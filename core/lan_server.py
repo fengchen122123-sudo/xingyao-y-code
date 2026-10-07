@@ -212,6 +212,8 @@ class LanServer:
     # Minor 1 的 fail-closed 默认裁决：LAN 排空 _js_queue 会偷走桌面事件并
     # 可能消费关停哨兵），以及交互式终端的写入/销毁类方法与 LSP 路径覆写
     # （Task 17：见下方 pty_terminal_* 分组的「只读留、写入/销毁封」划界）。
+    # 本轮边界审计（明文凭据读取 / 写桌面持久配置且决定后续执行 / 与已封
+    # 方法同类同边界）再补 6 项，逐项理由见下方各分组注释。
     FORBIDDEN_METHODS = frozenset({
         # 窗口控制（桌面专属，手机无意义）
         "window_minimize", "window_toggle_maximize", "window_native_maximize",
@@ -266,6 +268,42 @@ class LanServer:
         # 改桌面持久状态），fail-closed。只读类 lsp_server_status / lsp_request
         # / lsp_notify 与前端驱动的 lsp_sync_workspace 保持放行。
         "lsp_set_server_path",
+        # 明文凭据读取（本轮边界审计）：快照类方法一律只回 has_* 布尔
+        # （get_model_settings 的 has_api_key、get_feishu_settings 的
+        # has_secret），明文只在用户点「显示/复制」时按需取回。手机端不需要
+        # 这个能力——设置页的正常显示/回填走 has_* 布尔（占位文案「已配置；
+        # 留空表示不修改」），只有「显示」「复制」两个按钮会落空
+        # （SettingsPage.revealProviderKey 取不到明文时保持掩码，不抛异常）。
+        # 一旦放行，配对手机（或手机页面上任何脚本）就能一次性拖走全部厂商
+        # Key 与飞书 app_secret，属最不可接受的泄露面。
+        "get_provider_api_key", "get_feishu_secret",
+        # 写桌面持久配置且决定桌面后续执行内容：hook 命令的信任门禁在「用户级」
+        # 上是默认放行的（core/hooks/trust.py:status_for，scope == "user" 直接
+        # 返回 TRUST_TRUSTED），而 LAN 侧 payload 的 scope 由客户端自选——因此
+        # save_hook(scope="user") 写一次 ~/.ycode/hooks.json，就能让任意命令在
+        # 此后每次 SessionStart/PreToolUse/PostToolUse/Stop 上长期执行，且不产生
+        # 任何桌面确认（比刚封的 pty_terminal_write「一次一写」更宽）。
+        # grant_hook_trust 是同一通道的另一半：给项目级 pending hook 授信同样
+        # 等于远程放行任意 shell 命令，与已封的 acknowledge_computer_safety
+        # 同类（远程「确认安全检查」，设计 18 明确禁止）。deny/revoke/reset
+        # 只做减法（blocked/pending 都不会执行），保持放行。
+        "save_hook", "grant_hook_trust",
+        # MCP 服务新增：写盘 mcp.json 并立即 spawn（mcp_client.add_server 只
+        # 校验「命令名 ∈ npx/node/python 且不含路径」，args 原样透传，即
+        # npx -y <任意包> 仍可在桌面拉起任意代码），与已封的 lsp_set_server_path
+        # 同一边界（写一次配置 → 让桌面执行任意可执行文件），且比它更直接
+        # （写入即执行，不用等下次启动）。只读的 get_mcp_servers 与纯重连的
+        # reconnect_mcp 保持放行。
+        "add_mcp_server",
+        # 桌面持久化布局（ui_layout.json）：与已封的 ide_save_layout 同类同边界
+        # （覆盖桌面下次启动的侧栏排序），此前黑名单存在同类不对称。手机端无此
+        # 能力需求（frontend-mobile 不调用它）；只读的 get_ui_layout 保持放行。
+        "save_ui_layout",
+        # 桌面专属生命周期：shutdown 停掉自动化引擎、set 掉全部取消事件（正在跑
+        # 的回合被中止）并走窗口销毁链路——与已封的 window_close /
+        # window_confirm_close 同类（桌面专属，手机无意义）。桌面前端不调用它
+        # （唯一调用方是 gui_main 的窗口销毁链路），黑名单此前存在同类不对称。
+        "shutdown",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
