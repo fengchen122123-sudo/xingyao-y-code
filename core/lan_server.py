@@ -236,6 +236,9 @@ class LanServer:
         # ide_read_file / ide_stat_files / ide_get_layout 保持放行，与既有
         # read_file_preview 可被 LAN 调用的先例一致。
         "ide_write_file", "ide_set_open_files", "ide_save_layout",
+        # ide_run_file 往桌面常驻终端里写一行命令并回车（且支持 command= 原样透传），
+        # 比 ide_write_file 更进一步——等于开放远程任意命令执行，同样 fail-closed。
+        "ide_run_file",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
