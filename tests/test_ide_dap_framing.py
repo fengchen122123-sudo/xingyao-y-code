@@ -8,6 +8,8 @@ DAP 与 LSP 同为 Content-Length 帧，但载荷字段不同（seq/type/command
 `messages`，同一次 feed 里**已经成功解码**的报文不得随异常一起消失。
 """
 
+import json
+
 import pytest
 
 from core.ide.dap_manager import MAX_FRAME_BYTES, DapFramer, DapProtocolError, encode_message
@@ -24,6 +26,41 @@ def test_encode_message_frames_utf8_body_with_length():
     header, _, body = data.partition(b"\r\n\r\n")
     assert header == b"Content-Length: %d" % len(body)
     assert body.decode("utf-8") == '{"seq":1,"type":"request","command":"initialize"}'
+
+
+def test_encode_message_counts_utf8_bytes_for_multibyte_body():
+    """`Content-Length` 必须按**字节数**而非字符数：真多字节载荷的守门用例。
+
+    上面那条用例名叫 utf8，载荷却是纯 ASCII（字符数 == 字节数），按 `len(str)`
+    取长度同样能过——即「长度必须按字节算」这条风险此前没有任何用例守着。这里
+    用中文载荷钉死：实现若退化成按字符数取长度，头部会短 6 字节，接收端要么把
+    正文截成非法 UTF-8/JSON、要么一直等剩下的字节（挂起）。
+    """
+    payload = {"seq": 1, "type": "event", "event": "output", "body": {"output": "你好，星瑶\n"}}
+
+    data = encode_message(payload)
+
+    header, _, body = data.partition(b"\r\n\r\n")
+    text = body.decode("utf-8")
+    # 前提自检：载荷必须真的是多字节，否则这条用例守不住字节数口径
+    assert 0 < len(text) < len(body)
+    assert header == b"Content-Length: %d" % len(body)
+    assert header != b"Content-Length: %d" % len(text)  # 按字符数取长度会得到这个错误头部
+
+    framer = DapFramer()
+    messages = framer.feed(data)
+
+    assert messages == [payload] and framer.pending_bytes == 0
+
+
+def test_zero_content_length_is_rejected_as_empty_body():
+    """`Content-Length: 0`（空正文）是坏帧：当场判错，不得当作一条空报文或一直等。"""
+    framer = DapFramer()
+
+    with pytest.raises(DapProtocolError, match="合法 JSON"):
+        framer.feed(b"Content-Length: 0\r\n\r\n")
+
+    assert framer.pending_bytes == 0
 
 
 def test_max_frame_bytes_constant_is_32_mib():
@@ -183,6 +220,22 @@ def test_invalid_json_body_raises():
 
     with pytest.raises(DapProtocolError, match="合法 JSON"):
         framer.feed(_frame("{not json}"))
+
+
+@pytest.mark.parametrize("body", ["[]", '"hi"', "1", "null", "true"])
+def test_non_object_json_body_raises(body):
+    """合法 JSON 但不是对象（数组/字符串/数字/空/布尔）时必须抛 DapProtocolError。
+
+    `core/ide/dap_manager.py` 的 `_decode_body` 有 `isinstance(payload, dict)` 校验
+    （LSP 侧没有这条），此前没有任何用例走到——载荷是 `[]` 时它会一路冒到上层，
+    被当成「没有 response 字段的报文」而不是协议错，排查时看不出真正原因。
+    """
+    framer = DapFramer()
+
+    with pytest.raises(DapProtocolError, match="必须是 JSON 对象"):
+        framer.feed(_frame(body))
+
+    assert framer.pending_bytes == 0  # 坏帧已从缓冲里摘掉，语义与既有坏帧一致
 
 
 # --- 坏帧不得连带丢弃同一次 feed 里已解出的报文（S2-T3 语义） ---------------
