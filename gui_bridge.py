@@ -8401,6 +8401,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         if event_type == "dap_stopped":
             self._debug_last_thread_id = int(data.get("thread_id") or 0)
             self._debug_last_frame_id = int(data.get("frame_id") or 0)
+        elif event_type == "dap_terminated":
+            # 程序自然结束时适配器推 terminated：这里必须把会话引用放掉（S3-T7 评审），
+            # 否则上面那个「已有调试会话在运行」的判重会把**已经结束的会话**当成在跑的
+            # 会话拒绝掉，而前端 reduceDapEvent('dap_terminated') 只把 debugState 置
+            # stopped、并不调 ide_debug_stop → 用户必须手动点一次「停止」才能重新调试。
+            # 这里不调 session.stop()：本方法运行在 DAP 读线程内，同步等响应会被
+            # DapReaderBlockingError 护栏拦下；程序已结束，适配器进程通常也自行退出，
+            # 残余进程由 DebugSession.__del__ 兜底回收。
+            self._discard_debug_session()
         if self._shutting_down:
             return
         try:
@@ -8408,11 +8417,30 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception:
             logger.debug("推送调试事件失败", exc_info=True)
 
+    def _reset_debug_cursors(self) -> None:
+        """复位「当前线程 / 当前帧」记忆。
+
+        线程号与帧号只在**一次会话**内有意义：上一会话的值留到新会话，会让第一条
+        `dap_stopped` 到达之前的 continue / next / stepIn / stepOut / pause 与
+        stackTrace / evaluate 拿着失效 id 去问适配器，被拒成 "thread not found"
+        （S3-T7 评审）。
+        """
+        self._debug_last_thread_id = 0
+        self._debug_last_frame_id = 0
+
+    def _discard_debug_session(self) -> None:
+        """只放掉会话引用并复位线程/帧记忆，不回收进程（可从 DAP 读线程调用）。"""
+        with self._debug_lock:
+            self._debug_session = None
+        self._reset_debug_cursors()
+
     def _shutdown_debug_session(self) -> None:
         """结束会话并回收适配器进程（幂等；shutdown 与 ide_debug_stop 共用）。"""
         with self._debug_lock:
             session = self._debug_session
             self._debug_session = None
+        # 会话回收时一并复位线程/帧记忆：下一次调试不会继承上一会话的失效 id
+        self._reset_debug_cursors()
         if session is None:
             return
         session.stop()
@@ -8457,8 +8485,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         from core.ide.language_registry import language_id_for_path
 
         with self._debug_lock:
-            if self._debug_session is not None:
-                return {"ok": False, "msg": "已有调试会话在运行，请先停止"}
+            existing = self._debug_session
+        if existing is not None and existing.is_alive():
+            return {"ok": False, "msg": "已有调试会话在运行，请先停止"}
+        if existing is not None:
+            # 会话对象还在、但适配器已经不可用（程序自然结束推了 terminated，或适配器进程
+            # 意外退出连 terminated 都没送到）：先回收掉再放行。只看 `is not None` 会让
+            # 用户重新开始调试时永远拿到「已有调试会话在运行」却无会话可停（S3-T7 评审）。
+            self._shutdown_debug_session()
         real = _resolve_real_path(path)
         if not os.path.isfile(real):
             return {"ok": False, "msg": "文件不存在或不是普通文件，无法调试"}
