@@ -595,6 +595,32 @@ def test_debug_events_reach_js_queue(workspace, source_file, monkeypatch):
     assert payload["data"]["line"] == 7
 
 
+def test_new_dap_event_types_reach_js_queue(workspace, source_file, monkeypatch):
+    """thread / process / loadedSource 三类事件也要走 `_emit_dap_event` 这条唯一出口。
+
+    会话层归一化后不再静默丢弃它们（`dap_thread` / `dap_process` / `dap_loaded_source`），
+    桥层不需要为它们加特例：既有的「按当前会话 id 校验 + emit_event（put_nowait）」链路
+    就是它们的通道，前端靠 `type.startsWith('dap_')` 分流。
+    """
+    _patch_probe(monkeypatch)
+    _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+    bridge.drain_js_queue()
+
+    cases = (
+        ("dap_thread", {"session_id": "dap-fake", "reason": "started", "thread_id": 5}),
+        ("dap_thread", {"session_id": "dap-fake", "reason": "exited", "thread_id": 5}),
+        ("dap_process", {"session_id": "dap-fake", "name": "app.py", "system_process_id": 42}),
+        ("dap_loaded_source", {"session_id": "dap-fake", "reason": "new", "path": r"C:\p\app.py"}),
+    )
+    for event_type, payload in cases:
+        bridge._emit_dap_event(event_type, payload)
+        queued = bridge.drain_js_queue()
+        assert queued["type"] == event_type
+        assert queued["data"] == payload
+
+
 def test_stale_session_events_are_dropped(workspace, source_file, monkeypatch):
     """S3-T10 评审：旧会话迟到的事件不得被当成当前会话的事件处理。
 
