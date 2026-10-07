@@ -142,7 +142,16 @@ import { onDapOutput } from '../utils/dapBus';
 const debug = useIdeDebugStore();
 const watchInput = ref('');
 const consoleInput = ref('');
-// 控制台行缓冲：高频原始输出不进 Pinia（同 ptyBus 的理由），上限 2000 行防内存膨胀
+// 控制台行缓冲：高频原始输出不进 Pinia（同 ptyBus 的理由），上限 2000 行防内存膨胀。
+//
+// **已知边界（S3-T12 评审，已评估并显式记录）**：缓冲是组件本地的，而 `App.vue:62`
+// 用 `v-if="store.ideMode()"` 挂 IdeLayout —— 退出 IDE 模式会整体卸载 IdeLayout，
+// DebugPane 随之销毁，缓冲里全部控制台输出一起丢失（`utils/dapBus.ts` 只有广播、
+// 没有回放缓冲，重新挂载也补不回来）。计划只要求「收起面板不丢」：BottomPanel 用
+// v-show 让终端与调试控制台常驻，已由 BottomPanel.debugTab.test.ts 锁住。
+// 退出 IDE 模式本来就意味着调试会话结束（后端 ide_debug_stop 会回收适配器），
+// 下次进入从空控制台开始是期望行为，故保持组件本地缓冲、不提升到 store/dapBus 层；
+// 该边界的可观测形状由 DebugPane.consoleBoundary.test.ts 钉住。
 const consoleLines = ref<string[]>([]);
 const unsubs: Array<() => void> = [];
 
@@ -193,6 +202,11 @@ async function runExpression() {
 }
 
 onMounted(() => {
+  // 不按 `payload.session_id` 过滤：后端同一时刻只托管一个调试会话（gui_bridge 的
+  // 单个 `_debug_session`，前端 ideDebugStore 也只有一个 sessionId），单会话下过滤与
+  // 不过滤等价。**已知边界（S3-T12 评审）**：若将来支持并发调试会话，两个会话的输出
+  // 会串进同一个控制台，届时必须按 session_id 过滤（或按会话分缓冲）——今天不做，
+  // 因为没有第二个会话可区分，提前过滤反而会掩盖「事件不带 session_id」的老桥兼容路径。
   unsubs.push(onDapOutput((payload) => appendConsole(payload.text)));
 });
 
