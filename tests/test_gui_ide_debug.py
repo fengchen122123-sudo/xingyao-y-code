@@ -121,6 +121,8 @@ def _make_bridge(workdir):
     instance._debug_last_frame_id = 0
     instance._debug_reapers = []
     instance._debug_debuggee_exited = False
+    # 当前会话 id（与 `_debug_session` 成对维护）：`_emit_dap_event` 靠它丢弃残留事件
+    instance._debug_session_id = ""
     instance._current_session = "s1"
     instance._session_workdir = lambda name: workdir
     return instance
@@ -151,6 +153,20 @@ def _patch_session(monkeypatch):
         "core.ide.debug_session.DebugSession",
         lambda spec, **kwargs: created.append(_FakeSession(spec, **kwargs)) or created[-1],
     )
+    return created
+
+
+def _patch_session_with_distinct_ids(monkeypatch):
+    """同 `_patch_session`，但每次构造给一个不同的 session_id（检验跨会话的事件归属）。"""
+    created = []
+
+    def factory(spec, **kwargs):
+        session = _FakeSession(spec, **kwargs)
+        session.session_id = f"dap-{len(created) + 1}"
+        created.append(session)
+        return session
+
+    monkeypatch.setattr("core.ide.debug_session.DebugSession", factory)
     return created
 
 
@@ -450,12 +466,78 @@ def test_debug_events_reach_js_queue(workspace, source_file, monkeypatch):
     _patch_probe(monkeypatch)
     _patch_session(monkeypatch)
     bridge = _make_bridge(workspace)
+    # 会话必须先起来：`_emit_dap_event` 现在按事件携带的 session_id 与当前会话比对，
+    # 不属于当前会话的事件一律丢弃（S3-T10 评审），裸发会被当成残留事件
+    bridge.ide_debug_start(source_file)
+    bridge.drain_js_queue()
 
     bridge._emit_dap_event("dap_stopped", {"session_id": "dap-fake", "thread_id": 1, "line": 7})
     payload = bridge.drain_js_queue()
 
     assert payload["type"] == "dap_stopped"
     assert payload["data"]["line"] == 7
+
+
+def test_stale_session_events_are_dropped(workspace, source_file, monkeypatch):
+    """S3-T10 评审：旧会话迟到的事件不得被当成当前会话的事件处理。
+
+    `ide_debug_stop` 只丢引用 + 立即回报，适配器进程最坏 ≈10s 后才死；这段时间里旧会话
+    仍会推 `dap_continued` / `dap_exited` / `dap_terminated`。若放行它们，用户几秒内重启
+    调试时，旧会话的 `dap_exited` 会把 `_debug_debuggee_exited` 写脏，`ide_debug_start`
+    随即把**正在跑的新会话**当「已结束」回收掉。
+    """
+    _patch_probe(monkeypatch)
+    _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+    bridge.drain_js_queue()
+    bridge.ide_debug_stop()
+    bridge.drain_js_queue()
+
+    # 停止后桥层的会话 id 必须与会话引用一起放掉，否则残留事件的校验等于没有
+    assert bridge._debug_session_id == ""
+
+    for event_type, payload in (
+        ("dap_continued", {"session_id": "dap-fake", "thread_id": 1}),
+        ("dap_exited", {"session_id": "dap-fake", "exit_code": 0}),
+        ("dap_terminated", {"session_id": "dap-fake"}),
+        ("dap_output", {"session_id": "dap-fake", "category": "stderr", "text": "残留\n"}),
+    ):
+        bridge._emit_dap_event(event_type, payload)
+
+    assert bridge.drain_js_queue() is None
+    # 旧会话的 exited 不得写脏「被调试程序已退出」标记
+    assert bridge._debug_debuggee_exited is False
+    # 无当前会话时 dap_status 仍放行（停止/失败提示就是靠它送到前端的）
+    bridge._emit_dap_event("dap_status", {"session_id": "", "state": "stopped", "msg": ""})
+    assert bridge.drain_js_queue()["type"] == "dap_status"
+
+
+def test_stale_exited_does_not_reclaim_running_new_session(workspace, source_file, monkeypatch):
+    """更糟的那条后果：新会话正在跑时，旧会话的 dap_exited 不能让重启判重把它回收掉。"""
+    _patch_probe(monkeypatch)
+    created = _patch_session_with_distinct_ids(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+    first = created[0]
+    bridge.ide_debug_stop()
+    assert bridge._debug_session is None
+
+    bridge.ide_debug_start(source_file)
+    bridge.drain_js_queue()
+    running = bridge._debug_session
+    assert running is created[1]
+    assert running.session_id != first.session_id
+
+    # 旧适配器临死前推 exited：必须被会话校验丢掉
+    bridge._emit_dap_event("dap_exited", {"session_id": first.session_id, "exit_code": 0})
+
+    assert bridge._debug_debuggee_exited is False
+    # 新会话照旧是「在跑」：再来一次 start 会被那句「已有调试会话在运行」挡掉，
+    # 而不是被当作「已结束」回收
+    res = bridge.ide_debug_start(source_file)
+    assert res["ok"] is False and "已有调试会话" in res["msg"]
+    assert bridge._debug_session is running
 
 
 def test_stop_clears_session_and_terminates(workspace, source_file, monkeypatch):
@@ -636,6 +718,9 @@ def test_terminated_reaps_adapter_process_off_the_reader_thread(workspace):
         )
         session = _ReapingSession(child, reader_thread=reader_thread)
         bridge._debug_session = session
+        # 会话 id 与会话引用成对存在（`_emit_dap_event` 按它做归属校验，S3-T10 评审）：
+        # 这里手工搭桥内状态，必须把 id 一起放上，否则 terminated 会被当成残留事件丢掉
+        bridge._debug_session_id = "dap-fake"
         holder["session"] = session
 
         reader_thread.start()
@@ -670,6 +755,8 @@ def test_shutdown_after_terminated_still_reaps(workspace):
         bridge = _make_bridge(workspace)
         session = _ReapingSession(child)
         bridge._debug_session = session
+        # 同上一个用例：手工搭桥内状态时 id 要与会话引用成对放上
+        bridge._debug_session_id = "dap-fake"
 
         bridge._emit_dap_event("dap_terminated", {"session_id": "dap-fake"})
         assert bridge._debug_session is None

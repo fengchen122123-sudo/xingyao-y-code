@@ -161,3 +161,87 @@ it('does not expand a variable whose variablesReference is 0', async () => {
   expect(api.ide_debug_variables).toHaveBeenCalledTimes(1);
   wrapper.unmount();
 });
+
+// ── S3-T10 评审 ────────────────────────────────────────────────────────────
+
+it('每个作用域只渲染自己的变量，不把首个作用域的内容渲染两遍', async () => {
+  api.ide_debug_scopes.mockResolvedValue({
+    ok: true,
+    scopes: [
+      { name: 'Locals', variablesReference: 2001, expensive: false },
+      { name: 'Globals', variablesReference: 3001, expensive: false },
+    ],
+  });
+  api.ide_debug_variables.mockImplementation(async (reference: number) =>
+    reference === 2001
+      ? { ok: true, variables: [{ name: 'x', value: '42', type: 'int', variablesReference: 0 }] }
+      : { ok: true, variables: [{ name: 'os', value: '<module os>', type: 'module', variablesReference: 0 }] },
+  );
+  const debug = useIdeDebugStore();
+  const wrapper = mountPane();
+
+  await debug.loadScopes(1001);
+  await wrapper.vm.$nextTick();
+
+  const tabs = wrapper.findAll('[data-test="debug-scope"]');
+  expect(tabs.map((tab) => tab.text())).toEqual(['Locals', 'Globals']);
+  expect(tabs[0].classes()).toContain('active');
+  expect(wrapper.findAll('[data-test="debug-variable"]').map((row) => row.text())).toHaveLength(1);
+  expect(wrapper.get('[data-test="debug-variable"]').text()).toContain('x');
+
+  await tabs[1].trigger('click');
+  await wrapper.vm.$nextTick();
+
+  const rows = wrapper.findAll('[data-test="debug-variable"]');
+  expect(rows).toHaveLength(1);
+  expect(rows[0].text()).toContain('os');
+  expect(rows[0].text()).not.toContain('42');
+  wrapper.unmount();
+});
+
+it('展开变量后显示层级面包屑与「返回上一层」，可回到父层', async () => {
+  api.ide_debug_variables.mockResolvedValue({
+    ok: true,
+    variables: [{ name: 'self', value: 'App', type: 'App', variablesReference: 4001 }],
+  });
+  const debug = useIdeDebugStore();
+  const wrapper = mountPane();
+
+  await debug.loadScopes(1001);
+  await wrapper.vm.$nextTick();
+
+  // 作用域根层级没有展开箭头 → 没有返回按钮
+  expect(wrapper.find('[data-test="debug-var-back"]').exists()).toBe(false);
+  expect(wrapper.get('[data-test="debug-var-crumb"]').text()).toBe('Locals');
+
+  await wrapper.get('[data-test="debug-variable"]').trigger('click');
+  await flushPromises();
+  await wrapper.vm.$nextTick();
+
+  expect(wrapper.findAll('[data-test="debug-var-crumb"]').map((node) => node.text())).toEqual(['Locals', 'self']);
+
+  await wrapper.get('[data-test="debug-var-back"]').trigger('click');
+  await flushPromises();
+  await wrapper.vm.$nextTick();
+
+  expect(wrapper.findAll('[data-test="debug-var-crumb"]').map((node) => node.text())).toEqual(['Locals']);
+  expect(wrapper.find('[data-test="debug-var-back"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('调试输出之间不多插空行（DAP 输出自带尾换行）', async () => {
+  const wrapper = mountPane();
+
+  emitDapOutput({ session_id: 'dap-1', category: 'stdout', text: 'first\n' });
+  emitDapOutput({ session_id: 'dap-1', category: 'stdout', text: 'second\n' });
+  await wrapper.vm.$nextTick();
+
+  // 旧写法 split(/\r?\n/) 对尾换行会多出空串元素 → 两组输出之间被插入一个空行
+  expect(wrapper.get('[data-test="debug-console-output"]').element.textContent).toBe('first\nsecond');
+
+  // 输出内部的空行是真内容，必须保留
+  emitDapOutput({ session_id: 'dap-1', category: 'stdout', text: 'third\n\n' });
+  await wrapper.vm.$nextTick();
+  expect(wrapper.get('[data-test="debug-console-output"]').element.textContent).toBe('first\nsecond\nthird\n');
+  wrapper.unmount();
+});
