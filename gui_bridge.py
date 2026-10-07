@@ -623,6 +623,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 会话未必结束。只用来放行「重新开始调试」时回收旧会话，不在 exited 时丢会话
         # （否则 restart 这类合法流程会被误杀）
         self._debug_debuggee_exited = False
+        # 当前会话的 id（不是 `_debug_session.session_id` 的等价物）：
+        # ① 它在 `session.start()` **之前**就登记，适配器读线程/ stderr 读线程在启动
+        #    窗口里推的事件才不会被 `_emit_dap_event` 的会话校验当成残留事件丢掉；
+        # ② 它单独存一份，读线程不必去读 `_debug_session` 的字段（那个引用会被
+        #    `_discard_debug_session` 置 None，且读线程绝不能等锁，见 _emit_dap_event）。
+        self._debug_session_id = ""
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
@@ -8414,7 +8420,25 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
         emit_event 内部只做 put_nowait（队列满丢弃新事件、绝不阻塞），所以
         DAP 适配器读线程调用它是安全的：不触碰 WebView，也不会卡住读循环。
+
+        **会话归属校验（S3-T10 评审）：** 事件必须属于当前会话，否则直接丢弃。
+        `ide_debug_stop` 只放掉会话引用、适配器进程最坏 ≈10s 后才真正退出，这段时间里
+        旧适配器仍会推 `dap_continued` / `dap_exited` / `dap_terminated` / `dap_output`：
+        用户几秒内重启调试时，旧会话的 `dap_exited` / `dap_terminated` 会把**新会话**的
+        前端状态清掉、并把 `_debug_debuggee_exited` 写脏，使 `ide_debug_start` 把正在跑的
+        新会话当「已结束」回收掉。
+        校验放在本方法**最前面**（早于下面的状态副作用）：`dap_terminated` 分支内部会
+        `_discard_debug_session()`，若把校验放在其后，终止事件自己就会被自己的清理动作
+        判成「不属于当前会话」而丢掉。
+        只读共享标量、**不取 `_debug_lock`**：本方法可能跑在 DAP 读线程上，而
+        `_shutdown_debug_session` 会持锁做阻塞回收，读线程等锁就是死等（锁只用来读
+        单个属性，不需要）。
         """
+        incoming = str(data.get("session_id") or "")
+        current = getattr(self, "_debug_session_id", "") or ""
+        if event_type != "dap_status" and incoming != current:
+            logger.debug("丢弃不属于当前调试会话的事件：%s（%s）", event_type, incoming or "-")
+            return
         if event_type == "dap_stopped":
             self._debug_last_thread_id = int(data.get("thread_id") or 0)
             self._debug_last_frame_id = int(data.get("frame_id") or 0)
@@ -8476,6 +8500,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             session = self._debug_session
             self._debug_session = None
             self._debug_debuggee_exited = False
+            # 会话 id 与引用一起放掉：放掉之后旧适配器再推的事件（最坏 ≈10s 内）会被
+            # `_emit_dap_event` 的会话校验丢掉，不会污染下一次调试（S3-T10 评审）
+            self._debug_session_id = ""
             reaper = None
             if session is not None:
                 reaper = threading.Thread(
@@ -8578,6 +8605,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             session = self._debug_session
             self._debug_session = None
             self._debug_debuggee_exited = False
+            # 会话 id 与引用一起放掉（口径同 `_discard_debug_session`）：残留事件不得越过
+            # 关停边界污染下一次调试会话
+            self._debug_session_id = ""
             reapers = list(self._debug_reapers)
         # 会话回收时一并复位线程/帧记忆：下一次调试不会继承上一会话的失效 id
         self._reset_debug_cursors()
@@ -8689,12 +8719,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # debugpy 的适配器必须用启动它自己的解释器，否则 -m debugpy.adapter 找不到模块
             python=probe.spec.command[0] if language_id == "python" else "",
         )
+        # 会话 id 在 start() 之前就登记：适配器 stderr 读线程在 start() 内就会推
+        # dap_output（debugpy 的报错正是从这里来的），等到 start() 成功后再登记，
+        # 这段窗口里的事件会被 _emit_dap_event 的会话校验当成残留事件丢掉。
+        # 后面每一条失败返回都必须撤回它（否则旧 id 会一直挂在桥层，残留事件的校验跟着失效）。
+        self._debug_session_id = session.session_id
         try:
             info = session.start()
         except DebugSessionError as e:
+            self._debug_session_id = ""
             session.stop()
             return {"ok": False, "msg": str(e)}
         except (DapProtocolError, DapRequestError) as e:
+            self._debug_session_id = ""
             session.stop()
             return {"ok": False, "msg": f"启动调试适配器失败：{e}"}
         try:
@@ -8706,6 +8743,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 session.set_breakpoints(entry_path, lines)
             session.configuration_done()
         except (DapProtocolError, DapRequestError, DebugSessionError) as e:
+            self._debug_session_id = ""
             session.stop()
             return {"ok": False, "msg": f"调试初始化失败：{e}"}
         with self._debug_lock:
