@@ -93,6 +93,21 @@ it('打开文件后挂载编辑器，底部面板可切换到终端', async () =
   wrapper.unmount();
 });
 
+it('IDE 布局渲染出调试工具条（运行/调试的唯一入口必须可达）', async () => {
+  // S3-T9 评审：DebugToolbar 交付时全仓没有任何挂载点，计划自己的验收条款
+  //（Task 13 Step 5「点调试工具条『运行』」）在真实 IDE 模式里执行不了。
+  const wrapper = mount(IdeLayout);
+
+  const toolbar = wrapper.find('[data-test="debug-toolbar"]');
+  expect(toolbar.exists()).toBe(true);
+  // 「运行 / 调试」是工具条上必须可达的两个动作（无活动文件时 disabled，但要在）
+  expect(wrapper.find('[data-test="debug-run"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="debug-start"]').exists()).toBe(true);
+  // 工具条常驻：没有打开任何标签时也必须在（按钮自己 disabled）
+  expect(wrapper.find('.editor-pane-stub').exists()).toBe(false);
+  wrapper.unmount();
+});
+
 it('IDE 模式下终端只挂载一个实例，且那一个是底部面板的（App 自带的终端必须 v-if 退场）', async () => {
   const app = useAppStore();
   app.terminalPanelOpen = true;

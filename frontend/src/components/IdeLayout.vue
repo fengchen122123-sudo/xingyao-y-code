@@ -26,6 +26,12 @@
     </div>
 
     <div class="ide-main">
+      <!-- 调试工具条挂在编辑器区顶部：它是「运行 / 调试当前文件」在 IDE 模式下的唯一
+           入口。Task 9 只要求 Create 组件、全仓并无挂载点，导致计划自己的验收条款
+           （Task 13 Step 5「点调试工具条『运行』」）在真实 IDE 模式里执行不了——
+           等于交了死代码（S3-T9 评审）。工具条对活动文件操作，因此随编辑器区常驻，
+           不随标签是否存在而退场（无文件时按钮自己 disabled）。 -->
+      <DebugToolbar />
       <EditorTabs v-if="ide.tabs().length" />
       <div v-if="!ide.tabs().length" class="ide-empty-main">从左侧文件树打开文件</div>
       <EditorPane v-else :key="ide.activePath()" :path="ide.activePath()" />
@@ -51,6 +57,7 @@ import { onMounted, ref, watch } from 'vue';
 
 import ActivityBar from './ActivityBar.vue';
 import BottomPanel from './BottomPanel.vue';
+import DebugToolbar from './DebugToolbar.vue';
 import EditorPane from './EditorPane.vue';
 import EditorTabs from './EditorTabs.vue';
 import FileTreeNode from './FileTreeNode.vue';
