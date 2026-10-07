@@ -21,7 +21,12 @@ import { buildEditorTheme } from '../editor/theme';
 import { createEditorState, EditorView } from '../editor/setup';
 import { changeDocument, lspExtensions, openDocument } from '../editor/lsp';
 import { lspNavigationExtensions } from '../editor/lspNavigation';
-import { breakpointGutter, execLineField, setExecLineEffect } from '../ide/cmBreakpoints';
+import {
+  breakpointGutter,
+  execLineField,
+  refreshBreakpointsEffect,
+  setExecLineEffect,
+} from '../ide/cmBreakpoints';
 import { useIdeDebugStore } from '../stores/ideDebugStore';
 import { samePath, useIdeStore } from '../stores/ideStore';
 
@@ -168,9 +173,14 @@ function consumePendingJump() {
 
 watch(() => store.pendingJump, () => consumePendingJump(), { immediate: true });
 
-// 断点增删只改 ideStore，视图不会自己重绘：空 dispatch 一次让 gutter 的 lineMarker
-// 重算（否则点了 gutter 要等下一次光标移动才看到圆点）
-watch(() => store.breakpoints, () => view?.dispatch({}));
+// 断点增删只改 ideStore，视图不会自己重绘。这里**不能**用空 dispatch：实测
+// `view.dispatch({})` 不会让 CM6 重算 gutter 的 lineMarker（`updateGutters` 只在
+// docChanged / heightChanged / viewportChanged / gutterLineClass 变化时才同步），
+// 必须发一个能被 `lineMarkerChange` 认出来的 effect，否则点完 gutter 要等下一次输入 /
+// 滚动才看到圆点（S3-T11 评审 F3，见 cmBreakpoints.test.ts 的 Gutter 用例）。
+watch(() => store.breakpoints, () =>
+  view?.dispatch({ effects: refreshBreakpointsEffect.of(null) }),
+);
 
 /**
  * 把「当前执行行」落进本编辑器视图。
