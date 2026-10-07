@@ -1,5 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
+import { nextTick } from 'vue';
 import { beforeEach, expect, it, vi } from 'vitest';
 
 import { LAYOUT_PERSIST_DEBOUNCE_MS } from '../stores/ideStore';
@@ -28,6 +29,7 @@ vi.mock('./TerminalPane.vue', () => ({
 import App from '../App.vue';
 import IdeLayout from './IdeLayout.vue';
 import { useAppStore } from '../stores/appStore';
+import { emitDapOutput } from '../utils/dapBus';
 import { useIdeStore } from '../stores/ideStore';
 
 function installBridge(overrides: Record<string, unknown> = {}) {
@@ -225,6 +227,52 @@ it('恢复 N 个标签只落盘一次，且末次是完整标签列表与真实 
     breakpoints: [],
   });
   expect(ide.tabs().length).toBe(3);
+  wrapper.unmount();
+});
+
+// ── S3-T12：调试控制台页签在 IDE 模式里可达 ────────────────────────────────
+
+it('切到底部面板的「调试控制台」页签能看到调用栈 / 变量 / 监视区域', async () => {
+  // 验收前置：DebugPane（S3-T10）交付时全仓没有挂载点，Task 13 的「调试控制台可见」
+  // 一直执行不了。这里从真实布局点击页签，验证它真的可达。
+  const ide = useIdeStore();
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  await wrapper.get('[data-test="bottom-tab-debug"]').trigger('click');
+
+  expect(ide.bottomTab).toBe('debug');
+  const pane = wrapper.get('[data-test="debug-pane"]');
+  expect(pane.isVisible()).toBe(true);
+  expect(pane.text()).toContain('调用栈');
+  expect(pane.text()).toContain('变量');
+  expect(pane.text()).toContain('监视');
+  expect(pane.find('[data-test="debug-console-input"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+it('收起再展开底部面板：调试控制台输出不丢，页签选择也保留', async () => {
+  const ide = useIdeStore();
+  ide.setBottomTab('debug');
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  emitDapOutput({ session_id: 'dap-1', category: 'stdout', text: 'before close\n' });
+  await nextTick();
+
+  ide.toggleBottomPanel();
+  await nextTick();
+  // 面板收起期间适配器仍在推输出（后端不管前端可不可见）
+  emitDapOutput({ session_id: 'dap-1', category: 'stdout', text: 'while closed\n' });
+  await nextTick();
+
+  ide.toggleBottomPanel();
+  await nextTick();
+
+  const out = wrapper.get('[data-test="debug-console-output"]').element.textContent ?? '';
+  expect(out).toContain('before close');
+  expect(out).toContain('while closed');
+  expect(ide.bottomTab).toBe('debug');
   wrapper.unmount();
 });
 
