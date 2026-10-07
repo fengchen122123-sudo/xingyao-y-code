@@ -106,7 +106,10 @@ export const CHANGE_DEBOUNCE_MS = 150;
  * changeDocument 的内容）：语言服务器崩溃重启后新进程文档表为空，重发 didOpen
  * 必须带全文，而「只发过 didChange」的文档在服务端是无从还原的。
  */
-const openDocs = new Map<string, { languageId: string; version: number; text: string }>();
+const openDocs = new Map<
+  string,
+  { languageId: string; version: number; text: string; workspace?: string }
+>();
 const pendingChanges = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> }>();
 const diagnosticsByPath = new Map<string, LspDiagnostic[]>();
 /** normKey 会改写盘符大小写与斜杠，回传后端时必须用原样路径，这里按 key 反查*/
@@ -122,6 +125,30 @@ export function bridgeApi(): LspBridgeApi | null {
 
 export function normKey(path: string): string {
   return path.replace(/\//g, '\\').toLowerCase();
+}
+
+/**
+ * 工作区比较键：斜杠方向与大小写都可能因来源不同而不同（后端 `status()` 报的是
+ * `os.path.normcase` 归一化后的路径，`_emit_status` 报的是原始路径），统一归一化
+ * 后再比，末尾斜杠也去掉。
+ */
+export function workspaceKey(workspace: string | undefined | null): string {
+  return String(workspace ?? '')
+    .replace(/\//g, '\\')
+    .replace(/\\+$/, '')
+    .toLowerCase();
+}
+
+/**
+ * 当前工作区（后端 `lsp_sync_workspace` 的响应口径）。`openDocument` 打开的文档
+ * 记在自己名下：语言服务器按 (workspace, server) 记账，重发 didOpen 必须按工作区
+ * 过滤，否则会把 A 区的文档重发给 B 区的同语言服务器（LSP 规范下重复 didOpen
+ * 是协议错误，且会让 B 区服务器持有不属于它的文档）。
+ */
+let activeWorkspace: string | undefined;
+
+export function setActiveWorkspace(workspace: string | undefined | null): void {
+  activeWorkspace = workspace ? String(workspace) : undefined;
 }
 
 export function fileUri(path: string): string {
@@ -156,7 +183,12 @@ async function notifySafe(
   }
 }
 
-export async function openDocument(path: string, languageId: string, text: string): Promise<void> {
+export async function openDocument(
+  path: string,
+  languageId: string,
+  text: string,
+  workspace?: string,
+): Promise<void> {
   const api = bridgeApi();
   if (!api) return;
   const key = normKey(path);
@@ -180,7 +212,9 @@ export async function openDocument(path: string, languageId: string, text: strin
     );
     return;
   }
-  openDocs.set(key, { languageId, version: 1, text });
+  // 归属工作区：调用方没给就用当前工作区（后端 sync 响应口径），都没有时留 undefined
+  // ——「归属未知」按参与处理（见 reopenOpenDocuments）。
+  openDocs.set(key, { languageId, version: 1, text, workspace: workspace ?? activeWorkspace });
   docPaths.set(key, path);
 }
 
@@ -321,13 +355,19 @@ function serverKeyOf(status: LspServerStatus): string {
  * —— 那正是跨工作区误发（LSP 规范下重复 didOpen 是协议错误）。
  *
  * 只按 `languageId` 过滤本身不足以判定归属：同一语言在多个工作区各有一个进程，
- * 真正区分它们的是 `serverKeyOf` 的 (workspace, server) 口径。
+ * 真正区分它们的是 `serverKeyOf` 的 (workspace, server) 口径。因此重发时按
+ * 「文档登记的工作区 == 事件里的工作区」二次过滤（S2 验收欠账 4）：
+ * - 文档记过工作区：只有与事件工作区一致才重发；
+ * - 文档没记工作区（登记时前端还不知道当前工作区，例如挂载早期的文件）：
+ *   按参与处理，交回 `resetClientState()` 的三态同清兜底，绝不漏发。
  */
-async function reopenOpenDocuments(languageId: string): Promise<void> {
+async function reopenOpenDocuments(languageId: string, workspace?: string): Promise<void> {
   const api = bridgeApi();
   const jobs: Promise<void>[] = [];
+  const target = workspaceKey(workspace);
   openDocs.forEach((doc, key) => {
     if (languageId && doc.languageId !== languageId) return;
+    if (doc.workspace !== undefined && target && workspaceKey(doc.workspace) !== target) return;
     const path = pendingPath(key);
     // 待发变更的文本并入 didOpen 全文：那次 didChange 已经没有意义了
     const pending = pendingChanges.get(key);
@@ -379,7 +419,7 @@ function handleServerStatus(status: LspServerStatus): void {
   }
   if (status.state === 'running' && reopenPending.has(key)) {
     reopenPending.delete(key);
-    void reopenOpenDocuments(status.language);
+    void reopenOpenDocuments(status.language, status.workspace);
   }
 }
 
@@ -441,6 +481,10 @@ export function resetClientState(): void {
   // 文档上触发一次重启重发（跨工作区误发 didOpen，评审 B）。三条状态必须一起清。
   serverStateByKey.clear();
   reopenPending.clear();
+  // 当前工作区也一起清：留着旧值会让「切换后新打开」的文档被打上旧工作区的归属，
+  // 之后它自己的服务器重启时反而被过滤掉（宁可「归属未知」也不能记错归属）。
+  // 生产入口 `ideStore.syncWorkspace()` 紧接着会用后端响应把它设回当前工作区。
+  activeWorkspace = undefined;
 }
 
 // ---------------------------------------------------------------------------
