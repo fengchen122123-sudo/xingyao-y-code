@@ -8662,7 +8662,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         """启动调试：路径策略 → 探测适配器 → 起会话 → 下发断点 → configurationDone。
 
         program / cwd 也要过策略（S3-T4 评审）：两者都会原样进 DAP launch 参数，
-        不过策略就等于"用调试器起任意程序"。
+        不过策略就等于"用调试器起任意程序"。breakpoints 里的路径同理（先 realpath
+        再 gui_path_access_allowed），且在起会话前校验，越权时不留下适配器进程。
         """
         from core.ide.dap_manager import DapProtocolError, DapRequestError
         from core.ide.debug_adapters import probe_adapter
@@ -8705,6 +8706,22 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         denied = self._debug_path_denied(cwd_real, workspace, "调试工作目录")
         if denied:
             return {"ok": False, "msg": denied}
+        # 断点路径与 program / cwd 同口径（先 _resolve_real_path 再过策略）：断点路径
+        # 会原样进 DAP setBreakpoints，适配器据此去读文件，不过策略就等于"让调试器在
+        # 工作区外设断点"。校验放在会话启动之前：越权时直接拒绝，不留下适配器进程
+        # （与 program / cwd 越权时的行为一致）。
+        # `item["path"]` 缺省时回落成上面已校验过的目标文件 `real`——"该文件无断点"
+        # 或"前端只传行号"这类正常情况不会被误判成越权。
+        pending_breakpoints: List[Dict[str, Any]] = []
+        for item in breakpoints or []:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            entry_path = _resolve_real_path(raw_path) if raw_path else real
+            denied = self._debug_path_denied(entry_path, workspace, "断点文件")
+            if denied:
+                return {"ok": False, "msg": denied}
+            pending_breakpoints.append({"path": entry_path, "lines": list(item.get("lines") or [])})
         language_id = language_id_for_path(real)
         probe = probe_adapter(language_id)
         if not probe.ok or probe.spec is None:
@@ -8735,10 +8752,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             session.stop()
             return {"ok": False, "msg": f"启动调试适配器失败：{e}"}
         try:
-            for item in breakpoints or []:
-                if not isinstance(item, dict):
-                    continue
-                entry_path = str(item.get("path") or real)
+            # 路径已在会话启动前统一校验并 realpath 归一化（含 path 缺省回落 real 的分支）
+            for item in pending_breakpoints:
+                entry_path = str(item["path"])
                 lines = [int(line) for line in (item.get("lines") or [])]
                 session.set_breakpoints(entry_path, lines)
             session.configuration_done()
@@ -8757,16 +8773,30 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         }
 
     def ide_debug_set_breakpoints(self, path: str, lines: Optional[List[int]] = None) -> Dict[str, Any]:
-        """会话未启动时断点只存在前端，这里返回 pending 由启动时统一下发。"""
+        """会话未启动时断点只存在前端，这里返回 pending 由启动时统一下发。
+
+        断点路径与 program / cwd 同口径：先 `_resolve_real_path` 再
+        `gui_path_access_allowed`。策略校验放在会话判断之前——pending 与下发两条
+        分支共用同一道闸，用户在工作区外设断点能立刻拿到可诊断原因，而不是等到
+        「开始调试」时才失败。
+        """
         from core.ide.dap_manager import DapProtocolError, DapRequestError
         from core.ide.debug_session import DebugSessionError
 
+        real_path = _resolve_real_path(path)
+        workspace = self._session_workdir(self._current_session)
+        if workspace and workspace != "GLOBAL":
+            # 与 ide_run_file / ide_debug_start 同口径：工作区先归一化再交给策略做包含判断
+            workspace = _resolve_real_path(workspace)
+        denied = self._debug_path_denied(real_path, workspace, "断点文件")
+        if denied:
+            return {"ok": False, "msg": denied}
         with self._debug_lock:
             session = self._debug_session
         if session is None:
             return {"ok": True, "pending": True, "verified": []}
         try:
-            verified = session.set_breakpoints(_resolve_real_path(path), [int(line) for line in (lines or [])])
+            verified = session.set_breakpoints(real_path, [int(line) for line in (lines or [])])
         except (DebugSessionError, DapProtocolError, DapRequestError) as e:
             return {"ok": False, "msg": f"设置断点失败：{e}"}
         return {"ok": True, "pending": False, "verified": verified}
