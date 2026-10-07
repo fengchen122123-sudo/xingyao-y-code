@@ -38,6 +38,7 @@ def test_extra_args_are_appended(workspace, tmp_path):
 
     plan = rc.build_run_plan(str(target), workspace, extra_args="--name 星瑶")
 
+    assert plan.command.startswith("& ")
     assert plan.command.endswith("--name 星瑶")
 
 
@@ -89,6 +90,7 @@ def test_package_json_start_script_preferred(workspace, tmp_path):
     plan = rc.build_run_plan(str(target), workspace)
 
     assert plan.source == "package.json" and "run start" in plan.command
+    assert plan.command.startswith("& npm run start"), "npm 分支同样必须带 PowerShell 调用符"
 
 
 def test_package_json_dev_script_fallback(workspace, tmp_path):
@@ -98,7 +100,8 @@ def test_package_json_dev_script_fallback(workspace, tmp_path):
 
     plan = rc.build_run_plan(str(target), workspace)
 
-    assert "run dev" in plan.command and plan.source == "package.json"
+    assert plan.source == "package.json"
+    assert plan.command.startswith("& npm run dev")
 
 
 def test_launch_json_program_wins_for_compiled_output(workspace, tmp_path):
@@ -113,7 +116,10 @@ def test_launch_json_program_wins_for_compiled_output(workspace, tmp_path):
     plan = rc.build_run_plan(str(source_file), workspace)
 
     assert plan.source == "launch.json"
-    assert str(exe) in plan.command and "--verbose" in plan.command
+    # launch.json 分支是 C/C++ 唯一可运行入口：漏掉 `& ` 时 PowerShell 只回显一行
+    # 路径、程序不启动，因此这里必须断言前缀而不能只断言"包含路径"
+    assert plan.command.startswith("& ")
+    assert plan.command == f"& '{exe}' '--verbose'"
 
 
 def test_typescript_without_package_json_raises(workspace, tmp_path):
@@ -222,7 +228,125 @@ def test_launch_json_gbk_encoding_is_readable(workspace, tmp_path):
     plan = rc.build_run_plan(str(target), workspace)
 
     assert plan.source == "launch.json" and plan.note == ""
-    assert str(target) in plan.command
+    assert plan.command.startswith("& ")
+    assert plan.command == f"& '{target}'"
+
+
+# ------------------------------------------- launch.json 变量展开（VS Code 默认写法）
+
+
+def _write_launch_config(tmp_path, program, args=None, name="调试", runtime=""):
+    config = {"name": name, "program": program}
+    if args is not None:
+        config["args"] = args
+    if runtime:
+        config["runtimeExecutable"] = runtime
+    _write(
+        tmp_path / ".vscode" / "launch.json",
+        json.dumps({"version": "0.2.0", "configurations": [config]}),
+    )
+
+
+def test_launch_json_workspace_folder_variable_expands(workspace, tmp_path):
+    """C/C++ 默认模板写 ${workspaceFolder}/build/app.exe：必须展开成真实路径。"""
+    _write_launch_config(tmp_path, "${workspaceFolder}/build/app.exe", args=["--verbose"])
+    source_file = tmp_path / "src" / "main.cpp"
+    _write(source_file, "int main(){return 0;}\n")
+    exe = tmp_path / "build" / "app.exe"
+
+    plan = rc.build_run_plan(str(source_file), workspace)
+
+    assert plan.source == "launch.json"
+    assert plan.command == f"& '{exe}' '--verbose'"
+    assert "${" not in plan.command
+
+
+def test_launch_json_file_basename_no_extension_expands(workspace, tmp_path):
+    """${fileBasenameNoExtension} 这类变量要先展开再匹配（否则永远匹配不上源文件）。"""
+    _write_launch_config(tmp_path, "${workspaceFolder}/build/${fileBasenameNoExtension}.exe")
+    source_file = tmp_path / "main.cpp"
+    _write(source_file, "int main(){return 0;}\n")
+
+    plan = rc.build_run_plan(str(source_file), workspace)
+
+    assert plan.source == "launch.json"
+    assert plan.command == f"& '{tmp_path / 'build' / 'main.exe'}'"
+
+
+def test_launch_json_file_variable_expands_to_current_file(workspace, tmp_path):
+    """program 写成 ${file} 时展开成当前文件，并按当前文件匹配到这条配置。"""
+    _write_launch_config(tmp_path, "${file}", args=["--name", "星瑶"])
+    target = tmp_path / "app.py"
+    _write(target, "print('hi')\n")
+
+    plan = rc.build_run_plan(str(target), workspace)
+
+    assert plan.source == "launch.json" and plan.note == ""
+    assert plan.command == f"& '{target}' '--name' '星瑶'"
+
+
+def test_launch_json_file_dirname_and_extname_variables_expand(workspace, tmp_path):
+    _write_launch_config(tmp_path, "${fileDirname}/build/app${fileExtname}")
+    source_file = tmp_path / "src" / "main.cpp"
+    _write(source_file, "int main(){return 0;}\n")
+
+    plan = rc.build_run_plan(str(source_file), workspace)
+
+    assert plan.command == f"& '{tmp_path / 'src' / 'build' / 'app.cpp'}'"
+
+
+def test_launch_json_workspace_folder_basename_variable_expands(workspace, tmp_path):
+    """${workspaceFolderBasename} 常出现在 args / runtimeExecutable 里，同样要展开。"""
+    runtime = tmp_path / "runtime" / "python.exe"
+    _write_launch_config(
+        tmp_path, "${file}", args=["--tag", "${workspaceFolderBasename}"], runtime="${fileDirname}/runtime/python.exe"
+    )
+    target = tmp_path / "app.py"
+    _write(target, "print('hi')\n")
+    _write(runtime, "")
+
+    plan = rc.build_run_plan(str(target), workspace)
+
+    assert plan.command == f"& '{runtime}' '{target}' '--tag' '{tmp_path.name}'"
+
+
+def test_launch_json_unknown_variable_falls_back_with_reason(workspace, tmp_path):
+    """${env:...} 之类不支持的变量不得原样透传进终端，要有中文原因。"""
+    _write_launch_config(tmp_path, "${env:HOME}/bin/app.exe")
+    target = tmp_path / "app.py"
+    _write(target, "print('hi')\n")
+
+    plan = rc.build_run_plan(str(target), workspace)
+
+    assert plan.source == "language" and "-u" in plan.command
+    assert "env:HOME" in plan.note and "无法识别" in plan.note
+    assert "${" not in plan.command
+
+
+def test_launch_json_unknown_variable_in_matched_config_falls_back_with_reason(workspace, tmp_path):
+    """匹配上的配置里含未知变量：回退并说明，不许把字面量当路径执行。"""
+    target = tmp_path / "app.py"
+    _write(target, "print('hi')\n")
+    _write_launch_config(tmp_path, "${fileDirname}/${env:MY_ROOT}/app.py")
+
+    plan = rc.build_run_plan(str(target), workspace)
+
+    assert plan.source == "language"
+    assert "env:MY_ROOT" in plan.note and "无法识别" in plan.note
+    assert "${" not in plan.command
+
+
+def test_compiled_language_with_unknown_variable_reports_reason(workspace, tmp_path):
+    """编译型语言没有语言默认命令可退：报错里必须带上变量问题的中文原因。"""
+    _write_launch_config(tmp_path, "${env:BUILD_ROOT}/app.exe")
+    source_file = tmp_path / "main.cpp"
+    _write(source_file, "int main(){return 0;}\n")
+
+    with pytest.raises(rc.RunPlanError) as excinfo:
+        rc.build_run_plan(str(source_file), workspace)
+
+    message = str(excinfo.value)
+    assert "env:BUILD_ROOT" in message and "无法识别" in message
 
 
 def test_launch_json_without_matching_program_falls_back(workspace, tmp_path):
