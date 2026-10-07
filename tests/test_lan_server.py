@@ -1124,4 +1124,154 @@ def test_rotation_rejects_stale_registration_concurrently():
     assert srv._clients == []
     for c in registered_stale:
         assert c not in srv._clients
+    for c in registered_stale:
+        assert c not in srv._clients
         assert c.closed and c.closed[0][0] == 4401
+
+
+# ---------------------------------------------------------------------------
+# LAN 边界审计（本轮）：明文凭据读取 / 写桌面持久配置且决定后续执行 /
+# 与已封方法同类同边界。用「会真的返回敏感值」的桥桩，证明拦截发生在
+# LAN 分发边界（dispatch_rpc），而不是因为桥桩没有这个方法。
+# ---------------------------------------------------------------------------
+
+class _LeakProbeBridge:
+    """记录被调用次数并返回敏感值的桥桩：LAN 侧一旦放行就会泄露。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def _probe(self, name, value):
+        self.calls.append(name)
+        return {"ok": True, **value}
+
+    def get_provider_api_key(self, provider_id):
+        return self._probe("get_provider_api_key", {"api_key": "sk-real-secret"})
+
+    def get_feishu_secret(self):
+        return self._probe("get_feishu_secret", {"app_secret": "super_secret"})
+
+    def save_hook(self, payload):
+        return self._probe("save_hook", {"msg": "已保存"})
+
+    def grant_hook_trust(self, digest):
+        return self._probe("grant_hook_trust", {"msg": "已信任"})
+
+    def add_mcp_server(self, name, command, args, env=None, enabled=True):
+        return self._probe("add_mcp_server", {"msg": "已新增服务"})
+
+    def save_ui_layout(self, layout):
+        return self._probe("save_ui_layout", {"layout": layout})
+
+    def shutdown(self):
+        return self._probe("shutdown", {})
+
+
+@pytest.mark.parametrize("method", ["get_provider_api_key", "get_feishu_secret"])
+def test_lan_forbids_credential_plaintext_reads(method):
+    """明文凭据读取必须 fail-closed 拒绝（本轮审计：密钥/隐私读取类）。
+
+    快照类方法只回 has_* 布尔（get_model_settings 的 has_api_key /
+    get_feishu_settings 的 has_secret），明文只在桌面设置页用户点「显示/
+    复制」时按需取回。LAN 放行等于让配对手机一次性拖走全部厂商 Key 与
+    飞书 app_secret——手机端设置页的正常显示/回填不需要明文（走 has_*
+    占位），只有「显示」「复制」按钮会落空，代价可接受。
+    """
+    bridge = _LeakProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc(method, ["p1"] if method.endswith("api_key") else [])
+    assert response["error"]["code"] == "method_not_allowed"
+    # 拦截必须在到达桥之前：桥桩一旦被调用，敏感值就已经经 LAN 出去了
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize("method", [
+    "save_hook",
+    "grant_hook_trust",
+    "add_mcp_server",
+])
+def test_lan_forbids_execution_enabling_config_writes(method):
+    """写「决定桌面后续执行什么」的持久配置必须 fail-closed 拒绝（本轮审计）。
+
+    - save_hook：hook 信任门禁对「用户级」是默认放行的
+      （core/hooks/trust.py:status_for，scope == "user" → TRUST_TRUSTED），
+      而 scope 由客户端自选，所以写一次 ~/.ycode/hooks.json 就能让任意命令
+      在此后每次 hook 事件上长期执行、且没有任何桌面确认——比已封的
+      pty_terminal_write 更宽（一次一写 vs 长期生效）；
+    - grant_hook_trust：同一通道的另一半，给项目级 pending hook 授信等于
+      远程「确认安全检查」，与已封的 acknowledge_computer_safety 同类；
+    - add_mcp_server：写盘 mcp.json 并立即 spawn（只校验命令名 ∈ npx/node/
+      python，args 原样透传），与已封的 lsp_set_server_path 同边界且更直接。
+    """
+    bridge = _LeakProbeBridge()
+    srv = LanServer(bridge=bridge)
+    args = {
+        "save_hook": [{"scope": "user", "event": "SessionStart", "command": "calc.exe"}],
+        "grant_hook_trust": ["deadbeef"],
+        "add_mcp_server": ["evil", "npx", ["-y", "evil-pkg"]],
+    }[method]
+    response = srv.dispatch_rpc(method, args)
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize("method", ["save_ui_layout", "shutdown"])
+def test_lan_forbids_desktop_exclusive_layout_and_lifecycle(method):
+    """桌面专属的持久化布局与生命周期方法必须 fail-closed 拒绝（本轮审计）。
+
+    黑名单此前存在同类不对称：ide_save_layout 已封、同为「覆盖桌面持久化
+    布局」的 save_ui_layout 却放行；window_close 已封、真正中止全部活跃
+    回合并销毁窗口的 shutdown 却放行。两者手机端都无能力需求
+    （frontend-mobile 不调用；shutdown 的唯一调用方是 gui_main 的窗口销毁
+    链路），与既有窗口控制分组同一划界。
+    """
+    bridge = _LeakProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc(
+        method, [{"groups": []}] if method == "save_ui_layout" else []
+    )
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+def test_lan_allows_lsp_read_and_sync_methods():
+    """LSP 组的「只读/前端驱动」方法必须保持放行（Task 17 评审要求补「留」的断言）。
+
+    上一轮只测了 lsp_set_server_path 的「封」，没有测 LSP 组的「留」——
+    后人顺手把整组 LSP 方法都封掉也不会被测出，而手机端的 LSP 状态显示、
+    请求转发与工作区同步会随之静默失效。这里用与
+    test_lan_allows_pty_read_only_methods 同款的「必须真正到达 bridge」
+    断言锁定：dispatch_rpc 是 fail-open 分发，放行方法绝不能返回
+    method_not_allowed。
+    """
+    calls = []
+
+    class LspBridge:
+        def lsp_server_status(self, session=None):
+            calls.append(("status", session))
+            return {"ok": True, "running": True, "language": "python"}
+
+        def lsp_request(self, method, params=None, session=None):
+            calls.append(("request", method, session))
+            return {"ok": True, "result": {"contents": "x"}}
+
+        def lsp_notify(self, method, params=None, session=None):
+            calls.append(("notify", method, session))
+            return {"ok": True}
+
+        def lsp_sync_workspace(self, files=None, session=None):
+            calls.append(("sync", session))
+            return {"ok": True, "synced": 1}
+
+    srv = LanServer(bridge=LspBridge())
+    for method, args in (
+        ("lsp_server_status", ["s1"]),
+        ("lsp_request", ["textDocument/hover", {}, "s1"]),
+        ("lsp_notify", ["textDocument/didSave", {}, "s1"]),
+        ("lsp_sync_workspace", [[], "s1"]),
+    ):
+        result = srv.dispatch_rpc(method, args)
+        # 绝不能返回 method_not_allowed：LSP 只读/同步类方法必须真正到达 bridge
+        assert "error" not in result
+        assert result["ok"] is True
+    assert [c[0] for c in calls] == ["status", "request", "notify", "sync"]
