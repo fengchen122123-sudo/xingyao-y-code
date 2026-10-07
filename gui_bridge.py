@@ -8316,6 +8316,64 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # IDE 一键运行：命令写进既有常驻终端会话（输出继续走 pty_data 事件）
+    # core.ide 的导入放在方法内：与 core.gui_path_policy 的懒导入同口径
+    # （core/ide 依赖链不该拖慢 GUI 启动）
+    # ------------------------------------------------------------------
+    def ide_run_file(self, path: str, extra_args: str = "", command: str = "") -> Dict[str, Any]:
+        """解析运行命令并写进常驻终端；不新开进程，复用 pty_terminal_ensure 的会话语义。
+
+        运行进程由用户显式触发，不进 permission_broker（规格 §7.4），但路径策略一步
+        不少：先过 _resolve_real_path 再走 gui_path_access_allowed，口径与
+        open_path / read_file_preview 完全一致——否则本方法就是"往常驻 shell 里塞任意
+        命令"的越权通道。
+
+        返回 {ok, command?, source?, pid?, note?, msg?}。note 是 build_run_plan 的
+        回退说明（没能按项目配置解析、退成了语言默认命令时的中文原因，无回退时为空串），
+        并同步放进 msg：前端只渲染 msg 也能看到"为什么没按 launch.json 跑"。
+        """
+        from core.gui_path_policy import gui_path_access_allowed
+        from core.ide.run_command import RunPlanError, build_run_plan
+
+        try:
+            real = _resolve_real_path(path)
+            if not os.path.isfile(real):
+                return {"ok": False, "msg": "文件不存在或不是普通文件，无法运行"}
+            workspace = self._session_workdir(self._current_session)
+            if workspace and workspace != "GLOBAL":
+                # build_run_plan 内部用 os.path.abspath 按**进程 cwd** 解析相对路径，
+                # 而进程 cwd 不随会话工作区切换：桥层必须传解析后的绝对路径
+                workspace = _resolve_real_path(workspace)
+            allowed, reason = gui_path_access_allowed(
+                real, workspace, action="open", session_id=self._current_session
+            )
+            if not allowed:
+                return {"ok": False, "msg": reason}
+            try:
+                plan = build_run_plan(
+                    real, workspace, explicit_command=command, extra_args=extra_args
+                )
+            except RunPlanError as e:
+                return {"ok": False, "msg": str(e)}
+            ensured = self.pty_terminal_ensure()
+            if ensured.get("ok") is not True:
+                return {"ok": False, "msg": ensured.get("msg") or "终端启动失败，请重试"}
+            written = self.pty_terminal_write(plan.command + "\r")
+            if written.get("ok") is not True:
+                return {"ok": False, "msg": written.get("msg") or "命令未送达终端，请重试"}
+            return {
+                "ok": True,
+                "command": plan.command,
+                "source": plan.source,
+                "pid": ensured.get("pid"),
+                "note": plan.note,
+                "msg": plan.note,
+            }
+        except Exception as e:
+            logger.exception("ide_run_file 失败")
+            return {"ok": False, "msg": f"一键运行失败：{e}"}
+
+    # ------------------------------------------------------------------
     # 模型管理
     # ------------------------------------------------------------------
     def get_model_settings(self) -> Dict[str, Any]:
