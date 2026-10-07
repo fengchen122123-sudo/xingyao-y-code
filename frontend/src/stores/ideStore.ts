@@ -98,10 +98,20 @@ export const useIdeStore = defineStore('ide', {
   }),
 
   getters: {
-    /** `${path}:${line}` 集合，供断点 gutter 做 O(1) 判定 */
+    /**
+     * `${path}:${line}` 集合，供断点 gutter 做 O(1) 判定。
+     *
+     * 路径段走 `pathKey` 归一化（只统一分隔符），与 `breakpointsFor` /
+     * `toggleBreakpoint` 的查表口径、以及 `cmBreakpoints.breakpointKey` 用同一把尺子：
+     * 三处口径必须一致，否则反斜杠 realpath 与正斜杠调用方路径会拼出两个键，
+     * `ideDebugStore.toggleBreakpoint` 判「断点是否还在」时就会漏删 verified 状态
+     * （S3-T11 评审 F4）。
+     */
     breakpoints(state): Set<string> {
       return new Set(
-        (state.breakpointsBySession[state.session] ?? []).map((b) => `${b.path}:${b.line}`),
+        (state.breakpointsBySession[state.session] ?? []).map(
+          (b) => `${pathKey(b.path)}:${b.line}`,
+        ),
       );
     },
 

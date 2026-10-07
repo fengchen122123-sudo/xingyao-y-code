@@ -303,7 +303,7 @@ it('breakpointsFor 只返回该文件的断点并按行号升序', async () => {
   expect(store.breakpointsFor('c.py')).toEqual([]);
 });
 
-it('toggleBreakpoint 落库用标签 realpath，gutter 的 `${path}:${line}` 能命中', async () => {
+it('toggleBreakpoint 落库用标签 realpath，gutter 的归一化 `${path}:${line}` 键能命中', async () => {
   installBridge({
     ide_read_file: vi.fn(async () => ({
       ok: true, path: 'e:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
@@ -313,7 +313,10 @@ it('toggleBreakpoint 落库用标签 realpath，gutter 的 `${path}:${line}` 能
   await store.openFile('E:\\P\\a.py');
   store.toggleBreakpoint('E:\\P\\a.py', 4);
 
-  expect(store.breakpoints.has(`${store.tabs()[0].path}:4`)).toBe(true);
+  // 落库 realpath 是反斜杠的，集合键与 breakpointsFor / cmBreakpoints.breakpointKey
+  // 同口径（pathKey 只统一分隔符）——两处必须共用同一把尺子（S3-T11 评审 F4）
+  expect(store.breakpoints.has('e:/p/a.py:4')).toBe(true);
+  expect(store.breakpoints.has(`${store.tabs()[0].path}:4`)).toBe(false);
   expect(store.breakpointsFor('E:\\P\\a.py')).toEqual([4]);
 });
 
