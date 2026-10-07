@@ -210,7 +210,8 @@ class LanServer:
     # 以及电脑操控权限扩张方法（Task 15，设计 18：手机只可查看状态与紧急停止，
     # 不得远程开启/暂停/恢复/确认安全检查）与 drain_js_queue（Task 13a 审查
     # Minor 1 的 fail-closed 默认裁决：LAN 排空 _js_queue 会偷走桌面事件并
-    # 可能消费关停哨兵）。
+    # 可能消费关停哨兵），以及交互式终端的写入/销毁类方法与 LSP 路径覆写
+    # （Task 17：见下方 pty_terminal_* 分组的「只读留、写入/销毁封」划界）。
     FORBIDDEN_METHODS = frozenset({
         # 窗口控制（桌面专属，手机无意义）
         "window_minimize", "window_toggle_maximize", "window_native_maximize",
@@ -239,6 +240,32 @@ class LanServer:
         # ide_run_file 往桌面常驻终端里写一行命令并回车（且支持 command= 原样透传），
         # 比 ide_write_file 更进一步——等于开放远程任意命令执行，同样 fail-closed。
         "ide_run_file",
+        # 交互式终端（底部面板常驻 shell，pty_terminal_*）。按「只读/查看/调尺寸」
+        # 与「写入/执行/销毁」划界——不能整组封：封了 write/kill 就必须留
+        # ensure/resize，否则手机端连终端输出都看不到（本组方法共 4 个，无
+        # clear/read 之类）。
+        #   保留放行（不列入本集合）：
+        #     pty_terminal_ensure —— 只确保会话存活（复用存活会话则原样返回，
+        #       不写入任何输入字节），手机端据此订阅 pty_data 事件看到桌面
+        #       终端同一屏输出；
+        #     pty_terminal_resize —— 只把 xterm 视口尺寸同步给 ConPTY，不改
+        #       终端内容与进程状态。
+        #   两者都是「查看」，与既有设计原则「手机只可查看状态与紧急停止」
+        #   完全一致，必须放行。
+        #   封禁：
+        #     pty_terminal_write —— 把任意字符串原样写进桌面常驻 shell，语义
+        #       就是远程任意命令执行；比已封的 ide_run_file 更直接（连文件
+        #       路径都不校验、不经 gui_path_access_allowed），是本次要封掉的
+        #       那条「远程执行任意命令」通道本体；
+        #     pty_terminal_kill —— 终止用户的常驻 shell（销毁桌面用户态会话，
+        #       正在跑的任务随之消失），属「销毁」类。
+        "pty_terminal_write", "pty_terminal_kill",
+        # 语言服务器可执行文件路径覆写（写配置类）：写盘 override 并立即
+        # recycle_all() 换掉正在使用的 LSP 进程——等价于让桌面下次启动任意
+        # 可执行文件，与已封的 ide_write_file / ide_save_layout 同边界（远程
+        # 改桌面持久状态），fail-closed。只读类 lsp_server_status / lsp_request
+        # / lsp_notify 与前端驱动的 lsp_sync_workspace 保持放行。
+        "lsp_set_server_path",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
