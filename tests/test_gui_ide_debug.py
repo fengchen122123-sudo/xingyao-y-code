@@ -14,6 +14,7 @@
 （先 `_resolve_real_path` 再 `gui_path_access_allowed`）。
 """
 
+import inspect
 import os
 import queue
 import subprocess
@@ -23,7 +24,9 @@ import time
 
 import pytest
 
+import gui_bridge
 from gui_bridge import JS_QUEUE_MAXSIZE, ApiBridge
+from core.ide import dap_manager
 from core.ide.debug_adapters import STDIO, AdapterProbe, AdapterSpec
 
 
@@ -463,8 +466,14 @@ def test_stop_clears_session_and_terminates(workspace, source_file, monkeypatch)
 
     res = bridge.ide_debug_stop()
 
-    assert res["ok"] is True and created[0].stopped is True
+    assert res["ok"] is True
+    # 会话引用当场放掉（同步），回收本身是异步投递的：有界等待回收线程跑完
+    # （`ide_debug_stop` 绝不阻塞唯一派发线程，见 test_stop_returns_without_waiting_for_reap）
     assert bridge._debug_session is None
+    deadline = time.monotonic() + 5.0
+    while not created[0].stopped and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert created[0].stopped is True
     assert bridge.ide_debug_stop()["ok"] is True  # 幂等
 
 
@@ -672,6 +681,158 @@ def test_shutdown_after_terminated_still_reaps(workspace):
         assert session.stopped is True
         assert bridge._debug_session is None
         assert bridge._debug_reapers == []
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# S3-T9 评审（第 0 步）：停止调试不得冻结唯一派发线程；关停兜底窗口要够；
+# 回收线程起不来也不能丢会话；关停超时后补一刀强杀进程树
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSession:
+    """记录「回收参数 + 回收发生在哪条线程」的会话替身（不带真实进程）。"""
+
+    def __init__(self):
+        self.graceful = None
+        self.reap_thread = ""
+
+    def is_alive(self):
+        return True
+
+    def _reap(self, graceful):
+        self.graceful = graceful
+        self.reap_thread = threading.current_thread().name
+
+    def stop(self):
+        # 有 _reap 时必须优先走 _reap：graceful=False 不做同步 disconnect
+        raise AssertionError("丢弃/关停路径不该调用 stop()（会发同步 disconnect 请求）")
+
+
+class _BlockingReapSession:
+    """回收会一直阻塞的会话替身：用来证明 `ide_debug_stop` 不同步等回收。"""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.graceful = None
+
+    def is_alive(self):
+        return True
+
+    def _reap(self, graceful):
+        self.graceful = graceful
+        self.entered.set()
+        self.release.wait(10.0)
+
+
+def test_stop_returns_without_waiting_for_reap(workspace):
+    """`ide_debug_stop` 跑在唯一的 `gui-js-dispatcher` 线程上，绝不同步等回收。
+
+    适配器卡住不回 disconnect 时同步 `stop()` 最坏 ≈15s，会把唯一派发线程占住 =
+    整个前端 UI 冻结，退出星瑶的链路也被拖慢（S3-T9 评审 Important）。
+    """
+    bridge = _make_bridge(workspace)
+    session = _BlockingReapSession()
+    bridge._debug_session = session
+
+    started = time.monotonic()
+    res = bridge.ide_debug_stop()
+    elapsed = time.monotonic() - started
+
+    try:
+        assert res["ok"] is True
+        # 同步部分只做「丢引用 + 投递」：必须远快于回收本身
+        assert bridge._debug_session is None
+        assert elapsed < 1.0, f"ide_debug_stop 同步等了回收（{elapsed:.2f}s）"
+        # 非阻塞 ≠ 不回收：回收确实被投递到另一条线程，且用 graceful=False
+        assert session.entered.wait(5.0) is True, "回收没有被投递出去"
+        assert session.graceful is False
+    finally:
+        session.release.set()
+
+
+def test_shutdown_reaps_without_graceful_disconnect(workspace):
+    """关停路径的回收走 `_reap(graceful=False)`：不发同步 disconnect，最坏耗时砍 5s。"""
+    bridge = _make_bridge(workspace)
+    session = _RecordingSession()
+    bridge._debug_session = session
+
+    bridge._shutdown_debug_session()
+
+    assert session.graceful is False
+    assert session.reap_thread == threading.current_thread().name
+
+
+def test_shutdown_join_window_covers_worst_case_reap(workspace):
+    """join 窗口必须 ≥ 一次 `_reap(graceful=False)` 的最坏耗时，否则适配器卡住时父进程
+    先退出、子进程成孤儿（S3-T9 评审 Important）。
+
+    最坏构成：`terminate()` 等适配器优雅退出 + 强杀进程树后 `wait(2.0)` +
+    `_join_threads()` 的 2.0 + 1.0。旧实现 join_timeout=5.0 既小于这个值，走的还是
+    `stop()`（额外再等 `_DISCONNECT_TIMEOUT=5.0`）→ 最坏 ≈15s。
+    """
+    terminate_default = inspect.signature(dap_manager.DapProcess.terminate).parameters["timeout"].default
+    worst_case = terminate_default + 2.0 + 2.0 + 1.0
+
+    default = inspect.signature(ApiBridge._shutdown_debug_session).parameters["join_timeout"].default
+
+    assert default == gui_bridge.DEBUG_REAP_JOIN_TIMEOUT
+    assert default >= worst_case, f"join 窗口 {default}s 小于最坏回收耗时 {worst_case}s"
+
+
+def test_reaper_start_failure_falls_back_to_inline_reap(workspace, monkeypatch):
+    """`Thread.start()` 抛 RuntimeError（线程资源耗尽）时不许丢会话、也不许留一条永远
+    不会启动的登记线程。
+
+    旧实现：锁内先 `self._debug_session = None` 并 append 线程，锁外才 `start()`——
+    start() 失败即会话引用已丢、无人回收，随后 `_shutdown_debug_session` 对未启动线程
+    `join()` 抛 "cannot join thread before it is started"，异常经 `ide_debug_start`
+    冒到前端，界面停在「运行中」而进程无人回收（S3-T9 评审 Important）。
+    """
+    bridge = _make_bridge(workspace)
+    session = _RecordingSession()
+    bridge._debug_session = session
+
+    real_thread = threading.Thread
+
+    class _BoomThread(real_thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(gui_bridge.threading, "Thread", _BoomThread)
+
+    bridge._discard_debug_session()  # 不许抛
+
+    assert bridge._debug_session is None
+    assert bridge._debug_reapers == []  # 未启动的登记被摘掉
+    # 退化为就地回收：graceful=False 不发同步请求，因此在派发/读线程上调用也安全
+    assert session.graceful is False
+    assert session.reap_thread == threading.current_thread().name
+    # 关停链路不会再炸（旧实现在这里抛 cannot join thread before it is started）
+    bridge._shutdown_debug_session()
+
+
+def test_shutdown_force_kills_after_join_timeout(workspace):
+    """join 到点仍未收完 → 补一刀强杀进程树，保证退出后不留调试器进程（S3-3）。"""
+    child = _sleeping_child()
+    assert child.poll() is None
+    try:
+        bridge = _make_bridge(workspace)
+
+        class _ProcessHolder:
+            _proc = child
+
+        session = _RecordingSession()
+        session._process = _ProcessHolder()  # `_force_kill_session_tree` 的取值口径
+        bridge._debug_session = session
+
+        bridge._shutdown_debug_session(join_timeout=0.0)
+
+        assert _wait_dead(child), "关停超时后没有补强杀，适配器子进程成了孤儿"
     finally:
         if child.poll() is None:
             child.kill()
