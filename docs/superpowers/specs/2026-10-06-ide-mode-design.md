@@ -390,3 +390,37 @@ sequenceDiagram
 | 前端包体积 | CM6 + 语言包 + LSP 客户端 | 全部动态 import；`build_release.py` 加体积门禁 |
 | WebView2 localStorage 丢数据 | 已确认的历史问题（`core/ui_layout.py` 文件头） | 关键状态走后端原子写 |
 | 快捷键冲突 | 现有 GUI 已占用部分快捷键 | 实现前先盘点现有绑定，新增绑定写进规格 |
+
+---
+
+## 12. 已接受的风险与已知边界
+
+本节记录 IDE 批次（S1–S3）在实现与评审中**已被明确接受**的风险与边界。它们不是待办清单，而是「当前就是这样」的事实陈述——动相关代码前先读本节，动完请同步更新这里。每条按「现象 / 影响 / 当前取舍 / 将来变更需同步的位置」四段写，行号按 HEAD `5f908fe` 核对。
+
+### 12.1 `pty_terminal_ensure` 冷启动时会真的 spawn 一个 shell
+
+- **现象**：LAN 黑名单（`core/lan_server.py:264`）只封了 `pty_terminal_write` / `pty_terminal_kill`，放行 `pty_terminal_ensure`（`gui_bridge.py:8272`）与 `pty_terminal_resize`（`gui_bridge.py:8323`）。放行注释（`core/lan_server.py:250-253`）把理由写成「只确保会话存活（复用存活会话则原样返回，不写入任何输入字节）」，只覆盖了**复用**那一半；冷启动（无存活会话）时 `pty_terminal_ensure` 会走 `create_pty_terminal`（`gui_bridge.py:8287-8293`）真正拉起一个 shell，cwd 取当前会话工作目录、GLOBAL 回退进程 cwd（`gui_bridge.py:8283-8285`），输出经 `pty_data` 推送。
+- **影响**：语义上手机端仍未获得任何终端输入通道——已核对 `pty_*` / `lsp_*` / `run_*` / `execute_*` 方法全集，能写进常驻 shell 的入口只有 `pty_terminal_write`（`gui_bridge.py:8302`）与 `ide_run_file` 内部的 `pty_terminal_write` 调用（`gui_bridge.py:8397`），销毁入口只有 `pty_terminal_kill`（`gui_bridge.py:8341`），三者均已在黑名单（`core/lan_server.py:244`、`:264`），「手机只可查看状态」这条边界没有被突破。实际影响是**副作用对用户可见**：一次 `pty_terminal_ensure` 就能让桌面凭空多出一个终端会话（cwd = 桌面当前会话工作目录），并改变桌面底部终端面板的 UI。
+- **当前取舍**：接受。不放行 `ensure` 手机端就看不到终端输出（本组方法共 4 个，没有独立的只读入口），而「能看到桌面终端同一屏输出」正是手机端终端面板存在的意义；为此接受「冷启动会真的 spawn」这一副作用。
+- **将来变更需同步的位置**：若决定把 `ensure` 也封掉，需同步手机端终端面板的可用性预期（冷启动场景下将没有输出可看，只能看已有会话），并更新 `core/lan_server.py:250-253` 的注释——把「创建」那一半补上，不要只写「复用」。`ensure` 的 cwd 语义若要收紧，改 `gui_bridge.py:8283-8285`。
+
+### 12.2 `pty_data` 把桌面终端的全部输出实时广播给手机（含回显）
+
+- **现象**：`pty_terminal_ensure` 创建会话时挂的 `on_output` 回调（`gui_bridge.py:8291`）把终端全部输出作为 `pty_data` 事件发出；`_emit_raw`（`gui_bridge.py:2094-2096`）对**所有**事件无条件 `lan.broadcast()`。`pty_data` 不在断线补发白名单里（`core/lan_server.py:41-50`），但实时广播照旧。终端输出天然包含**用户敲入内容的回显**，因此手机端看到的不只是程序输出。
+- **影响**：任何能连上 LAN 的**已配对**设备都能看到桌面终端的全部内容，包括用户在终端里敲的命令、交互式程序的提示与回显、以及误粘进终端的内容。这是既有行为（`pty_data` 早于本批 IDE 工作），本批未触及，本批的 `ide_run_file` / `pty_terminal_*` 只是让它更容易被注意到。
+- **当前取舍**：显式接受并记录，不做「过滤回显」也不做按设备粒度授权。理由：终端回显与程序输出在 ConPTY 输出里是同一串 ANSI 字节流，无法可靠区分，过滤必然误伤；而配对本身已是信任边界（能配对的设备本来就能调 `send_user_message`）。
+- **将来变更需同步的位置**：若要收紧，落点在广播入口 `gui_bridge.py:2094-2096`（按事件类型 / 设备授权过滤）与 `core/lan_server.py:41-50` 的白名单语义；不要只在 `gui_bridge.py:8291` 的 `on_output` 上做字符串过滤。
+
+### 12.3 `ideDebugStore` 的线程表已维护，但 `pauseDebug` 仍主动拉线程表
+
+- **现象**：`dap_thread` 事件通道已把线程 started / exited 接出来，`ideDebugStore` 据此维护 `threads` 表（`frontend/src/stores/ideDebugStore.ts:116`、`:277-285`），后端注释也据此写下「不必每次切线程都主动调 `ide_debug_threads` 拉全量表」（`core/ide/debug_session.py:448`）。但 `pauseDebug`（`frontend/src/stores/ideDebugStore.ts:409-417`）在 `threadId` 为 0 时仍然调 `api.ide_debug_threads()`（`:412-414`）——暂停时通常还没有 `dap_stopped`、`threadId` 就是 0，而适配器会把 `threadId: 0` 的 pause 拒成 "thread not found"。
+- **影响**：`allThreadsStopped`（`frontend/src/stores/ideDebugStore.ts:105`）、`hitBreakpointIds`（`:107`）、`stopDescription`（`:98`）、`threads`（`:116`）四个字段在 `frontend/src` 内除 `ideDebugStore.ts` 自身与 `ideDebugStore.test.ts` 外**零引用**（已全量核对）。也就是说 S3 那批「不必每次切线程都主动调 `ide_debug_threads`」的收益**尚未真正落地**，这四个状态当前是**为将来视图预留**的（后端 payload 已带全，将来要展示不必改后端）。
+- **当前取舍**：接受。`pauseDebug` 里这一次拉取是有意保留的**兜底**：它是「拿一个真实线程号」的唯一来源，删掉会让暂停在多线程适配器上直接失败。线程表字段先存不用，等线程列表视图落地再消费。
+- **将来变更需同步的位置**：消费点应在 `frontend/src/stores/ideDebugStore.ts` 的 `pauseDebug`（改为优先从 `threads` 取真实线程号）与（尚不存在的）线程列表视图；若改 `pauseDebug`，需同步 `frontend/src/components/DebugToolbar.test.ts:153` 的断言（当前断言「必须调过 `ide_debug_threads`」）。
+
+### 12.4 Hook trust 模型薄弱：user 级默认可信 + scope 由调用方自选
+
+- **现象**：`core/hooks/trust.py:149-163` 的 `status_for` 对 `scope == "user"` 直接返回 `TRUST_TRUSTED`（仅显式 revoke 后不可执行）；写入侧 `core/hooks/config_mutation.py:281` 的 `save_hook_config` → `_create_hook`（`:424`）**没有任何 trust 校验**，`scope` 完全由 payload 自选（`:437-445`，只校验取值是否属于 user / project）。
+- **影响**：只要能写一次 `~/.ycode/hooks.json`（scope 选 user），此后每次 SessionStart / PreToolUse / PostToolUse / Stop 都会长期执行任意命令，且不产生任何桌面确认。**写入路径不止 LAN 一条**——桌面端自身、插件、以及其它能触达该文件的通道都在这个模型内，所以这是信任模型的弱点，不是某个入口的漏洞。
+- **当前取舍**：本批**只在 LAN 入口封堵**：`save_hook` / `grant_hook_trust` 已进 LAN 黑名单（`core/lan_server.py:290`，桥方法见 `gui_bridge.py:7430` / `:7398`）。`grant_hook_trust` 是同一通道的另一半——给项目级 pending hook 授信同样等于远程放行任意 shell 命令，与已封的 `acknowledge_computer_safety` 同类。这是 fail-closed 的入口封堵，**不是**信任模型的修复；根因仍在，需单独评估（其它写入路径、插件、桌面端自身）。
+- **将来变更需同步的位置**：正确修法方向有两条（择一或并用）——① user 级 hook 也应需显式授信，即 `core/hooks/trust.py:160-163` 不再无条件返回 `TRUST_TRUSTED`；② `scope` 不得由调用方自选，即 `core/hooks/config_mutation.py:437-445` 改为按调用上下文固定，参照 `core/lan_server.py:310-312` 对 `turn_source` 的内部注入做法。改任一条都要：复核 `core/lan_server.py:290` 的黑名单注释（届时它从「唯一防线」降级为「纵深防御」）、核对 GUI hook 管理页表单与 `core/hooks/trust.py` 的状态机测试。
