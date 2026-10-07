@@ -192,9 +192,13 @@ export const useIdeDebugStore = defineStore('ideDebug', {
         this.stopReason = String(data.reason ?? 'breakpoint');
         this.threadId = Number(data.thread_id ?? 0);
         this.selectedFrameId = Number(data.frame_id ?? 0);
+        // 顺序不能反：`_clearPauseDetail` 会把停止位置一并清掉（S3-T12）
+        this._clearPauseDetail();
+        // 老桥 / 夹具可能直接带 path,line（兼容保留）；真实后端发出的 dap_stopped
+        // 只带 thread_id / frame_id，行号由 locateStopPosition 拉栈顶帧补上
         this.stopPath = String(data.path ?? '');
         this.stopLine = Number(data.line ?? 0);
-        this._clearPauseDetail();
+        void this.locateStopPosition();
         return;
       }
       if (type === 'dap_continued') {
@@ -223,7 +227,7 @@ export const useIdeDebugStore = defineStore('ideDebug', {
     },
 
     /**
-     * 清空「暂停现场」（栈帧 / 作用域 / 变量）。
+     * 清空「暂停现场」（栈帧 / 作用域 / 变量 / 停止位置）。
      *
      * 幂等要求：只在非空时换新数组，重复到达的同一条 dap_stopped / dap_continued /
      * dap_terminated 不产生新的数组引用——否则每次重复事件都换一次引用，白触发
@@ -237,6 +241,10 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       if (this.varPath.length) this.varPath = [];
       if (this.activeScopeRef) this.activeScopeRef = 0;
       if (Object.keys(this.varCache).length) this.varCache = {};
+      // 停止位置（执行行高亮的行号来源）同属「暂停现场」：不清掉，编辑器的高亮会留在
+      // 已经跑过去的那一行上（继续 / 结束都必须把高亮收掉）
+      if (this.stopPath) this.stopPath = '';
+      if (this.stopLine) this.stopLine = 0;
     },
 
     reset() {
@@ -341,6 +349,38 @@ export const useIdeDebugStore = defineStore('ideDebug', {
         delete this.breakpointStates[key];
       }
       if (this.sessionId) await this.setBreakpointsFor(path);
+    },
+
+    /**
+     * 取「停在哪一行」（S3-T12 接线）。
+     *
+     * 后端 `dap_stopped` 只带 `thread_id` / `frame_id`（core/ide/debug_session.py 的
+     * `_emit_stopped`），既不带行号也不带 `hitBreakpointIds`，所以位置必须由前端自己取：
+     * 收到事件后拉一次调用栈，用**栈顶帧**补上 `stopPath` / `stopLine`，编辑器据此高亮
+     * 当前执行行。不改后端契约，把改动面留在前端。
+     *
+     * 迟到的响应绝不写状态：用户可能在 IPC 返回前就继续 / 停止，那时暂停现场已经结束，
+     * 再写位置会把编辑器的高亮留在已经跑过去的行上。
+     */
+    async locateStopPosition() {
+      const api = debugApi();
+      const threadId = this.threadId;
+      if (!api?.ide_debug_stack_trace || !threadId) return;
+      let res: { frames?: DapStackFrame[] } | undefined;
+      try {
+        res = await api.ide_debug_stack_trace(threadId, 20);
+      } catch {
+        // 取位置失败只是没有执行行高亮，不影响「已暂停」这件事本身
+        return;
+      }
+      if (this.debugState !== 'paused' || this.threadId !== threadId) return;
+      const frames = (res?.frames ?? []) as DapStackFrame[];
+      const top = frames[0];
+      if (!top) return;
+      this.stopPath = String(top.path ?? '');
+      this.stopLine = Number(top.line ?? 0);
+      // 帧列表一并填上：调试面板的「调用栈」不用等用户点刷新
+      this.frames = frames;
     },
 
     async refreshFrames() {

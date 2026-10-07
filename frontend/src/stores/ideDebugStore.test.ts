@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
+import { flushPromises } from '@vue/test-utils';
 
 import { useIdeDebugStore } from './ideDebugStore';
 import { useIdeStore } from './ideStore';
@@ -37,6 +38,56 @@ describe('ideDebugStore 事件归约', () => {
     expect(store.selectedFrameId).toBe(1001);
     expect(store.stopPath).toBe('E:/p/app.py');
     expect(store.stopLine).toBe(7);
+  });
+
+  it('dap_stopped 不带行号时用栈顶帧补上停止位置，会话结束即清除（S3-T12）', async () => {
+    api.ide_debug_stack_trace.mockResolvedValue({
+      ok: true,
+      frames: [
+        { id: 1001, name: 'main', path: 'E:/p/app.py', line: 12, column: 1 },
+        { id: 1002, name: 'helper', path: 'E:/p/helper.py', line: 3, column: 1 },
+      ],
+    });
+    const store = useIdeDebugStore();
+
+    // 后端 dap_stopped 只有 thread_id / frame_id：事件到手时行号还是未知的
+    store.reduceDapEvent('dap_stopped', { session_id: 'dap-1', thread_id: 1, frame_id: 1001 });
+    expect(store.stopPath).toBe('');
+    expect(store.stopLine).toBe(0);
+
+    await flushPromises();
+
+    expect(api.ide_debug_stack_trace).toHaveBeenCalledWith(1, 20);
+    expect(store.stopPath).toBe('E:/p/app.py');
+    expect(store.stopLine).toBe(12);
+    // 帧列表一并填上：调试面板的调用栈不用等用户点刷新
+    expect(store.frames.map((frame) => frame.id)).toEqual([1001, 1002]);
+
+    // 会话结束：位置清掉，编辑器据此收掉执行行高亮
+    store.reduceDapEvent('dap_terminated', { session_id: 'dap-1' });
+    expect(store.stopPath).toBe('');
+    expect(store.stopLine).toBe(0);
+  });
+
+  it('暂停在栈响应回来之前结束：迟到的位置不写状态（不留高亮）', async () => {
+    let release: (value: unknown) => void = () => {};
+    api.ide_debug_stack_trace.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const store = useIdeDebugStore();
+
+    store.reduceDapEvent('dap_stopped', { session_id: 'dap-1', thread_id: 1, frame_id: 1001 });
+    store.reduceDapEvent('dap_continued', { session_id: 'dap-1', thread_id: 1 });
+    release({ ok: true, frames: [{ id: 1001, name: 'main', path: 'E:/p/app.py', line: 12, column: 1 }] });
+    await flushPromises();
+
+    expect(store.debugState).toBe('running');
+    expect(store.stopPath).toBe('');
+    expect(store.stopLine).toBe(0);
+    expect(store.frames).toEqual([]);
   });
 
   it('clears pause info on continue and terminated', () => {

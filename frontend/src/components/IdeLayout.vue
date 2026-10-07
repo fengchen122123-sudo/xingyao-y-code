@@ -36,8 +36,11 @@
       <div v-if="!ide.tabs().length" class="ide-empty-main">从左侧文件树打开文件</div>
       <EditorPane v-else :key="ide.activePath()" :path="ide.activePath()" />
 
-      <div class="ide-bottom" :style="{ height: bottomHeight + 'px' }">
-        <BottomPanel v-if="ide.bottomPanelOpen" @close="ide.toggleBottomPanel()" />
+      <!-- v-show 而非 v-if（S3-T12 接线）：底部面板收起期间必须保持挂载——调试控制台
+           的行缓冲、断点 gutter 与执行行高亮都活在组件里，v-if 卸载会把它们一并丢掉，
+           与「收起期间调试输出不丢」冲突。隐藏的是外面这层定高容器，所以收起后不占高度。 -->
+      <div v-show="ide.bottomPanelOpen" class="ide-bottom" :style="{ height: bottomHeight + 'px' }">
+        <BottomPanel @close="ide.toggleBottomPanel()" />
       </div>
       <div v-if="!ide.bottomPanelOpen" class="ide-bottom-open">
         <button type="button" class="icon-btn" @click="ide.toggleBottomPanel()">显示面板</button>
