@@ -4,6 +4,9 @@ import { useGitStore } from './gitStore';
 // IDE 已打开文件的外部改动事件转发（ide_file_changed）；
 // ideStore 只依赖 editor/setup 与类型声明，不反向依赖 appStore，无环
 import { useIdeStore } from './ideStore';
+// 调试会话状态仓（S3-T8）：dap_* 事件统一进这里归约；ideDebugStore 只依赖
+// ideStore 与 utils/dapBus，不反向依赖 appStore，无环
+import { useIdeDebugStore } from './ideDebugStore';
 // LSP 事件（lsp_status / lsp_diagnostics）转发：桥事件的唯一赋值点在本 store 的
 // handleBridgeEvent，LSP 事件同样接进那条链（editor/lsp 不反向依赖 stores，无环）
 import { dispatchLspEvent } from '../editor/lsp';
@@ -50,6 +53,8 @@ import type {
   TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
+// 调试适配器输出旁路总线（S3-T8）：高频原始输出不进响应式状态
+import { emitDapOutput } from '../utils/dapBus';
 import { isMarkdownFilePath, toFileUrl } from '../utils/localPath';
 import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 // 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
@@ -4537,6 +4542,20 @@ navItems: [] as Array<{ id: number; preview: string }>,
         dispatchLspEvent(type, data);
       } else if (type === 'pty_exit') {
         emitPtyExit(Number(data.code ?? 0));
+      } else if (type === 'dap_output') {
+        // 调试适配器输出（S3-T8）：与 pty_data 同口径，高频原始文本走总线，
+        // 只做分流、不进 ideDebugStore 的响应式状态
+        emitDapOutput({
+          session_id: String(data.session_id ?? ''),
+          category: String(data.category ?? 'stdout'),
+          text: String(data.text ?? ''),
+        });
+      } else if (type.startsWith('dap_')) {
+        // 调试会话状态事件（dap_stopped / dap_terminated / dap_continued / dap_exited /
+        // dap_breakpoint_changed / dap_status）统一进 ideDebugStore 归约（与 gitStore
+        // 同范式）。这里和 lsp_* 一样必须接进本函数这条既有 type-if 链：它是
+        // window.onBridgeEvent 的唯一赋值点，另开通道等于绕开单消费者约定。
+        useIdeDebugStore().reduceDapEvent(type, data);
       } else if (type === 'update_download_progress') {
         this.updateState.status = 'downloading';
         this.updateState.downloadProgress = Number(data.percent) || 0;
