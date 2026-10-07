@@ -7,6 +7,12 @@ core/gui_terminal.py:62 resolve_shell_command 决定：Windows 上是 PowerShell
 项目配置读取顺序：.vscode/launch.json 的 program（编译型语言唯一可运行入口）
 → package.json 的 scripts.start / scripts.dev → 语言默认命令。
 
+launch.json 里的 program / runtimeExecutable / args 会先展开 VS Code 变量再使用：
+VS Code 生成的默认配置几乎都写 `${workspaceFolder}/...`，而命令最终进入 PowerShell，
+单引号内的 `${...}` 不会展开——不展开就等于把字面量 `${workspaceFolder}/app.py`
+当路径用，必然"文件不存在"。无法识别的变量（如 `${env:PATH}`）不原样透传，而是
+给出中文原因并回退到语言默认命令。
+
 配置读不出来或读不懂时**不失败**：回退到语言默认命令，并把原因写进 `RunPlan.note`
 （中文，可直接展示），用户据此知道下一步该改哪个文件。
 """
@@ -15,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -112,31 +119,129 @@ def _nearest_config(name: str, start_dir: str, workspace: str) -> str:
         current = parent
 
 
-def _match_launch_config(path: str, configs: List[Any]) -> Optional[Dict[str, Any]]:
-    """严格匹配：program 与当前文件同路径，或 basename 同名（launch.json 常写相对路径）。"""
-    base = os.path.normcase(os.path.basename(path))
-    target = os.path.normcase(os.path.abspath(path))
-    for item in configs:
-        if not isinstance(item, dict):
-            continue
-        program = str(item.get("program") or "")
-        if not program:
-            continue
-        if os.path.isabs(program) and os.path.normcase(os.path.abspath(program)) == target:
-            return item
-        if os.path.normcase(os.path.basename(program)) == base:
-            return item
-    return None
+# launch.json 里支持的 VS Code 变量（以工作区与"当前文件"为基准展开）。
+# 前三个是 VS Code 默认生成的配置最常用的写法；file 系列让
+# "${workspaceFolder}/build/${fileBasenameNoExtension}.exe" 这类 C/C++ 默认
+# 模板也能解析出真实路径。
+_LAUNCH_VARIABLE_NAMES = (
+    "workspaceFolder",
+    "workspaceFolderBasename",
+    "file",
+    "fileBasename",
+    "fileBasenameNoExtension",
+    "fileDirname",
+    "fileExtname",
+)
+
+_VARIABLE_PATTERN = re.compile(r"\$\{([^}]*)\}")
 
 
-def _build_config_command(item: Dict[str, Any]) -> str:
-    """把一条 configuration 变成命令行：runtimeExecutable（可选）+ program + args。"""
-    program = str(item.get("program") or "")
-    runtime = str(item.get("runtimeExecutable") or "")
+def _expand_launch_variables(text: str, path: str, workspace: str) -> Tuple[str, str]:
+    """展开 launch.json 字段里的 VS Code 变量。
+
+    返回 `(展开结果, 问题说明)`：问题说明为空串表示全部变量都认得；非空时是可直接
+    展示的中文原因（列出了认不出来的变量名），调用方必须放弃这条配置而不是把
+    `${...}` 透传进终端——PowerShell 单引号里不会展开变量，透传的结果是"路径不存在"。
+
+    `${workspaceFolder}` 以会话工作区为基准；GLOBAL 自由对话没有工作区概念，退化为
+    当前文件所在目录（用户至少能跑到自己点开的那个文件）。
+    """
+    raw = str(text or "")
+    if "${" not in raw:
+        return raw, ""
+    real_file = os.path.abspath(str(path or ""))
+    base = str(workspace or "")
+    if not base or base == "GLOBAL" or not os.path.isdir(base):
+        base = os.path.dirname(real_file)
+    workspace_dir = os.path.abspath(base)
+    basename = os.path.basename(real_file)
+    stem, extension = os.path.splitext(basename)
+    values = {
+        "workspaceFolder": workspace_dir,
+        "workspaceFolderBasename": os.path.basename(workspace_dir),
+        "file": real_file,
+        "fileBasename": basename,
+        "fileBasenameNoExtension": stem,
+        "fileDirname": os.path.dirname(real_file),
+        "fileExtname": extension,
+    }
+    unknown: List[str] = []
+
+    def _replace(match: "re.Match[str]") -> str:
+        name = match.group(1).strip()
+        if name in values:
+            return values[name]
+        unknown.append("${" + name + "}" if name else "空变量 `${}`")
+        return match.group(0)
+
+    expanded = _VARIABLE_PATTERN.sub(_replace, raw)
+    if unknown:
+        supported = "、".join("${" + name + "}" for name in _LAUNCH_VARIABLE_NAMES)
+        return expanded, f"变量 {'、'.join(sorted(set(unknown)))} 无法识别（只支持 {supported}）"
+    return expanded, ""
+
+
+def _expand_launch_config(
+    item: Dict[str, Any], path: str, workspace: str
+) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """展开一条 configuration 的 program / runtimeExecutable / args。
+
+    返回 `(展开后的字段, 问题说明, 部分展开的 program)`；问题说明非空时第一个元素为
+    None，表示这条配置不可用（含无法识别的变量），调用方据此回退并展示中文原因；
+    第三个元素用于"这条配置本来匹配当前文件、只是变量解析不了"的精确诊断。
+    """
     raw_args = item.get("args")
-    extra = [str(arg) for arg in raw_args] if isinstance(raw_args, (list, tuple)) else []
+    args_raw = [str(arg) for arg in raw_args] if isinstance(raw_args, (list, tuple)) else []
+    problems: List[str] = []
+
+    def _expand(value: str) -> str:
+        expanded, problem = _expand_launch_variables(value, path, workspace)
+        if problem:
+            problems.append(problem)
+        return expanded
+
+    program = _expand(str(item.get("program") or ""))
+    runtime = _expand(str(item.get("runtimeExecutable") or ""))
+    args = [_expand(arg) for arg in args_raw]
+    # program / runtimeExecutable 是路径：${workspaceFolder}/build/app.exe 展开后
+    # 混着正斜杠，normpath 统一成 Windows 分隔符（args 是参数，不能动）。
+    program_path = os.path.normpath(program)
+    if problems:
+        return None, "；".join(sorted(set(problems))), program_path
+    return {
+        "program": program_path,
+        "runtimeExecutable": os.path.normpath(runtime) if runtime else "",
+        "args": args,
+    }, "", program_path
+
+
+def _program_matches(path: str, program: str) -> bool:
+    """展开后的 program 是否指向当前文件：绝对路径同一，或 basename 同名。
+
+    必须先展开再比对：VS Code 会把 program 写成 `${file}` / `${fileBasename}`，
+    字面量 basename 永远与文件名不同名，展开后比对才能匹配上。
+    """
+    if not program:
+        return False
+    if os.path.isabs(program) and os.path.normcase(os.path.abspath(program)) == os.path.normcase(
+        os.path.abspath(path)
+    ):
+        return True
+    return os.path.normcase(os.path.basename(program)) == os.path.normcase(os.path.basename(path))
+
+
+def _build_config_command(values: Dict[str, Any]) -> str:
+    """把展开好的一条 configuration 变成命令行：runtimeExecutable（可选）+ program + args。
+
+    统一 PowerShell 语法：`& ` 显式调用 + 单引号引用。**不能省略 `& `**：PowerShell
+    把「以引号字符串开头的语句」当字符串表达式求值并回显，用户点运行后终端只会打印
+    一行路径、程序不会启动（launch.json 是 C/C++ 唯一可运行入口，必现）。
+    """
+    program = str(values.get("program") or "")
+    runtime = str(values.get("runtimeExecutable") or "")
+    args = [str(arg) for arg in (values.get("args") or [])]
     return " ".join(
-        [*(_quote(runtime) if runtime else "",), _quote(program), *[_quote(arg) for arg in extra]]
+        ["&", *([_quote(runtime)] if runtime else []), _quote(program), *[_quote(arg) for arg in args]]
     ).strip()
 
 
@@ -162,29 +267,60 @@ def _launch_json_plan(
             "`.vscode/launch.json` 里的 configurations 字段缺失或不是数组，已改用语言默认命令运行"
         )
         return None
-    matched = _match_launch_config(path, configs)
+    # 先展开所有「配了 program」的 configuration：匹配与命令拼装都基于展开后的值
+    entries: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]], str, str]] = []
+    for item in configs:
+        if not isinstance(item, dict) or not str(item.get("program") or ""):
+            continue
+        values, problem, partial = _expand_launch_config(item, path, workspace)
+        entries.append((item, values, problem, partial))
+    matched = next(
+        (
+            entry for entry in entries
+            if not entry[2] and _program_matches(path, (entry[1] or {}).get("program") or "")
+        ),
+        None,
+    )
     if matched is None and language_id in COMPILED_LANGUAGES:
         # 编译型语言的可运行入口是编译产物（build/app.exe），文件名天然与源码不同名：
         # 没有严格匹配时取第一个配了 program 的 configuration（用户机器上通常只有一条）。
-        matched = next(
-            (
-                item for item in configs
-                if isinstance(item, dict) and str(item.get("program") or "")
-            ),
-            None,
-        )
+        matched = entries[0] if entries else None
         if matched is not None:
             notes.append(
                 f"`.vscode/launch.json` 里没有与 {os.path.basename(path)} 同名的 program，"
-                f"已改用第一个配置「{str(matched.get('name') or '未命名')}」里的 program"
+                f"已改用第一个配置「{str(matched[0].get('name') or '未命名')}」里的 program"
             )
     if matched is None:
+        # 有一条配置本来就指的是当前文件、只是变量解析不了：点名这条配置，用户才知道改哪个
+        broken = next(
+            (entry for entry in entries if entry[2] and _program_matches(path, entry[3])), None
+        )
+        if broken is not None:
+            notes.append(
+                f"`.vscode/launch.json` 配置「{str(broken[0].get('name') or '未命名')}」的 program "
+                f"无法解析：{broken[2]}，已改用语言默认命令运行"
+            )
+            return None
+        problems = sorted({entry[2] for entry in entries if entry[2]})
+        if problems:
+            notes.append(
+                f"`.vscode/launch.json` 的 program 无法解析：{'；'.join(problems)}，"
+                "已改用语言默认命令运行"
+            )
+        else:
+            notes.append(
+                "`.vscode/launch.json` 里没有配置匹配当前文件的 program，已改用语言默认命令运行"
+            )
+        return None
+    item, values, problem, _partial = matched
+    if problem or not values:
         notes.append(
-            "`.vscode/launch.json` 里没有配置匹配当前文件的 program，已改用语言默认命令运行"
+            f"`.vscode/launch.json` 配置「{str(item.get('name') or '未命名')}」的 program 无法解析："
+            f"{problem or 'program 展开后为空'}，已改用语言默认命令运行"
         )
         return None
     return RunPlan(
-        command=_build_config_command(matched),
+        command=_build_config_command(values),
         source="launch.json",
         language_id=language_id,
     )
@@ -287,9 +423,10 @@ def build_run_plan(
         bash = _require_executable("bash", "bash")
         return RunPlan(command=_append_args(f"& {_quote(bash)} {_quote(real)}", extra_args), source="language", language_id=language_id, note=note)
 
+    hint = f"（{'；'.join(notes)}）" if notes else ""
     raise RunPlanError(
         f"{extension} 是编译型语言，需要先编译出可执行文件，"
-        "并在 .vscode/launch.json 里配置 program（或手动在终端运行）"
+        f"并在 .vscode/launch.json 里配置 program（或手动在终端运行）{hint}"
     )
 
 
