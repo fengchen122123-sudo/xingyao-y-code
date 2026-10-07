@@ -333,6 +333,113 @@ describe('ideDebugStore 会话归属（S3-T10 评审）', () => {
   });
 });
 
+describe('ideDebugStore 线程表与 dap_stopped 新字段（S3-T4 评审补）', () => {
+  it('dap_thread 的 started/exited 增删线程表，重复 started 不追加第二条', () => {
+    const store = useIdeDebugStore();
+
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: 5 });
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: 7 });
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: 5 });
+
+    expect(store.threads.map((thread) => thread.id)).toEqual([5, 7]);
+
+    store.reduceDapEvent('dap_thread', { reason: 'exited', thread_id: 5 });
+
+    expect(store.threads.map((thread) => thread.id)).toEqual([7]);
+
+    // 未知线程的 exited 不动表；再退一次同一线程也不动
+    store.reduceDapEvent('dap_thread', { reason: 'exited', thread_id: 99 });
+    store.reduceDapEvent('dap_thread', { reason: 'exited', thread_id: 7 });
+    const threads = store.threads;
+    store.reduceDapEvent('dap_thread', { reason: 'exited', thread_id: 7 });
+    expect(store.threads).toBe(threads);
+    expect(store.threads).toEqual([]);
+  });
+
+  it('线程号缺失或非法的事件被丢弃，不往线程表塞垃圾项', () => {
+    const store = useIdeDebugStore();
+
+    store.reduceDapEvent('dap_thread', { reason: 'started' });
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: 0 });
+    // 后端在 threadId 畸形时退化成 0，前端同样按 0 丢弃
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: Number.NaN });
+
+    expect(store.threads).toEqual([]);
+  });
+
+  it('dap_process 起来时清空上一进程的线程表，会话结束 / 重置同样清空', () => {
+    const store = useIdeDebugStore();
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: 5 });
+    expect(store.threads.length).toBe(1);
+
+    // 新进程：旧线程号一律失效
+    store.reduceDapEvent('dap_process', { name: 'app.py', system_process_id: 42 });
+    expect(store.threads).toEqual([]);
+
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: 9 });
+    store.reduceDapEvent('dap_exited', { session_id: 'dap-1', exit_code: 0 });
+    expect(store.threads).toEqual([]);
+
+    store.reduceDapEvent('dap_thread', { reason: 'started', thread_id: 11 });
+    store.reset();
+    expect(store.threads).toEqual([]);
+  });
+
+  it('dap_stopped 落库 all_threads_stopped / hit_breakpoint_ids / description', () => {
+    const store = useIdeDebugStore();
+
+    store.reduceDapEvent('dap_stopped', {
+      session_id: 'dap-1',
+      reason: 'exception',
+      thread_id: 2,
+      frame_id: 1001,
+      all_threads_stopped: true,
+      hit_breakpoint_ids: [3, 9],
+      description: 'ZeroDivisionError: division by zero',
+    });
+
+    expect(store.allThreadsStopped).toBe(true);
+    expect(store.hitBreakpointIds).toEqual([3, 9]);
+    expect(store.stopDescription).toBe('ZeroDivisionError: division by zero');
+    expect(store.debugState).toBe('paused');
+  });
+
+  it('老后端不发新字段时落到缺省值，既有行为不变（向后兼容）', () => {
+    const store = useIdeDebugStore();
+
+    store.reduceDapEvent('dap_stopped', { session_id: 'dap-1', thread_id: 1, frame_id: 1001, line: 7 });
+
+    expect(store.allThreadsStopped).toBe(false);
+    expect(store.hitBreakpointIds).toEqual([]);
+    expect(store.stopDescription).toBe('');
+    expect(store.debugState).toBe('paused');
+    expect(store.stopLine).toBe(7);
+    expect(store.threadId).toBe(1);
+  });
+
+  it('继续执行 / 结束时新字段随暂停现场一起清空', () => {
+    const store = useIdeDebugStore();
+
+    store.reduceDapEvent('dap_stopped', {
+      thread_id: 2, frame_id: 1, all_threads_stopped: true, hit_breakpoint_ids: [3],
+      description: 'boom',
+    });
+    store.reduceDapEvent('dap_continued', { thread_id: 2 });
+
+    expect(store.allThreadsStopped).toBe(false);
+    expect(store.hitBreakpointIds).toEqual([]);
+    expect(store.stopDescription).toBe('');
+
+    store.reduceDapEvent('dap_stopped', {
+      thread_id: 2, frame_id: 1, all_threads_stopped: true, hit_breakpoint_ids: [3], description: 'boom',
+    });
+    store.reduceDapEvent('dap_terminated', { session_id: 'dap-1' });
+
+    expect(store.allThreadsStopped).toBe(false);
+    expect(store.hitBreakpointIds).toEqual([]);
+    expect(store.stopDescription).toBe('');
+  });
+});
 describe('ideDebugStore 变量按作用域归属与层级回退（S3-T10 评审）', () => {
   const twoScopes = [
     { name: 'Locals', variablesReference: 2001, expensive: false },

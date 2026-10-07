@@ -55,6 +55,22 @@ export interface DapEventPayload {
   verified?: boolean;
   category?: string;
   text?: string;
+  /** `dap_stopped`：是否所有线程都已停止（DAP allThreadsStopped） */
+  all_threads_stopped?: boolean;
+  /** `dap_stopped`：本次停止命中的断点 id（DAP hitBreakpointIds） */
+  hit_breakpoint_ids?: number[];
+  /** `dap_stopped`：停止原因的人类可读说明（DAP description，异常/信号才有） */
+  description?: string;
+  /** `dap_process`：被调试进程名（后端 `name`，目前没有 UI 渲染，保留契约） */
+  name?: string;
+  /** `dap_process`：被调试进程的系统进程号（后端 `system_process_id`） */
+  system_process_id?: number;
+}
+
+/** 线程表条目：形状与 `ide_debug_threads()` 的返回对齐，便于「切线程看栈」两处数据通用。 */
+export interface DapThread {
+  id: number;
+  name: string;
 }
 
 /** 调试桥句柄：与 appStore._ptyApi 同口径，桥未就绪时返回 null。 */
@@ -75,6 +91,29 @@ export const useIdeDebugStore = defineStore('ideDebug', {
     threadId: 0,
     stopPath: '',
     stopLine: 0,
+    /**
+     * 当前暂停线程的停止原因说明（DAP `description`，异常/信号这类 reason 才有）。
+     * 与 `stopReason` 同为「暂停现场」，随继续/结束一起清掉。
+     */
+    stopDescription: '',
+    /**
+     * 本次停止是否所有线程都停了（DAP `allThreadsStopped`）。
+     *
+     * 老后端不发这个字段时落到 `false`：DAP 里缺省即「没声明全停」，前端行为因此不变差
+     * （单线程调试里它恒为 false，没有任何分支依赖它才能工作）。
+     */
+    allThreadsStopped: false,
+    /** 本次停止命中的断点 id（DAP `hitBreakpointIds`）：断点命中高亮/对账的数据源。 */
+    hitBreakpointIds: [] as number[],
+    /**
+     * 适配器线程表：由 `dap_thread` 的 started / exited 事件增删（不再靠主动轮询）。
+     *
+     * DAP 的 thread 事件只带线程号、不带名字，所以事件建出来的条目 `name` 是空串；
+     * 需要名字的地方仍可调 `ide_debug_threads()`（返回 `{id, name}`），两者形状一致，
+     * 按 id 合并即可。线程号只在**一个被调试进程**内有效，进程换了（`dap_process`）
+     * 或会话结束（`dap_exited` / `dap_terminated` / `reset`）时整表失效。
+     */
+    threads: [] as DapThread[],
     frames: [] as DapStackFrame[],
     selectedFrameId: 0,
     scopes: [] as DapScopeItem[],
@@ -198,6 +237,16 @@ export const useIdeDebugStore = defineStore('ideDebug', {
         // 只带 thread_id / frame_id，行号由 locateStopPosition 拉栈顶帧补上
         this.stopPath = String(data.path ?? '');
         this.stopLine = Number(data.line ?? 0);
+        // DAP stopped 本体透传过来的三个字段（S3-T4 评审补）。老后端（或适配器）没带时
+        // 落到缺省值 false / [] / ''，与「适配器没带」同义——新增字段只做加法，
+        // 没有任何既有分支依赖它们才能工作
+        this.allThreadsStopped = Boolean(data.all_threads_stopped);
+        this.hitBreakpointIds = Array.isArray(data.hit_breakpoint_ids)
+          ? data.hit_breakpoint_ids
+              .map((id) => Number(id))
+              .filter((id) => Number.isFinite(id))
+          : [];
+        this.stopDescription = String(data.description ?? '');
         void this.locateStopPosition();
         return;
       }
@@ -216,6 +265,33 @@ export const useIdeDebugStore = defineStore('ideDebug', {
         this._forgetCurrentSession();
         this.selectedFrameId = 0;
         this._clearPauseDetail();
+        // 进程没了：线程表整表失效（线程号只在进程内有意义）
+        if (this.threads.length) this.threads = [];
+        return;
+      }
+      if (type === 'dap_thread') {
+        // 线程表增量：started 加、exited 删。0 不是合法线程号（后端在 threadId
+        // 缺失/畸形时退化成 0），直接丢弃，不往列表里塞垃圾项
+        const id = Number(data.thread_id ?? 0);
+        if (id > 0) {
+          if (String(data.reason ?? 'started') === 'exited') {
+            if (this.threads.some((thread) => thread.id === id)) {
+              this.threads = this.threads.filter((thread) => thread.id !== id);
+            }
+          } else if (!this.threads.some((thread) => thread.id === id)) {
+            // 事件通道不带线程名（DAP 的 thread 事件只有线程号），名字由
+            // ide_debug_threads() 补；重复 started 不追加第二条
+            this.threads = [...this.threads, { id, name: '' }];
+          }
+        }
+        return;
+      }
+      if (type === 'dap_process') {
+        // 新的被调试进程起来了：上一进程的线程号一律失效，先清空线程表，
+        // 随后的 dap_thread started 会把新进程的线程填回来（「进程结束」那一半
+        // 由既有 dap_exited / dap_terminated 处理）。name / pid 目前没有 UI 消费，
+        // 不新增无人渲染的状态字段（后端 payload 里带着，将来要展示不必改后端）
+        if (this.threads.length) this.threads = [];
         return;
       }
       if (type === 'dap_breakpoint_changed') {
@@ -224,6 +300,8 @@ export const useIdeDebugStore = defineStore('ideDebug', {
         if (path && line > 0) this.breakpointStates[breakpointKey(path, line)] = Boolean(data.verified);
       }
       // 其余 dap_*（含未知事件）静默忽略：桥可能先于前端加新事件，不能让未知类型抛错
+      // （`dap_loaded_source` 就在这里：已加载源文件暂无面板消费，但后端已接出来，
+      //   将来加「已加载脚本」视图不必再动 core 层）
     },
 
     /**
@@ -245,6 +323,11 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       // 已经跑过去的那一行上（继续 / 结束都必须把高亮收掉）
       if (this.stopPath) this.stopPath = '';
       if (this.stopLine) this.stopLine = 0;
+      // 停止原因说明 / 命中断点 / 全停标记同属「暂停现场」：继续之后它们描述的那次
+      // 停止已经过去了，留着只会让面板显示上一次的异常说明
+      if (this.stopDescription) this.stopDescription = '';
+      if (this.hitBreakpointIds.length) this.hitBreakpointIds = [];
+      if (this.allThreadsStopped) this.allThreadsStopped = false;
     },
 
     reset() {
@@ -257,6 +340,11 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       this.threadId = 0;
       this.stopPath = '';
       this.stopLine = 0;
+      this.stopDescription = '';
+      this.allThreadsStopped = false;
+      this.hitBreakpointIds = [];
+      // 线程号只在一次会话内有意义：整表清掉，新会话的 dap_thread started 重新填
+      this.threads = [];
       this.frames = [];
       this.selectedFrameId = 0;
       this.scopes = [];
@@ -354,10 +442,10 @@ export const useIdeDebugStore = defineStore('ideDebug', {
     /**
      * 取「停在哪一行」（S3-T12 接线）。
      *
-     * 后端 `dap_stopped` 只带 `thread_id` / `frame_id`（core/ide/debug_session.py 的
-     * `_emit_stopped`），既不带行号也不带 `hitBreakpointIds`，所以位置必须由前端自己取：
-     * 收到事件后拉一次调用栈，用**栈顶帧**补上 `stopPath` / `stopLine`，编辑器据此高亮
-     * 当前执行行。不改后端契约，把改动面留在前端。
+     * 后端 `dap_stopped` 带 `thread_id` / `frame_id` 与栈顶帧的位置（S3-T4 起还带
+     * `all_threads_stopped` / `hit_breakpoint_ids` / `description`），但行号仍以这里
+     * 拉到的调用栈为准：后端取栈顶帧失败时会退化成空位置，前端自己再取一次能补上，
+     * 编辑器据此高亮当前执行行。
      *
      * 迟到的响应绝不写状态：用户可能在 IPC 返回前就继续 / 停止，那时暂停现场已经结束，
      * 再写位置会把编辑器的高亮留在已经跑过去的行上。

@@ -453,3 +453,128 @@ def test_no_stale_stopped_event_after_session_closed(collected):
         assert "dap_stopped" not in _types(collected), "会话已结束后不得再补发停止事件"
     finally:
         session.stop()
+
+
+# ------------------------------------------- stopped 关键字段透传（S3-T4 评审补的缺口）
+
+
+def _stub_stack_trace(monkeypatch, frames=None):
+    """把 stack_trace 换成本地桩：不启动适配器也能单独验 `_handle_stopped` 的载荷。"""
+    payload = frames if frames is not None else [
+        {"id": 7, "name": "main", "path": r"C:\proj\app.py", "line": 3, "column": 1},
+    ]
+    monkeypatch.setattr(DebugSession, "stack_trace", lambda self, thread_id, levels=1: payload)
+
+
+def test_stopped_passes_through_extra_dap_fields(collected, monkeypatch):
+    """`stopped` 本体带的三个关键字段必须透传，不能再在 core 层被抹掉。
+
+    缺了它们：多线程步进分不清「是不是所有线程都停了」、前端没法知道命中了哪个断点
+    （hitBreakpointIds）、异常的人类可读说明（description）在前端拿不回来。
+    """
+    _stub_stack_trace(monkeypatch)
+    session = _session(collected)
+
+    session._handle_stopped({
+        "reason": "exception",
+        "threadId": 2,
+        "allThreadsStopped": True,
+        "hitBreakpointIds": [3, "9", {"bad": 1}],
+        "description": "ZeroDivisionError: division by zero",
+    })
+
+    stopped = collected["events"][-1][1]
+    assert collected["events"][-1][0] == "dap_stopped"
+    assert stopped["all_threads_stopped"] is True
+    # 畸形项逐个丢弃而不是整体 int() 转换：工作线程里抛异常等于这条事件彻底发不出去
+    assert stopped["hit_breakpoint_ids"] == [3, 9]
+    assert stopped["description"] == "ZeroDivisionError: division by zero"
+    # 既有字段不受影响
+    assert stopped["reason"] == "exception" and stopped["thread_id"] == 2
+    assert stopped["frame_id"] == 7 and stopped["line"] == 3
+
+
+def test_stopped_without_extra_fields_uses_defaults_not_none(collected, monkeypatch):
+    """适配器没带这三个字段时给类型正确的默认值，而不是塞 None 污染载荷。"""
+    _stub_stack_trace(monkeypatch, frames=[])
+    session = _session(collected)
+
+    session._handle_stopped({"reason": "step", "threadId": 1})
+
+    stopped = collected["events"][-1][1]
+    assert stopped["all_threads_stopped"] is False
+    assert stopped["hit_breakpoint_ids"] == []
+    assert stopped["description"] == ""
+    assert all(value is not None for value in stopped.values()), "载荷里不许出现 None"
+
+
+def test_stopped_from_real_adapter_carries_all_threads_stopped(collected):
+    """端到端：假适配器的 stopped 事件带 allThreadsStopped=True，必须原样送到 emit。"""
+    session = _session(collected)
+    try:
+        session.start()
+        session.set_breakpoints(r"C:\proj\app.py", [7])
+        session.configuration_done()
+        _wait(collected["stopped"])
+
+        stopped = [data for kind, data in collected["events"] if kind == "dap_stopped"][-1]
+        assert stopped["all_threads_stopped"] is True
+        # 适配器没带的两个字段落到默认值（同一口径）
+        assert stopped["hit_breakpoint_ids"] == [] and stopped["description"] == ""
+    finally:
+        session.stop()
+
+
+# ------------------------------------------- 原先被静默丢弃的三类事件（S3-T4 评审补的缺口）
+
+
+def test_thread_process_and_loaded_source_events_are_forwarded(collected):
+    """thread / process / loadedSource 不再静默丢弃，按既有 `dap_*` 口径归一化外发。"""
+    session = _session(collected)
+
+    session._on_adapter_event("thread", {"reason": "started", "threadId": 5})
+    session._on_adapter_event("thread", {"reason": "exited", "threadId": 5})
+    session._on_adapter_event("process", {
+        "name": "app.py", "systemProcessId": 4242, "isLocalProcess": True,
+    })
+    session._on_adapter_event("loadedSource", {
+        "reason": "new", "source": {"path": r"C:\proj\app.py"},
+    })
+
+    assert _types(collected) == [
+        "dap_thread", "dap_thread", "dap_process", "dap_loaded_source",
+    ]
+    thread_started, thread_exited = collected["events"][0][1], collected["events"][1][1]
+    assert (thread_started["reason"], thread_started["thread_id"]) == ("started", 5)
+    assert (thread_exited["reason"], thread_exited["thread_id"]) == ("exited", 5)
+    assert all(item["session_id"] == session.session_id for _, item in collected["events"])
+
+    process = collected["events"][2][1]
+    assert process["name"] == "app.py" and process["system_process_id"] == 4242
+    assert process["is_local_process"] is True
+
+    loaded = collected["events"][3][1]
+    assert loaded["reason"] == "new" and loaded["path"] == r"C:\proj\app.py"
+
+
+def test_new_events_tolerate_malformed_bodies(collected):
+    """畸形字段不许抛：这些分支跑在读线程里，抛出去等于打断读循环。
+
+    threadId 退化成 0（前端按 0 丢弃）、source 不是字典就退化成空路径。
+    """
+    session = _session(collected)
+
+    session._on_adapter_event("thread", {"reason": "started", "threadId": {"bad": 1}})
+    session._on_adapter_event("process", {"systemProcessId": "x", "isLocalProcess": "yes"})
+    session._on_adapter_event("loadedSource", {"reason": "changed", "source": "not-a-dict"})
+    session._on_adapter_event("thread", {})
+
+    assert _types(collected) == [
+        "dap_thread", "dap_process", "dap_loaded_source", "dap_thread",
+    ]
+    assert collected["events"][0][1]["thread_id"] == 0
+    assert collected["events"][1][1]["system_process_id"] == 0
+    assert collected["events"][1][1]["is_local_process"] is True
+    assert collected["events"][2][1]["path"] == ""
+    # reason 缺失时按 DAP 的缺省语义兜底成 started（thread）/ new（loadedSource）
+    assert collected["events"][3][1]["reason"] == "started"
