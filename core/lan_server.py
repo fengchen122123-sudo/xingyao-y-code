@@ -304,6 +304,27 @@ class LanServer:
         # window_confirm_close 同类（桌面专属，手机无意义）。桌面前端不调用它
         # （唯一调用方是 gui_main 的窗口销毁链路），黑名单此前存在同类不对称。
         "shutdown",
+        # 自动化任务链（本轮边界审计 Important）：手机端原本可经
+        #   save_automation_task(permission_mode="full") → set_automation_task_enabled(True)
+        #   或 run_automation_task_now(task_id)
+        # 拿到一次「full 档」的桌面回合——automation 任务自带 permission_mode
+        # （core/automation/models.py 允许 "full"，即免确认执行文件写入与命令），
+        # 而 run_automation_task_now 内部硬编码 turn_source="local"
+        # （gui_bridge.py 的 _dispatch_automation_run），于是该回合连
+        # resolve_computer_capability 的远程禁令都不继承（判据正是
+        # turn_source != "local"）。这比已封的 save_hook 更直接：不需要等事件
+        # 触发，写一次任务即可长期反复执行。仅强制 turn_source 不足以堵住
+        # ——任务自带的 full 档权限仍会生效，所以必须封「写任务 / 启停 /
+        # 立即执行」这三个决定「桌面要不要跑、以什么档位跑」的入口。
+        # 只读快照（get_automation_tasks / get_automation_runs）保持放行，
+        # 手机端仍可查看任务与运行历史；frontend-mobile 对这三个方法零引用。
+        "save_automation_task", "set_automation_task_enabled", "run_automation_task_now",
+        # MCP 服务启停：与已封的 add_mcp_server 同通道——「启用」半边能把桌面
+        # 用户主动停用的 MCP 服务远程拉起（拉起即 spawn 该服务配置的命令），
+        # 属「写配置 → 让桌面执行」。此前以「移动端在用」为由保留，经核实
+        # frontend-mobile 零引用，该理由不成立。只读的 get_mcp_servers 与
+        # 纯重连的 reconnect_mcp 保持放行。
+        "toggle_mcp_server",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
@@ -707,6 +728,16 @@ class LanServer:
             return {"error": {"code": "method_not_allowed"}}
         if method.startswith("_"):
             return {"error": {"code": "method_not_allowed"}}
+        # set_permission_mode 的全局分支（session_name 为空）会改写**并落盘**
+        # 桌面全局权限档位（gui_bridge.py 的 set_permission_mode 在
+        # target_session 为空时调 app_context.set_permission_mode 并
+        # save_config_value("permission_mode", ...)）——手机端可据此把桌面
+        # 长期置成 full（免确认执行文件写入与命令）。手机端只需要会话级切换
+        # （frontend-mobile 调用时恒带 currentSession），全局档位属桌面持久
+        # 状态，与「手机只可查看状态与紧急停止」一致：LAN 侧 fail-closed，
+        # 只放行带 session 的会话级切换。
+        if method == "set_permission_mode" and not self._lan_session_arg(args):
+            return {"error": {"code": "method_not_allowed"}}
         extra_kwargs = None
         if method in self.MESSAGE_ENTRY_METHODS:
             normalized = self._force_lan_turn_source(args)
@@ -714,6 +745,22 @@ class LanServer:
                 return {"ok": False, "msg": "消息参数无法规范化，已拒绝"}
             args, extra_kwargs = normalized
         return self._call_bridge(method, args, extra_kwargs)
+
+    @staticmethod
+    def _lan_session_arg(args) -> str:
+        """从 LAN 参数里取 session_name（缺省/空/类型不符一律返回空串）。
+
+        位置通道取第 2 个位置参数（``set_permission_mode(mode, session_name)``），
+        kwargs 通道取同名键——两种形态都要按 strip 后的非空串判定，否则
+        ``{"session_name": "  "}`` 这类空白串会绕过守卫落到全局分支。
+        """
+        if isinstance(args, dict):
+            value = args.get("session_name", "")
+        elif isinstance(args, (list, tuple)):
+            value = args[1] if len(args) > 1 else ""
+        else:
+            value = ""
+        return str(value or "").strip()
 
     def _force_lan_turn_source(self, args):
         """消息入口参数规范化：剥离客户端一切 turn_source 绑定与权限档位注入通道。
