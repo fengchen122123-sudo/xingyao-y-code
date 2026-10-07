@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 
-import { closeDocument, resetClientState } from '../editor/lsp';
+import { closeDocument, resetClientState, setActiveWorkspace } from '../editor/lsp';
 import { languageIdForPath } from '../editor/setup';
 import type { IdeReadFileResult } from '../types/pywebview';
 
@@ -151,12 +151,17 @@ export const useIdeStore = defineStore('ide', {
      * 语言服务器的重启重发就可能落到已经切走的文档上（Task 12 评审 B）。
      * 后端那条腿是 `lsp_sync_workspace` → `LspManager.recycle_all()`；即使前端漏调
      * 本动作，`_lsp_workspace_guard` 也会在下一次 LSP 请求前兜底回收。
+     *
+     * 响应里的 `workspace` 记进 `setActiveWorkspace`：之后打开的文档按它记归属
+     * 工作区，服务器重启重发 didOpen 时才能按工作区过滤（S2 验收欠账 4）。桥不可用
+     * 时归属保持「未知」，宁可不过滤也不记错。
      */
     async syncWorkspace() {
       resetClientState();
       const api = ideApi();
       if (!api || typeof api.lsp_sync_workspace !== 'function') return;
-      await api.lsp_sync_workspace();
+      const res = await api.lsp_sync_workspace();
+      if (res && res.ok) setActiveWorkspace(res.workspace);
     },
 
     /** 打开目标文件并把光标定位到指定行列（S2 的跳转定义 / 诊断跳转复用） */
