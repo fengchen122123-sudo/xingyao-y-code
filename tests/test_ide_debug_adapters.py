@@ -5,6 +5,7 @@
 （同一语言先被探成「缺失」、后被探成「可用」，缓存会让后一条读到前一条）。
 """
 
+import os
 import sys
 
 import pytest
@@ -175,3 +176,79 @@ def test_lldb_dap_missing_while_which_order_prefers_lldb_dap(monkeypatch):
     probe = da.probe_adapter("rust")
 
     assert probe.spec.command == [r"C:\LLVM\bin\lldb-dap.exe", "--stdio"]
+
+
+# --- S3-T3 评审修复用例：失败不缓存 / 手填路径契约边界 / lldb 旧名开关 ---------------
+
+
+def test_failed_probe_is_not_cached_so_install_takes_effect(monkeypatch):
+    """第一次探测失败 → 用户装好适配器 → 不重启星瑶也能第二次探测成功。"""
+    state = {"installed": False}
+
+    def fake_probe(command, timeout=10.0):
+        return state["installed"]
+
+    monkeypatch.setattr(da, "_run_probe", fake_probe)
+
+    first = da.probe_adapter("python")
+    assert first.ok is False and "pip install debugpy" in first.hint
+
+    state["installed"] = True  # 用户在终端里按提示装好了 debugpy
+
+    second = da.probe_adapter("python")
+    assert second.ok is True and second.spec.adapter_id == "debugpy"
+    assert second.spec.command == [sys.executable, "-m", "debugpy.adapter"]
+
+
+def test_successful_probe_is_still_cached(monkeypatch):
+    """只缓存成功结果：成功之后重复探测不再起解释器进程（性能动机不能丢）。"""
+    calls = {"n": 0}
+
+    def fake_probe(command, timeout=10.0):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(da, "_run_probe", fake_probe)
+
+    da.probe_adapter("python")
+    da.probe_adapter("python")
+
+    assert calls["n"] == 1
+
+
+def test_missing_which_candidate_is_not_cached(monkeypatch):
+    """PATH 里先没有 dlv、后来有了：失败不缓存，第二次必须能发现（TCP 规格不变）。"""
+    monkeypatch.setattr(da.shutil, "which", lambda name: None)
+    assert da.probe_adapter("go").ok is False
+
+    monkeypatch.setattr(
+        da.shutil, "which", lambda name: r"C:\tools\dlv.exe" if name == "dlv" else None
+    )
+    probe = da.probe_adapter("go")
+
+    assert probe.ok is True and probe.spec.transport == da.TCP
+    assert probe.spec.command[-1] == "--listen=127.0.0.1:0"
+
+
+def test_assess_candidate_does_not_check_existence_contract_boundary():
+    """钉住边界：`_assess_candidate` 不查存在性（历史输入恒来自 shutil.which）。
+
+    Task 6 接入「手动指定适配器路径」时，必须在它之外补 os.path.exists 校验，
+    否则用户填一个不存在的路径会拿到「假成功」的 AdapterSpec。
+    """
+    missing = os.path.abspath("definitely-missing-ycode-dlv")
+
+    assert os.path.exists(missing) is False
+    assert da._assess_candidate(missing) == ""
+    assert "os.path.exists" in da._assess_candidate.__doc__
+
+
+def test_legacy_lldb_vscode_fallback_keeps_stdio_flag(monkeypatch):
+    """旧名 lldb-vscode 的 fallback 也带 --stdio（已核实：该开关被静默忽略，不影响启动）。"""
+    mapping = {"lldb-vscode": r"C:\LLVM\bin\lldb-vscode.exe"}
+    monkeypatch.setattr(da.shutil, "which", lambda name: mapping.get(name))
+
+    probe = da.probe_adapter("c")
+
+    assert probe.ok is True
+    assert probe.spec.command == [r"C:\LLVM\bin\lldb-vscode.exe", "--stdio"]
