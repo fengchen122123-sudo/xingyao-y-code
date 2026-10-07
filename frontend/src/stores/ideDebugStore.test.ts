@@ -216,3 +216,139 @@ describe('ideDebugStore 与桥的协作', () => {
     expect(store.variables[0].value).toBe('42');
   });
 });
+
+describe('ideDebugStore 会话归属（S3-T10 评审）', () => {
+  it('旧会话迟到的事件不会改动新会话状态', async () => {
+    api.ide_debug_start
+      .mockResolvedValueOnce({ ok: true, session_id: 'dap-A', adapter: 'debugpy' })
+      .mockResolvedValueOnce({ ok: true, session_id: 'dap-B', adapter: 'debugpy' });
+    const store = useIdeDebugStore();
+
+    await store.startDebug('E:/p/app.py');
+    await store.stopDebug();
+    await store.startDebug('E:/p/app.py');
+    expect(store.sessionId).toBe('dap-B');
+    expect(store.debugState).toBe('running');
+
+    // 旧适配器临死前推的结束事件：绝不能把新会话清掉
+    store.reduceDapEvent('dap_exited', { session_id: 'dap-A', exit_code: 0 });
+    store.reduceDapEvent('dap_terminated', { session_id: 'dap-A' });
+
+    expect(store.sessionId).toBe('dap-B');
+    expect(store.debugState).toBe('running');
+    expect(store.active).toBe(true);
+  });
+
+  it('旧会话的 dap_continued 不会把已停止的前端刷回 running', async () => {
+    api.ide_debug_start.mockResolvedValue({ ok: true, session_id: 'dap-A', adapter: 'debugpy' });
+    const store = useIdeDebugStore();
+
+    await store.startDebug('E:/p/app.py');
+    await store.stopDebug();
+    expect(store.debugState).toBe('stopped');
+
+    store.reduceDapEvent('dap_continued', { session_id: 'dap-A', thread_id: 1 });
+
+    expect(store.debugState).toBe('stopped');
+    expect(store.sessionId).toBe('');
+  });
+
+  it('重启后当前会话 id 已知：外来 id 的事件一律丢弃', async () => {
+    api.ide_debug_start
+      .mockResolvedValueOnce({ ok: true, session_id: 'dap-A', adapter: 'debugpy' })
+      .mockResolvedValueOnce({ ok: true, session_id: 'dap-B', adapter: 'debugpy' });
+    const store = useIdeDebugStore();
+
+    await store.startDebug('E:/p/app.py');
+    // 未经 stopDebug 直接重启（启动路径会回收旧会话）
+    await store.startDebug('E:/p/app.py');
+    store.reduceDapEvent('dap_stopped', { session_id: 'dap-A', thread_id: 1, line: 3 });
+
+    expect(store.debugState).toBe('running');
+    expect(store.stopLine).toBe(0);
+    // 属于自己的事件照常归约
+    store.reduceDapEvent('dap_stopped', { session_id: 'dap-B', thread_id: 1, frame_id: 7, line: 3 });
+    expect(store.debugState).toBe('paused');
+    expect(store.stopLine).toBe(3);
+  });
+
+  it('不带 session_id 的事件保持既有语义（老桥兼容）', () => {
+    const store = useIdeDebugStore();
+
+    store.reduceDapEvent('dap_stopped', { thread_id: 1, frame_id: 9, line: 4 });
+
+    expect(store.debugState).toBe('paused');
+    expect(store.stopLine).toBe(4);
+  });
+});
+
+describe('ideDebugStore 变量按作用域归属与层级回退（S3-T10 评审）', () => {
+  const twoScopes = [
+    { name: 'Locals', variablesReference: 2001, expensive: false },
+    { name: 'Globals', variablesReference: 3001, expensive: false },
+  ];
+
+  it('各作用域渲染自己的子节点，不会拿首个作用域的内容顶替', async () => {
+    api.ide_debug_scopes.mockResolvedValue({ ok: true, scopes: twoScopes });
+    api.ide_debug_variables.mockImplementation(async (reference: number) =>
+      reference === 2001
+        ? { ok: true, variables: [{ name: 'x', value: '42', type: 'int', variablesReference: 0 }] }
+        : { ok: true, variables: [{ name: 'os', value: '<module os>', type: 'module', variablesReference: 0 }] },
+    );
+    const store = useIdeDebugStore();
+
+    await store.loadScopes(1001);
+    expect(store.variables.map((item) => item.name)).toEqual(['x']);
+    expect(store.activeScopeRef).toBe(2001);
+
+    await store.selectScope(3001);
+
+    expect(api.ide_debug_variables).toHaveBeenLastCalledWith(3001);
+    expect(store.variables.map((item) => item.name)).toEqual(['os']);
+    expect(store.varPath.map((node) => node.name)).toEqual(['Globals']);
+  });
+
+  it('展开变量进入子层级，返回上一层恢复父层变量', async () => {
+    api.ide_debug_scopes.mockResolvedValue({ ok: true, scopes: [twoScopes[0]] });
+    api.ide_debug_variables.mockImplementation(async (reference: number) =>
+      reference === 2001
+        ? { ok: true, variables: [{ name: 'self', value: 'App', type: 'App', variablesReference: 4001 }] }
+        : { ok: true, variables: [{ name: 'x', value: '42', type: 'int', variablesReference: 0 }] },
+    );
+    const store = useIdeDebugStore();
+
+    await store.loadScopes(1001);
+    await store.expandVariables(4001, 'self');
+
+    expect(store.variables.map((item) => item.name)).toEqual(['x']);
+    expect(store.varPath.map((node) => node.name)).toEqual(['Locals', 'self']);
+
+    await store.backVariables();
+
+    expect(store.variables.map((item) => item.name)).toEqual(['self']);
+    expect(store.varPath.map((node) => node.name)).toEqual(['Locals']);
+    // 回退走缓存：只发过两次 variables 请求（Locals 根 + self 子层）
+    expect(api.ide_debug_variables).toHaveBeenCalledTimes(2);
+  });
+
+  it('继续执行后层级与缓存一起清空，不把上一次暂停的变量树留给下一次', async () => {
+    api.ide_debug_scopes.mockResolvedValue({ ok: true, scopes: [twoScopes[0]] });
+    api.ide_debug_variables.mockResolvedValue({
+      ok: true, variables: [{ name: 'self', value: 'App', type: 'App', variablesReference: 4001 }],
+    });
+    const store = useIdeDebugStore();
+
+    await store.loadScopes(1001);
+    await store.expandVariables(4001, 'self');
+    store.reduceDapEvent('dap_continued', { thread_id: 1 });
+
+    expect(store.varPath).toEqual([]);
+    expect(store.activeScopeRef).toBe(0);
+    expect(store.varCache).toEqual({});
+
+    // 下一次暂停会重新取，而不是吃上次的缓存
+    store.reduceDapEvent('dap_stopped', { thread_id: 1, frame_id: 7, line: 3 });
+    await store.loadScopes(1001);
+    expect(api.ide_debug_variables).toHaveBeenCalledTimes(3);
+  });
+});
