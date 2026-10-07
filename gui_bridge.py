@@ -3801,6 +3801,24 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("post_notice 失败")
             return {"ok": False, "msg": str(e)}
 
+    def _notice_emitter(self, session_name: str):
+        """构造带会话归属的对话提示发射器（notice 事件负载）。
+
+        压缩/水位线维护类提示可能由后台线程发起，也可能在用户已经切到别的
+        对话后才到达，因此必须携带 session_name：前端按归属会话把提示写进
+        对应对话流，缺省时只能落到用户正在查看的会话，表现为"别的对话的
+        提示出现在当前对话里"（跨会话串扰）。
+        """
+
+        def _emit(kind: str, message: str) -> None:
+            # kind 仅作调用方语义标记，压缩提示统一按普通 notice 渲染
+            self.emit_event("notice", {
+                "message": _strip_ansi_markup(message),
+                "session_name": str(session_name or ""),
+            })
+
+        return _emit
+
     # ------------------------------------------------------------------
     # 沙盒开关与持久化白名单（与 CLI 的 /sandbox、/whitelist 同一配置与存储）
     # ------------------------------------------------------------------
@@ -5741,7 +5759,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 # 用会话级绑定档位，未绑定回退全局默认；人工回合零改动
                 permission_mode=automation_permission_mode or self._effective_permission_mode(session_name),
                 cancel_event=cancel_event,
-                notify=lambda kind, message: self.emit_event("notice", {"message": _strip_ansi_markup(message)}),
+                # 压缩/维护提示按会话路由：缺 session_name 会串到用户正在看的对话
+                notify=self._notice_emitter(session_name),
                 api_key=api_key,
                 api_base=api_base,
                 is_gui=True,
@@ -5935,13 +5954,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 try:
                     idle_maintenance_service.on_turn_finished(
                         session_name,
-                        notify=lambda kind, message: self.emit_event(
-                            "notice",
-                            {
-                                "message": _strip_ansi_markup(message),
-                                "session_name": session_name,
-                            },
-                        ),
+                        # 与回合内/后台压缩共用同一发射器，避免再漏会话归属
+                        notify=self._notice_emitter(session_name),
                     )
                 except Exception:
                     pass
@@ -6748,9 +6762,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         active.get("litellm_model", ""),
                         window,
                         permission_mode=self._effective_permission_mode(session_name),
-                        notify=lambda kind, message: self.emit_event(
-                            "notice", {"message": _strip_ansi_markup(message)}
-                        ),
+                        # 后台压缩提示同样按会话路由（用户可能已切到别的对话）
+                        notify=self._notice_emitter(session_name),
                         api_key=active.get("api_key", ""),
                         api_base=active.get("base_url", ""),
                         is_gui=True,
@@ -6899,7 +6912,22 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         try:
             from core.plugin_loader import toggle_plugin as _toggle
             ok, msg = _toggle(name, enabled)
-            return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
+            # 回传模型设置快照（与 add_provider / add_model_to_provider 同一模式）：
+            # 插件的启用与禁用会增删 provider 与模型（例如 opencode_zen 启用时自举
+            # provider、禁用时按来源标记回收），只回传 plugins 会让模型选择器停在旧列表，
+            # 用户必须重启星瑶才能看到变化。
+            # 快照单独 try/except：取快照失败不能影响 toggle 本身的结果。
+            try:
+                settings = self.get_model_settings()
+            except Exception:
+                logger.exception("toggle_plugin 获取模型设置快照失败")
+                settings = None
+            return {
+                "ok": ok,
+                "msg": msg,
+                "plugins": self.get_plugins(),
+                "settings": settings,
+            }
         except Exception as e:
             logger.exception("toggle_plugin 失败")
             return {"ok": False, "msg": str(e)}
