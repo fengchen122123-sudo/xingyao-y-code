@@ -210,7 +210,8 @@ def test_stop_continue_loop_keeps_same_turn_id(monkeypatch):
     调用 → 再次 Stop 判定；若每轮重新生成 turn_id，StopContinueState 会按
     “新回合”重置计数，5 次上限永不触发（潜在死循环）。这里真实驱动
     chat_with_model_events（mock provider 每轮返回纯文本），断言：
-    1) 6 次 Stop 判定的 (session_id, turn_id) 完全一致——llm.py:2513 传的是
+    1) 6 次 Stop 判定（= lifecycle.STOP_CONTINUE_MAX(5) 次放行 + 第 6 次
+       limit_hit）的 (session_id, turn_id) 完全一致——llm.py:2513 传的是
        _chat_with_model_generator 的函数参数 parent_turn_id（llm.py:1044
        定义，循环体内无重新赋值）；
     2) 第 6 次判定 limit_hit，回合走正常收尾（turn_finished）；
@@ -252,7 +253,20 @@ def test_stop_continue_loop_keeps_same_turn_id(monkeypatch):
     monkeypatch.setattr(lifecycle, "get_stop_continue_state", lambda: state)
     monkeypatch.setattr(lifecycle, "get_default_hook_runner", lambda: _StopRunner())
     monkeypatch.setattr(turn_limits, "load_turn_step_limit", lambda: 20)
-    monkeypatch.setattr(llm, "completion", lambda **_kwargs: iter([_chunk("done")]))
+    # 驱动方式：每轮 provider 必须返回**互不相同**的正文。若各轮返回同一段短
+    # 正文（曾经是 "done"），会被后加的"退化（复读）熔断"护栏
+    # （core/llm.py 退化检测：_DEGENERATE_WINDOW=3，短正文逐位相同即命中）
+    # 在 Stop 判定之前拦下并提前收尾——那条护栏本身是按设计生效的（防"既不调
+    # 工具也不给结论、只刷同一句话"的卡死），但会让本用例根本走不到 Stop 续跑
+    # 上限，测不到本用例要锁定的性质。这里刻意每轮换文本（字符集两两几乎不
+    # 重叠，避免命中 _DEGENERATE_SIMILARITY_THRESHOLD=0.9 的相似度判据），
+    # 才能走满 STOP_CONTINUE_MAX+1 次判定。
+    _round_texts = iter(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"])
+
+    def _fake_completion(**_kwargs):
+        return iter([_chunk(next(_round_texts, "tail"))])
+
+    monkeypatch.setattr(llm, "completion", _fake_completion)
 
     events = list(llm.chat_with_model_events(
         "fake-model",
