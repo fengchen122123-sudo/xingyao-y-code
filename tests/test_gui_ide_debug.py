@@ -287,6 +287,72 @@ def test_start_rejects_debug_cwd_when_policy_denies(workspace, source_file, monk
     assert created == []
 
 
+def test_restart_allowed_after_program_terminated(workspace, source_file, monkeypatch):
+    """程序自然结束（terminated）后必须能重新开始调试，不需要先手动点一次停止。
+
+    S3-T7 评审：`ide_debug_start` 原来只判 `_debug_session is not None`，而 terminated
+    事件到达时不清会话引用；前端 `reduceDapEvent('dap_terminated')` 只把 debugState
+    置 stopped、不调 ide_debug_stop，于是「再点开始调试」永远拿到「已有调试会话在运行」。
+    """
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+
+    # 被调试程序跑完：DebugSession 从适配器读线程推 terminated
+    created[0].emit("dap_terminated", {"session_id": "dap-fake"})
+
+    res = bridge.ide_debug_start(source_file)
+
+    assert res["ok"] is True
+    assert len(created) == 2
+
+
+def test_restart_reaps_dead_session_without_terminated_event(workspace, source_file, monkeypatch):
+    """适配器进程意外退出（连 terminated 都没送到）：同样要放行并回收旧会话。"""
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+    created[0]._alive = False
+
+    res = bridge.ide_debug_start(source_file)
+
+    assert res["ok"] is True
+    assert created[0].stopped is True  # 旧会话被回收（不留适配器进程）
+    assert len(created) == 2
+
+
+def test_stop_resets_thread_and_frame_memory(workspace, source_file, monkeypatch):
+    """会话回收时必须复位线程/帧记忆，否则上一会话的失效 id 会泄漏给下一次调试。"""
+    _patch_probe(monkeypatch)
+    _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+    bridge._emit_dap_event("dap_stopped", {"session_id": "dap-fake", "thread_id": 1, "frame_id": 1001})
+    assert bridge._debug_last_thread_id == 1 and bridge._debug_last_frame_id == 1001
+
+    bridge.ide_debug_stop()
+
+    assert bridge._debug_last_thread_id == 0 and bridge._debug_last_frame_id == 0
+
+
+def test_new_session_does_not_inherit_stale_thread_id(workspace, source_file, monkeypatch):
+    """新会话在第一条 dap_stopped 之前不得沿用上一会话的线程号（会被适配器拒成 thread not found）。"""
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+    bridge._emit_dap_event("dap_stopped", {"session_id": "dap-fake", "thread_id": 7, "frame_id": 7001})
+
+    bridge.ide_debug_stop()
+    bridge.ide_debug_start(source_file)  # 新会话
+
+    assert bridge._debug_last_thread_id == 0 and bridge._debug_last_frame_id == 0
+    assert bridge.ide_debug_command("continue")["ok"] is True
+    assert created[-1].commands == [("continue", 0)]
+
+
 def test_command_requires_running_session(workspace):
     bridge = _make_bridge(workspace)
 
