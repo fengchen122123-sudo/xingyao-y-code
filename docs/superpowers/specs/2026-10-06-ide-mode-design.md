@@ -395,7 +395,7 @@ sequenceDiagram
 
 ## 12. 已接受的风险与已知边界
 
-本节记录 IDE 批次（S1–S3）在实现与评审中**已被明确接受**的风险与边界。它们不是待办清单，而是「当前就是这样」的事实陈述——动相关代码前先读本节，动完请同步更新这里。每条按「现象 / 影响 / 当前取舍 / 将来变更需同步的位置」四段写，行号按 HEAD `5f908fe` 核对。
+本节记录 IDE 批次（S1–S3）在实现与评审中**已被明确接受**的风险与边界。它们不是待办清单，而是「当前就是这样」的事实陈述——动相关代码前先读本节，动完请同步更新这里。每条按「现象 / 影响 / 当前取舍 / 将来变更需同步的位置」四段写，行号按 HEAD `6ff1abf` 核对。
 
 ### 12.1 `pty_terminal_ensure` 冷启动时会真的 spawn 一个 shell
 
@@ -423,4 +423,27 @@ sequenceDiagram
 - **现象**：`core/hooks/trust.py:149-163` 的 `status_for` 对 `scope == "user"` 直接返回 `TRUST_TRUSTED`（仅显式 revoke 后不可执行）；写入侧 `core/hooks/config_mutation.py:281` 的 `save_hook_config` → `_create_hook`（`:424`）**没有任何 trust 校验**，`scope` 完全由 payload 自选（`:437-445`，只校验取值是否属于 user / project）。
 - **影响**：只要能写一次 `~/.ycode/hooks.json`（scope 选 user），此后每次 SessionStart / PreToolUse / PostToolUse / Stop 都会长期执行任意命令，且不产生任何桌面确认。**写入路径不止 LAN 一条**——桌面端自身、插件、以及其它能触达该文件的通道都在这个模型内，所以这是信任模型的弱点，不是某个入口的漏洞。
 - **当前取舍**：本批**只在 LAN 入口封堵**：`save_hook` / `grant_hook_trust` 已进 LAN 黑名单（`core/lan_server.py:290`，桥方法见 `gui_bridge.py:7430` / `:7398`）。`grant_hook_trust` 是同一通道的另一半——给项目级 pending hook 授信同样等于远程放行任意 shell 命令，与已封的 `acknowledge_computer_safety` 同类。这是 fail-closed 的入口封堵，**不是**信任模型的修复；根因仍在，需单独评估（其它写入路径、插件、桌面端自身）。
-- **将来变更需同步的位置**：正确修法方向有两条（择一或并用）——① user 级 hook 也应需显式授信，即 `core/hooks/trust.py:160-163` 不再无条件返回 `TRUST_TRUSTED`；② `scope` 不得由调用方自选，即 `core/hooks/config_mutation.py:437-445` 改为按调用上下文固定，参照 `core/lan_server.py:310-312` 对 `turn_source` 的内部注入做法。改任一条都要：复核 `core/lan_server.py:290` 的黑名单注释（届时它从「唯一防线」降级为「纵深防御」）、核对 GUI hook 管理页表单与 `core/hooks/trust.py` 的状态机测试。
+- **将来变更需同步的位置**：正确修法方向有两条（择一或并用）——① user 级 hook 也应需显式授信，即 `core/hooks/trust.py:160-163` 不再无条件返回 `TRUST_TRUSTED`；② `scope` 不得由调用方自选，即 `core/hooks/config_mutation.py:437-445` 改为按调用上下文固定，参照 `core/lan_server.py:333` 与 `:742-746`（`dispatch_rpc` 的注入点）` 对 `turn_source` 的内部注入做法。改任一条都要：复核 `core/lan_server.py:290` 的黑名单注释（届时它从「唯一防线」降级为「纵深防御」）、核对 GUI hook 管理页表单与 `core/hooks/trust.py` 的状态机测试。
+
+### 12.5 自动化任务链曾是一条 full 档提权通道（本轮已封堵）
+
+- **现象**：LAN 侧原先放行 `save_automation_task`（`gui_bridge.py:5623`）、`set_automation_task_enabled`（`:5666`）与 `run_automation_task_now`（`:5676`）。automation 任务自带 `permission_mode`（`core/automation/models.py` 允许 `"full"`），而 `run_automation_task_now` 内部**硬编码** `turn_source="local"`（`_dispatch_automation_run`，`gui_bridge.py:5485`，两处落点在 `:5519` 排队条目与 `:5543` spawn 调用），于是该回合连 `resolve_computer_capability` 的远程禁令都不继承（判据正是 `turn_source != "local"`）。
+- **影响**：配对手机可「写一个 `permission_mode="full"` 的任务 → 立即执行」，拿到一次 **full 档、local 来源**的桌面回合（免确认执行文件写入与命令）。这比当时已封的 `pty_terminal_write`（一次一写）与 `save_hook`（需等事件触发）都更直接：写一次任务即可长期反复执行。
+- **当前取舍**：三个入口一并进黑名单（`core/lan_server.py:321`）。**只强制 `turn_source="lan"` 不足以堵住**——任务自带的 full 档权限仍会生效，所以必须封「写任务 / 启停 / 立即执行」这三个决定「桌面要不要跑、以什么档位跑」的入口。只读快照（`get_automation_tasks` / `get_automation_runs`）保持放行，手机端仍可查看任务与运行历史；`frontend-mobile` 对这三个方法零引用（已逐一搜索核实）。
+  同批一并封堵 `toggle_mcp_server`（`gui_bridge.py:7535`）——与已封的 `add_mcp_server` 同通道，「启用」半边能把桌面用户主动停用的 MCP 服务远程拉起（拉起即 spawn 该服务配置的命令）。此前以「移动端在用」为由保留，经核实 `frontend-mobile` 零引用，该理由不成立；只读的 `get_mcp_servers` 与纯重连的 `reconnect_mcp` 保持放行。
+  另给 `set_permission_mode` 加了 LAN 侧会话级守卫（`core/lan_server.py:739` + `:750` 的 `_lan_session_arg`）：session 为空/空白串时 fail-closed 拒绝——否则它会在 `gui_bridge.py:4205` 的分支里改写**并落盘**桌面全局权限档位（`save_config_value("permission_mode", ...)`），把桌面长期置成 full。手机端只需会话级切换（`frontend-mobile` 恒带 `currentSession`），会话级切换保持放行。
+- **将来变更需同步的位置**：若要恢复手机端「立即执行」能力，正确做法**不是解封**，而是让 `_dispatch_automation_run` 接受可注入的 `turn_source`（照 `core/lan_server.py:333` 与 `:742-746`（`dispatch_rpc` 的注入点）` 对 `send_user_message` 的内部注入做法）**并且**对 LAN 来源强制降级 `permission_mode`；两件事必须同时做，只做一件等于没堵。改 `set_permission_mode` 的守卫需同步 `frontend-mobile/src/stores/app.ts` 的调用形态（当前恒带 session）。
+
+### 12.6 明文凭据：没有专用读取入口，但存在残留路径
+
+- **现象**：`get_provider_api_key`（`gui_bridge.py:8974`）与 `get_feishu_secret` 已进 LAN 黑名单（`core/lan_server.py:279`），快照类方法一律只回 `has_*` 布尔（`get_model_settings` 的 `has_api_key`、`get_feishu_settings` 的 `has_secret`），已核对**没有其它专用明文读取入口**。
+- **影响**：但 `read_file_preview`（`gui_bridge.py:7849`）能读取 `gui_path_access_allowed` 放行范围内的**任意文件**，而 `config.json` 里的厂商 `api_key` 是**明文存储**的（仅飞书 `app_secret` 加密）。因此本节的结论必须表述为「**没有专用明文读取入口**」，而**不是**「拿到明文凭据的路径已全部关闭」——只要 `config.json` 落在策略放行范围内，LAN 侧就能经文件读取通道拿到它。
+- **当前取舍**：接受，不做额外封堵。理由：`read_file_preview` 是手机端查看工作区文件的正规能力（也是 IDE 文件预览的基础），按路径封它等于砍掉一个正常功能；而真正该改的是「密钥是否必须明文落盘」这个**存储决策**。
+- **将来变更需同步的位置**：若要收紧，正确落点在**存储层**（把 `config.json` 的 `api_key` 改为加密存储，照飞书 `app_secret` 的既有做法），而不是在 LAN 入口按文件名/路径做黑名单——后者必然漏（路径别名、大小写、软链都能绕）。改存储层需同步：桌面设置页的回填路径（`get_model_settings` 的 `has_api_key` 逻辑）、`get_provider_api_key` 的解密读取、以及本节的表述。
+
+### 12.7 调试求值链不是硬边界：`ide_debug_start` 未封
+
+- **现象**：`ide_debug_evaluate`（`gui_bridge.py:8858`）可在 debuggee 内求值任意表达式（对 Python 即任意代码执行），`ide_debug_command`（`:8804`）可控制继续/单步。两者均**不在**黑名单，保留理由是「需先有活跃调试会话」；但 `ide_debug_start`（`:8654`）同样不在黑名单，且它只受路径策略约束（`program` / `cwd` 过 `_resolve_real_path` + `gui_path_access_allowed`）——所以「需先起会话」**不是硬边界**，而是一条完整链路。
+- **影响**：配对手机可「起一个受路径策略约束的调试会话 → 在 debuggee 内求值任意表达式」。相比已封的 `pty_terminal_write`（任意命令、不经路径策略），这条链路多一道路径策略约束（起点不是任意的），但求值内容本身不受约束。
+- **当前取舍**：暂不封，作为**已知边界**记录。理由是调试台（调用栈 / 变量 / 监视 / 求值）是手机端调试功能的正常组成，整条封掉等于砍掉远程调试；而它的入口已受路径策略约束。
+- **将来变更需同步的位置**：若要收紧，**三者必须同封或同放**（只封 `evaluate` 而留 `start`，等于留了半个链）；落点在 `core/lan_server.py` 的黑名单与本节；封掉后需同步 `frontend-mobile` 调试台面板的可用性预期（若其使用该能力）。
