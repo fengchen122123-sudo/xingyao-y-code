@@ -315,6 +315,14 @@ JS_QUEUE_MAXSIZE = 2000
 # 不再因用户暂时离开而自动拒绝（拒绝会让模型拿到"用户拒绝"继续跑偏）
 PERMISSION_TIMEOUT_SECONDS = 300
 
+# 关停链路等待调试适配器回收线程的窗口（秒）。
+# 必须 ≥ 一次 `DebugSession._reap(graceful=False)` 的最坏耗时，否则适配器卡住时
+# 回收线程还没走完、父进程先退出，子进程就成孤儿（S3-T9 评审）。
+# 最坏耗时构成（见 core/ide/debug_session.py:_reap 与 core/ide/dap_manager.py:terminate）：
+#   terminate() 等优雅退出 5.0 + 强杀进程树后 wait 2.0 + _join_threads() 2.0 + 1.0 ≈ 10s
+# 取 12s 留出余量；超时后仍会补一刀强杀进程树（见 _shutdown_debug_session）。
+DEBUG_REAP_JOIN_TIMEOUT = 12.0
+
 # 文件预览上限：256KB
 FILE_PREVIEW_MAX_BYTES = 256 * 1024
 # 图片预览上限：20MB（base64 传输体积再膨胀约 33%）
@@ -607,8 +615,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._debug_last_thread_id = 0
         self._debug_last_frame_id = 0
         # terminated 后由读线程投递出去的「临时回收线程」（见 _discard_debug_session）：
-        # 关停时 join 它们，保证适配器进程一定被收掉，不留孤儿
-        self._debug_reapers: List[threading.Thread] = []
+        # 关停时 join 它们，保证适配器进程一定被收掉，不留孤儿。
+        # 登记成 (线程, 它负责回收的会话) 二元组：join 超时后要拿会话对象再补一刀强杀
+        # 进程树（S3-T9 评审），只留线程就够不到会话了。
+        self._debug_reapers: List[Tuple[threading.Thread, Any]] = []
         # 被调试程序是否已退出（收到 dap_exited）：DAP 里 exited 只表示「被调试程序结束」，
         # 会话未必结束。只用来放行「重新开始调试」时回收旧会话，不在 exited 时丢会话
         # （否则 restart 这类合法流程会被误杀）
@@ -8446,10 +8456,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     def _discard_debug_session(self) -> None:
         """放掉会话引用、复位线程/帧记忆，并把进程回收投递给临时线程。
 
-        **可从 DAP 读线程调用**：这里绝不直接 `session.stop()`——stop() 内部要发同步
-        disconnect 请求，读线程自己发请求会命中 `DapReaderBlockingError` 护栏（见
-        `DapProcess._reject_reader_blocking`）。只起一个临时线程去做 stop()，投递本身
-        非阻塞，读循环不会被拖住。
+        **可从 DAP 读线程调用，也不阻塞派发线程**：这里绝不直接回收会话，只做
+        非阻塞的投递（`Thread.start()`），读循环与 `gui-js-dispatcher` 都不会被拖住。
+        临时线程体走 `_reap(graceful=False)`——不发任何同步 DAP 请求，因此在读线程上
+        同步执行也是合法的（读线程护栏只禁「同步等响应」，见
+        `DapProcess._reject_reader_blocking`）。
 
         也不能像旧实现那样指望 `DebugSession.__del__` 兜底（S3-T8 评审三条理由）：
         ① `DapProcess.on_event` 是 `DebugSession` 的绑定方法，二者互指成环，带 `__del__`
@@ -8473,30 +8484,95 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     daemon=True,
                     name="ide-dap-reap",
                 )
-                self._debug_reapers.append(reaper)
+                self._debug_reapers.append((reaper, session))
         self._reset_debug_cursors()
         if reaper is None:
             return
-        reaper.start()
-
-    def _reap_debug_session(self, session: Any) -> None:
-        """临时线程体：stop() 幂等，失败也不能把回收线程炸掉（回收是 best-effort 兜底）。"""
         try:
-            session.stop()
+            reaper.start()
+        except RuntimeError:
+            # 线程资源耗尽（Thread.start 抛 RuntimeError）：登记表里那条线程永远不会启动，
+            # 会话引用却已经放掉了——不在这里兜底的话会话无人回收，而且随后
+            # `_shutdown_debug_session` 对「未启动的线程」join() 会再抛
+            # "cannot join thread before it is started"；该异常会从 `ide_debug_start`
+            # （内部会先 `_shutdown_debug_session` 回收旧会话）冒到前端，界面停在「运行中」
+            # 而适配器进程一路泄漏（S3-T9 评审）。
+            # 退化为就地回收：`_reap(graceful=False)` 不发同步请求，在派发线程/读线程上
+            # 调用都安全（不违读线程护栏）。
+            logger.exception("调试回收线程启动失败，就地回收适配器会话")
+            self._forget_debug_reaper(reaper)
+            self._reap_session_now(session, graceful=False)
+
+    def _forget_debug_reaper(self, reaper: threading.Thread) -> None:
+        """把一条没能启动（或已结束）的回收线程从登记表里摘掉（幂等）。"""
+        with self._debug_lock:
+            self._debug_reapers = [
+                item for item in self._debug_reapers if item[0] is not reaper
+            ]
+
+    def _reap_session_now(self, session: Any, graceful: bool) -> None:
+        """就地回收一个会话（best-effort，绝不抛）。
+
+        优先走 `DebugSession._reap(graceful=...)`：`graceful=False` 只关通道 + 杀进程树，
+        不发同步 DAP 请求，耗时远低于 `stop()`（后者要先等 `DISCONNECT_TIMEOUT=5.0` 的
+        disconnect 响应）。没有该私有方法的会话替身（测试替身、未来的第三方实现）退回
+        `stop()`，语义仍是「尽力回收」。
+        """
+        try:
+            reap = getattr(session, "_reap", None)
+            if callable(reap):
+                reap(graceful)
+            else:
+                session.stop()
         except Exception:
             logger.debug("回收调试适配器会话失败", exc_info=True)
-        finally:
-            with self._debug_lock:
-                try:
-                    self._debug_reapers.remove(threading.current_thread())
-                except ValueError:
-                    pass
 
-    def _shutdown_debug_session(self, join_timeout: float = 5.0) -> None:
-        """结束会话并回收适配器进程（幂等；shutdown 与 ide_debug_stop 共用）。
+    def _force_kill_session_tree(self, session: Any) -> None:
+        """兜底强杀：会话底层进程树还活着就再杀一刀（幂等、best-effort、绝不抛）。
+
+        正常路径上 `terminate()` 已经杀过一次，这里只处理「进程卡在不可杀状态 / 回收
+        提前中断」的极端场景，保证 S3-3「调试结束后适配器进程被回收」不因单个适配器
+        耍赖而失守。拿不到底层进程（会话替身 / 已释放）时静默跳过。
+        """
+        from core.ide.dap_manager import _kill_process_tree
+
+        process = getattr(session, "_process", None)
+        proc = getattr(process, "_proc", None)
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+                proc.wait(timeout=2.0)
+        except Exception:
+            logger.debug("兜底强杀调试适配器进程树失败", exc_info=True)
+
+    def _reap_debug_session(self, session: Any) -> None:
+        """临时线程体：回收幂等，失败也不能把回收线程炸掉（回收是 best-effort 兜底）。
+
+        用 `graceful=False`：走到这条路径说明会话已被丢弃（terminated / 显式停止），
+        再等一次优雅 disconnect 没有意义；关停链路要 join 的正是这条线程，越短越好
+        （见 `_shutdown_debug_session` 的超时预算）。
+        """
+        try:
+            self._reap_session_now(session, graceful=False)
+        finally:
+            self._forget_debug_reaper(threading.current_thread())
+
+    def _shutdown_debug_session(self, join_timeout: float = DEBUG_REAP_JOIN_TIMEOUT) -> None:
+        """结束会话并回收适配器进程（幂等；仅关停链路与「回收旧会话」链路调用）。
 
         除了当前会话，还要 join 掉 terminated 时投递出去的临时回收线程：否则关停
         （或进程退出）会与那条线程抢时序，极端情况下父进程先走，适配器变成孤儿。
+
+        **本方法会阻塞**，因此绝不能从 `gui-js-dispatcher` 线程调用（那会冻住整个前端
+        UI、并拖慢退出链路）：用户点「停止调试」走的是非阻塞的 `_discard_debug_session`
+        （见 `ide_debug_stop`）。
+
+        回收一律用 `_reap(graceful=False)`：最坏耗时从 ≈15s（5.0 disconnect + 5.0 优雅
+        退出 + 2.0 强杀后 wait + 3.0 线程 join）降到 ≈10s。`join_timeout` 必须 ≥ 这个
+        最坏值，否则适配器卡住时父进程先退出、子进程成孤儿（S3-T9 评审）；超时后还会
+        对仍未收完的会话补一刀强杀进程树。
         """
         with self._debug_lock:
             session = self._debug_session
@@ -8506,12 +8582,23 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 会话回收时一并复位线程/帧记忆：下一次调试不会继承上一会话的失效 id
         self._reset_debug_cursors()
         if session is not None:
-            session.stop()
+            self._reap_session_now(session, graceful=False)
         current = threading.current_thread()
-        for reaper in reapers:
+        deadline = time.monotonic() + join_timeout
+        stragglers: List[Any] = []
+        for reaper, owned in reapers:
             if reaper is current:
                 continue  # 防御：绝不在回收线程里 join 自己
-            reaper.join(join_timeout)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                reaper.join(remaining)
+            if reaper.is_alive():
+                stragglers.append(owned)
+        # 兜底：到点仍未收完（适配器进程卡在不可杀状态 / 回收提前中断）——直接对那些会话
+        # 再补一刀强杀进程树。`_force_kill_session_tree` 先 poll 再杀，进程已死则不发
+        # taskkill，因此不会误伤被复用的 pid。
+        for owned in ([session] if session is not None else []) + stragglers:
+            self._force_kill_session_tree(owned)
 
     def _debug_path_denied(self, real_path: str, workspace: str, label: str) -> str:
         """路径策略出口：入参必须已过 _resolve_real_path（口径同 ide_run_file）。
@@ -8716,8 +8803,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         return {"ok": True, **payload}
 
     def ide_debug_stop(self) -> Dict[str, Any]:
-        """停止调试并回收适配器进程（幂等）。"""
-        self._shutdown_debug_session()
+        """停止调试并回收适配器进程（幂等）。
+
+        **本方法绝不同步等回收**：它是前端 `api` 方法，跑在唯一的 `gui-js-dispatcher`
+        线程上——那也是唯一能调 `evaluate_js` 的线程。若在这里 `session.stop()`，适配器
+        卡住不回 disconnect 时会占住派发线程最坏 ≈15s（`DISCONNECT_TIMEOUT=5.0` +
+        `terminate(timeout=5.0)` + 强杀后 `wait(2.0)` + `_join_threads()` 2.0+1.0），
+        等同于整个前端 UI 冻结，退出星瑶的链路也被拖慢（S3-T9 评审）。
+
+        所以这里只做「丢引用 + 投递临时回收线程」（`_discard_debug_session`，与
+        `dap_terminated` 同一条路径，非阻塞），前端靠下面的 `dap_status` 事件更新状态；
+        真正需要「父进程退出前一定收干净」的关停链路仍走同步的
+        `_shutdown_debug_session`（它会把投递出去的回收线程一起 join 掉）。
+        """
+        self._discard_debug_session()
         self._emit_dap_event("dap_status", {"session_id": "", "state": "stopped", "msg": ""})
         return {"ok": True}
 
