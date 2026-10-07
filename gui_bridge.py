@@ -606,6 +606,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 当前暂停线程/帧：单步与求值都作用在它上面（由 dap_stopped 事件刷新）
         self._debug_last_thread_id = 0
         self._debug_last_frame_id = 0
+        # terminated 后由读线程投递出去的「临时回收线程」（见 _discard_debug_session）：
+        # 关停时 join 它们，保证适配器进程一定被收掉，不留孤儿
+        self._debug_reapers: List[threading.Thread] = []
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
@@ -8406,9 +8409,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 否则上面那个「已有调试会话在运行」的判重会把**已经结束的会话**当成在跑的
             # 会话拒绝掉，而前端 reduceDapEvent('dap_terminated') 只把 debugState 置
             # stopped、并不调 ide_debug_stop → 用户必须手动点一次「停止」才能重新调试。
-            # 这里不调 session.stop()：本方法运行在 DAP 读线程内，同步等响应会被
-            # DapReaderBlockingError 护栏拦下；程序已结束，适配器进程通常也自行退出，
-            # 残余进程由 DebugSession.__del__ 兜底回收。
+            # 同时**必须回收适配器进程**（S3-T8 评审）：_discard_debug_session 里起临时
+            # 线程去做 stop()，本方法仍在 DAP 读线程内，只做非阻塞投递。
             self._discard_debug_session()
         if self._shutting_down:
             return
@@ -8429,21 +8431,72 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._debug_last_frame_id = 0
 
     def _discard_debug_session(self) -> None:
-        """只放掉会话引用并复位线程/帧记忆，不回收进程（可从 DAP 读线程调用）。"""
-        with self._debug_lock:
-            self._debug_session = None
-        self._reset_debug_cursors()
+        """放掉会话引用、复位线程/帧记忆，并把进程回收投递给临时线程。
 
-    def _shutdown_debug_session(self) -> None:
-        """结束会话并回收适配器进程（幂等；shutdown 与 ide_debug_stop 共用）。"""
+        **可从 DAP 读线程调用**：这里绝不直接 `session.stop()`——stop() 内部要发同步
+        disconnect 请求，读线程自己发请求会命中 `DapReaderBlockingError` 护栏（见
+        `DapProcess._reject_reader_blocking`）。只起一个临时线程去做 stop()，投递本身
+        非阻塞，读循环不会被拖住。
+
+        也不能像旧实现那样指望 `DebugSession.__del__` 兜底（S3-T8 评审三条理由）：
+        ① `DapProcess.on_event` 是 `DebugSession` 的绑定方法，二者互指成环，带 `__del__`
+           的环只能靠分代 GC 非确定回收；
+        ② 读线程活着时环根本收不了——`ide-dap-reader` 的运行帧强引用 `DapProcess`，而
+           dlv 的 TCP dap-server / lldb-dap 在 terminated 后**不自行退出**，读线程永久
+           阻塞在 read 上，`__del__` 永不执行，进程与线程一路泄漏；
+        ③ 关停兜底也失效——`_shutdown_debug_session` 读的也是 `self._debug_session`，
+           此时已被置 `None`，`if session is None: return` 直接短路，适配器子进程不会
+           随父进程退出被杀，最终成为孤儿进程。
+        """
         with self._debug_lock:
             session = self._debug_session
             self._debug_session = None
+            reaper = None
+            if session is not None:
+                reaper = threading.Thread(
+                    target=self._reap_debug_session,
+                    args=(session,),
+                    daemon=True,
+                    name="ide-dap-reap",
+                )
+                self._debug_reapers.append(reaper)
+        self._reset_debug_cursors()
+        if reaper is None:
+            return
+        reaper.start()
+
+    def _reap_debug_session(self, session: Any) -> None:
+        """临时线程体：stop() 幂等，失败也不能把回收线程炸掉（回收是 best-effort 兜底）。"""
+        try:
+            session.stop()
+        except Exception:
+            logger.debug("回收调试适配器会话失败", exc_info=True)
+        finally:
+            with self._debug_lock:
+                try:
+                    self._debug_reapers.remove(threading.current_thread())
+                except ValueError:
+                    pass
+
+    def _shutdown_debug_session(self, join_timeout: float = 5.0) -> None:
+        """结束会话并回收适配器进程（幂等；shutdown 与 ide_debug_stop 共用）。
+
+        除了当前会话，还要 join 掉 terminated 时投递出去的临时回收线程：否则关停
+        （或进程退出）会与那条线程抢时序，极端情况下父进程先走，适配器变成孤儿。
+        """
+        with self._debug_lock:
+            session = self._debug_session
+            self._debug_session = None
+            reapers = list(self._debug_reapers)
         # 会话回收时一并复位线程/帧记忆：下一次调试不会继承上一会话的失效 id
         self._reset_debug_cursors()
-        if session is None:
-            return
-        session.stop()
+        if session is not None:
+            session.stop()
+        current = threading.current_thread()
+        for reaper in reapers:
+            if reaper is current:
+                continue  # 防御：绝不在回收线程里 join 自己
+            reaper.join(join_timeout)
 
     def _debug_path_denied(self, real_path: str, workspace: str, label: str) -> str:
         """路径策略出口：入参必须已过 _resolve_real_path（口径同 ide_run_file）。

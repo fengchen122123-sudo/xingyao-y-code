@@ -16,7 +16,10 @@
 
 import os
 import queue
+import subprocess
+import sys
 import threading
+import time
 
 import pytest
 
@@ -113,6 +116,7 @@ def _make_bridge(workdir):
     instance._debug_lock = threading.Lock()
     instance._debug_last_thread_id = 0
     instance._debug_last_frame_id = 0
+    instance._debug_reapers = []
     instance._current_session = "s1"
     instance._session_workdir = lambda name: workdir
     return instance
@@ -485,3 +489,126 @@ def test_availability_lists_adapters(workspace, monkeypatch):
     res = bridge.ide_debug_availability()
 
     assert res["ok"] is True and res["adapters"][0]["adapter_id"] == "debugpy"
+
+
+# ---------------------------------------------------------------------------
+# S3-T8 评审：dap_terminated 后适配器进程可能变孤儿 —— 必须真的回收
+# ---------------------------------------------------------------------------
+
+
+def _sleeping_child():
+    """一个真实活着的子进程（充当「不自行退出的适配器」，如 dlv / lldb-dap）。"""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+class _ReapingSession:
+    """持有**真实子进程**的会话罐头：stop() 真的回收它。
+
+    回收断言一律走 pid + `Popen.poll()` 存活探测，不看对象字段。若 stop() 在读线程内被
+    同步调用，就模拟 `DapProcess._reject_reader_blocking` 的 `DapReaderBlockingError`
+    护栏抛错——旧实现（在 `_discard_debug_session` 里同步等）会因此收不掉进程。
+    """
+
+    def __init__(self, process, reader_thread=None):
+        self._process = process
+        self._reader_thread = reader_thread
+        self.stopped = False
+        self.stop_thread = ""
+
+    def is_alive(self):
+        return self._process.poll() is None
+
+    def stop(self):
+        if self._reader_thread is not None and threading.current_thread() is self._reader_thread:
+            raise RuntimeError("DapReaderBlockingError: 读线程内禁止同步等响应")
+        self.stopped = True
+        self.stop_thread = threading.current_thread().name
+        self._process.kill()
+        self._process.wait(timeout=5)
+
+
+def _wait_dead(process, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return True
+        time.sleep(0.05)
+    return process.poll() is not None
+
+
+def test_terminated_reaps_adapter_process_off_the_reader_thread(workspace):
+    """收到 dap_terminated → 适配器进程必须真的被回收，且回收发生在读线程之外。
+
+    旧实现只把 `_debug_session` 置 None、指望 `__del__` 兜底：存在引用环
+    （DapProcess.on_event 是 DebugSession 的绑定方法）时只能靠分代 GC 非确定回收，
+    且读线程活着时环根本收不了 → 进程与线程一路泄漏（S3-T8 评审）。
+    """
+    child = _sleeping_child()
+    assert child.poll() is None  # 起点：进程真实存活
+    try:
+        bridge = _make_bridge(workspace)
+        holder = {}
+
+        # 从名为 ide-dap-reader 的线程里推 terminated，忠实模拟「事件来自 DAP 读线程」
+        def emit_on_reader_thread():
+            bridge._emit_dap_event("dap_terminated", {"session_id": "dap-fake"})
+
+        reader_thread = threading.Thread(
+            target=emit_on_reader_thread, daemon=True, name="ide-dap-reader"
+        )
+        session = _ReapingSession(child, reader_thread=reader_thread)
+        bridge._debug_session = session
+        holder["session"] = session
+
+        reader_thread.start()
+        reader_thread.join(5)
+        assert not reader_thread.is_alive()
+
+        # 会话引用当场放掉（S3-T7 语义不变）
+        assert bridge._debug_session is None
+        # 临时回收线程真的把子进程收掉了（pid 存活探测）
+        assert _wait_dead(child), "适配器子进程未被回收（成了孤儿进程）"
+        assert session.stopped is True
+        # 回收必须由临时线程执行，绝不能是读线程自己同步 stop()
+        assert session.stop_thread == "ide-dap-reap"
+        # 回收完成后登记表清空
+        assert bridge._debug_reapers == []
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def test_shutdown_after_terminated_still_reaps(workspace):
+    """terminated 之后关停路径仍要兜底：join 掉投递出去的回收线程，不留孤儿。
+
+    旧实现里 terminated 已把 `_debug_session` 置 None，`_shutdown_debug_session`
+    的 `if session is None: return` 直接短路 → 关停什么都没做，适配器子进程不随父
+    进程退出被杀（S3-T8 评审理由③）。
+    """
+    child = _sleeping_child()
+    assert child.poll() is None
+    try:
+        bridge = _make_bridge(workspace)
+        session = _ReapingSession(child)
+        bridge._debug_session = session
+
+        bridge._emit_dap_event("dap_terminated", {"session_id": "dap-fake"})
+        assert bridge._debug_session is None
+
+        # 关停时当前会话已是 None：仍必须兜底收掉投递出去的回收
+        bridge._shutdown_debug_session()
+
+        assert child.poll() is not None, "关停后适配器子进程仍存活（孤儿进程）"
+        assert session.stopped is True
+        assert bridge._debug_session is None
+        assert bridge._debug_reapers == []
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
