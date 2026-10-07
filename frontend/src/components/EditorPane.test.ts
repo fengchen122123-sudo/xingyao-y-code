@@ -131,7 +131,7 @@ vi.mock('../ide/cmBreakpoints', async () => {
 import EditorPane from './EditorPane.vue';
 import { buildEditorTheme } from '../editor/theme';
 import { createEditorState, EditorView } from '../editor/setup';
-import { execLineField, setExecLineEffect } from '../ide/cmBreakpoints';
+import { execLineField, refreshBreakpointsEffect, setExecLineEffect } from '../ide/cmBreakpoints';
 import { useIdeDebugStore } from '../stores/ideDebugStore';
 import { useIdeStore } from '../stores/ideStore';
 
@@ -485,7 +485,7 @@ it('编辑器状态里挂上断点 gutter 与执行行字段，行号现取 ideS
   wrapper.unmount();
 });
 
-it('断点增删后主动空 dispatch 一次，让 gutter 重算标记', async () => {
+it('断点增删后主动派发 refreshBreakpointsEffect，让 gutter 重算标记', async () => {
   const store = useIdeStore();
   await store.openFile('a.py');
   const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
@@ -494,8 +494,10 @@ it('断点增删后主动空 dispatch 一次，让 gutter 重算标记', async (
   store.toggleBreakpoint('a.py', 4);
   await nextTick();
 
-  // lineMarker 只在视图更新时重算：不发这一笔，点完 gutter 要等下次光标移动才见到圆点
-  expect(lastView().lastDispatch).toEqual({});
+  // 必须发这条 effect：实测（见 cmBreakpoints.test.ts 的「空事务不重算标记」）空 dispatch
+  // 不会让 CM6 重算 gutter 的 lineMarker，不发的话点完断点要等下次光标移动才见到圆点。
+  const dispatch = lastView().lastDispatch;
+  expect(dispatch?.effects?.is(refreshBreakpointsEffect)).toBe(true);
   wrapper.unmount();
 });
 
