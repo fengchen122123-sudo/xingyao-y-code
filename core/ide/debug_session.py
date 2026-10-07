@@ -115,6 +115,8 @@ class DebugSession:
         self._capabilities: Dict[str, Any] = {}
         self._launch_seq = 0
         self._failure = ""
+        # 会话已结束（stop()/失败回收/析构都会置位）：_handle_stopped 靠它决定要不要补发事件
+        self._closed = False
         self._process = DapProcess(
             spec,
             cwd=cwd,
@@ -217,6 +219,9 @@ class DebugSession:
 
     def _reap(self, graceful: bool) -> None:
         process = self._process
+        # 先置位、再关通道：正在补栈帧的 ide-dap-stopped 线程能立刻看到「会话已结束」，
+        # 不会在 dap_terminated 之后又补发一条 frame_id=0 的停止事件（事件顺序倒置）
+        self._closed = True
         try:
             if graceful and process.is_alive():
                 process.send_request(
@@ -414,14 +419,25 @@ class DebugSession:
         `test_stopped_handling_never_runs_in_adapter_reader_thread`。
         """
         with self._stopped_lock:
+            if self._closed:
+                # 会话已经结束（stop()/失败回收）：这条 stopped 是残留事件，补发它只会让前端
+                # 在 dap_terminated 之后又「跳回第 0 行」——事件顺序倒置，直接丢弃
+                logger.debug("会话已结束，丢弃迟到的停止事件：%s", body.get("reason"))
+                return
             thread_id = int(body.get("threadId") or 0)
             frame: Dict[str, Any] = {}
             try:
                 frames = self.stack_trace(thread_id, levels=1)
                 frame = frames[0] if frames else {}
-            except DebugSessionError as e:
-                # 取不到位置不影响「已停止」这件事本身，事件照发（前端至少能提示已暂停）
+            except Exception as e:
+                # 口径必须是 Exception 而非 DebugSessionError：stack_trace 内部还有
+                # int(raw.get("line") or 0) 这类转换，适配器推来畸形字段（"x"/dict）会抛
+                # ValueError/TypeError；漏出去会让本线程直接死掉 → dap_stopped 一次都不发，
+                # 前端永远不知道程序已经停下。取不到位置不影响「已停止」本身，事件照发。
                 logger.debug("取停止位置失败：%s", e)
+            if self._closed:
+                # 取栈帧期间会话被结束了（栈帧请求可能等了一小会儿）：同样不强发
+                return
             self._emit("dap_stopped", {
                 "session_id": self.session_id,
                 "reason": str(body.get("reason") or "breakpoint"),

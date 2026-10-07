@@ -220,7 +220,8 @@ def test_continue_and_step_emit_expected_events(collected):
         _wait(collected["stopped"])
 
         session.continue_(1)
-        assert "dap_continued" in _types(collected)
+        # 响应先到、事件后到：continue 的响应回来时 dap_continued 可能还没被读线程派发
+        assert _wait_until(lambda: "dap_continued" in _types(collected)), "continue 后必须发 dap_continued"
 
         collected["stopped"].clear()
         session.next_(1)
@@ -375,7 +376,8 @@ def test_context_manager_reaps_adapter_process(collected):
             raise RuntimeError("模拟编排中途炸掉")
 
     assert _process_exists(info["pid"]) is False
-    assert "dap_terminated" in _types(collected)
+    # terminated 由读线程异步派发：stop() 返回时可能还在路上
+    assert _wait_until(lambda: "dap_terminated" in _types(collected)), "回收后必须发 dap_terminated"
 
 
 # ------------------------------------------------------------------ 线程铁律（读线程禁止同步等待）
@@ -396,3 +398,58 @@ def test_stopped_handling_never_runs_in_adapter_reader_thread(collected):
     assert stopped_threads == ["ide-dap-stopped"], (
         "stopped 事件必须由独立工作线程补齐栈帧，绝不能蹲在读线程里等响应"
     )
+
+# ---------------------------------------------------- 停止事件的两条兜底（S3-T4 评审）
+
+
+def test_malformed_stack_frames_still_emit_stopped(collected, monkeypatch):
+    """适配器推来畸形栈帧字段时也必须发 dap_stopped。
+
+    stack_trace 内部有 int(raw.get("line") or 0) 这类转换：字段是 "x"/dict 就抛
+    ValueError/TypeError。工作线程上一旦漏出去，dap_stopped 一次都不发，前端永远不知道
+    程序已经停下——所以那里的 except 口径必须是 Exception。
+    """
+    session = _session(collected)
+    original = dm.DapProcess.send_request
+
+    def send_request(self, command, arguments=None, timeout=None):
+        if command == "stackTrace":
+            return {"stackFrames": [
+                {"id": {"bad": 1}, "name": "f", "line": "x", "column": None,
+                 "source": {"path": 7}},
+            ]}
+        return original(self, command, arguments, timeout=timeout)
+
+    monkeypatch.setattr(dm.DapProcess, "send_request", send_request)
+    try:
+        session.start()
+        session.set_breakpoints(r"C:\proj\app.py", [7])
+        session.configuration_done()
+
+        _wait(collected["stopped"])
+        stopped = [data for kind, data in collected["events"] if kind == "dap_stopped"][-1]
+        assert stopped["reason"] == "breakpoint" and stopped["thread_id"] == 1
+        # 位置取不到就退化成 0，但「已停止」这件事本身必须送达前端
+        assert (stopped["frame_id"], stopped["path"], stopped["line"]) == (0, "", 0)
+    finally:
+        session.stop()
+
+
+def test_no_stale_stopped_event_after_session_closed(collected):
+    """会话结束之后不许再补发停止事件：它可能晚于 dap_terminated，把前端跳回第 0 行。"""
+    session = _session(collected)
+    try:
+        session.start()
+        session.set_breakpoints(r"C:\proj\app.py", [7])
+        session.configuration_done()
+        _wait(collected["stopped"])
+
+        session.stop()
+        collected["events"].clear()
+
+        # 模拟「读线程已把 stopped 交给工作线程、会话却刚被 stop()」的残留事件
+        session._handle_stopped({"threadId": 1, "reason": "breakpoint"})
+
+        assert "dap_stopped" not in _types(collected), "会话已结束后不得再补发停止事件"
+    finally:
+        session.stop()
