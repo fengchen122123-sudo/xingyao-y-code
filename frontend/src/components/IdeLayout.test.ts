@@ -134,18 +134,26 @@ it('IDE 模式下终端只挂载一个实例，且那一个是底部面板的（
   expect(terminal.live).toBe(0);
 });
 
-it('不打开底部面板时 IDE 模式下也没有第二个终端实例', async () => {
+it('收起底部面板时也只有底部面板那一个终端实例，且面板只是隐藏', async () => {
   const app = useAppStore();
   app.terminalPanelOpen = true;
   app.toggleIdeMode();
   const ide = useIdeStore();
   ide.setSession('');
-  ide.toggleBottomPanel(); // 收起底部面板：终端随之退场
+  ide.toggleBottomPanel(); // 收起底部面板
 
   const wrapper = mountApp();
   await flushPromises();
-  expect(terminal.live).toBe(0);
+
+  // S3-T12：收起改用 v-show 控制可见性——调试控制台的行缓冲活在 DebugPane 里，
+  // v-if 卸载会把它连同输出一起丢掉，与「收起期间调试输出不丢」冲突。
+  // 这里唯一不变式仍是「不能出现第二个终端实例」：App 自带的那份在 IDE 模式下退场，
+  // 剩下的恰好是底部面板这一个（收起期间只是隐藏，不销毁）。
+  expect(terminal.live).toBe(1);
+  expect(wrapper.find('.ide-bottom').isVisible()).toBe(false);
+  expect(wrapper.find('.bottom-panel').exists()).toBe(true);
   wrapper.unmount();
+  expect(terminal.live).toBe(0);
 });
 
 it('恢复布局时快照 active 指向已删除文件：不切到陈旧路径，也不把它写回快照', async () => {
@@ -219,3 +227,4 @@ it('恢复 N 个标签只落盘一次，且末次是完整标签列表与真实 
   expect(ide.tabs().length).toBe(3);
   wrapper.unmount();
 });
+

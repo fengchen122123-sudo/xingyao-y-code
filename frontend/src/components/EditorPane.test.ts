@@ -36,6 +36,12 @@ vi.mock('../editor/setup', async () => {
   }
   type Listener = (update: { docChanged: boolean; state: FakeState }) => void;
 
+  interface FakeSpec {
+    changes?: { insert: string };
+    selection?: { anchor: number };
+    effects?: { is(effect: unknown): boolean; value?: unknown };
+  }
+
   class FakeEditorView {
     static __instances: FakeEditorView[] = [];
     static updateListener = { of: (listener: Listener) => ({ __listener: listener }) };
@@ -44,6 +50,7 @@ vi.mock('../editor/setup', async () => {
     focused = false;
     destroyed = false;
     lastSelection: { anchor: number } | null = null;
+    lastDispatch: FakeSpec | null = null;
     listeners: Listener[] = [];
 
     constructor(config: { state: FakeState; extensions?: unknown[] }) {
@@ -55,7 +62,8 @@ vi.mock('../editor/setup', async () => {
       FakeEditorView.__instances.push(this);
     }
 
-    dispatch(spec: { changes?: { insert: string }; selection?: { anchor: number } }) {
+    dispatch(spec: FakeSpec) {
+      this.lastDispatch = spec;
       if (spec.changes) {
         this.state = { doc: makeDoc(spec.changes.insert) };
         for (const listener of this.listeners) listener({ docChanged: true, state: this.state });
@@ -101,16 +109,44 @@ vi.mock('../editor/lspNavigation', async () => {
   };
 });
 
+// S3-T11 交付物的接线探针（S3-T12）：记录 EditorPane 传给 breakpointGutter 的选项，
+// 并给一个可识别的替身扩展——既能断言 gutter 真进了编辑器状态，也能驱动 lines /
+// onToggle 验证「行号现取 ideStore、点击只切 ideStore」这两个口径。
+const bpCalls = vi.hoisted(() => [] as Array<{
+  lines: () => number[];
+  onToggle: (line: number) => void;
+}>);
+
+vi.mock('../ide/cmBreakpoints', async () => {
+  const actual = await vi.importActual<typeof import('../ide/cmBreakpoints')>('../ide/cmBreakpoints');
+  return {
+    ...actual,
+    breakpointGutter: (options: (typeof bpCalls)[number]) => {
+      bpCalls.push(options);
+      return { __breakpointGutter: true };
+    },
+  };
+});
+
 import EditorPane from './EditorPane.vue';
 import { buildEditorTheme } from '../editor/theme';
 import { createEditorState, EditorView } from '../editor/setup';
+import { execLineField, setExecLineEffect } from '../ide/cmBreakpoints';
+import { useIdeDebugStore } from '../stores/ideDebugStore';
 import { useIdeStore } from '../stores/ideStore';
+
+interface RecordedDispatch {
+  changes?: { insert: string };
+  selection?: { anchor: number };
+  effects?: { is(effect: unknown): boolean; value?: unknown };
+}
 
 interface FakeView {
   state: { doc: { toString(): string } };
   focused: boolean;
   destroyed: boolean;
   lastSelection: { anchor: number } | null;
+  lastDispatch: RecordedDispatch | null;
 }
 
 function lastView(): FakeView {
@@ -142,6 +178,7 @@ function makeFakeDoc(text: string) {
 beforeEach(() => {
   (EditorView as unknown as { __instances: FakeView[] }).__instances = [];
   navCalls.length = 0;
+  bpCalls.length = 0;
   setActivePinia(createPinia());
   (window as any).pywebview = {
     api: {
@@ -308,8 +345,9 @@ it('编辑器状态里并列挂上补全/诊断扩展与 4 个导航扩展（悬
   expect(navCalls[0].path).toBe('a.py');
 
   // createEditorState 的第 3 个参数 = 3 个补全/诊断/视图扩展 + 4 个导航扩展
+  // + 断点 gutter + 执行行高亮字段（S3-T12 接线）
   const calls = (createEditorState as unknown as { mock: { calls: unknown[][] } }).mock.calls;
-  expect(calls[calls.length - 1][2]).toHaveLength(7);
+  expect(calls[calls.length - 1][2]).toHaveLength(9);
   wrapper.unmount();
 });
 
@@ -417,6 +455,93 @@ it('openFile 失败时 F12 跳转静默回落，不产生 unhandled rejection', 
 
   expect(rejections).toEqual([]);
   expect(store.pendingJump).toBeNull();
+  wrapper.unmount();
+});
+
+// ── S3-T12 接线：断点 gutter 与执行行高亮 ──────────────────────────────────
+
+it('编辑器状态里挂上断点 gutter 与执行行字段，行号现取 ideStore', async () => {
+  const store = useIdeStore();
+  await store.openFile('a.py');
+  store.toggleBreakpoint('a.py', 3);
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  // gutter 按当前文件实例化；行号真源是 ideStore 的断点表，编辑器不自己缓存
+  expect(bpCalls).toHaveLength(1);
+  expect(bpCalls[0].lines()).toEqual([3]);
+
+  // 点击只切 ideStore 的断点（编辑器不持有业务状态、也不自己发桥调用）
+  bpCalls[0].onToggle(5);
+  expect(store.breakpoints.has('a.py:5')).toBe(true);
+  bpCalls[0].onToggle(5);
+  expect(store.breakpoints.has('a.py:5')).toBe(false);
+
+  // 扩展真的进了编辑器状态：断点 gutter 与执行行字段都在 createEditorState 的 extras 里
+  const calls = (createEditorState as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+  const extras = calls[calls.length - 1][2] as unknown[];
+  expect(extras).toContainEqual({ __breakpointGutter: true });
+  expect(extras).toContain(execLineField);
+  wrapper.unmount();
+});
+
+it('断点增删后主动空 dispatch 一次，让 gutter 重算标记', async () => {
+  const store = useIdeStore();
+  await store.openFile('a.py');
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  store.toggleBreakpoint('a.py', 4);
+  await nextTick();
+
+  // lineMarker 只在视图更新时重算：不发这一笔，点完 gutter 要等下次光标移动才见到圆点
+  expect(lastView().lastDispatch).toEqual({});
+  wrapper.unmount();
+});
+
+it('收到 dap_stopped 后用栈顶帧行号高亮执行行（dap_stopped 本身不带行号）', async () => {
+  const store = useIdeStore();
+  const debug = useIdeDebugStore();
+  await store.openFile('a.py');
+  api().ide_debug_stack_trace = vi.fn(async () => ({
+    ok: true,
+    frames: [{ id: 1001, name: 'main', path: 'a.py', line: 2, column: 1 }],
+  }));
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  // 后端只给 thread_id / frame_id：行号靠 ide_debug_stack_trace 的栈顶帧补
+  debug.reduceDapEvent('dap_stopped', { session_id: 'dap-1', thread_id: 1, frame_id: 1001 });
+  await flushPromises();
+
+  expect(api().ide_debug_stack_trace).toHaveBeenCalledWith(1, 20);
+  expect(debug.stopLine).toBe(2);
+  expect(lastView().lastDispatch?.effects?.is(setExecLineEffect)).toBe(true);
+  expect(lastView().lastDispatch?.effects?.value).toBe(2);
+  wrapper.unmount();
+});
+
+it('会话结束后执行行高亮被清除', async () => {
+  const store = useIdeStore();
+  const debug = useIdeDebugStore();
+  await store.openFile('a.py');
+  api().ide_debug_stack_trace = vi.fn(async () => ({
+    ok: true,
+    frames: [{ id: 1001, name: 'main', path: 'a.py', line: 2, column: 1 }],
+  }));
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  debug.reduceDapEvent('dap_stopped', { session_id: 'dap-1', thread_id: 1, frame_id: 1001 });
+  await flushPromises();
+  expect(lastView().lastDispatch?.effects?.value).toBe(2);
+
+  debug.reduceDapEvent('dap_terminated', { session_id: 'dap-1' });
+  await flushPromises();
+
+  expect(debug.stopLine).toBe(0);
+  expect(lastView().lastDispatch?.effects?.is(setExecLineEffect)).toBe(true);
+  expect(lastView().lastDispatch?.effects?.value).toBeNull();
   wrapper.unmount();
 });
 
