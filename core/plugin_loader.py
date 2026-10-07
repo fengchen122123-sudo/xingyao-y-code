@@ -18,6 +18,12 @@
 插件内兄弟模块请用 import_sibling(__file__, "module_name") 加载，
 避免不同插件间的同名模块在 sys.modules 中互相覆盖。
 
+清理钩子（插件回收自己写入的持久化数据）：
+- 插件可选暴露无参函数 cleanup()，核心在禁用该插件时调用它；
+- 调用包在 try/except 内，失败只在 toggle 返回的提示里追加说明，绝不让禁用动作失败；
+- 启动扫描完成后由 _prune_orphan_providers() 兜底清理"其插件本次未加载"的孤儿
+  provider（只处理带 managed_by 标记的 provider，用户手配的配置绝不触碰）。
+
 信任机制（首次加载确认）：
 - 插件以进程全权限执行，加载前按目录内容指纹（文件哈希）判定是否已获信任；
 - 内置 plugins/ 目录随仓库发布，视为用户自己的代码：记录指纹并自动信任；
@@ -50,6 +56,10 @@ def _builtin_plugin_dir() -> Path:
 # 最近一次 load_and_register 的扫描结果（含禁用/失败/被覆盖的插件），
 # 供 /plugins 命令与诊断查询；每次扫描开头会整体重建。
 _PLUGIN_INFOS: list[dict] = []
+
+# 已加载插件的模块引用：留着是为了插件被禁用时能调用它可选的 cleanup() 钩子。
+# key 为插件名；禁用或加载失败时移除。
+_LOADED_MODULES: dict[str, Any] = {}
 
 
 def get_plugin_infos() -> list[dict]:
@@ -218,6 +228,81 @@ def _live_registry():
         return None
 
 
+def _run_cleanup_hook(name: str) -> str:
+    """调用插件可选的 cleanup() 钩子，回收插件写入的持久化数据。
+
+    返回空串表示无事发生；失败时返回可拼进提示语的说明，由调用方追加到 toggle
+    的结果消息里——绝不让"禁用插件"这个动作本身失败。
+    """
+    module = _LOADED_MODULES.pop(name, None)
+    if module is None:
+        return ""
+    hook = getattr(module, "cleanup", None)
+    if not callable(hook):
+        return ""
+    try:
+        hook()
+        return ""
+    except Exception as exc:
+        _logger.warning("插件 %s 的 cleanup 钩子执行失败: %s", name, exc)
+        return "（清理失败: %s）" % exc
+
+
+def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
+    """兜底清理"来源插件本次未加载"的孤儿 provider，返回被清理的 provider 名列表。
+
+    只处理带 managed_by 标记的 provider：用户手配的配置没有该字段，永远不会被碰。
+    典型场景：插件被禁用（或直接改了 plugin.json）后，它自举写入的 provider 仍留在
+    配置里，模型选择器就会一直显示一个已经用不了的厂商。
+    """
+    try:
+        import config
+        from core.model_manager import load_config
+    except Exception as exc:
+        _logger.warning("孤儿 provider 清理无法导入依赖，已跳过: %s", exc)
+        return []
+
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        _logger.warning("孤儿 provider 清理读取配置失败，已跳过: %s", exc)
+        return []
+
+    orphans = [
+        p for p in (cfg.get("providers") or [])
+        if isinstance(p, dict) and p.get("managed_by") and p["managed_by"] not in loaded_names
+    ]
+    if not orphans:
+        return []
+    orphan_names = [str(p.get("name") or p.get("id") or "?") for p in orphans]
+
+    def _mutate(data: dict) -> None:
+        removed_model_ids = set()
+        kept = []
+        for p in data.get("providers") or []:
+            # 写路径内二次判定：只删仍然符合"带标记且插件未加载"的项
+            if isinstance(p, dict) and p.get("managed_by") and p["managed_by"] not in loaded_names:
+                for m in (p.get("models") or []):
+                    if isinstance(m, dict) and m.get("id"):
+                        removed_model_ids.add(str(m["id"]))
+                continue
+            kept.append(p)
+        data["providers"] = kept
+        # 激活模型若属于被删 provider，一并清空，避免留下悬空 id
+        for key in ("active_model_id", "secondary_model_id"):
+            if str(data.get(key) or "") in removed_model_ids:
+                data[key] = None
+
+    try:
+        config.update_config(_mutate)
+    except Exception as exc:
+        _logger.warning("孤儿 provider 清理写入配置失败，已跳过: %s", exc)
+        return []
+
+    _logger.info("已清理孤儿 provider: %s", ", ".join(orphan_names))
+    return orphan_names
+
+
 def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
     """切换插件开关：写回 plugin.json 持久化，并热挂载/卸载运行时工具（无需重启）。
 
@@ -292,6 +377,8 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
                                 pass
                         info["status"] = "disabled"
                         break
+                # 禁用后调用插件可选的 cleanup()，回收它写入的持久化数据（如自举的 provider）
+                hot_note = _run_cleanup_hook(name)
         except Exception as exc:
             _logger.warning("插件 %s 热切换失败: %s", name, exc)
             hot_note = f"（热切换失败: {exc}，重启后生效）"
@@ -402,6 +489,8 @@ def _load_one(plugin_dir: Path, registry) -> str:
     if not callable(register):
         raise AttributeError(f"插件 {name} 的入口 {entry.name} 未暴露 register(registry) 函数")
     register(registry)
+    # 注册成功后才记录模块引用，避免对半初始化的模块被调用 cleanup
+    _LOADED_MODULES[name] = module
     return name
 
 
@@ -557,4 +646,11 @@ def load_and_register(registry) -> list[str]:
                 info["error"] = str(exc)
                 _logger.warning("插件 %s 加载失败，已跳过: %s", child.name, exc)
             _PLUGIN_INFOS.append(info)
+
+    # 兜底清理孤儿 provider：只处理带 managed_by 标记、且其插件本次未加载的项。
+    # 禁用/失败/未受信任的插件都不算已加载。整段隔离：清理异常绝不影响星瑶启动。
+    try:
+        _prune_orphan_providers(set(loaded))
+    except Exception as exc:
+        _logger.warning("孤儿 provider 兜底清理异常（已忽略）: %s", exc)
     return loaded
