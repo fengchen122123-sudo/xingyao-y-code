@@ -466,6 +466,59 @@ def test_lan_allows_ide_read_only_methods():
     assert [c[0] for c in calls] == ["read", "stat", "layout"]
 
 
+@pytest.mark.parametrize("method", [
+    "pty_terminal_write",
+    "pty_terminal_kill",
+    "lsp_set_server_path",
+])
+def test_lan_forbids_pty_write_kill_and_lsp_set_server_path(server, method):
+    """交互式终端的「写入/销毁」类与 LSP 路径覆写必须 fail-closed 拒绝（Task 17）。
+
+    dispatch_rpc 是 fail-open 分发（只拦黑名单 + 下划线前缀）：
+    - pty_terminal_write 把任意字符串原样写进桌面常驻 shell，等于远程任意
+      命令执行——比已封的 ide_run_file 更直接（连文件路径都不校验），是
+      「远程执行任意命令」这条通道的本体；
+    - pty_terminal_kill 终止用户的常驻 shell（销毁桌面用户态会话）；
+    - lsp_set_server_path 写盘 override 并 recycle_all() 换掉 LSP 可执行
+      文件，属写配置类，与 ide_write_file / ide_save_layout 同一边界。
+    """
+    response = server.dispatch_rpc(
+        method, ["rm -rf /\r"] if method == "pty_terminal_write" else []
+    )
+    assert response["error"]["code"] == "method_not_allowed"
+
+
+def test_lan_allows_pty_read_only_methods():
+    """终端的「查看/调尺寸」类必须保持放行（防止后人顺手多封砍掉手机端能力）。
+
+    设计原则：手机只可查看状态与紧急停止——pty_terminal_ensure 只确保会话
+    存活（不写任何输入），pty_terminal_resize 只同步 xterm 视口尺寸，两者
+    都属「查看」：手机端仍能看桌面终端的输出、能调尺寸，只是敲不进命令。
+    误拦会砍掉手机端既有能力，与 ide_read_file 保持放行的先例同口径。
+    """
+    calls = []
+
+    class PtyBridge:
+        def pty_terminal_ensure(self, cols=80, rows=24):
+            calls.append(("ensure", cols, rows))
+            return {"ok": True, "pid": 4321, "cwd": "E:\\ws", "reused": True}
+
+        def pty_terminal_resize(self, cols=80, rows=24):
+            calls.append(("resize", cols, rows))
+            return {"ok": True}
+
+    srv = LanServer(bridge=PtyBridge())
+    for method, args in (
+        ("pty_terminal_ensure", [100, 30]),
+        ("pty_terminal_resize", [120, 40]),
+    ):
+        result = srv.dispatch_rpc(method, args)
+        # 绝不能返回 method_not_allowed：只读/查看类方法必须真正到达 bridge
+        assert "error" not in result
+        assert result["ok"] is True
+    assert [c[0] for c in calls] == ["ensure", "resize"]
+
+
 @pytest.mark.parametrize("method", ["get_computer_control_status", "stop_computer_control"])
 def test_lan_allows_status_and_emergency_stop(server, method):
     assert server.dispatch_rpc(method, ["run-a"] if method.startswith("stop") else [])["ok"] is True
