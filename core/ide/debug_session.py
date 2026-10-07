@@ -45,6 +45,37 @@ class DebugSessionError(Exception):
     """调试会话失败（承载可直接展示给用户的中文消息）。"""
 
 
+def _as_int(value: Any) -> int:
+    """把适配器字段收敛成 int，转换不了就是 0（**绝不抛异常**）。
+
+    新增的事件分支都在 DAP 读线程里跑：那里抛异常＝打断读循环（整场调试哑掉），
+    比丢掉一条线程/进程事件严重得多。既有分支的 `int(x or 0)` 口径保持不变，
+    这里只服务新代码。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _int_list(raw: Any) -> List[int]:
+    """把适配器推来的 id 列表收敛成 `List[int]`（畸形项逐项丢弃，不抛异常）。
+
+    与 `_as_int` 同理：本函数可能跑在 `ide-dap-stopped` 工作线程里，抛异常＝这条
+    `dap_stopped` 彻底发不出去（同 `test_malformed_stack_frames_still_emit_stopped`
+    的教训），所以逐项转换而不是整体 `[int(x) for x in raw]`。
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    result: List[int] = []
+    for item in raw:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def build_launch_arguments(
     adapter_id: str,
     language_id: str,
@@ -411,6 +442,40 @@ class DebugSession:
                 "line": int(breakpoint.get("line") or 0),
                 "verified": bool(breakpoint.get("verified")),
             })
+            return
+        if name == "thread":
+            # 线程表变化（started / exited）：接出去前端才能自己维护线程列表，
+            # 不必每次切线程都主动调 `ide_debug_threads` 拉全量表。
+            # `threadId` 缺失/畸形时退化成 0（0 不是合法线程号，前端按 0 丢弃），
+            # 不抛异常：本方法跑在 DAP 读线程里，抛出去等于打断读循环，比丢一条
+            # 线程事件严重得多。
+            self._emit("dap_thread", {
+                "session_id": self.session_id,
+                "reason": str(body.get("reason") or "started"),
+                "thread_id": _as_int(body.get("threadId")),
+            })
+            return
+        if name == "process":
+            # 被调试进程起来了（DAP 的 process 事件只在启动时发一次，结束走 exited：
+            # 「停」的那一半由既有 `dap_exited`（带 exit_code）承担，不在这里重复）。
+            self._emit("dap_process", {
+                "session_id": self.session_id,
+                "name": str(body.get("name") or ""),
+                "system_process_id": _as_int(body.get("systemProcessId")),
+                "is_local_process": bool(body.get("isLocalProcess")),
+            })
+            return
+        if name == "loadedSource":
+            # 已加载源文件（new / changed / removed）。本仓暂无「已加载脚本」面板，
+            # 但归一化层不再静默丢弃：接出去，前端对未知 dap_* 类型静默忽略是既有契约
+            # （appStore.handleBridgeEvent 的 `type.startsWith('dap_')` 支路）。
+            source = body.get("source") if isinstance(body.get("source"), dict) else {}
+            self._emit("dap_loaded_source", {
+                "session_id": self.session_id,
+                "reason": str(body.get("reason") or "new"),
+                "path": str(source.get("path") or ""),
+            })
+            return
 
     def _handle_stopped(self, body: Dict[str, Any]) -> None:
         """在独立工作线程里补齐「停在哪」：取顶部栈帧要发 stackTrace 请求。
@@ -445,4 +510,13 @@ class DebugSession:
                 "frame_id": int(frame.get("id") or 0),
                 "path": str(frame.get("path") or ""),
                 "line": int(frame.get("line") or 0),
+                # DAP `stopped` 本体带的三个关键字段（S3-T4 评审补），原先在这里被丢掉：
+                # - `allThreadsStopped`：多线程步进语义（「是不是所有线程都停了」）；
+                # - `hitBreakpointIds`：命中了哪个断点，前端做命中高亮/对账的依据；
+                # - `description`：异常/信号这类 reason 的人类可读说明。
+                # 缺省口径与上面的 path/line 一致：**给类型正确的默认值**（False/[]/""），
+                # 而不是塞 None——前端因此不必区分「老后端不发」与「适配器没带」。
+                "all_threads_stopped": bool(body.get("allThreadsStopped")),
+                "hit_breakpoint_ids": _int_list(body.get("hitBreakpointIds")),
+                "description": str(body.get("description") or ""),
             })
