@@ -513,13 +513,17 @@ class LspManager:
     Popen 不会替你杀子进程）。`close()` 是终态：关闭后不允许再启动新进程，
     否则「关闭」之后起来的进程没人回收。
 
-    槽位世代（评审发现 A）：`recycle_workspace` / `close()` 除了收进程，还给被
-    pop 掉的槽位立墓碑（`_recycled_generations`）。崩溃回调 `_handle_exit` 在
-    退避结束后必须复核「我这一世代的槽位还在不在」，不在就放弃重启——否则
-    退避期间发生的工作区切换会让 `ensure_server` 给一个已经切走的工作区重新
-    拉起进程，留下跨工作区残留。`_closed` 只挡得住 `close()` 那条路径。
+    槽位世代与工作区 epoch（评审发现 A / S2 验收欠账 1）：`recycle_workspace` /
+    `close()` 会推进工作区 epoch（`current_epoch()`）。崩溃回调 `_handle_exit` 在
+    退避结束后复核「我这一世代的槽位还在不在」，不在就放弃重启——否则退避期间
+    发生的工作区切换会让 `ensure_server` 给一个已经切走的工作区重新拉起进程。
+    另外，调用方（`gui_bridge`）可以在取到 workspace 的同时取一个 epoch 并传给
+    `ensure_server(..., epoch=...)`：若取 workspace 与建槽之间发生了回收，epoch
+    已经推进，`ensure_server` 在同一临界区内就会拒绝启动，堵住「回收后重拉旧区
+    进程」的窗口。`_closed` 只挡得住 `close()` 那条路径。
     """
 
+    MAX_RESTARTS = 3
     MAX_RESTARTS = 3
     RESTART_BACKOFF = 0.5
     # 存活超过这个时长就认为服务器已经稳定，崩溃计数清零，
@@ -550,9 +554,10 @@ class LspManager:
         # 槽位世代计数器：每建一个槽位（含崩溃后重建）取一个新号，全局单调递增。
         # 用途是让「迟到的崩溃回调」能辨认自己那一世代还在不在（评审发现 A）。
         self._slot_seq = 0
-        # 墓碑：被 recycle_workspace 收掉的槽位世代。保证键的旧世代不被误复活，
-        # 新世代开张时（ensure_server 建槽）覆盖掉同名墓碑。
-        self._recycled_generations: dict[tuple[str, str], int] = {}
+        # 工作区 epoch：每次回收（recycle_workspace / recycle_all / close）推进一次。
+        # 调用方可以先取 epoch、再做耗时动作（取路径、探测可执行文件），建槽时把它
+        # 交回来：中途发生过回收就拒绝启动，避免给已经切走的工作区重拉进程。
+        self._epoch = 0
         self._closed = False
 
     # ---------------- 内部工具 ----------------
@@ -571,14 +576,23 @@ class LspManager:
             except ValueError:
                 pass
 
-    def _next_generation(self, key) -> int:
-        """给新槽位分配世代号，并清掉该键的墓碑（旧世代已经不会再回来）。
+    def _next_generation(self) -> int:
+        """给新槽位分配世代号。
 
         调用方必须已持有 `self._lock`（世代号与槽位登记必须在同一临界区里）。
         """
         self._slot_seq += 1
-        self._recycled_generations.pop(key, None)
         return self._slot_seq
+
+    def current_epoch(self) -> int:
+        """当前工作区 epoch。调用方在取 workspace 时一并取它，建槽时交回校验。"""
+        with self._lock:
+            return self._epoch
+
+    def _bump_epoch(self) -> int:
+        """推进 epoch（回收使其之前的令牌全部作废）。调用方必须已持有 `self._lock`。"""
+        self._epoch += 1
+        return self._epoch
 
     def _emit_status(self, workspace, language_id, server_id, state, msg="") -> None:
         if self._on_status is None:
@@ -604,11 +618,25 @@ class LspManager:
 
     # ---------------- 启动 ----------------
 
-    def ensure_server(self, workspace: str, language_id: str) -> LspProcess:
+    def ensure_server(self, workspace: str, language_id: str, *, epoch=None) -> LspProcess:
+        """确保该工作区该语言的服务器在跑，返回进程。
+
+        `epoch`：调用方在取 workspace 时通过 `current_epoch()` 拿到的令牌。一旦
+        中途发生过回收（recycle_workspace / recycle_all / close），epoch 就作废，
+        这里直接拒绝启动：否则回收与建槽之间会出现「旧工作区的槽位已被 pop，
+        却又被重建并拉起一个全新进程」的残留，且此后 guard 判定工作区无变化、
+        再也不会回收它。校验和建槽必须落在同一个临界区内（本函数的锁）才有意义。
+        """
         key = (self._norm(workspace), language_id)
         with self._lock:
             if self._closed:
                 raise LspStartError("语言服务器管理器已关闭，不能再启动语言服务器")
+            if epoch is not None and epoch != self._epoch:
+                # 明确的可诊断失败，绝不静默建槽
+                raise LspStartError(
+                    f"工作区 {workspace or '(默认)'} 的语言服务器令牌已过期"
+                    f"（期间发生了工作区回收），已放弃启动"
+                )
             slot = self._slots.get(key)
             if slot is not None and slot["proc"] is not None and slot["proc"].is_alive():
                 return slot["proc"]
@@ -631,7 +659,7 @@ class LspManager:
                     "started_at": 0.0,
                     # 世代号：本槽位这一轮生命的标识。`_handle_exit` 退避结束后凭它
                     # 判断「我负责的那个槽位还在不在」，被回收的槽位绝不复活。
-                    "generation": self._next_generation(key),
+                    "generation": self._next_generation(),
                 }
                 self._slots[key] = slot
             slot["state"] = "starting"
@@ -673,11 +701,14 @@ class LspManager:
 
     # ---------------- 请求 / 通知 ----------------
 
-    def request(self, workspace, language_id, method, params=None, *, timeout=None):
-        return self.ensure_server(workspace, language_id).request(method, params, timeout=timeout)
+    def request(self, workspace, language_id, method, params=None, *, timeout=None, epoch=None):
+        """`epoch` 与 `ensure_server` 同义：调用方取 workspace 时一并取，建槽时校验。"""
+        return self.ensure_server(workspace, language_id, epoch=epoch).request(
+            method, params, timeout=timeout
+        )
 
-    def notify(self, workspace, language_id, method, params=None) -> None:
-        self.ensure_server(workspace, language_id).notify(method, params)
+    def notify(self, workspace, language_id, method, params=None, *, epoch=None) -> None:
+        self.ensure_server(workspace, language_id, epoch=epoch).notify(method, params)
 
     # ---------------- 状态 ----------------
 
@@ -763,15 +794,18 @@ class LspManager:
     # ---------------- 回收 ----------------
 
     def recycle_workspace(self, workspace) -> list:
-        """回收某工作区的全部语言服务器进程，返回被回收的 (workspace, language) 列表。"""
+        """回收某工作区的全部语言服务器进程，返回被回收的 (workspace, language) 列表。
+
+        回收同时推进工作区 epoch：持有旧 epoch 的调用方（取 workspace 与建槽之间
+        被本操作插队的那些）在 `ensure_server` 里会被拒绝启动，槽位不会被重建。
+        """
         norm = self._norm(workspace)
         with self._lock:
             keys = [k for k in self._slots if k[0] == norm]
             slots = [(k, self._slots.pop(k)) for k in keys]
-            # 立墓碑：被回收的世代号记下来。槽位已 pop，任何还在退避中的 `_handle_exit`
-            # 无论按「槽位是否还在」还是按「世代是否相同」复核，都会判定为已回收而放弃重启。
-            for key, slot in slots:
-                self._recycled_generations[key] = slot.get("generation") or 0
+            # 槽位已 pop：还在退避中的 `_handle_exit` 会因「槽位没了 / 世代号变了」
+            # 放弃重启，epoch 则由 `ensure_server` 的令牌校验兜住另一条路径。
+            self._bump_epoch()
         recycled = []
         for (ws, language_id), slot in slots:
             proc = slot["proc"]
@@ -790,7 +824,13 @@ class LspManager:
         return recycled
 
     def recycle_all(self) -> list:
+        """回收全部工作区的语言服务器，并推进 epoch（令牌单调递增，任何一次推进都作废旧令牌）。
+
+        即使当前一个槽位都没有也推进：调用方可能是「切工作区」这一刻，持有旧令牌的
+        请求一律该被拒，而不是靠「恰好没槽位」侥幸。
+        """
         with self._lock:
+            self._bump_epoch()
             workspaces = sorted({k[0] for k in self._slots})
         recycled = []
         for ws in workspaces:

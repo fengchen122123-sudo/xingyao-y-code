@@ -13,6 +13,7 @@ import {
   onServerStatus,
   openDocument,
   resetClientState,
+  setActiveWorkspace,
   uriToPath,
   type LspDiagnostic,
   type LspServerStatus,
@@ -509,4 +510,122 @@ it('桥不支持 lsp_sync_workspace 时 syncWorkspace 仍然清本地状态（�
   dispatchLspEvent('lsp_diagnostics', { path: 'E:\\ws\\a.py', diagnostics: [DIAG] });
   await expect(store.syncWorkspace()).resolves.toBeUndefined();
   expect(diagnosticsFor('E:\\ws\\a.py')).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// S2 验收欠账 4：重启重发的过滤条件补齐 workspace 维度
+// ---------------------------------------------------------------------------
+
+it('重启重发按文档归属工作区过滤，不把 A 区文档重发给 B 区的同语言服务器', async () => {
+  const api = installBridge();
+  setActiveWorkspace('E:\\wsA');
+  await openDocument('E:\\wsA\\a.py', 'python', 'x = 1\n');
+
+  // B 区同语言的服务器重启：与 a.py 无关，重发就是跨区误发（重复 didOpen 是协议错误）
+  dispatchLspEvent('lsp_status', statusOf('jedi-b', 'E:\\wsB', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-b', 'E:\\wsB', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(1);
+
+  // 自己的服务器重启：必须重发
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(2);
+  expect((api.lsp_notify.mock.calls[1] as unknown[])[0]).toBe('E:\\wsA\\a.py');
+  expect((api.lsp_notify.mock.calls[1] as unknown[])[1]).toBe('textDocument/didOpen');
+});
+
+it('工作区比较对斜杠方向与盘符大小写不敏感（后端 normcase 口径）', async () => {
+  const api = installBridge();
+  setActiveWorkspace('E:\\wsA');
+  await openDocument('E:\\wsA\\a.py', 'python', 'x = 1\n');
+
+  // 后端 status() 报的是 os.path.normcase 归一化后的路径：小写 + 反斜杠
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'e:\\wsa', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'e:\\wsa', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(2);
+
+  // 另一个方向：事件里是正斜杠，登记时是反斜杠
+  dispatchLspEvent('lsp_status', statusOf('jedi-a2', 'E:/wsA/', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-a2', 'E:/wsA/', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(3);
+});
+
+it('openDocument 的 workspace 参数优先于当前工作区', async () => {
+  const api = installBridge();
+  setActiveWorkspace('E:\\wsA');
+  await openDocument('E:\\wsB\\b.py', 'python', 'y = 1\n', 'E:\\wsB');
+
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(1);
+
+  dispatchLspEvent('lsp_status', statusOf('jedi-b', 'E:\\wsB', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-b', 'E:\\wsB', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(2);
+  expect((api.lsp_notify.mock.calls[1] as unknown[])[0]).toBe('E:\\wsB\\b.py');
+});
+
+it('归属未知的文档仍参与重发（不因过滤而漏发）', async () => {
+  const api = installBridge();
+  // 没设过工作区（挂载早期打开的文件）：归属未知按参与处理，交回三态同清兜底
+  await openDocument('E:\\p\\a.py', 'python', 'x = 1\n');
+
+  dispatchLspEvent('lsp_status', statusOf('jedi-x', 'E:\\wsX', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-x', 'E:\\wsX', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(2);
+});
+
+it('resetClientState 一并清掉当前工作区（宁可未知也不记错归属）', async () => {
+  const api = installBridge();
+  setActiveWorkspace('E:\\wsA');
+  resetClientState();
+  await openDocument('E:\\wsB\\b.py', 'python', 'y = 1\n');
+
+  // 旧工作区（wsA）的服务器重启：新文档不是它的，不得把旧归属当成它的
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  // 归属未知 → 参与（唯一那次 didOpen 由本用例自己发出）
+  expect(api.lsp_notify).toHaveBeenCalledTimes(2);
+});
+
+it('syncWorkspace 记录当前工作区，供后续打开文档的归属过滤使用', async () => {
+  const { createPinia, setActivePinia } = await import('pinia');
+  const { useIdeStore } = await import('../stores/ideStore');
+  setActivePinia(createPinia());
+  const api = installBridge({
+    ide_read_file: vi.fn(async (path: string) => ({
+      ok: true,
+      path,
+      content: 'x = 1\n',
+      encoding: 'utf-8',
+      bom: false,
+      eol: 'lf',
+      hash: 'h1',
+    })),
+    ide_set_open_files: vi.fn(async () => ({ ok: true, count: 1 })),
+    lsp_sync_workspace: vi.fn(async () => ({ ok: true, workspace: 'E:\\wsA', recycled: [] })),
+  });
+  const store = useIdeStore();
+  store.setSession('s1');
+  await store.syncWorkspace();
+  expect(api.lsp_sync_workspace).toHaveBeenCalledTimes(1);
+  await openDocument('E:\\wsA\\a.py', 'python', 'x = 1\n');
+
+  dispatchLspEvent('lsp_status', statusOf('jedi-b', 'E:\\wsB', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-b', 'E:\\wsB', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(1);
+
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'restarting'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify).toHaveBeenCalledTimes(2);
 });
