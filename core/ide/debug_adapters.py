@@ -44,6 +44,8 @@ _CACHE_LOCK = threading.Lock()
 
 # 探测结果缓存：python 的探测要起一个解释器进程（几十到几百毫秒），
 # 而调试面板刷新与 adapter_availability() 会反复问同一批语言。
+# 只放成功结果（失败不缓存，见 probe_adapter）：失败一旦被缓存，用户运行中把适配器
+# 装好之后仍会一直看到「缺失」，只能靠重启星瑶。
 _CACHE: Dict[str, "AdapterProbe"] = {}
 
 
@@ -146,6 +148,13 @@ def _assess_candidate(path: str) -> str:
 
     完全没有候选（path 为空）时返回空串：这种情况的说明由各适配器的安装提示
     （「未找到 X。安装：…」）负责，不需要再叠一层原因。
+
+    **调用契约（Task 6 的「手动指定适配器路径」必须遵守）**：任何来自用户输入的候选
+    路径都要先过本函数校验再交给下面的分支使用。本函数只查「目录 / 无执行权限」这类
+    坏条目，因为它的历史输入一律来自 `shutil.which`（命中即存在）；用户手填的路径
+    可能压根不存在，接入入口时除了本函数还要补 `os.path.exists` 检查，否则用户填一个
+    不存在的路径会拿到「假成功」的 AdapterSpec，直到真正开始调试才失败。当前没有手填
+    入口，所以这条只是契约（见 tests 里钉住该边界的用例）。
     """
     if not path:
         return ""
@@ -207,6 +216,11 @@ def _probe_adapter_uncached(language_id: str) -> AdapterProbe:
     lldb_dap = _find_executable(("lldb-dap", "lldb-vscode"))
     problem = _assess_candidate(lldb_dap)
     if lldb_dap and not problem:
+        # `--stdio` 只是显式声明，保留不影响启动（S3-T3 评审第 3 条已核实）：
+        # LLVM 15 的 lldb-vscode 与 LLVM 18 的 lldb-dap，Options.td 里都**没有**
+        # stdio 选项，而且两者解析完 argv 后都不检查 OPT_unknown——未知开关被静默
+        # 忽略，默认就是 stdio 通信。所以旧名 fallback 不会因为这个开关启动失败。
+        # 若将来某版本的二进制改成拒绝未知开关（或要求显式 --stdio），改这一行即可。
         return AdapterProbe(
             True, adapter_id,
             AdapterSpec(
@@ -229,6 +243,11 @@ def probe_adapter(language_id: str) -> AdapterProbe:
     """探测某语言的调试适配器；未支持的语言也返回 probe（ok=False + 提示）。
 
     返回的 probe 与缓存不共享可变对象（见 `_clone_probe`）。
+
+    **只缓存成功结果**（S3-T3 评审发现）：失败结果一旦进缓存，用户运行中按提示在终端
+    装好 debugpy/dlv 之后，调试面板会一直显示缺失，直到重启星瑶——而 `invalidate_cache()`
+    在 S3-T3 之前全仓只有测试在调，没有生产失效入口。「装完回来看面板」是主路径，所以
+    失败必须重新探测；「探测要起解释器进程、慢」的性能动机由成功结果缓存保住。
     """
     key = str(language_id or "")
     with _CACHE_LOCK:
@@ -236,8 +255,9 @@ def probe_adapter(language_id: str) -> AdapterProbe:
     if cached is not None:
         return _clone_probe(cached)
     probe = _probe_adapter_uncached(key)
-    with _CACHE_LOCK:
-        _CACHE[key] = _clone_probe(probe)
+    if probe.ok:
+        with _CACHE_LOCK:
+            _CACHE[key] = _clone_probe(probe)
     return probe
 
 
