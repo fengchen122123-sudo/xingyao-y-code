@@ -311,6 +311,57 @@ def test_start_rejects_debug_cwd_when_policy_denies(workspace, source_file, monk
     assert created == []
 
 
+def test_start_rejects_breakpoint_outside_workspace_when_sandbox_off(workspace, source_file, monkeypatch):
+    """断点路径与 program / cwd 同口径：工作区外的断点在起会话前就被拒（不留适配器进程）。"""
+    from core import gui_path_policy
+
+    monkeypatch.setattr(gui_path_policy, "_allow_outside_workspace", lambda: False)
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    outside = os.path.join(os.path.dirname(workspace), "outside_bp.py")
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write("print('hi')\n")
+    bridge = _make_bridge(workspace)
+
+    res = bridge.ide_debug_start(source_file, breakpoints=[{"path": outside, "lines": [3]}])
+
+    assert res["ok"] is False
+    # 措辞与 program / cwd 越权一致：标签 + 策略原因，用户能直接看出该去改什么
+    assert "断点文件不可访问" in res["msg"] and "工作区" in res["msg"]
+    assert created == []
+    os.remove(outside)
+
+
+def test_start_passes_breakpoints_through_path_policy(workspace, source_file, monkeypatch):
+    """断点路径必须过策略；path 缺省时回落成已校验的目标文件，不误判成越权。"""
+    from core import gui_path_policy
+
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    seen = []
+    real_policy = gui_path_policy.gui_path_access_allowed
+
+    def spy(path, ws, *, action="preview", session_id=None):
+        seen.append(path)
+        return real_policy(path, ws, action=action, session_id=session_id)
+
+    monkeypatch.setattr(gui_path_policy, "gui_path_access_allowed", spy)
+    bridge = _make_bridge(workspace)
+
+    res = bridge.ide_debug_start(
+        source_file,
+        breakpoints=[{"path": source_file, "lines": [7]}, {"lines": [11]}],
+    )
+
+    assert res["ok"] is True
+    assert os.path.realpath(source_file) in seen  # 断点路径确实进了策略
+    # 下发前统一 realpath 归一化；两条（带 path / 只有行号）都落在目标文件上
+    assert created[0].breakpoints == [
+        (os.path.realpath(source_file), [7]),
+        (os.path.realpath(source_file), [11]),
+    ]
+
+
 def test_restart_allowed_after_program_terminated(workspace, source_file, monkeypatch):
     """程序自然结束（terminated）后必须能重新开始调试，不需要先手动点一次停止。
 
@@ -460,6 +511,72 @@ def test_set_breakpoints_forwards_to_session(workspace, source_file, monkeypatch
     forwarded = created[0].breakpoints[-1]
     assert os.path.realpath(forwarded[0]) == os.path.realpath(source_file)
     assert forwarded[1] == [3, 9]
+
+
+def test_set_breakpoints_rejects_path_outside_workspace(workspace, monkeypatch):
+    """工作区外的断点路径必须被拒，并给出与 program / cwd 同口径的中文原因。"""
+    from core import gui_path_policy
+
+    monkeypatch.setattr(gui_path_policy, "_allow_outside_workspace", lambda: False)
+    outside = os.path.join(os.path.dirname(workspace), "outside_bp.py")
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write("print('hi')\n")
+    bridge = _make_bridge(workspace)
+
+    res = bridge.ide_debug_set_breakpoints(outside, [3])
+
+    assert res["ok"] is False
+    assert "断点文件不可访问" in res["msg"] and "工作区" in res["msg"]
+    assert res.get("pending") is None  # 越权时不得退化成"先挂前端"的 pending
+    os.remove(outside)
+
+
+def test_set_breakpoints_rejects_outside_path_with_running_session(workspace, source_file, monkeypatch):
+    """会话在跑时同样拦截：越权路径不得下发给适配器。"""
+    from core import gui_path_policy
+
+    monkeypatch.setattr(gui_path_policy, "_allow_outside_workspace", lambda: False)
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    outside = os.path.join(os.path.dirname(workspace), "outside_bp.py")
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write("print('hi')\n")
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+
+    res = bridge.ide_debug_set_breakpoints(outside, [3])
+
+    assert res["ok"] is False and "工作区" in res["msg"]
+    assert created[0].breakpoints == []
+    os.remove(outside)
+
+
+def test_set_breakpoints_allows_path_inside_workspace(workspace, source_file, monkeypatch):
+    """防"顺手封死"：工作区内的断点路径照旧放行（无会话时仍返回 pending）。"""
+    from core import gui_path_policy
+
+    monkeypatch.setattr(gui_path_policy, "_allow_outside_workspace", lambda: False)
+    bridge = _make_bridge(workspace)
+
+    res = bridge.ide_debug_set_breakpoints(source_file, [3])
+
+    assert res["ok"] is True and res["pending"] is True
+
+
+def test_set_breakpoints_rejects_credential_file_even_with_sandbox_on(workspace, tmp_path, monkeypatch):
+    """断点走的是完整策略：凭据文件连沙盒开关都不受（与 program 同口径）。"""
+    from core import gui_path_policy
+
+    monkeypatch.setattr(gui_path_policy, "_ycode_data_dir", lambda: str(tmp_path / ".ycode"))
+    monkeypatch.setattr(gui_path_policy, "_allow_outside_workspace", lambda: True)
+    credential = tmp_path / ".ycode" / "config.json"
+    credential.parent.mkdir(parents=True, exist_ok=True)
+    credential.write_text("{}\n", encoding="utf-8")
+    bridge = _make_bridge(workspace)
+
+    res = bridge.ide_debug_set_breakpoints(str(credential), [1])
+
+    assert res["ok"] is False and "配置文件" in res["msg"]
 
 
 def test_debug_events_reach_js_queue(workspace, source_file, monkeypatch):
