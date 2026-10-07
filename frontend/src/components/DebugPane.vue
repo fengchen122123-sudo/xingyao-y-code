@@ -26,26 +26,61 @@
 
       <section class="dp-section">
         <header class="dp-head"><span>变量</span></header>
+        <!-- 作用域页签：每个作用域显示**自己**的变量（旧写法在 v-for scope 里渲染同一个
+             debug.variables，Locals 的子节点被当成 Globals 的内容再渲染一遍，用户看不出
+             自己在看哪个作用域）。超过一个作用域才需要页签，只有一个时直接显示名字。 -->
+        <div v-if="debug.scopes.length > 1" class="dp-scopes" data-test="debug-scopes">
+          <button
+            v-for="scope in debug.scopes"
+            :key="scope.variablesReference"
+            class="dp-scope-tab"
+            :class="{ active: scope.variablesReference === debug.activeScopeRef }"
+            data-test="debug-scope"
+            @click="debug.selectScope(scope.variablesReference)"
+          >
+            {{ scope.name }}
+          </button>
+        </div>
+        <div v-else-if="debug.scopes.length === 1" class="dp-scopes">
+          <span class="dp-scope-name" data-test="debug-scope">{{ debug.scopes[0].name }}</span>
+        </div>
+        <!-- 层级面包屑：展开 self / 大 dict 之后能看出自己在哪一层，并能走回去 -->
+        <div v-if="debug.varPath.length" class="dp-crumbs" data-test="debug-var-path">
+          <button
+            v-if="debug.varPath.length > 1"
+            class="dp-btn dp-crumb-back"
+            title="返回上一层"
+            data-test="debug-var-back"
+            @click="debug.backVariables()"
+          >
+            返回上一层
+          </button>
+          <span
+            v-for="(node, index) in debug.varPath"
+            :key="`${index}:${node.reference}`"
+            class="dp-crumb"
+            :class="{ active: index === debug.varPath.length - 1 }"
+            data-test="debug-var-crumb"
+            >{{ node.name }}</span
+          >
+        </div>
         <div class="dp-vars">
-          <div v-for="scope in debug.scopes" :key="scope.variablesReference" class="dp-scope" data-test="debug-scope">
-            <div class="dp-scope-name">{{ scope.name }}</div>
-            <div
-              v-for="item in debug.variables"
-              :key="item.name"
-              class="dp-var"
-              data-test="debug-variable"
-              :class="{ clickable: item.variablesReference > 0 }"
-              @click="item.variablesReference > 0 && debug.expandVariables(item.variablesReference)"
-            >
-              <!-- 展开箭头只在真有子节点时出现：variablesReference 为 0 表示无子节点，
-                   给它画个箭头等于骗用户去点（点了也不会展开） -->
-              <span v-if="item.variablesReference > 0" class="dp-expand">
-                <AppIcon name="chevron-right" :size="11" />
-              </span>
-              <span class="dp-var-name">{{ item.name }}</span>
-              <span class="dp-var-value">{{ item.value }}</span>
-              <span class="dp-var-type">{{ item.type }}</span>
-            </div>
+          <div
+            v-for="item in debug.variables"
+            :key="item.name"
+            class="dp-var"
+            data-test="debug-variable"
+            :class="{ clickable: item.variablesReference > 0 }"
+            @click="item.variablesReference > 0 && debug.expandVariables(item.variablesReference, item.name)"
+          >
+            <!-- 展开箭头只在真有子节点时出现：variablesReference 为 0 表示无子节点，
+                 给它画个箭头等于骗用户去点（点了也不会展开） -->
+            <span v-if="item.variablesReference > 0" class="dp-expand">
+              <AppIcon name="chevron-right" :size="11" />
+            </span>
+            <span class="dp-var-name">{{ item.name }}</span>
+            <span class="dp-var-value">{{ item.value }}</span>
+            <span class="dp-var-type">{{ item.type }}</span>
           </div>
           <div v-if="!debug.scopes.length" class="dp-empty">暂停后可查看变量</div>
         </div>
@@ -114,7 +149,12 @@ const unsubs: Array<() => void> = [];
 const consoleText = computed(() => consoleLines.value.join('\n'));
 
 function appendConsole(text: string) {
-  for (const line of text.split(/\r?\n/)) {
+  const lines = String(text).split(/\r?\n/);
+  // DAP 的 output 事件基本都带尾换行：split 会多出一个空串元素，push 进缓冲后每组
+  // 输出之间就多出一个空行（控制台双倍行距）。末尾那个空分片只是「行结束符」，丢掉；
+  // 中间的空行（连续两个 \n）是真内容，必须保留。
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  for (const line of lines) {
     consoleLines.value.push(line.replace(/\x1b\[[0-9;]*m/g, ''));
   }
   if (consoleLines.value.length > 2000) {
@@ -264,6 +304,53 @@ onBeforeUnmount(() => {
 .dp-vars {
   overflow: auto;
   min-height: 0;
+}
+.dp-scopes {
+  display: flex;
+  gap: 4px;
+  padding: 2px 6px;
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+.dp-scope-tab {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dp-scope-tab:hover {
+  color: var(--text);
+}
+.dp-scope-tab.active {
+  background: var(--bg2);
+  color: var(--text);
+  font-weight: 600;
+}
+.dp-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px 2px;
+  flex-shrink: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.dp-crumb {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.dp-crumb.active {
+  color: var(--text);
+}
+.dp-crumb-back {
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
 }
 .dp-scope-name {
   padding: 2px 8px;

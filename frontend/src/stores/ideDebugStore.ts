@@ -26,6 +26,15 @@ export interface DapScopeItem {
   expensive: boolean;
 }
 
+/**
+ * 变量树的一层：`reference` 是该层的 DAP variablesReference，`name` 是面包屑上显示的名字
+ * （作用域名 / 变量名）。索引 0 恒为作用域根，`length > 1` 表示已展开到子层级。
+ */
+export interface DapVarPathNode {
+  reference: number;
+  name: string;
+}
+
 export interface DapWatchResult {
   expression: string;
   result: string;
@@ -69,7 +78,27 @@ export const useIdeDebugStore = defineStore('ideDebug', {
     frames: [] as DapStackFrame[],
     selectedFrameId: 0,
     scopes: [] as DapScopeItem[],
+    /** 当前展示的变量层级（随 varPath 一起变），保留扁平字段供面板直接渲染 */
     variables: [] as DapVariable[],
+    /** 当前正在看哪个作用域（该作用域的 variablesReference；0 = 无） */
+    activeScopeRef: 0,
+    /** 当前层级路径：`varPath[0]` 是作用域，往后每展开一层追加一项 */
+    varPath: [] as DapVarPathNode[],
+    /**
+     * 已加载层级的缓存（键为 variablesReference）。
+     *
+     * 只用于「暂停期间」在层与层之间来回走：每次暂停现场清空时一并丢弃，
+     * 所以不会拿上一次暂停的旧值糊弄用户。
+     */
+    varCache: {} as Record<number, DapVariable[]>,
+    /**
+     * 已经结束的会话 id（S3-T10 评审）。
+     *
+     * `ide_debug_stop` 只丢引用、适配器最坏 ≈10s 后才死，这段时间里旧会话仍会推
+     * `dap_continued` / `dap_exited` / `dap_terminated`。记下「结过账」的 id，
+     * 迟到事件才能被丢掉，而不是把新会话刷回 running / 清空 sessionId。
+     */
+    staleSessionIds: [] as string[],
     watchExpressions: [] as string[],
     watchResults: [] as DapWatchResult[],
     breakpointStates: {} as Record<string, boolean>,
@@ -100,8 +129,49 @@ export const useIdeDebugStore = defineStore('ideDebug', {
   },
 
   actions: {
+    /**
+     * 事件是否属于当前会话（S3-T10 评审）。
+     *
+     * 后端 `_emit_dap_event` 已按同一口径丢残留事件，这里再做一层：桥的投递是异步的
+     * （入队 → 派发线程），事件到达时前端可能已经换了会话，只靠后端把关不够。
+     *
+     * 四段，顺序有讲究：
+     * 1. 事件不带 `session_id`（老桥 / 手工构造）→ 放行，不改变既有语义；
+     * 2. 与当前会话 id 相同 → 放行；
+     * 3. 已在 `staleSessionIds` 里（用户停过 / 结束过）→ **丢弃**：这是「停止后又被
+     *    旧适配器的 dap_continued 刷回 running」那条 bug 的堵点；
+     * 4. 当前会话 id 还是空的 → 放行：`startDebug` 的会话 id 来自 `ide_debug_start`
+     *    的**返回**，而适配器事件在启动窗口里就可能先到（后端 `dap_status` 先于
+     *    响应返回），严格比对会把合法事件一起丢掉；反之当前会话 id 已知时，外来 id
+     *    一律丢弃（重启后旧会话的 exited/terminated 就是这么被挡掉的）。
+     */
+    _eventBelongsToCurrentSession(data: DapEventPayload): boolean {
+      const incoming = String(data.session_id ?? '');
+      if (!incoming) return true;
+      if (incoming === this.sessionId) return true;
+      if (this.staleSessionIds.includes(incoming)) return false;
+      return this.sessionId === '';
+    },
+
+    /** 把当前会话「结账」：id 记进 staleSessionIds 并清空当前会话 id（幂等）。 */
+    _forgetCurrentSession() {
+      const id = this.sessionId;
+      if (id && !this.staleSessionIds.includes(id)) this.staleSessionIds.push(id);
+      this.sessionId = '';
+    },
+
+    /** 记下新会话 id，并把它替换掉的上一个会话结账（重启调试时旧 id 必须立即失效）。 */
+    _rememberSession(id: string) {
+      const next = String(id ?? '');
+      if (next !== this.sessionId) this._forgetCurrentSession();
+      this.sessionId = next;
+    },
+
     /** DAP 事件统一归约入口：由 appStore.handleBridgeEvent 分流调用。 */
     reduceDapEvent(type: string, data: DapEventPayload = {}) {
+      // dap_status 例外：停止与启动失败就是靠 `session_id: ''` 的 dap_status 送到
+      // 前端的，按会话 id 比对会把它们一起丢掉
+      if (type !== 'dap_status' && !this._eventBelongsToCurrentSession(data)) return;
       if (type === 'dap_output') {
         // 高频原始输出：走旁路总线，绝不进响应式状态（否则每行输出都会触发组件更新）
         emitDapOutput({
@@ -137,7 +207,9 @@ export const useIdeDebugStore = defineStore('ideDebug', {
         // 程序自然结束：会话 id 一并清掉，界面据此放行「再次开始调试」
         // （后端 _emit_dap_event 收到 terminated 也会丢弃会话引用，两边对齐）
         this.debugState = 'stopped';
-        this.sessionId = '';
+        // 通过 _forgetCurrentSession 清：这个 id 要进 staleSessionIds，旧适配器随后
+        // 推来的 exited/terminated（同一会话，最坏 ≈10s）才不会把新会话当成已结束
+        this._forgetCurrentSession();
         this.selectedFrameId = 0;
         this._clearPauseDetail();
         return;
@@ -161,10 +233,16 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       if (this.frames.length) this.frames = [];
       if (this.scopes.length) this.scopes = [];
       if (this.variables.length) this.variables = [];
+      // 层级路径与层级缓存同属「暂停现场」：不清就会把上一次暂停的变量树留给下一次
+      if (this.varPath.length) this.varPath = [];
+      if (this.activeScopeRef) this.activeScopeRef = 0;
+      if (Object.keys(this.varCache).length) this.varCache = {};
     },
 
     reset() {
-      this.sessionId = '';
+      // 会话 id 走 _forgetCurrentSession：先把它记进 staleSessionIds 再清空，
+      // 否则「停止后旧适配器迟到的事件」会拿到一个空 sessionId 的空档挤进来
+      this._forgetCurrentSession();
       this.adapter = '';
       this.debugState = 'idle';
       this.stopReason = '';
@@ -175,6 +253,9 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       this.selectedFrameId = 0;
       this.scopes = [];
       this.variables = [];
+      this.varPath = [];
+      this.activeScopeRef = 0;
+      this.varCache = {};
       this.watchResults = [];
       this.breakpointStates = {};
       this.lastError = '';
@@ -195,7 +276,8 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       this.lastError = '';
       const res = await api.ide_debug_start(path, this.breakpointsByPath, program, args);
       if (res?.ok) {
-        this.sessionId = String(res.session_id ?? '');
+        // 会话 id 从启动响应来：走 _rememberSession 顺带把上一个会话结账
+        this._rememberSession(String(res.session_id ?? ''));
         this.adapter = String(res.adapter ?? '');
         this.debugState = 'running';
       } else {
@@ -279,17 +361,72 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       if (!api?.ide_debug_scopes) return [];
       const res = await api.ide_debug_scopes(frameId);
       this.scopes = (res?.scopes ?? []) as DapScopeItem[];
+      // 换帧＝换一套作用域：层级路径与缓存必须一起重来，否则会把上一帧的变量挂在新帧下
+      this.varPath = [];
+      this.activeScopeRef = 0;
+      this.varCache = {};
       const first = this.scopes[0];
-      this.variables = first ? await this.expandVariables(first.variablesReference) : [];
+      if (!first) {
+        this.variables = [];
+        return this.scopes;
+      }
+      // 只加载首个作用域的子节点：Python(debugpy) 的 scopes 常态是 Locals + Globals，
+      // 一次 IPC 就把 Globals 也拉下来既慢又可能巨大；其余作用域由用户点页签时再取
+      // （S3-T10 评审：变量必须归属到各自的作用域，不能拿首个作用域的子节点去顶）
+      await this.selectScope(first.variablesReference);
       return this.scopes;
     },
 
-    async expandVariables(variablesReference: number) {
+    /** 切到某个作用域的根层级（点变量面板上的作用域页签） */
+    async selectScope(reference: number) {
+      const scope = this.scopes.find((item) => item.variablesReference === reference);
+      if (!scope) return this.variables;
+      this.activeScopeRef = reference;
+      this.varPath = [{ reference, name: scope.name }];
+      return this._loadLevel(reference);
+    },
+
+    /**
+     * 载入某一层的变量（命中缓存则直接用）。
+     *
+     * 缓存只服务「暂停期间来回走层级」：`_clearPauseDetail` 在每次暂停/继续/结束时清空。
+     */
+    async _loadLevel(reference: number) {
+      const cached = this.varCache[reference];
+      if (cached) {
+        this.variables = cached;
+        return cached;
+      }
       const api = debugApi();
       if (!api?.ide_debug_variables) return [];
-      const res = await api.ide_debug_variables(variablesReference);
-      this.variables = (res?.variables ?? []) as DapVariable[];
-      return this.variables;
+      const res = await api.ide_debug_variables(reference);
+      const items = (res?.variables ?? []) as DapVariable[];
+      this.varCache = { ...this.varCache, [reference]: items };
+      this.variables = items;
+      return items;
+    },
+
+    /**
+     * 展开一个变量：进入它的子层级。
+     *
+     * 旧实现是「用子节点整体替换 variables」，展开 `self` 或一个大 dict 之后用户既看不到
+     * 兄弟变量、也没有任何回退入口（唯一的回退是回调用栈再点一次帧）。现在把层级路径
+     * 记进 `varPath`，配合 `backVariables` 面包屑回退（S3-T10 评审）。
+     */
+    async expandVariables(variablesReference: number, name = '') {
+      const items = await this._loadLevel(variablesReference);
+      this.varPath = [
+        ...this.varPath,
+        { reference: variablesReference, name: name || `#${variablesReference}` },
+      ];
+      return items;
+    },
+
+    /** 返回上一层（面包屑左侧的「返回上一层」）；已在作用域根时不动作 */
+    async backVariables() {
+      if (this.varPath.length <= 1) return this.variables;
+      this.varPath = this.varPath.slice(0, -1);
+      return this._loadLevel(this.varPath[this.varPath.length - 1].reference);
     },
 
     async evaluate(expression: string, frameId = 0) {
