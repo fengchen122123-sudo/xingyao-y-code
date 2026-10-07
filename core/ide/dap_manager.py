@@ -173,6 +173,24 @@ class DapRequestError(DapProtocolError):
     """请求失败：超时、适配器返回 success=false、或通道已断开。"""
 
 
+class DapReaderBlockingError(DapProtocolError):
+    """在读线程内发起「同步等待响应」的请求（必然与自己的读循环死锁）。
+
+    这是运行时护栏（S3-T4 补）：铁律「适配器读线程内禁止调用任何同步等待响应的 DAP
+    请求」此前只有 docstring 约定，写出违规代码的后果是整条会话静默挂死（读线程在等
+    自己写出去的那条响应），既没有报错也没有超时。现在 `send_request` / `await_response`
+    只要在读线程里被调用就立刻抛本异常。
+
+    事件回调（`on_event`）内需要「收到事件后回请求」（如 stopped 后取栈）时只能二选一：
+    - 投递到别的线程执行（Task 4 的 `_handle_stopped` 走这条）；
+    - `send_request_async` 发出去，在别处 `await_response` 配对。
+
+    本异常从 `_dispatch` 的事件回调里冒出来时不会被「回调异常不打断读线程」的兜底吞掉
+    （见 `_dispatch`）：它会结束读线程并唤醒所有等待者——宁可让会话明确失败，也不留一个
+    「进程活着但没人读」的半死通道。
+    """
+
+
 def _spawn_adapter(command: List[str], cwd: str):
     """启动适配器进程：stdin/stdout/stderr 全接管（dlv 从 stderr 报端口）。"""
     return subprocess.Popen(
@@ -388,7 +406,17 @@ class DapProcess:
         arguments: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
+        # 护栏放在最前面：违规时连请求都不许发出去（发了就会留下一个没人等的 waiter）
+        self._reject_reader_blocking()
         return self.await_response(self.send_request_async(command, arguments), timeout=timeout)
+
+    def _reject_reader_blocking(self) -> None:
+        """读线程内同步等响应＝等自己把响应读回来，必然死锁（见 DapReaderBlockingError）。"""
+        if threading.current_thread() is self._reader:
+            raise DapReaderBlockingError(
+                "在 DAP 读线程内同步等待响应会造成死锁：请把请求投递到别的线程执行，"
+                "或改用 send_request_async + await_response 配对"
+            )
 
     def send_request_async(self, command: str, arguments: Optional[Dict[str, Any]] = None) -> int:
         """发出请求但不等响应，返回 seq。
@@ -414,6 +442,9 @@ class DapProcess:
         return seq
 
     def await_response(self, seq: int, timeout: Optional[float] = None) -> Dict[str, Any]:
+        # 运行时护栏（S3-T4 补）：直接 await 同样会死锁，违规在这里立刻变成异常，
+        # 而不是静默挂死整条会话。
+        self._reject_reader_blocking()
         with self._lock:
             waiter = self._waiters.get(seq)
             if waiter is not None:
@@ -429,9 +460,12 @@ class DapProcess:
             waiter.set()
         wait_time = self._request_timeout if timeout is None else timeout
         if not waiter.wait(wait_time):
-            # 超时：先把 waiter 摘掉（迟到响应命中「没有 waiter」即静默丢弃），再抛错
+            # 超时：把 waiter 与可能已经躺进 _responses 的条目一并摘掉再抛错。只摘 waiter
+            # 会漏：响应完全可能在 wait() 返回 False 之后、pop 之前被 _dispatch 存入，而
+            # seq 单调递增、永不复用，这条响应就永久滞留在 _responses 里（S3-T3 评审）。
             with self._lock:
                 self._waiters.pop(seq, None)
+                self._responses.pop(seq, None)
                 reason = self._failure_reason
             if reason:
                 raise DapRequestError(reason)
@@ -491,6 +525,10 @@ class DapProcess:
                     break
                 for message in messages:
                     self._dispatch(message)
+        except DapReaderBlockingError as exc:
+            # 事件回调（on_event）里同步等响应：护栏异常故意穿透回调兜底，这里要响亮地
+            # 结束读线程——finally 的 _fail_pending 会唤醒所有等待者，绝不静默半死。
+            logger.error("调试事件回调在读线程内同步等待响应（会死锁），已放弃该通道：%s", exc)
         except DapProtocolError:
             logger.debug("调试适配器读线程因协议错误结束", exc_info=True)
         except Exception:
@@ -555,6 +593,10 @@ class DapProcess:
                 body = message.get("body")
                 try:
                     self._on_event(str(message.get("event") or ""), body if isinstance(body, dict) else {})
+                except DapReaderBlockingError:
+                    # 护栏异常（回调内同步等响应）不许被下面的兜底吞掉：吞掉＝静默半死，
+                    # 必须让读线程结束并唤醒等待者（见 DapReaderBlockingError）。
+                    raise
                 except Exception:
                     # 事件回调异常不允许打断读线程，否则整条通道会静默死掉
                     logger.debug("调试事件回调异常", exc_info=True)

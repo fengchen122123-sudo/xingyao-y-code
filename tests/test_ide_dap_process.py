@@ -584,3 +584,123 @@ def test_real_adapter_timeout_then_late_response_keeps_channel_usable(tmp_path):
     process.terminate()
 
     assert spawned[0].poll() is not None
+
+
+# =====================================================================================
+# S3-T4 追加段：读线程内同步等待的运行时护栏 + 超时分支清 _responses
+# =====================================================================================
+
+
+def test_sync_request_inside_event_callback_is_rejected_not_deadlocked():
+    """读线程内同步等响应 = 自锁：护栏必须立刻抛 DapReaderBlockingError。
+
+    Global Constraints 的铁律：`on_event` 是在读线程内被同步调用的，回调里只能
+    `put_nowait` 投递事件，或改用 `send_request_async` + `await_response` 配对。
+    这条此前只有 docstring 约定、没有运行时护栏——写出违规代码的后果是整条会话静默
+    挂死（读线程在等自己的响应），因此这里把它变成「立刻可诊断的异常」。
+    """
+    out = _FakePipe()
+    proc = _FakeProc(out)
+    callback_threads, violations = [], []
+
+    def on_event(name, body):
+        callback_threads.append(threading.current_thread().name)
+        try:
+            process.send_request("threads", {}, timeout=5.0)
+        except Exception as exc:  # 违规的一方自己接住：护栏异常不该顺带毁掉通道
+            violations.append(exc)
+
+    process = DapProcess(
+        _spec(), cwd="", on_event=on_event, spawn=lambda command, cwd: proc, request_timeout=1.0
+    )
+    process.start()
+    try:
+        out.feed(encode_message({
+            "seq": 1, "type": "event", "event": "stopped", "body": {"threadId": 1},
+        }))
+        assert _wait_until(lambda: len(violations) == 1)
+
+        assert callback_threads == ["ide-dap-reader"], "回调必须在读线程内同步执行（铁律前提）"
+        assert isinstance(violations[0], dm.DapReaderBlockingError)
+        assert "死锁" in str(violations[0])
+        assert process._waiters == {}, "被拦下的请求不许留下孤儿 waiter"
+
+        # 护栏只拦违规请求，不牵连通道：读线程仍在读，后续请求照常配对
+        seq = process.send_request_async("threads", {})
+        out.feed(encode_message({
+            "seq": 2, "type": "response", "request_seq": seq, "success": True,
+            "body": {"threads": [{"id": 1, "name": "MainThread"}]},
+        }))
+        assert process.await_response(seq) == {"threads": [{"id": 1, "name": "MainThread"}]}
+        assert process.is_alive()
+    finally:
+        process.terminate()
+
+
+def test_uncaught_reader_violation_fails_channel_instead_of_hanging():
+    """回调没接住护栏异常时：必须让会话明确失败，而不是留下永久阻塞的等待者。"""
+    out = _FakePipe()
+    proc = _FakeProc(out)
+
+    def on_event(name, body):
+        process.send_request("threads", {}, timeout=60.0)  # 故意不接住护栏异常
+
+    process = DapProcess(
+        _spec(), cwd="", on_event=on_event, spawn=lambda command, cwd: proc, request_timeout=10.0
+    )
+    process.start()
+    try:
+        seq = process.send_request_async("launch", {})
+        started = time.time()
+        out.feed(encode_message({
+            "seq": 1, "type": "event", "event": "stopped", "body": {"threadId": 1},
+        }))
+
+        with pytest.raises(DapRequestError):
+            process.await_response(seq, timeout=10.0)
+
+        assert time.time() - started < 5.0, "违规后必须立刻唤醒等待者，不能白等到超时"
+        assert _wait_until(lambda: not process._reader.is_alive())
+        assert process._waiters == {} and process._responses == {}
+    finally:
+        process.terminate()
+
+
+def test_timeout_drops_response_stored_just_after_wait_returned():
+    """超时分支必须连 `_responses` 一起清：迟到响应可能卡在 wait 与 pop 之间。
+
+    竞态：`waiter.wait()` 返回 False（超时）之后、`pop` 之前，读线程完全可能刚把这条
+    响应 `_responses[seq] = ...` 存下。seq 单调递增、永不复用，只摘 waiter 会让该条目
+    永久滞留（内存只涨不降）。这里用受控交错复现：在「wait 返回 False 的同一瞬间」让
+    读线程真的把响应存进来。
+    """
+    out = _FakePipe()
+    proc = _FakeProc(out)
+    process = _make_process(proc, request_timeout=0.05)
+    seq = process.send_request_async("threads", {})
+
+    class _LateStoreEvent:
+        """假 waiter：wait() 里先让读线程存下响应，再返回 False（等价于超时那一瞬）。"""
+
+        def set(self):
+            pass
+
+        def is_set(self):
+            return False
+
+        def wait(self, timeout=None):
+            process._dispatch({
+                "seq": 99, "type": "response", "request_seq": seq, "success": True,
+                "command": "threads", "body": {"threads": []},
+            })
+            return False
+
+    process._waiters[seq] = _LateStoreEvent()
+    try:
+        with pytest.raises(DapRequestError, match="超时"):
+            process.await_response(seq)
+
+        assert process._responses == {}, "超时后不许在 _responses 里留下永不回收的响应"
+        assert process._waiters == {}
+    finally:
+        process.terminate()
