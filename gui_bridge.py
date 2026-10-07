@@ -609,6 +609,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # terminated 后由读线程投递出去的「临时回收线程」（见 _discard_debug_session）：
         # 关停时 join 它们，保证适配器进程一定被收掉，不留孤儿
         self._debug_reapers: List[threading.Thread] = []
+        # 被调试程序是否已退出（收到 dap_exited）：DAP 里 exited 只表示「被调试程序结束」，
+        # 会话未必结束。只用来放行「重新开始调试」时回收旧会话，不在 exited 时丢会话
+        # （否则 restart 这类合法流程会被误杀）
+        self._debug_debuggee_exited = False
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
@@ -8404,6 +8408,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         if event_type == "dap_stopped":
             self._debug_last_thread_id = int(data.get("thread_id") or 0)
             self._debug_last_frame_id = int(data.get("frame_id") or 0)
+            self._debug_debuggee_exited = False
+        elif event_type == "dap_continued":
+            self._debug_debuggee_exited = False
+        elif event_type == "dap_exited":
+            # 被调试程序已退出，但**会话（适配器进程）未必结束**：DAP 里 exited 与
+            # terminated 是两件事，restart 这类「重启被调试程序」的流程在 exited 之后
+            # 仍然合法。所以这里只记事实、不去动会话引用，只把它当作「重新开始调试时
+            # 可以安全回收旧会话」的依据（见 ide_debug_start；S3-T9 评审）。
+            self._debug_debuggee_exited = True
         elif event_type == "dap_terminated":
             # 程序自然结束时适配器推 terminated：这里必须把会话引用放掉（S3-T7 评审），
             # 否则上面那个「已有调试会话在运行」的判重会把**已经结束的会话**当成在跑的
@@ -8451,6 +8464,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         with self._debug_lock:
             session = self._debug_session
             self._debug_session = None
+            self._debug_debuggee_exited = False
             reaper = None
             if session is not None:
                 reaper = threading.Thread(
@@ -8487,6 +8501,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         with self._debug_lock:
             session = self._debug_session
             self._debug_session = None
+            self._debug_debuggee_exited = False
             reapers = list(self._debug_reapers)
         # 会话回收时一并复位线程/帧记忆：下一次调试不会继承上一会话的失效 id
         self._reset_debug_cursors()
@@ -8539,12 +8554,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
         with self._debug_lock:
             existing = self._debug_session
-        if existing is not None and existing.is_alive():
+            debuggee_exited = self._debug_debuggee_exited
+        if existing is not None and existing.is_alive() and not debuggee_exited:
             return {"ok": False, "msg": "已有调试会话在运行，请先停止"}
         if existing is not None:
             # 会话对象还在、但适配器已经不可用（程序自然结束推了 terminated，或适配器进程
-            # 意外退出连 terminated 都没送到）：先回收掉再放行。只看 `is not None` 会让
-            # 用户重新开始调试时永远拿到「已有调试会话在运行」却无会话可停（S3-T7 评审）。
+            # 意外退出连 terminated 都没送到），或者适配器只发了 exited 而进程还赖着不走
+            # （DAP 里 exited 只表示**被调试程序**退出，会话未必结束）：先回收掉再放行。
+            # 只看 `is not None` 会让用户重新开始调试时永远拿到「已有调试会话在运行」却
+            # 无会话可停（S3-T7 评审）；exited 这条是 S3-T9 评审补的：前端
+            # reduceDapEvent('dap_exited') 会清空 sessionId、界面据此放行「再次开始调试」，
+            # 后端不认 exited 就会两边打架。
             self._shutdown_debug_session()
         real = _resolve_real_path(path)
         if not os.path.isfile(real):
@@ -8626,8 +8646,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": f"设置断点失败：{e}"}
         return {"ok": True, "pending": False, "verified": verified}
 
-    def ide_debug_command(self, command: str) -> Dict[str, Any]:
-        """调试控制：continue / pause / next / stepIn / stepOut / restart。"""
+    def ide_debug_command(self, command: str, thread_id: int = 0) -> Dict[str, Any]:
+        """调试控制：continue / pause / next / stepIn / stepOut / restart。
+
+        `thread_id` 可选：显式传 >0 的线程号时优先用它（暂停的典型时机是「程序正在
+        运行」，此时还没有 dap_stopped 记录、桥层记忆是 0，前端先取线程表拿到真实线程号
+        再传进来；S3-T9 评审）；传 0/不传时沿用既有回退逻辑（桥层记忆 → 会话自报）。
+        """
         from core.ide.dap_manager import DapProtocolError, DapRequestError
         from core.ide.debug_session import DebugSessionError
 
@@ -8648,7 +8673,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": "调试未启动"}
         # 当前暂停线程来自 dap_stopped（桥层记录）；DebugSession 自己不带这个状态，
         # 用 0 发 continue/next 会被适配器拒绝（"thread not found"）
-        thread_id = self._debug_thread_id() or int(getattr(session, "_active_thread_id", 0) or 0)
+        thread_id = int(thread_id or 0)
+        if thread_id <= 0:
+            thread_id = self._debug_thread_id() or int(getattr(session, "_active_thread_id", 0) or 0)
         try:
             handler(session, int(thread_id or 0))
         except (DebugSessionError, DapProtocolError, DapRequestError) as e:

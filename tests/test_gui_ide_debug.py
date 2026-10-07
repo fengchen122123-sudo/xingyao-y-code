@@ -117,6 +117,7 @@ def _make_bridge(workdir):
     instance._debug_last_thread_id = 0
     instance._debug_last_frame_id = 0
     instance._debug_reapers = []
+    instance._debug_debuggee_exited = False
     instance._current_session = "s1"
     instance._session_workdir = lambda name: workdir
     return instance
@@ -477,6 +478,69 @@ def test_shutdown_debug_session_helper_reaps(workspace, source_file, monkeypatch
     bridge._shutdown_debug_session()
 
     assert created[0].stopped is True and bridge._debug_session is None
+
+
+def test_pause_accepts_explicit_thread_id(workspace, source_file, monkeypatch):
+    """S3-T9 评审：暂停的典型时机是「程序正在运行」，此时还没有 dap_stopped 记录，
+    桥层记忆是 0，发 threadId:0 的 pause 会被适配器拒成 thread not found。前端先取线程表
+    拿到真实线程号再传进来，桥层必须优先用它（传 0/不传时仍走既有回退逻辑）。"""
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+
+    assert bridge.ide_debug_command("pause", 42)["ok"] is True
+    # 显式线程号优先于（这里为 0 的）桥层记忆
+    assert created[0].commands == [("pause", 42)]
+    # 不传时仍走回退逻辑：没有 dap_stopped → 0
+    assert bridge.ide_debug_command("pause")["ok"] is True
+    assert created[0].commands[-1] == ("pause", 0)
+
+
+def test_restart_allowed_after_debuggee_exited_without_terminated(workspace, source_file, monkeypatch):
+    """适配器只发 exited（不发 terminated）且进程仍活：重新开始调试不能撞上「已有会话」判重。
+
+    S3-T9 评审：前端 `reduceDapEvent('dap_exited')` 会清空 sessionId、界面放行「再次开始
+    调试」，而后端只有 terminated 才清会话 → 两边打架。这里按「exited 只表示被调试程序
+    退出、会话未必结束」的 DAP 语义记事实，只在**用户重新开始调试**时回收旧会话。
+    """
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+
+    # 被调试程序退出，但适配器进程还活着，且没有 terminated
+    created[0].emit("dap_exited", {"session_id": "dap-fake", "exit_code": 0})
+    assert created[0].is_alive() is True
+
+    res = bridge.ide_debug_start(source_file)
+
+    assert res["ok"] is True
+    assert created[0].stopped is True  # 旧会话被回收（否则适配器变孤儿）
+    assert len(created) == 2
+
+
+def test_start_still_rejected_while_debuggee_running_after_exited_then_continued(
+    workspace, source_file, monkeypatch
+):
+    """exited 只是「被调试程序结束」的标记，不能变成绕过判重的后门。
+
+    restart 之后被调试程序又跑起来了（dap_continued / dap_stopped），此时再开新调试
+    必须照旧被拒——否则会把运行中的会话连人带进程收掉。
+    """
+    _patch_probe(monkeypatch)
+    created = _patch_session(monkeypatch)
+    bridge = _make_bridge(workspace)
+    bridge.ide_debug_start(source_file)
+
+    created[0].emit("dap_exited", {"session_id": "dap-fake", "exit_code": 0})
+    created[0].emit("dap_continued", {"session_id": "dap-fake", "thread_id": 1})
+
+    res = bridge.ide_debug_start(source_file)
+
+    assert res["ok"] is False and "已有调试会话" in res["msg"]
+    assert created[0].stopped is False
+    assert len(created) == 1
 
 
 def test_availability_lists_adapters(workspace, monkeypatch):
