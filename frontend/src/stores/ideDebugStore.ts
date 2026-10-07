@@ -212,12 +212,30 @@ export const useIdeDebugStore = defineStore('ideDebug', {
       this.debugState = 'stopped';
     },
 
-    async sendCommand(command: string) {
+    async sendCommand(command: string, threadId = 0) {
       const api = debugApi();
       if (!api?.ide_debug_command) return { ok: false, msg: '后端桥未就绪' };
-      const res = await api.ide_debug_command(command);
+      // 只在明确拿到线程号时才带第二个参数：不改变既有单参调用口径（回退逻辑在后端）
+      const res = threadId
+        ? await api.ide_debug_command(command, threadId)
+        : await api.ide_debug_command(command);
       if (!res?.ok) this.lastError = String(res?.msg ?? '调试命令失败');
       return res ?? { ok: false };
+    },
+
+    /**
+     * 暂停：运行中还没有 `dap_stopped` 记录，`threadId` 可能是 0，而适配器会把
+     * `threadId: 0` 的 pause 拒成 "thread not found"。先取线程表拿一个真实线程号，
+     * 取不到才退回 0，由后端按既有回退逻辑处理（S3-T9 评审补的缺口）。
+     */
+    async pauseDebug() {
+      const api = debugApi();
+      let threadId = this.threadId;
+      if (!threadId && api?.ide_debug_threads) {
+        const res = await api.ide_debug_threads();
+        threadId = Number(res?.threads?.[0]?.id ?? 0);
+      }
+      return this.sendCommand('pause', threadId);
     },
 
     async setBreakpointsFor(path: string) {
