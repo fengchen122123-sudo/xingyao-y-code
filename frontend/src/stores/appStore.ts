@@ -4774,6 +4774,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const res = await api.toggle_plugin(name, enabled);
         if (res && res.ok) {
           this.plugins = res.plugins || this.plugins;
+          // 插件启停会增删 provider 与模型（opencode_zen 启用时自举 provider、
+          // 禁用时按来源标记回收），只更新 plugins 会让模型列表停在旧快照，
+          // 用户必须重启星瑶才能看到变化。与 add_provider 同一模式：
+          // 后端回传 settings 就即时应用，模型选择器随开关立即刷新。
+          if (res.settings) this.applyModelSettings(res.settings);
           this.notifyModal('插件', res.msg || '插件状态已更新');
         } else {
           this.notifyModal('插件', '插件状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'));
