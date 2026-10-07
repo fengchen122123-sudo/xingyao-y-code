@@ -141,3 +141,68 @@ def test_lsp_sync_workspace_is_idempotent(tmp_path, monkeypatch):
     assert second["recycled"] == []
     assert manager.status(None) == []
     assert all(not _pid_alive(pid) for pid in pids)
+
+
+def test_ensure_server_rejects_stale_epoch(tmp_path):
+    """过期令牌直接拒绝启动，绝不静默建槽（S2 验收欠账 1，管理器级）。"""
+    import pytest
+
+    from core.ide.lsp_manager import LspStartError
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    manager = _manager(tmp_path)
+
+    stale = manager.current_epoch()
+    manager.recycle_all()  # 取完令牌之后发生了一次回收
+    assert manager.current_epoch() != stale
+
+    with pytest.raises(LspStartError, match="过期"):
+        manager.ensure_server(str(ws), "python", epoch=stale)
+
+    assert manager.status(None) == []  # 没建槽，也就没有进程
+    # 不带令牌（内部重启等既有调用方）保持向后兼容
+    manager.recycle_all()
+
+
+def test_stale_epoch_request_does_not_respawn_old_workspace_server(tmp_path, monkeypatch):
+    """取到旧 (workspace, epoch) → 回收 → 带着旧令牌的请求不得给旧工作区重拉进程。
+
+    竞态窗口：`_lsp_workspace_token()` 取 workspace/epoch 与 `ensure_server` 真正
+    建槽之间会穿插路径校验、可执行文件探测等动作。若这中间工作区被回收，旧的
+    `ensure_server` 会给**旧工作区**重新建槽并拉起一个全新进程（新世代号，
+    世代护栏拦不住），而且此后 `_lsp_workspace` 已是新工作区、下一次 guard 判定
+    「无变化」不再回收——那个进程会一直活到下次切换或 close()。
+    """
+    ws1 = tmp_path / "ws1"
+    ws1.mkdir()
+    f1 = ws1 / "a.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+    manager = _manager(tmp_path)
+    bridge = _make_bridge(str(ws1), tmp_path, monkeypatch, manager)
+
+    assert bridge.lsp_request(str(f1), "test/echo", {})["ok"] is True
+    procs = [slot["proc"] for slot in manager._slots.values()]
+    assert len(procs) == 1
+    old_pid = procs[0].pid
+    assert _pid_alive(old_pid) is True
+
+    # 精确复现竞态：guard 已经返回 (ws1, epoch)，此时回收插进来，然后才建槽
+    original_request = manager.request
+
+    def racing_request(workspace, language_id, method, params=None, *, timeout=None, epoch=None):
+        manager.recycle_all()
+        return original_request(
+            workspace, language_id, method, params, timeout=timeout, epoch=epoch
+        )
+
+    monkeypatch.setattr(manager, "request", racing_request)
+
+    res = bridge.lsp_request(str(f1), "test/echo", {})
+
+    assert res["ok"] is False
+    assert "过期" in res["msg"]
+    # 旧进程确实被回收，且**没有**被重新拉起：用 pid 向操作系统求证，不看对象字段
+    assert _pid_alive(old_pid) is False
+    assert manager.status(None) == []
+    assert manager._started == []

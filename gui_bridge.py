@@ -3498,11 +3498,28 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             self._lsp_workspace = workspace
         return workspace
 
+    def _lsp_workspace_token(self) -> tuple:
+        """取 (workspace, epoch)：两者必须同源取出，缺一都堵不住竞态窗口。
+
+        单取 workspace 是不够的（S2 验收欠账 1）：取到 workspace 与真正建槽之间
+        会穿插路径校验、语言识别、可执行文件探测等耗时动作，若这中间发生了工作区
+        回收，`LspManager.ensure_server` 会给**旧工作区**重新建槽并拉起全新进程
+        （世代护栏认的是新世代号，拦不住它），而此后 `_lsp_workspace` 已是新工作区，
+        下一次 guard 判定「无变化」不再回收——那个进程会一直活到下次切换或 close()。
+        把回收前取到的 epoch 一并交给 `ensure_server`，过期即拒绝启动。
+        epoch 与 workspace 都在 guard 之后取：guard 自身触发的回收会把 epoch 推进到
+        新值，这里读到的就是新工作区的有效令牌。
+        """
+        workspace = self._lsp_workspace_guard()
+        manager = getattr(self, "_lsp_manager", None)
+        epoch = manager.current_epoch() if manager is not None else 0
+        return workspace, epoch
+
     def lsp_request(self, path: str, method: str, params=None) -> Dict[str, Any]:
         from core.ide.lsp_manager import LspError, LspRequestError
 
         try:
-            workspace = self._lsp_workspace_guard()
+            workspace, epoch = self._lsp_workspace_token()
             real_path, deny = self._ide_guard(path, "preview")
             if deny:
                 return {"ok": False, "error": {"code": -32003, "message": deny}, "msg": deny}
@@ -3514,7 +3531,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 return {"ok": False, "error": {"code": -32000, "message": msg}, "msg": msg}
             manager = self._lsp_manager_instance()
             result = manager.request(
-                workspace, language_id, method, params or {}, timeout=self._LSP_REQUEST_TIMEOUT
+                workspace,
+                language_id,
+                method,
+                params or {},
+                timeout=self._LSP_REQUEST_TIMEOUT,
+                epoch=epoch,
             )
             return {"ok": True, "result": result}
         except LspRequestError as e:
@@ -3529,7 +3551,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         from core.ide.lsp_manager import LspError
 
         try:
-            workspace = self._lsp_workspace_guard()
+            workspace, epoch = self._lsp_workspace_token()
             real_path, deny = self._ide_guard(path, "preview")
             if deny:
                 return {"ok": False, "error": {"code": -32003, "message": deny}, "msg": deny}
@@ -3545,7 +3567,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 msg = "该文件类型未配置语言服务器，已降级为纯文本编辑"
                 return {"ok": False, "error": {"code": -32000, "message": msg}, "msg": msg}
             manager = self._lsp_manager_instance()
-            manager.notify(workspace, language_id, method, params or {})
+            manager.notify(workspace, language_id, method, params or {}, epoch=epoch)
             return {"ok": True}
         except LspError as e:
             return {"ok": False, "error": {"code": -32001, "message": str(e)}, "msg": str(e)}
