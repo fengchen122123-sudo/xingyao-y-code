@@ -503,6 +503,10 @@ _KNOWN_PROVIDER_KEYS = frozenset({
     # 历史功能键：dd839a0（2026-09-19）前的「预设模型删除痕迹」功能已移除，
     # 老配置可能残留此键，按兼容保留（不报未知，避免 strict 模式误阻断启动）。
     "removed_preset_models",
+    # 插件来源标记：插件自举 provider 时写入（core/plugin_loader 据此在插件禁用/
+    # 删除时精确回收，绝不误删用户手配厂商）。属于运行时合法键，不登记会让装过
+    # 插件的用户在 strict_config=true 下被 UnknownConfigKeysError 阻断启动。
+    "managed_by",
 })
 _KNOWN_MODEL_KEYS = frozenset({
     "id", "name", "litellm_model", "context_window", "supports_vision",
