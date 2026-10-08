@@ -41,6 +41,16 @@ export interface ModelInfo {
   computer_protocol: ComputerProtocolChoice;
   // 最大输出：null = 未设置（请求时走内置默认表）
   max_tokens?: number | null;
+  // 思考设置：choice 为当前持久化选择（未设置时 "default"）；
+  // options 为该模型真实支持的档位（后端按模型能力表给出，不猜测）；
+  // visible=false 的模型不展示思考设置，kind=fixed 的模型不可调（只读提示）。
+  reasoning_choice?: string;
+  reasoning_options?: { value: string; label: string }[];
+  reasoning_visible?: boolean;
+  reasoning_kind?: string;
+  // 内置官方默认档位（无依据的模型为空串）：打开弹窗且没有用户选择时自动预选
+  reasoning_default_choice?: string;
+  reasoning_disabled_reason?: string;
 }
 
 export interface ProviderInfo {
@@ -1003,6 +1013,7 @@ export interface PyWebViewAPI {
 
   set_model(modelId: string, sessionName?: string): Promise<any>;
   get_reasoning_snapshot(modelId: string): Promise<any>;
+  get_reasoning_snapshot_by_name(modelName: string): Promise<any>;
   set_reasoning_choice(modelId: string, choice: ReasoningChoice): Promise<any>;
   // 权限档位是会话级的：传 sessionName 只绑定该会话；不传则改全局默认
   set_permission_mode(mode: PermissionMode, sessionName?: string): Promise<any>;
@@ -1276,9 +1287,9 @@ export interface PyWebViewAPI {
   update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_provider_api_key(providerId: string): Promise<{ ok: boolean; api_key?: string; msg?: string }>;
   delete_provider(providerId: string): Promise<any>;
-  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
+  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null, reasoningChoice?: string | null): Promise<any>;
   fetch_provider_models(providerId: string): Promise<{ ok: boolean; msg?: string; models?: { id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[]; count?: number }>;
-  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
+  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null, reasoningChoice?: string | null): Promise<any>;
   delete_model(modelId: string): Promise<any>;
   test_model(modelId: string): Promise<any>;
   set_secondary_model(modelId: string): Promise<any>;
