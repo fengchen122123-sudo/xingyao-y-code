@@ -277,6 +277,57 @@ def test_fixed_reasoning_model_rejects_changes_without_writing(tmp_path, monkeyp
     assert cfg.read_bytes() == before
 
 
+def test_unregistered_model_accepts_generic_reasoning_effort(tmp_path, monkeypatch):
+    """未登记模型拿到通用强度能力后必须能真正持久化 default/off/强度档。
+
+    未登记模型不再是 hidden（hidden 已被 model_manager 拦截为"未声明可调思考能力"），
+    而是 effort 能力，用户要能为其保存 reasoning_effort；历史遗留的 "on" 已不在
+    档位表里，必须被拒绝。
+    """
+    data = _provider_config()
+    model = data["providers"][0]["models"][0]
+    model["name"] = "brand-new-model"
+    model["litellm_model"] = "openai/brand-new-model"
+    cfg = _use_tmp_config(tmp_path, monkeypatch, data)
+    model_manager.load_config()
+
+    for choice in ("off", "low", "high", "max"):
+        assert model_manager.set_model_reasoning_choice("m1", choice)[0]
+        on_disk = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0][
+            "models"
+        ][0]
+        assert on_disk["reasoning_choice"] == choice
+        assert model_manager.get_model_reasoning_choice("m1") == choice
+
+    assert model_manager.set_model_reasoning_choice("m1", "default")[0]
+    on_disk = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0]["models"][0]
+    assert "reasoning_choice" not in on_disk
+
+    # 历史遗留的 "on" 不再合法（兜底档位表已无 on），必须被拒绝且不写盘
+    before = cfg.read_bytes()
+    ok, message = model_manager.set_model_reasoning_choice("m1", "on")
+    assert not ok
+    assert "on" in message
+    assert cfg.read_bytes() == before
+
+
+def test_explicitly_hidden_model_rejects_reasoning_choice(tmp_path, monkeypatch):
+    """显式登记 hidden 的模型依旧被拦截，不可写入思考选择。"""
+    data = _provider_config()
+    model = data["providers"][0]["models"][0]
+    model["name"] = "sensenova-6.7-flash-lite"
+    model["litellm_model"] = "openai/sensenova-6.7-flash-lite"
+    cfg = _use_tmp_config(tmp_path, monkeypatch, data)
+    model_manager.load_config()
+    before = cfg.read_bytes()
+
+    ok, message = model_manager.set_model_reasoning_choice("m1", "off")
+
+    assert not ok
+    assert "未声明可调思考能力" in message
+    assert cfg.read_bytes() == before
+
+
 def test_reasoning_choice_rejects_invalid_or_missing_model(tmp_path, monkeypatch):
     """模型不支持的档位与不存在的 model_id 都不能落盘。"""
     data = _provider_config()
