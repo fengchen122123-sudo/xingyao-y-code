@@ -833,42 +833,87 @@ def test_explicit_config_max_tokens_wins_over_builtin_table(monkeypatch):
     assert opts["max_tokens"] == 8192
 
 
-def test_hidden_reasoning_model_silently_falls_back_to_default():
-    """能力表未登记的模型（厂商改名/新模型）忽略思考选择，不报错。
+def test_unregistered_model_default_choice_leaves_request_untouched():
+    """未登记模型在默认档绝不污染请求体：不注入任何思考参数。
 
-    GUI 为旧模型保存过 reasoning_choice 后，模型更名或换成未适配的
-    新模型时选择会命中 hidden 分支；约定一律静默回落默认档，
-    请求参数保持零思考覆盖，把对话连续性放在档位精确性之前。
+    未登记进能力表的模型（厂商新增、网关自定义名）不再是 hidden——那会让它们
+    凭空失去可操作的思考开关。现在它们拿通用 effort 能力，但"没存过任何思考
+    选择"时必须保持请求体零变化，这是老 hidden 静默回落想守护的核心意图。
     """
     from core.llm import _apply_reasoning_choice
 
-    for model_cfg in (
-        {"reasoning_choice": "high"},
-        {"enable_thinking": False},
-        {"reasoning_effort": "max"},
-    ):
+    for model_cfg in ({}, {"reasoning_choice": "default"}):
         result = {}
         capability = _apply_reasoning_choice(
             result, "openai/brand-new-model", model_cfg
         )
 
-        assert capability.kind == "hidden"
+        assert capability.kind == "effort"
+        assert capability.options == ("default", "off", "low", "medium", "high", "max")
         assert result == {}
 
 
-def test_hidden_reasoning_model_ignores_choice_without_touching_other_params():
-    """静默回落只跳过思考参数，不得清改请求里的其他字段。"""
+def test_unregistered_model_default_choice_keeps_other_params_intact():
+    """默认档的零注入只针对思考参数，不得清改请求里已有的其他字段。"""
     from core.llm import _apply_reasoning_choice
 
     result = {"max_tokens": 128000}
     capability = _apply_reasoning_choice(
         result,
         "openai/qwen-unknown-variant",
-        {"reasoning_choice": "off"},
+        {},
     )
 
-    assert capability.kind == "hidden"
+    assert capability.kind == "effort"
     assert result == {"max_tokens": 128000}
+
+
+def test_unregistered_model_explicit_choice_injects_reasoning_effort():
+    """未登记模型显式选择强度时只注入顶层 reasoning_effort，关闭注入 none。
+
+    未登记模型多为网关自定义名，走 OpenAI 标准字段（effort_switch）比厂商私有
+    的 thinking 对象被接受的概率更高。
+    """
+    from core.llm import _apply_reasoning_choice
+
+    for choice, expected in (("high", "high"), ("medium", "medium"), ("off", "none")):
+        result = {}
+        capability = _apply_reasoning_choice(
+            result,
+            "openai/brand-new-model",
+            {"reasoning_choice": choice},
+        )
+
+        assert capability.kind == "effort"
+        assert result["reasoning_effort"] == expected
+        assert "extra_body" not in result
+
+
+def test_explicitly_hidden_model_silently_falls_back_without_injection():
+    """显式登记为 hidden 的模型存过任何思考选择时依然静默回落、零注入。
+
+    hidden 是"已确认该模型不支持思考"的精确事实（如 sensenova-6.7-flash-lite），
+    与"只是没登记的新模型"不同：后者拿 toggle 可操作开关，前者必须继续走
+    _apply_reasoning_choice 里的 hidden 短路分支，不因残留的历史思考选择报错，
+    也不往请求体里注入任何思考参数。
+    """
+    from core.llm import _apply_reasoning_choice
+
+    for model_cfg in (
+        {"reasoning_choice": "on"},
+        {"reasoning_choice": "off"},
+        {"enable_thinking": True},
+        {"enable_thinking": False},
+        {"reasoning_effort": "high"},
+    ):
+        result = {"max_tokens": 128000}
+        capability = _apply_reasoning_choice(
+            result, "openai/sensenova-6.7-flash-lite", model_cfg
+        )
+
+        assert capability.kind == "hidden"
+        assert capability.options == ()
+        assert result == {"max_tokens": 128000}
 
 
 def test_unknown_deepseek_prefixed_model_applies_official_thinking_encoding(

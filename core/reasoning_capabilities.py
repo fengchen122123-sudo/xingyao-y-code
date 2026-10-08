@@ -21,9 +21,29 @@ class ReasoningCapability:
     options: tuple[str, ...]
     request_strategy: str
     disabled_reason: str = ""
+    # 官方默认档位：模型在不做任何覆盖时自己使用的档位，仅用于 GUI 打开弹窗时的
+    # 自动预选。没有官方依据的模型保持空串（不预选），不猜测。
+    default_choice: str = ""
 
 
+# 已确认该模型不支持思考（显式登记用）：GUI 侧隐藏思考按钮。
+# 注意它只用于"精确事实"的隐藏，不能当作"未登记"的兜底——那会让厂商新增
+# 或网关自定义名的模型凭空失去可操作的思考开关。
 HIDDEN_REASONING_CAPABILITY = ReasoningCapability("hidden", (), "hidden")
+
+# 未登记进能力表的模型（厂商新增、网关自定义名）：没有可依据的厂商事实，
+# 给出通用强度能力（默认/关闭/低/中/高/最高），由用户自行决定是否注入
+# reasoning_effort。不提供 "on"：effort_switch 策略下"开启但不定档"没有
+# 可靠表达，宁可不给这个档位，也不发一个会被网关拒绝的值。
+# 编码策略选 effort_switch（只注入顶层 reasoning_effort）而不是厂商私有的
+# thinking 对象：未登记模型多为网关自定义名，OpenAI 标准字段被接受的概率更高。
+# 与 HIDDEN_REASONING_CAPABILITY 的区别：hidden 是"已确认该模型不支持思考"的
+# 精确事实（显式登记），本兜底只是"尚未登记"，GUI 必须显示可操作的选项。
+UNKNOWN_REASONING_CAPABILITY = ReasoningCapability(
+    "effort",
+    ("default", "off", "low", "medium", "high", "max"),
+    "effort_switch",
+)
 REASONING_CAPABILITIES: dict[str, ReasoningCapability] = {}
 
 
@@ -49,12 +69,16 @@ _register(
         "effort",
         ("default", "off", "low", "high", "max"),
         "thinking_object_effort",
+        default_choice="high",
     ),
 )
 _register(
     ("deepseek-v4-pro",),
     ReasoningCapability(
-        "effort", ("default", "off", "high", "max"), "thinking_object_effort"
+        "effort",
+        ("default", "off", "high", "max"),
+        "thinking_object_effort",
+        default_choice="high",
     ),
 )
 _register(
@@ -63,6 +87,7 @@ _register(
         "effort",
         ("default", "off", "low", "high", "max"),
         "thinking_object_effort",
+        default_choice="high",
     ),
 )
 _register(
@@ -127,7 +152,8 @@ _register(
         "mimo-v2.5-pro",
     ),
     ReasoningCapability(
-        "toggle", ("default", "off", "on"), "thinking_object_toggle"
+        "toggle", ("default", "off", "on"), "thinking_object_toggle",
+        default_choice="on",
     ),
 )
 # 商汤 sensenova-6.8-flash-lite：官方文档 reasoning_effort 取值 low/medium/high/none
@@ -138,6 +164,7 @@ _register(
         "effort",
         ("default", "off", "low", "medium", "high"),
         "effort_switch",
+        default_choice="medium",
     ),
 )
 _register(
@@ -164,7 +191,8 @@ _register(
 _register(
     ("kimi-for-coding",),
     ReasoningCapability(
-        "effort", ("default", "low", "high", "max"), "always_on_effort"
+        "effort", ("default", "low", "high", "max"), "always_on_effort",
+        default_choice="max",
     ),
 )
 _register(
@@ -233,7 +261,8 @@ _register(
 # effort 默认 high。任何厂商中以 deepseek 开头（不区分大小写）的模型统一按此
 # 适配，无需逐个登记；能力表中的显式登记仅用于别名折叠等特例。
 _DEEPSEEK_PREFIX_CAPABILITY = ReasoningCapability(
-    "effort", ("default", "off", "low", "high", "max"), "thinking_object_effort"
+    "effort", ("default", "off", "low", "high", "max"), "thinking_object_effort",
+    default_choice="high",
 )
 
 # Agnes AI：OpenAI 兼容接口用 chat_template_kwargs.enable_thinking 开关思考，
@@ -274,6 +303,11 @@ def normalize_reasoning_model_name(model_name: str) -> str:
 
 
 def get_reasoning_capability(model_name: str) -> ReasoningCapability:
+    """按模型名取思考能力：显式登记 > 家族前缀规则 > 未登记兜底。
+
+    未登记模型不再隐藏，而是返回 UNKNOWN_REASONING_CAPABILITY（通用开关），
+    只有显式登记为 HIDDEN_REASONING_CAPABILITY 的模型才隐藏。
+    """
     normalized = normalize_reasoning_model_name(model_name)
     registered = REASONING_CAPABILITIES.get(normalized)
     if registered is not None:
@@ -284,7 +318,9 @@ def get_reasoning_capability(model_name: str) -> ReasoningCapability:
         return _AGNES_PREFIX_CAPABILITY
     if _model_leaf_name(normalized).startswith("glm-5.3"):
         return _GLM53_PREFIX_CAPABILITY
-    return HIDDEN_REASONING_CAPABILITY
+    # 未登记（厂商新增 / 网关自定义名）：没有可依据的厂商事实，给通用开关兜底，
+    # 让 GUI 仍能显示可操作的思考开关；显式的 hidden 登记已在上面命中返回。
+    return UNKNOWN_REASONING_CAPABILITY
 
 
 def build_reasoning_snapshot(model: dict | None, choice: str = "default") -> dict:
@@ -299,6 +335,7 @@ def build_reasoning_snapshot(model: dict | None, choice: str = "default") -> dic
         "disabled": fixed,
         "disabled_reason": capability.disabled_reason,
         "choice": "on" if fixed else choice,
+        "default_choice": capability.default_choice,
         "options": [
             {"value": value, "label": REASONING_LABELS[value]}
             for value in capability.options
