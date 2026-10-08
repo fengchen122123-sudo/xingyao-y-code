@@ -687,3 +687,212 @@ def test_fetch_provider_models_enriches_from_spec_table(tmp_path, monkeypatch):
     # 两边都没有 → 保持 None，由前端留空走内置默认
     assert by_id["unknown-model-xyz"]["context_window"] is None
     assert by_id["unknown-model-xyz"]["max_tokens"] is None
+
+
+def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypatch):
+    """模型条目必须带上思考设置字段，供模型编辑弹窗回填「思考设置」下拉。
+
+    - 已登记模型（deepseek-v4-pro）给出真实档位 default/off/high/max，
+      并带上官方默认档位 high；
+    - 未登记模型回落通用强度兜底 default/off/low/medium/high/max（无内置默认
+      档位，default_choice 为空串），而不是隐藏思考设置。
+    """
+    data = _configured_data()
+    data["providers"][0]["models"] = [
+        {
+            "id": "m1",
+            "name": "deepseek-v4-pro",
+            "litellm_model": "openai/deepseek-v4-pro",
+            "context_window": 200000,
+        },
+        {
+            "id": "m2",
+            "name": "hy4-preview",
+            "litellm_model": "openai/hy4-preview",
+            "context_window": 128000,
+        },
+    ]
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    bridge = _bare_bridge()
+
+    def _snapshot_models():
+        return {m["id"]: m for m in bridge.get_model_settings()["models"]}
+
+    known = _snapshot_models()["m1"]
+    assert known["reasoning_choice"] == "default"
+    assert known["reasoning_visible"] is True
+    assert known["reasoning_kind"] == "effort"
+    assert "default" in [opt["value"] for opt in known["reasoning_options"]]
+    assert known["reasoning_disabled_reason"] == ""
+    assert [opt["value"] for opt in known["reasoning_options"]] == [
+        "default", "off", "high", "max"
+    ]
+    # 已登记模型的官方默认档位随条目下发，供弹窗自动预选
+    assert known["reasoning_default_choice"] == "high"
+
+    # 未登记模型：通用强度兜底，GUI 仍显示可操作的思考设置
+    unknown = _snapshot_models()["m2"]
+    assert unknown["reasoning_visible"] is True
+    assert [opt["value"] for opt in unknown["reasoning_options"]] == [
+        "default", "off", "low", "medium", "high", "max"
+    ]
+    assert unknown["reasoning_default_choice"] == ""
+
+    ok, msg = model_manager.set_model_reasoning_choice("m1", "high")
+    assert ok is True, msg
+    assert _snapshot_models()["m1"]["reasoning_choice"] == "high"
+
+
+# ---------------- 思考设置随模型新增/编辑落库（reasoning_choice） ----------------
+
+
+def _data_with_model(name):
+    """构造只含一个指定名称模型的临时配置。"""
+    data = _configured_data()
+    data["providers"][0]["models"] = [
+        {
+            "id": "m1",
+            "name": name,
+            "litellm_model": f"openai/{name}",
+            "context_window": 200000,
+        }
+    ]
+    return data
+
+
+def test_add_model_persists_reasoning_choice(tmp_path, monkeypatch):
+    """add_model 传 reasoning_choice="max"：新增成功且思考档位落库。"""
+    _use_tmp_config(tmp_path, monkeypatch, _data_with_model("deepseek-v4-pro"))
+    bridge = _bare_bridge()
+
+    added = bridge.add_model(
+        "p1", "deepseek-v4-pro", 200000, True, True, "", None, "max"
+    )
+
+    assert added["ok"] is True, added["msg"]
+    model_id = added["model_id"]
+    stored = next(
+        model
+        for provider in json.loads(
+            (tmp_path / "config.json").read_text(encoding="utf-8")
+        )["providers"]
+        for model in provider["models"]
+        if model["id"] == model_id
+    )
+    assert stored["reasoning_choice"] == "max"
+    assert stored["reasoning_effort"] == "max"
+    assert model_manager.get_model_reasoning_choice(model_id) == "max"
+
+    # 不传 reasoning_choice 的旧调用不得改动思考设置（向后兼容）
+    plain = bridge.add_model("p1", "deepseek-v4-pro-b", 200000)
+    assert plain["ok"] is True, plain["msg"]
+    assert model_manager.get_model_reasoning_choice(plain["model_id"]) == "default"
+
+
+def test_update_model_persists_reasoning_choice(tmp_path, monkeypatch):
+    """update_model 传 reasoning_choice="high"：编辑成功且思考档位落库。"""
+    _use_tmp_config(tmp_path, monkeypatch, _data_with_model("deepseek-v4-pro"))
+    bridge = _bare_bridge()
+
+    result = bridge.update_model(
+        "p1", "m1", "deepseek-v4-pro", 200000, True, True, "", None, "high"
+    )
+
+    assert result["ok"] is True, result["msg"]
+    stored = next(
+        model
+        for provider in json.loads(
+            (tmp_path / "config.json").read_text(encoding="utf-8")
+        )["providers"]
+        for model in provider["models"]
+        if model["id"] == "m1"
+    )
+    assert stored["reasoning_choice"] == "high"
+    assert model_manager.get_model_reasoning_choice("m1") == "high"
+
+
+def test_update_model_rejects_unsupported_reasoning_choice_without_failing(
+    tmp_path, monkeypatch
+):
+    """非法档位（glm-5.3 不支持 off）：模型主体照常保存，思考设置只警告。"""
+    _use_tmp_config(tmp_path, monkeypatch, _data_with_model("glm-5.3"))
+    bridge = _bare_bridge()
+
+    result = bridge.update_model(
+        "p1", "m1", "glm-5.3-renamed", 256000, True, True, "", 8192, "off"
+    )
+
+    assert result["ok"] is True
+    assert "思考设置未生效" in result["msg"]
+    assert "off" in result["msg"]
+    stored = next(
+        model
+        for provider in json.loads(
+            (tmp_path / "config.json").read_text(encoding="utf-8")
+        )["providers"]
+        for model in provider["models"]
+        if model["id"] == "m1"
+    )
+    # 模型主体已更新，未被思考设置失败回滚
+    assert stored["name"] == "glm-5.3-renamed"
+    assert stored["context_window"] == 256000
+    assert stored["max_tokens"] == 8192
+    # 思考设置未生效，仍是默认
+    assert model_manager.get_model_reasoning_choice("m1") == "default"
+    assert "reasoning_choice" not in stored
+
+
+def test_stale_reasoning_choice_keeps_row_visible(tmp_path, monkeypatch):
+    """配置里存了能力表已不支持的档位（deepseek-v4-pro 无 low）时：
+
+    整行思考设置必须仍然可见（reasoning_visible is True），只把选择回退成
+    默认档。若在这里把 visible 置 False，用户就再也无法从 UI 改回合法档位
+    ——回归：此前 get_model_settings 的兜底会把整行隐藏。
+    """
+    data = _data_with_model("deepseek-v4-pro")
+    data["providers"][0]["models"][0]["reasoning_choice"] = "low"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    item = next(
+        model for model in _bare_bridge().get_model_settings()["models"]
+        if model["id"] == "m1"
+    )
+
+    assert item["reasoning_visible"] is True
+    assert item["reasoning_kind"] == "effort"
+    assert item["reasoning_choice"] == "default"
+    assert [opt["value"] for opt in item["reasoning_options"]] == [
+        "default", "off", "high", "max"
+    ]
+
+
+def test_get_reasoning_snapshot_by_name():
+    """按未落库的模型名预览思考能力（新增/改名时用），choice 恒为 default。"""
+    bridge = _bare_bridge()
+
+    known = bridge.get_reasoning_snapshot_by_name("deepseek-v4-pro")
+    assert known["ok"] is True
+    assert known["reasoning"]["kind"] == "effort"
+    assert [opt["value"] for opt in known["reasoning"]["options"]] == [
+        "default", "off", "high", "max"
+    ]
+    assert known["reasoning"]["choice"] == "default"
+    assert known["reasoning"]["visible"] is True
+    assert known["reasoning"]["default_choice"] == "high"
+
+    unknown = bridge.get_reasoning_snapshot_by_name("hy4-preview")
+    assert unknown["ok"] is True
+    assert unknown["reasoning"]["kind"] == "effort"
+    assert [opt["value"] for opt in unknown["reasoning"]["options"]] == [
+        "default", "off", "low", "medium", "high", "max"
+    ]
+    assert unknown["reasoning"]["default_choice"] == ""
+    assert unknown["reasoning"]["visible"] is True
+
+    hidden = bridge.get_reasoning_snapshot_by_name("sensenova-6.7-flash-lite")
+    assert hidden["ok"] is True
+    assert hidden["reasoning"]["visible"] is False
+    assert hidden["reasoning"]["kind"] == "hidden"
+
+    empty = bridge.get_reasoning_snapshot_by_name("")
+    assert empty["ok"] is False

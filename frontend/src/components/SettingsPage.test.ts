@@ -185,7 +185,8 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="model-supports-function-calling"]').setValue(true);
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
-    expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '', 0);
+    // 新增模型未定 ID、后端无从判断思考能力 → reasoningChoice 传 null（不落键）
+    expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '', 0, null);
   });
 
   it('blocks saving generic protocol without vision and function calling', async () => {
@@ -222,7 +223,7 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="model-computer-protocol-error"]').exists()).toBe(false);
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
-    expect(addModel).toHaveBeenCalledWith('p1', 'vision-model', 128000, true, true, 'generic', 0);
+    expect(addModel).toHaveBeenCalledWith('p1', 'vision-model', 128000, true, true, 'generic', 0, null);
     expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(false);
   });
 
@@ -286,6 +287,128 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
     expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(true);
+  });
+
+  it('renders no reasoning controls and sends null for the reasoning choice', async () => {
+    // 思考设置已从编辑弹窗下线：弹窗里不该有任何思考相关控件；
+    // 提交时一律传 null（后端语义 = 不落键），避免改上下文窗口这类无关操作覆盖既有档位。
+    // fixed 模型（始终开启思考）后端一律拒绝写入，若前端把回填的 "on" 传出去，
+    // 用户只改上下文窗口也会收到"思考设置未生效"的虚假警告。
+    const store = useAppStore();
+    const updateSpy = vi.spyOn(store, 'updateModel').mockResolvedValue({ ok: true } as never);
+    store.$patch({
+      providers: [
+        {
+          id: 'p1',
+          name: '测试厂商',
+          base_url: 'https://api.example.com',
+          protocol: 'responses',
+          has_api_key: true,
+          models: [
+            {
+              id: 'm1',
+              name: 'kimi-k2.7-code',
+              provider_id: 'p1',
+              provider_name: '测试厂商',
+              context_window: 200000,
+              supports_vision: true,
+              supports_function_calling: true,
+              computer_protocol: '',
+              // 与后端 build_reasoning_snapshot 的真实输出一致：fixed 的 options 为空
+              reasoning_choice: 'on',
+              reasoning_options: [],
+              reasoning_visible: true,
+              reasoning_kind: 'fixed',
+              reasoning_disabled_reason: '该模型始终开启思考',
+            },
+          ],
+        },
+      ],
+    });
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const editButton = wrapper.findAll('.configured-model-row .row-actions button')
+      .find(button => button.text() === '编辑');
+    await editButton!.trigger('click');
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+    await flushPromises();
+
+    expect(wrapper.findAll('[data-test^="model-reasoning"]').length).toBe(0);
+
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    expect(updateSpy.mock.calls[0]![8]).toBeNull();
+  });
+
+  it('keeps a stored reasoning level untouched when saving an unrelated edit', async () => {
+    const store = useAppStore();
+    const updateSpy = vi.spyOn(store, 'updateModel').mockResolvedValue({ ok: true } as never);
+    store.$patch({
+      providers: [
+        {
+          id: 'p1',
+          name: '测试厂商',
+          base_url: 'https://api.example.com',
+          protocol: 'responses',
+          has_api_key: true,
+          models: [
+            {
+              id: 'm1',
+              name: 'deepseek-v4-pro',
+              provider_id: 'p1',
+              provider_name: '测试厂商',
+              context_window: 200000,
+              supports_vision: true,
+              supports_function_calling: true,
+              computer_protocol: '',
+              reasoning_choice: 'default',
+              reasoning_options: [
+                { value: 'default', label: '默认' },
+                { value: 'off', label: '关闭' },
+                { value: 'high', label: '高' },
+                { value: 'max', label: '最高' },
+              ],
+              reasoning_visible: true,
+              reasoning_kind: 'effort',
+              reasoning_disabled_reason: '',
+            },
+          ],
+        },
+      ],
+    });
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const editButton = wrapper.findAll('.configured-model-row .row-actions button')
+      .find(button => button.text() === '编辑');
+    await editButton!.trigger('click');
+    // 编辑弹窗不再管理思考设置：弹窗里没有相关控件，保存时第 9 个参数必须传 null，
+    // 由后端保留用户已存的档位，而不是被弹窗里的默认值覆盖。
+    expect(wrapper.findAll('[data-test^="model-reasoning"]').length).toBe(0);
+
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+    await flushPromises();
+
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    const args = updateSpy.mock.calls[0];
+    // 思考设置是 updateModel 的第 9 个参数
+    expect(args.length).toBe(9);
+    expect(args[args.length - 1]).toBeNull();
+  });
+
+  it('does not probe reasoning capabilities while typing a model name', async () => {
+    // 编辑弹窗不再展示思考设置，输入模型名时不该再发探测请求
+    const store = useAppStore();
+    const probeSpy = vi.spyOn(store, 'getReasoningSnapshotByName').mockResolvedValue(null);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('deepseek-v4-pro');
+    await new Promise(resolve => setTimeout(resolve, 450));
+    await flushPromises();
+
+    expect(probeSpy).not.toHaveBeenCalled();
   });
 
   it('reveals the configured API key when clicking 显示', async () => {
