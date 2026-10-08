@@ -2364,6 +2364,21 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 按模型名预览思考能力（新增/改名时用）：仅查询不落库，
+    // 失败或异常一律返回 null，由调用方跳过更新，不弹提示打扰用户
+    async getReasoningSnapshotByName(modelName: string) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_reasoning_snapshot_by_name(modelName);
+        if (res && res.ok) return res.reasoning;
+        return null;
+      } catch (err) {
+        this.connected = false;
+        return null;
+      }
+    },
+
     async setPermissionMode(mode: PermissionMode) {
       const prev = this.permissionMode;
       const api = this._api();
@@ -5534,11 +5549,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
+    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
+        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
@@ -5555,11 +5570,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
+    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
+        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
           this.notifyModal('模型', res.msg || '模型已更新');

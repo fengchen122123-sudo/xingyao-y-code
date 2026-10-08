@@ -485,7 +485,23 @@ def _reasoning_snapshot_for_model(model: dict | None) -> dict:
     snapshot = build_reasoning_snapshot(model)
     model_id = str((model or {}).get("id") or "")
     if model_id and snapshot["kind"] not in {"fixed", "hidden"}:
-        snapshot["choice"] = get_model_reasoning_choice(model_id)
+        try:
+            snapshot["choice"] = get_model_reasoning_choice(model_id)
+        except ValueError:
+            # 配置里存的 reasoning_choice / reasoning_effort 已不在该模型当前能力表的
+            # 合法档位内（例如曾支持 low、后来能力表收窄）——这正是
+            # _reasoning_choice_from_model 的失效档位信号（只捕获 ValueError）。
+            # 这里绝不能把整行隐藏（置 reasoning_visible=False）：隐藏后 UI 不再渲染
+            # 思考设置行，用户就失去了从界面改回合法档位的入口，只能手改配置文件。
+            # 故只把选择回退为默认档展示，其余字段（visible / options / kind /
+            # disabled_reason）仍按能力表原样给出；用户下次保存时
+            # set_model_reasoning_choice 的正常校验会纠正落库值。
+            logger.debug(
+                "模型 %s 存了已失效的思考档位，按默认档展示: %s",
+                model_id,
+                model.get("reasoning_choice") or model.get("reasoning_effort"),
+            )
+            snapshot["choice"] = "default"
     return snapshot
 
 
@@ -3670,6 +3686,22 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             }
         except Exception as e:
             logger.exception("get_reasoning_snapshot 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_reasoning_snapshot_by_name(self, model_name: str) -> Dict[str, Any]:
+        """按模型名（尚未落库）返回思考能力快照，供新增模型/改名时即时预览档位。
+
+        与 get_reasoning_snapshot 的区别：后者按已保存的 model_id 查询配置，
+        能带出该模型持久化的思考选择；本方法只拿名字去推能力表，没有持久化
+        选择可读，因此返回的 choice 恒为 "default"。
+        """
+        try:
+            name = str(model_name or "").strip()
+            if not name:
+                return {"ok": False, "msg": "模型名不能为空"}
+            return {"ok": True, "reasoning": build_reasoning_snapshot({"name": name})}
+        except Exception as e:
+            logger.exception("get_reasoning_snapshot_by_name 失败")
             return {"ok": False, "msg": str(e)}
 
     def set_secondary_model(self, model_id: str) -> Dict[str, Any]:
@@ -7964,6 +7996,35 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         int(model["max_tokens"]) if model.get("max_tokens") else None
                     ),
                 }
+                # 思考设置（能力档位 + 已持久化选择），供模型编辑弹窗回填下拉。
+                # 单模型数据异常不得拖垮整个 get_model_settings（调用极频繁，
+                # 失败会让整个设置页打不开），故整体兜底到安全值。
+                try:
+                    reasoning = _reasoning_snapshot_for_model(model)
+                    item["reasoning_choice"] = str(reasoning.get("choice") or "default")
+                    item["reasoning_options"] = list(reasoning.get("options") or [])
+                    item["reasoning_visible"] = bool(reasoning.get("visible", False))
+                    item["reasoning_kind"] = str(reasoning.get("kind") or "hidden")
+                    item["reasoning_disabled_reason"] = str(
+                        reasoning.get("disabled_reason") or ""
+                    )
+                    # 内置官方默认档位（无依据的模型为空串）：前端打开弹窗时
+                    # 若配置里没有用户选择，就按它自动预选。
+                    item["reasoning_default_choice"] = str(
+                        reasoning.get("default_choice") or ""
+                    )
+                except Exception:
+                    logger.debug(
+                        "计算模型思考能力快照失败，回退安全值: %s",
+                        model.get("id"),
+                        exc_info=True,
+                    )
+                    item["reasoning_choice"] = "default"
+                    item["reasoning_options"] = []
+                    item["reasoning_visible"] = False
+                    item["reasoning_kind"] = "hidden"
+                    item["reasoning_disabled_reason"] = ""
+                    item["reasoning_default_choice"] = ""
                 provider_models.append(item)
                 models.append(dict(item))
             provider_item = {
@@ -8084,6 +8145,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("delete_provider 失败")
             return {"ok": False, "msg": str(e)}
 
+    def _apply_reasoning_choice(self, model_id: str, choice: str | None) -> str:
+        """保存模型的思考设置；返回人类可读的警告文本（成功返回空串）。
+
+        None = 不改动（旧前端调用语义）。失败时只警告，不抛异常——模型主体
+        已保存成功，不能因为思考档位不合法（例如给 glm-5.3 传 off）回滚编辑。
+        """
+        if choice is None:
+            return ""
+        ok, message = set_model_reasoning_choice(str(model_id), choice)
+        if ok:
+            return ""
+        logger.warning("模型 %s 的思考设置保存失败: %s", model_id, message)
+        return f"（思考设置未生效：{message}）"
+
     def add_model(
         self,
         provider_id: str,
@@ -8093,6 +8168,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         supports_function_calling: bool = True,
         computer_protocol: str = "",
         max_tokens: int | None = None,
+        reasoning_choice: str | None = None,
     ) -> Dict[str, Any]:
         try:
             if not str(model_name or "").strip():
@@ -8122,12 +8198,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 max_tokens=normalized_max_tokens,
             )
             self._sync_active_model_context()
+            warning = self._apply_reasoning_choice(model_id, reasoning_choice)
             return {
                 "ok": True,
                 "model_id": model_id,
                 "models": self._all_models(),
                 "settings": self.get_model_settings(),
-                "msg": f"已添加模型 {model_name}",
+                "msg": f"已添加模型 {model_name}{warning}",
             }
         except Exception as e:
             logger.exception("add_model 失败")
@@ -8143,6 +8220,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         supports_function_calling: bool | None = None,
         computer_protocol: str | None = None,
         max_tokens: int | None = None,
+        reasoning_choice: str | None = None,
     ) -> Dict[str, Any]:
         try:
             mm_update_model(
@@ -8157,7 +8235,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 max_tokens=max_tokens,
             )
             self._sync_active_model_context()
-            return {"ok": True, "settings": self.get_model_settings(), "msg": "模型已更新"}
+            warning = self._apply_reasoning_choice(model_id, reasoning_choice)
+            return {
+                "ok": True,
+                "settings": self.get_model_settings(),
+                "msg": f"模型已更新{warning}",
+            }
         except Exception as e:
             logger.exception("update_model 失败")
             return {"ok": False, "msg": str(e)}

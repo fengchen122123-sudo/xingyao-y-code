@@ -716,10 +716,13 @@ const secondaryRoles = computed({
   get: () => store.secondaryModelRoles,
   set: (v: { vision: boolean; compression: boolean; subagent: boolean }) => { store.secondaryModelRoles = v; },
 });
+
 const modelModal = reactive({
   show: false,
   model_id: '',
   name: '',
+  // 打开弹窗时的原始模型名：用于判断用户是否改过名字（未改名不必探测）
+  original_name: '',
   context_window: 128000,
   // 最大输出：'' = 留空（请求时走内置默认表）
   max_tokens: '' as number | '',
@@ -924,6 +927,7 @@ function openModelModal(model?: ModelInfo) {
   modelModal.show = true;
   modelModal.model_id = model?.id || '';
   modelModal.name = model?.name || '';
+  modelModal.original_name = model?.name || '';
   modelModal.context_window = model?.context_window || 128000;
   modelModal.max_tokens = model?.max_tokens || '';
   modelModal.supports_vision = model?.supports_vision || false;
@@ -988,19 +992,22 @@ async function saveModel() {
   saving.value = true;
   // 最大输出：留空 = 0（后端语义：新增不落键 / 编辑清除键，回到内置默认）
   const maxTokens = modelModal.max_tokens === '' ? 0 : Number(modelModal.max_tokens);
+  // 思考设置在编辑弹窗里已下线：一律传 null（后端语义 = 不落键、不改动既有配置），
+  // 避免改上下文窗口这类无关操作意外覆盖用户已保存的思考档位。
+  const reasoningChoice = null;
   let result;
   if (modelModal.model_id) {
     result = await store.updateModel(
       provider.id, modelModal.model_id, modelModal.name.trim(),
       Number(modelModal.context_window), modelModal.supports_vision,
       modelModal.supports_function_calling, modelModal.computer_protocol,
-      maxTokens,
+      maxTokens, reasoningChoice,
     );
   } else {
     result = await store.addModel(
       provider.id, modelModal.name.trim(), Number(modelModal.context_window), modelModal.supports_vision,
       modelModal.supports_function_calling, modelModal.computer_protocol,
-      maxTokens,
+      maxTokens, reasoningChoice,
     );
   }
   saving.value = false;
