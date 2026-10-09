@@ -756,6 +756,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
     rightPanelActiveTab: '' as RightPanelTabId | '',
     // IDE 模式：与 rightPanelTabs 同样按会话隔离
     ideModeBySession: {} as Record<string, boolean>,
+    // IDE 模式下右侧对话区是否收起：纯 UI 状态，不落盘——它只是「这一屏想不想看
+    // 对话」的临时选择。放在 appStore 而不是 IdeLayout 的本地 ref，是因为收起/展开
+    // 两个入口分处不同组件：收起按钮在对话头部（App.vue），恢复入口在活动栏「星瑶」
+    // 动作（IdeLayout），组件本地状态跨不过这条边界。
+    ideChatCollapsed: false,
     // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
     // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
     // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
@@ -1554,7 +1559,80 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
 
     toggleIdeMode() {
-      this.ideModeBySession[this.currentSessionName] = !this.ideMode();
+      const next = !this.ideMode();
+      this.ideModeBySession[this.currentSessionName] = next;
+      // 切换后立刻落盘（后端按会话名分桶）：下次启动/切回该会话才能恢复同一模式。
+      // 不 await：持久化是尽力而为，不能卡住界面上的模式切换
+      void this.persistIdeMode(this.currentSessionName);
+      // 切到 IDE 模式 = 用户要看这个会话的工作区文件夹：确保文件树已加载。
+      // 不 await：拉树可能耗时，模式切换本身要立即生效；未绑定工作区时
+      // ensureIdeWorkspace 会直接返回（欢迎页负责让用户选文件夹）
+      if (next) void this.ensureIdeWorkspace();
+    },
+
+    /**
+     * 把某会话的 IDE 模式写回后端（`save_session_ui`）。
+     *
+     * 失败静默（catch 掉）：模式持久化只是「重开软件后回到同一模式」的体验优化，
+     * 桥不可用 / 后端异常都不能阻断模式切换本身——与 ideStore 布局落盘的
+     * `persistLayout().catch(() => {})` 同一原则。
+     *
+     * 这里用静默取桥而不是 `_api()`：`_api()` 缺桥时会弹「连接失败」模态框，
+     * 而本动作可能在启动早期（bridgeReady 之前）被调用。
+     */
+    async persistIdeMode(session: string) {
+      const api = (window.pywebview && window.pywebview.api) || null;
+      if (!api?.save_session_ui) return;
+      try {
+        await api.save_session_ui(session, {
+          version: 1,
+          ide_mode: !!this.ideModeBySession[session],
+        });
+      } catch { /* 尽力而为：落盘失败不影响本次切换，下次切换会重试 */ }
+    },
+
+    /**
+     * 从后端恢复某会话的 IDE 模式（启动初始化 / 切换会话时调用）。
+     *
+     * **不覆盖用户的实时切换**：本动作是异步的，请求在途期间用户完全可能已经
+     * 手动切过模式（甚至已经切走会话）。因此后端值只在本地还没有该会话记录时
+     * 作为初值写入；本地已有记录（含显式 `false`）一律以本地为准。await 之后
+     * 再判一次，挡住「await 期间用户刚切过」的窗口。
+     */
+    async restoreIdeMode(session: string) {
+      if (session in this.ideModeBySession) return;
+      const api = (window.pywebview && window.pywebview.api) || null;
+      if (!api?.get_session_ui) return;
+      try {
+        const res = await api.get_session_ui(session);
+        if (res?.ok && res.ui?.ide_mode && !(session in this.ideModeBySession)) {
+          this.ideModeBySession[session] = true;
+        }
+      } catch { /* 取不到就保持对话模式：模式是可选的界面偏好，不该报错打扰用户 */ }
+    },
+
+    /**
+     * 会话名变化时迁移 IDE 模式的桶（`''` → 真实名；重命名 old → new）。
+     *
+     * 为什么必须迁移：草稿会话（未落库）统一挂在 `''` 桶上，而 `''` 桶是多个新
+     * 会话共用的。不迁移的话，在草稿里切到 IDE 模式后，下一个新会话一进来就会
+     * 继承这个模式（串模式）；反之删除 `''` 键则让每个新会话回到对话模式。
+     *
+     * 目标桶已有记录时以它自己为准，不搬运覆盖（与 ideStore.setSession 的
+     * `''` 桶标签迁移同一口径）。旧键在后端的记录删不掉——桥只有 get / save，
+     * 没有删除接口——只能留在 session_ui.json 里；它只在会话名恰好等于旧名时
+     * 才被读到，不会影响真实会话。
+     */
+    _moveIdeModeBucket(oldName: string, newName: string) {
+      if (!newName || oldName === newName) return;
+      const prev = this.ideModeBySession[oldName];
+      if (prev === undefined) return;
+      if (!(newName in this.ideModeBySession)) {
+        this.ideModeBySession[newName] = prev;
+      }
+      delete this.ideModeBySession[oldName];
+      // 迁移后按新名落盘：否则重开软件时按新名查不到模式（旧名那条成为孤儿记录）
+      void this.persistIdeMode(newName);
     },
 
     // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
@@ -2214,6 +2292,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         void this.refreshHooks();
         this.workdir = init.workdir || '';
         this.currentSessionName = (init as any).current_session || '';
+        // 会话名就位后恢复该会话的 IDE 模式（后端权威副本）：重开软件要回到
+        // 上次离开时的模式，而不是每次都从对话模式开始
+        void this.restoreIdeMode(this.currentSessionName);
         // 工作区标签以“当前会话归属”为准：GLOBAL 会话显示“对话”，
         // 不能直接用启动目录，否则会显示在工作区里、消息却发进自由对话
         const isGlobal = !!(init as any).is_global;
@@ -3033,6 +3114,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const runtimePerm = this._getSessionRuntime(sessionName);
           runtimePerm.permMode = res.permission_mode;
         }
+
+        // 切换成功后再恢复该会话的 IDE 模式（后端权威副本）。放在响应处理末端：
+        // 过期响应（用户已切走）在函数开头就 return 了，不会走到这里
+        void this.restoreIdeMode(sessionName);
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
@@ -3155,6 +3240,34 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.fileTreeExpanded = stillExists;
       } catch { /* 刷新失败静默：保留旧树 */ }
       finally { this.fileTreeRefreshing = false; }
+    },
+
+    /**
+     * 确保当前会话的工作区文件夹已"打开"（= 文件树已加载）。
+     *
+     * 服务的产品行为：「切到 IDE 模式之后文件夹要打开」——切模式是用户显式
+     * 表达"我要在这个工作区里看代码/改代码"，所以 IDE 侧栏必须马上有内容，
+     * 而不是等用户再去点一次刷新。
+     *
+     * 三条分支（前两条是用户明确确认的行为，不要改）：
+     * - `workdir` 为空（当前会话未绑定工作区）：**不自动弹目录选择器**，
+     *   直接返回，界面显示欢迎页，由用户点「打开文件夹」显式选择（欢迎页
+     *   UI 属 P6，本动作只负责不越权弹窗）；
+     * - 已绑定工作区但文件树为空：拉一次树（`refreshFileTree`），把结果写进
+     *   `fileTree`；
+     * - 文件树已加载：直接返回，不重复请求——模式切换是高频操作，每次都打
+     *   后端纯属浪费，还会让侧栏闪一下 loading。
+     *
+     * 失败不外泄：`refreshFileTree` 内部已 catch（失败保留旧树）并在 finally
+     * 复位 `fileTreeRefreshing`；这里再兜一层，保证调用方（toggleIdeMode 中的
+     * `void` 调用）不会产生未处理的 rejection，也不会把刷新态卡在 true。
+     */
+    async ensureIdeWorkspace() {
+      if (!this.workdir) return; // 未绑定工作区：留给欢迎页的「打开文件夹」按钮
+      if (this.fileTree.length > 0) return; // 树已加载：不重复打后端
+      try {
+        await this.refreshFileTree();
+      } catch { /* refreshFileTree 自身已静默处理；此处只保证不外泄 rejection */ }
     },
 
     async createGlobalSession() {
@@ -3334,6 +3447,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
             this.currentSessionName = res.name;
             this.currentSessionDisplayName = res.name;
           }
+          // IDE 模式桶随会话名迁移（用后端最终名 res.name：撞名时后端会加后缀，
+          // 按用户输入的 target 迁会迁到一个不存在的会话名下）
+          if (res.name) this._moveIdeModeBucket(oldName, res.name);
         } else {
           this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
@@ -3571,6 +3687,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.sessionRuntimeByName[sessionName] = this.sessionRuntimeByName[draftKey] || createSessionRuntime();
           delete this.sessionRuntimeByName[draftKey];
           this.currentSessionName = sessionName;
+          // 草稿会话（'' 桶）拿到真实名：把 IDE 模式迁到真实会话名下，
+          // 否则这个模式会留在共用的 '' 桶里串给下一个新会话
+          this._moveIdeModeBucket('', sessionName);
         }
         if (!willQueue) {
           this._setSessionRunning(sessionName, true);
@@ -4319,6 +4438,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           if (this.permRequest.sessionName === data.old) {
             this.permRequest.sessionName = data.new;
           }
+          // IDE 模式桶随会话名迁移：后端首条消息后会把 session_xxxxxx 自动改成
+          // 消息标题并推本事件，不迁移的话模式留在旧名下，重开软件就恢复不出来
+          this._moveIdeModeBucket(String(data.old), String(data.new));
         }
         this.sessionGroups.forEach(g => {
           (g.sessions || []).forEach(s => {
