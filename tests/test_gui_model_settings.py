@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import config
 import core.model_manager as model_manager
 import core.llm as llm
-from core.llm_policy import DEFAULT_USER_AGENT
+from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 from gui_bridge import ApiBridge
 
 
@@ -524,7 +524,7 @@ def test_fetch_provider_models_adds_tokenrhythm_agent_header(tmp_path, monkeypat
     result = _bare_bridge().fetch_provider_models("p1")
 
     assert result["ok"] is True
-    assert captured["headers"]["X-TokenRhythm-Agent"] == DEFAULT_USER_AGENT
+    assert captured["headers"]["X-TokenRhythm-Agent"] == TOKENRHYTHM_AGENT_NAME
 
 
 def test_fetch_provider_models_omits_tokenrhythm_agent_header_for_other_providers(
