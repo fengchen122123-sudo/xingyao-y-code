@@ -535,6 +535,137 @@ def test_call_tool_sync_timeout_returns_friendly_error(manager, tmp_path, monkey
     monkeypatch.setattr(mcp_client, "CALL_TOOL_TIMEOUT", 0.1)
 
     result = manager.call_tool_sync("srv__tool", {})
+    result = manager.call_tool_sync("srv__tool", {})
 
     assert result.startswith("🚨")
     assert "超时" in result
+
+
+# ── 连接失败原因可读（server_errors / last_error / 增删改如实反馈） ────
+
+class _RaisingStdioCM:
+    """stdio_client 替身：进入即抛错，用于稳定复现连接失败（无网络、无外部依赖）。"""
+
+    def __init__(self, message="Connection closed"):
+        self._message = message
+
+    async def __aenter__(self):
+        raise RuntimeError(self._message)
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_connect_failure_records_error_and_exposes_last_error(manager, tmp_path, monkeypatch):
+    """连接抛异常时记录脱敏原因，并通过 list_servers() 的 last_error 暴露给上层"""
+    _write_config(manager, tmp_path, {"s1": {"command": "node", "args": ["server.js"]}})
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _RaisingStdioCM())
+
+    asyncio.run(manager._connect_server("s1", {"command": "node", "args": ["server.js"]}))
+
+    assert "Connection closed" in manager.server_errors["s1"]
+    item = json.loads(manager.list_servers())[0]
+    assert item["connected"] is False
+    assert item["last_error"] and "Connection closed" in item["last_error"]
+
+
+def test_connect_rejected_by_launch_validation_records_reason(manager):
+    """启动校验失败（不存在的命令）同样要留下可读原因"""
+    asyncio.run(manager._connect_server("bad", {"command": "nonexistent-cmd"}))
+
+    assert "nonexistent-cmd" in manager.server_errors["bad"]
+
+
+def test_successful_connect_clears_server_error(manager, monkeypatch):
+    """连接成功必须清除该服务的历史失败原因"""
+    manager.server_errors["s1"] = "Connection closed"
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _FakeStdioCM())
+    monkeypatch.setattr(
+        mcp_client, "ClientSession", lambda r, w: _session_cm(_FakeSession(["alpha"]))
+    )
+
+    asyncio.run(manager._connect_server("s1", {"command": "node"}))
+
+    assert "s1" in manager.servers
+    assert "s1" not in manager.server_errors
+
+
+def test_disabled_server_skip_is_not_a_connection_error(manager, tmp_path):
+    """enabled=false 主动跳过的服务不算连接失败，不记录错误"""
+    _write_config(manager, tmp_path, {
+        "s1": {"command": "node", "args": [], "enabled": False}
+    })
+    manager._load_config()
+
+    asyncio.run(manager._connect_all())
+
+    assert "s1" not in manager.server_errors
+    assert "s1" not in manager.servers
+
+
+def test_list_servers_last_error_is_null_without_error(manager, tmp_path):
+    """无失败记录时 last_error 为 null"""
+    _write_config(manager, tmp_path, {"s1": {"command": "node", "args": []}})
+
+    item = json.loads(manager.list_servers())[0]
+
+    assert item["last_error"] is None
+
+
+def test_reconnect_clears_server_errors(manager, tmp_path):
+    """reconnect() 重置状态时必须一并清空 server_errors"""
+    _write_config(manager, tmp_path, {})
+    manager.server_errors["s1"] = "Connection closed"
+
+    ok, _ = manager.reconnect()
+
+    assert ok is True
+    assert manager.server_errors == {}
+
+
+def test_add_server_reports_connection_failure_reason(manager, tmp_path, monkeypatch):
+    """目标服务连不上时，add_server 不得再说“已新增服务”，必须给出失败原因"""
+    _write_config(manager, tmp_path, {})
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _RaisingStdioCM())
+
+    ok, message = manager.add_server("ghost", "node", ["server.js"])
+
+    assert ok is True, "配置已写盘，ok 仍为 True"
+    assert "已新增服务" not in message
+    assert "已写入 ghost 配置，但连接失败" in message
+    assert "Connection closed" in message
+    saved = json.loads((tmp_path / "mcp.json").read_text(encoding="utf-8"))
+    assert "ghost" in saved["mcpServers"]
+
+
+def test_add_server_reports_tool_count_when_connected(manager, tmp_path, monkeypatch):
+    """连接成功时 add_server 返回该 server 已就绪的工具数"""
+    _write_config(manager, tmp_path, {})
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _FakeStdioCM())
+    monkeypatch.setattr(
+        mcp_client, "ClientSession", lambda r, w: _session_cm(_FakeSession(["alpha", "beta"]))
+    )
+
+    ok, message = manager.add_server("s1", "node", ["server.js"])
+
+    assert ok is True
+    assert "已新增服务 s1（2 个工具）" in message
+
+
+def test_set_enabled_and_remove_do_not_claim_connection_success(manager, tmp_path, monkeypatch):
+    """禁用/删除后的消息不得暗示连接成功"""
+    _write_config(manager, tmp_path, {"s1": {"command": "node", "args": []}})
+
+    ok, message = manager.set_server_enabled("s1", False)
+
+    assert ok is True
+    assert "禁用" in message
+    assert "连接成功" not in message and "已启用" not in message
+
+    ok, message = manager.remove_server("s1")
+
+    assert ok is True
+    assert "已删除服务 s1" in message
+    assert "重新发起连接" not in message
+    saved = json.loads((tmp_path / "mcp.json").read_text(encoding="utf-8"))
+    assert "s1" not in saved["mcpServers"]
