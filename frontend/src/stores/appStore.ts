@@ -580,6 +580,11 @@ export const useAppStore = defineStore('app', {
       agent_turn_step_limit: 200,
       agent_turn_step_limit_min: 10,
       agent_turn_step_limit_max: 1000,
+      // 上下文水位基准：默认未设置（null，跟随模型真实窗口），
+      // 真实值一律以后端快照覆盖
+      context_watermark_base: null,
+      context_watermark_base_min: 50000,
+      context_watermark_base_max: 2000000,
       // AI 生成内容目录：默认目录与生效路径一律以后端快照覆盖，前端不猜路径
       ai_output_dir: '',
       ai_output_dir_setting: '',
@@ -2637,6 +2642,27 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.systemSettings = previous;
         this.connected = false;
         this.notifyModal('系统设置', '单任务最大模型轮次设置失败: ' + err);
+        return false;
+      }
+    },
+
+    async setContextWatermarkBase(value: number): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_context_watermark_base(value);
+        if (result && result.ok) {
+          this.systemSettings = result.settings;
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + err);
         return false;
       }
     },
@@ -4816,6 +4842,24 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('MCP 服务', '添加 MCP 服务失败: ' + err);
+      }
+    },
+
+    // 删除自定义 MCP 服务：从 mcp.json 移除配置，结果通过 mcp_status 事件回推
+    async removeMcpServer(name: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.remove_mcp_server(name);
+        if (res && res.ok) {
+          this.mcps = res.mcps || this.mcps;
+          this.notifyModal('MCP 服务', res.msg || '已删除');
+        } else {
+          this.notifyModal('MCP 服务', '删除失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('MCP 服务', '删除 MCP 服务失败: ' + err);
       }
     },
 
