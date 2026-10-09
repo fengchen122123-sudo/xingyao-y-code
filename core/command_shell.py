@@ -223,6 +223,13 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         get_ai_output_dir_setting as _get_ai_output_dir_setting,
         resolve_ai_output_dir as _resolve_ai_output_dir,
     )
+    # 上下文水位基准（memory_compression.watermark_base_tokens）：同样走函数内惰性导入，
+    # None 表示不设基准、按真实模型窗口的比例线计算。
+    from core.context_watermark import (
+        MAX_WATERMARK_BASE,
+        MIN_WATERMARK_BASE,
+        load_watermark_base,
+    )
 
     return {
         "command_shell": selected,
@@ -233,6 +240,10 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "agent_turn_step_limit": load_turn_step_limit(),
         "agent_turn_step_limit_min": MIN_TURN_STEP_LIMIT,
         "agent_turn_step_limit_max": MAX_TURN_STEP_LIMIT,
+        # 上下文水位基准：生效值（None = 不设基准、跟随真实窗口）/ 合法区间（设置页校验用）
+        "context_watermark_base": load_watermark_base(),
+        "context_watermark_base_min": MIN_WATERMARK_BASE,
+        "context_watermark_base_max": MAX_WATERMARK_BASE,
         "browser_control_enabled": computer.browser_control_enabled,
         "computer_control_enabled": computer.computer_control_enabled,
         "computer_browser": computer.computer_browser,

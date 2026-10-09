@@ -12,6 +12,13 @@ const turnStepLimitFields = {
   agent_turn_step_limit_max: 1000,
 };
 
+// 上下文水位基准设置：null 表示未设置（跟随模型真实窗口），取值范围由 min/max 给出
+const contextWatermarkFields = {
+  context_watermark_base: null as number | null,
+  context_watermark_base_min: 50000,
+  context_watermark_base_max: 2000000,
+};
+
 // AI 生成内容目录设置（Task 5）：setting 为原始配置值（未配置为空串），
 // default 为默认目录（占位符与说明文案展示用）
 const aiOutputDirFields = {
@@ -64,6 +71,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [
@@ -96,6 +104,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [
@@ -125,6 +134,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
@@ -148,6 +158,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
@@ -169,6 +180,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
@@ -183,6 +195,147 @@ describe('SystemSettings', () => {
     expect(save).not.toHaveBeenCalled();
   });
 
+  // ── 上下文水位基准 ──
+
+  function mountWithContextWatermark(overrides: Record<string, unknown> = {}) {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+      ...overrides,
+    } as typeof store.systemSettings;
+    return { store, wrapper: mount(SystemSettings) };
+  }
+
+  it('renders the context watermark base row with the bounds from the snapshot', () => {
+    const { wrapper } = mountWithContextWatermark();
+
+    const input = wrapper.get<HTMLInputElement>('[data-test="context-watermark-base-input"]');
+    const row = input.element.closest('.setting-row') as HTMLElement;
+
+    expect(row.querySelector('h2')?.textContent).toBe('上下文水位基准');
+    expect(input.attributes('min')).toBe('50000');
+    expect(input.attributes('max')).toBe('2000000');
+  });
+
+  it('shows an empty draft and disables saving while the watermark base is unset', () => {
+    const { wrapper } = mountWithContextWatermark();
+
+    expect(wrapper.get<HTMLInputElement>('[data-test="context-watermark-base-input"]').element.value).toBe('');
+    expect(wrapper.get('[data-test="save-context-watermark-base"]').attributes('disabled')).toBeDefined();
+  });
+
+  it('rejects a watermark base below the minimum without calling the store', async () => {
+    const { store, wrapper } = mountWithContextWatermark();
+    const save = vi.spyOn(store, 'setContextWatermarkBase').mockResolvedValue(true);
+
+    await wrapper.get('[data-test="context-watermark-base-input"]').setValue('49999');
+
+    expect(wrapper.get('[data-test="context-watermark-base-error"]').text()).toContain('50000–2000000');
+    expect(wrapper.get('[data-test="save-context-watermark-base"]').attributes('disabled')).toBeDefined();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('rejects a watermark base above the maximum without calling the store', async () => {
+    const { store, wrapper } = mountWithContextWatermark();
+    const save = vi.spyOn(store, 'setContextWatermarkBase').mockResolvedValue(true);
+
+    await wrapper.get('[data-test="context-watermark-base-input"]').setValue('2000001');
+
+    expect(wrapper.get('[data-test="context-watermark-base-error"]').text()).toContain('50000–2000000');
+    expect(wrapper.get('[data-test="save-context-watermark-base"]').attributes('disabled')).toBeDefined();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('accepts 0 as the explicit no-baseline value and submits it', async () => {
+    const { store, wrapper } = mountWithContextWatermark({ context_watermark_base: 500000 });
+    const save = vi.spyOn(store, 'setContextWatermarkBase').mockResolvedValue(true);
+
+    await wrapper.get('[data-test="context-watermark-base-input"]').setValue('0');
+
+    // 0 是「不设基准」（跟随模型真实窗口），不受 min/max 约束
+    expect(wrapper.find('[data-test="context-watermark-base-error"]').exists()).toBe(false);
+    const button = wrapper.get('[data-test="save-context-watermark-base"]');
+    expect(button.attributes('disabled')).toBeUndefined();
+
+    await button.trigger('click');
+
+    expect(save).toHaveBeenCalledWith(0);
+  });
+
+  it('saves an in-range watermark base through the bridge', async () => {
+    const next = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      context_watermark_base: 800000,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const setBase = vi.fn().mockResolvedValue({ ok: true, settings: next });
+    (window as any).pywebview = { api: { set_context_watermark_base: setBase } };
+    try {
+      const { store, wrapper } = mountWithContextWatermark();
+      const input = wrapper.get('[data-test="context-watermark-base-input"]');
+
+      await input.setValue('800000');
+
+      const button = wrapper.get('[data-test="save-context-watermark-base"]');
+      expect(button.attributes('disabled')).toBeUndefined();
+
+      await button.trigger('click');
+      await flushPromises();
+
+      expect(setBase).toHaveBeenCalledWith(800000);
+      expect(store.systemSettings.context_watermark_base).toBe(800000);
+    } finally {
+      delete (window as any).pywebview;
+    }
+  });
+
+  it('shows the inline error and rolls the draft back when saving the watermark base fails', async () => {
+    const unchanged = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      context_watermark_base: 500000,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const setBase = vi.fn().mockResolvedValue({ ok: false, msg: '范围错误', settings: unchanged });
+    (window as any).pywebview = { api: { set_context_watermark_base: setBase } };
+    try {
+      const { wrapper } = mountWithContextWatermark({ context_watermark_base: 500000 });
+      const input = wrapper.get<HTMLInputElement>('[data-test="context-watermark-base-input"]');
+      expect(input.element.value).toBe('500000');
+
+      await input.setValue('800000');
+      await wrapper.get('[data-test="save-context-watermark-base"]').trigger('click');
+      await flushPromises();
+
+      expect(setBase).toHaveBeenCalledWith(800000);
+      expect(wrapper.get('[data-test="context-watermark-base-error"]').text()).toContain('保存失败');
+      expect(input.element.value).toBe('500000');
+    } finally {
+      delete (window as any).pywebview;
+    }
+  });
+
   // ── AI 生成内容目录（Task 5）──
 
   it('saves the AI output directory through the store', async () => {
@@ -193,6 +346,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
@@ -218,6 +372,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
@@ -241,6 +396,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
@@ -268,6 +424,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
@@ -294,6 +451,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       ...overrides,
@@ -414,6 +572,7 @@ describe('computer active model capability hint', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
       ...aiOutputDirFields,
       ...computerSettings,
       ...overrides,
@@ -460,6 +619,7 @@ describe('doctor self-check entry', () => {
     command_shell_error: '',
     remote_token_ttl: 86400,
     ...turnStepLimitFields,
+    ...contextWatermarkFields,
     ...aiOutputDirFields,
     ...computerSettings,
     command_shell_options: [],

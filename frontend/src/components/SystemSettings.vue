@@ -85,6 +85,37 @@
       </p>
       <div class="setting-row">
         <div class="setting-copy">
+          <h2>上下文水位基准</h2>
+          <p>上下文压缩与折叠的触发水位按 min(模型窗口, 本值) 计算；留空或填 0 表示不设基准、直接跟随模型真实窗口。数值越大，维护触发越晚。例：1M 窗口填 800000 时，第一级折叠线落在 480000 tokens。</p>
+        </div>
+        <div class="setting-number-group">
+          <input
+            data-test="context-watermark-base-input"
+            v-model="contextWatermarkBaseDraft"
+            class="setting-number"
+            type="number"
+            step="1000"
+            :min="store.systemSettings.context_watermark_base_min"
+            :max="store.systemSettings.context_watermark_base_max"
+            :disabled="saving"
+            @input="contextWatermarkBaseSaveError = ''"
+          />
+          <button
+            data-test="save-context-watermark-base"
+            class="setting-save"
+            type="button"
+            :disabled="saving || !!contextWatermarkBaseError || !contextWatermarkBaseChanged"
+            @click="saveContextWatermarkBase"
+          >
+            保存
+          </button>
+        </div>
+      </div>
+      <p v-if="contextWatermarkBaseError" data-test="context-watermark-base-error" class="setting-error">
+        {{ contextWatermarkBaseError }}
+      </p>
+      <div class="setting-row">
+        <div class="setting-copy">
           <h2>AI 生成内容目录</h2>
           <p>AI 生成的图片、下载的网页图片与临时脚本统一落到此目录；留空恢复默认（{{ store.systemSettings.ai_output_dir_default }}）。</p>
         </div>
@@ -345,6 +376,63 @@ async function saveTurnStepLimit() {
     const saved = await store.setAgentTurnStepLimit(parsedTurnStepLimit.value);
     if (!saved) {
       turnStepLimitDraft.value = String(store.systemSettings.agent_turn_step_limit);
+    }
+  } finally {
+    saving.value = false;
+  }
+}
+
+// 上下文水位基准：草稿为字符串，空串表示不设基准（按 0 提交）；
+// 快照为 null（未设置）时同样回显为空串
+const contextWatermarkBaseDraft = ref(
+  store.systemSettings.context_watermark_base === null ? '' : String(store.systemSettings.context_watermark_base),
+);
+// 保存失败的行内提示：与校验错误共用同一行提示位
+const contextWatermarkBaseSaveError = ref('');
+
+watch(
+  () => store.systemSettings.context_watermark_base,
+  value => { contextWatermarkBaseDraft.value = value === null ? '' : String(value); },
+);
+
+// 空串按 0 处理（表示不设基准）；type="number" 的 v-model 会把草稿转为 number
+const parsedContextWatermarkBase = computed(
+  () => (String(contextWatermarkBaseDraft.value).trim() ? Number(contextWatermarkBaseDraft.value) : 0),
+);
+
+const contextWatermarkBaseValidationError = computed(() => {
+  const value = parsedContextWatermarkBase.value;
+  const min = store.systemSettings.context_watermark_base_min;
+  const max = store.systemSettings.context_watermark_base_max;
+  // type="number" 的 v-model 会自动把草稿转为 number，这里统一按字符串校验
+  if (!Number.isInteger(value)) {
+    return '请输入整数';
+  }
+  // 0 是「不设基准」的合法值，只有非 0 值才受 min/max 约束
+  if (value !== 0 && (value < min || value > max)) {
+    return `请输入 0（不设基准）或 ${min}–${max} 之间的整数`;
+  }
+  return '';
+});
+const contextWatermarkBaseError = computed(
+  () => contextWatermarkBaseValidationError.value || contextWatermarkBaseSaveError.value,
+);
+const contextWatermarkBaseChanged = computed(
+  () => !contextWatermarkBaseValidationError.value
+    && parsedContextWatermarkBase.value !== (store.systemSettings.context_watermark_base ?? 0),
+);
+
+async function saveContextWatermarkBase() {
+  if (saving.value || contextWatermarkBaseError.value || !contextWatermarkBaseChanged.value) return;
+  contextWatermarkBaseSaveError.value = '';
+  saving.value = true;
+  try {
+    const saved = await store.setContextWatermarkBase(parsedContextWatermarkBase.value);
+    if (!saved) {
+      // 失败：草稿回滚为快照值（未设置显示空串），失败原因留在行内提示
+      const snapshot = store.systemSettings.context_watermark_base;
+      contextWatermarkBaseDraft.value = snapshot === null ? '' : String(snapshot);
+      contextWatermarkBaseSaveError.value = '保存失败，请检查输入后重试';
     }
   } finally {
     saving.value = false;

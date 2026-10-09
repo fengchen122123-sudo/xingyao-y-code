@@ -4372,6 +4372,27 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "settings": self.get_system_settings(),
             }
 
+    def set_context_watermark_base(self, value: int) -> Dict[str, Any]:
+        """设置上下文水位基准（tokens）；0/None 表示不设基准、跟随真实窗口。
+
+        显式非法值（非整数 / 越界）必须拒绝且不写盘。
+        """
+        from core.context_watermark import WatermarkBaseError, save_watermark_base
+
+        try:
+            save_watermark_base(value)
+            return {
+                "ok": True,
+                "settings": self.get_system_settings(),
+                "msg": "上下文水位基准已更新",
+            }
+        except (WatermarkBaseError, ValueError) as error:
+            return {
+                "ok": False,
+                "msg": str(error),
+                "settings": self.get_system_settings(),
+            }
+
     # ------------------------------------------------------------------
     # /doctor 聚合自检（T3b：设置页「运行自检」入口）
     # ------------------------------------------------------------------
@@ -7582,6 +7603,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "enabled": enabled,
                 "connected": bool(item.get("connected", False)),
                 "tools_count": int(counts.get(name, 0)),
+                # 最近一次连接失败原因（无失败为 None），供界面提示排查
+                "last_error": item.get("last_error"),
             })
         return result
 
@@ -7662,6 +7685,32 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             }
         except Exception as e:
             logger.exception("add_mcp_server 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def remove_mcp_server(self, name: str) -> Dict[str, Any]:
+        """删除自定义 MCP 服务：删配置与重连放后台线程，避免阻塞界面。"""
+        if self._mcp is None:
+            return {"ok": False, "msg": "MCP 管理器不可用（依赖未安装）"}
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "msg": "服务名不能为空"}
+
+        def _job():
+            try:
+                ok, msg = self._mcp.remove_server(name)
+            except Exception as e:
+                ok, msg = False, str(e)
+            self.emit_event("mcp_status", {"mcps": self._build_mcp_list(), "ok": ok, "msg": msg})
+
+        try:
+            threading.Thread(target=_job, daemon=True, name="gui-mcp-remove").start()
+            return {
+                "ok": True,
+                "msg": f"正在删除 {name}，完成后会自动刷新状态",
+                "mcps": self._build_mcp_list(),
+            }
+        except Exception as e:
+            logger.exception("remove_mcp_server 失败")
             return {"ok": False, "msg": str(e)}
 
     def reconnect_mcp(self) -> Dict[str, Any]:
