@@ -30,11 +30,14 @@ function baseName(path: string) {
 
 <style scoped>
 .editor-tabs {
+  /* 标签栏尺寸与配色对齐设计稿 .tabs：35px 高、卡片底色作栏底 */
+  height: 35px;
+  flex: 0 0 auto;
   display: flex;
   align-items: stretch;
   gap: 2px;
   overflow-x: auto;
-  background: var(--bg1);
+  background: var(--bg2);
   border-bottom: 1px solid var(--border);
   scrollbar-width: thin;
 }
@@ -53,14 +56,15 @@ function baseName(path: string) {
 }
 
 .tab:hover {
-  background: var(--bg2);
+  background: var(--bg3);
   color: var(--text);
 }
 
 .tab.active {
-  background: var(--bg2);
+  /* 活动标签：抬到工作区底色 + 顶部 2px 强调条（设计稿 .tab.active） */
+  background: var(--bg0);
   color: var(--text-bright, var(--text));
-  box-shadow: inset 0 -2px 0 var(--accent);
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 
 .tab-dot {

@@ -3433,6 +3433,30 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 会话级 UI 状态（IDE 模式 / 对话模式）
+    # ------------------------------------------------------------------
+    # 与上面的 ide_get_layout / ide_save_layout 同构：前端切换模式时写一次，
+    # 打开会话时读一次。后端做权威副本是因为前端内存态一重启就丢、localStorage
+    # 又会在「改完立刻关窗」时丢尾部写入（详见 core/session_ui.py 文件头）。
+    def get_session_ui(self, session: str) -> Dict[str, Any]:
+        try:
+            from core import session_ui
+
+            return {"ok": True, "ui": session_ui.get_session_ui(session)}
+        except Exception as e:
+            logger.exception("get_session_ui 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def save_session_ui(self, session: str, ui) -> Dict[str, Any]:
+        try:
+            from core import session_ui
+
+            return {"ok": True, "ui": session_ui.save_session_ui(session, ui)}
+        except Exception as e:
+            logger.exception("save_session_ui 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # IDE 模式 S2：语言服务（LSP）
     # ------------------------------------------------------------------
     # 单次 LSP 请求的等待上限：补全 / 悬停这类交互请求超过这个时间对用户

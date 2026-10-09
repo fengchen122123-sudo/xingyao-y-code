@@ -31,7 +31,15 @@ export function buildEditorTheme(isLight: boolean): Extension {
       '.cm-activeLineGutter': { backgroundColor: accentSoft, color: text },
       '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: accentSoft },
       '.cm-selectionMatch': { backgroundColor: accentSoft },
-      '.cm-scroller': { fontFamily: 'Consolas, "Cascadia Mono", monospace', lineHeight: '1.5' },
+      // overflow: auto 写显式两轴：CodeMirror 的 baseTheme 只声明了 overflow-x，
+      // 垂直方向靠「另一轴为 auto 时 visible 被计算成 auto」这条隐式规则兜着。
+      // 一旦宿主高度约束不成立，滚动就静默失效（603 行文件滚不动就是这个链路），
+      // 这里把意图写明，不依赖隐式行为。
+      '.cm-scroller': {
+        fontFamily: 'Consolas, "Cascadia Mono", monospace',
+        lineHeight: '1.5',
+        overflow: 'auto',
+      },
       '.cm-placeholder': { color: dim },
       '.cm-tooltip': { backgroundColor: bg, border: `1px solid ${border}`, color: text },
       '.cm-panels': { backgroundColor: bg, color: text },
