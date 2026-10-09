@@ -315,6 +315,14 @@ JS_QUEUE_MAXSIZE = 2000
 # 不再因用户暂时离开而自动拒绝（拒绝会让模型拿到"用户拒绝"继续跑偏）
 PERMISSION_TIMEOUT_SECONDS = 300
 
+# 关停链路等待调试适配器回收线程的窗口（秒）。
+# 必须 ≥ 一次 `DebugSession._reap(graceful=False)` 的最坏耗时，否则适配器卡住时
+# 回收线程还没走完、父进程先退出，子进程就成孤儿（S3-T9 评审）。
+# 最坏耗时构成（见 core/ide/debug_session.py:_reap 与 core/ide/dap_manager.py:terminate）：
+#   terminate() 等优雅退出 5.0 + 强杀进程树后 wait 2.0 + _join_threads() 2.0 + 1.0 ≈ 10s
+# 取 12s 留出余量；超时后仍会补一刀强杀进程树（见 _shutdown_debug_session）。
+DEBUG_REAP_JOIN_TIMEOUT = 12.0
+
 # 文件预览上限：256KB
 FILE_PREVIEW_MAX_BYTES = 256 * 1024
 # 图片预览上限：20MB（base64 传输体积再膨胀约 33%）
@@ -616,6 +624,27 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 用户手动开启；模型/工具链路不经过这里
         self._pty_session = None
         self._pty_lock = threading.Lock()
+        # IDE 调试（DAP 适配器进程）：单会话、用户显式启动；读线程只 put_nowait 事件
+        self._debug_session = None
+        self._debug_lock = threading.Lock()
+        # 当前暂停线程/帧：单步与求值都作用在它上面（由 dap_stopped 事件刷新）
+        self._debug_last_thread_id = 0
+        self._debug_last_frame_id = 0
+        # terminated 后由读线程投递出去的「临时回收线程」（见 _discard_debug_session）：
+        # 关停时 join 它们，保证适配器进程一定被收掉，不留孤儿。
+        # 登记成 (线程, 它负责回收的会话) 二元组：join 超时后要拿会话对象再补一刀强杀
+        # 进程树（S3-T9 评审），只留线程就够不到会话了。
+        self._debug_reapers: List[Tuple[threading.Thread, Any]] = []
+        # 被调试程序是否已退出（收到 dap_exited）：DAP 里 exited 只表示「被调试程序结束」，
+        # 会话未必结束。只用来放行「重新开始调试」时回收旧会话，不在 exited 时丢会话
+        # （否则 restart 这类合法流程会被误杀）
+        self._debug_debuggee_exited = False
+        # 当前会话的 id（不是 `_debug_session.session_id` 的等价物）：
+        # ① 它在 `session.start()` **之前**就登记，适配器读线程/ stderr 读线程在启动
+        #    窗口里推的事件才不会被 `_emit_dap_event` 的会话校验当成残留事件丢掉；
+        # ② 它单独存一份，读线程不必去读 `_debug_session` 的字段（那个引用会被
+        #    `_discard_debug_session` 置 None，且读线程绝不能等锁，见 _emit_dap_event）。
+        self._debug_session_id = ""
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
@@ -1133,6 +1162,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 pty_session.kill()
         except Exception:
             logger.exception("退出时终止内嵌交互式终端失败")
+
+        # 调试适配器进程：与内嵌终端同口径，退出必须回收（否则用户机器上留下
+        # 一个活着的调试器进程）
+        try:
+            self._shutdown_debug_session()
+        except Exception:
+            logger.exception("退出时终止调试适配器失败")
 
         # 内嵌浏览器：best-effort 释放原生 WebView2 控件并取消节流定时器。
         # 放在 JS 派发哨兵之前；shutdown 内部吞异常，失败不阻断退出链
@@ -3243,6 +3279,426 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     lock.release()
                 except Exception:
                     logger.debug("释放技能扫描锁失败", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # IDE 模式：编辑器文件读写 / 布局 / 已打开文件变更
+    # ------------------------------------------------------------------
+    _IDE_WATCH_INTERVAL = 1.0
+
+    def _ide_watcher_instance(self):
+        """惰性创建轮询器与线程；线程只负责轮询，派发交给 emit_event。"""
+        from core.ide import file_service
+
+        watcher = getattr(self, "_ide_watcher", None)
+        if watcher is None:
+            watcher = file_service.OpenFileWatcher(interval=self._IDE_WATCH_INTERVAL)
+            self._ide_watcher = watcher
+        return watcher
+
+    def _ide_ensure_watch_thread(self) -> None:
+        if getattr(self, "_ide_watch_thread", None) is not None:
+            return
+        import threading
+
+        stop_event = threading.Event()
+        self._ide_watch_stop = stop_event
+
+        def _loop():
+            while not stop_event.wait(self._IDE_WATCH_INTERVAL):
+                try:
+                    self._ide_poll_once()
+                except Exception:
+                    logger.exception("IDE 已打开文件轮询失败")
+
+        thread = threading.Thread(target=_loop, name="ide-open-file-watcher", daemon=True)
+        self._ide_watch_thread = thread
+        thread.start()
+
+    def _ide_poll_once(self) -> int:
+        """轮询一次并派发变更事件，返回变更文件数（线程循环与测试共用）。"""
+        watcher = self._ide_watcher_instance()
+        changed = watcher.poll()
+        for path in changed:
+            self.emit_event("ide_file_changed", {"path": path})
+        return len(changed)
+
+    def ide_set_open_files(self, paths) -> Dict[str, Any]:
+        """登记当前编辑器打开的文件（轮询集合由前端驱动）。"""
+        try:
+            watcher = self._ide_watcher_instance()
+            watcher.set_open_files(paths or [])
+            self._ide_ensure_watch_thread()
+            return {"ok": True, "count": len(watcher._files)}
+        except Exception as e:
+            logger.exception("ide_set_open_files 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def _ide_guard(self, path: str, action: str) -> "tuple[str, str]":
+        """统一路径策略校验，返回 (real_path, 拒绝原因)。"""
+        from core.gui_path_policy import gui_path_access_allowed
+
+        real_path = _resolve_real_path(path)
+        workspace = self._session_workdir(self._current_session)
+        allowed, deny_msg = gui_path_access_allowed(
+            real_path, workspace, action=action, session_id=self._current_session
+        )
+        if not allowed:
+            return real_path, deny_msg
+        return real_path, ""
+
+    def ide_read_file(self, path: str) -> Dict[str, Any]:
+        from core.ide import file_service
+
+        try:
+            real_path, deny = self._ide_guard(path, "edit")
+            if deny:
+                return {"ok": False, "msg": deny}
+            return {"ok": True, **file_service.read_text_file(real_path)}
+        except file_service.FileServiceError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("ide_read_file 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def ide_write_file(
+        self,
+        path: str,
+        content: str,
+        expected_hash: str,
+        encoding: str = "utf-8",
+        bom: bool = False,
+        eol: str = "lf",
+    ) -> Dict[str, Any]:
+        """保存编辑器内容并刷新轮询基线。
+
+        expected_hash 必填、无默认值：它是打开文件时 read_text_file 返回的 hash，
+        作为冲突检测基准。**空串表示调用方明确要求覆盖**（用户在冲突提示里选择了
+        「用我的覆盖」），非空时作冲突检测基准。这里刻意不给默认值——调用方漏传
+        会被 Python 直接报 TypeError，而不是静默退化成「无条件覆盖」、关掉全部
+        冲突保护。
+        """
+        from core.ide import file_service
+
+        try:
+            real_path, deny = self._ide_guard(path, "edit")
+            if deny:
+                return {"ok": False, "msg": deny}
+            result = file_service.write_text_file(
+                real_path, content, expected_hash,
+                encoding=encoding, bom=bom, eol=eol,
+            )
+            # 只有真正落盘成功才回填基线：冲突 / 编码失败 / 权限失败都没改动磁盘，
+            # 回填反而会掩盖紧接着的外部改动。
+            if result.get("ok"):
+                watcher = getattr(self, "_ide_watcher", None)
+                if watcher is not None:
+                    try:
+                        watcher.acknowledge(real_path)
+                    except Exception:
+                        logger.debug("刷新 IDE 轮询基线失败", exc_info=True)
+            return result
+        except file_service.FileServiceError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("ide_write_file 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def ide_stat_files(self, paths) -> Dict[str, Any]:
+        try:
+            from core.ide import file_service
+
+            stats = []
+            for raw in paths or []:
+                real_path, deny = self._ide_guard(raw, "preview")
+                if deny:
+                    stats.append({"path": raw, "denied": True, "msg": deny})
+                    continue
+                try:
+                    st = os.stat(real_path)
+                    with open(real_path, "rb") as fh:
+                        digest = file_service._hash_bytes(fh.read())
+                    stats.append({
+                        "path": real_path,
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                        "hash": digest,
+                    })
+                except OSError:
+                    stats.append({"path": real_path, "missing": True})
+            return {"ok": True, "stats": stats}
+        except Exception as e:
+            logger.exception("ide_stat_files 失败")
+            return {"ok": False, "stats": [], "msg": str(e)}
+
+    def ide_get_layout(self, session: str) -> Dict[str, Any]:
+        try:
+            from core.ide import layout_store
+
+            return {"ok": True, "layout": layout_store.get_ide_layout(session)}
+        except Exception as e:
+            logger.exception("ide_get_layout 失败")
+            return {"ok": False, "layout": None, "msg": str(e)}
+
+    def ide_save_layout(self, session: str, layout) -> Dict[str, Any]:
+        try:
+            from core.ide import layout_store
+
+            return {"ok": True, "layout": layout_store.save_ide_layout(session, layout)}
+        except Exception as e:
+            logger.exception("ide_save_layout 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # IDE 模式 S2：语言服务（LSP）
+    # ------------------------------------------------------------------
+    # 单次 LSP 请求的等待上限：补全 / 悬停这类交互请求超过这个时间对用户
+    # 已经没有意义，宁可让前端拿到失败去回落纯文本编辑。
+    # 桥方法本身跑在 pywebview 为每次 JS 调用新建的临时线程上（不是 UI 线程，
+    # 也不是 gui-js-dispatcher），所以这里同步等待不会冻结界面；上限只是防止
+    # 语言服务器失联时前端 Promise 永远悬着。
+    _LSP_REQUEST_TIMEOUT = 15.0
+
+    def _lsp_manager_instance(self):
+        """惰性创建 LSP 管理器；两个回调都只做「进事件队列」这件事。
+
+        回调在每次取实例时统一挂一次，而不是只在新建时挂：测试或其它入口可能
+        把管理器直接塞进 `self._lsp_manager`（绕过本工厂），那种管理器没有回调，
+        语言服务器的推送与状态变化会被静默丢掉。挂回调是幂等的纯赋值，代价可忽略。
+        """
+        manager = getattr(self, "_lsp_manager", None)
+        if manager is None:
+            from core.ide import lsp_manager
+
+            manager = lsp_manager.LspManager()
+            self._lsp_manager = manager
+        # 回调只做「投递」：读线程 / 崩溃重启回调 / 合批定时器线程都可能在任意
+        # 线程调到它们；emit_event 内部只往 _js_queue put_nowait，绝不直接
+        # evaluate_js——那是 gui-js-dispatcher 单消费者线程的专属职责。
+        manager._on_notification = self._lsp_on_notification
+        manager._on_status = self._lsp_on_status
+        return manager
+
+    def _lsp_batcher_instance(self):
+        batcher = getattr(self, "_lsp_batcher", None)
+        if batcher is None:
+            from core.ide import diagnostics_batcher
+
+            batcher = diagnostics_batcher.DiagnosticsBatcher()
+            self._lsp_batcher = batcher
+        # 与 _lsp_manager_instance 同源的问题：只在「新建分支」挂 on_flush，测试或
+        # 其它入口直接把 batcher 塞进 `self._lsp_batcher`（绕过本工厂）时，那种
+        # batcher 永远没有 on_flush——诊断攒在内存里，一次都不会送到前端。
+        # 末尾幂等赋值，代价可忽略。
+        batcher._on_flush = self._lsp_flush_diagnostics
+        return batcher
+
+    def _lsp_on_status(self, status) -> None:
+        """可能在 LSP 读线程 / 重启回调里被调用，只允许 emit_event。"""
+        self.emit_event("lsp_status", status)
+
+    def _lsp_on_notification(self, workspace: str, language_id: str, method: str, params) -> None:
+        """语言服务器主动推送的入口，运行在该服务器的读线程上。
+
+        读线程只允许把消息交给合批器（纯内存操作），绝不触碰 WebView：真正送到
+        前端的 lsp_diagnostics 由合批定时器触发 _lsp_flush_diagnostics → emit_event。
+        """
+        if method != "textDocument/publishDiagnostics":
+            return
+        from core.ide.lsp_manager import uri_to_path
+
+        params = params or {}
+        uri = params.get("uri") or ""
+        path = uri_to_path(uri) or uri
+        self._lsp_batcher_instance().push(path, params.get("diagnostics") or [])
+
+    def _lsp_flush_diagnostics(self, path: str, diagnostics) -> None:
+        """由合批定时器线程调用，仍然只做 emit_event。"""
+        self.emit_event("lsp_diagnostics", {"path": path, "diagnostics": diagnostics})
+
+    def _lsp_discard_diagnostics(self, path: str, params=None) -> None:
+        """文档关闭：丢弃该路径的待派发诊断与去重指纹（Task 6 评审项 A）。
+
+        去重表 `_last_flushed` 唯一的清理点就是 `discard`；漏掉这一步它会随
+        打开过的文件数无界累积。键必须与 `_lsp_on_notification` 推入时一致
+        （uri 反解出来的路径）：前端传来的 path 与 didClose 的 uri 指向同一文件，
+        两边都清一遍，免得符号链接 / 大小写归一化差异造成漏清。
+        """
+        batcher = getattr(self, "_lsp_batcher", None)
+        if batcher is None:
+            return
+        from core.ide.lsp_manager import uri_to_path
+
+        keys = {str(path)}
+        doc = (params or {}).get("textDocument") if isinstance(params, dict) else None
+        uri = (doc or {}).get("uri") if isinstance(doc, dict) else None
+        if uri:
+            derived = uri_to_path(uri)
+            if derived:
+                keys.add(derived)
+        for key in keys:
+            batcher.discard(key)
+
+    def _lsp_workspace_guard(self) -> str:
+        """工作区变化时回收全部语言服务器：进程与工作区绑定，不跨区复用。"""
+        workspace = self._session_workdir(self._current_session) or ""
+        if getattr(self, "_lsp_workspace", None) != workspace:
+            if getattr(self, "_lsp_manager", None) is not None:
+                try:
+                    self._lsp_manager.recycle_all()
+                except Exception:
+                    logger.exception("切换工作区时回收语言服务器失败")
+            self._lsp_workspace = workspace
+        return workspace
+
+    def _lsp_workspace_token(self) -> tuple:
+        """取 (workspace, epoch)：两者必须同源取出，缺一都堵不住竞态窗口。
+
+        单取 workspace 是不够的（S2 验收欠账 1）：取到 workspace 与真正建槽之间
+        会穿插路径校验、语言识别、可执行文件探测等耗时动作，若这中间发生了工作区
+        回收，`LspManager.ensure_server` 会给**旧工作区**重新建槽并拉起全新进程
+        （世代护栏认的是新世代号，拦不住它），而此后 `_lsp_workspace` 已是新工作区，
+        下一次 guard 判定「无变化」不再回收——那个进程会一直活到下次切换或 close()。
+        把回收前取到的 epoch 一并交给 `ensure_server`，过期即拒绝启动。
+        epoch 与 workspace 都在 guard 之后取：guard 自身触发的回收会把 epoch 推进到
+        新值，这里读到的就是新工作区的有效令牌。
+        """
+        workspace = self._lsp_workspace_guard()
+        manager = getattr(self, "_lsp_manager", None)
+        epoch = manager.current_epoch() if manager is not None else 0
+        return workspace, epoch
+
+    def lsp_request(self, path: str, method: str, params=None) -> Dict[str, Any]:
+        from core.ide.lsp_manager import LspError, LspRequestError
+
+        try:
+            workspace, epoch = self._lsp_workspace_token()
+            real_path, deny = self._ide_guard(path, "preview")
+            if deny:
+                return {"ok": False, "error": {"code": -32003, "message": deny}, "msg": deny}
+            from core.ide import language_registry
+
+            language_id = language_registry.language_id_for_path(real_path)
+            if not language_id:
+                msg = "该文件类型未配置语言服务器，已降级为纯文本编辑"
+                return {"ok": False, "error": {"code": -32000, "message": msg}, "msg": msg}
+            manager = self._lsp_manager_instance()
+            result = manager.request(
+                workspace,
+                language_id,
+                method,
+                params or {},
+                timeout=self._LSP_REQUEST_TIMEOUT,
+                epoch=epoch,
+            )
+            return {"ok": True, "result": result}
+        except LspRequestError as e:
+            return {"ok": False, "error": {"code": e.code, "message": e.message}, "msg": str(e)}
+        except LspError as e:
+            return {"ok": False, "error": {"code": -32001, "message": str(e)}, "msg": str(e)}
+        except Exception as e:
+            logger.exception("lsp_request 失败")
+            return {"ok": False, "error": {"code": -32603, "message": str(e)}, "msg": str(e)}
+
+    def lsp_notify(self, path: str, method: str, params=None) -> Dict[str, Any]:
+        from core.ide.lsp_manager import LspError
+
+        try:
+            workspace, epoch = self._lsp_workspace_token()
+            real_path, deny = self._ide_guard(path, "preview")
+            if deny:
+                return {"ok": False, "error": {"code": -32003, "message": deny}, "msg": deny}
+            # 文档关闭是合批器状态的收口点：先清掉该文件的待派发诊断与去重指纹，
+            # 再发 didClose。放在 notify 之前——即使服务器不可用、通知发不出去，
+            # 前端已经关掉的文档也不该在去重表里留痕（评审项 A）。
+            if method == "textDocument/didClose":
+                self._lsp_discard_diagnostics(real_path, params)
+            from core.ide import language_registry
+
+            language_id = language_registry.language_id_for_path(real_path)
+            if not language_id:
+                msg = "该文件类型未配置语言服务器，已降级为纯文本编辑"
+                return {"ok": False, "error": {"code": -32000, "message": msg}, "msg": msg}
+            manager = self._lsp_manager_instance()
+            manager.notify(workspace, language_id, method, params or {}, epoch=epoch)
+            return {"ok": True}
+        except LspError as e:
+            return {"ok": False, "error": {"code": -32001, "message": str(e)}, "msg": str(e)}
+        except Exception as e:
+            logger.exception("lsp_notify 失败")
+            return {"ok": False, "error": {"code": -32603, "message": str(e)}, "msg": str(e)}
+
+    def lsp_sync_workspace(self) -> Dict[str, Any]:
+        """前端在会话 / 工作区切换后主动调用：旧工作区的语言服务器立刻退出。
+
+        配套的兜底是 _lsp_workspace_guard：即使前端漏调，下一次 LSP 请求也会
+        先回收旧工作区的进程，因此不存在「切了工作区还在跑旧服务器」的窗口。
+        """
+        try:
+            workspace = self._session_workdir(self._current_session) or ""
+            recycled = []
+            manager = getattr(self, "_lsp_manager", None)
+            if manager is not None:
+                recycled = [language_id for _, language_id in manager.recycle_all()]
+            batcher = getattr(self, "_lsp_batcher", None)
+            if batcher is not None:
+                batcher.flush()
+            self._lsp_workspace = workspace
+            return {"ok": True, "workspace": workspace, "recycled": recycled}
+        except Exception as e:
+            logger.exception("lsp_sync_workspace 失败")
+            return {"ok": False, "workspace": "", "recycled": [], "msg": str(e)}
+
+    def lsp_server_status(self, workspace: str = "") -> Dict[str, Any]:
+        """枚举全部已配置语言服务器的状态；不启动任何进程（不会因为看状态而拉起服务器）。"""
+        try:
+            from core.ide import language_registry, server_provision
+
+            current = workspace or self._lsp_workspace_guard()
+            manager = getattr(self, "_lsp_manager", None)
+            live = {}
+            if manager is not None:
+                for row in manager.status(current):
+                    live[row["language"]] = row
+            servers = []
+            for language_id, server_id in language_registry.all_language_servers():
+                provision = server_provision.resolve_executable(server_id)
+                row = live.get(language_id) or {}
+                if provision["source"] == "missing":
+                    state = "missing"
+                else:
+                    state = row.get("state", "stopped")
+                servers.append({
+                    "server": server_id,
+                    "language": language_id,
+                    "state": state,
+                    "executable": provision["executable"],
+                    "source": provision["source"],
+                    "pid": row.get("pid"),
+                    "msg": row.get("msg") or provision["msg"],
+                })
+            return {"ok": True, "workspace": current, "servers": servers}
+        except Exception as e:
+            logger.exception("lsp_server_status 失败")
+            return {"ok": False, "servers": [], "msg": str(e)}
+
+    def lsp_set_server_path(self, server_id: str, path: str) -> Dict[str, Any]:
+        """设置页手动指定可执行文件路径；path 为空串表示恢复自动探测。"""
+        from core.ide import server_provision
+
+        try:
+            if path:
+                result = server_provision.save_override(server_id, path)
+            else:
+                result = server_provision.clear_override(server_id)
+            # 可执行文件变了，旧进程必须换掉，否则用户改了路径却毫无效果
+            if getattr(self, "_lsp_manager", None) is not None:
+                self._lsp_manager.recycle_all()
+            return {"ok": True, **result}
+        except server_provision.ProvisionError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("lsp_set_server_path 失败")
+            return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
     # 会话持久化：历史会话列表
@@ -7954,6 +8410,563 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # IDE 一键运行：命令写进既有常驻终端会话（输出继续走 pty_data 事件）
+    # core.ide 的导入放在方法内：与 core.gui_path_policy 的懒导入同口径
+    # （core/ide 依赖链不该拖慢 GUI 启动）
+    # ------------------------------------------------------------------
+    def ide_run_file(self, path: str, extra_args: str = "", command: str = "") -> Dict[str, Any]:
+        """解析运行命令并写进常驻终端；不新开进程，复用 pty_terminal_ensure 的会话语义。
+
+        运行进程由用户显式触发，不进 permission_broker（规格 §7.4），但路径策略一步
+        不少：先过 _resolve_real_path 再走 gui_path_access_allowed，口径与
+        open_path / read_file_preview 完全一致——否则本方法就是"往常驻 shell 里塞任意
+        命令"的越权通道。
+
+        返回 {ok, command?, source?, pid?, note?, msg?}。note 是 build_run_plan 的
+        回退说明（没能按项目配置解析、退成了语言默认命令时的中文原因，无回退时为空串），
+        并同步放进 msg：前端只渲染 msg 也能看到"为什么没按 launch.json 跑"。
+        """
+        from core.gui_path_policy import gui_path_access_allowed
+        from core.ide.run_command import RunPlanError, build_run_plan
+
+        try:
+            real = _resolve_real_path(path)
+            if not os.path.isfile(real):
+                return {"ok": False, "msg": "文件不存在或不是普通文件，无法运行"}
+            workspace = self._session_workdir(self._current_session)
+            if workspace and workspace != "GLOBAL":
+                # build_run_plan 内部用 os.path.abspath 按**进程 cwd** 解析相对路径，
+                # 而进程 cwd 不随会话工作区切换：桥层必须传解析后的绝对路径
+                workspace = _resolve_real_path(workspace)
+            allowed, reason = gui_path_access_allowed(
+                real, workspace, action="open", session_id=self._current_session
+            )
+            if not allowed:
+                return {"ok": False, "msg": reason}
+            try:
+                plan = build_run_plan(
+                    real, workspace, explicit_command=command, extra_args=extra_args
+                )
+            except RunPlanError as e:
+                return {"ok": False, "msg": str(e)}
+            ensured = self.pty_terminal_ensure()
+            if ensured.get("ok") is not True:
+                return {"ok": False, "msg": ensured.get("msg") or "终端启动失败，请重试"}
+            written = self.pty_terminal_write(plan.command + "\r")
+            if written.get("ok") is not True:
+                return {"ok": False, "msg": written.get("msg") or "命令未送达终端，请重试"}
+            return {
+                "ok": True,
+                "command": plan.command,
+                "source": plan.source,
+                "pid": ensured.get("pid"),
+                "note": plan.note,
+                "msg": plan.note,
+            }
+        except Exception as e:
+            logger.exception("ide_run_file 失败")
+            return {"ok": False, "msg": f"一键运行失败：{e}"}
+
+    # ------------------------------------------------------------------
+    # IDE 调试：适配器进程由后端托管，事件一律经 emit_event（put_nowait 入队）
+    # core.ide 的导入同样放在方法内（同 ide_run_file：core/ide 依赖链不该
+    # 拖慢 GUI 启动）。路径口径与 ide_run_file 完全一致：先 _resolve_real_path，
+    # 再 gui_path_access_allowed——调试会起进程，这里少一步就是越权通道。
+    # ------------------------------------------------------------------
+    def _emit_dap_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """调试事件唯一出口：绝不在这里 evaluate_js（读线程不是派发线程）。
+
+        emit_event 内部只做 put_nowait（队列满丢弃新事件、绝不阻塞），所以
+        DAP 适配器读线程调用它是安全的：不触碰 WebView，也不会卡住读循环。
+
+        **会话归属校验（S3-T10 评审）：** 事件必须属于当前会话，否则直接丢弃。
+        `ide_debug_stop` 只放掉会话引用、适配器进程最坏 ≈10s 后才真正退出，这段时间里
+        旧适配器仍会推 `dap_continued` / `dap_exited` / `dap_terminated` / `dap_output`：
+        用户几秒内重启调试时，旧会话的 `dap_exited` / `dap_terminated` 会把**新会话**的
+        前端状态清掉、并把 `_debug_debuggee_exited` 写脏，使 `ide_debug_start` 把正在跑的
+        新会话当「已结束」回收掉。
+        校验放在本方法**最前面**（早于下面的状态副作用）：`dap_terminated` 分支内部会
+        `_discard_debug_session()`，若把校验放在其后，终止事件自己就会被自己的清理动作
+        判成「不属于当前会话」而丢掉。
+        只读共享标量、**不取 `_debug_lock`**：本方法可能跑在 DAP 读线程上，而
+        `_shutdown_debug_session` 会持锁做阻塞回收，读线程等锁就是死等（锁只用来读
+        单个属性，不需要）。
+        """
+        incoming = str(data.get("session_id") or "")
+        current = getattr(self, "_debug_session_id", "") or ""
+        if event_type != "dap_status" and incoming != current:
+            logger.debug("丢弃不属于当前调试会话的事件：%s（%s）", event_type, incoming or "-")
+            return
+        if event_type == "dap_stopped":
+            self._debug_last_thread_id = int(data.get("thread_id") or 0)
+            self._debug_last_frame_id = int(data.get("frame_id") or 0)
+            self._debug_debuggee_exited = False
+        elif event_type == "dap_continued":
+            self._debug_debuggee_exited = False
+        elif event_type == "dap_exited":
+            # 被调试程序已退出，但**会话（适配器进程）未必结束**：DAP 里 exited 与
+            # terminated 是两件事，restart 这类「重启被调试程序」的流程在 exited 之后
+            # 仍然合法。所以这里只记事实、不去动会话引用，只把它当作「重新开始调试时
+            # 可以安全回收旧会话」的依据（见 ide_debug_start；S3-T9 评审）。
+            self._debug_debuggee_exited = True
+        elif event_type == "dap_terminated":
+            # 程序自然结束时适配器推 terminated：这里必须把会话引用放掉（S3-T7 评审），
+            # 否则上面那个「已有调试会话在运行」的判重会把**已经结束的会话**当成在跑的
+            # 会话拒绝掉，而前端 reduceDapEvent('dap_terminated') 只把 debugState 置
+            # stopped、并不调 ide_debug_stop → 用户必须手动点一次「停止」才能重新调试。
+            # 同时**必须回收适配器进程**（S3-T8 评审）：_discard_debug_session 里起临时
+            # 线程去做 stop()，本方法仍在 DAP 读线程内，只做非阻塞投递。
+            self._discard_debug_session()
+        if self._shutting_down:
+            return
+        try:
+            self.emit_event(event_type, data)
+        except Exception:
+            logger.debug("推送调试事件失败", exc_info=True)
+
+    def _reset_debug_cursors(self) -> None:
+        """复位「当前线程 / 当前帧」记忆。
+
+        线程号与帧号只在**一次会话**内有意义：上一会话的值留到新会话，会让第一条
+        `dap_stopped` 到达之前的 continue / next / stepIn / stepOut / pause 与
+        stackTrace / evaluate 拿着失效 id 去问适配器，被拒成 "thread not found"
+        （S3-T7 评审）。
+        """
+        self._debug_last_thread_id = 0
+        self._debug_last_frame_id = 0
+
+    def _discard_debug_session(self) -> None:
+        """放掉会话引用、复位线程/帧记忆，并把进程回收投递给临时线程。
+
+        **可从 DAP 读线程调用，也不阻塞派发线程**：这里绝不直接回收会话，只做
+        非阻塞的投递（`Thread.start()`），读循环与 `gui-js-dispatcher` 都不会被拖住。
+        临时线程体走 `_reap(graceful=False)`——不发任何同步 DAP 请求，因此在读线程上
+        同步执行也是合法的（读线程护栏只禁「同步等响应」，见
+        `DapProcess._reject_reader_blocking`）。
+
+        也不能像旧实现那样指望 `DebugSession.__del__` 兜底（S3-T8 评审三条理由）：
+        ① `DapProcess.on_event` 是 `DebugSession` 的绑定方法，二者互指成环，带 `__del__`
+           的环只能靠分代 GC 非确定回收；
+        ② 读线程活着时环根本收不了——`ide-dap-reader` 的运行帧强引用 `DapProcess`，而
+           dlv 的 TCP dap-server / lldb-dap 在 terminated 后**不自行退出**，读线程永久
+           阻塞在 read 上，`__del__` 永不执行，进程与线程一路泄漏；
+        ③ 关停兜底也失效——`_shutdown_debug_session` 读的也是 `self._debug_session`，
+           此时已被置 `None`，`if session is None: return` 直接短路，适配器子进程不会
+           随父进程退出被杀，最终成为孤儿进程。
+        """
+        with self._debug_lock:
+            session = self._debug_session
+            self._debug_session = None
+            self._debug_debuggee_exited = False
+            # 会话 id 与引用一起放掉：放掉之后旧适配器再推的事件（最坏 ≈10s 内）会被
+            # `_emit_dap_event` 的会话校验丢掉，不会污染下一次调试（S3-T10 评审）
+            self._debug_session_id = ""
+            reaper = None
+            if session is not None:
+                reaper = threading.Thread(
+                    target=self._reap_debug_session,
+                    args=(session,),
+                    daemon=True,
+                    name="ide-dap-reap",
+                )
+                self._debug_reapers.append((reaper, session))
+        self._reset_debug_cursors()
+        if reaper is None:
+            return
+        try:
+            reaper.start()
+        except RuntimeError:
+            # 线程资源耗尽（Thread.start 抛 RuntimeError）：登记表里那条线程永远不会启动，
+            # 会话引用却已经放掉了——不在这里兜底的话会话无人回收，而且随后
+            # `_shutdown_debug_session` 对「未启动的线程」join() 会再抛
+            # "cannot join thread before it is started"；该异常会从 `ide_debug_start`
+            # （内部会先 `_shutdown_debug_session` 回收旧会话）冒到前端，界面停在「运行中」
+            # 而适配器进程一路泄漏（S3-T9 评审）。
+            # 退化为就地回收：`_reap(graceful=False)` 不发同步请求，在派发线程/读线程上
+            # 调用都安全（不违读线程护栏）。
+            logger.exception("调试回收线程启动失败，就地回收适配器会话")
+            self._forget_debug_reaper(reaper)
+            self._reap_session_now(session, graceful=False)
+
+    def _forget_debug_reaper(self, reaper: threading.Thread) -> None:
+        """把一条没能启动（或已结束）的回收线程从登记表里摘掉（幂等）。"""
+        with self._debug_lock:
+            self._debug_reapers = [
+                item for item in self._debug_reapers if item[0] is not reaper
+            ]
+
+    def _reap_session_now(self, session: Any, graceful: bool) -> None:
+        """就地回收一个会话（best-effort，绝不抛）。
+
+        优先走 `DebugSession._reap(graceful=...)`：`graceful=False` 只关通道 + 杀进程树，
+        不发同步 DAP 请求，耗时远低于 `stop()`（后者要先等 `DISCONNECT_TIMEOUT=5.0` 的
+        disconnect 响应）。没有该私有方法的会话替身（测试替身、未来的第三方实现）退回
+        `stop()`，语义仍是「尽力回收」。
+        """
+        try:
+            reap = getattr(session, "_reap", None)
+            if callable(reap):
+                reap(graceful)
+            else:
+                session.stop()
+        except Exception:
+            logger.debug("回收调试适配器会话失败", exc_info=True)
+
+    def _force_kill_session_tree(self, session: Any) -> None:
+        """兜底强杀：会话底层进程树还活着就再杀一刀（幂等、best-effort、绝不抛）。
+
+        正常路径上 `terminate()` 已经杀过一次，这里只处理「进程卡在不可杀状态 / 回收
+        提前中断」的极端场景，保证 S3-3「调试结束后适配器进程被回收」不因单个适配器
+        耍赖而失守。拿不到底层进程（会话替身 / 已释放）时静默跳过。
+        """
+        from core.ide.dap_manager import _kill_process_tree
+
+        process = getattr(session, "_process", None)
+        proc = getattr(process, "_proc", None)
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+                proc.wait(timeout=2.0)
+        except Exception:
+            logger.debug("兜底强杀调试适配器进程树失败", exc_info=True)
+
+    def _reap_debug_session(self, session: Any) -> None:
+        """临时线程体：回收幂等，失败也不能把回收线程炸掉（回收是 best-effort 兜底）。
+
+        用 `graceful=False`：走到这条路径说明会话已被丢弃（terminated / 显式停止），
+        再等一次优雅 disconnect 没有意义；关停链路要 join 的正是这条线程，越短越好
+        （见 `_shutdown_debug_session` 的超时预算）。
+        """
+        try:
+            self._reap_session_now(session, graceful=False)
+        finally:
+            self._forget_debug_reaper(threading.current_thread())
+
+    def _shutdown_debug_session(self, join_timeout: float = DEBUG_REAP_JOIN_TIMEOUT) -> None:
+        """结束会话并回收适配器进程（幂等；仅关停链路与「回收旧会话」链路调用）。
+
+        除了当前会话，还要 join 掉 terminated 时投递出去的临时回收线程：否则关停
+        （或进程退出）会与那条线程抢时序，极端情况下父进程先走，适配器变成孤儿。
+
+        **本方法会阻塞**，因此绝不能从 `gui-js-dispatcher` 线程调用（那会冻住整个前端
+        UI、并拖慢退出链路）：用户点「停止调试」走的是非阻塞的 `_discard_debug_session`
+        （见 `ide_debug_stop`）。
+
+        回收一律用 `_reap(graceful=False)`：最坏耗时从 ≈15s（5.0 disconnect + 5.0 优雅
+        退出 + 2.0 强杀后 wait + 3.0 线程 join）降到 ≈10s。`join_timeout` 必须 ≥ 这个
+        最坏值，否则适配器卡住时父进程先退出、子进程成孤儿（S3-T9 评审）；超时后还会
+        对仍未收完的会话补一刀强杀进程树。
+        """
+        with self._debug_lock:
+            session = self._debug_session
+            self._debug_session = None
+            self._debug_debuggee_exited = False
+            # 会话 id 与引用一起放掉（口径同 `_discard_debug_session`）：残留事件不得越过
+            # 关停边界污染下一次调试会话
+            self._debug_session_id = ""
+            reapers = list(self._debug_reapers)
+        # 会话回收时一并复位线程/帧记忆：下一次调试不会继承上一会话的失效 id
+        self._reset_debug_cursors()
+        if session is not None:
+            self._reap_session_now(session, graceful=False)
+        current = threading.current_thread()
+        deadline = time.monotonic() + join_timeout
+        stragglers: List[Any] = []
+        for reaper, owned in reapers:
+            if reaper is current:
+                continue  # 防御：绝不在回收线程里 join 自己
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                reaper.join(remaining)
+            if reaper.is_alive():
+                stragglers.append(owned)
+        # 兜底：到点仍未收完（适配器进程卡在不可杀状态 / 回收提前中断）——直接对那些会话
+        # 再补一刀强杀进程树。`_force_kill_session_tree` 先 poll 再杀，进程已死则不发
+        # taskkill，因此不会误伤被复用的 pid。
+        for owned in ([session] if session is not None else []) + stragglers:
+            self._force_kill_session_tree(owned)
+
+    def _debug_path_denied(self, real_path: str, workspace: str, label: str) -> str:
+        """路径策略出口：入参必须已过 _resolve_real_path（口径同 ide_run_file）。
+
+        返回空串表示放行；否则是可诊断的中文原因（前缀说明是哪个路径被拒，
+        用户能直接看出该去改工作区还是关沙盒）。
+        """
+        from core.gui_path_policy import gui_path_access_allowed
+
+        allowed, reason = gui_path_access_allowed(
+            real_path, workspace, action="open", session_id=self._current_session
+        )
+        if allowed:
+            return ""
+        return f"{label}不可访问：{reason}"
+
+    def ide_debug_availability(self) -> Dict[str, Any]:
+        """探测各语言调试适配器（给调试面板与设置页展示安装状态）。"""
+        from core.ide.debug_adapters import adapter_availability
+
+        return {"ok": True, "adapters": adapter_availability()}
+
+    def ide_debug_start(
+        self,
+        path: str = "",
+        breakpoints: Optional[List[Dict[str, Any]]] = None,
+        program: str = "",
+        args: Optional[List[str]] = None,
+        stop_on_entry: bool = False,
+    ) -> Dict[str, Any]:
+        """启动调试：路径策略 → 探测适配器 → 起会话 → 下发断点 → configurationDone。
+
+        program / cwd 也要过策略（S3-T4 评审）：两者都会原样进 DAP launch 参数，
+        不过策略就等于"用调试器起任意程序"。breakpoints 里的路径同理（先 realpath
+        再 gui_path_access_allowed），且在起会话前校验，越权时不留下适配器进程。
+        """
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_adapters import probe_adapter
+        from core.ide.debug_session import DebugSession, DebugSessionError
+        from core.ide.language_registry import language_id_for_path
+
+        with self._debug_lock:
+            existing = self._debug_session
+            debuggee_exited = self._debug_debuggee_exited
+        if existing is not None and existing.is_alive() and not debuggee_exited:
+            return {"ok": False, "msg": "已有调试会话在运行，请先停止"}
+        if existing is not None:
+            # 会话对象还在、但适配器已经不可用（程序自然结束推了 terminated，或适配器进程
+            # 意外退出连 terminated 都没送到），或者适配器只发了 exited 而进程还赖着不走
+            # （DAP 里 exited 只表示**被调试程序**退出，会话未必结束）：先回收掉再放行。
+            # 只看 `is not None` 会让用户重新开始调试时永远拿到「已有调试会话在运行」却
+            # 无会话可停（S3-T7 评审）；exited 这条是 S3-T9 评审补的：前端
+            # reduceDapEvent('dap_exited') 会清空 sessionId、界面据此放行「再次开始调试」，
+            # 后端不认 exited 就会两边打架。
+            self._shutdown_debug_session()
+        real = _resolve_real_path(path)
+        if not os.path.isfile(real):
+            return {"ok": False, "msg": "文件不存在或不是普通文件，无法调试"}
+        workspace = self._session_workdir(self._current_session)
+        if workspace and workspace != "GLOBAL":
+            # 与 ide_run_file 同口径：工作区先归一化再交给策略做包含判断
+            workspace = _resolve_real_path(workspace)
+        denied = self._debug_path_denied(real, workspace, "调试目标文件")
+        if denied:
+            return {"ok": False, "msg": denied}
+        program_real = ""
+        if str(program or "").strip():
+            # program 是 launch 参数里的「被调试程序」：同样先 realpath 再校验
+            program_real = _resolve_real_path(str(program))
+            denied = self._debug_path_denied(program_real, workspace, "调试程序")
+            if denied:
+                return {"ok": False, "msg": denied}
+        # cwd 由目标文件推导（适配器的工作目录），送进适配器前照样过策略
+        cwd_real = os.path.dirname(real)
+        denied = self._debug_path_denied(cwd_real, workspace, "调试工作目录")
+        if denied:
+            return {"ok": False, "msg": denied}
+        # 断点路径与 program / cwd 同口径（先 _resolve_real_path 再过策略）：断点路径
+        # 会原样进 DAP setBreakpoints，适配器据此去读文件，不过策略就等于"让调试器在
+        # 工作区外设断点"。校验放在会话启动之前：越权时直接拒绝，不留下适配器进程
+        # （与 program / cwd 越权时的行为一致）。
+        # `item["path"]` 缺省时回落成上面已校验过的目标文件 `real`——"该文件无断点"
+        # 或"前端只传行号"这类正常情况不会被误判成越权。
+        pending_breakpoints: List[Dict[str, Any]] = []
+        for item in breakpoints or []:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            entry_path = _resolve_real_path(raw_path) if raw_path else real
+            denied = self._debug_path_denied(entry_path, workspace, "断点文件")
+            if denied:
+                return {"ok": False, "msg": denied}
+            pending_breakpoints.append({"path": entry_path, "lines": list(item.get("lines") or [])})
+        language_id = language_id_for_path(real)
+        probe = probe_adapter(language_id)
+        if not probe.ok or probe.spec is None:
+            return {"ok": False, "msg": probe.hint or f"星瑶暂不支持调试该语言：{language_id or '未知'}"}
+        session = DebugSession(
+            probe.spec,
+            program=program_real or real,
+            cwd=cwd_real,
+            args=list(args or []),
+            stop_on_entry=bool(stop_on_entry),
+            emit=self._emit_dap_event,
+            # debugpy 的适配器必须用启动它自己的解释器，否则 -m debugpy.adapter 找不到模块
+            python=probe.spec.command[0] if language_id == "python" else "",
+        )
+        # 会话 id 在 start() 之前就登记：适配器 stderr 读线程在 start() 内就会推
+        # dap_output（debugpy 的报错正是从这里来的），等到 start() 成功后再登记，
+        # 这段窗口里的事件会被 _emit_dap_event 的会话校验当成残留事件丢掉。
+        # 后面每一条失败返回都必须撤回它（否则旧 id 会一直挂在桥层，残留事件的校验跟着失效）。
+        self._debug_session_id = session.session_id
+        try:
+            info = session.start()
+        except DebugSessionError as e:
+            self._debug_session_id = ""
+            session.stop()
+            return {"ok": False, "msg": str(e)}
+        except (DapProtocolError, DapRequestError) as e:
+            self._debug_session_id = ""
+            session.stop()
+            return {"ok": False, "msg": f"启动调试适配器失败：{e}"}
+        try:
+            # 路径已在会话启动前统一校验并 realpath 归一化（含 path 缺省回落 real 的分支）
+            for item in pending_breakpoints:
+                entry_path = str(item["path"])
+                lines = [int(line) for line in (item.get("lines") or [])]
+                session.set_breakpoints(entry_path, lines)
+            session.configuration_done()
+        except (DapProtocolError, DapRequestError, DebugSessionError) as e:
+            self._debug_session_id = ""
+            session.stop()
+            return {"ok": False, "msg": f"调试初始化失败：{e}"}
+        with self._debug_lock:
+            self._debug_session = session
+        self._emit_dap_event("dap_status", {"session_id": session.session_id, "state": "running", "msg": ""})
+        return {
+            "ok": True,
+            "session_id": session.session_id,
+            "adapter": probe.spec.adapter_id,
+            "pid": info.get("pid"),
+        }
+
+    def ide_debug_set_breakpoints(self, path: str, lines: Optional[List[int]] = None) -> Dict[str, Any]:
+        """会话未启动时断点只存在前端，这里返回 pending 由启动时统一下发。
+
+        断点路径与 program / cwd 同口径：先 `_resolve_real_path` 再
+        `gui_path_access_allowed`。策略校验放在会话判断之前——pending 与下发两条
+        分支共用同一道闸，用户在工作区外设断点能立刻拿到可诊断原因，而不是等到
+        「开始调试」时才失败。
+        """
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        real_path = _resolve_real_path(path)
+        workspace = self._session_workdir(self._current_session)
+        if workspace and workspace != "GLOBAL":
+            # 与 ide_run_file / ide_debug_start 同口径：工作区先归一化再交给策略做包含判断
+            workspace = _resolve_real_path(workspace)
+        denied = self._debug_path_denied(real_path, workspace, "断点文件")
+        if denied:
+            return {"ok": False, "msg": denied}
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": True, "pending": True, "verified": []}
+        try:
+            verified = session.set_breakpoints(real_path, [int(line) for line in (lines or [])])
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"设置断点失败：{e}"}
+        return {"ok": True, "pending": False, "verified": verified}
+
+    def ide_debug_command(self, command: str, thread_id: int = 0) -> Dict[str, Any]:
+        """调试控制：continue / pause / next / stepIn / stepOut / restart。
+
+        `thread_id` 可选：显式传 >0 的线程号时优先用它（暂停的典型时机是「程序正在
+        运行」，此时还没有 dap_stopped 记录、桥层记忆是 0，前端先取线程表拿到真实线程号
+        再传进来；S3-T9 评审）；传 0/不传时沿用既有回退逻辑（桥层记忆 → 会话自报）。
+        """
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        handlers = {
+            "continue": lambda session, thread_id: session.continue_(thread_id),
+            "pause": lambda session, thread_id: session.pause(thread_id),
+            "next": lambda session, thread_id: session.next_(thread_id),
+            "stepIn": lambda session, thread_id: session.step_in(thread_id),
+            "stepOut": lambda session, thread_id: session.step_out(thread_id),
+            "restart": lambda session, thread_id: session.restart(),
+        }
+        handler = handlers.get(str(command))
+        if handler is None:
+            return {"ok": False, "msg": f"不支持的调试命令：{command}"}
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": False, "msg": "调试未启动"}
+        # 当前暂停线程来自 dap_stopped（桥层记录）；DebugSession 自己不带这个状态，
+        # 用 0 发 continue/next 会被适配器拒绝（"thread not found"）
+        thread_id = int(thread_id or 0)
+        if thread_id <= 0:
+            thread_id = self._debug_thread_id() or int(getattr(session, "_active_thread_id", 0) or 0)
+        try:
+            handler(session, int(thread_id or 0))
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"{command} 失败：{e}"}
+        return {"ok": True}
+
+    def ide_debug_threads(self) -> Dict[str, Any]:
+        return self._debug_query("threads", lambda session: session.threads(), field="threads")
+
+    def ide_debug_stack_trace(self, thread_id: int = 0, levels: int = 20) -> Dict[str, Any]:
+        return self._debug_query(
+            "stackTrace",
+            lambda session: session.stack_trace(int(thread_id) or self._debug_thread_id(), int(levels)),
+            field="frames",
+        )
+
+    def ide_debug_scopes(self, frame_id: int = 0) -> Dict[str, Any]:
+        return self._debug_query("scopes", lambda session: session.scopes(int(frame_id)), field="scopes")
+
+    def ide_debug_variables(self, variables_reference: int = 0) -> Dict[str, Any]:
+        return self._debug_query(
+            "variables", lambda session: session.variables(int(variables_reference)), field="variables"
+        )
+
+    def ide_debug_evaluate(self, expression: str, frame_id: int = 0) -> Dict[str, Any]:
+        """求值：结果平铺返回（result / type / variablesReference），前端直接渲染。"""
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": False, "msg": "调试未启动", "result": "", "type": "", "variablesReference": 0}
+        try:
+            payload = session.evaluate(str(expression), int(frame_id) or self._debug_frame_id())
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"求值失败：{e}", "result": "", "type": "", "variablesReference": 0}
+        return {"ok": True, **payload}
+
+    def ide_debug_stop(self) -> Dict[str, Any]:
+        """停止调试并回收适配器进程（幂等）。
+
+        **本方法绝不同步等回收**：它是前端 `api` 方法，跑在唯一的 `gui-js-dispatcher`
+        线程上——那也是唯一能调 `evaluate_js` 的线程。若在这里 `session.stop()`，适配器
+        卡住不回 disconnect 时会占住派发线程最坏 ≈15s（`DISCONNECT_TIMEOUT=5.0` +
+        `terminate(timeout=5.0)` + 强杀后 `wait(2.0)` + `_join_threads()` 2.0+1.0），
+        等同于整个前端 UI 冻结，退出星瑶的链路也被拖慢（S3-T9 评审）。
+
+        所以这里只做「丢引用 + 投递临时回收线程」（`_discard_debug_session`，与
+        `dap_terminated` 同一条路径，非阻塞），前端靠下面的 `dap_status` 事件更新状态；
+        真正需要「父进程退出前一定收干净」的关停链路仍走同步的
+        `_shutdown_debug_session`（它会把投递出去的回收线程一起 join 掉）。
+        """
+        self._discard_debug_session()
+        self._emit_dap_event("dap_status", {"session_id": "", "state": "stopped", "msg": ""})
+        return {"ok": True}
+
+    def _debug_query(self, label: str, action, field: str) -> Dict[str, Any]:
+        """调试查询的统一出口：无会话 / 适配器报错的返回结构在这里收敛。"""
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": False, "msg": "调试未启动", field: None}
+        try:
+            return {"ok": True, field: action(session)}
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"{label} 失败：{e}", field: None}
+
+    def _debug_thread_id(self) -> int:
+        return int(getattr(self, "_debug_last_thread_id", 0) or 0)
+
+    def _debug_frame_id(self) -> int:
+        return int(getattr(self, "_debug_last_frame_id", 0) or 0)
 
     # ------------------------------------------------------------------
     # 模型管理
