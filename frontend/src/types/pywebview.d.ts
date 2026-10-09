@@ -162,6 +162,11 @@ export interface SystemSettingsSnapshot {
   agent_turn_step_limit: number;
   agent_turn_step_limit_min: number;
   agent_turn_step_limit_max: number;
+  // 上下文水位基准：null 表示未设置（直接跟随模型真实窗口），
+  // 取值范围由 min/max 给出，供设置页输入框与校验使用
+  context_watermark_base: number | null;
+  context_watermark_base_min: number;
+  context_watermark_base_max: number;
   // AI 生成内容目录（Task 5）：ai_output_dir 为当前生效的绝对路径；
   // ai_output_dir_setting 为原始配置值（未配置为空串，供设置页回显草稿）；
   // ai_output_dir_default 为默认目录（占位符展示用）
@@ -353,6 +358,8 @@ export interface McpInfo {
   enabled: boolean;
   connected: boolean;
   tools_count: number;
+  // 连接失败原因（正常为 null / 旧后端不返回该字段时为 undefined）
+  last_error?: string | null;
 }
 
 export interface PluginInfo {
@@ -1035,6 +1042,8 @@ export interface PyWebViewAPI {
   get_feishu_secret(): Promise<{ ok: boolean; app_secret?: string; msg?: string }>;
   test_feishu_connection(appId?: string, appSecret?: string): Promise<{ ok: boolean; msg?: string; endpoint_ready?: boolean }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // 上下文水位基准：0 表示不设基准（跟随模型真实窗口）
+  set_context_watermark_base(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   // /doctor 聚合自检（T3b）：设置页「运行自检」入口，复用 CLI 同一套检查
   // （core.doctor.run_checks）；skipNetwork 默认 false（含模型端点联网探测）
   run_doctor(skipNetwork?: boolean): Promise<DoctorReport>;
@@ -1100,6 +1109,7 @@ export interface PyWebViewAPI {
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
+  remove_mcp_server(name: string): Promise<any>;
   reconnect_mcp(): Promise<any>;
 
   export_session(fmt: 'md' | 'html' | 'json'): Promise<any>;
