@@ -1331,6 +1331,54 @@ export interface PyWebViewAPI {
   git_resolve_conflict(workdir: string, path: string, resultText?: string, side?: string): Promise<GitBridgeResult>;
   git_recover_branch(workdir: string, oid: string, name: string): Promise<GitBridgeResult>;
   git_ai_assist(workdir: string, kind: string): Promise<GitBridgeResult>;
+
+  // ---- IDE 模式 ----
+  ide_read_file(path: string): Promise<IdeReadFileResult>;
+  ide_write_file(
+    path: string,
+    content: string,
+    expectedHash: string,
+    encoding: string,
+    bom: boolean,
+    eol: string,
+  ): Promise<IdeWriteFileResult>;
+  ide_stat_files(paths: string[]): Promise<{ ok: boolean; stats: IdeFileStat[] }>;
+  ide_set_open_files(paths: string[]): Promise<{ ok: boolean; count: number }>;
+  ide_get_layout(session: string): Promise<{ ok: boolean; layout: IdeLayoutSnapshot | null }>;
+  ide_save_layout(session: string, layout: IdeLayoutSnapshot): Promise<{ ok: boolean; layout: IdeLayoutSnapshot }>;
+
+  // ---- IDE 模式 S2：语言服务 ----
+  lsp_request(
+    path: string,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<{ ok: boolean; result?: unknown; error?: { code: number; message: string }; msg?: string }>;
+  lsp_notify(
+    path: string,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<{ ok: boolean; error?: { code: number; message: string }; msg?: string }>;
+  lsp_server_status(workspace?: string): Promise<{
+    ok: boolean;
+    workspace: string;
+    servers: {
+      server: string;
+      language: string;
+      state: 'missing' | 'stopped' | 'starting' | 'running' | 'restarting' | 'failed';
+      executable: string;
+      source: 'override' | 'bundled' | 'path' | 'missing';
+      pid?: number | null;
+      msg?: string;
+    }[];
+    msg?: string;
+  }>;
+  lsp_set_server_path(serverId: string, path: string): Promise<{ ok: boolean; msg?: string }>;
+  lsp_sync_workspace(): Promise<{
+    ok: boolean;
+    workspace: string;
+    recycled: string[];
+    msg?: string;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,6 +1541,46 @@ export interface GitRebasePlanLineDto {
   summary: string;
   plan?: GitRebasePlanLineDto[];
   conflict?: GitConflictContentDto;
+}
+
+// ---------------------------------------------------------------------------
+// IDE 模式桥接 DTO（Task 8；字段与 gui_bridge.py 的 ide_* 方法返回一致）
+// ---------------------------------------------------------------------------
+
+export interface IdeReadFileResult {
+  ok: boolean;
+  path?: string;
+  content?: string;
+  encoding?: 'utf-8' | 'gbk';
+  bom?: boolean;
+  eol?: 'lf' | 'crlf' | 'cr' | 'mixed';
+  hash?: string;
+  size?: number;
+  msg?: string;
+}
+
+export interface IdeWriteFileResult {
+  ok: boolean;
+  hash?: string;
+  conflict?: { disk_hash: string };
+  msg?: string;
+}
+
+export interface IdeFileStat {
+  path: string;
+  mtime?: number;
+  size?: number;
+  hash?: string;
+  missing?: boolean;
+  denied?: boolean;
+  msg?: string;
+}
+
+export interface IdeLayoutSnapshot {
+  version: number;
+  tabs: { path: string; line: number }[];
+  active: string;
+  breakpoints: { path: string; line: number }[];
 }
 
 declare global {

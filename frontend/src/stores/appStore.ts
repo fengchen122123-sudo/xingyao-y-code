@@ -1,6 +1,15 @@
 import { defineStore } from 'pinia';
 // Git 工作台事件转发（git_state_changed）；gitStore 不反向依赖 appStore，无环
 import { useGitStore } from './gitStore';
+// IDE 已打开文件的外部改动事件转发（ide_file_changed）；
+// ideStore 只依赖 editor/setup 与类型声明，不反向依赖 appStore，无环
+import { useIdeStore } from './ideStore';
+// 调试会话状态仓（S3-T8）：dap_* 事件统一进这里归约；ideDebugStore 只依赖
+// ideStore 与 utils/dapBus，不反向依赖 appStore，无环
+import { useIdeDebugStore } from './ideDebugStore';
+// LSP 事件（lsp_status / lsp_diagnostics）转发：桥事件的唯一赋值点在本 store 的
+// handleBridgeEvent，LSP 事件同样接进那条链（editor/lsp 不反向依赖 stores，无环）
+import { dispatchLspEvent } from '../editor/lsp';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
@@ -44,6 +53,8 @@ import type {
   TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
+// 调试适配器输出旁路总线（S3-T8）：高频原始输出不进响应式状态
+import { emitDapOutput } from '../utils/dapBus';
 import { isMarkdownFilePath, toFileUrl } from '../utils/localPath';
 import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 // 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
@@ -743,6 +754,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 按会话保存恢复，A 会话打开的浏览器页签不会出现在 B 会话
     rightPanelTabs: [] as RightPanelTabId[],
     rightPanelActiveTab: '' as RightPanelTabId | '',
+    // IDE 模式：与 rightPanelTabs 同样按会话隔离
+    ideModeBySession: {} as Record<string, boolean>,
     // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
     // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
     // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
@@ -1079,6 +1092,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 切回时恢复该会话自己的浏览器/Git 等页签。事件管线的临时捕获
       // （skipLayout）不保存这段：顶层布局此时仍属于当前查看的会话
       if (!opts?.skipLayout) {
+      // 注意：本行**每次都换一个新数组引用**。S3-T8 报告里「回写当前 store 的同一批
+      // 引用、值相等时 Vue hasChanged 不触发更新」那条论断只适用于上面按引用直赋的
+      // 字段（messages / tokenUsage / modelId / navItems 等），**不适用于 rightPanelTabs**。
+      // 这里没有性能后果：该字段只在切会话时被读写，不在高频事件路径上。
       runtime.rightPanelTabs = [...this.rightPanelTabs];
       runtime.rightPanelActiveTab = this.rightPanelActiveTab;
       runtime.rightPanelExpanded = !this.rightPanelCollapsed;
@@ -1540,6 +1557,16 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.subagentDetailId = taskId;
       this.subagentOpenNonce += 1;
       this.openRightPanelTab('subagent');
+    },
+
+    // ── IDE 模式（对话 / IDE 双模式切换）───────────────────────────
+    // 按会话隔离：A 会话切到 IDE 模式，B 会话仍保持对话模式
+    ideMode(): boolean {
+      return !!this.ideModeBySession[this.currentSessionName];
+    },
+
+    toggleIdeMode() {
+      this.ideModeBySession[this.currentSessionName] = !this.ideMode();
     },
 
     // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
@@ -4534,8 +4561,32 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } else if (type === 'pty_data') {
         // 底部内嵌交互式终端：原始输出直接走 ptyBus 给 xterm，不进响应式状态
         emitPtyData(String(data.text ?? ''));
+      } else if (type === 'ide_file_changed') {
+        // IDE 已打开文件被外部改动（后端 Task 7 轮询发现）：交给 ideStore 决定
+        // 是自动重载（本地干净）还是只打脏标记（本地有未保存内容）
+        void useIdeStore().handleExternalChange(String(data.path ?? ''));
+      } else if (type === 'lsp_diagnostics' || type === 'lsp_status') {
+        // 语言服务事件（Task 9）：必须接进本函数这条既有 type-if 链——它是
+        // window.onBridgeEvent 的唯一赋值点。计划里「由 App.vue 的桥事件分发处转发」
+        // 的说法不成立：App.vue 再挂一处分发等于新开一条通道，违反单消费者约定。
+        // lsp_status 里还携带崩溃重启信号，由 lsp 客户端据此重发 didOpen。
+        dispatchLspEvent(type, data);
       } else if (type === 'pty_exit') {
         emitPtyExit(Number(data.code ?? 0));
+      } else if (type === 'dap_output') {
+        // 调试适配器输出（S3-T8）：与 pty_data 同口径，高频原始文本走总线，
+        // 只做分流、不进 ideDebugStore 的响应式状态
+        emitDapOutput({
+          session_id: String(data.session_id ?? ''),
+          category: String(data.category ?? 'stdout'),
+          text: String(data.text ?? ''),
+        });
+      } else if (type.startsWith('dap_')) {
+        // 调试会话状态事件（dap_stopped / dap_terminated / dap_continued / dap_exited /
+        // dap_breakpoint_changed / dap_status）统一进 ideDebugStore 归约（与 gitStore
+        // 同范式）。这里和 lsp_* 一样必须接进本函数这条既有 type-if 链：它是
+        // window.onBridgeEvent 的唯一赋值点，另开通道等于绕开单消费者约定。
+        useIdeDebugStore().reduceDapEvent(type, data);
       } else if (type === 'update_download_progress') {
         this.updateState.status = 'downloading';
         this.updateState.downloadProgress = Number(data.percent) || 0;
