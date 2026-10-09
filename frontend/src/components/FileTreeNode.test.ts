@@ -4,6 +4,7 @@ import { beforeEach, expect, it } from 'vitest';
 
 import FileTreeNode from './FileTreeNode.vue';
 import { useAppStore } from '../stores/appStore';
+import { useIdeStore } from '../stores/ideStore';
 import type { FileNode } from '../types/pywebview';
 
 beforeEach(() => setActivePinia(createPinia()));
@@ -56,5 +57,41 @@ it('文件树里的其它类型点击仍走源码预览弹窗', async () => {
 
   expect(previewCalls).toEqual(['D:\\proj\\app.py']);
   expect(panelCalls).toEqual([]);
+  wrapper.unmount();
+});
+
+it('IDE 模式下点击代码文件走编辑器打开，不弹预览', async () => {
+  const store = useAppStore();
+  const ide = useIdeStore();
+  store.ideModeBySession = { '': true };
+  const opened: string[] = [];
+  ide.openFile = (async (p: string) => { opened.push(p); }) as any;
+  const previewCalls: string[] = [];
+  store.openFilePreview = (async (p: string) => { previewCalls.push(p); }) as any;
+
+  const node = { n: 'app.py', d: 0 } as FileNode;
+  const wrapper = mount(FileTreeNode, { props: { node, parentPath: 'D:\\proj' } });
+  await wrapper.get('.file-row').trigger('click');
+
+  expect(opened).toEqual(['D:\\proj\\app.py']);
+  expect(previewCalls).toEqual([]);
+  wrapper.unmount();
+});
+
+it('对话模式下点击代码文件仍走源码预览', async () => {
+  const store = useAppStore();
+  const ide = useIdeStore();
+  store.ideModeBySession = { '': false };
+  const opened: string[] = [];
+  ide.openFile = (async (p: string) => { opened.push(p); }) as any;
+  const previewCalls: string[] = [];
+  store.openFilePreview = (async (p: string) => { previewCalls.push(p); }) as any;
+
+  const node = { n: 'app.py', d: 0 } as FileNode;
+  const wrapper = mount(FileTreeNode, { props: { node, parentPath: 'D:\\proj' } });
+  await wrapper.get('.file-row').trigger('click');
+
+  expect(previewCalls).toEqual(['D:\\proj\\app.py']);
+  expect(opened).toEqual([]);
   wrapper.unmount();
 });

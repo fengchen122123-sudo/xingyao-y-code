@@ -416,6 +416,109 @@ def test_lan_forbids_drain_js_queue(server):
     assert response["error"]["code"] == "method_not_allowed"
 
 
+@pytest.mark.parametrize("method", [
+    "ide_write_file",
+    "ide_set_open_files",
+    "ide_save_layout",
+])
+def test_lan_forbids_ide_state_mutating_methods(server, method):
+    """IDE 桥的写类方法必须 fail-closed 拒绝（Task 8 评审 Critical）。
+
+    dispatch_rpc 是 fail-open 分发（只拦黑名单 + 下划线前缀）：这些方法若不入
+    FORBIDDEN_METHODS，手机端等于凭空多出一条远程写文件 / 改打开集合 / 覆盖
+    持久化布局的通道。写类方法会改变桌面状态，必须与 open_path /
+    save_clipboard_image 同一边界（设计 18：LAN 实施 fail-closed 的同一边界）。
+    """
+    response = server.dispatch_rpc(method, [])
+    assert response["error"]["code"] == "method_not_allowed"
+
+
+def test_lan_allows_ide_read_only_methods():
+    """只读类 IDE 方法保持放行（与 read_file_preview 可被 LAN 调用同一先例）。
+
+    只读不改变桌面状态，误拦会破坏手机端浏览/查看文件的既有能力。
+    """
+    calls = []
+
+    class ReadBridge:
+        def ide_read_file(self, path):
+            calls.append(("read", path))
+            return {"ok": True, "path": path, "content": "x = 1\n"}
+
+        def ide_stat_files(self, paths):
+            calls.append(("stat", paths))
+            return {"ok": True, "stats": []}
+
+        def ide_get_layout(self, session):
+            calls.append(("layout", session))
+            return {"ok": True, "layout": None}
+
+    srv = LanServer(bridge=ReadBridge())
+    for method, args in (
+        ("ide_read_file", ["a.py"]),
+        ("ide_stat_files", [["a.py"]]),
+        ("ide_get_layout", ["s1"]),
+    ):
+        result = srv.dispatch_rpc(method, args)
+        # 绝不能返回 method_not_allowed：只读方法必须真正到达 bridge
+        assert "error" not in result
+        assert result["ok"] is True
+    assert [c[0] for c in calls] == ["read", "stat", "layout"]
+
+
+@pytest.mark.parametrize("method", [
+    "pty_terminal_write",
+    "pty_terminal_kill",
+    "lsp_set_server_path",
+])
+def test_lan_forbids_pty_write_kill_and_lsp_set_server_path(server, method):
+    """交互式终端的「写入/销毁」类与 LSP 路径覆写必须 fail-closed 拒绝（Task 17）。
+
+    dispatch_rpc 是 fail-open 分发（只拦黑名单 + 下划线前缀）：
+    - pty_terminal_write 把任意字符串原样写进桌面常驻 shell，等于远程任意
+      命令执行——比已封的 ide_run_file 更直接（连文件路径都不校验），是
+      「远程执行任意命令」这条通道的本体；
+    - pty_terminal_kill 终止用户的常驻 shell（销毁桌面用户态会话）；
+    - lsp_set_server_path 写盘 override 并 recycle_all() 换掉 LSP 可执行
+      文件，属写配置类，与 ide_write_file / ide_save_layout 同一边界。
+    """
+    response = server.dispatch_rpc(
+        method, ["rm -rf /\r"] if method == "pty_terminal_write" else []
+    )
+    assert response["error"]["code"] == "method_not_allowed"
+
+
+def test_lan_allows_pty_read_only_methods():
+    """终端的「查看/调尺寸」类必须保持放行（防止后人顺手多封砍掉手机端能力）。
+
+    设计原则：手机只可查看状态与紧急停止——pty_terminal_ensure 只确保会话
+    存活（不写任何输入），pty_terminal_resize 只同步 xterm 视口尺寸，两者
+    都属「查看」：手机端仍能看桌面终端的输出、能调尺寸，只是敲不进命令。
+    误拦会砍掉手机端既有能力，与 ide_read_file 保持放行的先例同口径。
+    """
+    calls = []
+
+    class PtyBridge:
+        def pty_terminal_ensure(self, cols=80, rows=24):
+            calls.append(("ensure", cols, rows))
+            return {"ok": True, "pid": 4321, "cwd": "E:\\ws", "reused": True}
+
+        def pty_terminal_resize(self, cols=80, rows=24):
+            calls.append(("resize", cols, rows))
+            return {"ok": True}
+
+    srv = LanServer(bridge=PtyBridge())
+    for method, args in (
+        ("pty_terminal_ensure", [100, 30]),
+        ("pty_terminal_resize", [120, 40]),
+    ):
+        result = srv.dispatch_rpc(method, args)
+        # 绝不能返回 method_not_allowed：只读/查看类方法必须真正到达 bridge
+        assert "error" not in result
+        assert result["ok"] is True
+    assert [c[0] for c in calls] == ["ensure", "resize"]
+
+
 @pytest.mark.parametrize("method", ["get_computer_control_status", "stop_computer_control"])
 def test_lan_allows_status_and_emergency_stop(server, method):
     assert server.dispatch_rpc(method, ["run-a"] if method.startswith("stop") else [])["ok"] is True
@@ -1021,4 +1124,317 @@ def test_rotation_rejects_stale_registration_concurrently():
     assert srv._clients == []
     for c in registered_stale:
         assert c not in srv._clients
+    for c in registered_stale:
+        assert c not in srv._clients
         assert c.closed and c.closed[0][0] == 4401
+
+
+# ---------------------------------------------------------------------------
+# LAN 边界审计（本轮）：明文凭据读取 / 写桌面持久配置且决定后续执行 /
+# 与已封方法同类同边界。用「会真的返回敏感值」的桥桩，证明拦截发生在
+# LAN 分发边界（dispatch_rpc），而不是因为桥桩没有这个方法。
+# ---------------------------------------------------------------------------
+
+class _LeakProbeBridge:
+    """记录被调用次数并返回敏感值的桥桩：LAN 侧一旦放行就会泄露。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def _probe(self, name, value):
+        self.calls.append(name)
+        return {"ok": True, **value}
+
+    def get_provider_api_key(self, provider_id):
+        return self._probe("get_provider_api_key", {"api_key": "sk-real-secret"})
+
+    def get_feishu_secret(self):
+        return self._probe("get_feishu_secret", {"app_secret": "super_secret"})
+
+    def save_hook(self, payload):
+        return self._probe("save_hook", {"msg": "已保存"})
+
+    def grant_hook_trust(self, digest):
+        return self._probe("grant_hook_trust", {"msg": "已信任"})
+
+    def add_mcp_server(self, name, command, args, env=None, enabled=True):
+        return self._probe("add_mcp_server", {"msg": "已新增服务"})
+
+    def save_ui_layout(self, layout):
+        return self._probe("save_ui_layout", {"layout": layout})
+
+    def shutdown(self):
+        return self._probe("shutdown", {})
+
+
+@pytest.mark.parametrize("method", ["get_provider_api_key", "get_feishu_secret"])
+def test_lan_forbids_credential_plaintext_reads(method):
+    """明文凭据读取必须 fail-closed 拒绝（本轮审计：密钥/隐私读取类）。
+
+    快照类方法只回 has_* 布尔（get_model_settings 的 has_api_key /
+    get_feishu_settings 的 has_secret），明文只在桌面设置页用户点「显示/
+    复制」时按需取回。LAN 放行等于让配对手机一次性拖走全部厂商 Key 与
+    飞书 app_secret——手机端设置页的正常显示/回填不需要明文（走 has_*
+    占位），只有「显示」「复制」按钮会落空，代价可接受。
+    """
+    bridge = _LeakProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc(method, ["p1"] if method.endswith("api_key") else [])
+    assert response["error"]["code"] == "method_not_allowed"
+    # 拦截必须在到达桥之前：桥桩一旦被调用，敏感值就已经经 LAN 出去了
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize("method", [
+    "save_hook",
+    "grant_hook_trust",
+    "add_mcp_server",
+])
+def test_lan_forbids_execution_enabling_config_writes(method):
+    """写「决定桌面后续执行什么」的持久配置必须 fail-closed 拒绝（本轮审计）。
+
+    - save_hook：hook 信任门禁对「用户级」是默认放行的
+      （core/hooks/trust.py:status_for，scope == "user" → TRUST_TRUSTED），
+      而 scope 由客户端自选，所以写一次 ~/.ycode/hooks.json 就能让任意命令
+      在此后每次 hook 事件上长期执行、且没有任何桌面确认——比已封的
+      pty_terminal_write 更宽（一次一写 vs 长期生效）；
+    - grant_hook_trust：同一通道的另一半，给项目级 pending hook 授信等于
+      远程「确认安全检查」，与已封的 acknowledge_computer_safety 同类；
+    - add_mcp_server：写盘 mcp.json 并立即 spawn（只校验命令名 ∈ npx/node/
+      python，args 原样透传），与已封的 lsp_set_server_path 同边界且更直接。
+    """
+    bridge = _LeakProbeBridge()
+    srv = LanServer(bridge=bridge)
+    args = {
+        "save_hook": [{"scope": "user", "event": "SessionStart", "command": "calc.exe"}],
+        "grant_hook_trust": ["deadbeef"],
+        "add_mcp_server": ["evil", "npx", ["-y", "evil-pkg"]],
+    }[method]
+    response = srv.dispatch_rpc(method, args)
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize("method", ["save_ui_layout", "shutdown"])
+def test_lan_forbids_desktop_exclusive_layout_and_lifecycle(method):
+    """桌面专属的持久化布局与生命周期方法必须 fail-closed 拒绝（本轮审计）。
+
+    黑名单此前存在同类不对称：ide_save_layout 已封、同为「覆盖桌面持久化
+    布局」的 save_ui_layout 却放行；window_close 已封、真正中止全部活跃
+    回合并销毁窗口的 shutdown 却放行。两者手机端都无能力需求
+    （frontend-mobile 不调用；shutdown 的唯一调用方是 gui_main 的窗口销毁
+    链路），与既有窗口控制分组同一划界。
+    """
+    bridge = _LeakProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc(
+        method, [{"groups": []}] if method == "save_ui_layout" else []
+    )
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+def test_lan_allows_lsp_read_and_sync_methods():
+    """LSP 组的「只读/前端驱动」方法必须保持放行（Task 17 评审要求补「留」的断言）。
+
+    上一轮只测了 lsp_set_server_path 的「封」，没有测 LSP 组的「留」——
+    后人顺手把整组 LSP 方法都封掉也不会被测出，而手机端的 LSP 状态显示、
+    请求转发与工作区同步会随之静默失效。这里用与
+    test_lan_allows_pty_read_only_methods 同款的「必须真正到达 bridge」
+    断言锁定：dispatch_rpc 是 fail-open 分发，放行方法绝不能返回
+    method_not_allowed。
+    """
+    calls = []
+
+    class LspBridge:
+        def lsp_server_status(self, session=None):
+            calls.append(("status", session))
+            return {"ok": True, "running": True, "language": "python"}
+
+        def lsp_request(self, method, params=None, session=None):
+            calls.append(("request", method, session))
+            return {"ok": True, "result": {"contents": "x"}}
+
+        def lsp_notify(self, method, params=None, session=None):
+            calls.append(("notify", method, session))
+            return {"ok": True}
+
+        def lsp_sync_workspace(self, files=None, session=None):
+            calls.append(("sync", session))
+            return {"ok": True, "synced": 1}
+
+    srv = LanServer(bridge=LspBridge())
+    for method, args in (
+        ("lsp_server_status", ["s1"]),
+        ("lsp_request", ["textDocument/hover", {}, "s1"]),
+        ("lsp_notify", ["textDocument/didSave", {}, "s1"]),
+        ("lsp_sync_workspace", [[], "s1"]),
+    ):
+        result = srv.dispatch_rpc(method, args)
+        # 绝不能返回 method_not_allowed：LSP 只读/同步类方法必须真正到达 bridge
+        assert "error" not in result
+        assert result["ok"] is True
+    assert [c[0] for c in calls] == ["status", "request", "notify", "sync"]
+
+
+class _EscalationProbeBridge:
+    """记录调用：验证封禁发生在到达桥之前（桥桩一旦被调用，危害已经发生）。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def _probe(self, name, payload):
+        self.calls.append(name)
+        return payload
+
+    def save_automation_task(self, *args, **kwargs):
+        return self._probe("save_automation_task", {"ok": True})
+
+    def set_automation_task_enabled(self, *args, **kwargs):
+        return self._probe("set_automation_task_enabled", {"ok": True})
+
+    def run_automation_task_now(self, *args, **kwargs):
+        return self._probe("run_automation_task_now", {"ok": True})
+
+    def toggle_mcp_server(self, *args, **kwargs):
+        return self._probe("toggle_mcp_server", {"ok": True})
+
+
+@pytest.mark.parametrize("method,args", [
+    ("save_automation_task", [{"name": "t", "prompt": "p", "permission_mode": "full"}]),
+    ("set_automation_task_enabled", ["t1", True]),
+    ("run_automation_task_now", ["t1"]),
+])
+def test_lan_forbids_automation_escalation_chain(method, args):
+    """自动化任务链必须 fail-closed 拒绝（本轮审计 Important）。
+
+    手机端原本可经 save_automation_task(permission_mode="full") →
+    set_automation_task_enabled(True) 或 run_automation_task_now(task_id)
+    拿到一次 full 档的桌面回合：automation 任务自带 permission_mode
+    （core/automation/models.py 允许 "full"），而 run_automation_task_now
+    内部硬编码 turn_source="local"（gui_bridge.py 的
+    _dispatch_automation_run），连 resolve_computer_capability 的远程禁令
+    都不继承。只强制 turn_source 不足以堵住（任务自带的 full 档仍生效），
+    所以三个入口一起封。只读快照保持放行（见下一条用例）。
+    """
+    bridge = _EscalationProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc(method, args)
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+def test_lan_forbids_toggle_mcp_server():
+    """MCP 启停必须 fail-closed 拒绝：与已封的 add_mcp_server 同通道。
+
+    「启用」半边能把桌面用户主动停用的 MCP 服务远程拉起（拉起即 spawn 该
+    服务配置的命令）。此前以「移动端在用」为由保留，经核实 frontend-mobile
+    对 toggle_mcp_server 零引用，该理由不成立。
+    """
+    bridge = _EscalationProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc("toggle_mcp_server", ["evil", True])
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+class _PermissionModeProbeBridge:
+    def __init__(self):
+        self.calls = []
+
+    def set_permission_mode(self, mode, session_name=""):
+        self.calls.append((mode, session_name))
+        return {"ok": True, "permission_mode": mode, "bound": bool(session_name)}
+
+
+@pytest.mark.parametrize("session_args", [[], [""], ["   "]])
+def test_lan_forbids_global_permission_mode_switch(session_args):
+    """无 session 的 set_permission_mode 必须拒绝：它会改写并落盘全局档位。
+
+    gui_bridge.py 的 set_permission_mode 在 target_session 为空时调
+    app_context.set_permission_mode 并 save_config_value("permission_mode", ...)
+    ——手机端可据此把桌面**长期**置成 full（免确认执行文件写入与命令）。
+    手机端只需要会话级切换（frontend-mobile 恒带 currentSession）。
+    空白串也必须拒（否则 {"session_name": "  "} 会绕过守卫落到全局分支）。
+    """
+    bridge = _PermissionModeProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc("set_permission_mode", ["full"] + session_args)
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+def test_lan_allows_session_scoped_permission_mode_switch():
+    """带 session 的会话级切换必须放行（手机端的档位选择器依赖它）。
+
+    与上一条构成「封全局 / 留会话」的双侧锁定：只封不留会把手机端的
+    权限档位选择器整条打断，而它是 frontend-mobile 真实在用的功能
+    （frontend-mobile/src/stores/app.ts 调用时恒带 currentSession）。
+    """
+    bridge = _PermissionModeProbeBridge()
+    srv = LanServer(bridge=bridge)
+    # 位置通道
+    result = srv.dispatch_rpc("set_permission_mode", ["full", "s1"])
+    assert "error" not in result
+    assert result["ok"] is True
+    assert bridge.calls == [("full", "s1")]
+    # kwargs 通道
+    result = srv.dispatch_rpc("set_permission_mode", {"mode": "confirm", "session_name": "s2"})
+    assert "error" not in result
+    assert result["ok"] is True
+    assert bridge.calls[-1] == ("confirm", "s2")
+
+
+def test_lan_allows_adjacent_read_only_methods():
+    """新封方法的相邻只读方法必须保持放行（评审 F5：双侧覆盖不能只做「封」）。
+
+    上一轮的双侧断言只做到了 LSP 组，新封方法的相邻只读方法没有「仍放行」
+    锁定——后人顺手多封不会被测出，而手机端的任务列表、运行历史、MCP 列表、
+    布局读取与设置回填会随之静默失效。
+    """
+    calls = []
+
+    class ReadOnlyBridge:
+        def get_automation_tasks(self):
+            calls.append("tasks")
+            return {"ok": True, "tasks": []}
+
+        def get_automation_runs(self, task_id="", limit=50):
+            calls.append("runs")
+            return {"ok": True, "runs": []}
+
+        def get_mcp_servers(self):
+            calls.append("mcp")
+            return {"ok": True, "servers": []}
+
+        def reconnect_mcp(self, name):
+            calls.append("reconnect")
+            return {"ok": True}
+
+        def get_ui_layout(self):
+            calls.append("layout")
+            return {"ok": True, "layout": {}}
+
+        def get_model_settings(self):
+            calls.append("model")
+            return {"ok": True, "has_api_key": True}
+
+        def get_feishu_settings(self):
+            calls.append("feishu")
+            return {"ok": True, "has_secret": True}
+
+    srv = LanServer(bridge=ReadOnlyBridge())
+    for method, args in (
+        ("get_automation_tasks", []),
+        ("get_automation_runs", []),
+        ("get_mcp_servers", []),
+        ("reconnect_mcp", ["srv1"]),
+        ("get_ui_layout", []),
+        ("get_model_settings", []),
+        ("get_feishu_settings", []),
+    ):
+        result = srv.dispatch_rpc(method, args)
+        # 绝不能返回 method_not_allowed：只读/回填类方法必须真正到达 bridge
+        assert "error" not in result, method
+        assert result["ok"] is True, method
+    assert calls == ["tasks", "runs", "mcp", "reconnect", "layout", "model", "feishu"]
