@@ -93,10 +93,26 @@ async function mountView() {
     parent: hostRef.value,
     extensions: [
       buildEditorTheme(isLightTheme()),
+      // 光标行列上报：底部状态栏「编辑器段」的唯一数据源。
+      // 只认 selectionSet（「本次 update 显式设置了选区」）——鼠标点选、方向键、输入、
+      // 跳转定位的 dispatch 都会带上选区，覆盖了光标会动的全部场景；而滚动 / 聚焦这类
+      // 无关 update 不会带上它，直接跳过。文档整体替换（applyingExternal）另走下面的
+      // listener，不需要在这里重复上报。
+      EditorView.updateListener.of((update) => {
+        if (!update.selectionSet) return;
+        const head = update.state.selection.main.head;
+        const line = update.state.doc.lineAt(head);
+        const column = head - line.from + 1;
+        // 行列未变时不写 store：update 频率很高，无意义的写入会让状态栏白重渲染
+        if (line.number === store.cursorLine && column === store.cursorColumn) return;
+        store.setCursor(line.number, column);
+      }),
       EditorView.updateListener.of((update) => {
         if (!update.docChanged || applyingExternal) return;
         const text = update.state.doc.toString();
         store.updateContent(props.path, text);
+        // 行数随文档增删同步，状态栏「共 N 行」跟着走
+        store.setDocLines(update.state.doc.lines);
         // 文档同步走防抖（CHANGE_DEBOUNCE_MS），不会因为一次击键打一次桥调用
         changeDocument(current.path, text);
       }),
@@ -110,6 +126,8 @@ async function mountView() {
   consumePendingJump();
   // 同理：切标签会重建视图，新实例要把「当前停在哪一行」的高亮补回来
   applyExecLine();
+  // 文档就绪即上报总行数：状态栏的「共 N 行」在打开文件后立刻可用
+  store.setDocLines(view.state.doc.lines);
 }
 
 onMounted(() => {
@@ -121,6 +139,10 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown, true);
   view?.destroy();
   view = null;
+  // 离开编辑器即把光标行列复位：IDE 布局卸载、会话切换后状态栏可能还挂着活动标签
+  //（甚至没有标签），不复位就会显示上一个文件的行列——那是无主的陈旧数据。
+  // 1,1 是「还没有视图报到」的中性值，新实例挂载后会立刻覆盖它。
+  store.setCursor(1, 1);
 });
 
 watch(
@@ -228,14 +250,40 @@ function onOverwrite() {
 .editor-pane {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  /* 作为 .ide-main（flex column）的子项，必须用 flex: 1 + min-height: 0 才能占满
+     「剩余高度」。原来的 height: 100% 在嵌套 flex 里解析不可靠：它会算成整个
+     .ide-main 的高度，不扣除调试工具条 / 标签页 / 底部面板，于是编辑器比可视区
+     高一截——CodeMirror 的滚动容器拿不到受限高度，内容被父级裁掉却滚不动
+     （实测症状：603 行的文件滚不到最后一行）。 */
+  flex: 1 1 0%;
   min-height: 0;
 }
 
+/* 宿主必须是 flex 容器：CodeMirror 的 .cm-editor 高度不能再靠 height: 100% 拿——
+   本宿主的 height 属性是 auto（实际高度由上面的 flex: 1 算出来），百分比高度解析不到
+   基准，会静默退回内容高度。实测（CDP 抓真实 DOM）：.editor-host 521px，.cm-editor
+   却是 18275px（900 行的全高），滚动容器跟着变成全高、没有可滚空间，滚轮完全无效。
+   这正是「代码滚不动」的根因。改成 flex 分配后不再依赖百分比。 */
 .editor-host {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* CodeMirror 根节点与滚动容器：一路用 flex 占满宿主。
+   flex-basis 取 0 而不是 auto，是为了不让 theme 里的 height: 100% 参与主轴计算——
+   在 flex 上下文里 basis: 0 优先，height 被忽略，百分比失效这条链路就绕开了。
+   .cm-scroller 覆盖掉 CodeMirror baseTheme 的 height: 100%，同理。 */
+.editor-host :deep(.cm-editor) {
+  flex: 1 1 0%;
+  min-height: 0;
+}
+
+.editor-host :deep(.cm-scroller) {
+  flex: 1 1 0%;
+  min-height: 0;
 }
 
 .external-bar {

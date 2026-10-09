@@ -1,6 +1,6 @@
 <template>
   <div>
-    <div class="file-row" :class="{ open: isOpen }" @click="toggle">
+    <div class="file-row" :class="{ open: isOpen, active: isActiveFile }" @click="toggle">
       <span class="fi">
         <AppIcon v-if="node.d" name="chevron-right" :size="12" :class="{ 'is-open': isOpen }" />
       </span>
@@ -51,11 +51,21 @@ const props = defineProps<{
 }>();
 
 const store = useAppStore();
+const ide = useIdeStore();
 // 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
 const isMobile = useIsMobile();
 // FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
 const fullPath = computed(() => {
   return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
+});
+// 选中态（设计稿 .row.sel）：当前活动标签所在行铺 --accent-soft 底色。
+// 用 ideStore.tab() 做判等而不是字符串直接比：活动标签记的是后端 realpath，
+// 而这里拼出来的是调用方路径，两者在大小写 / 分隔符上可能不同（tab() 是仓库里
+// 唯一的路径查表口径，两种形态都能命中）。
+const isActiveFile = computed(() => {
+  const active = ide.activePath();
+  if (!active || props.node.d) return false;
+  return ide.tab(fullPath.value)?.path === active;
 });
 // 展开状态持久化在 store：文件树刷新后新组件实例也能凭路径恢复展开
 const isOpen = ref(store.fileTreeExpanded.includes(fullPath.value));
@@ -70,7 +80,7 @@ async function toggle() {
     // IDE 模式下，代码与文本文件直接在编辑器打开；图片等非文本仍走既有预览分流。
     // 必须插在下方既有分流之前，且只接管可编辑文本类型，保证对话模式零回归。
     if (store.ideMode() && isEditableText(props.node.n)) {
-      void useIdeStore().openFile(fullPath.value);
+      void ide.openFile(fullPath.value);
       return;
     }
     // html / pdf / md 交给右栏（网页直接渲染，md 先渲染成预览页）；
@@ -115,7 +125,9 @@ async function toggle() {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 4px 8px;
+  /* 行高按设计稿 .row 定 24px（原来由字体行高决定，约 25.5px） */
+  min-height: 24px;
+  padding: 2px 8px;
   padding-right: 16px;
   border-radius: 6px;
   cursor: pointer;
@@ -129,6 +141,11 @@ async function toggle() {
 .file-row:hover {
   background: var(--bg2);
   color: var(--text);
+}
+/* 选中态（设计稿 .row.sel）：活动标签所在文件行 */
+.file-row.active {
+  background: var(--accent-soft);
+  color: var(--text-bright);
 }
 .file-row .fi {
   width: 15px;
@@ -151,9 +168,10 @@ async function toggle() {
   white-space: nowrap;
 }
 .file-children {
-  margin-left: 16px;
+  /* 每层缩进 14px（含 1px 竖向引导线），对齐设计稿 .row 的 padding-left 递进 */
+  margin-left: 10px;
   border-left: 1px solid var(--border);
-  padding-left: 6px;
+  padding-left: 4px;
 }
 .file-loading {
   padding: 3px 8px;

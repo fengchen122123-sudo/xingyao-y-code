@@ -95,6 +95,21 @@ export const useIdeStore = defineStore('ide', {
     bottomPanelOpenBySession: {} as Record<string, boolean>,
     /** 待执行的跳转请求：S2 的「跳转定义」把目标行列写在这里，EditorPane 消费后清空 */
     pendingJump: null as { path: string; line: number; character: number } | null,
+    /**
+     * 编辑器光标行列（1-based），底部状态栏「编辑器段」的数据源。
+     *
+     * 不按标签分桶：同一时刻只有活动标签的 EditorPane 实例在跑，切标签会重建视图，
+     * 由 `_syncActiveTab` 复位成 1,1、新实例建好视图后上报真实位置。若按标签存，
+     * 状态栏还得再拼一次「当前活动标签的光标」，多一份可能漂移的状态。
+     */
+    cursorLine: 1,
+    cursorColumn: 1,
+    /**
+     * 活动文档总行数：状态栏 IDE 段用它显示「共 N 行」。
+     * 它同时是排查「文件只加载了几十行 / 编辑器滚不动」这类问题的第一手事实——
+     * 光标行列只说明光标停在哪，说明不了文档到底读进来多少。
+     */
+    docLines: 0,
   }),
 
   getters: {
@@ -234,9 +249,42 @@ export const useIdeStore = defineStore('ide', {
       });
     },
 
+    /**
+     * 记录编辑器光标行列（EditorPane 在选区变化时上报，卸载时复位）。
+     *
+     * 行列未变时不写：同一位置的重复上报没有新信息，白白让状态栏重渲染一次
+     * （组件侧也在上报前做了同样的判定，这里再兜一层，保证任何调用方都受同一约束）。
+     */
+    setCursor(line: number, column: number) {
+      if (line === this.cursorLine && column === this.cursorColumn) return;
+      this.cursorLine = line;
+      this.cursorColumn = column;
+    },
+
+    /**
+     * 上报活动文档总行数。编辑器挂载、文档变更、外部重载三处都会调用——
+     * 行数变了才写，避免状态栏无意义重渲染。切标签时由 `_syncActiveTab` 复位成 0，
+     * 不显示上一个文件的陈旧行数。
+     */
+    setDocLines(lines: number) {
+      const next = Number.isFinite(lines) && lines > 0 ? Math.floor(lines) : 0;
+      if (next === this.docLines) return;
+      this.docLines = next;
+    },
+
     /** 活动标签对象与 activeBySession 保持同步，避免两处状态漂移 */
     _syncActiveTab() {
+      const prev = this.activeTab?.path ?? '';
       this.activeTab = this.tab(this.activePath()) ?? null;
+      // 活动标签换文件 = 换编辑器实例：上一个文件的光标行列立即失效，先复位成 1,1，
+      // 等新 EditorPane 建好视图（createEditorState 是异步的）后上报真实位置。
+      // 否则状态栏会在建视图的窗口里显示上一个文件的行列；切到无标签的会话时
+      // 更会留下一份无主的残留数据。
+      if (!samePath(prev, this.activeTab?.path ?? '')) {
+        this.setCursor(1, 1);
+        // 文档行数同理：换了文件，上一个文件的行数就是无主数据，新实例挂载后会重新上报
+        this.setDocLines(0);
+      }
     },
 
     tabs(): IdeTab[] {

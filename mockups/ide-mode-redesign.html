@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IDE 模式 · 界面设计稿 | 星瑶Code</title>
+<style>
+:root{
+  /* ===== 星瑶内置浅色主题（builtin.light）语义 token =====
+     取值与 core/gui_theme.py 的 BUILTIN_THEMES["builtin.light"] 完全一致，
+     落地开发时直接消费 --theme-* 变量，无需新增任何颜色 token。 */
+  --bg-app:#f4f4f1;        /* theme-background-app  工作区底色 */
+  --bg-panel:#ffffff;      /* theme-background-panel 侧栏/面板/顶栏 */
+  --bg-card:#efefec;       /* theme-background-card  状态栏/次级底 */
+  --bg-elevated:#e4e4e0;   /* theme-background-elevated 悬停/激活底 */
+  --border:#e3e3de;
+  --text:#2c2c2a;
+  --text-bright:#171716;
+  --text-dim:#5c5c56;
+  --text-faint:#7a7a73;
+  --accent:#3a6dd8;
+  --accent-soft:rgba(58,109,216,.10);
+  --accent-hover:rgba(58,109,216,.20);
+  --green:#2c8a4c;
+  --yellow:#96700f;
+  --red:#cf3d36;
+  --orange:#b85e1f;
+  --cyan:#1a7f92;
+  --purple:#7b5fc0;
+  --code-bg:#f0f0ec;
+  --mono:'JetBrains Mono','Cascadia Code',Consolas,'Microsoft YaHei',monospace;
+  --sans:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;
+  --r-sm:4px; --r-md:8px; --r-lg:14px;
+  /* 画布（设计稿页面本身） */
+  --canvas:#e9e9e4;
+  --shadow:0 16px 44px rgba(23,23,22,.13);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--canvas);
+  color:var(--text);
+  font-family:var(--sans);
+  font-size:13px;
+  line-height:1.5;
+  padding:26px 22px 70px;
+  -webkit-font-smoothing:antialiased;
+}
+button{font-family:inherit;color:inherit}
+
+/* ===================== 页面框架 ===================== */
+.page{max-width:1440px;margin:0 auto}
+.page-head{margin-bottom:18px}
+.page-head h1{font-size:19px;font-weight:600;color:var(--text-bright);letter-spacing:.2px}
+.page-head .sub{color:var(--text-dim);margin-top:7px;line-height:1.75;max-width:900px}
+.page-head .sub code{
+  font-family:var(--mono);font-size:11.5px;background:#fff;border:1px solid var(--border);
+  border-radius:4px;padding:1px 5px;color:var(--accent);
+}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:16px}
+.seg{display:inline-flex;gap:3px;padding:4px;background:#fff;border:1px solid var(--border);border-radius:10px}
+.seg button{
+  border:0;background:transparent;font-size:12.5px;color:var(--text-dim);
+  padding:6px 16px;border-radius:7px;cursor:pointer;transition:.15s;
+}
+.seg button:hover{color:var(--text)}
+.seg button.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.switch{
+  display:inline-flex;align-items:center;gap:8px;padding:7px 13px;background:#fff;
+  border:1px solid var(--border);border-radius:10px;font-size:12.5px;color:var(--text-dim);
+  cursor:pointer;user-select:none;
+}
+.switch input{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
+.switch:hover{border-color:#cfcfc8;color:var(--text)}
+
+/* ===================== 窗口模拟 ===================== */
+.stage{margin-top:4px}
+.window{
+  width:100%;height:calc(100vh - 186px);min-height:720px;max-height:900px;display:flex;flex-direction:column;
+  background:var(--bg-app);border:1px solid #d7d7d0;border-radius:10px;
+  overflow:hidden;box-shadow:var(--shadow);
+}
+/* scene visibility: B (editing) shows .only-open, A (no project) shows .only-empty */
+.stage[data-scene="empty"] .only-open{display:none}
+.stage[data-scene="open"] .only-empty{display:none}
+
+/* ---------- 顶栏（星瑶自绘标题栏，48px） ---------- */
+.topbar{
+  height:48px;flex:0 0 auto;display:flex;align-items:center;gap:10px;
+  padding:0 14px;background:var(--bg-panel);border-bottom:1px solid var(--border);
+}
+.logo{display:flex;align-items:center;gap:9px;user-select:none}
+.logo .mark{
+  width:28px;height:28px;border-radius:7px;display:block;object-fit:cover;
+  background:linear-gradient(135deg,#3a6dd8,#7b5fc0);
+}
+.logo .name{font-weight:600;letter-spacing:.5px;color:var(--text-bright)}
+.drag{flex:1;align-self:stretch;min-width:40px}
+.tb-btn{
+  height:30px;min-width:30px;padding:0 8px;display:inline-flex;align-items:center;gap:6px;
+  justify-content:center;border:1px solid transparent;border-radius:6px;background:transparent;
+  color:var(--text-dim);font-size:12.5px;cursor:pointer;transition:.15s;
+}
+.tb-btn:hover{background:var(--bg-card);color:var(--text)}
+.tb-btn svg{width:16px;height:16px;flex:0 0 auto}
+/* IDE 模式切换按钮 —— 激活态：强调色胶囊，一眼可见当前处于 IDE 模式 */
+.tb-btn.ide{font-weight:600;color:var(--text-dim);padding:0 11px}
+.tb-btn.ide svg{width:14px;height:14px}
+.tb-btn.ide.active{
+  background:var(--accent-soft);border-color:var(--accent);color:var(--accent);
+}
+.tb-btn.ide.active:hover{background:var(--accent-hover)}
+.tb-sep{width:1px;height:20px;background:var(--border);margin:0 3px}
+.win-ctrls{display:flex;align-items:center;gap:2px;margin-left:2px}
+.win-btn{
+  width:40px;height:32px;border:0;background:transparent;color:var(--text-dim);
+  font-size:13px;border-radius:6px;cursor:pointer;display:grid;place-items:center;transition:.12s;
+}
+.win-btn:hover{background:var(--bg-card);color:var(--text)}
+.win-btn.close:hover{background:var(--red);color:#fff}
+
+/* ---------- 可选菜单栏（默认关闭，见页面底部说明） ---------- */
+.menubar{
+  height:30px;flex:0 0 auto;display:flex;align-items:center;gap:2px;padding:0 10px;
+  background:var(--bg-panel);border-bottom:1px solid var(--border);font-size:12.5px;
+}
+.stage[data-menubar="off"] .menubar{display:none}
+.menubar .m-item{padding:4px 9px;border-radius:5px;color:var(--text-dim);cursor:default}
+.menubar .m-item:hover{background:var(--bg-card);color:var(--text)}
+.menubar .m-item.on{color:var(--accent);background:var(--accent-soft)}
+.menubar .m-search{
+  margin-left:14px;flex:1;max-width:280px;height:22px;display:flex;align-items:center;gap:6px;
+  padding:0 8px;background:var(--bg-card);border:1px solid var(--border);border-radius:5px;
+  color:var(--text-faint);font-size:12px;
+}
+.menubar .m-search svg{width:13px;height:13px}
+.menubar .m-right{margin-left:auto;display:flex;align-items:center;gap:12px;color:var(--text-faint);font-size:12px}
+
+/* ---------- 工作台三栏 ---------- */
+.workbench{flex:1;display:flex;min-height:0}
+
+/* 活动栏 */
+.activitybar{
+  width:48px;flex:0 0 auto;display:flex;flex-direction:column;gap:2px;padding:6px 4px;
+  background:var(--bg-panel);border-right:1px solid var(--border);
+}
+.act{
+  width:40px;height:38px;display:grid;place-items:center;border:0;background:transparent;
+  color:var(--text-faint);border-radius:6px;cursor:pointer;position:relative;transition:.15s;
+}
+.act svg{width:21px;height:21px}
+.act:hover{background:var(--bg-card);color:var(--text)}
+.act.active{color:var(--text-bright)}
+.act.active::before{
+  content:"";position:absolute;left:-4px;top:7px;bottom:7px;width:2px;
+  border-radius:0 2px 2px 0;background:var(--accent);
+}
+.act .badge{
+  position:absolute;right:5px;bottom:4px;min-width:15px;height:15px;padding:0 3px;
+  border-radius:8px;background:var(--accent);color:#fff;font-size:9.5px;
+  display:grid;place-items:center;font-weight:600;
+}
+.act .badge.warn{background:var(--orange)}
+.act-spacer{flex:1}
+
+/* 资源管理器 */
+.sidebar{
+  width:246px;flex:0 0 auto;display:flex;flex-direction:column;min-height:0;
+  background:var(--bg-panel);border-right:1px solid var(--border);
+}
+.side-head{
+  height:34px;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;
+  font-size:11px;font-weight:600;letter-spacing:.7px;color:var(--text-dim);text-transform:uppercase;
+}
+.side-head .acts{margin-left:auto;display:flex;gap:1px}
+.icon-btn{
+  width:24px;height:24px;display:grid;place-items:center;border:0;background:transparent;
+  color:var(--text-dim);border-radius:5px;cursor:pointer;transition:.12s;
+}
+.icon-btn:hover{background:var(--bg-card);color:var(--text)}
+.icon-btn svg{width:15px;height:15px}
+.tree{flex:1;overflow:auto;padding-bottom:6px;font-size:12.5px}
+.row{
+  height:24px;display:flex;align-items:center;gap:5px;padding-right:8px;
+  color:var(--text);cursor:default;white-space:nowrap;
+}
+.row:hover{background:var(--bg-card)}
+.row.sel{background:var(--accent-soft);color:var(--text-bright)}
+.row .caret{width:12px;flex:0 0 auto;color:var(--text-faint);font-size:9px;text-align:center}
+.row .fi{width:14px;flex:0 0 auto;display:grid;place-items:center}
+.row .fi svg{width:14px;height:14px}
+.row .name{overflow:hidden;text-overflow:ellipsis}
+.row .dim{color:var(--text-faint);font-size:11.5px;margin-left:auto;padding-left:8px}
+/* 目录区段（大纲 / 时间线） */
+.sect{border-top:1px solid var(--border)}
+.sect-head{
+  height:30px;display:flex;align-items:center;gap:7px;padding:0 10px;
+  font-size:11px;font-weight:600;letter-spacing:.7px;color:var(--text-dim);
+  text-transform:uppercase;cursor:default;
+}
+.sect-head:hover{background:var(--bg-card)}
+.sect-head .caret{color:var(--text-faint);font-size:9px}
+.sect-body{padding:2px 0 8px}
+.sect-body .row{font-size:12px;color:var(--text-dim);height:22px}
+.sect-empty{padding:4px 14px 10px;color:var(--text-faint);font-size:11.5px;line-height:1.6}
+.side-empty{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:10px;padding:0 22px;text-align:center;color:var(--text-faint);font-size:12px;
+}
+.side-empty svg{width:26px;height:26px;opacity:.55}
+.btn{
+  height:28px;padding:0 13px;border-radius:6px;border:1px solid var(--border);
+  background:var(--bg-panel);color:var(--text);font-size:12.5px;cursor:pointer;transition:.15s;
+}
+.btn:hover{background:var(--bg-card)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.btn.primary:hover{filter:brightness(1.06)}
+
+/* ---------- 编辑器区 ---------- */
+.editor-area{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-app)}
+
+/* 标签页 */
+.tabs{
+  height:35px;flex:0 0 auto;display:flex;align-items:stretch;background:var(--bg-card);
+  border-bottom:1px solid var(--border);overflow:hidden;
+}
+.tab{
+  display:flex;align-items:center;gap:7px;padding:0 11px;min-width:0;
+  border-right:1px solid var(--border);color:var(--text-dim);font-size:12.5px;
+  cursor:default;position:relative;background:var(--bg-card);
+}
+.tab .fi svg{width:14px;height:14px;display:block}
+.tab .tname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
+.tab .close{
+  width:17px;height:17px;display:grid;place-items:center;border:0;background:transparent;
+  color:var(--text-faint);border-radius:4px;font-size:12px;cursor:pointer;opacity:0;
+}
+.tab:hover .close{opacity:1}
+.tab .close:hover{background:var(--bg-elevated);color:var(--text)}
+.tab .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:0 0 auto}
+.tab.active{
+  background:var(--bg-app);color:var(--text-bright);border-right-color:transparent;
+}
+.tab.active::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;background:var(--accent)}
+.tab.active .close{opacity:1}
+.tabs .grow{flex:1;background:var(--bg-card)}
+.tabs .tabs-acts{display:flex;align-items:center;gap:1px;padding:0 7px;background:var(--bg-card)}
+.tabs .tabs-acts .icon-btn{width:26px;height:26px}
+
+/* 面包屑 */
+.breadcrumb{
+  height:28px;flex:0 0 auto;display:flex;align-items:center;gap:4px;padding:0 12px;
+  background:var(--bg-app);border-bottom:1px solid var(--border);
+  color:var(--text-faint);font-size:12px;
+}
+.breadcrumb .sep{opacity:.6}
+.breadcrumb .cur{color:var(--text-dim)}
+.breadcrumb .sym{color:var(--accent)}
+
+/* 代码区 */
+.editor{
+  flex:1;min-height:0;display:flex;overflow:auto;background:var(--bg-panel);
+  font-family:var(--mono);font-size:12.5px;line-height:19px;
+}
+.gutter{
+  flex:0 0 auto;padding:8px 0;text-align:right;color:var(--text-faint);
+  background:var(--bg-panel);border-right:1px solid var(--border);user-select:none;
+}
+.gutter .ln{padding:0 12px 0 16px}
+.gutter .ln.active{color:var(--text);background:var(--accent-soft)}
+.gutter .ln .bp{
+  display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);
+  margin-right:6px;vertical-align:1px;
+}
+.code{padding:8px 0 40px;white-space:pre;tab-size:4}
+.code .cl{padding:0 20px 0 14px}
+.code .cl.active{background:var(--accent-soft)}
+.code .cl .ind{display:inline-block;width:16px}
+/* 语法高亮：与编辑器既有配色同源（关键字紫 / 字符串绿 / 数字橙 / 注释灰 / 函数蓝） */
+.k{color:var(--purple)}
+.s{color:var(--green)}
+.n{color:var(--orange)}
+.c{color:#8f8f86;font-style:italic}
+.f{color:var(--accent)}
+.t{color:var(--cyan)}
+.d{color:var(--text-bright);font-weight:600}
+.o{color:var(--text-dim)}
+
+/* 编辑器空状态（未打开文件 / 未打开项目） */
+.welcome{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:22px;background:var(--bg-app);padding:20px;
+}
+.welcome .card{
+  width:340px;background:var(--bg-panel);border:1px solid var(--border);
+  border-radius:var(--r-md);overflow:hidden;box-shadow:0 1px 2px rgba(23,23,22,.05);
+}
+.welcome .card button{
+  width:100%;display:flex;align-items:center;gap:11px;padding:11px 14px;border:0;
+  background:transparent;border-bottom:1px solid var(--border);color:var(--text);
+  font-size:12.5px;cursor:pointer;transition:.15s;
+}
+.welcome .card button:last-child{border-bottom:0}
+.welcome .card button:hover{background:var(--bg-card);color:var(--text-bright)}
+.welcome .card button svg{width:16px;height:16px;color:var(--accent);flex:0 0 auto}
+.welcome .card button .arrow{margin-left:auto;color:var(--text-faint);opacity:0;transition:.15s}
+.welcome .card button:hover .arrow{opacity:1;transform:translateX(2px)}
+.recent{width:340px}
+.recent .r-head{
+  font-size:11px;font-weight:600;letter-spacing:.7px;color:var(--text-faint);
+  text-transform:uppercase;margin-bottom:8px;
+}
+.recent .r-row{
+  display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:5px;
+  font-size:12.5px;color:var(--text-dim);cursor:pointer;
+}
+.recent .r-row:hover{background:var(--bg-card);color:var(--text)}
+.recent .r-row svg{width:14px;height:14px;color:var(--text-faint)}
+.recent .r-row .path{margin-left:auto;color:var(--text-faint);font-size:11.5px}
+.hint{
+  display:flex;align-items:center;gap:14px;color:var(--text-faint);font-size:12px;
+}
+.hint kbd{
+  font-family:var(--mono);font-size:11px;background:var(--bg-panel);
+  border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;padding:1px 5px;color:var(--text-dim);
+}
+
+/* 底部面板 */
+.bottom{
+  height:198px;flex:0 0 auto;display:flex;flex-direction:column;
+  background:var(--bg-panel);border-top:1px solid var(--border);
+}
+.stage[data-scene="empty"] .bottom{display:none}
+.panel-tabs{
+  height:33px;flex:0 0 auto;display:flex;align-items:center;gap:2px;padding:0 8px 0 12px;
+  border-bottom:1px solid var(--border);
+}
+.ptab{
+  padding:5px 9px;border-radius:5px;font-size:11.5px;font-weight:600;letter-spacing:.5px;
+  color:var(--text-faint);text-transform:uppercase;cursor:default;transition:.15s;
+}
+.ptab:hover{color:var(--text)}
+.ptab.active{color:var(--text-bright);box-shadow:inset 0 -2px 0 var(--accent);border-radius:5px 5px 0 0}
+.ptab .cnt{margin-left:5px;font-weight:500;opacity:.75}
+.panel-acts{margin-left:auto;display:flex;gap:1px}
+.terminal{
+  flex:1;overflow:auto;padding:9px 14px;font-family:var(--mono);font-size:12px;line-height:1.75;
+  background:var(--bg-panel);color:var(--text-dim);
+}
+.terminal .cmd{color:var(--text-bright)}
+.terminal .ok{color:var(--green)}
+.terminal .warn{color:var(--yellow)}
+.terminal .path{color:var(--accent)}
+
+/* ---------- 右侧星瑶对话区 ---------- */
+.ai{
+  width:368px;flex:0 0 auto;display:flex;flex-direction:column;min-height:0;
+  background:var(--bg-panel);border-left:1px solid var(--border);
+}
+.stage[data-ai="closed"] .ai{display:none}
+.ai-head{
+  height:44px;flex:0 0 auto;display:flex;align-items:center;gap:9px;padding:0 8px 0 12px;
+  border-bottom:1px solid var(--border);
+}
+.avatar{
+  width:24px;height:24px;border-radius:7px;display:grid;place-items:center;flex:0 0 auto;
+  background:linear-gradient(135deg,#3a6dd8,#7b5fc0);color:#fff;font-size:12px;font-weight:700;
+}
+.ai-head .who{display:flex;flex-direction:column;line-height:1.25;min-width:0}
+.ai-head .who b{font-size:12.5px;color:var(--text-bright);font-weight:600}
+.ai-head .who span{font-size:11px;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ai-head .acts{margin-left:auto;display:flex;gap:1px}
+.ai-body{flex:1;min-height:0;overflow:auto;padding:14px 14px 6px;display:flex;flex-direction:column;gap:14px}
+
+/* 对话气泡 */
+.msg{display:flex;flex-direction:column;gap:8px;font-size:12.5px;line-height:1.75}
+.msg.user{align-items:flex-end}
+.msg.user .bubble{
+  background:var(--accent-soft);border:1px solid rgba(58,109,216,.22);
+  border-radius:var(--r-md);border-bottom-right-radius:3px;padding:8px 11px;max-width:88%;
+  color:var(--text-bright);
+}
+.msg .sender{display:flex;align-items:center;gap:7px;color:var(--text-faint);font-size:11.5px}
+.msg .sender .avatar{width:18px;height:18px;border-radius:5px;font-size:10px}
+.msg .say{color:var(--text);max-width:100%}
+.msg .say code{
+  font-family:var(--mono);font-size:11.5px;background:var(--code-bg);
+  border:1px solid var(--border);border-radius:4px;padding:1px 4px;color:var(--accent);
+}
+/* 工具执行卡 */
+.tool{
+  border:1px solid var(--border);border-radius:var(--r-md);background:var(--bg-app);
+  overflow:hidden;
+}
+.tool-head{
+  display:flex;align-items:center;gap:8px;padding:7px 10px;font-size:12px;color:var(--text-dim);
+  cursor:default;
+}
+.tool-head:hover{background:var(--bg-card)}
+.tool-head .chev{color:var(--text-faint);font-size:9px}
+.tool-head .tool-name{color:var(--text);font-family:var(--mono);font-size:11.5px}
+.tool-head .stat{margin-left:auto;display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px}
+.tool-head .add{color:var(--green)}
+.tool-head .del{color:var(--red)}
+.tool-body{
+  border-top:1px solid var(--border);background:var(--bg-panel);padding:8px 0;
+  font-family:var(--mono);font-size:11.5px;line-height:18px;
+}
+.tool-body .dl{padding:0 10px;white-space:pre}
+.tool-body .dl.add{background:rgba(44,138,76,.09);color:var(--green)}
+.tool-body .dl.del{background:rgba(207,61,54,.08);color:var(--red)}
+.tool-body .dl.ctx{color:var(--text-faint)}
+.tool-foot{
+  display:flex;align-items:center;gap:7px;padding:6px 10px;border-top:1px solid var(--border);
+  font-size:11.5px;color:var(--green);background:var(--bg-app);
+}
+.tool-foot svg{width:13px;height:13px}
+/* 输入区 */
+.ai-composer{flex:0 0 auto;padding:10px 12px 12px;border-top:1px solid var(--border)}
+.composer-box{
+  border:1px solid var(--border);border-radius:var(--r-md);background:var(--bg-app);
+  padding:9px 11px 7px;transition:.15s;
+}
+.composer-box:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.composer-box .ph{color:var(--text-faint);font-size:12.5px;line-height:1.6;min-height:38px}
+.composer-bar{display:flex;align-items:center;gap:8px;margin-top:6px}
+.composer-bar .chip{
+  display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 8px;border-radius:6px;
+  border:1px solid var(--border);background:var(--bg-panel);color:var(--text-dim);font-size:11.5px;
+  cursor:pointer;
+}
+.composer-bar .chip:hover{background:var(--bg-card);color:var(--text)}
+.composer-bar .chip svg{width:13px;height:13px}
+.composer-bar .grow{flex:1}
+.send{
+  width:28px;height:28px;border-radius:7px;border:1px solid var(--accent);background:var(--accent);
+  color:#fff;display:grid;place-items:center;cursor:pointer;transition:.15s;
+}
+.send:hover{filter:brightness(1.08)}
+.send svg{width:15px;height:15px}
+
+/* 对话区欢迎页（未打开项目 / 空会话） */
+.ai-welcome{
+  flex:1;display:flex;flex-direction:column;justify-content:center;gap:20px;padding:0 34px;
+}
+.ai-welcome .mark{
+  width:40px;height:40px;border-radius:11px;display:grid;place-items:center;
+  background:linear-gradient(135deg,#3a6dd8,#7b5fc0);color:#fff;font-size:19px;font-weight:700;
+}
+.ai-welcome h3{font-size:17px;font-weight:600;color:var(--text-bright);line-height:1.45;letter-spacing:.2px}
+.ai-welcome ul{list-style:none;display:flex;flex-direction:column;gap:10px;margin-top:2px}
+.ai-welcome li{display:flex;gap:9px;align-items:flex-start;color:var(--text-dim);font-size:12.5px;line-height:1.6}
+.ai-welcome li svg{width:14px;height:14px;color:var(--accent);flex:0 0 auto;margin-top:3px}
+.ai-welcome .cta{align-self:flex-start;margin-top:4px}
+
+/* ---------- 状态栏 ---------- */
+.statusbar{
+  height:24px;flex:0 0 auto;display:flex;align-items:center;gap:2px;padding:0 8px;
+  background:var(--bg-card);border-top:1px solid var(--border);
+  color:var(--text-faint);font-size:11.5px;white-space:nowrap;overflow:hidden;
+}
+.si{
+  display:inline-flex;align-items:center;gap:6px;height:19px;padding:0 7px;border-radius:4px;
+  cursor:default;
+}
+.si:hover{background:var(--bg-elevated);color:var(--text)}
+.si svg{width:12px;height:12px}
+.si .dot{width:7px;height:7px;border-radius:50%;background:var(--green);flex:0 0 auto}
+.si .dot.off{background:var(--red)}
+.si .dot.run{background:var(--accent);animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.statusbar .sb-spacer{flex:1}
+.statusbar .sb-note{color:var(--text-faint);opacity:.85}
+.statusbar .sb-ide{
+  background:var(--accent-soft);color:var(--accent);font-weight:600;
+}
+
+/* ===================== 设计说明 ===================== */
+.spec{margin-top:30px}
+.spec h2{font-size:15px;font-weight:600;color:var(--text-bright);margin-bottom:4px}
+.spec .lead{color:var(--text-dim);font-size:12.5px;line-height:1.7;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+.note{
+  background:#fff;border:1px solid var(--border);border-radius:10px;padding:14px 16px;
+  box-shadow:0 1px 2px rgba(23,23,22,.04);
+}
+.note h4{font-size:12.5px;color:var(--text-bright);margin-bottom:7px;display:flex;align-items:center;gap:7px}
+.note h4 .tag{
+  font-size:10.5px;font-weight:600;padding:1px 7px;border-radius:99px;
+  border:1px solid currentColor;
+}
+.note h4 .tag.new{color:var(--accent)}
+.note h4 .tag.keep{color:var(--green)}
+.note h4 .tag.opt{color:var(--orange)}
+.note p,.note li{color:var(--text-dim);font-size:12.5px;line-height:1.75}
+.note ul{padding-left:17px;display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.note code{font-family:var(--mono);font-size:11.5px;color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="page-head">
+    <h1>IDE 模式 · 界面设计稿</h1>
+    <p class="sub">
+      配色取星瑶当前内置浅色主题（<code>builtin.light</code>）的语义 token，落地时直接消费
+      <code>--theme-*</code> 变量，不新增任何颜色常量。布局按「左侧活动栏 + 资源管理器 → 中部编辑器 → 底部面板 → 右侧星瑶对话区 → 底部状态栏」组织，
+      入口仍是顶栏那颗 <code>IDE / 对话</code> 切换按钮。点下方按钮切换两种场景与两个可选项看效果。
+    </p>
+    <div class="controls">
+      <div class="seg" id="scene-switch">
+        <button data-scene="open" class="active">场景 B · 编辑中</button>
+        <button data-scene="empty">场景 A · 未打开项目</button>
+      </div>
+      <label class="switch"><input type="checkbox" id="opt-menubar"> 显示 IDE 菜单栏</label>
+      <label class="switch"><input type="checkbox" id="opt-ai" checked> 显示右侧对话区</label>
+    </div>
+  </header>
+
+  <div class="stage" id="stage" data-scene="open" data-menubar="off" data-ai="open">
+    <div class="window">
+
+      <!-- ==================== 顶栏 ==================== -->
+      <div class="topbar">
+        <div class="logo">
+          <img class="mark" src="../frontend/public/icon.png" alt="星瑶Code"
+               onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'mark'}))">
+          <span class="name">星瑶Code</span>
+        </div>
+        <div class="drag"></div>
+
+        <button class="tb-btn" title="切换终端">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 9.5l3 2.5-3 2.5M12.5 15h4.5"/>
+          </svg>
+        </button>
+        <!-- IDE 模式切换按钮：激活态（当前就在 IDE 模式） -->
+        <button class="tb-btn ide active" title="切换到对话模式">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 6l-4 6 4 6M16 6l4 6-4 6M13.5 4l-3 16"/>
+          </svg>
+          IDE
+        </button>
+        <button class="tb-btn" title="切换主题">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+            <circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M4.2 4.2l1.6 1.6M18.2 18.2l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.2 19.8l1.6-1.6M18.2 5.8l1.6-1.6"/>
+          </svg>
+        </button>
+        <button class="tb-btn" title="切换面板">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M14.5 4v16"/>
+          </svg>
+        </button>
+
+        <div class="tb-sep"></div>
+        <div class="win-ctrls">
+          <button class="win-btn" title="最小化">—</button>
+          <button class="win-btn" title="最大化">▢</button>
+          <button class="win-btn close" title="关闭">✕</button>
+        </div>
+      </div>
+
+      <!-- ==================== 可选菜单栏 ==================== -->
+      <div class="menubar">
+        <span class="m-item on">IDE</span>
+        <span class="m-item">文件</span>
+        <span class="m-item">编辑</span>
+        <span class="m-item">选择</span>
+        <span class="m-item">查看</span>
+        <span class="m-item">转到</span>
+        <span class="m-item">运行</span>
+        <span class="m-item">终端</span>
+        <span class="m-item">帮助</span>
+        <div class="m-search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>
+          </svg>
+          <span>搜索文件、命令（Ctrl+P）</span>
+        </div>
+        <div class="m-right">
+          <span>受限模式</span>
+          <span>IDE 布局</span>
+        </div>
+      </div>
+
+      <!-- ==================== 工作台 ==================== -->
+      <div class="workbench">
+
+        <!-- ---------- 活动栏 ---------- -->
+        <div class="activitybar">
+          <button class="act active" title="资源管理器">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M13.5 3H6.5A1.5 1.5 0 0 0 5 4.5v15A1.5 1.5 0 0 0 6.5 21h11a1.5 1.5 0 0 0 1.5-1.5V8.5z"/><path d="M13.5 3v5.5H19"/>
+            </svg>
+          </button>
+          <button class="act" title="搜索">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+              <circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/>
+            </svg>
+          </button>
+          <button class="act" title="源代码管理">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="6.5" cy="5.5" r="2.5"/><circle cx="6.5" cy="18.5" r="2.5"/><circle cx="17.5" cy="9" r="2.5"/>
+              <path d="M6.5 8v8M17.5 11.5c0 3.5-3 4-6.5 4.3"/>
+            </svg>
+            <span class="badge">3</span>
+          </button>
+          <button class="act" title="运行和调试">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M7 4.5l11 7.5-11 7.5z"/>
+            </svg>
+            <span class="badge warn">1</span>
+          </button>
+          <button class="act" title="扩展">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/>
+              <rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><path d="M17 13.5v7M13.5 17h7"/>
+            </svg>
+          </button>
+          <button class="act" title="星瑶（AI）">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l2.1 5.2L19.5 10l-5.4 1.8L12 17l-2.1-5.2L4.5 10l5.4-1.8z"/>
+            </svg>
+          </button>
+          <div class="act-spacer"></div>
+          <button class="act" title="设置">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 2.9 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9.8 4.1a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 20.7 11a2 2 0 1 1 0 4z"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- ---------- 资源管理器 ---------- -->
+        <div class="sidebar">
+          <div class="side-head">
+            <span>资源管理器</span>
+            <div class="acts">
+              <button class="icon-btn" title="新建文件">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6M12 13v5M9.5 15.5h5"/></svg>
+              </button>
+              <button class="icon-btn" title="新建文件夹">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v5M9.5 13.5h5"/></svg>
+              </button>
+              <button class="icon-btn" title="刷新">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.6 6"/><path d="M20 4.5V11h-6"/></svg>
+              </button>
+              <button class="icon-btn" title="全部折叠">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9.5l4-4 4 4M8 14.5l4 4 4-4"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- 文件树：场景 B -->
+          <div class="tree only-open">
+            <div class="row" style="padding-left:8px"><span class="caret">▾</span><span class="fi" style="color:var(--accent)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            </span><span class="name">Y-code_llm</span></div>
+
+            <div class="row" style="padding-left:22px"><span class="caret">▸</span><span class="fi" style="color:var(--yellow)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            </span><span class="name">core</span></div>
+
+            <div class="row sel" style="padding-left:36px"><span class="caret">▾</span><span class="fi" style="color:var(--yellow)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            </span><span class="name">tools</span></div>
+
+            <div class="row" style="padding-left:52px"><span class="caret"></span><span class="fi" style="color:var(--accent)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+            </span><span class="name">tools.py</span><span class="dim">M</span></div>
+            <div class="row" style="padding-left:52px"><span class="caret"></span><span class="fi" style="color:var(--accent)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+            </span><span class="name">lsp.py</span></div>
+            <div class="row" style="padding-left:52px"><span class="caret"></span><span class="fi" style="color:var(--accent)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+            </span><span class="name">gui_theme.py</span></div>
+            <div class="row" style="padding-left:52px"><span class="caret"></span><span class="fi" style="color:var(--accent)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+            </span><span class="name">appStore.ts</span><span class="dim">U</span></div>
+            <div class="row" style="padding-left:52px"><span class="caret"></span><span class="fi" style="color:var(--purple)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+            </span><span class="name">IdeLayout.vue</span></div>
+
+            <div class="row" style="padding-left:36px"><span class="caret">▸</span><span class="fi" style="color:var(--yellow)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            </span><span class="name">frontend</span></div>
+            <div class="row" style="padding-left:36px"><span class="caret">▸</span><span class="fi" style="color:var(--yellow)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            </span><span class="name">tests</span></div>
+            <div class="row" style="padding-left:36px"><span class="caret"></span><span class="fi" style="color:var(--text-faint)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+            </span><span class="name">README.md</span></div>
+            <div class="row" style="padding-left:36px"><span class="caret"></span><span class="fi" style="color:var(--text-faint)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+            </span><span class="name">requirements.txt</span></div>
+          </div>
+
+          <!-- 资源管理器空状态：场景 A -->
+          <div class="side-empty only-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+            </svg>
+            <div>尚未打开文件夹</div>
+            <button class="btn primary">打开文件夹</button>
+            <div style="font-size:11.5px">星瑶的对话仍可使用，打开项目后文件树会出现在这里</div>
+          </div>
+
+          <!-- 目录区段 -->
+          <div class="sect only-open">
+            <div class="sect-head"><span class="caret">▾</span><span>大纲</span></div>
+            <div class="sect-body">
+              <div class="row" style="padding-left:22px"><span class="caret"></span><span class="fi" style="color:var(--purple)">ƒ</span><span class="name">raise_if_cancelled</span></div>
+              <div class="row" style="padding-left:22px"><span class="caret"></span><span class="fi" style="color:var(--orange)">C</span><span class="name">ToolCancelledError</span></div>
+              <div class="row" style="padding-left:22px"><span class="caret"></span><span class="fi" style="color:var(--purple)">ƒ</span><span class="name">execute_command</span></div>
+              <div class="row" style="padding-left:22px"><span class="caret"></span><span class="fi" style="color:var(--purple)">ƒ</span><span class="name">read_file</span></div>
+            </div>
+          </div>
+          <div class="sect only-open">
+            <div class="sect-head"><span class="caret">▸</span><span>时间线</span></div>
+          </div>
+        </div>
+
+        <!-- ---------- 编辑器区 ---------- -->
+        <div class="editor-area">
+
+          <!-- 标签页 -->
+          <div class="tabs only-open">
+            <div class="tab active">
+              <span class="fi" style="color:var(--accent)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+              </span>
+              <span class="tname">tools.py</span>
+              <span class="dot" title="有未保存的修改"></span>
+              <button class="close" title="关闭">✕</button>
+            </div>
+            <div class="tab">
+              <span class="fi" style="color:var(--accent)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+              </span>
+              <span class="tname">appStore.ts</span>
+              <button class="close" title="关闭">✕</button>
+            </div>
+            <div class="tab">
+              <span class="fi" style="color:var(--purple)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+              </span>
+              <span class="tname">IdeLayout.vue</span>
+              <button class="close" title="关闭">✕</button>
+            </div>
+            <div class="tab">
+              <span class="fi" style="color:var(--text-faint)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+              </span>
+              <span class="tname">README.md</span>
+              <button class="close" title="关闭">✕</button>
+            </div>
+            <div class="grow"></div>
+            <div class="tabs-acts">
+              <button class="icon-btn" title="拆分编辑器">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/></svg>
+              </button>
+              <button class="icon-btn" title="更多操作">
+                <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- 面包屑 -->
+          <div class="breadcrumb only-open">
+            <span>core</span><span class="sep">›</span>
+            <span>tools</span><span class="sep">›</span>
+            <span class="cur">tools.py</span><span class="sep">›</span>
+            <span class="sym">ƒ</span><span class="cur">raise_if_cancelled</span>
+          </div>
+
+          <!-- 代码：场景 B -->
+          <div class="editor only-open">
+            <div class="gutter">
+              <div class="ln">1</div><div class="ln">2</div><div class="ln">3</div><div class="ln">4</div>
+              <div class="ln">5</div><div class="ln">6</div><div class="ln">7</div><div class="ln">8</div>
+              <div class="ln">9</div><div class="ln">10</div><div class="ln">11</div><div class="ln">12</div>
+              <div class="ln">13</div><div class="ln">14</div><div class="ln">15</div><div class="ln">16</div>
+              <div class="ln">17</div><div class="ln">18</div><div class="ln">19</div>
+              <div class="ln active">20</div>
+              <div class="ln">21</div><div class="ln">22</div><div class="ln">23</div><div class="ln">24</div>
+              <div class="ln">25</div><div class="ln">26</div><div class="ln">27</div><div class="ln">28</div>
+              <div class="ln">29</div><div class="ln">30</div><div class="ln">31</div>
+            </div>
+            <div class="code">
+<div class="cl"><span class="c">"""core/tools.py — 工具执行层（节选）"""</span></div>
+<div class="cl"></div>
+<div class="cl"><span class="k">import</span> logging</div>
+<div class="cl"><span class="k">from</span> core.version <span class="k">import</span> __version__ <span class="k">as</span> YCODE_VERSION</div>
+<div class="cl"><span class="k">from</span> core.tool_cache <span class="k">import</span> ToolCache</div>
+<div class="cl"><span class="k">from</span> core.lsp <span class="k">import</span> get_rg_executable</div>
+<div class="cl"></div>
+<div class="cl"><span class="c"># 网络工具统一超时：30s 是实测下大多数站点首字节的 3σ 边界，</span></div>
+<div class="cl"><span class="c"># 低于它会把慢站误判为失败，高于它会让工具调用卡住整个回合。</span></div>
+<div class="cl"><span class="d">HTTP_TIMEOUT_SECONDS</span> = <span class="n">30</span></div>
+<div class="cl"><span class="d">HTTP_MAX_BYTES</span> = <span class="n">512</span> * <span class="n">1024</span></div>
+<div class="cl"><span class="d">HTTP_USER_AGENT</span> = <span class="s">f"ycode/{YCODE_VERSION} (terminal coding assistant)"</span></div>
+<div class="cl"></div>
+<div class="cl"><span class="d">READ_FILE_MAX_LINES</span> = <span class="n">2000</span></div>
+<div class="cl"><span class="d">READ_FILE_LARGE_BYTES</span> = <span class="n">50</span> * <span class="n">1024</span></div>
+<div class="cl"><span class="d">EXECUTE_COMMAND_MAX_OUTPUT_BYTES</span> = <span class="n">1024</span> * <span class="n">1024</span></div>
+<div class="cl"></div>
+<div class="cl"><span class="d">_logger</span> = logging.<span class="f">getLogger</span>(<span class="n">__name__</span>)</div>
+<div class="cl"></div>
+<div class="cl"></div>
+<div class="cl active"><span class="k">class</span> <span class="t">ToolCancelledError</span>(<span class="t">Exception</span>):</div>
+<div class="cl"><span class="ind"></span><span class="s">"""工具在等待期间被用户取消（协作式取消，不暴露给模型调用方）。"""</span></div>
+<div class="cl"></div>
+<div class="cl"></div>
+<div class="cl"><span class="k">def</span> <span class="f">raise_if_cancelled</span>(<span class="d">cancel_event</span>):</div>
+<div class="cl"><span class="ind"></span><span class="k">if</span> cancel_event <span class="k">is not</span> <span class="t">None</span> <span class="k">and</span> cancel_event.<span class="f">is_set</span>():</div>
+<div class="cl"><span class="ind"></span><span class="ind"></span><span class="k">raise</span> <span class="t">ToolCancelledError</span>()</div>
+<div class="cl"></div>
+<div class="cl"><span class="c"># 断点：core/tools.py:31（第 31 行由调试器保留）</span></div>
+<div class="cl"></div>
+            </div>
+          </div>
+
+          <!-- 欢迎页：场景 A -->
+          <div class="welcome only-empty">
+            <div class="card">
+              <button>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                打开文件夹<span class="arrow">→</span>
+              </button>
+              <button>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                新建项目<span class="arrow">→</span>
+              </button>
+              <button>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="5.5" r="2.5"/><circle cx="6.5" cy="18.5" r="2.5"/><circle cx="17.5" cy="9" r="2.5"/><path d="M6.5 8v8M17.5 11.5c0 3.5-3 4-6.5 4.3"/></svg>
+                克隆 Git 仓库<span class="arrow">→</span>
+              </button>
+              <button>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 20h8M12 17v3"/></svg>
+                连接远程主机<span class="arrow">→</span>
+              </button>
+              <button>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></svg>
+                新建文件<span class="arrow">→</span>
+              </button>
+            </div>
+
+            <div class="recent">
+              <div class="r-head">最近打开</div>
+              <div class="r-row">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                Y-code_tui<span class="path">E:\fch\Y-code_tui</span>
+              </div>
+              <div class="r-row">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                Y-code_llm<span class="path">E:\fch\Y-code_llm</span>
+              </div>
+              <div class="r-row">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                xingyao-backend<span class="path">E:\fch\xingyao-backend</span>
+              </div>
+            </div>
+
+            <div class="hint">
+              <span><kbd>Ctrl</kbd> + <kbd>P</kbd> 快速打开文件</span>
+              <span><kbd>Ctrl</kbd> + <kbd>`</kbd> 打开终端</span>
+              <span><kbd>Ctrl</kbd> + <kbd>B</kbd> 切换侧栏</span>
+            </div>
+          </div>
+
+          <!-- 底部面板 -->
+          <div class="bottom">
+            <div class="panel-tabs">
+              <span class="ptab">问题<span class="cnt">0</span></span>
+              <span class="ptab">输出</span>
+              <span class="ptab">调试控制台</span>
+              <span class="ptab active">终端</span>
+              <div class="panel-acts">
+                <button class="icon-btn" title="新建终端">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                </button>
+                <button class="icon-btn" title="拆分终端">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/></svg>
+                </button>
+                <button class="icon-btn" title="清空终端">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9.5 7V5h5v2M6 7l1 13h10l1-13"/></svg>
+                </button>
+                <button class="icon-btn" title="收起面板">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="terminal">
+              <div><span class="path">PS E:\fch\Y-code_llm&gt;</span> <span class="cmd">python -m pytest tests/test_ide_layout.py -q</span></div>
+              <div><span class="ok">..........</span>                                              <span class="ok">[100%]</span></div>
+              <div><span class="ok">10 passed</span> in 0.42s</div>
+              <div><span class="path">PS E:\fch\Y-code_llm&gt;</span> <span class="warn">▌</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------- 右侧星瑶对话区 ---------- -->
+        <div class="ai">
+          <div class="ai-head">
+            <div class="avatar">瑶</div>
+            <div class="who">
+              <b>星瑶</b>
+              <span class="only-open">会话 · IDE 超时调整</span>
+              <span class="only-empty">新会话</span>
+            </div>
+            <div class="acts">
+              <button class="icon-btn" title="新会话">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
+              <button class="icon-btn" title="历史会话">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4.5V10h5.5"/><path d="M12 8v4.5l3 2"/></svg>
+              </button>
+              <button class="icon-btn" title="收起对话区">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- 对话：场景 B -->
+          <div class="ai-body only-open">
+            <div class="msg user">
+              <div class="bubble">把 <b>core/tools.py</b> 里的 HTTP 超时改成 30 秒，并在常量上方补一条注释说明原因</div>
+            </div>
+
+            <div class="msg">
+              <div class="sender"><div class="avatar">瑶</div>星瑶</div>
+              <div class="say">
+                改好了，<code>HTTP_TIMEOUT_SECONDS</code> 从 20 → 30，注释写在常量上方。顺手确认了引用点只有 <code>fetch_url</code> 一处，没有其他地方硬编码这个值。
+              </div>
+
+              <div class="tool">
+                <div class="tool-head">
+                  <span class="chev">▾</span>
+                  <span class="tool-name">edit_file</span>
+                  <span>core/tools.py</span>
+                  <span class="stat"><span class="add">+2</span><span class="del">-1</span></span>
+                </div>
+                <div class="tool-body">
+                  <div class="dl ctx">  7  </div>
+                  <div class="dl del">  8 - HTTP_TIMEOUT_SECONDS = 20</div>
+                  <div class="dl add">  8 + # 网络工具统一超时：30s 是实测下大多数站点首字节的 3σ 边界，</div>
+                  <div class="dl add">  9 + # 低于它会把慢站误判为失败，高于它会让工具调用卡住整个回合。</div>
+                  <div class="dl add"> 10 + HTTP_TIMEOUT_SECONDS = 30</div>
+                </div>
+                <div class="tool-foot">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>
+                  已写入 · 1 个文件已更改
+                </div>
+              </div>
+
+              <div class="tool">
+                <div class="tool-head">
+                  <span class="chev">▸</span>
+                  <span class="tool-name">execute_command</span>
+                  <span>python -m pytest tests/test_tools.py -q</span>
+                  <span class="stat"><span class="add">10 passed</span></span>
+                </div>
+              </div>
+
+              <div class="say" style="color:var(--text-dim)">
+                要不要顺手把 <code>READ_FILE_LARGE_BYTES</code> 也一起调大？现在 50 KB 对大型配置文件偏紧。
+              </div>
+            </div>
+          </div>
+
+          <!-- 欢迎页：场景 A -->
+          <div class="ai-welcome only-empty">
+            <div class="mark">瑶</div>
+            <h3>与星瑶一起<br>开启智能编程之旅</h3>
+            <ul>
+              <li>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>
+                集成丰富上下文，回答更准确
+              </li>
+              <li>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>
+                开放智能体生态，满足多样开发需求
+              </li>
+              <li>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>
+                理解需求、调用工具，直接生成真实软件
+              </li>
+            </ul>
+            <button class="btn primary cta">开始新对话</button>
+          </div>
+
+          <!-- 输入区（两种场景共用） -->
+          <div class="ai-composer">
+            <div class="composer-box">
+              <div class="ph">描述你想做的事，星瑶会读代码、改文件、跑测试…</div>
+              <div class="composer-bar">
+                <span class="chip">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                  附件
+                </span>
+                <span class="chip">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.1 5.2L19.5 10l-5.4 1.8L12 17l-2.1-5.2L4.5 10l5.4-1.8z"/></svg>
+                  星瑶 · 自动
+                </span>
+                <span class="chip">权限：确认</span>
+                <div class="grow"></div>
+                <span style="color:var(--text-faint);font-size:11px">Token 12%</span>
+                <button class="send" title="发送">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /workbench -->
+
+      <!-- ==================== 状态栏 ==================== -->
+      <div class="statusbar">
+        <span class="si sb-ide">IDE</span>
+        <span class="si"><span class="dot"></span>后端已连接</span>
+        <span class="si">星瑶 · claude-sonnet-4.6</span>
+        <span class="si only-open">main</span>
+        <span class="si">Token 12%</span>
+        <span class="si">权限：确认</span>
+        <span class="si">沙盒：限制</span>
+        <span class="si sb-note sb-note-full">内容由 AI 生成，仅供参考，请仔细甄别</span>
+        <span class="sb-spacer"></span>
+        <span class="si only-open">⊘ 0　⚠ 2</span>
+        <span class="si only-open">行 20，列 24</span>
+        <span class="si only-open">空格：4</span>
+        <span class="si only-open">UTF-8</span>
+        <span class="si only-open">LF</span>
+        <span class="si only-open">Python</span>
+        <span class="si only-open"><span class="dot run"></span>生成中…</span>
+        <span class="si only-empty">空闲</span>
+      </div>
+
+    </div><!-- /window -->
+  </div><!-- /stage -->
+
+  <!-- ==================== 设计说明 ==================== -->
+  <section class="spec">
+    <h2>改动点与落地说明</h2>
+    <p class="lead">下面每一项都标注了性质：新增 / 沿用 / 待定，方便你按优先级挑要做的部分。</p>
+    <div class="grid">
+
+      <div class="note">
+        <h4>入口：顶栏 IDE 切换按钮 <span class="tag keep">沿用</span></h4>
+        <p>
+          按钮已存在于 <code>Topbar.vue</code>（<code>#btn-ide-mode</code>，<code>store.toggleIdeMode()</code>）。
+          设计稿只把激活态做成强调色胶囊（<code>--accent-soft</code> 底 + <code>--accent</code> 边框与文字），
+          让「当前处于 IDE 模式」一眼可见，不再是纯文字按钮。
+        </p>
+      </div>
+
+      <div class="note">
+        <h4>布局骨架 <span class="tag keep">沿用</span></h4>
+        <p>
+          <code>IdeLayout.vue</code> 已有「活动栏 + 侧栏 + 编辑器区 + 对话区宿主」四段结构，
+          对话区经 <code>Teleport</code> 从 <code>App.vue</code> 搬入，只有一份 DOM。本次不改这套机制，
+          只调尺寸与视觉：活动栏 48px、侧栏 246px、对话区 368px。
+        </p>
+      </div>
+
+      <div class="note">
+        <h4>底部状态栏（IDE 态） <span class="tag new">新增</span></h4>
+        <ul>
+          <li>左段沿用现有 <code>#statusbar</code> 项：连接、模型、工作区、Token、权限、沙盒、AI 声明。</li>
+          <li>新增右段编辑器态：问题计数、<b>行 / 列</b>、缩进、编码、换行符、语言，数据来自 CodeMirror 光标状态。</li>
+          <li>最左新增 <code>IDE</code> 徽标，提示当前模式。</li>
+        </ul>
+      </div>
+
+      <div class="note">
+        <h4>工作区空状态 <span class="tag new">新增</span></h4>
+        <p>
+          未打开项目时，现在只显示一句「从左侧文件树打开文件」。设计稿换成 VS Code 式欢迎页：
+          打开文件夹 / 新建项目 / 克隆 Git 仓库 / 连接远程主机 / 新建文件，加最近打开列表与快捷键提示。
+          左侧资源管理器同步显示「尚未打开文件夹」空状态。
+        </p>
+      </div>
+
+      <div class="note">
+        <h4>资源管理器分区 <span class="tag new">新增</span></h4>
+        <p>
+          文件树之下补「大纲 / 时间线」两个可折叠区段：大纲读 LSP 文档符号（<code>core/lsp.py</code> 已有能力），
+          时间线读 Git 记录。落地可分两步，先接大纲。
+        </p>
+      </div>
+
+      <div class="note">
+        <h4>活动栏图标 <span class="tag new">新增</span></h4>
+        <p>
+          现状只有文件 / Git / 调试三个。设计稿扩到七个：资源管理器、搜索、源代码管理、运行调试、扩展、星瑶、设置。
+          图标全部走现有 <code>iconPaths.ts</code> 注册表，不引入图标库。搜索与扩展面板可后置。
+        </p>
+      </div>
+
+      <div class="note">
+        <h4>右侧对话区 <span class="tag new">新增</span></h4>
+        <ul>
+          <li>新增头部：星瑶头像 + 当前会话名 + 新会话 / 历史 / 收起三个操作。</li>
+          <li>消息区复用现有消息组件；工具执行卡在窄栏里改为紧凑样式（文件名 + 增删行数 + 可展开 diff）。</li>
+          <li>输入区复用现有输入框逻辑，窄栏下压缩为两行（输入 + 控件条）。</li>
+          <li>空会话显示欢迎页，与 TRAE 的欢迎区结构对齐，文案与强调色换成星瑶的蓝色。</li>
+        </ul>
+      </div>
+
+      <div class="note">
+        <h4>编辑器区 <span class="tag keep">沿用</span></h4>
+        <p>
+          标签页、面包屑、代码区沿用 <code>EditorTabs.vue</code> / <code>EditorPane.vue</code> / <code>BottomPanel.vue</code>，
+          仅统一视觉：标签顶部 2px 强调线、未保存圆点、面包屑显示当前符号、底部面板标签加计数。
+        </p>
+      </div>
+
+      <div class="note">
+        <h4>菜单栏 <span class="tag opt">待你定</span></h4>
+        <p>
+          TRAE 截图里有「文件 / 编辑 / 查看 …」菜单栏。星瑶顶栏是自绘的 frameless 标题栏（48px，含窗口控制），
+          再加一行菜单栏会变成两行、且需要新做整套菜单数据。
+          <b>我的建议：默认不加</b>，用 <kbd>Ctrl+P</kbd> 命令面板 + 活动栏承担这些入口；
+          你要是想要，用上面开关看看效果再定。
+        </p>
+      </div>
+
+    </div>
+  </section>
+</div>
+
+<script>
+(function () {
+  var stage = document.getElementById('stage');
+  var seg = document.getElementById('scene-switch');
+
+  seg.addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-scene]');
+    if (!btn) return;
+    stage.dataset.scene = btn.dataset.scene;
+    seg.querySelectorAll('button').forEach(function (b) {
+      b.classList.toggle('active', b === btn);
+    });
+  });
+
+  document.getElementById('opt-menubar').addEventListener('change', function (e) {
+    stage.dataset.menubar = e.target.checked ? 'on' : 'off';
+  });
+
+  document.getElementById('opt-ai').addEventListener('change', function (e) {
+    stage.dataset.ai = e.target.checked ? 'open' : 'closed';
+  });
+})();
+</script>
+</body>
+</html>

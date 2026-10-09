@@ -1335,6 +1335,11 @@ export interface PyWebViewAPI {
   ide_set_open_files(paths: string[]): Promise<{ ok: boolean; count: number }>;
   ide_get_layout(session: string): Promise<{ ok: boolean; layout: IdeLayoutSnapshot | null }>;
   ide_save_layout(session: string, layout: IdeLayoutSnapshot): Promise<{ ok: boolean; layout: IdeLayoutSnapshot }>;
+  // 会话级 UI 偏好（当前只有 IDE / 对话模式）：按会话名分桶存后端
+  // ~/.ycode/session_ui.json。get 恒回默认值（后端不返回 null），
+  // save 异常时回 ok=false + msg（前端据此静默降级，见 appStore.persistIdeMode）
+  get_session_ui(session: string): Promise<{ ok: boolean; ui: SessionUiSnapshot; msg?: string }>;
+  save_session_ui(session: string, ui: SessionUiSnapshot): Promise<{ ok: boolean; ui: SessionUiSnapshot; msg?: string }>;
 
   // ---- IDE 模式 S2：语言服务 ----
   lsp_request(
@@ -1570,6 +1575,12 @@ export interface IdeLayoutSnapshot {
   tabs: { path: string; line: number }[];
   active: string;
   breakpoints: { path: string; line: number }[];
+}
+
+/** 会话级 UI 偏好快照（get_session_ui / save_session_ui 的载荷，与后端同构） */
+export interface SessionUiSnapshot {
+  version: number;
+  ide_mode: boolean;
 }
 
 declare global {
