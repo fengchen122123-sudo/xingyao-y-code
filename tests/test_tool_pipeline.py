@@ -204,7 +204,10 @@ def test_catastrophic_command_never_enqueues_permission(monkeypatch):
 
     result = _call("execute_command", {"command": "format C:"})
 
-    assert result["content"] == "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+    assert result["content"] == (
+        "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+        "若这是文档/文件内容（而非要执行的命令），请改用文件写入工具（write_file）保存。"
+    )
     assert enqueued == []
 
 

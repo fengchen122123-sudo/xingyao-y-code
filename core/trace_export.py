@@ -6,7 +6,9 @@
 设计约束（实施计划与验收清单 · T5）：
 - 默认"精简模式"不含任何消息正文；`full=True` 追加会话消息导出，且必须
   配合显式确认参数（confirm=True），调用方（CLI）还须完成交互确认；
-  消息正文统一经 `core.share._redact_export_text` 脱敏；
+  包内文本（messages / doctor.json / logs）统一经 `_redact_bundle_text` 脱敏：
+  复用 `core.share._redact_export_text` 的密钥规则，并把本机用户目录路径
+  替换为 `<HOME>`（审查报告 A2-02）；
 - harness 记录遵循 Harness 纪律：只含 ID 与元数据（sha256 / 计数 / 时长等），
   不落消息正文；
 - 单项缺失/失败（无日志文件、无 MemoryManager、doctor 抛异常）优雅降级：
@@ -16,13 +18,14 @@
 包结构：
     manifest.json   版本/平台/时间范围/会话/文件清单/降级记录
     journal.jsonl   harness turns/steps/events 逐行 JSON（含回合 ID）
-    doctor.json     core.doctor.run_checks 的结果（数组，schema 同 --json）
+    doctor.json     core.doctor.run_checks 的结果（数组，schema 同 --json，已脱敏）
     messages.jsonl  仅 full 模式：经脱敏的会话消息（role/content）
-    logs/           GUI 运行日志尾部（gui-runtime.log 存在才打包）
+    logs/           GUI 运行日志尾部（gui-runtime.log 存在才打包，已脱敏）
 """
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 import zipfile
@@ -59,6 +62,32 @@ def _jsonl(rows: list[dict]) -> str:
     if not rows:
         return ""
     return "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
+
+
+# A2-02：诊断包内文本统一脱敏。除 core.share._redact_export_text 的密钥类
+# 规则外，本机用户目录路径（含 JSON 序列化里的双反斜杠转义变体）替换为 <HOME>。
+# 通用形态兜底：C:\Users\<name> / C:/Users/<name> / /home/<name> / /Users/<name>
+_USER_DIR_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}|/(?:home|Users)/)[^\\/\s\"'<>]+",
+    re.IGNORECASE,
+)
+
+
+def _redact_bundle_text(value) -> str:
+    """导出文本统一脱敏：复用 share 密钥规则 + 本机用户路径 → <HOME>。"""
+    from core.share import _redact_export_text
+
+    text = _redact_export_text(value)
+    home = str(Path.home())
+    # 先替换更长的（双反斜杠转义）变体，避免被单反斜杠变体抢先截断
+    for variant in sorted(
+        {home, Path(home).as_posix(), home.replace("\\", "\\\\")},
+        key=len,
+        reverse=True,
+    ):
+        if variant:
+            text = re.sub(re.escape(variant), "<HOME>", text, flags=re.IGNORECASE)
+    return _USER_DIR_RE.sub("<HOME>", text)
 
 
 def _collect_journal(session_name: str) -> tuple[list[dict], str]:
@@ -99,9 +128,8 @@ def _collect_doctor() -> tuple[list[dict], str]:
 
 
 def _collect_messages(session_name: str) -> tuple[list[dict], str]:
-    """收集会话消息（full 模式），逐条经 _redact_export_text 脱敏。"""
+    """收集会话消息（full 模式），逐条经 _redact_bundle_text 统一脱敏。"""
     from core import app_context
-    from core.share import _redact_export_text
 
     if not session_name:
         return [], "messages 未导出：未指定会话名"
@@ -119,7 +147,7 @@ def _collect_messages(session_name: str) -> tuple[list[dict], str]:
         rows.append(
             {
                 "role": str(message.get("role") or ""),
-                "content": _redact_export_text(message.get("content") or ""),
+                "content": _redact_bundle_text(message.get("content") or ""),
             }
         )
     return rows, ""
@@ -138,7 +166,8 @@ def _platform_info() -> dict:
 
 
 def _write_log_tail(zip_file: zipfile.ZipFile, log_path: Path) -> None:
-    """写入日志尾部：超过上限时截到 LOG_TAIL_BYTES 并去掉截断处的半行。"""
+    """写入日志尾部：超过上限时截到 LOG_TAIL_BYTES 并去掉截断处的半行；
+    整段经 _redact_bundle_text 统一脱敏后再打包（A2-02）。"""
     size = log_path.stat().st_size
     with open(log_path, "rb") as handle:
         if size > LOG_TAIL_BYTES:
@@ -149,7 +178,10 @@ def _write_log_tail(zip_file: zipfile.ZipFile, log_path: Path) -> None:
                 data = data[newline + 1:]
         else:
             data = handle.read()
-    zip_file.writestr("logs/gui-runtime.log", data)
+    zip_file.writestr(
+        "logs/gui-runtime.log",
+        _redact_bundle_text(data.decode("utf-8", errors="replace")),
+    )
 
 
 def export_diagnostics_bundle(
@@ -208,7 +240,12 @@ def export_diagnostics_bundle(
     if log_included:
         files.append("logs/gui-runtime.log")
 
-    errors = [item for item in (journal_error, doctor_error, messages_error) if item]
+    # 降级原因同样过脱敏：异常文本常内嵌本机路径（A2-02 同类泄漏面）
+    errors = [
+        _redact_bundle_text(item)
+        for item in (journal_error, doctor_error, messages_error)
+        if item
+    ]
 
     manifest = {
         "bundle_format": BUNDLE_FORMAT,
@@ -230,8 +267,8 @@ def export_diagnostics_bundle(
         "errors": errors,
         "notes": [
             "journal.jsonl 仅含回合/步进/事件的 ID 与元数据，不含消息正文。",
-            "full 模式下 messages.jsonl 已按 _redact_export_text 脱敏，"
-            "仍建议分享前人工复核。",
+            "messages.jsonl（full 模式）、doctor.json 与 logs/ 已统一脱敏："
+            "密钥类规则 + 本机用户路径 → <HOME>；仍建议分享前人工复核。",
         ],
     }
 
@@ -248,7 +285,10 @@ def export_diagnostics_bundle(
             "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)
         )
         bundle.writestr("journal.jsonl", _jsonl(journal_rows))
-        bundle.writestr("doctor.json", json.dumps(doctor_rows, ensure_ascii=False, indent=2))
+        bundle.writestr(
+            "doctor.json",
+            _redact_bundle_text(json.dumps(doctor_rows, ensure_ascii=False, indent=2)),
+        )
         if full and messages_rows:
             bundle.writestr("messages.jsonl", _jsonl(messages_rows))
         if log_included:
@@ -256,7 +296,8 @@ def export_diagnostics_bundle(
                 _write_log_tail(bundle, log_path)
             except Exception as exc:
                 manifest["errors"].append(
-                    f"logs 打包失败：{exc.__class__.__name__}: {exc}"
+                    f"logs 打包失败：{exc.__class__.__name__}: "
+                    f"{_redact_bundle_text(str(exc))}"
                 )
                 bundle.writestr(
                     "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)
