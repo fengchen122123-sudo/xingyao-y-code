@@ -813,6 +813,13 @@ def build():
             print("   即报 No module named 'winpty'）。")
             print("   请先补齐依赖：venv\\Scripts\\python -m pip install -r requirements.txt")
             sys.exit(1)
+        # 供应链把关（审查 B8-03）：vendor/ 随包资源（内置 ripgrep / mermaid）
+        # 是安装包的组成输入，其来源与哈希必须与 vendor/VENDOR_MANIFEST.json
+        # 记录一致；校验失败即中止构建，防止被篡改或漂移的资源打进产物。
+        run_checked(
+            [sys.executable, os.path.join(project_dir, "scripts", "verify_vendor.py")],
+            "vendor 随包资源校验",
+        )
         step0_build_frontend(project_dir, args)
         ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
         payload_zip = make_payload_archive(project_dir, ycode_dir)
