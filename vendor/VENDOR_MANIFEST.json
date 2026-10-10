@@ -1,0 +1,19 @@
+{
+  "note": "vendor/ 随包第三方资源的来源与完整性记录（系统审查报告 B8-03）：新增或升级资源必须先在 files 里登记来源 URL、版本与 SHA256，再用 scripts/verify_vendor.py 校验；哈希不一致时必须人工核查来源是否可信、文件是否被篡改，确认正常后才可更新记录，来源不明不得直接回填。",
+  "files": [
+    {
+      "path": "vendor/ripgrep/rg.exe",
+      "hash_mode": "binary",
+      "sha256": "a286ea6f4d0d8c1c6c2234728cf2d96afcf371c550086c11e1ea28730dcfb418",
+      "version": "15.0.0 (rev 3a612f88b8; features:+pcre2)",
+      "source": "https://github.com/BurntSushi/ripgrep/releases/tag/15.0.0"
+    },
+    {
+      "path": "vendor/mermaid/mermaid-11.17.2.min.js",
+      "hash_mode": "text_lf",
+      "sha256": "581ed7d74bd9048d0e3a91363927d72ef22942d7722546b27f7cc29e35390eb8",
+      "version": "11.17.2",
+      "source": "https://www.npmjs.com/package/mermaid/v/11.17.2"
+    }
+  ]
+}
