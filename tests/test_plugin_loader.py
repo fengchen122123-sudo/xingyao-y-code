@@ -47,6 +47,39 @@ _NO_REGISTER_PLUGIN = """
 X = 1
 """
 
+# 插件在加载期直接抛 SystemExit（B5-04：修复前会穿透 except Exception 中断加载流程）
+_SYSEXIT_PLUGIN = """
+import sys
+sys.exit(9)
+"""
+
+# 插件加载期抛 KeyboardInterrupt：必须维持传播（不能被插件隔离吞掉）
+_KEYBOARD_INTERRUPT_PLUGIN = """
+raise KeyboardInterrupt("插件要求中断")
+"""
+
+# 正常注册工具，但 cleanup() 禁用钩子抛 SystemExit（B5-04 同类路径）
+_CLEANUP_SYSEXIT_PLUGIN = """
+import sys
+
+from core.tool_protocol import ToolSpec
+
+
+def register(registry):
+    registry.register(ToolSpec(
+        name="cleanup_demo_tool",
+        description="demo",
+        input_schema={"type": "object", "properties": {}},
+        execute=lambda: "ok",
+        read_only=True,
+        requires_permission=False,
+    ))
+
+
+def cleanup():
+    sys.exit(3)
+"""
+
 
 @pytest.fixture
 def plugin_env(tmp_path, monkeypatch):
@@ -89,6 +122,79 @@ def test_broken_plugin_is_skipped_without_crashing(plugin_env):
 
     assert loaded == ["demo"]
     assert registry.execute("demo_tool", x="ok").content == "hello ok"
+
+
+# ── SystemExit / KeyboardInterrupt 隔离（B5-04） ─────────────────────
+
+def test_sysexit_plugin_is_skipped_without_crashing(plugin_env):
+    """插件抛 SystemExit 只算该插件加载失败，不穿透中断加载流程（B5-04）"""
+    user_dir, _ = plugin_env
+    # 命名保证 SystemExit 插件排在正常插件之前被扫描，验证"继续加载其他插件"
+    _make_plugin(user_dir / "aa_exiter", "aa_exiter", _SYSEXIT_PLUGIN)
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == ["demo"]
+    assert registry.execute("demo_tool", x="ok").content == "hello ok"
+    infos = {i["name"]: i for i in plugin_loader.get_plugin_infos()}
+    assert infos["aa_exiter"]["status"] == "failed"
+    assert "9" in infos["aa_exiter"]["error"]
+
+
+def test_sysexit_plugin_during_refresh_is_skipped(plugin_env):
+    """运行期间出现的 SystemExit 插件：热刷新只记失败，不中断刷新流程（B5-04）"""
+    user_dir, _ = plugin_env
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    _make_plugin(user_dir / "aa_exiter", "aa_exiter", _SYSEXIT_PLUGIN)
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    plugin_loader.refresh_plugins(registry)
+
+    infos = {i["name"]: i for i in plugin_loader.get_plugin_infos()}
+    assert infos["aa_exiter"]["status"] == "failed"
+    assert registry.execute("demo_tool", x="hot").content == "hello hot"
+
+
+def test_keyboard_interrupt_from_plugin_propagates(plugin_env):
+    """KeyboardInterrupt 必须维持传播：插件隔离不能吞掉用户中断"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "ki", "ki", _KEYBOARD_INTERRUPT_PLUGIN)
+
+    registry = ToolRegistry()
+    with pytest.raises(KeyboardInterrupt):
+        plugin_loader.load_and_register(registry)
+
+
+def test_toggle_enable_sysexit_plugin_reports_hot_failure(plugin_env, monkeypatch):
+    """热启用时插件抛 SystemExit：只报热切换失败，不穿透中断调用方（B5-04）"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "exiter", "exiter", _SYSEXIT_PLUGIN, enabled=False)
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+
+    ok, msg = plugin_loader.toggle_plugin("exiter", True)
+
+    assert ok is True
+    assert "热切换失败" in msg
+    assert "重启后生效" in msg
+
+
+def test_toggle_disable_cleanup_sysexit_does_not_fail_disable(plugin_env, monkeypatch):
+    """禁用时插件 cleanup() 抛 SystemExit：禁用动作仍成功（B5-04）"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "c", "c", _CLEANUP_SYSEXIT_PLUGIN)
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == ["c"]
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+
+    ok, msg = plugin_loader.toggle_plugin("c", False)
+
+    assert ok is True
+    assert "清理失败" in msg
 
 
 def test_plugin_without_register_function_is_skipped(plugin_env):

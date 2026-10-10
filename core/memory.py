@@ -2242,6 +2242,40 @@ class MemoryManager:
                 rows.append((msg_id, workdir, parsed))
             return rows
 
+    def iter_referenced_media_digests(self):
+        """全库媒体清单引用的 Blob 摘要集合（供闲时孤儿 Blob 回收，只读）。
+
+        粗筛 ``content LIKE '%media_v1%'`` 后解析 JSON，提取
+        ``_display.media_v1.items[*].digest``；解析失败/结构异常的行跳过
+        （回收侧另有宽限期兜底，缺引用最坏只是少回收，不会误删在用 Blob）。
+        """
+        digests = set()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT content FROM messages WHERE content LIKE '%media_v1%'"
+            )
+            for (raw,) in cursor.fetchall():
+                parsed, ok = _try_parse_json(raw)
+                if not ok or not isinstance(parsed, dict):
+                    continue
+                display = parsed.get("_display")
+                if not isinstance(display, dict):
+                    continue
+                manifest = display.get("media_v1")
+                if not isinstance(manifest, dict):
+                    continue
+                items = manifest.get("items")
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    digest = item.get("digest")
+                    if isinstance(digest, str) and len(digest) == 64:
+                        digests.add(digest)
+        return digests
+
     def update_message_display_media(self, message_id, media_v1) -> bool:
         """给单条消息补写 _display.media_v1（正文其余字节不动），幂等。"""
         with self._lock:
