@@ -243,6 +243,11 @@ def _run_cleanup_hook(name: str) -> str:
     try:
         hook()
         return ""
+    except SystemExit as exc:
+        # 同 load_and_register：SystemExit 只记清理失败，兑现"绝不让禁用动作失败"
+        #（KeyboardInterrupt 仍向上传播）。
+        _logger.warning("插件 %s 的 cleanup 钩子触发 SystemExit(%r)，已忽略", name, exc.code)
+        return f"（清理失败: SystemExit({exc.code!r})）"
     except Exception as exc:
         _logger.warning("插件 %s 的 cleanup 钩子执行失败: %s", name, exc)
         return "（清理失败: %s）" % exc
@@ -379,6 +384,11 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
                         break
                 # 禁用后调用插件可选的 cleanup()，回收它写入的持久化数据（如自举的 provider）
                 hot_note = _run_cleanup_hook(name)
+        except SystemExit as exc:
+            # 同 load_and_register：SystemExit 按热切换失败处理，不穿透中断调用方
+            #（KeyboardInterrupt 仍向上传播）。
+            _logger.warning("插件 %s 热切换触发 SystemExit(%r)，已按失败处理", name, exc.code)
+            hot_note = f"（热切换失败: SystemExit({exc.code!r})，重启后生效）"
         except Exception as exc:
             _logger.warning("插件 %s 热切换失败: %s", name, exc)
             hot_note = f"（热切换失败: {exc}，重启后生效）"
@@ -573,6 +583,13 @@ def refresh_plugins(registry=None) -> None:
                     _logger.info("插件已热加载: %s (%s)", name, child)
                 else:
                     info["status"] = "disabled"
+            except SystemExit as exc:
+                # 同 load_and_register：SystemExit 按"该插件热加载失败"处理，
+                # 不穿透中断刷新流程（KeyboardInterrupt 仍向上传播）。
+                taken_names.add(plugin_name)
+                info["status"] = "failed"
+                info["error"] = f"SystemExit({exc.code!r})"
+                _logger.warning("插件 %s 触发 SystemExit(%r)，已按热加载失败跳过", child.name, exc.code)
             except Exception as exc:
                 taken_names.add(plugin_name)
                 info["status"] = "failed"
@@ -640,6 +657,14 @@ def load_and_register(registry) -> list[str]:
                     _logger.info("插件已加载: %s (%s)", name, child)
                 else:
                     info["status"] = "disabled"
+            except SystemExit as exc:
+                # SystemExit 继承 BaseException，不会落入 except Exception：
+                # 单独按"该插件加载失败"处理，防止插件退出码穿透中断星瑶启动。
+                # KeyboardInterrupt 不在此列（同为 BaseException 子类），维持向上传播。
+                seen.add(plugin_name)
+                info["status"] = "failed"
+                info["error"] = f"SystemExit({exc.code!r})"
+                _logger.warning("插件 %s 触发 SystemExit(%r)，已按加载失败跳过", child.name, exc.code)
             except Exception as exc:
                 seen.add(plugin_name)
                 info["status"] = "failed"

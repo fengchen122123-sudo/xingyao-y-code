@@ -207,6 +207,75 @@ def test_full_mode_writes_redacted_messages(manager, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ③b A2-02：doctor.json 与 GUI 日志导出统一脱敏（本机用户路径 → <HOME>）
+# ---------------------------------------------------------------------------
+
+def test_redact_bundle_text_covers_home_dir_variants():
+    """本机用户目录的正/反斜杠与 JSON 转义双反斜杠变体都收敛为 <HOME>。"""
+    home = Path.home()
+    variants = [str(home), home.as_posix(), str(home).replace("\\", "\\\\")]
+    for variant in variants:
+        out = trace_export._redact_bundle_text(f"数据目录 {variant}\\.ycode 可读写")
+        assert "<HOME>" in out, variant
+        assert variant not in out, variant
+        assert home.name not in out, variant
+
+    # 与本机无关的通用 Windows/POSIX 用户目录形态同样收敛
+    generic = (
+        r"C:\Users\someone-else\.ycode 与 C:/Users/someone-else/x "
+        r"与 C:\\Users\\someone-else\\y"
+    )
+    out = trace_export._redact_bundle_text(generic)
+    assert "someone-else" not in out
+    assert out.count("<HOME>") == 3
+
+
+def test_doctor_and_log_export_are_redacted(manager, tmp_path, monkeypatch):
+    """doctor 行与日志行中的本机路径不再原样进包（审查报告 A2-02 实测泄漏点）。"""
+    home = Path.home()
+    rows = [
+        doctor.CheckResult(
+            name="数据目录",
+            status="ok",
+            detail=f"{home} 可读写",
+            hint=f"如需迁移，可用 YCODE_DATA_DIR 指到其他目录（当前 {home}）",
+        ),
+    ]
+    monkeypatch.setattr(doctor, "run_checks", lambda *, skip_network=False: rows)
+
+    log_path = tmp_path / "gui-runtime.log"
+    log_path.write_text(
+        f"2026-10-10 GUI 启动，数据目录 {home}\n"
+        f"缓存写入 {home.as_posix()}/cache\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(trace_export, "_gui_runtime_log_path", lambda: log_path)
+
+    zip_path = trace_export.export_diagnostics_bundle(
+        dest_dir=str(tmp_path / "out"), session_name="s1"
+    )
+
+    texts = _read_bundle_texts(zip_path)
+    doctor_text = texts["doctor.json"]
+    log_text = texts["logs/gui-runtime.log"]
+    manifest = json.loads(texts["manifest.json"])
+
+    username = home.name
+    assert username not in doctor_text, "doctor.json 泄漏用户名路径"
+    assert username not in log_text, "GUI 日志泄漏用户名路径"
+    assert home.as_posix() not in log_text
+    assert "<HOME>" in doctor_text
+    assert "<HOME>" in log_text
+
+    payload = json.loads(doctor_text)  # 脱敏后仍是合法 JSON、结构与字段不变
+    assert [row["name"] for row in payload] == ["数据目录"]
+    assert "<HOME>" in payload[0]["detail"]
+    assert "<HOME>" in payload[0]["hint"]
+    assert manifest["redacted"] is True
+    assert any("doctor" in note and "<HOME>" in note for note in manifest["notes"])
+
+
+# ---------------------------------------------------------------------------
 # ④ 单项缺失时的优雅降级
 # ---------------------------------------------------------------------------
 

@@ -1551,6 +1551,8 @@ def _chat_with_model_generator(
     current_step = None
     current_tool_calls = []
     pending_tool_records = {}
+    # 当前 step 的流式组装器（A1-02：通用异常路径打捞部分正文时读取；每 step 重建）
+    stream_assembler = None
 
     def _model_display_snapshot(metrics=None):
         """为落库的 assistant 消息附加"生成所用模型"及性能指标的显示元数据。
@@ -1684,6 +1686,34 @@ def _chat_with_model_generator(
                         "name": name,
                         "content": cancelled_content,
                     }))
+
+    def salvage_streaming_partial():
+        """A1-02：流式中断时把本 step 已生成的部分内容打捞进待写队列。
+
+        仅在组装器存在、尚未 finish 且确有公开正文时生效（半截 tool_calls
+        不带入，避免历史非法；纯思考不产生消息）。公开正文带
+        「[本轮流式中断]」标注落库，reasoning 一并携带。异常发生在组装
+        完成后（assembler 已 finish）时静默跳过；上游调用后仍需
+        flush_persistence()。
+        """
+        assembler = stream_assembler
+        if assembler is None:
+            return
+        try:
+            assembled = assembler.finish()
+        except Exception:
+            return
+        public_content = (assembled.content or "").strip()
+        if not public_content:
+            return
+        salvaged_message = {
+            "role": "assistant",
+            "content": f"{public_content}\n\n[本轮流式中断]",
+        }
+        if assembled.reasoning_content:
+            salvaged_message["reasoning_content"] = assembled.reasoning_content
+        salvaged_message.update(_model_display_snapshot())
+        pending_persistence.append(("assistant", salvaged_message))
 
     # 2. 注入后台子 Agent 回报数据 (XML task-notification)
     from core.tools import subagent_manager
@@ -3396,6 +3426,17 @@ def _chat_with_model_generator(
             response_stream.close()
         except Exception:
             pass
+        # A1-02：连接中断等通用异常同样先把本 step 已生成的部分正文与待写
+        # 队列打捞落库（带「[本轮流式中断]」标注）——否则用户所见正文重开
+        # 会话即消失（DB 与所见分叉）。打捞为 best-effort：失败不掩盖原始
+        # 异常的报告流程，仅记录 harness 失败原因。
+        try:
+            salvage_streaming_partial()
+            salvage_persistence_on_cancel()
+            flush_persistence()
+        except Exception as salvage_error:
+            if harness_runtime is not None:
+                harness_runtime.fail(type(salvage_error).__name__)
         # 异常路径同样回滚本轮未持久化的内存消息：既避免留下带 tool_calls 却无
         # tool 响应的悬空 assistant 消息（下一轮 API 会 400），也保持内存历史与 DB 一致
         rollback_turn_messages()
