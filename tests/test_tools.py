@@ -339,6 +339,8 @@ def test_execute_command_rejects_catastrophic_commands_before_spawn(monkeypatch)
 
     assert result.startswith("🚨")
     assert "危险命令" in result
+    # B2-03：拒绝对话需提示文档/文件内容改走 write_file 通道
+    assert "write_file" in result
 
 
 def test_skill_command_reports_missing_dependencies_without_installing(tmp_path, monkeypatch):

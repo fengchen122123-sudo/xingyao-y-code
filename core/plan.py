@@ -635,6 +635,17 @@ def get_bound_plan_session() -> str | None:
     return str(sid) if sid else None
 
 
+def get_plan_route() -> tuple[str | None, str | None]:
+    """返回当前线程的计划路由快照 (session_id, storage_dir)。
+
+    供并行工具线程在派发入口显式继承计划会话路由（线程本地状态不会自动
+    进入新线程）。storage_dir 必须一并携带：会话管理器若尚未注册，缺省会
+    按新线程的工作目录重新推导落盘位置，可能指向错误目录。未绑定时返回
+    (None, None)，语义与 get_bound_plan_session 一致（走进程级单例）。
+    """
+    return get_bound_plan_session(), getattr(_plan_route_tls, "storage_dir", None)
+
+
 def get_plan_manager_for(session_id: str, *, storage_dir=None) -> PlanManager:
     """取（或惰性创建）指定会话的专属计划管理器。
 

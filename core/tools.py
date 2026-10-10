@@ -858,7 +858,10 @@ def execute_command(
         )
 
     if is_dangerous_command(command):
-        return "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+        return (
+            "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+            "若这是文档/文件内容（而非要执行的命令），请改用文件写入工具（write_file）保存。"
+        )
 
     # 按回合撤销边界（M6）：仅在实际放行执行的命令上持久化"未覆盖副作用"
     # 事实——被冻结/危险策略拒绝的命令零副作用，不打虚假标记（规格 10）。
@@ -3962,13 +3965,19 @@ class SubagentManager:
 
     @staticmethod
     def _notification(task: SubagentTask) -> str:
-        summary = f"子任务「{task.description[:40]}」{task.status}"
+        # B1-01：子代理产出是数据——进上下文前中和保留标记（仅内容值；
+        # 包装标签与 XML 转义不受影响），防伪造标记与误截断。
+        from core.injection_markers import neutralize_reserved_markers
+
+        summary = neutralize_reserved_markers(
+            f"子任务「{task.description[:40]}」{task.status}"
+        )
         return f"""<task-notification>
   <task-id>{escape(task.task_id)}</task-id>
   <status>{escape(task.status)}</status>
   <summary>{escape(summary)}</summary>
-  <result>{escape(task.result)}</result>
-  <error>{escape(task.error)}</error>
+  <result>{escape(neutralize_reserved_markers(task.result))}</result>
+  <error>{escape(neutralize_reserved_markers(task.error))}</error>
 </task-notification>"""
 
     def _run_default_subagent(self, task: SubagentTask) -> str:
@@ -4088,7 +4097,7 @@ class SubagentManager:
         )
         # 自定义子 agent 的系统提示词优先；未配置时用内置 role_instructions
         instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]
-        # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪四条对内置与自定义子代理
+        # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪 / 信源分级五条对内置与自定义子代理
         # 一律生效。拼进 instruction_text 而非仅在首请求拼接——后续「续写总结」请求
         # （cont_messages）同样复用 instruction_text，两处请求自动带上同一份约束。
         # 顺序：身份正文在前、公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
@@ -4443,6 +4452,36 @@ def run_subagent(
             (item for item in scheduler.plan.snapshot() if item["id"] == str(plan_item_id)),
             None,
         )
+        if plan_item is None:
+            # 计划项查无此项时必须区分两种根因，否则会把平台侧路由缺陷
+            # 谎报成“计划项不存在”，误导模型放弃或改写计划：
+            #   1) 执行线程未绑定计划会话（绑定环境缺失，如并行工具线程
+            #      未继承计划路由）——可重试的环境问题；
+            #   2) 绑定会话内确实没有该 id——模型应核对 id 而不是重试。
+            from core.plan import get_bound_plan_session
+
+            bound_session = get_bound_plan_session()
+            if bound_session is None:
+                return json.dumps({
+                    "status": "blocked",
+                    "reason": "plan_binding_missing",
+                    "plan_item_id": str(plan_item_id),
+                    "error": (
+                        f"无法定位计划项 '{plan_item_id}'：当前执行线程未绑定计划会话"
+                        "（绑定环境缺失，属平台侧计划路由问题，不是计划项状态冲突）。"
+                        "请重试本项；若持续失败可改用单发（非同批并发）方式派发，"
+                        "并先用 plan_read 核对计划项 id。"
+                    ),
+                }, ensure_ascii=False)
+            return json.dumps({
+                "status": "blocked",
+                "reason": "plan_item_not_found",
+                "plan_item_id": str(plan_item_id),
+                "error": (
+                    f"计划会话 '{bound_session}' 中不存在计划项 '{plan_item_id}'，"
+                    "请先用 plan_read 核对当前会话的计划项 id。"
+                ),
+            }, ensure_ascii=False)
         if plan_item is not None and plan_item.get("kind") == "input_preparation":
             return json.dumps({
                 "status": "blocked",
