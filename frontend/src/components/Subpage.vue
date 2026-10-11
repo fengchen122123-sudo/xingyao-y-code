@@ -77,9 +77,10 @@
          <div v-if="addForm.show" class="mcp-add-form">
            <div class="maf-row">
              <input v-model="addForm.name" placeholder="服务名（如 filesystem）" style="width:180px" />
-             <input v-model="addForm.command" placeholder="启动命令（如 npx）" style="width:140px" />
+             <input v-model="addForm.command" placeholder="启动命令：npx / node / python" style="width:200px" />
              <input v-model="addForm.args" placeholder="参数，空格分隔（如 -y @modelcontextprotocol/server-filesystem）" style="flex:1;min-width:220px" />
            </div>
+           <div class="maf-hint">启动命令仅支持 npx / node / python 裸名，不能填路径；其他 CLI 类服务可用 node 启动它的入口脚本。</div>
            <textarea v-model="addForm.env" class="maf-env" rows="3" placeholder="环境变量（可选），每行一个 KEY=VALUE，如：&#10;API_KEY=sk-xxx"></textarea>
            <div class="maf-row maf-actions">
              <label class="maf-check"><input type="checkbox" v-model="addForm.enabled" /> 添加后立即启用</label>
@@ -101,7 +102,16 @@
                 <span class="switch-track"></span>
               </label>
             </div>
-            <div class="sc-desc">{{ '工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m) }}</div>
+            <div class="sc-desc">
+              {{ '工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m) }}<span
+                v-if="mcpErrorText(m)"
+                class="mcp-err"
+                :title="mcpErrorFull(m)"
+              > · 失败原因: {{ mcpErrorText(m) }}</span>
+            </div>
+            <div class="sc-id">
+              <button class="chip-btn danger" title="删除该 MCP 服务" @click.stop="onRemoveMcp(m)">删除</button>
+            </div>
           </div>
         </div>
       </div>
@@ -315,6 +325,29 @@ async function onRestoreSkill(s: SkillInfo) {
 
 function onToggleMcp(m: McpInfo, checked: boolean) {
   store.toggleMcpServer(m.name, checked);
+}
+
+// 删除 MCP 服务会改写 mcp.json，属破坏性操作，先二次确认再调 store action
+async function onRemoveMcp(m: McpInfo) {
+  const ok = await store.askConfirm(
+    '删除 MCP 服务',
+    m.name,
+    '将从 mcp.json 移除该服务配置，删除后需要重新添加才能恢复。',
+    '删除 ⏎',
+  );
+  if (ok) await store.removeMcpServer(m.name);
+}
+
+// 连接失败原因：仅展示已启用但未连接的服务的 last_error（旧后端不返回该字段，表现不变）
+const MCP_ERR_MAX = 120;
+function mcpErrorFull(m: McpInfo): string {
+  if (!m.enabled || m.connected) return '';
+  return (m.last_error || '').trim();
+}
+// 过长报错截断加省略号，完整内容由 title 承载，避免撑破卡片
+function mcpErrorText(m: McpInfo): string {
+  const err = mcpErrorFull(m);
+  return err.length > MCP_ERR_MAX ? err.slice(0, MCP_ERR_MAX) + '…' : err;
 }
 
 // 添加自定义 MCP 服务的表单状态
@@ -710,6 +743,12 @@ async function testModelRow(m: ModelInfo) {
   resize: vertical;
   margin-bottom: 8px;
 }
+.maf-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
 .maf-actions {
   align-items: center;
   margin-bottom: 0;
@@ -725,6 +764,10 @@ async function testModelRow(m: ModelInfo) {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-soft);
+}
+.mcp-err {
+  color: var(--red);
+  word-break: break-all;
 }
 .pl-ver {
   font-size: 10.5px;

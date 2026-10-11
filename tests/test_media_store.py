@@ -124,3 +124,62 @@ def test_blob_name_is_safe():
 
 def test_supported_mime_whitelist_has_no_svg():
     assert "image/svg+xml" not in SUPPORTED_MIME
+
+
+def test_archive_failure_cleans_part_residue(tmp_path, monkeypatch):
+    """B8-01：归档中途失败（os.replace 异常）不得残留 .part 临时文件。"""
+    import core.media_store as ms
+
+    # 内容唯一（尾部随机）：避开其它用例已归档同内容触发的去重命中，
+    # 确保走 os.replace 落盘分支，才能命中注入的失败点。
+    src = _write(tmp_path, "a.png", PNG_BYTES + os.urandom(16))
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full (simulated)")
+
+    monkeypatch.setattr(ms.os, "replace", boom)
+    with pytest.raises(MediaStoreError):
+        archive_media_file(src)
+
+    residue = [n for n in os.listdir(ms.MEDIA_TMP_DIR) if n.endswith(".part")]
+    assert residue == [], f"失败后 .part 残留: {residue}"
+
+
+def test_prune_orphan_blobs_reclaims_expired_orphans(tmp_path, monkeypatch):
+    """B8-01：过期且无引用的孤儿 Blob 被回收。"""
+    import time as _time
+
+    import core.media_store as ms
+
+    monkeypatch.setattr(ms, "MEDIA_BLOBS_DIR", str(tmp_path / "blobs"))
+    os.makedirs(ms.MEDIA_BLOBS_DIR, exist_ok=True)
+    blob = os.path.join(ms.MEDIA_BLOBS_DIR, "a" * 64 + ".png")
+    with open(blob, "wb") as f:
+        f.write(b"x")
+    old = _time.time() - (3 * 24 * 3600)
+    os.utime(blob, (old, old))
+
+    assert ms.prune_orphan_blobs(set()) == 1
+    assert not os.path.exists(blob)
+
+
+def test_prune_orphan_blobs_protects_referenced_and_recent(tmp_path, monkeypatch):
+    """B8-01：有引用或仍在宽限期内的 Blob 一律保留。"""
+    import time as _time
+
+    import core.media_store as ms
+
+    monkeypatch.setattr(ms, "MEDIA_BLOBS_DIR", str(tmp_path / "blobs"))
+    os.makedirs(ms.MEDIA_BLOBS_DIR, exist_ok=True)
+    digest = "b" * 64
+    referenced = os.path.join(ms.MEDIA_BLOBS_DIR, digest + ".png")
+    fresh = os.path.join(ms.MEDIA_BLOBS_DIR, "c" * 64 + ".png")
+    for path in (referenced, fresh):
+        with open(path, "wb") as f:
+            f.write(b"x")
+    old = _time.time() - (3 * 24 * 3600)
+    os.utime(referenced, (old, old))  # 老但被引用 → 保留
+
+    assert ms.prune_orphan_blobs({digest}) == 0
+    assert os.path.exists(referenced)
+    assert os.path.exists(fresh)  # 无引用但崭新（宽限期内）→ 保留

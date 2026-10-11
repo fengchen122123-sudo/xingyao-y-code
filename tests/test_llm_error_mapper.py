@@ -29,6 +29,29 @@ def test_auth_invalid_401():
     assert "***" in formatted
 
 
+def test_model_not_supported_under_401_is_not_blamed_on_api_key():
+    """401 + ModelError（模型下线/不被上游支持）不能诊断成"API 凭证无效"。
+
+    实测案例：OpenCode Zen 免费档对已下线模型回
+    {"type":"error","error":{"type":"ModelError","message":"Model xxx is not supported"}}，
+    状态码是 401。旧逻辑把它归类成凭证问题，用户按提示反复检查 API Key 也解决不了。
+    """
+    exc = DummyApiException(
+        "API 凭证无效或未授权 (HTTP 401): "
+        '{"type":"error","error":{"type":"ModelError",'
+        '"message":"Model deepseek-v4-flash-free is not supported"}}',
+        status_code=401,
+    )
+
+    info = map_llm_error(exc)
+    assert info.category == "model_unavailable"
+    assert "模型不可用" in info.title
+    assert "凭证无效" not in info.title
+
+    formatted = format_user_facing_error(exc)
+    assert "重新选择" in formatted
+
+
 def test_insufficient_quota_402():
     # 2. 欠费 / 额度耗尽
     exc = DummyApiException("Error code: 429 - {'error': {'message': 'You exceeded your current quota', 'type': 'insufficient_quota'}}")

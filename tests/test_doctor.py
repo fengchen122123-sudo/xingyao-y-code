@@ -388,12 +388,12 @@ def _capture_probe_headers(monkeypatch, url):
 
 def test_probe_endpoint_carries_tokenrhythm_agent_header_for_tokenrhythm(monkeypatch):
     """探测基元律动端点时携带 X-TokenRhythm-Agent 客户端标识头。"""
-    from core.llm_policy import DEFAULT_USER_AGENT
+    from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 
     ok, request = _capture_probe_headers(monkeypatch, "https://tokenrhythm.studio/v1")
 
     assert ok is True
-    assert _request_header(request, "X-TokenRhythm-Agent") == DEFAULT_USER_AGENT
+    assert _request_header(request, "X-TokenRhythm-Agent") == TOKENRHYTHM_AGENT_NAME
 
 
 def test_probe_endpoint_omits_tokenrhythm_agent_header_for_other_hosts(monkeypatch):

@@ -41,6 +41,16 @@ export interface ModelInfo {
   computer_protocol: ComputerProtocolChoice;
   // 最大输出：null = 未设置（请求时走内置默认表）
   max_tokens?: number | null;
+  // 思考设置：choice 为当前持久化选择（未设置时 "default"）；
+  // options 为该模型真实支持的档位（后端按模型能力表给出，不猜测）；
+  // visible=false 的模型不展示思考设置，kind=fixed 的模型不可调（只读提示）。
+  reasoning_choice?: string;
+  reasoning_options?: { value: string; label: string }[];
+  reasoning_visible?: boolean;
+  reasoning_kind?: string;
+  // 内置官方默认档位（无依据的模型为空串）：打开弹窗且没有用户选择时自动预选
+  reasoning_default_choice?: string;
+  reasoning_disabled_reason?: string;
 }
 
 export interface ProviderInfo {
@@ -152,6 +162,11 @@ export interface SystemSettingsSnapshot {
   agent_turn_step_limit: number;
   agent_turn_step_limit_min: number;
   agent_turn_step_limit_max: number;
+  // 上下文水位基准：null 表示未设置（直接跟随模型真实窗口），
+  // 取值范围由 min/max 给出，供设置页输入框与校验使用
+  context_watermark_base: number | null;
+  context_watermark_base_min: number;
+  context_watermark_base_max: number;
   // AI 生成内容目录（Task 5）：ai_output_dir 为当前生效的绝对路径；
   // ai_output_dir_setting 为原始配置值（未配置为空串，供设置页回显草稿）；
   // ai_output_dir_default 为默认目录（占位符展示用）
@@ -343,6 +358,8 @@ export interface McpInfo {
   enabled: boolean;
   connected: boolean;
   tools_count: number;
+  // 连接失败原因（正常为 null / 旧后端不返回该字段时为 undefined）
+  last_error?: string | null;
 }
 
 export interface PluginInfo {
@@ -1003,6 +1020,7 @@ export interface PyWebViewAPI {
 
   set_model(modelId: string, sessionName?: string): Promise<any>;
   get_reasoning_snapshot(modelId: string): Promise<any>;
+  get_reasoning_snapshot_by_name(modelName: string): Promise<any>;
   set_reasoning_choice(modelId: string, choice: ReasoningChoice): Promise<any>;
   // 权限档位是会话级的：传 sessionName 只绑定该会话；不传则改全局默认
   set_permission_mode(mode: PermissionMode, sessionName?: string): Promise<any>;
@@ -1024,6 +1042,8 @@ export interface PyWebViewAPI {
   get_feishu_secret(): Promise<{ ok: boolean; app_secret?: string; msg?: string }>;
   test_feishu_connection(appId?: string, appSecret?: string): Promise<{ ok: boolean; msg?: string; endpoint_ready?: boolean }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // 上下文水位基准：0 表示不设基准（跟随模型真实窗口）
+  set_context_watermark_base(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   // /doctor 聚合自检（T3b）：设置页「运行自检」入口，复用 CLI 同一套检查
   // （core.doctor.run_checks）；skipNetwork 默认 false（含模型端点联网探测）
   run_doctor(skipNetwork?: boolean): Promise<DoctorReport>;
@@ -1089,6 +1109,7 @@ export interface PyWebViewAPI {
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
+  remove_mcp_server(name: string): Promise<any>;
   reconnect_mcp(): Promise<any>;
 
   export_session(fmt: 'md' | 'html' | 'json'): Promise<any>;
@@ -1276,9 +1297,9 @@ export interface PyWebViewAPI {
   update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_provider_api_key(providerId: string): Promise<{ ok: boolean; api_key?: string; msg?: string }>;
   delete_provider(providerId: string): Promise<any>;
-  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
+  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null, reasoningChoice?: string | null): Promise<any>;
   fetch_provider_models(providerId: string): Promise<{ ok: boolean; msg?: string; models?: { id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[]; count?: number }>;
-  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
+  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null, reasoningChoice?: string | null): Promise<any>;
   delete_model(modelId: string): Promise<any>;
   test_model(modelId: string): Promise<any>;
   set_secondary_model(modelId: string): Promise<any>;

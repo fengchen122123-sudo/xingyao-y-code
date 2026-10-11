@@ -201,6 +201,28 @@ def test_historical_removed_preset_models_not_reported():
     assert config.find_unknown_config_keys(data) == []
 
 
+def test_plugin_managed_provider_key_is_known():
+    """插件写入的 provider 来源标记 managed_by 必须登记为已知键。
+
+    背景：opencode_zen 等插件会给自己自举出来的 provider 打 managed_by 标记，
+    core/plugin_loader 据此在插件禁用/删除时精确回收，绝不误删用户手配厂商。
+    不登记的话，装过插件的用户一开 strict_config=true，启动就会被
+    UnknownConfigKeysError 阻断（真实环境已复现 providers[1].managed_by 误报）。
+    """
+    data = {
+        "providers": [
+            {
+                "id": "p1",
+                "name": "OpenCode Zen 免费通道",
+                "base_url": "http://127.0.0.1:17863/v1",
+                "managed_by": "opencode_zen",
+            }
+        ]
+    }
+
+    assert config.find_unknown_config_keys(data) == []
+
+
 def test_unknown_second_level_key_detected():
     data = {"shell_env_policy": {"inherit": "all", "exclude_sensitve": False}}
 

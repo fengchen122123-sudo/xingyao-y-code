@@ -7,15 +7,20 @@
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
+from core.version import __version__ as YCODE_VERSION
+
 
 # 全局默认 User-Agent：所有方言的请求头统一带上，便于服务端在调用日志/用量
 # 统计中按客户端归类（不设时 httpx 会填 python-httpx/x.x，导致被识别为 python）。
-DEFAULT_USER_AGENT = "XingYaoCode/1.3.2"
+# 版本号取自 core/version.py 单一来源，升版后无需手工同步。
+DEFAULT_USER_AGENT = f"XingYaoCode/{YCODE_VERSION}"
 
 # 基元律动（TokenRhythm）专用：向 tokenrhythm.studio 发起的请求统一补
-# X-TokenRhythm-Agent 头（值同默认 User-Agent），便于服务端识别客户端来源。
+# X-TokenRhythm-Agent 头，便于服务端识别客户端来源。该头只作为客户端
+# 标识，不带版本号——版本信息由 User-Agent 承担，避免同一信息两处维护。
 TOKENRHYTHM_DOMAIN = "tokenrhythm.studio"
 TOKENRHYTHM_AGENT_HEADER = "X-TokenRhythm-Agent"
+TOKENRHYTHM_AGENT_NAME = "XingYaoCode"
 
 
 def tokenrhythm_agent_headers(url: Optional[str] = None) -> Dict[str, str]:
@@ -24,7 +29,7 @@ def tokenrhythm_agent_headers(url: Optional[str] = None) -> Dict[str, str]:
     非基元律动地址返回空 dict，调用方统一用 headers.update(...) 合并。
     """
     if TOKENRHYTHM_DOMAIN in str(url or "").lower():
-        return {TOKENRHYTHM_AGENT_HEADER: DEFAULT_USER_AGENT}
+        return {TOKENRHYTHM_AGENT_HEADER: TOKENRHYTHM_AGENT_NAME}
     return {}
 
 
