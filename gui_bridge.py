@@ -513,17 +513,33 @@ def _reasoning_snapshot_for_model(model: dict | None) -> dict:
     return snapshot
 
 
+# 「另存为」对话框的文件类型过滤器：视频按 Blob 真实扩展名单列一组，
+# 其余（含历史图片）沿用图片组，保证图片路径行为零变化。
+_MEDIA_SAVE_IMAGE_FILTER = "图片文件 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.avif)"
+_MEDIA_SAVE_VIDEO_FILTER = "视频文件 (*.mp4;*.webm)"
+_MEDIA_SAVE_VIDEO_EXTS = frozenset({".mp4", ".webm"})
+
+
+def _media_save_file_types(ext: str) -> tuple:
+    """按 Blob 的真实扩展名选择「另存为」对话框的文件类型过滤器。"""
+    if (ext or "").lower() in _MEDIA_SAVE_VIDEO_EXTS:
+        return (_MEDIA_SAVE_VIDEO_FILTER,)
+    return (_MEDIA_SAVE_IMAGE_FILTER,)
+
+
 def _media_save_filename(suggested_name: str, ext: str) -> str:
     """把建议文件名清理成安全的单段文件名，并强制使用 Blob 的真实扩展名。
 
-    建议名来自图片 alt / 原始文件名，可能带路径成分、Windows 非法字符，
-    或与实际内容不符的扩展名（如 alt 写成 xxx.jpg 而 Blob 是 png）。
+    建议名来自图片 alt 或视频 caption / 原始文件名，可能带路径成分、
+    Windows 非法字符，或与实际内容不符的扩展名（如 alt 写成 xxx.jpg 而
+    Blob 是 png）。
     """
     name = re.split(r"[\\/]", (suggested_name or "").strip())[-1]
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     if "." in name:
         name = name.rsplit(".", 1)[0].strip(" .")
-    return (name or "ycode-image") + ext
+    fallback = "ycode-video" if (ext or "").lower() in _MEDIA_SAVE_VIDEO_EXTS else "ycode-image"
+    return (name or fallback) + ext
 
 
 class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
@@ -2440,11 +2456,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return []
 
     def save_media_image(self, url: str, suggested_name: str = "") -> Dict[str, Any]:
-        """把消息里的媒体图片另存到用户选择的位置（原生"另存为"对话框）。
+        """把消息里的媒体（图片/视频）另存到用户选择的位置（原生"另存为"对话框）。
 
         只接受本进程媒体服务签发的 URL：反解回仓库 Blob 后原样复制字节，
-        不重新编码，保证另存结果与原图完全一致。用户取消不算错误，返回
+        不重新编码，保证另存结果与原图/原视频完全一致。用户取消不算错误，返回
         cancelled 标记供前端静默处理。
+
+        本方法同时服务图片与视频：对话框的文件类型过滤器由
+        `_media_save_file_types` 按 Blob 真实扩展名决定。方法名保留
+        `save_media_image` 不改——改名会波及 pywebview.d.ts、appStore.ts 与
+        本模块测试共四处，收益不抵成本。
         """
         try:
             source = media_server.local_path_for_url(url or "")
@@ -2452,7 +2473,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.debug("媒体 URL 反解失败", exc_info=True)
             source = None
         if not source:
-            return {"ok": False, "msg": "该图片不在本地媒体仓库中，无法另存"}
+            return {"ok": False, "msg": "该媒体不在本地媒体仓库中，无法另存"}
         if self._window is None:
             return {"ok": False, "msg": "窗口尚未就绪，无法打开保存对话框"}
 
@@ -2463,7 +2484,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             result = self._window.create_file_dialog(
                 webview.SAVE_DIALOG,
                 save_filename=_media_save_filename(suggested_name, ext),
-                file_types=("图片文件 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.avif)",),
+                file_types=_media_save_file_types(ext),
             )
             destination = self._dialog_path(result)
             if destination is None:
