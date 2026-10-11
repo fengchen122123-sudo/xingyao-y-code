@@ -13,6 +13,7 @@
       <button data-test="editor-language-nav" class="nav-item" :class="{ active: activeSection === 'editor-language' }" @click="activeSection = 'editor-language'"><span class="nav-ico"><AppIcon name="hexagon" :size="14" /></span>编辑器与语言服务</button>
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
       <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
+      <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
@@ -545,6 +546,98 @@
           </footer>
         </section>
       </template>
+      <!-- 会话归档：原侧栏底部「已归档」区的完整入口，交互语义不变（可逆恢复 + 两段确认删除） -->
+      <template v-else-if="activeSection === 'session-archive'">
+        <header class="settings-header settings-header--narrow">
+          <div>
+            <h1>会话归档</h1>
+            <p>归档的会话不会出现在会话列表里，数据完整保留，可随时恢复。</p>
+          </div>
+          <div class="archive-head-actions">
+            <button
+              v-if="orderedArchivedSessions.length"
+              class="secondary-button compact"
+              data-test="session-archive-batch-toggle"
+              :title="archiveBatchMode ? '退出批量管理' : '多选批量恢复或删除'"
+              @click="toggleArchiveBatchMode"
+            >{{ archiveBatchMode ? '退出批量' : '批量管理' }}</button>
+            <button class="icon-button" title="刷新归档会话" @click="store.loadArchivedSessions()"><AppIcon name="refresh" :size="14" /></button>
+          </div>
+        </header>
+
+        <section class="perm-settings-card archive-settings-card" data-test="session-archive-page">
+          <!-- 批量操作栏：仅在批量模式出现，退出模式即收起（勾选同时清空） -->
+          <div v-if="archiveBatchMode" class="archive-batch-bar" data-test="session-archive-batch-bar">
+            <label class="archive-check">
+              <input type="checkbox" data-test="session-archive-select-all" :checked="archiveAllSelected" @change="toggleArchiveSelectAll" />
+              <span>全选</span>
+            </label>
+            <span class="archive-batch-count" data-test="session-archive-selected-count">已选 {{ archiveSelected.length }} 项</span>
+            <div class="archive-batch-actions">
+              <button
+                class="secondary-button compact"
+                data-test="session-archive-batch-restore"
+                title="取消归档，恢复到会话列表"
+                :disabled="!archiveSelected.length || archiveBusy"
+                @click="batchRestoreArchived"
+              >恢复选中</button>
+              <button
+                class="archive-del-btn archive-del-btn--confirm archive-batch-delete"
+                data-test="session-archive-batch-delete"
+                title="永久删除选中的归档会话"
+                :disabled="!archiveSelected.length || archiveBusy"
+                @click="batchDeleteArchived"
+              >删除选中</button>
+            </div>
+          </div>
+          <div v-if="!orderedArchivedSessions.length" class="wl-empty" data-test="session-archive-empty">暂无归档会话</div>
+          <div
+            v-for="s in orderedArchivedSessions"
+            :key="s.name"
+            class="archive-row"
+            :class="{ confirming: archiveConfirmName === s.name, picked: archiveBatchMode && archiveSelected.includes(s.name) }"
+            :data-archived-name="s.name"
+            data-test="session-archive-item"
+          >
+            <label v-if="archiveBatchMode" class="archive-check">
+              <input type="checkbox" data-test="session-archive-select" :checked="archiveSelected.includes(s.name)" @change="toggleArchiveSelect(s.name)" />
+            </label>
+            <div class="archive-main" :class="{ 'archive-main--pick': archiveBatchMode }" @click="archiveBatchMode && toggleArchiveSelect(s.name)">
+              <div class="archive-title" :title="s.name">{{ s.display_name || s.name }}</div>
+              <div class="archive-meta">
+                <span data-test="session-archive-time" :title="`归档于 ${s.archived_at || ''}`">{{ relativeTime(s.archived_at) }}</span>
+                <span class="archive-sep">·</span>
+                <span data-test="session-archive-count">{{ s.count || 0 }} 条消息</span>
+                <span class="archive-sep">·</span>
+                <span class="mono archive-workdir" data-test="session-archive-workdir" :title="s.workdir || ''">{{ s.workdir || '未知目录' }}</span>
+              </div>
+            </div>
+            <!-- 批量模式下隐藏行内单项恢复/删除：批量语义与单项语义混排容易误触 -->
+            <div v-if="!archiveBatchMode" class="archive-actions">
+              <button
+                class="secondary-button compact"
+                data-test="session-archive-restore-btn"
+                title="取消归档，恢复到会话列表"
+                @click="restoreArchivedSession(s.name)"
+              >恢复</button>
+              <button
+                v-if="archiveConfirmName !== s.name"
+                class="archive-del-btn"
+                data-test="session-archive-delete-btn"
+                title="删除此对话"
+                @click="askArchiveDelete(s.name)"
+              ><AppIcon name="x" :size="13" /></button>
+              <button
+                v-else
+                class="archive-del-btn archive-del-btn--confirm"
+                data-test="session-archive-delete-confirm"
+                title="点击确认删除"
+                @click="confirmArchiveDelete(s.name)"
+              >确认</button>
+            </div>
+          </div>
+        </section>
+      </template>
       <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
       <TokenUsageSettingsLegacy v-else-if="activeSection === 'tokens-legacy'" />
       <SystemSettings v-else-if="activeSection === 'system'" />
@@ -676,8 +769,128 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'editor-language' | 'persona' | 'feishu' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'editor-language' | 'persona' | 'feishu' | 'session-archive' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
+
+// ── 会话归档分区（原侧栏底部「已归档」区搬入设置页）────────────
+// 归档列表不进主会话列表，故进入该分区时按需拉取（首次直接落在该分区也拉一次）。
+watch(activeSection, (section) => {
+  if (section === 'session-archive') void store.loadArchivedSessions();
+}, { immediate: true });
+
+/** 归档列表展示顺序：按 archived_at 倒序（后端已排好，前端再排一次以免快照顺序漂移） */
+const orderedArchivedSessions = computed(() => {
+  return (store.archivedSessions || []).slice().sort((a, b) => {
+    const ta = a.archived_at || '';
+    const tb = b.archived_at || '';
+    if (ta === tb) return (a.name || '').localeCompare(b.name || '');
+    return ta < tb ? 1 : -1;
+  });
+});
+
+// 删除沿用侧栏归档区的两段确认：先点 ✕ 进入确认态，再点「确认」才真正删除
+const archiveConfirmName = ref('');
+
+function askArchiveDelete(name: string) {
+  archiveConfirmName.value = name;
+}
+
+function confirmArchiveDelete(name: string) {
+  archiveConfirmName.value = '';
+  void store.deleteSingleSession(name);
+}
+
+// 取消归档：可逆操作，不弹确认框
+function restoreArchivedSession(name: string) {
+  void store.unarchiveSession(name);
+}
+
+// ── 归档区批量管理（多选恢复 / 多选删除）────────────────────
+// 进入批量模式后每行左侧出现勾选框、行内单项操作隐藏；恢复沿用「可逆操作不弹确认框」
+// 的既有语义，删除则弹一次带数量提示的二次确认（与行内删除同一保护级别）。
+const archiveBatchMode = ref(false);
+const archiveSelected = ref<string[]>([]);
+const archiveBusy = ref(false);
+
+const archiveAllSelected = computed(() => {
+  const total = orderedArchivedSessions.value.length;
+  return total > 0 && archiveSelected.value.length === total;
+});
+
+function toggleArchiveBatchMode() {
+  archiveBatchMode.value = !archiveBatchMode.value;
+  // 退出模式即清空勾选，避免下次进入时残留上一次的选择
+  archiveSelected.value = [];
+  // 顺带退出行内删除确认态，避免残留红色高亮
+  archiveConfirmName.value = '';
+}
+
+function toggleArchiveSelect(name: string) {
+  const idx = archiveSelected.value.indexOf(name);
+  if (idx >= 0) archiveSelected.value.splice(idx, 1);
+  else archiveSelected.value.push(name);
+}
+
+function toggleArchiveSelectAll() {
+  archiveSelected.value = archiveAllSelected.value
+    ? []
+    : orderedArchivedSessions.value.map(s => s.name);
+}
+
+async function batchRestoreArchived() {
+  const names = archiveSelected.value.slice();
+  if (!names.length) return;
+  archiveBusy.value = true;
+  const done = await store.batchUnarchiveSessions(names);
+  archiveBusy.value = false;
+  // 只清成功项的勾选：失败项留在勾选里，用户可直接重试
+  if (done.length) archiveSelected.value = archiveSelected.value.filter(n => !done.includes(n));
+}
+
+async function batchDeleteArchived() {
+  const names = archiveSelected.value.slice();
+  if (!names.length) return;
+  const ok = await store.askConfirm(
+    '批量删除归档会话',
+    `共 ${names.length} 个会话`,
+    `确定要永久删除选中的 ${names.length} 个归档会话吗？对话记录会从数据库物理删除，无法恢复。`,
+    '确认删除 ⏎',
+  );
+  if (!ok) return;
+  archiveBusy.value = true;
+  const done = await store.batchDeleteArchivedSessions(names);
+  archiveBusy.value = false;
+  if (done.length) archiveSelected.value = archiveSelected.value.filter(n => !done.includes(n));
+}
+
+// 列表变化（本端操作或其它端同步）后：清掉已不在列表里的勾选；列表空时退出批量模式
+watch(orderedArchivedSessions, (list) => {
+  const names = new Set(list.map(s => s.name));
+  const kept = archiveSelected.value.filter(n => names.has(n));
+  if (kept.length !== archiveSelected.value.length) archiveSelected.value = kept;
+  if (!list.length && archiveBatchMode.value) {
+    archiveBatchMode.value = false;
+    archiveSelected.value = [];
+  }
+});
+
+// ZCode 风格的紧凑相对时间：刚刚 / 5分钟 / 3小时 / 13天 / 2个月（与侧栏归档区同一口径）
+function relativeTime(archivedAt?: string) {
+  if (!archivedAt) return '';
+  const t = new Date(archivedAt.replace(' ', 'T')).getTime();
+  if (isNaN(t)) return '';
+  const diff = Math.max(0, Date.now() - t);
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return '刚刚';
+  if (min < 60) return `${min}分钟`;
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour}小时`;
+  const day = Math.floor(hour / 24);
+  if (day < 30) return `${day}天`;
+  const mon = Math.floor(day / 30);
+  if (mon < 12) return `${mon}个月`;
+  return `${Math.floor(mon / 12)}年`;
+}
 // ── 手机端钻取式布局（≤768px）────────────────────────────────
 // 桌面：分区侧栏 + 厂商列表 + 详情三栏并排（isMobile=false，模板不变）。
 // 手机：厂商列表全宽；点选后列表/详情互斥显示，详情顶栏带"返回列表"。
@@ -1508,6 +1721,32 @@ onMounted(async () => {
 .wl-item > span { flex: 1; min-width: 0; word-break: break-all; }
 .wl-remove { flex: none; border: 0; background: transparent; color: var(--red); cursor: pointer; padding: 4px 6px; }
 .wl-empty { padding: 26px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
+
+/* ── 会话归档分区 ── */
+.archive-settings-card { padding: 8px 24px 20px; }
+.archive-head-actions { display: flex; align-items: center; gap: 10px; }
+.archive-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+.archive-row:last-child { border-bottom: 0; }
+.archive-row.confirming { background: rgba(239, 68, 68, 0.08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
+/* 批量模式下被勾选的行给一层浅色底：滚动长列表时也不丢选中位置 */
+.archive-row.picked { background: rgba(99, 102, 241, 0.08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
+.archive-main { flex: 1; min-width: 0; }
+.archive-main--pick { cursor: pointer; }
+.archive-batch-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 12px 0; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
+.archive-batch-count { color: var(--text-dim); font-size: 12px; }
+.archive-batch-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.archive-batch-actions button:disabled, .archive-batch-delete:disabled { opacity: 0.45; cursor: not-allowed; }
+.archive-check { display: inline-flex; align-items: center; gap: 6px; flex: none; color: var(--text-dim); font-size: 12px; cursor: pointer; user-select: none; }
+.archive-check input { accent-color: var(--accent); cursor: pointer; }
+.archive-batch-delete { height: 30px; padding: 0 12px; }
+.archive-title { color: var(--text); font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; color: var(--text-faint); font-size: 11.5px; }
+.archive-sep { color: var(--border); }
+.archive-workdir { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-actions { flex: none; display: flex; align-items: center; gap: 8px; }
+.archive-del-btn { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--border); border-radius: 7px; background: transparent; color: var(--text-faint); cursor: pointer; }
+.archive-del-btn:hover { color: var(--red); border-color: var(--red); }
+.archive-del-btn--confirm { width: auto; padding: 0 9px; border-color: var(--red); color: var(--red); font-size: 11.5px; }
 /* ── 手机端钻取式布局（≤768px）──────────────────────────────
    分区导航变顶部横滑条；模型配置卡片单列，列表/详情互斥显示。
    仅在窄断点生效，桌面端布局不受任何影响。 */

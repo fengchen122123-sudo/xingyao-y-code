@@ -197,3 +197,61 @@ it('无游标或后端不可用时直接返回不发请求', async () => {
   await expect(store.loadOlderMessages()).resolves.toBeUndefined();
   expect(store.historyLoading).toBe(false);
 });
+
+// ---------------------------------------------------------------------------
+// 分页状态自愈：坏状态（has_more=false + 游标为空）必须能自己恢复
+// 真实故障（2026-10-11）：读库失败被后端吞成「空页 + has_more=False」，前端写进
+// 会话分页状态并随会话保存 → 滚到顶不加载更早消息、点最上面一个红点毫无反应，
+// 切走再切回依然失效（用户原话「怎么都无法加载到最上面」）。
+// ---------------------------------------------------------------------------
+
+it('游标被清空时用已加载消息里最旧的 _msg_id 自愈，翻页重新可用', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  // 只剩尾部一页的坏状态：游标为 null、has_more 被写成 false
+  store.messages = [
+    { role: 'user', content: '尾部提问', _msg_id: 41221 },
+    { role: 'assistant', content: '尾部回答', tool_calls: [], execution_state: 'completed', _msg_id: 41222 },
+  ] as any;
+  store.historyHasMore = false;
+  store.historyOldestId = null;
+  const loadOlder = vi.fn().mockResolvedValue({
+    ok: true,
+    messages: [
+      { role: 'user', content: '更早提问', _msg_id: 41000 },
+      { role: 'assistant', content: '更早回答', tool_calls: [], _msg_id: 41001 },
+    ],
+    has_more: true,
+    oldest_id: 41000,
+  });
+  (window as any).pywebview = { api: { load_older_messages: loadOlder } };
+
+  await store.loadOlderMessages();
+
+  // 不再被守卫短路：以最旧 _msg_id 当游标真发了一次请求，并 prepend 到头部
+  expect(loadOlder).toHaveBeenCalledTimes(1);
+  expect(loadOlder).toHaveBeenCalledWith('s1', 41221);
+  expect(store.messages.map(m => m.content)).toEqual([
+    '更早提问', '更早回答', '尾部提问', '尾部回答',
+  ]);
+  expect(store.historyHasMore).toBe(true);
+  expect(store.historyOldestId).toBe(41000);
+});
+
+it('翻页失败（ok=false）保留原分页状态，不写成「没有更早历史」', async () => {
+  const store = useAppStore();
+  seedSession(store);
+  const loadOlder = vi.fn().mockResolvedValue({
+    ok: false, messages: [], has_more: false, oldest_id: null, msg: 'database is locked',
+  });
+  (window as any).pywebview = { api: { load_older_messages: loadOlder } };
+
+  await store.loadOlderMessages();
+
+  // 状态原样保留：下次滚动/跳转仍会重试，而不是永久关掉翻页
+  expect(store.historyHasMore).toBe(true);
+  expect(store.historyOldestId).toBe(100);
+  expect(store.historyLoading).toBe(false);
+  await store.loadOlderMessages();
+  expect(loadOlder).toHaveBeenCalledTimes(2);
+});

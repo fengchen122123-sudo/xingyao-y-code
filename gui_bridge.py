@@ -2503,12 +2503,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         session_name: str,
         before_id: Optional[int] = None,
         limit: int = HISTORY_PAGE_SIZE,
+        raise_on_error: bool = False,
     ) -> Tuple[List[Dict[str, Any]], bool, Optional[int]]:
         """分页读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。
 
         返回 (msgs, has_more, oldest_id)：oldest_id 取未过滤的本页最旧 DB 行
         _msg_id 作为翻页游标（role 过滤会丢 system 等消息，取过滤后首条会漏翻）；
         会话级 last_error 附加仅首页（before_id=None）执行，翻页页不携带。
+
+        raise_on_error=True（翻页路径专用）：读库失败时向上抛，绝不用「空页 +
+        has_more=False」冒充「已到最早」——前端会把该结论写进会话分页状态并随
+        会话保存，之后滚动到顶与红点跨页跳转永久失效（用户反馈过）。
         """
         msgs: List[Dict[str, Any]] = []
         has_more = False
@@ -2600,6 +2605,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         })
         except Exception:
             logger.debug("加载会话消息失败", exc_info=True)
+            if raise_on_error:
+                raise
         return msgs, has_more, oldest_id
 
     def load_older_messages(self, session_name: str, before_id: Any) -> Dict[str, Any]:
@@ -2623,9 +2630,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             names = set()
         if session_name not in names:
             return {"ok": False, "messages": [], "has_more": False, "oldest_id": None}
-        msgs, has_more, oldest_id = self._load_session_messages(
-            session_name, before_id=before_id
-        )
+        try:
+            msgs, has_more, oldest_id = self._load_session_messages(
+                session_name, before_id=before_id, raise_on_error=True
+            )
+        except Exception as e:
+            # 读库失败必须显式报错（ok=False）：前端据此保留原分页状态、下次重试，
+            # 而不是把「读失败」当成「已到最早」永久关掉翻页
+            logger.exception("加载更早历史失败: %s", session_name)
+            return {"ok": False, "messages": [], "has_more": False, "oldest_id": None, "msg": str(e)}
         return {"ok": True, "messages": msgs, "has_more": has_more, "oldest_id": oldest_id}
 
     # 红点导航预览上限：与前端 MessageNavRail 的悬停截断口径一致
@@ -3036,8 +3049,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         scope: str = "all",
         workdir: str = "",
         limit: int = 30,
+        include_archived: bool = False,
     ) -> Dict[str, Any]:
-        """会话多维度全局检索（标题模糊匹配 + 对话内容全文检索）。"""
+        """会话多维度全局检索（标题模糊匹配 + 对话内容全文检索）。
+
+        include_archived:
+          - 默认 False，排除已归档会话（既有调用方行为不变）
+          - True 时把已归档会话一并纳入检索范围
+        """
         try:
             if self._memory is None:
                 return {"ok": False, "msg": "后端未就绪", "results": [], "total": 0}
@@ -3052,6 +3071,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 workdir=target_workdir,
                 source="GUI",
                 limit=max(1, min(int(limit or 30), 100)),
+                include_archived=bool(include_archived),
             )
 
             results = []
@@ -3858,6 +3878,50 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("get_sessions 失败")
             return []
 
+    def get_archived_sessions(self) -> List[Dict[str, Any]]:
+        """归档会话列表（按归档时刻倒序）。
+
+        条目字段风格与 get_sessions 分组树里的会话条目一致（name / session_id /
+        display_name / count / workdir / is_global / updated_at），额外带
+        archived_at；归档区没有分组语义，故直接返回扁平列表供侧栏渲染。
+        """
+        try:
+            raw = self._memory.get_all_sessions(
+                workdir=None, source="GUI", include_empty=True, archived_only=True
+            )
+            items: List[Dict[str, Any]] = []
+            for s in raw:
+                name = s.get("name", "")
+                wdir = s.get("workdir")
+                is_global = (not wdir) or wdir == "GLOBAL"
+                items.append({
+                    "name": name,
+                    "session_id": s.get("id"),
+                    # 与 get_sessions 同一口径：默认名显示为「新会话」
+                    "display_name": "新会话" if re.match(r"^session_[a-f0-9]{6}$", name) else name,
+                    "count": s.get("count", 0),
+                    "workdir": "GLOBAL" if is_global else _resolve_real_path(wdir),
+                    "is_global": is_global,
+                    "updated_at": s.get("updated_at") or "",
+                    "archived_at": s.get("archived_at") or "",
+                })
+            # archived_at 是 ISO8601 文本，字符串倒序即时间倒序；
+            # 同一时刻归档的会话再按名称兜底，避免列表顺序抖动
+            items.sort(key=lambda it: (it["archived_at"], it["name"]), reverse=True)
+            return items
+        except Exception:
+            logger.exception("get_archived_sessions 失败")
+            return []
+
+    def _session_archived_at(self, session_name: str) -> Optional[str]:
+        """查询会话当前归档时刻（不存在 / 未归档返回 None）。"""
+        for s in self._memory.get_all_sessions(
+            workdir=None, include_empty=True, include_archived=True
+        ):
+            if s.get("name") == session_name:
+                return s.get("archived_at") or None
+        return None
+
     def create_session(self, title: str = "新会话", workdir: Optional[str] = None) -> Dict[str, Any]:
         try:
             new_name = f"session_{uuid.uuid4().hex[:6]}"
@@ -4034,6 +4098,199 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             }
         except Exception as e:
             logger.exception("delete_session 失败")
+            return {"ok": False, "success": False, "msg": str(e)}
+
+    def archive_session(self, session_name: str) -> Dict[str, Any]:
+        """归档会话：从侧栏主列表隐藏，可在归档区随时恢复（可逆，数据零损失）。
+
+        当前活跃会话禁止归档（与 CLI 会话管家的约束同源）：会话处于归档态却正在
+        被使用是自相矛盾的状态。成功后推送 session_archived，负载附带最新列表，
+        照 session_renamed 的推送模式，前端无需再算一遍。
+        """
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if session_name == self._current_session:
+                return {"ok": False, "msg": "不能归档当前活跃会话，请先切换到其它会话"}
+            if not self._memory.archive_session(session_name):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            archived_at = self._session_archived_at(session_name)
+            # 推送失败不能让前端误以为归档失败：DB 已生效，此时报失败更糟
+            try:
+                self.emit_event("session_archived", {
+                    "name": session_name,
+                    # 别名与 session_renamed 的 old_name/new_name 双字段风格一致
+                    "session_name": session_name,
+                    "archived_at": archived_at,
+                    "sessions": self.get_sessions(),
+                    "archived_sessions": self.get_archived_sessions(),
+                })
+            except Exception:
+                logger.exception("推送 session_archived 事件失败")
+            return {"ok": True, "name": session_name, "archived_at": archived_at}
+        except Exception as e:
+            logger.exception("archive_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def unarchive_session(self, session_name: str) -> Dict[str, Any]:
+        """取消归档：会话恢复回侧栏主列表；成功推送 session_unarchived。"""
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if not self._memory.unarchive_session(session_name):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            try:
+                self.emit_event("session_unarchived", {
+                    "name": session_name,
+                    "session_name": session_name,
+                    "archived_at": None,
+                    "sessions": self.get_sessions(),
+                    "archived_sessions": self.get_archived_sessions(),
+                })
+            except Exception:
+                logger.exception("推送 session_unarchived 事件失败")
+            return {"ok": True, "name": session_name, "archived_at": None}
+        except Exception as e:
+            logger.exception("unarchive_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    @staticmethod
+    def _normalize_session_names(session_names: Any) -> List[str]:
+        """批量会话操作的入参归一：非数组直接丢弃，去空白、去重、保持传入顺序。"""
+        if isinstance(session_names, str) or not isinstance(session_names, (list, tuple, set)):
+            return []
+        seen = set()
+        names: List[str] = []
+        for raw in session_names:
+            name = str(raw or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
+    def _emit_archive_batch_event(self, event_type: str, names: List[str],
+                                  failed: List[Dict[str, str]]) -> None:
+        """批量归档操作的单次事件推送：负载带最新两侧快照与失败项，前端直接采用。
+
+        不能在循环里逐条推送——前端每次都用负载快照覆盖列表，逐条推会反复
+        重算并互相覆盖，后到的旧快照还可能把已归档会话「复活」。推送失败不改判
+        操作结果（DB 已生效，此时报失败更糟，照 session_archived 的容错写法）。
+        """
+        try:
+            self.emit_event(event_type, {
+                "name": names[0] if names else "",
+                "session_name": names[0] if names else "",
+                "names": list(names),
+                "failed": list(failed),
+                "archived_at": None,
+                "sessions": self.get_sessions(),
+                "archived_sessions": self.get_archived_sessions(),
+            })
+        except Exception:
+            logger.exception("推送 %s 事件失败", event_type)
+
+    def unarchive_sessions(self, session_names: List[str]) -> Dict[str, Any]:
+        """批量取消归档（设置页归档区多选恢复）。
+
+        与单条 unarchive_session 同语义（可逆、幂等、不弹确认框），差别只在
+        一次处理多个会话、只推一次事件。单项失败不阻断其它项：成功的照常恢复，
+        失败的按 name/msg 回传给前端展示。
+        """
+        try:
+            names = self._normalize_session_names(session_names)
+            if not names:
+                return {"ok": False, "success": False, "msg": "会话名不能为空"}
+            restored: List[str] = []
+            failed: List[Dict[str, str]] = []
+            for name in names:
+                try:
+                    if self._memory.unarchive_session(name):
+                        restored.append(name)
+                    else:
+                        failed.append({"name": name, "msg": f"会话 {name} 不存在"})
+                except Exception as e:
+                    logger.exception("批量取消归档单项失败: %s", name)
+                    failed.append({"name": name, "msg": str(e)})
+            # 没有任何成功项时列表零变化，不推事件（避免前端白跑一次刷新）
+            if restored:
+                self._emit_archive_batch_event("session_unarchived", restored, failed)
+            return {
+                "ok": bool(restored),
+                "success": bool(restored),
+                "count": len(restored),
+                "names": restored,
+                "failed": failed,
+                "sessions": self.get_sessions(),
+                "archived_sessions": self.get_archived_sessions(),
+                "msg": "" if restored else "选中的会话都不存在",
+            }
+        except Exception as e:
+            logger.exception("unarchive_sessions 失败")
+            return {"ok": False, "success": False, "msg": str(e)}
+
+    def delete_archived_sessions(self, session_names: List[str]) -> Dict[str, Any]:
+        """批量删除归档会话（设置页归档区多选删除）。
+
+        与单条 delete_session 的差异有三点：
+
+        1. 只删「当前仍处于归档态」的会话——确认弹窗到落盘之间该会话可能已被别的
+           入口取消归档（甚至删除），此时跳过，而不是误删一个用户刚放回主列表的会话；
+        2. 逐项复查运行态，运行中的项拒绝删除且不阻断其它项（对照 delete_session 的
+           M21 保护：回合线程会继续往已删会话写消息，产生幽灵数据）；
+        3. 只推一次事件，负载带最新两侧快照。
+        """
+        try:
+            names = self._normalize_session_names(session_names)
+            if not names:
+                return {"ok": False, "success": False, "msg": "会话名不能为空"}
+            from core import permission_grants
+            from core.tools import clear_session_sandbox_bypass
+
+            deleted: List[str] = []
+            failed: List[Dict[str, str]] = []
+            for name in names:
+                try:
+                    # 状态漂移复查：已不在归档区的会话不删，只跳过并说明
+                    if not self._session_archived_at(name):
+                        failed.append({"name": name, "msg": "已不在归档区，已跳过"})
+                        continue
+                    with self._turn_start_lock:
+                        if self._is_turn_active(name):
+                            failed.append({
+                                "name": name,
+                                "msg": "该会话正在运行回合，请先停止或等待完成后再删除",
+                            })
+                            continue
+                        # 会话删除后排队消息一并丢弃
+                        self._message_queues.pop(name, None)
+                    self._memory.delete_session(name)
+                    permission_grants.clear_task(name)
+                    clear_session_sandbox_bypass(name)
+                    if self._current_session == name:
+                        # 归档会话不会是当前活跃会话（切换会话会自动取消归档），
+                        # 但并发入口下仍照单条删除防呆：删到当前会话就补建 GLOBAL 会话
+                        new_session = f"session_{uuid.uuid4().hex[:6]}"
+                        self._memory.create_session_explicit(new_session, workdir="GLOBAL", source="GUI")
+                        self._set_current_session(new_session)
+                    deleted.append(name)
+                except Exception as e:
+                    logger.exception("批量删除归档会话单项失败: %s", name)
+                    failed.append({"name": name, "msg": str(e)})
+            if deleted:
+                self._emit_archive_batch_event("session_deleted", deleted, failed)
+            return {
+                "ok": bool(deleted),
+                "success": bool(deleted),
+                "count": len(deleted),
+                "names": deleted,
+                "failed": failed,
+                "sessions": self.get_sessions(),
+                "archived_sessions": self.get_archived_sessions(),
+                "current_session": self._current_session,
+                "msg": "" if deleted else "选中的会话都不在归档区",
+            }
+        except Exception as e:
+            logger.exception("delete_archived_sessions 失败")
             return {"ok": False, "success": False, "msg": str(e)}
 
     def delete_folder_group(self, workdir: str) -> Dict[str, Any]:
