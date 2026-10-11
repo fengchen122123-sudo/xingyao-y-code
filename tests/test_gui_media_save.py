@@ -6,7 +6,7 @@ test_media_server.py）。本文件只验证桥接层四条路径：非法 URL �
 """
 
 import gui_bridge
-from gui_bridge import ApiBridge, _media_save_filename
+from gui_bridge import ApiBridge, _media_save_file_types, _media_save_filename
 
 MEDIA_URL = "http://127.0.0.1:5000/m/" + "a" * 64 + ".png?t=token"
 
@@ -47,6 +47,21 @@ def test_filename_strips_path_and_illegal_chars():
 def test_filename_falls_back_when_empty():
     assert _media_save_filename("   ", ".jpg") == "ycode-image.jpg"
     assert _media_save_filename("", ".jpg") == "ycode-image.jpg"
+
+
+def test_file_types_by_ext():
+    """视频扩展名走视频过滤器，其余（含空扩展名）沿用图片过滤器。"""
+    assert _media_save_file_types(".mp4") == ("视频文件 (*.mp4;*.webm)",)
+    assert _media_save_file_types(".webm") == ("视频文件 (*.mp4;*.webm)",)
+    assert _media_save_file_types(".MP4") == ("视频文件 (*.mp4;*.webm)",)
+    assert _media_save_file_types(".png") == ("图片文件 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.avif)",)
+    assert _media_save_file_types("") == ("图片文件 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.avif)",)
+
+
+def test_filename_video_fallback():
+    """视频空建议名回退为 ycode-video，不再落到 ycode-image。"""
+    assert _media_save_filename("", ".mp4") == "ycode-video.mp4"
+    assert _media_save_filename("   ", ".webm") == "ycode-video.webm"
 
 
 # ---- 桥接层 ----
@@ -118,3 +133,21 @@ def test_window_not_ready(monkeypatch, tmp_path):
 
     assert res["ok"] is False
     assert res["msg"]
+
+
+def test_save_video_uses_video_filter(monkeypatch, tmp_path):
+    """视频成功路径：对话框收到视频过滤器与带真实扩展名的默认文件名。"""
+    src = tmp_path / "blob.mp4"
+    src.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    dest = tmp_path / "out.mp4"
+    patch_resolve(monkeypatch, str(src))
+    window = FakeWindow([str(dest)])
+    bridge = make_bridge(window)
+
+    res = bridge.save_media_image(MEDIA_URL.replace(".png", ".mp4"), "演示视频")
+
+    assert res == {"ok": True, "path": str(dest)}
+    assert dest.read_bytes() == src.read_bytes()
+    _, kwargs = window.calls[0]
+    assert kwargs["file_types"] == ("视频文件 (*.mp4;*.webm)",)
+    assert kwargs["save_filename"] == "演示视频.mp4"

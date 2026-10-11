@@ -33,7 +33,7 @@ describe('renderMarkdown 媒体语法', () => {
     expect(html).not.toContain('data-file-link');
   });
 
-  it('图片带悬停"复制原图"按钮：data-copy-src 与图标，错误项/视频没有按钮', () => {
+  it('图片带悬停"复制原图"按钮：data-copy-src 与图标（视频只有另存为、无复制）', () => {
     const html = renderMarkdown('![图](a.png)\n[video: v](b.mp4)', { items: [img(0), video(1)] });
     expect(html).toContain('class="md-media-wrap"');
     expect((html.match(/md-img-copy"/g) || []).length).toBe(1);
@@ -43,7 +43,7 @@ describe('renderMarkdown 媒体语法', () => {
     expect(html.indexOf('md-img-copy')).toBeGreaterThan(html.indexOf('md-img'));
   });
 
-  it('图片带悬停"另存为"按钮：data-save-src 与建议文件名，视频没有按钮', () => {
+  it('图片带悬停"另存为"按钮：data-save-src 与建议文件名（视频按钮用独立类名）', () => {
     const html = renderMarkdown('![微信群二维码](a.png)\n[video: v](b.mp4)', { items: [img(0), video(1)] });
     expect((html.match(/md-img-save"/g) || []).length).toBe(1);
     expect(html).toContain(`data-save-src="${img(0).url}"`);
@@ -73,6 +73,28 @@ describe('renderMarkdown 媒体语法', () => {
     expect(html).toContain('<video class="md-video"');
     expect((html.match(/<img class="md-img"/g) || []).length).toBe(2);
     expect((html.match(/<video class="md-video"/g) || []).length).toBe(1);
+  });
+
+  it('视频带"另存为"按钮与 nodownload，原生 ⋮ 菜单不再出现下载项', () => {
+    const html = renderMarkdown('[video: 演示](demo.mp4)', { items: [video(0)] });
+    expect(html).toContain('controlslist="nodownload"');
+    expect(html).toContain('class="md-media-wrap md-video-wrap"');
+    expect(html).toContain('class="md-video-actions"');
+    expect((html.match(/md-video-save"/g) || []).length).toBe(1);
+    expect(html).toContain(`data-save-src="${video(0).url}"`);
+    expect(html).toContain('data-save-name="演示"');
+  });
+
+  it('视频不渲染"复制原图"按钮（剪贴板不承载视频）', () => {
+    const html = renderMarkdown('[video: v](b.mp4)', { items: [video(0)] });
+    expect(html).not.toContain('md-img-copy');
+    expect(html).not.toContain('data-copy-src');
+  });
+
+  it('视频 caption 缺失时 data-save-name 回退为 source_name', () => {
+    const item: MediaItem = { ...video(0), caption: '', source_name: 'demo.mp4' };
+    const html = renderMarkdown('[video:](demo.mp4)', { items: [item] });
+    expect(html).toContain('data-save-name="demo.mp4"');
   });
 
   it('error 项渲染为失败态提示', () => {
