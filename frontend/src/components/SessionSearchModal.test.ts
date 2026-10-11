@@ -98,3 +98,30 @@ it('搜索弹窗输入关键词并检索会话与展示高亮切片', async () =
   await items[0].trigger('click');
   expect(store.sessionSearchModal.show).toBe(false);
 });
+
+it('「包含已归档」开关默认关闭，开启后检索请求才带上 include_archived', async () => {
+  const search_sessions_full = vi.fn(async () => ({ ok: true, total: 0, results: [] }));
+
+  (window as any).pywebview = {
+    api: { search_sessions_full, switch_session: vi.fn(async () => ({ ok: true })) },
+  };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.openSessionSearchModal();
+  const wrapper = mount(SessionSearchModal, { global: { plugins: [pinia] } });
+
+  const toggle = wrapper.get('[data-test="search-include-archived"]');
+  expect((toggle.element as HTMLInputElement).checked).toBe(false);
+
+  await wrapper.get('[data-test="session-search-input"]').setValue('归档');
+  await new Promise((r) => setTimeout(r, 200));
+  await nextTick();
+  // 默认关闭：保持原有 4 参签名不变（旧后端不接受第 5 参）
+  expect(search_sessions_full).toHaveBeenLastCalledWith('归档', 'all', undefined, 30);
+
+  await toggle.setValue(true);
+  await new Promise((r) => setTimeout(r, 0));
+  expect(search_sessions_full).toHaveBeenLastCalledWith('归档', 'all', undefined, 30, true);
+});

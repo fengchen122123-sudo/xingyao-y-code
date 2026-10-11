@@ -692,7 +692,9 @@ async function maybeLoadOlder() {
   const el = chatScrollRef.value;
   if (!el || el.scrollTop >= 120) return;
   // 调用方已保证本次是「用户滚动」来源；跳转/补偿等程序化滚动不会走到这里
-  if (!store.historyHasMore || store.historyLoading) return;
+  // 守卫与 store 的翻页守卫同源：has_more=false 但游标为空 = 分页状态未初始化/
+  // 被失败响应清空，此时仍要进 store 走一次自愈 + 真实翻页，否则滚到顶永远不加载
+  if (!(store.historyHasMore || store.historyOldestId == null) || store.historyLoading) return;
   const oldHeight = el.scrollHeight;
   const oldTop = el.scrollTop;
   // 用户接管检测：校正期间用户若主动滚动就立即让位。触发翻页那一瞬的惯性
@@ -748,6 +750,9 @@ async function maybeLoadOlder() {
 // 不补偿就会「一直跳动」；补偿后再让出一帧渲染，避免批量变化把锚点冲垮。
 // 跳转已由 rail 的 jumpStart 退出跟随（following=false），翻页期间内容变化
 // 不再吸底，无需任何抑制窗口；seq 令牌保证连续点击时旧循环立即让位。
+// 终止条件不信任 store.historyHasMore：该标记可能是过期值或被失败响应清空，
+// 一旦如此跨页跳转会直接放弃（点最上面的红点毫无反应，用户反馈过）。改为
+// 真调一次翻页、按「已加载首条 / 游标是否推进」判定还有没有更早历史。
 let navJumpSeq = 0;
 async function onNavJump(payload: { index: number; id: number }) {
   const seq = ++navJumpSeq;
@@ -759,8 +764,8 @@ async function onNavJump(payload: { index: number; id: number }) {
     if (seq !== navJumpSeq) return; // 新跳转接管：旧循环退出
     if (store.currentSessionName !== sessionAtJump) return; // 切会话：放弃跳转
     const first = store.firstLoadedMsgId;
-    if (first !== null && payload.id >= first) break;
-    if (!store.historyHasMore) break;
+    if (first !== null && payload.id >= first) break; // 目标已进入已加载区
+    const cursorBefore = store.historyOldestId;
     const oldHeight = el?.scrollHeight ?? 0;
     const oldTop = el?.scrollTop ?? 0;
     await store.loadOlderMessages();
@@ -769,6 +774,9 @@ async function onNavJump(payload: { index: number; id: number }) {
     if (seq !== navJumpSeq) return;
     // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加
     el.scrollTop = el.scrollHeight - oldHeight + oldTop;
+    // 无进展（游标未推进、已加载首条也未变）= 真的没有更早历史（或本次读库失败）：
+    // 停止翻页，交回 rail 把视口停在已加载区最上面
+    if (store.historyOldestId === cursorBefore && store.firstLoadedMsgId === first) break;
     // 让出一帧：给布局/anchoring 落地时间，下一轮 prepend 不在同一帧内叠加
     await new Promise<void>((resolve) => {
       window.requestAnimationFrame(() => resolve());
