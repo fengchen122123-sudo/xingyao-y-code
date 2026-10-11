@@ -115,6 +115,22 @@ docs/合规审查报告*
 docs/合规整改方案*
 docs/PII*
 
+# 内部审查/弱点报告（英文命名）：公开仓库即泄漏弱点清单，禁止入库/推送（A2-01）
+# 根目录审查与系统审查报告
+/代码审查与优化报告.md
+/系统审查报告-*.md
+# docs 顶层治理/审查/计算机控制测试报告
+docs/AUDIT-REMEDIATION-REPORT.md
+docs/REVIEW_TODO_*.md
+docs/HANDOVER-*.md
+docs/computer-audit-*
+docs/computer-control-audit-*
+docs/computer-control-repair-*
+docs/computer-repair-*
+docs/memory-compression-repair-*
+# superpowers 开发文档（plans/specs/reviews）整体不再跟踪
+docs/superpowers/
+
 hunyuan_*.jpg
 tokenrhythm_*.png
 .tmp_skill_src/

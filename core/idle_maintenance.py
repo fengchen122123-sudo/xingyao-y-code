@@ -21,6 +21,9 @@ except Exception:  # pragma: no cover - memory_compressor 导入失败时保持�
 
 _LOGGER = logging.getLogger(__name__)
 
+# 孤儿 Blob 回收最短间隔（秒）：需全库扫媒体清单，闲时维护节流为每小时至多一次
+BLOB_GC_MIN_INTERVAL_SECONDS = 3600
+
 
 def get_idle_maintenance_seconds():
     """闲时维护触发延时（秒，0 关闭）；读 config 失败回落默认值。"""
@@ -49,6 +52,7 @@ class IdleMaintenanceService:
         self._cancel_events = {}  # 在跑闲时压缩的协作取消事件
         self._thread = None
         self._shutdown = False
+        self._last_blob_gc_at = None  # 上次孤儿 Blob 回收时间（monotonic，节流用）
 
     # ── 入口层接线 API ────────────────────────────────────────────────────
 
@@ -173,6 +177,22 @@ class IdleMaintenanceService:
             manager.maintain_tool_results(session, tier=2)
         except Exception:
             _LOGGER.debug("会话 %s 闲时本地维护失败", session, exc_info=True)
+
+        # 媒体仓库治理（免费本地维护）：每次闲时清超期 .part 残留（目录通常
+        # 为空，成本极低）；孤儿 Blob 回收需全库扫媒体清单，按最短间隔节流。
+        try:
+            from core.media_store import prune_orphan_blobs, prune_orphan_tmp
+
+            prune_orphan_tmp()
+            now = time.monotonic()
+            if (
+                self._last_blob_gc_at is None
+                or now - self._last_blob_gc_at >= BLOB_GC_MIN_INTERVAL_SECONDS
+            ):
+                self._last_blob_gc_at = now
+                prune_orphan_blobs(manager.iter_referenced_media_digests())
+        except Exception:
+            _LOGGER.debug("会话 %s 闲时媒体仓库治理失败", session, exc_info=True)
 
         if cancel_event.is_set():
             return

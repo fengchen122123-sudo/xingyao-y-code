@@ -52,20 +52,76 @@ def test_glm53_variant_names_inherit_family_capability():
 
 
 def test_glm53_prefix_rule_does_not_spill_to_other_glm_generations():
-    """前缀规则只作用于 glm-5.3 家族，其他代际未知变体仍按未适配处理。"""
+    """前缀规则只作用于 glm-5.3 家族，其他代际未知变体不继承其强制思考能力。
+
+    glm-5.4 / glm-5.2-plus 等未登记代际走兜底通用强度（可关可定档），而不是
+    glm-5.3 那套不可关闭的 low/high/max 强度档。
+    """
     for name in ("glm-5.4", "glm-5.2-plus", "my-glm-5.3-clone"):
-        assert get_reasoning_capability(name).kind == "hidden", name
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "off", "low", "medium", "high", "max"), name
+        assert capability.request_strategy == "effort_switch", name
 
 
-def test_non_deepseek_unknown_models_stay_hidden():
-    """deepseek 前缀规则不得外溢：其他未登记模型仍按未适配处理。"""
+def test_prefix_rules_do_not_leak_to_lookalike_names():
+    """deepseek/agnes/glm-5.3 前缀规则不得外溢到形似而并非该家族的模型名。
+
+    my-deepseek-clone / my-agnes-clone 这类名字不以家族名开头，因此不会命中
+    前缀规则，只能落到未登记模型的兜底通用强度能力。
+    """
     for name in (
         "some-future-model",
         "my-deepseek-clone",
         "my-agnes-clone",
         "qwen3.9-max",
     ):
-        assert get_reasoning_capability(name).kind == "hidden", name
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "off", "low", "medium", "high", "max"), name
+        assert capability.request_strategy == "effort_switch", name
+
+
+def test_unregistered_models_fall_back_to_generic_effort():
+    """未登记模型不能因为没进能力表就隐藏 GUI 思考按钮。
+
+    未登记模型统一返回通用强度能力：kind=effort、六档 默认/关闭/低/中/高/最高、
+    request_strategy=effort_switch，由用户在 GUI 上自行选择是否注入 reasoning_effort。
+    """
+    for name in (
+        "hy4-preview",
+        "openai/hy4-preview",
+        "muse-spark-1.3-contributor-free",
+        "nemotron-3-ultra-free",
+        "mimo-v2.5-free",
+        "LongCat-2.5-Preview",
+        "intern-latest",
+        "senseaudio-s2",
+        "cn:kimi-k3-1",
+        "https://gateway.example/v1/some-custom-model",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "off", "low", "medium", "high", "max"), name
+        assert capability.request_strategy == "effort_switch", name
+
+
+def test_explicitly_hidden_models_stay_hidden():
+    """已确认不支持思考、显式登记为 hidden 的模型必须继续保持隐藏。
+
+    这些模型与"只是没登记的新模型"不同：它们的隐藏是精确事实，兜底通用
+    开关能力不能把它们重新变成可见。
+    """
+    for name in (
+        "sensenova-6.7-flash-lite",
+        "step-explore",
+        "doubao-seed-evolving",
+        "ark-code-latest",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "hidden", name
+        assert capability.options == (), name
+        assert capability.request_strategy == "hidden", name
 
 
 def test_agnes_prefixed_names_resolve_to_toggle_capability():
@@ -130,8 +186,8 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         assert get_reasoning_capability(model_name).options == options
 
 
-def test_fixed_models_are_visible_locked_on_and_unknown_models_are_hidden():
-    """固定思考必须显示为禁用的开启；未知或动态模型不能获得猜测档位。"""
+def test_fixed_models_are_visible_locked_on_and_explicit_hidden_models_are_hidden():
+    """固定思考必须显示为禁用的开启；显式登记为不支持思考的模型必须隐藏。"""
     for model_name in (
         "kimi-k2.7-code",
         "minimax-m2.5",
@@ -144,6 +200,7 @@ def test_fixed_models_are_visible_locked_on_and_unknown_models_are_hidden():
             "disabled": True,
             "disabled_reason": "该模型始终开启思考",
             "choice": "on",
+            "default_choice": "",
             "options": [],
         }
 
@@ -152,12 +209,46 @@ def test_fixed_models_are_visible_locked_on_and_unknown_models_are_hidden():
         "step-explore",
         "doubao-seed-evolving",
         "ark-code-latest",
-        "some-future-model",
     ):
         hidden = build_reasoning_snapshot({"name": model_name})
         assert hidden["kind"] == "hidden"
         assert hidden["visible"] is False
         assert hidden["options"] == []
+
+    for model_name in ("some-future-model", "hy4-preview"):
+        fallback = build_reasoning_snapshot({"name": model_name})
+        assert fallback["kind"] == "effort"
+        assert fallback["visible"] is True
+        assert fallback["options"] == [
+            {"value": "default", "label": "默认"},
+            {"value": "off", "label": "关闭"},
+            {"value": "low", "label": "低"},
+            {"value": "medium", "label": "中"},
+            {"value": "high", "label": "高"},
+            {"value": "max", "label": "最高"},
+        ]
+
+
+def test_unregistered_model_snapshot_exposes_effort_menu():
+    """未登记模型的 GUI 快照必须给出可操作的通用六档强度菜单。"""
+    snapshot = build_reasoning_snapshot({"name": "hy4-preview"})
+    assert snapshot == {
+        "kind": "effort",
+        "visible": True,
+        "disabled": False,
+        "disabled_reason": "",
+        "choice": "default",
+        "default_choice": "",
+        "options": [
+            {"value": "default", "label": "默认"},
+            {"value": "off", "label": "关闭"},
+            {"value": "low", "label": "低"},
+            {"value": "medium", "label": "中"},
+            {"value": "high", "label": "高"},
+            {"value": "max", "label": "最高"},
+        ],
+    }
+    assert build_reasoning_snapshot({"name": "hy4-preview"}, "high")["choice"] == "high"
 
 
 def test_snapshot_serializes_labels_in_capability_order():
@@ -171,3 +262,36 @@ def test_snapshot_serializes_labels_in_capability_order():
         {"value": "medium", "label": "中"},
         {"value": "xhigh", "label": "超高"},
     ]
+
+
+def test_builtin_default_choice_only_for_models_with_official_facts():
+    """内置默认档位只填有官方依据的模型，其余留空，绝不编造。"""
+    assert get_reasoning_capability("deepseek-v4-pro").default_choice == "high"
+    assert get_reasoning_capability("deepseek-flash").default_choice == "high"
+    assert get_reasoning_capability("openai/DeepSeek-v9-future").default_choice == "high"
+    assert get_reasoning_capability("kimi-for-coding").default_choice == "max"
+    assert get_reasoning_capability("sensenova-6.8-flash-lite").default_choice == "medium"
+    assert get_reasoning_capability("mimo-v2.6-pro").default_choice == "on"
+
+    for name in (
+        "k3",
+        "glm-5",
+        "glm-5.2",
+        "glm-5.3",
+        "qwen3.7-max",
+        "qwen3.8-max",
+        "seed-2.1-turbo",
+        "kimi-k2.6",
+        "step-3.7-flash",
+        "hy4-preview",
+    ):
+        assert get_reasoning_capability(name).default_choice == "", name
+
+
+def test_snapshot_carries_builtin_default_choice():
+    """快照必须带上内置默认档位，前端据此自动预选。"""
+    assert build_reasoning_snapshot({"name": "deepseek-v4-pro"})["default_choice"] == "high"
+    assert build_reasoning_snapshot({"name": "kimi-for-coding"})["default_choice"] == "max"
+    assert build_reasoning_snapshot({"name": "k3"})["default_choice"] == ""
+    assert build_reasoning_snapshot({"name": "kimi-k2.7-code"})["default_choice"] == ""
+    assert build_reasoning_snapshot({"name": "sensenova-6.7-flash-lite"})["default_choice"] == ""

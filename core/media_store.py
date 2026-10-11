@@ -147,6 +147,7 @@ def archive_media_file(path: str, workdir: str | None = None) -> dict:
 
     ext = SUPPORTED_MIME[mime]
     digest = hashlib.sha256()
+    tmp_name = None
     try:
         os.makedirs(MEDIA_BLOBS_DIR, exist_ok=True)
         os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
@@ -163,12 +164,22 @@ def archive_media_file(path: str, workdir: str | None = None) -> dict:
         if os.path.exists(blob_path):
             # 去重命中：内容寻址保证同名即同内容，丢弃临时副本直接复用
             os.remove(tmp_name)
+            tmp_name = None
         else:
             os.replace(tmp_name, blob_path)
+            tmp_name = None
     except MediaStoreError:
         raise
     except OSError as exc:
         raise MediaStoreError("repo_unwritable", f"媒体仓库写入失败: {exc}") from exc
+    finally:
+        # 失败路径（源文件读失败 / 写盘失败 / os.replace 失败等）不留 .part
+        # 残留；成功路径 tmp_name 已置 None，无需也不能再删（文件已入库）
+        if tmp_name is not None:
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
 
     width = height = None
     if mime.startswith("image/"):
@@ -227,4 +238,43 @@ def prune_orphan_tmp(max_age_seconds: int = 24 * 3600) -> int:
                 continue
     except OSError:
         pass
+    return removed
+
+
+# 孤儿 Blob 回收宽限期（秒）：刚归档的文件在宽限期内一律保留——消息落库、
+# 输入框缩略图展示等引用建立存在时间差，只回收"确定无引用且已过期"的 Blob。
+ORPHAN_BLOB_GRACE_SECONDS = 24 * 3600
+
+
+def prune_orphan_blobs(
+    referenced_digests, max_age_seconds: int = ORPHAN_BLOB_GRACE_SECONDS
+) -> int:
+    """回收未被消息引用的孤儿 Blob，返回删除数（内容寻址仓库的增量 GC）。
+
+    删除会话/消息不会联动删除 Blob（仓库与数据库解耦），本函数是唯一回收
+    通道，由闲时维护按小时节流调用。``referenced_digests`` 由消息层给出
+    （全库媒体清单引用的摘要集合）：摘要命中或 mtime 在宽限期内的一律保留；
+    只删超过宽限期的无引用文件，失败残留与废弃归档因此最终会被清理。
+    """
+    refs = set(referenced_digests or ())
+    now = time.time()
+    removed = 0
+    try:
+        names = os.listdir(MEDIA_BLOBS_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        # 只处理规范 Blob 文件名；tmp 子目录等非规范名一律不动
+        # （tmp 残留由 prune_orphan_tmp 负责）
+        if not blob_name_is_safe(name):
+            continue
+        if name.split(".", 1)[0] in refs:
+            continue
+        path = os.path.join(MEDIA_BLOBS_DIR, name)
+        try:
+            if now - os.path.getmtime(path) > max_age_seconds:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
     return removed

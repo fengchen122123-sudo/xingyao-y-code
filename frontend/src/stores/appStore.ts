@@ -580,6 +580,11 @@ export const useAppStore = defineStore('app', {
       agent_turn_step_limit: 200,
       agent_turn_step_limit_min: 10,
       agent_turn_step_limit_max: 1000,
+      // 上下文水位基准：默认未设置（null，跟随模型真实窗口），
+      // 真实值一律以后端快照覆盖
+      context_watermark_base: null,
+      context_watermark_base_min: 50000,
+      context_watermark_base_max: 2000000,
       // AI 生成内容目录：默认目录与生效路径一律以后端快照覆盖，前端不猜路径
       ai_output_dir: '',
       ai_output_dir_setting: '',
@@ -966,9 +971,21 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return state.backgroundTasks.filter(t => t.session_id === sess);
     },
 
-    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示
+    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示。
+    // 注意：这是全局判据（RightPanel 自动登记操控页签也用它），不区分会话
     computerControlBarVisible(state): boolean {
       return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
+    },
+
+    // 顶部安全条的会话归属（对齐 currentSessionBackgroundTasks 的既有约定）：
+    // 只在本会话发起的 run 里渲染，run 在 A 会话启动、用户正看 B 会话时不串显；
+    // 归属未知（owner_session_id 为空，如旧后端快照）时回落显示，
+    // 避免用户失去条上的暂停/停止入口
+    computerBarVisibleInCurrentSession(state): boolean {
+      if (!COMPUTER_BAR_STATUSES.includes(state.computerRun.status)) return false;
+      const owner = state.computerRun.owner_session_id;
+      if (!owner) return true;
+      return owner === state.currentSessionName;
     },
 
     // run 是否处于终态：驱动页签关闭入口与终态自动关闭计时
@@ -2460,6 +2477,21 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 按模型名预览思考能力（新增/改名时用）：仅查询不落库，
+    // 失败或异常一律返回 null，由调用方跳过更新，不弹提示打扰用户
+    async getReasoningSnapshotByName(modelName: string) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_reasoning_snapshot_by_name(modelName);
+        if (res && res.ok) return res.reasoning;
+        return null;
+      } catch (err) {
+        this.connected = false;
+        return null;
+      }
+    },
+
     async setPermissionMode(mode: PermissionMode) {
       const prev = this.permissionMode;
       const api = this._api();
@@ -2691,6 +2723,27 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.systemSettings = previous;
         this.connected = false;
         this.notifyModal('系统设置', '单任务最大模型轮次设置失败: ' + err);
+        return false;
+      }
+    },
+
+    async setContextWatermarkBase(value: number): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_context_watermark_base(value);
+        if (result && result.ok) {
+          this.systemSettings = result.settings;
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + err);
         return false;
       }
     },
@@ -4914,6 +4967,24 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 删除自定义 MCP 服务：从 mcp.json 移除配置，结果通过 mcp_status 事件回推
+    async removeMcpServer(name: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.remove_mcp_server(name);
+        if (res && res.ok) {
+          this.mcps = res.mcps || this.mcps;
+          this.notifyModal('MCP 服务', res.msg || '已删除');
+        } else {
+          this.notifyModal('MCP 服务', '删除失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('MCP 服务', '删除 MCP 服务失败: ' + err);
+      }
+    },
+
     async refreshPlugins() {
       const api = this._api();
       if (!api) return;
@@ -4935,6 +5006,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const res = await api.toggle_plugin(name, enabled);
         if (res && res.ok) {
           this.plugins = res.plugins || this.plugins;
+          // 插件启停会增删 provider 与模型（opencode_zen 启用时自举 provider、
+          // 禁用时按来源标记回收），只更新 plugins 会让模型列表停在旧快照，
+          // 用户必须重启星瑶才能看到变化。与 add_provider 同一模式：
+          // 后端回传 settings 就即时应用，模型选择器随开关立即刷新。
+          if (res.settings) this.applyModelSettings(res.settings);
           this.notifyModal('插件', res.msg || '插件状态已更新');
         } else {
           this.notifyModal('插件', '插件状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -5690,11 +5766,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
+    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
+        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
@@ -5711,11 +5787,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
+    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
+        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
           this.notifyModal('模型', res.msg || '模型已更新');
