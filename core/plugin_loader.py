@@ -71,6 +71,45 @@ def get_plugin_infos() -> list[dict]:
     return [dict(info) for info in _PLUGIN_INFOS]
 
 
+def call_plugin_hook(plugin_name: str, hook_name: str, payload: dict | None = None) -> dict:
+    """调用已加载插件的可选钩子（如 ``plugin_settings``）。
+
+    安全边界：只对"已加载（=已信任 + 已启用）"的插件调用；未加载时返回
+    ``needs`` 指引（"trust" / "enable"），绝不执行未加载插件的代码。
+
+    返回约定：
+    - 成功：``{"ok": True, "data": <钩子原样返回的 dict>}``
+    - 失败：``{"ok": False, "message": str, "needs": "trust"|"enable"|None}``
+    """
+    name = str(plugin_name or "").strip()
+    if not name:
+        return {"ok": False, "message": "插件名不能为空", "needs": None}
+    module = _LOADED_MODULES.get(name)
+    if module is None:
+        status = ""
+        for info in _PLUGIN_INFOS:
+            if str(info.get("name") or "") == name:
+                status = str(info.get("status") or "")
+                break
+        needs = "trust" if status == "untrusted" else "enable"
+        if status == "disabled":
+            message = f"插件 {name} 未启用，启用后即可配置"
+        else:
+            message = f"插件 {name} 尚未加载（{status or '未安装'}）"
+        return {"ok": False, "message": message, "needs": needs}
+    hook = getattr(module, hook_name, None)
+    if not callable(hook):
+        return {"ok": False, "message": f"插件 {name} 未提供 {hook_name}", "needs": None}
+    try:
+        result = hook(payload if payload is not None else {})
+    except Exception as exc:
+        _logger.exception("插件 %s 的钩子 %s 调用失败", name, hook_name)
+        return {"ok": False, "message": f"插件 {name} 的 {hook_name} 执行失败: {exc}", "needs": None}
+    if not isinstance(result, dict):
+        return {"ok": False, "message": f"插件 {name} 的 {hook_name} 返回值必须是 dict", "needs": None}
+    return {"ok": True, "data": result}
+
+
 # ─── 插件信任机制：首次加载/指纹变化需确认 ─────────────────────────
 
 # 已确认指纹持久化文件：{str(plugin_dir.resolve()): fingerprint}
@@ -504,6 +543,32 @@ def _load_one(plugin_dir: Path, registry) -> str:
     return name
 
 
+def _unload_removed_plugin(name: str, tools: list, registry) -> None:
+    """插件目录被删除后的运行期清理：注销工具并调用插件的 cleanup 钩子。
+
+    为什么需要：refresh_plugins 此前只清信息记录；已加载插件的工具仍挂在
+    registry、cleanup 不会被调用（如 provider 自举的回收）。目录删除不经过
+    toggle 流程，这里是唯一的清理点。每一步独立隔离，单项失败不影响其余
+    清理与后续扫描。
+    """
+    if not name:
+        return
+    module = _LOADED_MODULES.pop(name, None)
+    if module is None:
+        return
+    cleanup = getattr(module, "cleanup", None)
+    if callable(cleanup):
+        try:
+            cleanup()
+        except Exception:
+            _logger.exception("插件 %s 被删除后 cleanup 执行失败，已跳过", name)
+    for tool_name in tools or []:
+        try:
+            registry.unregister(str(tool_name))
+        except Exception as exc:
+            _logger.warning("插件 %s 被删除后注销工具 %s 失败: %s", name, tool_name, exc)
+
+
 def refresh_plugins(registry=None) -> None:
     """增量刷新插件信息：加载运行期间新安装的插件，移除已从磁盘删除的记录。
 
@@ -514,11 +579,16 @@ def refresh_plugins(registry=None) -> None:
     if registry is None:
         registry = _live_registry()
 
-    # 1) 移除磁盘上已删除（plugin.json 不存在）的插件记录
+    # 1) 移除磁盘上已删除（plugin.json 不存在）的插件记录；已加载的做完整卸载
     for info in list(_PLUGIN_INFOS):
         path = info.get("path")
         if path and not (Path(path) / "plugin.json").is_file():
             _PLUGIN_INFOS.remove(info)
+            _unload_removed_plugin(
+                str(info.get("name") or ""),
+                list(info.get("tools") or []),
+                registry,
+            )
 
     known_paths = {str(info.get("path") or "") for info in _PLUGIN_INFOS}
     # 已被占用的插件名（overridden 记录不占用：它是被同名压制的那个）
