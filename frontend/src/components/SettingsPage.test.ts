@@ -417,19 +417,21 @@ describe('SettingsPage', () => {
     const wrapper = mount(SettingsPage);
 
     await wrapper.get('[data-test="provider-p1"]').trigger('click');
-    const input = wrapper.get('[data-test="provider-api-key"]');
-    expect(input.attributes('type')).toBe('password');
+    const textarea = wrapper.get('[data-test="provider-api-key"]');
+    // textarea 不支持 type=password：隐藏态改由 key-masked class（-webkit-text-security: disc）实现
+    expect(textarea.attributes('type')).toBeUndefined();
+    expect(textarea.classes()).toContain('key-masked');
 
     await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
     await flushPromises();
 
     expect(spy).toHaveBeenCalledWith('p1');
-    expect((input.element as HTMLInputElement).value).toBe('sk-real-key');
-    expect(input.attributes('type')).toBe('text');
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('sk-real-key');
+    expect(textarea.classes()).not.toContain('key-masked');
 
     await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
     await flushPromises();
-    expect(input.attributes('type')).toBe('password');
+    expect(textarea.classes()).toContain('key-masked');
   });
 
   it('does not reveal when the key cannot be loaded', async () => {
@@ -441,7 +443,7 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
     await flushPromises();
 
-    expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
+    expect(wrapper.get('[data-test="provider-api-key"]').classes()).toContain('key-masked');
   });
 
   it('adds and removes a command permission rule', async () => {
@@ -488,8 +490,29 @@ describe('SettingsPage', () => {
     await flushPromises();
 
     expect(writeText).toHaveBeenCalledWith('sk-real-key');
-    // 复制后输入框仍为掩码态，仅剪贴板拿到明文
-    expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
+    // 复制后仍为掩码态，仅剪贴板拿到明文
+    expect(wrapper.get('[data-test="provider-api-key"]').classes()).toContain('key-masked');
+  });
+
+  it('saves a multi-line API key as-is through updateProvider', async () => {
+    const store = useAppStore();
+    const updateSpy = vi.spyOn(store, 'updateProvider').mockResolvedValue({ ok: true } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const textarea = wrapper.get('[data-test="provider-api-key"]');
+    expect(textarea.element.tagName).toBe('TEXTAREA');
+    // 多 Key：一行一个；保存时原样（含换行）传给后端
+    await textarea.setValue('k1\nk2');
+    await textarea.trigger('input');
+
+    const saveButton = wrapper.findAll('button').find(button => button.text() === '保存厂商配置');
+    expect(saveButton).toBeDefined();
+    await saveButton!.trigger('click');
+    await flushPromises();
+
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    expect(updateSpy).toHaveBeenCalledWith('p1', '测试厂商', 'https://api.example.com', 'k1\nk2', 'responses');
   });
 
   it('renders the disclaimer document with all clauses intact', async () => {

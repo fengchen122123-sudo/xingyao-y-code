@@ -53,6 +53,7 @@ from core.model_manager import (
     add_provider as mm_add_provider,
     delete_provider as mm_delete_provider,
     delete_model as mm_delete_model,
+    effective_provider_api_key,
     get_active_model,
     get_model_reasoning_choice,
     get_secondary_roles,
@@ -9646,7 +9647,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             base_url = str(provider.get("base_url") or "").strip()
             if not base_url:
                 return {"ok": False, "msg": "该厂商未配置 Base URL"}
-            api_key = str(provider.get("api_key") or "")
+            # 多 Key provider：取 Key 池「当前该用」的单 Key 进鉴权头，绝不把
+            # 多行串整体塞进 Authorization（拉列表非对话链路，此处不做轮换）
+            api_key = str(effective_provider_api_key(provider) or "")
             # base_url 可能已含版本段（OpenAI 惯例 …/v1，阶跃 step_plan/v1），
             # 也可能是裸端点（如 …/step_plan）：前者直接拼 /models，后者补 /v1/models，
             # 绝不能重复拼出版本段（曾出现 /v1/v1/models 404）。
@@ -9779,6 +9782,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 return {"ok": False, "msg": f"未找到模型: {model_id}"}
 
             result: Dict[str, Any] = {}
+            # 多 Key provider：取 Key 池「当前该用」的单 Key 发起探测；
+            # 错误文本按同一单 Key 脱敏（_sanitize_for_ui 逻辑不变）
+            effective_key = str(effective_provider_api_key(provider) or "")
 
             def _ping():
                 try:
@@ -9788,7 +9794,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         provider.get("protocol", "openai"),
                         {
                             "model": target.get("litellm_model"),
-                            "api_key": provider.get("api_key") or "",
+                            "api_key": effective_key,
                             "api_base": provider.get("base_url") or None,
                             "messages": [{"role": "user", "content": "ping"}],
                             "stream": True,
@@ -9803,7 +9809,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     result["msg"] = "连接成功"
                 except Exception as e:
                     result["ok"] = False
-                    result["msg"] = _sanitize_for_ui(str(e), provider.get("api_key"))[:300]
+                    result["msg"] = _sanitize_for_ui(str(e), effective_key)[:300]
 
             thread = threading.Thread(target=_ping, daemon=True, name="gui-test-model")
             thread.start()

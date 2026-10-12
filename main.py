@@ -5742,7 +5742,11 @@ def run_cli():
         try:
             key_input = input("👉 API Key: ").strip()
             if key_input:
-                current_key = key_input
+                # 多 Key（换行/逗号/分号分隔）：运行时先用首个 Key；完整原文照常
+                # 写入配置，后续所有读取统一走 Key 池（get_active_model → 单 Key）。
+                from core.provider_keys import split_provider_keys
+                _parsed_keys = split_provider_keys(key_input)
+                current_key = _parsed_keys[0] if _parsed_keys else key_input
                 _sync_active_model_context()
                 from core.model_manager import load_config, _write_config
                 cfg = load_config()
