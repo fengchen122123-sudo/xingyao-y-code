@@ -484,6 +484,106 @@ def test_extra_headers_win_over_hardcoded_tokenrhythm_header():
 
 
 # ---------------------------------------------------------------------------
+# 会话关联头：X-Session-Id（本地会话与服务端调用日志关联）
+# ---------------------------------------------------------------------------
+
+def test_session_id_header_added_when_thread_session_bound():
+    """绑定执行会话时，两条路由的请求头都带上 X-Session-Id。"""
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session("session_a1b2c3")
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+        )
+        assert headers["X-Session-Id"] == "session_a1b2c3"
+
+        _a_url, anthropic_headers = nt._anthropic_resolve_endpoint(
+            api_base="https://api.anthropic.com",
+            api_key="k",
+            extra_headers=None,
+        )
+        assert anthropic_headers["X-Session-Id"] == "session_a1b2c3"
+    finally:
+        app_context.set_thread_session(old)
+
+
+def test_session_id_header_percent_encoded_for_non_ascii():
+    """中文会话名 percent-encode 成纯 ASCII 头值，服务端 URL-decode 可还原。"""
+    from urllib.parse import unquote
+
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session("调试会话1")
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+        )
+        encoded = headers["X-Session-Id"]
+        assert encoded == "%E8%B0%83%E8%AF%95%E4%BC%9A%E8%AF%9D1"
+        assert encoded.isascii()
+        assert unquote(encoded) == "调试会话1"
+    finally:
+        app_context.set_thread_session(old)
+
+
+def test_session_id_header_omitted_without_bound_session():
+    """无会话上下文（单测 / headless）不携带该头，保证既有请求字节不变。"""
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session(None)
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+        )
+        assert "X-Session-Id" not in headers
+
+        _a_url, anthropic_headers = nt._anthropic_resolve_endpoint(
+            api_base="https://api.anthropic.com",
+            api_key="k",
+            extra_headers=None,
+        )
+        assert "X-Session-Id" not in anthropic_headers
+    finally:
+        app_context.set_thread_session(old)
+
+
+def test_extra_headers_win_over_builtin_session_id_header():
+    """配置的 extra_headers 可覆盖内置 X-Session-Id——由现有合并顺序保证。"""
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session("session_a1b2c3")
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+            extra_headers={"X-Session-Id": "custom-session"},
+        )
+        assert headers["X-Session-Id"] == "custom-session"
+    finally:
+        app_context.set_thread_session(old)
+
+
+# ---------------------------------------------------------------------------
 # 渠道请求形态覆盖零影响（V2）：未配置 route_request_overrides 时请求头逐字节不变
 # ---------------------------------------------------------------------------
 

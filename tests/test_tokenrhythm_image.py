@@ -235,8 +235,8 @@ class GenerateImageTest(unittest.TestCase):
         self.assertIn("base64", result.content)
 
     def test_generate_request_carries_tokenrhythm_agent_header(self):
-        """生图请求头必须携带 X-TokenRhythm-Agent 客户端标识（值同全局默认 User-Agent）。"""
-        from core.llm_policy import DEFAULT_USER_AGENT
+        """生图请求头必须携带 X-TokenRhythm-Agent 客户端标识（纯标识、不带版本号）。"""
+        from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 
         captured = {}
 
@@ -255,7 +255,34 @@ class GenerateImageTest(unittest.TestCase):
                 result = self.tr.generate_image("橘猫", save_dir=save_dir)
 
         self.assertFalse(result.is_error)
-        self.assertEqual(captured["agent"], DEFAULT_USER_AGENT)
+        self.assertEqual(captured["agent"], TOKENRHYTHM_AGENT_NAME)
+
+    def test_generate_request_carries_session_id_header(self):
+        """绑定执行会话时，生图请求头携带 X-Session-Id（本地会话与平台调用关联）。"""
+        from core import app_context
+
+        old_session = app_context.get_thread_session()
+        self.addCleanup(app_context.set_thread_session, old_session)
+        app_context.set_thread_session("session_tr42")
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["session_id"] = _request_header(request, "X-Session-Id")
+            return _Response({"data": [{"url": "https://example.invalid/x.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0")
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.generate_image("橘猫", save_dir=save_dir)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["session_id"], "session_tr42")
 
 class EditImageTest(unittest.TestCase):
     def setUp(self):
@@ -374,8 +401,8 @@ class EditImageTest(unittest.TestCase):
                 self.assertEqual(f.read(), raw)
 
     def test_edit_request_carries_tokenrhythm_agent_header(self):
-        """垫图改图请求头同样携带 X-TokenRhythm-Agent 客户端标识（值同全局默认 User-Agent）。"""
-        from core.llm_policy import DEFAULT_USER_AGENT
+        """垫图改图请求头同样携带 X-TokenRhythm-Agent 客户端标识（纯标识、不带版本号）。"""
+        from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 
         captured = {}
 
@@ -395,7 +422,35 @@ class EditImageTest(unittest.TestCase):
                 result = self.tr.edit_image(prompt="把背景换成雪景", image=png, save_dir=tmp)
 
         self.assertFalse(result.is_error)
-        self.assertEqual(captured["agent"], DEFAULT_USER_AGENT)
+        self.assertEqual(captured["agent"], TOKENRHYTHM_AGENT_NAME)
+
+    def test_edit_request_carries_session_id_header(self):
+        """绑定执行会话时，垫图改图请求头同样携带 X-Session-Id。"""
+        from core import app_context
+
+        old_session = app_context.get_thread_session()
+        self.addCleanup(app_context.set_thread_session, old_session)
+        app_context.set_thread_session("session_tr42")
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["session_id"] = _request_header(request, "X-Session-Id")
+            return _Response({"data": [{"url": "https://example.invalid/edited.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png = self._make_png(tmp)
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.edit_image(prompt="把背景换成雪景", image=png, save_dir=tmp)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["session_id"], "session_tr42")
 
 
 class PluginMetadataTest(unittest.TestCase):

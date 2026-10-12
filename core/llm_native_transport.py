@@ -21,6 +21,7 @@ from core.llm_policy import (
     get_model_policy,
     DEFAULT_USER_AGENT,
     tokenrhythm_agent_headers,
+    session_id_headers,
 )
 
 logger = logging.getLogger(__name__)
@@ -578,9 +579,10 @@ def _resolve_endpoint_and_headers(
     if effective_key:
         headers["Authorization"] = f"Bearer {effective_key}"
 
-    # 合并方言默认头、基元律动标识头与外部追加头
+    # 合并方言默认头、基元律动标识头、会话关联头与外部追加头
     headers.update(policy.default_headers)
     headers.update(tokenrhythm_agent_headers(url))
+    headers.update(session_id_headers())
     if extra_headers:
         headers.update(extra_headers)
 
@@ -888,6 +890,7 @@ def _anthropic_resolve_endpoint(
     if effective_key:
         headers["x-api-key"] = effective_key
     headers.update(tokenrhythm_agent_headers(url))
+    headers.update(session_id_headers())
     if extra_headers:
         headers.update(extra_headers)
     return url, headers
