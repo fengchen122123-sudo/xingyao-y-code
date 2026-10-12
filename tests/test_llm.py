@@ -916,6 +916,7 @@ def test_explicitly_hidden_model_silently_falls_back_without_injection():
         assert result == {"max_tokens": 128000}
 
 
+
 def test_unknown_deepseek_prefixed_model_applies_official_thinking_encoding(
     monkeypatch,
 ):

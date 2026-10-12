@@ -342,7 +342,8 @@ class MemoryManager:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         session_name TEXT UNIQUE,
                         memory_summary TEXT,
-                        summarized_until_msg_id INTEGER
+                        summarized_until_msg_id INTEGER,
+                        archived_at TEXT
                     )
                 ''')
 
@@ -372,6 +373,11 @@ class MemoryManager:
                 # 权限选择只影响当前会话，不再全局生效
                 if "permission_mode" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN permission_mode TEXT")
+                # 会话归档标记（对话归档功能）：NULL = 未归档，非空 = 归档时刻的
+                # ISO8601 文本，与 created_at / updated_at 同风格。只走 ALTER
+                # ADD COLUMN 幂等添加，不触发上方「遗留 sessions 表重建」分支。
+                if "archived_at" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -2832,32 +2838,45 @@ class MemoryManager:
                     self.conn.rollback()
                     raise
 
-    def get_all_sessions(self, workdir=None, source=None, include_empty=False):
-        """返回会话列表（名称/消息数/归属目录/时间/来源）。
+    def get_all_sessions(self, workdir=None, source=None, include_empty=False,
+                         include_archived=False, archived_only=False):
+        """返回会话列表（名称/消息数/归属目录/时间/来源/归档时刻）。
 
         workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话。
         source 参数用于过滤 GUI 或 CLI 专属会话。
         include_empty=False 时过滤掉无任何消息的空会话（参考 kimicode 的 is_empty 策略），
         避免会话列表被空会话污染；磁盘记录仍保留，不删除。
+        include_archived=False（默认）时不返回已归档会话，保证既有调用点行为不变；
+        archived_only=True 时只返回已归档会话（供归档区视图）。
         """
+        # 归档过滤条件：默认隐藏归档会话，archived_only 只取归档会话
+        if archived_only:
+            archived_filter = " AND s.archived_at IS NOT NULL"
+        elif include_archived:
+            archived_filter = ""
+        else:
+            archived_filter = " AND s.archived_at IS NULL"
         with self._lock:
             cursor = self.conn.cursor()
             if source:
-                cursor.execute('''
+                cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
-                           s.workdir, s.updated_at, s.created_at, s.source, s.id
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id,
+                           s.archived_at
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
-                    WHERE s.source = ? OR s.source IS NULL
+                    WHERE (s.source = ? OR s.source IS NULL){archived_filter}
                     GROUP BY s.id
                     ORDER BY s.id DESC
                 ''', (source,))
             else:
-                cursor.execute('''
+                cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
-                           s.workdir, s.updated_at, s.created_at, s.source, s.id
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id,
+                           s.archived_at
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
+                    WHERE 1=1{archived_filter}
                     GROUP BY s.id
                     ORDER BY s.id DESC
                 ''')
@@ -2883,6 +2902,8 @@ class MemoryManager:
                 "source": row[5] or "GUI",
                 # 不可变主键 sessions.id（按回合撤销等功能的稳定归属标识）
                 "id": row[6],
+                # 归档时刻（ISO8601 文本）；None = 未归档
+                "archived_at": row[7],
             }
             for row in filtered
         ]
@@ -2894,6 +2915,7 @@ class MemoryManager:
         workdir: Optional[str] = None,
         source: Optional[str] = "GUI",
         limit: int = 30,
+        include_archived: bool = False,
     ) -> List[Dict[str, Any]]:
         """全文与标题复合检索会话。
 
@@ -2909,6 +2931,8 @@ class MemoryManager:
           - 默认 "GUI"，匹配 s.source = 'GUI' OR s.source IS NULL
         limit:
           - 最大返回条数
+        include_archived:
+          - 默认 False，排除已归档会话（既有调用点行为不变）
         """
         q = str(query or "").strip()
         if not q:
@@ -2951,6 +2975,8 @@ class MemoryManager:
                       AND s.session_name LIKE ? ESCAPE '\\'
                 """
                 params = [source, pattern]
+                if not include_archived:
+                    title_sql += " AND s.archived_at IS NULL"
                 if norm_workdir is not None:
                     if norm_workdir == "GLOBAL":
                         title_sql += " AND (s.workdir IS NULL OR s.workdir = 'GLOBAL')"
@@ -2989,6 +3015,8 @@ class MemoryManager:
                       AND m.content LIKE ? ESCAPE '\\'
                 """
                 params = [source, pattern]
+                if not include_archived:
+                    content_sql += " AND s.archived_at IS NULL"
                 if norm_workdir is not None:
                     if norm_workdir == "GLOBAL":
                         content_sql += " AND (s.workdir IS NULL OR s.workdir = 'GLOBAL')"
@@ -3343,6 +3371,69 @@ class MemoryManager:
         from core.llm import rename_cache_usage_session
         rename_cache_usage_session(old_name, final_name)
         return result
+
+    def archive_session(self, session_name, archived_at=None) -> bool:
+        """归档会话：从默认会话列表隐藏，数据零损失、可随时恢复。
+
+        只写 sessions.archived_at 一列（NULL = 未归档，非空 = 归档时刻的
+        ISO8601 文本），不触碰 messages / session_summary_generations /
+        harness_* / token_usage，也不刷新 updated_at——归档不是「会话有新活动」，
+        混用会污染活跃时间排序。
+        幂等：已归档会话再次调用不覆盖原 archived_at，仍返回 True；
+        会话不存在时返回 False，由调用方提示。
+        """
+        stamp = (
+            str(archived_at).strip()
+            if archived_at
+            else datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    'SELECT archived_at FROM sessions WHERE session_name = ?',
+                    (session_name,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return False
+                if row[0]:
+                    # 已归档：幂等成功，保留原归档时刻
+                    return True
+                cursor.execute(
+                    'UPDATE sessions SET archived_at = ? WHERE session_name = ?',
+                    (stamp, session_name),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def unarchive_session(self, session_name) -> bool:
+        """取消归档：把 archived_at 置回 NULL，会话恢复回主列表。
+
+        幂等：对未归档会话调用同样安全返回 True（不产生额外副作用）；
+        会话不存在时返回 False。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    'SELECT archived_at FROM sessions WHERE session_name = ?',
+                    (session_name,),
+                )
+                if cursor.fetchone() is None:
+                    return False
+                cursor.execute(
+                    'UPDATE sessions SET archived_at = NULL WHERE session_name = ?',
+                    (session_name,),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def prune_history_files(self, session_name, max_turns=16, retain_recent=4):
         """物理级折叠历史挂载的大文件，以节省 token。"""

@@ -19,6 +19,8 @@ import type {
   PresetProviderInfo,
   ModelSettingsSnapshot,
   SessionGroup,
+  ArchivedSessionInfo,
+  ArchiveBatchResult,
   SkillInfo,
   McpInfo,
   PluginInfo,
@@ -635,6 +637,9 @@ export const useAppStore = defineStore('app', {
 
     // 会话 / 项目工作区
     sessionGroups: [] as SessionGroup[],
+    // 归档会话（get_archived_sessions 的扁平列表，按归档时刻倒序）：设置页
+    // 「会话归档」分区的数据源，不参与主列表渲染
+    archivedSessions: [] as ArchivedSessionInfo[],
     currentSessionName: '',
     currentSessionDisplayName: '新对话',
     // 懒创建会话：点“新会话”只进入空白状态不落库；发首条消息时才真正创建，
@@ -668,6 +673,8 @@ export const useAppStore = defineStore('app', {
     // M31 修复：各类异步刷新的请求序号，响应返回时序号已过期则丢弃，
     // 避免并发/重复刷新时旧快照覆盖新快照
     sessionsReqSeq: 0,
+    // 归档会话列表刷新序号（同上：过期快照不覆盖新快照）
+    archivedSessionsReqSeq: 0,
     tokenUsageReqSeq: 0,
     mcpReqSeq: 0,
     pluginsReqSeq: 0,
@@ -761,6 +768,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
     rightPanelActiveTab: '' as RightPanelTabId | '',
     // IDE 模式：与 rightPanelTabs 同样按会话隔离
     ideModeBySession: {} as Record<string, boolean>,
+    // IDE 模式下右侧对话区是否收起：纯 UI 状态，不落盘——它只是「这一屏想不想看
+    // 对话」的临时选择。放在 appStore 而不是 IdeLayout 的本地 ref，是因为收起/展开
+    // 两个入口分处不同组件：收起按钮在对话头部（App.vue），恢复入口在活动栏「星瑶」
+    // 动作（IdeLayout），组件本地状态跨不过这条边界。
+    ideChatCollapsed: false,
     // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
     // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
     // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
@@ -1571,7 +1583,80 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
 
     toggleIdeMode() {
-      this.ideModeBySession[this.currentSessionName] = !this.ideMode();
+      const next = !this.ideMode();
+      this.ideModeBySession[this.currentSessionName] = next;
+      // 切换后立刻落盘（后端按会话名分桶）：下次启动/切回该会话才能恢复同一模式。
+      // 不 await：持久化是尽力而为，不能卡住界面上的模式切换
+      void this.persistIdeMode(this.currentSessionName);
+      // 切到 IDE 模式 = 用户要看这个会话的工作区文件夹：确保文件树已加载。
+      // 不 await：拉树可能耗时，模式切换本身要立即生效；未绑定工作区时
+      // ensureIdeWorkspace 会直接返回（欢迎页负责让用户选文件夹）
+      if (next) void this.ensureIdeWorkspace();
+    },
+
+    /**
+     * 把某会话的 IDE 模式写回后端（`save_session_ui`）。
+     *
+     * 失败静默（catch 掉）：模式持久化只是「重开软件后回到同一模式」的体验优化，
+     * 桥不可用 / 后端异常都不能阻断模式切换本身——与 ideStore 布局落盘的
+     * `persistLayout().catch(() => {})` 同一原则。
+     *
+     * 这里用静默取桥而不是 `_api()`：`_api()` 缺桥时会弹「连接失败」模态框，
+     * 而本动作可能在启动早期（bridgeReady 之前）被调用。
+     */
+    async persistIdeMode(session: string) {
+      const api = (window.pywebview && window.pywebview.api) || null;
+      if (!api?.save_session_ui) return;
+      try {
+        await api.save_session_ui(session, {
+          version: 1,
+          ide_mode: !!this.ideModeBySession[session],
+        });
+      } catch { /* 尽力而为：落盘失败不影响本次切换，下次切换会重试 */ }
+    },
+
+    /**
+     * 从后端恢复某会话的 IDE 模式（启动初始化 / 切换会话时调用）。
+     *
+     * **不覆盖用户的实时切换**：本动作是异步的，请求在途期间用户完全可能已经
+     * 手动切过模式（甚至已经切走会话）。因此后端值只在本地还没有该会话记录时
+     * 作为初值写入；本地已有记录（含显式 `false`）一律以本地为准。await 之后
+     * 再判一次，挡住「await 期间用户刚切过」的窗口。
+     */
+    async restoreIdeMode(session: string) {
+      if (session in this.ideModeBySession) return;
+      const api = (window.pywebview && window.pywebview.api) || null;
+      if (!api?.get_session_ui) return;
+      try {
+        const res = await api.get_session_ui(session);
+        if (res?.ok && res.ui?.ide_mode && !(session in this.ideModeBySession)) {
+          this.ideModeBySession[session] = true;
+        }
+      } catch { /* 取不到就保持对话模式：模式是可选的界面偏好，不该报错打扰用户 */ }
+    },
+
+    /**
+     * 会话名变化时迁移 IDE 模式的桶（`''` → 真实名；重命名 old → new）。
+     *
+     * 为什么必须迁移：草稿会话（未落库）统一挂在 `''` 桶上，而 `''` 桶是多个新
+     * 会话共用的。不迁移的话，在草稿里切到 IDE 模式后，下一个新会话一进来就会
+     * 继承这个模式（串模式）；反之删除 `''` 键则让每个新会话回到对话模式。
+     *
+     * 目标桶已有记录时以它自己为准，不搬运覆盖（与 ideStore.setSession 的
+     * `''` 桶标签迁移同一口径）。旧键在后端的记录删不掉——桥只有 get / save，
+     * 没有删除接口——只能留在 session_ui.json 里；它只在会话名恰好等于旧名时
+     * 才被读到，不会影响真实会话。
+     */
+    _moveIdeModeBucket(oldName: string, newName: string) {
+      if (!newName || oldName === newName) return;
+      const prev = this.ideModeBySession[oldName];
+      if (prev === undefined) return;
+      if (!(newName in this.ideModeBySession)) {
+        this.ideModeBySession[newName] = prev;
+      }
+      delete this.ideModeBySession[oldName];
+      // 迁移后按新名落盘：否则重开软件时按新名查不到模式（旧名那条成为孤儿记录）
+      void this.persistIdeMode(newName);
     },
 
     // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
@@ -2135,12 +2220,18 @@ navItems: [] as Array<{ id: number; preview: string }>,
       scope: 'all' | 'title' | 'content' = 'all',
       workdir?: string,
       limit: number = 30,
+      includeArchived: boolean = false,
     ) {
       const api = this._api();
       if (!api || !api.search_sessions_full) {
         return { ok: false, total: 0, results: [], msg: '后端未就绪' };
       }
       try {
+        // include_archived 只在开启时作为第 5 个参数透传：默认路径保持原有 4 参
+        // 签名，归档前行为与旧后端完全不变。
+        if (includeArchived) {
+          return await api.search_sessions_full(query, scope, workdir, limit, true);
+        }
         return await api.search_sessions_full(query, scope, workdir, limit);
       } catch (err: any) {
         console.error('search_sessions_full 失败:', err);
@@ -2231,6 +2322,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         void this.refreshHooks();
         this.workdir = init.workdir || '';
         this.currentSessionName = (init as any).current_session || '';
+        // 会话名就位后恢复该会话的 IDE 模式（后端权威副本）：重开软件要回到
+        // 上次离开时的模式，而不是每次都从对话模式开始
+        void this.restoreIdeMode(this.currentSessionName);
         // 工作区标签以“当前会话归属”为准：GLOBAL 会话显示“对话”，
         // 不能直接用启动目录，否则会显示在工作区里、消息却发进自由对话
         const isGlobal = !!(init as any).is_global;
@@ -3086,6 +3180,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const runtimePerm = this._getSessionRuntime(sessionName);
           runtimePerm.permMode = res.permission_mode;
         }
+
+        // 切换成功后再恢复该会话的 IDE 模式（后端权威副本）。放在响应处理末端：
+        // 过期响应（用户已切走）在函数开头就 return 了，不会走到这里
+        void this.restoreIdeMode(sessionName);
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
@@ -3103,7 +3201,18 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 历史分页懒加载：滚动到顶触发，向前翻一页并 prepend 到消息流头部。
     // 守卫（无更多/加载中/无游标/后端不可用）与竞态丢弃（在途切会话）必须保持。
     async loadOlderMessages() {
-      if (!this.historyHasMore || this.historyLoading || !this.historyOldestId) return;
+      // 游标自愈：has_more=false 且游标为空，是「分页状态从未初始化 / 被失败响应
+      // 清空」的特征——真到最早时后端会带回非空 oldest_id。不修的话守卫会永久
+      // 短路：滚到顶不加载更早消息、点未加载红点没反应，而且这份坏状态会随会话
+      // 保存/恢复，切走再切回依然失效（用户反馈过「怎么都无法加载到最上面」）。
+      // 兜底口径：用已加载消息流里最旧的 _msg_id 当游标，交后端裁决是否还有更早。
+      if (!this.historyOldestId) {
+        const oldestLoaded = (this.messages as any[]).find(m => typeof m?._msg_id === 'number');
+        if (!oldestLoaded) return;
+        this.historyOldestId = oldestLoaded._msg_id as number;
+        this.historyHasMore = true;
+      }
+      if (!this.historyHasMore || this.historyLoading) return;
       const api = this._api();
       if (!api || typeof (api as any).load_older_messages !== 'function') return;
       const sessionAtCall = this.currentSessionName;
@@ -3118,6 +3227,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.historyHasMore = !!res.has_more;
           this.historyOldestId = res.oldest_id ?? null;
         }
+        // res.ok === false（读库失败等）：保持原分页状态不变，下次滚动/跳转自动重试；
+        // 绝不写成「没有更早历史」，否则翻页会被永久关掉
       } catch (err) {
         this.notifyChat('加载更早历史失败: ' + err);
       } finally {
@@ -3208,6 +3319,34 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.fileTreeExpanded = stillExists;
       } catch { /* 刷新失败静默：保留旧树 */ }
       finally { this.fileTreeRefreshing = false; }
+    },
+
+    /**
+     * 确保当前会话的工作区文件夹已"打开"（= 文件树已加载）。
+     *
+     * 服务的产品行为：「切到 IDE 模式之后文件夹要打开」——切模式是用户显式
+     * 表达"我要在这个工作区里看代码/改代码"，所以 IDE 侧栏必须马上有内容，
+     * 而不是等用户再去点一次刷新。
+     *
+     * 三条分支（前两条是用户明确确认的行为，不要改）：
+     * - `workdir` 为空（当前会话未绑定工作区）：**不自动弹目录选择器**，
+     *   直接返回，界面显示欢迎页，由用户点「打开文件夹」显式选择（欢迎页
+     *   UI 属 P6，本动作只负责不越权弹窗）；
+     * - 已绑定工作区但文件树为空：拉一次树（`refreshFileTree`），把结果写进
+     *   `fileTree`；
+     * - 文件树已加载：直接返回，不重复请求——模式切换是高频操作，每次都打
+     *   后端纯属浪费，还会让侧栏闪一下 loading。
+     *
+     * 失败不外泄：`refreshFileTree` 内部已 catch（失败保留旧树）并在 finally
+     * 复位 `fileTreeRefreshing`；这里再兜一层，保证调用方（toggleIdeMode 中的
+     * `void` 调用）不会产生未处理的 rejection，也不会把刷新态卡在 true。
+     */
+    async ensureIdeWorkspace() {
+      if (!this.workdir) return; // 未绑定工作区：留给欢迎页的「打开文件夹」按钮
+      if (this.fileTree.length > 0) return; // 树已加载：不重复打后端
+      try {
+        await this.refreshFileTree();
+      } catch { /* refreshFileTree 自身已静默处理；此处只保证不外泄 rejection */ }
     },
 
     async createGlobalSession() {
@@ -3355,6 +3494,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           // 排队消息随会话删除一并清理（后端已同步清空，此处防快照事件丢失残留）
           delete this.messageQueues[sessionName];
           delete this.sessionRuntimeByName[sessionName];
+          // 归档区行内删除同样走这里：归档会话不在 sessionGroups 中，
+          // 故单独摘除并刷新归档列表，避免已删除的条目残留在「已归档」区
+          this.archivedSessions = this.archivedSessions.filter(s => s.name !== sessionName);
+          void this.loadArchivedSessions();
           if (sessionName === this.currentSessionName && res.current_session) {
             await this.switchSession(res.current_session, '新会话');
           }
@@ -3387,12 +3530,196 @@ navItems: [] as Array<{ id: number; preview: string }>,
             this.currentSessionName = res.name;
             this.currentSessionDisplayName = res.name;
           }
+          // IDE 模式桶随会话名迁移（用后端最终名 res.name：撞名时后端会加后缀，
+          // 按用户输入的 target 迁会迁到一个不存在的会话名下）
+          if (res.name) this._moveIdeModeBucket(oldName, res.name);
         } else {
           this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
         this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
+    // 加载归档会话列表（设置页「会话归档」分区数据源）。
+    // 旧后端 / 纯浏览器预览没有该方法时静默保持现状，不弹连接失败框。
+    async loadArchivedSessions() {
+      const api = (window.pywebview && window.pywebview.api) as PyWebViewAPI | null;
+      if (!api || typeof api.get_archived_sessions !== 'function') return;
+      const seq = ++this.archivedSessionsReqSeq;
+      try {
+        const list = await api.get_archived_sessions();
+        if (seq !== this.archivedSessionsReqSeq) return;
+        if (Array.isArray(list)) this.archivedSessions = list;
+      } catch (err) {
+        // 静默失败：归档区不是主路径，下一次归档动作/事件到达时会重新拉取
+        console.error('加载归档会话失败:', err);
+      }
+    },
+
+    /** 取会话的展示名（归档 / 取消归档的反馈文案用；查不到时退回会话名） */
+    _sessionDisplayName(sessionName: string): string {
+      const hit = this.sessionGroups
+        .flatMap(g => g.sessions || [])
+        .find(s => s.name === sessionName);
+      if (hit && hit.display_name) return hit.display_name;
+      const archived = this.archivedSessions.find(s => s.name === sessionName);
+      return (archived && archived.display_name) || sessionName;
+    },
+
+    // 归档会话（侧栏行内 ⤓ 入口）。入口侧已改为行内二次确认（点确认才真正归档），
+    // 成功后与删除一致静默完成——会话从列表消失、归档区出现即是反馈，不再弹提示框。
+    // 后端 session_archived 事件在重连窗口期可能丢失，故按返回值/主动刷新兜底，
+    // 不做乐观更新（失败时保持原状）。
+    async archiveSession(sessionName: string) {
+      const api = this._api();
+      if (!api || !sessionName) return false;
+      // 归档与「禁止删除当前活跃会话」同源的保护：归档态会话正在被使用是自相矛盾的状态
+      if (sessionName === this.currentSessionName) {
+        this.notifyModal('会话归档', '不能归档当前活跃会话，请先切换到其它会话');
+        return false;
+      }
+      try {
+        const res = await api.archive_session(sessionName);
+        if (res && res.ok) {
+          if (Array.isArray(res.sessions)) {
+            this.sessionGroups = res.sessions;
+          } else {
+            // 桥接方法不回传列表时本地摘除，避免「已归档却仍在主列表」的中间态
+            this.sessionGroups = this.sessionGroups.map(g => ({
+              ...g,
+              sessions: (g.sessions || []).filter(s => s.name !== sessionName),
+            }));
+          }
+          if (Array.isArray(res.archived_sessions)) {
+            this.archivedSessions = res.archived_sessions;
+          } else {
+            await this.loadArchivedSessions();
+          }
+          // 归档成功静默完成：入口侧的二次确认已表明意图，列表刷新即为反馈
+          return true;
+        }
+        this.notifyModal('会话归档', '归档失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '归档失败: ' + err);
+        return false;
+      }
+    },
+
+    // 取消归档（归档区行内 ↩ 入口）：会话恢复回主列表。同样可逆、不弹确认框。
+    async unarchiveSession(sessionName: string) {
+      const api = this._api();
+      if (!api || !sessionName) return false;
+      const display = this._sessionDisplayName(sessionName);
+      try {
+        const res = await api.unarchive_session(sessionName);
+        if (res && res.ok) {
+          if (Array.isArray(res.archived_sessions)) {
+            this.archivedSessions = res.archived_sessions;
+          } else {
+            this.archivedSessions = this.archivedSessions.filter(s => s.name !== sessionName);
+            await this.loadArchivedSessions();
+          }
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else await this.refreshSessions();
+          this.notifyModal('会话归档', `已取消归档「${display}」，已恢复到会话列表`);
+          return true;
+        }
+        this.notifyModal('会话归档', '取消归档失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '取消归档失败: ' + err);
+        return false;
+      }
+    },
+
+    /** 批量归档操作的结果收尾：采用后端回传的两侧快照，缺省时主动刷新兜底 */
+    _applyArchiveBatchLists(res: ArchiveBatchResult | null | undefined) {
+      if (!res) return;
+      if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+      else void this.refreshSessions();
+      if (Array.isArray(res.archived_sessions)) this.archivedSessions = res.archived_sessions;
+      else void this.loadArchivedSessions();
+    },
+
+    // 批量取消归档（设置页归档区多选恢复）：与单条 unarchiveSession 同语义（可逆、
+    // 幂等、不弹确认框），差别只在一次桥接处理多个会话、只弹一次结果提示。
+    // 返回本次成功恢复的会话名数组；失败项不回传，调用方据此保留这些行的勾选。
+    async batchUnarchiveSessions(sessionNames: string[]): Promise<string[]> {
+      const api = this._api();
+      const names = (sessionNames || []).filter(n => !!n);
+      if (!api || !names.length) return [];
+      try {
+        const res = await api.unarchive_sessions(names);
+        if (!res || !res.ok) {
+          this.notifyModal('会话归档', '批量恢复失败: ' + (res && res.msg ? res.msg : '未知错误'));
+          return [];
+        }
+        this._applyArchiveBatchLists(res);
+        const done = Array.isArray(res.names) ? res.names : [];
+        const failed = Array.isArray(res.failed) ? res.failed : [];
+        this.notifyModal(
+          '会话归档',
+          failed.length
+            ? `已恢复 ${done.length} 个会话，${failed.length} 个失败：${failed.map(f => f.msg || f.name).join('；')}`
+            : `已恢复 ${done.length} 个会话到会话列表`,
+        );
+        return done;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '批量恢复失败: ' + err);
+        return [];
+      }
+    },
+
+    // 批量删除归档会话（设置页归档区多选删除）：二次确认由调用方（设置页）负责，
+    // 这里只落盘并同步本地状态。返回本次真正删除的会话名数组。
+    async batchDeleteArchivedSessions(sessionNames: string[]): Promise<string[]> {
+      const api = this._api();
+      const names = (sessionNames || []).filter(n => !!n);
+      if (!api || !names.length) return [];
+      try {
+        const res = await api.delete_archived_sessions(names);
+        const done = res && res.ok && Array.isArray(res.names) ? res.names : [];
+        if (!done.length) {
+          const failed = res && Array.isArray(res.failed) ? res.failed : [];
+          const reason = failed.length
+            ? failed.map(f => f.msg || f.name).join('；')
+            : (res && res.msg ? res.msg : '未知错误');
+          this.notifyModal('会话管理', '批量删除失败: ' + reason);
+          // 一项都没删掉时列表可能已被别的入口改动，仍刷新一次兜底
+          void this.loadArchivedSessions();
+          return [];
+        }
+        this._applyArchiveBatchLists(res);
+        // 逐个清理前端运行态残留（照 deleteSingleSession 的 T11 修复：否则
+        // runningSessions / sessionRuntimeByName 里留下已删会话的孤儿条目）
+        done.forEach(name => {
+          this.runningSessions = this.runningSessions.filter(s => s !== name);
+          this.queuedSessions = this.queuedSessions.filter(s => s !== name);
+          delete this.messageQueues[name];
+          delete this.sessionRuntimeByName[name];
+        });
+        // 极端并发下删到了当前活跃会话：后端已补建 GLOBAL 会话，跟随切换
+        if (res && res.current_session && done.includes(this.currentSessionName)) {
+          await this.switchSession(res.current_session, '新会话');
+        }
+        const failed = Array.isArray(res.failed) ? res.failed : [];
+        if (failed.length) {
+          this.notifyModal(
+            '会话管理',
+            `已删除 ${done.length} 个归档会话，${failed.length} 个失败：${failed.map(f => f.msg || f.name).join('；')}`,
+          );
+        }
+        return done;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '批量删除失败: ' + err);
+        return [];
       }
     },
 
@@ -3624,6 +3951,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.sessionRuntimeByName[sessionName] = this.sessionRuntimeByName[draftKey] || createSessionRuntime();
           delete this.sessionRuntimeByName[draftKey];
           this.currentSessionName = sessionName;
+          // 草稿会话（'' 桶）拿到真实名：把 IDE 模式迁到真实会话名下，
+          // 否则这个模式会留在共用的 '' 桶里串给下一个新会话
+          this._moveIdeModeBucket('', sessionName);
         }
         if (!willQueue) {
           this._setSessionRunning(sessionName, true);
@@ -4372,6 +4702,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           if (this.permRequest.sessionName === data.old) {
             this.permRequest.sessionName = data.new;
           }
+          // IDE 模式桶随会话名迁移：后端首条消息后会把 session_xxxxxx 自动改成
+          // 消息标题并推本事件，不迁移的话模式留在旧名下，重开软件就恢复不出来
+          this._moveIdeModeBucket(String(data.old), String(data.new));
         }
         this.sessionGroups.forEach(g => {
           (g.sessions || []).forEach(s => {
@@ -4381,6 +4714,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
             }
           });
         });
+      } else if (type === 'session_archived' || type === 'session_unarchived' || type === 'session_deleted') {
+        // 归档态变化（多端同步，含归档区批量删除）：负载带最新两侧快照时直接采用；
+        // 缺失时主动刷新兜底。不做乐观增删——迟到的旧快照不得让已归档会话在主列表里「复活」。
+        if (Array.isArray(data.sessions)) this.sessionGroups = data.sessions;
+        else void this.refreshSessions();
+        if (Array.isArray(data.archived_sessions)) this.archivedSessions = data.archived_sessions;
+        else void this.loadArchivedSessions();
       } else if (type === 'turn_finish' || type === 'turn_idle') {
         this.running = false;
         this.streamingSpeed = 0;

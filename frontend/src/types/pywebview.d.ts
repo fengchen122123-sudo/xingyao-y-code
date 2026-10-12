@@ -454,6 +454,38 @@ export interface SessionGroup {
   sessions: SessionInfo[];
 }
 
+// get_archived_sessions() 的扁平列表条目：字段与分组树里的会话条目同源，
+// 额外带 archived_at（归档时刻，ISO8601 文本）。归档区没有分组语义。
+export interface ArchivedSessionInfo extends SessionInfo {
+  archived_at?: string;
+}
+
+// archive_session / unarchive_session 的返回契约：成功时至少回 name 与 archived_at；
+// sessions / archived_sessions 是事件负载里的最新快照，桥接方法可选回传（缺省时前端主动刷新）。
+export interface ArchiveSessionResult {
+  ok: boolean;
+  name?: string;
+  archived_at?: string | null;
+  sessions?: SessionGroup[];
+  archived_sessions?: ArchivedSessionInfo[];
+  msg?: string;
+}
+
+// unarchive_sessions / delete_archived_sessions 的返回契约：names 是本次真正处理成功
+// 的会话名，failed 是逐项失败原因（一项失败不阻断其它项）。故 ok 表示「是否至少成功
+// 一项」而非「是否全部成功」；全失败时 names 为空、msg 给出整体原因。
+export interface ArchiveBatchResult {
+  ok: boolean;
+  success?: boolean;
+  count?: number;
+  names?: string[];
+  failed?: { name: string; msg?: string }[];
+  sessions?: SessionGroup[];
+  archived_sessions?: ArchivedSessionInfo[];
+  current_session?: string;
+  msg?: string;
+}
+
 export interface FileNode {
   n: string;
   d: number;
@@ -1017,6 +1049,13 @@ export interface PyWebViewAPI {
   delete_session(sessionName: string): Promise<any>;
   delete_folder_group(workdir: string): Promise<any>;
   rename_session(oldName: string, newName: string): Promise<any>;
+  // 归档会话：归档只写标记、可随时恢复，故默认列表不含归档会话（include_archived=false）
+  get_archived_sessions(): Promise<ArchivedSessionInfo[]>;
+  archive_session(sessionName: string): Promise<ArchiveSessionResult>;
+  unarchive_session(sessionName: string): Promise<ArchiveSessionResult>;
+  // 归档区多选批量操作：一次桥接处理多个会话，逐项容错（见 ArchiveBatchResult）
+  unarchive_sessions(sessionNames: string[]): Promise<ArchiveBatchResult>;
+  delete_archived_sessions(sessionNames: string[]): Promise<ArchiveBatchResult>;
 
   set_model(modelId: string, sessionName?: string): Promise<any>;
   get_reasoning_snapshot(modelId: string): Promise<any>;
@@ -1155,6 +1194,8 @@ export interface PyWebViewAPI {
     scope?: 'all' | 'title' | 'content',
     workdir?: string,
     limit?: number,
+    // 是否把已归档会话也纳入检索范围（默认 false：与归档前行为一致）
+    includeArchived?: boolean,
   ): Promise<{
     ok: boolean;
     total: number;
@@ -1356,6 +1397,11 @@ export interface PyWebViewAPI {
   ide_set_open_files(paths: string[]): Promise<{ ok: boolean; count: number }>;
   ide_get_layout(session: string): Promise<{ ok: boolean; layout: IdeLayoutSnapshot | null }>;
   ide_save_layout(session: string, layout: IdeLayoutSnapshot): Promise<{ ok: boolean; layout: IdeLayoutSnapshot }>;
+  // 会话级 UI 偏好（当前只有 IDE / 对话模式）：按会话名分桶存后端
+  // ~/.ycode/session_ui.json。get 恒回默认值（后端不返回 null），
+  // save 异常时回 ok=false + msg（前端据此静默降级，见 appStore.persistIdeMode）
+  get_session_ui(session: string): Promise<{ ok: boolean; ui: SessionUiSnapshot; msg?: string }>;
+  save_session_ui(session: string, ui: SessionUiSnapshot): Promise<{ ok: boolean; ui: SessionUiSnapshot; msg?: string }>;
 
   // ---- IDE 模式 S2：语言服务 ----
   lsp_request(
@@ -1591,6 +1637,12 @@ export interface IdeLayoutSnapshot {
   tabs: { path: string; line: number }[];
   active: string;
   breakpoints: { path: string; line: number }[];
+}
+
+/** 会话级 UI 偏好快照（get_session_ui / save_session_ui 的载荷，与后端同构） */
+export interface SessionUiSnapshot {
+  version: number;
+  ide_mode: boolean;
 }
 
 declare global {

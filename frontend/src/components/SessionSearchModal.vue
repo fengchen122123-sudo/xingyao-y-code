@@ -72,6 +72,16 @@
             </option>
             <option value="global">通用对话 (自由)</option>
           </select>
+          <!-- 归档会话默认不参与检索（与侧栏主列表口径一致），需要时手动打开 -->
+          <label class="archive-toggle" title="同时检索已归档会话（默认不检索）">
+            <input
+              v-model="includeArchived"
+              type="checkbox"
+              data-test="search-include-archived"
+              @change="doSearch"
+            />
+            <span>包含已归档</span>
+          </label>
         </div>
       </div>
 
@@ -163,6 +173,8 @@ const store = useAppStore();
 const query = ref('');
 const currentScope = ref<'all' | 'title' | 'content'>('all');
 const projectScope = ref<'all' | 'current' | 'global'>('all');
+// 是否把已归档会话纳入检索（默认关闭，与侧栏主列表口径一致）
+const includeArchived = ref(false);
 const results = ref<any[]>([]);
 const loading = ref(false);
 const selectedIndex = ref(0);
@@ -224,7 +236,13 @@ async function doSearch() {
 
   loading.value = true;
   try {
-    const res = await store.searchSessionsFull(q, currentScope.value, workdirFilter, 30);
+    const res = await store.searchSessionsFull(
+      q,
+      currentScope.value,
+      workdirFilter,
+      30,
+      includeArchived.value,
+    );
     if (res && res.ok && Array.isArray(res.results)) {
       results.value = res.results;
       selectedIndex.value = 0;
@@ -501,6 +519,28 @@ watch(
   font-size: 11.5px;
   outline: none;
   cursor: pointer;
+}
+
+/* 「包含已归档」开关：与范围选择器同排，弱化为次级过滤项 */
+.archive-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.archive-toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+.archive-toggle:hover {
+  color: var(--text);
 }
 
 /* 结果区 */

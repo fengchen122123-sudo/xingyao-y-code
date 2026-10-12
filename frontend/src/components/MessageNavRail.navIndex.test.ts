@@ -178,3 +178,39 @@ it('页首比所有 user 消息都新时：全部红点按未加载处理', asyn
   await nextTick();
   expect(wrapper.findAll('.dim')).toHaveLength(5);
 });
+
+// 跨页跳转收尾：父组件翻页加载完成后回调 jumpToLoaded，按全局索引定位目标消息。
+// 点最上面一个红点（全局索引 0）时必须定位到首条消息（视口最上面）——定位错到
+// 「已加载区第一条」上，就是用户反馈的「点了最上面的点却没反应」。
+it('jumpToLoaded：跨页加载完成后按全局索引定位（索引 0 → 首条消息，落点即内容顶部）', async () => {
+  const scrollEl = makeScrollEl();
+  Object.defineProperty(scrollEl, 'scrollHeight', { value: 5000, configurable: true });
+  scrollEl.scrollTop = 4000; // 用户此前在很下面，跳转必须把视口拉回顶部
+  scrollEl.getBoundingClientRect = () => ({ top: 0, height: 600 } as DOMRect);
+  // 内容坐标 21 + 500*i：视口 top = 内容坐标 - scrollTop
+  const els = [0, 1, 2].map((i) => {
+    const el = document.createElement('div');
+    el.className = 'msg-user';
+    el.innerHTML = `<span class="user-text">第${i}条</span>`;
+    el.getBoundingClientRect = () => ({ top: 21 + 500 * i - scrollEl.scrollTop, height: 40 } as DOMRect);
+    return el;
+  });
+  const scrolled: number[] = [];
+  scrollEl.scrollTo = ((opts: any) => { scrolled.push(opts?.top ?? -1); }) as unknown as typeof scrollEl.scrollTo;
+
+  const wrapper = mount(MessageNavRail, {
+    props: {
+      getScrollEl: () => scrollEl,
+      getUserMsgElements: () => els,
+      navItems,
+      loadedFirstId: 10, // 全部已加载：分界为 0
+    },
+  });
+  await nextTick();
+
+  (wrapper.vm as any).jumpToLoaded(0);
+
+  // 首条消息内容坐标 21，留 16px 呼吸空间 → 目标 5（内容顶部）
+  expect(scrolled).toEqual([5]);
+  wrapper.unmount();
+});

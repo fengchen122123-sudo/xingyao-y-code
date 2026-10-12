@@ -44,12 +44,13 @@
     <div id="main" :class="{ 'panel-resizing': anyPanelResizing }">
       <SettingsPage v-if="store.settingsOpen" />
       <template v-else>
-      <!-- 左侧边栏 -->
-      <Sidebar />
+      <!-- 左侧边栏：IDE 模式整块换成 IDE 布局，会话侧栏必须退场——否则它按固定宽度
+           占住左边，把编辑器区挤成一条缝（会话列表的入口由对话头部的新会话/历史按钮承担） -->
+      <Sidebar v-if="!store.ideMode()" />
 
       <!-- 左栏宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
       <div
-        v-if="!isMobile && !store.sidebarCollapsed"
+        v-if="!isMobile && !store.sidebarCollapsed && !store.ideMode()"
         class="panel-resizer"
         :class="{ resizing: sidebarResizing }"
         title="拖拽调整侧栏宽度，双击恢复默认"
@@ -61,12 +62,28 @@
       <!-- IDE 模式：中部整块换成 IDE 布局（活动栏 / 文件树 / 编辑器 / 底部面板 / 对话区宿主） -->
       <IdeLayout v-if="store.ideMode()" />
 
-      <!-- 中间主对话与聊天区域：对话模式就地渲染；IDE 模式经 Teleport 搬进 IdeLayout 的
-           #ide-chat-host —— 对话区只有一份 DOM，不复制标记、切换模式也不重建实例 -->
-      <Teleport to="#ide-chat-host" :disabled="!store.ideMode()">
-      <div id="center">
+      <!-- 中间主对话与聊天区域：对话模式就地渲染；IDE 模式用 CSS 停靠到 #main 右侧
+           （见下方 #center.ide-docked）。
+           这里原本用 Teleport 把这块搬进 IdeLayout 的宿主，但 Teleport 只在挂载时解析
+           一次目标，而宿主在 v-if 的 IdeLayout 里——对话模式下首次挂载时目标不存在，
+           target 解析成 null，之后切到 IDE 模式也不会重新解析，对话区就一直留在原地
+           按 flex:1 跟编辑器抢宽度（实测 #center 705px，而 368px 的宿主一直空置）。
+           CSS 停靠同样只有一份 DOM、不重建组件、模式切换状态不丢，且没有时序问题。 -->
+      <div
+        id="center"
+        :class="{
+          'ide-docked': store.ideMode(),
+          'ide-docked-hidden': store.ideMode() && store.ideChatCollapsed,
+        }"
+      >
         <div id="chat-header" data-theme-region="conversation_toolbar">
-          <span class="crumb">会话 / <b>{{ store.currentSessionDisplayName }}</b></span>
+          <!-- IDE 模式：对话头部按设计稿补上星瑶头像，会话名沿用同一行的 crumb——
+               不另起一行渲染第二个头部（IdeLayout 侧已不再重复渲染头部）。
+               对话模式下不渲染头像，头部与加入本段之前完全一致 -->
+          <div v-if="store.ideMode()" class="ai-avatar" data-test="ai-head-avatar">瑶</div>
+          <span class="crumb">
+            <template v-if="!store.ideMode()">会话 / </template><b>{{ store.currentSessionDisplayName }}</b>
+          </span>
           <span class="top-spacer"></span>
 
           <!-- 计划入口：星瑶创建了任务计划时显示；悬浮面板锚定在按钮下方，不遮全屏 -->
@@ -91,6 +108,30 @@
               <div class="export-item" @click="doExport('json')">JSON (.json)</div>
             </div>
           </div>
+
+          <!-- IDE 模式：新会话 / 历史 / 收起。这三个入口在对话模式下由侧栏与面板承担，
+               IDE 模式侧栏已退场，必须跟到对话头部来——尤其「收起」必须配对一条恢复
+               路径，否则收起后就再也打不开对话区（活动栏「星瑶」动作是那条路径） -->
+          <template v-if="store.ideMode()">
+            <button
+              class="chip-btn icon-only"
+              title="新会话"
+              data-test="ide-chat-new-session"
+              @click="store.createSessionSmart()"
+            ><AppIcon name="plus" :size="13" /></button>
+            <button
+              class="chip-btn icon-only"
+              title="历史会话"
+              data-test="ide-chat-history"
+              @click="store.openSessionSearchModal()"
+            ><AppIcon name="search" :size="13" /></button>
+            <button
+              class="chip-btn icon-only"
+              title="收起对话区（点活动栏「星瑶」恢复）"
+              data-test="ide-chat-collapse"
+              @click="store.ideChatCollapsed = true"
+            ><AppIcon name="chevron-right" :size="13" /></button>
+          </template>
         </div>
 
         <!-- 电脑操控安全条（设计 16.1）：聊天标题栏下方、滚动区外——对话滚动时保持可见；
@@ -199,7 +240,7 @@
              否则会同时存在两个 xterm 实例、两个 PTY 会话 -->
         <TerminalPane v-if="!store.ideMode()" v-show="store.terminalPanelOpen" />
       </div>
-      </Teleport>
+
 
       <!-- 右面板宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
       <div
@@ -212,13 +253,24 @@
         @dblclick="resetRightPanelWidth"
       ></div>
 
-      <!-- 右侧控制面板 -->
-      <RightPanel />
+      <!-- 右侧控制面板：IDE 模式下默认让位给对话区（控制面板默认就是收起态，所以
+           默认不显示 = 布局与设计稿一致），但保留按需展开——顶栏「切换面板」按钮与
+           状态栏 Git 分支项在 IDE 模式下仍然可用，不能因为它们唯一的宿主被摘掉而失效。
+           必须用 v-show 而不是 v-if：卸载会重建组件，它内部的原生 WebView2 表面
+           来不及 hide 就会以白块形式留在屏幕上（模式来回切一次就现形） -->
+      <RightPanel v-show="!store.ideMode() || !store.rightPanelCollapsed" />
       </template>
     </div>
 
     <!-- 状态栏 -->
     <div id="statusbar" data-theme-region="statusbar">
+      <!-- IDE 模式徽标：最左的小胶囊，仅 IDE 模式渲染；对话模式下状态栏与加入本段之前完全一致 -->
+      <span
+        v-if="store.ideMode()"
+        class="si status-ide-mode"
+        data-test="ide-status-mode"
+        title="当前处于 IDE 模式"
+      >IDE</span>
       <span class="si status-connection" data-test="status-connection" data-mobile-status="primary">
         <span class="s-dot" :class="{ off: !store.connected }"></span>
         <span class="conn-full">{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
@@ -257,6 +309,27 @@
       <div class="right status-runtime" data-test="status-runtime">
         <span class="si" data-test="status-running" data-mobile-status="primary">{{ store.running ? '生成中…' : '空闲' }}</span>
         <span class="si" data-test="status-charset" data-mobile-status="hidden">UTF-8</span>
+      </div>
+      <!-- IDE 模式「编辑器段」：光标行列 / 缩进 / 编码 / 换行符 / 语言，追加在右侧运行状态之后。
+           整段以「有活动标签」为前提：这些字段的数据源就是活动标签与它的编辑器实例，
+           没有活动标签时宁可整段不渲染，也不拿上一个文件的残留值充数。 -->
+      <div
+        v-if="store.ideMode() && ideStore.activeTab"
+        class="right status-editor"
+        data-test="status-editor"
+      >
+        <span class="si" data-test="ide-status-cursor" data-mobile-status="hidden">行 {{ ideStore.cursorLine }}，列 {{ ideStore.cursorColumn }}</span>
+        <span class="si" data-test="ide-status-doc-lines" data-mobile-status="hidden">共 {{ ideStore.docLines }} 行</span>
+        <!-- 缩进是项目约定值（编辑器未单独配置 indentUnit，本段只做展示，不去读编辑器配置） -->
+        <span class="si" data-test="ide-status-indent" data-mobile-status="hidden">空格：4</span>
+        <span class="si" data-test="ide-status-encoding" data-mobile-status="hidden">{{ ideEncodingText }}</span>
+        <span class="si" data-test="ide-status-eol" data-mobile-status="hidden">{{ ideEolText }}</span>
+        <span
+          class="si"
+          data-test="ide-status-language"
+          data-mobile-status="hidden"
+          :title="ideStore.activeTab.path"
+        >{{ ideLanguageText }}</span>
       </div>
     </div>
 
@@ -314,6 +387,8 @@
 import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue';
 import { useAppStore } from './stores/appStore';
 import { useGitStore } from './stores/gitStore';
+import { useIdeStore } from './stores/ideStore';
+import { languageIdForPath } from './editor/setup';
 import { formatPermMode } from './utils/markdown';
 import { buildMessageGroups, msgKey, type TurnGroupInfo } from './utils/turnGroups';
 import { useChatScroll } from './composables/useChatScroll';
@@ -485,6 +560,48 @@ const statusTokenClass = computed(() => {
   return '';
 });
 
+// ── IDE 模式状态栏的「编辑器段」（光标 / 缩进 / 编码 / 换行符 / 语言）──
+// 语言推断复用 editor/setup 的 languageIdForPath（与 ideStore.languageId 同一口径，
+// 状态栏不自己按后缀猜一遍，避免两处推断结果不一致）。
+const ideStore = useIdeStore();
+
+/** 语言 id → 状态栏友好名；未命中的语言 id 原样显示（推断不到就不装懂） */
+const IDE_LANGUAGE_LABELS: Record<string, string> = {
+  python: 'Python',
+  javascript: 'JavaScript',
+  typescript: 'TypeScript',
+  json: 'JSON',
+  markdown: 'Markdown',
+  html: 'HTML',
+  css: 'CSS',
+  vue: 'Vue',
+};
+
+/**
+ * 仅用于显示的后缀兜底。
+ *
+ * `.vue` 在用户眼里有公认名字，但 languageIdForPath 推断不出来（后端没有 vue 语言
+ * 服务器、CodeMirror 也没装 vue 语言包，编辑器按纯文本处理），只会返回空串。
+ * 这里补一层显示映射，只影响状态栏文字，不动语言推断与 LSP 行为。
+ */
+const IDE_DISPLAY_ONLY_EXT: Record<string, string> = { vue: 'Vue' };
+
+const ideLanguageText = computed(() => {
+  const path = ideStore.activeTab?.path ?? '';
+  const languageId = languageIdForPath(path);
+  if (languageId) return IDE_LANGUAGE_LABELS[languageId] ?? languageId;
+  // 推断不出语言 id：有公认名字的后缀走显示兜底，其余按纯文本显示
+  //（与 editor/setup.ts「未命中的语言一律走纯文本」同一口径）
+  const ext = (path.split(/[\\/]/).pop() ?? '').split('.').pop()?.toLowerCase() ?? '';
+  return IDE_DISPLAY_ONLY_EXT[ext] ?? '纯文本';
+});
+
+// 换行符：crlf → CRLF，其余（lf / cr / mixed）一律按 LF 显示
+const ideEolText = computed(() => (ideStore.activeTab?.eol === 'crlf' ? 'CRLF' : 'LF'));
+
+// 文件编码：读活动标签的真实编码，不用固定串掩盖（gbk 文件显示 UTF-8 会误导用户）
+const ideEncodingText = computed(() => (ideStore.activeTab?.encoding === 'gbk' ? 'GBK' : 'UTF-8'));
+
 // 状态栏"技能"项：显示本回合实际用到的技能名（来自 is_skill 工具调用收集），
 // 回合结束后固化；未使用任何技能时显示"无"，让"很少触发"从感觉变成可见数字
 // 技能较多时只显示装得下的部分并以省略号结尾（完整列表见 title），
@@ -575,7 +692,9 @@ async function maybeLoadOlder() {
   const el = chatScrollRef.value;
   if (!el || el.scrollTop >= 120) return;
   // 调用方已保证本次是「用户滚动」来源；跳转/补偿等程序化滚动不会走到这里
-  if (!store.historyHasMore || store.historyLoading) return;
+  // 守卫与 store 的翻页守卫同源：has_more=false 但游标为空 = 分页状态未初始化/
+  // 被失败响应清空，此时仍要进 store 走一次自愈 + 真实翻页，否则滚到顶永远不加载
+  if (!(store.historyHasMore || store.historyOldestId == null) || store.historyLoading) return;
   const oldHeight = el.scrollHeight;
   const oldTop = el.scrollTop;
   // 用户接管检测：校正期间用户若主动滚动就立即让位。触发翻页那一瞬的惯性
@@ -631,6 +750,9 @@ async function maybeLoadOlder() {
 // 不补偿就会「一直跳动」；补偿后再让出一帧渲染，避免批量变化把锚点冲垮。
 // 跳转已由 rail 的 jumpStart 退出跟随（following=false），翻页期间内容变化
 // 不再吸底，无需任何抑制窗口；seq 令牌保证连续点击时旧循环立即让位。
+// 终止条件不信任 store.historyHasMore：该标记可能是过期值或被失败响应清空，
+// 一旦如此跨页跳转会直接放弃（点最上面的红点毫无反应，用户反馈过）。改为
+// 真调一次翻页、按「已加载首条 / 游标是否推进」判定还有没有更早历史。
 let navJumpSeq = 0;
 async function onNavJump(payload: { index: number; id: number }) {
   const seq = ++navJumpSeq;
@@ -642,8 +764,8 @@ async function onNavJump(payload: { index: number; id: number }) {
     if (seq !== navJumpSeq) return; // 新跳转接管：旧循环退出
     if (store.currentSessionName !== sessionAtJump) return; // 切会话：放弃跳转
     const first = store.firstLoadedMsgId;
-    if (first !== null && payload.id >= first) break;
-    if (!store.historyHasMore) break;
+    if (first !== null && payload.id >= first) break; // 目标已进入已加载区
+    const cursorBefore = store.historyOldestId;
     const oldHeight = el?.scrollHeight ?? 0;
     const oldTop = el?.scrollTop ?? 0;
     await store.loadOlderMessages();
@@ -652,6 +774,9 @@ async function onNavJump(payload: { index: number; id: number }) {
     if (seq !== navJumpSeq) return;
     // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加
     el.scrollTop = el.scrollHeight - oldHeight + oldTop;
+    // 无进展（游标未推进、已加载首条也未变）= 真的没有更早历史（或本次读库失败）：
+    // 停止翻页，交回 rail 把视口停在已加载区最上面
+    if (store.historyOldestId === cursorBefore && store.firstLoadedMsgId === first) break;
     // 让出一帧：给布局/anchoring 落地时间，下一轮 prepend 不在同一帧内叠加
     await new Promise<void>((resolve) => {
       window.requestAnimationFrame(() => resolve());
@@ -1231,6 +1356,27 @@ onUnmounted(() => {
   flex: 1;
   display: flex;
   min-height: 0;
+  /* IDE 模式下 #center 要绝对停靠到右侧（见下），这里建立定位上下文 */
+  position: relative;
+}
+
+/* IDE 模式：对话区停靠到 #main 右侧，宽度按设计稿 368px。
+   绝对定位让它脱离 flex 宽度分配——编辑器区因此拿到全部剩余宽度（设计稿就是这个
+   关系），而不是和对话区按 flex:1 平分。收起对话区时整块 display:none，编辑器区
+   自然全屏；恢复入口在对话头部、活动栏「星瑶」和编辑器右上角的浮动按钮三处。 */
+#center.ide-docked {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 368px;
+  z-index: 6;
+  border-left: 1px solid var(--border);
+  background: var(--bg1);
+}
+
+#center.ide-docked.ide-docked-hidden {
+  display: none;
 }
 
 /* 面板宽度拖拽手柄：5px 隐形热区压在分界线上（负 margin 向两侧各溢出
@@ -1308,6 +1454,15 @@ onUnmounted(() => {
   position: relative;
 }
 
+/* IDE 模式：对话区经 Teleport 迁进 368px 窄栏（#ide-chat-host）后，内部容器必须跟着
+   收缩——外层 .ide-chat 的 min-width:0 只解开宿主自身，里面的表格 / 代码块仍会按
+   min-content 撑破容器。这两个选择器只在 IDE 模式下命中（对话模式 #center 不在
+   #ide-chat-host 内），因此对话模式的布局与加入本段之前完全一致 */
+#ide-chat-host #center,
+#ide-chat-host #center > * {
+  min-width: 0;
+}
+
 #chat-header {
   height: 38px;
   border-bottom: 1px solid var(--border);
@@ -1320,9 +1475,33 @@ onUnmounted(() => {
 #chat-header .crumb {
   font-size: 13px;
   color: var(--text-dim);
+  /* IDE 模式对话栏只有 368px 宽，会话名必须可压缩：空间不足时省略号截断，
+     而不是把右侧操作按钮挤出行外 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #chat-header .crumb b {
   color: var(--text);
+}
+/* IDE 模式对话头部：星瑶头像块（与活动栏「星瑶」同一品牌色，取色走主题变量） */
+#chat-header .ai-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+/* IDE 模式对话头部：图标型 chip（只有图标、无文字），把宽度省给会话名 */
+#chat-header .chip-btn.icon-only {
+  padding: 4px 7px;
+  flex-shrink: 0;
 }
 .top-spacer {
   flex: 1;
@@ -1491,6 +1670,17 @@ onUnmounted(() => {
 }
 #statusbar .si-warn {
   color: var(--orange);
+}
+/* IDE 模式徽标：小胶囊样式（--accent-soft 底 + --accent 文字 + 字重 600），
+   颜色一律走主题变量，不硬编码；不参与收缩，空间不足时先挤其它项 */
+#statusbar .status-ide-mode {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  height: 16px;
+  padding: 0 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
 }
 /* AI 生成内容声明：占据状态栏中段剩余空间并居中，窄窗口时优先收缩省略 */
 #statusbar .status-ai-notice {

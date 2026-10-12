@@ -238,7 +238,7 @@
               v-for="s in visibleSessions(group)"
               :key="s.name"
               class="session-item"
-              :class="[sessionDropClass(group, s), { active: s.name === store.currentSessionName, confirming: confirmDeleteName === s.name }]"
+              :class="[sessionDropClass(group, s), { active: s.name === store.currentSessionName, confirming: confirmDeleteName === s.name || confirmArchiveName === s.name }]"
               :draggable="true"
               :data-session-name="s.name"
               title="拖动可调整会话顺序，右键可上移 / 下移 / 置顶"
@@ -276,6 +276,24 @@
                 title="正在执行回合"
               ></span>
               <div class="m">{{ relativeTime(s.updated_at) }}</div>
+              <!-- 归档：可逆操作但误点会把会话挪出列表，故与删除一致走行内二次确认。
+                   当前活跃会话不可归档，按钮置灰并给出原因 -->
+              <button
+                v-if="confirmArchiveName !== s.name"
+                class="s-archive"
+                data-test="session-archive-btn"
+                :class="{ disabled: s.name === store.currentSessionName }"
+                :disabled="s.name === store.currentSessionName"
+                :title="s.name === store.currentSessionName ? '当前会话不能归档' : '归档此对话'"
+                @click.stop="askArchive(s.name)"
+              >⤓</button>
+              <button
+                v-else
+                class="s-confirm archive"
+                data-test="session-archive-confirm"
+                title="点击确认归档"
+                @click.stop="confirmArchive(s.name)"
+              >确认</button>
               <button
                 v-if="confirmDeleteName !== s.name"
                 class="s-del"
@@ -705,6 +723,9 @@ function startLayoutSync() {
     layoutSyncTimer = undefined;
   }
   syncLayoutFromBackend();
+  // 归档会话列表同样必须等桥就绪后再拉：api 对象先注入、方法后注入，
+  // 抢跑会拿到「方法不存在」的空结果，表现为归档区永远是 0
+  void store.loadArchivedSessions();
 }
 
 function onLayoutBridgeReady() {
@@ -890,6 +911,8 @@ function onGroupDragEnd() {
 }
 // 正在等待二次确认删除的会话名（在时间位置显示红色小确认按钮）
 const confirmDeleteName = ref('');
+// 正在等待二次确认归档的会话名（同处时间位置，确认按钮用主色区分可逆操作）
+const confirmArchiveName = ref('');
 // 手机访问绑定信息（点击手机图标后弹出二维码，弹窗内可切换移动端 / web远端）
 // permanent=true 表示永久有效（后端 expires_in=0），不做倒计时自动刷新
 const remoteBind = ref<null | { url: string; qr: string; expires_in: number; permanent?: boolean }>(null);
@@ -1369,13 +1392,28 @@ function confirmDelete(name: string) {
   store.deleteSingleSession(name);
 }
 
+// 归档（行内 ⤓）：与删除同一套行内二次确认——首击只进入确认态，点确认才真正归档。
+// 归档可逆但会把会话挪出列表，误点后要找回来得进设置页，故不直接执行。
+// 确认后由 store 静默完成刷新；当前活跃会话在按钮上已置灰，store 里还有一道同源保护。
+function askArchive(name: string) {
+  confirmDeleteName.value = '';
+  confirmArchiveName.value = name;
+}
+
+function confirmArchive(name: string) {
+  confirmArchiveName.value = '';
+  void store.archiveSession(name);
+}
+
 function onSessionClick(s: { name: string; display_name?: string; workdir?: string }) {
-  // 处于确认删除状态时，点击条目其它区域视为取消，不切换会话
-  if (confirmDeleteName.value === s.name) {
+  // 处于二次确认态（删除 / 归档）时，点击条目其它区域视为取消，不切换会话
+  if (confirmDeleteName.value === s.name || confirmArchiveName.value === s.name) {
     confirmDeleteName.value = '';
+    confirmArchiveName.value = '';
     return;
   }
   confirmDeleteName.value = '';
+  confirmArchiveName.value = '';
   // 切换会话前清理右键菜单与重命名编辑态（两者互斥，且不随会话保留）
   closeCtxMenu();
   cancelRename();
@@ -1796,6 +1834,14 @@ function getFolderTitle(g: SessionGroup) {
   flex-shrink: 0;
   font-size: 11.5px;
   color: var(--text-faint);
+  /* 右侧操作区（归档 ⤓ right:26px / 删除 ✕ right:6px 均为 absolute 定位）需要约 44px，
+     这里给时间预留等宽并右对齐，避免 hover 时按钮压在时间文字上 */
+  min-width: 44px;
+  text-align: right;
+}
+/* hover 时时间让位给操作按钮：两层文字不再叠在一起 */
+.session-item:hover .m {
+  visibility: hidden;
 }
 /* 悬停时删除按钮出现在最右侧，隐藏时间避免重叠 */
 .session-item:hover .m {
@@ -1854,6 +1900,34 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--red);
   background: rgba(248, 81, 73, 0.15);
 }
+/* 归档按钮与删除按钮同处 hover 操作区：删除贴最右，归档紧邻其左 */
+.session-item .s-archive {
+  position: absolute;
+  right: 26px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: 0.15s;
+}
+.session-item:hover .s-archive {
+  opacity: 1;
+}
+.session-item .s-archive:hover {
+  color: var(--accent);
+  background: var(--bg3);
+}
+/* 当前活跃会话不可归档：置灰且不可点（tooltip 说明原因） */
+.session-item .s-archive.disabled,
+.session-item:hover .s-archive.disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
 /* 二次确认状态：时间位置显示红色小确认按钮 */
 .session-item.confirming .m {
   visibility: hidden;
@@ -1875,6 +1949,11 @@ function getFolderTitle(g: SessionGroup) {
 }
 .session-item .s-confirm:hover {
   filter: brightness(1.15);
+}
+/* 归档的确认按钮与删除同处操作区，但用主色表示这是可逆操作 */
+.session-item .s-confirm.archive {
+  right: 26px;
+  background: var(--accent);
 }
 @keyframes s-confirm-pop {
   from { transform: translateY(-50%) scale(0.85); opacity: 0; }
