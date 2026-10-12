@@ -333,7 +333,7 @@ function onMdBodyClick(e: MouseEvent) {
     return;
   }
 
-  const saveBtn = (e.target as HTMLElement).closest('button.md-img-save');
+  const saveBtn = (e.target as HTMLElement).closest('button.md-img-save, button.md-video-save');
   if (saveBtn) {
     e.preventDefault();
     const src = saveBtn.getAttribute('data-save-src') || '';
@@ -456,9 +456,10 @@ async function copyMdImageToClipboard(src: string, btn: HTMLButtonElement) {
 }
 
 // "另存为"：后端弹原生保存对话框，把仓库里的原文件复制到用户选择的位置。
+// 图片与视频共用本函数（按钮由 Markdown 渲染层产出，类名不同、属性约定一致）。
 // 用户取消不提示失败；成功/失败都在按钮上短暂反馈，不打断阅读。
 async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButtonElement) {
-  const label = btn.querySelector('.md-img-save-text');
+  const label = btn.querySelector('.md-img-save-text, .md-video-save-text');
   const restore = () => {
     btn.classList.remove('saved', 'save-failed');
     if (label) label.textContent = '另存为';
@@ -476,7 +477,7 @@ async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButton
     } else if (!res || !res.cancelled) {
       // 取消对话框不是错误，静默复原；其余失败给出可见提示
       feedback('保存失败', 'save-failed');
-      if (res && res.msg) store.notifyChat(`另存图片失败：${res.msg}`);
+      if (res && res.msg) store.notifyChat(`另存失败：${res.msg}`);
     }
   } finally {
     btn.disabled = false;
@@ -853,10 +854,12 @@ async function copyUserMessage() {
   cursor: zoom-in;
   object-fit: contain;
 }
-/* 悬停浮现的图片操作区（复制原图 / 另存为）：图片右上角，两按钮横向排列。
-   配色固定为深色底白字（不随主题变量走），保证压在任意明暗的图片内容上
+/* 悬停浮现的媒体操作区（图片：复制原图 / 另存为；视频：另存为）：压在媒体
+   右上角，按钮横向排列。视频原生控件条在底部，与顶部操作区不重叠。
+   配色固定为深色底白字（不随主题变量走），保证压在任意明暗的图片/画面上
    都有足够对比度 */
-.md-body :deep(.md-img-actions) {
+.md-body :deep(.md-img-actions),
+.md-body :deep(.md-video-actions) {
   position: absolute;
   top: 14px;
   right: 14px;
@@ -866,16 +869,21 @@ async function copyUserMessage() {
   transition: opacity 0.15s ease;
 }
 .md-body :deep(.md-media-wrap:hover .md-img-actions),
+.md-body :deep(.md-media-wrap:hover .md-video-actions),
 .md-body :deep(.md-img-actions:focus-within),
+.md-body :deep(.md-video-actions:focus-within),
 /* 按钮自身处于反馈态时（点击后鼠标移开）操作区继续保持可见 */
 .md-body :deep(.md-img-actions:has(.copied)),
 .md-body :deep(.md-img-actions:has(.saved)),
 .md-body :deep(.md-img-actions:has(.copy-failed)),
-.md-body :deep(.md-img-actions:has(.save-failed)) {
+.md-body :deep(.md-img-actions:has(.save-failed)),
+.md-body :deep(.md-video-actions:has(.saved)),
+.md-body :deep(.md-video-actions:has(.save-failed)) {
   opacity: 1;
 }
 .md-body :deep(.md-img-copy),
-.md-body :deep(.md-img-save) {
+.md-body :deep(.md-img-save),
+.md-body :deep(.md-video-save) {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -891,27 +899,32 @@ async function copyUserMessage() {
   backdrop-filter: blur(4px);
 }
 .md-body :deep(.md-img-copy svg),
-.md-body :deep(.md-img-save svg) {
+.md-body :deep(.md-img-save svg),
+.md-body :deep(.md-video-save svg) {
   width: 13px;
   height: 13px;
 }
 .md-body :deep(.md-img-copy:disabled),
-.md-body :deep(.md-img-save:disabled) {
+.md-body :deep(.md-img-save:disabled),
+.md-body :deep(.md-video-save:disabled) {
   cursor: default;
   opacity: 0.75;
 }
 .md-body :deep(.md-img-copy:hover),
-.md-body :deep(.md-img-save:hover) {
+.md-body :deep(.md-img-save:hover),
+.md-body :deep(.md-video-save:hover) {
   background: rgba(15, 15, 15, 0.9);
   border-color: rgba(255, 255, 255, 0.55);
   color: #fff;
 }
 .md-body :deep(.md-img-copy.copied),
-.md-body :deep(.md-img-save.saved) {
+.md-body :deep(.md-img-save.saved),
+.md-body :deep(.md-video-save.saved) {
   color: #4ade80;
 }
 .md-body :deep(.md-img-copy.copy-failed),
-.md-body :deep(.md-img-save.save-failed) {
+.md-body :deep(.md-img-save.save-failed),
+.md-body :deep(.md-video-save.save-failed) {
   color: #f87171;
 }
 .md-body :deep(video.md-video) {

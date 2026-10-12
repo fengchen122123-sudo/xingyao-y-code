@@ -1138,6 +1138,16 @@ COMMAND_COMPLETIONS = [
     ("/exit", "退出 星瑶Code"),
 ]
 
+# /session 的子命令补全（与 /session 分支的实际分支保持一致）
+SESSION_SUBCOMMANDS = [
+    ("all", "列出所有目录下的历史会话"),
+    ("archive", "归档指定会话（从默认列表隐藏，数据保留可恢复）"),
+    ("unarchive", "取消归档，恢复回默认会话列表"),
+    ("archived", "列出全部已归档会话"),
+    ("rename", "重命名当前活动会话"),
+    ("delete", "物理删除指定会话"),
+]
+
 
 def _active_reasoning_snapshot():
     """返回 (active_model_id, model_dict, 思考能力快照)；无激活模型时前两者为 None。
@@ -2712,11 +2722,14 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("🌟 <b><ansigreen>星瑶Code CLI 系统指令与操作指南</ansigreen></b>"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
         print_formatted_text(HTML("<b><ansiyellow>【1. 会话与上下文管理】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名)"))
+        print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名，A 归档，Tab 切归档区)"))
         print_formatted_text(HTML("  <ansicyan>/session &lt;会话名称&gt;</ansicyan>              : 按名称直接切换到指定会话 (不存在则创建)"))
         print_formatted_text(HTML("  <ansicyan>/session all</ansicyan>                         : 列出所有目录下的历史会话 (含归属路径与时间)"))
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
+        print_formatted_text(HTML("  <ansicyan>/session archive &lt;会话名称&gt;</ansicyan>         : 归档指定会话（从默认列表隐藏，数据保留、可恢复）"))
+        print_formatted_text(HTML("  <ansicyan>/session unarchive &lt;会话名称&gt;</ansicyan>       : 取消归档，恢复回默认会话列表"))
+        print_formatted_text(HTML("  <ansicyan>/session archived</ansicyan>                    : 列出全部已归档会话 (含归档时间与归属路径)"))
         print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
         print_formatted_text(HTML(f"  <ansicyan>/undo [turn_id]</ansicyan>                      : 按回合撤销文件修改（整轮预检+确认；list 列表 / status 状态 / recover 恢复中断事务，默认确认 N，无 --force）"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
@@ -3472,9 +3485,50 @@ def handle_slash_command(command_text):
                         print_formatted_text(HTML("<ansired>❌ 会话重命名失败。</ansired>"))
                 else:
                     print_formatted_text(HTML("<ansired>❌ 用法错误。请输入：/session rename &lt;新名称&gt;</ansired>"))
+            elif sub == "archive" and len(parts) > 2:
+                # 归档会话：从默认列表隐藏，数据零损失、可逆（提示风格对齐 /session delete）
+                target = parts[2].strip("<>")
+                safe_target = _esc(target)
+                if target == current_session:
+                    print_formatted_text(HTML("<ansired>❌ 不能归档当前活跃会话，请先切换到其它会话。</ansired>"))
+                    return
+                if not manager.archive_session(target):
+                    print_formatted_text(HTML(f"<ansired>❌ 会话 {safe_target} 不存在，未执行归档。</ansired>"))
+                    return
+                print_formatted_text(HTML(
+                    f"<ansigreen>✔ 会话 {safe_target} 已归档（数据保留，可用 /session unarchive {safe_target} 恢复）。</ansigreen>"
+                ))
+            elif sub == "unarchive" and len(parts) > 2:
+                # 取消归档：把会话恢复回默认列表（幂等，未归档会话调用同样安全）
+                target = parts[2].strip("<>")
+                safe_target = _esc(target)
+                if not manager.unarchive_session(target):
+                    print_formatted_text(HTML(f"<ansired>❌ 会话 {safe_target} 不存在，未执行取消归档。</ansired>"))
+                    return
+                print_formatted_text(HTML(f"<ansigreen>✔ 会话 {safe_target} 已取消归档，已恢复回会话列表。</ansigreen>"))
+            elif sub in ("archive", "unarchive"):
+                print_formatted_text(HTML(f"<ansired>❌ 用法错误。请输入：/session {sub} &lt;会话名称&gt;</ansired>"))
+            elif sub == "archived":
+                # 列出全部已归档会话（含归档时间、消息数、归属目录），格式对齐 /session all
+                archived_sessions = manager.get_all_sessions(archived_only=True)
+                if not archived_sessions:
+                    print_formatted_text(HTML("<ansiyellow>(没有任何已归档会话)</ansiyellow>"))
+                else:
+                    print_formatted_text(HTML("<b><ansicyan>已归档会话（按归档时间排序）：</ansicyan></b>"))
+                    for s in archived_sessions:
+                        time_str = (s.get("updated_at") or "-")[:16]
+                        archived_at = (s.get("archived_at") or "-")[:16]
+                        workdir = s.get("workdir") or "(历史遗留/全局)"
+                        print_formatted_text(HTML(
+                            f"  - <b>{_esc(s['name'])}</b>  [{_esc(time_str)}]  ({s['count']} 条消息)  <ansigray>{_esc(workdir)}</ansigray>  <ansigray>归档于 {_esc(archived_at)}</ansigray>"
+                        ))
             else:
                 # 向后兼容：默认会话切换 /session <会话名>
                 target = parts[1].strip("<>")
+                # 不变量：切换到归档会话时自动取消归档，避免「会话处于归档态却正在被使用」
+                if target in {s["name"] for s in manager.get_all_sessions(archived_only=True)}:
+                    manager.unarchive_session(target)
+                    print_formatted_text(HTML(f"<ansiyellow>✔ 会话 {_esc(target)} 已自动取消归档。</ansiyellow>"))
                 # 确保目标会话在数据库中已存在，避免后续 get_history/计划绑定/压缩
                 # 基于一个不存在的 session_name 工作，导致状态失配。
                 manager.create_session_explicit(target)
@@ -4321,6 +4375,18 @@ def _make_input_app():
                                 opt_id,
                                 start_position=-len(typed),
                                 display_meta="解释器: " + label + ("" if available else " (未安装)"),
+                            )
+                    return
+                # /session 子命令补全：让归档等子命令可被直接发现（对照 /shell 的写法）
+                session_arg = re.match(r'^/sessions?\s+(\S*)$', text)
+                if session_arg is not None:
+                    typed = session_arg.group(1)
+                    for sub_name, sub_desc in SESSION_SUBCOMMANDS:
+                        if sub_name.startswith(typed.lower()):
+                            yield Completion(
+                                sub_name,
+                                start_position=-len(typed),
+                                display_meta="会话子命令: " + sub_desc,
                             )
                     return
                 word = document.get_word_before_cursor(WORD=True)

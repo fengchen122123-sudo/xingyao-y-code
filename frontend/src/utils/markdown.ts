@@ -93,7 +93,15 @@ function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): strin
     return `<span class="md-media-error">⚠ ${escapeHtml(name)}：媒体服务不可用</span>`;
   }
   if (item.kind === 'video') {
-    return `<video class="md-video" controls preload="metadata" playsinline src="${escapeHtml(src)}"></video>`;
+    const alt = caption || item.caption || item.source_name || '视频';
+    // controlslist 必须全小写（HTML 属性）；nodownload 让原生 ⋮ 溢出菜单不再出现
+    // 「下载」项——那套菜单在 Chromium shadow DOM 里，JS 改不了文字、也拦不到单项点击。
+    return `<span class="md-media-wrap md-video-wrap">`
+      + `<video class="md-video" controls controlslist="nodownload" preload="metadata" playsinline src="${escapeHtml(src)}"></video>`
+      + `<span class="md-video-actions">`
+      + `<button class="md-video-save" type="button" title="另存为" aria-label="另存为" data-save-src="${escapeHtml(src)}" data-save-name="${escapeHtml(alt)}">${SAVE_ICON_SVG}<span class="md-video-save-text">另存为</span></button>`
+      + `</span>`
+      + `</span>`;
   }
   const alt = caption || item.caption || item.source_name || '图片';
   // 悬停浮现操作区：src 放 data 属性，点击经 MessageBubble 事件委托处理。

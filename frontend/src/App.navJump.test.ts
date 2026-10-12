@@ -272,3 +272,61 @@ it('用户滚动到顶部正常触发翻页（意图守卫不误伤）', async (
   expect((window as any).pywebview.api.load_older_messages).toHaveBeenCalledTimes(1);
   wrapper.unmount();
 });
+
+// ---------------------------------------------------------------------------
+// 回归（2026-10-11 用户反馈「点右侧最上面一个点，怎么都无法加载到最上面」）：
+// 会话分页状态被失败响应清空（has_more=false + 游标 null）时，跨页跳转不得
+// 直接放弃 —— 必须真发一次翻页请求，把更早历史加载进来。
+// ---------------------------------------------------------------------------
+
+it('分页状态被清空（has_more=false、游标 null）时，跨页跳转仍会加载更早历史', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  store.currentSessionName = 'A';
+  // 历史窗口只剩尾部：已加载首条是红点索引 2，前两个红点（含最上面那个）未加载
+  store.messages = [
+    { role: 'user', content: '第三条', _msg_id: 30 },
+    { role: 'assistant', content: '回复三', _msg_id: 31 },
+  ] as any;
+  store.navItems = [
+    { id: 10, preview: '第一条' },
+    { id: 20, preview: '第二条' },
+    { id: 30, preview: '第三条' },
+  ];
+  store.historyHasMore = false;   // 被失败响应清成「没有更早历史」
+  store.historyOldestId = null;   // 游标同时丢失
+
+  (window as any).pywebview = {
+    api: {
+      load_older_messages: vi.fn().mockResolvedValue({
+        ok: true,
+        messages: [
+          { role: 'user', content: '第一条', _msg_id: 10 },
+          { role: 'assistant', content: '回复一', _msg_id: 11 },
+          { role: 'user', content: '第二条', _msg_id: 20 },
+          { role: 'assistant', content: '回复二', _msg_id: 21 },
+        ],
+        has_more: false,
+        oldest_id: 10,
+      }),
+    },
+  };
+
+  const wrapper = mount(App, { global: { stubs } });
+  const el = wrapper.find('#chat-scroll').element as HTMLElement;
+  setMetrics(el, { scrollTop: 0, scrollHeight: 600 });
+
+  emitJump(wrapper, { index: 0, id: 10 });
+  await wait(200);
+
+  // 关键回归：没被 historyHasMore=false 挡住，真发了一次翻页（游标由已加载消息自愈而来）
+  expect((window as any).pywebview.api.load_older_messages).toHaveBeenCalledWith('A', 30);
+  // 更早历史已进入消息流，最上面一个红点对应的消息已被加载
+  expect(store.messages.map(m => m.content)).toEqual([
+    '第一条', '回复一', '第二条', '回复二', '第三条', '回复三',
+  ]);
+  expect(store.firstLoadedMsgId).toBe(10);
+  expect(store.historyHasMore).toBe(false);
+  expect(store.historyOldestId).toBe(10);
+  wrapper.unmount();
+});

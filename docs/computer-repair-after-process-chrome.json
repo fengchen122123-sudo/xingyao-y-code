@@ -1,0 +1,49 @@
+[
+  {
+    "case": "process_start",
+    "ok": true,
+    "ms": 576.9,
+    "browser_pid": 13528
+  },
+  {
+    "case": "process_navigate_observe",
+    "ok": true,
+    "ms": 268.7,
+    "title": "YCODE LOCAL AUDIT",
+    "surface_id": "page-1"
+  },
+  {
+    "case": "process_click_title_oracle",
+    "ok": true,
+    "ms": 40.8,
+    "title": "YCODE CLICKED 1"
+  },
+  {
+    "case": "process_unicode_title_oracle",
+    "ok": true,
+    "ms": 61.1,
+    "title": "YCODE INPUT 10"
+  },
+  {
+    "case": "process_navigation_title_oracle",
+    "ok": true,
+    "title": "YCODE SECOND"
+  },
+  {
+    "case": "process_clean_close_no_orphans",
+    "ok": true,
+    "close_ms": 123.4,
+    "orphan_browser_processes": 0
+  },
+  {
+    "case": "stop_during_action_hard_stop",
+    "ok": true,
+    "close_ms": 118.3,
+    "admission_reject_under_200ms": true,
+    "orphan_browser_processes": 0
+  },
+  {
+    "case": "profile_reusable_after_hard_stop",
+    "ok": true
+  }
+]

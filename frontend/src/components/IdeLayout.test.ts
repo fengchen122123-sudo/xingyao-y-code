@@ -41,6 +41,9 @@ function installBridge(overrides: Record<string, unknown> = {}) {
     ide_write_file: vi.fn(async () => ({ ok: true, hash: 'h2' })),
     ide_get_layout: vi.fn(async () => ({ ok: true, layout: null })),
     ide_save_layout: vi.fn(async (_s: string, layout: unknown) => ({ ok: true, layout })),
+    // P6 布局用例要用到的两个工作区接口：文件树拉取与原生「打开文件夹」对话框
+    get_file_tree: vi.fn(async () => ({ ok: true, file_tree: [] })),
+    select_workspace_folder: vi.fn(async () => ({ ok: false })),
     ...overrides,
   };
   (window as any).pywebview = { api };
@@ -51,8 +54,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // 挂载真 App 时子组件全部 stub（照搬 App.historyPaged.test.ts），但 IdeLayout 保持真身——
 // A 用例要断言的正是 App 模板与 IdeLayout / BottomPanel 的终端挂载关系。
-// Teleport 一并 stub：目标 #ide-chat-host 在分离容器里挂载时还不在 document 中，
-// 真 Teleport 会取不到 target；本用例只数终端实例，不关心搬 DOM。
+// teleport 一并 stub：App 模板已不再用 Teleport 搬对话区（改用 CSS 停靠到 #main
+// 右侧），留这个 stub 是防止将来别处再引入 Teleport 时，在分离容器里取不到 target。
 const appStubs = {
   Topbar: true, Sidebar: true, KimiEmptyState: true, TurnGroup: true,
   InputArea: true, RightPanel: true, ConfirmModal: true, UpdateModal: true,
@@ -273,6 +276,157 @@ it('收起再展开底部面板：调试控制台输出不丢，页签选择也�
   expect(out).toContain('before close');
   expect(out).toContain('while closed');
   expect(ide.bottomTab).toBe('debug');
+  wrapper.unmount();
+});
+
+// ── P5：活动栏 7 项与左侧面板路由 ────────────────────────────────────────
+
+// 活动栏按钮没有 data-test，按 title 找（title 本身就是设计稿里的中文名，读起来也直观）
+function activityBtn(wrapper: ReturnType<typeof mount>, title: string) {
+  const btn = wrapper.findAll('.activity-btn').find((b) => b.attributes('title') === title);
+  expect(btn, `活动栏缺少「${title}」按钮`).toBeTruthy();
+  return btn!;
+}
+
+it('切到「运行和调试」挂载 DebugPane，不再出现「将在 S3 接入」的过时占位', async () => {
+  // 旧实现里 debug 落进 v-else 分支，只显示「断点与调用栈将在 S3 接入后显示」——
+  // DebugPane 早已交付，那句文案会把「点调试没反应」伪装成已完成。
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  await activityBtn(wrapper, '运行和调试').trigger('click');
+  await flushPromises();
+
+  expect(wrapper.find('[data-test="debug-pane"]').exists()).toBe(true);
+  expect(wrapper.text()).not.toContain('将在 S3 接入');
+  expect(wrapper.text()).not.toContain('断点与调用栈将在');
+  wrapper.unmount();
+});
+
+it('切到「搜索」「扩展」显示诚实空态：只说明能力边界，不放伪造的功能控件', async () => {
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  await activityBtn(wrapper, '搜索').trigger('click');
+  expect(wrapper.find('[data-test="search-empty"]').exists()).toBe(true);
+  expect(wrapper.text()).toContain('文件搜索将在后续版本接入');
+  // 空态里不得出现输入框：后端没有文件搜索接口（已核查 core/ide/ 与 gui_bridge.py），
+  // 放个搜不出东西的输入框比空态更误导
+  expect(wrapper.find('.ide-side input').exists()).toBe(false);
+  expect(wrapper.find('.ide-side textarea').exists()).toBe(false);
+
+  await activityBtn(wrapper, '扩展').trigger('click');
+  expect(wrapper.find('[data-test="extensions-empty"]').exists()).toBe(true);
+  expect(wrapper.text()).toContain('扩展市场尚未接入');
+  wrapper.unmount();
+});
+
+it('活动栏动作项：「设置」打开设置页，「星瑶」聚焦对话输入框，且都不改变当前面板', async () => {
+  const store = useAppStore();
+  // 设置入口走 openModelSettings（与 Sidebar 一致），它会拉取模型配置；桩掉避免真请求
+  installBridge({ get_model_settings: vi.fn(async () => ({})) });
+  // attachTo：星瑶按钮靠 document.querySelector 找对话输入框并 focus()，
+  // 未挂到 document 上的元素 focus 不会成为 activeElement（jsdom 语义），
+  // 这里必须真挂进 body 才能验证"聚焦"这一行为
+  const wrapper = mount(IdeLayout, { attachTo: document.body });
+  await flushPromises();
+
+  await activityBtn(wrapper, '设置').trigger('click');
+  expect(store.settingsOpen).toBe(true);
+
+  // 对话区由 App.vue 渲染、CSS 停靠在 #main 右侧，不在本组件树内。这里在 body 上
+  // 手工放一个 #center（含 textarea），模拟它在真实 DOM 里的样子
+  const host = document.createElement('div');
+  host.id = 'center';
+  const textarea = document.createElement('textarea');
+  host.appendChild(textarea);
+  document.body.appendChild(host);
+  await activityBtn(wrapper, '星瑶').trigger('click');
+  expect(document.activeElement).toBe(textarea);
+
+  // 动作型项不是面板：左侧仍是资源管理器（文件树），没有被顶成空白分支
+  expect(wrapper.text()).toContain('文件');
+  expect(wrapper.findAll('.activity-btn.active').map((b) => b.attributes('title'))).toEqual(['资源管理器']);
+  host.remove();
+  wrapper.unmount();
+});
+
+// ── P6：IDE 布局与视觉对齐设计稿（mockups/ide-mode-redesign.html） ──────────
+
+it('无工作区：编辑器区渲染欢迎卡片，且不自动弹目录选择器 / 不拉文件树', async () => {
+  const api = installBridge();
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  // 欢迎卡片（WorkspaceWelcome）用 data-test 锚点断言存在
+  expect(wrapper.find('[data-test="workspace-welcome"]').exists()).toBe(true);
+  // ensureIdeWorkspace 的语义：无工作区直接返回——既不弹原生对话框，也不打后端拉树
+  expect(api.get_file_tree).not.toHaveBeenCalled();
+  expect(api.select_workspace_folder).not.toHaveBeenCalled();
+  // 没有工作区时不得渲染文件树/空状态之外的假控件：欢迎卡片里没有可用的「新建项目」等
+  expect(wrapper.get('[data-test="welcome-new-project"]').attributes('disabled')).toBeDefined();
+  wrapper.unmount();
+});
+
+it('有工作区：资源管理器渲染文件树与大纲/时间线区段，不渲染欢迎卡片，也不重复拉树', async () => {
+  const store = useAppStore();
+  store.workdir = 'D:\\proj';
+  store.fileTree = [{ n: 'a.py', d: 0 }, { n: 'core', d: 1 }] as any;
+  const api = installBridge();
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  expect(wrapper.find('[data-test="explorer-tree"]').exists()).toBe(true);
+  expect(wrapper.text()).toContain('a.py');
+  expect(wrapper.find('[data-test="workspace-welcome"]').exists()).toBe(false);
+  // 树已在内存里：ensureIdeWorkspace 不重复打后端（模式切换是高频操作）
+  expect(api.get_file_tree).not.toHaveBeenCalled();
+
+  // 大纲 / 时间线：数据源核查为「没有」，因此只允许出现折叠区段 + 诚实空态
+  expect(wrapper.get('[data-test="explorer-outline-empty"]').text()).toContain('语言服务器提供符号后显示');
+  expect(wrapper.find('[data-test="explorer-timeline-empty"]').exists()).toBe(false); // 默认折叠
+  await wrapper.get('[data-test="explorer-timeline"] .sect-head').trigger('click');
+  expect(wrapper.get('[data-test="explorer-timeline-empty"]').text()).toContain('Git 提交历史接入后显示');
+  wrapper.unmount();
+});
+
+it('资源管理器空状态的「打开文件夹」点击后调用 select_workspace_folder', async () => {
+  const api = installBridge();
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  const btn = wrapper.get('[data-test="explorer-open-folder"]');
+  expect(btn.text()).toContain('打开文件夹');
+  await btn.trigger('click');
+  await flushPromises();
+
+  expect(api.select_workspace_folder).toHaveBeenCalledTimes(1);
+  wrapper.unmount();
+});
+
+it('收起对话区后活动栏「星瑶」能恢复，占位节点始终留在 DOM 里', async () => {
+  const store = useAppStore();
+  const wrapper = mount(IdeLayout);
+  await flushPromises();
+
+  // 收起状态在 appStore（收起按钮在 App.vue 的对话头部、恢复入口是本组件的活动栏动作
+  // 与右缘浮动按钮），所以这里直接置 store 状态模拟「已收起」
+  store.ideChatCollapsed = true;
+  await nextTick();
+
+  // 占位节点决定编辑器区右边让出多少宽度，用 v-show 隐藏而不是 v-if 卸载（避免布局抖动）。
+  // 这里断言内联 style 而不是 isVisible()——该 helper 在 jsdom 下按元素缓存首次结果，
+  // 收起前后读到的值不可靠。
+  expect(wrapper.find('[data-test="ide-chat-gap"]').exists()).toBe(true);
+  expect(wrapper.get('[data-test="ide-chat-gap"]').attributes('style') ?? '').toContain('display: none');
+  // 收起时右缘的浮动恢复按钮出现：只留活动栏图标不够显眼，「收起」会像不可逆操作
+  expect(wrapper.find('[data-test="ide-chat-restore"]').exists()).toBe(true);
+
+  // 活动栏「星瑶」必须能恢复展开，否则「收起」是一次性不可逆操作
+  await activityBtn(wrapper, '星瑶').trigger('click');
+  await nextTick();
+  expect(wrapper.get('[data-test="ide-chat-gap"]').attributes('style') ?? '').not.toContain('display: none');
+  expect(wrapper.find('[data-test="ide-chat-restore"]').exists()).toBe(false);
   wrapper.unmount();
 });
 

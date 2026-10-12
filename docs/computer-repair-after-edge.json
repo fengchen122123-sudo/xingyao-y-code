@@ -1,0 +1,109 @@
+[
+  {
+    "case": "start",
+    "ms": 480.5,
+    "ok": true
+  },
+  {
+    "case": "navigate_local",
+    "ms": 26.3,
+    "ok": true
+  },
+  {
+    "case": "observe",
+    "ms": 222.2,
+    "ok": true
+  },
+  {
+    "case": "plain_click",
+    "ms": 3.8,
+    "ok": true,
+    "actual": 1
+  },
+  {
+    "case": "ctrl_click",
+    "ms": 3.6,
+    "ok": true,
+    "actual": true
+  },
+  {
+    "case": "shift_click",
+    "ms": 3.9,
+    "ok": true,
+    "actual": true
+  },
+  {
+    "case": "double_click",
+    "ms": 1.6,
+    "ok": true,
+    "actual": 1
+  },
+  {
+    "case": "unicode_text",
+    "ms": 9.1,
+    "ok": true,
+    "actual": "中文🙂 audit"
+  },
+  {
+    "case": "ctrl_a_replace",
+    "ms": 3.8,
+    "ok": true,
+    "actual": "replaced"
+  },
+  {
+    "case": "drag",
+    "ms": 19.4,
+    "ok": true,
+    "actual": 1
+  },
+  {
+    "case": "scroll_dispatch",
+    "ms": 12.2,
+    "ok": true
+  },
+  {
+    "case": "scroll_result",
+    "ms": 1.4,
+    "ok": true,
+    "actual": 500
+  },
+  {
+    "case": "navigate_second",
+    "ms": 16.2,
+    "ok": true
+  },
+  {
+    "case": "back",
+    "ms": 19.7,
+    "ok": true,
+    "actual": "/"
+  },
+  {
+    "case": "forward",
+    "ms": 19.1,
+    "ok": true,
+    "actual": "/second"
+  },
+  {
+    "case": "reload",
+    "ms": 17.6,
+    "ok": true,
+    "actual": 0
+  },
+  {
+    "case": "navigate_slow_subresource",
+    "ms": 14.4,
+    "ok": true
+  },
+  {
+    "case": "manual_tab_focus_tracking",
+    "ms": 116.8,
+    "ok": true,
+    "actual": {
+      "tracked_first": true,
+      "click_landed_on_first": true,
+      "surface_id": "page-1",
+      "surface_generation": 1
+    }
+  }
+]

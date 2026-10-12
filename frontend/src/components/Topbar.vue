@@ -47,10 +47,14 @@
     <button class="icon-btn no-drag" id="btn-terminal" title="切换终端" data-test="btn-terminal" @click="store.toggleTerminalPanel()">
       <AppIcon name="square-terminal" :size="16" />
     </button>
-    <!-- 对话 / IDE 双模式切换：按会话隔离，不重建会话、不打断进行中的回合 -->
+    <!-- 对话 / IDE 双模式切换：按会话隔离，不重建会话、不打断进行中的回合。
+         激活态（当前就在 IDE 模式）走强调色胶囊：模式是"当前状态"而非一次性动作，
+         需要一眼可辨，不能只靠两字文案的差异（对照 mockups/ide-mode-redesign.html
+         的 .tb-btn.ide.active）。 -->
     <button
       type="button"
-      class="icon-btn no-drag"
+      class="icon-btn no-drag ide-mode-btn"
+      :class="{ 'is-active': store.ideMode() }"
       id="btn-ide-mode"
       data-test="btn-ide-mode"
       :title="store.ideMode() ? '切换到对话模式' : '切换到 IDE 模式'"
@@ -287,6 +291,19 @@ function handleUpdateClick() {
 .win-close:hover {
   background: var(--red);
   color: #fff;
+}
+
+/* 对话 / IDE 切换按钮：非激活态沿用 .icon-btn（透明底、次级文字色），
+   激活态（当前处于 IDE 模式）用强调色胶囊——背景/边框/文字统一取主题强调色，
+   与设计稿 .tb-btn.ide.active 一致；颜色只走主题变量，随主题自动换肤。 */
+#topbar .icon-btn.ide-mode-btn.is-active {
+  padding: 0 11px;
+  width: auto;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  border-radius: 6px;
 }
 
 /* 更新提示按钮 */

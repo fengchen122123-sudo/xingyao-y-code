@@ -299,6 +299,11 @@ class LanServer:
         # （覆盖桌面下次启动的侧栏排序），此前黑名单存在同类不对称。手机端无此
         # 能力需求（frontend-mobile 不调用它）；只读的 get_ui_layout 保持放行。
         "save_ui_layout",
+        # 会话级 UI 状态（session_ui.json）：写桌面持久状态，决定桌面下次打开
+        # 该会话时落在 IDE 模式还是对话模式——与已封的 save_ui_layout /
+        # ide_save_layout 同一边界（远程覆盖桌面持久状态），按设计 18 的
+        # fail-closed 原则一并封禁。只读的 get_session_ui 保持放行。
+        "save_session_ui",
         # 桌面专属生命周期：shutdown 停掉自动化引擎、set 掉全部取消事件（正在跑
         # 的回合被中止）并走窗口销毁链路——与已封的 window_close /
         # window_confirm_close 同类（桌面专属，手机无意义）。桌面前端不调用它

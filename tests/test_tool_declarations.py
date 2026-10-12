@@ -101,3 +101,4 @@ def test_default_registry_is_fully_covered_by_turn_undo_recorder():
     from core.turn_undo.service import validate_recorder_coverage
 
     assert validate_recorder_coverage(build_default_registry()) == []
+
