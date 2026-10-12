@@ -830,7 +830,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer',
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'plugins' | 'about' | 'contact' | 'disclaimer',
     // 智能体显示名：设置页「人设设置」自定义后全局生效（界面文案/执行过程/思考提示）
     agentName: '星瑶',
     // 智能体对用户的称呼；空串表示不使用特定称呼
@@ -5253,6 +5253,44 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('插件', '插件信任失败: ' + err);
+      }
+    },
+
+    // 插件设置页：页面快照由插件每次返回完整结构（服务端驱动），前端不做增量合并。
+    async loadPluginSettings(name: string): Promise<any> {
+      const api = this._api();
+      if (!api || typeof api.get_plugin_settings !== 'function') {
+        return { ok: false, msg: '当前版本不支持插件设置页' };
+      }
+      try {
+        return await api.get_plugin_settings(name);
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: '读取插件设置页失败: ' + err };
+      }
+    },
+
+    async runPluginSettingsAction(name: string, action: string, params: Record<string, unknown> = {}): Promise<any> {
+      const api = this._api();
+      if (!api || typeof api.run_plugin_settings_action !== 'function') {
+        return { ok: false, msg: '当前版本不支持插件设置动作' };
+      }
+      try {
+        return await api.run_plugin_settings_action(name, action, params);
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: '执行插件动作失败: ' + err };
+      }
+    },
+
+    async openExternalUrl(url: string): Promise<boolean> {
+      const api = this._api();
+      if (!api || typeof api.open_external_url !== 'function') return false;
+      try {
+        const res = await api.open_external_url(url);
+        return !!(res && res.ok);
+      } catch {
+        return false;
       }
     },
 

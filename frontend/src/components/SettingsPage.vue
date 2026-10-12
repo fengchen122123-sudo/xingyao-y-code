@@ -14,6 +14,7 @@
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
       <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
       <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
+      <button data-test="plugins-nav" class="nav-item" :class="{ active: activeSection === 'plugins' }" @click="activeSection = 'plugins'"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>插件</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
@@ -639,6 +640,7 @@
           </div>
         </section>
       </template>
+      <PluginsSettings v-else-if="activeSection === 'plugins'" />
       <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
       <TokenUsageSettingsLegacy v-else-if="activeSection === 'tokens-legacy'" />
       <SystemSettings v-else-if="activeSection === 'system'" />
@@ -754,6 +756,7 @@ import SystemSettings from './SystemSettings.vue';
 import EditorLanguageSettings from './EditorLanguageSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
 import FeishuSettings from './FeishuSettings.vue';
+import PluginsSettings from './PluginsSettings.vue';
 import HooksSettings from './HooksSettings.vue';
 import { useIsMobile } from '../composables/useViewport';
 import qrcodeWechat from '../assets/qrcode-wechat.png';
@@ -770,7 +773,7 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'editor-language' | 'persona' | 'feishu' | 'session-archive' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'editor-language' | 'persona' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 
 // ── 会话归档分区（原侧栏底部「已归档」区搬入设置页）────────────

@@ -1135,6 +1135,10 @@ export interface PyWebViewAPI {
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
   trust_plugin(name: string): Promise<any>;
+  // 插件设置页（声明式渲染）：页面快照读取 / 动作执行 / 打开外部授权链接
+  get_plugin_settings(name: string): Promise<any>;
+  run_plugin_settings_action(name: string, action: string, params?: Record<string, unknown>): Promise<any>;
+  open_external_url(url: string): Promise<{ ok: boolean; msg?: string }>;
   // C11：项目级 Hook 信任（信任卡片数据源 + 信任/拒绝/撤销/重置动作）
   get_hooks(): Promise<{ ok: boolean; hooks?: HookInfo[]; workdir?: string; msg?: string }>;
   grant_hook_trust(digest: string): Promise<any>;
