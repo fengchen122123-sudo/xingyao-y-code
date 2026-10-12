@@ -896,3 +896,96 @@ def test_get_reasoning_snapshot_by_name():
 
     empty = bridge.get_reasoning_snapshot_by_name("")
     assert empty["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 多 Key provider：取 Key 路径与 Key 池一致（单 Key 化），写入/展示原文不变
+# ---------------------------------------------------------------------------
+
+
+def test_get_active_model_returns_single_key_for_multi_key_provider(tmp_path, monkeypatch):
+    """多 Key provider：get_active_model 必须返回 Key 池「当前该用」的单 Key，
+    不得把多行/逗号分隔串整体当作一个 Key 返回。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-first\nsk-second"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    active = model_manager.get_active_model()
+
+    assert active["api_key"] == "sk-first"
+    assert "\n" not in active["api_key"]
+    assert "," not in active["api_key"]
+
+
+def test_get_active_model_keeps_single_key_as_is(tmp_path, monkeypatch):
+    """单 Key provider：get_active_model 原样返回，行为与改造前一致。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+
+    active = model_manager.get_active_model()
+
+    assert active["api_key"] == "sk-secret-value"
+
+
+def test_get_secondary_model_returns_single_key_for_multi_key_provider(tmp_path, monkeypatch):
+    """副模型读取路径同样只返回单 Key（与主链路 Key 池一致）。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-a,sk-b"
+    data["secondary_model_id"] = "m1"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    secondary = model_manager.get_secondary_model()
+
+    assert secondary["api_key"] == "sk-a"
+    assert "," not in secondary["api_key"]
+
+
+def test_get_provider_api_key_returns_full_multiline_raw(tmp_path, monkeypatch):
+    """设置页「显示/复制」路径必须返回完整多行原文（不得拆成单 Key 返回）。"""
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-line1\nsk-line2"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    result = _bare_bridge().get_provider_api_key("p1")
+
+    assert result["ok"] is True
+    assert result["api_key"] == "sk-line1\nsk-line2"
+
+
+def test_fetch_provider_models_uses_single_key_for_multi_key_provider(tmp_path, monkeypatch):
+    """多 Key provider：拉取模型列表的鉴权头必须用单 Key（Key 池首个），
+    绝不把多行串整体塞进 Authorization / x-api-key。"""
+    import httpx
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-first\nsk-second"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "alpha"}]}
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["headers"] = headers
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert captured["headers"]["Authorization"] == "Bearer sk-first"
+    assert captured["headers"]["x-api-key"] == "sk-first"

@@ -168,6 +168,29 @@ def _is_deterministic_api_failure(exc):
     except Exception:
         return False
 
+
+# 多 Key 粘性故障转移（设计见
+# docs/superpowers/specs/2026-10-12-provider-multi-key-failover-design.md）：
+# 仅这三类失败视为「厂商 Key 不可用」，命中时静默切换到下一个可用 Key 重发；
+# model_not_found / context_overflow / rate_limit / 网络类等与 Key 无关，
+# 维持既有 fail-fast / 退避重试逻辑。
+_KEY_RELATED_FAILURE_CATEGORIES = frozenset({
+    "insufficient_quota",
+    "auth_invalid",
+    "permission_denied",
+})
+
+
+def _is_key_related_failure(exc):
+    """判断异常是否属于"换 Key 可能解决"的厂商 Key 类失败（纯函数，便于单测）。
+
+    整体用 try/except 兜底：分类失败时返回 False（保守），绝不误触发换 Key。
+    """
+    try:
+        return map_llm_error(exc).category in _KEY_RELATED_FAILURE_CATEGORIES
+    except Exception:
+        return False
+
 # --- Re-exported from core.permission_terminal ---
 from core.permission_terminal import (
     ASK_USER_ERROR_PREFIX,
@@ -1977,7 +2000,27 @@ def _chat_with_model_generator(
             # API 调用指数退避与 Jitter 抖动重试
             response_stream = None
             inflight_holder = None
+            # 多 Key 粘性故障转移：每个 Step 重建「本请求链已尝试 Key」集合
+            # （同 Step 重试循环共享、跨 Step 重置），Key 池自身（sticky/冷却）
+            # 为进程内存态跨 Step 保留。单 Key / 路由未知 / 任何异常时
+            # key_failover=None，行为与现状完全一致；绝不打印 Key 明文。
+            key_failover = None
+            try:
+                from core.provider_keys import build_key_failover
+
+                key_failover = build_key_failover(
+                    model_name, api_base, model_id=request_model_id
+                )
+                if key_failover is not None:
+                    kwargs["api_key"] = key_failover.initial_key()
+            except Exception:
+                key_failover = None
+                logger.debug("多 Key 池初始化失败，退回单 Key 行为", exc_info=True)
+            key_tried = set()  # 本请求链已尝试过的 Key（防同链重复试同一 Key）
             max_api_retries = 5
+            if key_failover is not None:
+                # 每个 Key 至少有一次尝试机会；单 Key 维持 5 次不变
+                max_api_retries = max(5, key_failover.key_count + 2)
             base_delay = 1.0
             # 超窗自动压缩只允许一次：压缩后仍超限说明单条消息/附件本身过大，
             # 继续重试只会反复重发超大载荷空烧额度
@@ -2196,6 +2239,13 @@ def _chat_with_model_generator(
                     finally:
                         # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
                         future.cancel()
+                    if key_failover is not None:
+                        # 粘性锚定到本次成功的 Key 并清除其冷却；
+                        # 记账失败绝不影响请求成功本身
+                        try:
+                            key_failover.on_success(str(kwargs.get("api_key") or ""))
+                        except Exception:
+                            pass
                     break
                 except Exception as api_err:
                     # 硬中断（用户取消关闭在飞流）会让请求线程抛连接错误；
@@ -2320,6 +2370,25 @@ def _chat_with_model_generator(
                     # 走既有失败收尾（与五次重试耗尽后的路径一致）。分类失败保守回退
                     # 既有重试行为，不改变瞬时错误（429 等）的退避口径。
                     if _is_deterministic_api_failure(api_err):
+                        # 多 Key 粘性故障转移：Key 类失败（额度/鉴权/权限）静默切换
+                        # 到下一个未试过的 Key 重发——不发任何 UI 事件，仅 logger
+                        # 留痕（绝不打印 Key 明文）；其余确定性失败维持 fail-fast；
+                        # 全部 Key 试完 → 抛原错误走既有失败收尾。
+                        if key_failover is not None and _is_key_related_failure(api_err):
+                            current_key = str(kwargs.get("api_key") or "")
+                            key_tried.add(current_key)
+                            next_key = None
+                            try:
+                                next_key = key_failover.on_failure(current_key, key_tried)
+                            except Exception:
+                                next_key = None
+                            if next_key:
+                                kwargs["api_key"] = next_key
+                                logger.info(
+                                    "多 Key 静默切换：厂商 Key 不可用，"
+                                    "已切换下一个 Key 重发（不打印 Key 值）"
+                                )
+                                continue
                         raise api_err
 
                     if attempt < max_api_retries - 1:

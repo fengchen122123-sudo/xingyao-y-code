@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 import core.llm as llm
 import core.model_selector as model_selector
 from core.model_manager import add_provider, load_config
@@ -204,3 +206,45 @@ def test_preset_add_via_selector_path_adds_provider_without_models(monkeypatch, 
     provider = next(p for p in cfg["providers"] if p["id"] == pid)
     assert provider["preset_id"] == "kimi-coding-openai"
     assert provider["models"] == []
+
+
+# ---------------------------------------------------------------------------
+# 多 Key 连接测试（厂商多 Key 一致性适配）
+# ---------------------------------------------------------------------------
+
+
+def test_connection_falls_back_across_multiple_keys(monkeypatch):
+    """多 Key（换行分隔）连接测试：首 Key 失败后自动尝试下一个，任一成功即通过。"""
+    calls = []
+
+    def fake_request_stream(protocol, kwargs, *, timeout, cancel_event=None):
+        calls.append(kwargs.get("api_key"))
+        if kwargs.get("api_key") == "sk-bad":
+            raise RuntimeError("401 invalid api key")
+        return iter([object()]), None
+
+    monkeypatch.setattr("core.llm._request_stream", fake_request_stream)
+
+    model_selector._test_model_connection(
+        "openai", "model-a", "https://api.example.com", "sk-bad\nsk-good"
+    )
+
+    assert calls == ["sk-bad", "sk-good"]
+
+
+def test_connection_raises_last_error_when_all_keys_fail(monkeypatch):
+    """多 Key 全部失败：抛出最后一个 Key 的错误（调用方错误展示逻辑不变）。
+
+    逗号分隔串也按逐 Key 解析，证明 split_provider_keys 的分隔口径生效。
+    """
+    errors = iter([RuntimeError("first-key-error"), RuntimeError("second-key-error")])
+
+    def fake_request_stream(protocol, kwargs, *, timeout, cancel_event=None):
+        raise next(errors)
+
+    monkeypatch.setattr("core.llm._request_stream", fake_request_stream)
+
+    with pytest.raises(RuntimeError, match="second-key-error"):
+        model_selector._test_model_connection(
+            "openai", "model-a", "https://api.example.com", "sk-1,sk-2"
+        )

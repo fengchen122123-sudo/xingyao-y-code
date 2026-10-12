@@ -153,12 +153,13 @@
 
             <label class="field-label">API Key</label>
             <div class="key-field">
-              <input
+              <textarea
                 v-model="providerForm.api_key"
                 data-test="provider-api-key"
-                :type="showProviderKey ? 'text' : 'password'"
-                :placeholder="selectedProvider.has_api_key ? '已配置；留空表示不修改' : '输入 API Key'"
-              />
+                rows="3"
+                :class="{ 'key-masked': !showProviderKey }"
+                :placeholder="selectedProvider.has_api_key ? '已配置；一行一个 Key，留空表示不修改' : '一行一个 API Key，可配置多个'"
+              ></textarea>
               <button
                 class="icon-button"
                 title="复制 API Key"
@@ -1516,6 +1517,9 @@ onMounted(async () => {
 .readonly-field { display: flex; align-items: center; padding: 0 13px; color: var(--text-dim); }
 .key-field { display: flex; align-items: center; overflow: hidden; }
 .key-field input { flex: 1; min-width: 0; height: 40px; padding: 0 13px; border: 0; background: transparent; color: var(--text); outline: 0; }
+/* 多 Key textarea：一行一个 Key；隐藏态用 -webkit-text-security 遮蔽（textarea 不支持 type=password） */
+.key-field textarea { flex: 1; min-width: 0; min-height: 76px; padding: 10px 13px; border: 0; background: transparent; color: var(--text); outline: 0; resize: vertical; font-family: var(--mono); font-size: 13px; line-height: 1.5; box-sizing: border-box; }
+.key-field .key-masked { -webkit-text-security: disc; }
 .key-field button, .row-actions button { border: 0; background: transparent; color: var(--text-faint); }
 .key-field button { padding: 0 13px; }
 .key-field .icon-button { display: flex; align-items: center; padding: 0 10px; cursor: pointer; }
