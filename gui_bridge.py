@@ -7754,6 +7754,84 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 插件设置页（声明式）：插件提供界面快照，前端统一渲染
+    # ------------------------------------------------------------------
+    def get_plugin_settings(self, name: str) -> Dict[str, Any]:
+        """读取插件设置页快照（调插件 plugin_settings({"action": "render"})）。
+
+        仅对"已加载（=已信任 + 已启用）"插件调用；未加载时透传 needs 指引，
+        前端据此渲染"信任并启用"引导。
+        """
+        try:
+            from core.plugin_loader import call_plugin_hook
+
+            result = call_plugin_hook(name, "plugin_settings", {"action": "render"})
+            if not result.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": str(result.get("message") or "插件设置页不可用"),
+                    "needs": result.get("needs"),
+                }
+            data = result.get("data") or {}
+            page = data.get("page") if isinstance(data, dict) else None
+            if not isinstance(page, dict):
+                return {"ok": False, "msg": "插件未返回有效的设置页内容", "needs": None}
+            return {"ok": True, "msg": "", "needs": None, "page": page}
+        except Exception as e:
+            logger.exception("get_plugin_settings 失败")
+            return {"ok": False, "msg": str(e), "needs": None}
+
+    def run_plugin_settings_action(
+        self, name: str, action: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """执行插件设置页上的一个动作，返回插件声明的 envelope（透传）。"""
+        try:
+            from core.plugin_loader import call_plugin_hook
+
+            result = call_plugin_hook(
+                name,
+                "plugin_settings",
+                {"action": str(action or ""), "params": params or {}},
+            )
+            if not result.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": str(result.get("message") or "插件动作不可用"),
+                    "needs": result.get("needs"),
+                }
+            data = result.get("data") or {}
+            if not isinstance(data, dict):
+                return {"ok": False, "msg": "插件动作返回值无效", "needs": None}
+            return {
+                "ok": bool(data.get("ok", True)),
+                "msg": str(data.get("message") or ""),
+                "needs": None,
+                "page": data.get("page"),
+                "auth_url": data.get("auth_url"),
+                "poll": data.get("poll"),
+                "done": data.get("done"),
+            }
+        except Exception as e:
+            logger.exception("run_plugin_settings_action 失败")
+            return {"ok": False, "msg": str(e), "needs": None}
+
+    def open_external_url(self, url: str) -> Dict[str, Any]:
+        """在系统默认浏览器打开 http/https 链接（插件授权页等）；仅放行 http(s)。"""
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(str(url or "").strip())
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                return {"ok": False, "msg": "仅支持打开 http/https 链接"}
+            import webbrowser
+
+            opened = webbrowser.open(parsed.geturl())
+            return {"ok": bool(opened), "msg": "" if opened else "系统浏览器未能打开链接"}
+        except Exception as e:
+            logger.exception("open_external_url 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # Hooks（信任状态与操作走 core.hooks.trust，与 CLI / 执行侧同源；
     #        状态判定每次读盘、不缓存，执行期间的撤销立即生效）
     # ------------------------------------------------------------------
