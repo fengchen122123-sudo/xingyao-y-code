@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
+from urllib.parse import quote
 
 from core.version import __version__ as YCODE_VERSION
 
@@ -31,6 +32,28 @@ def tokenrhythm_agent_headers(url: Optional[str] = None) -> Dict[str, str]:
     if TOKENRHYTHM_DOMAIN in str(url or "").lower():
         return {TOKENRHYTHM_AGENT_HEADER: TOKENRHYTHM_AGENT_NAME}
     return {}
+
+
+# 会话关联头：出站请求统一附带当前执行会话 ID，把本地会话与服务端调用日志
+# 互相关联便于排查问题。值统一 percent-encode——HTTP 头值必须为 ASCII，
+# 中文会话名（自动标题 / 用户改名）编码后可由服务端 URL-decode 还原。
+SESSION_ID_HEADER = "X-Session-Id"
+
+
+def session_id_headers() -> Dict[str, str]:
+    """当前执行会话可确定时返回 X-Session-Id 头；无会话上下文返回空 dict。
+
+    会话取线程级绑定（app_context.get_thread_session）：回合线程 / 子代理
+    线程各自绑定自己的会话，多会话并行互不串扰；单测、headless 等无绑定
+    场景不携带该头，保持既有请求字节不变。调用方统一 headers.update(...) 合并。
+    """
+    # 延迟导入 app_context，避免传输层底端模块连带引入运行时上下文依赖。
+    from core import app_context
+
+    name = str(app_context.get_thread_session() or "")
+    if not name:
+        return {}
+    return {SESSION_ID_HEADER: quote(name, safe="")}
 
 
 @dataclass(frozen=True)
