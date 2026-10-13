@@ -66,9 +66,18 @@ def get_plugin_infos() -> list[dict]:
     """返回最近一次插件扫描的信息列表（dict 副本，调用方修改不影响内部状态）。
 
     每条记录字段：name / version / description / path / source(user|builtin) /
-    status(loaded|disabled|failed|overridden|untrusted) / tools(list[str]) / error(可选)。
+    status(loaded|disabled|failed|overridden|untrusted) / tools(list[str]) /
+    has_settings(bool，是否提供设置页) / error(可选)。
     """
-    return [dict(info) for info in _PLUGIN_INFOS]
+    result: list[dict] = []
+    for info in _PLUGIN_INFOS:
+        item = dict(info)
+        # 设置页由插件入口模块的可选 plugin_settings 钩子声明；未加载（未信任/未启用）
+        # 的插件代码不执行，一律视为没有设置页。
+        module = _LOADED_MODULES.get(str(item.get("name") or ""))
+        item["has_settings"] = callable(getattr(module, "plugin_settings", None))
+        result.append(item)
+    return result
 
 
 def call_plugin_hook(plugin_name: str, hook_name: str, payload: dict | None = None) -> dict:

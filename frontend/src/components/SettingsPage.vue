@@ -14,7 +14,8 @@
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
       <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
       <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
-      <button data-test="plugins-nav" class="nav-item" :class="{ active: activeSection === 'plugins' }" @click="activeSection = 'plugins'"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>插件</button>
+      <div class="nav-section">插件设置</div>
+      <button v-for="p in pluginNavItems" :key="p.name" :data-test="`plugin-nav-${p.name}`" class="nav-item" :class="{ active: activePluginName === p.name }" @click="openPluginSection(p.name)"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>{{ p.name }}</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
@@ -650,6 +651,19 @@
           </div>
         </section>
       </template>
+      <!-- 插件设置页：内容由插件通过 plugin_settings 声明，前端只负责挂载 -->
+      <template v-else-if="activePluginName">
+        <header class="settings-header">
+          <div>
+            <h1>{{ activePluginName }}</h1>
+            <p>插件设置页：内容与配置项由插件自己声明。</p>
+          </div>
+          <button class="icon-button" :title="`刷新 ${activePluginName} 设置页`" :data-test="`plugin-nav-refresh-${activePluginName}`" @click="pluginReloadKey += 1"><AppIcon name="refresh" :size="14" /></button>
+        </header>
+        <section class="plugin-nav-card" :data-test="`plugin-nav-page-${activePluginName}`">
+          <PluginSettingsPanel :name="activePluginName" :reload-key="pluginReloadKey" />
+        </section>
+      </template>
       <PluginsSettings v-else-if="activeSection === 'plugins'" />
       <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
       <TokenUsageSettingsLegacy v-else-if="activeSection === 'tokens-legacy'" />
@@ -767,6 +781,7 @@ import EditorLanguageSettings from './EditorLanguageSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
 import FeishuSettings from './FeishuSettings.vue';
 import PluginsSettings from './PluginsSettings.vue';
+import PluginSettingsPanel from './PluginSettingsPanel.vue';
 import HooksSettings from './HooksSettings.vue';
 import { useIsMobile } from '../composables/useViewport';
 import qrcodeWechat from '../assets/qrcode-wechat.png';
@@ -783,8 +798,23 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'editor-language' | 'persona' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'editor-language' | 'persona' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
+
+// ── 插件设置页入口（提供 plugin_settings 钩子的插件直接挂在左侧导航）────
+const PLUGIN_SECTION_PREFIX = 'plugin:';
+// 只有 has_settings === true（已启用且入口模块声明了设置页）的插件才进导航
+const pluginNavItems = computed(() => (store.plugins || []).filter((p: any) => p && p.has_settings));
+const activePluginName = computed(() =>
+  activeSection.value.startsWith(PLUGIN_SECTION_PREFIX)
+    ? activeSection.value.slice(PLUGIN_SECTION_PREFIX.length)
+    : ''
+);
+// 刷新按钮自增该值，通知面板重新拉取设置页快照
+const pluginReloadKey = ref(0);
+function openPluginSection(name: string) {
+  activeSection.value = `${PLUGIN_SECTION_PREFIX}${name}`;
+}
 
 // ── 会话归档分区（原侧栏底部「已归档」区搬入设置页）────────────
 // 归档列表不进主会话列表，故进入该分区时按需拉取（首次直接落在该分区也拉一次）。
@@ -1088,6 +1118,16 @@ function selectSecondary() {
 }
 
 function startCustomProvider() {
+  // customForm 与设置页同生命周期：上次填写/保存后不重置，再次进入会看到
+  // 上一次的名称、Base URL 甚至 API Key 明文（表现为"历史缓存"）。
+  // 仅在从其它视图进入时重置，已在表单中重复点击则保留正在编辑的内容。
+  if (selectedKind.value !== 'custom') {
+    customForm.name = '';
+    customForm.base_url = '';
+    customForm.api_key = '';
+    customForm.protocol = 'openai';
+    showCustomKey.value = false;
+  }
   selectedKind.value = 'custom';
   selectedId.value = '';
   openMobileDetail();
@@ -1445,6 +1485,8 @@ async function copyEmail() {
 }
 
 onMounted(async () => {
+  // 插件导航项依赖 has_settings，进设置页先刷一次插件列表（store 内部已静默失败）
+  void store.refreshPlugins();
   // 直接读 window.pywebview 而非 store._api()：后者为空时会弹
   // "连接失败" 模态框，更新内容拉取失败不该打扰用户
   const api = window.pywebview?.api;
@@ -1704,6 +1746,9 @@ onMounted(async () => {
 
 /* ── 权限与沙盒分区 ── */
 .perm-settings-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
+/* 插件设置页分区：与其它分区同款卡片外框，面板自带内边距 */
+.plugin-nav-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); overflow: hidden; }
+.plugin-nav-card :deep(.provider-detail) { padding: 26px 28px; }
 
 /* ── 免责条款分区（法律声明）── */
 .disclaimer-card { padding: 6px 32px 30px; }
@@ -1838,6 +1883,7 @@ onMounted(async () => {
 
   /* 其余分区的卡片跟随收紧（Token 统计等子组件自带适配，此处只调容器） */
   .settings-page--mobile .perm-settings-card { padding: 6px 16px 20px; }
+  .settings-page--mobile .plugin-nav-card :deep(.provider-detail) { padding: 18px 16px 22px; }
   .settings-page--mobile .whitelist-head { align-items: flex-start; flex-direction: column; }
   .settings-page--mobile .wl-form { align-items: stretch; flex-direction: column; }
   .settings-page--mobile .wl-form select { flex-basis: auto; }

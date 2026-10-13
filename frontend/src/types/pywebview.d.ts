@@ -370,6 +370,8 @@ export interface PluginInfo {
   status: string;      // loaded | disabled | failed | overridden | pending_enable | pending_disable | untrusted
   enabled: boolean;
   tools: string[];
+  // 插件是否提供设置页（入口模块声明了 plugin_settings 钩子；未启用/未信任一律 false）
+  has_settings?: boolean;
   error?: string;
 }
 
