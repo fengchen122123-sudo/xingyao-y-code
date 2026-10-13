@@ -293,6 +293,14 @@ function handleUpdateClick() {
   color: #fff;
 }
 
+/* 临时隐藏：标题栏「对话 / IDE」模式切换按钮（按需求先隐藏入口）。
+   仅做视觉隐藏，保留 DOM 节点与 store 逻辑——Topbar.ideMode.test.ts 仍以
+   [data-test="btn-ide-mode"] 定位该节点，功能与测试均不受影响；
+   需要恢复入口时删掉下面这条规则即可。 */
+#topbar .icon-btn.ide-mode-btn {
+  display: none;
+}
+
 /* 对话 / IDE 切换按钮：非激活态沿用 .icon-btn（透明底、次级文字色），
    激活态（当前处于 IDE 模式）用强调色胶囊——背景/边框/文字统一取主题强调色，
    与设计稿 .tb-btn.ide.active 一致；颜色只走主题变量，随主题自动换肤。 */
