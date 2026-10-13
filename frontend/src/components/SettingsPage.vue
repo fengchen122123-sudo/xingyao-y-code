@@ -110,12 +110,13 @@
             <div class="readonly-field">{{ selectedPreset.base_url }}</div>
             <label class="field-label">API Key</label>
             <div class="key-field">
-              <input
+              <textarea
                 v-model="presetApiKey"
                 data-test="preset-api-key"
-                :type="showPresetKey ? 'text' : 'password'"
-                placeholder="输入 API Key"
-              />
+                rows="3"
+                :class="{ 'key-masked': !showPresetKey }"
+                placeholder="一行一个 API Key，可配置多个"
+              ></textarea>
               <button @click="showPresetKey = !showPresetKey">{{ showPresetKey ? '隐藏' : '显示' }}</button>
             </div>
             <p class="modal-field-hint">预置厂商仅预填名称与接口地址；添加后通过「获取模型列表」选择模型并自动填充参数。</p>
@@ -299,9 +300,18 @@
             <label class="field-label">名称</label>
             <input v-model="customForm.name" data-test="custom-name" class="text-field" placeholder="如：团队网关" />
             <label class="field-label">Base URL</label>
-            <input v-model="customForm.base_url" class="text-field mono" placeholder="https://api.example.com/v1" />
+            <input v-model="customForm.base_url" data-test="custom-base-url" class="text-field mono" placeholder="https://api.example.com/v1" />
             <label class="field-label">API Key</label>
-            <input v-model="customForm.api_key" type="password" class="text-field" placeholder="输入 API Key" />
+            <div class="key-field">
+              <textarea
+                v-model="customForm.api_key"
+                data-test="custom-api-key"
+                rows="3"
+                :class="{ 'key-masked': !showCustomKey }"
+                placeholder="一行一个 API Key，可配置多个"
+              ></textarea>
+              <button @click="showCustomKey = !showCustomKey">{{ showCustomKey ? '隐藏' : '显示' }}</button>
+            </div>
             <label class="field-label">API 格式</label>
             <select v-model="customForm.protocol" class="text-field">
               <option v-for="protocol in store.modelProtocols" :key="protocol.id" :value="protocol.id">
@@ -909,6 +919,7 @@ const showAddProviders = ref(false);
 const presetApiKey = ref('');
 const showPresetKey = ref(false);
 const showProviderKey = ref(false);
+const showCustomKey = ref(false);
 const keyCopied = ref(false);
 let keyCopyTimer: ReturnType<typeof setTimeout> | null = null;
 const saving = ref(false);

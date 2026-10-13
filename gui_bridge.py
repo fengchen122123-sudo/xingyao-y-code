@@ -352,6 +352,30 @@ FILE_TREE_SKIP_DIRS = {
 # 测试模型连通性的超时（秒）
 TEST_MODEL_TIMEOUT = 15
 
+
+def _probe_keys_for_provider(provider: Dict[str, Any]) -> List[str]:
+    """配置流程（拉模型列表 / 测试连接）的 Key 尝试序列。
+
+    Key 池「当前该用」的单 Key 优先，其余按配置顺序去重；无 Key 时返回 [""]
+    （保持"不带鉴权头单次请求"的旧行为）。逐 Key 尝试只为让配置流程能跑通，
+    不写 Key 池状态——拉列表 / 探活失败不代表该 Key 在对话链路上不可用。
+    """
+    try:
+        from core.provider_keys import split_provider_keys
+
+        keys = split_provider_keys(str(provider.get("api_key") or ""))
+    except Exception:
+        keys = []
+    if not keys:
+        return [""]
+    try:
+        current = str(effective_provider_api_key(provider) or "")
+    except Exception:
+        current = ""
+    if current and current in keys:
+        keys = [current] + [key for key in keys if key != current]
+    return keys
+
 # 后台子代理全部终态后自动发起的汇总回合（与 CLI 的内部汇总指令同文案）。
 # 前缀复用 core.injection_markers 的常量：注入文案与展示层过滤前缀同源，
 # 从结构上杜绝"改了注入文案、忘改过滤表"导致的泄漏（这两类曾渲染成用户
@@ -9725,29 +9749,39 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             base_url = str(provider.get("base_url") or "").strip()
             if not base_url:
                 return {"ok": False, "msg": "该厂商未配置 Base URL"}
-            # 多 Key provider：取 Key 池「当前该用」的单 Key 进鉴权头，绝不把
-            # 多行串整体塞进 Authorization（拉列表非对话链路，此处不做轮换）
-            api_key = str(effective_provider_api_key(provider) or "")
             # base_url 可能已含版本段（OpenAI 惯例 …/v1，阶跃 step_plan/v1），
             # 也可能是裸端点（如 …/step_plan）：前者直接拼 /models，后者补 /v1/models，
             # 绝不能重复拼出版本段（曾出现 /v1/v1/models 404）。
             base = base_url.rstrip("/")
             url = (base + "/models") if base.endswith("/v1") else (base + "/v1/models")
-            headers = {"accept": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-                headers["x-api-key"] = api_key
             from core.llm_policy import tokenrhythm_agent_headers
             import httpx as _httpx
 
-            headers.update(tokenrhythm_agent_headers(url))
-            try:
-                resp = _httpx.get(url, headers=headers, timeout=15.0)
-            except Exception as exc:
-                return {"ok": False, "msg": f"无法连接 {base_url}: {exc}"}
-            if resp.status_code != 200:
-                body = (resp.text or "").strip()[:200]
-                return {"ok": False, "msg": f"获取失败 (HTTP {resp.status_code}): {body}"}
+            # 多 Key provider：逐 Key 尝试（池「当前该用」的 Key 优先），任一通过
+            # 鉴权即采用其结果；绝不把多行串整体塞进 Authorization / x-api-key。
+            probe_keys = _probe_keys_for_provider(provider)
+            resp = None
+            last_msg = ""
+            for api_key in probe_keys:
+                headers = {"accept": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                    headers["x-api-key"] = api_key
+                headers.update(tokenrhythm_agent_headers(url))
+                try:
+                    candidate = _httpx.get(url, headers=headers, timeout=15.0)
+                except Exception as exc:
+                    # 网络层不可达：换 Key 无意义，直接返回
+                    return {"ok": False, "msg": f"无法连接 {base_url}: {exc}"}
+                if candidate.status_code == 200:
+                    resp = candidate
+                    break
+                body = (candidate.text or "").strip()[:200]
+                last_msg = f"获取失败 (HTTP {candidate.status_code}): {body}"
+            if resp is None:
+                if len(probe_keys) > 1:
+                    return {"ok": False, "msg": f"{len(probe_keys)} 个 Key 均获取失败，最后错误：{last_msg}"}
+                return {"ok": False, "msg": last_msg or "获取失败"}
             try:
                 data = resp.json()
             except ValueError:
@@ -9859,42 +9893,56 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             if target is None:
                 return {"ok": False, "msg": f"未找到模型: {model_id}"}
 
-            result: Dict[str, Any] = {}
-            # 多 Key provider：取 Key 池「当前该用」的单 Key 发起探测；
-            # 错误文本按同一单 Key 脱敏（_sanitize_for_ui 逻辑不变）
-            effective_key = str(effective_provider_api_key(provider) or "")
+            # 多 Key provider：逐 Key 尝试（池「当前该用」的 Key 优先），任一成功
+            # 即通过；错误文本按各自 Key 脱敏。单 Key 保持原有超时口径；多 Key 时
+            # 给整轮探测 2 倍超时的总预算，避免逐个叠加等待。
+            probe_keys = _probe_keys_for_provider(provider)
+            budget = TEST_MODEL_TIMEOUT if len(probe_keys) <= 1 else TEST_MODEL_TIMEOUT * 2
+            deadline = time.monotonic() + budget
+            last_msg = ""
+            for api_key in probe_keys:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                outcome: Dict[str, Any] = {}
 
-            def _ping():
-                try:
-                    from core.llm import _request_stream
+                def _ping(_key: str = api_key, _out: Dict[str, Any] = outcome) -> None:
+                    try:
+                        from core.llm import _request_stream
 
-                    stream, _holder = _request_stream(
-                        provider.get("protocol", "openai"),
-                        {
-                            "model": target.get("litellm_model"),
-                            "api_key": effective_key,
-                            "api_base": provider.get("base_url") or None,
-                            "messages": [{"role": "user", "content": "ping"}],
-                            "stream": True,
-                            "max_tokens": 1,
-                            "num_retries": 0,
-                        },
-                        timeout=TEST_MODEL_TIMEOUT,
-                    )
-                    for _ in stream:
-                        pass
-                    result["ok"] = True
-                    result["msg"] = "连接成功"
-                except Exception as e:
-                    result["ok"] = False
-                    result["msg"] = _sanitize_for_ui(str(e), effective_key)[:300]
+                        stream, _holder = _request_stream(
+                            provider.get("protocol", "openai"),
+                            {
+                                "model": target.get("litellm_model"),
+                                "api_key": _key,
+                                "api_base": provider.get("base_url") or None,
+                                "messages": [{"role": "user", "content": "ping"}],
+                                "stream": True,
+                                "max_tokens": 1,
+                                "num_retries": 0,
+                            },
+                            timeout=TEST_MODEL_TIMEOUT,
+                        )
+                        for _ in stream:
+                            pass
+                        _out["ok"] = True
+                        _out["msg"] = "连接成功"
+                    except Exception as e:
+                        _out["ok"] = False
+                        _out["msg"] = _sanitize_for_ui(str(e), _key)[:300]
 
-            thread = threading.Thread(target=_ping, daemon=True, name="gui-test-model")
-            thread.start()
-            thread.join(timeout=TEST_MODEL_TIMEOUT)
-            if thread.is_alive():
-                return {"ok": False, "msg": f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"}
-            return {"ok": bool(result.get("ok")), "msg": str(result.get("msg", "未知结果"))}
+                thread = threading.Thread(target=_ping, daemon=True, name="gui-test-model")
+                thread.start()
+                thread.join(timeout=remaining)
+                if thread.is_alive():
+                    last_msg = f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"
+                    continue
+                if outcome.get("ok"):
+                    return {"ok": True, "msg": str(outcome.get("msg") or "连接成功")}
+                last_msg = str(outcome.get("msg") or "未知结果")
+            if len(probe_keys) > 1:
+                return {"ok": False, "msg": f"{len(probe_keys)} 个 Key 均未连通，最后错误：{last_msg}"}
+            return {"ok": False, "msg": last_msg or "连接失败"}
         except Exception as e:
             logger.exception("test_model 失败")
             return {"ok": False, "msg": str(e)}
