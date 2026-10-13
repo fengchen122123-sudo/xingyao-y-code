@@ -673,6 +673,11 @@ def load_and_register(registry) -> list[str]:
 
     单个插件的任何异常都被捕获、记录并跳过，保证 ycode 主流程不受影响。
     """
+    # 重复调用时沿用上一轮的插件工具清单（本轮对已加载插件跳过重复注册，见下方分支）
+    previous_tools = {
+        str(info.get("name") or ""): list(info.get("tools") or [])
+        for info in _PLUGIN_INFOS
+    }
     loaded: list[str] = []
     seen: set[str] = set()
     _PLUGIN_INFOS.clear()
@@ -715,6 +720,21 @@ def load_and_register(registry) -> list[str]:
                 seen.add(plugin_name)
                 _PLUGIN_INFOS.append(info)
                 continue
+            # 已加载跳过：同一进程内重复调用 load_and_register（多入口/测试场景）时，
+            # 插件模块与工具仍在运行注册表中；若再次 exec + register 会触发
+            # "duplicate tool" 并把插件误标为加载失败，且 loaded 置空会让孤儿
+            # provider 兜底清理误伤。跳过条件须同时满足"上一轮记录过工具"且
+            # "这些工具确实仍在当前注册表"；否则（新注册表 / 工具已注销 / 上次
+            # 并未加载成功）落回正常加载路径。
+            if plugin_name in _LOADED_MODULES:
+                previous = list(previous_tools.get(plugin_name) or [])
+                current_names = {s.name for s in registry.all()}
+                if previous and all(tool in current_names for tool in previous):
+                    info["tools"] = previous
+                    seen.add(plugin_name)
+                    loaded.append(plugin_name)
+                    _PLUGIN_INFOS.append(info)
+                    continue
             before_tools = {s.name for s in registry.all()}
             try:
                 name = _load_one(child, registry)
