@@ -7737,6 +7737,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     "status": status,
                     "enabled": enabled,
                     "tools": list(info.get("tools") or []),
+                    "has_settings": bool(info.get("has_settings")),
                     "error": str(info.get("error") or ""),
                 })
             return result
