@@ -486,6 +486,11 @@ class ThemeRepository:
             raise ThemeError("builtin_read_only", "id", "内置主题不能重命名")
         source_theme = self.get_theme(theme_id)
         manifest = self._manifest_for_copy(source_theme, new_id, new_name)
+        if new_id == theme_id:
+            # 仅改名称：ID 与目录不变，原地重写清单即可，无需搬迁目录或改活动主题配置。
+            theme_dir = self._theme_directory(theme_id)
+            self._write_manifest(theme_dir / "theme.json", manifest)
+            return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
         destination = self._require_free_destination(new_id)
         staging_dir = self._staging_directory()
         retired_directory = self.root.parent / f".gui-theme-retired-{theme_id}-{uuid.uuid4().hex}"
