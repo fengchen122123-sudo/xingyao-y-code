@@ -960,9 +960,9 @@ def test_get_provider_api_key_returns_full_multiline_raw(tmp_path, monkeypatch):
     assert result["api_key"] == "sk-line1\nsk-line2"
 
 
-def test_fetch_provider_models_uses_single_key_for_multi_key_provider(tmp_path, monkeypatch):
-    """多 Key provider：拉取模型列表的鉴权头必须用单 Key（Key 池首个），
-    绝不把多行串整体塞进 Authorization / x-api-key。"""
+def test_fetch_provider_models_prefers_current_key_for_multi_key_provider(tmp_path, monkeypatch):
+    """多 Key provider：拉取模型列表逐 Key 尝试，池「当前该用」的 Key 优先；
+    鉴权头绝不携带多行串整体。"""
     import httpx
     import core.provider_keys as provider_keys
 
@@ -989,3 +989,62 @@ def test_fetch_provider_models_uses_single_key_for_multi_key_provider(tmp_path, 
     assert result["ok"] is True
     assert captured["headers"]["Authorization"] == "Bearer sk-first"
     assert captured["headers"]["x-api-key"] == "sk-first"
+
+
+def test_fetch_provider_models_falls_back_to_next_key_on_auth_failure(tmp_path, monkeypatch):
+    """多 Key provider：首个 Key 鉴权失败（401）自动换下一个 Key，任一成功即返回列表。"""
+    import httpx
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-bad\nsk-good"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    seen_auth = []
+
+    class _FakeResponse:
+        def __init__(self, status_code, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, headers=None, timeout=None):
+        seen_auth.append(headers.get("Authorization", ""))
+        if headers.get("Authorization") == "Bearer sk-bad":
+            return _FakeResponse(401, text="unauthorized")
+        return _FakeResponse(200, {"data": [{"id": "alpha"}]})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert seen_auth == ["Bearer sk-bad", "Bearer sk-good"]
+
+
+def test_test_model_falls_back_to_next_key(tmp_path, monkeypatch):
+    """多 Key provider：测试模型时首个 Key 失败自动换下一个 Key，任一成功即通过。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["protocol"] = "openai"
+    data["providers"][0]["api_key"] = "sk-bad\nsk-good"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    seen_keys = []
+
+    def fake_completion(**kwargs):
+        seen_keys.append(kwargs.get("api_key"))
+        if kwargs.get("api_key") == "sk-bad":
+            raise RuntimeError("401 invalid api key")
+        return [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="pong"))])]
+
+    monkeypatch.setattr(llm, "completion", fake_completion)
+
+    result = _bare_bridge().test_model("m1")
+
+    assert result["ok"] is True
+    assert seen_keys == ["sk-bad", "sk-good"]

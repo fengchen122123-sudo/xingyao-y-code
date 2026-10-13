@@ -515,6 +515,53 @@ describe('SettingsPage', () => {
     expect(updateSpy).toHaveBeenCalledWith('p1', '测试厂商', 'https://api.example.com', 'k1\nk2', 'responses');
   });
 
+  it('accepts a multi-line API key for preset providers', async () => {
+    const store = useAppStore();
+    const addSpy = vi.spyOn(store, 'addPresetProvider').mockResolvedValue({ ok: true, provider_id: 'p1' } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-provider-toggle"]').trigger('click');
+    await wrapper.get('[data-test="preset-deepseek"]').trigger('click');
+
+    const textarea = wrapper.get('[data-test="preset-api-key"]');
+    expect(textarea.element.tagName).toBe('TEXTAREA');
+    // 多 Key：一行一个；保存时原样（含换行）传给后端
+    await textarea.setValue('k1\nk2');
+    await textarea.trigger('input');
+
+    const saveButton = wrapper.findAll('button').find(button => button.text() === '保存并添加厂商');
+    expect(saveButton).toBeDefined();
+    await saveButton!.trigger('click');
+    await flushPromises();
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith('deepseek', 'k1\nk2');
+  });
+
+  it('accepts a multi-line API key for custom providers', async () => {
+    const store = useAppStore();
+    const addSpy = vi.spyOn(store, 'addProvider').mockResolvedValue({ ok: true, provider_id: 'p1' } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-provider-toggle"]').trigger('click');
+    await wrapper.get('[data-test="add-custom-provider"]').trigger('click');
+
+    await wrapper.get('[data-test="custom-name"]').setValue('团队网关');
+    await wrapper.get('[data-test="custom-base-url"]').setValue('https://gw.example.com/v1');
+    const textarea = wrapper.get('[data-test="custom-api-key"]');
+    expect(textarea.element.tagName).toBe('TEXTAREA');
+    await textarea.setValue('k1\nk2');
+    await textarea.trigger('input');
+
+    const addButton = wrapper.findAll('button.primary-button').find(button => button.text() === '添加厂商');
+    expect(addButton).toBeDefined();
+    await addButton!.trigger('click');
+    await flushPromises();
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith('团队网关', 'https://gw.example.com/v1', 'k1\nk2', 'openai');
+  });
+
   it('renders the disclaimer document with all clauses intact', async () => {
     const wrapper = mount(SettingsPage);
 
