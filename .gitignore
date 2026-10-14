@@ -143,3 +143,9 @@ publish_*.log
 
 # One-off design exploration mockups (prototypes, not shipped)
 design_mockups/
+
+# 公众号内容工作区（本地草稿与配图，不入库）
+/公众号/
+
+# 一次性临时生图脚本（本地使用，不入库）
+_day3_imggen.py
