@@ -9,7 +9,6 @@ import base64
 import io
 import logging
 import struct
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -516,3 +515,266 @@ def test_window_client_frame_raises_on_win32_failure(monkeypatch):
 
     with pytest.raises(OSError):
         gui_snip_mixin._window_client_frame(12345)
+
+
+# --------------------------------- 全屏任意位置截图（2026-10-14 原生蒙版路径）
+
+
+class FakeCaptureImage:
+    """虚拟桌面捕获结果桩：size 与虚拟桌面 rect 匹配，save 写入预生成 PNG 字节。
+
+    不触发真实截屏；PNG 字节来自一张真实小图（蒙版桩只记录不解码，
+    字节内容只需可辨识）。
+    """
+
+    def __init__(self, size=(1920, 2280)):
+        self.size = size
+        buf = io.BytesIO()
+        Image.new("RGB", (2, 2), (1, 2, 3)).save(buf, format="PNG")
+        self.png = buf.getvalue()
+
+    def save(self, buf, format=None, **kwargs):
+        buf.write(self.png)
+
+
+def patch_native_snip_env(monkeypatch, image=None):
+    """公共环境：win32 + 固定虚拟桌面 rect + 假捕获，不触发真实截屏。"""
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gui_snip_mixin, "default_virtual_screen_rect", lambda: (0, -1080, 1920, 2280)
+    )
+    monkeypatch.setattr(
+        gui_snip_mixin,
+        "default_capture_virtual_screen",
+        lambda: image if image is not None else FakeCaptureImage(),
+    )
+
+
+def patch_native_overlay(monkeypatch):
+    """把 core.screen_snip_native.SnipOverlayNative 换成记录型假类（绝不建真实窗口）。
+
+    返回创建列表：每个实例记录构造参数 png_bytes/on_action 与 show 收到的
+    invoker；closed 恒 False（存活中），供重复调用保护分支使用。
+    """
+    created = []
+
+    class FakeOverlayNative:
+        def __init__(self, png_bytes, on_action):
+            self.png_bytes = png_bytes
+            self.on_action = on_action
+            self.show_invokers = []
+            self._closed = False
+            created.append(self)
+
+        @property
+        def closed(self):
+            return self._closed
+
+        def show(self, invoker):
+            self.show_invokers.append(invoker)
+            return True
+
+    monkeypatch.setattr("core.screen_snip_native.SnipOverlayNative", FakeOverlayNative)
+    return created
+
+
+def test_screen_snip_start_uses_native_overlay(monkeypatch):
+    image = FakeCaptureImage()
+    patch_native_snip_env(monkeypatch, image=image)
+    created = patch_native_overlay(monkeypatch)
+    form = fake_form()
+    d = Dummy(form=form)
+
+    res = d.screen_snip_start()
+
+    assert res == {"ok": True}
+    assert len(created) == 1
+    overlay = created[0]
+    # 蒙版拿到冻结帧 PNG（原生 GDI 绘制无 2MB 上限，用原图不压缩）与动作回调
+    assert overlay.png_bytes == image.png
+    assert overlay.on_action == d._on_snip_action
+    # 主窗体作为 invoker 传入：窗口创建经它 marshal 到 GUI 线程
+    assert overlay.show_invokers == [form]
+    assert d._screen_snip_overlay is overlay
+    # 原始全分辨率图留给动作阶段裁剪（保证输出无损）
+    assert d._screen_snip_source is image
+
+
+def test_screen_snip_start_reuses_open_overlay(monkeypatch):
+    patch_native_snip_env(monkeypatch)
+    created = patch_native_overlay(monkeypatch)
+    d = Dummy(form=fake_form())
+    d.screen_snip_start()
+    assert created[0].closed is False  # 蒙版存活中
+
+    res = d.screen_snip_start()
+
+    assert res == {"ok": True, "msg": "截图窗口已打开"}
+    assert len(created) == 1, "已有存活蒙版时不得重复创建"
+
+
+def test_screen_snip_start_rejects_non_windows(monkeypatch):
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "linux")
+    res = Dummy().screen_snip_start()
+    assert res["ok"] is False
+
+
+def test_screen_snip_start_rejects_size_mismatch(monkeypatch):
+    patch_native_snip_env(monkeypatch, image=FakeCaptureImage(size=(100, 100)))
+    created = patch_native_overlay(monkeypatch)
+
+    res = Dummy(form=fake_form()).screen_snip_start()
+
+    assert res["ok"] is False and "尺寸" in res["msg"]
+    assert created == [], "尺寸不匹配不得创建蒙版"
+
+
+def test_screen_snip_start_fails_without_main_form(monkeypatch):
+    patch_native_snip_env(monkeypatch)
+    created = patch_native_overlay(monkeypatch)
+    d = Dummy()  # form=None：_main_form 返回 None（主窗口尚未就绪）
+
+    res = d.screen_snip_start()
+
+    assert res["ok"] is False and res["msg"] == "主窗口尚未就绪"
+    assert created == [], "无主窗体不得创建蒙版"
+    assert d._screen_snip_source is None, "失败路径必须释放已捕获的原图"
+
+
+def test_on_snip_action_send_crops_and_emits(monkeypatch):
+    d = Dummy()
+    source = FakeCaptureImage()
+    d._screen_snip_source = source
+    emitted = []
+    d.emit_event = lambda event_type, data: emitted.append((event_type, data))
+    cropped = []
+    monkeypatch.setattr(
+        gui_snip_mixin,
+        "crop_frozen_frame",
+        lambda image, rect: cropped.append((image, rect)) or b"png-bytes",
+    )
+    monkeypatch.setattr(
+        gui_snip_mixin, "save_snip_png", lambda png: r"C:\fake\snip_test.png"
+    )
+
+    d._on_snip_action("send", (10, 20, 30, 40))
+
+    # 裁剪发生在原始全分辨率图上（蒙版只回报坐标），rect 转页面同口径 dict
+    assert cropped == [(source, {"x": 10, "y": 20, "w": 30, "h": 40})]
+    assert emitted == [("snip_attachment_ready", {"path": r"C:\fake\snip_test.png"})]
+    # 原图随动作完成释放（整屏位图不常驻）
+    assert d._screen_snip_source is None
+
+
+def test_on_snip_action_cancel_does_nothing(monkeypatch):
+    d = Dummy()
+    d._screen_snip_source = FakeCaptureImage()
+    emitted = []
+    d.emit_event = lambda *a: emitted.append(a)
+    calls = []
+    monkeypatch.setattr(
+        gui_snip_mixin, "crop_frozen_frame", lambda *a: calls.append(a) or b""
+    )
+
+    d._on_snip_action("cancel", None)
+
+    assert calls == [], "取消不得裁剪"
+    assert emitted == [], "取消不得回传事件"
+    assert d._screen_snip_source is None, "取消也要释放原图"
+# ------------------------------------------------------- 画笔笔迹合成与动作
+
+
+def _white_png(size=(200, 200)):
+    buf = io.BytesIO()
+    Image.new("RGB", size, (255, 255, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_draw_strokes_on_png_no_strokes():
+    png = _white_png()
+    assert gui_snip_mixin.draw_strokes_on_png(png, [], (0, 0)) is png
+
+
+def test_draw_strokes_on_png_offset():
+    png = _white_png((200, 200))
+    strokes = [{"color": (255, 0, 0), "width": 3, "points": [(50, 50), (150, 150)]}]
+
+    out = gui_snip_mixin.draw_strokes_on_png(png, strokes, (40, 40))
+
+    assert out.startswith(b"\x89PNG\r\n\x1a\n")
+    img = Image.open(io.BytesIO(out)).convert("RGB")
+    assert img.size == (200, 200), "合成不得改变尺寸"
+    # 笔迹全屏点 (50,50) 减偏移 (40,40) → 裁剪图相对点 (10,10) 应偏红
+    r, g, b = img.getpixel((10, 10))
+    assert r > g + 100 and r > b + 100, f"相对点 (10,10) 应偏红，实际 {(r, g, b)}"
+
+
+def test_draw_strokes_on_png_outside_selection():
+    png = _white_png((200, 200))
+    # 笔迹点全在选区/图外：不报错、仍返回合法 PNG
+    strokes = [{"color": (255, 0, 0), "width": 3, "points": [(500, 500), (600, 600)]}]
+
+    out = gui_snip_mixin.draw_strokes_on_png(png, strokes, (0, 0))
+
+    assert out.startswith(b"\x89PNG\r\n\x1a\n")
+    img = Image.open(io.BytesIO(out))
+    assert img.size == (200, 200)
+
+
+def test_draw_strokes_on_png_bad_input():
+    bad = b"not-a-png"
+    strokes = [{"color": (255, 0, 0), "width": 3, "points": [(1, 1), (2, 2)]}]
+    # 笔迹是增强，绝不能拖垮主流程：坏输入容错原样返回
+    assert gui_snip_mixin.draw_strokes_on_png(bad, strokes, (0, 0)) is bad
+
+
+def test_on_snip_action_send_with_strokes(monkeypatch):
+    d = Dummy()
+    source = Image.new("RGB", (100, 100), (9, 9, 9))  # 假 PIL 原图（.size/.crop 俱全）
+    d._screen_snip_source = source
+    emitted = []
+    d.emit_event = lambda event_type, data: emitted.append((event_type, data))
+    cropped = []
+    fixed_png = _white_png((30, 40))
+
+    def fake_crop(image, rect):
+        cropped.append((image, rect))
+        return fixed_png
+
+    monkeypatch.setattr(gui_snip_mixin, "crop_frozen_frame", fake_crop)
+    monkeypatch.setattr(
+        gui_snip_mixin, "save_snip_png", lambda png: r"C:\fake\snip_strokes.png"
+    )
+
+    strokes = [{"color": (255, 0, 0), "width": 3, "points": [(15, 25), (30, 40)]}]
+    d._on_snip_action("send", (10, 20, 30, 40), strokes)
+
+    assert cropped == [(source, {"x": 10, "y": 20, "w": 30, "h": 40})]
+    assert emitted == [
+        ("snip_attachment_ready", {"path": r"C:\fake\snip_strokes.png"})
+    ]
+    assert d._screen_snip_source is None, "动作完成后必须释放原图"
+    assert d._screen_snip_overlay is None
+
+
+def test_on_snip_action_cancel_ignores_strokes(monkeypatch):
+    d = Dummy()
+    d._screen_snip_source = Image.new("RGB", (100, 100))
+    emitted = []
+    d.emit_event = lambda *a: emitted.append(a)
+    calls = []
+    monkeypatch.setattr(
+        gui_snip_mixin, "crop_frozen_frame", lambda *a: calls.append(a) or b""
+    )
+    saved = []
+    monkeypatch.setattr(
+        gui_snip_mixin, "save_snip_png", lambda png: saved.append(png) or "x"
+    )
+
+    strokes = [{"color": (255, 0, 0), "width": 3, "points": [(15, 25), (30, 40)]}]
+    d._on_snip_action("cancel", None, strokes)
+
+    assert calls == [], "取消不得裁剪"
+    assert saved == [], "取消不得落盘"
+    assert emitted == [], "取消不得回传事件"
+    assert d._screen_snip_source is None, "取消也要释放原图"

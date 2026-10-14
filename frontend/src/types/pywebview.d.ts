@@ -1329,6 +1329,10 @@ export interface PyWebViewAPI {
     path?: string;
     msg?: string;
   }>;
+  // 屏幕截图（宿主 gui_snip_mixin.SnipBridgeMixin）：全屏任意位置截图，
+  // 打开遮罩窗口；「发到输入框」完成后的结果经桥事件
+  // {type:'snip_attachment_ready', data:{path}} 回传
+  screen_snip_start(): Promise<{ ok: boolean; msg?: string }>;
 
   // 旧版右侧面板单命令终端已下线；底部交互式终端见 pty_terminal_*
   pty_terminal_ensure(cols: number, rows: number): Promise<{

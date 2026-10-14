@@ -58,10 +58,12 @@ import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
 // 调试适配器输出旁路总线（S3-T8）：高频原始输出不进响应式状态
 import { emitDapOutput } from '../utils/dapBus';
 import { isMarkdownFilePath, toFileUrl } from '../utils/localPath';
+import { fileExt } from '../utils/fileIcon';
 import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 // 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
 import { requestFrontendReload } from '../utils/frontendUpdate';
 import type { MediaItem } from '../types/media';
+import type { AttachmentItem } from '../types/composer';
 import { formatPermMode } from '../utils/markdown';
 import {
   reduceExecutionState,
@@ -4947,6 +4949,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
           category: String(data.category ?? 'stdout'),
           text: String(data.text ?? ''),
         });
+      } else if (type === 'snip_attachment_ready') {
+        // 屏幕截图「发到输入框」（宿主 gui_snip_mixin.SnipBridgeMixin）：把
+        // 回传的图片路径加入当前会话输入框附件。与 lsp_*/dap_* 同约定——必须
+        // 接进本函数这条既有 type-if 链（window.onBridgeEvent 唯一赋值点），
+        // 另开通道等于绕开单消费者约定
+        void this._attachSnipToComposer(String(data.path || ''));
       } else if (type.startsWith('dap_')) {
         // 调试会话状态事件（dap_stopped / dap_terminated / dap_continued / dap_exited /
         // dap_breakpoint_changed / dap_status）统一进 ideDebugStore 归约（与 gitStore
@@ -5750,6 +5758,38 @@ navItems: [] as Array<{ id: number; preview: string }>,
         console.error('获取附件缩略图失败:', err);
       }
       return result;
+    },
+
+    // 屏幕截图「发到输入框」桥事件（snip_attachment_ready）落库：把图片路径
+    // 加入当前会话输入框附件。不复用 useAttachments.addPaths——composable 绑
+    // 定组件生命周期（onUnmounted 注册等），store 内写等价最小实现：
+    // 去重 → 查文件信息补全 name/ext/size（失败退化为 baseName）→ 补缩略图
+    async _attachSnipToComposer(path: string): Promise<void> {
+      if (!path) return;
+      const runtime = this._getSessionRuntime();
+      if (!runtime.composerAttachments) runtime.composerAttachments = [];
+      const target = runtime.composerAttachments;
+      // 去重：事件重放或重复截图同一文件时不叠加 chip
+      if (target.some(a => a.path === path)) return;
+      const infos = await this.getFilesInfo([path]);
+      const info = infos.find(i => i.path === path);
+      const sepIdx = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
+      const baseName = sepIdx >= 0 ? path.slice(sepIdx + 1) : path;
+      const name = info?.name || baseName;
+      const item: AttachmentItem = {
+        path,
+        name,
+        ext: info?.ext ?? fileExt(name),
+        size: info?.size ?? null,
+      };
+      target.push(item);
+      // 缩略图是增强能力：归档取受控媒体 URL 后补挂，失败静默
+      try {
+        const thumbs = await this.fetchAttachmentThumbnails([path]);
+        const url = thumbs.get(path);
+        if (url) item.thumb = url;
+      } catch { /* 缩略图失败静默，不影响附件 */ }
+      this.notifyChat('截图已加入输入框附件');
     },
 
     // 保存剪贴板粘贴的图片，返回落盘后的文件路径（失败返回空串并 toast）

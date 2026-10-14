@@ -1,9 +1,19 @@
-"""GUI 右面板「画笔截图」桥接 Mixin。
+"""GUI 截图桥接 Mixin：右面板「画笔截图」+ 屏幕「任意位置截图」。
 
-前端进入截图模式前先调 capture_right_panel_region 把整块右面板（含原生
-WebView2 浏览器表面，此刻仍可见）捕获为 PNG dataURL 冻结帧；随后前端隐藏
-原生表面、把冻结帧铺成覆盖层供画笔圈选，裁剪在前端完成。后端只补两件
-前端做不了的事：屏幕区域捕获与系统剪贴板/落盘写出。
+右面板画笔截图：前端进入截图模式前先调 capture_right_panel_region 把整块
+右面板（含原生 WebView2 浏览器表面，此刻仍可见）捕获为 PNG dataURL 冻结帧；
+随后前端隐藏原生表面、把冻结帧铺成覆盖层供画笔圈选，裁剪在前端完成。后端
+只补两件前端做不了的事：屏幕区域捕获与系统剪贴板/落盘写出。
+
+全屏任意位置截图（2026-10-14，设计 docs/superpowers/specs/
+2026-10-14-screen-snip-design.md）：前端调 screen_snip_start，后端捕获整个
+虚拟桌面（core/screen_snip）并以 create_window(html=...) 打开一个覆盖虚拟
+桌面、无边框置顶的遮罩窗口供框选；遮罩页的 snip_copy / snip_save /
+snip_send / snip_close 由 ScreenSnipWindowApi 承接，「发到输入框」经
+emit_event('snip_attachment_ready') 回传主窗口加入附件。create_window(html=)
+走 winforms 后端 CoreWebView2.NavigateToString 直载 HTML 字符串，不落临时
+文件、不依赖内置 HTTP server（js_api 调用经 WebView2 的 WebMessage 通道
+直达 Python），规避了运行时新建窗口对 server root_path / 盘符的依赖。
 
 坐标换算与内嵌浏览器表面定位共享同一套假设：pywebview winforms 启动即
 SetProcessDPIAware()，ClientToScreen/GetClientRect 返回物理像素，
@@ -28,7 +38,10 @@ import logging
 import os
 import struct
 import sys
+import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -52,6 +65,170 @@ def default_panel_grab(bbox: Tuple[int, int, int, int]):
     from PIL import ImageGrab
 
     return ImageGrab.grab(bbox=bbox, all_screens=True)
+
+
+# 全屏截图（screen_snip_start）的调度锁：串行化"检查已有窗口 → 捕获 → 建窗"，
+# 防止双击/连点在窗口尚未登记前创建出两个遮罩窗口（后到者应走聚焦路径）。
+# 必须用 RLock：start 持锁期间会调 _reveal_screen_snip_window（同样要拿这把锁），
+# 普通 Lock 会自锁死。
+_SCREEN_SNIP_LOCK = threading.RLock()
+
+# 遮罩窗口的"就绪前隐藏"兜底时限（秒）：页面正常情况下会在装载完成后立即回调
+# snip_ready 显示窗口；超过该时限仍未回调（脚本异常/桥注入失败）则无条件显示，
+# 避免出现"点了截图没反应"。取值兼顾慢机器上的 WebView2 首次初始化。
+_SCREEN_SNIP_SHOW_FALLBACK = 2.5
+
+
+def default_virtual_screen_rect() -> Tuple[int, int, int, int]:
+    """生产入口：惰性导入 core.screen_snip 读取虚拟桌面矩形（测试注入点）。"""
+    from core.screen_snip import get_virtual_screen_rect
+
+    return get_virtual_screen_rect()
+
+
+def default_capture_virtual_screen():
+    """生产入口：惰性导入 core.screen_snip 捕获整个虚拟桌面（测试注入点）。"""
+    from core.screen_snip import capture_virtual_screen
+
+    return capture_virtual_screen()
+
+
+def encode_png_data_url(image) -> str:
+    """PIL Image → PNG dataURL（与 capture_right_panel_region 的内联编码同口径）。"""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return _PNG_B64_PREFIX + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def encode_png_data_url_from_bytes(png: bytes) -> str:
+    """PNG 字节 → dataURL（裁剪结果转给复用现有剪贴板/另存通道时用）。"""
+    return _PNG_B64_PREFIX + base64.b64encode(png).decode("ascii")
+
+
+# WebView2 NavigateToString 的 HTML 内容硬上限（2MB，超限直接抛
+# "值不在预期的范围内"、窗口全黑）。遮罩页经 create_window(html=...) 直载，
+# 冻结帧必须连模板一起压到这个预算内。
+_NAVIGATE_TO_STRING_LIMIT = 2 * 1024 * 1024
+# 模板（HTML/CSS/JS + 占位符替换）体积预留，留足余量避免踩线
+_TEMPLATE_RESERVE = 64 * 1024
+# 冻结帧 dataURL 允许的最大字符数（base64 膨胀已含在内，直接比字符串长度）
+_FRAME_DATA_URL_BUDGET = _NAVIGATE_TO_STRING_LIMIT - _TEMPLATE_RESERVE
+
+
+def _jpeg_data_url(image, quality: int) -> str:
+    """单次 JPEG 编码为 dataURL（JPEG 体积可控，是绕开 2MB 上限的关键）。"""
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=quality, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def encode_frozen_frame(image) -> str:
+    """把整屏冻结帧编码为体积可控的预览 dataURL（遮罩窗口显示用）。
+
+    为什么不是 PNG：``create_window(html=...)`` 走 WebView2 的
+    ``NavigateToString``，该接口对 HTML 内容有 2MB 硬上限；1920x2280 的整屏
+    PNG 转 base64 后轻松到 2.6MB，必然超限（现象：遮罩窗口全黑）。因此改用
+    JPEG 逐级降质/缩放，把 **dataURL 长度本身**压进预算——预览只负责"看得清、
+    框得准"，最终输出由 Python 从原始全分辨率图裁剪（见 crop_frozen_frame），
+    不损失画质。
+    """
+    from PIL import Image
+
+    source = image.convert("RGB")
+    # 先原尺寸降质，再逐步缩边——绝大多数桌面画面第一档即可通过
+    attempts = [(85, None), (80, 2560), (75, 1920), (70, 1600), (65, 1280), (60, 1024)]
+    for quality, max_edge in attempts:
+        current = source
+        if max_edge is not None and max(source.size) > max_edge:
+            scale = max_edge / float(max(source.size))
+            current = source.resize(
+                (max(1, int(source.width * scale)), max(1, int(source.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        data_url = _jpeg_data_url(current, quality)
+        if len(data_url) <= _FRAME_DATA_URL_BUDGET:
+            return data_url
+    # 兜底：极端噪声画面（照片级壁纸）仍超限时再狠压一档，保证窗口一定能开
+    scale = 800 / float(max(source.size)) if max(source.size) > 800 else 1.0
+    fallback = source.resize(
+        (max(1, int(source.width * scale)), max(1, int(source.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    return _jpeg_data_url(fallback, 45)
+
+
+def crop_frozen_frame(image, rect: Dict[str, Any]) -> bytes:
+    """从原始全分辨率冻结帧按物理像素矩形裁剪，返回 PNG 字节。
+
+    裁剪放在 Python 端的原因：页面预览是被压缩/缩小过的，且页面内联原图会撞
+    NavigateToString 的 2MB 上限；页面只回报坐标，这里用原图输出，保证截图
+    与屏幕 1:1 无损。
+    """
+    from PIL import Image
+
+    left = max(0, int(rect.get("x", 0)))
+    top = max(0, int(rect.get("y", 0)))
+    width = max(1, int(rect.get("w", 1)))
+    height = max(1, int(rect.get("h", 1)))
+    right = min(image.width, left + width)
+    bottom = min(image.height, top + height)
+    if right <= left or bottom <= top:
+        raise ValueError("选区超出屏幕范围")
+    cropped = image.crop((left, top, right, bottom))
+    buf = io.BytesIO()
+    cropped.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def draw_strokes_on_png(png: bytes, strokes, offset) -> bytes:
+    """把画笔笔迹合成到裁剪后的 PNG 上（无笔迹原样返回，不重新编码）。
+
+    strokes 坐标是全屏（冻结帧）物理像素；offset=(ox,oy) 为裁剪选区左上角物理
+    像素坐标——合成时减 offset 得到 cropped 内相对坐标。任何异常只记日志并返回
+    原始 png（笔迹是增强，绝不能拖垮截图主流程）。
+    """
+    if not strokes:
+        return png
+    try:
+        from PIL import Image, ImageDraw
+        ox, oy = offset
+        img = Image.open(io.BytesIO(png))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        for stroke in strokes:
+            pts = [(p[0] - ox, p[1] - oy) for p in stroke.get("points", [])]
+            if len(pts) < 2:
+                continue
+            color = tuple(stroke.get("color", (239, 68, 68)))
+            width = int(stroke.get("width", 3))
+            draw.line(pts, fill=color, width=width, joint="curve")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        logger.exception("画笔笔迹合成失败")
+        return png
+
+
+def save_snip_png(png: bytes) -> str:
+    """把截图 PNG 写入受信粘贴目录并登记，返回路径。
+
+    复用 gui_bridge.save_clipboard_image 的通道约定（%TEMP%/ycode_paste/ +
+    core.tools.register_paste_file 受信登记，模型可直接读取）；命名 snip_
+    前缀与剪贴板粘贴的 paste_ 前缀区分，附件 chip 显示名更可读。
+    """
+    paste_dir = os.path.join(tempfile.gettempdir(), "ycode_paste")
+    os.makedirs(paste_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    ms = int(time.time() * 1000) % 1000
+    path = os.path.join(paste_dir, f"snip_{ts}_{ms:03d}_{uuid.uuid4().hex[:6]}.png")
+    with open(path, "wb") as fh:
+        fh.write(png)
+    from core.tools import register_paste_file
+
+    register_paste_file(path)
+    return path
 
 
 def _window_client_frame(
@@ -437,4 +614,271 @@ class SnipBridgeMixin:
             return {"ok": True, "path": path}
         except Exception as exc:
             logger.exception("snip_save_image 失败")
+            return {"ok": False, "msg": str(exc)}
+
+    # ------------------------------------------------ 全屏任意位置截图（入口）
+
+    def screen_snip_start(self) -> Dict[str, Any]:
+        """捕获整个虚拟桌面并弹出原生全屏截图蒙版（2026-10-14 原生重写）。
+
+        在 pywebview 桥调用线程执行：捕获屏幕后，经主窗口 Form 的 Invoke 把原生
+        蒙版（core/screen_snip_native.SnipOverlayNative，WinForms+GDI）的创建与
+        显示 marshal 到 GUI 消息循环线程。原生窗口创建即显示——无 WebView2 初始化
+        黑屏、无窗口尺寸削减、可完整盖住任务栏（POC 实测验证）。重复调用保护：
+        已有存活蒙版时不重复弹出。所有失败归一 {"ok": False, "msg": ...}，绝不抛穿。
+        """
+        try:
+            with _SCREEN_SNIP_LOCK:
+                existing = getattr(self, "_screen_snip_overlay", None)
+                if existing is not None and not existing.closed:
+                    return {"ok": True, "msg": "截图窗口已打开"}
+                self._screen_snip_overlay = None
+
+                if sys.platform != "win32":
+                    return {"ok": False, "msg": "全屏截图仅 Windows 桌面端可用"}
+
+                rect = default_virtual_screen_rect()
+                image = default_capture_virtual_screen()
+                if tuple(getattr(image, "size", ())) != (rect[2], rect[3]):
+                    # 与 core/computer/windows_backend 同一口径：截图尺寸与
+                    # Win32 度量不同源时宁可失败，也不给用户一张错位的冻结帧
+                    return {"ok": False, "msg": "屏幕捕获尺寸异常，请重试"}
+
+                # 原图保留供动作阶段裁剪（无损）；蒙版背景也用原图 PNG——原生
+                # GDI 绘制不走 NavigateToString，无 2MB 上限，无需压缩预览
+                self._screen_snip_source = image
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                png = buf.getvalue()
+
+                main_form = self._main_form()
+                if main_form is None:
+                    self._screen_snip_source = None
+                    return {"ok": False, "msg": "主窗口尚未就绪"}
+
+                from core.screen_snip_native import SnipOverlayNative
+
+                overlay = SnipOverlayNative(png, self._on_snip_action)
+                if not overlay.show(main_form):
+                    self._screen_snip_source = None
+                    return {"ok": False, "msg": "截图蒙版显示失败"}
+                self._screen_snip_overlay = overlay
+                return {"ok": True}
+        except Exception as exc:
+            logger.exception("screen_snip_start 失败")
+            return {"ok": False, "msg": str(exc)}
+
+    def _reveal_screen_snip_window(self) -> None:
+        """显示遮罩窗口（幂等）：页面就绪回调 / 超时兜底 / 重复调用三条路径共用。
+
+        线程安全：加锁 + 标志位，保证"就绪上报"与"超时兜底"并发时只显示一次。
+        窗口操作经 pywebview 内部 Invoke marshal 回 GUI 线程（已核实实现）。
+        """
+        with _SCREEN_SNIP_LOCK:
+            if getattr(self, "_screen_snip_shown", False):
+                return
+            window = getattr(self, "_screen_snip_window", None)
+            if window is None or window.events.closed.is_set():
+                return
+            self._screen_snip_shown = True
+            timer = getattr(self, "_screen_snip_timer", None)
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    logger.debug("取消截图窗口兜底计时器失败", exc_info=True)
+        try:
+            window.show()
+        except Exception:
+            # 显示失败则回滚标志，允许后续（重复调用 / 超时兜底）再试一次
+            self._screen_snip_shown = False
+            logger.debug("显示截图窗口失败", exc_info=True)
+
+    def _focus_screen_snip_window(self, window) -> None:
+        """把已有截图窗口拉回前台（best-effort；失败只留痕，不影响返回）。"""
+        try:
+            window.restore()
+        except Exception:
+            logger.debug("还原截图窗口失败", exc_info=True)
+        try:
+            import webview.platforms.winforms as wf
+
+            form = wf.BrowserView.instances.get(getattr(window, "uid", None))
+            hwnd = int(form.Handle.ToInt32()) if form is not None else 0
+            if hwnd:
+                user32 = ctypes.windll.user32
+                user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
+                user32.SetForegroundWindow.restype = ctypes.c_bool
+                user32.SetForegroundWindow(hwnd)
+        except Exception:
+            logger.debug("聚焦截图窗口失败", exc_info=True)
+
+    def _on_snip_action(self, action: str, rect, strokes=None) -> None:
+        """原生截图蒙版的动作回调（在 GUI 线程被调用，蒙版窗口已先行关闭）。
+
+        rect 为冻结帧物理像素矩形 (x,y,w,h) 或 None（cancel）；strokes 为画笔笔迹
+        （冻结帧物理像素坐标）。裁剪从原始全分辨率图执行，再合成笔迹，输出无损。
+        """
+        self._screen_snip_overlay = None
+        try:
+            if action == "cancel" or not rect:
+                return
+            source = self._screen_snip_source
+            if source is None:
+                return
+            x, y, w, h = rect
+            png = crop_frozen_frame(source, {"x": x, "y": y, "w": w, "h": h})
+            if strokes:
+                # 笔迹坐标是全屏物理像素，减选区偏移得到裁剪图内坐标
+                png = draw_strokes_on_png(png, strokes, (x, y))
+            if action == "copy":
+                self.snip_copy_clipboard(encode_png_data_url_from_bytes(png))
+            elif action == "save":
+                self.snip_save_image(encode_png_data_url_from_bytes(png))
+            elif action == "send":
+                path = save_snip_png(png)
+                self.emit_event("snip_attachment_ready", {"path": path})
+        except Exception:
+            logger.exception("截图动作处理失败: %s", action)
+        finally:
+            self._screen_snip_source = None
+
+
+class ScreenSnipWindowApi:
+    """截图遮罩窗口的 js_api（设计 2026-10-14）。
+
+    遮罩页 JS 调用 snip_copy / snip_save / snip_send / snip_close；pywebview
+    的 js_bridge_call 每次调用起独立线程，因此窗口操作（hide/show/destroy）
+    全部经 pywebview 内部 Invoke marshal 回 GUI 线程（其实现在
+    webview/platforms/winforms.py 已核实）。暴露面按 dir() 枚举生成：以下划
+    线开头的属性（_bridge / _live_window 等）不会被注入 JS 端函数清单。
+    """
+
+    def __init__(self, bridge: Any) -> None:
+        self._bridge = bridge
+
+    # ---------------------------------------------------------------- 内部
+
+    def _live_window(self):
+        """当前存活截图窗口；已关闭/不存在返回 None。"""
+        win = getattr(self._bridge, "_screen_snip_window", None)
+        if win is None or win.events.closed.is_set():
+            return None
+        return win
+
+    def _crop_selection(self, rect: Any) -> bytes:
+        """从原始全分辨率冻结帧裁剪选区，返回 PNG 字节（页面只回报坐标）。"""
+        source = getattr(self._bridge, "_screen_snip_source", None)
+        if source is None:
+            raise RuntimeError("截图原图已释放，请重新截图")
+        if not isinstance(rect, dict):
+            raise ValueError("选区参数无效")
+        return crop_frozen_frame(source, rect)
+
+    def _destroy_window(self, win) -> None:
+        """关闭窗口并把引用置空；destroy 失败只留痕，不改变本动作结果。"""
+        if getattr(self._bridge, "_screen_snip_window", None) is win:
+            self._bridge._screen_snip_window = None
+        # 原图随窗口一起释放：整屏位图内存不小，留着只会白占（下次截图会重捕）
+        self._bridge._screen_snip_source = None
+        # 就绪兜底计时器与显示标志一并复位，供下一次截图使用
+        timer = getattr(self._bridge, "_screen_snip_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                logger.debug("取消截图窗口兜底计时器失败", exc_info=True)
+        self._bridge._screen_snip_timer = None
+        try:
+            win.destroy()
+        except Exception:
+            logger.debug("关闭截图窗口失败（可能已关闭）", exc_info=True)
+
+    # ---------------------------------------------------------------- 桥方法
+
+    def snip_ready(self) -> Dict[str, Any]:
+        """遮罩页就绪回报：冻结帧已可绘制，显示窗口（对齐微信"画面瞬现"）。
+
+        窗口是 hidden=True 创建的，显示时机由本回调决定；宿主另有超时兜底，
+        本方法重复调用无害（_reveal_screen_snip_window 幂等）。
+        """
+        try:
+            self._bridge._reveal_screen_snip_window()
+            return {"ok": True}
+        except Exception as exc:
+            logger.exception("截图窗口就绪上报失败")
+            return {"ok": False, "msg": str(exc)}
+
+    def snip_copy(self, rect: Any) -> Dict[str, Any]:
+        """选区复制到系统剪贴板；成功后关闭遮罩窗口。"""
+        try:
+            win = self._live_window()
+            if win is None:
+                return {"ok": False, "msg": "截图窗口已关闭"}
+            png = self._crop_selection(rect)
+            res = self._bridge.snip_copy_clipboard(encode_png_data_url_from_bytes(png))
+            if not res.get("ok"):
+                return res
+            self._destroy_window(win)
+            return {"ok": True}
+        except Exception as exc:
+            logger.exception("截图窗口复制失败")
+            return {"ok": False, "msg": str(exc)}
+
+    def snip_save(self, rect: Any, suggested_name: str = "") -> Dict[str, Any]:
+        """选区另存为 PNG；成功后关闭遮罩窗口，取消/失败则恢复遮罩继续操作。
+
+        保存对话框弹出前先隐藏遮罩：遮罩窗口是置顶（TopMost）窗口，不隐藏
+        会盖住非置顶的系统保存对话框。
+        """
+        try:
+            win = self._live_window()
+            if win is None:
+                return {"ok": False, "msg": "截图窗口已关闭"}
+            png = self._crop_selection(rect)
+            data_url = encode_png_data_url_from_bytes(png)
+            hidden = False
+            try:
+                win.hide()
+                hidden = True
+            except Exception:
+                logger.debug("隐藏截图窗口失败（继续弹保存对话框）", exc_info=True)
+            res = self._bridge.snip_save_image(data_url, suggested_name)
+            if res.get("ok"):
+                self._destroy_window(win)
+                return res
+            if hidden:
+                try:
+                    win.show()
+                except Exception:
+                    logger.debug("恢复截图窗口失败", exc_info=True)
+            return res
+        except Exception as exc:
+            logger.exception("截图窗口保存失败")
+            return {"ok": False, "msg": str(exc)}
+
+    def snip_send(self, rect: Any) -> Dict[str, Any]:
+        """发到输入框：裁剪 → PNG 落盘受信目录 → 事件回传主窗口 → 关闭遮罩窗口。"""
+        try:
+            win = self._live_window()
+            if win is None:
+                return {"ok": False, "msg": "截图窗口已关闭"}
+            png = self._crop_selection(rect)
+            path = save_snip_png(png)
+            self._bridge.emit_event("snip_attachment_ready", {"path": path})
+            self._destroy_window(win)
+            return {"ok": True}
+        except Exception as exc:
+            logger.exception("截图发到输入框失败")
+            return {"ok": False, "msg": str(exc)}
+
+    def snip_close(self) -> Dict[str, Any]:
+        """取消：关闭遮罩窗口（幂等）。"""
+        try:
+            win = self._live_window()
+            if win is not None:
+                self._destroy_window(win)
+            return {"ok": True}
+        except Exception as exc:
+            logger.exception("关闭截图窗口失败")
             return {"ok": False, "msg": str(exc)}
