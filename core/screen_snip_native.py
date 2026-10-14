@@ -261,6 +261,10 @@ class SnipOverlayNative:
         panel = F.FlowLayoutPanel()
         panel.FlowDirection = F.FlowDirection.LeftToRight
         panel.AutoSize = True
+        # 必须显式 GrowAndShrink：AutoSize 默认 GrowOnly 只增不减，而
+        # FlowLayoutPanel 默认高度 100 大于工具条内容高度，面板底部会留一条
+        # 约 51px 的空白黑边（看着像"黑框偏大"，2026-10-14 实测修复）
+        panel.AutoSizeMode = F.AutoSizeMode.GrowAndShrink
         panel.BackColor = D.Color.FromArgb(230, 30, 34, 44)
         panel.Padding = F.Padding(4)
         panel.Visible = False
