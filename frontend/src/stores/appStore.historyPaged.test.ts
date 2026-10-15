@@ -255,3 +255,44 @@ it('翻页失败（ok=false）保留原分页状态，不写成「没有更早�
   await store.loadOlderMessages();
   expect(loadOlder).toHaveBeenCalledTimes(2);
 });
+
+// ---------------------------------------------------------------------------
+// 回归：跨会话事件不得回滚当前会话刚翻页加载的历史与游标
+// 真实故障（2026-10-15，用户第二次反馈）：长会话向上翻几页后，后台会话的
+// 事件（token_usage / turn_start 等）到达——事件管线临时绑定目标会话时
+// 没有先快照当前会话，finally 回绑拿的是旧快照，刚 prepend 的历史与推进的
+// 游标被丢弃，表现为「向上翻一段就被弹回、再也加载不出来，点红点也上不去」。
+// ---------------------------------------------------------------------------
+
+it('跨会话事件不回滚当前会话刚翻页加载的历史与游标', async () => {
+  const store = useAppStore();
+  seedSession(store);          // 当前会话 s1：尾部一页，游标 100
+  // 建立 s1 的 runtime 快照（等价于切进 s1 时的状态）
+  store._getSessionRuntime('s1');
+  store._captureRuntime('s1');
+
+  // 用户向上翻页：prepend 一页更早历史，游标推进到 60（顶层实时进度，尚未入快照）
+  const loadOlder = vi.fn().mockResolvedValue({
+    ok: true,
+    messages: [
+      { role: 'user', content: '第 49 条', _msg_id: 60 },
+      { role: 'assistant', content: '回答 49', tool_calls: [], _msg_id: 61 },
+    ],
+    has_more: true,
+    oldest_id: 60,
+  });
+  (window as any).pywebview = { api: { load_older_messages: loadOlder } };
+  await store.loadOlderMessages();
+  expect(store.messages.map(m => m.content)[0]).toBe('第 49 条');
+  expect(store.historyOldestId).toBe(60);
+
+  // 后台会话 B 的回合事件到达：跨会话 → 临时绑定 B 再回绑 s1
+  store.handleBridgeEvent({ type: 'turn_start', data: { session_name: 'B', user_text: '后台任务' } } as any);
+
+  // 刚翻页加载的历史与推进的游标不得被 s1 的旧快照回滚
+  expect(store.messages.map(m => m.content)).toEqual([
+    '第 49 条', '回答 49', '第 51 条', '回答 51',
+  ]);
+  expect(store.historyOldestId).toBe(60);
+  expect(store.historyHasMore).toBe(true);
+});

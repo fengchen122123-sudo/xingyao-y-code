@@ -134,15 +134,6 @@
             :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
           ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
-          <!-- Git 分支入口：非 Git 工作区不显示；点击弹出右侧 Git 管理面板 -->
-          <button
-            v-if="gitBranchLabel"
-            data-test="composer-git-branch"
-            class="chip-btn git-branch-btn"
-            title="Git 工作台：点击打开 Git 管理面板"
-            @click.stop="openGitPanel"
-          ><AppIcon name="git-branch" :size="12" :stroke-width="2" /><span class="git-branch-label">{{ gitBranchLabel }}</span></button>
-
           <!-- 上下文统计圆环：弧线占比 = 已用上下文/窗口；悬停弹出用量详情面板，
                触摸设备点按切换（面板见 ContextUsagePanel） -->
           <span
@@ -239,7 +230,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
-import { useGitStore } from '../stores/gitStore';
 import type { QueuedMessage } from '../types/pywebview';
 import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
@@ -257,17 +247,6 @@ import { useComposerResize } from '../composables/useComposerResize';
 import { buildSessionTokenSummary, formatTokenCount } from '../utils/tokenFormat';
 
 const store = useAppStore();
-const gitStore = useGitStore();
-// Git 分支 chip 文案：复用状态栏格式（去掉 ⎇ 前缀），带脏标记与同步状态；
-// snapshot 未加载或非 Git 工作区时为空，chip 由 v-if 隐藏
-const gitBranchLabel = computed(() => {
-  const text = gitStore.statusbarText;
-  return text ? text.slice(2) : '';
-});
-function openGitPanel() {
-  gitStore.requestOpenPanel();
-  store.openRightPanelTab('git');
-}
 const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
   set: value => { store._getSessionRuntime().composerText = value; },
@@ -735,19 +714,6 @@ textarea {
   color: var(--orange);
 }
 
-/* Git 分支入口：长分支名截断显示，完整名在 title 中；空间不足时与模型按钮
-   一起收缩（label 需 min-width:0 才能在 flex 内真正截断出省略号） */
-.git-branch-btn {
-  max-width: 200px;
-  min-width: 0;
-}
-.git-branch-btn .git-branch-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* 模型按钮上的小箭头（对齐旧 9px 文字箭头的视觉重量） */
 .model-chevron {
   color: var(--text-faint);
@@ -844,14 +810,8 @@ textarea {
 /* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
    两侧面板展开挤窄输入栏时禁止按钮换行/压成竖条，按 #input-wrap 容器
    宽度分档收纳，任何档位都保持单行：
-   ≤640 只隐 Git 分支文字（模型名继续省略号收缩）；
    ≤540 权限/模型转手机版纯图标；
-   ≤430 沙盒收成 开/限 并隐藏分支入口 */
-@container composer (max-width: 640px) {
-  .git-branch-btn .git-branch-label {
-    display: none;
-  }
-}
+   ≤430 沙盒收成 开/限 */
 @container composer (max-width: 540px) {
   .permission-mode-btn .perm-label,
   .permission-mode-btn .permission-chevron,
@@ -865,9 +825,6 @@ textarea {
   }
 }
 @container composer (max-width: 430px) {
-  .git-branch-btn {
-    display: none;
-  }
   .sandbox-label-full {
     display: none;
   }
@@ -915,10 +872,6 @@ textarea {
   .model-chip .model-label,
   .model-chip .model-chevron,
   .sandbox-label-full {
-    display: none;
-  }
-  /* 手机端分支信息看状态栏即可，输入框不挤占空间 */
-  .git-branch-btn {
     display: none;
   }
   .perm-icon,

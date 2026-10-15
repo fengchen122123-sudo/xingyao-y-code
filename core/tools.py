@@ -25,6 +25,8 @@ from core.version import __version__ as YCODE_VERSION
 from core import tool_cache as _tool_cache
 from core.lsp import _get_rg_executable
 from core.subagent_common import build_subagent_common_block
+# 秘书调度台的错误类型：仅用于把服务层的可读原因转成提示文本（纯类型，无 I/O）
+from core.secretary_dispatch import SecretaryDispatchError
 
 
 HTTP_TIMEOUT_SECONDS = 20
@@ -58,11 +60,15 @@ def _raise_if_cancelled(cancel_event):
 
 
 def _agent_display_name() -> str:
-    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
-    try:
-        from core.persona_settings import get_agent_display_name
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
 
-        return get_agent_display_name()
+    走 core.secretary 而非直接读设置页：子代理提示词里的名字是“当前会话内的自称”，
+    必须跟着会话走；读取失败回落默认“星瑶”（与原行为一致）。
+    """
+    try:
+        from core.secretary import get_active_agent_name
+
+        return get_active_agent_name()
     except Exception:
         return "星瑶"
 
@@ -4918,3 +4924,152 @@ def undo_turn(turn_id=""):
         "后续继续相关工作前必须重新读取磁盘文件。",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 秘书调度台工具（设计 2026-10-15 第 3/4/5 节）
+# 三个工具只对秘书会话可见（core/secretary 的工具策略），真实能力由 GUI 侧实现
+# 并经 core.secretary_dispatch 注册；core 层不 import gui_bridge。CLI / 脚本等
+# 未注册场景返回可读中文错误，绝不抛异常。
+# ---------------------------------------------------------------------------
+
+_SECRETARY_DISPATCH_UNAVAILABLE = (
+    "🚨 秘书调度能力当前不可用：会话检索 / 派活 / 跳转由界面进程提供，"
+    "需要 GUI 运行中（CLI / 脚本场景下不可用）。"
+)
+
+
+def _secretary_dispatch_service():
+    """取调度服务句柄；未注册或加载失败时返回 (None, 可读错误文本)。"""
+    try:
+        from core import secretary_dispatch as _dispatch
+    except Exception as exc:
+        return None, f"🚨 秘书调度能力加载失败：{exc}"
+    try:
+        service = _dispatch.get()
+    except Exception as exc:
+        return None, f"🚨 秘书调度能力加载失败：{exc}"
+    if service is None:
+        return None, _SECRETARY_DISPATCH_UNAVAILABLE
+    return service, ""
+
+
+def _secretary_scope_limit(value, default=20, maximum=50):
+    """limit 归一化：非法 / 非正数回落默认值，超出上限截到上限。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return min(parsed, maximum)
+
+
+def _secretary_json(payload) -> str:
+    """统一序列化出口：中文不转义，保证模型与日志可读。"""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def search_conversations(
+    keyword="", date_from="", date_to="", workdir="", limit=20, cancel_event=None
+):
+    """检索历史会话（秘书调度台：能力一）。
+
+    按关键词 / 日期区间（YYYY-MM-DD）/ 项目目录过滤；关键词与日期都为空时由
+    服务层拒绝（避免把全部会话倾倒进上下文）。返回 JSON 字符串：
+    ``{"count": n, "results": [{session_name, display_name, is_secretary,
+    workdir, updated_at, message_count, snippets}, ...]}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    _raise_if_cancelled(cancel_event)
+    try:
+        results = service.search_conversations(
+            keyword=str(keyword or ""),
+            date_from=str(date_from or ""),
+            date_to=str(date_to or ""),
+            workdir=str(workdir or ""),
+            limit=_secretary_scope_limit(limit),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 检索会话失败：{exc}"
+    except Exception as exc:
+        return f"🚨 检索会话失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    rows = [row for row in (results or []) if isinstance(row, dict)]
+    payload = {"count": len(rows), "results": rows}
+    if not rows:
+        payload["hint"] = "没找到匹配的会话，可换关键词或放宽日期范围。"
+    return _secretary_json(payload)
+
+
+def dispatch_task(
+    target="", prompt="", workdir="", model_id="", permission_mode="", cancel_event=None
+):
+    """把任务派给指定会话（秘书调度台：能力二）。
+
+    语义等价于**用户在目标会话亲手发一条消息**：内容以 role=user 落库、界面
+    正常显示并触发一轮真实执行；不传任何"自动化"显示标记。``target`` 为空或
+    「新会话」时按 ``workdir`` 懒创建新会话。返回 JSON 字符串：
+    ``{ok, target_session, display_name, workdir, state}``；目标不唯一时返回
+    ``{ok: false, candidates: [...]}``，由调用方向用户确认。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    text = str(prompt or "").strip()
+    if not text:
+        return "🚨 派活失败：prompt（任务正文）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.dispatch_task(
+            target=str(target or ""),
+            prompt=text,
+            workdir=str(workdir or ""),
+            model_id=str(model_id or ""),
+            permission_mode=str(permission_mode or ""),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 派活失败：{exc}"
+    except Exception as exc:
+        return f"🚨 派活失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 派活失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    if payload.get("ok") is False and payload.get("candidates"):
+        payload["hint"] = (
+            "目标不唯一：请把候选里的 session_name 交给用户确认后，用确定的"
+            "target 重新派活。"
+        )
+    return _secretary_json(payload)
+
+
+def open_session(target="", cancel_event=None):
+    """把用户带到某个历史会话（秘书调度台：能力三）。
+
+    纯系统层切换（不模拟点击）：解析目标（会话名 / 显示名 / 关键词唯一命中）、
+    已归档先取消归档、切换当前会话并推送界面事件。返回 JSON 字符串：
+    ``{ok, session_name, display_name, workdir}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    wanted = str(target or "").strip()
+    if not wanted:
+        return "🚨 跳转失败：target（会话名或显示名）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.open_session(target=wanted)
+    except SecretaryDispatchError as exc:
+        return f"🚨 跳转失败：{exc}"
+    except Exception as exc:
+        return f"🚨 跳转失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 跳转失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    return _secretary_json(payload)

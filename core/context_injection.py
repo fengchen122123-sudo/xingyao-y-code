@@ -141,16 +141,30 @@ def _unbound_section_builder() -> str:
     return ""
 
 
-def _build_context_prefix(is_gui: bool) -> str:
+def _build_context_prefix(is_gui: bool, session_name: str | None = None) -> str:
     """注入点 1：base_prompt + 决策规则（PREFIX/SYSTEM）。
 
     为什么包一层：现有 ``build_stable_prompt(base_prompt)`` 需要外部提供
     base_prompt，而 ``InjectionSpec.section_builder`` 约定无参；这里按端读取
     随包系统提示词后直接调用现有函数，包装层不产生任何新文本。
+
+    ``session_name`` 用于秘书会话分流（2026-10-15）：秘书会话才按会话名调用
+    带参签名（读秘书随包提示词）。其余情况保持 ``load_system_prompt(is_gui)``
+    的单参调用——非秘书会话下 load_system_prompt 完全忽略会话名，两种调用
+    逐字节等价，同时兼容按单参打桩的既有测试替身（多传参会直接 TypeError）。
     """
     from core.agent_service import load_system_prompt
     from core.context_builder import build_stable_prompt
 
+    if session_name:
+        try:
+            from core.secretary import is_secretary_session
+
+            if is_secretary_session(session_name):
+                return build_stable_prompt(load_system_prompt(is_gui, session_name))
+        except Exception:
+            # 身份解析异常按普通会话处理：前缀字节与改动前一致，绝不打断组装
+            pass
     return build_stable_prompt(load_system_prompt(is_gui))
 
 
@@ -320,7 +334,7 @@ def build_default_injection_registry(
         source=SOURCE_CONTEXT_PREFIX,
         persistence=Persistence.PREFIX,
         channel=Channel.SYSTEM,
-        section_builder=lambda: _build_context_prefix(is_gui),
+        section_builder=lambda: _build_context_prefix(is_gui, session_name),
     ))
 
     # 2) 通用编码规范 / 长期记忆 / 技能目录 / 子 Agent 清单 → PREFIX/SYSTEM

@@ -42,6 +42,8 @@ from core.media_server import media_server
 from core.media_store import archive_media_file
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
+from core import secretary
+from core.secretary_dispatch import SecretaryDispatchError
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_terminal
 from gui_git_mixin import GitBridgeMixin
@@ -567,6 +569,454 @@ def _media_save_filename(suggested_name: str, ext: str) -> str:
     return (name or fallback) + ext
 
 
+# ----------------------------------------------------------------------
+# 秘书调度台：会话检索 / 派活 / 跳转
+# （设计：docs/superpowers/specs/2026-10-15-secretary-dispatch-design.md，
+#  由 _SecretaryDispatchService 实现并注册到 core.secretary_dispatch 句柄）
+# ----------------------------------------------------------------------
+
+# 检索返回上限：超过此值直接夹紧（一次倾倒几百条会话既无用又费 token）
+_SECRETARY_SEARCH_LIMIT_MAX = 50
+# 同一会话最多回带几条命中片段（与 memory 检索口径一致，防止长会话刷屏）
+_SECRETARY_SNIPPET_MAX = 3
+# 新建会话的草稿名口径：与 create_session 一致
+_SECRETARY_DRAFT_NAME_RE = re.compile(r"^session_[a-f0-9]{6}$")
+# target 命中这些语义别名时走"按目录新建会话"分支
+_SECRETARY_NEW_SESSION_MARKS = ("新会话", "新对话", "new", "new_session")
+
+
+def _secretary_parse_date(value: str, field: str) -> str:
+    """校验 YYYY-MM-DD 日期入参：空值返回空串，非法值抛 SecretaryDispatchError。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        time.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        raise SecretaryDispatchError(f"{field} 需要 YYYY-MM-DD 格式的日期，收到：{raw}")
+    return raw
+
+
+def _secretary_in_date_range(updated_at: str, date_from: str, date_to: str) -> bool:
+    """按会话 updated_at（YYYY-MM-DD HH:MM:SS 文本）做日期区间判定。
+
+    空区间视为不限；ISO 文本按字典序比较即等价于按时间比较。updated_at 缺失时
+    只有"完全不限日期"才算命中，避免把无时间的会话混进有日期条件的检索结果。
+    """
+    day = str(updated_at or "")[:10]
+    if not day:
+        return not (date_from or date_to)
+    if date_from and day < date_from:
+        return False
+    if date_to and day > date_to:
+        return False
+    return True
+
+
+class _SecretaryDispatchService:
+    """秘书调度台能力的桥侧实现（注册为 core.secretary_dispatch 的句柄）。
+
+    三个方法全部落在既有通道上，不新增并行实现：
+      检索 → MemoryManager.search_sessions_and_messages；
+      派活 → _spawn_turn_worker / _message_queues（与用户亲手发消息同一条路）；
+      跳转 → unarchive_session 既有入口 + _set_current_session + open_session 事件。
+
+    约定：参数非法 / 目标不存在等"可读原因"一律抛 SecretaryDispatchError，
+    由 core 层工具转成提示文本；"命中多条"不算错误，返回候选列表让上层追问。
+    """
+
+    def __init__(self, bridge: "ApiBridge") -> None:
+        self._bridge = bridge
+
+    # ------------------------------------------------------------------
+    # 内部：会话清单、显示名、目标解析
+    # ------------------------------------------------------------------
+    def _candidate_sessions(self, include_archived: bool = False) -> List[Dict[str, Any]]:
+        """候选会话清单（GUI + 秘书来源）：秘书会话的 workdir 同为 GLOBAL，
+        只能靠 source 区分，因此必须一次取回两类来源。"""
+        try:
+            raw = self._bridge._memory.get_all_sessions(
+                workdir=None,
+                sources=["GUI", "SECRETARY"],
+                include_empty=True,
+                include_archived=include_archived,
+            )
+        except Exception:
+            logger.debug("读取会话清单失败", exc_info=True)
+            return []
+        return [dict(s) for s in (raw or [])]
+
+    def _is_secretary(self, session_name: str) -> bool:
+        """秘书会话判定：优先读会话来源，回落 core.secretary 的既有判定。"""
+        try:
+            if str(self._bridge._memory.get_session_source(session_name) or "") == "SECRETARY":
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(secretary.is_secretary_session(session_name))
+        except Exception:
+            return False
+
+    def _display_name(self, session_name: str) -> str:
+        """会话显示名：秘书会话用秘书名，草稿名显示「新会话」，其余用会话名
+        （与侧栏既有口径一致）。"""
+        name = str(session_name or "")
+        if self._is_secretary(name):
+            return secretary.get_secretary_name(name) or secretary.FALLBACK_SECRETARY_NAME
+        return "新会话" if _SECRETARY_DRAFT_NAME_RE.match(name) else name
+
+    def _session_workdir(self, session_name: str) -> str:
+        """会话登记的工作目录；查不到时回落 GLOBAL（自由对话）。"""
+        name = str(session_name or "")
+        for item in self._candidate_sessions(include_archived=True):
+            if str(item.get("name")) == name:
+                return str(item.get("workdir") or "GLOBAL")
+        return "GLOBAL"
+
+    def _candidate_view(self, session_name: str) -> Dict[str, str]:
+        """候选会话摘要（命中多条时回给上层，供秘书追问用户）。"""
+        return {
+            "session_name": session_name,
+            "display_name": self._display_name(session_name),
+            "workdir": self._session_workdir(session_name),
+        }
+
+    def _resolve_target(self, target: str) -> tuple:
+        """解析目标会话 → (session_name | None, candidates)。
+
+        命中顺序：会话名精确 → 显示名精确 → 会话名/显示名子串。恰好命中一条才算
+        成功；0 条与多条都返回 (None, ...)，由调用方决定报错还是给候选列表。
+        """
+        raw = str(target or "").strip()
+        if not raw:
+            return None, []
+        names = [str(s.get("name") or "") for s in self._candidate_sessions(include_archived=True)]
+        names = [n for n in names if n]
+        if raw in names:
+            return raw, []
+        pairs = [(n, self._display_name(n)) for n in names]
+        exact = [n for n, display in pairs if display == raw]
+        if len(exact) == 1:
+            return exact[0], []
+        if len(exact) > 1:
+            return None, [self._candidate_view(n) for n in exact]
+        fuzzy = [n for n, display in pairs if raw in n or raw in display]
+        if len(fuzzy) == 1:
+            return fuzzy[0], []
+        return None, [self._candidate_view(n) for n in fuzzy]
+
+    def _validate_workdir(self, workdir: str) -> str:
+        """校验新建会话的归属目录：空 / GLOBAL → GLOBAL；非法 → 报错并给相近候选。"""
+        raw = str(workdir or "").strip()
+        if not raw or raw.upper() == "GLOBAL":
+            return "GLOBAL"
+        path = _resolve_real_path(raw)
+        if os.path.isdir(path):
+            return path
+        hints = self._similar_dirs(raw)
+        hint_text = f"；相近目录：{'、'.join(hints)}" if hints else ""
+        raise SecretaryDispatchError(f"工作目录不存在或不是目录：{raw}{hint_text}")
+
+    def _similar_dirs(self, raw: str, limit: int = 5) -> List[str]:
+        """给非法 workdir 找相近目录候选（同父目录下名字互为子串，兜底取前几个）。"""
+        resolved = _resolve_real_path(raw)
+        parent = os.path.dirname(resolved) or os.sep
+        base = os.path.basename(str(raw).rstrip("\\/")).lower()
+        try:
+            entries = [
+                e for e in os.listdir(parent)
+                if os.path.isdir(os.path.join(parent, e))
+            ]
+        except Exception:
+            return []
+        hits = [e for e in entries if base and (base in e.lower() or e.lower() in base)]
+        if not hits:
+            hits = entries
+        return [os.path.join(parent, name) for name in hits[:limit]]
+
+    # ------------------------------------------------------------------
+    # 能力一：会话检索
+    # ------------------------------------------------------------------
+    def search_conversations(self, keyword: str = "", date_from: str = "",
+                             date_to: str = "", workdir: str = "",
+                             limit: int = 20) -> List[Dict[str, Any]]:
+        """检索历史会话；关键词为空且无日期时拒绝（避免把全部会话倾倒出来）。
+
+        检索本身复用 MemoryManager.search_sessions_and_messages，这里只做
+        参数校验、来源合并（GUI + 秘书）与字段整理（设计文档第 3 节）。
+        """
+        bridge = self._bridge
+        kw = str(keyword or "").strip()
+        start = _secretary_parse_date(date_from, "date_from")
+        end = _secretary_parse_date(date_to, "date_to")
+        if start and end and start > end:
+            raise SecretaryDispatchError(f"日期区间反了：{start} > {end}")
+        if not kw and not start and not end:
+            raise SecretaryDispatchError("请至少给出关键词或日期范围，避免把全部会话倾倒出来")
+        try:
+            size = int(limit or 20)
+        except (TypeError, ValueError):
+            raise SecretaryDispatchError(f"limit 需要是 1..{_SECRETARY_SEARCH_LIMIT_MAX} 的整数")
+        size = max(1, min(size, _SECRETARY_SEARCH_LIMIT_MAX))
+        workdir_filter = str(workdir or "").strip()
+
+        # 按会话聚合并保留顺序无关：最终统一按 updated_at 倒序截断
+        merged: Dict[str, Dict[str, Any]] = {}
+        if kw:
+            # memory 的 source 过滤是单值语义（含 source IS NULL 的历史数据），
+            # 分两次检索再合并，保证秘书会话也能被找到；CLI 会话不纳入
+            for source in ("GUI", "SECRETARY"):
+                try:
+                    rows = bridge._memory.search_sessions_and_messages(
+                        query=kw,
+                        scope="all",
+                        workdir=workdir_filter or None,
+                        source=source,
+                        limit=size,
+                        include_archived=False,
+                    )
+                except Exception as e:
+                    logger.exception("秘书检索会话失败")
+                    raise SecretaryDispatchError(f"检索失败：{e}")
+                self._merge_search_rows(merged, rows, start, end)
+        else:
+            # 只给日期：memory 的检索必须有关键词，这里按会话更新时间过滤
+            for item in self._candidate_sessions():
+                updated = str(item.get("updated_at") or "")
+                if not _secretary_in_date_range(updated, start, end):
+                    continue
+                if workdir_filter and workdir_filter != "GLOBAL":
+                    if str(item.get("workdir") or "") != workdir_filter:
+                        continue
+                name = str(item.get("name") or "")
+                if not name or name in merged:
+                    continue
+                merged[name] = self._session_row(
+                    name, updated, item.get("msg_count"), [], item.get("workdir")
+                )
+
+        rows = sorted(merged.values(), key=lambda r: str(r["updated_at"]), reverse=True)
+        return rows[:size]
+
+    def _merge_search_rows(self, merged: Dict[str, Dict[str, Any]], raw_rows,
+                           start: str, end: str) -> None:
+        """把 memory 的检索行按会话聚合（同一会话最多 3 条命中片段）。"""
+        for item in raw_rows or []:
+            name = str(item.get("session_name") or "")
+            if not name:
+                continue
+            updated = str(item.get("updated_at") or "")
+            if not _secretary_in_date_range(updated, start, end):
+                continue
+            row = merged.get(name)
+            if row is None:
+                row = self._session_row(
+                    name, updated, item.get("msg_count"), [], item.get("workdir")
+                )
+                merged[name] = row
+            role = item.get("role")
+            snippet = item.get("snippet")
+            if role and snippet and len(row["snippets"]) < _SECRETARY_SNIPPET_MAX:
+                row["snippets"].append({
+                    "role": str(role),
+                    "excerpt": str(snippet),
+                    "at": updated,
+                })
+
+    def _session_row(self, name: str, updated_at, message_count, snippets,
+                     workdir) -> Dict[str, Any]:
+        """整理一条检索结果（设计文档第 3 节字段）。"""
+        return {
+            "session_name": str(name),
+            "display_name": self._display_name(name),
+            "is_secretary": self._is_secretary(name),
+            # 与既有会话列表同口径：GLOBAL 表示自由对话，其余是真实目录
+            "workdir": str(workdir or "GLOBAL"),
+            "updated_at": str(updated_at or ""),
+            "message_count": int(message_count or 0),
+            "snippets": snippets,
+        }
+
+    # ------------------------------------------------------------------
+    # 能力二：派活
+    # ------------------------------------------------------------------
+    def dispatch_task(self, target: str = "", prompt: str = "", workdir: str = "",
+                      model_id: str = "", permission_mode: str = "") -> Dict[str, Any]:
+        """把任务投递给已有会话，或按 workdir 懒创建新会话执行。
+
+        投递语义与用户亲手发消息**完全一致**：走既有 _spawn_turn_worker，不传
+        display_text / internal_kind，目标会话里看到的是一条普通 role=user 消息；
+        目标会话忙则进既有 _message_queues（FIFO，回合结束自动补发），全程持
+        _turn_start_lock 保证"检查 + 启动"原子。
+        """
+        bridge = self._bridge
+        prompt_text = str(prompt or "").strip()
+        if not prompt_text:
+            raise SecretaryDispatchError("任务内容不能为空")
+        raw_target = str(target or "").strip()
+
+        # 指定模型必须真实存在（与 send_user_message 的 known_ids 防线同源）；
+        # 配置读取失败时放行，交由 worker 侧回退全局默认模型
+        clean_model_id = str(model_id or "").strip()
+        if clean_model_id:
+            known_ids = set()
+            try:
+                known_ids = {
+                    str(m.get("id"))
+                    for p in (load_config().get("providers") or [])
+                    for m in (p.get("models") or [])
+                }
+            except Exception:
+                known_ids = set()
+            if known_ids and clean_model_id not in known_ids:
+                raise SecretaryDispatchError(f"模型不存在或已被删除：{clean_model_id}")
+
+        # 会话级权限档位：未知值直接拒绝（宁可不派也不误放权）
+        raw_permission = str(permission_mode or "").strip()
+        pending_permission = ""
+        if raw_permission:
+            if not app_context.is_known_permission_mode(raw_permission):
+                raise SecretaryDispatchError(f"未知权限模式：{raw_permission}")
+            pending_permission = app_context.normalize_permission_mode(raw_permission)
+
+        is_new = (not raw_target) or raw_target.lower() in _SECRETARY_NEW_SESSION_MARKS
+        if is_new:
+            # 新建会话：会话行由回合 worker 懒创建（pending_workdir 语义），
+            # 侧栏按该目录落进对应项目分组
+            session_name = f"session_{uuid.uuid4().hex[:6]}"
+            pending_workdir = self._validate_workdir(workdir)
+            display_name = "新会话"
+        else:
+            session_name, candidates = self._resolve_target(raw_target)
+            if session_name is None:
+                if candidates:
+                    return {
+                        "ok": False,
+                        "msg": (
+                            f"「{raw_target}」命中 {len(candidates)} 个会话，"
+                            "请指明具体会话名后再派活"
+                        ),
+                        "candidates": candidates,
+                    }
+                raise SecretaryDispatchError(
+                    f"没找到会话「{raw_target}」，可以先用 search_conversations 检索"
+                )
+            pending_workdir = ""
+            display_name = self._display_name(session_name)
+        if pending_permission and not is_new:
+            # 已有会话：档位落在会话绑定上（等同用户在该会话里切换档位）
+            try:
+                bridge._memory.set_session_permission_mode(session_name, pending_permission)
+            except Exception:
+                logger.debug("派活绑定额度档位失败", exc_info=True)
+
+        # 完成通知按"发起会话"路由：用户在秘书会话里看不到目标会话的流式输出
+        notify_session = str(getattr(bridge, "_current_session", "") or "")
+        dispatch_context = {"display_name": display_name, "notify_session": notify_session}
+        queued_permission = pending_permission if is_new else ""
+        with bridge._turn_start_lock:
+            if bridge._is_turn_active(session_name):
+                bridge._message_queues.setdefault(session_name, []).append({
+                    "id": f"q_{uuid.uuid4().hex[:8]}",
+                    "text": prompt_text,
+                    "attachments": [],
+                    "queued_at": time.time(),
+                    # 派活等同用户亲手发消息：不写 display_text（前端按原文渲染气泡）
+                    "turn_source": "local",
+                    "pending_workdir": pending_workdir,
+                    "secretary_model_id": clean_model_id,
+                    "secretary_permission_mode": queued_permission,
+                    "secretary_dispatch_display_name": display_name,
+                    "secretary_dispatch_notify_session": notify_session,
+                })
+                # 快照在锁内发：与用户消息排队路径同序
+                bridge._emit_message_queue_snapshot(session_name)
+                state = "queued"
+            else:
+                try:
+                    bridge._spawn_turn_worker(
+                        prompt_text,
+                        session_name,
+                        pending_workdir=pending_workdir,
+                        # 派活是本地入口：turn_source 固定 local；不传 display_text /
+                        # internal_kind，保证落库与展示与用户手输消息同形（硬要求）
+                        turn_source="local",
+                        pending_model_id=clean_model_id,
+                        pending_permission_mode=queued_permission,
+                        secretary_dispatch_context=dispatch_context,
+                    )
+                except Exception as e:
+                    logger.exception("秘书派活启动回合失败")
+                    raise SecretaryDispatchError(f"派活失败：{e}")
+                state = "running"
+        return {
+            "ok": True,
+            "target_session": session_name,
+            "display_name": display_name,
+            "workdir": pending_workdir or self._session_workdir(session_name),
+            "state": state,
+        }
+
+    # ------------------------------------------------------------------
+    # 能力三：跳转
+    # ------------------------------------------------------------------
+    def open_session(self, target: str = "") -> Dict[str, Any]:
+        """把用户带到目标会话（纯系统层切换，不模拟点击、不打断正在跑的回合）。
+
+        已归档会话先走既有取消归档入口，再切当前会话并推 open_session 事件；
+        前端收到事件后按 switchSession 的既有路径刷新视图。
+        """
+        bridge = self._bridge
+        raw_target = str(target or "").strip()
+        if not raw_target:
+            raise SecretaryDispatchError("请给出要打开的会话名或关键词")
+        session_name, candidates = self._resolve_target(raw_target)
+        if session_name is None:
+            if candidates:
+                return {
+                    "ok": False,
+                    "msg": (
+                        f"「{raw_target}」命中 {len(candidates)} 个会话，"
+                        "请指明具体会话名后再跳转"
+                    ),
+                    "candidates": candidates,
+                }
+            raise SecretaryDispatchError(
+                f"没找到会话「{raw_target}」，可以先用 search_conversations 检索"
+            )
+        display_name = self._display_name(session_name)
+        workdir = self._session_workdir(session_name)
+
+        # 已归档 → 先取消归档（沿用既有入口，侧栏列表与归档区随之刷新）
+        try:
+            archived_at = bridge._session_archived_at(session_name)
+        except Exception:
+            archived_at = None
+        if archived_at:
+            try:
+                result = bridge.unarchive_session(session_name)
+            except Exception as e:
+                logger.exception("秘书跳转前取消归档失败")
+                raise SecretaryDispatchError(f"取消归档失败：{e}")
+            if not (isinstance(result, dict) and result.get("ok")):
+                reason = result.get("msg") if isinstance(result, dict) else result
+                raise SecretaryDispatchError(f"取消归档失败：{reason}")
+
+        bridge._set_current_session(session_name)
+        bridge.emit_event("open_session", {
+            "session_name": session_name,
+            "display_name": display_name,
+            "workdir": workdir,
+        })
+        return {
+            "ok": True,
+            "session_name": session_name,
+            "display_name": display_name,
+            "workdir": workdir,
+        }
+
+
 class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
@@ -785,6 +1235,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 工具经 core.automation.service.get() 取句柄后调用同名方法，落到桥侧既有
         # 实现（参数校验、任务上限检查、事件推送、引擎通知），不在 core 层重复实现。
         self._register_automation_service()
+        # 秘书调度台：把检索/派活/跳转能力注册为 core 层服务句柄，供秘书会话的
+        # Agent 工具调用；实现仍是桥侧既有通道（会话检索、_spawn_turn_worker、
+        # _message_queues、_set_current_session），不新增并行实现
+        self._register_secretary_dispatch_service()
         # 正在运行的星轨自动化回合：turn_id → {"run_id", "task_name"}。
         # 无人值守权限自动拒绝的判定依据（规格 5.5）
         self._automation_turn_labels: Dict[str, Dict[str, str]] = {}
@@ -1183,6 +1637,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             automation_service.unregister()
         except Exception:
             logger.exception("退出时注销自动化服务句柄失败")
+
+        # 秘书调度服务句柄同步注销：退出后工具层 get() 返回 None，避免悬挂引用
+        # 指向已停摆的桥；同样包 try/except，不中断后续收尾链
+        try:
+            from core import secretary_dispatch
+
+            secretary_dispatch.unregister()
+        except Exception:
+            logger.exception("退出时注销秘书调度服务句柄失败")
 
         for event in list(self._cancel_events.values()):
             event.set()
@@ -3797,7 +4260,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         try:
             # include_empty=True：空会话交给下方自己的跳过逻辑处理（当前会话
             # 即使还没有消息也要显示），否则刚新建的会话在侧栏永远是 0 个会话
-            raw = self._memory.get_all_sessions(workdir=None, source="GUI", include_empty=True)
+            # 一次取回 GUI 与秘书会话：秘书归属必须靠 source 区分，因为秘书会话的
+            # workdir 同为 "GLOBAL"，光看路径与自由对话无从辨别
+            raw = self._memory.get_all_sessions(
+                workdir=None, sources=["GUI", "SECRETARY"], include_empty=True
+            )
             saved_workspaces = self._memory.get_all_workspaces()
             current_wdir = _resolve_real_path(os.getcwd())
             app_dir = _app_install_dir()
@@ -3805,6 +4272,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 恢复最近会话会 chdir 到项目目录，此时新建自由对话，
             # 若按 cwd 标记就会出现“对话”和项目分组同时显示“当前”
             current_session_wdir = self._session_workdir(self._current_session)
+            # 秘书会话的 workdir 同样是 "GLOBAL"，所以“当前”归属也只能看 source：
+            # 否则“秘书”和“对话”两个分组会同时显示为当前分组
+            current_is_secretary = any(
+                s.get("name") == self._current_session
+                and (s.get("source") or "GUI") == "SECRETARY"
+                for s in raw
+            )
 
             if current_wdir != "GLOBAL" and current_wdir != app_dir:
                 self._memory.add_workspace(current_wdir)
@@ -3816,7 +4290,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "folder_path": "GLOBAL",
                 "folder_name": "对话",
                 "is_global": True,
-                "is_current": (current_session_wdir == "GLOBAL"),
+                "is_current": (current_session_wdir == "GLOBAL" and not current_is_secretary),
+                "sessions": [],
+            }
+
+            # 秘书分组：与"对话"一样不对应任何项目文件夹，故 is_global 必须是 False
+            # （前端多处用 is_global 判定"自由对话分组"，不能被秘书组误命中）；
+            # folder_path 仅作分组标识，不会作为 workdir 落库
+            secretary_group = {
+                "folder_path": "SECRETARY",
+                "folder_name": "秘书",
+                "is_global": False,
+                "is_secretary": True,
+                "is_current": current_is_secretary,
                 "sessions": [],
             }
 
@@ -3827,7 +4313,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
             for s in raw:
                 wdir_item = s.get("workdir")
-                if wdir_item and wdir_item != "GLOBAL":
+                # 只把"GLOBAL 之外的真实目录"纳入项目分组：秘书归属靠 source 判定，
+                # 其 workdir 仍是 "GLOBAL"，这里额外防御 "SECRETARY" 这个分组标识
+                # 被误当路径处理（_resolve_real_path 会把它拼成伪目录，凭空多出分组）
+                if wdir_item and wdir_item not in ("GLOBAL", "SECRETARY"):
                     all_known_wdirs.add(_resolve_real_path(wdir_item))
 
             for w_path in all_known_wdirs:
@@ -3854,6 +4343,29 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
                 wdir = s.get("workdir")
                 display = "新会话" if is_default_name else name
+
+                # 秘书归属只由 source 决定：秘书会话的 workdir 就是 "GLOBAL"，
+                # 与自由对话同路径，按路径归组会被"对话"分组抢走，
+                # 也无法表达两种不同的分组语义
+
+                if (s.get("source") or "GUI") == "SECRETARY":
+                    # 秘书会话的显示名就是秘书名（每个秘书会话各起一个名字）：
+                    # 未命名的历史遗留会话回落「秘书」，与身份解析口径保持一致
+                    sec_name = secretary.get_secretary_name(name) or secretary.FALLBACK_SECRETARY_NAME
+                    secretary_group["sessions"].append({
+                        "name": name,
+                        "session_id": s.get("id"),
+                        "display_name": sec_name,
+                        "secretary_name": sec_name,
+                        # 显式标注秘书归属（前端此前靠 secretary_name 兜底判定，
+                        # 这里给出明确字段，避免与"名字恰好叫秘书"的普通会话混淆）
+                        "is_secretary": True,
+                        "count": msg_count,
+                        "workdir": "GLOBAL",
+                        "is_global": True,
+                        "updated_at": s.get("updated_at") or "",
+                    })
+                    continue
 
                 # 无 workdir 的历史会话（旧数据/CLI 产生）固定归入"对话"分组；
                 # 不能兜底跟随进程 cwd，否则引入新目录 chdir 后它们会集体"搬"
@@ -3891,10 +4403,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     }
                 groups_dict[wdir_norm]["sessions"].append(s_info)
 
-            # 3. 全局对话组无条件保留在最顶部，项目分组按名称稳定排序。
-            # 不能把"当前会话所在目录"置顶：否则点击不同目录的会话时列表
-            # 会整体跳动
-            result_groups = [global_group]
+            # 3. 秘书组与全局对话组无条件保留在最顶部（秘书组置顶），
+            # 项目分组按名称稳定排序。不能把"当前会话所在目录"置顶：
+            # 否则点击不同目录的会话时列表会整体跳动
+            result_groups = [secretary_group, global_group]
             project_groups = list(groups_dict.values())
             project_groups.sort(key=lambda g: g["folder_name"])
             result_groups.extend(project_groups)
@@ -3907,29 +4419,53 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         """归档会话列表（按归档时刻倒序）。
 
         条目字段风格与 get_sessions 分组树里的会话条目一致（name / session_id /
-        display_name / count / workdir / is_global / updated_at），额外带
-        archived_at；归档区没有分组语义，故直接返回扁平列表供侧栏渲染。
+        display_name / count / workdir / is_global / updated_at），秘书会话另带
+        secretary_name 与 is_secretary（显示名即秘书名），额外带 archived_at；
+        归档区没有分组语义，故直接返回扁平列表供侧栏渲染。
         """
         try:
+            # 归档区必须同时收 GUI 与 SECRETARY：秘书会话已归档后在秘书分组里被
+            # 归档过滤隐去，若这里仍按 source="GUI" 过滤就会两边都看不到，等于
+            # 凭空消失（归档只是标记，列表里丢了就再也找不回来）
             raw = self._memory.get_all_sessions(
-                workdir=None, source="GUI", include_empty=True, archived_only=True
+                workdir=None, sources=["GUI", "SECRETARY"],
+                include_empty=True, archived_only=True
             )
             items: List[Dict[str, Any]] = []
             for s in raw:
                 name = s.get("name", "")
                 wdir = s.get("workdir")
                 is_global = (not wdir) or wdir == "GLOBAL"
-                items.append({
+                # 秘书归属只由 source 决定（口径与 get_sessions 一致）：秘书会话的
+                # workdir 就是 GLOBAL，无法靠路径区分
+                is_secretary = (s.get("source") or "GUI") == secretary.SECRETARY_SOURCE
+                if is_secretary:
+                    # 秘书会话的显示名就是秘书名；未命名的历史遗留会话回落「秘书」，
+                    # 与秘书分组、身份解析三处口径保持一致
+                    sec_name = (
+                        secretary.get_secretary_name(name)
+                        or secretary.FALLBACK_SECRETARY_NAME
+                    )
+                    display_name = sec_name
+                else:
+                    # 与 get_sessions 同一口径：默认名显示为「新会话」
+                    display_name = (
+                        "新会话" if re.match(r"^session_[a-f0-9]{6}$", name) else name
+                    )
+                entry = {
                     "name": name,
                     "session_id": s.get("id"),
-                    # 与 get_sessions 同一口径：默认名显示为「新会话」
-                    "display_name": "新会话" if re.match(r"^session_[a-f0-9]{6}$", name) else name,
+                    "display_name": display_name,
                     "count": s.get("count", 0),
                     "workdir": "GLOBAL" if is_global else _resolve_real_path(wdir),
                     "is_global": is_global,
                     "updated_at": s.get("updated_at") or "",
                     "archived_at": s.get("archived_at") or "",
-                })
+                }
+                if is_secretary:
+                    entry["secretary_name"] = display_name
+                    entry["is_secretary"] = True
+                items.append(entry)
             # archived_at 是 ISO8601 文本，字符串倒序即时间倒序；
             # 同一时刻归档的会话再按名称兜底，避免列表顺序抖动
             items.sort(key=lambda it: (it["archived_at"], it["name"]), reverse=True)
@@ -3947,11 +4483,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 return s.get("archived_at") or None
         return None
 
-    def create_session(self, title: str = "新会话", workdir: Optional[str] = None) -> Dict[str, Any]:
+    def create_session(self, title: str = "新会话", workdir: Optional[str] = None,
+                       source: str = "GUI") -> Dict[str, Any]:
         try:
             new_name = f"session_{uuid.uuid4().hex[:6]}"
             target_workdir = workdir or _resolve_real_path(os.getcwd())
-            self._memory.create_session_explicit(new_name, workdir=target_workdir, source="GUI")
+            self._memory.create_session_explicit(new_name, workdir=target_workdir, source=source)
             self._set_current_session(new_name)
             # 全局 session_token_usage 不按会话隔离，旧会话的 latest_total 会
             # 残留到新会话；新建后立即按空历史重算为 0，避免窗口占比虚高
@@ -3965,6 +4502,88 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             }
         except Exception as e:
             logger.exception("create_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def create_secretary_session(self, title: str = "新会话", name: str = "") -> Dict[str, Any]:
+        """新建一个「秘书」会话并切为当前会话（必须先给定这个名字）。
+
+        秘书会话固定 workdir="GLOBAL"、source="SECRETARY"：秘书能力不绑定任何
+        项目目录，其分组归属完全由 source 决定，因此不引入新的伪 workdir 值，
+        GLOBAL 的既有语义（自由对话）保持不变。
+
+        名字是秘书会话的身份标识：先校验后落库，非法名字直接拒绝且**不产生会话
+        记录**——否则会留下一个既无名字又已切走的孤儿会话。名字只存在
+        `secretary_name` 列里，不改 `session_name`，因此改名不牵动消息 / 摘要 / 快照。
+        """
+        try:
+            try:
+                secretary_name = secretary.validate_secretary_name(name)
+            except ValueError as e:
+                return {"ok": False, "msg": str(e)}
+            new_name = f"session_{uuid.uuid4().hex[:6]}"
+            self._memory.create_session_explicit(
+                new_name, workdir="GLOBAL", source="SECRETARY", secretary_name=secretary_name
+            )
+            # 新会话名此前不可能进过缓存，这里失效是为并发路径兜底（同名复用等），
+            # 成本一次字典 pop，却能让首轮工具提示 / 标题立刻拿到新名字
+            secretary.invalidate_secretary_cache(new_name)
+            self._set_current_session(new_name)
+            # 同 create_session：新建后立即重算，避免残留旧会话的 token 统计
+            self._recalc_token_usage(new_name)
+            return {
+                "ok": True,
+                "session_name": new_name,
+                "title": title,
+                "display_name": secretary_name,
+                "secretary_name": secretary_name,
+                "workdir": "GLOBAL",
+            }
+        except Exception as e:
+            logger.exception("create_secretary_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_active_agent_name(self) -> Dict[str, Any]:
+        """返回当前会话生效的 agent 自称，供前端刷新欢迎页 / 对话头部显示名。
+
+        秘书会话 → 该会话的秘书名（未命名回落「秘书」），其余 → 设置页智能体名。
+        解析全在 `core.secretary` 内完成并自带兜底，这里只做桥接与日志。
+        """
+        try:
+            return {
+                "agent_name": secretary.get_active_agent_name(),
+                "is_secretary": bool(secretary.is_secretary_session()),
+            }
+        except Exception as e:
+            logger.exception("get_active_agent_name 失败")
+            return {"agent_name": "", "is_secretary": False, "msg": str(e)}
+
+    def rename_secretary_session(self, session_name: str, new_name: str) -> Dict[str, Any]:
+        """给秘书会话改名：只改 `secretary_name`，不动 `session_name`。
+
+        名字是提示词身份与显示名的共同来源，改完必须失效缓存，否则同一进程内
+        早先缓存过旧名字的高频路径（工具提示、标题）会继续显示旧名。
+        """
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if not secretary.is_secretary_session(session_name):
+                return {"ok": False, "msg": "该会话不是秘书会话，无法改名"}
+            try:
+                cleaned = secretary.validate_secretary_name(new_name)
+            except ValueError as e:
+                return {"ok": False, "msg": str(e)}
+            if not self._memory.set_session_secretary_name(session_name, cleaned):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            secretary.invalidate_secretary_cache(session_name)
+            return {
+                "ok": True,
+                "session_name": session_name,
+                "secretary_name": cleaned,
+                "display_name": cleaned,
+                "sessions": self.get_sessions(),
+            }
+        except Exception as e:
+            logger.exception("rename_secretary_session 失败")
             return {"ok": False, "msg": str(e)}
 
     def _set_current_session(self, session_name: str):
@@ -4060,6 +4679,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
             if self._current_session == old_name:
                 self._set_current_session(final_name)
+            # 会话名变了：旧名缓存作废，新名留空由下次解析回源（秘书会话的来源与
+            # 名字都随行，缓存键必须跟着改名走）
+            secretary.invalidate_secretary_cache(old_name)
+            secretary.invalidate_secretary_cache(final_name)
             from core import permission_grants
             from core.tools import rename_session_sandbox_bypass
 
@@ -4105,7 +4728,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     return {"ok": False, "success": False, "msg": "该会话正在运行回合，请先停止或等待完成后再删除"}
                 # 会话删除后排队消息一并丢弃
                 self._message_queues.pop(session_name, None)
+
             self._memory.delete_session(session_name)
+            # 会话没了，身份缓存必须跟着失效：否则将来复用到同名会话名时
+            # 会读到已删会话的旧来源 / 旧秘书名
+            secretary.invalidate_secretary_cache(session_name)
             from core import permission_grants
             from core.tools import clear_session_sandbox_bypass
 
@@ -4289,6 +4916,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         # 会话删除后排队消息一并丢弃
                         self._message_queues.pop(name, None)
                     self._memory.delete_session(name)
+                    # 与单条删除同口径：会话没了，身份缓存不能留
+                    secretary.invalidate_secretary_cache(name)
                     permission_grants.clear_task(name)
                     clear_session_sandbox_bypass(name)
                     if self._current_session == name:
@@ -4337,6 +4966,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
             for name in group_sessions:
                 if name:
+                    # 组内会话被整体删除，身份缓存一并对齐（防御：秘书会话不属任何项目组）
+                    secretary.invalidate_secretary_cache(name)
                     permission_grants.clear_task(name)
                     clear_session_sandbox_bypass(name)
             return {"ok": True, "success": True, "sessions": self.get_sessions()}
@@ -4777,6 +5408,97 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:  # pragma: no cover - 防御性兜底
             logger.exception("set_persona_settings 失败")
             return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 决策模型（JEV）设置桥（Task 2：委托 core.decision_service，含异常兜底）
+    # ------------------------------------------------------------------
+    def get_decision_settings(self) -> Dict[str, Any]:
+        """返回决策模型设置快照（配置 + 运行时状态）。"""
+        from core import decision_service
+
+        try:
+            snapshot = decision_service.get_decision_settings_snapshot()
+            return {
+                "ok": True,
+                "settings": snapshot.get("config") or {},
+                "runtime": snapshot.get("runtime") or {},
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_settings 失败")
+            return {"ok": False, "msg": str(e), "settings": {}, "runtime": {}}
+
+    def set_decision_settings(self, patch: dict) -> Dict[str, Any]:
+        """校验并保存决策模型设置；非法值拒绝写盘并返回中文原因，成功返回新快照。"""
+        from core import decision_service
+
+        try:
+            settings = decision_service.save_decision_config(patch)
+            return {"ok": True, "msg": "决策设置已保存", "settings": settings}
+        except ValueError as error:
+            current = decision_service.load_decision_config()
+            return {"ok": False, "msg": str(error), "settings": current}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("set_decision_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def probe_decision(self) -> Dict[str, Any]:
+        """逐 Key 各跑一次无害探针，返回分类结果与目标任务模型。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.probe_decision()
+            return {
+                "ok": bool(result.get("ok", True)),
+                "results": result.get("results") or [],
+                "model_id": result.get("model_id") or "",
+                "msg": result.get("msg") or "",
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("probe_decision 失败")
+            return {"ok": False, "results": [], "model_id": "", "msg": str(e)}
+
+    def list_decision_models(self) -> Dict[str, Any]:
+        """从上游拉取 decision 类型模型列表（设置页「从上游拉取」下拉用）。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.list_decision_models()
+            return {
+                "ok": bool(result.get("ok")),
+                "models": result.get("models") or [],
+                "msg": result.get("msg") or "",
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("list_decision_models 失败")
+            return {"ok": False, "models": [], "msg": str(e)}
+
+    def get_decision_audit_tail(self, limit: int = 20) -> Dict[str, Any]:
+        """读取决策审计目录最新文件的尾部若干行；目录/文件缺失时返回空列表。"""
+        from core import decision_service
+
+        try:
+            try:
+                count = max(1, int(limit))
+            except (TypeError, ValueError):
+                count = 20
+            directory = decision_service._audit_dir()
+            if not os.path.isdir(directory):
+                return {"ok": True, "lines": []}
+            names = sorted(
+                name for name in os.listdir(directory) if name.endswith(".jsonl")
+            )
+            if not names:
+                return {"ok": True, "lines": []}
+            lines: list = []
+            with open(os.path.join(directory, names[-1]), "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        lines.append(line)
+            return {"ok": True, "lines": lines[-count:]}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_audit_tail 失败")
+            return {"ok": False, "msg": str(e), "lines": []}
 
     # ------------------------------------------------------------------
     # 免责条款同意（合规链路：首次使用与条款版本升级后必须显式确认，
@@ -5719,7 +6441,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                            internal_kind: str = "",
                            automation_context: Optional[Dict[str, str]] = None,
                            pending_model_id: str = "",
-                           pending_permission_mode: str = "") -> None:
+                           pending_permission_mode: str = "",
+                           secretary_dispatch_context: Optional[Dict[str, str]] = None) -> None:
         """启动一个新回合线程。调用方必须已持有 _turn_start_lock 且确认
         _is_turn_active(target_session) 为 False（检查+启动原子）。
 
@@ -5730,6 +6453,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         internal_kind 非空表示系统内部回合（星轨自动化任务/后台汇总）。
         automation_context 为星轨自动化回合上下文（run_id/task_name/
         permission_mode），见待开发/星轨自动化任务/01-完整设计规格.md 5.4。
+        secretary_dispatch_context 为秘书调度台派活上下文（display_name/
+        notify_session）：派活本身不传 display_text/internal_kind，这个轻量标记
+        只用于回合收尾时给发起会话回一条完成通知。
         """
         with self._bg_summary_lock:
             self._bg_summary_triggered.discard(target_session)
@@ -5756,6 +6482,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             turn_kwargs["internal_kind"] = internal_kind
         if automation_context:
             turn_kwargs["automation_context"] = automation_context
+        if secretary_dispatch_context:
+            # 秘书派活标记：仅用于回合收尾的完成通知（不改消息形态）
+            turn_kwargs["secretary_dispatch_context"] = secretary_dispatch_context
         worker = threading.Thread(
             target=self._run_turn_worker_serialized,
             args=(full_text, target_session),
@@ -5808,6 +6537,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 # 星轨自动化：排队条目可能是自动化触发（忙时入队），补发时把
                 # 自动化上下文透传回 worker；旧用户消息条目无这些键，零影响
                 automation_run_id = str(entry.get("automation_run_id") or "")
+                # 秘书调度台：派活排队条目补发时同样带完成通知标记（无该键的
+                # 普通用户消息条目零影响）
+                secretary_notify_session = str(
+                    entry.get("secretary_dispatch_notify_session") or ""
+                )
                 try:
                     self._spawn_turn_worker(
                         str(entry.get("text") or ""),
@@ -5816,13 +6550,22 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         # 排队消息补发保持原回合来源：LAN 消息不得降级为 local
                         turn_source=str(entry.get("turn_source") or "local"),
                         attachments=[str(p) for p in (entry.get("attachments") or [])],
-                        # 星轨自动化任务指定的工作目录：补发时重判会话是否仍不存在，
-                        # 已被其他回合创建的会话以自身归属为准
+                        # 待建会话工作目录（自动化任务 / 秘书派活共用同一条判定）：
+                        # 补发时重判会话是否仍不存在，已被其他回合创建的会话以
+                        # 自身归属为准
                         pending_workdir=self._automation_pending_workdir(
                             str(entry.get("pending_workdir") or ""), session_name
                         ),
                         # 任务指定模型随排队条目透传，补发回合同样生效
-                        pending_model_id=str(entry.get("automation_model_id") or ""),
+                        pending_model_id=str(
+                            entry.get("automation_model_id")
+                            or entry.get("secretary_model_id")
+                            or ""
+                        ),
+                        # 秘书派活的懒创建新会话档位：仅新会话需要，已有会话为空
+                        pending_permission_mode=str(
+                            entry.get("secretary_permission_mode") or ""
+                        ),
                         internal_kind="automation" if automation_run_id else "",
                         automation_context={
                             "run_id": automation_run_id,
@@ -5830,6 +6573,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                             "permission_mode": str(entry.get("automation_permission_mode") or ""),
                             "notify_on_success": str(entry.get("automation_notify_success") or ""),
                         } if automation_run_id else None,
+                        # 秘书派活完成通知标记：补发回合跑完仍要回通知给发起会话
+                        secretary_dispatch_context={
+                            "display_name": str(
+                                entry.get("secretary_dispatch_display_name") or ""
+                            ),
+                            "notify_session": secretary_notify_session,
+                        } if secretary_notify_session else None,
                     )
                 except Exception:
                     logger.exception("补发排队消息失败")
@@ -6010,6 +6760,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             run_now=self.run_automation_task_now,
             get_runs=self.get_automation_runs,
         ))
+
+    def _register_secretary_dispatch_service(self) -> None:
+        """把桥侧调度能力注册为 core 层服务句柄（秘书工具的唯一入口）。
+
+        实现全部指向本桥既有通道：检索复用 MemoryManager，派活复用
+        ``_spawn_turn_worker`` / ``_message_queues``，跳转复用
+        ``_set_current_session`` 与归档入口；core 层工具经
+        ``core.secretary_dispatch.get()`` 取到句柄后调用同名方法，不在 core 层
+        重复实现一遍参数校验与事件推送。
+        """
+        from core import secretary_dispatch
+
+        secretary_dispatch.register(_SecretaryDispatchService(self))
 
     def get_automation_tasks(self) -> Dict[str, Any]:
         try:
@@ -6231,7 +6994,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         保留函数名避免改动所有调用点，实现直接转发到 _run_turn_worker。"""
         return self._run_turn_worker(user_text, session_name, *args, **kwargs)
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None, automation_context: Optional[Dict[str, str]] = None, pending_model_id: str = "", pending_permission_mode: str = ""):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None, automation_context: Optional[Dict[str, str]] = None, pending_model_id: str = "", pending_permission_mode: str = "", secretary_dispatch_context: Optional[Dict[str, str]] = None):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
         internal_kind 非空表示这是系统自动发起的内部回合（后台任务汇总 /
@@ -6243,6 +7006,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         automation_context 非空表示星轨自动化回合：运行终态回写 automation_runs
         表（completed/cancelled/error），无人值守权限档位按任务配置覆盖
         （规格 5.4/5.5）。
+        secretary_dispatch_context 非空表示这是秘书调度台派出的回合（内容本身
+        仍是普通用户消息）：收尾时给发起会话回一条轻量 notice。
         """
         api_key = ""
         turn_finished = False
@@ -6771,6 +7536,35 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     logger.debug("自动化终态通知推送失败", exc_info=True)
                 if turn_id:
                     self._automation_turn_labels.pop(turn_id, None)
+            # 秘书调度台派活：回合收尾给发起会话回一条完成通知。用户在秘书会话里
+            # 看不到目标会话的流式输出，这是唯一附加提示；目标会话内的消息形态
+            # 与用户亲手发消息完全一致（不写 display_text / internal_kind）。
+            # session_name 取发起会话（notify_session）：notice 按归属会话路由，
+            # 缺省会串到用户当前查看的会话。
+            if secretary_dispatch_context:
+                try:
+                    notify_session = str(
+                        secretary_dispatch_context.get("notify_session") or ""
+                    ) or session_name
+                    dispatch_label = str(
+                        secretary_dispatch_context.get("display_name") or ""
+                    ) or session_name
+                    terminal_error = str(error_state.get("terminal_message") or "")
+                    if cancelled:
+                        notice_message = f"任务在「{dispatch_label}」会话已取消。"
+                    elif terminal_error:
+                        notice_message = (
+                            f"任务在「{dispatch_label}」会话执行失败："
+                            f"{terminal_error[:120]}"
+                        )
+                    else:
+                        notice_message = f"任务已在「{dispatch_label}」会话执行完成"
+                    self.emit_event("notice", {
+                        "message": notice_message,
+                        "session_name": notify_session,
+                    })
+                except Exception:
+                    logger.debug("秘书派活完成通知推送失败", exc_info=True)
             # 回合运行期间若有后台子代理进入终态（当时不能并发起新回合），
             # 此时按会话取出自己的 pending 补触发自动汇总检查（set 分桶，
             # 多会话并行互不覆盖）

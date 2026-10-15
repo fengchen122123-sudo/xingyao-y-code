@@ -109,6 +109,15 @@
             </div>
           </div>
 
+          <!-- Git 分支入口（原输入栏 chip 迁移至此）：非 Git 工作区不显示；点击打开右侧 Git 管理面板 -->
+          <button
+            v-if="gitBranchLabel"
+            data-test="chat-header-git-branch"
+            class="chip-btn git-branch-btn"
+            title="Git 工作台：点击打开 Git 管理面板"
+            @click.stop="openGitPanel"
+          ><AppIcon name="git-branch" :size="12" :stroke-width="2" /><span class="git-branch-label">{{ gitBranchLabel }}</span></button>
+
           <!-- IDE 模式：新会话 / 历史 / 收起。这三个入口在对话模式下由侧栏与面板承担，
                IDE 模式侧栏已退场，必须跟到对话头部来——尤其「收起」必须配对一条恢复
                路径，否则收起后就再也打不开对话区（活动栏「星瑶」动作是那条路径） -->
@@ -540,6 +549,11 @@ const gitBranchText = computed(() => {
   if (gitStore.error) return '';
   const base = gitStore.statusbarText;
   return base || '';
+});
+// 会话标题栏 Git chip 文案：去掉底栏文本的 ⎇ 前缀（迁移自输入栏 InputArea 的原实现）
+const gitBranchLabel = computed(() => {
+  const text = gitStore.statusbarText;
+  return text ? text.slice(2) : '';
 });
 function openGitPanel() {
   // 非 Git 项目点击不展开（面板内已有"非仓库"提示态），避免空操作困惑
@@ -1502,6 +1516,18 @@ onUnmounted(() => {
 #chat-header .chip-btn.icon-only {
   padding: 4px 7px;
   flex-shrink: 0;
+}
+/* 对话头部 Git 分支 chip：图标 + 分支名，空间不足时省略号收缩（min-width:0
+   才能突破 flex 最小内容宽度，否则按钮被挤成竖条、不省略） */
+#chat-header .git-branch-btn {
+  max-width: 200px;
+  min-width: 0;
+}
+#chat-header .git-branch-btn .git-branch-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .top-spacer {
   flex: 1;

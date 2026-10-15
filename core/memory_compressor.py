@@ -802,9 +802,11 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 elif role == "tool":
                     role_display = "工具结果"
                 else:
+                    # 摘要里的自称跟随当前会话（秘书会话 → 秘书名）
                     try:
-                        from core.persona_settings import get_agent_display_name
-                        role_display = get_agent_display_name()
+                        from core.secretary import get_active_agent_name
+
+                        role_display = get_active_agent_name()
                     except Exception:
                         role_display = "星瑶"
                 # 过滤内容里的思考标签以缩减 Token 负担
