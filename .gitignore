@@ -88,7 +88,7 @@ test20*/
 # Runtime diagnostic output (playwright screenshots, contact sheets, etc.)
 output/
 
-# pytest ��ʱ����Ŀ¼
+# pytest 临时工作目录
 tmp/
 
 # 临时产物：图片生成脚本（内含密钥，严禁入库）与本地测试生成的图片/图表
@@ -146,6 +146,7 @@ design_mockups/
 
 # 公众号内容工作区（本地草稿与配图，不入库）
 /公众号/
+gzh-tokenrhythm/
 
 # 一次性临时生图脚本（本地使用，不入库）
 _day3_imggen.py

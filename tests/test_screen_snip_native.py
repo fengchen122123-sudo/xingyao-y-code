@@ -146,3 +146,94 @@ def test_pen_clear_strokes():
 
     assert overlay._strokes == []
     assert overlay._current_stroke is None
+
+
+# --------------------------------------------------- 工具条尺寸（无头：假 .NET）
+
+class _FakeControls:
+    """假控件集合：只支持 Add，便于断言子控件数量与顺序。"""
+
+    def __init__(self):
+        self.items = []
+
+    def Add(self, control):
+        self.items.append(control)
+
+
+class _FakeEvent:
+    """假事件：支持 ``control.Click += handler``。"""
+
+    def __iadd__(self, handler):
+        return self
+
+
+class _FakeControl:
+    """假 WinForms 控件：只记录布局相关属性的赋值，不依赖真实窗体和句柄。"""
+
+    def __init__(self):
+        self.Controls = _FakeControls()
+        self.Click = _FakeEvent()
+        self.Text = ""
+        self.AutoSize = False
+        self.AutoSizeMode = None
+        self.FlowDirection = None
+        self.BackColor = None
+        self.ForeColor = None
+        self.FlatStyle = None
+        self.Cursor = None
+        self.Padding = None
+        self.Size = None
+
+
+class _FakeColor:
+    """假 Drawing.Color：既要支持 FromArgb 调用，也要提供 White 等颜色常量。"""
+
+    White = "White"
+
+    @staticmethod
+    def FromArgb(*args):
+        return ("argb",) + args
+
+
+def _install_fake_winforms(monkeypatch):
+    """把 _load() 换成假 .NET 程序集，让 _build_toolbar 可在无头环境执行。"""
+    from types import SimpleNamespace
+
+    fake_system = SimpleNamespace(EventHandler=lambda handler: handler)
+    fake_f = SimpleNamespace(
+        FlowLayoutPanel=_FakeControl,
+        Button=_FakeControl,
+        FlowDirection=SimpleNamespace(LeftToRight="LeftToRight"),
+        AutoSizeMode=SimpleNamespace(GrowAndShrink="GrowAndShrink"),
+        FlatStyle=SimpleNamespace(Flat="Flat"),
+        Cursors=SimpleNamespace(Hand="Hand"),
+        EventHandler=lambda handler: handler,
+        Padding=lambda value: ("Padding", value),
+    )
+    fake_d = SimpleNamespace(
+        Color=_FakeColor,
+        Size=lambda w, h: (w, h),
+    )
+    monkeypatch.setattr(
+        screen_snip_native, "_load", lambda: (fake_system, fake_f, fake_d)
+    )
+    return fake_f
+
+
+def test_toolbar_shrinks_to_content(monkeypatch):
+    """工具条面板必须随内容收缩（AutoSizeMode=GrowAndShrink）。
+
+    回归背景（2026-10-14 实测 2560x1440 桌面）：FlowLayoutPanel 默认高度 100
+    大于内容高度 49，GrowOnly（AutoSize 的默认模式）只增不减，面板底部会留
+    一条约 51px 的空白黑边，看着像"黑框偏大"。
+    """
+    fake_f = _install_fake_winforms(monkeypatch)
+    overlay = _make_overlay()
+
+    overlay._build_toolbar(_FakeControl())
+
+    panel = overlay._toolbar
+    assert panel.AutoSize is True
+    assert panel.AutoSizeMode == fake_f.AutoSizeMode.GrowAndShrink
+    # 画笔 + 6 个色块 + 清除 + 4 个动作按钮
+    assert len(panel.Controls.items) == 12
