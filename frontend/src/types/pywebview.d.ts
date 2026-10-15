@@ -153,6 +153,56 @@ export interface FeishuSettingsSnapshot {
   };
 }
 
+// JEV 决策模型服务（Task 3 设置页）：字段与 core.decision_service.DEFAULT_CONFIG 对齐。
+// 默认全关（enabled=false 时项目行为零变化）；损坏配置由后端回落默认值。
+export interface DecisionSettingsSnapshot {
+  version: number;
+  enabled: boolean;
+  /** "auto"=自动匹配基元律动通道；或指定 provider id/name */
+  provider_ref: string;
+  /** 空串 = 用 provider 的 base_url；非空为手动覆盖 */
+  base_url: string;
+  model_id: string;
+  endpoint_style: 'decision' | 'systemone';
+  /** "auto"=跨权限轮换并记忆可用 Key；"index:N"=固定第 N 把（N 为 0 基） */
+  key_mode: string;
+  shadow_mode: boolean;
+  timeout_ms: number;
+  scenes: Record<string, { enabled: boolean; shadow: boolean; threshold: number }>;
+  audit_enabled: boolean;
+}
+
+// probe_decision() 单条逐 Key 结果；status 分类见 core.decision_service.probe_decision
+export interface DecisionProbeKeyResult {
+  /** 第几把 Key（0 基；UI 展示时 +1） */
+  key_index: number;
+  status: 'available' | 'no_permission' | 'invalid_key' | 'timeout' | 'network_error' | 'rate_limited' | 'error';
+  latency_ms: number;
+  error: string;
+}
+
+// get_decision_settings() 的运行时状态（Key 序号与最近一次探针结果；不落盘）
+export interface DecisionRuntimeState {
+  key_count: number;
+  active_key_index: number | null;
+  denied_key_indexes: number[];
+  cooldown_key_indexes: number[];
+  last_probe: {
+    ok: boolean;
+    results: DecisionProbeKeyResult[];
+    model_id: string;
+    msg: string;
+  } | null;
+}
+
+// list_decision_models() 条目：上游 type=="decision" 的模型
+export interface DecisionModelOption {
+  id: string;
+  name: string;
+  context: number;
+  price_text: string;
+}
+
 export interface SystemSettingsSnapshot {
   command_shell: string;
   command_shell_options: CommandShellOption[];
@@ -438,6 +488,9 @@ export interface SessionInfo {
   count: number;
   workdir: string;
   is_global?: boolean;
+  // 秘书会话专属：该会话的秘书名（= 显示名，未命名的历史会话回落「秘书」）。
+  // 普通会话没有这个字段；前端据此 + 分组 is_secretary 判定改名走哪条路
+  secretary_name?: string;
   updated_at?: string;
 }
 
@@ -453,6 +506,10 @@ export interface SessionGroup {
   folder_name: string;
   is_current?: boolean;
   is_global?: boolean;
+  // 秘书归属分组：folder_path='SECRETARY' 只是分组标识，**不是磁盘目录**，
+  // 因此不能拿它拼路径 / 打开资源管理器 / 删除分组；组内会话与「对话」同口径
+  // （workdir='GLOBAL'、is_global=true）。后端固定把它排在 GLOBAL 之前。
+  is_secretary?: boolean;
   sessions: SessionInfo[];
 }
 
@@ -844,13 +901,35 @@ export interface SubagentProgressEventData {
 }
 
 export interface BridgeEvent {
-  type: string;
+  // 已知事件名的联合（供类型提示与检索用，不是闭集：末尾的 (string & {})
+  // 兜底允许后端先推送、前端后适配的新事件；桥梁事件唯一赋值点在 appStore）
+  type: BridgeEventType;
   // 既有事件信封为 {"type","data"}；电脑操控事件（Task 13a）为平铺信封，
   // data 缺省、run_id/event_seq 直接在顶层，识别规则见 appStore
   data?: any;
   run_id?: string;
   event_seq?: number;
 }
+
+/** 秘书调度台 open_session 事件的载荷（后端 gui_bridge 秘书调度服务推送） */
+export interface OpenSessionBridgeData {
+  /** 目标会话名（后端已用它切换当前会话；缺失时前端忽略本次跳转） */
+  session_name: string;
+  /** 目标会话生效显示名（秘书会话为秘书名，普通会话为标题/会话名） */
+  display_name?: string;
+  /** 目标会话归属目录，仅供调试/展示，前端切换不由它决定 */
+  workdir?: string;
+}
+
+/**
+ * 桥事件名联合。只登记前端 `handleBridgeEvent` 里确有处理分支的事件，
+ * `(string & {})` 兜底保证既有 `BridgeEvent.type` 的宽松口径不收紧
+ * （未知事件仍可传入，不会因类型收窄而编译失败）。
+ */
+export type BridgeEventType =
+  // 秘书调度台：系统层跳转（载荷见 OpenSessionBridgeData）
+  | 'open_session'
+  | (string & {});
 
 // ---------------------------------------------------------------------------
 // 按回合撤销 DTO（规格 19；与后端 core/turn_undo 状态值严格对应）
@@ -1045,6 +1124,18 @@ export interface PyWebViewAPI {
   get_workspace_state(workdir: string): Promise<any>;
   get_sessions(): Promise<SessionGroup[]>;
   create_session(title?: string, workdir?: string): Promise<any>;
+  // 秘书会话：与 create_session 的"首条消息才懒落库"不同，它立即落库并切为当前
+  // 会话（source=SECRETARY、workdir=GLOBAL）。name 是这个秘书的身份标识，必填
+  // 且去首尾空白后 1-20 字符；非法名后端拒绝且不产生会话记录，返回
+  // { ok:false, msg }。成功返回 { ok, session_name, title, display_name,
+  // secretary_name, workdir }（display_name 即秘书名，会话名不参与命名）。
+  create_secretary_session(title: string, name: string): Promise<any>;
+  // 当前会话生效名：秘书会话 → 该会话的秘书名（未命名回落「秘书」），
+  // 普通会话 → 设置页智能体名。前端切会话 / 建会话 / 启动后据此刷新显示名
+  get_active_agent_name(): Promise<{ agent_name: string; is_secretary: boolean; msg?: string }>;
+  // 秘书会话改名：只改 secretary_name，不动 session_name（消息 / 摘要 / 快照键
+  // 都不迁移）；成功回带 { ok, session_name, secretary_name, display_name, sessions }
+  rename_secretary_session(sessionName: string, newName: string): Promise<any>;
   switch_session(sessionName: string, targetWorkdir?: string): Promise<any>;
   load_older_messages(sessionName: string, beforeId: number): Promise<any>;
   get_session_nav_index(sessionName: string): Promise<any>;
@@ -1082,6 +1173,16 @@ export interface PyWebViewAPI {
   }): Promise<{ ok: boolean; settings?: FeishuSettingsSnapshot; msg?: string }>;
   get_feishu_secret(): Promise<{ ok: boolean; app_secret?: string; msg?: string }>;
   test_feishu_connection(appId?: string, appSecret?: string): Promise<{ ok: boolean; msg?: string; endpoint_ready?: boolean }>;
+  // JEV 决策模型（Task 3）：配置快照 + 运行时状态；后端未就绪/异常时 ok=false
+  get_decision_settings(): Promise<{ ok: boolean; settings?: DecisionSettingsSnapshot; runtime?: DecisionRuntimeState; msg?: string }>;
+  // 保存决策配置 patch（深合并 + 校验，非法值拒绝并回中文原因；settings 为保存后快照）
+  set_decision_settings(patch: Partial<DecisionSettingsSnapshot>): Promise<{ ok: boolean; msg?: string; settings?: DecisionSettingsSnapshot }>;
+  // 逐 Key 各跑 1 次无害探针（每把 Key 至多 1 次，不做压测；status 分类见 DecisionProbeKeyResult）
+  probe_decision(): Promise<{ ok: boolean; results: DecisionProbeKeyResult[]; model_id: string; msg?: string }>;
+  // 从上游拉取 type=="decision" 的模型列表（设置页「从上游拉取」下拉）
+  list_decision_models(): Promise<{ ok: boolean; models: DecisionModelOption[]; msg?: string }>;
+  // 决策审计尾部：~/.ycode/decision_audit 最新文件的最后 limit 行
+  get_decision_audit_tail(limit?: number): Promise<{ ok: boolean; lines: string[]; msg?: string }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   // 上下文水位基准：0 表示不设基准（跟随模型真实窗口）
   set_context_watermark_base(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;

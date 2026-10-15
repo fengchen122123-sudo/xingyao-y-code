@@ -141,6 +141,11 @@ export const TERMINAL_PANEL_DEFAULT_HEIGHT = 300;
 export const TERMINAL_PANEL_MIN_HEIGHT = 140;
 export const TERMINAL_PANEL_MAX_HEIGHT = 720;
 
+// 秘书名字长度上限：与后端 core.secretary.validate_secretary_name 的口径一致
+// （去首尾空白后 1-20 个字符）。前端只做「禁用按钮 + 可见提示」，不做截断——
+// 悄悄把用户输入砍短会让身份名字与用户输入不符，后端仍会二次校验。
+export const SECRETARY_NAME_MAX_LEN = 20;
+
 // 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页
 export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent';
 // 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
@@ -833,8 +838,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
     settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'plugins' | 'about' | 'contact' | 'disclaimer',
-    // 智能体显示名：设置页「人设设置」自定义后全局生效（界面文案/执行过程/思考提示）
+    // 智能体显示名：当前会话生效名——普通会话为设置页「人设设置」的名字，
+    // 秘书会话为该会话自己的秘书名（界面文案/执行过程/思考提示都跟随它）
     agentName: '星瑶',
+    // 设置页人设名：秘书会话里 agentName 会被秘书名占住，等切回普通会话 /
+    // 进入尚未落库的草稿会话时要回落，故与 agentName 分开单独留一份
+    personaAgentName: '星瑶',
     // 智能体对用户的称呼；空串表示不使用特定称呼
     userTitle: '',
     // 免责条款同意状态：requiredVersion 为当前生效的条款版本，acceptedVersion
@@ -2298,7 +2307,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 人设设置：智能体显示名与对用户的称呼（启动快照随 init 一起下发）
         const personaInit = (init as any).persona_settings;
         if (personaInit && typeof personaInit === 'object') {
-          this.agentName = String(personaInit.agent_name || '星瑶');
+          this.personaAgentName = String(personaInit.agent_name || '星瑶');
+          this.agentName = this.personaAgentName;
           this.userTitle = String(personaInit.user_title || '');
           this.syncDocumentTitle();
         }
@@ -2381,6 +2391,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.connected = true;
         // 启动后静默检查更新（不打扰用户）
         this.checkUpdate(false);
+        // 启动自动恢复的会话可能是秘书会话：显示名以桥上的「当前生效名」为准
+        // （拉不到时内部回落设置页名字，不打断启动流程）
+        void this.refreshActiveAgentName();
       } catch (err) {
         this.connected = false;
         this.notifyModal('连接失败', '后端连接失败：' + err);
@@ -2644,9 +2657,72 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 人设设置（名称/称呼）保存后即时同步全局显示；快照由 PersonaSettings 页传入
     applyPersonaSettings(snapshot: { agent_name?: string; user_title?: string }) {
       if (!snapshot || typeof snapshot !== 'object') return;
-      if (snapshot.agent_name) this.agentName = String(snapshot.agent_name);
+      if (snapshot.agent_name) {
+        this.personaAgentName = String(snapshot.agent_name);
+        this.agentName = this.personaAgentName;
+      }
       this.userTitle = String(snapshot.user_title || '');
       this.syncDocumentTitle();
+      // 秘书会话显示的是秘书名，不吃设置页名字：这时要多问一次桥把名字换回来
+      // （普通会话 / 草稿会话新名字就是生效名，不必多打一次后端）
+      if (this._isSecretarySession(this.currentSessionName)) void this.refreshActiveAgentName();
+    },
+
+    /** 统一改写生效显示名：agentName 与窗口标题同步，避免两处文案分叉 */
+    _applyAgentName(name: string) {
+      if (!name) return;
+      this.agentName = name;
+      this.syncDocumentTitle();
+    },
+
+    // 刷新「当前会话生效名」：秘书会话是桥上的秘书名，其余会话是设置页名字。
+    // 任何异常 / 旧后端没有该方法 / 返回空都静默回落设置页名字——显示名只是
+    // 展示层，绝不能因为它失败而打断切换会话、建会话这些主流程。
+    async refreshActiveAgentName() {
+      // 草稿会话（尚未落库）：后端当前会话还停在上一个真实会话上，此刻问桥
+      // 会把上一个会话（可能是秘书）的名字搬进来，故直接按普通会话呈现
+      if (!this.currentSessionName) {
+        this._applyAgentName(this.personaAgentName);
+        return;
+      }
+      // 静默取桥：刷新动作可能在启动早期（bridgeReady 之前）被触发，
+      // _api() 缺桥时会弹「连接失败」，为此弹窗不值得
+      const api = (window.pywebview && window.pywebview.api) as PyWebViewAPI | null;
+      if (!api || typeof api.get_active_agent_name !== 'function') {
+        this._applyAgentName(this.personaAgentName);
+        return;
+      }
+      const sessionAtCall = this.currentSessionName;
+      try {
+        const res = await api.get_active_agent_name();
+        // 竞态：在途期间用户可能已切走，过期名字不覆盖当前会话的显示名
+        if (this.currentSessionName !== sessionAtCall) return;
+        const name = res && typeof res === 'object' ? String(res.agent_name || '') : '';
+        this._applyAgentName(name || this.personaAgentName);
+      } catch (err) {
+        console.error('刷新当前会话生效名失败:', err);
+        this._applyAgentName(this.personaAgentName);
+      }
+    },
+
+    /** 在当前分组树里定位会话条目；返回 { session, group }，找不到返回 null */
+    _findSessionEntry(sessionName: string): { session: any; group: any } | null {
+      if (!sessionName) return null;
+      for (const g of this.sessionGroups || []) {
+        const hit = (g.sessions || []).find((s: any) => s && s.name === sessionName);
+        if (hit) return { session: hit, group: g };
+      }
+      return null;
+    },
+
+    // 会话是否属于「秘书」：条目自带的 secretary_name（后端对秘书会话都会带，
+    // 未命名回落「秘书」）与分组标记 is_secretary 任一命中即为真——历史遗留的
+    // 未命名会话靠分组标记兜底，避免被当成普通会话改了 session_name
+    _isSecretarySession(sessionName: string): boolean {
+      const hit = this._findSessionEntry(sessionName);
+      if (!hit) return false;
+      if (hit.group && (hit.group as any).is_secretary) return true;
+      return typeof hit.session.secretary_name === 'string';
     },
 
     // 页面标题跟随智能体显示名（webview/浏览器预览均可见；默认名时保持 星瑶Code 简洁形态）
@@ -3083,8 +3159,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.sessionSwitching = !runtime.running && runtime.messages.length === 0;
 
       const api = this._api();
-      // 后端不可用时不能残留加载态
-      if (!api) { this.sessionSwitching = false; return; }
+      // 后端不可用时不能残留加载态；显示名只用本地分组树兜底（秘书会话取条目里
+      // 的秘书名），同样不能停在上一个会话的名字上
+      if (!api) {
+        this.sessionSwitching = false;
+        const hit = this._findSessionEntry(sessionName);
+        const localName = hit && hit.session.secretary_name
+          ? String(hit.session.secretary_name)
+          : this.personaAgentName;
+        this._applyAgentName(localName);
+        return;
+      }
       // 模型版本快照：响应在途期间用户若又切了模型（setModel 递增版本），
       // 后端响应携带的是切换前的旧模型快照，不再覆盖本地选择
       const modelVersion = this._sessionModelVersion[sessionName] || 0;
@@ -3186,6 +3271,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 切换成功后再恢复该会话的 IDE 模式（后端权威副本）。放在响应处理末端：
         // 过期响应（用户已切走）在函数开头就 return 了，不会走到这里
         void this.restoreIdeMode(sessionName);
+        // 生效显示名随会话走：秘书会话显示秘书名，普通会话回到设置页名字
+        // （不 await：显示名刷新失败不能拖住会话切换，内部自带回落）
+        void this.refreshActiveAgentName();
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
@@ -3385,6 +3473,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.workdir = '';
       this.fileTree = [];
       this.fileTreeExpanded = [];
+      // 新对话是普通会话：生效名回到设置页名字（草稿态尚未落库，问桥会拿回
+      // 上一个会话的名字，故 refreshActiveAgentName 内部对草稿直接走回落）
+      void this.refreshActiveAgentName();
     },
 
     // 顶栏“新会话”按钮：跟随当前上下文——在项目中就在该项目新建，
@@ -3434,6 +3525,78 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.fileTree = [];
         this.fileTreeExpanded = [];
         this.loadFileTreeInBackground('', targetWorkdir);
+      }
+      // 同 createGlobalSession：新会话（草稿态）的生效名回到设置页名字
+      void this.refreshActiveAgentName();
+    },
+
+    // 秘书会话：后端建会话时立即落库并切为当前会话（不存在草稿态），所以这里
+    // 不能复用 createGlobalSession 的懒创建分支，要按 switchSession 的口径把
+    // 会话级状态整体复位到返回的 session_name 上（旧会话状态先由
+    // _captureCurrentRuntime 存回它自己的 runtime）。
+    // 名字必填：它是这个秘书的身份标识（显示名 + 提示词自称），没有名字就只能
+    // 落一个既无名又已切走的会话。前端先做可见校验、非法值不发请求且不截断
+    // （后端 validate_secretary_name 会二次校验并回 ok:false）。
+    async createSecretarySession(name: string) {
+      const normalized = (name || '').trim();
+      // 用码点计数与后端 len() 对齐：emoji 这类代理对不会被算成两个字符
+      const nameLength = [...normalized].length;
+      if (!normalized) {
+        this.notifyModal('新建秘书会话', '请先给这位秘书起个名字（1-20 个字符）');
+        return;
+      }
+      if (nameLength > SECRETARY_NAME_MAX_LEN) {
+        this.notifyModal(
+          '新建秘书会话',
+          `秘书名字最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${nameLength} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return; // _api() 缺桥时已弹「连接失败」，这里不再二次打扰
+      try {
+        // 标题固定「新会话」：侧栏与欢迎页显示的都是秘书名（后端 display_name），
+        // 会话名（session_xxx）不参与命名，这里不需要用户可见的会话标题
+        const res = await api.create_secretary_session('新会话', normalized);
+        if (!res || !res.ok) {
+          // 建会话是用户显式动作：失败必须可见，不做静默降级
+          this.notifyModal('新建秘书会话', (res && res.msg) || '创建失败');
+          return;
+        }
+        // 新会话意味着回到聊天视图：子页面打开时也要收起，否则状态已切换但
+        // 界面停在子页（表现为"点了没反应"），与 createGlobalSession 同口径
+        this.subpage.show = false;
+        this._captureCurrentRuntime();
+        // 已落库的真实会话：清掉草稿工作区标记，避免首条消息再走"草稿落库"分支
+        this.pendingWorkdir = null;
+        // 权限确认框属于上一个会话，新会话不该继承它（switchSession 按会话名判定同口径）
+        this.permRequest.show = false;
+        this.currentSessionName = res.session_name;
+        // 显示名优先用秘书名：侧栏条目、欢迎页、对话头部都读它
+        this.currentSessionDisplayName = String(res.secretary_name || res.display_name || normalized);
+        this._bindSessionRuntime(res.session_name);
+        this.messages = [];
+        this.currentStreamingText = '';
+        this.currentThinkingText = '';
+        this.subagentTasks = [];
+        this.planData = { title: '', items: [], progress: 0 };
+        this.tokenUsage = emptyTokenUsage();
+        this.running = false;
+        // 新会话不是"历史加载中"：显式清除切换加载态
+        this.sessionSwitching = false;
+        this._captureRuntime(res.session_name);
+        // 秘书会话固定 workdir=GLOBAL：按「对话」工作区呈现，不加载文件树
+        this.workdir = '';
+        this.currentWorkdirLabel = '对话';
+        this.fileTree = [];
+        this.fileTreeExpanded = [];
+        // 后端已落库：用最新分组树重建列表，新会话立刻出现在秘书分组里
+        await this.refreshSessions();
+        // 生效名以后端为准（会话已切过去、秘书名已落库），与侧栏显示同一来源
+        await this.refreshActiveAgentName();
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('新建秘书会话', '创建失败: ' + err);
       }
     },
 
@@ -3519,8 +3682,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 但事件在重连窗口期可能丢失（emit 失败后端也不改判成功），故此处按 res.name 兜底迁移。
     async renameSession(oldName: string, newName: string) {
       const target = (newName || '').trim();
-      // 空白名或与原会话名相同视为无改动，不发请求
-      if (!target || target === oldName) return;
+      // 空白名视为无改动，不发请求
+      if (!target) return;
+      // 秘书会话改的是「秘书名」（secretary_name），不是会话名：先分流。
+      // 秘书名与 session_xxx 永不相等，混在下面「与旧名相同」的判断里虽然不会
+      // 误伤，但两者语义完全不同，分开更不容易埋坑
+      if (this._isSecretarySession(oldName)) return this.renameSecretarySession(oldName, target);
+      // 与原会话名相同视为无改动，不发请求
+      if (target === oldName) return;
       const api = this._api();
       if (!api) return;
       try {
@@ -3535,6 +3704,45 @@ navItems: [] as Array<{ id: number; preview: string }>,
           // IDE 模式桶随会话名迁移（用后端最终名 res.name：撞名时后端会加后缀，
           // 按用户输入的 target 迁会迁到一个不存在的会话名下）
           if (res.name) this._moveIdeModeBucket(oldName, res.name);
+        } else {
+          this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
+    // 秘书会话改名（右键「重命名」入口，目标为秘书会话时由 renameSession 分流到此）。
+    // 只改后端的 secretary_name：session_name 仍是建会话时生成的 session_xxx，
+    // 所以消息 / 摘要 / 快照 / 侧栏高亮的键都不需要迁移，与普通会话重命名口径不同。
+    async renameSecretarySession(sessionName: string, newName: string) {
+      const target = (newName || '').trim();
+      if (!target) {
+        this.notifyModal('会话管理', '秘书名字不能为空（1-20 个字符）');
+        return;
+      }
+      if ([...target].length > SECRETARY_NAME_MAX_LEN) {
+        this.notifyModal(
+          '会话管理',
+          `秘书名字最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${[...target].length} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.rename_secretary_session(sessionName, target);
+        if (res && res.ok) {
+          // 后端回带最新分组树（条目里的秘书名已更新），直接覆盖同步
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else void this.refreshSessions();
+          // 改的是当前会话时还要刷新生效名：侧栏条目已变，欢迎页 / 对话头部
+          // 读的是 store.agentName，漏掉会出现"侧栏已改名、页面还叫旧名"
+          if (this.currentSessionName === sessionName) {
+            this.currentSessionDisplayName = String(res.secretary_name || res.display_name || target);
+            await this.refreshActiveAgentName();
+          }
         } else {
           this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
@@ -4130,6 +4338,35 @@ navItems: [] as Array<{ id: number; preview: string }>,
       s.visible = !!src.visible;
     },
 
+    /**
+     * 秘书调度台 open_session 桥事件处理：把界面带到后端已切好的目标会话。
+     *
+     * 视图切换复用用户点会话的那条路径（switchSession：丢弃 pending 草稿、
+     * 清流式态、按会话拉历史、恢复模型/权限/排队消息、刷新生效名），
+     * 这里只做「取载荷 + 兜底」两件事，不复制切换逻辑。
+     * 会话名缺失（后端解析异常 / 事件字段缺失）时静默记一条日志：跳转失败
+     * 不该弹窗、更不该让桥事件管线抛错。切换失败同理，只留日志。
+     */
+    async _handleOpenSessionEvent(event: BridgeEvent) {
+      // 载荷口径：后端信封是 {type, data}；个别来源可能用 {type, payload} 平铺
+      const raw = ((event as any).data ?? (event as any).payload ?? {}) as Record<string, unknown>;
+      const sessionName = String(raw.session_name || '').trim();
+      if (!sessionName) {
+        console.warn('[open_session] 桥事件缺少 session_name，已忽略本次跳转');
+        return;
+      }
+      const displayName = String(raw.display_name || '').trim();
+      try {
+        // 不传 workdir：目标是后端已存在的会话，其归属目录由后端权威副本决定
+        // （display_name 只在后端给了生效名时才覆盖本地兜底名）
+        await this.switchSession(sessionName, displayName || undefined);
+      } catch (err) {
+        // switchSession 内部已弹「切换会话失败」提示，这里只补一条静默日志，
+        // 绝不让异常冒泡回桥事件派发点
+        console.warn(`[open_session] 跳转到会话 ${sessionName} 失败:`, err);
+      }
+    },
+
     handleBridgeEvent(event: BridgeEvent) {
       const type = event.type;
       const data = event.data || {};
@@ -4200,6 +4437,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
         return;
       }
+      // 秘书调度台跳转（系统层带用户去看某个会话）：后端 open_session 工具切换
+      // 当前会话后推本事件。视图切换一律复用 switchSession（清流式态、按会话拉
+      // 历史、刷新生效名），这里不另写一套；独立支路，不参与会话 runtime 归属，
+      // 处理完直接返回（切换过程是异步的，故 void 掉，内部自带兜底不抛）
+      if (type === 'open_session') {
+        void this._handleOpenSessionEvent(event);
+        return;
+      }
       // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。
       // 只更新对应会话和回合，不串到当前正在查看的其他会话（规格 16/25.5）
       if (type === 'turn_undo_updated') {
@@ -4234,6 +4479,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       const targetRuntimeKey = eventSession || currentRuntimeKey;
       const switchedRuntime = targetRuntimeKey !== currentRuntimeKey;
       if (switchedRuntime) {
+        // 绑走前先快照当前会话：翻页 prepend 的历史、推进的分页游标等顶层
+        // 实时进度只在顶层、尚未入快照；直接绑走会被目标会话快照覆盖丢弃，
+        // finally 回绑时拿到旧快照——后台会话有事件到达时，用户刚翻上去的
+        // 历史被反复弹回、再也加载不出来（2026-10-15 用户反馈）。
+        this._captureRuntime(currentRuntimeKey, { skipLayout: true });
         // 跨会话临时绑定只切换会话数据，不恢复目标会话布局：顶层布局保持
         // 当前查看会话的实时状态，事件处理完在 finally 原样带回（否则目标
         // 会话的布局快照会覆盖用户刚对面板做的开合/页签操作）

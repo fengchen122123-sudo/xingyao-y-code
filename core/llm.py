@@ -264,6 +264,21 @@ def _pipeline_permission_checker(function_name, arguments, **context):
         **context,
     )
 
+
+def _current_agent_display_name() -> str:
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
+
+    与权限终端的 `_agent_display_name` 分工不同：后者是进程级文案（跟着设置页走），
+    而终端回合提示属于“当前会话内的自称”，必须跟随会话；解析失败回落原实现，
+    保证兜底文案与改动前一致。
+    """
+    try:
+        from core.secretary import get_active_agent_name
+
+        return get_active_agent_name()
+    except Exception:
+        return _agent_display_name()
+
 # --- Re-exported from core.llm_diagnostics ---
 from core.llm_diagnostics import (
     _USAGE_FIELD_MISSING,
@@ -296,6 +311,8 @@ from core.llm_diagnostics import (
 
 # The registry is the canonical capability metadata source.
 from core.tool_registry import build_default_registry, filter_reserved_tool_schemas
+# 秘书工具策略的单一事实源（纯读模块，模块级 import 无循环依赖）
+from core import secretary
 tool_registry = build_default_registry()
 
 
@@ -340,6 +357,58 @@ def _snapshot_tool_breakdown(request_tools):
         logger.debug("工具定义字符量统计失败（旁路，已忽略）", exc_info=True)
 
 
+def _registry_scope_map() -> dict[str, str]:
+    """注册表里的 {工具名: side_effect_scope}；读取失败返回空表（不抛错）。
+
+    只读判定依赖作用域，registry 的 api_schemas() 不带该字段，故单独取。
+    """
+    scopes: dict[str, str] = {}
+    try:
+        for spec in tool_registry.all():
+            scopes[str(getattr(spec, "name", "") or "")] = str(
+                getattr(spec, "side_effect_scope", "") or ""
+            )
+    except Exception:
+        logger.debug("读取工具作用域失败（旁路，按未知作用域处理）", exc_info=True)
+    return scopes
+
+
+def _secretary_tools_schema() -> list[dict]:
+    """秘书会话的工具 schema：只留策略放行的内置工具，且不合并任何 MCP（设计第 7 节）。"""
+    from core.secretary import secretary_allows_tool
+
+    scopes = _registry_scope_map()
+    schemas: list[dict] = []
+    for schema in tool_registry.api_schemas():
+        name = str(schema.get("function", {}).get("name", "") or "")
+        try:
+            allowed = bool(name) and secretary_allows_tool(name, scopes.get(name, ""))
+        except Exception:
+            allowed = False
+        if allowed:
+            schemas.append(schema)
+    return schemas
+
+
+def _ordinary_tools_schema(excluded_names) -> list[dict]:
+    """普通会话的工具 schema：注册表全量（剔除秘书专属项）+ MCP（保留名过滤后）。
+
+    设计第 2/7 节硬约束：三个调度工具只对秘书会话可见，普通会话工具集与本次
+    改动前逐元素一致（工具列表逐字节稳定是前缀缓存命中的前提）。
+    """
+    excluded = {str(name) for name in (excluded_names or ())}
+    schemas = list(tool_registry.api_schemas())
+    if excluded:
+        schemas = [
+            schema for schema in schemas
+            if str(schema.get("function", {}).get("name", "") or "") not in excluded
+        ]
+    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
+    # computer_action / computer_select_target 由固定 Harness 适配器提供，
+    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
+    return schemas + filter_reserved_tool_schemas(_get_mcp_manager().get_schemas())
+
+
 def get_tools_schema():
     """每次构建请求时新鲜获取工具 schema（registry 静态 + MCP 动态）。
 
@@ -349,6 +418,10 @@ def get_tools_schema():
     进程内首次调用时同步等待 MCP 连接就绪（有界超时，空配置立即返回）：
     否则 MCP schema 会在第 N 轮突然出现在 tools 列表里，DeepSeek/Kimi
     前缀缓存从头部整体失效。后续调用恢复非阻塞，避免每轮都承担连接延迟。
+
+    秘书会话（core.secretary.is_secretary_session）走另一条路径：只暴露只读
+    与调度类内置工具，并跳过 MCP schema 合并（设计 2026-10-15 第 7 节）；
+    普通会话路径与改动前逐元素一致。
     """
     global _mcp_first_wait_done
     if not _mcp_first_wait_done:
@@ -357,12 +430,18 @@ def get_tools_schema():
             _get_mcp_manager()._ensure_connected()
         except Exception:
             pass
-    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
-    # computer_action / computer_select_target 由固定 Harness 适配器提供，
-    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
-    return tool_registry.api_schemas() + filter_reserved_tool_schemas(
-        _get_mcp_manager().get_schemas()
-    )
+    try:
+        # 秘书身份解析异常按普通会话处理：绝不因策略组件故障改变普通对话的工具集
+        is_secretary = bool(secretary.is_secretary_session())
+    except Exception:
+        logger.debug("秘书会话判定失败（旁路，按普通会话处理）", exc_info=True)
+        is_secretary = False
+    if is_secretary:
+        try:
+            return _secretary_tools_schema()
+        except Exception:
+            logger.debug("秘书工具 schema 过滤失败（旁路，回落普通路径）", exc_info=True)
+    return _ordinary_tools_schema(secretary.SECRETARY_ONLY_TOOLS)
 
 
 def completion(**kwargs):
@@ -3525,7 +3604,7 @@ def _chat_with_model_generator(
         else:
             from prompt_toolkit.formatted_text import HTML
 
-            safe_print(HTML(f"<ansiyellow>{_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
+            safe_print(HTML(f"<ansiyellow>{_current_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
         return
     finally:
         # 注入了 system_prompt_extra 时，messages 是本次请求专用的新列表：循环里

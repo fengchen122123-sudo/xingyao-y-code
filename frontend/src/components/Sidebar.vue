@@ -178,7 +178,6 @@
       <span>
         <button class="add-btn" title="搜索会话 (Ctrl+F)" style="margin-right:4px" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="13" /></button>
         <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="13" /></button>
-        <button class="add-btn" title="新建自由通用对话(跳出文件夹)" @click="store.createGlobalSession()">＋</button>
       </span>
     </div>
 
@@ -207,8 +206,10 @@
             @dragend="onGroupDragEnd()"
           >
             <span class="g-arrow">{{ collapsedGroups[group.folder_path] ? '▸' : '▾' }}</span>
+            <!-- 秘书分组是虚拟分组（folder_path='SECRETARY' 不是磁盘目录）：不能打开
+                 目录，也不能整组删除，否则会把分组标识当路径发给后端 -->
             <span
-              v-if="!group.is_global && group.folder_path !== 'GLOBAL'"
+              v-if="!group.is_global && group.folder_path !== 'GLOBAL' && !group.is_secretary"
               class="g-folder-ico"
               title="在资源管理器中打开此目录"
               @click.stop="openFolder(group.folder_path)"
@@ -218,15 +219,29 @@
               <span v-if="group.is_current" style="font-size:10px;color:var(--green)"> [当前]</span>
             </span>
             <span class="g-count">{{ group.sessions ? group.sessions.length : 0 }} 个会话</span>
-            
-            <button 
-              v-if="!group.is_global && group.folder_path !== 'GLOBAL'" 
-              class="g-add" 
-              title="在项目新建会话" 
-              @click.stop="store.createSessionInGroup(group.folder_path)"
+
+            <!-- 「对话」（自由通用对话）分组的 ＋：原先挂在「项目会话」标题栏，
+                 现移到行内，与「秘书」分组的入口位置保持一致 -->
+            <button
+              v-if="isGlobalGroup(group)"
+              class="g-add"
+              title="新建自由通用对话(跳出文件夹)"
+              @click.stop="store.createGlobalSession()"
             >＋</button>
+
+            <!-- 秘书分组保留 ＋（新建归秘书的会话），但不能把 'SECRETARY' 当
+                 workdir 传给 createSessionInGroup，所以点击走专门的桥方法。
+                 秘书必须先起名（名字是它的身份标识），故先弹起名弹窗，
+                 提交后才由 store.createSecretarySession(name) 真正建会话 -->
             <button
               v-if="!group.is_global && group.folder_path !== 'GLOBAL'"
+              class="g-add"
+              :data-test="group.is_secretary ? 'secretary-add' : 'group-add'"
+              :title="group.is_secretary ? '新建秘书会话' : '在项目新建会话'"
+              @click.stop="group.is_secretary ? openSecretaryNameModal() : store.createSessionInGroup(group.folder_path)"
+            >＋</button>
+            <button
+              v-if="!group.is_global && group.folder_path !== 'GLOBAL' && !group.is_secretary"
               class="g-del"
               title="删除此项目分组及组内对话（会二次确认）"
               @click.stop="askDeleteGroup(group)"
@@ -437,6 +452,48 @@
       </div>
     </div>
   </div>
+
+  <!-- 给秘书起名的弹窗：名字是这个秘书会话的身份来源（侧栏 / 欢迎页 / 提示词
+       自称都用它），所以先起名再建会话。Enter 提交、Esc 取消、点遮罩关闭；
+       名字去首尾空白后为空或超 20 字符时创建按钮禁用（与后端校验同口径） -->
+  <div
+    v-if="secretaryNameModal.show"
+    class="modal-mask"
+    data-test="secretary-name-modal"
+    @click.self="closeSecretaryNameModal()"
+  >
+    <div class="modal">
+      <div class="modal-head">
+        <div class="mh-ico"><AppIcon name="pencil" :size="16" /></div>
+        <div>
+          <h3>给秘书起个名字</h3>
+          <p>名字只属于这个会话：界面显示与它的自称都用它，与设置页人设无关</p>
+        </div>
+      </div>
+      <div class="modal-body">
+        <input
+          ref="secretaryNameInput"
+          v-model="secretaryNameDraft"
+          class="s-name-input"
+          data-test="secretary-name-input"
+          placeholder="秘书名字（1-20 个字符）"
+          @keydown.enter="onSecretaryNameEnter($event)"
+          @keydown.esc="onSecretaryNameEsc($event)"
+        >
+        <!-- 校验失败原因就地说明：按钮禁用时用户能看到为什么不能创建 -->
+        <div class="s-name-hint" data-test="secretary-name-hint">{{ secretaryNameHint }}</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" data-test="secretary-name-cancel" @click="closeSecretaryNameModal()">取消</button>
+        <button
+          class="btn primary"
+          data-test="secretary-name-create"
+          :disabled="!secretaryNameValid"
+          @click="submitSecretaryName()"
+        >创建</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -529,11 +586,14 @@ function isGlobalGroup(g: SessionGroup | null | undefined): boolean {
 
 const groupOrder = ref<string[]>(loadGroupOrder());
 
-/** 展示顺序：GLOBAL 恒定在前，项目分组按自定义顺序，未记录的排在最后 */
+/** 展示顺序：秘书分组与「对话」恒定在前，项目分组按自定义顺序，未记录的排在最后 */
 const orderedGroups = computed<SessionGroup[]>(() => {
   const groups = store.sessionGroups || [];
+  // 秘书分组由后端固定排在首个，产品要求它显示在「对话」之上，故与 GLOBAL 一样
+  // 从项目排序里摘出来单独置顶：它是虚拟分组，混进自定义顺序会与后端顺序打架
+  const secretaries = groups.filter((g) => !!g.is_secretary);
   const globals = groups.filter((g) => isGlobalGroup(g));
-  const projects = groups.filter((g) => !isGlobalGroup(g));
+  const projects = groups.filter((g) => !isGlobalGroup(g) && !g.is_secretary);
   const rank = new Map<string, number>();
   groupOrder.value.forEach((p, i) => {
     if (!rank.has(p)) rank.set(p, i);
@@ -547,12 +607,14 @@ const orderedGroups = computed<SessionGroup[]>(() => {
     if (rb === undefined) return -1;
     return ra - rb;
   });
-  return [...globals, ...ranked];
+  return [...secretaries, ...globals, ...ranked];
 });
 
-/** 当前展示顺序下的项目路径列表（作为写回持久化的基准） */
+/** 当前展示顺序下的项目路径列表（作为写回持久化的基准；秘书分组不可排序，故排除） */
 function currentProjectOrder(): string[] {
-  return orderedGroups.value.filter((g) => !isGlobalGroup(g)).map((g) => g.folder_path);
+  return orderedGroups.value
+    .filter((g) => !isGlobalGroup(g) && !g.is_secretary)
+    .map((g) => g.folder_path);
 }
 
 function commitGroupOrder(paths: string[]) {
@@ -945,6 +1007,29 @@ const editingValue = ref('');
 let editingOriginal = '';
 const renameInputEl = ref<HTMLInputElement | null>(null);
 
+// 秘书起名弹窗：点秘书分组的 ＋ 打开（不再直接建会话），提交后才建。
+// 名字池随机预填一个推荐名，用户可直接改或清空重填
+const SECRETARY_NAME_POOL = ['星河', '小满', '望舒', '清和', '云疏', '拾光'];
+// 与后端 core.secretary.validate_secretary_name 同口径：去首尾空白后 1-20 字符
+const SECRETARY_NAME_MAX_LEN = 20;
+const secretaryNameModal = reactive({ show: false });
+const secretaryNameDraft = ref('');
+const secretaryNameInput = ref<HTMLInputElement | null>(null);
+// 规范化名字：去首尾空白后按码点计数与后端 len() 对齐（emoji 不算两个字符）
+const secretaryNameNormalized = computed(() => secretaryNameDraft.value.trim());
+const secretaryNameValid = computed(() => {
+  const name = secretaryNameNormalized.value;
+  return name.length > 0 && [...name].length <= SECRETARY_NAME_MAX_LEN;
+});
+const secretaryNameHint = computed(() => {
+  const name = secretaryNameNormalized.value;
+  if (!name) return '请输入名字：它会成为这位秘书的称呼';
+  if ([...name].length > SECRETARY_NAME_MAX_LEN) {
+    return `最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${[...name].length} 个`;
+  }
+  return '';
+});
+
 // QQ2009 皮肤：用户卡昵称可就地编辑（localStorage 持久化，默认「木偶」）
 const QQ09_NAME_KEY = 'qq09.sidebarUserName';
 const qq09UserName = ref(localStorage.getItem(QQ09_NAME_KEY)?.trim() || '木偶');
@@ -1183,6 +1268,48 @@ function startRename() {
   });
 }
 
+// 点秘书分组的 ＋：打开起名弹窗（先把菜单收掉，避免两个浮层叠着）。
+// 预填推荐名并全选：用户想沿用推荐名可直接回车，想换名直接键入即可覆盖
+function openSecretaryNameModal() {
+  closeCtxMenu();
+  closeGroupMenu();
+  secretaryNameDraft.value = SECRETARY_NAME_POOL[Math.floor(Math.random() * SECRETARY_NAME_POOL.length)];
+  secretaryNameModal.show = true;
+  nextTick(() => {
+    secretaryNameInput.value?.focus();
+    secretaryNameInput.value?.select();
+  });
+}
+
+function closeSecretaryNameModal() {
+  secretaryNameModal.show = false;
+  secretaryNameDraft.value = '';
+}
+
+// 提交：先校验（非法值不发请求，也不静默截断），关弹窗后交给 store 建会话。
+// 不 await：建会话失败由 store 弹可见提示，弹窗不必卡在加载态里
+function submitSecretaryName() {
+  if (!secretaryNameValid.value) return;
+  const name = secretaryNameNormalized.value;
+  closeSecretaryNameModal();
+  void store.createSecretarySession(name);
+}
+
+// Enter 提交：沿用重命名输入框的 IME 守卫——组合态下这次 Enter 是确认候选词，
+// 此刻文字还没上屏，提交会把中间态当名字发出去
+function onSecretaryNameEnter(e: KeyboardEvent) {
+  if (isImeComposing(e)) return;
+  e.preventDefault();
+  submitSecretaryName();
+}
+
+// Esc 取消：组合态是取消候选词，不应关弹窗
+function onSecretaryNameEsc(e: KeyboardEvent) {
+  if (isImeComposing(e)) return;
+  e.preventDefault();
+  closeSecretaryNameModal();
+}
+
 // 菜单项「删除」：复用现有二次确认流程（进入 confirming 态，仍需点红色确认按钮）
 function startDeleteFromMenu() {
   const name = ctxMenu.name;
@@ -1324,6 +1451,9 @@ function onDocKeyDown(e: KeyboardEvent) {
     closeSidebarMenus();
     qq09CloseStatusMenu();
     cancelRename();
+    // 起名弹窗也吃 Esc（输入框已聚焦时由它自己的 keydown.esc 先关，
+    // 这里兜住焦点不在输入框上的情况）
+    closeSecretaryNameModal();
   }
 }
 
@@ -2234,6 +2364,30 @@ function getFolderTitle(g: SessionGroup) {
   border: none;
   color: #fff;
   font-weight: 600;
+}
+
+/* 秘书起名弹窗的输入框：样式沿用侧栏就地重命名输入框（.s-rename-input）的观感，
+   只是占满弹窗正文宽度（.modal-body 是居中列布局，需要显式 100%） */
+.s-name-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  padding: 8px 10px;
+  outline: none;
+}
+.s-name-input:focus {
+  border-color: var(--accent);
+}
+.s-name-hint {
+  min-height: 15px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  text-align: left;
+  align-self: stretch;
 }
 
 /* 移动端侧栏遮罩：桌面端不显示，仅在 <=768px 侧栏展开时盖住主区。

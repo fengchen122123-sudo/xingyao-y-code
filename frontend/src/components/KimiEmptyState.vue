@@ -197,9 +197,10 @@ const permBtnRef = ref<HTMLElement | null>(null);
 const workdirBtnRef = ref<HTMLElement | null>(null);
 const reasoningSelectorRef = ref<{ close: () => void } | null>(null);
 
-// 工作区下拉数据：非 GLOBAL 的项目分组
+// 工作区下拉数据：非 GLOBAL 的项目分组（秘书分组不是工作区，选它会切到
+// folder_path='SECRETARY' 这个并不存在的"目录"，故一并过滤）
 const projectGroups = computed(() =>
-  store.sessionGroups.filter(g => !g.is_global && g.folder_path && g.folder_path !== 'GLOBAL')
+  store.sessionGroups.filter(g => !g.is_global && !g.is_secretary && g.folder_path && g.folder_path !== 'GLOBAL')
 );
 const isGlobalWorkdir = computed(() =>
   !store.workdir || store.currentWorkdirLabel === '对话' || store.currentWorkdirLabel === 'GLOBAL'

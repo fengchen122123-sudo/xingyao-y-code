@@ -378,6 +378,12 @@ class MemoryManager:
                 # ADD COLUMN 幂等添加，不触发上方「遗留 sessions 表重建」分支。
                 if "archived_at" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT")
+                # 秘书身份：会话级秘书名（NULL/空 = 非秘书会话）。起名后该会话的
+                # 显示与系统提示词身份全程使用它；名字不参与 session_name 标识，
+                # 重名互不影响，改名也不牵动消息/摘要/账本/快照的键。同样只走
+                # ALTER ADD COLUMN 幂等添加，不重建表、不动历史行。
+                if "secretary_name" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN secretary_name TEXT")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -2495,21 +2501,78 @@ class MemoryManager:
         clear_cache_usage_session(session_name)
         return deleted
 
-    def create_session_explicit(self, session_name, workdir=None, source="GUI"):
-        """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。"""
+    def create_session_explicit(self, session_name, workdir=None, source="GUI", secretary_name=None):
+        """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。
+
+        secretary_name 仅秘书会话创建路径传入（NULL/空 = 非秘书会话）。名字合法性
+        由调用方（core.secretary.validate_secretary_name）先行校验，本层不再静默
+        截断或改写，只把空值统一落 NULL，避免"空串"与"未设置"两套口径并存。
+        """
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
+        sec_name = str(secretary_name).strip() if secretary_name else None
         with self._lock:
             cursor = self.conn.cursor()
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (session_name, wdir, now, now, source))
+                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, secretary_name)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (session_name, wdir, now, now, source, sec_name or None))
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
                 raise
+
+    def get_session_secretary_name(self, session_name) -> str:
+        """取会话的秘书名；无记录 / 未命名 / 查询异常一律返回空串。
+
+        秘书名是显示与提示词的输入，读取处在每轮请求的高频路径上，不能因查询
+        异常打断整轮，故异常回落空串而非向上抛。
+        """
+        try:
+            with self._lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT secretary_name FROM sessions WHERE session_name = ?
+                ''', (session_name,))
+                row = cursor.fetchone()
+        except Exception:
+            return ""
+        return str(row[0]).strip() if row and row[0] else ""
+
+    def set_session_secretary_name(self, session_name, name) -> bool:
+        """写入会话的秘书名，返回是否有匹配行被更新。
+
+        传 None/空字符串落 NULL（= 非秘书 / 未命名）；合法性由调用方校验，本层
+        不做静默截断。异常回滚并返回 False，不向上抛。
+        """
+        sec_name = str(name).strip() if name else None
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute('''
+                    UPDATE sessions SET secretary_name = ?, updated_at = ?
+                    WHERE session_name = ?
+                ''', (sec_name or None, now, session_name))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self.conn.rollback()
+                return False
+
+    def get_session_source(self, session_name) -> str:
+        """取会话来源（GUI / SECRETARY 等）；无记录 / 查询异常返回空串。"""
+        try:
+            with self._lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT source FROM sessions WHERE session_name = ?
+                ''', (session_name,))
+                row = cursor.fetchone()
+        except Exception:
+            return ""
+        return str(row[0]).strip() if row and row[0] else ""
 
 
     @staticmethod
@@ -2839,11 +2902,16 @@ class MemoryManager:
                     raise
 
     def get_all_sessions(self, workdir=None, source=None, include_empty=False,
-                         include_archived=False, archived_only=False):
+                         include_archived=False, archived_only=False,
+                         sources: Optional[List[str]] = None):
         """返回会话列表（名称/消息数/归属目录/时间/来源/归档时刻）。
 
         workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话。
         source 参数用于过滤 GUI 或 CLI 专属会话。
+        sources 参数用于一次筛选多个来源（如 ["GUI", "SECRETARY"]），语义为
+        `(s.source IN (...) OR s.source IS NULL)`，与 source 的过滤口径一致；
+        sources 与 source 同时传入时以 sources 为准（source 被忽略）。
+        返回的每个会话都带 source 字段（无值时回退为 "GUI"），供上层按来源分组。
         include_empty=False 时过滤掉无任何消息的空会话（参考 kimicode 的 is_empty 策略），
         避免会话列表被空会话污染；磁盘记录仍保留，不删除。
         include_archived=False（默认）时不返回已归档会话，保证既有调用点行为不变；
@@ -2858,7 +2926,21 @@ class MemoryManager:
             archived_filter = " AND s.archived_at IS NULL"
         with self._lock:
             cursor = self.conn.cursor()
-            if source:
+            if sources:
+                # 多来源筛选（如 ["GUI", "SECRETARY"]）：口径与单 source 分支
+                # 完全一致，无 source 的历史数据同样视为可见，避免老会话消失
+                placeholders = ",".join("?" for _ in sources)
+                cursor.execute(f'''
+                    SELECT s.session_name, COUNT(m.id) as msg_count,
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id,
+                           s.archived_at
+                    FROM sessions s
+                    LEFT JOIN messages m ON s.id = m.session_id
+                    WHERE (s.source IN ({placeholders}) OR s.source IS NULL){archived_filter}
+                    GROUP BY s.id
+                    ORDER BY s.id DESC
+                ''', tuple(sources))
+            elif source:
                 cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
                            s.workdir, s.updated_at, s.created_at, s.source, s.id,

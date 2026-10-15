@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -20,8 +21,14 @@ from core.tool_registry import ToolRegistry
 from core.command_policy import classify_command_risk
 from core.permission_policy import PermissionRisk
 
+_LOGGER = logging.getLogger(__name__)
+
 
 TOOL_ERROR_PREFIX = "🚨"
+SECRETARY_READONLY_DENIED_MESSAGE = (
+    f"{TOOL_ERROR_PREFIX} 当前是秘书会话，只允许检索对话 / 派活 / 跳转以及只读查询。"
+    "秘书会话不写项目文件；可以让我派活给某个会话去改。"
+)
 PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
 PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
@@ -931,6 +938,7 @@ class ToolPipeline:
             ),
         }
 
+
     def _stale_execution_lease(self, context):
         """旧子 Agent 延迟工具调用 fencing（在权限询问与 adapter 之前）。
 
@@ -953,6 +961,40 @@ class ToolPipeline:
             return STALE_EXECUTION_LEASE_TEXT
         return STALE_EXECUTION_LEASE_TEXT
 
+    def _secretary_gate_blocked(self, decoded, context) -> bool:
+        """秘书会话只读门控兜底（设计 2026-10-15 第 6 节）。
+
+        放在权限判定之前：秘书会话里被禁的工具直接失败，不弹确认卡——避免
+        "先弹确认再硬拒"的坏体验。schema 层已按同一策略过滤过一遍，这里是
+        兜底：MCP / 插件 / 保留工具等不经过注册表 schema 的调用同样被拦下。
+
+        作用域取自注册表；取不到时按空作用域判定（只会更严，不会放过写类
+        工具）。身份解析异常按普通会话处理——门控组件故障不得阻断正常会话。
+        """
+        name = str(getattr(decoded, "name", "") or "")
+        if not name:
+            return False
+        try:
+            from core.secretary import is_secretary_tool_blocked
+        except Exception:
+            return False
+        scope = ""
+        try:
+            from core.llm import tool_registry as _registry
+
+            scope = str(getattr(_registry.get(name), "side_effect_scope", "") or "")
+        except Exception:
+            scope = ""
+        try:
+            return bool(
+                is_secretary_tool_blocked(
+                    name,
+                    scope,
+                    session_name=str(getattr(context, "parent_session", "") or "") or None,
+                )
+            )
+        except Exception:
+            return False
     def _run_tool_hook(
         self,
         decoded,
@@ -1047,6 +1089,18 @@ class ToolPipeline:
         constrained = self._plan_constraint(decoded, context)
         if constrained is not None:
             return _tool_message(decoded, constrained)
+
+        # 秘书只读门控兜底（设计 2026-10-15 第 6 节）：放在权限判定之前——
+        # 秘书会话里被禁的工具直接失败，不弹确认卡（避免"先确认再硬拒"）。
+        # 放行时行为与本改动前完全一致；schema 层已先行过滤，这里是兜底。
+        if self._secretary_gate_blocked(decoded, context):
+            _LOGGER.info(
+                "秘书会话只读门控拒绝工具：%s（会话 %s）",
+                decoded.name,
+                getattr(context, "parent_session", "")
+                or app_context.get_current_session(),
+            )
+            return _tool_message(decoded, SECRETARY_READONLY_DENIED_MESSAGE)
 
         # 固定 computer 适配（设计 19.2）：保留名 computer_action 在 resolve_tool
         # 之前识别，不经过注册表与权限链（设置开关即用户授权边界）。

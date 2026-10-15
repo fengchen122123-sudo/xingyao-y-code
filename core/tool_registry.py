@@ -315,6 +315,30 @@ def build_default_registry() -> ToolRegistry:
             activity_description="查看星轨自动化任务",
             side_effect_scope="none",  # 表未覆盖：只读查询，无持久副作用
         ),
+        # 秘书调度台（设计 2026-10-15 第 3 节）：仅秘书会话可见（core.secretary
+        # 的 SECRETARY_ONLY_TOOLS），普通会话的工具集零变化。
+        ToolSpec(
+            name="search_conversations",
+            description=(
+                "检索历史会话（秘书专用）：按关键词 / 日期区间（YYYY-MM-DD）/ 项目"
+                "目录找到用户以前聊过某个话题的会话，返回每个命中的会话名、显示名、"
+                "归属目录、更新时间和命中片段。关键词与日期都为空会被拒绝；先检索再"
+                "回答，不要凭印象猜会话名。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "keyword": {"type": "string", "default": "", "description": "要检索的关键词（可选，与日期至少给一个）"},
+                "date_from": {"type": "string", "default": "", "description": "起始日期 YYYY-MM-DD（可选，含当天）"},
+                "date_to": {"type": "string", "default": "", "description": "结束日期 YYYY-MM-DD（可选，含当天）"},
+                "workdir": {"type": "string", "default": "", "description": "按项目目录过滤（可选）"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "最多返回的会话数（上限 50）"},
+            }),
+            execute=tools.search_conversations,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="检索历史会话",
+            side_effect_scope="none",
+        ),
     ]
 
     mutating_specs = [
@@ -887,6 +911,46 @@ def build_default_registry() -> ToolRegistry:
             parallel_safe=False,
             activity_description="立即执行星轨自动化任务",
             side_effect_scope="workspace",
+        ),
+        # 秘书调度台（设计 2026-10-15 第 4/5 节）：仅秘书会话可见；派活/跳转会
+        # 改动别的会话与界面视图，按保守口径归 system。
+        ToolSpec(
+            name="dispatch_task",
+            description=(
+                "把任务派给指定会话执行（秘书专用）：等价于用户在那个会话亲手发一条"
+                "消息——内容以用户消息落库、界面正常显示、触发一轮真实执行，目标会话忙"
+                "则排队。target 传会话名/显示名，或留空并给 workdir 以新建会话。调用前"
+                "先向用户确认要派给哪个会话以及任务内容；派出去就可能真实改文件。"
+                "返回 JSON 字符串（含 target_session / state）。"
+            ),
+            input_schema=_schema({
+                "target": {"type": "string", "default": "", "description": "目标会话名或显示名；留空或填「新会话」表示新建会话"},
+                "prompt": {"type": "string", "description": "任务正文（必填），会作为用户消息投递给目标会话"},
+                "workdir": {"type": "string", "default": "", "description": "仅新建会话时生效：新会话归属的项目目录"},
+                "model_id": {"type": "string", "default": "", "description": "可选，指定目标使用的模型；留空沿用会话默认"},
+                "permission_mode": {"type": "string", "default": "", "description": "可选，指定目标会话的权限档位；留空沿用会话自身档位"},
+            }, ["prompt"]),
+            execute=tools.dispatch_task,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="派发任务给会话",
+            side_effect_scope="system",  # 表未覆盖：会向其它会话投递消息并触发真实执行
+        ),
+        ToolSpec(
+            name="open_session",
+            description=(
+                "把用户带到某个历史会话（秘书专用）：纯系统层切换，界面直接切过去，"
+                "不打断目标会话正在执行的回合。target 传会话名 / 显示名 / 关键词；"
+                "命中多条时要先问清是哪一条。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "target": {"type": "string", "description": "会话名、显示名或关键词（必填）"},
+            }, ["target"]),
+            execute=tools.open_session,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="跳转到会话",
+            side_effect_scope="system",  # 表未覆盖：切换当前会话与界面视图
         ),
     ]
     registry = ToolRegistry([*read_specs, *mutating_specs])

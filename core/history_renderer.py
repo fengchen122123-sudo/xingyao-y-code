@@ -139,8 +139,10 @@ def render_session_history(
                 if prev_block not in (None, "user"):
                     output.append("\n")
                 try:
-                    from core.persona_settings import get_agent_display_name
-                    _agent_label = get_agent_display_name()
+                    # 历史回放里的自称是“当前会话内的自称”：秘书会话显示秘书名
+                    from core.secretary import get_active_agent_name
+
+                    _agent_label = get_active_agent_name()
                 except Exception:
                     _agent_label = "星瑶"
                 output.append(f"{ANSI_MAGENTA}🤖 {_agent_label} >{ANSI_RESET}\n")

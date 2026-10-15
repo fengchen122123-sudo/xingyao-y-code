@@ -21,6 +21,13 @@
             <button class="seg-btn" :class="{ active: sourceFilter === 'user' }" data-test="src-filter-user" @click="sourceFilter = 'user'">用户</button>
           </div>
           <span class="toolbar-spacer"></span>
+          <input
+            v-model="searchQuery"
+            class="sub-search"
+            data-test="sub-search-input"
+            placeholder="搜索技能…"
+            title="按名称 / ID / 介绍搜索，多个关键词用空格分隔"
+          />
           <button
             class="chip-btn"
             data-test="refresh-skills-btn"
@@ -71,6 +78,14 @@
       <!-- MCP 页 -->
       <div v-else-if="subType === 'mcp'">
          <div class="sub-toolbar">
+           <span class="toolbar-spacer"></span>
+           <input
+             v-model="searchQuery"
+             class="sub-search"
+             data-test="sub-search-input"
+             placeholder="搜索服务名…"
+             title="按 MCP 服务名搜索"
+           />
            <button class="chip-btn" title="添加自定义 MCP 服务" @click="addForm.show = !addForm.show"><AppIcon name="plus" :size="12" /> 添加服务</button>
            <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()"><AppIcon name="refresh" :size="12" /> 重连</button>
          </div>
@@ -90,7 +105,8 @@
            </div>
          </div>        <div class="sub-grid">
           <div v-if="store.mcps.length === 0" class="sub-empty">暂无已配置的 MCP 服务</div>
-          <div v-for="m in store.mcps" :key="m.name" class="sub-card mcp-card">
+          <div v-else-if="filteredMcps.length === 0" class="sub-empty">没有匹配的 MCP 服务</div>
+          <div v-for="m in filteredMcps" :key="m.name" class="sub-card mcp-card">
             <div class="sc-top">
               <div class="sc-ico">⧉</div>
               <div class="sc-name">
@@ -124,6 +140,14 @@
             <button class="seg-btn" :class="{ active: sourceFilter === 'builtin' }" data-test="src-filter-builtin" @click="sourceFilter = 'builtin'">内置</button>
             <button class="seg-btn" :class="{ active: sourceFilter === 'user' }" data-test="src-filter-user" @click="sourceFilter = 'user'">用户</button>
           </div>
+          <span class="toolbar-spacer"></span>
+          <input
+            v-model="searchQuery"
+            class="sub-search"
+            data-test="sub-search-input"
+            placeholder="搜索插件…"
+            title="按名称 / 介绍 / 工具名搜索，多个关键词用空格分隔"
+          />
         </div>
         <div class="sub-grid">
           <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
@@ -285,15 +309,36 @@ const refreshingSkills = ref(false);
 // 技能缺 source（旧版后端）按用户算，插件非 'user' 按内置算
 type SourceFilterValue = 'all' | 'builtin' | 'user';
 const sourceFilter = ref<SourceFilterValue>('all');
-watch(() => props.subType, () => { sourceFilter.value = 'all'; });
+
+// 关键词搜索：技能 / MCP / 插件三页共用同一个输入框，切页时与来源筛选一起重置。
+// MCP 后端只返回服务名，故该页搜索范围仅服务名。
+const searchQuery = ref('');
+watch(() => props.subType, () => { sourceFilter.value = 'all'; searchQuery.value = ''; });
+
+// 关键词按空格拆成多个词，全部命中才算匹配（忽略大小写）；只传小写后的 kw
+function hitSearch(kw: string, fields: Array<string | undefined | null>): boolean {
+  if (!kw) return true;
+  const hay = fields.filter(Boolean).join(' ').toLowerCase();
+  return kw.split(/\s+/).every(t => hay.includes(t));
+}
 
 const filteredSkills = computed(() => {
-  if (sourceFilter.value === 'all') return store.skills;
-  return store.skills.filter(s => (s.source === 'builtin' ? 'builtin' : 'user') === sourceFilter.value);
+  const kw = searchQuery.value.trim().toLowerCase();
+  return store.skills.filter(s => {
+    if (sourceFilter.value !== 'all' && (s.source === 'builtin' ? 'builtin' : 'user') !== sourceFilter.value) return false;
+    return hitSearch(kw, [s.name, s.id, s.short_id, s.description]);
+  });
 });
 const filteredPlugins = computed(() => {
-  if (sourceFilter.value === 'all') return store.plugins;
-  return store.plugins.filter(p => (p.source === 'user' ? 'user' : 'builtin') === sourceFilter.value);
+  const kw = searchQuery.value.trim().toLowerCase();
+  return store.plugins.filter(p => {
+    if (sourceFilter.value !== 'all' && (p.source === 'user' ? 'user' : 'builtin') !== sourceFilter.value) return false;
+    return hitSearch(kw, [p.name, p.description, p.tools.join(' ')]);
+  });
+});
+const filteredMcps = computed(() => {
+  const kw = searchQuery.value.trim().toLowerCase();
+  return store.mcps.filter(m => hitSearch(kw, [m.name]));
 });
 
 async function onRefreshSkills() {
@@ -602,6 +647,22 @@ async function testModelRow(m: ModelInfo) {
 }
 .toolbar-spacer {
   flex: 1;
+}
+/* 技能 / MCP / 插件三页共用的关键词搜索框（与钩子页 .hook-search 同款外观） */
+.sub-search {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: var(--text);
+  font-size: 12px;
+  width: 180px;
+  outline: none;
+  font-family: inherit;
+  transition: 0.15s;
+}
+.sub-search:focus {
+  border-color: var(--accent);
 }
 /* 来源分段筛选：全部 / 内置 / 用户 */
 .src-filter {

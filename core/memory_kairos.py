@@ -360,10 +360,12 @@ def run_dream_consolidation_sync(api_model, api_key, api_base=None):
 
     # 统一经过 core.llm 的懒加载包装，确保补丁、日志和测试替换点一致。
     from core.llm import completion
-    
+
+    # 整理提示里的自称跟随当前会话（秘书会话 → 秘书名）
     try:
-        from core.persona_settings import get_agent_display_name
-        _agent = get_agent_display_name()
+        from core.secretary import get_active_agent_name
+
+        _agent = get_active_agent_name()
     except Exception:
         _agent = "星瑶"
 
