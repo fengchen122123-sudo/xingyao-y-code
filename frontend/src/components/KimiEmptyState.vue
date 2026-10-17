@@ -65,14 +65,6 @@
             :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
           ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
-          <!-- Git 分支入口（红框位）：非 Git 工作区不显示；点击弹出 Git 管理面板 -->
-          <button
-            v-if="gitBranchLabel"
-            data-test="hero-git-branch"
-            class="kimi-pill-btn"
-            title="Git 工作台：点击打开 Git 管理面板"
-            @click.stop="openGitPanel"
-          ><AppIcon name="git-branch" :size="13" :stroke-width="2" /><span class="git-branch-label">{{ gitBranchLabel }}</span></button>
         </div>
 
         <div style="display:flex;align-items:center;gap:10px">
@@ -158,7 +150,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
-import { useGitStore } from '../stores/gitStore';
 import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
@@ -171,16 +162,6 @@ import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
 
 const store = useAppStore();
-const gitStore = useGitStore();
-// Git 分支 chip 文案：复用状态栏格式（去掉 ⎇ 前缀与 dirty 星号，标题栏/状态栏两处保留星号）；非 Git 工作区为空隐藏
-const gitBranchLabel = computed(() => {
-  const text = gitStore.statusbarText;
-  return text ? text.slice(2).replace('*', '') : '';
-});
-function openGitPanel() {
-  gitStore.requestOpenPanel();
-  store.openRightPanelTab('git');
-}
 const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
   set: value => { store._getSessionRuntime().composerText = value; },
@@ -354,13 +335,6 @@ function handleKeydown(e: KeyboardEvent) {
   border-color: var(--orange);
   color: var(--orange);
 }
-/* Git 分支 chip：长分支名截断，完整名在 title 中 */
-.git-branch-label {
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .workdir-item {
   padding: 9px 12px;
   border-radius: 8px;
@@ -409,16 +383,10 @@ function handleKeydown(e: KeyboardEvent) {
 
 /* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
    侧栏展开挤窄首页卡片时禁止按钮换行，按 .kimi-card 容器宽度分档，
-   档位与对话中输入栏一致：≤640 隐分支文字 / ≤540 权限·模型转图标 /
-   ≤430 沙盒收成 开/限 并隐藏分支入口 */
+   档位与对话中输入栏一致：≤540 权限·模型转图标 / ≤430 沙盒收成 开/限 */
 .kimi-card {
   container-type: inline-size;
   container-name: composer;
-}
-@container composer (max-width: 640px) {
-  [data-test="hero-git-branch"] .git-branch-label {
-    display: none;
-  }
 }
 @container composer (max-width: 540px) {
   .permission-mode-btn .perm-label,
@@ -433,9 +401,6 @@ function handleKeydown(e: KeyboardEvent) {
   }
 }
 @container composer (max-width: 430px) {
-  [data-test="hero-git-branch"] {
-    display: none;
-  }
   .sandbox-label-full {
     display: none;
   }
@@ -456,13 +421,10 @@ function handleKeydown(e: KeyboardEvent) {
   .model-icon {
     display: inline-flex;
   }
-  /* 手机端沙盒只留 开/限，分支信息看状态栏即可 */
+  /* 手机端沙盒只留 开/限 */
   .sandbox-pill {
     font-size: 12px;
     padding: 6px 9px;
-  }
-  [data-test="hero-git-branch"] {
-    display: none;
   }
 }
 </style>
