@@ -230,8 +230,9 @@ def step0_build_frontend(project_dir, args):
         print("   3) frontend/src 下的 TypeScript / Vue 代码存在编译错误")
         sys.exit(1)
 
-    # IDE 模式引入 CodeMirror 6 后，首屏包体积必须受控：
-    # 语言包与重扩展一律动态 import，一旦被静态引入这里会失败。
+    # 首屏包体积守门：GUI 首屏只加载 index-*.js，体积必须受控。
+    # 既有约定是重依赖（语言包、语法高亮语言模式、图表/终端等大库）一律动态 import，
+    # 一旦某个大模块被静态引入，这里就会失败并给出可读告警。
     # 注：计划原文用 `base_dir`，本函数的对应变量名是 `project_dir`（函数内无 base_dir），
     # 故这里逐字保留校验逻辑、只把根目录变量名对齐到本函数的作用域。
     dist_assets = os.path.join(project_dir, "frontend", "dist", "assets")
