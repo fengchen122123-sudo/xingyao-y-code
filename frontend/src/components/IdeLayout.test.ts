@@ -113,47 +113,34 @@ it('IDE 布局渲染出调试工具条（运行/调试的唯一入口必须可�
   wrapper.unmount();
 });
 
-it('IDE 模式下终端只挂载一个实例，且那一个是底部面板的（App 自带的终端必须 v-if 退场）', async () => {
+it('App 不再挂载 IDE 布局：终端只挂 App 自带那一个实例', async () => {
   const app = useAppStore();
   app.terminalPanelOpen = true;
 
-  // 对话模式：App 自带的终端面板挂载一次
-  const chat = mountApp();
+  const wrapper = mountApp();
   await flushPromises();
+  // Phase 1 摘掉前端 IDE 入口后 App 不再渲染 IdeLayout，因此 App 只挂自己那一个终端；
+  // 不可能出现「App 的终端 + 底部面板的终端」两个 xterm / 两个 PTY 的情况
   expect(terminal.live).toBe(1);
-  expect(chat.findAllComponents({ name: 'TerminalPane' }).length).toBe(1);
-  chat.unmount();
-  expect(terminal.live).toBe(0);
-
-  // 切到 IDE 模式：终端让位给 IdeLayout 的 BottomPanel——同时挂两个即为两个 xterm / 两个 PTY
-  app.toggleIdeMode();
-  expect(app.ideMode()).toBe(true);
-  const ide = mountApp();
-  await flushPromises();
-
-  expect(ide.findAllComponents({ name: 'TerminalPane' }).length).toBe(1);
-  expect(terminal.live).toBe(1);
-  // 唯一的那个实例必须来自 BottomPanel（若把 App 里的 v-if 改回 v-show，这里会变成 2）
-  expect(ide.find('.bottom-panel .terminal-stub').exists()).toBe(true);
-  ide.unmount();
+  expect(wrapper.findAllComponents({ name: 'TerminalPane' }).length).toBe(1);
+  expect(wrapper.find('.bottom-panel').exists()).toBe(false);
+  wrapper.unmount();
   expect(terminal.live).toBe(0);
 });
 
 it('收起底部面板时也只有底部面板那一个终端实例，且面板只是隐藏', async () => {
-  const app = useAppStore();
-  app.terminalPanelOpen = true;
-  app.toggleIdeMode();
   const ide = useIdeStore();
   ide.setSession('');
   ide.toggleBottomPanel(); // 收起底部面板
 
-  const wrapper = mountApp();
+  // Phase 1 之后 App 不再渲染 IdeLayout（IDE 入口已摘），本用例直接挂布局组件本身
+  const wrapper = mount(IdeLayout);
   await flushPromises();
 
   // S3-T12：收起改用 v-show 控制可见性——调试控制台的行缓冲活在 DebugPane 里，
   // v-if 卸载会把它连同输出一起丢掉，与「收起期间调试输出不丢」冲突。
-  // 这里唯一不变式仍是「不能出现第二个终端实例」：App 自带的那份在 IDE 模式下退场，
-  // 剩下的恰好是底部面板这一个（收起期间只是隐藏，不销毁）。
+  // 这里唯一不变式仍是「不能出现第二个终端实例」：剩下的恰好是底部面板这一个
+  //（收起期间只是隐藏，不销毁）。
   expect(terminal.live).toBe(1);
   expect(wrapper.find('.ide-bottom').isVisible()).toBe(false);
   expect(wrapper.find('.bottom-panel').exists()).toBe(true);
