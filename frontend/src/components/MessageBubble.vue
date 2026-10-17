@@ -2,6 +2,11 @@
   <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : msg.role === 'notice' ? 'msg-notice' : 'msg-assistant'">
     <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大）；气泡下方悬停浮现操作栏 -->
     <template v-if="msg.role === 'user'">
+      <!-- QQ2009 皮肤专属：用户消息昵称行（仅内置 QQ2009 主题激活时渲染；
+           样式在 themes/qq2009.css，本组件不加样式） -->
+      <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-msg-sender">
+        <b class="qq09-sender-name">木偶</b>
+      </div>
       <div class="bubble user-bubble">
         <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
         <div
@@ -146,7 +151,8 @@ import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdownDetailed, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
 import { splitStableBlocks } from '../utils/markdownBlocks';
 import { renderMermaidBlocks } from '../utils/mermaidRenderer';
-import { toAbsoluteLocalPath } from '../utils/localPath';
+import { canOpenInRightPanel, toAbsoluteLocalPath } from '../utils/localPath';
+import { useIsMobile } from '../composables/useViewport';
 import { formatTokenSpeed, formatDuration } from '../utils/tokenSpeed';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
@@ -159,6 +165,8 @@ const props = defineProps<{
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
 // 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
 const store = useAppStore();
+// 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
+const isMobile = useIsMobile();
 // 用户消息复制按钮的「已复制」反馈状态与定时器
 const userCopied = ref(false);
 let userCopiedTimer: number | undefined;
@@ -325,7 +333,7 @@ function onMdBodyClick(e: MouseEvent) {
     return;
   }
 
-  const saveBtn = (e.target as HTMLElement).closest('button.md-img-save');
+  const saveBtn = (e.target as HTMLElement).closest('button.md-img-save, button.md-video-save');
   if (saveBtn) {
     e.preventDefault();
     const src = saveBtn.getAttribute('data-save-src') || '';
@@ -364,6 +372,12 @@ function onMdBodyClick(e: MouseEvent) {
     const target = toAbsoluteLocalPath(raw, store.workdir);
     if (!target) {
       store.notifyModal('文件预览', '当前会话未绑定工作目录，无法解析相对路径');
+      return;
+    }
+    // html / pdf / md 交给右栏（网页直接渲染，md 先渲染成预览页）；
+    // 移动端没有右面板，一律回退源码预览弹窗
+    if (canOpenInRightPanel(target) && !isMobile.value) {
+      void store.openInRightPanel(target);
       return;
     }
     store.openFilePreview(target);
@@ -442,9 +456,10 @@ async function copyMdImageToClipboard(src: string, btn: HTMLButtonElement) {
 }
 
 // "另存为"：后端弹原生保存对话框，把仓库里的原文件复制到用户选择的位置。
+// 图片与视频共用本函数（按钮由 Markdown 渲染层产出，类名不同、属性约定一致）。
 // 用户取消不提示失败；成功/失败都在按钮上短暂反馈，不打断阅读。
 async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButtonElement) {
-  const label = btn.querySelector('.md-img-save-text');
+  const label = btn.querySelector('.md-img-save-text, .md-video-save-text');
   const restore = () => {
     btn.classList.remove('saved', 'save-failed');
     if (label) label.textContent = '另存为';
@@ -462,7 +477,7 @@ async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButton
     } else if (!res || !res.cancelled) {
       // 取消对话框不是错误，静默复原；其余失败给出可见提示
       feedback('保存失败', 'save-failed');
-      if (res && res.msg) store.notifyChat(`另存图片失败：${res.msg}`);
+      if (res && res.msg) store.notifyChat(`另存失败：${res.msg}`);
     }
   } finally {
     btn.disabled = false;
@@ -839,10 +854,12 @@ async function copyUserMessage() {
   cursor: zoom-in;
   object-fit: contain;
 }
-/* 悬停浮现的图片操作区（复制原图 / 另存为）：图片右上角，两按钮横向排列。
-   配色固定为深色底白字（不随主题变量走），保证压在任意明暗的图片内容上
+/* 悬停浮现的媒体操作区（图片：复制原图 / 另存为；视频：另存为）：压在媒体
+   右上角，按钮横向排列。视频原生控件条在底部，与顶部操作区不重叠。
+   配色固定为深色底白字（不随主题变量走），保证压在任意明暗的图片/画面上
    都有足够对比度 */
-.md-body :deep(.md-img-actions) {
+.md-body :deep(.md-img-actions),
+.md-body :deep(.md-video-actions) {
   position: absolute;
   top: 14px;
   right: 14px;
@@ -852,16 +869,21 @@ async function copyUserMessage() {
   transition: opacity 0.15s ease;
 }
 .md-body :deep(.md-media-wrap:hover .md-img-actions),
+.md-body :deep(.md-media-wrap:hover .md-video-actions),
 .md-body :deep(.md-img-actions:focus-within),
+.md-body :deep(.md-video-actions:focus-within),
 /* 按钮自身处于反馈态时（点击后鼠标移开）操作区继续保持可见 */
 .md-body :deep(.md-img-actions:has(.copied)),
 .md-body :deep(.md-img-actions:has(.saved)),
 .md-body :deep(.md-img-actions:has(.copy-failed)),
-.md-body :deep(.md-img-actions:has(.save-failed)) {
+.md-body :deep(.md-img-actions:has(.save-failed)),
+.md-body :deep(.md-video-actions:has(.saved)),
+.md-body :deep(.md-video-actions:has(.save-failed)) {
   opacity: 1;
 }
 .md-body :deep(.md-img-copy),
-.md-body :deep(.md-img-save) {
+.md-body :deep(.md-img-save),
+.md-body :deep(.md-video-save) {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -877,27 +899,32 @@ async function copyUserMessage() {
   backdrop-filter: blur(4px);
 }
 .md-body :deep(.md-img-copy svg),
-.md-body :deep(.md-img-save svg) {
+.md-body :deep(.md-img-save svg),
+.md-body :deep(.md-video-save svg) {
   width: 13px;
   height: 13px;
 }
 .md-body :deep(.md-img-copy:disabled),
-.md-body :deep(.md-img-save:disabled) {
+.md-body :deep(.md-img-save:disabled),
+.md-body :deep(.md-video-save:disabled) {
   cursor: default;
   opacity: 0.75;
 }
 .md-body :deep(.md-img-copy:hover),
-.md-body :deep(.md-img-save:hover) {
+.md-body :deep(.md-img-save:hover),
+.md-body :deep(.md-video-save:hover) {
   background: rgba(15, 15, 15, 0.9);
   border-color: rgba(255, 255, 255, 0.55);
   color: #fff;
 }
 .md-body :deep(.md-img-copy.copied),
-.md-body :deep(.md-img-save.saved) {
+.md-body :deep(.md-img-save.saved),
+.md-body :deep(.md-video-save.saved) {
   color: #4ade80;
 }
 .md-body :deep(.md-img-copy.copy-failed),
-.md-body :deep(.md-img-save.save-failed) {
+.md-body :deep(.md-img-save.save-failed),
+.md-body :deep(.md-video-save.save-failed) {
   color: #f87171;
 }
 .md-body :deep(video.md-video) {

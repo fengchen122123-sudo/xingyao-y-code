@@ -362,3 +362,19 @@ def test_extract_session_refs_coexists_with_at_file(tmp_path):
     cleaned, refs = extract_session_refs(text)
     assert refs == ["我的对话"]
     assert f"@{f.name}" in cleaned  # @文件 标记原样保留给 parse_user_input
+
+
+def test_sanitize_session_title_restores_mention_and_drops_braces():
+    """标题派生净化：@{会话名} 还原为内部名，残留花括号剥掉，保证标题可被再次引用。"""
+    from core.input_parser import sanitize_session_title
+
+    # 完整标记：还原为内部名（原标题被截成「@{缓存改造} 阅读一下」形态）
+    assert sanitize_session_title("@{缓存改造} 阅读一下") == "缓存改造 阅读一下"
+    # 历史上截断产生的残缺标记（只有 @{、没有闭合）：花括号也必须剥掉
+    assert sanitize_session_title("@{我这个自然语言交互如") == "@我这个自然语言交互如"
+    # 无标记 / 空输入原样透传
+    assert sanitize_session_title("没有引用") == "没有引用"
+    assert sanitize_session_title("") == ""
+    # 截断到 12 字后仍不含 { }，可被 @{...} 引用语法表示
+    cut = sanitize_session_title("@{缓存改造} 阅读一下")[:12]
+    assert "{" not in cut and "}" not in cut

@@ -186,13 +186,17 @@ class BackendIdentity:
 
     browser/profile_path 取自 Turn 冻结能力快照与领取时解析的规范绝对路径；
     desktop 的 browser/profile_path 恒为空串。身份绝不进入 Provider 消息或
-    Journal。
+    Journal。cdp_endpoint 仅 embedded（内置 WebView2 CDP 直连）模式使用，
+    是 retained 会话身份的一部分：端口变化即视为配置变更、不复用旧实例。
     """
 
     platform: str
     target: str
     browser: str = ""
     profile_path: str = ""
+    cdp_endpoint: str = ""
+    viewport_width: int = 0
+    viewport_height: int = 0
 
 
 @dataclass(frozen=True)

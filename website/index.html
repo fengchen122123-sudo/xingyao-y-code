@@ -9,7 +9,8 @@
 <meta property="og:title" content="星瑶Code">
 <meta property="og:description" content="能执行任务、理解项目并长期记忆的本地 AI 编程伙伴">
 <meta property="og:image" content="https://xingyaocode.cn/assets/xingyaocode.png">
-<link rel="icon" type="image/png" href="assets/xingyaocode_rounded.png">
+<link rel="icon" type="image/png" href="assets/xingyaocode_logo.png">
+<link rel="preload" as="image" href="assets/xingyaocode_hero.webp" fetchpriority="high">
 <style>
 /* ============ 基础与变量 ============ */
 :root {
@@ -304,7 +305,7 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <nav class="nav" aria-label="主导航">
   <div class="nav-inner">
     <a class="nav-brand" href="#top" aria-label="星瑶Code 首页">
-      <img src="assets/xingyaocode_rounded.png" alt="星瑶Code 标志">
+      <img src="assets/xingyaocode_logo.png" alt="星瑶Code 标志">
       星瑶Code
     </a>
     <div class="nav-links">
@@ -319,8 +320,8 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <!-- ============ Hero 海报屏 ============ -->
 <header class="hero" id="top">
   <div class="hero-content">
-    <img class="hero-logo" src="assets/xingyaocode.png" alt="星瑶Code 像素机器人标志">
-    <div class="hero-tagline">星瑶Code 已上线 · v<span class="js-version">1.3.2</span></div>
+    <img class="hero-logo" src="assets/xingyaocode_hero.webp" alt="星瑶Code 像素机器人标志" fetchpriority="high">
+    <div class="hero-tagline">星瑶Code 已上线 · v<span class="js-version">1.3.3</span></div>
     <h1>让代码，回应你的想象。</h1>
     <p class="hero-desc">
       一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。<br>
@@ -395,7 +396,7 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
     <div class="download-head">
       <div class="eyebrow">Download</div>
       <h2 class="section-title">准备好，与星瑶并肩了吗？</h2>
-      <span class="version-tag">当前版本 v<span class="js-version">1.3.2</span> · Windows</span>
+      <span class="version-tag">当前版本 v<span class="js-version">1.3.3</span> · Windows</span>
     </div>
     <div class="download-grid">
       <div class="platform-card available">
@@ -421,7 +422,7 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <footer class="footer">
   <div class="wrap footer-inner">
     <div class="footer-brand">
-      <img src="assets/xingyaocode_rounded.png" alt="星瑶Code 标志">
+      <img src="assets/xingyaocode_logo.png" alt="星瑶Code 标志">
       星瑶Code <span>· 编程搭档</span>
     </div>
     <div class="footer-links">
@@ -443,17 +444,17 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <!-- ============ 演示下载弹窗 ============ -->
 <dialog id="demo-modal" aria-labelledby="demo-modal-title">
   <h3 id="demo-modal-title">在线演示版</h3>
-  <p>当前为在线演示版，下载通道尚未接入服务器。<br>安装包（<span class="js-filename">ycode_setup_v1.3.2.exe</span>）上线后，此按钮将直接开始下载。</p>
+  <p>当前为在线演示版，下载通道尚未接入服务器。<br>安装包（<span class="js-filename">ycode_setup_v1.3.3.exe</span>）上线后，此按钮将直接开始下载。</p>
   <button class="btn btn-primary" type="button" id="demo-modal-close">我知道了</button>
 </dialog>
 
 <script>
 /* ============ 下载配置：接入真实服务器时只需修改这里 ============ */
 const DOWNLOAD_CONFIG = {
-  mode: "demo",                 // "demo" 演示弹窗 | "live" 真实下载
-  windowsUrl: "",               // live 模式必填，必须是非空 https:// 地址
-  version: "1.3.2",             // 页面显示版本
-  fileName: "ycode_setup_v1.3.2.exe"
+  mode: "live",                 // "demo" 演示弹窗 | "live" 真实下载
+  windowsUrl: "https://pan.quark.cn/s/e49cc60c7364",  // live 模式必填，必须是非空 https:// 地址
+  version: "1.3.3",             // 页面显示版本
+  fileName: "ycode_setup_v1.3.3.exe"
 };
 
 /* 版本号与文件名统一由 CONFIG 渲染，改一处全站生效 */
@@ -464,23 +465,39 @@ document.querySelectorAll(".js-filename").forEach(function (el) {
   el.textContent = DOWNLOAD_CONFIG.fileName;
 });
 
-/* 下载入口：demo 弹演示窗；live 校验后走浏览器原生导航下载 */
+/* 下载入口：live 模式把按钮原地替换成真实 <a> 链接（原生导航，不受弹窗拦截，
+   WebView/内嵌浏览器里 window.open 会被静默吞掉）；demo 模式弹演示窗 */
 function onDownloadClick() {
+  var url = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
   if (DOWNLOAD_CONFIG.mode === "live") {
-    var url = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
     if (!/^https:\/\/\S+$/.test(url)) {
       console.error("[星瑶Code] live 模式下 windowsUrl 必须是非空 https:// 地址，当前值无效。");
       alert("下载配置无效，请稍后再试。");
       return;
     }
-    window.location.href = url;
+    window.open(url, "_blank", "noopener");
     return;
   }
   document.getElementById("demo-modal").showModal();
 }
 
+function toDownloadAnchor(el) {
+  var a = document.createElement("a");
+  a.className = el.className;
+  a.href = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
+  a.target = "_blank";
+  a.rel = "noopener";
+  a.innerHTML = el.innerHTML;
+  el.replaceWith(a);
+}
+
 document.querySelectorAll("[data-download]").forEach(function (el) {
-  el.addEventListener("click", onDownloadClick);
+  var liveUrl = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
+  if (DOWNLOAD_CONFIG.mode === "live" && /^https:\/\/\S+$/.test(liveUrl)) {
+    toDownloadAnchor(el);
+  } else {
+    el.addEventListener("click", onDownloadClick);
+  }
 });
 document.getElementById("demo-modal-close").addEventListener("click", function () {
   document.getElementById("demo-modal").close();

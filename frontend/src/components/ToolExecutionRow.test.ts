@@ -1,7 +1,14 @@
+import { createPinia, setActivePinia } from 'pinia';
 import { mount } from '@vue/test-utils';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import ToolExecutionRow from './ToolExecutionRow.vue';
+import { useAppStore } from '../stores/appStore';
 import type { ToolDisplay, ToolTraceRow } from '../utils/toolTrace';
+
+// 组件内 openSubagentDetail 依赖 pinia store
+beforeEach(() => {
+  setActivePinia(createPinia());
+});
 
 
 function failedCommandRow(): ToolTraceRow {
@@ -147,6 +154,20 @@ describe('ToolExecutionRow', () => {
     expect(wrapper.text()).toContain('整理测试报告');
     expect(wrapper.text()).toContain('12s');
     expect(wrapper.text()).toContain('30s');
+  });
+
+  it('查看按钮记录目标任务 id 并自增打开 nonce（右面板切入子代理工作台）', async () => {
+    const wrapper = mount(ToolExecutionRow, { props: { row: subagentRow() } });
+    const store = useAppStore();
+    expect(store.subagentDetailId).toBe('');
+
+    await wrapper.get('button[data-test="subagent-view-t1"]').trigger('click');
+    expect(store.subagentDetailId).toBe('t1');
+    expect(store.subagentOpenNonce).toBe(1);
+
+    await wrapper.get('button[data-test="subagent-view-t2"]').trigger('click');
+    expect(store.subagentDetailId).toBe('t2');
+    expect(store.subagentOpenNonce).toBe(2);
   });
 
   it.each([

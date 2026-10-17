@@ -107,10 +107,14 @@ def contexts_to_messages(event_name: str, contexts) -> tuple[dict, ...]:
     调用方据此保持"零影响"。
     """
     texts: list[str] = []
+    # B1-01：hook 输出是数据（用户配置的自动化命令产物）——入上下文前
+    # 中和保留标记，防伪造标记与误截断；头部标记是协议、保持原样。
+    from core.injection_markers import neutralize_reserved_markers
+
     for text in contexts or ():
         text = str(text or "").strip()
         if text:
-            texts.append(text)
+            texts.append(neutralize_reserved_markers(text))
     if not texts:
         return ()
     header = f"【{event_name} hook 追加上下文】"

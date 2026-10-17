@@ -1,5 +1,9 @@
 <template>
-  <div id="input-area" data-theme-region="composer" :class="{ 'is-resizing': isResizing }">
+  <div
+    id="input-area"
+    data-theme-region="composer"
+    :class="{ 'is-resizing': isResizing, 'right-panel-open': !store.rightPanelCollapsed }"
+  >
     <!-- 顶边拖拽手柄：向上拖抬高输入框（多显示几行），向下拖以默认高度为下限；
          双击恢复默认高度 -->
     <div
@@ -43,6 +47,38 @@
     </div>
 
     <div id="input-wrap">
+      <!-- QQ2009 皮肤专属：经典工具栏行（仅内置 QQ2009 主题激活时渲染；
+           只接入真实存在的功能，样式在 themes/qq2009.css，本组件不加样式） -->
+      <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-toolbar" data-test="qq09-toolbar">
+        <!-- 图片：星瑶的图片发送与文件共用同一个附件入口（pick_files 系统对话框，
+             图片扩展名会被识别出缩略图），无独立图片菜单，故与「文件」同调 onAttachClick -->
+        <button
+          type="button"
+          class="qq09-tb-btn"
+          data-test="qq09-tb-image"
+          title="发送图片：打开附件选择（png / jpg / gif / webp 等，选中后显示缩略图）"
+          @click="onAttachClick"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4.5" width="18" height="15" rx="2.5" />
+            <circle cx="8.5" cy="9.5" r="1.6" />
+            <path d="M4 17.8l4.8-4.8 3.4 3.4 3-2.8 4.8 4.8" />
+          </svg>
+        </button>
+        <!-- 文件：同一附件入口，任意格式文件都可选 -->
+        <button
+          type="button"
+          class="qq09-tb-btn"
+          data-test="qq09-tb-file"
+          title="发送文件：打开附件选择（任意格式，可多选）"
+          @click="onAttachClick"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3.5 7.2a2 2 0 0 1 2-2h3.4l1.8 2h8.2a2 2 0 0 1 2 2v7.6a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2z" />
+            <path d="M7.5 11.5h9" />
+          </svg>
+        </button>
+      </div>
       <div id="input-box" ref="inputBoxRef" :class="{ 'drop-hover': dragging }">
         <AttachmentChips :items="attachments" @remove="removeAttachment" @open="openAttachmentImage" />
         <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->
@@ -73,6 +109,14 @@
             title="附加文件"
             @click.stop="onAttachClick"
           ><AppIcon name="paperclip" :size="14" /></button>
+          <!-- 屏幕截图：全屏框选屏幕任意区域；截图「发到输入框」后后端经
+               snip_attachment_ready 桥事件回传路径，由 store 加入输入框附件 -->
+          <button
+            data-test="screen-snip-button"
+            class="chip-btn snip-btn"
+            title="截图：框选屏幕任意区域"
+            @click.stop="onScreenSnipClick"
+          ><AppIcon name="scissors" :size="14" /></button>
           <!-- 触摸设备隐藏文件入口：点击后由系统弹出拍照/相册/文件选择 -->
           <input ref="touchFileInputRef" type="file" multiple style="display:none" @change="onPickInputChange">
           <button
@@ -90,7 +134,6 @@
             :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
           ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
-
           <!-- 上下文统计圆环：弧线占比 = 已用上下文/窗口；悬停弹出用量详情面板，
                触摸设备点按切换（面板见 ContextUsagePanel） -->
           <span
@@ -157,12 +200,24 @@
       :anchor-el="permBtnRef"
       @close="showPermDropdown = false"
     />
+    <!-- 会话 token 弹层：点击状态行摘要向上弹出（本会话/全部/会话列表） -->
+    <TokenUsagePopover
+      :visible="showTokenPopover"
+      :anchor-el="tokenSummaryRef"
+      @close="showTokenPopover = false"
+    />
 
     <!-- 触摸设备不再使用应用内附件菜单：点回形针直接唤起系统文件选择器 -->
 
     <div id="input-meta">
       <div class="l">
-        <span class="token-summary" :title="summaryTitle">{{ tokenSummary }}</span>
+        <span
+          ref="tokenSummaryRef"
+          class="token-summary token-summary-clickable"
+          data-test="token-summary"
+          :title="summaryTitle"
+          @click.stop="toggleTokenPopover"
+        >{{ tokenSummary }}</span>
       </div>
       <div class="r keyboard-hints" data-test="keyboard-hints">
         <span class="ctx-percent" :class="tokenClass" :title="ctxTooltip">{{ ctxPctLabel }}</span>
@@ -181,6 +236,7 @@ import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
 import ContextUsagePanel from './ContextUsagePanel.vue';
 import PermDropdown from './PermDropdown.vue';
+import TokenUsagePopover from './TokenUsagePopover.vue';
 import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
@@ -188,7 +244,7 @@ import { useAttachments } from '../composables/useAttachments';
 import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
 import { useComposerResize } from '../composables/useComposerResize';
-import { buildTokenSummary, formatTokenCount } from '../utils/tokenFormat';
+import { buildSessionTokenSummary, formatTokenCount } from '../utils/tokenFormat';
 
 const store = useAppStore();
 const inputVal = computed<string>({
@@ -202,6 +258,8 @@ const showPermDropdown = ref(false);
 const modelBtnRef = ref<HTMLElement | null>(null);
 const permBtnRef = ref<HTMLElement | null>(null);
 const reasoningSelectorRef = ref<{ close: () => void } | null>(null);
+const showTokenPopover = ref(false);
+const tokenSummaryRef = ref<HTMLElement | null>(null);
 
 function closeComposerMenus() {
   showModelCascader.value = false;
@@ -211,13 +269,20 @@ function closeComposerMenus() {
 function toggleModelCascader() {
   reasoningSelectorRef.value?.close();
   showPermDropdown.value = false;
+  showTokenPopover.value = false;
   showModelCascader.value = !showModelCascader.value;
 }
 
 function togglePermDropdown() {
   reasoningSelectorRef.value?.close();
   showModelCascader.value = false;
+  showTokenPopover.value = false;
   showPermDropdown.value = !showPermDropdown.value;
+}
+
+function toggleTokenPopover() {
+  closeComposerMenus();
+  showTokenPopover.value = !showTokenPopover.value;
 }
 
 const tokenPct = computed(() => {
@@ -231,11 +296,13 @@ const tokenClass = computed(() => {
   return '';
 });
 
-// 状态栏摘要：与 CLI（main.py get_status）同口径——输入/输出/命中，命中率分母为输入
-const tokenSummary = computed(() => buildTokenSummary(store.tokenUsage));
+// 状态栏摘要：本会话口径（token_usage 落库聚合，重启不清零）；
+// 点击弹出会话明细（全部会话合计 + 会话列表）。命中率分母只含已报告
+// 缓存明细的轮次（未报告 ≠ 0），比旧全局口径的 cached/prompt 更真实
+const tokenSummary = computed(() => buildSessionTokenSummary(store.tokenUsage.session_totals));
 const summaryTitle = computed(() => (
   store.tokenUsage.cache_invalidation_reason
-  || '会话累计 Token（输入 / 输出 / 缓存命中），口径与 CLI 状态栏一致'
+  || '本会话 Token 统计（输入 / 输出 / 缓存命中，重启不清零）· 点击查看全部会话'
 ));
 
 // 上下文圆环：周长固定，弧长按占用百分比推进，悬停显示用量详情
@@ -353,6 +420,22 @@ function onAttachClick() {
   touchFileInputRef.value?.click();
 }
 
+// 屏幕截图：调后端打开全屏框选遮罩窗口；截图结果经桥事件
+// snip_attachment_ready 回传（见 appStore._attachSnipToComposer）
+async function onScreenSnipClick() {
+  const api = window.pywebview?.api;
+  if (!api?.screen_snip_start) {
+    store.notifyChat('桌面桥未就绪，无法使用截图');
+    return;
+  }
+  try {
+    const res = await api.screen_snip_start();
+    if (res && !res.ok) store.notifyChat(res.msg || '截图启动失败');
+  } catch {
+    store.notifyChat('截图启动失败：桥接调用异常');
+  }
+}
+
 async function onPickInputChange(e: Event) {
   const input = e.target as HTMLInputElement;
   const files = Array.from(input.files || []);
@@ -435,6 +518,10 @@ async function undoQueue(item: QueuedMessage) {
 #input-wrap {
   max-width: var(--chat-col-width);
   margin: 0 auto;
+  /* 图标化收纳档位的容器：挤压来自两侧面板展开而非窗口变窄，
+     媒体查询感知不到，按此容器宽度分档（见文件末尾 @container） */
+  container-type: inline-size;
+  container-name: composer;
 }
 
 /* 排队消息条：输入框上方逐条展示回合运行期间发送的排队消息 */
@@ -553,12 +640,25 @@ textarea {
   gap: 5px;
   cursor: pointer;
   transition: 0.15s;
+  /* 侧栏展开挤压输入栏时按钮被压缩，CJK 文本会逐字换行把按钮撑成
+     多行“竖条”、与其他按钮高低不一——文字一律单行，收缩交给可截断的
+     模型/分支按钮（见下），固定文案按钮禁止压缩 */
+  white-space: nowrap;
 }
 .plus-btn {
   font-size: 14px;
   font-weight: 600;
   padding: 3px 10px;
   line-height: 1.2;
+  flex-shrink: 0;
+}
+.permission-mode-btn,
+.sandbox-btn {
+  flex-shrink: 0;
+}
+/* 输入栏内按钮统一高度：回形针等图标按钮与文字胶囊不出现高低差 */
+#input-bar .chip-btn {
+  min-height: 28px;
 }
 .chip-btn:hover {
   border-color: var(--text-faint);
@@ -576,6 +676,9 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   display: inline-block;
+  /* 唯一允许被挤压的按钮：min-width:0 解除 flex 最小内容宽度限制，
+     空间不足时以省略号收缩而不是换行撑高 */
+  min-width: 0;
 }
 
 /* 上下文统计圆环：margin-left:auto 把它与模型/发送按钮一起顶到右侧（红圈位置）；
@@ -648,13 +751,30 @@ textarea {
   justify-content: space-between;
   font-size: 11.5px;
   color: var(--text-faint);
+  /* 元信息条收纳档位的容器：右侧栏展开挤窄中列时媒体查询感知不到，
+     按自身实际宽度分档隐藏（见文件末尾 @container input-meta） */
+  container-type: inline-size;
+  container-name: input-meta;
 }
 #input-meta .l {
   display: flex;
   gap: 12px;
+  /* 允许收缩配合省略号：token 摘要不换行，缺 min-width 会溢出压到右侧提示上 */
+  min-width: 0;
 }
 .token-summary {
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 状态行摘要可点击（弹出会话 token 面板）：加悬停反馈但不抢视觉 */
+.token-summary-clickable {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.15s;
+}
+.token-summary-clickable:hover {
+  color: var(--text);
 }
 .kbd {
   background: var(--bg3);
@@ -663,7 +783,12 @@ textarea {
   padding: 1px 5px;
   font-size: 10px;
 }
-/* 上下文百分比：仅手机端元信息条右侧显示（桌面该位置是快捷键提示） */
+/* 快捷键提示不参与收缩：窄时按档位整块隐藏，绝不折行叠到摘要上 */
+.keyboard-hints {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+/* 上下文百分比：桌面默认隐藏，手机端或空间不足档位时顶替快捷键提示的位置 */
 .ctx-percent {
   display: none;
   white-space: nowrap;
@@ -680,6 +805,57 @@ textarea {
 .model-icon,
 .sandbox-label-short {
   display: none;
+}
+
+/* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
+   两侧面板展开挤窄输入栏时禁止按钮换行/压成竖条，按 #input-wrap 容器
+   宽度分档收纳，任何档位都保持单行：
+   ≤540 权限/模型转手机版纯图标；
+   ≤430 沙盒收成 开/限 */
+@container composer (max-width: 540px) {
+  .permission-mode-btn .perm-label,
+  .permission-mode-btn .permission-chevron,
+  .model-chip .model-label,
+  .model-chip .model-chevron {
+    display: none;
+  }
+  .perm-icon,
+  .model-icon {
+    display: inline-flex;
+  }
+}
+@container composer (max-width: 430px) {
+  .sandbox-label-full {
+    display: none;
+  }
+  .sandbox-label-short {
+    display: inline;
+  }
+}
+
+/* ── 元信息条收纳（右侧栏展开 / 窄窗口 / 手机端）──
+   token 摘要与快捷键提示加起来约 600px，中间列被右侧栏挤窄后互相重叠。
+   右侧栏展开时按用户要求整行不显示快捷键提示；再按 #input-meta 实际宽度
+   兜底分档：≤640 提示换位为上下文百分比，≤540（手机竖屏宽度）连 token
+   摘要一起隐藏，完整数据仍在底栏与点击弹层中可查 */
+#input-area.right-panel-open .keyboard-hints .hint-full {
+  display: none;
+}
+#input-area.right-panel-open .ctx-percent {
+  display: inline;
+}
+@container input-meta (max-width: 640px) {
+  .keyboard-hints .hint-full {
+    display: none;
+  }
+  .ctx-percent {
+    display: inline;
+  }
+}
+@container input-meta (max-width: 540px) {
+  .token-summary {
+    display: none;
+  }
 }
 
 @media (max-width: 768px) {

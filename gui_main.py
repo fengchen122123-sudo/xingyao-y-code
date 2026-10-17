@@ -208,6 +208,115 @@ def _clear_stale_webview_cache():
         logger.debug("清理 WebView2 缓存失败（不影响启动）", exc_info=True)
 
 
+# 前端产物运行期监控参数：每 2 秒采样一次；发现与基线不同后等 1.5 秒复核
+# （vite build 会先清理/覆盖 dist，期间存在"文件缺失或指纹抖动"的中间态，
+# 必须等构建落盘、复核指纹稳定后才视为有效变更）。
+_DIST_WATCH_INTERVAL_SECONDS = 2.0
+_DIST_WATCH_CONFIRM_SECONDS = 1.5
+
+
+def _frontend_dist_fingerprint():
+    """采样 frontend/dist/index.html 的构建指纹：(int(mtime), size)；缺失返回 None。
+
+    路径与指纹算法和启动期 _clear_stale_webview_cache 保持一致——两处判定
+    必须是同一个"构建标识"，避免运行期变更通知与启动期缓存清理对不上。
+    任何采样失败（文件不存在、构建中被独占删除等）都返回 None，不抛异常。
+    """
+    try:
+        index_path = os.path.join(_get_base_dir(), "frontend", "dist", "index.html")
+        stat = os.stat(index_path)
+    except OSError:
+        return None
+    return (int(stat.st_mtime), stat.st_size)
+
+
+def _frontend_dist_watch_loop(
+    sampler=None,
+    emit=None,
+    stop_event=None,
+    sleep_fn=None,
+    interval=_DIST_WATCH_INTERVAL_SECONDS,
+    confirm_seconds=_DIST_WATCH_CONFIRM_SECONDS,
+):
+    """前端产物运行期变更监控核心循环（依赖全部可注入，便于单测）。
+
+    判定规则：
+    1. 先取一次基线（值即使为 None 也记录：启动时本就没有 dist 不算"变更"）；
+    2. 每 interval 秒采样一次，与基线相同则继续等待；
+    3. 发现不同后等待 confirm_seconds 再复核：复核指纹与首次发现一致且不为
+       None（构建已完成、文件存在）才算有效变更——更新基线并 emit 通知；
+       复核不一致或文件仍缺失（仍处于构建中间态）则不推送、不更新基线，
+       后续循环再采样重新判定；
+    4. 去重由基线机制保证：基线更新后同一指纹不会重复触发推送。
+    stop_event 被 set 后在下一次等待点退出（调用方的收集线程为 daemon 兜底）。
+    """
+    sampler = sampler or _frontend_dist_fingerprint
+    emit = emit if emit is not None else (lambda _fingerprint: None)
+    sleep_fn = sleep_fn or time.sleep
+
+    def _stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    def _wait(seconds: float) -> bool:
+        """等待 seconds 秒；返回 True 表示收到停止请求（调用方应立即退出）。"""
+        if stop_event is not None:
+            return bool(stop_event.wait(seconds))
+        sleep_fn(seconds)
+        return False
+
+    baseline = sampler()
+    while not _stopped():
+        if _wait(interval):
+            return
+        current = sampler()
+        if current == baseline:
+            continue
+        # 首次发现变化：先等构建写盘，再复核是否稳定
+        if _wait(confirm_seconds):
+            return
+        confirmed = sampler()
+        if confirmed is None or confirmed != current:
+            continue
+        baseline = confirmed
+        fingerprint = f"{confirmed[0]}:{confirmed[1]}"
+        logger.info("检测到前端产物运行期更新（%s），已通知前端刷新", fingerprint)
+        try:
+            emit(fingerprint)
+        except Exception:
+            # 通知失败不影响继续监控（best-effort，与启动流程各看门狗一致）
+            logger.exception("推送前端产物更新事件失败")
+
+
+def _start_frontend_dist_watchdog(api):
+    """启动前端产物运行期变更监控线程（daemon，name="gui-dist-watchdog"）。
+
+    背景：运行中的 WebView2 页面已按旧构建哈希加载 chunk，重新构建
+    frontend/dist 后旧哈希 chunk 404（典型表现：mermaid 报「渲染器加载失败」）。
+    本线程 2 秒采样 dist/index.html 指纹，确认构建完成后经事件管线推送
+    frontend_dist_updated（payload: fingerprint "mtime:size"），由前端自愈
+    刷新；本线程只负责感知与通知，不清缓存、不改动 dist_fingerprint.txt。
+    返回 stop_event 句柄：GUI 退出收尾时 set() 停止（daemon=True 兜底）。
+    """
+    stop_event = threading.Event()
+
+    def _emit(fingerprint: str) -> None:
+        # 后台线程安全：emit_event 内部走 _queue_js_payload 单消费者派发
+        api.emit_event("frontend_dist_updated", {"fingerprint": fingerprint})
+
+    def _watch():
+        try:
+            _frontend_dist_watch_loop(emit=_emit, stop_event=stop_event)
+        except Exception:
+            # 监控是 best-effort：线程异常绝不能影响 GUI 主流程
+            logger.exception("前端产物运行期监控线程异常退出")
+
+    try:
+        threading.Thread(target=_watch, daemon=True, name="gui-dist-watchdog").start()
+    except Exception:
+        logger.exception("启动前端产物监控线程失败（前端将不会感知运行期重建）")
+    return stop_event
+
+
 def is_port_open(host="127.0.0.1", port=5173) -> bool:
     """检查 Vite 开发服务器端口 5173 是否处于打开监听状态"""
     try:
@@ -239,6 +348,34 @@ def _get_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _frontend_missing_dialog(message: str) -> bool:
+    """前端入口缺失时的原生告警（不依赖 WebView，可显示任何内容的弹窗）。
+
+    打包版是 console=False 的 GUI 子系统程序：stderr 无处可看，用户面对的是
+    "双击图标毫无反应、无日志、无弹窗"。这里在退出前用 Windows 原生
+    MessageBoxW（MB_ICONERROR | MB_TOPMOST）把问题与修复建议直接摆到用户面前；
+    非 Windows（或弹窗失败）回退 stderr 打印。返回 True 表示已用原生弹窗告知。
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                message,
+                "星瑶Code · 启动失败",
+                0x10 | 0x00040000,  # MB_ICONERROR | MB_TOPMOST
+            )
+            return True
+        except Exception:
+            logger.exception("前端入口缺失告警弹窗失败（回退 stderr）")
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+    return False
+
+
 def get_frontend_url() -> str:
     # 1. 优先检查 Vite 实时热更新开发服务 (http://localhost:5173)
     #    仅限源码开发模式：打包后的安装版绝不能走这条——用户机器上任何
@@ -259,7 +396,22 @@ def get_frontend_url() -> str:
         print(f"Loading compiled Vue 3 production dist from: {dist_path}")
         return dist_path
 
+    # 3. 两个入口都不存在：启动无法继续。绝不能只 print+exit——打包版没有
+    #    控制台（console=False），用户看到的是"双击无反应"。先弹不依赖 WebView
+    #    的原生告警（含期望路径与修复建议），再退出。
     print(f"Error: No valid frontend entry point found!", file=sys.stderr)
+    logger.error(
+        "未找到前端入口（期望 %s）",
+        os.path.join(base_dir, "frontend", "dist", "index.html"),
+    )
+    _frontend_missing_dialog(
+        "未找到前端入口文件，星瑶Code 无法启动。\n\n"
+        f"期望的前端入口：\n{dist_path}\n"
+        "（即程序目录下的 frontend/dist/index.html）\n\n"
+        "请重新安装 星瑶Code；如果是源码运行，请在 frontend 目录执行\n"
+        "npm install 后 npm run build 重新构建前端产物。\n\n"
+        f"运行日志：{_data_dir() / 'logs' / 'gui-runtime.log'}"
+    )
     sys.exit(1)
 
 
@@ -290,11 +442,6 @@ def _initial_gui_theme() -> dict:
         "background": "#1a1a18",
         "error": startup_error.as_dict(),
     }
-
-
-def _initial_theme_light() -> bool:
-    """Compatibility helper retained for callers from the boolean-theme release."""
-    return _initial_gui_theme()["appearance"] == "light"
 
 
 def _build_gui_theme_fragment(gui_theme: dict) -> str:
@@ -498,7 +645,9 @@ def _create_main_window(api, url: str, gui_theme: dict):
         title="星瑶Code · 星瑶",
         url=url,
         js_api=api,
-        width=1320,
+        # 默认宽度演变：初版 1320 → 缩 15%（1122，缓解宽屏下对话行过长）→
+        # 回调 5%（1178）；用户可随时拖拽调节，高度与最小尺寸不变
+        width=1178,
         height=840,
         min_size=(960, 640),
         text_select=True,
@@ -600,6 +749,30 @@ def main():
         mcp_manager = None
     api = ApiBridge(mcp_manager=mcp_manager)
     _start_preload_thread()
+    # 星瑶浏览器自动化默认走 GUI 内置浏览器：注入进程级默认值（仅影响
+    # 配置缺省，不覆盖用户显式设置）与 CDP endpoint 提供者（embedded 专属，
+    # 确保内嵌控件带调试端口并通知前端面板呈现项目分辨率）。失败只留痕。
+    try:
+        from core.computer.controller import get_computer_control_service
+        from core.computer.settings import (
+            register_browser_viewport_listener,
+            set_process_default_browser,
+        )
+
+        set_process_default_browser("embedded")
+        get_computer_control_service().set_embedded_endpoint_provider(
+            api.embedded_browser_automation_endpoint
+        )
+
+        def _on_browser_viewport_changed(_workdir, viewport):
+            api.emit_event(
+                "embedded_browser_automation",
+                {"width": viewport[0], "height": viewport[1]},
+            )
+
+        register_browser_viewport_listener(_on_browser_viewport_changed)
+    except Exception:
+        logger.exception("接线内置浏览器自动化通道失败（保持外部浏览器可用）")
 
     # 启动前环境体检：Windows GUI 走 pywebview 的 edgechromium 后端，强依赖系统
     # WebView2 Runtime。该运行时缺失/损坏时 pywebview 的 on_webview_ready 只记一条
@@ -690,6 +863,12 @@ def main():
 
     _register_bridge_watchdog()
 
+    # 前端产物运行期变更监控：运行中的页面已按旧构建哈希加载 chunk，重建
+    # dist 后旧哈希 chunk 404（表现为 mermaid「渲染器加载失败」）。这里 2 秒
+    # 采样一次 dist/index.html 构建指纹，确认构建完成后经事件管线推送
+    # frontend_dist_updated，由前端自愈刷新（本线程只负责感知与通知）。
+    dist_watchdog_stop = _start_frontend_dist_watchdog(api)
+
     # pywebview 6.2+ 的拖拽文件完整路径注入：WebView2 只在
     # _dnd_state['num_listeners'] > 0（即通过 dom.on('drop') 注册过）时才
     # 放行系统层拖拽事件。前端原生 addEventListener 不会增加计数，
@@ -756,6 +935,10 @@ def main():
     finally:
         # 退出收尾固定顺序（Task 16）：回合级 shutdown（含取消/线程 drain）
         # 先于电脑操控运行时统一关闭；异常路径同样经过本 finally。
+        # 前端产物监控线程先停：webview 主循环已结束，无前端可通知
+        # （daemon=True 兜底，句柄为 None 时跳过，退出收尾不受影响）。
+        if dist_watchdog_stop is not None:
+            dist_watchdog_stop.set()
         _finalize_gui_exit(lifecycle)
         _remove_instance_info()
 

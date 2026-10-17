@@ -21,6 +21,7 @@ from core.llm_policy import (
     get_model_policy,
     DEFAULT_USER_AGENT,
     tokenrhythm_agent_headers,
+    session_id_headers,
 )
 
 logger = logging.getLogger(__name__)
@@ -550,7 +551,9 @@ def _resolve_endpoint_and_headers(
         elif kind == "dashscope":
             url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
         elif kind == "minimax":
-            url = "https://api.minimax.chat/v1/text/chatcompletion_v2"
+            # 兜底 URL 用官方现行域名（与 model_catalog 预置一致；旧域名
+            # api.minimax.chat 仍可被 llm_policy 识别，但不再作为默认）
+            url = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
         else:
             url = "https://api.openai.com/v1/chat/completions"
 
@@ -576,9 +579,10 @@ def _resolve_endpoint_and_headers(
     if effective_key:
         headers["Authorization"] = f"Bearer {effective_key}"
 
-    # 合并方言默认头、基元律动标识头与外部追加头
+    # 合并方言默认头、基元律动标识头、会话关联头与外部追加头
     headers.update(policy.default_headers)
     headers.update(tokenrhythm_agent_headers(url))
+    headers.update(session_id_headers())
     if extra_headers:
         headers.update(extra_headers)
 
@@ -886,6 +890,7 @@ def _anthropic_resolve_endpoint(
     if effective_key:
         headers["x-api-key"] = effective_key
     headers.update(tokenrhythm_agent_headers(url))
+    headers.update(session_id_headers())
     if extra_headers:
         headers.update(extra_headers)
     return url, headers
@@ -1030,7 +1035,20 @@ def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Di
             blocks = [{"type": "text", "text": ""}]
         if cache_ctrl:
             blocks[-1]["cache_control"] = cache_ctrl
-        out.append({"role": "user", "content": blocks})
+        # 相邻 user 消息并入前一条：OpenAI 序列 assistant(tool_calls) → tool(...)
+        # → user(编排提醒/follow-up 注入) 翻译后会出现 user(tool_result) 与
+        # user(text) 相邻，Anthropic 严格角色交替校验直接 400
+        # "roles must alternate"，故文本块追加进前一条 user 的块列表
+        # （tool_result 在前、文本在后）。
+        prev = out[-1] if out else None
+        if (
+            isinstance(prev, dict)
+            and prev.get("role") == "user"
+            and isinstance(prev.get("content"), list)
+        ):
+            prev["content"].extend(blocks)
+        else:
+            out.append({"role": "user", "content": blocks})
 
     system: Optional[Any] = None
     if system_blocks:

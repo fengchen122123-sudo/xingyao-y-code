@@ -74,10 +74,10 @@ def _format_message_markdown(msg):
     role = msg.get('role', 'unknown')
     content = msg.get('content', '')
 
-    # 角色显示名
+    # 角色显示名：以“当前会话内的自称”为准（秘书会话 → 秘书名）
     try:
-        from core.persona_settings import get_agent_display_name
-        _assistant_label = get_agent_display_name()
+        from core.secretary import get_active_agent_name
+        _assistant_label = get_active_agent_name()
     except Exception:
         _assistant_label = "星瑶"
     role_display = {
@@ -208,9 +208,10 @@ def export_session_html(session_name, manager=None, output_path=None):
             'tool': 'tool',
         }.get(role, 'other')
 
+        # 角色显示名：以“当前会话内的自称”为准（秘书会话 → 秘书名）
         try:
-            from core.persona_settings import get_agent_display_name
-            _assistant_label = get_agent_display_name()
+            from core.secretary import get_active_agent_name
+            _assistant_label = get_active_agent_name()
         except Exception:
             _assistant_label = "星瑶"
         role_display = {

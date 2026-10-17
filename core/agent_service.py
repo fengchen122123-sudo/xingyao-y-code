@@ -17,9 +17,9 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-import tempfile
+import re
 import threading
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from core.injection_markers import (
     BG_SUMMARY_PREFIX as _BG_SUMMARY_PREFIX,
@@ -148,7 +148,14 @@ def evict_oldest_turn(history: list) -> bool:
     return True
 
 
-def load_system_prompt(is_gui: bool = False) -> str:
+# 秘书专用随包提示词文件名与名字占位符（2026-10-15 秘书身份：按会话分流）。
+# 秘书会话读这份并列契约文件，而不是运行时裁剪 system_prompt_gui.md——裁剪太脆，
+# 改一次人设就可能漏删段落。
+SECRETARY_PROMPT_FILENAME = "system_prompt_secretary_gui.md"
+SECRETARY_NAME_PLACEHOLDER = "{{secretary_name}}"
+
+
+def load_system_prompt(is_gui: bool = False, session_name: str | None = None) -> str:
     """读取系统提示词：只从随包文件加载（仓库内 / 安装版 _internal），不从用户目录读取。
 
     设计决策（2026-08-21）：系统提示词是应用行为契约的一部分，跟随安装包分发，
@@ -159,6 +166,31 @@ def load_system_prompt(is_gui: bool = False) -> str:
     GUI 读 system_prompt_gui.md，CLI 读 system_prompt.md。GUI 版包含"不支持斜杠
     命令、引导用户看右侧面板"等 GUI 专属规则，回退到 CLI 版会让星瑶在图形界面里
     建议用户使用根本不存在的 /mcp /tasks 等命令，属于必须避免的行为错乱。
+
+    按会话分流（2026-10-15，秘书身份）：``session_name`` 指向秘书会话时改读
+    并列文件 SECRETARY_PROMPT_FILENAME 并把名字占位符替换为该会话的秘书名；
+    文件缺失 / 读取失败一律回落普通路径（回落文本里的默认名也换成秘书名），
+    绝不抛错——身份出错是观感问题，整轮对话失败是可用性问题。
+    非秘书路径（含不传 session_name）与改动前逐字节一致。
+    """
+    try:
+        from core.secretary import is_secretary_session
+
+        if is_secretary_session(session_name):
+            secretary_prompt = _load_secretary_system_prompt(is_gui, session_name)
+            if secretary_prompt:
+                return secretary_prompt
+    except Exception as e:
+        # 分流失败不是致命错误：回落到普通路径，保证本轮对话照常进行
+        logging.warning("秘书 system prompt 分流失败，回落普通提示词: %s", e)
+    return _load_plain_system_prompt(is_gui)
+
+
+def _load_plain_system_prompt(is_gui: bool = False) -> str:
+    """普通会话的提示词读取路径（2026-10-15 分流改造前的原实现，逐字保留）。
+
+    为什么原样拆成独立函数：非秘书路径必须与改动前逐字节相同（sha256 golden 守护），
+    秘书分流只在外层 load_system_prompt 判断，绝不改动这里的任何行为。
     """
     system_prompt = ""
     try:
@@ -182,7 +214,79 @@ def load_system_prompt(is_gui: bool = False) -> str:
     return system_prompt
 
 
-def _render_stable_system_extra_sections() -> tuple[list[str], int]:
+def _replace_default_agent_name(text: str, name: str) -> str:
+    """把提示词文本里的智能体名字替换为 ``name``（只用于秘书回落路径）。
+
+    为什么要替换：普通提示词与最终兜底文本里写着默认名（星瑶）。若原样返回，
+    模型会自称星瑶而用户以为秘书叫「星河」——身份自相矛盾比缺一个文件更糟。
+    名字按"默认名 → 设置页名"顺序各替换一次，两者相同或与目标名相同则跳过。
+    """
+    if not text or not name:
+        return text
+    candidates = ["星瑶"]
+    try:
+        from core import persona_settings
+
+        candidates = [
+            persona_settings.DEFAULT_AGENT_NAME,
+            persona_settings.get_agent_display_name(),
+        ]
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate and candidate != name:
+            text = text.replace(candidate, name)
+    return text
+
+
+def _load_secretary_system_prompt(is_gui: bool, session_name) -> str:
+    """秘书会话的提示词：读随包秘书文件 + 替换名字占位符；失败回落普通提示词。
+
+    为什么用 str.replace 而不是 str.format：提示词正文里有大量其它花括号
+    （代码示例、JSON 片段），format 会直接抛异常把整轮对话打挂。
+    返回值保证非空：秘书文件读不到时回落普通提示词（默认名已换成秘书名）。
+    """
+    secretary_name = ""
+    try:
+        from core.secretary import FALLBACK_SECRETARY_NAME, get_secretary_name
+
+        secretary_name = get_secretary_name(session_name) or FALLBACK_SECRETARY_NAME
+    except Exception:
+        # 秘书模块不可用也要给出身份，用兜底名保证提示词不出现"无人称"状态
+        secretary_name = "秘书"
+    try:
+        prompt_path = os.path.join(_repo_root(), SECRETARY_PROMPT_FILENAME)
+        if os.path.exists(prompt_path):
+            with open(prompt_path, "r", encoding="utf-8") as f:
+                secretary_prompt = f.read().strip()
+            if secretary_prompt:
+                return secretary_prompt.replace(
+                    SECRETARY_NAME_PLACEHOLDER, secretary_name
+                )
+    except Exception as e:
+        logging.warning("读取秘书 system prompt 失败: %s", e)
+    # 文件缺失 / 为空 / 读取失败：回落普通提示词，并把默认名换成秘书名
+    return _replace_default_agent_name(_load_plain_system_prompt(is_gui), secretary_name)
+
+
+def _is_secretary_session_for_render(session_name) -> bool:
+    """渲染期判断是否秘书会话；未给会话名 / 异常一律按普通会话处理（False）。
+
+    为什么未给会话名时不回落到"当前会话"：不传 session_name 的是 Token 估算与
+    测试路径，必须与改动前逐字节一致，不能因为当前会话恰好是秘书会话而改变渲染。
+    秘书会话的每次真实请求都由 build_stable_system_message 带上 session_name。
+    """
+    if not session_name:
+        return False
+    try:
+        from core.secretary import is_secretary_session
+
+        return bool(is_secretary_session(session_name))
+    except Exception:
+        return False
+
+
+def _render_stable_system_extra_sections(session_name=None) -> tuple[list[str], int]:
     """稳定前缀中「build_stable_prompt 之外」的段落（注入点 2，规格 02 §2.2）。
 
     本函数是无快照的原始渲染逻辑，会话级快照包装见 ``build_stable_system_extra_sections``。
@@ -199,6 +303,10 @@ def _render_stable_system_extra_sections() -> tuple[list[str], int]:
 
     本段与 GUI / CLI 口径无关，故不接受 is_gui 参数。
 
+    秘书会话（2026-10-15）跳过设置页人设块（按 ``session_name`` 判定）：秘书有自己的
+    身份（名字 + 并列的秘书契约文件），设置页的名称覆盖、称呼约定与自定义人设都不
+    适用，注入会让两套身份在同一份提示词里互相打架。其余段落与顺序完全不变。
+
     返回值第二项为技能目录段的字符量（空白目录记 0），与段落同源定格：
     供上下文来源统计与「系统提示词」做减项，避免会话中途技能变更后
     统计值与快照实际字节不一致（2026-09-23 修复）。
@@ -207,14 +315,16 @@ def _render_stable_system_extra_sections() -> tuple[list[str], int]:
     skills_len = 0
     # 人设设置块：仅当用户在设置页自定义了名称/称呼/人设时非空；
     # 默认配置返回空串，不影响 byte-stability。跨轮不变，归入稳定前缀。
-    try:
-        from core.persona_settings import build_persona_prompt_block
+    # 秘书会话一律不注入（见函数 docstring）。
+    if not _is_secretary_session_for_render(session_name):
+        try:
+            from core.persona_settings import build_persona_prompt_block
 
-        persona_block = build_persona_prompt_block()
-        if persona_block:
-            parts.append(persona_block)
-    except Exception:
-        pass
+            persona_block = build_persona_prompt_block()
+            if persona_block:
+                parts.append(persona_block)
+        except Exception:
+            pass
     parts.append(_GENERAL_CODING_STANDARDS)
     try:
         import core.memory_kairos as memory_kairos
@@ -259,6 +369,7 @@ def build_stable_system_extra_sections(session_name=None) -> list[str]:
     """注入点 2 的段落列表；给定会话名时按会话首请求的字节定型（会话级快照）。
 
     返回 list 副本，调用方对返回值的任何改动都不会污染快照本身。
+    会话名同时透传给渲染层：秘书会话据此跳过设置页人设块（2026-10-15）。
     """
     key = str(session_name or "").strip()
     if key:
@@ -266,7 +377,7 @@ def build_stable_system_extra_sections(session_name=None) -> list[str]:
             cached = _SESSION_STABLE_SECTIONS.get(key)
         if cached is not None:
             return list(cached[0])
-    parts, skills_len = _render_stable_system_extra_sections()
+    parts, skills_len = _render_stable_system_extra_sections(session_name)
     if key:
         with _SESSION_STABLE_SECTIONS_LOCK:
             _SESSION_STABLE_SECTIONS[key] = (tuple(parts), skills_len)
@@ -682,21 +793,51 @@ def _digest_one_session(manager, name, info):
     return body
 
 
+def _normalize_ref_lookup_key(name) -> str:
+    """@{...} 引用名的宽松匹配键：去掉花括号与空白、统一小写。
+
+    历史上前端插入引用时会剥掉名字里的花括号（useSuggest 的
+    replace(/[{}]/g, '')），而会话名里可能残留 @{...} 标记残渣
+    （「@{缓存改造} 阅读一下」「@{我这个自然语言交互如」）。两边同键
+    归一后这类名字才能被引用命中，而不是被误判为「不存在或已删除」。
+    """
+    return re.sub(r"[{}\s]+", "", str(name or "")).lower()
+
+
 def build_referenced_sessions_block(manager, ref_names, current_session=None):
     """把 @{会话名} 引用的对话内容组装为上下文后缀块文本。
 
     注入发生在 token 估算之后，必须自行限额（_REF_TOTAL_MAX_CHARS）。
     自引用与不存在的会话如实标注「已跳过」，绝不抛错影响主流程。
+    会话名先按精确匹配查找，落空再按规范化键兜底（见 _normalize_ref_lookup_key）。
     """
     if not ref_names:
         return ""
     try:
-        existing = {
-            str(s.get("name") or ""): s
-            for s in manager.get_all_sessions(workdir=None, include_empty=True)
-        }
+        session_rows = manager.get_all_sessions(workdir=None, include_empty=True)
     except Exception:
-        existing = {}
+        session_rows = []
+    existing = {}
+    normalized = {}
+    for s in session_rows:
+        real_name = str(s.get("name") or "")
+        if not real_name:
+            continue
+        # setdefault：同名会话取列表中靠前者（get_all_sessions 按 id DESC，
+        # 即较新创建的会话），保留既有「后即最新」的直觉语义
+        existing.setdefault(real_name, s)
+        normalized.setdefault(_normalize_ref_lookup_key(real_name), s)
+
+    def _resolve(raw_name):
+        """把引用名解析为 (真实会话名, 会话信息)；解析不到返回 (None, None)。"""
+        info = existing.get(raw_name)
+        if info is not None:
+            return raw_name, info
+        info = normalized.get(_normalize_ref_lookup_key(raw_name))
+        if info is not None:
+            return str(info.get("name") or ""), info
+        return None, None
+
     # T1.3 信源声明：引用块直接拼接被引用会话的历史文本，属"数据"而非指令；
     # 标题标记（REF_SESSIONS_PREFIX）是 strip_context_suffix 的剥离锚点，逐字保持。
     intro = (
@@ -712,15 +853,20 @@ def build_referenced_sessions_block(manager, ref_names, current_session=None):
         if current_session and name == current_session:
             skipped.append(f"「{name}」是当前会话，已跳过")
             continue
-        info = existing.get(name)
+        resolved_name, info = _resolve(name)
         if info is None:
             skipped.append(f"「{name}」不存在或已删除，已跳过")
             continue
+        # 自引用判定用解析后的真实名：名字被花括号污染时，宽松命中后
+        # 仍需拦住「引用当前会话自己」，而不是当成一个不存在的会话
+        if current_session and resolved_name == current_session:
+            skipped.append(f"「{name}」是当前会话，已跳过")
+            continue
         try:
-            digest = _digest_one_session(manager, name, info)
+            digest = _digest_one_session(manager, resolved_name, info)
         except Exception:
             # 单个脏会话（畸形消息/存储异常）不能拖垮全部引用：如实标注后跳过
-            logger.warning("引用会话「%s」摘要组装失败，已跳过", name, exc_info=True)
+            logger.warning("引用会话「%s」摘要组装失败，已跳过", resolved_name, exc_info=True)
             skipped.append(f"「{name}」读取失败，已跳过")
             continue
         if total + len(digest) > _REF_TOTAL_MAX_CHARS:
@@ -800,11 +946,15 @@ def _trigger_background_precompress(
     api_base: str,
     cancel_event: Optional[threading.Event],
     notify: Optional[Callable[[str, str], None]],
+    done_event: Optional[threading.Event] = None,
 ) -> bool:
     """在后台守护线程提前触发记忆压缩（与 0.95 同步路径同一入口）。
 
     返回是否真正启动了线程。防抖 + 防重入：后台已有压缩在跑或距上次
     尝试不足冷却时间时直接跳过，绝不影响当前回合的组装流程。
+    done_event（可选）：压缩线程真正结束时置位。闲时维护靠它把
+    cancel_event 的注册期延长到压缩结束，否则线程发射后立即返回，
+    事件会在压缩起飞前就被弹出注册表、无法被回合开始中断。
     """
     import time as _time
 
@@ -854,6 +1004,9 @@ def _trigger_background_precompress(
         except Exception:
             # 预压缩是锦上添花：任何异常只记日志，绝不影响对话主流程
             logger.exception("会话 %s 后台预压缩异常", session_name)
+        finally:
+            if done_event is not None:
+                done_event.set()
 
     threading.Thread(
         target=_run,

@@ -1017,3 +1017,84 @@ def test_usage_model_label_cell_is_bounded_but_keeps_channel_and_scope():
     assert "…" in cell
     # 不超宽时原样返回，不做任何压缩
     assert main._truncate_visible("a/b", 60) == "a/b"
+
+
+def test_get_token_usage_by_session_aggregates_conversation_and_keepalive_separately():
+    """本会话口径：main/legacy 聚合为主，保活单列；未报告行不进命中率分母。"""
+    manager = MemoryManager(":memory:")
+    assert manager.get_token_usage_by_session("s1")["prompt"] == 0
+
+    # main 轮次：一轮已报告缓存（cached=5），一轮未报告（cached=None）
+    manager.add_token_usage(
+        "openai", "m1", 300, 30, 5, 335, session_id="s1",
+        api_base="https://a.example/v1", cache_scope="main", ts=1000,
+    )
+    manager.add_token_usage(
+        "openai", "m1", 200, 20, None, 220, session_id="s1",
+        api_base="https://a.example/v1", cache_scope="main", ts=2000,
+    )
+    # legacy 迁移行并入对话口径
+    manager.add_token_usage(
+        "openai", "m1", 100, 10, 50, 160, session_id="s1", cache_scope="legacy", ts=2500,
+    )
+    # 保活单列，绝不混进对话口径
+    manager.add_token_usage(
+        "openai", "m1", 10, 1, 10, 11, session_id="s1",
+        api_base="https://a.example/v1", cache_scope="keepalive", ts=2600,
+    )
+    # 其他会话不串数
+    manager.add_token_usage("openai", "m1", 999, 99, 0, 1098, session_id="s2")
+
+    totals = manager.get_token_usage_by_session("s1")
+    assert totals["prompt"] == 600
+    assert totals["completion"] == 60
+    assert totals["cached"] == 55
+    # 命中率分母只含已报告缓存明细的行：300 + 100 = 400（200 那轮未报告 ≠ 0）
+    assert totals["cache_prompt"] == 400
+    assert totals["total"] == 715
+    assert totals["requests"] == 3
+    assert totals["last_ts"] == 2500
+    assert totals["keepalive_prompt"] == 10
+    assert totals["keepalive_requests"] == 1
+
+    assert manager.get_token_usage_by_session("missing")["requests"] == 0
+
+
+def test_list_token_usage_by_sessions_orders_by_total_and_skips_deleted():
+    """会话列表按合计降序、只列现存会话；全部合计不分会话不分 scope。"""
+    manager = MemoryManager(":memory:")
+    manager.create_session_explicit("live-a")
+    manager.create_session_explicit("live-b")
+    # 残留流水行：sessions 表无同名会话（已删/从未存在），不应进列表
+    manager.add_token_usage("openai", "m1", 10000, 100, 0, 10100, session_id="deleted")
+
+    manager.add_token_usage("openai", "m1", 300, 30, 5, 335, session_id="live-a")
+    manager.add_token_usage("openai", "m1", 100, 10, 0, 110, session_id="live-b")
+    manager.add_token_usage(
+        "openai", "m1", 10, 1, 10, 11, session_id="live-a", cache_scope="keepalive",
+    )
+
+    rows = manager.list_token_usage_by_sessions(limit=10)
+    assert [row["session_id"] for row in rows] == ["live-a", "live-b"]
+    assert rows[0]["total"] == 335
+    assert rows[0]["cache_prompt"] == 300
+    assert rows[1]["total"] == 110
+    # 已删会话行不进列表，但进全部合计（真实计费）
+    totals = manager.get_token_usage_totals()
+    assert totals["prompt"] == 300 + 100 + 10000 + 10
+    assert totals["requests"] == 4
+
+
+def test_rename_session_migrates_token_usage_rows_in_same_transaction():
+    """改名必须随迁 token_usage.session_id，否则按会话统计静默丢历史。"""
+    manager = MemoryManager(":memory:")
+    manager.create_session_explicit("old-name")
+    manager.add_token_usage("openai", "m1", 300, 30, 5, 335, session_id="old-name")
+
+    success, final_name = manager.rename_session("old-name", "new-name")
+    assert success is True
+
+    moved = manager.get_token_usage_by_session("new-name")
+    assert moved["prompt"] == 300
+    assert moved["requests"] == 1
+    assert manager.get_token_usage_by_session("old-name")["requests"] == 0

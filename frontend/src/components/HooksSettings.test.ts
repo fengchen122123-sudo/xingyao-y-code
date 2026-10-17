@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 
-import Subpage from './Subpage.vue';
+import HooksSettings from './HooksSettings.vue';
 import { useAppStore } from '../stores/appStore';
 import type { HookInfo } from '../types/pywebview';
 
@@ -23,17 +23,12 @@ function makeHook(overrides: Partial<HookInfo> = {}): HookInfo {
   };
 }
 
-function mountSubpage(visible = true, api: Record<string, unknown> = {}) {
+function mountHooks(api: Record<string, unknown> = {}) {
   (window as any).pywebview = { api };
-  return mount(Subpage, {
-    props: {
-      visible,
-      subType: 'hooks' as const,
-    },
-  });
+  return mount(HooksSettings);
 }
 
-describe('Subpage - 钩子 Hooks 管理页', () => {
+describe('HooksSettings - 钩子 Hooks 管理分区', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
   });
@@ -42,8 +37,17 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     delete (window as any).pywebview;
   });
 
+  it('挂载时刷新一次 Hook 列表', () => {
+    const store = useAppStore();
+    const refreshSpy = vi.fn().mockResolvedValue(undefined);
+    store.refreshHooks = refreshSpy as any;
+
+    mountHooks();
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('无 Hook 时展示空态文案与新建入口', () => {
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     expect(wrapper.find('[data-test="hook-row"]').exists()).toBe(false);
     expect(wrapper.text()).toContain('尚未配置钩子');
     expect(wrapper.text()).toContain('.ycode/hooks.json');
@@ -75,7 +79,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
         status: 'revoked',
       }),
     ];
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
 
     const rows = wrapper.findAll('[data-test="hook-row"]');
     expect(rows).toHaveLength(3);
@@ -102,7 +106,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     store.grantHookTrust = grantSpy as any;
     store.denyHookTrust = denySpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     const rows = wrapper.findAll('[data-test="hook-row"]');
     expect(rows).toHaveLength(2);
 
@@ -129,7 +133,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     store.revokeHookTrust = revokeSpy as any;
     store.resetHookTrust = resetSpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     const rows = wrapper.findAll('[data-test="hook-row"]');
 
     // 已信任行不再展示信任/拒绝，只提供撤销入口
@@ -141,25 +145,14 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     expect(resetSpy).toHaveBeenCalledWith('d-proj-blocked');
   });
 
-  it('打开页面（visible 翻转为 true）时刷新 Hook 列表', async () => {
-    const store = useAppStore();
-    const refreshSpy = vi.fn().mockResolvedValue(undefined);
-    store.refreshHooks = refreshSpy as any;
-
-    const wrapper = mountSubpage(false);
-    expect(refreshSpy).not.toHaveBeenCalled();
-
-    await wrapper.setProps({ visible: true });
-    await flushPromises();
-    expect(refreshSpy).toHaveBeenCalledTimes(1);
-  });
-
   it('点击刷新按钮调用 store.refreshHooks', async () => {
     const store = useAppStore();
     const refreshSpy = vi.fn().mockResolvedValue(undefined);
     store.refreshHooks = refreshSpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
+    refreshSpy.mockClear();
+
     await wrapper.get('[data-test="refresh-hooks-btn"]').trigger('click');
     expect(refreshSpy).toHaveBeenCalledTimes(1);
   });
@@ -172,7 +165,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     const saveSpy = vi.fn().mockResolvedValue({ ok: true });
     store.saveHook = saveSpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     expect(wrapper.find('[data-test="hook-form-save"]').exists()).toBe(false);
 
     await wrapper.get('[data-test="hook-new-btn"]').trigger('click');
@@ -211,7 +204,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     const saveSpy = vi.fn().mockResolvedValue({ ok: true });
     store.saveHook = saveSpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     await wrapper.get('[data-test="hook-row"]').trigger('click');
 
     const cmdInput = wrapper.get('[data-test="hook-form-command"]');
@@ -240,7 +233,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     store.askConfirm = confirmSpy as any;
     store.deleteHook = deleteSpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     await wrapper.get('[data-test="hook-row"]').trigger('click');
     await wrapper.get('[data-test="hook-form-delete"]').trigger('click');
     await flushPromises();
@@ -260,7 +253,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     const deleteSpy = vi.fn().mockResolvedValue({ ok: true });
     store.deleteHook = deleteSpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     await wrapper.get('[data-test="hook-row"]').trigger('click');
     await wrapper.get('[data-test="hook-form-delete"]').trigger('click');
     await flushPromises();
@@ -283,7 +276,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     const toggleSpy = vi.fn().mockResolvedValue({ ok: true });
     store.setHookDisabled = toggleSpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     const sw = wrapper.get('[data-test="hook-toggle-switch"]');
     expect((sw.element as HTMLInputElement).checked).toBe(true);
     expect((sw.element as HTMLInputElement).disabled).toBe(false);
@@ -299,7 +292,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     const store = useAppStore();
     store.hooks = [makeHook({ digest: 'd-proj-pending', status: 'pending', disabled: false })];
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     const sw = wrapper.get('[data-test="hook-toggle-switch"]');
     expect((sw.element as HTMLInputElement).disabled).toBe(true);
   });
@@ -310,7 +303,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
       makeHook({ digest: 'd-search-guard', command: 'python ./scripts/guard.py', status: 'trusted' }),
       makeHook({ digest: 'd-search-fmt', event: 'Stop', command: 'npm run fmt', status: 'trusted' }),
     ];
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     expect(wrapper.findAll('[data-test="hook-row"]')).toHaveLength(2);
 
     await wrapper.get('[data-test="hook-search-input"]').setValue('guard');
@@ -335,7 +328,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
       }),
       makeHook({ digest: 'd-scope-proj', scope: 'project', command: 'npm run fmt', status: 'trusted' }),
     ];
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     expect(wrapper.findAll('[data-test="hook-row"]')).toHaveLength(2);
 
     await wrapper.get('[data-test="hook-scope-filter-user"]').trigger('click');
@@ -360,7 +353,7 @@ describe('Subpage - 钩子 Hooks 管理页', () => {
     store.saveHook = saveSpy as any;
     store.notifyModal = notifySpy as any;
 
-    const wrapper = mountSubpage();
+    const wrapper = mountHooks();
     await wrapper.get('[data-test="hook-new-btn"]').trigger('click');
     await wrapper.get('[data-test="hook-form-save"]').trigger('click');
     await flushPromises();

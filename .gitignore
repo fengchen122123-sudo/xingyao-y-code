@@ -88,7 +88,7 @@ test20*/
 # Runtime diagnostic output (playwright screenshots, contact sheets, etc.)
 output/
 
-# pytest ��ʱ����Ŀ¼
+# pytest 临时工作目录
 tmp/
 
 # 临时产物：图片生成脚本（内含密钥，严禁入库）与本地测试生成的图片/图表
@@ -115,9 +115,38 @@ docs/合规审查报告*
 docs/合规整改方案*
 docs/PII*
 
+# 内部审查/弱点报告（英文命名）：公开仓库即泄漏弱点清单，禁止入库/推送（A2-01）
+# 根目录审查与系统审查报告
+/代码审查与优化报告.md
+/系统审查报告-*.md
+# docs 顶层治理/审查/计算机控制测试报告
+docs/AUDIT-REMEDIATION-REPORT.md
+docs/REVIEW_TODO_*.md
+docs/HANDOVER-*.md
+docs/computer-audit-*
+docs/computer-control-audit-*
+docs/computer-control-repair-*
+docs/computer-repair-*
+docs/memory-compression-repair-*
+# superpowers 开发文档（plans/specs/reviews）整体不再跟踪
+docs/superpowers/
+
 hunyuan_*.jpg
 tokenrhythm_*.png
 .tmp_skill_src/
 build_*.log
 dryrun_*.log
 publish_*.log
+
+# Y-code GUI 本地运行数据（后台任务日志/计划/任务设置），仅本地留存
+.ycode_tasks/
+
+# One-off design exploration mockups (prototypes, not shipped)
+design_mockups/
+
+# 公众号内容工作区（本地草稿与配图，不入库）
+/公众号/
+gzh-tokenrhythm/
+
+# 一次性临时生图脚本（本地使用，不入库）
+_day3_imggen.py

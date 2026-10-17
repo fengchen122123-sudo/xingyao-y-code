@@ -98,7 +98,12 @@ def test_snapshot_exposes_static_fields_without_runtime_state(tmp_path, monkeypa
     use_temp_config(tmp_path, monkeypatch, {})
     snapshot = load_computer_settings()
     assert isinstance(snapshot.browser_options, tuple)
-    assert {option.browser for option in snapshot.browser_options} == {"edge", "chrome"}
+    # embedded = GUI 内置 WebView2（CDP 直连），与外部浏览器并列可选项
+    assert {option.browser for option in snapshot.browser_options} == {
+        "edge",
+        "chrome",
+        "embedded",
+    }
     assert isinstance(snapshot.profile_display_path, str)
     assert snapshot.platform_supported is (sys.platform == "win32")
     assert not hasattr(snapshot, "hotkey_available")
@@ -261,3 +266,90 @@ def test_browser_option_to_dict_shape(monkeypatch):
     option = list_browser_options(platform="win32")[0].to_dict()
     assert set(option) == {"browser", "label", "available", "executable", "unavailable_reason"}
     assert option["available"] is False
+
+
+# ---------------- embedded（内置浏览器）与项目视口 ----------------
+
+
+def test_embedded_browser_option_detected_without_executable(tmp_path, monkeypatch):
+    use_temp_config(tmp_path, monkeypatch, {})
+    options = {option.browser: option for option in list_browser_options(platform="win32")}
+    assert "embedded" in options
+    assert options["embedded"].executable == ""
+    assert options["embedded"].available is (sys.platform == "win32")
+
+
+def test_get_browser_profile_dir_embedded_matches_automation_user_data(tmp_path, monkeypatch):
+    """embedded 的 profile 目录 = 自动化控件实际使用的 UserDataFolder。
+
+    与面板浏览目录（profile_dir）刻意分离：同一目录上再建带 CDP 参数的
+    WebView2 环境会失败（0x8007139F），identity 必须冻结自动化真正用的目录。
+    """
+    use_temp_config(tmp_path, monkeypatch, {})
+    from core.embedded_browser import automation_profile_dir, profile_dir
+
+    assert get_browser_profile_dir("embedded") == automation_profile_dir().resolve()
+    assert get_browser_profile_dir("embedded") != profile_dir().resolve()
+
+
+def test_process_default_browser_only_affects_missing_key(tmp_path, monkeypatch):
+    """GUI 注入的进程默认值只影响「配置缺省」；显式配置与 CLI 回落不变。"""
+    import core.computer.settings as settings_module
+
+    use_temp_config(tmp_path, monkeypatch, {})
+    monkeypatch.setattr(settings_module, "_process_default_browser", None)
+    assert load_computer_settings().computer_browser == "edge"
+    settings_module.set_process_default_browser("embedded")
+    assert load_computer_settings().computer_browser == "embedded"
+    use_temp_config(tmp_path, monkeypatch, {"computer_browser": "edge"})
+    assert load_computer_settings().computer_browser == "edge"
+    monkeypatch.setattr(settings_module, "_process_default_browser", None)
+
+
+def test_set_computer_browser_accepts_embedded(tmp_path, monkeypatch):
+    use_temp_config(tmp_path, monkeypatch, {})
+    snapshot = set_computer_browser("embedded", active_run=False)
+    assert snapshot.computer_browser == "embedded"
+
+
+def test_project_viewport_roundtrip_clamp_and_defaults(tmp_path):
+    from core.computer.settings import (
+        get_project_browser_viewport,
+        set_project_browser_viewport,
+    )
+
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    # 未设置回落默认
+    assert get_project_browser_viewport(str(workdir)) == (1440, 900)
+    # None（GLOBAL 自由会话）同样回落默认
+    assert get_project_browser_viewport(None) == (1440, 900)
+    assert set_project_browser_viewport(str(workdir), 375, 667) == (375, 667)
+    assert get_project_browser_viewport(str(workdir)) == (375, 667)
+    # 越界值夹取到合法域
+    assert set_project_browser_viewport(str(workdir), 50, 9000) == (120, 8192)
+
+
+def test_project_viewport_rejects_non_integer(tmp_path):
+    from core.computer.settings import set_project_browser_viewport
+
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    with pytest.raises(ComputerControlError):
+        set_project_browser_viewport(str(workdir), "abc", 667)
+    with pytest.raises(ComputerControlError):
+        set_project_browser_viewport(str(workdir), 800.5, 667)
+    with pytest.raises(ComputerControlError):
+        set_project_browser_viewport(None, 800, 600)
+
+
+def test_project_viewport_write_notifies_listeners(tmp_path, monkeypatch):
+    import core.computer.settings as settings_module
+
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    seen: list = []
+    monkeypatch.setattr(settings_module, "_VIEWPORT_LISTENERS", [])
+    settings_module.register_browser_viewport_listener(lambda w, v: seen.append((w, v)))
+    settings_module.set_project_browser_viewport(str(workdir), 800, 600)
+    assert seen == [(str(workdir), (800, 600))]

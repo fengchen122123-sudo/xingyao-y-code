@@ -668,9 +668,12 @@ class BrowserComputerBackend:
         use_process_worker: bool = False,
         worker_command: list[str] | None = None,
         process_guard_slack: float = _PROCESS_GUARD_SLACK,
+        viewport: tuple[int, int] = (_VIEWPORT_WIDTH, _VIEWPORT_HEIGHT),
     ) -> None:
         # 构造函数只校验参数，绝不导入或启动 Playwright。
-        if type(browser) is not str or browser not in _CHANNELS:
+        # "embedded" 仅由 EmbeddedBrowserBackend（CDP 直连内置 WebView2）使用：
+        # 不在 _CHANNELS 中，其启动/收尾分支由子类完全接管。
+        if type(browser) is not str or browser not in (*_CHANNELS, "embedded"):
             raise ComputerControlError(
                 "computer_invalid_config",
                 f"不支持的浏览器：{browser!r}，只支持 edge 或 chrome",
@@ -683,6 +686,12 @@ class BrowserComputerBackend:
         self._command_timeout = float(command_timeout)
         self._start_timeout = float(start_timeout)
         self._on_page_change = on_page_change
+        # 观察坐标系（逻辑视口）：外部浏览器 = 启动视口（dsf=1）；
+        # CDP 模式由子类覆写为项目分辨率/页面真实视口。
+        self._viewport_width, self._viewport_height = (int(viewport[0]), int(viewport[1]))
+        # 是否拥有 context 的关闭权：外部浏览器 owned（teardown 关 context）；
+        # CDP 直连内置浏览器时浏览器归 GUI 所有，teardown 绝不触碰 context。
+        self._owns_context = True
         # R5：系统侧窗口标题提示（平台层提供）；None 时退化为 DOM 可见性裁决。
         self._window_hint_provider = window_hint_provider
         self._browser_pid: int | None = None
@@ -781,6 +790,14 @@ class BrowserComputerBackend:
     def _default_worker_command(self) -> list[str]:
         if self._worker_command_override is not None:
             return list(self._worker_command_override)
+        # 项目视口随 argv 传入受管执行进程（进程模式的 Playwright 在子进程，
+        # 启动视口在子进程 _boot 生效）。
+        viewport_args = [
+            "--viewport-width",
+            str(self._viewport_width),
+            "--viewport-height",
+            str(self._viewport_height),
+        ]
         if getattr(sys, "frozen", False):
             return [
                 sys.executable,
@@ -791,6 +808,7 @@ class BrowserComputerBackend:
                 str(self._profile_dir),
                 "--command-timeout",
                 str(self._command_timeout),
+                *viewport_args,
             ]
         return [
             sys.executable,
@@ -802,6 +820,7 @@ class BrowserComputerBackend:
             str(self._profile_dir),
             "--command-timeout",
             str(self._command_timeout),
+            *viewport_args,
         ]
 
     def _start_process_worker(self) -> None:
@@ -1076,7 +1095,7 @@ class BrowserComputerBackend:
                 user_data_dir=resolved,
                 channel=_CHANNELS[self._browser],
                 headless=False,
-                viewport={"width": _VIEWPORT_WIDTH, "height": _VIEWPORT_HEIGHT},
+                viewport={"width": self._viewport_width, "height": self._viewport_height},
                 device_scale_factor=1,
             )
         except Exception as error:
@@ -1170,7 +1189,7 @@ class BrowserComputerBackend:
     def _teardown(self) -> None:
         context = self._context
         self._context = None
-        if context is not None:
+        if context is not None and self._owns_context:
             try:
                 context.close()
             except Exception:
@@ -1514,20 +1533,27 @@ class BrowserComputerBackend:
             ok=True,
             screen_sha256=hashlib.sha256(png_bytes).hexdigest(),
             png_path=str(path),
-            width=_VIEWPORT_WIDTH,
-            height=_VIEWPORT_HEIGHT,
-            original_width=_VIEWPORT_WIDTH,
-            original_height=_VIEWPORT_HEIGHT,
-            origin_x=0,
-            origin_y=0,
-            scale_x=1.0,
-            scale_y=1.0,
+            **self._observation_viewport(page),
             page_origin=origin,
             page_title=title[:_MAX_TITLE_CHARS],
             surface_id=f"page-{page_token}",
             surface_generation=self._surface_generation,
             elements=elements,
         )
+
+    def _observation_viewport(self, page) -> dict:
+        """观察坐标系：外部浏览器 = 启动视口常量（device_scale_factor=1，
+        PNG 像素与坐标空间 1:1）。CDP 模式由子类覆写为页面真实视口。"""
+        return {
+            "width": self._viewport_width,
+            "height": self._viewport_height,
+            "original_width": self._viewport_width,
+            "original_height": self._viewport_height,
+            "origin_x": 0,
+            "origin_y": 0,
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+        }
 
     def _cmd_execute(self, run_id: str, action: ComputerAction) -> None:
         if action.target != "browser":
@@ -1839,10 +1865,11 @@ class BrowserComputerBackend:
         return x, y
 
     def _check_coordinates(self, x: int, y: int) -> None:
-        if not (0 <= x < _VIEWPORT_WIDTH and 0 <= y < _VIEWPORT_HEIGHT):
+        if not (0 <= x < self._viewport_width and 0 <= y < self._viewport_height):
             raise ComputerControlError(
                 "computer_coordinate_out_of_bounds",
-                f"坐标 ({x}, {y}) 超出浏览器视口 {_VIEWPORT_WIDTH}x{_VIEWPORT_HEIGHT} 半开区间",
+                f"坐标 ({x}, {y}) 超出浏览器视口 "
+                f"{self._viewport_width}x{self._viewport_height} 半开区间",
             )
 
     # ---------------- worker 内：截图短期存储 ----------------

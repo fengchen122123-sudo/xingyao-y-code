@@ -1,3 +1,4 @@
+import difflib
 import json
 import hashlib
 import logging
@@ -8,13 +9,11 @@ import subprocess
 import threading
 import time
 import uuid
-from types import SimpleNamespace
-from urllib.parse import urlsplit
+from collections import deque
 # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
-from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
+from concurrent.futures import TimeoutError
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Dict, List
 
 from core.harness.request_envelope import (
@@ -72,6 +71,7 @@ from core.tools import (
     write_file,
 )
 from core.turn_events import TurnEventFactory
+from core.injection_markers import ORCHESTRATION_NUDGE_TEXT as _ORCHESTRATION_NUDGE_TEXT
 
 # 电脑操控（Task 10，设计 9.3/19）：包级轻量依赖，绝不触碰键鼠/浏览器；
 # controller 顶层也不 import core.llm，无循环导入。测试通过 monkeypatch
@@ -144,6 +144,52 @@ from core.llm_transport import (
     abort_inflight_streams,
     is_rate_limit_error,
 )
+
+# --- 上游错误分类（修复③：额度/鉴权类确定性失败 fail-fast 复用）---
+from core.llm_error_mapper import map_llm_error
+
+# 确定性失败类别：重试无意义（额度耗尽 / 鉴权失败 / 权限受限 / 模型不存在），
+# 命中即 fail-fast 直接抛出，走既有失败收尾；瞬时类（rate_limit 等）保持重试。
+_DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
+    "insufficient_quota",
+    "auth_invalid",
+    "permission_denied",
+    "model_not_found",
+})
+
+
+def _is_deterministic_api_failure(exc):
+    """判断异常是否属于"重试无意义"的确定性上游失败（纯函数，便于单测）。
+
+    整体用 try/except 兜底：分类失败时返回 False（保守），不改变既有重试行为。
+    """
+    try:
+        return map_llm_error(exc).category in _DETERMINISTIC_API_FAILURE_CATEGORIES
+    except Exception:
+        return False
+
+
+# 多 Key 粘性故障转移（设计见
+# docs/superpowers/specs/2026-10-12-provider-multi-key-failover-design.md）：
+# 仅这三类失败视为「厂商 Key 不可用」，命中时静默切换到下一个可用 Key 重发；
+# model_not_found / context_overflow / rate_limit / 网络类等与 Key 无关，
+# 维持既有 fail-fast / 退避重试逻辑。
+_KEY_RELATED_FAILURE_CATEGORIES = frozenset({
+    "insufficient_quota",
+    "auth_invalid",
+    "permission_denied",
+})
+
+
+def _is_key_related_failure(exc):
+    """判断异常是否属于"换 Key 可能解决"的厂商 Key 类失败（纯函数，便于单测）。
+
+    整体用 try/except 兜底：分类失败时返回 False（保守），绝不误触发换 Key。
+    """
+    try:
+        return map_llm_error(exc).category in _KEY_RELATED_FAILURE_CATEGORIES
+    except Exception:
+        return False
 
 # --- Re-exported from core.permission_terminal ---
 from core.permission_terminal import (
@@ -218,6 +264,21 @@ def _pipeline_permission_checker(function_name, arguments, **context):
         **context,
     )
 
+
+def _current_agent_display_name() -> str:
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
+
+    与权限终端的 `_agent_display_name` 分工不同：后者是进程级文案（跟着设置页走），
+    而终端回合提示属于“当前会话内的自称”，必须跟随会话；解析失败回落原实现，
+    保证兜底文案与改动前一致。
+    """
+    try:
+        from core.secretary import get_active_agent_name
+
+        return get_active_agent_name()
+    except Exception:
+        return _agent_display_name()
+
 # --- Re-exported from core.llm_diagnostics ---
 from core.llm_diagnostics import (
     _USAGE_FIELD_MISSING,
@@ -250,6 +311,8 @@ from core.llm_diagnostics import (
 
 # The registry is the canonical capability metadata source.
 from core.tool_registry import build_default_registry, filter_reserved_tool_schemas
+# 秘书工具策略的单一事实源（纯读模块，模块级 import 无循环依赖）
+from core import secretary
 tool_registry = build_default_registry()
 
 
@@ -262,6 +325,49 @@ def _get_mcp_manager():
     每次调用时读取属性，不做缓存，保证测试 monkeypatch core.mcp_client.mcp_manager 生效。"""
     from core.mcp_client import mcp_manager
     return mcp_manager
+
+
+# 【临时诊断】开关文件存在时，把每步请求的工具列表落盘
+_DEBUG_TOOLS_DUMP_FLAG = r"D:\ycodesso\llm_tools_dump.on"
+_DEBUG_TOOLS_DUMP_PATH = r"D:\ycodesso\llm_tools_dump.jsonl"
+
+
+def _debug_dump_request_tools(model_name, api_base, request_tools):
+    """【纯旁路 / 临时诊断】把即将发往上游的工具列表落盘。
+
+    为什么需要：上游对 tools[].function.description 做必填校验时只回「tools[N]
+    缺 description」，N 是它看到的数组下标；本地复算不出真实列表就只能靠这份
+    落盘对齐。仅在开关文件存在时写，任何异常只记 debug，绝不改变发送字节。
+    """
+    try:
+        import hashlib as _hashlib
+        import os as _os
+        import time as _time
+
+        if not _os.path.exists(_DEBUG_TOOLS_DUMP_FLAG):
+            return
+        tools = [tool for tool in (request_tools or []) if isinstance(tool, dict)]
+        blob = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        row = {
+            "ts": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model": str(model_name or ""),
+            "api_base": str(api_base or ""),
+            "count": len(tools),
+            "bytes": len(blob.encode("utf-8")),
+            "sha256": _hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+            "tools": [
+                {
+                    "i": index,
+                    "name": tool.get("function", {}).get("name"),
+                    "desc": tool.get("function", {}).get("description"),
+                }
+                for index, tool in enumerate(tools)
+            ],
+        }
+        with open(_DEBUG_TOOLS_DUMP_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("工具列表落盘失败（旁路，已忽略）", exc_info=True)
 
 
 def _snapshot_tool_breakdown(request_tools):
@@ -294,6 +400,58 @@ def _snapshot_tool_breakdown(request_tools):
         logger.debug("工具定义字符量统计失败（旁路，已忽略）", exc_info=True)
 
 
+def _registry_scope_map() -> dict[str, str]:
+    """注册表里的 {工具名: side_effect_scope}；读取失败返回空表（不抛错）。
+
+    只读判定依赖作用域，registry 的 api_schemas() 不带该字段，故单独取。
+    """
+    scopes: dict[str, str] = {}
+    try:
+        for spec in tool_registry.all():
+            scopes[str(getattr(spec, "name", "") or "")] = str(
+                getattr(spec, "side_effect_scope", "") or ""
+            )
+    except Exception:
+        logger.debug("读取工具作用域失败（旁路，按未知作用域处理）", exc_info=True)
+    return scopes
+
+
+def _secretary_tools_schema() -> list[dict]:
+    """秘书会话的工具 schema：只留策略放行的内置工具，且不合并任何 MCP（设计第 7 节）。"""
+    from core.secretary import secretary_allows_tool
+
+    scopes = _registry_scope_map()
+    schemas: list[dict] = []
+    for schema in tool_registry.api_schemas():
+        name = str(schema.get("function", {}).get("name", "") or "")
+        try:
+            allowed = bool(name) and secretary_allows_tool(name, scopes.get(name, ""))
+        except Exception:
+            allowed = False
+        if allowed:
+            schemas.append(schema)
+    return schemas
+
+
+def _ordinary_tools_schema(excluded_names) -> list[dict]:
+    """普通会话的工具 schema：注册表全量（剔除秘书专属项）+ MCP（保留名过滤后）。
+
+    设计第 2/7 节硬约束：三个调度工具只对秘书会话可见，普通会话工具集与本次
+    改动前逐元素一致（工具列表逐字节稳定是前缀缓存命中的前提）。
+    """
+    excluded = {str(name) for name in (excluded_names or ())}
+    schemas = list(tool_registry.api_schemas())
+    if excluded:
+        schemas = [
+            schema for schema in schemas
+            if str(schema.get("function", {}).get("name", "") or "") not in excluded
+        ]
+    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
+    # computer_action / computer_select_target 由固定 Harness 适配器提供，
+    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
+    return schemas + filter_reserved_tool_schemas(_get_mcp_manager().get_schemas())
+
+
 def get_tools_schema():
     """每次构建请求时新鲜获取工具 schema（registry 静态 + MCP 动态）。
 
@@ -303,6 +461,10 @@ def get_tools_schema():
     进程内首次调用时同步等待 MCP 连接就绪（有界超时，空配置立即返回）：
     否则 MCP schema 会在第 N 轮突然出现在 tools 列表里，DeepSeek/Kimi
     前缀缓存从头部整体失效。后续调用恢复非阻塞，避免每轮都承担连接延迟。
+
+    秘书会话（core.secretary.is_secretary_session）走另一条路径：只暴露只读
+    与调度类内置工具，并跳过 MCP schema 合并（设计 2026-10-15 第 7 节）；
+    普通会话路径与改动前逐元素一致。
     """
     global _mcp_first_wait_done
     if not _mcp_first_wait_done:
@@ -311,12 +473,18 @@ def get_tools_schema():
             _get_mcp_manager()._ensure_connected()
         except Exception:
             pass
-    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
-    # computer_action / computer_select_target 由固定 Harness 适配器提供，
-    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
-    return tool_registry.api_schemas() + filter_reserved_tool_schemas(
-        _get_mcp_manager().get_schemas()
-    )
+    try:
+        # 秘书身份解析异常按普通会话处理：绝不因策略组件故障改变普通对话的工具集
+        is_secretary = bool(secretary.is_secretary_session())
+    except Exception:
+        logger.debug("秘书会话判定失败（旁路，按普通会话处理）", exc_info=True)
+        is_secretary = False
+    if is_secretary:
+        try:
+            return _secretary_tools_schema()
+        except Exception:
+            logger.debug("秘书工具 schema 过滤失败（旁路，回落普通路径）", exc_info=True)
+    return _ordinary_tools_schema(secretary.SECRETARY_ONLY_TOOLS)
 
 
 def completion(**kwargs):
@@ -374,17 +542,6 @@ def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_e
         _unregister_inflight_stream(cancel_event, holder)
         raise
 
-
-def __getattr__(name):
-    # 兼容别名：惰性计算，避免 import 时触发 MCP 连接
-    if name == "TOOLS_SCHEMA":
-        return get_tools_schema()
-    if name == "mcp_manager":
-        # 惰性加载 mcp_manager 单例：避免 import core.llm 时就拉起 mcp 包全家桶
-        # （~1.1s 启动开销）。不缓存到 globals，保证外部属性访问始终反映
-        # core.mcp_client.mcp_manager 的当前值（测试 monkeypatch 友好）。
-        return _get_mcp_manager()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # estimate_tokens 结果缓存：token 估算整个历史开销可观（长会话消息多），
 # 而 UI 状态栏、压缩判断等会在内容未变时反复调用。用 (模型, 消息数, 总字符数)
@@ -538,8 +695,116 @@ def _yield_content(text):
         yield char
 
 
+# 填充词词表（修复①「填充词判据收紧」）。取舍是“宁可漏判、不可误判”：
+# 漏掉一个填充词只会少熔断一次，误判正常短回复则会触发下游护栏误熔断。
+# 首版照方案给定元素，唯一例外是不收录“完成”——它是常见的合法最终短回复
+# （仓库内多处用例即以 "完成" 作为模型收尾正文，属方案自身边界所言的
+# “正常短回复不得被误判”），收录它会让正常收尾被判为空正文并误触发催促。
+_FILLER_TOKENS = frozenset(
+    {
+        "好", "好的", "嗯", "哦", "噢", "ok", "okay", "行", "可以",
+        "收到", "明白", "了解", "继续", "输出", "完毕",
+        "yes", "no",
+    }
+)
+
+# 与 _is_meaningful_assistant_content 同款的“空白/标点/Markdown 符号”噪声字符类，
+# 剥离与切分共用同一口径，避免两处正则漂移。
+# 相较原判据补入省略号“…”（U+2026），否则“收到……”这类“填充词+省略号”无法被剥离，
+# 纯标点语义不变（仅标点仍由原判据判空）。
+_ASSISTANT_NOISE_PATTERN = r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\…]+"
+
+
+def _is_filler_only(text):
+    """判断文本是否只由填充词构成（修复①判据收紧的辅助函数）。
+
+    来历：原判定只剥离噪声字符，对 ``"好。"`` 剥完仍剩 ``"好"`` 而被判为有效正文，
+    使得慢步熔断 / 总结催促 / 收尾报错三道护栏同时短路。此处要求：剥完噪声后，
+    按标点切出的每个片段都命中 ``_FILLER_TOKENS``（比对前小写化），且残余长度 ≤6，
+    才算“纯填充词”。宁可漏判（放过个别填充词），也不误判（把正常短回复当空正文）。
+    """
+    raw = text or ""
+    stripped = re.sub(_ASSISTANT_NOISE_PATTERN, "", raw)
+    # 残余为空属于“空正文”语义，交回原判据处理，本函数不判假（不改变空串行为）。
+    if not stripped:
+        return False
+    # 残余过长，不可能只是短应答式填充词。
+    if len(stripped) > 6:
+        return False
+    fragments = [seg for seg in re.split(_ASSISTANT_NOISE_PATTERN, raw) if seg]
+    if not fragments:
+        return False
+    return all(seg.lower() in _FILLER_TOKENS for seg in fragments)
+
+
 def _is_meaningful_assistant_content(text):
-    return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
+    """是否含有效正文：原判据为真，且不是“剥完只剩填充词”。
+
+    函数名与签名保持不变（下游调用与回归用例依赖）。
+    """
+    if not bool(re.sub(_ASSISTANT_NOISE_PATTERN, "", text or "")):
+        return False
+    return not _is_filler_only(text)
+
+
+# --- 退化（复读）检测（修复②）：流式装配层的"连续复读"护栏 -------------------
+# 与修复①的分工：修复①管"单步只有填充词"，这里管"多步反复同一段短内容"。
+# 两者都是为了解决同一类卡死——模型既不调工具也不给结论，只反复刷同样的话，
+# 而 progress_guard 只看确定性状态、不读自然语言（有意设计），追不上这种模式。
+_DEGENERATE_WINDOW = 3
+# "连续相同"判据只对短内容生效：长正文逐位相同更像模型复述上下文，交给相似度判据。
+_DEGENERATE_MAX_FINGERPRINT_CHARS = 20
+_DEGENERATE_SIMILARITY_THRESHOLD = 0.9
+# 退化收敛催促的次数上限：首次命中催促一次，再次命中直接熔断收尾。
+_DEGENERATE_MAX_NUDGES = 1
+
+
+def _degenerate_fingerprint(text):
+    """退化指纹：剥离噪声字符（与修复①同一口径）后的字符串。
+
+    复用 ``_ASSISTANT_NOISE_PATTERN``，避免两处正则各写一份造成口径漂移。
+    """
+    return re.sub(_ASSISTANT_NOISE_PATTERN, "", text or "")
+
+
+def _fingerprint_similarity(left, right):
+    """两个指纹的相似度（0~1）：取“编辑距离比例”与“字符集包含度”的较大者。
+
+    只用标准库（difflib）实现，不引入第三方依赖。包含度是必要补充：中文短复读的
+    指纹常只差一两个字（如 "好" vs "好的"），编辑距离比例只有 0.67，会漏判；包含度
+    按 ``|A∩B| / min(|A|, |B|)`` 计算，能把“一方基本被另一方覆盖”的近似复读判出来。
+    """
+    if not left or not right:
+        return 0.0
+    edit_ratio = difflib.SequenceMatcher(None, left, right).ratio()
+    left_set, right_set = set(left), set(right)
+    containment = len(left_set & right_set) / min(len(left_set), len(right_set))
+    return max(edit_ratio, containment)
+
+
+def _is_degenerate_repeat(fingerprints):
+    """最近若干步指纹是否构成“退化复读”（纯函数，便于单测）。
+
+    判定口径（实施方案 §T2）：滑窗内连续 3 步指纹逐位相同且单步长度 ≤20 字符；
+    或滑窗内指纹两两相似度 ≥0.9。空指纹（工具调用步无正文、无思考）不参与判定，
+    避免把“连续只调工具”的正常步骤误判为复读。
+    """
+    window = list(fingerprints)[-_DEGENERATE_WINDOW:]
+    if len(window) < _DEGENERATE_WINDOW:
+        return False
+    if not all(window):
+        return False
+    if (
+        len(set(window)) == 1
+        and len(window[0]) <= _DEGENERATE_MAX_FINGERPRINT_CHARS
+    ):
+        return True
+    return all(
+        _fingerprint_similarity(earlier, later)
+        >= _DEGENERATE_SIMILARITY_THRESHOLD
+        for index, earlier in enumerate(window)
+        for later in window[index + 1:]
+    )
 
 
 # _read_text_with_encoding_fallback 的唯一实现位于 core/llm_execution.py，
@@ -597,6 +862,14 @@ def _claim_takeover_at_turn_start(
     return scheduler, claimed
 
 
+# 入口层受控回合来源白名单：只有入口层（GUI/CLI 本地、LAN 手机端、飞书通道）能设置，
+# 绝不来自用户消息或模型参数。非 local 的回合一律按「远程」处理（禁用电脑操控、
+# 不解析 @{会话名}、不抢桌面当前会话），见 core/computer/capability.py 与
+# core/agent_service.py 的 turn_source != "local" 分支。
+# 新增来源时必须同时更新 gui_bridge.TURN_SOURCES（有测试断言两者一致）。
+COMPUTER_TURN_SOURCES = ("local", "lan", "feishu")
+
+
 def resolve_turn_computer_capability(
     model_name,
     api_base=None,
@@ -608,7 +881,7 @@ def resolve_turn_computer_capability(
     按请求路由在 config 中查找模型条目，与请求实际使用的 base_url/protocol
     一起交给纯函数 resolve_computer_capability 冻结为不可变快照；同一 Turn
     的每个 Step 复用该快照，不做二次决策。turn_source 只接受入口层受控值
-    local|lan（不得来自用户消息或模型参数）。设置快照读取失败按
+    local|lan|feishu（不得来自用户消息或模型参数）。设置快照读取失败按
     computer_invalid_config 拒绝（fail-closed），绝不中断普通对话。
     """
     from core.model_manager import get_model_config_by_litellm_model, get_model_protocol
@@ -656,8 +929,8 @@ def chat_with_model_events(
     the event-oriented entry point used by the CLI and is deliberately kept
     separate while the existing tool loop is migrated incrementally.
 
-    computer_turn_source 是入口层给出的受控回合来源（local|lan）：LAN/mobile
-    发起的 Turn 在 resolve_computer_capability 内固定禁用电脑操控。
+    computer_turn_source 是入口层给出的受控回合来源（local|lan|feishu）：LAN/mobile
+    与飞书通道发起的 Turn 在 resolve_computer_capability 内固定禁用电脑操控。
 
     computer_capability（Task 11a F1 收敛）是调用方显式传入的 Turn 能力快照；
     未传时优先取同线程 prepare 阶段（agent_service.build_runtime_context）存入
@@ -665,8 +938,10 @@ def chat_with_model_events(
     Turn 的 capability 只解析一次；子代理回合（allow_subagents=False）始终为
     None，不解析也不注入电脑操控。
     """
-    if computer_turn_source not in ("local", "lan"):
-        raise ValueError("computer_turn_source 只允许受控值 local 或 lan")
+    if computer_turn_source not in COMPUTER_TURN_SOURCES:
+        raise ValueError(
+            f"computer_turn_source 只允许受控值 {'|'.join(COMPUTER_TURN_SOURCES)}"
+        )
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
     resolved_parent_turn_id = parent_turn_id or resolved_turn_id
     # Turn 起点解析一次电脑操控能力（Task 10 接线点①，设计 9.3）：局部不可变
@@ -927,7 +1202,6 @@ from core.llm_dialects import (
     _tool_contract_fingerprint,
     _uses_deepseek_prompt_ledger,
     _vision_support_cache,
-    _vision_support_cache_lock,
     consume_deepseek_generation_rotation,
     is_deepseek_ledger_route,
     mark_deepseek_generation_rotation,
@@ -1048,7 +1322,6 @@ from core.llm_execution import (
     _execute_single_tool_call,
     _get_imom_active_publish_root,
     _persisted_tool_calls,
-    _raise_if_tool_cancelled,
     _raw_tool_call_arguments,
     _read_file_result_limit,
     _read_text_with_encoding_fallback,
@@ -1071,6 +1344,120 @@ from core.llm_execution import (
     _unplanned_subagent_progress_part,
     _vision_fallback_text,
 )
+
+# ── 编排提醒：多步未建计划时的软提醒（每回合最多 1 次）────────────────
+
+# 阈值口径：计数对象是“实质操作数”而非模型拆解出的子任务条数——前者由
+# _count_substantive_ops 统计（write_file / edit_file / 非只读 execute_command
+# 的调用数），与后者是近似映射（一步实质操作 ≈ 推进一条子任务），仅作运行时兜底
+# 估计。阈值语义是“超过 3”（即 ≥ 4）才提醒，恰好 3 步及以内不提醒，与提醒文案及
+# system_prompt.md / system_prompt_gui.md 的“子任务超过 3 条（即 ≥ 4 条）必须先用
+# plan_write、3 条及以内直接执行”保持一致。
+_ORCHESTRATION_NUDGE_THRESHOLD = 3
+_ORCHESTRATION_COUNTED_TOOLS = frozenset({"write_file", "edit_file"})
+_ORCHESTRATION_COMMAND_TOOL = "execute_command"
+# 文案常量迁至 core.injection_markers（展示层过滤前缀与文案同源，防漂移）；
+# 顶部以别名导入并保留 _ORCHESTRATION_NUDGE_TEXT 名称供既有引用使用。
+
+# 慢步催促文案（core/tools.py 无该生成点；此处抽为模块级常量便于展示层过滤
+# 前缀与生成点对账，防止文案漂移）。
+SLOW_STEP_NUDGE_TEXT = (
+    "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何"
+    "正文内容，已出现明显的思考空转。请立即停止自检和复述思考过程，"
+    "直接输出最终结论：任务已完成就给出中文结论，仍需操作就立即"
+    "调用相应工具。禁止继续只输出思考内容。"
+)
+# 总结催促文案（工具已跑完却无结论）。
+SUMMARY_NUDGE_TOOL_DONE_TEXT = (
+    "工具已经执行完毕。现在必须只输出最终中文检查结论，"
+    "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
+)
+# 总结催促文案（只输出思考、既无工具也无正文）。
+SUMMARY_NUDGE_THINKING_ONLY_TEXT = (
+    "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
+    "也没有给出正式回复。请立即继续：需要执行操作就调用相应工具，"
+    "任务已完成就直接输出中文结论；不要只输出思考内容。"
+)
+# 计划续推催促文案（{hints} 由调用处填充）。
+PLAN_CONTINUE_NUDGE_TEXT = (
+    "计划尚未执行完毕，仍有可执行的计划项: [{hints}]。"
+    "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项；"
+    "若某项确实无法完成，请先用 plan_read 查看状态并明确说明原因，"
+    "不要在计划未完成时直接结束回答。"
+)
+
+# 按 turn_id 的进程内去重：同一 turn_id 异常重入（生成器被重复驱动）时，
+# 编排提醒只注入一次。写法参考 core/permission_terminal.py 的
+# _plan_turn_started_at（带 TTL + 过期清理，避免无限增长）。
+_orchestration_nudged_turns: dict[str, float] = {}
+_orchestration_nudged_lock = threading.Lock()
+_ORCHESTRATION_NUDGE_TURN_TTL_SECONDS = 3600
+
+
+def _orchestration_turn_already_nudged(turn_id) -> bool:
+    """该 turn_id 是否已注入过编排提醒（只读，不登记）。"""
+    if turn_id is None:
+        return False
+    with _orchestration_nudged_lock:
+        return str(turn_id) in _orchestration_nudged_turns
+
+
+def _register_orchestration_nudge(turn_id, *, now=None) -> None:
+    """登记某 turn_id 已注入编排提醒，并顺带清理过期条目（TTL 防无限增长）。"""
+    if turn_id is None:
+        return
+    now = time.monotonic() if now is None else now
+    with _orchestration_nudged_lock:
+        _orchestration_nudged_turns[str(turn_id)] = now
+        cutoff = now - _ORCHESTRATION_NUDGE_TURN_TTL_SECONDS
+        for stale_id, started_at in list(_orchestration_nudged_turns.items()):
+            if started_at < cutoff:
+                _orchestration_nudged_turns.pop(stale_id, None)
+
+
+def _count_substantive_ops(tool_calls):
+    """一批工具调用中的实质操作数：write_file / edit_file / 非只读 execute_command。
+
+    execute_command 的只读判定与计划门禁同口径（classify_command_risk）；
+    参数解析失败的调用按保守原则计入，空命令不计。
+    """
+    from core.permission_policy import PermissionRisk
+
+    count = 0
+    for tool_call in tool_calls or ():
+        function = tool_call.get("function") or {}
+        name = str(function.get("name") or "")
+        if name in _ORCHESTRATION_COUNTED_TOOLS:
+            count += 1
+            continue
+        if name != _ORCHESTRATION_COMMAND_TOOL:
+            continue
+        raw = str(function.get("arguments") or "")
+        try:
+            arguments = json.loads(raw) if raw.strip() else {}
+        except (TypeError, ValueError):
+            count += 1
+            continue
+        command = str((arguments or {}).get("command") or "")
+        if command and classify_command_risk(command) is not PermissionRisk.QUERY:
+            count += 1
+    return count
+
+
+def _should_nudge_orchestration(*, allow_subagents, count, session_id, turn_id, already_sent):
+    """是否注入编排提醒：主代理回合 + 实质操作超过阈值 + 无计划在途 + 未提醒过。
+
+    阈值口径：count 必须"超过" _ORCHESTRATION_NUDGE_THRESHOLD（即 ≥ 4）才提醒，
+    恰好 3 步及以内不提醒（与提醒文案及 system_prompt*.md 一致）。
+    """
+    if not allow_subagents or already_sent:
+        return False
+    if count <= _ORCHESTRATION_NUDGE_THRESHOLD:
+        return False
+    if _orchestration_turn_already_nudged(turn_id):
+        return False
+    return not (_has_pending_plan(session_id) or _is_plan_turn(turn_id))
+
 
 _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL = _execute_single_tool_call
 
@@ -1151,6 +1538,11 @@ def _chat_with_model_generator(
     FINAL_SUMMARY_MAX_RETRIES = 2
     # 慢步熔断已触发的强催促次数（随本轮会话循环生命周期）。
     slow_step_nudge_count = 0
+    # 退化（复读）检测：最近 3 步的正文指纹滑窗 + 已触发的收敛催促次数。
+    # 与 slow_step_nudge_count 同生命周期（随回合重置），且只存本回合内存：
+    # 不写 Journal、不入库、不落盘（与 read_signatures 同策略，避免污染缓存与历史）。
+    recent_content_fingerprints = deque(maxlen=_DEGENERATE_WINDOW)
+    degenerate_nudge_count = 0
     # D 方案：验证声明护栏已触发的提醒次数（随本轮会话循环生命周期）。
     verify_claim_nudge_count = 0
     # C8/C9：本回合工具调用总次数（Stop hook 输入字段；无 hooks 配置时零影响）。
@@ -1215,19 +1607,70 @@ def _chat_with_model_generator(
                 # complete 也不 stop。
                 return
             if computer_exit_kind == "completed":
+                # L1（2026-10-01 "接管—交还"修复）：用户接管态
+                # （waiting_for_user）同样走"完成"路径终结并交还排他租约。
+                # 转移表放行 waiting_for_user → completing 之前，这一步会抛
+                # 非法状态转换并被吞成 warning，run 既无终态也无租约释放，
+                # 下一回合被 computer_session_busy 挡死（2026-10-01 实机故障，
+                # 日志 gui-runtime.log:11174/11519）。
+                # retain 必须为 True、与普通收尾完全一致：外部 Edge/Chrome 上
+                # 关闭 backend 会连用户此刻正在手动操作的浏览器窗口一起关掉，
+                # 而接管场景恰恰正在用那个窗口；内置浏览器上保留会话也让下一
+                # 回合免去 CDP 重连。面板页面属于 GUI 的 WebView2 控件，与 run
+                # 是否保留无关。
                 computer_controller.complete_run(
                     computer_run_id, computer_owner, retain_browser_session=True
                 )
             else:
+                # cancel_owner=False：owner 的 cancel_event 就是 gui_bridge
+                # 判定"回合是否被用户取消"的事件（gui_bridge.py:6220 与 :6377）。
+                # cancelled/failed/stopped 三类非正常收尾里只有真取消才该保留该
+                # 语义，而真取消时 event 早已由停止按钮/Ctrl+C 路径置位，收尾不
+                # 需要也不应再设它：否则一次普通失败（如上游 402 额度不足）会被
+                # 误标成"已取消"，界面上错误原因全部丢失（2026-10-01 实机故障，
+                # 日志 gui-runtime.log 20:14-20:28 连续 8 次）。与下方
+                # turn_end_finalize_fallback 兜底口径保持一致。
                 computer_controller.stop(
                     computer_run_id,
                     "turn_cancelled" if computer_exit_kind == "cancelled" else "turn_stopped",
+                    cancel_owner=False,
                 )
-        except ComputerControlError as error:
+        except Exception as error:
+            # 捕获范围必须宽于 ComputerControlError（2026-10-01 审查补修）：
+            # snapshot()/complete_run()/stop() 可能抛出非领域异常，若任其逃逸，
+            # 既没有兜底释放租约，还会把异常抛进回合 finally、打断整个收尾流程。
             logger.warning(
-                "电脑操控 run 收尾失败（run=%s kind=%s）：%s",
-                computer_run_id, computer_exit_kind, error,
+                "电脑操控 run 收尾失败（run=%s kind=%s，%s）：%s",
+                computer_run_id, computer_exit_kind, type(error).__name__, error,
             )
+            # L2（2026-10-01 "接管—交还"修复）：收尾失败兜底，保证"回合结束绝不
+            # 留活租约"。complete_run 不可达的一切情形（paused 与
+            # starting/completing/stopping 等非终态——paused → completing 属于
+            # 既有契约明令拒绝的转移）以及其他导致收尾动作失败的异常，都在此
+            # 强制 stop 释放租约，否则 run 会既无终态也无租约释放，下一回合被
+            # computer_session_busy 挡死。整段兜底只 warning，绝不向上抛，也不
+            # 掩盖回合原本结局（provider_safety_required 的提前 return 语义不受
+            # 影响：该分支在上面已 return，不会进入这里）。
+            try:
+                fallback_snapshot = computer_controller.snapshot()
+                if (
+                    fallback_snapshot is not None
+                    and fallback_snapshot.run_id == computer_run_id
+                    and fallback_snapshot.status not in _COMPUTER_RUN_TERMINAL_STATUSES
+                ):
+                    # cancel_owner=False：gui_bridge.py:6220 与 :6377 用该 owner 的
+                    # cancel_event 判定"回合是否被用户取消"，收尾兜底不得把正常
+                    # 结束的回合误标成"已取消"。
+                    computer_controller.stop(
+                        computer_run_id,
+                        "turn_end_finalize_fallback",
+                        cancel_owner=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "电脑操控 run 收尾兜底释放失败（run=%s kind=%s，已忽略）",
+                    computer_run_id, computer_exit_kind, exc_info=True,
+                )
         # 截图清除（2026-09-06 提速计划 Task 6）：回合终结后该会话所有电脑操控
         # 观察图立即折叠为占位符。provider_safety_required 的提前 return 不会
         # 走到这里（run 仍存活，模型恢复后还需要最后一张图）。
@@ -1245,11 +1688,16 @@ def _chat_with_model_generator(
             logger.warning("折叠电脑操控观察截图失败（已忽略）", exc_info=True)
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
+    # 编排提醒：本回合是否已注入、实质操作累计（每回合重置）
+    orchestration_nudge_sent = False
+    substantive_op_count = 0
     pending_persistence = []
     persistence_failure = None
     current_step = None
     current_tool_calls = []
     pending_tool_records = {}
+    # 当前 step 的流式组装器（A1-02：通用异常路径打捞部分正文时读取；每 step 重建）
+    stream_assembler = None
 
     def _model_display_snapshot(metrics=None):
         """为落库的 assistant 消息附加"生成所用模型"及性能指标的显示元数据。
@@ -1268,7 +1716,9 @@ def _chat_with_model_generator(
                         disp["model_name"] = model.get("name") or model_name
                         break
         except Exception:
-            pass
+            # 读配置失败不影响落库：保留回退为 model_name 原值的行为，仅记录
+            # 调试日志留下痕迹，便于排查显示名缺失。
+            logger.debug("读取模型显示名配置失败，回退为 model_name", exc_info=True)
         if metrics:
             disp["metrics"] = metrics
         return {"_display": disp}
@@ -1382,6 +1832,34 @@ def _chat_with_model_generator(
                         "content": cancelled_content,
                     }))
 
+    def salvage_streaming_partial():
+        """A1-02：流式中断时把本 step 已生成的部分内容打捞进待写队列。
+
+        仅在组装器存在、尚未 finish 且确有公开正文时生效（半截 tool_calls
+        不带入，避免历史非法；纯思考不产生消息）。公开正文带
+        「[本轮流式中断]」标注落库，reasoning 一并携带。异常发生在组装
+        完成后（assembler 已 finish）时静默跳过；上游调用后仍需
+        flush_persistence()。
+        """
+        assembler = stream_assembler
+        if assembler is None:
+            return
+        try:
+            assembled = assembler.finish()
+        except Exception:
+            return
+        public_content = (assembled.content or "").strip()
+        if not public_content:
+            return
+        salvaged_message = {
+            "role": "assistant",
+            "content": f"{public_content}\n\n[本轮流式中断]",
+        }
+        if assembled.reasoning_content:
+            salvaged_message["reasoning_content"] = assembled.reasoning_content
+        salvaged_message.update(_model_display_snapshot())
+        pending_persistence.append(("assistant", salvaged_message))
+
     # 2. 注入后台子 Agent 回报数据 (XML task-notification)
     from core.tools import subagent_manager
     drained_notifications = []
@@ -1443,6 +1921,8 @@ def _chat_with_model_generator(
     # 【纯旁路】工具定义字符量快照（设计规格 §3.3；2026-09-23 拆分系统/MCP）：
     # 每步请求都会走到，重复更新无害；失败仅记 debug，绝不改变发送字节。
     _snapshot_tool_breakdown(request_tools)
+    # 【纯旁路 / 临时诊断】把最终工具列表落盘，供定位上游校验失败（用完即撤）。
+    _debug_dump_request_tools(model_name, api_base, request_tools)
     # 原生 OpenAI 协议（Task 11a，设计 11.1/11.2）：native tools 不进
     # request_tools（chat 格式），而是经 prepare_stream_request 的
     # native_computer_tools 参数追加在 flattened function tools 之后；
@@ -1644,7 +2124,27 @@ def _chat_with_model_generator(
             # API 调用指数退避与 Jitter 抖动重试
             response_stream = None
             inflight_holder = None
+            # 多 Key 粘性故障转移：每个 Step 重建「本请求链已尝试 Key」集合
+            # （同 Step 重试循环共享、跨 Step 重置），Key 池自身（sticky/冷却）
+            # 为进程内存态跨 Step 保留。单 Key / 路由未知 / 任何异常时
+            # key_failover=None，行为与现状完全一致；绝不打印 Key 明文。
+            key_failover = None
+            try:
+                from core.provider_keys import build_key_failover
+
+                key_failover = build_key_failover(
+                    model_name, api_base, model_id=request_model_id
+                )
+                if key_failover is not None:
+                    kwargs["api_key"] = key_failover.initial_key()
+            except Exception:
+                key_failover = None
+                logger.debug("多 Key 池初始化失败，退回单 Key 行为", exc_info=True)
+            key_tried = set()  # 本请求链已尝试过的 Key（防同链重复试同一 Key）
             max_api_retries = 5
+            if key_failover is not None:
+                # 每个 Key 至少有一次尝试机会；单 Key 维持 5 次不变
+                max_api_retries = max(5, key_failover.key_count + 2)
             base_delay = 1.0
             # 超窗自动压缩只允许一次：压缩后仍超限说明单条消息/附件本身过大，
             # 继续重试只会反复重发超大载荷空烧额度
@@ -1863,6 +2363,13 @@ def _chat_with_model_generator(
                     finally:
                         # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
                         future.cancel()
+                    if key_failover is not None:
+                        # 粘性锚定到本次成功的 Key 并清除其冷却；
+                        # 记账失败绝不影响请求成功本身
+                        try:
+                            key_failover.on_success(str(kwargs.get("api_key") or ""))
+                        except Exception:
+                            pass
                     break
                 except Exception as api_err:
                     # 硬中断（用户取消关闭在飞流）会让请求线程抛连接错误；
@@ -1981,6 +2488,32 @@ def _chat_with_model_generator(
                             _notify_event(event_callback, "status", {"message": warn_msg})
                         if attempt < max_api_retries - 1:
                             continue
+
+                    # 修复③：额度耗尽 / 鉴权失败 / 权限受限 / 模型不存在等确定性失败
+                    # 重试无意义，只会反复空烧额度、拖长用户等待；命中即直接抛出，
+                    # 走既有失败收尾（与五次重试耗尽后的路径一致）。分类失败保守回退
+                    # 既有重试行为，不改变瞬时错误（429 等）的退避口径。
+                    if _is_deterministic_api_failure(api_err):
+                        # 多 Key 粘性故障转移：Key 类失败（额度/鉴权/权限）静默切换
+                        # 到下一个未试过的 Key 重发——不发任何 UI 事件，仅 logger
+                        # 留痕（绝不打印 Key 明文）；其余确定性失败维持 fail-fast；
+                        # 全部 Key 试完 → 抛原错误走既有失败收尾。
+                        if key_failover is not None and _is_key_related_failure(api_err):
+                            current_key = str(kwargs.get("api_key") or "")
+                            key_tried.add(current_key)
+                            next_key = None
+                            try:
+                                next_key = key_failover.on_failure(current_key, key_tried)
+                            except Exception:
+                                next_key = None
+                            if next_key:
+                                kwargs["api_key"] = next_key
+                                logger.info(
+                                    "多 Key 静默切换：厂商 Key 不可用，"
+                                    "已切换下一个 Key 重发（不打印 Key 值）"
+                                )
+                                continue
+                        raise api_err
 
                     if attempt < max_api_retries - 1:
                         # 速率限制（429 / TooManyRequests / RateLimitError）需要更长退避，
@@ -2297,6 +2830,10 @@ def _chat_with_model_generator(
             # 思考原文可能极长（数万字），直接全量促升会把大段内心独白倾倒给用户，
             # 因此只保留开头一段预览，其余截断。
             raw_content_meaningful = _is_meaningful_assistant_content(public_content)
+            # 促升前的原始正文快照：退化（复读）检测的指纹必须取这里的值。
+            # 一旦走到下面的促升分支，public_content 会被改写成思考预览，
+            # 此时再取指纹等于拿思考内容当正文指纹（口径错误，见下方退化检测块）。
+            pre_promotion_content = public_content
             promoted_reasoning = False
             if (
                 not assembled_response.tool_calls
@@ -2330,6 +2867,74 @@ def _chat_with_model_generator(
             replay_reasoning_content = assembled_response.reasoning_content
             provider_thinking_blocks = assembled_response.thinking_blocks
 
+            # 退化（复读）检测（修复②）：模型连续多步只重复同一段短正文
+            # （"好。""嗯。"这类填充词或其近似变体）时，既不产出结论也不推进任务，
+            # 前端气泡持续刷屏、状态栏长期停在"生成中"，用户视角等同卡死。
+            # progress_guard 只比确定性状态、不读正文（有意设计），对这类失效不敏感，
+            # 因此在这里按正文指纹滑窗补一道护栏：首次命中发 notice 并要求收敛，
+            # 二次命中发 error 后走慢步熔断同一收尾路径结束回合。
+            # 注意：正文指纹取 pre_promotion_content（促升前的原始正文快照）——
+            # 上面的 reasoning 促升分支会把 public_content 改写成思考预览，若在促升后
+            # 取指纹（曾经就是如此），退化检测会拿思考预览当正文指纹（口径错误），
+            # 于是"连续几步只输出思考"被误判成正文复读，抢走促升兜底与总结催促的职责。
+            # 口径修正：退化判定只保留正文指纹，思考指纹不再参与熔断。理由是思考内容
+            # 在多步推理中天然高度相似（模型自检 / 复述思考），拿它做复读判据会误伤正常
+            # 推理；而"只输出思考、无正文"的场景本就由既有的 reasoning 促升兜底与总结
+            # 催促（FINAL_SUMMARY_MAX_RETRIES）护栏负责，并有专门测试守着。退化熔断因此
+            # 只针对正文复读这一种故障模式——故障现场正是"每步只输出'好。''嗯。''OK。'
+            # 这类填充词正文"。
+            # 收紧（修复②）：判定只针对"空转步"——有工具调用说明模型正在推进任务，
+            # 不属于"既不调工具也不给结论"的故障模式。若对有工具调用的步也判定，
+            # 首次命中会 continue 直接丢弃该步真实 tool_calls（工具不执行、assistant
+            # 消息不入历史），把"连续几步回相似短句但各自调用不同工具"的正常多步任务
+            # 误杀。这里与慢步熔断的 `not tool_calls_list` 前置条件保持同一口径：
+            # 只有无工具调用的步才累计指纹并参与判定。
+            if not tool_calls_list:
+                recent_content_fingerprints.append(
+                    _degenerate_fingerprint(pre_promotion_content)
+                )
+                if _is_degenerate_repeat(recent_content_fingerprints):
+                    if degenerate_nudge_count < _DEGENERATE_MAX_NUDGES:
+                        degenerate_nudge_count += 1
+                        _notify_event(event_callback, "notice", {
+                            "message": "检测到模型连续多步复读相同内容，已要求其立即收敛并给出结论。",
+                        })
+                        # 与慢步熔断同一通道：同时写内存与持久化，并立即 flush，
+                        # 否则下一轮重建历史时这条催促会丢失。
+                        degenerate_nudge = {
+                            "role": "user",
+                            "content": SLOW_STEP_NUDGE_TEXT,
+                        }
+                        messages.append(degenerate_nudge)
+                        pending_persistence.append(("user", degenerate_nudge))
+                        flush_persistence()
+                        # 复读本身无确定性状态变化：计入进展观察（停滞计数 +1）
+                        progress_guard.observe(
+                            _step_progress_observation(None, session_id=parent_session)
+                        )
+                        # Step 状态机要求 STREAMING → ASSISTANT_READY → COMPLETED，
+                        # 此处尚未走常规 mark_assistant_ready 路径，先补迁移再进入下一轮。
+                        if current_step is not None:
+                            current_step.mark_assistant_ready()
+                            if turn + 1 < max_turns:
+                                current_step.complete()
+                        continue
+                    # 催促过仍未收敛：发 error 让用户可见（禁止静默收尾），并走慢步
+                    # 熔断同一收尾路径结束循环、返回已产出的内容。
+                    _notify_event(event_callback, "error", {
+                        "message": "模型连续多步复读相同内容且未收敛，已触发退化熔断结束本回合。",
+                    })
+                    if promoted_reasoning and public_content:
+                        yield from _yield_content(public_content)
+                    flush_persistence()
+                    if current_step is not None:
+                        current_step.mark_assistant_ready()
+                        current_step.complete()
+                    if harness_runtime is not None:
+                        harness_runtime.complete()
+                    computer_exit_kind = "completed"
+                    return
+
             # 慢步熔断（防止推理型小模型思考失控、静默空转、零产出）：
             # 单步耗时超过 SLOW_STEP_ABORT_SECONDS 且既未产出正文、也未发起工具
             # 调用时，说明模型在空转烧时间。首次触发先追加一条强催促（要求立即
@@ -2348,12 +2953,7 @@ def _chat_with_model_generator(
                     })
                     slow_step_nudge = {
                         "role": "user",
-                        "content": (
-                            "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何"
-                            "正文内容，已出现明显的思考空转。请立即停止自检和复述思考过程，"
-                            "直接输出最终结论：任务已完成就给出中文结论，仍需操作就立即"
-                            "调用相应工具。禁止继续只输出思考内容。"
-                        ),
+                        "content": SLOW_STEP_NUDGE_TEXT,
                     }
                     # 空的 assistant 消息（content 为 None）不入库也不留内存，只追加
                     # 强催促；催促使消息同样需要持久化，避免下一轮重建历史时上下文缺失。
@@ -2482,20 +3082,11 @@ def _chat_with_model_generator(
                     # 留在历史里会让下一轮 API 报 400（Anthropic 拒绝空 content）
                     messages.pop()
                     if tool_activity_seen:
-                        nudge_text = (
-                            "工具已经执行完毕。现在必须只输出最终中文检查结论，"
-                            "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
-                            + length_hint
-                        )
+                        nudge_text = SUMMARY_NUDGE_TOOL_DONE_TEXT + length_hint
                     else:
                         # 模型只输出思考、未调用任何工具也未给出正文：催促它真正行动，
                         # 而不是把内心独白当成交付结果。
-                        nudge_text = (
-                            "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
-                            "也没有给出正式回复。请立即继续：需要执行操作就调用相应工具，"
-                            "任务已完成就直接输出中文结论；不要只输出思考内容。"
-                            + length_hint
-                        )
+                        nudge_text = SUMMARY_NUDGE_THINKING_ONLY_TEXT + length_hint
                     summary_request = {
                         "role": "user",
                         "content": nudge_text,
@@ -2576,13 +3167,14 @@ def _chat_with_model_generator(
                         )
                         nudge_request = {
                             "role": "user",
-                            "content": (
-                                f"计划尚未执行完毕，仍有可执行的计划项: [{hints}]。"
-                                "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项；"
-                                "若某项确实无法完成，请先用 plan_read 查看状态并明确说明原因，"
-                                "不要在计划未完成时直接结束回答。"
-                            ),
+                            "content": PLAN_CONTINUE_NUDGE_TEXT.format(hints=hints),
                         }
+                        # 注入催促消息后继续下一轮（与下方 Stop-hook 续跑同模式：
+                        # append + pending_persistence + flush_persistence）。
+                        # v1.1.51 重构时曾丢失这两行 append，导致模型从未真正
+                        # 收到催促、只有 UI 在空提醒——此处按 v1.1.25 原实现恢复。
+                        messages.append(nudge_request)
+                        pending_persistence.append(("user", nudge_request))
                         _notify_event(event_callback, "notice", {
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })
@@ -2865,6 +3457,11 @@ def _chat_with_model_generator(
                 key=lambda record: record.call_ordinal,
             ))
 
+            # 编排提醒（软）：多步实质操作仍未建计划时拉一把，每回合最多一次。
+            # 实质操作数在此累计；提醒本体的 append 推迟到全部 tool 结果（含
+            # follow-up 观察消息）之后，见下方"工具结果全部入列后再追加"处。
+            substantive_op_count += _count_substantive_ops(tool_calls_list)
+
             results = [record.message for record in records]
             # follow-up 观察 user 消息按 call ordinal 追加在全部 tool results
             # 之后（Task 10 接线点③，设计 19.3/19.4）：同一 Step 的既有提交
@@ -2886,6 +3483,40 @@ def _chat_with_model_generator(
                     pending_persistence.extend(
                         ("user", followup) for followup in followup_messages
                     )
+
+            # 工具结果全部入列后，再追加编排提醒：保证 messages 顺序为
+            # assistant(tool_calls) → tool(...)（含 follow-up 观察消息）→ user(提醒)，
+            # 满足 Anthropic「tool_use 后必须紧跟 tool_result」与 OpenAI「tool_calls
+            # 必须被 tool 消息应答」的约束；pending_persistence 入队顺序与之一致。
+            # 同一 turn 只注入一次：除生成器局部 orchestration_nudge_sent 外，还按
+            # turn_id 做进程内去重（异常重入时不再重复注入）。
+            if _should_nudge_orchestration(
+                allow_subagents=allow_subagents,
+                count=substantive_op_count,
+                session_id=parent_session,
+                turn_id=parent_turn_id,
+                already_sent=orchestration_nudge_sent,
+            ):
+                orchestration_nudge_sent = True
+                _register_orchestration_nudge(parent_turn_id)
+                orchestration_request = {
+                    "role": "user",
+                    "content": _ORCHESTRATION_NUDGE_TEXT,
+                }
+                messages.append(orchestration_request)
+                # 此处不重复加 if stream 守卫：flush_persistence() 内部已以
+                # `if stream and pending_persistence` 整体兜底，非持久化会话
+                # （stream=False，即 persist=False 的内部调用）下该 append 与随后的
+                # flush 均为 no-op，行为等价；与 slow_step_nudge / summary_request /
+                # claim_nudge 等既有 nudge 注入保持同一种写法（统一由 flush_persistence
+                # 兜底，不逐点加守卫）。
+                pending_persistence.append(("user", orchestration_request))
+                # 静默注入：不发 notice 事件（UI 不弹提示卡片），只留 debug 日志
+                logger.debug("已静默注入编排提醒（session=%s turn=%s）", parent_session, parent_turn_id)
+                flush_persistence()
+                progress_guard.observe(
+                    _step_progress_observation(None, session_id=parent_session)
+                )
 
             if event_callback is None:
                 app_context.set_task_status('executing')
@@ -2988,6 +3619,17 @@ def _chat_with_model_generator(
             response_stream.close()
         except Exception:
             pass
+        # A1-02：连接中断等通用异常同样先把本 step 已生成的部分正文与待写
+        # 队列打捞落库（带「[本轮流式中断]」标注）——否则用户所见正文重开
+        # 会话即消失（DB 与所见分叉）。打捞为 best-effort：失败不掩盖原始
+        # 异常的报告流程，仅记录 harness 失败原因。
+        try:
+            salvage_streaming_partial()
+            salvage_persistence_on_cancel()
+            flush_persistence()
+        except Exception as salvage_error:
+            if harness_runtime is not None:
+                harness_runtime.fail(type(salvage_error).__name__)
         # 异常路径同样回滚本轮未持久化的内存消息：既避免留下带 tool_calls 却无
         # tool 响应的悬空 assistant 消息（下一轮 API 会 400），也保持内存历史与 DB 一致
         rollback_turn_messages()
@@ -3007,7 +3649,7 @@ def _chat_with_model_generator(
         else:
             from prompt_toolkit.formatted_text import HTML
 
-            safe_print(HTML(f"<ansiyellow>{_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
+            safe_print(HTML(f"<ansiyellow>{_current_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
         return
     finally:
         # 注入了 system_prompt_extra 时，messages 是本次请求专用的新列表：循环里

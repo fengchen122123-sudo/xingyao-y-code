@@ -96,6 +96,26 @@ def _is_mostly_chinese(text: str) -> bool:
     return (chinese_chars / len(clean)) >= 0.45
 
 
+# 上游会把"模型不存在/不被支持"塞进 401 的错误结构（例如 OpenCode Zen 免费档对
+# 已下线模型回 {"type":"ModelError","message":"Model xxx is not supported"}）。
+# 这类报文与凭证无关，必须先于鉴权分类识别，否则会把用户带向"去查 API Key"的
+# 错误方向（实测案例：模型下线后用户按提示反复检查 Key，问题依旧）。
+_RE_MODEL_UNSUPPORTED = re.compile(
+    r"(?:modelerror"
+    r"|model_not_supported"
+    r"|unsupported_model"
+    r"|model_not_available"
+    r"|model[^,;{}\n]{0,80}?\bnot\s+supported"
+    r"|模型不支持|不支持的模型|模型已下线)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_unsupported_model(text: str) -> bool:
+    """报错文本是否属于"模型不被上游支持/已下线"这一类。"""
+    return bool(_RE_MODEL_UNSUPPORTED.search(text or ""))
+
+
 def map_llm_error(exc: Any) -> LLMErrorInfo:
     """将大模型报错或异常分类映射为结构化的中文错误信息。"""
     raw_str = sanitize_error_text(str(exc or ""))
@@ -144,6 +164,22 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             "未授权",
         )
     ):
+        # 401 也可能只是"模型不被上游支持"（模型下线/不属于该渠道）：此时提示
+        # 用户去查 API Key 会把排障方向带偏，因此先单独归类。
+        if _looks_like_unsupported_model(text_lower):
+            return LLMErrorInfo(
+                category="model_unavailable",
+                title="模型不可用 (上游不支持该模型)",
+                reason=(
+                    "该厂商/网关不认识当前请求的模型名称：它可能已下线、已改名，或不属于当前渠道"
+                    "（例如免费通道轮换了可用模型）。这与 API Key 是否正确无关。"
+                ),
+                suggestion=(
+                    "请在「设置 → 模型管理」中重新选择该厂商当前可用的模型；若使用会轮换模型的"
+                    "免费通道，请以模型列表里的最新名称为准。"
+                ),
+                raw_message=raw_str,
+            )
         return LLMErrorInfo(
             category="auth_invalid",
             title="API 凭证无效 (401 Unauthorized)",

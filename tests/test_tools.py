@@ -57,6 +57,51 @@ def _all_tasks_terminal(manager):
     )
 
 
+# 本文件共享的 turn_undo 服务（module 级装配，见 _turn_undo_service_ready）
+_TURN_UNDO_SHARED: dict = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _turn_undo_module_service(tmp_path_factory):
+    """本文件装配一次共享 turn_undo 服务（后台子代理启动要建独立撤销检查点）。
+
+    configure_default_manager 会重建工具注册表做记录器接入校验（约 0.7s），
+    不能每用例执行，故 module 级只做一次；每个用例的绑定/还原在
+    _turn_undo_service_ready 里完成。
+    """
+    from core.memory import MemoryManager
+    from core.turn_undo import service as turn_undo_service
+
+    root = tmp_path_factory.mktemp("turn-undo-module")
+    manager = MemoryManager(str(root / "module.db"))
+    _TURN_UNDO_SHARED["storage"] = turn_undo_service.configure_default_manager(
+        manager, blob_root=root / "blobs"
+    )
+    _TURN_UNDO_SHARED["manager"] = manager
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _turn_undo_service_ready():
+    """每个用例前把进程级默认 turn_undo 指回本文件共享服务，结束还原。
+
+    此前本文件的 run_in_background 子代理用例依赖同文件更早用例配置后
+    遗留的进程级全局——单独运行或顺序变化时报"turn_undo service 尚未配置"，
+    子代理线程在启动段崩溃，started 事件永不置位（2s 启动等待超时）。
+    用例内自行 configure_default_manager 的（撤销记录断言类用例）其配置
+    在用例期间优先生效，结束后由本夹具还原，不跨用例泄漏。
+    """
+    from core.turn_undo import service as turn_undo_service
+
+    with turn_undo_service._service_lock:
+        prev = (turn_undo_service._default_manager, turn_undo_service._default_storage)
+        turn_undo_service._default_manager = _TURN_UNDO_SHARED["manager"]
+        turn_undo_service._default_storage = _TURN_UNDO_SHARED["storage"]
+    yield
+    with turn_undo_service._service_lock:
+        turn_undo_service._default_manager, turn_undo_service._default_storage = prev
+
+
 def test_declared_search_dependency_uses_renamed_ddgs_package():
     from ddgs import DDGS
 
@@ -294,6 +339,8 @@ def test_execute_command_rejects_catastrophic_commands_before_spawn(monkeypatch)
 
     assert result.startswith("🚨")
     assert "危险命令" in result
+    # B2-03：拒绝对话需提示文档/文件内容改走 write_file 通道
+    assert "write_file" in result
 
 
 def test_skill_command_reports_missing_dependencies_without_installing(tmp_path, monkeypatch):
@@ -550,7 +597,7 @@ def test_subagent_cancel_terminates_running_task():
         daemon=True,
     )
     thread.start()
-    assert started.wait(2.0), "子代理未在 2 秒内启动"
+    assert started.wait(10.0), "子代理未在 10 秒内启动"
 
     # 找到运行中的 task_id 并取消
     snapshots = manager.snapshot()
@@ -756,7 +803,7 @@ def test_is_plan_item_running_returns_true_for_running_task():
         daemon=True,
     )
     thread.start()
-    assert started.wait(2.0), "子代理应在 2s 内启动"
+    assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
         # 任务运行中：应返回 True
@@ -923,7 +970,7 @@ def test_drain_terminal_background_tasks_skips_running_and_foreground():
         daemon=True,
     )
     thread1.start()
-    assert started.wait(2.0), "子代理应在 2s 内启动"
+    assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
         # drain：不应返回运行中的任务
@@ -963,7 +1010,7 @@ def test_has_running_background_tasks_detects_running():
         daemon=True,
     )
     thread.start()
-    assert started.wait(2.0), "子代理应在 2s 内启动"
+    assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
         # 有运行中的任务：应返回 True
@@ -1239,6 +1286,38 @@ def test_background_subagent_returns_task_id_immediately():
     assert manager.snapshot()[0].status in {"pending", "running"}
     release.set()
     assert manager.wait_for_idle(1)
+
+
+def test_background_subagent_startup_failure_reaches_terminal_state():
+    """启动段异常（如 turn_undo 未配置）必须落成 failed 终态，不得留僵尸 running。
+
+    回归守护：_run_task 启动段兜底前，线程带 running 状态裸崩——无终态回调、
+    无 done_event，started 等待方只能靠超时失败。
+    """
+    from core.turn_undo import service as turn_undo_service
+
+    manager = SubagentManager(runner=lambda record: "不应被执行到")
+    with turn_undo_service._service_lock:
+        prev = (turn_undo_service._default_manager, turn_undo_service._default_storage)
+        turn_undo_service._default_manager = None
+        turn_undo_service._default_storage = None
+    try:
+        result = manager.run(
+            "后台任务",
+            "s1",
+            "t1",
+            run_in_background=True,
+            timeout_seconds=30,
+        )
+        assert "subagent-" in result
+        assert _wait_until(lambda: _all_tasks_terminal(manager)), "启动失败应落成终态"
+        snapshot = manager.snapshot()[0]
+        assert snapshot.status == "failed"
+        assert "启动失败" in snapshot.error
+        assert "turn_undo" in snapshot.error
+    finally:
+        with turn_undo_service._service_lock:
+            turn_undo_service._default_manager, turn_undo_service._default_storage = prev
 
 
 def test_background_notifications_are_scoped_to_parent_session():

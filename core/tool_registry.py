@@ -209,6 +209,26 @@ def build_default_registry() -> ToolRegistry:
             side_effect_scope="none",
         ),
         ToolSpec(
+            name="recall_history",
+            description=(
+                "回溯当前会话更早被压缩归档的原始对话消息。before_msg_id 取自记忆摘要块"
+                "尾部[更早摘要回溯]索引中的 msg_id（或上一批回溯结果里最早一条的 msg_id 减 1，"
+                "避免重复返回该条），返回该边界及其之前（含边界自身）、摘要水位覆盖范围内的"
+                "原始消息（时间正序，含角色）。"
+                "仅用于恢复更早对话的细节；当前活跃上下文里已有的内容无需回溯。"
+            ),
+            input_schema=_schema({
+                "before_msg_id": {"type": "integer", "description": "读取该 msg_id 及其之前（含边界自身）的已压缩消息", "minimum": 1},
+                "limit": {"type": "integer", "default": 16, "minimum": 1, "maximum": 50, "description": "最多返回的消息条数"},
+            }, ["before_msg_id"]),
+            execute=tools.recall_history,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="回溯已压缩的历史消息",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
             name="search_news",
             description="搜索互联网新闻。",
             input_schema=_schema({
@@ -294,6 +314,30 @@ def build_default_registry() -> ToolRegistry:
             parallel_safe=True,
             activity_description="查看星轨自动化任务",
             side_effect_scope="none",  # 表未覆盖：只读查询，无持久副作用
+        ),
+        # 秘书调度台（设计 2026-10-15 第 3 节）：仅秘书会话可见（core.secretary
+        # 的 SECRETARY_ONLY_TOOLS），普通会话的工具集零变化。
+        ToolSpec(
+            name="search_conversations",
+            description=(
+                "检索历史会话（秘书专用）：按关键词 / 日期区间（YYYY-MM-DD）/ 项目"
+                "目录找到用户以前聊过某个话题的会话，返回每个命中的会话名、显示名、"
+                "归属目录、更新时间和命中片段。关键词与日期都为空会被拒绝；先检索再"
+                "回答，不要凭印象猜会话名。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "keyword": {"type": "string", "default": "", "description": "要检索的关键词（可选，与日期至少给一个）"},
+                "date_from": {"type": "string", "default": "", "description": "起始日期 YYYY-MM-DD（可选，含当天）"},
+                "date_to": {"type": "string", "default": "", "description": "结束日期 YYYY-MM-DD（可选，含当天）"},
+                "workdir": {"type": "string", "default": "", "description": "按项目目录过滤（可选）"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "最多返回的会话数（上限 50）"},
+            }),
+            execute=tools.search_conversations,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="检索历史会话",
+            side_effect_scope="none",
         ),
     ]
 
@@ -514,7 +558,13 @@ def build_default_registry() -> ToolRegistry:
                 "正确示例：cd path; javac Foo.java; java Foo\n"
                 "3) 条件串联用 if ($LASTEXITCODE -eq 0) { next }，PowerShell 7+ 才支持 && 运算符\n"
                 "单次执行输出总量上限 1MB（stdout+stderr）：超限会终止进程树并返回截断结果；"
-                "可能长时间刷屏的命令请自行收敛输出（重定向到文件、加 head 或限制范围）。"
+                "可能长时间刷屏的命令请自行收敛输出（重定向到文件、加 head 或限制范围）。\n"
+                "后台模式（run_in_background=true）禁止在命令末尾接 "
+                "| Select-Object -Last、| tail、| head 等缓冲/截断管道："
+                "输出会实时写入任务日志，用户在界面「后台任务」面板实时查看执行过程，"
+                "完成后系统自动取日志尾部汇总，无需自行截尾；"
+                "这类管道（尤其 Select-Object -Last）必须收齐全部输入才开始输出，"
+                "接上去整个运行期日志都只有启动标记一行，用户全程看不到执行进度。"
             ),
             input_schema=_schema({
                 "command": {"type": "string"},
@@ -674,6 +724,25 @@ def build_default_registry() -> ToolRegistry:
             parallel_safe=True,
             activity_description="查看 MCP 服务列表",
             side_effect_scope="none",  # 表未覆盖：只读查询
+        ),
+        # ── 项目浏览器分辨率（星瑶按项目自设视口）─────────────────────────
+        ToolSpec(
+            name="browser_set_viewport",
+            description=(
+                "设置当前项目的浏览器分辨率（逻辑视口宽×高，单位像素），按项目持久化。"
+                "星瑶做浏览器操作时页面按该分辨率渲染：GUI 内置浏览器以适应窗口缩放呈现，"
+                "外部浏览器作为窗口视口。适配移动端页面用 375×667，桌面页面用 1440×900。"
+                "当前会话未关联项目时无法设置。"
+            ),
+            input_schema=_schema({
+                "width": {"type": "integer", "description": "视口宽度（像素），120-8192"},
+                "height": {"type": "integer", "description": "视口高度（像素），120-8192"},
+            }, ["width", "height"]),
+            execute=lambda width, height: _browser_set_viewport_wrapper(width, height),
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="设置项目浏览器分辨率",
+            side_effect_scope="workspace",
         ),
         # ── 星轨自动化工具（对话里创建/修改/删除/立即执行定时任务）───────
         ToolSpec(
@@ -843,6 +912,46 @@ def build_default_registry() -> ToolRegistry:
             activity_description="立即执行星轨自动化任务",
             side_effect_scope="workspace",
         ),
+        # 秘书调度台（设计 2026-10-15 第 4/5 节）：仅秘书会话可见；派活/跳转会
+        # 改动别的会话与界面视图，按保守口径归 system。
+        ToolSpec(
+            name="dispatch_task",
+            description=(
+                "把任务派给指定会话执行（秘书专用）：等价于用户在那个会话亲手发一条"
+                "消息——内容以用户消息落库、界面正常显示、触发一轮真实执行，目标会话忙"
+                "则排队。target 传会话名/显示名，或留空并给 workdir 以新建会话。调用前"
+                "先向用户确认要派给哪个会话以及任务内容；派出去就可能真实改文件。"
+                "返回 JSON 字符串（含 target_session / state）。"
+            ),
+            input_schema=_schema({
+                "target": {"type": "string", "default": "", "description": "目标会话名或显示名；留空或填「新会话」表示新建会话"},
+                "prompt": {"type": "string", "description": "任务正文（必填），会作为用户消息投递给目标会话"},
+                "workdir": {"type": "string", "default": "", "description": "仅新建会话时生效：新会话归属的项目目录"},
+                "model_id": {"type": "string", "default": "", "description": "可选，指定目标使用的模型；留空沿用会话默认"},
+                "permission_mode": {"type": "string", "default": "", "description": "可选，指定目标会话的权限档位；留空沿用会话自身档位"},
+            }, ["prompt"]),
+            execute=tools.dispatch_task,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="派发任务给会话",
+            side_effect_scope="system",  # 表未覆盖：会向其它会话投递消息并触发真实执行
+        ),
+        ToolSpec(
+            name="open_session",
+            description=(
+                "把用户带到某个历史会话（秘书专用）：纯系统层切换，界面直接切过去，"
+                "不打断目标会话正在执行的回合。target 传会话名 / 显示名 / 关键词；"
+                "命中多条时要先问清是哪一条。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "target": {"type": "string", "description": "会话名、显示名或关键词（必填）"},
+            }, ["target"]),
+            execute=tools.open_session,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="跳转到会话",
+            side_effect_scope="system",  # 表未覆盖：切换当前会话与界面视图
+        ),
     ]
     registry = ToolRegistry([*read_specs, *mutating_specs])
     # 加载进程内插件（plugins/ 与 ~/.ycode/plugins/）。插件加载全程隔离，
@@ -903,6 +1012,29 @@ def _mcp_set_enabled_wrapper(name, enabled):
 def _mcp_list_servers_wrapper():
     from core.mcp_client import mcp_manager
     return ToolResult(content=mcp_manager.list_servers(), is_error=False)
+
+
+# ── 项目浏览器分辨率工具的执行包装函数 ──────────────────────────────
+def _browser_set_viewport_wrapper(width, height):
+    from core.computer.models import ComputerControlError
+    from core.computer.settings import set_project_browser_viewport
+    from core.workspace_context import get_workdir
+
+    workdir = get_workdir()
+    try:
+        viewport = set_project_browser_viewport(workdir, width, height)
+    except ComputerControlError as error:
+        return ToolResult(content=f"{error.code}: {error.message}", is_error=True)
+    except Exception as error:
+        return ToolResult(content=f"browser_set_viewport 执行失败：{error}", is_error=True)
+    return ToolResult(
+        content=(
+            f"已设置当前项目的浏览器分辨率：{viewport[0]}×{viewport[1]}"
+            "（逻辑像素，按项目持久化）。GUI 内置浏览器已即时按适应窗口缩放"
+            "呈现该分辨率；之后的浏览器自动化也会使用该视口。"
+        ),
+        is_error=False,
+    )
 
 
 # ── 星轨自动化（automation_*）工具的执行包装函数 ──────────────────────

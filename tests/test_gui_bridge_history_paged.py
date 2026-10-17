@@ -222,3 +222,73 @@ def test_switch_session_response_omits_skills_and_skips_scan(monkeypatch):
     assert res["ok"] is True
     assert "skills" not in res
     assert calls == []
+
+
+def test_observation_followup_messages_hidden_from_bubbles():
+    """电脑操控观察跟进消息是系统协议消息：气泡不渲染，模型上下文保留。
+
+    持久化形状与 provider_generic._observation_followup_message 一致：
+    整个 message dict JSON 串、内含 _computer_v1 标记。
+    """
+    import json
+
+    from core.computer.provider_generic import _observation_followup_message
+
+    class _Obs:
+        target = "browser"
+        elements = [
+            {"ref": "el-1", "kind": "link", "name": "主页",
+             "bounds": (10, 20, 30, 40), "enabled": True},
+        ]
+        png_path = ""
+
+    bridge = _bare_bridge()
+    bridge._memory.add_message("s", "user", "帮我打开浏览器看看")
+    followup = _observation_followup_message(_Obs(), run_id="run-1", ordinal=1)
+    bridge._memory.add_message("s", "user", json.dumps(followup, ensure_ascii=False))
+    bridge._memory.add_message("s", "assistant", "done")
+
+    msgs, _, _ = bridge._load_session_messages("s")
+
+    user_contents = [m["content"] for m in msgs if m["role"] == "user"]
+    assert user_contents == ["帮我打开浏览器看看"]
+
+    # 展示过滤绝不影响模型上下文：跟进消息仍在 get_history 里
+    history_roles = [m["role"] for m in bridge._memory.get_history("s")]
+    assert history_roles.count("user") == 2
+
+
+# ---------------------------------------------------------------------------
+# 翻页失败不得冒充「已到最早」（用户反馈：红点导航点最上面一个点无法加载到最上面）
+# ---------------------------------------------------------------------------
+
+
+def test_load_older_messages_reports_failure_instead_of_fake_end(monkeypatch):
+    """翻页读库失败必须返回 ok=False，绝不谎报 has_more=False。
+
+    故障链路（2026-10-11 用户反馈）：读库异常被 _load_session_messages 吞掉后
+    返回「空页 + has_more=False + oldest_id=None」，前端把这当成「已到最早」写进
+    会话分页状态并随会话保存 —— 之后滚动到顶不再加载更早消息、点未加载红点
+    （最上面那个点）毫无反应，切走再切回依然失效。
+    """
+    import sqlite3
+
+    bridge = _bare_bridge()
+    _seed(bridge._memory, "s", 120)
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(bridge._memory, "get_history_paged", boom)
+
+    res = bridge.load_older_messages("s", 100)
+    assert res["ok"] is False
+    assert res["messages"] == []
+    assert res["oldest_id"] is None
+    assert "locked" in res["msg"]
+
+    # 首页路径（switch_session / get_initial_state）保持既有容错：不抛异常、返回空页
+    msgs, has_more, oldest_id = bridge._load_session_messages("s")
+    assert msgs == []
+    assert has_more is False
+    assert oldest_id is None

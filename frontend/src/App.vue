@@ -44,7 +44,7 @@
     <div id="main" :class="{ 'panel-resizing': anyPanelResizing }">
       <SettingsPage v-if="store.settingsOpen" />
       <template v-else>
-      <!-- 左侧边栏 -->
+      <!-- 左侧边栏：会话列表与项目分组入口 -->
       <Sidebar />
 
       <!-- 左栏宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
@@ -61,8 +61,35 @@
       <!-- 中间主对话与聊天区域 -->
       <div id="center">
         <div id="chat-header" data-theme-region="conversation_toolbar">
-          <span class="crumb">会话 / <b>{{ store.currentSessionDisplayName }}</b></span>
+          <span class="crumb">
+            会话 / <b>{{ store.currentSessionDisplayName }}</b>
+          </span>
           <span class="top-spacer"></span>
+
+          <!-- 计划入口：星瑶创建了任务计划时显示；悬浮面板锚定在按钮下方，不遮全屏 -->
+          <div v-if="taskEntry.visible" class="plan-entry-wrap">
+            <button
+              class="chip-btn task-entry"
+              data-test="task-entry"
+              title="查看任务计划执行进度"
+              @click.stop="taskDialogOpen = !taskDialogOpen"
+            >
+              <AppIcon name="loader" :size="12" :stroke-width="2" :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }" /> 计划
+              <span v-if="taskEntry.activeCount > 0" class="task-entry-badge" data-test="task-entry-badge">{{ taskEntry.activeCount }}</span>
+            </button>
+            <TaskProgressDialog v-if="taskDialogOpen" @close="taskDialogOpen = false" />
+          </div>
+
+          <!-- 决策入口：点击查看 JEV 决策记录（设置页「决策模型」的轻量视图） -->
+          <div class="decision-entry-wrap">
+            <button
+              class="chip-btn"
+              data-test="decision-entry"
+              title="查看 JEV 决策记录"
+              @click.stop="decisionPanelOpen = !decisionPanelOpen"
+            ><AppIcon name="brain" :size="12" :stroke-width="2" /> 决策<span v-if="store.decisionUnread > 0" class="decision-entry-badge" data-test="decision-entry-badge">{{ store.decisionUnread > 99 ? '99+' : store.decisionUnread }}</span></button>
+            <DecisionRecordPopup v-if="decisionPanelOpen" @close="decisionPanelOpen = false" />
+          </div>
 
           <div class="export-wrap">
             <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /> 导出</button>
@@ -72,11 +99,20 @@
               <div class="export-item" @click="doExport('json')">JSON (.json)</div>
             </div>
           </div>
+
+          <!-- Git 分支入口（原输入栏 chip 迁移至此）：非 Git 工作区不显示；点击打开右侧 Git 管理面板 -->
+          <button
+            v-if="gitBranchLabel"
+            data-test="chat-header-git-branch"
+            class="chip-btn git-branch-btn"
+            title="Git 工作台：点击打开 Git 管理面板"
+            @click.stop="openGitPanel"
+          ><AppIcon name="git-branch" :size="12" :stroke-width="2" /><span class="git-branch-label">{{ gitBranchLabel }}</span></button>
         </div>
 
         <!-- 电脑操控安全条（设计 16.1）：聊天标题栏下方、滚动区外——对话滚动时保持可见；
              仅 run 活动期（starting/running/paused/waiting_for_user/
-             provider_safety_required/stopping/failed）渲染 -->
+             provider_safety_required/stopping/failed）且 run 归属当前会话时渲染 -->
         <ComputerControlBar />
 
         <!-- 对话主体滚动区：.chat-viewport 是不滚动的定位外壳，
@@ -143,6 +179,7 @@
             ref="railRef"
             :get-scroll-el="() => chatScrollRef"
             :get-user-msg-elements="getUserMsgElements"
+            :get-user-msg-element-by-id="getUserMsgElementById"
             :nav-items="store.navItems"
             :loaded-first-id="store.firstLoadedMsgId"
             @jump="onNavJump"
@@ -168,9 +205,17 @@
           @close="store.closeSubpage()"
         />
 
+        <!-- 后台任务执行条：list_active_tasks 快照非空时出现，详情展开任务卡片 -->
+        <BackgroundTasksBar />
+
         <!-- 底部固定输入框：跟随中间对话栏宽度（存在消息时呈现） -->
         <InputArea v-if="store.messages && store.messages.length > 0" />
+
+        <!-- 底部内嵌交互式终端（ZCode 式弹出）：v-show 保持挂载，
+             收起期间输出持续累积到 xterm 缓冲不丢失。 -->
+        <TerminalPane v-show="store.terminalPanelOpen" />
       </div>
+
 
       <!-- 右面板宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
       <div
@@ -183,8 +228,9 @@
         @dblclick="resetRightPanelWidth"
       ></div>
 
-      <!-- 右侧控制面板 -->
-      <RightPanel />
+      <!-- 右侧控制面板：必须用 v-show 而不是 v-if——卸载会重建组件，它内部的原生
+           WebView2 表面来不及 hide 就会以白块形式留在屏幕上 -->
+      <RightPanel v-show="!store.rightPanelCollapsed" />
       </template>
     </div>
 
@@ -218,6 +264,13 @@
         :class="{ 'si-warn': store.sandboxEnabled }"
         :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅允许访问工作目录内文件'"
       >沙盒: {{ store.sandboxEnabled ? '解除' : '限制' }}</span>
+      <!-- AI 生成内容声明：居中落在状态栏中段剩余区域，空间不足时收缩省略 -->
+      <span
+        class="si status-ai-notice"
+        data-test="status-ai-notice"
+        data-mobile-status="hidden"
+        title="本界面展示的内容由 AI 生成，仅供参考，请仔细甄别"
+      ><span class="notice-text">内容由 AI 生成，仅供参考，请仔细甄别</span></span>
       <div class="right status-runtime" data-test="status-runtime">
         <span class="si" data-test="status-running" data-mobile-status="primary">{{ store.running ? '生成中…' : '空闲' }}</span>
         <span class="si" data-test="status-charset" data-mobile-status="hidden">UTF-8</span>
@@ -302,10 +355,15 @@ import KimiEmptyState from './components/KimiEmptyState.vue';
 import TurnGroup from './components/TurnGroup.vue';
 import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
+import TerminalPane from './components/TerminalPane.vue';
 import ComputerControlBar from './components/ComputerControlBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
 import SessionSearchModal from './components/SessionSearchModal.vue';
+import TaskProgressDialog from './components/TaskProgressDialog.vue';
+import DecisionRecordPopup from './components/DecisionRecordPopup.vue';
+import BackgroundTasksBar from './components/BackgroundTasksBar.vue';
+import { taskEntryState } from './utils/taskEntry';
 // 免责条款首次使用确认（合规链路）：未同意或条款升级后强制弹出，不同意则退出
 import DisclaimerGate from './components/DisclaimerGate.vue';
 import PermCard from './components/PermCard.vue';
@@ -377,6 +435,8 @@ const {
   defaultWidth: RIGHT_PANEL_DEFAULT_WIDTH,
   getWidth: () => store.rightPanelWidth,
   setWidth: (w) => { store.rightPanelWidth = w; },
+  // 右面板按视口比例记忆：窗口放大/缩小等比跟随，拖到 50% 就一直保持 50%
+  viewportRatio: true,
 });
 // 拖拽期间给 #main 加 class：全局禁文本选择并强制 col-resize 光标
 const anyPanelResizing = computed(() => sidebarResizing.value || rightPanelResizing.value);
@@ -392,13 +452,24 @@ function backToThemeEditor() {
 
 const showExportMenu = ref(false);
 
+// 会话头部“计划”入口 + 任务计划进度对话框：计划数据由 plan_updated 事件流
+// 实时驱动，入口只在存在计划时显示，角标统计进行中的计划条目
+const taskDialogOpen = ref(false);
+// 决策记录入口：与计划入口同款悬浮面板（数据由 DecisionRecordPopup 自拉取）
+const decisionPanelOpen = ref(false);
+const taskEntry = computed(() => taskEntryState({ plan: store.planData }));
+
 async function doExport(fmt: 'md' | 'html' | 'json') {
   showExportMenu.value = false;
   await store.exportSession(fmt);
 }
 
-function closeExportMenu() {
+// 文档级点击统一收起头部悬浮层（导出菜单/计划面板）；按钮与面板内部
+// 用 @click.stop 挡泡，避免点开即关
+function closeHeaderPopovers() {
   showExportMenu.value = false;
+  taskDialogOpen.value = false;
+  decisionPanelOpen.value = false;
 }
 
 const statusTokenPct = computed(() => {
@@ -415,10 +486,15 @@ const gitBranchText = computed(() => {
   const base = gitStore.statusbarText;
   return base || '';
 });
+// 会话标题栏 Git chip 文案：去掉底栏文本的 ⎇ 前缀（迁移自输入栏 InputArea 的原实现）
+const gitBranchLabel = computed(() => {
+  const text = gitStore.statusbarText;
+  return text ? text.slice(2) : '';
+});
 function openGitPanel() {
   // 非 Git 项目点击不展开（面板内已有"非仓库"提示态），避免空操作困惑
   gitStore.requestOpenPanel();
-  if (store.rightPanelCollapsed) store.toggleRightPanel();
+  store.openRightPanelTab('git');
 }
 watch(
   () => store.workdir,
@@ -524,7 +600,9 @@ async function maybeLoadOlder() {
   const el = chatScrollRef.value;
   if (!el || el.scrollTop >= 120) return;
   // 调用方已保证本次是「用户滚动」来源；跳转/补偿等程序化滚动不会走到这里
-  if (!store.historyHasMore || store.historyLoading) return;
+  // 守卫与 store 的翻页守卫同源：has_more=false 但游标为空 = 分页状态未初始化/
+  // 被失败响应清空，此时仍要进 store 走一次自愈 + 真实翻页，否则滚到顶永远不加载
+  if (!(store.historyHasMore || store.historyOldestId == null) || store.historyLoading) return;
   const oldHeight = el.scrollHeight;
   const oldTop = el.scrollTop;
   // 用户接管检测：校正期间用户若主动滚动就立即让位。触发翻页那一瞬的惯性
@@ -580,6 +658,9 @@ async function maybeLoadOlder() {
 // 不补偿就会「一直跳动」；补偿后再让出一帧渲染，避免批量变化把锚点冲垮。
 // 跳转已由 rail 的 jumpStart 退出跟随（following=false），翻页期间内容变化
 // 不再吸底，无需任何抑制窗口；seq 令牌保证连续点击时旧循环立即让位。
+// 终止条件不信任 store.historyHasMore：该标记可能是过期值或被失败响应清空，
+// 一旦如此跨页跳转会直接放弃（点最上面的红点毫无反应，用户反馈过）。改为
+// 真调一次翻页、按「已加载首条 / 游标是否推进」判定还有没有更早历史。
 let navJumpSeq = 0;
 async function onNavJump(payload: { index: number; id: number }) {
   const seq = ++navJumpSeq;
@@ -591,16 +672,21 @@ async function onNavJump(payload: { index: number; id: number }) {
     if (seq !== navJumpSeq) return; // 新跳转接管：旧循环退出
     if (store.currentSessionName !== sessionAtJump) return; // 切会话：放弃跳转
     const first = store.firstLoadedMsgId;
-    if (first !== null && payload.id >= first) break;
-    if (!store.historyHasMore) break;
+    if (first !== null && payload.id >= first) break; // 目标已进入已加载区
+    const cursorBefore = store.historyOldestId;
     const oldHeight = el?.scrollHeight ?? 0;
     const oldTop = el?.scrollTop ?? 0;
-    await store.loadOlderMessages();
+    // force=true：入口不信任 historyHasMore（该标记随会话 runtime 保存/恢复，
+    // 可能是坏值）——否则跨页跳转在这里就被拦死，表现为点未加载红点没反应
+    await store.loadOlderMessages(true);
     await nextTick();
     if (!el || chatScrollRef.value !== el || store.currentSessionName !== sessionAtJump) return;
     if (seq !== navJumpSeq) return;
     // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加
     el.scrollTop = el.scrollHeight - oldHeight + oldTop;
+    // 无进展（游标未推进、已加载首条也未变）= 真的没有更早历史（或本次读库失败）：
+    // 停止翻页，交回 rail 把视口停在已加载区最上面
+    if (store.historyOldestId === cursorBefore && store.firstLoadedMsgId === first) break;
     // 让出一帧：给布局/anchoring 落地时间，下一轮 prepend 不在同一帧内叠加
     await new Promise<void>((resolve) => {
       window.requestAnimationFrame(() => resolve());
@@ -608,7 +694,9 @@ async function onNavJump(payload: { index: number; id: number }) {
   }
   if (seq !== navJumpSeq) return;
   await nextTick();
-  railRef.value?.jumpToLoaded?.(payload.index);
+  // 交回定位时带目标 id：rail 按 id 精确查找目标气泡（索引换算兜底），
+  // 翻页边界对齐异常时也不会把落点换到邻近消息上
+  railRef.value?.jumpToLoaded?.(payload.index, payload.id);
 }
 
 // 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
@@ -618,6 +706,12 @@ function refreshRail() {
 }
 function getUserMsgElements(): HTMLElement[] {
   return Array.from(chatScrollRef.value?.querySelectorAll('.msg-user') ?? []);
+}
+// 按消息 id 在已加载 DOM 内精确定位 user 气泡（红点跳转的权威通道）：
+// 索引换算依赖分页边界推断，边界漂移时会落到邻近消息上；id 直达目标。
+// 限定在 #chat-scroll 容器内查找，rail 不直接感知全局 DOM。
+function getUserMsgElementById(id: number): HTMLElement | null {
+  return chatScrollRef.value?.querySelector(`.msg-user[data-msg-id="${id}"]`) ?? null;
 }
 
 // 新用户消息（发送）→ 强制回底并恢复跟随；其余消息变化仅在跟随模式下跟随。
@@ -815,8 +909,7 @@ function onPywebviewReady() {
 }
 
 function onGlobalKeydown(e: KeyboardEvent) {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
-    // 拦截全局 Ctrl+F / Cmd+F 呼出会话多维检索面板
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {    // 拦截全局 Ctrl+F / Cmd+F 呼出会话多维检索面板
     e.preventDefault();
     if (store.sessionSearchModal.show) {
       store.closeSessionSearchModal();
@@ -844,10 +937,18 @@ function onGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
+let bgTaskPollTimer: number | undefined;
+
 onMounted(() => {
-  document.addEventListener('click', closeExportMenu);
+  document.addEventListener('click', closeHeaderPopovers);
   window.addEventListener('keydown', onGlobalKeydown);
   void syncInitialWindowMaximized();
+  // 启动拉一次后台任务快照，并每 5 秒轮询：底部执行条、关闭确认的
+  // hasActiveTasks 都依赖它保持新鲜（list_active_tasks 为进程内查询，开销极小）
+  void store.refreshBackgroundTasks();
+  bgTaskPollTimer = window.setInterval(() => {
+    void store.refreshBackgroundTasks();
+  }, 5000);
 
   // 窗口重新聚焦时校准电脑操控快照（设计 16.4）：_js_queue 满时允许丢新事件，
   // 终态不能只依赖事件推送，聚焦即用 get_computer_control_status() 复核
@@ -878,7 +979,8 @@ onMounted(() => {
   ensureBodyObserver();
 });
 onUnmounted(() => {
-  document.removeEventListener('click', closeExportMenu);
+  document.removeEventListener('click', closeHeaderPopovers);
+  clearInterval(bgTaskPollTimer);
   window.removeEventListener('keydown', onGlobalKeydown);
   window.removeEventListener('focus', onWindowFocusRecalibrateComputer);
   window.removeEventListener('pywebviewready', onPywebviewReady);
@@ -1160,6 +1262,7 @@ onUnmounted(() => {
   flex: 1;
   display: flex;
   min-height: 0;
+  position: relative;
 }
 
 /* 面板宽度拖拽手柄：5px 隐形热区压在分界线上（负 margin 向两侧各溢出
@@ -1249,12 +1352,76 @@ onUnmounted(() => {
 #chat-header .crumb {
   font-size: 13px;
   color: var(--text-dim);
+  /* 会话名必须可压缩：空间不足时省略号截断，而不是把右侧操作按钮挤出行外 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #chat-header .crumb b {
   color: var(--text);
 }
+/* 对话头部 Git 分支 chip：图标 + 分支名，空间不足时省略号收缩（min-width:0
+   才能突破 flex 最小内容宽度，否则按钮被挤成竖条、不省略） */
+#chat-header .git-branch-btn {
+  max-width: 200px;
+  min-width: 0;
+}
+#chat-header .git-branch-btn .git-branch-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .top-spacer {
   flex: 1;
+}
+
+/* 会话头部“计划”入口：进行中徽标 + 运行时旋转图标；悬浮面板锚定其下 */
+.plan-entry-wrap {
+  position: relative;
+}
+/* 会话头部“决策”入口：与计划入口同款锚定容器 */
+.decision-entry-wrap {
+  position: relative;
+}
+.decision-entry-badge {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-radius: 99px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  display: inline-block;
+}
+.task-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.task-entry-badge {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 99px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+@keyframes task-entry-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.task-entry .task-entry-spin {
+  animation: task-entry-spin 0.9s linear infinite;
 }
 
 .chat-viewport {
@@ -1263,11 +1430,24 @@ onUnmounted(() => {
   flex-direction: column;
   min-height: 0;
   position: relative;
+  /* 会话区做成与下方输入框一致的浮层卡片：四周 6px 衬边。
+     用 padding 而非 margin：margin 区不绘制本元素背景。
+     衬边色跟随工作区分区的背景透明度混合（--theme-workspace-* 由主题运行时
+     写在 documentElement 上）：实色主题 opacity=100% 衬边为纯白面板色；
+     全局背景图皮肤下调低透明度时，衬边与会话区一起透出背景图，
+     否则不透明白垫在半透明会话区下面会把背景图整块挡死。 */
+  padding: 6px;
+  background: color-mix(in srgb, var(--bg1) var(--theme-workspace-bg-opacity-pct, 100%), transparent);
 }
 #chat-scroll {
   flex: 1;
   overflow-y: auto;
   padding: 20px 28px 10px;
+  /* 圆角对齐输入框 #input-box（10px），内容随圆角裁剪；
+     描边与输入框同款：主题里会话区底色常与四周留白的 app 底色几乎同色，
+     没有这条 1px 描边时圆角卡片边界不可见（"看不到留白"的根因） */
+  border: 1px solid var(--border);
+  border-radius: 10px;
   /* 保留浏览器 scroll anchoring（默认 auto）：翻页 prepend 与图片/异步内容
      分批撑高时由渲染引擎持续保持视口锚点，这是"不回退"的主力机制。
      JS 侧 maybeLoadOlder 的补偿是绝对定位赋值（oldTop + 内容增量），
@@ -1378,6 +1558,20 @@ onUnmounted(() => {
 }
 #statusbar .si-warn {
   color: var(--orange);
+}
+/* AI 生成内容声明：占据状态栏中段剩余空间并居中，窄窗口时优先收缩省略 */
+#statusbar .status-ai-notice {
+  flex: 1 1 auto;
+  min-width: 0;
+  justify-content: center;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+#statusbar .status-ai-notice .notice-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #statusbar .right {
   margin-left: auto;

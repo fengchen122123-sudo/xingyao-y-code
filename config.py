@@ -182,6 +182,21 @@ REMOTE_PAIR_TOKEN_EXPIRES_KEY = "remote_pair_token_expires_at"
 # 配对端口持久化键：重启后复用同一端口，二维码 URL 不变、无需重新扫码
 REMOTE_PAIR_PORT_KEY = "remote_pair_port"
 
+# 飞书通道（在飞书里与星瑶对话）：默认关闭，未配置时不影响任何现有功能。
+# app_secret 写盘前经 core.credentials 加密（dpapi:/keyring: 前缀），读取时解密。
+FEISHU_ENABLED_KEY = "feishu_enabled"
+FEISHU_ENABLED_DEFAULT = False
+FEISHU_APP_ID_KEY = "feishu_app_id"
+FEISHU_APP_ID_DEFAULT = ""
+FEISHU_APP_SECRET_KEY = "feishu_app_secret"
+FEISHU_APP_SECRET_DEFAULT = ""
+# 审批白名单（open_id 列表）；为空时审批卡不渲染按钮
+FEISHU_APPROVERS_KEY = "feishu_approvers"
+FEISHU_APPROVERS_DEFAULT: tuple = ()
+# 固定推送落点（群/单聊 chat_id，oc_ 开头）；为空时推给最后说话的会话
+FEISHU_NOTIFY_CHAT_ID_KEY = "feishu_notify_chat_id"
+FEISHU_NOTIFY_CHAT_ID_DEFAULT = ""
+
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):
     default_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -417,6 +432,49 @@ def save_config_value(key, value):
         return False
 
 
+def save_nested_config_value(dotted_key, value):
+    """保存两层点分路径配置项（如 "memory_compression.watermark_base_tokens"）。
+
+    读-改-写整份 config.json：只改动目标子键，其他所有键（含 providers / theme）
+    原样保留；父级不存在或不是 dict 时创建空 dict。
+    与 save_config_value 同风格：复用 _CONFIG_LOCK 与 _atomic_write_json，
+    异常时记运行告警并返回 False，绝不把异常抛给调用方。
+    """
+    try:
+        parts = [part for part in str(dotted_key).split(".") if part]
+        if len(parts) != 2:
+            raise ValueError(f"只支持两层点分路径，收到 {dotted_key!r}")
+        parent_key, child_key = parts
+        with _CONFIG_LOCK:
+            data = _load(managed=False)
+            if not isinstance(data, dict):
+                data = {}
+            before = dict(data)
+            parent = data.get(parent_key)
+            if not isinstance(parent, dict):
+                parent = {}
+                data[parent_key] = parent
+            parent[child_key] = value
+            data, rejected = enforce_managed_writes(data, before)
+            _atomic_write_json(_CONFIG_FILE, data)
+        # config.toml 是只读覆盖层（读取时后合并）：同名子键会盖掉刚写入的值，
+        # 保存"成功却不生效"必须留痕
+        overlay = _read_toml_overlay(_TOML_CONFIG_FILE)
+        if isinstance(overlay, dict):
+            section = overlay.get(parent_key)
+            if isinstance(section, dict) and child_key in section:
+                _log_warning(
+                    "config.toml 中定义了键 [%s]，刚写入 config.json 的同名值在下次读取时"
+                    "仍会被 TOML 覆盖而不生效；如需修改生效值请编辑或删除 config.toml 中的对应键",
+                    dotted_key,
+                )
+        return parent_key not in rejected
+    except Exception as e:
+        # 调用方普遍不检查返回值，失败必须留下诊断痕迹而不是静默丢配置
+        _log_warning("save_nested_config_value(%r) 写入 config.json 失败: %s", dotted_key, e)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # T2 配置未知键校验：手改 config.json 拼错字段名时给出可见告警（此前静默无效）。
 # 只校验「键名」，不做类型/取值校验，也不触碰任何写路径。
@@ -447,14 +505,19 @@ KNOWN_CONFIG_KEYS = frozenset({
     # 局域网远程控制
     "remote_token_ttl", "remote_pair_token", "remote_pair_token_expires_at",
     "remote_pair_port",
+    # 飞书通道（在飞书里与星瑶对话）
+    "feishu_enabled", "feishu_app_id", "feishu_app_secret", "feishu_approvers",
+    "feishu_notify_chat_id",
     # 数据迁移
     "media_v1_migration_done",
     # 本任务新增：严格模式开关
     "strict_config",
     # 缓存路由显式配置（core/route_overrides.py CONFIG_KEY、core/llm_dialects.py
-    # _KEEPALIVE_ROUTES_CONFIG_KEY / _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY）、保活
+    # _KEEPALIVE_ROUTES_CONFIG_KEY）、保活
     # 证据门开关（_KEEPALIVE_EVIDENCE_GATE_CONFIG_KEY）与 prompt_cache_key
-    # 白名单（_AFFINITY_LANES_CONFIG_KEY）
+    # 白名单（_AFFINITY_LANES_CONFIG_KEY）。
+    # deepseek_cache_routes：已废弃不再读取（ledger 改纯模型家族判定），保留
+    # 键仅为旧 config.json 兼容（写入无任何效果，不会触发未知键告警）。
     "route_request_overrides", "cache_keepalive_routes", "deepseek_cache_routes",
     "cache_keepalive_evidence_gate", "cache_affinity_lanes",
 })
@@ -469,6 +532,9 @@ KNOWN_NESTED_CONFIG_KEYS = {
         "tool_result_token_limit", "summary_length_first", "summary_length_merge",
         "max_chunk_token_budget", "inter_chunk_delay_seconds", "max_total_seconds",
         "precompress_ratio",
+        # 水位线计算基准上限（tokens）：core/memory_compressor 读取、core/context_watermark
+        # 读写。漏登记会让启动误报「未知配置键（不会生效）」，strict_config 下还会阻断启动。
+        "watermark_base_tokens", "model_watermark_bases",
     }),
     "shell_env_policy": frozenset({
         "inherit", "exclude_sensitive", "exclude", "include_only", "set",
@@ -483,6 +549,10 @@ _KNOWN_PROVIDER_KEYS = frozenset({
     # 历史功能键：dd839a0（2026-09-19）前的「预设模型删除痕迹」功能已移除，
     # 老配置可能残留此键，按兼容保留（不报未知，避免 strict 模式误阻断启动）。
     "removed_preset_models",
+    # 插件来源标记：插件自举 provider 时写入（core/plugin_loader 据此在插件禁用/
+    # 删除时精确回收，绝不误删用户手配厂商）。属于运行时合法键，不登记会让装过
+    # 插件的用户在 strict_config=true 下被 UnknownConfigKeysError 阻断启动。
+    "managed_by",
 })
 _KNOWN_MODEL_KEYS = frozenset({
     "id", "name", "litellm_model", "context_window", "supports_vision",

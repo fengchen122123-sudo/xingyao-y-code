@@ -1138,6 +1138,16 @@ COMMAND_COMPLETIONS = [
     ("/exit", "退出 星瑶Code"),
 ]
 
+# /session 的子命令补全（与 /session 分支的实际分支保持一致）
+SESSION_SUBCOMMANDS = [
+    ("all", "列出所有目录下的历史会话"),
+    ("archive", "归档指定会话（从默认列表隐藏，数据保留可恢复）"),
+    ("unarchive", "取消归档，恢复回默认会话列表"),
+    ("archived", "列出全部已归档会话"),
+    ("rename", "重命名当前活动会话"),
+    ("delete", "物理删除指定会话"),
+]
+
 
 def _active_reasoning_snapshot():
     """返回 (active_model_id, model_dict, 思考能力快照)；无激活模型时前两者为 None。
@@ -1419,13 +1429,6 @@ def _echo_user_input(html_text: str) -> None:
         _print_turn_separator()
     _turn_separator_needed = True
     print_formatted_text(HTML(html_text))
-
-
-def _format_thinking_elapsed(elapsed: float) -> str:
-    # 短思考（< 1s）用毫秒显示，避免全部显示成 "0.0s" 让用户误以为没思考
-    if elapsed < 1.0:
-        return f"{int(elapsed * 1000)}ms"
-    return f"{elapsed:.1f}s"
 
 
 def _render_public_answer_block(turn_id: str, text: str) -> None:
@@ -2719,11 +2722,14 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("🌟 <b><ansigreen>星瑶Code CLI 系统指令与操作指南</ansigreen></b>"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
         print_formatted_text(HTML("<b><ansiyellow>【1. 会话与上下文管理】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名)"))
+        print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名，A 归档，Tab 切归档区)"))
         print_formatted_text(HTML("  <ansicyan>/session &lt;会话名称&gt;</ansicyan>              : 按名称直接切换到指定会话 (不存在则创建)"))
         print_formatted_text(HTML("  <ansicyan>/session all</ansicyan>                         : 列出所有目录下的历史会话 (含归属路径与时间)"))
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
+        print_formatted_text(HTML("  <ansicyan>/session archive &lt;会话名称&gt;</ansicyan>         : 归档指定会话（从默认列表隐藏，数据保留、可恢复）"))
+        print_formatted_text(HTML("  <ansicyan>/session unarchive &lt;会话名称&gt;</ansicyan>       : 取消归档，恢复回默认会话列表"))
+        print_formatted_text(HTML("  <ansicyan>/session archived</ansicyan>                    : 列出全部已归档会话 (含归档时间与归属路径)"))
         print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
         print_formatted_text(HTML(f"  <ansicyan>/undo [turn_id]</ansicyan>                      : 按回合撤销文件修改（整轮预检+确认；list 列表 / status 状态 / recover 恢复中断事务，默认确认 N，无 --force）"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
@@ -3479,9 +3485,50 @@ def handle_slash_command(command_text):
                         print_formatted_text(HTML("<ansired>❌ 会话重命名失败。</ansired>"))
                 else:
                     print_formatted_text(HTML("<ansired>❌ 用法错误。请输入：/session rename &lt;新名称&gt;</ansired>"))
+            elif sub == "archive" and len(parts) > 2:
+                # 归档会话：从默认列表隐藏，数据零损失、可逆（提示风格对齐 /session delete）
+                target = parts[2].strip("<>")
+                safe_target = _esc(target)
+                if target == current_session:
+                    print_formatted_text(HTML("<ansired>❌ 不能归档当前活跃会话，请先切换到其它会话。</ansired>"))
+                    return
+                if not manager.archive_session(target):
+                    print_formatted_text(HTML(f"<ansired>❌ 会话 {safe_target} 不存在，未执行归档。</ansired>"))
+                    return
+                print_formatted_text(HTML(
+                    f"<ansigreen>✔ 会话 {safe_target} 已归档（数据保留，可用 /session unarchive {safe_target} 恢复）。</ansigreen>"
+                ))
+            elif sub == "unarchive" and len(parts) > 2:
+                # 取消归档：把会话恢复回默认列表（幂等，未归档会话调用同样安全）
+                target = parts[2].strip("<>")
+                safe_target = _esc(target)
+                if not manager.unarchive_session(target):
+                    print_formatted_text(HTML(f"<ansired>❌ 会话 {safe_target} 不存在，未执行取消归档。</ansired>"))
+                    return
+                print_formatted_text(HTML(f"<ansigreen>✔ 会话 {safe_target} 已取消归档，已恢复回会话列表。</ansigreen>"))
+            elif sub in ("archive", "unarchive"):
+                print_formatted_text(HTML(f"<ansired>❌ 用法错误。请输入：/session {sub} &lt;会话名称&gt;</ansired>"))
+            elif sub == "archived":
+                # 列出全部已归档会话（含归档时间、消息数、归属目录），格式对齐 /session all
+                archived_sessions = manager.get_all_sessions(archived_only=True)
+                if not archived_sessions:
+                    print_formatted_text(HTML("<ansiyellow>(没有任何已归档会话)</ansiyellow>"))
+                else:
+                    print_formatted_text(HTML("<b><ansicyan>已归档会话（按归档时间排序）：</ansicyan></b>"))
+                    for s in archived_sessions:
+                        time_str = (s.get("updated_at") or "-")[:16]
+                        archived_at = (s.get("archived_at") or "-")[:16]
+                        workdir = s.get("workdir") or "(历史遗留/全局)"
+                        print_formatted_text(HTML(
+                            f"  - <b>{_esc(s['name'])}</b>  [{_esc(time_str)}]  ({s['count']} 条消息)  <ansigray>{_esc(workdir)}</ansigray>  <ansigray>归档于 {_esc(archived_at)}</ansigray>"
+                        ))
             else:
                 # 向后兼容：默认会话切换 /session <会话名>
                 target = parts[1].strip("<>")
+                # 不变量：切换到归档会话时自动取消归档，避免「会话处于归档态却正在被使用」
+                if target in {s["name"] for s in manager.get_all_sessions(archived_only=True)}:
+                    manager.unarchive_session(target)
+                    print_formatted_text(HTML(f"<ansiyellow>✔ 会话 {_esc(target)} 已自动取消归档。</ansiyellow>"))
                 # 确保目标会话在数据库中已存在，避免后续 get_history/计划绑定/压缩
                 # 基于一个不存在的 session_name 工作，导致状态失配。
                 manager.create_session_explicit(target)
@@ -3536,8 +3583,9 @@ def handle_slash_command(command_text):
                 if shell_log_available:
                     print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
                     # Low 修复：任务日志可能携带 ANSI 控制序列，直接 print 会注入终端样式；
-                    # 与 history_renderer 一致，剥离 ESC 字符后再输出。
-                    print(output.replace("\x1b", ""))
+                    # get_task_output 已整段剥离，这里兜底再过一次共享清洗函数
+                    from core.process_io import strip_ansi_escapes
+                    print(strip_ansi_escapes(output))
                 else:
                     # 再查子代理任务状态
                     sub_tasks = subagent_manager.snapshot()
@@ -4327,6 +4375,18 @@ def _make_input_app():
                                 opt_id,
                                 start_position=-len(typed),
                                 display_meta="解释器: " + label + ("" if available else " (未安装)"),
+                            )
+                    return
+                # /session 子命令补全：让归档等子命令可被直接发现（对照 /shell 的写法）
+                session_arg = re.match(r'^/sessions?\s+(\S*)$', text)
+                if session_arg is not None:
+                    typed = session_arg.group(1)
+                    for sub_name, sub_desc in SESSION_SUBCOMMANDS:
+                        if sub_name.startswith(typed.lower()):
+                            yield Completion(
+                                sub_name,
+                                start_position=-len(typed),
+                                display_meta="会话子命令: " + sub_desc,
                             )
                     return
                 word = document.get_word_before_cursor(WORD=True)
@@ -5235,19 +5295,37 @@ def _background_worker():
             def _turn_notify(kind, message):
                 schedule_ui(lambda text=message: print_formatted_text(HTML(text)))
 
-            history = _agent_service.prepare_turn_messages(
-                manager,
-                task_session,
-                task_model,
-                task_ctx_win,
-                permission_mode=current_permission_mode,
-                cancel_event=early_cancel,
-                notify=_turn_notify,
-                api_key=task_key,
-                api_base=task_url,
-                compress_threshold=MEMORY_COMPRESS_THRESHOLD,
-                referenced_sessions=session_refs,
-            )
+            # 闲时维护：回合开始即撤销本会话的空闲维护任务并协作中断在跑的
+            # 闲时压缩（见 core/idle_maintenance.py），结束在 finally 重新计时
+            try:
+                from core.idle_maintenance import idle_maintenance_service
+                idle_maintenance_service.on_turn_started(task_session)
+            except Exception:
+                pass
+
+            try:
+                history = _agent_service.prepare_turn_messages(
+                    manager,
+                    task_session,
+                    task_model,
+                    task_ctx_win,
+                    permission_mode=current_permission_mode,
+                    cancel_event=early_cancel,
+                    notify=_turn_notify,
+                    api_key=task_key,
+                    api_base=task_url,
+                    compress_threshold=MEMORY_COMPRESS_THRESHOLD,
+                    referenced_sessions=session_refs,
+                )
+            except Exception:
+                # 回合在进入下方 try/finally 之前早退：on_turn_started 已置位的
+                # 闲时维护忙位必须在这里收口，否则该会话的闲时任务在到期时
+                # 被忙闲复查跳过，直到下一个成功回合才自愈
+                try:
+                    idle_maintenance_service.on_turn_finished(task_session, notify=None)
+                except Exception:
+                    pass
+                raise
 
 
             # 后台线程只切换 UI 状态，不直接触碰 prompt_toolkit 布局。
@@ -5358,6 +5436,12 @@ def _background_worker():
                 is_thinking = False
                 task_status = "idle"
                 _clear_active_thinking()
+                # 闲时维护重新计时：空闲超过配置延时后跑水位线维护与压缩
+                # （默认开，config memory_compression.idle_maintenance_seconds = 0 关闭）
+                try:
+                    idle_maintenance_service.on_turn_finished(task_session, notify=_turn_notify)
+                except Exception:
+                    pass
                 from core import tool_cache as _tool_cache
                 _tool_cache.set_current_session(None)
                 # 清理卡在 in_progress 的计划项：子 agent 异常退出（超时/崩溃/未调用 terminal_callback）
@@ -5658,7 +5742,11 @@ def run_cli():
         try:
             key_input = input("👉 API Key: ").strip()
             if key_input:
-                current_key = key_input
+                # 多 Key（换行/逗号/分号分隔）：运行时先用首个 Key；完整原文照常
+                # 写入配置，后续所有读取统一走 Key 池（get_active_model → 单 Key）。
+                from core.provider_keys import split_provider_keys
+                _parsed_keys = split_provider_keys(key_input)
+                current_key = _parsed_keys[0] if _parsed_keys else key_input
                 _sync_active_model_context()
                 from core.model_manager import load_config, _write_config
                 cfg = load_config()

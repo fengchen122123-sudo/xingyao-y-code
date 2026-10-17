@@ -178,3 +178,90 @@ it('页首比所有 user 消息都新时：全部红点按未加载处理', asyn
   await nextTick();
   expect(wrapper.findAll('.dim')).toHaveLength(5);
 });
+
+// 跨页跳转收尾：父组件翻页加载完成后回调 jumpToLoaded，按全局索引定位目标消息。
+// 点最上面一个红点（全局索引 0）时必须定位到首条消息（视口最上面）——定位错到
+// 「已加载区第一条」上，就是用户反馈的「点了最上面的点却没反应」。
+it('jumpToLoaded：跨页加载完成后按全局索引定位（索引 0 → 首条消息，落点即内容顶部）', async () => {
+  const scrollEl = makeScrollEl();
+  Object.defineProperty(scrollEl, 'scrollHeight', { value: 5000, configurable: true });
+  scrollEl.scrollTop = 4000; // 用户此前在很下面，跳转必须把视口拉回顶部
+  scrollEl.getBoundingClientRect = () => ({ top: 0, height: 600 } as DOMRect);
+  // 内容坐标 21 + 500*i：视口 top = 内容坐标 - scrollTop
+  const els = [0, 1, 2].map((i) => {
+    const el = document.createElement('div');
+    el.className = 'msg-user';
+    el.innerHTML = `<span class="user-text">第${i}条</span>`;
+    el.getBoundingClientRect = () => ({ top: 21 + 500 * i - scrollEl.scrollTop, height: 40 } as DOMRect);
+    return el;
+  });
+  const scrolled: number[] = [];
+  scrollEl.scrollTo = ((opts: any) => { scrolled.push(opts?.top ?? -1); }) as unknown as typeof scrollEl.scrollTo;
+
+  const wrapper = mount(MessageNavRail, {
+    props: {
+      getScrollEl: () => scrollEl,
+      getUserMsgElements: () => els,
+      navItems,
+      loadedFirstId: 10, // 全部已加载：分界为 0
+    },
+  });
+  await nextTick();
+
+  (wrapper.vm as any).jumpToLoaded(0);
+
+  // 首条消息内容坐标 21，留 16px 呼吸空间 → 目标 5（内容顶部）
+  expect(scrolled).toEqual([5]);
+  wrapper.unmount();
+});
+
+// ---------------------------------------------------------------------------
+// 已加载分支的目标存在性校验（用户反馈「点未加载区红点没反应」的同源问题）：
+// 换算出的 local 目标在 DOM 中不存在时不能静默无反应——必须降级走跨页通道
+//（emit jump），由父组件翻页后回调 jumpToLoaded 重新定位。
+// ---------------------------------------------------------------------------
+
+it('已加载分支 local 越界（目标元素不存在）：降级 emit jump 走跨页通道', async () => {
+  const scrollEl = makeScrollEl();
+  const els = makeUserMsgEls(2); // DOM 只有 2 条，索引却有 5 条
+  const wrapper = mount(MessageNavRail, {
+    props: {
+      getScrollEl: () => scrollEl,
+      getUserMsgElements: () => els,
+      navItems,
+      loadedFirstId: 10, // 分界 0：全部红点走已加载分支
+    },
+  });
+  await nextTick();
+  await wrapper.findAll('[data-test="rail-dot"]')[4].trigger('click'); // local 4 越界
+  const emitted = wrapper.emitted('jump');
+  expect(emitted).toHaveLength(1);
+  expect(emitted![0][0]).toEqual({ index: 4, id: 50 });
+  wrapper.unmount();
+});
+
+it('DOM 支持 data-msg-id 时按 id 权威定位：id 未命中不落到邻近元素，降级跨页', async () => {
+  const scrollEl = makeScrollEl();
+  let scrolled = -1;
+  scrollEl.scrollTo = (opts: any) => { scrolled = opts?.top ?? 0; };
+  const els = makeUserMsgEls(2);
+  els[0].dataset.msgId = '30'; // DOM 已加载区间：30/40
+  els[1].dataset.msgId = '40';
+  const wrapper = mount(MessageNavRail, {
+    props: {
+      getScrollEl: () => scrollEl,
+      getUserMsgElements: () => els,
+      getUserMsgElementById: (id: number) => els.find(el => el.dataset.msgId === String(id)) ?? null,
+      navItems,
+      loadedFirstId: 20, // 分界=1：索引 1（id=20）按已加载分支处理，但 DOM 里没有它
+    },
+  });
+  await nextTick();
+  await wrapper.findAll('[data-test="rail-dot"]')[1].trigger('click');
+  // 绝不落到索引换算的邻近元素（id=30）上——那正是"点错消息/点了没反应"的来源
+  expect(scrolled).toBe(-1);
+  const emitted = wrapper.emitted('jump');
+  expect(emitted).toHaveLength(1);
+  expect(emitted![0][0]).toEqual({ index: 1, id: 20 });
+  wrapper.unmount();
+});

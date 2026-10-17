@@ -21,6 +21,13 @@
             <button class="seg-btn" :class="{ active: sourceFilter === 'user' }" data-test="src-filter-user" @click="sourceFilter = 'user'">用户</button>
           </div>
           <span class="toolbar-spacer"></span>
+          <input
+            v-model="searchQuery"
+            class="sub-search"
+            data-test="sub-search-input"
+            placeholder="搜索技能…"
+            title="按名称 / ID / 介绍搜索，多个关键词用空格分隔"
+          />
           <button
             class="chip-btn"
             data-test="refresh-skills-btn"
@@ -71,15 +78,24 @@
       <!-- MCP 页 -->
       <div v-else-if="subType === 'mcp'">
          <div class="sub-toolbar">
+           <span class="toolbar-spacer"></span>
+           <input
+             v-model="searchQuery"
+             class="sub-search"
+             data-test="sub-search-input"
+             placeholder="搜索服务名…"
+             title="按 MCP 服务名搜索"
+           />
            <button class="chip-btn" title="添加自定义 MCP 服务" @click="addForm.show = !addForm.show"><AppIcon name="plus" :size="12" /> 添加服务</button>
            <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()"><AppIcon name="refresh" :size="12" /> 重连</button>
          </div>
          <div v-if="addForm.show" class="mcp-add-form">
            <div class="maf-row">
              <input v-model="addForm.name" placeholder="服务名（如 filesystem）" style="width:180px" />
-             <input v-model="addForm.command" placeholder="启动命令（如 npx）" style="width:140px" />
+             <input v-model="addForm.command" placeholder="启动命令：npx / node / python" style="width:200px" />
              <input v-model="addForm.args" placeholder="参数，空格分隔（如 -y @modelcontextprotocol/server-filesystem）" style="flex:1;min-width:220px" />
            </div>
+           <div class="maf-hint">启动命令仅支持 npx / node / python 裸名，不能填路径；其他 CLI 类服务可用 node 启动它的入口脚本。</div>
            <textarea v-model="addForm.env" class="maf-env" rows="3" placeholder="环境变量（可选），每行一个 KEY=VALUE，如：&#10;API_KEY=sk-xxx"></textarea>
            <div class="maf-row maf-actions">
              <label class="maf-check"><input type="checkbox" v-model="addForm.enabled" /> 添加后立即启用</label>
@@ -89,7 +105,8 @@
            </div>
          </div>        <div class="sub-grid">
           <div v-if="store.mcps.length === 0" class="sub-empty">暂无已配置的 MCP 服务</div>
-          <div v-for="m in store.mcps" :key="m.name" class="sub-card mcp-card">
+          <div v-else-if="filteredMcps.length === 0" class="sub-empty">没有匹配的 MCP 服务</div>
+          <div v-for="m in filteredMcps" :key="m.name" class="sub-card mcp-card">
             <div class="sc-top">
               <div class="sc-ico">⧉</div>
               <div class="sc-name">
@@ -101,7 +118,16 @@
                 <span class="switch-track"></span>
               </label>
             </div>
-            <div class="sc-desc">{{ '工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m) }}</div>
+            <div class="sc-desc">
+              {{ '工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m) }}<span
+                v-if="mcpErrorText(m)"
+                class="mcp-err"
+                :title="mcpErrorFull(m)"
+              > · 失败原因: {{ mcpErrorText(m) }}</span>
+            </div>
+            <div class="sc-id">
+              <button class="chip-btn danger" title="删除该 MCP 服务" @click.stop="onRemoveMcp(m)">删除</button>
+            </div>
           </div>
         </div>
       </div>
@@ -114,6 +140,14 @@
             <button class="seg-btn" :class="{ active: sourceFilter === 'builtin' }" data-test="src-filter-builtin" @click="sourceFilter = 'builtin'">内置</button>
             <button class="seg-btn" :class="{ active: sourceFilter === 'user' }" data-test="src-filter-user" @click="sourceFilter = 'user'">用户</button>
           </div>
+          <span class="toolbar-spacer"></span>
+          <input
+            v-model="searchQuery"
+            class="sub-search"
+            data-test="sub-search-input"
+            placeholder="搜索插件…"
+            title="按名称 / 介绍 / 工具名搜索，多个关键词用空格分隔"
+          />
         </div>
         <div class="sub-grid">
           <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
@@ -138,166 +172,6 @@
             </div>
           </div>
         </div>
-      </div>
-
-<!-- 钩子 Hooks 页：列表（筛选/搜索/信任/启停）+ 新建/编辑表单双视图（C13 手动配置） -->
-      <div v-else-if="subType === 'hooks'">
-        <!-- 表单视图：新建/编辑钩子（替换列表） -->
-        <div v-if="hookForm.mode !== 'closed'" class="hook-form-page">
-          <button class="hook-back" @click="closeHookForm"><AppIcon name="arrow-left" :size="12" /> 返回列表</button>
-          <div class="hook-form-head">
-            <h3>{{ hookForm.mode === 'edit' ? '编辑钩子' : '新建钩子' }}</h3>
-            <p>在任务生命周期事件发生时自动执行命令。</p>
-          </div>
-          <div class="hook-form-card">
-            <div class="hf-row">
-              <label class="hf-field">
-                <span class="hf-label">事件</span>
-                <select v-model="hookForm.event" data-test="hook-form-event" title="触发该钩子的生命周期事件">
-                  <option value="SessionStart">SessionStart</option>
-                  <option value="PreToolUse">PreToolUse</option>
-                  <option value="PostToolUse">PostToolUse</option>
-                  <option value="Stop">Stop</option>
-                </select>
-              </label>
-              <label class="hf-field">
-                <span class="hf-label">作用域</span>
-                <select v-if="hookForm.mode === 'create'" v-model="hookForm.scope" data-test="hook-form-scope" title="新建钩子的保存位置">
-                  <option value="user">用户</option>
-                  <option value="project">项目</option>
-                </select>
-                <!-- 编辑时作用域随原条目不迁移：只读展示 -->
-                <span v-else class="hf-readonly" data-test="hook-form-scope">{{ hookForm.scope === 'user' ? '用户级' : '项目级' }}</span>
-              </label>
-            </div>
-            <div class="hf-row">
-              <label class="hf-field">
-                <span class="hf-label">匹配器</span>
-                <input v-model="hookForm.matcher" data-test="hook-form-matcher" placeholder="例如 write_file | edit_file（留空匹配全部）" />
-                <span class="hf-hint">仅对 PreToolUse / PostToolUse 生效；留空或 * 匹配全部工具。</span>
-              </label>
-              <label class="hf-field">
-                <span class="hf-label">命令</span>
-                <input v-model="hookForm.command" class="hf-mono" data-test="hook-form-command" placeholder="例如 python ./scripts/guard.py" />
-              </label>
-            </div>
-            <details class="hf-advanced">
-              <summary>高级</summary>
-              <div class="hf-row">
-                <label class="hf-field">
-                  <span class="hf-label">超时时间（秒）</span>
-                  <input v-model.number="hookForm.timeoutSec" type="number" min="1" max="300" style="width:140px" data-test="hook-form-timeout" />
-                  <span class="hf-hint">默认 60 秒，上限 300 秒；超时按失败处理，不阻断主流程。</span>
-                </label>
-                <label class="hf-field">
-                  <span class="hf-label">状态消息</span>
-                  <input v-model="hookForm.statusMessage" data-test="hook-form-status-message" placeholder="例如 正在检查工作区" />
-                </label>
-              </div>
-            </details>
-            <div class="hf-actions">
-              <button v-if="hookForm.mode === 'edit'" class="hf-delete" data-test="hook-form-delete" @click="onDeleteHook">删除</button>
-              <span style="flex:1"></span>
-              <button class="btn primary" data-test="hook-form-save" :disabled="hookForm.saving" @click="submitHookForm">保存</button>
-              <button class="btn" data-test="hook-form-cancel" @click="closeHookForm">取消</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- 列表视图 -->
-        <template v-else>
-          <div class="sub-toolbar">
-            <div class="src-filter">
-              <button class="seg-btn" :class="{ active: hookScopeFilter === 'all' }" data-test="hook-scope-filter-all" @click="hookScopeFilter = 'all'">全部</button>
-              <button class="seg-btn" :class="{ active: hookScopeFilter === 'user' }" data-test="hook-scope-filter-user" @click="hookScopeFilter = 'user'">用户</button>
-              <button class="seg-btn" :class="{ active: hookScopeFilter === 'project' }" data-test="hook-scope-filter-project" @click="hookScopeFilter = 'project'">项目</button>
-            </div>
-            <input v-model="hookQuery" class="hook-search" data-test="hook-search-input" placeholder="搜索钩子…" />
-            <span class="toolbar-spacer"></span>
-            <button
-              class="chip-btn"
-              data-test="refresh-hooks-btn"
-              title="重新读取用户级与项目级 Hook"
-              :disabled="store.hooksLoading"
-              @click="store.refreshHooks()"
-            >
-              <AppIcon name="refresh" :size="12" :class="{ 'icon-spin': store.hooksLoading }" />
-              {{ store.hooksLoading ? '刷新中…' : '刷新' }}
-            </button>
-            <button class="chip-btn" data-test="hook-new-btn" title="新建钩子" @click="openHookCreate">
-              <AppIcon name="plus" :size="12" /> 新建钩子
-            </button>
-          </div>
-          <div class="hook-list">
-            <div v-if="store.hooks.length === 0" class="hook-empty">
-              <div class="he-title">尚未配置钩子</div>
-              <div class="he-desc">新建钩子，以在任务生命周期事件中运行命令。（用户级 ~/.ycode/hooks.json、项目级 .ycode/hooks.json）</div>
-              <button class="btn primary" data-test="hook-empty-new-btn" @click="openHookCreate">新建钩子</button>
-            </div>
-            <div v-else-if="filteredHooks.length === 0" class="sub-empty">没有符合筛选条件的钩子</div>
-            <div
-              v-for="h in filteredHooks"
-              :key="h.digest"
-              class="hook-row"
-              :class="{ 'is-disabled': h.disabled === true }"
-              data-test="hook-row"
-              @click="openHookEditor(h)"
-            >
-              <div class="hr-ico"><AppIcon name="zap" :size="15" /></div>
-              <div class="hr-main">
-                <div class="hr-line">
-                  <span class="hr-event">{{ h.event }}</span>
-                  <span class="pl-src" :class="h.scope === 'user' ? 'user' : 'builtin'">{{ h.scope === 'user' ? '用户' : '项目' }}</span>
-                  <span class="hook-status" :class="h.status">{{ hookStatusText(h.status) }}</span>
-                  <span v-if="h.disabled === true" class="hook-status disabled-badge">已禁用</span>
-                </div>
-                <div class="hr-cmd">{{ h.command }}</div>
-                <div class="hr-meta">matcher: {{ h.matcher }} · 来源: {{ h.source_path }}</div>
-              </div>
-              <div class="hr-actions" @click.stop>
-                <!-- 待确认/配置已变更：需先信任才会执行，拒绝则显式屏蔽 -->
-                <button
-                  v-if="h.status === 'pending' || h.status === 'stale'"
-                  class="btn primary sc-trust-btn"
-                  data-test="hook-action-grant"
-                  title="确认内容后允许该 Hook 命令执行"
-                  @click="store.grantHookTrust(h.digest)"
-                >信任</button>
-                <button
-                  v-if="h.status === 'pending' || h.status === 'stale'"
-                  class="btn sc-trust-btn"
-                  data-test="hook-action-deny"
-                  title="拒绝后该 Hook 命令不再执行"
-                  @click="store.denyHookTrust(h.digest)"
-                >拒绝</button>
-                <button
-                  v-if="h.status === 'trusted'"
-                  class="btn sc-trust-btn"
-                  data-test="hook-action-revoke"
-                  title="撤销信任，该 Hook 回到待确认"
-                  @click="store.revokeHookTrust(h.digest)"
-                >撤销信任</button>
-                <button
-                  v-if="h.status === 'blocked' || h.status === 'revoked'"
-                  class="btn sc-trust-btn"
-                  data-test="hook-action-reset"
-                  title="重置为待确认，可重新决定是否信任"
-                  @click="store.resetHookTrust(h.digest)"
-                >重置为待确认</button>
-                <label class="switch" :title="h.status === 'trusted' ? '启用/禁用该钩子' : '信任后可用'">
-                  <input
-                    type="checkbox"
-                    data-test="hook-toggle-switch"
-                    :checked="h.disabled !== true"
-                    :disabled="h.status !== 'trusted'"
-                    @change="onToggleHookDisabled(h, ($event.target as HTMLInputElement).checked)"
-                  />
-                  <span class="switch-track"></span>
-                </label>
-              </div>
-            </div>
-          </div>
-        </template>
       </div>
 
       <!-- 星轨自动化任务页 -->
@@ -403,7 +277,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import AutomationPane from './AutomationPane.vue';
 import { useAppStore, type SubpageType } from '../stores/appStore';
-import type { SkillInfo, McpInfo, ModelInfo, PluginInfo, HookInfo } from '../types/pywebview';
+import type { SkillInfo, McpInfo, ModelInfo, PluginInfo } from '../types/pywebview';
 import { parseModelTestError } from '../utils/errorParser';
 
 const props = defineProps<{
@@ -419,7 +293,6 @@ const title = computed(() => {
   if (props.subType === 'mcp') return 'MCP 服务';
   if (props.subType === 'plugins') return '插件 Plugins';
   if (props.subType === 'automations') return '星轨自动化任务';
-  if (props.subType === 'hooks') return '钩子 Hooks';
   return '模型管理';
 });
 const desc = computed(() => {
@@ -427,7 +300,6 @@ const desc = computed(() => {
   if (props.subType === 'mcp') return '来自 mcp.json 的服务接口';
   if (props.subType === 'plugins') return '与 CLI 共用同一份 plugin.json 配置，开关状态两端同步';
   if (props.subType === 'automations') return '定时触发的星轨自动化回合，仅星瑶运行期间生效';
-  if (props.subType === 'hooks') return '用户级与项目级生命周期钩子（支持手动配置，信任确认后生效）';
   return '管理模型供应商与可用模型列表';
 });
 
@@ -437,15 +309,36 @@ const refreshingSkills = ref(false);
 // 技能缺 source（旧版后端）按用户算，插件非 'user' 按内置算
 type SourceFilterValue = 'all' | 'builtin' | 'user';
 const sourceFilter = ref<SourceFilterValue>('all');
-watch(() => props.subType, () => { sourceFilter.value = 'all'; });
+
+// 关键词搜索：技能 / MCP / 插件三页共用同一个输入框，切页时与来源筛选一起重置。
+// MCP 后端只返回服务名，故该页搜索范围仅服务名。
+const searchQuery = ref('');
+watch(() => props.subType, () => { sourceFilter.value = 'all'; searchQuery.value = ''; });
+
+// 关键词按空格拆成多个词，全部命中才算匹配（忽略大小写）；只传小写后的 kw
+function hitSearch(kw: string, fields: Array<string | undefined | null>): boolean {
+  if (!kw) return true;
+  const hay = fields.filter(Boolean).join(' ').toLowerCase();
+  return kw.split(/\s+/).every(t => hay.includes(t));
+}
 
 const filteredSkills = computed(() => {
-  if (sourceFilter.value === 'all') return store.skills;
-  return store.skills.filter(s => (s.source === 'builtin' ? 'builtin' : 'user') === sourceFilter.value);
+  const kw = searchQuery.value.trim().toLowerCase();
+  return store.skills.filter(s => {
+    if (sourceFilter.value !== 'all' && (s.source === 'builtin' ? 'builtin' : 'user') !== sourceFilter.value) return false;
+    return hitSearch(kw, [s.name, s.id, s.short_id, s.description]);
+  });
 });
 const filteredPlugins = computed(() => {
-  if (sourceFilter.value === 'all') return store.plugins;
-  return store.plugins.filter(p => (p.source === 'user' ? 'user' : 'builtin') === sourceFilter.value);
+  const kw = searchQuery.value.trim().toLowerCase();
+  return store.plugins.filter(p => {
+    if (sourceFilter.value !== 'all' && (p.source === 'user' ? 'user' : 'builtin') !== sourceFilter.value) return false;
+    return hitSearch(kw, [p.name, p.description, p.tools.join(' ')]);
+  });
+});
+const filteredMcps = computed(() => {
+  const kw = searchQuery.value.trim().toLowerCase();
+  return store.mcps.filter(m => hitSearch(kw, [m.name]));
 });
 
 async function onRefreshSkills() {
@@ -477,6 +370,29 @@ async function onRestoreSkill(s: SkillInfo) {
 
 function onToggleMcp(m: McpInfo, checked: boolean) {
   store.toggleMcpServer(m.name, checked);
+}
+
+// 删除 MCP 服务会改写 mcp.json，属破坏性操作，先二次确认再调 store action
+async function onRemoveMcp(m: McpInfo) {
+  const ok = await store.askConfirm(
+    '删除 MCP 服务',
+    m.name,
+    '将从 mcp.json 移除该服务配置，删除后需要重新添加才能恢复。',
+    '删除 ⏎',
+  );
+  if (ok) await store.removeMcpServer(m.name);
+}
+
+// 连接失败原因：仅展示已启用但未连接的服务的 last_error（旧后端不返回该字段，表现不变）
+const MCP_ERR_MAX = 120;
+function mcpErrorFull(m: McpInfo): string {
+  if (!m.enabled || m.connected) return '';
+  return (m.last_error || '').trim();
+}
+// 过长报错截断加省略号，完整内容由 title 承载，避免撑破卡片
+function mcpErrorText(m: McpInfo): string {
+  const err = mcpErrorFull(m);
+  return err.length > MCP_ERR_MAX ? err.slice(0, MCP_ERR_MAX) + '…' : err;
 }
 
 // 添加自定义 MCP 服务的表单状态
@@ -539,151 +455,8 @@ function pluginStatusText(p: PluginInfo) {
   }
 }
 
-// C12：Hook 信任状态文案（未知状态回退原文，避免新增状态时静默丢信息）
-function hookStatusText(status: HookInfo['status']) {
-  switch (status) {
-    case 'pending': return '待确认';
-    case 'trusted': return '已信任';
-    case 'stale': return '配置已变更';
-    case 'blocked': return '已拒绝';
-    case 'revoked': return '已撤销';
-    default: return status;
-  }
-}
 
-// C13：Hook 手动配置——列表（作用域筛选/关键词搜索）+ 新建/编辑表单双视图
-type HookScopeFilterValue = 'all' | 'user' | 'project';
-const hookScopeFilter = ref<HookScopeFilterValue>('all');
-const hookQuery = ref('');
-
-// 关键词命中 event/command/matcher/status_message/source_path 任一字段即保留
-const filteredHooks = computed(() => {
-  const kw = hookQuery.value.trim().toLowerCase();
-  return store.hooks.filter((h) => {
-    if (hookScopeFilter.value !== 'all' && h.scope !== hookScopeFilter.value) return false;
-    if (!kw) return true;
-    return [h.event, h.command, h.matcher, h.status_message, h.source_path]
-      .join(' ')
-      .toLowerCase()
-      .includes(kw);
-  });
-});
-
-// 表单三种形态：closed 显示列表；create/edit 时表单替换列表
-const hookForm = reactive({
-  mode: 'closed' as 'closed' | 'create' | 'edit',
-  editing: null as HookInfo | null,
-  event: 'PreToolUse',
-  scope: 'user' as 'user' | 'project',
-  matcher: '',
-  command: '',
-  timeoutSec: 60,
-  statusMessage: '',
-  saving: false,
-});
-
-function openHookCreate() {
-  hookForm.mode = 'create';
-  hookForm.editing = null;
-  hookForm.event = 'PreToolUse';
-  hookForm.scope = 'user';
-  hookForm.matcher = '';
-  hookForm.command = '';
-  hookForm.timeoutSec = 60;
-  hookForm.statusMessage = '';
-  hookForm.saving = false;
-}
-
-function openHookEditor(h: HookInfo) {
-  hookForm.mode = 'edit';
-  hookForm.editing = h;
-  hookForm.event = h.event;
-  hookForm.scope = h.scope === 'project' ? 'project' : 'user';
-  // matcher 为 "*"（匹配全部）时表单显示为空，保存时归一化回 "*"
-  hookForm.matcher = h.matcher === '*' ? '' : h.matcher;
-  hookForm.command = h.command;
-  hookForm.timeoutSec = Math.max(1, Math.round((h.timeout_ms || 60000) / 1000));
-  hookForm.statusMessage = h.status_message || '';
-  hookForm.saving = false;
-}
-
-function closeHookForm() {
-  hookForm.mode = 'closed';
-  hookForm.editing = null;
-  hookForm.saving = false;
-}
-
-// 保存：编辑附 source_path + digest（后端定位口径），新建附 scope（写入用户级/项目级文件）
-async function submitHookForm() {
-  const command = hookForm.command.trim();
-  if (!command) {
-    store.notifyModal('表单校验', '请填写要执行的命令');
-    return;
-  }
-  const timeoutSec = Number(hookForm.timeoutSec);
-  if (!Number.isFinite(timeoutSec) || timeoutSec < 1 || timeoutSec > 300) {
-    store.notifyModal('表单校验', '超时时间需为 1-300 秒之间的数字');
-    return;
-  }
-  const payload: Record<string, any> = {
-    event: hookForm.event,
-    matcher: hookForm.matcher.trim() || '*',
-    command,
-    timeout_ms: Math.round(timeoutSec * 1000),
-    status_message: hookForm.statusMessage.trim(),
-  };
-  if (hookForm.mode === 'edit' && hookForm.editing) {
-    payload.source_path = hookForm.editing.source_path;
-    payload.digest = hookForm.editing.digest;
-  } else {
-    payload.scope = hookForm.scope;
-  }
-  hookForm.saving = true;
-  try {
-    const res = await store.saveHook(payload);
-    if (res.ok) {
-      closeHookForm();
-    } else {
-      store.notifyModal('保存钩子', res.msg || '未知错误');
-    }
-  } finally {
-    hookForm.saving = false;
-  }
-}
-
-// 删除钩子（破坏性）：先复用项目统一的 askConfirm 二次确认，再调 store action
-async function onDeleteHook() {
-  const h = hookForm.editing;
-  if (!h) return;
-  const ok = await store.askConfirm(
-    '删除钩子',
-    h.event,
-    `将从配置文件中删除该钩子：${h.command}`,
-    '删除',
-  );
-  if (!ok) return;
-  const res = await store.deleteHook(h.source_path, h.digest);
-  if (res.ok) {
-    closeHookForm();
-  } else {
-    store.notifyModal('删除钩子', res.msg || '未知错误');
-  }
-}
-
-// 启停开关：checked = 启用，取反得到后端的 disabled 语义
-async function onToggleHookDisabled(h: HookInfo, checked: boolean) {
-  const res = await store.setHookDisabled(h.source_path, h.digest, !checked);
-  if (!res.ok) store.notifyModal('钩子启停', res.msg || '未知错误');
-}
-
-// 切页时重置筛选/搜索并关闭在途表单，避免下次进入残留编辑态
-watch(() => props.subType, () => {
-  hookScopeFilter.value = 'all';
-  hookQuery.value = '';
-  closeHookForm();
-});
-
-// 打开 MCP / 插件 / 钩子 / 自动化页时刷新一次最新状态
+// 打开 MCP / 插件 / 自动化页时刷新一次最新状态
 watch(
   () => [props.visible, props.subType] as const,
   ([visible, type]) => {
@@ -691,8 +464,6 @@ watch(
       store.refreshMcpServers();
     } else if (visible && type === 'plugins') {
       store.refreshPlugins();
-    } else if (visible && type === 'hooks') {
-      store.refreshHooks();
     } else if (visible && type === 'automations') {
       store.refreshAutomations();
     }
@@ -877,6 +648,22 @@ async function testModelRow(m: ModelInfo) {
 .toolbar-spacer {
   flex: 1;
 }
+/* 技能 / MCP / 插件三页共用的关键词搜索框（与钩子页 .hook-search 同款外观） */
+.sub-search {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: var(--text);
+  font-size: 12px;
+  width: 180px;
+  outline: none;
+  font-family: inherit;
+  transition: 0.15s;
+}
+.sub-search:focus {
+  border-color: var(--accent);
+}
 /* 来源分段筛选：全部 / 内置 / 用户 */
 .src-filter {
   display: inline-flex;
@@ -977,287 +764,6 @@ async function testModelRow(m: ModelInfo) {
   vertical-align: middle;
 }
 
-/* 钩子 Hooks 卡片：命令行按 mono 展示且允许换行，状态徽标按 status 分色 */
-.sub-card .hook-cmd {
-  font-family: var(--mono);
-  white-space: pre-wrap;
-  word-break: break-all;
-  min-height: 0;
-}
-.hook-status {
-  margin-left: auto;
-  flex-shrink: 0;
-  font-size: 10.5px;
-  padding: 1px 8px;
-  border-radius: 6px;
-  background: var(--bg3);
-  color: var(--text-dim);
-}
-.hook-status.trusted {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-.hook-status.pending,
-.hook-status.stale {
-  background: rgba(240, 136, 62, 0.15);
-  color: var(--orange);
-}
-.hook-status.blocked {
-  background: rgba(248, 81, 73, 0.12);
-  color: var(--red);
-}
-.hook-status.revoked {
-  color: var(--text-faint);
-}
-.hook-status.disabled-badge {
-  background: var(--bg3);
-  color: var(--text-faint);
-}
-
-/* C13：钩子搜索框 / 单列列表 / 行卡片 */
-.hook-search {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  padding: 6px 10px;
-  color: var(--text);
-  font-size: 12px;
-  width: 200px;
-  outline: none;
-  font-family: inherit;
-  transition: 0.15s;
-}
-.hook-search:focus {
-  border-color: var(--accent);
-}
-.hook-list {
-  max-width: 960px;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.hook-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  cursor: pointer;
-  transition: 0.15s;
-}
-.hook-row:hover {
-  border-color: var(--text-faint);
-}
-.is-disabled .hr-cmd {
-  color: var(--text-faint);
-  text-decoration: line-through;
-}
-.hr-ico {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-dim);
-  flex-shrink: 0;
-}
-.hr-main {
-  flex: 1;
-  min-width: 0;
-}
-.hr-line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.hr-event {
-  font-size: 13px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-.hr-cmd {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-dim);
-  margin-top: 3px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.hr-meta {
-  font-size: 10.5px;
-  color: var(--text-faint);
-  font-family: var(--mono);
-  margin-top: 3px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.hr-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-/* 行内开关紧跟操作按钮，不需要卡片布局的自动右推 */
-.hr-actions .switch {
-  margin-left: 0;
-}
-.hook-row .sc-trust-btn {
-  padding: 1px 8px;
-  font-size: 10px;
-  white-space: nowrap;
-  vertical-align: middle;
-}
-.hook-empty {
-  border: 1px dashed var(--border);
-  border-radius: 12px;
-  padding: 44px 24px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  text-align: center;
-}
-.he-title {
-  font-size: 13.5px;
-  font-weight: 600;
-}
-.he-desc {
-  font-size: 12px;
-  color: var(--text-faint);
-  line-height: 1.7;
-  max-width: 460px;
-}
-
-/* C13：钩子新建/编辑表单 */
-.hook-form-page {
-  max-width: 960px;
-  margin: 0 auto;
-}
-.hook-back {
-  background: transparent;
-  border: none;
-  color: var(--text-dim);
-  font-size: 12px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 0;
-  cursor: pointer;
-  font-family: inherit;
-}
-.hook-back:hover {
-  color: var(--accent);
-}
-.hook-form-head h3 {
-  font-size: 14px;
-  margin: 8px 0 4px;
-}
-.hook-form-head p {
-  font-size: 12px;
-  color: var(--text-faint);
-}
-.hook-form-card {
-  margin-top: 14px;
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
-}
-.hf-row {
-  display: flex;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.hf-field {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  flex: 1;
-  min-width: 0;
-}
-.hf-label {
-  font-size: 11.5px;
-  color: var(--text-dim);
-}
-.hf-field input,
-.hf-field select {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  padding: 7px 10px;
-  color: var(--text);
-  font-size: 12.5px;
-  outline: none;
-  font-family: inherit;
-  transition: 0.15s;
-}
-.hf-field input:focus,
-.hf-field select:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-soft);
-}
-.hf-field input.hf-mono {
-  font-family: var(--mono);
-}
-.hf-hint {
-  font-size: 10.5px;
-  color: var(--text-faint);
-  line-height: 1.5;
-}
-.hf-readonly {
-  font-size: 12.5px;
-  color: var(--text-dim);
-  padding: 7px 0;
-}
-.hf-advanced {
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-  margin-bottom: 12px;
-}
-.hf-advanced summary {
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--text-dim);
-  user-select: none;
-}
-.hf-advanced summary:hover {
-  color: var(--text);
-}
-.hf-advanced[open] summary {
-  margin-bottom: 12px;
-}
-.hf-advanced .hf-row:last-child {
-  margin-bottom: 0;
-}
-.hf-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
-.hf-delete {
-  background: transparent;
-  border: none;
-  color: var(--red);
-  font-size: 12.5px;
-  cursor: pointer;
-  padding: 6px 0;
-  font-family: inherit;
-}
-.hf-delete:hover {
-  text-decoration: underline;
-}
-
 /* MCP 添加服务表单 */
 .mcp-add-form {
   margin-bottom: 12px;
@@ -1298,6 +804,12 @@ async function testModelRow(m: ModelInfo) {
   resize: vertical;
   margin-bottom: 8px;
 }
+.maf-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
 .maf-actions {
   align-items: center;
   margin-bottom: 0;
@@ -1313,6 +825,10 @@ async function testModelRow(m: ModelInfo) {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-soft);
+}
+.mcp-err {
+  color: var(--red);
+  word-break: break-all;
 }
 .pl-ver {
   font-size: 10.5px;

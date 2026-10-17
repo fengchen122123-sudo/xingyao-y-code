@@ -167,9 +167,11 @@ def handle_diagram_command(command_text: str) -> str:
     if sub == "open":
         files = get_recent_diagrams()
         if not files:
+            # 提示文案里的自称跟随当前会话（秘书会话 → 秘书名）
             try:
-                from core.persona_settings import get_agent_display_name
-                _agent = get_agent_display_name()
+                from core.secretary import get_active_agent_name
+
+                _agent = get_active_agent_name()
             except Exception:
                 _agent = "星瑶"
             return f"🚨 还没有生成过流程图。{_agent}输出 Mermaid 代码块后会自动生成网页文件。"

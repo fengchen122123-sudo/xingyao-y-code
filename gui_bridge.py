@@ -31,20 +31,31 @@ import config
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
+from core.injection_markers import (
+    BG_COMMAND_SUMMARY_INJECTION_PREFIX,
+    BG_SUMMARY_INJECTION_PREFIX,
+    is_system_injected_user_text,
+)
 from core.turn_renderer import sanitize_protocol_text, sanitize_stream_text
 from core.media_refs import MEDIA_DISPLAY_ERROR_LABELS
 from core.media_server import media_server
 from core.media_store import archive_media_file
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
+from core import secretary
+from core.secretary_dispatch import SecretaryDispatchError
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
+from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_terminal
 from gui_git_mixin import GitBridgeMixin
+from gui_browser_mixin import BrowserBridgeMixin
+from gui_snip_mixin import SnipBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
     add_provider as mm_add_provider,
     delete_provider as mm_delete_provider,
     delete_model as mm_delete_model,
+    effective_provider_api_key,
     get_active_model,
     get_model_reasoning_choice,
     get_secondary_roles,
@@ -103,6 +114,12 @@ _MONITOR_DEFAULTTONEAREST = 2
 # 会话历史分页懒加载：切会话/启动只加载最近一页，滚动到顶向前翻页。
 # 回合对齐扩展上限为 limit + 30（见 core.memory.get_history_paged）。
 HISTORY_PAGE_SIZE = 50
+
+# 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu。
+# 由入口层注入，模型/用户正文无法设置（send_user_message 校验后拒绝非法值）。
+# 与 core.llm.COMPUTER_TURN_SOURCES 必须保持一致——低层还会再校验一次来源，
+# 两处不一致会让新来源的回合在模型请求处直接抛错（有测试断言两者相等）。
+TURN_SOURCES = ("local", "lan", "feishu")
 
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
@@ -329,11 +346,43 @@ FILE_TREE_SKIP_DIRS = {
 # 测试模型连通性的超时（秒）
 TEST_MODEL_TIMEOUT = 15
 
-# 后台子代理全部终态后自动发起的汇总回合（与 CLI 的内部汇总指令同文案）
+
+def _probe_keys_for_provider(provider: Dict[str, Any]) -> List[str]:
+    """配置流程（拉模型列表 / 测试连接）的 Key 尝试序列。
+
+    Key 池「当前该用」的单 Key 优先，其余按配置顺序去重；无 Key 时返回 [""]
+    （保持"不带鉴权头单次请求"的旧行为）。逐 Key 尝试只为让配置流程能跑通，
+    不写 Key 池状态——拉列表 / 探活失败不代表该 Key 在对话链路上不可用。
+    """
+    try:
+        from core.provider_keys import split_provider_keys
+
+        keys = split_provider_keys(str(provider.get("api_key") or ""))
+    except Exception:
+        keys = []
+    if not keys:
+        return [""]
+    try:
+        current = str(effective_provider_api_key(provider) or "")
+    except Exception:
+        current = ""
+    if current and current in keys:
+        keys = [current] + [key for key in keys if key != current]
+    return keys
+
+# 后台子代理全部终态后自动发起的汇总回合（与 CLI 的内部汇总指令同文案）。
+# 前缀复用 core.injection_markers 的常量：注入文案与展示层过滤前缀同源，
+# 从结构上杜绝"改了注入文案、忘改过滤表"导致的泄漏（这两类曾渲染成用户
+# 气泡并污染红点导航，用户报告过）。
 _BG_SUMMARY_PROMPT = (
-    "请汇总所有后台子代理任务的结果并告诉我。如果某些任务失败了，"
+    BG_SUMMARY_INJECTION_PREFIX + "。如果某些任务失败了，"
     "可以用你自身的工具（如 search_news / fetch_url 等）接手完成；"
     "但已被用户取消的任务不要接手或重试，如实说明即可。"
+)
+# 后台命令任务完成后自动发起总结回合的注入指令（同样以 role=user 落库，展示层过滤）
+_BG_COMMAND_SUMMARY_PROMPT = (
+    BG_COMMAND_SUMMARY_INJECTION_PREFIX
+    + "，请用一句话简短总结它的结果（成功/失败 + 关键信息，不要复述命令本身）。"
 )
 # 内部汇总回合在前端展示的系统提示文案（代替把上面的指令原文渲染成用户气泡）
 _BG_SUMMARY_DISPLAY_TEXT = "📦 所有后台子代理任务已结束，正在自动汇总结果…"
@@ -463,24 +512,504 @@ def _reasoning_snapshot_for_model(model: dict | None) -> dict:
     snapshot = build_reasoning_snapshot(model)
     model_id = str((model or {}).get("id") or "")
     if model_id and snapshot["kind"] not in {"fixed", "hidden"}:
-        snapshot["choice"] = get_model_reasoning_choice(model_id)
+        try:
+            snapshot["choice"] = get_model_reasoning_choice(model_id)
+        except ValueError:
+            # 配置里存的 reasoning_choice / reasoning_effort 已不在该模型当前能力表的
+            # 合法档位内（例如曾支持 low、后来能力表收窄）——这正是
+            # _reasoning_choice_from_model 的失效档位信号（只捕获 ValueError）。
+            # 这里绝不能把整行隐藏（置 reasoning_visible=False）：隐藏后 UI 不再渲染
+            # 思考设置行，用户就失去了从界面改回合法档位的入口，只能手改配置文件。
+            # 故只把选择回退为默认档展示，其余字段（visible / options / kind /
+            # disabled_reason）仍按能力表原样给出；用户下次保存时
+            # set_model_reasoning_choice 的正常校验会纠正落库值。
+            logger.debug(
+                "模型 %s 存了已失效的思考档位，按默认档展示: %s",
+                model_id,
+                model.get("reasoning_choice") or model.get("reasoning_effort"),
+            )
+            snapshot["choice"] = "default"
     return snapshot
+
+
+# 「另存为」对话框的文件类型过滤器：视频按 Blob 真实扩展名单列一组，
+# 其余（含历史图片）沿用图片组，保证图片路径行为零变化。
+_MEDIA_SAVE_IMAGE_FILTER = "图片文件 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.avif)"
+_MEDIA_SAVE_VIDEO_FILTER = "视频文件 (*.mp4;*.webm)"
+_MEDIA_SAVE_VIDEO_EXTS = frozenset({".mp4", ".webm"})
+
+
+def _media_save_file_types(ext: str) -> tuple:
+    """按 Blob 的真实扩展名选择「另存为」对话框的文件类型过滤器。"""
+    if (ext or "").lower() in _MEDIA_SAVE_VIDEO_EXTS:
+        return (_MEDIA_SAVE_VIDEO_FILTER,)
+    return (_MEDIA_SAVE_IMAGE_FILTER,)
 
 
 def _media_save_filename(suggested_name: str, ext: str) -> str:
     """把建议文件名清理成安全的单段文件名，并强制使用 Blob 的真实扩展名。
 
-    建议名来自图片 alt / 原始文件名，可能带路径成分、Windows 非法字符，
-    或与实际内容不符的扩展名（如 alt 写成 xxx.jpg 而 Blob 是 png）。
+    建议名来自图片 alt 或视频 caption / 原始文件名，可能带路径成分、
+    Windows 非法字符，或与实际内容不符的扩展名（如 alt 写成 xxx.jpg 而
+    Blob 是 png）。
     """
     name = re.split(r"[\\/]", (suggested_name or "").strip())[-1]
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     if "." in name:
         name = name.rsplit(".", 1)[0].strip(" .")
-    return (name or "ycode-image") + ext
+    fallback = "ycode-video" if (ext or "").lower() in _MEDIA_SAVE_VIDEO_EXTS else "ycode-image"
+    return (name or fallback) + ext
 
 
-class ApiBridge(GitBridgeMixin):
+# ----------------------------------------------------------------------
+# 秘书调度台：会话检索 / 派活 / 跳转
+# （设计：docs/superpowers/specs/2026-10-15-secretary-dispatch-design.md，
+#  由 _SecretaryDispatchService 实现并注册到 core.secretary_dispatch 句柄）
+# ----------------------------------------------------------------------
+
+# 检索返回上限：超过此值直接夹紧（一次倾倒几百条会话既无用又费 token）
+_SECRETARY_SEARCH_LIMIT_MAX = 50
+# 同一会话最多回带几条命中片段（与 memory 检索口径一致，防止长会话刷屏）
+_SECRETARY_SNIPPET_MAX = 3
+# 新建会话的草稿名口径：与 create_session 一致
+_SECRETARY_DRAFT_NAME_RE = re.compile(r"^session_[a-f0-9]{6}$")
+# target 命中这些语义别名时走"按目录新建会话"分支
+_SECRETARY_NEW_SESSION_MARKS = ("新会话", "新对话", "new", "new_session")
+
+
+def _secretary_parse_date(value: str, field: str) -> str:
+    """校验 YYYY-MM-DD 日期入参：空值返回空串，非法值抛 SecretaryDispatchError。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        time.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        raise SecretaryDispatchError(f"{field} 需要 YYYY-MM-DD 格式的日期，收到：{raw}")
+    return raw
+
+
+def _secretary_in_date_range(updated_at: str, date_from: str, date_to: str) -> bool:
+    """按会话 updated_at（YYYY-MM-DD HH:MM:SS 文本）做日期区间判定。
+
+    空区间视为不限；ISO 文本按字典序比较即等价于按时间比较。updated_at 缺失时
+    只有"完全不限日期"才算命中，避免把无时间的会话混进有日期条件的检索结果。
+    """
+    day = str(updated_at or "")[:10]
+    if not day:
+        return not (date_from or date_to)
+    if date_from and day < date_from:
+        return False
+    if date_to and day > date_to:
+        return False
+    return True
+
+
+class _SecretaryDispatchService:
+    """秘书调度台能力的桥侧实现（注册为 core.secretary_dispatch 的句柄）。
+
+    三个方法全部落在既有通道上，不新增并行实现：
+      检索 → MemoryManager.search_sessions_and_messages；
+      派活 → _spawn_turn_worker / _message_queues（与用户亲手发消息同一条路）；
+      跳转 → unarchive_session 既有入口 + _set_current_session + open_session 事件。
+
+    约定：参数非法 / 目标不存在等"可读原因"一律抛 SecretaryDispatchError，
+    由 core 层工具转成提示文本；"命中多条"不算错误，返回候选列表让上层追问。
+    """
+
+    def __init__(self, bridge: "ApiBridge") -> None:
+        self._bridge = bridge
+
+    # ------------------------------------------------------------------
+    # 内部：会话清单、显示名、目标解析
+    # ------------------------------------------------------------------
+    def _candidate_sessions(self, include_archived: bool = False) -> List[Dict[str, Any]]:
+        """候选会话清单（GUI + 秘书来源）：秘书会话的 workdir 同为 GLOBAL，
+        只能靠 source 区分，因此必须一次取回两类来源。"""
+        try:
+            raw = self._bridge._memory.get_all_sessions(
+                workdir=None,
+                sources=["GUI", "SECRETARY"],
+                include_empty=True,
+                include_archived=include_archived,
+            )
+        except Exception:
+            logger.debug("读取会话清单失败", exc_info=True)
+            return []
+        return [dict(s) for s in (raw or [])]
+
+    def _is_secretary(self, session_name: str) -> bool:
+        """秘书会话判定：优先读会话来源，回落 core.secretary 的既有判定。"""
+        try:
+            if str(self._bridge._memory.get_session_source(session_name) or "") == "SECRETARY":
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(secretary.is_secretary_session(session_name))
+        except Exception:
+            return False
+
+    def _display_name(self, session_name: str) -> str:
+        """会话显示名：秘书会话用秘书名，草稿名显示「新会话」，其余用会话名
+        （与侧栏既有口径一致）。"""
+        name = str(session_name or "")
+        if self._is_secretary(name):
+            return secretary.get_secretary_name(name) or secretary.FALLBACK_SECRETARY_NAME
+        return "新会话" if _SECRETARY_DRAFT_NAME_RE.match(name) else name
+
+    def _session_workdir(self, session_name: str) -> str:
+        """会话登记的工作目录；查不到时回落 GLOBAL（自由对话）。"""
+        name = str(session_name or "")
+        for item in self._candidate_sessions(include_archived=True):
+            if str(item.get("name")) == name:
+                return str(item.get("workdir") or "GLOBAL")
+        return "GLOBAL"
+
+    def _candidate_view(self, session_name: str) -> Dict[str, str]:
+        """候选会话摘要（命中多条时回给上层，供秘书追问用户）。"""
+        return {
+            "session_name": session_name,
+            "display_name": self._display_name(session_name),
+            "workdir": self._session_workdir(session_name),
+        }
+
+    def _resolve_target(self, target: str) -> tuple:
+        """解析目标会话 → (session_name | None, candidates)。
+
+        命中顺序：会话名精确 → 显示名精确 → 会话名/显示名子串。恰好命中一条才算
+        成功；0 条与多条都返回 (None, ...)，由调用方决定报错还是给候选列表。
+        """
+        raw = str(target or "").strip()
+        if not raw:
+            return None, []
+        names = [str(s.get("name") or "") for s in self._candidate_sessions(include_archived=True)]
+        names = [n for n in names if n]
+        if raw in names:
+            return raw, []
+        pairs = [(n, self._display_name(n)) for n in names]
+        exact = [n for n, display in pairs if display == raw]
+        if len(exact) == 1:
+            return exact[0], []
+        if len(exact) > 1:
+            return None, [self._candidate_view(n) for n in exact]
+        fuzzy = [n for n, display in pairs if raw in n or raw in display]
+        if len(fuzzy) == 1:
+            return fuzzy[0], []
+        return None, [self._candidate_view(n) for n in fuzzy]
+
+    def _validate_workdir(self, workdir: str) -> str:
+        """校验新建会话的归属目录：空 / GLOBAL → GLOBAL；非法 → 报错并给相近候选。"""
+        raw = str(workdir or "").strip()
+        if not raw or raw.upper() == "GLOBAL":
+            return "GLOBAL"
+        path = _resolve_real_path(raw)
+        if os.path.isdir(path):
+            return path
+        hints = self._similar_dirs(raw)
+        hint_text = f"；相近目录：{'、'.join(hints)}" if hints else ""
+        raise SecretaryDispatchError(f"工作目录不存在或不是目录：{raw}{hint_text}")
+
+    def _similar_dirs(self, raw: str, limit: int = 5) -> List[str]:
+        """给非法 workdir 找相近目录候选（同父目录下名字互为子串，兜底取前几个）。"""
+        resolved = _resolve_real_path(raw)
+        parent = os.path.dirname(resolved) or os.sep
+        base = os.path.basename(str(raw).rstrip("\\/")).lower()
+        try:
+            entries = [
+                e for e in os.listdir(parent)
+                if os.path.isdir(os.path.join(parent, e))
+            ]
+        except Exception:
+            return []
+        hits = [e for e in entries if base and (base in e.lower() or e.lower() in base)]
+        if not hits:
+            hits = entries
+        return [os.path.join(parent, name) for name in hits[:limit]]
+
+    # ------------------------------------------------------------------
+    # 能力一：会话检索
+    # ------------------------------------------------------------------
+    def search_conversations(self, keyword: str = "", date_from: str = "",
+                             date_to: str = "", workdir: str = "",
+                             limit: int = 20) -> List[Dict[str, Any]]:
+        """检索历史会话；关键词为空且无日期时拒绝（避免把全部会话倾倒出来）。
+
+        检索本身复用 MemoryManager.search_sessions_and_messages，这里只做
+        参数校验、来源合并（GUI + 秘书）与字段整理（设计文档第 3 节）。
+        """
+        bridge = self._bridge
+        kw = str(keyword or "").strip()
+        start = _secretary_parse_date(date_from, "date_from")
+        end = _secretary_parse_date(date_to, "date_to")
+        if start and end and start > end:
+            raise SecretaryDispatchError(f"日期区间反了：{start} > {end}")
+        if not kw and not start and not end:
+            raise SecretaryDispatchError("请至少给出关键词或日期范围，避免把全部会话倾倒出来")
+        try:
+            size = int(limit or 20)
+        except (TypeError, ValueError):
+            raise SecretaryDispatchError(f"limit 需要是 1..{_SECRETARY_SEARCH_LIMIT_MAX} 的整数")
+        size = max(1, min(size, _SECRETARY_SEARCH_LIMIT_MAX))
+        workdir_filter = str(workdir or "").strip()
+
+        # 按会话聚合并保留顺序无关：最终统一按 updated_at 倒序截断
+        merged: Dict[str, Dict[str, Any]] = {}
+        if kw:
+            # memory 的 source 过滤是单值语义（含 source IS NULL 的历史数据），
+            # 分两次检索再合并，保证秘书会话也能被找到；CLI 会话不纳入
+            for source in ("GUI", "SECRETARY"):
+                try:
+                    rows = bridge._memory.search_sessions_and_messages(
+                        query=kw,
+                        scope="all",
+                        workdir=workdir_filter or None,
+                        source=source,
+                        limit=size,
+                        include_archived=False,
+                    )
+                except Exception as e:
+                    logger.exception("秘书检索会话失败")
+                    raise SecretaryDispatchError(f"检索失败：{e}")
+                self._merge_search_rows(merged, rows, start, end)
+        else:
+            # 只给日期：memory 的检索必须有关键词，这里按会话更新时间过滤
+            for item in self._candidate_sessions():
+                updated = str(item.get("updated_at") or "")
+                if not _secretary_in_date_range(updated, start, end):
+                    continue
+                if workdir_filter and workdir_filter != "GLOBAL":
+                    if str(item.get("workdir") or "") != workdir_filter:
+                        continue
+                name = str(item.get("name") or "")
+                if not name or name in merged:
+                    continue
+                merged[name] = self._session_row(
+                    name, updated, item.get("msg_count"), [], item.get("workdir")
+                )
+
+        rows = sorted(merged.values(), key=lambda r: str(r["updated_at"]), reverse=True)
+        return rows[:size]
+
+    def _merge_search_rows(self, merged: Dict[str, Dict[str, Any]], raw_rows,
+                           start: str, end: str) -> None:
+        """把 memory 的检索行按会话聚合（同一会话最多 3 条命中片段）。"""
+        for item in raw_rows or []:
+            name = str(item.get("session_name") or "")
+            if not name:
+                continue
+            updated = str(item.get("updated_at") or "")
+            if not _secretary_in_date_range(updated, start, end):
+                continue
+            row = merged.get(name)
+            if row is None:
+                row = self._session_row(
+                    name, updated, item.get("msg_count"), [], item.get("workdir")
+                )
+                merged[name] = row
+            role = item.get("role")
+            snippet = item.get("snippet")
+            if role and snippet and len(row["snippets"]) < _SECRETARY_SNIPPET_MAX:
+                row["snippets"].append({
+                    "role": str(role),
+                    "excerpt": str(snippet),
+                    "at": updated,
+                })
+
+    def _session_row(self, name: str, updated_at, message_count, snippets,
+                     workdir) -> Dict[str, Any]:
+        """整理一条检索结果（设计文档第 3 节字段）。"""
+        return {
+            "session_name": str(name),
+            "display_name": self._display_name(name),
+            "is_secretary": self._is_secretary(name),
+            # 与既有会话列表同口径：GLOBAL 表示自由对话，其余是真实目录
+            "workdir": str(workdir or "GLOBAL"),
+            "updated_at": str(updated_at or ""),
+            "message_count": int(message_count or 0),
+            "snippets": snippets,
+        }
+
+    # ------------------------------------------------------------------
+    # 能力二：派活
+    # ------------------------------------------------------------------
+    def dispatch_task(self, target: str = "", prompt: str = "", workdir: str = "",
+                      model_id: str = "", permission_mode: str = "") -> Dict[str, Any]:
+        """把任务投递给已有会话，或按 workdir 懒创建新会话执行。
+
+        投递语义与用户亲手发消息**完全一致**：走既有 _spawn_turn_worker，不传
+        display_text / internal_kind，目标会话里看到的是一条普通 role=user 消息；
+        目标会话忙则进既有 _message_queues（FIFO，回合结束自动补发），全程持
+        _turn_start_lock 保证"检查 + 启动"原子。
+        """
+        bridge = self._bridge
+        prompt_text = str(prompt or "").strip()
+        if not prompt_text:
+            raise SecretaryDispatchError("任务内容不能为空")
+        raw_target = str(target or "").strip()
+
+        # 指定模型必须真实存在（与 send_user_message 的 known_ids 防线同源）；
+        # 配置读取失败时放行，交由 worker 侧回退全局默认模型
+        clean_model_id = str(model_id or "").strip()
+        if clean_model_id:
+            known_ids = set()
+            try:
+                known_ids = {
+                    str(m.get("id"))
+                    for p in (load_config().get("providers") or [])
+                    for m in (p.get("models") or [])
+                }
+            except Exception:
+                known_ids = set()
+            if known_ids and clean_model_id not in known_ids:
+                raise SecretaryDispatchError(f"模型不存在或已被删除：{clean_model_id}")
+
+        # 会话级权限档位：未知值直接拒绝（宁可不派也不误放权）
+        raw_permission = str(permission_mode or "").strip()
+        pending_permission = ""
+        if raw_permission:
+            if not app_context.is_known_permission_mode(raw_permission):
+                raise SecretaryDispatchError(f"未知权限模式：{raw_permission}")
+            pending_permission = app_context.normalize_permission_mode(raw_permission)
+
+        is_new = (not raw_target) or raw_target.lower() in _SECRETARY_NEW_SESSION_MARKS
+        if is_new:
+            # 新建会话：会话行由回合 worker 懒创建（pending_workdir 语义），
+            # 侧栏按该目录落进对应项目分组
+            session_name = f"session_{uuid.uuid4().hex[:6]}"
+            pending_workdir = self._validate_workdir(workdir)
+            display_name = "新会话"
+        else:
+            session_name, candidates = self._resolve_target(raw_target)
+            if session_name is None:
+                if candidates:
+                    return {
+                        "ok": False,
+                        "msg": (
+                            f"「{raw_target}」命中 {len(candidates)} 个会话，"
+                            "请指明具体会话名后再派活"
+                        ),
+                        "candidates": candidates,
+                    }
+                raise SecretaryDispatchError(
+                    f"没找到会话「{raw_target}」，可以先用 search_conversations 检索"
+                )
+            pending_workdir = ""
+            display_name = self._display_name(session_name)
+        if pending_permission and not is_new:
+            # 已有会话：档位落在会话绑定上（等同用户在该会话里切换档位）
+            try:
+                bridge._memory.set_session_permission_mode(session_name, pending_permission)
+            except Exception:
+                logger.debug("派活绑定额度档位失败", exc_info=True)
+
+        # 完成通知按"发起会话"路由：用户在秘书会话里看不到目标会话的流式输出
+        notify_session = str(getattr(bridge, "_current_session", "") or "")
+        dispatch_context = {"display_name": display_name, "notify_session": notify_session}
+        queued_permission = pending_permission if is_new else ""
+        with bridge._turn_start_lock:
+            if bridge._is_turn_active(session_name):
+                bridge._message_queues.setdefault(session_name, []).append({
+                    "id": f"q_{uuid.uuid4().hex[:8]}",
+                    "text": prompt_text,
+                    "attachments": [],
+                    "queued_at": time.time(),
+                    # 派活等同用户亲手发消息：不写 display_text（前端按原文渲染气泡）
+                    "turn_source": "local",
+                    "pending_workdir": pending_workdir,
+                    "secretary_model_id": clean_model_id,
+                    "secretary_permission_mode": queued_permission,
+                    "secretary_dispatch_display_name": display_name,
+                    "secretary_dispatch_notify_session": notify_session,
+                })
+                # 快照在锁内发：与用户消息排队路径同序
+                bridge._emit_message_queue_snapshot(session_name)
+                state = "queued"
+            else:
+                try:
+                    bridge._spawn_turn_worker(
+                        prompt_text,
+                        session_name,
+                        pending_workdir=pending_workdir,
+                        # 派活是本地入口：turn_source 固定 local；不传 display_text /
+                        # internal_kind，保证落库与展示与用户手输消息同形（硬要求）
+                        turn_source="local",
+                        pending_model_id=clean_model_id,
+                        pending_permission_mode=queued_permission,
+                        secretary_dispatch_context=dispatch_context,
+                    )
+                except Exception as e:
+                    logger.exception("秘书派活启动回合失败")
+                    raise SecretaryDispatchError(f"派活失败：{e}")
+                state = "running"
+        return {
+            "ok": True,
+            "target_session": session_name,
+            "display_name": display_name,
+            "workdir": pending_workdir or self._session_workdir(session_name),
+            "state": state,
+        }
+
+    # ------------------------------------------------------------------
+    # 能力三：跳转
+    # ------------------------------------------------------------------
+    def open_session(self, target: str = "") -> Dict[str, Any]:
+        """把用户带到目标会话（纯系统层切换，不模拟点击、不打断正在跑的回合）。
+
+        已归档会话先走既有取消归档入口，再切当前会话并推 open_session 事件；
+        前端收到事件后按 switchSession 的既有路径刷新视图。
+        """
+        bridge = self._bridge
+        raw_target = str(target or "").strip()
+        if not raw_target:
+            raise SecretaryDispatchError("请给出要打开的会话名或关键词")
+        session_name, candidates = self._resolve_target(raw_target)
+        if session_name is None:
+            if candidates:
+                return {
+                    "ok": False,
+                    "msg": (
+                        f"「{raw_target}」命中 {len(candidates)} 个会话，"
+                        "请指明具体会话名后再跳转"
+                    ),
+                    "candidates": candidates,
+                }
+            raise SecretaryDispatchError(
+                f"没找到会话「{raw_target}」，可以先用 search_conversations 检索"
+            )
+        display_name = self._display_name(session_name)
+        workdir = self._session_workdir(session_name)
+
+        # 已归档 → 先取消归档（沿用既有入口，侧栏列表与归档区随之刷新）
+        try:
+            archived_at = bridge._session_archived_at(session_name)
+        except Exception:
+            archived_at = None
+        if archived_at:
+            try:
+                result = bridge.unarchive_session(session_name)
+            except Exception as e:
+                logger.exception("秘书跳转前取消归档失败")
+                raise SecretaryDispatchError(f"取消归档失败：{e}")
+            if not (isinstance(result, dict) and result.get("ok")):
+                reason = result.get("msg") if isinstance(result, dict) else result
+                raise SecretaryDispatchError(f"取消归档失败：{reason}")
+
+        bridge._set_current_session(session_name)
+        bridge.emit_event("open_session", {
+            "session_name": session_name,
+            "display_name": display_name,
+            "workdir": workdir,
+        })
+        return {
+            "ok": True,
+            "session_name": session_name,
+            "display_name": display_name,
+            "workdir": workdir,
+        }
+
+
+class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -574,15 +1103,20 @@ class ApiBridge(GitBridgeMixin):
         self._perm_timers: Dict[str, threading.Timer] = {}
         self._perm_lock = threading.Lock()
 
-        # 内嵌终端：右侧面板用户手动执行命令的子进程（同一时刻最多一个）
-        self._term_proc = None
-        self._term_lock = threading.Lock()
+        # 内嵌交互式终端（底部面板，pywinpty/ConPTY 常驻 shell）：单会话、
+        # 用户手动开启；模型/工具链路不经过这里
+        self._pty_session = None
+        self._pty_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
         self._lan_server = None
         # 保护 _lan_server 惰性创建的双检锁：并发（启动后台线程 + 用户点二维码）时不得创建两个实例
         self._lan_lock = threading.Lock()
+        # 飞书通道服务（惰性创建，见 _ensure_feishu_service）：未配置时完全不启动，
+        # 对现有功能零影响
+        self._feishu_service = None
+        self._feishu_lock = threading.Lock()
         # 电脑操控事件桥：controller listener 注册标记（进程内建立一次、幂等，
         # 见 _ensure_computer_event_bridge；set_window 与各控制方法都会触发）
         self._computer_event_listener = None
@@ -672,6 +1206,13 @@ class ApiBridge(GitBridgeMixin):
         # 工具经 core.automation.service.get() 取句柄后调用同名方法，落到桥侧既有
         # 实现（参数校验、任务上限检查、事件推送、引擎通知），不在 core 层重复实现。
         self._register_automation_service()
+        # 秘书调度台：把检索/派活/跳转能力注册为 core 层服务句柄，供秘书会话的
+        # Agent 工具调用；实现仍是桥侧既有通道（会话检索、_spawn_turn_worker、
+        # _message_queues、_set_current_session），不新增并行实现
+        self._register_secretary_dispatch_service()
+        # 决策审计实时转发：每次决策落审计后向前端推 decision_recorded
+        # （会话头部徽章与决策记录面板实时刷新；独立支路，失败静默）
+        self._register_decision_audit_listener()
         # 正在运行的星轨自动化回合：turn_id → {"run_id", "task_name"}。
         # 无人值守权限自动拒绝的判定依据（规格 5.5）
         self._automation_turn_labels: Dict[str, Dict[str, str]] = {}
@@ -1071,6 +1612,15 @@ class ApiBridge(GitBridgeMixin):
         except Exception:
             logger.exception("退出时注销自动化服务句柄失败")
 
+        # 秘书调度服务句柄同步注销：退出后工具层 get() 返回 None，避免悬挂引用
+        # 指向已停摆的桥；同样包 try/except，不中断后续收尾链
+        try:
+            from core import secretary_dispatch
+
+            secretary_dispatch.unregister()
+        except Exception:
+            logger.exception("退出时注销秘书调度服务句柄失败")
+
         for event in list(self._cancel_events.values()):
             event.set()
         with self._bg_summary_lock:
@@ -1083,9 +1633,22 @@ class ApiBridge(GitBridgeMixin):
         permission_broker.cancel_all()
 
         try:
-            self.kill_terminal_command()
+            with self._pty_lock:
+                pty_session = self._pty_session
+                self._pty_session = None
+            if pty_session is not None:
+                pty_session.kill()
         except Exception:
-            logger.exception("退出时终止内嵌终端失败")
+            logger.exception("退出时终止内嵌交互式终端失败")
+
+        # 内嵌浏览器：best-effort 释放原生 WebView2 控件并取消节流定时器。
+        # 放在 JS 派发哨兵之前；shutdown 内部吞异常，失败不阻断退出链
+        try:
+            embedded = getattr(self, "_embedded_browser", None)
+            if embedded is not None:
+                embedded.shutdown()
+        except Exception:
+            logger.exception("退出时释放内嵌浏览器失败")
 
         try:
             from core.tools import subagent_manager
@@ -1120,6 +1683,12 @@ class ApiBridge(GitBridgeMixin):
                 self._lan_server.stop()
         except Exception:
             logger.exception("退出时停止局域网远程控制服务失败")
+
+        try:
+            if getattr(self, "_feishu_service", None) is not None:
+                self._feishu_service.stop()
+        except Exception:
+            logger.exception("退出时停止飞书通道服务失败")
 
         if self._mcp is not None:
             try:
@@ -2012,6 +2581,11 @@ class ApiBridge(GitBridgeMixin):
         lan = getattr(self, "_lan_server", None)
         if lan is not None:
             lan.broadcast(payload, event_type=event_type)
+        # 转发给飞书通道（未配置/未启动时为 None，零开销；on_event 内部已吞异常，
+        # 绝不影响桌面 JS 派发）
+        feishu = getattr(self, "_feishu_service", None)
+        if feishu is not None:
+            feishu.on_event(event_type, data)
 
     def _queue_js_payload(self, payload: str) -> None:
         """唯一入队点：保证派发线程存在后 put_nowait；队列满丢弃新事件并计数。"""
@@ -2337,11 +2911,16 @@ class ApiBridge(GitBridgeMixin):
             return []
 
     def save_media_image(self, url: str, suggested_name: str = "") -> Dict[str, Any]:
-        """把消息里的媒体图片另存到用户选择的位置（原生"另存为"对话框）。
+        """把消息里的媒体（图片/视频）另存到用户选择的位置（原生"另存为"对话框）。
 
         只接受本进程媒体服务签发的 URL：反解回仓库 Blob 后原样复制字节，
-        不重新编码，保证另存结果与原图完全一致。用户取消不算错误，返回
+        不重新编码，保证另存结果与原图/原视频完全一致。用户取消不算错误，返回
         cancelled 标记供前端静默处理。
+
+        本方法同时服务图片与视频：对话框的文件类型过滤器由
+        `_media_save_file_types` 按 Blob 真实扩展名决定。方法名保留
+        `save_media_image` 不改——改名会波及 pywebview.d.ts、appStore.ts 与
+        本模块测试共四处，收益不抵成本。
         """
         try:
             source = media_server.local_path_for_url(url or "")
@@ -2349,7 +2928,7 @@ class ApiBridge(GitBridgeMixin):
             logger.debug("媒体 URL 反解失败", exc_info=True)
             source = None
         if not source:
-            return {"ok": False, "msg": "该图片不在本地媒体仓库中，无法另存"}
+            return {"ok": False, "msg": "该媒体不在本地媒体仓库中，无法另存"}
         if self._window is None:
             return {"ok": False, "msg": "窗口尚未就绪，无法打开保存对话框"}
 
@@ -2360,7 +2939,7 @@ class ApiBridge(GitBridgeMixin):
             result = self._window.create_file_dialog(
                 webview.SAVE_DIALOG,
                 save_filename=_media_save_filename(suggested_name, ext),
-                file_types=("图片文件 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.avif)",),
+                file_types=_media_save_file_types(ext),
             )
             destination = self._dialog_path(result)
             if destination is None:
@@ -2379,16 +2958,24 @@ class ApiBridge(GitBridgeMixin):
         session_name: str,
         before_id: Optional[int] = None,
         limit: int = HISTORY_PAGE_SIZE,
+        raise_on_error: bool = False,
     ) -> Tuple[List[Dict[str, Any]], bool, Optional[int]]:
         """分页读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。
 
         返回 (msgs, has_more, oldest_id)：oldest_id 取未过滤的本页最旧 DB 行
         _msg_id 作为翻页游标（role 过滤会丢 system 等消息，取过滤后首条会漏翻）；
         会话级 last_error 附加仅首页（before_id=None）执行，翻页页不携带。
+
+        raise_on_error=True（翻页路径专用）：读库失败时向上抛，绝不用「空页 +
+        has_more=False」冒充「已到最早」——前端会把该结论写进会话分页状态并随
+        会话保存，之后滚动到顶与红点跨页跳转永久失效（用户反馈过）。
         """
         msgs: List[Dict[str, Any]] = []
         has_more = False
         oldest_id: Optional[int] = None
+        # 电脑操控观察跟进消息识别（展示层过滤，见循环内说明）
+        from core.computer.provider_generic import is_observation_protocol_message
+
         try:
             # 按回合撤销：消息 → 回合关联（纯界面元数据，Provider 请求不读取）
             try:
@@ -2405,6 +2992,18 @@ class ApiBridge(GitBridgeMixin):
                 if role in ("user", "assistant", "tool"):
                     content = msg.get("content") or ""
                     if role == "user":
+                        # 电脑操控观察跟进消息（设计 19.3）：系统发给模型的观察提示
+                        # 协议消息，不是用户发送的。展示层一律跳过——气泡与红点
+                        # 导航都按 user 消息渲染，不过滤就会冒充用户发言；
+                        # 模型上下文（get_history）不受影响。_parse_message_rows
+                        # 会把持久化 JSON 的 _computer_v1 键提升到行顶层。
+                        if is_observation_protocol_message(msg):
+                            continue
+                        # 后台任务回报 / 护栏催促 / hook 追加上下文等系统注入的
+                        # user 消息：不是用户发送的内容，气泡一律不渲染（与红点
+                        # 导航同一裁决）；模型上下文（get_history）不受影响。
+                        if is_system_injected_user_text(content):
+                            continue
                         # 历史回放：剥离当轮注入的「当前运行上下文 / 当前时间」后缀，
                         # 那部分是给模型看的运行快照，不该显示在历史气泡里
                         content = strip_context_suffix(content)
@@ -2461,6 +3060,8 @@ class ApiBridge(GitBridgeMixin):
                         })
         except Exception:
             logger.debug("加载会话消息失败", exc_info=True)
+            if raise_on_error:
+                raise
         return msgs, has_more, oldest_id
 
     def load_older_messages(self, session_name: str, before_id: Any) -> Dict[str, Any]:
@@ -2484,9 +3085,15 @@ class ApiBridge(GitBridgeMixin):
             names = set()
         if session_name not in names:
             return {"ok": False, "messages": [], "has_more": False, "oldest_id": None}
-        msgs, has_more, oldest_id = self._load_session_messages(
-            session_name, before_id=before_id
-        )
+        try:
+            msgs, has_more, oldest_id = self._load_session_messages(
+                session_name, before_id=before_id, raise_on_error=True
+            )
+        except Exception as e:
+            # 读库失败必须显式报错（ok=False）：前端据此保留原分页状态、下次重试，
+            # 而不是把「读失败」当成「已到最早」永久关掉翻页
+            logger.exception("加载更早历史失败: %s", session_name)
+            return {"ok": False, "messages": [], "has_more": False, "oldest_id": None, "msg": str(e)}
         return {"ok": True, "messages": msgs, "has_more": has_more, "oldest_id": oldest_id}
 
     # 红点导航预览上限：与前端 MessageNavRail 的悬停截断口径一致
@@ -2495,6 +3102,8 @@ class ApiBridge(GitBridgeMixin):
     def get_session_nav_index(self, session_name: str) -> Dict[str, Any]:
         """红点导航全量索引：该会话全部 user 消息的 {id, preview}（正序、不分页）。
 
+        只收录用户真实发送的内容：电脑操控观察跟进消息与系统注入的提示词
+        （后台任务回报 / 护栏催促 / hook 追加上下文）不产生红点。
         preview 剥离运行上下文后缀、折叠空白、截断 100 字；纯图片消息给占位。
         会话不存在/无消息返回空列表（ok=True），前端无差别渲染零红点。
         """
@@ -2502,6 +3111,14 @@ class ApiBridge(GitBridgeMixin):
             raw_items = self._memory.get_session_user_nav_items(session_name)
             items = []
             for it in raw_items:
+                # 电脑操控观察跟进消息不是用户发送的：红点导航一并跳过
+                # （与 _load_session_messages 的气泡过滤同一裁决）
+                if it.get("is_observation"):
+                    continue
+                # 后台任务回报 / 护栏催促 / hook 追加上下文等系统注入的 user
+                # 消息同样不是用户发送的：不产生红点（与气泡过滤同一裁决）
+                if is_system_injected_user_text(str(it.get("text") or "")):
+                    continue
                 text = strip_context_suffix(str(it.get("text") or ""))
                 text = re.sub(r"\s+", " ", text).strip()
                 if not text:
@@ -2528,6 +3145,15 @@ class ApiBridge(GitBridgeMixin):
             ).start()
         except Exception:
             logger.debug("局域网远程控制服务启动线程创建失败", exc_info=True)
+        # 飞书通道：未配置时 _ensure_feishu_service 直接返回 None，不做任何事
+        try:
+            threading.Thread(
+                target=self._ensure_feishu_service,
+                daemon=True,
+                name="feishu-startup",
+            ).start()
+        except Exception:
+            logger.debug("飞书通道服务启动线程创建失败", exc_info=True)
         # 历史消息媒体清单迁移：一次性、幂等，后台执行不阻塞初始化
         try:
             threading.Thread(
@@ -2878,8 +3504,14 @@ class ApiBridge(GitBridgeMixin):
         scope: str = "all",
         workdir: str = "",
         limit: int = 30,
+        include_archived: bool = False,
     ) -> Dict[str, Any]:
-        """会话多维度全局检索（标题模糊匹配 + 对话内容全文检索）。"""
+        """会话多维度全局检索（标题模糊匹配 + 对话内容全文检索）。
+
+        include_archived:
+          - 默认 False，排除已归档会话（既有调用方行为不变）
+          - True 时把已归档会话一并纳入检索范围
+        """
         try:
             if self._memory is None:
                 return {"ok": False, "msg": "后端未就绪", "results": [], "total": 0}
@@ -2894,6 +3526,7 @@ class ApiBridge(GitBridgeMixin):
                 workdir=target_workdir,
                 source="GUI",
                 limit=max(1, min(int(limit or 30), 100)),
+                include_archived=bool(include_archived),
             )
 
             results = []
@@ -3150,7 +3783,11 @@ class ApiBridge(GitBridgeMixin):
         try:
             # include_empty=True：空会话交给下方自己的跳过逻辑处理（当前会话
             # 即使还没有消息也要显示），否则刚新建的会话在侧栏永远是 0 个会话
-            raw = self._memory.get_all_sessions(workdir=None, source="GUI", include_empty=True)
+            # 一次取回 GUI 与秘书会话：秘书归属必须靠 source 区分，因为秘书会话的
+            # workdir 同为 "GLOBAL"，光看路径与自由对话无从辨别
+            raw = self._memory.get_all_sessions(
+                workdir=None, sources=["GUI", "SECRETARY"], include_empty=True
+            )
             saved_workspaces = self._memory.get_all_workspaces()
             current_wdir = _resolve_real_path(os.getcwd())
             app_dir = _app_install_dir()
@@ -3158,6 +3795,13 @@ class ApiBridge(GitBridgeMixin):
             # 恢复最近会话会 chdir 到项目目录，此时新建自由对话，
             # 若按 cwd 标记就会出现“对话”和项目分组同时显示“当前”
             current_session_wdir = self._session_workdir(self._current_session)
+            # 秘书会话的 workdir 同样是 "GLOBAL"，所以“当前”归属也只能看 source：
+            # 否则“秘书”和“对话”两个分组会同时显示为当前分组
+            current_is_secretary = any(
+                s.get("name") == self._current_session
+                and (s.get("source") or "GUI") == "SECRETARY"
+                for s in raw
+            )
 
             if current_wdir != "GLOBAL" and current_wdir != app_dir:
                 self._memory.add_workspace(current_wdir)
@@ -3169,7 +3813,19 @@ class ApiBridge(GitBridgeMixin):
                 "folder_path": "GLOBAL",
                 "folder_name": "对话",
                 "is_global": True,
-                "is_current": (current_session_wdir == "GLOBAL"),
+                "is_current": (current_session_wdir == "GLOBAL" and not current_is_secretary),
+                "sessions": [],
+            }
+
+            # 秘书分组：与"对话"一样不对应任何项目文件夹，故 is_global 必须是 False
+            # （前端多处用 is_global 判定"自由对话分组"，不能被秘书组误命中）；
+            # folder_path 仅作分组标识，不会作为 workdir 落库
+            secretary_group = {
+                "folder_path": "SECRETARY",
+                "folder_name": "秘书",
+                "is_global": False,
+                "is_secretary": True,
+                "is_current": current_is_secretary,
                 "sessions": [],
             }
 
@@ -3180,7 +3836,10 @@ class ApiBridge(GitBridgeMixin):
 
             for s in raw:
                 wdir_item = s.get("workdir")
-                if wdir_item and wdir_item != "GLOBAL":
+                # 只把"GLOBAL 之外的真实目录"纳入项目分组：秘书归属靠 source 判定，
+                # 其 workdir 仍是 "GLOBAL"，这里额外防御 "SECRETARY" 这个分组标识
+                # 被误当路径处理（_resolve_real_path 会把它拼成伪目录，凭空多出分组）
+                if wdir_item and wdir_item not in ("GLOBAL", "SECRETARY"):
                     all_known_wdirs.add(_resolve_real_path(wdir_item))
 
             for w_path in all_known_wdirs:
@@ -3207,6 +3866,29 @@ class ApiBridge(GitBridgeMixin):
 
                 wdir = s.get("workdir")
                 display = "新会话" if is_default_name else name
+
+                # 秘书归属只由 source 决定：秘书会话的 workdir 就是 "GLOBAL"，
+                # 与自由对话同路径，按路径归组会被"对话"分组抢走，
+                # 也无法表达两种不同的分组语义
+
+                if (s.get("source") or "GUI") == "SECRETARY":
+                    # 秘书会话的显示名就是秘书名（每个秘书会话各起一个名字）：
+                    # 未命名的历史遗留会话回落「秘书」，与身份解析口径保持一致
+                    sec_name = secretary.get_secretary_name(name) or secretary.FALLBACK_SECRETARY_NAME
+                    secretary_group["sessions"].append({
+                        "name": name,
+                        "session_id": s.get("id"),
+                        "display_name": sec_name,
+                        "secretary_name": sec_name,
+                        # 显式标注秘书归属（前端此前靠 secretary_name 兜底判定，
+                        # 这里给出明确字段，避免与"名字恰好叫秘书"的普通会话混淆）
+                        "is_secretary": True,
+                        "count": msg_count,
+                        "workdir": "GLOBAL",
+                        "is_global": True,
+                        "updated_at": s.get("updated_at") or "",
+                    })
+                    continue
 
                 # 无 workdir 的历史会话（旧数据/CLI 产生）固定归入"对话"分组；
                 # 不能兜底跟随进程 cwd，否则引入新目录 chdir 后它们会集体"搬"
@@ -3244,10 +3926,10 @@ class ApiBridge(GitBridgeMixin):
                     }
                 groups_dict[wdir_norm]["sessions"].append(s_info)
 
-            # 3. 全局对话组无条件保留在最顶部，项目分组按名称稳定排序。
-            # 不能把"当前会话所在目录"置顶：否则点击不同目录的会话时列表
-            # 会整体跳动
-            result_groups = [global_group]
+            # 3. 秘书组与全局对话组无条件保留在最顶部（秘书组置顶），
+            # 项目分组按名称稳定排序。不能把"当前会话所在目录"置顶：
+            # 否则点击不同目录的会话时列表会整体跳动
+            result_groups = [secretary_group, global_group]
             project_groups = list(groups_dict.values())
             project_groups.sort(key=lambda g: g["folder_name"])
             result_groups.extend(project_groups)
@@ -3256,11 +3938,80 @@ class ApiBridge(GitBridgeMixin):
             logger.exception("get_sessions 失败")
             return []
 
-    def create_session(self, title: str = "新会话", workdir: Optional[str] = None) -> Dict[str, Any]:
+    def get_archived_sessions(self) -> List[Dict[str, Any]]:
+        """归档会话列表（按归档时刻倒序）。
+
+        条目字段风格与 get_sessions 分组树里的会话条目一致（name / session_id /
+        display_name / count / workdir / is_global / updated_at），秘书会话另带
+        secretary_name 与 is_secretary（显示名即秘书名），额外带 archived_at；
+        归档区没有分组语义，故直接返回扁平列表供侧栏渲染。
+        """
+        try:
+            # 归档区必须同时收 GUI 与 SECRETARY：秘书会话已归档后在秘书分组里被
+            # 归档过滤隐去，若这里仍按 source="GUI" 过滤就会两边都看不到，等于
+            # 凭空消失（归档只是标记，列表里丢了就再也找不回来）
+            raw = self._memory.get_all_sessions(
+                workdir=None, sources=["GUI", "SECRETARY"],
+                include_empty=True, archived_only=True
+            )
+            items: List[Dict[str, Any]] = []
+            for s in raw:
+                name = s.get("name", "")
+                wdir = s.get("workdir")
+                is_global = (not wdir) or wdir == "GLOBAL"
+                # 秘书归属只由 source 决定（口径与 get_sessions 一致）：秘书会话的
+                # workdir 就是 GLOBAL，无法靠路径区分
+                is_secretary = (s.get("source") or "GUI") == secretary.SECRETARY_SOURCE
+                if is_secretary:
+                    # 秘书会话的显示名就是秘书名；未命名的历史遗留会话回落「秘书」，
+                    # 与秘书分组、身份解析三处口径保持一致
+                    sec_name = (
+                        secretary.get_secretary_name(name)
+                        or secretary.FALLBACK_SECRETARY_NAME
+                    )
+                    display_name = sec_name
+                else:
+                    # 与 get_sessions 同一口径：默认名显示为「新会话」
+                    display_name = (
+                        "新会话" if re.match(r"^session_[a-f0-9]{6}$", name) else name
+                    )
+                entry = {
+                    "name": name,
+                    "session_id": s.get("id"),
+                    "display_name": display_name,
+                    "count": s.get("count", 0),
+                    "workdir": "GLOBAL" if is_global else _resolve_real_path(wdir),
+                    "is_global": is_global,
+                    "updated_at": s.get("updated_at") or "",
+                    "archived_at": s.get("archived_at") or "",
+                }
+                if is_secretary:
+                    entry["secretary_name"] = display_name
+                    entry["is_secretary"] = True
+                items.append(entry)
+            # archived_at 是 ISO8601 文本，字符串倒序即时间倒序；
+            # 同一时刻归档的会话再按名称兜底，避免列表顺序抖动
+            items.sort(key=lambda it: (it["archived_at"], it["name"]), reverse=True)
+            return items
+        except Exception:
+            logger.exception("get_archived_sessions 失败")
+            return []
+
+    def _session_archived_at(self, session_name: str) -> Optional[str]:
+        """查询会话当前归档时刻（不存在 / 未归档返回 None）。"""
+        for s in self._memory.get_all_sessions(
+            workdir=None, include_empty=True, include_archived=True
+        ):
+            if s.get("name") == session_name:
+                return s.get("archived_at") or None
+        return None
+
+    def create_session(self, title: str = "新会话", workdir: Optional[str] = None,
+                       source: str = "GUI") -> Dict[str, Any]:
         try:
             new_name = f"session_{uuid.uuid4().hex[:6]}"
             target_workdir = workdir or _resolve_real_path(os.getcwd())
-            self._memory.create_session_explicit(new_name, workdir=target_workdir, source="GUI")
+            self._memory.create_session_explicit(new_name, workdir=target_workdir, source=source)
             self._set_current_session(new_name)
             # 全局 session_token_usage 不按会话隔离，旧会话的 latest_total 会
             # 残留到新会话；新建后立即按空历史重算为 0，避免窗口占比虚高
@@ -3276,23 +4027,86 @@ class ApiBridge(GitBridgeMixin):
             logger.exception("create_session 失败")
             return {"ok": False, "msg": str(e)}
 
-    def create_global_session(self, title: str = "新对话") -> Dict[str, Any]:
-        """创建跳出文件夹限定的独立通用对话"""
+    def create_secretary_session(self, title: str = "新会话", name: str = "") -> Dict[str, Any]:
+        """新建一个「秘书」会话并切为当前会话（必须先给定这个名字）。
+
+        秘书会话固定 workdir="GLOBAL"、source="SECRETARY"：秘书能力不绑定任何
+        项目目录，其分组归属完全由 source 决定，因此不引入新的伪 workdir 值，
+        GLOBAL 的既有语义（自由对话）保持不变。
+
+        名字是秘书会话的身份标识：先校验后落库，非法名字直接拒绝且**不产生会话
+        记录**——否则会留下一个既无名字又已切走的孤儿会话。名字只存在
+        `secretary_name` 列里，不改 `session_name`，因此改名不牵动消息 / 摘要 / 快照。
+        """
         try:
+            try:
+                secretary_name = secretary.validate_secretary_name(name)
+            except ValueError as e:
+                return {"ok": False, "msg": str(e)}
             new_name = f"session_{uuid.uuid4().hex[:6]}"
-            self._memory.create_session_explicit(new_name, workdir="GLOBAL", source="GUI")
+            self._memory.create_session_explicit(
+                new_name, workdir="GLOBAL", source="SECRETARY", secretary_name=secretary_name
+            )
+            # 新会话名此前不可能进过缓存，这里失效是为并发路径兜底（同名复用等），
+            # 成本一次字典 pop，却能让首轮工具提示 / 标题立刻拿到新名字
+            secretary.invalidate_secretary_cache(new_name)
             self._set_current_session(new_name)
-            # 同 create_session：清掉旧会话残留在全局 latest_total 的窗口占用
+            # 同 create_session：新建后立即重算，避免残留旧会话的 token 统计
             self._recalc_token_usage(new_name)
             return {
                 "ok": True,
                 "session_name": new_name,
                 "title": title,
-                "display_name": title,
+                "display_name": secretary_name,
+                "secretary_name": secretary_name,
                 "workdir": "GLOBAL",
             }
         except Exception as e:
-            logger.exception("create_global_session 失败")
+            logger.exception("create_secretary_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_active_agent_name(self) -> Dict[str, Any]:
+        """返回当前会话生效的 agent 自称，供前端刷新欢迎页 / 对话头部显示名。
+
+        秘书会话 → 该会话的秘书名（未命名回落「秘书」），其余 → 设置页智能体名。
+        解析全在 `core.secretary` 内完成并自带兜底，这里只做桥接与日志。
+        """
+        try:
+            return {
+                "agent_name": secretary.get_active_agent_name(),
+                "is_secretary": bool(secretary.is_secretary_session()),
+            }
+        except Exception as e:
+            logger.exception("get_active_agent_name 失败")
+            return {"agent_name": "", "is_secretary": False, "msg": str(e)}
+
+    def rename_secretary_session(self, session_name: str, new_name: str) -> Dict[str, Any]:
+        """给秘书会话改名：只改 `secretary_name`，不动 `session_name`。
+
+        名字是提示词身份与显示名的共同来源，改完必须失效缓存，否则同一进程内
+        早先缓存过旧名字的高频路径（工具提示、标题）会继续显示旧名。
+        """
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if not secretary.is_secretary_session(session_name):
+                return {"ok": False, "msg": "该会话不是秘书会话，无法改名"}
+            try:
+                cleaned = secretary.validate_secretary_name(new_name)
+            except ValueError as e:
+                return {"ok": False, "msg": str(e)}
+            if not self._memory.set_session_secretary_name(session_name, cleaned):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            secretary.invalidate_secretary_cache(session_name)
+            return {
+                "ok": True,
+                "session_name": session_name,
+                "secretary_name": cleaned,
+                "display_name": cleaned,
+                "sessions": self.get_sessions(),
+            }
+        except Exception as e:
+            logger.exception("rename_secretary_session 失败")
             return {"ok": False, "msg": str(e)}
 
     def _set_current_session(self, session_name: str):
@@ -3388,6 +4202,10 @@ class ApiBridge(GitBridgeMixin):
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
             if self._current_session == old_name:
                 self._set_current_session(final_name)
+            # 会话名变了：旧名缓存作废，新名留空由下次解析回源（秘书会话的来源与
+            # 名字都随行，缓存键必须跟着改名走）
+            secretary.invalidate_secretary_cache(old_name)
+            secretary.invalidate_secretary_cache(final_name)
             from core import permission_grants
             from core.tools import rename_session_sandbox_bypass
 
@@ -3433,7 +4251,11 @@ class ApiBridge(GitBridgeMixin):
                     return {"ok": False, "success": False, "msg": "该会话正在运行回合，请先停止或等待完成后再删除"}
                 # 会话删除后排队消息一并丢弃
                 self._message_queues.pop(session_name, None)
+
             self._memory.delete_session(session_name)
+            # 会话没了，身份缓存必须跟着失效：否则将来复用到同名会话名时
+            # 会读到已删会话的旧来源 / 旧秘书名
+            secretary.invalidate_secretary_cache(session_name)
             from core import permission_grants
             from core.tools import clear_session_sandbox_bypass
 
@@ -3451,6 +4273,201 @@ class ApiBridge(GitBridgeMixin):
             }
         except Exception as e:
             logger.exception("delete_session 失败")
+            return {"ok": False, "success": False, "msg": str(e)}
+
+    def archive_session(self, session_name: str) -> Dict[str, Any]:
+        """归档会话：从侧栏主列表隐藏，可在归档区随时恢复（可逆，数据零损失）。
+
+        当前活跃会话禁止归档（与 CLI 会话管家的约束同源）：会话处于归档态却正在
+        被使用是自相矛盾的状态。成功后推送 session_archived，负载附带最新列表，
+        照 session_renamed 的推送模式，前端无需再算一遍。
+        """
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if session_name == self._current_session:
+                return {"ok": False, "msg": "不能归档当前活跃会话，请先切换到其它会话"}
+            if not self._memory.archive_session(session_name):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            archived_at = self._session_archived_at(session_name)
+            # 推送失败不能让前端误以为归档失败：DB 已生效，此时报失败更糟
+            try:
+                self.emit_event("session_archived", {
+                    "name": session_name,
+                    # 别名与 session_renamed 的 old_name/new_name 双字段风格一致
+                    "session_name": session_name,
+                    "archived_at": archived_at,
+                    "sessions": self.get_sessions(),
+                    "archived_sessions": self.get_archived_sessions(),
+                })
+            except Exception:
+                logger.exception("推送 session_archived 事件失败")
+            return {"ok": True, "name": session_name, "archived_at": archived_at}
+        except Exception as e:
+            logger.exception("archive_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def unarchive_session(self, session_name: str) -> Dict[str, Any]:
+        """取消归档：会话恢复回侧栏主列表；成功推送 session_unarchived。"""
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if not self._memory.unarchive_session(session_name):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            try:
+                self.emit_event("session_unarchived", {
+                    "name": session_name,
+                    "session_name": session_name,
+                    "archived_at": None,
+                    "sessions": self.get_sessions(),
+                    "archived_sessions": self.get_archived_sessions(),
+                })
+            except Exception:
+                logger.exception("推送 session_unarchived 事件失败")
+            return {"ok": True, "name": session_name, "archived_at": None}
+        except Exception as e:
+            logger.exception("unarchive_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    @staticmethod
+    def _normalize_session_names(session_names: Any) -> List[str]:
+        """批量会话操作的入参归一：非数组直接丢弃，去空白、去重、保持传入顺序。"""
+        if isinstance(session_names, str) or not isinstance(session_names, (list, tuple, set)):
+            return []
+        seen = set()
+        names: List[str] = []
+        for raw in session_names:
+            name = str(raw or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
+    def _emit_archive_batch_event(self, event_type: str, names: List[str],
+                                  failed: List[Dict[str, str]]) -> None:
+        """批量归档操作的单次事件推送：负载带最新两侧快照与失败项，前端直接采用。
+
+        不能在循环里逐条推送——前端每次都用负载快照覆盖列表，逐条推会反复
+        重算并互相覆盖，后到的旧快照还可能把已归档会话「复活」。推送失败不改判
+        操作结果（DB 已生效，此时报失败更糟，照 session_archived 的容错写法）。
+        """
+        try:
+            self.emit_event(event_type, {
+                "name": names[0] if names else "",
+                "session_name": names[0] if names else "",
+                "names": list(names),
+                "failed": list(failed),
+                "archived_at": None,
+                "sessions": self.get_sessions(),
+                "archived_sessions": self.get_archived_sessions(),
+            })
+        except Exception:
+            logger.exception("推送 %s 事件失败", event_type)
+
+    def unarchive_sessions(self, session_names: List[str]) -> Dict[str, Any]:
+        """批量取消归档（设置页归档区多选恢复）。
+
+        与单条 unarchive_session 同语义（可逆、幂等、不弹确认框），差别只在
+        一次处理多个会话、只推一次事件。单项失败不阻断其它项：成功的照常恢复，
+        失败的按 name/msg 回传给前端展示。
+        """
+        try:
+            names = self._normalize_session_names(session_names)
+            if not names:
+                return {"ok": False, "success": False, "msg": "会话名不能为空"}
+            restored: List[str] = []
+            failed: List[Dict[str, str]] = []
+            for name in names:
+                try:
+                    if self._memory.unarchive_session(name):
+                        restored.append(name)
+                    else:
+                        failed.append({"name": name, "msg": f"会话 {name} 不存在"})
+                except Exception as e:
+                    logger.exception("批量取消归档单项失败: %s", name)
+                    failed.append({"name": name, "msg": str(e)})
+            # 没有任何成功项时列表零变化，不推事件（避免前端白跑一次刷新）
+            if restored:
+                self._emit_archive_batch_event("session_unarchived", restored, failed)
+            return {
+                "ok": bool(restored),
+                "success": bool(restored),
+                "count": len(restored),
+                "names": restored,
+                "failed": failed,
+                "sessions": self.get_sessions(),
+                "archived_sessions": self.get_archived_sessions(),
+                "msg": "" if restored else "选中的会话都不存在",
+            }
+        except Exception as e:
+            logger.exception("unarchive_sessions 失败")
+            return {"ok": False, "success": False, "msg": str(e)}
+
+    def delete_archived_sessions(self, session_names: List[str]) -> Dict[str, Any]:
+        """批量删除归档会话（设置页归档区多选删除）。
+
+        与单条 delete_session 的差异有三点：
+
+        1. 只删「当前仍处于归档态」的会话——确认弹窗到落盘之间该会话可能已被别的
+           入口取消归档（甚至删除），此时跳过，而不是误删一个用户刚放回主列表的会话；
+        2. 逐项复查运行态，运行中的项拒绝删除且不阻断其它项（对照 delete_session 的
+           M21 保护：回合线程会继续往已删会话写消息，产生幽灵数据）；
+        3. 只推一次事件，负载带最新两侧快照。
+        """
+        try:
+            names = self._normalize_session_names(session_names)
+            if not names:
+                return {"ok": False, "success": False, "msg": "会话名不能为空"}
+            from core import permission_grants
+            from core.tools import clear_session_sandbox_bypass
+
+            deleted: List[str] = []
+            failed: List[Dict[str, str]] = []
+            for name in names:
+                try:
+                    # 状态漂移复查：已不在归档区的会话不删，只跳过并说明
+                    if not self._session_archived_at(name):
+                        failed.append({"name": name, "msg": "已不在归档区，已跳过"})
+                        continue
+                    with self._turn_start_lock:
+                        if self._is_turn_active(name):
+                            failed.append({
+                                "name": name,
+                                "msg": "该会话正在运行回合，请先停止或等待完成后再删除",
+                            })
+                            continue
+                        # 会话删除后排队消息一并丢弃
+                        self._message_queues.pop(name, None)
+                    self._memory.delete_session(name)
+                    # 与单条删除同口径：会话没了，身份缓存不能留
+                    secretary.invalidate_secretary_cache(name)
+                    permission_grants.clear_task(name)
+                    clear_session_sandbox_bypass(name)
+                    if self._current_session == name:
+                        # 归档会话不会是当前活跃会话（切换会话会自动取消归档），
+                        # 但并发入口下仍照单条删除防呆：删到当前会话就补建 GLOBAL 会话
+                        new_session = f"session_{uuid.uuid4().hex[:6]}"
+                        self._memory.create_session_explicit(new_session, workdir="GLOBAL", source="GUI")
+                        self._set_current_session(new_session)
+                    deleted.append(name)
+                except Exception as e:
+                    logger.exception("批量删除归档会话单项失败: %s", name)
+                    failed.append({"name": name, "msg": str(e)})
+            if deleted:
+                self._emit_archive_batch_event("session_deleted", deleted, failed)
+            return {
+                "ok": bool(deleted),
+                "success": bool(deleted),
+                "count": len(deleted),
+                "names": deleted,
+                "failed": failed,
+                "sessions": self.get_sessions(),
+                "archived_sessions": self.get_archived_sessions(),
+                "current_session": self._current_session,
+                "msg": "" if deleted else "选中的会话都不在归档区",
+            }
+        except Exception as e:
+            logger.exception("delete_archived_sessions 失败")
             return {"ok": False, "success": False, "msg": str(e)}
 
     def delete_folder_group(self, workdir: str) -> Dict[str, Any]:
@@ -3472,6 +4489,8 @@ class ApiBridge(GitBridgeMixin):
 
             for name in group_sessions:
                 if name:
+                    # 组内会话被整体删除，身份缓存一并对齐（防御：秘书会话不属任何项目组）
+                    secretary.invalidate_secretary_cache(name)
                     permission_grants.clear_task(name)
                     clear_session_sandbox_bypass(name)
             return {"ok": True, "success": True, "sessions": self.get_sessions()}
@@ -3606,6 +4625,22 @@ class ApiBridge(GitBridgeMixin):
             logger.exception("get_reasoning_snapshot 失败")
             return {"ok": False, "msg": str(e)}
 
+    def get_reasoning_snapshot_by_name(self, model_name: str) -> Dict[str, Any]:
+        """按模型名（尚未落库）返回思考能力快照，供新增模型/改名时即时预览档位。
+
+        与 get_reasoning_snapshot 的区别：后者按已保存的 model_id 查询配置，
+        能带出该模型持久化的思考选择；本方法只拿名字去推能力表，没有持久化
+        选择可读，因此返回的 choice 恒为 "default"。
+        """
+        try:
+            name = str(model_name or "").strip()
+            if not name:
+                return {"ok": False, "msg": "模型名不能为空"}
+            return {"ok": True, "reasoning": build_reasoning_snapshot({"name": name})}
+        except Exception as e:
+            logger.exception("get_reasoning_snapshot_by_name 失败")
+            return {"ok": False, "msg": str(e)}
+
     def set_secondary_model(self, model_id: str) -> Dict[str, Any]:
         """设置/清除副模型（用于视觉/压缩/子代理等后台任务）。传空字符串清除。"""
         try:
@@ -3667,6 +4702,19 @@ class ApiBridge(GitBridgeMixin):
                 logger.debug("读取会话权限档位失败", exc_info=True)
         return getattr(self, "_current_permission_mode", "confirm") or "confirm"
 
+    def get_permission_mode(self, session_name: str = "") -> Dict[str, Any]:
+        """返回指定会话的**生效**权限档位（会话级优先，未绑定回退全局默认）。
+
+        只读接口：供飞书/手机端在切换档位前展示当前状态，不修改任何状态。
+        """
+        try:
+            target = str(session_name or "").strip() or self._current_session
+            return {"ok": True, "session_name": target,
+                    "permission_mode": self._effective_permission_mode(target)}
+        except Exception as e:
+            logger.exception("get_permission_mode 失败")
+            return {"ok": False, "msg": str(e)}
+
     def set_permission_mode(self, mode: str, session_name: str = "") -> Dict[str, Any]:
         try:
             # 规范化会把无法识别的值兜底成 confirm；这里要明确告诉前端"没识别出来"，
@@ -3721,6 +4769,24 @@ class ApiBridge(GitBridgeMixin):
         except Exception as e:
             logger.exception("post_notice 失败")
             return {"ok": False, "msg": str(e)}
+
+    def _notice_emitter(self, session_name: str):
+        """构造带会话归属的对话提示发射器（notice 事件负载）。
+
+        压缩/水位线维护类提示可能由后台线程发起，也可能在用户已经切到别的
+        对话后才到达，因此必须携带 session_name：前端按归属会话把提示写进
+        对应对话流，缺省时只能落到用户正在查看的会话，表现为"别的对话的
+        提示出现在当前对话里"（跨会话串扰）。
+        """
+
+        def _emit(kind: str, message: str) -> None:
+            # kind 仅作调用方语义标记，压缩提示统一按普通 notice 渲染
+            self.emit_event("notice", {
+                "message": _strip_ansi_markup(message),
+                "session_name": str(session_name or ""),
+            })
+
+        return _emit
 
     # ------------------------------------------------------------------
     # 沙盒开关与持久化白名单（与 CLI 的 /sandbox、/whitelist 同一配置与存储）
@@ -3787,6 +4853,27 @@ class ApiBridge(GitBridgeMixin):
                 "settings": self.get_system_settings(),
             }
 
+    def set_context_watermark_base(self, value: int) -> Dict[str, Any]:
+        """设置上下文水位基准（tokens）；0/None 表示不设基准、跟随真实窗口。
+
+        显式非法值（非整数 / 越界）必须拒绝且不写盘。
+        """
+        from core.context_watermark import WatermarkBaseError, save_watermark_base
+
+        try:
+            save_watermark_base(value)
+            return {
+                "ok": True,
+                "settings": self.get_system_settings(),
+                "msg": "上下文水位基准已更新",
+            }
+        except (WatermarkBaseError, ValueError) as error:
+            return {
+                "ok": False,
+                "msg": str(error),
+                "settings": self.get_system_settings(),
+            }
+
     # ------------------------------------------------------------------
     # /doctor 聚合自检（T3b：设置页「运行自检」入口）
     # ------------------------------------------------------------------
@@ -3844,6 +4931,141 @@ class ApiBridge(GitBridgeMixin):
         except Exception as e:  # pragma: no cover - 防御性兜底
             logger.exception("set_persona_settings 失败")
             return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 决策模型（JEV）设置桥（Task 2：委托 core.decision_service，含异常兜底）
+    # ------------------------------------------------------------------
+    def get_decision_settings(self) -> Dict[str, Any]:
+        """返回决策模型设置快照（配置 + 运行时状态）。"""
+        from core import decision_service
+
+        try:
+            snapshot = decision_service.get_decision_settings_snapshot()
+            return {
+                "ok": True,
+                "settings": snapshot.get("config") or {},
+                "runtime": snapshot.get("runtime") or {},
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_settings 失败")
+            return {"ok": False, "msg": str(e), "settings": {}, "runtime": {}}
+
+    def set_decision_settings(self, patch: dict) -> Dict[str, Any]:
+        """校验并保存决策模型设置；非法值拒绝写盘并返回中文原因，成功返回新快照。"""
+        from core import decision_service
+
+        try:
+            settings = decision_service.save_decision_config(patch)
+            return {"ok": True, "msg": "决策设置已保存", "settings": settings}
+        except ValueError as error:
+            current = decision_service.load_decision_config()
+            return {"ok": False, "msg": str(error), "settings": current}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("set_decision_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def probe_decision(self) -> Dict[str, Any]:
+        """逐 Key 各跑一次无害探针，返回分类结果与目标任务模型。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.probe_decision()
+            return {
+                "ok": bool(result.get("ok", True)),
+                "results": result.get("results") or [],
+                "model_id": result.get("model_id") or "",
+                "msg": result.get("msg") or "",
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("probe_decision 失败")
+            return {"ok": False, "results": [], "model_id": "", "msg": str(e)}
+
+    def list_decision_models(self) -> Dict[str, Any]:
+        """从上游拉取 decision 类型模型列表（设置页「从上游拉取」下拉用）。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.list_decision_models()
+            return {
+                "ok": bool(result.get("ok")),
+                "models": result.get("models") or [],
+                "msg": result.get("msg") or "",
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("list_decision_models 失败")
+            return {"ok": False, "models": [], "msg": str(e)}
+
+    def list_decision_providers(self) -> Dict[str, Any]:
+        """列出「决策模型」可选的调用通道（不含 Key 内容；设置页通道下拉用）。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.list_decision_providers()
+            return {
+                "ok": bool(result.get("ok")),
+                "providers": result.get("providers") or [],
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("list_decision_providers 失败")
+            return {"ok": False, "providers": [], "msg": str(e)}
+
+    def get_decision_audit_summary(self, limit: int = 20) -> Dict[str, Any]:
+        """决策审计汇总：今日计数 + 最近 N 条记录（设置页「决策记录」面板用）。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.get_decision_audit_summary(limit)
+            return result if isinstance(result, dict) else {"ok": False, "msg": "汇总返回异常"}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_audit_summary 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def open_decision_audit_dir(self) -> Dict[str, Any]:
+        """在系统文件管理器中打开决策审计目录（缺失时先创建）。"""
+        from core import decision_service
+
+        try:
+            directory = decision_service._audit_dir()
+            os.makedirs(directory, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(directory)  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, directory])
+            return {"ok": True, "path": directory}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("open_decision_audit_dir 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_decision_audit_tail(self, limit: int = 20) -> Dict[str, Any]:
+        """读取决策审计目录最新文件的尾部若干行；目录/文件缺失时返回空列表。"""
+        from core import decision_service
+
+        try:
+            try:
+                count = max(1, int(limit))
+            except (TypeError, ValueError):
+                count = 20
+            directory = decision_service._audit_dir()
+            if not os.path.isdir(directory):
+                return {"ok": True, "lines": []}
+            names = sorted(
+                name for name in os.listdir(directory) if name.endswith(".jsonl")
+            )
+            if not names:
+                return {"ok": True, "lines": []}
+            lines: list = []
+            with open(os.path.join(directory, names[-1]), "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        lines.append(line)
+            return {"ok": True, "lines": lines[-count:]}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_audit_tail 失败")
+            return {"ok": False, "msg": str(e), "lines": []}
 
     # ------------------------------------------------------------------
     # 免责条款同意（合规链路：首次使用与条款版本升级后必须显式确认，
@@ -4471,6 +5693,38 @@ class ApiBridge(GitBridgeMixin):
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
+    def _ensure_feishu_service(self):
+        """惰性创建并启动飞书通道服务，失败/未配置返回 None（不抛给调用方）。
+
+        与 _ensure_lan_server 同范式：双检锁保证并发（启动后台线程 + 设置页保存）
+        只创建一个实例。未配置（开关关闭或缺凭据）时不创建任何线程，对现有功能
+        零影响——这也是"飞书功能不影响其它功能"的兜底开关。
+        """
+        if getattr(self, "_feishu_service", None) is not None:
+            return self._feishu_service
+        lock = getattr(self, "_feishu_lock", None)
+        if lock is None:
+            # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__，
+            # 缺状态时就地补齐，避免后台启动线程里抛 AttributeError
+            lock = threading.Lock()
+            self._feishu_lock = lock
+        with lock:
+            if getattr(self, "_feishu_service", None) is not None:
+                return self._feishu_service
+            try:
+                from core.feishu.bridge import FeishuBridge
+                from core.feishu.service import FeishuService
+
+                svc = FeishuService(bridge=FeishuBridge(bridge=self))
+                if not svc.start():
+                    # 未配置：不发布实例，避免事件热路径上做无谓转发
+                    return None
+                self._feishu_service = svc
+                return svc
+            except Exception:
+                logger.exception("飞书通道服务启动失败")
+                return None
+
     def get_remote_bind_qr(self, force_new: bool = False, mobile: bool = False) -> Dict[str, Any]:
         """返回手机扫码绑定信息。
 
@@ -4500,17 +5754,141 @@ class ApiBridge(GitBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 飞书通道设置
+    # ------------------------------------------------------------------
+
+    def get_feishu_settings(self) -> Dict[str, Any]:
+        """飞书集成设置快照。**不含 app_secret 明文**，只回 has_secret 布尔。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            cfg = load_feishu_config()
+            svc = getattr(self, "_feishu_service", None)
+            if svc is not None:
+                status = svc.status()
+            else:
+                from core.feishu.service import FeishuService
+
+                status = FeishuService().status()
+            return {
+                "ok": True,
+                "settings": {
+                    "enabled": cfg.enabled,
+                    "app_id": cfg.app_id,
+                    "has_secret": cfg.has_secret,
+                    "approvers": list(cfg.approvers),
+                    "notify_chat_id": cfg.notify_chat_id,
+                    "status": status,
+                },
+            }
+        except Exception as e:
+            logger.exception("get_feishu_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_feishu_secret(self) -> Dict[str, Any]:
+        """按需返回 app_secret 明文（仅设置页用户主动点「显示」时调用）。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            return {"ok": True, "app_secret": load_feishu_config().app_secret}
+        except Exception as e:
+            logger.exception("get_feishu_secret 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_feishu_settings(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """保存飞书设置；app_secret 写盘前加密（dpapi:/keyring:）。
+
+        payload.app_secret 省略或为空字符串表示「不修改已有密钥」——避免设置页
+        因掩码回显把密钥写坏。
+        """
+        payload = dict(payload or {})
+        try:
+            from core.credentials import protect_secret
+
+            app_id = str(payload.get("app_id") or "").strip()
+            approvers = [str(x).strip() for x in (payload.get("approvers") or []) if str(x).strip()]
+            notify_chat_id = str(payload.get("notify_chat_id") or "").strip()
+            enabled = bool(payload.get("enabled"))
+            secret = str(payload.get("app_secret") or "")
+            secret_provided = bool(secret.strip())
+
+            def mutate(data: Dict[str, Any]) -> None:
+                data[config.FEISHU_ENABLED_KEY] = enabled
+                data[config.FEISHU_APP_ID_KEY] = app_id
+                if secret_provided:
+                    data[config.FEISHU_APP_SECRET_KEY] = protect_secret(secret.strip())
+                data[config.FEISHU_APPROVERS_KEY] = approvers
+                data[config.FEISHU_NOTIFY_CHAT_ID_KEY] = notify_chat_id
+
+            config.update_config(mutate)
+            self._refresh_feishu_service()
+            snapshot = self.get_feishu_settings()
+            return {"ok": True, "settings": snapshot.get("settings") or {}, "msg": ""}
+        except Exception as e:
+            logger.exception("set_feishu_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def test_feishu_connection(self, app_id: str = "", app_secret: str = "") -> Dict[str, Any]:
+        """校验凭据：请求飞书长连接接入点，返回是否拿到连接地址。
+
+        传入空值时用已保存的配置（密钥未填则用已存密钥），便于设置页「测试连接」。
+        """
+        try:
+            from core.feishu._lark_ws import Client
+            from core.feishu.config import load_feishu_config
+
+            cfg = load_feishu_config()
+            use_id = str(app_id or "").strip() or cfg.app_id
+            use_secret = str(app_secret or "").strip() or cfg.app_secret
+            if not use_id or not use_secret:
+                return {"ok": False, "msg": "请先填写 App ID 与 App Secret"}
+            client = Client(app_id=use_id, app_secret=use_secret, source="xingyao")
+            url = client._get_conn_url()
+            return {
+                "ok": True,
+                "msg": "凭据有效，飞书已返回长连接地址（保存后即开始连接）",
+                "endpoint_ready": bool(url),
+            }
+        except Exception as e:
+            logger.info("test_feishu_connection 失败: %s", e)
+            return {"ok": False, "msg": f"连接失败：{e}"}
+
+    def _refresh_feishu_service(self) -> None:
+        """配置变更后让飞书服务按新配置生效（启动 / 停止 / 重连）。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            configured = load_feishu_config().configured
+        except Exception:
+            configured = False
+        svc = getattr(self, "_feishu_service", None)
+        if svc is None:
+            if configured:
+                self._ensure_feishu_service()
+            return
+        if not configured:
+            try:
+                svc.stop()
+            finally:
+                self._feishu_service = None
+            return
+        try:
+            svc.restart()
+        except Exception:
+            logger.exception("重启飞书通道服务失败")
+
+    # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
         # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
-        # "lan"，本地 GUI/CLI 固定 "local"；只接受这两个受控值，模型/用户正文
-        # 无法设置，非法值直接拒绝（不启动回合）。
+        # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"；
+        # 只接受这几个受控值，模型/用户正文无法设置，非法值直接拒绝（不启动回合）。
         # 注意参数顺序：permission_mode 在 turn_source 之前——桌面 GUI 经
         # pywebview 按位置传参，第 6 位必须是会话级权限档位；LAN 分发只放行
         # 前 5 个位置参数（MESSAGE_ENTRY_POSITIONAL_LIMIT），客户端同样无法
         # 经位置通道注入档位。
-        if turn_source not in ("local", "lan"):
+        if turn_source not in TURN_SOURCES:
             return {"ok": False, "msg": "无效的回合来源"}
         try:
             if self._shutting_down:
@@ -4556,7 +5934,10 @@ class ApiBridge(GitBridgeMixin):
                 # 避免等整个回合跑完才由 _maybe_auto_rename 改名。
                 # 注意：rename_session 要求会话已落库，故先 ensure_session 创建。
                 if workdir and re.match(r"^session_[a-f0-9]{6}$", target_session or ""):
-                    base_title = clean_text[:12].replace("\n", " ").strip()
+                    # 标题派生前先净化 @{会话名} 标记：直接把标记原文截进名字会
+                    # 产生「@{xxx」这类残缺标题，令该会话永远无法被 @ 引用命中
+                    from core.input_parser import sanitize_session_title
+                    base_title = sanitize_session_title(clean_text)[:12].replace("\n", " ").strip()
                     if base_title:
                         try:
                             self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
@@ -4627,7 +6008,8 @@ class ApiBridge(GitBridgeMixin):
                            internal_kind: str = "",
                            automation_context: Optional[Dict[str, str]] = None,
                            pending_model_id: str = "",
-                           pending_permission_mode: str = "") -> None:
+                           pending_permission_mode: str = "",
+                           secretary_dispatch_context: Optional[Dict[str, str]] = None) -> None:
         """启动一个新回合线程。调用方必须已持有 _turn_start_lock 且确认
         _is_turn_active(target_session) 为 False（检查+启动原子）。
 
@@ -4638,6 +6020,9 @@ class ApiBridge(GitBridgeMixin):
         internal_kind 非空表示系统内部回合（星轨自动化任务/后台汇总）。
         automation_context 为星轨自动化回合上下文（run_id/task_name/
         permission_mode），见待开发/星轨自动化任务/01-完整设计规格.md 5.4。
+        secretary_dispatch_context 为秘书调度台派活上下文（display_name/
+        notify_session）：派活本身不传 display_text/internal_kind，这个轻量标记
+        只用于回合收尾时给发起会话回一条完成通知。
         """
         with self._bg_summary_lock:
             self._bg_summary_triggered.discard(target_session)
@@ -4664,6 +6049,9 @@ class ApiBridge(GitBridgeMixin):
             turn_kwargs["internal_kind"] = internal_kind
         if automation_context:
             turn_kwargs["automation_context"] = automation_context
+        if secretary_dispatch_context:
+            # 秘书派活标记：仅用于回合收尾的完成通知（不改消息形态）
+            turn_kwargs["secretary_dispatch_context"] = secretary_dispatch_context
         worker = threading.Thread(
             target=self._run_turn_worker_serialized,
             args=(full_text, target_session),
@@ -4716,6 +6104,11 @@ class ApiBridge(GitBridgeMixin):
                 # 星轨自动化：排队条目可能是自动化触发（忙时入队），补发时把
                 # 自动化上下文透传回 worker；旧用户消息条目无这些键，零影响
                 automation_run_id = str(entry.get("automation_run_id") or "")
+                # 秘书调度台：派活排队条目补发时同样带完成通知标记（无该键的
+                # 普通用户消息条目零影响）
+                secretary_notify_session = str(
+                    entry.get("secretary_dispatch_notify_session") or ""
+                )
                 try:
                     self._spawn_turn_worker(
                         str(entry.get("text") or ""),
@@ -4724,13 +6117,22 @@ class ApiBridge(GitBridgeMixin):
                         # 排队消息补发保持原回合来源：LAN 消息不得降级为 local
                         turn_source=str(entry.get("turn_source") or "local"),
                         attachments=[str(p) for p in (entry.get("attachments") or [])],
-                        # 星轨自动化任务指定的工作目录：补发时重判会话是否仍不存在，
-                        # 已被其他回合创建的会话以自身归属为准
+                        # 待建会话工作目录（自动化任务 / 秘书派活共用同一条判定）：
+                        # 补发时重判会话是否仍不存在，已被其他回合创建的会话以
+                        # 自身归属为准
                         pending_workdir=self._automation_pending_workdir(
                             str(entry.get("pending_workdir") or ""), session_name
                         ),
                         # 任务指定模型随排队条目透传，补发回合同样生效
-                        pending_model_id=str(entry.get("automation_model_id") or ""),
+                        pending_model_id=str(
+                            entry.get("automation_model_id")
+                            or entry.get("secretary_model_id")
+                            or ""
+                        ),
+                        # 秘书派活的懒创建新会话档位：仅新会话需要，已有会话为空
+                        pending_permission_mode=str(
+                            entry.get("secretary_permission_mode") or ""
+                        ),
                         internal_kind="automation" if automation_run_id else "",
                         automation_context={
                             "run_id": automation_run_id,
@@ -4738,6 +6140,13 @@ class ApiBridge(GitBridgeMixin):
                             "permission_mode": str(entry.get("automation_permission_mode") or ""),
                             "notify_on_success": str(entry.get("automation_notify_success") or ""),
                         } if automation_run_id else None,
+                        # 秘书派活完成通知标记：补发回合跑完仍要回通知给发起会话
+                        secretary_dispatch_context={
+                            "display_name": str(
+                                entry.get("secretary_dispatch_display_name") or ""
+                            ),
+                            "notify_session": secretary_notify_session,
+                        } if secretary_notify_session else None,
                     )
                 except Exception:
                     logger.exception("补发排队消息失败")
@@ -4918,6 +6327,35 @@ class ApiBridge(GitBridgeMixin):
             run_now=self.run_automation_task_now,
             get_runs=self.get_automation_runs,
         ))
+
+    def _register_decision_audit_listener(self) -> None:
+        """把决策审计事件转发为前端桥事件（会话头部徽章 / 决策面板实时刷新）。
+
+        独立支路：不参与会话 runtime 归属；转发失败只记调试日志，绝不影响
+        决策主流程与审计落盘。
+        """
+        from core import decision_service
+
+        def _forward(brief: dict) -> None:
+            try:
+                self.emit_event("decision_recorded", dict(brief or {}))
+            except Exception:
+                logger.debug("decision_recorded 转发失败", exc_info=True)
+
+        decision_service.add_audit_listener(_forward)
+
+    def _register_secretary_dispatch_service(self) -> None:
+        """把桥侧调度能力注册为 core 层服务句柄（秘书工具的唯一入口）。
+
+        实现全部指向本桥既有通道：检索复用 MemoryManager，派活复用
+        ``_spawn_turn_worker`` / ``_message_queues``，跳转复用
+        ``_set_current_session`` 与归档入口；core 层工具经
+        ``core.secretary_dispatch.get()`` 取到句柄后调用同名方法，不在 core 层
+        重复实现一遍参数校验与事件推送。
+        """
+        from core import secretary_dispatch
+
+        secretary_dispatch.register(_SecretaryDispatchService(self))
 
     def get_automation_tasks(self) -> Dict[str, Any]:
         try:
@@ -5139,7 +6577,7 @@ class ApiBridge(GitBridgeMixin):
         保留函数名避免改动所有调用点，实现直接转发到 _run_turn_worker。"""
         return self._run_turn_worker(user_text, session_name, *args, **kwargs)
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None, automation_context: Optional[Dict[str, str]] = None, pending_model_id: str = "", pending_permission_mode: str = ""):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None, automation_context: Optional[Dict[str, str]] = None, pending_model_id: str = "", pending_permission_mode: str = "", secretary_dispatch_context: Optional[Dict[str, str]] = None):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
         internal_kind 非空表示这是系统自动发起的内部回合（后台任务汇总 /
@@ -5151,6 +6589,8 @@ class ApiBridge(GitBridgeMixin):
         automation_context 非空表示星轨自动化回合：运行终态回写 automation_runs
         表（completed/cancelled/error），无人值守权限档位按任务配置覆盖
         （规格 5.4/5.5）。
+        secretary_dispatch_context 非空表示这是秘书调度台派出的回合（内容本身
+        仍是普通用户消息）：收尾时给发起会话回一条轻量 notice。
         """
         api_key = ""
         turn_finished = False
@@ -5161,6 +6601,13 @@ class ApiBridge(GitBridgeMixin):
         automation_task_name = str((automation_context or {}).get("task_name") or "")
         automation_permission_mode = str((automation_context or {}).get("permission_mode") or "")
         automation_error: Optional[str] = None
+        # 闲时维护：回合开始即撤销本会话的空闲维护任务并协作中断在跑的
+        # 闲时压缩（见 core/idle_maintenance.py），结束在 finally 重新计时
+        try:
+            from core.idle_maintenance import idle_maintenance_service
+            idle_maintenance_service.on_turn_started(session_name)
+        except Exception:
+            pass
         # 本回合起点消息 id（turn_start 事件后记录）：异常/取消回滚后 history
         # 末尾会退化成上一轮的助手消息，补发全文必须按此边界过滤。必须在
         # finish_once 定义之前初始化，闭包才能读到；取值失败退回 None（旧行为）。
@@ -5496,7 +6943,8 @@ class ApiBridge(GitBridgeMixin):
                 # 用会话级绑定档位，未绑定回退全局默认；人工回合零改动
                 permission_mode=automation_permission_mode or self._effective_permission_mode(session_name),
                 cancel_event=cancel_event,
-                notify=lambda kind, message: self.emit_event("notice", {"message": _strip_ansi_markup(message)}),
+                # 压缩/维护提示按会话路由：缺 session_name 会串到用户正在看的对话
+                notify=self._notice_emitter(session_name),
                 api_key=api_key,
                 api_base=api_base,
                 is_gui=True,
@@ -5671,6 +7119,35 @@ class ApiBridge(GitBridgeMixin):
                     logger.debug("自动化终态通知推送失败", exc_info=True)
                 if turn_id:
                     self._automation_turn_labels.pop(turn_id, None)
+            # 秘书调度台派活：回合收尾给发起会话回一条完成通知。用户在秘书会话里
+            # 看不到目标会话的流式输出，这是唯一附加提示；目标会话内的消息形态
+            # 与用户亲手发消息完全一致（不写 display_text / internal_kind）。
+            # session_name 取发起会话（notify_session）：notice 按归属会话路由，
+            # 缺省会串到用户当前查看的会话。
+            if secretary_dispatch_context:
+                try:
+                    notify_session = str(
+                        secretary_dispatch_context.get("notify_session") or ""
+                    ) or session_name
+                    dispatch_label = str(
+                        secretary_dispatch_context.get("display_name") or ""
+                    ) or session_name
+                    terminal_error = str(error_state.get("terminal_message") or "")
+                    if cancelled:
+                        notice_message = f"任务在「{dispatch_label}」会话已取消。"
+                    elif terminal_error:
+                        notice_message = (
+                            f"任务在「{dispatch_label}」会话执行失败："
+                            f"{terminal_error[:120]}"
+                        )
+                    else:
+                        notice_message = f"任务已在「{dispatch_label}」会话执行完成"
+                    self.emit_event("notice", {
+                        "message": notice_message,
+                        "session_name": notify_session,
+                    })
+                except Exception:
+                    logger.debug("秘书派活完成通知推送失败", exc_info=True)
             # 回合运行期间若有后台子代理进入终态（当时不能并发起新回合），
             # 此时按会话取出自己的 pending 补触发自动汇总检查（set 分桶，
             # 多会话并行互不覆盖）
@@ -5684,6 +7161,17 @@ class ApiBridge(GitBridgeMixin):
                     daemon=True,
                     name="gui-bg-summary-recheck",
                 ).start()
+            # 闲时维护重新计时：空闲超过配置延时后跑水位线维护与压缩（默认开，
+            # config memory_compression.idle_maintenance_seconds = 0 关闭）
+            if not self._shutting_down:
+                try:
+                    idle_maintenance_service.on_turn_finished(
+                        session_name,
+                        # 与回合内/后台压缩共用同一发射器，避免再漏会话归属
+                        notify=self._notice_emitter(session_name),
+                    )
+                except Exception:
+                    pass
             # finally 末尾：补发排队中的用户消息（FIFO）。放在所有清理之后，
             # 保证补发回合的 turn_start 事件一定晚于本回合的终态事件到达前端
             self._drain_message_queue(session_name)
@@ -5736,8 +7224,7 @@ class ApiBridge(GitBridgeMixin):
             cmd = redact_sensitive_text(command or "")
             tail = (log_tail or "").strip()[-1500:]
             prompt = (
-                "有一个后台命令任务执行完毕，请用一句话简短总结它的结果"
-                "（成功/失败 + 关键信息，不要复述命令本身）。\n"
+                f"{_BG_COMMAND_SUMMARY_PROMPT}\n"
                 f"命令: {cmd}\n"
                 f"退出码: {int(returncode or 0)}（0=成功，非0=失败）\n"
                 f"日志尾部:\n{tail or '(无输出)'}\n"
@@ -5874,6 +7361,11 @@ class ApiBridge(GitBridgeMixin):
                         "stage_detail": last_detail,
                         "elapsed": elapsed,
                         "background": bool(snap.run_in_background),
+                        # 完整阶段历史：右面板"子代理"工作台渲染执行流程时间线
+                        "stages": [
+                            {"name": s.name, "at": s.at, "detail": s.detail}
+                            for s in snap.stages
+                        ],
                     })
                 # 没有任务且上一轮也没有任务时不推事件，避免空轮询刷屏
                 if tasks or had_tasks:
@@ -6137,6 +7629,10 @@ class ApiBridge(GitBridgeMixin):
         # 首条用户消息也带着当轮注入的上下文后缀，提炼标题前剥掉，
         # 否则标题会混入「【当前运行上下文】当前模型：…」这类运行时文字
         first_text = str(strip_context_suffix(raw)).strip().replace("\n", " ")
+        # @{会话名} 标记按内部名还原并剥掉花括号：与首条消息即时命名
+        # （_send_message 内的 base_title 派生）保持同一净化口径
+        from core.input_parser import sanitize_session_title
+        first_text = sanitize_session_title(first_text)
         return first_text[:12] if first_text else None
 
     def _rename_session_to_title(self, session_name: str, base_title: str) -> str:
@@ -6327,6 +7823,10 @@ class ApiBridge(GitBridgeMixin):
                     process_usage.get("cumulative_completion", 0) or 0
                 ),
                 "total_cached": int(process_usage.get("cumulative_cached", 0) or 0),
+                # 本会话口径（token_usage 落库聚合，重启不清零）：状态行默认
+                # 显示当前会话的输入/输出/命中；命中率分母用 cache_prompt
+                # （只含已报告缓存明细的轮次，未报告 ≠ 0）
+                "session_totals": self._session_token_totals(self._current_session),
                 # 车道身份与保活单列（前端上下文面板消费；口径与上面的 cache_*_pct 一致，
                 # 因此不再重复输出 cache_lane_hot_pct / cache_lane_session_pct 这类
                 # 与既有键同值的字段——白涨载荷）。现有键语义保持不变。
@@ -6355,8 +7855,48 @@ class ApiBridge(GitBridgeMixin):
                 "cache_lane_model": "", "cache_lane_api_base": "",
                 "cache_keepalive_hot_pct": None,
                 "cache_keepalive_session_pct": None,
+                "session_totals": self._empty_session_totals(),
                 "context_breakdown": [],
             }
+
+    @staticmethod
+    def _empty_session_totals():
+        return {
+            "session_id": "", "prompt": 0, "completion": 0, "cached": 0,
+            "cache_prompt": 0, "total": 0, "requests": 0, "last_ts": None,
+            "keepalive_prompt": 0, "keepalive_cached": 0, "keepalive_requests": 0,
+        }
+
+    def _session_token_totals(self, session_name):
+        """本会话 token 用量落库聚合；失败返回零值，绝不影响主推送。"""
+        try:
+            totals = self._memory.get_token_usage_by_session(session_name)
+        except Exception:
+            logger.debug("本会话 token 聚合失败", exc_info=True)
+            totals = self._empty_session_totals()
+        totals = dict(totals)
+        totals["session_id"] = str(session_name or "")
+        return totals
+
+    def get_token_usage_overview(self, limit: int = 20) -> Dict[str, Any]:
+        """会话 token 弹层数据：全部会话合计 + 按用量排序的会话列表。
+
+        合计不分 scope（保活/压缩也是真实计费），会话列表只含对话口径
+        （main/legacy）且只列现存会话。供前端点击状态行时按需拉取。
+        """
+        try:
+            if type(limit) is not int or not (1 <= limit <= 100):
+                limit = 20
+            sessions = self._memory.list_token_usage_by_sessions(limit=limit)
+            return {
+                "ok": True,
+                "current": str(self._current_session or ""),
+                "totals": self._memory.get_token_usage_totals(),
+                "sessions": sessions,
+            }
+        except Exception as exc:
+            logger.debug("get_token_usage_overview 失败", exc_info=True)
+            return {"ok": False, "msg": str(exc), "current": "", "totals": {}, "sessions": []}
 
     def _emit_token_usage(self):
         try:
@@ -6435,9 +7975,8 @@ class ApiBridge(GitBridgeMixin):
                         active.get("litellm_model", ""),
                         window,
                         permission_mode=self._effective_permission_mode(session_name),
-                        notify=lambda kind, message: self.emit_event(
-                            "notice", {"message": _strip_ansi_markup(message)}
-                        ),
+                        # 后台压缩提示同样按会话路由（用户可能已切到别的对话）
+                        notify=self._notice_emitter(session_name),
                         api_key=active.get("api_key", ""),
                         api_base=active.get("base_url", ""),
                         is_gui=True,
@@ -6575,6 +8114,7 @@ class ApiBridge(GitBridgeMixin):
                     "status": status,
                     "enabled": enabled,
                     "tools": list(info.get("tools") or []),
+                    "has_settings": bool(info.get("has_settings")),
                     "error": str(info.get("error") or ""),
                 })
             return result
@@ -6586,7 +8126,22 @@ class ApiBridge(GitBridgeMixin):
         try:
             from core.plugin_loader import toggle_plugin as _toggle
             ok, msg = _toggle(name, enabled)
-            return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
+            # 回传模型设置快照（与 add_provider / add_model_to_provider 同一模式）：
+            # 插件的启用与禁用会增删 provider 与模型（例如 opencode_zen 启用时自举
+            # provider、禁用时按来源标记回收），只回传 plugins 会让模型选择器停在旧列表，
+            # 用户必须重启星瑶才能看到变化。
+            # 快照单独 try/except：取快照失败不能影响 toggle 本身的结果。
+            try:
+                settings = self.get_model_settings()
+            except Exception:
+                logger.exception("toggle_plugin 获取模型设置快照失败")
+                settings = None
+            return {
+                "ok": ok,
+                "msg": msg,
+                "plugins": self.get_plugins(),
+                "settings": settings,
+            }
         except Exception as e:
             logger.exception("toggle_plugin 失败")
             return {"ok": False, "msg": str(e)}
@@ -6598,6 +8153,84 @@ class ApiBridge(GitBridgeMixin):
             return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
         except Exception as e:
             logger.exception("trust_plugin 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 插件设置页（声明式）：插件提供界面快照，前端统一渲染
+    # ------------------------------------------------------------------
+    def get_plugin_settings(self, name: str) -> Dict[str, Any]:
+        """读取插件设置页快照（调插件 plugin_settings({"action": "render"})）。
+
+        仅对"已加载（=已信任 + 已启用）"插件调用；未加载时透传 needs 指引，
+        前端据此渲染"信任并启用"引导。
+        """
+        try:
+            from core.plugin_loader import call_plugin_hook
+
+            result = call_plugin_hook(name, "plugin_settings", {"action": "render"})
+            if not result.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": str(result.get("message") or "插件设置页不可用"),
+                    "needs": result.get("needs"),
+                }
+            data = result.get("data") or {}
+            page = data.get("page") if isinstance(data, dict) else None
+            if not isinstance(page, dict):
+                return {"ok": False, "msg": "插件未返回有效的设置页内容", "needs": None}
+            return {"ok": True, "msg": "", "needs": None, "page": page}
+        except Exception as e:
+            logger.exception("get_plugin_settings 失败")
+            return {"ok": False, "msg": str(e), "needs": None}
+
+    def run_plugin_settings_action(
+        self, name: str, action: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """执行插件设置页上的一个动作，返回插件声明的 envelope（透传）。"""
+        try:
+            from core.plugin_loader import call_plugin_hook
+
+            result = call_plugin_hook(
+                name,
+                "plugin_settings",
+                {"action": str(action or ""), "params": params or {}},
+            )
+            if not result.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": str(result.get("message") or "插件动作不可用"),
+                    "needs": result.get("needs"),
+                }
+            data = result.get("data") or {}
+            if not isinstance(data, dict):
+                return {"ok": False, "msg": "插件动作返回值无效", "needs": None}
+            return {
+                "ok": bool(data.get("ok", True)),
+                "msg": str(data.get("message") or ""),
+                "needs": None,
+                "page": data.get("page"),
+                "auth_url": data.get("auth_url"),
+                "poll": data.get("poll"),
+                "done": data.get("done"),
+            }
+        except Exception as e:
+            logger.exception("run_plugin_settings_action 失败")
+            return {"ok": False, "msg": str(e), "needs": None}
+
+    def open_external_url(self, url: str) -> Dict[str, Any]:
+        """在系统默认浏览器打开 http/https 链接（插件授权页等）；仅放行 http(s)。"""
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(str(url or "").strip())
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                return {"ok": False, "msg": "仅支持打开 http/https 链接"}
+            import webbrowser
+
+            opened = webbrowser.open(parsed.geturl())
+            return {"ok": bool(opened), "msg": "" if opened else "系统浏览器未能打开链接"}
+        except Exception as e:
+            logger.exception("open_external_url 失败")
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
@@ -6753,6 +8386,8 @@ class ApiBridge(GitBridgeMixin):
                 "enabled": enabled,
                 "connected": bool(item.get("connected", False)),
                 "tools_count": int(counts.get(name, 0)),
+                # 最近一次连接失败原因（无失败为 None），供界面提示排查
+                "last_error": item.get("last_error"),
             })
         return result
 
@@ -6833,6 +8468,32 @@ class ApiBridge(GitBridgeMixin):
             }
         except Exception as e:
             logger.exception("add_mcp_server 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def remove_mcp_server(self, name: str) -> Dict[str, Any]:
+        """删除自定义 MCP 服务：删配置与重连放后台线程，避免阻塞界面。"""
+        if self._mcp is None:
+            return {"ok": False, "msg": "MCP 管理器不可用（依赖未安装）"}
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "msg": "服务名不能为空"}
+
+        def _job():
+            try:
+                ok, msg = self._mcp.remove_server(name)
+            except Exception as e:
+                ok, msg = False, str(e)
+            self.emit_event("mcp_status", {"mcps": self._build_mcp_list(), "ok": ok, "msg": msg})
+
+        try:
+            threading.Thread(target=_job, daemon=True, name="gui-mcp-remove").start()
+            return {
+                "ok": True,
+                "msg": f"正在删除 {name}，完成后会自动刷新状态",
+                "mcps": self._build_mcp_list(),
+            }
+        except Exception as e:
+            logger.exception("remove_mcp_server 失败")
             return {"ok": False, "msg": str(e)}
 
     def reconnect_mcp(self) -> Dict[str, Any]:
@@ -7396,6 +9057,74 @@ class ApiBridge(GitBridgeMixin):
             logger.debug("get_background_tasks 失败", exc_info=True)
             return []
 
+    def get_background_task_output(self, task_id: str, tail_lines: int = 200) -> Dict[str, Any]:
+        """后台任务执行过程：读取任务日志尾部（右面板详情用）。
+
+        get_task_output 自带末尾字节截断与异常兜底，失败返回 🚨 文本而非抛错。
+        """
+        try:
+            from core.task_manager import get_task_output
+            return {"ok": True, "output": get_task_output(str(task_id or ""), int(tail_lines))}
+        except Exception as exc:
+            logger.debug("get_background_task_output 失败", exc_info=True)
+            return {"ok": False, "output": "", "msg": str(exc)}
+
+    def get_subagent_task_detail(self, task_id: str, session_name: str = "") -> Dict[str, Any]:
+        """子代理执行过程详情（右面板"子代理"工作台轮询用）。
+
+        返回目标任务的完整阶段历史 + 该会话全部子代理的轻量清单（供任务切换条）。
+        目标任务按 task_id 全局查找（会话切换后仍可回看）；清单按 session 过滤，
+        session_name 为空时返回全部任务。任务可能因容量清理被回收，此时 ok=False，
+        前端保留最后已知状态继续展示。
+        """
+        try:
+            from core.tools import subagent_manager
+            wanted = str(task_id or "")
+            session = str(session_name or "")
+            now = time.time()
+            tasks: List[Dict[str, Any]] = []
+            target = None
+            target_item: Dict[str, Any] | None = None
+            for snap in subagent_manager.snapshot():
+                elapsed = 0
+                if snap.started_at:
+                    elapsed = int((snap.finished_at or now) - snap.started_at)
+                item = {
+                    "id": snap.task_id,
+                    "description": snap.description,
+                    "type": snap.subagent_type,
+                    "status": snap.status,
+                    "stage": snap.stage,
+                    "elapsed": elapsed,
+                    "background": bool(snap.run_in_background),
+                }
+                if not session or snap.parent_session == session:
+                    tasks.append(item)
+                if snap.task_id == wanted:
+                    target = snap
+                    target_item = item
+            if target is None or target_item is None:
+                return {"ok": False, "task": None, "tasks": tasks,
+                        "msg": "未找到该子代理任务（可能已被清理）"}
+            detail = {
+                **target_item,
+                "stage_detail": target.stages[-1].detail if target.stages else "",
+                "plan_item_id": target.plan_item_id,
+                "started_at": target.started_at,
+                "finished_at": target.finished_at,
+                "stages": [
+                    {"name": s.name, "at": s.at, "detail": s.detail}
+                    for s in target.stages
+                ],
+                "result": str(target.result or "")[:4000],
+                "error": str(target.error or ""),
+                "partial": str(target.partial_result or "")[:2000],
+            }
+            return {"ok": True, "task": detail, "tasks": tasks}
+        except Exception as exc:
+            logger.debug("get_subagent_task_detail 失败", exc_info=True)
+            return {"ok": False, "task": None, "tasks": [], "msg": str(exc)}
+
     def kill_task(self, task_id: str) -> Dict[str, Any]:
         try:
             from core.task_manager import (
@@ -7418,108 +9147,98 @@ class ApiBridge(GitBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
-    # 内嵌终端（右侧面板）
-    # 仅执行用户在终端输入框里手动敲下的命令——模型/工具链路不经过这里，
+    # 内嵌交互式终端（底部面板，pywinpty/ConPTY 常驻 shell）
+    # 旧版右侧面板单命令终端（run/kill_terminal_command）已下线删除，
+    # 交互式终端能力由 pty_terminal_* 承载——模型/工具链路不经过这里，
     # 模型执行命令仍走 execute_command 工具的权限确认流程。
+    # 输出/退出经 emit_event（pty_data / pty_exit）进 _js_queue 派发。
     # ------------------------------------------------------------------
-    def run_terminal_command(self, command: str) -> Dict[str, Any]:
-        import subprocess
-        from core.command_shell import CommandShellError, build_command_invocation
+    def _emit_pty_exit(self, code) -> None:
+        if self._shutting_down:
+            return
+        try:
+            self.emit_event("pty_exit", {"code": int(code)})
+        except Exception:
+            logger.debug("推送终端退出事件失败", exc_info=True)
 
-        command = str(command or "").strip()
-        if not command:
-            return {"ok": False, "msg": "命令为空"}
+    def pty_terminal_ensure(self, cols=80, rows=24) -> Dict[str, Any]:
+        """确保存在一个存活的交互式终端会话；没有或已退出则新开一个。
 
-        with self._term_lock:
-            if self._term_proc is not None and self._term_proc.poll() is None:
-                return {"ok": False, "msg": "已有命令正在运行，请先等它结束或点击终止"}
+        以当前会话的 workdir 为起始目录；GLOBAL 自由对话按进程 cwd 兜底
+        （M19 同款处理，workdir 标记字符串不能直接当目录用）。
+        """
+        cols, rows = clamp_terminal_size(cols, rows)
+        with self._pty_lock:
+            session = self._pty_session
+            if session is not None and session.is_alive():
+                return {"ok": True, "pid": session.pid, "cwd": session.cwd, "reused": True}
             cwd = self._session_workdir(self._current_session)
             if cwd == "GLOBAL" or not os.path.isdir(cwd):
-                # M19：GLOBAL 自由对话的 workdir 只是归属标记字符串，直接当
-                # Popen cwd 必抛 FileNotFoundError；统一归一为进程 cwd
                 cwd = _resolve_real_path(os.getcwd())
             try:
-                invocation = build_command_invocation(command)
-                popen_kwargs = {
-                    "shell": invocation.use_system_shell,
-                    "cwd": cwd,
-                    "stdout": subprocess.PIPE,
-                    "stderr": subprocess.STDOUT,
-                    "stdin": subprocess.DEVNULL,
-                }
-                if invocation.executable:
-                    popen_kwargs["executable"] = invocation.executable
-                if os.name == "nt":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                else:
-                    # M20：独立进程组启动，终止时用 killpg 杀整棵子树，
-                    # 避免只 kill shell 父进程后子进程成孤儿
-                    popen_kwargs["start_new_session"] = True
-                proc = subprocess.Popen(invocation.argv, **popen_kwargs)
-            except CommandShellError as e:
-                return {"ok": False, "msg": f"命令解释器不可用: {e}"}
-            except Exception as e:
-                return {"ok": False, "msg": str(e)}
-            self._term_proc = proc
-
-        def _pump():
-            # 按行读取并小批量推送：逐行 evaluate_js 会在输出很密时拖垮 WebView
-            buf: List[str] = []
-            last_flush = time.monotonic()
-
-            def _flush():
-                nonlocal last_flush
-                if buf:
-                    self.emit_event("terminal_output", {"text": "".join(buf)})
-                    buf.clear()
-                last_flush = time.monotonic()
-
-            try:
-                for raw in iter(proc.stdout.readline, b""):
-                    try:
-                        line = raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        # Windows 下 cmd 内置命令常输出 GBK
-                        line = raw.decode("gbk", errors="replace")
-                    buf.append(line)
-                    if time.monotonic() - last_flush >= 0.08 or len(buf) >= 200:
-                        _flush()
-            except Exception:
-                logger.debug("终端输出读取中断", exc_info=True)
-            finally:
-                _flush()
-                try:
-                    rc = proc.wait(timeout=5)
-                except Exception:
-                    rc = -1
-                self.emit_event("terminal_finished", {"code": rc})
-
-        threading.Thread(target=_pump, daemon=True, name="gui-terminal-pump").start()
-        return {"ok": True, "cwd": cwd}
-
-    def kill_terminal_command(self) -> Dict[str, Any]:
-        import subprocess
-
-        with self._term_lock:
-            proc = self._term_proc
-        if proc is None or proc.poll() is not None:
-            return {"ok": False, "msg": "当前没有正在运行的命令"}
-        try:
-            if os.name == "nt":
-                # Windows 命令解释器会再派生子进程，必须 /T 杀掉整棵进程树
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
+                session = create_pty_terminal(
+                    cwd=cwd,
+                    cols=cols,
+                    rows=rows,
+                    on_output=lambda text: self.emit_event("pty_data", {"text": text}),
+                    on_exit=self._emit_pty_exit,
                 )
-            else:
-                # M20：配合 Popen 的 start_new_session，杀整个进程组而不是
-                # 只 kill shell 父进程（子树否则成孤儿）
-                import signal
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            except PtyTerminalError as e:
+                return {"ok": False, "msg": str(e)}
+            except Exception as e:
+                logger.exception("启动内嵌交互式终端失败")
+                return {"ok": False, "msg": str(e)}
+            self._pty_session = session
+            return {"ok": True, "pid": session.pid, "cwd": cwd, "reused": False}
+
+    def pty_terminal_write(self, data: str) -> Dict[str, Any]:
+        """把用户键入内容写进常驻 shell（xterm.js onData 原样字符串）。
+
+        session.write 返回 bool：显式 False 表示输入未送达（shell 已退出、
+        写入异常等），桥层如实回 {"ok": False}，前端据此提示而不是静默丢键。
+        """
+        data = str(data or "")
+        if not data:
+            return {"ok": False, "msg": "输入为空"}
+        with self._pty_lock:
+            session = self._pty_session
+        if session is None or not session.is_alive():
+            return {"ok": False, "msg": "终端未运行"}
+        try:
+            ok = session.write(data)
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+        if ok is False:
+            return {"ok": False, "msg": "终端已退出，输入未送达"}
+        return {"ok": True}
+
+    def pty_terminal_resize(self, cols=80, rows=24) -> Dict[str, Any]:
+        """同步前端 xterm 视口尺寸到 ConPTY（面板拖拽/窗口缩放时调用）。
+
+        session.resize 返回 bool：显式 False 表示尺寸未生效（会话已退出等）。
+        """
+        cols, rows = clamp_terminal_size(cols, rows)
+        with self._pty_lock:
+            session = self._pty_session
+        if session is None or not session.is_alive():
+            return {"ok": False, "msg": "终端未运行"}
+        try:
+            ok = session.resize(cols, rows)
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+        if ok is False:
+            return {"ok": False, "msg": "终端已退出，尺寸同步失败"}
+        return {"ok": True}
+
+    def pty_terminal_kill(self) -> Dict[str, Any]:
+        """终止常驻 shell（下次 pty_terminal_ensure 会重新拉起）。"""
+        with self._pty_lock:
+            session = self._pty_session
+            self._pty_session = None
+        if session is None:
+            return {"ok": True, "msg": "终端未启动"}
+        try:
+            session.kill()
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -7565,6 +9284,35 @@ class ApiBridge(GitBridgeMixin):
                         int(model["max_tokens"]) if model.get("max_tokens") else None
                     ),
                 }
+                # 思考设置（能力档位 + 已持久化选择），供模型编辑弹窗回填下拉。
+                # 单模型数据异常不得拖垮整个 get_model_settings（调用极频繁，
+                # 失败会让整个设置页打不开），故整体兜底到安全值。
+                try:
+                    reasoning = _reasoning_snapshot_for_model(model)
+                    item["reasoning_choice"] = str(reasoning.get("choice") or "default")
+                    item["reasoning_options"] = list(reasoning.get("options") or [])
+                    item["reasoning_visible"] = bool(reasoning.get("visible", False))
+                    item["reasoning_kind"] = str(reasoning.get("kind") or "hidden")
+                    item["reasoning_disabled_reason"] = str(
+                        reasoning.get("disabled_reason") or ""
+                    )
+                    # 内置官方默认档位（无依据的模型为空串）：前端打开弹窗时
+                    # 若配置里没有用户选择，就按它自动预选。
+                    item["reasoning_default_choice"] = str(
+                        reasoning.get("default_choice") or ""
+                    )
+                except Exception:
+                    logger.debug(
+                        "计算模型思考能力快照失败，回退安全值: %s",
+                        model.get("id"),
+                        exc_info=True,
+                    )
+                    item["reasoning_choice"] = "default"
+                    item["reasoning_options"] = []
+                    item["reasoning_visible"] = False
+                    item["reasoning_kind"] = "hidden"
+                    item["reasoning_disabled_reason"] = ""
+                    item["reasoning_default_choice"] = ""
                 provider_models.append(item)
                 models.append(dict(item))
             provider_item = {
@@ -7685,6 +9433,20 @@ class ApiBridge(GitBridgeMixin):
             logger.exception("delete_provider 失败")
             return {"ok": False, "msg": str(e)}
 
+    def _apply_reasoning_choice(self, model_id: str, choice: str | None) -> str:
+        """保存模型的思考设置；返回人类可读的警告文本（成功返回空串）。
+
+        None = 不改动（旧前端调用语义）。失败时只警告，不抛异常——模型主体
+        已保存成功，不能因为思考档位不合法（例如给 glm-5.3 传 off）回滚编辑。
+        """
+        if choice is None:
+            return ""
+        ok, message = set_model_reasoning_choice(str(model_id), choice)
+        if ok:
+            return ""
+        logger.warning("模型 %s 的思考设置保存失败: %s", model_id, message)
+        return f"（思考设置未生效：{message}）"
+
     def add_model(
         self,
         provider_id: str,
@@ -7694,6 +9456,7 @@ class ApiBridge(GitBridgeMixin):
         supports_function_calling: bool = True,
         computer_protocol: str = "",
         max_tokens: int | None = None,
+        reasoning_choice: str | None = None,
     ) -> Dict[str, Any]:
         try:
             if not str(model_name or "").strip():
@@ -7723,12 +9486,13 @@ class ApiBridge(GitBridgeMixin):
                 max_tokens=normalized_max_tokens,
             )
             self._sync_active_model_context()
+            warning = self._apply_reasoning_choice(model_id, reasoning_choice)
             return {
                 "ok": True,
                 "model_id": model_id,
                 "models": self._all_models(),
                 "settings": self.get_model_settings(),
-                "msg": f"已添加模型 {model_name}",
+                "msg": f"已添加模型 {model_name}{warning}",
             }
         except Exception as e:
             logger.exception("add_model 失败")
@@ -7744,6 +9508,7 @@ class ApiBridge(GitBridgeMixin):
         supports_function_calling: bool | None = None,
         computer_protocol: str | None = None,
         max_tokens: int | None = None,
+        reasoning_choice: str | None = None,
     ) -> Dict[str, Any]:
         try:
             mm_update_model(
@@ -7758,7 +9523,12 @@ class ApiBridge(GitBridgeMixin):
                 max_tokens=max_tokens,
             )
             self._sync_active_model_context()
-            return {"ok": True, "settings": self.get_model_settings(), "msg": "模型已更新"}
+            warning = self._apply_reasoning_choice(model_id, reasoning_choice)
+            return {
+                "ok": True,
+                "settings": self.get_model_settings(),
+                "msg": f"模型已更新{warning}",
+            }
         except Exception as e:
             logger.exception("update_model 失败")
             return {"ok": False, "msg": str(e)}
@@ -7800,27 +9570,39 @@ class ApiBridge(GitBridgeMixin):
             base_url = str(provider.get("base_url") or "").strip()
             if not base_url:
                 return {"ok": False, "msg": "该厂商未配置 Base URL"}
-            api_key = str(provider.get("api_key") or "")
             # base_url 可能已含版本段（OpenAI 惯例 …/v1，阶跃 step_plan/v1），
             # 也可能是裸端点（如 …/step_plan）：前者直接拼 /models，后者补 /v1/models，
             # 绝不能重复拼出版本段（曾出现 /v1/v1/models 404）。
             base = base_url.rstrip("/")
             url = (base + "/models") if base.endswith("/v1") else (base + "/v1/models")
-            headers = {"accept": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-                headers["x-api-key"] = api_key
             from core.llm_policy import tokenrhythm_agent_headers
             import httpx as _httpx
 
-            headers.update(tokenrhythm_agent_headers(url))
-            try:
-                resp = _httpx.get(url, headers=headers, timeout=15.0)
-            except Exception as exc:
-                return {"ok": False, "msg": f"无法连接 {base_url}: {exc}"}
-            if resp.status_code != 200:
-                body = (resp.text or "").strip()[:200]
-                return {"ok": False, "msg": f"获取失败 (HTTP {resp.status_code}): {body}"}
+            # 多 Key provider：逐 Key 尝试（池「当前该用」的 Key 优先），任一通过
+            # 鉴权即采用其结果；绝不把多行串整体塞进 Authorization / x-api-key。
+            probe_keys = _probe_keys_for_provider(provider)
+            resp = None
+            last_msg = ""
+            for api_key in probe_keys:
+                headers = {"accept": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                    headers["x-api-key"] = api_key
+                headers.update(tokenrhythm_agent_headers(url))
+                try:
+                    candidate = _httpx.get(url, headers=headers, timeout=15.0)
+                except Exception as exc:
+                    # 网络层不可达：换 Key 无意义，直接返回
+                    return {"ok": False, "msg": f"无法连接 {base_url}: {exc}"}
+                if candidate.status_code == 200:
+                    resp = candidate
+                    break
+                body = (candidate.text or "").strip()[:200]
+                last_msg = f"获取失败 (HTTP {candidate.status_code}): {body}"
+            if resp is None:
+                if len(probe_keys) > 1:
+                    return {"ok": False, "msg": f"{len(probe_keys)} 个 Key 均获取失败，最后错误：{last_msg}"}
+                return {"ok": False, "msg": last_msg or "获取失败"}
             try:
                 data = resp.json()
             except ValueError:
@@ -7932,39 +9714,56 @@ class ApiBridge(GitBridgeMixin):
             if target is None:
                 return {"ok": False, "msg": f"未找到模型: {model_id}"}
 
-            result: Dict[str, Any] = {}
+            # 多 Key provider：逐 Key 尝试（池「当前该用」的 Key 优先），任一成功
+            # 即通过；错误文本按各自 Key 脱敏。单 Key 保持原有超时口径；多 Key 时
+            # 给整轮探测 2 倍超时的总预算，避免逐个叠加等待。
+            probe_keys = _probe_keys_for_provider(provider)
+            budget = TEST_MODEL_TIMEOUT if len(probe_keys) <= 1 else TEST_MODEL_TIMEOUT * 2
+            deadline = time.monotonic() + budget
+            last_msg = ""
+            for api_key in probe_keys:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                outcome: Dict[str, Any] = {}
 
-            def _ping():
-                try:
-                    from core.llm import _request_stream
+                def _ping(_key: str = api_key, _out: Dict[str, Any] = outcome) -> None:
+                    try:
+                        from core.llm import _request_stream
 
-                    stream, _holder = _request_stream(
-                        provider.get("protocol", "openai"),
-                        {
-                            "model": target.get("litellm_model"),
-                            "api_key": provider.get("api_key") or "",
-                            "api_base": provider.get("base_url") or None,
-                            "messages": [{"role": "user", "content": "ping"}],
-                            "stream": True,
-                            "max_tokens": 1,
-                            "num_retries": 0,
-                        },
-                        timeout=TEST_MODEL_TIMEOUT,
-                    )
-                    for _ in stream:
-                        pass
-                    result["ok"] = True
-                    result["msg"] = "连接成功"
-                except Exception as e:
-                    result["ok"] = False
-                    result["msg"] = _sanitize_for_ui(str(e), provider.get("api_key"))[:300]
+                        stream, _holder = _request_stream(
+                            provider.get("protocol", "openai"),
+                            {
+                                "model": target.get("litellm_model"),
+                                "api_key": _key,
+                                "api_base": provider.get("base_url") or None,
+                                "messages": [{"role": "user", "content": "ping"}],
+                                "stream": True,
+                                "max_tokens": 1,
+                                "num_retries": 0,
+                            },
+                            timeout=TEST_MODEL_TIMEOUT,
+                        )
+                        for _ in stream:
+                            pass
+                        _out["ok"] = True
+                        _out["msg"] = "连接成功"
+                    except Exception as e:
+                        _out["ok"] = False
+                        _out["msg"] = _sanitize_for_ui(str(e), _key)[:300]
 
-            thread = threading.Thread(target=_ping, daemon=True, name="gui-test-model")
-            thread.start()
-            thread.join(timeout=TEST_MODEL_TIMEOUT)
-            if thread.is_alive():
-                return {"ok": False, "msg": f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"}
-            return {"ok": bool(result.get("ok")), "msg": str(result.get("msg", "未知结果"))}
+                thread = threading.Thread(target=_ping, daemon=True, name="gui-test-model")
+                thread.start()
+                thread.join(timeout=remaining)
+                if thread.is_alive():
+                    last_msg = f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"
+                    continue
+                if outcome.get("ok"):
+                    return {"ok": True, "msg": str(outcome.get("msg") or "连接成功")}
+                last_msg = str(outcome.get("msg") or "未知结果")
+            if len(probe_keys) > 1:
+                return {"ok": False, "msg": f"{len(probe_keys)} 个 Key 均未连通，最后错误：{last_msg}"}
+            return {"ok": False, "msg": last_msg or "连接失败"}
         except Exception as e:
             logger.exception("test_model 失败")
             return {"ok": False, "msg": str(e)}

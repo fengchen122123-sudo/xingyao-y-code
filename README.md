@@ -1,7 +1,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.3.2](https://img.shields.io/badge/Version-1.3.2-green.svg)](core/version.py)
+[![Version 1.3.6](https://img.shields.io/badge/Version-1.3.6-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
@@ -40,7 +40,7 @@
 ### 高级编排
 
 - **子代理系统**：5 种内置类型（explore / implement / test / review / general）+ 自定义子代理，支持依赖感知并行调度与嵌套（最深 3 层）
-- **计划执行模式**：复杂任务先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
+- **计划执行模式**：多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
 - **后台任务管理**：长周期命令后台执行，`/tasks` 查看状态、`/tasks tail` 看日志、`/tasks kill` 终结
 - **权限系统**：四种模式（confirm 变更前确认 / accept_edits 自动编辑 / plan 计划模式 / full 完全访问），沙盒控制工作目录访问边界
 
@@ -131,7 +131,40 @@ cp config.example.json config.json
 }
 ```
 
-### 4. 启动星瑶
+### 4.（可选）接入飞书：在飞书里和星瑶对话
+
+配好后在飞书里给机器人发一句话即可驱动一轮任务；执行完成卡、权限审批卡、提问卡、
+待拍板收件箱、卡住提醒与指令集都在飞书闭环。
+
+**飞书侧（一次性，三步）**
+
+1. 在[飞书开放平台](https://open.feishu.cn/)建一个**企业自建应用**，拿到 App ID 与 App Secret。
+2. 给应用开通权限：`im:message`（读消息）、`im:message:send_as_bot`（发消息）；
+   需要在群里 @ 机器人时再加 `im:message.group_at_msg`。
+3. 在「事件与回调」里把订阅方式切到**使用长连接接收事件**，然后**两块都要加**：
+   - **事件订阅**：`im.message.receive_v1`（收消息）
+   - **回调 / 卡片回调**：`card.action.trigger`（卡片按钮回传）
+
+   > 第二块最容易漏。只配事件不配回调时，消息能收到、机器人也能回话，但卡片上的
+   > 按钮（批准 / 拒绝 / 面板 / 翻页）点了没有任何反应。改完订阅记得**重新发布版本**。
+
+> 长连接由星瑶主动连飞书，**不需要公网 IP、也不需要内网穿透**，更不用配回调地址与校验密钥。
+
+**星瑶侧**：打开 GUI → **设置 → 飞书集成**，填入 App ID / App Secret，
+可选填「审批白名单」（open_id 列表）与「固定推送会话 ID」，点「测试连接」校验后保存即生效。
+
+- **审批白名单**决定谁能在飞书点「批准 / 拒绝」。留空时飞书侧**不可审批**（卡片只做提醒，
+  仍需回桌面端处理）——这是有意的 fail-closed 设计。
+  **不知道自己的 open_id？** 在飞书里给机器人发 `/whoami`，它会回你的 open_id，复制进白名单即可
+  （open_id 按应用区分，必须用星瑶看到的这个值）。
+- 设置页内置飞书侧**六步配置说明**与**配置检查清单**；连不上时先看说明里的排查顺序
+  （事件订阅是否选了长连接、应用是否已发布、权限是否已开通）。
+- 也可以手改 `config.json`：`feishu_enabled` / `feishu_app_id` / `feishu_app_secret` /
+  `feishu_approvers` / `feishu_notify_chat_id`；密钥建议在界面里填（会自动加密存储）。
+- 默认关闭；关闭或未配置时星瑶行为与未接入前完全一致。
+- 在飞书里发 `/help` 看全部指令（`/panel` `/status` `/new` `/list` `/switch` `/model` `/inbox` `/stop`）。
+
+### 5. 启动星瑶
 
 ```bash
 # CLI 控制台版（推荐）
@@ -141,7 +174,7 @@ python main.py
 ycode
 ```
 
-### 5.（可选）启动 GUI 窗口版
+### 6.（可选）启动 GUI 窗口版
 
 GUI 模式基于 `pywebview` + Vue 3 前端。前端构建产物 `frontend/dist/` 不随仓库提交，首次使用需先构建：
 
@@ -158,7 +191,7 @@ python gui_main.py
 
 > 前端开发调试时也可改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，CLI 模式不受影响。
 
-### 6.（可选）构建 Windows 安装包
+### 7.（可选）构建 Windows 安装包
 
 ```bash
 # 完整构建（GUI 主安装包 + 可选 CLI 组件）
@@ -370,7 +403,7 @@ Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工
 
 ### 计划模式（Plan Mode）
 
-复杂任务（3+ 文件、50+ 行改动）先用 `plan_write` 建立可执行计划：
+多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划：
 
 1. `plan_write` 建立计划（含依赖图、阶段、验证方式）
 2. 主 Agent 通用工具被限制，只能用 `run_subagent` / `ask_user` / `plan_read` / `plan_retry` / `plan_update`

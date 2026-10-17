@@ -1,0 +1,2228 @@
+/* ============================================================
+   星瑶 × QQ2009 经典皮肤 —— 主题专属质感层
+   ------------------------------------------------------------
+   本文件只做「平色 token 做不到」的质感：多段渐变标题栏、银蓝立体按钮、
+   橙色悬停发光、消息区顶部淡蓝光晕、XP 风格状态栏等。
+   取色/取值真源：design_mockups/qq2009-skin-v2.html 的 <style>（:root 色板与
+   各组件样式）。
+
+   激活机制：主题运行时 themes/runtime.ts 的 applyGuiTheme 会把主题 id 写到
+   <html> 的 data-gui-theme-id 属性上（切换主题时覆盖）。因此本文件
+   **每一条规则**都以 html[data-gui-theme-id="builtin.qq2009"] 开头，
+   仅在内置 QQ2009 激活时生效，对内置深色/浅色/田野笔记/用户主题零影响。
+   该前缀（元素 html + 属性 + 后续 id/类）的特异性已足以压过 Vue 组件
+   scoped 样式的 [data-v-xxx]。但当 style.css 的分区规则已经用 !important
+   把底色钉死时，普通规则压不过，只能同样加 !important：本文件现共 8 处
+   !important，全部只作用于 background，全部是为了覆盖 style.css 中既有的
+   !important 规则，且每处都在行内注明了理由（无「顺手 important」的情况）。
+
+   维护约定（新增规则必须遵守）：
+   1. 新规则必须带 html[data-gui-theme-id="builtin.qq2009"] 前缀，禁止全局规则；
+   2. 只改视觉（颜色/背景/渐变/边框/圆角/阴影），不改宽高/padding/margin/
+      定位/display，避免主题激活时布局漂移；
+   3. hover 只换色或换边框色/阴影，不得引起元素位移——需要「悬停加边框」时
+      用 box-shadow 环模拟，或复用元素本就存在的 1px 透明边框；
+   4. 颜色值必须与 design_mockups/qq2009-skin-v2.html 一致。
+   ============================================================ */
+
+/* ============================================================
+   §0 皮肤色板（局部变量，作用域即主题本身）
+   ============================================================ */
+html[data-gui-theme-id="builtin.qq2009"] {
+  --qq09-border: #1F6CB5;
+  --qq09-blue: #3A8FD0;
+  --qq09-blue-deep: #2E7CC4;
+  --qq09-blue-light: #8FC7F0;
+  --qq09-title-hi: #C9E5F9;
+  --qq09-panel: #E9F3FC;
+  --qq09-panel-2: #DCEBFA;
+  --qq09-hover-bg: #FEF3D8;
+  --qq09-orange: #F39C00;
+  --qq09-orange-deep: #E88B00;
+  --qq09-peer: #0B61A4;
+  --qq09-self: #098A08;
+  --qq09-sysmsg: #8B8B8B;
+  --qq09-text: #1A1A1A;
+  --qq09-text-2: #4A5A6A;
+  --qq09-text-3: #7A8A9A;
+  --qq09-btn-from: #FAFDFF;
+  --qq09-btn-to: #D9E9F8;
+  --qq09-btn-border: #8FB3D9;
+  /* 标题栏四段蓝渐变（mockup .titlebar） */
+  --qq09-title-gradient: linear-gradient(
+    180deg,
+    var(--qq09-title-hi) 0%,
+    #A5D2F2 8%,
+    #6FB3E5 42%,
+    var(--qq09-blue) 78%,
+    var(--qq09-blue-deep) 100%
+  );
+  /* 银蓝立体按钮渐变（mockup .qq-btn / .icon-btn） */
+  --qq09-btn-gradient: linear-gradient(180deg, var(--qq09-btn-from), var(--qq09-btn-to));
+  /* QQ 蓝主按钮渐变（mockup .qq-btn.primary / .new-session-btn） */
+  --qq09-primary-gradient: linear-gradient(180deg, #5FA8E0, var(--qq09-blue-deep));
+  /* 列表悬停：米黄底 + 橙框（mockup .qe-row:hover / .sess-item:hover） */
+  --qq09-hover-gradient: linear-gradient(180deg, #FFF8E8, var(--qq09-hover-bg));
+  /* 列表选中：橙色渐变 + 深橙框（mockup .sess-item.active / .nav-item.active） */
+  --qq09-selected-gradient: linear-gradient(180deg, #FFE9BE, #FDDFA6);
+  /* 悬停发光（mockup 各处 0 0 5~7px rgba(243,156,0,.45~.7)） */
+  --qq09-glow: 0 0 6px rgba(243, 156, 0, 0.55);
+  /* QQ2009 企鹅图标：取自 mockup 标题栏 .tb-logo 的 SVG，按 data-URI 要求做
+     URL 编码（# → %23，属性引号统一改为单引号）。用于顶栏 logo 与侧栏头像。 */
+  --qq09-penguin: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><ellipse cx='12' cy='13' rx='7.2' ry='8.2' fill='%2326303A'/><ellipse cx='12' cy='15.6' rx='4.4' ry='5.2' fill='%23FFFFFF'/><path d='M5.4 10.6 Q12 13.8 18.6 10.6 L18.6 12.3 Q12 15.6 5.4 12.3 Z' fill='%23D93A3A'/><circle cx='9.2' cy='8.4' r='1.15' fill='%23fff'/><circle cx='14.8' cy='8.4' r='1.15' fill='%23fff'/><circle cx='9.35' cy='8.6' r='.55' fill='%23222'/><circle cx='14.65' cy='8.6' r='.55' fill='%23222'/><path d='M10.6 10.4 L13.4 10.4 L12 12.2 Z' fill='%23F39C12'/><ellipse cx='8.1' cy='20.8' rx='2.1' ry='.95' fill='%23F39C12'/><ellipse cx='15.9' cy='20.8' rx='2.1' ry='.95' fill='%23F39C12'/></svg>");
+}
+
+/* ============================================================
+   §1 窗口顶栏（app_header 分区，含自绘窗口控制按钮）
+   对应组件：components/Topbar.vue
+   ============================================================ */
+/* 分区背景由 [data-theme-region]::after 承载（负 z-index 盖在元素底色之上），
+   渐变必须画在伪元素上才能真正显示 */
+html[data-gui-theme-id="builtin.qq2009"] #topbar::after {
+  background: var(--qq09-title-gradient);
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar {
+  /* 皮肤级尺寸调整：mockup 标题栏 32px，真实窗口没有 1px 外框，
+     收敛到 34px 更接近设计稿比例。内部是 flex + align-items:center，
+     只改高度不会让按钮/文字错位（本文件唯一一处尺寸改动，其余尺寸不动）。 */
+  height: 34px;
+  border-bottom-color: var(--qq09-border);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.55) inset;
+  color: #fff;
+}
+/* 左侧 logo 换成企鹅（mockup .tb-logo）：.mark 的真实结构是
+   <img src="/icon.png">，替换元素自身绘制的那张位图无法被 background 盖住，
+   所以两头一起上——content:url() 把替换内容换成企鹅（WebView2/Blink 支持），
+   background-image 用同一张企鹅作兜底绘制，border-radius 收成 4px 贴近设计稿。 */
+html[data-gui-theme-id="builtin.qq2009"] #topbar .logo .mark {
+  border-radius: 4px;
+  filter: drop-shadow(0 1px 1px rgba(0, 40, 80, 0.4));
+  object-fit: contain;
+  background-image: var(--qq09-penguin);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: contain;
+  content: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><ellipse cx='12' cy='13' rx='7.2' ry='8.2' fill='%2326303A'/><ellipse cx='12' cy='15.6' rx='4.4' ry='5.2' fill='%23FFFFFF'/><path d='M5.4 10.6 Q12 13.8 18.6 10.6 L18.6 12.3 Q12 15.6 5.4 12.3 Z' fill='%23D93A3A'/><circle cx='9.2' cy='8.4' r='1.15' fill='%23fff'/><circle cx='14.8' cy='8.4' r='1.15' fill='%23fff'/><circle cx='9.35' cy='8.6' r='.55' fill='%23222'/><circle cx='14.65' cy='8.6' r='.55' fill='%23222'/><path d='M10.6 10.4 L13.4 10.4 L12 12.2 Z' fill='%23F39C12'/><ellipse cx='8.1' cy='20.8' rx='2.1' ry='.95' fill='%23F39C12'/><ellipse cx='15.9' cy='20.8' rx='2.1' ry='.95' fill='%23F39C12'/></svg>");
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar .logo .mark:hover {
+  filter: brightness(1.12) drop-shadow(0 1px 1px rgba(0, 40, 80, 0.4));
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar .logo .name {
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-shadow: 0 1px 2px rgba(0, 40, 90, 0.65);
+}
+/* 顶栏图标按钮：透明底白字，悬停橙金渐变 + 发光（mockup .tb-btn:hover） */
+html[data-gui-theme-id="builtin.qq2009"] #topbar .icon-btn {
+  border-color: transparent;
+  border-radius: 3px;
+  color: #fff;
+  text-shadow: 0 1px 1px rgba(0, 40, 90, 0.6);
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar .icon-btn:hover {
+  border-color: rgba(255, 255, 255, 0.75);
+  background: linear-gradient(180deg, #FFD98A, var(--qq09-orange));
+  box-shadow: 0 1px 2px rgba(90, 40, 0, 0.35), 0 0 6px rgba(255, 170, 40, 0.8);
+  color: #fff;
+  text-shadow: none;
+}
+/* 更新提示按钮：银蓝胶囊，悬停橙框 */
+html[data-gui-theme-id="builtin.qq2009"] #topbar .update-topbar-btn {
+  border-color: var(--qq09-btn-border);
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset, 0 1px 2px rgba(30, 80, 140, 0.15);
+  text-shadow: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar .update-topbar-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset, var(--qq09-glow);
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar .update-topbar-btn .progress-tag {
+  background: rgba(31, 92, 150, 0.14);
+  color: #173F5F;
+}
+/* 窗口控制按钮：白字；关闭钮悬停红渐变（mockup .tb-btn.close:hover） */
+html[data-gui-theme-id="builtin.qq2009"] #topbar .win-btn {
+  border-radius: 3px;
+  color: #fff;
+  text-shadow: 0 1px 1px rgba(0, 40, 90, 0.6);
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar .win-btn:hover {
+  background: linear-gradient(180deg, #FFD98A, var(--qq09-orange));
+  box-shadow: 0 1px 2px rgba(90, 40, 0, 0.35), 0 0 6px rgba(255, 170, 40, 0.8);
+  color: #fff;
+  text-shadow: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] #topbar .win-close:hover {
+  background: linear-gradient(180deg, #F78D83, #D94336);
+  box-shadow: 0 0 6px rgba(255, 90, 70, 0.8);
+  color: #fff;
+}
+
+/* ============================================================
+   §2 左侧边栏（sidebar 分区）
+   对应组件：components/Sidebar.vue
+   ============================================================ */
+/* 侧栏底色：浅蓝三段渐变 + 右侧 1px 分隔线（mockup .sidebar） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar::after {
+  background: linear-gradient(180deg, #F2F8FE 0%, var(--qq09-panel) 30%, var(--qq09-panel-2) 100%);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar {
+  border-right-color: #A9C8E4;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu {
+  border-bottom-color: #BBD5EC;
+  background: linear-gradient(180deg, #FFFFFF, #EAF4FD);
+}
+/* ---- QQ2009 门控元素：主面板用户卡（v-if 仅在 QQ2009 下渲染，见 Sidebar.vue）
+   对照 mockup .user-card / .avatar-big / .status-dot / .user-name-row /
+   .user-sign / .status-row ---- */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card {
+  display: flex;
+  gap: 9px;
+  padding: 10px 10px 8px;
+  background: linear-gradient(180deg, #FFFFFF 0%, #EAF4FD 100%);
+  border-bottom: 1px solid #BBD5EC;
+}
+/* 大头像：56×56、4px 圆角、蓝渐变底 + 企鹅（padding 8px + background-origin:
+   content-box 让企鹅在框内居中留白；渐变层单独指定 border-box 铺满整框）。
+   cursor:pointer 表示可点击换头像（见 Sidebar.vue qq09PickAvatar），
+   同时也是 .qq09-avatar-img / .qq09-avatar-reset 绝对定位的锚点。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-avatar {
+  position: relative;
+  flex: none;
+  width: 56px;
+  height: 56px;
+  padding: 8px;
+  border: 1px solid #7FA8C9;
+  border-radius: 4px;
+  background-image: var(--qq09-penguin),
+    linear-gradient(180deg, #4EA3E0, var(--qq09-blue-deep));
+  background-repeat: no-repeat, no-repeat;
+  background-position: center, center;
+  background-size: contain, auto;
+  background-origin: content-box, border-box;
+  background-clip: border-box, border-box;
+  box-shadow: 0 1px 0 #fff inset, 0 1px 3px rgba(30, 80, 140, 0.3);
+  cursor: pointer;
+}
+/* 在线绿点：12×12 径向渐变 + 1.5px 白边，右下角外挂（mockup .status-dot）。
+   颜色跟随在线状态：由 data-status 驱动，六种配色见下方 [data-status] 规则
+   （与状态行图标 .qq09-st-icon[data-st=*] 同一套色标）。
+   z-index:2 让状态点压在自定义头像图（.qq09-avatar-img，z-index:1）之上——
+   与 QQ 原版一致：动图头像的右下角同样是状态点叠在上面。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-dot {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid #fff;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #B9F6B1, #3CB52E 60%, #1F8A15);
+  box-shadow: 0 1px 2px rgba(0, 60, 0, 0.4);
+  z-index: 2;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-dot[data-status="online"] {
+  background: radial-gradient(circle at 35% 30%, #B9F6B1, #3CB52E 60%, #1F8A15);
+  box-shadow: 0 1px 2px rgba(0, 60, 0, 0.4);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-dot[data-status="busy"] {
+  background: radial-gradient(circle at 35% 30%, #FFC9C4, #D9534F 60%, #B52A25);
+  box-shadow: 0 1px 2px rgba(120, 10, 5, 0.4);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-dot[data-status="away"] {
+  background: radial-gradient(circle at 35% 30%, #FFE9A8, #F2C94C 60%, #D9A51F);
+  box-shadow: 0 1px 2px rgba(140, 100, 0, 0.4);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-dot[data-status="dnd"] {
+  background: radial-gradient(circle at 35% 30%, #F5B3B3, #C0392B 60%, #96251B);
+  box-shadow: 0 1px 2px rgba(110, 15, 10, 0.45);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-dot[data-status="qme"] {
+  background: radial-gradient(circle at 35% 30%, #C9E5F9, #3A8FD0 60%, #2E7CC4);
+  box-shadow: 0 1px 2px rgba(10, 60, 110, 0.4);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-dot[data-status="offline"] {
+  background: radial-gradient(circle at 35% 30%, #E8EDF2, #9AA7B4 60%, #7A8896);
+  box-shadow: 0 1px 2px rgba(60, 75, 90, 0.35);
+}
+/* 自定义头像图（Sidebar.vue qq09AvatarData 有值时渲染）：inset 0 铺满整个头像框，
+   盖住 CSS 画的企鹅底图；border-radius:inherit 跟随头像框圆角；
+   object-fit:cover 让任意长宽比的图都裁切居中、不变形。
+   GIF 的 DataURL（data:image/gif;base64,...）作为 img.src 会被浏览器解码为
+   真正的 GIF 资源并按帧自动播放，这里不需要额外规则。
+   z-index:1 高于底图、低于状态点（2），层级与 QQ 原版一致。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-avatar-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+  z-index: 1;
+}
+/* 恢复默认头像钮：12×12 圆钮（QQ 橙底白字，与状态点同层的头像角标），
+   绝对定位在头像右上角（状态点在右下角，互不遮挡）；悬停 scale 放大 + 橙色发光。
+   scale 走合成层不引起回流，其他元素不会位移。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-avatar-reset {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 1.5px solid #fff;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #FFD98A, var(--qq09-orange) 60%, var(--qq09-orange-deep));
+  box-shadow: 0 1px 2px rgba(90, 40, 0, 0.4);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  text-shadow: 0 1px 1px rgba(90, 40, 0, 0.45);
+  cursor: pointer;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-avatar-reset:hover {
+  transform: scale(1.25);
+  box-shadow: 0 1px 3px rgba(90, 40, 0, 0.5), var(--qq09-glow);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-meta {
+  flex: 1;
+  min-width: 0;
+}
+/* 昵称行：13px 粗体深蓝 + 号码 11px 灰（mockup .user-name-row/.user-name/.user-num）。
+   昵称可就地编辑（铅笔 → 输入框 → 保存，见 Sidebar.vue 的 qq09* 状态）：
+   字体/颜色仍挂在行上，由 .qq09-user-name-text 继承，视觉与改动前一致。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: #173F5F;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+/* 昵称文本：超长省略号（铅笔与号码不参与压缩，见各自的 flex:none） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-name-text {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-no {
+  flex: none;
+  color: var(--qq09-text-3);
+  font-size: 11px;
+  font-weight: 400;
+}
+/* 昵称编辑铅笔按钮：默认透明边框占位，悬停橙框米黄底（不产生位移）。
+   尺寸/内边距是编辑控件本身的必要几何，非主题质感调整 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-name-edit {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: #5A7A94;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-name-edit:hover {
+  border-color: #F39C00;
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  color: #173F5F;
+}
+/* 昵称输入框：与 .qq09-search 同一套银蓝内凹输入质感，聚焦橙框 + 发光 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-name-input {
+  width: 110px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #1A1A1A;
+  background: #fff;
+  border: 1px solid #9FC2E2;
+  border-radius: 3px;
+  box-shadow: inset 0 1px 2px rgba(30, 80, 140, 0.12);
+  outline: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-name-input:focus {
+  border-color: #F39C00;
+  box-shadow: 0 0 5px rgba(243, 156, 0, 0.5);
+}
+/* 个性签名行：可就地编辑（铅笔 → 输入框 → 保存，见 Sidebar.vue 的 qq09UserSign*）。
+   行本身只做 flex 布局容器，省略号下沉到 .qq09-user-sign-text，铅笔不参与压缩。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-sign {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 3px;
+  color: var(--qq09-text-2);
+  font-size: 11px;
+  white-space: nowrap;
+}
+/* 签名文本：单行省略号（mockup .user-sign 的规则）；铅笔与编辑框走 flex:none */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-sign-text {
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 签名编辑铅笔：与昵称铅笔同款（透明边框占位，悬停橙框米黄底，不产生位移） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-sign-edit {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: #5A7A94;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-sign-edit:hover {
+  border-color: #F39C00;
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  color: #173F5F;
+}
+/* 签名输入框：与昵称输入框同一套银蓝内凹质感（聚焦橙框 + 发光） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-sign-input {
+  width: 120px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-family: inherit;
+  color: #1A1A1A;
+  background: #fff;
+  border: 1px solid #9FC2E2;
+  border-radius: 3px;
+  box-shadow: inset 0 1px 2px rgba(30, 80, 140, 0.12);
+  outline: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-sign-input:focus {
+  border-color: #F39C00;
+  box-shadow: 0 0 5px rgba(243, 156, 0, 0.5);
+}
+/* 自定义气泡提示（网名 / 签名被省略号截断时显示完整文本）：fixed 定位在元素上方
+   居中（translate -50%,-100%）；上方空间不足时加 .flipped 落到下方。
+   白底 1px 蓝框 4px 圆角 + 轻阴影，z-index 抬到侧栏内容之上，且不吃鼠标事件 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-tip {
+  position: fixed;
+  transform: translate(-50%, -100%);
+  max-width: 200px;
+  padding: 4px 8px;
+  border: 1px solid #8FB3D9;
+  border-radius: 4px;
+  background: #fff;
+  color: #173F5F;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+  box-shadow: 0 2px 6px rgba(30, 80, 140, 0.28);
+  pointer-events: none;
+  z-index: 40;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-tip.flipped {
+  transform: translate(-50%, 0);
+}
+/* 小三角尾巴：45° 旋转方块，只露下/上两条边（与气泡同底同框） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-tip::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -4px;
+  width: 6px;
+  height: 6px;
+  margin-left: -3px;
+  background: #fff;
+  border-right: 1px solid #8FB3D9;
+  border-bottom: 1px solid #8FB3D9;
+  transform: rotate(45deg);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-tip.flipped::before {
+  bottom: auto;
+  top: -4px;
+  border-right: none;
+  border-bottom: none;
+  border-left: 1px solid #8FB3D9;
+  border-top: 1px solid #8FB3D9;
+}
+/* 状态行：11px 蓝字，做成 mockup .status-pick 那种银蓝小胶囊。
+   现在是可点击的在线状态切换器（就地展开下方菜单，见 Sidebar.vue 的 qq09Status*）：
+   外层 .qq09-user-status 只当定位容器，胶囊质感落在 .qq09-status-trigger 上。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-status {
+  position: relative;
+  display: inline-block;
+  margin-top: 4px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid #A9C8E4;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #2B5A7A;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  box-shadow: 0 1px 0 #fff inset;
+  white-space: nowrap;
+  cursor: pointer;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-trigger:hover {
+  border-color: var(--qq09-orange);
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.5);
+}
+/* 触发器右侧的小三角（沿用原状态行的 ▾ 字形，只收窄字号） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-caret {
+  font-size: 9px;
+  line-height: 1;
+  color: #4A7BA0;
+}
+/* 状态下拉：非原生 select，朝下方展开，白底 + 1px 蓝框 + 4px 圆角 + 轻阴影，
+   z-index 抬到侧栏内容之上（侧栏内的会话/分组菜单用更高层级，互不遮挡） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 2px;
+  min-width: 104px;
+  padding: 2px;
+  border: 1px solid #8FB3D9;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(30, 80, 140, 0.28);
+  z-index: 30;
+}
+/* 菜单项：图标 + 名称；hover 米黄底橙框，当前选中沿用 QQ 橙色选中渐变 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--qq09-text);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.6;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-item:hover {
+  border-color: var(--qq09-orange);
+  background: var(--qq09-hover-gradient);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-status-item.active {
+  border-color: var(--qq09-orange-deep);
+  background: var(--qq09-selected-gradient);
+  font-weight: 700;
+}
+/* ---- 六种状态图标：11px CSS 圆点（径向渐变），中心记号用 ::before 画，
+   零 emoji / 零图片资源；状态行与下拉菜单共用同一套 data-st 色标 ---- */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon {
+  position: relative;
+  flex: none;
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="online"] {
+  background: radial-gradient(circle at 35% 30%, #B9F6B1, #3CB52E 60%, #1F8A15);
+}
+/* 忙碌中：红点 + 中心白色横杠 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="busy"] {
+  background: radial-gradient(circle at 35% 30%, #FFC9C4, #D9534F 60%, #B52A25);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="busy"]::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 5px;
+  height: 2px;
+  margin: -1px 0 0 -2.5px;
+  border-radius: 1px;
+  background: #fff;
+}
+/* 离开：橙黄点 + 中心白色弯月（内偏移 inset 阴影挖出月牙，无需图片） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="away"] {
+  background: radial-gradient(circle at 35% 30%, #FFE9A8, #F2C94C 60%, #D9A51F);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="away"]::before {
+  content: '';
+  position: absolute;
+  left: 1.5px;
+  top: 1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: inset -2.5px 1px 0 0 #fff;
+}
+/* 请勿打扰：深红点 + 中心白色圆点 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="dnd"] {
+  background: radial-gradient(circle at 35% 30%, #F5B3B3, #C0392B 60%, #96251B);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="dnd"]::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 4px;
+  height: 4px;
+  margin: -2px 0 0 -2px;
+  border-radius: 50%;
+  background: #fff;
+}
+/* Q我吧：蓝点 + 中心白色 Q 字形（文字字形，非 emoji） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="qme"] {
+  background: radial-gradient(circle at 35% 30%, #C9E5F9, #3A8FD0 60%, #2E7CC4);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="qme"]::before {
+  content: 'Q';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-family: inherit;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+}
+/* 隐身：灰色点，无中心记号 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[data-st="offline"] {
+  background: radial-gradient(circle at 35% 30%, #E8EDF2, #9AA7B4 60%, #7A8896);
+}
+/* ---- QQ 等级行：与状态胶囊同一行（状态胶囊 inline-block，等级块紧随其后），
+   图标 12px 纯 CSS 绘制（零 emoji / 零图片），末尾跟等级数字 ---- */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-level {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin: 4px 0 0 9px;
+  vertical-align: top;
+  line-height: 1;
+  white-space: nowrap;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon {
+  position: relative;
+  flex: none;
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+}
+/* 太阳：金橙圆盘（径向渐变模拟球面高光） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="sun"] {
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #FFE9A8, #F5A623 60%, #E08600);
+  box-shadow: 0 0 2px rgba(245, 166, 35, 0.6);
+}
+/* 月亮：经典双圆叠加出月牙——底圆金黄，右上叠一个与用户卡背景同色的圆，
+   把右大半遮掉，只露出左边一弯月牙（比 inset 阴影在小尺寸下边缘更干净） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="moon"] {
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #FFF3C4, #F2C94C 60%, #D9A51F);
+  overflow: hidden;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="moon"]::before {
+  content: '';
+  position: absolute;
+  right: -2px;
+  top: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #EAF3FB;
+}
+/* 星星：五角星用 clip-path 裁（10 顶点标准五星），金黄渐变 + 柔和外发光 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="star"] {
+  background: linear-gradient(180deg, #FFE27A, #F5A623);
+  clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+  filter: drop-shadow(0 0 1px rgba(245, 166, 35, 0.55));
+}
+/* ---- QQ2009 门控元素：搜索框（对照 mockup .search-row / .search-box）
+   注：mockup 里 .search-row 的浅蓝底行由侧栏自身渐变底色承接（真实 DOM 只有
+   框体一个节点），故这里只按 .search-box 规格绘制，用 margin 让出「行」的留白。 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-search {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 5px;
+  height: 24px;
+  margin: 7px 9px;
+  padding: 0 6px;
+  border: 1px solid #9FC2E2;
+  border-radius: 3px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(30, 80, 140, 0.12) inset;
+  color: var(--qq09-text-3);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-search:hover {
+  border-color: var(--qq09-orange);
+  box-shadow: 0 1px 2px rgba(30, 80, 140, 0.12) inset, 0 0 5px rgba(243, 156, 0, 0.5);
+}
+/* 首项「新会话」：QQ 蓝渐变主按钮（mockup .new-session-btn） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item:first-child {
+  border-radius: 3px;
+  background: var(--qq09-primary-gradient);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.4) inset, 0 1px 2px rgba(30, 80, 140, 0.3);
+  color: #fff;
+  font-weight: 700;
+  text-shadow: 0 1px 1px rgba(0, 40, 90, 0.5);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item:first-child:hover {
+  background: linear-gradient(180deg, #79BCE9, var(--qq09-blue));
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.4) inset, 0 0 7px rgba(243, 156, 0, 0.7);
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item:first-child .mi-count {
+  background: transparent;
+  color: #D8EBFA;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item:first-child .mi-ico,
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item:first-child .mi-arrow {
+  color: #EAF6FE;
+}
+/* 技能 / MCP / 插件 / 星轨入口行：深蓝字，悬停米黄底 + 橙框（mockup .qe-row） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item {
+  border-radius: 3px;
+  color: #1F4E79;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item:hover {
+  background: var(--qq09-hover-gradient);
+  box-shadow: inset 0 0 0 1px var(--qq09-orange);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item .mi-count {
+  background: #E3F0FB;
+  color: #5A7A94;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-menu .menu-item .mi-arrow {
+  color: #5A7A94;
+}
+/* 「项目会话」分组标题：深蓝加粗（mockup .sess-head） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-section {
+  color: #1F4E79;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-section .add-btn {
+  border: 1px solid var(--qq09-btn-border);
+  border-radius: 3px;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-section .add-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  color: #173F5F;
+  box-shadow: 0 0 5px rgba(243, 156, 0, 0.55);
+}
+/* 项目分组头：银蓝渐变条（mockup .sg-header；上下边线用 inset 阴影，
+   不占布局空间，避免分组头高度漂移） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .group-header {
+  border-radius: 3px;
+  background: linear-gradient(180deg, #F2F8FE, #E2EFFB);
+  box-shadow: inset 0 1px 0 #E3EEF8, inset 0 -1px 0 #E3EEF8;
+  color: #1F4E79;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .group-header:hover {
+  background: linear-gradient(180deg, #FFF8E8, var(--qq09-hover-bg));
+  box-shadow: inset 0 0 0 1px var(--qq09-orange);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .group-header .g-count {
+  background: #E3F0FB;
+  color: #5A7A94;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .group-header .g-arrow {
+  color: #5A7A94;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .group-header .g-del:hover {
+  background: var(--qq09-orange);
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .group-header .g-add:hover {
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .group-sessions {
+  border-left-color: #C6DBEF;
+}
+/* 会话项：白底 + 悬停橙框米黄底 + 选中橙色渐变（mockup .sess-item）
+   （.session-item 本身已有 1px 透明边框，换色不引起位移） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item {
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item .t {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item .m,
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item .s-del {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item:hover {
+  border-color: var(--qq09-orange);
+  background: var(--qq09-hover-gradient);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item.active {
+  border-color: var(--qq09-orange-deep);
+  background: var(--qq09-selected-gradient);
+  box-shadow: 0 1px 0 #fff inset;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item.active .t {
+  color: #173F5F;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item .s-del:hover,
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item .s-confirm {
+  background: #C0392B;
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item .s-rename-input {
+  background: #fff;
+  border-color: #9FC2E2;
+  border-radius: 3px;
+  color: var(--qq09-text);
+  box-shadow: 0 1px 2px rgba(30, 80, 140, 0.12) inset;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .more-toggle {
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .more-toggle:hover {
+  background: none;
+  color: var(--qq09-orange-deep);
+  text-decoration: underline;
+}
+/* 底部设置区：银蓝渐变底 + 顶部 1px 边线（mockup .sidebar-foot / .settings-link） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-footer {
+  border-top-color: #A9C8E4;
+  background: linear-gradient(180deg, #F2F8FE, #D5E7F7);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-footer button {
+  border-radius: 3px;
+  color: #1F4E79;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .side-footer button:hover {
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  box-shadow: inset 0 0 0 1px var(--qq09-orange);
+  color: #173F5F;
+}
+/* 会话 / 分组右键菜单：QQ 白底菜单 + 橙色悬停（mockup 无独立规格，
+   沿用列表项语言） */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-ctx-menu {
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  box-shadow: 0 4px 14px rgba(10, 42, 74, 0.28);
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-ctx-menu .ctx-item {
+  color: #173F5F;
+  border-radius: 2px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-ctx-menu .ctx-item:hover {
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-ctx-menu .ctx-item.danger:hover {
+  background: linear-gradient(180deg, #F78D83, #D94336);
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-ctx-menu .ctx-sep {
+  background: #C6DBEF;
+}
+/* 拖拽排序插入线：橙金更贴近 QQ 高亮 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-group.drop-before::before,
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-group.drop-after::after,
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item.drop-before::before,
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .session-item.drop-after::after {
+  background: var(--qq09-orange);
+}
+
+/* ============================================================
+   §3 会话工具栏（conversation_toolbar 分区：#chat-header）
+   对应组件：App.vue（#chat-header / .crumb / .chip-btn / .export-menu）
+   ============================================================ */
+html[data-gui-theme-id="builtin.qq2009"] #chat-header::after {
+  background: linear-gradient(180deg, #F4FAFF, #DCEBF9);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-header {
+  border-bottom-color: #A9C8E4;
+  box-shadow: 0 1px 0 #fff inset;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-header .crumb {
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-header .crumb b {
+  color: #173F5F;
+  font-weight: 700;
+}
+/* 导出 / 计划 等胶囊按钮：银蓝立体按钮（mockup .qq-btn） */
+html[data-gui-theme-id="builtin.qq2009"] #chat-header .chip-btn {
+  border-color: var(--qq09-btn-border);
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset, 0 1px 2px rgba(30, 80, 140, 0.15);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-header .chip-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  box-shadow: 0 1px 0 #fff inset, var(--qq09-glow);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-header .export-menu {
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  box-shadow: 0 6px 18px rgba(10, 42, 74, 0.28);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-header .export-item {
+  color: #1F4E79;
+  border-radius: 2px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-header .export-item:hover {
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+}
+
+/* ============================================================
+   §4 消息区（workspace 分区：#chat-scroll）
+   对应组件：App.vue（#chat-scroll / .jump-bottom）、MessageBubble.vue
+   ============================================================ */
+/* 白底 + 顶部 90px 淡蓝光晕（mockup .messages）。workspace 分区的
+   ::before/::after 已被 style.css 置为 content:none，故直接画在元素背景上。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll {
+  background-image: linear-gradient(180deg, rgba(201, 229, 249, 0.28), rgba(255, 255, 255, 0) 90px);
+  background-color: #FFFFFF;
+  background-repeat: no-repeat;
+  border-color: #C6DBEF;
+  border-radius: 3px;
+}
+/* 用户消息：QQ2009 是"无气泡"顺序流（mockup .msg.self / .msg-body）——
+   scoped 的 .msg-user 是 flex-end 右对齐，这里改成通栏左对齐；气泡本身压平成
+   透明无边框无阴影的纯文本块，只保留「左缩进 14px + 上下 2px」的呼吸。
+   此处的 background 必须带 !important：style.css 里
+   [data-theme-region="workspace"] .msg-user .bubble[class] 已用 !important
+   把气泡底色钉在分区面板色上，非 important 规则无法覆盖（本文件 8 处
+   !important 之一，全部只用于 background）。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user {
+  align-items: stretch;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-bubble {
+  max-width: none;
+  padding: 2px 0 2px 14px;
+  border-color: transparent;
+  border-radius: 0;
+  background: transparent !important;
+  box-shadow: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-bubble .user-text {
+  color: var(--qq09-text);
+  font-size: 13px;
+  line-height: 1.75;
+}
+/* 门控元素：用户消息昵称行（mockup .msg-head / .md-body 的 12px + 3px 间距），
+   手机/自定义主题下不渲染。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .qq09-msg-sender {
+  margin-bottom: 3px;
+  color: var(--qq09-sysmsg);
+  font-size: 12px;
+  line-height: 1.6;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .qq09-msg-sender .qq09-sender-name {
+  color: var(--qq09-self);
+  font-weight: 700;
+}
+/* 压平后气泡不再占半宽，图片/附件仍要可辨：保留小圆角 + 浅蓝细框。
+   图片网格需限宽——气泡通栏后 .img-grid.single 会跟着撑满整列，单图被拉成
+   通栏巨图（object-fit:contain 会留出大片底色），故给它一个上限宽度。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .img-grid {
+  max-width: 420px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .msg-img {
+  border-color: #9FC2E2;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .attachment-notes {
+  border-top-color: #C6DBEF;
+  color: var(--qq09-text-3);
+}
+/* 复制按钮：气泡压平后它仍在流内（气泡下方、整行左对齐），不会盖住文字；
+   配色换成 QQ 银蓝小按钮（mockup .qq-btn 语言） */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-action-bar .msg-copy-btn {
+  border-color: #9FC2E2;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-action-bar .msg-copy-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.45);
+}
+/* 发送者标签：星瑶（AI）蓝色加粗；时间/模型灰（mockup .who.peer / .time） */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .assistant-name {
+  color: var(--qq09-sysmsg);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .assistant-name b {
+  color: var(--qq09-peer);
+  font-weight: 700;
+}
+/* 模型名 span：mockup 里是 11px 灰（--qq-sysmsg #8B8B8B），组件对该 span 写了
+   内联 style="font-size:11px;color:var(--text-faint)"，内联样式只能用
+   !important 才能压过——按本文件约定（!important 仅用于覆盖 style.css 既有
+   !important）这里不加，因此该 span 的颜色仍由内联的 --text-faint（灰色）决定；
+   本规则只对「无 class 的同级 span」重申字号/灰色，兼作 :not([class]) 保护，
+   避免误伤 .cancel-badge 等同级 span。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .assistant-name span:not([class]) {
+  font-size: 11px;
+  color: var(--qq09-sysmsg);
+}
+/* 正文排版色（mockup .msg-body / .msg-body b） */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body {
+  color: var(--qq09-text);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body b,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body strong {
+  color: #173F5F;
+}
+/* 行内代码：浅蓝底 + 蓝框 + 深蓝字（mockup .msg-body code）。
+   background 需 !important：style.css 的 workspace 分区规则已用 !important
+   把行内代码底色钉在 70% 透明的 --bg3 上。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body code {
+  background: #F0F6FC !important;
+  border: 1px solid #C6DBEF;
+  border-radius: 2px;
+  color: var(--qq09-peer);
+}
+/* 代码块：浅蓝底 + 左 3px 蓝条 + 深蓝字（mockup 代码块规格）。
+   box-sizing:border-box 下左边框不改变外部尺寸，无布局漂移。
+   background 需 !important：style.css 的 workspace 分区规则
+   [data-theme-region="workspace"] .md-body pre 已用 !important 把代码块底色
+   钉成随分区背景透明度混合的 --theme-region-surface-code，非 important 压不过。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body pre {
+  background: #F7F9FB !important;
+  border: 1px solid #C6DBEF;
+  border-left: 3px solid var(--qq09-blue);
+  border-radius: 3px;
+  box-shadow: 0 1px 2px rgba(30, 80, 140, 0.08) inset;
+}
+/* 代码块内的 code 去掉行内代码的浅蓝底与蓝框（底色由外层 pre 提供）。
+   background 需 !important：上一条同源的 style.css !important 规则
+   （.md-body pre 的底色）会连带作用于 pre 内的 code，且 .md-body code 的
+   底色也被 style.css 用 !important 钉死，故这里同样只能 important 归零。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body pre code {
+  background: none !important;
+  border: none;
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body .code-copy {
+  border-color: var(--qq09-btn-border);
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body .code-copy:hover {
+  border-color: var(--qq09-orange);
+  color: #173F5F;
+}
+/* Markdown 表格：表头银蓝底 + 深蓝字（mockup .model-table th）。
+   background 需 !important：style.css 的 workspace 规则已把表头/斑马纹
+   钉成半透明混合色。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body th {
+  background: linear-gradient(180deg, #F2F8FE, #DCEBF9) !important;
+  border-color: #C6DBEF;
+  color: #1F4E79;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body td {
+  border-color: #E3EEF8;
+  color: var(--qq09-text);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .md-body tbody tr:nth-child(even) {
+  background: #F7FBFF !important;
+}
+/* 提示卡 / 错误卡：沿用 QQ 语义色（提示蓝、错误红），仅收紧圆角与描边 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .error-note,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .error-card {
+  border-color: #E7B3AD;
+  border-left-color: #C0392B;
+  border-radius: 3px;
+}
+/* 回到底部悬浮按钮：银蓝圆钮 + 橙框悬停 */
+html[data-gui-theme-id="builtin.qq2009"] .chat-viewport .jump-bottom {
+  border-color: var(--qq09-btn-border);
+  background: linear-gradient(180deg, #FFFFFF, #DCEBF9);
+  color: #173F5F;
+  box-shadow: 0 4px 12px rgba(10, 42, 74, 0.25);
+}
+html[data-gui-theme-id="builtin.qq2009"] .chat-viewport .jump-bottom:hover {
+  border-color: var(--qq09-orange);
+  color: #173F5F;
+  box-shadow: var(--qq09-glow);
+}
+/* 会话切换 / 历史分页提示文字 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .history-loading,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .session-switching {
+  color: var(--qq09-text-3);
+}
+
+/* ============================================================
+   §5 折叠卡与卡片：思考过程 / 执行过程 / 回合过程 / 权限确认卡
+   对应组件：FoldCard.vue、MessageBubble.vue（.think-block）、
+   ToolExecutionTrace.vue（.exec-trace）、TurnGroup.vue（.turn-fold）、
+   PermCard.vue（.perm-card）
+   ============================================================ */
+/* 思考过程块：QQ 银蓝卡片（mockup .proc-block） */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .think-block {
+  border-color: #C6DBEF;
+  border-left-color: var(--qq09-blue);
+  background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .think-block .fold-head {
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .think-block .tk-cnt {
+  color: var(--qq09-text-2);
+}
+/* 执行过程 / 回合过程折叠卡：银蓝卡片（不追加内边距，尊重"不改布局"约束） */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .exec-trace,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .turn-fold .fold {
+  border: 1px solid #C6DBEF;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
+  box-shadow: inset 3px 0 0 var(--qq09-blue);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .exec-trace .fold-head,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .turn-fold .fold-head {
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .turn-fold .fold-head:hover {
+  background: linear-gradient(180deg, #FFF8E8, var(--qq09-hover-bg));
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .fold-head:focus-visible {
+  outline-color: var(--qq09-orange);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .fold-body {
+  color: var(--qq09-text-2);
+}
+/* 权限确认卡：白→浅蓝渐变卡 + 蓝色渐变头（mockup .perm-card / .perm-head）。
+   background 需 !important：style.css 的 workspace 规则已把 .perm-card 底色
+   钉在分区面板色上。 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card {
+  background: linear-gradient(180deg, #FFFFFF, #EDF6FE) !important;
+  border-color: var(--qq09-btn-border);
+  border-left-color: var(--qq09-btn-border);
+  border-radius: 4px;
+  box-shadow: 0 1px 4px rgba(30, 80, 140, 0.18);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-head {
+  background: linear-gradient(180deg, #6FB3E5, var(--qq09-blue));
+  border-bottom: 1px solid var(--qq09-blue-deep);
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-head .pc-ico {
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 3px;
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-title b {
+  color: #fff;
+  text-shadow: 0 1px 1px rgba(0, 40, 90, 0.5);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-src {
+  color: #E4F2FD;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-body {
+  background: #fff;
+  border: 1px solid #C6DBEF;
+  border-radius: 2px;
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-undo-impact {
+  background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
+  border-color: #C6DBEF;
+  color: var(--qq09-text-2);
+}
+/* 权限按钮：银蓝立体 + QQ 蓝主按钮（mockup .qq-btn / .qq-btn.primary） */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-btn {
+  border-color: var(--qq09-btn-border);
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+  border-radius: 3px;
+  box-shadow: 0 1px 0 #fff inset, 0 1px 2px rgba(30, 80, 140, 0.15);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset, var(--qq09-glow);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-btn.primary {
+  border-color: #1F5C96;
+  background: var(--qq09-primary-gradient);
+  color: #fff;
+  text-shadow: 0 1px 1px rgba(0, 40, 90, 0.5);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-btn.primary:hover {
+  border-color: var(--qq09-orange-deep);
+  background: linear-gradient(180deg, #79BCE9, var(--qq09-blue));
+  color: #fff;
+  box-shadow: 0 0 7px rgba(243, 156, 0, 0.7);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-btn.danger {
+  color: #C0392B;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-btn.danger:hover {
+  border-color: #C0392B;
+  background: linear-gradient(180deg, #F78D83, #D94336);
+  color: #fff;
+}
+/* ask_user 选项行：白底蓝框 chip + 橙色悬停 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-choice {
+  border-color: #9FC2E2;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #173F5F;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-choice:hover {
+  border-color: var(--qq09-orange);
+  background: var(--qq09-hover-gradient);
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.45);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-choice-letter {
+  background: #E3F0FB;
+  border: 1px solid var(--qq09-btn-border);
+  border-radius: 2px;
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-custom-input {
+  color: var(--qq09-text);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-custom-btn {
+  border-color: var(--qq09-btn-border);
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .pc-custom-btn:hover:not(:disabled) {
+  border-color: var(--qq09-orange);
+  color: var(--qq09-orange-deep);
+}
+/* 文件变更面板（ChangedFilesPanel）：银蓝卡片 + 橙框悬停 */
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .cfp {
+  border-color: #C6DBEF;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .cfp-head {
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .cfp-row:hover {
+  background: var(--qq09-hover-gradient);
+  box-shadow: inset 0 0 0 1px var(--qq09-orange);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .cfp-row-name {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .cfp-add {
+  color: #3E9E3E;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .cfp-del {
+  color: #C0392B;
+}
+
+/* ============================================================
+   §6 输入区（composer 分区）
+   对应组件：InputArea.vue、AttachmentChips.vue、PermDropdown.vue、
+   ModelCascader.vue、ReasoningSelector.vue
+   ============================================================ */
+/* 输入区外壳：浅蓝渐变底 + 顶部 1px 边线（mockup .composer） */
+html[data-gui-theme-id="builtin.qq2009"] #input-area::after {
+  background: linear-gradient(180deg, #F7FBFF, #E9F3FC);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area {
+  border-top-color: #A9C8E4;
+}
+/* 输入框：保持白底 + 蓝框；聚焦橙框发光（mockup .qq-input:focus）。
+   background 需 !important：style.css 的 composer 规则已把 #input-box 底色
+   钉在分区 surface 色上。 */
+html[data-gui-theme-id="builtin.qq2009"] #input-box {
+  background: #FFFFFF !important;
+  border-color: #9FC2E2;
+  border-radius: 3px;
+  box-shadow: 0 1px 2px rgba(30, 80, 140, 0.12) inset;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box:focus-within {
+  border-color: var(--qq09-orange);
+  box-shadow: 0 0 5px rgba(243, 156, 0, 0.5);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box.drop-hover {
+  border-color: var(--qq09-orange);
+  box-shadow: 0 0 0 3px rgba(243, 156, 0, 0.18);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box textarea {
+  color: var(--qq09-text);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box textarea::placeholder {
+  color: #9AAAB8;
+}
+/* 底部控件排：银蓝渐变条（mockup .composer-bottom） */
+html[data-gui-theme-id="builtin.qq2009"] #input-bar {
+  border-top-color: #C6DBEF;
+  background: linear-gradient(180deg, #F4FAFF, #E0EEFB);
+  border-radius: 2px;
+}
+/* 权限 / 模型 / 分支 / 附件等 chip：白底蓝框 + 橙色悬停（mockup .cb-chip） */
+html[data-gui-theme-id="builtin.qq2009"] #input-area .chip-btn {
+  border-color: #9FC2E2;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #2B5A7A;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .chip-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.45);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .chip-btn.active {
+  border-color: var(--qq09-orange-deep);
+  background: var(--qq09-selected-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .sandbox-btn.sandbox-open {
+  border-color: #E0B050;
+  background: linear-gradient(180deg, #FFF6E2, #FBE7B8);
+  color: #8A5A00;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .model-chevron {
+  color: #5A7A94;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .ctx-ring-bg {
+  stroke: #D9E9F8;
+}
+/* ---- QQ2009 门控元素：经典工具栏行（v-if 仅在 QQ2009 下渲染，见 InputArea.vue）
+   对照 mockup .composer-toolbar / .cmp-btn：30px 银蓝渐变行 + 上下 1px 边线
+   （用 inset 阴影画边线，不占布局高度），按钮 26×24 透明底、悬停米黄底 + 橙框 ---- */
+html[data-gui-theme-id="builtin.qq2009"] #input-area .qq09-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 30px;
+  margin-bottom: 6px;
+  padding: 0 8px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #F4FAFF, #E0EEFB);
+  box-shadow: inset 0 1px 0 #C6DBEF, inset 0 -1px 0 #C6DBEF;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .qq09-toolbar .qq09-tb-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: #2B5A7A;
+  cursor: pointer;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .qq09-toolbar .qq09-tb-btn svg {
+  width: 14px;
+  height: 14px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .qq09-toolbar .qq09-tb-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.5);
+  color: #173F5F;
+}
+/* 发送按钮：mockup 里是 .send-group 里的矩形文字主按钮
+   （.qq-btn.primary：QQ 蓝渐变 #5FA8E0→#2E7CC4、3px 圆角、白字粗体、
+   padding 0 18px）。组件里 #send-btn 是圆形图标按钮（内含一个 svg），
+   故放开宽度、隐藏 svg，用 ::after 贴「发送」二字（content 文本属皮肤视觉）。
+   高度沿用组件既有的 32px，不在此改动尺寸。 */
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn {
+  width: auto;
+  padding: 0 18px;
+  border: 1px solid #1F5C96;
+  border-radius: 3px;
+  background: var(--qq09-primary-gradient);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.4) inset, 0 1px 2px rgba(30, 80, 140, 0.3);
+  text-shadow: 0 1px 1px rgba(0, 40, 90, 0.5);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn > svg {
+  display: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn::after {
+  content: '发送';
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn:hover {
+  border-color: var(--qq09-orange-deep);
+  background: linear-gradient(180deg, #79BCE9, var(--qq09-blue));
+  box-shadow: 0 0 7px rgba(243, 156, 0, 0.7);
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box:focus-within #send-btn,
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn.active {
+  background: linear-gradient(180deg, #79BCE9, var(--qq09-blue));
+  color: #fff;
+}
+/* 停止态：沿用 QQ 红（与标题栏关闭钮同源配色），文字改成「停止」 */
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn.stop {
+  border-color: #D94336;
+  background: linear-gradient(180deg, #F78D83, #D94336);
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn.stop::after {
+  content: '停止';
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-box #send-btn.stop:hover {
+  border-color: #B03A2E;
+  background: linear-gradient(180deg, #F89C93, #C93A2C);
+  box-shadow: 0 0 7px rgba(192, 57, 43, 0.7);
+  color: #fff;
+}
+/* 排队消息条 / 拖拽手柄 / 元信息 */
+html[data-gui-theme-id="builtin.qq2009"] #input-area .queue-item {
+  border-color: #C6DBEF;
+  background: linear-gradient(180deg, #FFFFFF, #EDF6FE);
+  color: var(--qq09-text-2);
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .queue-badge {
+  background: #E3F0FB;
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .queue-btn {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .queue-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .resize-handle::before {
+  background: #C6DBEF;
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-area .resize-handle:hover::before,
+html[data-gui-theme-id="builtin.qq2009"] #input-area .resize-handle.active::before {
+  background: var(--qq09-orange);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-meta {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] #input-meta .kbd {
+  border-color: #C6DBEF;
+  background: #EDF6FE;
+  color: #2B5A7A;
+}
+/* 附件 chip（AttachmentChips）：浅蓝白底卡片（mockup .attach-chip） */
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip {
+  border-color: #9FC2E2;
+  background: linear-gradient(180deg, #fff, #EDF6FE);
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip:hover {
+  border-color: var(--qq09-orange);
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.45);
+}
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip .ac-name {
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip .ac-meta {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip .ac-icon {
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip .ac-remove {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip .ac-remove:hover {
+  background: #E3F0FB;
+  color: #C0392B;
+}
+html[data-gui-theme-id="builtin.qq2009"] .attach-chip .ac-thumb {
+  background: #E3F0FB;
+  border-radius: 2px;
+}
+/* 权限下拉（PermDropdown，Teleport 到 body，仍在 html 之下故作用域成立） */
+html[data-gui-theme-id="builtin.qq2009"] #dropdown {
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  box-shadow: 0 6px 18px rgba(10, 42, 74, 0.28);
+}
+html[data-gui-theme-id="builtin.qq2009"] #dropdown .dd-item {
+  color: #1F4E79;
+  border-radius: 2px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #dropdown .dd-item:hover {
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #dropdown .dd-item .ck {
+  color: var(--qq09-orange-deep);
+}
+/* 模型级联面板（ModelCascader） */
+html[data-gui-theme-id="builtin.qq2009"] .cascader-main-panel,
+html[data-gui-theme-id="builtin.qq2009"] .cascader-sub-panel {
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  box-shadow: 0 8px 22px rgba(10, 42, 74, 0.28);
+}
+html[data-gui-theme-id="builtin.qq2009"] .cascader-provider-header,
+html[data-gui-theme-id="builtin.qq2009"] .cascader-item {
+  color: #1F4E79;
+}
+html[data-gui-theme-id="builtin.qq2009"] .cascader-item {
+  border-radius: 2px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .cascader-item:hover,
+html[data-gui-theme-id="builtin.qq2009"] .cascader-item.active {
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+  box-shadow: inset 0 0 0 1px var(--qq09-orange);
+}
+html[data-gui-theme-id="builtin.qq2009"] .cascader-item .c-vision {
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] .cascader-item .c-check {
+  color: var(--qq09-orange-deep);
+}
+/* 思考强度选择器（ReasoningSelector） */
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-button {
+  border-color: #9FC2E2;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #2B5A7A;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-button:hover:not(:disabled) {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.45);
+}
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-button .reasoning-chevron {
+  color: #5A7A94;
+}
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-menu {
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  box-shadow: 0 8px 22px rgba(10, 42, 74, 0.28);
+}
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-menu .reasoning-option {
+  color: #1F4E79;
+  border-radius: 2px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-menu .reasoning-option:hover,
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-menu .reasoning-option.active {
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .reasoning-menu .reasoning-option.active svg {
+  color: var(--qq09-orange-deep);
+}
+
+/* ============================================================
+   §7 右侧面板（right_panel 分区）
+   对应组件：RightPanel.vue（#rightbar / .tabbar / .tab-picker / 各页签内容）
+   ============================================================ */
+html[data-gui-theme-id="builtin.qq2009"] #rightbar::after {
+  background: linear-gradient(180deg, #F2F8FE, var(--qq09-panel-2));
+}
+html[data-gui-theme-id="builtin.qq2009"] #rightbar {
+  border-left-color: #A9C8E4;
+}
+/* 页签条：银蓝渐变（mockup .sp-head / .conv-toolbar 同语言） */
+html[data-gui-theme-id="builtin.qq2009"] .tabbar {
+  border-bottom-color: #A9C8E4;
+  background: linear-gradient(180deg, #F2F8FE, #DCEBF9);
+  box-shadow: 0 1px 0 #fff inset;
+}
+html[data-gui-theme-id="builtin.qq2009"] .tabbar-tab {
+  color: #2B5A7A;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .tabbar-tab:hover {
+  border-color: var(--qq09-orange);
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .tabbar-tab.active {
+  border-color: var(--qq09-orange-deep);
+  background: var(--qq09-selected-gradient);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset;
+}
+html[data-gui-theme-id="builtin.qq2009"] .tabbar-tab .tabbar-close,
+html[data-gui-theme-id="builtin.qq2009"] .tabbar-btn {
+  color: #5A7A94;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .tabbar-tab .tabbar-close:hover,
+html[data-gui-theme-id="builtin.qq2009"] .tabbar-btn:hover {
+  background: linear-gradient(180deg, #FFF3DA, #FDE3AE);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content {
+  background: #fff;
+  color: var(--qq09-text);
+}
+/* 打开标签页选择页：白底蓝框卡片 + 橙色悬停（mockup .tabpick-row） */
+html[data-gui-theme-id="builtin.qq2009"] .tab-picker .tp-title {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .tab-picker .tp-sub {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] .tab-picker .tp-card {
+  border-color: #C6DBEF;
+  background: linear-gradient(180deg, #fff, #F0F7FE);
+  color: #173F5F;
+  border-radius: 4px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .tab-picker .tp-card:hover {
+  border-color: var(--qq09-orange);
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+  box-shadow: var(--qq09-glow);
+}
+/* 面板内按钮 / 后台任务 / Git 区块 */
+html[data-gui-theme-id="builtin.qq2009"] #right-content .chip-btn {
+  border-color: #9FC2E2;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #2B5A7A;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .chip-btn:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 0 4px rgba(243, 156, 0, 0.45);
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-item {
+  border-color: #C6DBEF;
+  background: linear-gradient(180deg, #FFFFFF, #EDF6FE);
+  color: #2B5A7A;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-item:hover {
+  border-color: var(--qq09-orange);
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-item.active {
+  border-color: var(--qq09-orange-deep);
+  background: var(--qq09-selected-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-cmd,
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-item-cmd {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-log {
+  background: #F7F9FB;
+  border-color: #C6DBEF;
+  border-left: 3px solid var(--qq09-blue);
+  border-radius: 3px;
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-hint {
+  border-color: #E0B050;
+  background: linear-gradient(180deg, #FFF6E2, #FBE7B8);
+  color: #8A5A00;
+}
+html[data-gui-theme-id="builtin.qq2009"] #right-content .bgt-hint code {
+  color: #8A5A00;
+}
+/* 文件树 / 变更文件行：白底 + 橙色悬停 */
+html[data-gui-theme-id="builtin.qq2009"] #file-tree {
+  color: var(--qq09-text);
+}
+
+/* QQ2009 专属：右侧面板「打开标签页」页顶部的动态 QQ秀（主题门控区块 .qq09-show）。
+   取值照搬确认稿 design_mockups/qq2009-qqshow-panel.html（v3.2）的
+   .show-stage / .fz-gif-bg / .fz-gif / .show-nameplate，仅前缀改为
+   html[data-gui-theme-id="builtin.qq2009"]。该区块是本次新增元素、组件侧不带任何
+   样式，因此这里需要一并给出自身几何（高度/外边距/定位/滤镜）；对既有元素只做
+   视觉覆盖，不触碰既有规则。 */
+html[data-gui-theme-id="builtin.qq2009"] .qq09-show {
+  /* 置顶在页签条之上：顶部零留白；与下方页签条留 10px 间距 */
+  margin: 0 0 10px;
+}
+/* 银蓝渐变标题条，同 §7 的 .tabbar 语言；文字深蓝加粗左对齐（mockup .panel-head） */
+html[data-gui-theme-id="builtin.qq2009"] .qq09-show-head {
+  background: linear-gradient(180deg, #E3F0FB, #C9DFF3);
+  border-bottom: 1px solid #A9C8E4;
+  color: #173F5F;
+  font-weight: 700;
+  font-size: 12px;
+  padding: 5px 10px;
+  text-align: left;
+}
+/* 舞台：深紫底 + 蓝框小圆角，收住 600×957 竖图 */
+html[data-gui-theme-id="builtin.qq2009"] .qq09-show-stage {
+  position: relative;
+  height: 360px;
+  margin: 8px 10px 0;
+  overflow: hidden;
+  background: #160B2E;
+  border: 1px solid #7FA8C9;
+  border-radius: 4px;
+  box-shadow: 0 1px 0 #fff inset, 0 1px 4px rgba(30, 80, 140, 0.25);
+}
+/* 底层：同一张图外扩 18px 铺满 + 模糊压暗，消化竖图两侧空隙 */
+html[data-gui-theme-id="builtin.qq2009"] .qq09-show-bg {
+  position: absolute;
+  inset: -18px;
+  width: calc(100% + 36px);
+  height: calc(100% + 36px);
+  object-fit: cover;
+  filter: blur(16px) brightness(0.6) saturate(1.15);
+}
+/* 上层：完整显示（contain），动效来自 GIF 自身帧动画 */
+html[data-gui-theme-id="builtin.qq2009"] .qq09-show-gif {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+/* 舞台四角暗角，收拢视线（覆盖在图上但不吃鼠标事件） */
+html[data-gui-theme-id="builtin.qq2009"] .qq09-show-stage::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 26px rgba(10, 4, 26, 0.5);
+}
+/* 底部名牌：紫色描边 + 发光，压在暗角之上 */
+html[data-gui-theme-id="builtin.qq2009"] .qq09-show-nameplate {
+  position: absolute;
+  left: 50%;
+  bottom: 7px;
+  transform: translateX(-50%);
+  background: rgba(22, 11, 46, 0.82);
+  border: 1px solid #8A5FC0;
+  border-radius: 8px;
+  padding: 1px 12px;
+  color: #E4D4FF;
+  font-size: 11px;
+  white-space: nowrap;
+  box-shadow: 0 0 8px rgba(138, 95, 192, 0.45);
+  z-index: 5;
+}
+
+/* ============================================================
+   §8 设置页（Subpage 内的设置界面）
+   对应组件：SettingsPage.vue（.settings-nav / .model-settings-card / .provider-*）
+   ============================================================ */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page {
+  background: #F7FBFF;
+  color: var(--qq09-text);
+}
+/* 左侧导航：浅蓝渐变底（mockup .settings-nav） */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .settings-nav {
+  border-right-color: #A9C8E4;
+  background: linear-gradient(180deg, #F2F8FE, var(--qq09-panel-2));
+}
+/* 返回工作区 / 导航项：银蓝底深蓝字，悬停米黄橙框 */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .back-workspace,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .nav-item {
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: #1F4E79;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .back-workspace {
+  border-color: var(--qq09-btn-border);
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+  font-weight: 700;
+  box-shadow: 0 1px 0 #fff inset, 0 1px 2px rgba(30, 80, 140, 0.15);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .back-workspace:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset, var(--qq09-glow);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .nav-item:hover {
+  border-color: var(--qq09-orange);
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+}
+/* 选中项：橙色渐变（mockup .nav-item.active） */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .nav-item.active {
+  border-color: var(--qq09-orange-deep);
+  background: var(--qq09-selected-gradient);
+  color: #173F5F;
+  font-weight: 700;
+  box-shadow: 0 1px 0 #fff inset;
+}
+/* 分组标签：深蓝小字（mockup 里的 group label 语义） */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .nav-section {
+  color: #1F4E79;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .settings-user {
+  color: var(--qq09-text-2);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .avatar {
+  background: linear-gradient(180deg, #6FB3E5, var(--qq09-blue));
+  color: #fff;
+  border: 1px solid #1F5C96;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .settings-main {
+  background: #FFFFFF;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .settings-header h1 {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .settings-header p {
+  color: var(--qq09-text-3);
+}
+/* 主卡片：白→浅蓝渐变卡 + 小圆角 + 蓝描边（mockup .sc-card） */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .model-settings-card,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .perm-settings-card,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .appearance-settings-card {
+  border-color: #A9C8E4;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+  box-shadow: 0 1px 4px rgba(30, 80, 140, 0.12);
+}
+/* 厂商列表 / 详情两栏 */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-list {
+  border-right-color: #A9C8E4;
+  background: linear-gradient(180deg, #F2F8FE, #DCEBFA);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .list-label {
+  color: #1F4E79;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-item {
+  border-radius: 3px;
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-item:hover {
+  border-color: var(--qq09-orange);
+  background: var(--qq09-hover-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-item.active {
+  border-color: var(--qq09-orange-deep);
+  background: var(--qq09-selected-gradient);
+  color: #173F5F;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-logo {
+  border-radius: 3px;
+  background: linear-gradient(180deg, #6FB3E5, var(--qq09-blue));
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-logo.cube {
+  background: transparent;
+  color: #5A7A94;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-state {
+  background: #C6DBEF;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-state.ready {
+  background: radial-gradient(circle at 35% 30%, #B9F6B1, #3CB52E 60%, #1F8A15);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .add-provider-row {
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .add-provider-row:hover,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .add-provider-row.active {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .add-provider-choices {
+  border-top-color: #C6DBEF;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .secondary-entry-row {
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .secondary-entry-row:hover,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .secondary-entry-row.active {
+  border-color: var(--qq09-orange);
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .provider-detail {
+  background: #FFFFFF;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .detail-title-row h2 {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .detail-title-row p {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .field-label {
+  color: #2B5A7A;
+  font-weight: 700;
+}
+/* 输入框 / 只读字段 / Key 字段：白底蓝框（mockup .qq-input） */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .text-field,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .readonly-field,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .key-field {
+  border-color: #9FC2E2;
+  border-radius: 3px;
+  background: #FFFFFF;
+  color: var(--qq09-text);
+  box-shadow: 0 1px 2px rgba(30, 80, 140, 0.12) inset;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .key-field input {
+  color: var(--qq09-text);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .text-field:focus,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .key-field:focus-within {
+  border-color: var(--qq09-orange);
+  box-shadow: 0 0 5px rgba(243, 156, 0, 0.5);
+  outline: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .text-field::placeholder {
+  color: #9AAAB8;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .key-field button,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .row-actions button {
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .row-actions button:hover {
+  color: var(--qq09-orange-deep);
+}
+/* 主/次按钮：QQ 蓝渐变主按钮 / 银蓝按钮（mockup .qq-btn） */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .primary-button {
+  border-color: #1F5C96;
+  border-radius: 3px;
+  background: var(--qq09-primary-gradient);
+  color: #fff;
+  text-shadow: 0 1px 1px rgba(0, 40, 90, 0.5);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.4) inset, 0 1px 2px rgba(30, 80, 140, 0.3);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .primary-button:hover {
+  border-color: var(--qq09-orange-deep);
+  background: linear-gradient(180deg, #79BCE9, var(--qq09-blue));
+  box-shadow: 0 0 7px rgba(243, 156, 0, 0.7);
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .secondary-button {
+  border-color: var(--qq09-btn-border);
+  border-radius: 3px;
+  background: var(--qq09-btn-gradient);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset, 0 1px 2px rgba(30, 80, 140, 0.15);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .secondary-button:hover {
+  border-color: var(--qq09-orange);
+  background: linear-gradient(180deg, #FFF6E2, #FBD98F);
+  color: #173F5F;
+  box-shadow: 0 1px 0 #fff inset, var(--qq09-glow);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .danger-icon {
+  color: #8A4A4A;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .danger-icon:hover,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .row-actions .danger:hover {
+  color: #C0392B;
+}
+/* 模型列表：银蓝表头 + 浅蓝行线（mockup .model-table） */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .preset-models,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .configured-models {
+  border-color: #C6DBEF;
+  border-radius: 3px;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .preset-model-row,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .configured-model-row {
+  border-bottom-color: #E3EEF8;
+  color: var(--qq09-text-2);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .preset-model-row:hover,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .configured-model-row:hover {
+  background: #FFF8E8;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .model-list-header h3 {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .model-list-header span {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .model-main .model-id {
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .vision-tag,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .protocol-badge {
+  border-color: var(--qq09-btn-border);
+  border-radius: 2px;
+  background: linear-gradient(180deg, #fff, #E3F0FB);
+  color: #2B5A7A;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .vision-tag.on {
+  border-color: #7FBF7F;
+  background: #E4F4E4;
+  color: #2E7D32;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .test-result.ok {
+  color: #3E9E3E;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .test-result.testing {
+  color: var(--qq09-orange-deep);
+}
+/* 权限 / 沙盒与外观分区 */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .perm-row {
+  border-bottom-color: #C6DBEF;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .perm-row h3 {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .perm-row p {
+  color: var(--qq09-text-3);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .wl-label {
+  color: #2B5A7A;
+  font-weight: 700;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .wl-item {
+  border-color: #C6DBEF;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #FFFFFF, #EDF6FE);
+  color: var(--qq09-text-2);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .wl-item:hover {
+  border-color: var(--qq09-orange);
+}
+/* 联系我们 / 关于 / 免责声明卡片 */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .contact-card {
+  border-color: #A9C8E4;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .contact-card:hover {
+  border-color: var(--qq09-orange);
+  box-shadow: var(--qq09-glow);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .contact-card-icon {
+  border-radius: 3px;
+  background: linear-gradient(180deg, #6FB3E5, var(--qq09-blue));
+  color: #fff;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .contact-card h3 {
+  color: #173F5F;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .contact-value {
+  background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
+  border: 1px solid #C6DBEF;
+  border-radius: 2px;
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .disclaimer-card .disclaimer-list li,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .changelog-notes li {
+  color: var(--qq09-text-2);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .changelog-version .mono {
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .changelog-history-item {
+  border-left-color: #C6DBEF;
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .changelog-history-item:first-child {
+  border-left-color: var(--qq09-orange);
+}
+/* 设置页内的模态（添加模型等）：白底蓝框小圆角 */
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .model-modal,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .changelog-modal {
+  border-color: #A9C8E4;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #FFFFFF, #F4FAFF);
+  box-shadow: 0 14px 40px rgba(10, 42, 74, 0.35);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .modal-field,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .modal-field-row {
+  color: var(--qq09-text-2);
+}
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .role-choice,
+html[data-gui-theme-id="builtin.qq2009"] .settings-page .vision-choice {
+  border-color: #C6DBEF;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #FFFFFF, #EDF6FE);
+  color: var(--qq09-text-2);
+}
+
+/* ============================================================
+   §9 底部状态栏（statusbar 分区：XP 银蓝渐变 + 分段竖线）
+   对应组件：App.vue（#statusbar / .si / .right）
+   ============================================================ */
+html[data-gui-theme-id="builtin.qq2009"] #statusbar::after {
+  background: linear-gradient(180deg, #F7FBFF, #D5E5F4);
+}
+html[data-gui-theme-id="builtin.qq2009"] #statusbar {
+  border-top-color: #A9C8E4;
+  color: #2B5A7A;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.6) inset;
+}
+/* 分段竖线：用 inset 阴影模拟（mockup .sb-item 的 border-right），不占布局 */
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .si {
+  color: #2B5A7A;
+  box-shadow: inset -1px 0 0 #C2D8EC;
+}
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .si.status-ai-notice {
+  color: var(--qq09-text-3);
+  box-shadow: none;
+}
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .si-warn {
+  color: var(--qq09-orange-deep);
+}
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .status-model,
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .status-permission span,
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .status-git-branch {
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .s-dot {
+  background: #3E9E3E;
+  box-shadow: 0 0 4px rgba(62, 158, 62, 0.5);
+}
+html[data-gui-theme-id="builtin.qq2009"] #statusbar .s-dot.off {
+  background: #C0392B;
+  box-shadow: 0 0 4px rgba(192, 57, 43, 0.5);
+}
+
+/* ============================================================
+   §10 滚动条：QQ2009 蓝色细条（style.css 的 ::-webkit-scrollbar 是全局的，
+   此处仅在本主题下改写，作用域前缀保证其他主题不受影响）
+   ============================================================ */
+html[data-gui-theme-id="builtin.qq2009"] ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+html[data-gui-theme-id="builtin.qq2009"] ::-webkit-scrollbar-thumb {
+  border: 1px solid #1F5C96;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #A5D2F2, #6FB3E5);
+}
+html[data-gui-theme-id="builtin.qq2009"] ::-webkit-scrollbar-thumb:hover {
+  border-color: var(--qq09-orange-deep);
+  background: linear-gradient(180deg, #FFD98A, var(--qq09-orange));
+}
+html[data-gui-theme-id="builtin.qq2009"] ::-webkit-scrollbar-track {
+  background: linear-gradient(180deg, #F7FBFF, #E9F3FC);
+}
+
+/* ============================================================
+   选择器 → 组件文件 对照清单（供后续审查 / 回归时快速定位）
+   ------------------------------------------------------------
+   §1 #topbar（含 height:34px 皮肤级高度）/ .logo .mark（企鹅 data-URI，
+      见 §0 --qq09-penguin）/ .logo .name / .icon-btn / .update-topbar-btn
+      / .win-btn / .win-close                       → components/Topbar.vue
+   §2 #sidebar / .side-menu .menu-item(:first-child) / .side-section
+      / .group-header / .session-item / .more-toggle / .side-footer
+      / .session-ctx-menu / 拖拽插入线               → components/Sidebar.vue
+      .qq09-user-card / .qq09-avatar / .qq09-status-dot / .qq09-user-meta
+      / .qq09-user-name / .qq09-user-name-text / .qq09-user-no / .qq09-name-edit
+      / .qq09-name-input / .qq09-user-sign / .qq09-user-status
+      （状态切换器：.qq09-status-trigger / .qq09-status-caret
+      / .qq09-status-menu / .qq09-status-item / .qq09-st-icon[data-st=*]
+      / .qq09-status-dot[data-status=*]）
+      / .qq09-search（QQ2009 门控元素，同文件内无其他同名规则）
+                                                    → components/Sidebar.vue
+   §3 #chat-header / .crumb / .chip-btn / .export-menu
+      / .export-item                                → App.vue（#chat-header）
+   §4 #chat-scroll（workspace 分区）/ .msg-user（左对齐通栏）/ .user-bubble
+      （压平）/ .qq09-msg-sender / .qq09-sender-name / .assistant-name
+      / .md-body（code/pre/th/td）/ .error-card / .user-action-bar .msg-copy-btn
+                                                    → App.vue + components/
+      MessageBubble.vue；.jump-bottom → App.vue（.chat-viewport）
+   §5 .think-block（MessageBubble.vue）、.fold / .fold-head（components/
+      FoldCard.vue）、.exec-trace（components/ToolExecutionTrace.vue）、
+      .turn-fold（components/TurnGroup.vue）、.perm-card / .pc-*
+      （components/PermCard.vue）、.cfp*（components/ChangedFilesPanel.vue）
+   §6 #input-area / #input-box / #input-bar / .chip-btn / .sandbox-btn
+      / #send-btn（矩形「发送」按钮，svg 由皮肤隐藏）/ .queue-item
+      / #input-meta / .kbd
+                                                    → components/InputArea.vue
+      .qq09-toolbar / .qq09-tb-btn（QQ2009 门控元素）
+                                                    → components/InputArea.vue
+      .attach-chip / .ac-*                          → components/AttachmentChips.vue
+      #dropdown / .dd-item                          → components/PermDropdown.vue
+      .cascader-*                                   → components/ModelCascader.vue
+      .reasoning-button / .reasoning-menu           → components/ReasoningSelector.vue
+   §7 #rightbar / .tabbar* / .tab-picker / .tp-card / #right-content
+      / .chip-btn / .bgt-* / #file-tree              → components/RightPanel.vue
+   §8 .settings-page / .settings-nav / .nav-item / .model-settings-card
+      / .provider-* / .text-field / .key-field / .primary-button
+      / .secondary-button / .preset-models / .configured-models
+      / .contact-card / .perm-settings-card / .appearance-settings-card
+                                                    → components/SettingsPage.vue
+   §9 #statusbar / .si / .s-dot / .right            → App.vue（#statusbar）
+   §10 ::-webkit-scrollbar*                         → src/style.css 的全局滚动条
+      （本主题局部改写）
+
+   有意未实现的项:
+   - 设计稿中顶层窗口的 1px 深蓝描边 + 8px 圆角（真实窗口由 pywebview 宿主
+     决定边界）：未改。尺寸上唯一有意调整的是顶栏高度（48px → 34px，见 §1），
+     以及用户气泡压平涉及的 padding/对齐（见 §4）与新增门控元素自身的初始尺寸；
+     其余既有元素的宽高/padding/margin/定位一律不动（mockup 的侧栏 252px 等
+     尺寸差异属布局，未改）。
+      color:var(--text-faint)），内联样式只能用 !important 覆盖，而本文件的
+      !important 只允许用于压过 style.css 的 !important，故其颜色仍由内联的
+      --text-faint（灰色）决定，未强行改成 --qq09-sysmsg。
+   ============================================================ */
+
+/* ---------- §7 追加：QQ秀块贴顶 + 隐藏「打开标签页」标题文字 ----------
+   只作用于 QQ2009 主题：选择页自带的 40px 顶部留白收为 10px；
+   tp-title/tp-sub（打开标签页标题与说明文字）在该主题下隐藏。 */
+html[data-gui-theme-id="builtin.qq2009"] #right-content .tab-picker { padding-top: 10px; }
+html[data-gui-theme-id="builtin.qq2009"] #right-content .tab-picker .tp-title,
+html[data-gui-theme-id="builtin.qq2009"] #right-content .tab-picker .tp-sub { display: none; }

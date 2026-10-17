@@ -8,7 +8,13 @@ import json
 import pytest
 
 import core.llm_native_transport as nt
-from core.llm_policy import ModelPolicy, get_model_policy, POLICY_REGISTRY
+from core.llm_policy import (
+    ModelPolicy,
+    get_model_policy,
+    POLICY_REGISTRY,
+    DEFAULT_USER_AGENT,
+    TOKENRHYTHM_AGENT_NAME,
+)
 from core.llm_native_transport import (
     SSEDecoder,
     ChunkNormalizer,
@@ -401,7 +407,7 @@ def test_fast_token_counter_counts_tool_call_arguments():
 
 def test_openai_route_adds_tokenrhythm_agent_header():
     """OpenAI 兼容路由打到基元律动端点时，请求头必须补 X-TokenRhythm-Agent，
-    且值与 User-Agent 同源（服务端据此识别客户端来源）。"""
+    值是纯客户端标识（不带版本号，版本信息由 User-Agent 承担）。"""
     policy = get_model_policy("deepseek-chat", api_base="https://tokenrhythm.studio/v1")
     url, headers, _ = nt._resolve_endpoint_and_headers(
         model="deepseek-chat",
@@ -411,7 +417,7 @@ def test_openai_route_adds_tokenrhythm_agent_header():
     )
 
     assert url == "https://tokenrhythm.studio/v1/chat/completions"
-    assert headers["X-TokenRhythm-Agent"] == headers["User-Agent"]
+    assert headers["X-TokenRhythm-Agent"] == TOKENRHYTHM_AGENT_NAME
 
 
 def test_anthropic_route_adds_tokenrhythm_agent_header():
@@ -422,7 +428,7 @@ def test_anthropic_route_adds_tokenrhythm_agent_header():
         extra_headers=None,
     )
 
-    assert headers["X-TokenRhythm-Agent"] == headers["User-Agent"]
+    assert headers["X-TokenRhythm-Agent"] == TOKENRHYTHM_AGENT_NAME
 
 
 def test_non_tokenrhythm_bases_omit_tokenrhythm_agent_header():
@@ -457,7 +463,7 @@ def test_native_completion_sends_tokenrhythm_agent_header(monkeypatch):
     )
 
     assert client.last_url == "https://tokenrhythm.studio/v1/chat/completions"
-    assert client.last_headers["X-TokenRhythm-Agent"] == client.last_headers["User-Agent"]
+    assert client.last_headers["X-TokenRhythm-Agent"] == TOKENRHYTHM_AGENT_NAME
 
 
 # tests/test_llm_native_transport.py（守护现有合并顺序，不改代码）
@@ -475,6 +481,106 @@ def test_extra_headers_win_over_hardcoded_tokenrhythm_header():
         extra_headers={"X-TokenRhythm-Agent": "CustomAgent/1.0"},
     )
     assert headers["X-TokenRhythm-Agent"] == "CustomAgent/1.0"
+
+
+# ---------------------------------------------------------------------------
+# 会话关联头：X-Session-Id（本地会话与服务端调用日志关联）
+# ---------------------------------------------------------------------------
+
+def test_session_id_header_added_when_thread_session_bound():
+    """绑定执行会话时，两条路由的请求头都带上 X-Session-Id。"""
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session("session_a1b2c3")
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+        )
+        assert headers["X-Session-Id"] == "session_a1b2c3"
+
+        _a_url, anthropic_headers = nt._anthropic_resolve_endpoint(
+            api_base="https://api.anthropic.com",
+            api_key="k",
+            extra_headers=None,
+        )
+        assert anthropic_headers["X-Session-Id"] == "session_a1b2c3"
+    finally:
+        app_context.set_thread_session(old)
+
+
+def test_session_id_header_percent_encoded_for_non_ascii():
+    """中文会话名 percent-encode 成纯 ASCII 头值，服务端 URL-decode 可还原。"""
+    from urllib.parse import unquote
+
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session("调试会话1")
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+        )
+        encoded = headers["X-Session-Id"]
+        assert encoded == "%E8%B0%83%E8%AF%95%E4%BC%9A%E8%AF%9D1"
+        assert encoded.isascii()
+        assert unquote(encoded) == "调试会话1"
+    finally:
+        app_context.set_thread_session(old)
+
+
+def test_session_id_header_omitted_without_bound_session():
+    """无会话上下文（单测 / headless）不携带该头，保证既有请求字节不变。"""
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session(None)
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+        )
+        assert "X-Session-Id" not in headers
+
+        _a_url, anthropic_headers = nt._anthropic_resolve_endpoint(
+            api_base="https://api.anthropic.com",
+            api_key="k",
+            extra_headers=None,
+        )
+        assert "X-Session-Id" not in anthropic_headers
+    finally:
+        app_context.set_thread_session(old)
+
+
+def test_extra_headers_win_over_builtin_session_id_header():
+    """配置的 extra_headers 可覆盖内置 X-Session-Id——由现有合并顺序保证。"""
+    from core import app_context
+
+    old = app_context.get_thread_session()
+    app_context.set_thread_session("session_a1b2c3")
+    try:
+        policy = get_model_policy("deepseek-chat", api_base="https://api.deepseek.com/v1")
+        _url, headers, _ = nt._resolve_endpoint_and_headers(
+            model="deepseek-chat",
+            api_key="k",
+            api_base="https://api.deepseek.com/v1",
+            policy=policy,
+            extra_headers={"X-Session-Id": "custom-session"},
+        )
+        assert headers["X-Session-Id"] == "custom-session"
+    finally:
+        app_context.set_thread_session(old)
 
 
 # ---------------------------------------------------------------------------
@@ -516,8 +622,8 @@ def test_openai_route_headers_are_byte_golden_without_route_overrides(monkeypatc
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
         "Authorization": "Bearer k",
-        "User-Agent": "XingYaoCode/1.3.2",
-        "X-TokenRhythm-Agent": "XingYaoCode/1.3.2",
+        "User-Agent": DEFAULT_USER_AGENT,
+        "X-TokenRhythm-Agent": TOKENRHYTHM_AGENT_NAME,
     }
 
     url, plain_headers, _clean = nt._resolve_endpoint_and_headers(
@@ -533,7 +639,7 @@ def test_openai_route_headers_are_byte_golden_without_route_overrides(monkeypatc
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
         "Authorization": "Bearer k",
-        "User-Agent": "XingYaoCode/1.3.2",
+        "User-Agent": DEFAULT_USER_AGENT,
     }
 
 
@@ -551,7 +657,7 @@ def test_anthropic_route_headers_are_byte_golden_without_route_overrides(monkeyp
         "content-type": "application/json",
         "accept": "text/event-stream",
         "anthropic-version": "2023-06-01",
-        "User-Agent": "XingYaoCode/1.3.2",
+        "User-Agent": DEFAULT_USER_AGENT,
         "x-api-key": "k",
-        "X-TokenRhythm-Agent": "XingYaoCode/1.3.2",
+        "X-TokenRhythm-Agent": TOKENRHYTHM_AGENT_NAME,
     }

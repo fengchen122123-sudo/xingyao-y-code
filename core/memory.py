@@ -12,9 +12,21 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from core.cache_health import classify_lanes_health
 from core.harness.models import JournalEventDraft
+from core.tool_result_maintenance import PROTECTION_ZONE_TOKENS
 
 
 import pathlib
+
+
+# token 流水按 session_name 记账，而会话名可被新会话复用（旧会话被删除后
+# sessions 行消失、名字随之释放）。因此按名字聚合必须叠加「会话创建时间
+# 下界」，否则新会话会把同名旧会话的历史流水算进自己的累计（2026-09-29
+# 状态行显示 3200 万输入即此因）。created_at 是本地时间文本，'utc' 修饰符
+# 按系统本地时区把它换算成 epoch，与写入侧 int(time.time()) 口径一致。
+_SESSION_TOKEN_TIME_BOUND_SQL = (
+    "(s.created_at IS NULL OR s.created_at = '' "
+    "OR t.ts >= CAST(strftime('%s', s.created_at, 'utc') AS INTEGER))"
+)
 
 
 def _canonicalize_api_base(value):
@@ -152,7 +164,7 @@ def _tool_call_is_replayable(tc) -> bool:
 def _sanitize_tool_call_pairing(history):
     """修复 tool_call 配对，避免坏历史导致 API 报错后整个会话无法继续使用。
 
-    三种损坏形态：
+    四种损坏形态：
     1. 孤儿 tool 消息：tool_call_id 未在前面任何 assistant.tool_calls 中声明，
        API 会报 "tool_call_id is not found" → 直接丢弃该 tool 消息。
     2. assistant 声明了 tool_calls 但历史中缺少对应 tool 结果，
@@ -161,6 +173,10 @@ def _sanitize_tool_call_pairing(history):
     3. tool call 本身不可回放（函数名为空 / arguments 非法 JSON，
        典型成因：上游网关流式吐出残缺调用被原样落库）→ 从回放历史
        中剔除该调用，其 tool 结果按形态 1 连带丢弃。
+    4. tool 结果与应答它的 assistant 之间被注入了别的消息（典型成因：
+       编排提醒等 notice 消息在旧版落库顺序里插到了工具结果之前），严格
+       网关同样报 "must be followed by tool messages" → 按 tool_call_id 把
+       结果搬回对应 assistant 之后；正文一字不动，只调整位置。
     """
     announced = set()
     for msg in history:
@@ -207,6 +223,31 @@ def _sanitize_tool_call_pairing(history):
                 msg.pop("tool_calls", None)
                 if not msg.get("content"):
                     msg["content"] = "[工具调用记录缺失]"
+
+    # 形态 4：把被注入消息隔开的 tool 结果搬回所属 assistant 之后，
+    # 让回放顺序满足 provider 的「tool_calls 必须被 tool 消息应答」约束。
+    # 已合法相邻的调用组顺序保持不变（幂等，不扰动 provider 侧前缀缓存）。
+    tool_message_by_id = {}
+    for msg in sanitized:
+        if msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id")
+        if tcid and tcid not in tool_message_by_id:
+            tool_message_by_id[tcid] = msg
+
+    if tool_message_by_id:
+        reordered = []
+        for msg in sanitized:
+            if msg.get("role") == "tool":
+                # 结果统一由所属 assistant 就地安置，此处不再原样输出
+                continue
+            reordered.append(msg)
+            for tool_call in msg.get("tool_calls") or []:
+                tcid = tool_call.get("id") if isinstance(tool_call, dict) else None
+                tool_message = tool_message_by_id.pop(tcid, None) if tcid else None
+                if tool_message is not None:
+                    reordered.append(tool_message)
+        sanitized = reordered
 
     return sanitized
 
@@ -301,7 +342,8 @@ class MemoryManager:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         session_name TEXT UNIQUE,
                         memory_summary TEXT,
-                        summarized_until_msg_id INTEGER
+                        summarized_until_msg_id INTEGER,
+                        archived_at TEXT
                     )
                 ''')
 
@@ -331,6 +373,17 @@ class MemoryManager:
                 # 权限选择只影响当前会话，不再全局生效
                 if "permission_mode" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN permission_mode TEXT")
+                # 会话归档标记（对话归档功能）：NULL = 未归档，非空 = 归档时刻的
+                # ISO8601 文本，与 created_at / updated_at 同风格。只走 ALTER
+                # ADD COLUMN 幂等添加，不触发上方「遗留 sessions 表重建」分支。
+                if "archived_at" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT")
+                # 秘书身份：会话级秘书名（NULL/空 = 非秘书会话）。起名后该会话的
+                # 显示与系统提示词身份全程使用它；名字不参与 session_name 标识，
+                # 重名互不影响，改名也不牵动消息/摘要/账本/快照的键。同样只走
+                # ALTER ADD COLUMN 幂等添加，不重建表、不动历史行。
+                if "secretary_name" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN secretary_name TEXT")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -340,6 +393,25 @@ class MemoryManager:
                         role TEXT,
                         content TEXT
                     )
+                ''')
+                # 多代摘要归档：每次压缩成功后追加一代（摘要/topics/边界）。
+                # 只存边界元数据与摘要文本，原始消息永久保留在 messages 表——
+                # history[0] 摘要块据此注入回溯索引，recall_history 工具据此
+                # 按需取回更早被压缩掉的原始消息。
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS session_summary_generations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_name TEXT NOT NULL,
+                        gen INTEGER NOT NULL,
+                        summary_text TEXT,
+                        topics TEXT,
+                        until_msg_id INTEGER,
+                        created_at TEXT
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_summary_generations_session
+                    ON session_summary_generations(session_name, gen)
                 ''')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS harness_owners (
@@ -517,6 +589,11 @@ class MemoryManager:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_token_usage_route "
                     "ON token_usage(model, api_base, cache_scope, date)"
+                )
+                # 按会话聚合（GUI 状态栏本会话口径 / 会话弹层）的查询走此索引
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_token_usage_session "
+                    "ON token_usage(session_id, cache_scope)"
                 )
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS cache_request_diagnostics (
@@ -1174,11 +1251,14 @@ class MemoryManager:
         """
         with self._lock:
             cursor = self.conn.execute(
-                "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens, "
-                "provider, model, cache_write_tokens "
-                "FROM token_usage WHERE session_id = ? "
-                "AND cache_scope IN ('main', 'legacy') "
-                "ORDER BY id DESC LIMIT 1",
+                "SELECT t.prompt_tokens, t.completion_tokens, t.total_tokens, "
+                "t.cached_tokens, t.provider, t.model, t.cache_write_tokens "
+                "FROM token_usage t "
+                "LEFT JOIN sessions s ON s.session_name = t.session_id "
+                "WHERE t.session_id = ? "
+                "AND t.cache_scope IN ('main', 'legacy') "
+                f"AND {_SESSION_TOKEN_TIME_BOUND_SQL} "
+                "ORDER BY t.id DESC LIMIT 1",
                 (str(session_id),),
             )
             row = cursor.fetchone()
@@ -1263,6 +1343,121 @@ class MemoryManager:
                 }
                 for row in cursor.fetchall()
             ]
+
+    def get_token_usage_by_session(self, session_name):
+        """按会话聚合真实 token 用量：对话口径（main/legacy）为主，保活单列。
+
+        命中率分母 cache_prompt 只统计已报告缓存明细的行（未报告 ≠ 0）。
+        返回 {"prompt", "completion", "cached", "cache_prompt", "total",
+        "requests", "last_ts", "keepalive_prompt", "keepalive_cached",
+        "keepalive_requests"}；无记录时数值项为 0、last_ts 为 None。
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                f"""
+                SELECT SUM(t.prompt_tokens), SUM(t.completion_tokens),
+                       SUM(t.cached_tokens),
+                       SUM(CASE WHEN t.cached_tokens IS NOT NULL
+                                THEN t.prompt_tokens ELSE 0 END),
+                       SUM(t.total_tokens), COUNT(*), MAX(t.ts)
+                FROM token_usage t
+                LEFT JOIN sessions s ON s.session_name = t.session_id
+                WHERE t.session_id = ? AND t.cache_scope IN ('main', 'legacy')
+                  AND {_SESSION_TOKEN_TIME_BOUND_SQL}
+                """,
+                (str(session_name),),
+            )
+            row = cursor.fetchone()
+            cursor = self.conn.execute(
+                f"""
+                SELECT SUM(t.prompt_tokens), SUM(t.cached_tokens), COUNT(*)
+                FROM token_usage t
+                LEFT JOIN sessions s ON s.session_name = t.session_id
+                WHERE t.session_id = ? AND t.cache_scope = 'keepalive'
+                  AND {_SESSION_TOKEN_TIME_BOUND_SQL}
+                """,
+                (str(session_name),),
+            )
+            keepalive_row = cursor.fetchone()
+        return {
+            "prompt": int(row[0] or 0),
+            "completion": int(row[1] or 0),
+            "cached": int(row[2] or 0),
+            "cache_prompt": int(row[3] or 0),
+            "total": int(row[4] or 0),
+            "requests": int(row[5] or 0),
+            "last_ts": int(row[6]) if row[6] is not None else None,
+            "keepalive_prompt": int(keepalive_row[0] or 0),
+            "keepalive_cached": int(keepalive_row[1] or 0),
+            "keepalive_requests": int(keepalive_row[2] or 0),
+        }
+
+    def list_token_usage_by_sessions(self, limit=20):
+        """按会话聚合 token 用量并按合计降序排列，供会话弹层选择查看。
+
+        只列 sessions 表中仍存在的会话；已删会话的残留行不进列表，
+        但仍计入 get_token_usage_totals() 的全部会话合计。
+        返回 [{"session_id", "prompt", "completion", "cached", "cache_prompt",
+        "total", "requests", "last_ts"}, ...]
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                f"""
+                SELECT t.session_id,
+                       SUM(t.prompt_tokens), SUM(t.completion_tokens),
+                       SUM(t.cached_tokens),
+                       SUM(CASE WHEN t.cached_tokens IS NOT NULL THEN t.prompt_tokens ELSE 0 END),
+                       SUM(t.total_tokens), COUNT(*), MAX(t.ts)
+                FROM token_usage t
+                JOIN sessions s ON s.session_name = t.session_id
+                WHERE t.cache_scope IN ('main', 'legacy')
+                  AND {_SESSION_TOKEN_TIME_BOUND_SQL}
+                GROUP BY t.session_id
+                ORDER BY SUM(t.total_tokens) DESC, MAX(t.ts) DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            return [
+                {
+                    "session_id": row[0] or "",
+                    "prompt": int(row[1] or 0),
+                    "completion": int(row[2] or 0),
+                    "cached": int(row[3] or 0),
+                    "cache_prompt": int(row[4] or 0),
+                    "total": int(row[5] or 0),
+                    "requests": int(row[6] or 0),
+                    "last_ts": int(row[7]) if row[7] is not None else None,
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def get_token_usage_totals(self):
+        """全部会话的总计（不分 scope，与状态行旧口径同源的落库版）。
+
+        保活/压缩轮次也是真实计费，全部合计必须包含；命中率分母同样
+        只取已报告缓存明细的行。返回 {"prompt", "completion", "cached",
+        "cache_prompt", "total", "requests"}。
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT SUM(prompt_tokens), SUM(completion_tokens),
+                       SUM(cached_tokens),
+                       SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
+                       SUM(total_tokens), COUNT(*)
+                FROM token_usage
+                """
+            )
+            row = cursor.fetchone()
+        return {
+            "prompt": int(row[0] or 0),
+            "completion": int(row[1] or 0),
+            "cached": int(row[2] or 0),
+            "cache_prompt": int(row[3] or 0),
+            "total": int(row[4] or 0),
+            "requests": int(row[5] or 0),
+        }
 
     def add_cache_request_diagnostic(self, diagnostic):
         """追加一条无正文的请求级缓存诊断记录。"""
@@ -2059,6 +2254,40 @@ class MemoryManager:
                 rows.append((msg_id, workdir, parsed))
             return rows
 
+    def iter_referenced_media_digests(self):
+        """全库媒体清单引用的 Blob 摘要集合（供闲时孤儿 Blob 回收，只读）。
+
+        粗筛 ``content LIKE '%media_v1%'`` 后解析 JSON，提取
+        ``_display.media_v1.items[*].digest``；解析失败/结构异常的行跳过
+        （回收侧另有宽限期兜底，缺引用最坏只是少回收，不会误删在用 Blob）。
+        """
+        digests = set()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT content FROM messages WHERE content LIKE '%media_v1%'"
+            )
+            for (raw,) in cursor.fetchall():
+                parsed, ok = _try_parse_json(raw)
+                if not ok or not isinstance(parsed, dict):
+                    continue
+                display = parsed.get("_display")
+                if not isinstance(display, dict):
+                    continue
+                manifest = display.get("media_v1")
+                if not isinstance(manifest, dict):
+                    continue
+                items = manifest.get("items")
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    digest = item.get("digest")
+                    if isinstance(digest, str) and len(digest) == 64:
+                        digests.add(digest)
+        return digests
+
     def update_message_display_media(self, message_id, media_v1) -> bool:
         """给单条消息补写 _display.media_v1（正文其余字节不动），幂等。"""
         with self._lock:
@@ -2254,6 +2483,10 @@ class MemoryManager:
                 cursor.execute('DELETE FROM harness_turns WHERE session_id = ?', (session_id,))
                 cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
                 self._delete_deepseek_prompt_generations_locked(cursor, [session_name])
+                cursor.execute(
+                    'DELETE FROM session_summary_generations WHERE session_name = ?',
+                    (session_name,),
+                )
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute('''
                     UPDATE sessions
@@ -2268,29 +2501,89 @@ class MemoryManager:
         clear_cache_usage_session(session_name)
         return deleted
 
-    def create_session_explicit(self, session_name, workdir=None, source="GUI"):
-        """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。"""
+    def create_session_explicit(self, session_name, workdir=None, source="GUI", secretary_name=None):
+        """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。
+
+        secretary_name 仅秘书会话创建路径传入（NULL/空 = 非秘书会话）。名字合法性
+        由调用方（core.secretary.validate_secretary_name）先行校验，本层不再静默
+        截断或改写，只把空值统一落 NULL，避免"空串"与"未设置"两套口径并存。
+        """
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
+        sec_name = str(secretary_name).strip() if secretary_name else None
         with self._lock:
             cursor = self.conn.cursor()
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (session_name, wdir, now, now, source))
+                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, secretary_name)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (session_name, wdir, now, now, source, sec_name or None))
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
                 raise
 
+    def get_session_secretary_name(self, session_name) -> str:
+        """取会话的秘书名；无记录 / 未命名 / 查询异常一律返回空串。
+
+        秘书名是显示与提示词的输入，读取处在每轮请求的高频路径上，不能因查询
+        异常打断整轮，故异常回落空串而非向上抛。
+        """
+        try:
+            with self._lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT secretary_name FROM sessions WHERE session_name = ?
+                ''', (session_name,))
+                row = cursor.fetchone()
+        except Exception:
+            return ""
+        return str(row[0]).strip() if row and row[0] else ""
+
+    def set_session_secretary_name(self, session_name, name) -> bool:
+        """写入会话的秘书名，返回是否有匹配行被更新。
+
+        传 None/空字符串落 NULL（= 非秘书 / 未命名）；合法性由调用方校验，本层
+        不做静默截断。异常回滚并返回 False，不向上抛。
+        """
+        sec_name = str(name).strip() if name else None
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute('''
+                    UPDATE sessions SET secretary_name = ?, updated_at = ?
+                    WHERE session_name = ?
+                ''', (sec_name or None, now, session_name))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self.conn.rollback()
+                return False
+
+    def get_session_source(self, session_name) -> str:
+        """取会话来源（GUI / SECRETARY 等）；无记录 / 查询异常返回空串。"""
+        try:
+            with self._lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT source FROM sessions WHERE session_name = ?
+                ''', (session_name,))
+                row = cursor.fetchone()
+        except Exception:
+            return ""
+        return str(row[0]).strip() if row and row[0] else ""
+
 
     @staticmethod
-    def _parse_message_rows(rows, with_ids=False):
-        """把数据库行元组解析成消息字典列表（get_history / get_history_with_ids 共用）。
+    def _parse_message_rows(rows, with_ids=False, strip_display=False):
+        """把数据库行元组解析成消息字典列表（get_history / get_history_with_ids /
+        get_history_for_llm 共用）。
 
         with_ids=False 时 rows 每项为 (role, content)，返回的 dict 不新增任何键；
         with_ids=True 时 rows 每项为 (id, role, content)，返回的 dict 额外带 _msg_id。
+        strip_display=True 时剔除模型显示元数据 _display（仅供 UI 展示，不得混入
+        发给 LLM 的提示词），供 get_history_for_llm 使用。
         """
         history = []
         for record in rows:
@@ -2311,6 +2604,8 @@ class MemoryManager:
                 # 数据库列中的 role 是权威值：防止消息正文恰好是含 "role" 键的
                 # JSON 时覆盖真实角色（历史损坏 + 注入向量）
                 msg["role"] = role
+                if strip_display:
+                    msg.pop("_display", None)
             else:
                 msg = {"role": role, "content": parsed}
             if with_ids:
@@ -2478,12 +2773,16 @@ class MemoryManager:
             return self._parse_message_rows(page, with_ids=True), has_more
 
     def get_session_user_nav_items(self, session_name):
-        """红点导航全量索引：该会话全部 user 消息的 [{id, text}]（正序）。
+        """红点导航全量索引：该会话全部 user 消息的 [{id, text, is_observation}]（正序）。
 
         仅提取纯文本（多模态 blocks 只拼 text 块），不做后缀剥离/截断——
         预览清洗在 gui_bridge 层完成（strip_context_suffix 位于高层，
-        memory 不反向依赖）。
+        memory 不反向依赖）。is_observation 标记电脑操控观察跟进协议消息
+        （_computer_v1 结构标记），展示层据此过滤，模型上下文不受影响。
+        判定助手经惰性导入使用（memory 是底层模块，避免顶层依赖 computer 包）。
         """
+        from core.computer.provider_generic import is_observation_protocol_message
+
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
@@ -2496,6 +2795,7 @@ class MemoryManager:
                 "AND role = 'user' ORDER BY id ASC", (session_id,))
             items = []
             for msg_id, raw in cursor.fetchall():
+                observation = is_observation_protocol_message(raw)
                 parsed, ok = _try_parse_json(raw)
                 if ok and isinstance(parsed, list):
                     texts = [
@@ -2508,7 +2808,7 @@ class MemoryManager:
                     text = str(parsed.get("content") or "")
                 else:
                     text = str(raw or "")
-                items.append({"id": msg_id, "text": text})
+                items.append({"id": msg_id, "text": text, "is_observation": observation})
             return items
 
     def get_history_for_llm(self, session_name):
@@ -2532,25 +2832,7 @@ class MemoryManager:
                 ORDER BY id ASC
             ''', (session_id, summarized_until_msg_id))
 
-            history = []
-            for record in cursor.fetchall():
-                role = record[0]
-                raw_content = record[1]
-                parsed, ok = _try_parse_json(raw_content)
-                if not ok:
-                    history.append({"role": role, "content": raw_content})
-                    continue
-
-                if isinstance(parsed, dict):
-                    normalized = {"role": role}
-                    normalized.update(parsed)
-                    normalized["role"] = role
-                    # 剔除模型显示元数据（_display 仅供 UI 展示），
-                    # 避免混入发给 LLM 的提示词
-                    normalized.pop("_display", None)
-                    history.append(normalized)
-                else:
-                    history.append({"role": role, "content": parsed})
+            history = self._parse_message_rows(cursor.fetchall(), strip_display=True)
 
             # 修复 tool_call 配对（如压缩边界切断了工具调用组），
             # 防止坏历史让 API 报 "tool_call_id is not found" 后会话彻底不可用
@@ -2562,9 +2844,15 @@ class MemoryManager:
             # 且位置固定在 history[0]，在两次压缩之间保持稳定，
             # 不破坏 provider 侧 prefix caching。
             if memory_summary:
+                summary_content = (
+                    f"[历史对话记忆摘要 (以下是前段长对话的归纳记忆，请作为背景上下文参考，无需直接回复这段摘要)]\n{memory_summary}"
+                )
+                index_section = self._format_summary_generation_index(session_name)
+                if index_section:
+                    summary_content += index_section
                 history.insert(0, {
                     "role": "user",
-                    "content": f"[历史对话记忆摘要 (以下是前段长对话的归纳记忆，请作为背景上下文参考，无需直接回复这段摘要)]\n{memory_summary}"
+                    "content": summary_content
                 })
 
             return history
@@ -2602,37 +2890,75 @@ class MemoryManager:
                         SET memory_summary = NULL, summarized_until_msg_id = 0
                         WHERE id = ? AND (memory_summary IS NOT NULL OR summarized_until_msg_id)
                     ''', (session_id,))
+                    # 归档代次一并作废：被撤销区间的原始消息已 DELETE，归档的
+                    # 边界与回溯索引随之失真，保守清空（与删除同事务）。
+                    cursor.execute(
+                        'DELETE FROM session_summary_generations WHERE session_name = ?',
+                        (session_name,),
+                    )
                     self.conn.commit()
                 except Exception:
                     self.conn.rollback()
                     raise
 
-    def get_all_sessions(self, workdir=None, source=None, include_empty=False):
-        """返回会话列表（名称/消息数/归属目录/时间/来源）。
+    def get_all_sessions(self, workdir=None, source=None, include_empty=False,
+                         include_archived=False, archived_only=False,
+                         sources: Optional[List[str]] = None):
+        """返回会话列表（名称/消息数/归属目录/时间/来源/归档时刻）。
 
         workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话。
         source 参数用于过滤 GUI 或 CLI 专属会话。
+        sources 参数用于一次筛选多个来源（如 ["GUI", "SECRETARY"]），语义为
+        `(s.source IN (...) OR s.source IS NULL)`，与 source 的过滤口径一致；
+        sources 与 source 同时传入时以 sources 为准（source 被忽略）。
+        返回的每个会话都带 source 字段（无值时回退为 "GUI"），供上层按来源分组。
         include_empty=False 时过滤掉无任何消息的空会话（参考 kimicode 的 is_empty 策略），
         避免会话列表被空会话污染；磁盘记录仍保留，不删除。
+        include_archived=False（默认）时不返回已归档会话，保证既有调用点行为不变；
+        archived_only=True 时只返回已归档会话（供归档区视图）。
         """
+        # 归档过滤条件：默认隐藏归档会话，archived_only 只取归档会话
+        if archived_only:
+            archived_filter = " AND s.archived_at IS NOT NULL"
+        elif include_archived:
+            archived_filter = ""
+        else:
+            archived_filter = " AND s.archived_at IS NULL"
         with self._lock:
             cursor = self.conn.cursor()
-            if source:
-                cursor.execute('''
+            if sources:
+                # 多来源筛选（如 ["GUI", "SECRETARY"]）：口径与单 source 分支
+                # 完全一致，无 source 的历史数据同样视为可见，避免老会话消失
+                placeholders = ",".join("?" for _ in sources)
+                cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
-                           s.workdir, s.updated_at, s.created_at, s.source, s.id
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id,
+                           s.archived_at
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
-                    WHERE s.source = ? OR s.source IS NULL
+                    WHERE (s.source IN ({placeholders}) OR s.source IS NULL){archived_filter}
+                    GROUP BY s.id
+                    ORDER BY s.id DESC
+                ''', tuple(sources))
+            elif source:
+                cursor.execute(f'''
+                    SELECT s.session_name, COUNT(m.id) as msg_count,
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id,
+                           s.archived_at
+                    FROM sessions s
+                    LEFT JOIN messages m ON s.id = m.session_id
+                    WHERE (s.source = ? OR s.source IS NULL){archived_filter}
                     GROUP BY s.id
                     ORDER BY s.id DESC
                 ''', (source,))
             else:
-                cursor.execute('''
+                cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
-                           s.workdir, s.updated_at, s.created_at, s.source, s.id
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id,
+                           s.archived_at
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
+                    WHERE 1=1{archived_filter}
                     GROUP BY s.id
                     ORDER BY s.id DESC
                 ''')
@@ -2658,6 +2984,8 @@ class MemoryManager:
                 "source": row[5] or "GUI",
                 # 不可变主键 sessions.id（按回合撤销等功能的稳定归属标识）
                 "id": row[6],
+                # 归档时刻（ISO8601 文本）；None = 未归档
+                "archived_at": row[7],
             }
             for row in filtered
         ]
@@ -2669,6 +2997,7 @@ class MemoryManager:
         workdir: Optional[str] = None,
         source: Optional[str] = "GUI",
         limit: int = 30,
+        include_archived: bool = False,
     ) -> List[Dict[str, Any]]:
         """全文与标题复合检索会话。
 
@@ -2684,6 +3013,8 @@ class MemoryManager:
           - 默认 "GUI"，匹配 s.source = 'GUI' OR s.source IS NULL
         limit:
           - 最大返回条数
+        include_archived:
+          - 默认 False，排除已归档会话（既有调用点行为不变）
         """
         q = str(query or "").strip()
         if not q:
@@ -2726,6 +3057,8 @@ class MemoryManager:
                       AND s.session_name LIKE ? ESCAPE '\\'
                 """
                 params = [source, pattern]
+                if not include_archived:
+                    title_sql += " AND s.archived_at IS NULL"
                 if norm_workdir is not None:
                     if norm_workdir == "GLOBAL":
                         title_sql += " AND (s.workdir IS NULL OR s.workdir = 'GLOBAL')"
@@ -2764,6 +3097,8 @@ class MemoryManager:
                       AND m.content LIKE ? ESCAPE '\\'
                 """
                 params = [source, pattern]
+                if not include_archived:
+                    content_sql += " AND s.archived_at IS NULL"
                 if norm_workdir is not None:
                     if norm_workdir == "GLOBAL":
                         content_sql += " AND (s.workdir IS NULL OR s.workdir = 'GLOBAL')"
@@ -2824,6 +3159,135 @@ class MemoryManager:
             return ""
         return str(row[0] or "").strip()
 
+    def archive_summary_generation(self, session_name, summary_text, topics=None, until_msg_id=0):
+        """追加一代摘要归档（压缩成功后调用）。失败静默返回 None。
+
+        归档是纯增量元数据：不影响活跃历史，也不参与水位 CAS——任何失败
+        （如表尚未建立）只损失回溯索引，绝不影响压缩成果本身。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    'SELECT COALESCE(MAX(gen), 0) FROM session_summary_generations '
+                    'WHERE session_name = ?',
+                    (session_name,),
+                )
+                gen = int(cursor.fetchone()[0] or 0) + 1
+                cursor.execute(
+                    'INSERT INTO session_summary_generations '
+                    '(session_name, gen, summary_text, topics, until_msg_id, created_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?)',
+                    (
+                        session_name,
+                        gen,
+                        str(summary_text or ""),
+                        (str(topics).strip() if topics else None),
+                        int(until_msg_id or 0),
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+                self.conn.commit()
+                return gen
+            except Exception:
+                self.conn.rollback()
+                return None
+
+    def get_summary_generation_index(self, session_name, limit=10):
+        """读取归档索引。返回 (最新 limit 代 rows 倒序, 总代数)；无归档返回 ([], 0)。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT COUNT(*) FROM session_summary_generations WHERE session_name = ?',
+                (session_name,),
+            )
+            total = int(cursor.fetchone()[0] or 0)
+            if total == 0:
+                return [], 0
+            cursor.execute(
+                'SELECT gen, topics, until_msg_id, created_at '
+                'FROM session_summary_generations WHERE session_name = ? '
+                'ORDER BY gen DESC LIMIT ?',
+                (session_name, max(1, int(limit))),
+            )
+            rows = [
+                {"gen": r[0], "topics": r[1], "until_msg_id": r[2], "created_at": r[3]}
+                for r in cursor.fetchall()
+            ]
+            return rows, total
+
+    def _format_summary_generation_index(self, session_name, max_visible=10):
+        """生成摘要块尾部的回溯索引段；无归档返回空串（不改动摘要块字节）。
+
+        索引行内容来自归档表，两次压缩之间字节稳定，不破坏前缀缓存。
+        """
+        try:
+            rows, total = self.get_summary_generation_index(session_name, max_visible)
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        lines = [
+            f"\n\n[更早摘要回溯] 共 {total} 代归档；需要更早的对话细节时可用 "
+            "recall_history 工具按 before_msg_id 读取原始消息。最近归档："
+        ]
+        for row in rows:
+            topics = str(row.get("topics") or "").strip()
+            created = str(row.get("created_at") or "")[:10]
+            line = f"- gen#{row.get('gen')}（{created}，至 msg_id={row.get('until_msg_id')}）"
+            if topics:
+                line += f" {topics}"
+            lines.append(line)
+        older = total - len(rows)
+        if older > 0:
+            lines.append(f"- ...及更早 {older} 代（可用 recall_history 继续向前回溯）")
+        return "\n".join(lines)
+
+    def get_compressed_messages(self, session_name, before_msg_id, limit=16):
+        """读取已压缩区的原始消息，供 recall_history 工具回溯。
+
+        只服务摘要水位覆盖的范围（id <= summarized_until_msg_id 且
+        id <= before_msg_id，含边界 itself——索引里的 until_msg_id 本身就是
+        已压缩消息）：活跃区消息模型本就可见，不在此重复。
+        返回按时间正序的 [{"id", "role", "content"}]，content 为文本化内容。
+        """
+        try:
+            # 显式判 None：仅缺省用 16；0/负数按下限夹到 1，不再被 `or` 误当缺省
+            if limit is None:
+                limit = 16
+            limit = max(1, min(int(limit), 50))
+            before_msg_id = int(before_msg_id)
+        except (TypeError, ValueError):
+            return []
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT id, summarized_until_msg_id FROM sessions WHERE session_name = ?',
+                (session_name,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return []
+            session_id, watermark = row[0], (row[1] or 0)
+            if watermark <= 0:
+                return []
+            cursor.execute(
+                'SELECT id, role, content FROM ('
+                '  SELECT id, role, content FROM messages'
+                '  WHERE session_id = ? AND id <= ? AND id <= ?'
+                '  ORDER BY id DESC LIMIT ?'
+                ') ORDER BY id ASC',
+                (session_id, before_msg_id, watermark, limit),
+            )
+            return [
+                {
+                    "id": r[0],
+                    "role": r[1],
+                    "content": message_content_to_text(r[2]),
+                }
+                for r in cursor.fetchall()
+            ]
+
     def delete_session(self, session_name):
         """删除指定会话及其所有消息"""
         deleted = False
@@ -2836,6 +3300,16 @@ class MemoryManager:
                 try:
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
                     self._delete_deepseek_prompt_generations_locked(cursor, [session_name])
+                    cursor.execute(
+                        'DELETE FROM session_summary_generations WHERE session_name = ?',
+                        (session_name,),
+                    )
+                    # token 流水按 session_name 记账，会话行删除后流水若留下，
+                    # 同名新会话会把它当作自己的历史累计（2026-09-29 状态行
+                    # 显示 3200 万输入即此因），故与消息同事务一并清理。
+                    cursor.execute(
+                        'DELETE FROM token_usage WHERE session_id = ?', (session_name,)
+                    )
                     cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
                     self.conn.commit()
                     deleted = True
@@ -2863,6 +3337,19 @@ class MemoryManager:
                     deleted_names.append(r[1])
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (sid,))
                 self._delete_deepseek_prompt_generations_locked(cursor, deleted_names)
+                if deleted_names:
+                    placeholders = ",".join("?" for _ in deleted_names)
+                    cursor.execute(
+                        f'DELETE FROM session_summary_generations '
+                        f'WHERE session_name IN ({placeholders})',
+                        deleted_names,
+                    )
+                    # 同 delete_session：会话行删除必须连带清理按名字记账的
+                    # token 流水，否则同名新会话会继承这批历史累计。
+                    cursor.execute(
+                        f'DELETE FROM token_usage WHERE session_id IN ({placeholders})',
+                        deleted_names,
+                    )
                 cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
                 cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (workdir_norm,))
                 self.conn.commit()
@@ -2945,6 +3432,18 @@ class MemoryManager:
                     'UPDATE deepseek_prompt_generations SET session_name = ? WHERE session_name = ?',
                     (final_name, old_name),
                 )
+                # 归档代次同样按 session_name 键控：不随改名迁移会孤儿化，
+                # 回溯索引静默消失且旧名行永远清不掉（与上方更新同事务）
+                cursor.execute(
+                    'UPDATE session_summary_generations SET session_name = ? WHERE session_name = ?',
+                    (final_name, old_name),
+                )
+                # token 用量流水按 session_name 记账：不随迁则按会话统计
+                # 在改名后静默丢历史（与上方更新同事务）
+                cursor.execute(
+                    'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
+                    (final_name, old_name),
+                )
                 self.conn.commit()
                 result = (True, final_name)
             except Exception:
@@ -2954,6 +3453,69 @@ class MemoryManager:
         from core.llm import rename_cache_usage_session
         rename_cache_usage_session(old_name, final_name)
         return result
+
+    def archive_session(self, session_name, archived_at=None) -> bool:
+        """归档会话：从默认会话列表隐藏，数据零损失、可随时恢复。
+
+        只写 sessions.archived_at 一列（NULL = 未归档，非空 = 归档时刻的
+        ISO8601 文本），不触碰 messages / session_summary_generations /
+        harness_* / token_usage，也不刷新 updated_at——归档不是「会话有新活动」，
+        混用会污染活跃时间排序。
+        幂等：已归档会话再次调用不覆盖原 archived_at，仍返回 True；
+        会话不存在时返回 False，由调用方提示。
+        """
+        stamp = (
+            str(archived_at).strip()
+            if archived_at
+            else datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    'SELECT archived_at FROM sessions WHERE session_name = ?',
+                    (session_name,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return False
+                if row[0]:
+                    # 已归档：幂等成功，保留原归档时刻
+                    return True
+                cursor.execute(
+                    'UPDATE sessions SET archived_at = ? WHERE session_name = ?',
+                    (stamp, session_name),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def unarchive_session(self, session_name) -> bool:
+        """取消归档：把 archived_at 置回 NULL，会话恢复回主列表。
+
+        幂等：对未归档会话调用同样安全返回 True（不产生额外副作用）；
+        会话不存在时返回 False。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    'SELECT archived_at FROM sessions WHERE session_name = ?',
+                    (session_name,),
+                )
+                if cursor.fetchone() is None:
+                    return False
+                cursor.execute(
+                    'UPDATE sessions SET archived_at = NULL WHERE session_name = ?',
+                    (session_name,),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def prune_history_files(self, session_name, max_turns=16, retain_recent=4):
         """物理级折叠历史挂载的大文件，以节省 token。"""
@@ -3096,7 +3658,7 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
-    def maintain_tool_results(self, session_name, tier=1, protection_tokens=8000):
+    def maintain_tool_results(self, session_name, tier=1, protection_tokens=PROTECTION_ZONE_TOKENS):
         """分层本地维护旧工具结果（Snip/Elide），DB 层一次性改写并永久冻结。
 
         tier=1 截断（snip）；tier=2 占位符化（elide，snipped 可升级一次）。

@@ -51,12 +51,16 @@ from core.computer.settings import get_settings_generation, load_computer_settin
 _LOGGER = logging.getLogger(__name__)
 
 # 显式状态转移表（计划 Task 8 Step 3 逐字给定，非法转换抛领域不变量错误）。
+# 唯一有意放宽项（2026-10-01 实机复现后新增）：waiting_for_user → completing。
+# 用户接管态在回合正常收尾时按"完成"终结——本回合的操控工作正常收尾并交还
+# 排他租约；不放行该转移会让 run 既无终态也无清理，租约永久留活，下一回合被
+# computer_session_busy 永久挡死（日志：非法状态转换：waiting_for_user → completing）。
 _TRANSITIONS = {
     "idle": {"starting"},
     "starting": {"running", "failed", "stopping"},
     "running": {"paused", "waiting_for_user", "provider_safety_required", "completing", "stopping", "failed"},
     "paused": {"running", "stopping", "failed"},
-    "waiting_for_user": {"running", "stopping", "failed"},
+    "waiting_for_user": {"running", "stopping", "failed", "completing"},
     "provider_safety_required": {"running", "stopping", "failed"},
     "completing": {"completed", "stopping", "failed"},
     "completed": {"starting"},
@@ -163,17 +167,41 @@ def _default_backend_factory(target: str, identity: BackendIdentity) -> Computer
         raise ComputerControlError("computer_unsupported_os", adapter.unavailable_reason)
     if target == "browser":
         from core.computer.browser_backend import BrowserComputerBackend
+        from core.computer.settings import (
+            DEFAULT_BROWSER_VIEWPORT_HEIGHT,
+            DEFAULT_BROWSER_VIEWPORT_WIDTH,
+        )
 
         # R5：系统侧受控页裁决信号（窗口标题提示）由平台层提供；
         # 平台未实现时 getattr 回落 None，backend 退化为 DOM 可见性裁决。
         hint_provider = getattr(adapter, "browser_window_hints", None)
         if hint_provider is not None and not callable(hint_provider):
             hint_provider = None
+        # 项目分辨率（逻辑视口）对两种浏览器通道一致生效：外部浏览器作为
+        # 启动视口，内置浏览器作为缩放呈现的目标视口。
+        viewport = (identity.viewport_width, identity.viewport_height)
+        if viewport[0] <= 0 or viewport[1] <= 0:
+            viewport = (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
+        if identity.browser == "embedded":
+            from core.computer.embedded_browser_backend import EmbeddedBrowserBackend
+
+            if not identity.cdp_endpoint:
+                raise ComputerControlError(
+                    "computer_embedded_unavailable", "内置浏览器 CDP endpoint 缺失"
+                )
+            # 不传窗口标题提示：浏览器归 GUI 所有，PID/窗口裁决不适用，
+            # backend 内部退化为 DOM 可见性裁决。
+            return EmbeddedBrowserBackend(
+                identity.cdp_endpoint,
+                Path(identity.profile_path),
+                viewport=viewport,
+            )
         return BrowserComputerBackend(
             identity.browser,
             Path(identity.profile_path),
             window_hint_provider=hint_provider,
             use_process_worker=True,
+            viewport=viewport,
         )
     return adapter.create_desktop_backend()
 
@@ -215,11 +243,16 @@ class ComputerControlService:
         settings_loader: Callable[[], object] | None = None,
         generation_provider: Callable[[], int] | None = None,
         abort_streams: Callable[[threading.Event], None] | None = None,
+        embedded_endpoint_provider: Callable[[str], str] | None = None,
     ) -> None:
         self._backend_factory = backend_factory or _default_backend_factory
         self._settings_loader = settings_loader or load_computer_settings
         self._generation_provider = generation_provider or get_settings_generation
         self._abort_streams = abort_streams or _default_abort_streams
+        # 内置浏览器（embedded）CDP endpoint 提供者：仅 GUI 进程注入——
+        # 负责确保内嵌 WebView2 控件带调试端口存在并返回回环 endpoint；
+        # CLI/无 GUI 不注入，embedded 目标一律明确失败（不静默回落外部浏览器）。
+        self._embedded_endpoint_provider = embedded_endpoint_provider
         self._lock = threading.RLock()
         self._action_lock = threading.Lock()
         self._run: _Run | None = None
@@ -254,6 +287,18 @@ class ComputerControlService:
         """
         with self._lock:
             self._preview_publisher = publisher
+
+    def set_embedded_endpoint_provider(
+        self, provider: Callable[[str], str] | None
+    ) -> None:
+        """注册/清除内置浏览器 CDP endpoint 提供者（仅 GUI 进程接线）。
+
+        provider(session_id) 负责确保内嵌 WebView2 控件带调试端口存在并返回
+        "http://127.0.0.1:<port>"；session_id 为发起操控的会话名（供前端把
+        浏览器页签开进正确会话），抛出的异常由调用方归一为启动失败。
+        """
+        with self._lock:
+            self._embedded_endpoint_provider = provider
 
     def _build_event_locked(self, run: _Run, event_type: str, **fields) -> dict:
         """状态锁内分配事件序号并构造事件（调用方必须持有状态锁）。"""
@@ -453,29 +498,71 @@ class ComputerControlService:
     # ---------------- backend 获取（含 retained 复用） ----------------
 
     def _resolve_backend_identity(
-        self, target: str, capability: ComputerCapability
+        self, target: str, capability: ComputerCapability, session_id: str = ""
     ) -> BackendIdentity:
-        """按 run 冻结能力构造 backend 请求身份；profile 在本次领取时解析为规范绝对路径。"""
+        """按 run 冻结能力构造 backend 请求身份；profile 在本次领取时解析为规范绝对路径。
+
+        embedded（内置 WebView2）在此处即调用 endpoint 提供者：确保控件带
+        调试端口存在（GUI 线程 marshal），端点冻结进身份——端口变化即视为
+        配置变更、retained 会话不复用。项目分辨率同点冻结（R4）。
+        session_id 为发起会话名，透传给提供者供前端按会话归属展示浏览器页签。
+        """
         from core.computer.platforms import get_platform_adapter
 
         if target == "browser":
-            from core.computer.settings import get_browser_profile_dir
+            from core.computer.settings import (
+                get_browser_profile_dir,
+                get_project_browser_viewport,
+            )
+            from core.workspace_context import get_workdir
 
             browser = capability.browser
-            if browser not in ("edge", "chrome"):
+            cdp_endpoint = ""
+            if browser == "embedded":
+                provider = self._embedded_endpoint_provider
+                if provider is None:
+                    raise ComputerControlError(
+                        "computer_embedded_unavailable",
+                        "当前进程没有内置浏览器（GUI 专属）；"
+                        "请在设置中把浏览器切换为 Edge 或 Chrome",
+                    )
+                try:
+                    cdp_endpoint = provider(session_id)
+                except ComputerControlError:
+                    raise
+                except Exception as error:
+                    raise ComputerControlError(
+                        "computer_embedded_unavailable",
+                        f"内置浏览器自动化准备失败：{error}",
+                    ) from error
+                if not cdp_endpoint:
+                    raise ComputerControlError(
+                        "computer_embedded_unavailable",
+                        "内置浏览器 CDP endpoint 无效",
+                    )
+            elif browser not in ("edge", "chrome"):
                 raise ComputerControlError(
                     "computer_invalid_config",
                     f"能力快照缺少有效浏览器选择：{browser!r}",
                 )
             profile_path = str(get_browser_profile_dir(browser))
+            viewport_width, viewport_height = get_project_browser_viewport(
+                get_workdir()
+            )
         else:
             browser = ""
             profile_path = ""
+            cdp_endpoint = ""
+            viewport_width = 0
+            viewport_height = 0
         return BackendIdentity(
             platform=get_platform_adapter().name,
             target=target,
             browser=browser,
             profile_path=profile_path,
+            cdp_endpoint=cdp_endpoint,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
         )
 
     def _claim_backend(self, target: str, identity: BackendIdentity) -> ComputerBackend:
@@ -555,17 +642,25 @@ class ComputerControlService:
         run = _Run(owner, capability, target)
         with self._lock:
             if self._run is not None:
+                # L3 可诊断性：占用错误带上被占 run 的当前状态，让"下一回合
+                # 拿不到租约"一眼可诊断（该等它结束还是该手动停止），不必翻日志。
                 raise ComputerControlError(
                     "computer_session_busy",
-                    f"电脑操控正被会话「{self._run.owner.session_label}」占用",
-                    details={"owner_session_label": self._run.owner.session_label},
+                    f"电脑操控正被会话「{self._run.owner.session_label}」占用"
+                    f"（当前状态：{self._run.status}）",
+                    details={
+                        "owner_session_label": self._run.owner.session_label,
+                        "owner_run_status": self._run.status,
+                    },
                 )
             self._run = run
             self._transition(run, ComputerRunStatus.STARTING.value)
         self._emit_state(run, reason="start")
         if target is not None:
             try:
-                identity = self._resolve_backend_identity(target, capability)
+                identity = self._resolve_backend_identity(
+                    target, capability, run.owner.session_id
+                )
                 backend = self._claim_backend(target, identity)
             except Exception as error:
                 self._fail_run(run, error, "backend_start_failed")
@@ -650,7 +745,7 @@ class ComputerControlService:
             if establishing:
                 try:
                     identity = self._resolve_backend_identity(
-                        action.target, run.capability
+                        action.target, run.capability, run.owner.session_id
                     )
                     backend = self._claim_backend(action.target, identity)
                 except Exception as error:
@@ -1032,6 +1127,8 @@ class ComputerControlService:
         self,
         run_id: str | None = None,
         reason: str = "application_exit",
+        *,
+        cancel_owner: bool = True,
     ) -> ComputerRunSnapshot:
         """取消/故障/紧急停止终态：固定顺序清理并关闭 backend；幂等。
 
@@ -1039,6 +1136,16 @@ class ComputerControlService:
         → backend release_inputs → backend close → 状态终结 → 租约释放 →
         final event。每步独立 try/except 保证后续释放；首个清理错误记为 failed，
         绝不伪装成 stopped success。
+
+        cancel_owner（默认 True）：为 False 时跳过 `owner.cancel_event.set()`
+        与 `_abort_streams` 两步，其余清理顺序完全不变。回合正常收尾的兜底
+        释放必须传 False——`gui_bridge.py:6220` 与 `:6377` 用该 cancel_event
+        判定"回合是否被用户取消"，若兜底释放设置它，会把正常结束的回合误标
+        成"已取消"。
+
+        幂等：已处终态返回终态快照；已处 stopping（停止在途）直接返回当前
+        快照，不重复释放/关闭 backend、不重复终结——否则 stopping → stopping
+        非法会中断正在进行的清理链（日志 2026-09-10 有两条实例）。
 
         run_id 为 None（Task 16 进程退出统一入口）：先按上表停止当前活动
         run（若有），再关闭全部 retained browser session；无活动 run 时幂等
@@ -1078,21 +1185,29 @@ class ComputerControlService:
                 )
             if run.status in _TERMINAL_STATUSES:
                 return self._snapshot_locked(run)
+            if run.status == ComputerRunStatus.STOPPING.value:
+                # 停止在途：另一次 stop 已进入清理链，本次幂等返回当前快照，
+                # 不重复释放/关闭 backend、不重复终结。放行会让 _transition
+                # 抛"stopping → stopping"并中断那条清理链。
+                return self._snapshot_locked(run)
             self._transition(run, ComputerRunStatus.STOPPING.value)
             run.stop_reason = reason
         self._emit_state(run, reason=reason)
 
         first_error = None
-        try:
-            run.owner.cancel_event.set()
-        except Exception as error:  # 防御性：threading.Event.set 正常不会失败
-            first_error = first_error or error
-            _LOGGER.exception("设置电脑操控 owner cancel event 失败")
-        try:
-            self._abort_streams(run.owner.cancel_event)
-        except Exception as error:
-            first_error = first_error or error
-            _LOGGER.exception("中断在飞 Provider 流失败")
+        if cancel_owner:
+            # 回合正常收尾的兜底释放传 cancel_owner=False：不得把 cancel_event
+            # 置位（gui_bridge.py:6220/:6377 用它判定回合是否被用户取消）。
+            try:
+                run.owner.cancel_event.set()
+            except Exception as error:  # 防御性：threading.Event.set 正常不会失败
+                first_error = first_error or error
+                _LOGGER.exception("设置电脑操控 owner cancel event 失败")
+            try:
+                self._abort_streams(run.owner.cancel_event)
+            except Exception as error:
+                first_error = first_error or error
+                _LOGGER.exception("中断在飞 Provider 流失败")
         backend = run.backend
         if backend is not None:
             try:

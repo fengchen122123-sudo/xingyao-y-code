@@ -176,12 +176,6 @@ class GitBridgeMixin:
         except Exception as error:
             return self._git_err(error)
 
-    def git_refresh(self, workdir: str) -> Dict:
-        """外部变化后的权威重读（§10：最终状态必须重新调用 Git）。"""
-        return self.git_get_status(workdir)
-
-    # ---- 暂存 / 提交 ------------------------------------------------------
-
     def git_stage(self, workdir: str, paths) -> Dict:
         try:
             snap = self._git().stage(
@@ -217,13 +211,6 @@ class GitBridgeMixin:
         except Exception as error:
             return self._git_err(error)
 
-    def git_discard_changes(self, workdir: str, paths) -> Dict:
-        """Restore 未提交内容（高风险：前端必须先 git_preview_risk 并持令牌调用
-        git_confirm_operation；本方法保留为无令牌显式拒绝入口）。"""
-        return self.git_preview_risk(
-            workdir, "discard_changes", {"paths": list(paths or [])}
-        )
-
     def git_commit(self, workdir: str, title: str, body: str = "", amend: bool = False) -> Dict:
         try:
             snap = self._git().commit(
@@ -234,13 +221,6 @@ class GitBridgeMixin:
             return self._git_ok(snapshot=_to_dict(snap))
         except Exception as error:
             return self._git_err(error)
-
-    def git_undo_last_commit(self, workdir: str, keep_staged: bool) -> Dict:
-        return self.git_preview_risk(
-            workdir, "undo_last_commit", {"keep_staged": bool(keep_staged)}
-        )
-
-    # ---- 分支 ------------------------------------------------------------
 
     def git_list_branches(self, workdir: str) -> Dict:
         try:
@@ -277,12 +257,6 @@ class GitBridgeMixin:
             return self._git_err(error)
 
     # ---- Remote 与同步 ---------------------------------------------------
-
-    def git_list_remotes(self, workdir: str) -> Dict:
-        try:
-            return self._git_ok(remotes=_to_dict(self._git().list_remotes(workdir)))
-        except Exception as error:
-            return self._git_err(error)
 
     def git_fetch(self, workdir: str, remote: str = "", prune: bool = False) -> Dict:
         try:
@@ -357,28 +331,10 @@ class GitBridgeMixin:
         except Exception as error:
             return self._git_err(error)
 
-    def git_blame(self, workdir: str, path: str) -> Dict:
-        try:
-            return self._git_ok(lines=_to_dict(self._git().blame(workdir, path)))
-        except Exception as error:
-            return self._git_err(error)
-
     def git_load_reflog(self, workdir: str, skip: int = 0, limit: int = 50) -> Dict:
         try:
             entries = self._git().reflog_page(workdir, skip=int(skip), limit=int(limit))
             return self._git_ok(entries=_to_dict(entries))
-        except Exception as error:
-            return self._git_err(error)
-
-    def git_list_tags(self, workdir: str) -> Dict:
-        try:
-            return self._git_ok(tags=_to_dict(self._git().list_tags(workdir)))
-        except Exception as error:
-            return self._git_err(error)
-
-    def git_list_stashes(self, workdir: str) -> Dict:
-        try:
-            return self._git_ok(stashes=_to_dict(self._git().list_stashes(workdir)))
         except Exception as error:
             return self._git_err(error)
 
@@ -394,14 +350,6 @@ class GitBridgeMixin:
             return self._git_ok(snapshot=_to_dict(snap))
         except Exception as error:
             return self._git_err(error)
-
-    def git_stash_apply(self, workdir: str, index: int) -> Dict:
-        return self.git_preview_risk(workdir, "stash_apply", {"index": int(index)})
-
-    def git_stash_drop(self, workdir: str, index: int) -> Dict:
-        return self.git_preview_risk(workdir, "stash_drop", {"index": int(index)})
-
-    # ---- 风险与两段式确认（§13）-------------------------------------------
 
     def git_preview_risk(self, workdir: str, operation: str, params: Dict) -> Dict:
         try:
@@ -461,35 +409,6 @@ class GitBridgeMixin:
         except Exception as error:
             return self._git_err(error)
 
-    def git_read_rebase_plan(self, workdir: str) -> Dict:
-        try:
-            from core.git.rebase_plan import read_rebase_plan
-
-            svc = self._git()
-            lines = read_rebase_plan(svc.runner, svc.resolve(workdir))
-            return self._git_ok(plan=_to_dict(lines))
-        except Exception as error:
-            return self._git_err(error)
-
-    def git_write_rebase_plan(self, workdir: str, plan: list) -> Dict:
-        """plan: [{action, oid, summary}, ...]；仅 rebase 停住时可用。"""
-        try:
-            from core.git.rebase_plan import RebasePlanLine, write_rebase_plan
-
-            svc = self._git()
-            lines = [
-                RebasePlanLine(
-                    action=str(item.get("action", "pick")),
-                    oid=str(item.get("oid", "")),
-                    summary=str(item.get("summary", "")),
-                )
-                for item in plan or []
-            ]
-            write_rebase_plan(svc.runner, svc.resolve(workdir), lines)
-            return self._git_ok()
-        except Exception as error:
-            return self._git_err(error)
-
     def git_recover_branch(self, workdir: str, oid: str, name: str) -> Dict:
         """Reflog 恢复：从历史位置创建恢复分支（误删分支找回）。"""
         try:
@@ -524,50 +443,11 @@ class GitBridgeMixin:
                 return self._git_err(
                     GitError(GitErrorCode.INVALID_STATE, f"未知 AI 辅助类型: {kind}")
                 )
-            return dict(self.send_user_message(template, workdir=workdir, turn_source="git_panel"))
+            # 回合来源必须落在受控值域（local|lan，见 send_user_message 入口校验）：
+            # Git 面板属于本地入口，固定 local；曾误传 "git_panel" 导致按钮被入口拒绝
+            return dict(self.send_user_message(template, workdir=workdir, turn_source="local"))
         except Exception as error:
             return self._git_err(error)
 
     # ---- Worktree --------------------------------------------------------
 
-    def git_worktree_list(self, workdir: str) -> Dict:
-        try:
-            from core.git.query_refs import list_worktrees
-
-            wts = list_worktrees(self._git().runner, self._git().resolve(workdir))
-            return self._git_ok(worktrees=_to_dict(wts))
-        except Exception as error:
-            return self._git_err(error)
-
-    def git_worktree_add(self, workdir: str, path: str, branch: str, new_branch: bool) -> Dict:
-        try:
-            snap = self._git().execute(
-                workdir, "worktree_add",
-                {"path": path, "branch": branch, "new_branch": bool(new_branch)},
-                versions=SnapshotVersions(None, None),
-                session_id=self._git_session(),
-            )
-            self._git_remember_versions(snap)
-            return self._git_ok(snapshot=_to_dict(snap))
-        except Exception as error:
-            return self._git_err(error)
-
-    def git_worktree_remove(self, workdir: str, path: str, force: bool) -> Dict:
-        return self.git_preview_risk(
-            workdir, "worktree_remove" if not force else "worktree_remove_dirty",
-            {"path": path},
-        )
-
-    def git_stop_monitoring(self, workdir: str) -> Dict:
-        """会话切换/关闭时取消该工作区的监控订阅。"""
-        try:
-            self._git()
-            key = normalize_repo_path(workdir)
-            sub_id = self._git_subs.pop(key, None)
-            if sub_id:
-                self._git_monitor.unsubscribe(sub_id)
-            self._git_versions.pop(key, None)
-            self._git_serialized.pop(key, None)
-            return self._git_ok()
-        except Exception as error:
-            return self._git_err(error)

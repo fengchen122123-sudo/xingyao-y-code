@@ -25,6 +25,8 @@ from core.version import __version__ as YCODE_VERSION
 from core import tool_cache as _tool_cache
 from core.lsp import _get_rg_executable
 from core.subagent_common import build_subagent_common_block
+# 秘书调度台的错误类型：仅用于把服务层的可读原因转成提示文本（纯类型，无 I/O）
+from core.secretary_dispatch import SecretaryDispatchError
 
 
 HTTP_TIMEOUT_SECONDS = 20
@@ -58,11 +60,15 @@ def _raise_if_cancelled(cancel_event):
 
 
 def _agent_display_name() -> str:
-    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
-    try:
-        from core.persona_settings import get_agent_display_name
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
 
-        return get_agent_display_name()
+    走 core.secretary 而非直接读设置页：子代理提示词里的名字是“当前会话内的自称”，
+    必须跟着会话走；读取失败回落默认“星瑶”（与原行为一致）。
+    """
+    try:
+        from core.secretary import get_active_agent_name
+
+        return get_active_agent_name()
     except Exception:
         return "星瑶"
 
@@ -858,7 +864,10 @@ def execute_command(
         )
 
     if is_dangerous_command(command):
-        return "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+        return (
+            "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+            "若这是文档/文件内容（而非要执行的命令），请改用文件写入工具（write_file）保存。"
+        )
 
     # 按回合撤销边界（M6）：仅在实际放行执行的命令上持久化"未覆盖副作用"
     # 事实——被冻结/危险策略拒绝的命令零副作用，不打虚假标记（规格 10）。
@@ -3012,6 +3021,17 @@ def _unpack_model_config(model_config: tuple | None):
     raise ValueError("model_config 必须是 (model, key, base_url[, model_id])")
 
 
+def _format_tool_stage_duration(duration_ms) -> str:
+    """tool_finished 阶段详情里的耗时片段：≥1s 显示秒，否则毫秒。"""
+    try:
+        ms = max(0, int(duration_ms or 0))
+    except (TypeError, ValueError):
+        return ""
+    if ms <= 0:
+        return ""
+    return f"{ms / 1000:.1f}s" if ms >= 1000 else f"{ms}ms"
+
+
 def _permission_owner_waiting(owner_id: str) -> bool:
     from core.permission_broker import permission_broker
 
@@ -3326,34 +3346,48 @@ class SubagentManager:
                 task.started_at = time.time()
                 self._record_stage_locked(task, "running")
 
-            # 子代理线程标记父会话，使工具级共享缓存可被复用
-            _tool_cache.set_current_session(task.parent_session)
-            # 子代理线程继承父回合的工作目录上下文（多会话并行隔离）
-            from core.workspace_context import set_workdir
-            if task.workdir:
-                set_workdir(task.workdir)
-            # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
-            # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
-            # 不会串到其他并行会话
-            _subagent_app_context.set_thread_session(task.parent_session)
-            from core.plan import set_current_plan_session as _bind_plan_route
+            # 启动段（会话/工作目录/undo 检查点绑定）异常兜底：这里抛错会让
+            # 线程带着 running 状态裸崩（永无终态回调与 done_event），必须
+            # 落成终态让等待方可见（取消中 → cancelled，其余 → failed）
+            try:
+                # 子代理线程标记父会话，使工具级共享缓存可被复用
+                _tool_cache.set_current_session(task.parent_session)
+                # 子代理线程继承父回合的工作目录上下文（多会话并行隔离）
+                from core.workspace_context import set_workdir
+                if task.workdir:
+                    set_workdir(task.workdir)
+                # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
+                # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
+                # 不会串到其他并行会话
+                _subagent_app_context.set_thread_session(task.parent_session)
+                from core.plan import set_current_plan_session as _bind_plan_route
 
-            _bind_plan_route(task.parent_session)
-            # 按回合撤销归属（规格 9.2）：
-            # - 前台同步子代理共享父回合检查点（只借记录权）；
-            # - 可能迟于父回合结束的后台任务从启动时拥有独立检查点，
-            #   并以 parent_checkpoint_id 关联来源回合。
-            from core.turn_undo import recorder as _tu_recorder
-            from core.turn_undo import service as _tu_service
+                _bind_plan_route(task.parent_session)
+                # 按回合撤销归属（规格 9.2）：
+                # - 前台同步子代理共享父回合检查点（只借记录权）；
+                # - 可能迟于父回合结束的后台任务从启动时拥有独立检查点，
+                #   并以 parent_checkpoint_id 关联来源回合。
+                from core.turn_undo import recorder as _tu_recorder
+                from core.turn_undo import service as _tu_service
 
-            _own_undo_turn = None
-            if task.run_in_background:
-                _own_undo_turn = _tu_service.begin_background_task_turn(
-                    parent_turn_id=task.parent_turn_id,
-                    description=f"后台子代理 {task.task_id}: {task.description[:60]}",
-                )
-            else:
-                _tu_recorder.bind_thread_for_turn(task.parent_turn_id, owner=False)
+                _own_undo_turn = None
+                if task.run_in_background:
+                    _own_undo_turn = _tu_service.begin_background_task_turn(
+                        parent_turn_id=task.parent_turn_id,
+                        description=f"后台子代理 {task.task_id}: {task.description[:60]}",
+                    )
+                else:
+                    _tu_recorder.bind_thread_for_turn(task.parent_turn_id, owner=False)
+            except BaseException as error:
+                _logger.warning("子代理启动段失败 %s: %s", task.task_id, error)
+                _tool_cache.set_current_session(None)
+                if task.cancel_event.is_set():
+                    self._terminate(task.task_id, "cancelled", "task cancelled")
+                else:
+                    self._terminate(
+                        task.task_id, "failed", f"子代理启动失败: {error}"
+                    )
+                return
             try:
                 result = _strip_advisor_tags(str(self._runner(task) or "").strip())
             except BaseException as error:
@@ -3752,25 +3786,6 @@ class SubagentManager:
                     return True
             return False
 
-    def has_unconsumed_terminal_background_tasks(self, parent_session: str) -> bool:
-        """检查指定会话是否有未消费的终态后台子代理任务（成功+失败都算）。
-
-        用于决定是否在 turn 开始时注入汇总上下文。
-        """
-        if not parent_session:
-            return False
-        with self._lock:
-            for task in self._tasks.values():
-                if (
-                    task.run_in_background
-                    and task.parent_session == parent_session
-                    and task.status in _SUBAGENT_TERMINAL_STATUSES
-                    and task.done_event.is_set()
-                    and not task.notification_consumed
-                ):
-                    return True
-            return False
-
     def drain_terminal_background_tasks(self, parent_session: str) -> list[SubagentTaskSnapshot]:
         """提取本会话中所有终态（completed/failed/timed_out/cancelled）且尚未注入汇总上下文的后台子代理任务。
 
@@ -3956,13 +3971,19 @@ class SubagentManager:
 
     @staticmethod
     def _notification(task: SubagentTask) -> str:
-        summary = f"子任务「{task.description[:40]}」{task.status}"
+        # B1-01：子代理产出是数据——进上下文前中和保留标记（仅内容值；
+        # 包装标签与 XML 转义不受影响），防伪造标记与误截断。
+        from core.injection_markers import neutralize_reserved_markers
+
+        summary = neutralize_reserved_markers(
+            f"子任务「{task.description[:40]}」{task.status}"
+        )
         return f"""<task-notification>
   <task-id>{escape(task.task_id)}</task-id>
   <status>{escape(task.status)}</status>
   <summary>{escape(summary)}</summary>
-  <result>{escape(task.result)}</result>
-  <error>{escape(task.error)}</error>
+  <result>{escape(neutralize_reserved_markers(task.result))}</result>
+  <error>{escape(neutralize_reserved_markers(task.error))}</error>
 </task-notification>"""
 
     def _run_default_subagent(self, task: SubagentTask) -> str:
@@ -4082,7 +4103,7 @@ class SubagentManager:
         )
         # 自定义子 agent 的系统提示词优先；未配置时用内置 role_instructions
         instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]
-        # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪四条对内置与自定义子代理
+        # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪 / 信源分级五条对内置与自定义子代理
         # 一律生效。拼进 instruction_text 而非仅在首请求拼接——后续「续写总结」请求
         # （cont_messages）同样复用 instruction_text，两处请求自动带上同一份约束。
         # 顺序：身份正文在前、公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
@@ -4173,12 +4194,24 @@ class SubagentManager:
                     elif event.kind == "tool_finished":
                         name = str(event.payload.get("name", "tool"))
                         if event.payload.get("ok") is False:
-                            tool_errors[name] = str(
+                            err = str(
                                 event.payload.get("summary")
                                 or event.payload.get("error")
                                 or "工具执行失败"
                             )
+                            tool_errors[name] = err
+                            # 阶段历史带上失败摘要，右面板执行流程能看到卡在哪一步
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                f"{name} ✗ {' '.join(err.split())[:120]}",
+                            )
                         else:
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                f"{name} ✓ {_format_tool_stage_duration(event.payload.get('duration_ms'))}",
+                            )
                             tool_errors.pop(name, None)
                             success_count += 1
                     elif event.kind == "turn_error":
@@ -4196,7 +4229,7 @@ class SubagentManager:
                             try:
                                 task.event_callback("diff_ready", dict(event.payload))
                             except Exception:
-                                logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+                                _logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
         finally:
             # 现场打捞兜底：与循环内的周期 flush 幂等（_record_partial 只在更长时覆盖）。
             # 事件循环中途抛异常（如网络错误）时，周期 flush 只保到最后一个
@@ -4425,6 +4458,36 @@ def run_subagent(
             (item for item in scheduler.plan.snapshot() if item["id"] == str(plan_item_id)),
             None,
         )
+        if plan_item is None:
+            # 计划项查无此项时必须区分两种根因，否则会把平台侧路由缺陷
+            # 谎报成“计划项不存在”，误导模型放弃或改写计划：
+            #   1) 执行线程未绑定计划会话（绑定环境缺失，如并行工具线程
+            #      未继承计划路由）——可重试的环境问题；
+            #   2) 绑定会话内确实没有该 id——模型应核对 id 而不是重试。
+            from core.plan import get_bound_plan_session
+
+            bound_session = get_bound_plan_session()
+            if bound_session is None:
+                return json.dumps({
+                    "status": "blocked",
+                    "reason": "plan_binding_missing",
+                    "plan_item_id": str(plan_item_id),
+                    "error": (
+                        f"无法定位计划项 '{plan_item_id}'：当前执行线程未绑定计划会话"
+                        "（绑定环境缺失，属平台侧计划路由问题，不是计划项状态冲突）。"
+                        "请重试本项；若持续失败可改用单发（非同批并发）方式派发，"
+                        "并先用 plan_read 核对计划项 id。"
+                    ),
+                }, ensure_ascii=False)
+            return json.dumps({
+                "status": "blocked",
+                "reason": "plan_item_not_found",
+                "plan_item_id": str(plan_item_id),
+                "error": (
+                    f"计划会话 '{bound_session}' 中不存在计划项 '{plan_item_id}'，"
+                    "请先用 plan_read 核对当前会话的计划项 id。"
+                ),
+            }, ensure_ascii=False)
         if plan_item is not None and plan_item.get("kind") == "input_preparation":
             return json.dumps({
                 "status": "blocked",
@@ -4640,6 +4703,55 @@ def dream_consolidation():
         
     return run_dream_consolidation_sync(task_model, task_key, task_url)
 
+def recall_history(before_msg_id, limit=16, cancel_event=None):
+    """回溯当前会话更早被压缩归档的原始消息（recall_history 工具执行体）。
+
+    只服务摘要水位覆盖的范围：活跃区消息模型本就可见，重复注入只会浪费
+    上下文。会话身份取执行线程绑定，取不到时回退全局当前会话。
+    """
+    import core.app_context as _app_context
+
+    session_name = ""
+    try:
+        session_name = str(
+            _app_context.get_thread_session() or _app_context.get_current_session() or ""
+        ).strip()
+    except Exception:
+        session_name = ""
+    if not session_name:
+        return "无法确定当前会话，无法回溯历史。"
+    try:
+        manager = _app_context.get_manager()
+    except Exception:
+        manager = None
+    if manager is None:
+        return "会话存储未就绪，无法回溯历史。"
+
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+
+    try:
+        rows = manager.get_compressed_messages(session_name, before_msg_id, limit)
+    except Exception as exc:
+        return f"回溯历史失败：{exc}"
+    if not rows:
+        return (
+            "该范围内没有已压缩的原始消息。before_msg_id 需指向摘要水位覆盖的"
+            "区间（取值见记忆摘要块尾部的[更早摘要回溯]索引中的 msg_id）。"
+        )
+
+    lines = []
+    for row in rows:
+        content = str(row.get("content") or "").strip()
+        if len(content) > 600:
+            content = content[:600] + "...[该条过长，已截断]"
+        lines.append(f"#msg_id={row.get('id')} [{row.get('role')}]\n{content}")
+    header = (
+        f"共回溯 {len(rows)} 条已压缩原始消息（按时间正序；before_msg_id 含边界自身）。"
+        "需要更早的内容时，把 before_msg_id 设为本批最早一条的 msg_id 减 1 再调用。"
+    )
+    return header + "\n\n" + "\n\n".join(lines)
+
 def glob_files(pattern, dir_path=".", cancel_event=None):
     """快速文件模式匹配：使用 glob 表达式在项目目录中搜索匹配的文件路径列表。优先尝试 ripgrep。"""
     import glob
@@ -4812,3 +4924,152 @@ def undo_turn(turn_id=""):
         "后续继续相关工作前必须重新读取磁盘文件。",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 秘书调度台工具（设计 2026-10-15 第 3/4/5 节）
+# 三个工具只对秘书会话可见（core/secretary 的工具策略），真实能力由 GUI 侧实现
+# 并经 core.secretary_dispatch 注册；core 层不 import gui_bridge。CLI / 脚本等
+# 未注册场景返回可读中文错误，绝不抛异常。
+# ---------------------------------------------------------------------------
+
+_SECRETARY_DISPATCH_UNAVAILABLE = (
+    "🚨 秘书调度能力当前不可用：会话检索 / 派活 / 跳转由界面进程提供，"
+    "需要 GUI 运行中（CLI / 脚本场景下不可用）。"
+)
+
+
+def _secretary_dispatch_service():
+    """取调度服务句柄；未注册或加载失败时返回 (None, 可读错误文本)。"""
+    try:
+        from core import secretary_dispatch as _dispatch
+    except Exception as exc:
+        return None, f"🚨 秘书调度能力加载失败：{exc}"
+    try:
+        service = _dispatch.get()
+    except Exception as exc:
+        return None, f"🚨 秘书调度能力加载失败：{exc}"
+    if service is None:
+        return None, _SECRETARY_DISPATCH_UNAVAILABLE
+    return service, ""
+
+
+def _secretary_scope_limit(value, default=20, maximum=50):
+    """limit 归一化：非法 / 非正数回落默认值，超出上限截到上限。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return min(parsed, maximum)
+
+
+def _secretary_json(payload) -> str:
+    """统一序列化出口：中文不转义，保证模型与日志可读。"""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def search_conversations(
+    keyword="", date_from="", date_to="", workdir="", limit=20, cancel_event=None
+):
+    """检索历史会话（秘书调度台：能力一）。
+
+    按关键词 / 日期区间（YYYY-MM-DD）/ 项目目录过滤；关键词与日期都为空时由
+    服务层拒绝（避免把全部会话倾倒进上下文）。返回 JSON 字符串：
+    ``{"count": n, "results": [{session_name, display_name, is_secretary,
+    workdir, updated_at, message_count, snippets}, ...]}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    _raise_if_cancelled(cancel_event)
+    try:
+        results = service.search_conversations(
+            keyword=str(keyword or ""),
+            date_from=str(date_from or ""),
+            date_to=str(date_to or ""),
+            workdir=str(workdir or ""),
+            limit=_secretary_scope_limit(limit),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 检索会话失败：{exc}"
+    except Exception as exc:
+        return f"🚨 检索会话失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    rows = [row for row in (results or []) if isinstance(row, dict)]
+    payload = {"count": len(rows), "results": rows}
+    if not rows:
+        payload["hint"] = "没找到匹配的会话，可换关键词或放宽日期范围。"
+    return _secretary_json(payload)
+
+
+def dispatch_task(
+    target="", prompt="", workdir="", model_id="", permission_mode="", cancel_event=None
+):
+    """把任务派给指定会话（秘书调度台：能力二）。
+
+    语义等价于**用户在目标会话亲手发一条消息**：内容以 role=user 落库、界面
+    正常显示并触发一轮真实执行；不传任何"自动化"显示标记。``target`` 为空或
+    「新会话」时按 ``workdir`` 懒创建新会话。返回 JSON 字符串：
+    ``{ok, target_session, display_name, workdir, state}``；目标不唯一时返回
+    ``{ok: false, candidates: [...]}``，由调用方向用户确认。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    text = str(prompt or "").strip()
+    if not text:
+        return "🚨 派活失败：prompt（任务正文）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.dispatch_task(
+            target=str(target or ""),
+            prompt=text,
+            workdir=str(workdir or ""),
+            model_id=str(model_id or ""),
+            permission_mode=str(permission_mode or ""),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 派活失败：{exc}"
+    except Exception as exc:
+        return f"🚨 派活失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 派活失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    if payload.get("ok") is False and payload.get("candidates"):
+        payload["hint"] = (
+            "目标不唯一：请把候选里的 session_name 交给用户确认后，用确定的"
+            "target 重新派活。"
+        )
+    return _secretary_json(payload)
+
+
+def open_session(target="", cancel_event=None):
+    """把用户带到某个历史会话（秘书调度台：能力三）。
+
+    纯系统层切换（不模拟点击）：解析目标（会话名 / 显示名 / 关键词唯一命中）、
+    已归档先取消归档、切换当前会话并推送界面事件。返回 JSON 字符串：
+    ``{ok, session_name, display_name, workdir}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    wanted = str(target or "").strip()
+    if not wanted:
+        return "🚨 跳转失败：target（会话名或显示名）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.open_session(target=wanted)
+    except SecretaryDispatchError as exc:
+        return f"🚨 跳转失败：{exc}"
+    except Exception as exc:
+        return f"🚨 跳转失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 跳转失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    return _secretary_json(payload)

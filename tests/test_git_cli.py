@@ -11,6 +11,11 @@ from core.git.repository import resolve_repository
 from core.git.runner import GitRunner
 from tests.git_fixtures import make_commit, make_repo, run_git
 
+# 本文件的用例全部依赖真实 git 子进程（tmp_path 小仓库夹具，不依赖项目仓库
+# 规模）。慢点在于 Windows 上每次 git 子进程启动约 6 秒，单测实测 66s，整个
+# 文件需数分钟。标记为 slow 以便快速回归时用 `pytest -m "not slow"` 跳过。
+pytestmark = pytest.mark.slow
+
 
 @pytest.fixture(autouse=True)
 def _reset_singletons():

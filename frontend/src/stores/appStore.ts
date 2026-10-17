@@ -10,6 +10,8 @@ import type {
   PresetProviderInfo,
   ModelSettingsSnapshot,
   SessionGroup,
+  ArchivedSessionInfo,
+  ArchiveBatchResult,
   SkillInfo,
   McpInfo,
   PluginInfo,
@@ -20,6 +22,8 @@ import type {
   BackgroundTask,
   TokenUsage,
   ContextBreakdownItem,
+  SessionTokenTotals,
+  TokenUsageOverview,
   TokenStatisticsSnapshot,
   PermissionMode,
   ReasoningChoice,
@@ -41,7 +45,14 @@ import type {
   TurnUndoRecoveryPreviewPayload,
   TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
+import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
+import { isMarkdownFilePath, toFileUrl } from '../utils/localPath';
+import { fileExt } from '../utils/fileIcon';
+import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
+// 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
+import { requestFrontendReload } from '../utils/frontendUpdate';
 import type { MediaItem } from '../types/media';
+import type { AttachmentItem } from '../types/composer';
 import { formatPermMode } from '../utils/markdown';
 import {
   reduceExecutionState,
@@ -73,6 +84,7 @@ import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
   SIDEBAR_WIDTH_KEY,
+  computeRestoredRatioWidth,
   computeRestoredWidth,
 } from '../composables/usePanelResize';
 import {
@@ -92,6 +104,43 @@ function storedPanelWidth(key: string, def: number, min: number, max: number): n
     return def;
   }
 }
+
+/**
+ * 右面板宽度启动恢复（视口比例语义）：记忆的是“占视口宽度的比例”，
+ * 按当前视口换算成像素（兼容旧版像素记忆），并夹取到
+ * [min, min(配置上限, 视口 50%)]；未自定义或存储不可用回默认宽度。
+ * 窗口缩放时的等比跟随由 usePanelResize(viewportRatio) 的 resize 监听负责。
+ */
+function restoredRightPanelWidth(): number {
+  try {
+    return computeRestoredRatioWidth(
+      localStorage.getItem(RIGHT_PANEL_WIDTH_KEY),
+      RIGHT_PANEL_MIN_WIDTH,
+      RIGHT_PANEL_MAX_WIDTH,
+    ) ?? RIGHT_PANEL_DEFAULT_WIDTH;
+  } catch {
+    return RIGHT_PANEL_DEFAULT_WIDTH;
+  }
+}
+
+// 底部内嵌终端面板持久化键与尺寸边界（与 'ycode-*' 前缀约定一致）
+export const TERMINAL_PANEL_OPEN_KEY = 'ycode-terminal-open';
+export const TERMINAL_PANEL_HEIGHT_KEY = 'ycode-terminal-height';
+export const TERMINAL_PANEL_DEFAULT_HEIGHT = 300;
+export const TERMINAL_PANEL_MIN_HEIGHT = 140;
+export const TERMINAL_PANEL_MAX_HEIGHT = 720;
+
+// 秘书名字长度上限：与后端 core.secretary.validate_secretary_name 的口径一致
+// （去首尾空白后 1-20 个字符）。前端只做「禁用按钮 + 可见提示」，不做截断——
+// 悄悄把用户输入砍短会让身份名字与用户输入不符，后端仍会二次校验。
+export const SECRETARY_NAME_MAX_LEN = 20;
+
+// 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页
+export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent';
+// 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
+const RIGHT_PANEL_TAB_IDS = new Set<RightPanelTabId>([
+  'files', 'git', 'browser', 'tasks', 'computer', 'subagent',
+]);
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
   // Pinia exposes state through Vue proxies, which structuredClone rejects.
@@ -165,6 +214,20 @@ const normalizeContextBreakdown = (value: unknown): ContextBreakdownItem[] => {
   return items;
 };
 
+export const normalizeSessionTokenTotals = (data: any = {}): SessionTokenTotals => ({
+  session_id: String(data.session_id ?? ''),
+  prompt: Number(data.prompt ?? 0),
+  completion: Number(data.completion ?? 0),
+  cached: Number(data.cached ?? 0),
+  cache_prompt: Number(data.cache_prompt ?? 0),
+  total: Number(data.total ?? 0),
+  requests: Number(data.requests ?? 0),
+  last_ts: data.last_ts === null || data.last_ts === undefined ? null : Number(data.last_ts),
+  keepalive_prompt: Number(data.keepalive_prompt ?? 0),
+  keepalive_cached: Number(data.keepalive_cached ?? 0),
+  keepalive_requests: Number(data.keepalive_requests ?? 0),
+});
+
 export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
   const nullableNumber = (value: unknown): number | null => {
     if (value === null || value === undefined) return null;
@@ -194,6 +257,8 @@ export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
     cache_lane_api_base: String(data.cache_lane_api_base ?? ''),
     cache_keepalive_hot_pct: nullableNumber(data.cache_keepalive_hot_pct),
     cache_keepalive_session_pct: nullableNumber(data.cache_keepalive_session_pct),
+    // 本会话口径（落库聚合，重启不清零）；旧后端无此字段时回落全零 + 空 session_id
+    session_totals: normalizeSessionTokenTotals(data.session_totals),
     context_breakdown: normalizeContextBreakdown(data.context_breakdown),
   };
 };
@@ -298,6 +363,8 @@ export interface MessageMetrics {
 
 export interface ChatMessage {
   id?: string;
+  // 后端历史行的稳定 id（分页游标 / 红点导航按 id 定位用；本地新消息可能缺省）
+  _msg_id?: number;
   // notice：对话流内的系统提示（取代原 Toast，不自动消失）
   role: 'user' | 'assistant' | 'tool' | 'error' | 'notice';
   content?: string;
@@ -463,7 +530,7 @@ export interface PermReqState {
   undoImpact?: Record<string, any> | null;
 }
 
-export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations' | 'hooks';
+export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations';
 
 const speedTracker = new StreamingSpeedTracker();
 
@@ -486,6 +553,23 @@ export const useAppStore = defineStore('app', {
     // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享后端配置
     sandboxEnabled: false,
 
+    // 飞书集成快照（密钥只回 has_secret，明文按需单独取）
+    feishuSettings: {
+      enabled: false,
+      app_id: '',
+      has_secret: false,
+      approvers: [] as string[],
+      notify_chat_id: '',
+      status: {
+        state: 'disabled',
+        running: false,
+        last_error: '',
+        received_events: 0,
+        duplicate_events: 0,
+        uptime_seconds: 0,
+      },
+    },
+
     // 系统设置使用独立快照，后续新增系统级选项时继续扩展该对象。
     systemSettings: {
       command_shell: 'auto',
@@ -496,6 +580,11 @@ export const useAppStore = defineStore('app', {
       agent_turn_step_limit: 200,
       agent_turn_step_limit_min: 10,
       agent_turn_step_limit_max: 1000,
+      // 上下文水位基准：默认未设置（null，跟随模型真实窗口），
+      // 真实值一律以后端快照覆盖
+      context_watermark_base: null,
+      context_watermark_base_min: 50000,
+      context_watermark_base_max: 2000000,
       // AI 生成内容目录：默认目录与生效路径一律以后端快照覆盖，前端不猜路径
       ai_output_dir: '',
       ai_output_dir_setting: '',
@@ -546,6 +635,9 @@ export const useAppStore = defineStore('app', {
 
     // 会话 / 项目工作区
     sessionGroups: [] as SessionGroup[],
+    // 归档会话（get_archived_sessions 的扁平列表，按归档时刻倒序）：设置页
+    // 「会话归档」分区的数据源，不参与主列表渲染
+    archivedSessions: [] as ArchivedSessionInfo[],
     currentSessionName: '',
     currentSessionDisplayName: '新对话',
     // 懒创建会话：点“新会话”只进入空白状态不落库；发首条消息时才真正创建，
@@ -579,6 +671,8 @@ export const useAppStore = defineStore('app', {
     // M31 修复：各类异步刷新的请求序号，响应返回时序号已过期则丢弃，
     // 避免并发/重复刷新时旧快照覆盖新快照
     sessionsReqSeq: 0,
+    // 归档会话列表刷新序号（同上：过期快照不覆盖新快照）
+    archivedSessionsReqSeq: 0,
     tokenUsageReqSeq: 0,
     mcpReqSeq: 0,
     pluginsReqSeq: 0,
@@ -646,6 +740,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     version: '',
     // 启动初始化是否完成（控制 星瑶Code 启动画面，完成后淡出进入对话）
     initialized: false,
+    // JS 桥完成首次验证（initFromBackend 拿到 api）：底部终端等惰性能力
+    // 以此为启动信号，避免在 pywebview 注入完成前触达 _api() 弹连接失败框
+    bridgeReady: false,
 
     // 侧栏与面板开合状态
     // 移动端（<=768px）默认收起侧栏：侧栏作为 fixed 覆盖层，展开时滑入，
@@ -654,11 +751,49 @@ navItems: [] as Array<{ id: number; preview: string }>,
       typeof window !== 'undefined' &&
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(max-width: 768px)').matches,
-    rightPanelCollapsed: false,
+    // 右侧计划/任务/终端/文件/Git 栏默认收起：启动不摊开主对话区，
+    // 仅由顶栏“切换面板”按钮或底栏 Git 分支项手动展开；
+    // 展开状态不持久化，每次启动都从收起开始
+    rightPanelCollapsed: true,
+    // “打开标签页”选择页可见性：顶栏按钮等中性入口展开面板时先选择要看的内容，
+    // 底栏 Git 分支项等定向入口经 openRightPanelTab 直接开页签（不持久化）。
+    // 页签全部关闭时也回到选择页
+    rightPanelPicker: false,
+    // 右面板多页签：当前会话打开的页签与激活页签（'' = 停在选择页）。
+    // 页签集/激活页签/展开态都会话隔离：随 _captureRuntime/_bindSessionRuntime
+    // 按会话保存恢复，A 会话打开的浏览器页签不会出现在 B 会话
+    rightPanelTabs: [] as RightPanelTabId[],
+    rightPanelActiveTab: '' as RightPanelTabId | '',
+    // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
+    // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
+    // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
+    // 模态瞬态，不持久化也不会话隔离
+    rightPanelSnipActive: false,
     // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
+    // 右面板按视口比例记忆（窗口缩放等比跟随），侧栏按固定像素记忆；
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
-    rightPanelWidth: storedPanelWidth(RIGHT_PANEL_WIDTH_KEY, RIGHT_PANEL_DEFAULT_WIDTH, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
+    rightPanelWidth: restoredRightPanelWidth(),
+    // 内嵌浏览器（右侧面板浏览器页签）：真实网页由宿主叠加的原生 WebView2
+    // 渲染，前端只持有状态（地址栏/前进后退能力/加载态）并做乐观更新；
+    // supported=false 表示宿主平台不支持（非 Windows 桌面端 GUI 或缺桥）。
+    embeddedBrowser: {
+      url: '',
+      title: '',
+      can_go_back: false,
+      can_go_forward: false,
+      loading: false,
+      ready: false,
+      visible: false,
+      supported: true,
+      // 星瑶浏览器自动化的项目分辨率（适应窗口呈现）；null = 无自动化视口
+      automationViewport: null as [number, number] | null,
+    },
+    // 右栏浏览器「外部请求导航」（对话正文 / 文件树点击 html 文件触发）：
+    // BrowserPane 消费这条请求去导航；nonce 自增保证同一文件重复点击也能被
+    // 观察到（内容相同的对象引用不变时 watch 不触发）。null = 无待处理请求。
+    browserNavRequest: null as null | { url: string; path: string },
+    browserNavNonce: 0,
     themeLight: false,
     guiTheme: null as GuiTheme | null,
     savedGuiTheme: null as GuiTheme | null,
@@ -686,9 +821,16 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer',
-    // 智能体显示名：设置页「人设设置」自定义后全局生效（界面文案/执行过程/思考提示）
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'decision' | 'plugins' | 'about' | 'contact' | 'disclaimer',
+    // JEV 决策记录实时流：decision_recorded 事件累加未读徽章；面板按 tick 拉取刷新
+    decisionUnread: 0,
+    decisionEventTick: 0,
+    // 智能体显示名：当前会话生效名——普通会话为设置页「人设设置」的名字，
+    // 秘书会话为该会话自己的秘书名（界面文案/执行过程/思考提示都跟随它）
     agentName: '星瑶',
+    // 设置页人设名：秘书会话里 agentName 会被秘书名占住，等切回普通会话 /
+    // 进入尚未落库的草稿会话时要回落，故与 agentName 分开单独留一份
+    personaAgentName: '星瑶',
     // 智能体对用户的称呼；空串表示不使用特定称呼
     userTitle: '',
     // 免责条款同意状态：requiredVersion 为当前生效的条款版本，acceptedVersion
@@ -703,8 +845,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 计划、后台任务、Token 用量
     planData: { title: '', items: [], progress: 0 } as PlanData,
     backgroundTasks: [] as BackgroundTask[],
+    // 右面板“后台任务”详情：当前查看的任务 id 与打开 nonce（执行条“详情”触发）
+    bgTaskDetailId: '',
+    bgTaskOpenNonce: 0,
+    // 右面板“子代理”详情：当前查看的任务 id 与打开 nonce（卡片“查看”触发）
+    subagentDetailId: '',
+    subagentOpenNonce: 0,
     subagentTasks: [] as SubagentTaskSnapshot[],
     tokenUsage: emptyTokenUsage(),
+    // 会话 token 弹层（点击状态行时按需拉取；打开即刷新，不做后台轮询）
+    tokenUsageOverview: null as TokenUsageOverview | null,
+    tokenUsageOverviewLoading: false,
     tokenStatistics: null as TokenStatisticsSnapshot | null,
     tokenStatisticsLoading: false,
     tokenStatisticsDays: 30 as 1 | 7 | 30,
@@ -767,9 +918,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // frameless 窗口最大化状态（后端 window_maximize_state 事件推送）
     windowMaximized: false,
 
-    // 内嵌终端（右侧面板）
-    terminalOutput: '',
-    terminalRunning: false,
+    // 底部内嵌交互式终端面板（ZCode 弹出式终端）：
+    // open 持久化到 localStorage，height 记忆拖拽结果；默认收起
+    terminalPanelOpen: (() => {
+      try { return localStorage.getItem(TERMINAL_PANEL_OPEN_KEY) === '1'; } catch { return false; }
+    })(),
+    terminalPanelHeight: (() => {
+      try {
+        const n = Number(localStorage.getItem(TERMINAL_PANEL_HEIGHT_KEY));
+        return Number.isFinite(n) && n >= TERMINAL_PANEL_MIN_HEIGHT
+          ? Math.min(n, TERMINAL_PANEL_MAX_HEIGHT)
+          : TERMINAL_PANEL_DEFAULT_HEIGHT;
+      } catch { return TERMINAL_PANEL_DEFAULT_HEIGHT; }
+    })(),
   }),
 
   getters: {
@@ -806,9 +967,30 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return (state.currentSessionName && state.messageQueues[state.currentSessionName]) || [];
     },
 
-    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示
+    // 当前会话发起的后台任务（底部执行条渲染源）：快照带 session_id 归属，
+    // 只显示本会话启动的任务，其他会话（或 CLI）启动的任务不跨会话串显；
+    // 无归属的旧记录不属于任何会话，任何会话的执行条都不显示
+    currentSessionBackgroundTasks(state): BackgroundTask[] {
+      const sess = state.currentSessionName;
+      if (!sess) return [];
+      return state.backgroundTasks.filter(t => t.session_id === sess);
+    },
+
+    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示。
+    // 注意：这是全局判据（RightPanel 自动登记操控页签也用它），不区分会话
     computerControlBarVisible(state): boolean {
       return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
+    },
+
+    // 顶部安全条的会话归属（对齐 currentSessionBackgroundTasks 的既有约定）：
+    // 只在本会话发起的 run 里渲染，run 在 A 会话启动、用户正看 B 会话时不串显；
+    // 归属未知（owner_session_id 为空，如旧后端快照）时回落显示，
+    // 避免用户失去条上的暂停/停止入口
+    computerBarVisibleInCurrentSession(state): boolean {
+      if (!COMPUTER_BAR_STATUSES.includes(state.computerRun.status)) return false;
+      const owner = state.computerRun.owner_session_id;
+      if (!owner) return true;
+      return owner === state.currentSessionName;
     },
 
     // run 是否处于终态：驱动页签关闭入口与终态自动关闭计时
@@ -894,7 +1076,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return this.sessionRuntimeByName[key];
     },
 
-    _captureRuntime(this: any, sessionName = this.currentSessionName) {
+    // opts.skipLayout：跳过右面板页签/开合/任务详情等布局态捕获。事件管线
+    // （handleBridgeEvent）跨会话临时绑到目标会话时必须传 true——此时顶层
+    // 布局仍是当前查看会话的实时状态，捕获进目标会话会用 A 的布局污染 B 的
+    // 快照，用户真实切回 B 时恢复出错误页签/开合。
+    _captureRuntime(this: any, sessionName = this.currentSessionName, opts?: { skipLayout?: boolean }) {
       const runtime = this._getSessionRuntime(sessionName);
       runtime.messages = this.messages;
       runtime.streamingText = this.currentStreamingText;
@@ -917,6 +1103,22 @@ navItems: [] as Array<{ id: number; preview: string }>,
       runtime.historyOldestId = this.historyOldestId;
       // 导航索引随会话保存：切回时展示该会话自己的红点
       runtime.navItems = this.navItems;
+      // 右面板多页签随会话保存：页签集、激活页签与面板展开态都按会话隔离，
+      // 切回时恢复该会话自己的浏览器/Git 等页签。事件管线的临时捕获
+      // （skipLayout）不保存这段：顶层布局此时仍属于当前查看的会话
+      if (!opts?.skipLayout) {
+      // 注意：本行**每次都换一个新数组引用**。S3-T8 报告里「回写当前 store 的同一批
+      // 引用、值相等时 Vue hasChanged 不触发更新」那条论断只适用于上面按引用直赋的
+      // 字段（messages / tokenUsage / modelId / navItems 等），**不适用于 rightPanelTabs**。
+      // 这里没有性能后果：该字段只在切会话时被读写，不在高频事件路径上。
+      runtime.rightPanelTabs = [...this.rightPanelTabs];
+      runtime.rightPanelActiveTab = this.rightPanelActiveTab;
+      runtime.rightPanelExpanded = !this.rightPanelCollapsed;
+      // 后台任务详情查看对象随会话保存：切回时恢复该会话自己的查看对象
+      runtime.bgTaskDetailId = this.bgTaskDetailId;
+      // 子代理详情查看对象同口径随会话保存：切会话不残留上一个会话的查看 id
+      runtime.subagentDetailId = this.subagentDetailId;
+      }
     },
 
     _captureCurrentRuntime(this: any) {
@@ -934,7 +1136,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    _bindSessionRuntime(this: any, sessionName = this.currentSessionName) {
+    // opts.skipLayout：跳过右面板页签/开合/任务详情等布局态恢复。事件管线
+    // （handleBridgeEvent）跨会话临时绑回当前会话时必须传 true——布局只随
+    // 用户真实切换会话恢复，否则该会话旧快照会把用户刚点的面板开合覆盖掉
+    // （表现为"关了又自动打开 / 打开又自动关闭"）。
+    _bindSessionRuntime(this: any, sessionName = this.currentSessionName, opts?: { skipLayout?: boolean }) {
       const runtime = this._getSessionRuntime(sessionName);
       this.messages = runtime.messages;
       // 历史分页游标随会话恢复；loading 为瞬态，切会话强制复位防卡死翻页
@@ -971,6 +1177,48 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (runtime.permMode) {
         this.permissionMode = runtime.permMode as PermissionMode;
       }
+      // 右面板多页签随会话恢复：目标会话从未展开过面板（undefined）→ 收起、
+      // 无页签；展开过的会话恢复自己的页签集与激活页签。浏览器原生表面随
+      // BrowserPane 的 active prop 翻转自动隐藏/重显，不需要额外桥调用。
+      // 事件管线的临时回绑（skipLayout）不恢复这段：布局属用户实时操作面，
+      // 回滚到旧快照会吃掉用户刚做的开合/页签变更
+      if (!opts?.skipLayout) {
+      const savedTabs = runtime.rightPanelTabs;
+      // 按合法页签白名单过滤：旧快照里可能残留已删除的 id，直接 as 强转会让
+      // RightPanel 的 PANE_LABELS[tab] 取到 undefined（页签标题/图标变空白）
+      let tabs: RightPanelTabId[] = savedTabs
+        ? (savedTabs as string[]).filter(
+            (t: string): t is RightPanelTabId => RIGHT_PANEL_TAB_IDS.has(t as RightPanelTabId),
+          )
+        : [];
+      // 操控页签依附于全局唯一的 run：终态自动收场可能发生在别的会话上
+      // （closeRightPanelTab 只作用于当前页签集），run 已清场后残留的操控
+      // 页签恢复出来只会是一片空白，恢复时一并丢弃
+      if (!this.computerRun.run_id) {
+        tabs = tabs.filter(t => t !== 'computer');
+      }
+      this.rightPanelTabs = tabs;
+      const savedActive = runtime.rightPanelActiveTab;
+      this.rightPanelActiveTab = savedActive && this.rightPanelTabs.includes(savedActive as RightPanelTabId)
+        ? savedActive
+        : this.rightPanelTabs[this.rightPanelTabs.length - 1] || '';
+      // 该会话从未展开过面板（undefined）→ 收起，让它显示正常会话页面；
+      // 展开过的会话恢复自己的开合态
+      this.rightPanelCollapsed = runtime.rightPanelExpanded === undefined
+        ? true
+        : !runtime.rightPanelExpanded;
+      // 无页签 → 选择页；有页签 → 显示激活页签
+      this.rightPanelPicker = this.rightPanelTabs.length === 0;
+      // 后台任务详情查看对象随会话恢复：切会话不残留上一个会话的任务详情
+      this.bgTaskDetailId = runtime.bgTaskDetailId || '';
+      // 子代理详情查看对象同口径恢复：切会话不残留上一个会话的查看 id，
+      // 否则 SubagentPane 会用新会话名去查上一会话的任务 id，详情串场
+      this.subagentDetailId = runtime.subagentDetailId || '';
+      // 画笔截图模态（冻结帧覆盖层）是会话瞬态：切会话后置位残留会让新会话的
+      // 浏览器原生表面被持续压住、覆盖层显示上一会话的冻结帧，这里随会话强制退出
+      // （覆盖层的本地快照 ref 由 RightPanel 监听 currentSessionName 一并清除）
+      this.rightPanelSnipActive = false;
+      }
     },
 
     _setSessionRunning(this: any, sessionName: string, running: boolean) {
@@ -998,6 +1246,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
         return null;
       }
       return api;
+    },
+
+    // 底部终端专用的静默桥访问：不用 _api()（它缺桥时会弹窗），终端在
+    // bridgeReady 之前根本不发起调用，这里兜底返回 null 即可
+    _ptyApi(): PyWebViewAPI | null {
+      return (window.pywebview && window.pywebview.api) || null;
     },
 
     // 回合级事件（tool_start / tool_finish / diff_ready）必须落在当前助手消息上；
@@ -1142,8 +1396,239 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.sidebarCollapsed = !this.sidebarCollapsed;
     },
 
+    // 顶栏“切换面板”按钮等中性入口：收起/展开面板。展开时该会话已有页签 →
+    // 直接显示激活页签；一个页签都没开过 → 先进选择页
     toggleRightPanel() {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
+      if (!this.rightPanelCollapsed) {
+        this.rightPanelPicker = this.rightPanelTabs.length === 0;
+      }
+    },
+
+    // ── 右面板多页签（会话级隔离）─────────────────────────────────
+    // 打开（或切换到）指定页签：不存在则追加，激活并停在该页签。定向入口
+    // （Git 分支项、执行条详情、子代理卡片、浏览器自动化）统一走这里：
+    // 面板上已有其他页签时是“加页签”，不再互相覆盖。
+    // opts.expand=false：只登记页签不摊开面板（操控 run 自动切入沿用旧设计，
+    // 用户手动展开面板时直接落在操控页签）
+    openRightPanelTab(this: any, tab: RightPanelTabId, opts?: { expand?: boolean }) {
+      if (!this.rightPanelTabs.includes(tab)) this.rightPanelTabs.push(tab);
+      this.rightPanelActiveTab = tab;
+      this.rightPanelPicker = false;
+      if (opts?.expand !== false) this.rightPanelCollapsed = false;
+      // 详情页签缺省查看对象：只在本会话有后台任务时自动选第一个，
+      // 其他会话的任务不跨会话代选（与执行条的会话过滤口径一致）
+      if (tab === 'tasks' && !this.bgTaskDetailId && this.currentSessionBackgroundTasks.length) {
+        this.bgTaskDetailId = this.currentSessionBackgroundTasks[0].task_id;
+      }
+      if (tab === 'subagent' && !this.subagentDetailId && this.subagentTasks.length) {
+        this.subagentDetailId = this.subagentTasks[0].id;
+      }
+    },
+
+    // 关闭单个页签：激活页签被关时优先切换到右侧邻居（保持视线位置），
+    // 没有右侧则取最后一个；全部关完回选择页（面板保持展开，可再开新页签）
+    closeRightPanelTab(this: any, tab: RightPanelTabId) {
+      const idx = this.rightPanelTabs.indexOf(tab);
+      if (idx < 0) return;
+      this.rightPanelTabs.splice(idx, 1);
+      if (this.rightPanelActiveTab === tab) {
+        this.rightPanelActiveTab =
+          this.rightPanelTabs[Math.min(idx, this.rightPanelTabs.length - 1)] || '';
+      }
+      if (this.rightPanelTabs.length === 0) {
+        this.rightPanelActiveTab = '';
+        this.rightPanelPicker = true;
+      }
+      // 关闭页签同步清理该页签的瞬态查看对象：否则重开瞬间会先渲染旧详情
+      // （tasks 残留 bgTaskDetailId、subagent 残留查看 id 与 SubagentPane 内部 detail）
+      if (tab === 'tasks') this.bgTaskDetailId = '';
+      if (tab === 'subagent') this.subagentDetailId = '';
+    },
+
+    // 页签条点击：切到已打开的页签
+    activateRightPanelTab(this: any, tab: RightPanelTabId) {
+      if (!this.rightPanelTabs.includes(tab)) return;
+      this.rightPanelActiveTab = tab;
+      this.rightPanelPicker = false;
+    },
+
+    // 页签条“+”：展开面板并显示选择页（保留已开页签，选卡后追加/激活）
+    showRightPanelPicker(this: any) {
+      this.rightPanelCollapsed = false;
+      this.rightPanelPicker = true;
+    },
+
+    // 把浏览器页签开进指定会话的右面板（会话归属）：当前会话直接开；
+    // 其他会话只写入其 runtime（含展开态），不抢当前界面——切回该会话时
+    // 浏览器页签随之出现。浏览器原生表面随页签失活自动隐藏，不跨界显示
+    openBrowserTabForSession(this: any, sessionName: string) {
+      if (!sessionName || sessionName === this.currentSessionName) {
+        this.openRightPanelTab('browser');
+        return;
+      }
+      const runtime = this._getSessionRuntime(sessionName);
+      const tabs: RightPanelTabId[] = runtime.rightPanelTabs
+        ? ([...runtime.rightPanelTabs] as RightPanelTabId[])
+        : [];
+      if (!tabs.includes('browser')) tabs.push('browser');
+      runtime.rightPanelTabs = tabs;
+      runtime.rightPanelActiveTab = 'browser';
+      runtime.rightPanelExpanded = true;
+    },
+
+    // 本地 html 在右栏内嵌浏览器里按网页渲染（对话正文 / 文件树点击 html 的入口）。
+    // 路径转成 file:// URL 后写一条导航请求并摊开浏览器页签；转换失败（相对路径
+    // 等非绝对路径）直接回退源码预览弹窗，不静默失败。宿主不支持内嵌浏览器
+    // （非 Windows 桌面端 GUI）时，由 BrowserPane 消费请求时再回退预览。
+    openLocalFileInBrowser(this: any, path: string) {
+      const url = toFileUrl(path);
+      if (!url) {
+        void this.openFilePreview(path);
+        return;
+      }
+      this.browserNavRequest = { url, path };
+      this.browserNavNonce += 1;
+      this.openRightPanelTab('browser');
+    },
+
+    // markdown 在右栏浏览器里按阅读样式打开：浏览器直接打开 .md 只显示源码文本，
+    // 所以先用与消息气泡同一套渲染器生成预览 HTML，经桥落盘（core.web_preview）
+    // 后再交浏览器打开。任一环节不可用（缺桥 / 读文件失败 / 落盘失败）都回退
+    // 源码预览弹窗，不静默失败。
+    async openMarkdownInRightPanel(this: any, path: string) {
+      const api = this._api();
+      if (!api || typeof api.read_file_preview !== 'function'
+        || typeof api.write_preview_page !== 'function') {
+        await this.openFilePreview(path);
+        return;
+      }
+      try {
+        const res = await api.read_file_preview(path);
+        if (!res || !res.ok || typeof res.content !== 'string') {
+          await this.openFilePreview(path);
+          return;
+        }
+        const name = path.split(/[\\/]/).pop() || path;
+        const page = buildMarkdownPreviewHtml(res.content, path, name);
+        const written = await api.write_preview_page(page, path);
+        if (!written || !written.ok || !written.path) {
+          await this.openFilePreview(path);
+          return;
+        }
+        this.openLocalFileInBrowser(String(written.path));
+      } catch {
+        await this.openFilePreview(path);
+      }
+    },
+
+    // 本地文件在右栏显示的统一入口（对话正文 / 文件树的点击分流）：
+    // html / pdf 直接交给内嵌浏览器（pdf 走 WebView2 内置查看器）；md 先渲染成
+    // 预览页；其它类型回退源码预览弹窗。
+    async openInRightPanel(this: any, path: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      if (isMarkdownFilePath(target)) {
+        await this.openMarkdownInRightPanel(target);
+        return;
+      }
+      this.openLocalFileInBrowser(target);
+    },
+
+    // 把任意页签开进指定会话的右面板（会话归属）：当前会话直接开；其他会话只
+    // 写入其 runtime（含展开态），不抢当前界面——切回该会话时页签随之出现。
+    // 供「run 归属会话」的电脑操控页签等使用：run 在 A 会话启动、用户正看 B
+    // 会话时，操控页签应写进 A 的 runtime，不能把 B 的页签集写脏。
+    openRightPanelTabForSession(this: any, sessionName: string, tab: RightPanelTabId, opts?: { expand?: boolean }) {
+      if (!sessionName || sessionName === this.currentSessionName) {
+        this.openRightPanelTab(tab, opts);
+        return;
+      }
+      const runtime = this._getSessionRuntime(sessionName);
+      const tabs: RightPanelTabId[] = runtime.rightPanelTabs
+        ? (runtime.rightPanelTabs as string[]).filter(
+            (t: string): t is RightPanelTabId => RIGHT_PANEL_TAB_IDS.has(t as RightPanelTabId),
+          )
+        : [];
+      if (!tabs.includes(tab)) tabs.push(tab);
+      runtime.rightPanelTabs = tabs;
+      runtime.rightPanelActiveTab = tab;
+      if (opts?.expand !== false) runtime.rightPanelExpanded = true;
+    },
+
+    // 执行条“详情”：记录目标任务并打开后台任务页签（nonce 每次自增，
+    // 同一任务重复点击也能从其他页签切回）
+    openBackgroundTaskDetail(this: any, taskId: string) {
+      if (!taskId) return;
+      this.bgTaskDetailId = taskId;
+      this.bgTaskOpenNonce += 1;
+      this.openRightPanelTab('tasks');
+    },
+
+    // 子代理卡片"查看"按钮：记录目标任务 id 并打开子代理页签
+    // （nonce 每次自增，同一任务重复点击也能从其他页签切回）
+    openSubagentDetail(taskId: string) {
+      if (!taskId) return;
+      this.subagentDetailId = taskId;
+      this.subagentOpenNonce += 1;
+      this.openRightPanelTab('subagent');
+    },
+
+    // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
+    toggleTerminalPanel() {
+      this.terminalPanelOpen = !this.terminalPanelOpen;
+      try {
+        if (this.terminalPanelOpen) {
+          localStorage.setItem(TERMINAL_PANEL_OPEN_KEY, '1');
+        } else {
+          localStorage.removeItem(TERMINAL_PANEL_OPEN_KEY);
+        }
+      } catch { /* 存储不可用时仅本次会话生效 */ }
+    },
+
+    setTerminalPanelHeight(height: number) {
+      this.terminalPanelHeight = Math.round(
+        Math.min(TERMINAL_PANEL_MAX_HEIGHT, Math.max(TERMINAL_PANEL_MIN_HEIGHT, height))
+      );
+      try {
+        localStorage.setItem(TERMINAL_PANEL_HEIGHT_KEY, String(this.terminalPanelHeight));
+      } catch { /* 忽略 */ }
+    },
+
+    /** 确保后端常驻 shell 存在（首次打开面板或上次进程退出后调用） */
+    async ensurePtyTerminal(cols: number, rows: number): Promise<{ ok: boolean; cwd?: string; reused?: boolean; msg?: string }> {
+      const api = this._ptyApi();
+      if (!api?.pty_terminal_ensure) return { ok: false, msg: '后端桥未就绪' };
+      try {
+        const res = await api.pty_terminal_ensure(cols, rows);
+        if (res && res.ok === false && res.msg) {
+          this.notifyChatLocal(`终端启动失败：${res.msg}`, 'notice');
+        }
+        return res || { ok: false, msg: '未知错误' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async ptyTerminalWrite(text: string) {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_write) {
+        try { await api.pty_terminal_write(text); } catch { /* 输入丢弃即可 */ }
+      }
+    },
+
+    async ptyTerminalResize(cols: number, rows: number) {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_resize) {
+        try { await api.pty_terminal_resize(cols, rows); } catch { /* 下次 resize 再试 */ }
+      }
+    },
+
+    async ptyTerminalKill() {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_kill) {
+        try { await api.pty_terminal_kill(); } catch { /* 忽略 */ }
+      }
     },
 
     async _resyncAuthoritativeGuiTheme(this: any, failure: GuiThemeFailure): Promise<GuiThemeFailure> {
@@ -1197,12 +1682,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean) {
+    _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean, guiThemeId: string | undefined) {
       if (rootStyle === null) document.documentElement.removeAttribute('style');
       else document.documentElement.setAttribute('style', rootStyle);
       // light 类在 html 与 body 上成对维护（见 runtime.applyGuiTheme）
       document.documentElement.classList.toggle('light', light);
       document.body.classList.toggle('light', light);
+      // 主题身份钩子（data-gui-theme-id，主题专属 CSS 的作用域）随快照一起回滚：
+      // 候选主题的原生标题栏桥失败时若不回滚该属性，html 上停留的是候选主题的 id，
+      // 与 store.guiTheme（旧主题）不一致，旧主题会被候选主题的皮肤 CSS 染色。
+      if (guiThemeId === undefined) delete document.documentElement.dataset.guiThemeId;
+      else document.documentElement.dataset.guiThemeId = guiThemeId;
     },
 
     async _applyGuiThemeCandidate(
@@ -1216,6 +1706,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       const previousHandle = this._appliedGuiTheme as AppliedTheme | null;
       const previousRootStyle = document.documentElement.getAttribute('style');
       const previousLight = document.body.classList.contains('light');
+      const previousGuiThemeId = document.documentElement.dataset.guiThemeId;
       let candidateHandle: AppliedTheme;
       try {
         candidateHandle = await applyGuiTheme(theme, api);
@@ -1228,7 +1719,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const result = await api.preview_native_titlebar(theme.native_titlebar);
           if (!result.ok) {
             candidateHandle.dispose();
-            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
             const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
             if (!rollback.ok) return rollback;
             return result;
@@ -1238,7 +1729,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const result = await api.restore_native_titlebar();
           if (!result.ok) {
             candidateHandle.dispose();
-            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
             const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
             if (!rollback.ok) return rollback;
             return result;
@@ -1247,7 +1738,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
       } catch (error) {
         candidateHandle.dispose();
-        this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+        this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
         const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
         if (!rollback.ok) return rollback;
         return guiThemeFailure(error, 'native_titlebar');
@@ -1644,12 +2135,18 @@ navItems: [] as Array<{ id: number; preview: string }>,
       scope: 'all' | 'title' | 'content' = 'all',
       workdir?: string,
       limit: number = 30,
+      includeArchived: boolean = false,
     ) {
       const api = this._api();
       if (!api || !api.search_sessions_full) {
         return { ok: false, total: 0, results: [], msg: '后端未就绪' };
       }
       try {
+        // include_archived 只在开启时作为第 5 个参数透传：默认路径保持原有 4 参
+        // 签名，归档前行为与旧后端完全不变。
+        if (includeArchived) {
+          return await api.search_sessions_full(query, scope, workdir, limit, true);
+        }
         return await api.search_sessions_full(query, scope, workdir, limit);
       } catch (err: any) {
         console.error('search_sessions_full 失败:', err);
@@ -1677,6 +2174,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         await finishSplash();
         return;
       }
+      this.bridgeReady = true;
       // 星轨自动化：启动时主动拉一次任务快照（引擎启动推送可能早于页面就绪被丢弃）
       void this.refreshAutomations();
       this.themeLight = document.body.classList.contains('light');
@@ -1713,7 +2211,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 人设设置：智能体显示名与对用户的称呼（启动快照随 init 一起下发）
         const personaInit = (init as any).persona_settings;
         if (personaInit && typeof personaInit === 'object') {
-          this.agentName = String(personaInit.agent_name || '星瑶');
+          this.personaAgentName = String(personaInit.agent_name || '星瑶');
+          this.agentName = this.personaAgentName;
           this.userTitle = String(personaInit.user_title || '');
           this.syncDocumentTitle();
         }
@@ -1793,6 +2292,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.connected = true;
         // 启动后静默检查更新（不打扰用户）
         this.checkUpdate(false);
+        // 启动自动恢复的会话可能是秘书会话：显示名以桥上的「当前生效名」为准
+        // （拉不到时内部回落设置页名字，不打断启动流程）
+        void this.refreshActiveAgentName();
       } catch (err) {
         this.connected = false;
         this.notifyModal('连接失败', '后端连接失败：' + err);
@@ -1904,6 +2406,21 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 按模型名预览思考能力（新增/改名时用）：仅查询不落库，
+    // 失败或异常一律返回 null，由调用方跳过更新，不弹提示打扰用户
+    async getReasoningSnapshotByName(modelName: string) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_reasoning_snapshot_by_name(modelName);
+        if (res && res.ok) return res.reasoning;
+        return null;
+      } catch (err) {
+        this.connected = false;
+        return null;
+      }
+    },
+
     async setPermissionMode(mode: PermissionMode) {
       const prev = this.permissionMode;
       const api = this._api();
@@ -1959,6 +2476,71 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // ---- 飞书集成（设置 → 飞书集成）----
+
+    async refreshFeishuSettings() {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const result = await api.get_feishu_settings();
+        if (result && result.ok && result.settings) {
+          this.feishuSettings = result.settings;
+          return result.settings;
+        }
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('飞书集成', '加载飞书设置失败: ' + err);
+        return null;
+      }
+    },
+
+    /** 保存飞书设置；app_secret 留空表示不修改已有密钥 */
+    async saveFeishuSettings(payload: {
+      enabled: boolean;
+      app_id: string;
+      app_secret?: string;
+      approvers: string[];
+      notify_chat_id: string;
+    }): Promise<{ ok: boolean; msg: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥接不可用' };
+      try {
+        const result = await api.set_feishu_settings(payload);
+        if (result && result.ok) {
+          if (result.settings) this.feishuSettings = result.settings;
+          return { ok: true, msg: '' };
+        }
+        return { ok: false, msg: (result && result.msg) || '保存失败' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    /** 按需取 app_secret 明文（仅用户点「显示」时调用） */
+    async revealFeishuSecret(): Promise<string> {
+      const api = this._api();
+      if (!api) return '';
+      try {
+        const result = await api.get_feishu_secret();
+        return result && result.ok ? String(result.app_secret || '') : '';
+      } catch {
+        return '';
+      }
+    },
+
+    /** 测试连接：用传入凭据或已保存凭据请求飞书长连接接入点 */
+    async testFeishuConnection(appId: string, appSecret: string): Promise<{ ok: boolean; msg: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥接不可用' };
+      try {
+        const result = await api.test_feishu_connection(appId, appSecret);
+        return { ok: !!(result && result.ok), msg: (result && result.msg) || '' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
     async refreshSystemSettings() {
       const api = this._api();
       if (!api) return null;
@@ -1976,9 +2558,72 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 人设设置（名称/称呼）保存后即时同步全局显示；快照由 PersonaSettings 页传入
     applyPersonaSettings(snapshot: { agent_name?: string; user_title?: string }) {
       if (!snapshot || typeof snapshot !== 'object') return;
-      if (snapshot.agent_name) this.agentName = String(snapshot.agent_name);
+      if (snapshot.agent_name) {
+        this.personaAgentName = String(snapshot.agent_name);
+        this.agentName = this.personaAgentName;
+      }
       this.userTitle = String(snapshot.user_title || '');
       this.syncDocumentTitle();
+      // 秘书会话显示的是秘书名，不吃设置页名字：这时要多问一次桥把名字换回来
+      // （普通会话 / 草稿会话新名字就是生效名，不必多打一次后端）
+      if (this._isSecretarySession(this.currentSessionName)) void this.refreshActiveAgentName();
+    },
+
+    /** 统一改写生效显示名：agentName 与窗口标题同步，避免两处文案分叉 */
+    _applyAgentName(name: string) {
+      if (!name) return;
+      this.agentName = name;
+      this.syncDocumentTitle();
+    },
+
+    // 刷新「当前会话生效名」：秘书会话是桥上的秘书名，其余会话是设置页名字。
+    // 任何异常 / 旧后端没有该方法 / 返回空都静默回落设置页名字——显示名只是
+    // 展示层，绝不能因为它失败而打断切换会话、建会话这些主流程。
+    async refreshActiveAgentName() {
+      // 草稿会话（尚未落库）：后端当前会话还停在上一个真实会话上，此刻问桥
+      // 会把上一个会话（可能是秘书）的名字搬进来，故直接按普通会话呈现
+      if (!this.currentSessionName) {
+        this._applyAgentName(this.personaAgentName);
+        return;
+      }
+      // 静默取桥：刷新动作可能在启动早期（bridgeReady 之前）被触发，
+      // _api() 缺桥时会弹「连接失败」，为此弹窗不值得
+      const api = (window.pywebview && window.pywebview.api) as PyWebViewAPI | null;
+      if (!api || typeof api.get_active_agent_name !== 'function') {
+        this._applyAgentName(this.personaAgentName);
+        return;
+      }
+      const sessionAtCall = this.currentSessionName;
+      try {
+        const res = await api.get_active_agent_name();
+        // 竞态：在途期间用户可能已切走，过期名字不覆盖当前会话的显示名
+        if (this.currentSessionName !== sessionAtCall) return;
+        const name = res && typeof res === 'object' ? String(res.agent_name || '') : '';
+        this._applyAgentName(name || this.personaAgentName);
+      } catch (err) {
+        console.error('刷新当前会话生效名失败:', err);
+        this._applyAgentName(this.personaAgentName);
+      }
+    },
+
+    /** 在当前分组树里定位会话条目；返回 { session, group }，找不到返回 null */
+    _findSessionEntry(sessionName: string): { session: any; group: any } | null {
+      if (!sessionName) return null;
+      for (const g of this.sessionGroups || []) {
+        const hit = (g.sessions || []).find((s: any) => s && s.name === sessionName);
+        if (hit) return { session: hit, group: g };
+      }
+      return null;
+    },
+
+    // 会话是否属于「秘书」：条目自带的 secretary_name（后端对秘书会话都会带，
+    // 未命名回落「秘书」）与分组标记 is_secretary 任一命中即为真——历史遗留的
+    // 未命名会话靠分组标记兜底，避免被当成普通会话改了 session_name
+    _isSecretarySession(sessionName: string): boolean {
+      const hit = this._findSessionEntry(sessionName);
+      if (!hit) return false;
+      if (hit.group && (hit.group as any).is_secretary) return true;
+      return typeof hit.session.secretary_name === 'string';
     },
 
     // 页面标题跟随智能体显示名（webview/浏览器预览均可见；默认名时保持 星瑶Code 简洁形态）
@@ -2070,6 +2715,27 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.systemSettings = previous;
         this.connected = false;
         this.notifyModal('系统设置', '单任务最大模型轮次设置失败: ' + err);
+        return false;
+      }
+    },
+
+    async setContextWatermarkBase(value: number): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_context_watermark_base(value);
+        if (result && result.ok) {
+          this.systemSettings = result.settings;
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + err);
         return false;
       }
     },
@@ -2394,8 +3060,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.sessionSwitching = !runtime.running && runtime.messages.length === 0;
 
       const api = this._api();
-      // 后端不可用时不能残留加载态
-      if (!api) { this.sessionSwitching = false; return; }
+      // 后端不可用时不能残留加载态；显示名只用本地分组树兜底（秘书会话取条目里
+      // 的秘书名），同样不能停在上一个会话的名字上
+      if (!api) {
+        this.sessionSwitching = false;
+        const hit = this._findSessionEntry(sessionName);
+        const localName = hit && hit.session.secretary_name
+          ? String(hit.session.secretary_name)
+          : this.personaAgentName;
+        this._applyAgentName(localName);
+        return;
+      }
       // 模型版本快照：响应在途期间用户若又切了模型（setModel 递增版本），
       // 后端响应携带的是切换前的旧模型快照，不再覆盖本地选择
       const modelVersion = this._sessionModelVersion[sessionName] || 0;
@@ -2493,6 +3168,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const runtimePerm = this._getSessionRuntime(sessionName);
           runtimePerm.permMode = res.permission_mode;
         }
+
+        // 生效显示名随会话走：秘书会话显示秘书名，普通会话回到设置页名字
+        // （不 await：显示名刷新失败不能拖住会话切换，内部自带回落）
+        void this.refreshActiveAgentName();
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
@@ -2509,8 +3188,24 @@ navItems: [] as Array<{ id: number; preview: string }>,
 
     // 历史分页懒加载：滚动到顶触发，向前翻一页并 prepend 到消息流头部。
     // 守卫（无更多/加载中/无游标/后端不可用）与竞态丢弃（在途切会话）必须保持。
-    async loadOlderMessages() {
-      if (!this.historyHasMore || this.historyLoading || !this.historyOldestId) return;
+    // force=true（红点跨页跳转通道）：跳过 historyHasMore 入口守卫。该标记随
+    // 会话 runtime 保存/恢复，可能是过期值或被失败响应清空的坏值——一旦为
+    // false 而游标其实还有更早历史，onNavJump 的「无进展」判定会立刻 break，
+    // 表现为点未加载区红点没反应/落点不对（1.3.6 改过循环终止判定，漏了这里）。
+    // force 时交后端用游标裁决；historyLoading 重入保护保留（并发翻页仍需挡）。
+    async loadOlderMessages(force: boolean = false) {
+      // 游标自愈：has_more=false 且游标为空，是「分页状态从未初始化 / 被失败响应
+      // 清空」的特征——真到最早时后端会带回非空 oldest_id。不修的话守卫会永久
+      // 短路：滚到顶不加载更早消息、点未加载红点没反应，而且这份坏状态会随会话
+      // 保存/恢复，切走再切回依然失效（用户反馈过「怎么都无法加载到最上面」）。
+      // 兜底口径：用已加载消息流里最旧的 _msg_id 当游标，交后端裁决是否还有更早。
+      if (!this.historyOldestId) {
+        const oldestLoaded = (this.messages as any[]).find(m => typeof m?._msg_id === 'number');
+        if (!oldestLoaded) return;
+        this.historyOldestId = oldestLoaded._msg_id as number;
+        this.historyHasMore = true;
+      }
+      if ((!this.historyHasMore && !force) || this.historyLoading) return;
       const api = this._api();
       if (!api || typeof (api as any).load_older_messages !== 'function') return;
       const sessionAtCall = this.currentSessionName;
@@ -2525,6 +3220,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.historyHasMore = !!res.has_more;
           this.historyOldestId = res.oldest_id ?? null;
         }
+        // res.ok === false（读库失败等）：保持原分页状态不变，下次滚动/跳转自动重试；
+        // 绝不写成「没有更早历史」，否则翻页会被永久关掉
       } catch (err) {
         this.notifyChat('加载更早历史失败: ' + err);
       } finally {
@@ -2651,6 +3348,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.workdir = '';
       this.fileTree = [];
       this.fileTreeExpanded = [];
+      // 新对话是普通会话：生效名回到设置页名字（草稿态尚未落库，问桥会拿回
+      // 上一个会话的名字，故 refreshActiveAgentName 内部对草稿直接走回落）
+      void this.refreshActiveAgentName();
     },
 
     // 顶栏“新会话”按钮：跟随当前上下文——在项目中就在该项目新建，
@@ -2701,6 +3401,78 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.fileTreeExpanded = [];
         this.loadFileTreeInBackground('', targetWorkdir);
       }
+      // 同 createGlobalSession：新会话（草稿态）的生效名回到设置页名字
+      void this.refreshActiveAgentName();
+    },
+
+    // 秘书会话：后端建会话时立即落库并切为当前会话（不存在草稿态），所以这里
+    // 不能复用 createGlobalSession 的懒创建分支，要按 switchSession 的口径把
+    // 会话级状态整体复位到返回的 session_name 上（旧会话状态先由
+    // _captureCurrentRuntime 存回它自己的 runtime）。
+    // 名字必填：它是这个秘书的身份标识（显示名 + 提示词自称），没有名字就只能
+    // 落一个既无名又已切走的会话。前端先做可见校验、非法值不发请求且不截断
+    // （后端 validate_secretary_name 会二次校验并回 ok:false）。
+    async createSecretarySession(name: string) {
+      const normalized = (name || '').trim();
+      // 用码点计数与后端 len() 对齐：emoji 这类代理对不会被算成两个字符
+      const nameLength = [...normalized].length;
+      if (!normalized) {
+        this.notifyModal('新建秘书会话', '请先给这位秘书起个名字（1-20 个字符）');
+        return;
+      }
+      if (nameLength > SECRETARY_NAME_MAX_LEN) {
+        this.notifyModal(
+          '新建秘书会话',
+          `秘书名字最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${nameLength} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return; // _api() 缺桥时已弹「连接失败」，这里不再二次打扰
+      try {
+        // 标题固定「新会话」：侧栏与欢迎页显示的都是秘书名（后端 display_name），
+        // 会话名（session_xxx）不参与命名，这里不需要用户可见的会话标题
+        const res = await api.create_secretary_session('新会话', normalized);
+        if (!res || !res.ok) {
+          // 建会话是用户显式动作：失败必须可见，不做静默降级
+          this.notifyModal('新建秘书会话', (res && res.msg) || '创建失败');
+          return;
+        }
+        // 新会话意味着回到聊天视图：子页面打开时也要收起，否则状态已切换但
+        // 界面停在子页（表现为"点了没反应"），与 createGlobalSession 同口径
+        this.subpage.show = false;
+        this._captureCurrentRuntime();
+        // 已落库的真实会话：清掉草稿工作区标记，避免首条消息再走"草稿落库"分支
+        this.pendingWorkdir = null;
+        // 权限确认框属于上一个会话，新会话不该继承它（switchSession 按会话名判定同口径）
+        this.permRequest.show = false;
+        this.currentSessionName = res.session_name;
+        // 显示名优先用秘书名：侧栏条目、欢迎页、对话头部都读它
+        this.currentSessionDisplayName = String(res.secretary_name || res.display_name || normalized);
+        this._bindSessionRuntime(res.session_name);
+        this.messages = [];
+        this.currentStreamingText = '';
+        this.currentThinkingText = '';
+        this.subagentTasks = [];
+        this.planData = { title: '', items: [], progress: 0 };
+        this.tokenUsage = emptyTokenUsage();
+        this.running = false;
+        // 新会话不是"历史加载中"：显式清除切换加载态
+        this.sessionSwitching = false;
+        this._captureRuntime(res.session_name);
+        // 秘书会话固定 workdir=GLOBAL：按「对话」工作区呈现，不加载文件树
+        this.workdir = '';
+        this.currentWorkdirLabel = '对话';
+        this.fileTree = [];
+        this.fileTreeExpanded = [];
+        // 后端已落库：用最新分组树重建列表，新会话立刻出现在秘书分组里
+        await this.refreshSessions();
+        // 生效名以后端为准（会话已切过去、秘书名已落库），与侧栏显示同一来源
+        await this.refreshActiveAgentName();
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('新建秘书会话', '创建失败: ' + err);
+      }
     },
 
     async exitWorkspaceToGlobal() {
@@ -2726,7 +3498,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
 
     async deleteFolderGroup(workdir: string, folderTitle: string) {
-      // 确认动作已内联在分组头的红色小按钮上，不再弹大确认窗；
+      // 调用方（侧栏分组头 ✕）已用 askConfirm 弹窗完成二次确认；
       // 后端 delete_folder_group 会连同组内对话记录一起删除（不动磁盘文件）
       const api = this._api();
       if (!api) return;
@@ -2762,6 +3534,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           // 排队消息随会话删除一并清理（后端已同步清空，此处防快照事件丢失残留）
           delete this.messageQueues[sessionName];
           delete this.sessionRuntimeByName[sessionName];
+          // 归档区行内删除同样走这里：归档会话不在 sessionGroups 中，
+          // 故单独摘除并刷新归档列表，避免已删除的条目残留在「已归档」区
+          this.archivedSessions = this.archivedSessions.filter(s => s.name !== sessionName);
+          void this.loadArchivedSessions();
           if (sessionName === this.currentSessionName && res.current_session) {
             await this.switchSession(res.current_session, '新会话');
           }
@@ -2781,8 +3557,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 但事件在重连窗口期可能丢失（emit 失败后端也不改判成功），故此处按 res.name 兜底迁移。
     async renameSession(oldName: string, newName: string) {
       const target = (newName || '').trim();
-      // 空白名或与原会话名相同视为无改动，不发请求
-      if (!target || target === oldName) return;
+      // 空白名视为无改动，不发请求
+      if (!target) return;
+      // 秘书会话改的是「秘书名」（secretary_name），不是会话名：先分流。
+      // 秘书名与 session_xxx 永不相等，混在下面「与旧名相同」的判断里虽然不会
+      // 误伤，但两者语义完全不同，分开更不容易埋坑
+      if (this._isSecretarySession(oldName)) return this.renameSecretarySession(oldName, target);
+      // 与原会话名相同视为无改动，不发请求
+      if (target === oldName) return;
       const api = this._api();
       if (!api) return;
       try {
@@ -2800,6 +3582,226 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
+    // 秘书会话改名（右键「重命名」入口，目标为秘书会话时由 renameSession 分流到此）。
+    // 只改后端的 secretary_name：session_name 仍是建会话时生成的 session_xxx，
+    // 所以消息 / 摘要 / 快照 / 侧栏高亮的键都不需要迁移，与普通会话重命名口径不同。
+    async renameSecretarySession(sessionName: string, newName: string) {
+      const target = (newName || '').trim();
+      if (!target) {
+        this.notifyModal('会话管理', '秘书名字不能为空（1-20 个字符）');
+        return;
+      }
+      if ([...target].length > SECRETARY_NAME_MAX_LEN) {
+        this.notifyModal(
+          '会话管理',
+          `秘书名字最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${[...target].length} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.rename_secretary_session(sessionName, target);
+        if (res && res.ok) {
+          // 后端回带最新分组树（条目里的秘书名已更新），直接覆盖同步
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else void this.refreshSessions();
+          // 改的是当前会话时还要刷新生效名：侧栏条目已变，欢迎页 / 对话头部
+          // 读的是 store.agentName，漏掉会出现"侧栏已改名、页面还叫旧名"
+          if (this.currentSessionName === sessionName) {
+            this.currentSessionDisplayName = String(res.secretary_name || res.display_name || target);
+            await this.refreshActiveAgentName();
+          }
+        } else {
+          this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
+    // 加载归档会话列表（设置页「会话归档」分区数据源）。
+    // 旧后端 / 纯浏览器预览没有该方法时静默保持现状，不弹连接失败框。
+    async loadArchivedSessions() {
+      const api = (window.pywebview && window.pywebview.api) as PyWebViewAPI | null;
+      if (!api || typeof api.get_archived_sessions !== 'function') return;
+      const seq = ++this.archivedSessionsReqSeq;
+      try {
+        const list = await api.get_archived_sessions();
+        if (seq !== this.archivedSessionsReqSeq) return;
+        if (Array.isArray(list)) this.archivedSessions = list;
+      } catch (err) {
+        // 静默失败：归档区不是主路径，下一次归档动作/事件到达时会重新拉取
+        console.error('加载归档会话失败:', err);
+      }
+    },
+
+    /** 取会话的展示名（归档 / 取消归档的反馈文案用；查不到时退回会话名） */
+    _sessionDisplayName(sessionName: string): string {
+      const hit = this.sessionGroups
+        .flatMap(g => g.sessions || [])
+        .find(s => s.name === sessionName);
+      if (hit && hit.display_name) return hit.display_name;
+      const archived = this.archivedSessions.find(s => s.name === sessionName);
+      return (archived && archived.display_name) || sessionName;
+    },
+
+    // 归档会话（侧栏行内 ⤓ 入口）。入口侧已改为行内二次确认（点确认才真正归档），
+    // 成功后与删除一致静默完成——会话从列表消失、归档区出现即是反馈，不再弹提示框。
+    // 后端 session_archived 事件在重连窗口期可能丢失，故按返回值/主动刷新兜底，
+    // 不做乐观更新（失败时保持原状）。
+    async archiveSession(sessionName: string) {
+      const api = this._api();
+      if (!api || !sessionName) return false;
+      // 归档与「禁止删除当前活跃会话」同源的保护：归档态会话正在被使用是自相矛盾的状态
+      if (sessionName === this.currentSessionName) {
+        this.notifyModal('会话归档', '不能归档当前活跃会话，请先切换到其它会话');
+        return false;
+      }
+      try {
+        const res = await api.archive_session(sessionName);
+        if (res && res.ok) {
+          if (Array.isArray(res.sessions)) {
+            this.sessionGroups = res.sessions;
+          } else {
+            // 桥接方法不回传列表时本地摘除，避免「已归档却仍在主列表」的中间态
+            this.sessionGroups = this.sessionGroups.map(g => ({
+              ...g,
+              sessions: (g.sessions || []).filter(s => s.name !== sessionName),
+            }));
+          }
+          if (Array.isArray(res.archived_sessions)) {
+            this.archivedSessions = res.archived_sessions;
+          } else {
+            await this.loadArchivedSessions();
+          }
+          // 归档成功静默完成：入口侧的二次确认已表明意图，列表刷新即为反馈
+          return true;
+        }
+        this.notifyModal('会话归档', '归档失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '归档失败: ' + err);
+        return false;
+      }
+    },
+
+    // 取消归档（归档区行内 ↩ 入口）：会话恢复回主列表。同样可逆、不弹确认框。
+    async unarchiveSession(sessionName: string) {
+      const api = this._api();
+      if (!api || !sessionName) return false;
+      const display = this._sessionDisplayName(sessionName);
+      try {
+        const res = await api.unarchive_session(sessionName);
+        if (res && res.ok) {
+          if (Array.isArray(res.archived_sessions)) {
+            this.archivedSessions = res.archived_sessions;
+          } else {
+            this.archivedSessions = this.archivedSessions.filter(s => s.name !== sessionName);
+            await this.loadArchivedSessions();
+          }
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else await this.refreshSessions();
+          this.notifyModal('会话归档', `已取消归档「${display}」，已恢复到会话列表`);
+          return true;
+        }
+        this.notifyModal('会话归档', '取消归档失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '取消归档失败: ' + err);
+        return false;
+      }
+    },
+
+    /** 批量归档操作的结果收尾：采用后端回传的两侧快照，缺省时主动刷新兜底 */
+    _applyArchiveBatchLists(res: ArchiveBatchResult | null | undefined) {
+      if (!res) return;
+      if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+      else void this.refreshSessions();
+      if (Array.isArray(res.archived_sessions)) this.archivedSessions = res.archived_sessions;
+      else void this.loadArchivedSessions();
+    },
+
+    // 批量取消归档（设置页归档区多选恢复）：与单条 unarchiveSession 同语义（可逆、
+    // 幂等、不弹确认框），差别只在一次桥接处理多个会话、只弹一次结果提示。
+    // 返回本次成功恢复的会话名数组；失败项不回传，调用方据此保留这些行的勾选。
+    async batchUnarchiveSessions(sessionNames: string[]): Promise<string[]> {
+      const api = this._api();
+      const names = (sessionNames || []).filter(n => !!n);
+      if (!api || !names.length) return [];
+      try {
+        const res = await api.unarchive_sessions(names);
+        if (!res || !res.ok) {
+          this.notifyModal('会话归档', '批量恢复失败: ' + (res && res.msg ? res.msg : '未知错误'));
+          return [];
+        }
+        this._applyArchiveBatchLists(res);
+        const done = Array.isArray(res.names) ? res.names : [];
+        const failed = Array.isArray(res.failed) ? res.failed : [];
+        this.notifyModal(
+          '会话归档',
+          failed.length
+            ? `已恢复 ${done.length} 个会话，${failed.length} 个失败：${failed.map(f => f.msg || f.name).join('；')}`
+            : `已恢复 ${done.length} 个会话到会话列表`,
+        );
+        return done;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '批量恢复失败: ' + err);
+        return [];
+      }
+    },
+
+    // 批量删除归档会话（设置页归档区多选删除）：二次确认由调用方（设置页）负责，
+    // 这里只落盘并同步本地状态。返回本次真正删除的会话名数组。
+    async batchDeleteArchivedSessions(sessionNames: string[]): Promise<string[]> {
+      const api = this._api();
+      const names = (sessionNames || []).filter(n => !!n);
+      if (!api || !names.length) return [];
+      try {
+        const res = await api.delete_archived_sessions(names);
+        const done = res && res.ok && Array.isArray(res.names) ? res.names : [];
+        if (!done.length) {
+          const failed = res && Array.isArray(res.failed) ? res.failed : [];
+          const reason = failed.length
+            ? failed.map(f => f.msg || f.name).join('；')
+            : (res && res.msg ? res.msg : '未知错误');
+          this.notifyModal('会话管理', '批量删除失败: ' + reason);
+          // 一项都没删掉时列表可能已被别的入口改动，仍刷新一次兜底
+          void this.loadArchivedSessions();
+          return [];
+        }
+        this._applyArchiveBatchLists(res);
+        // 逐个清理前端运行态残留（照 deleteSingleSession 的 T11 修复：否则
+        // runningSessions / sessionRuntimeByName 里留下已删会话的孤儿条目）
+        done.forEach(name => {
+          this.runningSessions = this.runningSessions.filter(s => s !== name);
+          this.queuedSessions = this.queuedSessions.filter(s => s !== name);
+          delete this.messageQueues[name];
+          delete this.sessionRuntimeByName[name];
+        });
+        // 极端并发下删到了当前活跃会话：后端已补建 GLOBAL 会话，跟随切换
+        if (res && res.current_session && done.includes(this.currentSessionName)) {
+          await this.switchSession(res.current_session, '新会话');
+        }
+        const failed = Array.isArray(res.failed) ? res.failed : [];
+        if (failed.length) {
+          this.notifyModal(
+            '会话管理',
+            `已删除 ${done.length} 个归档会话，${failed.length} 个失败：${failed.map(f => f.msg || f.name).join('；')}`,
+          );
+        }
+        return done;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '批量删除失败: ' + err);
+        return [];
       }
     },
 
@@ -3149,6 +4151,23 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 会话 token 弹层数据：每次打开都重拉（面板是瞬时视图，不做增量维护）
+    async loadTokenUsageOverview(limit = 20) {
+      const api = this._api();
+      if (!api) return null;
+      this.tokenUsageOverviewLoading = true;
+      try {
+        const result = await api.get_token_usage_overview(limit);
+        if (result && result.ok) this.tokenUsageOverview = result;
+        return result;
+      } catch (err) {
+        console.error('加载会话 Token 概览失败:', err);
+        return null;
+      } finally {
+        this.tokenUsageOverviewLoading = false;
+      }
+    },
+
     // ── frameless 关闭确认（现代三选框） ──
     async _handleCloseRequested(this: any, hasRunningWork: boolean, trayAvailable: boolean) {
       const api = this._api();
@@ -3172,6 +4191,48 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (error) {
         console.warn('关闭确认执行失败', error);
         this.notifyModal('关闭失败', '窗口关闭失败：' + error);
+      }
+    },
+
+    /** 合并宿主回推的内嵌浏览器状态快照（字段强转，容忍缺省/多余字段） */
+    applyEmbeddedBrowserState(this: any, data: Record<string, unknown> | null | undefined) {
+      const src = (data || {}) as Record<string, unknown>;
+      const s = this.embeddedBrowser;
+      s.url = String(src.url ?? '');
+      s.title = String(src.title ?? '');
+      s.can_go_back = !!src.can_go_back;
+      s.can_go_forward = !!src.can_go_forward;
+      s.loading = !!src.loading;
+      s.ready = !!src.ready;
+      s.visible = !!src.visible;
+    },
+
+    /**
+     * 秘书调度台 open_session 桥事件处理：把界面带到后端已切好的目标会话。
+     *
+     * 视图切换复用用户点会话的那条路径（switchSession：丢弃 pending 草稿、
+     * 清流式态、按会话拉历史、恢复模型/权限/排队消息、刷新生效名），
+     * 这里只做「取载荷 + 兜底」两件事，不复制切换逻辑。
+     * 会话名缺失（后端解析异常 / 事件字段缺失）时静默记一条日志：跳转失败
+     * 不该弹窗、更不该让桥事件管线抛错。切换失败同理，只留日志。
+     */
+    async _handleOpenSessionEvent(event: BridgeEvent) {
+      // 载荷口径：后端信封是 {type, data}；个别来源可能用 {type, payload} 平铺
+      const raw = ((event as any).data ?? (event as any).payload ?? {}) as Record<string, unknown>;
+      const sessionName = String(raw.session_name || '').trim();
+      if (!sessionName) {
+        console.warn('[open_session] 桥事件缺少 session_name，已忽略本次跳转');
+        return;
+      }
+      const displayName = String(raw.display_name || '').trim();
+      try {
+        // 不传 workdir：目标是后端已存在的会话，其归属目录由后端权威副本决定
+        // （display_name 只在后端给了生效名时才覆盖本地兜底名）
+        await this.switchSession(sessionName, displayName || undefined);
+      } catch (err) {
+        // switchSession 内部已弹「切换会话失败」提示，这里只补一条静默日志，
+        // 绝不让异常冒泡回桥事件派发点
+        console.warn(`[open_session] 跳转到会话 ${sessionName} 失败:`, err);
       }
     },
 
@@ -3203,6 +4264,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (push) push(data);
         return;
       }
+      // 前端构建产物运行期更新（gui_main 的 dist watchdog 推送 fingerprint）：
+      // 触发「资源版本失配自愈」——等界面空闲时自动刷新到最新版本，
+      // 避免旧构建哈希 chunk 404（mermaid 等懒加载失败）；
+      // 不参与会话 runtime 归属，处理完直接返回
+      if (type === 'frontend_dist_updated') {
+        // 把后端 fingerprint（mtime:size）纳入判断：与上次触发刷新的指纹相同
+        // 说明构建并未真正更替，自愈模块会拦下重复刷新（防同一指纹反复整页重载）
+        const fingerprint = typeof data.fingerprint === 'string' ? data.fingerprint : undefined;
+        requestFrontendReload('dist-updated', fingerprint);
+        return;
+      }
       // frameless 自绘标题栏关闭请求：弹现代确认框（替代 win32 原生 MessageBox），
       // 不参与会话 runtime 归属逻辑，处理完直接返回
       if (type === 'close_requested') {
@@ -3212,6 +4284,42 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // frameless 最大化状态变更（原生双击/Snap/拖拽还原路径）：同步到 store
       if (type === 'window_maximize_state') {
         this.windowMaximized = !!data.maximized;
+        return;
+      }
+      // 内嵌浏览器状态推送（宿主 WebView2 控件的导航/标题/加载态回推）：
+      // 独立支路，不参与会话 runtime 归属，合并完直接返回
+      if (type === 'embedded_browser') {
+        this.applyEmbeddedBrowserState(data);
+        return;
+      }
+      // 内置浏览器自动化（星瑶经 CDP 驱动右侧面板浏览器）：携带项目分辨率，
+      // 面板切到浏览器页签并按该分辨率做适应窗口呈现（用户实时围观）。
+      // 独立支路，不参与会话 runtime 归属；页签按会话归属打开——
+      // A 会话发起的自动化不在当前查看的 B 会话抢屏
+      if (type === 'embedded_browser_automation') {
+        const width = Number(data.width);
+        const height = Number(data.height);
+        if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+          // 每次换新数组引用：相同分辨率再次下发时组件侧 watch 也能触发
+          this.embeddedBrowser.automationViewport = [width, height];
+          this.openBrowserTabForSession(String(data.session_name || this.currentSessionName || ''));
+        }
+        return;
+      }
+      // 秘书调度台跳转（系统层带用户去看某个会话）：后端 open_session 工具切换
+      // 当前会话后推本事件。视图切换一律复用 switchSession（清流式态、按会话拉
+      // 历史、刷新生效名），这里不另写一套；独立支路，不参与会话 runtime 归属，
+      // 处理完直接返回（切换过程是异步的，故 void 掉，内部自带兜底不抛）
+      if (type === 'open_session') {
+        void this._handleOpenSessionEvent(event);
+        return;
+      }
+      // 决策记录实时推送（JEV 每次决策落审计后由桥转发）：头部「决策」按钮
+      // 累加未读徽章，面板开着时按 tick 拉取刷新；独立支路，不参与会话
+      // runtime 归属，处理完直接返回
+      if (type === 'decision_recorded') {
+        this.decisionEventTick += 1;
+        this.decisionUnread += 1;
         return;
       }
       // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。
@@ -3247,7 +4355,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
       const targetRuntimeKey = eventSession || currentRuntimeKey;
       const switchedRuntime = targetRuntimeKey !== currentRuntimeKey;
-      if (switchedRuntime) this._bindSessionRuntime(targetRuntimeKey);
+      if (switchedRuntime) {
+        // 绑走前先快照当前会话：翻页 prepend 的历史、推进的分页游标等顶层
+        // 实时进度只在顶层、尚未入快照；直接绑走会被目标会话快照覆盖丢弃，
+        // finally 回绑时拿到旧快照——后台会话有事件到达时，用户刚翻上去的
+        // 历史被反复弹回、再也加载不出来（2026-10-15 用户反馈）。
+        this._captureRuntime(currentRuntimeKey, { skipLayout: true });
+        // 跨会话临时绑定只切换会话数据，不恢复目标会话布局：顶层布局保持
+        // 当前查看会话的实时状态，事件处理完在 finally 原样带回（否则目标
+        // 会话的布局快照会覆盖用户刚对面板做的开合/页签操作）
+        this._bindSessionRuntime(targetRuntimeKey, { skipLayout: true });
+      }
 
       try {
 
@@ -3554,7 +4672,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
             items,
             progress,
           };
-          this._captureRuntime(targetRuntimeKey);
+          // 事件中转捕获：跨会话事件跳过布局段（顶层布局仍属当前查看会话）
+          this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         }
       } else if (type === 'plan_item_handoff') {
         // 子 Agent 超时接管可见性：只更新本会话计划项的执行模式/owner，
@@ -3591,7 +4710,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
               ...patched,
             } as any);
           }
-          this._captureRuntime(targetRuntimeKey);
+          // 事件中转捕获：跨会话事件跳过布局段（顶层布局仍属当前查看会话）
+          this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         }
       } else if (type === 'user_message_images') {
         // 后端解析附件后补发的图片：挂到当前会话最后一条用户气泡上
@@ -3720,6 +4840,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
             }
           });
         });
+      } else if (type === 'session_archived' || type === 'session_unarchived' || type === 'session_deleted') {
+        // 归档态变化（多端同步，含归档区批量删除）：负载带最新两侧快照时直接采用；
+        // 缺失时主动刷新兜底。不做乐观增删——迟到的旧快照不得让已归档会话在主列表里「复活」。
+        if (Array.isArray(data.sessions)) this.sessionGroups = data.sessions;
+        else void this.refreshSessions();
+        if (Array.isArray(data.archived_sessions)) this.archivedSessions = data.archived_sessions;
+        else void this.loadArchivedSessions();
       } else if (type === 'turn_finish' || type === 'turn_idle') {
         this.running = false;
         this.streamingSpeed = 0;
@@ -3884,6 +5011,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
           stage: String(t.stage || ''),
           ...(t.stage_detail ? { stage_detail: String(t.stage_detail) } : {}),
           elapsed: Number(t.elapsed || 0),
+          ...(t.type ? { type: String(t.type) } : {}),
+          ...(t.background ? { background: true } : {}),
+          ...(Array.isArray(t.stages) ? {
+            stages: t.stages.map((s: any) => ({
+              name: String(s.name || ''),
+              at: Number(s.at) || 0,
+              detail: String(s.detail || ''),
+            })),
+          } : {}),
         }));
         target.subagent_tasks = snapshots;
         this.subagentTasks = snapshots;
@@ -3914,16 +5050,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const tid = String(data.task_id || '');
         const statusText = code === 0 ? '已完成' : `已结束（退出码 ${code}）`;
         this.notifyChatLocal(`后台任务 ${tid} ${statusText}`, 'notice', String(data.session_name || '') || undefined);
-      } else if (type === 'terminal_output') {
-        this.terminalOutput += data.text || '';
-        // 输出上限 200K 字符：超出后从头部截断，避免长任务把内存拖爆
-        if (this.terminalOutput.length > 200_000) {
-          this.terminalOutput = '…[输出过长，头部已截断]\n' + this.terminalOutput.slice(-160_000);
-        }
-      } else if (type === 'terminal_finished') {
-        this.terminalRunning = false;
-        const code = data.code;
-        this.terminalOutput += `\n[进程已退出，代码 ${code}]\n\n`;
+      } else if (type === 'pty_data') {
+        // 底部内嵌交互式终端：原始输出直接走 ptyBus 给 xterm，不进响应式状态
+        emitPtyData(String(data.text ?? ''));
+      } else if (type === 'pty_exit') {
+        emitPtyExit(Number(data.code ?? 0));
+      } else if (type === 'snip_attachment_ready') {
+        // 屏幕截图「发到输入框」（宿主 gui_snip_mixin.SnipBridgeMixin）：把
+        // 回传的图片路径加入当前会话输入框附件。与 pty_data 同约定——必须
+        // 接进本函数这条既有 type-if 链（window.onBridgeEvent 唯一赋值点），
+        // 另开通道等于绕开单消费者约定
+        void this._attachSnipToComposer(String(data.path || ''));
       } else if (type === 'update_download_progress') {
         this.updateState.status = 'downloading';
         this.updateState.downloadProgress = Number(data.percent) || 0;
@@ -3952,7 +5089,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
       }
       } finally {
-        this._captureRuntime(targetRuntimeKey);
+        // 同会话事件全量捕获（用户的面板开合由此落入快照）；跨会话事件
+        // 跳过布局段，避免把当前会话的实时布局写进目标会话的快照
+        this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         if (type === 'session_renamed' && data.old && data.new) {
           const oldKey = String(data.old);
           const newKey = String(data.new);
@@ -3962,7 +5101,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           }
           if (this.currentSessionName === newKey) this._bindSessionRuntime(newKey);
         } else if (switchedRuntime) {
-          this._bindSessionRuntime(currentRuntimeKey);
+          // 回绑只恢复会话数据（消息/流式/运行态等），不恢复面板布局：
+          // 用户在事件间隙对右面板做的开合是实时操作面，被旧快照回滚即
+          // "切换面板点了没反应/自动弹回"的根因
+          this._bindSessionRuntime(currentRuntimeKey, { skipLayout: true });
         }
       }
     },
@@ -4151,6 +5293,24 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 删除自定义 MCP 服务：从 mcp.json 移除配置，结果通过 mcp_status 事件回推
+    async removeMcpServer(name: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.remove_mcp_server(name);
+        if (res && res.ok) {
+          this.mcps = res.mcps || this.mcps;
+          this.notifyModal('MCP 服务', res.msg || '已删除');
+        } else {
+          this.notifyModal('MCP 服务', '删除失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('MCP 服务', '删除 MCP 服务失败: ' + err);
+      }
+    },
+
     async refreshPlugins() {
       const api = this._api();
       if (!api) return;
@@ -4172,6 +5332,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const res = await api.toggle_plugin(name, enabled);
         if (res && res.ok) {
           this.plugins = res.plugins || this.plugins;
+          // 插件启停会增删 provider 与模型（opencode_zen 启用时自举 provider、
+          // 禁用时按来源标记回收），只更新 plugins 会让模型列表停在旧快照，
+          // 用户必须重启星瑶才能看到变化。与 add_provider 同一模式：
+          // 后端回传 settings 就即时应用，模型选择器随开关立即刷新。
+          if (res.settings) this.applyModelSettings(res.settings);
           this.notifyModal('插件', res.msg || '插件状态已更新');
         } else {
           this.notifyModal('插件', '插件状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -4196,6 +5361,44 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('插件', '插件信任失败: ' + err);
+      }
+    },
+
+    // 插件设置页：页面快照由插件每次返回完整结构（服务端驱动），前端不做增量合并。
+    async loadPluginSettings(name: string): Promise<any> {
+      const api = this._api();
+      if (!api || typeof api.get_plugin_settings !== 'function') {
+        return { ok: false, msg: '当前版本不支持插件设置页' };
+      }
+      try {
+        return await api.get_plugin_settings(name);
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: '读取插件设置页失败: ' + err };
+      }
+    },
+
+    async runPluginSettingsAction(name: string, action: string, params: Record<string, unknown> = {}): Promise<any> {
+      const api = this._api();
+      if (!api || typeof api.run_plugin_settings_action !== 'function') {
+        return { ok: false, msg: '当前版本不支持插件设置动作' };
+      }
+      try {
+        return await api.run_plugin_settings_action(name, action, params);
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: '执行插件动作失败: ' + err };
+      }
+    },
+
+    async openExternalUrl(url: string): Promise<boolean> {
+      const api = this._api();
+      if (!api || typeof api.open_external_url !== 'function') return false;
+      try {
+        const res = await api.open_external_url(url);
+        return !!(res && res.ok);
+      } catch {
+        return false;
       }
     },
 
@@ -4442,42 +5645,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    // ---------------- 内嵌终端 ----------------
-    async runTerminalCommand(command: string) {
-      const cmd = (command || '').trim();
-      if (!cmd || this.terminalRunning) return;
-      const api = this._api();
-      if (!api) return;
-      this.terminalOutput += `$ ${cmd}\n`;
-      this.terminalRunning = true;
-      try {
-        const res = await api.run_terminal_command(cmd);
-        if (!res || !res.ok) {
-          this.terminalRunning = false;
-          this.terminalOutput += `[启动失败: ${(res && res.msg) || '未知错误'}]\n`;
-        }
-      } catch (err) {
-        this.terminalRunning = false;
-        this.terminalOutput += `[启动失败: ${err}]\n`;
-      }
-    },
-
-    async killTerminalCommand() {
-      const api = this._api();
-      if (!api) return;
-      try {
-        const res = await api.kill_terminal_command();
-        if (!res || !res.ok) {
-          this.notifyModal('后台任务', (res && res.msg) || '终止命令失败');
-        }
-      } catch (err) {
-        this.notifyModal('后台任务', '终止命令失败: ' + err);
-      }
-    },
-
-    clearTerminal() {
-      this.terminalOutput = '';
-    },
+    // ---------------- 内嵌终端（右侧面板版已下线，交互式终端见 ptyTerminal*） ----------------
 
     async exportSession(fmt: 'md' | 'html' | 'json') {
       const api = this._api();
@@ -4690,6 +5858,38 @@ navItems: [] as Array<{ id: number; preview: string }>,
         console.error('获取附件缩略图失败:', err);
       }
       return result;
+    },
+
+    // 屏幕截图「发到输入框」桥事件（snip_attachment_ready）落库：把图片路径
+    // 加入当前会话输入框附件。不复用 useAttachments.addPaths——composable 绑
+    // 定组件生命周期（onUnmounted 注册等），store 内写等价最小实现：
+    // 去重 → 查文件信息补全 name/ext/size（失败退化为 baseName）→ 补缩略图
+    async _attachSnipToComposer(path: string): Promise<void> {
+      if (!path) return;
+      const runtime = this._getSessionRuntime();
+      if (!runtime.composerAttachments) runtime.composerAttachments = [];
+      const target = runtime.composerAttachments;
+      // 去重：事件重放或重复截图同一文件时不叠加 chip
+      if (target.some(a => a.path === path)) return;
+      const infos = await this.getFilesInfo([path]);
+      const info = infos.find(i => i.path === path);
+      const sepIdx = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
+      const baseName = sepIdx >= 0 ? path.slice(sepIdx + 1) : path;
+      const name = info?.name || baseName;
+      const item: AttachmentItem = {
+        path,
+        name,
+        ext: info?.ext ?? fileExt(name),
+        size: info?.size ?? null,
+      };
+      target.push(item);
+      // 缩略图是增强能力：归档取受控媒体 URL 后补挂，失败静默
+      try {
+        const thumbs = await this.fetchAttachmentThumbnails([path]);
+        const url = thumbs.get(path);
+        if (url) item.thumb = url;
+      } catch { /* 缩略图失败静默，不影响附件 */ }
+      this.notifyChat('截图已加入输入框附件');
     },
 
     // 保存剪贴板粘贴的图片，返回落盘后的文件路径（失败返回空串并 toast）
@@ -4962,11 +6162,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
+    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
+        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
@@ -4983,11 +6183,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
+    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
+        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
           this.notifyModal('模型', res.msg || '模型已更新');
@@ -5067,6 +6267,34 @@ navItems: [] as Array<{ id: number; preview: string }>,
       const busyTurns = this.running || this.runningSessions.length > 0;
       const busyTasks = Array.isArray(this.backgroundTasks) && this.backgroundTasks.some(t => t.status === 'running');
       return busyTurns || busyTasks;
+    },
+
+    // 后台任务快照（list_active_tasks 只返回 running 项）：任务对话框打开、
+    // 应用启动等时机调用；桥未就绪（浏览器开发态）时静默保留上次快照
+    async refreshBackgroundTasks() {
+      if (!(window.pywebview && window.pywebview.api)) return;
+      try {
+        const list = await window.pywebview.api.get_background_tasks();
+        // list_active_tasks 只返回 running 任务且字段为 duration/pid：统一归一为
+        // 前端展示字段（status 恒为 running，running_time 取 duration）；
+        // session_id 为发起会话名，执行条经 currentSessionBackgroundTasks 按会话过滤；
+        // output_size/last_output_age/no_output_yet 为输出心跳，右面板任务页签
+        // 运行期提示用（旧后端缺省 undefined/null）
+        this.backgroundTasks = (Array.isArray(list) ? list : []).map((t: any) => ({
+          task_id: String(t?.task_id ?? ''),
+          command: String(t?.command ?? ''),
+          status: 'running',
+          running_time: String(t?.duration ?? '') || '活跃',
+          session_id: String(t?.session_id ?? ''),
+          pid: Number(t?.pid ?? 0) || undefined,
+          turn_id: String(t?.turn_id ?? ''),
+          output_size: Number(t?.output_size ?? 0),
+          last_output_age: (t?.last_output_age ?? null) === null ? null : Number(t.last_output_age),
+          no_output_yet: t?.no_output_yet === true,
+        }));
+      } catch {
+        // 拉取失败保留上次快照，不打断界面
+      }
     },
 
     async checkUpdate(manual: boolean = false) {

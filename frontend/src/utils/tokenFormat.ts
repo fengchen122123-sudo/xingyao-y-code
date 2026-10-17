@@ -1,8 +1,8 @@
 /**
  * Token 数字格式化与状态栏摘要组装：
  * - formatTokenCount：精确数值，千分位分隔（803,834），不再用 K/M 缩写
- * - buildTokenSummary：「输入 X · 输出 Y · 命中 Z (P%)」，
- *   命中率分母用输入 tokens（缓存只可能命中输入部分，用 total 会稀释失真）
+ * - buildSessionTokenSummary：「本会话 输入 X · 输出 Y · 命中 Z (P%)」，
+ *   命中率分母只取已报告缓存明细的轮次 prompt（未报告 ≠ 0）
  */
 
 export function formatTokenCount(n: number): string {
@@ -10,19 +10,38 @@ export function formatTokenCount(n: number): string {
   return Math.round(v).toLocaleString('en-US');
 }
 
-export interface CliStyleTotals {
-  total_prompt: number;
-  total_completion: number;
-  total_cached: number;
+/** 本会话 token 用量聚合（token_usage 落库；与后端 SessionTokenTotals 对齐） */
+export interface SessionTokenTotals {
+  session_id: string;
+  prompt: number;
+  completion: number;
+  cached: number;
+  cache_prompt: number;
+  total: number;
+  requests: number;
+  last_ts: number | null;
+  keepalive_prompt: number;
+  keepalive_cached: number;
+  keepalive_requests: number;
 }
 
-export function buildTokenSummary(totals: CliStyleTotals): string {
-  const prompt = totals.total_prompt || 0;
-  const completion = totals.total_completion || 0;
-  const cached = totals.total_cached || 0;
-  const hitRate = prompt > 0 ? Math.round((cached / prompt) * 100) : 0;
+/** 会话命中率：分母只含已报告缓存明细的轮次（未报告 ≠ 0）；无样本返回 null */
+export function sessionHitRate(totals: {
+  cached: number;
+  cache_prompt: number;
+}): number | null {
+  const denom = Number(totals.cache_prompt) || 0;
+  if (denom <= 0) return null;
+  return (Number(totals.cached) / denom) * 100;
+}
+
+/** 状态行本会话摘要：「本会话 输入 X · 输出 Y · 命中 Z (P%)」；无缓存样本时省略百分比 */
+export function buildSessionTokenSummary(totals: SessionTokenTotals): string {
+  const rate = sessionHitRate(totals);
+  const rateText = rate === null ? '' : ` (${Math.round(rate)}%)`;
   return (
-    `输入 ${formatTokenCount(prompt)} · 输出 ${formatTokenCount(completion)} · ` +
-    `命中 ${formatTokenCount(cached)} (${hitRate}%)`
+    `本会话 输入 ${formatTokenCount(totals.prompt)} · ` +
+    `输出 ${formatTokenCount(totals.completion)} · ` +
+    `命中 ${formatTokenCount(totals.cached)}${rateText}`
   );
 }

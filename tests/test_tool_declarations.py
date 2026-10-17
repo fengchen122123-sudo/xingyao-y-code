@@ -92,3 +92,13 @@ def test_shipped_plugins_are_covered_by_the_same_rules():
     assert registered, "项目自带插件必须注册至少一个工具"
     for spec in registered:
         _assert_declaration_consistent(spec)
+
+
+def test_default_registry_is_fully_covered_by_turn_undo_recorder():
+    """规格 9.5：默认注册表（内置 + 已加载插件）中不得存在未接入按回合撤销
+    记录器的 mutates_files 工具。本断言防同类声明遗漏再现（曾拦截
+    opencode_zen_sync 误声明 mutates_files 导致启动链 RuntimeError 的问题）。"""
+    from core.turn_undo.service import validate_recorder_coverage
+
+    assert validate_recorder_coverage(build_default_registry()) == []
+

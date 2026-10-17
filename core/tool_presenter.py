@@ -6,11 +6,15 @@ from typing import Any
 
 
 def _agent_display_name() -> str:
-    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
-    try:
-        from core.persona_settings import get_agent_display_name
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
 
-        return get_agent_display_name()
+    走 core.secretary 而非直接读设置页：工具提示里的名字属于“当前会话内的自称”，
+    秘书会话必须显示该会话的秘书名；读取失败回落默认“星瑶”（与原行为一致）。
+    """
+    try:
+        from core.secretary import get_active_agent_name
+
+        return get_active_agent_name()
     except Exception:
         return "星瑶"
 

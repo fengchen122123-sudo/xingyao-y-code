@@ -50,40 +50,58 @@ def _strip_output(text: str) -> str:
 
 
 def resolve_repository(workspace_path: str, runner: GitRunner) -> RepositoryIdentity:
-    """解析工作区对应的真实仓库身份。非仓库/Bare/低版本显式失败。"""
+    """解析工作区对应的真实仓库身份。非仓库/Bare/低版本显式失败。
+
+    is-bare / show-toplevel / absolute-git-dir / git-common-dir 四个查询合并为
+    一次 rev-parse：输出按旗标顺序逐行返回（普通仓库四行全有；裸仓库 rc=128
+    但 stdout 首行仍是 "true"，实测核对）。快照/preview/写操作每次都经过这里，
+    慢环境下省下的每个进程都是秒级开销。
+    """
     ws = str(workspace_path)
 
     detected = runner.check_available()
     runner.ensure_version(MIN_GIT_VERSION, detected)
 
-    # 仓库判定：bare 优先（bare 内 --show-toplevel 会失败）
-    bare_check = runner.run(["rev-parse", "--is-bare-repository"], cwd=ws, timeout=15.0)
-    if bare_check.returncode != 0:
+    probe = runner.run(
+        [
+            "rev-parse",
+            "--is-bare-repository",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ],
+        cwd=ws,
+        timeout=15.0,
+    )
+    lines = [ln.strip() for ln in probe.stdout_text.splitlines() if ln.strip()]
+    is_bare_mark = lines[0] if lines else ""
+    if probe.returncode != 0 and "not a git repository" in probe.stderr_text.lower():
         raise GitError(
             GitErrorCode.NOT_A_REPOSITORY,
             f"目录不是 Git 仓库（工作区与父级均未找到 .git）: {redact_ws(ws)}",
-            exit_code=bare_check.returncode,
+            exit_code=probe.returncode,
             command_summary="git rev-parse --is-bare-repository",
         )
-    if _strip_output(bare_check.stdout_text) == "true":
+    if is_bare_mark == "true":
         raise GitError(
             GitErrorCode.BARE_REPOSITORY_UNSUPPORTED,
             f"Git 工作台不支持管理裸仓库: {redact_ws(ws)}",
             command_summary="git rev-parse --is-bare-repository",
         )
+    if probe.returncode != 0 or len(lines) < 4:
+        # 非裸仓库却没拿全四行（异常 git 形态）：保留原始 stderr 显式失败
+        from core.git.models import redact_text
 
-    root = _strip_output(
-        runner.run_checked(["rev-parse", "--show-toplevel"], cwd=ws, timeout=15.0).stdout_text
-    )
-
-    git_dir = normalize_repo_path(
-        _strip_output(
-            runner.run_checked(["rev-parse", "--absolute-git-dir"], cwd=ws, timeout=15.0).stdout_text
+        raise GitError(
+            GitErrorCode.GIT_COMMAND_FAILED,
+            redact_text(probe.stderr_text.strip()[:200]) or "git rev-parse 复合查询失败",
+            exit_code=probe.returncode,
+            command_summary="git rev-parse [--is-bare-repository --show-toplevel --absolute-git-dir --git-common-dir]",
         )
-    )
-    common_raw = _strip_output(
-        runner.run_checked(["rev-parse", "--git-common-dir"], cwd=ws, timeout=15.0).stdout_text
-    )
+
+    root = _strip_output(lines[1])
+    git_dir = normalize_repo_path(_strip_output(lines[2]))
+    common_raw = _strip_output(lines[3])
     if not os.path.isabs(common_raw):
         common_raw = os.path.join(root, common_raw)
     common_dir = normalize_repo_path(common_raw)
@@ -115,14 +133,27 @@ def resolve_repository(workspace_path: str, runner: GitRunner) -> RepositoryIden
 
 def probe_identity_state(runner: GitRunner, ws: str) -> str:
     """提交身份可用性探测（规格 §5.2"Git 身份是否可用于提交"）：屏蔽全局/系统配置，
-    只看仓库本地配置是否齐备；返回 "ok" | "identity_missing"。"""
+    只看仓库本地配置是否齐备；返回 "ok" | "identity_missing"。
+
+    user.name / user.email 两键合并为一次 config --get-regexp（输出行格式
+    `<key> <value>`，值含空格时 partition 取其余整段）。
+    """
     env = {
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
     }
-    email = runner.run(["config", "user.email"], cwd=ws, timeout=10.0, env_extra=env)
-    name = runner.run(["config", "user.name"], cwd=ws, timeout=10.0, env_extra=env)
-    if email.returncode == 0 and name.returncode == 0 and email.stdout_text.strip() and name.stdout_text.strip():
+    result = runner.run(
+        ["config", "--get-regexp", r"^user\.(name|email)$"],
+        cwd=ws,
+        timeout=10.0,
+        env_extra=env,
+    )
+    seen = set()
+    for line in result.stdout_text.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("user.name", "user.email") and value.strip():
+            seen.add(key)
+    if seen == {"user.name", "user.email"}:
         return "ok"
     return "identity_missing"
 

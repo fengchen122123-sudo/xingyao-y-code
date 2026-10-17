@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, expect, it } from 'vitest';
+import { beforeEach, expect, it, vi } from 'vitest';
 import KimiEmptyState from './KimiEmptyState.vue';
 import { useAppStore } from '../stores/appStore';
 
@@ -67,5 +67,28 @@ it('未落库新会话离开空状态页后重新挂载仍恢复文字草稿', a
 
   wrapper = mount(KimiEmptyState);
   expect(wrapper.get('textarea').element.value).toBe('新会话尚未发送的内容');
+  wrapper.unmount();
+});
+
+it('shows the sandbox toggle without duplicating the git branch in the hero composer', async () => {
+  const { useGitStore } = await import('../stores/gitStore');
+  const store = useAppStore();
+  const gitStore = useGitStore();
+  gitStore.snapshot = {
+    branch_name: 'dev', head_state: 'clean', head_oid: 'abcd1234',
+    ahead: 0, behind: 0, staged: [], unstaged: [], untracked: [],
+    conflicts: [], operation_kind: 'idle',
+  } as any;
+  const setSandbox = vi.fn();
+  store.setSandbox = setSandbox as any;
+
+  const wrapper = mount(KimiEmptyState);
+
+  expect(wrapper.find('[data-test="hero-git-branch"]').exists()).toBe(false);
+
+  const sandbox = wrapper.get('[data-test="hero-sandbox-button"]');
+  expect(sandbox.text()).toContain('沙盒: 限');
+  await sandbox.trigger('click');
+  expect(setSandbox).toHaveBeenCalledWith(true);
   wrapper.unmount();
 });

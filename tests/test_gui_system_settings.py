@@ -101,6 +101,59 @@ def test_bridge_rejects_invalid_turn_step_limit_without_changing_config(
     assert json.loads(cfg.read_text(encoding="utf-8"))["agent_turn_step_limit"] == 100
 
 
+def test_system_settings_snapshot_exposes_context_watermark_base(tmp_path, monkeypatch):
+    """未配置水位基准时快照给 None（跟随真实窗口），并附带合法区间。"""
+    _use_isolated_config(tmp_path, monkeypatch, {})
+
+    result = _bare_bridge().get_system_settings()
+
+    assert result["context_watermark_base"] is None
+    assert result["context_watermark_base_min"] == 50000
+    assert result["context_watermark_base_max"] == 2000000
+
+
+def test_bridge_persists_valid_context_watermark_base(tmp_path, monkeypatch):
+    cfg = _use_isolated_config(tmp_path, monkeypatch, {})
+
+    result = _bare_bridge().set_context_watermark_base(800000)
+
+    assert result["ok"] is True
+    assert result["settings"]["context_watermark_base"] == 800000
+    stored = json.loads(cfg.read_text(encoding="utf-8"))["memory_compression"]
+    assert stored["watermark_base_tokens"] == 800000
+
+
+def test_bridge_accepts_zero_context_watermark_base_as_unset(tmp_path, monkeypatch):
+    """0 与 None 同义：不设基准，快照回落 None（配置文件里存 0）。"""
+    cfg = _use_isolated_config(tmp_path, monkeypatch, {})
+
+    result = _bare_bridge().set_context_watermark_base(0)
+
+    assert result["ok"] is True
+    assert result["settings"]["context_watermark_base"] is None
+    stored = json.loads(cfg.read_text(encoding="utf-8"))["memory_compression"]
+    assert stored["watermark_base_tokens"] == 0
+
+
+def test_bridge_rejects_invalid_context_watermark_base_without_changing_config(
+    tmp_path, monkeypatch
+):
+    cfg = _use_isolated_config(
+        tmp_path, monkeypatch, {"memory_compression": {"watermark_base_tokens": 300000}}
+    )
+    bridge = _bare_bridge()
+
+    for bad in (49999, 2000001, "abc"):
+        result = bridge.set_context_watermark_base(bad)
+        assert result["ok"] is False
+        assert result["msg"]
+        # 失败时不写盘：快照与配置文件都保持原值
+        assert result["settings"]["context_watermark_base"] == 300000
+
+    stored = json.loads(cfg.read_text(encoding="utf-8"))["memory_compression"]
+    assert stored["watermark_base_tokens"] == 300000
+
+
 def test_system_settings_snapshot_exposes_computer_control_settings(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch, {})
 
@@ -111,7 +164,8 @@ def test_system_settings_snapshot_exposes_computer_control_settings(tmp_path, mo
     assert result["computer_control_enabled"] is False
     assert result["computer_browser"] == "edge"
     options = {item["browser"]: item for item in result["computer_browser_options"]}
-    assert set(options) == {"edge", "chrome"}
+    # embedded = GUI 内置 WebView2（CDP 直连），与外部浏览器并列可选项
+    assert set(options) == {"edge", "chrome", "embedded"}
     for item in options.values():
         assert set(item) == {"browser", "label", "available", "executable", "unavailable_reason"}
     assert "browser-profiles" in result["computer_profile_path"].replace("/", "\\")

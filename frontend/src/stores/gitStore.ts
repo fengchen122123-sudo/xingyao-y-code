@@ -46,6 +46,13 @@ function callApi<T>(name: string, ...args: unknown[]): Promise<T> {
   return fn.apply(api, args);
 }
 
+// 快照请求串号：git_get_status 在大仓库要数秒，期间用户切会话/换工作区时
+// workdir 已被 $reset 或覆盖，若旧工作区的在途响应照常落地，会把上一仓库的
+// 快照串台到当前会话（表现为公共对话显示上一个项目的分支角标）。
+// 串号放模块级而非 state：$reset 会把计数归零，与在途旧请求撞号；
+// 且必须跨 reset 单调，旧请求的收尾分支才能可靠识别自己已过期。
+let refreshSerial = 0;
+
 export const useGitStore = defineStore('git', {
   state: () => ({
     workdir: '' as string,
@@ -71,6 +78,15 @@ export const useGitStore = defineStore('git', {
     panelOpenNonce: 0,
     // 冲突解决器当前打开的文件路径（空 = 关闭）
     conflictResolverPath: '',
+    // 刷新合并闸门（state 而非模块级）：慢环境下一次快照要数秒，监控失效
+    // 事件与面板操作会在数秒内堆起多个并发 git_get_status（同仓库在后端
+    // worktree_lock 串行执行，堆积让最新状态排队饿死）。在途期间同仓库的新
+    // 刷新记为待补，收尾后立即补发一次拿最新状态。放 state 的关键：换工作区
+    // 的 _setWorkdir 会 $reset 清闸——跨仓库切换立即放行（不同仓库后端是
+    // 不同的锁，可以并行，等旧仓库快照反而拖慢切换）；旧请求收尾时按串号
+    // 识别自己已过期，不再触碰这两个标志。
+    _refreshInFlight: false,
+    _refreshQueued: false,
   }),
 
   getters: {
@@ -128,14 +144,31 @@ export const useGitStore = defineStore('git', {
     },
 
     async refresh() {
-      if (!this.workdir) return;
+      const workdir = this.workdir;
+      if (!workdir) return;
+      if (this._refreshInFlight) {
+        this._refreshQueued = true;
+        return;
+      }
+      this._refreshInFlight = true;
+      const serial = ++refreshSerial;
       this.loading = true;
       try {
-        const res = await callApi<any>('git_get_status', this.workdir);
+        const res = await callApi<any>('git_get_status', workdir);
+        // 过期响应丢弃：已发起更新的快照请求，或 workdir 在途期间被切换/重置
+        if (serial !== refreshSerial || this.workdir !== workdir) return;
         this._applyResult(res);
-        if (res.ok) await this.loadTrust();
       } finally {
-        this.loading = false;
+        // 仅未被接替的请求有权收尾：被 $reset/新仓库接替的旧请求不触碰
+        // 闸门与 loading，由当前请求全权管理
+        if (serial === refreshSerial) {
+          this._refreshInFlight = false;
+          this.loading = false;
+          if (this._refreshQueued) {
+            this._refreshQueued = false;
+            void this.refresh();
+          }
+        }
       }
     },
 
@@ -149,8 +182,9 @@ export const useGitStore = defineStore('git', {
     },
 
     async loadTrust() {
-      const res = await callApi<any>('git_get_trust', this.workdir);
-      if (res.ok) this.trustLevel = res.level;
+      const workdir = this.workdir;
+      const res = await callApi<any>('git_get_trust', workdir);
+      if (res.ok && this.workdir === workdir) this.trustLevel = res.level;
     },
 
     async trustRepository() {

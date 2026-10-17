@@ -36,6 +36,14 @@
             title="添加附件"
             @click.stop="onAttachClick"
           ><AppIcon name="paperclip" :size="14" /></button>
+          <!-- 屏幕截图：全屏框选屏幕任意区域；截图「发到输入框」后后端经
+               snip_attachment_ready 桥事件回传路径，由 store 加入输入框附件 -->
+          <button
+            data-test="screen-snip-button"
+            class="kimi-pill-btn"
+            title="截图：框选屏幕任意区域"
+            @click.stop="onScreenSnipClick"
+          ><AppIcon name="scissors" :size="14" /></button>
           <!-- 触摸设备隐藏文件入口：点击后由系统弹出拍照/相册/文件选择 -->
           <input ref="touchFileInputRef" type="file" multiple style="display:none" @change="onPickInputChange">
           <button
@@ -49,6 +57,14 @@
             <AppIcon class="perm-icon" name="shield" :size="13" :stroke-width="2" /><span class="perm-label">{{ formatPermMode(store.permissionMode) }}</span>
             <AppIcon class="permission-chevron" name="chevron-down" :size="11" :stroke-width="2" />
           </button>
+          <!-- 沙盒限制开关（绿框位）：与输入框沙盒 chip 同一后端配置 -->
+          <button
+            data-test="hero-sandbox-button"
+            class="kimi-pill-btn sandbox-pill"
+            :class="{ 'sandbox-open': store.sandboxEnabled }"
+            :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
+            @click.stop="store.setSandbox(!store.sandboxEnabled)"
+          ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
         </div>
 
         <div style="display:flex;align-items:center;gap:10px">
@@ -162,9 +178,10 @@ const permBtnRef = ref<HTMLElement | null>(null);
 const workdirBtnRef = ref<HTMLElement | null>(null);
 const reasoningSelectorRef = ref<{ close: () => void } | null>(null);
 
-// 工作区下拉数据：非 GLOBAL 的项目分组
+// 工作区下拉数据：非 GLOBAL 的项目分组（秘书分组不是工作区，选它会切到
+// folder_path='SECRETARY' 这个并不存在的"目录"，故一并过滤）
 const projectGroups = computed(() =>
-  store.sessionGroups.filter(g => !g.is_global && g.folder_path && g.folder_path !== 'GLOBAL')
+  store.sessionGroups.filter(g => !g.is_global && !g.is_secretary && g.folder_path && g.folder_path !== 'GLOBAL')
 );
 const isGlobalWorkdir = computed(() =>
   !store.workdir || store.currentWorkdirLabel === '对话' || store.currentWorkdirLabel === 'GLOBAL'
@@ -249,6 +266,22 @@ function onAttachClick() {
   touchFileInputRef.value?.click();
 }
 
+// 屏幕截图：调后端打开全屏框选遮罩窗口；截图结果经桥事件
+// snip_attachment_ready 回传（见 appStore._attachSnipToComposer）
+async function onScreenSnipClick() {
+  const api = window.pywebview?.api;
+  if (!api?.screen_snip_start) {
+    store.notifyChat('桌面桥未就绪，无法使用截图');
+    return;
+  }
+  try {
+    const res = await api.screen_snip_start();
+    if (res && !res.ok) store.notifyChat(res.msg || '截图启动失败');
+  } catch {
+    store.notifyChat('截图启动失败：桥接调用异常');
+  }
+}
+
 async function onPickInputChange(e: Event) {
   const input = e.target as HTMLInputElement;
   const files = Array.from(input.files || []);
@@ -297,6 +330,11 @@ function handleKeydown(e: KeyboardEvent) {
   backdrop-filter: blur(14px);
   animation: fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
+/* 沙盒开关解除态：橙色提示（与输入框沙盒 chip 一致） */
+.sandbox-pill.sandbox-open {
+  border-color: var(--orange);
+  color: var(--orange);
+}
 .workdir-item {
   padding: 9px 12px;
   border-radius: 8px;
@@ -338,8 +376,37 @@ function handleKeydown(e: KeyboardEvent) {
 }
 /* 紧凑形态元素（图标）仅手机端显示，桌面端隐藏 */
 .perm-icon,
-.model-icon {
+.model-icon,
+.sandbox-label-short {
   display: none;
+}
+
+/* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
+   侧栏展开挤窄首页卡片时禁止按钮换行，按 .kimi-card 容器宽度分档，
+   档位与对话中输入栏一致：≤540 权限·模型转图标 / ≤430 沙盒收成 开/限 */
+.kimi-card {
+  container-type: inline-size;
+  container-name: composer;
+}
+@container composer (max-width: 540px) {
+  .permission-mode-btn .perm-label,
+  .permission-mode-btn .permission-chevron,
+  .model-chip .model-label,
+  .model-chip .model-chevron {
+    display: none;
+  }
+  .perm-icon,
+  .model-icon {
+    display: inline-flex;
+  }
+}
+@container composer (max-width: 430px) {
+  .sandbox-label-full {
+    display: none;
+  }
+  .sandbox-label-short {
+    display: inline;
+  }
 }
 
 @media (max-width: 768px) {
@@ -353,6 +420,11 @@ function handleKeydown(e: KeyboardEvent) {
   .perm-icon,
   .model-icon {
     display: inline-flex;
+  }
+  /* 手机端沙盒只留 开/限 */
+  .sandbox-pill {
+    font-size: 12px;
+    padding: 6px 9px;
   }
 }
 </style>

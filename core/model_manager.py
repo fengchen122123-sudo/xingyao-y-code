@@ -150,6 +150,33 @@ def _write_config(data: dict):
         config._atomic_write_json(_CONFIG_FILE, data)
 
 
+def effective_provider_api_key(provider: dict) -> str:
+    """请求读取路径使用的单 Key：多 Key provider 返回 Key 池「当前该用」的 Key。
+
+    设计见 docs/superpowers/specs/2026-10-12-provider-multi-key-failover-design.md
+    第 4 节：所有「取 Key 去发请求 / 返回给调用方」的路径都必须与 Key 池一致，
+    绝不把多行 Key 串整体当作一个 Key 使用。
+
+    - 多 Key（换行/逗号/分号分隔）→ Key 池 initial_key()（粘性 + 冷却后轮换）；
+    - 单 Key → 原样返回 provider["api_key"]；
+    - Key 池不可用 / 任何异常 → 原值回退，行为与现状一致。
+
+    注意：add/update/delete 等写入路径不得调用本函数——多行原文必须原样保存。
+    """
+    raw = (provider or {}).get("api_key")
+    try:
+        from core.provider_keys import get_key_pool
+
+        pool = get_key_pool(provider)
+        if pool is not None:
+            key = pool.initial_key()
+            if key:
+                return key
+    except Exception:
+        pass
+    return raw
+
+
 def get_active_model(session_name: str | None = None) -> dict | None:
     """
     返回当前激活模型的完整信息字典，包含：
@@ -184,7 +211,9 @@ def get_active_model(session_name: str | None = None) -> dict | None:
         return None
     return {
         "litellm_model":   model["litellm_model"],
-        "api_key":         provider["api_key"],
+        # 多 Key provider 只返回「当前该用的单 Key」（Key 池选择结果），
+        # 多行原文仍完整保存在配置里，由请求层按需切 Key
+        "api_key":         effective_provider_api_key(provider),
         "base_url":         provider["base_url"],
         "context_window":  model.get("context_window", 128000),
         "supports_vision": model.get("supports_vision"),
@@ -380,7 +409,7 @@ def get_secondary_model() -> dict | None:
             if model.get("id") == secondary_id:
                 return {
                     "litellm_model":   model["litellm_model"],
-                    "api_key":         provider["api_key"],
+                    "api_key":         effective_provider_api_key(provider),
                     "base_url":         provider["base_url"],
                     "context_window":  model.get("context_window", 128000),
                     "supports_vision": model.get("supports_vision"),

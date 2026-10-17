@@ -151,6 +151,23 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 - `core/cache_keepalive.py`：前缀缓存保活默认 120 秒（0 关闭，最小 60），仅 DeepSeek/Kimi 路由生效。
 
+- 插入式压缩（`memory_compression.insert_mode` 默认开）：复用 `get_session_snapshot()`
+  的会话最后主请求字节（ledger 消息 + tools + 亲和参数原样）尾部追加压缩指令，单请求
+  完成摘要后走既有 CAS 落库。快照缺失（保活关闭/路由不支持/主请求在飞）、model/key/base
+  三元组不符或窗口预算不足一律静默回退分段路径，绝不硬失败——因此 insert_mode 依赖
+  保活开关：`prompt_cache_keepalive_seconds=0` 时恒走分段路径。
+
+- `session_summary_generations` 归档表（memory.py）+ `recall_history` 只读工具：每次压缩
+  成功追加一代（摘要/topics/until_msg_id），`get_history_for_llm` 在 history[0] 摘要块尾部
+  注入 ≤10 代回溯索引。会话改名必须随迁、undo/清空/删会话/删工作区必须同事务清理该表，
+  否则回溯索引静默丢失并留孤儿行。
+
+- `core/idle_maintenance.py`：用户空闲 N 秒（`memory_compression.idle_maintenance_seconds`
+  默认 240，0 关闭）后跑本地水位维护与压缩。GUI/CLI 在回合开始/结束接线
+  `on_turn_started`/`on_turn_finished`；回合开始撤销未触发任务并协作中断在跑压缩——
+  cancel_event 注册期由 `done_event` 延长到压缩真正结束（`_trigger_background_precompress`
+  发射后即返回，worker 必须等 done 才弹事件），注册表复用不覆盖。
+
 - 智谱 GLM 缓存路线：官方隐式自动缓存（无亲和参数、无显式标记、命中五折、TTL 不透明），
   客户端走「稳定字节 + 保活」。`core/llm.py:_supports_cache_keepalive` 对官方
   open.bigmodel.cn（`_is_official_zhipu_route`）放行，第三方中转的 GLM 模型不放行。

@@ -41,6 +41,16 @@ export interface ModelInfo {
   computer_protocol: ComputerProtocolChoice;
   // 最大输出：null = 未设置（请求时走内置默认表）
   max_tokens?: number | null;
+  // 思考设置：choice 为当前持久化选择（未设置时 "default"）；
+  // options 为该模型真实支持的档位（后端按模型能力表给出，不猜测）；
+  // visible=false 的模型不展示思考设置，kind=fixed 的模型不可调（只读提示）。
+  reasoning_choice?: string;
+  reasoning_options?: { value: string; label: string }[];
+  reasoning_visible?: boolean;
+  reasoning_kind?: string;
+  // 内置官方默认档位（无依据的模型为空串）：打开弹窗且没有用户选择时自动预选
+  reasoning_default_choice?: string;
+  reasoning_disabled_reason?: string;
 }
 
 export interface ProviderInfo {
@@ -126,6 +136,107 @@ export interface ComputerRunSnapshot {
   hotkey_available: boolean;
 }
 
+export interface FeishuSettingsSnapshot {
+  enabled: boolean;
+  app_id: string;
+  /** 仅表示是否已配置密钥；明文不经快照下发 */
+  has_secret: boolean;
+  approvers: string[];
+  notify_chat_id: string;
+  status: {
+    state: string;
+    running: boolean;
+    last_error: string;
+    received_events: number;
+    duplicate_events: number;
+    uptime_seconds: number;
+  };
+}
+
+// JEV 决策模型服务（Task 3 设置页）：字段与 core.decision_service.DEFAULT_CONFIG 对齐。
+// 默认全关（enabled=false 时项目行为零变化）；损坏配置由后端回落默认值。
+export interface DecisionSettingsSnapshot {
+  version: number;
+  enabled: boolean;
+  /** "auto"=自动匹配基元律动通道；或指定 provider id/name */
+  provider_ref: string;
+  /** 空串 = 用 provider 的 base_url；非空为手动覆盖 */
+  base_url: string;
+  model_id: string;
+  endpoint_style: 'decision' | 'systemone';
+  /** "auto"=跨权限轮换并记忆可用 Key；"index:N"=固定第 N 把（N 为 0 基） */
+  key_mode: string;
+  shadow_mode: boolean;
+  timeout_ms: number;
+  scenes: Record<string, { enabled: boolean; shadow: boolean; threshold: number }>;
+  audit_enabled: boolean;
+}
+
+// probe_decision() 单条逐 Key 结果；status 分类见 core.decision_service.probe_decision
+export interface DecisionProbeKeyResult {
+  /** 第几把 Key（0 基；UI 展示时 +1） */
+  key_index: number;
+  status: 'available' | 'no_permission' | 'invalid_key' | 'timeout' | 'network_error' | 'rate_limited' | 'error';
+  latency_ms: number;
+  error: string;
+}
+
+// get_decision_settings() 的运行时状态（Key 序号与最近一次探针结果；不落盘）
+export interface DecisionRuntimeState {
+  key_count: number;
+  active_key_index: number | null;
+  denied_key_indexes: number[];
+  cooldown_key_indexes: number[];
+  last_probe: {
+    ok: boolean;
+    results: DecisionProbeKeyResult[];
+    model_id: string;
+    msg: string;
+  } | null;
+}
+
+// list_decision_models() 条目：上游 type=="decision" 的模型
+export interface DecisionModelOption {
+  id: string;
+  name: string;
+  context: number;
+  price_text: string;
+}
+
+// list_decision_providers() 条目：可选调用通道（不含 Key 内容，仅报数量）
+export interface DecisionProviderOption {
+  /** provider 的 id（优先）或 name */
+  ref: string;
+  name: string;
+  base_url: string;
+  key_count: number;
+  /** 是否为 provider_ref="auto" 的解析目标（base_url 含 tokenrhythm 的第一个通道） */
+  auto_match: boolean;
+}
+
+// get_decision_audit_summary() 条目：单条审计记录的精简视图（不含正文）
+export interface DecisionAuditRecentItem {
+  ts: string;
+  scene: string;
+  shadow: boolean;
+  adopted: boolean;
+  latency_ms: number | null;
+  fallback_reason: string;
+  model_id: string;
+  answers_digest: string;
+}
+
+// get_decision_audit_summary() 汇总：今日计数 + 最近记录（设置页「决策记录」面板）
+export interface DecisionAuditSummary {
+  ok: boolean;
+  today_count: number;
+  today_shadow_count: number;
+  today_adopted_count: number;
+  today_fallback_count: number;
+  recent: DecisionAuditRecentItem[];
+  msg?: string;
+}
+
 export interface SystemSettingsSnapshot {
   command_shell: string;
   command_shell_options: CommandShellOption[];
@@ -135,6 +246,11 @@ export interface SystemSettingsSnapshot {
   agent_turn_step_limit: number;
   agent_turn_step_limit_min: number;
   agent_turn_step_limit_max: number;
+  // 上下文水位基准：null 表示未设置（直接跟随模型真实窗口），
+  // 取值范围由 min/max 给出，供设置页输入框与校验使用
+  context_watermark_base: number | null;
+  context_watermark_base_min: number;
+  context_watermark_base_max: number;
   // AI 生成内容目录（Task 5）：ai_output_dir 为当前生效的绝对路径；
   // ai_output_dir_setting 为原始配置值（未配置为空串，供设置页回显草稿）；
   // ai_output_dir_default 为默认目录（占位符展示用）
@@ -176,6 +292,35 @@ export interface SystemSettingsMutationResult {
 export interface ComputerControlResult extends ComputerRunSnapshot {
   ok: boolean;
   msg?: string;
+}
+
+// 内嵌浏览器（右侧面板浏览器页签）：DOM 占位区的 CSS px 矩形，上报给宿主，
+// 由宿主把叠加的原生 WebView2 控件摆到该矩形上
+export interface EmbeddedBrowserRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// core.embedded_browser.EmbeddedBrowserController._snapshot()：宿主回推的状态快照
+export interface EmbeddedBrowserState {
+  url: string;
+  title: string;
+  can_go_back: boolean;
+  can_go_forward: boolean;
+  loading: boolean;
+  ready: boolean;
+  visible: boolean;
+}
+
+// browser_pane_* 系列统一返回：成功 {ok:true,state?}；失败 {ok:false,error}
+// error ∈ 'unsupported_platform' | 'invalid_rect' | 'form_unavailable' | 'not_open'
+//       | 'invoke_failed' | 'not_ready' | 'invalid_url'（前端只特判 unsupported_platform）
+export interface EmbeddedBrowserPaneResult {
+  ok: boolean;
+  state?: EmbeddedBrowserState | null;
+  error?: string;
 }
 
 // /doctor 聚合自检（T3b）：单项结果来自 core.doctor.CheckResult，字段名与
@@ -297,6 +442,8 @@ export interface McpInfo {
   enabled: boolean;
   connected: boolean;
   tools_count: number;
+  // 连接失败原因（正常为 null / 旧后端不返回该字段时为 undefined）
+  last_error?: string | null;
 }
 
 export interface PluginInfo {
@@ -307,6 +454,8 @@ export interface PluginInfo {
   status: string;      // loaded | disabled | failed | overridden | pending_enable | pending_disable | untrusted
   enabled: boolean;
   tools: string[];
+  // 插件是否提供设置页（入口模块声明了 plugin_settings 钩子；未启用/未信任一律 false）
+  has_settings?: boolean;
   error?: string;
 }
 
@@ -373,6 +522,9 @@ export interface SessionInfo {
   count: number;
   workdir: string;
   is_global?: boolean;
+  // 秘书会话专属：该会话的秘书名（= 显示名，未命名的历史会话回落「秘书」）。
+  // 普通会话没有这个字段；前端据此 + 分组 is_secretary 判定改名走哪条路
+  secretary_name?: string;
   updated_at?: string;
 }
 
@@ -388,7 +540,43 @@ export interface SessionGroup {
   folder_name: string;
   is_current?: boolean;
   is_global?: boolean;
+  // 秘书归属分组：folder_path='SECRETARY' 只是分组标识，**不是磁盘目录**，
+  // 因此不能拿它拼路径 / 打开资源管理器 / 删除分组；组内会话与「对话」同口径
+  // （workdir='GLOBAL'、is_global=true）。后端固定把它排在 GLOBAL 之前。
+  is_secretary?: boolean;
   sessions: SessionInfo[];
+}
+
+// get_archived_sessions() 的扁平列表条目：字段与分组树里的会话条目同源，
+// 额外带 archived_at（归档时刻，ISO8601 文本）。归档区没有分组语义。
+export interface ArchivedSessionInfo extends SessionInfo {
+  archived_at?: string;
+}
+
+// archive_session / unarchive_session 的返回契约：成功时至少回 name 与 archived_at；
+// sessions / archived_sessions 是事件负载里的最新快照，桥接方法可选回传（缺省时前端主动刷新）。
+export interface ArchiveSessionResult {
+  ok: boolean;
+  name?: string;
+  archived_at?: string | null;
+  sessions?: SessionGroup[];
+  archived_sessions?: ArchivedSessionInfo[];
+  msg?: string;
+}
+
+// unarchive_sessions / delete_archived_sessions 的返回契约：names 是本次真正处理成功
+// 的会话名，failed 是逐项失败原因（一项失败不阻断其它项）。故 ok 表示「是否至少成功
+// 一项」而非「是否全部成功」；全失败时 names 为空、msg 给出整体原因。
+export interface ArchiveBatchResult {
+  ok: boolean;
+  success?: boolean;
+  count?: number;
+  names?: string[];
+  failed?: { name: string; msg?: string }[];
+  sessions?: SessionGroup[];
+  archived_sessions?: ArchivedSessionInfo[];
+  current_session?: string;
+  msg?: string;
 }
 
 export interface FileNode {
@@ -428,6 +616,57 @@ export interface BackgroundTask {
   command: string;
   status: string;
   running_time?: string;
+  // 发起该任务的会话名（后端任务记录持久化）：执行条按当前会话过滤，
+  // 其他会话启动的任务不在本会话串显；旧记录无归属时不属于任何会话
+  session_id?: string;
+  // 输出心跳（list_active_tasks 提供）：日志字节数 / 距最后写入秒数 /
+  // 是否尚无实际命令输出（仅启动标记）。面板据此在运行期区分
+  // "仍在运行只是暂无输出"与"面板失联"，旧后端缺省 undefined
+  pid?: number;
+  turn_id?: string;
+  output_size?: number;
+  last_output_age?: number | null;
+  no_output_yet?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// 子代理执行过程（右面板"子代理"工作台 + 聊天卡片"查看"入口）
+// ---------------------------------------------------------------------------
+
+export interface SubagentStagePayload {
+  name: string;
+  at: number;
+  detail: string;
+}
+
+/** get_subagent_task_detail 返回的完整任务详情（含阶段历史与结论） */
+export interface SubagentTaskDetail {
+  id: string;
+  description: string;
+  type: string;
+  status: string;
+  stage: string;
+  stage_detail?: string;
+  elapsed: number;
+  background: boolean;
+  plan_item_id?: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  stages: SubagentStagePayload[];
+  result: string;
+  error: string;
+  partial: string;
+}
+
+/** 任务切换条用的轻量清单项 */
+export interface SubagentTaskListItem {
+  id: string;
+  description: string;
+  type: string;
+  status: string;
+  stage: string;
+  elapsed: number;
+  background: boolean;
 }
 
 // 上下文来源（字符数估算，仅用于悬停面板展示占比，不进 token 账本）
@@ -467,8 +706,54 @@ export interface TokenUsage {
   total_prompt: number;
   total_completion: number;
   total_cached: number;
+  /** 本会话口径（token_usage 落库聚合，重启不清零）；状态行默认显示这组数字 */
+  session_totals: SessionTokenTotals;
   /** 上下文来源字符占比快照（输入框悬停面板用）；无数据为 [] */
   context_breakdown: ContextBreakdownItem[];
+}
+
+/** 本会话 token 用量聚合：对话口径（main/legacy），保活单列不混入 */
+export interface SessionTokenTotals {
+  session_id: string;
+  prompt: number;
+  completion: number;
+  cached: number;
+  /** 命中率分母：只含已报告缓存明细的轮次 prompt（未报告 ≠ 0） */
+  cache_prompt: number;
+  total: number;
+  requests: number;
+  last_ts: number | null;
+  keepalive_prompt: number;
+  keepalive_cached: number;
+  keepalive_requests: number;
+}
+
+/** 会话弹层的单会话行（按合计 token 降序） */
+export interface TokenUsageOverviewSession {
+  session_id: string;
+  prompt: number;
+  completion: number;
+  cached: number;
+  cache_prompt: number;
+  total: number;
+  requests: number;
+  last_ts: number | null;
+}
+
+/** 会话 token 弹层数据：全部会话合计（不分 scope，含保活/压缩）+ 会话列表 */
+export interface TokenUsageOverview {
+  ok: boolean;
+  msg?: string;
+  current: string;
+  totals: {
+    prompt: number;
+    completion: number;
+    cached: number;
+    cache_prompt: number;
+    total: number;
+    requests: number;
+  };
+  sessions: TokenUsageOverviewSession[];
 }
 
 export interface TokenStatisticsMetrics {
@@ -645,17 +930,54 @@ export interface SubagentProgressEventData {
     stage_detail?: string;
     elapsed: number;
     background?: boolean;
+    stages?: SubagentStagePayload[];
   }>;
 }
 
 export interface BridgeEvent {
-  type: string;
+  // 已知事件名的联合（供类型提示与检索用，不是闭集：末尾的 (string & {})
+  // 兜底允许后端先推送、前端后适配的新事件；桥梁事件唯一赋值点在 appStore）
+  type: BridgeEventType;
   // 既有事件信封为 {"type","data"}；电脑操控事件（Task 13a）为平铺信封，
   // data 缺省、run_id/event_seq 直接在顶层，识别规则见 appStore
   data?: any;
   run_id?: string;
   event_seq?: number;
 }
+
+/** 秘书调度台 open_session 事件的载荷（后端 gui_bridge 秘书调度服务推送） */
+export interface OpenSessionBridgeData {
+  /** 目标会话名（后端已用它切换当前会话；缺失时前端忽略本次跳转） */
+  session_name: string;
+  /** 目标会话生效显示名（秘书会话为秘书名，普通会话为标题/会话名） */
+  display_name?: string;
+  /** 目标会话归属目录，仅供调试/展示，前端切换不由它决定 */
+  workdir?: string;
+}
+
+/** JEV 决策记录实时事件的载荷（后端 gui_bridge 决策审计监听器推送，形状同审计精简条目） */
+export interface DecisionRecordedBridgeData {
+  ts: string;
+  scene: string;
+  shadow: boolean;
+  adopted: boolean;
+  latency_ms: number | null;
+  fallback_reason: string;
+  model_id: string;
+  answers_digest: string;
+}
+
+/**
+ * 桥事件名联合。只登记前端 `handleBridgeEvent` 里确有处理分支的事件，
+ * `(string & {})` 兜底保证既有 `BridgeEvent.type` 的宽松口径不收紧
+ * （未知事件仍可传入，不会因类型收窄而编译失败）。
+ */
+export type BridgeEventType =
+  // 秘书调度台：系统层跳转（载荷见 OpenSessionBridgeData）
+  | 'open_session'
+  // JEV 决策记录实时推送（载荷见 DecisionRecordedBridgeData）
+  | 'decision_recorded'
+  | (string & {});
 
 // ---------------------------------------------------------------------------
 // 按回合撤销 DTO（规格 19；与后端 core/turn_undo 状态值严格对应）
@@ -850,16 +1172,35 @@ export interface PyWebViewAPI {
   get_workspace_state(workdir: string): Promise<any>;
   get_sessions(): Promise<SessionGroup[]>;
   create_session(title?: string, workdir?: string): Promise<any>;
-  create_global_session(title?: string): Promise<any>;
+  // 秘书会话：与 create_session 的"首条消息才懒落库"不同，它立即落库并切为当前
+  // 会话（source=SECRETARY、workdir=GLOBAL）。name 是这个秘书的身份标识，必填
+  // 且去首尾空白后 1-20 字符；非法名后端拒绝且不产生会话记录，返回
+  // { ok:false, msg }。成功返回 { ok, session_name, title, display_name,
+  // secretary_name, workdir }（display_name 即秘书名，会话名不参与命名）。
+  create_secretary_session(title: string, name: string): Promise<any>;
+  // 当前会话生效名：秘书会话 → 该会话的秘书名（未命名回落「秘书」），
+  // 普通会话 → 设置页智能体名。前端切会话 / 建会话 / 启动后据此刷新显示名
+  get_active_agent_name(): Promise<{ agent_name: string; is_secretary: boolean; msg?: string }>;
+  // 秘书会话改名：只改 secretary_name，不动 session_name（消息 / 摘要 / 快照键
+  // 都不迁移）；成功回带 { ok, session_name, secretary_name, display_name, sessions }
+  rename_secretary_session(sessionName: string, newName: string): Promise<any>;
   switch_session(sessionName: string, targetWorkdir?: string): Promise<any>;
   load_older_messages(sessionName: string, beforeId: number): Promise<any>;
   get_session_nav_index(sessionName: string): Promise<any>;
   delete_session(sessionName: string): Promise<any>;
   delete_folder_group(workdir: string): Promise<any>;
   rename_session(oldName: string, newName: string): Promise<any>;
+  // 归档会话：归档只写标记、可随时恢复，故默认列表不含归档会话（include_archived=false）
+  get_archived_sessions(): Promise<ArchivedSessionInfo[]>;
+  archive_session(sessionName: string): Promise<ArchiveSessionResult>;
+  unarchive_session(sessionName: string): Promise<ArchiveSessionResult>;
+  // 归档区多选批量操作：一次桥接处理多个会话，逐项容错（见 ArchiveBatchResult）
+  unarchive_sessions(sessionNames: string[]): Promise<ArchiveBatchResult>;
+  delete_archived_sessions(sessionNames: string[]): Promise<ArchiveBatchResult>;
 
   set_model(modelId: string, sessionName?: string): Promise<any>;
   get_reasoning_snapshot(modelId: string): Promise<any>;
+  get_reasoning_snapshot_by_name(modelName: string): Promise<any>;
   set_reasoning_choice(modelId: string, choice: ReasoningChoice): Promise<any>;
   // 权限档位是会话级的：传 sessionName 只绑定该会话；不传则改全局默认
   set_permission_mode(mode: PermissionMode, sessionName?: string): Promise<any>;
@@ -869,7 +1210,36 @@ export interface PyWebViewAPI {
   // AI 生成内容目录：不可用路径显式拒绝（ok=false + msg），不做静默降级
   set_ai_output_dir(path: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // 飞书集成：快照不含 app_secret 明文（只回 has_secret），明文按需 get_feishu_secret
+  get_feishu_settings(): Promise<{ ok: boolean; settings?: FeishuSettingsSnapshot; msg?: string }>;
+  set_feishu_settings(payload: {
+    enabled: boolean;
+    app_id: string;
+    app_secret?: string;
+    approvers: string[];
+    notify_chat_id: string;
+  }): Promise<{ ok: boolean; settings?: FeishuSettingsSnapshot; msg?: string }>;
+  get_feishu_secret(): Promise<{ ok: boolean; app_secret?: string; msg?: string }>;
+  test_feishu_connection(appId?: string, appSecret?: string): Promise<{ ok: boolean; msg?: string; endpoint_ready?: boolean }>;
+  // JEV 决策模型（Task 3）：配置快照 + 运行时状态；后端未就绪/异常时 ok=false
+  get_decision_settings(): Promise<{ ok: boolean; settings?: DecisionSettingsSnapshot; runtime?: DecisionRuntimeState; msg?: string }>;
+  // 保存决策配置 patch（深合并 + 校验，非法值拒绝并回中文原因；settings 为保存后快照）
+  set_decision_settings(patch: Partial<DecisionSettingsSnapshot>): Promise<{ ok: boolean; msg?: string; settings?: DecisionSettingsSnapshot }>;
+  // 逐 Key 各跑 1 次无害探针（每把 Key 至多 1 次，不做压测；status 分类见 DecisionProbeKeyResult）
+  probe_decision(): Promise<{ ok: boolean; results: DecisionProbeKeyResult[]; model_id: string; msg?: string }>;
+  // 从上游拉取 type=="decision" 的模型列表（设置页「从上游拉取」下拉）
+  list_decision_models(): Promise<{ ok: boolean; models: DecisionModelOption[]; msg?: string }>;
+  // 可选调用通道列表（不含 Key 内容，仅报数量；设置页通道下拉）
+  list_decision_providers(): Promise<{ ok: boolean; providers?: DecisionProviderOption[]; msg?: string }>;
+  // 决策审计汇总（今日计数 + 最近记录；设置页「决策记录」面板）
+  get_decision_audit_summary(limit?: number): Promise<DecisionAuditSummary>;
+  // 在系统文件管理器中打开决策审计目录（缺失时先创建）
+  open_decision_audit_dir(): Promise<{ ok: boolean; path?: string; msg?: string }>;
+  // 决策审计尾部：~/.ycode/decision_audit 最新文件的最后 limit 行
+  get_decision_audit_tail(limit?: number): Promise<{ ok: boolean; lines: string[]; msg?: string }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // 上下文水位基准：0 表示不设基准（跟随模型真实窗口）
+  set_context_watermark_base(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   // /doctor 聚合自检（T3b）：设置页「运行自检」入口，复用 CLI 同一套检查
   // （core.doctor.run_checks）；skipNetwork 默认 false（含模型端点联网探测）
   run_doctor(skipNetwork?: boolean): Promise<DoctorReport>;
@@ -903,6 +1273,7 @@ export interface PyWebViewAPI {
   jump_queue(sessionName: string, messageId: string): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;
+  get_token_usage_overview(limit?: number): Promise<TokenUsageOverview>;
   get_token_usage_statistics(days: 1 | 7 | 30 | 365): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
@@ -921,6 +1292,10 @@ export interface PyWebViewAPI {
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
   trust_plugin(name: string): Promise<any>;
+  // 插件设置页（声明式渲染）：页面快照读取 / 动作执行 / 打开外部授权链接
+  get_plugin_settings(name: string): Promise<any>;
+  run_plugin_settings_action(name: string, action: string, params?: Record<string, unknown>): Promise<any>;
+  open_external_url(url: string): Promise<{ ok: boolean; msg?: string }>;
   // C11：项目级 Hook 信任（信任卡片数据源 + 信任/拒绝/撤销/重置动作）
   get_hooks(): Promise<{ ok: boolean; hooks?: HookInfo[]; workdir?: string; msg?: string }>;
   grant_hook_trust(digest: string): Promise<any>;
@@ -934,6 +1309,7 @@ export interface PyWebViewAPI {
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
+  remove_mcp_server(name: string): Promise<any>;
   reconnect_mcp(): Promise<any>;
 
   export_session(fmt: 'md' | 'html' | 'json'): Promise<any>;
@@ -979,6 +1355,8 @@ export interface PyWebViewAPI {
     scope?: 'all' | 'title' | 'content',
     workdir?: string,
     limit?: number,
+    // 是否把已归档会话也纳入检索范围（默认 false：与归档前行为一致）
+    includeArchived?: boolean,
   ): Promise<{
     ok: boolean;
     total: number;
@@ -1054,10 +1432,70 @@ export interface PyWebViewAPI {
   }>>;
 
   get_background_tasks(): Promise<BackgroundTask[]>;
+  get_background_task_output(taskId: string, tailLines?: number): Promise<{ ok: boolean; output: string; msg?: string }>;
   kill_task(taskId: string): Promise<any>;
 
-  run_terminal_command(command: string): Promise<any>;
-  kill_terminal_command(): Promise<any>;
+  // 子代理执行过程详情（右面板"子代理"工作台轮询）：task 为目标任务完整详情，
+  // tasks 为会话内全部子代理轻量清单；任务被容量清理时 ok=false 保留 msg
+  get_subagent_task_detail(taskId: string, sessionName?: string): Promise<{
+    ok: boolean;
+    task?: SubagentTaskDetail | null;
+    tasks: SubagentTaskListItem[];
+    msg?: string;
+  }>;
+
+  // ---------------------------------------------------------------------------
+  // 内嵌浏览器（右侧面板浏览器页签；宿主 gui_browser_mixin.BrowserBridgeMixin）
+  // rect 为 DOM 占位区的 CSS px 矩形；url 为空串表示只创建/定位、不导航。
+  // 非 Windows 或缺桥时统一返回 {ok:false,error:'unsupported_platform'}。
+  // ---------------------------------------------------------------------------
+  browser_pane_open(rect: EmbeddedBrowserRect, url?: string): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_set_bounds(rect: EmbeddedBrowserRect): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_navigate(url: string): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_back(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_forward(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_reload(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_stop(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_hide(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_get_state(): Promise<EmbeddedBrowserPaneResult>;
+  // 把前端渲染好的预览 HTML 落盘（宿主 gui_browser_mixin.BrowserBridgeMixin，
+  // 实现 core.web_preview）：返回本地路径后由 browser_pane_navigate 打开。
+  // 与平台无关；内容为空/过大时返回 {ok:false,error}。
+  write_preview_page(
+    htmlText: string,
+    sourcePath?: string,
+  ): Promise<{ ok: boolean; path?: string; error?: string }>;
+
+  // ---------------------------------------------------------------------------
+  // 右面板画笔截图（宿主 gui_snip_mixin.SnipBridgeMixin）。rect 为右面板的
+  // CSS px 矩形（与 browser_pane_open 同一坐标系），冻结帧必须在其原生表面
+  // 仍可见时捕获（快照要包含浏览器内容）。所有失败归一 {ok:false,msg}。
+  // ---------------------------------------------------------------------------
+  capture_right_panel_region(rect: EmbeddedBrowserRect): Promise<{
+    ok: boolean;
+    data_url?: string;
+    width?: number;
+    height?: number;
+    msg?: string;
+  }>;
+  snip_copy_clipboard(dataUrl: string): Promise<{ ok: boolean; msg?: string }>;
+  snip_save_image(dataUrl: string, suggestedName?: string): Promise<{
+    ok: boolean;
+    path?: string;
+    msg?: string;
+  }>;
+  // 屏幕截图（宿主 gui_snip_mixin.SnipBridgeMixin）：全屏任意位置截图，
+  // 打开遮罩窗口；「发到输入框」完成后的结果经桥事件
+  // {type:'snip_attachment_ready', data:{path}} 回传
+  screen_snip_start(): Promise<{ ok: boolean; msg?: string }>;
+
+  // 旧版右侧面板单命令终端已下线；底部交互式终端见 pty_terminal_*
+  pty_terminal_ensure(cols: number, rows: number): Promise<{
+    ok: boolean; pid?: number; cwd?: string; reused?: boolean; msg?: string;
+  }>;
+  pty_terminal_write(data: string): Promise<{ ok: boolean; msg?: string }>;
+  pty_terminal_resize(cols: number, rows: number): Promise<{ ok: boolean; msg?: string }>;
+  pty_terminal_kill(): Promise<{ ok: boolean; msg?: string }>;
 
   add_provider(name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_model_settings(): Promise<ModelSettingsSnapshot>;
@@ -1065,9 +1503,9 @@ export interface PyWebViewAPI {
   update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_provider_api_key(providerId: string): Promise<{ ok: boolean; api_key?: string; msg?: string }>;
   delete_provider(providerId: string): Promise<any>;
-  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
+  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null, reasoningChoice?: string | null): Promise<any>;
   fetch_provider_models(providerId: string): Promise<{ ok: boolean; msg?: string; models?: { id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[]; count?: number }>;
-  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
+  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null, reasoningChoice?: string | null): Promise<any>;
   delete_model(modelId: string): Promise<any>;
   test_model(modelId: string): Promise<any>;
   set_secondary_model(modelId: string): Promise<any>;
@@ -1086,42 +1524,27 @@ export interface PyWebViewAPI {
   // Git 工作台（规格 §11/§13；桥接层 gui_git_mixin.GitBridgeMixin）
   // ---------------------------------------------------------------------------
   git_get_status(workdir: string): Promise<GitBridgeResult>;
-  git_refresh(workdir: string): Promise<GitBridgeResult>;
   git_stage(workdir: string, paths: string[]): Promise<GitBridgeResult>;
   git_stage_all(workdir: string): Promise<GitBridgeResult>;
   git_unstage(workdir: string, paths: string[]): Promise<GitBridgeResult>;
   git_commit(workdir: string, title: string, body?: string, amend?: boolean): Promise<GitBridgeResult>;
-  git_undo_last_commit(workdir: string, keepStaged: boolean): Promise<GitBridgeResult>;
-  git_discard_changes(workdir: string, paths: string[]): Promise<GitBridgeResult>;
   git_list_branches(workdir: string): Promise<GitBridgeResult>;
   git_switch_branch(workdir: string, target: string): Promise<GitBridgeResult>;
   git_create_branch(workdir: string, name: string, startPoint?: string, switchAfter?: boolean): Promise<GitBridgeResult>;
-  git_list_remotes(workdir: string): Promise<GitBridgeResult>;
   git_fetch(workdir: string, remote?: string, prune?: boolean): Promise<GitBridgeResult>;
   git_pull(workdir: string): Promise<GitBridgeResult>;
   git_push(workdir: string, remote?: string, refspec?: string, forceWithLease?: boolean, token?: string): Promise<GitBridgeResult>;
   git_load_history(workdir: string, skip?: number, limit?: number): Promise<GitBridgeResult>;
   git_load_diff(workdir: string, path?: string, staged?: boolean, left?: string, right?: string): Promise<GitBridgeResult>;
-  git_blame(workdir: string, path: string): Promise<GitBridgeResult>;
   git_load_reflog(workdir: string, skip?: number, limit?: number): Promise<GitBridgeResult>;
-  git_list_tags(workdir: string): Promise<GitBridgeResult>;
-  git_list_stashes(workdir: string): Promise<GitBridgeResult>;
   git_stash_create(workdir: string, message: string, includeUntracked: boolean): Promise<GitBridgeResult>;
-  git_stash_apply(workdir: string, index: number): Promise<GitBridgeResult>;
-  git_stash_drop(workdir: string, index: number): Promise<GitBridgeResult>;
   git_preview_risk(workdir: string, operation: string, params: Record<string, any>): Promise<GitBridgeResult>;
   git_confirm_operation(workdir: string, operation: string, params: Record<string, any>, token: string): Promise<GitBridgeResult>;
   git_get_trust(workdir: string): Promise<GitBridgeResult>;
   git_allow_once(workdir: string): Promise<GitBridgeResult>;
   git_trust_repository(workdir: string): Promise<GitBridgeResult>;
-  git_worktree_list(workdir: string): Promise<GitBridgeResult>;
-  git_worktree_add(workdir: string, path: string, branch: string, newBranch: boolean): Promise<GitBridgeResult>;
-  git_worktree_remove(workdir: string, path: string, force: boolean): Promise<GitBridgeResult>;
-  git_stop_monitoring(workdir: string): Promise<GitBridgeResult>;
   git_load_conflict(workdir: string, path: string): Promise<GitBridgeResult>;
   git_resolve_conflict(workdir: string, path: string, resultText?: string, side?: string): Promise<GitBridgeResult>;
-  git_read_rebase_plan(workdir: string): Promise<GitBridgeResult>;
-  git_write_rebase_plan(workdir: string, plan: { action: string; oid: string; summary: string }[]): Promise<GitBridgeResult>;
   git_recover_branch(workdir: string, oid: string, name: string): Promise<GitBridgeResult>;
   git_ai_assist(workdir: string, kind: string): Promise<GitBridgeResult>;
 }

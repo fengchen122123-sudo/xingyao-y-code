@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import config
 import core.model_manager as model_manager
 import core.llm as llm
-from core.llm_policy import DEFAULT_USER_AGENT
+from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 from gui_bridge import ApiBridge
 
 
@@ -524,7 +524,7 @@ def test_fetch_provider_models_adds_tokenrhythm_agent_header(tmp_path, monkeypat
     result = _bare_bridge().fetch_provider_models("p1")
 
     assert result["ok"] is True
-    assert captured["headers"]["X-TokenRhythm-Agent"] == DEFAULT_USER_AGENT
+    assert captured["headers"]["X-TokenRhythm-Agent"] == TOKENRHYTHM_AGENT_NAME
 
 
 def test_fetch_provider_models_omits_tokenrhythm_agent_header_for_other_providers(
@@ -687,3 +687,364 @@ def test_fetch_provider_models_enriches_from_spec_table(tmp_path, monkeypatch):
     # 两边都没有 → 保持 None，由前端留空走内置默认
     assert by_id["unknown-model-xyz"]["context_window"] is None
     assert by_id["unknown-model-xyz"]["max_tokens"] is None
+
+
+def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypatch):
+    """模型条目必须带上思考设置字段，供模型编辑弹窗回填「思考设置」下拉。
+
+    - 已登记模型（deepseek-v4-pro）给出真实档位 default/off/high/max，
+      并带上官方默认档位 high；
+    - 未登记模型回落通用强度兜底 default/off/low/medium/high/max（无内置默认
+      档位，default_choice 为空串），而不是隐藏思考设置。
+    """
+    data = _configured_data()
+    data["providers"][0]["models"] = [
+        {
+            "id": "m1",
+            "name": "deepseek-v4-pro",
+            "litellm_model": "openai/deepseek-v4-pro",
+            "context_window": 200000,
+        },
+        {
+            "id": "m2",
+            "name": "hy4-preview",
+            "litellm_model": "openai/hy4-preview",
+            "context_window": 128000,
+        },
+    ]
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    bridge = _bare_bridge()
+
+    def _snapshot_models():
+        return {m["id"]: m for m in bridge.get_model_settings()["models"]}
+
+    known = _snapshot_models()["m1"]
+    assert known["reasoning_choice"] == "default"
+    assert known["reasoning_visible"] is True
+    assert known["reasoning_kind"] == "effort"
+    assert "default" in [opt["value"] for opt in known["reasoning_options"]]
+    assert known["reasoning_disabled_reason"] == ""
+    assert [opt["value"] for opt in known["reasoning_options"]] == [
+        "default", "off", "high", "max"
+    ]
+    # 已登记模型的官方默认档位随条目下发，供弹窗自动预选
+    assert known["reasoning_default_choice"] == "high"
+
+    # 未登记模型：通用强度兜底，GUI 仍显示可操作的思考设置
+    unknown = _snapshot_models()["m2"]
+    assert unknown["reasoning_visible"] is True
+    assert [opt["value"] for opt in unknown["reasoning_options"]] == [
+        "default", "off", "low", "medium", "high", "max"
+    ]
+    assert unknown["reasoning_default_choice"] == ""
+
+    ok, msg = model_manager.set_model_reasoning_choice("m1", "high")
+    assert ok is True, msg
+    assert _snapshot_models()["m1"]["reasoning_choice"] == "high"
+
+
+# ---------------- 思考设置随模型新增/编辑落库（reasoning_choice） ----------------
+
+
+def _data_with_model(name):
+    """构造只含一个指定名称模型的临时配置。"""
+    data = _configured_data()
+    data["providers"][0]["models"] = [
+        {
+            "id": "m1",
+            "name": name,
+            "litellm_model": f"openai/{name}",
+            "context_window": 200000,
+        }
+    ]
+    return data
+
+
+def test_add_model_persists_reasoning_choice(tmp_path, monkeypatch):
+    """add_model 传 reasoning_choice="max"：新增成功且思考档位落库。"""
+    _use_tmp_config(tmp_path, monkeypatch, _data_with_model("deepseek-v4-pro"))
+    bridge = _bare_bridge()
+
+    added = bridge.add_model(
+        "p1", "deepseek-v4-pro", 200000, True, True, "", None, "max"
+    )
+
+    assert added["ok"] is True, added["msg"]
+    model_id = added["model_id"]
+    stored = next(
+        model
+        for provider in json.loads(
+            (tmp_path / "config.json").read_text(encoding="utf-8")
+        )["providers"]
+        for model in provider["models"]
+        if model["id"] == model_id
+    )
+    assert stored["reasoning_choice"] == "max"
+    assert stored["reasoning_effort"] == "max"
+    assert model_manager.get_model_reasoning_choice(model_id) == "max"
+
+    # 不传 reasoning_choice 的旧调用不得改动思考设置（向后兼容）
+    plain = bridge.add_model("p1", "deepseek-v4-pro-b", 200000)
+    assert plain["ok"] is True, plain["msg"]
+    assert model_manager.get_model_reasoning_choice(plain["model_id"]) == "default"
+
+
+def test_update_model_persists_reasoning_choice(tmp_path, monkeypatch):
+    """update_model 传 reasoning_choice="high"：编辑成功且思考档位落库。"""
+    _use_tmp_config(tmp_path, monkeypatch, _data_with_model("deepseek-v4-pro"))
+    bridge = _bare_bridge()
+
+    result = bridge.update_model(
+        "p1", "m1", "deepseek-v4-pro", 200000, True, True, "", None, "high"
+    )
+
+    assert result["ok"] is True, result["msg"]
+    stored = next(
+        model
+        for provider in json.loads(
+            (tmp_path / "config.json").read_text(encoding="utf-8")
+        )["providers"]
+        for model in provider["models"]
+        if model["id"] == "m1"
+    )
+    assert stored["reasoning_choice"] == "high"
+    assert model_manager.get_model_reasoning_choice("m1") == "high"
+
+
+def test_update_model_rejects_unsupported_reasoning_choice_without_failing(
+    tmp_path, monkeypatch
+):
+    """非法档位（glm-5.3 不支持 off）：模型主体照常保存，思考设置只警告。"""
+    _use_tmp_config(tmp_path, monkeypatch, _data_with_model("glm-5.3"))
+    bridge = _bare_bridge()
+
+    result = bridge.update_model(
+        "p1", "m1", "glm-5.3-renamed", 256000, True, True, "", 8192, "off"
+    )
+
+    assert result["ok"] is True
+    assert "思考设置未生效" in result["msg"]
+    assert "off" in result["msg"]
+    stored = next(
+        model
+        for provider in json.loads(
+            (tmp_path / "config.json").read_text(encoding="utf-8")
+        )["providers"]
+        for model in provider["models"]
+        if model["id"] == "m1"
+    )
+    # 模型主体已更新，未被思考设置失败回滚
+    assert stored["name"] == "glm-5.3-renamed"
+    assert stored["context_window"] == 256000
+    assert stored["max_tokens"] == 8192
+    # 思考设置未生效，仍是默认
+    assert model_manager.get_model_reasoning_choice("m1") == "default"
+    assert "reasoning_choice" not in stored
+
+
+def test_stale_reasoning_choice_keeps_row_visible(tmp_path, monkeypatch):
+    """配置里存了能力表已不支持的档位（deepseek-v4-pro 无 low）时：
+
+    整行思考设置必须仍然可见（reasoning_visible is True），只把选择回退成
+    默认档。若在这里把 visible 置 False，用户就再也无法从 UI 改回合法档位
+    ——回归：此前 get_model_settings 的兜底会把整行隐藏。
+    """
+    data = _data_with_model("deepseek-v4-pro")
+    data["providers"][0]["models"][0]["reasoning_choice"] = "low"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    item = next(
+        model for model in _bare_bridge().get_model_settings()["models"]
+        if model["id"] == "m1"
+    )
+
+    assert item["reasoning_visible"] is True
+    assert item["reasoning_kind"] == "effort"
+    assert item["reasoning_choice"] == "default"
+    assert [opt["value"] for opt in item["reasoning_options"]] == [
+        "default", "off", "high", "max"
+    ]
+
+
+def test_get_reasoning_snapshot_by_name():
+    """按未落库的模型名预览思考能力（新增/改名时用），choice 恒为 default。"""
+    bridge = _bare_bridge()
+
+    known = bridge.get_reasoning_snapshot_by_name("deepseek-v4-pro")
+    assert known["ok"] is True
+    assert known["reasoning"]["kind"] == "effort"
+    assert [opt["value"] for opt in known["reasoning"]["options"]] == [
+        "default", "off", "high", "max"
+    ]
+    assert known["reasoning"]["choice"] == "default"
+    assert known["reasoning"]["visible"] is True
+    assert known["reasoning"]["default_choice"] == "high"
+
+    unknown = bridge.get_reasoning_snapshot_by_name("hy4-preview")
+    assert unknown["ok"] is True
+    assert unknown["reasoning"]["kind"] == "effort"
+    assert [opt["value"] for opt in unknown["reasoning"]["options"]] == [
+        "default", "off", "low", "medium", "high", "max"
+    ]
+    assert unknown["reasoning"]["default_choice"] == ""
+    assert unknown["reasoning"]["visible"] is True
+
+    hidden = bridge.get_reasoning_snapshot_by_name("sensenova-6.7-flash-lite")
+    assert hidden["ok"] is True
+    assert hidden["reasoning"]["visible"] is False
+    assert hidden["reasoning"]["kind"] == "hidden"
+
+    empty = bridge.get_reasoning_snapshot_by_name("")
+    assert empty["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 多 Key provider：取 Key 路径与 Key 池一致（单 Key 化），写入/展示原文不变
+# ---------------------------------------------------------------------------
+
+
+def test_get_active_model_returns_single_key_for_multi_key_provider(tmp_path, monkeypatch):
+    """多 Key provider：get_active_model 必须返回 Key 池「当前该用」的单 Key，
+    不得把多行/逗号分隔串整体当作一个 Key 返回。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-first\nsk-second"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    active = model_manager.get_active_model()
+
+    assert active["api_key"] == "sk-first"
+    assert "\n" not in active["api_key"]
+    assert "," not in active["api_key"]
+
+
+def test_get_active_model_keeps_single_key_as_is(tmp_path, monkeypatch):
+    """单 Key provider：get_active_model 原样返回，行为与改造前一致。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+
+    active = model_manager.get_active_model()
+
+    assert active["api_key"] == "sk-secret-value"
+
+
+def test_get_secondary_model_returns_single_key_for_multi_key_provider(tmp_path, monkeypatch):
+    """副模型读取路径同样只返回单 Key（与主链路 Key 池一致）。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-a,sk-b"
+    data["secondary_model_id"] = "m1"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    secondary = model_manager.get_secondary_model()
+
+    assert secondary["api_key"] == "sk-a"
+    assert "," not in secondary["api_key"]
+
+
+def test_get_provider_api_key_returns_full_multiline_raw(tmp_path, monkeypatch):
+    """设置页「显示/复制」路径必须返回完整多行原文（不得拆成单 Key 返回）。"""
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-line1\nsk-line2"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    result = _bare_bridge().get_provider_api_key("p1")
+
+    assert result["ok"] is True
+    assert result["api_key"] == "sk-line1\nsk-line2"
+
+
+def test_fetch_provider_models_prefers_current_key_for_multi_key_provider(tmp_path, monkeypatch):
+    """多 Key provider：拉取模型列表逐 Key 尝试，池「当前该用」的 Key 优先；
+    鉴权头绝不携带多行串整体。"""
+    import httpx
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-first\nsk-second"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "alpha"}]}
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["headers"] = headers
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert captured["headers"]["Authorization"] == "Bearer sk-first"
+    assert captured["headers"]["x-api-key"] == "sk-first"
+
+
+def test_fetch_provider_models_falls_back_to_next_key_on_auth_failure(tmp_path, monkeypatch):
+    """多 Key provider：首个 Key 鉴权失败（401）自动换下一个 Key，任一成功即返回列表。"""
+    import httpx
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["api_key"] = "sk-bad\nsk-good"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    seen_auth = []
+
+    class _FakeResponse:
+        def __init__(self, status_code, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, headers=None, timeout=None):
+        seen_auth.append(headers.get("Authorization", ""))
+        if headers.get("Authorization") == "Bearer sk-bad":
+            return _FakeResponse(401, text="unauthorized")
+        return _FakeResponse(200, {"data": [{"id": "alpha"}]})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert seen_auth == ["Bearer sk-bad", "Bearer sk-good"]
+
+
+def test_test_model_falls_back_to_next_key(tmp_path, monkeypatch):
+    """多 Key provider：测试模型时首个 Key 失败自动换下一个 Key，任一成功即通过。"""
+    import core.provider_keys as provider_keys
+
+    provider_keys._POOL_REGISTRY.clear()
+    data = _configured_data()
+    data["providers"][0]["protocol"] = "openai"
+    data["providers"][0]["api_key"] = "sk-bad\nsk-good"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    seen_keys = []
+
+    def fake_completion(**kwargs):
+        seen_keys.append(kwargs.get("api_key"))
+        if kwargs.get("api_key") == "sk-bad":
+            raise RuntimeError("401 invalid api key")
+        return [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="pong"))])]
+
+    monkeypatch.setattr(llm, "completion", fake_completion)
+
+    result = _bare_bridge().test_model("m1")
+
+    assert result["ok"] is True
+    assert seen_keys == ["sk-bad", "sk-good"]

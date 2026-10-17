@@ -8,13 +8,12 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
       ycode.exe                  CLI 控制台版 (console=True)
       _internal/                 两者共享的运行时依赖与数据文件
   dist/ycode_uninstall.exe     独立卸载向导
-  dist/Y-code-cli-{版本}.exe   独立 CLI 安装向导（供主安装包内嵌，也可单独分发）
+  dist/Y-code-cli-{版本}.exe   独立 CLI 安装向导（单独分发，补装/纯 CLI 用户）
   dist/XingYaoCode-{版本}.exe  主安装向导（默认装 GUI，可选附带装 CLI）
   dist/release_parts/          Gitee Release 附件（超 100MB 的安装包按 ≤95MB
                                二进制分卷 .part1/.part2/...，附 RELEASE_NOTES.txt
                                上传指引，内含 SHA256 校验行）
-  （两个安装向导文件名带版本号，便于多渠道分发时区分新旧；内嵌进主安装包的
-    cli/ycode_cli_setup.exe 仍用固定名，安装引擎按固定名查找。）
+  （两个安装向导文件名带版本号，便于多渠道分发时区分新旧。）
 
 用法：
   venv\\Scripts\\python build_release.py                   完整构建
@@ -27,6 +26,7 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
 import argparse
 import glob
 import hashlib
+import importlib.util
 import os
 import re
 import shutil
@@ -84,6 +84,72 @@ def resolve_pyinstaller(project_dir):
     print("   venv\\Scripts\\activate")
     print("   venv\\Scripts\\pip install pyinstaller")
     sys.exit(1)
+
+
+def _strip_python_comment(line):
+    """剥掉一行 Python 代码里的注释（整行与行尾）：引号外的首个 # 起截断。
+
+    spec 里的 collect_all('x') 写进注释只是文档不是配置，混进解析结果会让
+    硬校验对不存在的包误报缺依赖、白白卡死构建，因此解析前必须剥离。
+    """
+    in_str = None
+    for i, ch in enumerate(line):
+        if in_str:
+            if ch == in_str:
+                in_str = None
+        elif ch in "'\"":
+            in_str = ch
+        elif ch == "#":
+            return line[:i]
+    return line
+
+
+def collect_all_targets_from_spec(spec_path):
+    """从 PyInstaller spec 提取全部 collect_all('包名') 目标（去重保序）。
+
+    以 spec 文件为唯一事实源解析，而不是在本脚本里另抄一份包名清单——
+    以后往 spec 加 collect_all 时校验自动跟上，不会出现两处清单漂移。
+    解析前剥离注释（见 _strip_python_comment），防止注释里的 collect_all
+    字样解析出假目标。
+    """
+    pattern = re.compile(r"collect_all\(\s*['\"]([A-Za-z0-9_.]+)['\"]\s*\)")
+    targets = []
+    with open(spec_path, "r", encoding="utf-8") as f:
+        for line in f:
+            code = _strip_python_comment(line)
+            for match in pattern.finditer(code):
+                if match.group(1) not in targets:
+                    targets.append(match.group(1))
+    return targets
+
+
+def find_missing_collect_all_targets(targets):
+    """返回 targets 中构建环境 import 不到的包名（find_spec 只定位不执行模块）。"""
+    missing = []
+    for name in targets:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is None:
+            missing.append(name)
+    return missing
+
+
+def verify_spec_collect_all_targets(project_dir):
+    """主程序构建前的环境硬校验：ycode.spec 每个 collect_all 目标必须可 import。
+
+    背景：PyInstaller 的 collect_all 对构建环境里缺失的包静默返回空三元组
+    （6.21.0 实测只打 WARNING 不报错），Analysis 照常通过，产物直接丢依赖。
+    pywinpty（GUI 内嵌终端）是重灾区——core/gui_terminal.py 被 gui_bridge.py 顶层
+    导入，其 `from winpty import PtyProcess` 虽是函数内 import，但仍是字面 import、
+    字节码扫描可识别，Python 模块本身不漏收；真正需要 collect_all 的是 pywinpty 的
+    原生二进制与 datas（默认收集不全，collect_all 是收全它们的唯一通道）；缺包时
+    打包版终端启动即报 ModuleNotFoundError，且整个构建流程没有任何失败信号。
+    """
+    return find_missing_collect_all_targets(
+        collect_all_targets_from_spec(os.path.join(project_dir, "ycode.spec"))
+    )
 
 
 def read_project_version(project_dir):
@@ -163,6 +229,27 @@ def step0_build_frontend(project_dir, args):
         print("   2) 尚未执行过 npm install 安装前端依赖")
         print("   3) frontend/src 下的 TypeScript / Vue 代码存在编译错误")
         sys.exit(1)
+
+    # 首屏包体积守门：GUI 首屏只加载 index-*.js，体积必须受控。
+    # 既有约定是重依赖（语言包、语法高亮语言模式、图表/终端等大库）一律动态 import，
+    # 一旦某个大模块被静态引入，这里就会失败并给出可读告警。
+    # 注：计划原文用 `base_dir`，本函数的对应变量名是 `project_dir`（函数内无 base_dir），
+    # 故这里逐字保留校验逻辑、只把根目录变量名对齐到本函数的作用域。
+    dist_assets = os.path.join(project_dir, "frontend", "dist", "assets")
+    MAX_ENTRY_BYTES = 1_800_000  # 首屏 JS 上限 1.8 MB
+    if os.path.isdir(dist_assets):
+        entry_files = [
+            f for f in os.listdir(dist_assets)
+            if f.startswith("index-") and f.endswith(".js")
+        ]
+        for name in entry_files:
+            size = os.path.getsize(os.path.join(dist_assets, name))
+            if size > MAX_ENTRY_BYTES:
+                raise SystemExit(
+                    f"前端首屏包过大：{name} {size / 1024 / 1024:.2f} MB，"
+                    f"上限 {MAX_ENTRY_BYTES / 1024 / 1024:.2f} MB。"
+                    "请检查是否有语言包被静态引入。"
+                )
 
     if not os.path.exists(index_html):
         print("❌ npm run build 已执行完成，但未生成 frontend/dist/index.html，请检查 vite 构建配置。")
@@ -326,13 +413,20 @@ def make_payload_archive(project_dir, ycode_dir):
     超过一分钟毫无反应（用户以为安装包坏了）。压缩成单文件后，启动解压量从
     4000+ 个文件降到十几个，界面几秒内出现；真正的文件释放挪到安装步骤里做
     （有进度条，符合正常安装体验）。
+
+    为什么 ZIP_LZMA 而不是 DEFLATE-6：载荷体积再省 ~15-20%，且载荷在每个
+    安装器里各嵌一份、直接决定安装器体积。释放侧 ycode_setup._copy_payload
+    走 zf.read() 逐成员读，对压缩算法完全透明；安装向导通过模块级
+    `import lzma` 已随包 _lzma 解码器。代价：压缩耗时约 2-4 分钟、安装时
+    解压略慢 1-3 秒（进度条内无感）；且 Explorer 无法直接打开 LZMA zip——
+    本产物仅供安装器内嵌，不是用户可直接解压的分发物。
     """
     zip_path = os.path.join(project_dir, "build", "ycode_pkg.zip")
     if os.path.exists(zip_path):
         os.remove(zip_path)
-    print("📦 正在压缩核心程序包为单文件载荷 (ycode_pkg.zip)...")
+    print("📦 正在压缩核心程序包为单文件载荷 (ycode_pkg.zip, LZMA)...")
     count = 0
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_LZMA, allowZip64=True) as zf:
         for root, _dirs, files in os.walk(ycode_dir):
             for name in files:
                 src = os.path.join(root, name)
@@ -363,14 +457,18 @@ def step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_e
     )
 
 
-def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, cli_setup_exe):
+def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe):
     print("\n[步骤 4/5] 正在编译主安装向导 ycode_setup.exe...")
+    # 不再内嵌 cli/ycode_cli_setup.exe（-222MB）：主安装器的 full 模式本来就
+    # 用同一份载荷直接释放 ycode.exe（run_install → _copy_payload），内嵌的
+    # CLI 安装器只在"用户勾掉 CLI"的兜底场景被复制到安装目录，却让 169MB
+    # 载荷 + 32MB 卸载器在主安装包里各出现两次。补装路径改为：重跑主安装
+    # 向导勾选「命令行版」。
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="full", output_name="ycode_setup",
         add_data_pairs=[
             (payload_zip, "."),
             (uninstall_exe, "."),
-            (cli_setup_exe, "cli"),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
             # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
@@ -705,15 +803,33 @@ def build():
         print("ℹ 已指定 --setup-only，跳过前端 / 核心载荷 / 卸载程序构建，直接复用现有产物。")
         payload_zip = make_payload_archive(project_dir, ycode_dir)
     else:
+        # 硬校验放在最前（含前端构建之前）：环境缺包时尽快失败，不浪费时间。
+        # --setup-only 分支复用既有载荷、不重新 Analysis，无需此检查。
+        missing_collect_all = verify_spec_collect_all_targets(project_dir)
+        if missing_collect_all:
+            print("❌ 构建环境缺少 ycode.spec collect_all 依赖的包: "
+                  + ", ".join(missing_collect_all))
+            print("   collect_all 对构建环境缺失的包会静默返回空而不报错，继续构建")
+            print("   会产出丢失该依赖的安装包（典型症状：打包后 GUI 内嵌终端启动")
+            print("   即报 No module named 'winpty'）。")
+            print("   请先补齐依赖：venv\\Scripts\\python -m pip install -r requirements.txt")
+            sys.exit(1)
+        # 供应链把关（审查 B8-03）：vendor/ 随包资源（内置 ripgrep / mermaid）
+        # 是安装包的组成输入，其来源与哈希必须与 vendor/VENDOR_MANIFEST.json
+        # 记录一致；校验失败即中止构建，防止被篡改或漂移的资源打进产物。
+        run_checked(
+            [sys.executable, os.path.join(project_dir, "scripts", "verify_vendor.py")],
+            "vendor 随包资源校验",
+        )
         step0_build_frontend(project_dir, args)
         ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
         payload_zip = make_payload_archive(project_dir, ycode_dir)
         uninstall_exe = step2_build_uninstaller(pyinstaller_bin, project_dir)
 
-    cli_setup_exe = step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
+    step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
 
     if not args.cli_only:
-        step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, cli_setup_exe)
+        step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
 
     version = read_project_version(project_dir)
     step4b_rename_setups(project_dir, version, args.cli_only)

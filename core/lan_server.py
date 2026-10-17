@@ -210,7 +210,10 @@ class LanServer:
     # 以及电脑操控权限扩张方法（Task 15，设计 18：手机只可查看状态与紧急停止，
     # 不得远程开启/暂停/恢复/确认安全检查）与 drain_js_queue（Task 13a 审查
     # Minor 1 的 fail-closed 默认裁决：LAN 排空 _js_queue 会偷走桌面事件并
-    # 可能消费关停哨兵）。
+    # 可能消费关停哨兵），以及交互式终端的写入/销毁类方法与 LSP 路径覆写
+    # （Task 17：见下方 pty_terminal_* 分组的「只读留、写入/销毁封」划界）。
+    # 本轮边界审计（明文凭据读取 / 写桌面持久配置且决定后续执行 / 与已封
+    # 方法同类同边界）再补 6 项，逐项理由见下方各分组注释。
     FORBIDDEN_METHODS = frozenset({
         # 窗口控制（桌面专属，手机无意义）
         "window_minimize", "window_toggle_maximize", "window_native_maximize",
@@ -227,6 +230,100 @@ class LanServer:
         "resume_computer_control", "acknowledge_computer_safety",
         # GUI 事件桥内部测试 seam（等价于窃听/阻断桌面事件流）
         "drain_js_queue",
+        # IDE 桥的状态变更类方法（历史项：2026-10-17 IDE 子系统整体移除后，
+        # gui_bridge 侧已无这些方法）。名单项保留作纵深防御——写文件 / 改打开
+        # 集合 / 覆盖持久化布局都不是手机远程控制该有的能力，与 open_path /
+        # save_clipboard_image 同一边界（设计 18 fail-closed）；若将来同名方法
+        # 被重新引入，这里仍然默认封禁。
+        "ide_write_file", "ide_set_open_files", "ide_save_layout",
+        # 历史项：ide_run_file 曾往桌面常驻终端写一行命令并回车（支持 command=
+        # 原样透传），等于开放远程任意命令执行；方法已移除，名单项同为纵深防御。
+        "ide_run_file",
+        # 交互式终端（底部面板常驻 shell，pty_terminal_*）。按「只读/查看/调尺寸」
+        # 与「写入/执行/销毁」划界——不能整组封：封了 write/kill 就必须留
+        # ensure/resize，否则手机端连终端输出都看不到（本组方法共 4 个，无
+        # clear/read 之类）。
+        #   保留放行（不列入本集合）：
+        #     pty_terminal_ensure —— 只确保会话存活（复用存活会话则原样返回，
+        #       不写入任何输入字节），手机端据此订阅 pty_data 事件看到桌面
+        #       终端同一屏输出；
+        #     pty_terminal_resize —— 只把 xterm 视口尺寸同步给 ConPTY，不改
+        #       终端内容与进程状态。
+        #   两者都是「查看」，与既有设计原则「手机只可查看状态与紧急停止」
+        #   完全一致，必须放行。
+        #   封禁：
+        #     pty_terminal_write —— 把任意字符串原样写进桌面常驻 shell，语义
+        #       就是远程任意命令执行；比已封的 ide_run_file 更直接（连文件
+        #       路径都不校验、不经 gui_path_access_allowed），是本次要封掉的
+        #       那条「远程执行任意命令」通道本体；
+        #     pty_terminal_kill —— 终止用户的常驻 shell（销毁桌面用户态会话，
+        #       正在跑的任务随之消失），属「销毁」类。
+        "pty_terminal_write", "pty_terminal_kill",
+        # 语言服务器可执行文件路径覆写（历史项：LSP 子系统已随 IDE 移除，
+        # gui_bridge 侧无此方法）。名单项保留作纵深防御——写盘 override 并
+        # recycle 等价于让桌面下次启动任意可执行文件，与 ide_write_file 同边界。
+        "lsp_set_server_path",
+        # 明文凭据读取（本轮边界审计）：快照类方法一律只回 has_* 布尔
+        # （get_model_settings 的 has_api_key、get_feishu_settings 的
+        # has_secret），明文只在用户点「显示/复制」时按需取回。手机端不需要
+        # 这个能力——设置页的正常显示/回填走 has_* 布尔（占位文案「已配置；
+        # 留空表示不修改」），只有「显示」「复制」两个按钮会落空
+        # （SettingsPage.revealProviderKey 取不到明文时保持掩码，不抛异常）。
+        # 一旦放行，配对手机（或手机页面上任何脚本）就能一次性拖走全部厂商
+        # Key 与飞书 app_secret，属最不可接受的泄露面。
+        "get_provider_api_key", "get_feishu_secret",
+        # 写桌面持久配置且决定桌面后续执行内容：hook 命令的信任门禁在「用户级」
+        # 上是默认放行的（core/hooks/trust.py:status_for，scope == "user" 直接
+        # 返回 TRUST_TRUSTED），而 LAN 侧 payload 的 scope 由客户端自选——因此
+        # save_hook(scope="user") 写一次 ~/.ycode/hooks.json，就能让任意命令在
+        # 此后每次 SessionStart/PreToolUse/PostToolUse/Stop 上长期执行，且不产生
+        # 任何桌面确认（比刚封的 pty_terminal_write「一次一写」更宽）。
+        # grant_hook_trust 是同一通道的另一半：给项目级 pending hook 授信同样
+        # 等于远程放行任意 shell 命令，与已封的 acknowledge_computer_safety
+        # 同类（远程「确认安全检查」，设计 18 明确禁止）。deny/revoke/reset
+        # 只做减法（blocked/pending 都不会执行），保持放行。
+        "save_hook", "grant_hook_trust",
+        # MCP 服务新增：写盘 mcp.json 并立即 spawn（mcp_client.add_server 只
+        # 校验「命令名 ∈ npx/node/python 且不含路径」，args 原样透传，即
+        # npx -y <任意包> 仍可在桌面拉起任意代码），与已封的 lsp_set_server_path
+        # 同一边界（写一次配置 → 让桌面执行任意可执行文件），且比它更直接
+        # （写入即执行，不用等下次启动）。只读的 get_mcp_servers 与纯重连的
+        # reconnect_mcp 保持放行。
+        "add_mcp_server",
+        # 桌面持久化布局（ui_layout.json）：与已封的 ide_save_layout 同类同边界
+        # （覆盖桌面下次启动的侧栏排序），此前黑名单存在同类不对称。手机端无此
+        # 能力需求（frontend-mobile 不调用它）；只读的 get_ui_layout 保持放行。
+        "save_ui_layout",
+        # 会话级 UI 状态（历史项：session_ui 存储已随 IDE 移除一并删除，
+        # gui_bridge 侧无对应方法）。名单项保留作纵深防御——写桌面持久状态，
+        # 与 save_ui_layout 同一边界（设计 18 fail-closed）。
+        "save_session_ui",
+        # 桌面专属生命周期：shutdown 停掉自动化引擎、set 掉全部取消事件（正在跑
+        # 的回合被中止）并走窗口销毁链路——与已封的 window_close /
+        # window_confirm_close 同类（桌面专属，手机无意义）。桌面前端不调用它
+        # （唯一调用方是 gui_main 的窗口销毁链路），黑名单此前存在同类不对称。
+        "shutdown",
+        # 自动化任务链（本轮边界审计 Important）：手机端原本可经
+        #   save_automation_task(permission_mode="full") → set_automation_task_enabled(True)
+        #   或 run_automation_task_now(task_id)
+        # 拿到一次「full 档」的桌面回合——automation 任务自带 permission_mode
+        # （core/automation/models.py 允许 "full"，即免确认执行文件写入与命令），
+        # 而 run_automation_task_now 内部硬编码 turn_source="local"
+        # （gui_bridge.py 的 _dispatch_automation_run），于是该回合连
+        # resolve_computer_capability 的远程禁令都不继承（判据正是
+        # turn_source != "local"）。这比已封的 save_hook 更直接：不需要等事件
+        # 触发，写一次任务即可长期反复执行。仅强制 turn_source 不足以堵住
+        # ——任务自带的 full 档权限仍会生效，所以必须封「写任务 / 启停 /
+        # 立即执行」这三个决定「桌面要不要跑、以什么档位跑」的入口。
+        # 只读快照（get_automation_tasks / get_automation_runs）保持放行，
+        # 手机端仍可查看任务与运行历史；frontend-mobile 对这三个方法零引用。
+        "save_automation_task", "set_automation_task_enabled", "run_automation_task_now",
+        # MCP 服务启停：与已封的 add_mcp_server 同通道——「启用」半边能把桌面
+        # 用户主动停用的 MCP 服务远程拉起（拉起即 spawn 该服务配置的命令），
+        # 属「写配置 → 让桌面执行」。此前以「移动端在用」为由保留，经核实
+        # frontend-mobile 零引用，该理由不成立。只读的 get_mcp_servers 与
+        # 纯重连的 reconnect_mcp 保持放行。
+        "toggle_mcp_server",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
@@ -630,6 +727,16 @@ class LanServer:
             return {"error": {"code": "method_not_allowed"}}
         if method.startswith("_"):
             return {"error": {"code": "method_not_allowed"}}
+        # set_permission_mode 的全局分支（session_name 为空）会改写**并落盘**
+        # 桌面全局权限档位（gui_bridge.py 的 set_permission_mode 在
+        # target_session 为空时调 app_context.set_permission_mode 并
+        # save_config_value("permission_mode", ...)）——手机端可据此把桌面
+        # 长期置成 full（免确认执行文件写入与命令）。手机端只需要会话级切换
+        # （frontend-mobile 调用时恒带 currentSession），全局档位属桌面持久
+        # 状态，与「手机只可查看状态与紧急停止」一致：LAN 侧 fail-closed，
+        # 只放行带 session 的会话级切换。
+        if method == "set_permission_mode" and not self._lan_session_arg(args):
+            return {"error": {"code": "method_not_allowed"}}
         extra_kwargs = None
         if method in self.MESSAGE_ENTRY_METHODS:
             normalized = self._force_lan_turn_source(args)
@@ -637,6 +744,22 @@ class LanServer:
                 return {"ok": False, "msg": "消息参数无法规范化，已拒绝"}
             args, extra_kwargs = normalized
         return self._call_bridge(method, args, extra_kwargs)
+
+    @staticmethod
+    def _lan_session_arg(args) -> str:
+        """从 LAN 参数里取 session_name（缺省/空/类型不符一律返回空串）。
+
+        位置通道取第 2 个位置参数（``set_permission_mode(mode, session_name)``），
+        kwargs 通道取同名键——两种形态都要按 strip 后的非空串判定，否则
+        ``{"session_name": "  "}`` 这类空白串会绕过守卫落到全局分支。
+        """
+        if isinstance(args, dict):
+            value = args.get("session_name", "")
+        elif isinstance(args, (list, tuple)):
+            value = args[1] if len(args) > 1 else ""
+        else:
+            value = ""
+        return str(value or "").strip()
 
     def _force_lan_turn_source(self, args):
         """消息入口参数规范化：剥离客户端一切 turn_source 绑定与权限档位注入通道。
