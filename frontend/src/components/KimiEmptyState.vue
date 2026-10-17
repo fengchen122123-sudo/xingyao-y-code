@@ -172,10 +172,10 @@ import { useSuggest } from '../composables/useSuggest';
 
 const store = useAppStore();
 const gitStore = useGitStore();
-// Git 分支 chip 文案：复用状态栏格式（去掉 ⎇ 前缀）；非 Git 工作区为空隐藏
+// Git 分支 chip 文案：复用状态栏格式（去掉 ⎇ 前缀与 dirty 星号，标题栏/状态栏两处保留星号）；非 Git 工作区为空隐藏
 const gitBranchLabel = computed(() => {
   const text = gitStore.statusbarText;
-  return text ? text.slice(2) : '';
+  return text ? text.slice(2).replace('*', '') : '';
 });
 function openGitPanel() {
   gitStore.requestOpenPanel();

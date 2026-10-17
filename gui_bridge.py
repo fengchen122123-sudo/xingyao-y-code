@@ -1239,6 +1239,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # Agent 工具调用；实现仍是桥侧既有通道（会话检索、_spawn_turn_worker、
         # _message_queues、_set_current_session），不新增并行实现
         self._register_secretary_dispatch_service()
+        # 决策审计实时转发：每次决策落审计后向前端推 decision_recorded
+        # （会话头部徽章与决策记录面板实时刷新；独立支路，失败静默）
+        self._register_decision_audit_listener()
         # 正在运行的星轨自动化回合：turn_id → {"run_id", "task_name"}。
         # 无人值守权限自动拒绝的判定依据（规格 5.5）
         self._automation_turn_labels: Dict[str, Dict[str, str]] = {}
@@ -5472,6 +5475,50 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("list_decision_models 失败")
             return {"ok": False, "models": [], "msg": str(e)}
 
+    def list_decision_providers(self) -> Dict[str, Any]:
+        """列出「决策模型」可选的调用通道（不含 Key 内容；设置页通道下拉用）。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.list_decision_providers()
+            return {
+                "ok": bool(result.get("ok")),
+                "providers": result.get("providers") or [],
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("list_decision_providers 失败")
+            return {"ok": False, "providers": [], "msg": str(e)}
+
+    def get_decision_audit_summary(self, limit: int = 20) -> Dict[str, Any]:
+        """决策审计汇总：今日计数 + 最近 N 条记录（设置页「决策记录」面板用）。"""
+        from core import decision_service
+
+        try:
+            result = decision_service.get_decision_audit_summary(limit)
+            return result if isinstance(result, dict) else {"ok": False, "msg": "汇总返回异常"}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_audit_summary 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def open_decision_audit_dir(self) -> Dict[str, Any]:
+        """在系统文件管理器中打开决策审计目录（缺失时先创建）。"""
+        from core import decision_service
+
+        try:
+            directory = decision_service._audit_dir()
+            os.makedirs(directory, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(directory)  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, directory])
+            return {"ok": True, "path": directory}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("open_decision_audit_dir 失败")
+            return {"ok": False, "msg": str(e)}
+
     def get_decision_audit_tail(self, limit: int = 20) -> Dict[str, Any]:
         """读取决策审计目录最新文件的尾部若干行；目录/文件缺失时返回空列表。"""
         from core import decision_service
@@ -6760,6 +6807,22 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             run_now=self.run_automation_task_now,
             get_runs=self.get_automation_runs,
         ))
+
+    def _register_decision_audit_listener(self) -> None:
+        """把决策审计事件转发为前端桥事件（会话头部徽章 / 决策面板实时刷新）。
+
+        独立支路：不参与会话 runtime 归属；转发失败只记调试日志，绝不影响
+        决策主流程与审计落盘。
+        """
+        from core import decision_service
+
+        def _forward(brief: dict) -> None:
+            try:
+                self.emit_event("decision_recorded", dict(brief or {}))
+            except Exception:
+                logger.debug("decision_recorded 转发失败", exc_info=True)
+
+        decision_service.add_audit_listener(_forward)
 
     def _register_secretary_dispatch_service(self) -> None:
         """把桥侧调度能力注册为 core 层服务句柄（秘书工具的唯一入口）。

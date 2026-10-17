@@ -203,6 +203,40 @@ export interface DecisionModelOption {
   price_text: string;
 }
 
+// list_decision_providers() 条目：可选调用通道（不含 Key 内容，仅报数量）
+export interface DecisionProviderOption {
+  /** provider 的 id（优先）或 name */
+  ref: string;
+  name: string;
+  base_url: string;
+  key_count: number;
+  /** 是否为 provider_ref="auto" 的解析目标（base_url 含 tokenrhythm 的第一个通道） */
+  auto_match: boolean;
+}
+
+// get_decision_audit_summary() 条目：单条审计记录的精简视图（不含正文）
+export interface DecisionAuditRecentItem {
+  ts: string;
+  scene: string;
+  shadow: boolean;
+  adopted: boolean;
+  latency_ms: number | null;
+  fallback_reason: string;
+  model_id: string;
+  answers_digest: string;
+}
+
+// get_decision_audit_summary() 汇总：今日计数 + 最近记录（设置页「决策记录」面板）
+export interface DecisionAuditSummary {
+  ok: boolean;
+  today_count: number;
+  today_shadow_count: number;
+  today_adopted_count: number;
+  today_fallback_count: number;
+  recent: DecisionAuditRecentItem[];
+  msg?: string;
+}
+
 export interface SystemSettingsSnapshot {
   command_shell: string;
   command_shell_options: CommandShellOption[];
@@ -921,6 +955,18 @@ export interface OpenSessionBridgeData {
   workdir?: string;
 }
 
+/** JEV 决策记录实时事件的载荷（后端 gui_bridge 决策审计监听器推送，形状同审计精简条目） */
+export interface DecisionRecordedBridgeData {
+  ts: string;
+  scene: string;
+  shadow: boolean;
+  adopted: boolean;
+  latency_ms: number | null;
+  fallback_reason: string;
+  model_id: string;
+  answers_digest: string;
+}
+
 /**
  * 桥事件名联合。只登记前端 `handleBridgeEvent` 里确有处理分支的事件，
  * `(string & {})` 兜底保证既有 `BridgeEvent.type` 的宽松口径不收紧
@@ -929,6 +975,8 @@ export interface OpenSessionBridgeData {
 export type BridgeEventType =
   // 秘书调度台：系统层跳转（载荷见 OpenSessionBridgeData）
   | 'open_session'
+  // JEV 决策记录实时推送（载荷见 DecisionRecordedBridgeData）
+  | 'decision_recorded'
   | (string & {});
 
 // ---------------------------------------------------------------------------
@@ -1181,6 +1229,12 @@ export interface PyWebViewAPI {
   probe_decision(): Promise<{ ok: boolean; results: DecisionProbeKeyResult[]; model_id: string; msg?: string }>;
   // 从上游拉取 type=="decision" 的模型列表（设置页「从上游拉取」下拉）
   list_decision_models(): Promise<{ ok: boolean; models: DecisionModelOption[]; msg?: string }>;
+  // 可选调用通道列表（不含 Key 内容，仅报数量；设置页通道下拉）
+  list_decision_providers(): Promise<{ ok: boolean; providers?: DecisionProviderOption[]; msg?: string }>;
+  // 决策审计汇总（今日计数 + 最近记录；设置页「决策记录」面板）
+  get_decision_audit_summary(limit?: number): Promise<DecisionAuditSummary>;
+  // 在系统文件管理器中打开决策审计目录（缺失时先创建）
+  open_decision_audit_dir(): Promise<{ ok: boolean; path?: string; msg?: string }>;
   // 决策审计尾部：~/.ycode/decision_audit 最新文件的最后 limit 行
   get_decision_audit_tail(limit?: number): Promise<{ ok: boolean; lines: string[]; msg?: string }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;

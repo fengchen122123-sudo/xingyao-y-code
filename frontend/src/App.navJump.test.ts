@@ -330,3 +330,109 @@ it('分页状态被清空（has_more=false、游标 null）时，跨页跳转仍
   expect(store.historyOldestId).toBe(10);
   wrapper.unmount();
 });
+
+// ---------------------------------------------------------------------------
+// 回归（用户反馈「我之前的对话记录都点不出来」）：长会话的 historyHasMore 会随
+// 会话 runtime 保存/恢复"粘"住坏值（false）。点未加载区红点时，翻页入口守卫
+// 必须不信任该标记，改由 force 通道真发一次请求、让后端用游标裁决——1.3.6 已把
+// 这个哲学改到 onNavJump 的循环终止判定，但漏掉了 loadOlderMessages 入口守卫。
+// ---------------------------------------------------------------------------
+
+it('historyHasMore=false 粘住坏值时：点未加载区红点仍真发翻页请求（force 通道）', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  store.currentSessionName = 'A';
+  store.messages = [
+    { role: 'user', content: '尾部提问', _msg_id: 30 },
+    { role: 'assistant', content: '尾部回复', _msg_id: 31 },
+  ] as any;
+  store.navItems = [
+    { id: 10, preview: '第一条' },
+    { id: 20, preview: '第二条' },
+    { id: 30, preview: '第三条' },
+  ];
+  store.historyHasMore = false; // 粘住的坏值：真实还有更早历史
+  store.historyOldestId = 30;   // 游标可用，不应被 has_more 拦下
+
+  const loadOlder = vi.fn().mockResolvedValue({
+    ok: true,
+    messages: [
+      { role: 'user', content: '第一条', _msg_id: 10 },
+      { role: 'assistant', content: '回复一', _msg_id: 11 },
+      { role: 'user', content: '第二条', _msg_id: 20 },
+      { role: 'assistant', content: '回复二', _msg_id: 21 },
+    ],
+    has_more: false,
+    oldest_id: 10,
+  });
+  (window as any).pywebview = { api: { load_older_messages: loadOlder } };
+
+  const wrapper = mount(App, { global: { stubs } });
+  const el = wrapper.find('#chat-scroll').element as HTMLElement;
+  setMetrics(el, { scrollTop: 500, scrollHeight: 2000 });
+
+  emitJump(wrapper, { index: 0, id: 10 });
+  await wait(250);
+
+  // 核心断言：旧代码被入口守卫拦死（0 次调用）——修复后必须真发一次翻页请求，
+  // 且用「已加载消息里最旧 _msg_id」当游标（30）
+  expect(loadOlder).toHaveBeenCalledWith('A', 30);
+  // 目标消息已进入消息流，可被后续定位
+  expect(store.messages.map(m => m.content)).toEqual([
+    '第一条', '回复一', '第二条', '回复二', '尾部提问', '尾部回复',
+  ]);
+  expect(store.firstLoadedMsgId).toBe(10);
+  wrapper.unmount();
+});
+
+it('多页未加载区：点第 1 个红点连续翻页直到目标进入已加载区，再交回定位', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  store.currentSessionName = 'A';
+  store.messages = [
+    { role: 'user', content: '第 5 条', _msg_id: 50 },
+    { role: 'assistant', content: '回复 5', _msg_id: 51 },
+  ] as any;
+  store.navItems = [10, 20, 30, 40, 50].map(id => ({ id, preview: `第 ${id / 10} 条` }));
+  store.historyHasMore = false; // 坏值粘住：force 通道必须逐页推进
+  store.historyOldestId = 50;
+
+  // 真实分页数据推进（id 50 → 10）：每页一对 user/assistant，末页 has_more=false
+  const loadOlder = vi.fn().mockImplementation(async (_session: string, cursor: number) => {
+    const pageId = cursor - 10;
+    return {
+      ok: true,
+      messages: [
+        { role: 'user', content: `第 ${pageId / 10} 条`, _msg_id: pageId },
+        { role: 'assistant', content: `回复 ${pageId / 10}`, _msg_id: pageId + 1 },
+      ],
+      has_more: pageId > 10,
+      oldest_id: pageId,
+    };
+  });
+  (window as any).pywebview = { api: { load_older_messages: loadOlder } };
+
+  const wrapper = mount(App, { global: { stubs } });
+  const el = wrapper.find('#chat-scroll').element as HTMLElement;
+  setMetrics(el, { scrollTop: 500, scrollHeight: 2000 });
+  const rail = wrapper.findComponent(RailStub);
+  const jumpToLoadedSpy = vi.spyOn(rail.vm as any, 'jumpToLoaded');
+
+  emitJump(wrapper, { index: 0, id: 10 });
+  await wait(400);
+
+  // 逐页推进到最早：50 → 40 → 30 → 20（第 1 条进入已加载区后停止，不再多翻）
+  expect(loadOlder).toHaveBeenCalledTimes(4);
+  expect(loadOlder.mock.calls.map(c => c[1])).toEqual([50, 40, 30, 20]);
+  expect(store.messages.map(m => m.content)).toEqual([
+    '第 1 条', '回复 1', '第 2 条', '回复 2', '第 3 条', '回复 3',
+    '第 4 条', '回复 4', '第 5 条', '回复 5',
+  ]);
+  expect(store.firstLoadedMsgId).toBe(10);
+  // 翻页完成后按目标全局索引 + 目标 id 交回 rail 定位（第 1 个红点 → 索引 0）
+  expect(jumpToLoadedSpy).toHaveBeenCalled();
+  const lastCall = jumpToLoadedSpy.mock.calls[jumpToLoadedSpy.mock.calls.length - 1];
+  expect(lastCall[0]).toBe(0);
+  expect(lastCall[1]).toBe(10);
+  wrapper.unmount();
+});

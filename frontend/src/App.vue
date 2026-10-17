@@ -100,6 +100,17 @@
             <TaskProgressDialog v-if="taskDialogOpen" @close="taskDialogOpen = false" />
           </div>
 
+          <!-- 决策入口：点击查看 JEV 决策记录（设置页「决策模型」的轻量视图） -->
+          <div class="decision-entry-wrap">
+            <button
+              class="chip-btn"
+              data-test="decision-entry"
+              title="查看 JEV 决策记录"
+              @click.stop="decisionPanelOpen = !decisionPanelOpen"
+            ><AppIcon name="brain" :size="12" :stroke-width="2" /> 决策<span v-if="store.decisionUnread > 0" class="decision-entry-badge" data-test="decision-entry-badge">{{ store.decisionUnread > 99 ? '99+' : store.decisionUnread }}</span></button>
+            <DecisionRecordPopup v-if="decisionPanelOpen" @close="decisionPanelOpen = false" />
+          </div>
+
           <div class="export-wrap">
             <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /> 导出</button>
             <div v-if="showExportMenu" class="export-menu" @click.stop>
@@ -212,6 +223,7 @@
             ref="railRef"
             :get-scroll-el="() => chatScrollRef"
             :get-user-msg-elements="getUserMsgElements"
+            :get-user-msg-element-by-id="getUserMsgElementById"
             :nav-items="store.navItems"
             :loaded-first-id="store.firstLoadedMsgId"
             @jump="onNavJump"
@@ -429,6 +441,7 @@ import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
 import SessionSearchModal from './components/SessionSearchModal.vue';
 import TaskProgressDialog from './components/TaskProgressDialog.vue';
+import DecisionRecordPopup from './components/DecisionRecordPopup.vue';
 import BackgroundTasksBar from './components/BackgroundTasksBar.vue';
 import { taskEntryState } from './utils/taskEntry';
 // 免责条款首次使用确认（合规链路）：未同意或条款升级后强制弹出，不同意则退出
@@ -522,6 +535,8 @@ const showExportMenu = ref(false);
 // 会话头部“计划”入口 + 任务计划进度对话框：计划数据由 plan_updated 事件流
 // 实时驱动，入口只在存在计划时显示，角标统计进行中的计划条目
 const taskDialogOpen = ref(false);
+// 决策记录入口：与计划入口同款悬浮面板（数据由 DecisionRecordPopup 自拉取）
+const decisionPanelOpen = ref(false);
 const taskEntry = computed(() => taskEntryState({ plan: store.planData }));
 
 async function doExport(fmt: 'md' | 'html' | 'json') {
@@ -534,6 +549,7 @@ async function doExport(fmt: 'md' | 'html' | 'json') {
 function closeHeaderPopovers() {
   showExportMenu.value = false;
   taskDialogOpen.value = false;
+  decisionPanelOpen.value = false;
 }
 
 const statusTokenPct = computed(() => {
@@ -782,7 +798,9 @@ async function onNavJump(payload: { index: number; id: number }) {
     const cursorBefore = store.historyOldestId;
     const oldHeight = el?.scrollHeight ?? 0;
     const oldTop = el?.scrollTop ?? 0;
-    await store.loadOlderMessages();
+    // force=true：入口不信任 historyHasMore（该标记随会话 runtime 保存/恢复，
+    // 可能是坏值）——否则跨页跳转在这里就被拦死，表现为点未加载红点没反应
+    await store.loadOlderMessages(true);
     await nextTick();
     if (!el || chatScrollRef.value !== el || store.currentSessionName !== sessionAtJump) return;
     if (seq !== navJumpSeq) return;
@@ -798,7 +816,9 @@ async function onNavJump(payload: { index: number; id: number }) {
   }
   if (seq !== navJumpSeq) return;
   await nextTick();
-  railRef.value?.jumpToLoaded?.(payload.index);
+  // 交回定位时带目标 id：rail 按 id 精确查找目标气泡（索引换算兜底），
+  // 翻页边界对齐异常时也不会把落点换到邻近消息上
+  railRef.value?.jumpToLoaded?.(payload.index, payload.id);
 }
 
 // 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
@@ -808,6 +828,12 @@ function refreshRail() {
 }
 function getUserMsgElements(): HTMLElement[] {
   return Array.from(chatScrollRef.value?.querySelectorAll('.msg-user') ?? []);
+}
+// 按消息 id 在已加载 DOM 内精确定位 user 气泡（红点跳转的权威通道）：
+// 索引换算依赖分页边界推断，边界漂移时会落到邻近消息上；id 直达目标。
+// 限定在 #chat-scroll 容器内查找，rail 不直接感知全局 DOM。
+function getUserMsgElementById(id: number): HTMLElement | null {
+  return chatScrollRef.value?.querySelector(`.msg-user[data-msg-id="${id}"]`) ?? null;
 }
 
 // 新用户消息（发送）→ 强制回底并恢复跟随；其余消息变化仅在跟随模式下跟随。
@@ -1536,6 +1562,24 @@ onUnmounted(() => {
 /* 会话头部“计划”入口：进行中徽标 + 运行时旋转图标；悬浮面板锚定其下 */
 .plan-entry-wrap {
   position: relative;
+}
+/* 会话头部“决策”入口：与计划入口同款锚定容器 */
+.decision-entry-wrap {
+  position: relative;
+}
+.decision-entry-badge {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-radius: 99px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  display: inline-block;
 }
 .task-entry {
   display: inline-flex;
