@@ -1,6 +1,7 @@
 <template>
-  <!-- 触发本轮的用户消息 -->
-  <MessageBubble v-if="group.userMsg" :msg="group.userMsg" />
+  <!-- 触发本轮的用户消息。data-msg-id 经 attrs 透传到 MessageBubble 根元素
+       （.msg-user）：红点导航按消息 id 精确定位用；本地新消息无 _msg_id 时不渲染 -->
+  <MessageBubble v-if="group.userMsg" :msg="group.userMsg" :data-msg-id="group.userMsg?._msg_id ?? undefined" />
 
   <!-- 回合运行中：保持现状，中间过程逐条实时显示，不折叠 -->
   <template v-if="group.running">

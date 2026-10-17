@@ -1,6 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { mount, flushPromises } from '@vue/test-utils';
 
 import App from './App.vue';
 import { useAppStore } from './stores/appStore';
@@ -52,5 +52,41 @@ it('对话标题栏渲染 Git 分支 chip，点击展开 Git 面板', async () =
   await chip.trigger('click');
   expect(gitStore.panelOpenNonce).toBe(nonceBefore + 1);
   expect(store.rightPanelCollapsed).toBe(false);
+  wrapper.unmount();
+});
+
+it('对话标题栏渲染「决策」入口，点击展开/收起决策记录面板', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  const wrapper = mount(App, { global: { stubs } });
+
+  const entry = wrapper.get('[data-test="decision-entry"]');
+  expect(entry.text()).toContain('决策');
+  expect(wrapper.find('[data-test="decision-dialog"]').exists()).toBe(false);
+
+  await entry.trigger('click');
+  expect(wrapper.find('[data-test="decision-dialog"]').exists()).toBe(true);
+
+  await entry.trigger('click');
+  expect(wrapper.find('[data-test="decision-dialog"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('决策未读徽章：decision_recorded 事件累计，打开面板后清零', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  const wrapper = mount(App, { global: { stubs } });
+
+  expect(wrapper.find('[data-test="decision-entry-badge"]').exists()).toBe(false);
+
+  store.handleBridgeEvent({ type: 'decision_recorded', data: {} } as any);
+  store.handleBridgeEvent({ type: 'decision_recorded', data: {} } as any);
+  await wrapper.vm.$nextTick();
+  expect(wrapper.get('[data-test="decision-entry-badge"]').text()).toBe('2');
+
+  // 打开面板 → onMounted 清零未读
+  await wrapper.find('[data-test="decision-entry"]').trigger('click');
+  await flushPromises();
+  expect(store.decisionUnread).toBe(0);
   wrapper.unmount();
 });

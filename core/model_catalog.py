@@ -83,12 +83,6 @@ PRESET_PROVIDERS = (
         "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
         "protocol": "openai",
     },
-    {
-        "id": "neohorse",
-        "name": "neoHorse",
-        "base_url": "https://tokenrhythm.studio/v1",
-        "protocol": "openai",
-    },
 )
 
 

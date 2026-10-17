@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鹈鹕骑行 · 2D 动态示例 | 星瑶Code</title>
+<style>
+  :root{
+    --bg:#f4f4f1;
+    --panel:#ffffff;
+    --card:#efefec;
+    --border:#e3e3de;
+    --text:#2c2c2a;
+    --text-bright:#171716;
+    --text-dim:#5c5c56;
+    --text-faint:#7a7a73;
+    --accent:#3a6dd8;
+    --accent-soft:rgba(58,109,216,.10);
+    --green:#2c8a4c;
+    --mono:'JetBrains Mono','Cascadia Code',Consolas,'Microsoft YaHei',monospace;
+    --sans:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;
+    --r-md:8px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    font-size:13px;
+    line-height:1.6;
+    padding:26px 22px 60px;
+  }
+  .wrap{max-width:1280px;margin:0 auto}
+  .page-head{margin-bottom:18px}
+  .page-head h1{font-size:20px;font-weight:600;color:var(--text-bright);letter-spacing:.3px}
+  .page-head .sub{color:var(--text-dim);margin-top:8px;line-height:1.8;max-width:920px}
+  .page-head .sub code{
+    font-family:var(--mono);font-size:11.5px;background:#fff;border:1px solid var(--border);
+    border-radius:4px;padding:1px 5px;color:var(--accent);
+  }
+  .stage{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:10px;
+    overflow:hidden;
+    box-shadow:0 16px 44px rgba(23,23,22,.10);
+  }
+  .stage-head{
+    display:flex;align-items:center;gap:10px;padding:10px 14px;
+    background:var(--panel);border-bottom:1px solid var(--border);
+    color:var(--text-dim);font-size:12px;
+  }
+  .stage-head .dot{width:8px;height:8px;border-radius:50%;background:var(--green)}
+  .stage-head .dot.run{background:var(--accent);animation:pulse 1.2s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .stage-head .title{font-family:var(--mono);font-size:12px;color:var(--text-bright)}
+  .stage-body{background:#eef4fb;}
+  .stage-body .stage{
+    border:0;border-radius:0;box-shadow:none;min-height:520px;
+  }
+  .stage-body .stage-head{border-radius:0 0 10px 10px}
+  /* 页面说明 */
+  .note{
+    margin-top:18px;background:var(--panel);border:1px solid var(--border);
+    border-radius:10px;padding:14px 18px;color:var(--text-dim);font-size:12.5px;line-height:1.8;
+  }
+  .note code{font-family:var(--mono);font-size:11.5px;background:var(--card);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="page-head">
+    <h1>鹈鹕骑行 · 2D 动态示例</h1>
+    <p class="sub">
+      这是用 SVG + SMIL 动画做出的鹈鹕骑自行车的小场景：鹈鹕在草地上慢悠悠骑车，翅膀张开张开，
+      海鸥在天空飞过，自行车还带着速度线。页面完全静态，打开即播放动画，无需联网。
+    </p>
+  </div>
+
+  <!-- 动态舞台 -->
+  <div class="stage">
+    <div class="stage-head">
+      <span class="dot run"></span>
+      <span class="title">pelican-bicycle.html — 动态播放中</span>
+    </div>
+    <div class="stage-body">
+      <iframe src="pelican-bicycle.svg" title="鹈鹕骑行 动态场景" style="width:100%;height:640px;border:0;display:block"></iframe>
+    </div>
+  </div>
+
+  <div class="note">
+    <p>动画用的是 SMIL（SVG 内置的 &lt;animation&gt; 语法），现代浏览器都能直接播放，不需要额外的 JavaScript。
+    若浏览器打不开动画，请检查浏览器版本；也可以直接双击打开
+    <code>pelican-bicycle.svg</code>，让它在浏览器里完整展示。</p>
+  </div>
+</div>
+</body>
+</html>

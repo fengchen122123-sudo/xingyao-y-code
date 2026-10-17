@@ -43,6 +43,10 @@ const props = defineProps<{
   navItems?: Array<{ id: number; preview: string }>;
   /** 已加载消息流首条 _msg_id：索引中小于它的红点为未加载（淡化） */
   loadedFirstId?: number | null;
+  /** 按消息 id 在已加载 DOM 中精确定位 user 气泡（App 注入，限定在 #chat-scroll
+      内查找）。命中即权威定位；缺省时退回索引换算；
+      未命中的降级路径由调用方决定（点击入口不落邻近、false 交跨页） */
+  getUserMsgElementById?: (id: number) => HTMLElement | null;
 }>();
 
 const emit = defineEmits<{
@@ -209,7 +213,12 @@ function jumpTo(i: number) {
     const item = props.navItems![i];
     if (!item) return;
     if (i >= loadedFirstIndex.value) {
-      scrollToLoadedIndex(i);
+      // 已加载分支：先做目标存在性校验（id 优先 + 旧索引换算兜底）。换算出的
+      // 元素不存在时降级走跨页通道——旧实现 clamp 到已加载区顶部后静默滑动，
+      // 正是用户反馈的"点了没反应/落点不对"
+      if (!scrollToLoadedIndex(i, item.id)) {
+        emit('jump', { index: i, id: item.id });
+      }
     } else {
       // 未加载区域：父组件跨页翻页后回调 jumpToLoaded
       emit('jump', { index: i, id: item.id });
@@ -219,12 +228,20 @@ function jumpTo(i: number) {
   scrollToLocalIndex(i);
 }
 
-/** 已加载（含刚翻页加载到）的红点定位：全局索引换算局部 DOM 索引后 scrollTo */
-function scrollToLoadedIndex(globalIdx: number) {
+/** 已加载（含刚翻页加载到）的红点定位：id 权威优先，索引换算兜底。
+    返回 false = 目标不在 DOM（调用方据此降级：点击入口走跨页通道，
+    翻页回调退索引兜底）——旧实现 clamp 到已加载区顶部后静默滑动，
+    正是用户反馈的"点了没反应/落点不对"。 */
+function scrollToLoadedIndex(globalIdx: number, id?: number): boolean {
+  // id 权威通道：命中即滚；未命中不落邻近元素（那是"点错消息"的来源），
+  // 直接返回 false 交调用方决定降级路径
+  if (id != null && props.getUserMsgElementById) {
+    return scrollToElement(props.getUserMsgElementById(id));
+  }
   const base = hasNavIndex.value ? loadedFirstIndex.value : 0;
   // clamp 到 0：翻页护栏中断导致目标仍超出已加载范围时，退到已加载区最上面，
-  // 避免负索引取不到元素、点了没反应
-  scrollToLocalIndex(Math.max(0, globalIdx - base));
+  // 避免负索引取不到元素；此时返回的存在性布尔仍为 false，交由调用方降级
+  return scrollToLocalIndex(Math.max(0, globalIdx - base));
 }
 
 /** 目标滚动位置：目标消息顶对齐视口顶部（留 16px 呼吸空间），并双端 clamp。
@@ -278,17 +295,23 @@ function prefersReducedMotion(): boolean {
     && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-function scrollToLocalIndex(localIdx: number) {
+/** 滚到指定元素（跳转定位公共路径）；返回是否成功发起定位 */
+function scrollToElement(el: HTMLElement | null | undefined): boolean {
   const scrollEl = props.getScrollEl();
-  const el = props.getUserMsgElements()[localIdx];
   if (!scrollEl || !el) {
-    // 目标缺失（索引与 DOM 短暂不同步）：结束检查，避免定时器泄漏
+    // 目标缺失（索引与 DOM 短暂不同步）：结束检查，避免定时器泄漏；
+    // 返回 false 不在此处静默吞掉——由调用方决定降级路径
     cancelJumpChecks();
-    return;
+    return false;
   }
   const target = computeJumpTarget(scrollEl, el);
   scrollEl.scrollTo({ top: target, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
   startJumpChecks(scrollEl, el);
+  return true;
+}
+
+function scrollToLocalIndex(localIdx: number): boolean {
+  return scrollToElement(props.getUserMsgElements()[localIdx]);
 }
 
 function startJumpChecks(scrollEl: HTMLElement, el: HTMLElement) {
@@ -332,12 +355,23 @@ function runJumpCheck(scrollEl: HTMLElement, el: HTMLElement, final = false) {
   }
 }
 
-/** 父组件跨页加载完成后回调：目标已进入已加载范围，执行定位 */
-function jumpToLoaded(globalIdx: number) {
+/** 父组件跨页加载完成后回调：目标已进入已加载范围，执行定位。
+    宽容兜底：id 命中优先；未命中退回索引换算（翻页已完成，索引此时期望可用）；
+    两者都失败仅记 warn——不得再 emit jump（会重新进入翻页循环）。 */
+function jumpToLoaded(globalIdx: number, id?: number) {
   cancelJumpChecks();
   pinnedIndex = globalIdx;
   activeIndex.value = globalIdx;
-  scrollToLoadedIndex(globalIdx);
+  if (id != null && props.getUserMsgElementById) {
+    const el = props.getUserMsgElementById(id);
+    if (el) {
+      scrollToElement(el);
+      return;
+    }
+  }
+  if (!scrollToLoadedIndex(globalIdx)) {
+    console.warn('[MessageNavRail] 跳转定位失败：目标既不在已加载 DOM、也未按 id 命中', globalIdx, id);
+  }
 }
 
 let resizeObserver: ResizeObserver | undefined;

@@ -441,15 +441,42 @@ def _new_record(cfg: dict, scene: str, shadow: bool, trace_id: str) -> dict:
 
 
 def _cap_record(record: dict) -> dict:
-    """保证单条记录 <2KB：超限时把 answers 换成摘要。"""
+    """保证单条记录 <2KB：超限时依次把 answers / extra 换成摘要。"""
     try:
         if len(json.dumps(record, ensure_ascii=False).encode("utf-8")) <= _AUDIT_MAX_BYTES:
             return record
         capped = dict(record)
         capped["answers"] = {"truncated": True, "digest": _sha16(record.get("answers"))}
+        if len(json.dumps(capped, ensure_ascii=False).encode("utf-8")) > _AUDIT_MAX_BYTES:
+            capped["extra"] = {"truncated": True, "digest": _sha16(record.get("extra"))}
         return capped
     except Exception:
         return record
+
+
+# 审计事件监听器：桥侧注册后把「决策已记录」实时转发给前端（徽章/面板实时刷新）。
+# listener 在审计写入成功后同步调用；任何异常都被吞掉，绝不影响决策主流程。
+_AUDIT_LISTENERS: list = []
+_AUDIT_LISTENERS_LOCK = threading.Lock()
+
+
+def add_audit_listener(callback) -> None:
+    """注册审计监听器（幂等；多播；异常隔离）。"""
+    if callback is None:
+        return
+    with _AUDIT_LISTENERS_LOCK:
+        if callback not in _AUDIT_LISTENERS:
+            _AUDIT_LISTENERS.append(callback)
+
+
+def _notify_audit_listeners(brief: dict) -> None:
+    with _AUDIT_LISTENERS_LOCK:
+        listeners = list(_AUDIT_LISTENERS)
+    for callback in listeners:
+        try:
+            callback(dict(brief))
+        except Exception:
+            pass
 
 
 def _append_audit(record: dict, enabled: bool) -> None:
@@ -463,6 +490,8 @@ def _append_audit(record: dict, enabled: bool) -> None:
         with _AUDIT_LOCK:
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+        # 写入成功后实时广播（前端徽章/面板刷新用；消费方自行兜底异常）
+        _notify_audit_listeners(_audit_brief(record))
     except Exception:
         pass
 
@@ -534,7 +563,7 @@ def _final_reason(failures: list) -> str:
     return failures[-1]
 
 
-def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None):
+def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None, audit_extra=None):
     """向 JEV 发一次决策请求。
 
     - 禁用 / 场景未启用：直接 None（零请求、零副作用）；
@@ -566,6 +595,10 @@ def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None):
     record = _new_record(cfg, scene_name, shadow, trace_id)
     record["state_digest"] = _state_digest(state)
     record["questions_digest"] = _sha16(questions)
+    if isinstance(audit_extra, dict) and audit_extra:
+        # 调用方附加上下文（如启发式基线档 baseline_tier）：供影子模式后续
+        # 一致性对比分析；体积由 _cap_record 统一兜底
+        record["extra"] = dict(list(audit_extra.items())[:8])
 
     try:
         provider = _resolve_provider(cfg)
@@ -740,6 +773,22 @@ def probe_decision() -> dict:
     except Exception as exc:
         msg = f"探针执行失败：{exc}"
     result = {"ok": not msg, "results": results, "model_id": model_id, "msg": msg}
+    # 探针也是真实调用：写一条 scene="probe" 的审计，让设置页「决策记录」
+    # 面板能立刻证明链路已通（与业务场景记录用 scene 字段区分统计）。
+    try:
+        record = _new_record(cfg, "probe", False, f"probe-{int(_now() * 1000)}")
+        available = next(
+            (item for item in results if item["status"] == "available"), None
+        )
+        record["latency_ms"] = available["latency_ms"] if available else None
+        record["adopted"] = available is not None
+        if not available:
+            record["fallback_reason"] = (
+                results[0].get("error") if results else (msg or "no_key")
+            )
+        _append_audit(record, bool(cfg.get("audit_enabled", True)))
+    except Exception:
+        pass
     with _KEY_STATE.lock:
         _KEY_STATE.last_probe = result
     return result
@@ -748,6 +797,49 @@ def probe_decision() -> dict:
 # ---------------------------------------------------------------------------
 # 上游模型列表（设置页「从上游拉取」下拉）
 # ---------------------------------------------------------------------------
+
+def list_decision_providers() -> dict:
+    """列出「决策模型」可选的调用通道（不含 Key 内容，仅报 Key 数量）。
+
+    数据源与 ask_decision 同一路径（~/.ycode/config.json），保证"界面能选到的
+    通道"和"实际能用的通道"一致；base_url 含 tokenrhythm 的第一个通道额外标记
+    auto_match=True（即 provider_ref="auto" 的解析目标），供前端提示。
+    """
+    try:
+        providers = [
+            item
+            for item in (_load_user_config().get("providers") or [])
+            if isinstance(item, dict)
+        ]
+    except Exception:
+        providers = []
+    cfg = load_decision_config()
+    items: list = []
+    auto_ref = ""
+    for provider in providers:
+        name = str(provider.get("name") or "").strip()
+        pid = str(provider.get("id") or "").strip()
+        ref = pid or name
+        if not ref:
+            continue
+        base_url = str(provider.get("base_url") or "").strip()
+        is_auto = False
+        if not auto_ref and "tokenrhythm" in base_url.lower():
+            auto_ref = ref
+            is_auto = True
+        try:
+            key_count = len(_load_keys(cfg, provider))
+        except Exception:
+            key_count = 0
+        items.append({
+            "ref": ref,
+            "name": name or ref,
+            "base_url": base_url,
+            "key_count": key_count,
+            "auto_match": is_auto,
+        })
+    return {"ok": True, "providers": items}
+
 
 def _price_text(model: dict) -> str:
     input_price = model.get("effectiveInputPrice")
@@ -816,6 +908,92 @@ def list_decision_models() -> dict:
 # ---------------------------------------------------------------------------
 # 设置页快照（配置 + 运行时状态）
 # ---------------------------------------------------------------------------
+
+def _audit_brief(record: dict) -> dict:
+    """审计记录 → 面板精简条目（不含 state/questions 正文）。"""
+    answers = record.get("answers")
+    answers_digest = ""
+    if isinstance(answers, dict):
+        # 只透出紧凑摘要（如 {"intent": "dispatch"}），避免把大对象塞进面板
+        answers_digest = json.dumps(answers, ensure_ascii=False)[:160]
+    return {
+        "ts": str(record.get("ts") or ""),
+        "scene": str(record.get("scene") or ""),
+        "shadow": bool(record.get("shadow")),
+        "adopted": bool(record.get("adopted")),
+        "latency_ms": record.get("latency_ms"),
+        "fallback_reason": str(record.get("fallback_reason") or ""),
+        "model_id": str(record.get("model_id") or ""),
+        "answers_digest": answers_digest,
+    }
+
+
+def get_decision_audit_summary(limit: int = 20) -> dict:
+    """汇总决策审计：今日计数 + 最近 N 条记录（设置页「决策记录」面板用）。
+
+    只读、容错：目录缺失返回全零；单行损坏跳过该行；绝不抛错。
+    """
+    try:
+        count = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        count = 20
+    directory = _audit_dir()
+    summary = {
+        "ok": True,
+        "today_count": 0,
+        "today_shadow_count": 0,
+        "today_adopted_count": 0,
+        "today_fallback_count": 0,
+        "recent": [],
+    }
+    if not os.path.isdir(directory):
+        return summary
+    try:
+        names = sorted(
+            name for name in os.listdir(directory) if name.endswith(".jsonl")
+        )
+    except Exception:
+        return summary
+    today_name = f"{_today()}.jsonl"
+
+    def _iter_records(path: str) -> list:
+        records: list = []
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return records
+
+    if today_name in names:
+        for record in _iter_records(os.path.join(directory, today_name)):
+            summary["today_count"] += 1
+            if record.get("shadow"):
+                summary["today_shadow_count"] += 1
+            if record.get("adopted"):
+                summary["today_adopted_count"] += 1
+            if record.get("fallback_reason"):
+                summary["today_fallback_count"] += 1
+    # 最近 N 条：从最新文件往前收集；收集时把老文件插到前面，保持时间升序
+    collected: list = []
+    for name in reversed(names):
+        if len(collected) >= count:
+            break
+        briefs = [
+            _audit_brief(record)
+            for record in _iter_records(os.path.join(directory, name))
+        ]
+        collected = briefs + collected
+    summary["recent"] = collected[-count:]
+    return summary
+
 
 def get_decision_settings_snapshot() -> dict:
     """配置快照 + 运行时状态（可用 Key 序号、拒绝/冷却列表、最近探针结果）。"""

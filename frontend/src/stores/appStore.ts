@@ -374,6 +374,8 @@ export interface MessageMetrics {
 
 export interface ChatMessage {
   id?: string;
+  // 后端历史行的稳定 id（分页游标 / 红点导航按 id 定位用；本地新消息可能缺省）
+  _msg_id?: number;
   // notice：对话流内的系统提示（取代原 Toast，不自动消失）
   role: 'user' | 'assistant' | 'tool' | 'error' | 'notice';
   content?: string;
@@ -837,7 +839,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'plugins' | 'about' | 'contact' | 'disclaimer',
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'decision' | 'plugins' | 'about' | 'contact' | 'disclaimer',
+    // JEV 决策记录实时流：decision_recorded 事件累加未读徽章；面板按 tick 拉取刷新
+    decisionUnread: 0,
+    decisionEventTick: 0,
     // 智能体显示名：当前会话生效名——普通会话为设置页「人设设置」的名字，
     // 秘书会话为该会话自己的秘书名（界面文案/执行过程/思考提示都跟随它）
     agentName: '星瑶',
@@ -3290,7 +3295,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
 
     // 历史分页懒加载：滚动到顶触发，向前翻一页并 prepend 到消息流头部。
     // 守卫（无更多/加载中/无游标/后端不可用）与竞态丢弃（在途切会话）必须保持。
-    async loadOlderMessages() {
+    // force=true（红点跨页跳转通道）：跳过 historyHasMore 入口守卫。该标记随
+    // 会话 runtime 保存/恢复，可能是过期值或被失败响应清空的坏值——一旦为
+    // false 而游标其实还有更早历史，onNavJump 的「无进展」判定会立刻 break，
+    // 表现为点未加载区红点没反应/落点不对（1.3.6 改过循环终止判定，漏了这里）。
+    // force 时交后端用游标裁决；historyLoading 重入保护保留（并发翻页仍需挡）。
+    async loadOlderMessages(force: boolean = false) {
       // 游标自愈：has_more=false 且游标为空，是「分页状态从未初始化 / 被失败响应
       // 清空」的特征——真到最早时后端会带回非空 oldest_id。不修的话守卫会永久
       // 短路：滚到顶不加载更早消息、点未加载红点没反应，而且这份坏状态会随会话
@@ -3302,7 +3312,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.historyOldestId = oldestLoaded._msg_id as number;
         this.historyHasMore = true;
       }
-      if (!this.historyHasMore || this.historyLoading) return;
+      if ((!this.historyHasMore && !force) || this.historyLoading) return;
       const api = this._api();
       if (!api || typeof (api as any).load_older_messages !== 'function') return;
       const sessionAtCall = this.currentSessionName;
@@ -4443,6 +4453,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 处理完直接返回（切换过程是异步的，故 void 掉，内部自带兜底不抛）
       if (type === 'open_session') {
         void this._handleOpenSessionEvent(event);
+        return;
+      }
+      // 决策记录实时推送（JEV 每次决策落审计后由桥转发）：头部「决策」按钮
+      // 累加未读徽章，面板开着时按 tick 拉取刷新；独立支路，不参与会话
+      // runtime 归属，处理完直接返回
+      if (type === 'decision_recorded') {
+        this.decisionEventTick += 1;
+        this.decisionUnread += 1;
         return;
       }
       // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。

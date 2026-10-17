@@ -6,7 +6,7 @@
         <h1>决策模型（JEV）</h1>
         <p>接入基元律动 JEV 决策服务；默认关闭，启用后任何失败都会静默回落原有逻辑。</p>
       </div>
-      <button class="refresh-button" type="button" title="重新加载" @click="loadSettings">
+      <button class="refresh-button" type="button" title="重新加载" @click="reloadAll">
         <AppIcon name="refresh" :size="14" />
       </button>
     </header>
@@ -59,8 +59,28 @@
       </div>
 
       <div class="field-label">调用通道</div>
-      <div class="channel-readonly" data-test="decision-channel">{{ channelText }}</div>
-      <p class="decision-note">provider_ref=auto 时自动匹配 base_url 含 tokenrhythm 的通道；指定通道下拉将在后续版本开放。</p>
+      <select
+        data-test="decision-channel-select"
+        v-model="providerRef"
+        class="text-field channel-select"
+        :disabled="controlsDisabled || channelsLoading"
+      >
+        <option value="auto">自动匹配（基元律动）</option>
+        <option v-for="item in providerOptions" :key="item.ref" :value="item.ref">
+          {{ item.name }}（{{ item.key_count }} 把 Key）
+        </option>
+        <option v-if="unlistedRef" :value="unlistedRef">{{ unlistedRef }}（当前配置，未在通道列表）</option>
+      </select>
+      <div class="field-label">Base URL 覆盖（可选）</div>
+      <input
+        data-test="decision-base-url"
+        v-model="baseUrlDraft"
+        class="text-field"
+        type="text"
+        placeholder="留空 = 使用通道默认地址"
+        :disabled="controlsDisabled"
+      />
+      <p class="decision-note">通道决定 Key 从哪来（选谁就用谁配置里的多 Key 池）；Base URL 填写后覆盖通道地址，用于非标端点。自动匹配 = base_url 含 tokenrhythm 的第一个通道。</p>
 
       <div class="field-label">Key 策略</div>
       <div class="radio-row">
@@ -88,10 +108,17 @@
         <span class="range-hint">100 ~ 5000 ms；超时宁可不判也不拖慢主链路</span>
       </div>
 
+      <div class="field-label">决策记录</div>
       <div class="audit-row">
-        <button data-test="decision-audit-open" class="secondary-button" type="button" disabled title="审计目录：~/.ycode/decision_audit/">打开审计目录</button>
-        <span class="audit-hint">审计按天写入 ~/.ycode/decision_audit/YYYYMMDD.jsonl（不含 Key）；桌面一键打开入口将在后续版本接入，可手动前往。</span>
+        <span class="audit-summary-text" data-test="decision-audit-summary">{{ auditSummaryText }}</span>
+        <button data-test="decision-audit-open" class="secondary-button" type="button" :disabled="loading || saving" @click="openAuditDir">打开审计目录</button>
       </div>
+      <ul v-if="auditRecent.length" class="audit-list" data-test="decision-audit-list">
+        <li v-for="(item, index) in auditRecent" :key="index" :class="{ shadow: item.shadow }">
+          {{ auditLine(item) }}
+        </li>
+      </ul>
+      <p class="decision-note">审计按天写入 ~/.ycode/decision_audit/YYYYMMDD.jsonl（不含 Key）；跑一次探针即可产生记录，业务场景接入后每次决策都会记录在这里。</p>
 
       <div class="decision-actions">
         <button data-test="decision-save" class="primary-button" type="button" :disabled="loading || saving" @click="saveSettings">
@@ -111,8 +138,11 @@ import { computed, onMounted, ref } from 'vue';
 
 import AppIcon from './AppIcon.vue';
 import type {
+  DecisionAuditRecentItem,
+  DecisionAuditSummary,
   DecisionModelOption,
   DecisionProbeKeyResult,
+  DecisionProviderOption,
   DecisionRuntimeState,
   DecisionSettingsSnapshot,
 } from '../types/pywebview';
@@ -144,12 +174,16 @@ const keyIndexDraft = ref(1);
 const shadowModeDraft = ref(true);
 const timeoutDraft = ref(800);
 const providerRef = ref('auto');
+const baseUrlDraft = ref('');
+const providerOptions = ref<DecisionProviderOption[]>([]);
+const channelsLoading = ref(false);
 
 const probeResults = ref<DecisionProbeKeyResult[]>([]);
 const probeModelId = ref('');
 const modelOptions = ref<DecisionModelOption[]>([]);
 const fetchHint = ref('');
 const fetchFailed = ref(false);
+const auditSummary = ref<DecisionAuditSummary | null>(null);
 
 let savedTipTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -176,12 +210,30 @@ const statusDotClass = computed(() => {
   return '';
 });
 
-const channelText = computed(() => {
-  const refText = providerRef.value.trim();
-  if (!refText || refText === 'auto') {
-    return '自动匹配基元律动（provider_ref=auto；base_url 含 tokenrhythm 的通道）';
+const auditRecent = computed(() => auditSummary.value?.recent ?? []);
+
+const auditSummaryText = computed(() => {
+  const summary = auditSummary.value;
+  if (!summary || summary.today_count <= 0) {
+    return '今日暂无决策记录（跑一次探针即可产生记录）';
   }
-  return `指定通道：${refText}`;
+  return `今日 ${summary.today_count} 次决策 · 影子 ${summary.today_shadow_count} · 采纳 ${summary.today_adopted_count} · 回退 ${summary.today_fallback_count}`;
+});
+
+/** 单条审计记录的展示行：时间 · 场景 · 模式 · 延迟 · 回退原因 */
+function auditLine(item: DecisionAuditRecentItem): string {
+  const time = item.ts.length >= 19 ? item.ts.slice(11, 19) : item.ts;
+  const parts = [time, item.scene || '未知场景', item.shadow ? '影子' : '正式'];
+  if (typeof item.latency_ms === 'number') parts.push(`${item.latency_ms}ms`);
+  if (item.fallback_reason) parts.push(`回退：${item.fallback_reason}`);
+  return parts.join(' · ');
+}
+
+/** 当前配置的通道不在已拉取列表里时（历史/插件配置），补一个兜底选项避免下拉显示为空 */
+const unlistedRef = computed(() => {
+  const refText = providerRef.value.trim();
+  if (!refText || refText === 'auto') return '';
+  return providerOptions.value.some((item) => item.ref === refText) ? '' : refText;
 });
 
 function probeLabel(item: DecisionProbeKeyResult): string {
@@ -222,6 +274,7 @@ function applySettings(settings: Partial<DecisionSettingsSnapshot>) {
   shadowModeDraft.value = settings.shadow_mode !== false;
   timeoutDraft.value = Number(settings.timeout_ms ?? 800) || 800;
   providerRef.value = String(settings.provider_ref ?? 'auto');
+  baseUrlDraft.value = String(settings.base_url ?? '');
 }
 
 function applyRuntime(lastProbe: DecisionRuntimeState['last_probe'] | undefined) {
@@ -279,6 +332,8 @@ async function saveSettings() {
       enabled: enabledDraft.value,
       model_id: modelIdDraft.value.trim(),
       endpoint_style: endpointStyleDraft.value,
+      provider_ref: providerRef.value.trim() || 'auto',
+      base_url: baseUrlDraft.value.trim(),
       key_mode: keyModeDraft.value === 'auto' ? 'auto' : `index:${index}`,
       shadow_mode: shadowModeDraft.value,
       timeout_ms: timeout,
@@ -313,6 +368,7 @@ async function runProbe() {
     probeResults.value = Array.isArray(res?.results) ? res.results.map(normalizeProbe) : [];
     probeModelId.value = String(res?.model_id ?? '');
     if (res?.msg) probeMsg.value = String(res.msg);
+    loadAuditSummary(); // 探针会写一条审计记录：刷一次面板立即可见
   } catch {
     probeMsg.value = '探针执行失败';
   } finally {
@@ -357,7 +413,74 @@ function pickModel(event: Event) {
   if (value) modelIdDraft.value = value;
 }
 
-onMounted(loadSettings);
+/** 审计汇总（决策记录面板）：加载失败静默，不阻塞其余控件 */
+async function loadAuditSummary() {
+  try {
+    const api = window.pywebview?.api;
+    if (!api?.get_decision_audit_summary) return;
+    const res = await api.get_decision_audit_summary(10);
+    if (res?.ok) {
+      auditSummary.value = {
+        ok: true,
+        today_count: Number(res.today_count ?? 0),
+        today_shadow_count: Number(res.today_shadow_count ?? 0),
+        today_adopted_count: Number(res.today_adopted_count ?? 0),
+        today_fallback_count: Number(res.today_fallback_count ?? 0),
+        recent: Array.isArray(res.recent) ? res.recent : [],
+      };
+    }
+  } catch {
+    // 记录面板失败不弹错
+  }
+}
+
+async function openAuditDir() {
+  try {
+    const api = window.pywebview?.api;
+    if (!api?.open_decision_audit_dir) return;
+    const res = await api.open_decision_audit_dir();
+    if (!res?.ok) errorMsg.value = res?.msg || '打开审计目录失败';
+  } catch {
+    errorMsg.value = '打开审计目录失败';
+  }
+}
+
+function reloadAll() {
+  loadSettings();
+  loadAuditSummary();
+}
+
+/** 拉取可选调用通道列表（不含 Key 内容）；失败静默，不阻塞页面其余控件 */
+async function loadProviders() {
+  if (channelsLoading.value) return;
+  channelsLoading.value = true;
+  try {
+    const api = window.pywebview?.api;
+    if (!api?.list_decision_providers) return;
+    const res = await api.list_decision_providers();
+    if (res?.ok && Array.isArray(res.providers)) {
+      providerOptions.value = res.providers
+        .map((item) => ({
+          ref: String(item.ref ?? ''),
+          name: String(item.name ?? item.ref ?? ''),
+          base_url: String(item.base_url ?? ''),
+          key_count: Number(item.key_count ?? 0),
+          auto_match: item.auto_match === true,
+        }))
+        .filter((item) => item.ref);
+    }
+  } catch {
+    // 通道列表失败不弹错：用户仍可用自动匹配或手动输入 Base URL
+  } finally {
+    channelsLoading.value = false;
+  }
+}
+
+onMounted(() => {
+  loadSettings();
+  loadProviders();
+  loadAuditSummary();
+});
 </script>
 
 <style scoped>
@@ -389,12 +512,15 @@ onMounted(loadSettings);
 .radio-row { display: flex; gap: 22px; flex-wrap: wrap; }
 .radio-item { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text); }
 .key-index-input { width: 64px; min-height: 34px; padding: 0 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text); font-size: 13px; }
-.channel-readonly { min-height: 40px; display: flex; align-items: center; padding: 0 13px; border: 1px dashed var(--border); border-radius: 9px; color: var(--text-dim); font-size: 12px; background: var(--bg2); }
+.channel-select { padding-right: 13px; }
 .timeout-row { display: flex; align-items: center; gap: 12px; }
 .timeout-input { width: 120px; }
 .range-hint { color: var(--text-faint); font-size: 12px; }
 .audit-row { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
 .audit-hint { color: var(--text-faint); font-size: 12px; }
+.audit-summary-text { color: var(--text-dim); font-size: 12px; }
+.audit-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--text-dim); }
+.audit-list li.shadow { opacity: .75; }
 .decision-actions { display: flex; gap: 10px; margin-top: 16px; }
 .primary-button, .secondary-button { min-height: 38px; padding: 0 18px; border-radius: 9px; border: 1px solid var(--border); font-weight: 600; cursor: pointer; font-size: 13px; }
 .primary-button { background: var(--text); color: var(--bg0); }

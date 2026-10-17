@@ -779,3 +779,186 @@ def test_bridge_decision_methods_never_raise(data_dir, monkeypatch):
         assert result["ok"] is False
         assert "模拟内部错误" in result["msg"]
     assert bridge.get_decision_audit_tail()["lines"] == []
+
+
+def test_list_decision_providers_lists_channels_without_key_text(data_dir, monkeypatch):
+    """通道列表：报 Key 数量但不含 Key 内容；tokenrhythm 通道标记 auto_match。"""
+    monkeypatch.setattr(
+        svc,
+        "_load_user_config",
+        lambda: {
+            "providers": [
+                {
+                    "id": "prov-token",
+                    "name": "基元律动",
+                    "base_url": "https://tokenrhythm.studio/v1",
+                    "api_key": "sk_a\nsk_b",
+                },
+                {
+                    "id": "prov-zen",
+                    "name": "OpenCode Zen 免费通道",
+                    "base_url": "http://127.0.0.1:17863/v1",
+                    "api_key": "sk_zen",
+                },
+            ]
+        },
+    )
+    result = svc.list_decision_providers()
+    assert result["ok"] is True
+    items = result["providers"]
+    assert [item["ref"] for item in items] == ["prov-token", "prov-zen"]
+    token, zen = items
+    assert token["auto_match"] is True
+    assert token["key_count"] == 2
+    assert zen["auto_match"] is False
+    assert zen["key_count"] == 1
+    # Key 内容绝不外泄：整个响应序列化后不得出现任何 Key 明文
+    assert "sk_" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_bridge_list_decision_providers_delegates(data_dir, monkeypatch):
+    monkeypatch.setattr(
+        svc,
+        "list_decision_providers",
+        lambda: {
+            "ok": True,
+            "providers": [
+                {
+                    "ref": "p1",
+                    "name": "P1",
+                    "base_url": "u",
+                    "key_count": 1,
+                    "auto_match": True,
+                }
+            ],
+        },
+    )
+    result = _make_bridge().list_decision_providers()
+    assert result["ok"] is True
+    assert result["providers"][0]["ref"] == "p1"
+
+
+def test_audit_summary_counts_and_recent(data_dir):
+    """审计汇总：今日计数（含影子/采纳/回退）+ 最近记录按时间升序。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    rows = [
+        {"ts": "2026-10-16T10:00:00", "scene": "probe", "shadow": False, "adopted": True,
+         "latency_ms": 326, "fallback_reason": None, "model_id": "NeoHorse-Jev-4B",
+         "answers": {"probe": 1.0}},
+        {"ts": "2026-10-16T10:01:00", "scene": "router", "shadow": True, "adopted": False,
+         "latency_ms": 210, "fallback_reason": None, "model_id": "NeoHorse-Jev-4B",
+         "answers": {"tier": "c2"}},
+        {"ts": "2026-10-16T10:02:00", "scene": "router", "shadow": False, "adopted": False,
+         "latency_ms": None, "fallback_reason": "upstream_error", "model_id": "NeoHorse-Jev-4B",
+         "answers": None},
+    ]
+    (audit / f"{svc._today()}.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8"
+    )
+    result = svc.get_decision_audit_summary(limit=10)
+    assert result["ok"] is True
+    assert result["today_count"] == 3
+    assert result["today_shadow_count"] == 1
+    assert result["today_adopted_count"] == 1
+    assert result["today_fallback_count"] == 1
+    assert [item["scene"] for item in result["recent"]] == ["probe", "router", "router"]
+    assert result["recent"][-1]["fallback_reason"] == "upstream_error"
+
+
+def test_audit_summary_missing_dir_returns_zeros(data_dir):
+    result = svc.get_decision_audit_summary()
+    assert result["ok"] is True
+    assert result["today_count"] == 0
+    assert result["recent"] == []
+
+
+def test_probe_writes_audit_record(data_dir, monkeypatch):
+    """探针也是真实调用：必须落一条 scene=probe 审计（面板可见性的基础）。"""
+    _write_user_config(data_dir, [PROVIDER])
+    svc.save_decision_config({"enabled": True, "audit_enabled": True})
+    _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"probe": 1.0}}))
+
+    result = svc.probe_decision()
+    assert result["ok"] is True
+    record = _last_audit(data_dir)
+    assert record["scene"] == "probe"
+    assert record["adopted"] is True
+    assert record["latency_ms"] is not None
+
+
+def test_bridge_get_decision_audit_summary_delegates(data_dir, monkeypatch):
+    monkeypatch.setattr(
+        svc,
+        "get_decision_audit_summary",
+        lambda limit=20: {"ok": True, "today_count": 5, "recent": []},
+    )
+    result = _make_bridge().get_decision_audit_summary()
+    assert result["ok"] is True
+    assert result["today_count"] == 5
+
+
+def test_audit_listener_receives_brief(data_dir):
+    """审计写入成功 → 监听器收到精简条目（前端实时徽章/面板的数据源）。"""
+    received = []
+    svc.add_audit_listener(received.append)
+    try:
+        svc._append_audit(
+            {
+                "ts": "2026-10-16T10:00:00",
+                "scene": "probe",
+                "shadow": False,
+                "adopted": True,
+                "latency_ms": 120,
+                "fallback_reason": None,
+                "model_id": "NeoHorse-Jev-4B",
+                "answers": {"a": 1},
+            },
+            True,
+        )
+    finally:
+        with svc._AUDIT_LISTENERS_LOCK:
+            svc._AUDIT_LISTENERS.clear()
+    assert len(received) == 1
+    assert received[0]["scene"] == "probe"
+    assert received[0]["adopted"] is True
+    assert received[0]["latency_ms"] == 120
+
+
+def test_audit_listener_exception_is_isolated(data_dir):
+    """监听器崩溃不得影响审计落盘（异常隔离是实时转发的底线）。"""
+
+    def boom(brief):
+        raise RuntimeError("listener 崩溃")
+
+    svc.add_audit_listener(boom)
+    try:
+        svc._append_audit({"ts": "x", "scene": "router"}, True)
+    finally:
+        with svc._AUDIT_LISTENERS_LOCK:
+            svc._AUDIT_LISTENERS.clear()
+    assert _audit_records(data_dir), "监听器异常不应中断审计写入"
+
+
+def test_ask_decision_writes_audit_extra(data_dir, monkeypatch):
+    """audit_extra 落进审计原始记录（影子模式一致性对比的基线数据）。"""
+    _write_user_config(data_dir, [PROVIDER])
+    svc.save_decision_config({
+        "enabled": True,
+        "audit_enabled": True,
+        "shadow_mode": True,
+        "scenes": {"router": {"enabled": True, "shadow": True, "threshold": 0.5}},
+    })
+    _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"tier": "c1"}}))
+
+    result = svc.ask_decision(
+        "帮我重构一下代码",
+        NOUL_Q,
+        scene="router",
+        audit_extra={"baseline_tier": "c0", "message_chars": 8},
+    )
+    assert result is None  # 影子模式：只记录不返回
+    record = _last_audit(data_dir)
+    assert record["extra"] == {"baseline_tier": "c0", "message_chars": 8}
+    assert record["shadow"] is True
+    assert record["answers"] == {"tier": "c1"}
