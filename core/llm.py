@@ -327,6 +327,49 @@ def _get_mcp_manager():
     return mcp_manager
 
 
+# 【临时诊断】开关文件存在时，把每步请求的工具列表落盘
+_DEBUG_TOOLS_DUMP_FLAG = r"D:\ycodesso\llm_tools_dump.on"
+_DEBUG_TOOLS_DUMP_PATH = r"D:\ycodesso\llm_tools_dump.jsonl"
+
+
+def _debug_dump_request_tools(model_name, api_base, request_tools):
+    """【纯旁路 / 临时诊断】把即将发往上游的工具列表落盘。
+
+    为什么需要：上游对 tools[].function.description 做必填校验时只回「tools[N]
+    缺 description」，N 是它看到的数组下标；本地复算不出真实列表就只能靠这份
+    落盘对齐。仅在开关文件存在时写，任何异常只记 debug，绝不改变发送字节。
+    """
+    try:
+        import hashlib as _hashlib
+        import os as _os
+        import time as _time
+
+        if not _os.path.exists(_DEBUG_TOOLS_DUMP_FLAG):
+            return
+        tools = [tool for tool in (request_tools or []) if isinstance(tool, dict)]
+        blob = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        row = {
+            "ts": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model": str(model_name or ""),
+            "api_base": str(api_base or ""),
+            "count": len(tools),
+            "bytes": len(blob.encode("utf-8")),
+            "sha256": _hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+            "tools": [
+                {
+                    "i": index,
+                    "name": tool.get("function", {}).get("name"),
+                    "desc": tool.get("function", {}).get("description"),
+                }
+                for index, tool in enumerate(tools)
+            ],
+        }
+        with open(_DEBUG_TOOLS_DUMP_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("工具列表落盘失败（旁路，已忽略）", exc_info=True)
+
+
 def _snapshot_tool_breakdown(request_tools):
     """【纯旁路】按 MCP 工具名集合拆分统计工具定义字符量（设计规格 §3.3；
     2026-09-23 拆分系统/MCP）。失败仅记 debug，绝不改变 request_tools 与发送字节。"""
@@ -1878,6 +1921,8 @@ def _chat_with_model_generator(
     # 【纯旁路】工具定义字符量快照（设计规格 §3.3；2026-09-23 拆分系统/MCP）：
     # 每步请求都会走到，重复更新无害；失败仅记 debug，绝不改变发送字节。
     _snapshot_tool_breakdown(request_tools)
+    # 【纯旁路 / 临时诊断】把最终工具列表落盘，供定位上游校验失败（用完即撤）。
+    _debug_dump_request_tools(model_name, api_base, request_tools)
     # 原生 OpenAI 协议（Task 11a，设计 11.1/11.2）：native tools 不进
     # request_tools（chat 格式），而是经 prepare_stream_request 的
     # native_computer_tools 参数追加在 flattened function tools 之后；
