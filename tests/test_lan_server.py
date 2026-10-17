@@ -422,48 +422,23 @@ def test_lan_forbids_drain_js_queue(server):
     "ide_save_layout",
 ])
 def test_lan_forbids_ide_state_mutating_methods(server, method):
-    """IDE 桥的写类方法必须 fail-closed 拒绝（Task 8 评审 Critical）。
+    """IDE 桥写类方法的黑名单项仍在（历史项：2026-10-17 IDE 子系统已移除）。
 
-    dispatch_rpc 是 fail-open 分发（只拦黑名单 + 下划线前缀）：这些方法若不入
-    FORBIDDEN_METHODS，手机端等于凭空多出一条远程写文件 / 改打开集合 / 覆盖
-    持久化布局的通道。写类方法会改变桌面状态，必须与 open_path /
-    save_clipboard_image 同一边界（设计 18：LAN 实施 fail-closed 的同一边界）。
+    这些方法在 gui_bridge 侧已不存在，名单项保留作纵深防御。本用例锁定
+    FORBIDDEN_METHODS 不因清理而丢掉这些边界——若将来同名的远程可写方法被
+    重新引入，仍必须 fail-closed（写文件 / 改打开集合 / 覆盖持久化布局都不是
+    手机远程控制该有的能力，与 open_path / save_clipboard_image 同一边界，
+    设计 18）。
     """
     response = server.dispatch_rpc(method, [])
     assert response["error"]["code"] == "method_not_allowed"
 
 
-def test_lan_allows_ide_read_only_methods():
-    """只读类 IDE 方法保持放行（与 read_file_preview 可被 LAN 调用同一先例）。
-
-    只读不改变桌面状态，误拦会破坏手机端浏览/查看文件的既有能力。
-    """
-    calls = []
-
-    class ReadBridge:
-        def ide_read_file(self, path):
-            calls.append(("read", path))
-            return {"ok": True, "path": path, "content": "x = 1\n"}
-
-        def ide_stat_files(self, paths):
-            calls.append(("stat", paths))
-            return {"ok": True, "stats": []}
-
-        def ide_get_layout(self, session):
-            calls.append(("layout", session))
-            return {"ok": True, "layout": None}
-
-    srv = LanServer(bridge=ReadBridge())
-    for method, args in (
-        ("ide_read_file", ["a.py"]),
-        ("ide_stat_files", [["a.py"]]),
-        ("ide_get_layout", ["s1"]),
-    ):
-        result = srv.dispatch_rpc(method, args)
-        # 绝不能返回 method_not_allowed：只读方法必须真正到达 bridge
-        assert "error" not in result
-        assert result["ok"] is True
-    assert [c[0] for c in calls] == ["read", "stat", "layout"]
+# 原 test_lan_allows_ide_read_only_methods（IDE 只读类放行断言）已删除：
+# 2026-10-17 IDE 子系统整体移除后，ide_read_file / ide_stat_files /
+# ide_get_layout 在 gui_bridge 侧已不存在，该用例靠自建 ReadBridge 假桩维持
+# 「放行」断言，恒绿且零信息量。只读放行的边界原则仍由
+# test_lan_allows_pty_read_only_methods 等活用例覆盖。
 
 
 @pytest.mark.parametrize("method", [
@@ -1234,47 +1209,11 @@ def test_lan_forbids_desktop_exclusive_layout_and_lifecycle(method):
     assert bridge.calls == []
 
 
-def test_lan_allows_lsp_read_and_sync_methods():
-    """LSP 组的「只读/前端驱动」方法必须保持放行（Task 17 评审要求补「留」的断言）。
-
-    上一轮只测了 lsp_set_server_path 的「封」，没有测 LSP 组的「留」——
-    后人顺手把整组 LSP 方法都封掉也不会被测出，而手机端的 LSP 状态显示、
-    请求转发与工作区同步会随之静默失效。这里用与
-    test_lan_allows_pty_read_only_methods 同款的「必须真正到达 bridge」
-    断言锁定：dispatch_rpc 是 fail-open 分发，放行方法绝不能返回
-    method_not_allowed。
-    """
-    calls = []
-
-    class LspBridge:
-        def lsp_server_status(self, session=None):
-            calls.append(("status", session))
-            return {"ok": True, "running": True, "language": "python"}
-
-        def lsp_request(self, method, params=None, session=None):
-            calls.append(("request", method, session))
-            return {"ok": True, "result": {"contents": "x"}}
-
-        def lsp_notify(self, method, params=None, session=None):
-            calls.append(("notify", method, session))
-            return {"ok": True}
-
-        def lsp_sync_workspace(self, files=None, session=None):
-            calls.append(("sync", session))
-            return {"ok": True, "synced": 1}
-
-    srv = LanServer(bridge=LspBridge())
-    for method, args in (
-        ("lsp_server_status", ["s1"]),
-        ("lsp_request", ["textDocument/hover", {}, "s1"]),
-        ("lsp_notify", ["textDocument/didSave", {}, "s1"]),
-        ("lsp_sync_workspace", [[], "s1"]),
-    ):
-        result = srv.dispatch_rpc(method, args)
-        # 绝不能返回 method_not_allowed：LSP 只读/同步类方法必须真正到达 bridge
-        assert "error" not in result
-        assert result["ok"] is True
-    assert [c[0] for c in calls] == ["status", "request", "notify", "sync"]
+# 原 test_lan_allows_lsp_read_and_sync_methods（LSP 只读/同步类放行断言）已删除：
+# 2026-10-17 LSP 子系统随 IDE 一并移除后，lsp_server_status / lsp_request /
+# lsp_notify / lsp_sync_workspace 在 gui_bridge 侧已不存在，该用例靠自建
+# LspBridge 假桩维持「放行」断言，恒绿且零信息量。封禁侧仍由
+# test_lan_forbids_pty_write_kill_and_lsp_set_server_path 覆盖。
 
 
 class _EscalationProbeBridge:
