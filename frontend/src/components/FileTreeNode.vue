@@ -1,6 +1,6 @@
 <template>
   <div>
-    <div class="file-row" :class="{ open: isOpen, active: isActiveFile }" @click="toggle">
+    <div class="file-row" :class="{ open: isOpen }" @click="toggle">
       <span class="fi">
         <AppIcon v-if="node.d" name="chevron-right" :size="12" :class="{ 'is-open': isOpen }" />
       </span>
@@ -27,7 +27,6 @@ import { ref, computed } from 'vue';
 import AppIcon from './AppIcon.vue';
 import type { FileNode } from '../types/pywebview';
 import { useAppStore } from '../stores/appStore';
-import { useIdeStore } from '../stores/ideStore';
 import { extIcon } from '../utils/fileIcon';
 import { canOpenInRightPanel } from '../utils/localPath';
 import { useIsMobile } from '../composables/useViewport';
@@ -38,21 +37,11 @@ const props = defineProps<{
 }>();
 
 const store = useAppStore();
-const ide = useIdeStore();
 // 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
 const isMobile = useIsMobile();
 // FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
 const fullPath = computed(() => {
   return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
-});
-// 选中态（设计稿 .row.sel）：当前活动标签所在行铺 --accent-soft 底色。
-// 用 ideStore.tab() 做判等而不是字符串直接比：活动标签记的是后端 realpath，
-// 而这里拼出来的是调用方路径，两者在大小写 / 分隔符上可能不同（tab() 是仓库里
-// 唯一的路径查表口径，两种形态都能命中）。
-const isActiveFile = computed(() => {
-  const active = ide.activePath();
-  if (!active || props.node.d) return false;
-  return ide.tab(fullPath.value)?.path === active;
 });
 // 展开状态持久化在 store：文件树刷新后新组件实例也能凭路径恢复展开
 const isOpen = ref(store.fileTreeExpanded.includes(fullPath.value));
@@ -122,11 +111,6 @@ async function toggle() {
 .file-row:hover {
   background: var(--bg2);
   color: var(--text);
-}
-/* 选中态（设计稿 .row.sel）：活动标签所在文件行 */
-.file-row.active {
-  background: var(--accent-soft);
-  color: var(--text-bright);
 }
 .file-row .fi {
   width: 15px;

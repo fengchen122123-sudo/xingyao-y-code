@@ -13,7 +13,6 @@ const stubs = {
   TokenUsageSettingsLegacy: true,
   GuiThemeSettings: true,
   SystemSettings: true,
-  EditorLanguageSettings: true,
   PersonaSettings: true,
   FeishuSettings: true,
   PluginsSettings: true,

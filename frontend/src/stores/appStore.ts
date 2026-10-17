@@ -1,9 +1,6 @@
 import { defineStore } from 'pinia';
 // Git 工作台事件转发（git_state_changed）；gitStore 不反向依赖 appStore，无环
 import { useGitStore } from './gitStore';
-// LSP 事件（lsp_status / lsp_diagnostics）转发：桥事件的唯一赋值点在本 store 的
-// handleBridgeEvent，LSP 事件同样接进那条链（editor/lsp 不反向依赖 stores，无环）
-import { dispatchLspEvent } from '../editor/lsp';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
@@ -49,8 +46,6 @@ import type {
   TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
-// 调试适配器输出旁路总线（S3-T8）：高频原始输出不进响应式状态
-import { emitDapOutput } from '../utils/dapBus';
 import { isMarkdownFilePath, toFileUrl } from '../utils/localPath';
 import { fileExt } from '../utils/fileIcon';
 import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
@@ -769,10 +764,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 按会话保存恢复，A 会话打开的浏览器页签不会出现在 B 会话
     rightPanelTabs: [] as RightPanelTabId[],
     rightPanelActiveTab: '' as RightPanelTabId | '',
-    // IDE 布局里的对话区是否收起：纯 UI 状态，不落盘——它只是「这一屏想不想看
-    // 对话」的临时选择。放在 appStore 而不是 IdeLayout 的本地 ref，是因为收起/展开
-    // 两个入口分处不同组件（IDE 布局右缘的浮动按钮与活动栏「星瑶」动作）。
-    ideChatCollapsed: false,
     // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
     // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
     // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
@@ -5062,25 +5053,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } else if (type === 'pty_data') {
         // 底部内嵌交互式终端：原始输出直接走 ptyBus 给 xterm，不进响应式状态
         emitPtyData(String(data.text ?? ''));
-      } else if (type === 'lsp_diagnostics' || type === 'lsp_status') {
-        // 语言服务事件（Task 9）：必须接进本函数这条既有 type-if 链——它是
-        // window.onBridgeEvent 的唯一赋值点。计划里「由 App.vue 的桥事件分发处转发」
-        // 的说法不成立：App.vue 再挂一处分发等于新开一条通道，违反单消费者约定。
-        // lsp_status 里还携带崩溃重启信号，由 lsp 客户端据此重发 didOpen。
-        dispatchLspEvent(type, data);
       } else if (type === 'pty_exit') {
         emitPtyExit(Number(data.code ?? 0));
-      } else if (type === 'dap_output') {
-        // 调试适配器输出（S3-T8）：与 pty_data 同口径，高频原始文本走总线，
-        // 只做分流、不进 ideDebugStore 的响应式状态
-        emitDapOutput({
-          session_id: String(data.session_id ?? ''),
-          category: String(data.category ?? 'stdout'),
-          text: String(data.text ?? ''),
-        });
       } else if (type === 'snip_attachment_ready') {
         // 屏幕截图「发到输入框」（宿主 gui_snip_mixin.SnipBridgeMixin）：把
-        // 回传的图片路径加入当前会话输入框附件。与 lsp_*/dap_* 同约定——必须
+        // 回传的图片路径加入当前会话输入框附件。与 pty_data 同约定——必须
         // 接进本函数这条既有 type-if 链（window.onBridgeEvent 唯一赋值点），
         // 另开通道等于绕开单消费者约定
         void this._attachSnipToComposer(String(data.path || ''));
