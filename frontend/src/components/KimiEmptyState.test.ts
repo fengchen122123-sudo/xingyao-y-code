@@ -70,7 +70,7 @@ it('未落库新会话离开空状态页后重新挂载仍恢复文字草稿', a
   wrapper.unmount();
 });
 
-it('shows the sandbox toggle and git branch in the hero composer', async () => {
+it('shows the sandbox toggle without duplicating the git branch in the hero composer', async () => {
   const { useGitStore } = await import('../stores/gitStore');
   const store = useAppStore();
   const gitStore = useGitStore();
@@ -84,16 +84,11 @@ it('shows the sandbox toggle and git branch in the hero composer', async () => {
 
   const wrapper = mount(KimiEmptyState);
 
+  expect(wrapper.find('[data-test="hero-git-branch"]').exists()).toBe(false);
+
   const sandbox = wrapper.get('[data-test="hero-sandbox-button"]');
   expect(sandbox.text()).toContain('沙盒: 限');
   await sandbox.trigger('click');
   expect(setSandbox).toHaveBeenCalledWith(true);
-
-  const branch = wrapper.get('[data-test="hero-git-branch"]');
-  expect(branch.text()).toContain('dev');
-  const nonceBefore = gitStore.panelOpenNonce;
-  await branch.trigger('click');
-  expect(gitStore.panelOpenNonce).toBe(nonceBefore + 1);
-  expect(store.rightPanelCollapsed).toBe(false);
   wrapper.unmount();
 });
