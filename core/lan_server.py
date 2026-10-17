@@ -230,17 +230,14 @@ class LanServer:
         "resume_computer_control", "acknowledge_computer_safety",
         # GUI 事件桥内部测试 seam（等价于窃听/阻断桌面事件流）
         "drain_js_queue",
-        # IDE 桥的状态变更类方法（fail-closed：dispatch_rpc 默认放行，若不入
-        # 黑名单，手机端等于凭空多出一条远程写文件 / 改布局的通道）。写入类
-        # 「ide_write_file」可直接改写桌面工作区文件，「ide_set_open_files」
-        # 会污染桌面轮询集合，「ide_save_layout」会覆盖桌面持久化布局——都不是
-        # 手机远程控制该有的能力，与既有 open_path / save_clipboard_image 同一
-        # 边界（设计 18：LAN 必须实施 fail-closed 的同一边界）。只读类
-        # ide_read_file / ide_stat_files / ide_get_layout 保持放行，与既有
-        # read_file_preview 可被 LAN 调用的先例一致。
+        # IDE 桥的状态变更类方法（历史项：2026-10-17 IDE 子系统整体移除后，
+        # gui_bridge 侧已无这些方法）。名单项保留作纵深防御——写文件 / 改打开
+        # 集合 / 覆盖持久化布局都不是手机远程控制该有的能力，与 open_path /
+        # save_clipboard_image 同一边界（设计 18 fail-closed）；若将来同名方法
+        # 被重新引入，这里仍然默认封禁。
         "ide_write_file", "ide_set_open_files", "ide_save_layout",
-        # ide_run_file 往桌面常驻终端里写一行命令并回车（且支持 command= 原样透传），
-        # 比 ide_write_file 更进一步——等于开放远程任意命令执行，同样 fail-closed。
+        # 历史项：ide_run_file 曾往桌面常驻终端写一行命令并回车（支持 command=
+        # 原样透传），等于开放远程任意命令执行；方法已移除，名单项同为纵深防御。
         "ide_run_file",
         # 交互式终端（底部面板常驻 shell，pty_terminal_*）。按「只读/查看/调尺寸」
         # 与「写入/执行/销毁」划界——不能整组封：封了 write/kill 就必须留
@@ -262,11 +259,9 @@ class LanServer:
         #     pty_terminal_kill —— 终止用户的常驻 shell（销毁桌面用户态会话，
         #       正在跑的任务随之消失），属「销毁」类。
         "pty_terminal_write", "pty_terminal_kill",
-        # 语言服务器可执行文件路径覆写（写配置类）：写盘 override 并立即
-        # recycle_all() 换掉正在使用的 LSP 进程——等价于让桌面下次启动任意
-        # 可执行文件，与已封的 ide_write_file / ide_save_layout 同边界（远程
-        # 改桌面持久状态），fail-closed。只读类 lsp_server_status / lsp_request
-        # / lsp_notify 与前端驱动的 lsp_sync_workspace 保持放行。
+        # 语言服务器可执行文件路径覆写（历史项：LSP 子系统已随 IDE 移除，
+        # gui_bridge 侧无此方法）。名单项保留作纵深防御——写盘 override 并
+        # recycle 等价于让桌面下次启动任意可执行文件，与 ide_write_file 同边界。
         "lsp_set_server_path",
         # 明文凭据读取（本轮边界审计）：快照类方法一律只回 has_* 布尔
         # （get_model_settings 的 has_api_key、get_feishu_settings 的
@@ -299,10 +294,9 @@ class LanServer:
         # （覆盖桌面下次启动的侧栏排序），此前黑名单存在同类不对称。手机端无此
         # 能力需求（frontend-mobile 不调用它）；只读的 get_ui_layout 保持放行。
         "save_ui_layout",
-        # 会话级 UI 状态（session_ui.json）：写桌面持久状态，决定桌面下次打开
-        # 该会话时落在 IDE 模式还是对话模式——与已封的 save_ui_layout /
-        # ide_save_layout 同一边界（远程覆盖桌面持久状态），按设计 18 的
-        # fail-closed 原则一并封禁。只读的 get_session_ui 保持放行。
+        # 会话级 UI 状态（历史项：session_ui 存储已随 IDE 移除一并删除，
+        # gui_bridge 侧无对应方法）。名单项保留作纵深防御——写桌面持久状态，
+        # 与 save_ui_layout 同一边界（设计 18 fail-closed）。
         "save_session_ui",
         # 桌面专属生命周期：shutdown 停掉自动化引擎、set 掉全部取消事件（正在跑
         # 的回合被中止）并走窗口销毁链路——与已封的 window_close /
