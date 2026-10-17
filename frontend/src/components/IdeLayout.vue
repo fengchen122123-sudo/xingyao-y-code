@@ -298,12 +298,31 @@ function onActivityAction(id: string) {
 // 先登记会话、再恢复标签：顺序不能反（Task 8 评审 Important）——
 // ideStore 的标签桶按会话隔离，若反过来，先 openFile 的标签会落进 '' 桶，
 // 会话绑定后成为孤儿、用户已打开的文件凭空消失。
+/**
+ * 确保当前会话的工作区文件夹已"打开"（= 文件树已加载）。
+ *
+ * 原 appStore.ensureIdeWorkspace 随 IDE 模式入口一并移除，这里内联其语义
+ * （该封装只有 IDE 布局侧调用）：
+ * - `workdir` 为空（当前会话未绑定工作区）：**不自动弹目录选择器**，直接返回，
+ *   界面显示欢迎页，由用户点「打开文件夹」显式选择；
+ * - 文件树已加载：直接返回，不重复打后端；
+ * - 已绑定工作区但文件树为空：拉一次树。
+ *
+ * 失败不外泄：`refreshFileTree` 内部已 catch（失败保留旧树）并在 finally
+ * 复位 `fileTreeRefreshing`。
+ */
+function ensureWorkspace() {
+  if (!store.workdir) return;
+  if (store.fileTree.length > 0) return;
+  void store.refreshFileTree();
+}
+
 onMounted(async () => {
   ide.setSession(store.currentSessionName);
-  // 进 IDE 模式就把当前会话的工作区"打开"（= 文件树加载好）。语义已由 appStore
+  // 进 IDE 布局就把当前会话的工作区"打开"（= 文件树加载好）。语义已由 ensureWorkspace
   // 定死：有工作区才拉树，没有工作区直接返回、由欢迎页引导用户选文件夹，
   // **不自动弹目录选择器**。不 await：拉树可能耗时，布局不该被它挡住。
-  void store.ensureIdeWorkspace();
+  ensureWorkspace();
   const api = (window as any).pywebview?.api;
   if (!api?.ide_get_layout) return;
   const res = await api.ide_get_layout(store.currentSessionName);
@@ -334,16 +353,16 @@ watch(() => store.currentSessionName, (name) => {
   // 迟到的诊断/跳转指向错误目录。回收幂等，与下面的 workdir 监听重复调用无副作用。
   void ide.syncWorkspace();
   // 新会话的工作区文件树同样要跟上（无工作区则保持欢迎页，不弹选择器）
-  void store.ensureIdeWorkspace();
+  ensureWorkspace();
 });
 
 // 工作区变了但会话没变（例如给「对话」会话引入项目文件夹，或手机上按路径选目录）：
 // 同样要回收，否则旧工作区的语言服务器会一直跑着（验收 S2-3：切工作区无残留进程）。
 watch(() => store.workdir, () => {
   void ide.syncWorkspace();
-  // 用户刚选好文件夹：文件树要立刻出现在资源管理器里（ensureIdeWorkspace 内部
+  // 用户刚选好文件夹：文件树要立刻出现在资源管理器里（ensureWorkspace 内部
   // 已加载就不重复打后端）
-  void store.ensureIdeWorkspace();
+  ensureWorkspace();
 });
 </script>
 
