@@ -150,3 +150,8 @@ gzh-tokenrhythm/
 
 # 一次性临时生图脚本（本地使用，不入库）
 _day3_imggen.py
+
+# 随包第三方二进制：ffmpeg.exe 约 96MB，体积过大不入库，按需本地下载（来源与 SHA256 见 vendor/VENDOR_MANIFEST.json）
+/vendor/ffmpeg/
+# 误操作产生的空文件（2026-10-17 命令重定向写坏），不入库
+/'
