@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>执行过程改版设计稿 · ZCode 风格</title>
+<style>
+  :root {
+    --bg: #faf9f6;
+    --panel: #ffffff;
+    --text: #3a3a36;
+    --dim: #6b6b64;
+    --faint: #8f8f87;
+    --border: #e2e0d8;
+    --code-bg: #f0efec;
+    --green: #3f9a4d;
+    --red: #d24a44;
+    --orange: #e07a2e;
+    --accent: #5b84c4;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 28px 32px 60px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  h1 { font-size: 17px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--faint); font-size: 12.5px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; align-items: start; }
+  .col-title {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12.5px; font-weight: 600; color: var(--dim);
+    margin-bottom: 10px; text-transform: none;
+  }
+  .tag {
+    font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 999px;
+    background: #eceae3; color: var(--faint);
+  }
+  .tag.new { background: rgba(91,132,196,.14); color: var(--accent); }
+  .board {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+
+  /* ── 折叠头（两栏共用） ── */
+  .fold-head {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12.5px; color: var(--faint); cursor: pointer;
+    margin-bottom: 10px;
+  }
+  .fold-head .caret { font-size: 10px; transform: rotate(90deg); opacity: .5; }
+  .fold-head b { font-weight: 600; color: var(--dim); }
+
+  /* ── 旧样式：独立白卡 ── */
+  .card {
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    display: flex; gap: 10px;
+    background: #fff;
+    font-size: 12.5px;
+  }
+  .card .ico { color: var(--green); }
+  .card .row1 { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .card .dur { margin-left: auto; font-size: 11px; color: var(--faint); font-weight: 400; }
+  .card .detail { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .cmd { font-family: Consolas, monospace; font-size: 11.5px; color: var(--faint); }
+  .card .more { font-size: 11px; color: var(--faint); margin-top: 2px; }
+  .card ul { margin: 4px 0 0; padding-left: 18px; font-family: Consolas, monospace; font-size: 11.5px; color: var(--dim); }
+
+  /* ── 新样式：ZCode 摘要行 ── */
+  .tool-line {
+    display: flex; align-items: center; gap: 8px;
+    width: fit-content; max-width: 100%;
+    padding: 3px 6px 3px 4px;
+    margin-left: -4px;
+    border-radius: 6px;
+    font-size: 12.5px;
+    color: var(--faint);
+    cursor: pointer;
+    transition: background .12s ease;
+  }
+  .tool-line:hover { background: #f4f2ed; }
+  .tool-line .t-ico { flex: none; opacity: .85; }
+  .tool-line .t-kind { font-weight: 500; white-space: nowrap; }
+  .tool-line .t-target {
+    min-width: 0; font-family: Consolas, monospace; font-size: 11.5px; color: var(--dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tool-line .t-sep { opacity: .5; }
+  .tool-line .t-meta { flex: none; color: var(--faint); }
+  .tool-line .t-diff { flex: none; font-family: Consolas, monospace; font-size: 11px; }
+  .tool-line .t-diff .add { color: var(--green); }
+  .tool-line .t-diff .del { color: var(--red); }
+  .tool-line .t-caret {
+    flex: none; margin-left: auto; opacity: 0;
+    transition: opacity .12s ease, transform .15s ease;
+    color: var(--faint); font-size: 11px;
+  }
+  .tool-line:hover .t-caret, .tool-line.is-open .t-caret { opacity: 1; }
+  .tool-line.is-open .t-caret { transform: rotate(90deg); }
+
+  /* 运行中：类别标签扫光 */
+  .is-running .t-kind {
+    background: linear-gradient(90deg, var(--faint) 0%, var(--text) 45%, var(--faint) 90%);
+    background-size: 220% 100%;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: shimmer 2.4s linear infinite;
+  }
+  @keyframes shimmer {
+    from { background-position: 120% 0; }
+    to { background-position: -120% 0; }
+  }
+  .state-ok { color: var(--green); }
+  .state-err { color: var(--red); }
+  .state-run { color: var(--accent); }
+
+  /* 展开详情：左细线 + 缩进 + 弱灰 */
+  .tool-detail {
+    margin: 2px 0 8px 10px;
+    padding: 6px 0 6px 14px;
+    border-left: 1px solid var(--border);
+    max-height: 168px; overflow: auto;
+    font-family: Consolas, monospace; font-size: 11.5px; line-height: 1.6;
+    color: var(--faint);
+    white-space: pre-wrap;
+  }
+  .tool-detail .ln { color: #a8a8a0; user-select: none; display: inline-block; width: 24px; }
+  .tool-detail .dl-add { color: var(--green); }
+  .tool-detail .dl-del { color: var(--red); }
+
+  /* 失败态：状态词虚线下划线 */
+  .t-fail-hint {
+    text-decoration: underline dotted;
+    text-decoration-color: var(--red);
+    text-underline-offset: 3px;
+    cursor: help;
+  }
+
+  .note {
+    margin-top: 18px; padding: 12px 14px;
+    background: #f4f2ed; border-radius: 8px;
+    font-size: 12.5px; color: var(--dim);
+  }
+  .note b { color: var(--text); }
+  .note li { margin: 2px 0; }
+  .note ul { margin: 6px 0 0; padding-left: 18px; }
+</style>
+</head>
+<body>
+
+<h1>执行过程 · 改版设计稿</h1>
+<div class="sub">左：现状（每个工具一张白卡）　右：ZCode 风格（每条工具一行摘要，详情按需展开）</div>
+
+<div class="grid">
+
+  <!-- 现状 -->
+  <div>
+    <div class="col-title">现在 <span class="tag">当前实现</span></div>
+    <div class="board">
+      <div class="fold-head"><span class="caret">▸</span> <b>执行过程</b> · 2 项 · 已完成</div>
+
+      <div class="card">
+        <span class="ico">✓</span>
+        <div style="flex:1;min-width:0">
+          <div class="row1">读取文件 <span class="dur">16ms</span></div>
+          <div class="detail">E:\fch\Y-code_tui\.gitignore</div>
+          <ul><li>E:\fch\Y-code_tui\.gitignore</li></ul>
+          <div class="more">展开详情</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <span class="ico">✓</span>
+        <div style="flex:1;min-width:0">
+          <div class="row1">运行命令 <span class="dur">109ms</span></div>
+          <div class="cmd">git diff -- vendor/VENDOR_MANIFEST.json</div>
+          <div class="more">展开详情</div>
+        </div>
+      </div>
+
+      <div style="font-size:12px;color:var(--faint);margin-top:10px">
+        卡片自带边框和圆角，一次十几个工具就会堆出一长串白色方块。
+      </div>
+    </div>
+  </div>
+
+  <!-- 新设计 -->
+  <div>
+    <div class="col-title">ZCode 风格 <span class="tag new">建议</span></div>
+    <div class="board">
+      <div class="fold-head"><span class="caret">▸</span> <b>执行过程</b> · 2 项 · 已完成</div>
+
+      <!-- 已完成：读取（收起） -->
+      <div class="tool-line">
+        <span class="t-ico">🔍</span>
+        <span class="t-kind">读取</span>
+        <span class="t-target">.gitignore</span>
+        <span class="t-caret">▸</span>
+      </div>
+
+      <!-- 已完成：命令（展开） -->
+      <div class="tool-line is-open">
+        <span class="t-ico">⌘</span>
+        <span class="t-kind">运行</span>
+        <span class="t-target">git diff -- vendor/VENDOR_MANIFEST.json</span>
+        <span class="t-meta">109ms</span>
+        <span class="t-caret">▸</span>
+      </div>
+      <div class="tool-detail">diff --git a/vendor/VENDOR_MANIFEST.json b/vendor/VENDOR_MANIFEST.json
+<span class="dl-del">-  "commit": "9f3c1a2"</span>
+<span class="dl-add">+  "commit": "4b81e07"</span></div>
+
+      <!-- 编辑：带增删统计 -->
+      <div class="tool-line">
+        <span class="t-ico">✏️</span>
+        <span class="t-kind">编辑</span>
+        <span class="t-target">core/app.py</span>
+        <span class="t-diff"><span class="add">+12</span> <span class="del">-3</span></span>
+        <span class="t-caret">▸</span>
+      </div>
+
+      <!-- 运行中：类别标签扫光 -->
+      <div class="tool-line is-running">
+        <span class="t-ico">⌘</span>
+        <span class="t-kind">运行</span>
+        <span class="t-target">pytest tests -q</span>
+        <span class="t-meta state-run">运行中</span>
+      </div>
+
+      <!-- 失败：红色状态词 + 虚线（hover 看完整报错） -->
+      <div class="tool-line">
+        <span class="t-ico state-err">✕</span>
+        <span class="t-kind">运行</span>
+        <span class="t-target">npm run build</span>
+        <span class="t-meta state-err t-fail-hint" title="error TS2322: Type 'string' is not assignable to type 'number'.">失败</span>
+      </div>
+
+      <div style="font-size:12px;color:var(--faint);margin-top:10px">
+        悬停任意一行看箭头浮现；点开只在行下展开缩进详情，不再有卡片方块堆叠。
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="note">
+  <b>这版设计的关键点</b>
+  <ul>
+    <li>工具行 = 图标 + 类别（读取 / 运行 / 编辑 / 搜索）+ 目标 + 状态/耗时 + 悬停箭头，整行无边框无底色。</li>
+    <li>行宽贴合内容（<code>width: fit-content</code>），不铺满整行；悬停整行轻微浅底，提示可点。</li>
+    <li>详情挂在行下面：左 1px 细线 + 14px 缩进 + 最弱灰，限高内滚，和思考块同一套语言。</li>
+    <li>运行中不转圈，靠类别标签轻微扫光 + “运行中”状态词；失败用红色状态词 + 虚线下划线，悬停看完整报错。</li>
+  </ul>
+</div>
+
+</body>
+</html>
