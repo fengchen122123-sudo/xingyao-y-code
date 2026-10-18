@@ -5200,6 +5200,54 @@ def _background_worker():
             task_key = active_info.get("api_key", "")
             task_url = active_info.get("base_url", "")
             task_ctx_win = active_info.get("context_window", 128000)
+            # 本回合实际发请求所用的模型 id（默认=激活模型）。router 场景可能一次性
+            # 换成副模型 id；必须与 task_model 成对替换——llm_dialects 按 id 读
+            # thinking / max_tokens 等模型级配置，只换名字不换 id 会用错推理参数。
+            task_model_id = active_info.get("id")
+            # —— router 场景：回合级模型档位（与 GUI 入口同源，方案 A）——
+            # 只替换本回合的几个局部变量（task_model / task_key / task_url /
+            # task_ctx_win / task_model_id），是本回合的一次性覆盖：不写任何全局或
+            # 会话级模型绑定，子代理继承链继续用各自的会话/全局模型。
+            # JEV 关闭 / 影子时 router_scene_live() 为假：不读历史、不算 token、
+            # 不发决策请求，CLI 行为与接入前逐字一致。
+            try:
+                from core.turn_model_override import router_scene_live, resolve_turn_model
+
+                if router_scene_live():
+                    from core.agent_service import get_session_token_baseline
+
+                    # 硬护栏基线：本会话当前上下文占用；拿不到就传 0 跳过这条护栏
+                    try:
+                        baseline_tokens = get_session_token_baseline(
+                            manager, task_session, task_model
+                        )
+                    except Exception:
+                        baseline_tokens = 0
+                    turn_override = resolve_turn_model(
+                        active_info,
+                        turn_source="local",
+                        pending_model_id="",
+                        baseline_tokens=baseline_tokens,
+                        user_text=user_input,
+                    )
+                    if turn_override:
+                        logging.getLogger("py.warnings").info(
+                            "router 场景覆盖本回合模型 [%s]：%s → %s（基线 %s tokens，副模型窗口 %s tokens）",
+                            task_session,
+                            task_model,
+                            turn_override["litellm_model"],
+                            baseline_tokens,
+                            turn_override["context_window"],
+                        )
+                        task_model = turn_override["litellm_model"]
+                        task_key = turn_override["api_key"]
+                        task_url = turn_override["base_url"]
+                        task_ctx_win = turn_override["context_window"]
+                        task_model_id = turn_override["model_id"]
+            except Exception:
+                logging.getLogger("py.warnings").debug(
+                    "router 场景模型档位覆盖失败，本回合沿用主模型", exc_info=True
+                )
 
             from core.input_parser import parse_user_input, extract_session_refs
             if is_skill_call:
@@ -5374,7 +5422,7 @@ def _background_worker():
                         parent_turn_id=turn_id,
                         permission_owner=turn_id,
                         permission_source="主代理",
-                        model_id=active_info.get("id"),
+                        model_id=task_model_id,
                     )
                     # 回复头部由 _render_ui_event 在主线程统一输出；
                     # 消息已由 generator 在生成迭代中实时持久化入库，此处不再重复写入

@@ -14,14 +14,18 @@ PyWebView JS-API 桥接层：为 Vue 前端提供后端能力，并把一轮对�
 import base64
 import copy
 import ctypes
+import glob
 import json
 import logging
 import os
 import queue
 import pathlib
+from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -101,6 +105,10 @@ _DWM_COLOR_CAPABILITY_UNSUPPORTED = "unsupported"
 _DWM_COLOR_CAPABILITY_PENDING = "pending"
 _DWM_COLOR_CAPABILITY_NOT_APPLICABLE = "not_applicable"
 _DWM_COLOR_CAPABILITY_UNKNOWN = "unknown"
+
+# 背景图转换支持的视频扩展名：与 pick_background_video 的文件对话框过滤器一致。
+# 只做扩展名白名单，真正的可解码性由 ffmpeg 探针/抽帧阶段判定。
+_BACKGROUND_VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
 
 # DwmSetWindowAttribute returns HRESULT. Pre-Win11 builds report custom color
 # attributes 34/35/36 as E_INVALIDARG; E_NOTIMPL and HRESULT_FROM_WIN32(
@@ -2294,6 +2302,375 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
         return self._run_gui_theme_operation("read_gui_theme_asset", operation, "asset_path")
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 背景图转换：把 mp4 等视频转成"动画 WebP"，供 GUI 主题当背景图使用
+    #
+    # 为什么是动画 WebP：本项目背景图走 CSS background-image（且多数挂在伪元素上），
+    # 承载不了视频；GIF 不在 core/gui_theme._IMAGE_FORMATS 白名单里且 256 色画质差；
+    # 动画 WebP 的容器格式就是 WEBP，天然通过 _IMAGE_FORMATS 与前端 MIME 白名单。
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _find_ffmpeg(self) -> Optional[str]:
+        """定位 ffmpeg 可执行文件；找不到返回 None（不静默失败，交给调用方提示）。
+
+        优先用**随包内置**的那份（打包后位于 `_MEIPASS/vendor/ffmpeg`，源码运行时位于
+        项目根 `vendor/ffmpeg`，与 core/lsp.py 定位内置 rg.exe 同一套约定）。内置副本
+        版本固定，用户无需自装 ffmpeg，也不会因系统 ffmpeg 版本漂移导致转换行为不一致；
+        只有在没有内置副本时才回退到 PATH 与常见安装位置。
+        """
+        candidates = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        candidates.append(Path(__file__).resolve().parent / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        candidates.append(Path(os.getcwd()) / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        for candidate in (
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            Path(os.path.expanduser(os.path.join("~", "scoop", "shims", "ffmpeg.exe"))),
+            Path(r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"),
+        ):
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _probe_video_meta(ffmpeg: str, source: str) -> Dict[str, Any]:
+        """用 `ffmpeg -i` 的 stderr 读时长/分辨率（不依赖 ffprobe：很多精简版不带）。"""
+        meta: Dict[str, Any] = {"duration": None, "width": None, "height": None}
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", source],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return meta
+        text = (proc.stderr or "") + (proc.stdout or "")
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+        if match:
+            hours, minutes, seconds = match.groups()
+            meta["duration"] = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        match = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", text)
+        if match:
+            meta["width"], meta["height"] = int(match.group(1)), int(match.group(2))
+        return meta
+
+    def _background_convert_limits(self) -> Dict[str, int]:
+        """与主题资源校验共用同一套上限，避免两处数字漂移。"""
+        from core.gui_theme import _MAX_IMAGE_BYTES, _MAX_IMAGE_DIMENSION
+        return {"max_bytes": int(_MAX_IMAGE_BYTES), "max_dimension": int(_MAX_IMAGE_DIMENSION)}
+
+    def pick_background_video(self) -> Dict[str, Any]:
+        """选择待转换的视频，并返回探测信息 + 预检结论（能否转换、有哪些提醒）。"""
+        def operation():
+            import webview
+
+            result = self._require_theme_window().create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("视频文件 (*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v)",),
+            )
+            source = self._dialog_path(result)
+            if source is None:
+                raise ThemeError("dialog_cancelled", "source", "已取消选择视频")
+            return {"ok": True, **self.describe_background_video(str(source))}
+
+        return self._run_gui_theme_operation("pick_background_video", operation, "source")
+
+    def describe_background_video(self, source: str) -> Dict[str, Any]:
+        """给定视频路径，返回大小/时长/分辨率与"能不能转"的结论。"""
+        limits = self._background_convert_limits()
+        source_path = Path(source)
+        if not source_path.is_file():
+            raise ThemeError("invalid_video", "source", "视频文件不存在或不可读")
+        if source_path.suffix.lower() not in _BACKGROUND_VIDEO_EXTENSIONS:
+            raise ThemeError(
+                "unsupported_video",
+                "source",
+                "只支持 mp4 / mov / mkv / webm / avi / m4v 视频文件",
+            )
+        size = source_path.stat().st_size
+        ffmpeg = self._find_ffmpeg()
+        info: Dict[str, Any] = {
+            "path": str(source_path),
+            "name": source_path.name,
+            "bytes": size,
+            "ffmpeg_available": bool(ffmpeg),
+            "max_bytes": limits["max_bytes"],
+            "max_dimension": limits["max_dimension"],
+            "duration": None,
+            "width": None,
+            "height": None,
+            "can_convert": True,
+            "blockers": [],
+            "warnings": [],
+        }
+        if not ffmpeg:
+            info["can_convert"] = False
+            info["blockers"].append(
+                "未找到 ffmpeg，无法转换。请安装 ffmpeg 并加入 PATH 后重启应用"
+                "（或放到 本目录/vendor/ffmpeg/ffmpeg.exe）。"
+            )
+            return info
+        info.update(self._probe_video_meta(ffmpeg, str(source_path)))
+        if info["duration"] is None:
+            info["warnings"].append("无法读取视频时长，转换中将只显示『处理中』而无法给出百分比。")
+        else:
+            fps_guess = 12
+            # 粗估输出帧数：乒乓模式相当于正放+倒放，帧数×2
+            frames = int(info["duration"] * fps_guess)
+            if frames > 600:
+                info["warnings"].append(
+                    f"视频约 {info['duration']:.1f} 秒；默认 12fps 下乒乓循环将有约 {frames * 2} 帧，"
+                    "文件会偏大、内存占用偏高。建议先用视频剪辑工具截取 4~6 秒的循环片段。"
+                )
+        return info
+
+    def pick_background_output_dir(self) -> Dict[str, Any]:
+        """选择转换结果的输出文件夹（默认落在桌面）。"""
+        def operation():
+            import webview
+
+            try:
+                from installer_common import get_desktop_dir
+                initial = get_desktop_dir()
+            except Exception:
+                initial = os.path.expanduser("~")
+            result = self._require_theme_window().create_file_dialog(
+                webview.FOLDER_DIALOG,
+                directory=initial,
+            )
+            if not result:
+                raise ThemeError("dialog_cancelled", "destination", "已取消选择文件夹")
+            chosen = Path(str(result[0] if isinstance(result, (list, tuple)) else result))
+            if not chosen.is_dir():
+                raise ThemeError("invalid_directory", "destination", "选择的路径不是文件夹")
+            return {"ok": True, "path": str(chosen)}
+
+        return self._run_gui_theme_operation("pick_background_output_dir", operation, "destination")
+
+    def start_background_convert(
+        self,
+        source: str,
+        output_dir: str,
+        fps: int = 12,
+        quality: int = 78,
+        pingpong: bool = True,
+    ) -> Dict[str, Any]:
+        """后台线程执行 ffmpeg 转换，进度经 bg_convert_progress 事件实时推送。"""
+        ffmpeg = self._find_ffmpeg()
+        if not ffmpeg:
+            return {"ok": False, "msg": "未找到 ffmpeg，无法转换（请安装后重启应用）"}
+        if getattr(self, "_bg_convert_running", False):
+            return {"ok": False, "msg": "已有转换任务在进行中"}
+        source_path = Path(source)
+        out_dir = Path(output_dir)
+        if not source_path.is_file():
+            return {"ok": False, "msg": "源视频不存在"}
+        if not out_dir.is_dir():
+            return {"ok": False, "msg": "输出文件夹不存在"}
+        fps = max(1, min(30, int(fps)))
+        quality = max(0, min(100, int(quality)))
+        meta = self._probe_video_meta(ffmpeg, str(source_path))
+        output_path = out_dir / (source_path.stem + "-动态背景.webp")
+
+        self._bg_convert_running = True
+        self._bg_convert_proc = None
+        thread = threading.Thread(
+            target=self._background_convert_worker,
+            args=(ffmpeg, str(source_path), str(output_path), fps, quality, bool(pingpong), meta),
+            name="bg-convert", daemon=True,
+        )
+        thread.start()
+        return {"ok": True, "output": str(output_path)}
+
+    def cancel_background_convert(self) -> Dict[str, Any]:
+        """中止正在进行的转换（终止 ffmpeg 子进程并删除半成品）。"""
+        proc = getattr(self, "_bg_convert_proc", None)
+        self._bg_convert_cancelled = True
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return {"ok": True, "msg": "已请求中止"}
+        return {"ok": True, "msg": "当前没有转换任务"}
+
+    def _background_convert_worker(self, ffmpeg, source, output_path, fps, quality, pingpong, meta):
+        """两阶段转换（有真实进度）：
+        ① ffmpeg 抽帧到临时目录（image2 边写边报 frame=，进度真实）
+        ② ffmpeg 从帧序列合成动画 WebP（乒乓=正放+倒放，按文件名顺序喂给 image2）
+
+        为什么不能一次 ffmpeg 转完：动画 WebP 的封装器必须收齐全部帧才写容器，
+        因此 `-progress` 的 out_time 全程是 N/A、frame 恒为 0，进度只能最后跳 100%；
+        而 filter_complex 的 reverse 还要额外缓存整条流（长视频会吃光内存）。
+        也没有用 PIL 合成：实测 122 帧要 32 秒，比 ffmpeg 慢一个数量级。
+        """
+        limits = self._background_convert_limits()
+        self._bg_convert_cancelled = False
+        duration = meta.get("duration")
+        width = min(int(meta.get("width") or 1920), 1920)
+        total_frames = int(duration * fps) if duration else None
+        temp_dir = tempfile.mkdtemp(prefix="ycode-bgconv-")
+        tail: list = []
+        try:
+            # ── 阶段①：抽帧  0~80% ──────────────────────────────────────
+            self.emit_event("bg_convert_progress", {"percent": 0, "stage": "extracting"})
+            extract_cmd = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", source,
+                "-vf", f"fps={fps},scale={width}:-2:flags=lanczos",
+                "-progress", "pipe:1", "-nostats",
+                os.path.join(temp_dir, "f-%05d.png"),
+            ]
+            proc = subprocess.Popen(
+                extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            self._bg_convert_proc = proc
+            last_percent = -1
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.strip()
+                if line.startswith("frame="):
+                    try:
+                        done = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    if total_frames:
+                        percent = max(0, min(80, int(done / total_frames * 80)))
+                        if percent != last_percent:
+                            last_percent = percent
+                            self.emit_event("bg_convert_progress", {
+                                "percent": percent, "stage": "extracting",
+                                "frames_done": done, "frames_total": total_frames,
+                            })
+                elif line:
+                    tail.append(line)
+                    if len(tail) > 60:
+                        tail.pop(0)
+            returncode = proc.wait()
+            self._bg_convert_proc = None
+            if self._bg_convert_cancelled:
+                self.emit_event("bg_convert_error", {"message": "已中止转换"})
+                return
+            if returncode != 0:
+                reason = tail[-1] if tail else f"ffmpeg 退出码 {returncode}"
+                self.emit_event("bg_convert_error", {"message": f"抽取帧失败：{reason}"})
+                return
+
+            frames = sorted(glob.glob(os.path.join(temp_dir, "f-*.png")))
+            if not frames:
+                self.emit_event("bg_convert_error", {"message": "未能从该视频中抽取到任何画面帧"})
+                return
+
+            # ── 阶段②：组装序列  80~88% ────────────────────────────────
+            # 乒乓：正放 + 倒放，并去掉折点重复帧（…f61→f60…、末尾 f2→循环回 f1 都连续）
+            ordered = frames + frames[-2:0:-1] if pingpong else frames
+            self.emit_event("bg_convert_progress", {"percent": 82, "stage": "assembling"})
+            for index, frame_path in enumerate(ordered, start=1):
+                shutil.copyfile(frame_path, os.path.join(temp_dir, f"s-{index:05d}.png"))
+                if self._bg_convert_cancelled:
+                    self.emit_event("bg_convert_error", {"message": "已中止转换"})
+                    return
+            self.emit_event("bg_convert_progress", {"percent": 88, "stage": "encoding"})
+
+            # ── 阶段③：合成动画 WebP  88~100% ──────────────────────────
+            assemble_cmd = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-framerate", str(fps),
+                "-i", os.path.join(temp_dir, "s-%05d.png"),
+                "-c:v", "libwebp_anim", "-lossless", "0", "-q:v", str(quality),
+                "-loop", "0", "-compression_level", "4", "-an",
+                output_path,
+            ]
+            proc = subprocess.Popen(
+                assemble_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            self._bg_convert_proc = proc
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.strip()
+                if line:
+                    tail.append(line)
+                    if len(tail) > 60:
+                        tail.pop(0)
+            returncode = proc.wait()
+            self._bg_convert_proc = None
+            if self._bg_convert_cancelled:
+                self._safe_unlink(output_path)
+                self.emit_event("bg_convert_error", {"message": "已中止转换"})
+                return
+            if returncode != 0 or not os.path.exists(output_path):
+                reason = tail[-1] if tail else f"ffmpeg 退出码 {returncode}"
+                # 合成失败时清掉可能已写出的半个容器，避免用户拿到不可用的 webp
+                self._safe_unlink(output_path)
+                self.emit_event("bg_convert_error", {"message": f"合成动画失败：{reason}"})
+                return
+
+            size = os.path.getsize(output_path)
+            if size > limits["max_bytes"]:
+                self._safe_unlink(output_path)
+                self.emit_event("bg_convert_error", {
+                    "message": (
+                        f"转换结果 {size / 1048576:.2f} MiB，超过背景图上限 "
+                        f"{limits['max_bytes'] / 1048576:.0f} MiB，已删除。"
+                        "请降低帧率或质量后重试，或先裁剪更短的循环片段。"
+                    ),
+                })
+                return
+            self.emit_event("bg_convert_progress", {"percent": 100, "stage": "done"})
+            self.emit_event("bg_convert_done", {
+                "path": output_path,
+                "bytes": size,
+                "frames": len(ordered),
+                "fps": fps,
+                "pingpong": pingpong,
+            })
+        except Exception as error:  # noqa: BLE001 — 后台线程必须兜住一切
+            logger.exception("背景图转换失败")
+            self._safe_unlink(output_path)
+            self.emit_event("bg_convert_error", {"message": f"转换异常：{error}"})
+        finally:
+            self._bg_convert_running = False
+            self._bg_convert_proc = None
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _safe_unlink(path):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def install_converted_background(self, webp_path: str) -> Dict[str, Any]:
+        """把转换好的 webp 直接设为当前主题的全局背景图（省去手动选图）。"""
+        def operation():
+            repository = get_gui_theme_repository()
+            # 激活主题只能经 get_active() 读取（返回完整主题 DTO，id 即激活主题 id）。
+            # 不能假设仓库有 active_theme_id()：目标库 ThemeRepository 没有该方法，
+            # 裸调用会抛 AttributeError 被兜底成「GUI 主题操作失败」。这里显式判空，
+            # 无激活主题时给出可读提示。
+            active_theme = repository.get_active()
+            active = active_theme.get("id") if isinstance(active_theme, dict) else None
+            if not active:
+                raise ThemeError("no_active_theme", "theme", "当前没有激活的主题")
+            asset_path = repository.import_image(active, "app", Path(webp_path))
+            return {"ok": True, "theme_id": active, "asset_path": asset_path}
+
+        return self._run_gui_theme_operation("install_converted_background", operation, "theme")
+
     def get_gui_theme_asset(self, theme_id: str, asset_path: str) -> Dict[str, Any]:
         """Compatibility alias for the initially published Task 3 method name."""
         return self.read_gui_theme_asset(theme_id, asset_path)
@@ -4239,6 +4616,97 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("rename_session 失败")
             return {"ok": False, "msg": str(e), "name": old_name}
 
+    def move_session_to_workdir(self, session_name: str, workdir: str) -> Dict[str, Any]:
+        """把会话移动到另一个工作区分组（或移回 GLOBAL「对话」分组）。
+
+        只改归属字段 sessions.workdir：消息、摘要、token 统计、会话级模型绑定
+        都按 session_id 关联，原样保留，不随归属变化。回合的 cwd 在开跑时从该
+        字段解析（见 _send_message 里的 turn_workdir / workspace_scope 绑定处），
+        所以移动后下一回合自然在新目录里干活，无需额外同步进程状态。
+
+        workdir 传 "GLOBAL" 表示移回无归属的「对话」分组；空字符串视为非法目标
+        （侧栏只会给出真实分组或 GLOBAL，空值一定是传参错误，静默当 GLOBAL
+        会把会话误移出项目）。
+        """
+        name = str(session_name or "").strip()
+        if not name:
+            return {"ok": False, "msg": "会话名不能为空"}
+        if self._memory is None:
+            return {"ok": False, "msg": "后端未就绪"}
+        try:
+            # 与重命名/删除同款守卫：回合运行中改归属会让前端 running 态与新分组
+            # 失配（侧栏把运行中的会话渲染到别处、状态残留）
+            if self._is_turn_active(name):
+                return {"ok": False, "msg": "该会话正在运行回合，请先停止或等待完成后再移动", "name": name}
+            # 后台任务/子代理仍挂在本会话上：它们是在旧目录里起的进程，cwd 不会跟着
+            # 搬走，收尾事件与产出会写回旧分组；此时改归属会让两侧状态错位，一并拦住
+            try:
+                from core.tools import subagent_manager
+                if subagent_manager.has_running_background_tasks(name):
+                    return {"ok": False, "msg": "该会话还有后台任务在执行，请等待完成或停止后再移动", "name": name}
+            except Exception:
+                # 查询失败不阻断主流程（后台任务管理是增强能力，不是移动的前置硬依赖）
+                logger.debug("查询后台任务状态失败", exc_info=True)
+
+            from core.memory import _normalize_workdir
+
+            target = str(workdir or "").strip()
+            if not target:
+                return {"ok": False, "msg": "目标分组不能为空", "name": name}
+            if target != "GLOBAL":
+                resolved = _resolve_real_path(target)
+                if not resolved or not os.path.isdir(resolved):
+                    return {"ok": False, "msg": "目标文件夹不存在或不可访问", "name": name}
+                target = _normalize_workdir(resolved)
+                # 登记工作区，否则侧栏拿不到这个分组（空分组也要能显示出来）
+                self._memory.add_workspace(target)
+
+            # 先取当前归属：会话不存在要报错，不能落到 _session_workdir 的
+            # "查不到就按当前 cwd 处理"兜底上（那会把不存在的会话误判成"已在目标分组"）
+            current = None
+            current_source = "GUI"
+            # include_archived=True：归档只是列表隐藏，会话仍存在，不能因为已归档
+            # 就误报"会话不存在"
+            for s in self._memory.get_all_sessions(
+                workdir=None, include_empty=True, include_archived=True
+            ):
+                if s.get("name") == name:
+                    current = s.get("workdir") or "GLOBAL"
+                    current_source = s.get("source") or "GUI"
+                    break
+            if current is None:
+                return {"ok": False, "msg": "会话不存在", "name": name}
+            # 秘书会话的归属分组由 source 决定（folder_path='SECRETARY' 不是磁盘目录），
+            # 改 workdir 不会改变它在侧栏的位置，反而会悄悄改掉回合 cwd，故直接拒绝
+            if current_source == secretary.SECRETARY_SOURCE:
+                return {"ok": False, "msg": "秘书会话固定归在「秘书」分组，不支持移动", "name": name}
+            if current != "GLOBAL":
+                current = _normalize_workdir(current)
+
+            if current == target:
+                # 已在目标分组：不写库。否则 updated_at 被刷新会把会话顶到该组
+                # 列表最前，看起来像"什么都没干却跳了位置"
+                return {"ok": True, "name": name, "workdir": target, "moved": False,
+                        "sessions": self.get_sessions()}
+
+            if not self._memory.update_session_workdir(name, target):
+                return {"ok": False, "msg": "移动失败（会话可能已不存在）", "name": name}
+
+            try:
+                sessions = self.get_sessions()
+                self.emit_event("session_moved", {
+                    "name": name,
+                    "workdir": target,
+                    "sessions": sessions,
+                })
+            except Exception:
+                logger.exception("推送 session_moved 事件失败")
+                sessions = None
+            return {"ok": True, "name": name, "workdir": target, "moved": True, "sessions": sessions}
+        except Exception as e:
+            logger.exception("move_session_to_workdir 失败")
+            return {"ok": False, "msg": str(e), "name": name}
+
     def delete_session(self, session_name: str) -> Dict[str, Any]:
         try:
             # M21：回合运行中禁止删除——回合线程会继续往已删会话写消息，
@@ -4963,6 +5431,202 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:  # pragma: no cover - 防御性兜底
             logger.exception("set_decision_settings 失败")
             return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 决策模型（JEV）业务场景三态桥（关闭 / 影子 / 正式）
+    #
+    # 三态不新增 schema 字段，沿用两个布尔的组合（与 core.decision_gateway
+    # 的判断口径逐字对齐，本层只做「组合 ↔ 三态」的翻译，不改判断逻辑）：
+    #   off    = scenes.X.enabled=false
+    #   shadow = scenes.X.enabled=true 且（全局 shadow_mode=true 或 scenes.X.shadow=true）
+    #   live   = scenes.X.enabled=true 且 全局 shadow_mode=false 且 scenes.X.shadow=false
+    # ------------------------------------------------------------------
+
+    # 四个业务场景的中文元信息（顺序与 core.decision_service.DEFAULT_CONFIG["scenes"] 一致）
+    _DECISION_SCENE_META = (
+        ("router", "路由", "本回合用会话主模型还是副模型；换模型失败或低置信自动回退主模型"),
+        ("secretary", "秘书", "任务派发给哪个候选会话；失败回退原有派发规则"),
+        ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；失败用默认 5 条"),
+        ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
+    )
+    # 三态取值：关闭 / 影子 / 正式
+    _DECISION_SCENE_MODES = ("off", "shadow", "live")
+    # 三态 → 中文文案（前端直接用这份，避免两边各写一套）
+    _DECISION_SCENE_MODE_TEXT = {"off": "关闭", "shadow": "影子", "live": "正式"}
+
+    @staticmethod
+    def _decision_scene_mode(cfg: dict, scene_cfg: dict) -> str:
+        """按两个布尔的组合反推三态（口径与 core.decision_gateway.decide 一致）。"""
+        if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
+            return "off"
+        if bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True)):
+            return "shadow"
+        return "live"
+
+    @staticmethod
+    def _decision_scene_requested_mode(scene_cfg: dict) -> str:
+        """按场景自身两个布尔反推「用户想选的三态」（不看全局影子）。
+
+        界面用它与实际生效的 ``mode`` 对比：两者不一致说明全局影子把场景压住了。
+        """
+        if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
+            return "off"
+        return "shadow" if bool(scene_cfg.get("shadow", True)) else "live"
+
+    def _decision_scene_rows(self, cfg: dict) -> list:
+        """配置 → 四个场景的展示行（含三态、阈值与超时）。"""
+        scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
+        global_shadow = bool(cfg.get("shadow_mode"))
+        rows: list = []
+        for scene, label, description in self._DECISION_SCENE_META:
+            raw_scene = scenes.get(scene)
+            scene_cfg = raw_scene if isinstance(raw_scene, dict) else {}
+            mode = self._decision_scene_mode(cfg, scene_cfg)
+            requested = self._decision_scene_requested_mode(scene_cfg)
+            # 阈值/超时的形状容错：非法值一律回落默认，保证界面永远能渲染
+            raw_threshold = scene_cfg.get("threshold", 0.5)
+            if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, (int, float)):
+                threshold = 0.5
+            else:
+                threshold = max(0.0, min(1.0, float(raw_threshold)))
+            raw_timeout = scene_cfg.get("timeout_ms", 250)
+            if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+                timeout_ms = 250
+            else:
+                timeout_ms = int(raw_timeout)
+            rows.append(
+                {
+                    "scene": scene,
+                    "label": label,
+                    "description": description,
+                    # mode = 真实生效的三态（全局影子开着时，live 也会回落成 shadow）
+                    "mode": mode,
+                    "mode_text": self._DECISION_SCENE_MODE_TEXT[mode],
+                    # requested_mode = 场景自身布尔对应的用户选择
+                    "requested_mode": requested,
+                    "enabled": bool(scene_cfg.get("enabled", False)),
+                    "shadow": bool(scene_cfg.get("shadow", True)),
+                    "threshold": threshold,
+                    "timeout_ms": timeout_ms,
+                    "global_shadow": global_shadow,
+                }
+            )
+        return rows
+
+    def get_decision_scenes(self) -> Dict[str, Any]:
+        """返回四个业务场景的三态快照（设置页「业务场景」区块用）。"""
+        from core import decision_service
+
+        try:
+            cfg = decision_service.load_decision_config()
+            rows = self._decision_scene_rows(cfg)
+            return {
+                "ok": True,
+                "scenes": rows,
+                "shadow_mode": bool(cfg.get("shadow_mode")),
+                "enabled": bool(cfg.get("enabled")),
+                "msg": "",
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_scenes 失败")
+            return {"ok": False, "msg": str(e), "scenes": [], "shadow_mode": True, "enabled": False}
+
+    def set_decision_scene(self, scene: str, mode: str, threshold=None) -> Dict[str, Any]:
+        """设置单个业务场景的三态（可选同时改阈值）；返回最新四场景快照。
+
+        - ``scene``：router / secretary / search / safety；
+        - ``mode``：off（关闭）/ shadow（影子）/ live（正式）；
+        - ``threshold``：可选，钳制到 0.0~1.0；
+        - live 遇到全局 shadow_mode=true 时，effective_mode 会是 shadow（口径如此），
+          返回里的 ``hint`` 会把这件事说明白，让用户知道还差哪一步。
+        """
+        from core import decision_service
+
+        scene_name = str(scene or "").strip()
+        mode_name = str(mode or "").strip().lower()
+        known_scenes = [item[0] for item in self._DECISION_SCENE_META]
+        if scene_name not in known_scenes:
+            return {
+                "ok": False,
+                "msg": f"未知场景「{scene_name or '(空)'}」；合法值为 {' / '.join(known_scenes)}",
+                "scenes": [],
+            }
+        if mode_name not in self._DECISION_SCENE_MODES:
+            return {
+                "ok": False,
+                "msg": f"未知模式「{mode_name or '(空)'}」；合法值为 off / shadow / live",
+                "scenes": [],
+            }
+
+        scene_patch: Dict[str, Any] = {"enabled": mode_name != "off"}
+        if mode_name == "shadow":
+            scene_patch["shadow"] = True
+        elif mode_name == "live":
+            scene_patch["shadow"] = False
+        # off 不动场景自身的 shadow：保留上一次档位，重新开启时语义不变
+        if threshold is not None:
+            if isinstance(threshold, bool):
+                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+            try:
+                threshold_value = float(threshold)
+            except (TypeError, ValueError):
+                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+            if threshold_value != threshold_value:  # NaN：拒绝写入，避免污染配置
+                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+            # 越界钳制而不是拒绝：界面滑到边界时不至于报错打断操作
+            scene_patch["threshold"] = round(max(0.0, min(1.0, threshold_value)), 2)
+
+        try:
+            # 保存统一走 decision_service（校验 + 原子写盘），本层不碰 decision.json
+            decision_service.save_decision_config({"scenes": {scene_name: scene_patch}})
+            cfg = decision_service.load_decision_config()
+            rows = self._decision_scene_rows(cfg)
+            row = next((item for item in rows if item["scene"] == scene_name), {}) or {}
+            effective_mode = str(row.get("mode") or "off")
+            label = str(row.get("label") or scene_name)
+            mode_text = self._DECISION_SCENE_MODE_TEXT.get(effective_mode, "关闭")
+            if mode_name == "live" and effective_mode != "live":
+                msg = f"{label}场景已标记为正式，但全局影子模式仍开启，当前实际按影子运行"
+                hint = "全局影子模式已开启：到上方关闭「影子模式」后，本场景才会正式生效"
+            elif not bool(cfg.get("enabled")):
+                msg = f"{label}场景已保存为{self._DECISION_SCENE_MODE_TEXT[mode_name]}"
+                hint = "决策模型总开关未启用：场景设置要等总开关打开后才生效"
+            elif effective_mode == "live":
+                msg = f"{label}场景已切换为正式（决策结果会真实影响任务行为）"
+                hint = "正式模式：失败、超时或低置信都会自动回退原逻辑，不会阻断任务"
+            elif effective_mode == "shadow":
+                msg = f"{label}场景已切换为影子（真发请求、真写审计，结果丢弃）"
+                hint = "影子模式用于观察决策质量；确认无误后再切正式"
+            else:
+                msg = f"{label}场景已关闭（零请求、零记录，走原逻辑）"
+                hint = "关闭后该场景不再询问决策模型，行为与未接入时一致"
+            return {
+                "ok": True,
+                "msg": msg,
+                "hint": hint,
+                "scene": row,
+                "scenes": rows,
+                "requested_mode": mode_name,
+                "effective_mode": effective_mode,
+                "mode_text": mode_text,
+                "global_shadow": bool(cfg.get("shadow_mode")),
+                "settings": cfg,
+            }
+        except ValueError as error:
+            # 校验拒绝（如全局配置已有非法值）：回显中文原因，不回写任何东西
+            return {"ok": False, "msg": str(error), "scenes": self._decision_scene_rows_safe()}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("set_decision_scene 失败")
+            return {"ok": False, "msg": str(e), "scenes": self._decision_scene_rows_safe()}
+
+    def _decision_scene_rows_safe(self) -> list:
+        """容错读取场景行：失败一律返回空列表（用于错误返回体，绝不二次抛错）。"""
+        from core import decision_service
+
+        try:
+            return self._decision_scene_rows(decision_service.load_decision_config())
+        except Exception:
+            return []
 
     def probe_decision(self) -> Dict[str, Any]:
         """逐 Key 各跑一次无害探针，返回分类结果与目标任务模型。"""
@@ -6792,6 +7456,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             api_key = active_model.get("api_key", "")
             api_base = active_model.get("base_url", "")
             ctx_win = active_model.get("context_window", 128000)
+            # 本回合实际发请求所用的模型 id（默认=会话激活模型）。router 场景可能
+            # 把它一次性换成副模型 id；必须与 model_name 成对替换——llm_dialects
+            # 按 id 读 thinking / max_tokens 等模型级配置，只换名字不换 id 会把主
+            # 模型的推理参数发给副模型（上游可能直接 400）。
+            model_id = active_model.get("id")
             # 首轮必须先创建会话再写模型绑定；后续模型未变化时不重复写库。
             session_workdir = pending_workdir or self._session_workdir(session_name)
             _ensure_session_model_binding(
@@ -6932,6 +7601,57 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # chat_with_model_events（parent_session），不依赖全局 _current_session。
             # 会话归属目录的绑定（os.chdir / memory.set_workdir）已在上面按 session_name 完成。
 
+            # —— router 场景：回合级模型档位（JEV 决定本回合用主模型还是副模型）——
+            # 方案 A：入口层局部变量替换 + 显式参数透传。覆盖只改本回合的这几个
+            # 局部变量（model_name / api_key / api_base / ctx_win / model_id），
+            # 是**本回合的一次性覆盖**：不写任何全局或会话级模型绑定，也不动
+            # _sync_active_model_context，所以并行会话与子代理继承链继续用各自的
+            # 会话模型（写全局会造成会话串味，禁止）。
+            # JEV 关闭 / 影子时 router_scene_live() 直接为假：不读历史、不算 token、
+            # 不发决策请求，本回合行为与接入前逐字一致（零额外开销）。
+            try:
+                from core.turn_model_override import router_scene_live, resolve_turn_model
+
+                # 内部回合（后台汇总 / 星轨自动化 / 命令总结）始终用会话主模型：
+                # 这类回合由系统构造 prompt，降级到副模型只会让汇总质量变差，且用户
+                # 无从察觉。只看用户亲手发起的回合，才有"本回合值不值得用强模型"的问题。
+                if router_scene_live() and not internal_kind:
+                    from core.agent_service import get_session_token_baseline
+
+                    # 窗口硬护栏的基线：本会话当前上下文占用（真实用量与估算取较小值）。
+                    # 这段在 JEV 未开启时根本不会执行；拿不到基线就传 0 跳过护栏，
+                    # 不能让一次基线计算失败把本回合的覆盖逻辑整体带崩。
+                    try:
+                        baseline_tokens = get_session_token_baseline(
+                            self._memory, session_name, model_name
+                        )
+                    except Exception:
+                        baseline_tokens = 0
+                    turn_override = resolve_turn_model(
+                        active_model,
+                        turn_source=turn_source,
+                        pending_model_id=pending_model_id,
+                        baseline_tokens=baseline_tokens,
+                        user_text=user_text,
+                    )
+                    if turn_override:
+                        logger.info(
+                            "router 场景覆盖本回合模型 [%s]：%s → %s（原因：JEV 判定本回合"
+                            "复杂度只需副模型；基线 %s tokens，副模型窗口 %s tokens）",
+                            session_name,
+                            model_name,
+                            turn_override["litellm_model"],
+                            baseline_tokens,
+                            turn_override["context_window"],
+                        )
+                        model_name = turn_override["litellm_model"]
+                        api_key = turn_override["api_key"]
+                        api_base = turn_override["base_url"]
+                        ctx_win = turn_override["context_window"]
+                        model_id = turn_override["model_id"]
+            except Exception:
+                logger.debug("router 场景模型档位覆盖失败，本回合沿用主模型", exc_info=True)
+
             # 与 CLI 完全同源的上下文组装（记忆压缩 / 系统提示词 / 运行上下文 / 后台任务汇总）
             from core.agent_service import prepare_turn_messages
             history = prepare_turn_messages(
@@ -6976,7 +7696,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     api_base,
                     session_name,
                     turn_id,
-                    model_id=active_model.get("id"),
+                    model_id=model_id,
                     error_state=error_state,
                     turn_source=turn_source,
                 )

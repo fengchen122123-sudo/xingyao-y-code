@@ -229,6 +229,79 @@ def build_default_registry() -> ToolRegistry:
             side_effect_scope="none",
         ),
         ToolSpec(
+            name="search_sessions",
+            description=(
+                "跨会话按关键词全文检索历史消息（含已被压缩归档、不再出现在当前"
+                "上下文里的早期消息），用于找回早前讨论过的细节。"
+                "中文按两字 bigram 匹配（搜“缓存”可命中“缓存命中率”），英文/数字按整词"
+                "匹配；每次检索前会先把新消息增量补进索引。"
+                "这不是文件搜索：搜代码/文件请用 search_code 或 glob_files。"
+            ),
+            input_schema=_schema({
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词（中文两字词即可；英文/数字为整词匹配）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "最多返回的消息条数",
+                },
+                "session": {
+                    "type": "string",
+                    "description": "可选：限定只在某个会话（按会话名）内检索，不传则跨全部会话",
+                },
+            }, ["query"]),
+            execute=tools.search_sessions,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="全文检索历史消息",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="tool_result_read",
+            description=(
+                "按句柄取回被折叠（snip/elide）的工具结果原始内容。"
+                "句柄来自工具结果 marker 里的 #xxxxxxxx（形如"
+                "[snipped tool result #ab12cd34 — read_file, ...] 或 "
+                "[elided tool result #ab12cd34 — ...]）。"
+                "仅在折叠后确实需要原始细节时使用；未折叠的结果仍在上下文里，无需取回。"
+                "mode=head/tail 按行读取，grep 按关键字检索带行号命中行，full 取全文。"
+            ),
+            input_schema=_schema({
+                "handle": {
+                    "type": "string",
+                    "description": "归档句柄：marker 里 # 后的 8 位小写十六进制（如 ab12cd34）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["head", "tail", "grep", "full"],
+                    "default": "head",
+                    "description": "head 前 N 行 / tail 后 N 行 / grep 关键字命中行 / full 全文",
+                },
+                "lines": {
+                    "type": "integer",
+                    "default": 80,
+                    "minimum": 1,
+                    "maximum": 2000,
+                    "description": "head/tail 读取的行数",
+                },
+                "grep": {
+                    "type": "string",
+                    "description": "mode=grep 时必填：要搜索的文本（不区分大小写的正则）",
+                },
+            }, ["handle"]),
+            execute=tools.tool_result_read,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="取回完整工具结果",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
             name="search_news",
             description="搜索互联网新闻。",
             input_schema=_schema({

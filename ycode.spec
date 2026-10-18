@@ -7,6 +7,8 @@
 # （两个 exe 平铺在根目录，依赖统一收在 dist/ycode/_internal/ 下），方便安装
 # 程序把它们当作同一个安装包里的两个入口来管理。
 # ============================================================================
+import os
+
 from PyInstaller.utils.hooks import collect_all
 
 # ---------------------------------------------------------------------------
@@ -75,6 +77,22 @@ common_datas = [
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
     ('assets/CHANGELOG.md', 'assets'),
 ] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas + playwright_datas + pywinpty_datas
+
+# 内置 ffmpeg：GUI 的「背景图转换」（视频 → 动画 WebP 动态背景）依赖它，
+# gui_bridge.py 的 _find_ffmpeg() 会优先取随包副本（_MEIPASS/vendor/ffmpeg），
+# 用户无需自行安装 ffmpeg。缺失时不中断构建，仅在控制台告警并回退到系统
+# PATH / 常见安装位置（避免误删 96MB 大文件后构建直接失败）。
+# NOTICE.txt 记录版本/构建配置/许可证要求，随包分发 GPLv3 构建时必须一并提供。
+for _ffmpeg_asset in ('ffmpeg.exe', 'NOTICE.txt'):
+    _ffmpeg_source = f'vendor/ffmpeg/{_ffmpeg_asset}'
+    if os.path.isfile(_ffmpeg_source):
+        common_datas.append((_ffmpeg_source, 'vendor/ffmpeg'))
+    else:
+        print(
+            f'[ycode.spec] 警告：{_ffmpeg_source} 不存在，本次构建不内置该文件；'
+            '内置 ffmpeg 缺失时背景图转换将回退到系统 PATH / 常见安装位置，'
+            '用户侧可能因此不可用。'
+        )
 
 common_binaries = litellm_binaries + tiktoken_ext_binaries + playwright_binaries + pywinpty_binaries
 

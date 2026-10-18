@@ -39,6 +39,12 @@ class HarnessEventKind(str, Enum):
     TOOL_FINISHED = "tool_finished"
     TOOL_RESULT_COMMITTED = "tool_result_committed"
     TURN_ERROR = "turn_error"
+    # 断点续跑（resume）事件：只做记录与回放标记，不新增任何状态迁移边——
+    # INTERRUPTED 仍是终态，续跑以新 turn（parent_turn_id 指向旧 turn）承载。
+    RESUME_STARTED = "resume_started"
+    RESUME_READ_REPLAYED = "resume_read_replayed"
+    RESUME_WRITE_CONFIRM_REQUIRED = "resume_write_confirm_required"
+    RESUME_ABORTED = "resume_aborted"
 
 
 class InvalidHarnessTransition(ValueError):
