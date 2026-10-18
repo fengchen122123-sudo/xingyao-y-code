@@ -1109,12 +1109,14 @@ html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .session-switching {
    ToolExecutionTrace.vue（.exec-trace）、TurnGroup.vue（.turn-fold）、
    PermCard.vue（.perm-card）
    ============================================================ */
-/* 思考过程块：QQ 银蓝卡片（mockup .proc-block） */
+/* 思考过程块：QQ 银蓝卡片（mockup .proc-block）。
+   基础样式已改为无底色形态，这里补齐卡片自己的边框与内边距 */
 html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .think-block {
-  border-color: #C6DBEF;
-  border-left-color: var(--qq09-blue);
-  background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
+  border: 1px solid #C6DBEF;
+  border-left: 3px solid var(--qq09-blue);
   border-radius: 3px;
+  background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
+  padding: 8px 12px;
 }
 html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .think-block .fold-head {
   color: #2B5A7A;

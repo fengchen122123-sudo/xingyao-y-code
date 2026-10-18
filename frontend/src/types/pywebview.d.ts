@@ -226,6 +226,30 @@ export interface DecisionAuditRecentItem {
   answers_digest: string;
 }
 
+// 业务场景三态（关闭 / 影子 / 正式）：由两个布尔组合映射，后端 get_decision_scenes 反推
+export type DecisionSceneMode = 'off' | 'shadow' | 'live';
+
+// get_decision_scenes() 单行：一个业务场景的三态、阈值与说明
+export interface DecisionSceneRow {
+  /** router / secretary / search / safety */
+  scene: string;
+  /** 中文场景名：路由 / 秘书 / 搜索 / 安全 */
+  label: string;
+  /** 中文说明（这个场景会被决策模型决定什么） */
+  description: string;
+  /** 真实生效的三态（全局影子开着时，live 也会回落成 shadow） */
+  mode: DecisionSceneMode;
+  mode_text: string;
+  /** 场景自身布尔对应的用户选择（界面用它作为单选选中项） */
+  requested_mode: DecisionSceneMode;
+  enabled: boolean;
+  shadow: boolean;
+  threshold: number;
+  timeout_ms: number;
+  /** 全局影子模式（为真时正式模式不会真的生效） */
+  global_shadow: boolean;
+}
+
 // get_decision_audit_summary() 汇总：今日计数 + 最近记录（设置页「决策记录」面板）
 export interface DecisionAuditSummary {
   ok: boolean;
@@ -945,6 +969,22 @@ export interface BridgeEvent {
   event_seq?: number;
 }
 
+/** 背景图转换：视频预检信息（pick_background_video / describe_background_video 返回） */
+export interface BackgroundVideoInfo {
+  path: string;
+  name: string;
+  bytes: number;
+  ffmpeg_available: boolean;
+  max_bytes: number;
+  max_dimension: number;
+  duration: number | null;
+  width: number | null;
+  height: number | null;
+  can_convert: boolean;
+  blockers: string[];
+  warnings: string[];
+}
+
 /** 秘书调度台 open_session 事件的载荷（后端 gui_bridge 秘书调度服务推送） */
 export interface OpenSessionBridgeData {
   /** 目标会话名（后端已用它切换当前会话；缺失时前端忽略本次跳转） */
@@ -977,6 +1017,10 @@ export type BridgeEventType =
   | 'open_session'
   // JEV 决策记录实时推送（载荷见 DecisionRecordedBridgeData）
   | 'decision_recorded'
+  // 背景图转换进度 / 完成 / 失败（后端 GuiBridge._background_convert_worker 推送）
+  | 'bg_convert_progress'
+  | 'bg_convert_done'
+  | 'bg_convert_error'
   | (string & {});
 
 // ---------------------------------------------------------------------------
@@ -1190,6 +1234,8 @@ export interface PyWebViewAPI {
   delete_session(sessionName: string): Promise<any>;
   delete_folder_group(workdir: string): Promise<any>;
   rename_session(oldName: string, newName: string): Promise<any>;
+  // 跨文件夹移动会话：workdir 传 "GLOBAL" 表示移回「对话」分组
+  move_session_to_workdir(sessionName: string, workdir: string): Promise<any>;
   // 归档会话：归档只写标记、可随时恢复，故默认列表不含归档会话（include_archived=false）
   get_archived_sessions(): Promise<ArchivedSessionInfo[]>;
   archive_session(sessionName: string): Promise<ArchiveSessionResult>;
@@ -1227,6 +1273,20 @@ export interface PyWebViewAPI {
   set_decision_settings(patch: Partial<DecisionSettingsSnapshot>): Promise<{ ok: boolean; msg?: string; settings?: DecisionSettingsSnapshot }>;
   // 逐 Key 各跑 1 次无害探针（每把 Key 至多 1 次，不做压测；status 分类见 DecisionProbeKeyResult）
   probe_decision(): Promise<{ ok: boolean; results: DecisionProbeKeyResult[]; model_id: string; msg?: string }>;
+  // 四个业务场景的三态快照（关闭 / 影子 / 正式；设置页「业务场景」区块）
+  get_decision_scenes(): Promise<{ ok: boolean; scenes?: DecisionSceneRow[]; shadow_mode?: boolean; enabled?: boolean; msg?: string }>;
+  // 设置单个场景的三态（可选同时改阈值）；effective_mode 是全局影子压过后的真实状态
+  set_decision_scene(scene: string, mode: DecisionSceneMode, threshold?: number): Promise<{
+    ok: boolean;
+    msg?: string;
+    hint?: string;
+    scene?: DecisionSceneRow;
+    scenes?: DecisionSceneRow[];
+    requested_mode?: DecisionSceneMode;
+    effective_mode?: DecisionSceneMode;
+    mode_text?: string;
+    global_shadow?: boolean;
+  }>;
   // 从上游拉取 type=="decision" 的模型列表（设置页「从上游拉取」下拉）
   list_decision_models(): Promise<{ ok: boolean; models: DecisionModelOption[]; msg?: string }>;
   // 可选调用通道列表（不含 Key 内容，仅报数量；设置页通道下拉）
@@ -1418,6 +1478,19 @@ export interface PyWebViewAPI {
   read_gui_theme_asset(themeId: string, assetPath: string): Promise<GuiThemeResult<{
     mime: string;
     base64: string;
+  }>>;
+  // ── 背景图转换（视频 → 动画 WebP 动态背景，后端 GuiBridge 同名前缀方法）──
+  // 进度经 pywebview 事件推送：bg_convert_progress / bg_convert_done / bg_convert_error
+  pick_background_video(): Promise<GuiThemeResult<BackgroundVideoInfo>>;
+  describe_background_video(source: string): Promise<GuiThemeResult<BackgroundVideoInfo>>;
+  pick_background_output_dir(): Promise<GuiThemeResult<{ path: string }>>;
+  start_background_convert(
+    source: string, outputDir: string, fps: number, quality: number, pingpong: boolean,
+  ): Promise<{ ok: boolean; output?: string; msg?: string }>;
+  cancel_background_convert(): Promise<{ ok: boolean; msg?: string }>;
+  install_converted_background(webpPath: string): Promise<GuiThemeResult<{
+    theme_id: string;
+    asset_path: string;
   }>>;
   get_gui_theme_asset(themeId: string, assetPath: string): Promise<GuiThemeResult<{
     mime: string;

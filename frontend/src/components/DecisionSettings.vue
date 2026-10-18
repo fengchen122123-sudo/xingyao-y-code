@@ -108,6 +108,69 @@
         <span class="range-hint">100 ~ 5000 ms；超时宁可不判也不拖慢主链路</span>
       </div>
 
+      <div class="field-label">业务场景</div>
+      <div class="scene-list" data-test="decision-scenes">
+        <div
+          v-for="row in sceneRows"
+          :key="row.scene"
+          class="scene-row"
+          :data-test="`decision-scene-${row.scene}`"
+        >
+          <div class="scene-head">
+            <span class="scene-name">{{ row.label }}</span>
+            <span class="scene-mode-badge" :class="row.mode">{{ row.mode_text }}</span>
+            <span class="scene-desc">{{ row.description }}</span>
+          </div>
+          <div class="scene-controls">
+            <div class="radio-row scene-modes">
+              <label v-for="option in SCENE_MODE_OPTIONS" :key="option.value" class="radio-item">
+                <input
+                  :data-test="`decision-scene-${row.scene}-mode-${option.value}`"
+                  type="radio"
+                  :name="`decision-scene-mode-${row.scene}`"
+                  :value="option.value"
+                  v-model="row.requested_mode"
+                  :disabled="controlsDisabled || sceneSaving === row.scene"
+                  @change="changeSceneMode(row, option.value)"
+                />
+                <span>{{ option.label }}</span>
+              </label>
+            </div>
+            <label class="scene-threshold">
+              <span>阈值</span>
+              <input
+                :data-test="`decision-scene-${row.scene}-threshold`"
+                class="text-field scene-threshold-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                :value="row.threshold"
+                :disabled="controlsDisabled || sceneSaving === row.scene"
+                @change="changeSceneThreshold(row, $event)"
+              />
+            </label>
+          </div>
+          <p
+            v-if="row.requested_mode === 'live'"
+            class="decision-note warn"
+            :data-test="`decision-scene-${row.scene}-live-warning`"
+          >
+            正式模式：决策结果会真实影响任务行为（例如路由场景会真的换模型）；失败、超时或低置信会自动回退原逻辑，不会阻断任务。
+          </p>
+          <p
+            v-if="sceneShadowBlocked(row)"
+            class="decision-note warn"
+            :data-test="`decision-scene-${row.scene}-effective-hint`"
+          >
+            全局影子模式已开启：本场景实际仍按「影子」运行（只记录不生效），关闭上方「影子模式」后才会正式生效。
+          </p>
+        </div>
+        <p v-if="!sceneRows.length" class="decision-note">场景列表未就绪（后端未响应或接口不可用）</p>
+      </div>
+      <p v-if="scenesMsg" class="decision-note" :class="{ warn: scenesFailed }" data-test="decision-scenes-msg">{{ scenesMsg }}</p>
+      <p class="decision-note">每个场景独立设置：关闭 = 零请求零记录；影子 = 真发请求、真写审计但结果丢弃；正式 = 决策结果真的参与业务判断。改一项即保存一项，无需点底部保存。</p>
+
       <div class="field-label">决策记录</div>
       <div class="audit-row">
         <span class="audit-summary-text" data-test="decision-audit-summary">{{ auditSummaryText }}</span>
@@ -144,6 +207,8 @@ import type {
   DecisionProbeKeyResult,
   DecisionProviderOption,
   DecisionRuntimeState,
+  DecisionSceneMode,
+  DecisionSceneRow,
   DecisionSettingsSnapshot,
 } from '../types/pywebview';
 
@@ -157,6 +222,13 @@ const PROBE_LABELS: Record<string, string> = {
   rate_limited: '限流',
   error: '失败',
 };
+
+// 业务场景三态（顺序：关闭 → 影子 → 正式，风险由低到高；文案与后端 mode_text 一致）
+const SCENE_MODE_OPTIONS: { value: DecisionSceneMode; label: string }[] = [
+  { value: 'off', label: '关闭' },
+  { value: 'shadow', label: '影子' },
+  { value: 'live', label: '正式' },
+];
 
 const loading = ref(false);
 const saving = ref(false);
@@ -184,6 +256,13 @@ const modelOptions = ref<DecisionModelOption[]>([]);
 const fetchHint = ref('');
 const fetchFailed = ref(false);
 const auditSummary = ref<DecisionAuditSummary | null>(null);
+
+// 业务场景（三态开关）：每个场景独立保存，改一项立即生效
+const sceneRows = ref<DecisionSceneRow[]>([]);
+// 正在保存的场景名（只禁用该行，避免整页置灰打断连续调整）
+const sceneSaving = ref('');
+const scenesMsg = ref('');
+const scenesFailed = ref(false);
 
 let savedTipTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -343,6 +422,8 @@ async function saveSettings() {
       savedTip.value = res.msg || '已保存';
       if (savedTipTimer) clearTimeout(savedTipTimer);
       savedTipTimer = setTimeout(() => { savedTip.value = ''; }, 2500);
+      // 全局影子开关会改变各场景的"真实生效三态"：保存后重取场景快照
+      loadScenes();
     } else {
       // 保存失败：保留用户草稿不回滚，只回显后端原因
       errorMsg.value = res?.msg || '保存失败';
@@ -413,6 +494,142 @@ function pickModel(event: Event) {
   if (value) modelIdDraft.value = value;
 }
 
+/** 业务场景条目归一：容忍后端字段缺失/扩展，避免渲染崩溃 */
+function normalizeScene(raw: Partial<DecisionSceneRow>): DecisionSceneRow {
+  const mode = raw.mode === 'live' || raw.mode === 'shadow' || raw.mode === 'off' ? raw.mode : 'off';
+  const requested = raw.requested_mode === 'live' || raw.requested_mode === 'shadow' || raw.requested_mode === 'off'
+    ? raw.requested_mode
+    : mode;
+  const threshold = Number(raw.threshold ?? 0.5);
+  return {
+    scene: String(raw.scene ?? ''),
+    label: String(raw.label ?? raw.scene ?? ''),
+    description: String(raw.description ?? ''),
+    mode,
+    mode_text: String(raw.mode_text ?? (mode === 'live' ? '正式' : mode === 'shadow' ? '影子' : '关闭')),
+    requested_mode: requested,
+    enabled: raw.enabled === true,
+    shadow: raw.shadow !== false,
+    threshold: Number.isFinite(threshold) ? threshold : 0.5,
+    timeout_ms: Number(raw.timeout_ms ?? 250) || 250,
+    global_shadow: raw.global_shadow === true,
+  };
+}
+
+function applyScenes(rows: Partial<DecisionSceneRow>[] | undefined) {
+  sceneRows.value = Array.isArray(rows) ? rows.map(normalizeScene).filter((row) => row.scene) : [];
+}
+
+/** 用户选了"正式"但全局影子把场景压成影子：这一行要额外提示 */
+function sceneShadowBlocked(row: DecisionSceneRow): boolean {
+  return row.requested_mode === 'live' && row.mode !== 'live';
+}
+
+/** 拉取四场景快照；接口缺失/异常一律返回 null（绝不抛错） */
+async function fetchSceneRows(): Promise<Partial<DecisionSceneRow>[] | null> {
+  try {
+    const api = window.pywebview?.api;
+    if (!api?.get_decision_scenes) return null;
+    const res = await api.get_decision_scenes();
+    return res?.ok && Array.isArray(res.scenes) ? res.scenes : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 保存失败时把界面回滚到落盘状态：不能让单选/阈值停在「看起来已生效」的位置 */
+async function restoreScenes() {
+  const rows = await fetchSceneRows();
+  if (rows) applyScenes(rows);
+}
+
+/** 场景三态快照（设置页「业务场景」区块）：失败静默，不阻塞其余控件 */
+async function loadScenes() {
+  const rows = await fetchSceneRows();
+  if (rows) {
+    applyScenes(rows);
+    return;
+  }
+  scenesFailed.value = true;
+  scenesMsg.value = '加载业务场景失败';
+}
+
+/** 切换某场景的三态：后端按三态反推两个布尔并立即落盘 */
+async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
+  if (sceneSaving.value) return;
+  sceneSaving.value = row.scene;
+  scenesMsg.value = '';
+  scenesFailed.value = false;
+  try {
+    const api = window.pywebview?.api;
+    if (!api?.set_decision_scene) {
+      scenesFailed.value = true;
+      scenesMsg.value = '后端接口未就绪，无法保存场景设置';
+      await restoreScenes();
+      return;
+    }
+    const res = await api.set_decision_scene(row.scene, mode);
+    if (res?.ok) {
+      // 后端返回最新四场景快照：用它刷新，保证 mode / requested_mode 都是落盘后的真实状态
+      if (res.scenes) applyScenes(res.scenes);
+      scenesMsg.value = res.hint ? `${res.msg || '已保存'}；${res.hint}` : String(res.msg || '已保存');
+      // 选了「正式」但真实生效不是 live（全局影子压住）：提示改用警示色
+      scenesFailed.value = mode === 'live' && res.effective_mode !== undefined && res.effective_mode !== 'live';
+    } else {
+      scenesFailed.value = true;
+      scenesMsg.value = String(res?.msg || '保存场景设置失败');
+      await restoreScenes();
+    }
+  } catch {
+    scenesFailed.value = true;
+    scenesMsg.value = '保存场景设置失败';
+    await restoreScenes();
+  } finally {
+    sceneSaving.value = '';
+  }
+}
+
+/** 改某场景阈值：钳制到 0~1 后按当前所选三态一起保存（阈值不影响三态） */
+async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
+  if (sceneSaving.value) return;
+  const input = event.target as HTMLInputElement;
+  const raw = Number(input.value);
+  if (input.value.trim() === '' || !Number.isFinite(raw)) {
+    scenesFailed.value = true;
+    scenesMsg.value = `${row.label}场景阈值必须是 0~1 之间的数字`;
+    input.value = String(row.threshold); // 输入框回到落盘值，避免留下空串/非法文本
+    return;
+  }
+  const threshold = Math.min(1, Math.max(0, raw));
+  sceneSaving.value = row.scene;
+  scenesMsg.value = '';
+  scenesFailed.value = false;
+  try {
+    const api = window.pywebview?.api;
+    if (!api?.set_decision_scene) {
+      scenesFailed.value = true;
+      scenesMsg.value = '后端接口未就绪，无法保存场景设置';
+      return;
+    }
+    // 传 requested_mode：保持「用户想要的档位」，不让全局影子的折算值覆盖用户选择
+    const res = await api.set_decision_scene(row.scene, row.requested_mode, threshold);
+    if (res?.ok) {
+      if (res.scenes) applyScenes(res.scenes);
+      scenesMsg.value = `${row.label}场景阈值已保存为 ${threshold}`;
+    } else {
+      scenesFailed.value = true;
+      scenesMsg.value = String(res?.msg || '保存阈值失败');
+      await restoreScenes();
+    }
+  } catch {
+    scenesFailed.value = true;
+    scenesMsg.value = '保存阈值失败';
+    await restoreScenes();
+  } finally {
+    sceneSaving.value = '';
+  }
+}
+
 /** 审计汇总（决策记录面板）：加载失败静默，不阻塞其余控件 */
 async function loadAuditSummary() {
   try {
@@ -447,6 +664,7 @@ async function openAuditDir() {
 
 function reloadAll() {
   loadSettings();
+  loadScenes();
   loadAuditSummary();
 }
 
@@ -478,6 +696,7 @@ async function loadProviders() {
 
 onMounted(() => {
   loadSettings();
+  loadScenes();
   loadProviders();
   loadAuditSummary();
 });
@@ -516,6 +735,18 @@ onMounted(() => {
 .timeout-row { display: flex; align-items: center; gap: 12px; }
 .timeout-input { width: 120px; }
 .range-hint { color: var(--text-faint); font-size: 12px; }
+.scene-list { display: grid; gap: 10px; }
+.scene-row { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--bg2); }
+.scene-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.scene-name { font-weight: 600; font-size: 13px; }
+.scene-mode-badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg3); }
+.scene-mode-badge.live { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
+.scene-mode-badge.shadow { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.scene-desc { color: var(--text-faint); font-size: 12px; flex: 1; min-width: 200px; }
+.scene-controls { display: flex; align-items: center; gap: 18px; margin-top: 10px; flex-wrap: wrap; }
+.scene-modes { gap: 16px; }
+.scene-threshold { display: inline-flex; align-items: center; gap: 7px; color: var(--text-dim); font-size: 12px; }
+.scene-threshold-input { width: 92px; min-height: 34px; padding: 0 9px; }
 .audit-row { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
 .audit-hint { color: var(--text-faint); font-size: 12px; }
 .audit-summary-text { color: var(--text-dim); font-size: 12px; }
