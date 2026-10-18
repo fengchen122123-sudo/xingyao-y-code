@@ -946,6 +946,8 @@ def get_decision_audit_summary(limit: int = 20) -> dict:
         "today_adopted_count": 0,
         "today_fallback_count": 0,
         "recent": [],
+        # 是否出现过真实业务决策（排除探针）：头部「决策」入口据此决定是否展示
+        "has_business_records": False,
     }
     if not os.path.isdir(directory):
         return summary
@@ -972,6 +974,16 @@ def get_decision_audit_summary(limit: int = 20) -> dict:
         except Exception:
             pass
         return records
+
+    # 探针（scene="probe"）只是连通性验证，不算真实决策：头部「决策」入口
+    # 只认业务场景记录，否则跑过一次探针就会挂出一个没有任何决策内容的入口。
+    for name in reversed(names):
+        if any(
+            str(record.get("scene") or "") not in ("", "probe")
+            for record in _iter_records(os.path.join(directory, name))
+        ):
+            summary["has_business_records"] = True
+            break
 
     if today_name in names:
         for record in _iter_records(os.path.join(directory, today_name)):
