@@ -3390,6 +3390,46 @@ def _chat_with_model_generator(
 
             from core.harness.tool_pipeline import ToolBatchExecutor
 
+            def _harness_journal_sink(kind, facts):
+                """把工具事件的脱敏事实写进 harness journal（断点续跑依据）。
+
+                只落哈希与元数据；任何异常都吞掉，绝不影响工具执行。
+                """
+                try:
+                    journal = getattr(
+                        getattr(current_step, "turn", None), "journal", None
+                    )
+                    if journal is None:
+                        return
+                    from core.harness.models import (
+                        HarnessEventKind,
+                        JournalEventDraft,
+                    )
+
+                    if kind == "tool_started":
+                        event_kind = HarnessEventKind.TOOL_STARTED
+                    elif kind == "tool_finished":
+                        event_kind = HarnessEventKind.TOOL_FINISHED
+                    else:
+                        return
+                    journal.append_event(
+                        current_step.turn.turn_id,
+                        JournalEventDraft(
+                            kind=event_kind,
+                            step_id=getattr(current_step, "step_id", None),
+                            tool_name=facts.get("tool_name"),
+                            call_ordinal=facts.get("call_ordinal"),
+                            arguments_sha256=facts.get("arguments_sha256"),
+                            result_sha256=facts.get("result_sha256"),
+                            duration_ms=facts.get("duration_ms"),
+                            result_status=facts.get("result_status"),
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "harness journal sink failed for %s", kind, exc_info=True
+                    )
+
             tool_pipeline, tool_context = _build_tool_pipeline_and_context(
                 event_callback,
                 parent_session=parent_session,
@@ -3400,6 +3440,11 @@ def _chat_with_model_generator(
                 permission_source=permission_source,
                 computer_lease=computer_lease,
                 computer_native_selection=native_selection,
+                # 续跑记录（S1-b）：没有 harness 回合时保持 None，行为不变。
+                journal_event_sink=(
+                    _harness_journal_sink if current_step is not None else None
+                ),
+                harness_step=current_step,
             )
             tool_calls_by_id = {
                 tool_call["id"]: tool_call for tool_call in tool_calls_list
@@ -3436,6 +3481,13 @@ def _chat_with_model_generator(
             notify_tool_event = (
                 lambda kind, payload: _notify_event(event_callback, kind, payload)
             )
+            # 续跑打点：记录本轮计划执行的工具调用总数。生产路径不走
+            # ToolBatchExecutor.execute()，必须在这里补一次，否则该列始终为空。
+            if current_step is not None:
+                try:
+                    current_step.mark_tool_call_count(len(tool_calls_list))
+                except Exception:
+                    logger.warning("mark tool call count failed", exc_info=True)
             for prepared_batch in batch_executor.prepare(
                 tool_calls_list,
                 tool_context,

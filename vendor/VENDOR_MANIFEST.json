@@ -2,6 +2,20 @@
   "note": "vendor/ 随包第三方资源的来源与完整性记录（系统审查报告 B8-03）：新增或升级资源必须先在 files 里登记来源 URL、版本与 SHA256，再用 scripts/verify_vendor.py 校验；哈希不一致时必须人工核查来源是否可信、文件是否被篡改，确认正常后才可更新记录，来源不明不得直接回填。",
   "files": [
     {
+      "path": "vendor/ffmpeg/ffmpeg.exe",
+      "hash_mode": "binary",
+      "sha256": "1a65d5b0b10d8d9a81d2824a3538046a40ed3607c906b335a166add87613f705",
+      "version": "8.1-essentials_build-www.gyan.dev (libavutil 60.26.100 / libavcodec 62.28.100 / libwebp 编码器 libwebp_anim)",
+      "source": "https://www.gyan.dev/ffmpeg/builds/"
+    },
+    {
+      "path": "vendor/ffmpeg/NOTICE.txt",
+      "hash_mode": "text_lf",
+      "sha256": "ab16770778986f2e6228f23769200dbcc5d0540c326eb1a194d414dbf61cb738",
+      "version": "1",
+      "source": "本项目自撰说明文件：记录 vendor/ffmpeg/ffmpeg.exe 的版本、构建配置、许可证与体积影响"
+    },
+    {
       "path": "vendor/ripgrep/rg.exe",
       "hash_mode": "binary",
       "sha256": "a286ea6f4d0d8c1c6c2234728cf2d96afcf371c550086c11e1ea28730dcfb418",

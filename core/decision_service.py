@@ -43,10 +43,11 @@ DEFAULT_CONFIG: dict = {
     "shadow_mode": True,
     "timeout_ms": 800,
     "scenes": {
-        "router": {"enabled": False, "shadow": True, "threshold": 0.5},
-        "secretary": {"enabled": False, "shadow": True, "threshold": 0.6},
-        "search": {"enabled": False, "shadow": True, "threshold": 0.5},
-        "safety": {"enabled": False, "shadow": True, "threshold": 0.9},
+        # timeout_ms：业务决策的单次超时（网关读取；真实决策宁可不用也不拖慢主流程）
+        "router": {"enabled": False, "shadow": True, "threshold": 0.5, "timeout_ms": 250},
+        "secretary": {"enabled": False, "shadow": True, "threshold": 0.6, "timeout_ms": 250},
+        "search": {"enabled": False, "shadow": True, "threshold": 0.5, "timeout_ms": 250},
+        "safety": {"enabled": False, "shadow": True, "threshold": 0.9, "timeout_ms": 250},
     },
     "audit_enabled": True,
 }

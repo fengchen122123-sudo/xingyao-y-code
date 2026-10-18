@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 
@@ -16,6 +17,9 @@ from core.harness.models import (
 )
 from core.harness.request_envelope import RequestEnvelope
 from core.memory import MemoryManager
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _STEP_TERMINAL = frozenset(
@@ -308,6 +312,47 @@ class StepRuntime:
 
     def mark_tools_running(self) -> None:
         self._transition(StepStatus.TOOLS_RUNNING)
+
+    def mark_tool_call_count(self, count: int) -> None:
+        """记录本轮工具调用数（续跑需要知道"原本要执行几个"）。
+
+        只在 tools_running 状态下更新；非该状态（批处理尾部、已提交）静默跳过，
+        避免把调用方的收尾逻辑打断。状态正确但更新行数异常时抛错，与
+        capture_request 的并发防护口径一致。
+        """
+        try:
+            total = int(count)
+        except (TypeError, ValueError):
+            raise ValueError("tool call count must be an integer")
+        if total < 0:
+            raise ValueError("tool call count must be non-negative")
+        if self.turn.manager is None:
+            return
+        with self.turn.manager.acquire_lock():
+            row = self.turn.manager.get_harness_step(self.step_id)
+            status = "" if row is None else str(row.get("status") or "")
+            if status != StepStatus.TOOLS_RUNNING.value:
+                _LOGGER.warning(
+                    "skip tool call count for step %s in status %s",
+                    self.step_id,
+                    status or "unknown",
+                )
+                return
+            cursor = self.turn.manager.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE harness_steps SET tool_call_count = ? "
+                    "WHERE step_id = ? AND status = 'tools_running'",
+                    (total, self.step_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"stale harness tool count: {self.step_id}"
+                    )
+                self.turn.manager.conn.commit()
+            except Exception:
+                self.turn.manager.conn.rollback()
+                raise
 
     def mark_tools_committed(self) -> None:
         self._transition(StepStatus.TOOLS_COMMITTED)

@@ -77,6 +77,81 @@ def _normalize_workdir(path):
         return str(path or "")
 
 
+# 消息全文检索的归一化取「字符 bigram」而非 FTS5 内置 trigram/unicode61：
+# - trigram 分词器要求查询 ≥3 字符，中文两字词（"缓存""路由"）会搜不到；
+# - unicode61 会把一整串连续汉字当成单个 token，同样搜不到子串。
+# 因此索引与查询两侧都走同一套自建归一化（零第三方依赖）：CJK 段切成相邻
+# 两字的 bigram（单字段保留单字），非 CJK 按非字母数字切分、转小写、长度
+# ≥2 保留。索引侧把结果存成空格连接的 token 串，查询侧把每个 token 加双引号
+# 后用 AND 连接（双引号既做短语化也防 FTS5 语法注入）。
+_CJK_CHAR_CLASS = (
+    "\u3040-\u30ff"  # 日文假名
+    "\u3400-\u4dbf"  # CJK 扩展 A
+    "\u4e00-\u9fff"  # CJK 基本区
+    "\uac00-\ud7af"  # 谚文音节
+    "\uf900-\ufaff"  # CJK 兼容表意文字
+)
+_CJK_RUN_RE = re.compile(f"[{_CJK_CHAR_CLASS}]+")
+_NON_ALNUM_RE = re.compile(r"[^0-9A-Za-z]+")
+
+
+def _fts_normalize(text) -> str:
+    """把任意文本归一化成 FTS 索引/查询共用的 token 串（空格连接）。"""
+    raw = str(text or "")
+    if not raw:
+        return ""
+    tokens = []
+    for match in _CJK_RUN_RE.finditer(raw):
+        run = match.group(0)
+        if len(run) == 1:
+            tokens.append(run)
+        else:
+            tokens.extend(run[i:i + 2] for i in range(len(run) - 1))
+    for chunk in _NON_ALNUM_RE.split(_CJK_RUN_RE.sub(" ", raw)):
+        token = chunk.lower()
+        if len(token) >= 2:
+            tokens.append(token)
+    return " ".join(tokens)
+
+
+def _fts_match_expression(normalized: str) -> str:
+    """把归一化 token 串转成 FTS5 MATCH 表达式（每个 token 短语化后 AND）。"""
+    tokens = [tok for tok in str(normalized or "").split() if tok]
+    return " AND ".join(f'"{tok}"' for tok in tokens)
+
+
+def _fts_snippet(text, query, radius=45):
+    """从消息原文里截取命中位置附近的可读片段。
+
+    索引列存的是 bigram token 串，FTS5 的 snippet() 只会在该列上取片段，
+    结果会变成 `stable 《prefix》` 这类 token 串而不通读。因此索引只用于
+    命中定位，片段一律回到 messages.content 原文上截取。
+
+    定位策略：按查询里的字符逐个在原文中查找，取第一个命中的位置（中文
+    不依赖分词边界，英文同样适用）；找不到则退化为原文开头。
+    """
+    body = str(text or "")
+    if not body:
+        return ""
+    needle_pos = -1
+    for ch in str(query or ""):
+        if not ch.strip():
+            continue
+        needle_pos = body.find(ch)
+        if needle_pos >= 0:
+            break
+    if needle_pos < 0:
+        head = body[: radius * 2]
+        return head + ("…" if len(body) > len(head) else "")
+    start = max(0, needle_pos - radius)
+    end = min(len(body), needle_pos + radius)
+    fragment = body[start:end].replace("\r", " ").replace("\n", " ")
+    result = ("…" if start > 0 else "") + fragment + ("…" if end < len(body) else "")
+    # 与 search_sessions_and_messages 的片段脱敏口径保持一致：检索结果会
+    # 直接进入模型上下文，历史消息里残留的密钥不能经由片段再次外泄。
+    return re.sub(r"sk-[a-zA-Z0-9]{16,}", "sk-***", result)
+
+
 def _try_parse_json(text):
     """仅对形如 JSON 对象/数组的字符串尝试解析，避免把 '123'、'true' 等纯文本曲解为标量。"""
     if not isinstance(text, str):
@@ -289,6 +364,11 @@ class MemoryManager:
         self._lock = threading.RLock()
         # 4. 新建会话的归属工作目录（默认取启动时的 cwd，可用 set_workdir 修改）
         self.workdir = _normalize_workdir(os.getcwd())
+        # 4.1 消息全文检索索引可用性标志：CREATE VIRTUAL TABLE 失败（该 SQLite
+        # 未编译 FTS5）时保持 False 并静默降级，检索返回 None 而非抛异常。
+        self._fts_available = False
+        # 建表失败过一次后不再重试（缺模块是永久性的），也保证 warning 只记一次。
+        self._fts_disabled = False
         # 5. 立刻建表
         self.create_tables()
         self.interrupt_stale_harness_runs(time.time_ns() // 1_000_000 - 10_000)
@@ -429,6 +509,11 @@ class MemoryManager:
                         finished_at_ms INTEGER,
                         last_sequence INTEGER NOT NULL DEFAULT 0,
                         error_code TEXT,
+                        -- 断点续跑（resume）元数据：续跑 turn 指回被中断的父 turn，
+                        -- resume_from_step_ordinal 记录从哪一步之后接续（NULL = 非续跑）。
+                        parent_turn_id TEXT,
+                        turn_kind TEXT,
+                        resume_from_step_ordinal INTEGER,
                         FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                         FOREIGN KEY(owner_id) REFERENCES harness_owners(owner_id) ON DELETE RESTRICT
                     )
@@ -462,10 +547,57 @@ class MemoryManager:
                         duration_ms INTEGER,
                         finish_reason TEXT,
                         error_code TEXT,
+                        -- 断点续跑（resume）元数据：replay_of_step_id 指向被回放的
+                        -- 旧 step（NULL = 原生 step），tool_call_count 记录该步工具调用数。
+                        replay_of_step_id TEXT,
+                        tool_call_count INTEGER,
                         UNIQUE(turn_id, ordinal),
                         FOREIGN KEY(turn_id) REFERENCES harness_turns(turn_id) ON DELETE CASCADE
                     )
                 ''')
+                # 断点续跑（resume）加列：上面两处 CREATE TABLE IF NOT EXISTS 对已存在
+                # 的旧库不生效，因此另走 ALTER ADD COLUMN 幂等补列（照 sessions.archived_at
+                # 的写法：先读 PRAGMA table_info，缺列才加）。不重建表、不动历史行。
+                cursor.execute("PRAGMA table_info(harness_turns)")
+                turn_columns = {col[1] for col in cursor.fetchall()}
+                if "parent_turn_id" not in turn_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE harness_turns ADD COLUMN parent_turn_id TEXT"
+                        )
+                    except Exception:
+                        pass
+                if "turn_kind" not in turn_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE harness_turns ADD COLUMN turn_kind TEXT"
+                        )
+                    except Exception:
+                        pass
+                if "resume_from_step_ordinal" not in turn_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE harness_turns "
+                            "ADD COLUMN resume_from_step_ordinal INTEGER"
+                        )
+                    except Exception:
+                        pass
+                cursor.execute("PRAGMA table_info(harness_steps)")
+                step_columns = {col[1] for col in cursor.fetchall()}
+                if "replay_of_step_id" not in step_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE harness_steps ADD COLUMN replay_of_step_id TEXT"
+                        )
+                    except Exception:
+                        pass
+                if "tool_call_count" not in step_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE harness_steps ADD COLUMN tool_call_count INTEGER"
+                        )
+                    except Exception:
+                        pass
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS harness_events (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -511,6 +643,24 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_harness_events_message_id "
                     "ON harness_events(message_id)"
                 )
+                # 工具结果归档（可逆折叠）：snip/elide 改写前把原始文本按句柄落库，
+                # 模型用 tool_result_read 按 #xxxxxxxx 句柄取回全文。
+                # 故意不加外键级联——消息被 undo/删除时归档原文仍可保留，避免误删。
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS tool_result_archive (
+                        handle TEXT PRIMARY KEY,
+                        session_id INTEGER NOT NULL,
+                        msg_id INTEGER,
+                        tool_name TEXT,
+                        bytes INTEGER NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TEXT
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_tool_result_archive_session
+                    ON tool_result_archive(session_id, created_at)
+                ''')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS deepseek_prompt_generations (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -688,6 +838,10 @@ class MemoryManager:
                 except Exception:
                     pass
                 raise
+            # 消息全文索引（FTS5）：放在主 DDL 事务提交之后单独执行，内部自带
+            # try/except —— 未编译 FTS5 的 SQLite 在这里静默降级，绝不冒泡，
+            # 不影响上面任何建表与既有功能。
+            self._ensure_message_fts(cursor)
 
     def create_harness_turn(self, turn_id: str, session_name: str, owner_id: str,
                             started_at_ms: int) -> None:
@@ -3299,6 +3453,12 @@ class MemoryManager:
                 session_id = row[0]
                 try:
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
+                    # 工具结果归档随会话物理删除一并清理（归档句柄只在本会话消息
+                    # 里出现，会话没了句柄也永不复活）。只走删除路径，检索/维护
+                    # 一律不动归档，避免 marker 句柄失效。
+                    cursor.execute(
+                        'DELETE FROM tool_result_archive WHERE session_id = ?', (session_id,)
+                    )
                     self._delete_deepseek_prompt_generations_locked(cursor, [session_name])
                     cursor.execute(
                         'DELETE FROM session_summary_generations WHERE session_name = ?',
@@ -3336,6 +3496,10 @@ class MemoryManager:
                     sid = r[0]
                     deleted_names.append(r[1])
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (sid,))
+                    # 同 delete_session：被删会话的工具结果归档一并清理
+                    cursor.execute(
+                        'DELETE FROM tool_result_archive WHERE session_id = ?', (sid,)
+                    )
                 self._delete_deepseek_prompt_generations_locked(cursor, deleted_names)
                 if deleted_names:
                     placeholders = ",".join("?" for _ in deleted_names)
@@ -3670,6 +3834,8 @@ class MemoryManager:
         from core.tool_result_maintenance import (
             elide_tool_result,
             estimate_text_tokens,
+            extract_handle,
+            new_handle,
             snip_tool_result,
         )
         with self._lock:
@@ -3699,7 +3865,9 @@ class MemoryManager:
                     break
 
             updates = []
+            archives = []
             snipped = elided = 0
+            now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for i in range(protection_start):
                 msg_id, role, raw = records[i]
                 if role != "tool":
@@ -3722,6 +3890,18 @@ class MemoryManager:
                         snipped += 1
                 if new_text is None:
                     continue
+                # 句柄：优先复用 marker 里已有的（snip → elide 升级同句柄）——
+                # elide 内部按 extract_handle(text) 复用，这里从新 marker 读回。
+                handle = extract_handle(new_text) or new_handle()
+                archives.append((
+                    handle,
+                    session_id,
+                    msg_id,
+                    name,
+                    len(text.encode("utf-8")),
+                    text,
+                    now_text,
+                ))
                 if ok and isinstance(parsed, dict):
                     parsed["content"] = new_text
                     new_raw = json.dumps(parsed, ensure_ascii=False)
@@ -3731,12 +3911,305 @@ class MemoryManager:
 
             if updates:
                 try:
+                    # 归档原文与改写 marker 同一事务提交：要么都成功（可取回），
+                    # 要么都回滚（不留指向空归档的 marker）。INSERT OR IGNORE 让
+                    # elide 升级时的二次落库静默跳过，原文只存一次。
+                    cursor.executemany(
+                        'INSERT OR IGNORE INTO tool_result_archive '
+                        '(handle, session_id, msg_id, tool_name, bytes, content, created_at) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                        archives,
+                    )
                     cursor.executemany('UPDATE messages SET content = ? WHERE id = ?', updates)
                     self.conn.commit()
                 except Exception:
                     self.conn.rollback()
                     raise
             return (snipped, elided)
+
+    def get_tool_result_archive(self, handle):
+        """按归档句柄取回 snip/elide 改写前的原始工具结果；查不到返回 None。"""
+        with self._lock:
+            row = self.conn.execute(
+                'SELECT handle, session_id, msg_id, tool_name, bytes, content, created_at '
+                'FROM tool_result_archive WHERE handle = ?',
+                (str(handle or ""),),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "handle": row[0],
+            "session_id": row[1],
+            "msg_id": row[2],
+            "tool_name": row[3],
+            "bytes": row[4],
+            "content": row[5],
+            "created_at": row[6],
+        }
+
+    def prune_tool_result_archive(self, session_name=None, keep_days=None) -> int:
+        """清理 tool_result_archive。session_name 给定时只清该会话；keep_days 给定时
+        删除 created_at 早于 keep_days 天的行（两种条件可叠加）。返回删除行数。
+
+        安全默认：两个条件都为空时直接返回 0，绝不全表删除。本方法只供会话/
+        工作区删除等显式清理路径调用——检索、维护、启动流程都不得自动调用，
+        否则仍留在消息 marker 里的 #句柄 会指向已删除的归档而取不回原文。
+        """
+        if not session_name and keep_days is None:
+            return 0
+        clauses = []
+        params = []
+        cutoff_text = None
+        if keep_days is not None:
+            try:
+                days = int(keep_days)
+            except (TypeError, ValueError):
+                return 0
+            if days < 0:
+                return 0
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+            cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                if session_name:
+                    cursor.execute(
+                        'SELECT id FROM sessions WHERE session_name = ?',
+                        (session_name,),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return 0
+                    clauses.append("session_id = ?")
+                    params.append(row[0])
+                if cutoff_text is not None:
+                    # created_at 是 '%Y-%m-%d %H:%M:%S' 文本，与同格式 cutoff
+                    # 直接字符串比较即可（字典序 == 时间序）；NULL 行不会被误删。
+                    clauses.append("created_at IS NOT NULL AND created_at < ?")
+                    params.append(cutoff_text)
+                cursor.execute(
+                    'DELETE FROM tool_result_archive WHERE ' + " AND ".join(clauses),
+                    params,
+                )
+                deleted = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                self.conn.commit()
+                return deleted
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                return 0
+
+    # ---------- 消息全文检索（FTS5 + bigram 归一化，懒同步） ----------
+
+    # 单条消息参与索引的最大字符数：超大工具结果先截断再归一化，
+    # 避免一次检索维护把索引体积撑爆（原文仍在 messages 表中）。
+    _FTS_MAX_CONTENT_CHARS = 20000
+    # 只索引这三类有检索价值的角色；notice/summary 等注入块不索引。
+    _FTS_INDEX_ROLES = ("user", "assistant", "tool")
+    _FTS_INSERT_SQL = "INSERT INTO messages_fts(rowid, tokens) VALUES (?, ?)"
+
+    def _ensure_message_fts(self, cursor=None) -> bool:
+        """幂等创建消息全文索引表；FTS5 不可用时静默降级并返回 False。
+
+        索引表是独立的 FTS5 表（tokens 列 + unicode61 分词），rowid 对齐
+        messages.id。不用 external content 模式：messages 表没有 session_name
+        列，无法满足外部内容映射。任何失败（该 SQLite 未编译 FTS5、建表被拒）
+        都只记一条 warning，绝不冒泡，不影响其它建表与既有功能。
+        """
+        if self._fts_available:
+            return True
+        if self._fts_disabled:
+            return False
+        with self._lock:
+            if self._fts_available:
+                return True
+            if self._fts_disabled:
+                return False
+            cur = cursor if cursor is not None else self.conn.cursor()
+            try:
+                cur.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
+                    "USING fts5(tokens, tokenize='unicode61')"
+                )
+                self.conn.commit()
+            except Exception as exc:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                self._fts_available = False
+                self._fts_disabled = True
+                try:
+                    logging.getLogger("py.warnings").warning(
+                        "消息全文检索不可用：当前 SQLite 未编译 FTS5（或建表失败: %s）。"
+                        "search_sessions 将提示不可用，其它功能不受影响。",
+                        exc,
+                    )
+                except Exception:
+                    pass
+                return False
+            self._fts_available = True
+            return True
+
+    @classmethod
+    def _fts_tokens_for_content(cls, content) -> str:
+        """把一条消息的 content 归一化成索引 token 串（超长先截断）。"""
+        text = message_content_to_text(content) if content is not None else ""
+        if len(text) > cls._FTS_MAX_CONTENT_CHARS:
+            text = text[:cls._FTS_MAX_CONTENT_CHARS]
+        return _fts_normalize(text)
+
+    def sync_message_index(self) -> int:
+        """把 messages 中尚未入索引的消息增量补进 FTS 索引，返回补入条数。
+
+        懒同步：不在 add_message / add_messages / 删除 / undo / 会话清理等
+        任何写入路径挂钩子（避免漏点），检索前调用一次即可。水位取
+        messages.MAX(id) 与 messages_fts.MAX(rowid) 的比较结果。已删除消息
+        留下的孤儿索引行不主动清理——查询侧的 JOIN messages 会自然排除。
+        """
+        if not self._ensure_message_fts():
+            return 0
+        with self._lock:
+            reader = self.conn.cursor()
+            writer = self.conn.cursor()
+            try:
+                reader.execute("SELECT MAX(id) FROM messages")
+                max_msg_id = int(reader.fetchone()[0] or 0)
+                reader.execute("SELECT MAX(rowid) FROM messages_fts")
+                max_indexed = int(reader.fetchone()[0] or 0)
+                if max_msg_id <= max_indexed:
+                    return 0
+                reader.execute(
+                    "SELECT id, role, content FROM messages "
+                    "WHERE id > ? AND role IN ('user', 'assistant', 'tool') "
+                    "ORDER BY id ASC",
+                    (max_indexed,),
+                )
+                total = 0
+                while True:
+                    rows = reader.fetchmany(200)
+                    if not rows:
+                        break
+                    batch = [
+                        (int(msg_id), self._fts_tokens_for_content(content))
+                        for msg_id, _role, content in rows
+                    ]
+                    writer.executemany(self._FTS_INSERT_SQL, batch)
+                    total += len(batch)
+                self.conn.commit()
+                return total
+            except Exception as exc:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    logging.getLogger("py.warnings").warning(
+                        "消息全文索引增量同步失败（已回滚，本次检索按现有索引进行）: %s",
+                        exc,
+                    )
+                except Exception:
+                    pass
+                return 0
+
+    def rebuild_message_index(self) -> int:
+        """清空并全量重建消息全文索引，返回重建条数（维护/排障用）。"""
+        if not self._ensure_message_fts():
+            return 0
+        with self._lock:
+            reader = self.conn.cursor()
+            writer = self.conn.cursor()
+            try:
+                # FTS5 的 'rebuild' 命令只对 external content 表有效；
+                # 本索引是独立表，直接 DELETE 清空即可。
+                writer.execute("DELETE FROM messages_fts")
+                reader.execute(
+                    "SELECT id, role, content FROM messages "
+                    "WHERE role IN ('user', 'assistant', 'tool') ORDER BY id ASC"
+                )
+                total = 0
+                while True:
+                    rows = reader.fetchmany(200)
+                    if not rows:
+                        break
+                    batch = [
+                        (int(msg_id), self._fts_tokens_for_content(content))
+                        for msg_id, _role, content in rows
+                    ]
+                    writer.executemany(self._FTS_INSERT_SQL, batch)
+                    total += len(batch)
+                self.conn.commit()
+                return total
+            except Exception as exc:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    logging.getLogger("py.warnings").warning(
+                        "消息全文索引重建失败（已回滚）: %s", exc
+                    )
+                except Exception:
+                    pass
+                return 0
+
+    def search_messages(self, query, limit=10, session_name=None):
+        """跨会话按关键词检索历史消息（含已被压缩归档的消息）。
+
+        返回 list[dict]（id/role/session_name/display_name/snippet），按相关度
+        排序；FTS5 不可用时返回 None，以区分「不可用」与「无命中」的空列表。
+        查询语法问题等 SQLite 层面的错误一律吞掉并记日志，不向调用方抛。
+        """
+        if not self._ensure_message_fts():
+            return None
+        match_expr = _fts_match_expression(_fts_normalize(query))
+        if not match_expr:
+            return []
+        try:
+            limit_n = int(limit)
+        except (TypeError, ValueError):
+            limit_n = 10
+        limit_n = max(1, min(50, limit_n))
+        self.sync_message_index()
+        sql = (
+            "SELECT m.id, m.role, s.session_name, "
+            "COALESCE(NULLIF(s.secretary_name, ''), s.session_name) AS display_name, "
+            "m.content AS raw "
+            "FROM messages_fts f "
+            "JOIN messages m ON m.id = f.rowid "
+            "JOIN sessions s ON s.id = m.session_id "
+            "WHERE messages_fts MATCH ?"
+        )
+        params: List[Any] = [match_expr]
+        target_session = str(session_name or "").strip()
+        if target_session:
+            sql += " AND s.session_name = ?"
+            params.append(target_session)
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(limit_n)
+        with self._lock:
+            try:
+                rows = self.conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as exc:
+                try:
+                    logging.getLogger("py.warnings").warning(
+                        "消息全文检索失败（query=%r）: %s", query, exc
+                    )
+                except Exception:
+                    pass
+                return []
+        return [
+            {
+                "id": row[0],
+                "role": row[1],
+                "session_name": row[2],
+                "display_name": row[3],
+                "snippet": _fts_snippet(message_content_to_text(row[4]), query),
+            }
+            for row in rows
+        ]
 
 
 # Backward-compatible public name used by the original test and extension API.
