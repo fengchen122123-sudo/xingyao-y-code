@@ -1124,15 +1124,14 @@ html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .think-block .fold-head {
 html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .think-block .tk-cnt {
   color: var(--qq09-text-2);
 }
-/* 执行过程 / 回合过程折叠卡：银蓝卡片（不追加内边距，尊重"不改布局"约束） */
-html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .exec-trace,
+/* 回合过程折叠卡：银蓝卡片（不追加内边距，尊重"不改布局"约束）。
+   执行过程已改为平铺的工具行、不再有卡片外壳，故这里只处理 .turn-fold */
 html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .turn-fold .fold {
   border: 1px solid #C6DBEF;
   border-radius: 3px;
   background: linear-gradient(180deg, #F7FBFF, #EDF6FE);
   box-shadow: inset 3px 0 0 var(--qq09-blue);
 }
-html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .exec-trace .fold-head,
 html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .turn-fold .fold-head {
   color: #2B5A7A;
 }

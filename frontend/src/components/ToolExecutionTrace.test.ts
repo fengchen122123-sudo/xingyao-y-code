@@ -41,7 +41,7 @@ afterEach(() => {
 });
 
 describe('ToolExecutionTrace', () => {
-  it('titles a running trace with the raw call count', () => {
+  it('announces the running trace via a visually hidden live region', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: {
         calls: [finishedCall('a'), runningCall('b', Date.now())],
@@ -49,7 +49,9 @@ describe('ToolExecutionTrace', () => {
         state: 'running',
       },
     });
-    expect(wrapper.get('.fold-title').text()).toBe('执行过程 · 2 项 · 进行中');
+    // 外壳标题已移除，但无障碍播报保留（视觉隐藏）
+    expect(wrapper.get('.sr-only').text()).toBe('执行过程 · 2 项 · 进行中');
+    expect(wrapper.find('.fold-head').exists()).toBe(false);
   });
 
   it('maps terminal states to Chinese labels', () => {
@@ -62,7 +64,7 @@ describe('ToolExecutionTrace', () => {
       const wrapper = mount(ToolExecutionTrace, {
         props: { calls: [finishedCall('a')], legacyDiffs: [], state },
       });
-      expect(wrapper.get('.fold-title').text()).toBe(title);
+      expect(wrapper.get('.sr-only').text()).toBe(title);
       wrapper.unmount();
     }
   });
@@ -80,20 +82,14 @@ describe('ToolExecutionTrace', () => {
     expect(wrapper.get('.trace-row').classes()).toContain('status-completed');
   });
 
-  it('toggles aria-expanded from the header button and defaults to collapsed', async () => {
+  it('renders tool rows directly without a collapsible shell', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [finishedCall('a')], legacyDiffs: [], state: 'completed' },
     });
-    const button = wrapper.get('button.fold-head');
-    // 默认收起（图二样式）：只显示标题行，详情折叠
-    expect(button.attributes('aria-expanded')).toBe('false');
-    expect(wrapper.find('.fold-body').attributes('style')).toContain('display: none');
-    await button.trigger('click');
-    expect(button.attributes('aria-expanded')).toBe('true');
-    expect(wrapper.find('.fold-body').attributes('style') || '').not.toContain('display: none');
-    await button.trigger('click');
-    expect(button.attributes('aria-expanded')).toBe('false');
-    expect(wrapper.find('.fold-body').attributes('style')).toContain('display: none');
+    // 没有"执行过程 · N 项"折叠头，工具行直接可见
+    expect(wrapper.find('.fold').exists()).toBe(false);
+    expect(wrapper.get('.exec-trace').find('.trace-line').isVisible()).toBe(true);
+    expect(wrapper.findAll('.trace-row')).toHaveLength(1);
   });
 
   it('runs exactly one interval while running and clears it on terminal state and unmount', async () => {
@@ -131,7 +127,7 @@ describe('ToolExecutionTrace', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [runningCall('b', Date.now())], legacyDiffs: [], state: 'running' },
     });
-    expect(wrapper.get('.fold-title [aria-live]').attributes('aria-live')).toBe('polite');
+    expect(wrapper.get('.sr-only').attributes('aria-live')).toBe('polite');
     expect(wrapper.get('.trace-meta').attributes('aria-live')).toBeUndefined();
   });
 
