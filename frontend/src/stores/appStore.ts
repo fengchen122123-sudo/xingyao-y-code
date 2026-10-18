@@ -826,6 +826,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // JEV 决策记录实时流：decision_recorded 事件累加未读徽章；面板按 tick 拉取刷新
     decisionUnread: 0,
     decisionEventTick: 0,
+    // 决策入口可见性：只有真的产生过决策记录才显示头部「决策」入口，
+    // 没做过决策（未启用 / 启用了但从未调用）时不给用户一个空入口
+    decisionHasRecords: false,
     // 智能体显示名：当前会话生效名——普通会话为设置页「人设设置」的名字，
     // 秘书会话为该会话自己的秘书名（界面文案/执行过程/思考提示都跟随它）
     agentName: '星瑶',
@@ -4494,6 +4497,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (type === 'decision_recorded') {
         this.decisionEventTick += 1;
         this.decisionUnread += 1;
+        // 刚发生一次真实决策：入口立刻出现，不用等下次启动探测
+        this.decisionHasRecords = true;
         return;
       }
       // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。
@@ -6485,6 +6490,20 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }));
       } catch {
         // 拉取失败保留上次快照，不打断界面
+      }
+    },
+
+    // 决策入口可见性探测：后端只认业务场景记录（排除 scene="probe" 的探针），
+    // 即"真的做过决策"才算数。启动时调一次；桥未就绪（浏览器开发态）静默跳过。
+    async refreshDecisionAvailability() {
+      if (!(window.pywebview && window.pywebview.api)) return;
+      try {
+        const res = await window.pywebview.api.get_decision_audit_summary(1);
+        if (res?.ok && res.has_business_records === true) {
+          this.decisionHasRecords = true;
+        }
+      } catch {
+        // 探测失败按"没有记录"处理：入口不显示，不影响其余头部功能
       }
     },
 

@@ -55,9 +55,20 @@ it('对话标题栏渲染 Git 分支 chip，点击展开 Git 面板', async () =
   wrapper.unmount();
 });
 
+it('未产生过决策记录时，头部不渲染「决策」入口', () => {
+  const store = useAppStore();
+  store.initialized = true;
+  const wrapper = mount(App, { global: { stubs } });
+
+  expect(wrapper.find('[data-test="decision-entry"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
 it('对话标题栏渲染「决策」入口，点击展开/收起决策记录面板', async () => {
   const store = useAppStore();
   store.initialized = true;
+  // 入口只在真的产生过决策记录时显示
+  store.decisionHasRecords = true;
   const wrapper = mount(App, { global: { stubs } });
 
   const entry = wrapper.get('[data-test="decision-entry"]');

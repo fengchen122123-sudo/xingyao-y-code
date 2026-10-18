@@ -866,6 +866,41 @@ def test_audit_summary_counts_and_recent(data_dir):
     assert result["recent"][-1]["fallback_reason"] == "upstream_error"
 
 
+def test_audit_summary_ignores_probe_only(data_dir):
+    """只有探针记录时 has_business_records 必须为 False：探针不算真实决策。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    row = {"ts": "2026-10-18T19:47:09", "scene": "probe", "shadow": False,
+           "adopted": True, "latency_ms": 421, "fallback_reason": None,
+           "model_id": "NeoHorse-Jev-4B", "answers": {"probe": 1.0}}
+    (audit / f"{svc._today()}.jsonl").write_text(
+        json.dumps(row, ensure_ascii=False), encoding="utf-8"
+    )
+    result = svc.get_decision_audit_summary(limit=10)
+    assert result["ok"] is True
+    assert result["today_count"] == 1
+    assert result["has_business_records"] is False
+
+
+def test_audit_summary_marks_business_records(data_dir):
+    """任意一天出现过业务场景记录（非 probe）就算真的做过决策，跨文件也要扫到。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    (audit / "20261017.jsonl").write_text(
+        json.dumps({"ts": "2026-10-17T10:00:00", "scene": "probe", "shadow": False},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (audit / f"{svc._today()}.jsonl").write_text(
+        json.dumps({"ts": "2026-10-18T10:00:00", "scene": "router", "shadow": True},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+    result = svc.get_decision_audit_summary(limit=10)
+    assert result["ok"] is True
+    assert result["has_business_records"] is True
+
+
 def test_audit_summary_missing_dir_returns_zeros(data_dir):
     result = svc.get_decision_audit_summary()
     assert result["ok"] is True

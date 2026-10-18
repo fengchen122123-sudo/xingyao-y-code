@@ -257,6 +257,8 @@ export interface DecisionAuditSummary {
   today_shadow_count: number;
   today_adopted_count: number;
   today_fallback_count: number;
+  // 是否出现过真实业务决策（后端排除 scene="probe" 的探针记录）
+  has_business_records?: boolean;
   recent: DecisionAuditRecentItem[];
   msg?: string;
 }

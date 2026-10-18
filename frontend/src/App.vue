@@ -80,8 +80,9 @@
             <TaskProgressDialog v-if="taskDialogOpen" @close="taskDialogOpen = false" />
           </div>
 
-          <!-- 决策入口：点击查看 JEV 决策记录（设置页「决策模型」的轻量视图） -->
-          <div class="decision-entry-wrap">
+          <!-- 决策入口：点击查看 JEV 决策记录（设置页「决策模型」的轻量视图）。
+               只在真的产生过决策记录时显示——未启用或从未决策时不留空入口 -->
+          <div v-if="store.decisionHasRecords" class="decision-entry-wrap">
             <button
               class="chip-btn"
               data-test="decision-entry"
@@ -903,6 +904,8 @@ function startInit() {
     initPollTimer = undefined;
   }
   store.initFromBackend();
+  // 头部「决策」入口是否显示取决于历史审计里有没有真实记录：桥就绪后探测一次
+  void store.refreshDecisionAvailability();
 }
 function onPywebviewReady() {
   startInit();
