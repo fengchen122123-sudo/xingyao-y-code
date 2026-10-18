@@ -371,8 +371,44 @@
       @click="runCtxMenu('top')"
     >置顶</div>
     <div class="ctx-sep"></div>
+    <div
+      v-if="!ctxMenu.secretary"
+      class="ctx-item"
+      data-test="ctx-move-to"
+      @click="openMoveMenu()"
+    >移动到…</div>
     <div class="ctx-item" data-test="ctx-rename" @click="startRename()">重命名</div>
     <div class="ctx-item danger" data-test="ctx-delete" @click="startDeleteFromMenu()">删除</div>
+  </div>
+
+  <!-- 会话「移动到…」的目标分组选择：沿用右键菜单外观，不另造一套弹层样式。
+       只列已存在的项目分组（含「对话」GLOBAL），排除会话当前所在分组。 -->
+  <div
+    v-if="moveMenu.show"
+    ref="moveMenuEl"
+    class="session-ctx-menu"
+    data-test="session-move-menu"
+    :style="{ left: `${moveMenu.x}px`, top: `${moveMenu.y}px` }"
+    @contextmenu.prevent
+    @click.stop
+  >
+    <div
+      v-if="!moveMenuFromGlobal"
+      class="ctx-item"
+      data-test="move-target-global"
+      @click="chooseMoveTarget('GLOBAL')"
+    >对话</div>
+    <div
+      v-for="g in moveTargets"
+      :key="g.folder_path"
+      class="ctx-item"
+      data-test="move-target"
+      :title="g.folder_path"
+      @click="chooseMoveTarget(g.folder_path)"
+    >{{ getFolderTitle(g) }}</div>
+    <div v-if="!moveTargets.length && moveMenuFromGlobal" class="ctx-item disabled">
+      没有其他分组
+    </div>
   </div>
 
   <!-- 项目分组右键菜单：排序入口（拖拽之外的确定性操作，首/末项自动置灰） -->
@@ -998,7 +1034,7 @@ let remoteBindExpiryTimer: ReturnType<typeof setInterval> | null = null;
 
 // 会话右键菜单：show 为浮层开关，x/y 为鼠标坐标（渲染后按视口边缘收拢）
 const MENU_EDGE = 8;
-const ctxMenu = reactive({ show: false, x: 0, y: 0, name: '', display: '', path: '' });
+const ctxMenu = reactive({ show: false, x: 0, y: 0, name: '', display: '', path: '', secretary: false });
 const ctxMenuEl = ref<HTMLElement | null>(null);
 // 就地重命名态：editingName 为会话名（唯一定位条目），editingValue 为输入框内容
 const editingName = ref('');
@@ -1223,6 +1259,8 @@ function openCtxMenu(e: MouseEvent, s: SessionInfo, group: SessionGroup) {
   ctxMenu.display = s.display_name || s.name;
   // 记下所属分组：菜单里的上移 / 下移 / 置顶要按组内顺序计算
   ctxMenu.path = group.folder_path;
+  // 秘书会话不提供「移动到…」：它的归属由 source 决定，改 workdir 不会离开「秘书」分组
+  ctxMenu.secretary = !!s.secretary_name;
   ctxMenu.x = e.clientX;
   ctxMenu.y = e.clientY;
   ctxMenu.show = true;
@@ -1253,6 +1291,7 @@ function closeCtxMenu() {
   ctxMenu.name = '';
   ctxMenu.display = '';
   ctxMenu.path = '';
+  ctxMenu.secretary = false;
 }
 
 // 菜单项「重命名」：关菜单、就地进入编辑态，并把输入框聚焦全选
@@ -1333,6 +1372,51 @@ function runCtxMenu(action: 'up' | 'down' | 'top') {
   if (action === 'up') moveSessionStep(path, name, -1);
   else if (action === 'down') moveSessionStep(path, name, 1);
   else moveSessionTop(path, name);
+}
+
+// 会话「移动到…」：跨文件夹改归属（后端只改 sessions.workdir，消息与模型绑定不动）。
+// 目标列表只列已存在的项目分组，并排除会话当前所在分组；「对话」(GLOBAL) 作为反向
+// 目标单独提供。秘书分组（folder_path='SECRETARY'）不是磁盘目录，不能作为移动目标。
+const moveMenu = reactive({ show: false, x: 0, y: 0, name: '', fromPath: '' });
+const moveMenuEl = ref<HTMLElement | null>(null);
+
+// 当前会话是否已在「对话」分组：在的话不需要再给「对话」这一项
+const moveMenuFromGlobal = computed(() => !moveMenu.fromPath || moveMenu.fromPath === 'GLOBAL');
+const moveTargets = computed(() =>
+  (store.sessionGroups || []).filter(
+    (g) => !isGlobalGroup(g) && !g.is_secretary && g.folder_path !== moveMenu.fromPath,
+  ),
+);
+
+function openMoveMenu() {
+  const { path, name, x, y } = ctxMenu;
+  closeCtxMenu();
+  if (!name) return;
+  moveMenu.name = name;
+  moveMenu.fromPath = path || 'GLOBAL';
+  moveMenu.x = x;
+  moveMenu.y = y;
+  moveMenu.show = true;
+  nextTick(clampMoveMenu);
+}
+
+function clampMoveMenu() {
+  const { x, y } = clampToViewport(moveMenuEl.value, moveMenu.x, moveMenu.y);
+  moveMenu.x = x;
+  moveMenu.y = y;
+}
+
+function closeMoveMenu() {
+  moveMenu.show = false;
+  moveMenu.name = '';
+  moveMenu.fromPath = '';
+}
+
+async function chooseMoveTarget(target: string) {
+  const name = moveMenu.name;
+  closeMoveMenu();
+  if (!name || !target) return;
+  await store.moveSessionToWorkdir(name, target);
 }
 
 // 分组右键菜单：拖拽之外的排序入口（触屏/手抖时更可靠，也便于长距离调整）
@@ -1421,10 +1505,11 @@ function commitRename() {
   store.renameSession(oldName, next);
 }
 
-// 会话菜单与分组菜单互斥，统一收口关闭（滚动 / 缩放时顺带收掉 QQ2009 气泡）
+// 会话菜单、分组菜单、移动目标菜单互斥，统一收口关闭（滚动 / 缩放时顺带收掉 QQ2009 气泡）
 function closeSidebarMenus() {
   closeCtxMenu();
   closeGroupMenu();
+  closeMoveMenu();
   qq09HideTip();
 }
 
@@ -1438,8 +1523,8 @@ function onDocMouseDown(e: MouseEvent) {
     const wrap = qq09StatusRef.value;
     if (!(wrap && e.target instanceof Node && wrap.contains(e.target))) qq09CloseStatusMenu();
   }
-  if (!ctxMenu.show && !groupMenu.show) return;
-  const el = ctxMenu.show ? ctxMenuEl.value : groupMenuEl.value;
+  if (!ctxMenu.show && !groupMenu.show && !moveMenu.show) return;
+  const el = ctxMenu.show ? ctxMenuEl.value : (groupMenu.show ? groupMenuEl.value : moveMenuEl.value);
   if (el && e.target instanceof Node && el.contains(e.target)) return;
   closeSidebarMenus();
 }

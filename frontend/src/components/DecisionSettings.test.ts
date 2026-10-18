@@ -329,4 +329,149 @@ describe('DecisionSettings', () => {
     await flushPromises();
     expect(wrapper.find('[data-test="decision-audit-summary"]').text()).toContain('暂无决策记录');
   });
+
+  it('业务场景：四行三态开关渲染，切正式给警示、全局影子压住时给提示', async () => {
+    // 全局影子开着：router 已按「正式」落盘，但真实生效仍是 shadow
+    const rows = [
+      {
+        scene: 'router',
+        label: '路由',
+        description: '本回合用主模型还是副模型',
+        mode: 'shadow',
+        mode_text: '影子',
+        requested_mode: 'live',
+        enabled: true,
+        shadow: false,
+        threshold: 0.5,
+        timeout_ms: 250,
+        global_shadow: true,
+      },
+      {
+        scene: 'secretary',
+        label: '秘书',
+        description: '派发给哪个候选会话',
+        mode: 'off',
+        mode_text: '关闭',
+        requested_mode: 'off',
+        enabled: false,
+        shadow: true,
+        threshold: 0.6,
+        timeout_ms: 250,
+        global_shadow: true,
+      },
+      {
+        scene: 'search',
+        label: '搜索',
+        description: '一次取回几条结果',
+        mode: 'shadow',
+        mode_text: '影子',
+        requested_mode: 'shadow',
+        enabled: true,
+        shadow: true,
+        threshold: 0.5,
+        timeout_ms: 250,
+        global_shadow: true,
+      },
+      {
+        scene: 'safety',
+        label: '安全',
+        description: '高风险命令是否放行',
+        mode: 'off',
+        mode_text: '关闭',
+        requested_mode: 'off',
+        enabled: false,
+        shadow: true,
+        threshold: 0.9,
+        timeout_ms: 250,
+        global_shadow: true,
+      },
+    ];
+    const api = mockApi(
+      {
+        get_decision_scenes: vi.fn(async () => ({
+          ok: true,
+          scenes: rows,
+          shadow_mode: true,
+          enabled: true,
+        })),
+        set_decision_scene: vi.fn(async () => ({
+          ok: true,
+          msg: '路由场景已关闭',
+          scenes: rows.map((row) => (row.scene === 'router' ? { ...row, mode: 'off', mode_text: '关闭', requested_mode: 'off' } : row)),
+        })),
+      },
+      { enabled: true },
+    );
+    const wrapper = mountPage();
+    await flushPromises();
+
+    // 四个场景行都在，且每行有三个三态单选项与阈值输入
+    for (const scene of ['router', 'secretary', 'search', 'safety']) {
+      expect(wrapper.find(`[data-test="decision-scene-${scene}"]`).exists()).toBe(true);
+      for (const mode of ['off', 'shadow', 'live']) {
+        expect(
+          wrapper.find(`[data-test="decision-scene-${scene}-mode-${mode}"]`).exists(),
+        ).toBe(true);
+      }
+      expect(wrapper.find(`[data-test="decision-scene-${scene}-threshold"]`).exists()).toBe(true);
+    }
+
+    // 选中态跟随 requested_mode（router 是 live，secretary 是 off）
+    expect(
+      (wrapper.find('[data-test="decision-scene-router-mode-live"]').element as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      (wrapper.find('[data-test="decision-scene-secretary-mode-off"]').element as HTMLInputElement).checked,
+    ).toBe(true);
+
+    // 正式模式的警示 + 全局影子压住的提示
+    expect(wrapper.find('[data-test="decision-scene-router-live-warning"]').text()).toContain('真实影响任务行为');
+    expect(wrapper.find('[data-test="decision-scene-router-effective-hint"]').text()).toContain('全局影子模式已开启');
+    // 非 live 场景不出现这两类提示
+    expect(wrapper.find('[data-test="decision-scene-secretary-live-warning"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="decision-scene-secretary-effective-hint"]').exists()).toBe(false);
+
+    // 切换场景三态：立即调用 set_decision_scene 并回显提示
+    const setScene = (api as unknown as { set_decision_scene: ReturnType<typeof vi.fn> }).set_decision_scene;
+    await wrapper.find('[data-test="decision-scene-router-mode-off"]').setValue();
+    await flushPromises();
+    expect(setScene).toHaveBeenCalledWith('router', 'off');
+    expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('路由场景已关闭');
+  });
+
+  it('业务场景：切换失败时回显后端原因', async () => {
+    mockApi(
+      {
+        get_decision_scenes: vi.fn(async () => ({
+          ok: true,
+          scenes: [
+            {
+              scene: 'router',
+              label: '路由',
+              description: '',
+              mode: 'off',
+              mode_text: '关闭',
+              requested_mode: 'off',
+              enabled: false,
+              shadow: true,
+              threshold: 0.5,
+              timeout_ms: 250,
+              global_shadow: true,
+            },
+          ],
+          shadow_mode: true,
+          enabled: true,
+        })),
+        set_decision_scene: vi.fn(async () => ({ ok: false, msg: '未知场景「nope」', scenes: [] })),
+      },
+      { enabled: true },
+    );
+    const wrapper = mountPage();
+    await flushPromises();
+
+    await wrapper.find('[data-test="decision-scene-router-mode-shadow"]').setValue();
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('未知场景');
+  });
 });

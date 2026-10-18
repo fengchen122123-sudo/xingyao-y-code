@@ -423,6 +423,63 @@ describe('MessageBubble 文件链接点击分流', () => {
   });
 });
 
+describe('MessageBubble 思考块折叠态实时预览', () => {
+  function mountStreaming(reasoning: string) {
+    const store = useAppStore();
+    store.running = true;
+    store.showThinking = false;
+    store.messages.push(assistantMessage({ reasoning_content: reasoning, execution_state: 'running' }));
+    // 走 store 响应式代理，模拟 App.vue 的 v-for 传参
+    const msg = store.messages[store.messages.length - 1];
+    return { wrapper: mount(MessageBubble, { props: { msg } }), store };
+  }
+
+  it('折叠态标题行显示正在输出的当前行，而不是固定的“思考过程”', () => {
+    const { wrapper } = mountStreaming('先分析结构\n\n然后确认渲染细节');
+
+    const head = wrapper.get('.think-block .fold-head');
+    expect(head.find('[data-test="think-live-line"]').exists()).toBe(true);
+    expect(head.text()).toContain('然后确认渲染细节');
+    expect(head.text()).not.toContain('思考过程');
+    // 折叠态：v-show 隐藏全文容器，只留标题行预览
+    expect(wrapper.get('.tk-cnt').isVisible()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('标题行去掉行首 markdown 标记，只留纯文本', () => {
+    const { wrapper } = mountStreaming('先分析结构\n- **确认** 分支覆盖');
+    expect(wrapper.get('.think-block .tk-live-text').text()).toBe('确认 分支覆盖');
+    wrapper.unmount();
+  });
+
+  it('展开后标题切为「思考 · 耗时」并显示全文，再折叠回到实时行', async () => {
+    const { wrapper } = mountStreaming('先分析结构\n然后确认渲染细节');
+    const head = wrapper.get('.think-block .fold-head');
+
+    await head.trigger('click');
+    // 展开态不再显示流式摘要，标签回到「思考」（有可信耗时时带秒数）
+    expect(wrapper.get('.think-block .tk-label').text()).toMatch(/^思考/);
+    expect(wrapper.find('.think-block [data-test="think-live-line"]').exists()).toBe(false);
+    expect(wrapper.get('.tk-cnt').text()).toContain('先分析结构');
+
+    await head.trigger('click');
+    expect(wrapper.get('.think-block .tk-live-text').text()).toBe('然后确认渲染细节');
+    wrapper.unmount();
+  });
+
+  it('生成结束后标签退回「思考」并带走流式摘要', async () => {
+    const { wrapper, store } = mountStreaming('先分析结构\n然后确认渲染细节');
+    expect(wrapper.get('.think-block .tk-live-text').text()).toBe('然后确认渲染细节');
+    expect(wrapper.get('.think-block .tk-label').text()).toBe('正在思考');
+
+    store.running = false;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get('.think-block .tk-label').text()).toMatch(/^思考/);
+    expect(wrapper.find('.think-block [data-test="think-live-line"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+});
+
 describe('MessageBubble QQ2009 用户昵称行', () => {
   it('默认主题（未设置 guiTheme）下用户消息不渲染 QQ2009 昵称行', () => {
     const store = useAppStore();

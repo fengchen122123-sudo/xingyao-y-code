@@ -18,6 +18,7 @@ import type {
   HookInfo,
   FileNode,
   BridgeEvent,
+  BackgroundVideoInfo,
   PlanData,
   BackgroundTask,
   TokenUsage,
@@ -898,6 +899,23 @@ navItems: [] as Array<{ id: number; preview: string }>,
 
     // 二级抽屉页面：技能 / MCP / 模型管理
     subpage: { show: false, type: 'skills' as SubpageType },
+
+    // ── 背景图转换（mp4 → 动画 WebP；后端 gui_bridge 的 bg_convert_* 接口）──
+    bgConvert: {
+      video: null as BackgroundVideoInfo | null,
+      outputDir: '',
+      fps: 12,
+      quality: 78,
+      pingpong: true,
+      running: false,
+      percent: 0,
+      stage: '',
+      etaSeconds: null as number | null,
+      resultPath: '',
+      resultBytes: 0,
+      message: '',
+      error: '',
+    },
 
     // 文件预览弹窗（RightPanel 文件树点击文件时使用）
     // kind=image 时正文渲染 dataUrl（base64 图片），否则渲染 content 文本
@@ -3585,6 +3603,45 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 跨文件夹移动会话（侧栏右键「移动到…」入口）。
+    // 只改归属：消息、摘要、token 统计、会话级模型绑定都按 session_id 关联，不受影响。
+    // 移动的是当前会话时，工作区标签与文件树要一并切到新目录，否则界面仍显示旧项目的文件。
+    async moveSessionToWorkdir(sessionName: string, workdir: string) {
+      const target = (workdir || '').trim();
+      // 空目标不发请求（后端也拒绝）：侧栏只会给出真实分组或 "GLOBAL"
+      if (!target) return;
+      // 秘书会话归属由 source 决定，后端会拒绝移动，这里先拦掉不发无谓请求
+      if (this._isSecretarySession(sessionName)) return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.move_session_to_workdir(sessionName, target);
+        if (res && res.ok) {
+          // 后端回带最新分组树：整份覆盖，免得前端再算一遍分组归属
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else void this.refreshSessions();
+          if (sessionName === this.currentSessionName) {
+            const wd = String(res.workdir || 'GLOBAL');
+            this.workdir = wd;
+            this.currentWorkdirLabel = wd === 'GLOBAL' ? '对话' : (wd.split('\\').pop() || wd);
+            if (wd === 'GLOBAL') {
+              this.fileTree = [];
+              this.fileTreeExpanded = [];
+            } else {
+              // 与 switchSession 同款：文件树后台异步加载，不阻塞交互
+              this.loadFileTreeInBackground(this.currentSessionName, wd);
+            }
+          }
+          this.notifyChat(res.moved === false ? '会话已在目标分组' : '会话已移动到新分组');
+        } else {
+          this.notifyModal('会话管理', '移动失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '移动失败: ' + err);
+      }
+    },
+
     // 秘书会话改名（右键「重命名」入口，目标为秘书会话时由 renameSession 分流到此）。
     // 只改后端的 secretary_name：session_name 仍是建会话时生成的 session_xxx，
     // 所以消息 / 摘要 / 快照 / 侧栏高亮的键都不需要迁移，与普通会话重命名口径不同。
@@ -4236,6 +4293,93 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // ── 背景图转换（视频 → 动画 WebP 动态背景）─────────────────────
+    // 后端：GuiBridge.pick_background_video / describe_background_video /
+    // pick_background_output_dir / start_background_convert /
+    // cancel_background_convert / install_converted_background
+    async pickBackgroundVideo() {
+      const api = this._api();
+      if (!api) return;
+      this.bgConvert.message = '';
+      this.bgConvert.error = '';
+      const res = await api.pick_background_video();
+      if (!res || !res.ok) {
+        const message = (res as { error?: { message?: string } } | undefined)?.error?.message || '';
+        // 用户主动取消不算错误
+        if (message && !message.includes('取消')) this.bgConvert.error = message;
+        return;
+      }
+      const info = res as unknown as BackgroundVideoInfo;
+      this.bgConvert.video = info;
+      this.bgConvert.resultPath = '';
+      this.bgConvert.resultBytes = 0;
+      this.bgConvert.percent = 0;
+      this.bgConvert.etaSeconds = null;
+      // 输出目录默认取源视频所在目录（用户仍可自行改选）
+      if (!this.bgConvert.outputDir) {
+        this.bgConvert.outputDir = info.path.replace(/[\\/][^\\/]*$/, '');
+      }
+    },
+    async pickBackgroundOutputDir() {
+      const api = this._api();
+      if (!api) return;
+      this.bgConvert.error = '';
+      const res = await api.pick_background_output_dir();
+      if (res && res.ok) {
+        this.bgConvert.outputDir = (res as unknown as { path: string }).path;
+      } else {
+        const message = (res as { error?: { message?: string } } | undefined)?.error?.message || '';
+        if (message && !message.includes('取消')) this.bgConvert.error = message;
+      }
+    },
+    async startBackgroundConvert() {
+      const api = this._api();
+      if (!api) return;
+      const video = this.bgConvert.video;
+      if (!video) { this.bgConvert.error = '请先选择要转换的视频'; return; }
+      if (!video.can_convert) {
+        this.bgConvert.error = video.blockers[0] || '该视频无法转换';
+        return;
+      }
+      if (!this.bgConvert.outputDir) { this.bgConvert.error = '请先选择输出文件夹'; return; }
+      this.bgConvert.error = '';
+      this.bgConvert.message = '';
+      this.bgConvert.percent = 0;
+      this.bgConvert.etaSeconds = null;
+      this.bgConvert.resultPath = '';
+      this.bgConvert.resultBytes = 0;
+      const res = await api.start_background_convert(
+        video.path, this.bgConvert.outputDir,
+        this.bgConvert.fps, this.bgConvert.quality, this.bgConvert.pingpong,
+      );
+      if (!res || !res.ok) {
+        this.bgConvert.error = (res && res.msg) || '启动转换失败';
+        return;
+      }
+      this.bgConvert.running = true;
+      this.bgConvert.resultPath = res.output || '';
+    },
+    async cancelBackgroundConvert() {
+      const api = this._api();
+      if (!api) return;
+      await api.cancel_background_convert();
+    },
+    async installConvertedBackground() {
+      const api = this._api();
+      if (!api) return;
+      const path = this.bgConvert.resultPath;
+      if (!path) return;
+      this.bgConvert.message = '';
+      this.bgConvert.error = '';
+      const res = await api.install_converted_background(path);
+      if (res && res.ok) {
+        this.bgConvert.message = '已设为当前主题的全局背景图（重启应用或切换主题后生效）';
+      } else {
+        this.bgConvert.error =
+          (res as { error?: { message?: string } } | undefined)?.error?.message || '应用到主题失败';
+      }
+    },
+
     handleBridgeEvent(event: BridgeEvent) {
       const type = event.type;
       const data = event.data || {};
@@ -4262,6 +4406,36 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (type === 'dropped_paths_push') {
         const push = (window as unknown as { __ycode_on_drop_paths?: (p: unknown) => void }).__ycode_on_drop_paths;
         if (push) push(data);
+        return;
+      }
+      // ── 背景图转换进度（GuiBridge 的 bg_convert_* 事件）──
+      // 全局单任务，不与会话 runtime 归属相关，处理完直接返回
+      if (type === 'bg_convert_progress') {
+        this.bgConvert.percent = Number(data.percent) || 0;
+        this.bgConvert.stage = String(data.stage || '');
+        this.bgConvert.etaSeconds =
+          typeof data.eta_seconds === 'number' ? data.eta_seconds : null;
+        if (data.stage === 'starting' || data.stage === 'extracting'
+            || data.stage === 'assembling' || data.stage === 'encoding'
+            || data.stage === 'converting') {
+          this.bgConvert.running = true;
+        }
+        return;
+      }
+      if (type === 'bg_convert_done') {
+        this.bgConvert.running = false;
+        this.bgConvert.percent = 100;
+        this.bgConvert.stage = 'done';
+        this.bgConvert.etaSeconds = null;
+        this.bgConvert.resultPath = String(data.path || '');
+        this.bgConvert.resultBytes = Number(data.bytes) || 0;
+        this.bgConvert.message = '转换完成';
+        return;
+      }
+      if (type === 'bg_convert_error') {
+        this.bgConvert.running = false;
+        this.bgConvert.etaSeconds = null;
+        this.bgConvert.error = String(data.message || '转换失败');
         return;
       }
       // 前端构建产物运行期更新（gui_main 的 dist watchdog 推送 fingerprint）：
@@ -4840,6 +5014,23 @@ navItems: [] as Array<{ id: number; preview: string }>,
             }
           });
         });
+      } else if (type === 'session_moved') {
+        // 跨文件夹移动会话（事件可能来自其他客户端，如手机端）：整份覆盖分组列表即可。
+        // 移动只改归属，消息/摘要/token/模型绑定都按 session_id 关联，无需迁移任何会话态
+        if (Array.isArray(data.sessions)) this.sessionGroups = data.sessions;
+        else void this.refreshSessions();
+        // 被移动的正是本端当前会话：工作区标签与文件树跟着切到新目录
+        if (data.name && data.name === this.currentSessionName && data.workdir) {
+          const wd = String(data.workdir);
+          this.workdir = wd;
+          this.currentWorkdirLabel = wd === 'GLOBAL' ? '对话' : (wd.split('\\').pop() || wd);
+          if (wd === 'GLOBAL') {
+            this.fileTree = [];
+            this.fileTreeExpanded = [];
+          } else {
+            this.loadFileTreeInBackground(this.currentSessionName, wd);
+          }
+        }
       } else if (type === 'session_archived' || type === 'session_unarchived' || type === 'session_deleted') {
         // 归档态变化（多端同步，含归档区批量删除）：负载带最新两侧快照时直接采用；
         // 缺失时主动刷新兜底。不做乐观增删——迟到的旧快照不得让已归档会话在主列表里「复活」。

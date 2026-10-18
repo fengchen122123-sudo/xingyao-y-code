@@ -9,6 +9,7 @@
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
       <button data-test="hooks-nav" class="nav-item" :class="{ active: activeSection === 'hooks' }" @click="activeSection = 'hooks'"><span class="nav-ico"><AppIcon name="zap" :size="14" /></span>钩子 Hooks</button>
       <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
+      <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
       <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
       <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
@@ -671,6 +672,7 @@
       <PersonaSettings v-else-if="activeSection === 'persona'" />
       <DecisionSettings v-else-if="activeSection === 'decision'" />
       <FeishuSettings v-else-if="activeSection === 'feishu'" />
+      <BackgroundConvert v-else-if="activeSection === 'bg-convert'" />
 
       <!-- 外观与主题常驻挂载（v-show）：切换设置分区不丢失未保存的主题草稿 -->
       <div v-show="activeSection === 'appearance'" class="appearance-section">
@@ -680,6 +682,10 @@
             <p>为 GUI 创建、编辑和切换可视化主题；CLI 的 /theme 配置保持独立、互不影响。</p>
           </div>
         </header>
+
+        <!-- 全局玻璃层：主题编辑卡里是「全局颜色 → 背景图片」，玻璃层就贴在那层壁纸之上，
+             故放在主题卡片之前（与位置语义一致：壁纸 → 玻璃 → 界面） -->
+        <AppGlassCard />
 
         <section class="appearance-settings-card">
           <GuiThemeSettings ref="themeEditorRef" />
@@ -776,6 +782,8 @@ import type { ChangelogEntry, ComputerProtocolChoice, ModelInfo } from '../types
 import TokenUsageSettings from './TokenUsageSettings.vue';
 import TokenUsageSettingsLegacy from './TokenUsageSettingsLegacy.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
+import BackgroundConvert from './BackgroundConvert.vue';
+import AppGlassCard from './AppGlassCard.vue';
 import SystemSettings from './SystemSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
 import DecisionSettings from './DecisionSettings.vue';
@@ -798,7 +806,7 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'decision' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'bg-convert' | 'system' | 'persona' | 'decision' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 
 // ── 插件设置页入口（提供 plugin_settings 钩子的插件直接挂在左侧导航）────
