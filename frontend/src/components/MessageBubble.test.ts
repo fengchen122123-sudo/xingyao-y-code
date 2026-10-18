@@ -106,8 +106,11 @@ describe('MessageBubble', () => {
     expect(wrapper.find('.tool-card').exists()).toBe(false);
     expect(wrapper.find('.diff-list').exists()).toBe(false);
     const trace = wrapper.get('.exec-trace');
-    expect(trace.text()).toContain('运行命令');
-    expect(trace.text()).toContain('未绑定的历史文件变更');
+    // 轨迹行改用「类别 + 目标」摘要：命令行给「运行 npm test」，
+    // 历史遗留 Diff 行给「变更 old.py」，不再有整句"未绑定的历史文件变更"
+    expect(trace.text()).toContain('运行');
+    expect(trace.text()).toContain('变更');
+    expect(trace.text()).toContain('old.py');
     wrapper.unmount();
   });
 

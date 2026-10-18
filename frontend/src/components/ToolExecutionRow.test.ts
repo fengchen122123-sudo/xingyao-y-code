@@ -107,47 +107,54 @@ function resultRow(results: string[]): ToolTraceRow {
 describe('ToolExecutionRow', () => {
   it('shows a failed command and continues to expose details', async () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: failedCommandRow() } });
-    expect(wrapper.text()).toContain('运行命令失败');
-    expect(wrapper.text()).toContain('pytest -q');
-    expect(wrapper.text()).toContain('ModuleNotFoundError: pytest');
-    const button = wrapper.get('button[data-detail-toggle]');
-    expect(button.attributes('aria-expanded')).toBe('false');
-    await button.trigger('click');
-    expect(button.attributes('aria-expanded')).toBe('true');
+    expect(wrapper.get('.trace-kind').text()).toBe('运行');
+    expect(wrapper.get('.trace-target').text()).toBe('pytest -q');
+    expect(wrapper.get('.trace-meta').text()).toBe('失败');
+    expect(wrapper.get('.trace-meta').attributes('title')).toContain('ModuleNotFoundError');
+    const toggle = wrapper.get('[data-row-toggle]');
+    expect(toggle.attributes('aria-expanded')).toBe('false');
+    await toggle.trigger('click');
+    expect(toggle.attributes('aria-expanded')).toBe('true');
     expect(wrapper.get('pre').text()).toContain('退出码 1');
   });
 
   it('expands a mutation diff in the same row', async () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: mutationRowWithDiff() } });
-    expect(wrapper.text()).toContain('+1 / -1 行');
-    await wrapper.get('button[data-diff-toggle]').trigger('click');
+    expect(wrapper.get('.trace-kind').text()).toBe('编辑');
+    expect(wrapper.get('.trace-diff-badge').text()).toContain('+1');
+    // 收起态不渲染 diff 行，点开整行才展开
+    expect(wrapper.find('.diff-line').exists()).toBe(false);
+    await wrapper.get('[data-row-toggle]').trigger('click');
     expect(wrapper.findAll('.diff-line.add')).toHaveLength(1);
     expect(wrapper.findAll('.diff-line.del')).toHaveLength(1);
   });
 
-  it('lists every file of a grouped read row', () => {
+  it('lists every file of a grouped read row after expanding', async () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: groupedReadRow() } });
-    expect(wrapper.text()).toContain('读取文件');
+    expect(wrapper.get('.trace-kind').text()).toBe('读取');
+    expect(wrapper.get('.trace-target').text()).toBe('2 个文件');
+    await wrapper.get('[data-row-toggle]').trigger('click');
     const files = wrapper.findAll('.trace-files li');
     expect(files).toHaveLength(2);
     expect(files[0].text()).toContain('alpha.ts');
     expect(files[1].text()).toContain('beta.ts');
   });
 
-  it('omits the duration badge when durationMs is missing', () => {
+  it('shows the running state word when no duration is known yet', () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: runningRowWithoutDuration() } });
-    expect(wrapper.find('.trace-duration').exists()).toBe(false);
+    expect(wrapper.get('.trace-meta').text()).toBe('运行中');
   });
 
-  it('shows a live duration badge from elapsedMs while running', () => {
+  it('shows a live duration from elapsedMs while running', () => {
     const wrapper = mount(ToolExecutionRow, {
       props: { row: runningRowWithoutDuration(), elapsedMs: 5000 },
     });
-    expect(wrapper.get('.trace-duration').text()).toBe('5.0s');
+    expect(wrapper.get('.trace-meta').text()).toBe('5.0s');
   });
 
-  it('renders run_subagent task snapshots', () => {
+  it('renders run_subagent task snapshots after expanding', async () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: subagentRow() } });
+    await wrapper.get('[data-row-toggle]').trigger('click');
     const tasks = wrapper.findAll('.subagent-task');
     expect(tasks).toHaveLength(2);
     expect(wrapper.text()).toContain('调研代码结构');
@@ -160,6 +167,7 @@ describe('ToolExecutionRow', () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: subagentRow() } });
     const store = useAppStore();
     expect(store.subagentDetailId).toBe('');
+    await wrapper.get('[data-row-toggle]').trigger('click');
 
     await wrapper.get('button[data-test="subagent-view-t1"]').trigger('click');
     expect(store.subagentDetailId).toBe('t1');

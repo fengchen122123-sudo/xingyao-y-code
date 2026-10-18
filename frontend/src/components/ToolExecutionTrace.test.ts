@@ -106,10 +106,10 @@ describe('ToolExecutionTrace', () => {
     });
     expect(setSpy).toHaveBeenCalledTimes(1);
 
-    // 实时秒表驱动运行中行的时长徽标
+    // 实时秒表驱动运行中行的耗时
     vi.advanceTimersByTime(3000);
     await wrapper.vm.$nextTick();
-    expect(wrapper.get('.trace-duration').text()).toBe('5.0s');
+    expect(wrapper.get('.trace-meta').text()).toBe('5.0s');
 
     // 进入终态后清除定时器，且 elapsed 秒数不在 aria-live 区域内
     await wrapper.setProps({ state: 'completed' });
@@ -132,10 +132,10 @@ describe('ToolExecutionTrace', () => {
       props: { calls: [runningCall('b', Date.now())], legacyDiffs: [], state: 'running' },
     });
     expect(wrapper.get('.fold-title [aria-live]').attributes('aria-live')).toBe('polite');
-    expect(wrapper.get('.trace-duration').attributes('aria-live')).toBeUndefined();
+    expect(wrapper.get('.trace-meta').attributes('aria-live')).toBeUndefined();
   });
 
-  it('groups consecutive reads and appends a legacy diff row', () => {
+  it('groups consecutive reads and appends a legacy diff row', async () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: {
         calls: [readCall('r1', 'a.ts'), readCall('r2', 'b.ts')],
@@ -145,10 +145,18 @@ describe('ToolExecutionTrace', () => {
     });
     const rows = wrapper.findAll('.trace-row');
     expect(rows).toHaveLength(2);
-    expect(rows[0].text()).toContain('读取文件');
-    expect(rows[0].text()).toContain('a.ts');
-    expect(rows[0].text()).toContain('b.ts');
-    expect(rows[1].text()).toContain('未绑定的历史文件变更');
-    expect(rows[1].text()).toContain('old.py');
+    // 分组行摘要只给类别与文件数，完整清单在展开区
+    expect(rows[0].get('.trace-kind').text()).toBe('读取');
+    expect(rows[0].get('.trace-target').text()).toBe('2 个文件');
+    await rows[0].get('[data-row-toggle]').trigger('click');
+    const files = rows[0].findAll('.trace-files li');
+    expect(files).toHaveLength(2);
+    expect(files[0].text()).toContain('a.ts');
+    expect(files[1].text()).toContain('b.ts');
+    // 未绑定的历史 Diff 行：行内给变更类别与文件，Diff 内容在展开区
+    expect(rows[1].get('.trace-kind').text()).toBe('变更');
+    expect(rows[1].get('.trace-target').text()).toContain('old.py');
+    await rows[1].get('[data-row-toggle]').trigger('click');
+    expect(rows[1].findAll('.diff-line.add')).toHaveLength(1);
   });
 });
