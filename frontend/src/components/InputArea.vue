@@ -832,6 +832,34 @@ textarea {
     display: inline;
   }
 }
+/* ── 极窄档：侧栏与右侧栏同时展开时输入栏只剩两百来像素 ──
+   按重要性由低到高依次收纳次要入口，任何档位都保持单行、发送按钮不被挤出：
+   ≤400 截图隐藏、思考档位只留图标 / ≤340 沙盒 / ≤300 上下文圆环 / ≤260 思考档位。
+   隐藏的开关仍可从设置页与首页卡片调整 */
+@container composer (max-width: 400px) {
+  .snip-btn {
+    display: none;
+  }
+  #input-bar :deep(.reasoning-label),
+  #input-bar :deep(.reasoning-chevron) {
+    display: none;
+  }
+}
+@container composer (max-width: 340px) {
+  .sandbox-btn {
+    display: none;
+  }
+}
+@container composer (max-width: 300px) {
+  .ctx-ring {
+    display: none;
+  }
+}
+@container composer (max-width: 260px) {
+  #input-bar :deep(.reasoning-button) {
+    display: none;
+  }
+}
 
 /* ── 元信息条收纳（右侧栏展开 / 窄窗口 / 手机端）──
    token 摘要与快捷键提示加起来约 600px，中间列被右侧栏挤窄后互相重叠。

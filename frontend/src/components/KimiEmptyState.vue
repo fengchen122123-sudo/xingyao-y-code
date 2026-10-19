@@ -28,7 +28,7 @@
       ></textarea>
 
       <div class="kimi-card-bar">
-        <div style="display:flex;align-items:center;gap:8px">
+        <div class="kimi-bar-left">
           <button
             ref="attachBtnRef"
             data-test="attachment-button"
@@ -40,7 +40,7 @@
                snip_attachment_ready 桥事件回传路径，由 store 加入输入框附件 -->
           <button
             data-test="screen-snip-button"
-            class="kimi-pill-btn"
+            class="kimi-pill-btn snip-pill"
             title="截图：框选屏幕任意区域"
             @click.stop="onScreenSnipClick"
           ><AppIcon name="scissors" :size="14" /></button>
@@ -67,7 +67,7 @@
           ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
         </div>
 
-        <div style="display:flex;align-items:center;gap:10px">
+        <div class="kimi-bar-right">
           <button
             ref="modelBtnRef"
             data-test="model-button"
@@ -102,7 +102,7 @@
       class="kimi-footer-workdir"
       @click.stop="toggleWorkdirDropdown"
     >
-      <span>{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '进入项目工作区' : '当前工作区: ' + store.currentWorkdirLabel }}</span>
+      <span class="workdir-label">{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '进入项目工作区' : '当前工作区: ' + store.currentWorkdirLabel }}</span>
       <AppIcon name="chevron-down" :size="11" :stroke-width="2" class="model-chevron" />
     </div>
 
@@ -388,6 +388,45 @@ function handleKeydown(e: KeyboardEvent) {
   container-type: inline-size;
   container-name: composer;
 }
+/* 卡片标题区按首页实际宽度分档（侧栏 + 右侧栏同时展开时中间列只剩两百多像素） */
+.kimi-empty-container {
+  container-type: inline-size;
+  container-name: empty-page;
+}
+.kimi-empty-container .kimi-title {
+  line-height: 1.25;
+}
+@container empty-page (max-width: 460px) {
+  .kimi-empty-container .kimi-title {
+    font-size: 20px;
+  }
+  .kimi-empty-container .kimi-hero {
+    margin-bottom: 16px;
+  }
+}
+/* 左右按钮组：左侧工具类可收缩（必要时整组裁剪），右侧模型/发送恒完整可见。
+   选择器带上 .kimi-card-bar 是为了盖过全局 `.kimi-card-bar > div{flex-shrink:0}` */
+.kimi-card-bar .kimi-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.kimi-card-bar .kimi-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+/* 工作区标签：窄容器下省略号收尾，不折行把卡片撑高 */
+.workdir-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 @container composer (max-width: 540px) {
   .permission-mode-btn .perm-label,
   .permission-mode-btn .permission-chevron,
@@ -406,6 +445,39 @@ function handleKeydown(e: KeyboardEvent) {
   }
   .sandbox-label-short {
     display: inline;
+  }
+}
+/* ── 极窄档：侧栏与右侧栏同时展开时中间列只剩两百来像素 ──
+   按“重要性由低到高”依次收纳次要入口，保证任何档位都是单行、
+   发送按钮永远留在卡片内：≤400 截图隐藏、思考档位只留图标 /
+   ≤340 沙盒隐藏 / ≤290 思考档位隐藏 / ≤210 工具按钮收紧内边距。
+   隐藏的开关仍可在设置页与对话中输入栏调整 */
+@container composer (max-width: 400px) {
+  .snip-pill {
+    display: none;
+  }
+  .kimi-bar-right :deep(.reasoning-label),
+  .kimi-bar-right :deep(.reasoning-chevron) {
+    display: none;
+  }
+}
+@container composer (max-width: 340px) {
+  .sandbox-pill {
+    display: none;
+  }
+}
+@container composer (max-width: 290px) {
+  .kimi-bar-right :deep(.reasoning-button) {
+    display: none;
+  }
+}
+@container composer (max-width: 210px) {
+  .kimi-card-bar .kimi-bar-left {
+    gap: 6px;
+  }
+  .kimi-bar-left .kimi-pill-btn {
+    padding-left: 8px;
+    padding-right: 8px;
   }
 }
 
