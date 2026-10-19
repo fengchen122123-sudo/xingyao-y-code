@@ -205,6 +205,12 @@ function handleUpdateClick() {
   gap: 12px;
   flex-shrink: 0;
 }
+
+/* 顶栏图标按钮（终端 / 主题 / 面板）：32×32 方形热区，圆角拉满成正圆。
+   与侧栏底部手机按钮同口径；窗口控制按钮（.win-btn，40×32）保持原圆角不动。 */
+#topbar .icon-btn {
+  border-radius: 50%;
+}
 #topbar .logo {
   display: flex;
   align-items: center;
