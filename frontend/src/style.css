@@ -518,8 +518,8 @@ button {
   margin-top: 12px;
 }
 
-/* 左右按钮组不参与压缩：宽度不足由容器查询（见 KimiEmptyState）整体
-   切换手机版图标形态，而不是组内按钮被压换行 */
+/* 左右按钮组：右侧（模型/发送）不参与压缩；左侧工具组允许收缩并在
+   极窄档逐级隐藏次要按钮，避免整条工具栏溢出卡片（见 KimiEmptyState） */
 .kimi-card-bar > div {
   flex-shrink: 0;
 }
@@ -628,6 +628,9 @@ button {
 
 .kimi-footer-workdir {
   margin-top: 18px;
+  /* 中间列被两侧面板挤窄时不超过容器宽度，超长文案走省略号（不折行、不撑宽） */
+  max-width: 100%;
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   gap: 8px;
