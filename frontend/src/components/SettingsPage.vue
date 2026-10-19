@@ -605,50 +605,84 @@
             </div>
           </div>
           <div v-if="!orderedArchivedSessions.length" class="wl-empty" data-test="session-archive-empty">暂无归档会话</div>
+          <!-- 按归属目录折叠分组：组头点击收起/展开，批量模式下组头勾选框按目录整组选择 -->
           <div
-            v-for="s in orderedArchivedSessions"
-            :key="s.name"
-            class="archive-row"
-            :class="{ confirming: archiveConfirmName === s.name, picked: archiveBatchMode && archiveSelected.includes(s.name) }"
-            :data-archived-name="s.name"
-            data-test="session-archive-item"
+            v-for="g in archiveGroups"
+            :key="g.key"
+            class="archive-group"
+            :data-archive-group="g.key"
+            data-test="session-archive-group"
           >
-            <label v-if="archiveBatchMode" class="archive-check">
-              <input type="checkbox" data-test="session-archive-select" :checked="archiveSelected.includes(s.name)" @change="toggleArchiveSelect(s.name)" />
-            </label>
-            <div class="archive-main" :class="{ 'archive-main--pick': archiveBatchMode }" @click="archiveBatchMode && toggleArchiveSelect(s.name)">
-              <div class="archive-title" :title="s.name">{{ s.display_name || s.name }}</div>
-              <div class="archive-meta">
-                <span data-test="session-archive-time" :title="`归档于 ${s.archived_at || ''}`">{{ relativeTime(s.archived_at) }}</span>
-                <span class="archive-sep">·</span>
-                <span data-test="session-archive-count">{{ s.count || 0 }} 条消息</span>
-                <span class="archive-sep">·</span>
-                <span class="mono archive-workdir" data-test="session-archive-workdir" :title="s.workdir || ''">{{ s.workdir || '未知目录' }}</span>
+            <div class="archive-group-head">
+              <label v-if="archiveBatchMode" class="archive-check archive-check--group">
+                <input
+                  type="checkbox"
+                  data-test="session-archive-group-select"
+                  :checked="archiveGroupSelectState(g.key) === 'all'"
+                  :indeterminate.prop="archiveGroupSelectState(g.key) === 'some'"
+                  :title="`选择「${g.label}」下全部 ${g.sessions.length} 项`"
+                  @change="toggleArchiveGroupSelect(g.key)"
+                />
+              </label>
+              <button
+                class="archive-group-toggle"
+                data-test="session-archive-group-toggle"
+                :title="archiveGroupCollapsed(g.key) ? `展开 ${g.path}` : `收起 ${g.path}`"
+                @click="toggleArchiveGroup(g.key)"
+              >
+                <AppIcon :name="archiveGroupCollapsed(g.key) ? 'chevron-right' : 'chevron-down'" :size="13" />
+                <span class="archive-group-name" data-test="session-archive-group-name">{{ g.label }}</span>
+                <span class="mono archive-group-path" data-test="session-archive-group-path" :title="g.path">{{ g.path }}</span>
+                <span class="archive-group-count" data-test="session-archive-group-count">{{ g.sessions.length }}</span>
+              </button>
+            </div>
+            <template v-if="!archiveGroupCollapsed(g.key)">
+              <div
+                v-for="s in g.sessions"
+                :key="s.name"
+                class="archive-row"
+                :class="{ confirming: archiveConfirmName === s.name, picked: archiveBatchMode && archiveSelected.includes(s.name) }"
+                :data-archived-name="s.name"
+                data-test="session-archive-item"
+              >
+                <label v-if="archiveBatchMode" class="archive-check">
+                  <input type="checkbox" data-test="session-archive-select" :checked="archiveSelected.includes(s.name)" @change="toggleArchiveSelect(s.name)" />
+                </label>
+                <div class="archive-main" :class="{ 'archive-main--pick': archiveBatchMode }" @click="archiveBatchMode && toggleArchiveSelect(s.name)">
+                  <div class="archive-title" :title="s.name">{{ s.display_name || s.name }}</div>
+                  <div class="archive-meta">
+                    <span data-test="session-archive-time" :title="`归档于 ${s.archived_at || ''}`">{{ relativeTime(s.archived_at) }}</span>
+                    <span class="archive-sep">·</span>
+                    <span data-test="session-archive-count">{{ s.count || 0 }} 条消息</span>
+                    <span class="archive-sep">·</span>
+                    <span class="mono archive-workdir" data-test="session-archive-workdir" :title="s.workdir || ''">{{ s.workdir || '未知目录' }}</span>
+                  </div>
+                </div>
+                <!-- 批量模式下隐藏行内单项恢复/删除：批量语义与单项语义混排容易误触 -->
+                <div v-if="!archiveBatchMode" class="archive-actions">
+                  <button
+                    class="secondary-button compact"
+                    data-test="session-archive-restore-btn"
+                    title="取消归档，恢复到会话列表"
+                    @click="restoreArchivedSession(s.name)"
+                  >恢复</button>
+                  <button
+                    v-if="archiveConfirmName !== s.name"
+                    class="archive-del-btn"
+                    data-test="session-archive-delete-btn"
+                    title="删除此对话"
+                    @click="askArchiveDelete(s.name)"
+                  ><AppIcon name="x" :size="13" /></button>
+                  <button
+                    v-else
+                    class="archive-del-btn archive-del-btn--confirm"
+                    data-test="session-archive-delete-confirm"
+                    title="点击确认删除"
+                    @click="confirmArchiveDelete(s.name)"
+                  >确认</button>
+                </div>
               </div>
-            </div>
-            <!-- 批量模式下隐藏行内单项恢复/删除：批量语义与单项语义混排容易误触 -->
-            <div v-if="!archiveBatchMode" class="archive-actions">
-              <button
-                class="secondary-button compact"
-                data-test="session-archive-restore-btn"
-                title="取消归档，恢复到会话列表"
-                @click="restoreArchivedSession(s.name)"
-              >恢复</button>
-              <button
-                v-if="archiveConfirmName !== s.name"
-                class="archive-del-btn"
-                data-test="session-archive-delete-btn"
-                title="删除此对话"
-                @click="askArchiveDelete(s.name)"
-              ><AppIcon name="x" :size="13" /></button>
-              <button
-                v-else
-                class="archive-del-btn archive-del-btn--confirm"
-                data-test="session-archive-delete-confirm"
-                title="点击确认删除"
-                @click="confirmArchiveDelete(s.name)"
-              >确认</button>
-            </div>
+            </template>
           </div>
         </section>
       </template>
@@ -840,6 +874,61 @@ const orderedArchivedSessions = computed(() => {
   });
 });
 
+// ── 归档列表按归属目录折叠分组 ─────────────────────────────
+// 归档会话攒多了单层平铺找不着，按 workdir 分成可折叠的目录组：
+// 组头 = 目录名 + 完整路径 + 会话数；组顺序 = 组内最新归档时间倒序
+// （orderedArchivedSessions 已按 archived_at 倒序，Map 插入顺序天然给出这个顺序），组内保持同一倒序。
+type ArchiveSessionItem = (typeof store.archivedSessions)[number];
+interface ArchiveDirGroup {
+  key: string;
+  /** 组头主标题：目录末级名；全局会话 / 无目录会话用固定文案 */
+  label: string;
+  /** 组头副标题（完整路径，hover 可见），用于区分同名的不同目录 */
+  path: string;
+  sessions: ArchiveSessionItem[];
+}
+
+/** 路径末级目录名：兼容 Windows 反斜杠与 POSIX 斜杠，忽略末尾分隔符 */
+function lastPathSegment(path: string) {
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+const archiveGroups = computed<ArchiveDirGroup[]>(() => {
+  const groups = new Map<string, ArchiveDirGroup>();
+  for (const s of orderedArchivedSessions.value) {
+    const workdir = (s.workdir || '').trim();
+    // 全局会话（workdir='GLOBAL'、is_global=true）不属于任何磁盘目录，单独成组
+    const isGlobal = !!s.is_global || workdir.toUpperCase() === 'GLOBAL';
+    const key = isGlobal ? '__GLOBAL__' : (workdir || '__UNKNOWN__');
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        key,
+        label: isGlobal ? '全局会话' : (lastPathSegment(workdir) || '未关联目录'),
+        path: isGlobal ? 'GLOBAL' : (workdir || '未关联目录'),
+        sessions: [],
+      };
+      groups.set(key, group);
+    }
+    group.sessions.push(s);
+  }
+  return [...groups.values()];
+});
+
+/** 已收起的目录组 key：默认全部展开；设置页组件常驻，切分区再回来时保留收起状态 */
+const collapsedArchiveGroups = ref<string[]>([]);
+
+function archiveGroupCollapsed(key: string) {
+  return collapsedArchiveGroups.value.includes(key);
+}
+
+function toggleArchiveGroup(key: string) {
+  const idx = collapsedArchiveGroups.value.indexOf(key);
+  if (idx >= 0) collapsedArchiveGroups.value.splice(idx, 1);
+  else collapsedArchiveGroups.value.push(key);
+}
+
 // 删除沿用侧栏归档区的两段确认：先点 ✕ 进入确认态，再点「确认」才真正删除
 const archiveConfirmName = ref('');
 
@@ -887,6 +976,27 @@ function toggleArchiveSelectAll() {
   archiveSelected.value = archiveAllSelected.value
     ? []
     : orderedArchivedSessions.value.map(s => s.name);
+}
+
+/** 目录组在批量模式下的勾选态：all=整组已选 / some=半选 / none=未选（组头勾选框据此显示 indeterminate） */
+function archiveGroupSelectState(key: string): 'all' | 'some' | 'none' {
+  const group = archiveGroups.value.find(g => g.key === key);
+  if (!group || !group.sessions.length) return 'none';
+  const picked = group.sessions.filter(s => archiveSelected.value.includes(s.name)).length;
+  if (picked === 0) return 'none';
+  return picked === group.sessions.length ? 'all' : 'some';
+}
+
+/** 组头勾选：未全选则补齐该组全部会话，已全选则整组取消（按目录批量操作） */
+function toggleArchiveGroupSelect(key: string) {
+  const group = archiveGroups.value.find(g => g.key === key);
+  if (!group) return;
+  const names = group.sessions.map(s => s.name);
+  if (names.every(n => archiveSelected.value.includes(n))) {
+    archiveSelected.value = archiveSelected.value.filter(n => !names.includes(n));
+  } else {
+    archiveSelected.value = [...new Set([...archiveSelected.value, ...names])];
+  }
 }
 
 async function batchRestoreArchived() {
@@ -1796,6 +1906,19 @@ onMounted(async () => {
 /* ── 会话归档分区 ── */
 .archive-settings-card { padding: 8px 24px 20px; }
 .archive-head-actions { display: flex; align-items: center; gap: 10px; }
+/* 目录分组：组间靠一行细分隔线区分（组内末行自带的下边框已由 .archive-row:last-child 去掉） */
+.archive-group + .archive-group { border-top: 1px solid var(--border); }
+.archive-group-head { display: flex; align-items: center; gap: 10px; padding: 10px 0 8px; }
+.archive-check--group { padding-left: 2px; }
+.archive-group-toggle {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+  padding: 0; border: 0; background: transparent; color: var(--text-dim);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.archive-group-toggle:hover .archive-group-name { color: var(--accent); }
+.archive-group-name { flex: none; max-width: 40%; color: var(--text); font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-group-path { flex: 1; min-width: 0; color: var(--text-faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-group-count { flex: none; margin-left: auto; padding: 1px 7px; border-radius: 999px; background: rgba(148, 163, 184, 0.16); color: var(--text-dim); font-size: 11px; line-height: 16px; }
 .archive-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--border); }
 .archive-row:last-child { border-bottom: 0; }
 .archive-row.confirming { background: rgba(239, 68, 68, 0.08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
