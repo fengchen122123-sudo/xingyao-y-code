@@ -438,7 +438,32 @@ def _new_record(cfg: dict, scene: str, shadow: bool, trace_id: str) -> dict:
         "adopted": False,
         "fallback_reason": None,
         "trace_id": trace_id,
+        # 会话标识：用于按会话判定「这个会话是否真的做过业务决策」；取不到时为空串
+        "session_id": "",
     }
+
+
+def _current_session_id() -> str:
+    """当前回合所属会话名（取不到返回空串）。
+
+    延迟 import ``core.app_context``：避免模块级循环依赖（app_context 会反向
+    引用 core 层）。优先取线程级会话（并行回合稳定归属），其次进程级「当前
+    查看的会话」；任何异常一律当作取不到，绝不影响决策主流程。
+    """
+    try:
+        from core import app_context
+
+        for getter in ("get_thread_session", "get_current_session"):
+            try:
+                value = getattr(app_context, getter)()
+            except Exception:
+                continue
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+    except Exception:
+        return ""
 
 
 def _cap_record(record: dict) -> dict:
@@ -594,6 +619,8 @@ def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None, au
     trace_id = uuid.uuid4().hex[:12]
     timeout_seconds = _effective_timeout_ms(cfg, timeout_ms) / 1000.0
     record = _new_record(cfg, scene_name, shadow, trace_id)
+    # 会话归属在构造后立即填充，保证下面所有 _append_audit 分支都带上该字段
+    record["session_id"] = _current_session_id()
     record["state_digest"] = _state_digest(state)
     record["questions_digest"] = _sha16(questions)
     if isinstance(audit_extra, dict) and audit_extra:
@@ -920,6 +947,7 @@ def _audit_brief(record: dict) -> dict:
     return {
         "ts": str(record.get("ts") or ""),
         "scene": str(record.get("scene") or ""),
+        "session_id": str(record.get("session_id") or ""),
         "shadow": bool(record.get("shadow")),
         "adopted": bool(record.get("adopted")),
         "latency_ms": record.get("latency_ms"),
@@ -929,15 +957,26 @@ def _audit_brief(record: dict) -> dict:
     }
 
 
-def get_decision_audit_summary(limit: int = 20) -> dict:
+def get_decision_audit_summary(limit: int = 20, session_id=None) -> dict:
     """汇总决策审计：今日计数 + 最近 N 条记录（设置页「决策记录」面板用）。
 
     只读、容错：目录缺失返回全零；单行损坏跳过该行；绝不抛错。
+
+    ``has_business_records`` 有两种口径：
+
+    - 传了非空 ``session_id``（strip 后非空）：只统计「属于该会话」的业务记录，
+      即 scene 既不是 ""/"probe" 且 ``record["session_id"] == session_id``；
+      头部「决策」入口据此判断当前会话是否真的做过业务决策。
+    - 不传或传空：保持全局口径（扫全部文件、全部会话），设置页面板依赖它。
+
+    ``today_*`` 计数与 ``recent`` 始终是全局口径，不受 ``session_id`` 影响，
+    避免设置页面板数据出现缺口。
     """
     try:
         count = max(1, min(int(limit), 200))
     except (TypeError, ValueError):
         count = 20
+    wanted_session = str(session_id or "").strip()
     directory = _audit_dir()
     summary = {
         "ok": True,
@@ -977,9 +1016,19 @@ def get_decision_audit_summary(limit: int = 20) -> dict:
 
     # 探针（scene="probe"）只是连通性验证，不算真实决策：头部「决策」入口
     # 只认业务场景记录，否则跑过一次探针就会挂出一个没有任何决策内容的入口。
+    # 传了 session_id 时再叠加会话过滤：别的会话做过的决策不算本会话做过。
+    def _is_business(record: dict) -> bool:
+        if not isinstance(record, dict):
+            return False
+        if str(record.get("scene") or "") in ("", "probe"):
+            return False
+        if not wanted_session:
+            return True
+        return str(record.get("session_id") or "") == wanted_session
+
     for name in reversed(names):
         if any(
-            str(record.get("scene") or "") not in ("", "probe")
+            _is_business(record)
             for record in _iter_records(os.path.join(directory, name))
         ):
             summary["has_business_records"] = True

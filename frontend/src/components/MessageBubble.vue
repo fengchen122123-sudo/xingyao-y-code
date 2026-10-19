@@ -52,8 +52,12 @@
     <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
       <div class="assistant-body">
-        <div class="assistant-name">
-          <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+        <!-- 名字行：一个回合只在最前面显示一次（由 TurnGroup 决定归属），
+             其余轮次的助手消息不再重复「星瑶 · 模型」；「已取消」徽标始终保留 -->
+        <div v-if="showName || msg.cancelled" class="assistant-name">
+          <template v-if="showName">
+            <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+          </template>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 
@@ -174,9 +178,13 @@ import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   msg: ChatMessage;
-}>();
+  /** 是否显示「星瑶 · 模型」名字行：一个回合只在最前面显示一次 */
+  showName?: boolean;
+}>(), {
+  showName: true,
+});
 
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
 // 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。

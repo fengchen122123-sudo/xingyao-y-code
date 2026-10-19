@@ -36,15 +36,16 @@ beforeEach(() => {
 describe('DecisionRecordPopup', () => {
   it('未启用且无记录：显示未启用状态与空态占位', async () => {
     mockApi();
+    useAppStore().currentSessionName = 'sess-A';
     const wrapper = mount(DecisionRecordPopup);
     await flushPromises();
 
     expect(wrapper.find('[data-test="decision-pop-status"]').text()).toContain('未启用');
-    expect(wrapper.find('[data-test="decision-pop-empty"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="decision-pop-empty"]').text()).toContain('本会话还没有决策记录');
   });
 
   it('有记录：渲染统计行与最近记录列表（含影子标记与延迟）', async () => {
-    mockApi({
+    const api = mockApi({
       get_decision_audit_summary: vi.fn(async () => ({
         ok: true,
         today_count: 2,
@@ -62,8 +63,13 @@ describe('DecisionRecordPopup', () => {
         runtime: {},
       })),
     });
+    useAppStore().currentSessionName = 'sess-A';
     const wrapper = mount(DecisionRecordPopup);
     await flushPromises();
+
+    // 记录按会话隔离：limit=10 + 当前会话名
+    expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(1);
+    expect(api.get_decision_audit_summary).toHaveBeenCalledWith(10, 'sess-A');
 
     expect(wrapper.find('[data-test="decision-pop-status"]').text()).toContain('已启用');
     expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('今日 2 次决策');
@@ -74,9 +80,47 @@ describe('DecisionRecordPopup', () => {
     expect(list).toContain('326ms');
   });
 
+  it('会话名为空（新会话懒创建阶段）时不请求审计汇总，直接显示空态', async () => {
+    const api = mockApi();
+    const store = useAppStore();
+    expect(store.currentSessionName).toBe('');
+
+    const wrapper = mount(DecisionRecordPopup);
+    await flushPromises();
+
+    expect(api.get_decision_audit_summary).not.toHaveBeenCalled();
+    expect(wrapper.find('[data-test="decision-pop-empty"]').exists()).toBe(true);
+
+    // 空白会话名同样不发请求
+    await wrapper.unmount();
+    store.currentSessionName = '   ';
+    const wrapper2 = mount(DecisionRecordPopup);
+    await flushPromises();
+    expect(api.get_decision_audit_summary).not.toHaveBeenCalled();
+    wrapper2.unmount();
+  });
+
+  it('切换当前会话后，按新会话名重新拉取一次记录', async () => {
+    const api = mockApi();
+    const store = useAppStore();
+    store.currentSessionName = 'sess-A';
+    const wrapper = mount(DecisionRecordPopup);
+    await flushPromises();
+    expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(1);
+    expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(10, 'sess-A');
+
+    store.currentSessionName = 'sess-B';
+    await flushPromises();
+
+    expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(2);
+    expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(10, 'sess-B');
+    wrapper.unmount();
+  });
+
   it('去设置：切到决策分区并关闭面板', async () => {
     mockApi();
     const store = useAppStore();
+    store.currentSessionName = 'sess-A';
     const wrapper = mount(DecisionRecordPopup);
     await flushPromises();
 
@@ -88,6 +132,7 @@ describe('DecisionRecordPopup', () => {
 
   it('打开审计目录：调用桥方法', async () => {
     const api = mockApi();
+    useAppStore().currentSessionName = 'sess-A';
     const wrapper = mount(DecisionRecordPopup);
     await flushPromises();
 
@@ -99,9 +144,11 @@ describe('DecisionRecordPopup', () => {
   it('面板开启期间收到新决策事件：自动刷新记录并保持已读', async () => {
     const api = mockApi();
     const store = useAppStore();
+    store.currentSessionName = 'sess-A';
     const wrapper = mount(DecisionRecordPopup);
     await flushPromises();
     expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(1);
+    expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(10, 'sess-A');
 
     // 模拟后端 decision_recorded 事件（store 侧 tick 递增）
     store.decisionUnread = 3;

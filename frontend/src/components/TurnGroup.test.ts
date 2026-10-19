@@ -112,4 +112,38 @@ describe('TurnGroup', () => {
     expect(wrapper.text()).toContain('导出失败');
     expect(wrapper.find('.fold-body').text()).not.toContain('导出失败');
   });
+
+  it('折叠收起时名字行只落在组尾总结上', () => {
+    const wrapper = mount(TurnGroup, { props: { group: finishedGroup() } });
+
+    // 整个回合只有一处「星瑶 · 模型」名字行，且不在折叠体内
+    expect(wrapper.findAll('.assistant-name')).toHaveLength(1);
+    expect(wrapper.find('.fold-body .assistant-name').exists()).toBe(false);
+  });
+
+  it('展开折叠区后名字行移到中间过程首条，仍只有一处', async () => {
+    const wrapper = mount(TurnGroup, { props: { group: finishedGroup() } });
+
+    await wrapper.get('.fold-head').trigger('click');
+
+    expect(wrapper.findAll('.assistant-name')).toHaveLength(1);
+    expect(wrapper.find('.fold-body .assistant-name').exists()).toBe(true);
+  });
+
+  it('回合运行中名字行只出现在中间过程首条', () => {
+    const group: TurnGroupInfo = {
+      userMsg: user('跑个任务'),
+      middle: [
+        assistant({ content: '中间轮' }),
+        assistant({ content: '第二中间轮' }),
+      ],
+      tail: [assistant({ content: '', execution_state: 'running' })],
+      running: true,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    expect(wrapper.findAll('.assistant-name')).toHaveLength(1);
+  });
 });

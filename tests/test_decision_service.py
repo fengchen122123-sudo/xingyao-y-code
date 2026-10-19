@@ -901,6 +901,57 @@ def test_audit_summary_marks_business_records(data_dir):
     assert result["has_business_records"] is True
 
 
+def test_audit_summary_session_ignores_other_session_records(data_dir):
+    """按会话判定：只有别的会话做过业务决策时，本会话 has_business_records 为 False。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    (audit / f"{svc._today()}.jsonl").write_text(
+        json.dumps({"ts": "2026-10-18T10:00:00", "scene": "router", "shadow": False,
+                    "session_id": "别的会话"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    scoped = svc.get_decision_audit_summary(session_id="当前会话")
+    assert scoped["ok"] is True
+    assert scoped["has_business_records"] is False
+    # 不传 session_id 保持全局口径（设置页面板依赖）
+    assert svc.get_decision_audit_summary()["has_business_records"] is True
+    # 空串 / 纯空白等同不传
+    assert svc.get_decision_audit_summary(session_id="")["has_business_records"] is True
+    assert svc.get_decision_audit_summary(session_id="   ")["has_business_records"] is True
+
+
+def test_audit_summary_session_marks_own_business_records(data_dir):
+    """本会话存在业务记录时，按会话查询也为 True（跨文件同样要扫到）。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    (audit / "20261017.jsonl").write_text(
+        json.dumps({"ts": "2026-10-17T10:00:00", "scene": "router", "shadow": True,
+                    "session_id": "当前会话"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (audit / f"{svc._today()}.jsonl").write_text(
+        json.dumps({"ts": "2026-10-18T10:00:00", "scene": "secretary", "shadow": False,
+                    "session_id": "别的会话"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    result = svc.get_decision_audit_summary(limit=10, session_id="当前会话")
+    assert result["has_business_records"] is True
+    assert result["today_count"] == 1  # today_* 保持全局口径
+
+
+def test_audit_summary_session_filter_still_ignores_probe(data_dir):
+    """即便 session_id 匹配，探针记录也不算业务记录。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    (audit / f"{svc._today()}.jsonl").write_text(
+        json.dumps({"ts": "2026-10-18T10:00:00", "scene": "probe", "shadow": False,
+                    "session_id": "当前会话"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    assert svc.get_decision_audit_summary(session_id="当前会话")["has_business_records"] is False
+    assert svc.get_decision_audit_summary()["has_business_records"] is False
+
+
 def test_audit_summary_missing_dir_returns_zeros(data_dir):
     result = svc.get_decision_audit_summary()
     assert result["ok"] is True
@@ -997,3 +1048,74 @@ def test_ask_decision_writes_audit_extra(data_dir, monkeypatch):
     assert record["extra"] == {"baseline_tier": "c0", "message_chars": 8}
     assert record["shadow"] is True
     assert record["answers"] == {"tier": "c1"}
+
+
+# ---------------------------------------------------------------------------
+# 会话标识：审计记录带 session_id + 按会话判定是否做过业务决策
+# ---------------------------------------------------------------------------
+
+def _stub_session(monkeypatch, thread_value, current_value):
+    """打桩 app_context 的两个会话来源（延迟 import，故打桩模块属性即可）。"""
+    from core import app_context
+
+    monkeypatch.setattr(app_context, "get_thread_session", lambda: thread_value)
+    monkeypatch.setattr(app_context, "get_current_session", lambda: current_value)
+    return app_context
+
+
+def test_ask_decision_records_session_id(data_dir, monkeypatch):
+    """审计落盘记录带 session_id，且优先取线程会话、其次进程当前会话。"""
+    _write_user_config(data_dir, [PROVIDER])
+    svc.save_decision_config({
+        "enabled": True,
+        "audit_enabled": True,
+        "shadow_mode": True,
+        "scenes": {"router": {"enabled": True, "shadow": True}},
+    })
+    _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
+
+    # 两种来源都有：线程会话优先
+    _stub_session(monkeypatch, "线程会话", "进程会话")
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    assert _last_audit(data_dir)["session_id"] == "线程会话"
+
+    # 线程会话为空：回落到进程当前会话
+    _stub_session(monkeypatch, None, "进程会话")
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    assert _last_audit(data_dir)["session_id"] == "进程会话"
+
+    # 都取不到：空串（字段始终存在，便于按会话过滤时判定）
+    _stub_session(monkeypatch, None, "")
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    assert _last_audit(data_dir)["session_id"] == ""
+
+
+def test_ask_decision_session_id_survives_app_context_failure(data_dir, monkeypatch):
+    """app_context 取会话抛异常时不影响决策主流程，session_id 退化为空串。"""
+    _write_user_config(data_dir, [PROVIDER])
+    svc.save_decision_config({
+        "enabled": True,
+        "audit_enabled": True,
+        "shadow_mode": True,
+        "scenes": {"router": {"enabled": True, "shadow": True}},
+    })
+    _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
+    from core import app_context
+
+    def boom():
+        raise RuntimeError("app_context 挂了")
+
+    monkeypatch.setattr(app_context, "get_thread_session", boom)
+    monkeypatch.setattr(app_context, "get_current_session", boom)
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    record = _last_audit(data_dir)
+    assert record["session_id"] == ""
+    assert record["answers"] == {"intent": "dispatch"}
+
+
+def test_audit_brief_carries_session_id(data_dir):
+    """实时推送的精简条目也要带会话标识。"""
+    brief = svc._audit_brief({"ts": "2026-10-18T10:00:00", "scene": "router",
+                             "session_id": "会话A"})
+    assert brief["session_id"] == "会话A"
+    assert svc._audit_brief({"scene": "router"})["session_id"] == ""

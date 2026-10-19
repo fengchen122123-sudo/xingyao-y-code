@@ -2268,11 +2268,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 启动时后端自动恢复最近一次对话：同步消息列表与标题
         this.messages = pairHistoryToolMessages((init as any).messages || []);
       this.historyHasMore = !!(init as any).history_has_more;
-      this.historyOldestId = (init as any).history_oldest_id ?? null;
-      void this.refreshNavIndex();
+      this.historyOldestId = (init as any).history_oldest_id ?? null;        void this.refreshNavIndex();
         // 按回合撤销：启动批量拉取当前会话的检查点状态（重建撤销卡片）
         void this.refreshTurnUndoStates();
-        // 批次D：窗口重载/崩溃重建期间终态事件已丢失，后端通过 active_sessions
+        // 决策入口按当前会话探测：必须在 currentSessionName 就绪之后调用
+        // （App.vue 的启动探测发生在 initFromBackend 未完成的时刻，那时还没有
+        // 会话名，会按口径直接跳过，故这里补一次）
+        void this.refreshDecisionAvailability();// 批次D：窗口重载/崩溃重建期间终态事件已丢失，后端通过 active_sessions
         // 告知仍有活跃回合的会话名列表。据此恢复各会话 running 态与顶层标记，
         // 让运行中的会话正确显示运行中（含发送拦截/停止按钮）而不是看似空闲。
         const activeSessions: string[] = Array.isArray((init as any).active_sessions)
@@ -3193,6 +3195,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 生效显示名随会话走：秘书会话显示秘书名，普通会话回到设置页名字
         // （不 await：显示名刷新失败不能拖住会话切换，内部自带回落）
         void this.refreshActiveAgentName();
+
+        // 决策入口按会话重探：先复位再按目标会话探测，切换后入口只反映本会话
+        // （不 await：探测失败不能拖住切换，内部自带复位兜底）
+        void this.refreshDecisionAvailability(sessionName);
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
@@ -4495,6 +4501,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 累加未读徽章，面板开着时按 tick 拉取刷新；独立支路，不参与会话
       // runtime 归属，处理完直接返回
       if (type === 'decision_recorded') {
+        // 入口与徽章口径是「当前会话」：其他会话的决策只让面板按 tick 重拉，
+        // 既不累加未读、也不点亮当前会话入口（否则切到 A 会话会看到 B 的决策）
+        const decisionSession = String(data.session_id || '').trim();
+        if (decisionSession && decisionSession !== this.currentSessionName) {
+          this.decisionEventTick += 1;
+          return;
+        }
         this.decisionEventTick += 1;
         this.decisionUnread += 1;
         // 刚发生一次真实决策：入口立刻出现，不用等下次启动探测
@@ -6493,12 +6506,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    // 决策入口可见性探测：后端只认业务场景记录（排除 scene="probe" 的探针），
-    // 即"真的做过决策"才算数。启动时调一次；桥未就绪（浏览器开发态）静默跳过。
-    async refreshDecisionAvailability() {
+    // 决策入口可见性探测：入口显示口径是「当前会话是否产生过真实业务决策」，
+    // 全局历史不再点亮（别的会话做过决策不能让当前会话出现入口）。
+    // 后端只认业务场景记录（排除 scene="probe" 的探针）。启动时调一次；
+    // 桥未就绪（浏览器开发态）静默跳过。
+    async refreshDecisionAvailability(sessionName?: string) {
+      // 每次探测先复位：避免上一会话的 true 残留，把入口错误地留在当前会话上
+      this.decisionHasRecords = false;
       if (!(window.pywebview && window.pywebview.api)) return;
+      const target = (sessionName ?? this.currentSessionName ?? '').trim();
+      // 无会话名（新会话懒创建阶段）时不请求后端：不能退回全局口径
+      if (!target) return;
       try {
-        const res = await window.pywebview.api.get_decision_audit_summary(1);
+        const res = await window.pywebview.api.get_decision_audit_summary(1, target);
         if (res?.ok && res.has_business_records === true) {
           this.decisionHasRecords = true;
         }

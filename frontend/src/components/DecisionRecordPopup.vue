@@ -28,7 +28,7 @@
         </ul>
       </template>
       <div v-else class="pop-empty" data-test="decision-pop-empty">
-        还没有决策记录。启用后在设置里跑一次探针就会产生记录；业务场景接入后每次决策都会出现在这里。
+        本会话还没有决策记录。启用后在设置里跑一次探针就会产生记录；业务场景接入后每次决策都会出现在这里。
       </div>
     </div>
 
@@ -70,10 +70,17 @@ function line(item: DecisionAuditRecentItem): string {
 }
 
 async function loadSummary() {
+  // 按当前会话拉取：入口/面板口径是「本会话的决策记录」，会话名为空
+  // （新会话懒创建阶段）时不请求，也不回退全局口径
+  const sessionName = String(store.currentSessionName || '').trim();
+  if (!sessionName) {
+    summary.value = null;
+    return;
+  }
   try {
     const api = window.pywebview?.api;
     if (!api?.get_decision_audit_summary) return;
-    const res = await api.get_decision_audit_summary(10);
+    const res = await api.get_decision_audit_summary(10, sessionName);
     if (res?.ok) {
       summary.value = {
         ok: true,
@@ -133,6 +140,12 @@ watch(
     loadSummary();
     store.decisionUnread = 0;
   },
+);
+
+// 切换会话：记录按会话隔离，必须重新拉取本会话的决策记录
+watch(
+  () => store.currentSessionName,
+  () => { loadSummary(); },
 );
 </script>
 

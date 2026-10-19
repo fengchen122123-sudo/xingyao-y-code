@@ -1007,6 +1007,8 @@ export interface DecisionRecordedBridgeData {
   fallback_reason: string;
   model_id: string;
   answers_digest: string;
+  /** 决策所属会话（后端 core/decision_service._audit_brief 写入）；旧后端可能缺省 */
+  session_id?: string;
 }
 
 /**
@@ -1293,8 +1295,10 @@ export interface PyWebViewAPI {
   list_decision_models(): Promise<{ ok: boolean; models: DecisionModelOption[]; msg?: string }>;
   // 可选调用通道列表（不含 Key 内容，仅报数量；设置页通道下拉）
   list_decision_providers(): Promise<{ ok: boolean; providers?: DecisionProviderOption[]; msg?: string }>;
-  // 决策审计汇总（今日计数 + 最近记录；设置页「决策记录」面板）
-  get_decision_audit_summary(limit?: number): Promise<DecisionAuditSummary>;
+  // 决策审计汇总（今日计数 + 最近记录；设置页「决策记录」面板 / 头部决策入口）。
+  // session_id 非空时 has_business_records 只统计该会话（scene 非 probe）的记录；
+  // 为空/缺省是全局口径（设置页面板用）。
+  get_decision_audit_summary(limit?: number, session_id?: string): Promise<DecisionAuditSummary>;
   // 在系统文件管理器中打开决策审计目录（缺失时先创建）
   open_decision_audit_dir(): Promise<{ ok: boolean; path?: string; msg?: string }>;
   // 决策审计尾部：~/.ycode/decision_audit 最新文件的最后 limit 行
