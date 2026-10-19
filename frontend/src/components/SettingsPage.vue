@@ -1625,7 +1625,11 @@ onMounted(async () => {
 
 <style scoped>
 .settings-page { position: relative; flex: 1; min-width: 0; z-index: 80; display: flex; background: var(--bg0); color: var(--text); }
-.settings-nav { width: 220px; padding: 22px 12px 14px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+/* 导航列：条目多于一屏时自身滚动（min-height:0 是 flex 子项允许收缩的前提，
+   否则内容溢出可见、按钮被压扁，底部用户区被顶到容器外与状态栏重叠） */
+.settings-nav { width: 220px; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 22px 12px 14px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+/* 导航项不参与纵向压缩，宁可整体滚动也不压扁按钮 */
+.settings-nav > * { flex-shrink: 0; }
 .back-workspace, .nav-item { width: 100%; border: 0; background: transparent; color: var(--text-dim); text-align: left; border-radius: 9px; padding: 10px 12px; }
 .back-workspace:hover, .nav-item:hover { color: var(--text); background: var(--bg2); }
 .nav-section { margin: 28px 12px 8px; color: var(--text-faint); font-size: 11px; }
@@ -1976,6 +1980,7 @@ onMounted(async () => {
     border-right: 0;
     border-bottom: 1px solid var(--border);
     overflow-x: auto;
+    overflow-y: hidden; /* 横滑胶囊条只横向滚动，避免出现多余的纵向滚动条 */
     -webkit-overflow-scrolling: touch;
     flex: none;
   }
