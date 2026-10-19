@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, expect, it } from 'vitest';
+import { beforeEach, expect, it, vi } from 'vitest';
 import { mount, flushPromises } from '@vue/test-utils';
 
 import App from './App.vue';
@@ -13,6 +13,16 @@ const stubs = {
   PermCard: true, ImageLightbox: true, Subpage: true, SettingsPage: true,
   AppIcon: true, MessageNavRail: true, RemoteDirBrowser: true,
 };
+
+// mock 决策桥方法：入口可见性探测只依赖 get_decision_audit_summary(limit, session)
+function mockDecisionApi(overrides: Record<string, unknown> = {}) {
+  const api = {
+    get_decision_audit_summary: vi.fn(async () => ({ ok: true, has_business_records: true })),
+    ...overrides,
+  };
+  (window as any).pywebview = { api };
+  return api;
+}
 
 beforeEach(() => {
   localStorage.clear();
@@ -100,4 +110,73 @@ it('决策未读徽章：decision_recorded 事件累计，打开面板后清零'
   await flushPromises();
   expect(store.decisionUnread).toBe(0);
   wrapper.unmount();
+});
+
+it('refreshDecisionAvailability 按会话名探测：has_business_records=false 时入口保持隐藏', async () => {
+  const api = mockDecisionApi({
+    get_decision_audit_summary: vi.fn(async () => ({ ok: true, has_business_records: false })),
+  });
+  const store = useAppStore();
+
+  await store.refreshDecisionAvailability('sess-A');
+
+  // 口径：limit=1 + 目标会话名（不能退化成全局口径）
+  expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(1);
+  expect(api.get_decision_audit_summary).toHaveBeenCalledWith(1, 'sess-A');
+  expect(store.decisionHasRecords).toBe(false);
+});
+
+it('refreshDecisionAvailability 连续探测：第二次先复位，不残留上一次的 true', async () => {
+  const summary = vi.fn()
+    .mockResolvedValueOnce({ ok: true, has_business_records: true })
+    .mockResolvedValueOnce({ ok: true, has_business_records: false });
+  const api = mockDecisionApi({ get_decision_audit_summary: summary });
+  const store = useAppStore();
+
+  await store.refreshDecisionAvailability('sess-A');
+  expect(store.decisionHasRecords).toBe(true);
+  expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(1, 'sess-A');
+
+  // 切到没有决策记录的会话：入口必须熄灭
+  await store.refreshDecisionAvailability('sess-B');
+  expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(1, 'sess-B');
+  expect(store.decisionHasRecords).toBe(false);
+});
+
+it('refreshDecisionAvailability 会话名为空时不请求后端，且入口保持隐藏', async () => {
+  const api = mockDecisionApi();
+  const store = useAppStore();
+  // 上一会话留下的 true 必须被复位
+  store.decisionHasRecords = true;
+
+  await store.refreshDecisionAvailability('   ');
+
+  expect(api.get_decision_audit_summary).not.toHaveBeenCalled();
+  expect(store.decisionHasRecords).toBe(false);
+
+  // 不传参且 currentSessionName 为空时同样不发请求
+  await store.refreshDecisionAvailability();
+  expect(api.get_decision_audit_summary).not.toHaveBeenCalled();
+  expect(store.decisionHasRecords).toBe(false);
+});
+
+it('decision_recorded 带其他会话 session_id：只推进 tick，不累加未读也不点亮入口', () => {
+  const store = useAppStore();
+  store.currentSessionName = 'sess-A';
+  store.decisionUnread = 0;
+  store.decisionHasRecords = false;
+  const tickBefore = store.decisionEventTick;
+
+  store.handleBridgeEvent({ type: 'decision_recorded', data: { session_id: 'sess-B' } } as any);
+
+  expect(store.decisionEventTick).toBe(tickBefore + 1);
+  expect(store.decisionUnread).toBe(0);
+  expect(store.decisionHasRecords).toBe(false);
+
+  // 当前会话自己的决策仍按旧行为累加未读 + 点亮入口
+  store.handleBridgeEvent({ type: 'decision_recorded', data: { session_id: 'sess-A' } } as any);
+
+  expect(store.decisionEventTick).toBe(tickBefore + 2);
+  expect(store.decisionUnread).toBe(1);
+  expect(store.decisionHasRecords).toBe(true);
 });

@@ -10,6 +10,7 @@
 本文件再把 ``config.YCODE_DIR`` monkeypatch 到每个用例的 tmp_path，绝不触碰
 真实 ``~/.ycode``，也不发任何网络请求（这两个桥方法只读写配置）。
 """
+import json
 import os
 import sys
 
@@ -374,3 +375,102 @@ def test_existing_bridge_methods_untouched(data_dir):
 
     # 现有保存不会写 scenes：四个场景保持默认全关
     assert [row["mode"] for row in bridge.get_decision_scenes()["scenes"]] == ["off"] * 4
+
+
+# ---------------------------------------------------------------------------
+# 7. get_decision_audit_summary：session_id 透传到 decision_service
+# ---------------------------------------------------------------------------
+
+SUMMARY_KEYS = {
+    "ok",
+    "today_count",
+    "today_shadow_count",
+    "today_adopted_count",
+    "today_fallback_count",
+    "recent",
+    "has_business_records",
+}
+
+
+def _fake_summary(has_business_records=True):
+    return {
+        "ok": True,
+        "today_count": 2,
+        "today_shadow_count": 1,
+        "today_adopted_count": 1,
+        "today_fallback_count": 0,
+        "recent": [],
+        "has_business_records": has_business_records,
+    }
+
+
+def test_get_decision_audit_summary_passes_session_id(data_dir, monkeypatch):
+    """桥层把 session_id 原样透传给 decision_service（头部决策入口按会话判定）。"""
+    calls = []
+
+    def fake(limit=20, session_id=None):
+        calls.append((limit, session_id))
+        return _fake_summary(True)
+
+    monkeypatch.setattr(svc, "get_decision_audit_summary", fake)
+
+    result = _make_bridge().get_decision_audit_summary(5, "sess-A")
+
+    assert calls == [(5, "sess-A")]
+    assert result["ok"] is True
+    assert result["has_business_records"] is True
+    assert SUMMARY_KEYS <= set(result)
+
+
+def test_get_decision_audit_summary_defaults_to_global(data_dir, monkeypatch):
+    """不传 session_id 时下游仍然只拿到 limit（session_id 有效值为 None），返回结构不变。"""
+    calls = []
+
+    def fake(limit=20, session_id=None):
+        calls.append((limit, session_id))
+        return _fake_summary(True)
+
+    monkeypatch.setattr(svc, "get_decision_audit_summary", fake)
+
+    result = _make_bridge().get_decision_audit_summary()
+
+    assert calls == [(20, None)]
+    assert result["ok"] is True
+    assert SUMMARY_KEYS <= set(result)
+    assert result["today_count"] == 2
+    assert result["recent"] == []
+
+
+def test_get_decision_audit_summary_non_dict_result_falls_back(data_dir, monkeypatch):
+    """底层返回非字典时仍走既有兜底：ok=false + 中文原因，不抛错。"""
+    monkeypatch.setattr(svc, "get_decision_audit_summary", lambda limit=20, session_id=None: [])
+
+    result = _make_bridge().get_decision_audit_summary(3, "sess-A")
+
+    assert result["ok"] is False
+    assert result["msg"] == "汇总返回异常"
+
+
+def test_get_decision_audit_summary_session_scope_end_to_end(data_dir):
+    """真链路：别的会话做过业务决策时，本会话 has_business_records 仍为 False。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    (audit / f"{svc._today()}.jsonl").write_text(
+        json.dumps(
+            {"ts": "2026-10-18T10:00:00", "scene": "router", "shadow": False,
+             "session_id": "别的会话"},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    bridge = _make_bridge()
+
+    scoped = bridge.get_decision_audit_summary(10, "本会话")
+    assert scoped["ok"] is True
+    assert scoped["has_business_records"] is False
+
+    # 全局口径（不传 session_id）：任何会话的业务记录都算
+    glob = bridge.get_decision_audit_summary(10)
+    assert glob["ok"] is True
+    assert glob["has_business_records"] is True
+
