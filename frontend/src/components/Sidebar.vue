@@ -149,19 +149,19 @@
       </div>
       <div class="menu-item" @click="openSkills()">
         <span class="mi-ico">❖</span>
-        <span class="mi-label">技能 Skills</span>
+        <span class="mi-label">星盘 · 技能</span>
         <span class="mi-count">{{ store.skills.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openMcp()">
         <span class="mi-ico">⧉</span>
-        <span class="mi-label">MCP 服务</span>
+        <span class="mi-label">星桥 · MCP</span>
         <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openPlugins()">
         <span class="mi-ico">⬡</span>
-        <span class="mi-label">插件</span>
+        <span class="mi-label">星匣 · 插件</span>
         <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
         <span class="mi-arrow">›</span>
       </div>

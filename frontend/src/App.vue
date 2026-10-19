@@ -230,8 +230,12 @@
       ></div>
 
       <!-- 右侧控制面板：必须用 v-show 而不是 v-if——卸载会重建组件，它内部的原生
-           WebView2 表面来不及 hide 就会以白块形式留在屏幕上 -->
-      <RightPanel v-show="!store.rightPanelCollapsed" />
+           WebView2 表面来不及 hide 就会以白块形式留在屏幕上。
+           外层 Transition 负责拖住 display:none 直到滑入/滑出动画跑完：v-show 单独
+           使用时 display 和 margin 在同一帧切换，负 margin 的过渡根本来不及生效 -->
+      <Transition name="right-panel-slide">
+        <RightPanel v-show="!store.rightPanelCollapsed" />
+      </Transition>
       </template>
     </div>
 

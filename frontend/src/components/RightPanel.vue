@@ -67,11 +67,11 @@
       </button>
     </div>
 
-    <div id="right-content" :class="{ flush: activeTab === 'browser' }">
+    <div id="right-content" :class="{ flush: visualTab === 'browser' }">
       <!-- 打开标签页选择页（ZCode 式侧板）：无页签/点"+"时出现，从卡片
            追加页签；已打开的页签保留在页签条上随时可切回。定向入口经
            openRightPanelTab 直接开页签跳过本页 -->
-      <div v-if="showPicker" class="tab-picker" data-test="tab-picker">
+      <div v-if="visualPicker" class="tab-picker" data-test="tab-picker">
         <h3 class="tp-title">打开标签页</h3>
         <p class="tp-sub">选择要在侧边面板中打开的标签。</p>
         <div class="tp-cards">
@@ -80,6 +80,7 @@
             :key="card.id"
             class="tp-card"
             :data-test="'picker-card-' + card.id"
+            :title="card.label"
             @click="store.openRightPanelTab(card.id)"
           >
             <AppIcon :name="card.icon" :size="15" :stroke-width="2" />
@@ -90,7 +91,7 @@
 
       <template v-else>
       <!-- 文件树面板 -->
-      <div v-show="activeTab === 'files'" class="rpane active">
+      <div v-show="visualTab === 'files'" class="rpane active">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)">
           <span style="font-size:12px;color:var(--text-dim);font-weight:600">项目文件</span>
           <span style="display:flex;gap:6px">
@@ -115,25 +116,25 @@
       </div>
 
       <!-- 源代码管理面板（Git 工作台，规格 §11.2） -->
-      <div v-show="activeTab === 'git'" class="rpane active" data-test="git-pane">
+      <div v-show="visualTab === 'git'" class="rpane active" data-test="git-pane">
         <GitPanel />
       </div>
 
       <!-- 电脑操控面板（设计 16.2）：出现过 run 后自动切入的“操控”工作台 -->
-      <div v-show="activeTab === 'computer' && !!store.computerRun.run_id" class="rpane active" data-test="computer-pane">
+      <div v-show="visualTab === 'computer' && !!store.computerRun.run_id" class="rpane active" data-test="computer-pane">
         <ComputerControlPane />
       </div>
 
       <!-- 浏览器工作台：DOM 工具栏 + 原生表面占位区；真实网页由宿主叠加的
            WebView2 控件渲染，前端负责矩形上报与起始页/不支持态 -->
-      <div v-show="activeTab === 'browser'" class="rpane active" data-test="browser-pane">
+      <div v-show="visualTab === 'browser'" class="rpane active" data-test="browser-pane">
         <BrowserPane :active="activeTab === 'browser'" />
       </div>
 
       <!-- 后台任务执行过程：底部执行条“详情”触发，2 秒轮询日志尾部与任务快照。
            多任务时顶部列表切换；元信息行带输出字节心跳，运行中日志只有启动
            标记时给出缓冲管道解释（Select-Object -Last 会攒到进程结束才输出） -->
-      <div v-show="activeTab === 'tasks'" class="rpane active" data-test="bg-task-pane">
+      <div v-show="visualTab === 'tasks'" class="rpane active" data-test="bg-task-pane">
         <div class="bgt-wrap">
           <div v-if="store.currentSessionBackgroundTasks.length > 1" class="bgt-list" data-test="bg-task-list">
             <button
@@ -164,7 +165,7 @@
       </div>
 
       <!-- 子代理执行过程：聊天卡片“查看”触发，1 秒轮询任务阶段历史 -->
-      <div v-show="activeTab === 'subagent'" class="rpane active" data-test="subagent-pane">
+      <div v-show="visualTab === 'subagent'" class="rpane active" data-test="subagent-pane">
         <SubagentPane :active="activeTab === 'subagent'" />
       </div>
       </template>
@@ -274,7 +275,12 @@ watch(() => store.currentSessionName, () => { exitSnipMode(); });
 const isMobile = useIsMobile();
 const panelStyle = computed(() => {
   if (isMobile.value) return {};
-  const style: Record<string, string> = { width: `${store.rightPanelWidth}px` };
+  const style: Record<string, string> = {
+    width: `${store.rightPanelWidth}px`,
+    // 滑入/滑出动画的位移量来源：Transition 的 enter-from 用 calc(-1 * var(--rp-width))
+    // 把面板推到视口右侧外，和 collapsed 的负 margin 是同一套位移
+    '--rp-width': `${store.rightPanelWidth}px`,
+  };
   if (store.rightPanelCollapsed) style.marginRight = `-${store.rightPanelWidth}px`;
   return style;
 });
@@ -288,27 +294,52 @@ const activeTab = computed<RightPanelTabId | ''>(() => {
   return store.rightPanelActiveTab;
 });
 const showPicker = computed(() => !store.rightPanelCollapsed && activeTab.value === '');
+
+// ── 滑出过场期间保持画面 ──
+// 收起时 activeTab 会立刻转 ''（原生表面 hide、轮询停止、切会话的浏览器隔离都靠它），
+// 直接跟着清空会让"滑出"变成一个空面板平移。这里给渲染用的页签加一层缓冲：
+// 收起时先原样保留，等滑出动画（PANEL_SLIDE_MS）跑完再清。
+const PANEL_SLIDE_MS = 240;
+const visualTab = ref<RightPanelTabId | ''>(activeTab.value);
+const visualPicker = ref(showPicker.value);
+let visualClearTimer: number | undefined;
+
+watch([activeTab, showPicker], ([nextTab, nextPicker]) => {
+  window.clearTimeout(visualClearTimer);
+  if (!store.rightPanelCollapsed) {
+    visualTab.value = nextTab;
+    visualPicker.value = nextPicker;
+    return;
+  }
+  // 收起：先原样留住在显示的画面，滑出跑完后再切到真实值（此时已 display:none）
+  visualClearTimer = window.setTimeout(() => {
+    visualTab.value = nextTab;
+    visualPicker.value = nextPicker;
+  }, PANEL_SLIDE_MS);
+}, { immediate: true });
+// 页签高亮跟随渲染用的页签（收起滑出期间保持高亮，不提前熄灭）
 function isActiveTab(tab: RightPanelTabId) {
-  return activeTab.value === tab;
+  return visualTab.value === tab;
 }
 
-// 选择页五张卡（对齐 ZCode 官方侧板）：文件 / Git / 浏览器 / 后台任务 / 子代理；
-// “操控”不进选择页，只在出现过电脑操控 run 后自动切入（设计 16.2）
+// 选择页五张卡（对齐 ZCode 官方侧板）；“操控”不进选择页，只在出现过电脑操控
+// run 后自动切入（设计 16.2）。星名只对应这一个场景（一名一景），页签/卡片统一
+// 用「星名 · 通用名」的写法，新用户第一眼就知道是什么
 const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> = [
   { id: 'files', label: '文件', icon: 'folder' },
   { id: 'git', label: 'Git', icon: 'git-branch' },
-  { id: 'browser', label: '浏览器', icon: 'globe' },
-  { id: 'tasks', label: '后台任务', icon: 'square-terminal' },
-  { id: 'subagent', label: '子代理', icon: 'blocks' }
+  { id: 'browser', label: '星眼 · 浏览器', icon: 'globe' },
+  { id: 'tasks', label: '星港 · 后台任务', icon: 'square-terminal' },
+  { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' }
 ];
 
 const PANE_LABELS: Record<RightPanelTabId, string> = {
   files: '文件',
   git: 'Git',
-  browser: '浏览器',
-  tasks: '后台任务',
+  browser: '星眼 · 浏览器',
+  tasks: '星港 · 后台任务',
   computer: '操控',
-  subagent: '子代理'
+  subagent: '星舰 · 子代理'
 };
 const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
   files: 'folder',
@@ -563,6 +594,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('focus', onWindowFocus);
+  window.clearTimeout(visualClearTimer);
   clearComputerDismissTimer();
   stopTaskOutputPolling();
 });
@@ -575,12 +607,32 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  transition: margin-right 0.25s;
+  transition: margin-right 0.24s cubic-bezier(0.4, 0, 0.2, 1);
   /* 画笔截图覆盖层的定位基准（absolute inset:0 盖住页签条+内容区） */
   position: relative;
 }
 #rightbar.collapsed {
   margin-right: -330px;
+}
+/* 展开/收起都从右侧划入划出：面板是 flex item，靠负 margin 送出视口右侧，
+   占位增减由同一条 margin 过渡带出，不动 width（拖拽调宽仍即时响应）。
+   收起时面板内容由 visualTab/visualPicker 缓冲 PANEL_SLIDE_MS，滑走的是一直
+   看到的那块画面，不会先变空白再平移。 */
+.right-panel-slide-enter-active,
+.right-panel-slide-leave-active {
+  transition: margin-right 0.24s cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: margin-right;
+}
+.right-panel-slide-enter-from,
+.right-panel-slide-leave-to {
+  margin-right: calc(-1 * var(--rp-width, 330px));
+}
+@media (prefers-reduced-motion: reduce) {
+  #rightbar,
+  .right-panel-slide-enter-active,
+  .right-panel-slide-leave-active {
+    transition: none;
+  }
 }
 /* 页签条：多页签并存 + “+”选择页 + 收起按钮；页签过多时横向滚动。
    高度钉死为 38px（+1px 下边框与 #chat-header 的 38px+1px 完全一致），
