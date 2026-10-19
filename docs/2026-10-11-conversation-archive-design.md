@@ -314,3 +314,20 @@ stateDiagram-v2
 
 返回契约：`{ok, count, names, failed: [{name, msg}], sessions, archived_sessions, current_session}`。
 `ok` 表示「**至少**成功一项」而非「全部成功」；一项都没成功时 `names` 为空、`msg` 给出整体原因。
+
+## 附录 C：归档列表按目录分组（2026-10-19 实现）
+
+归档会话攒多之后，扁平列表里同一项目的会话与其它目录混在一起、只剩行尾一行路径小字可辨，找起来很累。
+设置页「会话归档」改为**按 workdir 折叠分组**，纯前端渲染改动，桥接与数据层零变化。
+
+| 层 | 实现要点 |
+| --- | --- |
+| 分组键 | `is_global`（或 `workdir='GLOBAL'`）单独一组；其余按 `workdir` 分组；`workdir` 为空的归入「未关联目录」组 |
+| 组头 | chevron + 目录末级名 + 完整路径（淡色小字，hover 看全路径，用于区分同名目录）+ 会话数徽标 |
+| 组顺序 | 按组内最新归档时间倒序（沿用 `orderedArchivedSessions` 的 `archived_at` 倒序，Map 插入顺序天然满足） |
+| 组内顺序 | 与全局口径一致：`archived_at` 倒序 |
+| 折叠 | 组头整行可点，默认全部展开；收起状态存在组件内 `ref`（设置页组件常驻，切分区回来仍保留） |
+| 批量联动 | 批量模式下组头出现勾选框：未全选则补齐该组，已全选则整组取消；半选态用 `indeterminate` 表达；顶栏「全选」仍按全列表口径 |
+| 分隔线 | 组间一行细分隔线（`.archive-group + .archive-group`），组内末行的下边框沿用既有 `:last-child` 规则去掉 |
+| 兼容 | 行级 `data-test="session-archive-item/restore-btn/delete-btn"` 与两段确认、批量语义全部不变；既有 13 条归档用例零改动通过 |
+
