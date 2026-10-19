@@ -25,7 +25,7 @@
       <!-- 热力图卡片 -->
       <section v-if="heatmap" class="usage-section heatmap-card" aria-label="Token 活动热力图">
         <div class="section-heading">
-          <h2>Token 活动</h2>
+          <h2>Token 活动<span class="heatmap-hint">点格子看当天明细</span></h2>
           <div class="pill-tabs" role="group" aria-label="热力图聚合方式">
             <button
               v-for="option in heatmapModes"
@@ -45,14 +45,17 @@
             :title="column.title || undefined"
             data-test="heatmap-column"
           >
-            <span
+            <button
               v-for="cell in column.cells"
               :key="cell.date"
+              type="button"
               class="heatmap-cell"
-              :class="[`lvl-${cell.level}`, { 'has-usage': cell.level > 0 }]"
+              :class="[`lvl-${cell.level}`, { 'has-usage': cell.level > 0, 'is-selected': isCellSelected(column, cell) }]"
               :title="cell.title"
+              :aria-pressed="isCellSelected(column, cell)"
               data-test="heatmap-cell"
-            ></span>
+              @click="toggleCell(column, cell)"
+            ></button>
           </div>
         </div>
         <div class="heatmap-grid heatmap-months">
@@ -64,6 +67,14 @@
           >{{ label.label }}</span>
         </div>
       </section>
+
+      <!-- 点热力图格子后就地展开的明细：折线排行 + 占比环图 -->
+      <TokenUsageDayDetail
+        v-if="selectionDetail"
+        :detail="selectionDetail"
+        :mode="heatmapMode === 'daily' ? 'day' : 'week'"
+        @close="clearSelection"
+      />
 
       <!-- 范围切换 -->
       <div class="range-row">
@@ -165,8 +176,8 @@
                 fill="none"
                 :stroke="slice.color"
                 stroke-width="16"
-                :stroke-dasharray="donutDashArray(slice)"
-                :stroke-dashoffset="donutDashOffset(slice)"
+                :stroke-dasharray="donutDashArray(slice, DONUT_CIRCUMFERENCE)"
+                :stroke-dashoffset="donutDashOffset(slice, DONUT_CIRCUMFERENCE)"
                 transform="rotate(-90 60 60)"
               />
             </svg>
@@ -197,16 +208,25 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
-import type { DonutSlice, HeatmapMode, LifetimeSummary } from '../utils/tokenStatistics';
+import TokenUsageDayDetail from './TokenUsageDayDetail.vue';
+import type {
+  HeatmapDayCell,
+  HeatmapMode,
+  HeatmapWeekColumn,
+  LifetimeSummary,
+} from '../utils/tokenStatistics';
 import {
   buildDonutSlices,
   buildHeatmapMonthLabels,
   buildHeatmapWeeks,
   buildLifetimeSummary,
   buildLinePath,
+  buildSelectionDetail,
   buildTrendChart,
+  donutDashArray,
+  donutDashOffset,
   formatDayFull,
   formatTokenCount,
 } from '../utils/tokenStatistics';
@@ -238,6 +258,12 @@ const heatmapModes: { value: HeatmapMode; label: string }[] = [
   { value: 'cumulative', label: '累计' },
 ];
 const heatmapMode = ref<HeatmapMode>('daily');
+
+// 选中的热力图格子：daily 模式落到具体一天，weekly / cumulative 模式整列（自然周）为一格。
+const selection = ref<{ columnKey: string; date: string | null } | null>(null);
+
+// 模式切换后列 key 前缀已变，清掉旧选中态，避免留下对不上列的无主明细。
+watch(heatmapMode, () => { selection.value = null; });
 
 // 摘要条：lifetime 快照缺省时统一显示 --。
 const lifetimeItems = computed(() => {
@@ -318,6 +344,39 @@ const donutRows = computed(() => {
   });
 });
 
+// 点选明细：日期集合取自选中的格子（单日一格 / 整列 7 天），明细数据来自 365 天快照，
+// 热力图窗口本身也是 52 周，所以点击不会触达快照范围外。
+const selectionDetail = computed(() => {
+  const current = selection.value;
+  if (!current) return null;
+  const column = (heatmap.value?.columns ?? []).find(item => item.key === current.columnKey);
+  if (!column) return null;
+  const dates = current.date ? [current.date] : column.cells.map(cell => cell.date);
+  return buildSelectionDetail(store.tokenStatisticsLifetime?.days ?? [], dates);
+});
+
+function isCellSelected(column: HeatmapWeekColumn, cell: HeatmapDayCell) {
+  const current = selection.value;
+  if (!current || current.columnKey !== column.key) return false;
+  return current.date === null || current.date === cell.date;
+}
+
+function toggleCell(column: HeatmapWeekColumn, cell: HeatmapDayCell) {
+  const next = {
+    columnKey: column.key,
+    date: heatmapMode.value === 'daily' ? cell.date : null,
+  };
+  const current = selection.value;
+  const same = Boolean(
+    current && current.columnKey === next.columnKey && current.date === next.date,
+  );
+  selection.value = same ? null : next;
+}
+
+function clearSelection() {
+  selection.value = null;
+}
+
 function trendColumnX(index: number) {
   return TREND_PAD_LEFT + index * trendBandWidth.value;
 }
@@ -330,15 +389,6 @@ function showAxisLabel(index: number) {
 // 趋势列 title 用「9月22日」这种不含年份的中文短日期。
 function dayLabel(date: string) {
   return formatDayFull(date).replace(/^\d{4}年/, '');
-}
-
-function donutDashArray(slice: DonutSlice) {
-  const length = (slice.endRatio - slice.startRatio) * DONUT_CIRCUMFERENCE;
-  return `${length.toFixed(2)} ${DONUT_CIRCUMFERENCE.toFixed(2)}`;
-}
-
-function donutDashOffset(slice: DonutSlice) {
-  return (-slice.startRatio * DONUT_CIRCUMFERENCE).toFixed(2);
 }
 
 function formatShare(share: number) {
@@ -393,7 +443,9 @@ onMounted(() => {
 /* 热力图：52 列 × 7 格 */
 .heatmap-grid { display: grid; grid-template-columns: repeat(52, minmax(0, 1fr)); column-gap: 3px; margin-top: 14px; }
 .heatmap-col { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.heatmap-cell { width: 100%; min-width: 0; aspect-ratio: 1; border: 1px solid transparent; border-radius: 3px; transition: transform .15s ease; }
+/* 格子按 button 渲染（键盘可达），清掉默认外观后按原尺寸绘制 */
+.heatmap-cell { width: 100%; min-width: 0; aspect-ratio: 1; padding: 0; border: 1px solid transparent; border-radius: 3px; background: none; appearance: none; cursor: pointer; transition: transform .15s ease; }
+.heatmap-cell.is-selected { box-shadow: 0 0 0 2px var(--accent); transform: scale(1.15); }
 .heatmap-cell.has-usage { border-color: var(--border); }
 .heatmap-cell:hover { transform: scale(1.15); }
 .heatmap-cell.lvl-0 { background: var(--bg3); }
@@ -401,6 +453,7 @@ onMounted(() => {
 .heatmap-cell.lvl-2 { background: color-mix(in srgb, var(--accent) 42%, var(--bg2)); }
 .heatmap-cell.lvl-3 { background: color-mix(in srgb, var(--accent) 64%, var(--bg2)); }
 .heatmap-cell.lvl-4 { background: color-mix(in srgb, var(--accent) 88%, var(--bg2)); }
+.heatmap-hint { margin-left: 8px; color: var(--text-faint); font-size: 11px; font-weight: 500; }
 .heatmap-months { margin-top: 10px; }
 .heatmap-month { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-faint); font-size: 10px; }
 

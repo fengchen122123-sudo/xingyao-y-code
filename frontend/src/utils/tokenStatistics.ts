@@ -1,6 +1,10 @@
 // 星瑶 Token 统计可视化的纯计算工具：色板、热力图、趋势折线、环图切片、累计摘要与日期格式化。
 // 组件只负责渲染，所有分级、聚合与格式化逻辑集中在这里，便于单元测试。
-import type { TokenStatisticsDay, TokenStatisticsModel } from '../types/pywebview';
+import type {
+  TokenStatisticsDay,
+  TokenStatisticsMetrics,
+  TokenStatisticsModel,
+} from '../types/pywebview';
 
 const DAY_MS = 86_400_000;
 const HEATMAP_DAYS_PER_WEEK = 7;
@@ -411,6 +415,183 @@ export function buildLifetimeSummary(days: TokenStatisticsDay[]): LifetimeSummar
   }
 
   return { totalTokens, peakDay, activeDays, currentStreak, longestStreak };
+}
+
+// ---------------------------------------------------------------------------
+// 选中日期明细（热力图点开的单日 / 单周）
+// ---------------------------------------------------------------------------
+
+const SELECTION_METRIC_FIELDS = [
+  'prompt', 'completion', 'cached', 'cache_prompt', 'total', 'requests',
+] as const;
+
+export interface SelectionDetail extends TokenStatisticsMetrics {
+  dates: string[];
+  title: string;
+  models: TokenStatisticsModel[];
+}
+
+function emptyMetrics(): TokenStatisticsMetrics {
+  return {
+    prompt: 0, completion: 0, cached: 0, cache_prompt: 0, total: 0, requests: 0,
+    cache_hit_rate: null,
+  };
+}
+
+// 单日单模型自带 cache_hit_rate，跨模型、跨天聚合后必须按合计数重算。
+function withCacheHitRate<T extends TokenStatisticsMetrics>(metrics: T): T {
+  const rate = metrics.cache_prompt > 0
+    ? Math.round((metrics.cached / metrics.cache_prompt) * 1000) / 10
+    : null;
+  return { ...metrics, cache_hit_rate: rate };
+}
+
+export function formatDayMonthDay(date: string): string {
+  const parsed = parseUtcDate(date);
+  if (!parsed) return date;
+  return `${parsed.getUTCMonth() + 1}月${parsed.getUTCDate()}日`;
+}
+
+export function buildSelectionTitle(dates: string[]): string {
+  const first = dates[0] ?? '';
+  const last = dates[dates.length - 1] ?? '';
+  if (!last || first === last) return formatDayFull(first);
+  // 同年只留「9月21日 - 9月22日」，跨年才补年份，避免标题过长。
+  const sameYear = first.slice(0, 4) === last.slice(0, 4);
+  const format = sameYear ? formatDayMonthDay : formatDayFull;
+  return `${format(first)} - ${format(last)}`;
+}
+
+/** 把选中的日期集合（单日格 1 个、周聚合格 7 个）聚合成一行合计 + 按总量降序的模型列表。 */
+export function buildSelectionDetail(
+  days: TokenStatisticsDay[],
+  dates: string[],
+): SelectionDetail | null {
+  const wanted = Array.from(
+    new Set((dates ?? []).filter(date => typeof date === 'string' && date)),
+  ).sort();
+  if (wanted.length === 0) return null;
+
+  const daysByDate = new Map<string, TokenStatisticsDay>();
+  for (const day of days ?? []) {
+    if (day && typeof day.date === 'string') daysByDate.set(day.date, day);
+  }
+
+  const totals = emptyMetrics();
+  const modelTotals = new Map<string, TokenStatisticsModel>();
+  for (const date of wanted) {
+    const day = daysByDate.get(date);
+    if (!day) continue;
+    for (const field of SELECTION_METRIC_FIELDS) totals[field] += Number(day[field]) || 0;
+    for (const model of day.models ?? []) {
+      const key = typeof model?.key === 'string' ? model.key : '';
+      if (!key) continue;
+      let current = modelTotals.get(key);
+      if (!current) {
+        current = {
+          key,
+          provider: model.provider ?? '',
+          model: model.model ?? '',
+          ...emptyMetrics(),
+        };
+        modelTotals.set(key, current);
+      }
+      for (const field of SELECTION_METRIC_FIELDS) current[field] += Number(model[field]) || 0;
+    }
+  }
+
+  const models = Array.from(modelTotals.values())
+    .map(withCacheHitRate)
+    .sort((a, b) => (b.total - a.total) || a.key.localeCompare(b.key));
+
+  return { dates: wanted, title: buildSelectionTitle(wanted), ...withCacheHitRate(totals), models };
+}
+
+// ---------------------------------------------------------------------------
+// 模型用量排行折线（横轴 = 按总量降序的模型，三条序列：总量 / 输入 / 输出）
+// ---------------------------------------------------------------------------
+
+export const RANKING_MAX_MODELS = 6;
+const RANKING_LABEL_MAX_LENGTH = 12;
+
+export type RankingSeriesKey = 'total' | 'prompt' | 'completion';
+
+export interface RankingSeries {
+  key: RankingSeriesKey;
+  label: string;
+  color: string;
+  values: number[];
+  path: string;
+}
+
+export interface RankingChart {
+  labels: string[];
+  fullLabels: string[];
+  series: RankingSeries[];
+  maxValue: number;
+  hasData: boolean;
+}
+
+const RANKING_SERIES_DEFINITIONS: { key: RankingSeriesKey; label: string; color: string }[] = [
+  { key: 'total', label: '总量', color: seriesColor(0) },
+  { key: 'prompt', label: '输入', color: seriesColor(1) },
+  { key: 'completion', label: '输出', color: seriesColor(2) },
+];
+
+function truncateModelLabel(name: string): string {
+  const label = String(name ?? '');
+  return label.length > RANKING_LABEL_MAX_LENGTH
+    ? `${label.slice(0, RANKING_LABEL_MAX_LENGTH - 1)}…`
+    : label;
+}
+
+export function buildRankingChart(
+  models: TokenStatisticsModel[],
+  width: number,
+  height: number,
+): RankingChart {
+  const ranked = (models ?? [])
+    .filter(model => Number(model?.total) > 0)
+    .sort((a, b) => (Number(b.total) - Number(a.total)) || a.key.localeCompare(b.key))
+    .slice(0, RANKING_MAX_MODELS);
+  const fullLabels = ranked.map(model => model.model || model.key);
+  if (ranked.length === 0) {
+    return { labels: [], fullLabels: [], series: [], maxValue: 0, hasData: false };
+  }
+
+  let maxValue = 0;
+  for (const model of ranked) {
+    for (const definition of RANKING_SERIES_DEFINITIONS) {
+      maxValue = Math.max(maxValue, Number(model[definition.key]) || 0);
+    }
+  }
+  const series = RANKING_SERIES_DEFINITIONS.map(definition => {
+    const values = ranked.map(model => Number(model[definition.key]) || 0);
+    return {
+      ...definition,
+      values,
+      // 单个模型时没有连线，组件只画数据点。
+      path: values.length >= 2 ? buildLinePath(values, width, height, maxValue) : '',
+    };
+  });
+
+  return {
+    labels: fullLabels.map(truncateModelLabel),
+    fullLabels,
+    series,
+    maxValue,
+    hasData: maxValue > 0,
+  };
+}
+
+// 环图弧段：主统计页与当日明细共用，避免两份同样的字符串拼接。
+export function donutDashArray(slice: DonutSlice, circumference: number): string {
+  const length = (slice.endRatio - slice.startRatio) * circumference;
+  return `${length.toFixed(2)} ${circumference.toFixed(2)}`;
+}
+
+export function donutDashOffset(slice: DonutSlice, circumference: number): string {
+  return (-slice.startRatio * circumference).toFixed(2);
 }
 
 export function formatTokenCount(value: number): string {

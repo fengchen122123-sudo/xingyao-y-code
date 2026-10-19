@@ -4,11 +4,15 @@ import type { TokenStatisticsDay, TokenStatisticsModel } from '../types/pywebvie
 import type { HeatmapWeekColumn } from './tokenStatistics';
 import {
   CHART_SERIES_COLORS,
+  RANKING_MAX_MODELS,
   buildDonutSlices,
   buildHeatmapMonthLabels,
   buildHeatmapWeeks,
   buildLifetimeSummary,
   buildLinePath,
+  buildRankingChart,
+  buildSelectionDetail,
+  buildSelectionTitle,
   buildTrendChart,
   formatDayFull,
   formatDayShort,
@@ -370,5 +374,155 @@ describe('日期格式化与 token 计数', () => {
     expect(formatTokenCount(3_400_000)).toBe('3.4M');
     expect(formatTokenCount(2_000_000_000)).toBe('2B');
     expect(formatTokenCount(0)).toBe('0');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 热力图点选明细
+// ---------------------------------------------------------------------------
+
+function modelMetrics(
+  key: string,
+  prompt: number,
+  completion: number,
+  cached = 0,
+  cachePrompt = 0,
+  requests = 1,
+): TokenStatisticsModel {
+  return {
+    key,
+    provider: 'test-provider',
+    model: key,
+    prompt,
+    completion,
+    cached,
+    cache_prompt: cachePrompt,
+    total: prompt + completion,
+    requests,
+    cache_hit_rate: null,
+  };
+}
+
+const modelA = modelMetrics('alpha/flash', 180, 40, 100, 200, 2);
+const modelB = modelMetrics('beta/max', 70, 10, 30, 80, 1);
+
+describe('buildSelectionDetail', () => {
+  // 日级字段与模型合计保持一致（真实后端快照就是这么来的）。
+  const dayOne: TokenStatisticsDay = {
+    date: '2026-09-22',
+    prompt: 250,
+    completion: 50,
+    cached: 130,
+    cache_prompt: 280,
+    total: 300,
+    requests: 3,
+    cache_hit_rate: null,
+    models: [modelA, modelB],
+  };
+  const dayTwo = makeDay('2026-09-21', 120, 1, [modelMetrics('alpha/flash', 100, 20, 50, 100, 1)]);
+
+  it('单日只取当天，模型按总量降序并重算命中率', () => {
+    const detail = buildSelectionDetail([dayOne, dayTwo], ['2026-09-22']);
+
+    expect(detail).not.toBeNull();
+    expect(detail!.title).toBe('2026年9月22日');
+    expect(detail!.dates).toEqual(['2026-09-22']);
+    expect(detail!.total).toBe(300);
+    expect(detail!.requests).toBe(3);
+    expect(detail!.models.map(model => model.key)).toEqual(['alpha/flash', 'beta/max']);
+    // 130 / 280 ≈ 46.4%，聚合后的命中率必须按合计数重算。
+    expect(detail!.cache_hit_rate).toBe(46.4);
+    expect(detail!.models[0].total).toBe(220);
+  });
+
+  it('多日按模型 key 合并，标题用同年省略年份的中文区间', () => {
+    const detail = buildSelectionDetail([dayOne, dayTwo], ['2026-09-22', '2026-09-21']);
+
+    expect(detail!.title).toBe('9月21日 - 9月22日');
+    expect(detail!.total).toBe(420);
+    expect(detail!.models).toHaveLength(2);
+    const merged = detail!.models.find(model => model.key === 'alpha/flash')!;
+    expect(merged.total).toBe(340);
+    expect(merged.requests).toBe(3);
+    expect(merged.cache_hit_rate).toBe(50);
+  });
+
+  it('没有命中的日期返回 0 合计与空模型列表', () => {
+    const detail = buildSelectionDetail([dayOne], ['2026-01-01']);
+
+    expect(detail).not.toBeNull();
+    expect(detail!.total).toBe(0);
+    expect(detail!.models).toEqual([]);
+    expect(detail!.cache_hit_rate).toBeNull();
+  });
+
+  it('空日期集合返回 null', () => {
+    expect(buildSelectionDetail([dayOne], [])).toBeNull();
+    expect(buildSelectionDetail([dayOne], ['', ''])).toBeNull();
+  });
+});
+
+describe('buildSelectionTitle', () => {
+  it('跨年日期保留年份', () => {
+    expect(buildSelectionTitle(['2025-12-31', '2026-01-01'])).toBe('2025年12月31日 - 2026年1月1日');
+    expect(buildSelectionTitle(['2026-09-22'])).toBe('2026年9月22日');
+  });
+});
+
+describe('buildRankingChart', () => {
+  it('按总量降序截断，输出总量/输入/输出三条序列', () => {
+    const models = [
+      modelMetrics('c', 10, 5),
+      modelMetrics('a', 200, 40),
+      modelMetrics('b', 50, 10),
+    ];
+    const chart = buildRankingChart(models, 400, 160);
+
+    expect(chart.hasData).toBe(true);
+    expect(chart.labels).toEqual(['a', 'b', 'c']);
+    expect(chart.series.map(series => series.key)).toEqual(['total', 'prompt', 'completion']);
+    expect(chart.series.map(series => series.color)).toEqual([
+      seriesColor(0), seriesColor(1), seriesColor(2),
+    ]);
+    expect(chart.series[0].values).toEqual([240, 60, 15]);
+    expect(chart.series[1].values).toEqual([200, 50, 10]);
+    expect(chart.maxValue).toBe(240);
+    expect(chart.series[0].path.startsWith('M ')).toBe(true);
+  });
+
+  it('单个模型没有连线，只留数据点', () => {
+    const chart = buildRankingChart([modelMetrics('only', 10, 2)], 400, 160);
+
+    expect(chart.labels).toEqual(['only']);
+    expect(chart.series.every(series => series.path === '')).toBe(true);
+    expect(chart.series[0].values).toEqual([12]);
+  });
+
+  it(`最多保留 ${RANKING_MAX_MODELS} 个模型，零用量模型不参与`, () => {
+    const models = [
+      modelMetrics('zero', 0, 0),
+      ...Array.from({ length: 8 }, (_, index) => modelMetrics(`m${index}`, 100 - index, 0)),
+    ];
+    const chart = buildRankingChart(models, 400, 160);
+
+    expect(chart.labels).toHaveLength(RANKING_MAX_MODELS);
+    expect(chart.labels[0]).toBe('m0');
+    expect(chart.labels).not.toContain('zero');
+  });
+
+  it('长模型名截断到 12 字符', () => {
+    const chart = buildRankingChart([modelMetrics('a-very-long-model-name', 10, 0)], 400, 160);
+
+    expect(chart.labels[0]).toHaveLength(12);
+    expect(chart.labels[0].endsWith('…')).toBe(true);
+    expect(chart.fullLabels[0]).toBe('a-very-long-model-name');
+  });
+
+  it('全零用量为空态', () => {
+    const chart = buildRankingChart([modelMetrics('zero', 0, 0)], 400, 160);
+
+    expect(chart.hasData).toBe(false);
+    expect(chart.series).toEqual([]);
+    expect(chart.maxValue).toBe(0);
   });
 });
