@@ -120,7 +120,7 @@
 
         <!-- 流式生成中的实时速度指示胶囊 -->
         <div v-else-if="isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
-          <AppIcon name="zap" :size="12" class="zap-pulse" />
+          <AppIcon name="orbit" :size="12" class="zap-pulse" />
           <span>{{ liveSpeedText }}</span>
         </div>
 
@@ -132,7 +132,7 @@
           data-test="msg-metrics"
         >
           <span v-if="msg.metrics.token_speed" class="metric-item">
-            <AppIcon name="zap" :size="12" class="metric-icon" />
+            <AppIcon name="orbit" :size="12" class="metric-icon" />
             <span class="metric-val">{{ msg.metrics.token_speed }}</span> t/s
           </span>
           <span v-if="msg.metrics.token_speed && msg.metrics.duration_s" class="metric-sep">·</span>

@@ -4,10 +4,14 @@
   <div class="exec-trace">
     <p class="sr-only" aria-live="polite">{{ title }}</p>
     <ToolExecutionRow
-      v-for="row in rows"
+      v-for="(row, index) in rows"
       :key="row.id"
       :row="row"
       :elapsed-ms="activeElapsedMs"
+      :class="{
+        'trace-first': index === 0,
+        'trace-last': index === rows.length - 1,
+      }"
     />
   </div>
 </template>
@@ -89,8 +93,9 @@ const activeElapsedMs = computed(() => {
 .exec-trace {
   display: flex;
   flex-direction: column;
-  margin: 6px 0;
+  margin: 4px 0 6px;
 }
+
 /* 无障碍播报专用：视觉隐藏但仍在可访问树里 */
 .sr-only {
   position: absolute;

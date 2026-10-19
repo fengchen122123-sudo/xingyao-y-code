@@ -2321,6 +2321,8 @@ function getFolderTitle(g: SessionGroup) {
   justify-content: center;
   padding: 7px;
   gap: 0;
+  /* 圆角拉满成正圆（32×32 方形热区），与顶栏图标按钮同口径 */
+  border-radius: 50%;
 }
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
 .footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

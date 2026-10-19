@@ -15,8 +15,18 @@
       @keydown.enter.prevent="onLineClick"
       @keydown.space.prevent="onLineClick"
     >
-      <span class="trace-icon" aria-hidden="true">
-        <AppIcon :name="rowIcon" :size="13" :stroke-width="2" />
+      <!-- 星轨节点：类别色圆点串在一条轨道线上，运行中自带扩散光环；
+           失败/取消时圆点换成状态图标，整行仍是同一颗节点 -->
+      <span class="trace-icon" :class="nodeToneClass" aria-hidden="true">
+        <AppIcon
+          v-if="nodeMark"
+          :name="nodeMark"
+          :size="11"
+          :stroke-width="2.4"
+          class="trace-node-mark"
+        />
+        <span v-else class="trace-node-dot" />
+        <span v-if="row.status === 'running'" class="trace-node-pulse" />
       </span>
       <span class="trace-kind" :class="{ 'is-live': row.status === 'running' }">{{ kindLabel }}</span>
       <span v-if="targetText" class="trace-target" :title="targetText">{{ targetText }}</span>
@@ -102,15 +112,15 @@ function onLineClick() {
   rowOpen.value = !rowOpen.value;
 }
 
-// ZCode 形态：图标表达工具类别，只有失败/取消才切成状态图标
-const KIND_ICONS: Record<ToolTraceRow['kind'], string> = {
-  'read-group': 'file',
+// 轨道节点按工具类别取色（颜色在 scoped 样式里映射到语义 token）
+const NODE_TONES: Record<ToolTraceRow['kind'], string> = {
+  'read-group': 'read',
   'search-group': 'search',
-  command: 'square-terminal',
-  mutation: 'pencil',
-  skill: 'gem',
-  tool: 'box',
-  'legacy-diffs': 'layers',
+  command: 'command',
+  mutation: 'mutation',
+  skill: 'skill',
+  tool: 'tool',
+  'legacy-diffs': 'legacy',
 };
 const KIND_LABELS: Record<ToolTraceRow['kind'], string> = {
   'read-group': '读取',
@@ -123,10 +133,13 @@ const KIND_LABELS: Record<ToolTraceRow['kind'], string> = {
 };
 
 const kindLabel = computed(() => KIND_LABELS[props.row.kind] ?? '工具');
-const rowIcon = computed(() => {
+const nodeToneClass = computed(() => `node-${NODE_TONES[props.row.kind] ?? 'tool'}`);
+
+// 只有失败/取消把圆点换成状态图标，其余状态一律是类别色圆点
+const nodeMark = computed(() => {
   if (props.row.status === 'failed') return 'x';
   if (props.row.status === 'cancelled') return 'ban';
-  return KIND_ICONS[props.row.kind] ?? 'circle';
+  return '';
 });
 
 function formatDuration(ms: number): string {
@@ -303,7 +316,7 @@ function diffLineClass(line: string) {
 <style scoped>
 /* 每条工具 = 一行摘要（无边框无底色，宽度贴合内容）+ 按需展开的缩进详情 */
 .trace-row {
-  margin: 1px 0;
+  margin: 0;
 }
 .trace-line {
   display: flex;
@@ -311,8 +324,7 @@ function diffLineClass(line: string) {
   gap: 8px;
   width: fit-content;
   max-width: 100%;
-  padding: 3px 6px 3px 4px;
-  margin-left: -4px;
+  padding: 3px 8px 3px 0;
   border-radius: 6px;
   font-size: 12.5px;
   color: var(--text-faint);
@@ -334,18 +346,85 @@ function diffLineClass(line: string) {
 .trace-caret.is-open {
   opacity: 1;
 }
+/* 节点列：固定 18px 宽，圆点居中落在轨道线上 */
 .trace-icon {
+  position: relative;
   flex: none;
+  width: 18px;
+  height: 18px;
   display: inline-flex;
   align-items: center;
-  color: var(--text-faint);
+  justify-content: center;
+  color: var(--text-dim);
 }
-.status-failed .trace-icon {
-  color: var(--red);
+/* 轨道线：贯穿摘要行高度，相邻行首尾相接成为一条连续竖线；
+   首行从节点中心起、末行到节点中心止，线不会伸出整组两端 */
+.trace-icon::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: -3px;
+  bottom: -3px;
+  width: 1px;
+  margin-left: -0.5px;
+  background: var(--border);
 }
-.status-cancelled .trace-icon {
-  color: var(--orange);
+.trace-row.trace-first .trace-icon::before {
+  top: 50%;
 }
+.trace-row.trace-last .trace-icon::before {
+  bottom: 50%;
+}
+/* 类别色：读取蓝 / 搜索青 / 运行绿 / 编辑橙 / 技能紫 / 通用灰 / 历史变更黄 */
+.trace-icon.node-read { color: var(--accent); }
+.trace-icon.node-search { color: var(--cyan); }
+.trace-icon.node-command { color: var(--green); }
+.trace-icon.node-mutation { color: var(--orange); }
+.trace-icon.node-skill { color: var(--purple); }
+.trace-icon.node-tool { color: var(--text-dim); }
+.trace-icon.node-legacy { color: var(--yellow); }
+.status-failed .trace-icon { color: var(--red); }
+.status-cancelled .trace-icon { color: var(--orange); }
+/* 节点圆点：当前色实心点，完成/取消后收一点透明度，运行中保持满亮 */
+.trace-node-dot {
+  position: relative;
+  z-index: 1;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.status-completed .trace-node-dot {
+  opacity: 0.55;
+}
+/* 运行中：圆点外圈持续扩散的脉冲光环（替代文字扫光） */
+.trace-node-pulse {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin: -3px 0 0 -3px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: trace-node-pulse 2s ease-out infinite;
+  pointer-events: none;
+}
+@keyframes trace-node-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.4;
+  }
+  70%,
+  100% {
+    transform: scale(2.8);
+    opacity: 0;
+  }
+}
+.trace-node-mark {
+  position: relative;
+  z-index: 1;
+} 
 /* 运行中不转圈：图标保持静态，状态交给扫光标签与行尾耗时 */
 .trace-kind {
   flex: none;
@@ -354,16 +433,7 @@ function diffLineClass(line: string) {
   color: var(--text-dim);
 }
 .trace-kind.is-live {
-  background: linear-gradient(90deg, var(--text-faint) 0%, var(--text) 45%, var(--text-faint) 90%);
-  background-size: 220% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: trace-shimmer 2.4s linear infinite;
-}
-@keyframes trace-shimmer {
-  from { background-position: 120% 0; }
-  to { background-position: -120% 0; }
+  color: var(--text-bright);
 }
 .trace-target {
   min-width: 0;
@@ -425,10 +495,10 @@ function diffLineClass(line: string) {
   transform: rotate(90deg);
 }
 
-/* 展开区：左 1px 细线 + 缩进 + 弱灰，与思考块同一套语言 */
+/* 展开区：左侧细线与轨道线同一条竖线（9px 处），视觉上属于同一个节点 */
 .trace-detail {
-  margin: 2px 0 6px 8px;
-  padding: 4px 0 4px 12px;
+  margin: 0 0 4px 9px;
+  padding: 2px 0 6px 13px;
   border-left: 1px solid var(--border);
   font-size: 12px;
   color: var(--text-faint);
@@ -559,10 +629,9 @@ function diffLineClass(line: string) {
   color: var(--text);
 }
 @media (prefers-reduced-motion: reduce) {
-  .trace-kind.is-live {
+  .trace-node-pulse {
     animation: none;
-    background: none;
-    color: var(--text-dim);
+    opacity: 0.25;
   }
 }
 </style>
