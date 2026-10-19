@@ -50,6 +50,20 @@ it('面板折叠时对应手柄隐藏，展开后恢复', async () => {
   wrapper.unmount();
 });
 
+// 右侧面板必须走 right-panel-slide 过场：v-show 单独使用时 display: none 与
+// margin 在同一帧切换，负 margin 的过渡来不及生效，面板会"直接出现"
+it('右侧面板套在 right-panel-slide 过场里', () => {
+  const store = useAppStore();
+  store.initialized = true;
+  const wrapper = mount(App, { global: { stubs } });
+
+  const slides = wrapper
+    .findAllComponents({ name: 'Transition' })
+    .filter(item => item.props('name') === 'right-panel-slide');
+  expect(slides).toHaveLength(1);
+  wrapper.unmount();
+});
+
 // ── 电脑操控安全条接线（Task 13b，设计 16.1 / 16.4） ──
 
 it('电脑操控安全条渲染在聊天标题栏下方，idle 时不渲染', async () => {
