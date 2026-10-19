@@ -182,3 +182,66 @@ KAIROS 系统是星瑶的跨会话长期记忆核，保证大模型能够进行�
 - 物理删除桌面快捷方式，从环境变量 `PATH` 移除安装目录并向全局广播。
 - 弹出选项供用户选择是否彻底抹除用户目录下的 `.ycode` 文件夹（会话数据库与模型配置）。
 - **自销毁命令行设计**：进程退出前拉起一个独立的 cmd choice 命令，在 1 秒后强制静默删除当前正在运行 of `ycode_uninstall.exe` 并清空删除原安装文件夹，做到 0 残留。
+
+---
+
+## 🧩 九、对话可操作系统管理工具（2026-10-19）
+
+此前有一批功能只能「在 GUI 设置页点按钮」或「在 CLI 敲斜杠命令」，Agent 侧没有任何出口。本轮新增 **21 个管理类 Agent 工具**，把这些手点操作变成可以直接对话完成。全部工具在 `core/tool_registry.py` 的 `build_default_registry()` 中通过 `admin_specs` 段注册（`from core import tools_admin_*` + 各模块 `build_specs()`），按域分模块实现。注册表条目由 50 增至 71（本机已装插件的口径；新增的 21 个为内置工具）。
+
+### 1. 会话与上下文（`core/tools_admin_session.py`）
+
+- **`session_manage`**：`list` / `create` / `rename` / `delete` / `archive` / `unarchive` / `move_workdir` / `clear_history` / `compress` / `checkpoint_list` / `checkpoint_restore` / `undo_list` / `undo_preview` / `undo_recover`
+  - 覆盖原来的：会话列表的重命名、删除、归档/取消归档、迁移工作目录、新建会话，CLI 的 `/compress`、`/clear-history`、`/checkpoint`，以及 GUI 的撤销记录列表/预览/崩溃恢复面板。
+  - 删除会话、清空历史不可恢复，执行前需确认目标会话；`undo_recover` 用于收尾被中断的撤销操作。
+
+### 2. 模型与供应商（`core/tools_admin_model.py`）
+
+- **`model_manage`**：`list_providers` / `list_models` / `add_provider` / `add_preset_provider` / `update_provider` / `delete_provider` / `add_model` / `update_model` / `delete_model` / `set_active` / `set_reasoning` / `test` / `fetch_models`
+  - 覆盖原来的：`/models` 全屏表单与设置页模型页的全部增删改、切换活动模型、思考档位、连通性测试、从服务商拉取模型列表。
+  - API Key 仍沿用既有加密存储链路，工具只写不回显；`computer_protocol` 等字段沿用原校验规则。
+
+### 3. 技能、插件与 Hook（`core/tools_admin_skill.py`）
+
+- **`skill_manage`**：`list` / `enable` / `disable` / `refresh` / `restore`（替代 `/skills` 的勾选启停、重新扫描与「恢复随包内置版本」）。
+- **`plugin_manage`**：`list` / `enable` / `disable` / `settings_get` / `settings_action`（替代插件页启停与插件设置页的读取/动作执行）。
+- **`hook_manage`**：`list` / `save` / `delete` / `set_disabled`（替代 Hooks 页的增删改与停用开关，支持用户级与项目级）。
+- 边界：这三个工具**不提供** trust/grant/deny/revoke；未信任的插件无法通过工具启用，hook 由模型写入后也仍需用户在交互终端自行信任才会执行，信任状态只在 `list` 结果中原样透出。
+
+### 4. 运维与诊断（`core/tools_admin_ops.py`）
+
+- **`usage_stats`**：按 1 / 7 / 30 / 365 天汇总 token 用量、各模型维度与缓存命中率（只读），用于回答「这个月花了多少」。
+- **`session_export`**：把指定会话（默认当前）导出为 md / html / json，返回真实文件路径。
+- **`update_manage`**：`check` / `download` / `cancel` / `install` / `cleanup`（替代更新按钮与 `/update` 流程）。
+- **`system_settings`**：`get` / `set`，仅限 `command_shell`（默认命令解释器）、`turn_step_limit`（单任务最大轮次）、`search_exclude_dirs`、`ai_output_dir`；权限模式、沙箱与命令白名单被显式拒绝。
+- **`diagram_manage`**：`export` / `list` / `open`（Mermaid 代码块导出 HTML、列最近图表、用默认浏览器打开），补上 `/diagram` 的预览入口。
+- **`doctor_run`**：聚合自检（环境、配置、凭据、数据目录、数据库、MCP、模型端点、GUI 运行时），`json_output=True` 返回结构化结果，与 `/doctor` 等价。
+
+### 5. 外观与人设（`core/tools_admin_look.py`）
+
+- **`theme_manage`**：`list` / `get` / `active` / `activate` / `save` / `copy` / `rename` / `delete` / `import` / `export` / `read_asset`，覆盖 GUI 主题的切换、编辑保存、复制、重命名、删除、ZIP 导入导出与图片资源读取。内置主题只能启用或复制，不能编辑/删除；删除活动主题会被拒绝；导入导出使用传入的本地路径，不弹文件选择框。
+- **`persona_manage`**：`get` / `set`，读写智能体名称、自定义人设正文与对用户的称呼，改动写入本地人设配置并在后续对话的系统提示词中生效（无需重启）。
+
+### 6. 外部集成与协作（`core/tools_admin_integration.py`）
+
+- **`feishu_manage`**：`get` / `set` / `test` / `status`（飞书集成配置、连通性测试与运行状态）。
+- **`lan_manage`**：`status` / `start` / `stop`（局域网手机远程服务的启停与状态）。
+- **`decision_manage`**：`get` / `set` / `probe` / `scenes` / `set_scene`（决策模型配置与探针；场景为 `router` / `secretary` / `search` / `safety`，三态 `off` / `shadow` / `live`）。
+
+### 7. 交互面板与屏幕（`core/tools_admin_interaction.py`）
+
+- **`pty_manage`**：`ensure` / `write` / `resize` / `kill` / `state`，让需要 TTY 的程序（交互式脚手架、分页器、登录提示）也能由 Agent 驱动，`execute_command` 的非交互子进程不再是唯一选择。
+- **`browser_pane`**：`open` / `close` / `navigate` / `back` / `forward` / `reload` / `state` / `set_bounds`，内嵌浏览器面板从「必须用户先开启」变成可对话开合、导航与调整位置尺寸。
+- **`screenshot_capture`**：`mode=full`（含多显示器）/ `mode=region`（指定矩形）截取桌面并存盘，返回真实文件路径。
+- **`clipboard_image`**：`read` / `save`，把剪贴板中的图片落盘为文件，可直接作为后续输入。
+- **`computer_control`**：`status` / `pause` / `resume` / `stop` / `browser`，补齐电脑操控的运行状态查看、暂停恢复、紧急停止与可用浏览器查看；不提供权限档位或信任类操作。
+
+### 8. 明确的非目标
+
+工具化不等于「全部功能都能对话完成」，以下仍是刻意保留的边界：
+
+- **权限档位、沙箱开关、命令白名单**：属用户侧授权模型，`system_settings` 显式拒绝，只能由用户在界面/CLI 修改。
+- **Hook 与插件的信任授予**：信任是对本机命令执行的授权，必须由人确认，三个管理工具只做配置与启停。
+- **免责声明确认**：合规交互，不应由 Agent 代劳。
+- **窗口最小化/最大化/关闭、侧栏分组排序、消息导航**：纯界面交互，无工具化价值。
+- **尚未补齐**：会话消息排队（`/queue`）、附件拖拽上传仍无对应工具；主题实时预览仍需 GUI。

@@ -136,6 +136,17 @@ def build_default_registry() -> ToolRegistry:
         plan_write,
     )
 
+    # 管理类工具（21 个）：各模块自带 build_specs() 提供 ToolSpec 契约，
+    # 注册表只做装配与分组，不在此重复定义任何工具或实现；模块内部执行逻辑
+    # 一律函数内惰性导入，注册阶段仅构造 ToolSpec 对象，不触发扫描/网络/写盘。
+    from core import tools_admin_integration
+    from core import tools_admin_interaction
+    from core import tools_admin_look
+    from core import tools_admin_model
+    from core import tools_admin_ops
+    from core import tools_admin_session
+    from core import tools_admin_skill
+
     # side_effect_scope 归类依据《03-工具调度拓扑化设计规格》3.2 取值表
     # （none / workspace / git / network / system）；表未覆盖的工具按语义归类，
     # 行尾注释说明理由。该字段 v1 不参与调度决策，仅为契约元数据。
@@ -1026,7 +1037,29 @@ def build_default_registry() -> ToolRegistry:
             side_effect_scope="system",  # 表未覆盖：切换当前会话与界面视图
         ),
     ]
-    registry = ToolRegistry([*read_specs, *mutating_specs])
+
+    # ── 管理类工具（21 个）─────────────────────────────────────────────
+    # 会话 / 模型 / 技能插件 hook / 运维系统设置 / 外观人设 / 集成 / 交互面板。
+    # 各模块 build_specs() 返回的就是可直接注册的 ToolSpec（含 execute 可调用
+    # 对象与 side_effect_scope 元数据），此处仅按来源分组拼接。
+    admin_specs = [
+        # 会话与上下文管理（1）
+        *tools_admin_session.build_specs(),
+        # 模型与供应商管理（1）
+        *tools_admin_model.build_specs(),
+        # 技能 / 插件 / hook 管理（3）
+        *tools_admin_skill.build_specs(),
+        # 运维与诊断：用量、导出、更新、系统设置、架构图、体检（6）
+        *tools_admin_ops.build_specs(),
+        # 外观与人设：主题、人格设定（2）
+        *tools_admin_look.build_specs(),
+        # 集成与协作：飞书、局域网、决策记录（3）
+        *tools_admin_integration.build_specs(),
+        # 交互面板：pty、浏览器面板、截图、剪贴板、电脑操控（5）
+        *tools_admin_interaction.build_specs(),
+    ]
+
+    registry = ToolRegistry([*read_specs, *mutating_specs, *admin_specs])
     # 加载进程内插件（plugins/ 与 ~/.ycode/plugins/）。插件加载全程隔离，
     # 任何失败只记录日志，绝不影响内置工具的可用性。
     try:
