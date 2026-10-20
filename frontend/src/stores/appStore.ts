@@ -135,6 +135,9 @@ export const TERMINAL_PANEL_MAX_HEIGHT = 720;
 // （去首尾空白后 1-20 个字符）。前端只做「禁用按钮 + 可见提示」，不做截断——
 // 悄悄把用户输入砍短会让身份名字与用户输入不符，后端仍会二次校验。
 export const SECRETARY_NAME_MAX_LEN = 20;
+// 秘书专属人设长度上限：与后端 core.secretary.MAX_PERSONA_LEN 一致；留空合法
+// （= 使用内置默认秘书人设），只在超长时拦下并给出可见提示
+export const SECRETARY_PERSONA_MAX_LEN = 20000;
 
 // 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页
 export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent';
@@ -2564,7 +2567,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async refreshSystemSettings() {
+    // silent：后台静默刷新（模型切换、其它端推送触发的），失败不弹模态框、
+    // 不把连接状态打成断开——用户没有主动请求，不该被打扰
+    async refreshSystemSettings(options: { silent?: boolean } = {}) {
       const api = this._api();
       if (!api) return null;
       try {
@@ -2572,8 +2577,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.systemSettings = settings;
         return settings;
       } catch (err) {
-        this.connected = false;
-        this.notifyModal('系统设置', '加载系统设置失败: ' + err);
+        if (!options.silent) {
+          this.connected = false;
+          this.notifyModal('系统设置', '加载系统设置失败: ' + err);
+        }
         return null;
       }
     },
@@ -3439,7 +3446,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 名字必填：它是这个秘书的身份标识（显示名 + 提示词自称），没有名字就只能
     // 落一个既无名又已切走的会话。前端先做可见校验、非法值不发请求且不截断
     // （后端 validate_secretary_name 会二次校验并回 ok:false）。
-    async createSecretarySession(name: string) {
+    // persona 可选：每个秘书是用户自己创建的独立 agent，人设只属于它这个会话；
+    // 留空就用内置默认秘书人设（与设置页的星瑶人设完全无关）。
+    async createSecretarySession(name: string, persona = '') {
       const normalized = (name || '').trim();
       // 用码点计数与后端 len() 对齐：emoji 这类代理对不会被算成两个字符
       const nameLength = [...normalized].length;
@@ -3454,12 +3463,21 @@ navItems: [] as Array<{ id: number; preview: string }>,
         );
         return;
       }
+      // 人设空白视为"没填"，正常放行（走默认人设）
+      const personaDraft = (persona || '').trim();
+      if (personaDraft.length > SECRETARY_PERSONA_MAX_LEN) {
+        this.notifyModal(
+          '新建秘书会话',
+          `秘书人设最多 ${SECRETARY_PERSONA_MAX_LEN} 个字符，当前 ${personaDraft.length} 个`,
+        );
+        return;
+      }
       const api = this._api();
       if (!api) return; // _api() 缺桥时已弹「连接失败」，这里不再二次打扰
       try {
         // 标题固定「新会话」：侧栏与欢迎页显示的都是秘书名（后端 display_name），
         // 会话名（session_xxx）不参与命名，这里不需要用户可见的会话标题
-        const res = await api.create_secretary_session('新会话', normalized);
+        const res = await api.create_secretary_session('新会话', normalized, personaDraft);
         if (!res || !res.ok) {
           // 建会话是用户显式动作：失败必须可见，不做静默降级
           this.notifyModal('新建秘书会话', (res && res.msg) || '创建失败');
@@ -3687,6 +3705,38 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
+    // 设置秘书专属人设（右键「编辑人设」入口，仅秘书会话可用）。
+    // 人设只落该会话自己的 secretary_persona，不碰会话名 / 消息 / 摘要，
+    // 也不影响设置页的星瑶人设；传空串 = 恢复内置默认秘书人设。
+    async updateSecretaryPersona(sessionName: string, persona: string) {
+      if (!this._isSecretarySession(sessionName)) return;
+      const draft = (persona || '').trim();
+      if (draft.length > SECRETARY_PERSONA_MAX_LEN) {
+        this.notifyModal(
+          '秘书人设',
+          `秘书人设最多 ${SECRETARY_PERSONA_MAX_LEN} 个字符，当前 ${draft.length} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_secretary_persona(sessionName, draft);
+        if (res && res.ok) {
+          // 后端回带最新分组树（条目里的人设已更新），直接覆盖同步
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else void this.refreshSessions();
+          // 人设是在下一轮请求里生效的：当前会话提示"改完即生效"要如实说明
+          this.notifyChat(draft ? '秘书人设已更新，下一轮对话生效' : '已恢复默认秘书人设');
+        } else {
+          this.notifyModal('秘书人设', '保存失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('秘书人设', '保存失败: ' + err);
       }
     },
 
@@ -5162,6 +5212,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           if (newId || newName) {
             this._sessionModelVersion[eventSession] = (this._sessionModelVersion[eventSession] || 0) + 1;
           }
+          // 系统设置里的「当前模型电脑操控资格」跟着生效模型走，换模型后
+          // 旧快照立刻过期；后台静默重拉，设置页再打开时不会是陈旧的模型名
+          void this.refreshSystemSettings({ silent: true });
         }
       } else if (type === 'file_tree_loaded') {
         // 异步文件树加载完成（后端 _async_load_file_tree 推送）：

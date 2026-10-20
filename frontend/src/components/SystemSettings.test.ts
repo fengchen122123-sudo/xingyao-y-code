@@ -598,9 +598,12 @@ describe('computer active model capability hint', () => {
 
   it('shows eligible summary when switches on and model qualifies', () => {
     const wrapper = mountWith({ browser_control_enabled: true });
-    const hint = wrapper.get('[data-test="computer-model-capability-hint"]');
+    // 合格提示是说明性内容，收在「环境检测与安全提示」折叠区里，不占主视图行
+    const hint = wrapper.get('[data-test="computer-diagnostics-capability-hint"]');
     expect(hint.text()).toContain('已具备电脑操控资格');
     expect(hint.classes()).not.toContain('blocked');
+    // 不合格时才是需要立刻看到的问题，仍然放在折叠区外
+    expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
   });
 
   it('hides the hint when both switches are off', () => {

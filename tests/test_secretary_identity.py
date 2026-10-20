@@ -288,3 +288,178 @@ def test_plain_session_unaffected_when_prompt_files_missing(tmp_path, monkeypatc
         agent_name=persona_settings.get_agent_display_name()
     )
     assert content == expected
+
+
+# ---------------------------------------------------------------------------
+# 秘书专属人设（每个秘书是一个独立 agent，人设只属于它自己的会话）
+# ---------------------------------------------------------------------------
+
+# core.secretary.build_secretary_persona_block 的固定表头
+_SECRETARY_PERSONA_HEADER = "# 秘书人设（本会话专属，由用户设定）"
+
+
+def test_secretary_persona_roundtrip(manager):
+    manager.create_session_explicit(
+        "s_persona",
+        workdir="GLOBAL",
+        source="SECRETARY",
+        secretary_name="星河",
+        secretary_persona="你是一位做事讲究先后的行政秘书。",
+    )
+    assert manager.get_session_secretary_persona("s_persona") == "你是一位做事讲究先后的行政秘书。"
+
+    # 非秘书会话与不存在的会话都返回空串（= 无专属人设），不抛错
+    manager.create_session_explicit("s_plain_persona", workdir="GLOBAL", source="GUI")
+    assert manager.get_session_secretary_persona("s_plain_persona") == ""
+    assert manager.get_session_secretary_persona("s_missing_persona") == ""
+
+    # 写人设：命中与会话不存在分别返回 True / False
+    assert manager.set_session_secretary_persona("s_persona", "新人设") is True
+    assert manager.get_session_secretary_persona("s_persona") == "新人设"
+    # 清空 = 恢复内置默认秘书人设
+    assert manager.set_session_secretary_persona("s_persona", "  ") is True
+    assert manager.get_session_secretary_persona("s_persona") == ""
+    assert manager.set_session_secretary_persona("s_nope_persona", "x") is False
+
+
+def test_validate_secretary_persona_allows_empty_and_rejects_too_long():
+    # 没写人设是合法输入（= 用默认人设），首尾空白去掉后原样返回
+    assert secretary.validate_secretary_persona("") == ""
+    assert secretary.validate_secretary_persona("   ") == ""
+    assert secretary.validate_secretary_persona(None) == ""
+    assert secretary.validate_secretary_persona("  人设  ") == "人设"
+    # 边界内合法、超出报错（不静默截断）
+    assert secretary.validate_secretary_persona("设" * secretary.MAX_PERSONA_LEN)
+    with pytest.raises(ValueError):
+        secretary.validate_secretary_persona("设" * (secretary.MAX_PERSONA_LEN + 1))
+    with pytest.raises(ValueError):
+        secretary.validate_secretary_persona(123)
+
+
+def test_secretary_persona_read_and_cache_invalidation(manager):
+    manager.create_session_explicit(
+        "s_persona_cache",
+        workdir="GLOBAL",
+        source="SECRETARY",
+        secretary_name="星河",
+        secretary_persona="旧人设",
+    )
+    secretary.invalidate_secretary_cache()
+    assert secretary.get_secretary_persona("s_persona_cache") == "旧人设"
+
+    # 改库但缓存未失效 → 仍读到旧值（证明缓存生效）
+    manager.set_session_secretary_persona("s_persona_cache", "新人设")
+    assert secretary.get_secretary_persona("s_persona_cache") == "旧人设"
+
+    secretary.invalidate_secretary_cache("s_persona_cache")
+    assert secretary.get_secretary_persona("s_persona_cache") == "新人设"
+    # 非秘书会话永远读不到人设
+    manager.create_session_explicit("s_plain_cache", workdir="GLOBAL", source="GUI")
+    manager.set_session_secretary_persona("s_plain_cache", "不该出现")
+    secretary.invalidate_secretary_cache()
+    assert secretary.get_secretary_persona("s_plain_cache") == ""
+
+
+def test_build_secretary_persona_block():
+    block = secretary.build_secretary_persona_block("你是一位说话简短直接的秘书。")
+    assert _SECRETARY_PERSONA_HEADER in block
+    assert "你是一位说话简短直接的秘书。" in block
+    # 明确声明"取代默认人设"，但红线和调度硬约束不受影响
+    assert "取代" in block and "绝对红线" in block
+    # 空人设不注入任何块
+    assert secretary.build_secretary_persona_block("") == ""
+    assert secretary.build_secretary_persona_block(None) == ""
+
+
+def test_secretary_prompt_injects_custom_persona(manager, monkeypatch):
+    """专属人设非空：前置注入秘书提示词，且设置页星瑶人设仍不串入。"""
+    import core.agent_service as agent_service
+    import core.persona_settings as persona_settings
+
+    manager.create_session_explicit(
+        "s_prompt_persona",
+        workdir="GLOBAL",
+        source="SECRETARY",
+        secretary_name="星河",
+        secretary_persona="你是一位说话像老朋友的秘书，偶尔会用一个语气词。",
+    )
+    secretary.invalidate_secretary_cache()
+    # 设置页人设块故意设为非空：秘书会话必须跳过它，不能把星瑶人设串进来
+    monkeypatch.setattr(
+        persona_settings,
+        "build_persona_prompt_block",
+        lambda: _PERSONA_BLOCK_HEADER + "\n\n名字覆盖：你是「星瑶」。",
+    )
+    prompt = agent_service.load_system_prompt(is_gui=True, session_name="s_prompt_persona")
+
+    # 人设块在最前面，且写明覆盖默认人设
+    assert prompt.startswith(_SECRETARY_PERSONA_HEADER)
+    assert "你是一位说话像老朋友的秘书" in prompt
+    # 秘书文件照常加载、名字占位符已替换
+    assert _SECRETARY_PROMPT_MARKER in prompt
+    assert "{{secretary_name}}" not in prompt
+    assert "星河" in prompt
+    # 设置页人设块一律不进秘书会话
+    assert _PERSONA_BLOCK_HEADER not in prompt
+
+
+def test_secretary_prompt_without_persona_has_no_persona_block(manager):
+    """没填人设：提示词与改造前一致，不出现人设块表头。"""
+    import core.agent_service as agent_service
+
+    manager.create_session_explicit(
+        "s_prompt_default", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
+    )
+    secretary.invalidate_secretary_cache()
+    prompt = agent_service.load_system_prompt(is_gui=True, session_name="s_prompt_default")
+    assert _SECRETARY_PERSONA_HEADER not in prompt
+    assert prompt.startswith("你是「星河」，用户的私人秘书。")
+
+
+# ---------------------------------------------------------------------------
+# 桥层：创建带人设的秘书 / 事后改人设 / 非秘书会话拒绝
+# ---------------------------------------------------------------------------
+
+def _lightweight_bridge(manager):
+    """只注入 _memory 并桩掉 get_sessions 的桥对象：避免起整套 ApiBridge。"""
+    import gui_bridge
+
+    bridge = object.__new__(gui_bridge.ApiBridge)
+    bridge._memory = manager
+    bridge.get_sessions = lambda: []
+    return bridge
+
+
+def test_bridge_create_secretary_with_persona_and_update_it(manager):
+    bridge = _lightweight_bridge(manager)
+    created = bridge.create_secretary_session("新会话", "星河", "你是说话干脆的行政秘书。")
+    assert created["ok"] is True
+    session = created["session_name"]
+    secretary.invalidate_secretary_cache()
+    assert secretary.get_secretary_persona(session) == "你是说话干脆的行政秘书。"
+
+    # 事后改人设：只动 secretary_persona，会话名不变
+    updated = bridge.set_secretary_persona(session, "改成一个爱开玩笑的秘书。")
+    assert updated["ok"] is True and updated["session_name"] == session
+    secretary.invalidate_secretary_cache()
+    assert secretary.get_secretary_persona(session) == "改成一个爱开玩笑的秘书。"
+
+    # 传空白 = 恢复内置默认秘书人设（合法操作，不报错）
+    assert bridge.set_secretary_persona(session, "  ")["ok"] is True
+    secretary.invalidate_secretary_cache()
+    assert secretary.get_secretary_persona(session) == ""
+
+
+def test_bridge_rejects_bad_persona_and_non_secretary_session(manager):
+    bridge = _lightweight_bridge(manager)
+    # 超长人设拒绝，且不产生会话记录（否则会留下一个名字合法但人设非法的孤儿会话）
+    too_long = "设" * (secretary.MAX_PERSONA_LEN + 1)
+    created = bridge.create_secretary_session("新会话", "星河", too_long)
+    assert created["ok"] is False
+    secretary.invalidate_secretary_cache()
+    assert [s for s in manager.get_all_sessions() if s["source"] == "SECRETARY"] == []
+
+    # 非秘书会话不允许设置秘书人设
+    manager.create_session_explicit("s_plain_bridge", workdir="GLOBAL", source="GUI")
+    secretary.invalidate_secretary_cache()
+    assert bridge.set_secretary_persona("s_plain_bridge", "人设")["ok"] is False

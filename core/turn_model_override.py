@@ -37,8 +37,10 @@ MAIN_OPTION = "main"
 SECONDARY_OPTION = "secondary"
 ROUTER_OPTIONS = (MAIN_OPTION, SECONDARY_OPTION)
 
-# 单次决策超时：真实决策宁可不用，也不能拖慢主流程
-ROUTER_TIMEOUT_MS = 250
+# 单次决策超时：真实决策宁可不用，也不能拖慢主流程。
+# 注意：这里是硬编码的 override，会覆盖 scenes.router.timeout_ms 配置；
+# 实测 JEV 单次决策耗时约 600~900ms，250ms 会让每一次决策都超时回退，故放宽到 1500ms。
+ROUTER_TIMEOUT_MS = 1500
 
 # state 裁剪上限：只把「这段输入有多复杂」告诉决策模型，长粘贴没有额外信息
 STATE_CHAR_LIMIT = 500
@@ -50,7 +52,11 @@ ROUTER_QUESTION = {
         "判断这一回合该用哪个模型：main=能力更强但更贵，适合复杂推理/大范围改代码/"
         "多文件任务；secondary=更便宜，适合简单问答、单点修改、格式转换、闲聊。"
     ),
-    "criteria": [MAIN_OPTION, SECONDARY_OPTION],
+    # 上游 choice 题的 criteria 是「选项名 → 描述」的对象（传数组会 422）
+    "criteria": {
+        MAIN_OPTION: "能力更强但更贵，适合复杂推理、大范围改代码、多文件任务",
+        SECONDARY_OPTION: "更便宜，适合简单问答、单点修改、格式转换、闲聊",
+    },
 }
 
 
@@ -129,6 +135,7 @@ def resolve_turn_model(
     pending_model_id: str = "",
     baseline_tokens: int = 0,
     user_text: str = "",
+    has_image: bool = False,
 ) -> dict | None:
     """判定本回合是否临时改用副模型；返回参数包或 ``None``。
 
@@ -141,7 +148,9 @@ def resolve_turn_model(
       非空说明用户/调度方已经显式选了模型，决策无权覆盖；
     - ``baseline_tokens``：本会话当前上下文占用基线，用于窗口硬护栏；传 0 表示
       调用方拿不到基线，跳过这条护栏；
-    - ``user_text``：本轮用户输入本身，**唯一**进入决策 state 的文本。
+    - ``user_text``：本轮用户输入本身，**唯一**进入决策 state 的文本；
+    - ``has_image``：本轮用户消息是否带图片。带图时只有副模型**确实支持视觉**
+      才允许覆盖（见下方能力护栏）——否则等于把用户的图丢掉。
 
     返回：``None``（不覆盖）或
     ``{"litellm_model", "api_key", "base_url", "context_window", "model_id", "name"}``。
@@ -199,6 +208,23 @@ def resolve_turn_model(
             )
             return None
 
+        # 能力硬护栏：本轮带图时，只有副模型确实支持视觉才允许覆盖。
+        # 否则切过去等于把用户的图片丢掉（视觉链路会退化成「无法分析图片」的占位
+        # 提示），省下的那点钱完全不值得。视觉能力判定失败一律保守放弃覆盖。
+        if has_image:
+            try:
+                from core.llm_dialects import _supports_vision_llm_first
+
+                secondary_can_see = bool(_supports_vision_llm_first(secondary_litellm))
+            except Exception:
+                secondary_can_see = False
+            if not secondary_can_see:
+                logger.info(
+                    "router 场景跳过覆盖：本轮含图片，副模型 %s 不支持视觉输入",
+                    secondary_id,
+                )
+                return None
+
         # --- 3) 问一次决策（网关已把 off/shadow/失败/非法答案收敛成 None）---
         from core.decision_gateway import decide
 
@@ -209,7 +235,11 @@ def resolve_turn_model(
             options=ROUTER_OPTIONS,
             timeout_ms=ROUTER_TIMEOUT_MS,
             # 审计只附带非敏感的结构化信息，便于事后核对决策当时的处境
-            audit_extra={"turn_source": "local", "baseline_tokens": baseline},
+            audit_extra={
+                "turn_source": "local",
+                "baseline_tokens": baseline,
+                "has_image": bool(has_image),
+            },
         )
         # 只认「副模型」这一档：None（未启用/影子/失败/低置信）= 保持主模型
         if picked != SECONDARY_OPTION:

@@ -214,7 +214,7 @@ export interface DecisionProviderOption {
   auto_match: boolean;
 }
 
-// get_decision_audit_summary() 条目：单条审计记录的精简视图（不含正文）
+// get_decision_audit_summary() 条目：单条审计记录的精简视图
 export interface DecisionAuditRecentItem {
   ts: string;
   scene: string;
@@ -224,6 +224,39 @@ export interface DecisionAuditRecentItem {
   fallback_reason: string;
   model_id: string;
   answers_digest: string;
+  /** 决策当时的输入摘要（已脱敏、截断）：面板靠它显示这次判的是什么事 */
+  state_digest?: string;
+  /** 模型给出的结论：choice 选项 / noul 概率 / score 等级 */
+  answer?: string;
+  /** 记录唯一 ID：点开某条时用它回查完整请求/响应 */
+  trace_id?: string;
+}
+
+// get_decision_record_detail() 单条决策记录：发给 JEV 的请求 + 上游返回的答案
+export interface DecisionRecordDetail {
+  ok: boolean;
+  record?: {
+    ts?: string;
+    scene?: string;
+    shadow?: boolean;
+    adopted?: boolean;
+    model_id?: string;
+    latency_ms?: number | null;
+    fallback_reason?: string | null;
+    trace_id?: string;
+    session_id?: string;
+    /** 实际发给决策模型的请求体：model / state / questions */
+    request?: {
+      model?: string;
+      state?: string;
+      questions?: unknown;
+      state_truncated?: boolean;
+    } | null;
+    /** 上游原样返回的答案（choice 选项 + probabilities 等） */
+    answers?: unknown;
+    extra?: unknown;
+  };
+  msg?: string;
 }
 
 // 业务场景三态（关闭 / 影子 / 正式）：由两个布尔组合映射，后端 get_decision_scenes 反推
@@ -551,6 +584,9 @@ export interface SessionInfo {
   // 秘书会话专属：该会话的秘书名（= 显示名，未命名的历史会话回落「秘书」）。
   // 普通会话没有这个字段；前端据此 + 分组 is_secretary 判定改名走哪条路
   secretary_name?: string;
+  // 秘书专属人设原文（空串 / 缺省 = 使用内置默认秘书人设）。
+  // 每个秘书是独立 agent，人设只属于它自己这个会话，与设置页星瑶人设无关
+  secretary_persona?: string;
   updated_at?: string;
 }
 
@@ -1222,10 +1258,15 @@ export interface PyWebViewAPI {
   create_session(title?: string, workdir?: string): Promise<any>;
   // 秘书会话：与 create_session 的"首条消息才懒落库"不同，它立即落库并切为当前
   // 会话（source=SECRETARY、workdir=GLOBAL）。name 是这个秘书的身份标识，必填
-  // 且去首尾空白后 1-20 字符；非法名后端拒绝且不产生会话记录，返回
+  // 且去首尾空白后 1-20 字符；persona 是它的专属人设（可选，留空 = 内置默认
+  // 秘书人设，上限 20000 字符）。非法值后端拒绝且不产生会话记录，返回
   // { ok:false, msg }。成功返回 { ok, session_name, title, display_name,
-  // secretary_name, workdir }（display_name 即秘书名，会话名不参与命名）。
-  create_secretary_session(title: string, name: string): Promise<any>;
+  // secretary_name, secretary_persona, workdir }（display_name 即秘书名）。
+  create_secretary_session(title: string, name: string, persona?: string): Promise<any>;
+  // 设置某个秘书会话的专属人设：persona 传空串 = 恢复内置默认秘书人设。
+  // 只改人设，不动 session_name / 消息 / 摘要；成功回带
+  // { ok, session_name, secretary_persona, sessions }
+  set_secretary_persona(sessionName: string, persona: string): Promise<any>;
   // 当前会话生效名：秘书会话 → 该会话的秘书名（未命名回落「秘书」），
   // 普通会话 → 设置页智能体名。前端切会话 / 建会话 / 启动后据此刷新显示名
   get_active_agent_name(): Promise<{ agent_name: string; is_secretary: boolean; msg?: string }>;
@@ -1299,6 +1340,8 @@ export interface PyWebViewAPI {
   // session_id 非空时 has_business_records 只统计该会话（scene 非 probe）的记录；
   // 为空/缺省是全局口径（设置页面板用）。
   get_decision_audit_summary(limit?: number, session_id?: string): Promise<DecisionAuditSummary>;
+  // 按 trace_id 取单条决策记录详情：发给 JEV 的请求 + 上游答案（面板展开用）
+  get_decision_record_detail(trace_id: string): Promise<DecisionRecordDetail>;
   // 在系统文件管理器中打开决策审计目录（缺失时先创建）
   open_decision_audit_dir(): Promise<{ ok: boolean; path?: string; msg?: string }>;
   // 决策审计尾部：~/.ycode/decision_audit 最新文件的最后 limit 行

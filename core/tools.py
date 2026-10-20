@@ -1079,6 +1079,12 @@ def execute_command(
 _SEARCH_NUM_RESULTS_QUESTION = {
     "type": "choice",
     "instructions": "判断这次联网检索的信息量需求：3=单一事实即可，5=常规，8=需要多来源交叉核对。只依据查询词本身判断。",
+    # 上游 choice 题的 criteria 是「选项名 → 描述」的对象，不可省略
+    "criteria": {
+        3: "单一事实即可（如某个具体数字、日期、定义）",
+        5: "常规信息量（一般性的资讯或说明）",
+        8: "需要多来源交叉核对（争议话题、对比评估、时效性强的动态）",
+    },
 }
 _SEARCH_NUM_RESULTS_OPTIONS = (3, 5, 8)
 # search 场景单次决策超时（与 decision_service.DEFAULT_CONFIG["scenes"]["search"] 对齐）
@@ -5331,10 +5337,16 @@ def _decide_secretary_target(service, prompt, workdir):
 
         names = [candidate["session_name"] for candidate in candidates]
         options = [_SECRETARY_NEW_OPTION] + names
+        # 上游 choice 题的 criteria 是「选项名 → 描述」的对象（传数组会 422）
+        criteria = {_SECRETARY_NEW_OPTION: "新建一个会话来处理这条任务"}
+        for candidate in candidates:
+            session_name = candidate["session_name"]
+            display = str(candidate.get("display_name") or "").strip()
+            criteria[session_name] = f"派给已有会话：{display or session_name}"
         question = {
             "type": "choice",
             "instructions": _SECRETARY_TARGET_INSTRUCTIONS,
-            "criteria": list(options),
+            "criteria": criteria,
         }
         state = _secretary_decision_state(prompt, workdir, candidates)
         picked = decide(

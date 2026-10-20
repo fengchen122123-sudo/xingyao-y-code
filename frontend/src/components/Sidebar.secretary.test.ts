@@ -156,7 +156,8 @@ it('填名按 Enter → 以该名字调用 create_secretary_session 并关闭弹
   await flush();
 
   expect(create_secretary_session).toHaveBeenCalledTimes(1);
-  expect(create_secretary_session).toHaveBeenCalledWith('新会话', '清和');
+  // 第三参数是专属人设：没填就传空串（= 使用内置默认秘书人设）
+  expect(create_secretary_session).toHaveBeenCalledWith('新会话', '清和', '');
   expect(wrapper.find('[data-test="secretary-name-modal"]').exists()).toBe(false);
   // 会话以该名字落库并切为当前会话：侧栏条目、欢迎页、头部读的都是它
   expect(store.currentSessionName).toBe('session-sec2');
@@ -237,4 +238,99 @@ it('桥取不到生效名时回落设置页名字，不打断切换流程', asyn
 
   expect(store.agentName).toBe('星瑶');
   expect(store.currentSessionName).toBe('session-a');
+});
+
+// ---------------------------------------------------------------------------
+// 秘书专属人设（每个秘书是一个独立 agent，人设只属于它自己的会话）
+// ---------------------------------------------------------------------------
+
+it('新建秘书可填专属人设：与名字一起提交给桥，并去掉首尾空白', async () => {
+  const create_secretary_session = vi.fn(async () => ({
+    ok: true,
+    session_name: 'session-sec2',
+    title: '新会话',
+    display_name: '清和',
+    secretary_name: '清和',
+    secretary_persona: '你是说话干脆的行政秘书。',
+    workdir: 'GLOBAL',
+  }));
+  const { wrapper } = setup({
+    create_secretary_session,
+    get_active_agent_name: vi.fn(async () => ({ agent_name: '清和', is_secretary: true })),
+    get_sessions: vi.fn(async () => secretaryGroups('清和')),
+  });
+
+  await openNameModal(wrapper);
+  await wrapper.find('[data-test="secretary-name-input"]').setValue('清和');
+  await wrapper
+    .find('[data-test="secretary-persona-input"]')
+    .setValue('  你是说话干脆的行政秘书。  ');
+  await wrapper.find('[data-test="secretary-name-create"]').trigger('click');
+  await flush();
+
+  expect(create_secretary_session).toHaveBeenCalledWith(
+    '新会话',
+    '清和',
+    '你是说话干脆的行政秘书。',
+  );
+  expect(wrapper.find('[data-test="secretary-name-modal"]').exists()).toBe(false);
+});
+
+it('秘书会话右键「编辑人设」：回填已有人设，保存走 set_secretary_persona', async () => {
+  const set_secretary_persona = vi.fn(async () => ({
+    ok: true,
+    session_name: 'session-sec',
+    secretary_persona: '新人设',
+    sessions: secretaryGroups(),
+  }));
+  const { wrapper, store } = setup({ set_secretary_persona });
+  // 条目带上后端下发的 secretary_persona，弹窗应原样回填（不再打一次后端）
+  store.sessionGroups = [
+    {
+      ...secretaryGroups()[0],
+      sessions: [
+        {
+          name: 'session-sec',
+          display_name: '星河',
+          secretary_name: '星河',
+          secretary_persona: '旧人设：说话简短',
+          count: 2,
+          workdir: 'GLOBAL',
+          updated_at: '',
+        },
+      ],
+    },
+    secretaryGroups()[1],
+  ] as any;
+
+  const el = wrapper.findAll('.session-item')[0].element as HTMLElement;
+  el.dispatchEvent(
+    new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }),
+  );
+  await nextTick();
+  await wrapper.find('[data-test="ctx-secretary-persona"]').trigger('click');
+  await nextTick();
+
+  const textarea = wrapper.find('[data-test="secretary-persona-input"]');
+  expect((textarea.element as HTMLTextAreaElement).value).toBe('旧人设：说话简短');
+
+  await textarea.setValue('新人设');
+  await wrapper.find('[data-test="secretary-name-create"]').trigger('click');
+  await flush();
+
+  expect(set_secretary_persona).toHaveBeenCalledWith('session-sec', '新人设');
+});
+
+it('普通会话的右键菜单没有「编辑人设」入口', async () => {
+  const { wrapper } = setup();
+  // 侧栏渲染顺序里普通会话排在秘书之后，按显示名定位那个条目
+  const item = wrapper
+    .findAll('.session-item')
+    .find((w) => w.text().includes('会话 A'));
+  expect(item).toBeTruthy();
+  (item!.element as HTMLElement).dispatchEvent(
+    new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }),
+  );
+  await nextTick();
+  expect(wrapper.find('[data-test="ctx-secretary-persona"]').exists()).toBe(false);
 });
