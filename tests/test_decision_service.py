@@ -952,6 +952,40 @@ def test_audit_summary_session_filter_still_ignores_probe(data_dir):
     assert svc.get_decision_audit_summary()["has_business_records"] is False
 
 
+def test_audit_summary_session_only_filters_recent_and_today(data_dir):
+    """session_only=True：today_* 与 recent 只算本会话，别会话的记录一律不出现。
+
+    会话头部面板用这个口径（否则会把别的会话的「判的是什么事」显示在当前会话下）；
+    不传 session_only 时保持全局口径，设置页面板依赖它。
+    """
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    today = svc._today()
+    rows = [
+        {"ts": f"{today}T10:00:00", "scene": "router", "shadow": False,
+         "session_id": "本会话", "answers": {"tier": "main"}},
+        {"ts": f"{today}T10:01:00", "scene": "secretary", "shadow": False,
+         "session_id": "别的会话", "answers": {"choice": "sess-B"}},
+        {"ts": f"{today}T10:02:00", "scene": "router", "shadow": True,
+         "session_id": "本会话", "answers": {"tier": "secondary"}},
+    ]
+    (audit / f"{today}.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8"
+    )
+
+    scoped = svc.get_decision_audit_summary(limit=10, session_id="本会话", session_only=True)
+    assert scoped["session_scoped"] is True
+    assert scoped["today_count"] == 2
+    assert scoped["today_shadow_count"] == 1
+    assert [item["scene"] for item in scoped["recent"]] == ["router", "router"]
+
+    # 全局口径不受影响：设置页面板照旧看到所有会话的记录
+    glob = svc.get_decision_audit_summary(limit=10)
+    assert glob["session_scoped"] is False
+    assert glob["today_count"] == 3
+    assert len(glob["recent"]) == 3
+
+
 def test_audit_summary_missing_dir_returns_zeros(data_dir):
     result = svc.get_decision_audit_summary()
     assert result["ok"] is True

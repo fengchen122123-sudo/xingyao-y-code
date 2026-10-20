@@ -1054,20 +1054,24 @@ def _audit_brief(record: dict) -> dict:
     }
 
 
-def get_decision_audit_summary(limit: int = 20, session_id=None) -> dict:
-    """汇总决策审计：今日计数 + 最近 N 条记录（设置页「决策记录」面板用）。
+def get_decision_audit_summary(
+    limit: int = 20, session_id=None, session_only: bool = False
+) -> dict:
+    """汇总决策审计：今日计数 + 最近 N 条记录。
 
-    只读、容错：目录缺失返回全零；单行损坏跳过该行；绝不抛错。
+    两种口径，由 ``session_only`` 决定（返回值的 ``session_scoped`` 明示实际用了哪种）：
+
+    - ``session_only=True`` 且 ``session_id`` 非空：``today_*`` 与 ``recent`` 也只统计
+      该会话的记录。会话头部「决策」面板用这个口径，否则会把别的会话的
+      「判的是什么事 / 判成什么」展示在当前会话下。
+    - 其余情况：全局口径（扫全部文件、全部会话），设置页面板依赖它，避免数据缺口。
 
     ``has_business_records`` 有两种口径：
 
     - 传了非空 ``session_id``（strip 后非空）：只统计「属于该会话」的业务记录，
       即 scene 既不是 ""/"probe" 且 ``record["session_id"] == session_id``；
       头部「决策」入口据此判断当前会话是否真的做过业务决策。
-    - 不传或传空：保持全局口径（扫全部文件、全部会话），设置页面板依赖它。
-
-    ``today_*`` 计数与 ``recent`` 始终是全局口径，不受 ``session_id`` 影响，
-    避免设置页面板数据出现缺口。
+    - 不传或传空：保持全局口径（扫全部文件、全部会话）。
     """
     try:
         count = max(1, min(int(limit), 200))
@@ -1082,6 +1086,8 @@ def get_decision_audit_summary(limit: int = 20, session_id=None) -> dict:
         "today_adopted_count": 0,
         "today_fallback_count": 0,
         "recent": [],
+        # 本次是否按会话过滤 today_*/recent（前端据此决定文案口径）
+        "session_scoped": bool(session_only and wanted_session),
         # 是否出现过真实业务决策（排除探针）：头部「决策」入口据此决定是否展示
         "has_business_records": False,
     }
@@ -1111,6 +1117,18 @@ def get_decision_audit_summary(limit: int = 20, session_id=None) -> dict:
             pass
         return records
 
+    def _in_scope(record) -> bool:
+        """记录是否落在本次统计口径内：session_only 时按会话过滤。
+
+        非 dict（JSON 行解析出数字/字符串）一律排除：既避免下面 .get 抛错，
+        也不让脏行污染计数。
+        """
+        if not isinstance(record, dict):
+            return False
+        if not (session_only and wanted_session):
+            return True
+        return str(record.get("session_id") or "") == wanted_session
+
     # 探针（scene="probe"）只是连通性验证，不算真实决策：头部「决策」入口
     # 只认业务场景记录，否则跑过一次探针就会挂出一个没有任何决策内容的入口。
     # 传了 session_id 时再叠加会话过滤：别的会话做过的决策不算本会话做过。
@@ -1133,6 +1151,8 @@ def get_decision_audit_summary(limit: int = 20, session_id=None) -> dict:
 
     if today_name in names:
         for record in _iter_records(os.path.join(directory, today_name)):
+            if not _in_scope(record):
+                continue
             summary["today_count"] += 1
             if record.get("shadow"):
                 summary["today_shadow_count"] += 1
@@ -1148,6 +1168,7 @@ def get_decision_audit_summary(limit: int = 20, session_id=None) -> dict:
         briefs = [
             _audit_brief(record)
             for record in _iter_records(os.path.join(directory, name))
+            if _in_scope(record)
         ]
         collected = briefs + collected
     summary["recent"] = collected[-count:]

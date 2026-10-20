@@ -5726,18 +5726,24 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("list_decision_providers 失败")
             return {"ok": False, "providers": [], "msg": str(e)}
 
-    def get_decision_audit_summary(self, limit: int = 20, session_id=None) -> Dict[str, Any]:
+    def get_decision_audit_summary(
+        self, limit: int = 20, session_id=None, session_only: bool = False
+    ) -> Dict[str, Any]:
         """决策审计汇总：今日计数 + 最近 N 条记录。
 
-        ``session_id`` 为空时返回全局汇总（设置页面板口径，扫全部会话）；
-        非空时 ``has_business_records`` 只按该会话判定（会话头部「决策」入口）。
-        ``today_*`` 计数与 ``recent`` 始终全局，不受 ``session_id`` 影响。
+        ``session_only=True`` 且 ``session_id`` 非空时，``today_*`` 与 ``recent``
+        也按该会话过滤（会话头部「决策」面板口径，避免展示别的会话的记录）；
+        否则返回全局汇总，设置页面板依赖全局数据、不能出现缺口。
+        ``has_business_records`` 只在传了非空 ``session_id`` 时按会话判定。
         """
         from core import decision_service
 
         try:
-            if str(session_id or "").strip():
-                result = decision_service.get_decision_audit_summary(limit, session_id)
+            scope_session = str(session_id or "").strip()
+            if scope_session:
+                result = decision_service.get_decision_audit_summary(
+                    limit, scope_session, bool(session_only)
+                )
             else:
                 # 空会话不追加参数：下游默认 None = 全局口径，也保持旧调用签名兼容
                 result = decision_service.get_decision_audit_summary(limit)
