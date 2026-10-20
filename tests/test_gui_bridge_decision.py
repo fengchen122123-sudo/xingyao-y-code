@@ -389,10 +389,11 @@ SUMMARY_KEYS = {
     "today_fallback_count",
     "recent",
     "has_business_records",
+    "session_scoped",
 }
 
 
-def _fake_summary(has_business_records=True):
+def _fake_summary(has_business_records=True, session_scoped=False):
     return {
         "ok": True,
         "today_count": 2,
@@ -401,6 +402,7 @@ def _fake_summary(has_business_records=True):
         "today_fallback_count": 0,
         "recent": [],
         "has_business_records": has_business_records,
+        "session_scoped": session_scoped,
     }
 
 
@@ -408,25 +410,41 @@ def test_get_decision_audit_summary_passes_session_id(data_dir, monkeypatch):
     """桥层把 session_id 原样透传给 decision_service（头部决策入口按会话判定）。"""
     calls = []
 
-    def fake(limit=20, session_id=None):
-        calls.append((limit, session_id))
+    def fake(limit=20, session_id=None, session_only=False):
+        calls.append((limit, session_id, session_only))
         return _fake_summary(True)
 
     monkeypatch.setattr(svc, "get_decision_audit_summary", fake)
 
     result = _make_bridge().get_decision_audit_summary(5, "sess-A")
 
-    assert calls == [(5, "sess-A")]
+    assert calls == [(5, "sess-A", False)]
     assert result["ok"] is True
     assert result["has_business_records"] is True
     assert SUMMARY_KEYS <= set(result)
+
+
+def test_get_decision_audit_summary_passes_session_only(data_dir, monkeypatch):
+    """session_only=True 必须透传到下游：否则面板拿到全局 recent（含别会话记录）。"""
+    calls = []
+
+    def fake(limit=20, session_id=None, session_only=False):
+        calls.append((limit, session_id, session_only))
+        return _fake_summary(True, session_scoped=True)
+
+    monkeypatch.setattr(svc, "get_decision_audit_summary", fake)
+
+    result = _make_bridge().get_decision_audit_summary(10, "sess-A", True)
+
+    assert calls == [(10, "sess-A", True)]
+    assert result["session_scoped"] is True
 
 
 def test_get_decision_audit_summary_defaults_to_global(data_dir, monkeypatch):
     """不传 session_id 时下游仍然只拿到 limit（session_id 有效值为 None），返回结构不变。"""
     calls = []
 
-    def fake(limit=20, session_id=None):
+    def fake(limit=20, session_id=None, session_only=False):
         calls.append((limit, session_id))
         return _fake_summary(True)
 
@@ -443,7 +461,11 @@ def test_get_decision_audit_summary_defaults_to_global(data_dir, monkeypatch):
 
 def test_get_decision_audit_summary_non_dict_result_falls_back(data_dir, monkeypatch):
     """底层返回非字典时仍走既有兜底：ok=false + 中文原因，不抛错。"""
-    monkeypatch.setattr(svc, "get_decision_audit_summary", lambda limit=20, session_id=None: [])
+    monkeypatch.setattr(
+        svc,
+        "get_decision_audit_summary",
+        lambda limit=20, session_id=None, session_only=False: [],
+    )
 
     result = _make_bridge().get_decision_audit_summary(3, "sess-A")
 

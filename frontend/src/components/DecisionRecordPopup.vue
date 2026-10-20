@@ -1,6 +1,6 @@
 <template>
   <!-- 会话头部「决策」入口的悬浮面板：展示 JEV 决策记录（只读轻量视图），
-       锚定在按钮下方；点外部/Esc 由 App.vue 统一收起 -->
+       锚定在按钮下方；点面板外部由 App.vue 统一收起 -->
   <div class="decision-pop" data-test="decision-dialog" @click.stop>
     <div class="pop-head">
       <div class="ph-ico"><AppIcon name="brain" :size="14" :stroke-width="2" /></div>
@@ -17,9 +17,11 @@
         <span>{{ statusText }}</span>
       </div>
 
-      <template v-if="summary && summary.today_count > 0">
+      <!-- 门禁看「有没有记录」而不是「今天有没有」：昨天有决策、今天没有时
+           列表仍应展示最近的记录（今日计数单独一行，跨天不影响可见性） -->
+      <template v-if="summary && summary.recent.length > 0">
         <div class="stats-line" data-test="decision-pop-stats">
-          今日 {{ summary.today_count }} 次决策 · 影子 {{ summary.today_shadow_count }} · 采纳 {{ summary.today_adopted_count }} · 回退 {{ summary.today_fallback_count }}
+          本会话今日 {{ summary.today_count }} 次决策 · 影子 {{ summary.today_shadow_count }} · 采纳 {{ summary.today_adopted_count }} · 回退 {{ summary.today_fallback_count }}
         </div>
         <ul class="record-list" data-test="decision-pop-list">
           <li
@@ -122,11 +124,17 @@ const expandedIndex = ref<number | null>(null);
 const detail = ref<DecisionRecordDetail['record'] | null>(null);
 const detailLoading = ref(false);
 const detailError = ref('');
+// 详情请求序号：连点两条记录时，先发的请求可能后返回，不能让它的结果
+// 覆盖后一条的详情（共享 detail/detailLoading，必须靠序号判归属）
+let detailRequestSeq = 0;
 
 function collapse() {
+  // 收起时让在途请求作废：迟到的响应不能把已收起的面板重新填上内容
+  detailRequestSeq += 1;
   expandedIndex.value = null;
   detail.value = null;
   detailError.value = '';
+  detailLoading.value = false;
 }
 
 async function toggle(index: number, item: DecisionAuditRecentItem) {
@@ -142,23 +150,26 @@ async function toggle(index: number, item: DecisionAuditRecentItem) {
     detailError.value = '这条记录没有 trace_id，读不到详情（旧版本记录）';
     return;
   }
+  const seq = (detailRequestSeq += 1);
   detailLoading.value = true;
   try {
     const api = window.pywebview?.api;
     if (!api?.get_decision_record_detail) {
-      detailError.value = '当前版本不支持查看详情';
+      if (seq === detailRequestSeq) detailError.value = '当前版本不支持查看详情';
       return;
     }
     const res = await api.get_decision_record_detail(traceId);
+    // 已经展开别的记录或已收起：丢弃这次响应
+    if (seq !== detailRequestSeq) return;
     if (res?.ok && res.record) {
       detail.value = res.record;
     } else {
       detailError.value = res?.msg || '未找到这条决策记录';
     }
   } catch {
-    detailError.value = '读取详情失败';
+    if (seq === detailRequestSeq) detailError.value = '读取详情失败';
   } finally {
-    detailLoading.value = false;
+    if (seq === detailRequestSeq) detailLoading.value = false;
   }
 }
 
@@ -183,32 +194,35 @@ function prettyAnswers(record: DecisionRecordDetail['record']): string {
   return JSON.stringify(record.answers ?? null, null, 2);
 }
 
+// 汇总请求序号：切换会话时旧请求可能后返回，不能让它的结果落到新会话面板上
+let summaryRequestSeq = 0;
+
 async function loadSummary() {
-  // 按当前会话拉取：入口/面板口径是「本会话的决策记录」，会话名为空
-  // （新会话懒创建阶段）时不请求，也不回退全局口径
+  // 按当前会话拉取（session_only=true）：today_*/recent 都只算本会话，
+  // 否则面板会把别的会话的「判的是什么事 / 判成什么」显示在当前会话下。
+  // 会话名为空（新会话懒创建阶段）时不请求，也不回退到全局口径。
   const sessionName = String(store.currentSessionName || '').trim();
   // 列表刷新后索引会变，展开态必须收起，否则会张冠李戴
   collapse();
+  const seq = (summaryRequestSeq += 1);
   if (!sessionName) {
     summary.value = null;
     return;
   }
   try {
     const api = window.pywebview?.api;
-    if (!api?.get_decision_audit_summary) return;
-    const res = await api.get_decision_audit_summary(10, sessionName);
-    if (res?.ok) {
-      summary.value = {
-        ok: true,
-        today_count: Number(res.today_count ?? 0),
-        today_shadow_count: Number(res.today_shadow_count ?? 0),
-        today_adopted_count: Number(res.today_adopted_count ?? 0),
-        today_fallback_count: Number(res.today_fallback_count ?? 0),
-        recent: Array.isArray(res.recent) ? res.recent : [],
-      };
+    if (!api?.get_decision_audit_summary) {
+      summary.value = null;
+      return;
     }
+    const res = await api.get_decision_audit_summary(10, sessionName, true);
+    // 已经切到别的会话：丢弃这次结果
+    if (seq !== summaryRequestSeq) return;
+    // 直接转发后端结果：手抄字段会丢掉 has_business_records / session_scoped
+    summary.value = res?.ok ? res : null;
   } catch {
-    // 静默：记录面板失败不影响头部其余功能
+    // 静默：请求失败时清空快照，宁可显示空态也不展示上一个会话的记录
+    if (seq === summaryRequestSeq) summary.value = null;
   }
 }
 

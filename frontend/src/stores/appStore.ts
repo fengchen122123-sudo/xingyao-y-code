@@ -4559,6 +4559,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           return;
         }
         this.decisionEventTick += 1;
+        // 探针（scene="probe"）只证明链路通了，不算真实决策：与后端
+        // has_business_records 的口径保持一致。否则跑一次探针就会点亮入口，
+        // 而下次启动探测又按 has_business_records=false 把它熄灭（入口闪烁）。
+        if (String(data.scene || '') === 'probe') return;
         this.decisionUnread += 1;
         // 刚发生一次真实决策：入口立刻出现，不用等下次启动探测
         this.decisionHasRecords = true;

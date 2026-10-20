@@ -292,6 +292,8 @@ export interface DecisionAuditSummary {
   today_fallback_count: number;
   // 是否出现过真实业务决策（后端排除 scene="probe" 的探针记录）
   has_business_records?: boolean;
+  // 本次汇总是否按会话过滤了 today_*/recent（true=会话口径，false=全局口径）
+  session_scoped?: boolean;
   recent: DecisionAuditRecentItem[];
   msg?: string;
 }
@@ -1339,7 +1341,9 @@ export interface PyWebViewAPI {
   // 决策审计汇总（今日计数 + 最近记录；设置页「决策记录」面板 / 头部决策入口）。
   // session_id 非空时 has_business_records 只统计该会话（scene 非 probe）的记录；
   // 为空/缺省是全局口径（设置页面板用）。
-  get_decision_audit_summary(limit?: number, session_id?: string): Promise<DecisionAuditSummary>;
+  // session_only=true 且传了 session_id 时，today_*/recent 也按会话过滤
+  // （会话头部面板口径）；不传则保持全局口径（设置页面板依赖）
+  get_decision_audit_summary(limit?: number, session_id?: string, session_only?: boolean): Promise<DecisionAuditSummary>;
   // 按 trace_id 取单条决策记录详情：发给 JEV 的请求 + 上游答案（面板展开用）
   get_decision_record_detail(trace_id: string): Promise<DecisionRecordDetail>;
   // 在系统文件管理器中打开决策审计目录（缺失时先创建）
