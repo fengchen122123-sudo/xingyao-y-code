@@ -197,9 +197,11 @@ def test_secondary_picked_passes_protocol_expectations(monkeypatch):
     call = calls[0]
     assert call["scene"] == "router"
     assert call["kwargs"]["options"] == ("main", "secondary")
-    assert call["kwargs"]["timeout_ms"] == 250
+    assert call["kwargs"]["timeout_ms"] == tmo.ROUTER_TIMEOUT_MS
     assert call["question"]["type"] == "choice"
-    assert call["question"]["criteria"] == ["main", "secondary"]
+    # 上游 choice 题的 criteria 必须是「选项名 → 描述」的对象，不是数组
+    assert set(call["question"]["criteria"]) == {"main", "secondary"}
+    assert all(call["question"]["criteria"].values())
     assert "main=能力更强但更贵" in call["question"]["instructions"]
     assert "secondary=更便宜" in call["question"]["instructions"]
     # 决策输入不含任何模型密钥（防泄露到决策服务）
@@ -556,3 +558,39 @@ def test_jev_disabled_zero_request_and_no_override(data_dir, monkeypatch):
     assert tmo.resolve_turn_model(MAIN_MODEL, user_text=USER_TEXT) is None
     assert post_calls == []
     assert _audit_records(data_dir) == []
+
+
+def test_image_turn_never_falls_back_to_text_only_secondary(data_dir, monkeypatch):
+    """本轮带图且副模型不识图：禁止覆盖，且不浪费一次决策请求。
+
+    回归背景：用户发截图时，JEV 因文字很短判定「简单任务」把回合切到纯文本副模型，
+    视觉链路随即降级成「无法分析图片」占位提示——图片被静默丢弃。
+    """
+    _write_user_config(data_dir)
+    _enable_router(shadow=False)
+    _mock_secondary(monkeypatch, SECONDARY_MODEL)  # supports_vision=False
+    post_calls = _mock_no_network(monkeypatch)
+
+    result = tmo.resolve_turn_model(MAIN_MODEL, user_text=USER_TEXT, has_image=True)
+
+    assert result is None, "带图回合不能被切到不识图的副模型"
+    assert post_calls == [], "能力护栏必须在问决策模型之前就短路（零请求）"
+
+
+def test_image_turn_allowed_when_secondary_can_see(data_dir, monkeypatch):
+    """本轮带图但副模型确实支持视觉：能力护栏放行，正常走决策。"""
+    from core import llm_dialects
+
+    _write_user_config(data_dir)
+    _enable_router(shadow=False)
+    _mock_secondary(monkeypatch, {**SECONDARY_MODEL, "supports_vision": True})
+    calls = _mock_decide(monkeypatch, "secondary")
+    monkeypatch.setattr(llm_dialects, "_supports_vision_llm_first", lambda name: True)
+
+    result = tmo.resolve_turn_model(MAIN_MODEL, user_text=USER_TEXT, has_image=True)
+
+    assert result is not None
+    assert result["litellm_model"] == SECONDARY_MODEL["litellm_model"]
+    assert len(calls) == 1
+    # 审计上下文带上 has_image，便于事后核对「当时这轮有没有图」
+    assert calls[0]["kwargs"]["audit_extra"]["has_image"] is True

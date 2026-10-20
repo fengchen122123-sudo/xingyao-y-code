@@ -240,33 +240,54 @@ def _replace_default_agent_name(text: str, name: str) -> str:
 
 
 def _load_secretary_system_prompt(is_gui: bool, session_name) -> str:
-    """秘书会话的提示词：读随包秘书文件 + 替换名字占位符；失败回落普通提示词。
+    """秘书会话的提示词：读随包秘书文件 + 替换名字占位符 + 注入专属人设。
 
     为什么用 str.replace 而不是 str.format：提示词正文里有大量其它花括号
     （代码示例、JSON 片段），format 会直接抛异常把整轮对话打挂。
     返回值保证非空：秘书文件读不到时回落普通提示词（默认名已换成秘书名）。
+
+    专属人设（`sessions.secretary_persona`）非空时以独立块**前置**注入：每个秘书
+    都是用户自己创建的独立 agent，人设只作用于它自己的会话，与设置页的星瑶人设
+    互不相干；留空时保持默认秘书人设，提示词与改造前逐字节一致。
     """
     secretary_name = ""
+    persona_block = ""
     try:
-        from core.secretary import FALLBACK_SECRETARY_NAME, get_secretary_name
+        from core.secretary import (
+            FALLBACK_SECRETARY_NAME,
+            build_secretary_persona_block,
+            get_secretary_name,
+            get_secretary_persona,
+        )
 
         secretary_name = get_secretary_name(session_name) or FALLBACK_SECRETARY_NAME
+        persona_block = build_secretary_persona_block(get_secretary_persona(session_name))
     except Exception:
         # 秘书模块不可用也要给出身份，用兜底名保证提示词不出现"无人称"状态
         secretary_name = "秘书"
+        persona_block = ""
     try:
         prompt_path = os.path.join(_repo_root(), SECRETARY_PROMPT_FILENAME)
         if os.path.exists(prompt_path):
             with open(prompt_path, "r", encoding="utf-8") as f:
                 secretary_prompt = f.read().strip()
             if secretary_prompt:
-                return secretary_prompt.replace(
+                text = secretary_prompt.replace(
                     SECRETARY_NAME_PLACEHOLDER, secretary_name
                 )
+                return _prepend_persona_block(text, persona_block)
     except Exception as e:
         logging.warning("读取秘书 system prompt 失败: %s", e)
     # 文件缺失 / 为空 / 读取失败：回落普通提示词，并把默认名换成秘书名
-    return _replace_default_agent_name(_load_plain_system_prompt(is_gui), secretary_name)
+    text = _replace_default_agent_name(_load_plain_system_prompt(is_gui), secretary_name)
+    return _prepend_persona_block(text, persona_block)
+
+
+def _prepend_persona_block(text: str, persona_block: str) -> str:
+    """把秘书专属人设块前置到提示词顶部；块为空时原样返回（默认人设路径不变）。"""
+    if not persona_block:
+        return text
+    return f"{persona_block}\n\n{text}" if text else persona_block
 
 
 def _is_secretary_session_for_render(session_name) -> bool:

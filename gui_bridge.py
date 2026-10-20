@@ -4257,6 +4257,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         "session_id": s.get("id"),
                         "display_name": sec_name,
                         "secretary_name": sec_name,
+                        # 专属人设原文（空串 = 内置默认秘书人设）：侧栏「编辑人设」
+                        # 弹窗直接用它回填，不再多打一次后端
+                        "secretary_persona": secretary.get_secretary_persona(name),
                         # 显式标注秘书归属（前端此前靠 secretary_name 兜底判定，
                         # 这里给出明确字段，避免与"名字恰好叫秘书"的普通会话混淆）
                         "is_secretary": True,
@@ -4364,6 +4367,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 }
                 if is_secretary:
                     entry["secretary_name"] = display_name
+                    entry["secretary_persona"] = secretary.get_secretary_persona(name)
                     entry["is_secretary"] = True
                 items.append(entry)
             # archived_at 是 ISO8601 文本，字符串倒序即时间倒序；
@@ -4404,7 +4408,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("create_session 失败")
             return {"ok": False, "msg": str(e)}
 
-    def create_secretary_session(self, title: str = "新会话", name: str = "") -> Dict[str, Any]:
+    def create_secretary_session(self, title: str = "新会话", name: str = "",
+                                 persona: str = "") -> Dict[str, Any]:
         """新建一个「秘书」会话并切为当前会话（必须先给定这个名字）。
 
         秘书会话固定 workdir="GLOBAL"、source="SECRETARY"：秘书能力不绑定任何
@@ -4414,15 +4419,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         名字是秘书会话的身份标识：先校验后落库，非法名字直接拒绝且**不产生会话
         记录**——否则会留下一个既无名字又已切走的孤儿会话。名字只存在
         `secretary_name` 列里，不改 `session_name`，因此改名不牵动消息 / 摘要 / 快照。
+
+        persona 是这个秘书的专属人设（可选）：每个秘书都是用户自己创建的独立
+        agent，人设只作用于它自己的会话；留空 = 使用内置默认秘书人设。
         """
         try:
             try:
                 secretary_name = secretary.validate_secretary_name(name)
+                secretary_persona = secretary.validate_secretary_persona(persona)
             except ValueError as e:
                 return {"ok": False, "msg": str(e)}
             new_name = f"session_{uuid.uuid4().hex[:6]}"
             self._memory.create_session_explicit(
-                new_name, workdir="GLOBAL", source="SECRETARY", secretary_name=secretary_name
+                new_name, workdir="GLOBAL", source="SECRETARY",
+                secretary_name=secretary_name, secretary_persona=secretary_persona,
             )
             # 新会话名此前不可能进过缓存，这里失效是为并发路径兜底（同名复用等），
             # 成本一次字典 pop，却能让首轮工具提示 / 标题立刻拿到新名字
@@ -4436,10 +4446,40 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "title": title,
                 "display_name": secretary_name,
                 "secretary_name": secretary_name,
+                "secretary_persona": secretary_persona,
                 "workdir": "GLOBAL",
             }
         except Exception as e:
             logger.exception("create_secretary_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_secretary_persona(self, session_name: str, persona: str = "") -> Dict[str, Any]:
+        """设置某个秘书会话的专属人设（空串 = 恢复内置默认秘书人设）。
+
+        人设只落 `secretary_persona` 列，不碰 session_name / 消息 / 摘要，因此
+        改人设不迁移任何键；改完必须失效身份缓存，否则同一进程内已缓存旧身份的
+        高频路径（提示词、工具提示）会沿用旧人设到下次重启。
+        """
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if not secretary.is_secretary_session(session_name):
+                return {"ok": False, "msg": "该会话不是秘书会话，无法设置秘书人设"}
+            try:
+                cleaned = secretary.validate_secretary_persona(persona)
+            except ValueError as e:
+                return {"ok": False, "msg": str(e)}
+            if not self._memory.set_session_secretary_persona(session_name, cleaned):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            secretary.invalidate_secretary_cache(session_name)
+            return {
+                "ok": True,
+                "session_name": session_name,
+                "secretary_persona": cleaned,
+                "sessions": self.get_sessions(),
+            }
+        except Exception as e:
+            logger.exception("set_secretary_persona 失败")
             return {"ok": False, "msg": str(e)}
 
     def get_active_agent_name(self) -> Dict[str, Any]:
@@ -5277,7 +5317,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         """返回可扩展的系统级设置快照；不得包含凭据。"""
         from core.command_shell import get_system_settings
 
-        return get_system_settings()
+        return get_system_settings(active_model_id=self._effective_active_model_id())
+
+    def _effective_active_model_id(self) -> str:
+        """当前会话生效模型的 id（GUI 按会话绑定模型，全局值可能已过期）。
+
+        电脑操控资格提示必须跟着"真正会执行任务的模型"走：用户在不同会话里
+        可以用不同模型，全局 active_model_id 只在会话未绑定时才是生效值。
+        """
+        try:
+            active = get_active_model(getattr(self, "_current_session", None)) or {}
+            return str(active.get("id") or "")
+        except Exception:
+            logger.debug("解析会话生效模型失败，回退全局默认", exc_info=True)
+            return ""
 
     def set_command_shell(self, shell_id: str) -> Dict[str, Any]:
         """设置命令默认解释器；不可用解释器必须显式拒绝，不做静默降级。"""
@@ -5691,6 +5744,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return result if isinstance(result, dict) else {"ok": False, "msg": "汇总返回异常"}
         except Exception as e:  # pragma: no cover - 防御性兜底
             logger.exception("get_decision_audit_summary 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_decision_record_detail(self, trace_id: str) -> Dict[str, Any]:
+        """按 trace_id 取单条决策记录详情（发给 JEV 的请求 + 上游返回的答案）。
+
+        面板点开一条记录时调用：只读审计文件，找不到返回 ok=false，不抛错。
+        """
+        from core import decision_service
+
+        try:
+            result = decision_service.get_decision_record_detail(trace_id)
+            return result if isinstance(result, dict) else {"ok": False, "msg": "详情返回异常"}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_record_detail 失败")
             return {"ok": False, "msg": str(e)}
 
     def open_decision_audit_dir(self) -> Dict[str, Any]:
@@ -7636,12 +7703,21 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         )
                     except Exception:
                         baseline_tokens = 0
+                    # 本轮是否带图：带图时 router 只能切到「确实支持视觉」的副模型，
+                    # 否则等于把用户的图片丢给不识图的便宜模型，视觉链路会直接降级成
+                    # 「无法分析图片」占位提示（用户发图就是要人看图，不能为省钱吞掉）。
+                    turn_has_image = isinstance(parsed_content, list) and any(
+                        isinstance(block, dict)
+                        and block.get("type") in ("image_url", "image")
+                        for block in parsed_content
+                    )
                     turn_override = resolve_turn_model(
                         active_model,
                         turn_source=turn_source,
                         pending_model_id=pending_model_id,
                         baseline_tokens=baseline_tokens,
                         user_text=user_text,
+                        has_image=turn_has_image,
                     )
                     if turn_override:
                         logger.info(

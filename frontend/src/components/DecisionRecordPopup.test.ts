@@ -22,6 +22,7 @@ function mockApi(overrides: Record<string, unknown> = {}) {
       runtime: {},
     })),
     open_decision_audit_dir: vi.fn(async () => ({ ok: true })),
+    get_decision_record_detail: vi.fn(async () => ({ ok: false, msg: '未找到这条决策记录' })),
     ...overrides,
   };
   (window as any).pywebview = { api };
@@ -54,7 +55,7 @@ describe('DecisionRecordPopup', () => {
         today_fallback_count: 0,
         recent: [
           { ts: '2026-10-16T10:00:00', scene: 'probe', shadow: false, adopted: true, latency_ms: 326, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '' },
-          { ts: '2026-10-16T10:01:00', scene: 'router', shadow: true, adopted: false, latency_ms: 210, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '' },
+          { ts: '2026-10-16T10:01:00', scene: 'router', shadow: true, adopted: false, latency_ms: 210, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '帮我把登录模块重构成 async/await', answer: 'main' },
         ],
       })),
       get_decision_settings: vi.fn(async () => ({
@@ -74,10 +75,16 @@ describe('DecisionRecordPopup', () => {
     expect(wrapper.find('[data-test="decision-pop-status"]').text()).toContain('已启用');
     expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('今日 2 次决策');
     const list = wrapper.find('[data-test="decision-pop-list"]').text();
-    expect(list).toContain('probe');
-    expect(list).toContain('router');
+    // 场景显示中文标签：一眼看出这条记录在判什么
+    expect(list).toContain('探针（连通性）');
+    expect(list).toContain('路由（选模型）');
     expect(list).toContain('影子');
     expect(list).toContain('326ms');
+    // 业务记录必须带上「判定的事由」与「模型结论」
+    expect(list).toContain('帮我把登录模块重构成 async/await');
+    expect(list).toContain('→ main');
+    // 采纳状态与回退原因互斥展示
+    expect(list).toContain('已采纳');
   });
 
   it('会话名为空（新会话懒创建阶段）时不请求审计汇总，直接显示空态', async () => {
@@ -115,6 +122,65 @@ describe('DecisionRecordPopup', () => {
     expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(2);
     expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(10, 'sess-B');
     wrapper.unmount();
+  });
+
+  it('点开一条记录：展示发给 JEV 的请求原文与 JEV 的判定原文', async () => {
+    const api = mockApi({
+      get_decision_audit_summary: vi.fn(async () => ({
+        ok: true,
+        today_count: 1,
+        today_shadow_count: 0,
+        today_adopted_count: 1,
+        today_fallback_count: 0,
+        recent: [
+          {
+            ts: '2026-10-20T10:50:25', scene: 'router', shadow: false, adopted: true,
+            latency_ms: 804, fallback_reason: '', model_id: 'NeoHorse-Jev-4B',
+            answers_digest: '', state_digest: '1+1 等于几？', answer: 'secondary',
+            trace_id: 'abc123',
+          },
+        ],
+      })),
+      get_decision_record_detail: vi.fn(async () => ({
+        ok: true,
+        record: {
+          ts: '2026-10-20T10:50:25',
+          scene: 'router',
+          model_id: 'NeoHorse-Jev-4B',
+          request: {
+            model: 'NeoHorse-Jev-4B',
+            state: '1+1 等于几？',
+            questions: { q: { type: 'choice', criteria: { main: '更强', secondary: '更便宜' } } },
+          },
+          answers: {
+            q: { type: 'choice', choice: 'secondary', probabilities: { main: 0.001, secondary: 0.999 } },
+          },
+        },
+      })),
+    });
+    useAppStore().currentSessionName = 'sess-A';
+    const wrapper = mount(DecisionRecordPopup);
+    await flushPromises();
+
+    // 默认收起
+    expect(wrapper.find('[data-test="decision-pop-detail"]').exists()).toBe(false);
+
+    await wrapper.find('[data-test="decision-pop-item"]').trigger('click');
+    await flushPromises();
+
+    expect(api.get_decision_record_detail).toHaveBeenCalledWith('abc123');
+    const request = wrapper.find('[data-test="decision-pop-request"]').text();
+    expect(request).toContain('"state": "1+1 等于几？"');
+    expect(request).toContain('"type": "choice"');
+    expect(request).toContain('"secondary": "更便宜"');
+    const answers = wrapper.find('[data-test="decision-pop-answers"]').text();
+    expect(answers).toContain('"choice": "secondary"');
+    expect(answers).toContain('0.999');
+
+    // 再点一次收起
+    await wrapper.find('[data-test="decision-pop-item"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="decision-pop-detail"]').exists()).toBe(false);
   });
 
   it('去设置：切到决策分区并关闭面板', async () => {

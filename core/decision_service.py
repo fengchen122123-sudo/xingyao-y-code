@@ -61,8 +61,9 @@ KEY_COOLDOWN_SECONDS = 60
 _PROBE_STATE = "本请求为无害连通探针，不涉及任何用户数据。"
 _PROBE_INSTRUCTIONS = "1+1 是否等于 2？请给出该命题成立的概率。"
 
-# 单条审计记录的字节上限（设计第 5 节：单条 <2KB）
-_AUDIT_MAX_BYTES = 1900
+# 单条审计记录的字节上限：要容纳「请求快照（state ≤500 字 + questions）」+
+# 「上游答案」，同时仍保持一条一行的小体积；超限按 _cap_record 的顺序降级。
+_AUDIT_MAX_BYTES = 6000
 _AUDIT_LOCK = threading.Lock()
 
 # Key 分隔符：换行（含 \r\n）、英文/中文逗号、分号（中英文）
@@ -135,9 +136,14 @@ def _sha16(value) -> str:
 
 
 def _state_digest(state) -> str:
-    """state 摘要：字符串取前 80 字符，其余取哈希。"""
+    """state 摘要：字符串取前 80 字符（超长截断），非字符串取哈希。
+
+    超长时截断而不是整条转哈希：决策记录面板要靠这段摘要告诉用户「这次判的是
+    什么事」，全哈希等于把面板变成一串无意义字符。80 字上限保持不变。
+    """
     if isinstance(state, str):
-        return state if len(state) <= 80 else _sha16(state)
+        text = state.strip()
+        return text if len(text) <= 80 else text[:80]
     return _sha16(state)
 
 
@@ -433,6 +439,9 @@ def _new_record(cfg: dict, scene: str, shadow: bool, trace_id: str) -> dict:
         "key_hint": None,
         "state_digest": None,
         "questions_digest": None,
+        # 请求快照：实际发给决策模型的 model / state / questions，
+        # 用于「回看这次到底问了什么」；state 已脱敏并截断（见 _audit_state）
+        "request": None,
         "answers": None,
         "latency_ms": None,
         "adopted": False,
@@ -441,6 +450,30 @@ def _new_record(cfg: dict, scene: str, shadow: bool, trace_id: str) -> dict:
         # 会话标识：用于按会话判定「这个会话是否真的做过业务决策」；取不到时为空串
         "session_id": "",
     }
+
+
+def _audit_state(state, limit: int = 500) -> str:
+    """审计用的 state 快照：先脱敏再截断（非字符串先序列化）。
+
+    与发给模型的 state 同源同量级（router 场景本来就只发 500 字符），这样
+    「面板回看发给 JEV 的请求」看到的就是真实请求体，而不是另一个摘要。
+    """
+    if isinstance(state, str):
+        text = state
+    else:
+        try:
+            text = json.dumps(state, ensure_ascii=False)
+        except Exception:
+            text = str(state or "")
+    text = text.strip()
+    try:
+        # 延迟导入：避免 decision_service ↔ decision_gateway 模块级循环依赖
+        from core.decision_gateway import redact_sensitive
+
+        text = redact_sensitive(text)
+    except Exception:
+        pass
+    return text if len(text) <= limit else text[:limit]
 
 
 def _current_session_id() -> str:
@@ -467,14 +500,30 @@ def _current_session_id() -> str:
 
 
 def _cap_record(record: dict) -> dict:
-    """保证单条记录 <2KB：超限时依次把 answers / extra 换成摘要。"""
+    """把单条记录压到 _AUDIT_MAX_BYTES 以内，尽量保住可读内容。
+
+    降级顺序：先缩 request.state（保留 200 字）→ 再换掉 answers → 最后换掉 extra。
+    优先保住请求摘要，因为「面板回看这次问了什么」最依赖它。
+    """
     try:
-        if len(json.dumps(record, ensure_ascii=False).encode("utf-8")) <= _AUDIT_MAX_BYTES:
+        def _size(value) -> int:
+            return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+        if _size(record) <= _AUDIT_MAX_BYTES:
             return record
         capped = dict(record)
+        request = capped.get("request")
+        if isinstance(request, dict):
+            shrunk = dict(request)
+            shrunk["state"] = str(request.get("state") or "")[:200]
+            shrunk["state_truncated"] = True
+            capped["request"] = shrunk
+        if _size(capped) <= _AUDIT_MAX_BYTES:
+            return capped
         capped["answers"] = {"truncated": True, "digest": _sha16(record.get("answers"))}
-        if len(json.dumps(capped, ensure_ascii=False).encode("utf-8")) > _AUDIT_MAX_BYTES:
-            capped["extra"] = {"truncated": True, "digest": _sha16(record.get("extra"))}
+        if _size(capped) <= _AUDIT_MAX_BYTES:
+            return capped
+        capped["extra"] = {"truncated": True, "digest": _sha16(record.get("extra"))}
         return capped
     except Exception:
         return record
@@ -623,6 +672,12 @@ def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None, au
     record["session_id"] = _current_session_id()
     record["state_digest"] = _state_digest(state)
     record["questions_digest"] = _sha16(questions)
+    # 请求快照：记录真正发给决策模型的三个字段，供面板回看「问的是什么」
+    record["request"] = {
+        "model": cfg.get("model_id"),
+        "state": _audit_state(state),
+        "questions": questions,
+    }
     if isinstance(audit_extra, dict) and audit_extra:
         # 调用方附加上下文（如启发式基线档 baseline_tier）：供影子模式后续
         # 一致性对比分析；体积由 _cap_record 统一兜底
@@ -937,8 +992,44 @@ def list_decision_models() -> dict:
 # 设置页快照（配置 + 运行时状态）
 # ---------------------------------------------------------------------------
 
+def _brief_answer(answers) -> str:
+    """从审计 answers 里提取一行结论（choice 选项 / noul 概率 / score 等级）。
+
+    只做展示用的字符串化：解析不出来就返回空串，绝不抛错。
+    """
+    try:
+        payload = answers
+        if isinstance(payload, dict):
+            if "q" in payload:
+                payload = payload["q"]
+            elif len(payload) == 1:
+                payload = next(iter(payload.values()))
+            else:
+                return ""
+        if isinstance(payload, dict):
+            if "choice" in payload:
+                return str(payload["choice"])[:40]
+            if "noul" in payload:
+                return f"概率 {float(payload['noul']):.2f}"
+            if "score" in payload:
+                return f"评分 {payload['score']}"
+            return ""
+        if isinstance(payload, bool):
+            return "是" if payload else "否"
+        if isinstance(payload, (int, float, str)):
+            return str(payload)[:40]
+    except Exception:
+        return ""
+    return ""
+
+
 def _audit_brief(record: dict) -> dict:
-    """审计记录 → 面板精简条目（不含 state/questions 正文）。"""
+    """审计记录 → 面板精简条目。
+
+    ``state_digest`` 是**决策当时的输入摘要**（已在构造时脱敏并截断），面板靠它
+    显示「这一次到底判的是什么事」；``answer`` 是模型给出的结论（choice 选项 /
+    noul 概率），两者都只透出短片段，避免把大对象塞进面板。
+    """
     answers = record.get("answers")
     answers_digest = ""
     if isinstance(answers, dict):
@@ -953,6 +1044,12 @@ def _audit_brief(record: dict) -> dict:
         "latency_ms": record.get("latency_ms"),
         "fallback_reason": str(record.get("fallback_reason") or ""),
         "model_id": str(record.get("model_id") or ""),
+        # trace_id：面板点开某条记录时用它回查完整请求/响应
+        "trace_id": str(record.get("trace_id") or ""),
+        # 决策输入摘要：面板据此展示「这次判的是什么事」
+        "state_digest": str(record.get("state_digest") or "")[:160],
+        # 模型给出的结论：choice 选项 / noul 概率 / score 等级
+        "answer": _brief_answer(answers),
         "answers_digest": answers_digest,
     }
 
@@ -1055,6 +1152,46 @@ def get_decision_audit_summary(limit: int = 20, session_id=None) -> dict:
         collected = briefs + collected
     summary["recent"] = collected[-count:]
     return summary
+
+
+def get_decision_record_detail(trace_id: str) -> dict:
+    """按 trace_id 取单条审计记录的完整内容（请求快照 + 上游答案）。
+
+    面板「点开一条记录」用：``request`` 是真正发给决策模型的 model/state/questions，
+    ``answers`` 是上游原样返回的结构（choice 选项 + probabilities 等）。
+    只读、容错：找不到返回 ok=false，文件损坏跳过该行，绝不抛错。
+    """
+    wanted = str(trace_id or "").strip()
+    if not wanted:
+        return {"ok": False, "msg": "缺少 trace_id"}
+    directory = _audit_dir()
+    if not os.path.isdir(directory):
+        return {"ok": False, "msg": "审计目录不存在"}
+    try:
+        names = sorted(
+            (name for name in os.listdir(directory) if name.endswith(".jsonl")),
+            reverse=True,
+        )
+    except Exception:
+        return {"ok": False, "msg": "审计目录不可读"}
+    for name in names:
+        try:
+            with open(os.path.join(directory, name), "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except Exception:
+            continue
+        # 新记录在文件末尾，倒序找更快命中
+        for line in reversed(lines):
+            line = line.strip()
+            if not line or wanted not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(record, dict) and str(record.get("trace_id") or "") == wanted:
+                return {"ok": True, "record": record}
+    return {"ok": False, "msg": "未找到这条决策记录"}
 
 
 def get_decision_settings_snapshot() -> dict:

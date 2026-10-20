@@ -86,7 +86,7 @@
       <div class="setting-row">
         <div class="setting-copy">
           <h2>上下文水位基准</h2>
-          <p>上下文压缩与折叠的触发水位按 min(模型窗口, 本值) 计算；留空或填 0 表示不设基准、直接跟随模型真实窗口。数值越大，维护触发越晚。例：1M 窗口填 800000 时，第一级折叠线落在 480000 tokens。</p>
+          <p>触发水位按 min(模型窗口, 本值) 计算；留空或填 0 表示不设基准、直接跟随模型真实窗口。</p>
         </div>
         <div class="setting-number-group">
           <input
@@ -155,21 +155,19 @@
         {{ store.systemSettings.command_shell_error }}
       </p>
       <p class="setting-note">
-        命令失败时错误会原样返回给大模型，由模型调整语法或通过命令工具显式指定其他已安装解释器；系统不会静默降级。
+        命令失败时错误会原样返回给模型，由模型调整语法或显式指定其他已安装解释器，系统不会静默降级。
       </p>
     </section>
 
     <section class="computer-settings" data-test="computer-settings-section">
       <header class="computer-header">
         <h2 class="computer-title"><AppIcon name="zap" :size="14" /> 电脑操控</h2>
-        <p>浏览器操控与完整电脑操控是两个独立开关，默认关闭；开启后 星瑶Code 不再逐动作询问授权。</p>
-        <p>电脑操控要求模型支持视觉（识图）与工具调用：两项能力都开启的模型在开关开启后自动可用，无需逐个配置。</p>
       </header>
 
       <div class="setting-row">
         <div class="setting-copy">
           <h2>浏览器操控</h2>
-          <p>模型可在专用 Edge/Chrome 页面中观察、点击、输入、滚动和导航；只控制网页内容区。</p>
+          <p>在专用 Edge/Chrome 页面中观察、点击、输入、滚动和导航。</p>
         </div>
         <button
           v-if="!isMobile"
@@ -233,35 +231,49 @@
         电脑操控开关与默认浏览器请在桌面端开启或修改；手机端仅可查看状态与紧急停止。
       </p>
 
-      <div class="computer-info-row">
+      <div class="setting-row">
         <div class="setting-copy">
           <h2>专用配置目录</h2>
-          <p class="mono profile-path" data-test="computer-profile-path">{{ store.systemSettings.computer_profile_path }}</p>
-          <p>登录态与浏览器数据保存在本机该目录中，不读取日常浏览器的配置、Cookie 或扩展。</p>
+          <p>登录态与浏览器数据只保存在本机该目录，不读取日常浏览器的配置、Cookie 或扩展。</p>
         </div>
+        <span class="setting-path mono" data-test="computer-profile-path">{{ store.systemSettings.computer_profile_path }}</span>
       </div>
 
-      <p class="computer-privacy" data-test="computer-privacy-notice"><AppIcon name="triangle-alert" :size="13" />开启后，当前页面或桌面截图会发送给当前模型 Provider；星瑶Code 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。</p>
-
       <p
-        v-if="computerModelCapabilityHint"
-        class="computer-model-hint"
-        :class="{ blocked: computerModelCapabilityBlocked }"
+        v-if="computerModelCapabilityBlocked"
+        class="computer-model-hint blocked"
         data-test="computer-model-capability-hint"
       >{{ computerModelCapabilityHint }}</p>
 
-      <ul class="computer-preflight" data-test="computer-preflight-list">
-        <li v-for="item in preflightItems" :key="item.label" :class="{ ok: item.ok }">
-          <AppIcon :name="item.ok ? 'check' : 'x'" :size="12" :stroke-width="2.25" />
-          <span>{{ item.label }}</span>
-        </li>
-      </ul>
+      <details class="setting-details" data-test="computer-diagnostics">
+        <summary>环境检测与安全提示</summary>
+        <div class="setting-details-body">
+          <p class="computer-privacy" data-test="computer-privacy-notice"><AppIcon name="triangle-alert" :size="13" />开启后，当前页面或桌面截图会发送给当前模型 Provider；星瑶Code 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。</p>
+
+          <p
+            v-if="computerModelCapabilityHint && !computerModelCapabilityBlocked"
+            class="computer-model-hint"
+            data-test="computer-diagnostics-capability-hint"
+          >{{ computerModelCapabilityHint }}</p>
+
+          <ul class="computer-preflight" data-test="computer-preflight-list">
+            <li v-for="item in preflightItems" :key="item.label" :class="{ ok: item.ok }">
+              <AppIcon :name="item.ok ? 'check' : 'x'" :size="12" :stroke-width="2.25" />
+              <span>{{ item.label }}</span>
+            </li>
+          </ul>
+
+          <p class="setting-details-note">
+            浏览器操控与完整电脑操控是两个独立开关，默认关闭；开启后 星瑶Code 不再逐动作询问授权。电脑操控要求模型支持视觉（识图）与工具调用，两项能力都开启的模型在开关开启后自动可用，无需逐个配置。
+          </p>
+        </div>
+      </details>
     </section>
 
     <section class="doctor-settings" data-test="doctor-settings-section">
       <header class="doctor-header">
         <h2 class="doctor-title"><AppIcon name="zap" :size="14" /> 运行自检</h2>
-        <p>一键检查配置、凭据、数据目录、数据库、MCP 服务、模型端点与运行环境，与 CLI 的 /doctor 使用同一套检查项；除数据目录做一次写入-删除自测外全部只读。</p>
+        <p>一键检查配置、凭据、数据目录、数据库、MCP 服务、模型端点与运行环境，与 CLI 的 /doctor 同源。</p>
       </header>
 
       <div class="setting-row">
@@ -311,7 +323,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 
 import { useAppStore } from '../stores/appStore';
 import { useIsMobile } from '../composables/useViewport';
@@ -323,6 +335,10 @@ const saving = ref(false);
 
 // 手机 viewport 不显示可点击启用控件（呈现层约束；后端边界由 Task 15 实施）
 const isMobile = useIsMobile();
+
+// 每次进入设置页重拉一次：电脑操控资格提示依赖「当前会话生效模型」，
+// 会话级模型随时可能被切换，沿用启动时的快照会显示成别的模型
+onMounted(() => { void store.refreshSystemSettings({ silent: true }); });
 
 const turnStepLimitDraft = ref(String(store.systemSettings.agent_turn_step_limit));
 
@@ -664,10 +680,22 @@ async function runDoctor() {
 .setting-switch[aria-checked='true'] .switch-knob { transform: translateX(20px); }
 .setting-switch:disabled { cursor: wait; opacity: .7; }
 .computer-mobile-note { margin: 10px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
-.computer-info-row { border-bottom: 1px solid var(--border); padding: 18px 0; }
-.profile-path { margin: 4px 0 6px; color: var(--text-dim); font-size: 12px; word-break: break-all; }
+/* 专用配置目录是长路径：右侧只读展示，不占整行 */
+.setting-path { flex: 0 0 auto; max-width: 50%; color: var(--text-dim); font-size: 12px; text-align: right; word-break: break-all; }
+
+/* 环境检测/安全提示等说明性内容默认收起，保持主视图一行一项 */
+.setting-details { margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }
+.setting-details > summary { display: flex; align-items: center; gap: 6px; padding: 11px 14px; color: var(--text-dim); font-size: 12.5px; cursor: pointer; list-style: none; }
+.setting-details > summary::-webkit-details-marker { display: none; }
+.setting-details > summary::before { content: '▸'; color: var(--text-faint); font-size: 10px; }
+.setting-details[open] > summary::before { content: '▾'; }
+.setting-details > summary:hover { color: var(--text); }
+.setting-details-body { padding: 0 14px 12px; }
+/* 提示本身就在折叠容器里，去掉重复的边框与底色 */
+.setting-details-body .computer-privacy { margin-top: 0; padding: 0; border: 0; background: transparent; }
+.setting-details-note { margin: 10px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
 .computer-model-hint {
-  margin: 0;
+  margin: 12px 0 0;
   font-size: 12px;
   color: var(--text-secondary, #666);
 }

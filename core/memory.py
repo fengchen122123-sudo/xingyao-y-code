@@ -464,6 +464,11 @@ class MemoryManager:
                 # ALTER ADD COLUMN 幂等添加，不重建表、不动历史行。
                 if "secretary_name" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN secretary_name TEXT")
+                # 秘书人设：会话级自定义人设文本（NULL/空 = 使用内置默认秘书人设）。
+                # 每个秘书是独立 agent，人设只属于它自己这个会话，与设置页的
+                # 星瑶人设互不影响；同样只走 ALTER ADD COLUMN 幂等添加。
+                if "secretary_persona" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN secretary_persona TEXT")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -2655,23 +2660,27 @@ class MemoryManager:
         clear_cache_usage_session(session_name)
         return deleted
 
-    def create_session_explicit(self, session_name, workdir=None, source="GUI", secretary_name=None):
+    def create_session_explicit(self, session_name, workdir=None, source="GUI", secretary_name=None,
+                                secretary_persona=None):
         """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。
 
         secretary_name 仅秘书会话创建路径传入（NULL/空 = 非秘书会话）。名字合法性
         由调用方（core.secretary.validate_secretary_name）先行校验，本层不再静默
         截断或改写，只把空值统一落 NULL，避免"空串"与"未设置"两套口径并存。
+
+        secretary_persona 同上：仅秘书会话使用，NULL/空 = 走内置默认秘书人设。
         """
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
         sec_name = str(secretary_name).strip() if secretary_name else None
+        sec_persona = str(secretary_persona).strip() if secretary_persona else None
         with self._lock:
             cursor = self.conn.cursor()
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, secretary_name)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (session_name, wdir, now, now, source, sec_name or None))
+                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, secretary_name, secretary_persona)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (session_name, wdir, now, now, source, sec_name or None, sec_persona or None))
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
@@ -2709,6 +2718,44 @@ class MemoryManager:
                     UPDATE sessions SET secretary_name = ?, updated_at = ?
                     WHERE session_name = ?
                 ''', (sec_name or None, now, session_name))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self.conn.rollback()
+                return False
+
+    def get_session_secretary_persona(self, session_name) -> str:
+        """取会话的秘书人设；无记录 / 未设置 / 查询异常一律返回空串。
+
+        空串语义是"使用内置默认秘书人设"，与读取异常共用同一回落值——人设是
+        提示词增强项，取不到时宁可退回默认证，也不能打断整轮请求。
+        """
+        try:
+            with self._lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT secretary_persona FROM sessions WHERE session_name = ?
+                ''', (session_name,))
+                row = cursor.fetchone()
+        except Exception:
+            return ""
+        return str(row[0]) if row and row[0] else ""
+
+    def set_session_secretary_persona(self, session_name, persona) -> bool:
+        """写入会话的秘书人设，返回是否有匹配行被更新。
+
+        传 None/空字符串落 NULL（= 回退内置默认秘书人设）；长度等合法性由调用方
+        （core.secretary.validate_secretary_persona）校验。异常回滚返回 False。
+        """
+        sec_persona = str(persona).strip() if persona else None
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute('''
+                    UPDATE sessions SET secretary_persona = ?, updated_at = ?
+                    WHERE session_name = ?
+                ''', (sec_persona or None, now, session_name))
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception:

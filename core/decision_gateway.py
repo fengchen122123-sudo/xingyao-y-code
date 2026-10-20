@@ -197,6 +197,35 @@ def _pick_choice(answer, options):
     return _MISSING
 
 
+def _criteria_object(criteria, options) -> dict:
+    """把 choice 题的 criteria 规范成上游要求的「选项名 → 描述」对象。
+
+    上游协议（`GET /api/docs/jev`）：`choice` 的 `criteria` 必须是「选项名到描述的
+    对象，1～255 项」；传数组或干脆省略都会被上游判成 422 JEV_INVALID_REQUEST。
+    这里统一兜一层，避免每个调用点各写一遍形状：
+
+    - 已是对象：原样（转成字符串键值）使用；
+    - 数组：元素是 `{"name"/"id"/"choice", "description"}` 时取字段，否则以元素自述；
+    - 缺失：用调用方给的 ``options`` 构造（选项名即描述）。
+    """
+    if isinstance(criteria, dict) and criteria:
+        return {str(name): str(desc) for name, desc in criteria.items()}
+    items = criteria if isinstance(criteria, (list, tuple)) else []
+    if not items:
+        items = list(options) if isinstance(options, (list, tuple)) else []
+    normalized: dict = {}
+    for item in items:
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("id") or item.get("choice")
+            if name is None:
+                continue
+            description = item.get("description") or item.get("desc") or name
+            normalized[str(name)] = str(description)
+        else:
+            normalized[str(item)] = str(item)
+    return normalized
+
+
 def _pick_noul(answer, threshold: float):
     """noul 题：概率必须是 0~1 的数字且 >= threshold。"""
     if answer is _MISSING:
@@ -258,6 +287,14 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
         scene_cfg = _scene_config(cfg, scene)
         if scene_cfg is None or not bool(scene_cfg.get("enabled")):
             return None
+
+        # 2.5) 题面规范化：上游 choice 题要求 criteria 是「选项名 → 描述」的对象，
+        #      数组/缺失一律 422。这里统一校正，校正不出任何选项就不发这次请求。
+        if question_type == "choice":
+            question = dict(question)
+            question["criteria"] = _criteria_object(question.get("criteria"), options)
+            if not question["criteria"]:
+                return None
 
         # 3) shadow：照旧发请求并写审计，但结果丢弃（影子只做观测）
         shadow = bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True))

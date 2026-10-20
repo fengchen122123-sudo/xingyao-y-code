@@ -434,10 +434,12 @@ def test_state_contains_only_prompt_head_names_and_workdir(
     assert state.endswith("工作目录：/tmp/project-x")
     # 检索片段（snippets 里的会话正文）绝不能进入 state
     assert "会话历史正文不应进入 state" not in state
-    # 题目形状符合规范
+    # 题目形状符合规范：上游要求 criteria 是「选项名 → 描述」的对象，不是数组
     question = calls[0]["question"]
     assert question["type"] == "choice"
-    assert question["criteria"] == calls[0]["kwargs"]["options"]
+    assert isinstance(question["criteria"], dict)
+    assert set(question["criteria"]) == set(calls[0]["kwargs"]["options"])
+    assert all(question["criteria"].values())
     assert "只依据任务描述与会话名判断" in question["instructions"]
 
 
