@@ -12,11 +12,18 @@ handoff，模型事件入口取出复用，避免同一 Turn 解析两次。hand
 （一次性），只在同线程内可见，绝不是跨回合/跨线程的全局状态。
 """
 
+from __future__ import annotations
+
 import threading
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from core.computer.models import ComputerCapability, ComputerProtocol, ComputerTarget
-from core.computer.settings import ComputerSettingsSnapshot
+
+if TYPE_CHECKING:
+    # 仅类型注解使用：core.computer.settings 会连带 platforms/config（约 36ms），
+    # 不该跟着纯判定模块一起进 CLI 的启动路径。
+    from core.computer.settings import ComputerSettingsSnapshot
 
 _OFFICIAL_OPENAI_HOST = "api.openai.com"
 
@@ -70,6 +77,21 @@ def resolve_computer_capability(
     """在 Turn 起点冻结一次能力决策；任何一步不满足都返回带稳定错误码的禁用结果。"""
     model = model or {}
     provider = provider or {}
+
+    # CLI 轻量模式硬禁用：main.py 入口在导入 core.* 之前设置 YCODE_TOOL_PROFILE=cli。
+    # 放在所有判定之前，保证任何调用方（主代理/子代理/后台任务）都拿不到能力，
+    # 也就不会把 computer_action 注入工具表。只读这一个入口声明，不碰配置文件。
+    try:
+        import os
+
+        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "cli":
+            return _rejected(
+                settings,
+                "computer_cli_disabled",
+                "CLI 轻量模式不提供电脑操控与浏览器操控",
+            )
+    except Exception:
+        pass
 
     if turn_source != "local":
         return _rejected(

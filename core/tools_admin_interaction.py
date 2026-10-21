@@ -722,7 +722,9 @@ def _computer_mutate(act: str, run_id: str) -> dict[str, Any]:
         elif act == "resume":
             snapshot = controller.resume(run_id)
         else:
-            snapshot = controller.stop(run_id, "user_stop")
+            # 走 stop_for_user：用户（或模型代表用户）停止操控不应终止整个
+            # 对话回合，只需结束 run 并留下"用户已停止"的抑制态与通知。
+            snapshot = controller.stop_for_user(run_id, "user_stop")
     except ComputerControlError as exc:
         return {
             "source": "core",

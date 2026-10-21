@@ -106,7 +106,8 @@ from core.computer.provider_openai import (
     native_computer_call_from_stream,
     native_has_dual_targets,
 )
-from core.computer.settings import load_computer_settings
+# load_computer_settings 延迟到能力解析时再 import：它连带 core.computer.platforms
+# 与 config（冷启动约 36ms），CLI 轻量模式下能力恒为禁用，不需要在启动期付这笔成本。
 from core.computer.tool_adapter import (
     COMPUTER_ACTION_TOOL_NAME,
     RESERVED_COMPUTER_TOOL_NAMES,
@@ -313,7 +314,56 @@ from core.llm_diagnostics import (
 from core.tool_registry import build_default_registry, filter_reserved_tool_schemas
 # 秘书工具策略的单一事实源（纯读模块，模块级 import 无循环依赖）
 from core import secretary
-tool_registry = build_default_registry()
+
+
+class _LazyToolRegistry:
+    """首次被访问时才真正构建默认工具表。
+
+    构建要装配 60+ 个 ToolSpec 并扫描插件目录（实测冷启动约 0.6s），而它
+    只在"第一次真正要发请求 / 查工具"时才有用。改成惰性后，入口层可以先
+    铺界面，再由后台线程预热；首轮请求正常情况下已经命中缓存。
+    """
+
+    __slots__ = ("_inner", "_building")
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_inner", None)
+        object.__setattr__(self, "_building", False)
+
+    def _load(self):
+        inner = object.__getattribute__(self, "_inner")
+        if inner is not None:
+            return inner
+        with _TOOL_REGISTRY_BUILD_LOCK:
+            inner = object.__getattribute__(self, "_inner")
+            if inner is not None:
+                return inner
+            if object.__getattribute__(self, "_building"):
+                # 构建期内的同线程回环访问（插件加载链路可能向上取活跃表）：
+                # 返回空表占位，避免无限递归。
+                from core.tool_registry import ToolRegistry
+
+                return ToolRegistry()
+            object.__setattr__(self, "_building", True)
+            try:
+                inner = build_default_registry()
+            finally:
+                object.__setattr__(self, "_building", False)
+            object.__setattr__(self, "_inner", inner)
+            return inner
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._load(), name, value)
+
+
+_TOOL_REGISTRY_BUILD_LOCK = threading.RLock()
+
+# 保持模块级属性名不变：permission_terminal / plugin_loader / tool_pipeline
+# 以及测试都通过 getattr(llm, "tool_registry") 取"当前活跃注册表"。
+tool_registry = _LazyToolRegistry()
 
 
 _mcp_first_wait_done = False
@@ -892,6 +942,8 @@ def resolve_turn_computer_capability(
         "base_url": api_base,
     }
     try:
+        from core.computer.settings import load_computer_settings
+
         settings = load_computer_settings()
     except ComputerControlError as error:
         return ComputerCapability(
@@ -1496,6 +1548,27 @@ def _chat_with_model_generator(
     if request_protocol is None:
         request_protocol = "anthropic" if str(model_name).startswith("anthropic/") else "openai"
     turn_snapshot = deepcopy(messages)
+    # 电脑操控「用户已停止」抑制态与待投递通知（core/computer/stop_notice.py）：
+    # 函数内导入而非模块顶层，让依赖方向保持单向（stop_notice 只用标准库，
+    # 不反向依赖 llm）。恢复条件②在这里生效：用户新消息命中恢复关键词即解除
+    # 抑制——停止不再终止回合后模型会被硬拦（computer_user_stopped），必须留
+    # 一条用户侧的解除路径，否则用户说"继续操作"也解不开。只扫最后一条 user
+    # 消息：更早的历史消息代表过去的意图，不能用来解除当前抑制。
+    from core.computer import stop_notice as _stop_notice
+
+    for _turn_msg in reversed(messages):
+        if isinstance(_turn_msg, dict) and _turn_msg.get("role") == "user":
+            _resume_content = _turn_msg.get("content")
+            if isinstance(_resume_content, list):
+                # 多模态 user 消息只拼文本片段，忽略图片/附件对象。
+                _resume_content = " ".join(
+                    str(_part.get("text") or "")
+                    for _part in _resume_content
+                    if isinstance(_part, dict)
+                )
+            if _stop_notice.user_message_resumes_control(str(_resume_content or "")):
+                _stop_notice.deactivate_user_stop("user_message")
+            break
     keepalive_interval = 0
     if cache_scope == "main":
         from core.cache_keepalive import cache_keepalive_service, load_keepalive_interval
@@ -1874,11 +1947,18 @@ def _chat_with_model_generator(
             pending_persistence.append(("user", notif))
         flush_persistence()
 
+    # 电脑操控「用户已停止」通知由 _stop_notice（回合入口已导入）提供，本处只
+    # 准备"本轮已 drain"的镜像列表：异常/取消回滚时要像后台通知一样把已 drain
+    # 的文案放回内存 messages，否则同一轮的后续步骤会看不到这条事实。
+    drained_stop_notices = []
+
     def rollback_turn_messages():
         """回滚本轮新增的消息残影；已 drain 的后台通知重新保留，避免丢失。"""
         messages[:] = turn_snapshot
         for notif in drained_notifications:
             messages.append({"role": "user", "content": notif})
+        for stop_notice_text in drained_stop_notices:
+            messages.append({"role": "user", "content": stop_notice_text})
 
     # 注意：不因“计划进行中”裁剪 tools——计划约束由执行层
     # （_execute_single_tool_call 的 plan_enforced 拦截）统一保证，裁剪是双重保险。
@@ -2116,6 +2196,21 @@ def _chat_with_model_generator(
                 return
             if harness_runtime is not None:
                 current_step = harness_runtime.begin_step()
+            # 用户点过"停止电脑操控"时，把那条模型可见通知插在 Step 边界：上一
+            # Step 的工具结果已经全部 append 并 flush，assistant(tool_calls) 与
+            # tool 结果配对完整；插在 Step 中间会制造悬空 tool_calls（Anthropic/
+            # OpenAI 都会 400）。放在这里也保证"先落库工具结果，再落库通知"。
+            _drained_stop_notices = _stop_notice.drain_stop_notices()
+            if _drained_stop_notices:
+                for _stop_notice_text in _drained_stop_notices:
+                    _stop_notice_msg = {
+                        "role": "user",
+                        "content": _stop_notice_text,
+                    }
+                    messages.append(_stop_notice_msg)
+                    pending_persistence.append(("user", _stop_notice_msg))
+                drained_stop_notices.extend(_drained_stop_notices)
+                flush_persistence()
             if turn > 0:
                 # 轮次边界事件：GUI 流式渲染据此把每个 LLM 轮次拆成独立消息块，
                 # 与历史重放（每轮一条 DB 记录）的结构对齐；CLI/子代理只认已知事件，自动忽略

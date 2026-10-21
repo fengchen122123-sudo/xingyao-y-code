@@ -98,6 +98,16 @@ def _restore_entry_layer_globals():
         take_turn_computer_capability()
     except Exception:
         pass
+    # 用户停止电脑操控的抑制态同样是进程级模块变量（core/computer/stop_notice.py）：
+    # 紧急热键用例会真的走 controller.stop_for_user 并置位它，残留后同进程后续用例的
+    # start_run / computer_turn_context_error 会被硬拦成 computer_user_stopped
+    # ——只在组合跑才出现的假失败。
+    try:
+        from core.computer import stop_notice
+
+        stop_notice.deactivate_user_stop("test_reset")
+    except Exception:
+        pass
 
 
 def pytest_sessionfinish(session, exitstatus):

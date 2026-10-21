@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>电脑操控展示 · ZCode 风格改版稿</title>
+<style>
+  :root {
+    --bg: #faf9f6;
+    --panel: #ffffff;
+    --text: #3a3a36;
+    --dim: #6b6b64;
+    --faint: #8f8f87;
+    --border: #e2e0d8;
+    --code-bg: #f0efec;
+    --green: #3f9a4d;
+    --red: #d24a44;
+    --accent: #5b84c4;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 26px 30px 56px;
+    background: var(--bg); color: var(--text);
+    font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+    font-size: 14px; line-height: 1.6;
+  }
+  h1 { font-size: 17px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--faint); font-size: 12.5px; margin-bottom: 22px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; align-items: start; }
+  .col-title { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; color: var(--dim); margin-bottom: 10px; }
+  .tag { font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 999px; background: #eceae3; color: var(--faint); }
+  .tag.new { background: rgba(91,132,196,.14); color: var(--accent); }
+  .board { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+
+  /* 通用小件 */
+  .mini-label { font-size: 11px; color: var(--faint); margin: 14px 0 6px; letter-spacing: .02em; }
+  .chatline { font-size: 12.5px; color: var(--dim); margin-bottom: 8px; }
+
+  /* 旧：右侧面板长列表 */
+  .old-preview { border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--code-bg); }
+  .old-preview .fake-shot {
+    height: 96px; border-radius: 6px;
+    background: repeating-linear-gradient(45deg, #e7e5df, #e7e5df 8px, #efece6 8px, #efece6 16px);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--faint); font-size: 11.5px;
+  }
+  .old-trace { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; max-height: 168px; overflow: hidden; }
+  .old-trace li {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px;
+    background: var(--bg); font-size: 12px; color: var(--dim);
+  }
+  .old-trace li .ok { color: var(--green); }
+  .old-trace li .ms { margin-left: auto; font-family: Consolas, monospace; font-size: 11px; color: var(--faint); }
+  .fade { text-align: center; font-size: 11.5px; color: var(--faint); padding-top: 6px; }
+
+  /* 新：顶部细状态条 + 对话内一行摘要 */
+  .statusbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel); font-size: 12.5px; margin-bottom: 12px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; }
+  .dot.idle { background: var(--faint); }
+  .statustext { color: var(--dim); }
+  .statustext b { color: var(--text); font-weight: 600; }
+  .statusbar .btns { margin-left: auto; display: flex; gap: 6px; }
+  .chip { border: 1px solid var(--border); background: var(--bg3, #f2f0ea); color: var(--dim); border-radius: 6px; padding: 2px 9px; font-size: 11.5px; }
+  .chip.danger { color: var(--red); }
+
+  .tool-line {
+    display: flex; align-items: center; gap: 8px;
+    width: fit-content; max-width: 100%;
+    padding: 3px 6px 3px 4px; margin-left: -4px;
+    border-radius: 6px; font-size: 12.5px; color: var(--faint); cursor: pointer;
+  }
+  .tool-line:hover { background: #f4f2ed; }
+  .tool-line .ico { flex: none; opacity: .85; }
+  .tool-line .kind { font-weight: 500; white-space: nowrap; }
+  .tool-line .target { min-width: 0; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tool-line .meta { flex: none; font-family: Consolas, monospace; font-size: 11px; }
+  .tool-line .caret { flex: none; margin-left: auto; opacity: 0; font-size: 11px; }
+  .tool-line:hover .caret, .tool-line.is-open .caret { opacity: 1; }
+  .running .kind {
+    background: linear-gradient(90deg, var(--faint) 0%, var(--text) 45%, var(--faint) 90%);
+    background-size: 220% 100%;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: shimmer 2.4s linear infinite;
+  }
+  @keyframes shimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+  .err { color: var(--red); }
+
+  .tool-detail {
+    margin: 2px 0 8px 10px; padding: 8px 0 8px 14px;
+    border-left: 1px solid var(--border);
+    display: flex; gap: 10px; align-items: flex-start;
+  }
+  .shot {
+    width: 180px; height: 100px; flex: none; border-radius: 6px;
+    border: 1px solid var(--border);
+    background: repeating-linear-gradient(45deg, #e7e5df, #e7e5df 8px, #efece6 8px, #efece6 16px);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: var(--faint);
+  }
+  .detail-text { font-family: Consolas, monospace; font-size: 11.5px; color: var(--faint); white-space: pre-wrap; }
+
+  .note { margin-top: 20px; padding: 12px 14px; background: #f4f2ed; border-radius: 8px; font-size: 12.5px; color: var(--dim); }
+  .note b { color: var(--text); }
+  .note ul { margin: 6px 0 0; padding-left: 18px; }
+  .note li { margin: 3px 0; }
+</style>
+</head>
+<body>
+
+<h1>电脑操控 · 展示改版稿</h1>
+<div class="sub">左：现在的样子（右侧面板里一长串轨迹）　右：ZCode 风格（对话里一行一个动作，点开才看截图）</div>
+
+<div class="grid">
+
+  <!-- 现状 -->
+  <div>
+    <div class="col-title">现在 <span class="tag">右侧面板 · ComputerControlPane</span></div>
+    <div class="board">
+      <div class="chatline">对话区：只有一个「computer_action」工具行，看不到在干什么。</div>
+
+      <div class="mini-label">右侧面板 · 电脑操控</div>
+      <div class="old-preview"><div class="fake-shot">最新截图预览（整屏，占面板一半高度）</div></div>
+      <div class="mini-label">已执行 7 个动作 · browser · 商品列表</div>
+      <ul class="old-trace">
+        <li><span class="ok">✓</span> 7. 点击 提交按钮 <span class="ms">320ms</span></li>
+        <li><span class="ok">✓</span> 6. 输入 备注输入框 <span class="ms">280ms</span></li>
+        <li><span class="ok">✓</span> 5. 滚动 向下 400 <span class="ms">140ms</span></li>
+        <li><span class="ok">✓</span> 4. 点击 数量 + <span class="ms">260ms</span></li>
+        <li><span class="ok">✓</span> 3. 观察 商品列表 <span class="ms">210ms</span></li>
+      </ul>
+      <div class="fade">↓ 还有 2 条，列表最多滚 200 条</div>
+      <div class="fade" style="margin-top:8px">截图与动作列表分处两处，对不上号</div>
+    </div>
+  </div>
+
+  <!-- 新设计 -->
+  <div>
+    <div class="col-title">ZCode 风格 <span class="tag new">建议</span></div>
+    <div class="board">
+      <div class="statusbar">
+        <span class="dot"></span>
+        <span class="statustext"><b>正在操控 Edge</b> · 第 7 个动作 · 商品列表</span>
+        <span class="btns"><span class="chip">暂停</span><span class="chip danger">立即停止</span></span>
+      </div>
+
+      <div class="mini-label">对话区 · 动作直接长在对话流里</div>
+
+      <div class="tool-line">
+        <span class="ico">🔍</span><span class="kind">观察</span>
+        <span class="target">商品列表页</span>
+        <span class="meta">1280×720 · 210ms</span>
+        <span class="caret">▸</span>
+      </div>
+
+      <div class="tool-line">
+        <span class="ico">👆</span><span class="kind">点击</span>
+        <span class="target">「数量 +」 el-8</span>
+        <span class="meta">260ms</span>
+        <span class="caret">▸</span>
+      </div>
+
+      <div class="tool-line is-open">
+        <span class="ico">⌨️</span><span class="kind">输入</span>
+        <span class="target">备注输入框 el-12</span>
+        <span class="meta">12 字 · 280ms</span>
+        <span class="caret">▸</span>
+      </div>
+      <div class="tool-detail">
+        <div class="shot">动作后截图（可并排看前后差异）</div>
+        <div class="detail-text">set_value_element  el-12
+frame=8f3c1a2b…  1280×720
+画面已变化 · 与上一张不同</div>
+      </div>
+
+      <div class="tool-line running">
+        <span class="ico">👆</span><span class="kind">点击</span>
+        <span class="target">「提交」 el-20</span>
+        <span class="meta">运行中</span>
+      </div>
+
+      <div class="tool-line">
+        <span class="ico err">✕</span><span class="kind">点击</span>
+        <span class="target">「确认支付」 el-31</span>
+        <span class="meta err">element_stale</span>
+        <span class="caret">▸</span>
+      </div>
+
+      <div class="fade" style="text-align:left;margin-top:10px">右侧面板只留控制与最新一张图，不再堆 200 条轨迹。</div>
+    </div>
+  </div>
+</div>
+
+<div class="note">
+  <b>这版和现在最大的区别</b>
+  <ul>
+    <li>动作直接进对话流：一行 = 图标 + 动作类别（观察/点击/输入/滚动）+ 目标 + 耗时，跟你现在普通工具调用完全同一套语言。</li>
+    <li>截图挂在动作下面，点开才看：一行一个动作，截图不再单独占一块，动作和画面天然对上号。</li>
+    <li>运行中靠类别标签轻微扫光 + 「运行中」，不转圈；失败显示稳定错误码（如 element_stale）而不是一串中文。</li>
+    <li>顶部细状态条常驻：正在操控谁、第几个动作、暂停/停止；右侧面板只保留最新截图和控制，长列表去掉。</li>
+  </ul>
+</div>
+
+</body>
+</html>

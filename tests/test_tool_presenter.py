@@ -312,3 +312,66 @@ def test_subagent_activity_compacts_long_multiline_descriptions():
     assert text.startswith("星瑶正在调度子代理：查询北京当前天气。")
     assert text.endswith("...")
     assert len(text.removeprefix("星瑶正在调度子代理：")) <= 48
+
+
+# ── computer_action 展示投影（2026-10-21）────────────────────────────────
+# 目标：对话区把电脑动作渲染成「动词 + 目标」的紧凑行，而不是
+# "使用工具 computer_action"。这里锁住投影契约。
+
+
+def test_computer_action_display_uses_action_verb_and_element_ref():
+    display = build_tool_display(
+        "computer_action",
+        {"kind": "click_element", "target": "browser", "element_ref": "el-20"},
+    )
+
+    assert display["category"] == "computer"
+    assert display["action"] == "点击控件"
+    assert display["target"] == "el-20"
+
+
+def test_computer_action_display_prefers_url_then_keys_then_coordinates():
+    url_display = build_tool_display(
+        "computer_action", {"kind": "navigate", "target": "browser", "url": "https://example.test/a"}
+    )
+    keys_display = build_tool_display(
+        "computer_action", {"kind": "keypress", "target": "desktop", "keys": ["CTRL", "S"]}
+    )
+    point_display = build_tool_display(
+        "computer_action", {"kind": "click", "target": "desktop", "x": 320, "y": 480}
+    )
+
+    assert url_display["target"] == "https://example.test/a"
+    assert keys_display["target"] == "CTRL+S"
+    assert point_display["target"] == "(320, 480)"
+
+
+def test_computer_action_text_never_echoes_content_only_length():
+    display = build_tool_display(
+        "computer_action",
+        {"kind": "type_text", "target": "desktop", "text": "机密内容一二三"},
+    )
+
+    assert display["target"] == "7 字"
+    assert "机密内容" not in str(display["target"])
+
+
+def test_computer_action_unknown_kind_falls_back_to_generic_verb():
+    display = build_tool_display(
+        "computer_action", {"kind": "some_future_kind", "target": "desktop"}
+    )
+
+    assert display["action"] == "操作"
+    assert display["category"] == "computer"
+
+
+def test_computer_action_failure_keeps_sanitized_error_summary():
+    display = build_tool_display(
+        "computer_action",
+        {"kind": "click", "target": "browser", "element_ref": "el-1"},
+        {"content": "🚨 用户已停止电脑操控：本任务后续不要调用任何电脑操控工具"},
+        ok=False,
+    )
+
+    assert display["error_summary"].startswith("用户已停止电脑操控")
+    assert "🚨" not in display["error_summary"]

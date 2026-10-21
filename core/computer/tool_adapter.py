@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.computer.actions import COMPUTER_ACTION_TOOL_SCHEMA
+from core.computer import stop_notice as stop_notice
 from core.computer.models import (
     ComputerCapability,
     ComputerControlError,
@@ -85,6 +86,15 @@ def lease_from_context(context) -> ComputerTurnLease | None:
 
 def computer_turn_context_error(lease: ComputerTurnLease | None) -> ComputerControlError | None:
     """固定适配的 Turn 上下文校验：设置关闭 / 协议不符 / run 缺失返回稳定错误。"""
+    if stop_notice.is_user_stop_active():
+        # 用户点过停止：run 已经收尾，但回合还在继续，此时若只靠 lease 校验，
+        # 模型仍会拿到"run 已结束"之类可重试的信号并继续调 computer_action。
+        # 这里先给一个不可重试的稳定错误码，逼模型换策略或向用户说明。
+        return ComputerControlError(
+            "computer_user_stopped",
+            "用户已停止电脑操控：本任务后续不要调用任何电脑操控工具，"
+            "请改用其它方式或直接向用户说明",
+        )
     if lease is None:
         return ComputerControlError(
             "computer_disabled",

@@ -409,3 +409,29 @@ describe('buildSubagentFlatView', () => {
     expect(buildSubagentFlatView([])).toEqual({ rows: [], rounds: 0, toolOk: 0, toolErr: 0 });
   });
 });
+
+// 电脑操控调用单独成类：行内以「动词 + 目标」渲染，不并入通用 tool 行
+it('maps computer actions to their own row kind', () => {
+  const rows = buildToolTraceRows([
+    {
+      id: 'c1',
+      name: 'computer_action',
+      label: '点击控件 el-20',
+      display: {
+        category: 'computer',
+        action: '点击控件',
+        target: 'el-20',
+        command: '',
+        metrics: {},
+        error_summary: '',
+        is_skill: false,
+      },
+      result: { ok: true, summary: '完成', result: '{}' },
+    },
+  ]);
+
+  expect(rows).toHaveLength(1);
+  expect(rows[0].kind).toBe('computer');
+  expect(rows[0].action).toBe('点击控件');
+  expect(rows[0].detail).toBe('el-20');
+});
