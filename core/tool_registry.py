@@ -157,9 +157,6 @@ CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
     # 运维与内容生成
     "update_manage",
     "diagram_manage",
-    "hunyuan_generate_image",
-    "tokenrhythm_generate_image",
-    "tokenrhythm_edit_image",
     # 只读查询类：斜杠命令（/usage /share /doctor）或已保留的同名工具
     # （search_sessions）完全覆盖，不必再占一份 schema。
     "usage_stats",
