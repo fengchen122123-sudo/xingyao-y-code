@@ -571,8 +571,6 @@ def _status_cache_metrics(session_id, model_name, api_base, cache_scope="main"):
 
 def _compose_status_token_info(
     *,
-    lane_cached,
-    lane_rate,
     prompt,
     completion,
     cached,
@@ -582,15 +580,14 @@ def _compose_status_token_info(
     ctx_max,
     keepalive_rate=None,
 ):
-    """状态栏 Token 概览文字：车道热口径与进程累计口径分别标注。
+    """状态栏 Token 概览文字：进程累计口径 + 上下文占用。
 
-    车道命中率的分母是「当前会话 × 当前车道」的热窗口，而输入/输出/命中是
-    进程累计（跨会话、渠道、scope 混算）。两者分母不同，并排出现又不标口径时，
-    「命中 X (Y%)」会被读成「输入 X 的 Y%」，自相矛盾——故分别加「本车道」/
-    「全局」标签。所有传参均为已格式化文本；未报告的 rate 由调用方传 "--"。
+    输入/输出/命中都是进程累计（跨会话、渠道、scope 混算），故统一带「全局」
+    标签标明口径。当前车道的热命中率不再进状态栏（一行放不下，易被截断），
+    需要时用 /usage 查看明细。所有传参均为已格式化文本；未报告的 rate 由调用
+    方传 "--"。
     """
     text = (
-        f"本车道命中 {lane_cached} ({lane_rate}) · "
         f"全局 输入 {prompt} · 输出 {completion} · 命中 {cached} ({global_rate}) · "
         f"上下文 {ctx_pct} ({ctx_used}/{ctx_max})"
     )
@@ -958,19 +955,10 @@ def _reset_turn_state():
         app_instance.invalidate()
 
 
-def _git_status_bar_segment() -> str:
-    """CLI 底部状态栏的 Git 段（规格 §12.1）：``⎇ dev* ↑2 ↓1  3 changes``。
-
-    非仓库/异常时为空串（状态栏布局不变）；内部带 1.5 秒 TTL 缓存，
-    保证高频渲染不反复拉起 git 进程。
-    """
-    try:
-        from core.workspace_context import get_workdir
-        from core.git_cli import render_git_status_bar
-
-        return render_git_status_bar(get_workdir() or "")
-    except Exception:
-        return ""
+# 状态栏不再展示 Git 段：本机实测 `git status` 约 1.0s、`git rev-parse` 约 0.9s
+# （仓库索引大 + 实时防护），任何同步调用都会卡住首帧与键盘回显；放后台线程又
+# 因为缺少权限上下文拿不到快照（返回空）。Git 信息统一走 `/git status` 或
+# `/git` 管理器按需查看，绝不再占渲染路径。
 
 
 def _ensure_cli_disclaimer_consent() -> None:
@@ -4618,8 +4606,8 @@ def _make_input_app():
         # 1. 提取短模型名（使用内存缓存，避免每次渲染都读盘解析 config.json）
         model_display = current_model_name or "未激活模型"
 
-        # 2. 读取统一快照：主指标 = 当前会话 × 当前车道的热命中率；
-        #    进程级累计（所有会话/渠道/scope 混算）降为次要显示
+        # 2. 读取统一快照：输入/输出/命中取进程累计（跨会话/渠道/scope 混算）；
+        #    车道热命中率不进状态栏（一行宽度有限），明细改用 /usage 查看
         usage_snapshot = get_token_usage_snapshot(
             current_session, current_model, current_url, "main"
         )
@@ -4627,20 +4615,17 @@ def _make_input_app():
         latest_total = usage_snapshot["window"]["latest_total"]
         max_win = current_ctx_win
 
-        lane_metrics = _status_cache_metrics(
+        # 保活命中率仍作尾部标注，车道热口径不再参与渲染
+        keepalive_rate = _status_cache_metrics(
             current_session, current_model, current_url, "main"
-        )
-        lane_rate = lane_metrics["hot_rate"]
-        lane_cached = lane_metrics["hot_cached"]
-        keepalive_rate = lane_metrics["keepalive_rate"]
+        )["keepalive_rate"]
 
         cum_prompt = process_usage["cumulative_prompt"]
         cum_completion = process_usage["cumulative_completion"]
         cum_cached = process_usage["cumulative_cached"]
 
         # 命中率分母用 prompt tokens（缓存只可能命中输入部分），
-        # 用 total（含输出）会把比率稀释失真。
-        # lane_rate 为 None 表示该车道 usage 未报告（≠ 0 命中），显示 "--"。
+        # 用 total（含输出）会把比率稀释失真。未报告时为 None，显示 "--"。
         global_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else None
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
 
@@ -4656,17 +4641,12 @@ def _make_input_app():
         prompt_str = format_num(cum_prompt)
         completion_str = format_num(cum_completion)
         cached_str = format_num(cum_cached)
-        lane_cached_str = format_num(lane_cached)
-        lane_rate_str = f"{lane_rate:.0f}%" if lane_rate is not None else "--"
         global_rate_str = f"{global_rate:.0f}%" if global_rate is not None else "--"
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 状态栏 Token 概览：主指标是当前车道热命中率；
-        # 进程级累计只作次要标注（跨会话/渠道/scope 混算，不代表当前车道）。
+        # 状态栏 Token 概览：只报进程累计口径与上下文占用（车道热命中率已移除）
         token_info = _compose_status_token_info(
-            lane_cached=lane_cached_str,
-            lane_rate=lane_rate_str,
             prompt=prompt_str,
             completion=completion_str,
             cached=cached_str,
@@ -4725,10 +4705,8 @@ def _make_input_app():
             ("class:status.sep",     "  |  "),
             (task_style,             task_info),
         ]
-        git_segment = _git_status_bar_segment()
-        if git_segment:
-            segments.append(("class:status.sep", "  |  "))
-            segments.append(("class:status.token", f" {git_segment} "))
+        # 状态栏不渲染 Git 段（git 子进程在本机约 1s，见 _ensure_cli_disclaimer_consent
+        # 上方的说明）；Git 信息按需用 /git status 查看，保证输入零阻塞。
         return segments
 
     def get_activity_text():
@@ -5857,9 +5835,11 @@ def run_cli():
 
     _preload_llm_thread = threading.Thread(target=_preload_llm_engine, daemon=True)
     _preload_llm_thread.start()
-    # MCP 连接与 Token 统计放纯后台：都不影响首屏可用性，同步等它们只是白拉长启动。
-    for _bg_target in (_preload_mcp, _warm_token_usage):
-        threading.Thread(target=_bg_target, daemon=True).start()
+    # Token 统计是本地 DB 读取（毫秒级、几乎不占 GIL），可以立即后台跑。
+    # MCP 不在这里预热：mcp 全家桶（pydantic/httpx/anyio）冷加载约 1.1s，且是
+    # CPU 密型 import，与 TUI 渲染线程抢 GIL 会让输入框迟迟不出现、键盘无回显。
+    # 首次请求时由 get_tools_schema() 的惰性连接负责（有界超时，只等一次）。
+    threading.Thread(target=_warm_token_usage, daemon=True).start()
 
     # 进度动画：纯文本终端阶段（CLI 未启动），非 tty 时安静等待
     _preload_t0 = time.monotonic()
@@ -5882,15 +5862,35 @@ def run_cli():
 
     # 工具表后台预热：界面已经可用，趁用户输入第一个问题的时间把工具表装配完
     # （实测约 0.6s），首轮请求直接命中缓存，不必在请求路径上现构建。
-    def _warm_tool_registry():
+    def _warm_background_services():
+        # 两步都要避开 TUI 首帧：工具表装配（约 0.6s）与 MCP 连接（实测 7s，
+        # 含 mcp 全家桶 import）都是 CPU 密集操作，紧跟 print_logo 执行会和渲染
+        # 线程抢 GIL，表现为输入框迟迟不出现、键盘输入无回显。
+        # 先等界面稳定，再把本线程降到 BELOW_NORMAL；即使仍有竞争，主线程
+        # 也优先拿到调度，不会卡住键盘回显。
+        time.sleep(1.5)
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.SetThreadPriority(
+                    ctypes.windll.kernel32.GetCurrentThread(), -2  # BELOW_NORMAL
+                )
+            except Exception:
+                pass
         try:
             import core.llm as _llm_module
 
             _llm_module.tool_registry.all()
         except Exception:
             pass
+        # 刻意不在这里连 MCP：amap 实测要 6~7s（npx 拉起 + mcp 全家桶 import），
+        # 全程 CPU 密集，会持续抢 GIL 让键盘回显一顿一顿。MCP 交给首次请求时
+        # 的惰性连接（get_tools_schema 的有界等待，只等一次），界面先保持流畅。
+        # 同理也不在后台预热 @文件清单：该缓存只在 UI 线程读写，跨线程会引入
+        # 竞态，而它只有 0.17s，留给第一次输入 @ 时现扫更划算。
 
-    threading.Thread(target=_warm_tool_registry, daemon=True).start()
+    threading.Thread(target=_warm_background_services, daemon=True).start()
 
     # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
     def _ui_refresher_loop():
