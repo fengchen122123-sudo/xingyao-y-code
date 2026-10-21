@@ -21,7 +21,7 @@ def test_entry_and_low_level_whitelists_match():
 
 
 def test_expected_sources_present():
-    for source in ("local", "lan", "feishu"):
+    for source in ("local", "lan", "feishu", "mcp"):
         assert source in TURN_SOURCES
         assert source in COMPUTER_TURN_SOURCES
 

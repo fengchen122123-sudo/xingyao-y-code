@@ -912,12 +912,13 @@ def _claim_takeover_at_turn_start(
     return scheduler, claimed
 
 
-# 入口层受控回合来源白名单：只有入口层（GUI/CLI 本地、LAN 手机端、飞书通道）能设置，
-# 绝不来自用户消息或模型参数。非 local 的回合一律按「远程」处理（禁用电脑操控、
-# 不解析 @{会话名}、不抢桌面当前会话），见 core/computer/capability.py 与
-# core/agent_service.py 的 turn_source != "local" 分支。
+# 入口层受控回合来源白名单：只有入口层（GUI/CLI 本地、LAN 手机端、飞书通道、
+# 手机端 MCP 客户端经局域网 MCP 服务投递）能设置，绝不来自用户消息或模型参数。
+# 非 local 的回合一律按「远程」处理（禁用电脑操控、不解析 @{会话名}、不抢桌面当前
+# 会话），见 core/computer/capability.py 与 core/agent_service.py 的
+# turn_source != "local" 分支。
 # 新增来源时必须同时更新 gui_bridge.TURN_SOURCES（有测试断言两者一致）。
-COMPUTER_TURN_SOURCES = ("local", "lan", "feishu")
+COMPUTER_TURN_SOURCES = ("local", "lan", "feishu", "mcp")
 
 
 def resolve_turn_computer_capability(
@@ -931,7 +932,7 @@ def resolve_turn_computer_capability(
     按请求路由在 config 中查找模型条目，与请求实际使用的 base_url/protocol
     一起交给纯函数 resolve_computer_capability 冻结为不可变快照；同一 Turn
     的每个 Step 复用该快照，不做二次决策。turn_source 只接受入口层受控值
-    local|lan|feishu（不得来自用户消息或模型参数）。设置快照读取失败按
+    local|lan|feishu|mcp（不得来自用户消息或模型参数）。设置快照读取失败按
     computer_invalid_config 拒绝（fail-closed），绝不中断普通对话。
     """
     from core.model_manager import get_model_config_by_litellm_model, get_model_protocol
