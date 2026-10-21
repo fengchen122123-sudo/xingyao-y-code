@@ -106,6 +106,7 @@ from core.runtime_warnings import configure_runtime_warnings
 configure_runtime_warnings()
 import datetime
 import logging
+import math
 import re
 import time
 import threading
@@ -229,6 +230,10 @@ is_thinking = False
 # 让用户误以为卡死。
 _llm_engine_ready = False
 task_status = 'idle'  # 全局运行状态：'idle' (闲置), 'thinking' (思考中), 'executing' (执行中), 'waiting' (等待确认)
+# 状态栏吐字速度：最近一次 LLM 请求的实测 token 速度（t/s），来源是
+# core.llm 请求结束时发出的 step_metrics（上游 usage 的 completion_tokens
+# 除以真实流式输出时长，批式投递已由 core.llm 兜底校正）。None 表示还没测到。
+_last_token_speed: float | None = None
 think_start_time = 0
 # 底部活动指示区使用的独立墙钟计时起点：思考开始/首个工具开始时刷新，
 # 避免工具执行阶段复用上一次思考的起始时间。
@@ -543,12 +548,15 @@ def _format_cache_hit_rate(cached_tokens, cache_prompt_tokens):
 
 
 def _status_cache_metrics(session_id, model_name, api_base, cache_scope="main"):
-    """状态栏口径：当前会话 × 当前车道的热命中率（主指标）。
+    """口径查询：当前会话 × 当前车道的热命中率（主指标）。
 
     车道键与 core/llm_diagnostics._cache_usage_key 完全一致
     （lower + 去尾斜杠 + scope）。keepalive 从 cache_scopes 单列取，
     不混进 main；进程级累计（所有会话/渠道/scope 混算）不在此函数内。
     rate 为 None 表示该车道 usage 未报告，展示层按 "--" 处理（未报告 ≠ 0）。
+
+    注意：状态栏已不再消费本函数（保活段与车道热口径都已从状态栏移除），
+    这里保留为 /usage 之类明细视图与口径测试的查询入口。
     """
     snapshot = get_token_usage_snapshot(session_id, model_name, api_base, cache_scope)
     cache = snapshot.get("cache") or {}
@@ -578,22 +586,55 @@ def _compose_status_token_info(
     ctx_pct,
     ctx_used,
     ctx_max,
-    keepalive_rate=None,
 ):
     """状态栏 Token 概览文字：进程累计口径 + 上下文占用。
 
-    输入/输出/命中都是进程累计（跨会话、渠道、scope 混算），故统一带「全局」
-    标签标明口径。当前车道的热命中率不再进状态栏（一行放不下，易被截断），
-    需要时用 /usage 查看明细。所有传参均为已格式化文本；未报告的 rate 由调用
-    方传 "--"。
+    输入/输出/命中都是进程累计（跨会话、渠道、scope 混算），早年用「全局」
+    前缀标注口径，现按需求去掉——状态栏一行宽度有限，标签比数字更不值钱。
+    保活命中率同样不再进状态栏（需要时用 /usage 查看明细）。所有传参均为已
+    格式化文本；未报告的 rate 由调用方传 "--"。
+
+    标签改用符号（↑ 输入 / ↓ 输出 / ⚡ 命中）压缩宽度：状态栏一行还要塞
+    上下文与吐字速度，中文标签两字占 4 格，符号只占 1~2 格。符号均取自
+    BMP 常见区段，Windows Terminal 与常见等宽字体都有字形。
     """
-    text = (
-        f"全局 输入 {prompt} · 输出 {completion} · 命中 {cached} ({global_rate}) · "
+    return (
+        f"↑ {prompt} · ↓ {completion} · ⚡ {cached} ({global_rate}) · "
         f"上下文 {ctx_pct} ({ctx_used}/{ctx_max})"
     )
-    if keepalive_rate is not None:
-        text += f" · 保活 {keepalive_rate}"
-    return text
+
+
+def _format_token_speed(speed) -> str:
+    """状态栏吐字速度文本：只认实测的正值，未测到一律显示 "-- t/s"。
+
+    速度全部由 core.llm 的 step_metrics 提供（completion_tokens ÷ 真实流式
+    输出时长），这里只做格式化，绝不按字符数/耗时之类自行估算凑数。
+    """
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        return "-- t/s"
+    if not math.isfinite(value) or value <= 0:
+        return "-- t/s"
+    return f"{value:.1f} t/s"
+
+
+def _compose_status_task_segment(task_status, speed):
+    """状态栏最右段（text, style）三元组：闲置位改为实测吐字速度。
+
+    闲置时没有任何执行状态可报，原先固定显示「闲置」纯占位；现在换成最近一次
+    请求的实测 token 速度，信息量更足。运行中仍报执行状态——「等待授权确认」
+    这类标签有行动价值，不能为了塞速度把它换掉。
+    """
+    speed_label = f" {_format_token_speed(speed)} "
+    status_map = {
+        "idle": (speed_label, "class:status.task_speed"),
+        "thinking": (" 思考中... ", "class:status.task_active"),
+        "executing": (" 正在干活... ", "class:status.task_active"),
+        "waiting": (" 等待授权确认... ", "class:status.task_active"),
+    }
+    # 未知状态按闲置处理（与历史默认值一致），同样落回实测速度位
+    return status_map.get(task_status, (speed_label, "class:status.task_speed"))
 
 
 def _usage_model_label(row, api_base=None, cache_scope=None):
@@ -1487,6 +1528,7 @@ def _render_ui_event(event):
     global active_thinking_text, active_thinking_turn_id, _active_tool_status
     global _thinking_panel_linger
     global _last_printed_plan_state
+    global _last_token_speed
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
         # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，不显示具体工具调用细节。
@@ -1509,6 +1551,20 @@ def _render_ui_event(event):
         message = str(event.payload.get("message", ""))
         if message:
             print_formatted_text(HTML(f"\n<ansigray>{_esc(message)}</ansigray>"))
+        return
+
+    if event.kind == "step_metrics":
+        # 状态栏吐字速度：只接收 core.llm 用上游 usage（completion_tokens）÷
+        # 真实流式输出时长算出的 token_speed。缺失/非正值一律不覆盖（保持
+        # "-- t/s"），绝不在这里按字符数自行推算，速度必须是实测的。
+        try:
+            speed = float(event.payload.get("token_speed") or 0)
+        except (TypeError, ValueError):
+            speed = 0.0
+        if math.isfinite(speed) and speed > 0:
+            _last_token_speed = speed
+            if app_instance is not None:
+                app_instance.invalidate()
         return
 
     if event.kind == "permission_requested":
@@ -4615,11 +4671,8 @@ def _make_input_app():
         latest_total = usage_snapshot["window"]["latest_total"]
         max_win = current_ctx_win
 
-        # 保活命中率仍作尾部标注，车道热口径不再参与渲染
-        keepalive_rate = _status_cache_metrics(
-            current_session, current_model, current_url, "main"
-        )["keepalive_rate"]
-
+        # 保活命中率与车道热口径都不再进状态栏：省掉一次 _status_cache_metrics
+        # 查询，需要看明细时用 /usage。
         cum_prompt = process_usage["cumulative_prompt"]
         cum_completion = process_usage["cumulative_completion"]
         cum_cached = process_usage["cumulative_cached"]
@@ -4645,7 +4698,7 @@ def _make_input_app():
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 状态栏 Token 概览：只报进程累计口径与上下文占用（车道热命中率已移除）
+        # 状态栏 Token 概览：只报进程累计口径与上下文占用（车道热命中率与保活已移除）
         token_info = _compose_status_token_info(
             prompt=prompt_str,
             completion=completion_str,
@@ -4654,20 +4707,14 @@ def _make_input_app():
             ctx_pct=f"{pct:.0f}%",
             ctx_used=latest_total_str,
             ctx_max=max_win_str,
-            keepalive_rate=(
-                None if keepalive_rate is None else f"{keepalive_rate:.0f}%"
-            ),
         )
 
-        # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
+        # 3. 状态位：闲置时展示最近一次请求的实测吐字速度（t/s），运行中仍展示
+        # 执行状态（spinner + 文字），保留「等待授权确认」这类有行动价值的信息。
         # 直接读模块全局变量，不再 import main 自引用
-        status_map = {
-            "idle": (" 闲置 ", "class:status.task_idle"),
-            "thinking": (" 思考中... ", "class:status.task_active"),
-            "executing": (" 正在干活... ", "class:status.task_active"),
-            "waiting": (" 等待授权确认... ", "class:status.task_active"),
-        }
-        status_label, task_style = status_map.get(task_status, (" 闲置 ", "class:status.task_idle"))
+        status_label, task_style = _compose_status_task_segment(
+            task_status, _last_token_speed
+        )
 
         if task_status != "idle":
             # 播放流式旋转动画
@@ -4961,6 +5008,8 @@ def _build_cli_style(theme_name):
         "status.think":    "bold #e2e8f0",
         "status.task_active": "bold #39ff14",  # 矩阵亮绿
         "status.task_idle":   status_sep,
+        # 闲置位的实测吐字速度：用主题主色加粗，比原来的灰色"闲置"更醒目
+        "status.task_speed":  f"bold {border_color}",
         "status.permission_confirm":      "bold #50fa7b",
         "status.permission_accept_edits": "bold #f1fa8c",
         "status.permission_plan":         "bold #88c0d0",
