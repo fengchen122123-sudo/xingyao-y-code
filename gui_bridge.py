@@ -123,11 +123,12 @@ _MONITOR_DEFAULTTONEAREST = 2
 # 回合对齐扩展上限为 limit + 30（见 core.memory.get_history_paged）。
 HISTORY_PAGE_SIZE = 50
 
-# 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu。
+# 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu，
+# 手机端 MCP 客户端（阶跃 Amoo 等）经局域网 MCP 服务投递 = mcp。
 # 由入口层注入，模型/用户正文无法设置（send_user_message 校验后拒绝非法值）。
 # 与 core.llm.COMPUTER_TURN_SOURCES 必须保持一致——低层还会再校验一次来源，
 # 两处不一致会让新来源的回合在模型请求处直接抛错（有测试断言两者相等）。
-TURN_SOURCES = ("local", "lan", "feishu")
+TURN_SOURCES = ("local", "lan", "feishu", "mcp")
 
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
@@ -1121,6 +1122,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._lan_server = None
         # 保护 _lan_server 惰性创建的双检锁：并发（启动后台线程 + 用户点二维码）时不得创建两个实例
         self._lan_lock = threading.Lock()
+        # 局域网 MCP 服务（手机端 MCP 客户端调用，惰性创建，见 _ensure_mcp_server）：
+        # 与 _lan_server 同范式——双检锁 + 启动成功才发布，未配置时完全不启动
+        self._mcp_server = None
+        self._mcp_server_lock = threading.Lock()
         # 飞书通道服务（惰性创建，见 _ensure_feishu_service）：未配置时完全不启动，
         # 对现有功能零影响
         self._feishu_service = None
@@ -1691,6 +1696,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 self._lan_server.stop()
         except Exception:
             logger.exception("退出时停止局域网远程控制服务失败")
+
+        try:
+            if getattr(self, "_mcp_server", None) is not None:
+                self._mcp_server.stop()
+        except Exception:
+            logger.exception("退出时停止局域网 MCP 服务失败")
 
         try:
             if getattr(self, "_feishu_service", None) is not None:
@@ -3513,10 +3524,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 若启动卡死时日志里没有这条，说明调用根本没到 Python（桥消息丢失），
         # 而非本方法内部卡住——据此区分"前端没调进来"与"卡在入口"。
         logger.info("get_initial_state 入口被调用（前端桥已打通）")
-        # 前端桥已打通：后台惰性启动局域网手机远程控制服务（不阻塞初始化）
+        # 前端桥已打通：后台惰性启动局域网手机远程控制服务（不阻塞初始化），
+        # 同一线程里紧接着启动局域网 MCP 服务（手机一打开星瑶就能连上手机端
+        # MCP 客户端；MCP 复用 LAN 的配对 token，故必须排在 LAN 之后）。
+        def _startup_lan_and_mcp():
+            try:
+                self._ensure_lan_server()
+            except Exception:
+                logger.debug("局域网远程控制服务启动失败", exc_info=True)
+            # LAN 起不来时 _ensure_mcp_server 自己返回 None，不往外抛
+            self._ensure_mcp_server()
+
         try:
             threading.Thread(
-                target=self._ensure_lan_server,
+                target=_startup_lan_and_mcp,
                 daemon=True,
                 name="lan-remote-startup",
             ).start()
@@ -6450,6 +6471,62 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
+    def _ensure_mcp_server(self):
+        """惰性创建并启动局域网 MCP 服务，失败/未启用返回 None（不抛给调用方）。
+
+        与 _ensure_lan_server 同范式：双检锁保证并发（启动后台线程 + 设置页/二维码）
+        只创建一个实例；start() 返回 ok 后才发布 self._mcp_server，失败不发布，
+        下次调用可重试（端口被占用属运行时状况，不该让实例停留在半成品状态）。
+        供手机端 MCP 客户端（阶跃 Amoo 等）调用，与远程控制共用同一配对 token。
+        """
+        if getattr(self, "_mcp_server", None) is not None:
+            return self._mcp_server
+        lock = getattr(self, "_mcp_server_lock", None)
+        if lock is None:
+            # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__，
+            # 缺状态时就地补齐，避免后台启动线程里抛 AttributeError
+            lock = threading.Lock()
+            self._mcp_server_lock = lock
+        with lock:
+            if getattr(self, "_mcp_server", None) is not None:
+                return self._mcp_server
+            try:
+                data = config._load()
+                if not data.get(
+                    config.REMOTE_MCP_ENABLED_KEY, config.REMOTE_MCP_ENABLED_DEFAULT
+                ):
+                    # 默认开启，但允许用户显式关掉；关闭时完全不绑定端口、不起线程
+                    return None
+                # MCP 复用 LAN 远程控制的配对 token：LAN 服务起不来就没有可校验的
+                # 凭据，此时直接放弃启动（fail-closed，绝不裸奔成无鉴权入口）。
+                lan = self._ensure_lan_server()
+                if lan is None:
+                    logger.debug("局域网 MCP 服务未启动：LAN 远程控制服务不可用")
+                    return None
+
+                def _token_provider():
+                    # 每次请求现取 LAN 服务上的当前 token：用户刷新/轮换 token 后
+                    # MCP 端无需重启即自动跟随；取不到空值时核心侧按未授权拒绝
+                    return getattr(lan, "_token", b"") or b""
+
+                try:
+                    port = int(data.get(config.REMOTE_MCP_PORT_KEY, config.REMOTE_MCP_PORT_DEFAULT))
+                except (TypeError, ValueError):
+                    port = config.REMOTE_MCP_PORT_DEFAULT
+                from core.mcp_server import McpServer
+
+                srv = McpServer(bridge=self, port=port, token_provider=_token_provider)
+                info = srv.start()
+                if not info.get("ok"):
+                    logger.warning("局域网 MCP 服务启动失败: %s", info.get("msg") or info)
+                    return None
+                self._mcp_server = srv
+                logger.info("局域网 MCP 服务已启动: %s", info.get("url"))
+                return srv
+            except Exception:
+                logger.exception("局域网 MCP 服务启动失败")
+                return None
+
     def _ensure_feishu_service(self):
         """惰性创建并启动飞书通道服务，失败/未配置返回 None（不抛给调用方）。
 
@@ -6639,7 +6716,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     # ------------------------------------------------------------------
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
         # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
-        # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"；
+        # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"，
+        # 局域网 MCP 服务由 core/mcp_server 注入 "mcp"；
         # 只接受这几个受控值，模型/用户正文无法设置，非法值直接拒绝（不启动回合）。
         # 注意参数顺序：permission_mode 在 turn_source 之前——桌面 GUI 经
         # pywebview 按位置传参，第 6 位必须是会话级权限档位；LAN 分发只放行
