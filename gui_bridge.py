@@ -5975,6 +5975,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             }
         if value is False:
             self._stop_computer_runs_for_disabled_switch("desktop")
+        else:
+            # 恢复条件①（core/computer/stop_notice.py 注释）：用户在设置里重新
+            # 开启电脑操控，等于明确要求恢复，解除"用户已停止"抑制与未投递通知；
+            # 否则用户只能靠发一句含恢复关键词的消息才能再让模型操作电脑。
+            from core.computer import stop_notice
+
+            stop_notice.deactivate_user_stop("settings_reenabled")
         # 开关切换成功后同步紧急停止热键（Task 16：开启首次注册/全关注销）
         self._refresh_computer_hotkey()
         return {"ok": True, "settings": self.get_system_settings()}
@@ -6072,9 +6079,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         )
 
     def stop_computer_control(self, run_id: str) -> Dict[str, Any]:
-        """用户紧急停止当前 run；固定停止顺序由 controller.stop 执行（设计 15.2）。"""
+        """用户紧急停止当前 run；固定停止顺序由 controller.stop_for_user 执行（设计 15.2）。
+
+        用 stop_for_user 而非 stop：用户点停止只应结束电脑操控 run，不应置位
+        回合 cancel_event 把整个对话回合掐掉（否则模型收不到"用户已停止"）。
+        """
         return self._run_computer_mutation(
-            lambda controller: controller.stop(str(run_id or ""), "user_stop")
+            lambda controller: controller.stop_for_user(str(run_id or ""), "user_stop")
         )
 
     def acknowledge_computer_safety(self, run_id: str, check_ids=None) -> Dict[str, Any]:

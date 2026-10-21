@@ -46,9 +46,23 @@ from core.computer.models import (
     ComputerRunSnapshot,
     ComputerRunStatus,
 )
-from core.computer.settings import get_settings_generation, load_computer_settings
+from core.computer import stop_notice as stop_notice
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _default_settings_loader():
+    """惰性 import 设置模块：它连带 platforms/config（约 48ms），
+    CLI 轻量模式下不创建 controller，没必要在启动期付这笔成本。"""
+    from core.computer.settings import load_computer_settings
+
+    return load_computer_settings()
+
+
+def _default_generation_provider() -> int:
+    from core.computer.settings import get_settings_generation
+
+    return get_settings_generation()
 
 # 显式状态转移表（计划 Task 8 Step 3 逐字给定，非法转换抛领域不变量错误）。
 # 唯一有意放宽项（2026-10-01 实机复现后新增）：waiting_for_user → completing。
@@ -246,8 +260,8 @@ class ComputerControlService:
         embedded_endpoint_provider: Callable[[str], str] | None = None,
     ) -> None:
         self._backend_factory = backend_factory or _default_backend_factory
-        self._settings_loader = settings_loader or load_computer_settings
-        self._generation_provider = generation_provider or get_settings_generation
+        self._settings_loader = settings_loader or _default_settings_loader
+        self._generation_provider = generation_provider or _default_generation_provider
         self._abort_streams = abort_streams or _default_abort_streams
         # 内置浏览器（embedded）CDP endpoint 提供者：仅 GUI 进程注入——
         # 负责确保内嵌 WebView2 控件带调试端口存在并返回回环 endpoint；
@@ -626,6 +640,14 @@ class ComputerControlService:
         target: str | None = None,
     ) -> ComputerRunSnapshot:
         """创建活动 run 并获取排他租约；target=None 时首次合法 observe 建立租约。"""
+        # 用户已停止操控期间一律不准新开 run：否则模型可以换个 target（或换
+        # 协议走 native）绕开 computer_turn_context_error 的抑制拦截。
+        if stop_notice.is_user_stop_active():
+            raise ComputerControlError(
+                "computer_user_stopped",
+                "用户已停止电脑操控：本任务后续不要调用任何电脑操控工具，"
+                "请改用其它方式或直接向用户说明",
+            )
         if owner.cancel_event.is_set():
             raise ComputerControlError(
                 "computer_cancelled", "owner Turn 已取消，不能开启电脑操控 run"
@@ -898,6 +920,13 @@ class ComputerControlService:
                 action=action.kind,
                 before_fingerprint=before_fingerprint,
                 after_fingerprint=after_fingerprint,
+                # 帧契约：与上一步截图字节完全相同时打标，Provider 投影据此
+                # 省掉重复附图（画面没变，模型手里已有同一张图）。previous 为
+                # 空表示本 run 的第一张图，必须照常附上。
+                screen_unchanged=bool(
+                    previous_screen_sha256
+                    and previous_screen_sha256 == observation.screen_sha256
+                ),
             )
             publisher = self._preview_publisher
             if publisher is not None and observation.png_path:
@@ -1232,6 +1261,28 @@ class ComputerControlService:
                 self._finalize_locked(run)
         self._emit_state(run, reason=reason)
         return self.snapshot()
+
+    def stop_for_user(
+        self, run_id: str, reason: str = "user_stop"
+    ) -> ComputerRunSnapshot:
+        """用户主动停止（GUI 停止按钮 / computer_control stop / 紧急热键）。
+
+        为什么不能直接用 stop()：stop 默认 cancel_owner=True 会把回合级
+        cancel_event 置位并中断在飞 Provider 流，效果等于"点停止 = 终止整个
+        对话回合"，模型连一句解释都收不到。用户停止只应结束电脑操控 run，
+        因此这里传 cancel_owner=False 复用同一条清理链（顺序、幂等、错误
+        处理与 stop 完全一致），并另外记录会话级禁止态 + 排队一条模型可见
+        通知，让模型下一步知道"用户停止"而不是被静默掐断。
+
+        抑制状态只在设置重开或用户消息命中恢复关键词时解除（见
+        core/computer/stop_notice.py），因此本方法同时是 start_run 的闸门来源。
+        """
+        snapshot = self.stop(run_id, reason, cancel_owner=False)
+        # 顺序：先真正停住，再立禁止态。stop 抛错（未知 run / 非法状态）时
+        # 不会走到这里，避免"没停成却已经宣告用户停止"。
+        stop_notice.activate_user_stop(reason)
+        stop_notice.queue_stop_notice(reason)
+        return snapshot
 
 
 _SERVICE_LOCK = threading.Lock()

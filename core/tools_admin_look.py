@@ -18,13 +18,26 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from core.gui_theme import ThemeError, get_repository
 from core.persona_settings import (
     PersonaSettingsError,
     get_persona_settings,
     save_persona_settings,
 )
 from core.tool_protocol import ToolSpec
+
+
+# 主题仓库延迟导入：core.gui_theme 会连带拉起 PIL/config（冷启动实测约 26ms），
+# 而 CLI 下用户往往整局都不碰皮肤主题，没必要在启动期付这个成本。
+def _theme_repo():
+    from core.gui_theme import get_repository
+
+    return get_repository()
+
+
+def _theme_error_class():
+    from core.gui_theme import ThemeError
+
+    return ThemeError
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +154,7 @@ _THEME_ACTIONS = (
 
 
 def _action_list() -> str:
-    repository = get_repository()
+    repository = _theme_repo()
     themes = repository.list_themes()
     active_id = None
     try:
@@ -154,18 +167,18 @@ def _action_list() -> str:
 def _action_get(theme_id: str) -> str:
     if not theme_id:
         return _fail("需要提供 theme_id")
-    return _ok(theme=get_repository().get_theme(theme_id))
+    return _ok(theme=_theme_repo().get_theme(theme_id))
 
 
 def _action_active() -> str:
-    theme = get_repository().get_active()
+    theme = _theme_repo().get_active()
     return _ok(theme=theme, active_id=theme.get("id"))
 
 
 def _action_activate(theme_id: str) -> str:
     if not theme_id:
         return _fail("需要提供 theme_id")
-    repository = get_repository()
+    repository = _theme_repo()
     theme = repository.set_active(theme_id)
     notification = _notify_theme_activated(theme_id)
     return _ok(
@@ -185,7 +198,7 @@ def _action_save(payload: Any) -> str:
     manifest = _theme_manifest(_payload_mapping(payload))
     if not manifest:
         return _fail("需要提供 payload（完整主题对象）")
-    saved = get_repository().save_theme(manifest)
+    saved = _theme_repo().save_theme(manifest)
     return _ok(theme=saved, theme_id=saved.get("id"))
 
 
@@ -197,7 +210,7 @@ def _action_copy(theme_id: str, payload: Any) -> str:
     if not new_id:
         return _fail("需要在 payload 中提供新主题的 id")
     new_name = _text(data.get("name")) or new_id
-    copied = get_repository().copy_theme(theme_id, new_id, new_name)
+    copied = _theme_repo().copy_theme(theme_id, new_id, new_name)
     return _ok(theme=copied, theme_id=copied.get("id"))
 
 
@@ -209,14 +222,14 @@ def _action_rename(theme_id: str, payload: Any) -> str:
     new_name = _text(data.get("name"))
     if not new_name:
         return _fail("需要在 payload 中提供新的主题名称 name")
-    renamed = get_repository().rename_theme(theme_id, new_id, new_name)
+    renamed = _theme_repo().rename_theme(theme_id, new_id, new_name)
     return _ok(theme=renamed, theme_id=renamed.get("id"))
 
 
 def _action_delete(theme_id: str) -> str:
     if not theme_id:
         return _fail("需要提供 theme_id")
-    get_repository().delete_theme(theme_id)
+    _theme_repo().delete_theme(theme_id)
     return _ok(deleted=theme_id)
 
 
@@ -224,7 +237,7 @@ def _action_import(source_path: Any) -> str:
     source = _local_path(source_path, "source_path")
     if not source.is_file():
         return _fail(f"主题归档文件不存在：{source}")
-    imported = get_repository().import_zip(source)
+    imported = _theme_repo().import_zip(source)
     return _ok(theme=imported, theme_id=imported.get("id"))
 
 
@@ -234,7 +247,7 @@ def _action_export(theme_id: str, output_path: Any) -> str:
     destination = _local_path(output_path, "output_path")
     if destination.suffix.lower() != ".zip":
         destination = destination.with_suffix(".zip")
-    exported = get_repository().export_zip(theme_id, destination)
+    exported = _theme_repo().export_zip(theme_id, destination)
     return _ok(theme_id=theme_id, path=str(exported))
 
 
@@ -243,7 +256,7 @@ def _action_read_asset(theme_id: str, asset_path: str) -> str:
         return _fail("需要提供 theme_id")
     if not asset_path:
         return _fail("需要提供 asset_path（主题内的资源相对路径，例如 assets/xxx.png）")
-    mime_type, data = get_repository().read_asset(theme_id, asset_path)
+    mime_type, data = _theme_repo().read_asset(theme_id, asset_path)
     return _ok(
         theme_id=theme_id,
         asset_path=asset_path,
@@ -291,7 +304,7 @@ def theme_manage(
         if action == "read_asset":
             return _action_read_asset(theme_id, asset_path)
         return _fail(f"不支持的 action: {action}，可选：" + "/".join(_THEME_ACTIONS))
-    except ThemeError as exc:
+    except _theme_error_class() as exc:
         # 内置主题只读、删除活动主题、ZIP 不安全等都在这一层报出
         return _fail_theme(exc)
     except ValueError as exc:

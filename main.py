@@ -3,6 +3,13 @@ import shutil
 import sys
 import io
 
+# CLI 轻量档位：必须在后续任何 core.* 导入之前声明——core.llm 会在模块导入期
+# 按该档位构建工具表（剔除 GUI 专属工具，每个请求少约 5.6k tokens 的工具定义）。
+# 只在真实入口生效（__name__ == "__main__"），避免测试 `import main` 时污染
+# 同进程后续构建的工具表；GUI 入口不设此变量，保持 full 档位。
+if __name__ == "__main__":
+    os.environ.setdefault("YCODE_TOOL_PROFILE", "cli")
+
 
 def _agent_name() -> str:
     """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
@@ -15,6 +22,11 @@ def _agent_name() -> str:
 
 
 def _dispatch_browser_worker_argv() -> bool:
+    # 先做纯字符串预检再 import：core.computer.browser_backend 会连带拉起
+    # core.computer 全套（实测冷启动约 0.45s），而普通 CLI 启动根本用不到。
+    # 字面量必须与 WORKER_ARGV_FLAG 保持一致，import 后仍做一次兜底校验。
+    if "--ycode-browser-worker" not in sys.argv:
+        return False
     from core.computer.browser_backend import WORKER_ARGV_FLAG
 
     if WORKER_ARGV_FLAG not in sys.argv:
@@ -34,12 +46,24 @@ _dispatch_browser_worker_argv()
 # 按 GBK 解释，非 BMP emoji（🚨 🤖 等）照样乱码。启动时尽量把控制台代码页切到
 # UTF-8(65001)，让旧版 conhost 也能正确显示。
 if sys.platform == "win32":
+    # 只在"真的需要改控制台代码页"时才 import ctypes：ctypes 首次加载在冷启动
+    # 实测约 0.25~0.36s，而管道/headless（非 tty）输出根本不经过控制台渲染，
+    # 现代 UTF-8 终端也不需要切代码页。只在旧版 GBK 交互终端里付这笔成本。
+    _needs_codepage_switch = False
     try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-        ctypes.windll.kernel32.SetConsoleCP(65001)
+        _needs_codepage_switch = bool(
+            sys.stdout is not None and sys.stdout.isatty()
+        ) and "utf" not in str(getattr(sys.stdout, "encoding", "") or "").lower()
     except Exception:
-        pass
+        _needs_codepage_switch = False
+    if _needs_codepage_switch:
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
 if sys.stdout and hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", None) != "utf-8":
     try:
         sys.stdout = io.TextIOWrapper(
@@ -125,8 +149,6 @@ from core.ui_markers import ANSI_GRAY, ANSI_RESET, plan_color, plan_html_color, 
 from core.plan import bind_default_plan_session, get_default_plan_manager
 from core.model_manager import get_active_model
 from core.version import __version__ as YCODE_VERSION
-# 电脑操控 CLI 运行控制（Task 14）：cli 模块只依赖纯模型层，import 无副作用
-from core.computer.cli import ComputerCliEvent
 # 警告：from-import 会在 import 时冻结常量值。新增调用方禁止 from-import 这些常量，
 # 应 import config 后动态读取（如 config.MY_MODEL），以便配置热更新生效。
 # config.py 已通过模块级 __getattr__ 动态解析 MY_* 常量，必须走模块属性访问。
@@ -936,40 +958,6 @@ def _reset_turn_state():
         app_instance.invalidate()
 
 
-def _stop_active_computer_run_for_cancel() -> None:
-    """Ctrl+C 先停止活动电脑操控 run，再走 Turn 级取消（Task 14）。
-
-    controller.stop(run_id, "cli_ctrl_c") 内部按固定顺序触发 owner cancel
-    与 Provider 在飞流中断；无活动 run 时是空操作。Task 14 审查裁决④：
-    与 Bridge 的 _stop_computer_runs_for_disabled_switch 对齐加兜底
-    except——取消路径绝不因电脑操控清理异常而中断 Turn 级取消。
-    """
-    try:
-        from core.computer.cli import stop_active_run_for_cancel
-        from core.computer.controller import get_computer_control_service
-
-        stop_active_run_for_cancel(get_computer_control_service())
-    except Exception:
-        logging.getLogger("main.computer").exception(
-            "Ctrl+C 停止活动电脑操控 run 失败（已忽略，继续 Turn 级取消）"
-        )
-
-
-def _computer_status_bar_segment() -> str:
-    """CLI 底部状态栏的电脑操控段（设计 17.2，Task 14 审查裁决①）。
-
-    活动 run 时为 ``电脑操控: 运行中 · Edge · N 步``；否则空串（状态栏
-    布局不变）。读取失败一律返回空串——状态栏渲染绝不因电脑操控异常抖动。
-    """
-    try:
-        from core.computer.cli import render_computer_status_bar
-        from core.computer.controller import get_computer_control_service
-
-        return render_computer_status_bar(get_computer_control_service().snapshot())
-    except Exception:
-        return ""
-
-
 def _git_status_bar_segment() -> str:
     """CLI 底部状态栏的 Git 段（规格 §12.1）：``⎇ dev* ↑2 ↓1  3 changes``。
 
@@ -983,33 +971,6 @@ def _git_status_bar_segment() -> str:
         return render_git_status_bar(get_workdir() or "")
     except Exception:
         return ""
-
-
-def _startup_computer_runtime_for_cli() -> None:
-    """启动轻量电脑操控运行时（Task 16）：开关开启时注册全局紧急停止热键。
-
-    默认关闭路径零额外导入（不触碰 Playwright/浏览器/截图）；失败只留痕。
-    """
-    try:
-        from core.computer.runtime import start_computer_runtime
-
-        start_computer_runtime()
-    except Exception:
-        logging.getLogger("main.computer").exception(
-            "启动电脑操控运行时失败（已忽略）"
-        )
-
-
-def _shutdown_computer_runtime_for_cli() -> None:
-    """CLI 退出统一收尾（Task 16）：controller（活动 run+retained）→ preview → hotkey。"""
-    try:
-        from core.computer.runtime import shutdown_process_computer_runtime
-
-        shutdown_process_computer_runtime("cli_exit")
-    except Exception:
-        logging.getLogger("main.computer").exception(
-            "CLI 退出时关闭电脑操控运行时失败（已忽略）"
-        )
 
 
 def _ensure_cli_disclaimer_consent() -> None:
@@ -1094,8 +1055,9 @@ def _require_interactive_console() -> None:
     raise SystemExit(2)
 
 
-# 斜杠命令输入补全表（Task 14 审查裁决③：补 /computer；从 _make_input_app
-# 提取到模块层供测试断言，SlashCommandCompleter 经局部别名引用不变）。
+# 斜杠命令输入补全表（从 _make_input_app 提取到模块层供测试断言，
+# SlashCommandCompleter 经局部别名引用不变）。
+# 注：CLI 轻量模式不提供电脑/浏览器操控，/computer 已下线。
 COMMAND_COMPLETIONS = [
     ("/help", "查看系统指令说明"),
     ("/session", "切换或创建新的记忆会话"),
@@ -1133,7 +1095,6 @@ COMMAND_COMPLETIONS = [
     ("/turns", "设置单任务最大模型轮次 (10-1000)"),
     ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
     ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
-    ("/computer", "电脑操控运行控制 (status/pause/resume/stop, browser 切默认浏览器)"),
     ("/clear", "清理当前屏幕"),
     ("/exit", "退出 星瑶Code"),
 ]
@@ -1229,10 +1190,6 @@ def _cancel_active_turn() -> None:
     from core.tools import subagent_manager
     from core.task_scheduler import get_default_scheduler
     from core.plan import suppress_plan_auto_continue
-
-    # Ctrl+C：先停止活动电脑操控 run（owner cancel + Provider 流中断在其
-    # 内部按固定顺序触发），再走 Turn 级取消收尾（Task 14）
-    _stop_active_computer_run_for_cancel()
 
     # 取消完全由每 turn 的 cancel_event 驱动（core.llm 已不再读取模块级 cancel_requested）
     if active_cancel_event is not None:
@@ -1542,13 +1499,6 @@ def _render_ui_event(event):
     global active_thinking_text, active_thinking_turn_id, _active_tool_status
     global _thinking_panel_linger
     global _last_printed_plan_state
-    if isinstance(event, ComputerCliEvent):
-        # 电脑操控动作摘要（Task 14）：listener 在 worker 线程只入队，
-        # 这里在 UI 线程单行打印已脱敏的纯文本
-        text = str(event.payload.get("text", ""))
-        if text:
-            _print_ui_fragment(f"{text}\n")
-        return
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
         # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，不显示具体工具调用细节。
@@ -2778,8 +2728,6 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;任务ID&gt;</ansicyan>              : 查看任务最新 30 行日志 (子代理任务显示运行状态)"))
         print_formatted_text(HTML("  <ansicyan>/plan</ansicyan>                                : 查看当前任务计划与逐项状态"))
         print_formatted_text(HTML("  <ansicyan>/plan &lt;pause|resume|retry ID|cancel&gt;</ansicyan>       : 暂停、恢复、重试或取消计划"))
-        print_formatted_text(HTML("  <ansicyan>/computer &lt;status|pause|resume|stop&gt;</ansicyan>   : 电脑操控运行控制"))
-        print_formatted_text(HTML("  <ansicyan>/computer browser [edge|chrome]</ansicyan>    : 查看/切换操控默认浏览器 (活动任务内禁止切换；操控开关请在 GUI 系统设置页修改)"))
         print_formatted_text(HTML("  <ansicyan>/doctor [--json]</ansicyan>                    : 聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 输出机器可读结果)"))
         print_formatted_text(HTML("  <ansicyan>/doctor export [--full y]</ansicyan>           : 导出排障诊断包 zip (manifest/journal/doctor/日志；默认不含消息正文，--full 经脱敏+确认后追加)"))
         print_formatted_text(HTML(""))
@@ -3694,17 +3642,6 @@ def handle_slash_command(command_text):
             else:
                 print_formatted_text(HTML("<ansired>❌ 用法：/plan、/plan pause、/plan resume、/plan retry &lt;id&gt;、/plan cancel</ansired>"))
 
-    elif cmd == "/computer":
-        # 电脑操控运行控制（设计 17.1）：CLI 只 status/pause/resume/stop；
-        # browser 子命令可查看/切换默认浏览器（CLI 唯一可改的永久设置项），
-        # 操控开关本身仍只能在 GUI 系统设置页修改（与 GUI 共用同一 controller 单例）
-        from core.computer.cli import handle_computer_command
-        from core.computer.controller import get_computer_control_service
-
-        result = handle_computer_command(command_text, get_computer_control_service())
-        color = "ansicyan" if result.ok else "ansiyellow"
-        print_formatted_text(HTML(f"<{color}>{_esc(result.text)}</{color}>"))
-
     elif cmd == "/undo":
         # 按回合撤销（规格 17）：/undo、/undo <turn_id>、list、preview、status、recover。
         # 预检 + 一次性令牌 + 多文件事务；默认确认 N，无 --force。
@@ -4342,8 +4279,8 @@ def _make_input_app():
     └──────────────────────────────────────┘
      model · session · dir     快捷键提示
     """
-    # COMMAND_COMPLETIONS 已提取为模块级常量（Task 14 审查裁决③：补
-    # /computer；模块层定义供测试断言，SlashCommandCompleter 引用不变）。
+    # COMMAND_COMPLETIONS 已提取为模块级常量（模块层定义供测试断言，
+    # SlashCommandCompleter 引用不变）。
     command_completions = COMMAND_COMPLETIONS
 
     class SlashCommandCompleter(Completer):
@@ -4788,10 +4725,6 @@ def _make_input_app():
             ("class:status.sep",     "  |  "),
             (task_style,             task_info),
         ]
-        computer_segment = _computer_status_bar_segment()
-        if computer_segment:
-            segments.append(("class:status.sep", "  |  "))
-            segments.append(("class:status.token", f" {computer_segment} "))
         git_segment = _git_status_bar_segment()
         if git_segment:
             segments.append(("class:status.sep", "  |  "))
@@ -5848,11 +5781,11 @@ def run_cli():
     except Exception:
         pass
 
-    # ── 启动预热（同步阶段，CLI 出现前完成）──────────────────────────────
-    # 设计取向：启动慢一点没关系，但进入界面后必须立即可用、输入不卡。
-    # 若改为后台预热，mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
-    # 抢 GIL，实测会把首帧绘制卡 8 秒、键盘输入无回显。因此三个预热任务在
-    # 此处并发执行、主线程显示进度动画并等全部完成后再进入 CLI。
+    # ── 启动预热 ────────────────────────────────────────────────────────
+    # 只同步等待 LLM 引擎：tiktoken 首次调用是 CPU 密集 import，若它与 TUI
+    # 渲染线程抢 GIL，会把首帧卡住数秒、键盘输入无回显，这一项必须等。
+    # MCP 连接是网络 I/O、Token 统计是本地 DB 读取，都不影响首屏可用性，
+    # 全部放纯后台，不再拖长启动时间。
 
     def _preload_llm_engine():
         """预热 LLM 引擎：token 估算器首次调用与模型视觉能力探测
@@ -5922,33 +5855,42 @@ def run_cli():
         except Exception as e:
             logging.getLogger("py.warnings").warning("启动预热 recalc_token_usage 失败: %s", e)
 
-    _preload_threads = [
-        threading.Thread(target=_preload_llm_engine, daemon=True),
-        threading.Thread(target=_preload_mcp, daemon=True),
-        threading.Thread(target=_warm_token_usage, daemon=True),
-    ]
-    for _t in _preload_threads:
-        _t.start()
+    _preload_llm_thread = threading.Thread(target=_preload_llm_engine, daemon=True)
+    _preload_llm_thread.start()
+    # MCP 连接与 Token 统计放纯后台：都不影响首屏可用性，同步等它们只是白拉长启动。
+    for _bg_target in (_preload_mcp, _warm_token_usage):
+        threading.Thread(target=_bg_target, daemon=True).start()
 
     # 进度动画：纯文本终端阶段（CLI 未启动），非 tty 时安静等待
     _preload_t0 = time.monotonic()
     _spin_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     _tty = sys.stdout is not None and sys.stdout.isatty()
     try:
-        while any(_t.is_alive() for _t in _preload_threads):
+        while _preload_llm_thread.is_alive():
             if _tty:
                 _frame = _spin_frames[int((time.monotonic() - _preload_t0) * 10) % len(_spin_frames)]
                 print(f"\r  {_frame} {_agent_name()}正在预热模型引擎 · {time.monotonic() - _preload_t0:.1f}s   ", end="", flush=True)
-            for _t in _preload_threads:
-                _t.join(timeout=0.1)
+            _preload_llm_thread.join(timeout=0.1)
     except KeyboardInterrupt:
         # Ctrl+C：跳过等待直接进入界面（后台 daemon 线程仍会继续预热）
         if _tty:
             print("\r  ⚠️ 已跳过预热等待，首轮对话可能稍慢。           ")
 
-    # 预热全部完成后才铺主界面：print_logo 会清屏，启动提示与预热动画随之消失，
-    # 用户直接看到完整可输入的主页面（logo + 输入框 + 准确的状态栏）
+    # LLM 引擎就绪即铺主界面：print_logo 会清屏，启动提示与预热动画随之消失，
+    # 用户直接看到可输入的主页面（MCP/Token 统计仍在后台补齐，不影响输入）
     print_logo()
+
+    # 工具表后台预热：界面已经可用，趁用户输入第一个问题的时间把工具表装配完
+    # （实测约 0.6s），首轮请求直接命中缓存，不必在请求路径上现构建。
+    def _warm_tool_registry():
+        try:
+            import core.llm as _llm_module
+
+            _llm_module.tool_registry.all()
+        except Exception:
+            pass
+
+    threading.Thread(target=_warm_tool_registry, daemon=True).start()
 
     # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
     def _ui_refresher_loop():
@@ -5968,18 +5910,8 @@ def run_cli():
 
     threading.Thread(target=_ui_refresher_loop, daemon=True).start()
 
-    # 电脑操控事件桥（Task 14）：controller listener 在 worker 线程触发，
-    # 只向现有 UI 事件队列投递（post_ui_event → schedule_ui 回 UI 线程），
-    # 由 _render_ui_event 打印一行脱敏摘要；绝不直接 print / 改 layout。
-    from core.computer.cli import make_cli_event_listener
-    from core.computer.controller import get_computer_control_service as _get_computer_service
-
-    _get_computer_service().add_listener(make_cli_event_listener(post_ui_event))
-
-    # 电脑操控运行时（Task 16，设计 23.2）：轻量容器——任一开关开启时注册
-    # 全局紧急停止热键；默认关闭路径零额外导入（不触碰 Playwright/浏览器/
-    # 截图）。CLI 不接预览发布器（无预览 UI）。
-    _startup_computer_runtime_for_cli()
+    # CLI 轻量模式不加载电脑/浏览器操控：不注册 controller 监听、不启动运行时、
+    # 不注册紧急停止热键（能力层已在 core.computer.capability 统一禁用）。
 
     # 主循环：支持 /models 弹出选择器并重启主 App
     while True:
@@ -6189,16 +6121,9 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     if args.prompt is not None:
-        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码；
-        # finally 统一关闭电脑操控运行时（Task 16：controller→preview→hotkey）
-        try:
-            exit_code = run_headless(prompt=args.prompt, session_name=args.session)
-        finally:
-            _shutdown_computer_runtime_for_cli()
+        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码
+        exit_code = run_headless(prompt=args.prompt, session_name=args.session)
         sys.exit(exit_code)
     else:
-        # 交互式模式（默认）；finally 覆盖正常退出与异常退出两条路径
-        try:
-            run_cli()
-        finally:
-            _shutdown_computer_runtime_for_cli()
+        # 交互式模式（默认）
+        run_cli()

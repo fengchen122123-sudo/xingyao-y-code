@@ -123,7 +123,91 @@ def filter_reserved_tool_schemas(schemas: Iterable[dict[str, Any]]) -> list[dict
     return allowed
 
 
-def build_default_registry() -> ToolRegistry:
+# ── 运行形态档位（CLI 轻量档）────────────────────────────────────────
+# CLI 的定位是"开发者终端里写代码"，不与 GUI 共享全部富交互面板能力。
+# 下列工具在 CLI 下要么必然不可用（内嵌浏览器面板、星轨自动化、选区截图），
+# 要么与写代码无关（皮肤/人设/飞书/局域网/决策面板/图片生成/更新向导），
+# 注册它们只会让每次请求都多背约 5.6k tokens 的工具定义，因此在 CLI 档位剔除。
+# 注意：这里只裁"对模型暴露的工具表"，对应的斜杠命令与业务能力不受影响。
+CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
+    # 外观与人设
+    "theme_manage",
+    "persona_manage",
+    # 星轨自动化（CLI/headless 下服务句柄未注册，调用必然失败）
+    "automation_list",
+    "automation_create",
+    "automation_update",
+    "automation_delete",
+    "automation_run_now",
+    # 外部集成与决策面板
+    "feishu_manage",
+    "lan_manage",
+    "decision_manage",
+    # 交互面板（GUI 专属 UI 能力）
+    "computer_control",
+    "pty_manage",
+    "browser_pane",
+    "screenshot_capture",
+    "browser_set_viewport",
+    "clipboard_image",
+    # 跨会话派发 / 秘书
+    "dispatch_task",
+    "open_session",
+    "secretary_probe",
+    # 运维与内容生成
+    "update_manage",
+    "diagram_manage",
+    "hunyuan_generate_image",
+    "tokenrhythm_generate_image",
+    "tokenrhythm_edit_image",
+    # 只读查询类：斜杠命令（/usage /share /doctor）或已保留的同名工具
+    # （search_sessions）完全覆盖，不必再占一份 schema。
+    "usage_stats",
+    "session_export",
+    "doctor_run",
+    "search_conversations",
+    # 会话/模型配置：斜杠命令 /session、/models 覆盖；保留 skill_manage /
+    # plugin_manage / hook_manage / mcp_* / system_settings 的对话式配置能力。
+    "session_manage",
+    "model_manage",
+    # 与写代码无关（fetch_image 只在网页图文并茂展示时用，写代码不需要）
+    "get_weather",
+    "search_news",
+    "fetch_image",
+})
+
+VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli")
+
+
+def _resolve_tool_profile(profile: str | None = None) -> str:
+    """解析工具表档位：显式参数 > 环境变量 > app_context UI 形态 > full。
+
+    环境变量优先于 app_context，是因为 core.llm 在模块导入期就会构建工具表，
+    此时入口层往往还没来得及 set_ui_flavor；main.py 在 import core.llm 之前
+    用 YCODE_TOOL_PROFILE=cli 声明形态。
+    """
+    candidate = str(profile or "").strip().lower()
+    if candidate in VALID_TOOL_PROFILES:
+        return candidate
+    try:
+        import os
+
+        env_value = os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower()
+        if env_value in VALID_TOOL_PROFILES:
+            return env_value
+    except Exception:
+        pass
+    try:
+        from core.app_context import get_ui_flavor
+
+        if get_ui_flavor() == "cli":
+            return "cli"
+    except Exception:
+        pass
+    return "full"
+
+
+def build_default_registry(profile: str | None = None) -> ToolRegistry:
     from core import tools
     from core import lsp as _lsp
     from core.ask_user import ask_user
@@ -1067,6 +1151,18 @@ def build_default_registry() -> ToolRegistry:
         plugin_loader.load_and_register(registry)
     except Exception:
         pass
+    # CLI 轻量档位：剔除 GUI 专属工具（见 CLI_EXCLUDED_TOOLS 说明）。
+    # 放在插件加载之后，避免插件重新注册同名工具又把它们带回来。
+    if _resolve_tool_profile(profile) == "cli":
+        removed = 0
+        for _name in sorted(CLI_EXCLUDED_TOOLS):
+            try:
+                registry.unregister(_name)
+            except KeyError:
+                continue
+            removed += 1
+        if removed:
+            _LOGGER.debug("CLI 轻量档位已剔除 %d 个 GUI 专属工具", removed)
     _apply_managed_tool_filter(registry)
     return registry
 

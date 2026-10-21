@@ -209,3 +209,61 @@ describe('ToolExecutionRow', () => {
     expect(wrapper.get('.trace-takeover-badge').text()).toBe('等待主 Agent 接管');
   });
 });
+
+
+// ── 电脑操控行（2026-10-21）：动作动词 + 目标，展开看当帧截图 ────────────
+describe('computer action row', () => {
+  const shotSha = 'a'.repeat(64);
+
+  function computerRow(): ToolTraceRow {
+    return {
+      id: 'computer:c1',
+      kind: 'computer',
+      status: 'completed',
+      action: '点击',
+      detail: 'el-20',
+      command: '',
+      errorSummary: '',
+      count: 1,
+      durationMs: 320,
+      metrics: {},
+      calls: [{
+        id: 'c1',
+        name: 'computer_action',
+        label: '点击控件 el-20',
+        result: {
+          ok: true,
+          summary: '完成',
+          result: JSON.stringify({ ok: true, target: 'browser', action: 'click_element', screen_sha256: shotSha }),
+        },
+      }],
+    };
+  }
+
+  it('uses the action verb as the row label instead of 工具', () => {
+    const wrapper = mount(ToolExecutionRow, { props: { row: computerRow() } });
+    expect(wrapper.get('.trace-kind').text()).toBe('点击');
+    expect(wrapper.get('.trace-target').text()).toBe('el-20');
+    expect(wrapper.get('.trace-meta').text()).toBe('320ms');
+  });
+
+  it('expands to the screenshot matched by screenshot hash', async () => {
+    const store = useAppStore();
+    store.computerShots[shotSha] = '/computer-preview/tok/shot-007.png';
+    const wrapper = mount(ToolExecutionRow, { props: { row: computerRow() } });
+
+    await wrapper.get('.trace-line').trigger('click');
+
+    expect(wrapper.get('.computer-shot').attributes('src')).toBe('/computer-preview/tok/shot-007.png');
+    expect(wrapper.text()).toContain('该动作当帧');
+  });
+
+  it('explains when that frame is no longer cached', async () => {
+    const wrapper = mount(ToolExecutionRow, { props: { row: computerRow() } });
+
+    await wrapper.get('.trace-line').trigger('click');
+
+    expect(wrapper.find('.computer-shot').exists()).toBe(false);
+    expect(wrapper.text()).toContain('该帧已过期');
+  });
+});

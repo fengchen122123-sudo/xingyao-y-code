@@ -152,8 +152,12 @@ def _default_controller_provider():
 
 
 def _emergency_stop(controller_provider):
-    """Ctrl+Alt+Esc 回调：停止当前活动 run（controller 固定停止顺序内含
-    owner cancel 与 Provider 在飞流中断）；run 已收尾（竞态）无事发生。"""
+    """Ctrl+Alt+Esc 回调：停止当前活动 run。
+
+    走 stop_for_user：紧急热键同样是"用户"的停止意图，只应结束电脑操控 run，
+    不能置位回合 cancel_event 把对话回合整条掐掉（模型会毫不知情地被打断）；
+    抑制态与通知由 stop_for_user 统一记账。run 已收尾（竞态）无事发生。
+    """
 
     def _on_hotkey_stop() -> None:
         try:
@@ -171,7 +175,7 @@ def _emergency_stop(controller_provider):
         if not run_id or status in _TERMINAL_RUN_STATUSES:
             return
         try:
-            controller.stop(run_id, "emergency_hotkey")
+            controller.stop_for_user(run_id, "emergency_hotkey")
         except ComputerControlError:
             # run 已在停止收尾（竞态）：紧急停止的目标已达成
             _LOGGER.info("紧急停止热键触发时 run 已在收尾（忽略）")

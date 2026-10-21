@@ -616,6 +616,10 @@ export const useAppStore = defineStore('app', {
     // （设置读取快照）相互独立；轨迹为内存态，run 结束保留到下一个 run
     computerRun: emptyComputerRun(),
     computerTrace: [] as ComputerActionTrace[],
+    // 每帧截图索引：screen_sha256 → loopback 预览 URL。computer_observation 事件
+    // 同时带画面哈希与预览地址，按哈希记住后在对话区的电脑动作行里反查该动作
+    // 当帧的画面——不用给每个动作单独存截图，也不会把旧图错配到新动作上。
+    computerShots: {} as Record<string, string>,
     // 操控页签自动打开标志：run 开始时首次自动切到操控页签一次，
     // 用户手动切走后不抢回（设计 16.2），新 run 再开一次
     computerLastAutoOpenedRunId: '',
@@ -2878,6 +2882,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // observation 只带 loopback token URL 与当前窗口/页面摘要，无截图内容
         const previewUrl = String(raw.preview_url || '');
         const surface = String(raw.origin_or_window || '');
+        const shotSha = String(raw.screen_sha256 || '');
+        if (previewUrl && shotSha) this._rememberComputerShot(shotSha, previewUrl);
         this.computerRun = {
           ...this.computerRun,
           ...(previewUrl ? { preview_url: previewUrl } : {}),
@@ -2911,6 +2917,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
         durationMs,
         String(raw.error_code || ''),
       );
+    },
+
+    // 每帧截图索引：按画面哈希记 loopback 预览地址，供对话区电脑动作行反查
+    // 该动作当帧的画面。只保留最近 80 帧（Map 语义按插入顺序淘汰最旧），
+    // 避免长回合里无界增长；同一帧重复观察只刷新不新增。
+    _rememberComputerShot(sha: string, url: string) {
+      const shots = this.computerShots;
+      if (shots[sha] === url) return;
+      shots[sha] = url;
+      const keys = Object.keys(shots);
+      if (keys.length > 80) {
+        for (const key of keys.slice(0, keys.length - 80)) delete shots[key];
+      }
     },
 
     // 轨迹行 upsert：行内只有五个契约字段（绝不透传事件原始字段），新行插到
@@ -2948,6 +2967,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this._computerClosedRunId = runId;
       this.computerRun = emptyComputerRun();
       this.computerTrace = [];
+      this.computerShots = {};
       this._computerActionStartMs = {};
       this._computerEventSeq = 0;
     },

@@ -47,6 +47,21 @@
     </div>
 
     <div v-if="rowOpen" class="trace-detail">
+      <!-- 电脑操控：该动作当帧的截图（按画面哈希反查）+ 目标说明 -->
+      <div v-if="isComputerRow" class="computer-detail">
+        <img
+          v-if="computerShotUrl"
+          class="computer-shot"
+          :src="computerShotUrl"
+          alt="该动作当帧截图"
+        />
+        <div class="computer-params">
+          <span v-if="row.detail">目标：{{ row.detail }}</span>
+          <span v-if="computerShotUrl">画面：该动作当帧（按画面哈希匹配）</span>
+          <span v-else>画面：该帧已过期，右侧「电脑操控」面板可看本 run 最新一张</span>
+        </div>
+      </div>
+
       <!-- 分组读取 / 搜索：列出每个文件目标 -->
       <ul v-if="groupFiles.length > 0" class="trace-files">
         <li v-for="(file, fi) in groupFiles" :key="fi">{{ file }}</li>
@@ -119,6 +134,7 @@ const NODE_TONES: Record<ToolTraceRow['kind'], string> = {
   command: 'command',
   mutation: 'mutation',
   skill: 'skill',
+  computer: 'computer',
   tool: 'tool',
   'legacy-diffs': 'legacy',
 };
@@ -128,11 +144,17 @@ const KIND_LABELS: Record<ToolTraceRow['kind'], string> = {
   command: '运行',
   mutation: '编辑',
   skill: '技能',
+  computer: '电脑',
   tool: '工具',
   'legacy-diffs': '变更',
 };
 
-const kindLabel = computed(() => KIND_LABELS[props.row.kind] ?? '工具');
+// 电脑操控行直接把动作动词当类别（观察 / 点击 / 输入…），其余行用固定类别名
+const kindLabel = computed(() =>
+  props.row.kind === 'computer'
+    ? props.row.action || '电脑'
+    : (KIND_LABELS[props.row.kind] ?? '工具'),
+);
 const nodeToneClass = computed(() => `node-${NODE_TONES[props.row.kind] ?? 'tool'}`);
 
 // 只有失败/取消把圆点换成状态图标，其余状态一律是类别色圆点
@@ -289,12 +311,36 @@ const resultText = computed(() =>
 );
 const hasResult = computed(() => resultText.value.trim().length > 0);
 
+// 电脑操控行：展开后显示该动作**当帧**的截图。做法是用结果 JSON 里的
+// screen_sha256 去 store.computerShots 反查——不按"第几个动作"猜，也不把
+// store 里最新一张硬套到历史动作上，避免图与动作错配。
+const isComputerRow = computed(() => props.row.kind === 'computer');
+const computerShotUrl = computed(() => {
+  if (!isComputerRow.value) return '';
+  for (const call of props.row.calls) {
+    const text = call.result?.result ?? '';
+    if (!text) continue;
+    try {
+      const payload = JSON.parse(text);
+      const sha = String(payload?.screen_sha256 || '');
+      if (sha) {
+        const url = store.computerShots[sha];
+        if (url) return url;
+      }
+    } catch {
+      // 非 JSON 结果（错误文本等）不参与匹配
+    }
+  }
+  return '';
+});
+
 // 有展开内容时整行才可点：否则不挂 role=button、不显示箭头（对齐 ZCode 的 canToggle=false）
 const canExpand = computed(
   () => groupFiles.value.length > 0
     || diffs.value.length > 0
     || subagentTasks.value.length > 0
-    || hasResult.value,
+    || hasResult.value
+    || isComputerRow.value,
 );
 
 function splitDiffLines(text: string): string[] {
@@ -381,6 +427,7 @@ function diffLineClass(line: string) {
 .trace-icon.node-command { color: var(--green); }
 .trace-icon.node-mutation { color: var(--orange); }
 .trace-icon.node-skill { color: var(--purple); }
+.trace-icon.node-computer { color: var(--cyan); }
 .trace-icon.node-tool { color: var(--text-dim); }
 .trace-icon.node-legacy { color: var(--yellow); }
 .status-failed .trace-icon { color: var(--red); }
@@ -510,6 +557,30 @@ function diffLineClass(line: string) {
   font-size: 11.5px;
   line-height: 1.6;
   color: var(--text-dim);
+}
+/* 电脑操控展开区：截图在前、参数在后，图限宽避免撑破对话列 */
+.computer-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.computer-shot {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  width: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.computer-params {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-faint);
+  word-break: break-word;
 }
 .diff-body {
   margin-top: 2px;

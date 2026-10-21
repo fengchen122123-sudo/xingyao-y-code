@@ -183,6 +183,32 @@ def _attempted_value(decoded, key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+# 稳定错误码 → 模型下一步动作（2026-10-21）：错误码本身只是分类，模型真正
+# 需要的是"现在该换什么策略"。文案统一为短句祈使，避免模型把可重试错误当
+# 致命错误、或把不可重试错误当偶发失败反复重试。只在 error_message 末尾追加，
+# 9 键 JSON 形状与 error_code 一律不变。
+_ERROR_NEXT_STEP = {
+    "computer_element_stale": "先重新 list_elements 或 observe 拿到新的元素引用，再操作",
+    "computer_elements_unavailable": "当前界面没有可用控件，改用截图坐标或换一个目标窗口",
+    "computer_element_unsupported": "该控件不支持这个操作，换用其它控件或改用坐标点击",
+    "computer_surface_changed": "画面或窗口已切换，先 observe 重建基线再继续",
+    "computer_surface_ambiguous": "候选窗口不唯一，先 list_surfaces 后用 surface_ref 指定",
+    "computer_coordinate_out_of_bounds": "坐标超出当前画面尺寸，先 observe 确认尺寸再点",
+    "computer_no_progress": "画面连续多次没有变化，换一种操作策略或直接询问用户",
+    "computer_action_timeout": "动作超时且结果未知，先 observe 确认当前状态再决定",
+    "computer_invalid_action": "按工具说明修正参数后重试，不要原样重复同一调用",
+}
+
+
+def _error_message_with_next_step(error: ComputerControlError) -> str:
+    """错误文案追加「下一步」，让模型把错误码换成具体策略而不是盲目重试。"""
+    message = str(getattr(error, "message", "") or "")
+    hint = _ERROR_NEXT_STEP.get(str(getattr(error, "code", "") or ""))
+    if not hint or hint in message:
+        return message
+    return f"{message}；下一步：{hint}"
+
+
 def _error_result(target: str, action: str, error: ComputerControlError) -> ToolResult:
     """稳定 9 键 JSON 错误结果（设计 10.2）：不携带截图、输入正文或旧图。"""
     payload = {
@@ -194,7 +220,7 @@ def _error_result(target: str, action: str, error: ComputerControlError) -> Tool
         "height": 0,
         "origin_or_window": "",
         "error_code": error.code,
-        "error_message": error.message,
+        "error_message": _error_message_with_next_step(error),
     }
     return ToolResult(
         content=json.dumps(payload, **_PROVIDER_JSON_KWARGS),
@@ -221,20 +247,94 @@ _OBSERVATION_ELEMENTS_TEXT_PREFIX = (
     " set_value_element）；元素都不可用时再用截图坐标。元素列表："
 )
 
+# 帧契约（2026-10-21，借 zcode frame-contract 的「体积上限 + 成对引用」思路）：
+# 单张观察图进上下文前必须有字节上限，否则长回合里截图会累积吃干上下文。
+# 2MB 是权衡值——1280 宽的界面截图 PNG 通常 100~600KB，超限基本意味着高分屏
+# 整屏原图，缩放一档就能回到预算内。
+_OBSERVATION_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+_OBSERVATION_IMAGE_MAX_EDGE = 1280
+
+# 画面与上一张完全相同时的替代说明：不重复附图，省下的 token 留给真实信息。
+_OBSERVATION_UNCHANGED_TEXT = (
+    "【电脑观察】本次动作后画面与上一张截图完全相同，已省略重复图片，"
+    "请直接依据上一张截图判断下一步；若怀疑画面其实已变，先调用 observe 重新确认。"
+)
+
+# 截图超限且缩放后仍超限时的说明。
+_OBSERVATION_IMAGE_OMITTED_TEXT = (
+    "【电脑观察】本次截图体积仍超出上限，已省略图片，只返回画面摘要；"
+    "请依据 screen_sha256 与画面尺寸判断，必要时缩小窗口比例后重新 observe。"
+)
+
+
+def _frame_reference_line(observation, *, size_bytes: int = 0) -> str:
+    """成对引用行（帧契约）：模型据此引用「同一帧」，而不是反复请求新图。
+
+    只含画面身份与尺寸，不含路径、时间戳或随机序号，保证相同画面字节稳定。
+    """
+    sha = str(getattr(observation, "screen_sha256", "") or "")
+    parts = [
+        f"frame={sha[:12] or 'unknown'}",
+        f"{int(getattr(observation, 'width', 0) or 0)}x"
+        f"{int(getattr(observation, 'height', 0) or 0)}",
+    ]
+    if size_bytes:
+        parts.append(f"png={size_bytes}B")
+    return "；".join(parts)
+
+
+def _downscale_png(png_bytes: bytes) -> bytes | None:
+    """超过体积上限时按最长边缩放重编码；Pillow 不可用或失败返回 None。
+
+    缩放是尽力而为：拿不到 Pillow 就按原图继续走体积判断，最终由调用方
+    决定是省略图片还是照常发送——绝不因为缩放失败让整个观察链路报错。
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as image:
+            image.load()
+            longest = max(image.width, image.height)
+            if longest <= _OBSERVATION_IMAGE_MAX_EDGE:
+                return None
+            ratio = _OBSERVATION_IMAGE_MAX_EDGE / float(longest)
+            target = (
+                max(1, int(image.width * ratio)),
+                max(1, int(image.height * ratio)),
+            )
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+            resized = image.resize(target, resample)
+            buffer = io.BytesIO()
+            resized.save(buffer, format="PNG", optimize=True)
+            return buffer.getvalue()
+    except Exception:
+        _LOGGER.exception("观察截图缩放失败，按原图判断体积上限")
+        return None
+
 
 def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> dict:
-    """观察的 follow-up user 消息（设计 10.2 + 阶段二双路径）。
+    """观察的 follow-up user 消息（设计 10.2 + 阶段二双路径 + 帧契约）。
 
-    有 elements 时为纯文本控件列表（a11y-first，请求不含截图字节）；
-    否则维持既有路径：PNG 转 data:image/png;base64 只存在于此消息。
-    tool result JSON、metadata 与日志绝不携带截图字节。_computer_v1 为
-    私有元数据（run_id/ordinal/target），两种路径一致。
+    三条路径按优先级：
+    1. 有 elements：纯文本控件列表（a11y-first，请求不含截图字节）；
+    2. 画面与上一张完全相同（screen_unchanged 且不是显式 observe）：纯文本
+       说明，不重复附图；
+    3. 其余：PNG 转 data:image/png;base64，受体积上限约束——超限先缩放，
+       缩放后仍超限则退化为纯文摘略。
+
+    tool result JSON、metadata 与日志绝不携带截图字节。_computer_v1 为私有
+    元数据（run_id/ordinal/target，必要时带 image_omitted 原因）。
     """
     meta = {
         "run_id": run_id,
         "ordinal": int(ordinal),
         "target": observation.target,
     }
+    frame_line = _frame_reference_line(observation)
     if observation.elements:
         lines = [
             f"- {e.get('ref', '')} {e.get('kind', '')} name={e.get('name', '')!r} "
@@ -249,12 +349,40 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
             ],
             "_computer_v1": meta,
         }
+    # 显式 observe 永远附图：模型主动要看画面时省略图片等于没回答它。
+    if getattr(observation, "screen_unchanged", False) and observation.action != "observe":
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{_OBSERVATION_UNCHANGED_TEXT}\n{frame_line}"}
+            ],
+            "_computer_v1": {**meta, "image_omitted": "unchanged"},
+        }
     png_bytes = _read_observation_png(observation.png_path)
+    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+        scaled = _downscale_png(png_bytes)
+        if scaled:
+            png_bytes = scaled
+    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"{_OBSERVATION_IMAGE_OMITTED_TEXT}\n"
+                    f"{_frame_reference_line(observation, size_bytes=len(png_bytes))}",
+                }
+            ],
+            "_computer_v1": {**meta, "image_omitted": "too_large"},
+        }
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
     return {
         "role": "user",
         "content": [
-            {"type": "text", "text": OBSERVATION_FOLLOWUP_TEXT},
+            {
+                "type": "text",
+                "text": OBSERVATION_FOLLOWUP_TEXT,
+            },
             {"type": "image_url", "image_url": {"url": data_url}},
         ],
         "_computer_v1": meta,
