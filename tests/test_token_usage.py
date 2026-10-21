@@ -980,22 +980,17 @@ def test_usage_table_keeps_numeric_columns_aligned_for_long_route_labels(monkeyp
 
 
 def test_status_token_info_reports_process_scope_only():
-    """状态栏只报进程累计口径：不再出现「本车道命中」段，全局标签仍在。"""
+    """状态栏只报进程累计口径：「本车道命中」「全局」标签、保活段都已移除。"""
     text = main._compose_status_token_info(
         prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
-        ctx_pct="3%", ctx_used="4K", ctx_max="128K", keepalive_rate=None,
+        ctx_pct="3%", ctx_used="4K", ctx_max="128K",
     )
 
     assert "本车道" not in text
-    assert "全局 输入 40.0M · 输出 2.1M · 命中 700.4K (71%)" in text
+    assert text.startswith("↑ 40.0M · ↓ 2.1M · ⚡ 700.4K (71%)")
     assert "上下文 3% (4K/128K)" in text
+    assert "全局" not in text
     assert "保活" not in text
-
-    with_keepalive = main._compose_status_token_info(
-        prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
-        ctx_pct="3%", ctx_used="4K", ctx_max="128K", keepalive_rate="2%",
-    )
-    assert with_keepalive.endswith("· 保活 2%")
 
 
 def test_usage_model_label_cell_is_bounded_but_keeps_channel_and_scope():
