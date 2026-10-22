@@ -332,13 +332,35 @@
       </div>
     </div>
 
-    <div class="side-footer">
-      <button data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
-        <span>⚙</span><span class="footer-copy"><b>设置</b></span>
-      </button>
-      <button class="phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
-        <AppIcon name="smartphone" :size="16" />
-      </button>
+    <!-- 底部容器：只为账号浮层提供定位基准（浮层 absolute 到 .side-bottom 的
+         上边缘），不改变内部 .side-footer 的网格布局 -->
+    <div class="side-bottom">
+      <div class="side-footer">
+        <!-- 左下角用户卡片：未登录点开基元律动（TokenRhythm）登录窗（登录成功后
+             后端自动绑定 API Key）；已登录则切换上方的账号浮层。
+             设置入口仍是右侧齿轮，手机访问是它右边的手机按钮 -->
+        <button
+          class="side-user"
+          data-test="side-user-card"
+          :title="store.trAuth.status === 'loggedIn'
+            ? '查看基元律动账号'
+            : '点击登录基元律动账号，自动配置 API Key'"
+          @click="onUserCardClick()"
+        >
+          <span class="side-avatar">{{ trAvatarText }}</span>
+          <span class="footer-copy"><b>{{ trUserLabel }}</b></span>
+        </button>
+        <button class="icon-btn" data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
+          <AppIcon name="settings" :size="16" />
+        </button>
+        <button class="icon-btn phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
+          <AppIcon name="smartphone" :size="16" />
+        </button>
+      </div>
+      <!-- 基元律动账号浮层：登录成功后点左下角卡片，在卡片上方弹出 -->
+      <TokenRhythmAccountPanel />
+      <!-- 账号中心原生弹窗（充值 / 用量明细 / 个人信息），Teleport 到 body -->
+      <TokenRhythmAccountDialog />
     </div>
   </div>
 
@@ -557,16 +579,40 @@
       </div>
     </div>
   </div>
+
+  <!-- 基元律动账号登录窗：左下角用户卡片点击后打开，登录成功自动关窗 -->
+  <TokenRhythmLoginModal />
 </template>
 
 <script setup lang="ts">
 import { ref, computed, reactive, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
+import TokenRhythmLoginModal from './TokenRhythmLoginModal.vue';
+import TokenRhythmAccountPanel from './TokenRhythmAccountPanel.vue';
+import TokenRhythmAccountDialog from './TokenRhythmAccountDialog.vue';
 import type { SessionGroup, SessionInfo } from '../types/pywebview';
 import { useIsMobile } from '../composables/useViewport';
 
 const store = useAppStore();
+
+// 左下角卡片点击：已登录 → 切换账号浮层；未登录 → 打开登录弹窗
+function onUserCardClick() {
+  if (store.trAuth.status === 'loggedIn') store.toggleTrAccountPanel();
+  else store.openTrLoginModal();
+}
+
+// 基元律动账号名（左下角用户卡片）：user 字段结构由后端决定，前端按常见字段
+// 兜底，全都拿不到就回落到产品名，避免登录后卡片显示空白
+const trUserLabel = computed(() => {
+  if (store.trAuth.status !== 'loggedIn') return '星瑶Code';
+  const user = (store.trAuth.user || {}) as Record<string, any>;
+  return String(user.name || user.nickname || user.phone || user.account || '星瑶Code');
+});
+// 头像文字：已登录取账号名首字，未登录沿用原来的产品首字母 Y
+const trAvatarText = computed(() => (
+  store.trAuth.status === 'loggedIn' ? (trUserLabel.value.slice(0, 1).toUpperCase() || 'Y') : 'Y'
+));
 
 // 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
 // 宽度。移动端（<=768px）不输出内联样式，布局交给 style.css 媒体查询。
@@ -1638,6 +1684,9 @@ onMounted(() => {
   document.addEventListener('mousedown', onDocMouseDown);
   document.addEventListener('keydown', onDocKeyDown);
 
+  // 账号状态是左下角用户卡片的数据源：启动后静默探测一次（未登录不弹提示）
+  if (store.trAuth.status === 'unknown') void store.refreshTrAuth();
+
   // 用后端权威快照校正本地缓存（localStorage 在强杀场景会丢写）。
   // 必须等桥真正就绪：api 对象先注入、方法后注入，抢跑会静默失败。
   if (pywebviewLayoutApiReady()) {
@@ -2380,13 +2429,21 @@ function getFolderTitle(g: SessionGroup) {
   margin: 4px 2px;
   background: var(--border);
 }
-
 .side-footer {
   padding: 7px;
   border-top: 1px solid var(--border);
   display: grid;
-  grid-template-columns: 1fr auto;
+  /* 左侧用户卡片占满剩余宽度，右侧两个图标按钮各自固定 32px */
+  grid-template-columns: 1fr auto auto;
   gap: 3px;
+}
+/* 底部容器：账号浮层（TokenRhythmAccountPanel）以它为定位基准，
+   absolute + bottom: calc(100% + 8px) 即贴在用户卡片正上方。
+   浮层不放在 .side-footer 内部：主题 CSS 里的 `#sidebar .side-footer button`
+   会连带改掉浮层按钮外观，这里避让开。 */
+.side-bottom {
+  position: relative;
+  flex: 0 0 auto;
 }
 .side-footer button {
   width: 100%;
@@ -2404,13 +2461,33 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--text);
   background: var(--bg2);
 }
-/* 手机访问入口：与设置按钮同行右侧的小方形图标按钮（弹窗内切换移动端 / web远端） */
-.side-footer .phone-btn {
+/* 底部用户卡片：可点击打开基元律动登录窗（圆形头像 + 名称），hover 反馈
+   沿用 .side-footer button 的统一样式 */
+.side-footer .side-user {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 7px;
+  color: var(--text-dim);
+}
+.side-footer .side-avatar {
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--bg3);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+/* 底部右侧图标按钮：设置与手机访问共用同一形态（32×32 圆形热区，与顶栏图标按钮同口径） */
+.side-footer .icon-btn {
   width: 32px;
   justify-content: center;
   padding: 7px;
   gap: 0;
-  /* 圆角拉满成正圆（32×32 方形热区），与顶栏图标按钮同口径 */
   border-radius: 50%;
 }
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }

@@ -904,6 +904,42 @@ navItems: [] as Array<{ id: number; preview: string }>,
       show: false,
     },
 
+    // 基元律动（TokenRhythm）账号：登录成功后由后端自动写入 API Key，前端只
+    // 维护展示态。status='unknown' 表示还没探测过（桥未就绪），避免把"未探测
+    // 到"误显示成"未登录"。
+    trAuth: {
+      status: 'unknown' as 'unknown' | 'anonymous' | 'loggedIn',
+      user: null as Record<string, any> | null,
+      configured: false,
+      loading: false,
+    },
+    // 登录弹窗显隐：与 sessionSearchModal 同一套 store 布尔控制约定
+    trLoginModal: { show: false },
+    // 账号浮层（左下角用户卡片上方的小窗）显隐：登录成功后点卡片切换
+    trAccountPanel: { show: false },
+    // 账号总览快照：一次 tr_account_overview() 取回 user / wallet / usage_today。
+    // data 为 null 且 error 为空时表示"还没取过"，浮层据此显示加载态
+    trOverview: {
+      loading: false,
+      data: null as Record<string, any> | null,
+      error: '',
+    },
+
+    // 账号中心原生弹窗（充值 / 用量明细 / 个人信息）：居中遮罩，直连官方接口
+    // 拿真实数据展示，免去内嵌浏览器二次登录。tab 决定当前渲染哪一块，
+    // 三个按钮共用这一个弹窗实例，关闭后状态清空。
+    trDialog: {
+      show: false,
+      tab: 'recharge' as 'recharge' | 'usage' | 'profile',
+      loading: false,
+      error: '',
+      data: null as Record<string, any> | null,
+      // 用量明细与调用日志分页游标（仅 usage 视图内部使用）
+      usagePage: 1,
+      usageRange: '7d' as string,
+      logsPage: 1,
+    },
+
     // 权限请求弹窗
     permRequest: { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '' } as PermReqState,
 
@@ -1516,6 +1552,23 @@ navItems: [] as Array<{ id: number; preview: string }>,
         return;
       }
       this.browserNavRequest = { url, path };
+      this.browserNavNonce += 1;
+      this.openRightPanelTab('browser');
+    },
+
+    // 基元律动控制台页面（充值 / 用量明细 / 个人信息）在应用内打开：复用右栏
+    // 内嵌浏览器页签，不再拉起系统浏览器。宿主确认不支持内嵌浏览器（非 Windows
+    // 桌面端 GUI）时回退外部打开，保证任何宿主上点按钮都落得了地。
+    // 账号浮层先收起：它相对左下角卡片定位并盖在内容之上，留着会压住刚摊开的右栏。
+    openTrConsolePage(this: any, url: string) {
+      const target = String(url || '').trim();
+      if (!target) return;
+      this.closeTrAccountPanel();
+      if (this.embeddedBrowser.supported === false) {
+        void this.openExternalUrl(target);
+        return;
+      }
+      this.browserNavRequest = { url: target, path: '' };
       this.browserNavNonce += 1;
       this.openRightPanelTab('browser');
     },
@@ -2158,6 +2211,245 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.sessionSearchModal.show = false;
     },
 
+    // ── 基元律动账号（TokenRhythm）────────────────────────────────────────
+    // 后端 tr_auth_* 系列不在 PyWebViewAPI 类型声明里（这批接口由后加的解
+    // 决方案提供），这里统一做一次存在性检查 + any 收窄，避免登录入口在旧后
+    // 端上直接抛错。
+    async _trAuthCall(method: string, label: string, args: any[] = []): Promise<any> {
+      const api = this._api() as any;
+      if (!api) return { ok: false, msg: '后端连接不可用，请启动应用后再试' };
+      const fn = api[method];
+      if (typeof fn !== 'function') {
+        return { ok: false, msg: '当前后端版本不支持基元律动登录，请更新到最新版本' };
+      }
+      try {
+        return await fn(...args);
+      } catch (err) {
+        console.error(`${method} 失败:`, err);
+        return { ok: false, msg: `${label}失败：${String(err)}` };
+      }
+    },
+
+    openTrLoginModal() {
+      this.trLoginModal.show = true;
+    },
+
+    closeTrLoginModal() {
+      this.trLoginModal.show = false;
+    },
+
+    // 账号浮层：打开即拉一次总览（余额 / 今日用量会变，不能只依赖上一次快照）。
+    // 拉取失败不清空已有登录态，只在浮层里展示后端原因 + 重试入口。
+    openTrAccountPanel() {
+      this.trAccountPanel.show = true;
+      void this.refreshTrOverview();
+    },
+
+    closeTrAccountPanel() {
+      this.trAccountPanel.show = false;
+    },
+
+    toggleTrAccountPanel() {
+      if (this.trAccountPanel.show) this.closeTrAccountPanel();
+      else this.openTrAccountPanel();
+    },
+
+    // 账号总览：桥接 tr_account_overview()。与 refreshTrAuth 一样按后台探测处理，
+    // 桥未就绪时不弹"连接失败"框，而是把原因写进 error 交给浮层展示。
+    async refreshTrOverview() {
+      const api = (window.pywebview && window.pywebview.api) as any;
+      if (!api || typeof api.tr_account_overview !== 'function') {
+        this.trOverview.data = null;
+        this.trOverview.error = api
+          ? '当前后端版本不支持账号总览，请更新到最新版本'
+          : '后端连接不可用，请启动应用后再试';
+        return null;
+      }
+      this.trOverview.loading = true;
+      this.trOverview.error = '';
+      try {
+        const res = await api.tr_account_overview();
+        if (res && res.ok) {
+          // 原样保存后端快照（user / wallet / usage_today / partial），展示口径交给组件
+          this.trOverview.data = res as Record<string, any>;
+          this.trOverview.error = '';
+        } else {
+          // 未登录也走这条分支：后端 msg 是中文原因，原样展示
+          this.trOverview.data = null;
+          this.trOverview.error = String((res && res.msg) || '账号信息获取失败，请稍后重试');
+        }
+        return res;
+      } catch (err) {
+        console.error('tr_account_overview 失败:', err);
+        this.trOverview.data = null;
+        this.trOverview.error = `账号信息获取失败：${String(err)}`;
+        return null;
+      } finally {
+        this.trOverview.loading = false;
+      }
+    },
+
+    // 查询基元律动登录状态：属后台静默探测（侧栏启动就会调一次），桥未就绪
+    // 时直接返回 null，不弹"连接失败"框骚扰用户。
+    async refreshTrAuth() {
+      const api = (window.pywebview && window.pywebview.api) as any;
+      if (!api || typeof api.tr_auth_status !== 'function') return null;
+      this.trAuth.loading = true;
+      try {
+        const res = await api.tr_auth_status();
+        if (res && res.ok) {
+          this.trAuth.status = res.logged_in ? 'loggedIn' : 'anonymous';
+          this.trAuth.user = res.logged_in && res.user && typeof res.user === 'object' ? res.user : null;
+          this.trAuth.configured = !!res.configured;
+        }
+        return res;
+      } catch (err) {
+        console.error('tr_auth_status 失败:', err);
+        return null;
+      } finally {
+        this.trAuth.loading = false;
+      }
+    },
+
+    // 登录结果落地：ok=true 才算登录成功；bind_ok=false 表示账号已登录但 Key
+    // 没绑上，configured 保持 false，由登录弹窗把 bind_error 原样提示出来。
+    _applyTrLoginResult(res: any) {
+      if (!res || !res.ok) return;
+      this.trAuth.status = 'loggedIn';
+      this.trAuth.user = res.user && typeof res.user === 'object' ? res.user : null;
+      this.trAuth.configured = res.bind_ok !== false;
+      // settings 是完整 get_model_settings() 快照，合并进现有模型设置状态，
+      // 登录后无需再进设置页即可直接对话
+      if (res.settings && Array.isArray(res.settings.models)) {
+        this.applyModelSettings(res.settings);
+      }
+    },
+
+    // 第二个参数是阿里云人机验证 success 回调给出的 captchaVerifyParam，必须原样透传；
+    // 人机验证不可用时省略该参数（后端签名已归一为空串，不会因此报错）
+    async trSendSms(phone: string, captchaVerifyParam?: string) {
+      const args: any[] = [phone];
+      if (captchaVerifyParam) args.push(captchaVerifyParam);
+      return this._trAuthCall('tr_auth_send_sms', '发送验证码', args);
+    },
+
+    // 第三个参数是邀请码（选填）：未填时传空串，后端会归一成 None 且不上送 inviteCode
+    async trSmsLogin(phone: string, code: string, inviteCode?: string) {
+      const res = await this._trAuthCall('tr_auth_sms_login', '登录', [phone, code, inviteCode ?? '']);
+      this._applyTrLoginResult(res);
+      return res;
+    },
+
+    async trPasswordLogin(account: string, password: string) {
+      const res = await this._trAuthCall('tr_auth_password_login', '登录', [account, password]);
+      this._applyTrLoginResult(res);
+      return res;
+    },
+
+    // 退出只清进程内账号会话，后端不动已绑定的 API Key，故这里重新探测状态
+    // 而不是凭本地猜测（configured 仍由后端权威返回）
+    async trLogout() {
+      const res = await this._trAuthCall('tr_auth_logout', '退出登录');
+      if (res && res.ok) {
+        await this.refreshTrAuth();
+        // 账号已退出：浮层里的余额/用量属于上一个账号，必须清掉并收起，
+        // 否则下次打开会先闪一帧旧数据
+        this.trOverview.data = null;
+        this.trOverview.error = '';
+        this.trAccountPanel.show = false;
+      }
+      return res;
+    },
+
+    // ── 账号中心原生弹窗（充值 / 用量明细 / 个人信息）────────────────────
+    // 三个入口共用一个居中遮罩弹窗，按 tab 渲染不同视图；数据直连官方接口，
+    // 不再走内嵌浏览器（独立 WebView2 会话无登录态，会逼用户二次登录）。
+    openTrDialog(this: any, tab: 'recharge' | 'usage' | 'profile') {
+      this.trDialog.tab = tab;
+      this.trDialog.show = true;
+      this.trDialog.loading = false;
+      this.trDialog.error = '';
+      this.trDialog.data = null;
+      this.trDialog.usagePage = 1;
+      this.trDialog.logsPage = 1;
+      this.trDialog.usageRange = '7d';
+      // 浮层若开着先收起，避免两层 UI 叠在一起
+      this.closeTrAccountPanel();
+      void this.fetchTrDialog();
+    },
+
+    closeTrDialog() {
+      this.trDialog.show = false;
+    },
+
+    // 按当前 tab 拉取对应官方接口数据；桥未就绪 / 未登录 / 接口报错都收敛成
+    // error 文本，由弹窗展示"重试"，不弹第二个窗。
+    async fetchTrDialog(this: any) {
+      const api = (window.pywebview && window.pywebview.api) as any;
+      if (!api) {
+        this.trDialog.error = '后端连接不可用，请启动应用后再试';
+        return;
+      }
+      const methodByTab: Record<string, string> = {
+        recharge: 'tr_wallet_transactions',
+        usage: 'tr_usage_detail',
+        profile: 'tr_profile',
+      };
+      const method = methodByTab[this.trDialog.tab];
+      if (typeof api[method] !== 'function') {
+        this.trDialog.error = '当前后端版本不支持该账号中心功能，请更新到最新版本';
+        return;
+      }
+      this.trDialog.loading = true;
+      this.trDialog.error = '';
+      try {
+        let res: any;
+        if (this.trDialog.tab === 'usage') {
+          res = await api[method](this.trDialog.usageRange, this.trDialog.usagePage, 20);
+        } else if (this.trDialog.tab === 'recharge') {
+          res = await api[method](this.trDialog.usagePage, 20);
+        } else {
+          res = await api[method]();
+        }
+        if (res && res.ok) {
+          this.trDialog.data = (res.data && typeof res.data === 'object') ? res.data : null;
+          this.trDialog.error = '';
+        } else {
+          this.trDialog.data = null;
+          this.trDialog.error = String((res && res.msg) || (res && res.reason) || '数据获取失败，请稍后重试');
+        }
+      } catch (err) {
+        console.error(`${method} 失败:`, err);
+        this.trDialog.data = null;
+        this.trDialog.error = `数据获取失败：${String(err)}`;
+      } finally {
+        this.trDialog.loading = false;
+      }
+    },
+
+    // 用量明细翻页：改页后重新拉用法面板（不切换 tab）
+    async trDialogChangeUsagePage(this: any, page: number) {
+      if (this.trDialog.tab !== 'usage') return;
+      this.trDialog.usagePage = Math.max(1, page);
+      await this.fetchTrDialog();
+    },
+
+    // 用量明细切换时间窗（today / 7d / 30d 等），重置到第 1 页
+    async trDialogChangeUsageRange(this: any, range: string) {
+      if (this.trDialog.tab !== 'usage') return;
+      this.trDialog.usageRange = range;
+      this.trDialog.usagePage = 1;
+      await this.fetchTrDialog();
+    },
+
+    // 调用日志翻页：usage 视图下半截的日志列表单独用 logsPage 游标，
+    // 切页后重新拉用法面板（同一接口已含 list 分页）。
+    async trDialogChangeLogsPage(this: any, page: number) {
+      if (this.trDialog.tab !== 'usage') return;
+      this.trDialog.logsPage = Math.max(1, page);
+      await this.fetchTrDialog();
+    },
+
     async searchSessionsFull(
       query: string,
       scope: 'all' | 'title' | 'content' = 'all',
@@ -2205,6 +2497,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.bridgeReady = true;
       // 星轨自动化：启动时主动拉一次任务快照（引擎启动推送可能早于页面就绪被丢弃）
       void this.refreshAutomations();
+      // 基元律动账号状态：侧栏左下角用户卡片据此显示昵称 / 手机号
+      void this.refreshTrAuth();
       this.themeLight = document.body.classList.contains('light');
       try {
         const init = await api.get_initial_state();
@@ -4216,6 +4510,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
           }
         }
         if (!res || !res.ok) {
+          // 基元律动登录会话失效：后端返回 need_login 时直接把登录窗口拉起来，
+          // 比只显示一行错误更省事——点一下就能重新登录。
+          if (res && (res as any).need_login) {
+            this.openTrLoginModal();
+            void this.refreshTrAuth();
+          }
           // #13 修复：失败分支不再无条件 _bindSessionRuntime(sessionName)。
           // await 期间用户可能已切换到其他会话，重新绑定会把 store 顶层
           // 引用切回失败会话的运行态，覆盖用户当前正在查看的会话。

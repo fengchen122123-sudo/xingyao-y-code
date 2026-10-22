@@ -431,6 +431,13 @@ function consumeBrowserNavRequest() {
   const req = store.browserNavRequest;
   if (!req || !req.url) return;
   if (unsupported.value) {
+    // path 为空 = 不是本地文件请求（如账号控制台页面）：回退系统浏览器，
+    // 否则 openFilePreview('') 只会弹一个读文件失败的错，点了等于没反应
+    if (!req.path) {
+      store.notifyChat('内嵌浏览器不可用，已改用系统浏览器打开');
+      void store.openExternalUrl(req.url);
+      return;
+    }
     store.notifyChat('内嵌浏览器不可用，已改为源码预览');
     void store.openFilePreview(req.path);
     return;

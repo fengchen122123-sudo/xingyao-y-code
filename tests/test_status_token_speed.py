@@ -46,17 +46,19 @@ def test_idle_segment_without_measurement_shows_dash():
     assert text == " -- t/s "
 
 
-@pytest.mark.parametrize(
-    ("status", "expected"),
-    [
-        ("thinking", " 思考中... "),
-        ("executing", " 正在干活... "),
-        ("waiting", " 等待授权确认... "),
-    ],
-)
-def test_running_states_keep_actionable_status_text(status, expected):
+@pytest.mark.parametrize("status", ["thinking", "executing"])
+def test_running_states_show_speed_without_status_text(status):
+    """运行中不再显示「思考中/正在干活」文字：速度滚动本身就是工作信号。"""
     text, style = main._compose_status_task_segment(status, 88.8)
-    assert text == expected
+    assert text == " 88.8 t/s "
+    assert "思考" not in text and "干活" not in text
+    assert style == "class:status.task_speed"
+
+
+def test_waiting_still_keeps_actionable_status_text():
+    """等待授权确认必须保留文字：那一步需要用户动手，不能退化成速度。"""
+    text, style = main._compose_status_task_segment("waiting", 88.8)
+    assert text == " 等待授权确认... "
     assert style == "class:status.task_active"
 
 

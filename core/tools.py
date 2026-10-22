@@ -603,6 +603,19 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
     _tool_cache.read_file_put(cache_key, final)
     if session_id:
         _tool_cache.shared_put(session_id, ("read_file", cache_key), final)
+
+    # 登记本次读取指纹，供写前新鲜度守卫校验。
+    # 只有「一个字节都没截断」（start == 0 且 end >= total）才算完整读取；
+    # 登记失败绝不影响 read_file 正常返回，因此异常全部吞掉。
+    try:
+        from core.fresh_read_guard import record_read
+        record_read(
+            session_id or "",
+            str(resolved),
+            full_read=(start == 0 and end >= total),
+        )
+    except Exception:
+        pass
     return final
 
 def write_file(file_path, content):
@@ -613,6 +626,22 @@ def write_file(file_path, content):
     导致 diff 全红、Token 浪费以及误删未改动的代码。
     """
     resolved = _resolve_workspace_path(file_path)
+
+    # 写前新鲜度守卫：覆盖已有文件前必须本会话完整读过，且内容未变
+    from core.fresh_read_guard import (
+        StaleReadError,
+        is_guard_enabled,
+        require_fresh_read,
+    )
+    try:
+        require_fresh_read(
+            _tool_cache.get_current_session() or "",
+            str(resolved),
+            tool_name="write_file",
+            skip=not is_guard_enabled(),
+        )
+    except StaleReadError as e:
+        return f"🚨 {e}"
 
     from core.turn_undo import coordinator as _tu_coordinator
     from core.turn_undo import recorder as _tu_recorder
@@ -2668,6 +2697,22 @@ def edit_file(
     # 并发防护：同一文件的 读→改→写 全过程按路径串行化（多子代理并发编辑同一
     # 文件时后写者不再静默覆盖），写前另有 mtime 乐观校验检测外部修改
     with _edit_file_lock(resolved):
+        # 写前新鲜度守卫：未完整读过或读后文件被外部改过时拒绝修改
+        from core.fresh_read_guard import (
+            StaleReadError,
+            is_guard_enabled,
+            require_fresh_read,
+        )
+        try:
+            require_fresh_read(
+                _tool_cache.get_current_session() or "",
+                str(resolved),
+                tool_name="edit_file",
+                skip=not is_guard_enabled(),
+            )
+        except StaleReadError as e:
+            return f"🚨 {e}"
+
         # 先记录 mtime 再读取：写入前若 mtime 变化即拒绝覆盖。
         # 宁可误报冲突（让调用方重读），也不放过读后写前的外部修改窗口。
         expected_mtime_ns = _stat_mtime_ns(resolved)

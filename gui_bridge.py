@@ -72,6 +72,7 @@ from core.model_manager import (
     update_provider as mm_update_provider,
 )
 from core.model_catalog import API_PROTOCOLS, get_preset_providers
+from core import tokenrhythm_auth
 from core.reasoning_capabilities import build_reasoning_snapshot
 from core.permission_broker import permission_broker
 from core.skills import (
@@ -352,8 +353,9 @@ FILE_TREE_SKIP_DIRS = {
     ".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build",
 }
 
-# 测试模型连通性的超时（秒）
-TEST_MODEL_TIMEOUT = 15
+# 测试模型连通性的超时（秒）：推理模型要先吐思考内容，首字常常 15 秒以上，
+# 15 秒会把 glm-5.1 这类模型误判成连接失败，这里放宽到 40 秒。
+TEST_MODEL_TIMEOUT = 40
 
 
 def _probe_keys_for_provider(provider: Dict[str, Any]) -> List[str]:
@@ -6740,6 +6742,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 full_text = f"{clean_text} {joined}" if clean_text else joined
             target_session = session_name or self._current_session
             clean_model_id = str(model_id or "").strip()
+            # 会话守门：基元律动登录时创建的专属 Key 与登录会话绑定，cookie 失效后
+            # 这枚 Key 不允许继续对话——在排队 / 启动回合之前就拦住，并提示重新登录。
+            # 非 tokenrhythm 厂商的模型直接跳过（不触发任何额外请求）。
+            blocked = self._tr_session_gate(clean_model_id)
+            if blocked is not None:
+                return blocked
             # 会话级权限档位：pending 草稿会话在落库前无法绑定，用户的选择随
             # 首条消息带给 worker 补绑定；未知值直接拒绝（宁可不发也不误放权）
             pending_permission_mode = ""
@@ -10288,6 +10296,395 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("add_provider 失败")
             return {"ok": False, "msg": str(e)}
 
+    # ------------------------------------------------------------------
+    # 基元律动（TokenRhythm）账号：登录 / 短信验证码 / 自动绑定 API Key
+    # 账号会话由 core.tokenrhythm_auth 保存在进程内存，桥接层不落盘；手机号、
+    # 密码、明文 Key 一律不写日志（异常只记 traceback，不带入参）。
+    # ------------------------------------------------------------------
+
+    # 会话守门命中时返回给前端的固定提示（前端据此弹「重新登录」）。
+    _TR_NEED_LOGIN_MSG = "基元律动登录已失效，请重新登录后再使用该模型"
+
+    def _tr_effective_base_url(self, model_id: str = "") -> str:
+        """本条消息真正会用的模型的 base_url；解析不出来返回空串。
+
+        优先用前端随消息带来的激活模型 id（落库后就是会话绑定模型），取不到再回退
+        会话 / 全局激活模型。只读本地配置，不联网、不发请求。
+        """
+        target = str(model_id or "").strip()
+        if target:
+            try:
+                for provider in load_config().get("providers", []) or []:
+                    if not isinstance(provider, dict):
+                        continue
+                    for model in provider.get("models") or []:
+                        if isinstance(model, dict) and str(model.get("id") or "") == target:
+                            return str(provider.get("base_url") or "")
+            except Exception:
+                logger.debug("解析激活模型厂商失败", exc_info=True)
+        try:
+            active = get_active_model(getattr(self, "_current_session", None)) or {}
+        except Exception:
+            logger.debug("解析会话生效模型失败，按非基元律动处理", exc_info=True)
+            return ""
+        return str(active.get("base_url") or "")
+
+    def _tr_session_gate(self, model_id: str = "") -> Optional[Dict[str, Any]]:
+        """基元律动会话守门：专属 Key 的登录会话失效时返回拦截结果，否则 None。
+
+        只有「本条消息用的模型来自 tokenrhythm 厂商」且「本地存在账号绑定的专属
+        Key」时才校验会话，其它模型的调用路径完全不受影响（不多发任何请求）。
+        守门自身异常一律放行并记日志：宁可漏拦一次，也不能把对话入口打挂。
+        """
+        try:
+            base_url = self._tr_effective_base_url(model_id).lower()
+            if "tokenrhythm.studio" not in base_url:
+                return None
+            if not tokenrhythm_auth.binding_active():
+                return None
+            health = tokenrhythm_auth.session_health() or {}
+            if bool(health.get("ok")):
+                return None
+            logger.warning(
+                "基元律动会话不可用，已拦截发消息：%s", str(health.get("reason") or "")
+            )
+            return {"ok": False, "msg": self._TR_NEED_LOGIN_MSG, "need_login": True}
+        except Exception:
+            logger.warning("基元律动会话守门校验失败，本次放行", exc_info=True)
+            return None
+
+    def _tr_settings_snapshot(self) -> Dict[str, Any]:
+        """模型设置快照；失败只降级为空 dict，不用它拖垮登录结果展示。"""
+        try:
+            return self.get_model_settings()
+        except Exception:
+            logger.warning("基元律动登录后读取模型设置失败", exc_info=True)
+            return {}
+
+    def _tr_has_configured_provider(self) -> bool:
+        """本地是否已有可用的基元律动 provider（base_url 命中且有 api_key）。
+
+        只读本地配置、不联网校验：状态查询要秒回，Key 真实可用性等对话链路
+        真正 401 时再暴露。
+        """
+        try:
+            config_data = load_config()
+        except Exception:
+            logger.debug("读取本地模型配置失败，视为未配置基元律动", exc_info=True)
+            return False
+        providers = config_data.get("providers", []) if isinstance(config_data, dict) else []
+        if not isinstance(providers, list):
+            return False
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            base_url = str(provider.get("base_url") or "").lower()
+            if "tokenrhythm.studio" in base_url and str(provider.get("api_key") or "").strip():
+                return True
+        return False
+
+    def tr_session_health(self, force: bool = False) -> Dict[str, Any]:
+        """透传 core 的会话健康检查：前端可在发消息前 / 定时刷新登录态提示。
+
+        force=True 时跳过 core 的 60 秒缓存强制校验（用户点「重新检查」用）。
+        """
+        try:
+            health = tokenrhythm_auth.session_health(force=bool(force)) or {}
+        except Exception as e:
+            logger.exception("tr_session_health 失败")
+            return {"ok": False, "logged_in": False, "reason": str(e), "msg": str(e)}
+        return {
+            "ok": bool(health.get("ok")),
+            "logged_in": bool(health.get("logged_in")),
+            "reason": str(health.get("reason") or ""),
+        }
+
+    def tr_auth_status(self) -> Dict[str, Any]:
+        """查询基元律动登录状态 + 本地是否已配置可用 Key。"""
+        try:
+            status = tokenrhythm_auth.account_status() or {}
+            logged_in = bool(status.get("logged_in"))
+            user = status.get("user") if logged_in else None
+            return {
+                "ok": True,
+                "logged_in": logged_in,
+                "user": user if isinstance(user, dict) else None,
+                "configured": self._tr_has_configured_provider(),
+            }
+        except Exception as e:
+            logger.exception("tr_auth_status 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def tr_account_overview(self) -> Dict[str, Any]:
+        """账号概览：一次返回余额、今日用量与个人信息。
+
+        金额（wallet.available_balance_cny / usage_today.cost_cny /
+        temporary_credits.total_cny）保持服务端返回的字符串原样，前端自行格式化，
+        避免浮点换算丢精度。核心层没登录时返回 ok=False + reason，这里统一收敛成
+        {ok: False, msg} 供前端提示。部分接口失败时透传 partial / errors
+        （对应字段已降级为 0 / "0"）。
+        """
+        try:
+            overview = tokenrhythm_auth.account_overview() or {}
+            if not overview.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": str(overview.get("reason") or "尚未登录基元律动账号"),
+                }
+            credits = overview.get("temporary_credits")
+            if not isinstance(credits, dict):
+                # 老版本 core 或字段缺失：给一份与 core 降级值一致的零值，前端不必判空
+                credits = {"total_cny": "0", "count": 0, "nearest_expires_at": "", "nearest_amount_cny": "0"}
+            result: Dict[str, Any] = {
+                "ok": True,
+                "user": overview.get("user") or {},
+                "wallet": overview.get("wallet") or {},
+                "usage_today": overview.get("usage_today") or {},
+                # 临时额度汇总（total_cny 金额字符串 / count / nearest_expires_at），原样透传
+                "temporary_credits": credits,
+            }
+            if overview.get("partial"):
+                result["partial"] = True
+                result["errors"] = dict(overview.get("errors") or {})
+            return result
+        except Exception as e:
+            logger.exception("tr_account_overview 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def tr_auth_send_sms(
+        self, phone: str, captcha_verify_param: str = ""
+    ) -> Dict[str, Any]:
+        """发送短信验证码（challengeId 由 core 层进程内保存）。
+
+        captcha_verify_param 由前端在阿里云验证码 success 回调里取得，原样透传给
+        core 层；空串归一成 None，保证未集成验证码时请求体里不出现
+        captchaVerifyParam 字段。该值是一次性校验凭据，绝不写日志。
+        """
+        try:
+            phone = str(phone or "").strip()
+            if not phone:
+                return {"ok": False, "msg": "请输入手机号"}
+            captcha = str(captcha_verify_param or "").strip()
+            result = tokenrhythm_auth.send_sms_code(phone, captcha or None) or {}
+            return {
+                "ok": True,
+                "challenge_id": str(result.get("challenge_id") or ""),
+                "interval_seconds": result.get("interval_seconds"),
+                "ttl_seconds": result.get("ttl_seconds"),
+                "masked_target": str(result.get("masked_target") or ""),
+                "msg": "验证码已发送",
+            }
+        except Exception as e:
+            logger.exception("tr_auth_send_sms 失败")
+            # 异常 message 已含面向用户的中文提示，不能吞成空串
+            return {"ok": False, "msg": str(e) or "验证码发送失败，请稍后重试"}
+
+    def _tr_finish_login(self, login_result: Dict[str, Any]) -> Dict[str, Any]:
+        """登录成功后自动绑定 Key，并同步激活模型上下文。
+
+        绑定失败不静默：账号确实已登录，仍返回 ok=True（前端不应把用户打回
+        登录页），但 bind.ok=False、bind_error 与 msg 都带明确原因，前端可
+        直接提示"登录成功但 Key 未绑定，请到模型设置手动填 Key"。
+        """
+        user = (login_result or {}).get("user") or {}
+        try:
+            bind = dict(tokenrhythm_auth.ensure_bound() or {})
+        except Exception as error:
+            logger.warning("基元律动登录后自动绑定 API Key 失败: %s", error)
+            bind = {
+                "ok": False,
+                "created": False,
+                "provider_id": "",
+                "error": str(error) or "自动绑定 API Key 失败",
+            }
+        else:
+            bind["ok"] = True
+
+        models: Dict[str, Any] = {"ok": False, "error": "未绑定 API Key，跳过模型同步"}
+        if bind.get("ok"):
+            # Key 可能刚写入配置：同步 app_context，避免本进程继续用旧 Key；
+            # 绑定失败时配置没有变化（无新 Key），不必重复同步。
+            try:
+                sync = getattr(self, "_sync_active_model_context", None)
+                if callable(sync):
+                    sync()
+            except Exception:
+                logger.warning("基元律动登录后同步激活模型上下文失败", exc_info=True)
+            try:
+                synced = dict(
+                    tokenrhythm_auth.sync_models(bind.get("provider_id") or None) or {}
+                )
+                synced["ok"] = True
+                models = synced
+            except Exception as error:
+                logger.warning("基元律动登录后同步模型失败: %s", error)
+                models = {"ok": False, "error": str(error) or "模型同步失败"}
+            bind_error = ""
+            base_msg = (
+                "登录成功，已自动配置基元律动 API Key"
+                if bind.get("created")
+                else "登录成功，本地已有可用 API Key"
+            )
+            if models.get("ok"):
+                msg = f"{base_msg}（同步 {int(models.get('added') or 0)} 个模型）"
+            else:
+                msg = f"{base_msg}（模型同步失败：{models.get('error') or '未知原因'}）"
+        else:
+            bind_error = str(bind.get("error") or "自动绑定 API Key 失败")
+            msg = f"登录成功，但自动绑定 API Key 失败：{bind_error}"
+
+        return {
+            "ok": True,
+            "user": user if isinstance(user, dict) else {},
+            "bind": bind,
+            "bind_ok": bool(bind.get("ok")),
+            "bind_error": bind_error,
+            "models": models,
+            "settings": self._tr_settings_snapshot(),
+            "msg": msg,
+        }
+
+    def tr_auth_sync_models(self) -> Dict[str, Any]:
+        """把基元律动官方模型全量同步到本地厂商配置（幂等，已存在的跳过）。"""
+        try:
+            result = dict(tokenrhythm_auth.sync_models() or {})
+            result.setdefault("ok", True)
+            try:
+                sync = getattr(self, "_sync_active_model_context", None)
+                if callable(sync):
+                    sync()
+            except Exception:
+                logger.warning("同步模型后刷新激活模型上下文失败", exc_info=True)
+            result["settings"] = self._tr_settings_snapshot()
+            return result
+        except Exception as e:
+            logger.exception("tr_auth_sync_models 失败")
+            return {"ok": False, "msg": str(e) or "同步模型失败，请稍后重试"}
+
+    def tr_auth_sms_login(
+        self, phone: str, code: str, invite_code: str = ""
+    ) -> Dict[str, Any]:
+        """短信验证码登录 / 注册，成功后自动绑定 Key。
+
+        invite_code 为可选邀请码：空白一律归一成 None 再交给 core，避免把空串
+        当作"提供了但无效"上送服务端。该值属于邀请关系凭据，不写日志。
+        """
+        try:
+            phone = str(phone or "").strip()
+            code = str(code or "").strip()
+            invite = str(invite_code or "").strip()
+            if not phone:
+                return {"ok": False, "msg": "请输入手机号"}
+            if not code:
+                return {"ok": False, "msg": "请输入验证码"}
+            login_result = tokenrhythm_auth.sms_login(phone, code, invite or None)
+            return self._tr_finish_login(login_result)
+        except Exception as e:
+            logger.exception("tr_auth_sms_login 失败")
+            return {"ok": False, "msg": str(e) or "登录失败，请稍后重试"}
+
+    def tr_auth_password_login(self, account: str, password: str) -> Dict[str, Any]:
+        """账号密码登录，成功后自动绑定 Key。"""
+        try:
+            account = str(account or "").strip()
+            password = "" if password is None else str(password)
+            if not account:
+                return {"ok": False, "msg": "请输入手机号或邮箱"}
+            if not password:
+                return {"ok": False, "msg": "请输入密码"}
+            login_result = tokenrhythm_auth.password_login(account, password)
+            return self._tr_finish_login(login_result)
+        except Exception as e:
+            logger.exception("tr_auth_password_login 失败")
+            return {"ok": False, "msg": str(e) or "登录失败，请稍后重试"}
+
+    def tr_auth_logout(self) -> Dict[str, Any]:
+        """退出基元律动账号：会先删掉登录时创建的专属 API Key，再清会话。
+
+        返回里带 key_deleted / had_key，前端据此决定提示「Key 已删除」还是
+        「删除失败，请去控制台手动清理」。
+        """
+        try:
+            result = dict(tokenrhythm_auth.logout() or {})
+            deleted = bool(result.get("key_deleted"))
+            providers_removed = int(result.get("providers_removed") or 0)
+            if result.get("had_key") and not deleted:
+                msg = "已退出基元律动账号，但专属 API Key 删除失败，请到基元律动控制台手动删除"
+            elif deleted and providers_removed:
+                msg = "已退出基元律动账号，专属 API Key 与模型配置已移除"
+            elif deleted:
+                msg = "已退出基元律动账号，该账号的专属 API Key 已删除"
+            elif providers_removed:
+                msg = "已退出基元律动账号，模型配置已移除"
+            else:
+                msg = "已退出基元律动账号"
+            return {
+                "ok": True,
+                "msg": msg,
+                "key_deleted": deleted,
+                "had_key": bool(result.get("had_key")),
+                "providers_removed": providers_removed,
+            }
+        except Exception as e:
+            logger.exception("tr_auth_logout 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 账号中心只读查询：充值（钱包流水）/ 用量明细 / 个人信息 / 调用日志
+    # 直接用已登录会话直连官方后台，前端原生弹窗展示，免去内嵌浏览器二次登录。
+    # ------------------------------------------------------------------
+    def tr_profile(self) -> Dict[str, Any]:
+        """个人信息：前端「个人信息」弹窗拉取。"""
+        try:
+            return dict(tokenrhythm_auth.user_profile() or {"ok": False, "msg": "未登录"})
+        except Exception as e:
+            logger.exception("tr_profile 失败")
+            return {"ok": False, "msg": str(e) or "获取个人信息失败"}
+
+    def tr_usage_detail(
+        self, range: str = "7d", page: int = 1, page_size: int = 20
+    ) -> Dict[str, Any]:
+        """用量明细：前端「用量」弹窗拉取（默认近 7 天）。"""
+        try:
+            result = dict(
+                tokenrhythm_auth.usage_detail(
+                    str(range or "7d"), int(page or 1), int(page_size or 20)
+                )
+                or {"ok": False, "msg": "未登录"}
+            )
+            return result
+        except Exception as e:
+            logger.exception("tr_usage_detail 失败")
+            return {"ok": False, "msg": str(e) or "获取用量明细失败"}
+
+    def tr_wallet_transactions(
+        self, page: int = 1, page_size: int = 20
+    ) -> Dict[str, Any]:
+        """钱包流水：前端「充值 / 余额明细」弹窗拉取（充值、扣费、退款等）。"""
+        try:
+            return dict(
+                tokenrhythm_auth.wallet_transactions(int(page or 1), int(page_size or 20))
+                or {"ok": False, "msg": "未登录"}
+            )
+        except Exception as e:
+            logger.exception("tr_wallet_transactions 失败")
+            return {"ok": False, "msg": str(e) or "获取钱包流水失败"}
+
+    def tr_call_logs(
+        self, page: int = 1, page_size: int = 20, status: str = ""
+    ) -> Dict[str, Any]:
+        """调用日志：前端「用量」弹窗的「调用记录」分页拉取。"""
+        try:
+            return dict(
+                tokenrhythm_auth.call_logs(
+                    int(page or 1), int(page_size or 20), str(status or "")
+                )
+                or {"ok": False, "msg": "未登录"}
+            )
+        except Exception as e:
+            logger.exception("tr_call_logs 失败")
+            return {"ok": False, "msg": str(e) or "获取调用日志失败"}
+
     def _resolve_provider_id(self, provider_ref: str) -> Optional[str]:
         """provider_ref 既可能是真实 id，也可能是前端回传的供应商名称。"""
         ref = str(provider_ref or "").strip()
@@ -10656,7 +11053,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 thread.start()
                 thread.join(timeout=remaining)
                 if thread.is_alive():
-                    last_msg = f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"
+                    last_msg = (
+                        f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"
+                        "，推理模型首次响应可能较慢，可稍后重试"
+                    )
                     continue
                 if outcome.get("ok"):
                     return {"ok": True, "msg": str(outcome.get("msg") or "连接成功")}

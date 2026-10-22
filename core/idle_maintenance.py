@@ -24,6 +24,9 @@ _LOGGER = logging.getLogger(__name__)
 # 孤儿 Blob 回收最短间隔（秒）：需全库扫媒体清单，闲时维护节流为每小时至多一次
 BLOB_GC_MIN_INTERVAL_SECONDS = 3600
 
+# 工具结果归档治理最短间隔（秒）：统计归档总体积要扫全表，同样每小时至多一次
+ARCHIVE_SWEEP_MIN_INTERVAL_SECONDS = 3600
+
 
 def get_idle_maintenance_seconds():
     """闲时维护触发延时（秒，0 关闭）；读 config 失败回落默认值。"""
@@ -53,6 +56,7 @@ class IdleMaintenanceService:
         self._thread = None
         self._shutdown = False
         self._last_blob_gc_at = None  # 上次孤儿 Blob 回收时间（monotonic，节流用）
+        self._last_archive_sweep_at = None  # 上次工具结果归档治理时间（monotonic，节流用）
 
     # ── 入口层接线 API ────────────────────────────────────────────────────
 
@@ -192,6 +196,25 @@ class IdleMaintenanceService:
                 prune_orphan_blobs(manager.iter_referenced_media_digests())
         except Exception:
             _LOGGER.debug("会话 %s 闲时媒体仓库治理失败", session, exc_info=True)
+
+        # 工具结果归档治理（免费本地维护）：先删超期归档，再按 accessed_at 有效
+        # 淘汰到预算内（刚被 tool_result_read 取回过的记录受保护）。统计归档总体
+        # 积要扫全表，与 Blob 回收同口径按小时节流。
+        try:
+            now = time.monotonic()
+            if (
+                self._last_archive_sweep_at is None
+                or now - self._last_archive_sweep_at >= ARCHIVE_SWEEP_MIN_INTERVAL_SECONDS
+            ):
+                self._last_archive_sweep_at = now
+                stats = manager.sweep_tool_result_archive()
+                if stats.get("expired") or stats.get("evicted"):
+                    _LOGGER.debug(
+                        "会话 %s 归档治理：过期 %s 条，淘汰 %s 条",
+                        session, stats["expired"], stats["evicted"],
+                    )
+        except Exception:
+            _LOGGER.debug("会话 %s 归档治理失败", session, exc_info=True)
 
         if cancel_event.is_set():
             return
