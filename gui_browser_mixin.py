@@ -13,6 +13,7 @@ import logging
 import sys
 import threading
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,34 @@ class BrowserBridgeMixin:
             return None, {"ok": False, "error": "unsupported_platform"}
         return ctrl, None
 
+    @staticmethod
+    def _is_tokenrhythm_url(url: str) -> bool:
+        """判断是否为基元律动官方站点（含子域）。"""
+        try:
+            host = urlparse(url or "").hostname or ""
+        except Exception:
+            return False
+        host = host.lower()
+        return host == "tokenrhythm.studio" or host.endswith(".tokenrhythm.studio")
+
+    def _inject_tokenrhythm_session(self, ctrl, url: str) -> None:
+        """打开官方控制台前，把已登录会话 cookie 灌进内嵌 WebView2 免二次登录。
+
+        失败绝不影响导航：这里只记 debug 日志，不抛异常、不改返回值。
+        安全：绝不打印 cookie 的 name/value。
+        """
+        if ctrl is None or not self._is_tokenrhythm_url(url):
+            return
+        try:
+            from core import tokenrhythm_auth
+
+            cookies = tokenrhythm_auth.export_session_cookies()
+            if cookies:
+                ctrl.set_session_cookies(cookies, domain="tokenrhythm.studio")
+        except Exception:
+            # 免登录是增强项：任何失败都只记 debug，不干扰导航本身。
+            logger.debug("注入基元律动会话 cookie 失败", exc_info=True)
+
     # ---------------------------------------------------------------- 桥方法
 
     def browser_pane_open(self, rect: Dict[str, Any], url: str = "", zoom: float = 1.0) -> Dict[str, Any]:
@@ -153,6 +182,7 @@ class BrowserBridgeMixin:
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
+            self._inject_tokenrhythm_session(ctrl, url)
             return ctrl.open(rect, url, zoom)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -178,6 +208,7 @@ class BrowserBridgeMixin:
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
+            self._inject_tokenrhythm_session(ctrl, url)
             return ctrl.navigate(url)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}

@@ -10657,13 +10657,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("tr_usage_detail 失败")
             return {"ok": False, "msg": str(e) or "获取用量明细失败"}
 
-    def tr_wallet_transactions(
-        self, page: int = 1, page_size: int = 20
-    ) -> Dict[str, Any]:
-        """钱包流水：前端「充值 / 余额明细」弹窗拉取（充值、扣费、退款等）。"""
+    def tr_wallet_transactions(self) -> Dict[str, Any]:
+        """钱包流水：前端「充值 / 余额明细」弹窗拉取（充值、扣费、退款等）。
+
+        官方该接口是严格 schema 的无参 GET，任何分页参数都会 400，
+        因此桥层不透传分页（前端也不分页，一次拿服务端默认条数）。
+        """
         try:
             return dict(
-                tokenrhythm_auth.wallet_transactions(int(page or 1), int(page_size or 20))
+                tokenrhythm_auth.wallet_transactions()
                 or {"ok": False, "msg": "未登录"}
             )
         except Exception as e:

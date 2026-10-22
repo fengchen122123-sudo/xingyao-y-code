@@ -322,6 +322,12 @@ class EmbeddedBrowserController:
         # _on_init_completed 补导航。没有它，「打开面板后首次导航」会因
         # open→navigate 背靠背派发撞上初始化竞态而被静默丢弃（评审 B1）。
         self._pending_url = ""
+        # 会话 cookie 注入：内嵌 WebView2 控件没有主 webview 的登录态，Python 侧
+        # 会话 cookie 必须经 CoreWebView2.CookieManager 写进去。控件内核是异步
+        # 初始化的（EnsureCoreWebView2Async），所以这里只做记录，实际写入在
+        # 内核就绪与每次导航前重放（页面把 cookie 清掉也能补回来）。
+        self._session_cookies: list[dict] = []
+        self._session_cookie_domain = ""
 
     # ------------------------------------------------------------------ 内部
 
@@ -455,6 +461,8 @@ class EmbeddedBrowserController:
             with self._lock:
                 pending = self._pending_url
                 self._pending_url = ""
+            # 会话 cookie 重放：必须早于补导航，否则首个页面仍按未登录渲染。
+            self._flush_session_cookies()
             if pending:
                 try:
                     self._url = pending
@@ -683,6 +691,77 @@ class EmbeddedBrowserController:
         except Exception:
             logger.debug("设置 WebView2 ZoomFactor 失败", exc_info=True)
 
+    # ------------------------------------------------------ 会话 cookie 注入
+
+    def set_session_cookies(
+        self, cookies: list[dict], domain: str = "tokenrhythm.studio"
+    ) -> None:
+        """记住要注入的 cookie 并立即尝试写入；内核未就绪时等 _on_init_completed 重放。"""
+        try:
+            items: list[dict] = []
+            for raw in cookies or []:
+                if not isinstance(raw, dict):
+                    continue
+                name = raw.get("name")
+                value = raw.get("value")
+                if not name or not value:
+                    continue  # 缺 name/value 的项无法构成合法 cookie，直接丢弃
+                items.append(
+                    {
+                        "name": str(name),
+                        "value": str(value),
+                        "domain": str(raw.get("domain") or domain or ""),
+                        "path": str(raw.get("path") or "/"),
+                        "http_only": bool(raw.get("http_only")),
+                        "secure": bool(raw.get("secure")),
+                    }
+                )
+            self._session_cookies = items
+            self._session_cookie_domain = str(domain or "")
+        except Exception:
+            logger.debug("记录会话 cookie 失败", exc_info=True)
+            return
+        self._flush_session_cookies()
+
+    def _flush_session_cookies(self) -> None:
+        """把已记录的会话 cookie 写入内核（内核未就绪则等初始化完成回放）。
+
+        不设置 Expires：按会话级处理，每次导航前重放即可覆盖页面清 cookie 的情况。
+        """
+        try:
+            webview = self._webview
+            if webview is None or not self._ready:
+                return
+            form = self._form
+            if form is None:
+                return
+            cookies = list(self._session_cookies)
+            if not cookies:
+                return
+
+            def _write():
+                try:
+                    core = self._webview.CoreWebView2
+                    if core is None:
+                        return
+                    manager = core.CookieManager
+                    for item in cookies:
+                        cookie = manager.CreateCookie(
+                            item["name"], item["value"], item["domain"], item["path"]
+                        )
+                        cookie.IsHttpOnly = bool(item.get("http_only"))
+                        cookie.IsSecure = bool(item.get("secure"))
+                        manager.AddOrUpdateCookie(cookie)
+                except Exception:
+                    # 日志级别压到 debug 且只给摘要：cookie 的 value 是登录凭据，
+                    # 任何形态（含异常消息）都不得写进日志。
+                    logger.debug("写入会话 cookie 失败", exc_info=True)
+
+            if not self._invoke(form, _write):
+                logger.debug("写入会话 cookie 失败：GUI 线程不可用")
+        except Exception:
+            logger.debug("重放会话 cookie 失败", exc_info=True)
+
     def navigate(self, url: str) -> Dict[str, Any]:
         target = normalize_url(url)
         if not target:
@@ -701,6 +780,8 @@ class EmbeddedBrowserController:
             if not became_ready:
                 self._url = target
                 return {"ok": True, "state": self._snapshot()}
+        # 每次导航前重放：页面可能已把 cookie 清掉，重放保证登录态始终在。
+        self._flush_session_cookies()
         return self._navigate_now(target)
 
     def _navigate_now(self, target: str) -> Dict[str, Any]:

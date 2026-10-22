@@ -1464,6 +1464,41 @@ def _requests_safe(http):
 
 
 # ---------------------------------------------------------------------------
+# 钱包流水：/api/wallet/transactions（严格 schema，必须无参 GET）
+# ---------------------------------------------------------------------------
+
+_WALLET_TXN_URL = "https://tokenrhythm.studio/api/wallet/transactions"
+
+
+def test_wallet_transactions_request_has_no_query(http):
+    """回归：钱包流水必须发无参 GET，URL 不能带任何 query。
+
+    官方对该接口走严格 schema，多传 page/pageSize/range/limit 任一都会 400
+    「请求包含未知字段（错误码：BAD_REQUEST）」，充值弹窗曾因此整块拉不到数据。
+    这里断言实际请求 URL 与无参地址严格相等（并显式排除 "?" / pageSize），
+    防止后续有人「顺手」给这个接口补分页。
+    """
+    _login(http)
+    data = {
+        "items": [
+            {"id": "t1", "type": "recharge", "amountCny": "1.00000000"},
+        ],
+        "total": 1,
+    }
+    http.queue(_FakeResponse(200, _ok(data)))
+
+    result = auth.wallet_transactions()
+
+    calls = _requests(http)
+    assert len(calls) == 1, "钱包流水只应发一次请求"
+    assert calls[0]["method"].upper() == "GET"
+    url = calls[0]["url"]
+    assert url == _WALLET_TXN_URL, "钱包流水接口不能带任何查询参数"
+    assert "?" not in url and "pageSize" not in url
+    assert result == {"ok": True, "data": data}, "data 必须原样透传"
+
+
+# ---------------------------------------------------------------------------
 # 临时额度：/api/wallet/expiring-credits
 # ---------------------------------------------------------------------------
 
@@ -2027,6 +2062,57 @@ def test_session_health_cache_invalidated_by_login(http, session_store):
     assert result["ok"] is True
     # 登录 2 次请求 + 登录后的 1 次健康检查：说明缓存确实被作废了
     assert len(_requests(http)) == 3
+
+
+# ---------------------------------------------------------------------------
+# 会话 cookie 导出：给内嵌 WebView2 复用免登录
+# ---------------------------------------------------------------------------
+
+
+def test_export_session_cookies_returns_tokenrhythm_cookies(http):
+    """只导出 tokenrhythm.studio 域的 cookie，字段齐全且 value 原样。"""
+    client = auth._get_client()
+    client.cookies.set("tr_session", "abc123", domain="tokenrhythm.studio", path="/")
+    client.cookies.set("tr_csrf", "def456", domain=".tokenrhythm.studio", path="/")
+    client.cookies.set("other", "zzz", domain="example.com", path="/")
+    try:
+        cookies = auth.export_session_cookies()
+    finally:
+        client.cookies.clear()
+
+    by_name = {item["name"]: item for item in cookies}
+    assert set(by_name) == {"tr_session", "tr_csrf"}, "example.com 的 cookie 不能导出"
+    # 导出纯本地读 jar，不该发任何网络请求
+    assert _requests(http) == []
+
+    for name, value in (("tr_session", "abc123"), ("tr_csrf", "def456")):
+        item = by_name[name]
+        assert set(item) == {
+            "name",
+            "value",
+            "domain",
+            "path",
+            "secure",
+            "http_only",
+            "expires",
+        }
+        assert item["value"] == value, "value 必须原样导出"
+        assert item["domain"] in {"tokenrhythm.studio", ".tokenrhythm.studio"}
+        assert item["path"] == "/"
+        assert item["secure"] is False
+        assert isinstance(item["http_only"], bool)
+        # 会话级 cookie 没有过期时间，统一用 0 表示
+        assert item["expires"] == 0
+
+
+def test_export_session_cookies_empty_when_logged_out(http):
+    """未登录（jar 为空）：返回空列表且不抛异常。"""
+    client = auth._get_client()
+    client.cookies.clear()
+    try:
+        assert auth.export_session_cookies() == []
+    finally:
+        client.cookies.clear()
 
 
 def test_binding_active_requires_key_and_provider(http):

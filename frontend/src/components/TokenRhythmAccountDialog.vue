@@ -1,6 +1,6 @@
 <template>
   <!-- 账号中心原生弹窗：居中遮罩，直连官方接口拿真实数据，免去二次登录。
-       三个入口（充值 / 用量明细 / 个人信息）共用这一个弹窗，按 store.trDialog.tab
+       用量明细 / 个人信息两个入口共用这一个弹窗，按 store.trDialog.tab
        切视图。Teleport 到 body，独立于侧栏浮层，点击遮罩或关闭按钮关闭。 -->
   <Teleport to="body">
     <div
@@ -19,13 +19,6 @@
         <!-- 标题栏：标签切换 + 关闭 -->
         <header class="trd-head">
           <nav class="trd-tabs">
-            <button
-              type="button"
-              class="trd-tab"
-              :class="{ active: store.trDialog.tab === 'recharge' }"
-              data-test="trd-tab-recharge"
-              @click="store.openTrDialog('recharge')"
-            >充值</button>
             <button
               type="button"
               class="trd-tab"
@@ -56,37 +49,6 @@
           <p class="trd-error" data-test="trd-error">{{ store.trDialog.error }}</p>
           <button type="button" class="trd-retry" data-test="trd-retry" @click="store.fetchTrDialog()">重试</button>
         </div>
-
-        <!-- 充值视图：钱包流水（充值 / 扣费 / 退款），分页 -->
-        <section v-else-if="store.trDialog.tab === 'recharge'" class="trd-body" data-test="trd-recharge">
-          <p v-if="!transactions.length" class="trd-empty" data-test="trd-empty">暂无流水记录</p>
-          <ul v-else class="trd-txn">
-            <li v-for="(t, i) in transactions" :key="t.transactionId || i" class="trd-txn-item" data-test="trd-txn-item">
-              <span class="trd-txn-desc">{{ t.description || t.type || '—' }}</span>
-              <span class="trd-txn-amount" :class="amountClass(t)" data-test="trd-txn-amount">
-                {{ directionSign(t) }}{{ money(t.amountCny) }}
-              </span>
-              <span class="trd-txn-time">{{ fmtTime(t.occurredAt) }}</span>
-            </li>
-          </ul>
-          <footer v-if="transactions.length" class="trd-pager">
-            <button
-              type="button"
-              class="trd-pg-btn"
-              data-test="trd-prev"
-              :disabled="store.trDialog.usagePage <= 1"
-              @click="store.trDialogChangeUsagePage(store.trDialog.usagePage - 1)"
-            >上一页</button>
-            <span class="trd-pg-info" data-test="trd-page-info">第 {{ store.trDialog.usagePage }} 页</span>
-            <button
-              type="button"
-              class="trd-pg-btn"
-              data-test="trd-next"
-              :disabled="!hasMoreTxn"
-              @click="store.trDialogChangeUsagePage(store.trDialog.usagePage + 1)"
-            >下一页</button>
-          </footer>
-        </section>
 
         <!-- 用量明细视图：时间窗切换 + summary 指标 + 调用日志分页 -->
         <section v-else-if="store.trDialog.tab === 'usage'" class="trd-body" data-test="trd-usage">
@@ -181,10 +143,24 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onBeforeUnmount, onMounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
+
+// Esc 关闭：遮罩是普通 div（没有原生 <dialog> 的取消行为），这里自己挂键盘监听。
+// 必须用同一个具名函数注册/移除，否则监听会泄漏到组件卸载之后。
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && store.trDialog.show) store.closeTrDialog();
+}
+
+onMounted(() => {
+  document.addEventListener('keydown', onKeydown);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('keydown', onKeydown);
+});
 
 const PLACEHOLDER = '—';
 
@@ -199,14 +175,6 @@ const data = computed<Record<string, any>>(() => {
   const d = store.trDialog.data;
   return d && typeof d === 'object' ? d : {};
 });
-
-// ── 充值：钱包流水 ────────────────────────────────────────────────
-const transactions = computed<Record<string, any>[]>(() => {
-  const items = data.value.items;
-  return Array.isArray(items) ? (items as Record<string, any>[]) : [];
-});
-const txnTotal = computed(() => Number(data.value.total) || transactions.value.length);
-const hasMoreTxn = computed(() => transactions.value.length >= 20 || txnTotal.value > store.trDialog.usagePage * 20);
 
 // ── 用量明细：summary + 调用日志 ───────────────────────────────────
 const summary = computed<Record<string, any> | null>(() => {
@@ -273,20 +241,6 @@ function fmtTime(iso: unknown): string {
   if (Number.isNaN(date.getTime())) return raw;
   const p = (n: number) => String(n).padStart(2, '0');
   return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`;
-}
-
-function directionSign(t: Record<string, any>): string {
-  const dir = String(t.direction || '').toUpperCase();
-  if (dir === 'CREDIT') return '+';
-  if (dir === 'DEBIT') return '-';
-  return '';
-}
-
-function amountClass(t: Record<string, any>): string {
-  const dir = String(t.direction || '').toUpperCase();
-  if (dir === 'CREDIT') return 'credit';
-  if (dir === 'DEBIT') return 'debit';
-  return '';
 }
 
 function statusText(log: Record<string, any>): string {
@@ -421,35 +375,6 @@ function statusLabel(status: unknown): string {
   color: #8a8a8a;
   text-align: center;
   font-size: 12.5px;
-}
-/* 充值流水 */
-.trd-txn { list-style: none; margin: 0; padding: 0; }
-.trd-txn-item {
-  display: grid;
-  grid-template-columns: 1fr auto auto;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 4px;
-  border-bottom: 1px solid #f3f3f3;
-}
-.trd-txn-desc {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: #222;
-}
-.trd-txn-amount {
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.trd-txn-amount.credit { color: #1a7f37; }
-.trd-txn-amount.debit { color: #c02626; }
-.trd-txn-time {
-  color: #a8a8a8;
-  font-size: 11.5px;
-  white-space: nowrap;
 }
 /* 用量：时间窗切换 */
 .trd-ranges {

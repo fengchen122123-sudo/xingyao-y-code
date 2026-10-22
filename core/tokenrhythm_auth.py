@@ -629,6 +629,64 @@ def account_status() -> dict:
     return {"logged_in": True, "user": user}
 
 
+def export_session_cookies() -> list[dict[str, Any]]:
+    """导出当前登录会话的 cookie，供内嵌浏览器（WebView2）复用免登录。
+
+    只导出 tokenrhythm.studio 域名下的 cookie；未登录或无 cookie 时返回 []。
+    返回值每项形如：
+        {"name": str, "value": str, "domain": str, "path": str,
+         "secure": bool, "http_only": bool, "expires": int}   # expires 为 0 表示会话级
+    安全约束：本函数以及调用链绝不把 value 写日志/异常消息。
+    """
+    try:
+        # _get_client() 首次调用会尝试从本地恢复持久化 cookie，所以重启后也能导出。
+        client = _get_client()
+        jar = getattr(getattr(client, "cookies", None), "jar", None) or ()
+        exported: list[dict[str, Any]] = []
+        for cookie in jar:
+            try:
+                name = str(getattr(cookie, "name", "") or "")
+                value = str(getattr(cookie, "value", "") or "")
+                if not name or not value:
+                    continue
+                # 保留原始 domain（含 .tokenrhythm.studio 前导点），只按归一后的 host 判定归属
+                domain = str(getattr(cookie, "domain", "") or "").strip()
+                host = domain.lower().lstrip(".")
+                if host != "tokenrhythm.studio" and not host.endswith(
+                    ".tokenrhythm.studio"
+                ):
+                    continue
+                if cookie.is_expired():
+                    continue
+                try:
+                    expires = int(cookie.expires or 0)
+                except (TypeError, ValueError):
+                    expires = 0
+                checker = getattr(cookie, "has_nonstandard_attr", None)
+                try:
+                    http_only = bool(checker("HttpOnly")) if callable(checker) else False
+                except Exception:  # noqa: BLE001 - 拿不到就当非 HttpOnly
+                    http_only = False
+                exported.append(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": str(getattr(cookie, "path", "") or "/"),
+                        "secure": bool(getattr(cookie, "secure", False)),
+                        "http_only": http_only,
+                        "expires": expires,
+                    }
+                )
+            except Exception:  # noqa: BLE001 - 单枚 cookie 异常不影响其余导出
+                continue
+        return exported
+    except Exception as error:  # noqa: BLE001 - 内嵌浏览器不能因导 cookie 崩溃
+        # 只记异常类型：cookie 的 value 绝不进日志
+        logger.warning("基元律动会话 cookie 导出失败（%s）", type(error).__name__)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # 会话守门：cookie 失效 → 绑定在会话上的专属 Key 不可用
 # ---------------------------------------------------------------------------
@@ -1185,19 +1243,19 @@ def usage_detail(
     return {"ok": True, "data": data if isinstance(data, dict) else {}}
 
 
-def wallet_transactions(page: int = 1, page_size: int = 20) -> dict:
-    """钱包流水明细：GET /api/wallet/transactions（严格 schema，不能多带参数）。
+def wallet_transactions() -> dict:
+    """钱包流水明细：无参 GET /api/wallet/transactions（官方严格 schema）。
 
-    官方对该接口走严格 schema，多传 ``range/page/pageSize/limit`` 任一都会 400
-    「请求包含未知字段」，因此仅用后端分页参数（与官方前端 /account/wallet/
-    transactions 的分页一致），不带任何它不认的查询字段。
-    返回 data 原样（items / total / page / pageSize 等），前端容错渲染。
+    官方对该接口走严格 schema，任何查询参数（``range/page/pageSize/limit`` 等）
+    都会直接 400「请求包含未知字段（错误码：BAD_REQUEST）」，因此这里必须发
+    纯无参 GET，不拼接任何 query。
+    一次返回服务端默认条数（前端不分页、不做二次拉取），data 原样透传
+    （items / total 等字段随服务端），由前端容错渲染。
     """
     if _require_logged_in_client() is None:
         return {"ok": False, "reason": "未登录"}
     try:
-        params = f"page={int(page)}&pageSize={int(page_size)}"
-        data = _payload_data(_request("GET", f"{_WALLET_TXN_PATH}?{params}"))
+        data = _payload_data(_request("GET", _WALLET_TXN_PATH))
     except TokenRhythmAuthError as error:
         return {"ok": False, "msg": str(error)}
     return {"ok": True, "data": data if isinstance(data, dict) else {}}
@@ -2035,6 +2093,7 @@ __all__ = [
     "send_sms_code",
     "sms_login",
     "account_status",
+    "export_session_cookies",
     "session_health",
     "binding_active",
     "account_overview",
