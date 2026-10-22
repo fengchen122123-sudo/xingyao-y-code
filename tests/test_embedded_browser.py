@@ -665,6 +665,28 @@ def test_set_session_cookies_writes_every_valid_cookie():
     assert (second.IsHttpOnly, second.IsSecure) == (True, True)
 
 
+def test_tr_csrf_cookie_is_visible_to_page_js():
+    """tr_csrf 必须对页面 JS 可见。
+
+    官方前端的请求包装从 document.cookie 读 tr_csrf 并回填 X-CSRF-Token；
+    若按 httpOnly 注入，所有非 GET 请求都会被服务端判 CSRF_INVALID，
+    充值页的「查看报价」就是这样失败的。会话凭据 tr_session 仍保持 httpOnly。
+    """
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies(
+        [
+            {"name": "tr_session", "value": "s", "http_only": True},
+            {"name": "tr_csrf", "value": "c", "http_only": True},
+        ]
+    )
+
+    session, csrf = core.CookieManager.created
+    assert session.IsHttpOnly is True
+    assert csrf.IsHttpOnly is False
+
+
 def test_set_session_cookies_tolerates_bad_items():
     ctrl, _core = _fake_ready_controller()
     ctrl._ready = True
