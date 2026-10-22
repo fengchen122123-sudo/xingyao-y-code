@@ -749,7 +749,12 @@ class EmbeddedBrowserController:
                         cookie = manager.CreateCookie(
                             item["name"], item["value"], item["domain"], item["path"]
                         )
-                        cookie.IsHttpOnly = bool(item.get("http_only"))
+                        # tr_csrf 必须对页面 JS 可见：官方前端的请求包装会从
+                        # document.cookie 读它并回填 X-CSRF-Token。若按 httpOnly
+                        # 注入，所有非 GET 请求会被服务端判 CSRF_INVALID，充值页
+                        # 的「查看报价」就是这样失败的。它只是 CSRF token 而非会话
+                        # 凭据，放开可见性正是官方浏览器端的设计。
+                        cookie.IsHttpOnly = bool(item.get("http_only")) and item.get("name") != "tr_csrf"
                         cookie.IsSecure = bool(item.get("secure"))
                         manager.AddOrUpdateCookie(cookie)
                 except Exception:
