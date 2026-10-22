@@ -925,12 +925,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
       error: '',
     },
 
-    // 账号中心原生弹窗（充值 / 用量明细 / 个人信息）：居中遮罩，直连官方接口
+    // 账号中心原生弹窗（用量明细 / 个人信息）：居中遮罩，直连官方接口
     // 拿真实数据展示，免去内嵌浏览器二次登录。tab 决定当前渲染哪一块，
-    // 三个按钮共用这一个弹窗实例，关闭后状态清空。
+    // 两个按钮共用这一个弹窗实例，关闭后状态清空。
     trDialog: {
       show: false,
-      tab: 'recharge' as 'recharge' | 'usage' | 'profile',
+      tab: 'usage' as 'usage' | 'profile',
       loading: false,
       error: '',
       data: null as Record<string, any> | null,
@@ -2361,10 +2361,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return res;
     },
 
-    // ── 账号中心原生弹窗（充值 / 用量明细 / 个人信息）────────────────────
-    // 三个入口共用一个居中遮罩弹窗，按 tab 渲染不同视图；数据直连官方接口，
+    // ── 账号中心原生弹窗（用量明细 / 个人信息）────────────────────
+    // 两个入口共用一个居中遮罩弹窗，按 tab 渲染不同视图；数据直连官方接口，
     // 不再走内嵌浏览器（独立 WebView2 会话无登录态，会逼用户二次登录）。
-    openTrDialog(this: any, tab: 'recharge' | 'usage' | 'profile') {
+    openTrDialog(this: any, tab: 'usage' | 'profile') {
       this.trDialog.tab = tab;
       this.trDialog.show = true;
       this.trDialog.loading = false;
@@ -2391,7 +2391,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
         return;
       }
       const methodByTab: Record<string, string> = {
-        recharge: 'tr_wallet_transactions',
         usage: 'tr_usage_detail',
         profile: 'tr_profile',
       };
@@ -2406,8 +2405,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
         let res: any;
         if (this.trDialog.tab === 'usage') {
           res = await api[method](this.trDialog.usageRange, this.trDialog.usagePage, 20);
-        } else if (this.trDialog.tab === 'recharge') {
-          res = await api[method](this.trDialog.usagePage, 20);
         } else {
           res = await api[method]();
         }

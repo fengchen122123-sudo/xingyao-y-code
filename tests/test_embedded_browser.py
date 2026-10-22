@@ -4,6 +4,7 @@
 所有方法必须优雅失败而不抛异常。
 """
 
+import logging
 from types import SimpleNamespace
 import time
 
@@ -169,10 +170,34 @@ class _FakeSettings:
     IsStatusBarEnabled = True
 
 
+class _FakeCookieManager:
+    """CookieManager 桩：记录 CreateCookie / AddOrUpdateCookie 的调用。"""
+
+    def __init__(self):
+        self.created = []
+        self.added = []
+
+    def CreateCookie(self, name, value, domain, path):
+        cookie = SimpleNamespace(
+            Name=name,
+            Value=value,
+            Domain=domain,
+            Path=path,
+            IsHttpOnly=False,
+            IsSecure=False,
+        )
+        self.created.append(cookie)
+        return cookie
+
+    def AddOrUpdateCookie(self, cookie):
+        self.added.append(cookie)
+
+
 class _FakeCore:
     def __init__(self):
         self.navigated = []
         self.Settings = _FakeSettings()
+        self.CookieManager = _FakeCookieManager()
         self.Source = ""
         self.DocumentTitle = ""
         self.CanGoBack = False
@@ -571,3 +596,112 @@ def test_browser_mixin_releases_cached_controller_on_shutdown(monkeypatch):
     assert bridge.browser_pane_set_bounds(rect) == {"ok": False, "error": "not_open"}
     assert bridge.browser_pane_get_state() == {"ok": True, "state": None}
     assert bridge.browser_pane_hide() == {"ok": True}
+
+
+# ---------------- 会话 cookie 注入（内嵌控件没有自己的登录态） ----------------
+
+def test_set_session_cookies_waits_for_core_ready_then_replays():
+    """内核异步初始化：就绪前只记录不外写，_on_init_completed 必须补写。
+
+    只在 set_session_cookies 调用时写一次会永久丢掉登录态（控件此刻内核还没起）。
+    """
+    ctrl, core = _fake_ready_controller()
+    assert ctrl._ready is False
+
+    ctrl.set_session_cookies([{"name": "sid", "value": "secret-1"}])  # 不得抛
+
+    assert ctrl._session_cookies[0]["name"] == "sid"
+    assert ctrl._session_cookie_domain == "tokenrhythm.studio"
+    assert core.CookieManager.added == []  # 内核未就绪，此时不写
+
+    ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
+
+    assert ctrl._ready is True
+    assert [c.Name for c in core.CookieManager.added] == ["sid"]
+    cookie = core.CookieManager.added[0]
+    assert (cookie.Domain, cookie.Path) == ("tokenrhythm.studio", "/")
+
+
+def test_set_session_cookies_without_control_is_safe():
+    """控件尚未创建（_webview=None）时只记录，不抛异常，等初始化回放。"""
+    ctrl = _controller()
+    ctrl.set_session_cookies([{"name": "sid", "value": "v"}])
+
+    assert ctrl._webview is None
+    assert [item["name"] for item in ctrl._session_cookies] == ["sid"]
+
+
+def test_set_session_cookies_writes_every_valid_cookie():
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies(
+        [
+            {"name": "sid", "value": "v1"},
+            {"name": "", "value": "v2"},  # 缺 name
+            {"name": "no_value"},  # 缺 value
+            {"value": "v3"},  # 缺 name
+            {
+                "name": "keep",
+                "value": "v4",
+                "domain": "app.example.com",
+                "path": "/app",
+                "http_only": True,
+                "secure": True,
+            },
+        ]
+    )
+
+    manager = core.CookieManager
+    assert [(c.Name, c.Value) for c in manager.created] == [
+        ("sid", "v1"),
+        ("keep", "v4"),
+    ]
+    assert manager.added == manager.created  # 每个 CreateCookie 都 AddOrUpdate 一次
+    first, second = manager.created
+    assert (first.Domain, first.Path) == ("tokenrhythm.studio", "/")
+    assert (second.Domain, second.Path) == ("app.example.com", "/app")
+    assert (first.IsHttpOnly, first.IsSecure) == (False, False)
+    assert (second.IsHttpOnly, second.IsSecure) == (True, True)
+
+
+def test_set_session_cookies_tolerates_bad_items():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies([None, "sid=v", {"name": None, "value": None}])
+
+    assert ctrl._session_cookies == []
+
+
+def test_navigate_replays_session_cookies_before_navigating():
+    """每次导航前重放：页面把 cookie 清掉后下一次导航也能补回登录态。"""
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+    ctrl.set_session_cookies([{"name": "sid", "value": "v1"}])
+    assert len(core.CookieManager.added) == 1
+
+    core.CookieManager.created.clear()
+    core.CookieManager.added.clear()
+    result = ctrl.navigate("example.com")
+
+    assert result["ok"] is True
+    assert core.navigated == ["https://example.com"]
+    assert [c.Name for c in core.CookieManager.added] == ["sid"]
+
+
+def test_session_cookie_value_never_logged(caplog):
+    """cookie 的 value 是登录凭据：写入失败走 debug 日志，但 value 不得出现。"""
+    caplog.set_level(logging.DEBUG, logger=eb.logger.name)
+    secret = "SESSION-SECRET-DO-NOT-LOG"
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    def _boom(name, value, domain, path):
+        raise RuntimeError("CreateCookie failed")
+
+    core.CookieManager.CreateCookie = _boom
+    ctrl.set_session_cookies([{"name": "sid", "value": secret}])
+
+    assert "写入会话 cookie 失败" in caplog.text  # 失败路径确实记了日志
+    assert secret not in caplog.text  # 但 value 绝不入日志

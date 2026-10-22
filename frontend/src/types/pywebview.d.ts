@@ -1412,7 +1412,7 @@ export interface PyWebViewAPI {
   // 基元律动账号中心只读查询（供原生弹窗直连官方接口，免去内嵌浏览器二次登录）
   tr_profile(): Promise<{ ok: boolean; data?: Record<string, any>; reason?: string; msg?: string }>;
   tr_usage_detail(range?: string, page?: number, page_size?: number): Promise<{ ok: boolean; data?: Record<string, any>; reason?: string; msg?: string }>;
-  tr_wallet_transactions(page?: number, page_size?: number): Promise<{ ok: boolean; data?: Record<string, any>; reason?: string; msg?: string }>;
+  tr_wallet_transactions(): Promise<{ ok: boolean; data?: Record<string, any>; reason?: string; msg?: string }>;
   tr_call_logs(page?: number, page_size?: number, status?: string): Promise<{ ok: boolean; data?: Record<string, any>; reason?: string; msg?: string }>;
   // C11：项目级 Hook 信任（信任卡片数据源 + 信任/拒绝/撤销/重置动作）
   get_hooks(): Promise<{ ok: boolean; hooks?: HookInfo[]; workdir?: string; msg?: string }>;

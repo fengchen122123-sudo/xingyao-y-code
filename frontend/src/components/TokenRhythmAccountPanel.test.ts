@@ -41,6 +41,11 @@ function installBridge(overrides: Record<string, any> = {}) {
     tr_account_overview: vi.fn(async () => okOverview()),
     tr_auth_logout: vi.fn(async () => ({ ok: true, msg: '已退出基元律动账号' })),
     open_external_url: vi.fn(async () => ({ ok: true })),
+    // 账号中心原生弹窗两个 tab 各自对应的官方接口（openTrDialog 会按 tab 调其中之一）
+    tr_usage_detail: vi.fn(async () => ({ ok: true, data: {} })),
+    tr_profile: vi.fn(async () => ({ ok: true, data: {} })),
+    // 充值 tab 已随弹窗改版删除：这个 mock 只用于「充值不拉钱包流水」的反向断言
+    tr_wallet_transactions: vi.fn(async () => ({ ok: true, data: {} })),
     ...overrides,
   };
   (window as any).pywebview = { api };
@@ -147,45 +152,75 @@ it('未登录（后端 ok=false）展示后端原因与重试按钮，重试成�
   expect(w!.get('[data-test="tr-acc-balance"]').text()).toBe('¥298.10');
 });
 
-it('充值 / 用量明细 / 个人信息 在应用内右栏浏览器打开对应官方页面', async () => {
+it('充值在右侧内嵌浏览器打开官方充值页，不弹原生弹窗', async () => {
   const api = installBridge();
   const { store, wrapper: w } = setup();
-
-  const cases: Array<[string, string]> = [
-    ['tr-acc-recharge', 'https://tokenrhythm.studio/account'],
-    ['tr-acc-usage-detail', 'https://tokenrhythm.studio/account/usage'],
-    ['tr-acc-profile', 'https://tokenrhythm.studio/account/profile'],
-  ];
-  for (const [btn, url] of cases) {
-    // 每次点击都会收起浮层，下一个入口要重新打开
-    await openPanel(store);
-    await w!.get(`[data-test="${btn}"]`).trigger('click');
-    await nextTick();
-    // 导航请求交给右栏 BrowserPane 消费；nonce 自增保证同一入口重复点击也能触发
-    expect(store.browserNavRequest).toEqual({ url, path: '' });
-    expect(store.rightPanelTabs).toContain('browser');
-    expect(store.rightPanelActiveTab).toBe('browser');
-    // 浮层收起：不压住刚摊开的右栏
-    expect(store.trAccountPanel.show).toBe(false);
-  }
-  // 全程不拉系统浏览器
-  expect(api.open_external_url).not.toHaveBeenCalled();
-});
-
-it('宿主不支持内嵌浏览器时回退系统浏览器打开', async () => {
-  const api = installBridge();
-  const { store, wrapper: w } = setup();
-  // 非 Windows 桌面端 GUI：BrowserPane 判定宿主不支持后置 false
-  store.embeddedBrowser.supported = false;
-
   await openPanel(store);
+
   await w!.get('[data-test="tr-acc-recharge"]').trigger('click');
   await flushPromises();
 
-  expect(api.open_external_url).toHaveBeenCalledWith('https://tokenrhythm.studio/account');
-  // 不当成右栏导航请求：否则 BrowserPane 会拿空 path 去走源码预览
+  // 右栏内嵌浏览器收到导航请求，目标就是官方充值入口
+  expect(store.browserNavRequest).toEqual({ url: 'https://tokenrhythm.studio/account/recharge?entry_source=header_menu', path: '' });
+  // 充值不再走原生弹窗：不打开弹窗、不拉钱包流水，也不拉起系统浏览器
+  expect(store.trDialog.show).toBe(false);
+  expect(api.tr_wallet_transactions).not.toHaveBeenCalled();
+  expect(api.open_external_url).not.toHaveBeenCalled();
+  // 浮层收起，避免压住刚摊开的右栏
+  expect(store.trAccountPanel.show).toBe(false);
+});
+
+it('用量明细 / 个人信息 打开账号中心原生弹窗并收起账号浮层', async () => {
+  const api = installBridge();
+  const { store, wrapper: w } = setup();
+
+  // [按钮 data-test, 弹窗 tab, 该 tab 对应的桥方法]
+  const cases: Array<[string, 'usage' | 'profile', string]> = [
+    ['tr-acc-usage-detail', 'usage', 'tr_usage_detail'],
+    ['tr-acc-profile', 'profile', 'tr_profile'],
+  ];
+  for (const [btn, tab, method] of cases) {
+    // 弹窗是同一实例按 tab 复用：先关掉上一个 tab，才能证明这次点击确实打开了弹窗
+    store.closeTrDialog();
+    await openPanel(store);
+    await w!.get(`[data-test="${btn}"]`).trigger('click');
+    await flushPromises();
+    // 走原生弹窗：tab 切到对应视图，并由它自己去拉官方数据
+    expect(store.trDialog.show).toBe(true);
+    expect(store.trDialog.tab).toBe(tab);
+    expect(api[method]).toHaveBeenCalledTimes(1);
+    // 浮层收起：不压住刚打开的弹窗
+    expect(store.trAccountPanel.show).toBe(false);
+  }
+  // 原生弹窗路径：既不拉系统浏览器，也不给右栏内嵌浏览器发导航请求
+  expect(api.open_external_url).not.toHaveBeenCalled();
   expect(store.browserNavRequest).toBeNull();
-  // 回退路径同样收起浮层
+});
+
+it('个人信息 tab 关掉弹窗后回到浮层再点一次，仍是原生弹窗且不调用系统浏览器', async () => {
+  const api = installBridge();
+  const { store, wrapper: w } = setup();
+
+  // 先在「用量明细」视图，模拟用户关掉弹窗回到浮层，再点「个人信息」切换过去
+  store.openTrDialog('usage');
+  await flushPromises();
+  expect(store.trDialog.tab).toBe('usage');
+  store.closeTrDialog();
+  expect(store.trDialog.show).toBe(false);
+
+  await openPanel(store);
+  await w!.get('[data-test="tr-acc-profile"]').trigger('click');
+  await flushPromises();
+
+  // 同一个弹窗实例按 tab 复用，不新开第二个窗口，也不会顺带重拉其它 tab 的数据
+  expect(store.trDialog.show).toBe(true);
+  expect(store.trDialog.tab).toBe('profile');
+  expect(api.tr_profile).toHaveBeenCalledTimes(1);
+  expect(api.tr_usage_detail).toHaveBeenCalledTimes(1);
+  // 原生弹窗路径：不拉系统浏览器，也不给右栏内嵌浏览器发导航请求
+  expect(api.open_external_url).not.toHaveBeenCalled();
+  expect(store.browserNavRequest).toBeNull();
+  // 浮层同样被 openTrDialog 内部收起
   expect(store.trAccountPanel.show).toBe(false);
 });
 

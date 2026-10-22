@@ -37,6 +37,10 @@ class StubController:
         self.calls.append(("navigate", url))
         return self.result
 
+    def set_session_cookies(self, cookies, domain="tokenrhythm.studio"):
+        self.calls.append(("set_session_cookies", cookies, domain))
+        return self.result
+
     def back(self):
         self.calls.append(("back",))
         return self.result
@@ -147,6 +151,114 @@ def test_controller_exception_is_swallowed(monkeypatch):
     d._embedded_browser = BoomController()
 
     assert d.browser_pane_navigate("https://x.com") == {"ok": False, "error": "boom"}
+
+
+# ---------------- 基元律动会话 cookie 注入（内嵌浏览器免二次登录）----------------
+
+TOKENRHYTHM_URL = "https://tokenrhythm.studio/account"
+FAKE_COOKIES = [
+    {"name": "sid", "value": "secret-value", "domain": "tokenrhythm.studio", "path": "/"}
+]
+
+
+def _patch_export_session_cookies(monkeypatch, result):
+    """把 core.tokenrhythm_auth.export_session_cookies 换成固定返回值/异常。"""
+    import core.tokenrhythm_auth as ta
+
+    calls = []
+
+    def _fake_export():
+        calls.append(True)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(ta, "export_session_cookies", _fake_export)
+    return calls
+
+
+def test_navigate_injects_tokenrhythm_session_cookies(monkeypatch):
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    export_calls = _patch_export_session_cookies(monkeypatch, FAKE_COOKIES)
+    d = Dummy()
+    stub = StubController()
+    d._embedded_browser = stub
+
+    result = d.browser_pane_navigate(TOKENRHYTHM_URL)
+
+    assert result["ok"] is True
+    assert export_calls == [True]
+    # 注入在 navigate 之前，且带上官方域名
+    assert stub.calls == [
+        ("set_session_cookies", FAKE_COOKIES, "tokenrhythm.studio"),
+        ("navigate", TOKENRHYTHM_URL),
+    ]
+
+
+def test_open_injects_tokenrhythm_session_cookies(monkeypatch):
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    _patch_export_session_cookies(monkeypatch, FAKE_COOKIES)
+    d = Dummy()
+    stub = StubController()
+    d._embedded_browser = stub
+
+    result = d.browser_pane_open(VALID_RECT, TOKENRHYTHM_URL)
+
+    assert result["ok"] is True
+    assert stub.calls == [
+        ("set_session_cookies", FAKE_COOKIES, "tokenrhythm.studio"),
+        ("open", VALID_RECT, TOKENRHYTHM_URL, 1.0),
+    ]
+
+
+def test_subdomain_url_also_injects(monkeypatch):
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    _patch_export_session_cookies(monkeypatch, FAKE_COOKIES)
+    d = Dummy()
+    stub = StubController()
+    d._embedded_browser = stub
+
+    d.browser_pane_navigate("https://console.tokenrhythm.studio/login")
+
+    assert ("set_session_cookies", FAKE_COOKIES, "tokenrhythm.studio") in stub.calls
+
+
+def test_non_tokenrhythm_url_skips_injection(monkeypatch):
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    export_calls = _patch_export_session_cookies(monkeypatch, FAKE_COOKIES)
+    d = Dummy()
+    stub = StubController()
+    d._embedded_browser = stub
+
+    assert d.browser_pane_navigate("https://example.com")["ok"] is True
+
+    assert export_calls == []  # 非官方站点连导出都不做
+    assert stub.calls == [("navigate", "https://example.com")]
+
+
+def test_export_failure_does_not_break_navigation(monkeypatch):
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    _patch_export_session_cookies(monkeypatch, RuntimeError("token file unreadable"))
+    d = Dummy()
+    stub = StubController()
+    d._embedded_browser = stub
+
+    result = d.browser_pane_navigate(TOKENRHYTHM_URL)
+
+    assert result["ok"] is True
+    assert stub.calls == [("navigate", TOKENRHYTHM_URL)]  # 未注入，导航照常
+
+
+def test_empty_cookie_list_skips_injection(monkeypatch):
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    _patch_export_session_cookies(monkeypatch, [])
+    d = Dummy()
+    stub = StubController()
+    d._embedded_browser = stub
+
+    assert d.browser_pane_navigate(TOKENRHYTHM_URL)["ok"] is True
+
+    assert stub.calls == [("navigate", TOKENRHYTHM_URL)]
 
 
 def test_controller_lazy_singleton_wires_on_state(monkeypatch):

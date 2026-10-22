@@ -67,7 +67,7 @@
 
     <!-- 操作区：充值 / 用量明细 / 个人信息 / 退出登录（两行两列，样式统一） -->
     <div class="tr-acc-actions">
-      <button class="tr-acc-btn primary" type="button" data-test="tr-acc-recharge" @click="store.openTrDialog('recharge')">充值</button>
+      <button class="tr-acc-btn primary" type="button" data-test="tr-acc-recharge" @click="store.openTrConsolePage(RECHARGE_URL)">充值</button>
       <button class="tr-acc-btn" type="button" data-test="tr-acc-usage-detail" @click="store.openTrDialog('usage')">用量明细</button>
       <button class="tr-acc-btn" type="button" data-test="tr-acc-profile" @click="store.openTrDialog('profile')">个人信息</button>
       <button
@@ -102,13 +102,11 @@ import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
 
-/** 官方控制台的三个入口（充值 / 用量明细 / 个人信息） */
-const RECHARGE_URL = 'https://tokenrhythm.studio/account';
-const USAGE_URL = 'https://tokenrhythm.studio/account/usage';
-const PROFILE_URL = 'https://tokenrhythm.studio/account/profile';
-
 /** 数据缺失时的占位符：任何情况下都不把 undefined / NaN 甩到界面上 */
 const PLACEHOLDER = '—';
+
+/** 官方充值入口：点「充值」直接在右栏内嵌浏览器打开充值页，不再走原生弹窗 */
+const RECHARGE_URL = 'https://tokenrhythm.studio/account/recharge?entry_source=header_menu';
 
 const panelEl = ref<HTMLElement | null>(null);
 
@@ -262,11 +260,6 @@ const avatarText = computed(() => displayName.value.slice(0, 1).toUpperCase() ||
 
 function retry() {
   void store.refreshTrOverview();
-}
-
-/** 三个入口统一走应用内打开：右栏内嵌浏览器页签（宿主不支持时才回退系统浏览器） */
-function openConsolePage(url: string) {
-  store.openTrConsolePage(url);
 }
 
 async function logout() {
