@@ -1,4 +1,6 @@
+import base64
 import datetime
+import gzip
 import hashlib
 import json
 import logging
@@ -12,7 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from core.cache_health import classify_lanes_health
 from core.harness.models import JournalEventDraft
-from core.tool_result_maintenance import PROTECTION_ZONE_TOKENS
+from core.tool_result_maintenance import PROTECTION_ZONE_TOKENS, new_handle
 
 
 import pathlib
@@ -351,6 +353,108 @@ def _position_kind_for_role(role: str) -> str:
     return value
 
 
+# ── 工具结果归档层：编码策略 / 内容寻址句柄 / 落库行加工 ──────────────────────
+# 超过该字节数的原文改用 gzip+base64 落库（文本类工具结果通常能压到 1/5 以下），
+# 省下的是磁盘与 WAL 体积；解码在读取路径完成，调用方无感知。
+COMPRESS_THRESHOLD_BYTES = 256 * 1024
+# 单条归档上限：超过则只保留头尾各 4MB 并在中间插省略提示；bytes 仍记真实长度
+SINGLE_RECORD_LIMIT_BYTES = 8 * 1024 * 1024
+# 归档层总预算与 TTL：供闲时维护的 sweep_tool_result_archive 淘汰
+ARCHIVE_BUDGET_BYTES = 256 * 1024 * 1024
+ARCHIVE_TTL_DAYS = 7
+
+# 单条归档保留了头尾各这么多字节（= SINGLE_RECORD_LIMIT_BYTES 的一半）
+_TRUNCATE_HEAD_BYTES = SINGLE_RECORD_LIMIT_BYTES // 2
+_TRUNCATE_TAIL_BYTES = SINGLE_RECORD_LIMIT_BYTES // 2
+
+# 归档表的唯一写入口：11 列与 build_archive_row 的输出一一对应
+_TOOL_RESULT_ARCHIVE_INSERT_SQL = (
+    "INSERT OR IGNORE INTO tool_result_archive "
+    "(handle, session_id, msg_id, tool_name, bytes, content, created_at, "
+    "sha256, stored_bytes, encoding, accessed_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def encode_payload(raw: bytes) -> tuple[str, str, int]:
+    """把原始工具结果字节编码成 (落库文本, 编码标记, 原始字节数)。"""
+    size = len(raw)
+    if size > SINGLE_RECORD_LIMIT_BYTES:
+        # 超大结果：头尾各留 4MB，中间只留一句省略提示（原始长度照样记全）
+        head = raw[:_TRUNCATE_HEAD_BYTES].decode("utf-8", "replace")
+        tail = raw[-_TRUNCATE_TAIL_BYTES:].decode("utf-8", "replace")
+        hint = f"\n\n[... {size} 字节超过单条归档上限，中间部分未归档 ...]\n\n"
+        return head + hint + tail, "truncated", size
+    if size > COMPRESS_THRESHOLD_BYTES:
+        payload = base64.b64encode(gzip.compress(raw)).decode("ascii")
+        return payload, "gzip+base64", size
+    return raw.decode("utf-8", "replace"), "utf-8", size
+
+
+def decode_payload(content: str, encoding: str | None) -> str:
+    """把落库文本还原成原文；encoding 为 None/未知时按 utf-8 原文处理。"""
+    if content is None:
+        return ""
+    text = content if isinstance(content, str) else str(content)
+    flag = str(encoding or "utf-8").strip().lower()
+    if flag == "gzip+base64":
+        try:
+            return gzip.decompress(
+                base64.b64decode(text.encode("ascii"))
+            ).decode("utf-8", "replace")
+        except Exception:
+            # 落库文本损坏或被外部改写时降级返回原文，绝不让读取路径炸掉
+            return text
+    # truncated / utf-8 / 未知编码：库里存的都是可直接阅读的文本
+    return text
+
+
+def content_handle(cursor, text: str) -> str:
+    """由内容 sha256 派生 8 位句柄；同内容复用，碰撞时回退随机句柄。
+
+    同一段原文 → 同一句柄，配合 INSERT OR IGNORE 让重复归档自动去重。
+    """
+    sha = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+    candidate = sha[:8]
+    try:
+        row = cursor.execute(
+            "SELECT sha256 FROM tool_result_archive WHERE handle = ?", (candidate,)
+        ).fetchone()
+    except Exception:
+        # 表/列缺失（极端旧库）：退回一次性随机句柄，不阻断改写流程
+        return new_handle()
+    # 已有同句柄记录：sha 相同说明同一段内容（复用）；不同（含旧行 sha 为 NULL）
+    # 说明是真碰撞，必须换随机句柄，否则 marker 会指向别人的原文
+    if row is not None and str(row[0] or "") != sha:
+        return new_handle()
+    return candidate
+
+
+def build_archive_row(record) -> tuple:
+    """把 7 字段归档元组加工成 11 字段落库行（编码 + 内容寻址 + 容量统计列）。
+
+    record = (handle, session_id, msg_id, tool_name, bytes, content, created_at)。
+    bytes 列仍写原始字节数（对外语义不变），stored_bytes 是实际落库文本长度。
+    """
+    handle, session_id, msg_id, tool_name, _bytes, content, created_at = record
+    raw = str(content).encode("utf-8")
+    sha = hashlib.sha256(raw).hexdigest()
+    stored, encoding, original_bytes = encode_payload(raw)
+    return (
+        handle,
+        session_id,
+        msg_id,
+        tool_name,
+        original_bytes,
+        stored,
+        created_at,
+        sha,
+        len(stored),
+        encoding,
+        created_at,
+    )
+
+
 class MemoryManager:
     def __init__(self, db_path="ycode.db"):
         # 1. 连接数据库（check_same_thread=False 允许多线程访问，timeout=30.0 防止多窗口并发挂起）
@@ -659,13 +763,54 @@ class MemoryManager:
                         tool_name TEXT,
                         bytes INTEGER NOT NULL,
                         content TEXT NOT NULL,
-                        created_at TEXT
+                        created_at TEXT,
+                        sha256 TEXT,
+                        stored_bytes INTEGER,
+                        encoding TEXT DEFAULT 'utf-8',
+                        accessed_at TEXT
                     )
                 ''')
                 cursor.execute('''
                     CREATE INDEX IF NOT EXISTS idx_tool_result_archive_session
                     ON tool_result_archive(session_id, created_at)
                 ''')
+                # 归档层内容寻址/压缩升级：老库没有这四列，照 cache_request_diagnostics
+                # 的写法先读 PRAGMA 再 ALTER，缺列才加、失败静默，保证幂等与平滑升级。
+                # 旧行 sha256/stored_bytes/accessed_at 保持 NULL，encoding 落默认 utf-8，
+                # 读取路径按 utf-8 原文处理（见 decode_payload）。
+                cursor.execute("PRAGMA table_info(tool_result_archive)")
+                archive_columns = {col[1] for col in cursor.fetchall()}
+                for column, alter_sql in (
+                    ("sha256", "ALTER TABLE tool_result_archive ADD COLUMN sha256 TEXT"),
+                    (
+                        "stored_bytes",
+                        "ALTER TABLE tool_result_archive ADD COLUMN stored_bytes INTEGER",
+                    ),
+                    (
+                        "encoding",
+                        "ALTER TABLE tool_result_archive ADD COLUMN encoding TEXT DEFAULT 'utf-8'",
+                    ),
+                    ("accessed_at", "ALTER TABLE tool_result_archive ADD COLUMN accessed_at TEXT"),
+                ):
+                    if column in archive_columns:
+                        continue
+                    try:
+                        cursor.execute(alter_sql)
+                    except Exception:
+                        pass
+                # 去重索引是部分索引：旧行 sha256 为 NULL 天然被排除。若历史库存在
+                # 同 (session_id, sha256) 重复数据导致建索引失败，静默忽略即可——
+                # 去重只是优化，绝不能因此阻断启动。
+                for index_sql in (
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_result_archive_dedup "
+                    "ON tool_result_archive(session_id, sha256) WHERE sha256 IS NOT NULL",
+                    "CREATE INDEX IF NOT EXISTS idx_tool_result_archive_accessed "
+                    "ON tool_result_archive(accessed_at)",
+                ):
+                    try:
+                        cursor.execute(index_sql)
+                    except Exception:
+                        pass
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS deepseek_prompt_generations (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3878,10 +4023,13 @@ class MemoryManager:
         不在请求前缀里，无需维护）。
         返回 (snipped_count, elided_count)。
         """
+        from core.tool_output_reducer import REDUCED_HINT_MARK, reduce_tool_output
         from core.tool_result_maintenance import (
+            ERROR_PREFIXES,
             elide_tool_result,
             estimate_text_tokens,
             extract_handle,
+            is_frozen,
             new_handle,
             snip_tool_result,
         )
@@ -3927,19 +4075,51 @@ class MemoryManager:
                     name, text = "", str(raw or "")
 
                 new_text = None
-                if tier >= 2:
-                    new_text = elide_tool_result(name, text)
-                    if new_text is not None:
-                        elided += 1
-                if new_text is None and tier >= 1:
-                    new_text = snip_tool_result(name, text)
-                    if new_text is not None:
-                        snipped += 1
+                handle = None
+                # 内容寻址句柄：同一段原文 → 同一句柄，配合 INSERT OR IGNORE 让重复
+                # 归档自动去重；已 frozen 的 marker 沿用 marker 里的句柄（snip → elide
+                # 升级必须是同一句柄，否则同一结果的原文会被重复归档）。
+                frozen_handle = extract_handle(text)
+                # 命令感知精简：先按输出特征去掉重复行/噪声行。命中时原文必须先
+                # 归档（保持可逆），并跳过本条的 snip/elide——已是精简文本，再
+                # 截断只会丢信息。reducer 属于 Tier 1 维护，tier=0 时不启用；
+                # 已冻结（snip/elide marker）、错误结果、已带精简提示的结果
+                # 一律不精简，保持既有幂等与「错误不改写」不变量。
+                reduced = None
+                if (
+                    tier >= 1
+                    and not is_frozen(text)
+                    and not text.startswith(ERROR_PREFIXES)
+                    and REDUCED_HINT_MARK not in text
+                ):
+                    reduced = reduce_tool_output(name, text)
+                if reduced is not None:
+                    # 归库存的是 reducer 之前的原文，句柄必须按原文算（不是精简文本）
+                    handle = frozen_handle or content_handle(cursor, text)
+                    new_text = (
+                        reduced.text
+                        + f"\n\n[... 原文 {reduced.original_chars} 字符，已按 "
+                        f"{reduced.reducer} 规则精简，完整内容见 #{handle} ...]"
+                    )
+                    # 计入 snipped，与下面的 elide/snip 分支互斥，不会重复累加
+                    snipped += 1
+                else:
+                    # snip/elide 的 marker 必须携带内容寻址句柄，所以先算句柄再传进去
+                    if tier >= 1:
+                        handle = frozen_handle or content_handle(cursor, text)
+                    if tier >= 2:
+                        new_text = elide_tool_result(name, text, handle=handle)
+                        if new_text is not None:
+                            elided += 1
+                    if new_text is None and tier >= 1:
+                        new_text = snip_tool_result(name, text, handle=handle)
+                        if new_text is not None:
+                            snipped += 1
                 if new_text is None:
                     continue
-                # 句柄：优先复用 marker 里已有的（snip → elide 升级同句柄）——
-                # elide 内部按 extract_handle(text) 复用，这里从新 marker 读回。
-                handle = extract_handle(new_text) or new_handle()
+                # 兜底：正常情况下分支内已经算好句柄，这里只防「改写发生了却没句柄」
+                if handle is None:
+                    handle = extract_handle(new_text) or new_handle()
                 archives.append((
                     handle,
                     session_id,
@@ -3959,13 +4139,12 @@ class MemoryManager:
             if updates:
                 try:
                     # 归档原文与改写 marker 同一事务提交：要么都成功（可取回），
-                    # 要么都回滚（不留指向空归档的 marker）。INSERT OR IGNORE 让
-                    # elide 升级时的二次落库静默跳过，原文只存一次。
+                    # 要么都回滚（不留指向空归档的 marker）。落库行在此统一加工：
+                    # 编码（utf-8 / gzip+base64 / truncated）+ sha256 + 容量统计列；
+                    # INSERT OR IGNORE 让同内容重复归档（同句柄）静默跳过。
                     cursor.executemany(
-                        'INSERT OR IGNORE INTO tool_result_archive '
-                        '(handle, session_id, msg_id, tool_name, bytes, content, created_at) '
-                        'VALUES (?, ?, ?, ?, ?, ?, ?)',
-                        archives,
+                        _TOOL_RESULT_ARCHIVE_INSERT_SQL,
+                        [build_archive_row(record) for record in archives],
                     )
                     cursor.executemany('UPDATE messages SET content = ? WHERE id = ?', updates)
                     self.conn.commit()
@@ -3975,23 +4154,39 @@ class MemoryManager:
             return (snipped, elided)
 
     def get_tool_result_archive(self, handle):
-        """按归档句柄取回 snip/elide 改写前的原始工具结果；查不到返回 None。"""
+        """按归档句柄取回 snip/elide 改写前的原始工具结果；查不到返回 None。
+
+        · 老库可能还没有 sha256/encoding 列，故统一 SELECT * 后按列名取值，
+          缺列按 None 处理；
+        · content 按 encoding 解码（gzip+base64 反解，truncated/utf-8 原样返回）；
+        · 读取成功顺手更新 accessed_at（best effort），供闲时淘汰判断访问热度。
+        """
+        key = str(handle or "")
         with self._lock:
-            row = self.conn.execute(
-                'SELECT handle, session_id, msg_id, tool_name, bytes, content, created_at '
-                'FROM tool_result_archive WHERE handle = ?',
-                (str(handle or ""),),
-            ).fetchone()
-        if not row:
-            return None
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT * FROM tool_result_archive WHERE handle = ?', (key,))
+            fetched = cursor.fetchone()
+            if not fetched:
+                return None
+            columns = [col[0] for col in (cursor.description or ())]
+            record = dict(zip(columns, fetched))
+            try:
+                cursor.execute(
+                    'UPDATE tool_result_archive SET accessed_at = ? WHERE handle = ?',
+                    (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), key),
+                )
+                self.conn.commit()
+            except Exception:
+                # 只影响淘汰冷热判断，失败静默（旧库无 accessed_at 列也走这里）
+                pass
         return {
-            "handle": row[0],
-            "session_id": row[1],
-            "msg_id": row[2],
-            "tool_name": row[3],
-            "bytes": row[4],
-            "content": row[5],
-            "created_at": row[6],
+            "handle": record.get("handle"),
+            "session_id": record.get("session_id"),
+            "msg_id": record.get("msg_id"),
+            "tool_name": record.get("tool_name"),
+            "bytes": record.get("bytes"),
+            "content": decode_payload(record.get("content"), record.get("encoding")),
+            "created_at": record.get("created_at"),
         }
 
     def prune_tool_result_archive(self, session_name=None, keep_days=None) -> int:
@@ -4047,6 +4242,86 @@ class MemoryManager:
                 except Exception:
                     pass
                 return 0
+
+    def sweep_tool_result_archive(
+        self,
+        *,
+        budget_bytes=ARCHIVE_BUDGET_BYTES,
+        keep_days=ARCHIVE_TTL_DAYS,
+        protect_seconds=3600,
+    ) -> dict:
+        """归档层容量治理：先删过期，再按 accessed_at 升序淘汰到预算内。
+
+        返回 {"expired": n, "evicted": n}。protect_seconds 内的记录视为「刚被
+        取回」，即使超预算也跳过——它们最可能还被模型引用，删了 marker 就取不回。
+        任何异常都静默（回滚 + 返回零统计），这条路径只服务闲时维护。
+        """
+        stats = {"expired": 0, "evicted": 0}
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                now = datetime.datetime.now()
+                if keep_days is not None:
+                    try:
+                        days = max(0, int(keep_days))
+                    except (TypeError, ValueError):
+                        days = ARCHIVE_TTL_DAYS
+                    cutoff_text = (now - datetime.timedelta(days=days)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    # created_at 与 cutoff 同为 '%Y-%m-%d %H:%M:%S' 文本，
+                    # 字典序即时间序；NULL 行不被误删（与 prune 保持同口径）。
+                    cursor.execute(
+                        'DELETE FROM tool_result_archive '
+                        'WHERE created_at IS NOT NULL AND created_at < ?',
+                        (cutoff_text,),
+                    )
+                    stats["expired"] = max(cursor.rowcount or 0, 0)
+                if budget_bytes is not None:
+                    # 旧行没有 stored_bytes，按 LENGTH(content) 估算
+                    total = int(
+                        cursor.execute(
+                            'SELECT COALESCE(SUM(COALESCE(stored_bytes, '
+                            'LENGTH(content))), 0) FROM tool_result_archive'
+                        ).fetchone()[0]
+                        or 0
+                    )
+                    budget = max(0, int(budget_bytes))
+                    if total > budget:
+                        try:
+                            protect_before = (
+                                now - datetime.timedelta(seconds=max(0, int(protect_seconds or 0)))
+                            ).strftime("%Y-%m-%d %H:%M:%S")
+                        except (TypeError, ValueError):
+                            protect_before = now.strftime("%Y-%m-%d %H:%M:%S")
+                        # 候选：未访问过（NULL）或最近访问早于保护窗口；按 accessed_at
+                        # 升序（冷的最先）淘汰，NULL 视为最冷排最前。
+                        cursor.execute(
+                            'SELECT handle, COALESCE(stored_bytes, LENGTH(content)) '
+                            'FROM tool_result_archive '
+                            'WHERE accessed_at IS NULL OR accessed_at < ? '
+                            'ORDER BY accessed_at IS NULL DESC, accessed_at ASC, '
+                            'created_at ASC',
+                            (protect_before,),
+                        )
+                        for row in cursor.fetchall():
+                            if total <= budget:
+                                break
+                            cursor.execute(
+                                'DELETE FROM tool_result_archive WHERE handle = ?',
+                                (row[0],),
+                            )
+                            if cursor.rowcount and cursor.rowcount > 0:
+                                total -= int(row[1] or 0)
+                                stats["evicted"] += 1
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                return {"expired": 0, "evicted": 0}
+        return stats
 
     # ---------- 消息全文检索（FTS5 + bigram 归一化，懒同步） ----------
 

@@ -620,17 +620,18 @@ def _format_token_speed(speed) -> str:
 
 
 def _compose_status_task_segment(task_status, speed):
-    """状态栏最右段（text, style）三元组：闲置位改为实测吐字速度。
+    """状态栏最右段（text, style）三元组：一律展示实测吐字速度。
 
-    闲置时没有任何执行状态可报，原先固定显示「闲置」纯占位；现在换成最近一次
-    请求的实测 token 速度，信息量更足。运行中仍报执行状态——「等待授权确认」
-    这类标签有行动价值，不能为了塞速度把它换掉。
+    运行中原本还要显示「思考中…／正在干活…」文字，但速度位一旦有数字滚动
+    就已经说明在工作，多一段文字只占宽度、还会随状态反复跳变。现在除
+    「等待授权确认」外一律显示 t/s——那一个标签需要用户立刻动手，必须显眼。
+    运行中的旋转动画由调用方补在速度前面，保留最低限度的活动反馈。
     """
     speed_label = f" {_format_token_speed(speed)} "
     status_map = {
         "idle": (speed_label, "class:status.task_speed"),
-        "thinking": (" 思考中... ", "class:status.task_active"),
-        "executing": (" 正在干活... ", "class:status.task_active"),
+        "thinking": (speed_label, "class:status.task_speed"),
+        "executing": (speed_label, "class:status.task_speed"),
         "waiting": (" 等待授权确认... ", "class:status.task_active"),
     }
     # 未知状态按闲置处理（与历史默认值一致），同样落回实测速度位
@@ -4709,9 +4710,9 @@ def _make_input_app():
             ctx_max=max_win_str,
         )
 
-        # 3. 状态位：闲置时展示最近一次请求的实测吐字速度（t/s），运行中仍展示
-        # 执行状态（spinner + 文字），保留「等待授权确认」这类有行动价值的信息。
-        # 直接读模块全局变量，不再 import main 自引用
+        # 3. 状态位：一律展示最近一次请求的实测吐字速度（t/s）——运行中只加
+        # 旋转动画，不再叠状态文字；仅「等待授权确认」保留文字提示，因为那一
+        # 步需要用户动手。直接读模块全局变量，不再 import main 自引用
         status_label, task_style = _compose_status_task_segment(
             task_status, _last_token_speed
         )

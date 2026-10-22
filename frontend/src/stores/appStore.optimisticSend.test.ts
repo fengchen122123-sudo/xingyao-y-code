@@ -56,3 +56,28 @@ it('turn_start 到达时不重复渲染用户消息与占位', async () => {
   // 不重复添加：消息数不变（用户消息已有 + 占位复用）
   expect(after).toBe(before);
 });
+
+// 基元律动登录会话失效：后端在失败结果里带 need_login 时，直接把登录弹窗拉起来
+it('send_user_message 返回 need_login 时拉起基元律动登录弹窗', async () => {
+  const store = useAppStore();
+  const api = {
+    send_user_message: vi.fn().mockResolvedValue({
+      ok: false,
+      msg: '基元律动登录已失效，请重新登录后再使用该模型',
+      need_login: true,
+    }),
+    get_sessions: vi.fn().mockResolvedValue([]),
+    tr_auth_status: vi.fn().mockResolvedValue({ ok: true, logged_in: false }),
+  };
+  (window as any).pywebview = { api };
+
+  store.pendingWorkdir = 'GLOBAL';
+  store.currentSessionName = '';
+  expect(store.trLoginModal.show).toBe(false);
+
+  await store.sendMessage('你好', []);
+
+  // 只认 need_login：弹窗被拉起，且顺带刷新了一次账号状态
+  expect(store.trLoginModal.show).toBe(true);
+  expect(api.tr_auth_status).toHaveBeenCalledTimes(1);
+});

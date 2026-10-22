@@ -253,6 +253,12 @@ class Client(object):
         self._ping_interval: int = 120
         self._cache: _ExpiringCache = _ExpiringCache(clear_interval=30)
         self._lock: Optional[asyncio.Lock] = None
+        # [星瑶改造] 后台任务集中托管：关闭时统一 cancel + 等待，避免 loop
+        # 停止后残留协程在 GC 阶段被 close，再次执行 await 逻辑时拿不到运行
+        # 中的 loop（表现为 "Exception ignored while closing generator
+        # <coroutine object Client._receive_message_loop> ... 'NoneType'
+        # object has no attribute 'create_future'"）。
+        self._tasks: set = set()
         # [星瑶改造] 供外部观察重连生命周期
         self.on_reconnecting: Callable[[], None] = lambda: None
         self.on_reconnected: Callable[[], None] = lambda: None
@@ -272,6 +278,19 @@ class Client(object):
         asyncio.set_event_loop(self._loop)
         self._lock = asyncio.Lock()
         try:
+            self._serve()
+        finally:
+            # [星瑶改造] 无论正常停止还是异常退出，都必须把 loop 收干净。
+            # 上游只让 run_until_complete 返回、从不关 loop，残留的协程会
+            # 在解释器 GC 时才被 close：finalize 会重新驱动协程，继续执行
+            # await 表达式（如 asyncio.Lock.acquire），而此时线程里已没有
+            # 运行中的事件循环，于是打出
+            # "Exception ignored while closing generator ..." 这类噪音。
+            self._teardown_loop()
+
+    def _serve(self) -> None:
+        """start() 的主体：建连并维持，直到 stop() 唤醒 _select()。"""
+        try:
             self._loop.run_until_complete(self._connect())
         except ClientException as e:
             logger.error(self._fmt_log("connect failed, err: {}", e))
@@ -288,7 +307,7 @@ class Client(object):
             self._loop.run_until_complete(self._disconnect())
             return
 
-        self._loop.create_task(self._ping_loop())
+        self._spawn(self._ping_loop())
         self._loop.run_until_complete(self._select())
 
     def stop(self) -> None:
@@ -306,21 +325,79 @@ class Client(object):
             logger.debug(self._fmt_log("投递停止信号失败"), exc_info=True)
 
     def _signal_stop(self) -> None:
-        waiter = self._stop_waiter
-        if waiter is not None and not waiter.is_set():
-            waiter.set()
-        self._loop.create_task(self._shutdown())
+        # [星瑶改造] 先断开连接，断完再叫醒 _select()：保证 stop() 返回时
+        # 连接真的关了，而不是把 _shutdown() 丢进 loop 就撒手。
+        self._spawn(self._shutdown())
 
     async def _shutdown(self) -> None:
         try:
-            await self._disconnect()
+            # 兜底超时：_connect 可能正持有锁（建连最长 30s），不能把
+            # stop() 的 join 拖死，超时就直接释放连接状态。
+            await asyncio.wait_for(self._disconnect(), timeout=3.0)
+        except asyncio.TimeoutError:  # pragma: no cover - 关闭竞态
+            logger.warning(self._fmt_log("关闭连接超时，强制释放连接状态"))
+            self._reset_conn_state()
         except Exception:  # pragma: no cover - 关闭时尽力而为
             logger.debug(self._fmt_log("断开长连接失败"), exc_info=True)
+        finally:
+            waiter = self._stop_waiter
+            if waiter is not None and not waiter.is_set():
+                waiter.set()
 
     async def _select(self) -> None:
         """[星瑶改造] 上游是 `while True: sleep(3600)`；这里改成可被 stop() 唤醒。"""
         self._stop_waiter = asyncio.Event()
         await self._stop_waiter.wait()
+
+    def _spawn(self, coro) -> Optional[asyncio.Task]:
+        """[星瑶改造] 托管后台任务：保留引用，结束/取消后自动摘除。
+
+        上游直接 `loop.create_task(...)` 丢引用，关闭阶段 cancel 不到也等不到，
+        任务只能在 loop 停止后被 GC，从而在 finalize 阶段触发上面说的噪音。
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():  # pragma: no cover - loop 已收尾
+            coro.close()
+            return None
+        task = loop.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: "asyncio.Task") -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            # 取回异常，避免 asyncio 额外打 "Task exception was never retrieved"
+            logger.debug(self._fmt_log("后台任务异常退出: {}", exc), exc_info=exc)
+
+    def _teardown_loop(self) -> None:
+        """[星瑶改造] 关闭 loop 前收尾：取消残留任务并等它们真正结束。"""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            pending = [t for t in self._tasks if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._tasks.clear()
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:  # pragma: no cover - 收尾尽力而为
+            logger.debug(self._fmt_log("关闭事件循环前收尾失败"), exc_info=True)
+        finally:
+            try:
+                loop.close()
+            except Exception:  # pragma: no cover
+                logger.debug(self._fmt_log("关闭事件循环失败"), exc_info=True)
+            self._loop = None
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:  # pragma: no cover
+                pass
 
     # ---- 连接 ----
 
@@ -354,7 +431,7 @@ class Client(object):
             self._service_id = service_id
 
             logger.info(self._fmt_log("connected to {}", conn_url))
-            self._loop.create_task(self._receive_message_loop())
+            self._spawn(self._receive_message_loop())
             try:
                 self.on_connected()
             except Exception:  # pragma: no cover - 观察者异常不影响连接
@@ -370,12 +447,16 @@ class Client(object):
                 if self._conn is None:
                     raise ConnectionClosedException("connection is closed")
                 msg = await self._conn.recv()
-                self._loop.create_task(self._handle_message(msg))
+                self._spawn(self._handle_message(msg))
         except Exception as e:
+            if self._stopping:
+                # [星瑶改造] 停止过程中连接被 _shutdown 关掉属预期：不再二次
+                # 断开，避免关闭路径上再去抢 asyncio.Lock（此前正是这里在
+                # loop 停止后被 GC 重新驱动，才打出 NoneType.create_future）。
+                logger.debug(self._fmt_log("receive message loop exit on stop, err: {}", e))
+                return
             logger.error(self._fmt_log("receive message loop exit, err: {}", e))
             await self._disconnect()
-            if self._stopping:
-                return
             if self._auto_reconnect:
                 await self._reconnect()
             else:
@@ -558,21 +639,34 @@ class Client(object):
             return False
 
     async def _disconnect(self) -> None:
+        lock = self._lock
+        if lock is None:  # pragma: no cover - loop 已收尾，不再有连接
+            self._reset_conn_state()
+            return
+        acquired = False
         try:
-            await self._lock.acquire()
+            await lock.acquire()
+            acquired = True
             if self._conn is None:
                 return
             await self._conn.close()
             logger.info(self._fmt_log("disconnected to {}", self._conn_url))
         finally:
-            self._conn = None
-            self._conn_url = ""
-            self._conn_id = ""
-            self._service_id = ""
-            self._lock.release()
+            self._reset_conn_state()
+            if acquired:
+                lock.release()
+
+    def _reset_conn_state(self) -> None:
+        self._conn = None
+        self._conn_url = ""
+        self._conn_id = ""
+        self._service_id = ""
 
     async def _write_message(self, data: bytes) -> None:
-        async with self._lock:
+        lock = self._lock
+        if lock is None:  # pragma: no cover - loop 已收尾
+            raise ConnectionClosedException("connection is closed, write message failed")
+        async with lock:
             if self._conn is None:
                 raise ConnectionClosedException("connection is closed, write message failed")
             await self._conn.send(data)
