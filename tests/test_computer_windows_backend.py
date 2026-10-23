@@ -934,8 +934,8 @@ def test_click_skips_activation_when_already_foreground():
         backend.close()
 
 
-def test_activation_failure_does_not_block_input():
-    """SetForegroundWindow 失败（含 Alt 键技巧重试后）：输入照常发送。"""
+def test_activation_failure_blocks_input_with_explicit_error():
+    """SetForegroundWindow 失败：显式报错并中止输入，避免落到旧前台窗口。"""
     adapter = FakeWin32Adapter()
     adapter.window_at_point_id = 2002
     adapter.set_foreground_result = False
@@ -943,11 +943,13 @@ def test_activation_failure_does_not_block_input():
     backend.start()
     try:
         backend.observe("run-c")
-        backend.execute(
-            "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
-        )
+        with pytest.raises(ComputerControlError) as excinfo:
+            backend.execute(
+                "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
+            )
+        assert excinfo.value.code == "computer_foreground_activation_failed"
         assert adapter.set_foreground_calls == [2002]
-        assert adapter.clicks == [(-1720, 200, "left")]
+        assert adapter.clicks == []
     finally:
         backend.close()
 
@@ -991,6 +993,65 @@ def test_type_text_after_window_switch_is_rejected_without_focus_steal():
         assert adapter.set_foreground_calls == []  # 未发生任何抢焦点
         assert adapter.texts == []
         assert adapter.keys_sent == []
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        ComputerAction(kind="keypress", target="desktop", keys=("CTRL", "A")),
+        ComputerAction(kind="type_text", target="desktop", text="hello"),
+    ],
+    ids=["keypress", "type_text"],
+)
+def test_keyboard_after_focus_steal_back_is_rejected_with_foreground_lost(action):
+    """键盘焦点护栏：前台回到观察过的窗口（R5 基线仍吻合），但已不是最近一次
+    点击的目标窗口 → 零输入 + 显式 computer_foreground_lost。"""
+    adapter = FakeWin32Adapter(foreground_id=1001)
+    backend = _activation_backend(adapter)
+    backend.start()
+    try:
+        assert backend.observe("run-c").surface_id == "hwnd:1001"
+        # 点击命中另一个窗口（hwnd 2002）→ 前置激活把它提到前台并记为键盘参照。
+        adapter.window_at_point_id = 2002
+        backend.execute(
+            "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
+        )
+        assert adapter.set_foreground_calls == [2002]
+        assert adapter.clicks  # 点击本身照常送出
+        # 焦点被切回观察过的窗口：R5 基线吻合，但键盘目标已不是 2002。
+        adapter.foreground_id = 1001
+        adapter.window_at_point_id = None
+        with pytest.raises(ComputerControlError) as exc:
+            backend.execute("run-c", action)
+        assert exc.value.code == "computer_foreground_lost"
+        assert exc.value.details == {"expected_hwnd": 2002, "current_hwnd": 1001}
+        assert "activate_surface" in exc.value.message  # 提示模型重建焦点的路径
+        assert adapter.texts == []
+        assert adapter.keys_sent == []
+        assert adapter.clipboard_writes == []  # 非 ASCII 路径也绝不落剪贴板
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        ComputerAction(kind="keypress", target="desktop", keys=("CTRL", "A")),
+        ComputerAction(kind="type_text", target="desktop", text="hi"),
+    ],
+    ids=["keypress", "type_text"],
+)
+def test_keyboard_without_focus_reference_is_allowed(action):
+    """拿不到参照窗口（未观察、也没点过）时放行，键盘护栏不阻塞首次输入。"""
+    adapter = FakeWin32Adapter(foreground_id=1001)
+    backend = _activation_backend(adapter)
+    try:
+        backend.execute("run-c", action)
+        assert adapter.keys_sent or adapter.texts
+        assert adapter.window_from_point_calls == []  # 键盘动作绝不做置前探测
+        assert adapter.set_foreground_calls == []
     finally:
         backend.close()
 

@@ -69,6 +69,13 @@ _GENERIC_DYNAMIC_PROMPT = (
     "3. 每次只调用一个 computer_action，不得与其他工具混用；有把握的连续微动作"
     "（点击→输入→按键）用 kind=sequence 打包一次执行（中途不截图，完成后返回"
     "标注截图）；没把握时单独执行并逐次验证。\n"
+    "   - 【强制】确定性的连续操作（点击输入框 → 输入文本 → 回车）必须打包成一次\n"
+    "     sequence 调用，禁止把每一步拆成独立调用逐步请示。\n"
+    "   - sequence 内允许条件等待：页面需要加载时插入 wait（duration_ms 100-10000）\n"
+    "     等页面就绪，再由后续步骤接着做，不要靠反复 observe 轮询等元素出现；\n"
+    "     click_element / set_value_element 自带元素自动等待，不必在外层反复观察。\n"
+    "   - 只有下一步依赖观察结果（需要看画面才知道点哪里）时才单独调用；能一次性\n"
+    "     规划完的，一律打包。\n"
     "4. 每个动作后依据最新观察决定下一步，不得猜测成功；观察里的"
     "surface_generation 变化表示画面已切换，旧坐标与旧元素引用立即作废。\n"
     "5. 出现焦点被抢、会话失活、窗口挪位时：先 list_elements 或 activate_surface"
@@ -247,6 +254,15 @@ _OBSERVATION_ELEMENTS_TEXT_PREFIX = (
     " set_value_element）；元素都不可用时再用截图坐标。元素列表："
 )
 
+# 无元素场景的定位提示（只在本次没有控件列表、模型只能看截图时追加）：
+# 目标控件可能只有三四十像素（如 32×33 的按钮），整屏截图目测必然点偏，
+# 必须先 observe_region 放大局部再点。有控件列表时不加——模型用 click_element
+# 就够，加了只会白占 token。
+_OBSERVATION_REGION_HINT = (
+    "【定位提示】若目标控件较小、密集或看不清，先用 observe_region 放大该区域再"
+    "点击，不要凭整屏截图目测坐标。"
+)
+
 # 帧契约（2026-10-21，借 zcode frame-contract 的「体积上限 + 成对引用」思路）：
 # 单张观察图进上下文前必须有字节上限，否则长回合里截图会累积吃干上下文。
 # 2MB 是权衡值——1280 宽的界面截图 PNG 通常 100~600KB，超限基本意味着高分屏
@@ -347,17 +363,93 @@ def _downscale_png(png_bytes: bytes) -> bytes | None:
         return None
 
 
+def _element_position_label(element, observation) -> str:
+    """按元素 bounds（物理屏幕坐标，矩形四角 left/top/right/bottom）给一个方位描述。
+
+    name 为空的控件（WebView2/Chromium 常见）只靠 bounds 无法判断是什么，
+    方位描述至少能让模型知道「右上角那个按钮」与列表项的对应关系。
+    坐标换算失败或落在画面外时返回空串，不阻断列表输出。
+    """
+    bounds = tuple(element.get("bounds", ()) or ())
+    if len(bounds) != 4:
+        return ""
+    try:
+        # 元素 bounds 是矩形四角 (left, top, right, bottom)——与生产方一致：
+        # windows_elements_uia 直接取 UIA CurrentBoundingRectangle 的四边，
+        # 浏览器侧 JS 取 getBoundingClientRect 的 right/bottom；绘图端
+        # som_annotator 也按同一语义读。故中心是两角均值，不能把 right/bottom
+        # 当宽高写成 left + right/2（那会把中心推到元素右下方，甚至推出画面）。
+        left, top, right, bottom = (float(v) for v in bounds)
+        vw = float(getattr(observation, "width", 0) or 0)
+        vh = float(getattr(observation, "height", 0) or 0)
+        ow = float(getattr(observation, "original_width", 0) or 0)
+        oh = float(getattr(observation, "original_height", 0) or 0)
+        if vw <= 0 or vh <= 0 or ow <= 0 or oh <= 0:
+            return ""
+        # 反算与 screenshot_to_physical 同构：(物理 - 原点) * 模型尺寸 / 原始尺寸。
+        # 原点可为负（副屏在主屏上方/左侧），减法即完成平移，无需额外分支。
+        # 退化矩形（宽或高为 0，right==left / bottom==top）中心即角点，同样安全。
+        mx = (((left + right) / 2.0) - float(getattr(observation, "origin_x", 0) or 0)) * vw / ow
+        my = (((top + bottom) / 2.0) - float(getattr(observation, "origin_y", 0) or 0)) * vh / oh
+    except (TypeError, ValueError):
+        return ""
+    if not (0.0 <= mx <= vw and 0.0 <= my <= vh):
+        return ""
+    col = "左" if mx < vw / 3 else ("右" if mx > vw * 2 / 3 else "中")
+    row = "上" if my < vh / 3 else ("下" if my > vh * 2 / 3 else "中")
+    if col == "中" and row == "中":
+        return "画面中央"
+    if col == "中":
+        return "画面" + row + "部"
+    if row == "中":
+        return "画面" + col + "侧"
+    return "画面" + col + row + "角"
+
+
+def _element_lines(observation) -> list[str]:
+    """控件列表的逐行渲染；带方位描述，未知位置时不加后缀。"""
+    lines = []
+    for element in getattr(observation, "elements", ()) or ():
+        position = _element_position_label(element, observation)
+        suffix = (" 位置=" + position) if position else ""
+        lines.append(
+            f"- {element.get('ref', '')} {element.get('kind', '')} "
+            f"name={element.get('name', '')!r} "
+            f"bounds={tuple(element.get('bounds', ()))} "
+            f"enabled={bool(element.get('enabled', True))}{suffix}"
+        )
+    return lines
+
+
+def _elements_content_blocks(element_lines: list[str]) -> list[dict]:
+    """控件列表的两个文本块（前缀 + 逐行）；无元素时返回空列表。
+
+    显式 observe 的附图路径与两条降级路径（无截图/超限）共用同一形状，
+    保证「能看图但看不了图」时也不会丢掉 el-N 引用。
+    """
+    if not element_lines:
+        return []
+    return [
+        {"type": "text", "text": _OBSERVATION_ELEMENTS_TEXT_PREFIX},
+        {"type": "text", "text": "\n".join(element_lines)},
+    ]
+
+
 def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> dict:
     """观察的 follow-up user 消息（设计 10.2 + 阶段二双路径 + 帧契约）。
 
     四条路径按优先级：
-    1. 有 elements：纯文本控件列表（a11y-first，请求不含截图字节）；
+    1. 有 elements 且不是显式 observe：纯文本控件列表（a11y-first，请求不含
+       截图字节）；
     2. 画面与上一张完全相同（screen_unchanged 且不是显式 observe）：纯文本
        说明，不重复附图；
     3. 本次没有截图（png_path 为空，B 方案降级：窗口被遮挡/最小化导致截图
-       失败）：纯文本观察（无截图说明 + 页面正文），绝不读图；
-    4. 其余：PNG 转 data:image/png;base64，受体积上限约束——超限先缩放，
-       缩放后仍超限则退化为纯文摘略。
+       失败）：纯文本观察（无截图说明 + 页面正文），绝不读图；有 elements 时
+       仍附控件列表（否则模型既没图也没 el-N 引用）；
+    4. 其余：PNG 转 data:image/png;base64；显式 observe 有 elements 时先给
+       控件列表再附图，受体积上限约束——超限先缩放，缩放后仍超限则退化为
+       纯文摘略（带控件列表）。无 elements 时在附图前追加放大局部的定位
+       提示（_OBSERVATION_REGION_HINT），避免模型凭整屏截图目测小控件。
 
     tool result JSON、metadata 与日志绝不携带截图字节。_computer_v1 为私有
     元数据（run_id/ordinal/target，必要时带 image_omitted 原因）。
@@ -368,18 +460,13 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
         "target": observation.target,
     }
     frame_line = _frame_reference_line(observation)
-    if observation.elements:
-        lines = [
-            f"- {e.get('ref', '')} {e.get('kind', '')} name={e.get('name', '')!r} "
-            f"bounds={tuple(e.get('bounds', ()))} enabled={bool(e.get('enabled', True))}"
-            for e in observation.elements
-        ]
+    element_lines = _element_lines(observation)
+    # 显式 observe 例外：模型主动要看画面时必须给图，同时保留控件列表，
+    # 让它「看图认位置、用 el-N 精确点击」，而不是退回目测坐标。
+    if element_lines and getattr(observation, "action", "") != "observe":
         return {
             "role": "user",
-            "content": [
-                {"type": "text", "text": _OBSERVATION_ELEMENTS_TEXT_PREFIX},
-                {"type": "text", "text": "\n".join(lines)},
-            ],
+            "content": _elements_content_blocks(element_lines),
             "_computer_v1": meta,
         }
     # 显式 observe 永远附图：模型主动要看画面时省略图片等于没回答它。
@@ -397,7 +484,7 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
     if not str(getattr(observation, "png_path", "") or ""):
         return {
             "role": "user",
-            "content": [
+            "content": _elements_content_blocks(element_lines) + [
                 {"type": "text", "text": no_screenshot_observation_text(observation)},
                 {"type": "text", "text": frame_line},
             ],
@@ -411,7 +498,7 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
     if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
         return {
             "role": "user",
-            "content": [
+            "content": _elements_content_blocks(element_lines) + [
                 {
                     "type": "text",
                     "text": f"{_OBSERVATION_IMAGE_OMITTED_TEXT}\n"
@@ -421,15 +508,17 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
             "_computer_v1": {**meta, "image_omitted": "too_large"},
         }
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    content = _elements_content_blocks(element_lines)
+    content.append({"type": "text", "text": OBSERVATION_FOLLOWUP_TEXT})
+    # 无控件列表（WebView2/Chromium 的 UIA 树 name 为空或元素过少）时模型只能
+    # 看整屏截图估坐标，32×33 这类小控件必然点偏——此时才追加放大局部的提示。
+    # 有控件列表时不加：模型用 click_element 精确点击即可，加了只白占 token。
+    if not element_lines:
+        content.append({"type": "text", "text": _OBSERVATION_REGION_HINT})
+    content.append({"type": "image_url", "image_url": {"url": data_url}})
     return {
         "role": "user",
-        "content": [
-            {
-                "type": "text",
-                "text": OBSERVATION_FOLLOWUP_TEXT,
-            },
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ],
+        "content": content,
         "_computer_v1": meta,
     }
 

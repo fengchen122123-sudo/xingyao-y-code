@@ -393,7 +393,11 @@ def test_tool_result_then_observation_followup_in_same_commit_order(monkeypatch,
         "run_id": "run-a", "ordinal": 1, "target": "browser",
     }
     assert followup["content"][0]["text"] == "【电脑观察】请只依据这张最新截图决定下一步。"
-    assert followup["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    # 无控件列表时中间会多一个 observe_region 定位提示块，按类型取图更稳
+    image_block = next(
+        block for block in followup["content"] if block.get("type") == "image_url"
+    )
+    assert image_block["image_url"]["url"].startswith("data:image/png;base64,")
     # 第二个请求：tool result 在 follow-up 之前；截图进入多模态消息，
     # _computer_v1 私有元数据绝不发给 Provider
     second_messages = requests[1]["messages"]
