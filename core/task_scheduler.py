@@ -712,9 +712,19 @@ class TaskScheduler:
             return None
         with self._lock:
             item = self._item(item_id)
+            # takeover_queued 的 in_progress 项同样允许恢复：它是「等待主 Agent
+            # 接管」的排队态，旧守卫只看 status 会把它误判为正在执行而永久锁死。
+            queued_in_progress = (
+                item is not None
+                and item.get("status") == "in_progress"
+                and item.get("execution_mode") == "takeover_queued"
+            )
             if (
                 item is None
-                or item.get("status") not in {"failed", "blocked", "cancelled", "pending"}
+                or (
+                    item.get("status") not in {"failed", "blocked", "cancelled", "pending"}
+                    and not queued_in_progress
+                )
                 or not bool(item.get("takeover_required", False))
                 or self._active_takeover_locked() is not None
             ):
