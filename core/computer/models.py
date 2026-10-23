@@ -158,6 +158,13 @@ class ComputerObservation:
     window_title: str = ""
     page_origin: str = ""
     page_title: str = ""
+    # B 方案（窗口被遮挡时的降级观察）：页面正文摘要（只含可见文本，已按码点
+    # 截断）。窗口最小化/被遮挡时 WebView2 渲染被节流，截图可能卡住或失败，
+    # 此时模型仍能凭正文判断页面内容。repr=False：正文属于页面内容，绝不进日志。
+    page_text: str = field(default="", repr=False)
+    # 本次未取到截图的原因（空串表示截图正常）：只含异常类名的简短中文说明，
+    # 绝不含堆栈或页面 URL，用于告知模型"这次没有图"而不是让它以为页面空白。
+    screenshot_error: str = ""
     error_code: str = ""
     error_message: str = ""
     before_fingerprint: str = ""

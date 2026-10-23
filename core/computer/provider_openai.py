@@ -591,7 +591,21 @@ def build_computer_call_output(call, observation) -> dict:
     Computer use 请求 schema 未定义 acknowledged_safety_checks 契约前绝不
     产出——pending safety 时 execute_native_computer_call 已先行返回
     provider_safety_required，本函数只服务已执行成功的批次）。
+
+    B 方案降级：浏览器窗口被遮挡/最小化时渲染被节流，本次观察可能没有截图
+    （png_path 为空）。此时不调 _read_png_bytes（空路径必抛错、整批动作的
+    结果全丢），改发纯文本观察（无截图说明 + 页面正文）。
     """
+    if not str(getattr(observation, "png_path", "") or ""):
+        from core.computer.provider_generic import no_screenshot_observation_text
+
+        return {
+            "type": "computer_call_output",
+            "call_id": call.call_id,
+            "output": [
+                {"type": "input_text", "text": no_screenshot_observation_text(observation)}
+            ],
+        }
     png_bytes = _read_png_bytes(observation)
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
     return {

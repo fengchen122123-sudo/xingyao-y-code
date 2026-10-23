@@ -266,6 +266,37 @@ _OBSERVATION_IMAGE_OMITTED_TEXT = (
     "请依据 screen_sha256 与画面尺寸判断，必要时缩小窗口比例后重新 observe。"
 )
 
+# B 方案（窗口被遮挡时的降级观察）：本次没有截图的说明。窗口最小化/被遮挡时
+# WebView2 渲染被节流，截图会卡住或失败；必须显式告诉模型"这次没图"，否则它
+# 会把缺图当成页面空白，或者反复 observe 期待出现图片。
+_OBSERVATION_NO_SCREENSHOT_TEXT = (
+    "【电脑观察】本次没有截图（浏览器窗口不可见或被遮挡时渲染会被节流，"
+    "截图可能卡住或失败）。请只依据下面的文本信息判断下一步，"
+    "不要假设画面为空；需要图片时先让窗口重新可见（切回窗口或取消最小化）再 observe。"
+)
+
+# 无截图时附在文本观察里的页面正文章节标题（正文长度已由 backend 按码点截断）。
+_OBSERVATION_PAGE_TEXT_HEADING = "【页面正文】"
+
+
+def no_screenshot_observation_text(observation) -> str:
+    """无截图时的纯文本观察正文（B 方案降级；generic 与原生协议共用）。
+
+    为什么需要：截图缺失时观察只剩 DOM 信息（元素列表 / 页面正文），模型必须
+    同时知道"没有图"和"为什么没有图"，才能决定是继续按文本操作还是先恢复窗口。
+    正文长度已由 backend 截断，这里不再二次截断（再截短只会丢信息）。
+    """
+    lines = [_OBSERVATION_NO_SCREENSHOT_TEXT]
+    reason = str(getattr(observation, "screenshot_error", "") or "")
+    if reason:
+        lines.append(reason)
+    page_text = str(getattr(observation, "page_text", "") or "")
+    if page_text:
+        lines.append(f"{_OBSERVATION_PAGE_TEXT_HEADING}\n{page_text}")
+    else:
+        lines.append("【页面正文】本次也未能读到可见文本。")
+    return "\n".join(lines)
+
 
 def _frame_reference_line(observation, *, size_bytes: int = 0) -> str:
     """成对引用行（帧契约）：模型据此引用「同一帧」，而不是反复请求新图。
@@ -319,11 +350,13 @@ def _downscale_png(png_bytes: bytes) -> bytes | None:
 def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> dict:
     """观察的 follow-up user 消息（设计 10.2 + 阶段二双路径 + 帧契约）。
 
-    三条路径按优先级：
+    四条路径按优先级：
     1. 有 elements：纯文本控件列表（a11y-first，请求不含截图字节）；
     2. 画面与上一张完全相同（screen_unchanged 且不是显式 observe）：纯文本
        说明，不重复附图；
-    3. 其余：PNG 转 data:image/png;base64，受体积上限约束——超限先缩放，
+    3. 本次没有截图（png_path 为空，B 方案降级：窗口被遮挡/最小化导致截图
+       失败）：纯文本观察（无截图说明 + 页面正文），绝不读图；
+    4. 其余：PNG 转 data:image/png;base64，受体积上限约束——超限先缩放，
        缩放后仍超限则退化为纯文摘略。
 
     tool result JSON、metadata 与日志绝不携带截图字节。_computer_v1 为私有
@@ -357,6 +390,18 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
                 {"type": "text", "text": f"{_OBSERVATION_UNCHANGED_TEXT}\n{frame_line}"}
             ],
             "_computer_v1": {**meta, "image_omitted": "unchanged"},
+        }
+    # B 方案降级：png_path 为空说明本次没有截图，绝不能走 _read_observation_png
+    # （空路径会抛 computer_backend_error，整条观察链就白降级了）。改为纯文本
+    # 观察：说明"本次没有截图"的原因，并附上后端截断好的页面正文。
+    if not str(getattr(observation, "png_path", "") or ""):
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": no_screenshot_observation_text(observation)},
+                {"type": "text", "text": frame_line},
+            ],
+            "_computer_v1": {**meta, "image_omitted": "no_screenshot"},
         }
     png_bytes = _read_observation_png(observation.png_path)
     if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:

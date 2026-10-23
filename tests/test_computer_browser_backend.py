@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from core.computer.actions import observation_provider_projection, parse_computer_action
-from core.computer.browser_backend import BrowserComputerBackend
+from core.computer.browser_backend import BrowserComputerBackend, _SCREENSHOT_TIMEOUT_MS
 from core.computer.models import ComputerAction, ComputerControlError
 from tests.computer_fakes import FakePage, FakePlaywrightRuntime, fake_png_bytes
 
@@ -323,7 +323,10 @@ def test_observe_returns_png_sha256_and_fixed_viewport(backend):
     assert observation.run_id == "run-a"
     assert observation.ok is True
     assert Path(observation.png_path).read_bytes() == png
-    assert backend.active_page.screenshot_calls == [{"type": "png"}]
+    # B 方案：截图显式带短超时（默认 30s 在窗口被遮挡时会把命令预算耗尽）。
+    assert backend.active_page.screenshot_calls == [
+        {"type": "png", "timeout": _SCREENSHOT_TIMEOUT_MS}
+    ]
 
 
 def test_provider_projection_only_sees_origin_and_truncated_title(backend):
@@ -339,15 +342,66 @@ def test_provider_projection_only_sees_origin_and_truncated_title(backend):
     assert "frag" not in repr(projection)
 
 
-def test_screenshot_failure_raises_and_never_reuses_old_png(backend):
+def test_screenshot_failure_degrades_to_dom_observation(backend):
+    """B 方案：截图失败不再让观察报错，降级为纯 DOM 观察且绝不复用旧截图。
+
+    为什么改：窗口被遮挡/最小化时 WebView2 渲染被节流，截图卡住或失败属于
+    预期环境状态；旧行为（抛 computer_action_failed）会让整条观察链失败。
+    新契约：观察成功返回、png_path/screen_sha256 为空、screenshot_error 给出
+    简短中文原因（带异常类名、不带堆栈与页面 URL）。
+    """
     page = backend.active_page
+    page.page_text = "示例页面正文"
     page.screenshot_error = RuntimeError("gpu gone")
-    with pytest.raises(ComputerControlError) as raised:
-        backend.observe("run-a")
-    assert raised.value.code == "computer_action_failed"
+    observation = backend.observe("run-a")
+    assert observation.ok is True
+    assert observation.png_path == ""
+    assert observation.screen_sha256 == ""
+    assert observation.page_text == "示例页面正文"
+    assert "RuntimeError" in observation.screenshot_error
+    assert "gpu gone" not in observation.screenshot_error  # 只留异常类名，不带原始文案/堆栈
+    assert "http" not in observation.screenshot_error  # 绝不带页面 URL
+    # 恢复截图后：观察回到原语义（新截图、新 sha、无降级说明）。
     page.screenshot_error = None
     observation = backend.observe("run-a")
+    assert observation.screenshot_error == ""
     assert observation.screen_sha256 == hashlib.sha256(fake_png_bytes(6)).hexdigest()
+    assert Path(observation.png_path).read_bytes() == fake_png_bytes(6)
+
+
+def test_page_text_failure_does_not_break_observe(backend):
+    """正文提取失败只丢正文：观察仍然成功（缺正文比观察失败轻）。"""
+    page = backend.active_page
+    page.page_text_error = RuntimeError("evaluate timeout")
+    observation = backend.observe("run-a")
+    assert observation.ok is True
+    assert observation.page_text == ""
+    assert observation.screenshot_error == ""
+    assert Path(observation.png_path).read_bytes() == fake_png_bytes(6)
+
+
+def test_surface_change_during_degraded_observation_is_still_discarded(backend):
+    """降级不放松页面身份复核：截图失败时切换页面，本次观察仍必须作废。
+
+    为什么重要：降级路径让"没有图"变成合法结果，但绝不能顺带让"旧页文本
+    冒充新页观察"变合法——computer_surface_changed 的裁决与是否有图无关。
+    """
+    page = backend.active_page
+    other = backend._context.new_page()
+    other.visibility_state = "hidden"
+    other.focused = False
+
+    def switch_then_fail(**kwargs):
+        page.visibility_state = "hidden"
+        page.focused = False
+        other.visibility_state = "visible"
+        other.focused = True
+        raise RuntimeError("frame not produced while occluded")
+
+    page.screenshot = switch_then_fail
+    with pytest.raises(ComputerControlError) as raised:
+        backend.observe("run-a")
+    assert raised.value.code == "computer_surface_changed"
 
 
 # ---------------- 动作映射与坐标边界 ----------------
