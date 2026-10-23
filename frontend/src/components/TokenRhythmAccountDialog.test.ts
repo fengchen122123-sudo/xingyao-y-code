@@ -152,6 +152,26 @@ it('个人信息视图：昵称、手机号打码、原始手机号与状态中�
   expect(w!.get('[data-test="trd-field-status"]').text()).toBe('正常');
 });
 
+it('两个视图的「去官网查看」按钮各自打开对应官网页并关闭弹窗', async () => {
+  installBridge();
+  const { store, wrapper: w } = setup();
+
+  // 用量明细 → 官方控制台首页
+  await openDialog(store, 'usage');
+  await w!.get('[data-test="trd-site-usage"]').trigger('click');
+  await flushPromises();
+  expect(store.browserNavRequest).toEqual({ url: 'https://tokenrhythm.studio/account', path: '' });
+  // 遮罩会挡住右栏，所以点完必须收起弹窗
+  expect(store.trDialog.show).toBe(false);
+
+  // 个人信息 → 官方个人中心
+  await openDialog(store, 'profile');
+  await w!.get('[data-test="trd-site-profile"]').trigger('click');
+  await flushPromises();
+  expect(store.browserNavRequest).toEqual({ url: 'https://tokenrhythm.studio/account/profile', path: '' });
+  expect(store.trDialog.show).toBe(false);
+});
+
 it('按 Esc 关闭弹窗', async () => {
   installBridge();
   const { store } = setup();

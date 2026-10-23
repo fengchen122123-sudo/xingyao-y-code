@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://tokenrhythm.studio"
 API_BASE_URL = BASE_URL + "/v1"
 DEFAULT_PROVIDER_NAME = "基元律动"
+# 登录自动创建的厂商会在 provider 记录里打上这个标记：退出登录 / 换账号时只清理
+# 带标记（或命中本地绑定）的条目。用户自己填 Key 配置的同域厂商没有标记，
+# 任何情况下都不会被改名或删除。
+MANAGED_PROVIDER_FLAG = "managed_by"
+MANAGED_PROVIDER_VALUE = "tokenrhythm"
 DEFAULT_MODEL_NAME = "deepseek-v4.1-flash"
 DEFAULT_CONTEXT_WINDOW = 128000
 API_KEY_NAME = "星瑶Code"
@@ -353,10 +358,12 @@ def _request(
     body: dict | None = None,
     *,
     allow_empty_data: bool = False,
+    timeout: float | None = None,
 ) -> dict:
     """调用 /api/*，成功返回完整 envelope，失败抛 TokenRhythmAuthError。
 
     allow_empty_data：允许 `data` 为 null 也算成功（删除类接口可能返回空 data）。
+    timeout：单次请求超时（秒），缺省用 _REQUEST_TIMEOUT。
     """
     url = BASE_URL + path
     try:
@@ -365,7 +372,7 @@ def _request(
             url,
             json=body,
             headers=_headers_for(method),
-            timeout=_REQUEST_TIMEOUT,
+            timeout=timeout if timeout is not None else _REQUEST_TIMEOUT,
         )
     except httpx.HTTPError as error:
         raise TokenRhythmAuthError(
@@ -846,6 +853,23 @@ _TEMPORARY_CREDITS_PATH = (
     "/api/wallet/expiring-credits"
     "?page=1&pageSize=50&includeInactive=false&includePermanent=false"
 )
+# 临时额度接口单独放宽超时：服务端要汇总全部历史额度，冷启动实测 10~30 秒
+# （热态 0.3 秒），20 秒的通用超时一抖动就撞线，直接把这栏判成"获取失败"。
+_TEMPORARY_CREDITS_TIMEOUT = 45.0
+# 服务端冷启动汇总超时时回的错误码：属于"等一下再试就好"，可以重试。
+_RETRYABLE_CREDITS_CODES = frozenset({"INTERNAL_ERROR", "TIMEOUT", "SERVICE_UNAVAILABLE"})
+
+
+def _is_retryable_credits_error(error: TokenRhythmAuthError) -> bool:
+    """临时额度请求是否值得重试：只认传输层失败、5xx 与服务端内部错误码。
+
+    鉴权 / 参数类业务错误（HTTP 4xx、code 非内部错误）重试只会白等，直接降级。
+    """
+    if error.status is None and error.code is None:
+        return True  # 超时 / 连接中断
+    if error.status is not None and error.status >= 500:
+        return True
+    return str(error.code or "").strip().upper() in _RETRYABLE_CREDITS_CODES
 
 
 def _amount_text(value: Any) -> str:
@@ -987,7 +1011,19 @@ def _fetch_temporary_credits() -> dict:
     额度，这里再按 remainingCny > 0 且 expiresAt 存在、未过期（UTC 比较）双重过滤；
     解析失败一律当作不计入。求和用 Decimal 保留原始精度，不做两位小数四舍五入。
     """
-    payload = _request("GET", _TEMPORARY_CREDITS_PATH)
+    try:
+        payload = _request("GET", _TEMPORARY_CREDITS_PATH)
+    except TokenRhythmAuthError as error:
+        # 只重试"临时性"失败：该接口冷启动要现算全量汇总，实测首次请求会在
+        # 13~30 秒后超时或直接回 INTERNAL_ERROR，紧接着的第二次只需 0.3~5 秒
+        # 就能命中结果（服务端已算完并缓存）。HTTP 4xx / 鉴权类错误重试没有意义，
+        # 直接抛给上层走降级。
+        if not _is_retryable_credits_error(error):
+            raise
+        logger.warning("临时额度请求失败，重试一次：%s", error)
+        payload = _request(
+            "GET", _TEMPORARY_CREDITS_PATH, timeout=_TEMPORARY_CREDITS_TIMEOUT
+        )
     items = _credit_items(payload)
     # 服务端在 data.summary 里直接给了汇总（官方控制台用的就是它）：
     # expiringBalanceCny 到期中余额、nextExpiryAt 最近到期时间。优先采用，列表求和只作兜底。
@@ -1521,7 +1557,11 @@ def _clear_binding() -> None:
 def _remember_binding(
     account: dict, provider_id: str, key_id: str = "", bound_at: int = 0
 ) -> None:
-    """记录最新绑定：账号 id / 昵称 + 厂商 id + Key id。"""
+    """记录最新绑定：账号 id / 昵称 + 厂商 id + Key id。
+
+    顺手给这条厂商打上托管标记：新建 / 覆盖 / 复用都会走到这里，标记只写这一处，
+    之后退出登录、换账号清理时就能精确区分"自己创建的"与"用户手动配置的"。
+    """
     _save_binding(
         {
             "account_id": account.get("id"),
@@ -1531,6 +1571,7 @@ def _remember_binding(
             "bound_at": bound_at or int(time.time()),
         }
     )
+    _mark_provider_managed(provider_id)
 
 
 def _current_account() -> dict:
@@ -1564,9 +1605,13 @@ def _current_account() -> dict:
 
 
 def _bound_provider_name(account_name: str) -> str:
-    """厂商名称带上账号昵称，多账号时用户一眼能分清；昵称为空则用默认名。"""
-    nickname = str(account_name or "").strip()
-    return f"{DEFAULT_PROVIDER_NAME}（{nickname}）" if nickname else DEFAULT_PROVIDER_NAME
+    """厂商名称带上账号昵称，与用户手动配置的「基元律动」区分开。
+
+    昵称取不到时回落到「基元律动（账号）」而不是裸「基元律动」：后者正是用户
+    自己手填 Key 时最常用的名字，重名会让两条配置在模型列表里无法分辨。
+    """
+    nickname = str(account_name or "").strip() or "账号"
+    return f"{DEFAULT_PROVIDER_NAME}（{nickname}）"
 
 
 def _rename_provider(provider: dict, provider_name: str) -> None:
@@ -1698,17 +1743,68 @@ def _reuse_bound_key(account: dict, binding: dict, provider_name: str) -> dict |
     )
 
 
-def _delete_tr_providers(keep_id: str = "") -> int:
-    """删除本地所有基元律动厂商配置（keep_id 指定的那条保留），返回删除数量。
+def _mark_provider_managed(provider_id: str) -> None:
+    """给自动创建/绑定的厂商打托管标记（幂等）。
 
-    产品上模型配置里只允许存在一条「基元律动（账号）」：退出登录要清掉，
-    换账号/重新绑定时也要先清掉旧的，避免列表里堆出多个基元律动条目。
+    标记是"这条是本程序建的"的持久化凭据：即使本地绑定文件丢了，也能识别出来，
+    不会和用户手动配置的条目混为一谈。打标记失败不影响绑定主流程。
+    """
+    target = str(provider_id or "").strip()
+    if not target:
+        return
+    try:
+        from core.model_manager import load_config
+
+        provider = next(
+            (
+                item
+                for item in load_config().get("providers", []) or []
+                if str(item.get("id") or "").strip() == target
+            ),
+            None,
+        )
+        # 厂商不存在或已有标记都不写盘：复用登录每次都走这里，别白白重写配置
+        if provider is None:
+            return
+        if str(provider.get(MANAGED_PROVIDER_FLAG) or "").strip() == MANAGED_PROVIDER_VALUE:
+            return
+
+        import config as app_config
+
+        def _mutate(data: dict) -> None:
+            for item in data.get("providers", []) or []:
+                if str(item.get("id") or "").strip() != target:
+                    continue
+                item[MANAGED_PROVIDER_FLAG] = MANAGED_PROVIDER_VALUE
+                return
+
+        app_config.update_config(_mutate)
+    except Exception:  # noqa: BLE001 - 标记失败不能影响登录绑定
+        logger.warning("基元律动厂商托管标记写入失败（id=%s）", target, exc_info=True)
+
+
+def _is_managed_provider(provider: dict, bound_ids: set[str]) -> bool:
+    """这条厂商是否由本程序创建：带托管标记，或正是本地绑定记录里的那条。"""
+    if str(provider.get(MANAGED_PROVIDER_FLAG) or "").strip() == MANAGED_PROVIDER_VALUE:
+        return True
+    provider_id = str(provider.get("id") or "").strip()
+    return bool(provider_id) and provider_id in bound_ids
+
+
+def _delete_tr_providers(keep_id: str = "") -> int:
+    """删除本程序自动创建/托管的基元律动厂商（keep_id 那条保留），返回删除数量。
+
+    只认两种身份：provider 上的托管标记，或本地绑定信息记录的 provider_id。
+    用户自己填 Key 配置的同域厂商两个都不满足——退出登录、换账号都不会动它，
+    名字里带「基元律动」也一样（用户手动配置的条目必须原样保留）。
     """
     removed = 0
     try:
         from core import model_manager
         from core.model_manager import load_config
 
+        bound_provider_id = str((_load_binding() or {}).get("provider_id") or "").strip()
+        bound_ids = {bound_provider_id} if bound_provider_id else set()
         providers = load_config().get("providers", []) or []
         for provider in providers:
             if not isinstance(provider, dict):
@@ -1717,6 +1813,8 @@ def _delete_tr_providers(keep_id: str = "") -> int:
                 continue
             provider_id = str(provider.get("id") or "").strip()
             if not provider_id or (keep_id and provider_id == keep_id):
+                continue
+            if not _is_managed_provider(provider, bound_ids):
                 continue
             try:
                 model_manager.delete_provider(provider_id)
@@ -1995,6 +2093,8 @@ def _resolve_sync_provider(provider_id: str | None) -> tuple[str, str]:
                 name = str(provider.get("name") or "").strip() or DEFAULT_PROVIDER_NAME
                 return bound_id, name
 
+    # 兜底：优先挑本程序托管的厂商，别把模型塞进用户手动配置的那条里
+    fallback: tuple[str, str] | None = None
     for provider in providers:
         if not _is_tokenrhythm_provider(provider):
             continue
@@ -2002,7 +2102,12 @@ def _resolve_sync_provider(provider_id: str | None) -> tuple[str, str]:
         if not candidate_id:
             continue
         name = str(provider.get("name") or "").strip() or DEFAULT_PROVIDER_NAME
-        return candidate_id, name
+        if str(provider.get(MANAGED_PROVIDER_FLAG) or "").strip() == MANAGED_PROVIDER_VALUE:
+            return candidate_id, name
+        if fallback is None:
+            fallback = (candidate_id, name)
+    if fallback is not None:
+        return fallback
     raise TokenRhythmAuthError("未找到基元律动厂商配置，请先登录")
 
 

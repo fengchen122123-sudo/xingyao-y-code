@@ -152,6 +152,23 @@ it('未登录（后端 ok=false）展示后端原因与重试按钮，重试成�
   expect(w!.get('[data-test="tr-acc-balance"]').text()).toBe('¥298.10');
 });
 
+it('头部「官网」按钮在右侧内嵌浏览器打开官方账户页，并收起浮层', async () => {
+  const api = installBridge();
+  const { store, wrapper: w } = setup();
+  await openPanel(store);
+
+  await w!.get('[data-test="tr-acc-site"]').trigger('click');
+  await flushPromises();
+
+  // 与「充值」同一套打开逻辑：右栏内嵌浏览器收到导航请求，目标就是官方账户页
+  expect(store.browserNavRequest).toEqual({ url: 'https://tokenrhythm.studio/account/account', path: '' });
+  // 内嵌浏览器可用时不拉起系统浏览器，也不打开账号中心原生弹窗
+  expect(api.open_external_url).not.toHaveBeenCalled();
+  expect(store.trDialog.show).toBe(false);
+  // 浮层收起，避免压住刚摊开的右栏
+  expect(store.trAccountPanel.show).toBe(false);
+});
+
 it('充值在右侧内嵌浏览器打开官方充值页，不弹原生弹窗', async () => {
   const api = installBridge();
   const { store, wrapper: w } = setup();
