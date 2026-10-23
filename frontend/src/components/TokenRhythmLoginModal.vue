@@ -283,13 +283,16 @@ const CAPTCHA_REGION = 'cn';
 const CAPTCHA_ELEMENT = '#tr-aliyun-captcha';
 const CAPTCHA_BUTTON = '#tr-send-code-btn';
 
+/** 邀请码默认预填值：仅是表单初始值，用户可自行修改或清空，不在登录逻辑里做任何强制 */
+const DEFAULT_INVITE_CODE = 'rf_tr_WXK47U';
+
 const tab = ref<LoginTab>('sms');
 
 // 短信登录
 const phone = ref('');
 const code = ref('');
-/** 邀请码选填：填了随登录请求上送，空串由后端归一成 None（不上送 inviteCode） */
-const inviteCode = ref('');
+/** 邀请码选填：默认预填推荐邀请码，用户可修改或清空；空串由后端归一成 None（不上送 inviteCode） */
+const inviteCode = ref(DEFAULT_INVITE_CODE);
 const maskedTip = ref('');
 const countdown = ref(0);
 const sendingCode = ref(false);
@@ -383,7 +386,7 @@ function resetForm() {
   tab.value = 'sms';
   phone.value = '';
   code.value = '';
-  inviteCode.value = '';
+  inviteCode.value = DEFAULT_INVITE_CODE;
   agreed.value = false;
   showDisclaimer.value = false;
   maskedTip.value = '';

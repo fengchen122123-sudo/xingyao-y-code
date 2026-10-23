@@ -183,7 +183,7 @@ it('短信登录成功时调用桥接并展示自动创建 API Key 的成功文�
 
   await submitSms(w);
 
-  expect(api.tr_auth_sms_login).toHaveBeenCalledWith('13800138000', '123456', '');
+  expect(api.tr_auth_sms_login).toHaveBeenCalledWith('13800138000', '123456', 'rf_tr_WXK47U');
   expect(w.get('[data-test="tr-login-success"]').text()).toContain('自动创建并绑定 API Key');
   expect(store.trAuth.status).toBe('loggedIn');
 });
@@ -385,13 +385,27 @@ it('填写邀请码时，作为第三个参数透传给短信登录桥接', asyn
   expect(w.get('[data-test="tr-login-success"]').text()).toContain('自动创建并绑定 API Key');
 });
 
-it('不填邀请码时，第三个参数为空串（后端据此归一成 None）', async () => {
+it('默认预填推荐邀请码，不改动直接提交时随登录上送', async () => {
   const api = installBridge({
     tr_auth_status: vi.fn(async () => ({ ok: true, logged_in: true, user: { name: '阿晨' }, configured: true })),
   });
   const { wrapper: w } = openModal();
 
-  expect((w.get('[data-test="tr-invite-input"]').element as HTMLInputElement).value).toBe('');
+  expect((w.get('[data-test="tr-invite-input"]').element as HTMLInputElement).value).toBe('rf_tr_WXK47U');
+
+  await submitSms(w);
+
+  expect(api.tr_auth_sms_login).toHaveBeenCalledTimes(1);
+  expect(api.tr_auth_sms_login).toHaveBeenCalledWith('13800138000', '123456', 'rf_tr_WXK47U');
+});
+
+it('清空默认邀请码后提交，第三个参数为空串（后端据此归一成 None）', async () => {
+  const api = installBridge({
+    tr_auth_status: vi.fn(async () => ({ ok: true, logged_in: true, user: { name: '阿晨' }, configured: true })),
+  });
+  const { wrapper: w } = openModal();
+
+  await w.get('[data-test="tr-invite-input"]').setValue('');
 
   await submitSms(w);
 
