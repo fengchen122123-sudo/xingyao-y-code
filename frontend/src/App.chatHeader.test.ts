@@ -42,6 +42,19 @@ it('对话标题栏不再渲染「清空」按钮，导出入口保留', () => {
   wrapper.unmount();
 });
 
+it('对话标题栏按钮文字收进 .chip-label，窄栏由容器查询换成纯图标', () => {
+  const store = useAppStore();
+  store.initialized = true;
+  const wrapper = mount(App, { global: { stubs } });
+
+  const exportBtn = wrapper.get('#chat-header .export-wrap .chip-btn');
+  // 文字必须在 .chip-label 内，@container(chat-header) 才能整块隐去收成图标
+  expect(exportBtn.get('.chip-label').text()).toBe('导出');
+  // 图标档没有文字，语义靠 title 兜底，所以 title 不能缺
+  expect(exportBtn.attributes('title')).toBe('导出会话');
+  wrapper.unmount();
+});
+
 it('对话标题栏渲染 Git 分支 chip，点击展开 Git 面板', async () => {
   const store = useAppStore();
   store.initialized = true;
