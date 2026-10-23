@@ -87,6 +87,7 @@ SVG 采用固定逻辑坐标系，例如 `viewBox="0 0 1440 900"`，配合 `pres
 - `lastTimestamp`：上一有效 rAF 时间戳，暂停、后台和恢复时清空；
 - `userPaused`：用户是否明确暂停；
 - `reducedMotion`：系统是否要求减少动态效果；
+- `motionPreferencePaused`：系统减少动态效果偏好触发的独立锁存暂停状态；初始命中或运行中切换到 `reduce` 时置为 `true`，只能由用户明确继续清除，不随偏好切回 `no-preference` 自动清除；
 - `frameId`：当前唯一待执行 rAF 的标识，无待执行帧时为空。
 
 所有旋转、起伏和视差均从 `distance` 及其派生相位计算。禁止用 `Date.now()`、独立 CSS 动画或另一个计时器推动部分部件。
@@ -134,7 +135,7 @@ rightPedal = B + r * (cos(crankAngle),     sin(crankAngle))
 leftPedal  = B + r * (cos(crankAngle + π), sin(crankAngle + π))
 ```
 
-脚踏节点只更新平移 `transform`，保持踏板接近水平，不继承曲柄组的旋转。左右脚分别绑定左右脚踏，脚底参考点与踏板参考点重合。
+脚踏节点只更新平移 `transform`，保持踏板水平，不继承曲柄组的旋转。左右脚分别绑定左右脚踏，脚底参考点与踏板参考点重合。
 
 双腿采用固定腿长、两节骨骼的平面逆运动学。以当前髋点为起点、对应脚踏为终点，使用大腿长 `L1` 和小腿长 `L2` 求膝点；膝部始终选择向前弯曲的同一分支，避免跨帧翻面。几何参数必须保证整个曲柄周期内，髋到踏板的距离位于 `[abs(L1-L2) + ε, L1+L2 - ε]` 的可达范围；求解时仍进行同样的数值钳制以防止浮点越界，但正常运行不得依靠钳制改变脚踏位置或实际腿长。大腿和小腿均使用固定长度的局部 SVG 节点，通过各自的 `translate(...) rotate(...)` 连接关节，不在每帧重写路径数据。
 
@@ -162,9 +163,9 @@ layerTransform = translate(-offset, 0)
 ### 6.1 暂停与继续
 
 - 暂停时记录 `userPaused = true`，取消唯一待执行 rAF，清空 `lastTimestamp`，保留 `distance` 与所有当前 `transform`；
-- 继续时清空时间基准并只请求一个 rAF，首个回调不推进路程，从第二个有效间隔继续；
+- 继续仅在 `reducedMotion = false` 时可用；用户主动点击“继续动画”后同时清除 `userPaused` 与 `motionPreferencePaused`，清空时间基准并只请求一个 rAF，首个回调不推进路程，从第二个有效间隔继续；
 - 重复点击、可见性事件与恢复事件不得产生并行 rAF；调度前先检查 `frameId`；
-- 按钮使用原生 `<button>`，可见文字与无障碍名称在“暂停动画”和“继续动画”之间同步更新。
+- 按钮使用原生 `<button>`；当 `userPaused` 或 `motionPreferencePaused` 为 `true` 时，可见文字与无障碍名称均为“继续动画”，否则均为“暂停动画”；`reducedMotion = true` 时按钮禁用并说明原因。
 
 ### 6.2 速度滑块
 
@@ -174,9 +175,9 @@ layerTransform = translate(-offset, 0)
 
 ### 6.3 后台与页面恢复
 
-- `document.hidden` 变为 `true` 时取消待执行 rAF、清空 `lastTimestamp`，保留用户暂停状态和累计路程；
-- 页面重新可见时，仅在用户未暂停且未启用减少动态效果的情况下重新调度，首帧只建立新时间基准；
-- `pagehide` 采用同样停止策略，`pageshow`（包括前进后退缓存恢复）清空旧时间戳并按当前状态重新调度；
+- `document.hidden` 变为 `true` 时取消待执行 rAF、清空 `lastTimestamp`，保留 `userPaused`、`motionPreferencePaused` 和累计路程；
+- 页面重新可见时，仅在 `!userPaused && !reducedMotion && !motionPreferencePaused` 时重新调度，首帧只建立新时间基准；`visibilitychange` 不得清除或绕过 `motionPreferencePaused`；
+- `pagehide` 采用同样停止策略，`pageshow`（包括前进后退缓存恢复）清空旧时间戳并按上述同一条件重新调度，不得清除或绕过 `motionPreferencePaused`；
 - 后台停留时长不折算成路程，恢复时不能突然追赶动画。
 
 ## 7. 响应式、无障碍与减少动态效果
@@ -199,9 +200,9 @@ SVG 提供“明亮海岸边，一只鹈鹕骑着自行车”的标题及更完�
 
 同时通过 CSS 媒体查询和 JavaScript `matchMedia('(prefers-reduced-motion: reduce)')` 响应系统偏好：
 
-- 初次加载命中 `reduce` 时，只显示完整静态画面，不启动 rAF，动画控件禁用并说明原因；
-- 播放过程中系统切换为 `reduce` 时，立即在当前姿态停止，保留累计路程，不闪回初始帧；
-- 系统切回 `no-preference` 后恢复控件可用性，但不自动播放，由用户明确选择继续；
+- 初次加载命中 `reduce` 时，设置 `reducedMotion = true` 与 `motionPreferencePaused = true`，只显示完整静态画面，不启动 rAF，动画控件禁用并说明原因；
+- 系统切换为 `reduce` 时，设置 `reducedMotion = true` 与 `motionPreferencePaused = true`，不改写 `userPaused`；立即取消待执行 rAF、清空 `lastTimestamp` 并在当前姿态停止，保留累计路程，不闪回初始帧；
+- 系统切回 `no-preference` 后，仅设置 `reducedMotion = false` 并恢复控件可用性，保留 `motionPreferencePaused = true`，不自动播放；按钮显示“继续动画”，只有用户主动继续才按 6.1 节清除锁存并恢复调度；
 - CSS 同时关闭非必要的界面过渡，不用平滑滚动或闪烁提示替代动画。
 
 ## 8. 性能约束与异常降级
@@ -249,13 +250,13 @@ SVG 提供“明亮海岸边，一只鹈鹕骑着自行车”的标题及更完�
 使用本机实际安装的 Chrome 或 Edge，通过 `file://` 直接打开最终文件，记录版本，并检查：
 
 1. 首屏完整显示明亮海岸、鹈鹕和自行车，控制台无错误，无外部网络请求；
-2. 车轮、曲柄和左右脚踏方向一致，双脚不离开踏板，膝盖不翻面，身体与头部动作稳定；
+2. 车轮与曲柄按既定传动关系旋转；左右脚踏中心随曲柄同向绕中轴运动、相位差为 `π`，踏板自身只平移并保持水平；双脚不离开踏板，膝盖不翻面，身体与头部动作稳定；
 3. 暂停至少三秒时所有场景 transform 保持不变，继续后从原姿态平滑恢复；
 4. 播放中拖动速度滑块，位置、车轮角和各图层相位不跳变，仅后续速度改变；
 5. 标签页在后台停留后再恢复，无追帧、瞬移或并行加速；
 6. 云、海浪、护栏、道路标线和近景经历多次取模后均无明显接缝、空档或跳变；
 7. 在约 `360px`、`768px` 和 `1440px` 宽度下，主体不裁切、控件不重叠、页面无横向滚动；
-8. 模拟 `prefers-reduced-motion: reduce` 时初始静止，运行中切换立即冻结，切回后不自动播放；
+8. 模拟 `prefers-reduced-motion: reduce` 时初始静止，运行中切换立即冻结并锁存；切回 `no-preference` 后不自动播放，按钮显示“继续动画”，仅在用户主动继续后恢复；`visibilitychange` 与 `pageshow` 均不得绕过锁存；
 9. 禁用 JavaScript 后仍有完整静态 SVG，控件不会呈现为可操作状态；
 10. 连续播放并反复操作控件后，DOM 节点数保持稳定，帧回调中没有节点重建或持续布局读取。
 
