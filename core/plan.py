@@ -1001,7 +1001,16 @@ def plan_resume_takeover(
         and str(item.get("takeover_turn_id", "")) == turn_id
     ):
         return f"计划项 '{item_key}' 已由当前主 Agent 回合接管，无需重复恢复。"
-    if item.get("status") not in {"failed", "blocked", "cancelled", "pending"}:
+    # 排队等待接管的 in_progress 项必须允许恢复：它的 status 仍是 in_progress，
+    # 但 execution_mode=takeover_queued，属于「等主 Agent 接手」而不是「正在执行」。
+    queued_in_progress = (
+        item.get("status") == "in_progress"
+        and item.get("execution_mode") == "takeover_queued"
+    )
+    if (
+        item.get("status") not in {"failed", "blocked", "cancelled", "pending"}
+        and not queued_in_progress
+    ):
         return (
             f"🚨 计划项 '{item_key}' 当前状态为 {item.get('status')}，"
             "不允许恢复接管。"
