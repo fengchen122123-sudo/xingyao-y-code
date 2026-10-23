@@ -55,7 +55,11 @@ def test_explicit_observe_always_sends_image(tmp_path):
         observation, run_id="run-1", ordinal=3
     )
 
-    assert [block["type"] for block in message["content"]] == ["text", "image_url"]
+    # 无控件列表时附图前会追加一条 observe_region 定位提示（见 provider_generic
+    # 的 _OBSERVATION_REGION_HINT），故正文为「说明文本 + 定位提示 + 图片」。
+    assert [block["type"] for block in message["content"]] == [
+        "text", "text", "image_url",
+    ]
     assert "image_omitted" not in message["_computer_v1"]
 
 
@@ -68,7 +72,10 @@ def test_normal_frame_pairs_text_and_image(tmp_path):
     )
 
     assert message["content"][0]["text"] == provider_generic.OBSERVATION_FOLLOWUP_TEXT
-    assert message["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    # 无控件列表：说明文本之后是定位提示，图片始终在最后一块
+    assert message["content"][1]["text"] == provider_generic._OBSERVATION_REGION_HINT
+    assert message["content"][-1]["type"] == "image_url"
+    assert message["content"][-1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
 def test_oversize_frame_falls_back_to_text(tmp_path, monkeypatch):
@@ -95,7 +102,11 @@ def test_oversize_frame_uses_downscaled_bytes(tmp_path, monkeypatch):
         observation, run_id="run-1", ordinal=5
     )
 
-    assert [block["type"] for block in message["content"]] == ["text", "image_url"]
+    # 无控件列表：正文为「说明文本 + 定位提示 + 图片」，图片在最后一块
+    assert [block["type"] for block in message["content"]] == [
+        "text", "text", "image_url",
+    ]
+    assert message["content"][-1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert message["_computer_v1"].get("image_omitted") is None
 
 
