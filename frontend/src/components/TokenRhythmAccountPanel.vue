@@ -11,13 +11,21 @@
     role="dialog"
     aria-label="基元律动账号"
   >
-    <!-- 顶部：圆形头像 + 昵称 + 账号 -->
+    <!-- 顶部：圆形头像 + 昵称 + 账号 + 右侧官网入口 -->
     <div class="tr-acc-head">
       <span class="tr-acc-avatar" data-test="tr-acc-avatar">{{ avatarText }}</span>
       <span class="tr-acc-meta">
         <b class="tr-acc-name" data-test="tr-acc-name">{{ displayName }}</b>
         <span class="tr-acc-account" data-test="tr-acc-account">{{ accountText }}</span>
       </span>
+      <!-- 官网入口：与「充值」同一套打开逻辑（右栏内嵌浏览器，不支持时回退系统浏览器） -->
+      <button
+        class="tr-acc-site"
+        type="button"
+        data-test="tr-acc-site"
+        title="在右侧浏览器打开基元律动官网账户页"
+        @click="store.openTrConsolePage(SITE_URL)"
+      >官网 ↗</button>
     </div>
 
     <!-- 加载态 / 失败态（失败给后端原因 + 重试，不弹第二次窗） -->
@@ -107,6 +115,9 @@ const PLACEHOLDER = '—';
 
 /** 官方充值入口：点「充值」直接在右栏内嵌浏览器打开充值页，不再走原生弹窗 */
 const RECHARGE_URL = 'https://tokenrhythm.studio/account/recharge?entry_source=header_menu';
+
+/** 官方账户页：点头部「官网」进控制台，与充值页同一套（右栏内嵌浏览器 / 不支持时回退系统浏览器） */
+const SITE_URL = 'https://tokenrhythm.studio/account/account';
 
 const panelEl = ref<HTMLElement | null>(null);
 
@@ -408,6 +419,27 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 头部右侧「官网」入口：小号描边按钮，margin-left:auto 把它推到行尾，昵称过长时自己缩 */
+.tr-acc-site {
+  flex: 0 0 auto;
+  margin-left: auto;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid #e3e3e3;
+  border-radius: 6px;
+  background: #f7f7f7;
+  color: #333;
+  font-size: 11px;
+  font-family: inherit;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.tr-acc-site:hover {
+  background: #ededed;
+  border-color: #d8d8d8;
 }
 /* 加载态 / 失败态 */
 .tr-acc-state {

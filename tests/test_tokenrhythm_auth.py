@@ -82,6 +82,9 @@ def http(monkeypatch, tmp_path):
     # 不打桩会把用户本机真实的「基元律动」模型配置删掉。默认 no-op，需要验证的用例
     # 再自行 monkeypatch 覆盖。
     monkeypatch.setattr(auth, "_delete_tr_providers", lambda keep_id="": 0)
+    # 绑定时会给厂商打托管标记（写 config.json）：测试里必须隔离，
+    # 否则每个用例都会重写一遍用户真实的模型配置。
+    monkeypatch.setattr(auth, "_mark_provider_managed", lambda provider_id: None)
     auth.logout()
     holder = {"client": None, "responses": []}
 
@@ -1178,6 +1181,119 @@ def test_logout_removes_tokenrhythm_providers(http, monkeypatch):
     assert result["providers_removed"] == 1
 
 
+def _patch_model_config(monkeypatch, providers):
+    """固定 model_manager 读到的厂商列表，并拦截删除动作（返回被删 id 列表）。"""
+    from core import model_manager
+
+    deleted: list[str] = []
+    monkeypatch.setattr(model_manager, "load_config", lambda: {"providers": providers})
+    monkeypatch.setattr(model_manager, "delete_provider", lambda pid: deleted.append(pid))
+    return deleted
+
+
+def test_delete_tr_providers_keeps_user_manual_provider(monkeypatch, tmp_path):
+    """用户自己填 Key 配置的「基元律动」不在清理范围内：只删本程序托管的条目。"""
+    monkeypatch.setattr(auth, "_BINDING_FILE", tmp_path / "tr_binding.json")
+    providers = [
+        {
+            "id": "manual",
+            "name": "基元律动",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "api_key": "",
+            "protocol": "openai",
+            "models": [],
+        },
+        {
+            "id": "auto",
+            "name": "基元律动（木偶）",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "api_key": "",
+            "protocol": "openai",
+            "models": [],
+            auth.MANAGED_PROVIDER_FLAG: auth.MANAGED_PROVIDER_VALUE,
+        },
+    ]
+    deleted = _patch_model_config(monkeypatch, providers)
+    auth._save_binding(
+        {"account_id": "u1", "account_name": "木偶", "provider_id": "auto", "key_id": "k1"}
+    )
+
+    removed = auth._delete_tr_providers()
+
+    # 只删自动建的那条，用户手动配置的原样保留
+    assert deleted == ["auto"]
+    assert removed == 1
+
+
+def test_delete_tr_providers_removes_bound_legacy_provider_only(monkeypatch, tmp_path):
+    """老版本建的条目没有托管标记，靠 binding 的 provider_id 识别；用户手动的仍保留。"""
+    monkeypatch.setattr(auth, "_BINDING_FILE", tmp_path / "tr_binding.json")
+    providers = [
+        {
+            "id": "manual",
+            "name": "基元律动",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "api_key": "",
+            "protocol": "openai",
+            "models": [],
+        },
+        {
+            "id": "legacy",
+            "name": "基元律动（木偶）",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "api_key": "",
+            "protocol": "openai",
+            "models": [],
+        },
+    ]
+    deleted = _patch_model_config(monkeypatch, providers)
+    auth._save_binding(
+        {"account_id": "u1", "account_name": "木偶", "provider_id": "legacy", "key_id": "k1"}
+    )
+
+    removed = auth._delete_tr_providers()
+
+    assert deleted == ["legacy"]
+    assert removed == 1
+
+
+def test_bound_provider_name_falls_back_to_account_suffix():
+    """昵称缺失时不能回落到裸「基元律动」——那是用户手动配置最常用的名字。"""
+    assert auth._bound_provider_name("木偶") == "基元律动（木偶）"
+    assert auth._bound_provider_name("") == "基元律动（账号）"
+    assert auth._bound_provider_name(None) == "基元律动（账号）"
+
+
+def test_resolve_sync_provider_prefers_managed_provider(monkeypatch, tmp_path):
+    """同步模型时优先写本程序托管的厂商，绝不往用户手动配置的条目里塞模型。"""
+    monkeypatch.setattr(auth, "_BINDING_FILE", tmp_path / "tr_binding.json")
+    providers = [
+        {
+            "id": "manual",
+            "name": "基元律动",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "api_key": "",
+            "protocol": "openai",
+            "models": [],
+        },
+        {
+            "id": "auto",
+            "name": "基元律动（木偶）",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "api_key": "",
+            "protocol": "openai",
+            "models": [],
+            auth.MANAGED_PROVIDER_FLAG: auth.MANAGED_PROVIDER_VALUE,
+        },
+    ]
+    monkeypatch.setattr(auth, "_load_providers", lambda: providers)
+
+    provider_id, name = auth._resolve_sync_provider(None)
+
+    assert provider_id == "auto"
+    assert name == "基元律动（木偶）"
+
+
 def test_logout_clears_local_even_when_key_delete_fails(http, monkeypatch, caplog):
     """删除 Key 返回 500：仍清 binding / 会话 / 登录态，只记 warning。"""
     auth._save_session(_client_with_cookies(("tr_session", "abc123", None)))
@@ -1658,6 +1774,63 @@ def test_temporary_credits_accepts_multiple_envelope_shapes(http, container):
     }
 
 
+def test_temporary_credits_retries_once_after_network_timeout(http):
+    """额度接口冷启动慢（实测 10~15 秒）：超时后重试一次，第二次成功即正常返回。"""
+    _login(http)
+    http.queue(
+        _wallet_ok(),
+        _usage_ok(),
+        _FakeResponse(200, _ok(dict(_ME_USER))),
+        httpx.ReadTimeout("read operation timed out"),  # 第一次：传输层超时
+        _credits_ok([_credit(remaining="5.00000000", expires="2099-02-01T00:00:00Z")]),
+    )
+
+    result = auth.account_overview()
+
+    # 重试成功：额度不再降级成 0，也不需要把整体标成 partial
+    assert result["temporary_credits"]["total_cny"] == "5.00000000"
+    assert "partial" not in result
+    calls = _requests(http)
+    assert [call["url"] for call in calls].count(_CREDITS_URL) == 2
+    # 重试那次用放宽后的超时，避免再次撞上同一个 20 秒窗口
+    assert calls[-1]["timeout"] == auth._TEMPORARY_CREDITS_TIMEOUT
+
+
+def test_temporary_credits_retries_after_server_internal_error(http):
+    """服务端冷启动汇总超时会直接回 INTERNAL_ERROR：这种"等一下就好"的错误要重试。"""
+    _login(http)
+    http.queue(
+        _wallet_ok(),
+        _usage_ok(),
+        _FakeResponse(200, _ok(dict(_ME_USER))),
+        _FakeResponse(500, {"code": "INTERNAL_ERROR", "message": "服务内部错误", "data": None}),
+        _credits_ok([_credit(remaining="7.50000000", expires="2099-03-01T00:00:00Z")]),
+    )
+
+    result = auth.account_overview()
+
+    assert result["temporary_credits"]["total_cny"] == "7.50000000"
+    assert "partial" not in result
+    assert [call["url"] for call in _requests(http)].count(_CREDITS_URL) == 2
+
+
+def test_temporary_credits_does_not_retry_auth_errors(http):
+    """鉴权类业务错误（HTTP 4xx）重试没有意义：只请求一次，直接降级。"""
+    _login(http)
+    http.queue(
+        _wallet_ok(),
+        _usage_ok(),
+        _FakeResponse(200, _ok(dict(_ME_USER))),
+        _FakeResponse(401, {"code": "UNAUTHORIZED", "message": "请先登录", "data": None}),
+    )
+
+    result = auth.account_overview()
+
+    assert result["partial"] is True
+    assert set(result["errors"]) == {"temporary_credits"}
+    assert [call["url"] for call in _requests(http)].count(_CREDITS_URL) == 1
+
+
 def test_account_overview_temporary_credits_failure_partial(http):
     """额度接口失败：只降级 temporary_credits，其余三个分区照常返回。"""
     _login(http)
@@ -1665,8 +1838,9 @@ def test_account_overview_temporary_credits_failure_partial(http):
         _wallet_ok(),
         _usage_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
+        # 用不可重试的鉴权错误：5xx / INTERNAL_ERROR 属于"等一下就好"，会被重试
         _FakeResponse(
-            500, {"code": "INTERNAL", "message": "额度服务不可用", "data": None}
+            401, {"code": "UNAUTHORIZED", "message": "额度服务不可用", "data": None}
         ),
     )
 

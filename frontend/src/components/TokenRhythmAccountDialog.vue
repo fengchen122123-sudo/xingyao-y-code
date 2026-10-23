@@ -62,6 +62,14 @@
               :data-test="`trd-range-${r.value}`"
               @click="store.trDialogChangeUsageRange(r.value)"
             >{{ r.label }}</button>
+            <!-- 官网入口：跟着时间窗按钮组靠右，进官方控制台看完整消费明细 -->
+            <button
+              type="button"
+              class="trd-site"
+              data-test="trd-site-usage"
+              title="在右侧浏览器打开基元律动官网账户页"
+              @click="openSite(SITE_URLS.usage)"
+            >去官网查看 ↗</button>
           </div>
 
           <div v-if="summary" class="trd-summary">
@@ -125,6 +133,14 @@
               <b class="trd-profile-name" data-test="trd-profile-name">{{ profileName }}</b>
               <span class="trd-profile-account" data-test="trd-profile-account">{{ maskedAccount }}</span>
             </div>
+            <!-- 官网入口：与头像行靠右对齐，进官方个人中心看完整资料 / 改资料 -->
+            <button
+              type="button"
+              class="trd-site"
+              data-test="trd-site-profile"
+              title="在右侧浏览器打开基元律动官网个人中心"
+              @click="openSite(SITE_URLS.profile)"
+            >去官网查看 ↗</button>
           </div>
           <dl class="trd-fields">
             <div class="trd-field" v-for="f in profileFields" :key="f.label">
@@ -170,6 +186,21 @@ const RANGES = [
   { value: '7d', label: '近 7 天' },
   { value: '30d', label: '近 30 天' },
 ] as const;
+
+/** 两个视图各自的官网地址：纸面数据有限，给一条去官网看全量明细的出口 */
+const SITE_URLS = {
+  usage: 'https://tokenrhythm.studio/account',
+  profile: 'https://tokenrhythm.studio/account/profile',
+} as const;
+
+/**
+ * 去官网查看：先收起弹窗（遮罩会挡住右栏），再走与「充值」同一套打开逻辑——
+ * 右栏内嵌浏览器优先，宿主不支持时由 store 回退系统浏览器。
+ */
+function openSite(url: string) {
+  store.closeTrDialog();
+  store.openTrConsolePage(url);
+}
 
 const data = computed<Record<string, any>>(() => {
   const d = store.trDialog.data;
@@ -394,6 +425,27 @@ function statusLabel(status: unknown): string {
   cursor: pointer;
 }
 .trd-range.active { background: #111; color: #fff; border-color: #111; }
+/* 「去官网查看」入口：两个视图共用，margin-left:auto 贴到行尾，与时间窗按钮同高 */
+.trd-site {
+  flex: 0 0 auto;
+  margin-left: auto;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid #e3e3e3;
+  border-radius: 8px;
+  background: #fff;
+  color: #333;
+  font-size: 12px;
+  font-family: inherit;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.trd-site:hover {
+  background: #f5f5f5;
+  border-color: #d8d8d8;
+}
 .trd-summary {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
