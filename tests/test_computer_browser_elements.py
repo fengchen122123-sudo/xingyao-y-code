@@ -15,6 +15,7 @@ from core.computer.actions import parse_computer_action
 from core.computer.browser_backend import (
     BrowserComputerBackend,
     ELEMENT_COLLECT_SCRIPT,
+    PAGE_TEXT_SCRIPT,
 )
 from core.computer.browser_worker_protocol import (
     normalize_observation_payload,
@@ -101,6 +102,25 @@ def test_observe_without_elements_falls_back_to_screenshot(backend):
     assert Path(observation.png_path).read_bytes() == fake_png_bytes(7)
 
 
+def test_observe_without_screenshot_keeps_elements_and_page_text(backend):
+    """B 方案：截图失败时元素列表与正文照常返回，ref 依然可用于元素动作。
+
+    为什么重要：窗口被遮挡/最小化时渲染被节流，截图失败；但 WebView2 的 DOM
+    仍可求值，元素引用是降级后唯一能"点得准"的操作通道，必须保留。
+    """
+    page = backend.active_page
+    page.element_collect_result = [dict(_ELEMENT)]
+    page.page_text = "页面正文：提交表单"
+    page.screenshot_error = RuntimeError("frame not produced while occluded")
+    observation = backend.observe("run-a")
+    assert observation.ok is True
+    assert observation.png_path == ""
+    assert observation.screenshot_error
+    assert [item["ref"] for item in observation.elements] == ["el-1"]
+    assert backend._observed_element_refs == frozenset({"el-1"})
+    assert observation.page_text == "页面正文：提交表单"
+
+
 # ---------------- ③ 收集失败不中断（元素不可用回落是产品决定） ----------------
 
 
@@ -166,6 +186,14 @@ def test_collect_script_never_touches_private_values(forbidden):
     assert forbidden not in ELEMENT_COLLECT_SCRIPT
 
 
+@pytest.mark.parametrize(
+    "forbidden", [".value", "cookie", "localStorage", "sessionStorage"]
+)
+def test_page_text_script_never_touches_private_values(forbidden):
+    """B 方案正文脚本同一条隐私铁律：只读可见文本，绝不读输入值/存储。"""
+    assert forbidden not in PAGE_TEXT_SCRIPT
+
+
 # ---------------- ⑥ 投影契约：有 elements 走纯文本路径 ----------------
 
 
@@ -206,6 +234,26 @@ def test_observation_payload_roundtrip_restores_elements_tuple():
     assert isinstance(restored.elements[0]["bounds"], list)
     assert restored.page_origin == observation.page_origin
     assert restored.surface_generation == observation.surface_generation
+
+
+def test_observation_payload_carries_page_text_and_screenshot_error():
+    """B 方案：正文与"为何没截图"必须跨受管进程管道回传，否则降级只剩空图。
+
+    受管子进程模式下父进程只拿到 OBSERVATION_FIELDS 里的字段；漏传会让降级
+    观察在父进程侧退化成"无图、无正文、无原因"的空观察。
+    """
+    observation = ComputerObservation(
+        run_id="run-a",
+        target="browser",
+        page_text="页面正文",
+        screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
+    )
+    payload = json.loads(
+        json.dumps(observation_payload(observation), ensure_ascii=False)
+    )
+    restored = ComputerObservation(**normalize_observation_payload(payload))
+    assert restored.page_text == "页面正文"
+    assert "TimeoutError" in restored.screenshot_error
 
 
 def test_normalize_observation_payload_defends_bad_shapes():

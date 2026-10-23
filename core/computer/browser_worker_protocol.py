@@ -43,6 +43,10 @@ OBSERVATION_FIELDS = (
     "window_title",
     "page_origin",
     "page_title",
+    # B 方案（窗口被遮挡时的降级观察）：正文摘要与"本次为何没有截图"的说明
+    # 必须跨管道回传父进程，否则降级观察在受管进程模式下只剩空图信息。
+    "page_text",
+    "screenshot_error",
     "surface_id",
     "surface_generation",
     "elements",

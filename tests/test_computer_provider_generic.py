@@ -138,3 +138,49 @@ def test_is_persisted_observation_message_shape_variants():
     )
     assert not is_observation_protocol_message(None)
     assert not is_observation_protocol_message(123)
+
+
+def test_no_screenshot_observation_projects_text_only_with_page_text():
+    """B 方案：png_path 为空时绝不读图，改发纯文本观察（无截图说明 + 页面正文）。
+
+    为什么：窗口被遮挡/最小化时 WebView2 渲染被节流，截图会卡住或失败；旧路径
+    _read_observation_png("") 会抛 computer_backend_error，让观察链整体失败。
+    """
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    page_text = "搜索结果第一条：示例页面正文" * 20
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="browser",
+        action="observe",
+        page_text=page_text,
+        screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    assert all(block["type"] == "text" for block in message["content"])
+    assert not any(block["type"] == "image_url" for block in message["content"])
+    assert message["_computer_v1"]["image_omitted"] == "no_screenshot"
+    text = "\n".join(block["text"] for block in message["content"])
+    assert "本次没有截图" in text
+    assert "TimeoutError" in text
+    # 正文按 backend 截断后的原样进入消息（这里不再二次截断）
+    assert page_text in text
+
+
+def test_no_screenshot_observation_without_page_text_still_succeeds():
+    """正文也缺失时仍返回纯文本观察，绝不因缺图/缺正文抛错。"""
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="browser",
+        action="observe",
+        screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    assert all(block["type"] == "text" for block in message["content"])
+    text = "\n".join(block["text"] for block in message["content"])
+    assert "本次没有截图" in text
+    assert "本次也未能读到可见文本" in text

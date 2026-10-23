@@ -10,7 +10,8 @@ worker 退出都明确失败（稳定错误码），绝不在调用线程重建 
 无降级原则（设计 21）：所选浏览器启动失败抛 ``computer_browser_unavailable``，
 绝不 fallback 另一个浏览器；profile 锁冲突抛 ``computer_profile_locked``；
 context/page 被用户关闭后后续动作抛 ``computer_browser_closed``，不自动重开；
-截图失败抛错，绝不复用旧截图。
+截图失败不再让观察报错（窗口被遮挡/最小化时渲染被节流），而是降级为纯 DOM
+观察（元素列表 + 页面正文 + screenshot_error 说明），且绝不复用旧截图。
 
 隐私（设计 22）：观察只暴露 ``scheme://netloc`` origin 与截断 200 字符的 title；
 不读取 DOM 输入值、Cookie、localStorage 或密码库。
@@ -102,6 +103,30 @@ _ELEMENT_MAX_NAME_CHARS = 80
 # 检查失败时由元素语义错误码（computer_element_unsupported）返回，而不是拖到
 # 命令超时变成笼统的 computer_action_timeout；实际取与命令剩余预算的较小值。
 _ELEMENT_ACTION_TIMEOUT_MS = 10_000
+
+# B 方案（窗口被遮挡时的降级观察）常量。
+# _SCREENSHOT_TIMEOUT_MS：截图超时必须显式设短（Playwright 默认 30s）。浏览器
+# 窗口被遮挡/最小化后 WebView2 渲染被节流，screenshot 等不到新帧会一直阻塞，
+# 默认超时基本等于把整个命令预算（30s）用完，调用侧只剩"观察超时失败"；3s
+# 足够识别"这次取不到图"，把剩余预算留给 DOM 观察与返回。
+_SCREENSHOT_TIMEOUT_MS = 3000
+
+# _PAGE_TEXT_MAX_CHARS：页面正文摘要上限。按 Python 码点切片截断（与前端
+# Array.from 的码点语义一致），够模型判断页面内容，又不把整篇长文塞进上下文。
+_PAGE_TEXT_MAX_CHARS = 6000
+
+# B 方案：页面正文提取脚本（降级观察的唯一 DOM 来源）。
+# - 隐私铁律：只读可见文本（innerText 已排除 display:none / visibility:hidden
+#   的内容），绝不读 input.value / textarea.value 里的用户输入，绝不读 cookie、
+#   localStorage 或 sessionStorage；脚本源码不得出现这些字样。
+# - 为什么用 innerText 而不是 textContent：innerText 近似"用户看到的文本"，
+#   不含隐藏文本与脚本内容，泄露面最小。
+# - 为什么不需要可见性/焦点：窗口被遮挡时 DOM 求值照常返回，正是降级要用的通道。
+PAGE_TEXT_SCRIPT = """() => {
+  const root = document.body || document.documentElement;
+  if (!root) return "";
+  return (root.innerText || "").trim();
+}"""
 
 # E1 浏览器元素收集脚本（设计 2.2~2.4）：一次 JS 求值收集视口内可交互元素。
 # - 隐私铁律：只读标签/ARIA/文本等结构信息，绝不读输入值、Cookie 或存储
@@ -1473,22 +1498,66 @@ class BrowserComputerBackend:
             })
         return tuple(listing)
 
+    def _collect_page_text(self, page) -> str:
+        """提取页面可见正文摘要（B 方案降级观察的文本来源）。
+
+        为什么需要：窗口被遮挡/最小化后 WebView2 渲染被节流，截图会卡住或失败；
+        DOM 求值不受渲染节流影响，所以正文是"没有截图的观察"里最可靠的信息。
+        任何失败都归一为空串并留 warning，绝不中断观察（缺正文比观察失败更轻）。
+        返回前按 _PAGE_TEXT_MAX_CHARS 码点截断，正文绝不写日志（隐私设计 22）。
+        """
+        try:
+            raw = page.evaluate(PAGE_TEXT_SCRIPT)
+        except Exception:
+            _LOGGER.warning("浏览器页面正文读取失败，本次观察仅保留元素与截图", exc_info=True)
+            return ""
+        if not isinstance(raw, str):
+            _LOGGER.warning(
+                "浏览器页面正文返回非字符串（%s），按空正文处理", type(raw).__name__
+            )
+            return ""
+        return raw[:_PAGE_TEXT_MAX_CHARS]
+
     def _cmd_observe(self, run_id: str) -> ComputerObservation:
         page = self._resolve_active_page()
         page_token = self._page_token(page)
+        url = page.url if isinstance(page.url, str) else ""
+        # E2：同步观察时的 URL，供 _require_ref_valid 做「页面地址已变化」校验
+        # （token 不随同页导航变化，URL 对比是旧 ref 失效裁决的补全）。
+        self._observed_url = url
+        parts = urlsplit(url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        # B 方案（降级观察）：先做不依赖渲染的 DOM 收集。窗口被遮挡/最小化时
+        # 渲染被节流而 DOM 求值照常，先把元素与正文拿到手，保证"这次观察至少
+        # 有文本信息"；截图放到最后，失败也只降级、不让整条观察链报错。
+        elements = self._collect_interactive_elements(page)
+        page_text = self._collect_page_text(page)
+        png_bytes = b""
+        screenshot_error = ""
         try:
-            png = page.screenshot(type="png")
+            # 显式短超时：默认 30s 在窗口被遮挡时会一直等新帧，把命令预算耗尽
+            # 变成笼统超时；短超时能快速判定"这次取不到图"并落到文本降级。
+            png = page.screenshot(type="png", timeout=_SCREENSHOT_TIMEOUT_MS)
         except ComputerControlError:
             raise
         except Exception as error:
-            raise ComputerControlError(
-                "computer_action_failed",
-                f"浏览器截图失败：{type(error).__name__}",
-            ) from error
-        if not isinstance(png, (bytes, bytearray)) or not bytes(png):
-            raise ComputerControlError("computer_action_failed", "浏览器截图未返回 PNG bytes")
-        png_bytes = bytes(png)
-        # 截图后再验证仍是同一受控页：期间切换则本次观察作废（R5）。
+            # 不抛错：窗口被遮挡/最小化时截图等不到新帧属于预期内的环境状态，
+            # 抛错会让模型完全失去观察能力；降级为纯 DOM 观察更有用。
+            screenshot_error = (
+                f"浏览器窗口不可见或被遮挡，本次未取到截图：{type(error).__name__}"
+            )
+            _LOGGER.warning(
+                "浏览器截图失败，本次降级为纯文本观察：%s", type(error).__name__
+            )
+            png = None
+        if png is not None:
+            if not isinstance(png, (bytes, bytearray)) or not bytes(png):
+                raise ComputerControlError(
+                    "computer_action_failed", "浏览器截图未返回 PNG bytes"
+                )
+            png_bytes = bytes(png)
+        # 截图后再验证仍是同一受控页：期间切换则本次观察作废（R5）。降级路径
+        # 同样必须复核——页面切换时旧页的文本/元素不得冒充新页观察。
         if self._page_token(self._resolve_active_page()) != page_token:
             raise ComputerControlError(
                 "computer_surface_changed",
@@ -1503,14 +1572,6 @@ class BrowserComputerBackend:
             ) from error
         if not isinstance(title, str):
             title = ""
-        url = page.url if isinstance(page.url, str) else ""
-        # E2：同步观察时的 URL，供 _require_ref_valid 做「页面地址已变化」校验
-        # （token 不随同页导航变化，URL 对比是旧 ref 失效裁决的补全）。
-        self._observed_url = url
-        parts = urlsplit(url)
-        origin = f"{parts.scheme}://{parts.netloc}"
-        # E1：截图与页面复核完成后收集可交互元素；收集失败/为空都回落截图路径。
-        elements = self._collect_interactive_elements(page)
         if elements and (
             self._page_token(self._resolve_active_page()) != page_token
             or (page.url if isinstance(page.url, str) else "") != url
@@ -1519,7 +1580,8 @@ class BrowserComputerBackend:
             # 快照不同源，整体清空回落截图路径（E2 的 ref 集合随之置空，
             # 旧引用由 stale 校验拒绝）。
             elements = ()
-        path = self._store_screenshot(png_bytes)
+        # 只有真正拿到 PNG 才落盘：降级路径不写文件、也绝不复用任何旧截图。
+        path = self._store_screenshot(png_bytes) if png_bytes else None
         if self._observed_page_token != page_token:
             self._surface_generation += 1
             self._observed_page_token = page_token
@@ -1531,11 +1593,13 @@ class BrowserComputerBackend:
             target="browser",
             action="observe",
             ok=True,
-            screen_sha256=hashlib.sha256(png_bytes).hexdigest(),
-            png_path=str(path),
+            screen_sha256=hashlib.sha256(png_bytes).hexdigest() if png_bytes else "",
+            png_path=str(path) if path is not None else "",
             **self._observation_viewport(page),
             page_origin=origin,
             page_title=title[:_MAX_TITLE_CHARS],
+            page_text=page_text,
+            screenshot_error=screenshot_error,
             surface_id=f"page-{page_token}",
             surface_generation=self._surface_generation,
             elements=elements,

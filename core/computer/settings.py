@@ -165,10 +165,10 @@ def get_browser_profile_dir(browser: str) -> Path:
 
     edge/chrome：Path(config.YCODE_DIR) / "browser-profiles" / browser，
     resolve 后确认仍在专用根之下，拒绝任何路径逃逸；
-    embedded：星瑶自动化控件自己的 UserDataFolder（单一事实来源在
-    core.embedded_browser.automation_profile_dir；面板浏览控件另用
-    profile_dir——两者按 WebView2「同目录二次带参建环境必失败
-    （0x8007139F）」的约束刻意分离，identity 冻结的是自动化实际使用的目录）。
+    embedded：面板控件与自动化共用 core.embedded_browser.profile_dir()——
+    面板 WebView2 控件从创建起就带 CDP 调试端口，自动化直接接管用户看到的
+    那个浏览器（共享登录态），不再有第二个 WebView2 环境，因此原先"同目录
+    二次带参建环境必失败（0x8007139F）"的分离约束不再成立。
     """
     if type(browser) is not str or browser not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
@@ -176,9 +176,9 @@ def get_browser_profile_dir(browser: str) -> Path:
             f"不支持的浏览器：{browser!r}，只支持 edge、chrome 或 embedded",
         )
     if browser == "embedded":
-        from core.embedded_browser import automation_profile_dir
+        from core.embedded_browser import profile_dir
 
-        return automation_profile_dir().resolve()
+        return profile_dir().resolve()
     root = Path(config.YCODE_DIR) / "browser-profiles"
     resolved_root = root.resolve()
     candidate = (root / browser).resolve()
