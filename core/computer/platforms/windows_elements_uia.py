@@ -62,8 +62,10 @@ class RealUIAHost:
     def collect(self, hwnd: int):
         """ElementFromHandle → ControlView BFS 收集。
 
-        返回 (listing, ref→IUIAutomationElement 映射)；映射只留在本对象内存，
-        供同线程后续 click/set_value 经 marshal 使用。
+        返回 (listing, ref→None 字典)；真实 ref→IUIAutomationElement 映射只
+        留在本对象内存（COM 线程内读写，见 _require），供后续 click/set_value
+        经 marshal 使用。返回字典仅承载 ref 全集供 locator 做成员门禁——
+        COM 对象绝不随返回值离开线程（跨 apartment 传出/释放是未定义行为）。
         """
 
         def job(uia):
@@ -127,11 +129,18 @@ class RealUIAHost:
                         child = walker.GetNextSiblingElement(child)
                     except Exception:
                         child = None
-            # 映射替换在 COM 线程内完成：旧 ref 即刻过期。
+            # 映射替换在 COM 线程内完成：旧 ref 即刻过期（引用在本线程释放）。
             self._elements = elements
-            return listing, elements
+            return listing, {ref: None for ref in elements}
 
         return self._com.call(job)
+
+    def clear(self) -> None:
+        """在 COM 线程内清空 ref→元素映射（画面代数变化时释放引用）。"""
+        def job(_uia):
+            self._elements = {}
+
+        self._com.call(job)
 
     def click(self, ref: str) -> None:
         def job(uia):

@@ -2389,15 +2389,22 @@ def _chat_with_model_generator(
                             attempt_timeout,
                             native_computer_tools=step_native_tools,
                         )
-                    request_envelope = RequestEnvelope.capture(
-                        prepared_request,
-                        cache_scope=cache_scope,
-                        request_reason=request_cache_reason,
-                        attempt=attempt + 1,
-                        deepseek_generation_id=active_deepseek_generation_id,
-                        deepseek_message_count=active_deepseek_message_count,
-                    )
-                    if current_step is not None:
+                    # 指纹层只观察请求：序列化失败（NaN/不可序列化对象等）不能
+                    # 杀掉主请求，跳过捕获并告警（该 step 缺指纹，不影响续跑——
+                    # resume 对缺指纹的 started-not-finished 一律 BLOCK）
+                    try:
+                        request_envelope = RequestEnvelope.capture(
+                            prepared_request,
+                            cache_scope=cache_scope,
+                            request_reason=request_cache_reason,
+                            attempt=attempt + 1,
+                            deepseek_generation_id=active_deepseek_generation_id,
+                            deepseek_message_count=active_deepseek_message_count,
+                        )
+                    except Exception:
+                        logger.warning("请求指纹捕获失败（跳过，不影响请求）", exc_info=True)
+                        request_envelope = None
+                    if current_step is not None and request_envelope is not None:
                         current_step.capture_request(request_envelope)
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 在飞请求登记到 cancel_event 名下，停止路径可硬中断底层连接。
@@ -3738,7 +3745,13 @@ def _chat_with_model_generator(
             # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
             rollback_turn_messages()
         if harness_runtime is not None:
-            harness_runtime.cancel()
+            # 取消收尾 best-effort：cancel() 内 journal CAS 失败若抛出会顶替
+            # 原始 KeyboardInterrupt，外层把"用户取消"渲染成 FAILED；残留的
+            # 非终态 Turn 由崩溃恢复路径标 interrupted 收敛。
+            try:
+                harness_runtime.cancel()
+            except Exception:
+                logger.warning("用户取消的 harness 收尾失败（交由恢复路径收敛）", exc_info=True)
         raise
     except GeneratorExit:
         # GUI 消费端检测到取消后 break，生成器在 yield 点被 close：这条路径
@@ -3759,7 +3772,11 @@ def _chat_with_model_generator(
                 harness_runtime.fail(type(salvage_error).__name__)
             raise
         if harness_runtime is not None:
-            harness_runtime.cancel()
+            # 同 KeyboardInterrupt 路径：收尾 best-effort，不顶替原始异常
+            try:
+                harness_runtime.cancel()
+            except Exception:
+                logger.warning("生成器取消的 harness 收尾失败（交由恢复路径收敛）", exc_info=True)
         raise
     except Exception as e:
         computer_exit_kind = "failed"

@@ -1073,8 +1073,12 @@ def test_unverifiable_path_never_prompts_or_executes_a_file_tool(
         "check_permission_and_ask",
         lambda *args, **kwargs: prompted.append((args, kwargs)) or True,
     )
+    # patch 类属性而非 _LazyToolRegistry 实例：实例 setattr 会把 fake 经
+    # __setattr__ 落到进程级缓存的内部注册表上（还原不可靠，见 test_llm_events）。
+    from core.tool_registry import ToolRegistry
+
     monkeypatch.setattr(
-        llm_mod.tool_registry,
+        ToolRegistry,
         "execute",
         lambda *args, **kwargs: (
             executed.append((args, kwargs))
@@ -1290,8 +1294,10 @@ def test_plan_mode_blocks_modifying_tools(monkeypatch):
 
     monkeypatch.setattr(llm_mod.app_context, "get_permission_mode", lambda: "plan")
     executed = []
+    from core.tool_registry import ToolRegistry
+
     monkeypatch.setattr(
-        llm_mod.tool_registry, "execute",
+        ToolRegistry, "execute",
         lambda name, **kw: executed.append(name),
     )
 

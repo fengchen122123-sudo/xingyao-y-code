@@ -87,9 +87,10 @@ def test_keepalive_interval_defaults_120_and_rejects_too_short(monkeypatch):
         "core.model_manager.load_config",
         lambda: {"prompt_cache_keepalive_seconds": 30},
     )
-    with pytest.raises(ValueError, match="至少为 60"):
-        load_keepalive_interval()
-    # 显式传 interval 的调用点（register_request）同样拒绝过短间隔
+    # 配置路径绝不抛出（每轮主请求前置区裸调，raise 会打穿全部对话）：
+    # 越界回落默认 120
+    assert load_keepalive_interval() == 120
+    # 显式传 interval 的调用点（register_request）是编程错误，保留拒绝
     from core.cache_keepalive import CacheKeepaliveService
 
     with pytest.raises(ValueError, match="至少为 60"):

@@ -682,6 +682,14 @@ def rename_cache_usage_session(old_name, new_name):
         rename_session_stable_sections(old_key, new_key)
     except Exception:
         logger.debug("稳定段落快照迁移失败（已忽略）", exc_info=True)
+    try:
+        # 预压缩冷却时间戳随改名迁移（与稳定段落快照同生命周期）
+        from core.agent_service import _PRECOMPRESS_LAST_START
+
+        if old_key in _PRECOMPRESS_LAST_START:
+            _PRECOMPRESS_LAST_START[new_key] = _PRECOMPRESS_LAST_START.pop(old_key)
+    except Exception:
+        logger.debug("预压缩冷却迁移失败（已忽略）", exc_info=True)
 
 
 def clear_cache_usage_session(session_name):
@@ -697,6 +705,14 @@ def clear_cache_usage_session(session_name):
         clear_session_stable_sections(session_key)
     except Exception:
         logger.debug("稳定段落快照清理失败（已忽略）", exc_info=True)
+    try:
+        # 预压缩冷却时间戳同生命周期：不清理会随会话名无界累积，且同名新
+        # 会话会继承旧冷却、首次空闲压缩被莫名推迟
+        from core.agent_service import _PRECOMPRESS_LAST_START
+
+        _PRECOMPRESS_LAST_START.pop(session_key, None)
+    except Exception:
+        logger.debug("预压缩冷却清理失败（已忽略）", exc_info=True)
 
 
 def _persist_token_usage(model_name, prompt_tokens, completion_tokens,

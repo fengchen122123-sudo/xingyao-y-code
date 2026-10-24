@@ -374,7 +374,17 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
 
             def _tick(_sender, _args):
                 _do_install()
+                # 总 tick 上限：即使始终不 ok（深层窗口始终枚举不到的异常
+                # 环境——恰是本定时器存在的场景）也要停表，不能无限空转。
                 if not state.get("ok"):
+                    if getattr(_tick, "count", 0) + 1 >= 60:
+                        timer.Stop()
+                        timer.Dispose()
+                        logger.info(
+                            "frameless 周期补装放弃: 90 秒内未成功（已子类化 %s 个窗口）",
+                            len(_SUBCLASSED),
+                        )
+                    _tick.count = getattr(_tick, "count", 0) + 1
                     return
                 if getattr(_tick, "count", 0) + 1 >= 60:
                     timer.Stop()

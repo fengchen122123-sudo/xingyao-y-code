@@ -29,13 +29,26 @@ def _clean_singleton():
 
 @pytest.fixture()
 def manager(tmp_path):
-    """独立临时 DB 的 MemoryManager，并注册为 app_context 当前管理器。"""
+    """独立临时 DB 的 MemoryManager，并注册为 app_context 当前管理器。
+
+    同 test_secretary_identity：`import main` 注册的 CLI ctx 以只读视图
+    影子化 set_manager fallback，需先注销 ctx 才能让本管理器生效。
+    """
     m = MemoryManager(str(tmp_path / "ycode.db"))
+    prev_ctx = app_context.get()
+    prev_manager = app_context.get_manager()
+    prev_session = app_context.get_current_session()
+    app_context.register(None)
     app_context.set_manager(m)
-    secretary.invalidate_secretary_cache()
-    yield m
-    secretary.invalidate_secretary_cache()
     app_context.set_current_session("")
+    secretary.invalidate_secretary_cache()
+    try:
+        yield m
+    finally:
+        secretary.invalidate_secretary_cache()
+        app_context.set_current_session(prev_session)
+        app_context.set_manager(prev_manager)
+        app_context.register(prev_ctx)
 
 
 def _make_bridge(manager, *, is_turn_active=False):

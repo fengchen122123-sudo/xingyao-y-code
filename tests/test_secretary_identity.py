@@ -18,13 +18,29 @@ from core.memory import MemoryManager
 
 @pytest.fixture
 def manager(tmp_path):
-    """独立临时 DB 的 MemoryManager，并注册为 app_context 当前管理器。"""
+    """独立临时 DB 的 MemoryManager，并注册为 app_context 当前管理器。
+
+    `import main`（任何更早的测试文件触发）会注册 CLI ctx，其只读 manager/
+    current_session 视图优先于 set_manager 的 fallback——按 app_context 的
+    文档契约，需覆盖必须先注销 ctx，否则本 fixture 的管理器被 main 模块
+    全局影子化（全量套件下身份解析读到 main.manager 的空库、当前会话读到
+    main 导入期生成的 session_xxx）。
+    """
     m = MemoryManager(str(tmp_path / "s.db"))
+    prev_ctx = app_context.get()
+    prev_manager = app_context.get_manager()
+    prev_session = app_context.get_current_session()
+    app_context.register(None)
     app_context.set_manager(m)
-    secretary.invalidate_secretary_cache()
-    yield m
-    secretary.invalidate_secretary_cache()
     app_context.set_current_session("")
+    secretary.invalidate_secretary_cache()
+    try:
+        yield m
+    finally:
+        secretary.invalidate_secretary_cache()
+        app_context.set_current_session(prev_session)
+        app_context.set_manager(prev_manager)
+        app_context.register(prev_ctx)
 
 
 # ---------------------------------------------------------------------------

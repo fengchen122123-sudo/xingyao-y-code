@@ -13,6 +13,7 @@ import json
 import logging
 import mimetypes
 import os
+import queue as queue_mod
 import secrets
 import socket
 import threading
@@ -38,6 +39,12 @@ logger = logging.getLogger(__name__)
 # step_metrics、subagent_progress、terminal_output、tool_start/finish 等）
 # 不进缓冲——流式缺失由 message_final 终态全文自愈校正，工具卡片状态由
 # turn 终态事件收敛。
+# 出站队列容量：按 ~16 事件/秒的流式峰值约 30 秒缓冲；超过即丢弃新事件
+# （与 gui_bridge._js_queue 同一哲学：宁可丢帧不可反压阻塞生产者）。丢失的
+# 白名单事件仍可经断线补发缓冲在重连后找回。
+_OUTBOUND_QUEUE_MAX = 500
+_OUTBOUND_DROP_WARN_EVERY = 200
+
 REPLAYABLE_EVENT_TYPES = frozenset({
     "notice", "error",
     "turn_start", "turn_finish", "turn_cancelled", "turn_error",
@@ -324,6 +331,26 @@ class LanServer:
         # frontend-mobile 零引用，该理由不成立。只读的 get_mcp_servers 与
         # 纯重连的 reconnect_mcp 保持放行。
         "toggle_mcp_server",
+        # 插件信任与热加载（发版前边界审计）：trust_plugin 写 ~/.ycode/plugin_trust.json
+        # 记录指纹、toggle_plugin 随即热加载并 exec_module ~/.ycode/plugins/<name>/
+        # plugin.py——链起来等于「远程绕过插件首次/指纹变化必须本地确认的信任
+        # 门禁，持久化加载任意代码」，比已封的 save_hook 更直接（写入即执行，
+        # 且随每次启动长期生效），桌面端零确认零提示。run_plugin_settings_action
+        # 是插件设置动作执行入口，同样执行插件提供的任意代码。三者均经核实
+        # frontend-mobile 零引用，与封 toggle_mcp_server 时的判定标准一致。
+        "trust_plugin", "toggle_plugin", "run_plugin_settings_action",
+        # 权限白名单持久放宽：add_permission_rule 写盘添加 command 前缀/文件白名单
+        # （permission_store），此后匹配命令免确认执行——与已封的 grant_hook_trust
+        # 同类（远程放行后续命令，且无审计事件、桌面无感知），区别只在「白名单
+        # 生效」与「hook 触发」；一次性 respond_permission_* 属远程控制语义保留
+        # 放行，但「永久白名单」必须封。frontend-mobile 零引用。
+        "add_permission_rule",
+        # 其余桌面专属/破坏性入口（fail-closed 收口）：remove_mcp_server 删除桌面
+        # MCP 配置（破坏性、手机无场景）；open_external_url 在桌面默认浏览器打开
+        # 任意 URL（钓鱼面，手机端自己有浏览器）；get_remote_bind_qr 的
+        # force_new=True 会轮换 token 把其他已配对设备踢下线（配对二维码本就由
+        # 桌面展示、手机扫码，手机无需调用）。三者 frontend-mobile 均零引用。
+        "remove_mcp_server", "open_external_url", "get_remote_bind_qr",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
@@ -350,6 +377,15 @@ class LanServer:
         # _token_issue_lock → _clients_lock（_issue_token 内部取后者），无死锁。
         self._token_issue_lock = threading.Lock()
         self._client_locks: Dict[Any, threading.Lock] = {}
+        # 每客户端出站队列 + 专用发送线程：broadcast 只 put_nowait（满则丢弃），
+        # 网络 IO 全部收敛到发送线程。客户端静默失联（锁屏断网、无 TCP RST）时
+        # 只有该客户端自己的发送线程阻塞在 send 上，桌面回合线程与其它客户端
+        # 不受影响——此前同步 broadcast 会把回合 worker 卡死到 TCP 重传超时
+        # （Windows 上可达 5-15 分钟）。真实注册路径必建队列；测试直连桩
+        # （只登记 _clients/_client_locks）回落同步发送，保持既有语义。
+        self._outbound_queues: Dict[Any, "queue_mod.Queue"] = {}
+        self._outbound_threads: Dict[Any, threading.Thread] = {}
+        self._outbound_dropped = 0
         self._token = None
         self._token_expires = 0.0
         self._ttl = 86400
@@ -442,6 +478,8 @@ class LanServer:
         """断开所有已连接客户端并清空列表（token 轮换时防止旧链接继续可控）。"""
         with self._clients_lock:
             clients = self._detach_clients_locked()
+        for client in clients:
+            self._shutdown_outbound(client)
         self._close_rotated(clients)
 
     def _issue_token(self) -> str:
@@ -490,6 +528,16 @@ class LanServer:
                 return False, []
             self._clients.append(ws)
             self._client_locks[ws] = threading.Lock()
+            outbound: queue_mod.Queue = queue_mod.Queue(maxsize=_OUTBOUND_QUEUE_MAX)
+            self._outbound_queues[ws] = outbound
+            sender = threading.Thread(
+                target=self._outbound_sender_loop,
+                args=(ws, outbound),
+                name=f"lan-outbound-{id(ws):x}",
+                daemon=True,
+            )
+            self._outbound_threads[ws] = sender
+            sender.start()
             if last_seq is None:
                 return True, []
             replay = [
@@ -497,6 +545,42 @@ class LanServer:
                 if seq > last_seq
             ]
             return True, replay
+
+    def _outbound_sender_loop(self, ws, outbound: "queue_mod.Queue") -> None:
+        """单客户端出站发送线程：逐条写出广播事件。
+
+        独占该客户端的网络 IO；sentinel（None）即退出。发送失败由
+        _safe_send 吞掉（客户端随后经 recv 循环结束被统一注销）。
+        """
+        while True:
+            item = outbound.get()
+            try:
+                if item is None:
+                    return
+                self._safe_send(ws, item)
+            finally:
+                outbound.task_done()
+
+    def _shutdown_outbound(self, ws) -> None:
+        """注销某客户端的出站队列并通知发送线程退出（幂等、非阻塞）。"""
+        outbound = self._outbound_queues.pop(ws, None)
+        self._outbound_threads.pop(ws, None)
+        if outbound is not None:
+            try:
+                outbound.put_nowait(None)
+            except queue_mod.Full:
+                pass
+
+    def wait_outbound_drain(self, timeout: float = 5.0) -> bool:
+        """等待全部出站队列排空（测试用；生产路径无需等待）。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._clients_lock:
+                queues = list(self._outbound_queues.values())
+            if all(q.unfinished_tasks == 0 for q in queues):
+                return True
+            time.sleep(0.01)
+        return False
 
     def _send_replay(self, ws, replay_items) -> None:
         """按序补发缺失事件；与实时广播共用每客户端发送锁保证顺序。
@@ -626,6 +710,11 @@ class LanServer:
     def broadcast(self, payload: str, event_type: str = "") -> None:
         """向所有已连接客户端发送事件 payload，线程安全且异常吞掉。
 
+        真实注册的客户端经各自的有界出站队列异步发送（put_nowait，满则
+        丢弃该事件并计数告警）——本方法绝不阻塞调用者（回合 worker 在
+        流式期间高频调用，不能被单个失联手机拖死）。直连桩/无队列的注册
+        路径回落同步 _safe_send，保持既有语义。
+
         event_type 命中 REPLAYABLE_EVENT_TYPES 时打 seq 并入补发缓冲；
         客户端断线重连后按各自 last_seq 补发缺失（见 _handle_ws）。
         未传 event_type（历史调用方/测试）原样发送、不进缓冲。
@@ -635,7 +724,20 @@ class LanServer:
             if event_type in REPLAYABLE_EVENT_TYPES:
                 payload = self._stamp_and_buffer_locked(payload)
         for client in clients:
-            self._safe_send(client, payload)
+            outbound = self._outbound_queues.get(client)
+            if outbound is None:
+                self._safe_send(client, payload)
+                continue
+            try:
+                outbound.put_nowait(payload)
+            except queue_mod.Full:
+                self._outbound_dropped += 1
+                if self._outbound_dropped % _OUTBOUND_DROP_WARN_EVERY == 1:
+                    logger.warning(
+                        "LAN 出站队列已满，丢弃事件（累计 %d 条）；"
+                        "客户端可能已失联，断线重连后经补发缓冲找回白名单事件",
+                        self._outbound_dropped,
+                    )
 
     # ------------------------------------------------------------------ #
     # WebSocket RPC
@@ -684,6 +786,7 @@ class LanServer:
                 except ValueError:
                     pass
                 self._client_locks.pop(ws, None)
+            self._shutdown_outbound(ws)
 
     def _route_message(self, ws, raw: str) -> None:
         """解析单条 RPC 消息并回包 ``{"id", "result"}`` 或 ``{"id", "error"}``。"""
@@ -825,7 +928,10 @@ class LanServer:
                 return fn(**merged)
             return fn(**(extra_kwargs or {}))
         except Exception as e:
-            return {"ok": False, "msg": str(e)}
+            # 不回传 str(e)：内部路径/实现细节外泄到 LAN 客户端；完整堆栈
+            # 在桌面端日志里查（logger.exception）
+            logger.exception("LAN 桥方法 %s 执行失败", method)
+            return {"ok": False, "msg": f"内部方法执行失败（{type(e).__name__}），详见桌面端日志"}
 
     # ------------------------------------------------------------------ #
     # HTTP 静态服务（作为 websockets process_request 回调）
@@ -1071,6 +1177,8 @@ class LanServer:
 
     def stop(self) -> None:
         """关闭服务（关闭监听 socket 让 serve_forever 退出）。"""
+        for ws in list(self._outbound_queues):
+            self._shutdown_outbound(ws)
         server = self._server
         self._server = None
         if server is not None:

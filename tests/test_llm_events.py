@@ -70,6 +70,18 @@ def test_tool_finish_payload_has_duration_result_and_display():
     assert payload["result"] == "one\ntwo"
 
 
+def _patch_registry_execute(mocker, **kwargs):
+    """patch ToolRegistry.execute 类属性。
+
+    不能 patch _LazyToolRegistry 实例（core.llm.tool_registry）：fake 会经
+    __setattr__ 落到进程级缓存的内部注册表上，而 teardown 的还原对
+    __slots__ 包装器必然失败，fake executor 从此泄漏并污染后续所有测试。
+    """
+    from core.tool_registry import ToolRegistry
+
+    return mocker.patch.object(ToolRegistry, "execute", **kwargs)
+
+
 def test_repaired_arguments_are_shared_by_event_payload_and_executor(mocker):
     import core.llm as llm
 
@@ -92,7 +104,12 @@ def test_repaired_arguments_are_shared_by_event_payload_and_executor(mocker):
         return FakeToolResult()
 
     mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
-    mocker.patch.object(llm.tool_registry, "execute", side_effect=fake_execute)
+    # 不能 patch _LazyToolRegistry 实例：fake 会经 __setattr__ 落到进程级
+    # 缓存的内部注册表上，而 teardown 的还原对 __slots__ 包装器必然失败，
+    # fake executor 就此泄漏并污染后续所有测试。patch 类属性可被可靠还原。
+    from core.tool_registry import ToolRegistry
+
+    mocker.patch.object(ToolRegistry, "execute", side_effect=fake_execute)
 
     payload = llm._tool_event_payload(tc)
     llm._execute_single_tool_call(tc, event_callback=lambda *_args: None)
@@ -1007,7 +1024,10 @@ def test_existing_pending_plan_rejects_direct_root_tool(mocker):
     previous_session = plan.session_id
     bind_default_plan_session("existing-pending-plan-test")
     plan.replace([{"id": "weather", "subject": "查询天气"}])
-    execute = mocker.patch.object(llm.tool_registry, "execute")
+    # 同上：patch ToolRegistry 类属性，避免 _LazyToolRegistry 实例 patch 泄漏。
+    from core.tool_registry import ToolRegistry
+
+    execute = mocker.patch.object(ToolRegistry, "execute")
 
     result = llm._execute_single_tool_call(
         {
@@ -1475,8 +1495,8 @@ def test_stalled_plan_after_repeated_failures_allows_direct_diagnosis(mocker):
     bind_default_plan_session("stalled-plan-escape-test")
     plan.replace([{"id": "impl", "subject": "实现功能", "stage": "build"}])
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "写入成功"
         )
     )
@@ -1523,8 +1543,8 @@ def test_cleared_plan_turn_releases_tool_gate(mocker):
     plan.replace([])
     llm._mark_plan_turn("turn-cleared-gate")
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "执行成功"
         )
     )
@@ -1567,8 +1587,8 @@ def test_completed_plan_turn_releases_tool_gate(mocker):
     }])
     llm._mark_plan_turn("turn-terminal-gate")
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "执行成功"
         )
     )
@@ -1616,8 +1636,8 @@ def test_unresolved_plan_keeps_tool_gate_across_turns(mocker, statuses):
         for index, status in enumerate(statuses)
     ])
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "不应执行"
         )
     )
@@ -1656,8 +1676,8 @@ def test_plan_retry_repeat_calls_are_not_suppressed(mocker):
     bind_default_plan_session("plan-retry-repeat-guard-test")
     plan.replace([{"id": "t1", "subject": "任务"}])
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute",
+    execute = _patch_registry_execute(
+        mocker,
         return_value=mocker.Mock(to_message_content=lambda: "计划项已重置为 pending。"),
     )
     responses = [

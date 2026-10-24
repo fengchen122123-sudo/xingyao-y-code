@@ -1081,8 +1081,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._turn_owner_sessions: dict[str, str] = {}
         self._turn_owner_lock = threading.Lock()
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
-        # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
-        self._turn_start_lock = threading.Lock()
+        # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合。
+        # RLock 仅为纵深防御（跨线程互斥语义与 Lock 一致）：临界区内调用的
+        # 改名随迁已通过 holds_turn_start_lock 显式跳过重入取锁，不依赖此重入性
+        self._turn_start_lock = threading.RLock()
         # 用户消息排队：会话回合运行中收到的新消息进入该队列（FIFO），
         # 回合 finally 结束时自动补发队首。条目含 id/text/display_text/
         # attachments，供前端排队条目展示与取消/插队操作定位
@@ -1281,7 +1283,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         _active_turns 在回合 finally 中 pop，条目存在即代表回合已登记；
         再用 is_alive 过滤刚登记尚未启动/已结束未清理的极窄竞态窗口。
         """
-        return any(t.is_alive() for t in self._active_turns.values())
+        # list() 快照：与回合 finally 的 pop 并发时，生成器迭代会抛
+        # "dictionary changed size during iteration"，on_closing 捕获后按
+        # "无回合"处理，极端时序可能在回合运行中放行关窗（shutdown 用了快照，两处对齐）
+        return any(t.is_alive() for t in list(self._active_turns.values()))
 
     def get_active_turn_snapshot(self, session_name: str) -> Optional[Dict[str, Any]]:
         """获取指定会话当前进行中的回合快照（若无活跃回合返回 None）。"""
@@ -4631,6 +4636,48 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("switch_session 失败")
             return {"ok": False, "msg": str(e), "messages": []}
 
+    def _migrate_session_aux_state(
+        self, old_name: str, final_name: str, *, holds_turn_start_lock: bool = False
+    ) -> None:
+        """会话改名后的随迁五件套：手动与自动改名共用，缺一即漏。
+
+        - 秘书来源缓存：旧名作废，新名留空由下次解析回源（来源与名字都随行，
+          缓存键必须跟着改名走）；
+        - 「总是允许」授权与沙盒放行（permission_grants / sandbox_bypass）：
+          不随迁则改名后等效全部失效，用户需重新审批；
+        - 排队消息队列迁到新名并推快照——首轮自动改名发生在回合 finally 内，
+          不迁则 finally 末尾按旧名补发会把旧名重新 ensure_session 成幽灵会话，
+          排队消息"消失"进幽灵会话。
+
+        holds_turn_start_lock：调用方已持 _turn_start_lock 时（send 路径的
+        落库即命名在 send 临界区内）队列迁移不得重入取锁——裸构造的测试桥
+        装的是普通 Lock，重入即自死锁；此时外层临界区本就保证原子性。
+        """
+        try:
+            secretary.invalidate_secretary_cache(old_name)
+            secretary.invalidate_secretary_cache(final_name)
+        except Exception:
+            logger.debug("秘书缓存随改名失效失败", exc_info=True)
+        try:
+            from core import permission_grants
+            from core.tools import rename_session_sandbox_bypass
+
+            permission_grants.rename_task(old_name, final_name)
+            rename_session_sandbox_bypass(old_name, final_name)
+        except Exception:
+            logger.warning("授权/沙盒放行随改名迁移失败 (%s -> %s)", old_name, final_name, exc_info=True)
+        if holds_turn_start_lock:
+            self._migrate_message_queue_unlocked(old_name, final_name)
+        else:
+            with self._turn_start_lock:
+                self._migrate_message_queue_unlocked(old_name, final_name)
+
+    def _migrate_message_queue_unlocked(self, old_name: str, final_name: str) -> None:
+        """排队消息随会话迁到新名并推快照（调用方保证与队列操作互斥）。"""
+        if old_name in self._message_queues:
+            self._message_queues[final_name] = self._message_queues.pop(old_name)
+            self._emit_message_queue_snapshot(final_name)
+
     def rename_session(self, old_name: str, new_name: str) -> Dict[str, Any]:
         try:
             # M21：回合运行中禁止重命名——运行中的回合终态事件带的是旧会话名，
@@ -4642,21 +4689,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
             if self._current_session == old_name:
                 self._set_current_session(final_name)
-            # 会话名变了：旧名缓存作废，新名留空由下次解析回源（秘书会话的来源与
-            # 名字都随行，缓存键必须跟着改名走）
-            secretary.invalidate_secretary_cache(old_name)
-            secretary.invalidate_secretary_cache(final_name)
-            from core import permission_grants
-            from core.tools import rename_session_sandbox_bypass
-
-            permission_grants.rename_task(old_name, final_name)
-            rename_session_sandbox_bypass(old_name, final_name)
-            # 排队消息随会话迁移到新名（重命名时无运行回合，但队列可能非空：
-            # 上一回合刚结束、补发线程尚未调度等窗口），快照让前端同步
-            with self._turn_start_lock:
-                if old_name in self._message_queues:
-                    self._message_queues[final_name] = self._message_queues.pop(old_name)
-                    self._emit_message_queue_snapshot(final_name)
+            self._migrate_session_aux_state(old_name, final_name)
             # 手动重命名与自动重命名（_rename_session_to_title）共用同一事件负载：
             # 前端按该负载迁移当前会话名、运行态与分组内条目，避免前端再写一份同步逻辑。
             # 取列表与推事件都放在保护块内：此时 DB 与授权迁移均已生效，报失败会让前端
@@ -5032,6 +5065,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     def clear_session_history(self, session_name: Optional[str] = None) -> Dict[str, Any]:
         try:
             target = session_name or self._current_session
+            # M21：与 delete/rename 同界——清空会删 messages、harness turns、
+            # DeepSeek prompt generations 与摘要归档，在飞回合随后引用已删行
+            # （CAS 世代被从脚下删掉、turn 边界失效），必须先停或等完成。
+            if self._is_turn_active(target):
+                return {
+                    "ok": False, "success": False,
+                    "msg": "该会话正在运行回合，请先停止或等待完成后再清空历史",
+                }
             self._clear_session_last_error(target)
             deleted = self._memory.clear_session_messages(target)
             from core.llm import session_token_usage, token_usage_lock
@@ -6784,7 +6825,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     if base_title:
                         try:
                             self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
-                            new_session = self._rename_session_to_title(target_session, base_title)
+                            # 本处已持有 _turn_start_lock（send 临界区内）：
+                            # 随迁队列不得重入取锁（裸构造测试桥装的是普通 Lock）
+                            new_session = self._rename_session_to_title(
+                                target_session, base_title, holds_turn_start_lock=True
+                            )
                             if new_session != target_session:
                                 target_session = new_session
                         except Exception:
@@ -7438,6 +7483,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         api_key = ""
         turn_finished = False
         event_session_name = session_name
+        # 自动改名（首轮标题化）后队列已随迁新名，finally 末尾补发必须用新名，
+        # 否则按旧名 drain 扑空、排队消息滞留（旧名还会被 ensure_session 成幽灵会话）
+        drain_session_name = session_name
         cancelled = False
         turn_id = ""
         automation_run_id = str((automation_context or {}).get("run_id") or "")
@@ -7626,6 +7674,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
                 if automation_run_id:
                     automation_error = "当前未激活任何 LLM 模型"
+                # 秘书派发回合同样要置 terminal_message：finally 的完成通知按
+                # 该字段区分成败，缺省会把"什么都没跑"误报成"任务已执行完成"
+                error_state["terminal_message"] = "当前未激活任何 LLM 模型"
                 self.emit_event("error", {"message": "当前未激活任何 LLM 模型，请先在模型管理中配置并激活模型。", "session_name": session_name})
                 self.emit_event("turn_cancelled", {"session_name": session_name})
                 finish_once()
@@ -7919,6 +7970,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 self.emit_event("turn_cancelled", {"session_name": session_name})
             else:
                 event_session_name = self._maybe_auto_rename(session_name) or session_name
+                drain_session_name = event_session_name
             _phase_mark("取消事件/自动重命名完成")
         except Exception as e:
             logger.exception("GUI 对话回合失败")
@@ -8081,8 +8133,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 except Exception:
                     pass
             # finally 末尾：补发排队中的用户消息（FIFO）。放在所有清理之后，
-            # 保证补发回合的 turn_start 事件一定晚于本回合的终态事件到达前端
-            self._drain_message_queue(session_name)
+            # 保证补发回合的 turn_start 事件一定晚于本回合的终态事件到达前端。
+            # 用 drain_session_name：首轮自动改名后队列已在新名下。
+            self._drain_message_queue(drain_session_name)
 
     def _on_background_task_finished(self, task_id: str, command: str, returncode: int,
                                      session_id: str = "", log_tail: str = "") -> None:
@@ -8216,6 +8269,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return
         if subagent_manager.has_running_background_tasks(session):
             return
+        # 会话可能已被删除（删除会话时不拦在跑的后台子代理，其终态回调晚到）：
+        # 在已删会话上起汇总回合会把旧名 ensure_session 复活成幽灵会话
+        try:
+            known = {
+                str(s.get("name") or "")
+                for s in self._memory.get_all_sessions(workdir=None)
+            }
+            if session not in known:
+                return
+        except Exception:
+            logger.debug("后台汇总前会话存在性检查失败，继续原流程", exc_info=True)
 
         with self._turn_start_lock:
             if self._is_turn_active(session):
@@ -8543,8 +8607,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         first_text = sanitize_session_title(first_text)
         return first_text[:12] if first_text else None
 
-    def _rename_session_to_title(self, session_name: str, base_title: str) -> str:
-        """把会话重命名为 base_title（撞名自动加序号），成功推送 session_renamed。"""
+    def _rename_session_to_title(
+        self, session_name: str, base_title: str, *, holds_turn_start_lock: bool = False
+    ) -> str:
+        """把会话重命名为 base_title（撞名自动加序号），成功推送 session_renamed。
+
+        holds_turn_start_lock 由 send 路径（落库即命名，已持锁）传入，
+        透传给随迁五件套避免重入取锁。
+        """
         existing = {s.get("name") for s in self._memory.get_all_sessions(workdir=None)}
         new_title = base_title
         suffix = 2
@@ -8555,6 +8625,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         if success:
             if self._current_session == session_name:
                 self._set_current_session(final_name)
+            # 与手动改名共用同一套随迁（授权/沙盒放行/秘书缓存/排队消息）：
+            # 首轮自动改名发生在回合 finally 内，此前缺这一步会让"总是允许"
+            # 授权静默失效、排队消息落进旧名幽灵会话。
+            self._migrate_session_aux_state(
+                session_name, final_name, holds_turn_start_lock=holds_turn_start_lock
+            )
             self.emit_event("session_renamed", {
                 "old": session_name,
                 "new": final_name,

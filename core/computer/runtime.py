@@ -130,6 +130,22 @@ def sweep_stale_computer_temp_dirs(
                 entry.name.startswith(prefix) for prefix in _STALE_TEMP_DIR_PREFIXES
             ):
                 continue
+            if entry.name == "ycode-computer-preview":
+                # 预览根目录只是容器，绝不整体 rmtree：根自身 mtime 只随子目录
+                # 增删变化，长驻实例 24h 无子目录变动时根 mtime 过老，后启动
+                # 实例会把存活实例的 preview 目录一并删掉。逐子目录
+                # （preview-* 按进程隔离）判 mtime。
+                for child in entry.iterdir():
+                    try:
+                        if not child.name.startswith("preview-"):
+                            continue
+                        if now - child.stat().st_mtime < max_age_s:
+                            continue
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                    except OSError:
+                        _LOGGER.exception("清扫预览进程目录失败：%s", child)
+                continue
             if now - entry.stat().st_mtime < max_age_s:
                 continue
             shutil.rmtree(entry, ignore_errors=True)

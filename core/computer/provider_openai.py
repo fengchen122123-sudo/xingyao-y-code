@@ -607,6 +607,31 @@ def build_computer_call_output(call, observation) -> dict:
             ],
         }
     png_bytes = _read_png_bytes(observation)
+    # 与 provider_generic 同一上限（2MB/1280 边）：高分屏整屏 PNG 直接 base64
+    # 会显著放大请求体；超限先缩放，仍超限发纯文本观察（原生协议无省略图
+    # 专用字段，退回 input_text 与 B 方案降级同构）。
+    from core.computer.provider_generic import (
+        _OBSERVATION_IMAGE_MAX_BYTES,
+        _downscale_png,
+        no_screenshot_observation_text,
+    )
+
+    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+        scaled = _downscale_png(png_bytes)
+        if scaled:
+            png_bytes = scaled
+    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+        return {
+            "type": "computer_call_output",
+            "call_id": call.call_id,
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": no_screenshot_observation_text(observation)
+                    + "\n（截图体积超过上限，已省略）",
+                }
+            ],
+        }
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
     return {
         "type": "computer_call_output",

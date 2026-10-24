@@ -328,6 +328,7 @@ class _DefaultSurfaceHost:
 
         def collect(uia):
             buttons = []
+            registry: dict[int, object] = {}
             for hwnd in hosts:
                 try:
                     element = uia.ElementFromHandle(hwnd)
@@ -368,19 +369,23 @@ class _DefaultSurfaceHost:
                                 )
                             except Exception:
                                 can_invoke = False
-                            buttons.append((hwnd, name, bounds, can_invoke, item))
+                            # 元素引用只登记进本线程内的注册表并整体替换（旧
+                            # 引用随之在本线程释放）；返回值只带序号与纯数据——
+                            # COM 接口指针跨 apartment 传出/释放是未定义行为，
+                            # 此前把 item 直接带出线程违反了本文件头部的不变量。
+                            serial = id(item)
+                            registry[serial] = item
+                            buttons.append((hwnd, serial, name, bounds, can_invoke))
                         except Exception:
                             continue
+            self._elements = registry
             return buttons
 
         raw = com.call(collect)
-        # 控件对象与序号留在 COM 线程侧：以序号引用，元素本体由本 host 持有。
-        buttons = []
-        self._elements = getattr(self, "_elements", {})
-        self._element_source = getattr(self, "_element_source", {})
-        for hwnd, name, bounds, can_invoke, item in raw:
-            serial = id(item)
-            self._elements[serial] = item
+        # 序号→来源窗口类名（纯字符串，调用线程持有安全）
+        buttons: list[tuple[int, str, tuple[int, int, int, int], bool]] = []
+        self._element_source = {}
+        for hwnd, serial, name, bounds, can_invoke in raw:
             self._element_source[serial] = class_names.get(hwnd, "")
             buttons.append((serial, name, bounds, can_invoke))
         return buttons
@@ -390,15 +395,15 @@ class _DefaultSurfaceHost:
         return getattr(self, "_element_source", {}).get(int(serial), "")
 
     def invoke_button(self, serial: int) -> None:
-        elements = getattr(self, "_elements", {})
-        item = elements.get(int(serial))
-        if item is None:
-            raise ComputerControlError(
-                "computer_surface_unknown", "托盘候选已失效，请重新观察"
-            )
         com = self._com_thread()
 
         def invoke(_uia):
+            # 注册表只在 COM 线程内读写（见 list_tray_buttons）
+            item = getattr(self, "_elements", {}).get(int(serial))
+            if item is None:
+                raise ComputerControlError(
+                    "computer_surface_unknown", "托盘候选已失效，请重新观察"
+                )
             pattern = item.GetCurrentPattern(_UIA_INVOKE_PATTERN_ID)
             if not pattern:
                 raise ComputerControlError(
@@ -421,13 +426,13 @@ class _DefaultSurfaceHost:
             ) from error
 
     def element_bounds(self, serial: int) -> tuple[int, int, int, int] | None:
-        elements = getattr(self, "_elements", {})
-        item = elements.get(int(serial))
-        if item is None:
-            return None
         com = self._com_thread()
 
         def bounds(_uia):
+            # 注册表只在 COM 线程内读写（见 list_tray_buttons）
+            item = getattr(self, "_elements", {}).get(int(serial))
+            if item is None:
+                return None
             rect = item.CurrentBoundingRectangle
             return (
                 int(rect.left),
@@ -453,8 +458,13 @@ class _DefaultSurfaceHost:
         with self._com_lock:
             com = self._com
             self._com = None
-            self._elements = {}
         if com is not None:
+            # 元素注册表在 COM 线程内清空（引用随之在该线程释放），绝不从
+            # 调用线程丢弃 COM 引用
+            try:
+                com.call(lambda _uia: setattr(self, "_elements", {}))
+            except Exception:
+                pass
             com.close()
 
 

@@ -95,7 +95,9 @@ def decide_replay(facts: Any) -> tuple[ReplayDecision, str]:
         # workspace / git / network / system 以及未知 scope 一律走人工确认。
         return ReplayDecision.CONFIRM, "write_requires_confirmation"
     except Exception:
-        return ReplayDecision.CONFIRM, "write_requires_confirmation"
+        # 决策异常的兜底：保守确认（方向与写操作一致），但原因码独立，
+        # 避免诊断时把异常兜底误读成"已判定为写操作"
+        return ReplayDecision.CONFIRM, "decision_error_requires_confirmation"
 
 
 _BUCKETS = {
