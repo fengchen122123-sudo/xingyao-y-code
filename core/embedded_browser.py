@@ -395,8 +395,9 @@ class EmbeddedBrowserController:
     ) -> None:
         """在 GUI 线程内创建并挂载 WebView2 控件（幂等）。
 
-        additional_browser_args 也用于面板控件创建路径（面板从创建起就带 CDP
-        调试端口，这样星瑶自动化操作的就是用户看到的那个浏览器），必须在
+        面板控件创建路径不再传 CDP 端口（面板默认不带调试端口）；需要端口的
+        是 prepare_automation 的重建路径（自动化/电脑操控接管时按需带端口
+        重建，仍是用户看到的那个浏览器）。additional_browser_args 必须在
         EnsureCoreWebView2Async 之前写入 CreationProperties。
         user_data_folder 缺省为 profile_dir()：面板控件与自动化共用同一目录，
         一套浏览器、共享登录态。cdp_port 记录本次实际请求的端口，供
@@ -615,16 +616,14 @@ class EmbeddedBrowserController:
 
             def _do_open():
                 try:
-                    # 面板控件从创建起就带 CDP 调试端口：星瑶自动化用的就是用户
-                    # 眼睛看到的这个浏览器（一套实例、共享登录态、用户可见），
-                    # 不再另建隐藏控件，也就不存在第二个 WebView2 环境。
-                    # _create_control 幂等：控件已存在时端口不生效，保持原状。
-                    port = pick_free_loopback_port()
-                    self._create_control(
-                        form,
-                        additional_browser_args=f"--remote-debugging-port={port}",
-                        cdp_port=port,
-                    )
+                    # 面板控件默认不带 CDP 调试端口：星瑶自动化/电脑操控接管时经
+                    # prepare_automation 按需重建带端口的控件（仍是从用户眼睛
+                    # 看到的这个浏览器，一套实例、共享登录态），首次接管页面会
+                    # 重载一次。这样"只打开右侧浏览器面板、从未用自动化"的
+                    # 用户不再背一个无鉴权的常驻回环 CDP 端口（同机任意进程
+                    # 可连上并接管浏览器、读登录态）。
+                    # _create_control 幂等：控件已存在时保持原状。
+                    self._create_control(form)
                     self._apply_bounds(form, rect, zoom)
                     self._visible = True
                     if self._webview is not None:

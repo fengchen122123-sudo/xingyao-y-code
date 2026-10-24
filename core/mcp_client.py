@@ -685,6 +685,11 @@ class MCPManager:
             return False, "MCP 管理器已关闭（进程退出中）"
         if not name or not isinstance(name, str):
             return False, "server 名称不能为空"
+        # 名称不得含 "__"：工具名形如 f"{server}__{tool}"，重连按前缀
+        # f"{name}__" 幂等替换 schema——名为 "a__b" 的 server 会剥掉
+        # server "a" 的 "b__*" 工具并把它们重路由到自己（本地配置内遮蔽）
+        if "__" in name:
+            return False, "server 名称不能包含双下划线（__，与工具名前缀分隔符冲突）"
         if not command or not isinstance(command, str):
             return False, "command 不能为空"
         if not isinstance(args, list):
@@ -749,7 +754,7 @@ class MCPManager:
         """返回所有 MCP server 配置的 JSON 字符串（供 AI 工具读取）。
 
         包含 enabled/command/args/env/connected/last_error 字段，env 中的 API Key
-        会做掩码处理（前 4 位 + **** + 后 4 位），避免敏感信息泄露给 LLM。
+        会做全掩码处理（***），避免敏感信息泄露给 LLM。
         last_error 为最近一次连接失败原因（无失败时为 null），便于排查连接问题。
         """
         try:
@@ -772,6 +777,16 @@ class MCPManager:
                 env = conf.get("env")
                 if env:
                     item["env"] = {key: _redact_secret(value) for key, value in env.items()}
+                    # 加密失败的值按明文落盘（_encrypt_env_values 的可用性优先
+                    # 降级）：状态里显式标出，让 /mcp 的用户能发现该 server
+                    # 的 env 未加密，而不是只藏在日志里
+                    plaintext_keys = [
+                        key
+                        for key, value in env.items()
+                        if not str(value or "").startswith(("dpapi:", "keyring:"))
+                    ]
+                    if plaintext_keys:
+                        item["env_plaintext"] = plaintext_keys
                 else:
                     item["env"] = None
                 result.append(item)

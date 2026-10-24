@@ -146,7 +146,11 @@ def render_session_history(
                 except Exception:
                     _agent_label = "星瑶"
                 output.append(f"{ANSI_MAGENTA}🤖 {_agent_label} >{ANSI_RESET}\n")
-                output.append(render_markdown_to_ansi(content, width))
+                try:
+                    output.append(render_markdown_to_ansi(content, width))
+                except Exception:
+                    # 单块病态 markdown 只降级为原文，不能让整个历史回放失败
+                    output.append(content or "")
                 prev_block = "assistant"
             continue
 

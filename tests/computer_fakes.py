@@ -1002,6 +1002,10 @@ class FakeBridgeController:
         self.emit_state(run_id=run_id, event_seq=4, status="stopped", reason=reason)
         return self.snapshot()
 
+    def stop_for_user(self, run_id: str, reason: str = "user_stop"):
+        # 镜像真实 controller：用户停止只结束 run，不置位回合 cancel_event。
+        return self.stop(run_id, reason, cancel_owner=False)
+
     def snapshot(self):
         return ComputerRunSnapshot(
             run_id=self.run_id,

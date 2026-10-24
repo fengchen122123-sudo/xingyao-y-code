@@ -340,7 +340,9 @@ class PtyTerminalSession:
                 try:
                     self._exit_code = int(self._proc.exitstatus)
                 except Exception:
-                    self._exit_code = 0
+                    # 被强杀的 shell exitstatus 为 None：兜底记 0 会让前端把
+                    # "被杀"显示成"正常退出"；保留 None 表示无退出码
+                    self._exit_code = None
             else:
                 self._exit_code = self._popen.wait()
         except Exception:

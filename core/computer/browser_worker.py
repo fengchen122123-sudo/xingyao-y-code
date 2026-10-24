@@ -86,9 +86,11 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 request = decode_request(line)
             except (ValueError, json.JSONDecodeError) as error:
+                # 会话期协议错误用独立事件名：父进程把 boot_failed 记进
+                # _boot_error（启动后无人再读），语义误导且难排查
                 _emit(
                     {
-                        "event": "boot_failed",
+                        "event": "worker_protocol_error",
                         "error_code": "computer_provider_protocol_error",
                         "error_message": f"受管进程请求不合法：{error}",
                     }

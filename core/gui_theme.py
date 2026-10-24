@@ -446,8 +446,15 @@ class ThemeRepository:
         if not self.root.exists():
             return summaries
         for directory in sorted(self.root.iterdir(), key=lambda item: item.name):
-            if directory.is_dir():
+            # 跳过点前缀目录：staging（.gui-theme-*，建在 root 内，崩溃/占用
+            # 清理失败会残留）与用户随手放进来的杂项目录。无差别 get_theme 会让
+            # 一个不匹配 THEME_ID_RE 的目录把整个主题列表打挂到手动删除为止。
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            try:
                 summaries.append(self._summary(self.get_theme(directory.name)))
+            except ThemeError:
+                continue
         return summaries
 
     def get_theme(self, theme_id: str) -> dict[str, Any]:

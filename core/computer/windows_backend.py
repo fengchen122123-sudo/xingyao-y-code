@@ -543,7 +543,6 @@ class WindowsComputerBackend:
                 for candidate in (*windows, *tray)
             )
             return
-            return
         if kind == "activate_surface":
             # 激活窗口并验证实际前台身份（SetForegroundWindow 失败显式报错）。
             locator.activate_window(action.surface_ref, action.surface_generation)

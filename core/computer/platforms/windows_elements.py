@@ -72,6 +72,13 @@ class WindowsElementLocator:
         全部旧 ref 立即过期，后续 click/set_value 抛 computer_element_stale。"""
         with self._lock:
             self._elements = {}
+            real = self._real
+        if real is not None:
+            # 真实映射在 COM 线程内释放（本层字典只承载 ref 名，无 COM 对象）
+            try:
+                real.clear()
+            except Exception:
+                pass
 
     def click(self, ref: str) -> None:
         with self._lock:

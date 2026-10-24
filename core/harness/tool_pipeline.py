@@ -665,14 +665,17 @@ class ToolBatchExecutor:
         on_event: Callable[[str, dict], None] | None,
     ) -> tuple[ToolExecutionRecord, ...]:
         records: list[ToolExecutionRecord] = []
+        total_calls = 0
 
         for batch in self.prepare(tool_calls, context):
-            # 续跑打点：记录本轮工具调用数。harness_step 默认 None 时不写库，
-            # 因此未接入续跑的场景行为与字节完全不变。
+            # 续跑打点：记录本轮工具调用数（跨批累计——按批覆盖会在多批时
+            # 只剩最后一批的数目）。harness_step 默认 None 时不写库，因此
+            # 未接入续跑的场景行为与字节完全不变。
             step = getattr(context, "harness_step", None)
+            total_calls += len(batch.calls)
             if step is not None:
                 try:
-                    step.mark_tool_call_count(len(batch.calls))
+                    step.mark_tool_call_count(total_calls)
                 except Exception:
                     _LOGGER.warning("mark_tool_call_count failed", exc_info=True)
             self.begin_batch(batch, context, on_event)

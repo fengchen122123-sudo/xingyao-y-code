@@ -12,6 +12,7 @@ ApiBridge 继承本混入；pywebview 反射暴露 public snake_case 方法。
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import fields as dataclass_fields, is_dataclass
 from typing import Any, Dict, Optional
 
@@ -42,14 +43,21 @@ class GitBridgeMixin:
 
     # ---- 惰性初始化 ------------------------------------------------------
 
+    # js_api 方法由 pywebview 在各自线程派发，并发首调必须串行化创建：
+    # 无锁双写会重置 _git_versions 等三个 dict，worktree_version=None 的
+    # 快照让 core/git/service 跳过乐观并发校验，外部改动可被静默覆盖。
+    _git_init_lock = threading.Lock()
+
     def _git(self):
         if getattr(self, "_git_svc", None) is None:
-            self._git_svc = get_git_service()
-            self._git_svc.on_invalidate = self._git_on_invalidated
-            self._git_monitor = get_git_monitor()
-            self._git_subs: Dict[str, str] = {}
-            self._git_versions: Dict[str, SnapshotVersions] = {}
-            self._git_serialized: Dict[str, Dict] = {}
+            with self._git_init_lock:
+                if getattr(self, "_git_svc", None) is None:
+                    self._git_svc = get_git_service()
+                    self._git_svc.on_invalidate = self._git_on_invalidated
+                    self._git_monitor = get_git_monitor()
+                    self._git_subs: Dict[str, str] = {}
+                    self._git_versions: Dict[str, SnapshotVersions] = {}
+                    self._git_serialized: Dict[str, Dict] = {}
         return self._git_svc
 
     def _git_ok(self, **data) -> Dict:

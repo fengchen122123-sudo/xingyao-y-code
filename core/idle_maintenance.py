@@ -148,6 +148,7 @@ class IdleMaintenanceService:
         session = entry["session"]
         notify = entry.get("notify")
         cancel_event = threading.Event()
+        self_registered = False
         with self._condition:
             if self._shutdown or session in self._busy:
                 return
@@ -157,14 +158,17 @@ class IdleMaintenanceService:
                 cancel_event = self._cancel_events[session]
             else:
                 self._cancel_events[session] = cancel_event
+                self_registered = True
         try:
             self._do_maintenance(session, notify, cancel_event)
         except Exception:
             _LOGGER.debug("会话 %s 闲时维护异常（已忽略）", session, exc_info=True)
         finally:
             with self._condition:
-                # 只清理自己注册的事件；复用场景下注册表条目归上一轮所有
-                if self._cancel_events.get(session) is cancel_event:
+                # 只清理自己注册的事件：复用方持有的是同一对象，`is` 比较
+                # 区分不出"我注册的"与"我复用的"，复用方先结束会把条目弹掉，
+                # 注册方还在等 done、回合开始却再也中断不到在跑的压缩
+                if self_registered and self._cancel_events.get(session) is cancel_event:
                     self._cancel_events.pop(session, None)
 
     def _do_maintenance(self, session, notify, cancel_event):

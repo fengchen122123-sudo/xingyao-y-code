@@ -371,6 +371,10 @@ class _WorkerProcessTransport:
         self._proc: subprocess.Popen | None = None
         self._job = None
         self._lock = threading.Lock()
+        # stdin 写入串行化：execute（回合线程）与 release/close（停止线程）
+        # 可并发写管道，单行 JSON 被拆多次 WriteFile 时可能交错、子进程解析
+        # 失败即自杀。_lock 只覆盖序号/登记，刻意保持小临界区，故独立锁。
+        self._stdin_lock = threading.Lock()
         self._seq = 0
         self._pending: dict[int, _PendingCommand] = {}
         self._ready = threading.Event()
@@ -438,10 +442,11 @@ class _WorkerProcessTransport:
             pending = _PendingCommand()
             self._pending[command_id] = pending
         try:
-            line = _encode_worker_request(command_id, op, **payload)
-            assert self._proc is not None and self._proc.stdin is not None
-            self._proc.stdin.write((line + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
+            with self._stdin_lock:
+                line = _encode_worker_request(command_id, op, **payload)
+                assert self._proc is not None and self._proc.stdin is not None
+                self._proc.stdin.write((line + "\n").encode("utf-8"))
+                self._proc.stdin.flush()
         except (OSError, ValueError) as error:
             self._fail_pending_closed()
             raise ComputerControlError(
@@ -506,6 +511,13 @@ class _WorkerProcessTransport:
                 str(message.get("error_message") or "受管执行进程启动失败"),
             )
             self._ready.set()
+        elif event == "worker_protocol_error":
+            # 会话期协议错误：worker 随即退出（EOF 路径统一归一
+            # computer_browser_closed），此处只留痕
+            _LOGGER.warning(
+                "受管浏览器执行进程报告协议错误：%s",
+                message.get("error_message"),
+            )
 
     def _fail_pending_closed(self) -> None:
         with self._lock:

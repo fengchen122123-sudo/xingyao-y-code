@@ -590,15 +590,21 @@ class ToolAdapterSet:
                 f"不超过 {max_target_len} 字符的小段后重试；如需整体重写，请改用 write_file。",
                 is_error=True,
             )
-        if not os.path.isfile(file_path or ""):
-            return ToolResult(
-                f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
-                "edit_file 只能修改已有文件；创建新文件请改用 write_file。",
-                is_error=True,
-            )
+        # 与 execute_write_file 同一口径：bypass 临界区内先按线程级 workdir
+        # 解析再判存。进程 cwd 在 GUI 打包版停在安装目录，裸用原始相对路径
+        # 会按 cwd 判存，把合法编辑误报成"文件不存在"；而解析必须放在
+        # bypass 之内——工作区外的路径（守卫已批准）在临界区外会被
+        # _resolve_workspace_path 的越界检查直接拒绝。
         with bypass if bypass is not None else self.sandbox_bypass():
+            resolved_path = _resolve_workspace_path(file_path)
+            if not resolved_path.is_file():
+                return ToolResult(
+                    f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
+                    "edit_file 只能修改已有文件；创建新文件请改用 write_file。",
+                    is_error=True,
+                )
             try:
-                old_content = self.read_text(file_path)
+                old_content = self.read_text(str(resolved_path))
             except OSError as read_error:
                 logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_error)
                 old_content = ""
@@ -615,12 +621,12 @@ class ToolAdapterSet:
             ).to_message_content()
             if not result.startswith(TOOL_ERROR_PREFIX):
                 try:
-                    new_content = self.read_text(file_path)
+                    new_content = self.read_text(str(resolved_path))
                 except OSError as read_error:
                     logger.warning("读取新文件内容失败 (%s): %s", file_path, read_error)
                     new_content = ""
                 self.show_file_diff(
-                    file_path,
+                    str(resolved_path),
                     old_content,
                     new_content,
                     context.event_callback,

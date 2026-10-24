@@ -321,10 +321,11 @@ def is_port_open(host="127.0.0.1", port=5173) -> bool:
     """检查 Vite 开发服务器端口 5173 是否处于打开监听状态"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        res = s.connect_ex((host, port))
-        s.close()
-        return res == 0
+        try:
+            s.settimeout(0.5)
+            return s.connect_ex((host, port)) == 0
+        finally:
+            s.close()
     except Exception:
         return False
 

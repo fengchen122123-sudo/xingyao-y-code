@@ -795,6 +795,8 @@ def test_broadcast_concurrent_thread_safety():
     for t in threads:
         t.join()
 
+    # broadcast 走每客户端出站队列异步发送（真实注册路径建队列），等排空再断言
+    assert srv.wait_outbound_drain(timeout=5.0) is True
     # 4 个 worker_broadcast 发送 4*10=40 条，4 个 worker_route 发送 4*10=40 条，共 80 条全部收到
     assert len(sent_messages) == 80
 

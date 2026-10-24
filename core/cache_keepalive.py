@@ -59,25 +59,34 @@ def _resolve_keepalive_session_key(session_key=None, telemetry=None):
 
 
 def load_keepalive_interval() -> int:
-    """保活间隔秒数：默认 120；显式配置 0 关闭；0<x<60 拒绝（过于频繁）。"""
+    """保活间隔秒数：默认 120；显式配置 0 关闭；越界值回落默认并告警。
+
+    本函数在每轮主对话请求的前置区被裸调（llm.py cache_scope == "main"），
+    任何 raise 都会把全部会话打穿成 turn_error——非数字与数字越界（负数、
+    0<x<60）一律回落默认 120 并告警，绝不抛出。
+    """
     from core.model_manager import load_config
 
     raw = load_config().get("prompt_cache_keepalive_seconds", 120)
     try:
         interval = int(raw or 0)
     except (TypeError, ValueError):
-        # 配置写成 "abc" 这类非法值时不能抛穿 register_request（每轮对话都会调用），
-        # 回落默认间隔并告警
         logger.warning(
             "prompt_cache_keepalive_seconds 配置非法: %r，已回落默认 120 秒", raw
         )
         interval = 120
     if interval < 0:
-        raise ValueError("prompt_cache_keepalive_seconds 不能为负数")
-    if 0 < interval < MIN_KEEPALIVE_SECONDS:
-        raise ValueError(
-            f"prompt_cache_keepalive_seconds 至少为 {MIN_KEEPALIVE_SECONDS} 秒，0 表示关闭"
+        logger.warning(
+            "prompt_cache_keepalive_seconds 配置为负数: %r，已回落默认 120 秒", raw
         )
+        interval = 120
+    elif 0 < interval < MIN_KEEPALIVE_SECONDS:
+        logger.warning(
+            "prompt_cache_keepalive_seconds 配置为 %r（小于最小值 %d 秒，0 表示关闭），"
+            "已回落默认 120 秒",
+            raw, MIN_KEEPALIVE_SECONDS,
+        )
+        interval = 120
     return interval
 
 
