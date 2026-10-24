@@ -5,7 +5,12 @@
     <!-- img-src/media-src 放行 127.0.0.1 任意端口：助手消息媒体经 core/media_server
          的随机端口受控服务加载（内容寻址 Blob + 令牌鉴权，与 connect-src 的
          LAN 远程放行同一安全边界）；仅限本机回环，不放宽到任意主机 -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:*; media-src 'self' http://127.0.0.1:* http://localhost:*; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:*; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <!-- CSP：默认只信任自身；仅额外放行阿里云人机验证（sms 登录的滑块）所需域名——
+         SDK 主入口在 o.alicdn.com，加载后还会动态拉 g./x.alicdn.com 上的子脚本与样式，
+         故 script/style 统一按 *.alicdn.com 放行；验证码接口与设备指纹走 aliyun.com /
+         aliyuncs.com；connect-src 额外允许 data:（SDK 会读取内联 data URL）。
+         除这些来源外不放宽任何策略，且不引入 unsafe-eval。 -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://*.alicdn.com; style-src 'self' 'unsafe-inline' https://*.alicdn.com; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:* https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; media-src 'self' http://127.0.0.1:* http://localhost:*; connect-src 'self' data: ws://127.0.0.1:* http://127.0.0.1:* https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; frame-src https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; font-src 'self' data: https://*.alicdn.com; object-src 'none'; base-uri 'none'; form-action 'none'">
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>星瑶Code</title>

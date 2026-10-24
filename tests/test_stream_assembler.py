@@ -157,6 +157,21 @@ def test_deepseek_thinking_tool_call_preserves_empty_reasoning_string():
     assert assembler.finish().reasoning_content == ""
 
 
+def test_deepseek_thinking_text_reply_keeps_empty_reasoning_string():
+    """无工具调用的常规回复也要带空串：留 None 会让下一轮历史缺字段，被上游拒绝。"""
+    assembler = StreamAssembler(require_tool_call_reasoning=True)
+    assembler.consume(_chunk(content="拉好了"))
+
+    assert assembler.finish().reasoning_content == ""
+
+
+def test_deepseek_thinking_text_reply_preserves_real_reasoning():
+    assembler = StreamAssembler(require_tool_call_reasoning=True)
+    assembler.consume(_chunk(reasoning="先看下工作区状态", content="拉好了"))
+
+    assert assembler.finish().reasoning_content == "先看下工作区状态"
+
+
 def test_non_reasoning_provider_strips_unsupported_reasoning_fields():
     assembler = StreamAssembler(
         keep_reasoning_fields=False,

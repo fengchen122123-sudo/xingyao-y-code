@@ -659,6 +659,8 @@ def _build_tool_pipeline_and_context(
     permission_source="主代理",
     computer_lease=None,
     computer_native_selection=None,
+    journal_event_sink=None,
+    harness_step=None,
 ):
     from core.harness.tool_adapters import ToolAdapterSet
     from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
@@ -713,6 +715,10 @@ def _build_tool_pipeline_and_context(
         # C6/C7 接线：注入默认 HookRunner（进程内单例）。无 hooks 配置时
         # runner 各层快速短路，工具链行为与字节保持改造前完全一致（H-T16）。
         hook_runner=get_default_hook_runner(),
+        # 续跑记录（S1-b）：由调用方（core/llm.py 的 turn/step 作用域）注入。
+        # 默认 None 时既不写 journal 也不写 tool_call_count，行为与改造前一致。
+        journal_event_sink=journal_event_sink,
+        harness_step=harness_step,
     )
     pipeline = ToolPipeline(
         adapters,

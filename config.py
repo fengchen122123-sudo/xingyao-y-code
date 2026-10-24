@@ -181,6 +181,11 @@ REMOTE_PAIR_TOKEN_KEY = "remote_pair_token"
 REMOTE_PAIR_TOKEN_EXPIRES_KEY = "remote_pair_token_expires_at"
 # 配对端口持久化键：重启后复用同一端口，二维码 URL 不变、无需重新扫码
 REMOTE_PAIR_PORT_KEY = "remote_pair_port"
+# 局域网 MCP 服务（供手机端 MCP 客户端如阶跃 Amoo 调用）：默认开启，与远程控制共用配对 token
+REMOTE_MCP_ENABLED_KEY = "remote_mcp_enabled"
+REMOTE_MCP_ENABLED_DEFAULT = True
+REMOTE_MCP_PORT_KEY = "remote_mcp_port"
+REMOTE_MCP_PORT_DEFAULT = 8765
 
 # 飞书通道（在飞书里与星瑶对话）：默认关闭，未配置时不影响任何现有功能。
 # app_secret 写盘前经 core.credentials 加密（dpapi:/keyring: 前缀），读取时解密。
@@ -505,6 +510,9 @@ KNOWN_CONFIG_KEYS = frozenset({
     # 局域网远程控制
     "remote_token_ttl", "remote_pair_token", "remote_pair_token_expires_at",
     "remote_pair_port",
+    # 局域网 MCP 服务（供手机端 MCP 客户端调用；未登记会在 strict_config=true
+    # 下被 UnknownConfigKeysError 阻断启动）
+    "remote_mcp_enabled", "remote_mcp_port",
     # 飞书通道（在飞书里与星瑶对话）
     "feishu_enabled", "feishu_app_id", "feishu_app_secret", "feishu_approvers",
     "feishu_notify_chat_id",

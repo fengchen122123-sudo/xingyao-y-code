@@ -665,6 +665,8 @@ class SnipBridgeMixin:
                 self._screen_snip_overlay = overlay
                 return {"ok": True}
         except Exception as exc:
+            # 异常路径清掉整屏原图引用（4K 屏约 30MB+），避免滞留到下次截图
+            self._screen_snip_source = None
             logger.exception("screen_snip_start 失败")
             return {"ok": False, "msg": str(exc)}
 

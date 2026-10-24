@@ -78,7 +78,7 @@
               class="danger"
               @click="deleteActiveTheme"
             >删除</button>
-            <button data-test="save-theme" class="primary-button" type="button" :disabled="busy || !fieldsValid" @click="saveTheme">保存</button>
+            <button data-test="save-theme" class="primary-button" type="button" :disabled="busy || !fieldsValid || !unifyValid" @click="saveTheme">保存</button>
             <button data-test="cancel-theme" type="button" :disabled="busy" @click="cancelEdits">取消</button>
           </template>
           <button data-test="toggle-preview" type="button" :disabled="busy" @click="togglePreview">
@@ -111,6 +111,29 @@
           @click="selectedRegion = 'native_titlebar'"
         >系统标题栏</button>
       </nav>
+
+      <!-- 统一文字颜色（全局一键）：把 4 个全局文字令牌 + 7 个分区的文字色
+           一次性写成同一个颜色。只写 theme.json 里**已有**的字段，不新增任何
+           schema 键，所以后端 core/gui_theme.py 的校验不需要改。 -->
+      <div v-if="selectedRegion === 'global'" class="unify-group">
+        <div class="unify-title">统一文字颜色</div>
+        <ColorField
+          :field="{ key: 'text_unify', label: '全部文字' }"
+          prefix="unify-"
+          :value="unifyColor"
+          :disabled="isBuiltin"
+          @commit="onUnifyCommit"
+          @validity="unifyValid = $event"
+        />
+        <p class="unify-hint">
+          这里选一个颜色 → 一次性写入 <b>4 个全局文字令牌</b>（主文字 / 高亮文字 /
+          次级文字 / 弱化文字）+ <b>7 个分区的文字色</b>，整个界面的文字随之统一。
+          之后想单独微调某一处，照常改对应页签即可；再点这里的颜色会再次全部覆盖。
+          <br />
+          不含彩色按钮上的前景色（如蓝色按钮的白字）—— 跟着变会出现"绿字压蓝底"
+          之类的可读性问题，故刻意不动。
+        </p>
+      </div>
 
       <ThemeRegionEditor
         v-if="selectedRegion === 'global'"
@@ -184,6 +207,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue';
 import ThemeRegionEditor from './theme/ThemeRegionEditor.vue';
+import ColorField from './theme/ColorField.vue';
 import { useAppStore } from '../stores/appStore';
 import type {
   GuiTheme,
@@ -226,6 +250,8 @@ const draft = ref<GuiTheme | null>(initialDraft ? clone(initialDraft) : null);
 
 const selectedRegion = ref<'global' | ThemeRegionId | 'native_titlebar'>('global');
 const fieldsValid = ref(true);
+// 统一文字颜色取色器的合法性：非法色值禁止保存/切换，与 fieldsValid 同一口径
+const unifyValid = ref(true);
 const busy = ref(false);
 const actionError = ref('');
 const copyDialog = ref<{ newId: string; newName: string } | null>(null);
@@ -250,6 +276,23 @@ function schedulePreview() {
     return;
   }
   void runPreview(snapshot);
+}
+
+// ── 统一文字颜色（全局一键）───────────────────────────────────────────────
+// 把 4 个全局文字令牌 + 7 个分区的文字色一次性写成同一个颜色。
+// 刻意只写 theme.json 里**已经存在**的字段，不新增 schema 键——
+// core/gui_theme.py 对未知字段是"明确报错"，新增键要同步改后端校验；
+// 而分区文字色本身就会在 CSS 的 [data-theme-region] 里覆盖全局令牌，
+// 所以把两边都写成同色就等于"全局统一"，无需改任何 CSS 或后端。
+const UNIFY_TEXT_TOKEN_KEYS = ['text_primary', 'text_bright', 'text_secondary', 'text_faint'] as const;
+// 展示值取"主文字"令牌：一键统一之后它就是那个统一色，语义自洽。
+const unifyColor = computed(() => String(draft.value?.tokens?.text_primary ?? '#000000'));
+
+function onUnifyCommit(_key: string, value: string) {
+  if (!draft.value) return;
+  for (const key of UNIFY_TEXT_TOKEN_KEYS) draft.value.tokens[key] = value;
+  for (const region of Object.values(draft.value.regions)) region.text = value;
+  schedulePreview();
 }
 
 async function runPreview(snapshot: GuiTheme) {
@@ -327,7 +370,7 @@ async function selectTheme(summary: GuiThemeSummary) {
         '未保存的主题修改', '', '当前主题有未保存的修改，是否先保存？', '保存修改',
       );
       if (saveFirst) {
-        if (!fieldsValid.value) {
+        if (!fieldsValid.value || !unifyValid.value) {
           actionError.value = '存在无效字段，请修正后再保存';
           return;
         }
@@ -357,7 +400,7 @@ async function selectTheme(summary: GuiThemeSummary) {
 
 // ── 保存 / 取消 ──
 async function saveTheme() {
-  if (busy.value || !draft.value || !fieldsValid.value) return;
+  if (busy.value || !draft.value || !fieldsValid.value || !unifyValid.value) return;
   store.themePreviewMode = false;
   busy.value = true;
   const snapshot = clone(draft.value);
@@ -662,6 +705,20 @@ async function clearGlobalInherit() {
 .theme-import { margin-top: 8px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12.5px; }
 .theme-import:hover { border-color: var(--accent); color: var(--accent); }
 .list-hint { margin: 10px 4px 0; font-size: 11px; color: var(--text-faint); line-height: 1.6; }
+/* ── 统一文字颜色（全局一键） ── */
+.unify-group {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg2);
+}
+.unify-title { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.unify-hint { margin: 0; font-size: 11.5px; line-height: 1.7; color: var(--text-faint); }
+.unify-hint b { color: var(--text-dim); font-weight: 600; }
 .theme-editor { min-width: 0; max-width: 100%; border: 1px solid var(--border); border-radius: 14px; background: var(--bg1); padding: 20px 22px; }
 .theme-editor-head { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; }
 .theme-id-row { min-width: 0; display: flex; align-items: center; gap: 10px; }

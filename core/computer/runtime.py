@@ -130,6 +130,22 @@ def sweep_stale_computer_temp_dirs(
                 entry.name.startswith(prefix) for prefix in _STALE_TEMP_DIR_PREFIXES
             ):
                 continue
+            if entry.name == "ycode-computer-preview":
+                # 预览根目录只是容器，绝不整体 rmtree：根自身 mtime 只随子目录
+                # 增删变化，长驻实例 24h 无子目录变动时根 mtime 过老，后启动
+                # 实例会把存活实例的 preview 目录一并删掉。逐子目录
+                # （preview-* 按进程隔离）判 mtime。
+                for child in entry.iterdir():
+                    try:
+                        if not child.name.startswith("preview-"):
+                            continue
+                        if now - child.stat().st_mtime < max_age_s:
+                            continue
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                    except OSError:
+                        _LOGGER.exception("清扫预览进程目录失败：%s", child)
+                continue
             if now - entry.stat().st_mtime < max_age_s:
                 continue
             shutil.rmtree(entry, ignore_errors=True)
@@ -152,8 +168,12 @@ def _default_controller_provider():
 
 
 def _emergency_stop(controller_provider):
-    """Ctrl+Alt+Esc 回调：停止当前活动 run（controller 固定停止顺序内含
-    owner cancel 与 Provider 在飞流中断）；run 已收尾（竞态）无事发生。"""
+    """Ctrl+Alt+Esc 回调：停止当前活动 run。
+
+    走 stop_for_user：紧急热键同样是"用户"的停止意图，只应结束电脑操控 run，
+    不能置位回合 cancel_event 把对话回合整条掐掉（模型会毫不知情地被打断）；
+    抑制态与通知由 stop_for_user 统一记账。run 已收尾（竞态）无事发生。
+    """
 
     def _on_hotkey_stop() -> None:
         try:
@@ -171,7 +191,7 @@ def _emergency_stop(controller_provider):
         if not run_id or status in _TERMINAL_RUN_STATUSES:
             return
         try:
-            controller.stop(run_id, "emergency_hotkey")
+            controller.stop_for_user(run_id, "emergency_hotkey")
         except ComputerControlError:
             # run 已在停止收尾（竞态）：紧急停止的目标已达成
             _LOGGER.info("紧急停止热键触发时 run 已在收尾（忽略）")

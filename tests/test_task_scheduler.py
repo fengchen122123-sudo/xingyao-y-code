@@ -782,3 +782,37 @@ def test_writeback_rejected_event_keeps_plan_items_render_path_clean():
 
     kinds = [kind for kind, _ in events]
     assert kinds == ["plan_writeback_rejected"]
+
+
+def test_resume_takeover_accepts_queued_in_progress_item():
+    """排队等待接管的 in_progress 项必须能恢复为 main_takeover。
+
+    回归场景：子代理超时移交后，项停在 status=in_progress +
+    execution_mode=takeover_queued。旧 resume_takeover 只认
+    failed/blocked/cancelled/pending，导致这类项既不能 resume、也不能 finish、
+    更不能 retry，永久锁死整条依赖链。
+    """
+    plan = PlanManager()
+    item = _queued_takeover_item("stuck", sequence=1, files=["a.py"])
+    item["status"] = "in_progress"
+    plan.replace([item])
+    scheduler = TaskScheduler(plan)
+
+    resumed = scheduler.resume_takeover("stuck", "turn-9")
+
+    assert resumed is not None
+    assert resumed["status"] == "in_progress"
+    assert resumed["execution_mode"] == "main_takeover"
+    assert resumed["takeover_turn_id"] == "turn-9"
+
+
+def test_resume_takeover_still_rejects_delegated_in_progress_item():
+    """在途 delegated 项不得被 resume 抢走：只放行 takeover_queued。"""
+    plan = PlanManager()
+    plan.replace([{"id": "running", "subject": "执行中", "files": ["b.py"]}])
+    scheduler = TaskScheduler(plan)
+    assert scheduler.start_delegated_item(
+        "running", "subagent-x", "subagent:implement", None
+    ) is True
+
+    assert scheduler.resume_takeover("running", "turn-9") is None

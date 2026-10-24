@@ -49,7 +49,7 @@ it('renders the screenshot preview from the loopback token url only', () => {
   wrapper.unmount();
 });
 
-it('renders trace rows newest first without raw input text', () => {
+it('no longer renders an action list in the panel (动作已移到对话区)', () => {
   const store = useAppStore();
   seedRun(store);
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
@@ -58,13 +58,12 @@ it('renders trace rows newest first without raw input text', () => {
   store.reduceComputerEvent({ type: 'computer_action_finished', run_id: 'run-1', event_seq: 5, action_ordinal: 2, action_kind: 'type_text', ok: true, error_code: '', duration_ms: 140, text: 'secret text', text_length: 7 });
 
   const wrapper = mountPane();
-  const rows = wrapper.findAll('[data-test="computer-trace-row"]');
-  expect(rows).toHaveLength(2);
-  // 新到旧：第 2 个动作排在最前
-  expect(rows[0].text()).toContain('输入 7 个字符');
-  expect(rows[0].text()).toContain('140');
-  expect(rows[1].text()).toContain('导航');
-  expect(rows[1].text()).toContain('820');
+  // 2026-10-21：面板只留控制与最新截图，动作明细改在对话区逐行展示，
+  // 同一批动作不再两处重复，列表也不会在面板里越滚越长。
+  expect(wrapper.find('[data-test="computer-trace-list"]').exists()).toBe(false);
+  expect(wrapper.findAll('[data-test="computer-trace-row"]')).toHaveLength(0);
+  // reducer 侧数据照旧保留（对话区据此渲染），且绝不保存输入正文
+  expect(store.computerTrace).toHaveLength(2);
   expect(wrapper.text()).not.toContain('secret text');
   wrapper.unmount();
 });
@@ -82,9 +81,9 @@ it('renders production-shaped finished events with measured segments', () => {
     duration_ms: 268.5, queue_ms: 0.4, input_ms: 4.5, observe_ms: 263.6,
   });
   const wrapper = mountPane();
-  const row = wrapper.get('[data-test="computer-trace-row"]');
-  expect(row.text()).toContain('268.5');
+  // 面板不再渲染行，但 reducer 必须仍按实测耗时记账（对话区按 ordinal 展示）
   expect(store.computerTrace[0].duration_ms).toBe(268.5);
+  expect(wrapper.findAll('[data-test="computer-trace-row"]')).toHaveLength(0);
   wrapper.unmount();
 });
 
@@ -145,7 +144,7 @@ it('pause resume and stop controls drive the bridge with the current run id', as
   wrapper.unmount();
 });
 
-it('keeps showing the trace after the run ends', () => {
+it('keeps showing the stop reason after the run ends', () => {
   const store = useAppStore();
   seedRun(store, { status: 'stopped', stop_reason: 'user_stop' });
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
@@ -153,8 +152,9 @@ it('keeps showing the trace after the run ends', () => {
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 3, status: 'stopped' });
 
   const wrapper = mountPane();
-  expect(wrapper.findAll('[data-test="computer-trace-row"]')).toHaveLength(1);
   expect(wrapper.text()).toContain('user_stop');
+  // 轨迹列表已移出面板：结束后也不会再出现动作行
+  expect(wrapper.findAll('[data-test="computer-trace-row"]')).toHaveLength(0);
   wrapper.unmount();
 });
 

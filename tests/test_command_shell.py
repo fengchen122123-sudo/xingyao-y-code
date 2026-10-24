@@ -438,6 +438,48 @@ def test_system_settings_include_active_model_computer_capability(monkeypatch, t
     assert hint["protocol"] == "generic"
 
 
+def test_system_settings_capability_hint_follows_caller_model(monkeypatch, tmp_path):
+    """GUI 传入会话生效模型时按它判定，缺省仍读全局默认。"""
+    from tests.computer_fakes import use_temp_config
+    import core.computer.settings as computer_settings
+
+    use_temp_config(tmp_path, monkeypatch, {
+        "active_model_id": "m-vision",
+        "browser_control_enabled": True,
+        "computer_control_enabled": True,
+        "computer_browser": "edge",
+        "providers": [{
+            "protocol": "openai", "base_url": "https://example.test/v1", "api_key": "k",
+            "models": [
+                {
+                    "id": "m-vision", "name": "vision-model", "litellm_model": "openai/t-v",
+                    "supports_vision": True, "supports_function_calling": True,
+                },
+                {
+                    "id": "m-text", "name": "text-model", "litellm_model": "openai/t-t",
+                    "supports_vision": False, "supports_function_calling": True,
+                },
+            ],
+        }],
+    })
+    monkeypatch.setattr(
+        computer_settings, "list_browser_options", lambda platform=None: ()
+    )
+
+    from core import command_shell
+
+    # 会话绑定的模型是纯文本模型，全局仍是视觉模型：必须按会话模型判定
+    hint = command_shell.get_system_settings(
+        active_model_id="m-text"
+    )["computer_active_model_capability"]
+    assert hint["model"] == "text-model"
+    assert hint["eligible"] is False
+
+    # 不传（CLI 场景）沿用全局默认
+    hint = command_shell.get_system_settings()["computer_active_model_capability"]
+    assert hint["model"] == "vision-model"
+
+
 def test_system_settings_capability_hint_fail_closed_when_model_missing(monkeypatch, tmp_path):
     """未选择模型/模型缺能力：提示不合格且不拖垮设置页。"""
     from tests.computer_fakes import use_temp_config

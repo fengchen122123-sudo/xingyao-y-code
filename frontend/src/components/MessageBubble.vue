@@ -52,17 +52,37 @@
     <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
       <div class="assistant-body">
-        <div class="assistant-name">
-          <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+        <!-- 名字行：一个回合只在最前面显示一次（由 TurnGroup 决定归属），
+             其余轮次的助手消息不再重复「星瑶 · 模型」；「已取消」徽标始终保留 -->
+        <div v-if="showName || msg.cancelled" class="assistant-name">
+          <template v-if="showName">
+            <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+          </template>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 
-        <!-- 思考过程 Block（FoldCard 统一折叠体系，箭头在标题右侧） -->
+        <!-- 思考过程 Block（对齐 ZCode 思考块形态：脑图标 + 灰色状态文案 + 悬停才出现的箭头，
+             无底色无边框；展开后弱灰正文、左侧 1px 细线、限高内滚 + 上下边缘渐隐 + 默认吸底） -->
         <div v-if="msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
-          <FoldCard v-model:open="thinkingOpen" title="思考过程" caret="end">
-            <div class="tk-cnt">
-              {{ msg.reasoning_content }}
-            </div>
+          <FoldCard v-model:open="thinkingOpen" caret="end">
+            <template #title>
+              <span class="tk-head">
+                <AppIcon class="tk-brain" name="brain" :size="13" :stroke-width="1.7" />
+                <span class="tk-label" :class="{ 'is-thinking': !!thinkLiveLine }">{{ thinkLabel }}</span>
+                <template v-if="thinkLiveLine">
+                  <span class="tk-sep">·</span>
+                  <span class="tk-live" data-test="think-live-line">
+                    <span class="tk-live-text">{{ thinkLiveLine }}</span>
+                  </span>
+                </template>
+              </span>
+            </template>
+            <div
+              ref="tkScrollRef"
+              class="tk-cnt"
+              :class="{ 'is-scrollable': tkScrollable, 'at-top': tkAtTop, 'at-bottom': tkAtBottom }"
+              @scroll="syncTkScroll"
+            >{{ msg.reasoning_content }}</div>
           </FoldCard>
         </div>
 
@@ -100,7 +120,7 @@
 
         <!-- 流式生成中的实时速度指示胶囊 -->
         <div v-else-if="isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
-          <AppIcon name="zap" :size="12" class="zap-pulse" />
+          <AppIcon name="orbit" :size="12" class="zap-pulse" />
           <span>{{ liveSpeedText }}</span>
         </div>
 
@@ -112,7 +132,7 @@
           data-test="msg-metrics"
         >
           <span v-if="msg.metrics.token_speed" class="metric-item">
-            <AppIcon name="zap" :size="12" class="metric-icon" />
+            <AppIcon name="orbit" :size="12" class="metric-icon" />
             <span class="metric-val">{{ msg.metrics.token_speed }}</span> t/s
           </span>
           <span v-if="msg.metrics.token_speed && msg.metrics.duration_s" class="metric-sep">·</span>
@@ -146,7 +166,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdownDetailed, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
 import { splitStableBlocks } from '../utils/markdownBlocks';
@@ -158,9 +178,13 @@ import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   msg: ChatMessage;
-}>();
+  /** 是否显示「星瑶 · 模型」名字行：一个回合只在最前面显示一次 */
+  showName?: boolean;
+}>(), {
+  showName: true,
+});
 
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
 // 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
@@ -249,6 +273,143 @@ const localThinkOverride = ref<boolean | null>(null);
 const thinkingOpen = computed({
   get: () => (localThinkOverride.value !== null ? localThinkOverride.value : store.showThinking),
   set: (v: boolean) => { localThinkOverride.value = v; },
+});
+
+// 折叠态标题行预览的最大字符数：超长行只留结尾（"正在输出"的尾部才是最新推进内容），
+// 避免一整段没有换行的思考把标题塞满开头几个字、看上去像不动
+const THINK_LIVE_MAX = 90;
+
+// 去掉行首 markdown 标记（标题 # / 引用 > / 列表 - * 1. / 代码围栏）与行内强调符号，
+// 只留一行纯文本给折叠标题用
+function toPlainHeadline(line: string): string {
+  const plain = line
+    .replace(/^\s*```[A-Za-z0-9_+-]*/, '')
+    .replace(/^[\s>#*+\-–—\d.、:：)）]+/, '')
+    .replace(/\*\*|__|`/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return plain.length > THINK_LIVE_MAX ? `…${plain.slice(-THINK_LIVE_MAX)}` : plain;
+}
+
+// 折叠态要显示的实时思考行：仅在「本条最新气泡仍在流式生成」时给值，
+// 展开态（用户要看全文）与生成结束后都返回空串，回落到固定标签"思考"
+const thinkLiveLine = computed(() => {
+  if (thinkingOpen.value) return '';
+  if (!store.running || !isLatestAssistant.value) return '';
+  const raw = props.msg.reasoning_content || '';
+  if (!raw.trim()) return '';
+  const lines = raw.split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const plain = toPlainHeadline(lines[i]);
+    if (plain) return plain;
+  }
+  return '';
+});
+
+/* ── 思考耗时（对齐 ZCode 的「思考 · N 秒」）──────────────────────────
+   只有在本条气泡还处于流式态时才有可信的起始时刻；历史消息挂载时已经
+   结束，拿不到起始时间，就不编造耗时，标签只显示「思考」。 */
+const thinkStartAt = ref<number | null>(null);
+const thinkEndedAt = ref<number | null>(null);
+const thinkTick = ref(Date.now());
+let thinkTicker: number | null = null;
+
+const thinkStreaming = computed(() => {
+  const raw = (props.msg.reasoning_content || '').trim();
+  return !!raw && store.running && isLatestAssistant.value;
+});
+
+watch(
+  thinkStreaming,
+  (streaming) => {
+    if (streaming) {
+      if (thinkStartAt.value === null) {
+        thinkStartAt.value = Date.now();
+        thinkTick.value = thinkStartAt.value;
+      }
+      return;
+    }
+    if (thinkStartAt.value !== null && thinkEndedAt.value === null) {
+      thinkEndedAt.value = Date.now();
+      thinkTick.value = thinkEndedAt.value;
+    }
+  },
+  { immediate: true },
+);
+
+const thinkDurationSec = computed(() => {
+  const start = thinkStartAt.value;
+  if (start === null) return null;
+  const end = thinkEndedAt.value ?? thinkTick.value;
+  return Math.max(1, Math.round((end - start) / 1000));
+});
+
+// 收起 + 流式中显示「正在思考 · <最新一行>」；其余显示「思考」，有耗时时追加「· N 秒」
+const thinkLabel = computed(() => {
+  if (thinkLiveLine.value) return '正在思考';
+  const sec = thinkDurationSec.value;
+  return sec === null ? '思考' : `思考 · ${sec} 秒`;
+});
+
+// 耗时只在「展开 + 流式中」每秒刷新：收起态看不到秒数，没必要触发整块重渲染
+watch(
+  () => thinkingOpen.value && thinkStreaming.value,
+  (ticking) => {
+    if (thinkTicker !== null) {
+      window.clearInterval(thinkTicker);
+      thinkTicker = null;
+    }
+    if (ticking) {
+      thinkTicker = window.setInterval(() => {
+        thinkTick.value = Date.now();
+      }, 1000);
+    }
+  },
+  { immediate: true },
+);
+
+/* ── 展开区滚动：边缘渐隐状态 + 默认吸底 ────────────────────────────── */
+const tkScrollRef = ref<HTMLElement | null>(null);
+const tkAtTop = ref(true);
+const tkAtBottom = ref(true);
+const tkScrollable = ref(false);
+
+function syncTkScroll() {
+  const el = tkScrollRef.value;
+  if (!el) return;
+  tkScrollable.value = el.scrollHeight > el.clientHeight + 1;
+  tkAtTop.value = el.scrollTop <= 1;
+  tkAtBottom.value = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
+}
+
+// 思考内容流式追加时默认跟到底部；用户自己往上滚离底部后不再抢滚动位置
+watch(
+  () => props.msg.reasoning_content,
+  async () => {
+    await nextTick();
+    const el = tkScrollRef.value;
+    if (!el) return;
+    if (tkAtBottom.value) el.scrollTop = el.scrollHeight;
+    syncTkScroll();
+  },
+);
+
+// 收起态是 v-show 隐藏（clientHeight=0），重新展开后要重算遮罩与吸底状态
+watch(thinkingOpen, async () => {
+  await nextTick();
+  syncTkScroll();
+});
+
+onMounted(async () => {
+  await nextTick();
+  syncTkScroll();
+});
+
+onUnmounted(() => {
+  if (thinkTicker !== null) {
+    window.clearInterval(thinkTicker);
+    thinkTicker = null;
+  }
 });
 
 // 媒体渲染上下文：media_v1 清单按 ordinal 与正文中的媒体语法对齐
@@ -708,25 +869,135 @@ async function copyUserMessage() {
   padding: 1px 7px;
 }
 
+/* 思考块（对齐 ZCode）：整块无底色无边框，折叠头是一行轻量灰字——
+   脑图标 +「思考 · N 秒」+ 悬停才浮现的小箭头 */
 .think-block {
-  border-left: 2px solid var(--purple);
-  background: rgba(188, 140, 255, 0.06);
-  border-radius: 0 8px 8px 0;
-  padding: 8px 12px;
-  margin: 8px 0;
+  margin: 10px 0;
   font-size: 12.5px;
-  color: var(--purple);
+  color: var(--text-faint);
 }
-/* 思考块内的折叠头跟随块体紫色（覆盖 FoldCard 默认的 faint 灰） */
+/* 折叠头改成贴合内容的行内宽度（ZCode 的 trigger 是 self-start，不铺满整行） */
 .think-block :deep(.fold-head) {
+  width: fit-content;
+  max-width: 100%;
+  gap: 6px;
+  padding: 1px 0;
   color: inherit;
 }
+.think-block :deep(.fold-head:hover) {
+  color: var(--text-dim);
+}
+.tk-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.tk-brain {
+  flex: none;
+  opacity: 0.85;
+}
+.tk-label {
+  flex: none;
+  font-weight: 500;
+  white-space: nowrap;
+}
+/* 流式中的标签走极轻的扫光渐变，比"呼吸圆点"更安静 */
+.tk-label.is-thinking {
+  background: linear-gradient(
+    90deg,
+    var(--text-faint) 0%,
+    var(--text-bright) 45%,
+    var(--text-faint) 90%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: tk-shimmer 2.4s linear infinite;
+}
+@keyframes tk-shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
+}
+.tk-sep {
+  flex: none;
+  opacity: 0.5;
+}
+/* 收起态的流式摘要：单行省略，占用标签之后的剩余宽度 */
+.tk-live {
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--text-dim);
+}
+.tk-live-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 箭头平时不出现，悬停 / 键盘聚焦 / 已展开时才浮现（与 ZCode 的 hover-only 一致） */
+.think-block :deep(.fold-caret) {
+  opacity: 0;
+  transition: opacity 0.12s ease, transform 0.15s ease;
+}
+.think-block :deep(.fold-head:hover .fold-caret),
+.think-block :deep(.fold-head:focus-visible .fold-caret),
+.think-block :deep(.fold-caret.is-open) {
+  opacity: 1;
+}
 .tk-cnt {
-  margin-top: 6px;
+  margin: 4px 0 0 6px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+  /* 展开后默认只占 10 行高度（1.6em 即一行行高），超出部分内部滚动查看，
+     避免超长思考把整个对话拉成一条；+2px 抵消行高小数的取整误差，防止
+     恰好 10 行时露出 1px 滚动条 */
+  max-height: calc(1.6em * 10 + 2px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   white-space: pre-wrap;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.6;
+  color: var(--text-faint);
+}
+/* 滚动边缘渐隐：在顶部只淡出底边，在底部只淡出顶边，在中间两侧都淡 */
+.tk-cnt.is-scrollable.at-bottom:not(.at-top) {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+}
+.tk-cnt.is-scrollable.at-top:not(.at-bottom) {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent 100%);
+}
+.tk-cnt.is-scrollable:not(.at-top):not(.at-bottom) {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 14px,
+    #000 calc(100% - 14px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 14px,
+    #000 calc(100% - 14px),
+    transparent 100%
+  );
+}
+@media (prefers-reduced-motion: reduce) {
+  .tk-label.is-thinking {
+    animation: none;
+    background: none;
+    color: var(--text-faint);
+  }
 }
 
 .spin {

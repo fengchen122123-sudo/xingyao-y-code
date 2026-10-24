@@ -807,16 +807,24 @@ class Win32InputAdapter:
         )
 
     def release_all(self) -> None:
-        """尽力释放全部已按下的键与鼠标键；释放失败只留痕不抛出。"""
+        """尽力释放全部已按下的键与鼠标键；释放失败只留痕不抛出。
+
+        先整体快照再构造事件：controller 停止路径的 release 与回合线程的
+        send_keys 并发时，直接 reversed(列表) 迭代会抛
+        "list changed size during iteration"被上层吞掉，本次释放失败、
+        修饰键残留。
+        """
+        pressed_keys = list(self._pressed_keys)
+        pressed_buttons = sorted(self._pressed_buttons)
+        self._pressed_keys.clear()
+        self._pressed_buttons.clear()
         events: list = []
-        for name in reversed(self._pressed_keys):
+        for name in reversed(pressed_keys):
             events.append(
                 KeyEventDescriptor(vk=KEY_NAME_TO_VK[name], scan=0, flags=KEYEVENTF_KEYUP)
             )
-        for button in sorted(self._pressed_buttons):
+        for button in pressed_buttons:
             events.append(MouseEventDescriptor(0, 0, _MOUSE_BUTTON_FLAGS[button][1]))
-        self._pressed_keys.clear()
-        self._pressed_buttons.clear()
         if not events:
             return
         try:

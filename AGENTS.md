@@ -68,6 +68,20 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 - `_connect_server` 幂等：同名重连先关旧连接，schema 按 server 名替换不追加；
   取消竞态会清理已入 `self.servers` 的孤儿连接；`call_tool_sync` 超时返回 🚨 友好文本并取消底层调用。
 
+- mcp.json 的 env 值加密失败按明文落盘（可用性优先的显式降级），`list_servers`
+  会以 `env_plaintext` 字段标出未加密的键名；server 名禁止含 `__`（与
+  `f"{server}__{tool}"` 工具名前缀分隔符冲突，否则重连按前缀替换会剥掉别家工具）。
+
+## 📡 LAN/MCP 远程服务安全基线
+
+- `LanServer.FORBIDDEN_METHODS` 是 fail-closed 黑名单：新增桌面桥方法若属
+  「写持久配置→让桌面长期执行」（hook/插件信任/MCP/权限白名单/自动化任务）、
+  「明文凭据读取」或「桌面专属生命周期」，必须同步入名单；判定标准见名单内
+  注释，frontend-mobile 零引用是入名单的必要条件。
+- `LanServer.broadcast` 只向每客户端有界出站队列 put_nowait（满则丢弃并计数），
+  网络 IO 收敛到每客户端发送线程——事件生产线程（回合 worker）绝不因单个
+  失联手机阻塞在 send 上；测试直连桩无队列时回落同步发送。
+
 ---
 
 ## 🧭 固定 Harness 内核
@@ -85,10 +99,17 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   Kimi 缓存亲和值原文。
 
 - 一个 Step 对应一次真实模型请求；Provider 内部重试必须留在同一个 Step，工具结果后
-  再次请求模型才创建下一个 Step。非法状态转换、Journal 序列化或数据库写入必须显式失败。
+  再次请求模型才创建下一个 Step。非法状态转换与状态迁移的 CAS 写库必须显式失败；
+  journal 的事件 sink（STEP_CREATED 等辅助事件）失败只告警不阻断回合——续跑对
+  started-not-finished 一律 BLOCK，遥测缺失不会伪装成已提交。
 
 - 崩溃恢复只把未完成 Turn/Step 标记为 `interrupted`，绝不自动重放模型请求、命令、
   文件写入或其他副作用工具。
+
+- owner 心跳双通道：journal 操作搭车续租之外，`TurnRuntime` 为持久回合起
+  `harness-heartbeat-*` 守护线程按 2s 节拍续租（turn 终态即退）——长工具执行
+  >10s 期间不再因零心跳被另一进程的 `interrupt_stale_harness_runs` 误标
+  interrupted（GUI 与 CLI 共享 ycode.db 的场景）。
 
 - 修改请求构造、消息规范化、system prompt、tools、metadata、`extra_body` 或缓存亲和
   逻辑前，必须先运行 Provider 请求 byte-golden 与 prompt byte-stability 回归；黄金字节
@@ -105,6 +126,9 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 - `core/tool_result_maintenance.py`：工具结果 Snip/Elide 纯函数层，marker 幂等，
   每条消息字节最多改写两次（snip 一次 + elide 升级一次），改写后永久冻结。
+  注意 tier>=1 的规则精简 reducer（`core/memory.py:maintain_tool_results` 前置）
+  是另一类独立改写：精简 → snip → elide 三段各自最多一次、方向单调，
+  snip/elide 的两次上限在自身类别内成立。
 
 - `core/memory.py:maintain_tool_results`：DB 层维护入口，尾部 8000 估算 token 保护区不改写；
   `_fold_stale_media_locked` 在含媒体新消息入库的同一事务内折叠旧媒体。
@@ -169,8 +193,10 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   发射后即返回，worker 必须等 done 才弹事件），注册表复用不覆盖。
 
 - 智谱 GLM 缓存路线：官方隐式自动缓存（无亲和参数、无显式标记、命中五折、TTL 不透明），
-  客户端走「稳定字节 + 保活」。`core/llm.py:_supports_cache_keepalive` 对官方
-  open.bigmodel.cn（`_is_official_zhipu_route`）放行，第三方中转的 GLM 模型不放行。
+  客户端走「稳定字节 + 保活」。`core/llm.py:_supports_cache_keepalive` 对 DeepSeek/
+  GLM/Kimi/Qwen 四族按模型名判定、任意渠道路由放行（第三方中转同样保活），无名模型
+  回退域名判定（官方 open.bigmodel.cn 放行）；上有车道证据门兜底——某车道实测命中率
+  < 0.5 且样本 >= 10 轮即停该车道保活（小时级自愈），第三方中转若确实不缓存会自动停。
   特例：GLM 强制思考模型（glm-5.3/5.3-flash，能力表无关闭档，`thinking.type=disabled`
   直接报错）的保活快照必须保留 thinking.enabled 并把 max_tokens 抬到
   `KEEPALIVE_THINKING_MODEL_MAX_TOKENS=1024`（`core/cache_keepalive.py`，

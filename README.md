@@ -1,7 +1,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.3.6](https://img.shields.io/badge/Version-1.3.6-green.svg)](core/version.py)
+[![Version 1.3.8](https://img.shields.io/badge/Version-1.3.8-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
@@ -367,9 +367,6 @@ Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工
 | `plan_retry` | 重置失败项为 pending |
 | `plan_finish` | 完成主 Agent 接管的计划项（并执行验证命令） |
 | `plan_resume_takeover` | 恢复因超时移交主 Agent 的计划项 |
-| `smart_router_status` | 查看智能路由当前状态与统计 |
-| `smart_router_config` | 配置智能路由（模型分层 / 开关） |
-| `smart_router_toggle` | 快速开关智能路由 |
 | `mcp_add_server` | 新增 MCP server 配置 |
 | `mcp_remove_server` | 删除 MCP server 配置 |
 | `mcp_set_enabled` | 启用 / 禁用 MCP server |
@@ -544,7 +541,6 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 | 插件 | 位置 | 功能 |
 |------|------|------|
 | 混元文生图 | 仓库 `plugins/hunyuan_image/` | 腾讯混元文本生图，数据随包编译进 PYZ；Key 仅从环境变量 `HUNYUAN_API_KEY` 读取，代码中不存储 Key，未配置时工具明确报错 |
-| 智能路由 | `~/.ycode/plugins/smart_router/` | 按任务复杂度自动选择合适模型，省 token 且保质量，关闭后不影响原有行为 |
 | iMOM 定位器 | `~/.ycode/plugins/imom_locator/` | iMOM/MES 多项目代码定位：动态发现 publish、系统识别、页面索引构建与毫秒级定位 |
 
 > 用户级插件放在 `~/.ycode/plugins/<插件名>/`，同名插件会覆盖内置/仓库版本。

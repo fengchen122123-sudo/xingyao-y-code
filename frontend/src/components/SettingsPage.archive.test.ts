@@ -303,3 +303,137 @@ describe('SettingsPage 会话归档·批量管理', () => {
     expect(wrapper.get('[data-test="session-archive-empty"]').text()).toContain('暂无归档会话');
   });
 });
+
+// 目录分组：归档列表按 workdir 折叠分组（组头 = 目录名 + 完整路径 + 数量）
+describe('SettingsPage 会话归档·按目录分组', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    delete (window as any).pywebview;
+  });
+
+  /** 两个目录各两个会话 + 一条全局会话，便于验证组内/组间顺序与分组归并 */
+  function groupedList() {
+    return [
+      {
+        name: 'proj-a-new',
+        display_name: '项目A新',
+        count: 2,
+        workdir: 'D:/work/proj-a',
+        is_global: false,
+        archived_at: ts(5),
+      },
+      {
+        name: 'global-1',
+        display_name: '全局会话',
+        count: 4,
+        workdir: 'GLOBAL',
+        is_global: true,
+        archived_at: ts(20),
+      },
+      {
+        name: 'proj-b-1',
+        display_name: '项目B',
+        count: 7,
+        workdir: 'E:\\code\\proj-b',
+        is_global: false,
+        archived_at: ts(45),
+      },
+      {
+        name: 'proj-a-old',
+        display_name: '项目A旧',
+        count: 9,
+        workdir: 'D:/work/proj-a',
+        is_global: false,
+        archived_at: ts(60),
+      },
+    ];
+  }
+
+  function groupHeads(wrapper: VueWrapper) {
+    return wrapper.findAll('[data-test="session-archive-group"]');
+  }
+
+  it('按 workdir 归并成目录组，组头显示末级目录名、完整路径与会话数', async () => {
+    const { wrapper } = setup(groupedList());
+    await openArchiveSection(wrapper);
+
+    const groups = groupHeads(wrapper);
+    // 组顺序 = 组内最新归档时间倒序：proj-a(5分钟) → 全局(20分钟) → proj-b(45分钟)
+    expect(groups.map(g => g.attributes('data-archive-group')))
+      .toEqual(['D:/work/proj-a', '__GLOBAL__', 'E:\\code\\proj-b']);
+
+    const names = wrapper.findAll('[data-test="session-archive-group-name"]').map(n => n.text());
+    expect(names).toEqual(['proj-a', '全局会话', 'proj-b']);
+
+    const paths = wrapper.findAll('[data-test="session-archive-group-path"]').map(n => n.text());
+    expect(paths).toEqual(['D:/work/proj-a', 'GLOBAL', 'E:\\code\\proj-b']);
+
+    const counts = wrapper.findAll('[data-test="session-archive-group-count"]').map(n => n.text());
+    expect(counts).toEqual(['2', '1', '1']);
+  });
+
+  it('同目录会话落在同一组内，并保持归档时间倒序', async () => {
+    const { wrapper } = setup(groupedList());
+    await openArchiveSection(wrapper);
+
+    const projA = groupHeads(wrapper)[0];
+    expect(projA.findAll('[data-test="session-archive-item"]')
+      .map(n => n.attributes('data-archived-name'))).toEqual(['proj-a-new', 'proj-a-old']);
+  });
+
+  it('点组头收起该组会话（其它组不受影响），再点展开恢复', async () => {
+    const { wrapper } = setup(groupedList());
+    await openArchiveSection(wrapper);
+    expect(archivedNames(wrapper).length).toBe(4);
+
+    const heads = () => wrapper.findAll('[data-test="session-archive-group-toggle"]');
+    await heads()[0].trigger('click');
+    await nextTick();
+
+    // 第一组收起：只剩另外两组各 1 条
+    expect(archivedNames(wrapper)).toEqual(['global-1', 'proj-b-1']);
+    // 收起时组头仍在，数量不变
+    expect(wrapper.findAll('[data-test="session-archive-group-count"]')[0].text()).toBe('2');
+
+    await heads()[0].trigger('click');
+    await nextTick();
+    expect(archivedNames(wrapper).length).toBe(4);
+  });
+
+  it('无 workdir 的会话归入「未关联目录」组', async () => {
+    const { wrapper } = setup([
+      { name: 'orphan', display_name: '孤儿会话', count: 0, workdir: '', is_global: false, archived_at: ts(10) },
+    ]);
+    await openArchiveSection(wrapper);
+
+    expect(wrapper.get('[data-test="session-archive-group-name"]').text()).toBe('未关联目录');
+    expect(archivedNames(wrapper)).toEqual(['orphan']);
+  });
+
+  it('批量模式下组头勾选框按目录整组选择，并反映半选状态', async () => {
+    const { wrapper } = setup(groupedList());
+    await openArchiveSection(wrapper);
+    await wrapper.get('[data-test="session-archive-batch-toggle"]').trigger('click');
+    await nextTick();
+
+    const groupBoxes = () => wrapper.findAll('[data-test="session-archive-group-select"]');
+    expect(groupBoxes().length).toBe(3);
+    expect((groupBoxes()[0].element as HTMLInputElement).indeterminate).toBe(false);
+
+    // 勾组内第一条：该组进入半选
+    await wrapper.findAll('[data-test="session-archive-select"]')[0].setValue(true);
+    await nextTick();
+    expect((groupBoxes()[0].element as HTMLInputElement).indeterminate).toBe(true);
+    expect(wrapper.get('[data-test="session-archive-selected-count"]').text()).toContain('1');
+
+    // 点组头勾选框：未全选 → 补齐该组两条
+    await groupBoxes()[0].setValue(true);
+    await nextTick();
+    expect(wrapper.get('[data-test="session-archive-selected-count"]').text()).toContain('2');
+
+    // 再点一次：整组取消勾选，不影响其它组
+    await groupBoxes()[0].setValue(false);
+    await nextTick();
+    expect(wrapper.get('[data-test="session-archive-selected-count"]').text()).toContain('0');
+  });
+});

@@ -50,9 +50,9 @@ def test_identity_carries_endpoint_and_project_viewport(tmp_path, monkeypatch):
     assert identity.browser == "embedded"
     assert identity.cdp_endpoint == "http://127.0.0.1:9333"
     assert (identity.viewport_width, identity.viewport_height) == (1024, 768)
-    # profile 即自动化控件的 UserDataFolder（与面板浏览目录刻意分离：
-    # 同目录二次带参建 WebView2 环境会撞 0x8007139F）
-    assert identity.profile_path.replace("\\", "/").endswith("browser_profile_cdp")
+    # profile 即面板控件（自动化接管的就是用户看到的那个浏览器）的
+    # UserDataFolder：两者共用 browser_profile，不再有独立自动化目录
+    assert identity.profile_path.replace("\\", "/").endswith("browser_profile")
 
 
 def test_provider_receives_owner_session_id():

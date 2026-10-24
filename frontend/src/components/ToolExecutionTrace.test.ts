@@ -41,7 +41,7 @@ afterEach(() => {
 });
 
 describe('ToolExecutionTrace', () => {
-  it('titles a running trace with the raw call count', () => {
+  it('announces the running trace via a visually hidden live region', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: {
         calls: [finishedCall('a'), runningCall('b', Date.now())],
@@ -49,7 +49,9 @@ describe('ToolExecutionTrace', () => {
         state: 'running',
       },
     });
-    expect(wrapper.get('.fold-title').text()).toBe('执行过程 · 2 项 · 进行中');
+    // 外壳标题已移除，但无障碍播报保留（视觉隐藏）
+    expect(wrapper.get('.sr-only').text()).toBe('执行过程 · 2 项 · 进行中');
+    expect(wrapper.find('.fold-head').exists()).toBe(false);
   });
 
   it('maps terminal states to Chinese labels', () => {
@@ -62,7 +64,7 @@ describe('ToolExecutionTrace', () => {
       const wrapper = mount(ToolExecutionTrace, {
         props: { calls: [finishedCall('a')], legacyDiffs: [], state },
       });
-      expect(wrapper.get('.fold-title').text()).toBe(title);
+      expect(wrapper.get('.sr-only').text()).toBe(title);
       wrapper.unmount();
     }
   });
@@ -80,20 +82,14 @@ describe('ToolExecutionTrace', () => {
     expect(wrapper.get('.trace-row').classes()).toContain('status-completed');
   });
 
-  it('toggles aria-expanded from the header button and defaults to collapsed', async () => {
+  it('renders tool rows directly without a collapsible shell', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [finishedCall('a')], legacyDiffs: [], state: 'completed' },
     });
-    const button = wrapper.get('button.fold-head');
-    // 默认收起（图二样式）：只显示标题行，详情折叠
-    expect(button.attributes('aria-expanded')).toBe('false');
-    expect(wrapper.find('.fold-body').attributes('style')).toContain('display: none');
-    await button.trigger('click');
-    expect(button.attributes('aria-expanded')).toBe('true');
-    expect(wrapper.find('.fold-body').attributes('style') || '').not.toContain('display: none');
-    await button.trigger('click');
-    expect(button.attributes('aria-expanded')).toBe('false');
-    expect(wrapper.find('.fold-body').attributes('style')).toContain('display: none');
+    // 没有"执行过程 · N 项"折叠头，工具行直接可见
+    expect(wrapper.find('.fold').exists()).toBe(false);
+    expect(wrapper.get('.exec-trace').find('.trace-line').isVisible()).toBe(true);
+    expect(wrapper.findAll('.trace-row')).toHaveLength(1);
   });
 
   it('runs exactly one interval while running and clears it on terminal state and unmount', async () => {
@@ -106,10 +102,10 @@ describe('ToolExecutionTrace', () => {
     });
     expect(setSpy).toHaveBeenCalledTimes(1);
 
-    // 实时秒表驱动运行中行的时长徽标
+    // 实时秒表驱动运行中行的耗时
     vi.advanceTimersByTime(3000);
     await wrapper.vm.$nextTick();
-    expect(wrapper.get('.trace-duration').text()).toBe('5.0s');
+    expect(wrapper.get('.trace-meta').text()).toBe('5.0s');
 
     // 进入终态后清除定时器，且 elapsed 秒数不在 aria-live 区域内
     await wrapper.setProps({ state: 'completed' });
@@ -131,11 +127,11 @@ describe('ToolExecutionTrace', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [runningCall('b', Date.now())], legacyDiffs: [], state: 'running' },
     });
-    expect(wrapper.get('.fold-title [aria-live]').attributes('aria-live')).toBe('polite');
-    expect(wrapper.get('.trace-duration').attributes('aria-live')).toBeUndefined();
+    expect(wrapper.get('.sr-only').attributes('aria-live')).toBe('polite');
+    expect(wrapper.get('.trace-meta').attributes('aria-live')).toBeUndefined();
   });
 
-  it('groups consecutive reads and appends a legacy diff row', () => {
+  it('groups consecutive reads and appends a legacy diff row', async () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: {
         calls: [readCall('r1', 'a.ts'), readCall('r2', 'b.ts')],
@@ -145,10 +141,18 @@ describe('ToolExecutionTrace', () => {
     });
     const rows = wrapper.findAll('.trace-row');
     expect(rows).toHaveLength(2);
-    expect(rows[0].text()).toContain('读取文件');
-    expect(rows[0].text()).toContain('a.ts');
-    expect(rows[0].text()).toContain('b.ts');
-    expect(rows[1].text()).toContain('未绑定的历史文件变更');
-    expect(rows[1].text()).toContain('old.py');
+    // 分组行摘要只给类别与文件数，完整清单在展开区
+    expect(rows[0].get('.trace-kind').text()).toBe('读取');
+    expect(rows[0].get('.trace-target').text()).toBe('2 个文件');
+    await rows[0].get('[data-row-toggle]').trigger('click');
+    const files = rows[0].findAll('.trace-files li');
+    expect(files).toHaveLength(2);
+    expect(files[0].text()).toContain('a.ts');
+    expect(files[1].text()).toContain('b.ts');
+    // 未绑定的历史 Diff 行：行内给变更类别与文件，Diff 内容在展开区
+    expect(rows[1].get('.trace-kind').text()).toBe('变更');
+    expect(rows[1].get('.trace-target').text()).toContain('old.py');
+    await rows[1].get('[data-row-toggle]').trigger('click');
+    expect(rows[1].findAll('.diff-line.add')).toHaveLength(1);
   });
 });

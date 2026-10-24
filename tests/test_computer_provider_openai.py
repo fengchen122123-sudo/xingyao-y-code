@@ -1045,6 +1045,30 @@ def test_call_output_never_invents_safety_acknowledgement_fields(tmp_path):
     assert output["call_id"] == "call_any"
 
 
+def test_call_output_without_screenshot_sends_text_observation():
+    """B 方案：本次没有截图时改发纯文本观察，绝不因缺图让整批动作结果丢失。
+
+    为什么：窗口被遮挡/最小化时 WebView2 渲染被节流，截图会卡住或失败；
+    旧实现在 _read_png_bytes 里对空 png_path 抛 computer_backend_error。
+    """
+    observation = ComputerObservation(
+        run_id="run-native",
+        target="browser",
+        action="observe",
+        page_text="页面正文第一段",
+        screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
+    )
+    output = build_computer_call_output(ANY_CALL, observation)
+    assert output["type"] == "computer_call_output"
+    assert output["call_id"] == "call_any"
+    assert isinstance(output["output"], list)
+    assert all(item["type"] == "input_text" for item in output["output"])
+    text = output["output"][0]["text"]
+    assert "本次没有截图" in text
+    assert "TimeoutError" in text
+    assert "页面正文第一段" in text
+
+
 def test_provider_missing_response_id_fails_turn_without_resending_history():
     """流内 computer_call 载荷缺 response id：回合立即失败，没有第二次请求。"""
     call_events = [

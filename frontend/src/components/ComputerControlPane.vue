@@ -48,39 +48,14 @@
         <span>{{ reasonText }}</span>
       </div>
 
-      <!-- 操作轨迹：按新到旧，最多 200 行（内存态，run 结束保留到下一个 run） -->
-      <div class="cp-trace-head">
-        <span class="cp-trace-title">操作轨迹</span>
-        <span class="cp-trace-note">最多 200 条 · 新到旧</span>
-      </div>
-      <ul v-if="store.computerTrace.length" class="cp-trace" data-test="computer-trace-list">
-        <li
-          v-for="row in store.computerTrace"
-          :key="row.action_ordinal"
-          class="cp-trace-row"
-          :class="row.status"
-          data-test="computer-trace-row"
-        >
-          <span class="cp-row-ico">
-            <AppIcon
-              :name="row.status === 'done' ? 'check' : (row.status === 'failed' ? 'x' : 'loader')"
-              :size="12"
-              :stroke-width="2"
-              :class="{ 'icon-spin': row.status === 'running' }"
-            />
-          </span>
-          <span class="cp-row-text">
-            <span class="cp-row-summary">{{ row.action_ordinal }}. {{ row.summary }}</span>
-            <span v-if="row.error_code" class="cp-row-error">{{ row.error_code }}</span>
-          </span>
-          <span v-if="row.duration_ms" class="cp-row-duration">{{ row.duration_ms }}ms</span>
-        </li>
-      </ul>
-      <p v-else class="cp-trace-empty">本 run 暂无已记录的操作轨迹</p>
+      <!-- 动作明细不再在这里堆列表：每个动作已经以「点击 · 目标 · 耗时」的
+           紧凑行长在对话区，点开还能看当帧截图。面板只保留控制与最新一张图，
+           避免同一批动作在两处重复展示、列表越滚越长。 -->
     </template>
 
     <p v-else class="cp-empty" data-test="computer-empty-state">
-      暂无电脑操控会话。{{ store.agentName }}开始操控浏览器或桌面时，这里会实时显示截图预览与操作轨迹。
+      暂无电脑操控会话。{{ store.agentName }}开始操控浏览器或桌面时，这里会显示最新画面与运行控制，
+      每个动作的明细与当帧截图在对话区逐行展示。
     </p>
   </div>
 </template>

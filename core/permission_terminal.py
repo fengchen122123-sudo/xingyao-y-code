@@ -32,6 +32,8 @@ from core.permission_policy import (
     PermissionRisk,
     decide_permission,
 )
+# safety 场景（JEV 决策）薄包装层：只做「allow → ask」的加严，纯函数判定不受污染
+from core.permission_safety_gate import apply_decision_to_permission
 
 # 工具结果中的错误哨兵前缀
 TOOL_ERROR_PREFIX = "🚨"
@@ -651,7 +653,7 @@ def authorize_tool_call(
     task_sandbox_bypass = (
         False if credential_write else is_session_sandbox_bypass_enabled()
     )
-    decision = decide_permission(PermissionFacts(
+    facts = PermissionFacts(
         mode=app_context.get_permission_mode(),
         risk=risk,
         plan_internal=plan_internal,
@@ -660,7 +662,21 @@ def authorize_tool_call(
         task_sandbox_bypass=task_sandbox_bypass,
         task_grant_hit=task_hit,
         project_rule_hit=project_hit,
-    ))
+    )
+    decision = decide_permission(facts)
+    # JEV safety 场景接入：高风险操作再问一次「直接执行是否安全」，
+    # **唯一允许的变化是 allow → ask**（只能加严，不能放宽）。
+    # 纯函数 decide_permission 保持无网络 IO，决策叠加在薄包装层完成；
+    # JEV 关闭 / 影子 / 失败 / 低风险时该调用是纯本地空转，判定完全不变。
+    decision = apply_decision_to_permission(
+        facts,
+        decision,
+        command=(
+            str(effective_arguments.get("command", ""))
+            if effective_function_name == "execute_command"
+            else effective_function_name
+        ),
+    )
 
     if decision.action is PermissionAction.ALLOW:
         _notify_event(event_callback, "permission_resolved", {

@@ -74,25 +74,26 @@
               title="查看任务计划执行进度"
               @click.stop="taskDialogOpen = !taskDialogOpen"
             >
-              <AppIcon name="loader" :size="12" :stroke-width="2" :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }" /> 计划
+              <AppIcon name="loader" :size="12" :stroke-width="2" :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }" /><span class="chip-label">计划</span>
               <span v-if="taskEntry.activeCount > 0" class="task-entry-badge" data-test="task-entry-badge">{{ taskEntry.activeCount }}</span>
             </button>
             <TaskProgressDialog v-if="taskDialogOpen" @close="taskDialogOpen = false" />
           </div>
 
-          <!-- 决策入口：点击查看 JEV 决策记录（设置页「决策模型」的轻量视图） -->
-          <div class="decision-entry-wrap">
+          <!-- 决策入口：点击查看 JEV 决策记录（设置页「决策模型」的轻量视图）。
+               只在真的产生过决策记录时显示——未启用或从未决策时不留空入口 -->
+          <div v-if="store.decisionHasRecords" class="decision-entry-wrap">
             <button
               class="chip-btn"
               data-test="decision-entry"
               title="查看 JEV 决策记录"
               @click.stop="decisionPanelOpen = !decisionPanelOpen"
-            ><AppIcon name="brain" :size="12" :stroke-width="2" /> 决策<span v-if="store.decisionUnread > 0" class="decision-entry-badge" data-test="decision-entry-badge">{{ store.decisionUnread > 99 ? '99+' : store.decisionUnread }}</span></button>
+            ><AppIcon name="brain" :size="12" :stroke-width="2" /><span class="chip-label">决策</span><span v-if="store.decisionUnread > 0" class="decision-entry-badge" data-test="decision-entry-badge">{{ store.decisionUnread > 99 ? '99+' : store.decisionUnread }}</span></button>
             <DecisionRecordPopup v-if="decisionPanelOpen" @close="decisionPanelOpen = false" />
           </div>
 
           <div class="export-wrap">
-            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /> 导出</button>
+            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /><span class="chip-label">导出</span></button>
             <div v-if="showExportMenu" class="export-menu" @click.stop>
               <div class="export-item" @click="doExport('md')">Markdown (.md)</div>
               <div class="export-item" @click="doExport('html')">HTML (.html)</div>
@@ -229,8 +230,12 @@
       ></div>
 
       <!-- 右侧控制面板：必须用 v-show 而不是 v-if——卸载会重建组件，它内部的原生
-           WebView2 表面来不及 hide 就会以白块形式留在屏幕上 -->
-      <RightPanel v-show="!store.rightPanelCollapsed" />
+           WebView2 表面来不及 hide 就会以白块形式留在屏幕上。
+           外层 Transition 负责拖住 display:none 直到滑入/滑出动画跑完：v-show 单独
+           使用时 display 和 margin 在同一帧切换，负 margin 的过渡根本来不及生效 -->
+      <Transition name="right-panel-slide">
+        <RightPanel v-show="!store.rightPanelCollapsed" />
+      </Transition>
       </template>
     </div>
 
@@ -903,6 +908,8 @@ function startInit() {
     initPollTimer = undefined;
   }
   store.initFromBackend();
+  // 头部「决策」入口是否显示取决于历史审计里有没有真实记录：桥就绪后探测一次
+  void store.refreshDecisionAvailability();
 }
 function onPywebviewReady() {
   startInit();
@@ -1348,6 +1355,10 @@ onUnmounted(() => {
   padding: 0 16px;
   gap: 10px;
   flex-shrink: 0;
+  /* 工具栏按钮的收纳容器：侧栏/右侧面板展开挤窄的是中间列，
+     媒体查询感知不到，改按本栏实际宽度分档（见下方 @container chat-header） */
+  container-type: inline-size;
+  container-name: chat-header;
 }
 #chat-header .crumb {
   font-size: 13px;
@@ -1493,10 +1504,49 @@ onUnmounted(() => {
   align-items: center;
   gap: 5px;
   transition: 0.15s;
+  /* 单行 + 不参与压缩：文字永不断行、按钮不被挤成竖条；
+     空间不足时由 .crumb 省略号让位，再窄则由下方 @container 收成纯图标 */
+  white-space: nowrap;
+  flex-shrink: 0;
+  /* 图标档数字角标改为绝对定位叠在右上角，给窄栏的会话名留出空间 */
+  position: relative;
 }
 .chip-btn:hover {
   color: var(--text);
   border-color: var(--text-faint);
+}
+
+/* ── 工具栏按钮图标化收纳 ──
+   计划/决策/导出/Git 分支四个胶囊带文字约需 280px，再加会话名与栏内边距，
+   中间列被侧栏或右侧面板挤窄后必然放不下。空间不足时保留图标、隐去文字，
+   按钮靠自身 title 提示语义，任何宽度都保持单行、不再压成竖排：
+   ≤430 只留图标（图标 + 内边距约 34px，四个按钮不足 150px） */
+@container chat-header (max-width: 430px) {
+  #chat-header .chip-label,
+  #chat-header .git-branch-label {
+    display: none;
+  }
+  #chat-header .chip-btn {
+    padding: 4px 7px;
+    gap: 4px;
+  }
+  /* 图标档不再需要分支名的省略号收缩能力，放开 200px 上限 */
+  #chat-header .git-branch-btn {
+    max-width: none;
+  }
+  /* 数字角标改成图标右上角的小圆点：不再横向占位，窄栏才能给会话名留出空间 */
+  #chat-header .task-entry-badge,
+  #chat-header .decision-entry-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    margin-left: 0;
+    min-width: 13px;
+    height: 13px;
+    padding: 0 3px;
+    font-size: 9.5px;
+    line-height: 13px;
+  }
 }
 
 .export-wrap {

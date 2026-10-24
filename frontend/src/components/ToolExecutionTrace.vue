@@ -1,22 +1,23 @@
 <template>
-  <FoldCard v-model:open="expanded" class="exec-trace">
-    <!-- 状态变化（进行中 -> 已完成 等）通过 aria-live 礼貌播报；
-         行内 elapsed 秒数不在 live 区域内，避免高频打扰 -->
-    <template #title>
-      <span aria-live="polite">{{ title }}</span>
-    </template>
+  <!-- 直接平铺工具行：不再有"执行过程 · N 项"外壳，也没有折叠开关。
+       状态变化仍通过视觉隐藏的 aria-live 区域礼貌播报（行内耗时不在 live 区内） -->
+  <div class="exec-trace">
+    <p class="sr-only" aria-live="polite">{{ title }}</p>
     <ToolExecutionRow
-      v-for="row in rows"
+      v-for="(row, index) in rows"
       :key="row.id"
       :row="row"
       :elapsed-ms="activeElapsedMs"
+      :class="{
+        'trace-first': index === 0,
+        'trace-last': index === rows.length - 1,
+      }"
     />
-  </FoldCard>
+  </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue';
-import FoldCard from './FoldCard.vue';
 import ToolExecutionRow from './ToolExecutionRow.vue';
 import {
   buildToolTraceRows,
@@ -31,10 +32,6 @@ const props = defineProps<{
   state: ExecutionState;
 }>();
 
-// 默认收起（图二样式）：只显示"执行过程 · N 项 · 状态"一行，点击标题展开详情；
-// 折叠状态只影响本组件 UI，不写入任何 store
-const expanded = ref(false);
-
 const STATE_LABELS: Record<ExecutionState, string> = {
   running: '进行中',
   completed: '已完成',
@@ -42,7 +39,7 @@ const STATE_LABELS: Record<ExecutionState, string> = {
   error: '异常结束',
 };
 
-// 头部计数是“已注册的原始调用数”，不是预测总数
+// 只用于视觉隐藏的无障碍播报（"执行过程 · N 项 · 状态"），界面上不再渲染这层标题
 const title = computed(
   () => `执行过程 · ${props.calls.length} 项 · ${STATE_LABELS[props.state] ?? props.state}`,
 );
@@ -91,10 +88,24 @@ const activeElapsedMs = computed(() => {
   return Math.max(0, now.value - earliest);
 });
 </script>
-
 <style scoped>
-/* 折叠头/箭头/内容体样式统一由 FoldCard 提供 */
+/* 平铺的工具行：行间距交给每行自己的 padding，这里只给块级留白 */
 .exec-trace {
-  margin: 8px 0;
+  display: flex;
+  flex-direction: column;
+  margin: 4px 0 6px;
+}
+
+/* 无障碍播报专用：视觉隐藏但仍在可访问树里 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 </style>

@@ -68,26 +68,21 @@ def is_supported() -> bool:
 def profile_dir() -> Path:
     """内嵌 WebView2 面板浏览控件的 UserDataFolder。支持 YCODE_DATA_DIR 覆盖。
 
-    注意：自动化控件另用 automation_profile_dir()（刻意分离，原因见该函数）。
+    面板控件与自动化共用这一个目录：面板控件从创建起就带 CDP 调试端口，
+    星瑶自动化直接接管用户眼睛看到的那个浏览器（共享登录态，不再另建隐藏
+    控件），因此不需要第二个 WebView2 环境，也就不存在"同目录二次带参建
+    环境"的冲突。
     """
     return _data_dir() / "browser_profile"
 
 
 def automation_profile_dir() -> Path:
-    """星瑶自动化控件的专用 UserDataFolder（与面板浏览目录刻意分离）。
+    """【历史符号，仅保留兼容旧引用】自动化曾经使用的专用 UserDataFolder。
 
-    为什么必须分离（实测复现的 WebView2 硬约束）：同一个 UserDataFolder 上
-    只要还存在一个活着的 WebView2 环境，再创建带 AdditionalBrowserArguments
-    的环境就会失败——HRESULT 0x8007139F（ERROR_INVALID_STATE，"组或资源的
-    状态不是执行请求操作的正确状态"）。面板浏览控件是无参创建的，而自动化
-    准备要带 --remote-debugging-port 重建，Dispose 之后底层环境与浏览器进程
-    未必立刻收尾（初始化尚在飞行时 Dispose 尤其如此），于是带参重建必炸：
-    2026-09-28 20:48、2026-09-30 18:22 各发生一次，面板 profile 里再无浏览器
-    进程，星瑶的每一次电脑操控都表现为"embedded 浏览器启动超时"。
-
-    给自动化控件独立目录后，它与浏览控件不在同一目录，冲突从结构上不可能
-    发生，也不再依赖 Dispose 的收尾时序。computer.settings 的 embedded 分支
-    以此为准（identity 冻结的是自动化实际使用的 profile）。
+    该目录已不再用于创建任何控件：两套控件已合并到 profile_dir()——面板控件
+    创建时就带 --remote-debugging-port，自动化准备直接复用/接管它，不再另建
+    隐藏控件（一套浏览器、共享登录态、用户可见）。保留函数只因其它模块可能
+    仍 import 它；新代码不得把它当作任何控件的 UserDataFolder。
     """
     return _data_dir() / "browser_profile_cdp"
 
@@ -322,6 +317,12 @@ class EmbeddedBrowserController:
         # _on_init_completed 补导航。没有它，「打开面板后首次导航」会因
         # open→navigate 背靠背派发撞上初始化竞态而被静默丢弃（评审 B1）。
         self._pending_url = ""
+        # 会话 cookie 注入：内嵌 WebView2 控件没有主 webview 的登录态，Python 侧
+        # 会话 cookie 必须经 CoreWebView2.CookieManager 写进去。控件内核是异步
+        # 初始化的（EnsureCoreWebView2Async），所以这里只做记录，实际写入在
+        # 内核就绪与每次导航前重放（页面把 cookie 清掉也能补回来）。
+        self._session_cookies: list[dict] = []
+        self._session_cookie_domain = ""
 
     # ------------------------------------------------------------------ 内部
 
@@ -394,10 +395,14 @@ class EmbeddedBrowserController:
     ) -> None:
         """在 GUI 线程内创建并挂载 WebView2 控件（幂等）。
 
-        additional_browser_args 仅自动化准备路径使用（CDP 调试端口），
-        必须在 EnsureCoreWebView2Async 之前写入 CreationProperties。
-        user_data_folder 缺省为面板浏览目录；自动化路径传
-        automation_profile_dir()——两者必须分离，理由见该函数说明。
+        面板控件创建路径不再传 CDP 端口（面板默认不带调试端口）；需要端口的
+        是 prepare_automation 的重建路径（自动化/电脑操控接管时按需带端口
+        重建，仍是用户看到的那个浏览器）。additional_browser_args 必须在
+        EnsureCoreWebView2Async 之前写入 CreationProperties。
+        user_data_folder 缺省为 profile_dir()：面板控件与自动化共用同一目录，
+        一套浏览器、共享登录态。cdp_port 记录本次实际请求的端口，供
+        prepare_automation 复用；控件已存在时直接 return，端口只在首次创建时
+        生效（不要在已存在的控件上换端口，那需要 Dispose 重建）。
         """
         if self._webview is not None:
             return
@@ -455,6 +460,8 @@ class EmbeddedBrowserController:
             with self._lock:
                 pending = self._pending_url
                 self._pending_url = ""
+            # 会话 cookie 重放：必须早于补导航，否则首个页面仍按未登录渲染。
+            self._flush_session_cookies()
             if pending:
                 try:
                     self._url = pending
@@ -609,6 +616,13 @@ class EmbeddedBrowserController:
 
             def _do_open():
                 try:
+                    # 面板控件默认不带 CDP 调试端口：星瑶自动化/电脑操控接管时经
+                    # prepare_automation 按需重建带端口的控件（仍是从用户眼睛
+                    # 看到的这个浏览器，一套实例、共享登录态），首次接管页面会
+                    # 重载一次。这样"只打开右侧浏览器面板、从未用自动化"的
+                    # 用户不再背一个无鉴权的常驻回环 CDP 端口（同机任意进程
+                    # 可连上并接管浏览器、读登录态）。
+                    # _create_control 幂等：控件已存在时保持原状。
                     self._create_control(form)
                     self._apply_bounds(form, rect, zoom)
                     self._visible = True
@@ -683,6 +697,82 @@ class EmbeddedBrowserController:
         except Exception:
             logger.debug("设置 WebView2 ZoomFactor 失败", exc_info=True)
 
+    # ------------------------------------------------------ 会话 cookie 注入
+
+    def set_session_cookies(
+        self, cookies: list[dict], domain: str = "tokenrhythm.studio"
+    ) -> None:
+        """记住要注入的 cookie 并立即尝试写入；内核未就绪时等 _on_init_completed 重放。"""
+        try:
+            items: list[dict] = []
+            for raw in cookies or []:
+                if not isinstance(raw, dict):
+                    continue
+                name = raw.get("name")
+                value = raw.get("value")
+                if not name or not value:
+                    continue  # 缺 name/value 的项无法构成合法 cookie，直接丢弃
+                items.append(
+                    {
+                        "name": str(name),
+                        "value": str(value),
+                        "domain": str(raw.get("domain") or domain or ""),
+                        "path": str(raw.get("path") or "/"),
+                        "http_only": bool(raw.get("http_only")),
+                        "secure": bool(raw.get("secure")),
+                    }
+                )
+            self._session_cookies = items
+            self._session_cookie_domain = str(domain or "")
+        except Exception:
+            logger.debug("记录会话 cookie 失败", exc_info=True)
+            return
+        self._flush_session_cookies()
+
+    def _flush_session_cookies(self) -> None:
+        """把已记录的会话 cookie 写入内核（内核未就绪则等初始化完成回放）。
+
+        不设置 Expires：按会话级处理，每次导航前重放即可覆盖页面清 cookie 的情况。
+        """
+        try:
+            webview = self._webview
+            if webview is None or not self._ready:
+                return
+            form = self._form
+            if form is None:
+                return
+            cookies = list(self._session_cookies)
+            if not cookies:
+                return
+
+            def _write():
+                try:
+                    core = self._webview.CoreWebView2
+                    if core is None:
+                        return
+                    manager = core.CookieManager
+                    for item in cookies:
+                        cookie = manager.CreateCookie(
+                            item["name"], item["value"], item["domain"], item["path"]
+                        )
+                        # tr_csrf 必须对页面 JS 可见：官方前端的请求包装会从
+                        # document.cookie 读它并回填 X-CSRF-Token。若按 httpOnly
+                        # 注入，所有非 GET 请求会被服务端判 CSRF_INVALID，充值页
+                        # 的「查看报价」就是这样失败的。它只是 CSRF token 而非会话
+                        # 凭据，放开可见性正是官方浏览器端的设计。
+                        cookie.IsHttpOnly = bool(item.get("http_only")) and item.get("name") != "tr_csrf"
+                        cookie.IsSecure = bool(item.get("secure"))
+                        manager.AddOrUpdateCookie(cookie)
+                except Exception:
+                    # 日志级别压到 debug 且只给摘要：cookie 的 value 是登录凭据，
+                    # 任何形态（含异常消息）都不得写进日志。
+                    logger.debug("写入会话 cookie 失败", exc_info=True)
+
+            if not self._invoke(form, _write):
+                logger.debug("写入会话 cookie 失败：GUI 线程不可用")
+        except Exception:
+            logger.debug("重放会话 cookie 失败", exc_info=True)
+
     def navigate(self, url: str) -> Dict[str, Any]:
         target = normalize_url(url)
         if not target:
@@ -701,6 +791,8 @@ class EmbeddedBrowserController:
             if not became_ready:
                 self._url = target
                 return {"ok": True, "state": self._snapshot()}
+        # 每次导航前重放：页面可能已把 cookie 清掉，重放保证登录态始终在。
+        self._flush_session_cookies()
         return self._navigate_now(target)
 
     def _navigate_now(self, target: str) -> Dict[str, Any]:
@@ -807,16 +899,27 @@ class EmbeddedBrowserController:
     def prepare_automation(self) -> Dict[str, Any]:
         """星瑶自动化准备：确保控件带 CDP 调试端口存在且端点真的可用（幂等）。
 
-        - 控件已带端口：直接返回现有 endpoint（该端口在创建时已验证过）；
-        - 控件存在但未带端口：Dispose 后带端口重建（页面会重载）；
-        - 控件不存在：隐藏创建（不强制打开面板，可见性/定位仍由前端
-          面板的 open/set_bounds 正常路径负责——WebView2 隐藏时渲染可能
-          被节流，自动化开始后面板会自动切到浏览器页签使其可见）。
+        - 控件已带端口：真实 probe 该端口，可用则返回现有 endpoint。端口可能
+          只是面板控件创建时带上的（面板控件从创建起就带端口），创建路径从不
+          探测，所以这里必须验证，不能凭"带端口"就认定可用；
+        - 端口探测失败（或控件未带端口）：丢弃控件、带新随机端口重建（页面会
+          重载），重建后再 probe 一次；
+        - 控件不存在：带端口创建（不强制打开面板，可见性/定位仍由前端面板的
+          open/set_bounds 正常路径负责——WebView2 隐藏时渲染可能被节流，自动化
+          开始后面板会自动切到浏览器页签使其可见）。
 
-        自动化控件使用 automation_profile_dir()（与面板浏览目录分离，见该函数
-        说明）。创建后同步探测 CDP 端点：探不到就丢弃控件并返回真实错误——
-        绝不把死端点当成功交给上层，否则上层会拿着连不上的端口去建 backend，
-        最终只表现为"启动超时"，真因被完全掩盖（2026-09-30 故障）。
+        控件与面板共用 profile_dir()：自动化接管的就是用户眼睛看到的那个浏览器
+        （一套实例、共享登录态），不再另建隐藏控件。任何一次探测失败都丢弃控件
+        并返回真实错误——绝不把死端点当成功交给上层，否则上层会拿着连不上的
+        端口去建 backend，最终只表现为"启动超时"，真因被完全掩盖（2026-09-30
+        故障）。
+
+        安全权衡（有意为之，不要"顺手收紧"成外部浏览器）：CDP 调试端口只监听
+        127.0.0.1，但同机任意进程都能连上它并接管这个浏览器——包括用户已登录
+        的站点。这是为"自动化操作的就是用户眼睛看到的那个浏览器、共享登录态"
+        付的代价；改用外部 Edge/Chrome 能消除暴露面，但也就没有"在右栏围观"
+        这一层。端口为动态分配（pick_free_loopback_port），绝不写进日志、绝不
+        随观察回传给模型。
 
         返回 {'ok', 'endpoint', 'recreated'}；失败 {'ok': False, 'error'}。
         """
@@ -828,21 +931,26 @@ class EmbeddedBrowserController:
                 return {"ok": False, "error": "form_unavailable"}
             box: Dict[str, Any] = {}
 
-            def _do_prepare():
+            def _prepare_control(*, allow_reuse: bool) -> None:
+                """GUI 线程内：复用已带端口的控件（仅登记待验证），否则重建/创建。"""
                 try:
-                    if self._webview is not None and self._cdp_port is not None:
-                        box["ok"] = True
-                        box["endpoint"] = f"http://127.0.0.1:{self._cdp_port}"
-                        box["recreated"] = False
+                    if (
+                        allow_reuse
+                        and self._webview is not None
+                        and self._cdp_port is not None
+                    ):
+                        # 该端口可能来自面板控件创建路径（从未 probe 过）：这里只
+                        # 登记候选端口，真实探测放到 GUI 线程外，避免卡住界面。
                         box["port"] = self._cdp_port
-                        box["verify"] = False
+                        box["ok"] = True
                         return
                     if self._webview is not None:
-                        # 已有控件但未带调试端口：带端口重建（页面重载）。
+                        # 控件未带端口，或带的端口已探测失败：带端口重建（页面重载）。
                         old = self._webview
                         self._webview = None
                         self._ready = False
                         self._visible = False
+                        self._cdp_port = None
                         with self._lock:
                             self._pending_url = ""
                         self._zoom = 1.0
@@ -852,42 +960,47 @@ class EmbeddedBrowserController:
                             logger.debug("释放旧内嵌 WebView2 失败", exc_info=True)
                         box["recreated"] = True
                     port = pick_free_loopback_port()
+                    # 不传 user_data_folder：面板控件与自动化共用 profile_dir()。
                     self._create_control(
                         form,
                         additional_browser_args=f"--remote-debugging-port={port}",
                         cdp_port=port,
-                        user_data_folder=automation_profile_dir(),
                     )
-                    box["ok"] = True
-                    box["endpoint"] = f"http://127.0.0.1:{port}"
                     box["port"] = port
-                    box["verify"] = True
-                    if not box.get("recreated"):
-                        box["recreated"] = False
+                    box["ok"] = True
                 except Exception as exc:
                     box["ok"] = False
                     box["error"] = str(exc)
 
-            if not self._invoke(form, _do_prepare):
+            if not self._invoke(form, lambda: _prepare_control(allow_reuse=True)):
                 return {"ok": False, "error": "invoke_failed"}
             if not box.get("ok"):
                 return box or {"ok": False, "error": "invoke_failed"}
-            result = {
-                "ok": True,
-                "endpoint": box["endpoint"],
-                "recreated": box.get("recreated", False),
-            }
-            if not box.get("verify"):
-                return result
             ready, detail = self._cdp_probe(box["port"], self._cdp_ready_timeout)
-            if ready:
-                return result
             init_error = self._init_error
-            self._discard_control(form)
-            reason = f"内置浏览器 CDP 端点不可用（{detail}）"
-            if init_error:
-                reason += f"；WebView2 初始化失败：{init_error}"
-            return {"ok": False, "error": reason}
+            if not ready:
+                # 复用来的端口不可用（面板控件创建路径从不 probe）：丢弃后带新
+                # 端口重建一次再验证，绝不把死端点交给上层。
+                self._discard_control(form)
+                box.clear()
+                box["recreated"] = True
+                if not self._invoke(form, lambda: _prepare_control(allow_reuse=False)):
+                    return {"ok": False, "error": "invoke_failed"}
+                if not box.get("ok"):
+                    return box or {"ok": False, "error": "invoke_failed"}
+                ready, detail = self._cdp_probe(box["port"], self._cdp_ready_timeout)
+                init_error = self._init_error or init_error
+                if not ready:
+                    self._discard_control(form)
+                    reason = f"内置浏览器 CDP 端点不可用（{detail}）"
+                    if init_error:
+                        reason += f"；WebView2 初始化失败：{init_error}"
+                    return {"ok": False, "error": reason}
+            return {
+                "ok": True,
+                "endpoint": f"http://127.0.0.1:{box['port']}",
+                "recreated": bool(box.get("recreated")),
+            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

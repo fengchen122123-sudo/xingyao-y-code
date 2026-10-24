@@ -13,6 +13,7 @@ export type ToolCategory =
   | 'command'
   | 'mutation'
   | 'skill'
+  | 'computer'
   | 'other';
 
 export interface ToolDisplay {
@@ -77,6 +78,7 @@ export interface ToolTraceRow {
     | 'command'
     | 'mutation'
     | 'skill'
+    | 'computer'
     | 'tool'
     | 'legacy-diffs';
   status: ToolCallStatus;
@@ -123,6 +125,9 @@ function kindFor(category: ToolCategory): ToolTraceRow['kind'] {
   if (category === 'command') return 'command';
   if (category === 'mutation') return 'mutation';
   if (category === 'skill') return 'skill';
+  // 电脑操控单独一类：行内以「动作动词 + 目标」渲染（点击 / el-20），
+  // 不并入 tool 的通用「工具」文案。
+  if (category === 'computer') return 'computer';
   return 'tool';
 }
 

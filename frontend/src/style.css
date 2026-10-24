@@ -320,6 +320,25 @@ body::before {
   opacity: var(--theme-app-image-opacity, 1);
 }
 
+/* ── 全屏玻璃层：夹在「全局背景图」与「界面内容」之间 ────────────────────
+   背景图是 body::before（z-index:-1）；这里用 body::after 同层级、树序在后，
+   于是玻璃层恰好盖在壁纸之上、又被所有内容（z-index auto/0）盖住 ——
+   观感就是"壁纸之上糊了一层磨砂玻璃"，各半透明分区再叠上来。
+   透明度与模糊强度由 设置 → 外观与主题 → 玻璃效果 调整，
+   通过 --app-glass-opacity / --app-glass-blur 两个变量驱动（默认 0 = 完全不生效）。
+   注：本项目 body::after 此前未被占用（背景图在 body::before），故沿用原生伪元素，
+   与源实现保持同一层叠口径。 */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--theme-background-app) var(--app-glass-opacity, 0%), transparent);
+  backdrop-filter: blur(var(--app-glass-blur, 0px));
+  -webkit-backdrop-filter: blur(var(--app-glass-blur, 0px));
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -499,8 +518,8 @@ button {
   margin-top: 12px;
 }
 
-/* 左右按钮组不参与压缩：宽度不足由容器查询（见 KimiEmptyState）整体
-   切换手机版图标形态，而不是组内按钮被压换行 */
+/* 左右按钮组：右侧（模型/发送）不参与压缩；左侧工具组允许收缩并在
+   极窄档逐级隐藏次要按钮，避免整条工具栏溢出卡片（见 KimiEmptyState） */
 .kimi-card-bar > div {
   flex-shrink: 0;
 }
@@ -609,6 +628,9 @@ button {
 
 .kimi-footer-workdir {
   margin-top: 18px;
+  /* 中间列被两侧面板挤窄时不超过容器宽度，超长文案走省略号（不折行、不撑宽） */
+  max-width: 100%;
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   gap: 8px;

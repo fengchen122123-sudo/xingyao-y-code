@@ -138,11 +138,14 @@ def get_selected_command_shell() -> str:
     return value or DEFAULT_COMMAND_SHELL
 
 
-def _computer_active_model_capability(computer) -> dict[str, Any]:
+def _computer_active_model_capability(computer, active_model_id: str | None = None) -> dict[str, Any]:
     """当前活动模型的电脑操控资格摘要（设置面板展示用，只读）。
 
     与 Turn 起点走同一个判定函数（resolve_computer_capability，local 来源），
     保证设置页提示与真实执行门槛一致；模型未配置/读取失败时不影响设置页。
+
+    active_model_id 由调用方传入「真正会执行任务的模型」（GUI 按会话绑定模型，
+    全局 active_model_id 只在会话未绑定时才生效）；缺省时退回全局值。
     """
     try:
         from core.computer.capability import resolve_computer_capability
@@ -151,7 +154,7 @@ def _computer_active_model_capability(computer) -> dict[str, Any]:
         # 不走 model_manager.load_config（其模块级 _CONFIG_FILE 快照与设置
         # 路径可能不一致）。
         data = config._load()
-        active_id = str(data.get("active_model_id") or "")
+        active_id = str(active_model_id or data.get("active_model_id") or "")
         model = None
         provider = {}
         for candidate in data.get("providers", []):
@@ -189,7 +192,9 @@ def _computer_active_model_capability(computer) -> dict[str, Any]:
         }
 
 
-def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
+def get_system_settings(
+    *, platform: str | None = None, active_model_id: str | None = None
+) -> dict[str, Any]:
     selected = get_selected_command_shell()
     options = list_command_shell_options(platform=platform)
     selected_option = next((item for item in options if item["id"] == selected), None)
@@ -253,7 +258,9 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "computer_hotkey_available": hotkey.available,
         "computer_hotkey": "Ctrl+Alt+Esc",
         "computer_run": computer_run.to_public_dict(),
-        "computer_active_model_capability": _computer_active_model_capability(computer),
+        "computer_active_model_capability": _computer_active_model_capability(
+            computer, active_model_id
+        ),
         # AI 生成内容目录：生效绝对路径 / 原始配置值（设置页回显）/ 默认目录
         "ai_output_dir": str(_resolve_ai_output_dir()),
         "ai_output_dir_setting": _get_ai_output_dir_setting(),

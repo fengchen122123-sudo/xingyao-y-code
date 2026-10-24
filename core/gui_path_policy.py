@@ -19,10 +19,13 @@ core.harness.tool_adapters）"沙盒开启即放行工作区外"的语义不一�
 本模块只依赖标准库与 config，不引入 PIL / webview / gui_bridge 等重组件，
 便于独立测试（gui_bridge 模块顶层 import PIL，缺依赖环境下无法导入）。
 """
+import logging
 import os
 from pathlib import Path
 
 from config import YCODE_DIR as CONFIG_YCODE_DIR
+
+_LOGGER = logging.getLogger(__name__)
 
 # 与 core.harness.tool_adapters 的凭据口径一致：数据目录顶层的配置文件
 # （含 .bak 备份）含 API Key / MCP server 配置，GUI 预览/打开一律拒绝
@@ -110,7 +113,9 @@ def gui_path_access_allowed(real_path: str, workspace: str, *, action: str = "pr
         if is_trusted_paste_path(real_path) or is_session_user_attached_path(real_path, session_id):
             return True, ""
     except Exception:
-        pass
+        # 导入失败不能静默跳过：受信粘贴/附件不放行会被误报"不在工作区内"，
+        # 留痕便于发现 core.tools 装配异常。
+        _LOGGER.warning("受信粘贴/会话附件校验不可用，按工作区规则处理", exc_info=True)
     # 5) 工作区外：跟随沙盒开关
     if _allow_outside_workspace():
         return True, ""

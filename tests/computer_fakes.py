@@ -40,7 +40,7 @@ from dataclasses import replace
 import pytest
 
 import config
-from core.computer.browser_backend import ELEMENT_COLLECT_SCRIPT
+from core.computer.browser_backend import ELEMENT_COLLECT_SCRIPT, PAGE_TEXT_SCRIPT
 from core.computer.models import (
     ComputerCapability,
     ComputerControlError,
@@ -306,6 +306,10 @@ class FakePage:
         self.element_collect_result = None
         self.element_collect_error = None
         self.element_collect_hook = None
+        # B 方案（窗口被遮挡时的降级观察）：页面正文本注入点。默认空串；
+        # error 非空时 evaluate 抛错，用于验证「正文读取失败不中断 observe」。
+        self.page_text = ""
+        self.page_text_error = None
         # E2 元素动作注入点：locator 调用记录（selector 列表）与最近创建的
         # FakeLocator（供断言 click/fill 参数与异常注入路径）；预设字段
         # 在 locator 创建时应用到新对象（execute 前设置即可注入失败/命中数）。
@@ -320,7 +324,7 @@ class FakePage:
         return self.closed
 
     def evaluate(self, expression, *args, **kwargs):
-        """仅支持 R5 可见性探针与 E1 元素收集脚本；其他表达式一律拒绝（隐私边界）。"""
+        """仅支持 R5 可见性探针、E1 元素收集与正文提取脚本；其他表达式一律拒绝（隐私边界）。"""
         self._runtime._record_call("page.evaluate")
         self.evaluate_calls.append(expression)
         if expression == ELEMENT_COLLECT_SCRIPT:
@@ -330,10 +334,14 @@ class FakePage:
             if self.element_collect_hook is not None:
                 self.element_collect_hook(self)
             return [] if result is None else result
+        if expression == PAGE_TEXT_SCRIPT:
+            if self.page_text_error is not None:
+                raise self.page_text_error
+            return self.page_text
         if "visibilityState" in str(expression) and "hasFocus" in str(expression):
             return [self.visibility_state, self.focused]
         raise AssertionError(
-            f"fake page 只允许可见性探针与元素收集脚本，拒绝 evaluate: {expression!r}"
+            f"fake page 只允许可见性探针、元素收集与正文提取脚本，拒绝 evaluate: {expression!r}"
         )
 
     def title(self):
@@ -993,6 +1001,10 @@ class FakeBridgeController:
         self.status = "stopped"
         self.emit_state(run_id=run_id, event_seq=4, status="stopped", reason=reason)
         return self.snapshot()
+
+    def stop_for_user(self, run_id: str, reason: str = "user_stop"):
+        # 镜像真实 controller：用户停止只结束 run，不置位回合 cancel_event。
+        return self.stop(run_id, reason, cancel_owner=False)
 
     def snapshot(self):
         return ComputerRunSnapshot(

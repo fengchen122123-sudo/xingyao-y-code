@@ -4,6 +4,7 @@
 所有方法必须优雅失败而不抛异常。
 """
 
+import logging
 from types import SimpleNamespace
 import time
 
@@ -169,10 +170,34 @@ class _FakeSettings:
     IsStatusBarEnabled = True
 
 
+class _FakeCookieManager:
+    """CookieManager 桩：记录 CreateCookie / AddOrUpdateCookie 的调用。"""
+
+    def __init__(self):
+        self.created = []
+        self.added = []
+
+    def CreateCookie(self, name, value, domain, path):
+        cookie = SimpleNamespace(
+            Name=name,
+            Value=value,
+            Domain=domain,
+            Path=path,
+            IsHttpOnly=False,
+            IsSecure=False,
+        )
+        self.created.append(cookie)
+        return cookie
+
+    def AddOrUpdateCookie(self, cookie):
+        self.added.append(cookie)
+
+
 class _FakeCore:
     def __init__(self):
         self.navigated = []
         self.Settings = _FakeSettings()
+        self.CookieManager = _FakeCookieManager()
         self.Source = ""
         self.DocumentTitle = ""
         self.CanGoBack = False
@@ -297,12 +322,13 @@ def test_apply_zoom_tolerates_bad_input():
 # ---------------- 星瑶自动化准备（prepare_automation） ----------------
 
 
-def test_automation_profile_dir_is_separate_from_browsing_profile():
-    """自动化控件必须用独立 UserDataFolder：同目录二次带参建环境会撞
-    WebView2 0x8007139F（本次故障根因），分离后从结构上不可能冲突。"""
-    assert eb.automation_profile_dir() != eb.profile_dir()
-    assert eb.automation_profile_dir().name == "browser_profile_cdp"
+def test_automation_profile_dir_reflects_shared_profile():
+    """两套控件已合并：面板控件从创建起就带 CDP 调试端口，自动化接管的就是用户
+    看到的那个浏览器（共享登录态），两者共用 profile_dir()，不再有第二个
+    WebView2 环境，也就不存在同目录二次带参建环境（0x8007139F）的约束。"""
     assert eb.profile_dir().name == "browser_profile"
+    # automation_profile_dir 仅为兼容旧引用的历史符号，已不用于创建任何控件
+    assert eb.automation_profile_dir().name == "browser_profile_cdp"
 
 
 def test_prepare_automation_creates_hidden_control_with_cdp_args():
@@ -315,7 +341,8 @@ def test_prepare_automation_creates_hidden_control_with_cdp_args():
     def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
         calls["args"] = additional_browser_args
         calls["port"] = cdp_port
-        calls["folder"] = user_data_folder
+        # 未传目录即等价于 _create_control 的缺省 profile_dir()（两套控件共用）
+        calls["folder"] = eb.profile_dir() if user_data_folder is None else user_data_folder
         ctrl._webview = SimpleNamespace()
         ctrl._cdp_port = cdp_port
 
@@ -326,7 +353,7 @@ def test_prepare_automation_creates_hidden_control_with_cdp_args():
     assert result["endpoint"] == f"http://127.0.0.1:{calls['port']}"
     assert calls["args"].startswith("--remote-debugging-port=")
     assert calls["args"] == f"--remote-debugging-port={calls['port']}"
-    assert calls["folder"] == eb.automation_profile_dir()
+    assert calls["folder"] == eb.profile_dir()
 
 
 def test_prepare_automation_is_idempotent_when_port_present():
@@ -334,11 +361,50 @@ def test_prepare_automation_is_idempotent_when_port_present():
     ctrl._get_form = lambda: _FakeForm()
     ctrl._webview = SimpleNamespace()
     ctrl._cdp_port = 9321
+    probed: list = []
+    ctrl._cdp_probe = lambda port, timeout: (probed.append(port), (True, "ready"))[1]
     created: list = []
     ctrl._create_control = lambda *args, **kwargs: created.append(args)
     result = ctrl.prepare_automation()
     assert result == {"ok": True, "endpoint": "http://127.0.0.1:9321", "recreated": False}
-    assert created == []  # 幂等：不重复创建/重建控件
+    assert created == []  # 幂等：端口可用时不重复创建/重建控件
+    assert probed == [9321]  # 但必须真实探测，不能凭"控件带端口"就返回
+
+
+def test_prepare_automation_rebuilds_when_existing_port_is_dead():
+    """控件已带端口但 probe 失败（面板控件创建路径从不 probe，端口可能已死）：
+    必须丢弃该控件、带新端口重建，重建后 probe 通过才把 endpoint 交给上层。"""
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    disposed: list = []
+    ctrl._webview = SimpleNamespace(Dispose=lambda: disposed.append(1))
+    ctrl._cdp_port = 9321
+    probes: list = []
+
+    def _probe(port, timeout):
+        probes.append(port)
+        if port == 9321:  # 旧端口已死
+            return False, "URLError: connection refused"
+        return True, "ready"
+
+    ctrl._cdp_probe = _probe
+    created: dict = {}
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
+        created["port"] = cdp_port
+        created["args"] = additional_browser_args
+        ctrl._webview = SimpleNamespace()
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    result = ctrl.prepare_automation()
+    assert result["ok"] is True
+    assert result["recreated"] is True
+    assert disposed == [1]  # 死端点控件被丢弃，不留在主窗体上
+    assert created["port"] is not None and created["port"] != 9321
+    assert created["args"] == f"--remote-debugging-port={created['port']}"
+    assert result["endpoint"] == f"http://127.0.0.1:{created['port']}"
+    assert probes == [9321, created["port"]]  # 旧端口一次 + 重建端口一次
 
 
 def test_prepare_automation_recreates_control_without_port():
@@ -369,7 +435,8 @@ def test_prepare_automation_recreates_control_without_port():
 def test_prepare_automation_reports_real_error_when_cdp_never_ready():
     """控件建了但 CDP 端口起不来（如 WebView2 初始化失败 0x8007139F）：
     必须丢弃控件并返回真实错误，绝不返回连不上的死端点——否则上层会拿着
-    它去建 backend，最终只表现为"启动超时"，真因被掩盖。"""
+    它去建 backend，最终只表现为"启动超时"，真因被掩盖。重建一次仍失败时
+    同样丢弃并报错（两次都探不到就认输）。"""
     ctrl, _core = _fake_ready_controller()
     ctrl._get_form = lambda: _FakeForm()
     ctrl._webview = None
@@ -386,7 +453,7 @@ def test_prepare_automation_reports_real_error_when_cdp_never_ready():
     assert result["ok"] is False
     assert "CDP 端点不可用" in result["error"]
     assert "0x8007139F" in result["error"]
-    assert disposed == [1]  # 死控件不留在主窗体上
+    assert disposed == [1, 1]  # 首次创建 + 重建各丢弃一次死控件，都不留在主窗体上
     assert ctrl._webview is None
     assert ctrl._cdp_port is None  # 清端口：下次准备必须重新创建
 
@@ -571,3 +638,134 @@ def test_browser_mixin_releases_cached_controller_on_shutdown(monkeypatch):
     assert bridge.browser_pane_set_bounds(rect) == {"ok": False, "error": "not_open"}
     assert bridge.browser_pane_get_state() == {"ok": True, "state": None}
     assert bridge.browser_pane_hide() == {"ok": True}
+
+
+# ---------------- 会话 cookie 注入（内嵌控件没有自己的登录态） ----------------
+
+def test_set_session_cookies_waits_for_core_ready_then_replays():
+    """内核异步初始化：就绪前只记录不外写，_on_init_completed 必须补写。
+
+    只在 set_session_cookies 调用时写一次会永久丢掉登录态（控件此刻内核还没起）。
+    """
+    ctrl, core = _fake_ready_controller()
+    assert ctrl._ready is False
+
+    ctrl.set_session_cookies([{"name": "sid", "value": "secret-1"}])  # 不得抛
+
+    assert ctrl._session_cookies[0]["name"] == "sid"
+    assert ctrl._session_cookie_domain == "tokenrhythm.studio"
+    assert core.CookieManager.added == []  # 内核未就绪，此时不写
+
+    ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
+
+    assert ctrl._ready is True
+    assert [c.Name for c in core.CookieManager.added] == ["sid"]
+    cookie = core.CookieManager.added[0]
+    assert (cookie.Domain, cookie.Path) == ("tokenrhythm.studio", "/")
+
+
+def test_set_session_cookies_without_control_is_safe():
+    """控件尚未创建（_webview=None）时只记录，不抛异常，等初始化回放。"""
+    ctrl = _controller()
+    ctrl.set_session_cookies([{"name": "sid", "value": "v"}])
+
+    assert ctrl._webview is None
+    assert [item["name"] for item in ctrl._session_cookies] == ["sid"]
+
+
+def test_set_session_cookies_writes_every_valid_cookie():
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies(
+        [
+            {"name": "sid", "value": "v1"},
+            {"name": "", "value": "v2"},  # 缺 name
+            {"name": "no_value"},  # 缺 value
+            {"value": "v3"},  # 缺 name
+            {
+                "name": "keep",
+                "value": "v4",
+                "domain": "app.example.com",
+                "path": "/app",
+                "http_only": True,
+                "secure": True,
+            },
+        ]
+    )
+
+    manager = core.CookieManager
+    assert [(c.Name, c.Value) for c in manager.created] == [
+        ("sid", "v1"),
+        ("keep", "v4"),
+    ]
+    assert manager.added == manager.created  # 每个 CreateCookie 都 AddOrUpdate 一次
+    first, second = manager.created
+    assert (first.Domain, first.Path) == ("tokenrhythm.studio", "/")
+    assert (second.Domain, second.Path) == ("app.example.com", "/app")
+    assert (first.IsHttpOnly, first.IsSecure) == (False, False)
+    assert (second.IsHttpOnly, second.IsSecure) == (True, True)
+
+
+def test_tr_csrf_cookie_is_visible_to_page_js():
+    """tr_csrf 必须对页面 JS 可见。
+
+    官方前端的请求包装从 document.cookie 读 tr_csrf 并回填 X-CSRF-Token；
+    若按 httpOnly 注入，所有非 GET 请求都会被服务端判 CSRF_INVALID，
+    充值页的「查看报价」就是这样失败的。会话凭据 tr_session 仍保持 httpOnly。
+    """
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies(
+        [
+            {"name": "tr_session", "value": "s", "http_only": True},
+            {"name": "tr_csrf", "value": "c", "http_only": True},
+        ]
+    )
+
+    session, csrf = core.CookieManager.created
+    assert session.IsHttpOnly is True
+    assert csrf.IsHttpOnly is False
+
+
+def test_set_session_cookies_tolerates_bad_items():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies([None, "sid=v", {"name": None, "value": None}])
+
+    assert ctrl._session_cookies == []
+
+
+def test_navigate_replays_session_cookies_before_navigating():
+    """每次导航前重放：页面把 cookie 清掉后下一次导航也能补回登录态。"""
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+    ctrl.set_session_cookies([{"name": "sid", "value": "v1"}])
+    assert len(core.CookieManager.added) == 1
+
+    core.CookieManager.created.clear()
+    core.CookieManager.added.clear()
+    result = ctrl.navigate("example.com")
+
+    assert result["ok"] is True
+    assert core.navigated == ["https://example.com"]
+    assert [c.Name for c in core.CookieManager.added] == ["sid"]
+
+
+def test_session_cookie_value_never_logged(caplog):
+    """cookie 的 value 是登录凭据：写入失败走 debug 日志，但 value 不得出现。"""
+    caplog.set_level(logging.DEBUG, logger=eb.logger.name)
+    secret = "SESSION-SECRET-DO-NOT-LOG"
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    def _boom(name, value, domain, path):
+        raise RuntimeError("CreateCookie failed")
+
+    core.CookieManager.CreateCookie = _boom
+    ctrl.set_session_cookies([{"name": "sid", "value": secret}])
+
+    assert "写入会话 cookie 失败" in caplog.text  # 失败路径确实记了日志
+    assert secret not in caplog.text  # 但 value 绝不入日志

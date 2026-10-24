@@ -979,28 +979,18 @@ def test_usage_table_keeps_numeric_columns_aligned_for_long_route_labels(monkeyp
     assert len(widths) == 1, (widths, table_lines)
 
 
-def test_status_token_info_labels_lane_and_process_scopes_separately():
-    """状态栏一行内必须分别标注「车道热口径」与「进程累计口径」。
-
-    车道命中率的分母是当前车道的热窗口，进程输入/输出/命中的分母是进程累计；
-    两者并排却不标口径时，「命中 X (Y%)」会被读成「输入 X 的 Y%」，自相矛盾。
-    """
+def test_status_token_info_reports_process_scope_only():
+    """状态栏只报进程累计口径：「本车道命中」「全局」标签、保活段都已移除。"""
     text = main._compose_status_token_info(
-        lane_cached="15.2K", lane_rate="88%",
         prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
-        ctx_pct="3%", ctx_used="4K", ctx_max="128K", keepalive_rate=None,
+        ctx_pct="3%", ctx_used="4K", ctx_max="128K",
     )
 
-    assert "本车道命中 15.2K (88%)" in text
-    assert "全局 输入 40.0M · 输出 2.1M · 命中 700.4K (71%)" in text
+    assert "本车道" not in text
+    assert text.startswith("↑ 40.0M · ↓ 2.1M · ⚡ 700.4K (71%)")
+    assert "上下文 3% (4K/128K)" in text
+    assert "全局" not in text
     assert "保活" not in text
-
-    with_keepalive = main._compose_status_token_info(
-        lane_cached="15.2K", lane_rate="88%",
-        prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
-        ctx_pct="3%", ctx_used="4K", ctx_max="128K", keepalive_rate="2%",
-    )
-    assert with_keepalive.endswith("· 保活 2%")
 
 
 def test_usage_model_label_cell_is_bounded_but_keeps_channel_and_scope():

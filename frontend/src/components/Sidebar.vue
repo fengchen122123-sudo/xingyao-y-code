@@ -149,19 +149,19 @@
       </div>
       <div class="menu-item" @click="openSkills()">
         <span class="mi-ico">❖</span>
-        <span class="mi-label">技能 Skills</span>
+        <span class="mi-label">星盘 · 技能</span>
         <span class="mi-count">{{ store.skills.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openMcp()">
         <span class="mi-ico">⧉</span>
-        <span class="mi-label">MCP 服务</span>
+        <span class="mi-label">星桥 · MCP</span>
         <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openPlugins()">
         <span class="mi-ico">⬡</span>
-        <span class="mi-label">插件</span>
+        <span class="mi-label">星匣 · 插件</span>
         <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
@@ -232,7 +232,7 @@
             <!-- 秘书分组保留 ＋（新建归秘书的会话），但不能把 'SECRETARY' 当
                  workdir 传给 createSessionInGroup，所以点击走专门的桥方法。
                  秘书必须先起名（名字是它的身份标识），故先弹起名弹窗，
-                 提交后才由 store.createSecretarySession(name) 真正建会话 -->
+                 提交后才由 store.createSecretarySession(name, persona) 真正建会话 -->
             <button
               v-if="!group.is_global && group.folder_path !== 'GLOBAL'"
               class="g-add"
@@ -332,13 +332,35 @@
       </div>
     </div>
 
-    <div class="side-footer">
-      <button data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
-        <span>⚙</span><span class="footer-copy"><b>设置</b></span>
-      </button>
-      <button class="phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
-        <AppIcon name="smartphone" :size="16" />
-      </button>
+    <!-- 底部容器：只为账号浮层提供定位基准（浮层 absolute 到 .side-bottom 的
+         上边缘），不改变内部 .side-footer 的网格布局 -->
+    <div class="side-bottom">
+      <div class="side-footer">
+        <!-- 左下角用户卡片：未登录点开基元律动（TokenRhythm）登录窗（登录成功后
+             后端自动绑定 API Key）；已登录则切换上方的账号浮层。
+             设置入口仍是右侧齿轮，手机访问是它右边的手机按钮 -->
+        <button
+          class="side-user"
+          data-test="side-user-card"
+          :title="store.trAuth.status === 'loggedIn'
+            ? '查看基元律动账号'
+            : '点击登录基元律动账号，自动配置 API Key'"
+          @click="onUserCardClick()"
+        >
+          <span class="side-avatar">{{ trAvatarText }}</span>
+          <span class="footer-copy"><b>{{ trUserLabel }}</b></span>
+        </button>
+        <button class="icon-btn" data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
+          <AppIcon name="settings" :size="16" />
+        </button>
+        <button class="icon-btn phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
+          <AppIcon name="smartphone" :size="16" />
+        </button>
+      </div>
+      <!-- 基元律动账号浮层：登录成功后点左下角卡片，在卡片上方弹出 -->
+      <TokenRhythmAccountPanel />
+      <!-- 账号中心原生弹窗（充值 / 用量明细 / 个人信息），Teleport 到 body -->
+      <TokenRhythmAccountDialog />
     </div>
   </div>
 
@@ -371,8 +393,51 @@
       @click="runCtxMenu('top')"
     >置顶</div>
     <div class="ctx-sep"></div>
+    <div
+      v-if="!ctxMenu.secretary"
+      class="ctx-item"
+      data-test="ctx-move-to"
+      @click="openMoveMenu()"
+    >移动到…</div>
     <div class="ctx-item" data-test="ctx-rename" @click="startRename()">重命名</div>
+    <!-- 只有秘书会话有专属人设：每个秘书是用户自己创建的独立 agent -->
+    <div
+      v-if="ctxMenu.secretary"
+      class="ctx-item"
+      data-test="ctx-secretary-persona"
+      @click="openSecretaryPersonaModal()"
+    >编辑人设</div>
     <div class="ctx-item danger" data-test="ctx-delete" @click="startDeleteFromMenu()">删除</div>
+  </div>
+
+  <!-- 会话「移动到…」的目标分组选择：沿用右键菜单外观，不另造一套弹层样式。
+       只列已存在的项目分组（含「对话」GLOBAL），排除会话当前所在分组。 -->
+  <div
+    v-if="moveMenu.show"
+    ref="moveMenuEl"
+    class="session-ctx-menu"
+    data-test="session-move-menu"
+    :style="{ left: `${moveMenu.x}px`, top: `${moveMenu.y}px` }"
+    @contextmenu.prevent
+    @click.stop
+  >
+    <div
+      v-if="!moveMenuFromGlobal"
+      class="ctx-item"
+      data-test="move-target-global"
+      @click="chooseMoveTarget('GLOBAL')"
+    >对话</div>
+    <div
+      v-for="g in moveTargets"
+      :key="g.folder_path"
+      class="ctx-item"
+      data-test="move-target"
+      :title="g.folder_path"
+      @click="chooseMoveTarget(g.folder_path)"
+    >{{ getFolderTitle(g) }}</div>
+    <div v-if="!moveTargets.length && moveMenuFromGlobal" class="ctx-item disabled">
+      没有其他分组
+    </div>
   </div>
 
   <!-- 项目分组右键菜单：排序入口（拖拽之外的确定性操作，首/末项自动置灰） -->
@@ -453,25 +518,29 @@
     </div>
   </div>
 
-  <!-- 给秘书起名的弹窗：名字是这个秘书会话的身份来源（侧栏 / 欢迎页 / 提示词
-       自称都用它），所以先起名再建会话。Enter 提交、Esc 取消、点遮罩关闭；
-       名字去首尾空白后为空或超 20 字符时创建按钮禁用（与后端校验同口径） -->
+  <!-- 秘书弹窗：新建时先起名（名字是它的身份来源），并可选填专属人设；
+       编辑时只改人设。每个秘书都是独立的 agent，人设只属于这个会话，
+       与设置页的星瑶人设无关。人设留空 = 内置默认秘书人设。
+       Enter 提交、Esc 取消、点遮罩关闭；新建时名字去首尾空白后为空或
+       超 20 字符则创建按钮禁用（与后端校验同口径） -->
   <div
-    v-if="secretaryNameModal.show"
+    v-if="secretaryModal.show"
     class="modal-mask"
     data-test="secretary-name-modal"
-    @click.self="closeSecretaryNameModal()"
+    @click.self="closeSecretaryModal()"
   >
     <div class="modal">
       <div class="modal-head">
         <div class="mh-ico"><AppIcon name="pencil" :size="16" /></div>
         <div>
-          <h3>给秘书起个名字</h3>
-          <p>名字只属于这个会话：界面显示与它的自称都用它，与设置页人设无关</p>
+          <h3>{{ secretaryModal.mode === 'create' ? '给秘书起个名字' : `编辑「${secretaryModal.display}」的人设` }}</h3>
+          <p v-if="secretaryModal.mode === 'create'">名字只属于这个会话：界面显示与它的自称都用它，与设置页人设无关</p>
+          <p v-else>人设只属于这位秘书：它是个独立 agent，与设置页的星瑶人设无关</p>
         </div>
       </div>
       <div class="modal-body">
         <input
+          v-if="secretaryModal.mode === 'create'"
           ref="secretaryNameInput"
           v-model="secretaryNameDraft"
           class="s-name-input"
@@ -481,29 +550,69 @@
           @keydown.esc="onSecretaryNameEsc($event)"
         >
         <!-- 校验失败原因就地说明：按钮禁用时用户能看到为什么不能创建 -->
-        <div class="s-name-hint" data-test="secretary-name-hint">{{ secretaryNameHint }}</div>
+        <div
+          v-if="secretaryModal.mode === 'create'"
+          class="s-name-hint"
+          data-test="secretary-name-hint"
+        >{{ secretaryNameHint }}</div>
+        <label class="s-persona-label" for="secretary-persona-input">专属人设（可选）</label>
+        <textarea
+          id="secretary-persona-input"
+          ref="secretaryPersonaInput"
+          v-model="secretaryPersonaDraft"
+          class="s-persona-input"
+          data-test="secretary-persona-input"
+          rows="8"
+          placeholder="留空就使用内置默认秘书人设。想让她多大程度上像「你自己造出来的人」，就把身份、性格、说话风格、做事偏好写清楚。例如：你是做事讲究先后的行政秘书，说话简短直接，涉及日程和邮件时先给结论再给依据。"
+          @keydown.esc="onSecretaryNameEsc($event)"
+        ></textarea>
+        <div class="s-name-hint" data-test="secretary-persona-hint">{{ secretaryPersonaHint }}</div>
       </div>
       <div class="modal-foot">
-        <button class="btn" data-test="secretary-name-cancel" @click="closeSecretaryNameModal()">取消</button>
+        <button class="btn" data-test="secretary-name-cancel" @click="closeSecretaryModal()">取消</button>
         <button
           class="btn primary"
           data-test="secretary-name-create"
-          :disabled="!secretaryNameValid"
-          @click="submitSecretaryName()"
-        >创建</button>
+          :disabled="!secretarySubmitValid"
+          @click="submitSecretaryModal()"
+        >{{ secretaryModal.mode === 'create' ? '创建' : '保存' }}</button>
       </div>
     </div>
   </div>
+
+  <!-- 基元律动账号登录窗：左下角用户卡片点击后打开，登录成功自动关窗 -->
+  <TokenRhythmLoginModal />
 </template>
 
 <script setup lang="ts">
 import { ref, computed, reactive, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
+import TokenRhythmLoginModal from './TokenRhythmLoginModal.vue';
+import TokenRhythmAccountPanel from './TokenRhythmAccountPanel.vue';
+import TokenRhythmAccountDialog from './TokenRhythmAccountDialog.vue';
 import type { SessionGroup, SessionInfo } from '../types/pywebview';
 import { useIsMobile } from '../composables/useViewport';
 
 const store = useAppStore();
+
+// 左下角卡片点击：已登录 → 切换账号浮层；未登录 → 打开登录弹窗
+function onUserCardClick() {
+  if (store.trAuth.status === 'loggedIn') store.toggleTrAccountPanel();
+  else store.openTrLoginModal();
+}
+
+// 基元律动账号名（左下角用户卡片）：user 字段结构由后端决定，前端按常见字段
+// 兜底，全都拿不到就回落到产品名，避免登录后卡片显示空白
+const trUserLabel = computed(() => {
+  if (store.trAuth.status !== 'loggedIn') return '星瑶Code';
+  const user = (store.trAuth.user || {}) as Record<string, any>;
+  return String(user.name || user.nickname || user.phone || user.account || '星瑶Code');
+});
+// 头像文字：已登录取账号名首字，未登录沿用原来的产品首字母 Y
+const trAvatarText = computed(() => (
+  store.trAuth.status === 'loggedIn' ? (trUserLabel.value.slice(0, 1).toUpperCase() || 'Y') : 'Y'
+));
 
 // 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
 // 宽度。移动端（<=768px）不输出内联样式，布局交给 style.css 媒体查询。
@@ -998,7 +1107,7 @@ let remoteBindExpiryTimer: ReturnType<typeof setInterval> | null = null;
 
 // 会话右键菜单：show 为浮层开关，x/y 为鼠标坐标（渲染后按视口边缘收拢）
 const MENU_EDGE = 8;
-const ctxMenu = reactive({ show: false, x: 0, y: 0, name: '', display: '', path: '' });
+const ctxMenu = reactive({ show: false, x: 0, y: 0, name: '', display: '', path: '', secretary: false });
 const ctxMenuEl = ref<HTMLElement | null>(null);
 // 就地重命名态：editingName 为会话名（唯一定位条目），editingValue 为输入框内容
 const editingName = ref('');
@@ -1007,14 +1116,23 @@ const editingValue = ref('');
 let editingOriginal = '';
 const renameInputEl = ref<HTMLInputElement | null>(null);
 
-// 秘书起名弹窗：点秘书分组的 ＋ 打开（不再直接建会话），提交后才建。
-// 名字池随机预填一个推荐名，用户可直接改或清空重填
+// 秘书弹窗：mode='create' 由秘书分组 ＋ 打开（起名 + 可选人设并建会话），
+// mode='edit' 由右键「编辑人设」打开（只改该秘书的人设）。名字池随机预填一个推荐名
 const SECRETARY_NAME_POOL = ['星河', '小满', '望舒', '清和', '云疏', '拾光'];
 // 与后端 core.secretary.validate_secretary_name 同口径：去首尾空白后 1-20 字符
 const SECRETARY_NAME_MAX_LEN = 20;
-const secretaryNameModal = reactive({ show: false });
+// 与后端 core.secretary.MAX_PERSONA_LEN 同口径；留空合法（= 内置默认秘书人设）
+const SECRETARY_PERSONA_MAX_LEN = 20000;
+const secretaryModal = reactive({
+  show: false,
+  mode: 'create' as 'create' | 'edit',
+  session: '',
+  display: '',
+});
 const secretaryNameDraft = ref('');
+const secretaryPersonaDraft = ref('');
 const secretaryNameInput = ref<HTMLInputElement | null>(null);
+const secretaryPersonaInput = ref<HTMLTextAreaElement | null>(null);
 // 规范化名字：去首尾空白后按码点计数与后端 len() 对齐（emoji 不算两个字符）
 const secretaryNameNormalized = computed(() => secretaryNameDraft.value.trim());
 const secretaryNameValid = computed(() => {
@@ -1028,6 +1146,20 @@ const secretaryNameHint = computed(() => {
     return `最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${[...name].length} 个`;
   }
   return '';
+});
+// 人设留空视为"没填"，直接放行（走内置默认秘书人设），只有超长才拦
+const secretaryPersonaNormalized = computed(() => secretaryPersonaDraft.value.trim());
+const secretaryPersonaHint = computed(() => {
+  const len = secretaryPersonaNormalized.value.length;
+  if (len > SECRETARY_PERSONA_MAX_LEN) {
+    return `最多 ${SECRETARY_PERSONA_MAX_LEN} 个字符，当前 ${len} 个`;
+  }
+  return secretaryModal.mode === 'edit' ? '留空即恢复内置默认秘书人设' : '';
+});
+const secretarySubmitValid = computed(() => {
+  if (secretaryPersonaNormalized.value.length > SECRETARY_PERSONA_MAX_LEN) return false;
+  // 编辑态只改人设，没有名字输入框，不必校验名字
+  return secretaryModal.mode === 'edit' ? true : secretaryNameValid.value;
 });
 
 // QQ2009 皮肤：用户卡昵称可就地编辑（localStorage 持久化，默认「木偶」）
@@ -1223,6 +1355,8 @@ function openCtxMenu(e: MouseEvent, s: SessionInfo, group: SessionGroup) {
   ctxMenu.display = s.display_name || s.name;
   // 记下所属分组：菜单里的上移 / 下移 / 置顶要按组内顺序计算
   ctxMenu.path = group.folder_path;
+  // 秘书会话不提供「移动到…」：它的归属由 source 决定，改 workdir 不会离开「秘书」分组
+  ctxMenu.secretary = !!s.secretary_name;
   ctxMenu.x = e.clientX;
   ctxMenu.y = e.clientY;
   ctxMenu.show = true;
@@ -1253,6 +1387,7 @@ function closeCtxMenu() {
   ctxMenu.name = '';
   ctxMenu.display = '';
   ctxMenu.path = '';
+  ctxMenu.secretary = false;
 }
 
 // 菜单项「重命名」：关菜单、就地进入编辑态，并把输入框聚焦全选
@@ -1269,45 +1404,84 @@ function startRename() {
 }
 
 // 点秘书分组的 ＋：打开起名弹窗（先把菜单收掉，避免两个浮层叠着）。
-// 预填推荐名并全选：用户想沿用推荐名可直接回车，想换名直接键入即可覆盖
+// 预填推荐名并全选：用户想沿用推荐名可直接回车，想换名直接键入即可覆盖。
+// 人设预填为空 = 默认秘书人设
 function openSecretaryNameModal() {
   closeCtxMenu();
   closeGroupMenu();
+  secretaryModal.mode = 'create';
+  secretaryModal.session = '';
+  secretaryModal.display = '';
   secretaryNameDraft.value = SECRETARY_NAME_POOL[Math.floor(Math.random() * SECRETARY_NAME_POOL.length)];
-  secretaryNameModal.show = true;
+  secretaryPersonaDraft.value = '';
+  secretaryModal.show = true;
   nextTick(() => {
     secretaryNameInput.value?.focus();
     secretaryNameInput.value?.select();
   });
 }
 
-function closeSecretaryNameModal() {
-  secretaryNameModal.show = false;
+// 右键「编辑人设」：只对秘书会话出现，用侧栏条目里已下发的人设原文回填
+function openSecretaryPersonaModal() {
+  const { name, display } = ctxMenu;
+  closeCtxMenu();
+  if (!name) return;
+  const entry = store.sessionGroups
+    .flatMap((g) => g.sessions || [])
+    .find((s) => s.name === name);
+  secretaryModal.mode = 'edit';
+  secretaryModal.session = name;
+  secretaryModal.display = display;
   secretaryNameDraft.value = '';
+  secretaryPersonaDraft.value = String((entry && entry.secretary_persona) || '');
+  secretaryModal.show = true;
+  nextTick(() => {
+    secretaryPersonaInput.value?.focus();
+    // 光标落到末尾：编辑现有人设时接着写，而不是把原文全选覆盖掉
+    const len = secretaryPersonaDraft.value.length;
+    secretaryPersonaInput.value?.setSelectionRange(len, len);
+  });
 }
 
-// 提交：先校验（非法值不发请求，也不静默截断），关弹窗后交给 store 建会话。
-// 不 await：建会话失败由 store 弹可见提示，弹窗不必卡在加载态里
-function submitSecretaryName() {
-  if (!secretaryNameValid.value) return;
+function closeSecretaryModal() {
+  secretaryModal.show = false;
+  secretaryModal.mode = 'create';
+  secretaryModal.session = '';
+  secretaryModal.display = '';
+  secretaryNameDraft.value = '';
+  secretaryPersonaDraft.value = '';
+}
+
+// 提交：先校验（非法值不发请求，也不静默截断），关弹窗后交给 store。
+// 不 await：新建 / 保存失败由 store 弹可见提示，弹窗不必卡在加载态里
+function submitSecretaryModal() {
+  if (!secretarySubmitValid.value) return;
+  const persona = secretaryPersonaNormalized.value;
+  if (secretaryModal.mode === 'edit') {
+    const session = secretaryModal.session;
+    closeSecretaryModal();
+    void store.updateSecretaryPersona(session, persona);
+    return;
+  }
   const name = secretaryNameNormalized.value;
-  closeSecretaryNameModal();
-  void store.createSecretarySession(name);
+  closeSecretaryModal();
+  void store.createSecretarySession(name, persona);
 }
 
-// Enter 提交：沿用重命名输入框的 IME 守卫——组合态下这次 Enter 是确认候选词，
-// 此刻文字还没上屏，提交会把中间态当名字发出去
+// Enter 提交（仅名字输入框）：沿用重命名输入框的 IME 守卫——组合态下这次
+// Enter 是确认候选词，此刻文字还没上屏，提交会把中间态当名字发出去。
+// 人设是多行文本域，Enter 保留换行语义，不在这里提交
 function onSecretaryNameEnter(e: KeyboardEvent) {
   if (isImeComposing(e)) return;
   e.preventDefault();
-  submitSecretaryName();
+  submitSecretaryModal();
 }
 
 // Esc 取消：组合态是取消候选词，不应关弹窗
 function onSecretaryNameEsc(e: KeyboardEvent) {
   if (isImeComposing(e)) return;
   e.preventDefault();
-  closeSecretaryNameModal();
+  closeSecretaryModal();
 }
 
 // 菜单项「删除」：复用现有二次确认流程（进入 confirming 态，仍需点红色确认按钮）
@@ -1333,6 +1507,51 @@ function runCtxMenu(action: 'up' | 'down' | 'top') {
   if (action === 'up') moveSessionStep(path, name, -1);
   else if (action === 'down') moveSessionStep(path, name, 1);
   else moveSessionTop(path, name);
+}
+
+// 会话「移动到…」：跨文件夹改归属（后端只改 sessions.workdir，消息与模型绑定不动）。
+// 目标列表只列已存在的项目分组，并排除会话当前所在分组；「对话」(GLOBAL) 作为反向
+// 目标单独提供。秘书分组（folder_path='SECRETARY'）不是磁盘目录，不能作为移动目标。
+const moveMenu = reactive({ show: false, x: 0, y: 0, name: '', fromPath: '' });
+const moveMenuEl = ref<HTMLElement | null>(null);
+
+// 当前会话是否已在「对话」分组：在的话不需要再给「对话」这一项
+const moveMenuFromGlobal = computed(() => !moveMenu.fromPath || moveMenu.fromPath === 'GLOBAL');
+const moveTargets = computed(() =>
+  (store.sessionGroups || []).filter(
+    (g) => !isGlobalGroup(g) && !g.is_secretary && g.folder_path !== moveMenu.fromPath,
+  ),
+);
+
+function openMoveMenu() {
+  const { path, name, x, y } = ctxMenu;
+  closeCtxMenu();
+  if (!name) return;
+  moveMenu.name = name;
+  moveMenu.fromPath = path || 'GLOBAL';
+  moveMenu.x = x;
+  moveMenu.y = y;
+  moveMenu.show = true;
+  nextTick(clampMoveMenu);
+}
+
+function clampMoveMenu() {
+  const { x, y } = clampToViewport(moveMenuEl.value, moveMenu.x, moveMenu.y);
+  moveMenu.x = x;
+  moveMenu.y = y;
+}
+
+function closeMoveMenu() {
+  moveMenu.show = false;
+  moveMenu.name = '';
+  moveMenu.fromPath = '';
+}
+
+async function chooseMoveTarget(target: string) {
+  const name = moveMenu.name;
+  closeMoveMenu();
+  if (!name || !target) return;
+  await store.moveSessionToWorkdir(name, target);
 }
 
 // 分组右键菜单：拖拽之外的排序入口（触屏/手抖时更可靠，也便于长距离调整）
@@ -1421,10 +1640,11 @@ function commitRename() {
   store.renameSession(oldName, next);
 }
 
-// 会话菜单与分组菜单互斥，统一收口关闭（滚动 / 缩放时顺带收掉 QQ2009 气泡）
+// 会话菜单、分组菜单、移动目标菜单互斥，统一收口关闭（滚动 / 缩放时顺带收掉 QQ2009 气泡）
 function closeSidebarMenus() {
   closeCtxMenu();
   closeGroupMenu();
+  closeMoveMenu();
   qq09HideTip();
 }
 
@@ -1438,8 +1658,8 @@ function onDocMouseDown(e: MouseEvent) {
     const wrap = qq09StatusRef.value;
     if (!(wrap && e.target instanceof Node && wrap.contains(e.target))) qq09CloseStatusMenu();
   }
-  if (!ctxMenu.show && !groupMenu.show) return;
-  const el = ctxMenu.show ? ctxMenuEl.value : groupMenuEl.value;
+  if (!ctxMenu.show && !groupMenu.show && !moveMenu.show) return;
+  const el = ctxMenu.show ? ctxMenuEl.value : (groupMenu.show ? groupMenuEl.value : moveMenuEl.value);
   if (el && e.target instanceof Node && el.contains(e.target)) return;
   closeSidebarMenus();
 }
@@ -1451,9 +1671,9 @@ function onDocKeyDown(e: KeyboardEvent) {
     closeSidebarMenus();
     qq09CloseStatusMenu();
     cancelRename();
-    // 起名弹窗也吃 Esc（输入框已聚焦时由它自己的 keydown.esc 先关，
+    // 秘书弹窗也吃 Esc（输入框已聚焦时由它自己的 keydown.esc 先关，
     // 这里兜住焦点不在输入框上的情况）
-    closeSecretaryNameModal();
+    closeSecretaryModal();
   }
 }
 
@@ -1463,6 +1683,9 @@ onMounted(() => {
   window.addEventListener('resize', closeSidebarMenus);
   document.addEventListener('mousedown', onDocMouseDown);
   document.addEventListener('keydown', onDocKeyDown);
+
+  // 账号状态是左下角用户卡片的数据源：启动后静默探测一次（未登录不弹提示）
+  if (store.trAuth.status === 'unknown') void store.refreshTrAuth();
 
   // 用后端权威快照校正本地缓存（localStorage 在强杀场景会丢写）。
   // 必须等桥真正就绪：api 对象先注入、方法后注入，抢跑会静默失败。
@@ -2206,13 +2429,21 @@ function getFolderTitle(g: SessionGroup) {
   margin: 4px 2px;
   background: var(--border);
 }
-
 .side-footer {
   padding: 7px;
   border-top: 1px solid var(--border);
   display: grid;
-  grid-template-columns: 1fr auto;
+  /* 左侧用户卡片占满剩余宽度，右侧两个图标按钮各自固定 32px */
+  grid-template-columns: 1fr auto auto;
   gap: 3px;
+}
+/* 底部容器：账号浮层（TokenRhythmAccountPanel）以它为定位基准，
+   absolute + bottom: calc(100% + 8px) 即贴在用户卡片正上方。
+   浮层不放在 .side-footer 内部：主题 CSS 里的 `#sidebar .side-footer button`
+   会连带改掉浮层按钮外观，这里避让开。 */
+.side-bottom {
+  position: relative;
+  flex: 0 0 auto;
 }
 .side-footer button {
   width: 100%;
@@ -2230,12 +2461,34 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--text);
   background: var(--bg2);
 }
-/* 手机访问入口：与设置按钮同行右侧的小方形图标按钮（弹窗内切换移动端 / web远端） */
-.side-footer .phone-btn {
+/* 底部用户卡片：可点击打开基元律动登录窗（圆形头像 + 名称），hover 反馈
+   沿用 .side-footer button 的统一样式 */
+.side-footer .side-user {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 7px;
+  color: var(--text-dim);
+}
+.side-footer .side-avatar {
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--bg3);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+/* 底部右侧图标按钮：设置与手机访问共用同一形态（32×32 圆形热区，与顶栏图标按钮同口径） */
+.side-footer .icon-btn {
   width: 32px;
   justify-content: center;
   padding: 7px;
   gap: 0;
+  border-radius: 50%;
 }
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
 .footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2388,6 +2641,33 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--text-faint);
   text-align: left;
   align-self: stretch;
+}
+
+/* 秘书人设输入区：与名字输入框同一套观感，纵向可拉伸但限制最小高度，
+   让多行人设有足够书写空间又不把弹窗撑出屏幕 */
+.s-persona-label {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  text-align: left;
+  align-self: stretch;
+}
+.s-persona-input {
+  width: 100%;
+  min-height: 130px;
+  max-height: 320px;
+  resize: vertical;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.55;
+  padding: 8px 10px;
+  outline: none;
+}
+.s-persona-input:focus {
+  border-color: var(--accent);
 }
 
 /* 移动端侧栏遮罩：桌面端不显示，仅在 <=768px 侧栏展开时盖住主区。

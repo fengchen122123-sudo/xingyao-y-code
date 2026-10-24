@@ -251,7 +251,11 @@ class StreamAssembler:
         replay_reasoning = reasoning_content or None
         if not self._keep_reasoning_fields:
             replay_reasoning = None
-        elif tool_calls and self._require_tool_call_reasoning:
+        elif self._require_tool_call_reasoning:
+            # DeepSeek thinking 契约：历史里的 assistant 消息必须携带字符串
+            # reasoning_content。带 tool_calls 的轮次原样回放推理内容；没有
+            # 工具调用、或本轮未输出思考内容时用空串占位——留 None 会让上游
+            # 按"历史消息缺少 reasoning_content"拒绝整轮请求。
             replay_reasoning = reasoning_content
 
         if (

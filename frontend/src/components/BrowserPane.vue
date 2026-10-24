@@ -431,6 +431,13 @@ function consumeBrowserNavRequest() {
   const req = store.browserNavRequest;
   if (!req || !req.url) return;
   if (unsupported.value) {
+    // path 为空 = 不是本地文件请求（如账号控制台页面）：回退系统浏览器，
+    // 否则 openFilePreview('') 只会弹一个读文件失败的错，点了等于没反应
+    if (!req.path) {
+      store.notifyChat('内嵌浏览器不可用，已改用系统浏览器打开');
+      void store.openExternalUrl(req.url);
+      return;
+    }
     store.notifyChat('内嵌浏览器不可用，已改为源码预览');
     void store.openFilePreview(req.path);
     return;
@@ -602,10 +609,10 @@ onMounted(() => {
   // 挂载前到达的外部导航请求（点击 html 时本组件可能还没挂载）统一在此消费：
   // 桥未就绪先挂起（就绪后补导航），宿主不支持则回退源码预览
   consumeBrowserNavRequest();
-  // 桥已在 setup 前就绪（热重载/重挂载）：直接校准；waiting 则挂双通道等待
-  if (bridgePhase.value === 'ready') { void calibrate(); return; }
-  if (bridgePhase.value === 'waiting') watchBridge();
-  // missing（确认缺桥）：不再做任何桥调用
+  // ResizeObserver 必须先于桥状态分支注册：面板尺寸变化与桥是否就绪无关。
+  // 旧实现把它放在 `bridgePhase === 'ready' → return` 之后，正常启动（桥已就绪）
+  // 永远走不到这里，于是拖动右侧面板宽度后 fitScale 不重算，视口框仍按旧尺寸
+  // 渲染，网页被裁掉一截（只能看到左上区域）。
   const el = surfaceRef.value;
   if (el && typeof ResizeObserver !== 'undefined') {
     try {
@@ -618,6 +625,15 @@ onMounted(() => {
       surfaceRo.observe(el);
     } catch { surfaceRo = null; }
   }
+  // 初始校准：resize 观测只在尺寸变化时触发，首帧的适应缩放要主动算一次。
+  // 否则 fitScale 会一直停在兜底 1，视口框按原始逻辑尺寸渲染并溢出面板。
+  if (freeSize.value.on) {
+    updateFitScale();
+    void nextTick(() => surface.syncNow());
+  }
+  // 桥已在 setup 前就绪（热重载/重挂载）：直接校准；waiting 则挂双通道等待
+  if (bridgePhase.value === 'ready') { void calibrate(); return; }
+  if (bridgePhase.value === 'waiting') watchBridge();
 });
 
 onUnmounted(() => {

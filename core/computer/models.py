@@ -158,6 +158,13 @@ class ComputerObservation:
     window_title: str = ""
     page_origin: str = ""
     page_title: str = ""
+    # B 方案（窗口被遮挡时的降级观察）：页面正文摘要（只含可见文本，已按码点
+    # 截断）。窗口最小化/被遮挡时 WebView2 渲染被节流，截图可能卡住或失败，
+    # 此时模型仍能凭正文判断页面内容。repr=False：正文属于页面内容，绝不进日志。
+    page_text: str = field(default="", repr=False)
+    # 本次未取到截图的原因（空串表示截图正常）：只含异常类名的简短中文说明，
+    # 绝不含堆栈或页面 URL，用于告知模型"这次没有图"而不是让它以为页面空白。
+    screenshot_error: str = ""
     error_code: str = ""
     error_message: str = ""
     before_fingerprint: str = ""
@@ -178,6 +185,10 @@ class ComputerObservation:
     # 通用化重构 Task C：本动作是否发生了前台切换（输入前置激活），仅本地
     # 自愈判定使用；绝不加入 observation_provider_projection 投影（投影字节不变）。
     input_activated: bool = False
+    # 帧契约（2026-10-21）：本步截图与**上一步**截图完全相同。用于在 Provider
+    # 投影层省掉重复附图的字节——同画面重复发图只烧上下文，模型从上一张图就能
+    # 读到内容。同样不进 observation_provider_projection，投影字节保持稳定。
+    screen_unchanged: bool = False
 
 
 @dataclass(frozen=True)

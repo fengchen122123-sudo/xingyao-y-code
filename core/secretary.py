@@ -1,15 +1,19 @@
-"""秘书身份解析：当前会话生效的显示名 / 自称的唯一事实源。
+"""秘书身份解析：当前会话生效的显示名 / 自称 / 专属人设的唯一事实源。
 
 背景：侧栏「秘书」分组下的会话是独立身份实体——每个会话各自起名（落库
 `sessions.secretary_name`），此后该会话的显示与系统提示词身份全程使用这个名字，
 且不复用设置页的人设名。
 
+专属人设（2026-10-20）：每个秘书都是用户自己创建的独立 agent，可另存一份
+`sessions.secretary_persona` 覆盖内置默认秘书人设；留空即用默认，且与设置页
+「星瑶人设」互不影响（永远不回落到 persona_settings）。
+
 设计约束：
 - 本模块只做"读 + 解析"，写入仍由 MemoryManager 承担；
 - 容错优先：任何异常都回落 persona 名（或空串），绝不抛错——身份解析处在每轮
   请求与工具提示的高频路径上，不能因一次解析失败拖垮整轮；
-- 会话名 → (来源, 名字) 做进程内缓存，避免高频路径每轮打 DB；创建 / 改名 / 删除
-  会话的调用方负责调用 `invalidate_secretary_cache` 失效。
+- 会话名 → (来源, 名字, 人设) 做进程内缓存，避免高频路径每轮打 DB；创建 /
+  改名 / 改人设 / 删除会话的调用方负责调用 `invalidate_secretary_cache` 失效。
 """
 
 from __future__ import annotations
@@ -22,11 +26,14 @@ FALLBACK_SECRETARY_NAME = "秘书"
 
 # 名字长度约束：strip 后 1..20 字符；非法值拒绝而非静默截断
 _MAX_NAME_LEN = 20
+# 人设长度上限：与设置页人设（persona_settings.MAX_PERSONA_LEN）同口径，
+# 避免两套"人设"对同一类文本给出不同长度限制
+MAX_PERSONA_LEN = 20000
 
-# 进程内缓存：键 = 会话名，值 = (source, name)。会话名是稳定标识，缓存值随
-# 创建 / 改名 / 删除失效，不设 TTL。
+# 进程内缓存：键 = 会话名，值 = (source, name, persona)。会话名是稳定标识，
+# 缓存值随创建 / 改名 / 改人设 / 删除失效，不设 TTL。
 _CACHE_LOCK = threading.Lock()
-_CACHE: dict[str, tuple[str, str]] = {}
+_CACHE: dict[str, tuple[str, str, str]] = {}
 
 
 def validate_secretary_name(name) -> str:
@@ -45,6 +52,22 @@ def validate_secretary_name(name) -> str:
     return cleaned
 
 
+def validate_secretary_persona(persona) -> str:
+    """校验并返回去首尾空白后的秘书人设；空值合法（= 使用内置默认人设）。
+
+    只有非空且超长才抛错——人设是可选项，留空必须能建秘书，不能把"没写人设"
+    当成非法输入拒掉。
+    """
+    if persona is None:
+        return ""
+    if not isinstance(persona, str):
+        raise ValueError("秘书人设必须是文本")
+    cleaned = persona.strip()
+    if len(cleaned) > MAX_PERSONA_LEN:
+        raise ValueError(f"秘书人设过长（最多 {MAX_PERSONA_LEN} 字符）")
+    return cleaned
+
+
 def _resolve_session_name(session_name):
     """统一会话名入口：显式传入优先，缺省取当前会话；取不到返回空串。"""
     if session_name:
@@ -58,22 +81,29 @@ def _resolve_session_name(session_name):
 
 
 def _load_identity(session_name):
-    """读取 (source, name)；无管理器 / 查询异常回落 ("", "")。"""
+    """读取 (source, name, persona)；无管理器 / 查询异常回落 ("", "", "")。"""
     try:
         from core import app_context
 
         manager = app_context.get_manager()
         if manager is None:
-            return ("", "")
+            return ("", "", "")
         source = manager.get_session_source(session_name) or ""
         name = manager.get_session_secretary_name(session_name) or ""
-        return (str(source), str(name))
     except Exception:
-        return ("", "")
+        return ("", "", "")
+    # 人设单独读取：测试替身 / 老实现可能没有该方法，缺它只应损失人设，
+    # 不该连来源与名字一起丢掉
+    persona = ""
+    try:
+        persona = manager.get_session_secretary_persona(session_name) or ""
+    except Exception:
+        persona = ""
+    return (str(source), str(name), str(persona))
 
 
 def _cached_identity(session_name):
-    """按会话名取 (source, name)，命中缓存则不打 DB。"""
+    """按会话名取 (source, name, persona)，命中缓存则不打 DB。"""
     with _CACHE_LOCK:
         cached = _CACHE.get(session_name)
     if cached is not None:
@@ -101,7 +131,7 @@ def is_secretary_session(session_name=None) -> bool:
     name = _resolve_session_name(session_name)
     if not name:
         return False
-    source, _ = _cached_identity(name)
+    source, _, _ = _cached_identity(name)
     return source == SECRETARY_SOURCE
 
 
@@ -110,10 +140,25 @@ def get_secretary_name(session_name=None) -> str:
     name = _resolve_session_name(session_name)
     if not name:
         return ""
-    source, secretary_name = _cached_identity(name)
+    source, secretary_name, _ = _cached_identity(name)
     if source != SECRETARY_SOURCE:
         return ""
     return secretary_name
+
+
+def get_secretary_persona(session_name=None) -> str:
+    """取会话的秘书专属人设；非秘书会话或未设置返回空串（= 用内置默认人设）。
+
+    人设与设置页的星瑶人设是两套东西：这里只读会话级 `secretary_persona`，
+    绝不回落到 persona_settings，否则"没填人设"的秘书会莫名其妙继承星瑶。
+    """
+    name = _resolve_session_name(session_name)
+    if not name:
+        return ""
+    source, _, persona = _cached_identity(name)
+    if source != SECRETARY_SOURCE:
+        return ""
+    return persona
 
 
 def get_active_agent_name() -> str:
@@ -228,4 +273,28 @@ def build_secretary_name_block(name) -> str:
         "# 秘书身份\n\n"
         f"你是「{cleaned}」，用户的私人秘书。这个名字是本会话专属的，"
         "与设置页的智能体人设无关；不主动引用或提及设置页的智能体名称。"
+    )
+
+
+def build_secretary_persona_block(persona) -> str:
+    """构建注入秘书系统提示词的"专属人设"块；人设为空返回空串（不注入）。
+
+    为什么单独成块并显式声明"取代"：秘书提示词随包分发、开头就写着默认定位
+    （可靠干练、结论先行、不寒暄…）。用户自定义人设若只是追加在后面，模型会
+    同时看到两套性格描述而互相打架，所以必须写明覆盖范围；但绝对红线、调度
+    硬约束、工具与安全规则不属于"人设"，一律保留。
+    """
+    try:
+        cleaned = validate_secretary_persona(persona)
+    except ValueError:
+        cleaned = str(persona or "").strip()
+    if not cleaned:
+        return ""
+    return (
+        "# 秘书人设（本会话专属，由用户设定）\n\n"
+        "以下是用户为这位秘书设定的完整人设，取代内置默认的秘书定位与性格设定"
+        "（可靠干练、信息优先、结论先行、不寒暄、不卖萌等风格描述一律不再沿用；"
+        "秘书的名字与称呼以「秘书身份」为准）。绝对红线、调度能力与硬约束、"
+        "核心原则、工具使用规范与工作流不受人设影响，仍然完整生效。\n"
+        + cleaned
     )

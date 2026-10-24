@@ -138,3 +138,335 @@ def test_is_persisted_observation_message_shape_variants():
     )
     assert not is_observation_protocol_message(None)
     assert not is_observation_protocol_message(123)
+
+
+def test_no_screenshot_observation_projects_text_only_with_page_text():
+    """B 方案：png_path 为空时绝不读图，改发纯文本观察（无截图说明 + 页面正文）。
+
+    为什么：窗口被遮挡/最小化时 WebView2 渲染被节流，截图会卡住或失败；旧路径
+    _read_observation_png("") 会抛 computer_backend_error，让观察链整体失败。
+    """
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    page_text = "搜索结果第一条：示例页面正文" * 20
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="browser",
+        action="observe",
+        page_text=page_text,
+        screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    assert all(block["type"] == "text" for block in message["content"])
+    assert not any(block["type"] == "image_url" for block in message["content"])
+    assert message["_computer_v1"]["image_omitted"] == "no_screenshot"
+    text = "\n".join(block["text"] for block in message["content"])
+    assert "本次没有截图" in text
+    assert "TimeoutError" in text
+    # 正文按 backend 截断后的原样进入消息（这里不再二次截断）
+    assert page_text in text
+
+
+def test_no_screenshot_observation_without_page_text_still_succeeds():
+    """正文也缺失时仍返回纯文本观察，绝不因缺图/缺正文抛错。"""
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="browser",
+        action="observe",
+        screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    assert all(block["type"] == "text" for block in message["content"])
+    text = "\n".join(block["text"] for block in message["content"])
+    assert "本次没有截图" in text
+    assert "本次也未能读到可见文本" in text
+
+
+def test_explicit_observe_with_elements_attaches_image_and_position(tmp_path):
+    """显式 observe 有元素时也附图：模型能看图认位置、用 el-N 精确点击。"""
+    from PIL import Image
+
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    png = tmp_path / "frame.png"
+    Image.new("RGB", (16, 16), (255, 255, 255)).save(png, format="PNG")
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="observe",
+        png_path=str(png),
+        width=100,
+        height=100,
+        original_width=200,
+        original_height=200,
+        origin_x=0,
+        origin_y=0,
+        elements=(
+            # bounds 是矩形四角 (left, top, right, bottom)，与 UIA/浏览器一致
+            {"ref": "el-1", "kind": "button", "name": "",
+             "bounds": (160, 160, 180, 180), "enabled": True},
+        ),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    types = [block["type"] for block in message["content"]]
+    assert "image_url" in types
+    text = "\n".join(
+        block["text"] for block in message["content"] if block["type"] == "text"
+    )
+    assert "el-1" in text
+    # 物理 (160,160)-(180,180) 换算到 100x100 模型图落在右下区域
+    assert "位置=画面右下角" in text
+
+
+def test_no_elements_image_observation_hints_observe_region(tmp_path):
+    """无控件列表时附图观察追加放大提示：模型只能看整屏截图估坐标，易点偏。"""
+    from PIL import Image
+
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    png = tmp_path / "frame.png"
+    Image.new("RGB", (16, 16), (255, 255, 255)).save(png, format="PNG")
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="observe",
+        png_path=str(png),
+        elements=(),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    types = [block["type"] for block in message["content"]]
+    assert "image_url" in types
+    text = "\n".join(
+        block["text"] for block in message["content"] if block["type"] == "text"
+    )
+    assert "observe_region" in text
+    # 提示必须排在 image_url 之前（先读指引再看图）
+    assert types.index("image_url") == len(types) - 1
+
+
+def test_with_elements_image_observation_has_no_region_hint(tmp_path):
+    """有控件列表时不加放大提示：模型用 click_element 即可，加了只占 token。"""
+    from PIL import Image
+
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    png = tmp_path / "frame.png"
+    Image.new("RGB", (16, 16), (255, 255, 255)).save(png, format="PNG")
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="observe",
+        png_path=str(png),
+        width=100,
+        height=100,
+        original_width=100,
+        original_height=100,
+        elements=(
+            {"ref": "el-5", "kind": "button", "name": "提交",
+             "bounds": (10, 10, 20, 20), "enabled": True},
+        ),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    text = "\n".join(
+        block["text"] for block in message["content"] if block["type"] == "text"
+    )
+    assert "el-5" in text
+    assert "observe_region" not in text
+
+
+def test_followup_observation_with_elements_stays_text_only(tmp_path):
+    """动作后的跟进观察（非显式 observe）有元素时仍只发文本，省 token。"""
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="click",
+        width=100,
+        height=100,
+        original_width=100,
+        original_height=100,
+        elements=(
+            {"ref": "el-2", "kind": "button", "name": "确定",
+             "bounds": (10, 10, 20, 20), "enabled": True},
+        ),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=2)
+    assert all(block["type"] == "text" for block in message["content"])
+    assert "el-2" in "\n".join(
+        block["text"] for block in message["content"]
+    )
+
+
+def test_explicit_observe_with_elements_keeps_list_when_no_screenshot():
+    """显式 observe 有元素但没截图：降级纯文本仍保留 el-N，模型不至于全盲。"""
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="observe",
+        screenshot_error="截图失败：TimeoutError",
+        elements=(
+            {"ref": "el-3", "kind": "button", "name": "保存",
+             "bounds": (10, 10, 20, 20), "enabled": True},
+        ),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    assert all(block["type"] == "text" for block in message["content"])
+    assert message["_computer_v1"]["image_omitted"] == "no_screenshot"
+    text = "\n".join(block["text"] for block in message["content"])
+    assert "el-3" in text
+    assert "本次没有截图" in text
+
+
+def test_explicit_observe_with_elements_keeps_list_when_frame_too_large(
+    tmp_path, monkeypatch
+):
+    """显式 observe 有元素但截图超限：省略图片时仍给出控件列表。"""
+    from core.computer import provider_generic
+    from core.computer.models import ComputerObservation
+
+    monkeypatch.setattr(provider_generic, "_OBSERVATION_IMAGE_MAX_BYTES", 8)
+    monkeypatch.setattr(provider_generic, "_downscale_png", lambda _b: None)
+    png = tmp_path / "frame.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="observe",
+        png_path=str(png),
+        elements=(
+            {"ref": "el-4", "kind": "button", "name": "取消",
+             "bounds": (10, 10, 20, 20), "enabled": True},
+        ),
+    )
+    message = provider_generic._observation_followup_message(
+        observation, run_id="run-1", ordinal=1
+    )
+    assert not any(block["type"] == "image_url" for block in message["content"])
+    assert message["_computer_v1"]["image_omitted"] == "too_large"
+    text = "\n".join(block["text"] for block in message["content"])
+    assert "el-4" in text
+    assert "已省略图片" in text
+
+
+# ---------------- 元素方位描述：边界场景 ----------------
+
+
+def test_element_position_label_handles_negative_origin_for_monitor_above():
+    """副屏在主屏上方（origin_y 为负）时，方位仍相对本帧画面判断。
+
+    负原点是虚拟桌面的常见形态：坐标先减原点再按比例缩放，减法天然完成平移，
+    不需要为负原点单开分支。若漏减原点（或错把 bounds 当 x/y/w/h），副屏元素的
+    中心会整体偏出画面，退化成空串。
+    """
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _element_lines
+
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="click",
+        width=960,             # 副屏 1920x1080 缩半后的模型图
+        height=540,
+        original_width=1920,
+        original_height=1080,
+        origin_x=0,
+        origin_y=-1080,        # 副屏位于主屏正上方 → 虚拟桌面原点 y 为负
+        elements=(
+            {"ref": "el-1", "kind": "ButtonControl", "name": "",
+             "bounds": (1600, -1080, 1920, -720), "enabled": True},
+            {"ref": "el-2", "kind": "ButtonControl", "name": "",
+             "bounds": (0, -1080, 320, -720), "enabled": True},
+        ),
+    )
+    lines = _element_lines(observation)
+    # 物理中心 (1760,-900) → 模型 (880,90)：右上角
+    assert "位置=画面右上角" in lines[0]
+    # 物理中心 (160,-900) → 模型 (80,90)：左上角
+    assert "位置=画面左上角" in lines[1]
+
+
+def test_element_position_label_returns_empty_when_bounds_outside_frame():
+    """中心落在画面外（跨屏元素、截图只含本屏）时返回空串，不加位置后缀。"""
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import (
+        _element_lines,
+        _element_position_label,
+    )
+
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="click",
+        width=960,
+        height=540,
+        original_width=1920,
+        original_height=1080,
+    )
+    # 画面右侧之外（中心 x=2050 → 模型 1025 > 960）
+    right_out = {"ref": "el-1", "kind": "ButtonControl", "name": "越界右",
+                 "bounds": (2000, 100, 2100, 200), "enabled": True}
+    # 画面左侧之外（中心 x=-150 → 模型 -75 < 0）
+    left_out = {"ref": "el-2", "kind": "ButtonControl", "name": "越界左",
+                "bounds": (-200, 100, -100, 200), "enabled": True}
+    assert _element_position_label(right_out, observation) == ""
+    assert _element_position_label(left_out, observation) == ""
+    # 渲染层同样不加后缀：越界元素仍保留 ref/name，只是没有方位
+    lines = _element_lines(
+        ComputerObservation(
+            run_id="run-1",
+            target="desktop",
+            action="click",
+            width=960,
+            height=540,
+            original_width=1920,
+            original_height=1080,
+            elements=(right_out,),
+        )
+    )
+    assert "el-1" in lines[0]
+    assert "位置=" not in lines[0]
+
+
+def test_element_position_label_zero_size_bounds_is_safe():
+    """退化矩形（宽或高为 0）不抛错：中心即角点，按该点判方位。"""
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _element_position_label
+
+    square = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="click",
+        width=1000,
+        height=1000,
+        original_width=1000,
+        original_height=1000,
+    )
+    # 四角退化：right==left、bottom==top
+    for bounds, expected in (
+        ((0, 0, 0, 0), "画面左上角"),
+        ((1000, 1000, 1000, 1000), "画面右下角"),
+        ((500, 500, 500, 500), "画面中央"),
+    ):
+        element = {"ref": "el-1", "kind": "ButtonControl", "name": "",
+                   "bounds": bounds, "enabled": True}
+        assert _element_position_label(element, square) == expected
+
+    # 观察尺寸缺失（宽高为 0）时同样不抛错，只返回空串
+    bare = ComputerObservation(run_id="run-1", target="desktop", action="click")
+    assert _element_position_label(
+        {"ref": "el-1", "kind": "ButtonControl", "name": "",
+         "bounds": (10, 10, 20, 20), "enabled": True}, bare
+    ) == ""
+

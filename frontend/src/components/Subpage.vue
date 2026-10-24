@@ -289,10 +289,10 @@ const emit = defineEmits(['close']);
 const store = useAppStore();
 
 const title = computed(() => {
-  if (props.subType === 'skills') return '技能 Skills';
-  if (props.subType === 'mcp') return 'MCP 服务';
-  if (props.subType === 'plugins') return '插件 Plugins';
-  if (props.subType === 'automations') return '星轨自动化任务';
+  if (props.subType === 'skills') return '星盘';
+  if (props.subType === 'mcp') return '星桥';
+  if (props.subType === 'plugins') return '星匣';
+  if (props.subType === 'automations') return '星轨';
   return '模型管理';
 });
 const desc = computed(() => {

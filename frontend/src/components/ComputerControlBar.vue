@@ -12,6 +12,7 @@
     <span class="ccb-status" data-test="computer-status-text">{{ statusText }}</span>
     <span class="ccb-target" data-test="computer-target">{{ targetLabel }}</span>
     <span class="ccb-meta ccb-secondary" data-test="computer-action-count">{{ store.computerRun.action_count }} 个动作</span>
+    <span v-if="currentActionLabel" class="ccb-meta ccb-secondary" data-test="computer-current-action">{{ currentActionLabel }}</span>
     <span
       v-if="store.computerRun.current_surface"
       class="ccb-meta ccb-surface ccb-secondary"
@@ -68,6 +69,38 @@ const STATUS_TEXTS: Record<string, string> = {
 };
 
 const statusText = computed(() => STATUS_TEXTS[store.computerRun.status] || '电脑操控');
+
+// 当前动作：把后端 kind 翻成中文动词，让状态条能回答"它现在在干什么"，
+// 而不是只显示"已执行 N 个动作"这种事后统计。未知 kind 不渲染。
+const ACTION_VERBS: Record<string, string> = {
+  observe: '观察',
+  click: '点击',
+  double_click: '双击',
+  move: '移动',
+  drag: '拖拽',
+  scroll: '滚动',
+  type_text: '输入',
+  keypress: '按键',
+  wait: '等待',
+  navigate: '打开网址',
+  back: '后退',
+  forward: '前进',
+  reload: '刷新',
+  request_user_takeover: '请求接管',
+  list_surfaces: '列出窗口',
+  activate_surface: '切换窗口',
+  invoke_surface: '唤醒窗口',
+  observe_region: '局部观察',
+  sequence: '连续操作',
+  list_elements: '列出控件',
+  click_element: '点击控件',
+  set_value_element: '填写控件',
+};
+const currentActionLabel = computed(() => {
+  if (store.computerRun.status !== 'running') return '';
+  const verb = ACTION_VERBS[String(store.computerRun.current_action || '')];
+  return verb ? `正在${verb}` : '';
+});
 
 // 操控目标标识：Edge / Chrome / 桌面（设计 16.1）
 const targetLabel = computed(() => {

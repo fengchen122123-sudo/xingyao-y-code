@@ -603,6 +603,19 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
     _tool_cache.read_file_put(cache_key, final)
     if session_id:
         _tool_cache.shared_put(session_id, ("read_file", cache_key), final)
+
+    # 登记本次读取指纹，供写前新鲜度守卫校验。
+    # 只有「一个字节都没截断」（start == 0 且 end >= total）才算完整读取；
+    # 登记失败绝不影响 read_file 正常返回，因此异常全部吞掉。
+    try:
+        from core.fresh_read_guard import record_read
+        record_read(
+            session_id or "",
+            str(resolved),
+            full_read=(start == 0 and end >= total),
+        )
+    except Exception:
+        pass
     return final
 
 def write_file(file_path, content):
@@ -613,6 +626,22 @@ def write_file(file_path, content):
     导致 diff 全红、Token 浪费以及误删未改动的代码。
     """
     resolved = _resolve_workspace_path(file_path)
+
+    # 写前新鲜度守卫：覆盖已有文件前必须本会话完整读过，且内容未变
+    from core.fresh_read_guard import (
+        StaleReadError,
+        is_guard_enabled,
+        require_fresh_read,
+    )
+    try:
+        require_fresh_read(
+            _tool_cache.get_current_session() or "",
+            str(resolved),
+            tool_name="write_file",
+            skip=not is_guard_enabled(),
+        )
+    except StaleReadError as e:
+        return f"🚨 {e}"
 
     from core.turn_undo import coordinator as _tu_coordinator
     from core.turn_undo import recorder as _tu_recorder
@@ -1074,6 +1103,59 @@ def execute_command(
 
 # --- 星瑶的新神装：新闻搜索 ---
 
+# search 场景的决策题：让 JEV 按检索词判断本次需要几条结果。
+# 3 = 单一事实即可，5 = 常规，8 = 需要多来源交叉核对。
+_SEARCH_NUM_RESULTS_QUESTION = {
+    "type": "choice",
+    "instructions": "判断这次联网检索的信息量需求：3=单一事实即可，5=常规，8=需要多来源交叉核对。只依据查询词本身判断。",
+    # 上游 choice 题的 criteria 是「选项名 → 描述」的对象，不可省略
+    "criteria": {
+        3: "单一事实即可（如某个具体数字、日期、定义）",
+        5: "常规信息量（一般性的资讯或说明）",
+        8: "需要多来源交叉核对（争议话题、对比评估、时效性强的动态）",
+    },
+}
+_SEARCH_NUM_RESULTS_OPTIONS = (3, 5, 8)
+# search 场景单次决策超时（与 decision_service.DEFAULT_CONFIG["scenes"]["search"] 对齐）
+_SEARCH_DECISION_TIMEOUT_MS = 250
+
+
+def _decide_search_num_results(query):
+    """search 场景接入：让 JEV 按查询词决定本次 news 请求的结果条数。
+
+    返回采纳的条数（int）；未启用 / 影子 / 上游失败 / 答案非法 / 任何异常一律
+    返回 ``None``，调用方据此沿用原有的 num_results——**JEV 全关时本函数恒为
+    None，零网络请求、零审计副作用**，因此 search_news 的行为与接入前完全一致。
+
+    隐私约束：``state`` 只放查询词本身。这段文本会真实发送给决策模型，
+    绝不拼接会话历史、文件内容或任何用户隐私文本。
+    """
+    try:
+        # 惰性导入：避免 core.tools 与 core.decision_gateway 之间的循环依赖，
+        # 也避免模块导入期就拉起决策链路的副作用（tools 被大量模块早期引用）。
+        from core.decision_gateway import decide
+
+        state = f"用户检索词：{query}"
+        question = dict(_SEARCH_NUM_RESULTS_QUESTION)
+        picked = decide(
+            "search",
+            state,
+            question,
+            options=_SEARCH_NUM_RESULTS_OPTIONS,
+            timeout_ms=_SEARCH_DECISION_TIMEOUT_MS,
+        )
+    except Exception as error:
+        # 网关本身已兜底；这里再加一层，确保决策永远不成为检索的故障点
+        _logger.debug("search 场景决策失败，沿用原 num_results: %s", error)
+        return None
+    # 只接受 int 档位并做范围保护：越界值一律丢弃（布尔是 int 子类，需排除）
+    if isinstance(picked, bool) or not isinstance(picked, int):
+        return None
+    if not 1 < picked < 50:
+        return None
+    return picked
+
+
 def search_news(query, num_results=5, cancel_event=None):
     """🌐 现代化新闻搜索工具：稳定可靠的联网引擎"""
     try:
@@ -1084,6 +1166,13 @@ def search_news(query, num_results=5, cancel_event=None):
             num_results = 5
         num_results = max(1, min(num_results, 20))
         _raise_if_cancelled(cancel_event)
+        # JEV 决策接入点：真正发请求前问一次「这次需要几条结果」。
+        # 拿到合法档位就用它；None 表示未启用/影子/失败/低置信，此时保持上面
+        # 算好的 num_results 不变（尊重调用方传值，而非回落到硬编码 5）。
+        decided_num_results = _decide_search_num_results(query)
+        if decided_num_results is not None:
+            # 仍走同一套钳制，保证 ddgs 的限流保护不被决策链路绕过
+            num_results = max(1, min(decided_num_results, 20))
         with DDGS() as ddgs:
             results = list(ddgs.news(query, max_results=num_results))
             _raise_if_cancelled(cancel_event)
@@ -2608,6 +2697,22 @@ def edit_file(
     # 并发防护：同一文件的 读→改→写 全过程按路径串行化（多子代理并发编辑同一
     # 文件时后写者不再静默覆盖），写前另有 mtime 乐观校验检测外部修改
     with _edit_file_lock(resolved):
+        # 写前新鲜度守卫：未完整读过或读后文件被外部改过时拒绝修改
+        from core.fresh_read_guard import (
+            StaleReadError,
+            is_guard_enabled,
+            require_fresh_read,
+        )
+        try:
+            require_fresh_read(
+                _tool_cache.get_current_session() or "",
+                str(resolved),
+                tool_name="edit_file",
+                skip=not is_guard_enabled(),
+            )
+        except StaleReadError as e:
+            return f"🚨 {e}"
+
         # 先记录 mtime 再读取：写入前若 mtime 变化即拒绝覆盖。
         # 宁可误报冲突（让调用方重读），也不放过读后写前的外部修改窗口。
         expected_mtime_ns = _stat_mtime_ns(resolved)
@@ -4752,6 +4857,150 @@ def recall_history(before_msg_id, limit=16, cancel_event=None):
     )
     return header + "\n\n" + "\n\n".join(lines)
 
+def search_sessions(query, limit=10, session=None, cancel_event=None):
+    """跨会话全文检索历史消息（search_sessions 工具执行体）。
+
+    检索覆盖当前数据库内 messages 表已写入的全部消息（含已被压缩归档、
+    不再出现在活跃上下文里的早期消息）。索引在每次检索前增量补齐，因此
+    刚写入的消息也能立刻搜到。纯只读，不改任何状态。
+    """
+    keyword = str(query or "").strip()
+    if not keyword:
+        return "🚨 请提供要检索的关键词（query 不能为空）。"
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+    try:
+        import core.app_context as _app_context
+        manager = _app_context.get_manager()
+    except Exception:
+        manager = None
+    if manager is None:
+        return "会话存储未就绪，无法全文检索历史消息。"
+    try:
+        limit_n = int(limit)
+    except (TypeError, ValueError):
+        limit_n = 10
+    limit_n = max(1, min(50, limit_n))
+    session_name = str(session or "").strip() or None
+    try:
+        rows = manager.search_messages(
+            keyword, limit=limit_n, session_name=session_name
+        )
+    except Exception as exc:
+        return f"全文检索失败：{exc}"
+    if rows is None:
+        return "当前 SQLite 未启用 FTS5，全文检索不可用（不影响其它功能）。"
+    if not rows:
+        return (
+            "未找到匹配消息；检索覆盖当前数据库内已写入的消息，"
+            "索引会在每次检索前增量补齐。"
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+
+    lines = []
+    for row in rows:
+        if cancel_event is not None and cancel_event.is_set():
+            return "🛑 操作已被用户取消。"
+        snippet = str(row.get("snippet") or "").replace("\n", " ").strip()
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "…"
+        if not snippet:
+            snippet = "(该条无可见片段)"
+        display = row.get("display_name") or row.get("session_name") or "(未知)"
+        lines.append(
+            f"#msg_id={row.get('id')} [{row.get('role')}] 会话: {display}\n{snippet}"
+        )
+    scope = f"（限定会话: {session_name}）" if session_name else "（跨全部会话）"
+    header = (
+        f"命中 {len(rows)} 条消息{scope}，按相关度排序，最多返回 {limit_n} 条；"
+        "片段中的 《》 标记匹配到的关键词。"
+    )
+    return header + "\n\n" + "\n\n".join(lines)
+
+def tool_result_read(handle, mode="head", lines=80, grep=None, cancel_event=None):
+    """取回被 snip/elide 折叠的工具结果原文（tool_result_read 工具执行体）。
+
+    句柄取自 marker 里的 `#xxxxxxxx`，如
+    `[snipped tool result #ab12cd34 — read_file, ...]`。纯只读，不改任何状态。
+    """
+    from core.tool_result_maintenance import is_valid_handle
+
+    if not is_valid_handle(handle):
+        return (
+            "🚨 无效的句柄。句柄是 marker 里 `#` 后的 8 位小写十六进制"
+            "（形如 [snipped tool result #ab12cd34 — read_file, ...]）。"
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+    try:
+        import core.app_context as _app_context
+        manager = _app_context.get_manager()
+    except Exception:
+        manager = None
+    if manager is None:
+        return "会话存储未就绪，无法取回工具结果。"
+    try:
+        row = manager.get_tool_result_archive(handle)
+    except Exception as exc:
+        return f"取回工具结果失败：{exc}"
+    if not row:
+        return (
+            f"归档中没有句柄 #{handle} 的记录。归档仅覆盖被 snip/elide 折叠过的"
+            "工具结果（未折叠的结果仍在上下文里，无需取回）。"
+        )
+    content = str(row.get("content") or "")
+    body_lines = content.split("\n")
+    total_lines = len(body_lines)
+    header = (
+        f"归档工具结果 #{row.get('handle')}｜来源工具: {row.get('tool_name') or '(未知)'}"
+        f"｜原始 {row.get('bytes')} 字节 / {total_lines} 行"
+        f"｜改写前保存于 {row.get('created_at') or '(未知)'}"
+    )
+    mode = str(mode or "head").strip().lower()
+    if mode not in ("head", "tail", "grep", "full"):
+        mode = "head"
+    try:
+        line_limit = int(lines)
+    except (TypeError, ValueError):
+        line_limit = 80
+    line_limit = max(1, min(2000, line_limit))
+    if mode == "grep":
+        pattern = str(grep or "").strip()
+        if not pattern:
+            return header + "\n\n🚨 mode=grep 需要同时提供 grep 参数（要搜索的文本）。"
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            regex = None
+        hits = []
+        for idx, line in enumerate(body_lines, 1):
+            if cancel_event is not None and idx % 200 == 0 and cancel_event.is_set():
+                return "🛑 操作已被用户取消。"
+            if (regex.search(line) if regex else pattern.lower() in line.lower()):
+                hits.append(f"{idx}:{line[:500]}")
+                if len(hits) >= 100:
+                    break
+        if not hits:
+            return header + f"\n\n命中 0 行（grep={pattern!r}）。"
+        return header + f"\n\n命中 {len(hits)} 行（最多 100 行，格式 行号:内容）:\n" + "\n".join(hits)
+    if mode == "full":
+        # 全文保护上限：超过 200000 字符时截断，避免把一次折叠省下的字节又灌回上下文
+        full_text = content
+        note = ""
+        if len(full_text) > 200000:
+            full_text = full_text[:200000]
+            note = "\n\n[... 全文超过 200000 字符，已截断；建议改用 mode=grep 精确检索]"
+        return header + f"\n\n全文（{len(content)} 字符）:\n" + full_text + note
+    if mode == "tail":
+        selected = body_lines[-line_limit:]
+        start = total_lines - len(selected) + 1
+        label = f"末尾 {len(selected)} 行（从第 {start} 行开始）"
+    else:
+        selected = body_lines[:line_limit]
+        label = f"开头 {len(selected)} 行"
+    return header + f"\n\n{label}（全文共 {total_lines} 行）:\n" + "\n".join(selected)
+
 def glob_files(pattern, dir_path=".", cancel_event=None):
     """快速文件模式匹配：使用 glob 表达式在项目目录中搜索匹配的文件路径列表。优先尝试 ripgrep。"""
     import glob
@@ -5004,6 +5253,167 @@ def search_conversations(
     return _secretary_json(payload)
 
 
+# ---------------------------------------------------------------------------
+# secretary 场景的 JEV 决策接线（设计文档 2026-10-18 第 3 节）
+# 只在「调用方没有显式指定 target」时介入：让决策模型在「已有的最近若干会话」
+# 与「新建会话」之间挑一个。任何异常 / 无候选 / 答案不合法都回落原逻辑。
+# ---------------------------------------------------------------------------
+
+# 选择项里的「新建会话」标记（与调度服务的 new 语义标记无关，仅本题内部使用）
+_SECRETARY_NEW_OPTION = "new"
+_SECRETARY_TARGET_INSTRUCTIONS = (
+    "判断这条任务应该派发到哪个已有会话执行；如果没有明显相关的会话，"
+    "选 new 表示新建会话。只依据任务描述与会话名判断。"
+)
+# 与 decision_service.DEFAULT_CONFIG["scenes"]["secretary"]["timeout_ms"] 对齐
+_SECRETARY_DECISION_TIMEOUT_MS = 250
+# 候选上限：只把最近的 10 个会话交给模型，避免题目与上下文膨胀
+_SECRETARY_CANDIDATE_LIMIT = 10
+# state 里任务描述的截断长度（这段文本会真实发送给决策模型）
+_SECRETARY_STATE_PROMPT_CHARS = 300
+# 秘书检索协议要求「关键词或日期至少给一个」（否则会抛错拒绝全表倾倒）。这里给
+# 一个早于任何数据的日期下界，语义等价于「按最近更新时间取候选会话」；刻意不拿
+# 任务正文当 LIKE 关键词——任务正文通常是整句，几乎必然零命中，决策永远发不出去。
+_SECRETARY_CANDIDATE_DATE_FLOOR = "1970-01-01"
+
+
+def _secretary_decision_armed():
+    """secretary 场景当前是否需要发起决策（关 / 未启用 → False）。
+
+    这条前置判断的意义：JEV 全关时必须在**调用调度服务之前**就退出，保证
+    ``dispatch_task`` 对调度服务的调用次数与接入前完全一致（不白跑一次会话检索）。
+    读取配置失败一律视为未启用。
+    """
+    try:
+        from core import decision_service as _decision
+
+        config = _decision.load_decision_config()
+    except Exception as error:
+        _logger.debug("secretary 场景读取决策配置失败，按未启用处理: %s", error)
+        return False
+    if not isinstance(config, dict) or not bool(config.get("enabled")):
+        return False
+    scenes = config.get("scenes")
+    if not isinstance(scenes, dict):
+        return False
+    scene_config = scenes.get("secretary")
+    if not isinstance(scene_config, dict):
+        return False
+    return bool(scene_config.get("enabled"))
+
+
+def _secretary_candidate_rows(service, workdir):
+    """取候选会话：最近的 ``_SECRETARY_CANDIDATE_LIMIT`` 个，按 updated_at 倒序。
+
+    走调度服务既有的 ``search_conversations``（协议见 core/secretary_dispatch.py），
+    不复用任何私有实现。取不到（抛错 / 结构异常 / 全无 session_name）一律返回
+    空列表，调用方据此完全不发决策。
+    """
+    try:
+        rows = service.search_conversations(
+            keyword="",
+            date_from=_SECRETARY_CANDIDATE_DATE_FLOOR,
+            date_to="",
+            workdir=str(workdir or ""),
+            limit=_SECRETARY_CANDIDATE_LIMIT,
+        )
+    except Exception as error:
+        # 检索失败（未实现 / 参数被拒 / 底层异常）不是派活失败：只是不发决策
+        _logger.debug("secretary 场景取候选会话失败，跳过决策: %s", error)
+        return []
+    if not isinstance(rows, (list, tuple)):
+        return []
+    candidates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("session_name") or "").strip()
+        if not name:
+            continue
+        candidates.append(
+            {
+                "session_name": name,
+                "display_name": str(row.get("display_name") or "").strip() or name,
+                "updated_at": str(row.get("updated_at") or ""),
+            }
+        )
+    # 服务端已按 updated_at 倒序，这里再兜一次（协议未强制顺序）
+    candidates.sort(key=lambda item: item["updated_at"], reverse=True)
+    return candidates[:_SECRETARY_CANDIDATE_LIMIT]
+
+
+def _secretary_decision_state(prompt, workdir, candidates):
+    """构造决策 state：任务描述前 300 字符 + 候选会话名 + 工作目录。
+
+    隐私约束：这段文本会真实发送给决策模型，只允许出现任务描述截断、会话名
+    （session_name / display_name）与 workdir；**绝不拼接会话历史、检索片段、
+    文件内容或任何密钥**。
+    """
+    head = str(prompt or "").strip()[:_SECRETARY_STATE_PROMPT_CHARS]
+    lines = [f"任务描述：{head}", "候选会话："]
+    for candidate in candidates:
+        name = candidate["session_name"]
+        display = candidate["display_name"]
+        if display and display != name:
+            lines.append(f"- {name}（{display}）")
+        else:
+            lines.append(f"- {name}")
+    lines.append(f"工作目录：{str(workdir or '').strip() or 'GLOBAL'}")
+    return "\n".join(lines)
+
+
+def _decide_secretary_target(service, prompt, workdir):
+    """secretary 场景接入：未指定目标时让 JEV 挑一个已有会话作为派发目标。
+
+    返回采纳的 ``session_name``；``None`` 表示未启用 / 影子 / 无候选 / 上游失败 /
+    选了「新建会话」/ 答案不在候选内 / 任何异常——调用方此时保持 ``target=""``，
+    走原有「按 workdir 懒建新会话」的路径。因此 JEV 全关时本函数恒为 None，
+    派发目标、调用次数、返回文本与接入前完全一致。
+    """
+    try:
+        if not _secretary_decision_armed():
+            return None
+        candidates = _secretary_candidate_rows(service, workdir)
+        if not candidates:
+            # 没有候选就没有选择余地：不打扰决策模型，等价于新建会话
+            return None
+        # 惰性导入：避免 core.tools 与 core.decision_gateway 循环依赖
+        from core.decision_gateway import decide
+
+        names = [candidate["session_name"] for candidate in candidates]
+        options = [_SECRETARY_NEW_OPTION] + names
+        # 上游 choice 题的 criteria 是「选项名 → 描述」的对象（传数组会 422）
+        criteria = {_SECRETARY_NEW_OPTION: "新建一个会话来处理这条任务"}
+        for candidate in candidates:
+            session_name = candidate["session_name"]
+            display = str(candidate.get("display_name") or "").strip()
+            criteria[session_name] = f"派给已有会话：{display or session_name}"
+        question = {
+            "type": "choice",
+            "instructions": _SECRETARY_TARGET_INSTRUCTIONS,
+            "criteria": criteria,
+        }
+        state = _secretary_decision_state(prompt, workdir, candidates)
+        picked = decide(
+            "secretary",
+            state,
+            question,
+            options=options,
+            timeout_ms=_SECRETARY_DECISION_TIMEOUT_MS,
+        )
+    except Exception as error:
+        # gateway 已兜底；这里再兜一层，决策永远不能成为派活的故障点
+        _logger.debug("secretary 场景决策失败，沿用原派发规则: %s", error)
+        return None
+    if not isinstance(picked, str):
+        return None
+    picked = picked.strip()
+    # "new"（新建会话）、空串、候选之外的名字（脏数据）统统视为「不改变目标」
+    if picked not in names:
+        return None
+    return picked
+
+
 def dispatch_task(
     target="", prompt="", workdir="", model_id="", permission_mode="", cancel_event=None
 ):
@@ -5014,6 +5424,10 @@ def dispatch_task(
     「新会话」时按 ``workdir`` 懒创建新会话。返回 JSON 字符串：
     ``{ok, target_session, display_name, workdir, state}``；目标不唯一时返回
     ``{ok: false, candidates: [...]}``，由调用方向用户确认。
+
+    JEV 决策（secretary 场景）：**只有调用方没指定 target 时**才问一次决策模型
+    「这条任务该派给哪个已有会话」，采纳时把 target 换成该会话并在返回里带上
+    ``decision_note``；选「new」/ 无候选 / 未启用 / 影子 / 失败一律沿用原逻辑。
     """
     service, error = _secretary_dispatch_service()
     if service is None:
@@ -5022,9 +5436,19 @@ def dispatch_task(
     if not text:
         return "🚨 派活失败：prompt（任务正文）不能为空。"
     _raise_if_cancelled(cancel_event)
+    # JEV 决策接入点：仅在 target 为空（真有选择余地）时介入。
+    # None = 未启用/影子/无候选/失败/选了新建会话 → 保持 target 原样。
+    target_value = str(target or "")
+    decision_note = ""
+    if not target_value.strip():
+        decided_target = _decide_secretary_target(service, text, workdir)
+        if decided_target:
+            target_value = decided_target
+            decision_note = f"已按决策模型建议派发到 {decided_target}"
+            _logger.info("secretary 派活采纳决策建议: %s", decided_target)
     try:
         result = service.dispatch_task(
-            target=str(target or ""),
+            target=target_value,
             prompt=text,
             workdir=str(workdir or ""),
             model_id=str(model_id or ""),
@@ -5039,6 +5463,9 @@ def dispatch_task(
         return f"🚨 派活失败：调度服务返回了无法识别的结果：{result!r}"
     payload = dict(result)
     payload.setdefault("ok", True)
+    # 只在决策真正被采纳时加说明，保证 JEV 全关时返回文本逐字节不变
+    if decision_note:
+        payload["decision_note"] = decision_note
     if payload.get("ok") is False and payload.get("candidates"):
         payload["hint"] = (
             "目标不唯一：请把候选里的 session_name 交给用户确认后，用确定的"

@@ -5,18 +5,33 @@
 
   <!-- 回合运行中：保持现状，中间过程逐条实时显示，不折叠 -->
   <template v-if="group.running">
-    <MessageBubble v-for="m in group.middle" :key="msgKey(m)" :msg="m" />
+    <MessageBubble
+      v-for="m in group.middle"
+      :key="msgKey(m)"
+      :msg="m"
+      :show-name="msgKey(m) === nameOwnerKey"
+    />
   </template>
   <!-- 回合已结束：中间过程收成一块可展开的折叠区（FoldCard 统一折叠体系），
        突出最终总结 -->
   <div v-else-if="group.middle.length" class="turn-fold">
     <FoldCard v-model:open="expanded" :title="title">
-      <MessageBubble v-for="m in group.middle" :key="msgKey(m)" :msg="m" />
+      <MessageBubble
+        v-for="m in group.middle"
+        :key="msgKey(m)"
+        :msg="m"
+        :show-name="msgKey(m) === nameOwnerKey"
+      />
     </FoldCard>
   </div>
 
   <!-- 组尾：总结轮 assistant + 其后的 error 消息，始终可见 -->
-  <MessageBubble v-for="m in group.tail" :key="msgKey(m)" :msg="m" />
+  <MessageBubble
+    v-for="m in group.tail"
+    :key="msgKey(m)"
+    :msg="m"
+    :show-name="msgKey(m) === nameOwnerKey"
+  />
 
   <!-- 回合结束且有文件改动时：底部展示可折叠的"文件更改"面板
        （含按回合撤销按钮：按权威 turnId 绑定状态） -->
@@ -57,6 +72,17 @@ const STATE_LABELS: Record<TurnGroupInfo['state'], string> = {
 };
 
 const stats = computed(() => groupStats(props.group));
+
+// 一个回合只在最前面显示一次「星瑶 · 模型」名字行：
+// 运行中 / 折叠区展开时由中间过程第一条 assistant 承担；折叠收起（中间过程
+// 不可见）时改由组尾第一条承担，保证可见区域顶部始终有且只有一个名字行。
+const nameOwnerKey = computed<number | null>(() => {
+  const firstMiddle = props.group.middle.find((m) => m.role === 'assistant');
+  const firstTail = props.group.tail.find((m) => m.role === 'assistant');
+  const middleVisible = props.group.running || expanded.value;
+  const owner = (middleVisible ? firstMiddle : null) ?? firstTail ?? firstMiddle;
+  return owner ? msgKey(owner) : null;
+});
 
 // 回合文件更改摘要（无改动则空数组，面板不渲染）
 const fileChanges = computed(() => collectFileChanges(props.group));

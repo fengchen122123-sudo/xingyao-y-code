@@ -23,6 +23,8 @@ it('桌面端根元素内联宽度跟随 store.rightPanelWidth，折叠时负 ma
 
   const root = wrapper.find('#rightbar');
   expect(root.attributes('style')).toContain('width: 400px');
+  // 滑入/滑出动画的位移量由这个变量提供（Transition 的 enter-from 用 calc 取用）
+  expect(root.attributes('style')).toContain('--rp-width: 400px');
   expect(root.attributes('style')).not.toContain('margin-right');
 
   store.rightPanelCollapsed = true;
@@ -82,7 +84,7 @@ it('中性入口展开面板：无页签先显示选择页五卡，点卡片开�
   await nextTick();
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
   expect(wrapper.findAll('.tp-card').map(c => c.text().trim()))
-    .toEqual(['文件', 'Git', '浏览器', '后台任务', '子代理']);
+    .toEqual(['文件', 'Git', '星眼 · 浏览器', '星港 · 后台任务', '星舰 · 子代理']);
 
   await wrapper.find('[data-test="picker-card-files"]').trigger('click');
   await nextTick();
@@ -202,6 +204,32 @@ it('页签条 × 收起整个面板，再次中性展开回到激活页签', asy
   expect(store.rightPanelCollapsed).toBe(false);
   expect(store.rightPanelPicker).toBe(false);
   expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
+  wrapper.unmount();
+});
+
+it('收起时保留收起前的页签画面到滑出动画结束，避免空面板平移', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+  // jsdom 里脱离文档树的元素 getComputedStyle 拿不到 display，isVisible() 恒为 true，
+  // 所以这里直接看 v-show 写进 style 的 display
+  const paneStyle = () => wrapper.find('[data-test="git-pane"]').attributes('style') ?? '';
+
+  store.openRightPanelTab('git');
+  await nextTick();
+  expect(paneStyle()).not.toContain('display: none');
+
+  // 收起瞬间 activeTab 已转空（原生表面 hide、轮询停止都靠它），但渲染用的
+  // visualTab 还要留一个滑出时长，滑走的才是刚看到的那一屏
+  store.toggleRightPanel();
+  await nextTick();
+  expect(store.rightPanelCollapsed).toBe(true);
+  expect(paneStyle()).not.toContain('display: none');
+
+  // 滑出动画走完再清空
+  await new Promise(resolve => setTimeout(resolve, 300));
+  await nextTick();
+  expect(paneStyle()).toContain('display: none');
+
   wrapper.unmount();
 });
 

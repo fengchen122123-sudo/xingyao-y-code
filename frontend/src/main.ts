@@ -8,6 +8,7 @@ import App from './App.vue';
 import { applyBootTheme } from './themes/runtime';
 import { useAppStore } from './stores/appStore';
 import { registerFrontendUpdateHandlers } from './utils/frontendUpdate';
+import { loadAppGlass } from './composables/appGlass';
 
 // 启动画面在 get_initial_state 返回前就会渲染：先同步恢复主题，避免浅色主题
 // 用户看到黑色 splash（后端真值返回后会再校正一次）。
@@ -16,6 +17,10 @@ import { registerFrontendUpdateHandlers } from './utils/frontendUpdate';
 try {
   applyBootTheme(location.hash, document.body);
 } catch { /* 保持默认深色 */ }
+
+// 全屏玻璃层偏好（设置 → 外观与主题 → 玻璃效果）：启动即恢复，读不到就是默认关闭。
+// 必须在 mount 之前应用，否则启动首帧会先闪一下无玻璃的版本。
+loadAppGlass();
 
 const app = createApp(App);
 app.use(createPinia());

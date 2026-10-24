@@ -123,7 +123,88 @@ def filter_reserved_tool_schemas(schemas: Iterable[dict[str, Any]]) -> list[dict
     return allowed
 
 
-def build_default_registry() -> ToolRegistry:
+# ── 运行形态档位（CLI 轻量档）────────────────────────────────────────
+# CLI 的定位是"开发者终端里写代码"，不与 GUI 共享全部富交互面板能力。
+# 下列工具在 CLI 下要么必然不可用（内嵌浏览器面板、星轨自动化、选区截图），
+# 要么与写代码无关（皮肤/人设/飞书/局域网/决策面板/图片生成/更新向导），
+# 注册它们只会让每次请求都多背约 5.6k tokens 的工具定义，因此在 CLI 档位剔除。
+# 注意：这里只裁"对模型暴露的工具表"，对应的斜杠命令与业务能力不受影响。
+CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
+    # 外观与人设
+    "theme_manage",
+    "persona_manage",
+    # 星轨自动化（CLI/headless 下服务句柄未注册，调用必然失败）
+    "automation_list",
+    "automation_create",
+    "automation_update",
+    "automation_delete",
+    "automation_run_now",
+    # 外部集成与决策面板
+    "feishu_manage",
+    "lan_manage",
+    "decision_manage",
+    # 交互面板（GUI 专属 UI 能力）
+    "computer_control",
+    "pty_manage",
+    "browser_pane",
+    "screenshot_capture",
+    "browser_set_viewport",
+    "clipboard_image",
+    # 跨会话派发 / 秘书
+    "dispatch_task",
+    "open_session",
+    "secretary_probe",
+    # 运维与内容生成
+    "update_manage",
+    "diagram_manage",
+    # 只读查询类：斜杠命令（/usage /share /doctor）或已保留的同名工具
+    # （search_sessions）完全覆盖，不必再占一份 schema。
+    "usage_stats",
+    "session_export",
+    "doctor_run",
+    "search_conversations",
+    # 会话/模型配置：斜杠命令 /session、/models 覆盖；保留 skill_manage /
+    # plugin_manage / hook_manage / mcp_* / system_settings 的对话式配置能力。
+    "session_manage",
+    "model_manage",
+    # 与写代码无关（fetch_image 只在网页图文并茂展示时用，写代码不需要）
+    "get_weather",
+    "search_news",
+    "fetch_image",
+})
+
+VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli")
+
+
+def _resolve_tool_profile(profile: str | None = None) -> str:
+    """解析工具表档位：显式参数 > 环境变量 > app_context UI 形态 > full。
+
+    环境变量优先于 app_context，是因为 core.llm 在模块导入期就会构建工具表，
+    此时入口层往往还没来得及 set_ui_flavor；main.py 在 import core.llm 之前
+    用 YCODE_TOOL_PROFILE=cli 声明形态。
+    """
+    candidate = str(profile or "").strip().lower()
+    if candidate in VALID_TOOL_PROFILES:
+        return candidate
+    try:
+        import os
+
+        env_value = os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower()
+        if env_value in VALID_TOOL_PROFILES:
+            return env_value
+    except Exception:
+        pass
+    try:
+        from core.app_context import get_ui_flavor
+
+        if get_ui_flavor() == "cli":
+            return "cli"
+    except Exception:
+        pass
+    return "full"
+
+
+def build_default_registry(profile: str | None = None) -> ToolRegistry:
     from core import tools
     from core import lsp as _lsp
     from core.ask_user import ask_user
@@ -135,6 +216,17 @@ def build_default_registry() -> ToolRegistry:
         plan_update,
         plan_write,
     )
+
+    # 管理类工具（21 个）：各模块自带 build_specs() 提供 ToolSpec 契约，
+    # 注册表只做装配与分组，不在此重复定义任何工具或实现；模块内部执行逻辑
+    # 一律函数内惰性导入，注册阶段仅构造 ToolSpec 对象，不触发扫描/网络/写盘。
+    from core import tools_admin_integration
+    from core import tools_admin_interaction
+    from core import tools_admin_look
+    from core import tools_admin_model
+    from core import tools_admin_ops
+    from core import tools_admin_session
+    from core import tools_admin_skill
 
     # side_effect_scope 归类依据《03-工具调度拓扑化设计规格》3.2 取值表
     # （none / workspace / git / network / system）；表未覆盖的工具按语义归类，
@@ -226,6 +318,79 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="回溯已压缩的历史消息",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="search_sessions",
+            description=(
+                "跨会话按关键词全文检索历史消息（含已被压缩归档、不再出现在当前"
+                "上下文里的早期消息），用于找回早前讨论过的细节。"
+                "中文按两字 bigram 匹配（搜“缓存”可命中“缓存命中率”），英文/数字按整词"
+                "匹配；每次检索前会先把新消息增量补进索引。"
+                "这不是文件搜索：搜代码/文件请用 search_code 或 glob_files。"
+            ),
+            input_schema=_schema({
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词（中文两字词即可；英文/数字为整词匹配）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "最多返回的消息条数",
+                },
+                "session": {
+                    "type": "string",
+                    "description": "可选：限定只在某个会话（按会话名）内检索，不传则跨全部会话",
+                },
+            }, ["query"]),
+            execute=tools.search_sessions,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="全文检索历史消息",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="tool_result_read",
+            description=(
+                "按句柄取回被折叠（snip/elide）的工具结果原始内容。"
+                "句柄来自工具结果 marker 里的 #xxxxxxxx（形如"
+                "[snipped tool result #ab12cd34 — read_file, ...] 或 "
+                "[elided tool result #ab12cd34 — ...]）。"
+                "仅在折叠后确实需要原始细节时使用；未折叠的结果仍在上下文里，无需取回。"
+                "mode=head/tail 按行读取，grep 按关键字检索带行号命中行，full 取全文。"
+            ),
+            input_schema=_schema({
+                "handle": {
+                    "type": "string",
+                    "description": "归档句柄：marker 里 # 后的 8 位小写十六进制（如 ab12cd34）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["head", "tail", "grep", "full"],
+                    "default": "head",
+                    "description": "head 前 N 行 / tail 后 N 行 / grep 关键字命中行 / full 全文",
+                },
+                "lines": {
+                    "type": "integer",
+                    "default": 80,
+                    "minimum": 1,
+                    "maximum": 2000,
+                    "description": "head/tail 读取的行数",
+                },
+                "grep": {
+                    "type": "string",
+                    "description": "mode=grep 时必填：要搜索的文本（不区分大小写的正则）",
+                },
+            }, ["handle"]),
+            execute=tools.tool_result_read,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="取回完整工具结果",
             side_effect_scope="none",
         ),
         ToolSpec(
@@ -953,7 +1118,29 @@ def build_default_registry() -> ToolRegistry:
             side_effect_scope="system",  # 表未覆盖：切换当前会话与界面视图
         ),
     ]
-    registry = ToolRegistry([*read_specs, *mutating_specs])
+
+    # ── 管理类工具（21 个）─────────────────────────────────────────────
+    # 会话 / 模型 / 技能插件 hook / 运维系统设置 / 外观人设 / 集成 / 交互面板。
+    # 各模块 build_specs() 返回的就是可直接注册的 ToolSpec（含 execute 可调用
+    # 对象与 side_effect_scope 元数据），此处仅按来源分组拼接。
+    admin_specs = [
+        # 会话与上下文管理（1）
+        *tools_admin_session.build_specs(),
+        # 模型与供应商管理（1）
+        *tools_admin_model.build_specs(),
+        # 技能 / 插件 / hook 管理（3）
+        *tools_admin_skill.build_specs(),
+        # 运维与诊断：用量、导出、更新、系统设置、架构图、体检（6）
+        *tools_admin_ops.build_specs(),
+        # 外观与人设：主题、人格设定（2）
+        *tools_admin_look.build_specs(),
+        # 集成与协作：飞书、局域网、决策记录（3）
+        *tools_admin_integration.build_specs(),
+        # 交互面板：pty、浏览器面板、截图、剪贴板、电脑操控（5）
+        *tools_admin_interaction.build_specs(),
+    ]
+
+    registry = ToolRegistry([*read_specs, *mutating_specs, *admin_specs])
     # 加载进程内插件（plugins/ 与 ~/.ycode/plugins/）。插件加载全程隔离，
     # 任何失败只记录日志，绝不影响内置工具的可用性。
     try:
@@ -961,6 +1148,18 @@ def build_default_registry() -> ToolRegistry:
         plugin_loader.load_and_register(registry)
     except Exception:
         pass
+    # CLI 轻量档位：剔除 GUI 专属工具（见 CLI_EXCLUDED_TOOLS 说明）。
+    # 放在插件加载之后，避免插件重新注册同名工具又把它们带回来。
+    if _resolve_tool_profile(profile) == "cli":
+        removed = 0
+        for _name in sorted(CLI_EXCLUDED_TOOLS):
+            try:
+                registry.unregister(_name)
+            except KeyError:
+                continue
+            removed += 1
+        if removed:
+            _LOGGER.debug("CLI 轻量档位已剔除 %d 个 GUI 专属工具", removed)
     _apply_managed_tool_filter(registry)
     return registry
 

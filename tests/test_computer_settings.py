@@ -279,17 +279,14 @@ def test_embedded_browser_option_detected_without_executable(tmp_path, monkeypat
     assert options["embedded"].available is (sys.platform == "win32")
 
 
-def test_get_browser_profile_dir_embedded_matches_automation_user_data(tmp_path, monkeypatch):
-    """embedded 的 profile 目录 = 自动化控件实际使用的 UserDataFolder。
-
-    与面板浏览目录（profile_dir）刻意分离：同一目录上再建带 CDP 参数的
-    WebView2 环境会失败（0x8007139F），identity 必须冻结自动化真正用的目录。
-    """
+def test_get_browser_profile_dir_embedded_matches_panel_profile(tmp_path, monkeypatch):
+    """embedded 的 profile 目录 = 面板 WebView2 控件（自动化也接管它）的
+    UserDataFolder：面板控件从创建起就带 CDP 端口，两套共用一个 profile，
+    不再有 0x8007139F 所迫的分离。"""
     use_temp_config(tmp_path, monkeypatch, {})
-    from core.embedded_browser import automation_profile_dir, profile_dir
+    from core.embedded_browser import profile_dir
 
-    assert get_browser_profile_dir("embedded") == automation_profile_dir().resolve()
-    assert get_browser_profile_dir("embedded") != profile_dir().resolve()
+    assert get_browser_profile_dir("embedded") == profile_dir().resolve()
 
 
 def test_process_default_browser_only_affects_missing_key(tmp_path, monkeypatch):

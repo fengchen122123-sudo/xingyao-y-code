@@ -53,10 +53,15 @@ _ACTIVATION_SETTLE_S = 0.15
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
 # 阶段二（2026-09-06）：UIA 元素观察与元素引用动作（desktop only）。
 _ELEMENT_KINDS = frozenset({"list_elements", "click_element", "set_value_element"})
+# 自动补表的元素上限（与 WindowsElementLocator.MAX_ELEMENTS 对齐）：超大树
+# 只截前 N 个，避免把一次观察拖成整树遍历后的超长上下文。
+_MAX_OBSERVE_ELEMENTS = 200
 # R10：语义定位与局部观察动作（不做 surface 输入复核——它们自带 ref+代数校验）。
 _SEMANTIC_DESKTOP_KINDS = frozenset(
     {"list_surfaces", "activate_surface", "invoke_surface", "observe_region"}
 )
+# 键盘类动作：没有目标点，发送前必须复核前台窗口仍是最近一次点击的目标窗口。
+_KEYBOARD_KINDS = frozenset({"type_text", "keypress"})
 
 
 def default_image_grab():
@@ -178,6 +183,10 @@ class WindowsComputerBackend:
         # Task C（P3）：本动作是否发生了前台切换；observe 构造观察时消费
         # （写入 input_activated 并清零），输入动作分发前重置。
         self._last_activation_changed = False
+        # 键盘焦点护栏：最近一次 pointer 动作（click/double_click/drag）的目标
+        # 窗口身份；键盘动作发送前比对当前前台，不一致即 computer_foreground_lost。
+        # 新观察会重建焦点基线（清空该参照），届时回落到观察记录的前台窗口。
+        self._last_pointer_target_hwnd: int | None = None
 
     @classmethod
     def create_default(cls) -> "WindowsComputerBackend":
@@ -222,6 +231,9 @@ class WindowsComputerBackend:
             if signature != self._surface_signature:
                 self._surface_generation += 1
                 self._surface_signature = signature
+            # 观察重建焦点基线：清空 pointer 目标参照，键盘护栏回落到本次前台，
+            # 避免「先点 B、再观察 C」时拿旧点击目标误判焦点丢失。
+            self._last_pointer_target_hwnd = None
             if pending_region is not None:
                 # R10 局部观察：从原始分辨率整屏裁剪候选区域，区域原点/尺寸
                 # 进入观察的 origin/original_*，坐标反算沿用既有公式结构。
@@ -259,6 +271,14 @@ class WindowsComputerBackend:
                                 self._element_locator.invalidate()
                             except Exception:
                                 _LOGGER.exception("失效旧元素引用失败")
+                    # 自动补表：没有新 list_elements 时直接抓一次前台窗口元素，
+                    # 模型第一次 observe 就能拿到 ref 用 click_element 精确点击
+                    # （32×33 像素的小按钮靠截图目测必然点偏）。best-effort：
+                    # 失败只留痕，观察照常返回普通截图。
+                    elements = self._collect_elements_locked()
+                    if elements:
+                        self._last_elements = elements
+                        self._elements_surface_generation = self._surface_generation
                 effective_elements = elements
                 if elements:
                     png = self._annotate_elements_locked(
@@ -353,6 +373,9 @@ class WindowsComputerBackend:
                 # 微信群聊。键盘输入的焦点漂移维持 R5 fail-closed：前台与最近
                 # 观察不一致即拒绝，强制重新 observe 后再输入。
                 self._require_current_surface_locked()
+                if kind in _KEYBOARD_KINDS:
+                    # 键盘没有目标点：额外复核前台仍是最近一次 pointer 目标窗口。
+                    self._require_keyboard_focus_locked()
                 self._dispatch_locked(action)
                 return
         # R8：wait 在锁外分片等待，close 可收尾、停止可中断。
@@ -388,6 +411,28 @@ class WindowsComputerBackend:
             )
         locator.set_value(action.element_ref, action.text)
 
+    def _collect_elements_locked(self) -> tuple:
+        """自动补元素表（调用方持有锁）：前台窗口 UIA 元素，best-effort。
+
+        observe 没有新的 list_elements 结果、也没有代数未变的上代元素表时调用：
+        直接抓一次前台窗口元素，模型第一次观察即可用 click_element 精确点击，
+        不必退回截图目测坐标（小控件只有几十像素，目测必然点偏）。
+
+        任何失败（UIA 不可用、窗口关闭、COM 异常）只记日志并返回空表——观察
+        退回普通截图，绝不因为补表失败阻断观察。元素数量按
+        ``_MAX_OBSERVE_ELEMENTS`` 截断，避免超大树拖慢观察。
+        """
+        locator = self._element_locator
+        if locator is None:
+            return ()
+        try:
+            hwnd = self._adapter.foreground_window_id()
+            listing = tuple(locator.collect(hwnd))
+        except Exception:
+            _LOGGER.exception("自动提取前台窗口元素失败，观察退回普通截图")
+            return ()
+        return listing[:_MAX_OBSERVE_ELEMENTS]
+
     # ---------------- Task C：输入前置激活（best-effort，绝不阻断输入） ----------------
 
     def _ensure_target_window_active_locked(self, point: tuple[int, int]) -> bool:
@@ -396,22 +441,40 @@ class WindowsComputerBackend:
         - 目标 = 输入点所属顶层窗口（WindowFromPoint，64 位安全经 adapter）：
           点击命中点所在窗口是权威目标，激活它不改变动作语义；
         - 已是前台/查询失败/无目标：不切换，返回 False；
-        - SetForegroundWindow 失败：返回 False，输入照常发送（best-effort）。
+        - SetForegroundWindow 失败或激活过程异常：抛 ComputerControlError 中止本次输入。
+          旧实现是 best-effort 直接继续发送，输入会落到仍在前台的旧窗口，
+          表现为失去焦点、点到别处，因此改为显式失败。
 
         仅用于 pointer 类动作（click/double_click/drag）；键盘动作没有目标点，
         不做前置激活（真机验收修正：键盘激活会把旧观察窗口抢回前台）。
+
+        查询到的目标窗口无论是否发生切换，都记为「最近一次 pointer 目标窗口」，
+        供后续键盘动作复核焦点（_require_keyboard_focus_locked）。
         """
         try:
             hwnd = self._adapter.window_from_point(int(point[0]), int(point[1]))
+            if hwnd:
+                # 记录最近一次 pointer 动作的目标窗口（键盘焦点参照）。
+                self._last_pointer_target_hwnd = int(hwnd)
             if not hwnd or hwnd == self._adapter.foreground_window_id():
                 return False
             if not self._adapter.set_foreground_window(hwnd):
-                return False
+                raise ComputerControlError(
+                    "computer_foreground_activation_failed",
+                    "目标窗口未能置前，已在发送输入前中止，避免输入落到其他窗口。请先调用 activate_surface 激活目标窗口，或重新 observe 建立基线后再试。",
+                    {"hwnd": int(hwnd), "point": [int(point[0]), int(point[1])]},
+                )
             time.sleep(_ACTIVATION_SETTLE_S)
             return True
-        except Exception:
-            _LOGGER.exception("输入前置激活失败（继续原输入路径）")
-            return False
+        except ComputerControlError:
+            raise
+        except Exception as exc:
+            _LOGGER.exception("输入前置激活失败")
+            raise ComputerControlError(
+                "computer_foreground_activation_failed",
+                "激活目标窗口时出错，已在发送输入前中止，避免输入落到错误窗口。请重新 observe 建立基线后再试。",
+                {"point": [int(point[0]), int(point[1])], "reason": str(exc)},
+            ) from exc
 
     # ---------------- Task B：SoM 编号标注（best-effort，绝不阻断观察） ----------------
 
@@ -479,7 +542,6 @@ class WindowsComputerBackend:
                 }
                 for candidate in (*windows, *tray)
             )
-            return
             return
         if kind == "activate_surface":
             # 激活窗口并验证实际前台身份（SetForegroundWindow 失败显式报错）。
@@ -609,6 +671,37 @@ class WindowsComputerBackend:
                     "局部观察区域对应的窗口/控件已移动或消失，"
                     "必须重新 list_surfaces 观察后再操作",
                 )
+
+    def _require_keyboard_focus_locked(self) -> None:
+        """键盘动作发送前复核：前台窗口必须是最近一次 pointer 动作的目标窗口。
+
+        键盘没有目标点，焦点被抢走后按键会静默打进错误窗口。R5 只比对「最近
+        一次观察」基线：用户从刚点击的窗口切回观察过的窗口时基线仍吻合，缺口
+        正在这里——键盘输入会送到不该收键的窗口。参照优先级：
+
+        1. 最近一次 pointer 动作（click/double_click/drag）的目标窗口；
+        2. 没有 pointer 参照时回落到最近一次观察记录的前台窗口。
+
+        两者都没有（尚未观察、也没点过）时放行，不阻塞首次键盘输入。不一致即
+        零输入 + 显式报错，由模型 click 或 activate_surface 重建焦点。
+        """
+        expected = self._last_pointer_target_hwnd
+        if expected is None:
+            signature = self._surface_signature
+            expected = None if signature is None else int(signature[0])
+        if expected is None:
+            return
+        current = int(self._adapter.foreground_window_id())
+        if current == int(expected):
+            return
+        raise ComputerControlError(
+            "computer_foreground_lost",
+            f"前台窗口（hwnd {current}）已不是最近一次点击的目标窗口"
+            f"（hwnd {int(expected)}），键盘输入会落到错误窗口，已在发送前中止。"
+            "请先用 click 点回目标窗口，或用 activate_surface 重新激活目标窗口"
+            "后再输入。",
+            {"expected_hwnd": int(expected), "current_hwnd": current},
+        )
 
     def release_inputs(self) -> None:
         """尽力释放所有按下的键和鼠标键；失败只留痕不抛出。"""

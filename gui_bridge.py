@@ -14,14 +14,18 @@ PyWebView JS-API 桥接层：为 Vue 前端提供后端能力，并把一轮对�
 import base64
 import copy
 import ctypes
+import glob
 import json
 import logging
 import os
 import queue
 import pathlib
+from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -68,6 +72,7 @@ from core.model_manager import (
     update_provider as mm_update_provider,
 )
 from core.model_catalog import API_PROTOCOLS, get_preset_providers
+from core import tokenrhythm_auth
 from core.reasoning_capabilities import build_reasoning_snapshot
 from core.permission_broker import permission_broker
 from core.skills import (
@@ -102,6 +107,10 @@ _DWM_COLOR_CAPABILITY_PENDING = "pending"
 _DWM_COLOR_CAPABILITY_NOT_APPLICABLE = "not_applicable"
 _DWM_COLOR_CAPABILITY_UNKNOWN = "unknown"
 
+# 背景图转换支持的视频扩展名：与 pick_background_video 的文件对话框过滤器一致。
+# 只做扩展名白名单，真正的可解码性由 ffmpeg 探针/抽帧阶段判定。
+_BACKGROUND_VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
+
 # DwmSetWindowAttribute returns HRESULT. Pre-Win11 builds report custom color
 # attributes 34/35/36 as E_INVALIDARG; E_NOTIMPL and HRESULT_FROM_WIN32(
 # ERROR_NOT_SUPPORTED) are also explicit capability signals. No other failure
@@ -115,11 +124,12 @@ _MONITOR_DEFAULTTONEAREST = 2
 # 回合对齐扩展上限为 limit + 30（见 core.memory.get_history_paged）。
 HISTORY_PAGE_SIZE = 50
 
-# 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu。
+# 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu，
+# 手机端 MCP 客户端（阶跃 Amoo 等）经局域网 MCP 服务投递 = mcp。
 # 由入口层注入，模型/用户正文无法设置（send_user_message 校验后拒绝非法值）。
 # 与 core.llm.COMPUTER_TURN_SOURCES 必须保持一致——低层还会再校验一次来源，
 # 两处不一致会让新来源的回合在模型请求处直接抛错（有测试断言两者相等）。
-TURN_SOURCES = ("local", "lan", "feishu")
+TURN_SOURCES = ("local", "lan", "feishu", "mcp")
 
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
@@ -343,8 +353,9 @@ FILE_TREE_SKIP_DIRS = {
     ".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build",
 }
 
-# 测试模型连通性的超时（秒）
-TEST_MODEL_TIMEOUT = 15
+# 测试模型连通性的超时（秒）：推理模型要先吐思考内容，首字常常 15 秒以上，
+# 15 秒会把 glm-5.1 这类模型误判成连接失败，这里放宽到 40 秒。
+TEST_MODEL_TIMEOUT = 40
 
 
 def _probe_keys_for_provider(provider: Dict[str, Any]) -> List[str]:
@@ -1070,8 +1081,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._turn_owner_sessions: dict[str, str] = {}
         self._turn_owner_lock = threading.Lock()
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
-        # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
-        self._turn_start_lock = threading.Lock()
+        # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合。
+        # RLock 仅为纵深防御（跨线程互斥语义与 Lock 一致）：临界区内调用的
+        # 改名随迁已通过 holds_turn_start_lock 显式跳过重入取锁，不依赖此重入性
+        self._turn_start_lock = threading.RLock()
         # 用户消息排队：会话回合运行中收到的新消息进入该队列（FIFO），
         # 回合 finally 结束时自动补发队首。条目含 id/text/display_text/
         # attachments，供前端排队条目展示与取消/插队操作定位
@@ -1113,6 +1126,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._lan_server = None
         # 保护 _lan_server 惰性创建的双检锁：并发（启动后台线程 + 用户点二维码）时不得创建两个实例
         self._lan_lock = threading.Lock()
+        # 局域网 MCP 服务（手机端 MCP 客户端调用，惰性创建，见 _ensure_mcp_server）：
+        # 与 _lan_server 同范式——双检锁 + 启动成功才发布，未配置时完全不启动
+        self._mcp_server = None
+        self._mcp_server_lock = threading.Lock()
         # 飞书通道服务（惰性创建，见 _ensure_feishu_service）：未配置时完全不启动，
         # 对现有功能零影响
         self._feishu_service = None
@@ -1266,7 +1283,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         _active_turns 在回合 finally 中 pop，条目存在即代表回合已登记；
         再用 is_alive 过滤刚登记尚未启动/已结束未清理的极窄竞态窗口。
         """
-        return any(t.is_alive() for t in self._active_turns.values())
+        # list() 快照：与回合 finally 的 pop 并发时，生成器迭代会抛
+        # "dictionary changed size during iteration"，on_closing 捕获后按
+        # "无回合"处理，极端时序可能在回合运行中放行关窗（shutdown 用了快照，两处对齐）
+        return any(t.is_alive() for t in list(self._active_turns.values()))
 
     def get_active_turn_snapshot(self, session_name: str) -> Optional[Dict[str, Any]]:
         """获取指定会话当前进行中的回合快照（若无活跃回合返回 None）。"""
@@ -1683,6 +1703,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 self._lan_server.stop()
         except Exception:
             logger.exception("退出时停止局域网远程控制服务失败")
+
+        try:
+            if getattr(self, "_mcp_server", None) is not None:
+                self._mcp_server.stop()
+        except Exception:
+            logger.exception("退出时停止局域网 MCP 服务失败")
 
         try:
             if getattr(self, "_feishu_service", None) is not None:
@@ -2293,6 +2319,375 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             }
 
         return self._run_gui_theme_operation("read_gui_theme_asset", operation, "asset_path")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 背景图转换：把 mp4 等视频转成"动画 WebP"，供 GUI 主题当背景图使用
+    #
+    # 为什么是动画 WebP：本项目背景图走 CSS background-image（且多数挂在伪元素上），
+    # 承载不了视频；GIF 不在 core/gui_theme._IMAGE_FORMATS 白名单里且 256 色画质差；
+    # 动画 WebP 的容器格式就是 WEBP，天然通过 _IMAGE_FORMATS 与前端 MIME 白名单。
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _find_ffmpeg(self) -> Optional[str]:
+        """定位 ffmpeg 可执行文件；找不到返回 None（不静默失败，交给调用方提示）。
+
+        优先用**随包内置**的那份（打包后位于 `_MEIPASS/vendor/ffmpeg`，源码运行时位于
+        项目根 `vendor/ffmpeg`，与 core/lsp.py 定位内置 rg.exe 同一套约定）。内置副本
+        版本固定，用户无需自装 ffmpeg，也不会因系统 ffmpeg 版本漂移导致转换行为不一致；
+        只有在没有内置副本时才回退到 PATH 与常见安装位置。
+        """
+        candidates = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        candidates.append(Path(__file__).resolve().parent / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        candidates.append(Path(os.getcwd()) / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        for candidate in (
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            Path(os.path.expanduser(os.path.join("~", "scoop", "shims", "ffmpeg.exe"))),
+            Path(r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"),
+        ):
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _probe_video_meta(ffmpeg: str, source: str) -> Dict[str, Any]:
+        """用 `ffmpeg -i` 的 stderr 读时长/分辨率（不依赖 ffprobe：很多精简版不带）。"""
+        meta: Dict[str, Any] = {"duration": None, "width": None, "height": None}
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", source],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return meta
+        text = (proc.stderr or "") + (proc.stdout or "")
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+        if match:
+            hours, minutes, seconds = match.groups()
+            meta["duration"] = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        match = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", text)
+        if match:
+            meta["width"], meta["height"] = int(match.group(1)), int(match.group(2))
+        return meta
+
+    def _background_convert_limits(self) -> Dict[str, int]:
+        """与主题资源校验共用同一套上限，避免两处数字漂移。"""
+        from core.gui_theme import _MAX_IMAGE_BYTES, _MAX_IMAGE_DIMENSION
+        return {"max_bytes": int(_MAX_IMAGE_BYTES), "max_dimension": int(_MAX_IMAGE_DIMENSION)}
+
+    def pick_background_video(self) -> Dict[str, Any]:
+        """选择待转换的视频，并返回探测信息 + 预检结论（能否转换、有哪些提醒）。"""
+        def operation():
+            import webview
+
+            result = self._require_theme_window().create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("视频文件 (*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v)",),
+            )
+            source = self._dialog_path(result)
+            if source is None:
+                raise ThemeError("dialog_cancelled", "source", "已取消选择视频")
+            return {"ok": True, **self.describe_background_video(str(source))}
+
+        return self._run_gui_theme_operation("pick_background_video", operation, "source")
+
+    def describe_background_video(self, source: str) -> Dict[str, Any]:
+        """给定视频路径，返回大小/时长/分辨率与"能不能转"的结论。"""
+        limits = self._background_convert_limits()
+        source_path = Path(source)
+        if not source_path.is_file():
+            raise ThemeError("invalid_video", "source", "视频文件不存在或不可读")
+        if source_path.suffix.lower() not in _BACKGROUND_VIDEO_EXTENSIONS:
+            raise ThemeError(
+                "unsupported_video",
+                "source",
+                "只支持 mp4 / mov / mkv / webm / avi / m4v 视频文件",
+            )
+        size = source_path.stat().st_size
+        ffmpeg = self._find_ffmpeg()
+        info: Dict[str, Any] = {
+            "path": str(source_path),
+            "name": source_path.name,
+            "bytes": size,
+            "ffmpeg_available": bool(ffmpeg),
+            "max_bytes": limits["max_bytes"],
+            "max_dimension": limits["max_dimension"],
+            "duration": None,
+            "width": None,
+            "height": None,
+            "can_convert": True,
+            "blockers": [],
+            "warnings": [],
+        }
+        if not ffmpeg:
+            info["can_convert"] = False
+            info["blockers"].append(
+                "未找到 ffmpeg，无法转换。请安装 ffmpeg 并加入 PATH 后重启应用"
+                "（或放到 本目录/vendor/ffmpeg/ffmpeg.exe）。"
+            )
+            return info
+        info.update(self._probe_video_meta(ffmpeg, str(source_path)))
+        if info["duration"] is None:
+            info["warnings"].append("无法读取视频时长，转换中将只显示『处理中』而无法给出百分比。")
+        else:
+            fps_guess = 12
+            # 粗估输出帧数：乒乓模式相当于正放+倒放，帧数×2
+            frames = int(info["duration"] * fps_guess)
+            if frames > 600:
+                info["warnings"].append(
+                    f"视频约 {info['duration']:.1f} 秒；默认 12fps 下乒乓循环将有约 {frames * 2} 帧，"
+                    "文件会偏大、内存占用偏高。建议先用视频剪辑工具截取 4~6 秒的循环片段。"
+                )
+        return info
+
+    def pick_background_output_dir(self) -> Dict[str, Any]:
+        """选择转换结果的输出文件夹（默认落在桌面）。"""
+        def operation():
+            import webview
+
+            try:
+                from installer_common import get_desktop_dir
+                initial = get_desktop_dir()
+            except Exception:
+                initial = os.path.expanduser("~")
+            result = self._require_theme_window().create_file_dialog(
+                webview.FOLDER_DIALOG,
+                directory=initial,
+            )
+            if not result:
+                raise ThemeError("dialog_cancelled", "destination", "已取消选择文件夹")
+            chosen = Path(str(result[0] if isinstance(result, (list, tuple)) else result))
+            if not chosen.is_dir():
+                raise ThemeError("invalid_directory", "destination", "选择的路径不是文件夹")
+            return {"ok": True, "path": str(chosen)}
+
+        return self._run_gui_theme_operation("pick_background_output_dir", operation, "destination")
+
+    def start_background_convert(
+        self,
+        source: str,
+        output_dir: str,
+        fps: int = 12,
+        quality: int = 78,
+        pingpong: bool = True,
+    ) -> Dict[str, Any]:
+        """后台线程执行 ffmpeg 转换，进度经 bg_convert_progress 事件实时推送。"""
+        ffmpeg = self._find_ffmpeg()
+        if not ffmpeg:
+            return {"ok": False, "msg": "未找到 ffmpeg，无法转换（请安装后重启应用）"}
+        if getattr(self, "_bg_convert_running", False):
+            return {"ok": False, "msg": "已有转换任务在进行中"}
+        source_path = Path(source)
+        out_dir = Path(output_dir)
+        if not source_path.is_file():
+            return {"ok": False, "msg": "源视频不存在"}
+        if not out_dir.is_dir():
+            return {"ok": False, "msg": "输出文件夹不存在"}
+        fps = max(1, min(30, int(fps)))
+        quality = max(0, min(100, int(quality)))
+        meta = self._probe_video_meta(ffmpeg, str(source_path))
+        output_path = out_dir / (source_path.stem + "-动态背景.webp")
+
+        self._bg_convert_running = True
+        self._bg_convert_proc = None
+        thread = threading.Thread(
+            target=self._background_convert_worker,
+            args=(ffmpeg, str(source_path), str(output_path), fps, quality, bool(pingpong), meta),
+            name="bg-convert", daemon=True,
+        )
+        thread.start()
+        return {"ok": True, "output": str(output_path)}
+
+    def cancel_background_convert(self) -> Dict[str, Any]:
+        """中止正在进行的转换（终止 ffmpeg 子进程并删除半成品）。"""
+        proc = getattr(self, "_bg_convert_proc", None)
+        self._bg_convert_cancelled = True
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return {"ok": True, "msg": "已请求中止"}
+        return {"ok": True, "msg": "当前没有转换任务"}
+
+    def _background_convert_worker(self, ffmpeg, source, output_path, fps, quality, pingpong, meta):
+        """两阶段转换（有真实进度）：
+        ① ffmpeg 抽帧到临时目录（image2 边写边报 frame=，进度真实）
+        ② ffmpeg 从帧序列合成动画 WebP（乒乓=正放+倒放，按文件名顺序喂给 image2）
+
+        为什么不能一次 ffmpeg 转完：动画 WebP 的封装器必须收齐全部帧才写容器，
+        因此 `-progress` 的 out_time 全程是 N/A、frame 恒为 0，进度只能最后跳 100%；
+        而 filter_complex 的 reverse 还要额外缓存整条流（长视频会吃光内存）。
+        也没有用 PIL 合成：实测 122 帧要 32 秒，比 ffmpeg 慢一个数量级。
+        """
+        limits = self._background_convert_limits()
+        self._bg_convert_cancelled = False
+        duration = meta.get("duration")
+        width = min(int(meta.get("width") or 1920), 1920)
+        total_frames = int(duration * fps) if duration else None
+        temp_dir = tempfile.mkdtemp(prefix="ycode-bgconv-")
+        tail: list = []
+        try:
+            # ── 阶段①：抽帧  0~80% ──────────────────────────────────────
+            self.emit_event("bg_convert_progress", {"percent": 0, "stage": "extracting"})
+            extract_cmd = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", source,
+                "-vf", f"fps={fps},scale={width}:-2:flags=lanczos",
+                "-progress", "pipe:1", "-nostats",
+                os.path.join(temp_dir, "f-%05d.png"),
+            ]
+            proc = subprocess.Popen(
+                extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            self._bg_convert_proc = proc
+            last_percent = -1
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.strip()
+                if line.startswith("frame="):
+                    try:
+                        done = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    if total_frames:
+                        percent = max(0, min(80, int(done / total_frames * 80)))
+                        if percent != last_percent:
+                            last_percent = percent
+                            self.emit_event("bg_convert_progress", {
+                                "percent": percent, "stage": "extracting",
+                                "frames_done": done, "frames_total": total_frames,
+                            })
+                elif line:
+                    tail.append(line)
+                    if len(tail) > 60:
+                        tail.pop(0)
+            returncode = proc.wait()
+            self._bg_convert_proc = None
+            if self._bg_convert_cancelled:
+                self.emit_event("bg_convert_error", {"message": "已中止转换"})
+                return
+            if returncode != 0:
+                reason = tail[-1] if tail else f"ffmpeg 退出码 {returncode}"
+                self.emit_event("bg_convert_error", {"message": f"抽取帧失败：{reason}"})
+                return
+
+            frames = sorted(glob.glob(os.path.join(temp_dir, "f-*.png")))
+            if not frames:
+                self.emit_event("bg_convert_error", {"message": "未能从该视频中抽取到任何画面帧"})
+                return
+
+            # ── 阶段②：组装序列  80~88% ────────────────────────────────
+            # 乒乓：正放 + 倒放，并去掉折点重复帧（…f61→f60…、末尾 f2→循环回 f1 都连续）
+            ordered = frames + frames[-2:0:-1] if pingpong else frames
+            self.emit_event("bg_convert_progress", {"percent": 82, "stage": "assembling"})
+            for index, frame_path in enumerate(ordered, start=1):
+                shutil.copyfile(frame_path, os.path.join(temp_dir, f"s-{index:05d}.png"))
+                if self._bg_convert_cancelled:
+                    self.emit_event("bg_convert_error", {"message": "已中止转换"})
+                    return
+            self.emit_event("bg_convert_progress", {"percent": 88, "stage": "encoding"})
+
+            # ── 阶段③：合成动画 WebP  88~100% ──────────────────────────
+            assemble_cmd = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-framerate", str(fps),
+                "-i", os.path.join(temp_dir, "s-%05d.png"),
+                "-c:v", "libwebp_anim", "-lossless", "0", "-q:v", str(quality),
+                "-loop", "0", "-compression_level", "4", "-an",
+                output_path,
+            ]
+            proc = subprocess.Popen(
+                assemble_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            self._bg_convert_proc = proc
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.strip()
+                if line:
+                    tail.append(line)
+                    if len(tail) > 60:
+                        tail.pop(0)
+            returncode = proc.wait()
+            self._bg_convert_proc = None
+            if self._bg_convert_cancelled:
+                self._safe_unlink(output_path)
+                self.emit_event("bg_convert_error", {"message": "已中止转换"})
+                return
+            if returncode != 0 or not os.path.exists(output_path):
+                reason = tail[-1] if tail else f"ffmpeg 退出码 {returncode}"
+                # 合成失败时清掉可能已写出的半个容器，避免用户拿到不可用的 webp
+                self._safe_unlink(output_path)
+                self.emit_event("bg_convert_error", {"message": f"合成动画失败：{reason}"})
+                return
+
+            size = os.path.getsize(output_path)
+            if size > limits["max_bytes"]:
+                self._safe_unlink(output_path)
+                self.emit_event("bg_convert_error", {
+                    "message": (
+                        f"转换结果 {size / 1048576:.2f} MiB，超过背景图上限 "
+                        f"{limits['max_bytes'] / 1048576:.0f} MiB，已删除。"
+                        "请降低帧率或质量后重试，或先裁剪更短的循环片段。"
+                    ),
+                })
+                return
+            self.emit_event("bg_convert_progress", {"percent": 100, "stage": "done"})
+            self.emit_event("bg_convert_done", {
+                "path": output_path,
+                "bytes": size,
+                "frames": len(ordered),
+                "fps": fps,
+                "pingpong": pingpong,
+            })
+        except Exception as error:  # noqa: BLE001 — 后台线程必须兜住一切
+            logger.exception("背景图转换失败")
+            self._safe_unlink(output_path)
+            self.emit_event("bg_convert_error", {"message": f"转换异常：{error}"})
+        finally:
+            self._bg_convert_running = False
+            self._bg_convert_proc = None
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _safe_unlink(path):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def install_converted_background(self, webp_path: str) -> Dict[str, Any]:
+        """把转换好的 webp 直接设为当前主题的全局背景图（省去手动选图）。"""
+        def operation():
+            repository = get_gui_theme_repository()
+            # 激活主题只能经 get_active() 读取（返回完整主题 DTO，id 即激活主题 id）。
+            # 不能假设仓库有 active_theme_id()：目标库 ThemeRepository 没有该方法，
+            # 裸调用会抛 AttributeError 被兜底成「GUI 主题操作失败」。这里显式判空，
+            # 无激活主题时给出可读提示。
+            active_theme = repository.get_active()
+            active = active_theme.get("id") if isinstance(active_theme, dict) else None
+            if not active:
+                raise ThemeError("no_active_theme", "theme", "当前没有激活的主题")
+            asset_path = repository.import_image(active, "app", Path(webp_path))
+            return {"ok": True, "theme_id": active, "asset_path": asset_path}
+
+        return self._run_gui_theme_operation("install_converted_background", operation, "theme")
 
     def get_gui_theme_asset(self, theme_id: str, asset_path: str) -> Dict[str, Any]:
         """Compatibility alias for the initially published Task 3 method name."""
@@ -3136,10 +3531,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 若启动卡死时日志里没有这条，说明调用根本没到 Python（桥消息丢失），
         # 而非本方法内部卡住——据此区分"前端没调进来"与"卡在入口"。
         logger.info("get_initial_state 入口被调用（前端桥已打通）")
-        # 前端桥已打通：后台惰性启动局域网手机远程控制服务（不阻塞初始化）
+        # 前端桥已打通：后台惰性启动局域网手机远程控制服务（不阻塞初始化），
+        # 同一线程里紧接着启动局域网 MCP 服务（手机一打开星瑶就能连上手机端
+        # MCP 客户端；MCP 复用 LAN 的配对 token，故必须排在 LAN 之后）。
+        def _startup_lan_and_mcp():
+            try:
+                self._ensure_lan_server()
+            except Exception:
+                logger.debug("局域网远程控制服务启动失败", exc_info=True)
+            # LAN 起不来时 _ensure_mcp_server 自己返回 None，不往外抛
+            self._ensure_mcp_server()
+
         try:
             threading.Thread(
-                target=self._ensure_lan_server,
+                target=_startup_lan_and_mcp,
                 daemon=True,
                 name="lan-remote-startup",
             ).start()
@@ -3880,6 +4285,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         "session_id": s.get("id"),
                         "display_name": sec_name,
                         "secretary_name": sec_name,
+                        # 专属人设原文（空串 = 内置默认秘书人设）：侧栏「编辑人设」
+                        # 弹窗直接用它回填，不再多打一次后端
+                        "secretary_persona": secretary.get_secretary_persona(name),
                         # 显式标注秘书归属（前端此前靠 secretary_name 兜底判定，
                         # 这里给出明确字段，避免与"名字恰好叫秘书"的普通会话混淆）
                         "is_secretary": True,
@@ -3987,6 +4395,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 }
                 if is_secretary:
                     entry["secretary_name"] = display_name
+                    entry["secretary_persona"] = secretary.get_secretary_persona(name)
                     entry["is_secretary"] = True
                 items.append(entry)
             # archived_at 是 ISO8601 文本，字符串倒序即时间倒序；
@@ -4027,7 +4436,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("create_session 失败")
             return {"ok": False, "msg": str(e)}
 
-    def create_secretary_session(self, title: str = "新会话", name: str = "") -> Dict[str, Any]:
+    def create_secretary_session(self, title: str = "新会话", name: str = "",
+                                 persona: str = "") -> Dict[str, Any]:
         """新建一个「秘书」会话并切为当前会话（必须先给定这个名字）。
 
         秘书会话固定 workdir="GLOBAL"、source="SECRETARY"：秘书能力不绑定任何
@@ -4037,15 +4447,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         名字是秘书会话的身份标识：先校验后落库，非法名字直接拒绝且**不产生会话
         记录**——否则会留下一个既无名字又已切走的孤儿会话。名字只存在
         `secretary_name` 列里，不改 `session_name`，因此改名不牵动消息 / 摘要 / 快照。
+
+        persona 是这个秘书的专属人设（可选）：每个秘书都是用户自己创建的独立
+        agent，人设只作用于它自己的会话；留空 = 使用内置默认秘书人设。
         """
         try:
             try:
                 secretary_name = secretary.validate_secretary_name(name)
+                secretary_persona = secretary.validate_secretary_persona(persona)
             except ValueError as e:
                 return {"ok": False, "msg": str(e)}
             new_name = f"session_{uuid.uuid4().hex[:6]}"
             self._memory.create_session_explicit(
-                new_name, workdir="GLOBAL", source="SECRETARY", secretary_name=secretary_name
+                new_name, workdir="GLOBAL", source="SECRETARY",
+                secretary_name=secretary_name, secretary_persona=secretary_persona,
             )
             # 新会话名此前不可能进过缓存，这里失效是为并发路径兜底（同名复用等），
             # 成本一次字典 pop，却能让首轮工具提示 / 标题立刻拿到新名字
@@ -4059,10 +4474,40 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "title": title,
                 "display_name": secretary_name,
                 "secretary_name": secretary_name,
+                "secretary_persona": secretary_persona,
                 "workdir": "GLOBAL",
             }
         except Exception as e:
             logger.exception("create_secretary_session 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_secretary_persona(self, session_name: str, persona: str = "") -> Dict[str, Any]:
+        """设置某个秘书会话的专属人设（空串 = 恢复内置默认秘书人设）。
+
+        人设只落 `secretary_persona` 列，不碰 session_name / 消息 / 摘要，因此
+        改人设不迁移任何键；改完必须失效身份缓存，否则同一进程内已缓存旧身份的
+        高频路径（提示词、工具提示）会沿用旧人设到下次重启。
+        """
+        try:
+            if not session_name:
+                return {"ok": False, "msg": "会话名不能为空"}
+            if not secretary.is_secretary_session(session_name):
+                return {"ok": False, "msg": "该会话不是秘书会话，无法设置秘书人设"}
+            try:
+                cleaned = secretary.validate_secretary_persona(persona)
+            except ValueError as e:
+                return {"ok": False, "msg": str(e)}
+            if not self._memory.set_session_secretary_persona(session_name, cleaned):
+                return {"ok": False, "msg": f"会话 {session_name} 不存在"}
+            secretary.invalidate_secretary_cache(session_name)
+            return {
+                "ok": True,
+                "session_name": session_name,
+                "secretary_persona": cleaned,
+                "sessions": self.get_sessions(),
+            }
+        except Exception as e:
+            logger.exception("set_secretary_persona 失败")
             return {"ok": False, "msg": str(e)}
 
     def get_active_agent_name(self) -> Dict[str, Any]:
@@ -4191,6 +4636,48 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("switch_session 失败")
             return {"ok": False, "msg": str(e), "messages": []}
 
+    def _migrate_session_aux_state(
+        self, old_name: str, final_name: str, *, holds_turn_start_lock: bool = False
+    ) -> None:
+        """会话改名后的随迁五件套：手动与自动改名共用，缺一即漏。
+
+        - 秘书来源缓存：旧名作废，新名留空由下次解析回源（来源与名字都随行，
+          缓存键必须跟着改名走）；
+        - 「总是允许」授权与沙盒放行（permission_grants / sandbox_bypass）：
+          不随迁则改名后等效全部失效，用户需重新审批；
+        - 排队消息队列迁到新名并推快照——首轮自动改名发生在回合 finally 内，
+          不迁则 finally 末尾按旧名补发会把旧名重新 ensure_session 成幽灵会话，
+          排队消息"消失"进幽灵会话。
+
+        holds_turn_start_lock：调用方已持 _turn_start_lock 时（send 路径的
+        落库即命名在 send 临界区内）队列迁移不得重入取锁——裸构造的测试桥
+        装的是普通 Lock，重入即自死锁；此时外层临界区本就保证原子性。
+        """
+        try:
+            secretary.invalidate_secretary_cache(old_name)
+            secretary.invalidate_secretary_cache(final_name)
+        except Exception:
+            logger.debug("秘书缓存随改名失效失败", exc_info=True)
+        try:
+            from core import permission_grants
+            from core.tools import rename_session_sandbox_bypass
+
+            permission_grants.rename_task(old_name, final_name)
+            rename_session_sandbox_bypass(old_name, final_name)
+        except Exception:
+            logger.warning("授权/沙盒放行随改名迁移失败 (%s -> %s)", old_name, final_name, exc_info=True)
+        if holds_turn_start_lock:
+            self._migrate_message_queue_unlocked(old_name, final_name)
+        else:
+            with self._turn_start_lock:
+                self._migrate_message_queue_unlocked(old_name, final_name)
+
+    def _migrate_message_queue_unlocked(self, old_name: str, final_name: str) -> None:
+        """排队消息随会话迁到新名并推快照（调用方保证与队列操作互斥）。"""
+        if old_name in self._message_queues:
+            self._message_queues[final_name] = self._message_queues.pop(old_name)
+            self._emit_message_queue_snapshot(final_name)
+
     def rename_session(self, old_name: str, new_name: str) -> Dict[str, Any]:
         try:
             # M21：回合运行中禁止重命名——运行中的回合终态事件带的是旧会话名，
@@ -4202,21 +4689,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
             if self._current_session == old_name:
                 self._set_current_session(final_name)
-            # 会话名变了：旧名缓存作废，新名留空由下次解析回源（秘书会话的来源与
-            # 名字都随行，缓存键必须跟着改名走）
-            secretary.invalidate_secretary_cache(old_name)
-            secretary.invalidate_secretary_cache(final_name)
-            from core import permission_grants
-            from core.tools import rename_session_sandbox_bypass
-
-            permission_grants.rename_task(old_name, final_name)
-            rename_session_sandbox_bypass(old_name, final_name)
-            # 排队消息随会话迁移到新名（重命名时无运行回合，但队列可能非空：
-            # 上一回合刚结束、补发线程尚未调度等窗口），快照让前端同步
-            with self._turn_start_lock:
-                if old_name in self._message_queues:
-                    self._message_queues[final_name] = self._message_queues.pop(old_name)
-                    self._emit_message_queue_snapshot(final_name)
+            self._migrate_session_aux_state(old_name, final_name)
             # 手动重命名与自动重命名（_rename_session_to_title）共用同一事件负载：
             # 前端按该负载迁移当前会话名、运行态与分组内条目，避免前端再写一份同步逻辑。
             # 取列表与推事件都放在保护块内：此时 DB 与授权迁移均已生效，报失败会让前端
@@ -4238,6 +4711,97 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:
             logger.exception("rename_session 失败")
             return {"ok": False, "msg": str(e), "name": old_name}
+
+    def move_session_to_workdir(self, session_name: str, workdir: str) -> Dict[str, Any]:
+        """把会话移动到另一个工作区分组（或移回 GLOBAL「对话」分组）。
+
+        只改归属字段 sessions.workdir：消息、摘要、token 统计、会话级模型绑定
+        都按 session_id 关联，原样保留，不随归属变化。回合的 cwd 在开跑时从该
+        字段解析（见 _send_message 里的 turn_workdir / workspace_scope 绑定处），
+        所以移动后下一回合自然在新目录里干活，无需额外同步进程状态。
+
+        workdir 传 "GLOBAL" 表示移回无归属的「对话」分组；空字符串视为非法目标
+        （侧栏只会给出真实分组或 GLOBAL，空值一定是传参错误，静默当 GLOBAL
+        会把会话误移出项目）。
+        """
+        name = str(session_name or "").strip()
+        if not name:
+            return {"ok": False, "msg": "会话名不能为空"}
+        if self._memory is None:
+            return {"ok": False, "msg": "后端未就绪"}
+        try:
+            # 与重命名/删除同款守卫：回合运行中改归属会让前端 running 态与新分组
+            # 失配（侧栏把运行中的会话渲染到别处、状态残留）
+            if self._is_turn_active(name):
+                return {"ok": False, "msg": "该会话正在运行回合，请先停止或等待完成后再移动", "name": name}
+            # 后台任务/子代理仍挂在本会话上：它们是在旧目录里起的进程，cwd 不会跟着
+            # 搬走，收尾事件与产出会写回旧分组；此时改归属会让两侧状态错位，一并拦住
+            try:
+                from core.tools import subagent_manager
+                if subagent_manager.has_running_background_tasks(name):
+                    return {"ok": False, "msg": "该会话还有后台任务在执行，请等待完成或停止后再移动", "name": name}
+            except Exception:
+                # 查询失败不阻断主流程（后台任务管理是增强能力，不是移动的前置硬依赖）
+                logger.debug("查询后台任务状态失败", exc_info=True)
+
+            from core.memory import _normalize_workdir
+
+            target = str(workdir or "").strip()
+            if not target:
+                return {"ok": False, "msg": "目标分组不能为空", "name": name}
+            if target != "GLOBAL":
+                resolved = _resolve_real_path(target)
+                if not resolved or not os.path.isdir(resolved):
+                    return {"ok": False, "msg": "目标文件夹不存在或不可访问", "name": name}
+                target = _normalize_workdir(resolved)
+                # 登记工作区，否则侧栏拿不到这个分组（空分组也要能显示出来）
+                self._memory.add_workspace(target)
+
+            # 先取当前归属：会话不存在要报错，不能落到 _session_workdir 的
+            # "查不到就按当前 cwd 处理"兜底上（那会把不存在的会话误判成"已在目标分组"）
+            current = None
+            current_source = "GUI"
+            # include_archived=True：归档只是列表隐藏，会话仍存在，不能因为已归档
+            # 就误报"会话不存在"
+            for s in self._memory.get_all_sessions(
+                workdir=None, include_empty=True, include_archived=True
+            ):
+                if s.get("name") == name:
+                    current = s.get("workdir") or "GLOBAL"
+                    current_source = s.get("source") or "GUI"
+                    break
+            if current is None:
+                return {"ok": False, "msg": "会话不存在", "name": name}
+            # 秘书会话的归属分组由 source 决定（folder_path='SECRETARY' 不是磁盘目录），
+            # 改 workdir 不会改变它在侧栏的位置，反而会悄悄改掉回合 cwd，故直接拒绝
+            if current_source == secretary.SECRETARY_SOURCE:
+                return {"ok": False, "msg": "秘书会话固定归在「秘书」分组，不支持移动", "name": name}
+            if current != "GLOBAL":
+                current = _normalize_workdir(current)
+
+            if current == target:
+                # 已在目标分组：不写库。否则 updated_at 被刷新会把会话顶到该组
+                # 列表最前，看起来像"什么都没干却跳了位置"
+                return {"ok": True, "name": name, "workdir": target, "moved": False,
+                        "sessions": self.get_sessions()}
+
+            if not self._memory.update_session_workdir(name, target):
+                return {"ok": False, "msg": "移动失败（会话可能已不存在）", "name": name}
+
+            try:
+                sessions = self.get_sessions()
+                self.emit_event("session_moved", {
+                    "name": name,
+                    "workdir": target,
+                    "sessions": sessions,
+                })
+            except Exception:
+                logger.exception("推送 session_moved 事件失败")
+                sessions = None
+            return {"ok": True, "name": name, "workdir": target, "moved": True, "sessions": sessions}
+        except Exception as e:
+            logger.exception("move_session_to_workdir 失败")
+            return {"ok": False, "msg": str(e), "name": name}
 
     def delete_session(self, session_name: str) -> Dict[str, Any]:
         try:
@@ -4501,6 +5065,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     def clear_session_history(self, session_name: Optional[str] = None) -> Dict[str, Any]:
         try:
             target = session_name or self._current_session
+            # M21：与 delete/rename 同界——清空会删 messages、harness turns、
+            # DeepSeek prompt generations 与摘要归档，在飞回合随后引用已删行
+            # （CAS 世代被从脚下删掉、turn 边界失效），必须先停或等完成。
+            if self._is_turn_active(target):
+                return {
+                    "ok": False, "success": False,
+                    "msg": "该会话正在运行回合，请先停止或等待完成后再清空历史",
+                }
             self._clear_session_last_error(target)
             deleted = self._memory.clear_session_messages(target)
             from core.llm import session_token_usage, token_usage_lock
@@ -4809,7 +5381,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         """返回可扩展的系统级设置快照；不得包含凭据。"""
         from core.command_shell import get_system_settings
 
-        return get_system_settings()
+        return get_system_settings(active_model_id=self._effective_active_model_id())
+
+    def _effective_active_model_id(self) -> str:
+        """当前会话生效模型的 id（GUI 按会话绑定模型，全局值可能已过期）。
+
+        电脑操控资格提示必须跟着"真正会执行任务的模型"走：用户在不同会话里
+        可以用不同模型，全局 active_model_id 只在会话未绑定时才是生效值。
+        """
+        try:
+            active = get_active_model(getattr(self, "_current_session", None)) or {}
+            return str(active.get("id") or "")
+        except Exception:
+            logger.debug("解析会话生效模型失败，回退全局默认", exc_info=True)
+            return ""
 
     def set_command_shell(self, shell_id: str) -> Dict[str, Any]:
         """设置命令默认解释器；不可用解释器必须显式拒绝，不做静默降级。"""
@@ -4964,6 +5549,202 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("set_decision_settings 失败")
             return {"ok": False, "msg": str(e)}
 
+    # ------------------------------------------------------------------
+    # 决策模型（JEV）业务场景三态桥（关闭 / 影子 / 正式）
+    #
+    # 三态不新增 schema 字段，沿用两个布尔的组合（与 core.decision_gateway
+    # 的判断口径逐字对齐，本层只做「组合 ↔ 三态」的翻译，不改判断逻辑）：
+    #   off    = scenes.X.enabled=false
+    #   shadow = scenes.X.enabled=true 且（全局 shadow_mode=true 或 scenes.X.shadow=true）
+    #   live   = scenes.X.enabled=true 且 全局 shadow_mode=false 且 scenes.X.shadow=false
+    # ------------------------------------------------------------------
+
+    # 四个业务场景的中文元信息（顺序与 core.decision_service.DEFAULT_CONFIG["scenes"] 一致）
+    _DECISION_SCENE_META = (
+        ("router", "路由", "本回合用会话主模型还是副模型；换模型失败或低置信自动回退主模型"),
+        ("secretary", "秘书", "任务派发给哪个候选会话；失败回退原有派发规则"),
+        ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；失败用默认 5 条"),
+        ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
+    )
+    # 三态取值：关闭 / 影子 / 正式
+    _DECISION_SCENE_MODES = ("off", "shadow", "live")
+    # 三态 → 中文文案（前端直接用这份，避免两边各写一套）
+    _DECISION_SCENE_MODE_TEXT = {"off": "关闭", "shadow": "影子", "live": "正式"}
+
+    @staticmethod
+    def _decision_scene_mode(cfg: dict, scene_cfg: dict) -> str:
+        """按两个布尔的组合反推三态（口径与 core.decision_gateway.decide 一致）。"""
+        if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
+            return "off"
+        if bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True)):
+            return "shadow"
+        return "live"
+
+    @staticmethod
+    def _decision_scene_requested_mode(scene_cfg: dict) -> str:
+        """按场景自身两个布尔反推「用户想选的三态」（不看全局影子）。
+
+        界面用它与实际生效的 ``mode`` 对比：两者不一致说明全局影子把场景压住了。
+        """
+        if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
+            return "off"
+        return "shadow" if bool(scene_cfg.get("shadow", True)) else "live"
+
+    def _decision_scene_rows(self, cfg: dict) -> list:
+        """配置 → 四个场景的展示行（含三态、阈值与超时）。"""
+        scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
+        global_shadow = bool(cfg.get("shadow_mode"))
+        rows: list = []
+        for scene, label, description in self._DECISION_SCENE_META:
+            raw_scene = scenes.get(scene)
+            scene_cfg = raw_scene if isinstance(raw_scene, dict) else {}
+            mode = self._decision_scene_mode(cfg, scene_cfg)
+            requested = self._decision_scene_requested_mode(scene_cfg)
+            # 阈值/超时的形状容错：非法值一律回落默认，保证界面永远能渲染
+            raw_threshold = scene_cfg.get("threshold", 0.5)
+            if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, (int, float)):
+                threshold = 0.5
+            else:
+                threshold = max(0.0, min(1.0, float(raw_threshold)))
+            raw_timeout = scene_cfg.get("timeout_ms", 250)
+            if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+                timeout_ms = 250
+            else:
+                timeout_ms = int(raw_timeout)
+            rows.append(
+                {
+                    "scene": scene,
+                    "label": label,
+                    "description": description,
+                    # mode = 真实生效的三态（全局影子开着时，live 也会回落成 shadow）
+                    "mode": mode,
+                    "mode_text": self._DECISION_SCENE_MODE_TEXT[mode],
+                    # requested_mode = 场景自身布尔对应的用户选择
+                    "requested_mode": requested,
+                    "enabled": bool(scene_cfg.get("enabled", False)),
+                    "shadow": bool(scene_cfg.get("shadow", True)),
+                    "threshold": threshold,
+                    "timeout_ms": timeout_ms,
+                    "global_shadow": global_shadow,
+                }
+            )
+        return rows
+
+    def get_decision_scenes(self) -> Dict[str, Any]:
+        """返回四个业务场景的三态快照（设置页「业务场景」区块用）。"""
+        from core import decision_service
+
+        try:
+            cfg = decision_service.load_decision_config()
+            rows = self._decision_scene_rows(cfg)
+            return {
+                "ok": True,
+                "scenes": rows,
+                "shadow_mode": bool(cfg.get("shadow_mode")),
+                "enabled": bool(cfg.get("enabled")),
+                "msg": "",
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_scenes 失败")
+            return {"ok": False, "msg": str(e), "scenes": [], "shadow_mode": True, "enabled": False}
+
+    def set_decision_scene(self, scene: str, mode: str, threshold=None) -> Dict[str, Any]:
+        """设置单个业务场景的三态（可选同时改阈值）；返回最新四场景快照。
+
+        - ``scene``：router / secretary / search / safety；
+        - ``mode``：off（关闭）/ shadow（影子）/ live（正式）；
+        - ``threshold``：可选，钳制到 0.0~1.0；
+        - live 遇到全局 shadow_mode=true 时，effective_mode 会是 shadow（口径如此），
+          返回里的 ``hint`` 会把这件事说明白，让用户知道还差哪一步。
+        """
+        from core import decision_service
+
+        scene_name = str(scene or "").strip()
+        mode_name = str(mode or "").strip().lower()
+        known_scenes = [item[0] for item in self._DECISION_SCENE_META]
+        if scene_name not in known_scenes:
+            return {
+                "ok": False,
+                "msg": f"未知场景「{scene_name or '(空)'}」；合法值为 {' / '.join(known_scenes)}",
+                "scenes": [],
+            }
+        if mode_name not in self._DECISION_SCENE_MODES:
+            return {
+                "ok": False,
+                "msg": f"未知模式「{mode_name or '(空)'}」；合法值为 off / shadow / live",
+                "scenes": [],
+            }
+
+        scene_patch: Dict[str, Any] = {"enabled": mode_name != "off"}
+        if mode_name == "shadow":
+            scene_patch["shadow"] = True
+        elif mode_name == "live":
+            scene_patch["shadow"] = False
+        # off 不动场景自身的 shadow：保留上一次档位，重新开启时语义不变
+        if threshold is not None:
+            if isinstance(threshold, bool):
+                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+            try:
+                threshold_value = float(threshold)
+            except (TypeError, ValueError):
+                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+            if threshold_value != threshold_value:  # NaN：拒绝写入，避免污染配置
+                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+            # 越界钳制而不是拒绝：界面滑到边界时不至于报错打断操作
+            scene_patch["threshold"] = round(max(0.0, min(1.0, threshold_value)), 2)
+
+        try:
+            # 保存统一走 decision_service（校验 + 原子写盘），本层不碰 decision.json
+            decision_service.save_decision_config({"scenes": {scene_name: scene_patch}})
+            cfg = decision_service.load_decision_config()
+            rows = self._decision_scene_rows(cfg)
+            row = next((item for item in rows if item["scene"] == scene_name), {}) or {}
+            effective_mode = str(row.get("mode") or "off")
+            label = str(row.get("label") or scene_name)
+            mode_text = self._DECISION_SCENE_MODE_TEXT.get(effective_mode, "关闭")
+            if mode_name == "live" and effective_mode != "live":
+                msg = f"{label}场景已标记为正式，但全局影子模式仍开启，当前实际按影子运行"
+                hint = "全局影子模式已开启：到上方关闭「影子模式」后，本场景才会正式生效"
+            elif not bool(cfg.get("enabled")):
+                msg = f"{label}场景已保存为{self._DECISION_SCENE_MODE_TEXT[mode_name]}"
+                hint = "决策模型总开关未启用：场景设置要等总开关打开后才生效"
+            elif effective_mode == "live":
+                msg = f"{label}场景已切换为正式（决策结果会真实影响任务行为）"
+                hint = "正式模式：失败、超时或低置信都会自动回退原逻辑，不会阻断任务"
+            elif effective_mode == "shadow":
+                msg = f"{label}场景已切换为影子（真发请求、真写审计，结果丢弃）"
+                hint = "影子模式用于观察决策质量；确认无误后再切正式"
+            else:
+                msg = f"{label}场景已关闭（零请求、零记录，走原逻辑）"
+                hint = "关闭后该场景不再询问决策模型，行为与未接入时一致"
+            return {
+                "ok": True,
+                "msg": msg,
+                "hint": hint,
+                "scene": row,
+                "scenes": rows,
+                "requested_mode": mode_name,
+                "effective_mode": effective_mode,
+                "mode_text": mode_text,
+                "global_shadow": bool(cfg.get("shadow_mode")),
+                "settings": cfg,
+            }
+        except ValueError as error:
+            # 校验拒绝（如全局配置已有非法值）：回显中文原因，不回写任何东西
+            return {"ok": False, "msg": str(error), "scenes": self._decision_scene_rows_safe()}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("set_decision_scene 失败")
+            return {"ok": False, "msg": str(e), "scenes": self._decision_scene_rows_safe()}
+
+    def _decision_scene_rows_safe(self) -> list:
+        """容错读取场景行：失败一律返回空列表（用于错误返回体，绝不二次抛错）。"""
+        from core import decision_service
+
+        try:
+            return self._decision_scene_rows(decision_service.load_decision_config())
+        except Exception:
+            return []
+
     def probe_decision(self) -> Dict[str, Any]:
         """逐 Key 各跑一次无害探针，返回分类结果与目标任务模型。"""
         from core import decision_service
@@ -5009,15 +5790,44 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("list_decision_providers 失败")
             return {"ok": False, "providers": [], "msg": str(e)}
 
-    def get_decision_audit_summary(self, limit: int = 20) -> Dict[str, Any]:
-        """决策审计汇总：今日计数 + 最近 N 条记录（设置页「决策记录」面板用）。"""
+    def get_decision_audit_summary(
+        self, limit: int = 20, session_id=None, session_only: bool = False
+    ) -> Dict[str, Any]:
+        """决策审计汇总：今日计数 + 最近 N 条记录。
+
+        ``session_only=True`` 且 ``session_id`` 非空时，``today_*`` 与 ``recent``
+        也按该会话过滤（会话头部「决策」面板口径，避免展示别的会话的记录）；
+        否则返回全局汇总，设置页面板依赖全局数据、不能出现缺口。
+        ``has_business_records`` 只在传了非空 ``session_id`` 时按会话判定。
+        """
         from core import decision_service
 
         try:
-            result = decision_service.get_decision_audit_summary(limit)
+            scope_session = str(session_id or "").strip()
+            if scope_session:
+                result = decision_service.get_decision_audit_summary(
+                    limit, scope_session, bool(session_only)
+                )
+            else:
+                # 空会话不追加参数：下游默认 None = 全局口径，也保持旧调用签名兼容
+                result = decision_service.get_decision_audit_summary(limit)
             return result if isinstance(result, dict) else {"ok": False, "msg": "汇总返回异常"}
         except Exception as e:  # pragma: no cover - 防御性兜底
             logger.exception("get_decision_audit_summary 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_decision_record_detail(self, trace_id: str) -> Dict[str, Any]:
+        """按 trace_id 取单条决策记录详情（发给 JEV 的请求 + 上游返回的答案）。
+
+        面板点开一条记录时调用：只读审计文件，找不到返回 ok=false，不抛错。
+        """
+        from core import decision_service
+
+        try:
+            result = decision_service.get_decision_record_detail(trace_id)
+            return result if isinstance(result, dict) else {"ok": False, "msg": "详情返回异常"}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_decision_record_detail 失败")
             return {"ok": False, "msg": str(e)}
 
     def open_decision_audit_dir(self) -> Dict[str, Any]:
@@ -5229,6 +6039,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             }
         if value is False:
             self._stop_computer_runs_for_disabled_switch("desktop")
+        else:
+            # 恢复条件①（core/computer/stop_notice.py 注释）：用户在设置里重新
+            # 开启电脑操控，等于明确要求恢复，解除"用户已停止"抑制与未投递通知；
+            # 否则用户只能靠发一句含恢复关键词的消息才能再让模型操作电脑。
+            from core.computer import stop_notice
+
+            stop_notice.deactivate_user_stop("settings_reenabled")
         # 开关切换成功后同步紧急停止热键（Task 16：开启首次注册/全关注销）
         self._refresh_computer_hotkey()
         return {"ok": True, "settings": self.get_system_settings()}
@@ -5326,9 +6143,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         )
 
     def stop_computer_control(self, run_id: str) -> Dict[str, Any]:
-        """用户紧急停止当前 run；固定停止顺序由 controller.stop 执行（设计 15.2）。"""
+        """用户紧急停止当前 run；固定停止顺序由 controller.stop_for_user 执行（设计 15.2）。
+
+        用 stop_for_user 而非 stop：用户点停止只应结束电脑操控 run，不应置位
+        回合 cancel_event 把整个对话回合掐掉（否则模型收不到"用户已停止"）。
+        """
         return self._run_computer_mutation(
-            lambda controller: controller.stop(str(run_id or ""), "user_stop")
+            lambda controller: controller.stop_for_user(str(run_id or ""), "user_stop")
         )
 
     def acknowledge_computer_safety(self, run_id: str, check_ids=None) -> Dict[str, Any]:
@@ -5693,6 +6514,62 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
+    def _ensure_mcp_server(self):
+        """惰性创建并启动局域网 MCP 服务，失败/未启用返回 None（不抛给调用方）。
+
+        与 _ensure_lan_server 同范式：双检锁保证并发（启动后台线程 + 设置页/二维码）
+        只创建一个实例；start() 返回 ok 后才发布 self._mcp_server，失败不发布，
+        下次调用可重试（端口被占用属运行时状况，不该让实例停留在半成品状态）。
+        供手机端 MCP 客户端（阶跃 Amoo 等）调用，与远程控制共用同一配对 token。
+        """
+        if getattr(self, "_mcp_server", None) is not None:
+            return self._mcp_server
+        lock = getattr(self, "_mcp_server_lock", None)
+        if lock is None:
+            # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__，
+            # 缺状态时就地补齐，避免后台启动线程里抛 AttributeError
+            lock = threading.Lock()
+            self._mcp_server_lock = lock
+        with lock:
+            if getattr(self, "_mcp_server", None) is not None:
+                return self._mcp_server
+            try:
+                data = config._load()
+                if not data.get(
+                    config.REMOTE_MCP_ENABLED_KEY, config.REMOTE_MCP_ENABLED_DEFAULT
+                ):
+                    # 默认开启，但允许用户显式关掉；关闭时完全不绑定端口、不起线程
+                    return None
+                # MCP 复用 LAN 远程控制的配对 token：LAN 服务起不来就没有可校验的
+                # 凭据，此时直接放弃启动（fail-closed，绝不裸奔成无鉴权入口）。
+                lan = self._ensure_lan_server()
+                if lan is None:
+                    logger.debug("局域网 MCP 服务未启动：LAN 远程控制服务不可用")
+                    return None
+
+                def _token_provider():
+                    # 每次请求现取 LAN 服务上的当前 token：用户刷新/轮换 token 后
+                    # MCP 端无需重启即自动跟随；取不到空值时核心侧按未授权拒绝
+                    return getattr(lan, "_token", b"") or b""
+
+                try:
+                    port = int(data.get(config.REMOTE_MCP_PORT_KEY, config.REMOTE_MCP_PORT_DEFAULT))
+                except (TypeError, ValueError):
+                    port = config.REMOTE_MCP_PORT_DEFAULT
+                from core.mcp_server import McpServer
+
+                srv = McpServer(bridge=self, port=port, token_provider=_token_provider)
+                info = srv.start()
+                if not info.get("ok"):
+                    logger.warning("局域网 MCP 服务启动失败: %s", info.get("msg") or info)
+                    return None
+                self._mcp_server = srv
+                logger.info("局域网 MCP 服务已启动: %s", info.get("url"))
+                return srv
+            except Exception:
+                logger.exception("局域网 MCP 服务启动失败")
+                return None
+
     def _ensure_feishu_service(self):
         """惰性创建并启动飞书通道服务，失败/未配置返回 None（不抛给调用方）。
 
@@ -5882,7 +6759,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     # ------------------------------------------------------------------
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
         # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
-        # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"；
+        # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"，
+        # 局域网 MCP 服务由 core/mcp_server 注入 "mcp"；
         # 只接受这几个受控值，模型/用户正文无法设置，非法值直接拒绝（不启动回合）。
         # 注意参数顺序：permission_mode 在 turn_source 之前——桌面 GUI 经
         # pywebview 按位置传参，第 6 位必须是会话级权限档位；LAN 分发只放行
@@ -5905,6 +6783,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 full_text = f"{clean_text} {joined}" if clean_text else joined
             target_session = session_name or self._current_session
             clean_model_id = str(model_id or "").strip()
+            # 会话守门：基元律动登录时创建的专属 Key 与登录会话绑定，cookie 失效后
+            # 这枚 Key 不允许继续对话——在排队 / 启动回合之前就拦住，并提示重新登录。
+            # 非 tokenrhythm 厂商的模型直接跳过（不触发任何额外请求）。
+            blocked = self._tr_session_gate(clean_model_id)
+            if blocked is not None:
+                return blocked
             # 会话级权限档位：pending 草稿会话在落库前无法绑定，用户的选择随
             # 首条消息带给 worker 补绑定；未知值直接拒绝（宁可不发也不误放权）
             pending_permission_mode = ""
@@ -5941,7 +6825,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     if base_title:
                         try:
                             self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
-                            new_session = self._rename_session_to_title(target_session, base_title)
+                            # 本处已持有 _turn_start_lock（send 临界区内）：
+                            # 随迁队列不得重入取锁（裸构造测试桥装的是普通 Lock）
+                            new_session = self._rename_session_to_title(
+                                target_session, base_title, holds_turn_start_lock=True
+                            )
                             if new_session != target_session:
                                 target_session = new_session
                         except Exception:
@@ -6595,6 +7483,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         api_key = ""
         turn_finished = False
         event_session_name = session_name
+        # 自动改名（首轮标题化）后队列已随迁新名，finally 末尾补发必须用新名，
+        # 否则按旧名 drain 扑空、排队消息滞留（旧名还会被 ensure_session 成幽灵会话）
+        drain_session_name = session_name
         cancelled = False
         turn_id = ""
         automation_run_id = str((automation_context or {}).get("run_id") or "")
@@ -6783,6 +7674,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
                 if automation_run_id:
                     automation_error = "当前未激活任何 LLM 模型"
+                # 秘书派发回合同样要置 terminal_message：finally 的完成通知按
+                # 该字段区分成败，缺省会把"什么都没跑"误报成"任务已执行完成"
+                error_state["terminal_message"] = "当前未激活任何 LLM 模型"
                 self.emit_event("error", {"message": "当前未激活任何 LLM 模型，请先在模型管理中配置并激活模型。", "session_name": session_name})
                 self.emit_event("turn_cancelled", {"session_name": session_name})
                 finish_once()
@@ -6792,6 +7686,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             api_key = active_model.get("api_key", "")
             api_base = active_model.get("base_url", "")
             ctx_win = active_model.get("context_window", 128000)
+            # 本回合实际发请求所用的模型 id（默认=会话激活模型）。router 场景可能
+            # 把它一次性换成副模型 id；必须与 model_name 成对替换——llm_dialects
+            # 按 id 读 thinking / max_tokens 等模型级配置，只换名字不换 id 会把主
+            # 模型的推理参数发给副模型（上游可能直接 400）。
+            model_id = active_model.get("id")
             # 首轮必须先创建会话再写模型绑定；后续模型未变化时不重复写库。
             session_workdir = pending_workdir or self._session_workdir(session_name)
             _ensure_session_model_binding(
@@ -6932,6 +7831,66 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # chat_with_model_events（parent_session），不依赖全局 _current_session。
             # 会话归属目录的绑定（os.chdir / memory.set_workdir）已在上面按 session_name 完成。
 
+            # —— router 场景：回合级模型档位（JEV 决定本回合用主模型还是副模型）——
+            # 方案 A：入口层局部变量替换 + 显式参数透传。覆盖只改本回合的这几个
+            # 局部变量（model_name / api_key / api_base / ctx_win / model_id），
+            # 是**本回合的一次性覆盖**：不写任何全局或会话级模型绑定，也不动
+            # _sync_active_model_context，所以并行会话与子代理继承链继续用各自的
+            # 会话模型（写全局会造成会话串味，禁止）。
+            # JEV 关闭 / 影子时 router_scene_live() 直接为假：不读历史、不算 token、
+            # 不发决策请求，本回合行为与接入前逐字一致（零额外开销）。
+            try:
+                from core.turn_model_override import router_scene_live, resolve_turn_model
+
+                # 内部回合（后台汇总 / 星轨自动化 / 命令总结）始终用会话主模型：
+                # 这类回合由系统构造 prompt，降级到副模型只会让汇总质量变差，且用户
+                # 无从察觉。只看用户亲手发起的回合，才有"本回合值不值得用强模型"的问题。
+                if router_scene_live() and not internal_kind:
+                    from core.agent_service import get_session_token_baseline
+
+                    # 窗口硬护栏的基线：本会话当前上下文占用（真实用量与估算取较小值）。
+                    # 这段在 JEV 未开启时根本不会执行；拿不到基线就传 0 跳过护栏，
+                    # 不能让一次基线计算失败把本回合的覆盖逻辑整体带崩。
+                    try:
+                        baseline_tokens = get_session_token_baseline(
+                            self._memory, session_name, model_name
+                        )
+                    except Exception:
+                        baseline_tokens = 0
+                    # 本轮是否带图：带图时 router 只能切到「确实支持视觉」的副模型，
+                    # 否则等于把用户的图片丢给不识图的便宜模型，视觉链路会直接降级成
+                    # 「无法分析图片」占位提示（用户发图就是要人看图，不能为省钱吞掉）。
+                    turn_has_image = isinstance(parsed_content, list) and any(
+                        isinstance(block, dict)
+                        and block.get("type") in ("image_url", "image")
+                        for block in parsed_content
+                    )
+                    turn_override = resolve_turn_model(
+                        active_model,
+                        turn_source=turn_source,
+                        pending_model_id=pending_model_id,
+                        baseline_tokens=baseline_tokens,
+                        user_text=user_text,
+                        has_image=turn_has_image,
+                    )
+                    if turn_override:
+                        logger.info(
+                            "router 场景覆盖本回合模型 [%s]：%s → %s（原因：JEV 判定本回合"
+                            "复杂度只需副模型；基线 %s tokens，副模型窗口 %s tokens）",
+                            session_name,
+                            model_name,
+                            turn_override["litellm_model"],
+                            baseline_tokens,
+                            turn_override["context_window"],
+                        )
+                        model_name = turn_override["litellm_model"]
+                        api_key = turn_override["api_key"]
+                        api_base = turn_override["base_url"]
+                        ctx_win = turn_override["context_window"]
+                        model_id = turn_override["model_id"]
+            except Exception:
+                logger.debug("router 场景模型档位覆盖失败，本回合沿用主模型", exc_info=True)
+
             # 与 CLI 完全同源的上下文组装（记忆压缩 / 系统提示词 / 运行上下文 / 后台任务汇总）
             from core.agent_service import prepare_turn_messages
             history = prepare_turn_messages(
@@ -6976,7 +7935,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     api_base,
                     session_name,
                     turn_id,
-                    model_id=active_model.get("id"),
+                    model_id=model_id,
                     error_state=error_state,
                     turn_source=turn_source,
                 )
@@ -7011,6 +7970,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 self.emit_event("turn_cancelled", {"session_name": session_name})
             else:
                 event_session_name = self._maybe_auto_rename(session_name) or session_name
+                drain_session_name = event_session_name
             _phase_mark("取消事件/自动重命名完成")
         except Exception as e:
             logger.exception("GUI 对话回合失败")
@@ -7173,8 +8133,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 except Exception:
                     pass
             # finally 末尾：补发排队中的用户消息（FIFO）。放在所有清理之后，
-            # 保证补发回合的 turn_start 事件一定晚于本回合的终态事件到达前端
-            self._drain_message_queue(session_name)
+            # 保证补发回合的 turn_start 事件一定晚于本回合的终态事件到达前端。
+            # 用 drain_session_name：首轮自动改名后队列已在新名下。
+            self._drain_message_queue(drain_session_name)
 
     def _on_background_task_finished(self, task_id: str, command: str, returncode: int,
                                      session_id: str = "", log_tail: str = "") -> None:
@@ -7308,6 +8269,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return
         if subagent_manager.has_running_background_tasks(session):
             return
+        # 会话可能已被删除（删除会话时不拦在跑的后台子代理，其终态回调晚到）：
+        # 在已删会话上起汇总回合会把旧名 ensure_session 复活成幽灵会话
+        try:
+            known = {
+                str(s.get("name") or "")
+                for s in self._memory.get_all_sessions(workdir=None)
+            }
+            if session not in known:
+                return
+        except Exception:
+            logger.debug("后台汇总前会话存在性检查失败，继续原流程", exc_info=True)
 
         with self._turn_start_lock:
             if self._is_turn_active(session):
@@ -7635,8 +8607,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         first_text = sanitize_session_title(first_text)
         return first_text[:12] if first_text else None
 
-    def _rename_session_to_title(self, session_name: str, base_title: str) -> str:
-        """把会话重命名为 base_title（撞名自动加序号），成功推送 session_renamed。"""
+    def _rename_session_to_title(
+        self, session_name: str, base_title: str, *, holds_turn_start_lock: bool = False
+    ) -> str:
+        """把会话重命名为 base_title（撞名自动加序号），成功推送 session_renamed。
+
+        holds_turn_start_lock 由 send 路径（落库即命名，已持锁）传入，
+        透传给随迁五件套避免重入取锁。
+        """
         existing = {s.get("name") for s in self._memory.get_all_sessions(workdir=None)}
         new_title = base_title
         suffix = 2
@@ -7647,6 +8625,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         if success:
             if self._current_session == session_name:
                 self._set_current_session(final_name)
+            # 与手动改名共用同一套随迁（授权/沙盒放行/秘书缓存/排队消息）：
+            # 首轮自动改名发生在回合 finally 内，此前缺这一步会让"总是允许"
+            # 授权静默失效、排队消息落进旧名幽灵会话。
+            self._migrate_session_aux_state(
+                session_name, final_name, holds_turn_start_lock=holds_turn_start_lock
+            )
             self.emit_event("session_renamed", {
                 "old": session_name,
                 "new": final_name,
@@ -9388,6 +10372,397 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("add_provider 失败")
             return {"ok": False, "msg": str(e)}
 
+    # ------------------------------------------------------------------
+    # 基元律动（TokenRhythm）账号：登录 / 短信验证码 / 自动绑定 API Key
+    # 账号会话由 core.tokenrhythm_auth 保存在进程内存，桥接层不落盘；手机号、
+    # 密码、明文 Key 一律不写日志（异常只记 traceback，不带入参）。
+    # ------------------------------------------------------------------
+
+    # 会话守门命中时返回给前端的固定提示（前端据此弹「重新登录」）。
+    _TR_NEED_LOGIN_MSG = "基元律动登录已失效，请重新登录后再使用该模型"
+
+    def _tr_effective_base_url(self, model_id: str = "") -> str:
+        """本条消息真正会用的模型的 base_url；解析不出来返回空串。
+
+        优先用前端随消息带来的激活模型 id（落库后就是会话绑定模型），取不到再回退
+        会话 / 全局激活模型。只读本地配置，不联网、不发请求。
+        """
+        target = str(model_id or "").strip()
+        if target:
+            try:
+                for provider in load_config().get("providers", []) or []:
+                    if not isinstance(provider, dict):
+                        continue
+                    for model in provider.get("models") or []:
+                        if isinstance(model, dict) and str(model.get("id") or "") == target:
+                            return str(provider.get("base_url") or "")
+            except Exception:
+                logger.debug("解析激活模型厂商失败", exc_info=True)
+        try:
+            active = get_active_model(getattr(self, "_current_session", None)) or {}
+        except Exception:
+            logger.debug("解析会话生效模型失败，按非基元律动处理", exc_info=True)
+            return ""
+        return str(active.get("base_url") or "")
+
+    def _tr_session_gate(self, model_id: str = "") -> Optional[Dict[str, Any]]:
+        """基元律动会话守门：专属 Key 的登录会话失效时返回拦截结果，否则 None。
+
+        只有「本条消息用的模型来自 tokenrhythm 厂商」且「本地存在账号绑定的专属
+        Key」时才校验会话，其它模型的调用路径完全不受影响（不多发任何请求）。
+        守门自身异常一律放行并记日志：宁可漏拦一次，也不能把对话入口打挂。
+        """
+        try:
+            base_url = self._tr_effective_base_url(model_id).lower()
+            if "tokenrhythm.studio" not in base_url:
+                return None
+            if not tokenrhythm_auth.binding_active():
+                return None
+            health = tokenrhythm_auth.session_health() or {}
+            if bool(health.get("ok")):
+                return None
+            logger.warning(
+                "基元律动会话不可用，已拦截发消息：%s", str(health.get("reason") or "")
+            )
+            return {"ok": False, "msg": self._TR_NEED_LOGIN_MSG, "need_login": True}
+        except Exception:
+            logger.warning("基元律动会话守门校验失败，本次放行", exc_info=True)
+            return None
+
+    def _tr_settings_snapshot(self) -> Dict[str, Any]:
+        """模型设置快照；失败只降级为空 dict，不用它拖垮登录结果展示。"""
+        try:
+            return self.get_model_settings()
+        except Exception:
+            logger.warning("基元律动登录后读取模型设置失败", exc_info=True)
+            return {}
+
+    def _tr_has_configured_provider(self) -> bool:
+        """本地是否已有可用的基元律动 provider（base_url 命中且有 api_key）。
+
+        只读本地配置、不联网校验：状态查询要秒回，Key 真实可用性等对话链路
+        真正 401 时再暴露。
+        """
+        try:
+            config_data = load_config()
+        except Exception:
+            logger.debug("读取本地模型配置失败，视为未配置基元律动", exc_info=True)
+            return False
+        providers = config_data.get("providers", []) if isinstance(config_data, dict) else []
+        if not isinstance(providers, list):
+            return False
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            base_url = str(provider.get("base_url") or "").lower()
+            if "tokenrhythm.studio" in base_url and str(provider.get("api_key") or "").strip():
+                return True
+        return False
+
+    def tr_session_health(self, force: bool = False) -> Dict[str, Any]:
+        """透传 core 的会话健康检查：前端可在发消息前 / 定时刷新登录态提示。
+
+        force=True 时跳过 core 的 60 秒缓存强制校验（用户点「重新检查」用）。
+        """
+        try:
+            health = tokenrhythm_auth.session_health(force=bool(force)) or {}
+        except Exception as e:
+            logger.exception("tr_session_health 失败")
+            return {"ok": False, "logged_in": False, "reason": str(e), "msg": str(e)}
+        return {
+            "ok": bool(health.get("ok")),
+            "logged_in": bool(health.get("logged_in")),
+            "reason": str(health.get("reason") or ""),
+        }
+
+    def tr_auth_status(self) -> Dict[str, Any]:
+        """查询基元律动登录状态 + 本地是否已配置可用 Key。"""
+        try:
+            status = tokenrhythm_auth.account_status() or {}
+            logged_in = bool(status.get("logged_in"))
+            user = status.get("user") if logged_in else None
+            return {
+                "ok": True,
+                "logged_in": logged_in,
+                "user": user if isinstance(user, dict) else None,
+                "configured": self._tr_has_configured_provider(),
+            }
+        except Exception as e:
+            logger.exception("tr_auth_status 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def tr_account_overview(self) -> Dict[str, Any]:
+        """账号概览：一次返回余额、今日用量与个人信息。
+
+        金额（wallet.available_balance_cny / usage_today.cost_cny /
+        temporary_credits.total_cny）保持服务端返回的字符串原样，前端自行格式化，
+        避免浮点换算丢精度。核心层没登录时返回 ok=False + reason，这里统一收敛成
+        {ok: False, msg} 供前端提示。部分接口失败时透传 partial / errors
+        （对应字段已降级为 0 / "0"）。
+        """
+        try:
+            overview = tokenrhythm_auth.account_overview() or {}
+            if not overview.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": str(overview.get("reason") or "尚未登录基元律动账号"),
+                }
+            credits = overview.get("temporary_credits")
+            if not isinstance(credits, dict):
+                # 老版本 core 或字段缺失：给一份与 core 降级值一致的零值，前端不必判空
+                credits = {"total_cny": "0", "count": 0, "nearest_expires_at": "", "nearest_amount_cny": "0"}
+            result: Dict[str, Any] = {
+                "ok": True,
+                "user": overview.get("user") or {},
+                "wallet": overview.get("wallet") or {},
+                "usage_today": overview.get("usage_today") or {},
+                # 临时额度汇总（total_cny 金额字符串 / count / nearest_expires_at），原样透传
+                "temporary_credits": credits,
+            }
+            if overview.get("partial"):
+                result["partial"] = True
+                result["errors"] = dict(overview.get("errors") or {})
+            return result
+        except Exception as e:
+            logger.exception("tr_account_overview 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def tr_auth_send_sms(
+        self, phone: str, captcha_verify_param: str = ""
+    ) -> Dict[str, Any]:
+        """发送短信验证码（challengeId 由 core 层进程内保存）。
+
+        captcha_verify_param 由前端在阿里云验证码 success 回调里取得，原样透传给
+        core 层；空串归一成 None，保证未集成验证码时请求体里不出现
+        captchaVerifyParam 字段。该值是一次性校验凭据，绝不写日志。
+        """
+        try:
+            phone = str(phone or "").strip()
+            if not phone:
+                return {"ok": False, "msg": "请输入手机号"}
+            captcha = str(captcha_verify_param or "").strip()
+            result = tokenrhythm_auth.send_sms_code(phone, captcha or None) or {}
+            return {
+                "ok": True,
+                "challenge_id": str(result.get("challenge_id") or ""),
+                "interval_seconds": result.get("interval_seconds"),
+                "ttl_seconds": result.get("ttl_seconds"),
+                "masked_target": str(result.get("masked_target") or ""),
+                "msg": "验证码已发送",
+            }
+        except Exception as e:
+            logger.exception("tr_auth_send_sms 失败")
+            # 异常 message 已含面向用户的中文提示，不能吞成空串
+            return {"ok": False, "msg": str(e) or "验证码发送失败，请稍后重试"}
+
+    def _tr_finish_login(self, login_result: Dict[str, Any]) -> Dict[str, Any]:
+        """登录成功后自动绑定 Key，并同步激活模型上下文。
+
+        绑定失败不静默：账号确实已登录，仍返回 ok=True（前端不应把用户打回
+        登录页），但 bind.ok=False、bind_error 与 msg 都带明确原因，前端可
+        直接提示"登录成功但 Key 未绑定，请到模型设置手动填 Key"。
+        """
+        user = (login_result or {}).get("user") or {}
+        try:
+            bind = dict(tokenrhythm_auth.ensure_bound() or {})
+        except Exception as error:
+            logger.warning("基元律动登录后自动绑定 API Key 失败: %s", error)
+            bind = {
+                "ok": False,
+                "created": False,
+                "provider_id": "",
+                "error": str(error) or "自动绑定 API Key 失败",
+            }
+        else:
+            bind["ok"] = True
+
+        models: Dict[str, Any] = {"ok": False, "error": "未绑定 API Key，跳过模型同步"}
+        if bind.get("ok"):
+            # Key 可能刚写入配置：同步 app_context，避免本进程继续用旧 Key；
+            # 绑定失败时配置没有变化（无新 Key），不必重复同步。
+            try:
+                sync = getattr(self, "_sync_active_model_context", None)
+                if callable(sync):
+                    sync()
+            except Exception:
+                logger.warning("基元律动登录后同步激活模型上下文失败", exc_info=True)
+            try:
+                synced = dict(
+                    tokenrhythm_auth.sync_models(bind.get("provider_id") or None) or {}
+                )
+                synced["ok"] = True
+                models = synced
+            except Exception as error:
+                logger.warning("基元律动登录后同步模型失败: %s", error)
+                models = {"ok": False, "error": str(error) or "模型同步失败"}
+            bind_error = ""
+            base_msg = (
+                "登录成功，已自动配置基元律动 API Key"
+                if bind.get("created")
+                else "登录成功，本地已有可用 API Key"
+            )
+            if models.get("ok"):
+                msg = f"{base_msg}（同步 {int(models.get('added') or 0)} 个模型）"
+            else:
+                msg = f"{base_msg}（模型同步失败：{models.get('error') or '未知原因'}）"
+        else:
+            bind_error = str(bind.get("error") or "自动绑定 API Key 失败")
+            msg = f"登录成功，但自动绑定 API Key 失败：{bind_error}"
+
+        return {
+            "ok": True,
+            "user": user if isinstance(user, dict) else {},
+            "bind": bind,
+            "bind_ok": bool(bind.get("ok")),
+            "bind_error": bind_error,
+            "models": models,
+            "settings": self._tr_settings_snapshot(),
+            "msg": msg,
+        }
+
+    def tr_auth_sync_models(self) -> Dict[str, Any]:
+        """把基元律动官方模型全量同步到本地厂商配置（幂等，已存在的跳过）。"""
+        try:
+            result = dict(tokenrhythm_auth.sync_models() or {})
+            result.setdefault("ok", True)
+            try:
+                sync = getattr(self, "_sync_active_model_context", None)
+                if callable(sync):
+                    sync()
+            except Exception:
+                logger.warning("同步模型后刷新激活模型上下文失败", exc_info=True)
+            result["settings"] = self._tr_settings_snapshot()
+            return result
+        except Exception as e:
+            logger.exception("tr_auth_sync_models 失败")
+            return {"ok": False, "msg": str(e) or "同步模型失败，请稍后重试"}
+
+    def tr_auth_sms_login(
+        self, phone: str, code: str, invite_code: str = ""
+    ) -> Dict[str, Any]:
+        """短信验证码登录 / 注册，成功后自动绑定 Key。
+
+        invite_code 为可选邀请码：空白一律归一成 None 再交给 core，避免把空串
+        当作"提供了但无效"上送服务端。该值属于邀请关系凭据，不写日志。
+        """
+        try:
+            phone = str(phone or "").strip()
+            code = str(code or "").strip()
+            invite = str(invite_code or "").strip()
+            if not phone:
+                return {"ok": False, "msg": "请输入手机号"}
+            if not code:
+                return {"ok": False, "msg": "请输入验证码"}
+            login_result = tokenrhythm_auth.sms_login(phone, code, invite or None)
+            return self._tr_finish_login(login_result)
+        except Exception as e:
+            logger.exception("tr_auth_sms_login 失败")
+            return {"ok": False, "msg": str(e) or "登录失败，请稍后重试"}
+
+    def tr_auth_password_login(self, account: str, password: str) -> Dict[str, Any]:
+        """账号密码登录，成功后自动绑定 Key。"""
+        try:
+            account = str(account or "").strip()
+            password = "" if password is None else str(password)
+            if not account:
+                return {"ok": False, "msg": "请输入手机号或邮箱"}
+            if not password:
+                return {"ok": False, "msg": "请输入密码"}
+            login_result = tokenrhythm_auth.password_login(account, password)
+            return self._tr_finish_login(login_result)
+        except Exception as e:
+            logger.exception("tr_auth_password_login 失败")
+            return {"ok": False, "msg": str(e) or "登录失败，请稍后重试"}
+
+    def tr_auth_logout(self) -> Dict[str, Any]:
+        """退出基元律动账号：会先删掉登录时创建的专属 API Key，再清会话。
+
+        返回里带 key_deleted / had_key，前端据此决定提示「Key 已删除」还是
+        「删除失败，请去控制台手动清理」。
+        """
+        try:
+            result = dict(tokenrhythm_auth.logout() or {})
+            deleted = bool(result.get("key_deleted"))
+            providers_removed = int(result.get("providers_removed") or 0)
+            if result.get("had_key") and not deleted:
+                msg = "已退出基元律动账号，但专属 API Key 删除失败，请到基元律动控制台手动删除"
+            elif deleted and providers_removed:
+                msg = "已退出基元律动账号，专属 API Key 与模型配置已移除"
+            elif deleted:
+                msg = "已退出基元律动账号，该账号的专属 API Key 已删除"
+            elif providers_removed:
+                msg = "已退出基元律动账号，模型配置已移除"
+            else:
+                msg = "已退出基元律动账号"
+            return {
+                "ok": True,
+                "msg": msg,
+                "key_deleted": deleted,
+                "had_key": bool(result.get("had_key")),
+                "providers_removed": providers_removed,
+            }
+        except Exception as e:
+            logger.exception("tr_auth_logout 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 账号中心只读查询：充值（钱包流水）/ 用量明细 / 个人信息 / 调用日志
+    # 直接用已登录会话直连官方后台，前端原生弹窗展示，免去内嵌浏览器二次登录。
+    # ------------------------------------------------------------------
+    def tr_profile(self) -> Dict[str, Any]:
+        """个人信息：前端「个人信息」弹窗拉取。"""
+        try:
+            return dict(tokenrhythm_auth.user_profile() or {"ok": False, "msg": "未登录"})
+        except Exception as e:
+            logger.exception("tr_profile 失败")
+            return {"ok": False, "msg": str(e) or "获取个人信息失败"}
+
+    def tr_usage_detail(
+        self, range: str = "7d", page: int = 1, page_size: int = 20
+    ) -> Dict[str, Any]:
+        """用量明细：前端「用量」弹窗拉取（默认近 7 天）。"""
+        try:
+            result = dict(
+                tokenrhythm_auth.usage_detail(
+                    str(range or "7d"), int(page or 1), int(page_size or 20)
+                )
+                or {"ok": False, "msg": "未登录"}
+            )
+            return result
+        except Exception as e:
+            logger.exception("tr_usage_detail 失败")
+            return {"ok": False, "msg": str(e) or "获取用量明细失败"}
+
+    def tr_wallet_transactions(self) -> Dict[str, Any]:
+        """钱包流水：前端「充值 / 余额明细」弹窗拉取（充值、扣费、退款等）。
+
+        官方该接口是严格 schema 的无参 GET，任何分页参数都会 400，
+        因此桥层不透传分页（前端也不分页，一次拿服务端默认条数）。
+        """
+        try:
+            return dict(
+                tokenrhythm_auth.wallet_transactions()
+                or {"ok": False, "msg": "未登录"}
+            )
+        except Exception as e:
+            logger.exception("tr_wallet_transactions 失败")
+            return {"ok": False, "msg": str(e) or "获取钱包流水失败"}
+
+    def tr_call_logs(
+        self, page: int = 1, page_size: int = 20, status: str = ""
+    ) -> Dict[str, Any]:
+        """调用日志：前端「用量」弹窗的「调用记录」分页拉取。"""
+        try:
+            return dict(
+                tokenrhythm_auth.call_logs(
+                    int(page or 1), int(page_size or 20), str(status or "")
+                )
+                or {"ok": False, "msg": "未登录"}
+            )
+        except Exception as e:
+            logger.exception("tr_call_logs 失败")
+            return {"ok": False, "msg": str(e) or "获取调用日志失败"}
+
     def _resolve_provider_id(self, provider_ref: str) -> Optional[str]:
         """provider_ref 既可能是真实 id，也可能是前端回传的供应商名称。"""
         ref = str(provider_ref or "").strip()
@@ -9756,7 +11131,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 thread.start()
                 thread.join(timeout=remaining)
                 if thread.is_alive():
-                    last_msg = f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"
+                    last_msg = (
+                        f"连接超时（超过 {TEST_MODEL_TIMEOUT} 秒）"
+                        "，推理模型首次响应可能较慢，可稍后重试"
+                    )
                     continue
                 if outcome.get("ok"):
                     return {"ok": True, "msg": str(outcome.get("msg") or "连接成功")}

@@ -144,6 +144,34 @@ describe('GuiThemeSettings', () => {
     expect(wrapper.get('[data-test="region-workspace"]').classes()).not.toContain('active');
   });
 
+  it('unifies every text color from the global color tab', async () => {
+    const wrapper = mountThemeSettings({ active: userTheme() });
+
+    await wrapper.get('[data-test="unify-text_unify-hex"]').setValue('#123456');
+    await flushPromises();
+
+    // 4 个全局文字令牌 + 7 个分区的文字色一次性写成同一个颜色
+    const previewed = previewGuiTheme.mock.calls.at(-1)?.[0] as GuiTheme;
+    expect(previewed.tokens.text_primary).toBe('#123456');
+    expect(previewed.tokens.text_bright).toBe('#123456');
+    expect(previewed.tokens.text_secondary).toBe('#123456');
+    expect(previewed.tokens.text_faint).toBe('#123456');
+    for (const region of Object.values(previewed.regions)) {
+      expect(region.text).toBe('#123456');
+    }
+    // 刻意不动语义色：彩色按钮上的前景色跟着变会出现「绿字压蓝底」
+    expect(previewed.tokens.accent).toBe('#7867d9');
+    expect(previewed.tokens.danger).toBe('#d95656');
+  });
+
+  it('shows the unify picker only on the global tab', async () => {
+    const wrapper = mountThemeSettings({ active: userTheme() });
+    expect(wrapper.find('[data-test="unify-text_unify-hex"]').exists()).toBe(true);
+
+    await wrapper.get('[data-test="region-sidebar"]').trigger('click');
+    expect(wrapper.find('[data-test="unify-text_unify-hex"]').exists()).toBe(false);
+  });
+
   it('requires copying a built-in theme before editing', () => {
     const wrapper = mountThemeSettings({ active: builtinLight() });
 

@@ -551,3 +551,27 @@ it('宿主不支持内嵌浏览器时回退源码预览并提示', async () => {
   expect(notices.join('')).toContain('内嵌浏览器不可用');
   wrapper.unmount();
 });
+
+it('宿主不支持内嵌浏览器且请求非本地文件（path 为空）时回退系统浏览器', async () => {
+  vi.useFakeTimers();
+  const store = useAppStore();
+  const previewCalls: string[] = [];
+  const opened: string[] = [];
+  store.openFilePreview = (async (p: string) => { previewCalls.push(p); }) as any;
+  store.openExternalUrl = (async (u: string) => { opened.push(u); return true; }) as any;
+  store.notifyChat = (() => {}) as any;
+
+  const wrapper = await mountPane(true);
+  vi.advanceTimersByTime(BRIDGE_GRACE_MS + 1);
+  await nextTick();
+
+  // 账号控制台入口：只有 url 没有本地路径
+  store.browserNavRequest = { url: 'https://tokenrhythm.studio/account', path: '' };
+  store.browserNavNonce += 1;
+  await nextTick();
+
+  expect(opened).toEqual(['https://tokenrhythm.studio/account']);
+  // 不能拿空 path 去走源码预览（那只会弹一个读文件失败）
+  expect(previewCalls).toEqual([]);
+  wrapper.unmount();
+});

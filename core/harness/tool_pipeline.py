@@ -184,6 +184,12 @@ class ToolExecutionContext:
     # 注入的 HookRunner。默认 None 时 execute_decoded 不运行任何 hook、不产生任何
     # 附加消息，工具链行为与字节保持改造前完全一致（H-T16 硬约束）。
     hook_runner: object | None = None
+    # 断点续跑记录（S1-b）：可选的事件落库回调，签名 (kind: str, facts: dict) -> None。
+    # facts 只含哈希与元数据，绝不含参数原文或结果正文。默认 None 时事件流、
+    # 工具执行顺序与请求字节均与改造前完全一致。
+    journal_event_sink: Callable[[str, dict], None] | None = None
+    # 续跑打点用的 StepRuntime 句柄，仅用于写入 tool_call_count。默认 None 时不写库。
+    harness_step: object | None = None
 
 
 @dataclass(frozen=True)
@@ -403,6 +409,47 @@ def build_tool_result_event_draft(
     )
 
 
+def _journal_text_content(message) -> str:
+    """把工具结果消息的 content 归一化成文本，仅用于计算哈希（不保留正文）。"""
+    try:
+        content = message.get("content")
+    except Exception:
+        return ""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return str(content)
+
+
+def _journal_facts_for_call(prepared_call) -> dict:
+    """构造只含哈希与元数据的事实字典，绝不包含参数原文。"""
+    decoded = getattr(prepared_call, "decoded", None)
+    name = str(getattr(decoded, "name", "") or "")
+    raw_arguments = str(getattr(decoded, "raw_arguments", "") or "")
+    if not raw_arguments:
+        try:
+            raw_arguments = json.dumps(
+                getattr(decoded, "arguments", {}) or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            raw_arguments = ""
+    arguments_sha256 = None
+    if raw_arguments:
+        arguments_sha256 = hashlib.sha256(raw_arguments.encode("utf-8")).hexdigest()
+    return {
+        "tool_name": name,
+        "call_ordinal": int(getattr(prepared_call, "call_ordinal", -1)),
+        "arguments_sha256": arguments_sha256,
+    }
+
+
 class ToolBatchExecutor:
     """Execute adjacent safe tools concurrently and return model-ordered records."""
 
@@ -463,6 +510,17 @@ class ToolBatchExecutor:
     def _emit(on_event, kind, payload):
         if on_event is not None:
             on_event(kind, payload)
+
+    @staticmethod
+    def _emit_journal(context, kind, facts):
+        """把脱敏事实交给可选的 journal sink；sink 异常绝不影响工具执行。"""
+        sink = getattr(context, "journal_event_sink", None)
+        if sink is None:
+            return
+        try:
+            sink(kind, facts)
+        except Exception:
+            _LOGGER.warning("journal event sink failed for %s", kind, exc_info=True)
 
     @staticmethod
     def _raise_if_cancelled(cancel_event):
@@ -538,6 +596,9 @@ class ToolBatchExecutor:
                 "tool_started",
                 self.event_payload(prepared_call.decoded),
             )
+            facts = _journal_facts_for_call(prepared_call)
+            facts["started"] = True
+            self._emit_journal(context, "tool_started", facts)
 
     def execute_batch(self, batch, context, on_event):
         self._raise_if_cancelled(context.cancel_event)
@@ -576,15 +637,25 @@ class ToolBatchExecutor:
                 followup_messages=followup_messages,
             )
             records.append(record)
-            self._emit(
-                on_event,
-                "tool_finished",
-                self.finished_event_payload(
-                    prepared_call.decoded,
-                    message,
-                    duration_ms,
-                ),
+            finished_payload = self.finished_event_payload(
+                prepared_call.decoded,
+                message,
+                duration_ms,
             )
+            self._emit(on_event, "tool_finished", finished_payload)
+            # journal 事实独立于 finished_payload 计算：payload 允许被调用方注入成
+            # 携带完整结果的版本（GUI/CLI 需要），而 journal 只允许哈希与元数据。
+            facts = _journal_facts_for_call(prepared_call)
+            facts["result_sha256"] = hashlib.sha256(
+                _journal_text_content(message).encode("utf-8")
+            ).hexdigest()
+            facts["duration_ms"] = max(0, int(duration_ms))
+            facts["result_status"] = (
+                "ok"
+                if self.result_ok(prepared_call.decoded.name, message)
+                else "error"
+            )
+            self._emit_journal(context, "tool_finished", facts)
         return tuple(records)
 
     def execute(
@@ -594,8 +665,19 @@ class ToolBatchExecutor:
         on_event: Callable[[str, dict], None] | None,
     ) -> tuple[ToolExecutionRecord, ...]:
         records: list[ToolExecutionRecord] = []
+        total_calls = 0
 
         for batch in self.prepare(tool_calls, context):
+            # 续跑打点：记录本轮工具调用数（跨批累计——按批覆盖会在多批时
+            # 只剩最后一批的数目）。harness_step 默认 None 时不写库，因此
+            # 未接入续跑的场景行为与字节完全不变。
+            step = getattr(context, "harness_step", None)
+            total_calls += len(batch.calls)
+            if step is not None:
+                try:
+                    step.mark_tool_call_count(total_calls)
+                except Exception:
+                    _LOGGER.warning("mark_tool_call_count failed", exc_info=True)
             self.begin_batch(batch, context, on_event)
             records.extend(self.execute_batch(batch, context, on_event))
 
