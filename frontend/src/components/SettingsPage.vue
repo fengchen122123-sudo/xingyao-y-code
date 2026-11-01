@@ -1589,7 +1589,7 @@ const currentEntry = computed<ChangelogEntry | null>(() => {
 // ------------------------------------------------------------------
 // 联系我们页
 // ------------------------------------------------------------------
-const contactEmail = 'contact@example.com';
+const contactEmail = 'contact@xingyaocode.cn';
 const emailCopied = ref(false);
 const enlargedQr = ref<{ src: string; alt: string } | null>(null);
 let emailCopyTimer: ReturnType<typeof setTimeout> | null = null;

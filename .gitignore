@@ -73,6 +73,11 @@ zip/
 # Build logs
 build_log.txt
 
+# 根目录临时日志与草稿（不入库）
+# 注意：/*.log 只匹配仓库根目录，不要写成 *.log，否则会误伤 assets 等子目录中的正常文件
+/*.log
+/*.txt.tmp
+
 # DB debug exports (temporary debug dumps)
 db_*.txt
 
@@ -142,6 +147,8 @@ publish_*.log
 .ycode_tasks/
 
 # One-off design exploration mockups (prototypes, not shipped)
+# 实际目录名为 mockups/，design_mockups/ 为旧名，两者都忽略
+mockups/
 design_mockups/
 
 # 公众号内容工作区（本地草稿与配图，不入库）
@@ -163,9 +170,26 @@ gzh-loomy/
 # —— 与 docs/computer-audit-* 系列同类
 docs/电脑操控审计与修复方案*
 
+# 内部开发方案草稿（不公开）
+/待开发/
+
+# docs 顶层其余内部审计/交接数据与临时工作文档（已从索引移除，规则防止再次入库）
+docs/computer-soak-*.json
+docs/computer-local-benchmark.json
+docs/computer-model-loop-benchmark.json
+docs/computer-apps-matrix.json
+docs/2026-10-23-computer-efficiency-report.md
+docs/2026-10-27-edit-message-and-release-review-todo.md
+docs/对话可操作性审计-*.md
+docs/opensquilla-可借鉴方案-*.md
+docs/task.md
+
 # JVM 崩溃转储（保底规则：GPU/OCR 等 Java 依赖崩溃时会写在工作目录根部，不入库）
 hs_err_pid*.log
 replay_pid*.log
 
 # 一次性开发补丁脚本（含内部实现细节，不入库）
 _patch_tr_*.py
+
+# 第三方平台接口逆向清单（本地参考，不公开）
+skills/tokenrhythm-account/reference.md

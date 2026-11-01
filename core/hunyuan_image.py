@@ -25,10 +25,7 @@ from pathlib import Path
 
 from core.tool_protocol import ToolResult
 
-_API_URL = (
-    "https://example-env-id.api.example.invalid"
-    "/v1/functions/example-function"
-)
+_API_URL = os.environ.get("HUNYUAN_IMAGE_ENDPOINT", "")
 
 # Server API Key 仅从本机环境变量读取，不写入发布包。
 VALID_SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280")
@@ -36,6 +33,11 @@ VALID_SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280")
 def _resolve_api_key() -> str:
     """解析生图 Server API Key：仅从环境变量 HUNYUAN_API_KEY 读取。"""
     return os.environ.get("HUNYUAN_API_KEY", "").strip()
+
+
+def _resolve_api_url() -> str:
+    """解析生图接口地址：优先取调用时的 HUNYUAN_IMAGE_ENDPOINT，其次导入时的值。"""
+    return os.environ.get("HUNYUAN_IMAGE_ENDPOINT", _API_URL).strip()
 
 # 图生图（垫图）模式使用的模型；传入 image 参数时自动切换，文生图不指定模型
 _I2I_MODEL = "HY-Image-v3.0-I2I-ToB-v1.0.1"
@@ -75,6 +77,12 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = 
     api_key = _resolve_api_key()
     if not api_key:
         return ToolResult("缺少 HUNYUAN_API_KEY：请在本机配置 CloudBase Server API Key。", is_error=True)
+    api_url = _resolve_api_url()
+    if not api_url:
+        return ToolResult(
+            "缺少 HUNYUAN_IMAGE_ENDPOINT：请在本机配置生图接口地址（CloudBase 生图网关 URL）。",
+            is_error=True,
+        )
     payload = {"prompt": prompt, "size": size}
     if footnote is not None:
         payload["footnote"] = footnote
@@ -89,7 +97,7 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = 
         payload["model"] = _I2I_MODEL
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        _API_URL,
+        api_url,
         data=body,
         headers={
             "Content-Type": "application/json",

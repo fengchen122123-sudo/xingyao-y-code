@@ -29,11 +29,11 @@ import paramiko
 # ---------------------------------------------------------------------------
 # 默认配置（可通过命令行参数覆盖）
 # ---------------------------------------------------------------------------
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 22
-DEFAULT_USER = "ubuntu"
-DEFAULT_REMOTE_ROOT = "/var/www/example"
-DEFAULT_SITE_URL = "https://xingyaocode.cn/"
+DEFAULT_HOST = os.environ.get("DEPLOY_HOST", "")
+DEFAULT_PORT = int(os.environ.get("DEPLOY_PORT") or "22")
+DEFAULT_USER = os.environ.get("DEPLOY_USER", "")
+DEFAULT_REMOTE_ROOT = os.environ.get("DEPLOY_REMOTE_ROOT", "")
+DEFAULT_SITE_URL = os.environ.get("DEPLOY_SITE_URL", "")
 DEFAULT_SITE_KEYWORD = "星瑶Code"
 
 # 本地源目录：基于本脚本位置定位，避免写死绝对路径
@@ -51,8 +51,30 @@ def error(msg: str) -> None:
     print(f"[ERROR] {msg}", file=sys.stderr)
 
 
+def validate_config(args: argparse.Namespace, skip_verify: bool) -> None:
+    """校验必需配置；缺失时给出明确中文报错并退出，避免用空值去连接。"""
+    missing: list[str] = []
+    if not (args.host or "").strip():
+        missing.append("DEPLOY_HOST（远程主机地址，也可用 --host 指定）")
+    if not (args.user or "").strip():
+        missing.append("DEPLOY_USER（SSH 用户名，也可用 --user 指定）")
+    if not (args.remote_root or "").strip():
+        missing.append(
+            "DEPLOY_REMOTE_ROOT（远程站点根目录，也可用 --remote-root 指定）"
+        )
+    if not skip_verify and not (DEFAULT_SITE_URL or "").strip():
+        missing.append(
+            "DEPLOY_SITE_URL（公网验证地址，也可用 --skip-verify 跳过验证）"
+        )
+    if missing:
+        error("缺失必需配置，请通过环境变量或命令行参数提供：")
+        for item in missing:
+            error(f"  - 未配置 {item}")
+        sys.exit(1)
+
+
 def parse_args() -> argparse.Namespace:
-    """解析命令行参数，默认值即真实生产配置。"""
+    """解析命令行参数，默认值取自环境变量（未配置时为空）。"""
     parser = argparse.ArgumentParser(
         description="一键同步星瑶Code 官网静态文件到远程服务器并校验。"
     )
@@ -202,6 +224,7 @@ def verify_public_site(url: str, keyword: str) -> bool:
 
 def main() -> int:
     args = parse_args()
+    validate_config(args, args.skip_verify)
     password = resolve_password()
     rel_paths = collect_files(args.local_dir)
 
