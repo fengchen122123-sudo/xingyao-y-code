@@ -6,6 +6,7 @@ import os
 import shutil
 import threading
 import time
+import traceback
 from copy import deepcopy
 
 from core.credentials import DPAPI_PREFIX, KEYRING_PREFIX, protect_secret, unprotect_secret
@@ -59,15 +60,91 @@ def _restore_after_read(path, data):
     return _transform_api_keys(data, _unprotect_api_key_safely)
 
 
+# 历史备份保留份数：够回溯到「坏数据出现之前」即可，避免无限增长
+_HISTORY_BACKUP_KEEP = 10
+
+
+def _history_backup_path(path):
+    """为 ``path + ".bak"`` 生成一份不重名的历史备份名：``config.json.bak.YYYYmmdd-HHMMSS``。
+
+    必须保持 ``.bak.`` 点分形式：``_recover_from_history_backups`` 用
+    ``glob(path + ".bak.*")`` 找历史备份，换成其它分隔符就再也找不到。
+    同一秒内多次写入时时间戳会相同，此时追加毫秒和递增序号，绝不覆盖已有历史备份
+    （否则「同一秒连续写两次」只留一份，等于把轮转退化成单备份）。
+    """
+    base = f"{path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+    if not os.path.exists(base):
+        return base
+    millis = f"{int(time.time() * 1000) % 1000:03d}"
+    candidate = f"{base}-{millis}"
+    index = 1
+    while os.path.exists(candidate):
+        candidate = f"{base}-{millis}-{index}"
+        index += 1
+    return candidate
+
+
+def _prune_history_backups(path, keep=_HISTORY_BACKUP_KEEP):
+    """只保留最近 ``keep`` 份历史备份（按 mtime 倒序），更早的删掉。"""
+    try:
+        candidates = [item for item in glob.glob(path + ".bak.*") if os.path.isfile(item)]
+        if len(candidates) <= keep:
+            return
+        candidates.sort(key=lambda item: (os.path.getmtime(item), item), reverse=True)
+        for stale in candidates[keep:]:
+            try:
+                os.remove(stale)
+            except OSError as error:
+                _log_warning("历史备份 %s 清理失败（%s）", os.path.basename(stale), error)
+    except OSError as error:
+        _log_warning("历史备份清理失败（%s），本次跳过清理", error)
+
+
+def _rotate_history_backup(path, backup_path):
+    """覆盖 .bak 前，先把上一份合法 .bak 转存成带时间戳的历史备份。
+
+    事故教训：单一 .bak 每次写盘都被覆盖，主文件被写成残缺内容时 .bak 也同步变残缺，
+    恢复源和主文件一起坏掉，「从备份恢复」形同虚设。转存/清理失败一律只告警，
+    绝不影响主写入流程。
+    """
+    try:
+        if not os.path.exists(backup_path):
+            return
+        with open(backup_path, "r", encoding="utf-8") as f:
+            json.load(f)  # 只校验可解析：已损坏的 .bak 没有转存价值
+    except Exception as error:  # noqa: BLE001
+        _log_warning("%s 未转存为历史备份（%s）", os.path.basename(backup_path), error)
+        return
+    target = _history_backup_path(path)
+    try:
+        shutil.copy2(backup_path, target)
+    except Exception as error:  # noqa: BLE001
+        _log_warning("历史备份转存失败（%s），本次仅保留单份 .bak", error)
+        return
+    _prune_history_backups(path)
+
+
 def _backup_if_valid(path):
-    """仅在当前文件是合法 JSON 时刷新 .bak 备份，保证备份始终是最近一份可用配置。"""
+    """仅在当前文件是合法 JSON 时刷新 .bak 备份，保证备份始终是最近一份可用配置。
+
+    覆盖 .bak 之前先把旧的合法 .bak 转存成 ``config.json.bak.YYYYmmdd-HHMMSS``
+    历史备份，让「备份跟着主文件一起坏」也有更早的恢复源可用。
+    """
+    # 调用方可能传 pathlib.Path（ui_layout / permission_store 等），统一成 str
+    path = os.fspath(path)
+    backup_path = path + ".bak"
     try:
         with open(path, "r", encoding="utf-8") as f:
             existing = json.load(f)
-        with open(path + ".bak", "w", encoding="utf-8") as backup:
+    except Exception:  # noqa: BLE001
+        # 主文件自己就读不出来时没有可信内容可备份，保持原语义直接跳过
+        return
+    _rotate_history_backup(path, backup_path)
+    try:
+        with open(backup_path, "w", encoding="utf-8") as backup:
             json.dump(_prepare_for_storage(path, _restore_after_read(path, existing)), backup, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    except Exception as error:  # noqa: BLE001
+        _log_warning("%s 备份写入失败（%s），本次仅写主文件", os.path.basename(backup_path), error)
 
 
 def _log_warning(message, *args):
@@ -79,19 +156,29 @@ def _log_warning(message, *args):
 
 
 def _config_read_failed(path):
-    """主文件存在且有内容，但解析不出 JSON：属于「读失败」，不是首次运行。
+    """主文件存在但读不到用户数据：属于「读失败」，不是首次运行。
 
     写路径用它做最后一道闸：读不出来时宁可拒绝保存，也不能拿空配置覆盖用户数据
     （历史事故：读失败 → load_config 写默认 → 17 个厂商配置被 1 个默认厂商替换）。
+
+    「读失败」的判定口径（三者等价，都是「磁盘上拿不到用户数据」）：
+      - 文件有内容但解析不出 JSON（合法损坏）；
+      - 文件存在但 0 字节：空文件只可能是截断/异常残留，写路径若拿空 dict 顶替，
+        单键保存就会把文件覆盖成只剩这一个键；
+      - 能解析但顶层不是 dict，或顶层是空对象 ``{}``：正常写入的配置至少含
+        providers 或 active_model_id，空对象同样意味着「用户数据没读到」。
+    文件**不存在**仍返回 False（真首次运行，允许写默认结构）。
     """
     try:
-        if not os.path.exists(path) or os.path.getsize(path) == 0:
+        if not os.path.exists(path):
             return False
+        if os.path.getsize(path) == 0:
+            return True
         with open(path, "r", encoding="utf-8") as f:
-            json.load(f)
-        return False
+            parsed = json.load(f)
     except (OSError, json.JSONDecodeError):
         return True
+    return not isinstance(parsed, dict) or not parsed
 
 
 def _quarantine_corrupt_config(path):
@@ -162,9 +249,82 @@ def _recover_from_history_backups(path):
     return None
 
 
+# 写入诊断埋点：只记结构/数量/调用方，绝不记录 api_key 等密钥内容
+_CONFIG_WRITE_LOGGER = "ycode.config_write"
+_DIAG_CALLER_DEPTH = 3
+
+
+def _diag_snapshot(data):
+    """取配置诊断快照：providers 数量与 active_model_id（不含任何密钥）。"""
+    if not isinstance(data, dict):
+        return {"providers": None, "active_model_id": None}
+    providers = data.get("providers")
+    return {
+        "providers": len(providers) if isinstance(providers, list) else None,
+        "active_model_id": data.get("active_model_id"),
+    }
+
+
+def _diag_disk_snapshot(path):
+    """写入前磁盘上的配置快照；读不出来时各字段为 None（表示"未知"，不是"0 个"）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _diag_snapshot(json.load(f))
+    except Exception:  # noqa: BLE001
+        return {"providers": None, "active_model_id": None}
+
+
+def _diag_callers(limit=_DIAG_CALLER_DEPTH):
+    """最近 N 层非本文件的调用帧，格式 "file:line in func"（由外到内）。"""
+    frames = []
+    try:
+        for frame in reversed(traceback.extract_stack()[:-1]):
+            if os.path.basename(frame.filename) == os.path.basename(__file__):
+                continue
+            frames.append(f"{frame.filename}:{frame.lineno} in {frame.name}")
+            if len(frames) >= limit:
+                break
+    except Exception:  # noqa: BLE001
+        return []
+    return list(reversed(frames))
+
+
+def _diag_write(path, before, after):
+    """记录一次结构化写入诊断；仅在 providers 减少/清零时升级为 WARNING。"""
+    try:
+        payload = (
+            "%s 写入诊断：providers %s -> %s，active_model_id %r -> %r，调用方 %s",
+            os.path.basename(path),
+            before.get("providers"),
+            after.get("providers"),
+            before.get("active_model_id"),
+            after.get("active_model_id"),
+            _diag_callers(),
+        )
+        logging.getLogger(_CONFIG_WRITE_LOGGER).debug(*payload)
+        before_n, after_n = before.get("providers"), after.get("providers")
+        shrunk = before_n is not None and after_n is not None and after_n < before_n
+        emptied = after_n == 0 and before_n != 0
+        if shrunk or emptied:
+            _log_warning(*payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _atomic_write_json(path, data, indent=2):
-    """原子写 JSON：临时文件 + os.replace，写前刷新 .bak，避免写一半崩溃损坏配置。"""
+    """原子写 JSON：临时文件 + os.replace，写前刷新 .bak，避免写一半崩溃损坏配置。
+
+    写入前后各取一次诊断快照（providers 数量 / active_model_id / 调用方栈），
+    正常写入走 debug，providers 减少或清零才升 WARNING，便于事后定位是谁写坏的。
+    """
     tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    diag_before = _diag_disk_snapshot(path)
+    diag_after = _diag_snapshot(data)
+    diag_enabled = (
+        diag_before["providers"] is not None
+        or diag_after["providers"] is not None
+        or "active_model_id" in (data if isinstance(data, dict) else {})
+    )
     try:
         stored_data = _prepare_for_storage(path, data)
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -182,6 +342,8 @@ def _atomic_write_json(path, data, indent=2):
                 os.remove(tmp_path)
         except OSError:
             pass
+        if diag_enabled:
+            _diag_write(path, diag_before, diag_after)
 
 
 _CONFIG_CACHE: dict[str, dict] = {}
@@ -225,6 +387,23 @@ def _read_json_with_backup(path, default=None):
                 cache_entry["data"] = data
             return _copy_cached(data)
     except FileNotFoundError:
+        # 主文件被删/被移走同样属于"读失败"：只要还有可用备份就不是首次运行，
+        # 必须先恢复，否则 load_config 会当成首启、用默认结构覆盖用户配置。
+        data = _recover_from_history_backups(path)
+        if _backup_data_usable(data, _expected_json_root_type(path)):
+            _log_warning(
+                "%s 主文件缺失，已从备份恢复（有可用备份即视为非首次运行）",
+                os.path.basename(path),
+            )
+            try:
+                with _CONFIG_LOCK:
+                    _atomic_write_json(path, data)
+            except Exception as error:  # noqa: BLE001
+                _log_warning(
+                    "%s 从备份恢复后回写失败（%s），本次仅在内存中使用备份内容",
+                    os.path.basename(path), error,
+                )
+            return data
         return default
     except (json.JSONDecodeError, OSError):
         # 主文件坏了：先留现场副本，再从 .bak / 历史备份里找一份可用的回写自愈。
@@ -481,13 +660,30 @@ def __getattr__(name):
     raise AttributeError(f"module 'config' has no attribute {name!r}")
 
 
-def update_config(mutator):
+def _providers_wiped(before, after) -> bool:
+    """写入前厂商非空、写入后变成空/缺失：视为数据被抹掉，拒绝落盘。
+
+    历史事故：残缺数据（空对象/零字节/被删）经 load 拿到近似空配置后再保存单键，
+    会把用户全部厂商一次性清掉，随后插件自举重建出"只剩 3 个厂商"的假象。
+    """
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    before_providers = before.get("providers")
+    if not isinstance(before_providers, list) or not before_providers:
+        return False
+    after_providers = after.get("providers")
+    return not isinstance(after_providers, list) or not after_providers
+
+
+def update_config(mutator, *, allow_provider_wipe: bool = False):
     """在进程内锁中执行 load→mutate→原子写，消除读-改-写竞态（TOCTOU 丢失更新）。
 
     mutator 接收当前配置 dict：原地修改后返回 None，或返回一个全新的 dict 作为写入内容。
     返回值为实际写入的配置 dict。mutator 改动了同时被 config.toml 覆盖的键时，
     写入运行时告警（TOML 读取时后合并，实际生效值仍以 TOML 为准）。
     受管策略锁定的键（permission_mode 超上限）变更被拒绝（回退写入前值）并提示。
+    allow_provider_wipe 仅给『用户明确删除最后一个厂商』这类路径使用，
+    其余调用一律拒绝把 providers 写空（防止残缺配置把用户厂商一次性抹掉）。
     """
     with _CONFIG_LOCK:
         data = _load(managed=False)
@@ -501,6 +697,12 @@ def update_config(mutator):
         if result is not None:
             data = result
         data, _rejected = enforce_managed_writes(data, before)
+        if not allow_provider_wipe and _providers_wiped(before, data):
+            _log_warning(
+                "拒绝写入：本次保存会把全部厂商（%d 个）清空，已保留原配置",
+                len(before.get("providers") or []),
+            )
+            return before
         _atomic_write_json(_CONFIG_FILE, data)
     changed_keys = {
         key
@@ -529,6 +731,12 @@ def save_config_value(key, value):
             before = dict(data) if isinstance(data, dict) else {}
             data[key] = value
             data, rejected = enforce_managed_writes(data, before)
+            if _providers_wiped(before, data):
+                _log_warning(
+                    "拒绝写入 %r：本次保存会把全部厂商（%d 个）清空，已保留原配置",
+                    key, len(before.get("providers") or []),
+                )
+                return False
             _atomic_write_json(_CONFIG_FILE, data)
         _warn_toml_overridden_keys([key])
         return key not in rejected

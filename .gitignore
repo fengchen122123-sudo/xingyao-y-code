@@ -193,3 +193,7 @@ _patch_tr_*.py
 
 # 第三方平台接口逆向清单（本地参考，不公开）
 skills/tokenrhythm-account/reference.md
+
+# 误操作产生的临时文件（命令重定向写坏 / 空文件），不入库
+/a.txt
+/y

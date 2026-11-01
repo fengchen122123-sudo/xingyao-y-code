@@ -190,7 +190,10 @@
           :result="auditResult"
           :loading="auditLoading"
           :error="auditError"
+          :fixing="auditFixing"
           @run="runAudit()"
+          @fix="fixFromAudit"
+          @fix-all="fixAllFromAudit"
         />
       </div>
 
@@ -242,6 +245,7 @@ import NovelAuditPanel from './NovelAuditPanel.vue';
 import NovelDocViewer from './NovelDocViewer.vue';
 import type {
   NovelAuditDto,
+  NovelAuditFindingDto,
   NovelDocReadDto,
   NovelStatusDto,
   NovelWorkbenchCharacterDto,
@@ -576,6 +580,8 @@ const settingTab = ref<'foreshadow' | 'character' | 'volume'>('foreshadow');
 const auditResult = ref<NovelAuditDto | null>(null);
 const auditLoading = ref(false);
 const auditError = ref('');
+// 修复入口只是把指令填进输入框（同步完成）：短暂上锁，避免连点重复预填
+const auditFixing = ref(false);
 const docTitle = ref('');
 const docData = ref<NovelDocReadDto | null>(null);
 const docLoading = ref(false);
@@ -687,6 +693,104 @@ async function runAudit() {
   } finally {
     if (seq === auditSeq) auditLoading.value = false;
   }
+}
+
+// ---- 审查结论 → 修复入口：只把问题拼成对话指令预填进输入框，不在面板里直接改文件 ----
+
+// 五种检查项（后端 AUDIT_TYPES）各自的修复方向；未知 type 落到通用兜底文案
+const AUDIT_FIX_HINTS: Record<string, string> = {
+  foreshadow_overdue:
+    '核对伏笔台账的埋设章、计划回收章与最新已提交章，补齐回收计划或按正文实际回收并更新状态；不要为消除告警而伪造回收。',
+  ai_patterns: '按《设定/文风.md》与禁用词表替换或改写，保留原意与叙述节奏。',
+  chapter_wordcount: '按细纲字数目标补写该章（先看细纲，只补该章）。',
+  outline_gap: '补写缺失的细纲。',
+  tracking_state: '把正文与追踪状态对齐（缺哪章补哪章的事务）。',
+};
+
+// 分组顺序：固定按后端检查项顺序排，组内保持 findings 原顺序
+const AUDIT_TYPE_ORDER = ['tracking_state', 'foreshadow_overdue', 'chapter_wordcount', 'outline_gap', 'ai_patterns'];
+
+function auditTypeLabel(type: unknown): string {
+  const key = String(type || '').trim();
+  return key || '未标注类型';
+}
+
+function auditFixHint(type: string): string {
+  return AUDIT_FIX_HINTS[String(type || '').trim()] || '按审查结论逐条核对原文后修正。';
+}
+
+// 预填与提示都是同步的：短暂上锁只为挡住连点造成的重复预填
+function tryLockAuditFix(): boolean {
+  if (auditFixing.value) return false;
+  auditFixing.value = true;
+  window.setTimeout(() => {
+    auditFixing.value = false;
+  }, 800);
+  return true;
+}
+
+// 单条修复：原样带上级别/类型/文件/问题全文，只动这一处
+function fixFromAudit(finding: NovelAuditFindingDto) {
+  const workdir = currentWorkdir();
+  if (!workdir || !tryLockAuditFix()) return;
+  const level = String(finding?.level || '').trim() || '未标注级别';
+  const type = auditTypeLabel(finding?.type);
+  const file = String(finding?.file || '').trim() || '（未标注文件）';
+  const message = String(finding?.message || '').trim() || '（后端没有给出问题描述）';
+  const text = [
+    `在小说项目（${workdir}）里，修复一致性审查发现的这条问题：`,
+    '',
+    `- 级别：${level}`,
+    `- 类型：${type}`,
+    `- 文件：${file}`,
+    `- 问题：${message}`,
+    '',
+    `本条修复方向：${auditFixHint(type)}`,
+    '请先读原文核对证据，只做最小改动；改完请重跑一致性审查（scope=chapter）确认该类问题消失，' +
+      '不要改动与本条无关的内容。',
+  ].join('\n');
+  store.prefillComposer(text);
+  store.notifyChat('已把这条问题的修复指令填进输入框，确认后回车发送');
+}
+
+// 全部修复：按 type 分组汇总当前审查结论，逐组给修复方向，一次交给星瑶
+function fixAllFromAudit() {
+  const workdir = currentWorkdir();
+  const findings = Array.isArray(auditResult.value?.findings) ? auditResult.value.findings : [];
+  if (!workdir || findings.length === 0 || !tryLockAuditFix()) return;
+  const groups = new Map<string, NovelAuditFindingDto[]>();
+  for (const finding of findings) {
+    const key = auditTypeLabel(finding?.type);
+    const list = groups.get(key);
+    if (list) list.push(finding);
+    else groups.set(key, [finding]);
+  }
+  const orderedKeys = [
+    ...AUDIT_TYPE_ORDER.filter((key) => groups.has(key)),
+    ...[...groups.keys()].filter((key) => !AUDIT_TYPE_ORDER.includes(key)),
+  ];
+  const lines: string[] = [
+    `在小说项目（${workdir}）里，修复最近一次一致性审查发现的问题（共 ${findings.length} 条，按类型分组）：`,
+  ];
+  for (const key of orderedKeys) {
+    const items = groups.get(key) ?? [];
+    lines.push('', `## ${key}（${items.length} 条）`);
+    for (const item of items) {
+      const level = String(item?.level || '').trim() || '未标注级别';
+      const file = String(item?.file || '').trim() || '（未标注文件）';
+      const message = String(item?.message || '').trim() || '（后端没有给出问题描述）';
+      lines.push(`- [${level}] ${file}：${message}`);
+    }
+    lines.push(`修复方向：${auditFixHint(key)}`);
+  }
+  lines.push(
+    '',
+    '逐组处理，每处理完一组报一次进度；遇到需要作者拍板的口径冲突先列出来不要直接改。',
+    '每组都先读原文核对证据，只做最小改动，不要改动与这些问题无关的内容。',
+    '全部处理完请重跑一致性审查（scope=chapter）确认这些条目消失。',
+  );
+  store.prefillComposer(lines.join('\n'));
+  store.notifyChat('已把全部问题的修复指令填进输入框，确认后回车发送');
 }
 
 // 点卷纲：拼相对项目根的 posix 路径读文档；失败也打开浮层，在浮层里显示错误

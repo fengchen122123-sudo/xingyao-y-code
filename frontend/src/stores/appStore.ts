@@ -1,6 +1,10 @@
 import { defineStore } from 'pinia';
 // Git 工作台事件转发（git_state_changed）；gitStore 不反向依赖 appStore，无环
 import { useGitStore } from './gitStore';
+// 画布事件转发（canvas_focus_node）与生图产出识别：canvas store 只依赖 pinia，
+// 不反向依赖 appStore，静态 import 不会成环（与上面 gitStore 同一套权衡：
+// 惰性 require 反而让「谁依赖谁」在编译期看不见）
+import { useCanvasStore } from './canvas';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
@@ -37,6 +41,8 @@ import type {
   ComputerActionTrace,
   ComputerControlEvent,
   ComputerRunSnapshot,
+  FfmpegComponentStatus,
+  SearchComponentStatus,
   PlaywrightComponentStatus,
   PyWebViewAPI,
   ToolStartEventData,
@@ -100,6 +106,84 @@ import {
   DISCLAIMER_VERSION,
   isDisclaimerVersionAccepted,
 } from '../data/disclaimer';
+
+// 生图类工具白名单：只有这三个工具的结果文本里出现本地图片路径才进「最近产出」。
+// 为什么是白名单而不是全量扫描：read_file / grep / 代码编辑的结果里也常出现
+// 图片路径，那些不是「刚生成的产出」，全量扫会把托盘刷成历史文件列表
+const IMAGE_OUTPUT_TOOL_NAMES = new Set([
+  'hunyuan_generate_image',
+  'tokenrhythm_generate_image',
+  'tokenrhythm_edit_image',
+]);
+
+/**
+ * 改图类工具：只有它们的产出能认领「送去修改」的源节点。
+ * 生图工具是凭空出图，若也去认领，会给一张全新的图造出假的溯源关系。
+ */
+const IMAGE_EDIT_TOOL_NAMES = new Set(['tokenrhythm_edit_image']);
+
+// 从工具结果文本里抠本地图片路径，覆盖后端实际产出的两种形态：
+// 1) Markdown：`![生成的图片](C:\dir\hunyuan_20251101_104500.png)`
+//    —— core/hunyuan_image.py 与 plugins/tokenrhythm_image/plugin.py 结尾都要求
+//    模型用这种语法把图展示出来，所以它一定在结果文本里
+// 2) 纯文本：`图片已生成并保存：C:\dir\x.png`（生图）
+//    与 `图片已改图并保存：C:\dir\x.png`（tokenrhythm_edit_image 的文案不同，
+//    所以「生成」与「改图」两个字样都要认，否则改图产出永远进不了托盘）
+//
+// 路径字符类特意用 [^()\n\r] 而不是 \S：Windows 路径允许空格，用户目录里
+// 中文名 + 空格都常见，用 \S 会在第一个空格处截断，拿到一个不存在的路径
+const MARKDOWN_IMAGE_RE = /!\[[^\]]*\]\(\s*([^()\n\r]+?)\s*\)/g;
+const PLAIN_IMAGE_RE = /图片已(?:生成|改图)并保存[:：]\s*([^\n\r]+)/g;
+// 只认图片扩展名：同一行后面可能还跟着 URL、耗时、费用等文字，靠扩展名兜住
+const LOCAL_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|gif|bmp)$/i;
+
+/** 抽出文本里的本地图片路径（去重、保序）；网络地址不算本地产出 */
+function extractLocalImagePaths(text: string): string[] {
+  const out: string[] = [];
+  const push = (rawPath: string) => {
+    // 去掉可能包裹路径的引号/尖括号后再判断扩展名
+    const path = rawPath.trim().replace(/^["'`<]+/, '').replace(/["'`>]+$/, '').trim();
+    if (!path) return;
+    // 生图结果里也有远端 imageUrl（24 小时有效），它不会被归档，跳过
+    if (/^https?:\/\//i.test(path)) return;
+    if (!LOCAL_IMAGE_EXT_RE.test(path)) return;
+    if (!out.includes(path)) out.push(path);
+  };
+  // 两个模块级正则都带 g：复用前先复位游标，否则第二次调用会从上次位置继续
+  for (const re of [MARKDOWN_IMAGE_RE, PLAIN_IMAGE_RE]) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null = re.exec(text);
+    while (m !== null) {
+      push(m[1] || '');
+      m = re.exec(text);
+    }
+  }
+  return out;
+}
+
+/**
+ * 生图工具收尾：把结果里的图片路径送进画布「最近产出」托盘。
+ * 只入托盘、绝不自动 addNode——工具吐几张图就往画布上铺几张，会把用户
+ * 精心摆好的构图冲散；要哪张由用户自己点。调用方负责 try/catch。
+ */
+function collectGeneratedImages(toolName: string, resultText: string): void {
+  if (!IMAGE_OUTPUT_TOOL_NAMES.has(toolName)) return;
+  if (!resultText) return;
+  const paths = extractLocalImagePaths(resultText);
+  if (!paths.length) return;
+  const canvas = useCanvasStore();
+  // 认领「刚刚送去修改」的源节点：命中时画布层会把产出直接落成源图的下游节点
+  // 并连一条「改图」边，溯源关系因此看得见也存得下
+  const source = IMAGE_EDIT_TOOL_NAMES.has(toolName) ? canvas.pendingEditSource : null;
+  for (const path of paths) {
+    canvas.pushRecentOutput(
+      source ? { path, sourceNodeId: source.nodeId, sourceTitle: source.title } : { path },
+    );
+  }
+  // 一次改图只认领一次：同一批多张图都算这次产物，认完即清，
+  // 否则后面无关的产出会被挂到这张源图下面
+  if (source) canvas.clearEditSource();
+}
 
 /**
  * 面板宽度启动恢复：读取 localStorage 中上次拖拽记忆的宽度，
@@ -678,6 +762,36 @@ export const useAppStore = defineStore('app', {
       stage: '',
       dir: '',
     } as PlaywrightComponentStatus,
+
+    // ffmpeg 按需组件（背景图转换依赖）：安装包不再内置 ffmpeg，转换页
+    // 「视频转换组件」卡片按需下载。口径与 playwrightComponent 完全一致——
+    // 真值一律以后端快照覆盖，进度经 ffmpeg_component_progress 桥事件增量合并
+    ffmpegComponent: {
+      installed: false,
+      version: '',
+      downloading: false,
+      percent: 0,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      error: '',
+      stage: '',
+      dir: '',
+    } as FfmpegComponentStatus,
+
+    // 网页搜索按需组件（ddgs 链路）：安装包不再内置 ddgs/primp/lxml/fake_useragent，
+    // web_search 工具按需下载组件后才能用。口径与前两个组件完全一致——
+    // 真值一律以后端快照覆盖，进度经 search_component_progress 桥事件增量合并
+    searchComponent: {
+      installed: false,
+      version: '',
+      downloading: false,
+      percent: 0,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      error: '',
+      stage: '',
+      dir: '',
+    } as SearchComponentStatus,
 
     // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
     reasoning: {
@@ -3344,6 +3458,124 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // ── ffmpeg 按需组件（背景图转换依赖）：结构与 playwright 三兄弟逐一对齐，
+    //    失败提示统一挂「视频转换组件」标题；进度由 ffmpeg_component_progress
+    //    事件增量合并，错误不回滚已下载字节 ──
+
+    async refreshFfmpegComponentStatus(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.get_ffmpeg_component_status();
+        if (result && result.component) this.ffmpegComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('视频转换组件', '读取组件状态失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('视频转换组件', '读取组件状态失败: ' + err);
+        return false;
+      }
+    },
+
+    async downloadFfmpegComponent(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.download_ffmpeg_component();
+        if (result && result.component) this.ffmpegComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('视频转换组件', '下载组件失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        // 桥返回即表示下载任务已受理（真下载在后台线程），这里不改下载态：
+        // downloading/percent 一律等 ffmpeg_component_progress 事件推动
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('视频转换组件', '下载组件失败: ' + err);
+        return false;
+      }
+    },
+
+    async cancelFfmpegComponentDownload(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.cancel_ffmpeg_component_download();
+        if (result && result.component) this.ffmpegComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('视频转换组件', '取消下载失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('视频转换组件', '取消下载失败: ' + err);
+        return false;
+      }
+    },
+
+    // ── 网页搜索按需组件（ddgs 链路）：第三个组件，结构与前两个逐一对齐，
+    //    失败提示统一挂「网页搜索组件」标题；进度由 search_component_progress
+    //    事件增量合并，错误不回滚已下载字节 ──
+
+    async refreshSearchComponentStatus(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.get_search_component_status();
+        if (result && result.component) this.searchComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('网页搜索组件', '读取组件状态失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('网页搜索组件', '读取组件状态失败: ' + err);
+        return false;
+      }
+    },
+
+    async downloadSearchComponent(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.download_search_component();
+        if (result && result.component) this.searchComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('网页搜索组件', '下载组件失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('网页搜索组件', '下载组件失败: ' + err);
+        return false;
+      }
+    },
+
+    async cancelSearchComponentDownload(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.cancel_search_component_download();
+        if (result && result.component) this.searchComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('网页搜索组件', '取消下载失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('网页搜索组件', '取消下载失败: ' + err);
+        return false;
+      }
+    },
+
     // ── 电脑操控运行态（Task 13b，设计 16.4）：
     //    纯事件 reducer + Bridge 快照校准 + 暂停/恢复/停止控制 ──
 
@@ -5016,6 +5248,37 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.bgConvert.outputDir = info.path.replace(/[\\/][^\\/]*$/, '');
       }
     },
+    // 重新探测「已选视频」的预检信息（不重新弹文件选择框）。
+    // 为什么需要：ffmpeg 组件是按需下载的，预检快照是选视频那一刻算出来的，
+    // 装好组件后旧快照里的「未检测到 ffmpeg」blocker 不会自己消失，
+    // 用户会被迫重选一次视频。下载完成事件与「重新检测」按钮都走这里，
+    // 让 can_convert / blockers 按当前环境重算。
+    // 只在已有视频时调用：没选视频时不做无意义探测；转换进行中也不重探，
+    // 避免覆盖正在展示的预检信息。
+    async redescribeBackgroundVideo(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      const current = this.bgConvert.video;
+      if (!current || !current.path) return false;
+      if (this.bgConvert.running) return false;
+      try {
+        const res = await api.describe_background_video(current.path);
+        if (!res || !res.ok) {
+          const message = (res as { error?: { message?: string } } | undefined)?.error?.message || '';
+          // 探测失败只在有消息时提示，不覆盖用户已看到的转换结果区
+          if (message) this.bgConvert.error = message;
+          return false;
+        }
+        this.bgConvert.video = res as unknown as BackgroundVideoInfo;
+        // 重新探测的结果是权威的：之前因缺组件留下的错误提示要清掉
+        this.bgConvert.error = '';
+        return true;
+      } catch (err) {
+        // 桥异常不该冒泡到点击点，留一条日志即可（用户还能手动再点一次）
+        console.warn('[bg_convert] 重新探测视频信息失败:', err);
+        return false;
+      }
+    },
     async pickBackgroundOutputDir() {
       const api = this._api();
       if (!api) return;
@@ -5031,8 +5294,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
     async startBackgroundConvert() {
       const api = this._api();
       if (!api) return;
-      const video = this.bgConvert.video;
+      let video = this.bgConvert.video;
       if (!video) { this.bgConvert.error = '请先选择要转换的视频'; return; }
+      // 兜底放行：预检快照可能是「ffmpeg 组件还没下载」时算的，此刻组件若已就绪，
+      // 先按当前环境重探一次再判定，避免用户装好组件后还得重选视频
+      if (!video.can_convert && this.ffmpegComponent.installed) {
+        await this.redescribeBackgroundVideo();
+        video = this.bgConvert.video;
+        if (!video) { this.bgConvert.error = '请先选择要转换的视频'; return; }
+      }
       if (!video.can_convert) {
         this.bgConvert.error = video.blockers[0] || '该视频无法转换';
         return;
@@ -5160,6 +5430,59 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
         return;
       }
+      // ── ffmpeg 按需组件下载进度（GuiBridge 的 ffmpeg_component_progress）──
+      // 合并口径与 playwright 分支完全一致：进度事件不推断安装态，
+      // downloading 由 stage 推导，终态补一次状态刷新（installed/version 需磁盘探测）
+      if (type === 'ffmpeg_component_progress') {
+        const next: FfmpegComponentStatus = { ...this.ffmpegComponent };
+        next.stage = String(data.stage || '');
+        next.percent = Number(data.percent) || 0;
+        next.downloaded_bytes = Number(data.downloaded_bytes) || 0;
+        next.total_bytes = Number(data.total_bytes) || 0;
+        next.error = String(data.error || '');
+        if (typeof data.installed === 'boolean') next.installed = data.installed;
+        if (typeof data.version === 'string') next.version = data.version;
+        next.downloading = next.stage === 'downloading' || next.stage === 'extracting';
+        if (next.stage === 'done') {
+          next.downloading = false;
+          next.percent = 100;
+        }
+        this.ffmpegComponent = next;
+        if (next.stage === 'done' || next.stage === 'error') {
+          void this.refreshFfmpegComponentStatus();
+        }
+        // 关键：ffmpeg 就绪后要让「已经选好的视频」立即可用。
+        // 预检快照（bgConvert.video）是选视频那一刻算的，里面可能还写着
+        // 「未检测到 ffmpeg」的 blocker；不重算的话用户必须重选视频才能转换。
+        // 只在 done 且确实已选了视频时才重探，没选视频时不做无意义调用
+        if (next.stage === 'done' && this.bgConvert.video) {
+          void this.redescribeBackgroundVideo();
+        }
+        return;
+      }
+      // ── 网页搜索组件下载进度（GuiBridge 的 search_component_progress）──
+      // 合并口径与前两个组件完全一致：进度事件不推断安装态，downloading 由
+      // stage 推导，终态补一次状态刷新（installed/version 只有磁盘探测才知道）
+      if (type === 'search_component_progress') {
+        const next: SearchComponentStatus = { ...this.searchComponent };
+        next.stage = String(data.stage || '');
+        next.percent = Number(data.percent) || 0;
+        next.downloaded_bytes = Number(data.downloaded_bytes) || 0;
+        next.total_bytes = Number(data.total_bytes) || 0;
+        next.error = String(data.error || '');
+        if (typeof data.installed === 'boolean') next.installed = data.installed;
+        if (typeof data.version === 'string') next.version = data.version;
+        next.downloading = next.stage === 'downloading' || next.stage === 'extracting';
+        if (next.stage === 'done') {
+          next.downloading = false;
+          next.percent = 100;
+        }
+        this.searchComponent = next;
+        if (next.stage === 'done' || next.stage === 'error') {
+          void this.refreshSearchComponentStatus();
+        }
+        return;
+      }
       // 前端构建产物运行期更新（gui_main 的 dist watchdog 推送 fingerprint）：
       // 触发「资源版本失配自愈」——等界面空闲时自动刷新到最新版本，
       // 避免旧构建哈希 chunk 404（mermaid 等懒加载失败）；
@@ -5205,6 +5528,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const session = String(data.session_name || '');
         if (!session) return;
         this.openBrowserTabForSession(session);
+        return;
+      }
+      // 画布节点聚焦（Agent 侧发起「带我去看这张图」）：只改画布 store 的选中态，
+      // 不参与会话 runtime 归属，处理完直接 return。
+      // 节点 id 缺失时什么都不做——静默忽略比清空选中更安全（清空会让用户
+      // 当前正在看的节点莫名丢失高亮）
+      if (type === 'canvas_focus_node') {
+        const nodeId = String(data.node_id || data.id || '');
+        if (nodeId) useCanvasStore().selectNode(nodeId);
         return;
       }
       // 内嵌浏览器页签归属（后台会话请求打开/导航）：只在目标会话自己的右栏
@@ -5586,6 +5918,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
             label: String(d.label || d.name || 'tool'),
             result,
           });
+        }
+        // 生图产出识别：结果文本里出现的本地图片路径放进画布「最近产出」托盘。
+        // 单独 try/catch 包住——正则解析出任何意外都只丢托盘这一条，
+        // 绝不影响上面已经完成的 tool 结果记录（工具轨迹比托盘重要得多）
+        try {
+          collectGeneratedImages(String(d.name || ''), String(d.result || ''));
+        } catch (err) {
+          console.debug('[canvas] 生图产出识别失败，已忽略', err);
         }
       } else if (type === 'plan_updated') {
         if (Array.isArray(data.items)) {

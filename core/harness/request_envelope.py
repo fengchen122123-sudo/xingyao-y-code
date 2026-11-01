@@ -223,6 +223,10 @@ class RequestEnvelope:
     # messages/system/tools/options 计算，新增字段不改动任何既有哈希。
     model: str = ""
     api_base: str = ""
+    # 回合意图标记（断点续跑 S2）：与 request_reason（缓存失效原因）严格
+    # 分离，只承载「这一轮为什么被发起」（如 "resume"），不参与缓存诊断，
+    # 也不进入任何指纹字节。空字符串＝普通回合，保持既有默认行为。
+    turn_reason: str = ""
 
     @classmethod
     def capture(
@@ -234,6 +238,7 @@ class RequestEnvelope:
         attempt: int,
         deepseek_generation_id: int | None,
         deepseek_message_count: int | None,
+        turn_reason: str = "",
     ) -> "RequestEnvelope":
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise ValueError("attempt must be a one-based integer")
@@ -279,5 +284,6 @@ class RequestEnvelope:
             deepseek_message_count=deepseek_message_count,
             model=str(kwargs.get("model") or ""),
             api_base=str(kwargs.get("api_base") or ""),
+            turn_reason=str(turn_reason or ""),
             fingerprint=fingerprint,
         )

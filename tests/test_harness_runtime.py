@@ -509,12 +509,27 @@ def test_timeout_handoff_takeover_completes_without_redelegation(
     llm._mark_plan_turn("turn-e2e-takeover")
 
     class FakeMonotonic:
+        """假时钟：按序列返回，序列耗尽后继续向前推进。
+
+        真实 time.monotonic() 一直在前进，桩必须模拟这两个性质，否则本用例
+        会以两种错误方式失效：
+        1) 直接 next()：实现多读一次就把 StopIteration 冒泡成「子代理启动失败」；
+        2) 耗尽后返回固定值：elapsed 恒为 0，超时永不触发——排队阶段的时间
+           不计入 execution_elapsed，第一次读到的 601 若落在排队窗口就被丢弃，
+           后面全是 0，于是子代理跑完被判「无有效正文」→ failed。
+        因此耗尽后按固定步长继续推进。
+        """
+
         def __init__(self, values):
             self._values = iter(values)
+            self._last = 0.0
 
         def __call__(self):
-            return next(self._values)
-
+            try:
+                self._last = next(self._values)
+            except StopIteration:
+                self._last += 1000.0
+            return self._last
     slow_manager = tools_module.SubagentManager(
         runner=lambda record: record.cancel_event.wait(1),
         # 模型伪造的 timeout_seconds=30 已由 adapter 丢弃；general 角色使用

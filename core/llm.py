@@ -992,6 +992,8 @@ def chat_with_model_events(
     computer_turn_source="local",
     computer_capability=None,
     budget_notice_provider=None,
+    request_reason: str = "",
+    resume_turn: bool = False,
 ):
     """Yield ordered :class:`TurnEvent` snapshots for one model turn.
 
@@ -1007,6 +1009,13 @@ def chat_with_model_events(
     的 handoff，仍无才自行解析（兼容旧调用方）。三条路径合起来保证同一生产
     Turn 的 capability 只解析一次；子代理回合（allow_subagents=False）始终为
     None，不解析也不注入电脑操控。
+
+    request_reason 是回合意图标记（断点续跑接线）：与缓存失效原因
+    （RequestEnvelope.request_reason 取值域"冷启动"/"上下文压缩或历史重写"/
+    "工具契约变化"/"模型或接口变化"/""）严格分离，只经 turn_reason 落到
+    harness_steps.request_reason 的续跑标记位，不参与缓存诊断；空字符串＝
+    普通回合。resume_turn=True 表示该 turn_id 的行已被 ResumeExecutor 建好，
+    TurnRuntime.start 不再重复 INSERT（否则 harness_turns 主键冲突）。
     """
     if computer_turn_source not in COMPUTER_TURN_SOURCES:
         raise ValueError(
@@ -1043,6 +1052,7 @@ def chat_with_model_events(
             manager=_manager,
             cancel_event=cancel_event,
             clock_ms=lambda: time.time_ns() // 1_000_000,
+            create_row=not resume_turn,
         )
     factory = TurnEventFactory(resolved_turn_id)
     pending_events = []
@@ -1145,6 +1155,7 @@ def chat_with_model_events(
             harness_runtime=harness_runtime,
             computer_capability=computer_turn_capability,
             budget_notice_provider=budget_notice_provider,
+            request_reason=request_reason,
         )
         for chunk in generator:
             yield from drain_public_events()
@@ -1555,6 +1566,7 @@ def _chat_with_model_generator(
     harness_runtime=None,
     computer_capability=None,
     budget_notice_provider=None,
+    request_reason: str = "",
 ):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
@@ -2441,6 +2453,7 @@ def _chat_with_model_generator(
                             attempt=attempt + 1,
                             deepseek_generation_id=active_deepseek_generation_id,
                             deepseek_message_count=active_deepseek_message_count,
+                            turn_reason=request_reason,
                         )
                     except Exception:
                         logger.warning("请求指纹捕获失败（跳过，不影响请求）", exc_info=True)

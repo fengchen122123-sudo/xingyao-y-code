@@ -67,7 +67,7 @@
       </button>
     </div>
 
-    <div id="right-content" :class="{ flush: visualTab === 'browser' }">
+    <div id="right-content" :class="{ flush: visualTab === 'browser' || visualTab === 'canvas' }">
       <!-- 打开标签页选择页（ZCode 式侧板）：无页签/点"+"时出现，从卡片
            追加页签；已打开的页签保留在页签条上随时可切回。定向入口经
            openRightPanelTab 直接开页签跳过本页 -->
@@ -173,6 +173,12 @@
       <div v-show="visualTab === 'subagent'" class="rpane active" data-test="subagent-pane">
         <SubagentPane :active="activeTab === 'subagent'" />
       </div>
+
+      <!-- 无限画布：满幅渲染（flush），页签未激活时把 active 传下去，
+           让画布跳过测量/重绘这类只在可见时才有意义的工作 -->
+      <div v-show="visualTab === 'canvas'" class="rpane active" data-test="canvas-pane">
+        <CanvasPane :active="activeTab === 'canvas'" />
+      </div>
       </template>
     </div>
 
@@ -223,6 +229,9 @@ import BrowserPane from './BrowserPane.vue';
 import GitPanel from './GitPanel.vue';
 import SubagentPane from './SubagentPane.vue';
 import NovelPane from './NovelPane.vue';
+// 画布工作台与数据层都放在 src/canvas|stores 下的画布域，与 components 里的
+// 通用面板区分，避免以后画布节点组件把 components 目录撑大
+import CanvasPane from '../canvas/CanvasPane.vue';
 import RightPanelSnip from './RightPanelSnip.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
@@ -337,7 +346,8 @@ const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> =
   { id: 'browser', label: '星眼 · 浏览器', icon: 'globe' },
   { id: 'tasks', label: '星港 · 后台任务', icon: 'square-terminal' },
   { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' },
-  { id: 'novel', label: '小说', icon: 'file' }
+  { id: 'novel', label: '小说', icon: 'file' },
+  { id: 'canvas', label: '画布', icon: 'layers' }
 ];
 
 const PANE_LABELS: Record<RightPanelTabId, string> = {
@@ -347,7 +357,8 @@ const PANE_LABELS: Record<RightPanelTabId, string> = {
   tasks: '星港 · 后台任务',
   computer: '操控',
   subagent: '星舰 · 子代理',
-  novel: '小说'
+  novel: '小说',
+  canvas: '画布'
 };
 // 小说页签图标：图标表里没有 book，用「稿件」语义的 file（不新增图标资源）
 const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
@@ -357,7 +368,8 @@ const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
   tasks: 'square-terminal',
   computer: 'scan',
   subagent: 'blocks',
-  novel: 'file'
+  novel: 'file',
+  canvas: 'layers'
 };
 
 // run 开始时首次自动切入操控工作台（设计 16.2）：每个 run 只开一次（记录到

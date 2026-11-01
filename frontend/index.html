@@ -9,8 +9,11 @@
          SDK 主入口在 o.alicdn.com，加载后还会动态拉 g./x.alicdn.com 上的子脚本与样式，
          故 script/style 统一按 *.alicdn.com 放行；验证码接口与设备指纹走 aliyun.com /
          aliyuncs.com；connect-src 额外允许 data:（SDK 会读取内联 data URL）。
+         frame-src 放行 127.0.0.1:*/localhost:*：画布页签的「自由画布」用 iframe
+         挂 Excalidraw 子应用，由 core/media_server 在随机端口上以令牌路径提供
+         （与 img-src/media-src 同一安全边界：仅本机回环 + 随机令牌）。
          除这些来源外不放宽任何策略，且不引入 unsafe-eval。 -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://*.alicdn.com; style-src 'self' 'unsafe-inline' https://*.alicdn.com; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:* https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; media-src 'self' http://127.0.0.1:* http://localhost:*; connect-src 'self' data: ws://127.0.0.1:* http://127.0.0.1:* https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; frame-src https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; font-src 'self' data: https://*.alicdn.com; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://*.alicdn.com; style-src 'self' 'unsafe-inline' https://*.alicdn.com; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:* https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; media-src 'self' http://127.0.0.1:* http://localhost:*; connect-src 'self' data: ws://127.0.0.1:* http://127.0.0.1:* https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; frame-src http://127.0.0.1:* http://localhost:* https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com; font-src 'self' data: https://*.alicdn.com; object-src 'none'; base-uri 'none'; form-action 'none'">
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>星瑶Code</title>

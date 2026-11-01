@@ -513,3 +513,316 @@ def test_run_novel_audit_surfaces_invalid_scope_error_from_service(bridge, tmp_p
     assert "scope" in result["error"]
     assert result["error"] == service_result["error"]
     assert "findings" not in result
+
+
+# ---------------------------------------------------------------------------
+# 审查问题修复：novel_audit_fix（只改显式状态字段，语义判定不自动做）
+# ---------------------------------------------------------------------------
+
+# 伏笔表列序（tracking_commit.render_foreshadow）：ID | 内容 | 埋设章 | 计划回收章 | …
+FORESHADOW_TABLE_HEADER = (
+    "| ID | 内容 | 埋设章 | 计划回收章 | 状态 | 重要度 | 最近变更章 |\n"
+    "|---|---|---:|---:|---|---|---:|\n"
+)
+
+
+def _foreshadow_row(identifier, summary, planted, planned, status, updated):
+    """造一行伏笔表数据行（planned 为 None 时按渲染口径写占位符）。"""
+    planned_cell = f"第{planned}章" if planned else "—"
+    return (
+        f"| {identifier} | {summary} | 第{planted}章 | {planned_cell} | "
+        f"{status} | 高 | 第{updated}章 |\n"
+    )
+
+
+def _make_audit_fix_project(root):
+    """造带追踪状态与伏笔表的最小小说项目。
+
+    F001：第55章埋设、计划第50章回收（最近提交章 100 已超「计划章+20」→ 报超期）；
+    F002：第70章埋设、计划回收章留空 —— 长线伏笔（不报超期），验证「其它行一字不动」。
+    """
+    project = _make_novel_project(root)
+    state = {
+        "schema": 1,
+        "state_revision": 3,
+        "last_committed_chapter": 100,
+        "foreshadow": {
+            "F001": {
+                "id": "F001",
+                "importance": "高",
+                "planned_resolution_chapter": 50,
+                "planted_chapter": 55,
+                "status": "已埋",
+                "summary": "玄真观旧物",
+                "updated_chapter": 55,
+            },
+            "F002": {
+                "id": "F002",
+                "importance": "高",
+                "planned_resolution_chapter": None,
+                "planted_chapter": 70,
+                "status": "已埋",
+                "summary": "接引簿两个活人",
+                "updated_chapter": 70,
+            },
+        },
+    }
+    tracking = project / "追踪"
+    (tracking / "_tracking-state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (tracking / "伏笔.md").write_text(
+        "# 伏笔当前状态\n\n"
+        "> 状态修订：3。每个 ID 只保留一行当前状态；历史变化见 `逐章记录/`。\n\n"
+        + FORESHADOW_TABLE_HEADER
+        + _foreshadow_row("F001", "玄真观旧物", 55, 50, "已埋", 55)
+        + _foreshadow_row("F002", "接引簿两个活人", 70, None, "已埋", 70),
+        encoding="utf-8",
+    )
+    return project
+
+
+def _overdue_finding(project, identifier="F001"):
+    """跑一次真实审计，取出该伏笔的 foreshadow_overdue 结论（不手写 message）。"""
+    result = novel_service.novel_audit(str(project), scope="all")
+    assert result["ok"] is True, result
+    for finding in result["findings"]:
+        if finding["type"] == "foreshadow_overdue" and identifier in finding["message"]:
+            return finding
+    raise AssertionError(f"审计没有报出 {identifier} 的超期结论：{result['findings']}")
+
+
+def test_novel_audit_fix_dry_run_changes_nothing(tmp_path):
+    """dry_run：只给 before/after 与 would_change，state 与伏笔表文本一字不变。"""
+    project = _make_audit_fix_project(tmp_path / "长夜行")
+    state_path = project / "追踪" / "_tracking-state.json"
+    table_path = project / "追踪" / "伏笔.md"
+    state_before = state_path.read_text(encoding="utf-8")
+    table_before = table_path.read_text(encoding="utf-8")
+
+    result = novel_service.novel_audit_fix(
+        str(project), _overdue_finding(project), "defer", dry_run=True
+    )
+
+    assert result["ok"] is True, result
+    assert result["dry_run"] is True
+    assert result["foreshadow_id"] == "F001"
+    assert result["before"] == {"planned_resolution_chapter": 50, "updated_chapter": 55}
+    assert result["after"] == {"planned_resolution_chapter": None, "updated_chapter": 100}
+    assert result["would_change"] is True
+    assert state_path.read_text(encoding="utf-8") == state_before
+    assert table_path.read_text(encoding="utf-8") == table_before
+
+
+def test_novel_audit_fix_defer_updates_state_and_one_table_row(tmp_path):
+    """defer：state 里计划回收章置空，伏笔表只改该行第 4 列，其它行保持原样。"""
+    project = _make_audit_fix_project(tmp_path / "长夜行")
+    table_path = project / "追踪" / "伏笔.md"
+    table_before = table_path.read_text(encoding="utf-8")
+
+    result = novel_service.novel_audit_fix(
+        str(project), _overdue_finding(project), "defer"
+    )
+
+    assert result["ok"] is True, result
+    assert result["dry_run"] is False
+    assert result["after"] == {"planned_resolution_chapter": None, "updated_chapter": 100}
+
+    state = json.loads(
+        (project / "追踪" / "_tracking-state.json").read_text(encoding="utf-8")
+    )
+    row = state["foreshadow"]["F001"]
+    assert row["planned_resolution_chapter"] is None
+    assert row["updated_chapter"] == 100
+    # 其它字段不被顺手改写
+    assert row["summary"] == "玄真观旧物"
+    assert row["planted_chapter"] == 55
+    assert row["status"] == "已埋"
+
+    table_after = table_path.read_text(encoding="utf-8")
+    lines_after = table_after.splitlines()
+    lines_before = table_before.splitlines()
+    assert len(lines_after) == len(lines_before)
+    # 只命中一行变化
+    changed = [i for i, (a, b) in enumerate(zip(lines_before, lines_after)) if a != b]
+    assert len(changed) == 1
+    target = lines_after[changed[0]]
+    assert "| F001 |" in target
+    assert target.split("|")[4].strip() == "—"
+    # 其它行一字不动
+    assert [l for i, l in enumerate(lines_after) if i != changed[0]] == [
+        l for i, l in enumerate(lines_before) if i != changed[0]
+    ]
+
+
+def test_novel_audit_fix_reschedule_rejects_past_chapter(tmp_path):
+    """reschedule 章号 ≤ 当前已提交章：ok=False、文案含「不能早于」、文件不动。"""
+    project = _make_audit_fix_project(tmp_path / "长夜行")
+    state_path = project / "追踪" / "_tracking-state.json"
+    table_path = project / "追踪" / "伏笔.md"
+    state_before = state_path.read_text(encoding="utf-8")
+    table_before = table_path.read_text(encoding="utf-8")
+
+    for illegal in (100, 60):
+        result = novel_service.novel_audit_fix(
+            str(project),
+            _overdue_finding(project),
+            "reschedule",
+            planned_resolution_chapter=illegal,
+        )
+        assert result["ok"] is False, result
+        assert "不能早于" in result["error"]
+
+    assert state_path.read_text(encoding="utf-8") == state_before
+    assert table_path.read_text(encoding="utf-8") == table_before
+
+
+def test_novel_audit_fix_rejects_unsupported_type_without_writing(tmp_path):
+    """不支持的类型（ai_patterns）：ok=False + supported=False，且不写任何文件。"""
+    project = _make_audit_fix_project(tmp_path / "长夜行")
+    state_path = project / "追踪" / "_tracking-state.json"
+    table_path = project / "追踪" / "伏笔.md"
+    state_before = state_path.read_text(encoding="utf-8")
+    table_before = table_path.read_text(encoding="utf-8")
+
+    finding = {
+        "level": "S4",
+        "type": "ai_patterns",
+        "file": "正文/第001章_夜行.md",
+        "message": "第1章命中一级禁用词「仿佛」1 处，按 banned-words.md 应替换",
+    }
+    result = novel_service.novel_audit_fix(str(project), finding, "defer")
+
+    assert result["ok"] is False, result
+    assert result["supported"] is False
+    assert "该类型不支持自动修复" in result["error"]
+    assert state_path.read_text(encoding="utf-8") == state_before
+    assert table_path.read_text(encoding="utf-8") == table_before
+
+
+# ---------------------------------------------------------------------------
+# 超期判定口径：以「计划回收章 + 宽限」为准，无计划章的长线伏笔不报 S2
+# ---------------------------------------------------------------------------
+
+
+def _make_planned_scope_project(root):
+    """造两条已埋伏笔，用于锁定审计侧的超期判定口径。
+
+    F001：计划第50章回收，最近提交章 100 → 100 > 50 + 20 → 报 S2；
+    F002：计划回收章为空（长线伏笔，第1章埋设）→ 无逾期基准，不报 S2。
+    """
+    project = _make_novel_project(root)
+    state = {
+        "schema": 1,
+        "state_revision": 1,
+        "last_committed_chapter": 100,
+        "foreshadow": {
+            "F001": {
+                "id": "F001",
+                "importance": "高",
+                "planned_resolution_chapter": 50,
+                "planted_chapter": 40,
+                "status": "已埋",
+                "summary": "青铜钥匙",
+                "updated_chapter": 40,
+            },
+            "F002": {
+                "id": "F002",
+                "importance": "低",
+                "planned_resolution_chapter": None,
+                "planted_chapter": 1,
+                "status": "已埋",
+                "summary": "长线悬念",
+                "updated_chapter": 1,
+            },
+        },
+    }
+    tracking = project / "追踪"
+    (tracking / "_tracking-state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (tracking / "伏笔.md").write_text(
+        "# 伏笔当前状态\n\n"
+        + FORESHADOW_TABLE_HEADER
+        + _foreshadow_row("F001", "青铜钥匙", 40, 50, "已埋", 40)
+        + _foreshadow_row("F002", "长线悬念", 1, None, "已埋", 1),
+        encoding="utf-8",
+    )
+    return project
+
+
+def test_audit_foreshadow_overdue_only_counts_planned_rows(tmp_path):
+    """口径：有计划章且逾期 → S2；无计划章的长线伏笔 → 不报。"""
+    project = _make_planned_scope_project(tmp_path / "长夜行")
+
+    result = novel_service.novel_audit(str(project), scope="all")
+
+    assert result["ok"] is True, result
+    overdue = [f for f in result["findings"] if f["type"] == "foreshadow_overdue"]
+    assert len(overdue) == 1, overdue
+    assert "F001" in overdue[0]["message"]
+    assert "计划第50章回收" in overdue[0]["message"]
+    assert "逾期 50 章" in overdue[0]["message"]
+    assert result["summary"]["S2"] == 1
+    assert "F002" not in json.dumps(overdue, ensure_ascii=False)
+
+
+def test_audit_fix_defer_clears_overdue_warning(tmp_path):
+    """defer 置空计划章后重跑 audit：该条不再报出（still_reported=False）。"""
+    project = _make_planned_scope_project(tmp_path / "长夜行")
+    finding = _overdue_finding(project, "F001")
+
+    result = novel_service.novel_audit_fix(str(project), finding, "defer")
+
+    assert result["ok"] is True, result
+    assert result["after"]["planned_resolution_chapter"] is None
+    assert result["still_reported"] is False
+    # 重跑审计双重确认：该条彻底消失，口径不靠 still_reported 单点
+    again = novel_service.novel_audit(str(project), scope="all")
+    still = [
+        f for f in again["findings"]
+        if f["type"] == "foreshadow_overdue" and "F001" in f["message"]
+    ]
+    assert still == []
+
+
+# ---------------------------------------------------------------------------
+# 桥接：run_novel_audit_fix（转发 novel_audit_fix，校验规则留在 service）
+# ---------------------------------------------------------------------------
+
+
+def test_run_novel_audit_fix_bridge_defer_dry_run(bridge, tmp_path):
+    """桥接方法存在且可用：defer + dry_run=True 只回 before/after，不写文件。"""
+    project = _make_planned_scope_project(tmp_path / "长夜行")
+    state_path = project / "追踪" / "_tracking-state.json"
+    table_path = project / "追踪" / "伏笔.md"
+    state_before = state_path.read_text(encoding="utf-8")
+    table_before = table_path.read_text(encoding="utf-8")
+
+    result = bridge.run_novel_audit_fix(
+        str(project),
+        finding=_overdue_finding(project, "F001"),
+        action="defer",
+        dry_run=True,
+    )
+
+    assert result["ok"] is True, result
+    assert result["dry_run"] is True
+    assert result["foreshadow_id"] == "F001"
+    assert result["would_change"] is True
+    assert state_path.read_text(encoding="utf-8") == state_before
+    assert table_path.read_text(encoding="utf-8") == table_before
+
+
+@pytest.mark.parametrize("workdir", ["GLOBAL", "", None])
+def test_run_novel_audit_fix_rejects_blank_global_workdir(bridge, workdir):
+    """GLOBAL / 空串 / None 工作目录：结构化 error，不触达 service。"""
+    result = bridge.run_novel_audit_fix(
+        workdir, finding={"type": "foreshadow_overdue", "message": "伏笔 F001 计划…"}
+    )
+
+    assert result["ok"] is False
+    assert "不存在" in result["error"]
+    assert "before" not in result

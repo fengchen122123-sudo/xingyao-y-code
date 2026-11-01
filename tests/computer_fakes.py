@@ -57,7 +57,9 @@ def use_temp_config(tmp_path, monkeypatch, values):
     ~/.ycode/config.toml 对读取结果的只读覆盖。
     """
     cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+    # 空 dict 会被 config.py 写闸门判为读失败而拒写，故补最小可用结构。
+    payload = values if values else {"active_model_id": None, "providers": []}
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
     monkeypatch.setattr(config, "_TOML_CONFIG_FILE", str(tmp_path / "config.toml"))
     return cfg

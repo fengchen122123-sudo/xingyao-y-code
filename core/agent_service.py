@@ -1037,6 +1037,36 @@ def _trigger_background_precompress(
     return True
 
 
+def build_resume_messages(manager, session_name: str, *, is_gui: bool = True) -> list:
+    """断点续跑专用消息组装：只读、不改库、不压缩、不重写历史字节。
+
+    与 prepare_turn_messages 的区别（后者严禁用于续跑，见
+    core/harness/resume.py 的断点续跑红线 TODO）：
+
+      * 不执行四级水位线维护（snip / elide / 摘要压缩 / 物理折叠 / 滑窗淘汰），
+        因此不会改写或删除任何历史消息字节；
+      * 不调用 build_runtime_context / build_dynamic_prompt，也不调用
+        _append_context_suffix_to_last_user；
+      * 不追加新的 user 消息，不写库（不调 add_message /
+        replace_latest_user_message_content 等任何写接口）。
+
+    为什么不再调 build_dynamic_prompt：父回合组装时，
+    _append_context_suffix_to_last_user 已把当轮的动态上下文块与时间注记
+    内联进末条 user 消息并 CAS 回写数据库，也就是说库里的末条 user 消息本身
+    就带着父回合的动态块与时间注记。此处若再组装一次动态块并追加，会改写
+    这段文本（再叠一层、并可能回写库），请求前缀便与父回合逐字节不一致，
+    直接破坏断点续跑用于比对的四哈希锚点，provider 侧缓存前缀也随之失效。
+    因此续跑只要「稳定系统提示词 + 库中已定型的 LLM 历史」即可，
+    这样拼装出的前缀与父回合请求前缀逐字节相同。
+    """
+    # 稳定系统提示词复用同一组装入口，保证首部字节与父回合一致；
+    # 传 session_name 以命中会话级快照（与 prepare_turn_messages 同源）。
+    system_message = build_stable_system_message(is_gui, session_name)
+    # get_history_for_llm 内部只读查询并返回新列表，不做任何写库操作
+    history = manager.get_history_for_llm(session_name)
+    return [system_message, *history]
+
+
 def prepare_turn_messages(
     manager,
     session_name: str,

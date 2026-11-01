@@ -22,7 +22,7 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
   venv\\Scripts\\python build_release.py                   完整构建
   venv\\Scripts\\python build_release.py --cli-only         只构建 CLI 相关产物，跳过主安装包
   venv\\Scripts\\python build_release.py --skip-frontend    跳过前端构建，直接用现有 frontend/dist
-  venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build
+  venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build（含画布子应用）
   venv\\Scripts\\python build_release.py --setup-only       只重建两个安装向导（复用现有载荷）
   venv\\Scripts\\python build_release.py --no-split-parts   跳过分卷切割（产物不分发到 Gitee 时用）
 """
@@ -52,12 +52,12 @@ def parse_args():
     )
     parser.add_argument(
         "--skip-frontend", action="store_true",
-        help="跳过前端构建步骤，直接复用现有的 frontend/dist 产物"
-             "（不存在也不会报错，但生成的 GUI 版启动后将无法加载界面）。",
+        help="跳过前端构建步骤，直接复用现有的 frontend/dist 与 frontend-canvas/dist 产物"
+             "（不存在也不会报错，但生成的 GUI 版启动后将无法加载界面，画布也会提示未构建）。",
     )
     parser.add_argument(
         "--rebuild-frontend", action="store_true",
-        help="强制重新执行 npm run build，即使 frontend/dist/index.html 已经存在。",
+        help="强制重新执行 npm run build（主前端与画布子应用），即使 dist/index.html 已经存在。",
     )
     parser.add_argument(
         "--cli-only", action="store_true",
@@ -71,8 +71,9 @@ def parse_args():
     )
     parser.add_argument(
         "--component-only", action="store_true",
-        help="只产出 playwright 组件包 dist/playwright-component-*.zip，"
-             "跳过其它所有构建（前端 / 核心载荷 / 安装向导 / 分卷）。",
+        help="只产出按需组件包（playwright + ffmpeg，即 dist/playwright-component-*.zip "
+             "与 dist/ffmpeg-component-*.zip），跳过其它所有构建"
+             "（前端 / 核心载荷 / 安装向导 / 分卷）。",
     )
     parser.add_argument(
         "--no-split-parts", action="store_true",
@@ -300,6 +301,222 @@ def step0b_build_playwright_component(project_dir):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ============================================================================
+# 步骤 0d：ffmpeg 组件包（运行时由 core/components.py 的 FFMPEG_SPEC 下载安装）
+# ============================================================================
+
+FFMPEG_COMPONENT_FILES = ("ffmpeg.exe", "NOTICE.txt")
+
+
+def read_ffmpeg_version(project_dir):
+    """从 vendor/ffmpeg/NOTICE.txt 解析 ffmpeg 版本号，解析不出返回 "bundled"。
+
+    只认 NOTICE.txt 里那行「版本 : ffmpeg version 8.1-essentials_build-www.gyan.dev」
+    的数字版本段（→ "8.1"）：完整构建串里带下载站后缀，塞进 zip 文件名会很难看。
+    刻意**不执行 ffmpeg.exe -version**：那是 96MB 二进制，冷启动要几秒且会把
+    stdout 编码/编码页问题引进构建脚本，而版本事实已在 NOTICE.txt 里由构建者记录。
+    """
+    notice_path = os.path.join(project_dir, "vendor", "ffmpeg", "NOTICE.txt")
+    try:
+        with open(notice_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        print("⚠️ 未能读取 vendor/ffmpeg/NOTICE.txt，版本号回退为 bundled。")
+        return "bundled"
+    match = re.search(r"ffmpeg\s+version\s+(\d+(?:\.\d+)*)", content, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    print("⚠️ 未能从 NOTICE.txt 解析 ffmpeg 版本号，回退为 bundled。")
+    return "bundled"
+
+
+def step0d_build_ffmpeg_component(project_dir):
+    """把仓库里自带的 ffmpeg 打成可发布到 Gitee Release 的组件包。
+
+    与 playwright 组件包（step0b）不同，ffmpeg 是**可选**能力：仓库里没有
+    ffmpeg.exe（.gitignore 排除的大文件，见 vendor/VENDOR_MANIFEST.json 的
+    optional 记录）时只告警并返回 None，绝不能让整个构建失败——否则没装
+    ffmpeg 的构建机就再也打不出安装包了。
+
+    包内布局必须是「根目录直接平铺 COMPONENT.json + ffmpeg.exe」：
+    core/components.py 的 _locate_component_root_impl 用 required_files[0]
+    （即 "ffmpeg.exe"）与 COMPONENT.json 在**同一层**同时存在来判定组件根，
+    多套一层目录虽然它有兜底探测，但会让安装目录里多一层无谓嵌套，不干净。
+    """
+    print("\n[步骤 0d/5] 正在产出 ffmpeg 组件包 (dist/ffmpeg-component-*.zip)...")
+    ffmpeg_dir = os.path.join(project_dir, "vendor", "ffmpeg")
+    sources = [os.path.join(ffmpeg_dir, name) for name in FFMPEG_COMPONENT_FILES]
+    missing = [path for path in sources if not os.path.isfile(path)]
+    if missing:
+        # 可选组件：告警后跳过，不中断构建（与 playwright 的 sys.exit(1) 不同）。
+        print("⚠️ ffmpeg 组件源文件缺失，本次不产出组件包: "
+              + ", ".join(os.path.relpath(path, project_dir) for path in missing))
+        print("   影响：设置页「下载视频转换组件」会报『未找到组件下载源』，"
+              "背景图转换回退系统 PATH 的 ffmpeg。")
+        return None
+
+    version = read_ffmpeg_version(project_dir)
+    dist_dir = os.path.join(project_dir, "dist")
+    os.makedirs(dist_dir, exist_ok=True)
+    zip_path = os.path.join(dist_dir, f"ffmpeg-component-{version}.zip")
+    # 同版本组件包已存在就复用：ffmpeg.exe 97MB，LZMA 单线程压缩要几分钟，
+    # 每个完整构建都重压一遍纯属浪费。版本号取自 NOTICE.txt，换构建则版本变、
+    # 文件名变，不会误用旧包；需要强制重建时先删掉该 zip。
+    if os.path.exists(zip_path):
+        print(f"✅ 已存在同版本组件包，跳过压缩: {zip_path} ({format_size_mb(zip_path)})")
+        return zip_path
+
+    manifest = {
+        "ffmpeg_version": version,
+        "platform": "win-amd64",
+        "built_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    for old in glob.glob(os.path.join(dist_dir, "ffmpeg-component-*.zip")):
+        os.remove(old)
+
+    print("📦 正在压缩 ffmpeg 组件包 (LZMA，97MB 需要几分钟)...")
+    count = 0
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_LZMA, allowZip64=True) as zf:
+        # 直接以文件名（不带目录）为 arcname 写入 → 压缩包根目录平铺，正好满足
+        # _locate_component_root_impl 的布局要求。
+        for src in sources:
+            zf.write(src, os.path.basename(src))
+            count += 1
+        zf.writestr("COMPONENT.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        count += 1
+
+    # SHA256 要把成品 zip 全量读一遍（本机约 97MB 输入 / 数十 MB 输出），几秒正常。
+    digest = sha256_file(zip_path)
+    print(f"✔ 组件包产出完成: {count} 个文件 -> {format_size_mb(zip_path)}")
+    print(f"   - 文件  : {zip_path}")
+    print(f"   - SHA256: {digest}")
+    return zip_path
+
+
+# ============================================================================
+# 步骤 0e：网页搜索组件包（运行时由 core/components.py 的 SEARCH_SPEC 下载安装）
+# ============================================================================
+
+# 只服务网页搜索（ddgs）的顶层包目录：主安装包已不再内置，全部改由本组件携带。
+#   ddgs           —— 搜索聚合库本身
+#   primp          —— ddgs 的 HTTP 客户端，Rust 扩展（.pyd），平台绑定
+#   lxml           —— ddgs 的 HTML 解析依赖，C 扩展（.pyd），平台绑定
+#   fake_useragent —— ddgs 的 UA 伪装依赖（仅 ddgs 使用）
+# 刻意**不含** click / httpx / certifi：ddgs 的 Requires 确实列了 click 与 httpx，
+# 但这两个是主程序自己的依赖（litellm / uvicorn / 各处 HTTP 调用都直接用），
+# ycode.spec 不能排除它们，它们留在主安装包里即可被组件复用（组件目录的包
+# 只是插在 sys.path 前面，同名的仍能从主包导入）。
+SEARCH_COMPONENT_SOURCES = ("ddgs", "primp", "lxml", "fake_useragent")
+
+
+def read_search_version(project_dir):
+    """从 venv 里 ddgs/__init__.py 读 `__version__ = "9.14.4"` 形式的版本号。
+
+    读不到（缺文件 / 格式变化）时回退 "bundled"：组件包文件名会变成
+    dist/search-component-bundled.zip，Core 侧按 asset_hint 只匹配名字片段，
+    不解析版本，所以回退不影响下载安装，只是失去版本区分度。
+    刻意不 import ddgs：import 会拉起 lxml/primp 等二进制扩展，
+    构建脚本不该为读一个字符串付这个代价（同 read_playwright_version 的思路）。
+    """
+    init_file = os.path.join(
+        project_dir, "venv", "Lib", "site-packages", "ddgs", "__init__.py"
+    )
+    try:
+        with open(init_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        match = re.search(r"__version__\s*=\s*[\"']([^\"']+)[\"']", content)
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    print("⚠️ 未能解析 ddgs 版本号，组件包文件名将回退为 bundled。")
+    return "bundled"
+
+
+def step0e_build_search_component(project_dir):
+    """把 ddgs 及其二进制依赖打成可发布到 Gitee Release 的网页搜索组件包。
+
+    包内布局：根目录平铺 COMPONENT.json + ddgs/ + primp/ + lxml/ + fake_useragent/。
+    core/components.py 的 SEARCH_SPEC 用 required_dirs（四个顶层包目录）判定安装完整，
+    _locate_component_root_impl 要求 COMPONENT.json 与这些目录在**同一层**，
+    所以不能再套一层目录。
+
+    与 ffmpeg 组件一样按「可选组件」处理：venv 里缺包时只告警并返回 None，
+    不中断构建——组件包缺失只影响用户能否下载网页搜索能力，不该让整条发布
+    流水线失败（Core 侧会提示「未找到组件下载源」）。
+    """
+    print("\n[步骤 0e/5] 正在产出网页搜索组件包 (dist/search-component-*.zip)...")
+    site_packages = os.path.join(project_dir, "venv", "Lib", "site-packages")
+    missing = [
+        name for name in SEARCH_COMPONENT_SOURCES
+        if not os.path.isdir(os.path.join(site_packages, name))
+    ]
+    if missing:
+        print("⚠️ 网页搜索组件源目录缺失，本次不产出组件包: " + ", ".join(missing))
+        print("   影响：设置页「网页搜索组件」点下载会报『未找到组件下载源』，"
+              "web_search 工具在运行时不可用。")
+        print("   补齐方式：venv\\Scripts\\python -m pip install -r requirements.txt")
+        return None
+
+    version = read_search_version(project_dir)
+    dist_dir = os.path.join(project_dir, "dist")
+    os.makedirs(dist_dir, exist_ok=True)
+    zip_path = os.path.join(dist_dir, f"search-component-{version}.zip")
+    # 同版本已存在就复用：lxml/primp 都是二进制轮子，LZMA 压缩不算便宜，
+    # 每次构建都重压一遍没有意义；需要强制重建时先删掉该 zip。
+    if os.path.exists(zip_path):
+        print(f"✅ 已存在同版本组件包，跳过压缩: {zip_path} ({format_size_mb(zip_path)})")
+        return zip_path
+
+    tmp_dir = os.path.join(project_dir, "build", "_search_component_tmp")
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+    try:
+        # 剔除 __pycache__/*.pyc/tests：字节码与上游测试都不参与运行，
+        # 留着只会让 zip 变大（二进制扩展同目录常有几十 KB 缓存）。
+        ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "tests")
+        for name in SEARCH_COMPONENT_SOURCES:
+            shutil.copytree(
+                os.path.join(site_packages, name),
+                os.path.join(tmp_dir, name),
+                ignore=ignore,
+            )
+
+        manifest = {
+            "search_version": version,
+            "platform": "win-amd64",
+            "built_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        with open(os.path.join(tmp_dir, "COMPONENT.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        # 清掉其它版本的旧包，避免 dist/ 里堆着多个 search-component-*.zip
+        # （find_component_archive 取最新一个，混着容易传错版本）
+        for old in glob.glob(os.path.join(dist_dir, "search-component-*.zip")):
+            os.remove(old)
+
+        print("📦 正在压缩网页搜索组件包 (LZMA)...")
+        count = 0
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_LZMA, allowZip64=True) as zf:
+            # 以相对 tmp_dir 的路径为 arcname：包根目录就是各包目录 + COMPONENT.json
+            for root, _dirs, files in os.walk(tmp_dir):
+                for name in files:
+                    src = os.path.join(root, name)
+                    arcname = os.path.relpath(src, tmp_dir).replace(os.sep, "/")
+                    zf.write(src, arcname)
+                    count += 1
+
+        digest = sha256_file(zip_path)
+        print(f"✔ 组件包产出完成: {count} 个文件 -> {format_size_mb(zip_path)}")
+        print(f"   - 文件  : {zip_path}")
+        print(f"   - SHA256: {digest}")
+        return zip_path
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def step0_build_frontend(project_dir, args):
     print("\n[步骤 0/5] 检查 / 构建前端产物 (frontend/dist)...")
     frontend_dir = os.path.join(project_dir, "frontend")
@@ -413,6 +630,69 @@ def step0_build_frontend(project_dir, args):
         print("❌ 移动端构建完成但未生成 frontend-mobile/dist/index.html，请检查 vite 配置。")
         sys.exit(1)
     print(f"✅ 移动端构建成功: {mobile_index}")
+
+
+def step0c_build_canvas(project_dir, args):
+    """构建 / 复用画布子应用产物 (frontend-canvas/dist)。
+
+    为什么必须有这一步：画布（Excalidraw）是独立构建的 React 子应用，它不打进
+    主前端 bundle，而是由 core/media_server.py 的 canvas_dist_root() 在运行期从
+    _MEIPASS/frontend-canvas/dist 读静态资源、再由 gui_canvas_mixin 用 iframe 挂进
+    主界面右边栏；ycode.spec 的 datas 也只是把这个目录原样拷进安装包。
+    该 dist 被 .gitignore 的 dist/ 规则忽略，仓库里没有副本 —— 不先构建就打包，
+    安装后的应用点开画布只会显示「画布子应用未构建」。这与 frontend/dist、
+    frontend-mobile/dist 是同一类问题，故按同样方式在打包前自动构建。
+
+    与 step0_build_frontend 的关系：独立成函数、由 build() 在该步骤之后无条件调用。
+    不写进 step0_build_frontend 内，是因为那个函数在「复用已有前端产物」时会直接
+    return（早退），加在它末尾的新步骤会被一起跳过；画布构建必须不受此影响。
+    """
+    print("\n[步骤 0.9/5] 构建 / 复用画布子应用产物 (frontend-canvas/dist)...")
+    canvas_dir = os.path.join(project_dir, "frontend-canvas")
+    canvas_dist = os.path.join(canvas_dir, "dist")
+    canvas_index = os.path.join(canvas_dist, "index.html")
+
+    if args.skip_frontend:
+        print("ℹ 已指定 --skip-frontend，同步跳过画布子应用构建。")
+        # ycode.spec 的 datas 把 frontend-canvas/dist 整个目录当源，目录本身必须
+        # 存在，否则 PyInstaller 会在 Analysis 阶段直接报错退出（与 frontend/dist
+        # 的处理方式一致）。
+        os.makedirs(canvas_dist, exist_ok=True)
+        if not os.path.exists(canvas_index):
+            print("⚠️ frontend-canvas/dist/index.html 不存在：打包后点开画布会提示"
+                  "「画布子应用未构建」，请手动执行 npm --prefix frontend-canvas run build。")
+        return
+
+    if os.path.exists(canvas_index) and not args.rebuild_frontend:
+        print(f"✅ 已检测到画布子应用产物: {canvas_index}（如需强制重新构建，请加上 --rebuild-frontend）。")
+        return
+
+    if not os.path.isdir(canvas_dir):
+        print(f"❌ 未找到画布子应用项目目录: {canvas_dir}")
+        sys.exit(1)
+
+    npm_bin = shutil.which("npm")
+    if npm_bin is None:
+        print("❌ PATH 环境变量中未找到 npm，无法构建画布子应用。")
+        sys.exit(1)
+    if not os.path.isdir(os.path.join(canvas_dir, "node_modules")):
+        print("🚀 画布子应用依赖缺失，正在执行 npm install ...")
+        install = subprocess.run([npm_bin, "install", "--no-audit", "--no-fund"], cwd=canvas_dir)
+        if install.returncode != 0:
+            print("❌ 画布子应用 npm install 失败。")
+            sys.exit(1)
+
+    print("🚀 正在执行画布子应用 npm run build ...")
+    # 该包的 prebuild 会先跑 scripts/sync-excalidraw-assets.mjs 同步 Excalidraw 的
+    # 字体/多语言资源到 dist，因此这里只调 build 即可（与 package.json 保持一致）。
+    result = subprocess.run([npm_bin, "run", "build"], cwd=canvas_dir)
+    if result.returncode != 0:
+        print(f"❌ 画布子应用构建失败（npm run build 退出码 {result.returncode}）。")
+        sys.exit(1)
+    if not os.path.exists(canvas_index):
+        print("❌ 画布子应用构建完成但未生成 frontend-canvas/dist/index.html，请检查 vite 配置。")
+        sys.exit(1)
+    print(f"✅ 画布子应用构建成功: {canvas_index}")
 
 
 # ============================================================================
@@ -578,6 +858,16 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
         cmd = [
             # --windowed：安装向导是 tkinter GUI，不能弹出黑色控制台窗口
             pyinstaller_bin, "--clean", "--noconfirm", "--onefile", "--windowed", "--noupx",
+            # 安装向导除标准库 + tkinter 之外不需要任何第三方运行时：
+            #   - PIL：侧栏 logo 已改为构建期预缩放的 assets/ycode-logo-168.png，
+            #     运行期用 tk.PhotoImage 直接读，不再 import PIL（省 ~15MB）；
+            #   - numpy：安装向导自己从不 import，它只是 PIL 的可选依赖，
+            #     PyInstaller 的 hook 会顺带扫进来（省 ~31MB）。
+            # 这两项只影响本函数拼出来的向导构建命令，不影响 ycode.spec 里
+            # 主程序/卸载器的 Analysis（主程序 core/gui_theme.py 顶层 import PIL，
+            # 绝不能全局排除）。
+            "--exclude-module", "numpy",
+            "--exclude-module", "PIL",
             "--name", output_name,
             "--icon", os.path.join(project_dir, "assets", "ycode.ico"),
             # --specpath 指向临时目录：避免 PyInstaller 自动生成/覆盖同名的
@@ -649,8 +939,9 @@ def step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_e
             (payload_zip, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
-            # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
-            (os.path.join("assets", "ycode.png"), "assets"),
+            # GUI 向导资源：侧栏 logo（构建期已缩放好的 168x168 PNG，
+            # tk.PhotoImage 直接读，因此不需要随包 Pillow）+ 窗口图标
+            (os.path.join("assets", "ycode-logo-168.png"), "assets"),
             (os.path.join("assets", "ycode.ico"), "assets"),
         ],
     )
@@ -669,8 +960,9 @@ def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_
             (payload_zip, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
-            # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
-            (os.path.join("assets", "ycode.png"), "assets"),
+            # GUI 向导资源：侧栏 logo（构建期已缩放好的 168x168 PNG，
+            # tk.PhotoImage 直接读，因此不需要随包 Pillow）+ 窗口图标
+            (os.path.join("assets", "ycode-logo-168.png"), "assets"),
             (os.path.join("assets", "ycode.ico"), "assets"),
         ],
     )
@@ -863,12 +1155,35 @@ def component_digest_line(archive_name, digest):
     return COMPONENT_DIGEST_LINE.format(name=archive_name, digest=digest)
 
 
-def find_playwright_component_archive(project_dir):
-    """返回 dist/ 下的 playwright 组件包路径（多个时取最新；没有返回空串）。"""
+# 随主安装包一起发到同一个 Gitee Release 的按需组件包清单：
+#   (dist/ 里的 glob 前缀, 发布说明里的标题, 组件包体积量级MB)
+# 新增组件只要在这里登记一行，上传指引与校验行就会自动各多一条——避免出现
+# 「运行时加了组件、发布说明忘了写 digest」这种客户端只能告警放行的漏配。
+RELEASE_COMPONENTS = (
+    ("playwright-component", "浏览器操控组件包", 25),
+    ("ffmpeg-component", "视频转换组件包", 97),
+    # 网页搜索组件：ddgs + primp + lxml + fake_useragent 四个包目录，
+    # 体积量级按 18MB 报（zip 实测约 8-10MB，解压后约 18MB）。
+    ("search-component", "网页搜索组件包", 18),
+)
+
+
+def find_component_archive(project_dir, prefix):
+    """返回 dist/ 下某个组件包路径（多个时取最新；没有返回空串）。
+
+    prefix 形如 "playwright-component" / "ffmpeg-component"，与 core/components.py
+    里各 ComponentSpec 的 asset_hint 保持一致（客户端按 asset_hint 在 Release
+    资产里找下载源，两边必须同名，否则用户点下载直接报"未找到组件下载源"）。
+    """
     candidates = sorted(
-        glob.glob(os.path.join(project_dir, "dist", "playwright-component-*.zip"))
+        glob.glob(os.path.join(project_dir, "dist", f"{prefix}-*.zip"))
     )
     return candidates[-1] if candidates else ""
+
+
+def find_playwright_component_archive(project_dir):
+    """playwright 组件包的便捷封装（保留旧名字，调用方无需关心泛化细节）。"""
+    return find_component_archive(project_dir, "playwright-component")
 
 
 def step4c_make_release_parts(project_dir, version, cli_only):
@@ -911,19 +1226,22 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         print("⚠️ 没有可切分的安装包产物，跳过 RELEASE_NOTES 生成。")
         return
 
-    # 组件包 SHA256 必须写进发布说明：客户端下载组件前会解析这一行做强制校验
-    # （core/components.py::_parse_component_digest），缺失时客户端只能告警放行。
-    component_line = ""
-    component_archive = find_playwright_component_archive(project_dir)
-    if component_archive:
-        component_digest = sha256_file(component_archive)
-        component_line = component_digest_line(
-            os.path.basename(component_archive), component_digest
+    # 组件包 SHA256 必须写进发布说明：客户端下载组件前会解析对应那一行做强制校验
+    # （core/components.py::_parse_component_digest，按资产名精确匹配），缺失时
+    # 客户端只能告警放行。每个组件各占一行，互不影响——多个组件行共存时客户端
+    # 靠资产名区分，不会串号（见 tests/test_components.py 的 digest 用例）。
+    component_entries = []  # (glob 前缀, 标题, 文件名, sha256)
+    for prefix, title, _size_mb in RELEASE_COMPONENTS:
+        archive = find_component_archive(project_dir, prefix)
+        if not archive:
+            print(f"⚠️ 未找到 dist/{prefix}-*.zip：发布说明里不会有「{title}」"
+                  "校验行，客户端下载该组件时无法校验完整性。")
+            continue
+        component_digest = sha256_file(archive)
+        component_entries.append(
+            (prefix, title, os.path.basename(archive), component_digest)
         )
-        print(f"✔ 组件包 {os.path.basename(component_archive)}  SHA256: {component_digest}")
-    else:
-        print("⚠️ 未找到 dist/playwright-component-*.zip：发布说明里不会有组件包"
-              "校验行，客户端下载组件时无法校验完整性。")
+        print(f"✔ 组件包 {os.path.basename(archive)}  SHA256: {component_digest}")
 
     # 生成上传指引 + 发布说明模板（SHA256 行供 updater 解析，勿改动格式）
     main_entry = next((e for e in entries if "主安装包" in e[0]), entries[0])
@@ -936,12 +1254,14 @@ def step4c_make_release_parts(project_dir, version, cli_only):
     lines.append("   自动更新依赖它做安装包完整性校验）")
     lines.append("3. 附件上传本目录 (dist/release_parts/) 下的全部分卷文件")
     # 组件包必须与主安装包同 Release 发布：core/components.py 只在该 Release 的
-    # 资产里按「名字含 playwright-component 且以 .zip 结尾」查找下载源，
-    # 漏传时用户在设置页点「下载组件」会直接报"未找到组件下载源"。
-    lines.append("   + dist/playwright-component-*.zip（浏览器操控按需组件，"
-                 "约 25MB，漏传会导致下载按钮失败）")
-    lines.append("   （该附件必须出现在下方『浏览器操控组件包 SHA256』行里：客户端靠它"
-                 "校验组件包完整性，格式勿改动）")
+    # 资产里按「名字含 spec.asset_hint 且以 .zip 结尾」查找下载源（见
+    # _resolve_component_source_impl），漏传时用户在设置页点「下载组件」会直接报
+    # "未找到组件下载源"。逐个组件单独列一行，漏传哪项一眼可见。
+    for prefix, title, size_mb in RELEASE_COMPONENTS:
+        lines.append(f"   + dist/{prefix}-*.zip（{title}，约 {size_mb}MB；"
+                     "漏传则用户点下载会报「未找到组件下载源」）")
+    lines.append("   （上述附件必须分别出现在下方对应的『…组件包 SHA256』行里："
+                 "客户端靠它校验组件包完整性，格式勿改动）")
     lines.append("4. 勾选『设为最新发布版本』后发布")
     lines.append("")
     lines.append("发布说明模板")
@@ -965,11 +1285,18 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         parts_desc = f"（{len(names)} 分卷）" if len(names) > 1 else ""
         lines.append(f"{fname:<40} {parts_desc} {digest}")
 
-    lines.append("")
-    lines.append("浏览器操控组件包 SHA256（core/components.py 下载校验，格式勿改动）")
-    lines.append("-" * 52)
-    lines.append(component_line or "（本次未产出组件包：客户端下载组件时无法校验，"
-                 "请补传组件包后补充此行）")
+    # 每个组件一段独立的校验行区块：客户端按资产名精确匹配取 digest，
+    # 多段共存不会互相干扰；某组件本次未产出时给出可执行的补救说明。
+    for prefix, title, _size_mb in RELEASE_COMPONENTS:
+        found = next((e for e in component_entries if e[0] == prefix), None)
+        lines.append("")
+        lines.append(f"{title} SHA256（core/components.py 下载校验，格式勿改动）")
+        lines.append("-" * 52)
+        lines.append(
+            component_digest_line(found[2], found[3]) if found
+            else f"（本次未产出 dist/{prefix}-*.zip：客户端下载该组件时无法校验，"
+                 "请补传组件包后补充此行）"
+        )
 
     notes_path = os.path.join(out_dir, "RELEASE_NOTES.txt")
     with open(notes_path, "w", encoding="utf-8") as f:
@@ -1004,16 +1331,18 @@ def step5_summary(project_dir, cli_only, version):
         else:
             print(f"  ❌ {rel_path:<34} {'缺失':>9}   {desc}")
             all_ok = False
-    # playwright 组件包由 step0b 独立产出；--setup-only 复用既有载荷时不会重新生成，
-    # 故这里只列示、不计入"产物缺失即失败"的判定。
-    component_zips = sorted(
-        glob.glob(os.path.join(project_dir, "dist", "playwright-component-*.zip"))
-    )
-    for zip_path in component_zips:
-        rel = os.path.relpath(zip_path, project_dir)
-        print(f"  ✅ {rel:<34} {format_size_mb(zip_path):>9}   playwright 组件包 (Gitee Release)")
-    if not component_zips:
-        print(f"  ⚠️ {'dist/playwright-component-*.zip':<34} {'未产出':>9}   playwright 组件包")
+    # 组件包由 step0b / step0d 独立产出；--setup-only 复用既有载荷时不会重新生成，
+    # 故这里只列示、不计入"产物缺失即失败"的判定（ffmpeg 还是可选组件）。
+    for prefix, title, _size_mb in RELEASE_COMPONENTS:
+        found_zips = sorted(
+            glob.glob(os.path.join(project_dir, "dist", f"{prefix}-*.zip"))
+        )
+        if not found_zips:
+            print(f"  ⚠️ {f'dist/{prefix}-*.zip':<34} {'未产出':>9}   {title} (Gitee Release)")
+            continue
+        for zip_path in found_zips:
+            rel = os.path.relpath(zip_path, project_dir)
+            print(f"  ✅ {rel:<34} {format_size_mb(zip_path):>9}   {title} (Gitee Release)")
     print("=" * 64)
 
     if not all_ok:
@@ -1044,8 +1373,11 @@ def build():
     os.chdir(project_dir)
 
     if args.component_only:
-        # 快速通道：只打 playwright 组件包，不需要 PyInstaller / 前端 / 安装向导环境
+        # 快速通道：只打组件包，不需要 PyInstaller / 前端 / 安装向导环境
         step0b_build_playwright_component(project_dir)
+        step0d_build_ffmpeg_component(project_dir)
+        # 网页搜索组件同样随 Release 单独发布（ddgs 链路已从主包剔除）
+        step0e_build_search_component(project_dir)
         print("ℹ 已指定 --component-only，跳过其它所有构建步骤。")
         return
 
@@ -1083,8 +1415,16 @@ def build():
             "vendor 随包资源校验",
         )
         step0_build_frontend(project_dir, args)
-        # playwright 与安装包分离发布：组件包必须与同版本主安装包一起上传 Gitee Release
+        # 画布子应用（frontend-canvas/dist）独立于主前端构建，必须在打 spec 之前
+        # 产出：否则安装包里的 _MEIPASS/frontend-canvas/dist 为空，用户点开画布
+        # 只会看到「画布子应用未构建」。
+        step0c_build_canvas(project_dir, args)
+        # playwright / ffmpeg / 网页搜索与安装包分离发布：组件包必须与同版本主安装包
+        # 一起上传 Gitee Release（ffmpeg 缺失时 step0d 只告警，不阻断构建）
         step0b_build_playwright_component(project_dir)
+        step0d_build_ffmpeg_component(project_dir)
+        # 网页搜索组件（ddgs 链路）已从主安装包剔除，漏传则用户无法联网搜索
+        step0e_build_search_component(project_dir)
         ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
         payload_zip = make_payload_archive(project_dir, ycode_dir)
         uninstall_exe = step2_build_uninstaller(pyinstaller_bin, project_dir)

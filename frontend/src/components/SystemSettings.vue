@@ -325,6 +325,68 @@
       </details>
     </section>
 
+    <!-- 网页搜索按需组件（core/components.py 的 SEARCH_SPEC）：ddgs 及其
+         primp/lxml/fake_useragent 二进制依赖已从主安装包剔除，未安装时在这里
+         按需下载；下载进度走 search_component_progress 桥事件 -->
+    <section class="search-component-settings" data-test="search-component-section">
+      <header class="computer-header">
+        <h2 class="computer-title"><AppIcon name="search" :size="14" /> 网页搜索</h2>
+      </header>
+
+      <div class="setting-row search-component-card" data-test="search-component-card">
+        <div class="setting-copy">
+          <h2>网页搜索组件</h2>
+          <p>网页搜索组件 · 约 18 MB · 让星瑶能够联网搜索最新信息</p>
+          <div class="search-component-state">
+            <span
+              v-if="searchComponent.installed"
+              class="search-component-ready"
+              data-test="search-component-ready"
+            >已就绪 · v{{ searchComponent.version || '未知' }}</span>
+            <template v-else-if="searchComponent.downloading">
+              <div
+                class="search-component-progress"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                :aria-valuenow="searchPercent"
+                data-test="search-component-progress"
+              >
+                <div class="search-component-progress-bar" :style="{ width: searchPercent + '%' }" />
+              </div>
+              <span class="search-component-size" data-test="search-component-size">{{ searchSizeText }}</span>
+            </template>
+            <span v-else class="search-component-missing" data-test="search-component-missing">未安装</span>
+          </div>
+          <p v-if="searchComponent.error" class="setting-error" data-test="search-component-error">
+            {{ searchComponent.error }}
+          </p>
+        </div>
+        <div v-if="!isMobile" class="search-component-actions">
+          <button
+            v-if="!searchComponent.installed && !searchComponent.downloading"
+            data-test="search-component-download"
+            class="setting-save"
+            type="button"
+            :disabled="searchBusy"
+            @click="downloadSearchComponent"
+          >
+            下载组件
+          </button>
+          <button
+            v-if="searchComponent.downloading"
+            data-test="search-component-cancel"
+            class="setting-save"
+            type="button"
+            :disabled="searchBusy"
+            @click="cancelSearchComponentDownload"
+          >
+            取消下载
+          </button>
+        </div>
+      </div>
+    </section>
+
     <section class="doctor-settings" data-test="doctor-settings-section">
       <header class="doctor-header">
         <h2 class="doctor-title"><AppIcon name="zap" :size="14" /> 运行自检</h2>
@@ -398,6 +460,8 @@ onMounted(() => {
   // Playwright 组件状态来自磁盘探测（安装包已不再内置），进页必拉一次；
   // 下载中的进度由 playwright_component_progress 桥事件持续合并
   void store.refreshPlaywrightComponentStatus();
+  // 网页搜索组件同样是磁盘探测得来的（安装包已不含 ddgs），进页也要拉一次
+  void store.refreshSearchComponentStatus();
 });
 
 // ── Playwright 按需组件（设置页「浏览器操控组件」卡片）──
@@ -434,6 +498,43 @@ async function cancelPlaywrightComponentDownload() {
     await store.cancelPlaywrightComponentDownload();
   } finally {
     playwrightBusy.value = false;
+  }
+}
+
+// ── 网页搜索按需组件（设置页「网页搜索组件」卡片）──
+// 与 Playwright 卡片同构：状态只读 Store 快照，组件内不维护副本（桥事件只更新 Store）
+const searchComponent = computed(() => store.searchComponent);
+const searchPercent = computed(() => {
+  const value = Number(store.searchComponent.percent) || 0;
+  return Math.min(100, Math.max(0, Math.round(value)));
+});
+// 已下载/总字节按 MB 展示（后端 total 未知时为 0，此时只显示已下载量）
+const searchSizeText = computed(() => {
+  const format = (bytes: number) => `${(Math.max(0, Number(bytes) || 0) / (1024 * 1024)).toFixed(1)} MB`;
+  const total = Number(store.searchComponent.total_bytes) || 0;
+  const done = Number(store.searchComponent.downloaded_bytes) || 0;
+  return total > 0 ? `${format(done)} / ${format(total)}` : format(done);
+});
+// 桥调用在途闸门：下载/取消都只发一次请求，避免重复点击叠加调用
+const searchBusy = ref(false);
+
+async function downloadSearchComponent() {
+  if (searchBusy.value) return;
+  searchBusy.value = true;
+  try {
+    await store.downloadSearchComponent();
+  } finally {
+    searchBusy.value = false;
+  }
+}
+
+async function cancelSearchComponentDownload() {
+  if (searchBusy.value) return;
+  searchBusy.value = true;
+  try {
+    await store.cancelSearchComponentDownload();
+  } finally {
+    searchBusy.value = false;
   }
 }
 
@@ -797,6 +898,27 @@ async function runDoctor() {
 .playwright-component-progress-bar { height: 100%; background: var(--accent); transition: width .2s ease; }
 .playwright-component-size { flex: 0 0 auto; color: var(--text-faint); font-size: 12px; white-space: nowrap; }
 .playwright-component-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+
+/* ── 网页搜索按需组件卡片（安装包不再内置 ddgs）：样式与 Playwright 卡片同构，
+      重复写一份而不是复用它，是为了两处互不牵连地各自演进 ── */
+/* 与「电脑操控」区块保持同样的段落间距（新卡片单独成一个 section） */
+.search-component-settings { margin-top: 34px; }
+.search-component-card { align-items: flex-start; padding: 14px 0; }
+.search-component-state { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.search-component-missing { color: var(--text-faint); font-size: 12px; }
+.search-component-ready { color: var(--green, #22c55e); font-size: 12px; }
+.search-component-progress {
+  flex: 1 1 auto;
+  min-width: 120px;
+  max-width: 320px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.search-component-progress-bar { height: 100%; background: var(--accent); transition: width .2s ease; }
+.search-component-size { flex: 0 0 auto; color: var(--text-faint); font-size: 12px; white-space: nowrap; }
+.search-component-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
 
 /* 环境检测/安全提示等说明性内容默认收起，保持主视图一行一项 */
 .setting-details { margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }

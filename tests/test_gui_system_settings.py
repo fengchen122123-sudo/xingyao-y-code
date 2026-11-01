@@ -13,7 +13,10 @@ def _bare_bridge():
 
 def _use_tmp_config(tmp_path, monkeypatch, data):
     cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    # config.py 写闸门把「存在但解析为空对象」判为读失败并拒写，
+    # 因此空 fixture 也要写入可用的最小结构。
+    payload = data if data else {"active_model_id": None, "providers": []}
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
     return cfg
 

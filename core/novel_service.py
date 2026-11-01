@@ -515,7 +515,7 @@ AUDIT_SCOPES = ("chapter", "all")
 AUDIT_CHECKS_DEFAULT = "auto"
 # 审计结论分级（S1 最高）：S1 状态断链、S2 伏笔超期、S3 进度/字数风险、S4 风格提示
 AUDIT_LEVELS = ("S1", "S2", "S3", "S4")
-# 伏笔超期阈值：已埋且距最近提交章超过 20 章仍未回收 → S2
+# 伏笔超期宽限：已埋且有计划回收章，last_commit 超过「计划回收章 + 20」→ S2
 FORESHADOW_OVERDUE_CHAPTERS = 20
 # 单章字数下限系数：正文可见字数低于细纲字数目标的 80% → S3
 CHAPTER_WORDCOUNT_FLOOR = 0.8
@@ -531,6 +531,20 @@ OUTLINE_CHAPTER_RANGE_RE = re.compile(
 )
 # AI 味检查脚本名（上游未随包分发，缺失时固定进 skipped）
 AI_PATTERN_CHECKER = "check-ai-patterns.js"
+
+# novel_audit_fix 可显式修复的问题类型：只收确定性可改的状态字段，语义判定交星瑶
+AUDIT_FIX_TYPES = ("foreshadow_overdue",)
+# novel_audit_fix 的动作：defer＝改长线、reschedule＝重排计划回收章、resolve＝明确拒绝
+AUDIT_FIX_ACTIONS = ("defer", "reschedule", "resolve")
+# 伏笔视图文件名（tracking_commit.py 渲染的派生表格，列为
+# ID / 内容 / 埋设章 / 计划回收章 / 状态 / 重要度 / 最近变更章）
+FORESHADOW_TABLE_NAME = "伏笔.md"
+# 伏笔表「计划回收章」列的下标（按 "|" 切分后：1=ID、2=内容、3=埋设章、4=计划回收章）
+FORESHADOW_TABLE_PLANNED_COL = 4
+# 计划回收章留空时的占位符（与 tracking_commit.render_foreshadow 一致）
+FORESHADOW_PLANNED_PLACEHOLDER = "—"
+# 从审计结论 message 里取伏笔编号：形如「伏笔 F003 计划第95章回收…」
+FORESHADOW_ID_IN_MESSAGE_RE = re.compile(r"伏笔\s*([A-Za-z]{1,4}\d{1,6})")
 
 
 def vendor_dir() -> Path:
@@ -1151,10 +1165,12 @@ def _tracking_rows(state: dict | None, key: str) -> list[tuple[str, dict]]:
 def _workbench_foreshadows(state: dict | None) -> list[dict]:
     """把伏笔表摊平成前端可直接渲染的行，两个「超期」维度分开给。
 
-    ``overdue`` 与 ``_audit_foreshadow_overdue`` 逐条对齐：状态为「已埋」、埋设章
-    有效（>0），且最近提交章 − 埋设章 **超过** ``FORESHADOW_OVERDUE_CHAPTERS``
-    （严格大于，正好等于阈值不算超期）。埋设章非法时无法判定，audit 会跳过，
-    这里同样不给 overdue，避免面板与体检结论两套标准。
+    ``overdue`` 是写作面板自己的维度（埋设章基准）：状态为「已埋」、埋设章有效
+    （>0），且最近提交章 − 埋设章 **超过** ``FORESHADOW_OVERDUE_CHAPTERS``
+    （严格大于，正好等于阈值不算超期）。埋设章非法时无法判定，这里不给
+    overdue，与 audit 的跳过规则一致。注意它与审计侧不同维度：审计看的是
+    「计划回收章 + 宽限」是否已过（见 ``_audit_foreshadow_overdue``），面板看的是
+    「埋了多久还没收」，所以同一条伏笔可能只有一边为真。
 
     ``planned_overdue`` 是写作视角的另一维度：计划回收章已过（``< next_chapter``）
     但仍标记「已埋」。它不等同于 audit 的 overdue——audit 看埋设章搁置了多久，
@@ -1776,7 +1792,8 @@ def novel_audit(workdir, scope="chapter", chapter=None, checks="auto") -> dict:
 
     - ``tracking_state``：``_tracking-state.json`` 的最近提交章与 正文/ 最大章号比对，
       不一致记 S1，状态文件缺失/损坏记 S3；
-    - ``foreshadow_overdue``：状态为"已埋"且埋设章距最近提交章超过 20 章，逐条记 S2；
+    - ``foreshadow_overdue``：状态为"已埋"且有计划回收章时，最近提交章超过
+      「计划回收章 + 20」逐条记 S2；无计划回收章的长线伏笔不报（无逾期基准）；
     - ``chapter_wordcount``：有细纲且正文存在时，正文可见字数低于细纲字数目标的
       80% 记 S3；
     - ``outline_gap``：审计范围内细纲存在但正文缺失记 S3；
@@ -1981,7 +1998,21 @@ def _audit_tracking_state(context: dict) -> tuple[list[dict], str | None]:
 
 
 def _audit_foreshadow_overdue(context: dict) -> tuple[list[dict], str | None]:
-    """检查 2：已埋伏笔距最近提交章超过 20 章未回收，逐条记 S2。"""
+    """检查 2：已埋伏笔超过「计划回收章 + 宽限」仍未回收，逐条记 S2。
+
+    判定基准是 ``planned_resolution_chapter``（计划回收章），不是埋设章：
+    只有 ``last_commit > planned + FORESHADOW_OVERDUE_CHAPTERS``（严格大于，
+    正好等于宽限不算逾期）才记 S2，message 里给出逾期章数。
+
+    计划回收章为空（None / 0）视为长线伏笔，**不报 S2**：没有承诺回收章就
+    不存在「逾期」的判定基准。这类伏笔搁置多久由工作台
+    （``_workbench_foreshadows`` 的 stale / planned_overdue 维度）呈现，不应
+    污染审计的必须改项——否则 defer / reschedule 把计划章置空或改远之后，
+    告警仍然存在，修复等于无效。
+
+    仍跳过 ``status != 已埋`` 与 ``planted_chapter <= 0``（埋设章非法时无法判定，
+    跳过而不误报）。
+    """
     state = context["state"]
     if not isinstance(state, dict):
         return [], "tracking_state_missing"
@@ -2008,13 +2039,18 @@ def _audit_foreshadow_overdue(context: dict) -> tuple[list[dict], str | None]:
         if planted <= 0:
             # 埋设章缺失/非法时无法判定超期，跳过该条而不误报
             continue
-        distance = last_commit - planted
-        if distance <= FORESHADOW_OVERDUE_CHAPTERS:
+        planned = _as_non_negative_int(
+            row.get("planned_resolution_chapter"), default=0
+        )
+        if planned <= 0:
+            # 无计划回收章 = 长线伏笔，没有逾期基准；交给工作台 stale 维度呈现
+            continue
+        if last_commit <= planned + FORESHADOW_OVERDUE_CHAPTERS:
             continue
         identifier = str(row.get("id") or "?").strip() or "?"
         message = (
-            f"伏笔 {identifier} 于第{planted}章埋设，已过 {distance} 章仍未回收，"
-            f"超过阈值 {FORESHADOW_OVERDUE_CHAPTERS} 章"
+            f"伏笔 {identifier} 计划第{planned}章回收，已逾期 {last_commit - planned} 章"
+            f"（超过宽限 {FORESHADOW_OVERDUE_CHAPTERS} 章）"
         )
         summary = str(row.get("summary") or "").strip()
         if summary:
@@ -2191,3 +2227,237 @@ def _audit_ai_patterns(context: dict) -> tuple[list[dict], str | None]:
             _scan_ai_patterns(context["root"], body_path, number, text, banned)
         )
     return findings, None
+
+
+# ---------------------------------------------------------------------------
+# 审查问题修复：novel_audit_fix（只做显式、可验证的状态改动）
+# ---------------------------------------------------------------------------
+
+
+def novel_audit_fix(
+    workdir, finding, action, planned_resolution_chapter=None, dry_run=False
+) -> dict:
+    """按审计结论修一处可显式验证的状态字段（不判定语义，不做正文改动）。
+
+    只支持 ``foreshadow_overdue``（伏笔超期），并且只改追踪状态里的
+    ``planned_resolution_chapter`` / ``updated_chapter`` 与 ``追踪/伏笔.md``
+    对应行的「计划回收章」单元格：
+
+    - ``defer``：计划回收章置空（长线经营），不再给出回收章承诺；
+    - ``reschedule``：重排到指定章，必须大于当前已提交章，不能倒着排；
+    - ``resolve``：明确拒绝——标已回收需要正文证据，交星瑶判断。
+
+    ``dry_run=True`` 只算 before/after，不写任何文件。真写时用 ``_write_text``
+    （带按回合撤销记录），写完重读 state 自检，并跑一次 ``novel_audit(scope=all)``
+    回报该伏笔是否仍被报出（``still_reported``）。
+
+    任何前置条件不满足都返回结构化 dict，不抛异常。
+    """
+    root = Path(workdir).expanduser()
+    missing = _require_novel_project(root)
+    if missing is not None:
+        return missing
+
+    if not isinstance(finding, dict):
+        return {
+            "ok": False,
+            "error": f"finding 必须是审计结论对象，收到：{type(finding).__name__}",
+        }
+    type_name = str(finding.get("type") or "").strip()
+    if not type_name:
+        return {"ok": False, "error": "finding 缺少 type 字段，无法判断问题类型"}
+    if type_name not in AUDIT_FIX_TYPES:
+        return {
+            "ok": False,
+            "supported": False,
+            "error": "该类型不支持自动修复，请交给星瑶按证据处理",
+        }
+
+    action_value = str(action or "").strip().lower()
+    if action_value not in AUDIT_FIX_ACTIONS:
+        return {
+            "ok": False,
+            "error": f"action 只接受 {' / '.join(AUDIT_FIX_ACTIONS)}，收到：{action}",
+        }
+    if action_value == "resolve":
+        return {
+            "ok": False,
+            "supported": False,
+            "error": "不提供自动标已回收：回收必须有正文证据，请交给星瑶",
+        }
+
+    matched = FORESHADOW_ID_IN_MESSAGE_RE.search(str(finding.get("message") or ""))
+    if matched is None:
+        return {"ok": False, "error": "无法从问题描述中定位伏笔编号"}
+    identifier = matched.group(1)
+
+    state = _load_tracking_state(root)
+    if not isinstance(state, dict):
+        return {
+            "ok": False,
+            "error": (
+                f"追踪状态不可用：{TRACKING_SUBDIR.as_posix()}/{TRACKING_STATE_NAME} "
+                "缺失或无法解析（先运行 novel_track init）"
+            ),
+        }
+    rows = state.get("foreshadow")
+    row = rows.get(identifier) if isinstance(rows, dict) else None
+    if not isinstance(row, dict):
+        return {"ok": False, "error": f"追踪状态里没有伏笔 {identifier}，无法修复"}
+
+    last_commit = _as_non_negative_int(state.get("last_committed_chapter"))
+    before = {
+        "planned_resolution_chapter": row.get("planned_resolution_chapter"),
+        "updated_chapter": row.get("updated_chapter"),
+    }
+
+    after_planned = None
+    if action_value == "reschedule":
+        raw_planned = planned_resolution_chapter
+        if isinstance(raw_planned, bool):
+            return {"ok": False, "error": "planned_resolution_chapter 必须是正整数"}
+        try:
+            planned = int(raw_planned) if raw_planned is not None else None
+        except (TypeError, ValueError):
+            planned = None
+        if planned is None or planned <= 0:
+            return {
+                "ok": False,
+                "error": (
+                    "reschedule 需要正整数 planned_resolution_chapter，"
+                    f"收到：{raw_planned!r}"
+                ),
+            }
+        if planned <= last_commit:
+            return {
+                "ok": False,
+                "error": (
+                    "计划回收章不能早于或等于当前已提交章"
+                    f"（第{last_commit}章），收到：第{planned}章"
+                ),
+            }
+        after_planned = planned
+
+    after = {"planned_resolution_chapter": after_planned, "updated_chapter": last_commit}
+    would_change = (
+        before["planned_resolution_chapter"] != after_planned
+        or before["updated_chapter"] != last_commit
+    )
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "foreshadow_id": identifier,
+            "before": before,
+            "after": after,
+            "would_change": would_change,
+        }
+
+    state_path = root / TRACKING_SUBDIR / TRACKING_STATE_NAME
+    table_path = root / TRACKING_SUBDIR / FORESHADOW_TABLE_NAME
+
+    row["planned_resolution_chapter"] = after_planned
+    row["updated_chapter"] = last_commit
+    # 与 tracking_commit.py 的写出口径一致（indent=2、键排序、末尾换行），
+    # 保证除被改字段外文件字节不变，不制造无意义 diff
+    _write_text(
+        state_path,
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        tool_name="novel_audit_fix",
+    )
+
+    planned_cell = (
+        FORESHADOW_PLANNED_PLACEHOLDER
+        if after_planned is None
+        else f"第{after_planned}章"
+    )
+    table_updated = False
+    if table_path.is_file():
+        try:
+            table_text = table_path.read_text(encoding="utf-8")
+        except OSError as error:
+            return {
+                "ok": False,
+                "error": f"伏笔表无法读取：{table_path}（{error}）",
+                "state_path": str(state_path),
+            }
+        patched, table_updated = _patch_foreshadow_table_text(
+            table_text, identifier, planned_cell
+        )
+        if table_updated:
+            _write_text(table_path, patched, tool_name="novel_audit_fix")
+
+    # 自检：重读 state 确认值真的落下去了，别把写失败报成成功
+    verified_state = _load_tracking_state(root)
+    verified_rows = (
+        verified_state.get("foreshadow") if isinstance(verified_state, dict) else None
+    )
+    verified_row = (
+        verified_rows.get(identifier) if isinstance(verified_rows, dict) else None
+    )
+    if not isinstance(verified_row, dict) or (
+        verified_row.get("planned_resolution_chapter") != after_planned
+    ):
+        return {
+            "ok": False,
+            "error": (
+                f"写入后自检失败：{_audit_relpath(root, state_path)} 中伏笔 "
+                f"{identifier} 的计划回收章未生效"
+            ),
+            "foreshadow_id": identifier,
+            "before": before,
+            "after": after,
+            "state_path": str(state_path),
+            "table_path": str(table_path),
+        }
+
+    result = {
+        "ok": True,
+        "dry_run": False,
+        "foreshadow_id": identifier,
+        "before": before,
+        "after": after,
+        "state_path": str(state_path),
+        "table_path": str(table_path),
+        "table_updated": table_updated,
+    }
+    result["still_reported"] = _audit_fix_still_reported(root, type_name, identifier)
+    return result
+
+
+def _patch_foreshadow_table_text(
+    text: str, identifier: str, planned_cell: str
+) -> tuple[str, bool]:
+    """只改伏笔表里该 ID 那一行的「计划回收章」单元格，其余行一字不动。
+
+    返回 (新文本, 是否命中)；表头、"|" 数量不足的异常行、其它 ID 全部跳过。
+    """
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        parts = body.split("|")
+        if len(parts) <= FORESHADOW_TABLE_PLANNED_COL:
+            continue
+        if parts[1].strip() != identifier:
+            continue
+        parts[FORESHADOW_TABLE_PLANNED_COL] = f" {planned_cell} "
+        lines[index] = "|".join(parts) + ending
+        return "".join(lines), True
+    return text, False
+
+
+def _audit_fix_still_reported(root: Path, type_name: str, identifier: str) -> bool:
+    """修复后再跑一次全项目审计，判断该伏笔是否仍被报出（只读）。"""
+    audit = novel_audit(str(root), scope="all")
+    if not isinstance(audit, dict) or not audit.get("ok"):
+        return False
+    for finding in audit.get("findings") or []:
+        if not isinstance(finding, dict) or finding.get("type") != type_name:
+            continue
+        matched = FORESHADOW_ID_IN_MESSAGE_RE.search(
+            str(finding.get("message") or "")
+        )
+        if matched is not None and matched.group(1) == identifier:
+            return True
+    return False

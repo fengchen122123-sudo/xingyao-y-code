@@ -1,0 +1,7 @@
+node_modules/
+dist/
+# 由 scripts/sync-excalidraw-assets.mjs 从 node_modules 同步的构建中间产物
+public/fonts/
+public/locales/
+*.local
+.DS_Store

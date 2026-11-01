@@ -11,7 +11,11 @@ from gui_bridge import ApiBridge
 
 def _use_isolated_config(tmp_path, monkeypatch, data=None):
     cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps(data or {}, ensure_ascii=False), encoding="utf-8")
+    # 未显式给内容时写一份「最小合法空配置」（与安装器 seed 的结构一致），
+    # 而不是 {}：配置读写闸门把「能解析但顶层空对象」判为读失败，
+    # 用 {} 会让 set_feishu_settings 的写入被整份拒绝，与本文件要测的飞书设置无关。
+    payload = data if data else {"active_model_id": None, "providers": []}
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
     monkeypatch.setattr(config, "_TOML_CONFIG_FILE", str(tmp_path / "config.toml"))
     return cfg

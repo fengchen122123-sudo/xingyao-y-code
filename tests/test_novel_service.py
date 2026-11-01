@@ -717,7 +717,10 @@ def test_audit_tracking_state_mismatch_returns_s1(tmp_path):
 
 
 def test_audit_foreshadow_overdue_returns_s2(tmp_path):
-    """伏笔第3章埋设、最近提交到第25章（差 22 章 > 20）→ 该伏笔记 S2。"""
+    """计划第4章回收、最近提交到第25章（25 > 4 + 20）→ 该伏笔记 S2。
+
+    口径以计划回收章为基准；无计划章的长线伏笔（F004）不报。
+    """
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 25, "远行", "# 第025章 远行\n\n雪停了。\n")
     _write_tracking_state(root, {
@@ -727,17 +730,17 @@ def test_audit_foreshadow_overdue_returns_s2(tmp_path):
                 "id": "F001",
                 "summary": "玉佩裂纹",
                 "planted_chapter": 3,
-                "planned_resolution_chapter": None,
+                "planned_resolution_chapter": 4,
                 "status": "已埋",
                 "importance": "高",
                 "updated_chapter": 3,
             },
-            # 差 20 章：正好等于阈值，不应报
+            # 计划第5章回收：25 <= 5 + 20，在宽限内，不应报
             "F002": {
                 "id": "F002",
                 "summary": "旧信",
                 "planted_chapter": 5,
-                "planned_resolution_chapter": 30,
+                "planned_resolution_chapter": 5,
                 "status": "已埋",
                 "importance": "中",
                 "updated_chapter": 5,
@@ -751,6 +754,16 @@ def test_audit_foreshadow_overdue_returns_s2(tmp_path):
                 "status": "已回收",
                 "importance": "低",
                 "updated_chapter": 10,
+            },
+            # 无计划回收章的长线伏笔：没有逾期基准，不报
+            "F004": {
+                "id": "F004",
+                "summary": "无名石碑",
+                "planted_chapter": 1,
+                "planned_resolution_chapter": None,
+                "status": "已埋",
+                "importance": "低",
+                "updated_chapter": 1,
             },
         },
     })
@@ -1239,21 +1252,26 @@ def test_workbench_non_novel_and_missing_state_defaults(tmp_path):
     assert {item["words"] for item in result["recent_daily"]} == {0}
 
 
-def test_workbench_foreshadows_sorted_and_overdue_matches_audit(tmp_path):
-    """排序为 超期 → 搁置章数 → 埋设章；overdue 与 novel_audit 的超期判定逐条一致。"""
+def test_workbench_foreshadows_sorted_and_overdue_is_planted_basis(tmp_path):
+    """排序为 超期 → 搁置章数 → 埋设章；overdue 按埋设章基准（与审计口径不同维度）。
+
+    audit 的超期口径是「计划回收章 + 宽限」（见 _audit_foreshadow_overdue），
+    本 fixture 里没有任何一条超过「计划章 + 20」，所以审计一条都不报；面板的
+    overdue 看的是埋设章搁置多久，仍会标出 F001。两者不再等价，故分开断言。
+    """
     root = _make_novel_project(tmp_path / "book")
     _write_tracking_state(root, {
         "last_committed_chapter": 25,
         "foreshadow": {
-            # 差 22 章 > 20 → 超期
+            # 差 22 章 > 20 → 面板 overdue
             "F001": _foreshadow_row("F001", 3, planned_resolution_chapter=21),
-            # 差 20 章，正好等于阈值 → 不算超期（与 audit 同为严格大于）
+            # 差 20 章，正好等于阈值 → 不算超期（严格大于）
             "F002": _foreshadow_row("F002", 5, planned_resolution_chapter=30),
             # 已回收：即使搁置最久也不算超期
             "F003": _foreshadow_row("F003", 2, status="已回收"),
             # 差 15 章 → 不超期
             "F004": _foreshadow_row("F004", 10),
-            # 埋设章缺失/为 0：audit 跳过，面板同样不报超期
+            # 埋设章缺失/为 0：面板与审计都跳过超期判定
             "F005": _foreshadow_row("F005", 0),
         },
     })
@@ -1266,13 +1284,13 @@ def test_workbench_foreshadows_sorted_and_overdue_matches_audit(tmp_path):
     assert [row["stale_chapters"] for row in rows] == [22, 25, 23, 20, 15]
     assert [row["overdue"] for row in rows] == [True, False, False, False, False]
 
+    # 审计侧：计划章 21 / 30 都在「计划 + 20」宽限内（25 <= 41 / 50），无计划章的不判，
+    # 所以一条超期结论都不该有——这正是面板 overdue 与审计口径分离后的预期
     audit = novel_service.novel_audit(str(root), scope="all")
     overdue_messages = [
         item["message"] for item in audit["findings"] if item["type"] == "foreshadow_overdue"
     ]
-    for row in rows:
-        audit_hit = any(f"伏笔 {row['id']} " in message for message in overdue_messages)
-        assert row["overdue"] is audit_hit, row
+    assert overdue_messages == []
 
 
 def test_workbench_characters_defaults_and_sorting(tmp_path):

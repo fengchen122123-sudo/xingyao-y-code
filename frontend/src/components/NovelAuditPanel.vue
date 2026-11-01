@@ -2,15 +2,25 @@
   <!-- 只读体检面板：一个按钮 + 分级汇总 + 逐条发现 + 跳过项，不做折叠/分页 -->
   <div class="novel-audit">
     <div class="novel-audit-head">
-      <button
-        class="novel-audit-run"
-        data-test="novel-audit-run"
-        :disabled="loading"
-        @click="emit('run')"
-      >
-        <AppIcon :name="loading ? 'loader' : 'shield'" :size="13" :class="{ 'icon-spin': loading }" />
-        <span>{{ loading ? '审查中…' : '运行审查' }}</span>
-      </button>
+      <!-- 运行审查 + 全部修复：修复入口只是把问题拼成指令交给星瑶，不在面板里直接改文件 -->
+      <div class="novel-audit-actions">
+        <button
+          class="novel-audit-run"
+          data-test="novel-audit-run"
+          :disabled="loading"
+          @click="emit('run')"
+        >
+          <AppIcon :name="loading ? 'loader' : 'shield'" :size="13" :class="{ 'icon-spin': loading }" />
+          <span>{{ loading ? '审查中…' : '运行审查' }}</span>
+        </button>
+        <button
+          v-if="findings.length > 0"
+          class="novel-audit-fix-all"
+          data-test="novel-audit-fix-all"
+          :disabled="fixing || loading"
+          @click="emit('fixAll')"
+        >全部交给星瑶修（{{ findings.length }}）</button>
+      </div>
       <span class="novel-audit-note">只读体检：追踪一致性 / 伏笔超期 / 字数达标 / 细纲缺口 / AI 味</span>
     </div>
 
@@ -43,6 +53,12 @@
             <span class="novel-audit-level" :class="levelClass(finding.level)">{{ finding.level }}</span>
             <span class="novel-audit-type">{{ finding.type }}</span>
             <span class="novel-audit-file">{{ finding.file }}</span>
+            <button
+              class="novel-audit-fix"
+              data-test="novel-audit-fix"
+              :disabled="fixing"
+              @click="emit('fix', finding)"
+            >修复</button>
           </div>
           <div class="novel-audit-message">{{ finding.message }}</div>
         </div>
@@ -62,7 +78,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import AppIcon from './AppIcon.vue';
-import type { NovelAuditDto } from '../types/pywebview.d';
+import type { NovelAuditDto, NovelAuditFindingDto } from '../types/pywebview.d';
 
 const props = defineProps<{
   /** 最近一次体检结果：null 表示还没跑过（只显示按钮与说明） */
@@ -71,11 +87,17 @@ const props = defineProps<{
   loading: boolean;
   /** 桥接层错误文本（调用失败 / 缺桥），非空时按 --red 显示 */
   error: string;
+  /** 是否正在把问题交给星瑶：为真时禁用修复入口，避免重复点击 */
+  fixing?: boolean;
 }>();
 
 const emit = defineEmits<{
   /** 点击「运行审查」：父组件负责调 run_novel_audit 并回填 result */
   (e: 'run'): void;
+  /** 点击单条「修复」：把这条 finding 交给父组件拼成对话指令 */
+  (e: 'fix', finding: NovelAuditFindingDto): void;
+  /** 点击「全部修复」：父组件按 type 分组汇总出总指令 */
+  (e: 'fixAll'): void;
 }>();
 
 // 分级固定四态（后端 AUDIT_LEVELS），缺项按 0 展示，不因缺键而漏格
@@ -139,6 +161,14 @@ function levelClass(level: string): string {
   gap: 4px;
 }
 
+/* 运行审查与全部修复同一行：窄面板下允许换行，不挤压说明文案 */
+.novel-audit-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 .novel-audit-run {
   display: inline-flex;
   align-items: center;
@@ -159,6 +189,36 @@ function levelClass(level: string): string {
 .novel-audit-run:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* 修复入口：与 .novel-audit-run 同色系，尺寸更小，hover/disabled 口径一致 */
+.novel-audit-fix-all,
+.novel-audit-fix {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.novel-audit-fix-all:hover:not(:disabled),
+.novel-audit-fix:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text-bright);
+}
+.novel-audit-fix-all:disabled,
+.novel-audit-fix:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* 单条修复贴在卡片头部最右侧：margin-left:auto 不挤掉 level/type/file */
+.novel-audit-fix {
+  margin-left: auto;
+  flex: 0 0 auto;
 }
 
 .novel-audit-note {

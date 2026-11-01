@@ -19,7 +19,15 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from xml.sax.saxutils import escape
 
-from ddgs import DDGS
+# 网页搜索依赖（ddgs）已做成「按需下载组件」，因此**不再**在模块级 import：
+# 它连带 primp（Rust 扩展）、lxml、fake_useragent 等二进制包，主安装包不再内置。
+# 若仍写 ``from ddgs import DDGS``，缺组件时连 ``import core.tools`` 都会失败——
+# 那是灾难性的：CLI 起不来、所有工具（不止搜索）全部不可用。
+#
+# 这里保留一个同名模块级占位 ``DDGS``，语义与懒加载器 _load_ddgs() 约定如下：
+#   - None  → 尚未加载，首次搜索时才真正导入（并按需插入组件目录到 sys.path）；
+#   - 非 None → 已加载的类，或测试 monkeypatch 注入的假 DDGS（沿用旧打桩方式）。
+DDGS = None
 
 from core.version import __version__ as YCODE_VERSION
 from core import tool_cache as _tool_cache
@@ -1110,6 +1118,47 @@ def execute_command(
 
 # --- 星瑶的新神装：新闻搜索 ---
 
+# 组件缺失时回给模型的可读提示（不是异常）：搜索是可选能力，缺组件只应让本次
+# 工具调用「不可用」，不能让整个 agent 轮次炸掉。提示里必须带设置页路径，
+# 这样模型可以把原话转述给用户，用户点两下就能装好。
+_SEARCH_COMPONENT_MISSING_HINT = (
+    "网页搜索需要先安装「网页搜索组件」。请在 设置 → 网页搜索 中点击下载，"
+    "或改用其它方式获取信息。"
+)
+
+
+def _load_ddgs():
+    """按需返回 ``ddgs.DDGS`` 类；网页搜索组件不可用时返回 None（不抛异常）。
+
+    流程（与 core.components.ensure_playwright 同一范式）：
+      1. 模块级 ``DDGS`` 已被填充（此前加载成功，或测试注入的桩）→ 直接返回；
+      2. ``ensure_search_component()``：已能 import ddgs 就直接通过，否则把组件
+         目录插进 sys.path 再试一次；
+      3. 组件缺失/导入失败一律返回 None，由调用方转成中文提示——这里刻意不抛
+         ComponentError，避免「没装搜索组件」把 search_news 的返回变成异常路径。
+    """
+    global DDGS
+    if DDGS is not None:
+        return DDGS
+    try:
+        # 惰性导入：core.tools 被大量模块早期引用，避免 import 期就把组件探测
+        # （含可能的 sys.path/import 动作）拖进启动路径。
+        from core.components import ensure_search_component
+
+        ensure_search_component()
+    except Exception as error:
+        _logger.info("网页搜索组件不可用：%s", error)
+        return None
+    try:
+        from ddgs import DDGS as _DDGS
+    except Exception as error:
+        # 走到这里说明组件目录里缺依赖（常见：primp/lxml 二进制扩展缺失）
+        _logger.info("导入 ddgs 失败：%s", error)
+        return None
+    DDGS = _DDGS
+    return DDGS
+
+
 # search 场景的决策题：让 JEV 按检索词判断本次需要几条结果。
 # 3 = 单一事实即可，5 = 常规，8 = 需要多来源交叉核对。
 _SEARCH_NUM_RESULTS_QUESTION = {
@@ -1165,6 +1214,11 @@ def _decide_search_num_results(query):
 
 def search_news(query, num_results=5, cancel_event=None):
     """🌐 现代化新闻搜索工具：稳定可靠的联网引擎"""
+    # 组件就绪性最先检查：ddgs 现在是按需下载的「网页搜索组件」，缺它时直接给
+    # 模型一段可读提示并正常返回（不抛异常），也不白跑一次 JEV 决策与网络请求。
+    ddgs_cls = _load_ddgs()
+    if ddgs_cls is None:
+        return _SEARCH_COMPONENT_MISSING_HINT
     try:
         # 钳制结果数：模型传 100000 会触发 DuckDuckGo 限流
         try:
@@ -1180,7 +1234,7 @@ def search_news(query, num_results=5, cancel_event=None):
         if decided_num_results is not None:
             # 仍走同一套钳制，保证 ddgs 的限流保护不被决策链路绕过
             num_results = max(1, min(decided_num_results, 20))
-        with DDGS() as ddgs:
+        with ddgs_cls() as ddgs:
             results = list(ddgs.news(query, max_results=num_results))
             _raise_if_cancelled(cancel_event)
 

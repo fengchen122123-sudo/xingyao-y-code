@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -682,3 +683,208 @@ def test_status_keeps_quiet_when_version_unknown(component_env):
     assert status["version_compatible"] is None
     assert status["outdated"] is False
     assert status["version_warning"] == ""
+
+
+# ---------------------------------------------------------------- ffmpeg 组件
+# 第二个接入组件注册表的组件（视频转换组件）。这里只验证「注册表驱动」这条主线上
+# 最容易回归的点：spec 字段值、未安装/已安装两种状态、未知 id 的错误码。
+# 目录一律落在 tmp_path（component_env 已把 COMPONENT_ROOT 指过去），绝不碰真实用户目录。
+
+
+_FFMPEG_STATUS_KEYS = {
+    "installed",
+    "version",
+    "downloading",
+    "percent",
+    "downloaded_bytes",
+    "total_bytes",
+    "error",
+    "digest_verified",
+    "warning",
+    "required_version",
+    "version_compatible",
+    "outdated",
+    "version_warning",
+    "dir",
+    "stage",
+}
+
+
+def test_ffmpeg_spec_registered():
+    """ffmpeg 已登记进 _COMPONENTS，且关键字段值固定（桥接层/前端文案依赖它们）。"""
+    spec = components._COMPONENTS["ffmpeg"]
+    assert spec is components.FFMPEG_SPEC
+    assert components.get_component_spec("ffmpeg") is spec
+    assert spec.display_name == "视频转换组件"
+    assert spec.install_dir == "ffmpeg"
+    assert spec.archive_name == "ffmpeg-component.zip"
+    assert spec.extract_prefix == ".ffmpeg-extract-"
+    assert spec.asset_hint == "ffmpeg-component"
+    assert spec.required_files == ("ffmpeg.exe",)
+    assert spec.required_dirs == ()
+    # 不是 Python 包：版本约束/版本探测文件/import 名一律为空，泛化实现必须容忍
+    assert spec.version_spec == ""
+    assert spec.version_probe_file == ""
+    assert spec.import_name == ""
+    assert spec.manifest_version_key == "ffmpeg_version"
+    assert spec.env_url_var == "YCODE_FFMPEG_COMPONENT_URL"
+    assert spec.error_prefix == "ffmpeg_component"
+    assert spec.settings_hint == "设置 → 背景图转换"
+    assert spec.size_hint_mb == 97
+    assert spec.version_label == "ffmpeg"
+
+
+def test_ffmpeg_not_installed_status(component_env):
+    """空组件目录：installed/downloading 均为 False，15 键齐全且版本为空串。"""
+    status = components.get_component_status("ffmpeg")
+
+    assert set(status.keys()) == _FFMPEG_STATUS_KEYS
+    assert len(status) == 15
+    assert status["installed"] is False
+    assert status["downloading"] is False
+    assert status["version"] == ""
+    # 没有版本约束 → 版本比对为「未知」，不得误报 outdated
+    assert status["required_version"] == ""
+    assert status["version_compatible"] is None
+    assert status["outdated"] is False
+    assert status["version_warning"] == ""
+    expected_dir = os.path.join(os.path.abspath(str(component_env)), "ffmpeg")
+    assert os.path.normcase(status["dir"]) == os.path.normcase(expected_dir)
+
+
+def test_ffmpeg_installed_detection(component_env):
+    """ffmpeg.exe 就位即算已安装，且版本号能从 COMPONENT.json 的 ffmpeg_version 读到。"""
+    ffmpeg_dir = Path(components.component_dir("ffmpeg"))
+    ffmpeg_dir.mkdir(parents=True, exist_ok=True)
+    (ffmpeg_dir / "ffmpeg.exe").write_bytes(b"stub-ffmpeg")
+    (ffmpeg_dir / "COMPONENT.json").write_text(
+        json.dumps({"ffmpeg_version": "8.1.0"}), encoding="utf-8"
+    )
+
+    status = components.get_component_status("ffmpeg")
+    assert status["installed"] is True
+    assert status["version"] == "8.1.0"
+    assert status["version_compatible"] is None
+    assert status["outdated"] is False
+    assert status["version_warning"] == ""
+
+    # 必检文件缺失 → 回到未安装（required_files 真的在参与判定）
+    (ffmpeg_dir / "ffmpeg.exe").unlink()
+    assert components.get_component_status("ffmpeg")["installed"] is False
+
+
+def test_unknown_component_raises():
+    """未知组件 id 抛 ComponentError，错误码为 ``<id>_component_unknown``。"""
+    with pytest.raises(components.ComponentError) as excinfo:
+        components.get_component_status("nope")
+    assert excinfo.value.code == "nope_component_unknown"
+
+
+# ---------------------------------------------------------------- search 组件
+# 第三个接入组件注册表的组件（网页搜索组件：ddgs + primp + lxml + fake_useragent
+# 四个纯 Python/二进制包目录）。与 ffmpeg 恰好互补地验证另一条空值分支：
+# 它 required_files 为空、required_dirs 有四个——安装检测必须靠目录判定，
+# 不能因为「没有单个标志文件」就恒判未安装或恒判已安装。
+
+
+def test_search_spec_registered():
+    """search 已登记进 _COMPONENTS，且关键字段值固定（桥接层/提示文案依赖它们）。"""
+    spec = components._COMPONENTS["search"]
+    assert spec is components.SEARCH_SPEC
+    assert components.get_component_spec("search") is spec
+    assert spec.display_name == "网页搜索组件"
+    assert spec.install_dir == "search"
+    assert spec.archive_name == "search-component.zip"
+    assert spec.extract_prefix == ".search-extract-"
+    assert spec.asset_hint == "search-component"
+    # 与 ffmpeg 相反：没有单个标志文件，只能按顶层包目录判定
+    assert spec.required_files == ()
+    assert spec.required_dirs == ("ddgs", "primp", "lxml", "fake_useragent")
+    # 不做版本约束：没有约束、没有版本探测文件
+    assert spec.version_spec == ""
+    assert spec.version_probe_file == ""
+    assert spec.manifest_version_key == "search_version"
+    assert spec.import_name == "ddgs"
+    assert spec.env_url_var == "YCODE_SEARCH_COMPONENT_URL"
+    assert spec.error_prefix == "search_component"
+    assert spec.settings_hint == "设置 → 网页搜索"
+    assert spec.size_hint_mb == 18
+    assert spec.version_label == "search"
+
+
+def test_search_not_installed_status(component_env):
+    """空组件目录：installed/downloading 均为 False，15 键齐全且版本为空串。"""
+    status = components.get_component_status("search")
+
+    # 状态形状必须与 playwright / ffmpeg 完全一致（前端同一套渲染）
+    assert set(status.keys()) == _FFMPEG_STATUS_KEYS
+    assert len(status) == 15
+    assert status["installed"] is False
+    assert status["downloading"] is False
+    assert status["version"] == ""
+    # 没有版本约束 → 版本比对为「未知」，不得误报 outdated
+    assert status["required_version"] == ""
+    assert status["version_compatible"] is None
+    assert status["outdated"] is False
+    assert status["version_warning"] == ""
+    expected_dir = os.path.join(os.path.abspath(str(component_env)), "search")
+    assert os.path.normcase(status["dir"]) == os.path.normcase(expected_dir)
+
+
+def test_search_installed_detection(component_env):
+    """四个包目录 + COMPONENT.json 就位即算已安装；缺任一目录回到未安装。"""
+    search_dir = Path(components.component_dir("search"))
+    for package in ("ddgs", "primp", "lxml", "fake_useragent"):
+        (search_dir / package).mkdir(parents=True, exist_ok=True)
+        (search_dir / package / "__init__.py").write_text("", encoding="utf-8")
+    (search_dir / "COMPONENT.json").write_text(
+        json.dumps({"search_version": "9.14.4"}), encoding="utf-8"
+    )
+
+    status = components.get_component_status("search")
+    assert status["installed"] is True
+    assert status["version"] == "9.14.4"
+    assert status["version_compatible"] is None
+    assert status["outdated"] is False
+    assert status["version_warning"] == ""
+
+    # 少一个必检目录 → 未安装（required_dirs 真的在参与判定，而不是恒真/恒假）
+    shutil.rmtree(search_dir / "fake_useragent")
+    assert components.get_component_status("search")["installed"] is False
+
+
+def test_ensure_search_component_inserts_dir_then_caches(component_env, monkeypatch):
+    """首轮导入失败时插入组件目录并重试；成功后走独立缓存不再重试。
+
+    顺带守住「缓存不与 playwright 共用」这条约束：_search_import_ready 与
+    _import_ready 是两个独立布尔，playwright 已就绪不代表 ddgs 已就绪。
+    """
+    calls: list[bool] = []
+
+    def fake_try_import() -> bool:
+        calls.append(True)
+        return len(calls) > 1  # 首次失败（需插入 sys.path），插入后成功
+
+    monkeypatch.setattr(components, "_try_import_ddgs", fake_try_import)
+    monkeypatch.setattr(components, "_search_import_ready", False)
+    monkeypatch.setattr(components, "_import_ready", True)  # playwright 已就绪
+
+    components.ensure_search_component()
+    assert len(calls) == 2
+    target = os.path.normcase(os.path.abspath(str(components.component_dir("search"))))
+    assert [p for p in sys.path if os.path.normcase(os.path.abspath(p)) == target]
+    assert components._search_import_ready is True
+
+    components.ensure_search_component()  # 缓存命中，不再重试
+    assert len(calls) == 2
+
+
+def test_ensure_search_component_missing_raises(component_env, monkeypatch):
+    """导入始终失败：抛 search_component_missing，文案带设置页路径。"""
+    monkeypatch.setattr(components, "_try_import_ddgs", lambda: False)
+    monkeypatch.setattr(components, "_search_import_ready", False)
+
+    with pytest.raises(components.ComponentError) as excinfo:
+        components.ensure_search_component()
+    assert excinfo.value.code == "search_component_missing"
+    assert "网页搜索" in str(excinfo.value)

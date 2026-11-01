@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import io
 import re
 import zipfile
 import xml.etree.ElementTree as ET
@@ -236,6 +237,32 @@ def _read_pdf(path: str, max_pages: int = DEFAULT_MAX_PAGES) -> str:
 # ─── 工具入口 ────────────────────────────────────────────────────────
 
 
+_MISSING_DEP_HINTS = {
+    "openpyxl": ("openpyxl", "xlsx 读写"),
+    "et_xmlfile": ("openpyxl", "xlsx 读写"),
+    "pypdf": ("pypdf", "pdf 文本提取"),
+}
+
+
+def _missing_dependency_hint(exc: BaseException) -> str:
+    """把 ModuleNotFoundError 翻成「缺什么、怎么装」的可执行提示。
+
+    正常安装包已通过 ycode.spec 的 collect_all 内置这两个包；走到这里通常是
+    源码运行环境没装依赖，或拿到的是旧版安装包。裸抛 ModuleNotFoundError
+    对用户毫无可操作性，所以统一翻译。
+    """
+    name = str(getattr(exc, "name", "") or "")
+    package, capability = _MISSING_DEP_HINTS.get(name, (name, "该格式"))
+    if not package:
+        return "缺少依赖：%s" % exc
+    return (
+        "缺少依赖 %s（%s所需）。\n"
+        "  源码/开发环境：pip install %s\n"
+        "  安装包版本：请升级到内置该依赖的新版本（旧包未随包携带）"
+        % (package, capability, package)
+    )
+
+
 def office_read(path, sheet="", max_rows=DEFAULT_MAX_ROWS, max_chars=DEFAULT_MAX_CHARS):
     """读取办公文档并转成结构化 Markdown。"""
     if not isinstance(path, str) or not path.strip():
@@ -272,6 +299,9 @@ def office_read(path, sheet="", max_rows=DEFAULT_MAX_ROWS, max_chars=DEFAULT_MAX
             body = _read_pptx(str(resolved))
         else:
             body = _read_pdf(str(resolved))
+    except ImportError as exc:
+        # openpyxl / pypdf 缺失：给可执行提示，别把 ModuleNotFoundError 甩给用户
+        return ToolResult(content=_missing_dependency_hint(exc), is_error=True)
     except Exception as exc:
         return ToolResult(
             content="解析 %s 失败：%s: %s" % (resolved.name, type(exc).__name__, exc),
@@ -324,7 +354,11 @@ def _cell_value(value):
 
 
 def _write_xlsx(path: Path, sheets, overwrite: bool = False):
-    """按办公室默认规范写 xlsx；返回 (数据行数, 工作表名列表)，非法输入抛 ValueError。"""
+    """按办公室默认规范生成 xlsx 字节；返回 (字节, 数据行数, 工作表名列表)。
+
+    只在内存里生成产物、不落盘——落盘由调用方走 _save_with_turn_undo，
+    这样按回合撤销能拿到完整的计划 after。非法输入抛 ValueError。
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -411,9 +445,43 @@ def _write_xlsx(path: Path, sheets, overwrite: bool = False):
         ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
 
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue(), written, names
+
+
+def _save_with_turn_undo(path: Path, payload: bytes, tool_name: str) -> None:
+    """落盘并接入按回合撤销（与 write_file、图片落盘同一套记录器流程）。
+
+    检查点已封闭（迟到写入）时直接抛错、不触盘；没有活动检查点（CLI、测试或
+    未开启撤销的嵌入方）降级为不可撤销裸写，与 write_file 的降级语义一致。
+    工作区正被其他活跃回合写入时 prepare_mutation 抛 workspace_busy，同样不触盘。
+    """
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.turn_undo import recorder as _tu_recorder
+    from core.turn_undo.models import NodeKind, TurnUndoError, UndoErrorCode
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(path))
-    return written, names
+    with _tu_coordinator.get_coordinator().workspace_lock(
+        _tu_coordinator.thread_workspace_root()
+    ):
+        handle = None
+        try:
+            handle = _tu_recorder.prepare_mutation(
+                display_path=str(path),
+                after_kind=NodeKind.REGULAR_FILE,
+                after_content=payload,
+                tool_name=tool_name,
+                tool_call_id="",
+            )
+        except TurnUndoError as error:
+            if error.code != UndoErrorCode.NO_ACTIVE_CHECKPOINT:
+                raise
+            handle = None
+        with open(path, "wb") as f:
+            f.write(payload)
+        if handle is not None:
+            _tu_recorder.verify_after_mutation(handle)
 
 
 def office_write(path, sheets=None, overwrite=False):
@@ -440,10 +508,21 @@ def office_write(path, sheets=None, overwrite=False):
         return ToolResult(content="写入失败：%s" % exc, is_error=True)
 
     try:
-        written, names = _write_xlsx(resolved, sheets, overwrite=overwrite)
+        payload, written, names = _write_xlsx(resolved, sheets, overwrite=overwrite)
     except ValueError as exc:
         return ToolResult(content="写入失败：%s" % exc, is_error=True)
+    except ImportError as exc:
+        return ToolResult(content=_missing_dependency_hint(exc), is_error=True)
     except Exception as exc:
+        return ToolResult(
+            content="写入 %s 失败：%s: %s" % (resolved.name, type(exc).__name__, exc),
+            is_error=True,
+        )
+
+    try:
+        _save_with_turn_undo(resolved, payload, "office_write")
+    except Exception as exc:
+        # 撤销记录失败（检查点已封闭 / 工作区被占）一律不触盘，如实报错
         return ToolResult(
             content="写入 %s 失败：%s: %s" % (resolved.name, type(exc).__name__, exc),
             is_error=True,
@@ -464,7 +543,9 @@ _PERMISSION_KWARGS = dict(
     mutates_files=False,
     requires_permission=True,
     parallel_safe=True,
-    side_effect_scope="workspace",
+    # 纯本地只读：按声明契约（tests/test_tool_declarations.py）只读工具的
+    # side_effect_scope 只能是 none / network，不得标 workspace 这类写类范围
+    side_effect_scope="none",
 )
 
 _WRITE_KWARGS = dict(

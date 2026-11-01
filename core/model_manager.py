@@ -588,7 +588,11 @@ def delete_model(model_id: str):
 
 
 def delete_provider(provider_id: str):
-    """显式删除厂商及其模型，并修复活动/副模型选择。"""
+    """显式删除厂商及其模型，并修复活动/副模型选择。
+
+    删除最后一个厂商同样属于用户明确意图，因此显式传 allow_provider_wipe=True
+    放行写入保护（其余写入路径仍会拒绝把 providers 写空）。
+    """
     def _mutate(data):
         providers = data.get("providers", [])
         target = next((provider for provider in providers if provider.get("id") == provider_id), None)
@@ -604,7 +608,7 @@ def delete_provider(provider_id: str):
                 None,
             )
 
-    config.update_config(_mutate)
+    config.update_config(_mutate, allow_provider_wipe=True)
 
 
 def update_provider(

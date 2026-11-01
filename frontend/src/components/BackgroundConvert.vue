@@ -27,11 +27,67 @@
           建议先截取 <b>4~6 秒</b>、fps <b>8~15</b> 的循环片段：体积小、内存占用低、观感足够。
         </li>
         <li>
-          转换使用<strong>随包内置的 ffmpeg</strong>，无需自行安装；
-          仅在内置副本缺失时才回退到系统 <code>ffmpeg</code>。
-          <span v-if="ffmpegChecked && !ffmpegOk" class="bad">当前未检测到 ffmpeg —— 无法转换。</span>
+          转换需要<strong>视频转换组件（ffmpeg）</strong>，首次使用需下载一次。
         </li>
       </ul>
+    </section>
+
+    <!-- 视频转换组件（ffmpeg）：安装包不再内置，改用按需下载。
+         状态一律读 Store 快照（桥事件只更新 Store），组件内不另存副本，
+         避免两处状态不一致；进度条结构沿用设置页 playwright 卡片那套语感 -->
+    <section class="card component-card" data-test="ffmpeg-component">
+      <h2>视频转换组件</h2>
+      <div class="component-row">
+        <span
+          v-if="ffmpegComponent.installed"
+          class="component-ready"
+          data-test="ffmpeg-component-ready"
+        >已就绪 · v{{ ffmpegComponent.version || '未知' }}</span>
+        <template v-else-if="ffmpegComponent.downloading">
+          <div
+            class="component-progress"
+            role="progressbar"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            :aria-valuenow="ffmpegPercent"
+            data-test="ffmpeg-component-progress"
+          >
+            <div class="component-progress-bar" :style="{ width: ffmpegPercent + '%' }" />
+          </div>
+          <span class="component-size" data-test="ffmpeg-component-size">{{ ffmpegSizeText }}</span>
+        </template>
+        <span v-else class="component-missing" data-test="ffmpeg-component-missing">未安装</span>
+
+        <button
+          v-if="!ffmpegComponent.installed && !ffmpegComponent.downloading"
+          class="btn primary"
+          type="button"
+          data-test="ffmpeg-component-download"
+          :disabled="ffmpegBusy"
+          @click="downloadFfmpegComponent"
+        >下载组件</button>
+        <button
+          v-if="ffmpegComponent.downloading"
+          class="btn ghost danger"
+          type="button"
+          data-test="ffmpeg-component-cancel"
+          :disabled="ffmpegBusy"
+          @click="cancelFfmpegComponentDownload"
+        >取消</button>
+        <!-- 兜底：组件就绪但旧预检快照仍说不能转换时（例如进度事件丢失导致
+             自动重探没触发），给一个手动重新检测的出口 -->
+        <button
+          v-if="ffmpegComponent.installed && video && !video.can_convert"
+          class="btn ghost"
+          type="button"
+          data-test="ffmpeg-component-recheck"
+          :disabled="ffmpegBusy"
+          @click="recheckVideo"
+        >重新检测</button>
+      </div>
+      <p v-if="ffmpegComponent.error" class="alert bad" data-test="ffmpeg-component-error">
+        {{ ffmpegComponent.error }}
+      </p>
     </section>
 
     <!-- ① 选择视频 -->
@@ -164,7 +220,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
@@ -178,8 +234,6 @@ const maxDimension = computed(() => store.bgConvert.video?.max_dimension ?? 8192
 
 const video = computed(() => store.bgConvert.video);
 const hasDuration = computed(() => !!video.value?.duration);
-const ffmpegChecked = computed(() => !!video.value);
-const ffmpegOk = computed(() => !!video.value?.ffmpeg_available);
 
 const estimatedFrames = computed(() => {
   const v = video.value;
@@ -230,6 +284,52 @@ function fmtBytes(bytes: number) {
   if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1048576).toFixed(2)} MiB`;
 }
+
+// ── 视频转换组件（ffmpeg）──
+// 展示状态一律读 Store 快照，桥事件只更新 Store；组件内不维护副本
+const ffmpegComponent = computed(() => store.ffmpegComponent);
+const ffmpegPercent = computed(() => {
+  const value = Number(store.ffmpegComponent.percent) || 0;
+  return Math.min(100, Math.max(0, Math.round(value)));
+});
+// 已下载/总字节按 MB 展示（total 未知时为 0，此时只显示已下载量）
+const ffmpegSizeText = computed(() => {
+  const format = (bytes: number) => `${(Math.max(0, Number(bytes) || 0) / (1024 * 1024)).toFixed(1)} MB`;
+  const total = Number(store.ffmpegComponent.total_bytes) || 0;
+  const done = Number(store.ffmpegComponent.downloaded_bytes) || 0;
+  return total > 0 ? `${format(done)} / ${format(total)}` : format(done);
+});
+// 桥调用在途闸门：下载/取消/重探都只发一次请求，避免重复点击叠加调用
+const ffmpegBusy = ref(false);
+
+async function withFfmpegBusy(task: () => Promise<unknown>) {
+  if (ffmpegBusy.value) return;
+  ffmpegBusy.value = true;
+  try {
+    await task();
+  } finally {
+    ffmpegBusy.value = false;
+  }
+}
+
+function downloadFfmpegComponent() {
+  void withFfmpegBusy(() => store.downloadFfmpegComponent());
+}
+
+function cancelFfmpegComponentDownload() {
+  void withFfmpegBusy(() => store.cancelFfmpegComponentDownload());
+}
+
+// 手动兜底：组件装好但预检快照仍是旧的（正常情况由下载完成事件自动重探，
+// 事件丢失时靠这个按钮补救），重探只影响当前已选视频的 blocker，不动转换结果
+function recheckVideo() {
+  void withFfmpegBusy(() => store.redescribeBackgroundVideo());
+}
+
+// 进入本页先同步一次组件真实安装态：Store 可能是上次会话留下的旧快照
+onMounted(() => {
+  void store.refreshFfmpegComponentStatus();
+});
 </script>
 
 <style scoped>
@@ -296,4 +396,20 @@ function fmtBytes(bytes: number) {
 @keyframes bg-convert-slide { from { opacity: 0.35; } to { opacity: 1; } }
 .progress-meta { font-size: 11.5px; color: var(--text-faint); }
 .result { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+/* ── 视频转换组件（ffmpeg）状态块：语感对齐设置页 playwright 卡片 ── */
+.component-card { gap: 8px; }
+.component-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.component-missing { color: var(--text-faint); font-size: 12px; }
+.component-ready { color: var(--green); font-size: 12px; }
+.component-progress {
+  flex: 1 1 auto;
+  min-width: 120px;
+  max-width: 320px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.component-progress-bar { height: 100%; background: var(--accent); transition: width 0.2s ease; }
+.component-size { flex: 0 0 auto; color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
 </style>

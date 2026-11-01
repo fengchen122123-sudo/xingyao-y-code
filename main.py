@@ -2269,6 +2269,102 @@ def _resume_make_planner(manager_obj):
     return ResumePlanner(manager_obj, registry)
 
 
+def _resume_journal_writer(manager_obj):
+    """续跑专用 journal writer：与回合运行时统一 owner 租约。
+
+    ResumeExecutor 自建 journal 的 owner 是 ``harness-resume-<uuid>``，与
+    TurnRuntime 的 PROCESS_OWNER_ID 不同；10s 心跳过期后 recover_stale 会把
+    续跑 turn 判成 interrupted。显式注入同一 owner 的 HarnessJournal 规避。
+    manager 不支持 journal 存储（鸭子类型替身）时回退 None，行为同接线前。
+    """
+    from core.harness.journal import (
+        PROCESS_OWNER_ID,
+        HarnessJournal,
+        journal_storage_supported,
+    )
+
+    if not journal_storage_supported(manager_obj):
+        return None
+    return HarnessJournal(
+        manager_obj,
+        PROCESS_OWNER_ID,
+        clock_ms=lambda: time.time_ns() // 1_000_000,
+    )
+
+
+def _run_resume_turn_cli_worker(session_name: str, *, turn_id: str, parent_turn_id: str) -> None:
+    """CLI 断点续跑的真实请求线程体（daemon 线程）。
+
+    刻意不复用 _background_worker 的回合装配：那条路径会先把用户输入落库
+    （追加一条 user 消息）并开撤销检查点，等于篡改父回合历史。本方法只读
+    组装历史，然后以 resume_turn=True 直接发一次请求（该 turn 行已由
+    ResumeExecutor 建好，TurnRuntime.start 不能再重复 INSERT）。
+    """
+    global active_cancel_event, active_turn_id
+
+    cancel_event = None
+    try:
+        from core.agent_service import build_resume_messages
+        from core.llm import chat_with_model_events
+        from core.model_manager import get_active_model
+
+        active_model = get_active_model(session_name)
+        if not active_model or not active_model.get("litellm_model"):
+            schedule_ui(lambda: print_formatted_text(HTML(
+                "<ansired>❌ 断点续跑未执行：当前未激活任何 LLM 模型。</ansired>"
+            )))
+            return
+        model_name = active_model["litellm_model"]
+        api_key = active_model.get("api_key", "") or ""
+        api_base = active_model.get("base_url", "") or ""
+        model_id = active_model.get("id")
+        history = build_resume_messages(manager, session_name, is_gui=False)
+        cancel_event = threading.Event()
+        active_cancel_event = cancel_event
+        active_turn_id = turn_id
+        try:
+            from core import tool_cache as _tool_cache_cli
+
+            _tool_cache_cli.set_current_session(session_name)
+        except Exception:
+            pass
+        schedule_ui(lambda: print_formatted_text(HTML(
+            "<ansigray>↻ 断点续跑：正在从上次中断处继续…</ansigray>"
+        )))
+        response_gen = chat_with_model_events(
+            model_name,
+            api_key,
+            history,
+            api_base,
+            persist=True,
+            turn_id=turn_id,
+            cancel_event=cancel_event,
+            parent_session=session_name,
+            parent_turn_id=parent_turn_id,
+            permission_owner=turn_id,
+            permission_source="主代理",
+            model_id=model_id,
+            request_reason="resume",
+            resume_turn=True,
+        )
+        # 事件统一交回主 CLI 线程渲染（后台线程绝不直接 print）
+        _forward_response_events(response_gen)
+    except Exception as e:
+        logging.getLogger("py.warnings").exception(
+            "CLI 断点续跑回合失败 session=%s turn=%s", session_name, turn_id
+        )
+        message = _esc(str(e))
+        schedule_ui(lambda text=message: print_formatted_text(HTML(
+            f"<ansired>❌ 断点续跑失败：{text}</ansired>"
+        )))
+    finally:
+        if cancel_event is not None and active_cancel_event is cancel_event:
+            active_cancel_event = None
+        if active_turn_id == turn_id:
+            active_turn_id = None
+        schedule_ui(_reset_turn_state)
+
+
 def _resume_print_plan(plan, aborts) -> None:
     """打印断点位置与待确认清单（只含序号/工具名/原因，不含参数与结果正文）。"""
     anchor_state = "完整" if plan.anchor.complete() else "缺失"
@@ -2301,7 +2397,12 @@ def _resume_print_plan(plan, aborts) -> None:
 
 
 def _handle_resume_command(session_name: str) -> None:
-    """`/resume`：打印断点 → 终端一次性确认（全部同意或取消）→ ResumeExecutor。"""
+    """`/resume`：打印断点 → 终端一次性确认（全部同意或取消）→ ResumeExecutor。
+
+    通过 resume_execute 同款 request_fn 发起真实请求：本函数在主提示循环里
+    同步执行，因此只负责"确认 + 建 turn + 起线程"，模型请求本身在 daemon
+    线程里跑（CLI 没有 emit_event，事件经 _forward_response_events 回显）。
+    """
     if not _resume_switch_enabled():
         print_formatted_text(HTML("<ansiyellow>断点续跑未启用（resume.enabled=false）。</ansiyellow>"))
         print_formatted_text(HTML(
@@ -2329,10 +2430,37 @@ def _handle_resume_command(session_name: str) -> None:
         print_formatted_text(HTML("<ansigray>已取消（默认 N）：父回合保持中断，未做任何修改。</ansigray>"))
         return
     confirmed: set = {call.call_ordinal for call in plan.blocked}
-    result = ResumeExecutor(manager, planner).run(plan, confirmed=confirmed)
+
+    def _request_resume_turn(
+        *, turn_id: str, parent_turn_id: str, request_reason: str = "resume"
+    ) -> None:
+        """request_fn 契约（core/harness/resume.py）：只发起，绝不阻塞。
+
+        本命令由 CLI 主提示循环同步调用：若在此同步跑完整个模型回合，界面会
+        整段冻住（既看不到输出也无法响应 Ctrl+C）。故起 daemon 线程后立即返回，
+        真实请求与事件渲染都由 _run_resume_turn_cli_worker 负责。
+        """
+        threading.Thread(
+            target=_run_resume_turn_cli_worker,
+            args=(session_name,),
+            kwargs={"turn_id": turn_id, "parent_turn_id": parent_turn_id},
+            daemon=True,
+            name=f"cli-resume-turn-{session_name}",
+        ).start()
+
+    result = ResumeExecutor(
+        manager,
+        planner,
+        writer=_resume_journal_writer(manager),
+        request_fn=_request_resume_turn,
+    ).run(plan, confirmed=confirmed)
     if result.get("ok"):
         turn_id = str(result.get("turn_id") or "")
-        note = "（dry-run：请求层未接线，未发出模型请求）" if result.get("dry_run") else ""
+        note = (
+            "（dry-run：请求层未接线，未发出模型请求）"
+            if result.get("dry_run")
+            else "（模型请求已在后台线程发出，输出稍后到达）"
+        )
         print_formatted_text(HTML(
             f"<ansigreen>✅ 已从断点续跑：新回合 {_esc(_undo_short_id(turn_id))}，"
             f"回灌只读调用 {int(result.get('replayed') or 0)} 个{_esc(note)}。</ansigreen>"

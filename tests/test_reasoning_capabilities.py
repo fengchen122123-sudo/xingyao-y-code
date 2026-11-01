@@ -223,12 +223,12 @@ def test_fixed_models_are_visible_locked_on_and_explicit_hidden_models_are_hidde
         assert fallback["kind"] == "effort"
         assert fallback["visible"] is True
         assert fallback["options"] == [
-            {"value": "default", "label": "default"},
-            {"value": "off", "label": "off"},
-            {"value": "low", "label": "low"},
-            {"value": "medium", "label": "medium"},
-            {"value": "high", "label": "high"},
-            {"value": "max", "label": "max"},
+            {"value": "default", "label": "默认"},
+            {"value": "off", "label": "关闭"},
+            {"value": "low", "label": "低"},
+            {"value": "medium", "label": "中"},
+            {"value": "high", "label": "高"},
+            {"value": "max", "label": "最高"},
         ]
 
 
@@ -243,12 +243,12 @@ def test_unregistered_model_snapshot_exposes_effort_menu():
         "choice": "default",
         "default_choice": "",
         "options": [
-            {"value": "default", "label": "default"},
-            {"value": "off", "label": "off"},
-            {"value": "low", "label": "low"},
-            {"value": "medium", "label": "medium"},
-            {"value": "high", "label": "high"},
-            {"value": "max", "label": "max"},
+            {"value": "default", "label": "默认"},
+            {"value": "off", "label": "关闭"},
+            {"value": "low", "label": "低"},
+            {"value": "medium", "label": "中"},
+            {"value": "high", "label": "高"},
+            {"value": "max", "label": "最高"},
         ],
     }
     assert build_reasoning_snapshot({"name": "hy4-preview"}, "high")["choice"] == "high"
@@ -259,11 +259,11 @@ def test_snapshot_serializes_labels_in_capability_order():
     snapshot = build_reasoning_snapshot({"name": "qwen3.8-max"}, "medium")
     assert snapshot["choice"] == "medium"
     assert snapshot["options"] == [
-        {"value": "default", "label": "default"},
-        {"value": "off", "label": "off"},
-        {"value": "low", "label": "low"},
-        {"value": "medium", "label": "medium"},
-        {"value": "xhigh", "label": "xhigh"},
+        {"value": "default", "label": "默认"},
+        {"value": "off", "label": "关闭"},
+        {"value": "low", "label": "低"},
+        {"value": "medium", "label": "中"},
+        {"value": "xhigh", "label": "极高"},
     ]
 
 

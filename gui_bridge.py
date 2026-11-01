@@ -2468,6 +2468,21 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             candidates.append(Path(meipass) / "vendor" / "ffmpeg" / "ffmpeg.exe")
         candidates.append(Path(__file__).resolve().parent / "vendor" / "ffmpeg" / "ffmpeg.exe")
         candidates.append(Path(os.getcwd()) / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        # 按需组件安装目录（~/.ycode/components/ffmpeg/ffmpeg.exe）：用户在「设置 →
+        # 背景图转换」里下载视频转换组件后，ffmpeg 就落在这里，优先级做成与内置副本
+        # 同级、高于 PATH（用户显式下载的版本应当胜出）。
+        # 必须用 gui_bridge.Path 拼接而不是 os.path.join：tests/test_gui_background_convert.py
+        # 的「全都不存在返回 None」用例把 gui_bridge.Path 换成假 Path 来屏蔽本机真实
+        # 安装位置，os.path.join 拼出的字符串会绕过该替换，让用例在装了组件的机器上失真。
+        # 目录取值统一走 core.components.component_dir，避免这里重复实现
+        # YCODE_COMPONENT_DIR/install_dir 的覆盖规则。
+        try:
+            from core import components
+
+            candidates.append(Path(components.component_dir("ffmpeg")) / "ffmpeg.exe")
+        except Exception:
+            # 组件模块缺失/未知 id 时只是少一个候选，不能影响后面的 PATH 回退
+            logger.warning("定位视频转换组件目录失败，跳过该候选", exc_info=True)
         for candidate in candidates:
             try:
                 if candidate.is_file():
@@ -2562,9 +2577,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         }
         if not ffmpeg:
             info["can_convert"] = False
+            # 安装包已不再内置 ffmpeg（改为按需组件），所以文案必须给出「去哪下载」
+            # 的可执行路径，而不是让用户自己去找 ffmpeg 安装包
             info["blockers"].append(
-                "未找到 ffmpeg，无法转换。请安装 ffmpeg 并加入 PATH 后重启应用"
-                "（或放到 本目录/vendor/ffmpeg/ffmpeg.exe）。"
+                "未找到视频转换组件（ffmpeg）。可在「设置 → 背景图转换」中点击"
+                "下载视频转换组件，或自行安装 ffmpeg 并加入 PATH 后重启应用。"
             )
             return info
         info.update(self._probe_video_meta(ffmpeg, str(source_path)))
@@ -2615,7 +2632,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         """后台线程执行 ffmpeg 转换，进度经 bg_convert_progress 事件实时推送。"""
         ffmpeg = self._find_ffmpeg()
         if not ffmpeg:
-            return {"ok": False, "msg": "未找到 ffmpeg，无法转换（请安装后重启应用）"}
+            return {"ok": False, "msg": "未找到视频转换组件（ffmpeg），请先在设置中下载组件"}
         if getattr(self, "_bg_convert_running", False):
             return {"ok": False, "msg": "已有转换任务在进行中"}
         source_path = Path(source)
@@ -4266,6 +4283,35 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             return novel_service.novel_audit(path, scope=scope, chapter=chapter)
         except Exception as e:
             logger.exception("run_novel_audit 失败")
+            return {"ok": False, "error": str(e)}
+
+    def run_novel_audit_fix(
+        self, workdir: str, finding: Any = None, action: str = "defer",
+        planned_resolution_chapter: Any = None, dry_run: bool = False
+    ) -> Dict[str, Any]:
+        """按一条审计结论修一处可显式验证的状态字段（只改追踪状态与伏笔表）。
+
+        业务逻辑全部委托 core.novel_service.novel_audit_fix，本方法只做目录
+        校验与异常兜底。``finding`` 原样透传（类型、message 都由 service
+        校验并返回结构化错误），桥接层不复制校验规则；``dry_run`` 转 bool，
+        ``planned_resolution_chapter`` 原样透传（int 或 None）。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"ok": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.novel_audit_fix(
+                path,
+                finding,
+                action,
+                planned_resolution_chapter=planned_resolution_chapter,
+                dry_run=bool(dry_run),
+            )
+        except Exception as e:
+            logger.exception("run_novel_audit_fix 失败")
             return {"ok": False, "error": str(e)}
 
     def browse_remote_dirs(self, path: str = "") -> Dict[str, Any]:
@@ -6628,6 +6674,256 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             self.emit_event("playwright_component_progress", payload)
         except Exception:
             logger.exception("推送 Playwright 组件进度事件失败")
+
+    # ------------------------------------------------------------------
+    # 视频转换组件（ffmpeg）：与 Playwright 走同一套「组件注册表 + 泛化下载流程」，
+    # 只是组件 id 不同。进度事件名 ffmpeg_component_progress，由前端按同名字段消费。
+    # ------------------------------------------------------------------
+
+    def _empty_component_status(self) -> Dict[str, Any]:
+        """任意组件的状态兜底快照（15 键，与 core.components 状态快照同形状）。
+
+        为什么委托 playwright 那份：前端只按 key 读字段，两个组件的状态形状必须
+        完全一致（多/少一个 key 都会让前端拿到 undefined）；直接复用同一份字段表，
+        避免两处各自维护后漂移。
+        """
+        return self._empty_playwright_component_status()
+
+    def get_ffmpeg_component_status(self) -> Dict[str, Any]:
+        """返回视频转换组件状态快照（设置页「背景图转换」卡片组件的唯一真值源）。"""
+        try:
+            from core import components
+
+            return {"ok": True, "component": components.get_component_status("ffmpeg")}
+        except Exception as exc:
+            logger.exception("读取视频转换组件状态失败")
+            return {
+                "ok": False,
+                "msg": f"读取视频转换组件状态失败：{exc}",
+                "component": self._empty_component_status(),
+            }
+
+    def download_ffmpeg_component(self) -> Dict[str, Any]:
+        """后台下载并安装视频转换组件；进度经 ffmpeg_component_progress 事件回推前端。
+
+        ``start_component_download`` 是全局单例（任意组件下载中即返回 False），因此
+        重复点击、或与 Playwright 组件下载并发时只返回中文提示，不会起第二个下载
+        线程；组件状态无论成功失败都回传，供前端校准（下载可能在本次响应前已推进）。
+        """
+        try:
+            from core import components
+
+            started = components.start_component_download(
+                "ffmpeg", on_event=self._on_ffmpeg_component_event
+            )
+            status = components.get_component_status("ffmpeg")
+            if not started:
+                return {
+                    "ok": False,
+                    "msg": "组件已在下载中，请等待当前下载完成或先取消",
+                    "component": status,
+                }
+            return {"ok": True, "msg": "已开始下载视频转换组件", "component": status}
+        except Exception as exc:
+            logger.exception("启动视频转换组件下载失败")
+            return {
+                "ok": False,
+                "msg": f"启动组件下载失败：{exc}",
+                "component": self._empty_component_status(),
+            }
+
+    def cancel_ffmpeg_component_download(self) -> Dict[str, Any]:
+        """取消进行中的视频转换组件下载（工作线程在下一块下载时退出并清理临时文件）。"""
+        try:
+            from core import components
+
+            components.cancel_component_download("ffmpeg")
+            return {
+                "ok": True,
+                "msg": "已请求取消组件下载",
+                "component": components.get_component_status("ffmpeg"),
+            }
+        except Exception as exc:
+            logger.exception("取消视频转换组件下载失败")
+            return {
+                "ok": False,
+                "msg": f"取消组件下载失败：{exc}",
+                "component": self._empty_component_status(),
+            }
+
+    def _on_ffmpeg_component_event(self, event: dict) -> None:
+        """视频转换组件下载进度回调：规整为小 JSON 事件经 emit_event 推给前端。
+
+        结构与 _on_playwright_component_event 一致（前端复用同一套进度渲染），
+        只有事件名不同。回调发生在下载线程（ycode-ffmpeg-component-download）：
+        emit_event → _emit_raw → _queue_js_payload 只做序列化与 put_nowait，
+        evaluate_js 由 gui-js-dispatcher 单消费者线程执行，故此处可直接调用。
+        任何异常只记日志，绝不影响下载线程。
+        """
+        try:
+            raw = event if isinstance(event, dict) else {}
+
+            def _as_int(value) -> int:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            payload: Dict[str, Any] = {
+                "stage": str(raw.get("stage") or ""),
+                "percent": _as_int(raw.get("percent")),
+                "downloaded_bytes": _as_int(raw.get("downloaded_bytes")),
+                "total_bytes": _as_int(raw.get("total_bytes")),
+                "error": str(raw.get("error") or ""),
+                "warning": str(raw.get("warning") or ""),
+            }
+        except Exception:
+            logger.warning("规整视频转换组件进度事件失败", exc_info=True)
+            payload = {
+                "stage": "",
+                "percent": 0,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "error": "",
+                "warning": "",
+            }
+        # installed/version 不能从进度事件推断，统一按当前磁盘/状态快照补齐；
+        # 读取失败时保持 False/空串，前端据此只更新进度、不做安装态跳变
+        try:
+            from core import components
+
+            status = components.get_component_status("ffmpeg")
+            payload["installed"] = bool(status.get("installed"))
+            payload["version"] = str(status.get("version") or "")
+        except Exception:
+            logger.warning("读取组件状态失败（进度事件缺少 installed/version）", exc_info=True)
+            payload["installed"] = False
+            payload["version"] = ""
+        try:
+            self.emit_event("ffmpeg_component_progress", payload)
+        except Exception:
+            logger.exception("推送视频转换组件进度事件失败")
+
+    # ------------------------------------------------------------------
+    # 网页搜索组件（search）：注册表第三个实例，走完全同一套「组件注册表 + 泛化
+    # 下载流程」，只是组件 id 不同。进度事件名 search_component_progress。
+    # 返回结构与 ffmpeg 版逐字一致（ok / msg? / component 15 键），前端可复用同一套
+    # 组件卡片渲染逻辑，不必为第三个组件再写一份。
+    # ------------------------------------------------------------------
+
+    def get_search_component_status(self) -> Dict[str, Any]:
+        """返回网页搜索组件状态快照（设置页「网页搜索」卡片组件的唯一真值源）。"""
+        try:
+            from core import components
+
+            return {"ok": True, "component": components.get_component_status("search")}
+        except Exception as exc:
+            logger.exception("读取网页搜索组件状态失败")
+            return {
+                "ok": False,
+                "msg": f"读取网页搜索组件状态失败：{exc}",
+                "component": self._empty_component_status(),
+            }
+
+    def download_search_component(self) -> Dict[str, Any]:
+        """后台下载并安装网页搜索组件；进度经 search_component_progress 事件回推前端。
+
+        ``start_component_download`` 是全局单例（任意组件下载中即返回 False），所以
+        重复点击、或与 Playwright / ffmpeg 组件下载并发时只返回中文提示，不会起
+        第二个下载线程；组件状态无论成功失败都回传，供前端校准。
+        """
+        try:
+            from core import components
+
+            started = components.start_component_download(
+                "search", on_event=self._on_search_component_event
+            )
+            status = components.get_component_status("search")
+            if not started:
+                return {
+                    "ok": False,
+                    "msg": "组件已在下载中，请等待当前下载完成或先取消",
+                    "component": status,
+                }
+            return {"ok": True, "msg": "已开始下载网页搜索组件", "component": status}
+        except Exception as exc:
+            logger.exception("启动网页搜索组件下载失败")
+            return {
+                "ok": False,
+                "msg": f"启动组件下载失败：{exc}",
+                "component": self._empty_component_status(),
+            }
+
+    def cancel_search_component_download(self) -> Dict[str, Any]:
+        """取消进行中的网页搜索组件下载（工作线程在下一块下载时退出并清理临时文件）。"""
+        try:
+            from core import components
+
+            components.cancel_component_download("search")
+            return {
+                "ok": True,
+                "msg": "已请求取消组件下载",
+                "component": components.get_component_status("search"),
+            }
+        except Exception as exc:
+            logger.exception("取消网页搜索组件下载失败")
+            return {
+                "ok": False,
+                "msg": f"取消组件下载失败：{exc}",
+                "component": self._empty_component_status(),
+            }
+
+    def _on_search_component_event(self, event: dict) -> None:
+        """网页搜索组件下载进度回调：规整为小 JSON 事件经 emit_event 推给前端。
+
+        结构与 _on_ffmpeg_component_event 完全一致（前端复用同一套进度渲染），
+        只有事件名不同。回调发生在下载线程（ycode-search-component-download），
+        emit_event 只做序列化 + put_nowait，evaluate_js 由 gui-js-dispatcher
+        单消费者线程执行，故此处可直接调用；任何异常只记日志，不影响下载线程。
+        """
+        try:
+            raw = event if isinstance(event, dict) else {}
+
+            def _as_int(value) -> int:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            payload: Dict[str, Any] = {
+                "stage": str(raw.get("stage") or ""),
+                "percent": _as_int(raw.get("percent")),
+                "downloaded_bytes": _as_int(raw.get("downloaded_bytes")),
+                "total_bytes": _as_int(raw.get("total_bytes")),
+                "error": str(raw.get("error") or ""),
+                "warning": str(raw.get("warning") or ""),
+            }
+        except Exception:
+            logger.warning("规整网页搜索组件进度事件失败", exc_info=True)
+            payload = {
+                "stage": "",
+                "percent": 0,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "error": "",
+                "warning": "",
+            }
+        # installed/version 不能从进度事件推断，按当前磁盘/状态快照补齐；
+        # 读取失败时保持 False/空串，前端据此只更新进度、不做安装态跳变
+        try:
+            from core import components
+
+            status = components.get_component_status("search")
+            payload["installed"] = bool(status.get("installed"))
+            payload["version"] = str(status.get("version") or "")
+        except Exception:
+            logger.warning("读取组件状态失败（进度事件缺少 installed/version）", exc_info=True)
+            payload["installed"] = False
+            payload["version"] = ""
+        try:
+            self.emit_event("search_component_progress", payload)
+        except Exception:
+            logger.exception("推送网页搜索组件进度事件失败")
 
     def get_permission_rules(self) -> Dict[str, Any]:
         """返回当前项目的持久化白名单（含沙盒开关状态），供设置页展示。"""
@@ -9862,12 +10158,21 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         model_id=None,
         error_state=None,
         turn_source="local",
+        parent_turn_id=None,
+        request_reason="",
+        resume_turn=False,
     ) -> bool:
         """迭代模型事件并翻译为前端事件；返回本轮是否被取消。
 
         turn_source 是入口层受控回合来源（local|lan，设计 18），透传给
         chat_with_model_events 的 computer_turn_source：LAN 回合即使本机
         开关开启也拿不到 computer tool / native built-in。
+
+        parent_turn_id / request_reason / resume_turn 只由断点续跑路径显式
+        传入（纯关键字 + 默认值，普通回合调用点与本函数行为逐字不变）：
+        resume_turn=True 让 TurnRuntime.start 跳过 create_turn，避免与
+        ResumeExecutor 已建好的 turn 行主键冲突；parent_turn_id 缺省时沿用
+        turn_id（普通回合的父子同 id 语义）。
         """
         from core.llm import chat_with_model_events
 
@@ -9889,11 +10194,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             turn_id=turn_id,
             cancel_event=self._cancel_events.get(session_name) or self._get_cancel_event(session_name),
             parent_session=session_name,
-            parent_turn_id=turn_id,
+            parent_turn_id=parent_turn_id or turn_id,
             permission_owner=turn_id,
             permission_source="主代理",
             model_id=model_id,
             computer_turn_source=turn_source,
+            request_reason=request_reason,
+            resume_turn=resume_turn,
         ):
             if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
                 cancelled = True
@@ -10055,6 +10362,174 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
             cancelled = True
         return cancelled
+
+    def _run_resume_turn_worker(
+        self, session_name: str, *, turn_id: str, parent_turn_id: str
+    ) -> None:
+        """断点续跑的真实请求线程体（daemon 线程）。
+
+        刻意不复用 send_user_message / _run_turn_worker：那条路径会
+        ``memory.add_message(user)`` 追加一条用户消息、并用 ``begin_turn``
+        新开一个撤销检查点——等于篡改父回合历史（断点续跑红线）。本方法只做
+        「只读组装历史 + 以 resume_turn=True 发一次真实请求」：
+        不写 user 消息、不开撤销检查点、不改父回合任何状态。
+
+        turn_id 由 ResumeExecutor 建好（harness_turns 已有该行），因此
+        _consume_turn_events 必须透传 resume_turn=True，否则 TurnRuntime.start
+        会重复 INSERT 撞主键。
+        """
+        from core.agent_service import build_resume_messages
+        from core.plan import set_current_plan_session
+        from core.workspace_context import workspace_scope
+
+        error_state: Dict[str, Any] = {"toast_messages": set(), "terminal_message": None}
+        cancel_event = self._get_cancel_event(session_name)
+        api_key = ""
+        workdir_scope = None
+        permission_scope = None
+        finished = False
+
+        def finish_once() -> None:
+            """turn_finish 只发一次：前端输入框解锁依赖它，任何路径都不能漏。"""
+            nonlocal finished
+            if finished:
+                return
+            finished = True
+            try:
+                self._emit_message_final(session_name)
+            except Exception:
+                logger.debug("断点续跑 message_final 补发失败", exc_info=True)
+            self.emit_event("turn_finish", {"session_name": session_name})
+            # 续跑写入的是新的 assistant 消息：窗口占用必须重算后再推面板，
+            # 否则上下文圆圈停在父回合中断时的数字。来源占比快照保留不清
+            # （clear_breakdown_snapshot=False）：清空会让面板数据变空白
+            try:
+                self._recalc_token_usage(session_name, clear_breakdown_snapshot=False)
+            except Exception:
+                logger.debug("断点续跑 token 用量重算失败", exc_info=True)
+            self._emit_token_usage()
+            self._clear_session_last_error(session_name)
+
+        self._active_turns[session_name] = threading.current_thread()
+        self._active_turn_ids[session_name] = turn_id
+        with self._turn_owner_lock:
+            self._turn_owner_sessions[turn_id] = session_name
+        try:
+            active_model = get_active_model(session_name)
+            if not active_model or not active_model.get("litellm_model"):
+                self.emit_event("error", {
+                    "message": "当前未激活任何 LLM 模型，请先在模型管理中配置并激活模型。",
+                    "session_name": session_name,
+                })
+                self.emit_event("notice", {
+                    "message": "断点续跑未执行：当前未激活任何 LLM 模型。",
+                    "session_name": session_name,
+                })
+                return
+
+            model_name = active_model["litellm_model"]
+            api_key = active_model.get("api_key", "") or ""
+            api_base = active_model.get("base_url", "") or ""
+            model_id = active_model.get("id")
+
+            # 线程隔离作用域：与普通回合同一套（工作目录 / 会话路由 / 权限档位）。
+            # 缺任一项都会让续跑回合里的工具调用读到别的会话或全局档位。
+            turn_workdir = self._session_workdir(session_name)
+            if turn_workdir == "GLOBAL":
+                turn_workdir = _resolve_real_path(os.getcwd())
+            else:
+                turn_workdir = _resolve_real_path(turn_workdir)
+            workdir_scope = workspace_scope(turn_workdir)
+            workdir_scope.__enter__()
+            self._memory.set_workdir(turn_workdir)
+            app_context.set_thread_session(session_name)
+            set_current_plan_session(session_name)
+            permission_scope = app_context.permission_mode_scope(
+                self._effective_permission_mode(session_name)
+            )
+            permission_scope.__enter__()
+            self._sync_active_model_context(session_name)
+
+            # 只读组装：稳定系统提示词 + 库中已定型的 LLM 历史（不做水位线维护、
+            # 不追加 user 消息、不重写字节），前缀与父回合逐字节相同。
+            history = build_resume_messages(self._memory, session_name, is_gui=True)
+
+            with self._active_turn_lock:
+                self._active_turn_snapshots[session_name] = {
+                    "session_name": session_name,
+                    "user_text": "",
+                    "display_text": "断点续跑：从上次中断处继续",
+                    "started_at_ms": int(time.time() * 1000),
+                    "thinking_text": "",
+                    "streaming_text": "",
+                    "tool_calls": [],
+                    "internal_kind": "resume",
+                }
+            # 用户消息没有新增（历史原样续用），因此 turn_start 只带展示文案，
+            # 前端按 display_text 渲染一条标记气泡
+            self.emit_event("turn_start", {
+                "user_text": "",
+                "display_text": "断点续跑：从上次中断处继续",
+                "internal": "resume",
+                "turn_id": turn_id,
+                "session_name": session_name,
+            })
+
+            cancelled = self._consume_turn_events(
+                history,
+                model_name,
+                api_key,
+                api_base,
+                session_name,
+                turn_id,
+                model_id=model_id,
+                error_state=error_state,
+                parent_turn_id=parent_turn_id,
+                request_reason="resume",
+                resume_turn=True,
+            )
+            if cancelled:
+                self.emit_event("turn_cancelled", {"session_name": session_name})
+            terminal_error = str(error_state.get("terminal_message") or "")
+            if terminal_error:
+                # 内层生成器把模型失败吞成事件：这里补一条续跑口径的提示，
+                # 避免用户只看到一条 error 却不知道断点续跑已中止
+                self.emit_event("notice", {
+                    "message": f"断点续跑已中止：{terminal_error[:200]}",
+                    "session_name": session_name,
+                })
+        except Exception as e:
+            logger.exception("断点续跑回合失败")
+            # 异常绝不静默：终态事件让前端退出 running，notice 给出可读原因
+            self._emit_owned_error(
+                str(e), api_key, error_state, terminal=True, session_name=session_name
+            )
+            self.emit_event("notice", {
+                "message": f"断点续跑失败：{e}",
+                "session_name": session_name,
+            })
+        finally:
+            try:
+                from core.plan import set_current_plan_session as _unbind_plan_route
+
+                _unbind_plan_route(None)
+            except Exception:
+                pass
+            app_context.set_thread_session(None)
+            if workdir_scope is not None:
+                workdir_scope.__exit__(None, None, None)
+            if permission_scope is not None:
+                permission_scope.__exit__(None, None, None)
+            if self._cancel_events.get(session_name) is cancel_event:
+                self._cancel_events.pop(session_name, None)
+            self._active_turns.pop(session_name, None)
+            self._active_turn_ids.pop(session_name, None)
+            with self._turn_owner_lock:
+                self._turn_owner_sessions.pop(turn_id, None)
+            with self._active_turn_lock:
+                self._active_turn_snapshots.pop(session_name, None)
+            self._finalize_session_deltas(session_name)
+            finish_once()
 
     def _session_workdir(self, session_name: str) -> str:
         """查询会话已登记的 workdir；查不到时按当前工作目录处理。"""
@@ -11111,11 +11586,39 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             logger.exception("resume_plan 失败")
             return {"ok": False, "msg": f"断点续跑规划失败：{e}"}
 
+    def _resume_journal_writer(self):
+        """续跑专用 journal writer：统一 owner 租约，与回合运行时同一 owner。
+
+        ResumeExecutor 自建 journal 时用的 owner 是 ``harness-resume-<uuid>``，
+        与 TurnRuntime 的 PROCESS_OWNER_ID 不同：10s 心跳过期后 recover_stale
+        会把续跑 turn 判成 interrupted（自己把自己踩断）。这里显式注入同一
+        owner 的 HarnessJournal，让心跳续租落在同一条 owner 记录上。
+
+        manager 不支持 journal 存储（鸭子类型替身/旧测试替身）时回退 None，
+        交由执行层按原逻辑自建，行为与接线前一致。
+        """
+        from core.harness.journal import (
+            PROCESS_OWNER_ID,
+            HarnessJournal,
+            journal_storage_supported,
+        )
+
+        if not journal_storage_supported(self._memory):
+            return None
+        return HarnessJournal(
+            self._memory,
+            PROCESS_OWNER_ID,
+            clock_ms=lambda: time.time_ns() // 1_000_000,
+        )
+
     def resume_execute(self, session_name: str = "", confirmed: Any = None) -> Dict[str, Any]:
         """执行接口：aborts 非空先回原因；否则交给 ResumeExecutor.run（含审计事件）。
 
         ``confirmed`` 是调用序号数组（用户逐项确认过的写操作）；空数组表示
         "只续跑无写操作的调用"，此时命中写操作会返回 ``reason=confirm_required``。
+
+        真实请求由 request_fn 起 daemon 线程发出：本方法被 pywebview 的 JS
+        调用同步进入 Python，若在此同步跑完整个模型回合，前端主线程会被冻住。
         """
         try:
             if not self._resume_switch_enabled():
@@ -11127,7 +11630,27 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
                 return {"ok": False, "reason": aborts[0], "reasons": aborts}
             from core.harness.resume import ResumeExecutor
 
-            executor = ResumeExecutor(self._memory, planner)
+            def _request_resume_turn(
+                *, turn_id: str, parent_turn_id: str, request_reason: str = "resume"
+            ) -> None:
+                """request_fn 契约（core/harness/resume.py）：只负责发起，不阻塞。
+
+                request_reason 由执行层传 "resume"，本层只做审计口径的兜底默认。
+                """
+                threading.Thread(
+                    target=self._run_resume_turn_worker,
+                    args=(session_name,),
+                    kwargs={"turn_id": turn_id, "parent_turn_id": parent_turn_id},
+                    daemon=True,
+                    name=f"gui-resume-turn-{session_name}",
+                ).start()
+
+            executor = ResumeExecutor(
+                self._memory,
+                planner,
+                writer=self._resume_journal_writer(),
+                request_fn=_request_resume_turn,
+            )
             return executor.run(plan, confirmed=set(confirmed or ()))
         except Exception as e:
             logger.exception("resume_execute 失败")

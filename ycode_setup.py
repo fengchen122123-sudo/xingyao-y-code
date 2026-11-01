@@ -1824,17 +1824,24 @@ class SetupWizard(tk.Tk):
         tk.Label(sidebar, text="AI 编程助手", font=FONT_DIM, fg="#9CA3AF",
                  bg=SIDEBAR_BG).pack()
 
-        # Logo 放大居中（用 PIL 精确缩放到 168x168）
+        # Logo 放大居中：直接读随包预生成的 168x168 PNG（tk.PhotoImage）。
+        #
+        # 为什么不用 PIL 缩放：PIL 会带进来 ~15MB 的 Pillow 运行时，而它在整个
+        # 安装向导里只为这一张 logo 服务；安装包体积对分发（尤其分卷下载）
+        # 很敏感，故改为构建期用 PIL 一次性生成定尺寸图，运行期彻底不 import PIL。
+        #
+        # 为什么固定尺寸而不在运行时缩放：tk.PhotoImage 只支持整数倍 zoom/subsample，
+        # 任意缩放会失真，所以尺寸在 build 时就定死为 168x168（与侧栏宽度匹配）。
+        # 换 logo 时请重新生成 assets/ycode-logo-168.png（LANCZOS 缩放，RGBA）。
         self._sidebar_logo = None
-        logo_path = os.path.join(self.bundle_dir, "assets", "ycode.png")
+        logo_path = os.path.join(self.bundle_dir, "assets", "ycode-logo-168.png")
         if os.path.exists(logo_path):
             try:
-                from PIL import Image, ImageTk
-                im = Image.open(logo_path)
-                im = im.resize((168, 168), Image.LANCZOS)
-                self._sidebar_logo = ImageTk.PhotoImage(im)
+                self._sidebar_logo = tk.PhotoImage(file=logo_path)
                 tk.Label(sidebar, image=self._sidebar_logo, bg=SIDEBAR_BG).pack(pady=(16, 0))
             except Exception:
+                # 图缺失/损坏时静默跳过：侧栏少一个 logo 不影响向导功能，
+                # 更不能因此让用户卡在装不上软件的第一步。
                 pass
 
         tk.Label(sidebar, text=f"v{self.version}", font=FONT_VERSION, fg="#6B7280",

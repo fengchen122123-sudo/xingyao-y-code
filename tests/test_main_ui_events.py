@@ -1271,7 +1271,9 @@ def _turns_env(tmp_path, monkeypatch, data):
     import config
 
     cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(_json.dumps(data), encoding="utf-8")
+    # 空 dict 会被 config.py 写闸门判为读失败而拒写，故补最小可用结构。
+    payload = data if data else {"active_model_id": None, "providers": []}
+    cfg_path.write_text(_json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg_path))
     config._CONFIG_CACHE.clear()
 

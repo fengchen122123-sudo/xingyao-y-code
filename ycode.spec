@@ -50,10 +50,10 @@ from packaging_datas import strip_unused_datas  # noqa: E402  (须在 sys.path �
 # 两边都会 import），因此下面几个 collect_all 结果只构建一份 Analysis 也要全部收齐。
 # ---------------------------------------------------------------------------
 
-# litellm/__init__.py 顶层会导入大量子模块（batches、images、router_utils 等），
-# 一旦被 excludes 排除，运行时会直接报 No module named 'litellm.xxx'，因此不做
-# 子系统级裁剪，优先保证运行时完整性。
-litellm_datas, litellm_binaries, litellm_hiddenimports = collect_all('litellm')
+# litellm 已彻底移除：core/llm_native_transport.py 用原生 httpx.Client + SSEDecoder
+# 直连 provider，token 估算也是自写的，全仓没有一行 import litellm。此前的
+# collect_all('litellm') 会把整个包（约 29MB）无差别塞进产物，属于纯死重量，故移除。
+# 若日后重新引入 litellm，需同时恢复这里与下方三处拼接。
 
 # pyfiglet 通过 importlib.resources 在 pyfiglet.fonts 包里加载 .flf 字体文件，
 # PyInstaller 默认不会收集，需要 collect_all 才能避免运行时 "No module named
@@ -65,6 +65,17 @@ pyfiglet_datas, pyfiglet_binaries, pyfiglet_hiddenimports = collect_all('pyfigle
 # （如 openai_public），PyInstaller 默认不会收集这个命名空间包，需要显式收集，
 # 否则打包后会报 "Unknown encoding cl100k_base. Plugins found: []"。
 tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hiddenimports = collect_all('tiktoken_ext')
+
+# 办公文档工具（plugins/office）：xlsx 走 openpyxl、pdf 走 pypdf，两者都是纯
+# Python 包。注意这里的收集不是"保险起见"——plugins/ 目录是以 datas 原样拷进
+# 安装包的（见下方 ('plugins', 'plugins')），PyInstaller 根本不会分析插件文件里
+# 的 import，所以 office_read / office_write 依赖的这两个包静态分析一律收不到，
+# 不显式 collect_all 就是打包版直接 ModuleNotFoundError。
+# 另一个好处：build_release.verify_spec_collect_all_targets 从 spec 源码解析
+# collect_all 目标，补上后会被纳入构建前环境硬校验，构建机漏装时立刻失败，
+# 不会再静默产出缺依赖的安装包。
+openpyxl_datas, openpyxl_binaries, openpyxl_hiddenimports = collect_all('openpyxl')
+pypdf_datas, pypdf_binaries, pypdf_hiddenimports = collect_all('pypdf')
 
 # Playwright（电脑操控，Task 16 / 设计 23.1）：**不再随包收集**（原先这里是
 # collect_all('playwright')）。原因：运行时只用系统 Edge/Chrome
@@ -102,6 +113,18 @@ common_datas = [
     # _serve_mobile_static() 在打包环境从 _MEIPASS/frontend-mobile/dist 读取；
     # 缺失时手机扫码打开 /m/ 路径会 404（经典界面不受影响）
     ('frontend-mobile/dist', 'frontend-mobile/dist'),
+    # 画布子应用（Excalidraw，独立 React 子应用）：core/media_server.py 的
+    # canvas_dist_root() 在打包环境从 _MEIPASS/frontend-canvas/dist 读静态资源
+    # （index.html / assets / fonts / locales），由 gui_canvas_mixin 用 iframe 挂进
+    # 主界面右边栏。**必须整目录递归随包**：只带 index.html 会让子应用缺 JS/CSS/
+    # 字体/多语言包而白屏。缺失时点开画布直接提示「画布子应用未构建」——这是
+    # 打包版专属故障（源码仓库里开发者自己跑过 npm build，看不出问题），因此
+    # 这里与 frontend/dist 保持同一写法：源与 dest 都是两级相对路径
+    # 'frontend-canvas/dist'（canvas_dist_root() 硬编码了这两级结构，不能拍平）。
+    # 注意该目录被 .gitignore 的 dist/ 规则忽略，仓库里没有副本：构建前必须先执行
+    # npm --prefix frontend-canvas run build（build_release.py 的
+    # step0c_build_canvas 已自动化，见该函数注释）。
+    ('frontend-canvas/dist', 'frontend-canvas/dist'),
     # 手机远程控制传输 shim：LAN server 注入到手机端页面 <head>，
     # _serve_shim() 在打包环境从 _MEIPASS/frontend/ 读取；缺失时手机端
     # window.pywebview 永不注入，前端 30s 轮询超时后弹「pywebview API 不可用」
@@ -114,27 +137,31 @@ common_datas = [
     ('assets/ycode.ico', 'assets'),
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
     ('assets/CHANGELOG.md', 'assets'),
-] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas + pywinpty_datas
+] + pyfiglet_datas + tiktoken_ext_datas + pywinpty_datas \
+  + openpyxl_datas + pypdf_datas
 
-# 内置 ffmpeg：GUI 的「背景图转换」（视频 → 动画 WebP 动态背景）依赖它，
-# gui_bridge.py 的 _find_ffmpeg() 会优先取随包副本（_MEIPASS/vendor/ffmpeg），
-# 用户无需自行安装 ffmpeg。缺失时不中断构建，仅在控制台告警并回退到系统
-# PATH / 常见安装位置（避免误删 96MB 大文件后构建直接失败）。
-# NOTICE.txt 记录版本/构建配置/许可证要求，随包分发 GPLv3 构建时必须一并提供。
-for _ffmpeg_asset in ('ffmpeg.exe', 'NOTICE.txt'):
-    _ffmpeg_source = f'vendor/ffmpeg/{_ffmpeg_asset}'
-    if os.path.isfile(_ffmpeg_source):
-        common_datas.append((_ffmpeg_source, 'vendor/ffmpeg'))
-    else:
-        print(
-            f'[ycode.spec] 警告：{_ffmpeg_source} 不存在，本次构建不内置该文件；'
-            '内置 ffmpeg 缺失时背景图转换将回退到系统 PATH / 常见安装位置，'
-            '用户侧可能因此不可用。'
-        )
+# 【ffmpeg 不再随安装包分发】历史上这里会把 vendor/ffmpeg/ffmpeg.exe 与
+# NOTICE.txt 追加进 common_datas（打进 _MEIPASS/vendor/ffmpeg）。96.4 MiB 的
+# GPLv3 二进制让安装包凭空大出 ~35 MiB，而「背景图转换」只是少数用户会用的
+# 可选功能——为一个可选功能让所有人多下 35 MiB 并不划算。
+# 现在改为**按需组件**：运行期由 core/components.py 的 FFMPEG_SPEC 下载安装到
+# ~/.ycode/components/ffmpeg/（用户在「设置 → 背景图转换」点下载），组件包由
+# build_release.py::step0d_build_ffmpeg_component 单独产出并挂到同一个 Gitee
+# Release 上。
+# 因此本 spec 刻意不再引用 vendor/ffmpeg：仓库里的文件保留（scripts/verify_vendor.py
+# 仍按 vendor/VENDOR_MANIFEST.json 校验其哈希），只是不再进入安装包。
+# 注：GPLv3 的分发义务（许可证全文 + 源码获取方式）随组件包内的 NOTICE.txt
+# 一并提供给下载者，不再由安装包承担。
 
-common_binaries = litellm_binaries + tiktoken_ext_binaries + pywinpty_binaries
+common_binaries = (
+    tiktoken_ext_binaries + pywinpty_binaries
+    + openpyxl_binaries + pypdf_binaries
+)
 
-common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken_ext_hiddenimports + pywinpty_hiddenimports + [
+common_hiddenimports = (
+    pyfiglet_hiddenimports + tiktoken_ext_hiddenimports
+    + pywinpty_hiddenimports + openpyxl_hiddenimports + pypdf_hiddenimports
+) + [
     # core.hunyuan_image 只被内置插件 plugins/hunyuan_image 在运行时动态 import，
     # PyInstaller 静态分析不可达，必须显式声明，否则打包后插件调用直接
     # ModuleNotFoundError。
@@ -171,6 +198,15 @@ common_excludes = [
     # Playwright 改按需补装（见上方 collect_all 说明）：排除模块本身，避免
     # 隐式 import 或第三方 hook 把 wheel 与 node driver 重新收进安装包。
     'playwright',
+    # 网页搜索链路（ddgs）改按需组件（见 core/components.py 的 SEARCH_SPEC）：
+    # 以下四个包只服务 web_search，已改为运行时下载，安装包不再内置。
+    #   ddgs           -> 搜索聚合库本身（core/tools.py 已改为函数内懒 import）
+    #   primp / lxml   -> ddgs 的 Rust / C 扩展，平台绑定且体积不小
+    #   fake_useragent -> 仅 ddgs 用到的 UA 伪装库
+    # 刻意不排除 click / httpx / certifi：它们虽然也在 ddgs 的 Requires 里，
+    # 但主程序自己（litellm、uvicorn、各处 HTTP 调用）就在用，排除会直接
+    # ImportError。组件包内同名目录只是插在 sys.path 前面，仍可从主包复用。
+    'ddgs', 'primp', 'lxml', 'fake_useragent',
 ]
 
 
@@ -351,7 +387,13 @@ a_uninst = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=common_excludes,
+    # 卸载器只用 tkinter（横幅图标走 tk.PhotoImage 读 assets/ycode.png），
+    # 全程不 import PIL，因此这里在 common_excludes 之外单独再排除 PIL：
+    # 它只服务卸载器这一路，不能进 common_excludes —— 主程序
+    # core/gui_theme.py 顶层 `from PIL import Image` 真的要用 PIL，
+    # 一旦全局排除，GUI 一启动就 ImportError。
+    # （numpy 本来就在 common_excludes 里，这里显式重申只为表明卸载器同样不需要它。）
+    excludes=common_excludes + ['PIL', 'numpy'],
     noarchive=False,
     optimize=0,
 )

@@ -320,6 +320,21 @@ def get_reasoning_capability(model_name: str) -> ReasoningCapability:
     return UNKNOWN_REASONING_CAPABILITY
 
 
+# 档位显示标签：CLI 的 /effort 与 GUI 选择器共用同一份快照，label 就是给人看的
+# 文案。必须给中文——把 value 直接当 label 会输出 "○ off(off)" 这种重复且不可读
+# 的文案（历史遗留：标签表收敛时误把 label 简化成 value）。
+_REASONING_LEVEL_LABELS = {
+    "default": "默认",
+    "off": "关闭",
+    "on": "开启",
+    "none": "关闭",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "xhigh": "极高",
+    "max": "最高",
+}
+
 def build_reasoning_snapshot(model: dict | None, choice: str = "default") -> dict:
     """生成可直接交给 GUI 的不可猜测能力快照。"""
     model_data = model or {}
@@ -334,7 +349,7 @@ def build_reasoning_snapshot(model: dict | None, choice: str = "default") -> dic
         "choice": "on" if fixed else choice,
         "default_choice": capability.default_choice,
         "options": [
-            {"value": value, "label": value}
+            {"value": value, "label": _REASONING_LEVEL_LABELS.get(value, value)}
             for value in capability.options
         ],
     }

@@ -1,8 +1,8 @@
 # Y-CODE 更新日志
 
-## 未发布 (2026-10-29)
+## 1.3.9 (2026-11-01)
 
-- 新增：办公文档读取工具 `office_read`（内置插件 `plugins/office`）——把 xlsx / xlsm / docx / pptx / pdf 转成结构化 Markdown 供模型理解：xlsx 按工作表输出表格、docx 保留标题层级与表格、pptx 与 pdf 按页输出文本。只读，不修改文件；大文件可用 `sheet` / `max_rows` / `max_chars` 控制返回量。**零新增第三方依赖**：xlsx 走已在依赖中的 openpyxl、pdf 走已在依赖中的 pypdf，docx/pptx 用标准库 `zipfile` + `ElementTree` 直接解析 OOXML，打包体积不变
+- 新增：办公文档读取工具 `office_read`（内置插件 `plugins/office`）——把 xlsx / xlsm / docx / pptx / pdf 转成结构化 Markdown 供模型理解：xlsx 按工作表输出表格、docx 保留标题层级与表格、pptx 与 pdf 按页输出文本。只读，不修改文件；大文件可用 `sheet` / `max_rows` / `max_chars` 控制返回量。xlsx 走 openpyxl、pdf 走 pypdf（两者是新增依赖，已写入 `requirements.txt` 并由 `ycode.spec` 的 `collect_all` 随包收集），docx/pptx 用标准库 `zipfile` + `ElementTree` 直接解析 OOXML，不引入额外依赖
 - 新增：Excel 生成工具 `office_write`（同属 `plugins/office`）——传入二维数据即按办公室默认规范出表：表头蓝底白字加粗居中、正文微软雅黑 10.5、细边框、偶数行斑马纹、列宽按显示宽度自适应（中文按 2 计）、冻结首行、首行自动筛选、横向打印并缩放到一页宽、跨页重复表头；支持多工作表。目标文件已存在时默认拒绝写入，需显式 `overwrite=true`，避免误覆盖旧表
 - 新增：办公文档处理技能 `office-format`——沉淀「先读再写、大表限量读取、覆盖前先告知、Word/PPT 暂不直出」的处理规范与交付前自检项
 - 新增：桌面版斜杠命令——只提供按钮无法替代的 13 条（`/goal`、`/agent`、`/skill`、`/remember`、`/forget`、`/fix`、`/review`、`/init`、`/test`、`/explain`、`/compact`、`/commit`、`/workflow`），输入 `/` 弹出候选，未命中命令表的文本按普通消息发送
@@ -16,6 +16,11 @@
 - 修复：草稿会话首条消息即 `/goal` 时工作目录丢失——斜杠命令在落库前就地执行，前端携带的 workdir 无人接收，目标循环按进程启动目录落库，导致会话归组与每轮 cwd 全错；现由斜杠层一路透传到目标启动，先按目录落库
 - 修复：目标状态随会话改名迁移，并在目标运行期间禁止改名（否则后续轮次会写进旧名的幽灵会话）
 - 测试：斜杠命令与 `/goal` 相关后端用例 82 项、turn_source 相关 23 项通过；前端全量 158 个文件 1502 项通过
+- 修复：`office_write` 未接入按回合撤销记录器——它声明了 `mutates_files` 却没走 `prepare_mutation`，启动校验直接抛 `RuntimeError`，导致 7 个测试文件在收集阶段中断；现落盘统一走 `_save_with_turn_undo`（工作区锁 → 撤销句柄 → 落盘 → 校验），检查点封闭时拒绝触盘，并补进记录器覆盖白名单
+- 修复：`openpyxl` / `pypdf` 此前未在任何依赖清单中声明，安装包不会携带，office 工具一用即报 `ModuleNotFoundError`；现补进 `requirements.txt` 与 `ycode.spec` 的 `collect_all`，`build_release` 的构建前校验同步覆盖这两个包
+- 修复：`office_read` 声明为只读却标了 `side_effect_scope="workspace"` 写类范围，按声明契约改为 `none`
+- 修复：思考档位标签被收敛成 value 本身，`/effort` 输出 `○ off(off)`、GUI 选择器退化为英文；恢复中文标签（默认 / 关闭 / 开启 / 低 / 中 / 高 / 极高 / 最高）
+- 优化：缺少 openpyxl / pypdf 时不再抛裸 `ModuleNotFoundError`，改为「缺什么、怎么装」的可执行提示
 
 ## 1.3.8 (2026-10-24)
 

@@ -99,6 +99,34 @@ def test_find_ffmpeg_falls_back_to_path(tmp_path, monkeypatch):
     assert _bare_bridge()._find_ffmpeg() == r"C:\tools\ffmpeg.exe"
 
 
+
+def test_find_ffmpeg_prefers_component_dir(tmp_path, monkeypatch):
+    """组件安装目录（<COMPONENT_ROOT>/ffmpeg/ffmpeg.exe）优先于系统 PATH。
+
+    按需组件下载后 ffmpeg 落在用户目录，必须能被 _find_ffmpeg 找到；COMPONENT_ROOT
+    用 monkeypatch 改到 tmp_path，绝不往真实用户目录写文件。
+    """
+    from core import components
+
+    root = tmp_path / "components"
+    installed = root / "ffmpeg" / FFMPEG_EXE
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_bytes(b"stub-ffmpeg")
+
+    monkeypatch.delenv("YCODE_COMPONENT_DIR", raising=False)
+    monkeypatch.setattr(components, "COMPONENT_ROOT", str(root))
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(gui_bridge, "__file__", str(project / "gui_bridge.py"))
+    # cwd 下没有内置副本，保证命中的只能是组件目录
+    other_cwd = tmp_path / "other"
+    other_cwd.mkdir()
+    monkeypatch.setattr(gui_bridge.os, "getcwd", lambda: str(other_cwd))
+    monkeypatch.setattr(gui_bridge.shutil, "which", lambda name: r"C:\tools\ffmpeg.exe")
+
+    assert _bare_bridge()._find_ffmpeg() == str(installed)
+
 def test_find_ffmpeg_returns_none_when_absent(tmp_path, monkeypatch):
     """内置副本、PATH、常见安装位置全缺失 → None（不静默回退到假路径）。"""
     monkeypatch.delattr(sys, "_MEIPASS", raising=False)

@@ -31,13 +31,18 @@ REQUIRED_TWO_TUPLE_DATAS = [
     ('vendor/mermaid/mermaid-11.17.2.min.js', 'vendor/mermaid'),
     ('frontend/dist', 'frontend/dist'),
     ('frontend-mobile/dist', 'frontend-mobile/dist'),
+    # 画布子应用（Excalidraw）：必须整目录随包到 _MEIPASS/frontend-canvas/dist，
+    # 否则安装后点开画布只会提示「画布子应用未构建」（canvas_dist_root() 定位规则）。
+    ('frontend-canvas/dist', 'frontend-canvas/dist'),
     ('frontend/mobile-shim.js', 'frontend'),
     ('skills', 'skills'),
     ('plugins', 'plugins'),
     ('assets/ycode.ico', 'assets'),
     ('assets/CHANGELOG.md', 'assets'),
-    ('vendor/ffmpeg/ffmpeg.exe', 'vendor/ffmpeg'),
-    ('vendor/ffmpeg/NOTICE.txt', 'vendor/ffmpeg'),
+    # 注：这里刻意不再有 vendor/ffmpeg/*。ffmpeg 已改成按需组件（运行期由
+    # core/components.py 的 FFMPEG_SPEC 下载到 ~/.ycode/components/ffmpeg/），
+    # ycode.spec 不再把它追加进 common_datas，安装包体积因此少 ~35MB。
+    # 仓库里的 vendor/ffmpeg 文件保留，仍受 scripts/verify_vendor.py 校验。
 ]
 
 

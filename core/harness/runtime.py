@@ -81,6 +81,7 @@ class TurnRuntime:
         manager: MemoryManager | None,
         cancel_event: threading.Event | None,
         clock_ms: Callable[[], int],
+        create_row: bool = True,
     ) -> "TurnRuntime":
         if not turn_id:
             raise ValueError("turn_id must not be empty")
@@ -104,11 +105,16 @@ class TurnRuntime:
             journal=journal,
         )
         if journal is not None:
-            journal.create_turn(turn_id, session_name)
-            journal.append_event(
-                turn_id,
-                JournalEventDraft(HarnessEventKind.TURN_CREATED),
-            )
+            # create_row=False（断点续跑）：ResumeExecutor 已用同一 turn_id 建过
+            # harness_turns 行（主键），重复 create_turn 会 IntegrityError；
+            # 因此跳过建行与 TURN_CREATED 事件，直接在本进程接管既有行，
+            # 随后 CREATED→PREPARING 的 CAS 在该行上天然成立。
+            if create_row:
+                journal.create_turn(turn_id, session_name)
+                journal.append_event(
+                    turn_id,
+                    JournalEventDraft(HarnessEventKind.TURN_CREATED),
+                )
             runtime._start_heartbeat_sidecar()
         runtime._transition(TurnStatus.PREPARING)
         return runtime
@@ -347,7 +353,7 @@ class StepRuntime:
                             fingerprint.system_bytes,
                             fingerprint.tools_bytes,
                             fingerprint.options_bytes,
-                            envelope.request_reason,
+                            envelope.turn_reason or envelope.request_reason,
                             envelope.attempt,
                             envelope.deepseek_generation_id,
                             self.step_id,

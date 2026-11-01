@@ -370,6 +370,36 @@ export interface PlaywrightComponentStatus {
   dir: string;
 }
 
+// ffmpeg 按需组件状态快照（后端 core/components.py::get_status() 的 ffmpeg 分支）。
+// 与 PlaywrightComponentStatus 字段口径一致：安装包不再内置 ffmpeg（背景图转换依赖它），
+// 首次使用时按需下载；installed/version/dir 来自磁盘探测，其余是进程内下载状态机实时值
+export interface FfmpegComponentStatus {
+  installed: boolean;
+  version: string;
+  downloading: boolean;
+  percent: number;
+  downloaded_bytes: number;
+  total_bytes: number;
+  error: string;
+  stage: string;
+  dir: string;
+}
+
+// 网页搜索按需组件状态快照（后端 core/components.py::get_status() 的 search 分支）。
+// 安装包不再内置 ddgs（及其 primp/lxml/fake_useragent），web_search 工具首次使用时
+// 按需下载；字段口径与 Playwright/FfmpegComponentStatus 完全一致，前端卡片可复用
+export interface SearchComponentStatus {
+  installed: boolean;
+  version: string;
+  downloading: boolean;
+  percent: number;
+  downloaded_bytes: number;
+  total_bytes: number;
+  error: string;
+  stage: string;
+  dir: string;
+}
+
 // 内嵌浏览器（右侧面板浏览器页签）：DOM 占位区的 CSS px 矩形，上报给宿主，
 // 由宿主把叠加的原生 WebView2 控件摆到该矩形上
 export interface EmbeddedBrowserRect {
@@ -1580,6 +1610,35 @@ export interface NovelAuditDto {
   error?: string;
 }
 
+// novel_audit_fix 返回的伏笔计划改动前后值
+export interface NovelAuditFixSnapshotDto {
+  planned_resolution_chapter?: number | null;
+  updated_chapter?: number | null;
+}
+
+// run_novel_audit_fix 返回：dry_run 与真写两套字段并存，按 ok 与 dry_run 区分。
+// 成功时 dry_run=true 只回 before/after/would_change（不写任何文件），真写时
+// dry_run=false 并额外回 state_path / table_path / table_updated /
+// still_reported（写完自检后该伏笔是否仍被体检报出）。失败分四种：
+// 非小说项目 { ok:false, is_novel:false, error }；不支持的类型或 resolve
+// { ok:false, supported:false, error }；参数错 / 写入自检失败 { ok:false, error }
+// （自检失败时也带 foreshadow_id / before / after / state_path / table_path）。
+export interface NovelAuditFixDto {
+  ok: boolean;
+  is_novel?: boolean;
+  supported?: boolean;
+  dry_run?: boolean;
+  foreshadow_id?: string;
+  before?: NovelAuditFixSnapshotDto;
+  after?: NovelAuditFixSnapshotDto;
+  would_change?: boolean;
+  state_path?: string;
+  table_path?: string;
+  table_updated?: boolean;
+  still_reported?: boolean;
+  error?: string;
+}
+
 // get_novel_chapter 单章正文（章节编辑器用）。只读接口：ok=false 时带 error
 // （非小说项目 / 章节不存在 / 正文不可读），前端据此显示错误文本。
 // path 是相对项目根的 posix 路径，visible_chars 与 novel_status 同口径。
@@ -1671,6 +1730,19 @@ export interface PyWebViewAPI {
     scope?: 'chapter' | 'all',
     chapter?: number | string,
   ): Promise<NovelAuditDto>;
+  // 按一条审计结论修一处可显式验证的状态字段（只支持 foreshadow_overdue，
+  // 只改追踪状态与伏笔表的「计划回收章」）：action 只接受
+  // 'defer' | 'reschedule' | 'resolve'，其中 resolve 后端明确拒绝（回收需要
+  // 正文证据）；reschedule 需给正整数 planned_resolution_chapter 且必须大于
+  // 当前已提交章。dry_run=true 只算 before/after 不写文件；真写时写完自检并
+  // 回报 still_reported
+  run_novel_audit_fix(
+    workdir: string,
+    finding: NovelAuditFindingDto | null,
+    action?: 'defer' | 'reschedule' | 'resolve',
+    planned_resolution_chapter?: number | null,
+    dry_run?: boolean,
+  ): Promise<NovelAuditFixDto>;
   get_sessions(): Promise<SessionGroup[]>;
   create_session(title?: string, workdir?: string): Promise<any>;
   // 秘书会话：与 create_session 的"首条消息才懒落库"不同，它立即落库并切为当前
@@ -1788,6 +1860,16 @@ export interface PyWebViewAPI {
   get_playwright_component_status(): Promise<{ ok: boolean; msg?: string; component: PlaywrightComponentStatus }>;
   download_playwright_component(): Promise<{ ok: boolean; msg?: string; component: PlaywrightComponentStatus }>;
   cancel_playwright_component_download(): Promise<{ ok: boolean; msg?: string; component: PlaywrightComponentStatus }>;
+  // ffmpeg 按需组件（背景图转换依赖）：同样三个接口都回传最新组件状态快照，
+  // 下载进度另走 ffmpeg_component_progress 桥事件（payload 口径同 playwright 版）
+  get_ffmpeg_component_status(): Promise<{ ok: boolean; msg?: string; component: FfmpegComponentStatus }>;
+  download_ffmpeg_component(): Promise<{ ok: boolean; msg?: string; component: FfmpegComponentStatus }>;
+  cancel_ffmpeg_component_download(): Promise<{ ok: boolean; msg?: string; component: FfmpegComponentStatus }>;
+  // 网页搜索按需组件（ddgs 链路）：同样三个接口回传最新组件状态快照，
+  // 下载进度另走 search_component_progress 桥事件（payload 口径同 playwright 版）
+  get_search_component_status(): Promise<{ ok: boolean; msg?: string; component: SearchComponentStatus }>;
+  download_search_component(): Promise<{ ok: boolean; msg?: string; component: SearchComponentStatus }>;
+  cancel_search_component_download(): Promise<{ ok: boolean; msg?: string; component: SearchComponentStatus }>;
   get_permission_rules(): Promise<any>;
   add_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
   remove_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;

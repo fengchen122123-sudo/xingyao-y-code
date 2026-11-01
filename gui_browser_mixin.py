@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 _RECT_KEYS = ("x", "y", "width", "height")
 
+# 「这个会话还没有属于自己的页面」时代替显示的空白地址：原生控件里若还停着
+# 上一个会话的网页，宁可先换成一页白纸，也不能让它在别的会话的面板里出现。
+_BLANK_PAGE = "about:blank"
+
 # 实例级控制器创建锁的模块级 guard：锁本身的创建也要防竞态——否则并发首调
 # 可能各持一把锁、双检被绕过、各建一个控制器（后建者覆盖缓存引用，先建的
 # 原生控件失去引用残留主窗体）。该 guard 只用于创建实例锁，绝不嵌套持有。
@@ -71,7 +75,18 @@ class BrowserBridgeMixin:
                     # 状态事件必须带归属会话：前端只认领「当前查看会话」的状态，
                     # 否则后台会话的导航/标题/加载态会污染用户正在看的另一个会话。
                     payload = dict(state or {})
-                    payload["session_name"] = self._browser_pane_owner()
+                    content = self._browser_pane_content_session()
+                    if content:
+                        # 快照描述的是「控件里这一页」，归属必须是这一页的会话，
+                        # 而不是发射这一刻的控件占用者：状态推送是 150ms 节流的
+                        # 尾随补发，切会话那一瞬间到达的旧快照若按占用者打标，
+                        # A 会话的页面地址会被当成 B 会话的状态写进 B 的界面。
+                        url = str(payload.get("url") or "")
+                        if url:
+                            self._browser_pane_urls()[content] = url
+                        payload["session_name"] = content
+                    else:
+                        payload["session_name"] = self._browser_pane_owner()
                     self.emit_event("embedded_browser", payload)
                 except Exception:
                     logger.debug("推送内嵌浏览器状态失败", exc_info=True)
@@ -127,6 +142,9 @@ class BrowserBridgeMixin:
         if isinstance(result, dict) and result.get("ok"):
             if getattr(self, "_embedded_browser", None) is ctrl:
                 self._embedded_browser = None
+            # 控件已 Dispose：页面随控件一起消失，页面记账同步作废（会话地址表
+            # 保留，重建控件后切回该会话仍能恢复自己的页面）
+            self._browser_pane_mark_content("")
         else:
             logger.warning(
                 "释放失败（%s），保留控制器引用（残留控件仍挂主窗体，避免下次 open 叠加新控件）",
@@ -206,6 +224,27 @@ class BrowserBridgeMixin:
             self._browser_pane_pending_intents = pending
         return pending
 
+    def _browser_pane_urls(self) -> Dict[str, str]:
+        """每个会话最近一次加载的地址（会话级页面记账）。
+
+        原生控件全进程唯一，同一时刻只能停一页，所以「页面内容属于谁」不能由
+        「谁在占用控件」推断：切回某会话时它该看到自己上次那一页（或什么都没有），
+        绝不能是别的会话留在控件里的页面。这张表就是那个依据。
+        """
+        urls = getattr(self, "_browser_pane_url_memory", None)
+        if not isinstance(urls, dict):
+            urls = {}
+            self._browser_pane_url_memory = urls
+        return urls
+
+    def _browser_pane_content_session(self) -> str:
+        """控件里**当前这一页**属于哪个会话；空串 = 控件还没载入过任何页面。"""
+        return str(getattr(self, "_browser_pane_content_owner", "") or "")
+
+    def _browser_pane_mark_content(self, session_name: str) -> None:
+        """登记「控件里现在这一页属于某个会话」（导航类操作生效时调用）。"""
+        self._browser_pane_content_owner = str(session_name or "")
+
     def _browser_pane_is_foreground(self, session_name: str) -> bool:
         """是否就是 UI 当前查看的会话；空值按前台处理（兼容旧前端）。"""
         current = str(getattr(self, "_current_session", "") or "")
@@ -246,8 +285,22 @@ class BrowserBridgeMixin:
             # 先记归属再 open：controller 的 on_state 回调据此给事件打 session；
             # open 失败时归属残留无副作用（下次成功 open 会覆盖）。
             self._browser_pane_owner_session = target
-            self._inject_tokenrhythm_session(ctrl, url)
-            return ctrl.open(rect, url, zoom)
+            page = str(url or "").strip()
+            if not page:
+                # 空 url = 前端只要求「把原生表面摆到这块矩形上」；该显示哪一页
+                # 由会话级页面记账决定。控件里若还停着**别的会话**的页面，绝不
+                # 能就这么显示出来（那正是「A 会话打开的内容出现在 B 会话」的
+                # 最后一环）：优先恢复本会话自己上次的地址，没有就退到空白页。
+                content = self._browser_pane_content_session()
+                if content and content != target:
+                    page = self._browser_pane_urls().get(target, "") or _BLANK_PAGE
+            self._inject_tokenrhythm_session(ctrl, page)
+            result = ctrl.open(rect, page, zoom)
+            if isinstance(result, dict) and result.get("ok") and page:
+                self._browser_pane_mark_content(target)
+                if page != _BLANK_PAGE:
+                    self._browser_pane_urls()[target] = page
+            return result
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -323,7 +376,16 @@ class BrowserBridgeMixin:
             if error is not None:
                 return error
             self._inject_tokenrhythm_session(ctrl, url)
-            return ctrl.navigate(url)
+            result = ctrl.navigate(url)
+            if isinstance(result, dict) and result.get("ok") and not result.get("deferred"):
+                # 导航生效：控件里这一页从此属于该会话，同时记成该会话的
+                # 「上次地址」（切回它时按这张表恢复自己的页面）
+                self._browser_pane_owner_session = target
+                self._browser_pane_mark_content(target)
+                page = str(url or "").strip()
+                if page:
+                    self._browser_pane_urls()[target] = page
+            return result
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -413,7 +475,22 @@ class BrowserBridgeMixin:
             ctrl = getattr(self, "_embedded_browser", None)
             if ctrl is None:
                 return {"ok": True, "state": None}
-            return ctrl.get_state()
+            result = ctrl.get_state()
+            if not isinstance(result, dict) or not result.get("ok"):
+                return result
+            state = result.get("state")
+            if not isinstance(state, dict):
+                return result
+            # 校准口径与状态事件一致：快照描述的是「控件里这一页」，只能交给
+            # 这一页所属的会话。别的会话来问（面板挂载/桥就绪时 calibrate）
+            # 一律给 state=None，绝不把 A 会话的地址当成 B 会话的状态写进界面。
+            content = self._browser_pane_content_session()
+            target = self._browser_pane_session(session_name)
+            if content and target and content != target:
+                return {"ok": True, "state": None}
+            snapshot = dict(state)
+            snapshot["session_name"] = content or target
+            return {"ok": True, "state": snapshot}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -451,6 +528,11 @@ class BrowserBridgeMixin:
                 "computer_embedded_unavailable",
                 f"内置浏览器自动化准备失败：{result.get('error')}",
             )
+        if session_name:
+            # 自动化接下来驱动的就是这一页：把控件里的页面记到发起会话名下。
+            # 否则前端把面板摆过来（open 空 url）时会认为「控件里是别人的页面」
+            # 而换成空白页，正在被操控的页面就被清掉了。
+            self._browser_pane_mark_content(str(session_name))
         try:
             width, height = get_project_browser_viewport(get_workdir())
             self.emit_event(

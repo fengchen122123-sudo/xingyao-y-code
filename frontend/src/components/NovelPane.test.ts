@@ -711,3 +711,121 @@ it('回合结束：设定库重新拉取，审查结论作废且不自动重跑'
   expect(wrapper.find('[data-test="novel-audit-finding"]').exists()).toBe(false);
   wrapper.unmount();
 });
+
+// ---- 一致性审查修复入口：把 finding 拼成对话指令交回星瑶（只预填不发送） ----
+
+// 多条 findings 的 fixture：覆盖三类检查项，单条修复与全部修复两条预填路径共用
+function auditFindings() {
+  return [
+    { level: 'S1', type: 'tracking_state', file: '追踪/追踪表.md', message: '第 3 章状态与追踪表不一致' },
+    { level: 'S2', type: 'foreshadow_overdue', file: '追踪/伏笔表.md', message: 'F001「断剑的来历」已超期 5 章' },
+    { level: 'S3', type: 'chapter_wordcount', file: '细纲/第004章.md', message: '第 4 章字数 1200 未达目标 3000' },
+  ];
+}
+
+function auditPayload(findings: Record<string, unknown>[]) {
+  return {
+    is_novel: true,
+    ok: true,
+    scope: 'chapter',
+    summary: { S1: 1, S2: 1, S3: 1, S4: 0 },
+    findings,
+    skipped: [],
+  };
+}
+
+// 点「运行审查」并等到结论渲染完成
+async function runAuditAndWait(wrapper: any) {
+  await vi.waitFor(() => {
+    expect(wrapper.find('[data-test="novel-audit-run"]').exists()).toBe(true);
+  });
+  await wrapper.get('[data-test="novel-audit-run"]').trigger('click');
+  await vi.waitFor(() => {
+    expect(wrapper.find('[data-test="novel-audit-summary"]').exists()).toBe(true);
+  });
+}
+
+it('一致性审查修复：每条结论都有修复按钮，单条修复预填该条类型/文件/原文与最小改动要求', async () => {
+  const findings = auditFindings();
+  const runNovelAudit = vi.fn(async () => auditPayload(findings));
+  const { wrapper } = mountPane(async () => statusPayload(), { run_novel_audit: runNovelAudit });
+  const store = useAppStore();
+
+  await runAuditAndWait(wrapper);
+  // 每条 finding 一条修复按钮，且初始没有草稿
+  const fixes = wrapper.findAll('[data-test="novel-audit-fix"]');
+  expect(fixes).toHaveLength(findings.length);
+  expect(store._getSessionRuntime().composerText || '').toBe('');
+
+  await fixes[0].trigger('click');
+
+  // 只预填输入框、不直接改文件也不自动发送
+  const draft = store._getSessionRuntime().composerText || '';
+  expect(draft).toContain(WORKDIR);
+  expect(draft).toContain(findings[0].type);
+  expect(draft).toContain(findings[0].file);
+  expect(draft).toContain(findings[0].message);
+  // 别的条目不该混进这一条指令
+  expect(draft).not.toContain(findings[1].message);
+  // 明确要求最小改动 + 改完重跑审查
+  expect(draft).toContain('只做最小改动');
+  expect(draft).toContain('重跑一致性审查');
+  wrapper.unmount();
+});
+
+it('一致性审查修复：全部交给星瑶修按类型分组预填，含组标题、每组条数与重跑要求', async () => {
+  const findings = auditFindings();
+  const runNovelAudit = vi.fn(async () => auditPayload(findings));
+  const { wrapper } = mountPane(async () => statusPayload(), { run_novel_audit: runNovelAudit });
+  const store = useAppStore();
+
+  await runAuditAndWait(wrapper);
+  const fixAll = wrapper.get('[data-test="novel-audit-fix-all"]');
+  expect(fixAll.text()).toContain('全部交给星瑶修');
+  await fixAll.trigger('click');
+
+  const draft = store._getSessionRuntime().composerText || '';
+  // 总数 + 按 type 分组的标题与每组条数
+  expect(draft).toContain('共 3 条');
+  expect(draft).toContain('## tracking_state（1 条）');
+  expect(draft).toContain('## foreshadow_overdue（1 条）');
+  expect(draft).toContain('## chapter_wordcount（1 条）');
+  // 分组顺序按后端检查项顺序，不按 findings 出现顺序乱排
+  expect(draft.indexOf('## tracking_state')).toBeLessThan(draft.indexOf('## foreshadow_overdue'));
+  for (const finding of findings) {
+    expect(draft).toContain(finding.message);
+    expect(draft).toContain(finding.file);
+  }
+  expect(draft).toContain('重跑一致性审查');
+  wrapper.unmount();
+});
+
+it('一致性审查修复：修复中两个入口都 disabled，挡住连点重复预填', async () => {
+  const runNovelAudit = vi.fn(async () => auditPayload(auditFindings()));
+  const { wrapper } = mountPane(async () => statusPayload(), { run_novel_audit: runNovelAudit });
+
+  await runAuditAndWait(wrapper);
+  // 就绪态两个入口都可点
+  expect(wrapper.get('[data-test="novel-audit-fix-all"]').attributes('disabled')).toBeUndefined();
+  expect(wrapper.get('[data-test="novel-audit-fix"]').attributes('disabled')).toBeUndefined();
+
+  // 点「全部修复」即上锁（fixing=true 短时窗口）：全部修复与每条的修复按钮一起禁用
+  await wrapper.get('[data-test="novel-audit-fix-all"]').trigger('click');
+  expect(wrapper.get('[data-test="novel-audit-fix-all"]').attributes('disabled')).toBeDefined();
+  const fixes = wrapper.findAll('[data-test="novel-audit-fix"]');
+  expect(fixes.length).toBeGreaterThan(0);
+  for (const btn of fixes) expect(btn.attributes('disabled')).toBeDefined();
+  wrapper.unmount();
+});
+
+it('一致性审查修复：findings 为空时不渲染「全部修复」，只显示没有发现问题', async () => {
+  const runNovelAudit = vi.fn(async () => auditPayload([]));
+  const { wrapper } = mountPane(async () => statusPayload(), { run_novel_audit: runNovelAudit });
+
+  await runAuditAndWait(wrapper);
+  expect(wrapper.findAll('[data-test="novel-audit-finding"]')).toHaveLength(0);
+  expect(wrapper.find('[data-test="novel-audit-fix"]').exists()).toBe(false);
+  expect(wrapper.find('[data-test="novel-audit-fix-all"]').exists()).toBe(false);
+  expect(wrapper.text()).toContain('没有发现问题');
+  wrapper.unmount();
+});
