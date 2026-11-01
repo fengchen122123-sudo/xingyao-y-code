@@ -769,3 +769,258 @@ def test_session_cookie_value_never_logged(caplog):
 
     assert "写入会话 cookie 失败" in caplog.text  # 失败路径确实记了日志
     assert secret not in caplog.text  # 但 value 绝不入日志
+
+
+# ------------------------------------------------ 滚动后重绘 nudge（异步投递）
+
+class _FakeRect:
+    """System.Drawing.Rectangle 桩：避免 headless 测试依赖 pythonnet/clr。"""
+
+    def __init__(self, x, y, w, h):
+        self.X, self.Y = int(x), int(y)
+        self.Width, self.Height = int(w), int(h)
+
+    def as_tuple(self):
+        return (self.X, self.Y, self.Width, self.Height)
+
+
+def _rect_factory(x, y, w, h):
+    return _FakeRect(x, y, w, h)
+
+
+class _NudgeForm:
+    """BeginInvoke 只入队、不立即执行，由测试 run_next() 逐个驱动。
+
+    真实实现依赖 BeginInvoke 把「+1」与「还原」分到两个 GUI 消息轮次；同步执行
+    的桩会把两帧合并成一次布局，无法断言航次，所以这里必须排队驱动。
+    """
+
+    def __init__(self):
+        self.Handle = _FakeHandle()  # 覆盖 _begin_invoke 的句柄预检分支
+        self.queue = []
+        self.begin_invoke_calls = 0
+
+    def BeginInvoke(self, delegate):
+        self.begin_invoke_calls += 1
+        self.queue.append(delegate)
+
+    def run_next(self):
+        assert self.queue, "没有待驱动的 BeginInvoke 投递"
+        self.queue.pop(0)()
+
+
+class _BoundsProbe:
+    """控件桩：记录每一次 Bounds 赋值（顺序 + 矩形）。"""
+
+    def __init__(self):
+        self.writes = []
+        self._bounds = None
+        self.Visible = False
+        self.CoreWebView2 = None
+
+    @property
+    def Bounds(self):
+        return self._bounds
+
+    @Bounds.setter
+    def Bounds(self, rect):
+        self._bounds = rect
+        self.writes.append(rect.as_tuple())
+
+
+class _FakeMessageArgs:
+    """WebView2 WebMessageReceivedEventArgs 桩：两种取值形态都可控。"""
+
+    def __init__(self, text=None, json_value=None):
+        self._text = text
+        self._json = json_value
+
+    def TryGetWebMessageAsString(self):
+        if self._text is None:
+            raise RuntimeError("消息不是字符串形态")
+        return self._text
+
+    @property
+    def WebMessageAsJson(self):
+        if self._json is None:
+            raise RuntimeError("JSON 形态不可用")
+        return self._json
+
+
+def _nudge_controller(monkeypatch=None, bounds=(10, 20, 300, 200)):
+    ctrl = eb.EmbeddedBrowserController(on_state=lambda _state: None, get_form=lambda: None)
+    form = _NudgeForm()
+    probe = _BoundsProbe()
+    ctrl._form = form
+    ctrl._webview = probe
+    ctrl._ready = True
+    ctrl._visible = True
+    ctrl._loading = False
+    ctrl._bounds = bounds
+    ctrl._last_nudge = 0.0  # 远早于节流窗口：默认可立即投递
+    if monkeypatch is not None:
+        # 矩形由 System.Drawing 提供（headless 不可用）；被测点是 +1/还原的算术
+        monkeypatch.setattr(ctrl, "_make_rectangle", _rect_factory, raising=False)
+    return ctrl, form, probe
+
+
+def test_scroll_nudge_script_carries_ms_threshold():
+    """脚本里的节流毫秒值必须由 _SCROLL_NUDGE_MIN_INTERVAL 派生，不写死。"""
+    expected = str(max(1, int(eb._SCROLL_NUDGE_MIN_INTERVAL * 1000)))
+    assert "__YCODE_NUDGE_MS__" not in eb._SCROLL_NUDGE_SCRIPT
+    assert "now - last < " + expected + ")" in eb._SCROLL_NUDGE_SCRIPT
+
+
+def test_non_nudge_web_message_does_not_trigger_nudge(monkeypatch):
+    """消息里没有 scroll-nudge 时一律忽略：不进入节流、不投递任何回调。"""
+    ctrl, form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs(text="hello"))
+    ctrl._on_web_message_received(None, _FakeMessageArgs(json_value='{"type":"hello"}'))
+    ctrl._on_web_message_received(None, _FakeMessageArgs(text=""))
+
+    assert calls == []
+    assert form.begin_invoke_calls == 0
+
+
+def test_scroll_nudge_web_message_triggers_nudge(monkeypatch):
+    """主路径：TryGetWebMessageAsString 命中字符串 scroll-nudge。"""
+    ctrl, _form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs(text="scroll-nudge"))
+
+    assert calls == [1]
+
+
+def test_scroll_nudge_json_fallback_triggers_nudge(monkeypatch):
+    """非字符串形态：主路径抛异常后回退 WebMessageAsJson，仍能识别。"""
+    ctrl, _form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs(json_value='"scroll-nudge"'))
+
+    assert calls == [1]
+
+
+def test_scroll_nudge_unreadable_args_ignored(monkeypatch):
+    """两种取值形态都不可用：静默放弃，绝不抛异常给 WebView2 消息循环。"""
+    ctrl, _form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs())
+
+    assert calls == []
+
+
+def test_nudge_throttled_within_window():
+    """节流窗口内立即 return；窗口过去后才投递一次。"""
+    ctrl, form, probe = _nudge_controller()
+    ctrl._last_nudge = time.monotonic()
+
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 0
+    assert form.queue == []
+    assert probe.writes == []
+
+    ctrl._last_nudge = time.monotonic() - eb._SCROLL_NUDGE_MIN_INTERVAL - 0.01
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 1
+    assert len(form.queue) == 1
+    assert ctrl._last_nudge > 0.0  # 成功后推进节流起点
+
+    # 刚投递过：紧接着再滚动仍被节流，不产生第二次投递
+    ctrl._nudge_after_scroll()
+    assert form.begin_invoke_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("_ready", False),
+        ("_webview", None),
+        ("_visible", False),
+        ("_loading", True),
+        ("_bounds", None),
+    ],
+)
+def test_nudge_guard_blocks_dispatch(field, value):
+    """守卫命中时既不投递也不推进节流起点（顺序：ready/webview/visible/loading/bounds）。"""
+    ctrl, form, probe = _nudge_controller()
+    setattr(ctrl, field, value)
+
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 0
+    assert form.queue == []
+    assert probe.writes == []
+    assert ctrl._last_nudge == 0.0
+
+
+def test_nudge_bumps_height_by_one_then_restores(monkeypatch):
+    """+1 与还原落在两次投递（两个 GUI 轮次），x/y/w 全程不变。"""
+    ctrl, form, probe = _nudge_controller(monkeypatch, bounds=(10, 20, 300, 200))
+
+    ctrl._nudge_after_scroll()
+
+    assert len(form.queue) == 1
+    assert probe.writes == []  # 只排队，尚未执行
+    assert form.queue[0] is not None
+
+    form.run_next()  # 驱动第一帧：+1
+    assert probe.writes == [(10, 20, 300, 201)]
+    assert ctrl._bounds == (10, 20, 300, 200)  # 状态矩形不被 nudge 改写
+    assert len(form.queue) == 1  # 还原单独投递到「下一帧」
+
+    form.run_next()  # 驱动第二帧：还原
+    assert probe.writes == [(10, 20, 300, 201), (10, 20, 300, 200)]
+    assert form.queue == []
+
+
+def test_nudge_restore_follows_latest_bounds(monkeypatch):
+    """两帧之间 set_bounds 换了新矩形：还原必须用新值，不能覆盖用户新尺寸。"""
+    ctrl, form, probe = _nudge_controller(monkeypatch, bounds=(10, 20, 300, 200))
+
+    ctrl._nudge_after_scroll()
+    form.run_next()  # +1：旧矩形
+
+    ctrl._bounds = (50, 60, 400, 500)  # 模拟中途 set_bounds
+    form.run_next()  # 还原
+
+    assert probe.writes == [(10, 20, 300, 201), (50, 60, 400, 500)]
+
+
+def test_nudge_swallows_dispatch_failure():
+    """BeginInvoke 抛异常时 nudge 静默放弃，绝不影响浏览器主流程。"""
+    ctrl, form, probe = _nudge_controller()
+
+    def _boom(delegate):
+        raise RuntimeError("BeginInvoke failed")
+
+    form.BeginInvoke = _boom
+
+    ctrl._nudge_after_scroll()  # 不抛
+
+    assert probe.writes == []
+    assert form.queue == []
+
+
+def test_nudge_skips_zero_size_bounds_inside_callback(monkeypatch):
+    """w/h<=0 的判断在回调内（守卫只判 _bounds 是否为空）：会投递一次，
+    但绝不写入非法矩形。
+    """
+    ctrl, form, probe = _nudge_controller(monkeypatch, bounds=(10, 20, 0, 0))
+
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 1
+    form.run_next()
+    assert probe.writes == []
+    assert form.queue == []  # 还原也没投递

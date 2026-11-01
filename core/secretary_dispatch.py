@@ -67,6 +67,17 @@ class SecretaryDispatchService:
         """派发任务；返回 {ok, target_session, display_name, workdir, state}。"""
         raise NotImplementedError
 
+    def create_project(self, path: str = "") -> dict:
+        """新建项目文件夹并引入为工作区。
+
+        语义等价于用户点侧栏「添加/引入项目文件夹」并选中这个目录：目录不存在
+        则逐级创建，已存在则直接复用；随后登记进工作区表，侧栏立即出现该分组，
+        之后 ``dispatch_task(workdir=该目录)`` 就能在里面建会话干活。
+        返回 {ok, workdir, created, display_name}；路径非法 / 无法创建时抛
+        ``SecretaryDispatchError``。
+        """
+        raise NotImplementedError
+
     def open_session(self, target: str = "") -> dict:
         """切换到目标会话；返回 {ok, session_name, display_name, workdir}。"""
         raise NotImplementedError

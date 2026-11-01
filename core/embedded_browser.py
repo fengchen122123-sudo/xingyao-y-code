@@ -59,6 +59,42 @@ _CDP_READY_TIMEOUT = 20.0
 _CDP_PROBE_INTERVAL = 0.25
 _CDP_PROBE_HTTP_TIMEOUT = 1.0
 
+# 滚动后轻量重绘 nudge 的节流下限（秒）。这是**唯一数据源**：JS 侧的节流毫秒
+# 阈值由它派生（见下方 _SCROLL_NUDGE_SCRIPT 的占位替换），不再在脚本里另写一个
+# 数字，否则两处各改一处就会悄悄漂移。原注释声称"共用这个最小间隔"，但脚本里
+# 实际写死了 150，属于注释与实现不符，这里一并改正。
+_SCROLL_NUDGE_MIN_INTERVAL = 0.15
+
+# 每个新文档自动执行的滚动监听脚本：监听 document 与 window 的 scroll 事件
+# （passive、捕获，覆盖子滚动容器），节流内最多一次通知宿主做重绘 nudge
+# （见 _on_web_message_received / _nudge_after_scroll）。节流毫秒数不写死，
+# 留 __YCODE_NUDGE_MS__ 占位，紧跟脚本定义后模块级替换一次。
+_SCROLL_NUDGE_SCRIPT = """
+(function () {
+  if (window.__ycodeScrollNudgeInstalled) return;
+  window.__ycodeScrollNudgeInstalled = true;
+  var last = 0;
+  function onScroll() {
+    var now = Date.now();
+    if (now - last < __YCODE_NUDGE_MS__) return;
+    last = now;
+    try {
+      // 只发字符串：宿主主路径是 TryGetWebMessageAsString()，发对象会让它抛
+      // 异常、绕道 WebMessageAsJson 兜底，白付一次异常开销（缺陷 3）。
+      window.chrome.webview.postMessage('scroll-nudge');
+    } catch (e) { /* 通道不可用时静默放弃，不影响页面滚动 */ }
+  }
+  document.addEventListener('scroll', onScroll, { passive: true, capture: true });
+  window.addEventListener('scroll', onScroll, { passive: true });
+})();
+"""
+
+# 占位替换成毫秒整数。用 .replace 而非 str.format：JS 里大量 {} 会被当成
+# 占位符直接炸掉。max(1, ...) 防止常量被改小到 0 导致节流失效（每帧都发）。
+_SCROLL_NUDGE_SCRIPT = _SCROLL_NUDGE_SCRIPT.replace(
+    "__YCODE_NUDGE_MS__", str(max(1, int(_SCROLL_NUDGE_MIN_INTERVAL * 1000)))
+)
+
 
 def is_supported() -> bool:
     """内嵌浏览器仅 Windows（WebView2/WinForms）可用。"""
@@ -323,6 +359,8 @@ class EmbeddedBrowserController:
         # 内核就绪与每次导航前重放（页面把 cookie 清掉也能补回来）。
         self._session_cookies: list[dict] = []
         self._session_cookie_domain = ""
+        # 滚动重绘 nudge 的上次触发时间（monotonic），用于严格节流；未滚动过为 0。
+        self._last_nudge = 0.0
 
     # ------------------------------------------------------------------ 内部
 
@@ -340,6 +378,19 @@ class EmbeddedBrowserController:
             return True
         except Exception:
             logger.debug("GUI 线程 Invoke 失败", exc_info=True)
+            return False
+
+    def _begin_invoke(self, form, callback: Callable[[], None]) -> bool:
+        """把回调异步投递到 GUI 线程（WebView2 事件回调场景，不等返回）。
+
+        与 _invoke 的 Invoke 不同：这里只排队不等待，事件回调（滚动上报）不会
+        因为 GUI 线程正忙而卡住 WebView2 的消息循环。
+        """
+        try:
+            form.BeginInvoke(_make_delegate(callback))
+            return True
+        except Exception:
+            logger.debug("GUI 线程 BeginInvoke 失败", exc_info=True)
             return False
 
     @staticmethod
@@ -427,6 +478,7 @@ class EmbeddedBrowserController:
         self._form = form
         self._cdp_port = cdp_port
         self._zoom = 1.0  # 新控件从默认缩放起步，旧缓存不得带入
+        self._last_nudge = 0.0  # 新控件的滚动 nudge 节流起点归零
 
     # ------------------------------------------------------------ 事件回调
 
@@ -453,6 +505,21 @@ class EmbeddedBrowserController:
             core.NavigationStarting += self._on_navigation_starting
             core.NavigationCompleted += self._on_navigation_completed
             core.NewWindowRequested += self._on_new_window_requested
+            # 滚动重绘 nudge 的页面→宿主通道：本模块此前没有任何注入点/消息
+            # 通道（全仓库搜 AddScriptToExecuteOnDocumentCreatedAsync /
+            # ExecuteScriptAsync / WebMessageReceived 均无内嵌浏览器的用法），
+            # 这里建最小一套，只承载固定的滚动通知。
+            # 缺陷 2 修正：这两步原本在同一个 try 里，任一步抛异常都会连带跳过
+            # 另一步且日志分不清死因。拆开：订阅失败仍可注入脚本（消息暂时没人
+            # 收），注入失败仍可收消息（脚本早注入的文档依旧能通知），互不拖累。
+            try:
+                core.WebMessageReceived += self._on_web_message_received
+            except Exception:
+                logger.debug("订阅 WebMessageReceived 失败（滚动 nudge 通道收不到消息）", exc_info=True)
+            try:
+                core.AddScriptToExecuteOnDocumentCreatedAsync(_SCROLL_NUDGE_SCRIPT)
+            except Exception:
+                logger.debug("注入滚动重绘 nudge 脚本失败（新文档将无法上报滚动）", exc_info=True)
             self._ready = True
             # 补导航：内核就绪前 navigate()/open(url) 缓存的目标（评审 B1/S1）。
             # 与 navigate 的竞态闭环：双方都在 _lock 内读写 _pending_url/_ready，
@@ -510,6 +577,14 @@ class EmbeddedBrowserController:
             self._url = str(sender.Source or self._url)
         except Exception:
             pass
+        # 补注入滚动监听：AddScriptToExecuteOnDocumentCreatedAsync 的注册是异步
+        # 的，首个文档可能与注册赛跑，丢监听等于丢滚动后的重绘自愈能力（脚本
+        # 自带安装标记，重复注入无副作用）。
+        try:
+            if self._webview is not None:
+                self._webview.CoreWebView2.ExecuteScriptAsync(_SCROLL_NUDGE_SCRIPT)
+        except Exception:
+            logger.debug("补注入滚动重绘 nudge 脚本失败", exc_info=True)
         self._schedule_emit()
 
     def _on_new_window_requested(self, sender, args) -> None:
@@ -521,6 +596,23 @@ class EmbeddedBrowserController:
                 self._webview.CoreWebView2.Navigate(target)
         except Exception:
             logger.debug("处理新窗口请求失败", exc_info=True)
+
+    def _on_web_message_received(self, sender, args) -> None:
+        """页面脚本 → 宿主：只认"滚动过"这一条通知，其他消息一律忽略。"""
+        try:
+            # 主路径：脚本发的是字符串，TryGetWebMessageAsString 直接命中，零异常。
+            raw = args.TryGetWebMessageAsString()
+        except Exception:
+            # 防御性兜底（非主路径）：仅应对消息不是字符串形态的情况（例如页面
+            # 别处或旧版脚本发了对象）。旧实现把对象当唯一形态，主路径每次都抛
+            # 异常再兜底，白付开销；现在反过来。兜底失败即放弃本次通知。
+            try:
+                raw = args.WebMessageAsJson
+            except Exception:
+                return
+        if "scroll-nudge" not in str(raw or ""):
+            return
+        self._nudge_after_scroll()
 
     # ------------------------------------------------------------ 状态推送
 
@@ -696,6 +788,85 @@ class EmbeddedBrowserController:
             self._zoom = z
         except Exception:
             logger.debug("设置 WebView2 ZoomFactor 失败", exc_info=True)
+
+    def _nudge_after_scroll(self) -> None:
+        """滚动后做一次轻量重绘 nudge（严格节流，控件 x/y/w/h 的终值不变）。
+
+        为什么需要 nudge：fit 模式下后端用分数 ZoomFactor 把 CSS 视口等比缩放进
+        控件矩形，叠加高 DPI 后 Chromium 合成器的瓦片在滚轮滚动时可能不重绘
+        （上半部分留一块空白），而滚动本身不改 Bounds、代码里没有重绘兜底，只能
+        等切页签/改尺寸这类整屏重绘才自愈——所以滚动后主动抖 1px 逼它重画。
+        失败一律吞掉：nudge 只是视觉兜底，绝不能影响浏览器主流程。
+        """
+        try:
+            if not self._ready or self._webview is None or not self._visible:
+                return  # 控件未就绪或面板未显示：不做任何事
+            if self._loading:
+                return  # 正在导航：整屏重绘由导航自带，nudge 无意义
+            bounds = self._bounds
+            if not bounds:
+                return  # 还没有有效 Bounds，抖不了
+            now = time.monotonic()
+            if now - self._last_nudge < _SCROLL_NUDGE_MIN_INTERVAL:
+                return  # 节流：连续滚动时最多每 _SCROLL_NUDGE_MIN_INTERVAL 抖一次
+            form = self._form or self._get_form()
+            if form is None:
+                return
+            self._last_nudge = now
+
+            def _nudge():
+                try:
+                    if self._webview is None or self._bounds is None:
+                        return
+                    x, y, w, h = self._bounds
+                    if w <= 0 or h <= 0:
+                        return
+                    # 缺陷 4 修正：只在本帧做 +1px，还原交给下一帧的另一次
+                    # BeginInvoke 投递。原实现在同一帧里连续写两次 Bounds，
+                    # WinForms 会合并成一次布局，Chromium 看不到中间态，nudge
+                    # 等于没做。
+                    self._webview.Bounds = self._make_rectangle(x, y, w, h + 1)
+                    logger.debug(
+                        "滚动重绘 nudge 执行：页面滚动静默重绘兜底，h %d -> %d",
+                        h, h + 1,
+                    )
+                except Exception:
+                    logger.debug("滚动重绘 nudge 执行失败", exc_info=True)
+                    return
+
+                def _restore():
+                    try:
+                        if self._webview is None:
+                            return  # 控件已销毁：没有可还原的对象
+                        # 必须重新读 self._bounds 而非闭包里的旧 (x,y,w,h)：
+                        # 这两帧之间 set_bounds 可能已换成新矩形，用旧值还原
+                        # 会把用户刚设的新尺寸覆盖掉。
+                        cur = self._bounds
+                        if not cur:
+                            return
+                        rx, ry, rw, rh = cur
+                        if rw <= 0 or rh <= 0:
+                            return
+                        # 语义选择：还原是"恢复动作"，不受 _loading / _visible
+                        # 影响——否则跳过会把 h+1 永久留在控件上（隐藏后重新
+                        # 显示时高度就多了 1px，且没有任何路径会再修正）。
+                        # 隐藏态下写 Bounds 无副作用，导航中也只是回到既有矩形。
+                        self._webview.Bounds = self._make_rectangle(rx, ry, rw, rh)
+                    except Exception:
+                        logger.debug("滚动重绘 nudge 还原 Bounds 失败", exc_info=True)
+                    # 注意：还原回调里绝不调用 _nudge_after_scroll，否则会自激
+                    # 成 nudge 死循环。
+
+                # 一帧延迟：还原单独投递一次，保证 +1 与还原落在不同的消息循环
+                # 轮次（BeginInvoke 就是"下一轮 GUI 消息"）。投递失败也不回滚，
+                # 那说明控件/句柄已不可用，此后 _create_control 会重建。
+                if not self._begin_invoke(form, _restore):
+                    logger.debug("滚动重绘 nudge 还原未能投递到 GUI 线程")
+
+            if not self._begin_invoke(form, _nudge):
+                logger.debug("滚动重绘 nudge 未能投递到 GUI 线程")
+        except Exception:
+            logger.debug("滚动重绘 nudge 调度失败", exc_info=True)
 
     # ------------------------------------------------------ 会话 cookie 注入
 

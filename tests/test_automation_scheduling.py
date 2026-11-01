@@ -5,8 +5,10 @@ from datetime import datetime
 import pytest
 
 from core.automation.scheduling import (
+    TRIGGER_TYPES,
     compute_next_run,
     parse_hhmm,
+    parse_run_at,
     validate_trigger,
 )
 
@@ -148,3 +150,105 @@ def test_compute_next_run_always_strictly_after_now():
 
 def test_compute_next_run_startup_has_no_schedule():
     assert compute_next_run("startup", {}, ts(year=2026, month=9, day=12, hour=10, minute=0)) is None
+
+
+# ---------------------------------------------------------------------------
+# once：类型注册与 parse_run_at
+# ---------------------------------------------------------------------------
+
+def test_once_is_registered_trigger_type():
+    assert "once" in TRIGGER_TYPES
+    assert isinstance(TRIGGER_TYPES, tuple)
+    assert TRIGGER_TYPES[-1] == "once"
+
+
+def test_parse_run_at_accepts_strict_format():
+    parsed = parse_run_at("2026-10-25 09:05")
+    assert parsed == pytest.approx(ts(year=2026, month=10, day=25, hour=9, minute=5))
+    assert isinstance(parsed, float)
+    # 闰日（2028 是闰年）合法
+    leap = parse_run_at("2028-02-29 00:00")
+    assert leap == pytest.approx(ts(year=2028, month=2, day=29, hour=0, minute=0))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-2-29 09:00",       # 月日未零填充
+        "2026-02-29 9:00",       # 时未零填充
+        "2026-02-28 09:0",       # 分未零填充
+        "2026/02/28 09:00",      # 分隔符错误
+        "2026-02-28T09:00",      # 缺空格
+        "2026-02-28 09:00:00",   # 多余秒
+        "2026-02-30 09:00",      # 非法日期（2 月 30 日）
+        "2027-02-29 09:00",      # 非闰年闰日
+        "2026-13-01 09:00",      # 月份越界
+        "2026-00-10 09:00",      # 月份为 0
+        "2026-04-31 09:00",      # 4 月没有 31 日
+        "2026-01-01 24:00",      # 时越界
+        "2026-01-01 09:60",      # 分越界
+        "",
+        "  2026-01-01 09:00 ",
+        None,
+        1234,
+    ],
+)
+def test_parse_run_at_rejects_invalid_values(value):
+    with pytest.raises(ValueError):
+        parse_run_at(value)
+
+
+# ---------------------------------------------------------------------------
+# once：validate_trigger
+# ---------------------------------------------------------------------------
+
+def test_validate_trigger_once_accepts_each_form():
+    assert validate_trigger("once", {"delay_minutes": 8}) == []
+    assert validate_trigger("once", {"run_at": "2026-10-25 09:05"}) == []
+    # 边界值合法
+    assert validate_trigger("once", {"delay_minutes": 1}) == []
+    assert validate_trigger("once", {"delay_minutes": 10080}) == []
+
+
+def test_validate_trigger_once_requires_exactly_one_form():
+    missing = validate_trigger("once", {})
+    assert missing
+    assert any("必须且只能提供 delay_minutes 或 run_at 之一" in e for e in missing)
+
+    both = validate_trigger("once", {"delay_minutes": 5, "run_at": "2026-10-25 09:05"})
+    assert both
+    assert any("必须且只能提供 delay_minutes 或 run_at 之一" in e for e in both)
+
+
+@pytest.mark.parametrize("value", [0, 10081, -3, 1.5, True, False, "8", None])
+def test_validate_trigger_once_rejects_bad_delay(value):
+    errors = validate_trigger("once", {"delay_minutes": value})
+    assert errors
+    assert any("delay_minutes" in e for e in errors)
+
+
+def test_validate_trigger_once_rejects_bad_run_at():
+    for value in ("2026-02-30 09:00", "2026-1-1 09:00", "09:00", 20261025):
+        errors = validate_trigger("once", {"run_at": value})
+        assert errors, value
+        assert any("一次性触发时刻非法" in e for e in errors), value
+
+
+# ---------------------------------------------------------------------------
+# once：compute_next_run
+# ---------------------------------------------------------------------------
+
+def test_compute_next_run_once_uses_run_at():
+    now = ts(year=2026, month=9, day=12, hour=10, minute=0)
+    nxt = compute_next_run("once", {"run_at": "2026-09-12 10:30"}, now)
+    assert nxt == pytest.approx(ts(year=2026, month=9, day=12, hour=10, minute=30))
+
+
+def test_compute_next_run_once_uses_delay_minutes():
+    now = ts(year=2026, month=9, day=12, hour=10, minute=0)
+    nxt = compute_next_run("once", {"delay_minutes": 8}, now)
+    assert nxt == pytest.approx(now + 8 * 60)
+    # 上限
+    nxt = compute_next_run("once", {"delay_minutes": 10080}, now)
+    assert nxt == pytest.approx(now + 10080 * 60)
+

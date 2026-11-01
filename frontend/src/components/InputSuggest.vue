@@ -1,7 +1,10 @@
 <template>
   <!-- 输入自动补全面板：/ 斜杠命令 与 @ 文件引用共用 -->
-  <div v-if="items.length" class="suggest-panel">
-    <div class="sg-list">
+  <div v-if="items.length || emptyHint" class="suggest-panel">
+    <!-- 空态：检索完成但两侧都没有命中时必须给反馈，否则面板直接消失，
+         用户无法区分「没有结果」和「功能失效」 -->
+    <div v-if="!items.length" class="sg-empty">{{ emptyHint }}</div>
+    <div v-else class="sg-list">
       <template v-for="(it, i) in items" :key="it.key">
         <!-- 分组小标题：仅在 group 非空且与相邻前项不同时渲染（斜杠命令无 group 不渲染） -->
         <div v-if="it.group && (i === 0 || items[i - 1].group !== it.group)" class="sg-group">
@@ -38,6 +41,8 @@ export interface SuggestItem {
 defineProps<{
   items: SuggestItem[];
   activeIndex: number;
+  // @ 模式下的空结果提示；空串表示没有空态要展示（/ 命令模式恒为空串）
+  emptyHint?: string;
 }>();
 
 const emit = defineEmits<{
@@ -70,6 +75,12 @@ const emit = defineEmits<{
   /* 候选列表独立滚动区，把滚动与提示条隔离 */
   overflow-y: auto;
   min-height: 0;
+}
+.sg-empty {
+  /* 空结果占位：与候选条目同高，保持面板高度稳定，不闪烁 */
+  padding: 9px 10px;
+  font-size: 12px;
+  color: var(--text-faint);
 }
 .sg-item {
   display: flex;

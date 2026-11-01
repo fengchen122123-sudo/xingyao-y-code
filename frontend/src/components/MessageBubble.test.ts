@@ -526,3 +526,42 @@ describe('MessageBubble QQ2009 用户昵称行', () => {
     qq09Theme.unmount();
   });
 });
+
+describe('MessageBubble 登录过期入口', () => {
+  it('助手消息上的登录失效错误旁出现「重新登录」按钮，点击拉起登录窗', async () => {
+    const store = useAppStore();
+    const wrapper = mount(MessageBubble, {
+      props: {
+        msg: assistantMessage({
+          execution_state: 'error',
+          error_note: '基元律动登录已失效，请重新登录后再使用该模型',
+        }),
+      },
+    });
+
+    const btn = wrapper.get('[data-test="login-again-btn"]');
+    expect(btn.text()).toContain('重新登录');
+    await btn.trigger('click');
+    expect(store.trLoginModal.show).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('独立运行错误卡片里的登录过期同样给按钮', async () => {
+    const store = useAppStore();
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'error', content: '登录已过期，请重新登录' } },
+    });
+
+    await wrapper.get('[data-test="login-again-btn"]').trigger('click');
+    expect(store.trLoginModal.show).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('非登录类错误不出现该按钮', () => {
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'error', content: '余额不足' } },
+    });
+    expect(wrapper.find('[data-test="login-again-btn"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+});

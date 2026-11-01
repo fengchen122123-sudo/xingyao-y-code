@@ -148,6 +148,32 @@ def scan_and_mark_interrupted_on_startup(
                         pass
             except OSError:
                 pass
+    # 崩溃残留的 recording 检查点：进程重启后不可能再有回合在写它们。
+    # 超过阈值仍为 recording 的一律收敛为 unavailable，否则该工作区的
+    # 撤销/恢复会被活跃登记永久阻塞为 workspace_busy（M4 的另一半）。
+    stale_threshold_ms = 6 * 60 * 60 * 1000
+    now = now_ms()
+    for checkpoint in storage.list_checkpoints_by_status((TurnUndoStatus.RECORDING,)):
+        started = checkpoint.started_at_ms or 0
+        if started and now - started < stale_threshold_ms:
+            continue
+        try:
+            storage.transition_checkpoint(
+                checkpoint.checkpoint_id,
+                TurnUndoStatus.UNAVAILABLE,
+                unavailable_code="stale_recording",
+                last_error_code="stale_recording",
+                last_error_message="回合异常中断后残留的 recording 检查点，已回收",
+                completed_at_ms=now,
+            )
+        except TurnUndoError:
+            continue
+        report.append({
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "from_status": TurnUndoStatus.RECORDING.value,
+            "to_status": TurnUndoStatus.UNAVAILABLE.value,
+            "reason": "stale_recording",
+        })
     return report
 
 

@@ -13,6 +13,7 @@
       <InputSuggest
         :items="suggestItems"
         :active-index="suggestIndex"
+        :empty-hint="suggestEmpty"
         @select="applySuggest"
         @hover="i => suggestIndex = i"
       />
@@ -244,7 +245,7 @@ function closeComposerMenus() {
 }
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, uploadFiles, openAttachmentImage } = useAttachments();
-const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 
 // 输入卡片容器：拖拽文件进入时高亮提示，drop 由原生事件桥（pywebview）提供完整路径
 const kimiCardRef = ref<HTMLElement | null>(null);

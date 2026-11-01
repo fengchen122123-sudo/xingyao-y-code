@@ -1,0 +1,7 @@
+{
+  "name": "office",
+  "version": "1.0.0",
+  "description": "办公文档读取：把 xlsx / docx / pptx / pdf 转成结构化 Markdown 供模型理解。不新增第三方依赖——xlsx 走 openpyxl、pdf 走 pypdf（均已在依赖中），docx/pptx 用标准库 zipfile + ElementTree 直接解析 OOXML。",
+  "entry": "plugin.py",
+  "enabled": true
+}

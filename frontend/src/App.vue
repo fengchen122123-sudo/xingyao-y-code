@@ -116,6 +116,12 @@
              provider_safety_required/stopping/failed）且 run 归属当前会话时渲染 -->
         <ComputerControlBar />
 
+        <!-- /goal 目标状态条：与电脑操控安全条同层（标题栏下方、对话滚动区外），
+             对话长也不会滚走；没有目标时组件自身不渲染，不影响既有布局。
+             放在输入框上方而非输入框内部，是因为它描述的是"整个会话的推进状态"，
+             而不是某条待发消息 -->
+        <GoalBar />
+
         <!-- 对话主体滚动区：.chat-viewport 是不滚动的定位外壳，
              红点轨道与"回到底部"按钮放在它里面、#chat-scroll 外面——
              若放进 overflow 滚动的 #chat-scroll 内，position:absolute 会相对
@@ -362,6 +368,7 @@ import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
 import TerminalPane from './components/TerminalPane.vue';
 import ComputerControlBar from './components/ComputerControlBar.vue';
+import GoalBar from './components/GoalBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
 import SessionSearchModal from './components/SessionSearchModal.vue';

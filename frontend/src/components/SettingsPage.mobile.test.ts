@@ -69,7 +69,9 @@ describe('SettingsPage 手机端钻取布局', () => {
     expect(wrapper.find('.provider-detail').exists()).toBe(true);
     expect(wrapper.find('.provider-list').exists()).toBe(false);
     expect(wrapper.get('.mobile-detail-back').isVisible()).toBe(true);
-    expect(wrapper.text()).toContain('月之暗面 Kimi-for-Coding');
+    // 详情标题只展示前 6 个字符，完整厂商名挂在 title 里作悬停气泡
+    expect(wrapper.get('.detail-title').text()).toBe('月之暗面 K…');
+    expect(wrapper.get('.detail-title').attributes('title')).toBe('月之暗面 Kimi-for-Coding');
 
     await wrapper.get('.mobile-detail-back').trigger('click');
     // closeMobileDetail 改的是 ref，DOM 同步在下一帧

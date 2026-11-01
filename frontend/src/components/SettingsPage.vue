@@ -48,7 +48,7 @@
             @click="selectProvider(provider.id)"
           >
             <span class="provider-logo cube"><AppIcon name="hexagon" :size="13" /></span>
-            <span class="provider-name">{{ provider.name }}</span>
+            <span class="provider-name" :title="provider.name">{{ shortLabel(provider.name) }}</span>
             <span class="provider-state ready"></span>
           </button>
           <div v-if="!store.providers.length" class="provider-empty">暂无已配置厂商</div>
@@ -130,7 +130,9 @@
           <template v-else-if="selectedProvider">
             <div class="detail-title-row">
               <div>
-                <h2>{{ selectedProvider.name }}</h2>
+                <!-- 厂商名可任意长：只展示前 6 个字符，完整名字放进 title 作悬停气泡，
+                     否则长标题会撑开标题行并压住右侧删除按钮 -->
+                <h2 class="detail-title" :title="selectedProvider.name">{{ shortLabel(selectedProvider.name) }}</h2>
                 <p>{{ selectedProvider.preset_id ? '预置厂商配置' : '自定义模型供应商' }}</p>
               </div>
               <button class="danger-icon" title="删除厂商" @click="store.deleteProvider(selectedProvider)"><AppIcon name="trash" :size="16" /></button>
@@ -812,6 +814,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
+import { shortLabel } from '../utils/shortLabel';
 import type { ChangelogEntry, ComputerProtocolChoice, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 import TokenUsageSettingsLegacy from './TokenUsageSettingsLegacy.vue';
@@ -1687,7 +1690,10 @@ onMounted(async () => {
 .secondary-entry-row .provider-name { font-size: 13px; }
 .provider-detail { min-width: 0; padding: 38px; overflow-y: auto; }
 .detail-title-row { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 28px; }
+/* 标题列允许收缩：长厂商名不再把右侧删除按钮挤出可见区（名称本身已按 6 字符截断） */
+.detail-title-row > div { min-width: 0; }
 .detail-title-row h2 { margin: 0 0 8px; font-size: 20px; }
+.detail-title-row h2.detail-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .protocol-badge, .vision-tag { align-self: flex-start; padding: 4px 9px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-faint); font-size: 11px; }
 .field-label { display: block; margin: 16px 0 7px; color: var(--text-dim); font-size: 12px; }
 .text-field, .readonly-field, .key-field { width: 100%; min-height: 42px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--text); font-size: 13px; }

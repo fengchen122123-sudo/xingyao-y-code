@@ -4,6 +4,9 @@ prompt_toolkit>=3.0.0
 pyfiglet>=0.8.0
 ddgs>=9.0.0
 mcp>=1.0.0
+# 工作流 frontmatter（ZCode .dwf.ts 导入）的 YAML 解析；此前经 mcp 传递引入，
+# core/workflows 直接依赖后在此显式声明
+pyyaml>=6.0
 psutil>=5.9.0
 tenacity>=8.0.0
 

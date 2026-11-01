@@ -85,6 +85,16 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
         factory = self._playwright_factory
         if factory is None:
             # 惰性导入：只有真实启动时才触碰 playwright，且发生在 worker 线程。
+            # 安装包已不再自带 playwright（见 ycode.spec）：先确保按需组件就绪，
+            # 再导入；组件缺失时转成电脑操控领域错误码，提示用户去设置页下载。
+            from core.components import ComponentError, ensure_playwright
+
+            try:
+                ensure_playwright()
+            except ComponentError as error:
+                raise ComputerControlError(
+                    "playwright_component_missing", str(error)
+                ) from error
             from playwright.sync_api import sync_playwright as factory
         try:
             self._runtime = factory()

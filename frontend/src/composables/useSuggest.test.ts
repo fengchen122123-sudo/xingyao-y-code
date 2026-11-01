@@ -4,9 +4,12 @@ import { createPinia, setActivePinia } from 'pinia';
 import { useAppStore } from '../stores/appStore';
 import { useSuggest } from './useSuggest';
 
-// 模拟 textarea 元素：selectionStart + setSelectionRange
+// 模拟 textarea 元素：DOM value + selectionStart + setSelectionRange。
+// value 必须单独给：detectToken 以 DOM 值为权威（输入法组词期间 v-model
+// 尚未同步，只能靠 DOM 拿最新文本），测试用它复现「inputVal 落后于 DOM」。
 function mockTextarea(value: string, cursor: number = value.length) {
   const el = {
+    value,
     selectionStart: cursor,
     setSelectionRange(start: number, _end: number) { this.selectionStart = start; },
     focus() {},
@@ -306,7 +309,10 @@ describe('useSuggest', () => {
     detectToken();
     expect(searchSessions).toHaveBeenLastCalledWith('', 12, '');
 
-    // 已在某个已落库会话里：把会话名交给后端，由它排除自身
+    // 已在某个已落库会话里：把会话名交给后端，由它排除自身。
+    // 两次 detectToken 之间要跨过 250ms 的同 token 去重窗口，否则第二次
+    // 会被当成同一次按键的 input/keyup 重复事件而直接复用上一轮结果。
+    await vi.advanceTimersByTimeAsync(300);
     store.currentSessionName = '缓存改造';
     detectToken();
     expect(searchSessions).toHaveBeenLastCalledWith('', 12, '缓存改造');
@@ -539,5 +545,310 @@ describe('useSuggest', () => {
 
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it('删掉 @ 后重新输入 @ 能重新拉起候选（以 DOM 值为准）', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({
+      ok: true,
+      sessions: [{ name: '登录bug排查', count: 3, updated_at: '', workdir: '' }],
+    });
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggest, suggestItems, suggestEmpty } = useSuggest(inputVal, taRef);
+
+    // 输入 @：出候选
+    taRef.value = mockTextarea('@', 1);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggestItems.value.length).toBe(1);
+
+    // 删除 @：面板关闭、空态清空
+    inputVal.value = '';
+    taRef.value = mockTextarea('', 0);
+    detectToken();
+    expect(suggest.value).toBeNull();
+    expect(suggestEmpty.value).toBe('');
+
+    // 重新输入 @：必须再次检出 token 并拉起候选。
+    // 这里刻意让 inputVal 落后于 DOM（模拟输入法组词期间 v-model 尚未同步），
+    // 旧实现读 inputVal 会漏掉这个 @，面板就不会出现。
+    inputVal.value = '';
+    taRef.value = mockTextarea('@', 1);
+    await vi.advanceTimersByTimeAsync(300);
+    detectToken();
+    expect(suggest.value?.mode).toBe('file');
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggestItems.value.map(it => it.label)).toEqual(['登录bug排查']);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('同一次按键的 input/keyup 重复触发只检索一次', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({ ok: true, sessions: [] });
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@登录');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@登录', 3);
+    detectToken(); // input 事件
+    detectToken(); // 紧跟着的 keyup 事件
+    await vi.advanceTimersByTimeAsync(200);
+
+    // 同一个 token 的重复事件必须复用同一轮检索，否则每次按键打两遍 SQL
+    expect(searchSessions).toHaveBeenCalledTimes(1);
+    expect(searchFiles).toHaveBeenCalledTimes(1);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('两侧都无命中时展示空态提示，而不是面板整体消失', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({ ok: true, sessions: [] });
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@不存在');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestEmpty, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@不存在', 4);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(suggestItems.value.length).toBe(0);
+    expect(suggestEmpty.value).toBe('没有匹配的对话或文件');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('会话检索失败且文件无结果时提示检索失败（与真的没命中区分）', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockRejectedValue(new Error('bridge error'));
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@登录');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestEmpty } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@登录', 3);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(suggestEmpty.value).toBe('对话检索失败，改一下关键词可重试');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('文件候选晚到不重置用户已移动的高亮', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({
+      ok: true,
+      sessions: [
+        { name: '会话A', count: 1, updated_at: '', workdir: '' },
+        { name: '会话B', count: 2, updated_at: '', workdir: '' },
+      ],
+    });
+    let resolveFiles!: (v: any) => void;
+    const searchFiles = vi.fn(() => new Promise(resolve => { resolveFiles = resolve; }));
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, onKeydown, suggestIndex, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@', 1);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(suggestItems.value.length).toBe(2);
+
+    // 用户按 ↓ 选中第二条
+    onKeydown(key('ArrowDown'));
+    expect(suggestIndex.value).toBe(1);
+
+    // 文件候选晚到触发再次 render：高亮必须留在原处，不能被重置回第一项
+    await vi.advanceTimersByTimeAsync(130);
+    resolveFiles({ files: ['a.ts'] });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(suggestItems.value.length).toBe(3);
+    expect(suggestIndex.value).toBe(1);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  // ---------------- 内置斜杠命令（后端清单纯读投影） ----------------
+
+  it('斜杠命令：内置命令参与补全，前缀命中只留 /goal', () => {
+    const store = useAppStore();
+    store.skills = [];
+    store.slashCommands = [
+      { name: '/goal', usage: '/goal <目标>', summary: '目标模式', kind: 'local' } as any,
+      { name: '/fix', usage: '/fix <报错>', summary: '修复报错', kind: 'prompt' } as any,
+    ];
+
+    const inputVal = ref('/go');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggest, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('/go', 3);
+    detectToken();
+
+    expect(suggest.value?.mode).toBe('command');
+    // 只有 /goal 命中前缀 /go
+    expect(suggestItems.value.map(it => it.label)).toEqual(['/goal']);
+    // 右侧说明取 summary，key 带 cmd: 前缀避免与技能/MCP 撞 key
+    expect(suggestItems.value[0].desc).toBe('目标模式');
+    expect(suggestItems.value[0].key).toBe('cmd:/goal');
+  });
+
+  it('斜杠命令：命令候选排在技能之前，同名 label 只出现一次', () => {
+    const store = useAppStore();
+    store.slashCommands = [
+      { name: '/goal', usage: '', summary: '目标模式', kind: 'local' } as any,
+    ];
+    store.skills = [
+      { id: 's1', name: '同名技能', short_id: 'goal', description: '与命令重名', enabled: true } as any,
+      { id: 's2', name: '图技能', short_id: 'graph', description: '', enabled: true } as any,
+    ];
+    store.mcps = [];
+
+    const inputVal = ref('/');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('/', 1);
+    detectToken();
+
+    // 命令在前；技能里的 /goal 因 label 重复被丢弃，/graph 仍然保留（" /" 单独
+    // 输入时技能候选照旧可见，既有行为不变）
+    expect(suggestItems.value.map(it => it.label)).toEqual(['/goal', '/graph']);
+    expect(suggestItems.value[0].key).toBe('cmd:/goal');
+    expect(suggestItems.value[1].key).toBe('skill:graph');
+  });
+
+  it('斜杠命令：选中命令后插入 name 加一个空格', () => {
+    const store = useAppStore();
+    store.skills = [];
+    store.slashCommands = [
+      { name: '/goal', usage: '', summary: '目标模式', kind: 'local' } as any,
+    ];
+
+    const inputVal = ref('/go');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, onKeydown, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('/go', 3);
+    detectToken();
+    expect(suggestItems.value.length).toBe(1);
+
+    onKeydown(key('Tab'));
+    // apply 本身带尾随空格，写回时不能变成两个空格
+    expect(inputVal.value).toBe('/goal ');
+  });
+
+  it('斜杠命令：命令名后已输入空格时不再展示命令候选', () => {
+    const store = useAppStore();
+    store.skills = [];
+    store.mcps = [];
+    store.slashCommands = [
+      { name: '/fix', usage: '', summary: '修复报错', kind: 'prompt' } as any,
+    ];
+
+    const inputVal = ref('/fix ');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggest, suggestItems } = useSuggest(inputVal, taRef);
+
+    // 空格之后是参数位置，已不属于命令名，不能继续弹候选
+    taRef.value = mockTextarea('/fix ', 5);
+    detectToken();
+
+    expect(suggest.value).toBeNull();
+    expect(suggestItems.value.filter(it => it.key.startsWith('cmd:'))).toEqual([]);
+    expect(suggestItems.value.length).toBe(0);
+  });
+
+  it('斜杠命令：清单里无前缀命中时不出现命令候选', () => {
+    const store = useAppStore();
+    store.skills = [];
+    store.mcps = [];
+    store.slashCommands = [
+      { name: '/goal', usage: '', summary: '目标模式', kind: 'local' } as any,
+      { name: '/fix', usage: '', summary: '修复报错', kind: 'prompt' } as any,
+    ];
+
+    const inputVal = ref('/usr');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('/usr', 4);
+    detectToken();
+
+    // /usr 未命中任何内置命令，也没有技能/MCP 匹配：面板保持空列表
+    expect(suggestItems.value.filter(it => it.key.startsWith('cmd:'))).toEqual([]);
+    expect(suggestItems.value.length).toBe(0);
+  });
+
+  it('loadSlashCommands：桥返回 ok 时写入 slashCommands', async () => {
+    const listFn = vi.fn().mockResolvedValue({
+      ok: true,
+      commands: [{ name: '/goal', usage: '/goal <目标>', summary: '目标模式', kind: 'local' }],
+    });
+    vi.stubGlobal('pywebview', { api: { list_slash_commands: listFn } });
+
+    const store = useAppStore();
+    expect(store.slashCommands).toEqual([]);
+
+    await store.loadSlashCommands();
+    expect(listFn).toHaveBeenCalledTimes(1);
+    expect(store.slashCommands.map(c => c.name)).toEqual(['/goal']);
+
+    vi.unstubAllGlobals();
+  });
+
+  it('loadSlashCommands：桥报错或缺接口时保持既有清单且不抛错', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const listFn = vi.fn().mockRejectedValue(new Error('bridge error'));
+    vi.stubGlobal('pywebview', { api: { list_slash_commands: listFn } });
+
+    const store = useAppStore();
+    store.slashCommands = [
+      { name: '/keep', usage: '', summary: '', kind: 'local' } as any,
+    ];
+
+    // reject 被吞掉：补全面板退化为原有候选，不影响输入
+    await expect(store.loadSlashCommands()).resolves.toBeUndefined();
+    expect(store.slashCommands.map(c => c.name)).toEqual(['/keep']);
+    vi.unstubAllGlobals();
+
+    // 旧版桥没有该方法：直接返回，同样不抛错
+    vi.stubGlobal('pywebview', { api: {} });
+    await expect(store.loadSlashCommands()).resolves.toBeUndefined();
+    expect(store.slashCommands.map(c => c.name)).toEqual(['/keep']);
+
+    vi.unstubAllGlobals();
+    errSpy.mockRestore();
   });
 });

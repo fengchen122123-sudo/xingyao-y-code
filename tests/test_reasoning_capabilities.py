@@ -18,7 +18,8 @@ def test_deepseek_prefixed_names_resolve_to_official_thinking_capability():
     """任意厂商的 deepseek 前缀模型（不区分大小写）都按官方思考模式文档适配。
 
     依据 https://api-docs.deepseek.com/zh-cn/guides/thinking_mode：
-    thinking.type 控制开关、reasoning_effort 控制强度，档位 默认/关闭/低/高/最高。
+    thinking.type 控制开关、reasoning_effort 控制强度，档位 default/off/low/high/xhigh/max。
+    其中 xhigh 是官方接受的取值，服务端会按其映射表折叠为 high（不产生额外推理深度）。
     """
     for name in (
         "deepseek-flash",
@@ -29,7 +30,9 @@ def test_deepseek_prefixed_names_resolve_to_official_thinking_capability():
     ):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name
-        assert capability.options == ("default", "off", "low", "high", "max"), name
+        assert capability.options == (
+            "default", "off", "low", "high", "xhigh", "max"
+        ), name
         assert capability.request_strategy == "thinking_object_effort", name
 
 
@@ -146,9 +149,9 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "k3-256k": ("default", "low", "high", "max"),
         "kimi-k3": ("default", "low", "high", "max"),
         "kimi-for-coding": ("default", "low", "high", "max"),
-        "deepseek-flash": ("default", "off", "low", "high", "max"),
-        "deepseek-v4-flash-0731": ("default", "off", "low", "high", "max"),
-        "deepseek-v4.1-flash": ("default", "off", "low", "high", "max"),
+        "deepseek-flash": ("default", "off", "low", "high", "xhigh", "max"),
+        "deepseek-v4-flash-0731": ("default", "off", "low", "high", "xhigh", "max"),
+        "deepseek-v4.1-flash": ("default", "off", "low", "high", "xhigh", "max"),
         "deepseek-v4-pro": ("default", "off", "high", "max"),
         "deepseek-v4-pro-0813": ("default", "off", "low", "high", "max"),
         "qwen3.8-max": ("default", "off", "low", "medium", "xhigh"),
@@ -220,12 +223,12 @@ def test_fixed_models_are_visible_locked_on_and_explicit_hidden_models_are_hidde
         assert fallback["kind"] == "effort"
         assert fallback["visible"] is True
         assert fallback["options"] == [
-            {"value": "default", "label": "默认"},
-            {"value": "off", "label": "关闭"},
-            {"value": "low", "label": "低"},
-            {"value": "medium", "label": "中"},
-            {"value": "high", "label": "高"},
-            {"value": "max", "label": "最高"},
+            {"value": "default", "label": "default"},
+            {"value": "off", "label": "off"},
+            {"value": "low", "label": "low"},
+            {"value": "medium", "label": "medium"},
+            {"value": "high", "label": "high"},
+            {"value": "max", "label": "max"},
         ]
 
 
@@ -240,27 +243,27 @@ def test_unregistered_model_snapshot_exposes_effort_menu():
         "choice": "default",
         "default_choice": "",
         "options": [
-            {"value": "default", "label": "默认"},
-            {"value": "off", "label": "关闭"},
-            {"value": "low", "label": "低"},
-            {"value": "medium", "label": "中"},
-            {"value": "high", "label": "高"},
-            {"value": "max", "label": "最高"},
+            {"value": "default", "label": "default"},
+            {"value": "off", "label": "off"},
+            {"value": "low", "label": "low"},
+            {"value": "medium", "label": "medium"},
+            {"value": "high", "label": "high"},
+            {"value": "max", "label": "max"},
         ],
     }
     assert build_reasoning_snapshot({"name": "hy4-preview"}, "high")["choice"] == "high"
 
 
 def test_snapshot_serializes_labels_in_capability_order():
-    """前端菜单必须收到后端定义的精确顺序和中文标签。"""
+    """前端菜单必须收到后端定义的精确顺序和英文原值标签。"""
     snapshot = build_reasoning_snapshot({"name": "qwen3.8-max"}, "medium")
     assert snapshot["choice"] == "medium"
     assert snapshot["options"] == [
-        {"value": "default", "label": "默认"},
-        {"value": "off", "label": "关闭"},
-        {"value": "low", "label": "低"},
-        {"value": "medium", "label": "中"},
-        {"value": "xhigh", "label": "超高"},
+        {"value": "default", "label": "default"},
+        {"value": "off", "label": "off"},
+        {"value": "low", "label": "low"},
+        {"value": "medium", "label": "medium"},
+        {"value": "xhigh", "label": "xhigh"},
     ]
 
 

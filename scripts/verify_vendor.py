@@ -100,7 +100,15 @@ def load_manifest(manifest_path: str):
         if rel in records:
             problems.append(f"{rel}: 记录重复")
             continue
-        records[rel] = {"sha256": digest, "hash_mode": mode}
+        records[rel] = {
+            "sha256": digest,
+            "hash_mode": mode,
+            # optional=true：体积过大不入库、按需本地下载的资源（如 vendor/ffmpeg，
+            # 见 .gitignore）。记录必须保留（来源/哈希是供应链事实），但构建机上
+            # 没有该文件时只告警跳过，不阻断构建——ycode.spec 也按"存在才打包、
+            # 缺失则运行时回退系统 PATH"处理。
+            "optional": bool(item.get("optional")),
+        }
     return records, problems
 
 
@@ -136,6 +144,11 @@ def verify_vendor(root: str | None = None, manifest_path: str | None = None,
     for rel, rec in sorted(records.items()):
         full = os.path.join(root, *rel.split("/"))
         if not os.path.isfile(full):
+            if rec.get("optional"):
+                # 可选资源：构建机未下载属正常状态（.gitignore 已排除大文件），
+                # 仍要提示，因为最终产物会因此缺少该能力。
+                printer(f"[SKIP] {rel}: 可选资源未提供，本次构建不随包")
+                continue
             problems.append(f"{rel}: 记录存在但文件缺失")
             continue
         try:

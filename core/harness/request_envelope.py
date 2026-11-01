@@ -217,6 +217,12 @@ class RequestEnvelope:
     deepseek_generation_id: int | None
     deepseek_message_count: int | None
     fingerprint: RequestFingerprint
+    # 路由快照（断点续跑 S1）：记录该 Step 实际发给哪个模型、哪个中转地址，
+    # 续跑据此判断路由是否被悄悄换掉。两个字段只是从 kwargs 复制的旁挂元数据，
+    # 不参与任何指纹字节——RequestFingerprint 的 sha256 仍只由
+    # messages/system/tools/options 计算，新增字段不改动任何既有哈希。
+    model: str = ""
+    api_base: str = ""
 
     @classmethod
     def capture(
@@ -271,5 +277,7 @@ class RequestEnvelope:
             attempt=attempt,
             deepseek_generation_id=deepseek_generation_id,
             deepseek_message_count=deepseek_message_count,
+            model=str(kwargs.get("model") or ""),
+            api_base=str(kwargs.get("api_base") or ""),
             fingerprint=fingerprint,
         )

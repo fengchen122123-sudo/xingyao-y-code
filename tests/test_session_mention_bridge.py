@@ -162,6 +162,151 @@ class SessionMentionBridgeTest(unittest.TestCase):
         self.assertNotIn("前端所在的会话", names)
         self.assertIn("后端以为的当前会话", names)
 
+    def test_archived_session_excluded_from_suggestions(self):
+        """已归档会话不参与 @ 候选：归档是用户主动收起的上下文。
+
+        回归：search_sessions 必须显式带 include_archived=False。若哪天
+        get_all_sessions 的默认值被改成包含归档，@ 列表会重新被收起的历史
+        会话污染，且会挤占前 4 个会话名额。
+        """
+        bridge = self._make_bridge_with_tmp_memory(current_session="")
+        for name in ("活跃会话", "已归档会话"):
+            bridge._memory.ensure_session(name)
+            bridge._memory.add_message(name, "user", "hi")
+        self.assertTrue(bridge._memory.archive_session("已归档会话"))
+
+        names = [s["name"] for s in bridge.search_sessions("")["sessions"]]
+        self.assertIn("活跃会话", names)
+        self.assertNotIn("已归档会话", names)
+        # query 精确命中归档会话名时也不能被检索出来
+        self.assertEqual(bridge.search_sessions("已归档")["sessions"], [])
+        # 未归档会话仍可正常命中
+        self.assertEqual(
+            [s["name"] for s in bridge.search_sessions("活跃")["sessions"]],
+            ["活跃会话"],
+        )
+
+    def test_messages_session_id_index_created(self):
+        """messages(session_id) 必须建索引。
+
+        @ 补全会话列表走 get_all_sessions 的 LEFT JOIN messages + COUNT，
+        每次按键都会执行。缺索引时 SQLite 只能全表 SCAN messages
+        （真机 900MB 库单次实测 82~95ms），这是输入 @ 后明显卡顿的根因。
+        """
+        bridge = self._make_bridge_with_tmp_memory()
+        rows = bridge._memory.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
+        ).fetchall()
+        self.assertIn("idx_messages_session", [r[0] for r in rows])
+
+    def test_search_matches_full_first_message_beyond_truncated_name(self):
+        """会话名被截断到 12 字，@ 检索仍要能命中完整首条消息。
+
+        会话名只是首条消息的截断，用户记住的关键词经常落在第 12 字之后
+        （例如名字「帮我看一下缓存命中率」，想搜「eviction」）。只按名字
+        匹配时这类目标永远搜不到，表现为「@ 里什么都出不来」。
+        """
+        bridge = self._make_bridge_with_tmp_memory(current_session="")
+        bridge._memory.ensure_session("帮我看一下缓存命中率")
+        bridge._memory.add_message(
+            "帮我看一下缓存命中率",
+            "user",
+            "帮我看一下缓存命中率为什么忽高忽低，顺便检查 eviction 策略",
+        )
+
+        names = [s["name"] for s in bridge.search_sessions("eviction")["sessions"]]
+        self.assertEqual(names, ["帮我看一下缓存命中率"])
+
+    def test_search_text_keeps_first_user_message_only(self):
+        """search_text 只记录首条 user 消息，后续消息不能覆盖它。"""
+        bridge = self._make_bridge_with_tmp_memory(current_session="")
+        bridge._memory.ensure_session("会话")
+        bridge._memory.add_message("会话", "user", "第一条：初始化仓库")
+        bridge._memory.add_message("会话", "assistant", "好的")
+        bridge._memory.add_message("会话", "user", "第二条：发布上线")
+
+        self.assertEqual(
+            [s["name"] for s in bridge.search_sessions("初始化")["sessions"]],
+            ["会话"],
+        )
+        # 后续 user 消息不进入 search_text，避免检索文本漂移到会话中途
+        self.assertEqual(bridge.search_sessions("发布上线")["sessions"], [])
+
+    def test_name_hits_rank_before_body_hits(self):
+        """名字命中的会话必须排在「仅正文命中」的会话前面。"""
+        bridge = self._make_bridge_with_tmp_memory(current_session="")
+        bridge._memory.ensure_session("缓存改造")
+        bridge._memory.add_message("缓存改造", "user", "hi")
+        # 名字不含「缓存」，只有首条消息里提到
+        bridge._memory.ensure_session("登录问题")
+        bridge._memory.add_message("登录问题", "user", "顺便聊聊缓存策略")
+
+        names = [s["name"] for s in bridge.search_sessions("缓存")["sessions"]]
+        self.assertEqual(names[0], "缓存改造")
+        self.assertEqual(set(names), {"缓存改造", "登录问题"})
+
+    def test_archived_session_not_matched_by_body(self):
+        """正文命中也不能把已归档会话捞回 @ 候选。"""
+        bridge = self._make_bridge_with_tmp_memory(current_session="")
+        bridge._memory.ensure_session("归档目标")
+        bridge._memory.add_message("归档目标", "user", "这里提到了 quantum 方案")
+        self.assertTrue(bridge._memory.archive_session("归档目标"))
+
+        self.assertEqual(bridge.search_sessions("quantum")["sessions"], [])
+
+    def test_search_text_backfilled_on_legacy_database(self):
+        """存量库升级：新增 search_text 列后要用首条 user 消息自动回填。
+
+        否则老会话升级后只有会话名可搜，用户会以为「换个对话还是搜不到」。
+        """
+        import shutil
+        import tempfile
+
+        from core.memory import MemoryManager
+
+        tmp_dir = tempfile.mkdtemp()
+        db_path = str(Path(tmp_dir) / "legacy.db")
+        mem = MemoryManager(db_path)
+        mem.ensure_session("老会话")
+        mem.add_message("老会话", "user", "历史问题：数据库迁移失败")
+        # 模拟升级前的 schema：没有 search_text 列，也没有回填数据
+        mem.conn.execute("ALTER TABLE sessions DROP COLUMN search_text")
+        mem.conn.commit()
+        mem.conn.close()
+
+        reopened = MemoryManager(db_path)
+        try:
+            row = reopened.conn.execute(
+                "SELECT search_text FROM sessions WHERE session_name = '老会话'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertIn("数据库迁移失败", row[0] or "")
+        finally:
+            reopened.conn.close()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_search_text_strips_injected_runtime_context(self):
+        """首条消息尾部的运行上下文块不能进入检索文本。
+
+        否则「deepseek」「当前时间」这类只存在于系统注入块里的词，会把一大片
+        无关会话都顶进 @ 候选，用户反而找不到真正想要的那个。
+        """
+        bridge = self._make_bridge_with_tmp_memory(current_session="")
+        bridge._memory.ensure_session("上下文会话")
+        bridge._memory.add_message(
+            "上下文会话",
+            "user",
+            "帮我修一下启动报错\n\n【\u200b当前运行上下文】\n当前模型：deepseek",
+        )
+
+        # 正文关键词照常命中
+        self.assertEqual(
+            [s["name"] for s in bridge.search_sessions("启动报错")["sessions"]],
+            ["上下文会话"],
+        )
+        # 注入块里的词不进入检索文本
+        self.assertEqual(bridge.search_sessions("deepseek")["sessions"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

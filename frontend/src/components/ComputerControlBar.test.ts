@@ -37,6 +37,23 @@ function piniaWithRunningComputer() {
   return { plugins: [pinia] };
 }
 
+// 桌面操控的运行态：安全条按设计 16.1 正常显示（浏览器目标改为「就地围观」后
+// 不再渲染安全条，需要条的用例统一用桌面目标构造）
+function piniaWithRunningDesktop() {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-1',
+    status: 'running',
+    target: 'desktop',
+    action_count: 3,
+    current_surface: '记事本 - 未命名',
+  };
+  return { plugins: [pinia] };
+}
+
 // ── Store reducer：顺序、容量与脱敏（brief Step 1 样例 1-3 逐字） ──
 
 it('rejects late events from old runs and older event_seq', () => {
@@ -70,7 +87,7 @@ it('recalibrates from bridge snapshot after queue drops events', async () => {
 
 
 it('always shows stop and pause controls on the compact bar', () => {
-  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningComputer() });
+  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningDesktop() });
   expect(wrapper.get('[data-test="computer-pause"]').isVisible()).toBe(true);
   expect(wrapper.get('[data-test="computer-stop"]').isVisible()).toBe(true);
   wrapper.unmount();
@@ -184,11 +201,19 @@ it.each([['idle'], ['stopped'], ['completed'], ['completing']])(
 );
 
 it('renders the target, action count and current surface on the bar', () => {
-  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningComputer() });
+  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningDesktop() });
   const text = wrapper.get('[data-test="computer-control-bar"]').text();
-  expect(text).toContain('Edge');
+  expect(text).toContain('桌面');
   expect(text).toContain('3');
-  expect(text).toContain('example.com');
+  expect(text).toContain('记事本');
+  wrapper.unmount();
+});
+
+it('hides the bar for browser runs: browser control shows only the browser pane', () => {
+  // 浏览器操控改为「就地围观」：右侧只留浏览器页签，不再显示操控安全条
+  // （停止入口收进浏览器工具栏，见 BrowserPane 的 bp-computer-stop）
+  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningComputer() });
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
   wrapper.unmount();
 });
 

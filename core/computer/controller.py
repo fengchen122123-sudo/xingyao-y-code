@@ -315,12 +315,19 @@ class ComputerControlService:
             self._embedded_endpoint_provider = provider
 
     def _build_event_locked(self, run: _Run, event_type: str, **fields) -> dict:
-        """状态锁内分配事件序号并构造事件（调用方必须持有状态锁）。"""
+        """状态锁内分配事件序号并构造事件（调用方必须持有状态锁）。
+
+        每个事件都带 owner_session_id：前端靠首个事件建立 run 运行态，而
+        「操控」页签按 run 归属会话登记——归属只存在于快照时，首帧页面就会被
+        开进用户当前查看的会话（后台会话发起的操控串台，2026-10-30 反馈）。
+        事件里带上是零成本的：字段是短字符串，不随观察截图变大。
+        """
         run.event_seq += 1
         return {
             "type": event_type,
             "run_id": run.run_id,
             "event_seq": run.event_seq,
+            "owner_session_id": run.owner.session_id,
             **fields,
         }
 

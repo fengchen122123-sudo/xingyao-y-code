@@ -73,6 +73,8 @@ _RECORDED_FIRST_PARTY_TOOLS = frozenset({
     "hunyuan_generate_image",     # core/hunyuan_image.py 保存点已接入
     "tokenrhythm_generate_image", # 插件 _save_image_bytes 保存点已接入
     "tokenrhythm_edit_image",     # 同上（edit_image 复用同一落盘路径）
+    "novel_init",                 # core/novel_service.py _write_text 落盘点已接入
+    "novel_track",                # 同上：快照重放经 _write_text 记录 before/after
 })
 
 

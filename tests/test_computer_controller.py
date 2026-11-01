@@ -142,6 +142,20 @@ def running_run(service, owner_a, capability):
 # ---------------- brief Step 1 样例（逐字） ----------------
 
 
+def test_every_event_carries_owner_session_id(service, owner_a, capability):
+    """事件信封必须带 run 归属会话：前端用首个事件建立运行态，「操控」页签按
+    归属会话登记——归属只在快照里时，首帧只能回落当前查看的会话，后台会话
+    发起的操控会串到用户眼前的另一个会话（2026-10-30 反馈）。"""
+    events = []
+    service.add_listener(events.append)
+    run = service.start_run(owner_a, capability, target=None)
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+
+    assert events
+    assert {"computer_state", "computer_observation"} <= {event["type"] for event in events}
+    assert all(event["owner_session_id"] == "session-a" for event in events)
+
+
 def test_second_owner_cannot_take_active_lease(service, owner_a, owner_b, capability):
     run = service.start_run(owner_a, capability, target="desktop")
     with pytest.raises(ComputerControlError) as raised:

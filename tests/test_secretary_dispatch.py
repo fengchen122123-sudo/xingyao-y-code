@@ -499,3 +499,68 @@ def test_real_turn_without_dispatch_context_emits_no_notice(manager, tmp_path):
         bridge._run_turn_worker("你好", "项目甲")
 
     assert [e for e in events if e[0] == "notice"] == []
+
+
+# ---------------------------------------------------------------------------
+# 能力四：新建项目文件夹并引入工作区
+# ---------------------------------------------------------------------------
+
+def test_create_project_creates_nested_dir_and_registers_workspace(manager, tmp_path):
+    """不存在的多级路径：逐级创建，并登记为工作区（排在会话之上）。"""
+    _make_bridge(manager)
+    target = tmp_path / "work" / "demo"
+
+    res = secretary_dispatch.get().create_project(path=str(target))
+
+    assert res["ok"] is True
+    assert res["created"] is True
+    assert res["display_name"] == "demo"
+    assert os.path.isdir(target)
+    # 登记进工作区后，侧栏分组数据源（get_all_workspaces）能读到它
+    assert str(target.resolve()) in [str(p) for p in manager.get_all_workspaces()]
+
+
+def test_create_project_reuses_existing_dir(manager, tmp_path):
+    """目录已存在：直接复用，created=False，不报错。"""
+    _make_bridge(manager)
+    target = tmp_path / "已有项目"
+    target.mkdir()
+
+    res = secretary_dispatch.get().create_project(path=str(target))
+
+    assert res["ok"] is True
+    assert res["created"] is False
+    assert str(target.resolve()) in [str(p) for p in manager.get_all_workspaces()]
+
+
+def test_create_project_rejects_relative_path(manager):
+    """相对路径拒绝：否则按进程 cwd（安装目录）建目录，位置完全不可预期。"""
+    _make_bridge(manager)
+
+    with pytest.raises(secretary_dispatch.SecretaryDispatchError) as exc:
+        secretary_dispatch.get().create_project(path="demo")
+
+    assert "绝对路径" in str(exc.value)
+
+
+def test_create_project_rejects_reserved_marker(manager):
+    """GLOBAL / SECRETARY 是虚拟分组标识，不能当磁盘目录创建。"""
+    _make_bridge(manager)
+
+    for marker in ("GLOBAL", "SECRETARY"):
+        with pytest.raises(secretary_dispatch.SecretaryDispatchError) as exc:
+            secretary_dispatch.get().create_project(path=marker)
+        assert "保留分组标识" in str(exc.value)
+
+
+def test_create_project_rejects_existing_file(manager, tmp_path):
+    """同名文件已存在：拒绝，不覆盖文件。"""
+    _make_bridge(manager)
+    target = tmp_path / "占位.txt"
+    target.write_text("x", encoding="utf-8")
+
+    with pytest.raises(secretary_dispatch.SecretaryDispatchError) as exc:
+        secretary_dispatch.get().create_project(path=str(target))
+
+    assert "同名文件已存在" in str(exc.value)
+    assert target.read_text(encoding="utf-8") == "x"

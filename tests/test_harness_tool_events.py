@@ -148,3 +148,51 @@ def test_facts_for_call_without_raw_arguments_falls_back_to_canonical_json():
     assert facts["tool_name"] == "read_file"
     assert facts["call_ordinal"] == 0
     assert len(facts["arguments_sha256"]) == 64
+
+
+def _prepared_pair():
+    return (
+        _prepared(arguments={"path": "a.py"}, ordinal=0),
+        _prepared(arguments={"path": "b.py"}, ordinal=1),
+    )
+
+
+def test_journal_writes_started_finished_per_call_in_execution_order():
+    """逐调用成对交错：call0 started→finished 之后才是 call1 started。"""
+    journal = []
+    executor = _executor()
+    context = _context(lambda kind, facts: journal.append((kind, facts)))
+    batch = _PreparedToolBatch(parallel=False, calls=_prepared_pair())
+
+    executor.begin_batch(batch, context, None)
+    # 入批排队不写 journal：STARTED 只在真正开始执行时落。
+    assert journal == []
+
+    executor.execute_batch(batch, context, None)
+
+    assert [kind for kind, _facts in journal] == [
+        "tool_started",
+        "tool_finished",
+        "tool_started",
+        "tool_finished",
+    ]
+    assert [facts["call_ordinal"] for _kind, facts in journal] == [0, 0, 1, 1]
+
+
+def test_failed_call_leaves_only_started_as_uncertain_state():
+    """执行抛错的调用只留 STARTED——续跑据此识别为不确定态并 BLOCK。"""
+    journal = []
+
+    def boom(_decoded, _context):
+        raise RuntimeError("tool crashed")
+
+    executor = ToolBatchExecutor(pipeline=object(), execute_decoded=boom)
+    context = _context(lambda kind, facts: journal.append((kind, facts)))
+    batch = _PreparedToolBatch(parallel=False, calls=(_prepared(),))
+
+    executor.begin_batch(batch, context, None)
+    with pytest.raises(RuntimeError, match="tool crashed"):
+        executor.execute_batch(batch, context, None)
+
+    assert [kind for kind, _facts in journal] == ["tool_started"]
+    assert journal[0][1]["started"] is True

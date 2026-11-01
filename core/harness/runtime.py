@@ -16,7 +16,7 @@ from core.harness.models import (
     transition_turn,
 )
 from core.harness.request_envelope import RequestEnvelope
-from core.memory import MemoryManager
+from core.memory import MemoryManager, canonicalize_api_base
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -322,6 +322,7 @@ class StepRuntime:
                 try:
                     cursor.execute(
                         "UPDATE harness_steps SET protocol = ?, cache_scope = ?, "
+                        "model = ?, api_base = ?, "
                         "messages_sha256 = ?, system_sha256 = ?, tools_sha256 = ?, "
                         "options_sha256 = ?, cache_lane_sha256 = ?, message_count = ?, "
                         "system_message_count = ?, request_bytes = ?, system_bytes = ?, "
@@ -331,6 +332,10 @@ class StepRuntime:
                         (
                             envelope.protocol,
                             envelope.cache_scope,
+                            str(getattr(envelope, "model", "") or ""),
+                            canonicalize_api_base(
+                                getattr(envelope, "api_base", "") or ""
+                            ),
                             fingerprint.messages_sha256,
                             fingerprint.system_sha256,
                             fingerprint.tools_sha256,

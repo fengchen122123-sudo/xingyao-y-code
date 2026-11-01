@@ -5,6 +5,9 @@ GUI / 数据库：工具层只允许经服务句柄访问自动化能力，fake 
 同构的 dict（ok/errors/msg/deleted/run_id/runs）。
 """
 
+import re
+from datetime import datetime
+
 import pytest
 
 from core import app_context
@@ -569,3 +572,163 @@ def test_create_schema_exposes_trigger_parameters(registry):
     assert properties["permission_mode"]["default"] == "confirm"
     assert properties["missed_run_policy"]["default"] == "skip"
     assert properties["notify_on_success"]["default"] is False
+
+
+# ---------------------------------------------------------------------------
+# once（一次性触发器）：对话内只收 delay_minutes
+# ---------------------------------------------------------------------------
+
+def test_create_schema_offers_once_with_delay_minutes_only(registry):
+    properties = (
+        registry.get("automation_create")
+        .api_schema()["function"]["parameters"]["properties"]
+    )
+
+    assert "once" in properties["trigger_type"]["enum"]
+    assert properties["delay_minutes"]["type"] == "integer"
+    assert properties["delay_minutes"]["minimum"] == 1
+    assert properties["delay_minutes"]["maximum"] == 10080
+    # 对话内绝不暴露绝对时刻参数（防模型自算漂移）
+    assert "run_at" not in properties
+
+
+def test_create_description_documents_once_delay_minutes(registry):
+    description = registry.get("automation_create").description
+
+    assert "once" in description
+    assert "delay_minutes" in description
+
+
+def test_create_once_rejects_run_at_and_feeds_back_current_time(fake_service, registry):
+    result = registry.execute(
+        "automation_create",
+        name="明早提醒",
+        prompt="提醒我喝水",
+        trigger_type="once",
+        target_session="会话A",
+        run_at="2030-01-01 09:00",
+    )
+
+    assert result.is_error is True
+    assert "只接受 delay_minutes" in result.content
+    # 把当前时刻回喂给模型，便于下一轮自行换算
+    assert re.search(r"现在是 \d{2}:\d{2}", result.content)
+    assert "save_task" not in fake_service.call_names()
+
+
+def test_create_once_requires_delay_minutes(fake_service, registry):
+    result = registry.execute(
+        "automation_create",
+        name="一次性任务",
+        prompt="做事",
+        trigger_type="once",
+        target_session="会话A",
+    )
+
+    assert result.is_error is True
+    assert "只接受 delay_minutes" in result.content
+    assert "save_task" not in fake_service.call_names()
+
+
+@pytest.mark.parametrize("delay", [0, 10081, 1.5, True])
+def test_create_once_rejects_bad_delay_minutes(fake_service, registry, delay):
+    result = registry.execute(
+        "automation_create",
+        name="一次性任务",
+        prompt="做事",
+        trigger_type="once",
+        target_session="会话A",
+        delay_minutes=delay,
+    )
+
+    assert result.is_error is True
+    assert "delay_minutes" in result.content
+    assert "save_task" not in fake_service.call_names()
+
+
+def test_create_once_converts_delay_minutes_to_run_at(fake_service, registry):
+    before = datetime.now()
+
+    result = registry.execute(
+        "automation_create",
+        name="喝水提醒",
+        prompt="提醒我喝水",
+        trigger_type="once",
+        target_session="会话A",
+        delay_minutes=8,
+    )
+
+    assert result.is_error is False
+    task = fake_service.last_saved()
+    assert task["trigger_type"] == "once"
+    config = task["trigger_config"]
+    # 相对延迟不落库，换算成服务端时钟锚定的绝对时刻
+    assert set(config) == {"run_at"}
+    fire_at = datetime.strptime(config["run_at"], "%Y-%m-%d %H:%M")
+    delta_seconds = (fire_at - before).total_seconds()
+    assert 6 * 60 < delta_seconds <= 8 * 60 + 1
+    assert "一次性" in result.content
+    assert config["run_at"] in result.content
+
+
+# ---------------------------------------------------------------------------
+# 有限次执行：max_runs（共执行 N 次后自动完成，手动执行不计入）
+# ---------------------------------------------------------------------------
+
+def test_create_passes_max_runs(fake_service, registry):
+    result = registry.execute(
+        "automation_create",
+        name="跑三次",
+        prompt="做事",
+        trigger_type="daily",
+        time="09:00",
+        target_session="会话A",
+        max_runs=3,
+    )
+
+    assert result.is_error is False
+    assert fake_service.last_saved()["max_runs"] == 3
+
+
+def test_create_omits_max_runs_when_not_given(fake_service, registry):
+    result = registry.execute(
+        "automation_create",
+        name="不限次",
+        prompt="做事",
+        trigger_type="startup",
+        target_session="会话A",
+    )
+
+    assert result.is_error is False
+    assert "max_runs" not in fake_service.last_saved()
+
+
+@pytest.mark.parametrize("bad", [0, -2, 1.5, True, "3"])
+def test_create_rejects_bad_max_runs(fake_service, registry, bad):
+    result = registry.execute(
+        "automation_create",
+        name="有限次",
+        prompt="做事",
+        trigger_type="startup",
+        target_session="会话A",
+        max_runs=bad,
+    )
+
+    assert result.is_error is True
+    assert "最多执行次数" in result.content
+    assert "save_task" not in fake_service.call_names()
+
+
+def test_create_schema_documents_max_runs(registry):
+    properties = (
+        registry.get("automation_create")
+        .api_schema()["function"]["parameters"]["properties"]
+    )
+    assert properties["max_runs"]["type"] == "integer"
+    assert properties["max_runs"]["minimum"] == 1
+
+    description = registry.get("automation_create").description
+    assert "max_runs" in description
+    assert "自动完成" in description
+    assert "不计入" in description
+

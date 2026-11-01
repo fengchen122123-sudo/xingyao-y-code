@@ -1451,17 +1451,24 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
             log("ℹ 按您的选择，未创建桌面快捷方式。")
         progress(93.0)
 
-        # 4. 复制卸载程序
+        # 4. 卸载程序：正常情况下由载荷统一释放到安装目录（与主程序共享同一份
+        #    _internal，dist/ycode/Y-code-uninstall.exe），安装器不再内嵌独立的
+        #    13MB onefile。这里保留“安装器内嵌副本”的兼容分支：旧安装包或第三方
+        #    重打包仍可能把卸载器放在 bundle 根目录。
         dest_uninst = os.path.join(install_dir, "Y-code-uninstall.exe")
-        try:
+        if not os.path.exists(dest_uninst):
             src_uninst = os.path.join(bundle_dir, "Y-code-uninstall.exe")
             if os.path.exists(src_uninst):
-                shutil.copy2(src_uninst, dest_uninst)
-                log(f"✔ 卸载程序成功复制到: {dest_uninst}")
-            else:
-                log("⚠️ 安装包中未找到卸载程序，跳过复制（“应用和功能”卸载入口将不可用）。")
-        except Exception as e:
-            log(f"⚠️ 复制卸载程序失败: {e}")
+                try:
+                    shutil.copy2(src_uninst, dest_uninst)
+                    log(f"✔ 卸载程序已从安装器复制到: {dest_uninst}")
+                except Exception as e:
+                    log(f"⚠️ 复制卸载程序失败: {e}")
+        if os.path.exists(dest_uninst):
+            log(f"✔ 卸载程序就绪: {dest_uninst}")
+        else:
+            log("⚠️ 未找到卸载程序 Y-code-uninstall.exe，"
+                "“应用和功能”卸载入口可能不可用。")
         progress(96.0)
 
         # 5. 初始化 ~/.ycode 用户配置
@@ -1510,11 +1517,19 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
             log("ℹ 已合并进现有的完整版安装，沿用原有卸载入口，不再重复注册。")
         else:
             try:
+                # 卸载程序：优先用载荷已释放的那份；旧安装包可能把它内嵌在安装器里，
+                # 这里保留兼容复制分支。注册表始终指向安装目录下的固定路径。
                 dest_uninst = os.path.join(install_dir, "Y-code-uninstall.exe")
-                src_uninst = os.path.join(bundle_dir, "Y-code-uninstall.exe")
-                if os.path.exists(src_uninst):
-                    shutil.copy2(src_uninst, dest_uninst)
-                    log(f"✔ 卸载程序成功复制到: {dest_uninst}")
+                if not os.path.exists(dest_uninst):
+                    src_uninst = os.path.join(bundle_dir, "Y-code-uninstall.exe")
+                    if os.path.exists(src_uninst):
+                        try:
+                            shutil.copy2(src_uninst, dest_uninst)
+                        except Exception as e:
+                            log(f"⚠️ 复制卸载程序失败: {e}")
+                # 只有卸载程序确实存在时才写注册表：否则“应用和功能”里会多出一条
+                # UninstallString 指向不存在的 exe、点了毫无反应的死条目。
+                if os.path.exists(dest_uninst):
                     write_uninstall_registry_key(
                         app_key_name="Y-code-CLI",
                         display_name="Y-code CLI",
@@ -1525,7 +1540,7 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
                     )
                     log("✔ 已在“应用和功能”中注册 Y-code CLI。")
                 else:
-                    log("⚠️ 安装包中未找到卸载程序，跳过卸载注册。")
+                    log("⚠️ 未找到卸载程序 Y-code-uninstall.exe，跳过卸载入口注册。")
             except Exception as e:
                 log(f"⚠️ 注册卸载信息失败: {e}")
         progress(100.0)

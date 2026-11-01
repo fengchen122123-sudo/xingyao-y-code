@@ -348,7 +348,7 @@
           @click="onUserCardClick()"
         >
           <span class="side-avatar">{{ trAvatarText }}</span>
-          <span class="footer-copy"><b>{{ trUserLabel }}</b></span>
+          <span class="footer-copy"><b :title="trUserLabelTitle">{{ trUserLabelShort }}</b></span>
         </button>
         <button class="icon-btn" data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
           <AppIcon name="settings" :size="16" />
@@ -593,6 +593,7 @@ import TokenRhythmAccountPanel from './TokenRhythmAccountPanel.vue';
 import TokenRhythmAccountDialog from './TokenRhythmAccountDialog.vue';
 import type { SessionGroup, SessionInfo } from '../types/pywebview';
 import { useIsMobile } from '../composables/useViewport';
+import { shortLabel } from '../utils/shortLabel';
 
 const store = useAppStore();
 
@@ -612,6 +613,14 @@ const trUserLabel = computed(() => {
 // 头像文字：已登录取账号名首字，未登录沿用原来的产品首字母 Y
 const trAvatarText = computed(() => (
   store.trAuth.status === 'loggedIn' ? (trUserLabel.value.slice(0, 1).toUpperCase() || 'Y') : 'Y'
+));
+// 卡片上只显示前 6 个字符：账号名可以任意长，全量渲染会把右侧设置/手机图标
+// 挤出侧栏；完整名字挂在 <b> 的 title 上作悬停气泡。
+const trUserLabelShort = computed(() => shortLabel(trUserLabel.value));
+// 悬停气泡只对已登录账号给出完整账号名；未登录时按钮自身的 title 已是引导文案，
+// 这里返回 undefined 让属性不渲染，避免气泡内容重复。
+const trUserLabelTitle = computed(() => (
+  store.trAuth.status === 'loggedIn' ? trUserLabel.value : undefined
 ));
 
 // 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
@@ -2469,6 +2478,10 @@ function getFolderTitle(g: SessionGroup) {
   gap: 9px;
   padding: 5px 7px;
   color: var(--text-dim);
+  /* 名字已按 6 字符截断，这里再允许收缩一次：即使出现超长/不可断文本，
+     也只让名字自己省略，不把右侧设置与手机图标挤出网格 */
+  min-width: 0;
+  overflow: hidden;
 }
 .side-footer .side-avatar {
   flex: 0 0 26px;

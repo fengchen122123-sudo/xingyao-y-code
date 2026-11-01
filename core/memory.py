@@ -68,6 +68,17 @@ def _canonicalize_api_base(value):
     except Exception:
         return f"invalid-endpoint#{digest(text)}"
 
+
+def canonicalize_api_base(value):
+    """公开别名：规范化 endpoint 身份，剥离 userinfo/query/fragment。
+
+    规范化把凭据片段折算成不可逆摘要（最多保留 16 位哈希，绝不留明文），
+    因此 api_base 写进 harness_steps 不会落密码或 token；断点续跑的路由
+    快照可安全读取比对。
+    """
+    return _canonicalize_api_base(value)
+
+
 def _normalize_workdir(path):
     """规范化工作目录路径（真实磁盘物理大小写），用于会话归属目录比较。"""
     try:
@@ -77,6 +88,27 @@ def _normalize_workdir(path):
         return os.path.abspath(str(path))
     except Exception:
         return str(path or "")
+
+
+# 首条用户消息尾部常被追加运行时上下文/附件清单（【当前运行上下文】、
+# [附带文件] 等）。这些系统块会把「模型」「当前时间」这类词带进检索文本，
+# 让 @ 补全命中一堆无关会话，所以生成会话检索文本时要在第一个块之前截断。
+_SESSION_SEARCH_CUT_MARKERS = (
+    "\n\n【\u200b当前运行上下文】",  # 带零宽空格的版本（GUI 注入）
+    "\n\n【当前运行上下文】",
+    "\n\n[附带",
+)
+
+
+def _session_search_text(content, limit: int = 2000) -> str:
+    """把首条用户消息压成 @ 提及检索用的文本（去系统注入块 + 限制长度）。"""
+    text = str(content or "")
+    cut = len(text)
+    for marker in _SESSION_SEARCH_CUT_MARKERS:
+        idx = text.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    return text[:cut].strip()[:limit]
 
 
 # 消息全文检索的归一化取「字符 bigram」而非 FTS5 内置 trigram/unicode61：
@@ -573,6 +605,15 @@ class MemoryManager:
                 # 星瑶人设互不影响；同样只走 ALTER ADD COLUMN 幂等添加。
                 if "secretary_persona" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN secretary_persona TEXT")
+                # @ 提及检索用的会话全文：存「首条用户消息」的前 2000 字。
+                # 会话名只是首条消息截断到 12 字，用户记住的往往是后面的内容，
+                # 只按名字匹配会永远搜不到（例如名字是「我感觉我现在@对话这个功」，
+                # 想搜「功能」就命中不了）。新增列时顺带回填存量会话。
+                if "search_text" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN search_text TEXT")
+                    backfill_search_text = True
+                else:
+                    backfill_search_text = False
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -583,6 +624,38 @@ class MemoryManager:
                         content TEXT
                     )
                 ''')
+                # 会话维度的消息索引：会话列表/计数（get_all_sessions 的
+                # LEFT JOIN + COUNT）、@ 提及对话检索、按会话取历史都按
+                # session_id 过滤。缺索引时 SQLite 只能 SCAN messages 全表
+                # （真机 900MB 库单次约 95ms），@ 补全每敲一个字都要跑一遍，
+                # 叠加 keyup 重复触发后输入明显卡顿。幂等建索引，只在首次
+                # 启动时为存量库补齐（53k 行实测数秒内完成）。
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_messages_session
+                    ON messages(session_id)
+                ''')
+                # 存量库首次补 search_text 列：用每条会话最早的一条 user 消息
+                # 回填，这样升级后立刻就能按完整首条消息检索，不用等新对话。
+                # 逐条走 Python 而不是纯 SQL：检索文本必须与写入口径一致地
+                # 做截断 + 去系统注入块，否则老会话会带着「当前运行上下文」
+                # 这类噪音词被搜出来。会话数有限（几百），一次性成本可忽略。
+                if backfill_search_text:
+                    rows = cursor.execute('''
+                        SELECT s.id, (
+                            SELECT m.content FROM messages m
+                            WHERE m.session_id = s.id AND m.role = 'user'
+                            ORDER BY m.id ASC LIMIT 1
+                        )
+                        FROM sessions s
+                        WHERE s.search_text IS NULL
+                    ''').fetchall()
+                    for sid, content in rows:
+                        text = _session_search_text(content or "")
+                        if text:
+                            cursor.execute(
+                                "UPDATE sessions SET search_text = ? WHERE id = ?",
+                                (text, sid),
+                            )
                 # 多代摘要归档：每次压缩成功后追加一代（摘要/topics/边界）。
                 # 只存边界元数据与摘要文本，原始消息永久保留在 messages 表——
                 # history[0] 摘要块据此注入回溯索引，recall_history 工具据此
@@ -1250,13 +1323,15 @@ class MemoryManager:
                 turn_params.append(int(since_ms))
             cursor.execute(
                 "SELECT turn_id, session_id, owner_id, status, started_at_ms, "
-                "finished_at_ms, last_sequence, error_code FROM harness_turns "
+                "finished_at_ms, last_sequence, error_code, parent_turn_id, "
+                "turn_kind, resume_from_step_ordinal FROM harness_turns "
                 f"{turn_filter} ORDER BY started_at_ms ASC, turn_id ASC",
                 turn_params,
             )
             turn_columns = (
                 "turn_id", "session_id", "owner_id", "status", "started_at_ms",
-                "finished_at_ms", "last_sequence", "error_code",
+                "finished_at_ms", "last_sequence", "error_code", "parent_turn_id",
+                "turn_kind", "resume_from_step_ordinal",
             )
             rows: list[dict] = []
             for raw in cursor.fetchall():
@@ -1271,6 +1346,9 @@ class MemoryManager:
                     "finished_at_ms": turn["finished_at_ms"],
                     "last_sequence": turn["last_sequence"],
                     "error_code": turn["error_code"],
+                    "parent_turn_id": turn["parent_turn_id"],
+                    "turn_kind": turn["turn_kind"],
+                    "resume_from_step_ordinal": turn["resume_from_step_ordinal"],
                 })
 
             joined_filter = (
@@ -1288,6 +1366,7 @@ class MemoryManager:
                 "st.cache_lane_sha256, st.message_count, st.system_message_count, "
                 "st.request_bytes, st.system_bytes, st.tools_bytes, st.options_bytes, "
                 "st.request_reason, st.attempt_count, st.deepseek_generation_id, "
+                "st.tool_call_count, st.replay_of_step_id, "
                 "st.started_at_ms, st.finished_at_ms, st.duration_ms, "
                 "st.finish_reason, st.error_code FROM harness_steps st "
                 f"{joined_filter} ORDER BY st.turn_id ASC, st.ordinal ASC",
@@ -1299,7 +1378,8 @@ class MemoryManager:
                 "tools_sha256", "options_sha256", "cache_lane_sha256",
                 "message_count", "system_message_count", "request_bytes",
                 "system_bytes", "tools_bytes", "options_bytes", "request_reason",
-                "attempt_count", "deepseek_generation_id", "started_at_ms",
+                "attempt_count", "deepseek_generation_id", "tool_call_count",
+                "replay_of_step_id", "started_at_ms",
                 "finished_at_ms", "duration_ms", "finish_reason", "error_code",
             )
             for raw in cursor.fetchall():
@@ -2217,20 +2297,33 @@ class MemoryManager:
 
     def _insert_message_batch_locked(self, cursor, session_name, serialized):
         cursor.execute(
-            "SELECT id FROM sessions WHERE session_name = ?",
+            "SELECT id, search_text FROM sessions WHERE session_name = ?",
             (session_name,),
         )
         row = cursor.fetchone()
         if row is None:
             raise RuntimeError(f"missing message session: {session_name}")
-        session_id = row[0]
+        session_id, search_text = row[0], row[1]
         message_ids = []
+        first_user_content = ""
         for role, content in serialized:
             cursor.execute(
                 "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
                 (session_id, role, content),
             )
             message_ids.append(int(cursor.lastrowid))
+            if not first_user_content and str(role) == "user":
+                first_user_content = str(content or "")
+        # search_text 是「首条用户消息」的正文（截到 2000 字，并去掉尾部
+        # 系统注入的上下文/附件块），供 @ 检索命中被 12 字会话名截断掉的部分。
+        # 只在为空时写一次：后续消息不能覆盖，否则检索文本会漂移到会话中途，
+        # 失去「标题来源」的语义。
+        search_candidate = _session_search_text(first_user_content)
+        if not search_text and search_candidate:
+            cursor.execute(
+                "UPDATE sessions SET search_text = ? WHERE id = ?",
+                (search_candidate, session_id),
+            )
         return tuple(message_ids)
     def add_messages(self, session_name, messages, *, turn_checkpoint_id=None,
                      turn_position_kinds=None):
@@ -3247,6 +3340,83 @@ class MemoryManager:
                     self.conn.rollback()
                     raise
 
+    def get_message_role(self, session_name, msg_id):
+        """取指定消息的角色（供编辑入口做前置校验）；不存在或不属于该会话返回 None。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT m.role FROM messages m '
+                'JOIN sessions s ON s.id = m.session_id '
+                'WHERE m.id = ? AND s.session_name = ?',
+                (int(msg_id), session_name),
+            )
+            row = cursor.fetchone()
+            return str(row[0]) if row else None
+
+    def rewind_to_message(self, session_name, msg_id):
+        """把会话截断到指定消息之前：删除该条及之后的全部记录。
+
+        编辑历史用户消息意味着「从这条重新分叉」，因此：
+        - messages 表里 id >= msg_id 的行全部删除（含该条自身，新文本由调用方重发）
+        - message_turn_links 的孤立关联一并清理（该表无 ON DELETE CASCADE）
+        - memory_summary / summarized_until_msg_id 与多代归档作废：被删区间可能
+          已被压缩进摘要，继续注入会让模型看到已撤销的旧结论
+        - messages_fts 无需处理：全文索引是独立表，查询侧 JOIN messages 自然排除
+
+        返回 {"role": 原消息角色, "removed": 删除条数}；目标消息不属于该会话时
+        返回 None（不做任何修改）。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT id FROM sessions WHERE session_name = ?', (session_name,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            session_id = row[0]
+            cursor.execute(
+                'SELECT role FROM messages WHERE id = ? AND session_id = ?',
+                (int(msg_id), session_id),
+            )
+            target = cursor.fetchone()
+            if not target:
+                return None
+            role = target[0]
+            try:
+                # turn_undo 未初始化（老库/纯 CLI 环境）时该表可能不存在，跳过即可
+                cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'message_turn_links'"
+                )
+                if cursor.fetchone():
+                    cursor.execute(
+                        'DELETE FROM message_turn_links WHERE message_id IN ('
+                        '  SELECT id FROM messages WHERE session_id = ? AND id >= ?'
+                        ')',
+                        (session_id, int(msg_id)),
+                    )
+                cursor.execute(
+                    'DELETE FROM messages WHERE session_id = ? AND id >= ?',
+                    (session_id, int(msg_id)),
+                )
+                removed = cursor.rowcount
+                cursor.execute(
+                    'UPDATE sessions '
+                    'SET memory_summary = NULL, summarized_until_msg_id = 0 '
+                    'WHERE id = ? AND (memory_summary IS NOT NULL OR summarized_until_msg_id)',
+                    (session_id,),
+                )
+                cursor.execute(
+                    'DELETE FROM session_summary_generations WHERE session_name = ?',
+                    (session_name,),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            return {"role": str(role or ""), "removed": int(removed or 0)}
+
     def get_all_sessions(self, workdir=None, source=None, include_empty=False,
                          include_archived=False, archived_only=False,
                          sources: Optional[List[str]] = None):
@@ -3279,7 +3449,7 @@ class MemoryManager:
                 cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
                            s.workdir, s.updated_at, s.created_at, s.source, s.id,
-                           s.archived_at
+                           s.archived_at, s.search_text
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
                     WHERE (s.source IN ({placeholders}) OR s.source IS NULL){archived_filter}
@@ -3290,7 +3460,7 @@ class MemoryManager:
                 cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
                            s.workdir, s.updated_at, s.created_at, s.source, s.id,
-                           s.archived_at
+                           s.archived_at, s.search_text
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
                     WHERE (s.source = ? OR s.source IS NULL){archived_filter}
@@ -3301,7 +3471,7 @@ class MemoryManager:
                 cursor.execute(f'''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
                            s.workdir, s.updated_at, s.created_at, s.source, s.id,
-                           s.archived_at
+                           s.archived_at, s.search_text
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
                     WHERE 1=1{archived_filter}
@@ -3332,6 +3502,8 @@ class MemoryManager:
                 "id": row[6],
                 # 归档时刻（ISO8601 文本）；None = 未归档
                 "archived_at": row[7],
+                # 首条用户消息前 2000 字，供 @ 检索匹配被会话名截断的内容
+                "search_text": row[8],
             }
             for row in filtered
         ]

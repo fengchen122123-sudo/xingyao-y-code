@@ -301,10 +301,43 @@ def _run_cleanup_hook(name: str) -> str:
         return "（清理失败: %s）" % exc
 
 
+def _core_managed_markers() -> frozenset[str]:
+    """由核心功能（而不是插件）托管的 provider 标记值。
+
+    基元律动账号绑定自动创建的厂商用 ``managed_by="tokenrhythm"`` 标记，它不是插件名。
+    若把它按"来源插件本次未加载"处理，每次启动都会把登录后刚建好的厂商连 Key 一起
+    删掉（真实事故：登录成功 → 重启一次 → provider 消失，表现为"Key 没配置成功"）。
+    标记值只在 core 里定义一次，这里动态取，避免两处字面量漂移。
+    """
+    try:
+        from core.tokenrhythm_auth import MANAGED_PROVIDER_VALUE
+
+        return frozenset({str(MANAGED_PROVIDER_VALUE)})
+    except Exception:  # noqa: BLE001 - 取不到就退回字面量：宁可漏清理也绝不误删
+        return frozenset({"tokenrhythm"})
+
+
+def _is_orphan_provider(
+    provider: dict, loaded_names: set[str], core_markers: frozenset[str]
+) -> bool:
+    """是否该按孤儿清理：带 managed_by 标记、不属核心托管、且其插件本次未加载。
+
+    用户手配的厂商没有 managed_by 字段，永远不在此列。
+    """
+    marker = provider.get("managed_by")
+    if not marker:
+        return False
+    text = str(marker)
+    if text in core_markers:
+        return False
+    return text not in loaded_names
+
+
 def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
     """兜底清理"来源插件本次未加载"的孤儿 provider，返回被清理的 provider 名列表。
 
-    只处理带 managed_by 标记的 provider：用户手配的配置没有该字段，永远不会被碰。
+    只处理带 managed_by 标记、且不属于核心托管的 provider：用户手配的配置没有该字段，
+    核心功能（账号绑定）创建的厂商由 ``_core_managed_markers()`` 豁免，都不会被碰。
     典型场景：插件被禁用（或直接改了 plugin.json）后，它自举写入的 provider 仍留在
     配置里，模型选择器就会一直显示一个已经用不了的厂商。
     """
@@ -321,9 +354,10 @@ def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
         _logger.warning("孤儿 provider 清理读取配置失败，已跳过: %s", exc)
         return []
 
+    core_markers = _core_managed_markers()
     orphans = [
         p for p in (cfg.get("providers") or [])
-        if isinstance(p, dict) and p.get("managed_by") and p["managed_by"] not in loaded_names
+        if isinstance(p, dict) and _is_orphan_provider(p, loaded_names, core_markers)
     ]
     if not orphans:
         return []
@@ -333,8 +367,8 @@ def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
         removed_model_ids = set()
         kept = []
         for p in data.get("providers") or []:
-            # 写路径内二次判定：只删仍然符合"带标记且插件未加载"的项
-            if isinstance(p, dict) and p.get("managed_by") and p["managed_by"] not in loaded_names:
+            # 写路径内二次判定：只删仍然符合"带标记、非核心托管、插件未加载"的项
+            if isinstance(p, dict) and _is_orphan_provider(p, loaded_names, core_markers):
                 for m in (p.get("models") or []):
                     if isinstance(m, dict) and m.get("id"):
                         removed_model_ids.add(str(m["id"]))

@@ -593,3 +593,67 @@ def test_trust_plugin_persists_fingerprint_entry(plugin_env, tmp_path):
         str((user_dir / "demo").resolve()):
             plugin_loader._plugin_fingerprint(user_dir / "demo")
     }
+
+
+def test_core_managed_markers_include_tokenrhythm_account_provider():
+    """基元律动账号托管的标记值必须被识别为核心托管，不是插件名。"""
+    from core.tokenrhythm_auth import MANAGED_PROVIDER_VALUE
+
+    assert MANAGED_PROVIDER_VALUE in plugin_loader._core_managed_markers()
+
+
+def test_prune_orphan_providers_keeps_account_provider(monkeypatch):
+    """孤儿清理不能删基元律动账号创建的厂商，否则重启一次 Key 就没了。
+
+    真实事故：登录成功 → 创建 provider 与 API Key → 重启时插件加载完毕触发清理，
+    把 managed_by="tokenrhythm" 当成"来源插件未加载"整个删掉，用户看到的就是
+    「明明登录了但 Key 没配置成功」。
+    """
+    import config as config_module
+    import core.model_manager as model_manager
+
+    cfg = {
+        "providers": [
+            # 账号绑定自动创建：必须保留（连它名下的模型一起）
+            {
+                "id": "tr1",
+                "name": "基元律动（基元律动请送…）",
+                "managed_by": "tokenrhythm",
+                "models": [{"id": "m_tr"}],
+            },
+            # 已加载插件托管的：保留
+            {
+                "id": "p_plugin",
+                "name": "免费通道",
+                "managed_by": "tokenrhythm_image",
+                "models": [],
+            },
+            # 用户手配、没有标记：永远不碰
+            {"id": "p_user", "name": "手动厂商", "models": [{"id": "m_user"}]},
+            # 插件已卸载/禁用的孤儿：这次要被清掉
+            {
+                "id": "p_orphan",
+                "name": "被禁用的插件厂商",
+                "managed_by": "gone_plugin",
+                "models": [{"id": "m_orphan"}],
+            },
+        ],
+        "active_model_id": "m_orphan",
+    }
+
+    monkeypatch.setattr(model_manager, "load_config", lambda: cfg)
+    written = {}
+
+    def _fake_update_config(mutator):
+        data = json.loads(json.dumps(cfg))
+        mutator(data)
+        written["data"] = data
+
+    monkeypatch.setattr(config_module, "update_config", _fake_update_config)
+
+    removed = plugin_loader._prune_orphan_providers({"tokenrhythm_image"})
+
+    assert removed == ["被禁用的插件厂商"]
+    assert [p["id"] for p in written["data"]["providers"]] == ["tr1", "p_plugin", "p_user"]
+    # 激活模型属于被删厂商时才清空，属于保留厂商时不受影响
+    assert written["data"]["active_model_id"] is None

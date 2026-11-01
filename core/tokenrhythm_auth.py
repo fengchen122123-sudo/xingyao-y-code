@@ -28,7 +28,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -43,9 +43,16 @@ DEFAULT_PROVIDER_NAME = "基元律动"
 # 带标记（或命中本地绑定）的条目。用户自己填 Key 配置的同域厂商没有标记，
 # 任何情况下都不会被改名或删除。
 MANAGED_PROVIDER_FLAG = "managed_by"
+# 注意：这个值不是插件名。core/plugin_loader 的孤儿清理会通过
+# _core_managed_markers() 把它排除，否则每次启动都会把账号绑定的厂商连 Key 删掉。
 MANAGED_PROVIDER_VALUE = "tokenrhythm"
-DEFAULT_MODEL_NAME = "deepseek-v4.1-flash"
+# 上游某条模型记录缺 contextWindow（或给了非正数）时的保守兜底值：只为让本地
+# 配置有个合法正数，不代表模型真实上限——有值一律用接口给的 contextWindow。
 DEFAULT_CONTEXT_WINDOW = 128000
+# 注意：这里刻意不再保留"默认占位模型"常量。历史实现首次绑定时会硬编码写入
+# deepseek-v4.1-flash（128000 上下文）作为占位条目，但该裸名模型已在上游目录
+# 下线，只会给用户留下一条调不通的脏数据。模型目录统一由 sync_models() 按
+# GET /api/models 返回的真实 contextWindow 填充。
 API_KEY_NAME = "星瑶Code"
 
 _REQUEST_TIMEOUT = 20.0
@@ -846,13 +853,26 @@ def binding_active() -> bool:
 # 四个数据源均取自官方前端页面（会话 cookie 鉴权，复用进程内同一个 Client）。
 _WALLET_PATH = "/api/wallet/summary"
 _USAGE_TODAY_PATH = "/api/usage/panel?range=today"
-_ME_PATH = "/api/auth/me"
-# 临时额度 = 有到期时间的有效额度：参数与官方前端一致——
-# includeInactive=false 只取有效额度，includePermanent=false 排除永久额度。
-_TEMPORARY_CREDITS_PATH = (
-    "/api/wallet/expiring-credits"
-    "?page=1&pageSize=50&includeInactive=false&includePermanent=false"
+# 今日消费全口径：与官方「用量与费用 · 钱包用量」页同源的多模态总览接口。
+# panel 只统计语言 Token 与图片任务，视频任务（wan3.0-video 等）完全不计入，
+# 只用它会让「今日已用」漏掉视频费用；这个接口的 summary.costCny 覆盖语言 / 视频 / 图片。
+_MULTIMODAL_TODAY_PATH = (
+    "/api/usage/multimodal/overview"
+    "?type=all&metric=cost&groupBy=model&range=today&fundingScope=WALLET"
 )
+_ME_PATH = "/api/auth/me"
+# 临时额度 = 剩余有效期"够近"的有效额度。请求只过滤失效项（includeInactive=false），
+# 刻意不传 includePermanent：服务端对"永久赠额"的判定与到期时间并不一致——充值活动赠额
+# 的到期时间被写成 2099-12-31 这类远期占位值，但传 includePermanent=true / false
+# 返回完全一样（实测），说明这枚参数挡不住它。所以全部取回来，本地按到期时间判定。
+# pageSize 上限实测 100：传 200 直接 400 BAD_REQUEST。
+_TEMPORARY_CREDITS_PATH = (
+    "/api/wallet/expiring-credits?page=1&pageSize=100&includeInactive=false"
+)
+# 永久额度的判定阈值：到期时间晚于"现在 + 这个跨度"就等价于永久，不计入临时额度。
+# 实测同一账号里，真正会过期的邀请奖励是 30 天后到期，充值活动赠额是 2099-12-31
+# （70 多年后），10 年既能稳定切开两者，也不会误伤有效期较长的活动额度。
+_TEMPORARY_CREDITS_HORIZON = timedelta(days=365 * 10)
 # 临时额度接口单独放宽超时：服务端要汇总全部历史额度，冷启动实测 10~30 秒
 # （热态 0.3 秒），20 秒的通用超时一抖动就撞线，直接把这栏判成"获取失败"。
 _TEMPORARY_CREDITS_TIMEOUT = 45.0
@@ -1005,11 +1025,14 @@ def _fetch_temporary_credits() -> dict:
 
     每项字段（官方前端控制台在用）：grantedCny 授予金额、remainingCny 剩余金额、
     consumedCny 已消费金额、grantedAt 授予时间、expiresAt 到期时间（ISO 字符串）、
-    validityStartsAt 生效时间、lineType 额度类型。
+    validityStartsAt 生效时间、source / sourceLabel 来源（「邀请奖励」「充值活动赠额」等）。
 
-    口径：临时额度 = 有到期时间的有效额度。请求已用 includeInactive=false 过滤失效
-    额度，这里再按 remainingCny > 0 且 expiresAt 存在、未过期（UTC 比较）双重过滤；
-    解析失败一律当作不计入。求和用 Decimal 保留原始精度，不做两位小数四舍五入。
+    口径：临时额度 = 会在**可预见的时间窗口内**到期的有效额度。请求只用
+    includeInactive=false 过滤失效项，其余条件全部在本地按到期时间判断：
+    remainingCny > 0、expiresAt 可解析、未过期，且到期时间不超过
+    ``_TEMPORARY_CREDITS_HORIZON``（2099 这类远期占位值代表永久额度，不计入）。
+    服务端 summary.expiringBalanceCny 不采用——它把伪永久的充值赠额一起算进去了。
+    求和用 Decimal 保留原始精度，不做两位小数四舍五入。
     """
     try:
         payload = _request("GET", _TEMPORARY_CREDITS_PATH)
@@ -1025,13 +1048,10 @@ def _fetch_temporary_credits() -> dict:
             "GET", _TEMPORARY_CREDITS_PATH, timeout=_TEMPORARY_CREDITS_TIMEOUT
         )
     items = _credit_items(payload)
-    # 服务端在 data.summary 里直接给了汇总（官方控制台用的就是它）：
-    # expiringBalanceCny 到期中余额、nextExpiryAt 最近到期时间。优先采用，列表求和只作兜底。
-    raw_data = payload.get("data")
-    summary: dict = {}
-    if isinstance(raw_data, dict) and isinstance(raw_data.get("summary"), dict):
-        summary = raw_data["summary"]
     now = datetime.now(timezone.utc)
+    # 远期占位到期时间（2099-12-31 之类）等价于永久：把它算进来会让「临时额度」虚高，
+    # 「最近到期」也会被它带偏，所以统一按"到期时间是否落在窗口内"判定。
+    horizon = now + _TEMPORARY_CREDITS_HORIZON
     total = Decimal("0")
     count = 0
     # 先把有效额度收集起来：算完总合计再定位"最近到期日"，那一天的额度一起加总。
@@ -1048,19 +1068,21 @@ def _fetch_temporary_credits() -> dict:
         expires_at = _parse_expires_at(raw_expires)
         if expires_at is None or expires_at <= now:
             continue
+        # 伪永久额度（充值活动赠额等）：有 expiresAt，但远到不构成"临时"
+        if expires_at > horizon:
+            continue
         # 原始时间字符串一起留着：重新格式化会丢掉服务端给的纳秒精度
         valid.append(
             (expires_at, remaining, str(raw_expires if raw_expires is not None else "").strip())
         )
 
-    nearest: datetime | None = None
     nearest_raw = ""
-    for expires_at, remaining, raw in valid:
+    for _expires_at, remaining, _raw in valid:
         total += remaining
         count += 1
-        if nearest is None or expires_at < nearest:
-            nearest = expires_at
-            nearest_raw = raw
+    if valid:
+        # 最早到期那一条的原始字符串：保留服务端给的精度，格式化交给展示层
+        nearest_raw = min(valid, key=lambda entry: entry[0])[2]
     # 按"到期日"聚合而不是按精确时间：同一批发的体验卡到期时间只差几秒，
     # 精确比较只会命中其中一张，那个数字会随着单张卡被消费光而跳动。
     # 按日期合计表达的是"这一天会过期多少钱"，既稳定也更符合用户直觉。
@@ -1073,17 +1095,20 @@ def _fetch_temporary_credits() -> dict:
         ),
         Decimal("0"),
     )
-    # 服务端合计优先：即使列表被分页/过滤掉部分条目，这个数也是官方口径
-    summary_total = _decimal_amount(summary.get("expiringBalanceCny"))
-    if summary_total is not None and summary_total.is_finite() and summary_total >= 0:
-        total = summary_total
-    summary_nearest = str(summary.get("nextExpiryAt") or "").strip()
-    if summary_nearest:
-        nearest_raw = summary_nearest
+    # 服务端 summary.expiringBalanceCny / nextExpiryAt 刻意不采用：它把伪永久的
+    # 充值赠额（2099 到期）也计入了"到期中余额"，正是这条口径让临时额度虚高。
+    # 分页保护：临时额度均为非负金额，服务端总数多于本页返回数时合计会偏小，记一条
+    # warning 便于排查（pageSize 已取到上限 100，正常账号远用不到）。
+    data = payload.get("data")
+    server_total = data.get("total") if isinstance(data, dict) else None
+    if isinstance(server_total, int) and server_total > len(items):
+        logger.warning(
+            "临时额度列表未取全：服务端共 %d 条，本页返回 %d 条", server_total, len(items)
+        )
 
     if not count and items:
-        # 接口有返回但一条都没算进合计：把首条的字段名记进日志（不含金额），
-        # 方便按服务端真实字段补兜底，不必靠猜。
+        # 接口有返回但一条都没算进合计（全是伪永久 / 已过期 / 字段不匹配）：
+        # 把首条的字段名记进日志（不含金额），方便按服务端真实字段补兜底，不必靠猜。
         try:
             sample_keys = sorted(str(key) for key in items[0].keys())[:24]
         except Exception:  # noqa: BLE001 - 诊断信息不能反过来影响主流程
@@ -1112,8 +1137,26 @@ def _fetch_wallet() -> dict:
     }
 
 
+def _fetch_multimodal_cost(fallback: str) -> str:
+    """今日钱包消费全口径：/api/usage/multimodal/overview 的 summary.costCny。
+
+    该接口与官方「钱包用量」页同源，统计语言调用、视频任务与图片任务；
+    panel 接口不含视频，只用它会把「今日已用」算小（实测少掉整笔视频费）。
+    它是附加口径：请求失败或结构异常时回落到 panel 的 costCny，
+    不让一个补充接口把整块用量判成失败。
+    """
+    try:
+        payload = _request("GET", _MULTIMODAL_TODAY_PATH)
+    except TokenRhythmAuthError:
+        return fallback
+    summary = _payload_data(payload).get("summary")
+    if not isinstance(summary, dict) or summary.get("costCny") is None:
+        return fallback
+    return _amount_text(summary.get("costCny"))
+
+
 def _fetch_usage_today() -> dict:
-    """GET /api/usage/panel?range=today → data.summary 的调用次数与 token 用量。"""
+    """今日用量：panel 出调用次数与 Token，多模态总览出全口径消费金额。"""
     data = _payload_data(_request("GET", _USAGE_TODAY_PATH))
     summary = data.get("summary")
     if not isinstance(summary, dict):
@@ -1123,7 +1166,8 @@ def _fetch_usage_today() -> dict:
         "total_tokens": _as_int(summary.get("totalTokens"), 0),
         "input_tokens": _as_int(summary.get("inputTokens"), 0),
         "output_tokens": _as_int(summary.get("outputTokens"), 0),
-        "cost_cny": _amount_text(summary.get("costCny")),
+        # 金额取全口径：语言 + 视频 + 图片，避免「今日已用」漏掉视频任务费用
+        "cost_cny": _fetch_multimodal_cost(_amount_text(summary.get("costCny"))),
     }
 
 
@@ -1140,11 +1184,13 @@ def account_overview() -> dict:
 
     字段来源（与官方前端一致，全部需要会话 cookie）：
     - GET /api/wallet/summary            → data.availableBalanceCny / frozenBalanceCny / currency
-    - GET /api/usage/panel?range=today   → data.summary.{calls,totalTokens,inputTokens,outputTokens,costCny}
+    - GET /api/usage/panel?range=today   → data.summary.{calls,totalTokens,inputTokens,outputTokens}
+    - GET /api/usage/multimodal/overview → data.summary.costCny（今日消费全口径：语言 + 视频 + 图片）
     - GET /api/auth/me                   → data（用户对象，含 id / name / nickname / phone / email / status）
     - GET /api/wallet/expiring-credits    → data.{items|records|list}（直接返回数组也兼容）
-      每项取 remainingCny / expiresAt：剩余金额 > 0 且未过期的项，即"临时额度"
-      （= 有到期时间的有效额度，请求已按 includeInactive=false & includePermanent=false 过滤）。
+      每项取 remainingCny / expiresAt：剩余金额 > 0、未过期，且到期时间落在
+      10 年窗口内的项才算"临时额度"（2099 这类远期占位值代表永久赠额，不计入；
+      服务端 summary.expiringBalanceCny 因含永久项不采用）。
 
     未登录（进程内无会话）时不发任何请求，返回 ``{"ok": False, "reason": "未登录"}``：
     与 account_status 风格一致——"没有会话"用返回值表达，而不是抛异常。
@@ -1604,13 +1650,28 @@ def _current_account() -> dict:
     return {"id": account_id, "name": account_name}
 
 
+def _short_account_label(account_name: str, limit: int = 6) -> str:
+    """账号昵称定长截断：超过 limit 个码点就砍掉并补省略号。
+
+    昵称会落到厂商名、浮层标题这类窄位置（实测有「基元律动请送我token我…」
+    这种超长昵称），原样写进去会把厂商名撑到 20 多字、标题被 CSS 硬切。
+    按码点切分，避免把 emoji / 代理对劈成乱码。
+    """
+    text = str(account_name or "").strip()
+    keep = max(1, int(limit))
+    chars = list(text)
+    if len(chars) <= keep:
+        return text
+    return "".join(chars[:keep]) + "…"
+
+
 def _bound_provider_name(account_name: str) -> str:
-    """厂商名称带上账号昵称，与用户手动配置的「基元律动」区分开。
+    """厂商名称带上账号昵称（昵称超长只取前 6 个字符），与手动配置的「基元律动」区分开。
 
     昵称取不到时回落到「基元律动（账号）」而不是裸「基元律动」：后者正是用户
     自己手填 Key 时最常用的名字，重名会让两条配置在模型列表里无法分辨。
     """
-    nickname = str(account_name or "").strip() or "账号"
+    nickname = _short_account_label(account_name) or "账号"
     return f"{DEFAULT_PROVIDER_NAME}（{nickname}）"
 
 
@@ -1688,6 +1749,9 @@ def _bind_result(
 
     created 一直表示"本次是否新建了 Key"；key_created 省略时跟随 created，
     显式传 False 用于"复用已有 Key"的分支，便于上层区分。
+
+    model_added 是历史字段：自首次绑定不再写占位模型后恒为 False，仅为兼容
+    老调用方保留键位，新代码不要据此判断模型是否可用（看 sync_models 的结果）。
     """
     created_key = bool(created) if key_created is None else bool(key_created)
     result: dict[str, Any] = {
@@ -1838,8 +1902,9 @@ def ensure_bound() -> dict:
 
     未登录抛 TokenRhythmAuthError（请先登录基元律动账号）。
     返回：created / key_created（是否新建了 Key）、old_key_deleted（换账号时旧 Key
-    是否删除成功）、provider_id、model_added、reason、account_id、account_name、
-    provider_name；account_switched 只在本次发生账号切换时出现。
+    是否删除成功）、provider_id、reason、account_id、account_name、provider_name；
+    account_switched 只在本次发生账号切换时出现。model_added 为历史字段（恒 False）：
+    本函数不再写入任何占位模型，新建厂商后由调用方用 sync_models() 填充真实目录。
     日志只记 key_id / provider_id，绝不打印 Key 明文。
     """
     account = _current_account()
@@ -1916,22 +1981,10 @@ def ensure_bound() -> dict:
             f"API Key 已创建，但新增模型厂商失败：{error}"
         ) from error
 
-    model_added = False
-    try:
-        from core import model_manager
-
-        model_manager.add_model_to_provider(
-            provider_id,
-            DEFAULT_MODEL_NAME,
-            DEFAULT_CONTEXT_WINDOW,
-            supports_vision=False,
-            supports_function_calling=True,
-        )
-        model_added = True
-    except Exception as error:
-        # 默认模型追加失败不影响 Key 绑定本身，记 warning 即可。
-        logger.warning("基元律动默认模型添加失败（provider=%s）：%s", provider_id, error)
-
+    # 刻意不写任何"占位模型"：厂商建好后由调用方紧接着执行 sync_models()，
+    # 按上游 GET /api/models 的真实条目（含真实 contextWindow）填充目录。
+    # 历史实现此处硬编码 deepseek-v4.1-flash + 128000，而该裸名模型已在上游
+    # 下线，只会给用户留下一条调不通、上下文还比真实值小一截的脏模型。
     _remember_binding(account, provider_id, key_id)
     return _bind_result(
         account,
@@ -1939,7 +1992,6 @@ def ensure_bound() -> dict:
         provider_id=provider_id,
         reason="已自动创建并绑定 Key",
         provider_name=provider_name,
-        model_added=model_added,
         account_switched=account_switched,
         key_created=True,
         old_key_deleted=old_key_deleted,

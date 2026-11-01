@@ -4,8 +4,11 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
 
 产出物（均在 dist/ 下）：
   dist/ycode/                  onedir 核心程序包，同时包含：
-      Y-code.exe                 GUI 窗口版 (pywebview, console=False)
-      ycode.exe                  CLI 控制台版 (console=True)
+      Y-code.exe                 GUI 窗口版 (pywebview, console=False)，同时也是
+                                 `--cli` 模式下的 CLI 实现（唯一一份 Python 载荷）
+      ycode.exe                  CLI 启动器（几 KB 的 C# 控制台程序，把参数原样
+                                 透传并追加 --cli 拉起 Y-code.exe；由
+                                 build_cli_launcher 用 csc 编译，不再是 PyInstaller 产物）
       _internal/                 两者共享的运行时依赖与数据文件
   dist/ycode_uninstall.exe     独立卸载向导
   dist/Y-code-cli-{版本}.exe   独立 CLI 安装向导（单独分发，补装/纯 CLI 用户）
@@ -24,9 +27,11 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
   venv\\Scripts\\python build_release.py --no-split-parts   跳过分卷切割（产物不分发到 Gitee 时用）
 """
 import argparse
+import datetime
 import glob
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -63,6 +68,11 @@ def parse_args():
         "--setup-only", action="store_true",
         help="只重建两个安装向导 (ycode_setup_v*.exe / ycode_cli_setup_v*.exe)：复用现有 dist/ycode "
              "载荷与 dist/ycode_uninstall.exe，适用于仅改动 ycode_setup.py 后的快速重建。",
+    )
+    parser.add_argument(
+        "--component-only", action="store_true",
+        help="只产出 playwright 组件包 dist/playwright-component-*.zip，"
+             "跳过其它所有构建（前端 / 核心载荷 / 安装向导 / 分卷）。",
     )
     parser.add_argument(
         "--no-split-parts", action="store_true",
@@ -185,6 +195,111 @@ def format_size_mb(path):
 # 步骤 0：前端构建
 # ============================================================================
 
+def read_playwright_version(project_dir):
+    """从 venv 里 playwright 的 _repo_version.py 读版本号；读不到返回 "0.0.0"。
+
+    该文件由 hatch-vcs 生成，实体形如 `__version__ = version = '1.62.0'`；
+    这里只做正则解析，不 import playwright（import 会拉起完整运行时依赖，
+    构建脚本不该为读一个字符串付这个代价）。
+    """
+    version_file = os.path.join(
+        project_dir, "venv", "Lib", "site-packages", "playwright", "_repo_version.py"
+    )
+    try:
+        with open(version_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        match = re.search(
+            r"__version__\s*=\s*(?:version\s*=\s*)?[\"']([^\"']+)[\"']", content
+        )
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    print("⚠️ 未能解析 playwright 版本号，组件包文件名将回退为 0.0.0。")
+    return "0.0.0"
+
+
+# ============================================================================
+# 步骤 0b：playwright 组件包（运行时由 core/components.py 下载安装）
+# ============================================================================
+
+PLAYWRIGHT_COMPONENT_SOURCES = ("playwright", "greenlet", "pyee")
+
+
+def step0b_build_playwright_component(project_dir):
+    """把 playwright 运行时（含 driver/node.exe）打成可发布到 Gitee Release 的组件包。
+
+    组件包根目录平铺 COMPONENT.json + playwright/ + greenlet/ + pyee/，正好满足
+    core/components.py 的 _locate_component_root 校验（COMPONENT.json 与
+    playwright/driver/node.exe 必须同时存在）。greenlet 是 cp314 编译扩展，
+    必须从当前 venv 复制，保证 ABI 与打包版 Python 3.14 一致。
+    """
+    print("\n[步骤 0b/5] 正在产出 playwright 组件包 (dist/playwright-component-*.zip)...")
+    site_packages = os.path.join(project_dir, "venv", "Lib", "site-packages")
+    missing = [
+        name for name in PLAYWRIGHT_COMPONENT_SOURCES
+        if not os.path.isdir(os.path.join(site_packages, name))
+    ]
+    if missing:
+        print("❌ 组件源目录缺失: " + ", ".join(missing))
+        sys.exit(1)
+
+    version = read_playwright_version(project_dir)
+    dist_dir = os.path.join(project_dir, "dist")
+    os.makedirs(dist_dir, exist_ok=True)
+    zip_path = os.path.join(dist_dir, f"playwright-component-{version}.zip")
+    # 同版本组件包已存在就复用：LZMA 压缩 107MB（node.exe 占 88MB）单线程要
+    # 十几分钟，每次完整构建都重压一遍纯属浪费。内容由 playwright 版本号决定，
+    # 版本变则文件名变，不存在"旧内容被误用"。需要强制重建时先删掉该 zip。
+    if os.path.exists(zip_path):
+        print(f"✅ 已存在同版本组件包，跳过压缩: {zip_path} ({format_size_mb(zip_path)})")
+        return zip_path
+
+    tmp_dir = os.path.join(project_dir, "build", "_playwright_component_tmp")
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+    try:
+        ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "tests")
+        for name in PLAYWRIGHT_COMPONENT_SOURCES:
+            shutil.copytree(
+                os.path.join(site_packages, name),
+                os.path.join(tmp_dir, name),
+                ignore=ignore,
+            )
+
+        manifest = {
+            "playwright_version": version,
+            "python_version": "3.14",
+            "abi": "cp314",
+            "platform": "win-amd64",
+            "built_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        with open(os.path.join(tmp_dir, "COMPONENT.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        for old in glob.glob(os.path.join(dist_dir, "playwright-component-*.zip")):
+            os.remove(old)
+
+        print("📦 正在压缩 playwright 组件包 (LZMA)...")
+        count = 0
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_LZMA, allowZip64=True) as zf:
+            for root, _dirs, files in os.walk(tmp_dir):
+                for name in files:
+                    src = os.path.join(root, name)
+                    arcname = os.path.relpath(src, tmp_dir).replace(os.sep, "/")
+                    zf.write(src, arcname)
+                    count += 1
+
+        digest = sha256_file(zip_path)
+        print(f"✔ 组件包产出完成: {count} 个文件 -> {format_size_mb(zip_path)}")
+        print(f"   - 文件  : {zip_path}")
+        print(f"   - SHA256: {digest}")
+        return zip_path
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def step0_build_frontend(project_dir, args):
     print("\n[步骤 0/5] 检查 / 构建前端产物 (frontend/dist)...")
     frontend_dir = os.path.join(project_dir, "frontend")
@@ -301,28 +416,107 @@ def step0_build_frontend(project_dir, args):
 
 
 # ============================================================================
-# 步骤 1：核心双主程序 (Y-code.exe + ycode.exe)
+# 步骤 1：核心程序包（Y-code.exe 唯一 Python 载荷 + ycode.exe 控制台启动器）
 # ============================================================================
 
+def find_csc():
+    """定位 .NET Framework 自带的 csc.exe（Windows 10/11 默认存在，无需装 VS）。
+
+    优先 v4.x（launcher 只用到 kernel32 P/Invoke 与最基础的 BCL，v3.5 也能编，
+    但 v4 运行时在所有受支持 Windows 上都预装）。找不到返回空串，由调用方回退。
+    """
+    windir = os.environ.get("WINDIR") or r"C:\Windows"
+    found = []
+    for flavor in ("Framework64", "Framework"):
+        root = os.path.join(windir, "Microsoft.NET", flavor)
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root), reverse=True):
+            exe = os.path.join(root, name, "csc.exe")
+            if os.path.isfile(exe):
+                found.append(exe)
+    for exe in found:
+        if os.sep + "v4." in exe:
+            return exe
+    return found[0] if found else ""
+
+
+def build_cli_launcher(project_dir, ycode_dir):
+    """把 ycode.exe 编译成几 KB 的 C# 控制台启动器（转发到 Y-code.exe --cli）。
+
+    背景：原先 Y-code.exe(GUI) 与 ycode.exe(CLI) 各自内嵌一份约 31MB 的
+    PyInstaller 字节码归档（PYZ），实测两份里 30.83MB 的共用模块完全相同、
+    CLI 独有模块只有 0.12MB。现在 ycode.spec 只产出 GUI 那一路，ycode.exe
+    由 packaging/ycode_launcher.cs 编译而来：原样透传参数、继承标准输入输出、
+    等待子进程并返回其退出码。
+
+    找不到 csc 时回退为复制 Y-code.exe（CLI 会以 GUI 模式启动，控制台模式
+    不可用），打印显眼告警但不中断构建——宁可交付一个能用的 GUI 包，也不要
+    因为构建机缺 .NET Framework 而让整条发布流水线失败。
+    """
+    print("\n[步骤 1.5/5] 正在编译 CLI 控制台启动器 ycode.exe...")
+    source = os.path.join(project_dir, "packaging", "ycode_launcher.cs")
+    target = os.path.join(ycode_dir, "ycode.exe")
+
+    def _fallback(reason):
+        gui_exe = os.path.join(ycode_dir, "Y-code.exe")
+        shutil.copy2(gui_exe, target)
+        print(f"⚠️ {reason}")
+        print("⚠️ 已回退为“复制 Y-code.exe 作为 ycode.exe”：CLI 将以 GUI 模式启动，")
+        print("   控制台 CLI 模式不可用（安装包体积也会多出约 31MB）。")
+
+    if not os.path.isfile(source):
+        _fallback(f"未找到启动器源码: {source}")
+        return target
+
+    csc = find_csc()
+    if not csc:
+        _fallback("未找到 csc.exe（.NET Framework 编译器）")
+        return target
+
+    # 先编到临时名，成功后再原子替换：编译失败时不会把可用的旧产物弄坏
+    tmp_target = target + ".building"
+    cmd = [
+        csc, "/nologo", "/target:exe", "/platform:anycpu", "/optimize+",
+        f"/out:{tmp_target}", source,
+    ]
+    try:
+        result = subprocess.run(cmd)
+    except OSError as exc:
+        _fallback(f"启动 csc.exe 失败: {exc}")
+        return target
+    if result.returncode != 0 or not os.path.isfile(tmp_target):
+        if os.path.exists(tmp_target):
+            os.remove(tmp_target)
+        _fallback(f"csc 编译失败（退出码 {result.returncode}）")
+        return target
+
+    os.replace(tmp_target, target)
+    size_kb = os.path.getsize(target) / 1024
+    print(f"✅ CLI 启动器编译成功: {target} ({size_kb:.0f} KB)")
+    if size_kb > 1024:
+        print("⚠️ 启动器体积异常（> 1MB），请检查是否误用了回退产物。")
+    return target
+
+
 def step1_build_core(pyinstaller_bin, project_dir):
-    print("\n[步骤 1/5] 正在编译核心程序包 (Y-code.exe GUI + ycode.exe CLI)...")
-    # 用 ycode.spec 而不是一堆 CLI flag：spec 里配置了两套 Analysis（分别对应
-    # GUI/CLI 两个入口）、collect_all 依赖收集与 upx=False（避免启动时内存
-    # 解压 + Defender 扫描拖慢启动速度），这些精细控制没法完全用 CLI 表达。
+    print("\n[步骤 1/5] 正在编译核心程序包 (Y-code.exe GUI，CLI 共用同一份载荷)...")
+    # 用 ycode.spec 而不是一堆 CLI flag：spec 里配置了单套 GUI Analysis（CLI 走
+    # --cli 模式共用同一份 PYZ）、collect_all 依赖收集与 upx=False（避免启动时
+    # 内存解压 + Defender 扫描拖慢启动速度），这些精细控制没法完全用 CLI 表达。
     cmd = [pyinstaller_bin, "--clean", "--noconfirm", "ycode.spec"]
     run_checked(cmd, "核心程序包编译")
 
     ycode_dir = os.path.join(project_dir, "dist", "ycode")
-    cli_exe = os.path.join(ycode_dir, "ycode.exe")
     gui_exe = os.path.join(ycode_dir, "Y-code.exe")
-    missing = [p for p in (cli_exe, gui_exe) if not os.path.exists(p)]
-    if missing:
-        print("❌ 核心程序包生成不完整，缺少以下文件：")
-        for p in missing:
-            print(f"   - {p}")
+    if not os.path.exists(gui_exe):
+        print("❌ 核心程序包生成不完整，缺少 GUI 主程序：")
+        print(f"   - {gui_exe}")
         sys.exit(1)
     print(f"✅ 核心程序包 (onedir) 生成成功: {ycode_dir}")
-    print(f"   - GUI 窗口版  : {gui_exe}")
+    print(f"   - GUI 窗口版  : {gui_exe} ({os.path.getsize(gui_exe) / 1024 / 1024:.1f} MB)")
+
+    cli_exe = build_cli_launcher(project_dir, ycode_dir)
     print(f"   - CLI 控制台版: {cli_exe}")
     return ycode_dir
 
@@ -332,15 +526,21 @@ def step1_build_core(pyinstaller_bin, project_dir):
 # ============================================================================
 
 def step2_build_uninstaller(pyinstaller_bin, project_dir):
-    print("\n[步骤 2/5] 正在编译卸载程序 Y-code-uninstall.exe...")
-    cmd = [pyinstaller_bin, "--clean", "--noconfirm", "ycode_uninstall.spec"]
-    run_checked(cmd, "卸载程序编译")
+    """确认卸载向导已由 ycode.spec 产出（与主程序共享 _internal 的 onedir 入口）。
 
-    uninstall_exe = os.path.join(project_dir, "dist", "Y-code-uninstall.exe")
+    历史上卸载器是单独的 PyInstaller onefile（13.4MB），需要这一步单独编译、
+    再作为 add-data 内嵌进两个安装器。现在它由 spec 的第三套 Analysis 产出到
+    dist/ycode/ 下、随载荷一起释放，安装包因此省掉整整一份重复的运行时。
+    """
+    print("\n[步骤 2/5] 正在检查卸载向导 Y-code-uninstall.exe...")
+    uninstall_exe = os.path.join(project_dir, "dist", "ycode", "Y-code-uninstall.exe")
     if not os.path.exists(uninstall_exe):
-        print(f"❌ 未找到预期产物: {uninstall_exe}")
+        print(f"❌ 未找到预期产物: {uninstall_exe}（应由 ycode.spec 的 a_uninst 产出）")
         sys.exit(1)
-    print(f"✅ 卸载程序生成成功: {uninstall_exe}")
+    size_kb = os.path.getsize(uninstall_exe) / 1024
+    print(f"✅ 卸载向导就绪: {uninstall_exe} ({size_kb:.0f} KB)")
+    if size_kb > 5120:
+        print("⚠️ 卸载向导体积异常（> 5MB），请检查是否仍在用旧的独立 onefile。")
     return uninstall_exe
 
 
@@ -447,7 +647,6 @@ def step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_e
         pyinstaller_bin, project_dir, mode="cli", output_name="ycode_cli_setup",
         add_data_pairs=[
             (payload_zip, "."),
-            (uninstall_exe, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
             # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
@@ -468,7 +667,6 @@ def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_
         pyinstaller_bin, project_dir, mode="full", output_name="ycode_setup",
         add_data_pairs=[
             (payload_zip, "."),
-            (uninstall_exe, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
             # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
@@ -653,6 +851,26 @@ def split_file_for_release(src_path, out_dir, part_bytes=SPLIT_PART_BYTES):
     return names, sha256_file(src_path)
 
 
+# 发布说明里组件包校验行的固定格式：``<文件名>  SHA256=<64 位十六进制>``。
+# 刻意用 "=" 而不是 ":"：core.updater.parse_release_sha256 只认 "SHA256: <hex>"，
+# 用冒号会让主安装包的官方校验和解析错取组件包 digest；客户端解析见
+# core/components.py::_parse_component_digest（两处格式必须同步修改）。
+COMPONENT_DIGEST_LINE = "{name}  SHA256={digest}"
+
+
+def component_digest_line(archive_name, digest):
+    """生成 Release 说明里的组件包校验行（格式固定，客户端据它做下载校验）。"""
+    return COMPONENT_DIGEST_LINE.format(name=archive_name, digest=digest)
+
+
+def find_playwright_component_archive(project_dir):
+    """返回 dist/ 下的 playwright 组件包路径（多个时取最新；没有返回空串）。"""
+    candidates = sorted(
+        glob.glob(os.path.join(project_dir, "dist", "playwright-component-*.zip"))
+    )
+    return candidates[-1] if candidates else ""
+
+
 def step4c_make_release_parts(project_dir, version, cli_only):
     """生成 Gitee Release 上传用的分卷附件目录 dist/release_parts/。
 
@@ -693,6 +911,20 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         print("⚠️ 没有可切分的安装包产物，跳过 RELEASE_NOTES 生成。")
         return
 
+    # 组件包 SHA256 必须写进发布说明：客户端下载组件前会解析这一行做强制校验
+    # （core/components.py::_parse_component_digest），缺失时客户端只能告警放行。
+    component_line = ""
+    component_archive = find_playwright_component_archive(project_dir)
+    if component_archive:
+        component_digest = sha256_file(component_archive)
+        component_line = component_digest_line(
+            os.path.basename(component_archive), component_digest
+        )
+        print(f"✔ 组件包 {os.path.basename(component_archive)}  SHA256: {component_digest}")
+    else:
+        print("⚠️ 未找到 dist/playwright-component-*.zip：发布说明里不会有组件包"
+              "校验行，客户端下载组件时无法校验完整性。")
+
     # 生成上传指引 + 发布说明模板（SHA256 行供 updater 解析，勿改动格式）
     main_entry = next((e for e in entries if "主安装包" in e[0]), entries[0])
     lines = []
@@ -703,6 +935,13 @@ def step4c_make_release_parts(project_dir, version, cli_only):
     lines.append("2. 描述粘贴下方『发布说明模板』（SHA256 校验行格式勿改动，")
     lines.append("   自动更新依赖它做安装包完整性校验）")
     lines.append("3. 附件上传本目录 (dist/release_parts/) 下的全部分卷文件")
+    # 组件包必须与主安装包同 Release 发布：core/components.py 只在该 Release 的
+    # 资产里按「名字含 playwright-component 且以 .zip 结尾」查找下载源，
+    # 漏传时用户在设置页点「下载组件」会直接报"未找到组件下载源"。
+    lines.append("   + dist/playwright-component-*.zip（浏览器操控按需组件，"
+                 "约 25MB，漏传会导致下载按钮失败）")
+    lines.append("   （该附件必须出现在下方『浏览器操控组件包 SHA256』行里：客户端靠它"
+                 "校验组件包完整性，格式勿改动）")
     lines.append("4. 勾选『设为最新发布版本』后发布")
     lines.append("")
     lines.append("发布说明模板")
@@ -726,6 +965,12 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         parts_desc = f"（{len(names)} 分卷）" if len(names) > 1 else ""
         lines.append(f"{fname:<40} {parts_desc} {digest}")
 
+    lines.append("")
+    lines.append("浏览器操控组件包 SHA256（core/components.py 下载校验，格式勿改动）")
+    lines.append("-" * 52)
+    lines.append(component_line or "（本次未产出组件包：客户端下载组件时无法校验，"
+                 "请补传组件包后补充此行）")
+
     notes_path = os.path.join(out_dir, "RELEASE_NOTES.txt")
     with open(notes_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -741,7 +986,7 @@ def step5_summary(project_dir, cli_only, version):
     rows = [
         (os.path.join("dist", "ycode", "Y-code.exe"), "GUI 主程序 (窗口版)"),
         (os.path.join("dist", "ycode", "ycode.exe"), "CLI 主程序 (控制台版)"),
-        (os.path.join("dist", "Y-code-uninstall.exe"), "卸载程序"),
+        (os.path.join("dist", "ycode", "Y-code-uninstall.exe"), "卸载向导"),
         (os.path.join("dist", f"{versioned_setup_name('ycode_cli_setup', version)}.exe"), "CLI 独立安装包"),
     ]
     if not cli_only:
@@ -759,6 +1004,16 @@ def step5_summary(project_dir, cli_only, version):
         else:
             print(f"  ❌ {rel_path:<34} {'缺失':>9}   {desc}")
             all_ok = False
+    # playwright 组件包由 step0b 独立产出；--setup-only 复用既有载荷时不会重新生成，
+    # 故这里只列示、不计入"产物缺失即失败"的判定。
+    component_zips = sorted(
+        glob.glob(os.path.join(project_dir, "dist", "playwright-component-*.zip"))
+    )
+    for zip_path in component_zips:
+        rel = os.path.relpath(zip_path, project_dir)
+        print(f"  ✅ {rel:<34} {format_size_mb(zip_path):>9}   playwright 组件包 (Gitee Release)")
+    if not component_zips:
+        print(f"  ⚠️ {'dist/playwright-component-*.zip':<34} {'未产出':>9}   playwright 组件包")
     print("=" * 64)
 
     if not all_ok:
@@ -788,12 +1043,18 @@ def build():
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)
 
+    if args.component_only:
+        # 快速通道：只打 playwright 组件包，不需要 PyInstaller / 前端 / 安装向导环境
+        step0b_build_playwright_component(project_dir)
+        print("ℹ 已指定 --component-only，跳过其它所有构建步骤。")
+        return
+
     pyinstaller_bin = resolve_pyinstaller(project_dir)
 
     if args.setup_only:
         # 快速通道：核心载荷与卸载程序未变，直接复用现有产物，只重新编译安装向导。
         ycode_dir = os.path.join(project_dir, "dist", "ycode")
-        uninstall_exe = os.path.join(project_dir, "dist", "Y-code-uninstall.exe")
+        uninstall_exe = os.path.join(project_dir, "dist", "ycode", "Y-code-uninstall.exe")
         if not os.path.isdir(ycode_dir):
             print(f"❌ --setup-only 需要现有核心载荷目录: {ycode_dir}（请先完整构建一次）。")
             sys.exit(1)
@@ -822,6 +1083,8 @@ def build():
             "vendor 随包资源校验",
         )
         step0_build_frontend(project_dir, args)
+        # playwright 与安装包分离发布：组件包必须与同版本主安装包一起上传 Gitee Release
+        step0b_build_playwright_component(project_dir)
         ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
         payload_zip = make_payload_archive(project_dir, ycode_dir)
         uninstall_exe = step2_build_uninstaller(pyinstaller_bin, project_dir)

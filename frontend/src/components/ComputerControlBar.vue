@@ -1,9 +1,11 @@
 <template>
   <!-- 电脑操控安全条（设计 16.1）：插在聊天标题栏下方、滚动区外——
        对话滚动时保持可见；只对活动期 run 渲染（idle/stopped/completed/completing 不显示），
-       且只在本会话发起的 run 里渲染：其他会话正在操控时不串显到当前会话 -->
+       且只在本会话发起的 run 里渲染：其他会话正在操控时不串显到当前会话。
+       浏览器操控（target=browser）不渲染本条：右侧直接呈现可围观的浏览器，
+       停止入口收进浏览器工具栏，避免「操作浏览器」时冒出整套操控界面。 -->
   <div
-    v-if="store.computerBarVisibleInCurrentSession"
+    v-if="store.computerBarVisibleInCurrentSession && !store.computerRunIsBrowser"
     class="computer-control-bar"
     data-test="computer-control-bar"
     data-theme-region="conversation_toolbar"

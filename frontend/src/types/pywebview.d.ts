@@ -355,6 +355,21 @@ export interface ComputerControlResult extends ComputerRunSnapshot {
   msg?: string;
 }
 
+// Playwright 按需组件状态快照（core/components.py::get_status()）。
+// 安装包不再内置 Playwright：installed/version/dir 来自磁盘探测，
+// downloading/percent/stage/error 是进程内下载状态机的实时值
+export interface PlaywrightComponentStatus {
+  installed: boolean;
+  version: string;
+  downloading: boolean;
+  percent: number;
+  downloaded_bytes: number;
+  total_bytes: number;
+  error: string;
+  stage: string;
+  dir: string;
+}
+
 // 内嵌浏览器（右侧面板浏览器页签）：DOM 占位区的 CSS px 矩形，上报给宿主，
 // 由宿主把叠加的原生 WebView2 控件摆到该矩形上
 export interface EmbeddedBrowserRect {
@@ -507,6 +522,42 @@ export interface McpInfo {
   last_error?: string | null;
 }
 
+// 斜杠命令清单（后端 core/slash_commands 注册表的只读投影，供输入补全使用）
+export interface SlashCommandInfo {
+  // 主名，含前导斜杠，例如 "/goal"
+  name: string;
+  // 用法示例，例如 "/goal <目标> [--check 命令]"
+  usage: string;
+  // 一句话说明，补全面板右侧展示
+  summary: string;
+  // 执行方式：local 本地直执行 / prompt 展开提示词 / hybrid 交给编排器
+  kind: string;
+}
+
+// /goal 目标状态码：取值必须与 core/slash_commands/goal/state.py 的 STATUS_* 一致
+// （后端是权威定义，这里只是给前端徽标/按钮分支用的类型收窄）
+export type GoalStatus =
+  | 'running'
+  | 'awaiting_confirm'
+  | 'achieved'
+  | 'blocked'
+  | 'stopped'
+  | 'interrupted';
+
+// 单个会话的目标状态快照（桥 get_goal_state 的 state 字段，GoalBar 的数据源）
+export interface GoalStateInfo {
+  // 用户设定的目标原文
+  goal: string;
+  // 已跑轮次 / 轮次上限：状态条显示"第 N/M 轮"
+  round: number;
+  max_rounds: number;
+  status: GoalStatus;
+  // 最近一轮摘要（没有历史时为空串）
+  last_summary: string;
+  // 可执行验证命令（空串表示靠模型自评）
+  check: string;
+}
+
 export interface PluginInfo {
   name: string;
   version: string;
@@ -540,7 +591,9 @@ export interface AutomationTaskInfo {
   id: string;
   name: string;
   enabled: boolean;
-  trigger_type: 'interval' | 'daily' | 'weekly' | 'startup';
+  // once：一次性触发，trigger_config 为 {run_at: 'YYYY-MM-DD HH:MM'} 或 {delay_minutes: N}
+  // （保存时后端把 delay_minutes 归一化成 run_at 落库）
+  trigger_type: 'interval' | 'daily' | 'weekly' | 'startup' | 'once';
   trigger_config: Record<string, any>;
   target_session: string;
   // 任务指定的工作目录：'' = 跟随目标会话归属；'GLOBAL' = 新会话挂自由对话；
@@ -559,6 +612,14 @@ export interface AutomationTaskInfo {
   next_run_at?: number | null;
   // 后端生成的面向用户触发器摘要（如「每天 09:30」）
   trigger_summary?: string;
+  // 最多执行次数：null = 不限次；手动「立即执行」不计入
+  max_runs?: number | null;
+  // 已按计划执行的次数（手动触发不计数）
+  scheduled_run_count?: number;
+  // 任务生命周期状态：达 max_runs 后由后端置 completed
+  status?: 'active' | 'completed';
+  // 后端派生字段：剩余可执行次数；不限次任务为 null
+  remaining_runs?: number | null;
 }
 
 export interface AutomationRunInfo {
@@ -573,6 +634,60 @@ export interface AutomationRunInfo {
   queued_at: string;
   started_at?: string | null;
   finished_at?: string | null;
+}
+
+// 星流工作流（ZCode .dwf.ts 导入，待开发/ZCode钩子与工作流导入/设计规格.md §3）
+export interface WorkflowArgDecl {
+  type: 'string' | 'number' | 'boolean' | 'json';
+  description?: string;
+  required?: boolean;
+  default?: unknown;
+}
+
+export interface WorkflowInfo {
+  name: string;
+  scope: 'user' | 'project';
+  path: string;
+  description: string;
+  when_to_use?: string;
+  args?: Record<string, WorkflowArgDecl>;
+}
+
+// 坏文件（frontmatter 解析失败/名字非法）：不参与执行，面板指名展示
+export interface WorkflowInvalidInfo {
+  name: string;
+  scope?: string;
+  path?: string;
+  error: string;
+}
+
+export interface WorkflowImportReport {
+  imported: Array<{ name: string; scope: string; path: string; skill?: string; frontmatter_error?: string }>;
+  skipped: Array<{ name: string; scope?: string; reason?: string }>;
+  invalid: Array<{ name: string; scope?: string; error?: string }>;
+}
+
+// 工作流运行台账（workflow_runs 表）：workflow_run 发起时登记，workflow_finish 收尾
+export interface WorkflowRunInfo {
+  id: string;
+  workflow_name: string;
+  scope: string;
+  session_name: string;
+  args?: Record<string, any>;
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
+  summary: string;
+  error: string;
+  artifact_dir: string;
+  started_at: string;
+  finished_at: string;
+}
+
+// 解释执行器的节点级实时事件（workflow_run_progress 桥事件）
+export interface WorkflowRunEvent {
+  seq?: number;
+  run_id: string;
+  kind: string;
+  payload: Record<string, any>;
 }
 
 export interface SessionInfo {
@@ -984,6 +1099,75 @@ export interface TurnErrorEventData {
   message: string;
 }
 
+// ---------------------------------------------------------------------------
+// 断点续跑（S4）：resume.enabled 默认关闭；关闭时两个接口都回 {ok:false,reason:'disabled'}。
+// 快照只含判定与摘要（sha256 / 序号 / 原因），不含参数与结果正文。
+// ---------------------------------------------------------------------------
+export interface ResumeCallDecision {
+  call_ordinal: number;
+  tool_name: string;
+  klass: 'replay_with_result' | 'replay_fresh' | 'block' | string;
+  reason: string;
+  step_id?: string;
+  arguments_sha256?: string | null;
+  result_sha256?: string | null;
+  message_row_present?: boolean;
+}
+
+export interface ResumeAnchorSnapshot {
+  complete: boolean;
+  message_count: number;
+  // 四个字节锚点摘要（比对口径在 Python 侧，前端只做展示与"是否完整"判断）
+  messages_sha256?: string;
+  system_sha256?: string;
+  tools_sha256?: string;
+  cache_lane_sha256?: string;
+}
+
+export interface ResumePlanSnapshot {
+  session_name: string;
+  parent_turn_id: string;
+  resume_from_step_ordinal: number;
+  anchor: ResumeAnchorSnapshot;
+  decisions: ResumeCallDecision[];
+  // 用户可读的待确认文案（含写操作/不确定态）
+  blockers: string[];
+  replayable_count: number;
+  fresh_count: number;
+  blocked_count: number;
+  // §7 降级原因（非空则不可自动续跑）
+  aborts: string[];
+}
+
+export interface ResumePlanResponse {
+  ok: boolean;
+  reason?: string;
+  msg?: string;
+  resumable?: boolean;
+  plan?: ResumePlanSnapshot;
+  aborts?: string[];
+}
+
+export interface ResumeBlockerItem {
+  call_ordinal: number;
+  tool_name: string;
+  arguments_sha256?: string | null;
+}
+
+export interface ResumeExecuteResponse {
+  ok: boolean;
+  reason?: string;
+  reasons?: string[];
+  msg?: string;
+  turn_id?: string;
+  parent_turn_id?: string;
+  dry_run?: boolean;
+  replayed?: number;
+  anchored?: boolean;
+  // reason=confirm_required 时列出待确认写操作（列表展示，暂不做逐项确认）
+  blockers?: ResumeBlockerItem[];
+}
+
 export interface SubagentProgressEventData {
   tasks: Array<{
     id: string;
@@ -1246,6 +1430,206 @@ export interface UpdateCheckResult {
   msg?: string;
 }
 
+// novel_status 的 chapters[] 单项：后端按正文文件扫描得出逐章明细。
+// number 为章号（1 基），name 为正文文件名（如「第001章_灵前第一笔」），
+// words 为该章 visible_chars 同口径字数，submitted 表示该章有提交记录、
+// outline_ready 表示该章章纲已就绪。volume 是「所属卷号」：卷纲无法唯一
+// 判定归属时该键整体不出现（不是 null、也不是空串），前端按缺省处理。
+export interface NovelChapterSummaryDto {
+  number?: number;
+  name?: string;
+  // 历史兼容保留：后端当前只下发 name，不再返回 title（旧代码仍可能读它），
+  // 新代码请用 name，不要按 title 实现章名逻辑
+  title?: string;
+  words?: number;
+  submitted?: boolean;
+  outline_ready?: boolean;
+  volume?: number;
+}
+
+// get_novel_status 状态快照（设计 §7.2）。非小说项目只返回 { is_novel: false }，
+// 目录不存在/异常时额外带 error（前端据此显示错误文本而非当成空项目）；
+// 此时其余字段不下发，因此除 is_novel 外一律按可选声明。
+// 逐章明细（chapters）读不到时前端按章号兜底，不伪造章名/字数。
+export interface NovelStatusDto {
+  is_novel: boolean;
+  error?: string;
+  title?: string;
+  // 目标字数（正式字段，来自 .novel.json）：0 或缺省表示未设定，
+  // 前端此时不画进度条分母
+  target_words?: number;
+  chapters_written?: number;
+  // 逐章明细（后端扫描正文目录得出，含 submitted / outline_ready / volume）
+  chapters?: NovelChapterSummaryDto[];
+  total_words?: number;
+  today_words?: number;
+  next_chapter?: number;
+  outline_ready?: boolean;
+  active_foreshadows?: number;
+  // 最近一次提交的时间戳（秒）；0 或缺省表示还没有提交记录
+  last_commit?: number;
+}
+
+// get_novel_workbench 的伏笔表单项（设定库「伏笔」表）。三个超期/陈旧维度
+// 语义不同，不能混用：
+// - overdue：与 novel_audit 同一超期口径——状态为已埋，且埋设章距最近提交章
+//   超过 20 章；
+// - planned_overdue：另一维度——计划回收章已过（< next_chapter）但状态仍为
+//   已埋（说明「承诺的回收点已经错过」）；
+// - stale_chapters：该伏笔距今的章数间隔，用来提示「很久没提」。
+export interface NovelWorkbenchForeshadowDto {
+  id: string;
+  summary: string;
+  status: string;
+  importance: string;
+  // 以下章号在伏笔尚未埋设时不存在（缺省表示未知，不要当 0 处理）
+  planted_chapter?: number;
+  planned_resolution_chapter?: number;
+  updated_chapter?: number;
+  overdue: boolean;
+  planned_overdue: boolean;
+  stale_chapters: number;
+}
+
+// get_novel_workbench 的角色表单项（设定库「角色」表）。字符串字段缺失时
+// 后端给空串，四个数组字段缺失时给空数组，前端无需再判 null。
+export interface NovelWorkbenchCharacterDto {
+  name: string;
+  identity: string;
+  state: string;
+  location: string;
+  goal: string;
+  knowledge: string[];
+  abilities_resources: string[];
+  open_threads: string[];
+  relationships: string[];
+}
+
+// get_novel_workbench 的卷纲表单项。no 为卷号（1 基），chars 为该卷卷纲字符数，
+// current 标记按 next_chapter 落点判断出的当前卷（同一时刻最多一项为 true）。
+export interface NovelWorkbenchVolumeDto {
+  no: number;
+  name: string;
+  chars: number;
+  current: boolean;
+}
+
+// get_novel_workbench 的近期字数项。date 为 YYYY-MM-DD，words 为当天字数；
+// 口径是章节文件 mtime 落在该天（不是提交时间），固定 7 项、按日期升序。
+export interface NovelWorkbenchDailyDto {
+  date: string;
+  words: number;
+}
+
+// get_novel_workbench 聚合快照：一次只读扫描设定库四张表（伏笔 / 角色 / 卷纲）
+// 与近 7 天字数，供「小说工作台」页签渲染。非小说项目返回
+// { is_novel: false }，扫描异常时额外带 error（与 NovelStatusDto 同风格），
+// 此时四个数组不下发，前端按空数组兜底。
+export interface NovelWorkbenchDto {
+  is_novel: boolean;
+  error?: string;
+  foreshadows?: NovelWorkbenchForeshadowDto[];
+  characters?: NovelWorkbenchCharacterDto[];
+  volumes?: NovelWorkbenchVolumeDto[];
+  recent_daily?: NovelWorkbenchDailyDto[];
+}
+
+// read_novel_doc 读取设定文档结果。成功 { ok: true, text, chars, path }：
+// text 为文档全文（UTF-8），chars 与 novel_status 同口径字数，path 为相对
+// 项目根的 posix 路径；失败 { ok: false, error }（文档不存在 / 不可读 /
+// 越出项目根），前端据此显示错误文本。
+export interface NovelDocReadDto {
+  ok: boolean;
+  error?: string;
+  text?: string;
+  chars?: number;
+  path?: string;
+}
+
+// novel_audit 的单条结论（core.novel_service.novel_audit 五项只读检查）。
+// level 是分级 S1~S4（S1 最高：状态断链、S2 伏笔超期、S3 进度/字数风险、
+// S4 风格提示），type 为检查项名（tracking_state / foreshadow_overdue /
+// chapter_wordcount / outline_gap / ai_patterns），file 为相对项目根的 posix
+// 路径，message 是后端给出的可直接展示的中文结论。
+export interface NovelAuditFindingDto {
+  level: string;
+  type: string;
+  file: string;
+  message: string;
+}
+
+// novel_audit 的跳过项：某项前置素材缺失（如没有细纲文件）或检查器抛错时，
+// 只把该检查记进 skipped，不影响其余检查；check 为检查项名，reason 为后端
+// 给出的跳过原因文本（如「没有细纲」「正文缺失」）。
+export interface NovelAuditSkippedDto {
+  check: string;
+  reason: string;
+}
+
+// run_novel_audit 返回快照（只读体检，不写文件、不跑子进程）。成功时 ok=true，
+// scope 为 chapter / all，findings 为逐条结论，summary 是 S1..S4 四个等级的计数
+// （键固定四态，缺项按 0 展示），skipped 是单项前置缺失时的跳过原因；非小说项目
+// 回 { is_novel:false }，参数非法或读取失败回 ok=false 且带 error。
+export interface NovelAuditDto {
+  is_novel?: boolean;
+  ok?: boolean;
+  scope?: string;
+  findings?: NovelAuditFindingDto[];
+  summary?: Record<string, number>;
+  skipped?: NovelAuditSkippedDto[];
+  error?: string;
+}
+
+// get_novel_chapter 单章正文（章节编辑器用）。只读接口：ok=false 时带 error
+// （非小说项目 / 章节不存在 / 正文不可读），前端据此显示错误文本。
+// path 是相对项目根的 posix 路径，visible_chars 与 novel_status 同口径。
+export interface NovelChapterDto {
+  ok: boolean;
+  error?: string;
+  chapter?: number;
+  path?: string;
+  content?: string;
+  visible_chars?: number;
+}
+
+// save_novel_chapter 保存结果。章节必须已存在（本接口不新建章节），
+// visible_chars 为保存后按同一口径重算的字数，前端用它更新该章字数。
+export interface NovelChapterSaveDto {
+  ok: boolean;
+  error?: string;
+  chapter?: number;
+  path?: string;
+  visible_chars?: number;
+}
+
+// list_novel_projects 单个小说项目（多书切换用）。path 是相对工作区的 posix
+// 路径，工作区自身（.novel.json 在根目录）为 "."；chapters_written 只给章数，
+// 不逐章读正文（只读扫描，快）。
+export interface NovelProjectDto {
+  path: string;
+  title: string;
+  chapters_written: number;
+}
+
+// list_novel_projects 结果：工作区不是小说项目时 projects 为空数组而非报错，
+// root 为扫描起点；目录不存在 / 读写异常时 ok=false 且带 error。
+export interface NovelProjectListDto {
+  ok: boolean;
+  error?: string;
+  root?: string;
+  projects?: NovelProjectDto[];
+}
+
+// export_novel 结果：产物落在 {项目}/导出/{书名}.{fmt}，chapters 为导出章数、
+// visible_chars 为按 novel_status 同口径统计的字数；失败时 ok=false 且带 error。
+export interface NovelExportDto {
+  ok: boolean;
+  error?: string;
+  path?: string;
+  chapters?: number;
+  visible_chars?: number;
+}
+
 // 后端所有方法均返回 Promise<纯 JSON 对象>；大多数写操作的返回值形状
 // 为 { ok: boolean, msg?: string, ...其余按方法而定 }，此处以 any 承接，
 // 具体字段读取处自行按契约文档取用，避免过度约束导致类型摩擦。
@@ -1256,6 +1640,37 @@ export interface PyWebViewAPI {
   // 纯选目录：弹原生文件夹对话框只返回路径，不切换工作区（自动化任务表单用）
   pick_folder_dialog(): Promise<{ ok: boolean; path?: string; msg?: string }>;
   get_workspace_state(workdir: string): Promise<any>;
+  // 小说工作台状态（只读扫描，不写文件、不轮询）；非小说项目 is_novel=false
+  get_novel_status(workdir: string): Promise<NovelStatusDto>;
+  // 读取单章正文（chapter 支持章号或正文文件名），供右侧「小说」页签内直接编辑
+  get_novel_chapter(workdir: string, chapter: number | string): Promise<NovelChapterDto>;
+  // 覆盖保存单章正文（UTF-8 + LF，走按回合撤销的写文件封装）；
+  // 章节不存在时报错而不新建
+  save_novel_chapter(
+    workdir: string,
+    chapter: number | string,
+    content: string,
+  ): Promise<NovelChapterSaveDto>;
+  // 列出工作区内的小说项目（多书切换数据源）：只读扫描 .novel.json，不逐章
+  // 读正文；工作区自身不是小说项目时 projects 为空数组，不算错误
+  list_novel_projects(workdir: string): Promise<NovelProjectListDto>;
+  // 导出全书正文为单文件：fmt 只接受 'md' | 'txt'，产物落在 {项目}/导出/，
+  // 成功回带 path / chapters / visible_chars，失败回 { ok:false, error }
+  export_novel(workdir: string, fmt: 'md' | 'txt'): Promise<NovelExportDto>;
+  // 小说工作台聚合（只读扫描，不写文件、不轮询）：一次读回伏笔 / 角色 / 卷纲
+  // 三张设定表 + 近 7 天字数；非小说项目回 { is_novel:false }，异常回 error
+  get_novel_workbench(workdir: string): Promise<NovelWorkbenchDto>;
+  // 读取项目内设定文档（rel_path 为相对项目根的 posix 路径）：
+  // 成功回 { ok:true, text, chars, path }，失败回 { ok:false, error }
+  read_novel_doc(workdir: string, rel_path: string): Promise<NovelDocReadDto>;
+  // 确定性体检（只读五项检查，不写文件）：scope 只接受 'chapter' | 'all'，
+  // chapter 在 scope='chapter' 时指定章号（缺省 = 最新已写章节）；成功回
+  // { ok:true, scope, findings, summary, skipped }，失败回 { ok:false, error }
+  run_novel_audit(
+    workdir: string,
+    scope?: 'chapter' | 'all',
+    chapter?: number | string,
+  ): Promise<NovelAuditDto>;
   get_sessions(): Promise<SessionGroup[]>;
   create_session(title?: string, workdir?: string): Promise<any>;
   // 秘书会话：与 create_session 的"首条消息才懒落库"不同，它立即落库并切为当前
@@ -1367,6 +1782,12 @@ export interface PyWebViewAPI {
   stop_computer_control(runId: string): Promise<ComputerControlResult>;
   // Provider 强制安全检查确认：官方契约验证完成前固定不可用（Task 11b 条件）
   acknowledge_computer_safety(runId: string, checkIds?: string[]): Promise<ComputerControlResult>;
+  // Playwright 按需组件（设置页「浏览器操控组件」卡片）：安装包不再内置 Playwright，
+  // 三个接口都回传最新组件状态快照，前端只以快照校准 Store；
+  // 下载进度另走 playwright_component_progress 桥事件（payload 见 appStore.handleBridgeEvent）
+  get_playwright_component_status(): Promise<{ ok: boolean; msg?: string; component: PlaywrightComponentStatus }>;
+  download_playwright_component(): Promise<{ ok: boolean; msg?: string; component: PlaywrightComponentStatus }>;
+  cancel_playwright_component_download(): Promise<{ ok: boolean; msg?: string; component: PlaywrightComponentStatus }>;
   get_permission_rules(): Promise<any>;
   add_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
   remove_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
@@ -1376,6 +1797,9 @@ export interface PyWebViewAPI {
   respond_permission_choice(requestId: string, choiceIndex: number, customText?: string): Promise<any>;
 
   send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string, modelId?: string, permissionMode?: string): Promise<any>;
+  /** 编辑已发送的用户消息：后端截断该条及其之后的历史，成功后由前端重发（文件改动不回滚）。
+   *  interrupt 默认 true：回合在跑时先停止并等它退出再截断（编辑即打断）。 */
+  edit_user_message(sessionName: string, msgId: number, newText: string, interrupt?: boolean): Promise<{ ok: boolean; msg?: string; removed?: number; session_name?: string }>;
   // 客户端本地提示（notice/error 卡片）经桥广播到全部客户端（桌面 + 手机端）；
   // 各端收到 notice 桥事件后统一回环插入，提示为瞬态、不落历史
   post_notice(message: string, sessionName?: string, kind?: 'notice' | 'error'): Promise<any>;
@@ -1402,6 +1826,15 @@ export interface PyWebViewAPI {
   run_automation_task_now(taskId: string): Promise<{ ok: boolean; run_id?: string; msg?: string }>;
   get_automation_runs(taskId?: string, limit?: number): Promise<{ ok: boolean; runs?: AutomationRunInfo[]; msg?: string }>;
   clear_automation_runs(taskId: string): Promise<{ ok: boolean; msg?: string }>;
+  // 星流工作流：workspaceRoot 为当前会话工作目录（项目档遮蔽全局档）
+  get_workflows(workspaceRoot?: string): Promise<{ ok: boolean; workflows?: WorkflowInfo[]; invalid?: WorkflowInvalidInfo[]; msg?: string }>;
+  get_workflow_detail(name: string, workspaceRoot?: string): Promise<{ ok: boolean; workflow?: WorkflowInfo & { body?: string }; msg?: string }>;
+  pick_workflow_files(): Promise<{ ok: boolean; paths?: string[]; msg?: string }>;
+  import_workflows(paths: string[], workspaceRoot?: string, scope?: 'project' | 'user', overwrite?: boolean): Promise<{ ok: boolean; imported?: Array<{ name: string; scope: string; path: string }>; failed?: Array<{ name: string; error: string; exists?: boolean }>; msg?: string }>;
+  save_workflow(payload: { name: string; description: string; when_to_use?: string; args?: Record<string, WorkflowArgDecl>; body: string; scope: 'project' | 'user'; overwrite?: boolean; workspace_root?: string }): Promise<{ ok: boolean; name?: string; errors?: string[]; msg?: string }>;
+  delete_workflow(name: string, scope: 'project' | 'user', workspaceRoot?: string): Promise<{ ok: boolean; msg?: string }>;
+  get_workflow_runs(name?: string, limit?: number): Promise<{ ok: boolean; runs?: WorkflowRunInfo[]; msg?: string }>;
+  clear_workflow_runs(name: string): Promise<{ ok: boolean; msg?: string }>;
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
   trust_plugin(name: string): Promise<any>;
@@ -1425,6 +1858,13 @@ export interface PyWebViewAPI {
   delete_hook(sourcePath: string, digest: string): Promise<{ ok: boolean; msg?: string; hooks?: HookInfo[]; workdir?: string }>;
   set_hook_disabled(sourcePath: string, digest: string, disabled: boolean): Promise<{ ok: boolean; msg?: string; hooks?: HookInfo[]; workdir?: string }>;
   get_mcp_servers(): Promise<McpInfo[]>;
+  // 只读：返回全部内置斜杠命令的元数据（无副作用，异常时回 {ok:false,msg}）
+  list_slash_commands(): Promise<{ ok: boolean; commands?: SlashCommandInfo[]; msg?: string }>;
+  // /goal 目标状态（GoalBar 数据源）：无目标时 state=null；会话名缺省用当前会话
+  get_goal_state(sessionName?: string): Promise<{ ok: boolean; state?: GoalStateInfo | null; msg?: string }>;
+  // /goal 的停止/继续：复用 /goal stop、/goal resume 的语义，成功后前端重拉状态
+  goal_stop(sessionName?: string): Promise<{ ok: boolean; msg?: string }>;
+  goal_resume(sessionName?: string): Promise<{ ok: boolean; msg?: string }>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
   remove_mcp_server(name: string): Promise<any>;
@@ -1444,10 +1884,16 @@ export interface PyWebViewAPI {
   preview_turn_undo_recovery(sessionName: string, operationId: string, action: 'continue_revert' | 'cancel_revert'): Promise<TurnUndoRecoveryPreviewResponse>;
   execute_turn_undo_recovery(sessionName: string, operationId: string, action: 'continue_revert' | 'cancel_revert', previewToken: string): Promise<TurnUndoRecoveryExecuteResponse>;
 
+  // 断点续跑（S4）：开关关闭时后端回 {ok:false,reason:'disabled'}，前端据此不显示入口
+  resume_plan(sessionName: string): Promise<ResumePlanResponse>;
+  resume_execute(sessionName: string, confirmed?: number[]): Promise<ResumeExecuteResponse>;
+
   read_file_preview(path: string): Promise<any>;
   check_paths_kind(paths: string[]): Promise<Array<{ path: string; kind: 'file' | 'dir' | 'missing' }>>;
   open_path(path: string): Promise<any>;
   open_folder_in_explorer(path: string): Promise<any>;
+  // Office 转 PDF 预览：首次会拉起 Office 进程（十几秒），结果按源文件 mtime 缓存
+  preview_office_doc(path: string): Promise<any>;
   // 侧栏排序快照：权威副本在数据目录 ui_layout.json，localStorage 只是缓存
   // （WebView2 的 localStorage 在"拖完立刻重启"时会被 leveldb 丢弃）
   get_ui_layout(): Promise<{ ok: boolean; group_order?: string[]; session_order?: Record<string, string[]>; msg?: string }>;
@@ -1580,8 +2026,12 @@ export interface PyWebViewAPI {
   // rect 为 DOM 占位区的 CSS px 矩形；url 为空串表示只创建/定位、不导航。
   // 非 Windows 或缺桥时统一返回 {ok:false,error:'unsupported_platform'}。
   // ---------------------------------------------------------------------------
-  browser_pane_open(rect: EmbeddedBrowserRect, url?: string): Promise<EmbeddedBrowserPaneResult>;
-  browser_pane_set_bounds(rect: EmbeddedBrowserRect): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_open(rect: EmbeddedBrowserRect, url?: string, zoom?: number, sessionName?: string): Promise<EmbeddedBrowserPaneResult>;
+  // 只登记「该会话要打开这个地址」，不创建/移动原生控件（真实矩形由界面测量）
+  browser_pane_assign(url?: string, sessionName?: string): Promise<EmbeddedBrowserPaneResult>;
+  // 切会话时把原生控件归属切到目标会话，并回放该会话待加载的地址
+  browser_pane_set_active_session(sessionName?: string): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_set_bounds(rect: EmbeddedBrowserRect, zoom?: number, sessionName?: string): Promise<EmbeddedBrowserPaneResult>;
   browser_pane_navigate(url: string): Promise<EmbeddedBrowserPaneResult>;
   browser_pane_back(): Promise<EmbeddedBrowserPaneResult>;
   browser_pane_forward(): Promise<EmbeddedBrowserPaneResult>;

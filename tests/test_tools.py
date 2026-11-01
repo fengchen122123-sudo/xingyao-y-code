@@ -2443,8 +2443,8 @@ def test_subagent_result_keeps_only_text_after_last_tool_call(monkeypatch):
 
 def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
     """回归：未显式传 timeout_seconds 时按角色解析默认超时
-    （explore 240 / review 300 / test 480 / implement、general 600）。
-    只读子代理的设计目标是快，不能默认给 10 分钟。"""
+    （explore 300 / review 420 / test、implement、general 900）。
+    只读子代理的设计目标是快，预算仍明显低于写代码/跑测试角色。"""
     import core.tools as tools_module
 
     captured = {}
@@ -2457,8 +2457,8 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
     monkeypatch.setattr(tools_module, "subagent_manager", _FakeManager())
 
     for role, expected in [
-        ("explore", 240), ("review", 300), ("test", 480),
-        ("implement", 600), ("general", 600), ("custom-agent", 600),
+        ("explore", 300), ("review", 420), ("test", 900),
+        ("implement", 900), ("general", 900), ("custom-agent", 900),
     ]:
         captured.clear()
         tools_module.run_subagent(
@@ -2467,7 +2467,15 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
         )
         assert captured["timeout_seconds"] == expected, role
 
-    # 显式传入时以显式值为准，但受前台硬上限 600 秒约束（Task 8）
+    # 后台任务不阻塞用户，默认预算按系数放宽（explore 300 × 1.5 = 450）
+    captured.clear()
+    tools_module.run_subagent(
+        "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
+        subagent_type="explore", run_in_background=True,
+    )
+    assert captured["timeout_seconds"] == 450
+
+    # 显式传入时以显式值为准（后台不放大），但受前台硬上限约束
     captured.clear()
     tools_module.run_subagent(
         "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
@@ -2477,7 +2485,7 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
     captured.clear()
     tools_module.run_subagent(
         "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
-        subagent_type="explore", timeout_seconds=601,
+        subagent_type="explore", timeout_seconds=901,
     )
     assert "timeout_seconds" not in captured
 
@@ -4373,7 +4381,7 @@ def test_run_subagent_rejects_oversized_description(monkeypatch):
 
 
 def test_run_subagent_enforces_foreground_hard_timeout(monkeypatch):
-    """前台子代理硬上限 600 秒：内部调用传 601 返回参数错误，不启动子代理。"""
+    """前台子代理硬上限 900 秒：内部调用传 901 返回参数错误，不启动子代理。"""
     import core.tools as tools_module
 
     class UnusedManager:
@@ -4382,11 +4390,11 @@ def test_run_subagent_enforces_foreground_hard_timeout(monkeypatch):
 
     monkeypatch.setattr(tools_module, "subagent_manager", UnusedManager())
     result = tools_module.run_subagent(
-        "长任务", parent_session="s", parent_turn_id="t", timeout_seconds=601,
+        "长任务", parent_session="s", parent_turn_id="t", timeout_seconds=901,
     )
     payload = json.loads(result)
     assert payload["status"] == "failed"
-    assert "600" in payload["error"]
+    assert "900" in payload["error"]
     assert "manage_task" in payload["error"]
 
 
@@ -4662,3 +4670,94 @@ def test_truncate_subagent_result_keeps_warning_footer():
 
     # 未超长原样返回
     assert _truncate_subagent_result("short", 16000, "省略 {omitted}") == "short"
+
+# ── 子代理时间预算：软着陆提醒与超时交付增强 ──────────────────────────────
+
+
+def test_subagent_budget_notice_thresholds_and_dedup():
+    """预算提醒按 25% / 10% 两级触发，同一级别只发一次；不越级重复轰炸。"""
+    from core.tools import build_subagent_budget_notice
+
+    # 预算充足：不提醒
+    assert build_subagent_budget_notice(600, 600, 0) == (0, None)
+    assert build_subagent_budget_notice(151, 600, 0) == (0, None)
+
+    # 跨过 25%（max(90, 150) = 150）：收尾提醒，级别 1
+    level, text = build_subagent_budget_notice(150, 600, 0)
+    assert level == 1
+    assert "时间预算提醒" in text and "600s" in text and "150s" in text
+
+    # 级别 1 已发：同一阈值不再重复
+    assert build_subagent_budget_notice(140, 600, 1) == (1, None)
+
+    # 跨过 10%（max(45, 60) = 60）：终止提醒，级别 2
+    level, text = build_subagent_budget_notice(60, 600, 1)
+    assert level == 2
+    assert "时间预算即将耗尽" in text
+
+    # 级别 2 已发：不再提醒
+    assert build_subagent_budget_notice(20, 600, 2) == (2, None)
+
+    # 短预算任务：10% 阈值有 45s 下限，30s 直接进终止提醒
+    level, text = build_subagent_budget_notice(30, 300, 0)
+    assert level == 2 and "即将耗尽" in text
+
+    # 非法输入不抛异常
+    assert build_subagent_budget_notice(0, 0, 0) == (0, None)
+    assert build_subagent_budget_notice("bad", 600, 0) == (0, None)
+
+
+def test_subagent_timeout_failure_text_delivers_partial_and_progress():
+    """超时交付：部分产出按完整上限给到主 Agent，并附进度与"不要重做"指引。"""
+    from core.tools import (
+        SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS,
+        SubagentManager,
+        SubagentTask,
+    )
+
+    manager = SubagentManager(runner=lambda record: "")
+    task = SubagentTask(
+        task_id="subagent-test",
+        parent_session="s",
+        parent_turn_id="t",
+        description="大改造",
+        subagent_type="implement",
+        status="timed_out",
+        stage="tool",
+        timeout_seconds=900,
+        execution_elapsed=900.0,
+        approval_wait_elapsed=3.0,
+        tool_success_count=7,
+        partial_result="已完成一半的改动说明\n" * 2000,
+    )
+    text = manager._format_failure_text(task)
+
+    assert "进度: 阶段 tool / 工具成功 7 次" in text
+    assert "预算 900s" in text
+    assert "不要从头重做" in text
+    assert "部分产出已截断" in text
+    # 交付量必须接近最终结果上限，而不是旧的 1500 字符
+    assert len(text) > 10000
+    assert len(text) < len(task.partial_result)
+
+
+def test_subagent_timeout_without_partial_still_guides_direct_completion():
+    from core.tools import SubagentManager, SubagentTask
+
+    manager = SubagentManager(runner=lambda record: "")
+    task = SubagentTask(
+        task_id="subagent-empty",
+        parent_session="s",
+        parent_turn_id="t",
+        description="空任务",
+        subagent_type="explore",
+        status="timed_out",
+        stage="tool",
+        timeout_seconds=300,
+        execution_elapsed=300.0,
+    )
+    text = manager._format_failure_text(task)
+
+    # 无部分产出时引导直接用自身工具完成，而不是"接着 partial 做"
+    assert "直接用自身工具完成" in text
+    assert "不要从头重做" not in text

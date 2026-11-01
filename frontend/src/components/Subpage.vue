@@ -174,9 +174,28 @@
         </div>
       </div>
 
-      <!-- 星轨自动化任务页 -->
-      <div v-else-if="subType === 'automations'" class="automations-page">
-        <AutomationPane />
+      <!-- 星轨：自动化任务 + 工作流 双标签页（参考 ZCode 的 Automations 页签形态） -->
+      <div v-else-if="subType === 'automations' || subType === 'workflows'" class="auto-page">
+        <div class="auto-tabs" role="tablist" aria-label="星轨页签" data-test="auto-tabs">
+          <button
+            class="seg-btn"
+            :class="{ active: subType === 'automations' }"
+            role="tab"
+            :aria-selected="subType === 'automations'"
+            data-test="auto-tab-automations"
+            @click="switchAutoTab('automations')"
+          >星轨</button>
+          <button
+            class="seg-btn"
+            :class="{ active: subType === 'workflows' }"
+            role="tab"
+            :aria-selected="subType === 'workflows'"
+            data-test="auto-tab-workflows"
+            @click="switchAutoTab('workflows')"
+          >星流</button>
+        </div>
+        <AutomationPane v-if="subType === 'automations'" />
+        <WorkflowPane v-else />
       </div>
 
       <!-- 模型管理页 -->
@@ -276,6 +295,7 @@
 import { computed, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import AutomationPane from './AutomationPane.vue';
+import WorkflowPane from './WorkflowPane.vue';
 import { useAppStore, type SubpageType } from '../stores/appStore';
 import type { SkillInfo, McpInfo, ModelInfo, PluginInfo } from '../types/pywebview';
 import { parseModelTestError } from '../utils/errorParser';
@@ -292,14 +312,14 @@ const title = computed(() => {
   if (props.subType === 'skills') return '星盘';
   if (props.subType === 'mcp') return '星桥';
   if (props.subType === 'plugins') return '星匣';
-  if (props.subType === 'automations') return '星轨';
+  if (props.subType === 'automations' || props.subType === 'workflows') return '星轨';
   return '模型管理';
 });
 const desc = computed(() => {
   if (props.subType === 'skills') return '已扫描的项目技能与用户扩展技能';
   if (props.subType === 'mcp') return '来自 mcp.json 的服务接口';
   if (props.subType === 'plugins') return '与 CLI 共用同一份 plugin.json 配置，开关状态两端同步';
-  if (props.subType === 'automations') return '定时触发的星轨自动化回合，仅星瑶运行期间生效';
+  if (props.subType === 'automations' || props.subType === 'workflows') return '定时触发的星轨自动化回合；工作流保存在项目里，填好参数就能再跑一次';
   return '管理模型供应商与可用模型列表';
 });
 
@@ -456,19 +476,27 @@ function pluginStatusText(p: PluginInfo) {
 }
 
 
-// 打开 MCP / 插件 / 自动化页时刷新一次最新状态
+// 打开 MCP / 插件 / 自动化页时刷新一次最新状态；星轨/星流双标签共用一个
+// 子页，切换或打开任一标签都同时刷新两侧数据（两侧各自幂等，开销可忽略）
 watch(
   () => [props.visible, props.subType] as const,
   ([visible, type]) => {
-    if (visible && type === 'mcp') {
+    if (!visible) return;
+    if (type === 'mcp') {
       store.refreshMcpServers();
-    } else if (visible && type === 'plugins') {
+    } else if (type === 'plugins') {
       store.refreshPlugins();
-    } else if (visible && type === 'automations') {
+    } else if (type === 'automations' || type === 'workflows') {
       store.refreshAutomations();
+      store.refreshWorkflows();
     }
   }
 );
+
+// 星轨/星流标签切换：换 subType 而不关子页（openSubpage 是幂等置值）
+function switchAutoTab(tab: 'automations' | 'workflows') {
+  store.openSubpage(tab);
+}
 
 // ---- 模型管理：添加供应商 ----
 const newProvider = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
@@ -647,6 +675,42 @@ async function testModelRow(m: ModelInfo) {
 }
 .toolbar-spacer {
   flex: 1;
+}
+/* 星轨/星流双标签页签（复用技能页 .seg-btn 分段外观，置于内容区顶部） */
+.auto-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.auto-tabs {
+  display: inline-flex;
+  align-items: center;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+  align-self: flex-start;
+}
+.auto-tabs .seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: 0.15s;
+  font-family: inherit;
+}
+.auto-tabs .seg-btn:hover {
+  color: var(--text);
+}
+.auto-tabs .seg-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
 }
 /* 技能 / MCP / 插件三页共用的关键词搜索框（与钩子页 .hook-search 同款外观） */
 .sub-search {

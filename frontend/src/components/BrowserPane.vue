@@ -63,6 +63,18 @@
         @input="onAddrInput"
         @keydown="onAddrKeydown"
       />
+
+      <!-- 浏览器操控的紧急停止：target=browser 时顶部安全条不渲染，停止入口
+           收进工具栏，失控时仍能一键停止（快捷键 Ctrl+Alt+Esc 同样可用） -->
+      <button
+        v-if="store.computerRunIsBrowser && !store.computerRunTerminal"
+        class="bp-btn bp-btn-stop"
+        data-test="bp-computer-stop"
+        title="停止当前浏览器操控（快捷键 Ctrl+Alt+Esc）"
+        @click="stopBrowserControl"
+      >
+        <AppIcon name="square" :size="13" :stroke-width="2" />
+      </button>
     </div>
 
     <!-- 自由尺寸菜单：预设 + 自定义宽高。打开期间宿主 hide 原生表面，
@@ -145,6 +157,14 @@
         <AppIcon name="loader" :size="22" :class="{ 'icon-spin': true }" />
       </div>
 
+      <!-- Office 文档转 PDF 进行中：优先于起始页/空态显示。首次转换要拉起
+           Office（10~25 秒），没有这个提示用户会以为点击没生效、反复点 -->
+      <div v-else-if="officePending" class="bp-notice" data-test="bp-office-pending">
+        <AppIcon name="loader" :size="22" :class="{ 'icon-spin': true }" />
+        <p class="bp-notice-title">正在把 {{ officePending.name }} 转换成预览页</p>
+        <p class="bp-notice-sub">首次转换需要 10~25 秒，之后会命中缓存</p>
+      </div>
+
       <!-- 起始页：没有页面时显示（此时原生表面被 hide，让出 DOM 起始页） -->
       <div v-else-if="isStartPage" class="bp-start" data-test="bp-start">
         <p class="bp-start-title">内置浏览器</p>
@@ -179,6 +199,12 @@ import { useEmbeddedBrowserSurface } from '../composables/useEmbeddedBrowserSurf
 const props = defineProps<{ active: boolean }>();
 
 const store = useAppStore();
+
+// 浏览器操控的紧急停止：target=browser 时顶部安全条不渲染，停止入口收到
+// 工具栏（computerRunIsBrowser && !computerRunTerminal 时才显示）。
+function stopBrowserControl(): void {
+  void store.stopComputerControl();
+}
 
 const QUICK_SITES = [
   { key: 'baidu', label: '百度', url: 'https://www.baidu.com' },
@@ -258,6 +284,11 @@ const isStartPage = computed(() => {
   return isBlankUrl(String(store.embeddedBrowser.url || '')) && !store.embeddedBrowser.loading;
 });
 
+// Office 文档转 PDF 进行中的提示对象（{path,name} | null）：模板据此显示
+// 「正在把 xxx 转换成预览页」浮层，并让原生表面暂时让位（原生控件绘制在
+// DOM 之上，否则浮层会被已打开的页面盖住）
+const officePending = computed(() => store.officePreviewPending);
+
 const surfaceRef = ref<HTMLElement | null>(null);
 
 // ── 自由尺寸（自定义视口 · 适应窗口）──
@@ -287,7 +318,8 @@ const customH = ref<number | ''>(800);
 const frameRef = ref<HTMLElement | null>(null);
 
 const frameRenderable = computed(
-  () => freeSize.value.on && !unsupported.value && !bridgeWaiting.value && !isStartPage.value,
+  () => freeSize.value.on && !unsupported.value && !bridgeWaiting.value
+    && !isStartPage.value && !officePending.value,
 );
 const sizeLabel = computed(() =>
   freeSize.value.on ? `${freeSize.value.w} × ${freeSize.value.h}` : '适配面板',
@@ -329,6 +361,9 @@ const surface = useEmbeddedBrowserSurface({
     !store.rightPanelSnipActive &&
     !unsupported.value &&
     !sizeMenuOpen.value &&
+    // Office 转 PDF 期间先把原生表面收起：原生控件永远画在 DOM 之上，
+    // 否则「正在转换」浮层会被上一页盖住（转换结束/失败后自动 re-show）
+    !store.officePreviewPending &&
     (!isStartPage.value || !!store.embeddedBrowser.automationViewport),
   // 自由尺寸模式下量「视口框」而非整块表面
   getSurfaceEl: () => frameRef.value || surfaceRef.value,
@@ -427,9 +462,18 @@ function goTo(url: string) {
 // 点击 html 在任何宿主上都落得了地，不会「点了没反应」。
 const pendingExternalUrl = ref('');
 
+// 已消费的请求 nonce：页签激活/面板展开会再次触发消费，靠它避免重复导航
+let consumedNavNonce = 0;
+
 function consumeBrowserNavRequest() {
   const req = store.browserNavRequest;
   if (!req || !req.url) return;
+  // 页签未激活（面板折叠/停在别的页签）：等 active 变 true 再消费，
+  // 否则会对着 0 尺寸占位区 open，导航被丢弃
+  if (!props.active) return;
+  // 别的会话的导航请求不在当前视图消费：切到该会话时由 active 变化再触发
+  if (req.session && req.session !== store.currentSessionName) return;
+  if (store.browserNavNonce === consumedNavNonce) return;
   if (unsupported.value) {
     // path 为空 = 不是本地文件请求（如账号控制台页面）：回退系统浏览器，
     // 否则 openFilePreview('') 只会弹一个读文件失败的错，点了等于没反应
@@ -446,11 +490,16 @@ function consumeBrowserNavRequest() {
     pendingExternalUrl.value = req.url;
     return;
   }
+  consumedNavNonce = store.browserNavNonce;
   goTo(req.url);
 }
 
 // nonce 变化 = 新的导航请求（同一文件重复点击也会自增，watch 必触发）
 watch(() => store.browserNavNonce, consumeBrowserNavRequest);
+// 页签/面板激活：消费挂起期间到达的请求（切回会话时回放的 pending URL 走这条）
+watch(() => props.active, (active) => {
+  if (active) consumeBrowserNavRequest();
+});
 
 // ── 工具栏按钮 ──
 function onBack() { surface.request('browser_pane_back'); }

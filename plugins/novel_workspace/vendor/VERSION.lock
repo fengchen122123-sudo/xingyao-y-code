@@ -1,0 +1,18 @@
+{
+  "source": "https://github.com/zenstory-ai/oh-story-claudecode",
+  "commit": "70d1cf426f8cbe3d374e2b06e4c2cbdbd986da06",
+  "skill": "story-long-write",
+  "skill_version": "1.0.0",
+  "fetched_at": "2026-10-28T08:17:40Z",
+  "notes": [
+    "脚本取自本机已安装的技能包 ~/.agents/skills/story-long-write/scripts/（SKILL.md 声明 version 1.0.0）；commit 是取 LICENSE 时上游 main 的 HEAD（v0.9.1），本机快照未与之一一比对。",
+    "tracking_commit.py 通过 __file__ 同目录加载 wordcount_core.py，因此两者必须同目录一起 vendor。",
+    "outline_view.py 与 wordcount_core.py 只依赖标准库；未 vendor storyctl.py、build_writer_prompt.py 与 Node 脚本。",
+    "升级流程：重新复制脚本后重算 sha256 并更新本文件，人工比对 diff。"
+  ],
+  "files": {
+    "outline_view.py": "46e54ee1231dd87c7d3188ecb2356cacd4ea2fcb061e082b6d95e464e837bcc2",
+    "tracking_commit.py": "91476a0e66d16f163ded9d58eef59518336f25ee5b2c569f8cae7950df864f4d",
+    "wordcount_core.py": "287f7e629adbdd47d8c65a5b83b5d186f9249c029f0bc6b5d721b139f2cb05bb"
+  }
+}

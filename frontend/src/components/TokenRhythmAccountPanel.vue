@@ -15,7 +15,7 @@
     <div class="tr-acc-head">
       <span class="tr-acc-avatar" data-test="tr-acc-avatar">{{ avatarText }}</span>
       <span class="tr-acc-meta">
-        <b class="tr-acc-name" data-test="tr-acc-name">{{ displayName }}</b>
+        <b class="tr-acc-name" data-test="tr-acc-name" :title="displayNameFull">{{ displayName }}</b>
         <span class="tr-acc-account" data-test="tr-acc-account">{{ accountText }}</span>
       </span>
       <!-- 官网入口：与「充值」同一套打开逻辑（右栏内嵌浏览器，不支持时回退系统浏览器） -->
@@ -32,7 +32,17 @@
     <div v-if="loading" class="tr-acc-state" data-test="tr-acc-loading">正在加载…</div>
     <div v-else-if="error" class="tr-acc-state">
       <p class="tr-acc-error" data-test="tr-acc-error">{{ error }}</p>
-      <button class="tr-acc-retry" type="button" data-test="tr-acc-retry" @click="retry()">重试</button>
+      <div class="tr-acc-actions">
+        <!-- 登录态失效：面板内直接给登录入口，不必再让用户去找左下角用户卡片 -->
+        <button
+          v-if="isLoginExpiredError(error)"
+          class="tr-acc-retry"
+          type="button"
+          data-test="tr-acc-relogin"
+          @click="relogin()"
+        >重新登录</button>
+        <button class="tr-acc-retry" type="button" data-test="tr-acc-retry" @click="retry()">重试</button>
+      </div>
     </div>
 
     <!-- 数据区：余额 / 今日用量 -->
@@ -107,6 +117,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { shortLabel } from '../utils/shortLabel';
+import { isLoginExpiredError } from '../utils/loginExpired';
 
 const store = useAppStore();
 
@@ -259,7 +271,8 @@ const accountText = computed(() => {
   return PLACEHOLDER;
 });
 
-const displayName = computed(() => {
+/** 完整账号名：悬停气泡用（浮层标题位置窄，超长名会被 CSS 硬切） */
+const displayNameFull = computed(() => {
   const named = String(user.value.name || user.value.nickname || '').trim();
   if (named) return named;
   if (rawPhone.value) return maskPhone(rawPhone.value);
@@ -267,10 +280,20 @@ const displayName = computed(() => {
   return '基元律动账号';
 });
 
+/** 展示名：超过 6 个字符取前 6 个 + 省略号（与厂商名的截断口径保持一致） */
+const displayName = computed(() => shortLabel(displayNameFull.value));
+
 const avatarText = computed(() => displayName.value.slice(0, 1).toUpperCase() || '律');
 
 function retry() {
   void store.refreshTrOverview();
+}
+
+// 登录过期：面板本身依赖登录态，留着只会继续报错——先收起再拉起登录窗
+function relogin() {
+  store.closeTrAccountPanel();
+  store.openTrLoginModal();
+  void store.refreshTrAuth();
 }
 
 async function logout() {
@@ -453,6 +476,11 @@ onBeforeUnmount(() => {
   font-size: 12px;
   line-height: 1.6;
   word-break: break-word;
+}
+.tr-acc-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
 }
 .tr-acc-retry {
   height: 26px;

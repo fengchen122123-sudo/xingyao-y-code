@@ -46,6 +46,7 @@ from core.media_server import media_server
 from core.media_store import archive_media_file
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
+from core import novel_service
 from core import secretary
 from core.secretary_dispatch import SecretaryDispatchError
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
@@ -53,6 +54,7 @@ from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_
 from gui_git_mixin import GitBridgeMixin
 from gui_browser_mixin import BrowserBridgeMixin
 from gui_snip_mixin import SnipBridgeMixin
+from gui_canvas_mixin import CanvasBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -125,11 +127,12 @@ _MONITOR_DEFAULTTONEAREST = 2
 HISTORY_PAGE_SIZE = 50
 
 # 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu，
-# 手机端 MCP 客户端（阶跃 Amoo 等）经局域网 MCP 服务投递 = mcp。
+# 手机端 MCP 客户端（阶跃 Amoo 等）经局域网 MCP 服务投递 = mcp，
+# /goal 目标模式自动续跑的回合 = goal（由桥自己注入，用户正文无法伪造）。
 # 由入口层注入，模型/用户正文无法设置（send_user_message 校验后拒绝非法值）。
 # 与 core.llm.COMPUTER_TURN_SOURCES 必须保持一致——低层还会再校验一次来源，
 # 两处不一致会让新来源的回合在模型请求处直接抛错（有测试断言两者相等）。
-TURN_SOURCES = ("local", "lan", "feishu", "mcp")
+TURN_SOURCES = ("local", "lan", "feishu", "mcp", "goal")
 
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
@@ -267,6 +270,18 @@ def _strip_ansi_markup(text) -> str:
     # 剥离 CLI 着色标签后，再去掉首尾空白/换行：CLI 习惯用 \n 做段落分隔，
     # 但 GUI notice 卡片用 white-space: pre-wrap 会把这个换行渲染成空行
     return _ANSI_MARKUP_RE.sub("", str(text)).strip()
+
+
+class _CompactStartAck(dict):
+    """/compact 的"已受理"回执。
+
+    handle_compact 会把 compress 的返回值原样拼进提示文案（f"压缩已触发：{result}"），
+    返回普通 dict 会让 notice 卡片上出现 "{'ok': True}"。这里保留 dict 形状（调用方
+    仍可按键读取 ok/msg），只把字符串化结果换成一句人话，提示才是给用户看的。
+    """
+
+    def __str__(self) -> str:
+        return "已在后台开始压缩，完成后会在当前对话给出提示"
 
 
 def _session_from_turn_id(turn_id: str) -> str:
@@ -472,12 +487,46 @@ def _to_plain_dict(obj) -> dict:
     return {}
 
 
+# core 层工具（core/tools_admin_interaction.py）只通过 app_context.get() 取运行上下文，
+# 不 import gui_bridge。内嵌浏览器面板的桥方法实现在 ApiBridge（BrowserBridgeMixin），
+# 若 _GuiContext 不转发，browser_pane 工具会以「缺少 browser_pane_open」失败——
+# 这条链路 2026-10 起就是断的（前端直连 window.pywebview.api 能开、模型调工具必失败）。
+# 只放行白名单：不把 ApiBridge 的全部属性（_window / _memory 等）暴露给 core 层，
+# 也避免 pywebview 的属性探测递归。
+_BROWSER_BRIDGE_METHODS = frozenset(
+    {
+        "browser_pane_open",
+        "browser_pane_set_bounds",
+        "browser_pane_navigate",
+        "browser_pane_back",
+        "browser_pane_forward",
+        "browser_pane_reload",
+        "browser_pane_stop",
+        "browser_pane_hide",
+        "browser_pane_get_state",
+        "browser_pane_assign",
+        "browser_pane_set_active_session",
+    }
+)
+
+
 class _GuiContext:
     """GUI 运行时上下文适配器，代理到 ApiBridge 实例的状态。"""
 
     def __init__(self, bridge: "ApiBridge"):
         self._bridge = bridge
         self.ui_flavor = "gui"
+
+    def __getattr__(self, name: str):
+        """按白名单把内嵌浏览器桥方法转发到 ApiBridge。
+
+        __getattr__ 只在常规属性查找失败时触发，_bridge 由 __init__ 写入实例字典，
+        正常访问不会递归；白名单外一律 AttributeError（保持适配器的最小暴露面）。
+        """
+        if name in _BROWSER_BRIDGE_METHODS:
+            bridge = object.__getattribute__(self, "_bridge")
+            return getattr(bridge, name)
+        raise AttributeError(name)
 
     @property
     def app_instance(self):
@@ -962,6 +1011,52 @@ class _SecretaryDispatchService:
         }
 
     # ------------------------------------------------------------------
+    # 能力四：新建项目文件夹并引入工作区
+    # ------------------------------------------------------------------
+    def create_project(self, path: str = "") -> Dict[str, Any]:
+        """新建项目文件夹并登记为工作区。
+
+        语义与用户点侧栏「添加/引入项目文件夹」选中该目录一致：目录不存在则
+        逐级创建、已存在则直接复用，随后 ``_memory.add_workspace`` 登记，
+        侧栏据 ``get_sessions`` 的 workspaces 快照出现该分组；之后
+        ``dispatch_task(workdir=该目录)`` 即可在其中建会话执行任务（沙箱边界
+        是回合线程的 workdir，新目录天然在边界内，无需额外授权）。
+        """
+        raw = str(path or "").strip()
+        if not raw:
+            raise SecretaryDispatchError("项目路径不能为空")
+        if raw.upper() in {"GLOBAL", "SECRETARY"}:
+            raise SecretaryDispatchError(f"「{raw}」是保留分组标识，不是磁盘目录")
+        # 只接受完整路径：相对路径会按进程 cwd（安装目录）解析，等于把项目
+        # 建到用户完全没预期的地方
+        if not os.path.isabs(raw):
+            raise SecretaryDispatchError(
+                f"只接受完整绝对路径（如 D:{os.sep}work{os.sep}demo）：{raw}"
+            )
+        target = _resolve_real_path(raw)
+        if os.path.exists(target) and not os.path.isdir(target):
+            raise SecretaryDispatchError(f"同名文件已存在，无法作为项目目录：{target}")
+        created = not os.path.exists(target)
+        try:
+            os.makedirs(target, exist_ok=True)
+        except Exception as exc:
+            raise SecretaryDispatchError(f"创建目录失败：{target}（{exc}）")
+        bridge = self._bridge
+        bridge._memory.add_workspace(target)
+        # 侧栏刷新：复用 session_moved 的整体覆盖通道（负载不带 name，前端
+        # 只做 sessionGroups 替换，不会误命中断言「当前会话切换」的分支）
+        try:
+            bridge.emit_event("session_moved", {"sessions": bridge.get_sessions()})
+        except Exception:
+            logger.debug("新建项目后刷新侧栏失败", exc_info=True)
+        return {
+            "ok": True,
+            "workdir": target,
+            "created": created,
+            "display_name": os.path.basename(target.rstrip("\\/")) or target,
+        }
+
+    # ------------------------------------------------------------------
     # 能力三：跳转
     # ------------------------------------------------------------------
     def open_session(self, target: str = "") -> Dict[str, Any]:
@@ -1020,7 +1115,7 @@ class _SecretaryDispatchService:
         }
 
 
-class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
+class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -1102,6 +1197,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 用户主动点过“终止”的会话：抑制后台任务终态的自动汇总回合，
         # 防止被取消的任务被“接手完成”机制复活；用户发新消息时解除
         self._user_cancelled_sessions: set = set()
+        # /goal 目标模式的运行表（会话名 -> 取消事件）：一个会话同时只允许一个
+        # 目标循环，键的存在即代表"该会话有目标在跑"；停止时 set 事件让循环退出。
+        # 循环每轮结束都会落盘状态，所以这里不保存线程句柄（崩溃后靠 resume 恢复）。
+        self._goal_runs: dict[str, threading.Event] = {}
 
         # 按会话隔离的流式 delta 缓冲，防止多会话并行时 token 混合
         self._delta_lock = threading.Lock()
@@ -1219,6 +1318,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._automation_engine = AutomationEngine(
             self._automation_storage, self._dispatch_automation_run
         )
+        # 星流工作流运行台账：与自动化存储同库同模式；工具层经
+        # core.workflows.runs.get_run_storage() 取进程级句柄（未注入时降级）
+        from core.workflows.runs import init_run_storage, set_cancel_provider, set_event_sink
+        self._workflow_run_storage = init_run_storage(self._memory)
+        # 解释执行器的实时事件 → 前端（window.onBridgeEvent 'workflow_run_progress'）
+        set_event_sink(self._on_workflow_run_event)
+        # 解释执行器的取消：读当前会话回合的取消事件（Esc 中断工作流运行）
+        set_cancel_provider(self._workflow_cancel_event)
+
         # 把桥侧自动化能力注册为 core 层服务句柄，供 Agent 工具在对话里复用：
         # 工具经 core.automation.service.get() 取句柄后调用同名方法，落到桥侧既有
         # 实现（参数校验、任务上限检查、事件推送、引擎通知），不在 core 层重复实现。
@@ -1241,6 +1349,24 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             daemon=True,
             name="gui-update-cleaner",
         ).start()
+
+    def _on_workflow_run_event(self, run_id: str, kind: str, payload: dict) -> None:
+        """解释执行器实时事件 → 前端桥事件（JS 派发队列保证顺序）。"""
+        try:
+            self.emit_event(
+                "workflow_run_progress",
+                {"run_id": run_id, "kind": kind, "payload": payload},
+            )
+        except Exception:
+            logger.debug("工作流运行事件推送失败（run=%s kind=%s）", run_id, kind, exc_info=True)
+
+    def _workflow_cancel_event(self):
+        """当前查看会话的回合取消事件；无活动回合返回 None（执行器照常跑完）。"""
+        target = self._current_session
+        evt = self._cancel_events.get(target)
+        if evt is not None and evt.is_set():
+            return evt
+        return None
 
     # ------------------------------------------------------------------
     # 基础设施：窗口、事件推送
@@ -3871,7 +3997,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 exclude_name = str(self._current_session or "")
             else:
                 exclude_name = str(current_session)
-            raw = self._memory.get_all_sessions(workdir=None, include_empty=True)
+            # include_archived=False 显式声明：已归档会话不参与 @ 补全。
+            # 归档是用户主动收起的上下文，出现在候选里既容易被误引用，
+            # 也会挤占本就有限的前 4 个会话名额。
+            raw = self._memory.get_all_sessions(
+                workdir=None, include_empty=True, include_archived=False
+            )
             items = []
             for s in raw:
                 name = str(s.get("name") or "")
@@ -3882,7 +4013,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 # 垃圾临时会话，与 get_sessions() 的跳过策略保持一致
                 if count == 0 and re.match(r"^session_[a-f0-9]{6}$", name):
                     continue
-                if q and q not in name.lower():
+                # 匹配范围：会话名（首条消息截断到 12 字）+ search_text
+                # （首条用户消息前 2000 字）。只按名字匹配时，用户想搜的
+                # 关键词只要落在第 12 字之后就永远搜不到。
+                if q and q not in name.lower() and q not in str(s.get("search_text") or "").lower():
                     continue
                 items.append({
                     "name": name,
@@ -3893,9 +4027,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 先按最近活跃倒序（稳定排序的基础顺序）
             items.sort(key=lambda it: it["updated_at"], reverse=True)
             if q:
-                # 稳定排序：前缀命中优先 → 名字长度升序 → 保持上面的 updated_at 倒序
+                # 稳定排序：名字前缀命中 → 名字子串命中 → 仅正文命中。
+                # 正文命中排最后：这类结果的相关性最弱（可能只是会话中途
+                # 提过一嘴），不能把真正名字命中的目标挤出前 12 条。
+                # 同档内名字更短的更贴近输入，再保持 updated_at 倒序。
                 items.sort(key=lambda it: (
-                    0 if it["name"].lower().startswith(q) else 1,
+                    0 if it["name"].lower().startswith(q)
+                    else (1 if q in it["name"].lower() else 2),
                     len(it["name"]),
                 ))
             return {"ok": True, "sessions": items[:max(1, int(limit or 12))]}
@@ -3980,6 +4118,155 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:
             logger.exception("get_workspace_state 失败")
             return {"ok": False, "msg": str(e)}
+
+    def get_novel_status(self, workdir: str) -> Dict[str, Any]:
+        """返回小说项目状态；非小说项目返回 {"is_novel": False}。
+
+        业务逻辑全部委托 core.novel_service.novel_status（只读扫描：不写文件、
+        不调子进程），本方法只做目录校验与异常兜底，不复制章节统计口径。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                # 未指定项目目录属于参数问题，带 error 便于前端提示，不当成"非小说项目"
+                return {"is_novel": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"is_novel": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.novel_status(path)
+        except Exception as e:
+            logger.exception("get_novel_status 失败")
+            return {"is_novel": False, "error": str(e)}
+
+    def get_novel_chapter(self, workdir: str, chapter: Any) -> Dict[str, Any]:
+        """读取单章正文（小说工作台章节编辑器）；失败统一返回 {ok: False, error}。
+
+        业务逻辑全部委托 core.novel_service.read_chapter（chapter 支持章号或
+        文件名），本方法只做目录校验与异常兜底，不复制定位/字数统计口径。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"ok": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.read_chapter(path, chapter)
+        except Exception as e:
+            logger.exception("get_novel_chapter 失败")
+            return {"ok": False, "error": str(e)}
+
+    def save_novel_chapter(self, workdir: str, chapter: Any, content: str) -> Dict[str, Any]:
+        """覆盖保存单章正文，返回保存后的可见字数；失败返回 {ok: False, error}。
+
+        业务逻辑委托 core.novel_service.save_chapter（定位正文 → _write_text 落盘
+        → 按 novel_status 同口径重算字数），章节不存在时报错而不新建。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"ok": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.save_chapter(path, chapter, content)
+        except Exception as e:
+            logger.exception("save_novel_chapter 失败")
+            return {"ok": False, "error": str(e)}
+
+    def list_novel_projects(self, workdir: str) -> Dict[str, Any]:
+        """列出工作区内的小说项目（多书切换数据源）。
+
+        委托 core.novel_service.discover_novel_projects：只读目录与 .novel.json，
+        不逐章读正文。工作区本身不是小说项目时 projects 为空数组，不算错误。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"ok": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.discover_novel_projects(path)
+        except Exception as e:
+            logger.exception("list_novel_projects 失败")
+            return {"ok": False, "error": str(e)}
+
+    def export_novel(self, workdir: str, fmt: str = "md") -> Dict[str, Any]:
+        """导出全书正文为 md / txt 单文件，返回 {ok, path, chapters, visible_chars}。
+
+        委托 core.novel_service.export_novel：产物落在 {项目}/导出/ 下，写文件共用
+        按回合撤销记录；格式非法或没有正文时返回结构化错误。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"ok": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.export_novel(path, fmt)
+        except Exception as e:
+            logger.exception("export_novel 失败")
+            return {"ok": False, "error": str(e)}
+
+    def get_novel_workbench(self, workdir: str) -> Dict[str, Any]:
+        """返回小说工作台聚合数据（伏笔 / 角色 / 卷纲 / 近 7 天字数），只读。
+
+        业务逻辑全部委托 core.novel_service.novel_workbench（不写文件、不调子进程），
+        本方法只做目录校验与异常兜底，不在桥接层复制统计口径。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"is_novel": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"is_novel": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.novel_workbench(path)
+        except Exception as e:
+            logger.exception("get_novel_workbench 失败")
+            return {"is_novel": False, "error": str(e)}
+
+    def read_novel_doc(self, workdir: str, rel_path: str) -> Dict[str, Any]:
+        """只读预览 大纲/设定/追踪 下的 .md 文档（白名单在 core 内严格执行）。
+
+        委托 core.novel_service.read_novel_doc：越界路径、非 .md、过大文件都返回
+        {ok: False, error}，本方法只做目录校验与异常兜底，不自行拼接文件路径。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"ok": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.read_novel_doc(path, rel_path)
+        except Exception as e:
+            logger.exception("read_novel_doc 失败")
+            return {"ok": False, "error": str(e)}
+
+    def run_novel_audit(
+        self, workdir: str, scope: str = "chapter", chapter: Any = None
+    ) -> Dict[str, Any]:
+        """对小说项目做确定性体检：五项检查全跑，只读（不写文件、不跑子进程）。
+
+        业务逻辑全部委托 core.novel_service.novel_audit，本方法只做目录校验与
+        异常兜底。``scope`` 只接受 chapter / all；``chapter`` 仅在 scope=chapter
+        时有意义，省略或 None 表示审计最新已写章节。scope / chapter 原样透传，
+        参数非法时由 service 返回结构化错误，桥接层不复制校验规则。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw == "GLOBAL":
+                return {"ok": False, "error": f"项目文件夹不存在: {raw or '<empty>'}"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            return novel_service.novel_audit(path, scope=scope, chapter=chapter)
+        except Exception as e:
+            logger.exception("run_novel_audit 失败")
+            return {"ok": False, "error": str(e)}
 
     def browse_remote_dirs(self, path: str = "") -> Dict[str, Any]:
         """列出指定目录的子目录（手机端内置文件夹浏览器数据源）。
@@ -4666,11 +4953,34 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             rename_session_sandbox_bypass(old_name, final_name)
         except Exception:
             logger.warning("授权/沙盒放行随改名迁移失败 (%s -> %s)", old_name, final_name, exc_info=True)
+        # 目标状态文件按会话名落盘（goals/<会话名>.json）：不随迁的话改名后
+        # GoalBar / stop / resume 全部按新名查不到目标，等于目标凭空消失
+        self._migrate_goal_state(old_name, final_name)
         if holds_turn_start_lock:
             self._migrate_message_queue_unlocked(old_name, final_name)
         else:
             with self._turn_start_lock:
                 self._migrate_message_queue_unlocked(old_name, final_name)
+
+    def _migrate_goal_state(self, old_name: str, final_name: str) -> None:
+        """把旧会话名的目标状态文件迁到新名（没有目标时是空操作）。"""
+        if not old_name or not final_name or old_name == final_name:
+            return
+        try:
+            store = self._goal_store()
+            state = store.load(old_name)
+            if state is None:
+                return
+            state.session = final_name
+            store.save(state)
+            store.clear(old_name)
+            # 运行中的循环以会话名作运行表键：不改键则 /goal stop 停不到它
+            runs = self._goal_runs_map()
+            if old_name in runs:
+                runs[final_name] = runs.pop(old_name)
+        except Exception:
+            # 迁移失败不能让改名整体失败：界面仍要看到改名成功，目标可在新名下重建
+            logger.warning("目标状态随改名迁移失败 (%s -> %s)", old_name, final_name, exc_info=True)
 
     def _migrate_message_queue_unlocked(self, old_name: str, final_name: str) -> None:
         """排队消息随会话迁到新名并推快照（调用方保证与队列操作互斥）。"""
@@ -4684,6 +4994,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 重命名后前端 running 态与新名失配（输入框锁死/状态残留）
             if self._is_turn_active(old_name):
                 return {"ok": False, "msg": "该会话正在运行回合，请先停止或等待完成后再重命名", "name": old_name}
+            if old_name in self._goal_runs_map():
+                # 目标循环按旧名逐轮发送：改名会让后续轮次落进幽灵会话，
+                # 与 _maybe_auto_rename 的同一约束保持一致
+                return {"ok": False, "msg": "该会话有进行中的目标，请先 /goal stop 再重命名", "name": old_name}
             success, final_name = self._memory.rename_session(old_name, new_name)
             if not success:
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
@@ -6169,6 +6483,152 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             "msg": "Provider 强制安全检查的确认通道未开放：官方确认契约验证前只允许查看状态与停止",
         }
 
+    # ------------------------------------------------------------------
+    # Playwright 按需组件（core/components.py）：安装包不再内置 Playwright，
+    # 设置页「浏览器操控组件」卡片按需下载/取消；进度事件经
+    # _on_playwright_component_event → emit_event 入 _js_queue，由
+    # gui-js-dispatcher 单消费者线程 evaluate_js 投递（下载线程绝不碰 WebView）
+    # ------------------------------------------------------------------
+
+    def _empty_playwright_component_status(self) -> Dict[str, Any]:
+        """组件状态兜底快照：core.components 不可用时保持前端契约形状不报错。"""
+        return {
+            "installed": False,
+            "version": "",
+            "downloading": False,
+            "percent": 0,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "error": "",
+            # digest_verified/warning：官方 SHA256 缺失时供前端提示风险
+            "digest_verified": False,
+            "warning": "",
+            # 版本比对（Minor 4）：required_version 是主程序约束，
+            # outdated=True 表示组件版本不满足要求，前端可提示重新下载
+            "required_version": "",
+            "version_compatible": None,
+            "outdated": False,
+            "version_warning": "",
+            "stage": "",
+            "dir": "",
+        }
+
+    def get_playwright_component_status(self) -> Dict[str, Any]:
+        """返回 Playwright 按需组件状态快照（设置页组件卡片的唯一真值源）。"""
+        try:
+            from core import components
+
+            return {"ok": True, "component": components.get_status()}
+        except Exception as exc:
+            logger.exception("读取 Playwright 组件状态失败")
+            return {
+                "ok": False,
+                "msg": f"读取 Playwright 组件状态失败：{exc}",
+                "component": self._empty_playwright_component_status(),
+            }
+
+    def download_playwright_component(self) -> Dict[str, Any]:
+        """后台下载并安装 Playwright 组件；进度经进度事件回推前端。
+
+        ``start_download`` 是单例（已有下载线程时返回 False），因此重复点击
+        只返回中文提示，不会启动第二个下载线程；组件状态无论成功失败都回传，
+        供前端校准（下载可能在本次响应前就已经推进）。
+
+        包完整性：下载线程会先解析 Release 说明里该组件包的 ``SHA256=`` 行作为
+        期望值（调用方也可通过 ``start_download(expected_sha256=...)`` 指定，优先级
+        更高），校验不过即按 ``playwright_component_corrupt`` 拒绝安装；拿不到
+        digest 时仍安装但会带 ``warning`` 推给前端。这里刻意不在本方法内联网解析
+        digest：Release 查询有 8 秒超时，不能阻塞桥调用线程。
+        """
+        try:
+            from core import components
+
+            started = components.start_download(
+                on_event=self._on_playwright_component_event
+            )
+            status = components.get_status()
+            if not started:
+                return {
+                    "ok": False,
+                    "msg": "组件已在下载中，请等待当前下载完成或先取消",
+                    "component": status,
+                }
+            return {"ok": True, "msg": "已开始下载 Playwright 组件", "component": status}
+        except Exception as exc:
+            logger.exception("启动 Playwright 组件下载失败")
+            return {
+                "ok": False,
+                "msg": f"启动组件下载失败：{exc}",
+                "component": self._empty_playwright_component_status(),
+            }
+
+    def cancel_playwright_component_download(self) -> Dict[str, Any]:
+        """取消进行中的组件下载（工作线程在下一块下载时退出并清理临时文件）。"""
+        try:
+            from core import components
+
+            components.cancel_download()
+            return {"ok": True, "msg": "已请求取消组件下载", "component": components.get_status()}
+        except Exception as exc:
+            logger.exception("取消 Playwright 组件下载失败")
+            return {
+                "ok": False,
+                "msg": f"取消组件下载失败：{exc}",
+                "component": self._empty_playwright_component_status(),
+            }
+
+    def _on_playwright_component_event(self, event: dict) -> None:
+        """组件下载进度回调：规整为小 JSON 事件经 emit_event 推给前端。
+
+        回调发生在下载线程（ycode-playwright-component-download）：
+        emit_event → _emit_raw → _queue_js_payload 只做序列化与 put_nowait，
+        evaluate_js 由 gui-js-dispatcher 单消费者线程执行，故此处可直接调用，
+        不需要额外 marshal 回主线程。任何异常只记日志，绝不影响下载线程。
+        """
+        try:
+            raw = event if isinstance(event, dict) else {}
+
+            def _as_int(value) -> int:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            payload: Dict[str, Any] = {
+                "stage": str(raw.get("stage") or ""),
+                "percent": _as_int(raw.get("percent")),
+                "downloaded_bytes": _as_int(raw.get("downloaded_bytes")),
+                "total_bytes": _as_int(raw.get("total_bytes")),
+                "error": str(raw.get("error") or ""),
+                "warning": str(raw.get("warning") or ""),
+            }
+        except Exception:
+            logger.warning("规整 Playwright 组件进度事件失败", exc_info=True)
+            payload = {
+                "stage": "",
+                "percent": 0,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "error": "",
+                "warning": "",
+            }
+        # installed/version 不能从进度事件推断，统一按当前磁盘/状态快照补齐；
+        # 读取失败时保持 False/空串，前端据此只更新进度不做安装态跳变
+        try:
+            from core import components
+
+            status = components.get_status()
+            payload["installed"] = bool(status.get("installed"))
+            payload["version"] = str(status.get("version") or "")
+        except Exception:
+            logger.warning("读取组件状态失败（进度事件缺少 installed/version）", exc_info=True)
+            payload["installed"] = False
+            payload["version"] = ""
+        try:
+            self.emit_event("playwright_component_progress", payload)
+        except Exception:
+            logger.exception("推送 Playwright 组件进度事件失败")
+
     def get_permission_rules(self) -> Dict[str, Any]:
         """返回当前项目的持久化白名单（含沙盒开关状态），供设置页展示。"""
         try:
@@ -6757,6 +7217,804 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
+    def edit_user_message(self, session_name: Optional[str], msg_id: Any, new_text: str, interrupt: bool = True) -> Dict[str, Any]:
+        """编辑已发送的用户消息：截断该条及其之后的全部历史，由前端重发新文本。
+
+        只做校验与截断，不启动回合——前端拿到 ok 后复用 send_user_message，
+        乐观渲染、排队与错误提示都不另写一套。
+
+        interrupt 默认 True（编辑即打断）：回合正在跑时先完整停止它、等线程
+        真正退出后再截断——取消是协作式的，worker 收尾阶段还会写消息，提前
+        截断会被残留消息污染。文本与图片都空的情况由前端拦截，这里不校验。
+        文件副作用不回滚（由前端在界面上提示）。
+        """
+        try:
+            if self._shutting_down:
+                return {"ok": False, "msg": "应用正在退出"}
+            clean_text = str(new_text or "").strip()
+            try:
+                target_msg_id = int(msg_id)
+            except (TypeError, ValueError):
+                return {"ok": False, "msg": "无效的消息编号"}
+            target_session = session_name or self._current_session
+            if not target_session:
+                return {"ok": False, "msg": "会话不存在"}
+            # 回合运行中：interrupt=True 表示「编辑即打断」——先完整停止回合、
+            # 等线程真正退出，再截断。取消是协作式的，worker 收尾阶段仍会写消息，
+            # 提前截断会被残留消息污染，也可能撞上写库锁
+            if self._is_turn_active(target_session):
+                if not interrupt:
+                    return {"ok": False, "msg": "会话正在生成，请先停止或等待完成"}
+                # worker 收尾时会自动补发该会话的排队消息：不先清空的话，
+                # 截断后立刻会跑起旧的排队内容，与本次编辑的重发打架
+                with self._turn_start_lock:
+                    if self._message_queues.pop(target_session, None):
+                        self._emit_message_queue_snapshot(target_session)
+                stopped = self.stop_current_turn(target_session)
+                if not stopped.get("ok"):
+                    return {
+                        "ok": False,
+                        "msg": "停止当前回合失败: " + str(stopped.get("msg") or "未知错误"),
+                    }
+                # 锁外 join：worker 的 finally 会取 _turn_start_lock 做收尾/补发，
+                # 持锁等待会直接死锁。超时上限 10s——工具卡在长命令里时取消要等
+                # 它自己返回，宁可提示用户稍后重试，也不能无限挂住桥调用
+                worker = getattr(self, "_active_turns", {}).get(target_session)
+                if worker is not None:
+                    try:
+                        worker.join(10.0)
+                    except Exception:
+                        logger.debug("等待回合线程退出失败", exc_info=True)
+                if self._is_turn_active(target_session):
+                    return {"ok": False, "msg": "停止当前回合超时，请稍后重试"}
+            with self._turn_start_lock:
+                # 角色校验必须在删除之前：rewind 会连同该条一起删掉，
+                # 先删后校验会把「误点助手消息」变成一次真实的数据丢失
+                role = self._memory.get_message_role(target_session, target_msg_id)
+                if role is None:
+                    return {"ok": False, "msg": "目标消息不存在"}
+                if role != "user":
+                    return {"ok": False, "msg": "只能编辑用户消息"}
+                rewound = self._memory.rewind_to_message(target_session, target_msg_id)
+                if rewound is None:
+                    return {"ok": False, "msg": "目标消息不存在"}
+                # 排队消息依赖被截断的历史，一并丢弃并刷新前端排队条目
+                if self._message_queues.pop(target_session, None):
+                    self._emit_message_queue_snapshot(target_session)
+            return {
+                "ok": True,
+                "removed": rewound.get("removed", 0),
+                "session_name": target_session,
+            }
+        except Exception as exc:
+            logger.exception("编辑用户消息失败")
+            return {"ok": False, "msg": f"编辑失败: {exc}"}
+
+    def list_slash_commands(self) -> Dict[str, Any]:
+        """返回全部内置斜杠命令的元数据，供前端输入补全使用。
+
+        只读、无副作用：注册表登记本身幂等（GUI 与 CLI 启动各调一次也只会得到
+        同一份表），这里再调一次是为了让前端在分发层尚未初始化时也能拿到清单。
+        """
+        try:
+            from core.slash_commands.specs import register_builtin_commands
+            from core.slash_commands.registry import all_specs
+            register_builtin_commands()
+            return {
+                "ok": True,
+                "commands": [
+                    {
+                        "name": spec.name,
+                        "usage": spec.usage,
+                        "summary": spec.summary,
+                        "kind": spec.kind,
+                    }
+                    for spec in all_specs()
+                ],
+            }
+        except Exception as exc:
+            # 与桥内其他方法保持一致：异常不穿透，交给前端按 ok=False 降级
+            logger.exception("读取斜杠命令清单失败")
+            return {"ok": False, "msg": str(exc)}
+
+    def _manual_compress(self, session_name, args=""):
+        """手动触发当前会话的上下文压缩（GUI 侧对 /compact 的真实落地）。
+
+        为什么必须丢到后台线程：压缩要先把历史对话打包送去调模型，一次可能几十秒；
+        而 /compact 是在回合入口的同步路径上被分发的，若在这里等压缩跑完，整条消息
+        入口（含前端输入框解锁）都会被堵住，用户只会看到界面卡死。所以本方法只做
+        「取当前模型配置 + 起线程」，立刻返回受理回执，进度用 notice 卡片推送。
+
+        args 是 /compact 的保留指令（例如"保留最近 10 条"）：压缩器目前按默认策略
+        执行、没有对应开关，故原样收下但不透传，保留这个入参是为了继续满足
+        handle_compact 里 compress(args) 的调用契约。
+        """
+        try:
+            # 压缩本身仍要调模型：用该会话当前激活的模型，没激活就无处可压
+            active_model = get_active_model(session_name) or {}
+            api_model = str(active_model.get("litellm_model") or "")
+            api_key = str(active_model.get("api_key") or "")
+            api_url = str(active_model.get("base_url") or "")
+            if not api_model:
+                # 不弹两次卡片：这里只回失败，由 _dispatch_slash 统一渲染 error 卡片
+                return {"ok": False, "msg": "当前会话未激活任何模型，无法压缩"}
+            if args:
+                logger.info("/compact 收到保留指令（压缩器暂不支持自定义策略）：%s", args)
+
+            def _run():
+                try:
+                    from core.memory_compressor import compress_session_memory
+
+                    compress_session_memory(
+                        self._memory,
+                        session_name,
+                        api_model=api_model,
+                        api_key=api_key,
+                        api_url=api_url,
+                        # 压缩器吐的是 CLI 着色标签文案，GUI 卡片要剥离；且提示必须带
+                        # 会话名，否则用户已切走的对话里的进度会串到当前对话
+                        output_callback=lambda msg: self.post_notice(
+                            _strip_ansi_markup(msg), session_name
+                        ),
+                    )
+                except Exception as exc:
+                    logger.exception("手动压缩失败")
+                    self.post_notice("压缩失败: " + str(exc), session_name, "error")
+
+            # daemon=True：应用退出时不因一次压缩把进程吊住
+            threading.Thread(
+                target=_run,
+                name=f"gui-manual-compress-{session_name}",
+                daemon=True,
+            ).start()
+            return _CompactStartAck(ok=True)
+        except Exception as exc:
+            logger.exception("准备手动压缩失败")
+            self.post_notice("压缩失败: " + str(exc), session_name, "error")
+            return {"ok": False, "msg": str(exc)}
+
+    def _dispatch_slash(self, clean_text, session_name, full_text, workdir="", turn_source="local"):
+        """把可能以 "/" 开头的输入交给斜杠命令分发层，返回 None 表示按普通消息继续。
+
+        workdir/turn_source 原样带到动作层：本地命令在草稿会话上执行时（最常见
+        是 /goal），必须知道前端这次要落库到哪个目录，否则会话会被目标循环
+        按进程 cwd 错挂到星瑶自己的源码目录。
+
+        为什么放在桥上而不是入口层：GUI 是唯一同时具备 notice 卡片、git 面板与
+        子代理编排能力的入口，命令动作（/commit /agent ...）必须由桥执行副作用；
+        核心分发层（core.slash_commands.dispatch）保持纯逻辑，桥只做适配。
+        ctx 里 compress 注入的是本桥的手动压缩入口（_manual_compress）：它在后台
+        线程里调压缩器并立即返回，因此 /compact 既是真的压缩，又不会阻塞回合入口。
+        """
+        try:
+            from core.slash_commands.dispatch import dispatch_command
+            result = dispatch_command(
+                clean_text, ctx={"compress": lambda _args: self._manual_compress(session_name)}
+            )
+        except Exception:
+            # 命令层自身的缺陷不该让整条消息发不出去：兜底按普通消息继续，
+            # 用户至少不会因为 /fix 写错参数而彻底发不出话。
+            logger.exception("斜杠命令分发失败")
+            return None
+        if not result.handled:
+            return None
+        if result.kind == "prompt":
+            # 提示词命令不本地执行，交回调用方替换本回合正文（仍走模型）
+            return {"prompt": result.prompt}
+        if result.kind == "error":
+            # 错误用 error 卡片展示，并带 slash 标记让前端知道消息没送出
+            self.post_notice(result.error, session_name, "error")
+            return {"ok": False, "msg": result.error, "slash": True}
+        if result.kind == "action":
+            return self._run_slash_action(
+                result.action, session_name, workdir=workdir, turn_source=turn_source
+            )
+        # 剩下的就是 notice：本地命令已就地完成，只需要一句提示
+        self.post_notice(result.notice, session_name)
+        return {"ok": True, "slash": True}
+
+    def _run_slash_action(self, action, session_name, workdir="", turn_source="local"):
+        """执行工具类命令产出的动作描述；核心层只给数据，副作用全在这里。
+
+        危险动作（提交代码、删长期记忆）不可逆，因此先给出确认提示并返回
+        confirm_required=True，由前端弹确认后再走真正的提交/删除流程，
+        桥不在这一步自作主张落盘。
+
+        workdir/turn_source 是入口上下文：/goal 这类"本地命令 + 后续真实回合"
+        的动作在草稿会话上要先按 workdir 落库，参数在斜杠层丢掉就是本次
+        「在小说目录执行 /goal 却开到了源码目录」的根因。
+        """
+        """执行工具类命令产出的动作描述；核心层只给数据，副作用全在这里。
+
+        危险动作（提交代码、删长期记忆）不可逆，因此先给出确认提示并返回
+        confirm_required=True，由前端弹确认后再走真正的提交/删除流程，
+        桥不在这一步自作主张落盘。
+        """
+        # /goal 的动作值本身是一个带参数的字典（{"ok":…, "action": {"action":
+        # "goal_start", "goal":…}}）：外层 action 键是 dispatch 约定的搬运字段，
+        # 内层才是真正的动作描述。这里就地解包，下面所有分支就能对"字符串动作"
+        # 与"字典动作"两种形状写同一句 kind 判定，不必为 /goal 单独再判一次类型。
+        if isinstance(action.get("action"), dict):
+            action = action["action"]
+        kind = str(action.get("action") or "")
+        if kind == "commit":
+            # 两阶段提交的落地在 _slash_commit：这里不再只弹一句"即将提交"，
+            # 而是真的暂存 / 提交（细节与原因见该方法注释）。
+            return self._slash_commit(action, session_name)
+        if kind == "forget_memory":
+            # 两阶段删除的落地在 _slash_forget：这里不再只弹一句"收到删除请求"，
+            # 而是真的先扫命中行、确认后才删（范围约束与原因见该方法注释）。
+            return self._slash_forget(action, session_name)
+        # —— /goal 目标模式 ——
+        # 状态机与循环语义都在 core.slash_commands.goal 里，桥只做三件事：
+        # 渲染状态/进度、驱动后台线程、把取消信号转给真实回合。
+        if kind == "goal_help":
+            from core.slash_commands.goal_command import GOAL_USAGE
+
+            self.post_notice(GOAL_USAGE, session_name)
+            return {"ok": True, "slash": True}
+        if kind == "goal_status":
+            return self._goal_status(session_name)
+        if kind == "goal_stop":
+            return self._goal_stop(session_name)
+        if kind == "goal_resume":
+            return self._goal_resume(session_name)
+        if kind == "goal_start":
+            # workdir/turn_source 必须透传：草稿首条消息是 /goal 时靠它们落库归组
+            return self._goal_start(action, session_name, workdir=workdir, turn_source=turn_source)
+        # 翻译成一句提示词交给模型，由模型在回合内调用对应工具完成，
+        # 这样本任务只做最小接入，不必在桥上重建一遍编排逻辑。
+        # /skill 的动作里带着技能正文（core 层已查表命中的 body）时，直接把正文
+        # 拼进提示词：模型拿到即可执行的完整步骤，不必再自己找目录、读 SKILL.md。
+        # 没有 content 说明核心层读不到正文（降级路径），继续走下面的老提示词。
+        content = str(action.get("content") or "")
+        if kind == "use_skill" and content:
+            skill = action.get("skill", "")
+            requirement = str(action.get("requirement") or "").strip() or "按技能说明执行"
+            return {"prompt": f"请严格按以下技能执行任务。\n\n# 技能：{skill}\n\n{content}\n\n任务：{requirement}"}
+        prompts = {
+            "spawn_subagent": f"请使用 run_subagent 工具派一个 {action.get('subagent_type','')} 子代理执行：{action.get('task','')}",
+            "run_workflow": f"请运行工作流 {action.get('name','')}，参数 {action.get('args',{})}",
+            "use_skill": f"请加载技能 {action.get('skill','')} 并完成：{action.get('requirement','')}",
+        }
+        prompt = prompts.get(kind)
+        if prompt:
+            return {"prompt": prompt}
+        # 未知动作按失败返回而不是静默成功：命令表新增了动作却没在这里适配时，
+        # 用户会看到明确提示，便于定位是适配层漏了分支。
+        return {"ok": False, "msg": f"未知命令动作: {kind}", "slash": True}
+
+    # ---------------- /commit 两阶段真实提交（GUI 适配层） ----------------
+    #
+    # 为什么是两阶段：git 提交会写进版本库并影响协作者，误触一次斜杠命令就落库
+    # 是不可接受的。所以 /commit 只做"暂存 + 回显将提交的文件清单"，把最终决定权
+    # 交给用户在下一轮输入 /commit --yes；--yes 才真正执行 commit。
+    # 这样即使用户手滑发了 /commit，最坏结果只是暂存（可用 Git 面板一键取消暂存）。
+    # 核心层只判定 confirmed（见 core/slash_commands/tooling.py 的 handle_commit），
+    # 真实 git 操作全部留在桥里，保证核心层零副作用、可单测。
+
+    def _slash_commit(self, action, session_name):
+        """执行 /commit 动作：先暂存全部改动，confirmed 为真时才真正提交。"""
+        confirmed = bool(action.get("confirmed"))
+        message = str(action.get("message") or "").strip()
+        # 工作目录取法与会话附属状态一致：_session_workdir 查会话登记的 workdir，
+        # 查不到时回落到进程当前目录。GLOBAL / 非目录意味着这条会话没有关联项目，
+        # 此时既没有仓库也没有"要提交什么"，直接报错比落到别处仓库上更安全。
+        workdir = str(self._session_workdir(session_name) or "").strip()
+        if not workdir or workdir.upper() == "GLOBAL" or not os.path.isdir(workdir):
+            self.post_notice(
+                "当前会话没有关联项目目录，无法定位要提交的 Git 仓库。"
+                "请在项目会话里执行 /commit。",
+                session_name,
+                "error",
+            )
+            return {"ok": False, "msg": "当前会话没有关联项目目录", "slash": True}
+        try:
+            # 第一步：暂存全部改动。这里用 git_stage_all 而不是 git_stage(workdir, None)：
+            # git_stage 的 paths 语义是"显式路径列表"，空列表会在 core.git.mutation.stage
+            # 里被判为非法（"stage 需要至少一个路径"），"全部暂存"的既有实现就是
+            # git_stage_all（内部 git add -A），复用它能同时拿到最新快照。
+            stage_result = self.git_stage_all(workdir)
+            if not stage_result.get("ok"):
+                reason = str(
+                    ((stage_result.get("error") or {}).get("message")) or "未知错误"
+                )
+                self.post_notice(f"暂存失败：{reason}", session_name, "error")
+                return {"ok": False, "msg": reason, "slash": True}
+            # 第二步：取暂存区清单。只有 index 里已暂存的条目才是"即将提交"的文件，
+            # 未暂存的修改和 untracked 不在其中；顺带刷新前端 Git 面板的版本号。
+            status_result = self.git_get_status(workdir)
+            snapshot = (
+                status_result.get("snapshot") if status_result.get("ok") else None
+            ) or stage_result.get("snapshot") or {}
+            names = []
+            for entry in snapshot.get("staged") or []:
+                # 快照里 staged 是 FileChange dataclass 序列化后的字典
+                path = entry.get("path") if isinstance(entry, dict) else entry
+                if path:
+                    names.append(str(path))
+            if not names:
+                # 没有改动就不要走到 commit：core.git 的 commit 会直接抛
+                # "暂存区为空，没有可提交的内容"，与其回一条错误卡片，
+                # 不如明确告诉用户"没什么可提交"，这是正常的空操作。
+                self.post_notice("工作区没有可提交的改动，/commit 已跳过。", session_name)
+                return {"ok": True, "slash": True}
+            count = len(names)
+            # 只回显前 5 个：文件多时把几十个路径灌进一张提示卡片会让消息流变形，
+            # 完整清单用户可以在 Git 面板里看。
+            preview = "、".join(names[:5])
+            if not confirmed:
+                # 第一阶段到此为止：只暂存，不提交，等用户显式带上 --yes。
+                self.post_notice(
+                    f"已暂存 {count} 个文件：{preview}。"
+                    "确认后执行 /commit --yes [说明] 完成提交",
+                    session_name,
+                )
+                return {"ok": True, "slash": True, "confirm_required": True}
+            # 第二阶段：--yes 才真正提交。无说明时按文件数自动生成，保证提交信息非空
+            # （空 title 会让 git 打开编辑器/直接失败）。
+            title = message or f"更新 {count} 个文件"
+            commit_result = self.git_commit(workdir, title=title)
+            if not commit_result.get("ok"):
+                reason = str(
+                    ((commit_result.get("error") or {}).get("message")) or "未知错误"
+                )
+                self.post_notice(f"提交失败：{reason}", session_name, "error")
+                return {"ok": False, "msg": reason, "slash": True}
+            self.post_notice(
+                f"已提交 {count} 个文件：{preview}。提交信息：{title}", session_name
+            )
+            return {"ok": True, "slash": True}
+        except Exception as exc:
+            # 桥接层约束：异常不许穿透到前端，转成提示 + 失败返回。
+            logger.exception("/commit 执行失败")
+            self.post_notice(f"/commit 执行失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+
+    # ---------------- /forget 两阶段真实删除（GUI 适配层） ----------------
+    #
+    # 删除范围被死限定为两处：**当日记忆日志**里包含关键词的行，以及 **MEMORY.md 索引**
+    # 里包含关键词的行。为什么不能再宽：
+    #   - 分类记忆文件（user/ feedback/ project/ reference/*.md）是结构化事实，关键词
+    #     出现在正文里常常只是"提到"，按关键词删整文件会连带抹掉同一条记忆里的其他事实；
+    #   - 历史日志是时间线本身，跨天删除会让"某天发生了什么"永久缺失且难以追查；
+    #   - 模糊/跨行匹配会让删除边界不可预期，整行删除的边界用户能在预览样例里核对。
+    # 真正的文件操作（扫描/原子写回）在 core/slash_commands/memory_forget.py，
+    # 桥这里只负责取路径、走两阶段、把结果翻译成提示；核心层因此保持零副作用、可单测。
+
+    def _slash_forget(self, action, session_name):
+        """执行 /forget 动作：confirmed 为假时只统计命中行，为真时才真删。"""
+        try:
+            from core import memory_kairos
+            from core.slash_commands.memory_forget import (
+                delete_matches,
+                scan_matches,
+            )
+
+            keyword = str(action.get("keyword") or "").strip()
+            confirmed = bool(action.get("confirmed"))
+            # 路径都取记忆系统的既有事实源：daily_log_path() 会按今天的日期拼出
+            # logs/<年>/<月>/<日>.md（顺带建好父目录），MEMORY_DIR 是 ~/.ycode/memory。
+            # 不在这里自己拼路径字符串，日期格式一旦变化这里不会跟着错。
+            log_path = memory_kairos.daily_log_path()
+            index_path = memory_kairos.MEMORY_DIR / "MEMORY.md"
+            if not confirmed:
+                # 第一阶段是纯读：只统计 + 回显样例，记忆目录一个字节都不改。
+                stats = scan_matches(keyword, log_path=log_path, index_path=index_path)
+                samples = "；".join(stats.get("samples") or [])
+                notice = (
+                    f"当日日志命中 {stats['log_lines']} 行、"
+                    f"记忆索引命中 {stats['index_lines']} 行。"
+                )
+                # 没有样例时不写这一段：空"样例："会让用户以为格式坏了。
+                if samples:
+                    notice += f"样例：{samples}。"
+                notice += f"确认删除请执行 /forget --yes {keyword}"
+                self.post_notice(notice, session_name)
+                return {"ok": True, "slash": True, "confirm_required": True}
+            # 第二阶段：删除命中行（原子写回），并回显两处各删了多少行，
+            # 让用户能对上第一阶段的统计数字。
+            stats = delete_matches(keyword, log_path=log_path, index_path=index_path)
+            self.post_notice(
+                f"已删除：当日日志 {stats['log_lines']} 行、"
+                f"索引 {stats['index_lines']} 行",
+                session_name,
+            )
+            return {"ok": True, "slash": True}
+        except Exception as exc:
+            # 桥接层约束：异常不许穿透到前端，转成提示 + 失败返回。
+            logger.exception("/forget 执行失败")
+            self.post_notice(f"/forget 执行失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+
+    # ---------------- /goal 目标模式（GUI 适配层） ----------------
+    #
+    # 分工：core.slash_commands.goal 负责判定与循环语义，core.slash_commands.goal.
+    # gui_executor 负责"跑一轮/跑验证命令"，桥负责"状态渲染 + 起线程 + 取消"。
+    # 桥里不复制任何判定逻辑，行为差异只可能出在适配层，便于定位。
+
+    # 状态码 -> 用户可读文案：直接把 running/blocked 这类英文码回显给用户，
+    # 中文界面里会显得像程序异常，集中成一张表便于以后加状态。
+    _GOAL_STATUS_TEXT = {
+        "running": "进行中",
+        "awaiting_confirm": "待确认",
+        "achieved": "已达成",
+        "blocked": "受阻（轮次用尽）",
+        "stopped": "已停止",
+        "interrupted": "已中断",
+    }
+    # 只接受这三种状态 resume：achieved 再跑没有意义，awaiting_confirm 需要的是
+    # "确认达成"而不是"再来一轮"，running 说明线程还在跑（重复启动会被拒）。
+    # 取值必须与 core.slash_commands.goal.state 的 STATUS_* 一致——那里是权威
+    # 定义，这里只是"可恢复集合"的适配层视图。
+    _GOAL_RESUMABLE = ("blocked", "stopped", "interrupted")
+
+    def _goal_runs_map(self):
+        """目标运行表（会话名 -> 取消事件）。
+
+        裸实例（测试里 __new__ 构造）没走 __init__，这里惰性建一份，
+        避免一条 /goal status 就要求完整构造桥。
+        """
+        runs = getattr(self, "_goal_runs", None)
+        if runs is None:
+            runs = self._goal_runs = {}
+        return runs
+
+    def _goal_store(self):
+        """打开目标状态仓库（落在 AI 生成内容目录下的 goals/）。"""
+        from core.slash_commands.goal.gui_executor import open_goal_store
+
+        return open_goal_store()
+
+    # —— 前端 GoalBar 用的窄接口（公开桥方法） ——
+    # 为什么另开这三个方法而不是让前端发 "/goal stop" 之类的文本：状态条上的按钮
+    # 属于界面操作，走 send_user_message 会在对话流里多出一条用户消息，还会触发
+    # 一连串本不需要的回合事件。窄接口只做「读一次状态 / 置位取消 / 续跑」，
+    # 具体语义全部复用下面的 _goal_* 实现，桥里不出现第二套目标逻辑。
+
+    def get_goal_state(self, session_name: str = "") -> Dict[str, Any]:
+        """返回会话当前的目标状态快照（只读，前端状态条轮询用）。
+
+        为什么不复用 _goal_status：那个方法把状态渲染成对话流里的一句中文提示，
+        而状态条需要结构化字段（目标/轮次/上限/状态码/最近摘要）自己排版；
+        桥只给数据，状态码到中文文案的映射留在前端，避免两处各维护一份文案。
+        """
+        target_session = str(session_name or "") or self._current_session
+        if not target_session:
+            # 草稿/首屏阶段还没有会话：按"没有目标"返回，前端静默隐藏状态条
+            return {"ok": True, "state": None}
+        try:
+            state = self._goal_store().load(target_session)
+        except Exception as exc:
+            logger.exception("读取目标状态失败")
+            return {"ok": False, "msg": str(exc)}
+        if state is None:
+            return {"ok": True, "state": None}
+        last_summary = ""
+        if state.history:
+            last_summary = str(state.history[-1].get("summary") or "")
+        return {
+            "ok": True,
+            "state": {
+                "goal": state.goal,
+                "round": state.round,
+                "max_rounds": state.max_rounds,
+                "status": state.status,
+                "last_summary": last_summary,
+                "check": state.check,
+            },
+        }
+
+    def goal_stop(self, session_name: str = "") -> Dict[str, Any]:
+        """状态条上的「停止」：复用 /goal stop 的取消语义，不另写一套。
+
+        会话名缺省用当前会话：前端在切换瞬间自己拼会话名容易停错目标，
+        统一由桥解析当前会话更安全。
+        """
+        target_session = str(session_name or "") or self._current_session
+        if not target_session:
+            return {"ok": False, "msg": "会话不存在"}
+        live = self._goal_runs_map().get(target_session)
+        if live is not None and not live.is_set():
+            # 有真实循环在跑：走 _goal_stop（置位取消事件 + 中断在飞回合）
+            return self._goal_stop(target_session)
+        # 没有在跑的循环：awaiting_confirm 早已退出循环线程在等用户确认，上个进程
+        # 遗留的 running 也没人推进。此时 _goal_stop 只会回一句"当前没有运行中的
+        # 目标"而不改状态，状态条上的「停止」就变成点了没反应的按钮——这里直接把
+        # 仍处于活动期的状态收敛成 stopped（与 runner 里"用户中断"的语义一致）。
+        try:
+            from core.slash_commands.goal.state import (
+                STATUS_AWAITING_CONFIRM,
+                STATUS_RUNNING,
+                STATUS_STOPPED,
+            )
+
+            store = self._goal_store()
+            state = store.load(target_session)
+            if state is None or state.status not in (STATUS_RUNNING, STATUS_AWAITING_CONFIRM):
+                # 没有目标或已是终态：保留 _goal_stop 原有的提示文案
+                return self._goal_stop(target_session)
+            state.status = STATUS_STOPPED
+            store.save(state)
+        except Exception as exc:
+            logger.exception("停止目标失败")
+            self.post_notice(f"停止目标失败：{exc}", target_session, "error")
+            return {"ok": False, "msg": str(exc)}
+        self.post_notice("已停止目标：不再自动续跑", target_session)
+        return {"ok": True}
+
+    def goal_resume(self, session_name: str = "") -> Dict[str, Any]:
+        """状态条上的「继续」：复用 /goal resume（仅 blocked/stopped/interrupted 可恢复）。"""
+        target_session = str(session_name or "") or self._current_session
+        if not target_session:
+            return {"ok": False, "msg": "会话不存在"}
+        return self._goal_resume(target_session)
+
+    def _goal_status(self, session_name):
+        """/goal status：输出轮次/状态/最近一轮摘要。"""
+        try:
+            state = self._goal_store().load(session_name)
+        except Exception as exc:
+            logger.exception("读取目标状态失败")
+            self.post_notice(f"读取目标状态失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+        if state is None:
+            # 没有状态文件是正常情况（用户只是问问），回一句提示即可，不报错
+            self.post_notice("当前会话没有进行中的目标", session_name)
+            return {"ok": True, "slash": True}
+        summary = "（还没有完成任何一轮）"
+        if state.history:
+            summary = str(state.history[-1].get("summary") or "") or summary
+        status_text = self._GOAL_STATUS_TEXT.get(state.status, state.status)
+        self.post_notice(
+            f"第 {state.round}/{state.max_rounds} 轮 · {status_text} · {summary}",
+            session_name,
+        )
+        return {"ok": True, "slash": True}
+
+    def _goal_stop(self, session_name):
+        """/goal stop：置位该会话的取消事件，并中断本轮真实回合。"""
+        event = self._goal_runs_map().get(session_name)
+        if event is None:
+            self.post_notice("当前没有运行中的目标", session_name)
+            return {"ok": True, "slash": True}
+        event.set()
+        # 光置位只影响"两轮之间"的检查点：用户点停止时若正卡在一轮模型回复里，
+        # 要等这一轮整个跑完才停，体验上像"停不掉"。因此同时走桥既有的回合取消
+        # 通道（stop_current_turn 会关掉在飞的 HTTP 流）。
+        try:
+            self.stop_current_turn(session_name)
+        except Exception:
+            logger.debug("停止目标回合失败", exc_info=True)
+        self.post_notice("已停止目标：本轮中断，不再自动续跑", session_name)
+        return {"ok": True, "slash": True}
+
+    def _goal_resume(self, session_name):
+        """/goal resume：把 blocked/stopped/interrupted 的目标重新跑起来。"""
+        try:
+            store = self._goal_store()
+            state = store.load(session_name)
+        except Exception as exc:
+            logger.exception("读取目标状态失败")
+            self.post_notice(f"读取目标状态失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+        if state is None:
+            self.post_notice("当前会话没有可恢复的目标，用 /goal <目标> 新建一个", session_name)
+            return {"ok": True, "slash": True}
+        if state.status not in self._GOAL_RESUMABLE:
+            status_text = self._GOAL_STATUS_TEXT.get(state.status, state.status)
+            hint = {
+                "achieved": "目标已达成，无需恢复；要跑新目标请用 /goal <目标>",
+                "awaiting_confirm": "目标在待确认状态，请确认是否达成或用 /goal <目标> 重新设定",
+                "running": "目标已在运行中，无需重复恢复",
+            }.get(state.status, "")
+            self.post_notice(
+                f"当前状态为「{status_text}」，不能恢复。{hint}".strip(), session_name
+            )
+            return {"ok": True, "slash": True}
+        if state.round >= state.max_rounds:
+            # 轮次已用尽的目标恢复后会立刻再次 blocked（循环条件一开始就不成立），
+            # 与其让用户看到"看起来恢复了其实没跑"，不如直接说明需要用新额度重建。
+            self.post_notice(
+                f"轮次已用尽（{state.round}/{state.max_rounds}），"
+                "请用 /goal <目标> [--rounds N] 重新设定目标与轮次",
+                session_name,
+            )
+            return {"ok": True, "slash": True}
+        # 用核心层的常量而不是字面量 "running"：状态机改了名字时这里会立刻
+        # 报 ImportError，而不是静默写进一个循环再也不认的状态值。
+        from core.slash_commands.goal.state import STATUS_RUNNING
+
+        state.status = STATUS_RUNNING
+        try:
+            store.save(state)
+        except Exception as exc:
+            logger.exception("保存目标状态失败")
+            self.post_notice(f"保存目标状态失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+        started, message = self._start_goal_run(state)
+        if not started:
+            self.post_notice(message, session_name, "error")
+            return {"ok": False, "msg": message, "slash": True}
+        self.post_notice(
+            f"已恢复目标（第 {state.round}/{state.max_rounds} 轮起）：{state.goal}",
+            session_name,
+        )
+        return {"ok": True, "slash": True}
+
+    def _materialize_goal_session(self, session_name, workdir, goal, turn_source="local"):
+        """草稿会话在 /goal 启动前先按 workdir 落库，返回可用的会话名。
+
+        为什么需要：/goal 在桥内就地执行并提前返回，走不到「pending 草稿按首条
+        消息落库」的普通分支；不落库的话目标循环首轮查库无此会话，会按进程 cwd
+        （星瑶安装目录）落库，会话归组与每轮工作目录全部错位。
+        """
+        if not re.match(r"^session_[a-f0-9]{6}$", session_name or ""):
+            # 已落库/已命名会话：不重复落库，更不该把老会话改名
+            return session_name
+        if not str(workdir or "").strip():
+            return session_name
+        try:
+            existing = {
+                s.get("name")
+                for s in self._memory.get_all_sessions(workdir=None, include_empty=True)
+            }
+            if session_name in existing:
+                return session_name
+            self._memory.ensure_session(session_name, workdir=str(workdir), source="GUI")
+            # 不在这一步改名：改名会立刻触发 session_renamed，而前端此刻还在
+            # 等 send_user_message 返回，靠事件迁移会话名容易和随后的状态刷新
+            # 抢跑（状态条查空后不再轮询）。命名交给第一轮结束后的
+            # _maybe_auto_rename，它会连同目标状态文件一起随迁（_migrate_goal_state）。
+            # 仅 local 入口切当前会话：LAN 分发不能抢本地会话
+            if turn_source == "local" and getattr(self, "_current_session", None) != session_name:
+                self._set_current_session(session_name)
+            return session_name
+        except Exception:
+            # 落库失败不拦住目标启动（回合 worker 里还有 ensure_session 兜底），
+            # 错误留给日志——用户至少能看到目标在跑，而不是点了没反应
+            logger.debug("goal 草稿落库失败", exc_info=True)
+            return session_name
+
+    def _goal_start(self, action, session_name, workdir="", turn_source="local"):
+        """/goal <目标>：新建目标状态并启动后台循环。
+
+        workdir/turn_source 由斜杠派发层透传：草稿会话的首条消息是 /goal 时，
+        必须先按携带目录落库（见 _materialize_goal_session），否则目标循环会把
+        会话错挂到进程启动目录。
+        """
+        from core.slash_commands.goal.state import GoalState
+        from core.slash_commands.goal_command import DEFAULT_MAX_ROUNDS, GOAL_USAGE
+
+        goal = str(action.get("goal") or "").strip()
+        if not goal:
+            # 理论上命令层已拦住空目标，这里兜底：没有目标的循环只会空转烧 token
+            self.post_notice(GOAL_USAGE, session_name, "error")
+            return {"ok": False, "msg": "目标不能为空", "slash": True}
+        try:
+            max_rounds = int(action.get("max_rounds") or 0)
+        except (TypeError, ValueError):
+            max_rounds = 0
+        if max_rounds <= 0:
+            max_rounds = DEFAULT_MAX_ROUNDS
+        runs = self._goal_runs_map()
+        existing = runs.get(session_name)
+        if existing is not None and not existing.is_set():
+            self.post_notice(
+                "当前会话已有运行中的目标，先 /goal stop 再重新设定", session_name, "error"
+            )
+            return {"ok": False, "msg": "已有运行中的目标", "slash": True}
+        # 草稿会话先按前端携带的目录落库：/goal 就地执行走不到普通消息的落库
+        # 分支，缺这步会让目标循环首轮把会话错挂到进程启动目录（本次 bug）
+        final_session = self._materialize_goal_session(
+            session_name, workdir, goal, turn_source=turn_source
+        )
+        if final_session != session_name:
+            # 后台循环、运行表与状态文件全部改用最终名：改名后旧名不复存在，
+            # 否则 GoalBar / stop / resume 都查不到这个目标
+            session_name = final_session
+        state = GoalState(
+            session=session_name,
+            goal=goal,
+            check=str(action.get("check") or "").strip(),
+            max_rounds=max_rounds,
+        )
+        try:
+            self._goal_store().save(state)
+        except Exception as exc:
+            logger.exception("保存目标状态失败")
+            self.post_notice(f"保存目标状态失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+        started, message = self._start_goal_run(state)
+        if not started:
+            self.post_notice(message, session_name, "error")
+            return {"ok": False, "msg": message, "slash": True}
+        self.post_notice(
+            f"已启动目标（最多 {state.max_rounds} 轮）：{state.goal}"
+            + (f" · 验证命令：{state.check}" if state.check else ""),
+            session_name,
+        )
+        # 返回 session：草稿落库改名后前端 currentSessionName 还是旧名，
+        # GoalBar 立刻刷新与后续 stop/resume 都要靠它对齐
+        return {"ok": True, "slash": True, "session": session_name}
+
+    def _start_goal_run(self, state):
+        """起一条后台线程驱动 run_goal_loop；返回 (是否启动, 失败说明)。
+
+        用 daemon 线程而不是线程池：目标是"用户可见的长任务"，不参与任何请求
+        生命周期，进程退出时应当直接结束（状态已在每轮落盘，重启可 resume）。
+        """
+        from core.slash_commands.goal.gui_executor import GuiGoalExecutor
+        from core.slash_commands.goal.runner import run_goal_loop
+
+        session_name = state.session
+        runs = self._goal_runs_map()
+        existing = runs.get(session_name)
+        if existing is not None and not existing.is_set():
+            # 检查与写入在同一调用点完成：目标是每个会话最多一条循环，
+            # 两条循环同时推进会把同一份 history 写乱（状态文件互相覆盖）。
+            return False, "该会话已有运行中的目标"
+        cancel_event = threading.Event()
+        runs[session_name] = cancel_event
+        try:
+            store = self._goal_store()
+        except Exception as exc:
+            runs.pop(session_name, None)
+            logger.exception("打开目标状态仓库失败")
+            return False, f"打开目标状态仓库失败：{exc}"
+        executor = GuiGoalExecutor(self, session_name)
+
+        def on_event(event, current_state):
+            """循环进度回调：只做广播，不碰界面对象也绝不抛给循环。"""
+            try:
+                if event == "round_done":
+                    summary = ""
+                    if current_state.history:
+                        summary = str(current_state.history[-1].get("summary") or "")
+                    self.post_notice(
+                        f"目标第 {current_state.round}/{current_state.max_rounds} 轮：{summary}",
+                        session_name,
+                    )
+                elif event == "finished":
+                    status_text = self._GOAL_STATUS_TEXT.get(
+                        current_state.status, current_state.status
+                    )
+                    self.post_notice(
+                        f"目标流程结束：{status_text}"
+                        f"（第 {current_state.round}/{current_state.max_rounds} 轮）",
+                        session_name,
+                    )
+            except Exception:
+                logger.debug("目标进度提示广播失败", exc_info=True)
+
+        def worker():
+            try:
+                run_goal_loop(
+                    state,
+                    executor,
+                    store,
+                    on_event=on_event,
+                    cancel_event=cancel_event,
+                    run_check=executor.run_check,
+                )
+            except Exception as exc:  # 循环自身缺陷不该让线程静默死掉
+                logger.exception("目标循环异常退出")
+                try:
+                    self.post_notice(f"目标循环异常终止：{exc}", session_name, "error")
+                except Exception:
+                    pass
+            finally:
+                # 只删自己那一条：期间用户可能已经 stop 后重建了新目标，
+                # 误删会把新循环的取消事件一起丢掉（之后 stop 就失效了）
+                if runs.get(session_name) is cancel_event:
+                    runs.pop(session_name, None)
+
+        thread = threading.Thread(
+            target=worker, name=f"goal-loop-{session_name}", daemon=True
+        )
+        thread.start()
+        return True, ""
+
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
         # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
         # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"，
@@ -6797,6 +8055,32 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 if not app_context.is_known_permission_mode(raw_permission):
                     return {"ok": False, "msg": f"未知权限模式: {raw_permission}"}
                 pending_permission_mode = app_context.normalize_permission_mode(raw_permission)
+            # 斜杠命令接入点放在取锁之前：命令要么是纯文本展开、要么是本地副作用，
+            # 都不需要进入回合临界区；若放进锁内，命令里的 post_notice 广播会在持锁
+            # 期间触发前端回调，容易和排队/补发逻辑互相等待。
+            # workdir/turn_source 一并带入：草稿首条消息是 /goal 这类"本地命令 +
+            # 后续真实回合"时，动作层要按本条消息携带的目录先落库（见 _goal_start）
+            slash = self._dispatch_slash(
+                clean_text,
+                target_session,
+                full_text,
+                workdir=str(workdir or ""),
+                turn_source=turn_source,
+            )
+            if slash is not None:
+                if "prompt" in slash:
+                    # 提示词命令：用展开后的提示词替换本回合正文，仍走模型；
+                    # 附件 @路径 是拼接在 clean_text 之后的，替掉正文时要把尾部
+                    # （附件标记或用户续写）接回去，否则附件会被静默丢掉。
+                    prompt_text = slash["prompt"]
+                    if full_text != clean_text:
+                        tail = full_text[len(clean_text):].strip()
+                        if tail:
+                            prompt_text = f"{prompt_text}\n\n{tail}"
+                    full_text = prompt_text
+                else:
+                    # 本地命令/动作已就地完成（或需要确认），直接返回，不启动回合
+                    return slash
             with self._turn_start_lock:
                 if self._is_turn_active(target_session):
                     # 回合运行中：消息进入排队（FIFO），回合结束由
@@ -7062,6 +8346,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 logger.info("星轨自动化任务启动恢复：%s 条遗留运行标记为 interrupted", recovered)
         except Exception:
             logger.exception("星轨自动化任务启动恢复失败")
+        # 工作流运行台账恢复：遗留 running 一律 interrupted（记录只是历史，不重放）
+        try:
+            recovered_runs = self._workflow_run_storage.recover_stale_runs()
+            if recovered_runs:
+                logger.info("星流工作流启动恢复：%s 条遗留运行标记为 interrupted", recovered_runs)
+        except Exception:
+            logger.exception("星流工作流启动恢复失败")
         self._automation_engine.start()
         self._emit_automation_tasks_changed()
 
@@ -7193,6 +8484,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # SQLite 行直出 0/1，归一为布尔（P2-7：与 pywebview.d.ts 声明一致）
             dto["enabled"] = bool(dto.get("enabled"))
             dto["notify_on_success"] = bool(dto.get("notify_on_success"))
+            # 派生字段：剩余可执行次数（不限次任务返回 None，前端据此展示进度）
+            max_runs = dto.get("max_runs")
+            try:
+                dto["remaining_runs"] = (
+                    None
+                    if max_runs is None
+                    else int(max_runs) - int(dto.get("scheduled_run_count") or 0)
+                )
+            except (TypeError, ValueError):
+                dto["remaining_runs"] = None
             dtos.append(dto)
         return dtos
 
@@ -7348,6 +8649,160 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": True}
         except Exception as e:
             logger.exception("清空自动化运行历史失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ── 星流工作流（ZCode 导入，设计 待开发/ZCode钩子与工作流导入/设计规格.md §3.3）──
+    # 项目档以「当前会话工作目录」为根：GUI 的 js-api 派发线程没有线程级 workdir
+    # （进程 cwd 不可信），由前端显式传入 store.workdir。
+
+    def get_workflows(self, workspace_root: str = "") -> Dict[str, Any]:
+        try:
+            from core.workflows import store as workflow_store
+
+            data = workflow_store.list_workflows(str(workspace_root or "").strip() or None)
+            return {"ok": True, "workflows": data["workflows"], "invalid": data["invalid"]}
+        except Exception as e:
+            logger.exception("读取工作流清单失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_workflow_detail(self, name: str, workspace_root: str = "") -> Dict[str, Any]:
+        try:
+            from core.workflows import store as workflow_store
+
+            entry = workflow_store.get_workflow(
+                str(name or "").strip(), str(workspace_root or "").strip() or None
+            )
+            return {"ok": True, "workflow": entry}
+        except LookupError as exc:
+            return {"ok": False, "msg": str(exc)}
+        except Exception as e:
+            logger.exception("读取工作流详情失败")
+            return {"ok": False, "msg": str(e)}
+
+    def pick_workflow_files(self) -> Dict[str, Any]:
+        """原生文件选择框（多选 .dwf.ts）；用户取消返回 ok=False + msg。"""
+        try:
+            import webview
+
+            if not self._window:
+                return {"ok": False, "msg": "窗口尚未就绪"}
+            result = self._window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=("Workflow (*.dwf.ts;*.ts)",),
+            )
+            if not result:
+                return {"ok": False, "msg": "已取消选择"}
+            return {"ok": True, "paths": [str(item) for item in result]}
+        except Exception as e:
+            logger.exception("选择工作流文件失败")
+            return {"ok": False, "msg": str(e)}
+
+    def import_workflows(
+        self,
+        paths: List[str],
+        workspace_root: str = "",
+        scope: str = "project",
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """导入用户选择的工作流文件（.dwf.ts）到指定档位。"""
+        try:
+            from core.workflows.store import import_workflow_file
+
+            if scope not in ("project", "user"):
+                scope = "project"
+            root = str(workspace_root or "").strip() or None
+            imported: List[Dict[str, Any]] = []
+            failed: List[Dict[str, Any]] = []
+            for raw in list(paths or [])[:50]:
+                result = import_workflow_file(
+                    raw, scope=scope, workspace_root=root, overwrite=bool(overwrite)
+                )
+                if result.get("ok"):
+                    imported.append(
+                        {"name": result["name"], "scope": scope, "path": result["path"]}
+                    )
+                else:
+                    failed.append(
+                        {
+                            "name": str(raw).rsplit("/", 1)[-1].rsplit("\\", 1)[-1],
+                            "error": str(result.get("error", "")),
+                            "exists": bool(result.get("exists")),
+                        }
+                    )
+            return {"ok": True, "imported": imported, "failed": failed}
+        except Exception as e:
+            logger.exception("导入工作流文件失败")
+            return {"ok": False, "msg": str(e)}
+
+    def save_workflow(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """新建 / 更新工作流（GUI 表单与对话创建共用）。"""
+        try:
+            if self._shutting_down:
+                return {"ok": False, "errors": ["应用正在退出"]}
+            from core.workflows.store import save_workflow
+
+            data = payload or {}
+            error = save_workflow(
+                str(data.get("name") or "").strip(),
+                description=str(data.get("description") or ""),
+                when_to_use=str(data.get("when_to_use") or ""),
+                args=data.get("args") if isinstance(data.get("args"), dict) else {},
+                body=str(data.get("body") or ""),
+                scope=str(data.get("scope") or "project"),
+                workspace_root=str(data.get("workspace_root") or "").strip() or None,
+                overwrite=bool(data.get("overwrite")),
+            )
+            if error:
+                return {"ok": False, "errors": [error]}
+            return {
+                "ok": True,
+                "name": str(data.get("name") or "").strip(),
+                "scope": str(data.get("scope") or "project"),
+            }
+        except Exception as e:
+            logger.exception("保存工作流失败")
+            return {"ok": False, "errors": [str(e)]}
+
+    def delete_workflow(
+        self, name: str, scope: str, workspace_root: str = ""
+    ) -> Dict[str, Any]:
+        try:
+            from core.workflows.store import delete_workflow
+
+            error = delete_workflow(
+                str(name or "").strip(),
+                str(scope or "project"),
+                str(workspace_root or "").strip() or None,
+            )
+            if error:
+                return {"ok": False, "msg": error}
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("删除工作流失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_workflow_runs(self, name: str = "", limit: int = 20) -> Dict[str, Any]:
+        """工作流运行台账：name 为空返回全部工作流的最近运行。"""
+        try:
+            storage = getattr(self, "_workflow_run_storage", None)
+            if storage is None:
+                return {"ok": True, "runs": []}
+            runs = storage.list_runs(str(name or ""), limit=max(1, min(int(limit or 20), 200)))
+            return {"ok": True, "runs": runs}
+        except Exception as e:
+            logger.exception("读取工作流运行历史失败")
+            return {"ok": False, "msg": str(e)}
+
+    def clear_workflow_runs(self, name: str) -> Dict[str, Any]:
+        try:
+            storage = getattr(self, "_workflow_run_storage", None)
+            if storage is None:
+                return {"ok": True}
+            storage.clear_runs(str(name or ""))
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("清空工作流运行历史失败")
             return {"ok": False, "msg": str(e)}
 
     def stop_current_turn(self, session_name: str = "") -> Dict[str, Any]:
@@ -7509,6 +8964,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 线程本地权限档位作用域：与 workdir 同理，回合期间冻结会话生效档位，
         # 供鉴权路径（app_context.get_permission_mode）读取，退出时恢复
         _permission_scope = None
+        # 线程本地自动化回合标记作用域（G3 防任务自我繁殖）：与权限档位同理，
+        # 回合内标记本回合来源，退出时恢复，防止线程复用时残留污染普通回合
+        _automation_scope = None
         error_state = {
             "toast_messages": set(),
             "terminal_message": None,
@@ -7741,6 +9199,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 or self._effective_permission_mode(session_name)
             )
             _permission_scope.__enter__()
+            # 自动化回合标记（G3 防任务自我繁殖）：与权限档位同一生命周期，
+            # 供工具 schema 层与执行门控判定「本回合由星轨自动化派发」。
+            _automation_scope = app_context.automation_turn_scope(
+                automation_run_id or None
+            )
+            _automation_scope.__enter__()
 
             # 会话已在模型绑定阶段创建；此处直接解析用户输入并入库。
             try:
@@ -7804,6 +9268,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 4) 发出携带稳定身份的 turn_start（session_id + turn_id）
             turn_start_data["turn_id"] = turn_id
             turn_start_data["session_id"] = _tu_checkpoint.session_id
+            # 用户消息的数据库 id 一并下发：前端乐观渲染的气泡靠它补上 _msg_id，
+            # 「编辑已发送消息」按 id 定位——不回填的话刚发出的这条要等切会话
+            # 重载历史才拿得到 id，表现为「刚发的不能编辑、旧消息可以」。
+            # 这是可选增强：memory 实现缺该方法时跳过，绝不能让回合 worker 崩掉
+            get_last_id = getattr(self._memory, "get_last_message_id", None)
+            if callable(get_last_id):
+                try:
+                    user_msg_id = get_last_id(session_name)
+                except Exception:
+                    logger.debug("取用户消息 id 失败（不影响回合）", exc_info=True)
+                    user_msg_id = 0
+                if user_msg_id:
+                    turn_start_data["user_msg_id"] = int(user_msg_id)
             self.emit_event("turn_start", turn_start_data)
             if attached_msgs:
                 self.emit_event("user_attachment_notes", {
@@ -8003,6 +9480,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 _workdir_scope.__exit__(None, None, None)
             if _permission_scope is not None:
                 _permission_scope.__exit__(None, None, None)
+            if _automation_scope is not None:
+                _automation_scope.__exit__(None, None, None)
             # 身份校验清理 cancel 事件：finally 竞态窗口内（本线程还没走完
             # finally，但 _active_turns 已 pop）新回合可能已建立同名事件，
             # 仅当字典里仍是本回合自己的事件对象时才删除，防误删新回合事件
@@ -8645,6 +10124,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     def _maybe_auto_rename(self, session_name: str) -> str:
         """首轮对话完成后，把默认的 session_xxxxxx 命名换成提炼出的标题。"""
         if not re.match(r"^session_[a-f0-9]{6}$", session_name or ""):
+            return session_name
+        if session_name in self._goal_runs_map():
+            # 目标循环把会话名记在循环闭包里逐轮发送：中途改名会让后续轮次
+            # 写进旧名的幽灵会话（用户看到"目标还在跑，消息却进了另一个会话"）。
+            # 目标结束（运行表自清）后，下一条消息会照常触发自动命名。
             return session_name
         try:
             base_title = self._derive_title_from_first_user_msg(session_name)
@@ -9540,6 +11024,116 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 断点续跑（规格 §4.1 GUI 入口，S4）。总开关 resume.enabled 默认关闭：
+    # 关闭时两个方法都只回 disabled，不发请求、不写库、不建 turn（R-T1）。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resume_switch_enabled() -> bool:
+        """读取 resume.enabled；读配置失败按关闭处理（宁可不可用也不误触发）。"""
+        try:
+            section = config._load().get("resume") or {}
+        except Exception:
+            return False
+        return bool(section.get("enabled")) if isinstance(section, dict) else False
+
+    def _resume_make_planner(self):
+        """装配规划层；默认注册表构造失败降级为 None（planner 会判工具不可用→BLOCK）。"""
+        from core.harness.resume import ResumePlanner
+
+        registry = None
+        try:
+            from core.tool_registry import build_default_registry
+
+            registry = build_default_registry()
+        except Exception:
+            logger.warning("断点续跑：默认工具注册表构造失败，按无注册表降级", exc_info=True)
+            registry = None
+        return ResumePlanner(self._memory, registry)
+
+    @staticmethod
+    def _resume_call_snapshot(call: Any) -> Dict[str, Any]:
+        """单个调用的可序列化快照：只含摘要与判定，绝不含参数/结果正文（红线 §9.3）。"""
+        return {
+            "call_ordinal": int(call.call_ordinal),
+            "tool_name": call.tool_name,
+            "klass": call.klass,
+            "reason": call.reason,
+            "step_id": call.step_id,
+            "arguments_sha256": call.arguments_sha256,
+            "result_sha256": call.result_sha256,
+            "message_row_present": bool(call.message_row_present),
+        }
+
+    def _resume_plan_snapshot(self, planner: Any, plan: Any) -> Dict[str, Any]:
+        return {
+            "session_name": plan.session_name,
+            "parent_turn_id": plan.parent_turn_id,
+            "resume_from_step_ordinal": int(plan.resume_from_step_ordinal),
+            "anchor": {
+                "complete": plan.anchor.complete(),
+                "message_count": int(plan.anchor.message_count),
+                "messages_sha256": plan.anchor.messages_sha256,
+                "system_sha256": plan.anchor.system_sha256,
+                "tools_sha256": plan.anchor.tools_sha256,
+                "cache_lane_sha256": plan.anchor.cache_lane_sha256,
+            },
+            "decisions": [self._resume_call_snapshot(call) for call in plan.decisions],
+            "blockers": list(plan.blockers),
+            "replayable_count": len(plan.replayable),
+            "fresh_count": len(plan.fresh),
+            "blocked_count": len(plan.blocked),
+            "aborts": [str(reason) for reason in (planner.aborts(plan) or ())],
+        }
+
+    def resume_plan(self, session_name: str = "") -> Dict[str, Any]:
+        """规划接口：只读 journal，返回可续跑快照；不发请求、不写库。"""
+        try:
+            if not self._resume_switch_enabled():
+                return {"ok": False, "reason": "disabled"}
+            planner = self._resume_make_planner()
+            plan = planner.plan(session_name)
+            if plan is None:
+                return {
+                    "ok": True,
+                    "resumable": False,
+                    "reason": "no_resumable_turn",
+                    "aborts": [str(reason) for reason in (planner.aborts(None) or ())],
+                }
+            snapshot = self._resume_plan_snapshot(planner, plan)
+            return {
+                "ok": True,
+                "resumable": not snapshot["aborts"],
+                "plan": snapshot,
+                "aborts": snapshot["aborts"],
+            }
+        except Exception as e:
+            logger.exception("resume_plan 失败")
+            return {"ok": False, "msg": f"断点续跑规划失败：{e}"}
+
+    def resume_execute(self, session_name: str = "", confirmed: Any = None) -> Dict[str, Any]:
+        """执行接口：aborts 非空先回原因；否则交给 ResumeExecutor.run（含审计事件）。
+
+        ``confirmed`` 是调用序号数组（用户逐项确认过的写操作）；空数组表示
+        "只续跑无写操作的调用"，此时命中写操作会返回 ``reason=confirm_required``。
+        """
+        try:
+            if not self._resume_switch_enabled():
+                return {"ok": False, "reason": "disabled"}
+            planner = self._resume_make_planner()
+            plan = planner.plan(session_name)
+            aborts = [str(reason) for reason in (planner.aborts(plan) or ())]
+            if aborts:
+                return {"ok": False, "reason": aborts[0], "reasons": aborts}
+            from core.harness.resume import ResumeExecutor
+
+            executor = ResumeExecutor(self._memory, planner)
+            return executor.run(plan, confirmed=set(confirmed or ()))
+        except Exception as e:
+            logger.exception("resume_execute 失败")
+            return {"ok": False, "msg": f"断点续跑执行失败：{e}"}
+
+    # ------------------------------------------------------------------
     # 按回合撤销：窄桥接（规格 19.1）。桥只做会话归属校验与会话名 →
     # sessions.id 解析，不复制文件检查和事务逻辑。
     # ------------------------------------------------------------------
@@ -9828,6 +11422,48 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": True}
         except Exception as e:
             logger.exception("open_folder_in_explorer 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def preview_office_doc(self, path: str) -> Dict[str, Any]:
+        """把 Office 文档转成 PDF 并返回 PDF 路径（右栏内嵌预览用）。
+
+        首次转换会拉起 Office 进程（十几秒），结果按源文件 mtime 缓存：同一文件
+        再次点击直接命中缓存 PDF，不再启动子进程。本方法只回路径，不把 PDF 内容
+        读进内存——前端仍走既有的 `file://` + PDF 查看器链路。
+        """
+        try:
+            from core.gui_path_policy import gui_path_access_allowed
+
+            if not path:
+                return {"ok": False, "msg": "路径为空"}
+            real_path = _resolve_real_path(path)
+            if not os.path.isfile(real_path):
+                return {"ok": False, "msg": f"文件不存在: {real_path}"}
+            workspace = self._session_workdir(self._current_session)
+            allowed, deny_msg = gui_path_access_allowed(
+                real_path, workspace, action="preview", session_id=self._current_session
+            )
+            if not allowed:
+                return {"ok": False, "msg": deny_msg}
+            try:
+                from core.office_preview import (
+                    OfficeConvertError, convert_to_pdf, is_office_path,
+                )
+            except Exception as e:
+                logger.exception("preview_office_doc 导入 core.office_preview 失败")
+                return {"ok": False, "msg": f"Office 预览能力不可用: {e}"}
+            if not is_office_path(real_path):
+                return {
+                    "ok": False,
+                    "msg": f"不是可预览的 Office 文档: {os.path.basename(real_path)}",
+                }
+            try:
+                pdf_path = convert_to_pdf(real_path)
+            except OfficeConvertError as e:
+                return {"ok": False, "msg": str(e)}
+            return {"ok": True, "path": str(pdf_path), "source": real_path}
+        except Exception as e:
+            logger.exception("preview_office_doc 失败")
             return {"ok": False, "msg": str(e)}
 
     def get_ui_layout(self) -> Dict[str, Any]:

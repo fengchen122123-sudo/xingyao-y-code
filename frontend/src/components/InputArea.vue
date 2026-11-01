@@ -85,6 +85,7 @@
         <InputSuggest
           :items="suggestItems"
           :active-index="suggestIndex"
+          :empty-hint="suggestEmpty"
           @select="applySuggest"
           @hover="i => suggestIndex = i"
         />
@@ -375,7 +376,7 @@ onUnmounted(() => {
 });
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths, uploadFiles, openAttachmentImage } = useAttachments();
-const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 // 输入框高度拖拽：最小=默认渲染高度，向上拖抬高、松手记忆，双击恢复
 const { textareaHeight, isResizing, onHandlePointerdown, resetHeight } = useComposerResize(() => textareaRef.value);
 

@@ -10,6 +10,14 @@
   （Windows 下即 cmd.exe，POSIX 下即 /bin/sh）；
 - Windows 无控制台场景传 CREATE_NO_WINDOW，避免黑窗闪现（项目既有惯例，
   与 core/git/runner.py、core/tools.py 等调用点一致）。
+
+ZCode 导入兼容（ZCode 导入设计 §2.5）：
+
+- 命令里的 ``${VAR}`` 模板变量在执行前展开（项目目录 / 会话 id 三组拼写等价），
+  未识别的变量原样保留；同名键同时注入子进程环境变量（与 ZCode「展开+注入」
+  双通道一致）；
+- 退出码契约：0 = 放行（解析 stdout），**2 = 主动阻断**（合成 decision=block
+  的输出，reason 取 stderr 末行），其他非 0 = failed。
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ import json
 import locale
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -29,6 +38,17 @@ _logger = logging.getLogger("ycode.hooks")
 
 #: 命令预览的最大长度：warning 里只放截断后的单行命令，避免日志被超长命令撑爆。
 _COMMAND_PREVIEW_LIMIT = 120
+
+#: 模板变量名 → HookInput 字段（ZCode/Claude 与星瑶拼写等价）。
+_TEMPLATE_VARS: dict[str, str] = {
+    "YCODE_PROJECT_DIR": "cwd",
+    "ZCODE_PROJECT_DIR": "cwd",
+    "CLAUDE_PROJECT_DIR": "cwd",
+    "YCODE_SESSION_ID": "session_id",
+    "CLAUDE_SESSION_ID": "session_id",
+}
+
+_TEMPLATE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def command_preview(command: str, limit: int = _COMMAND_PREVIEW_LIMIT) -> str:
@@ -101,6 +121,54 @@ def _parse_stdout(raw: bytes | None) -> HookOutput | None:
     return HookOutput.from_wire(data)
 
 
+def _template_values(hook_input: HookInput) -> dict[str, str]:
+    """模板变量的实际取值（空字段不产生条目：不展开也不注入 env）。"""
+    values: dict[str, str] = {}
+    for name, field in _TEMPLATE_VARS.items():
+        value = getattr(hook_input, field, "") or ""
+        if value:
+            values[name] = str(value)
+    return values
+
+
+def expand_template_variables(command: str, hook_input: HookInput) -> str:
+    """展开命令里的 ``${VAR}`` 模板变量。
+
+    只识别 :data:`_TEMPLATE_VARS` 里的名字；未识别的变量**原样保留**（不报错、
+    不清空——hook 可能本来就要把未展开的 `${...}` 交给自己的解释器处理）。
+    """
+    values = _template_values(hook_input)
+
+    def _sub(match: re.Match) -> str:
+        value = values.get(match.group(1))
+        return match.group(0) if value is None else value
+
+    return _TEMPLATE_PATTERN.sub(_sub, command)
+
+
+def _build_hook_env(hook_input: HookInput) -> dict[str, str]:
+    """子进程环境：继承当前环境 + 模板变量同名注入（值非空才注入）。"""
+    env = dict(os.environ)
+    env.update(_template_values(hook_input))
+    return env
+
+
+def _stderr_tail(raw: bytes | None, limit: int = 200) -> str:
+    """退出码 2 阻断时的 reason：stderr 末行（截断），无内容给默认文案。"""
+    fallback = "hook 以退出码 2 请求阻断"
+    if not raw:
+        return fallback
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode(locale.getpreferredencoding(False), errors="replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return fallback
+    tail = lines[-1]
+    return tail if len(tail) <= limit else tail[: limit - 1] + "…"
+
+
 def run_hook(
     registration: HookRegistration,
     hook_input: HookInput,
@@ -126,6 +194,9 @@ def run_hook(
         hook_input.to_wire(), separators=(",", ":")
     ).encode("ascii")
     timeout_s = max(0.001, registration.timeout_ms / 1000.0)
+    # 模板变量在执行前展开（ZCode 导入设计 §2.5）；日志与预览仍用原始命令，
+    # 展开产物不落日志，避免把展开后的绝对路径随告警外带。
+    command = expand_template_variables(registration.command, hook_input)
     kwargs = {
         "shell": True,
         "input": payload,
@@ -133,6 +204,7 @@ def run_hook(
         "stderr": subprocess.PIPE,
         "timeout": timeout_s,
         "cwd": _resolve_cwd(hook_input.cwd),
+        "env": _build_hook_env(hook_input),
     }
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if creationflags and os.name == "nt":
@@ -140,7 +212,7 @@ def run_hook(
 
     started = time.monotonic()
     try:
-        completed = subprocess.run(registration.command, **kwargs)
+        completed = subprocess.run(command, **kwargs)
     except subprocess.TimeoutExpired:
         duration_ms = int((time.monotonic() - started) * 1000)
         log.warning(
@@ -168,6 +240,16 @@ def run_hook(
 
     duration_ms = int((time.monotonic() - started) * 1000)
     exit_code = completed.returncode
+    if exit_code == 2:
+        # ZCode/Claude 退出码契约：2 = 主动阻断，不是失败。合成 decision=block
+        # 的输出交给既有合并语义——HookRunResult.merge_output 只让
+        # PreToolUse/Stop 事件的阻断生效，其余事件按规格静默忽略。
+        return HookExecutionOutcome(
+            status="ok",
+            output=HookOutput(decision="block", reason=_stderr_tail(completed.stderr)),
+            exit_code=2,
+            duration_ms=duration_ms,
+        )
     if exit_code != 0:
         log.warning(
             "hook 退出码非 0（%s，事件 %s）: %s",

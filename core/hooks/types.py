@@ -108,6 +108,9 @@ class HookInput:
             payload["permission_decision"] = self.permission_decision
         if self.tool_result_preview:
             payload["tool_result_preview"] = self.tool_result_preview
+            # ZCode/Claude 系 hook 读的是 tool_response；同值双写形成超集，
+            # 导入的 hook 无需改一行即可读到工具结果（ZCode 导入设计 §2.6）。
+            payload["tool_response"] = self.tool_result_preview
         if self.tool_call_count:
             payload["tool_call_count"] = self.tool_call_count
         if self.response_preview:
@@ -139,6 +142,10 @@ class HookOutput:
 
         容错策略：任何非法字段/类型都被忽略并回退默认值（默认 = 无干预），
         而不是抛错——hook 是增强能力，畸形输出不应让主流程感知异常（规格 §7）。
+
+        camelCase 别名（ZCode 导入设计 §2.5）：ZCode/Claude 系 hook 的 stdout
+        用 camelCase 键。同一字段两种拼写等价，snake_case 优先、camelCase
+        仅在 snake_case 缺失或类型非法时生效。
         """
         if not isinstance(data, dict):
             return cls()
@@ -147,6 +154,18 @@ class HookOutput:
         reason = data.get("reason")
         additional_context = data.get("additional_context")
         permission_decision = data.get("permission_decision")
+        if not isinstance(reason, str) or not reason:
+            alias = data.get("stopReason")
+            if isinstance(alias, str):
+                reason = alias
+        if not isinstance(additional_context, str) or not additional_context:
+            alias = data.get("additionalContext")
+            if isinstance(alias, str):
+                additional_context = alias
+        if not isinstance(permission_decision, str) or permission_decision not in _VALID_PERMISSION_DECISIONS:
+            alias = data.get("permissionDecision")
+            if isinstance(alias, str) and alias in _VALID_PERMISSION_DECISIONS:
+                permission_decision = alias
         return cls(
             continue_=continue_ if isinstance(continue_, bool) else True,
             decision=decision if decision in _VALID_DECISIONS else "",

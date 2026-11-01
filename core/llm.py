@@ -534,6 +534,21 @@ def get_tools_schema():
             return _secretary_tools_schema()
         except Exception:
             logger.debug("秘书工具 schema 过滤失败（旁路，回落普通路径）", exc_info=True)
+    # 自动化回合（G3）：额外隐藏写类自动化工具，防任务自我繁殖。策略读取
+    # 异常按空集处理并走与原逻辑完全一致的调用——普通回合的工具列表必须与
+    # 改动前逐字节一致（前缀缓存命中的前提）。
+    hidden = frozenset()
+    try:
+        from core.automation import tool_policy as _automation_tool_policy
+
+        hidden = _automation_tool_policy.hidden_tool_names_for_current_turn()
+    except Exception:
+        logger.debug("自动化回合工具过滤失败（旁路，按普通回合处理）", exc_info=True)
+        hidden = frozenset()
+    if hidden:
+        return _ordinary_tools_schema(
+            set(secretary.SECRETARY_ONLY_TOOLS) | {str(name) for name in hidden}
+        )
     return _ordinary_tools_schema(secretary.SECRETARY_ONLY_TOOLS)
 
 
@@ -913,12 +928,13 @@ def _claim_takeover_at_turn_start(
 
 
 # 入口层受控回合来源白名单：只有入口层（GUI/CLI 本地、LAN 手机端、飞书通道、
-# 手机端 MCP 客户端经局域网 MCP 服务投递）能设置，绝不来自用户消息或模型参数。
+# 手机端 MCP 客户端经局域网 MCP 服务投递、/goal 目标模式自动续跑）能设置，
+# 绝不来自用户消息或模型参数。
 # 非 local 的回合一律按「远程」处理（禁用电脑操控、不解析 @{会话名}、不抢桌面当前
 # 会话），见 core/computer/capability.py 与 core/agent_service.py 的
 # turn_source != "local" 分支。
 # 新增来源时必须同时更新 gui_bridge.TURN_SOURCES（有测试断言两者一致）。
-COMPUTER_TURN_SOURCES = ("local", "lan", "feishu", "mcp")
+COMPUTER_TURN_SOURCES = ("local", "lan", "feishu", "mcp", "goal")
 
 
 def resolve_turn_computer_capability(
@@ -975,6 +991,7 @@ def chat_with_model_events(
     model_id=None,
     computer_turn_source="local",
     computer_capability=None,
+    budget_notice_provider=None,
 ):
     """Yield ordered :class:`TurnEvent` snapshots for one model turn.
 
@@ -1127,6 +1144,7 @@ def chat_with_model_events(
             model_id=model_id,
             harness_runtime=harness_runtime,
             computer_capability=computer_turn_capability,
+            budget_notice_provider=budget_notice_provider,
         )
         for chunk in generator:
             yield from drain_public_events()
@@ -1536,6 +1554,7 @@ def _chat_with_model_generator(
     *,
     harness_runtime=None,
     computer_capability=None,
+    budget_notice_provider=None,
 ):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
@@ -2212,6 +2231,28 @@ def _chat_with_model_generator(
                     pending_persistence.append(("user", _stop_notice_msg))
                 drained_stop_notices.extend(_drained_stop_notices)
                 flush_persistence()
+            # 时间预算提醒（子代理专用）：provider 每步返回一次提醒文本或 None。
+            # 只在 Step 边界插入——上一 Step 的工具调用与结果已配对并 flush，
+            # 插在 Step 中间会制造悬空 tool_calls（OpenAI/Anthropic 都会 400）。
+            # 主回合不传 provider，行为完全不变。
+            if budget_notice_provider is not None:
+                try:
+                    _budget_notice_text = budget_notice_provider()
+                except Exception:
+                    _budget_notice_text = None
+                if _budget_notice_text:
+                    _budget_notice_msg = {
+                        "role": "user",
+                        "content": str(_budget_notice_text),
+                    }
+                    messages.append(_budget_notice_msg)
+                    pending_persistence.append(("user", _budget_notice_msg))
+                    flush_persistence()
+                    _notify_event(
+                        event_callback,
+                        "budget_notice",
+                        {"message": str(_budget_notice_text)},
+                    )
             if turn > 0:
                 # 轮次边界事件：GUI 流式渲染据此把每个 LLM 轮次拆成独立消息块，
                 # 与历史重放（每轮一条 DB 记录）的结构对齐；CLI/子代理只认已知事件，自动忽略

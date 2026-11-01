@@ -164,6 +164,11 @@
         </div>
       </div>
 
+      <!-- 小说工作台（设计 §7）：只读展示书名/字数/章节/追踪状态，激活时拉一次 -->
+      <div v-show="visualTab === 'novel'" class="rpane active" data-test="novel-pane-wrap">
+        <NovelPane :active="activeTab === 'novel'" />
+      </div>
+
       <!-- 子代理执行过程：聊天卡片“查看”触发，1 秒轮询任务阶段历史 -->
       <div v-show="visualTab === 'subagent'" class="rpane active" data-test="subagent-pane">
         <SubagentPane :active="activeTab === 'subagent'" />
@@ -217,6 +222,7 @@ import ComputerControlPane from './ComputerControlPane.vue';
 import BrowserPane from './BrowserPane.vue';
 import GitPanel from './GitPanel.vue';
 import SubagentPane from './SubagentPane.vue';
+import NovelPane from './NovelPane.vue';
 import RightPanelSnip from './RightPanelSnip.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
@@ -322,15 +328,16 @@ function isActiveTab(tab: RightPanelTabId) {
   return visualTab.value === tab;
 }
 
-// 选择页五张卡（对齐 ZCode 官方侧板）；“操控”不进选择页，只在出现过电脑操控
-// run 后自动切入（设计 16.2）。星名只对应这一个场景（一名一景），页签/卡片统一
-// 用「星名 · 通用名」的写法，新用户第一眼就知道是什么
+// 选择页六张卡（对齐 ZCode 官方侧板，外加小说工作台）；“操控”不进选择页，只在
+// 出现过电脑操控 run 后自动切入（设计 16.2）。星名只对应这一个场景（一名一景），
+// 页签/卡片统一用「星名 · 通用名」的写法，新用户第一眼就知道是什么
 const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> = [
   { id: 'files', label: '文件', icon: 'folder' },
   { id: 'git', label: 'Git', icon: 'git-branch' },
   { id: 'browser', label: '星眼 · 浏览器', icon: 'globe' },
   { id: 'tasks', label: '星港 · 后台任务', icon: 'square-terminal' },
-  { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' }
+  { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' },
+  { id: 'novel', label: '小说', icon: 'file' }
 ];
 
 const PANE_LABELS: Record<RightPanelTabId, string> = {
@@ -339,36 +346,70 @@ const PANE_LABELS: Record<RightPanelTabId, string> = {
   browser: '星眼 · 浏览器',
   tasks: '星港 · 后台任务',
   computer: '操控',
-  subagent: '星舰 · 子代理'
+  subagent: '星舰 · 子代理',
+  novel: '小说'
 };
+// 小说页签图标：图标表里没有 book，用「稿件」语义的 file（不新增图标资源）
 const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
   files: 'folder',
   git: 'git-branch',
   browser: 'globe',
   tasks: 'square-terminal',
   computer: 'scan',
-  subagent: 'blocks'
+  subagent: 'blocks',
+  novel: 'file'
 };
 
 // run 开始时首次自动切入操控工作台（设计 16.2）：每个 run 只开一次（记录到
 // computerLastAutoOpenedRunId），用户关闭页签不抢回，新 run 再开一次；
 // 挂载补跑覆盖“run 启动时右面板尚未挂载（如设置页打开中）”的场景
-function autoOpenComputerTabOnce() {
+async function autoOpenComputerTabOnce() {
   const runId = store.computerRun.run_id;
   if (!runId || runId === store.computerLastAutoOpenedRunId) return;
   if (!store.computerControlBarVisible) return;
+  // 浏览器操控不弹「操控」工作台：右侧直接呈现浏览器页签（embedded_browser_automation
+  // 已按会话打开并激活它），用户看到的就是一个可围观的浏览器而不是操控面板。
+  // 仍记 lastAutoOpenedRunId：避免后续 watch（归属补齐）反复进入快照校准分支。
+  if (store.computerRunIsBrowser) {
+    store.computerLastAutoOpenedRunId = runId;
+    return;
+  }
+  // 归属会话优先取 run 自己的 owner_session_id（事件信封/快照都带）。为空时
+  // 先拉一次完整快照校准——绝不能直接回落 currentSessionName：run 在后台会话
+  // 启动、用户正看另一个会话时，回落会把「操控」页签登记到用户眼前的会话上
+  // （2026-10-30 反馈：openquilla 会话的浏览器操控显示在小说会话下）。
+  // 没有桥（浏览器开发态/测试环境）时无从校准，保持同步回落，不引入额外等待。
+  let owner = store.computerRun.owner_session_id || '';
+  const automationApi = (window as any).pywebview?.api?.get_computer_control_status;
+  if (!owner && typeof automationApi === 'function') {
+    // 静默校准：这是自动开页签的内部步骤，失败不该弹「操控状态刷新失败」的框
+    // （那条提示留给用户手动刷新），校准不到就按旧后端回落。
+    try {
+      const snapshot = await (window as any).pywebview.api.get_computer_control_status();
+      if (snapshot && snapshot.run_id) {
+        store._applyComputerSnapshot(snapshot as Record<string, unknown>);
+      }
+    } catch { /* 校准失败：保持未知归属，下面按兼容路径回落 */ }
+    // 校准期间 run 换代/收场：交给新 run 的触发逻辑，别替旧 run 登记页签
+    if (store.computerRun.run_id !== runId || !store.computerControlBarVisible) return;
+    owner = store.computerRun.owner_session_id || '';
+  }
   store.computerLastAutoOpenedRunId = runId;
   // 只登记页签不摊开面板（设计 16.2 旧语义）：面板已展开的直接落在操控页签，
   // 收起中的等用户手动展开时再看到。
   // 按 run 归属会话写入：run 在 A 会话启动、用户正看 B 会话时写进 A 的 runtime，
-  // 不把 B 的页签集写脏（归属会话未知时回落当前会话）
+  // 不把 B 的页签集写脏（快照也没有归属的旧后端才回落当前会话，保住入口）
   store.openRightPanelTabForSession(
-    store.computerRun.owner_session_id || store.currentSessionName,
+    owner || store.currentSessionName,
     'computer',
     { expand: false },
   );
 }
-watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
+// owner 也要监听：归属随快照/后续事件补齐后仍要补开一次（每个 run 只开一次）
+watch(
+  () => [store.computerRun.run_id, store.computerRun.owner_session_id] as const,
+  () => { void autoOpenComputerTabOnce(); },
+);
 
 // ── 后台任务执行过程：2 秒轮询日志尾部，跟随滚动到底 ──
 const detailOutput = ref('');
@@ -588,7 +629,7 @@ const onWindowFocus = () => { if (activeTab.value === 'files') maybeAutoRefreshF
 
 onMounted(() => {
   // 挂载补跑一次自动开工作台（run 启动时右面板可能尚未挂载，见函数注释）
-  autoOpenComputerTabOnce();
+  void autoOpenComputerTabOnce();
   window.addEventListener('focus', onWindowFocus);
 });
 

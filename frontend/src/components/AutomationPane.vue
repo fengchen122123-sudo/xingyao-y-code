@@ -16,11 +16,19 @@
         <div class="ap-card-top">
           <span class="ap-name">{{ t.name }}</span>
           <span class="ap-chip">{{ t.trigger_summary || t.trigger_type }}</span>
-          <label class="ap-switch" title="启用/停用该任务" @click.stop>
+          <!-- 任务生命周期状态（active/completed）：与运行历史的 statusLabel 不是同一套状态 -->
+          <span
+            v-if="t.status === 'completed'"
+            class="ap-chip ok"
+            data-test="automation-task-status"
+            title="任务生命周期已结束（已达到最多执行次数）"
+          >{{ taskStatusLabel(t.status) }}</span>
+          <label class="ap-switch" :class="{ off: t.status === 'completed' }" title="启用/停用该任务" @click.stop>
             <input
               type="checkbox"
               :checked="t.enabled"
               :data-test="`automation-toggle-${t.name}`"
+              :disabled="t.status === 'completed'"
               @change="onToggle(t, ($event.target as HTMLInputElement).checked)"
             />
             <span class="ap-switch-track"></span>
@@ -39,10 +47,17 @@
             {{ t.enabled ? `下次：${formatNextRun(t.next_run_at)}` : '已停用' }}
           </span>
           <span v-if="t.last_run_at" class="ap-meta-item">上次：{{ t.last_run_at }}</span>
+          <span v-if="t.max_runs" class="ap-meta-item" data-test="automation-task-runs">已执行 {{ t.scheduled_run_count || 0 }}/{{ t.max_runs }} 次</span>
         </div>
         <div class="ap-prompt" :title="t.prompt">{{ t.prompt }}</div>
         <div class="ap-actions">
-          <button class="ap-btn" title="立刻执行一次" :data-test="`automation-run-${t.name}`" @click="onRunNow(t)">立即执行</button>
+          <button
+            class="ap-btn"
+            :title="t.status === 'completed' ? '任务已完成，不再执行' : '立刻执行一次'"
+            :data-test="`automation-run-${t.name}`"
+            :disabled="t.status === 'completed'"
+            @click="onRunNow(t)"
+          >立即执行</button>
           <button class="ap-btn" @click="openEdit(t)">编辑</button>
           <button class="ap-btn" @click="toggleHistory(t)">{{ expanded[t.id] ? '收起历史' : '运行历史' }}</button>
           <span class="ap-flex"></span>
@@ -118,6 +133,7 @@
           <option value="interval">固定间隔</option>
           <option value="daily">每天定时</option>
           <option value="weekly">每周定时</option>
+          <option value="once">一次性</option>
           <option value="startup">应用启动时</option>
         </select>
         <template v-if="form.triggerType === 'interval'">
@@ -133,6 +149,28 @@
           </label>
           <input v-model="form.time" type="time" data-test="automation-time" />
         </template>
+        <!-- 一次性触发：「N 分钟后」与绝对时刻二选一，保存时只传其中一个键 -->
+        <template v-else-if="form.triggerType === 'once'">
+          <select v-model="form.onceMode" data-test="automation-once-mode" title="一次性触发的表达方式">
+            <option value="delay">N 分钟后</option>
+            <option value="absolute">指定时刻</option>
+          </select>
+          <template v-if="form.onceMode === 'delay'">
+            <input
+              v-model.number="form.delayMinutes"
+              type="number"
+              data-test="automation-delay-minutes"
+              min="1"
+              max="10080"
+              style="width:110px"
+            />
+            <span class="ap-unit">分钟后（1-10080）</span>
+          </template>
+          <template v-else>
+            <input v-model="form.runAt" type="datetime-local" data-test="automation-run-at" />
+            <span class="ap-unit">本地时刻</span>
+          </template>
+        </template>
       </div>
 
       <textarea
@@ -142,6 +180,20 @@
         placeholder="提示词：到点后星瑶将把这段文字作为一次真实对话回合发送到目标会话"
       ></textarea>
       <div class="ap-char-count">{{ form.prompt.length }} / 6000</div>
+
+      <!-- 最多执行次数：留空 = 不限次；手动「立即执行」不计入该次数 -->
+      <div class="ap-row">
+        <span class="ap-unit">最多执行次数</span>
+        <input
+          v-model="form.maxRuns"
+          type="number"
+          data-test="automation-max-runs"
+          min="1"
+          placeholder="留空=不限次"
+          style="width:150px"
+        />
+        <span class="ap-unit">留空 = 不限次；手动「立即执行」不计入次数</span>
+      </div>
 
       <!-- 执行模型：与对话页模型同源，留空跟随会话绑定/全局默认 -->
       <div class="ap-row">
@@ -225,6 +277,12 @@ const form = reactive({
   intervalMinutes: 30,
   time: '09:30',
   weekdays: [1] as number[],
+  // 一次性触发：相对延迟（delayMinutes）与绝对时刻（runAt）二选一
+  onceMode: 'delay' as 'delay' | 'absolute',
+  delayMinutes: 60,
+  runAt: '',
+  // 最多执行次数：'' = 不限次
+  maxRuns: '' as string | number,
   prompt: '',
   permissionMode: 'confirm' as AutomationTaskInfo['permission_mode'],
   missedPolicy: 'skip' as 'skip' | 'run_once',
@@ -265,6 +323,10 @@ function openCreate() {
   form.intervalMinutes = 30;
   form.time = '09:30';
   form.weekdays = [1];
+  form.onceMode = 'delay';
+  form.delayMinutes = 60;
+  form.runAt = '';
+  form.maxRuns = '';
   form.prompt = '';
   form.permissionMode = 'confirm';
   form.missedPolicy = 'skip';
@@ -293,12 +355,30 @@ function openEdit(t: AutomationTaskInfo) {
   form.intervalMinutes = Number(cfg.interval_minutes) || 30;
   form.time = typeof cfg.time === 'string' ? cfg.time : '09:30';
   form.weekdays = Array.isArray(cfg.weekdays) ? cfg.weekdays.map(Number) : [1];
+  // once 落库后 trigger_config 只剩 run_at（delay_minutes 保存时已被后端归一化），
+  // 编辑时按绝对时刻形态回填；max_runs 为空表示不限次
+  form.onceMode = typeof cfg.run_at === 'string' && cfg.run_at.trim() ? 'absolute' : 'delay';
+  form.runAt = typeof cfg.run_at === 'string' ? toRunAtInput(cfg.run_at) : '';
+  form.delayMinutes = Number(cfg.delay_minutes) > 0 ? Number(cfg.delay_minutes) : 60;
+  form.maxRuns = t.max_runs === null || t.max_runs === undefined ? '' : String(t.max_runs);
   form.prompt = t.prompt;
   form.permissionMode = t.permission_mode;
   form.missedPolicy = t.missed_run_policy === 'run_once' ? 'run_once' : 'skip';
   form.notifyOnSuccess = !!t.notify_on_success;
   form.errors = [];
   form.show = true;
+}
+
+// 后端 run_at 是 "YYYY-MM-DD HH:MM"；datetime-local 需要的值是 "YYYY-MM-DDTHH:MM"
+function toRunAtInput(value: string): string {
+  const text = String(value || '').trim().replace(' ', 'T');
+  return text.length >= 16 ? text.slice(0, 16) : text;
+}
+
+function toRunAtValue(raw: string): string {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  return text.replace('T', ' ').slice(0, 16);
 }
 
 function pickWorkdir() {
@@ -329,6 +409,34 @@ async function onSave() {
   if (form.triggerType === 'interval') config.interval_minutes = form.intervalMinutes;
   if (form.triggerType === 'daily' || form.triggerType === 'weekly') config.time = form.time;
   if (form.triggerType === 'weekly') config.weekdays = [...form.weekdays].sort((a, b) => a - b);
+  // 一次性触发：延迟与绝对时刻互斥，只传其中一个键（后端按保存时刻把 delay_minutes
+  // 归一化成 run_at 落库；已过期的绝对时刻由后端拒绝并把原因放进 msg）
+  if (form.triggerType === 'once') {
+    if (form.onceMode === 'absolute') {
+      const runAt = toRunAtValue(form.runAt);
+      if (!runAt) {
+        form.errors = ['请选择一次性触发的绝对时刻，或改用「N 分钟后」'];
+        return;
+      }
+      config.run_at = runAt;
+    } else {
+      const delay = Number(form.delayMinutes);
+      if (!Number.isInteger(delay) || delay < 1) {
+        form.errors = ['「N 分钟后」必须是 ≥1 的整数分钟'];
+        return;
+      }
+      config.delay_minutes = delay;
+    }
+  }
+  // 最多执行次数：留空 = 不限次（null）；手动「立即执行」不计入该次数
+  const maxRunsRaw = String(form.maxRuns ?? '').trim();
+  if (maxRunsRaw !== '') {
+    const parsed = Number(maxRunsRaw);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      form.errors = ['最多执行次数必须是 ≥1 的整数（留空表示不限次）'];
+      return;
+    }
+  }
   form.saving = true;
   try {
     const res = await store.saveAutomationTask({
@@ -336,6 +444,7 @@ async function onSave() {
       name: form.name.trim(),
       trigger_type: form.triggerType,
       trigger_config: config,
+      max_runs: maxRunsRaw === '' ? null : Number(maxRunsRaw),
       target_session: targetSession,
       workdir,
       model_id: form.modelId,
@@ -362,10 +471,14 @@ function editingEnabled(): boolean {
 }
 
 function onToggle(t: AutomationTaskInfo, enabled: boolean) {
+  // 已完成任务生命周期结束：卡片开关已置灰，这里再兜一道
+  if (t.status === 'completed') return;
   void store.toggleAutomationTask(t.id, enabled);
 }
 
 async function onRunNow(t: AutomationTaskInfo) {
+  // 已完成任务不再派发（按钮已 disabled，这里兜住程序化点击）
+  if (t.status === 'completed') return;
   const res = await store.runAutomationTaskNow(t.id);
   if (res.ok) expanded[t.id] = true;
 }
@@ -413,6 +526,13 @@ function kindLabel(kind: string): string {
     scheduled: '定时', startup: '启动', manual: '手动', catchup: '补跑',
   };
   return map[kind] || kind;
+}
+
+// 任务生命周期状态（active/completed）文案：与运行历史的 statusLabel 是两套状态，
+// 独立映射，避免「已完成」被误读成某次运行的结果
+function taskStatusLabel(status?: string): string {
+  const map: Record<string, string> = { active: '进行中', completed: '已完成' };
+  return map[String(status || '')] || '';
 }
 
 function statusLabel(status: string): string {
@@ -502,6 +622,8 @@ function durationText(r: { started_at?: string | null; finished_at?: string | nu
   content: ''; position: absolute; width: 12px; height: 12px; left: 2px; top: 2px;
   background: var(--text-faint); border-radius: 50%; transition: 0.15s;
 }
+.ap-switch.off { opacity: 0.55; cursor: not-allowed; }
+.ap-switch input:disabled + .ap-switch-track { opacity: 0.6; }
 .ap-switch input:checked + .ap-switch-track { background: var(--accent); border-color: transparent; }
 .ap-switch input:checked + .ap-switch-track::before { transform: translateX(16px); background: #fff; }
 .ap-meta {

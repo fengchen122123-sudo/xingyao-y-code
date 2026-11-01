@@ -2108,3 +2108,65 @@ def test_alternating_plan_control_failures_abort_after_twelve_stalled_steps():
         _progress_record("cycle-11", name, content)
     ])) is False
     assert guard.should_abort() is True
+
+
+def test_budget_notice_provider_injects_at_step_boundary(mocker):
+    """子代理预算提醒必须以 user 消息插在 Step 边界，并随事件流上报。
+
+    注入位置错误（例如插在 tool_calls 与 tool 结果之间）会制造悬空
+    tool_calls，OpenAI/Anthropic 都会 400，所以这条契约必须锁住。
+    """
+    from types import SimpleNamespace
+
+    seen_messages = []
+
+    def completion(**kwargs):
+        seen_messages.append([dict(m) for m in kwargs.get("messages", [])])
+        return iter([_chunk("done")])
+
+    mocker.patch("core.llm.completion", side_effect=completion)
+    notices = ["⏳ 时间预算提醒：剩余 100s"]
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "执行子任务"}],
+        persist=False,
+        turn_id="subagent-budget",
+        parent_session="session",
+        parent_turn_id="turn",
+        budget_notice_provider=lambda: notices.pop(0) if notices else None,
+    ))
+
+    assert any(event.kind == "budget_notice" for event in events)
+    first_request = seen_messages[0]
+    assert first_request[-1]["role"] == "user"
+    assert "时间预算提醒" in first_request[-1]["content"]
+    # 只注入一次：provider 返回 None 后不再追加
+    assert sum(
+        1 for m in first_request if "时间预算提醒" in str(m.get("content"))
+    ) == 1
+
+
+def test_budget_notice_provider_failure_never_breaks_turn(mocker):
+    """提醒通道异常必须被吞掉：预算提示失败不能中断子代理回合。"""
+    def completion(**kwargs):
+        return iter([_chunk("ok")])
+
+    mocker.patch("core.llm.completion", side_effect=completion)
+
+    def broken_provider():
+        raise RuntimeError("provider boom")
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "任务"}],
+        persist=False,
+        turn_id="subagent-budget-broken",
+        parent_session="session",
+        parent_turn_id="turn",
+        budget_notice_provider=broken_provider,
+    ))
+
+    assert any(event.kind == "turn_finished" for event in events)

@@ -1,9 +1,11 @@
 import difflib
+import glob
 import json
 import logging
 import os
 import shutil
 import threading
+import time
 from copy import deepcopy
 
 from core.credentials import DPAPI_PREFIX, KEYRING_PREFIX, protect_secret, unprotect_secret
@@ -76,6 +78,90 @@ def _log_warning(message, *args):
         pass
 
 
+def _config_read_failed(path):
+    """主文件存在且有内容，但解析不出 JSON：属于「读失败」，不是首次运行。
+
+    写路径用它做最后一道闸：读不出来时宁可拒绝保存，也不能拿空配置覆盖用户数据
+    （历史事故：读失败 → load_config 写默认 → 17 个厂商配置被 1 个默认厂商替换）。
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
+        return False
+    except (OSError, json.JSONDecodeError):
+        return True
+
+
+def _quarantine_corrupt_config(path):
+    """把无法解析的配置留一份现场副本（只复制、不改动原文件），便于事后人工恢复。"""
+    target = f"{path}.corrupt-{time.strftime('%Y%m%d%H%M%S')}"
+    try:
+        shutil.copy2(path, target)
+        _log_warning("%s 读取失败，已保留现场副本 %s", os.path.basename(path), target)
+    except OSError as error:
+        _log_warning("%s 读取失败，现场副本保存失败（%s）", os.path.basename(path), error)
+
+
+# 备份恢复的顶层类型契约：不同用途的 JSON 文件顶层结构不同，必须按文件逐一定义，
+# 不能一刀切放宽成「dict 或 list 都算可用」。
+#   - config.json 等配置型文件是对象：主文件被误写成 list 时，若把 list 备份当配置
+#     恢复，就会用非法结构覆盖用户配置，所以仍要求非空 dict；
+#   - active_skills.json / builtin_skills_released.json 本身以 list 存储，沿用
+#     「非空 dict」判据会把唯一可用的备份判为无效，导致激活技能/释放记录静默清空。
+_LIST_TYPED_JSON_FILES = {"active_skills.json", "builtin_skills_released.json"}
+
+
+def _expected_json_root_type(path):
+    """该文件备份恢复时要求的 JSON 顶层类型（dict / list）。
+
+    按文件名判定而非按调用方传参，是为了让所有既有读取点（含测试里 monkeypatch
+    出来的临时路径）无需改动就拿到正确契约；未知文件默认按配置型（dict）对待，
+    保持本次修复前的严格行为。
+    """
+    return list if os.path.basename(path) in _LIST_TYPED_JSON_FILES else dict
+
+
+def _backup_data_usable(data, expected_type):
+    """备份内容是否可用：顶层类型符合该文件用途，且非空。
+
+    空对象/空列表视作不可用（与修复前「非空 dict」口径一致），继续向更早的备份回溯，
+    避免用一个空备份覆盖掉仍有内容的现场。
+    """
+    return isinstance(data, expected_type) and bool(data)
+
+
+def _recover_from_history_backups(path):
+    """按 .bak、config.json.bak.*（按修改时间倒序）找第一份可用配置。
+
+    单一 .bak 会在每次写入时被刷新，一旦主文件被错误覆盖，.bak 也可能是坏数据；
+    历史命名备份（*.bak.2026xxxx-xxx）是最后一道兜底。
+    """
+    expected_type = _expected_json_root_type(path)
+    candidates = [path + ".bak"]
+    try:
+        candidates.extend(
+            sorted(
+                glob.glob(path + ".bak.*"),
+                key=lambda candidate: os.path.getmtime(candidate),
+                reverse=True,
+            )
+        )
+    except OSError:
+        pass
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _backup_data_usable(data, expected_type):
+            _log_warning("%s 读取失败，已从备份 %s 恢复", os.path.basename(path), candidate)
+            return _restore_after_read(path, data)
+    return None
+
+
 def _atomic_write_json(path, data, indent=2):
     """原子写 JSON：临时文件 + os.replace，写前刷新 .bak，避免写一半崩溃损坏配置。"""
     tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -141,19 +227,24 @@ def _read_json_with_backup(path, default=None):
     except FileNotFoundError:
         return default
     except (json.JSONDecodeError, OSError):
-        backup = path + ".bak"
-        try:
-            with open(backup, "r", encoding="utf-8") as f:
-                data = _restore_after_read(path, json.load(f))
-            # 用备份回写主文件完成自愈；对 config.json 加锁，避免与正常写路径竞态覆盖新配置
-            if path == _CONFIG_FILE:
+        # 主文件坏了：先留现场副本，再从 .bak / 历史备份里找一份可用的回写自愈。
+        # 找不到可用备份时保持原文件不动并返回 default——绝不在这里写默认配置，
+        # 否则一次瞬时读取失败就会把用户的厂商/模型配置覆盖成新手引导结构。
+        data = _recover_from_history_backups(path)
+        # 判据与备份筛选一致：只有「类型符合该文件用途的非空数据」才回写自愈，
+        # list 型文件（active_skills.json 等）恢复到的 list 同样要走回写，不能被
+        # 固定写成 isinstance(data, dict) 挡在门外。
+        if _backup_data_usable(data, _expected_json_root_type(path)):
+            _quarantine_corrupt_config(path)
+            try:
+                # 对配置写路径加锁，避免与正常写路径竞态覆盖新配置
                 with _CONFIG_LOCK:
                     _atomic_write_json(path, data)
-            else:
-                _atomic_write_json(path, data)
+            except Exception as error:
+                _log_warning("%s 从备份恢复后回写失败（%s），本次仅在内存中使用备份内容", os.path.basename(path), error)
             return data
-        except Exception:
-            return default
+        _log_warning("%s 读取失败且没有可用备份，本次不覆盖原文件", os.path.basename(path))
+        return default
 
 # 获取用户目录下的 .ycode 文件夹。测试/隔离运行可在进程启动前显式覆盖，
 # 默认生产路径保持不变。
@@ -400,6 +491,11 @@ def update_config(mutator):
     """
     with _CONFIG_LOCK:
         data = _load(managed=False)
+        if _config_read_failed(_CONFIG_FILE):
+            _log_warning(
+                "config.json 当前无法解析且无可用备份，已拒绝本次写入，避免覆盖用户配置"
+            )
+            return data
         before = deepcopy(data)
         result = mutator(data)
         if result is not None:
@@ -425,6 +521,11 @@ def save_config_value(key, value):
     try:
         with _CONFIG_LOCK:
             data = _load(managed=False)
+            if _config_read_failed(_CONFIG_FILE):
+                _log_warning(
+                    "config.json 当前无法解析且无可用备份，已拒绝写入 %r，避免覆盖用户配置", key
+                )
+                return False
             before = dict(data) if isinstance(data, dict) else {}
             data[key] = value
             data, rejected = enforce_managed_writes(data, before)
@@ -452,6 +553,12 @@ def save_nested_config_value(dotted_key, value):
         parent_key, child_key = parts
         with _CONFIG_LOCK:
             data = _load(managed=False)
+            if _config_read_failed(_CONFIG_FILE):
+                _log_warning(
+                    "config.json 当前无法解析且无可用备份，已拒绝写入 %r，避免覆盖用户配置",
+                    dotted_key,
+                )
+                return False
             if not isinstance(data, dict):
                 data = {}
             before = dict(data)
@@ -498,6 +605,9 @@ KNOWN_CONFIG_KEYS = frozenset({
     "command_shell", "shell_env_policy",
     "agent_turn_step_limit", "prompt_cache_keepalive_seconds",
     "mermaid_auto_open", "read_file_result_max_chars",
+    # 断点续跑总开关（S4）：只登记键名，缺省=关闭；关闭时状态机、事件序列、
+    # 请求字节与改动前完全一致（规格 §9.5）
+    "resume",
     # 记忆/图片压缩
     "memory_compression", "image_compression",
     # 工具、安全与数据目录
@@ -533,6 +643,8 @@ KNOWN_CONFIG_KEYS = frozenset({
 # 已知嵌套对象（两层）允许的子键：顶层键 -> 子键集合
 KNOWN_NESTED_CONFIG_KEYS = {
     "secondary_model_roles": frozenset({"vision", "compression", "subagent"}),
+    # 断点续跑（默认关闭）：只允许 enabled 一个子键，拼错时启动告警可见
+    "resume": frozenset({"enabled"}),
     "image_compression": frozenset({"max_edge", "quality", "max_output_bytes"}),
     "memory_compression": frozenset({
         "retain_count", "retain_count_force",

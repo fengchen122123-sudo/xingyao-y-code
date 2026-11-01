@@ -527,16 +527,42 @@ class ToolBatchExecutor:
         if cancel_event is not None and cancel_event.is_set():
             raise KeyboardInterrupt("用户终止了工具执行。")
 
+    def _emit_started_journal(self, context, prepared_call):
+        """逐调用即时写 tool_started：只落哈希与元数据，不落参数原文。"""
+        facts = _journal_facts_for_call(prepared_call)
+        facts["started"] = True
+        self._emit_journal(context, "tool_started", facts)
+
+    def _emit_finished_journal(self, context, prepared_call, message, duration_ms):
+        """逐调用即时写 tool_finished：只落结果哈希/耗时/状态，不落正文。"""
+        facts = _journal_facts_for_call(prepared_call)
+        facts["result_sha256"] = hashlib.sha256(
+            _journal_text_content(message).encode("utf-8")
+        ).hexdigest()
+        facts["duration_ms"] = max(0, int(duration_ms))
+        facts["result_status"] = (
+            "ok" if self.result_ok(prepared_call.decoded.name, message) else "error"
+        )
+        self._emit_journal(context, "tool_finished", facts)
+
     def _execute_timed(self, decoded, context):
         started_at = self.clock()
         message = self.execute_decoded(decoded, context)
         duration_ms = round((self.clock() - started_at) * 1000)
         return message, max(0, duration_ms)
 
-    def _execute_guarded(self, decoded, context):
+    def _execute_guarded(self, prepared_call, context):
+        decoded = prepared_call.decoded
+        # 进入即写 STARTED：执行中途崩溃（进程被杀/抛错）时，journal 里
+        # 「有 STARTED 无 FINISHED」就是不确定态，续跑据此归 BLOCK，绝不重放。
+        self._emit_started_journal(context, prepared_call)
         guard_exempt = repeat_guard_exempt(decoded.name, decoded.arguments)
         if not guard_exempt and not self.repeat_guard.should_execute(decoded.name, decoded.raw_arguments):
-            return _repeat_call_blocked_result(decoded), 0
+            # 被重复调用守卫拦下也成对写 FINISHED：它确实"跑过"，不能留成
+            # 不确定态，否则续跑会无谓 BLOCK 该只读调用。
+            blocked = _repeat_call_blocked_result(decoded)
+            self._emit_finished_journal(context, prepared_call, blocked, 0)
+            return blocked, 0
         message, duration_ms = self._execute_timed(decoded, context)
         if not guard_exempt:
             self.repeat_guard.record(
@@ -544,11 +570,12 @@ class ToolBatchExecutor:
                 decoded.raw_arguments,
                 ok=self.result_ok(decoded.name, message),
             )
+        self._emit_finished_journal(context, prepared_call, message, duration_ms)
         return message, duration_ms
 
-    def _execute_parallel(self, decoded, context):
+    def _execute_parallel(self, prepared_call, context):
         with self._parallel_slots:
-            return self._execute_guarded(decoded, context)
+            return self._execute_guarded(prepared_call, context)
 
     def _wait_for(self, future, cancel_event):
         while not future.done():
@@ -590,15 +617,14 @@ class ToolBatchExecutor:
                 "tool_requested",
                 self.event_payload(prepared_call.decoded),
             )
+        # journal 的 tool_started 不在这里写：批内排队不代表已开始执行，
+        # 逐调用即时写在 _execute_guarded 里（GUI 的 on_event 序列保持不变）。
         for prepared_call in batch.calls:
             self._emit(
                 on_event,
                 "tool_started",
                 self.event_payload(prepared_call.decoded),
             )
-            facts = _journal_facts_for_call(prepared_call)
-            facts["started"] = True
-            self._emit_journal(context, "tool_started", facts)
 
     def execute_batch(self, batch, context, on_event):
         self._raise_if_cancelled(context.cancel_event)
@@ -606,7 +632,7 @@ class ToolBatchExecutor:
             futures = [
                 self.submit_call(
                     self._execute_parallel,
-                    prepared_call.decoded,
+                    prepared_call,
                     context,
                 )
                 for prepared_call in batch.calls
@@ -619,7 +645,7 @@ class ToolBatchExecutor:
             for prepared_call in batch.calls:
                 self._raise_if_cancelled(context.cancel_event)
                 results.append(
-                    self._execute_guarded(prepared_call.decoded, context)
+                    self._execute_guarded(prepared_call, context)
                 )
 
         records = []
@@ -643,19 +669,6 @@ class ToolBatchExecutor:
                 duration_ms,
             )
             self._emit(on_event, "tool_finished", finished_payload)
-            # journal 事实独立于 finished_payload 计算：payload 允许被调用方注入成
-            # 携带完整结果的版本（GUI/CLI 需要），而 journal 只允许哈希与元数据。
-            facts = _journal_facts_for_call(prepared_call)
-            facts["result_sha256"] = hashlib.sha256(
-                _journal_text_content(message).encode("utf-8")
-            ).hexdigest()
-            facts["duration_ms"] = max(0, int(duration_ms))
-            facts["result_status"] = (
-                "ok"
-                if self.result_ok(prepared_call.decoded.name, message)
-                else "error"
-            )
-            self._emit_journal(context, "tool_finished", facts)
         return tuple(records)
 
     def execute(
@@ -1077,6 +1090,29 @@ class ToolPipeline:
             )
         except Exception:
             return False
+    def _automation_gate_blocked(self, decoded, context):
+        """自动化回合安全门控兜底（G3 防任务自我繁殖）。
+
+        星轨自动化派发的回合里，写类自动化工具（创建/修改/删除/立即执行）必须
+        直接失败：这类回合无人值守，确认卡等于卡死，且放行会让任务自我繁殖。
+
+        schema 层（core.llm）已按同一策略把这 4 个工具从工具列表里剔除，这里
+        是执行侧兜底：MCP / 插件 / 与注册表同名的调用不经过 schema 过滤，同样
+        被拦下。策略与判定集中在 core.automation.tool_policy（唯一事实源）。
+
+        返回带拒绝文案的 tool message；放行返回 None。门控组件异常按放行处理
+        （fail-open），绝不因策略组件故障阻断普通回合。
+        """
+        try:
+            from core.automation import tool_policy as automation_tool_policy
+
+            if automation_tool_policy.is_automation_turn_tool_blocked(decoded.name):
+                return _tool_message(
+                    decoded, automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE
+                )
+        except Exception:
+            _LOGGER.debug("自动化回合门控判定失败（旁路，按放行处理）", exc_info=True)
+        return None
     def _run_tool_hook(
         self,
         decoded,
@@ -1183,6 +1219,18 @@ class ToolPipeline:
                 or app_context.get_current_session(),
             )
             return _tool_message(decoded, SECRETARY_READONLY_DENIED_MESSAGE)
+
+        # 自动化回合安全门控（G3 防任务自我繁殖）：与秘书门控一样放在权限判定
+        # 之前——无人值守回合里确认卡等于卡死，直接失败更清晰。schema 层已隐藏
+        # 同名工具，这里兜住 MCP / 插件 / 同名注册工具的旁路调用。
+        automation_blocked = self._automation_gate_blocked(decoded, context)
+        if automation_blocked is not None:
+            _LOGGER.info(
+                "自动化回合拒绝写类自动化工具：%s（run_id=%s）",
+                decoded.name,
+                app_context.get_thread_automation_turn() or "",
+            )
+            return automation_blocked
 
         # 固定 computer 适配（设计 19.2）：保留名 computer_action 在 resolve_tool
         # 之前识别，不经过注册表与权限链（设置开关即用户授权边界）。

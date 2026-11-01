@@ -801,3 +801,134 @@ def test_native_crash_recovery_marks_interrupted_and_never_continues(tmp_path, m
         generator.close()
     except Exception:
         pass
+
+
+def test_capture_request_persists_model_and_canonical_api_base(tmp_path):
+    """capture_request 补写 model/api_base，且 api_base 只落规范化身份。"""
+    from core.harness.request_envelope import PreparedStreamRequest, RequestEnvelope
+    from core.harness.runtime import TurnRuntime
+    from core.memory import canonicalize_api_base
+
+    manager = MemoryManager(str(tmp_path / "capture.db"))
+    manager.create_session_explicit("session")
+    turn = TurnRuntime.start(
+        "turn-capture",
+        "session",
+        persist=True,
+        manager=manager,
+        cancel_event=threading.Event(),
+        clock_ms=lambda: 10_000,
+    )
+    turn.mark_running()
+    step = turn.begin_step()
+    raw_base = "https://user:pass@relay.example.com/v1/?token=abc#frag"
+    prepared = PreparedStreamRequest(
+        "openai",
+        {
+            "model": "deepseek/deepseek-chat",
+            "api_key": "sk-secret-value",
+            "api_base": raw_base,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+            "timeout": 90,
+        },
+    )
+    envelope = RequestEnvelope.capture(
+        prepared,
+        cache_scope="main",
+        request_reason="冷启动",
+        attempt=1,
+        deepseek_generation_id=None,
+        deepseek_message_count=None,
+    )
+    assert envelope.model == "deepseek/deepseek-chat"
+    assert envelope.api_base == raw_base
+
+    step.capture_request(envelope)
+    model, stored_base = manager.conn.execute(
+        "SELECT model, api_base FROM harness_steps WHERE step_id = ?",
+        (step.step_id,),
+    ).fetchone()
+    assert model == "deepseek/deepseek-chat"
+    assert stored_base == canonicalize_api_base(raw_base)
+    assert "pass" not in stored_base
+    assert "abc" not in stored_base
+    assert "relay.example.com" in stored_base
+    turn.fail("capture_test_done")
+
+
+def test_model_and_api_base_fields_do_not_change_prefix_fingerprints():
+    """新增的两个路由字段是旁挂元数据：messages/system/tools 哈希不变。"""
+    from core.harness.request_envelope import PreparedStreamRequest, RequestEnvelope
+
+    messages = [{"role": "user", "content": "qi"}]
+    shared = {"model": "m", "messages": messages, "tools": [], "timeout": 90}
+    with_base = RequestEnvelope.capture(
+        PreparedStreamRequest(
+            "openai", {**shared, "api_base": "https://relay.example.com/v1"}
+        ),
+        cache_scope="main",
+        request_reason="冷启动",
+        attempt=1,
+        deepseek_generation_id=None,
+        deepseek_message_count=None,
+    )
+    without_base = RequestEnvelope.capture(
+        PreparedStreamRequest("openai", dict(shared)),
+        cache_scope="main",
+        request_reason="冷启动",
+        attempt=1,
+        deepseek_generation_id=None,
+        deepseek_message_count=None,
+    )
+    assert with_base.fingerprint.messages_sha256 == without_base.fingerprint.messages_sha256
+    assert with_base.fingerprint.system_sha256 == without_base.fingerprint.system_sha256
+    assert with_base.fingerprint.tools_sha256 == without_base.fingerprint.tools_sha256
+    assert without_base.api_base == ""
+
+
+def test_canonicalize_api_base_never_keeps_credentials():
+    from core.memory import canonicalize_api_base
+
+    canonical = canonicalize_api_base(
+        "https://user:pass@relay.example.com/v1/?api_key=sk-live-123#frag"
+    )
+    assert canonical.startswith("https://relay.example.com/v1")
+    assert "pass" not in canonical
+    assert "sk-live-123" not in canonical
+    assert canonicalize_api_base("") == ""
+    assert canonicalize_api_base(None) == ""
+
+
+def test_tool_call_writes_paired_started_and_finished_journal(tmp_path, mocker):
+    """一次真实工具调用在 journal 里成对写 tool_started → tool_finished。"""
+    manager = MemoryManager(str(tmp_path / "runtime.db"))
+    manager.create_session_explicit("session")
+    mocker.patch("core.app_context.get_manager", return_value=manager)
+    (tmp_path / "a.py").write_text("body", encoding="utf-8")
+    mocker.patch(
+        "core.llm.completion",
+        side_effect=[
+            _tool_stream("call-1", "read_file", {"file_path": str(tmp_path / "a.py")}),
+            _text_stream("done"),
+        ],
+    )
+    # 只验 journal 成对写：工具真实执行换成固定只读结果，避开沙盒询问等
+    # 环境相关分支；批执行器与 journal sink 仍走生产路径。
+    mocker.patch(
+        "core.llm._execute_single_tool_call",
+        side_effect=_fixed_tool_result,
+    )
+
+    list(_persistent_events())
+
+    rows = manager.conn.execute(
+        "SELECT kind, tool_name, call_ordinal, result_status FROM harness_events "
+        "WHERE turn_id = ? AND kind IN ('tool_started', 'tool_finished') "
+        "ORDER BY sequence",
+        ("turn-runtime",),
+    ).fetchall()
+    assert [row[0] for row in rows] == ["tool_started", "tool_finished"]
+    assert {row[1] for row in rows} == {"read_file"}
+    assert {row[2] for row in rows} == {0}
+    assert rows[1][3] == "ok"

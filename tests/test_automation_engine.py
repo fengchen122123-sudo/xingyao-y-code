@@ -204,3 +204,50 @@ def test_engine_stopped_thread_no_longer_dispatches(storage):
     engine.notify_changed()
     time.sleep(0.2)
     assert recorder.call_count(task["id"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# 有限次执行（max_runs）：达上限即停、手动执行不消耗次数
+# ---------------------------------------------------------------------------
+
+def _finish_queued_runs(storage, task_id: str) -> None:
+    """收尾该任务全部 queued 运行行：fake dispatch 不跑真实回合，需手动解除单飞。"""
+    for run in storage.list_runs(task_id):
+        if run["status"] == "queued":
+            storage.finish_run(run["id"], "completed")
+
+
+def test_max_runs_task_stops_after_limit(storage):
+    task = _insert_task(storage, name="只跑两次", max_runs=2)
+    recorder = DispatchRecorder()
+    engine = AutomationEngine(storage, recorder)
+
+    engine._run_iteration()  # 第 1 次认领
+    assert recorder.call_count(task["id"]) == 1
+    _finish_queued_runs(storage, task["id"])
+    storage.set_next_run_raw(task["id"], time.time() - 10)
+
+    engine._run_iteration()  # 第 2 次认领 → 达上限，落终态
+    assert recorder.call_count(task["id"]) == 2
+    reloaded = storage.get_task(task["id"])
+    assert reloaded["scheduled_run_count"] == 2
+    assert reloaded["status"] == "completed"
+    assert reloaded["next_run_at"] is None
+
+    # 终态之后即便把 next_run_at 拽回过去，引擎也不再认领
+    _finish_queued_runs(storage, task["id"])
+    storage.set_next_run_raw(task["id"], time.time() - 10)
+    engine._run_iteration()
+    assert recorder.call_count(task["id"]) == 2
+
+
+def test_manual_run_does_not_consume_max_runs(storage):
+    task = _insert_task(storage, name="手动试跑", max_runs=2)
+    manual = storage.create_manual_run_if_idle(task)
+    assert manual is not None and manual["status"] == "queued"
+    storage.finish_run(manual["id"], "completed")
+
+    reloaded = storage.get_task(task["id"])
+    assert reloaded["scheduled_run_count"] == 0  # 手动执行不消耗生命周期
+    assert reloaded["status"] == "active"
+    assert reloaded["next_run_at"] is not None  # 周期节奏不受手动执行影响

@@ -129,6 +129,31 @@ it('桥注入晚于挂载：pywebviewready 事件后恢复就绪并校准状态�
   wrapper.unmount();
 });
 
+it('Office 文档转换期间显示进行中浮层，优先于起始页，结束后消失', async () => {
+  const store = useAppStore();
+  const wrapper = await mountPane(true);
+  (window as any).pywebview = { api: mockApi() };
+  window.dispatchEvent(new Event('pywebviewready'));
+  await nextTick();
+  await nextTick();
+
+  // 转换中：浮层盖过起始页，给出文件名与耗时预期（否则用户会以为点击没生效）
+  store.officePreviewPending = { path: 'D:\\proj\\季度报告.pptx', name: '季度报告.pptx' };
+  await nextTick();
+
+  const pending = wrapper.find('[data-test="bp-office-pending"]');
+  expect(pending.exists()).toBe(true);
+  expect(pending.text()).toContain('季度报告.pptx');
+  expect(pending.text()).toContain('首次转换需要');
+  expect(wrapper.find('[data-test="bp-start"]').exists()).toBe(false);
+
+  // 转换结束（成功或失败都会在 finally 里清空）→ 浮层立即消失
+  store.officePreviewPending = null;
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-office-pending"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
 it('active 且已有页面时同步矩形并首次 open(rect, "")', async () => {
   const api = mockApi();
   (window as any).pywebview = { api };
@@ -142,6 +167,36 @@ it('active 且已有页面时同步矩形并首次 open(rect, "")', async () => 
   expect(rect).toEqual({ x: 0, y: 0, width: 300, height: 400 });
   expect(url).toBe('');
   expect(wrapper.find('[data-test="bp-unsupported"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('浏览器操控期间在工具栏提供停止入口，run 结束后消失', async () => {
+  // 浏览器模式不再渲染顶部安全条：停止入口必须在浏览器工具栏可见，
+  // 否则用户失去一键停止能力（只剩 Ctrl+Alt+Esc 热键）
+  const api = {
+    ...mockApi(),
+    stop_computer_control: vi.fn().mockResolvedValue({ ok: true, run_id: 'run-1', status: 'stopped' }),
+  };
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-1',
+    status: 'running',
+    target: 'browser',
+  };
+
+  const wrapper = await mountPane(true);
+  const stop = wrapper.find('[data-test="bp-computer-stop"]');
+  expect(stop.exists()).toBe(true);
+
+  await stop.trigger('click');
+  expect(api.stop_computer_control).toHaveBeenCalledWith('run-1');
+
+  // run 收场（终态）后按钮立即消失，不长期占用工具栏
+  store.computerRun = { ...store.computerRun, status: 'stopped' };
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-computer-stop"]').exists()).toBe(false);
   wrapper.unmount();
 });
 

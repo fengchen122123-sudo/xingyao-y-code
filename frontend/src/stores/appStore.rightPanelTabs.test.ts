@@ -105,7 +105,7 @@ it('浏览器自动化事件按会话归属：不抢当前会话的屏，切回�
   expect(runtimeA.rightPanelExpanded).toBe(true);
 });
 
-it('浏览器自动化事件缺 session_name 时归属当前会话（兼容旧后端/视口变更推送）', () => {
+it('浏览器自动化事件缺 session_name 时只应用分辨率，不替任何会话开页签', () => {
   const store = useAppStore();
   store.currentSessionName = 'B';
   store.rightPanelCollapsed = true;
@@ -114,10 +114,10 @@ it('浏览器自动化事件缺 session_name 时归属当前会话（兼容旧�
     type: 'embedded_browser_automation',
     data: { width: 375, height: 667 },
   } as any);
-  expect(store.rightPanelTabs).toEqual(['browser']);
-  expect(store.rightPanelActiveTab).toBe('browser');
-  expect(store.rightPanelCollapsed).toBe(false);
-  expect(store.rightPanelPicker).toBe(false);
+  // 2026-10-28：此前缺 session 会回落当前会话，导致视口变更在别人窗口冒出浏览器
+  expect(store.embeddedBrowser.automationViewport).toEqual([375, 667]);
+  expect(store.rightPanelTabs).toEqual([]);
+  expect(store.rightPanelCollapsed).toBe(true);
 });
 
 it('openRightPanelTab 打开详情页签时缺省选中本会话第一个任务，不跨会话代选', () => {
@@ -163,4 +163,39 @@ it('切会话时丢弃失去 run 的残留操控页签（终态收场发生在�
   await store.switchSession('A');
   expect(store.rightPanelTabs).toContain('computer');
   expect(store.rightPanelActiveTab).toBe('computer');
+});
+
+it('embedded_browser_assigned：后台会话只在自己的右栏登记，不抢当前会话', () => {
+  const store = useAppStore();
+  store.currentSessionName = 'A';
+  store.openRightPanelTab('files');
+
+  store.handleBridgeEvent({
+    type: 'embedded_browser_assigned',
+    data: { session_name: 'B', url: 'https://example.com' },
+  } as any);
+
+  // 当前查看的 A 完全不受打扰：页签不变、也没有导航请求
+  expect(store.rightPanelTabs).toEqual(['files']);
+  expect(store.browserNavRequest).toBeNull();
+  // 发起会话 B 的 runtime 已记下浏览器页签，切回时自动出现
+  const runtimeB = (store as any).sessionRuntimeByName['B'];
+  expect(runtimeB.rightPanelTabs).toEqual(['browser']);
+  expect(runtimeB.rightPanelActiveTab).toBe('browser');
+});
+
+it('embedded_browser_activation：当前会话收到回放地址时写入导航请求并开页签', () => {
+  const store = useAppStore();
+  store.currentSessionName = 'B';
+
+  store.handleBridgeEvent({
+    type: 'embedded_browser_activation',
+    data: { session_name: 'B', url: 'https://example.com/page' },
+  } as any);
+
+  expect(store.rightPanelTabs).toContain('browser');
+  expect(store.browserNavRequest).toMatchObject({
+    url: 'https://example.com/page',
+    session: 'B',
+  });
 });

@@ -283,6 +283,11 @@ class UndoErrorCode:
     NO_ACTIVE_CHECKPOINT = "no_active_checkpoint"
 
 
+# 文件级撤销结果（turn_undo_files.undo_result）：skipped 表示该文件在回合内
+# 被外部修改，已退出本回合撤销范围，但回合本身仍可继续写入。
+UNDO_RESULT_SKIPPED = "skipped"
+
+
 # ---------------------------------------------------------------------------
 # 值对象
 # ---------------------------------------------------------------------------
@@ -434,6 +439,8 @@ class TurnUndoPreview:
     restore_path_state_count: int
     created_files: tuple[str, ...]
     conflicts: tuple[FileConflict, ...] = ()
+    # 因回合内被外部修改而退出撤销范围的文件（display_path）；撤销时跳过
+    skipped_files: tuple[str, ...] = ()
     has_uncovered_command_effects: bool = False
     subsequent_completed_turns: int = 0
     workspace_root: str = ""

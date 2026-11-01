@@ -33,6 +33,46 @@ it('桌面端根元素内联宽度跟随 store.rightPanelWidth，折叠时负 ma
   wrapper.unmount();
 });
 
+it('浏览器操控不自动弹出操控页签（右侧只留可围观的浏览器）', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel, { global: { plugins: [pinia] } });
+
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-1',
+    status: 'running',
+    target: 'browser',
+  };
+  await nextTick();
+  await nextTick();
+
+  expect(store.rightPanelTabs).not.toContain('computer');
+  wrapper.unmount();
+});
+
+it('桌面操控仍自动登记操控页签（回归：只对浏览器目标收口）', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel, { global: { plugins: [pinia] } });
+
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-1',
+    status: 'running',
+    target: 'desktop',
+  };
+  await nextTick();
+  await nextTick();
+
+  expect(store.rightPanelTabs).toContain('computer');
+  wrapper.unmount();
+});
+
 it('图片预览：kind=image 时弹窗正文渲染 <img>，文本代码块不出现', async () => {
   const store = useAppStore();
   store.filePreview = {
@@ -75,7 +115,7 @@ it('文本预览：kind=text 时仍渲染代码块，不出现 <img>', async () 
 
 // ── 多页签容器：页签条 + 单独关闭 + 选择页追加 ──
 
-it('中性入口展开面板：无页签先显示选择页五卡，点卡片开出对应页签', async () => {
+it('中性入口展开面板：无页签先显示选择页六卡，点卡片开出对应页签', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
@@ -84,7 +124,7 @@ it('中性入口展开面板：无页签先显示选择页五卡，点卡片开�
   await nextTick();
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
   expect(wrapper.findAll('.tp-card').map(c => c.text().trim()))
-    .toEqual(['文件', 'Git', '星眼 · 浏览器', '星港 · 后台任务', '星舰 · 子代理']);
+    .toEqual(['文件', 'Git', '星眼 · 浏览器', '星港 · 后台任务', '星舰 · 子代理', '小说']);
 
   await wrapper.find('[data-test="picker-card-files"]').trigger('click');
   await nextTick();
@@ -113,6 +153,23 @@ it('浏览器卡片开出浏览器页签并挂载 BrowserPane', async () => {
   expect(pane.isVisible()).toBe(true);
   expect(pane.find('browser-pane-stub').exists()).toBe(true);
   expect(wrapper.find('[data-test="tab-browser"]').classes()).toContain('active');
+  wrapper.unmount();
+});
+
+it('小说卡片开出小说页签并挂载 NovelPane', async () => {
+  const store = useAppStore();
+  // NovelPane 激活时会向宿主桥拉取项目状态，测试中以 stub 替换（只验证入口链路）
+  const wrapper = mount(RightPanel, { global: { stubs: { NovelPane: true } } });
+
+  store.toggleRightPanel();
+  await nextTick();
+  await wrapper.find('[data-test="picker-card-novel"]').trigger('click');
+  await nextTick();
+
+  const wrap = wrapper.find('[data-test="novel-pane-wrap"]');
+  expect(wrap.exists()).toBe(true);
+  expect(wrap.isVisible()).toBe(true);
+  expect(wrapper.find('[data-test="tab-novel"]').classes()).toContain('active');
   wrapper.unmount();
 });
 
@@ -329,13 +386,20 @@ it('目标任务已被清理（ok=false）时显示未找到提示而非空白',
 // ── 操控页签（设计 16.2：run 出现自动切入，不进选择页） ──
 
 it('run 出现后自动切入操控页签并校准快照，关闭页签后事件不抢回，新 run 再开一次', async () => {
-  const getStatus = vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'paused', pause_reason: 'user_pause' });
-  (window as any).pywebview = { api: { get_computer_control_status: getStatus } };
   const store = useAppStore();
+  // 快照回当前 run（真实桥行为）：校准按 store 里最新的 run_id 返回
+  const getStatus = vi.fn(async () => ({
+    run_id: store.computerRun.run_id,
+    status: 'paused',
+    pause_reason: 'user_pause',
+  }));
+  (window as any).pywebview = { api: { get_computer_control_status: getStatus } };
   store.rightPanelCollapsed = false;
   const wrapper = mount(RightPanel);
 
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'starting' });
+  // 事件不带归属（旧后端）：开页签前先做一次快照校准，等页签真正落地再断言
+  await vi.waitFor(() => expect(store.computerLastAutoOpenedRunId).toBe('run-1'));
   await nextTick();
 
   expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
@@ -357,8 +421,9 @@ it('run 出现后自动切入操控页签并校准快照，关闭页签后事件
   await nextTick();
   expect(store.rightPanelPicker).toBe(true);
 
-  // 新 run 开始：再自动开一次
+  // 新 run 开始：再自动开一次（同样先校准归属再落地页签）
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'starting' });
+  await vi.waitFor(() => expect(store.computerLastAutoOpenedRunId).toBe('run-2'));
   await nextTick();
   expect(store.rightPanelPicker).toBe(false);
   expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
@@ -542,6 +607,54 @@ it('后台任务详情头部与列表同口径：只认当前会话任务，不�
 });
 
 // ── 操控页签的会话归属 ──
+
+it('run 首个事件带归属时操控页签直接写进归属会话，不碰当前查看的会话', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'B';
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  // 事件信封自带 owner_session_id（后端每个电脑操控事件都下发）：首帧即可定归属
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-1', event_seq: 1,
+    status: 'running', owner_session_id: 'A',
+  } as any);
+  await nextTick();
+
+  expect(store.computerRun.owner_session_id).toBe('A');
+  expect(store.rightPanelTabs).not.toContain('computer');
+  const runtimeA = (store as any).sessionRuntimeByName['A'];
+  expect(runtimeA.rightPanelTabs).toContain('computer');
+  wrapper.unmount();
+});
+
+it('事件缺归属时先校准快照再开页签，绝不回落当前查看的会话', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'B';
+  store.rightPanelCollapsed = false;
+  // 旧后端事件不带归属：快照校准是唯一真值源
+  (window as any).pywebview = {
+    api: {
+      get_computer_control_status: async () => ({
+        ok: true, run_id: 'run-1', owner_session_id: 'A', status: 'running',
+      }),
+    },
+  };
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running',
+  } as any);
+
+  // 2026-10-30 反馈：此前归属未知直接回落 currentSessionName，后台会话发起的
+  // 操控把页签开进用户正看着的会话。校准后应落进归属会话 A
+  await vi.waitFor(() => {
+    const runtimeA = (store as any).sessionRuntimeByName?.['A'];
+    expect(runtimeA?.rightPanelTabs || []).toContain('computer');
+  });
+  expect(store.rightPanelTabs).not.toContain('computer');
+  wrapper.unmount();
+});
 
 it('run 归属其他会话时操控页签写入归属会话，不污染当前查看的会话', async () => {
   const store = useAppStore();

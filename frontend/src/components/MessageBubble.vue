@@ -7,10 +7,20 @@
       <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-msg-sender">
         <b class="qq09-sender-name">木偶</b>
       </div>
-      <div class="bubble user-bubble">
-        <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
+      <div class="bubble user-bubble" :class="{ 'is-editing': editing }">
+        <textarea
+          v-if="editing"
+          ref="editInputRef"
+          v-model="editText"
+          class="user-edit-input"
+          data-test="user-edit-input"
+          rows="3"
+          @keydown="onEditKeydown"
+          @paste="onEditPaste"
+        ></textarea>
+        <div v-else-if="msg.content" class="user-text">{{ msg.content }}</div>
         <div
-          v-if="msg.images && msg.images.length"
+          v-if="!editing && msg.images && msg.images.length"
           class="img-grid"
           :class="{ single: msg.images.length === 1, duo: msg.images.length === 2 }"
         >
@@ -23,6 +33,24 @@
             @click="store.openLightbox(msg.images!, i)"
           >
         </div>
+        <!-- 编辑态：图片可逐张移除，新图由下方「添加图片」追加 -->
+        <div
+          v-if="editing && editImages.length"
+          class="edit-img-grid"
+          data-test="user-edit-images"
+        >
+          <div v-for="(img, i) in editImages" :key="i" class="edit-img-cell">
+            <img :src="img" class="edit-img" alt="待发送的图片">
+            <button
+              type="button"
+              class="edit-img-remove"
+              title="移除这张图片"
+              data-test="user-edit-image-remove"
+              :disabled="editSubmitting"
+              @click="removeEditImage(i)"
+            >×</button>
+          </div>
+        </div>
         <div
           v-if="msg.attachment_notes && msg.attachment_notes.length"
           class="attachment-notes"
@@ -34,8 +62,60 @@
           >{{ note }}</div>
         </div>
       </div>
-      <!-- 用户消息操作栏：气泡下方，悬停气泡时浮现，点击复制本条消息文本 -->
-      <div v-if="msg.content" class="user-action-bar">
+      <!-- 编辑态操作区：保存即截断本条之后的历史并重新生成；被截断回合的
+           文件改动不会回滚，所以就地提示一句，避免用户以为代码也退回去了 -->
+      <div v-if="editing" class="user-edit-bar">
+        <span class="user-edit-hint">{{ editHint }}</span>
+        <input
+          ref="editImageInput"
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp"
+          multiple
+          class="edit-file-input"
+          data-test="user-edit-image-input"
+          @change="onEditImagesPicked"
+        >
+        <button
+          type="button"
+          class="msg-copy-btn"
+          data-test="user-edit-image-add"
+          :disabled="editSubmitting"
+          @click="pickEditImages"
+        >
+          <span>添加图片</span>
+        </button>
+        <button
+          type="button"
+          class="msg-copy-btn"
+          data-test="user-edit-cancel"
+          :disabled="editSubmitting"
+          @click="cancelEdit"
+        >
+          <span>取消</span>
+        </button>
+        <button
+          type="button"
+          class="msg-copy-btn user-edit-submit"
+          data-test="user-edit-submit"
+          :disabled="editSubmitting || (!editText.trim() && !editImages.length)"
+          @click="submitEdit"
+        >
+          <span>{{ editSubmitting ? '处理中…' : '保存并重新生成' }}</span>
+        </button>
+      </div>
+      <!-- 用户消息操作栏：气泡下方，悬停气泡时浮现；点击编辑或复制本条消息 -->
+      <div v-else-if="msg.content" class="user-action-bar">
+        <button
+          v-if="canEdit"
+          type="button"
+          class="msg-copy-btn"
+          title="编辑并重新生成"
+          data-test="user-edit-btn"
+          @click="startEdit"
+        >
+          <AppIcon name="pencil" :size="13" :stroke-width="2" />
+          <span>编辑</span>
+        </button>
         <button
           class="msg-copy-btn"
           :class="{ copied: userCopied }"
@@ -111,6 +191,42 @@
           <AppIcon name="triangle-alert" :size="13" /> {{ msg.error_note }}
         </div>
 
+        <!-- 登录态失效：错误提示下方直接出现「重新登录」，点一下拉起登录窗 -->
+        <div v-if="msg.error_note && isLoginExpiredError(msg.error_note)" class="login-again-row">
+          <button
+            type="button"
+            class="login-again-btn"
+            data-test="login-again-btn"
+            @click="onLoginAgain"
+          >
+            <AppIcon name="refresh" :size="12" /> 重新登录
+          </button>
+        </div>
+
+        <!-- 断点续跑（S4）：仅当后端 resume_plan 判定可续跑时出现（开关关闭时不出现）。
+             按钮只续跑无写操作的调用；含写操作的调用需人工重做，blockers 列表就地展示 -->
+        <div v-if="msg.error_note && store.resumeAvailable" class="resume-continue" data-test="resume-continue">
+          <button
+            type="button"
+            class="resume-btn"
+            data-test="resume-continue-btn"
+            :disabled="store.resumeBusy"
+            @click="store.runResume()"
+          >
+            <AppIcon name="play" :size="12" /> 从断点继续
+          </button>
+          <span class="resume-hint">仅回灌已完成的调用；含写操作的调用需手动重做</span>
+        </div>
+        <ul v-if="msg.error_note && store.resumeBlockers.length" class="resume-blockers" data-test="resume-blockers">
+          <li
+            v-for="item in store.resumeBlockers"
+            :key="item.call_ordinal"
+            data-test="resume-blocker-item"
+          >
+            第 {{ item.call_ordinal }} 个调用 {{ item.tool_name }} 需手动重做
+          </li>
+        </ul>
+
         <!-- 等待模型响应期间的动态反馈（对齐 CLI 的"正在干活"） -->
         <div v-if="showWorking" class="working-line">
           <span class="spin"></span>
@@ -151,6 +267,18 @@
       <div class="error-body">
         <div class="error-title">运行错误</div>
         <div class="error-text">{{ msg.content }}</div>
+        <!-- 登录过期（账号 cookie / 专属 Key 失效）：错误旁直接给登录入口，
+             不要求用户自己去找左下角账号卡片 -->
+        <div v-if="isLoginExpiredError(msg.content)" class="login-again-row">
+          <button
+            type="button"
+            class="login-again-btn"
+            data-test="login-again-btn"
+            @click="onLoginAgain"
+          >
+            <AppIcon name="refresh" :size="12" /> 重新登录
+          </button>
+        </div>
       </div>
     </div>
 
@@ -174,6 +302,7 @@ import { renderMermaidBlocks } from '../utils/mermaidRenderer';
 import { canOpenInRightPanel, toAbsoluteLocalPath } from '../utils/localPath';
 import { useIsMobile } from '../composables/useViewport';
 import { formatTokenSpeed, formatDuration } from '../utils/tokenSpeed';
+import { isLoginExpiredError } from '../utils/loginExpired';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
@@ -189,6 +318,13 @@ const props = withDefaults(defineProps<{
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
 // 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
 const store = useAppStore();
+
+// 登录过期提示上的「重新登录」：拉起基元律动登录窗，并顺手刷新一次登录态
+// （接口抖动时状态能立即回正，用户关掉弹窗也不会继续看到过期的账号信息）。
+function onLoginAgain() {
+  store.openTrLoginModal();
+  void store.refreshTrAuth();
+}
 // 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
 const isMobile = useIsMobile();
 // 用户消息复制按钮的「已复制」反馈状态与定时器
@@ -739,6 +875,146 @@ async function copyUserMessage() {
   if (userCopiedTimer) window.clearTimeout(userCopiedTimer);
   userCopiedTimer = window.setTimeout(() => { userCopied.value = false; }, 1500);
 }
+
+// 编辑已发送消息：气泡就地变输入框，提交后由 store 截断历史并重新发送。
+// 生成中也能编辑：提交会先打断当前回合并等它收尾，再回滚重发
+const editing = ref(false);
+const editText = ref('');
+const editSubmitting = ref(false);
+const editInputRef = ref<HTMLTextAreaElement | null>(null);
+// 编辑态的图片：初始是本条消息原有的 dataURL；新增的（选文件/粘贴）也是 dataURL，
+// 提交时统一经 saveClipboardImage 落盘成路径，交给 sendMessage 的附件链路
+const editImages = ref<string[]>([]);
+const editImageInput = ref<HTMLInputElement | null>(null);
+
+const canEdit = computed(() => !!props.msg._msg_id);
+
+// 提示要说清后果：运行中会中断当前回合并丢弃它产生的记录
+const editHint = computed(() => (store.running
+  ? '保存将中断当前回合，并删除该回合产生的记录'
+  : '该回合的文件改动不会随编辑回滚'));
+
+async function startEdit() {
+  if (!canEdit.value) return;
+  editText.value = props.msg.content || '';
+  editImages.value = [...(props.msg.images || [])];
+  editing.value = true;
+  await nextTick();
+  const el = editInputRef.value;
+  if (el) {
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }
+}
+
+function cancelEdit() {
+  if (editSubmitting.value) return;
+  editing.value = false;
+  editText.value = '';
+  editImages.value = [];
+}
+
+function removeEditImage(index: number) {
+  if (editSubmitting.value) return;
+  editImages.value.splice(index, 1);
+}
+
+function pickEditImages() {
+  if (editSubmitting.value) return;
+  editImageInput.value?.click();
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => resolve('');
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addEditImageFiles(files: File[]) {
+  for (const file of files) {
+    // 与 save_clipboard_image 支持的格式对齐：不支持的当场挡掉，
+    // 免得提交时才报错、用户还得重新选一遍
+    if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) continue;
+    const url = await readFileAsDataUrl(file);
+    if (url) editImages.value.push(url);
+  }
+}
+
+async function onEditImagesPicked(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  input.value = '';   // 复位后同一个文件可以再次选择
+  await addEditImageFiles(files);
+}
+
+async function onEditPaste(e: ClipboardEvent) {
+  const items = Array.from(e.clipboardData?.items || []);
+  const files: File[] = [];
+  for (const item of items) {
+    if (item.kind === 'file' && item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  if (!files.length) return;
+  // 有图片就拦下默认粘贴，避免把图片当成路径文本塞进输入框
+  e.preventDefault();
+  await addEditImageFiles(files);
+}
+
+function sameImages(a: string[], b: string[]) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+async function submitEdit() {
+  if (editSubmitting.value) return;
+  const text = editText.value.trim();
+  const imagesChanged = !sameImages(editImages.value, props.msg.images || []);
+  // 文本和图都没动 = 取消；文本和图都空 = 没内容可发
+  if (!text && !editImages.value.length) return;
+  if (text === (props.msg.content || '').trim() && !imagesChanged) {
+    cancelEdit();
+    return;
+  }
+  editSubmitting.value = true;
+  try {
+    // 历史图与新图都是 dataURL：统一落盘成路径后走 sendMessage 的附件链路
+    const paths: string[] = [];
+    for (const url of editImages.value) {
+      if (!url.startsWith('data:')) {
+        paths.push(url);
+        continue;
+      }
+      const saved = await store.saveClipboardImage(url);
+      // 落盘失败（超 8MB / 格式不支持）已由 store 提示，中止以免图片静默丢失
+      if (!saved) return;
+      paths.push(saved);
+    }
+    const ok = await store.editUserMessage(props.msg, text, paths);
+    // 成功后本组件对应的消息已被移出列表；失败留在编辑态便于重试
+    if (ok) editing.value = false;
+  } finally {
+    editSubmitting.value = false;
+  }
+}
+
+function onEditKeydown(e: KeyboardEvent) {
+  // 输入法组合中的 Enter 是在确认候选词，不能当成提交
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    void submitEdit();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    cancelEdit();
+  }
+}
 </script>
 
 <style scoped>
@@ -827,6 +1103,83 @@ async function copyUserMessage() {
 }
 .msg-user:hover .user-action-bar {
   opacity: 1;
+}
+/* 编辑态：气泡变可编辑文本框，操作区常驻（不随 hover 淡出） */
+.user-bubble.is-editing {
+  max-width: 80%;
+}
+.user-edit-input {
+  width: 100%;
+  min-width: 260px;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  line-height: 1.65;
+  resize: vertical;
+}
+.user-edit-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.user-edit-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.user-edit-submit {
+  color: var(--text-bright);
+  border-color: var(--accent);
+}
+.user-edit-bar .msg-copy-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+/* 编辑态的图片网格：与只读缩略图分开，右上角带移除按钮 */
+.edit-img-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.edit-img-cell {
+  position: relative;
+}
+.edit-img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+}
+.edit-img-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(15, 15, 15, 0.66);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.edit-img-remove:hover {
+  background: rgba(15, 15, 15, 0.88);
+}
+.edit-file-input {
+  display: none;
 }
 .msg-copy-btn {
   display: inline-flex;
@@ -1310,6 +1663,70 @@ async function copyUserMessage() {
   border-radius: 8px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 登录过期：错误提示旁直接出现的「重新登录」入口 */
+.login-again-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+.login-again-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg3));
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 6px;
+  cursor: pointer;
+}
+.login-again-btn:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg3));
+}
+
+/* 断点续跑入口（S4）：紧贴错误条，说明"只续跑无写操作的调用" */
+.resume-continue {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+.resume-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.resume-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.resume-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.resume-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.resume-blockers {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--red);
 }
 
 .msg-error {

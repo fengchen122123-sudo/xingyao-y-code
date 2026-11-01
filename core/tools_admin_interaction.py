@@ -326,7 +326,9 @@ BROWSER_ACTIONS = (
 
 # action -> (桥方法名, 是否需要 rect)
 _BROWSER_METHODS: dict[str, tuple[str, bool]] = {
-    "open": ("browser_pane_open", True),
+    # open 不再强制 rect：模型不知道窗口布局，缺 rect 时走 browser_pane_assign
+    # 只登记「该会话要打开这个地址」，由前端在页签激活时测量矩形并真正 open。
+    "open": ("browser_pane_open", False),
     "close": ("browser_pane_hide", False),
     "navigate": ("browser_pane_navigate", False),
     "back": ("browser_pane_back", False),
@@ -341,6 +343,7 @@ _BROWSER_ERROR_TEXT = {
     "not_open": "浏览器面板尚未打开，请先执行 action=open",
     "invalid_rect": "面板位置参数 rect 非法（必须包含 x/y/width/height 四个键）",
     "no_gui": "当前不在 GUI 环境，浏览器面板不可用",
+    "not_visible": "该会话当前不在前台，浏览器面板操作已延后（切回该会话后生效）",
 }
 
 
@@ -350,7 +353,24 @@ def _browser_context() -> Any:
     return app_context.get()
 
 
-def _call_browser_bridge(method_name: str, rect: dict | None, url: str, zoom: float) -> Any:
+def _browser_session() -> str:
+    """本次调用所属会话：回合线程绑定的会话优先（多会话并行下稳定）。
+
+    线程级绑定由回合入口写入，后台并行的 B 会话不会因为用户正在看 A 而被
+    误判成 A；未绑定的调用（前端直连、测试主线程）回落到当前查看会话。
+    """
+    from core import app_context
+
+    return str(
+        app_context.get_thread_session()
+        or app_context.get_current_session()
+        or ""
+    )
+
+
+def _call_browser_bridge(
+    method_name: str, rect: dict | None, url: str, zoom: float, session_name: str = ""
+) -> Any:
     """按桥方法的真实签名调用；缺少方法时抛 RuntimeError（中文消息）。"""
     ctx = _browser_context()
     if ctx is None:
@@ -359,12 +379,14 @@ def _call_browser_bridge(method_name: str, rect: dict | None, url: str, zoom: fl
     if not callable(method):
         raise RuntimeError(f"当前上下文不支持该浏览器面板操作：缺少 {method_name}")
     if method_name == "browser_pane_open":
-        return method(rect, url, zoom)
+        return method(rect, url, zoom, session_name)
+    if method_name == "browser_pane_assign":
+        return method(url, session_name)
     if method_name == "browser_pane_set_bounds":
-        return method(rect, zoom)
+        return method(rect, zoom, session_name)
     if method_name == "browser_pane_navigate":
-        return method(url)
-    return method()
+        return method(url, session_name)
+    return method(session_name)
 
 
 @_guard
@@ -376,26 +398,31 @@ def browser_pane(action: str, url: str = "", rect: Any = None, zoom: float = 1.0
 
     method_name, need_rect = _BROWSER_METHODS[act]
     rect_value: dict | None = None
-    if need_rect:
-        if not isinstance(rect, dict) or not rect:
-            return _fail(
-                "该操作需要 rect 参数（对象，包含 x/y/width/height 四个数值键）",
-                hint="rect 会原样交给桥层校验，不做本地改写",
-            )
+    # open 的 rect 可选（模型不知道窗口布局）；其余需要 rect 的动作缺参即报错。
+    if isinstance(rect, dict) and rect:
         rect_value = dict(rect)
+    if need_rect and rect_value is None:
+        return _fail(
+            "该操作需要 rect 参数（对象，包含 x/y/width/height 四个数值键）",
+            hint="rect 会原样交给桥层校验，不做本地改写",
+        )
 
     if act == "navigate":
         target = str(url or "").strip()
         if not target:
             return _fail("navigate 需要非空 url")
-    if act == "open":
-        target = str(url or "").strip()
     else:
         target = str(url or "")
 
+    if act == "open" and rect_value is None:
+        # 模型不可能知道真实窗口布局：不强制它凭空编 rect，改由前端在浏览器
+        # 页签激活时测量占位区并真正 open；后台会话只登记意图，切回时生效。
+        method_name = "browser_pane_assign"
+
+    session_name = _browser_session()
     try:
         result = _call_browser_bridge(
-            method_name, rect_value, target, _as_float(zoom, 1.0)
+            method_name, rect_value, target, _as_float(zoom, 1.0), session_name
         )
     except RuntimeError as exc:
         return _fail(str(exc))
@@ -415,6 +442,11 @@ def browser_pane(action: str, url: str = "", rect: Any = None, zoom: float = 1.0
             bridge_detail={k: v for k, v in result.items() if k != "ok"},
         )
     payload = {k: v for k, v in result.items() if k != "ok"}
+    if result.get("deferred"):
+        # 明确告诉模型「已登记、界面会自动打开」：否则它容易以为没生效而反复调用
+        payload.setdefault(
+            "note", "已登记到该会话的浏览器页签，界面会自动打开（切回该会话时显示），无需重复调用"
+        )
     return _ok(action=act, **payload)
 
 
@@ -861,6 +893,8 @@ def build_specs() -> list[ToolSpec]:
             description=(
                 "驱动 GUI 内嵌浏览器面板：open 打开、close 关闭、navigate 导航、"
                 "back/forward/reload 前进后退刷新、state 查看状态、set_bounds 调整位置。"
+                "open 的 rect 可省略——真实位置由界面测量，不要凭空编造坐标；"
+                "在非当前查看的会话里打开时只登记意图，切回该会话才显示。"
                 "仅在 GUI 运行环境可用，非 GUI 环境会明确报错。"
             ),
             input_schema=_schema(

@@ -36,6 +36,7 @@ from core.turn_undo.models import (
     TurnUndoResult,
     TurnUndoStatus,
     UndoErrorCode,
+    UNDO_RESULT_SKIPPED,
 )
 from core.turn_undo.storage import (
     BlobStore,
@@ -185,7 +186,9 @@ def preview_revert(
         )
 
     # 逐文件重查实际状态（规格 11.2）
+    # 因回合内被外部修改而退出撤销范围的文件不参与冲突判定，只在预检里列出。
     conflicts: list[FileConflict] = []
+    skipped_files: list[str] = []
     pairs = []
     restore_content = 0
     delete_created = 0
@@ -193,6 +196,9 @@ def preview_revert(
     restore_path_state = 0
     created_files: list[str] = []
     for row in files:
+        if row.undo_result == UNDO_RESULT_SKIPPED:
+            skipped_files.append(row.display_path)
+            continue
         expected = recorder_mod.state_from_row_side(row, "after")
         actual = recorder_mod.capture_node_state(row.canonical_path)
         pairs.append((row.canonical_path, actual))
@@ -221,6 +227,13 @@ def preview_revert(
         else:
             restore_content += 1
 
+    if not pairs:
+        # 所有文件都因回合内外部修改退出撤销范围：没有可执行的还原动作
+        raise TurnUndoError(
+            UndoErrorCode.CHECKPOINT_UNAVAILABLE,
+            "该回合没有可撤销的文件（全部因回合内外部修改被跳过）",
+        )
+
     if conflicts:
         # 结构化冲突：不生成令牌；状态转 conflicted（可重新预检）
         if status is not TurnUndoStatus.CONFLICTED:
@@ -236,13 +249,14 @@ def preview_revert(
             status=TurnUndoStatus.CONFLICTED,
             snapshot_availability=checkpoint.availability_enum,
             record_version=storage.get_checkpoint(checkpoint.checkpoint_id).record_version,
-            file_count=len(files),
+            file_count=len(pairs),
             restore_content_count=0,
             delete_created_count=0,
             restore_deleted_count=0,
             restore_path_state_count=0,
             created_files=(),
             conflicts=tuple(conflicts),
+            skipped_files=tuple(skipped_files),
             has_uncovered_command_effects=bool(checkpoint.has_uncovered_command_effects),
             subsequent_completed_turns=storage.count_subsequent_ready_turns(
                 checkpoint.session_id, checkpoint.workspace_root,
@@ -279,12 +293,13 @@ def preview_revert(
         status=checkpoint.status_enum,
         snapshot_availability=checkpoint.availability_enum,
         record_version=checkpoint.record_version,
-        file_count=len(files),
+        file_count=len(pairs),
         restore_content_count=restore_content,
         delete_created_count=delete_created,
         restore_deleted_count=restore_deleted,
         restore_path_state_count=restore_path_state,
         created_files=tuple(created_files),
+        skipped_files=tuple(skipped_files),
         has_uncovered_command_effects=bool(checkpoint.has_uncovered_command_effects),
         subsequent_completed_turns=storage.count_subsequent_ready_turns(
             checkpoint.session_id, checkpoint.workspace_root,
@@ -499,10 +514,13 @@ def execute_revert(
                 "检查点版本已变化，令牌失效，请重新预检",
             )
 
-        # 锁内重算全部指纹（规格 11.3）
+        # 锁内重算全部指纹（规格 11.3）；已退出撤销范围的文件不参与
         files = storage.list_files(checkpoint.checkpoint_id)
-        pairs = [(row.canonical_path, recorder_mod.capture_node_state(row.canonical_path))
-                 for row in files]
+        pairs = [
+            (row.canonical_path, recorder_mod.capture_node_state(row.canonical_path))
+            for row in files
+            if row.undo_result != UNDO_RESULT_SKIPPED
+        ]
         actual_set = fingerprint_set_sha256(pairs)
         if actual_set != confirmation["fingerprint_set_sha256"]:
             storage.transition_checkpoint(
@@ -558,7 +576,10 @@ def execute_revert(
 def _run_revert_transaction(storage, coordinator, checkpoint, operation, files) -> TurnUndoResult:
     """prepared → applying → verifying → committed；失败进入中断恢复。"""
     operation_id = operation.operation_id
-    entries = _insert_operation_files(storage, operation, files)
+    entries = _insert_operation_files(
+        storage, operation,
+        [row for row in files if row.undo_result != UNDO_RESULT_SKIPPED],
+    )
     op_files = {row.file_id: row for row in storage.list_operation_files(operation_id)}
 
     # prepared：阶段文件全部生成并校验（不触碰目标）

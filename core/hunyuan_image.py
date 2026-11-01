@@ -163,6 +163,12 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = 
             except TurnUndoError as error:
                 if error.code == "no_active_checkpoint":
                     handle = None
+                elif error.code == "workspace_busy":
+                    return ToolResult(
+                        f"🚨 该目录正在被另一个回合写入，图片未写入：{error.message}\n"
+                        f"请稍后重试。",
+                        is_error=True,
+                    )
                 else:
                     return ToolResult(
                         f"🚨 撤销检查点已封闭，迟到的图片写入已被拒绝：{error.message}",

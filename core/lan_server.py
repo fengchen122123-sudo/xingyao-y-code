@@ -227,7 +227,11 @@ class LanServer:
         "window_close", "window_is_maximized", "window_begin_drag",
         "window_begin_resize", "window_confirm_close", "set_titlebar_theme",
         # 桌面文件/系统交互（手机无意义）
+        # preview_office_doc：手机端无法访问桌面文件系统（同一路径在手机上不存在），
+        # 且该调用会在桌面拉起 Office 进程（Word/Excel/PowerPoint 的 COM 实例，
+        # 属桌面专属副作用），与 open_path / open_folder_in_explorer 同一边界。
         "select_workspace_folder", "open_folder_in_explorer", "open_path",
+        "preview_office_doc",
         "pick_files", "report_dropped_files", "save_clipboard_image",
         # 更新/安装（危险，桌面专属）
         "download_update", "cancel_download_update", "launch_installer", "check_update",

@@ -8,6 +8,9 @@ const KNOWN_EXTENSIONS = new Set([
   'txt', 'log', 'csv', 'xml', 'sql', 'sh', 'bat', 'ps1', 'c', 'h', 'cpp',
   'hpp', 'java', 'go', 'rs', 'rb', 'php', 'kt', 'swift', 'cs', 'fs', 'm',
   'gradle', 'properties', 'env', 'gitignore',
+  // 办公文档：`报告.docx`、`docs/方案.pptx` 这类相对路径也要能被识别成可点链接
+  // （绝对路径本来就按盘符识别）。rtf/odt/ods/odp 覆盖 WPS/LibreOffice 另存格式。
+  'doc', 'docx', 'rtf', 'odt', 'xls', 'xlsx', 'ods', 'ppt', 'pptx', 'odp',
 ]);
 
 function extOf(s: string): string {
@@ -65,9 +68,20 @@ export function toAbsoluteLocalPath(raw: string, workdir: string): string | null
 
 const HTML_EXTENSIONS = new Set(['html', 'htm']);
 const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown']);
+// Office 文档：右栏不能直接渲染，需先由后端转成 PDF 再交 WebView2 查看器。
+// rtf/odt/ods/odp 一并算进来（WPS/LibreOffice 的另存格式，后端转换器同样吃）。
+export const OFFICE_EXTENSIONS = new Set([
+  'doc', 'docx', 'rtf', 'odt',
+  'xls', 'xlsx', 'ods',
+  'ppt', 'pptx', 'odp',
+]);
 // 右栏内嵌浏览器能打开的文件类型：html/htm（网页）、pdf（WebView2 内置查看器）、
-// md/markdown（先由前端渲染成预览 HTML 再打开）。其它类型仍走源码预览弹窗。
-const RIGHT_PANEL_EXTENSIONS = new Set(['html', 'htm', 'pdf', 'md', 'markdown']);
+// md/markdown（先由前端渲染成预览 HTML 再打开）、office 文档（先由后端转 PDF）。
+// 其它类型仍走源码预览弹窗。
+const RIGHT_PANEL_EXTENSIONS = new Set([
+  'html', 'htm', 'pdf', 'md', 'markdown',
+  ...OFFICE_EXTENSIONS,
+]);
 
 function normalizedExt(path: string): string {
   return extOf((path || '').trim().replace(/[?#].*$/, ''));
@@ -83,7 +97,12 @@ export function isMarkdownFilePath(path: string): boolean {
   return MARKDOWN_EXTENSIONS.has(normalizedExt(path));
 }
 
-/** 是否该交给右栏内嵌浏览器打开（html / pdf / md 三类） */
+/** 是否是 Office 文档（doc/docx/rtf/odt/xls/xlsx/ods/ppt/pptx/odp，忽略查询串与锚点） */
+export function isOfficeFilePath(path: string): boolean {
+  return OFFICE_EXTENSIONS.has(normalizedExt(path));
+}
+
+/** 是否该交给右栏内嵌浏览器打开（html / pdf / md / office 四类） */
 export function canOpenInRightPanel(path: string): boolean {
   return RIGHT_PANEL_EXTENSIONS.has(normalizedExt(path));
 }

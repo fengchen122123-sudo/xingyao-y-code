@@ -3,16 +3,9 @@
 from dataclasses import dataclass
 
 
-REASONING_LABELS = {
-    "default": "默认",
-    "off": "关闭",
-    "on": "开启",
-    "low": "低",
-    "medium": "中",
-    "high": "高",
-    "xhigh": "超高",
-    "max": "最高",
-}
+# 思考档位在界面直接显示英文原值（default/off/low/medium/high/xhigh/max）。
+# 不再维护中文别名表：档位语义由各家厂商定义，中文翻译反而容易误读
+# （例如 DeepSeek 的 xhigh 实际映射到 high，直呼原名更不容易想当然）。
 
 
 @dataclass(frozen=True)
@@ -67,7 +60,7 @@ _register(
     ),
     ReasoningCapability(
         "effort",
-        ("default", "off", "low", "high", "max"),
+        ("default", "off", "low", "high", "xhigh", "max"),
         "thinking_object_effort",
         default_choice="high",
     ),
@@ -257,11 +250,15 @@ _register(
 
 
 # DeepSeek 官方思考模式（https://api-docs.deepseek.com/zh-cn/guides/thinking_mode）：
-# thinking.type 控制开关，reasoning_effort 控制强度（low/high/max），默认开启、
-# effort 默认 high。任何厂商中以 deepseek 开头（不区分大小写）的模型统一按此
-# 适配，无需逐个登记；能力表中的显式登记仅用于别名折叠等特例。
+# thinking.type 控制开关，reasoning_effort 控制强度，默认开启、effort 默认 high。
+# 服务端真正区分的强度只有 low/high/max，但官方同时接受 minimal/medium/xhigh/ultra，
+# 按文档映射表分别折叠为 low/high/high/max——即 xhigh 与 high 等价、ultra 与 max 等价。
+# 这里保留 xhigh（官方承认的取值，界面上可选到），ultra 不单列。
+# 任何厂商中以 deepseek 开头（不区分大小写）的模型统一按此适配。
 _DEEPSEEK_PREFIX_CAPABILITY = ReasoningCapability(
-    "effort", ("default", "off", "low", "high", "max"), "thinking_object_effort",
+    "effort",
+    ("default", "off", "low", "high", "xhigh", "max"),
+    "thinking_object_effort",
     default_choice="high",
 )
 
@@ -337,7 +334,7 @@ def build_reasoning_snapshot(model: dict | None, choice: str = "default") -> dic
         "choice": "on" if fixed else choice,
         "default_choice": capability.default_choice,
         "options": [
-            {"value": value, "label": REASONING_LABELS[value]}
+            {"value": value, "label": value}
             for value in capability.options
         ],
     }

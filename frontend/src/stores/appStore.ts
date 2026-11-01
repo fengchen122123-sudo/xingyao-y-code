@@ -4,6 +4,9 @@ import { useGitStore } from './gitStore';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
+  WorkflowInfo,
+  WorkflowInvalidInfo,
+  WorkflowRunInfo,
   ModelInfo,
   ProviderInfo,
   ApiProtocolInfo,
@@ -34,6 +37,7 @@ import type {
   ComputerActionTrace,
   ComputerControlEvent,
   ComputerRunSnapshot,
+  PlaywrightComponentStatus,
   PyWebViewAPI,
   ToolStartEventData,
   ToolFinishEventData,
@@ -45,9 +49,13 @@ import type {
   TurnUndoExecutePayload,
   TurnUndoRecoveryPreviewPayload,
   TurnUndoRecoveryExecutePayload,
+  ResumePlanSnapshot,
+  ResumeBlockerItem,
+  SlashCommandInfo,
+  GoalStateInfo,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
-import { isMarkdownFilePath, toFileUrl } from '../utils/localPath';
+import { isMarkdownFilePath, isOfficeFilePath, toFileUrl } from '../utils/localPath';
 import { fileExt } from '../utils/fileIcon';
 import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 // 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
@@ -139,11 +147,12 @@ export const SECRETARY_NAME_MAX_LEN = 20;
 // （= 使用内置默认秘书人设），只在超长时拦下并给出可见提示
 export const SECRETARY_PERSONA_MAX_LEN = 20000;
 
-// 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页
-export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent';
+// 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页，
+// novel 是小说工作台（只读展示项目状态，设计 §7）
+export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent' | 'novel' | 'canvas';
 // 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
 const RIGHT_PANEL_TAB_IDS = new Set<RightPanelTabId>([
-  'files', 'git', 'browser', 'tasks', 'computer', 'subagent',
+  'files', 'git', 'browser', 'tasks', 'computer', 'subagent', 'novel', 'canvas',
 ]);
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
@@ -534,9 +543,33 @@ export interface PermReqState {
   undoImpact?: Record<string, any> | null;
 }
 
-export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations';
+export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations' | 'workflows';
+
+// 星流工作流：导入结果（成功条目 / 失败原因，exists=同名已存在待确认覆盖）
+export interface WorkflowImportedItem { name: string; path: string; }
+export interface WorkflowImportFailure { name: string; error: string; exists?: boolean; }
 
 const speedTracker = new StreamingSpeedTracker();
+
+// 页面是否由本机回环地址加载（桌面 pywebview 宿主）：
+// 手机经局域网 IP 访问时 hostname 是 192.168.x.x 之类，桌面专属桥
+// （open_path / preview_office_doc 等）在 LanServer.FORBIDDEN_METHODS 里被
+// fail-closed 封禁，调用只会拿到 "method not allowed"。桌面专属分支据此提前
+// 收手并给出可读提示，不发起注定失败的调用。无主机名（file:// 等）按本机处理，
+// 避免误伤不经过 HTTP 的宿主形态。
+export function isLoopbackHostName(host: unknown): boolean {
+  const h = String(host ?? '').trim().toLowerCase();
+  if (!h) return true;
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
+function isLoopbackPageHost(): boolean {
+  try {
+    return isLoopbackHostName(window.location.hostname);
+  } catch {
+    return true;
+  }
+}
 
 export const useAppStore = defineStore('app', {
   state: () => ({
@@ -631,6 +664,21 @@ export const useAppStore = defineStore('app', {
     // 防止「操控」页签被旧事件复活
     _computerClosedRunId: '',
 
+    // Playwright 按需组件（core/components.py）：安装包不再内置 Playwright，
+    // 设置页「浏览器操控组件」卡片按需下载。真值一律以后端快照覆盖，
+    // 下载进度经 playwright_component_progress 桥事件增量合并（不做乐观进度）
+    playwrightComponent: {
+      installed: false,
+      version: '',
+      downloading: false,
+      percent: 0,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      error: '',
+      stage: '',
+      dir: '',
+    } as PlaywrightComponentStatus,
+
     // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
     reasoning: {
       kind: 'hidden',
@@ -697,6 +745,15 @@ export const useAppStore = defineStore('app', {
     skillsLoading: false,
     mcps: [] as McpInfo[],
     plugins: [] as PluginInfo[],
+    // 斜杠命令清单（后端注册表只读投影）：输入框 "/" 补全的候选源之一。
+    // 默认空数组：接口不可用/加载失败时补全面板退化为「技能 + MCP」两路，不报错
+    slashCommands: [] as SlashCommandInfo[],
+    // /goal 目标状态快照（GoalBar 的数据源）：null = 当前会话没有目标 / 尚未加载。
+    // 取数由组件驱动（挂载探测 + 有目标时每 5 秒轮询），store 只提供 loadGoalState，
+    // 类目上跟 slashCommands 一样属于"后端只读投影"，失败静默不打断对话
+    goalState: null as GoalStateInfo | null,
+    // 目标状态请求序号：轮询/切会话并发时，过期响应不覆盖新会话的状态条
+    goalStateReqSeq: 0,
     // C11：Hook 信任卡片数据源（项目级命令逐条信任，信任前不执行）
     hooks: [] as HookInfo[],
     hooksLoading: false,
@@ -704,6 +761,15 @@ export const useAppStore = defineStore('app', {
     // 星轨自动化任务：任务列表 + 每任务运行历史（事件幂等替换）
     automationTasks: [] as AutomationTaskInfo[],
     automationRuns: {} as Record<string, AutomationRunInfo[]>,
+
+    // 星流工作流（ZCode 导入）：清单 + 坏文件（打开面板时刷新）
+    workflows: [] as WorkflowInfo[],
+    workflowInvalid: [] as WorkflowInvalidInfo[],
+    workflowsLoading: false,
+    // 每工作流运行历史（面板按需加载）
+    workflowRuns: {} as Record<string, WorkflowRunInfo[]>,
+    // 解释执行器节点级实时事件（run_id → 事件列表，桥事件推送，上限 100 条/run）
+    workflowLiveEvents: {} as Record<string, import('../types/pywebview').WorkflowRunEvent[]>,
 
     // 对话消息流
     messages: [] as ChatMessage[],
@@ -731,6 +797,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 非当前会话的状态提醒点：sessionName → 'green'(完成) | 'yellow'(待确认) | 'red'(报错)
     // 仅给非当前窗口打点，切换到该会话时清除
     sessionStatusDots: {} as Record<string, 'green' | 'yellow' | 'red'>,
+    // 断点续跑（S4）：后端 resume_plan 判定的可续跑快照（父回合 / 断点位置 /
+    // 待确认项）。仅当它存在且没有降级原因时，错误条旁才出现「从断点继续」按钮
+    resumePlan: null as ResumePlanSnapshot | null,
+    // resume_execute 回 confirm_required 时的写操作清单（列表展示，暂不逐项确认）
+    resumeBlockers: [] as ResumeBlockerItem[],
+    resumeBusy: false,
     // 每个会话独立保存流式消息和回合状态；切换会话不丢失后台事件
     sessionRuntimeByName: {} as Record<string, SessionRuntimeState>,
     // 会话切换加载中：切到"已有会话"时，目标会话历史仍在后端返回路上（消息区为空）
@@ -800,8 +872,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 右栏浏览器「外部请求导航」（对话正文 / 文件树点击 html 文件触发）：
     // BrowserPane 消费这条请求去导航；nonce 自增保证同一文件重复点击也能被
     // 观察到（内容相同的对象引用不变时 watch 不触发）。null = 无待处理请求。
-    browserNavRequest: null as null | { url: string; path: string },
+    browserNavRequest: null as null | { url: string; path: string; session?: string },
     browserNavNonce: 0,
+    // Office 文档转 PDF 预览的进行中提示（首次转换要拉起 Office，10~25 秒）：
+    // 非空期间 BrowserPane 在面板里显示「正在把 xxx 转换成预览页」浮层，
+    // 转换结束（成功/失败）一定清空。null = 没有进行中的转换。
+    officePreviewPending: null as null | { path: string; name: string },
     themeLight: false,
     guiTheme: null as GuiTheme | null,
     savedGuiTheme: null as GuiTheme | null,
@@ -1021,6 +1097,16 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return !!state.currentSessionName && state.runningSessions.includes(state.currentSessionName);
     },
 
+    // 断点续跑（S4）：仅"快照属于当前会话 + 没有降级原因 + 当前没有回合在跑"时
+    // 才显示入口，避免按钮指向别的会话或与运行中的回合并发
+    resumeAvailable(state): boolean {
+      const plan = state.resumePlan as ResumePlanSnapshot | null;
+      if (!plan || !plan.session_name) return false;
+      if (state.currentSessionName && plan.session_name !== state.currentSessionName) return false;
+      if (plan.aborts && plan.aborts.length > 0) return false;
+      return !state.running;
+    },
+
     // 批次D：当前会话是否在排队等其他会话的回合释放锁（turn_queued）
     currentSessionQueued(state): boolean {
       return !!state.currentSessionName && state.queuedSessions.includes(state.currentSessionName);
@@ -1044,6 +1130,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 注意：这是全局判据（RightPanel 自动登记操控页签也用它），不区分会话
     computerControlBarVisible(state): boolean {
       return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
+    },
+
+    // 浏览器操控（target=browser）走「就地围观」：右侧只呈现浏览器页签，
+    // 不自动弹「操控」工作台、不显示顶部安全条——浏览器操控要的是「直接操作
+    // 浏览器」的观感，操控面板只在桌面目标或用户手动打开时出现。
+    // target 为空（旧后端快照）时按非浏览器处理，保留原有安全入口。
+    computerRunIsBrowser(state): boolean {
+      return state.computerRun.target === 'browser';
     },
 
     // 顶部安全条的会话归属（对齐 currentSessionBackgroundTasks 的既有约定）：
@@ -1551,7 +1645,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
         void this.openFilePreview(path);
         return;
       }
-      this.browserNavRequest = { url, path };
+      // session 只在非空时写入：空会话名不产生多余字段，兼容既有导航请求结构
+      this.browserNavRequest = {
+        url,
+        path,
+        session: this.currentSessionName || undefined,
+      };
       this.browserNavNonce += 1;
       this.openRightPanelTab('browser');
     },
@@ -1568,7 +1667,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
         void this.openExternalUrl(target);
         return;
       }
-      this.browserNavRequest = { url: target, path: '' };
+      this.browserNavRequest = {
+        url: target,
+        path: '',
+        session: this.currentSessionName || undefined,
+      };
       this.browserNavNonce += 1;
       this.openRightPanelTab('browser');
     },
@@ -1603,12 +1706,71 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // Office 文档（doc/docx/xls/ppt/odt...）在右栏预览：右栏渲染不了 Office 二进制，
+    // 先让后端把它转成 PDF（core 侧走 Office COM，首次要拉起进程 10~25 秒，之后按
+    // 源文件 mtime 命中缓存是毫秒级），转好的 PDF 再交给内嵌浏览器（WebView2 内置
+    // 查看器），与 pdf 链接同一条路径。
+    //
+    // 两个刻意的设计：
+    // 1) 转换前先把右栏摊开并置 officePreviewPending 提示——二十秒的转换期间界面
+    //    必须有反馈，否则用户以为点击没生效会反复点（每次都排一次转换）；
+    // 2) 转换失败不弹窗打断（用户此刻只想看文档），直接用系统默认程序打开源文件兜底；
+    //    连 open_path 都没有（极旧宿主）才退化成一句模态提示。
+    async openOfficeInRightPanel(this: any, path: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      // 桌面专属能力的两道前置判定：
+      // 1) 非桌面宿主（确认缺内嵌浏览器）：转出 PDF 也没地方显示，不白等 20 秒；
+      // 2) 手机经局域网访问桌面 dist 时 hostname 不是回环地址，而 preview_office_doc /
+      //    open_path 都在 LanServer.FORBIDDEN_METHODS 里被 fail-closed 封禁，LAN shim
+      //    又是 Proxy（任何方法名都返回函数），调过去只会拿到 "method not allowed"。
+      //    这种情况直接给可读提示，不发起注定失败的桥调用。
+      if (this.embeddedBrowser.supported === false || !isLoopbackPageHost()) {
+        this.notifyModal('Office 预览', 'Office 文档右侧预览仅支持在本机桌面端使用');
+        return;
+      }
+      const api = this._api();
+      // 旧后端 / 桥未注入：没有转换能力，回退源码预览弹窗（至少能看文本）
+      if (!api || typeof api.preview_office_doc !== 'function') {
+        await this.openFilePreview(target);
+        return;
+      }
+      const name = target.split(/[\\/]/).pop() || target;
+      // 先把浏览器页签摊开（提示浮层就挂在 BrowserPane 里），再置进行中提示
+      this.openRightPanelTab('browser', { expand: true });
+      this.officePreviewPending = { path: target, name };
+      let failMsg = '';
+      try {
+        const res = await api.preview_office_doc(target);
+        if (res && res.ok && res.path) {
+          this.openLocalFileInBrowser(String(res.path));
+          return;
+        }
+        failMsg = (res && res.msg) || '';
+      } catch (err) {
+        failMsg = String(err || '');
+      } finally {
+        // 成功/失败/异常一律清空：浮层是"转换进行中"的唯一信号，残留会永远转圈
+        this.officePreviewPending = null;
+      }
+      // 兜底：系统默认程序打开源文件（openInSystem 内部失败会自己 notifyModal）
+      if (typeof api.open_path === 'function') {
+        await this.openInSystem(target);
+        return;
+      }
+      this.notifyModal('Office 预览', failMsg || '转换失败');
+    },
+
     // 本地文件在右栏显示的统一入口（对话正文 / 文件树的点击分流）：
     // html / pdf 直接交给内嵌浏览器（pdf 走 WebView2 内置查看器）；md 先渲染成
-    // 预览页；其它类型回退源码预览弹窗。
+    // 预览页；office 文档先转 PDF；其它类型回退源码预览弹窗。
     async openInRightPanel(this: any, path: string) {
       const target = String(path || '').trim();
       if (!target) return;
+      if (isOfficeFilePath(target)) {
+        await this.openOfficeInRightPanel(target);
+        return;
+      }
       if (isMarkdownFilePath(target)) {
         await this.openMarkdownInRightPanel(target);
         return;
@@ -2555,6 +2717,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.plugins = (init as any).plugins || [];
         // C11：启动时拉取 Hook 信任状态（信任卡片数据源）
         void this.refreshHooks();
+        // 斜杠命令清单：与技能/MCP 同为首屏补全数据源，失败不阻塞启动
+        void this.loadSlashCommands();
         this.workdir = init.workdir || '';
         this.currentSessionName = (init as any).current_session || '';
         // 工作区标签以“当前会话归属”为准：GLOBAL 会话显示“对话”，
@@ -3122,6 +3286,64 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // ── Playwright 按需组件（core/components.py）：三个动作都以桥返回的
+    //    组件状态快照回写本地，进度则由 playwright_component_progress 事件
+    //    增量合并；失败只弹提示，不回滚已下载进度 ──
+
+    async refreshPlaywrightComponentStatus(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.get_playwright_component_status();
+        if (result && result.component) this.playwrightComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('浏览器操控组件', '读取组件状态失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('浏览器操控组件', '读取组件状态失败: ' + err);
+        return false;
+      }
+    },
+
+    async downloadPlaywrightComponent(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.download_playwright_component();
+        if (result && result.component) this.playwrightComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('浏览器操控组件', '下载组件失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('浏览器操控组件', '下载组件失败: ' + err);
+        return false;
+      }
+    },
+
+    async cancelPlaywrightComponentDownload(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.cancel_playwright_component_download();
+        if (result && result.component) this.playwrightComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('浏览器操控组件', '取消下载失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('浏览器操控组件', '取消下载失败: ' + err);
+        return false;
+      }
+    },
+
     // ── 电脑操控运行态（Task 13b，设计 16.4）：
     //    纯事件 reducer + Bridge 快照校准 + 暂停/恢复/停止控制 ──
 
@@ -3150,14 +3372,22 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (seq <= this._computerEventSeq) return;
       }
       this._computerEventSeq = seq;
+      // 归属会话随事件信封下发（后端每个事件都带 owner_session_id）：run 首帧
+      // 就必须知道「谁发起的」，否则「操控」页签只能按当前查看的会话登记，
+      // 后台会话发起的操控会串到用户正在看的另一个会话上（2026-10-30 反馈）
+      const ownerSession = typeof raw.owner_session_id === 'string' ? raw.owner_session_id : '';
       if (isNewRun) {
         this.computerRun = {
           ...emptyComputerRun(),
           run_id: runId,
           status: type === 'computer_state' ? String(raw.status || '') || 'starting' : 'starting',
+          owner_session_id: ownerSession,
         };
         this.computerTrace = [];
         this._computerActionStartMs = {};
+      } else if (ownerSession && !this.computerRun.owner_session_id) {
+        // 旧后端不带归属时 owner 一直为空；一旦后续事件/快照带来归属就补上
+        this.computerRun = { ...this.computerRun, owner_session_id: ownerSession };
       }
       if (type === 'computer_state') {
         const status = String(raw.status || '');
@@ -3390,6 +3620,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.pendingWorkdir = null;
       this.currentSessionName = sessionName;
       if (displayName) this.currentSessionDisplayName = displayName;
+      // 目标状态条属于会话级数据：切会话先清空再重拉，避免上一个会话的目标串显
+      // 在新会话上（在途响应由 loadGoalState 的序号 + 会话名校验丢弃）
+      this.goalState = null;
+      void this.loadGoalState();
       this.permRequest.show = this.permRequest.sessionName === sessionName;
       // 进入该会话即视为已读，清除其状态提醒点
       this._clearSessionStatusDot(sessionName);
@@ -3411,6 +3645,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
           : this.personaAgentName;
         this._applyAgentName(localName);
         return;
+      }
+      // 通知宿主把内嵌浏览器归属切到目标会话：该会话若有后台积压的
+      // 「打开浏览器」意图，后端回放 embedded_browser_activation；没有则
+      // 收起仍挂着旧会话内容的原生控件（跨端兜底）。
+      try {
+        void api.browser_pane_set_active_session?.(sessionName);
+      } catch {
+        /* 非 GUI / 旧后端无此桥：忽略，不影响会话切换 */
       }
       // 模型版本快照：响应在途期间用户若又切了模型（setModel 递增版本），
       // 后端响应携带的是切换前的旧模型快照，不再覆盖本地选择
@@ -3670,6 +3912,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.pendingWorkdir = 'GLOBAL';
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新对话';
+      // 草稿会话没有目标：清掉上一个会话的状态条，避免新对话里挂着旧目标
+      this.goalState = null;
       this._bindSessionRuntime('');
       // 新会话继承用户当前窗口正在使用的模型。pending 会话尚未落库，
       // 首条消息发送时通过 draftModelId 一并提交，不能回退到全局默认模型。
@@ -3720,6 +3964,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.pendingWorkdir = targetWorkdir;
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新会话';
+      // 同 createGlobalSession：草稿态没有目标，先清空状态条
+      this.goalState = null;
       this._bindSessionRuntime('');
       const runtime = this._getSessionRuntime('');
       runtime.modelId = inheritedModelId;
@@ -4501,6 +4747,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (res && res.ok) {
           // 草稿模型已随后端落库（或本就不存在），不再保留待重发状态
           this.draftModelId = '';
+          // /goal 是本地直执行命令：桥内起后台循环并立刻落盘状态，不产生任何
+          // 回合事件，一次 send_user_message 就结束了。这里补一次目标状态刷新，
+          // 让 GoalBar 立刻出现/更新——空状态下组件不轮询，没有这个触发就只能
+          // 等用户切会话才看得到刚设的目标。
+          if (/^\/goal(\s|$)/i.test(text.trim())) void this.loadGoalState();
           if (pendingDir) {
           // 让新会话立即出现在左侧列表（自动重命名事件随后会再刷新一次）
           this.refreshSessions();
@@ -4552,6 +4803,70 @@ navItems: [] as Array<{ id: number; preview: string }>,
           }
         }
       }
+    },
+
+    // 编辑已发送的用户消息：后端截断该条及其之后的历史（含摘要作废），本地同步
+    // 截断后复用 sendMessage 重新发送——乐观渲染、排队与错误提示不另写一套。
+    // 文件副作用不回滚：那条回合的工具已改过磁盘，界面在编辑条上提示用户。
+    async editUserMessage(
+      msg: ChatMessage, newText: string, imagePaths: string[] = [],
+    ): Promise<boolean> {
+      const text = (newText || '').trim();
+      // 图片由调用方先落盘成路径（历史图是 dataURL，需经 saveClipboardImage）；
+      // 纯图片编辑（文字清空只留图）合法，所以判断依据是「文本和图片都空」
+      const paths = (imagePaths || []).filter(p => !!p);
+      if (!text && !paths.length) return false;
+      const msgId = msg._msg_id;
+      if (!msgId) {
+        this.broadcastChatNotice('该消息尚未入库，暂时无法编辑', 'error');
+        return false;
+      }
+      const api = this._api();
+      if (!api || typeof api.edit_user_message !== 'function') {
+        this.broadcastChatNotice('当前后端不支持编辑消息，请重启软件后重试', 'error');
+        return false;
+      }
+      const sessionName = this.currentSessionName;
+      try {
+        const res = await api.edit_user_message(sessionName, msgId, text);
+        if (!res || !res.ok) {
+          this.broadcastChatNotice(
+            '编辑失败: ' + ((res && res.msg) || '未知错误'), 'error', sessionName,
+          );
+          return false;
+        }
+      } catch (err) {
+        this.broadcastChatNotice('编辑失败: ' + err, 'error', sessionName);
+        return false;
+      }
+      // 后端已截断：本地从该条开始（含这条）丢弃，historyHasMore 保持原值——
+      // 更早的历史仍在库里，向前翻页游标依然有效。
+      // 截断必须落在发起编辑的会话视图上：await 期间用户可能已切走，
+      // this.messages 已指向别的会话（绝不能动），故取该会话自己的 runtime；
+      // 仍停在原会话时顶层 messages 就是它的视图（_bindSessionRuntime 绑同一数组）
+      const view = this.currentSessionName === sessionName
+        ? this.messages
+        : this._getSessionRuntime(sessionName).messages;
+      const idx = view.findIndex(m => m._msg_id === msgId);
+      if (idx >= 0) view.splice(idx);
+      // 本地历史已截断：右侧红点导航的索引要同步少掉被截断的条目，
+      // 否则已删除的消息还能在导轨里点进去（索引是后端按库重建的）
+      void this.refreshNavIndex(sessionName);
+      // 会话已切换就不能再 sendMessage：它按 currentSessionName 发送，会把编辑后的
+      // 文本发到新会话，而两者工作目录可能不同，模型会按错误上下文执行工具
+      if (this.currentSessionName !== sessionName) {
+        this.broadcastChatNotice('会话已切换，编辑已保存但未重新生成', 'error', sessionName);
+        return false;
+      }
+      // 编辑已落库（截断 + 新文本由本地历史承载），重发生成失败不能把它算成
+      // 编辑失败：异常抛出去界面只会显示「编辑失败」，用户会以为改动丢了
+      try {
+        await this.sendMessage(text, paths);
+      } catch {
+        this.broadcastChatNotice('编辑已保存，但重新生成失败，请手动重发', 'error', sessionName);
+        return false;
+      }
+      return true;
     },
 
     async refreshSessions() {
@@ -4630,6 +4945,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
     /** 合并宿主回推的内嵌浏览器状态快照（字段强转，容忍缺省/多余字段） */
     applyEmbeddedBrowserState(this: any, data: Record<string, unknown> | null | undefined) {
       const src = (data || {}) as Record<string, unknown>;
+      // 归属会话：原生控件全进程唯一，状态事件带 session_name。只认领当前
+      // 查看会话的状态，后台会话的导航/标题/加载态不得污染当前界面
+      // （空值 = 旧后端/未占用，按当前会话处理）。
+      const owner = String(src.session_name || '');
+      if (owner && owner !== this.currentSessionName) return;
       const s = this.embeddedBrowser;
       s.url = String(src.url ?? '');
       s.title = String(src.title ?? '');
@@ -4814,6 +5134,32 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.bgConvert.error = String(data.message || '转换失败');
         return;
       }
+      // ── Playwright 按需组件下载进度（GuiBridge 的 playwright_component_progress）──
+      // 全局单任务，不参与会话 runtime 归属，处理完直接返回；
+      // 进度事件不推断安装态：payload 缺 installed/version 时保留本地原值
+      if (type === 'playwright_component_progress') {
+        const next: PlaywrightComponentStatus = { ...this.playwrightComponent };
+        next.stage = String(data.stage || '');
+        next.percent = Number(data.percent) || 0;
+        next.downloaded_bytes = Number(data.downloaded_bytes) || 0;
+        next.total_bytes = Number(data.total_bytes) || 0;
+        next.error = String(data.error || '');
+        if (typeof data.installed === 'boolean') next.installed = data.installed;
+        if (typeof data.version === 'string') next.version = data.version;
+        // 下载中标记只由阶段决定：downloading/extracting 视为进行中，
+        // done/error 由后端状态机收尾，前端不做额外乐观判断
+        next.downloading = next.stage === 'downloading' || next.stage === 'extracting';
+        if (next.stage === 'done') {
+          next.downloading = false;
+          next.percent = 100;
+        }
+        this.playwrightComponent = next;
+        // 终态事件补一次快照刷新：安装完成时 installed/version 只有磁盘探测才知道
+        if (next.stage === 'done' || next.stage === 'error') {
+          void this.refreshPlaywrightComponentStatus();
+        }
+        return;
+      }
       // 前端构建产物运行期更新（gui_main 的 dist watchdog 推送 fingerprint）：
       // 触发「资源版本失配自愈」——等界面空闲时自动刷新到最新版本，
       // 避免旧构建哈希 chunk 404（mermaid 等懒加载失败）；
@@ -4852,7 +5198,35 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
           // 每次换新数组引用：相同分辨率再次下发时组件侧 watch 也能触发
           this.embeddedBrowser.automationViewport = [width, height];
-          this.openBrowserTabForSession(String(data.session_name || this.currentSessionName || ''));
+        }
+        // 缺会话归属时只应用分辨率、不打开任何页签：此前回落成「当前查看会话」，
+        // 后台会话改一次分辨率就会在用户正看着的窗口里冒出一个浏览器页签
+        // （2026-10-28 反馈：B 调 browser_set_viewport，页签开到 A）。
+        const session = String(data.session_name || '');
+        if (!session) return;
+        this.openBrowserTabForSession(session);
+        return;
+      }
+      // 内嵌浏览器页签归属（后台会话请求打开/导航）：只在目标会话自己的右栏
+      // 登记页签，不抢当前界面；切回该会话时原生控件才创建并加载地址。
+      if (type === 'embedded_browser_assigned') {
+        const session = String(data.session_name || '');
+        if (!session) return;
+        this.openBrowserTabForSession(session);
+        if (session === this.currentSessionName && data.url) {
+          this.browserNavRequest = { url: String(data.url), path: '', session };
+          this.browserNavNonce += 1;
+        }
+        return;
+      }
+      // 切回持有会话：回放该会话待加载的地址（页签在 assigned 时已开好）
+      if (type === 'embedded_browser_activation') {
+        const session = String(data.session_name || '');
+        if (!session || session !== this.currentSessionName) return;
+        this.openBrowserTabForSession(session);
+        if (data.url) {
+          this.browserNavRequest = { url: String(data.url), path: '', session };
+          this.browserNavNonce += 1;
         }
         return;
       }
@@ -4961,6 +5335,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.running = true;
         // 本回合技能收集重置：从这一刻起的 is_skill 工具调用归入本回合
         this.usedSkills = [];
+        // 断点续跑：新回合一开始就丢弃上一回合的续跑入口与待确认清单
+        this.resumePlan = null;
+        this.resumeBlockers = [];
         this.streamingSpeed = 0;
         speedTracker.reset();
         // 记录本轮回合开始时间戳，供"已工作 xx秒"计时（随会话切换恢复，不重置）
@@ -4985,6 +5362,18 @@ navItems: [] as Array<{ id: number; preview: string }>,
             const m = this.messages[i] as ChatMessage;
             if (m.role === 'user' && m.content === turnUserText && !m.turnId) {
               m.turnId = String(data.turn_id);
+              break;
+            }
+          }
+        }
+        // 编辑已发送消息：乐观渲染的气泡同样缺数据库 id，靠 turn_start 一并补上。
+        // 不回填的话刚发出的这条要切会话重载历史才拿得到 _msg_id，表现为
+        // 「旧消息能编辑、刚发的不能」，同一个按钮两种行为
+        if (data.user_msg_id) {
+          for (let i = this.messages.length - 1; i >= 0; i--) {
+            const m = this.messages[i] as ChatMessage;
+            if (m.role === 'user' && m.content === turnUserText && !m._msg_id) {
+              m._msg_id = Number(data.user_msg_id);
               break;
             }
           }
@@ -5352,6 +5741,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 星轨自动化：任务全量快照，幂等替换（与 message_queue 快照同模式）
         const tasks = Array.isArray(data.tasks) ? (data.tasks as AutomationTaskInfo[]) : [];
         this.automationTasks = tasks;
+      } else if (type === 'workflow_run_progress') {
+        // 星流工作流：解释执行器节点级实时事件（阶段/子代理/命令/产物）
+        const runId = String(data.run_id || '');
+        if (runId) {
+          const list = this.workflowLiveEvents[runId] || [];
+          list.push({
+            run_id: runId,
+            kind: String(data.kind || ''),
+            payload: (data.payload as Record<string, any>) || {},
+          });
+          if (list.length > 100) list.splice(0, list.length - 100);
+          this.workflowLiveEvents[runId] = list;
+        }
       } else if (type === 'automation_run_updated') {
         // 星轨自动化：单条运行行更新——按 id 幂等替换或插入历史头部，上限 50 条
         const run = data.run as AutomationRunInfo | undefined;
@@ -5504,6 +5906,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         void this.refreshNavIndex(eventSession || undefined);
         // 非当前窗口报错中断 → 红点
         this._setSessionStatusDot(eventSession, 'red');
+        // 断点续跑（S4）：问一次后端「这回合能不能续」。开关关闭时后端回 disabled，
+        // 快照保持为空、按钮不出现（R-T1：关闭态界面零变化）。
+        void this.loadResumePlan(eventSession || this.currentSessionName);
       } else if (type === 'token_usage') {
         this.tokenUsage = normalizeTokenUsage(data);
       } else if (type === 'token_usage_updated') {
@@ -6094,6 +6499,147 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // ---- 星流工作流（ZCode 导入）----
+    async refreshWorkflows(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      this.workflowsLoading = true;
+      try {
+        const res = await api.get_workflows(this.workdir || '');
+        if (res && res.ok && Array.isArray(res.workflows)) {
+          this.workflows = res.workflows;
+          this.workflowInvalid = Array.isArray(res.invalid) ? res.invalid : [];
+          return true;
+        }
+        return false;
+      } catch (err) {
+        this.notifyModal('星流工作流', '读取工作流清单失败: ' + err);
+        return false;
+      } finally {
+        this.workflowsLoading = false;
+      }
+    },
+
+    async pickWorkflowFiles(): Promise<string[] | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.pick_workflow_files();
+        if (res && res.ok && Array.isArray(res.paths) && res.paths.length) return res.paths;
+        return null; // 取消 / 未选 / 桥失败都按「无文件」处理
+      } catch {
+        return null;
+      }
+    },
+
+    async importWorkflows(
+      paths: string[],
+      scope: 'project' | 'user',
+      overwrite = false,
+    ): Promise<{ imported: WorkflowImportedItem[]; failed: WorkflowImportFailure[] | null }> {
+      const api = this._api();
+      if (!api) {
+        this.notifyModal('星流工作流', '桥未就绪');
+        return { imported: [], failed: null };
+      }
+      try {
+        const res = await api.import_workflows(paths, this.workdir || '', scope, overwrite);
+        if (res && res.ok) {
+          await this.refreshWorkflows();
+          return {
+            imported: (res.imported || []).map(i => ({ name: i.name, path: i.path })),
+            failed: res.failed || [],
+          };
+        }
+        this.notifyModal('星流工作流', '导入失败: ' + ((res && res.msg) || '未知错误'));
+        return { imported: [], failed: null };
+      } catch (err) {
+        this.notifyModal('星流工作流', '导入失败: ' + err);
+        return { imported: [], failed: null };
+      }
+    },
+
+    async saveWorkflow(payload: {
+      name: string;
+      description: string;
+      when_to_use?: string;
+      args?: Record<string, any>;
+      body: string;
+      scope: 'project' | 'user';
+      overwrite?: boolean;
+    }): Promise<{ ok: boolean; errors?: string[]; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, errors: ['桥未就绪'] };
+      try {
+        const res = await api.save_workflow({ ...payload, workspace_root: this.workdir || '' });
+        if (res && res.ok) await this.refreshWorkflows();
+        return res || { ok: false, errors: ['未知错误'] };
+      } catch (err) {
+        return { ok: false, errors: [String(err)] };
+      }
+    },
+
+    async deleteWorkflow(name: string, scope: 'project' | 'user'): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.delete_workflow(name, scope, this.workdir || '');
+        if (res && res.ok) {
+          await this.refreshWorkflows();
+          return true;
+        }
+        this.notifyModal('星流工作流', '删除失败: ' + ((res && res.msg) || '未知错误'));
+        return false;
+      } catch (err) {
+        this.notifyModal('星流工作流', '删除失败: ' + err);
+        return false;
+      }
+    },
+
+    async loadWorkflowDetail(name: string): Promise<(WorkflowInfo & { body?: string }) | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_workflow_detail(name, this.workdir || '');
+        if (res && res.ok && res.workflow) return res.workflow;
+        return null;
+      } catch {
+        return null;
+      }
+    },
+
+    async loadWorkflowRuns(name: string): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.get_workflow_runs(name, 20);
+        if (res && res.ok) {
+          this.workflowRuns[name] = res.runs || [];
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    },
+
+    async clearWorkflowRuns(name: string): Promise<void> {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.clear_workflow_runs(name);
+        if (res && res.ok) await this.loadWorkflowRuns(name);
+      } catch {
+        /* 清空失败静默：下次加载仍显示旧历史 */
+      }
+    },
+
+    // 预填当前会话输入框（星流面板「通过对话创建」等工作流引导用）：
+    // 只写草稿不发送，用户在对话里补全描述后自行回车
+    prefillComposer(text: string) {
+      this._getSessionRuntime().composerText = text;
+    },
+
     // ---- 星轨自动化任务 ----
     async refreshAutomations(): Promise<boolean> {
       const api = this._api();
@@ -6226,6 +6772,70 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         console.error('刷新 MCP 列表失败:', err);
       }
+    },
+
+    // 斜杠命令清单：只读接口、无副作用，加载失败时保持空数组（补全面板自动
+    // 退化为技能 + MCP 两路候选），绝不向前端抛错打断输入
+    async loadSlashCommands() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.list_slash_commands !== 'function') return;
+      try {
+        const res = await api.list_slash_commands();
+        if (res && res.ok && Array.isArray(res.commands)) {
+          this.slashCommands = res.commands;
+        }
+      } catch (err) {
+        // 旧版桥没有该方法 / 桥报错：静默保持既有清单
+        console.error('加载斜杠命令清单失败:', err);
+      }
+    },
+
+    // ---------------- /goal 目标状态（GoalBar 数据源） ----------------
+
+    // 拉取当前会话的目标状态：没有目标、接口缺失或桥报错一律写 null，
+    // 状态条据此静默隐藏——目标模式是辅助功能，不能因为读状态失败打断对话。
+    // 序号 + 会话名双重防护：轮询请求可能跨会话返回，过期响应不能覆盖新会话。
+    async loadGoalState() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.get_goal_state !== 'function') return;
+      const session = this.currentSessionName;
+      const seq = ++this.goalStateReqSeq;
+      try {
+        const res = await api.get_goal_state(session);
+        if (seq !== this.goalStateReqSeq || session !== this.currentSessionName) return;
+        this.goalState = res && res.ok ? (res.state ?? null) : null;
+      } catch {
+        // 静默失败但清空：读不到就当作没有目标，避免旧会话的状态条一直挂着
+        if (seq === this.goalStateReqSeq && session === this.currentSessionName) {
+          this.goalState = null;
+        }
+      }
+    },
+
+    // 状态条「停止」：桥里复用 /goal stop 的取消语义（含 awaiting_confirm 的状态
+    // 收敛），调用后立刻重拉状态，让按钮切换与徽标更新不必等下一次轮询
+    async stopGoal() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.goal_stop !== 'function') return;
+      try {
+        await api.goal_stop(this.currentSessionName);
+      } catch (err) {
+        console.error('停止目标失败:', err);
+      }
+      await this.loadGoalState();
+    },
+
+    // 状态条「继续」：桥里复用 /goal resume（仅 blocked/stopped/interrupted 可恢复，
+    // 其余状态由后端给出提示），同样调用后重拉状态刷新按钮
+    async resumeGoal() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.goal_resume !== 'function') return;
+      try {
+        await api.goal_resume(this.currentSessionName);
+      } catch (err) {
+        console.error('恢复目标失败:', err);
+      }
+      await this.loadGoalState();
     },
 
     // ---------------- 内嵌终端（右侧面板版已下线，交互式终端见 ptyTerminal*） ----------------
@@ -6877,6 +7487,64 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }));
       } catch {
         // 拉取失败保留上次快照，不打断界面
+      }
+    },
+
+    // 断点续跑（S4）：拉取可续跑快照。开关关闭时后端回 disabled，这里静默清空，
+    // 界面与改动前完全一致（R-T1）。
+    async loadResumePlan(sessionName?: string) {
+      const api = window.pywebview && window.pywebview.api;
+      const target = (sessionName || this.currentSessionName || '').trim();
+      this.resumePlan = null;
+      this.resumeBlockers = [];
+      if (!api || typeof (api as any).resume_plan !== 'function' || !target) return;
+      try {
+        const res = await (api as any).resume_plan(target);
+        // 只有「存在可续跑回合 + 无降级原因」才保留快照（按钮出现条件）
+        if (res && res.ok && res.resumable && res.plan
+          && (!res.aborts || res.aborts.length === 0)) {
+          this.resumePlan = res.plan as ResumePlanSnapshot;
+        }
+      } catch {
+        // 探测失败按不可续跑处理：不显示入口，也不打断错误条
+      }
+    },
+
+    // 断点续跑（S4）：confirmed 传空数组 = 只续跑无写操作的调用；命中写操作时
+    // 后端回 confirm_required + blockers，这里以列表展示（含写操作的调用需手动重做）。
+    async runResume(sessionName?: string) {
+      if (this.resumeBusy) return;
+      const api = window.pywebview && window.pywebview.api;
+      const target = (sessionName || this.currentSessionName || '').trim();
+      if (!api || typeof (api as any).resume_execute !== 'function' || !target) return;
+      this.resumeBusy = true;
+      try {
+        const res = await (api as any).resume_execute(target, []);
+        this.resumeBlockers = Array.isArray(res?.blockers)
+          ? (res.blockers as ResumeBlockerItem[])
+          : [];
+        if (res && res.ok) {
+          this.resumePlan = null;
+          this.resumeBlockers = [];
+          const suffix = res.dry_run ? '（预演：未发请求）' : '';
+          this.notifyChatLocal(`已从断点续跑：新回合 ${String(res.turn_id || '')}${suffix}`);
+          return;
+        }
+        if (res && res.reason === 'confirm_required') {
+          this.notifyChatLocal('断点续跑需要确认写操作：含写操作的调用需手动重做', 'notice');
+          return;
+        }
+        this.notifyChatLocal(
+          `断点续跑未执行：${String(res?.msg || res?.reason || '未知原因')}`,
+          'error',
+        );
+      } catch (err) {
+        this.notifyChatLocal(
+          `断点续跑失败：${String((err as Error)?.message || err)}`,
+          'error',
+        );
+      } finally {
+        this.resumeBusy = false;
       }
     },
 

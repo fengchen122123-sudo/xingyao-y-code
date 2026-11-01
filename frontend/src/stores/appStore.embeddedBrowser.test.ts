@@ -39,13 +39,17 @@ it('embedded_browser 事件合并到 embeddedBrowser 状态并强制字段类型
   expect(store.embeddedBrowser.loading).toBe(false);
 });
 
-it('embedded_browser_automation 事件写入项目分辨率并展开面板到浏览器页签', () => {
+it('embedded_browser_automation 事件写入项目分辨率并展开发起会话的浏览器页签', () => {
   const store = useAppStore();
+  store.currentSessionName = 'A';
   store.rightPanelCollapsed = true;
   store.rightPanelPicker = true;
   expect(store.embeddedBrowser.automationViewport).toBeNull();
 
-  store.handleBridgeEvent({ type: 'embedded_browser_automation', data: { width: 1280, height: 800 } } as any);
+  store.handleBridgeEvent({
+    type: 'embedded_browser_automation',
+    data: { width: 1280, height: 800, session_name: 'A' },
+  } as any);
   expect(store.embeddedBrowser.automationViewport).toEqual([1280, 800]);
   expect(store.rightPanelCollapsed).toBe(false);
   expect(store.rightPanelPicker).toBe(false);
@@ -53,6 +57,21 @@ it('embedded_browser_automation 事件写入项目分辨率并展开面板到浏
   // 非法/缺省分辨率：状态不变（不写入 NaN 视口）
   store.handleBridgeEvent({ type: 'embedded_browser_automation', data: {} } as any);
   expect(store.embeddedBrowser.automationViewport).toEqual([1280, 800]);
+});
+
+it('embedded_browser_automation 缺 session_name 时只应用分辨率，不替当前会话开页签', () => {
+  const store = useAppStore();
+  store.currentSessionName = 'A';
+  store.rightPanelCollapsed = true;
+
+  store.handleBridgeEvent({
+    type: 'embedded_browser_automation',
+    data: { width: 1440, height: 900 },
+  } as any);
+
+  expect(store.embeddedBrowser.automationViewport).toEqual([1440, 900]);
+  expect(store.rightPanelTabs).toEqual([]);
+  expect(store.rightPanelCollapsed).toBe(true);
 });
 
 it('embedded_browser_automation 相同分辨率重复下发仍换新引用（可重复触发组件 watch）', () => {

@@ -177,6 +177,44 @@ def permission_mode_scope(mode: Any):
         _permission_mode_tls.mode = previous
 
 
+# ---------------------------------------------------------------------------
+# 自动化回合标记（G3：防任务自我繁殖）
+# ---------------------------------------------------------------------------
+
+# 线程级自动化回合标记：星轨自动化派发的回合线程绑定本次运行 id，工具 schema
+# 层（core.llm）与执行层（core.harness.tool_pipeline）据此隐藏/拒绝写类自动化
+# 工具。仅作为「本回合来源」标记，不承担跨线程权限判定（那是
+# _automation_turn_labels 的职责）。
+_automation_turn_tls = threading.local()
+
+
+def set_thread_automation_turn(run_id: Any) -> None:
+    """绑定当前线程的自动化回合标记（run_id 为空即解绑）。"""
+    _automation_turn_tls.run_id = str(run_id or "") or None
+
+
+def get_thread_automation_turn() -> str | None:
+    """返回当前线程所属的自动化运行 id；非自动化回合返回 None。"""
+    return getattr(_automation_turn_tls, "run_id", None)
+
+
+@contextlib.contextmanager
+def automation_turn_scope(run_id: Any):
+    """线程内临时标记「本回合由星轨自动化派发」，退出时恢复原值（支持嵌套）。
+
+    必须用 scope 而不是裸 set_thread_automation_turn：回合线程会被复用（同一
+    线程承接后续普通回合），裸设置只要有一条提前返回/异常路径漏了解绑，普通
+    会话就会永久丢掉 automation_* 写工具并被门控拒绝——正是 scope 的 finally
+    负责兜底恢复。
+    """
+    previous = getattr(_automation_turn_tls, "run_id", None)
+    set_thread_automation_turn(run_id)
+    try:
+        yield
+    finally:
+        _automation_turn_tls.run_id = previous
+
+
 def get_permission_mode() -> str:
     """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。
 

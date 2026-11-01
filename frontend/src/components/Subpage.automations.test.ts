@@ -45,8 +45,25 @@ describe('Subpage - 星轨自动化任务', () => {
   it('渲染标题、说明条与空态', () => {
     const wrapper = mountSubpage();
     expect(wrapper.text()).toContain('星轨自动化任务');
-    expect(wrapper.text()).toContain('仅星瑶运行期间生效');
     expect(wrapper.text()).toContain('还没有星轨自动化任务');
+  });
+
+  it('页内提供星轨/星流双标签，当前标签高亮', () => {
+    const wrapper = mountSubpage();
+    const tabs = wrapper.find('[data-test="auto-tabs"]');
+    expect(tabs.exists()).toBe(true);
+    expect(wrapper.find('[data-test="auto-tab-automations"]').classes()).toContain('active');
+    expect(wrapper.find('[data-test="auto-tab-workflows"]').classes()).not.toContain('active');
+  });
+
+  it('点星流标签切到工作流面板（openSubpage 幂等切 subType 不关子页）', async () => {
+    const store = useAppStore();
+    const openSpy = vi.fn();
+    store.openSubpage = openSpy as any;
+
+    const wrapper = mountSubpage();
+    await wrapper.find('[data-test="auto-tab-workflows"]').trigger('click');
+    expect(openSpy).toHaveBeenCalledWith('workflows');
   });
 
   it('打开页面时拉取任务列表并渲染任务卡', async () => {
@@ -278,5 +295,163 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(wrapper.text()).toContain('📁 proj');
     // 指定模型的任务卡展示模型名（供应商）
     expect(wrapper.text()).toContain('🧠 GLM-5.3（智谱）');
+  });
+
+  it('选择一次性触发后出现「N 分钟后」输入，保存只传 delay_minutes', async () => {
+    const store = useAppStore();
+    const saveSpy = vi.fn().mockResolvedValue({ ok: true });
+    store.saveAutomationTask = saveSpy as any;
+    store.sessionGroups = [];
+
+    const wrapper = mountSubpage();
+    await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
+    await wrapper.find('[data-test="automation-trigger-type"]').setValue('once');
+
+    // 默认形态是「N 分钟后」；绝对时刻输入此时不渲染（二选一）
+    expect(wrapper.find('[data-test="automation-delay-minutes"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="automation-run-at"]').exists()).toBe(false);
+
+    await wrapper.find('[data-test="automation-name"]').setValue('一次性任务');
+    await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
+    await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
+    await wrapper.find('[data-test="automation-delay-minutes"]').setValue('15');
+    await wrapper.find('[data-test="automation-save"]').trigger('click');
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    const payload = saveSpy.mock.calls[0][0];
+    expect(payload.trigger_type).toBe('once');
+    // 只传其中一个键：延迟形态不带 run_at
+    expect(payload.trigger_config).toEqual({ delay_minutes: 15 });
+  });
+
+  it('一次性触发切到绝对时刻时保存传 run_at（空格分隔的本地时刻）', async () => {
+    const store = useAppStore();
+    const saveSpy = vi.fn().mockResolvedValue({ ok: true });
+    store.saveAutomationTask = saveSpy as any;
+    store.sessionGroups = [];
+
+    const wrapper = mountSubpage();
+    await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
+    await wrapper.find('[data-test="automation-trigger-type"]').setValue('once');
+    await wrapper.find('[data-test="automation-once-mode"]').setValue('absolute');
+
+    expect(wrapper.find('[data-test="automation-run-at"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="automation-delay-minutes"]').exists()).toBe(false);
+
+    await wrapper.find('[data-test="automation-name"]').setValue('一次性任务');
+    await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
+    await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
+    await wrapper.find('[data-test="automation-run-at"]').setValue('2030-01-02T08:15');
+    await wrapper.find('[data-test="automation-save"]').trigger('click');
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    const payload = saveSpy.mock.calls[0][0];
+    expect(payload.trigger_type).toBe('once');
+    // 绝对时刻形态不带 delay_minutes，且 datetime-local 的 T 换成后端认的空格
+    expect(payload.trigger_config).toEqual({ run_at: '2030-01-02 08:15' });
+  });
+
+  it('最多执行次数留空保存为 null，填写后按整数下发', async () => {
+    const store = useAppStore();
+    const saveSpy = vi.fn().mockResolvedValue({ ok: true });
+    store.saveAutomationTask = saveSpy as any;
+    store.sessionGroups = [];
+
+    const wrapper = mountSubpage();
+
+    const fillAndSave = async (maxRuns?: string) => {
+      await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
+      await wrapper.find('[data-test="automation-name"]').setValue('限次任务');
+      await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
+      await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
+      const input = wrapper.find('[data-test="automation-max-runs"]');
+      expect(input.exists()).toBe(true);
+      expect(wrapper.text()).toContain('手动「立即执行」不计入次数');
+      if (maxRuns !== undefined) await input.setValue(maxRuns);
+      await wrapper.find('[data-test="automation-save"]').trigger('click');
+      return saveSpy.mock.calls[saveSpy.mock.calls.length - 1][0];
+    };
+
+    // 留空 = 不限次
+    expect((await fillAndSave()).max_runs).toBeNull();
+    expect((await fillAndSave('3')).max_runs).toBe(3);
+  });
+
+  it('已完成任务卡展示「已完成」徽标并禁用立即执行与启停', async () => {
+    const store = useAppStore();
+    store.automationTasks = [{
+      ..._task,
+      id: 'task-done',
+      name: '跑完的任务',
+      max_runs: 3,
+      scheduled_run_count: 3,
+      status: 'completed',
+    }] as any;
+    const runSpy = vi.fn().mockResolvedValue({ ok: true });
+    store.runAutomationTaskNow = runSpy as any;
+
+    const wrapper = mountSubpage();
+    const card = wrapper.find('[data-test="automation-card-跑完的任务"]');
+    expect(card.exists()).toBe(true);
+
+    const badge = card.find('[data-test="automation-task-status"]');
+    expect(badge.exists()).toBe(true);
+    expect(badge.text()).toContain('已完成');
+
+    const runBtn = card.find('[data-test="automation-run-跑完的任务"]');
+    expect(runBtn.attributes('disabled')).toBeDefined();
+    const toggle = card.find('[data-test="automation-toggle-跑完的任务"]').element as HTMLInputElement;
+    expect(toggle.disabled).toBe(true);
+
+    // 置灰后点击不会真正派发
+    await runBtn.trigger('click');
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it('有限次任务卡展示「已执行 1/3 次」进度', async () => {
+    const store = useAppStore();
+    store.automationTasks = [{
+      ..._task,
+      id: 'task-limit',
+      name: '限次任务',
+      max_runs: 3,
+      scheduled_run_count: 1,
+      status: 'active',
+    }] as any;
+
+    const wrapper = mountSubpage();
+    const card = wrapper.find('[data-test="automation-card-限次任务"]');
+    expect(card.exists()).toBe(true);
+    expect(card.text()).toContain('已执行 1/3 次');
+    // 未达上限不展示生命周期徽标
+    expect(card.find('[data-test="automation-task-status"]').exists()).toBe(false);
+  });
+
+  it('一次性触发时刻已过时，把后端返回的 msg 展示在表单错误位', async () => {
+    const store = useAppStore();
+    const saveSpy = vi.fn().mockResolvedValue({
+      ok: false,
+      msg: '一次性触发时刻已过（2020-01-01 00:00），请改用 delay_minutes 指定「距现在多少分钟」后重试',
+    });
+    store.saveAutomationTask = saveSpy as any;
+    store.sessionGroups = [];
+
+    const wrapper = mountSubpage();
+    await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
+    await wrapper.find('[data-test="automation-name"]').setValue('一次性任务');
+    await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
+    await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
+    await wrapper.find('[data-test="automation-trigger-type"]').setValue('once');
+    await wrapper.find('[data-test="automation-once-mode"]').setValue('absolute');
+    await wrapper.find('[data-test="automation-run-at"]').setValue('2020-01-01T00:00');
+    await wrapper.find('[data-test="automation-save"]').trigger('click');
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy.mock.calls[0][0].trigger_config).toEqual({ run_at: '2020-01-01 00:00' });
+    const err = wrapper.find('[data-test="automation-form-errors"]');
+    expect(err.exists()).toBe(true);
+    expect(err.text()).toContain('一次性触发时刻已过');
+    // 失败后表单保持打开，便于用户改时刻重试
+    expect(wrapper.find('[data-test="automation-form"]').exists()).toBe(true);
   });
 });

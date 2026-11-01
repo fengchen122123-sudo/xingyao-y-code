@@ -52,10 +52,17 @@ def _validate_computer_combination(supports_vision, supports_function_calling, c
 
 
 def load_config() -> dict:
-    """加载完整配置，如果是旧格式则自动迁移。主文件损坏时优先从 .bak 备份恢复。"""
-    data = config._read_json_with_backup(_CONFIG_FILE, default=None)
-    if not isinstance(data, dict):
-        data = {}
+    """加载完整配置，如果是旧格式则自动迁移。主文件损坏时优先从备份恢复。
+
+    读取失败（主文件损坏且无可用备份）时只在内存里给出默认结构，绝不写盘：
+    以前这里会顺手把默认配置落盘，导致一次瞬时读取失败就把用户的全部厂商/模型
+    配置覆盖成单个默认厂商（重启后「模型配置全丢」的事故根因）。
+    """
+    raw = config._read_json_with_backup(_CONFIG_FILE, default=None)
+    # 首次运行（文件确实不存在）允许把默认结构落盘；文件存在却读不出来属于故障，
+    # 此时只在内存里用默认结构顶住，绝不回写磁盘
+    read_failed = not isinstance(raw, dict) and os.path.exists(_CONFIG_FILE)
+    data = raw if isinstance(raw, dict) else {}
 
     # 检测旧格式（只有 model/api_key/base_url 的扁平结构），自动迁移
     if "model" in data and "providers" not in data:
@@ -137,7 +144,14 @@ def load_config() -> dict:
                     }
                 ]
             }
-            _write_config(data)
+            if read_failed:
+                config._log_warning(
+                    "config.json 读取失败且没有可用备份，本次按空配置启动；"
+                    "为避免把用户模型配置覆盖成默认值，本次不会写回磁盘"
+                )
+            else:
+                # 仅「首次运行（配置文件确实不存在）」才落盘默认结构
+                _write_config(data)
         else:
             data["providers"] = []
 

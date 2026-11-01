@@ -68,7 +68,11 @@ class BrowserBridgeMixin:
 
             def _on_state(state: Dict[str, Any]) -> None:
                 try:
-                    self.emit_event("embedded_browser", state)
+                    # 状态事件必须带归属会话：前端只认领「当前查看会话」的状态，
+                    # 否则后台会话的导航/标题/加载态会污染用户正在看的另一个会话。
+                    payload = dict(state or {})
+                    payload["session_name"] = self._browser_pane_owner()
+                    self.emit_event("embedded_browser", payload)
                 except Exception:
                     logger.debug("推送内嵌浏览器状态失败", exc_info=True)
 
@@ -173,22 +177,128 @@ class BrowserBridgeMixin:
             # 免登录是增强项：任何失败都只记 debug，不干扰导航本身。
             logger.debug("注入基元律动会话 cookie 失败", exc_info=True)
 
+    # ------------------------------------------------------- 会话归属（多会话）
+    #
+    # 原生 WebView2 控件全进程只有一个，因此必须明确「此刻归哪个会话」：
+    # - 前台会话（UI 当前查看的会话）调用：立即作用到控件；
+    # - 后台会话调用：只登记待加载 URL，并通知前端在该会话自己的右栏开页签，
+    #   绝不移动/显示控件——否则浏览器会盖到用户正在看的另一个会话上；
+    # - 用户切到该会话时，前端调用 browser_pane_set_active_session，桥层切换
+    #   归属并回放 pending（embedded_browser_activation），前端就地 open + 导航。
+    # 前端直接调用不带 session_name，一律按「当前查看会话」处理（与旧版一致）。
+
+    def _browser_pane_session(self, session_name: str = "") -> str:
+        """解析本次调用的归属会话：显式入参 > UI 当前查看会话。"""
+        explicit = str(session_name or "").strip()
+        if explicit:
+            return explicit
+        return str(getattr(self, "_current_session", "") or "")
+
+    def _browser_pane_owner(self) -> str:
+        """当前占用原生控件的会话名（状态事件的归属）。"""
+        return str(getattr(self, "_browser_pane_owner_session", "") or "")
+
+    def _browser_pane_pending(self) -> Dict[str, Dict[str, Any]]:
+        """后台会话的待加载意图：session_name -> {'url': str}。"""
+        pending = getattr(self, "_browser_pane_pending_intents", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._browser_pane_pending_intents = pending
+        return pending
+
+    def _browser_pane_is_foreground(self, session_name: str) -> bool:
+        """是否就是 UI 当前查看的会话；空值按前台处理（兼容旧前端）。"""
+        current = str(getattr(self, "_current_session", "") or "")
+        target = str(session_name or "").strip()
+        if not target or not current:
+            return True
+        return target == current
+
+    def _browser_pane_defer(self, session_name: str, url: str) -> Dict[str, Any]:
+        """后台会话：登记待加载 URL 并通知前端在它自己的右栏开页签。"""
+        target = str(session_name or "").strip() or str(
+            getattr(self, "_current_session", "") or ""
+        )
+        self._browser_pane_pending()[target] = {"url": str(url or "")}
+        try:
+            self.emit_event(
+                "embedded_browser_assigned",
+                {"session_name": target, "url": str(url or "")},
+            )
+        except Exception:
+            logger.debug("推送内嵌浏览器归属事件失败", exc_info=True)
+        return {"ok": True, "deferred": True, "session_name": target}
+
     # ---------------------------------------------------------------- 桥方法
 
-    def browser_pane_open(self, rect: Dict[str, Any], url: str = "", zoom: float = 1.0) -> Dict[str, Any]:
+    def browser_pane_open(
+        self, rect: Dict[str, Any], url: str = "", zoom: float = 1.0, session_name: str = ""
+    ) -> Dict[str, Any]:
         try:
+            target = self._browser_pane_session(session_name)
+            if not self._browser_pane_is_foreground(target):
+                return self._browser_pane_defer(target, url)
             if not self._valid_rect(rect):
                 return {"ok": False, "error": "invalid_rect"}
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
+            # 先记归属再 open：controller 的 on_state 回调据此给事件打 session；
+            # open 失败时归属残留无副作用（下次成功 open 会覆盖）。
+            self._browser_pane_owner_session = target
             self._inject_tokenrhythm_session(ctrl, url)
             return ctrl.open(rect, url, zoom)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_set_bounds(self, rect: Dict[str, Any], zoom: float = 1.0) -> Dict[str, Any]:
+    def browser_pane_assign(self, url: str = "", session_name: str = "") -> Dict[str, Any]:
+        """只登记「该会话要打开这个地址」，不创建/移动原生控件。
+
+        给模型用的 open 入口：模型不可能知道窗口布局，rect 一律由前端在页签
+        激活时测量上报；前台会话收到 assigned 后立即开页签并导航。
+        """
         try:
+            return self._browser_pane_defer(self._browser_pane_session(session_name), url)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def browser_pane_set_active_session(self, session_name: str = "") -> Dict[str, Any]:
+        """前端切会话时通知：把原生控件归属切到该会话并回放它的待加载 URL。"""
+        try:
+            target = str(session_name or "").strip() or str(
+                getattr(self, "_current_session", "") or ""
+            )
+            self._browser_pane_owner_session = target
+            item = self._browser_pane_pending().pop(target, None)
+            if item and item.get("url"):
+                try:
+                    self.emit_event(
+                        "embedded_browser_activation",
+                        {"session_name": target, "url": str(item["url"])},
+                    )
+                except Exception:
+                    logger.debug("推送内嵌浏览器激活事件失败", exc_info=True)
+            elif item is None:
+                # 目标会话没有待显示页面：收起仍挂着旧会话内容的原生控件。
+                # 前端切会话时通常已随组件卸载 hide，这里只作跨端兜底。
+                ctrl = getattr(self, "_embedded_browser", None)
+                if ctrl is not None:
+                    try:
+                        ctrl.hide()
+                    except Exception:
+                        logger.debug("切换会话时收起内嵌浏览器失败", exc_info=True)
+            return {"ok": True, "session_name": target, "activated": bool(item)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def browser_pane_set_bounds(
+        self, rect: Dict[str, Any], zoom: float = 1.0, session_name: str = ""
+    ) -> Dict[str, Any]:
+        try:
+            if not self._browser_pane_is_foreground(
+                self._browser_pane_session(session_name)
+            ):
+                return {"ok": False, "error": "not_visible"}
             if not self._valid_rect(rect):
                 return {"ok": False, "error": "invalid_rect"}
             # 平台守卫与其余桥方法保持一致（评审 S5）；控制器不存在时
@@ -203,8 +313,12 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_navigate(self, url: str) -> Dict[str, Any]:
+    def browser_pane_navigate(self, url: str, session_name: str = "") -> Dict[str, Any]:
         try:
+            target = self._browser_pane_session(session_name)
+            if not self._browser_pane_is_foreground(target):
+                # 后台会话导航只更新意图，切回该会话时再真正加载
+                return self._browser_pane_defer(target, url)
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
@@ -213,8 +327,12 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_back(self) -> Dict[str, Any]:
+    def browser_pane_back(self, session_name: str = "") -> Dict[str, Any]:
         try:
+            if not self._browser_pane_is_foreground(
+                self._browser_pane_session(session_name)
+            ):
+                return {"ok": False, "error": "not_visible"}
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
@@ -222,8 +340,12 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_forward(self) -> Dict[str, Any]:
+    def browser_pane_forward(self, session_name: str = "") -> Dict[str, Any]:
         try:
+            if not self._browser_pane_is_foreground(
+                self._browser_pane_session(session_name)
+            ):
+                return {"ok": False, "error": "not_visible"}
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
@@ -231,8 +353,12 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_reload(self) -> Dict[str, Any]:
+    def browser_pane_reload(self, session_name: str = "") -> Dict[str, Any]:
         try:
+            if not self._browser_pane_is_foreground(
+                self._browser_pane_session(session_name)
+            ):
+                return {"ok": False, "error": "not_visible"}
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
@@ -240,8 +366,12 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_stop(self) -> Dict[str, Any]:
+    def browser_pane_stop(self, session_name: str = "") -> Dict[str, Any]:
         try:
+            if not self._browser_pane_is_foreground(
+                self._browser_pane_session(session_name)
+            ):
+                return {"ok": False, "error": "not_visible"}
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
@@ -249,8 +379,12 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_hide(self) -> Dict[str, Any]:
+    def browser_pane_hide(self, session_name: str = "") -> Dict[str, Any]:
         try:
+            if not self._browser_pane_is_foreground(
+                self._browser_pane_session(session_name)
+            ):
+                return {"ok": False, "error": "not_visible"}
             ctrl = getattr(self, "_embedded_browser", None)
             if ctrl is None:
                 return {"ok": True}
@@ -274,7 +408,7 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_get_state(self) -> Dict[str, Any]:
+    def browser_pane_get_state(self, session_name: str = "") -> Dict[str, Any]:
         try:
             ctrl = getattr(self, "_embedded_browser", None)
             if ctrl is None:

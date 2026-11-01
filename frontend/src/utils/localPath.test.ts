@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  OFFICE_EXTENSIONS,
   canOpenInRightPanel,
   isHtmlFilePath,
   isLocalFileLink,
   isMarkdownFilePath,
+  isOfficeFilePath,
   toAbsoluteLocalPath,
   toFileUrl,
 } from './localPath';
@@ -12,6 +14,11 @@ describe('isLocalFileLink', () => {
   it('识别相对路径（含分隔符 + 已知扩展名）', () => {
     expect(isLocalFileLink('docs/foo.md')).toBe(true);
     expect(isLocalFileLink('src\\app.py')).toBe(true);
+  });
+  it('办公文档的相对路径也算本地文件链接（相对路径白名单已含 office 扩展名）', () => {
+    expect(isLocalFileLink('docs/方案.pptx')).toBe(true);
+    expect(isLocalFileLink('报告.docx')).toBe(true);
+    expect(isLocalFileLink('assets/表格.xlsx')).toBe(true);
   });
   it('识别相对前缀 ./ 与 ../', () => {
     expect(isLocalFileLink('./foo.py')).toBe(true);
@@ -85,13 +92,52 @@ describe('isMarkdownFilePath', () => {
   });
 });
 
+describe('isOfficeFilePath', () => {
+  it('识别 Word / Excel / PowerPoint 及 WPS 另存格式（不分大小写）', () => {
+    expect(isOfficeFilePath('D:\\proj\\报告.docx')).toBe(true);
+    expect(isOfficeFilePath('a.DOC')).toBe(true);
+    expect(isOfficeFilePath('表格.xlsx')).toBe(true);
+    expect(isOfficeFilePath('a.XLS')).toBe(true);
+    expect(isOfficeFilePath('docs/方案.pptx')).toBe(true);
+    expect(isOfficeFilePath('a.PPT')).toBe(true);
+    // WPS / LibreOffice 另存格式
+    expect(isOfficeFilePath('a.rtf')).toBe(true);
+    expect(isOfficeFilePath('a.odt')).toBe(true);
+    expect(isOfficeFilePath('a.ods')).toBe(true);
+    expect(isOfficeFilePath('a.odp')).toBe(true);
+  });
+  it('忽略查询串与锚点（前端链接常带 ?x=1）', () => {
+    expect(isOfficeFilePath('report.docx?x=1')).toBe(true);
+    expect(isOfficeFilePath('report.PPTX#page=2')).toBe(true);
+    expect(isOfficeFilePath('  a.xls?download=1  ')).toBe(true);
+  });
+  it('非办公文档不算', () => {
+    expect(isOfficeFilePath('pic.png')).toBe(false);
+    expect(isOfficeFilePath('a.txt')).toBe(false);
+    expect(isOfficeFilePath('a.docx.bak')).toBe(false);
+    expect(isOfficeFilePath('a.pdf')).toBe(false);
+    expect(isOfficeFilePath('')).toBe(false);
+  });
+  it('OFFICE_EXTENSIONS 覆盖三类办公文档', () => {
+    for (const ext of ['doc', 'docx', 'rtf', 'odt', 'xls', 'xlsx', 'ods', 'ppt', 'pptx', 'odp']) {
+      expect(OFFICE_EXTENSIONS.has(ext)).toBe(true);
+    }
+    expect(OFFICE_EXTENSIONS.has('pdf')).toBe(false);
+  });
+});
+
 describe('canOpenInRightPanel', () => {
-  it('html / pdf / md 三类交给右栏', () => {
+  it('html / pdf / md / office 四类交给右栏', () => {
     expect(canOpenInRightPanel('D:\\proj\\index.html')).toBe(true);
     expect(canOpenInRightPanel('D:\\proj\\doc.pdf')).toBe(true);
     expect(canOpenInRightPanel('docs/notes.md')).toBe(true);
     expect(canOpenInRightPanel('a.MARKDOWN')).toBe(true);
     expect(canOpenInRightPanel('report.pdf?x=1')).toBe(true);
+  });
+  it('office 文档也交给右栏（docx / pptx / xlsx）', () => {
+    expect(canOpenInRightPanel('D:\\proj\\报告.docx')).toBe(true);
+    expect(canOpenInRightPanel('docs/方案.pptx')).toBe(true);
+    expect(canOpenInRightPanel('表格.XLSX?x=1')).toBe(true);
   });
   it('其它类型仍走源码预览弹窗', () => {
     expect(canOpenInRightPanel('a.py')).toBe(false);

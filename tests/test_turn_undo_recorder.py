@@ -208,20 +208,31 @@ def test_second_mutation_keeps_before_replaces_after(env):
     recorder.release_context(cp.checkpoint_id)
 
 
-def test_verify_mismatch_marks_unavailable_and_raises(env):
+def test_verify_mismatch_skips_file_and_keeps_turn_recording(env):
     target = env["ws"] / "race.txt"
     cp, ctx = _begin_turn(env)
-    handle = _prepare(env, target, b"planned")
-    # 验证前被外部改变
-    target.write_bytes(b"external!")
-    with pytest.raises(TurnUndoError) as exc:
-        recorder.verify_after_mutation(handle)
-    assert exc.value.code == UndoErrorCode.FILE_CONFLICT
-    cp_row = env["storage"].get_checkpoint(cp.checkpoint_id)
-    assert cp_row.status_enum is TurnUndoStatus.UNAVAILABLE
-    # 目标文件未被记录器触碰（仍是外部内容）
-    assert target.read_bytes() == b"external!"
-    recorder.release_context(cp.checkpoint_id)
+    try:
+        handle = _prepare(env, target, b"planned")
+        # 验证前被外部改变
+        target.write_bytes(b"external!")
+        with pytest.raises(TurnUndoError) as exc:
+            recorder.verify_after_mutation(handle)
+        assert exc.value.code == UndoErrorCode.FILE_CONFLICT
+        # 单个文件验证失败只让该文件退出撤销范围，不再封死整个回合
+        row = env["storage"].get_file(handle.file_id)
+        assert row.undo_result == "skipped"
+        cp_row = env["storage"].get_checkpoint(cp.checkpoint_id)
+        assert cp_row.status_enum is TurnUndoStatus.RECORDING
+        # 目标文件未被记录器触碰（仍是外部内容）
+        assert target.read_bytes() == b"external!"
+        # 同回合后续写入其他文件不受影响
+        other = env["ws"] / "later.txt"
+        h2 = _prepare(env, other, b"later", call="call-later")
+        other.write_bytes(b"later")
+        recorder.verify_after_mutation(h2)
+        assert recorder.close_turn(ctx) is TurnUndoStatus.READY
+    finally:
+        recorder.release_context(cp.checkpoint_id)
 
 
 def test_verify_missing_target_for_delete_plan(env):
@@ -397,21 +408,47 @@ def test_unverified_record_makes_turn_unavailable(env):
     assert cp_row.unavailable_code == UndoErrorCode.CHECKPOINT_UNAVAILABLE
 
 
-def test_mid_turn_external_change_detected_at_prepare(env):
+def test_mid_turn_external_change_skips_file_but_keeps_recording(env):
     target = env["ws"] / "ext.txt"
     target.write_bytes(b"v0")
     cp, ctx = _begin_turn(env)
-    h1 = _prepare(env, target, b"v1", call="call-1")
-    target.write_bytes(b"v1")
-    recorder.verify_after_mutation(h1)
-    # 外部修改后再 prepare 同一文件 → 拒绝并标记不可撤销
-    target.write_bytes(b"external")
-    with pytest.raises(TurnUndoError) as exc:
-        _prepare(env, target, b"v2", call="call-2")
-    assert exc.value.code == UndoErrorCode.FILE_CONFLICT
-    assert env["storage"].get_checkpoint(cp.checkpoint_id).status_enum \
-        is TurnUndoStatus.UNAVAILABLE
-    recorder.release_context(cp.checkpoint_id)
+    try:
+        h1 = _prepare(env, target, b"v1", call="call-1")
+        target.write_bytes(b"v1")
+        recorder.verify_after_mutation(h1)
+        # 外部修改后再 prepare 同一文件：该文件退出撤销范围，写入继续
+        target.write_bytes(b"external")
+        h2 = _prepare(env, target, b"v2", call="call-2")
+        assert h2.file_id == h1.file_id
+        target.write_bytes(b"v2")
+        recorder.verify_after_mutation(h2)
+        row = env["storage"].get_file(h1.file_id)
+        assert row.undo_result == "skipped"
+        assert row.undo_error_code == UndoErrorCode.FILE_CONFLICT
+        assert env["storage"].get_checkpoint(cp.checkpoint_id).status_enum \
+            is TurnUndoStatus.RECORDING
+        # 同回合写其他文件仍正常
+        other = env["ws"] / "other.txt"
+        h3 = _prepare(env, other, b"ok", call="call-3")
+        other.write_bytes(b"ok")
+        recorder.verify_after_mutation(h3)
+        assert recorder.close_turn(ctx) is TurnUndoStatus.READY
+    finally:
+        recorder.release_context(cp.checkpoint_id)
+
+
+def test_close_turn_all_files_skipped_is_no_changes(env):
+    target = env["ws"] / "only.txt"
+    cp, ctx = _begin_turn(env)
+    try:
+        handle = _prepare(env, target, b"planned")
+        target.write_bytes(b"external")
+        with pytest.raises(TurnUndoError):
+            recorder.verify_after_mutation(handle)
+        # 全部文件退出撤销范围 → 等价于本回合没有可撤销修改
+        assert recorder.close_turn(ctx) is TurnUndoStatus.NO_CHANGES
+    finally:
+        recorder.release_context(cp.checkpoint_id)
 
 
 # ---------------------------------------------------------------------------
@@ -503,4 +540,56 @@ def test_prepare_rejects_via_capture_poisoned_symlink(env, monkeypatch):
         assert exc.value.code == UndoErrorCode.UNSUPPORTED_NODE_KIND
     finally:
         monkeypatch.undo()
+        recorder.release_context(cp.checkpoint_id)
+
+
+# ---------------------------------------------------------------------------
+# 工作区写入互斥与封闭原因可读性
+# ---------------------------------------------------------------------------
+
+def test_workspace_busy_blocks_concurrent_turn_write(env):
+    """同目录另一个回合活跃时，本回合写入在触盘前被拒，但检查点不被判死。"""
+    from core.turn_undo import coordinator as coord_mod
+
+    cp, ctx = _begin_turn(env, turn="turn-busy")
+    coordinator = coord_mod.get_coordinator()
+    coordinator.register_active_turn(ctx.workspace_root, "turn-busy")
+    coordinator.register_active_turn(ctx.workspace_root, "turn-other")
+    target = env["ws"] / "busy.txt"
+    try:
+        with pytest.raises(TurnUndoError) as exc:
+            _prepare(env, target, b"x")
+        assert exc.value.code == UndoErrorCode.WORKSPACE_BUSY
+        assert "turn-other"[:8] in exc.value.message
+        # 冲突是"忙"，不是"检查点封闭"：回合仍 recording，可重试
+        assert env["storage"].get_checkpoint(cp.checkpoint_id).status_enum \
+            is TurnUndoStatus.RECORDING
+        coordinator.unregister_active_turn(ctx.workspace_root, "turn-other")
+        handle = _prepare(env, target, b"x", call="retry")
+        target.write_bytes(b"x")
+        recorder.verify_after_mutation(handle)
+        assert recorder.close_turn(ctx) is TurnUndoStatus.READY
+    finally:
+        coordinator.unregister_active_turn(ctx.workspace_root, "turn-busy")
+        coordinator.unregister_active_turn(ctx.workspace_root, "turn-other")
+        recorder.release_context(cp.checkpoint_id)
+
+
+def test_checkpoint_closed_message_includes_reason(env):
+    """封闭错误必须带出触发原因，避免只看到"检查点已封闭"无从排查。"""
+    cp, ctx = _begin_turn(env, turn="turn-closed")
+    try:
+        env["storage"].transition_checkpoint(
+            cp.checkpoint_id,
+            TurnUndoStatus.UNAVAILABLE,
+            unavailable_code=UndoErrorCode.CHECKPOINT_UNAVAILABLE,
+            last_error_code=UndoErrorCode.CHECKPOINT_UNAVAILABLE,
+            last_error_message="示例原因：验证结果落库失败",
+        )
+        with pytest.raises(TurnUndoError) as exc:
+            _prepare(env, env["ws"] / "closed.txt", b"x")
+        assert exc.value.code == UndoErrorCode.CHECKPOINT_CLOSED
+        assert "示例原因" in exc.value.message
+        assert exc.value.detail.get("status") == "unavailable"
+    finally:
         recorder.release_context(cp.checkpoint_id)

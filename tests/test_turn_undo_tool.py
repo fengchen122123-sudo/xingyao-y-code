@@ -226,6 +226,30 @@ def test_configure_fails_when_coverage_incomplete(tmp_path, monkeypatch):
         tu_service.configure_default_manager(manager, blob_root=tmp_path / "blobs")
 
 
+def test_write_file_returns_retryable_busy_when_workspace_occupied(env, monkeypatch):
+    """同目录另一个回合活跃时，write_file 返回可重试提示而不是"检查点封闭"。"""
+    from core.tools import write_file
+    from core.turn_undo import coordinator as coord_mod
+
+    monkeypatch.chdir(env["ws"])
+    checkpoint, ctx = turn_undo_service.begin_turn(
+        session_id=env["session_id"],
+        turn_id="turn-busy-tool",
+        workspace_root=str(env["ws"]),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+    coordinator = coord_mod.get_coordinator()
+    coordinator.register_active_turn(ctx.workspace_root, "turn-other")
+    try:
+        result = write_file(str(env["ws"] / "busy.txt"), "content")
+        assert "另一个回合" in result
+        assert "检查点已封闭" not in result
+        assert not (env["ws"] / "busy.txt").exists()
+    finally:
+        coordinator.unregister_active_turn(ctx.workspace_root, "turn-other")
+        turn_undo_service.finish_turn(ctx, aborted=True, reason="测试清理")
+
+
 def test_late_subagent_write_refused_at_tool_level(tmp_path, monkeypatch):
     """H2 端到端：父回合封闭后，仍绑定旧检查点的线程调用 write_file 必须在
     触盘前失败（🚨），文件不变——工具层不得把"检查点已封闭"降级为裸写。"""

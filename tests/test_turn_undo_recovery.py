@@ -444,3 +444,44 @@ def test_startup_scan_wires_retention_expiry(env):
     # 生命周期事实不被覆盖
     for r in expired:
         assert r["status"] in ("ready", "reverted", "failed", "conflicted")
+
+
+def test_startup_scan_reaps_stale_recording_checkpoint(env):
+    """崩溃残留的 recording 检查点：超过阈值启动时收敛为 unavailable。
+
+    否则该工作区的撤销/恢复会被活跃登记永久阻塞为 workspace_busy。
+    """
+    from core.turn_undo.storage import now_ms
+
+    cp, ctx = _begin_turn(env, turn="turn-crashed")
+    with env["storage"]._manager._lock:
+        env["storage"].conn.execute(
+            "UPDATE turn_undo_checkpoints SET started_at_ms = ? WHERE checkpoint_id = ?",
+            (now_ms() - 7 * 60 * 60 * 1000, cp.checkpoint_id),
+        )
+        env["storage"].conn.commit()
+    tu_recorder.release_context(cp.checkpoint_id)
+    env["coordinator"].unregister_active_turn(ctx.workspace_root, "turn-crashed")
+
+    report = turn_undo_service.startup_recovery_scan()
+
+    row = env["storage"].get_checkpoint(cp.checkpoint_id)
+    assert row.status_enum is TurnUndoStatus.UNAVAILABLE
+    assert row.unavailable_code == "stale_recording"
+    assert any(
+        item.get("reason") == "stale_recording"
+        and item.get("checkpoint_id") == cp.checkpoint_id
+        for item in report
+    )
+
+
+def test_startup_scan_keeps_fresh_recording_checkpoint(env):
+    """刚启动的短 recording 检查点不得被误回收。"""
+    cp, ctx = _begin_turn(env, turn="turn-fresh")
+    try:
+        turn_undo_service.startup_recovery_scan()
+        row = env["storage"].get_checkpoint(cp.checkpoint_id)
+        assert row.status_enum is TurnUndoStatus.RECORDING
+    finally:
+        tu_recorder.release_context(cp.checkpoint_id)
+        env["coordinator"].unregister_active_turn(ctx.workspace_root, "turn-fresh")

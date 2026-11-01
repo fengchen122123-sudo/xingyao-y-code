@@ -110,6 +110,23 @@ def test_cli_install_skips_frontend(tmp_path, patched_env):
     assert patched_env["registry"][0]["app_key_name"] == "Y-code-CLI"
 
 
+def test_cli_install_without_uninstaller_skips_registry(tmp_path, patched_env):
+    """CLI 安装时卸载程序不存在，就不该注册“应用和功能”卸载入口。
+
+    载荷里没有 Y-code-uninstall.exe、安装器 bundle 根目录也没有兼容副本时，
+    写注册表会留下一条点了没反应的死条目（Important 3）。
+    """
+    bundle = _fake_bundle(tmp_path)
+    # 去掉 bundle 根目录的兼容副本：模拟载荷里也没带卸载程序的安装包
+    (bundle / "Y-code-uninstall.exe").unlink()
+    install_dir = str(tmp_path / "installed_cli_no_uninst")
+    run_install(
+        "cli", str(bundle), InstallOptions(install_dir), _startupinfo(), log=lambda m: None,
+    )
+    assert not (tmp_path / "installed_cli_no_uninst" / "Y-code-uninstall.exe").exists()
+    assert patched_env["registry"] == []
+
+
 def test_missing_payload_raises_install_error(tmp_path, patched_env):
     bundle = tmp_path / "empty_bundle"
     bundle.mkdir()

@@ -15,6 +15,199 @@ from pathlib import Path
 from typing import Optional
 
 
+# ============================================================================
+# 内置 CLI 模式（--cli）：安装包只保留一份 Python 载荷
+#
+# 背景（合并方案，见 packaging/ycode_launcher.cs）：原先 Y-code.exe(GUI) 与
+# ycode.exe(CLI) 各带一份约 31MB 的 PyInstaller 字节码归档，其中约 30.83MB 是
+# 两份完全相同的共用模块、CLI 独有模块只有 0.12MB。现在 ycode.exe 退化为几 KB 的
+# C# 控制台启动器，它把调用方参数原样透传并追加 --cli 拉起本程序；本模块必须在
+# 任何 GUI 重模块（webview / gui_bridge / core.gui_*）被 import 之前识别该标志并
+# 转交 CLI 主流程，否则会先白付一遍 GUI 导入开销，还会把
+# hide_child_console_windows 这类 GUI 专属兜底带进控制台程序。
+# ============================================================================
+_CLI_FLAG = "--cli"
+# CLI 模式自救时打开的 CONOUT$/CONIN$ 流必须持有引用：main.py 会把 sys.stdout
+# 重新包一层 TextIOWrapper，旧对象一旦被 GC 回收就会顺带关闭底层 buffer。
+_CLI_STDIO_STREAMS = []
+
+
+def _stream_usable(stream) -> bool:
+    """标准流是否真的可用（None 与 runtime hook 的哑对象都应视为不可用）。"""
+    if stream is None:
+        return False
+    try:
+        stream.fileno()
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_cli_stdio() -> None:
+    """修复 CLI 模式下的标准流。
+
+    打包版是 console=False 的 GUI 子系统程序，Python 初始化时 sys.stdout /
+    sys.stderr 常常是 None（runtime hook packaging/runtime_hook_nullstdout.py 会把
+    它们换成哑对象，详见该文件说明）。但本进程是被 ycode.exe 启动器用「继承标准
+    句柄」拉起的，通常与调用方共享同一个控制台：先 AttachConsole(父进程) 再打开
+    CONOUT$/CONIN$；拿不到控制台（从资源管理器双击、或输出被重定向到管道）时退回
+    os.devnull，保证任何 print() 都不会因 None/哑对象而崩溃，交互式检查也能给出
+    "不是终端"的清晰结论而不是 AttributeError。
+    """
+    if sys.platform != "win32":
+        for name, mode in (("stdin", "r"), ("stdout", "w"), ("stderr", "w")):
+            if _stream_usable(getattr(sys, name, None)):
+                continue
+            try:
+                stream = open(os.devnull, mode, encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            _CLI_STDIO_STREAMS.append(stream)
+            setattr(sys, name, stream)
+        return
+
+    try:
+        import ctypes
+
+        # ATTACH_PARENT_PROCESS(-1)：附着到启动器所在的控制台。已经附着时返回
+        # 失败（ERROR_ACCESS_DENIED），属正常过渡，忽略即可。
+        ctypes.windll.kernel32.AttachConsole(-1)
+    except Exception:
+        pass
+
+    for name, device, mode in (
+        ("stdin", "CONIN$", "r"),
+        ("stdout", "CONOUT$", "w"),
+        ("stderr", "CONOUT$", "w"),
+    ):
+        if _stream_usable(getattr(sys, name, None)):
+            continue
+        stream = None
+        for target in (device, os.devnull):
+            try:
+                stream = open(
+                    target, mode, encoding="utf-8", errors="replace",
+                    buffering=1 if mode == "w" else -1,
+                )
+                break
+            except Exception:
+                stream = None
+        if stream is None:
+            continue
+        _CLI_STDIO_STREAMS.append(stream)
+        setattr(sys, name, stream)
+
+
+def _run_cli_entry(cli_main) -> int:
+    """按 main.py 结尾 `__main__` 块的分派语义启动 CLI 主流程。
+
+    main.py 目前没有统一的 main() 包装，只有 run_cli() / run_headless()：这里
+    照搬它的三段顺序（配置未知键自检 → -p/--prompt 判定 → 交互式/headless），
+    保持 `ycode`、`ycode -p ...`、`ycode --help` 的行为与独立 CLI exe 一致。
+    若将来 main.py 补上 main() 包装，_dispatch_cli_argv 会优先调用它，本函数
+    自动退居兜底。
+    """
+    # T2 配置未知键自检：与 main.py 的 __main__ 块一致（strict_config=true 时
+    # 退出码 2，与 headless「2=配置错误」语义一致）。
+    try:
+        from config import UnknownConfigKeysError, audit_config_keys
+
+        audit_config_keys()
+    except UnknownConfigKeysError as config_key_error:
+        print(f"\n🚨 配置校验失败：{config_key_error}", file=sys.stderr)
+        print("请修正 config.json 中的未知键（或删除拼错的键）后重试。", file=sys.stderr)
+        return 2
+    except Exception:
+        # 自检属于 best-effort 诊断，自身故障绝不能反过来阻断启动
+        pass
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="ycode",
+        description="星瑶Code 终端 AI 编程助手",
+        add_help=False,  # 交互模式下 argparse 的 -h/--help 会干扰；只在显式 -p 时启用
+    )
+    parser.add_argument("-p", "--prompt", dest="prompt",
+                        help="Headless 模式：执行一次性任务后退出（- 读取 stdin）")
+    parser.add_argument("--session", dest="session", default=None,
+                        help="指定会话名（headless 模式下有效）")
+    parser.add_argument("-h", "--help", action="help",
+                        help="显示帮助信息")
+
+    args, _unknown = parser.parse_known_args()
+
+    if args.prompt is not None:
+        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码
+        return cli_main.run_headless(prompt=args.prompt, session_name=args.session)
+    # 交互式模式（默认）
+    cli_main.run_cli()
+    return 0
+
+
+def _dispatch_cli_argv() -> None:
+    """命中 --cli（ycode.exe 启动器注入）时，在 GUI 重模块 import 前转交 CLI。
+
+    不在 --cli 模式下本函数零副作用，原 GUI 启动路径完全不受影响。
+    """
+    if _CLI_FLAG not in sys.argv:
+        return
+
+    # 只摘掉启动器注入的那一个（它紧随 argv[0]）：用户参数里若也出现同样字面量
+    # （例如 -p "--cli foo"），保留原样交给 CLI 解析，不做批量清除。
+    try:
+        sys.argv.remove(_CLI_FLAG)
+    except ValueError:
+        pass
+    # CLI 轻量档位：core.llm 在 import 期按该变量构建工具表（剔除 GUI 专属工具，
+    # 每个请求少约 5.6k tokens 的工具定义）。main.py 只在自身作为 __main__ 运行时
+    # 设置它，这里是同一个「真实入口」语义，必须早于 import main。
+    os.environ.setdefault("YCODE_TOOL_PROFILE", "cli")
+    # 必须先修好标准流：main.py 导入期就会按 isatty() 决定是否打印启动提示。
+    _ensure_cli_stdio()
+
+    import main as cli_main
+
+    entry = getattr(cli_main, "main", None)
+    if callable(entry):
+        raise SystemExit(entry())
+    raise SystemExit(_run_cli_entry(cli_main))
+
+
+def _dispatch_office_convert_argv() -> None:
+    """Office 转 PDF 子进程入口；命中后只做一次转换，不导入或启动 GUI。
+
+    打包版（PyInstaller 冻结）的 sys.executable 就是本 exe，`-m core.office_preview`
+    无法成立，core.office_preview._convert_argv 因此改传 WORKER_ARGV_FLAG 回落到
+    这里。先做纯字符串预检再 import：core.office_preview 会连带 import
+    core.web_preview，而普通 GUI 启动用不到它（字面量必须与 WORKER_ARGV_FLAG 保持
+    一致，import 后仍做一次兜底校验）。
+    """
+    if "--ycode-office-convert" not in sys.argv:
+        return
+    from core.office_preview import (
+        WORKER_ARGV_FLAG,
+        _write_worker_stderr,
+        run_convert_worker,
+    )
+
+    if WORKER_ARGV_FLAG not in sys.argv:
+        return
+    index = sys.argv.index(WORKER_ARGV_FLAG)
+    # 标志之后必须正好跟 src / dst 两个参数（顺序即位置参数，不做批量 remove）
+    pair = sys.argv[index + 1:index + 3]
+    if len(pair) < 2:
+        _write_worker_stderr("Office 转换子进程参数不足（需要 SRC 与 DST）")
+        raise SystemExit(2)
+    raise SystemExit(run_convert_worker(pair[0], pair[1]))
+
+
+# 必须排在 CLI 分派之前：本进程是被 core.office_preview 用 sys.executable 直接
+# 拉起的转换子进程，即使外层启动器（ycode.exe）再注入 --cli，也要先接住转换标志。
+_dispatch_office_convert_argv()
+_dispatch_cli_argv()
+
+
 def _dispatch_browser_worker_argv() -> bool:
     """PyInstaller 子进程入口；命中后不导入或启动 GUI。"""
     from core.computer.browser_backend import WORKER_ARGV_FLAG
@@ -766,9 +959,27 @@ def main():
         )
 
         def _on_browser_viewport_changed(_workdir, viewport):
+            # 事件必须带发起会话：browser_set_viewport 由某个会话的回合调用，前端据此
+            # 把浏览器页签开进该会话。缺 session_name 时前端只能回落「当前查看的会话」，
+            # 后台会话改一次分辨率就会把浏览器面板抢到用户正在看的另一个窗口上
+            # （2026-10-28 用户反馈：B 会话调 browser_set_viewport，页签冒到 A 会话）。
+            try:
+                from core import app_context
+
+                session_name = (
+                    app_context.get_thread_session()
+                    or app_context.get_current_session()
+                    or ""
+                )
+            except Exception:
+                session_name = ""
             api.emit_event(
                 "embedded_browser_automation",
-                {"width": viewport[0], "height": viewport[1]},
+                {
+                    "width": viewport[0],
+                    "height": viewport[1],
+                    "session_name": session_name,
+                },
             )
 
         register_browser_viewport_listener(_on_browser_viewport_changed)

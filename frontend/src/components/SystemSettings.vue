@@ -183,6 +183,61 @@
         </button>
       </div>
 
+      <!-- Playwright 按需组件（core/components.py）：安装包不再内置 Playwright，
+           未安装时在这里按需下载；下载进度走 playwright_component_progress 桥事件 -->
+      <div class="setting-row playwright-component-card" data-test="playwright-component-card">
+        <div class="setting-copy">
+          <h2>浏览器操控组件</h2>
+          <p>浏览器操控依赖 Playwright 组件（约 25 MB），安装包不再内置，需要时在这里下载。</p>
+          <div class="playwright-component-state">
+            <span
+              v-if="playwrightComponent.installed"
+              class="playwright-component-ready"
+              data-test="playwright-component-ready"
+            >已就绪 · v{{ playwrightComponent.version || '未知' }}</span>
+            <template v-else-if="playwrightComponent.downloading">
+              <div
+                class="playwright-component-progress"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                :aria-valuenow="playwrightPercent"
+                data-test="playwright-component-progress"
+              >
+                <div class="playwright-component-progress-bar" :style="{ width: playwrightPercent + '%' }" />
+              </div>
+              <span class="playwright-component-size" data-test="playwright-component-size">{{ playwrightSizeText }}</span>
+            </template>
+            <span v-else class="playwright-component-missing" data-test="playwright-component-missing">未安装</span>
+          </div>
+          <p v-if="playwrightComponent.error" class="setting-error" data-test="playwright-component-error">
+            {{ playwrightComponent.error }}
+          </p>
+        </div>
+        <div v-if="!isMobile" class="playwright-component-actions">
+          <button
+            v-if="!playwrightComponent.installed && !playwrightComponent.downloading"
+            data-test="playwright-component-download"
+            class="setting-save"
+            type="button"
+            :disabled="playwrightBusy"
+            @click="downloadPlaywrightComponent"
+          >
+            下载组件
+          </button>
+          <button
+            v-if="playwrightComponent.downloading"
+            data-test="playwright-component-cancel"
+            class="setting-save"
+            type="button"
+            :disabled="playwrightBusy"
+            @click="cancelPlaywrightComponentDownload"
+          >
+            取消下载
+          </button>
+        </div>
+      </div>
+
       <div class="setting-row">
         <div class="setting-copy">
           <h2>默认浏览器</h2>
@@ -338,7 +393,49 @@ const isMobile = useIsMobile();
 
 // 每次进入设置页重拉一次：电脑操控资格提示依赖「当前会话生效模型」，
 // 会话级模型随时可能被切换，沿用启动时的快照会显示成别的模型
-onMounted(() => { void store.refreshSystemSettings({ silent: true }); });
+onMounted(() => {
+  void store.refreshSystemSettings({ silent: true });
+  // Playwright 组件状态来自磁盘探测（安装包已不再内置），进页必拉一次；
+  // 下载中的进度由 playwright_component_progress 桥事件持续合并
+  void store.refreshPlaywrightComponentStatus();
+});
+
+// ── Playwright 按需组件（设置页「浏览器操控组件」卡片）──
+// 展示状态一律读 Store 快照，不在组件内单独维护副本（桥事件只更新 Store）
+const playwrightComponent = computed(() => store.playwrightComponent);
+const playwrightPercent = computed(() => {
+  const value = Number(store.playwrightComponent.percent) || 0;
+  return Math.min(100, Math.max(0, Math.round(value)));
+});
+// 已下载/总字节按 MB 展示（后端 total 未知时为 0，此时只显示已下载量）
+const playwrightSizeText = computed(() => {
+  const format = (bytes: number) => `${(Math.max(0, Number(bytes) || 0) / (1024 * 1024)).toFixed(1)} MB`;
+  const total = Number(store.playwrightComponent.total_bytes) || 0;
+  const done = Number(store.playwrightComponent.downloaded_bytes) || 0;
+  return total > 0 ? `${format(done)} / ${format(total)}` : format(done);
+});
+// 桥调用在途闸门：下载/取消都只发一次请求，避免重复点击叠加调用
+const playwrightBusy = ref(false);
+
+async function downloadPlaywrightComponent() {
+  if (playwrightBusy.value) return;
+  playwrightBusy.value = true;
+  try {
+    await store.downloadPlaywrightComponent();
+  } finally {
+    playwrightBusy.value = false;
+  }
+}
+
+async function cancelPlaywrightComponentDownload() {
+  if (playwrightBusy.value) return;
+  playwrightBusy.value = true;
+  try {
+    await store.cancelPlaywrightComponentDownload();
+  } finally {
+    playwrightBusy.value = false;
+  }
+}
 
 const turnStepLimitDraft = ref(String(store.systemSettings.agent_turn_step_limit));
 
@@ -682,6 +779,24 @@ async function runDoctor() {
 .computer-mobile-note { margin: 10px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
 /* 专用配置目录是长路径：右侧只读展示，不占整行 */
 .setting-path { flex: 0 0 auto; max-width: 50%; color: var(--text-dim); font-size: 12px; text-align: right; word-break: break-all; }
+
+/* ── Playwright 按需组件卡片（安装包不再内置 Playwright）── */
+.playwright-component-card { align-items: flex-start; padding: 14px 0; }
+.playwright-component-state { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.playwright-component-missing { color: var(--text-faint); font-size: 12px; }
+.playwright-component-ready { color: var(--green, #22c55e); font-size: 12px; }
+.playwright-component-progress {
+  flex: 1 1 auto;
+  min-width: 120px;
+  max-width: 320px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.playwright-component-progress-bar { height: 100%; background: var(--accent); transition: width .2s ease; }
+.playwright-component-size { flex: 0 0 auto; color: var(--text-faint); font-size: 12px; white-space: nowrap; }
+.playwright-component-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
 
 /* 环境检测/安全提示等说明性内容默认收起，保持主视图一行一项 */
 .setting-details { margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }

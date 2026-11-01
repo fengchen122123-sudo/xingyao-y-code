@@ -3,6 +3,7 @@
 import base64
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -571,15 +572,23 @@ def _unexpected(name):
 
 
 def _creation_recorder(model_manager, monkeypatch):
-    """打桩 model_manager：记录新增厂商，禁止更新 / 删除厂商。"""
-    calls = {"added": []}
+    """打桩 model_manager：记录新增厂商与新增模型，禁止更新 / 删除厂商。
+
+    模型添加必须"记录"而不是"抛异常"：ensure_bound 内部用 try/except 包住了
+    这段调用，抛异常会被吞成 model_added=False，测试反而误判为通过。
+    """
+    calls = {"added": [], "models": []}
 
     def _add_provider(name, base_url, api_key, protocol):
         calls["added"].append((name, base_url, api_key, protocol))
         return "p-new"
 
+    def _add_model(*args, **kwargs):
+        calls["models"].append((args, kwargs))
+        return "m-new"
+
     monkeypatch.setattr(model_manager, "add_provider", _add_provider)
-    monkeypatch.setattr(model_manager, "add_model_to_provider", lambda *a, **k: "m-new")
+    monkeypatch.setattr(model_manager, "add_model_to_provider", _add_model)
     monkeypatch.setattr(model_manager, "update_provider", _unexpected("update_provider"))
     monkeypatch.setattr(model_manager, "delete_provider", _unexpected("delete_provider"))
     return calls
@@ -607,6 +616,7 @@ def test_ensure_bound_without_binding_always_creates_key(http, monkeypatch):
     assert result["reason"] == "已自动创建并绑定 Key"
     assert result["provider_id"] == "p-new"
     assert result["provider_name"] == "基元律动（木偶）"
+    assert calls["models"] == []  # 不再写占位模型
     assert calls["added"] == [
         ("基元律动（木偶）", "https://tokenrhythm.studio/v1", "sk-dedicated", "openai")
     ]
@@ -638,25 +648,30 @@ def test_ensure_bound_never_probes_local_key_when_unbound(http, monkeypatch):
 
     assert result["created"] is True
     assert result["key_created"] is True
+    assert calls["models"] == []  # 不再写占位模型
     assert calls["added"] == [
         ("基元律动（木偶）", "https://tokenrhythm.studio/v1", "sk-new", "openai")
     ]
 
 
-def test_ensure_bound_without_provider_creates_key_and_provider(http, monkeypatch):
-    """无 provider：创建 Key 后 add_provider（名称带昵称）并追加默认模型。"""
+def test_ensure_bound_without_provider_creates_provider_without_model(http, monkeypatch):
+    """无 provider：创建 Key 后只建 add_provider，绝不写占位模型。
+
+    真实模型目录由紧随其后的 sync_models 负责填充；旧实现硬编码的
+    deepseek-v4.1-flash / 128K 占位条目在上游已下线，属于脏数据。
+    """
     _patch_providers(monkeypatch)
 
     from core import model_manager
 
-    calls = {}
+    calls = {"models": []}
 
     def _add_provider(name, base_url, api_key, protocol):
         calls["add_provider"] = (name, base_url, api_key, protocol)
         return "p-new"
 
-    def _add_model(provider_id, name, context_window, **kwargs):
-        calls["add_model"] = (provider_id, name, context_window, kwargs)
+    def _add_model(*args, **kwargs):
+        calls["models"].append((args, kwargs))
         return "m-new"
 
     monkeypatch.setattr(model_manager, "add_provider", _add_provider)
@@ -676,7 +691,7 @@ def test_ensure_bound_without_provider_creates_key_and_provider(http, monkeypatc
         "key_created": True,
         "old_key_deleted": False,
         "provider_id": "p-new",
-        "model_added": True,
+        "model_added": False,
         "reason": "已自动创建并绑定 Key",
         "account_id": "u1",
         "account_name": "木偶",
@@ -685,17 +700,13 @@ def test_ensure_bound_without_provider_creates_key_and_provider(http, monkeypatc
     create_call = _requests(http)[1]
     assert create_call["url"] == "https://tokenrhythm.studio/api/api-keys"
     assert create_call["json"] == {"name": "星瑶Code"}
+    assert calls["models"] == []  # 不再写占位模型，模型目录交给 sync_models
     assert calls["add_provider"] == (
         "基元律动（木偶）",
         "https://tokenrhythm.studio/v1",
         "sk-created",
         "openai",
     )
-    provider_id, model_name, context_window, kwargs = calls["add_model"]
-    assert provider_id == "p-new"
-    assert model_name == "deepseek-v4.1-flash"
-    assert context_window == 128000
-    assert kwargs == {"supports_vision": False, "supports_function_calling": True}
 
 
 def test_ensure_bound_new_provider_when_local_key_invalid(http, monkeypatch):
@@ -717,7 +728,8 @@ def test_ensure_bound_new_provider_when_local_key_invalid(http, monkeypatch):
     assert result["created"] is True
     assert result["key_created"] is True
     assert result["provider_id"] == "p-new"
-    assert result["model_added"] is True
+    assert result["model_added"] is False
+    assert calls["models"] == []  # 不再写占位模型
     assert calls["added"] == [
         ("基元律动（木偶）", "https://tokenrhythm.studio/v1", "sk-new", "openai")
     ]
@@ -744,14 +756,18 @@ def test_ensure_bound_first_bind_creates_key_provider_and_binding(http, monkeypa
 
     from core import model_manager
 
-    calls = {}
+    calls = {"models": []}
 
     def _add_provider(name, base_url, api_key, protocol):
         calls["add_provider"] = (name, base_url, api_key, protocol)
         return "p-new"
 
+    def _add_model(*args, **kwargs):
+        calls["models"].append((args, kwargs))
+        return "m-new"
+
     monkeypatch.setattr(model_manager, "add_provider", _add_provider)
-    monkeypatch.setattr(model_manager, "add_model_to_provider", lambda *a, **k: "m-new")
+    monkeypatch.setattr(model_manager, "add_model_to_provider", _add_model)
     monkeypatch.setattr(
         model_manager,
         "update_provider",
@@ -772,7 +788,7 @@ def test_ensure_bound_first_bind_creates_key_provider_and_binding(http, monkeypa
         "key_created": True,
         "old_key_deleted": False,
         "provider_id": "p-new",
-        "model_added": True,
+        "model_added": False,
         "reason": "已自动创建并绑定 Key",
         "account_id": "u1",
         "account_name": "木偶",
@@ -784,6 +800,7 @@ def test_ensure_bound_first_bind_creates_key_provider_and_binding(http, monkeypa
         "sk-created",
         "openai",
     )
+    assert calls["models"] == []  # 不再写占位模型
     binding = auth._load_binding()
     assert binding["v"] == 1
     assert binding["account_id"] == "u1"
@@ -1264,6 +1281,20 @@ def test_bound_provider_name_falls_back_to_account_suffix():
     assert auth._bound_provider_name(None) == "基元律动（账号）"
 
 
+def test_bound_provider_name_truncates_long_nickname():
+    """超长昵称只取前 6 个字符 + 省略号：厂商名要能在窄列表里看清。
+
+    实测账号昵称「基元律动请送我token我…」原样拼进去会生成 20 多字的厂商名，
+    在设置页厂商列表里被 CSS 硬切，反而看不出属于哪个账号。
+    """
+    assert auth._bound_provider_name("基元律动请送我token我") == "基元律动（基元律动请送…）"
+    # 正好 6 个码点不截断，第 7 个开始才补省略号
+    assert auth._bound_provider_name("六个字符名字") == "基元律动（六个字符名字）"
+    assert auth._bound_provider_name("六个字符名字多") == "基元律动（六个字符名字…）"
+    # 按码点切分：emoji 不能被劈成半个代理对
+    assert auth._bound_provider_name("😀😀😀😀😀😀😀") == "基元律动（😀😀😀😀😀😀…）"
+
+
 def test_resolve_sync_provider_prefers_managed_provider(monkeypatch, tmp_path):
     """同步模型时优先写本程序托管的厂商，绝不往用户手动配置的条目里塞模型。"""
     monkeypatch.setattr(auth, "_BINDING_FILE", tmp_path / "tr_binding.json")
@@ -1373,14 +1404,48 @@ def _usage_ok(**overrides):
     return _FakeResponse(200, _ok({"summary": summary}))
 
 
-def _credit(remaining="1.00000000", expires="2099-01-01T00:00:00Z", **overrides):
-    """一条临时额度记录，字段名与官方 /api/wallet/expiring-credits 契约一致。"""
+# 今日消费全口径接口（与官方「钱包用量」页同源，含视频任务）
+_MULTIMODAL_URL = (
+    "https://tokenrhythm.studio/api/usage/multimodal/overview"
+    "?type=all&metric=cost&groupBy=model&range=today&fundingScope=WALLET"
+)
+
+
+def _multimodal_ok(cost="9.87654321"):
+    """多模态总览成功响应：用例只关心 summary.costCny（语言 + 视频 + 图片）。"""
+    return _FakeResponse(200, _ok({"summary": {"costCny": cost}}))
+
+
+# 临时额度用例的时间基准：一律相对"现在"生成，绝不写死年份——写死 2099 会被
+# "永久额度"阈值判成永久赠额，写死具体日期也会随时间流逝而失效。
+_CREDIT_BASE = datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _in(days: int) -> datetime:
+    """相对基准时间的 UTC 时刻（aware）。"""
+    return _CREDIT_BASE + timedelta(days=days)
+
+
+def _iso(moment: datetime, fraction: str = "") -> str:
+    """UTC ISO 字符串，格式与服务端一致（fraction 可插入纳秒小数秒）。"""
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + fraction + "Z"
+
+
+# 哨兵：区分"没传 expires（用默认 30 天后）"与"显式传 None（测字段缺失）"
+_DEFAULT_EXPIRY = object()
+
+
+def _credit(remaining="1.00000000", expires=_DEFAULT_EXPIRY, **overrides):
+    """一条临时额度记录，字段名与官方 /api/wallet/expiring-credits 契约一致。
+
+    expires 不传时给"30 天后到期"；要测缺字段 / 空值就显式传 expires=None / ""。
+    """
     item = {
         "grantedCny": "10.00000000",
         "remainingCny": remaining,
         "consumedCny": "0.00000000",
         "grantedAt": "2026-01-01T00:00:00Z",
-        "expiresAt": expires,
+        "expiresAt": _iso(_in(30)) if expires is _DEFAULT_EXPIRY else expires,
         "validityStartsAt": "2026-01-01T00:00:00Z",
         "lineType": "promo",
     }
@@ -1395,7 +1460,7 @@ def _credits_ok(items=None):
 
 _CREDITS_URL = (
     "https://tokenrhythm.studio/api/wallet/expiring-credits"
-    "?page=1&pageSize=50&includeInactive=false&includePermanent=false"
+    "?page=1&pageSize=100&includeInactive=false"
 )
 
 
@@ -1415,17 +1480,19 @@ def test_account_overview_success(http):
     http.queue(
         _wallet_ok(),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
-        _credits_ok([_credit(remaining="5.00000000", expires="2099-02-01T00:00:00Z")]),
+        _credits_ok([_credit(remaining="5.00000000", expires=_iso(_in(30)))]),
     )
 
     result = auth.account_overview()
 
     calls = _requests(http)
-    assert [call["method"] for call in calls] == ["GET", "GET", "GET", "GET"]
+    assert [call["method"] for call in calls] == ["GET", "GET", "GET", "GET", "GET"]
     assert [call["url"] for call in calls] == [
         "https://tokenrhythm.studio/api/wallet/summary",
         "https://tokenrhythm.studio/api/usage/panel?range=today",
+        _MULTIMODAL_URL,
         "https://tokenrhythm.studio/api/auth/me",
         _CREDITS_URL,
     ]
@@ -1442,12 +1509,12 @@ def test_account_overview_success(http):
             "total_tokens": 3456,
             "input_tokens": 2000,
             "output_tokens": 1456,
-            "cost_cny": "1.23456789",
+            "cost_cny": "9.87654321",
         },
         "temporary_credits": {
             "total_cny": "5.00000000",
             "count": 1,
-            "nearest_expires_at": "2099-02-01T00:00:00Z",
+            "nearest_expires_at": _iso(_in(30)),
             "nearest_amount_cny": "5.00000000",
         },
     }
@@ -1457,12 +1524,57 @@ def test_account_overview_success(http):
     assert isinstance(result["usage_today"]["total_tokens"], int)
 
 
+def test_account_overview_cost_uses_multimodal_total(http):
+    """回归：今日已用必须按全口径统计，视频任务费用不能漏。
+
+    实测 /api/usage/panel 的 summary.costCny 不含视频任务（byModel 里根本没有
+    wan3.0-video），只用它会把 10 条视频的 19.50 漏成 0；官方「钱包用量」页用的是
+    /api/usage/multimodal/overview?fundingScope=WALLET，这里断言金额取后者。
+    """
+    _login(http)
+    http.queue(
+        _wallet_ok(),
+        _usage_ok(costCny="0.20000000"),
+        _multimodal_ok(cost="22.70000000"),
+        _FakeResponse(200, _ok(dict(_ME_USER))),
+        _credits_ok(),
+    )
+
+    result = auth.account_overview()
+
+    assert result["usage_today"]["cost_cny"] == "22.70000000", "金额必须含视频任务费用"
+    # 调用次数与 Token 仍来自 panel：多模态 WALLET 口径的 tokens 只统计钱包消费，
+    # 走钱包口径的语言调用在那里是 0，不能拿来替换。
+    assert result["usage_today"]["calls"] == 12
+    assert result["usage_today"]["total_tokens"] == 3456
+    assert "partial" not in result
+
+
+def test_account_overview_multimodal_failure_falls_back(http):
+    """全口径接口失败：金额回落到 panel 的 costCny，用量分区不算失败。"""
+    _login(http)
+    http.queue(
+        _wallet_ok(),
+        _usage_ok(costCny="0.20000000"),
+        _FakeResponse(500, {"code": "INTERNAL", "message": "多模态服务不可用", "data": None}),
+        _FakeResponse(200, _ok(dict(_ME_USER))),
+        _credits_ok(),
+    )
+
+    result = auth.account_overview()
+
+    assert result["usage_today"]["cost_cny"] == "0.20000000", "失败时回落到 panel 口径"
+    assert "partial" not in result
+    assert "errors" not in result
+
+
 def test_account_overview_keeps_amount_strings_verbatim(http):
     """金额不做 float 换算：高位小数字符串一位都不能变；缺省字段给默认值。"""
     _login(http)
     http.queue(
         _wallet_ok(availableBalanceCny="0.00000001", frozenBalanceCny=None, currency=""),
         _usage_ok(costCny="100.10000000"),
+        _multimodal_ok(cost="100.10000000"),
         _FakeResponse(200, _ok(dict(_ME_USER))),
         _credits_ok(),
     )
@@ -1482,6 +1594,7 @@ def test_account_overview_wallet_failure_partial(http):
     http.queue(
         _FakeResponse(500, {"code": "INTERNAL", "message": "服务内部错误", "data": None}),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
         _credits_ok([_credit()]),
     )
@@ -1533,6 +1646,7 @@ def test_account_overview_user_failure_partial(http):
     http.queue(
         _wallet_ok(),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(401, {"code": "UNAUTHORIZED", "message": "登录已过期", "data": None}),
         _credits_ok(),
     )
@@ -1625,6 +1739,7 @@ def _overview_with_credits(http, data):
     http.queue(
         _wallet_ok(),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
         _FakeResponse(200, _ok(data)),
     )
@@ -1641,11 +1756,11 @@ def test_temporary_credits_sums_with_decimal_precision(http):
         http,
         {
             "items": [
-                _credit(remaining="0.10000000", expires="2099-01-03T00:00:00Z"),
-                _credit(remaining="0.20000000", expires="2099-01-02T00:00:00Z"),
+                _credit(remaining="0.10000000", expires=_iso(_in(3))),
+                _credit(remaining="0.20000000", expires=_iso(_in(2))),
                 _credit(
                     remaining="0.00000001",
-                    expires="2099-01-01T12:00:00.123456789Z",
+                    expires=_iso(_in(1), ".123456789"),
                 ),
             ]
         },
@@ -1656,7 +1771,7 @@ def test_temporary_credits_sums_with_decimal_precision(http):
     assert isinstance(credits["total_cny"], str), "金额必须是字符串"
     assert credits["count"] == 3
     # 最早到期的一条原样返回（含纳秒小数秒），格式化交给展示层。
-    assert credits["nearest_expires_at"] == "2099-01-01T12:00:00.123456789Z"
+    assert credits["nearest_expires_at"] == _iso(_in(1), ".123456789")
     assert "partial" not in result
 
 
@@ -1678,13 +1793,18 @@ def test_temporary_credits_excludes_non_positive_remaining(http):
     assert result["temporary_credits"] == {
         "total_cny": "3.00000000",
         "count": 1,
-        "nearest_expires_at": "2099-01-01T00:00:00Z",
+        "nearest_expires_at": _iso(_in(30)),
         "nearest_amount_cny": "3.00000000",
     }
 
 
 def test_temporary_credits_excludes_expired_and_blank_expiry(http):
     """expiresAt 已过期 / 空 / 缺失 / 解析失败的项不计入；有效项按 UTC 比较。"""
+    # +08:00 与 Z 混用，且换算到 UTC 后是同一天（16:00Z / 20:00Z），前者更早。
+    same_day_utc = _in(40).replace(hour=16, minute=0, second=0)
+    plus8 = same_day_utc.astimezone(timezone(timedelta(hours=8))).strftime(
+        "%Y-%m-%dT%H:%M:%S+08:00"
+    )
     result = _overview_with_credits(
         http,
         {
@@ -1693,9 +1813,8 @@ def test_temporary_credits_excludes_expired_and_blank_expiry(http):
                 _credit(remaining="8.00000000", expires=""),
                 _credit(remaining="7.00000000", expires=None),
                 _credit(remaining="6.00000000", expires="not-a-date"),
-                # +08:00 与 Z 混用：两者都是 2099-04-30 16:00:00Z 之后，前者更早。
-                _credit(remaining="4.00000000", expires="2099-05-01T00:00:00+08:00"),
-                _credit(remaining="1.50000000", expires="2099-04-30T20:00:00Z"),
+                _credit(remaining="4.00000000", expires=plus8),
+                _credit(remaining="1.50000000", expires=_iso(same_day_utc + timedelta(hours=4))),
             ]
         },
     )
@@ -1703,9 +1822,94 @@ def test_temporary_credits_excludes_expired_and_blank_expiry(http):
     assert result["temporary_credits"] == {
         "total_cny": "5.50000000",
         "count": 2,
-        "nearest_expires_at": "2099-05-01T00:00:00+08:00",
+        "nearest_expires_at": plus8,
         # 同日两条额度（4.0 + 1.5）：按到期日聚合，浮层显示的是"这天会过期多少钱"
         "nearest_amount_cny": "5.50000000",
+    }
+
+
+def test_temporary_credits_excludes_pseudo_permanent_grants(http):
+    """充值活动赠额把到期时间写成 2099 这类远期占位值，等于永久，不能算临时额度。
+
+    实测账号：邀请奖励 24 天后到期（剩余 57.77609144）+ 充值活动赠额
+    expiresAt=2099-12-31（剩余 50）。服务端 summary.expiringBalanceCny 把两者
+    加在一起给 107.77609144，照抄就会把永久赠额算进「临时额度」——口径必须以
+    到期时间为准，只有真会过期的部分才算临时。
+    """
+    real_expiry = _iso(_in(24))
+    result = _overview_with_credits(
+        http,
+        {
+            "items": [
+                _credit(
+                    remaining="57.77609144",
+                    expires=real_expiry,
+                    source="REFERRAL_INVITER_REWARD",
+                    sourceLabel="邀请奖励",
+                ),
+                _credit(
+                    remaining="50.00000000",
+                    expires="2099-12-31T15:59:59Z",
+                    source="RECHARGE_MATCH_BONUS",
+                    sourceLabel="充值活动赠额",
+                ),
+            ],
+            "summary": {
+                "expiringBalanceCny": "107.77609144",
+                "nextExpiryAt": real_expiry,
+                "cumulativeGiftGrantedCny": "888.73386216",
+            },
+            "total": 2,
+        },
+    )
+
+    credits = result["temporary_credits"]
+    assert credits["total_cny"] == "57.77609144", "永久赠额不能算进临时额度"
+    assert credits["count"] == 1
+    assert credits["nearest_expires_at"] == real_expiry
+    assert credits["nearest_amount_cny"] == "57.77609144"
+
+
+def test_temporary_credits_permanent_horizon_boundary(http):
+    """永久阈值按到期时间卡在 10 年：窗口内算临时，超出一天即视为永久。"""
+    inside = _iso(_in(365 * 10 - 1))
+    outside = _iso(_in(365 * 10 + 1))
+    result = _overview_with_credits(
+        http,
+        {
+            "items": [
+                _credit(remaining="8.00000000", expires=inside),
+                _credit(remaining="9.00000000", expires=outside),
+            ]
+        },
+    )
+
+    assert result["temporary_credits"] == {
+        "total_cny": "8.00000000",
+        "count": 1,
+        "nearest_expires_at": inside,
+        "nearest_amount_cny": "8.00000000",
+    }
+
+
+def test_temporary_credits_all_permanent_shows_zero(http):
+    """只有永久赠额时临时额度归零：不能因为 summary 给了金额就把永久额度显示出来。"""
+    result = _overview_with_credits(
+        http,
+        {
+            "items": [_credit(remaining="50.00000000", expires="2099-12-31T15:59:59Z")],
+            "summary": {
+                "expiringBalanceCny": "50.00000000",
+                "nextExpiryAt": "2099-12-31T15:59:59Z",
+            },
+        },
+    )
+
+    assert result["temporary_credits"] == {
+        "total_cny": "0",
+        "count": 0,
+        "nearest_expires_at": "",
+        "nearest_amount_cny": "0",
     }
 
 
@@ -1715,13 +1919,13 @@ def test_temporary_credits_accepts_timestamps_and_alias_fields(http):
     官方控制台把 expiresAt 直接传给 new Date()，说明它可能是时间戳而不是 ISO 字符串；
     若只认 ISO，整批额度会被误判成"已过期"而清零，浮层就只剩一个「—」。
     """
-    future_ms = 4102444800000  # 2100-01-01T00:00:00Z（毫秒）
+    future_ms = int(_in(20).timestamp() * 1000)  # 毫秒时间戳（相对当前时间，避免撞上永久阈值）
     result = _overview_with_credits(
         http,
         {
             "items": [
                 {"remainingCny": "2.50000000", "expiresAt": future_ms},
-                {"remaining": "1.50000000", "expireAt": "2100-02-01T00:00:00Z"},
+                {"remaining": "1.50000000", "expireAt": _iso(_in(25))},
             ]
         },
     )
@@ -1736,7 +1940,7 @@ def test_temporary_credits_seconds_timestamp(http):
     """秒级时间戳（10 位）同样认，不与毫秒混淆。"""
     result = _overview_with_credits(
         http,
-        {"items": [{"remainingCny": "1.00000000", "expiresAt": 4102444800}]},
+        {"items": [{"remainingCny": "1.00000000", "expiresAt": int(_in(15).timestamp())}]},
     )
 
     credits = result["temporary_credits"]
@@ -1769,7 +1973,7 @@ def test_temporary_credits_accepts_multiple_envelope_shapes(http, container):
     assert result["temporary_credits"] == {
         "total_cny": "2.00000000",
         "count": 1,
-        "nearest_expires_at": "2099-01-01T00:00:00Z",
+        "nearest_expires_at": _iso(_in(30)),
         "nearest_amount_cny": "2.00000000",
     }
 
@@ -1780,9 +1984,10 @@ def test_temporary_credits_retries_once_after_network_timeout(http):
     http.queue(
         _wallet_ok(),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
         httpx.ReadTimeout("read operation timed out"),  # 第一次：传输层超时
-        _credits_ok([_credit(remaining="5.00000000", expires="2099-02-01T00:00:00Z")]),
+        _credits_ok([_credit(remaining="5.00000000", expires=_iso(_in(30)))]),
     )
 
     result = auth.account_overview()
@@ -1802,9 +2007,10 @@ def test_temporary_credits_retries_after_server_internal_error(http):
     http.queue(
         _wallet_ok(),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
         _FakeResponse(500, {"code": "INTERNAL_ERROR", "message": "服务内部错误", "data": None}),
-        _credits_ok([_credit(remaining="7.50000000", expires="2099-03-01T00:00:00Z")]),
+        _credits_ok([_credit(remaining="7.50000000", expires=_iso(_in(60)))]),
     )
 
     result = auth.account_overview()
@@ -1820,6 +2026,7 @@ def test_temporary_credits_does_not_retry_auth_errors(http):
     http.queue(
         _wallet_ok(),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
         _FakeResponse(401, {"code": "UNAUTHORIZED", "message": "请先登录", "data": None}),
     )
@@ -1837,6 +2044,7 @@ def test_account_overview_temporary_credits_failure_partial(http):
     http.queue(
         _wallet_ok(),
         _usage_ok(),
+        _multimodal_ok(),
         _FakeResponse(200, _ok(dict(_ME_USER))),
         # 用不可重试的鉴权错误：5xx / INTERNAL_ERROR 属于"等一下就好"，会被重试
         _FakeResponse(
@@ -2303,3 +2511,4 @@ def test_binding_active_requires_key_and_provider(http):
         # 必须清干净：http fixture 收尾的 logout 会按 binding 去删服务端 Key
         auth._clear_binding()
     assert auth.binding_active() is False
+

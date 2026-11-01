@@ -14,6 +14,10 @@ PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
 # 错过触发（应用未运行）的处理策略。
 MISSED_RUN_POLICIES = ("skip", "run_once")
 
+# 任务生命周期状态：active=可触发；completed=执行次数耗尽（自然终态，不可逆——
+# 不允许 set_enabled 复活、不允许编辑改回 active，只能复制新建）。
+TASK_STATUSES = ("active", "completed")
+
 # 运行状态机：queued → running → completed | cancelled | error；
 # skipped（单飞/错过）与 interrupted（启动恢复）为旁路终态。
 RUN_STATUSES = (
@@ -87,6 +91,20 @@ def validate_task(task: dict) -> list[str]:
         elif len(model_id.strip()) > MAX_MODEL_ID_CHARS:
             errors.append(f"模型 id 不能超过 {MAX_MODEL_ID_CHARS} 个字符")
 
+    # 最多执行次数可选：留空 = 不限次；给出时必须是 ≥1 的整数（bool 不算整数）
+    max_runs = task.get("max_runs")
+    if max_runs not in (None, ""):
+        if isinstance(max_runs, bool) or not isinstance(max_runs, int) or max_runs < 1:
+            errors.append("最多执行次数必须是 ≥1 的整数（留空表示不限次）")
+
+    # status 是读侧字段（由存储层按认领次数维护），入参只接受 active
+    status = task.get("status")
+    if status not in (None, "") and status != "active":
+        errors.append(
+            "任务状态是只读字段（只能由系统维护），保存时不允许写入 "
+            f"{status!r}；已完成的任务请复制新建"
+        )
+
     if task.get("permission_mode") not in PERMISSION_MODES:
         errors.append(f"无人值守权限档位必须是 {'/'.join(PERMISSION_MODES)} 之一")
     if task.get("missed_run_policy") not in MISSED_RUN_POLICIES:
@@ -122,6 +140,14 @@ def trigger_summary(trigger_type: str, config: dict) -> str:
             WEEKDAY_NAMES.get(weekday, str(weekday)) for weekday in sorted(weekdays)
         )
         return f"每周{labels} {config.get('time', '??:??')}"
+    if trigger_type == "once":
+        run_at = config.get("run_at")
+        if isinstance(run_at, str) and run_at.strip():
+            return f"一次性 {run_at.strip()}"
+        minutes = config.get("delay_minutes")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes <= 0:
+            return "一次性（配置非法）"
+        return f"一次性（{minutes} 分钟后）"
     if trigger_type == "startup":
         return "应用启动时"
     return "未知触发器"

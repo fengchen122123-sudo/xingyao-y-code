@@ -973,6 +973,13 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 cache_session_id=session_name,
                 tool_contract="no-tools",
             ))
+            # 渠道请求形态覆盖：与 _provider_request_options 出口同一语义
+            # （headers → extra_headers、body → extra_body），压缩 scope 由此对齐
+            from core.llm_dialects import _apply_route_request_overrides
+
+            request_kwargs = _apply_route_request_overrides(
+                request_kwargs, compress_model, compress_url
+            )
 
             candidate = None
             for attempt in range(COMPRESSION_MAX_RETRIES):

@@ -288,3 +288,43 @@ def test_owner_throttle_survives_journal_recreation_across_connections(tmp_path)
 
     assert replacement.heartbeat() is False
     assert writes == [("owner-shared", 1_000)]
+
+
+def test_export_harness_journal_carries_resume_columns_without_body_text(tmp_path):
+    """导出形状：turn/step 带上续跑列，且任何记录都不出现正文键。"""
+    manager, journal = _journal(tmp_path, now_ms=10_000)
+    journal.create_step("turn-1:step:1", "turn-1", 1)
+    manager.conn.execute(
+        "UPDATE harness_turns SET parent_turn_id = ?, turn_kind = ?, "
+        "resume_from_step_ordinal = ? WHERE turn_id = ?",
+        ("turn-0", "resume", 3, "turn-1"),
+    )
+    manager.conn.execute(
+        "UPDATE harness_steps SET tool_call_count = ?, replay_of_step_id = ? "
+        "WHERE step_id = ?",
+        (5, "turn-0:step:1", "turn-1:step:1"),
+    )
+    manager.conn.commit()
+    journal.append_event(
+        "turn-1",
+        JournalEventDraft(
+            kind=HarnessEventKind.TOOL_STARTED,
+            step_id="turn-1:step:1",
+            tool_name="read_file",
+            call_ordinal=0,
+        ),
+    )
+
+    rows = manager.export_harness_journal(session_name="session")
+
+    turn_row = next(row for row in rows if row["type"] == "turn")
+    step_row = next(row for row in rows if row["type"] == "step")
+    assert turn_row["parent_turn_id"] == "turn-0"
+    assert turn_row["turn_kind"] == "resume"
+    assert turn_row["resume_from_step_ordinal"] == 3
+    assert step_row["tool_call_count"] == 5
+    assert step_row["replay_of_step_id"] == "turn-0:step:1"
+    # journal 只允许状态/ID/序号/时间/计数/sha256：正文键一个都不能出现。
+    forbidden = {"content", "arguments", "result", "payload"}
+    for row in rows:
+        assert forbidden.isdisjoint(row), row

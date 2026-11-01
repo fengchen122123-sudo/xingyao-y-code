@@ -270,8 +270,11 @@ def test_controller_lazy_singleton_wires_on_state(monkeypatch):
     assert ctrl is not None
     assert d._browser_controller() is ctrl  # 单例
     # on_state → emit_event('embedded_browser', ...)
+    # 状态事件必须带归属会话（未占用控件时为空串，前端按当前查看会话处理）
     ctrl._on_state({"url": "https://x.com"})
-    assert d.events == [("embedded_browser", {"url": "https://x.com"})]
+    assert d.events == [
+        ("embedded_browser", {"url": "https://x.com", "session_name": ""})
+    ]
 
 
 def test_controller_creation_failure_reports_unsupported(monkeypatch):

@@ -162,3 +162,10 @@ gzh-loomy/
 # 电脑操控内部审计与修复方案（含系统弱点清单，公开仓库即泄漏），禁止入库/推送
 # —— 与 docs/computer-audit-* 系列同类
 docs/电脑操控审计与修复方案*
+
+# JVM 崩溃转储（保底规则：GPU/OCR 等 Java 依赖崩溃时会写在工作目录根部，不入库）
+hs_err_pid*.log
+replay_pid*.log
+
+# 一次性开发补丁脚本（含内部实现细节，不入库）
+_patch_tr_*.py

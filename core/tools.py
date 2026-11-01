@@ -734,6 +734,13 @@ def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, 
             if error.code == "no_active_checkpoint":
                 # 回合外调用（无检查点上下文）：保持既有行为，不做可撤销记录
                 handle = None
+            elif error.code == "workspace_busy":
+                # 同目录另有活跃回合：可重试，未触盘，不产生不可撤销修改
+                return (
+                    f"🚨 该目录正在被另一个回合写入，本次未修改文件（{file_path}）：\n"
+                    f"{error.message}\n"
+                    f"请稍后重试。"
+                )
             else:
                 # 检查点已封闭（迟到写入）：必须在触盘前失败（规格 9.2）
                 return (
@@ -1592,6 +1599,11 @@ def fetch_image(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
             except TurnUndoError as error:
                 if error.code == "no_active_checkpoint":
                     handle = None
+                elif error.code == "workspace_busy":
+                    return (
+                        f"🚨 该目录正在被另一个回合写入，图片未写入（{target}）：\n"
+                        f"{error.message}\n请稍后重试。"
+                    )
                 else:
                     return (
                         f"🚨 该回合的撤销检查点已封闭，迟到的图片写入已被拒绝（{target}）：\n"
@@ -2488,6 +2500,11 @@ def _recorded_atomic_write(resolved, encoding, new_content, *, file_path=None,
                     resolved, encoding, new_content,
                     file_path=file_path, expected_mtime_ns=None,
                 )
+            if error.code == "workspace_busy":
+                return (
+                    f"🚨 该目录正在被另一个回合写入，本次未修改文件"
+                    f"（{file_path or resolved}）：\n{error.message}\n请稍后重试。"
+                )
             # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
             return (
                 f"🚨 该回合的撤销检查点已封闭，迟到的修改已被拒绝"
@@ -2858,6 +2875,53 @@ _SUBAGENT_APPROVAL_WAIT_LIMIT = 300
 # 与 core/llm.py 工具结果入上下文的截断上限（16000）对齐。
 SUBAGENT_RESULT_MAX_CHARS = 16000
 
+# 超时/失败时交付给主 Agent 的部分产出上限（字符）。
+# 此前固定 1500：长任务即便已完成大半，主 Agent 也只拿到一小段残片，只能
+# 从头重做，链路被拉长成"再派一次 → 再超时"。与最终结果上限同量级后，
+# "在已有成果上接着做"才成为可行选项。
+SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS = 12000
+
+# 时间预算提醒阈值：(剩余比例, 最小剩余秒数, 提醒级别)。
+# 按紧急程度从高到低排列，命中即返回；同一级别只提示一次。
+# 设最小秒数是为了短预算任务（如 explore 240s）不会一开跑就被提醒淹没。
+_SUBAGENT_BUDGET_NOTICE_RATIOS = ((0.10, 45, 2), (0.25, 90, 1))
+
+
+def build_subagent_budget_notice(remaining, budget, stage):
+    """构造子代理时间预算提醒，返回 (新 stage, 提醒文本或 None)。
+
+    stage：0 未提醒 / 1 已发收尾提醒 / 2 已发终止提醒。纯函数，便于单测：
+    manager 每步调用一次，只有跨过阈值且尚未提醒过该级别时才返回文本。
+    """
+    try:
+        remaining = float(remaining)
+        budget = float(budget)
+        stage = int(stage)
+    except (TypeError, ValueError):
+        return stage, None
+    if budget <= 0 or remaining <= 0:
+        return stage, None
+    for ratio, floor, level in _SUBAGENT_BUDGET_NOTICE_RATIOS:
+        if stage >= level:
+            continue
+        if remaining > max(float(floor), budget * ratio):
+            continue
+        budget_text = f"{int(budget)}s"
+        remaining_text = f"{int(max(0.0, remaining))}s"
+        if level >= 2:
+            return level, (
+                f"⏳ 时间预算即将耗尽：本次子任务总预算 {budget_text}，"
+                f"剩余约 {remaining_text}。立即停止一切探索、读取和新增工具调用，"
+                "把你已经完成的工作整理成最终结论输出（已改动的文件、已验证的结果、"
+                "未完成的部分都要写清）。不要再调用任何工具。"
+            )
+        return level, (
+            f"⏳ 时间预算提醒：本次子任务总预算 {budget_text}，"
+            f"剩余约 {remaining_text}。请立即收敛范围：优先完成手头最关键的一步，"
+            "随后直接输出当前结论，不要再开启新的探索或大范围改动。"
+        )
+    return stage, None
+
 
 def _has_meaningful_subagent_result(text: str) -> bool:
     return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
@@ -3014,6 +3078,9 @@ class SubagentTask:
     thread: threading.Thread | None = field(default=None, repr=False)
     custom_config: dict | None = field(default=None, repr=False)
     timeout_seconds: int = field(default=600, repr=False)
+    # 已发出的时间预算提醒级别（0 未提醒 / 1 已提醒收尾 / 2 已提醒终止）。
+    # 由子代理线程在每步边界读取 execution_elapsed 后写回，避免同一级别反复注入。
+    budget_notice_stage: int = field(default=0, repr=False)
     # 并发名额生命周期标记：超时/取消是协作式，线程可能仍卡在不可中断的
     # LLM 请求里，但名额要立即归还（见 _release_slot），两者都必须幂等
     slot_acquired: bool = field(default=False, repr=False)
@@ -3347,6 +3414,12 @@ class SubagentManager:
                 )
                 break
 
+        # 超时/取消：给 worker 一个短暂的打捞窗口，等它在 finally 里把最后一段
+        # 正文写进 partial_result 再返回。abort_inflight_streams 已关闭在飞请求，
+        # 正常情况毫秒级退出；不 join 会让主 Agent 拿到 2000 字符前的旧快照，
+        # 部分产出越完整，"在已有成果上继续"才越可行。
+        if task.status in {"timed_out", "cancelled"} and task.thread is not None:
+            task.thread.join(timeout=2.0)
         return self._foreground_result(task.task_id)
 
     def _watch_background(
@@ -3705,7 +3778,9 @@ class SubagentManager:
                     "inspection_required": True,
                     "stage": task.stage,
                     "execution_elapsed": round(task.execution_elapsed, 1),
-                    "partial_result": str(task.partial_result or "")[:1500],
+                    "partial_result": str(task.partial_result or "")[
+                        :SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS
+                    ],
                     "error": task.error,
                 }, ensure_ascii=False)
             # 失败/超时/取消：返回结构化文本，让主 agent 能快速理解决策下一步
@@ -3743,7 +3818,17 @@ class SubagentManager:
         # 下一步建议（根据失败类型给不同指引）
         hints = []
         if task.status == "timed_out":
-            hints.append("子代理超时，主 Agent 应直接用自身工具完成该任务，或拆分为更小的子任务")
+            if str(task.partial_result or "").strip():
+                hints.append(
+                    "子代理超时，但已产出部分成果：先用 read_file/list_directory 核对"
+                    "工作区实际改动，确认哪些已完成，再在已有成果基础上继续；"
+                    "不要从头重做已完成的工作。剩余工作量仍大时拆成更小的子任务。"
+                )
+            else:
+                hints.append(
+                    "子代理超时且没有可交付正文：主 Agent 应直接用自身工具完成该任务，"
+                    "或拆分为更小的子任务后重新派发"
+                )
         elif task.status == "cancelled":
             hints.append("子代理被取消（可能是父轮次结束），如仍需执行请重新发起")
         elif tool_lines:
@@ -3769,11 +3854,21 @@ class SubagentManager:
             parts.extend(tool_lines)
         partial = str(task.partial_result or "").strip()
         if partial:
-            if len(partial) > 1500:
-                partial = partial[:1500] + "..."
-            parts.append("已完成的部分（超时/失败前已产出的正文，据此判断成果是否已落地）:")
+            if len(partial) > SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS:
+                partial = (
+                    partial[:SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS]
+                    + "\n... [部分产出已截断，完整内容以工作区实际改动为准]"
+                )
+            parts.append(
+                "已完成的部分（超时/失败前已产出的正文，据此判断成果是否已落地；"
+                "通常可直接采用或在其基础上继续，不要从头重做）:"
+            )
             parts.append(partial)
-        parts.append(f"耗时: 执行 {round(task.execution_elapsed, 1)}s / 等待审批 {round(task.approval_wait_elapsed, 1)}s")
+        parts.append(
+            f"进度: 阶段 {task.stage} / 工具成功 {task.tool_success_count} 次 / "
+            f"执行 {round(task.execution_elapsed, 1)}s（预算 {task.timeout_seconds}s）"
+            f" / 等待审批 {round(task.approval_wait_elapsed, 1)}s"
+        )
         parts.append("下一步建议:")
         for h in hints:
             parts.append(f"  {h}")
@@ -4224,6 +4319,9 @@ class SubagentManager:
                     "【速度要求】子任务必须快速收敛：优先用 search_code / glob_files / "
                     "list_directory 定位关键位置后精读相关片段，不要逐文件全文通读；"
                     "信息足以支撑结论时立即停止探索并输出最终结论，不要追求穷尽。"
+                    "【结论格式】最终结论只写主 Agent 决策所需的事实：做了什么、"
+                    "改了哪些文件、验证结果、未完成项与风险。不要复述任务描述，"
+                    "不要逐条回顾工具调用过程，不要做与任务无关的推测性延伸。"
                     "所有输出必须使用中文，包括过程说明与最终结论；"
                     "不要输出 [Advisor consultation] 等内部协议标记，"
                     "也不要在正文中书写 <function_calls>/<advisor-request> 之类的 XML 伪工具调用。"
@@ -4234,6 +4332,30 @@ class SubagentManager:
                 "content": f"请完成以下子任务：\n{task.description}",
             },
         ]
+        def _budget_notice_provider():
+            """每步边界返回一次时间预算提醒，无新提醒时返回 None。
+
+            execution_elapsed 由 manager 的监管循环累加（排队与审批等待不计时），
+            子代理线程只读；提醒级别写回 task，保证同一级别只注入一次。
+            提醒文本以 user 消息插在 Step 边界，工具调用与结果配对始终完整。
+            """
+            budget = int(task.timeout_seconds or 0)
+            remaining = budget - float(task.execution_elapsed or 0.0)
+            level, text = build_subagent_budget_notice(
+                remaining,
+                budget,
+                task.budget_notice_stage,
+            )
+            if text is None:
+                return None
+            task.budget_notice_stage = level
+            self._record_stage(
+                task.task_id,
+                "budget_notice",
+                f"剩余约 {int(max(0.0, remaining))}s 已提醒收尾",
+            )
+            return text
+
         self._record_stage(task.task_id, "model")
         # 子代理执行具体计划项时，不应继承父会话的计划锁约束；
         # 否则子代理会被剥夺 write_file/edit_file/execute_command 等必要工具，
@@ -4256,7 +4378,9 @@ class SubagentManager:
             cache_scope=f"subagent:{role}",
             cache_session_id=task.parent_session,
             model_id=current_model_id,
+            budget_notice_provider=_budget_notice_provider,
         )
+
         answer = []
         tool_errors: dict[str, str] = {}
         success_count = 0
@@ -4351,8 +4475,12 @@ class SubagentManager:
         # 只保留末次工具调用后的内容），此时必须补一轮总结才有可交付结论。
         # 无进展熔断/轮次上限中止（turn_error）后不再续写：终态已注定 failed，
         # 续写产出只会以截断 partial 出现在失败文本里，白烧一次 LLM 请求。
+        # 阈值 120：只拦"搞定/完成"这类敷衍（以及末次工具调用后无正文的空结果），
+        # 不再把 150 字左右的精炼结论判为过短。与系统提示的【结论格式】配套：
+        # 只加约束不降阈值，会出现"写了精炼结论 → 被判太短 → 被迫展开"的自相矛盾，
+        # 白烧一次完整请求（大任务上下文下这一步本身就要 10s+）。
         if (
-            len(result_text.strip()) < 200
+            len(result_text.strip()) < 120
             and not task.cancel_event.is_set()
             and not turn_error_message
         ):
@@ -4420,12 +4548,18 @@ subagent_manager = SubagentManager()
 # 按角色的默认超时（秒）：只读角色必须快速收敛，写代码/跑测试允许更久。
 # 调用方显式传 timeout_seconds 时以显式值为准。
 _SUBAGENT_DEFAULT_TIMEOUTS = {
-    "explore": 240,
-    "review": 300,
-    "test": 480,
-    "implement": 600,
-    "general": 600,
+    "explore": 300,
+    "review": 420,
+    "test": 900,
+    "implement": 900,
+    "general": 900,
 }
+
+# 前台子代理的等待上限（秒）：前台会阻塞父回合，不能无限拉长；
+# 超过该预算的大任务应转后台（后台默认预算按系数放宽）。
+SUBAGENT_FOREGROUND_MAX_TIMEOUT = 900
+# 后台子代理预算系数：后台不阻塞用户，允许在角色默认值上放宽 1.5 倍。
+SUBAGENT_BACKGROUND_TIMEOUT_FACTOR = 1.5
 
 
 def make_authorized_verification_runner(
@@ -4522,17 +4656,17 @@ def run_subagent(
                 "plan_item_id": str(plan_item_id or ""),
                 "error": "timeout_seconds 必须在 30 到 3600 秒之间。",
             }, ensure_ascii=False)
-        if not run_in_background and timeout_seconds > 600:
+        if not run_in_background and timeout_seconds > SUBAGENT_FOREGROUND_MAX_TIMEOUT:
             # 前台硬上限（内部调用同样受限）：模型不得把前台子 Agent 超时扩大到
             # 2400/3600 秒；长命令应使用后台任务 + manage_task(wait) 等待。
             return json.dumps({
                 "status": "failed",
                 "plan_item_id": str(plan_item_id or ""),
                 "error": (
-                    "前台子代理 timeout_seconds 硬上限为 600 秒（当前 {} 秒）。"
+                    "前台子代理 timeout_seconds 硬上限为 {} 秒（当前 {} 秒）。"
                     "长任务请拆分为更小的计划项，或改用 run_in_background=true "
                     "启动后台任务并用 manage_task(action='wait') 等待结果。"
-                ).format(timeout_seconds),
+                ).format(SUBAGENT_FOREGROUND_MAX_TIMEOUT, timeout_seconds),
             }, ensure_ascii=False)
     if not str(task_description or "").strip():
         return json.dumps({
@@ -4760,10 +4894,16 @@ def run_subagent(
         return None
 
     # 此时 subagent_type 已最终确定（含计划 stage 自动映射），解析角色默认超时。
-    # 只读角色（explore/review）默认更短：子代理设计目标是"快"，
-    # 10 分钟级别的探索/审查违背设计初衷（自定义类型回落到 600 秒）。
+    # 只读角色（explore/review）预算更短：子代理设计目标是"快"；
+    # 写代码/跑测试角色按实测 p99 给到 900s，避免"快做完被硬砍"。
+    # 后台任务不阻塞用户，默认预算再放宽 1.5 倍；显式传入的预算不做放大。
     if timeout_seconds is None:
-        timeout_seconds = _SUBAGENT_DEFAULT_TIMEOUTS.get(str(subagent_type or "general"), 600)
+        timeout_seconds = _SUBAGENT_DEFAULT_TIMEOUTS.get(str(subagent_type or "general"), 900)
+        if run_in_background:
+            timeout_seconds = min(
+                3600,
+                int(timeout_seconds * SUBAGENT_BACKGROUND_TIMEOUT_FACTOR),
+            )
 
     try:
         return subagent_manager.run(
@@ -5497,6 +5637,38 @@ def open_session(target="", cancel_event=None):
     _raise_if_cancelled(cancel_event)
     if not isinstance(result, dict):
         return f"🚨 跳转失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    return _secretary_json(payload)
+
+
+def create_project(path="", cancel_event=None):
+    """新建项目文件夹并引入为工作区（秘书调度台：能力四）。
+
+    等价于用户点侧栏「添加/引入项目文件夹」并选中该目录：目录不存在则逐级
+    创建，已存在则直接复用；登记进工作区表后侧栏立刻出现对应分组，之后
+    ``dispatch_task(workdir=该路径)`` 即可在其中建会话执行任务。
+
+    只接受完整路径（用户已明确「在对话里说清建在哪」），不做相对路径推断——
+    秘书自己猜位置最容易建到意料之外的目录里。返回 JSON 字符串：
+    ``{ok, workdir, created, display_name}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    wanted = str(path or "").strip()
+    if not wanted:
+        return "🚨 新建项目失败：path（完整路径）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.create_project(path=wanted)
+    except SecretaryDispatchError as exc:
+        return f"🚨 新建项目失败：{exc}"
+    except Exception as exc:
+        return f"🚨 新建项目失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 新建项目失败：调度服务返回了无法识别的结果：{result!r}"
     payload = dict(result)
     payload.setdefault("ok", True)
     return _secretary_json(payload)

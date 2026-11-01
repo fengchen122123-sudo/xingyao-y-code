@@ -342,3 +342,42 @@ def test_later_turn_same_file_blocks_early_undo(env):
     preview, token = turn_undo_service.preview_turn_undo(env["session_id"], "turn-e1")
     assert token == "" and preview.conflicts
     assert f1.read_bytes() == b"v2"
+
+
+def test_preview_skips_conflicted_file_and_still_undoes_others(env):
+    """因回合内外部修改退出撤销范围的文件不参与撤销，其余文件正常还原。"""
+    from core.turn_undo import recorder as tu_recorder
+
+    ws = env["ws"]
+    f1 = ws / "skip.txt"
+    f2 = ws / "keep.txt"
+    f1.write_bytes(b"old-skip")
+    f2.write_bytes(b"old-keep")
+
+    checkpoint, ctx = _begin_turn(env, turn="turn-tx-skip")
+    _record_write(env, ctx, f1, "new-skip", call="c1")
+    _record_write(env, ctx, f2, "new-keep", call="c2")
+    # f1 被外部修改后再次写入 → 该文件退出撤销范围，回合继续
+    f1.write_bytes(b"external")
+    handle = tu_recorder.prepare_mutation(
+        display_path=str(f1),
+        after_kind=NodeKind.REGULAR_FILE,
+        after_content=b"after-skip",
+        tool_name="write_file",
+        tool_call_id="c3",
+    )
+    f1.write_bytes(b"after-skip")
+    tu_recorder.verify_after_mutation(handle)
+    assert _finish(env, ctx) is TurnUndoStatus.READY
+
+    preview, token = turn_undo_service.preview_turn_undo(
+        env["session_id"], "turn-tx-skip"
+    )
+    assert token, "有可撤销文件时仍应签发令牌"
+    assert preview.skipped_files == ("skip.txt",)
+    assert preview.file_count == 1
+    assert preview.restore_content_count == 1
+
+    turn_undo_service.execute_turn_undo(env["session_id"], "turn-tx-skip", token)
+    assert f2.read_bytes() == b"old-keep", "可撤销文件必须还原"
+    assert f1.read_bytes() == b"after-skip", "skipped 文件不得被触碰"

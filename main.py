@@ -39,6 +39,35 @@ def _dispatch_browser_worker_argv() -> bool:
 
 _dispatch_browser_worker_argv()
 
+
+def _dispatch_office_convert_argv() -> bool:
+    """Office 转 PDF 子进程入口（冻结版 exe 被 core.office_preview 重新拉起时）。
+
+    打包后 sys.executable 是本程序的 exe，`-m core.office_preview` 不成立，
+    core.office_preview._convert_argv 改用 WORKER_ARGV_FLAG 回落；GUI 与 CLI 共用
+    同一个载荷，两条入口都必须能接住这个标志，少一处就会漏（例如 CLI 形态的 exe
+    被当作 sys.executable 时）。同样先字面量预检，避免普通 CLI 启动白付 import。
+    """
+    if "--ycode-office-convert" not in sys.argv:
+        return False
+    from core.office_preview import (
+        WORKER_ARGV_FLAG,
+        _write_worker_stderr,
+        run_convert_worker,
+    )
+
+    if WORKER_ARGV_FLAG not in sys.argv:
+        return False
+    index = sys.argv.index(WORKER_ARGV_FLAG)
+    pair = sys.argv[index + 1:index + 3]
+    if len(pair) < 2:
+        _write_worker_stderr("Office 转换子进程参数不足（需要 SRC 与 DST）")
+        raise SystemExit(2)
+    raise SystemExit(run_convert_worker(pair[0], pair[1]))
+
+
+_dispatch_office_convert_argv()
+
 # Windows GBK 终端在输出 emoji/非 BMP 字符时会触发 UnicodeEncodeError 崩溃。
 # 强制 stdout/stderr 使用 UTF-8 + replace 错误策略：无法显示的字符会变成 �，
 # 保证程序不崩溃；现代 Windows Terminal 已支持 UTF-8，旧版 conhost 最多显示乱码。
@@ -1106,7 +1135,9 @@ COMMAND_COMPLETIONS = [
     ("/doctor", "聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 机器可读；export 导出诊断包)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
+    ("/goal", "目标模式：自主迭代直到达成（支持 status / stop / resume / --check / --rounds）"),
     ("/undo", "按回合撤销文件修改 (list/preview/status/recover)"),
+    ("/resume", "断点续跑：从本会话最近中断的回合继续 (需 resume.enabled=true)"),
     ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
     ("/share", "导出会话为 Markdown/HTML/JSON"),
     ("/diagram", "打开/列出 Mermaid 流程图网页 (open 序号/list)"),
@@ -1119,6 +1150,7 @@ COMMAND_COMPLETIONS = [
     ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
     ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
     ("/hooks", "Hook 管理 (查看清单/信任确认/撤销)"),
+    ("/hooks import", "从 ZCode 配置导入 hook (预览确认后写入,rollback 撤销)"),
     ("/skills", "技能管理 (list/refresh/enable/disable 或开选择器)"),
     ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
     ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
@@ -2189,6 +2221,127 @@ def _undo_print_result(result) -> None:
     print_formatted_text(HTML("<ansigray>  聊天历史保留；通用命令与外部副作用未随文件恢复。</ansigray>"))
 
 
+# ── 断点续跑（规格 §4.1 CLI 入口，S4）─────────────────────────────
+# 与 /undo 同级：开关关闭时只提示不动作；开启后一律"打印断点 → 一次性确认 →
+# ResumeExecutor"，绝不静默续跑（规格 §9.9）。
+_RESUME_REASON_TEXT = {
+    "disabled": "断点续跑未启用（resume.enabled=false）",
+    "no_resumable_turn": "本会话没有可续跑的中断回合",
+    "anchor_missing": "缺少缓存锚点（父回合没有已完成的 Step），请手动重来",
+    "session_archived": "会话已归档，请先取消归档后再续跑",
+    "undo_recovering": "会话处于撤销恢复态，请先执行 /undo recover",
+    "owner_still_alive": "该回合可能仍在其他进程运行，已拒绝续跑",
+    "confirm_required": "仍有写操作待确认，已暂停（零工具执行、零模型请求）",
+    "hash_anchor_mismatch": "缓存锚点已变化（历史被改写），请手动重来",
+    "planner_failed": "规划层故障，无法确定断点，请手动重来",
+    "resume_cancelled": "续跑已取消",
+}
+
+
+def _resume_reason_text(code: str) -> str:
+    """把 §7 的错误码翻成用户能懂的一句中文（未知码原样回显）。"""
+    return _RESUME_REASON_TEXT.get(str(code or ""), str(code or "未知原因"))
+
+
+def _resume_switch_enabled() -> bool:
+    """读取 resume.enabled；读配置失败按关闭处理（宁可不可用也不误触发）。"""
+    try:
+        section = config._load().get("resume") or {}
+    except Exception:
+        return False
+    return bool(section.get("enabled")) if isinstance(section, dict) else False
+
+
+def _resume_make_planner(manager_obj):
+    """装配规划层；默认注册表构造失败降级为 None（planner 会判工具不可用→BLOCK）。"""
+    from core.harness.resume import ResumePlanner
+
+    registry = None
+    try:
+        from core.tool_registry import build_default_registry
+
+        registry = build_default_registry()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "断点续跑：默认工具注册表构造失败，按无注册表降级", exc_info=True
+        )
+        registry = None
+    return ResumePlanner(manager_obj, registry)
+
+
+def _resume_print_plan(plan, aborts) -> None:
+    """打印断点位置与待确认清单（只含序号/工具名/原因，不含参数与结果正文）。"""
+    anchor_state = "完整" if plan.anchor.complete() else "缺失"
+    print_formatted_text(HTML(
+        "<ansicyan><b>断点续跑</b></ansicyan> "
+        f"父回合 {_esc(_undo_short_id(plan.parent_turn_id))} · "
+        f"从第 {plan.resume_from_step_ordinal} 个 Step 继续 · 锚点{anchor_state}"
+    ))
+    if plan.replayable:
+        names = ", ".join(sorted({call.tool_name for call in plan.replayable}))
+        print_formatted_text(HTML(
+            f"<ansigray>  可回灌的只读调用 {len(plan.replayable)} 个（{_esc(names)}）："
+            "结果直接取自 messages，不会重新执行。</ansigray>"
+        ))
+    if plan.fresh:
+        names = ", ".join(sorted({call.tool_name for call in plan.fresh}))
+        print_formatted_text(HTML(
+            f"<ansigray>  需重新获取结果的只读调用 {len(plan.fresh)} 个（{_esc(names)}）。</ansigray>"
+        ))
+    if plan.blocked:
+        print_formatted_text(HTML("<ansiyellow>  待确认清单（写操作/不确定态，需逐项同意）：</ansiyellow>"))
+        for call in plan.blocked:
+            print_formatted_text(HTML(
+                f"<ansiyellow>    · 第 {call.call_ordinal} 个调用 {_esc(call.tool_name)}"
+                f" — {_esc(call.reason)}</ansiyellow>"
+            ))
+    if aborts:
+        reasons = "、".join(_resume_reason_text(code) for code in aborts)
+        print_formatted_text(HTML(f"<ansired>❌ 不可续跑：{_esc(reasons)}</ansired>"))
+
+
+def _handle_resume_command(session_name: str) -> None:
+    """`/resume`：打印断点 → 终端一次性确认（全部同意或取消）→ ResumeExecutor。"""
+    if not _resume_switch_enabled():
+        print_formatted_text(HTML("<ansiyellow>断点续跑未启用（resume.enabled=false）。</ansiyellow>"))
+        print_formatted_text(HTML(
+            '<ansigray>  如需启用：在 config.json 写入 "resume": {"enabled": true} 后重启。</ansigray>'
+        ))
+        return
+    if not session_name:
+        print_formatted_text(HTML("<ansired>⚠️ 当前没有活动会话，无法确定续跑目标。</ansired>"))
+        return
+    from core.harness.resume import ResumeExecutor
+
+    planner = _resume_make_planner(manager)
+    plan = planner.plan(session_name)
+    if plan is None:
+        print_formatted_text(HTML("<ansigray>ℹ 没有断点信息（本会话最近没有中断的回合），请手动重来。</ansigray>"))
+        return
+    aborts = [str(code) for code in (planner.aborts(plan) or ())]
+    _resume_print_plan(plan, aborts)
+    if aborts:
+        return
+    question = "确认从断点继续？"
+    if plan.blocked:
+        question = f"确认从断点继续？将一次确认全部 {len(plan.blocked)} 项写操作"
+    if not _undo_confirm(question):
+        print_formatted_text(HTML("<ansigray>已取消（默认 N）：父回合保持中断，未做任何修改。</ansigray>"))
+        return
+    confirmed: set = {call.call_ordinal for call in plan.blocked}
+    result = ResumeExecutor(manager, planner).run(plan, confirmed=confirmed)
+    if result.get("ok"):
+        turn_id = str(result.get("turn_id") or "")
+        note = "（dry-run：请求层未接线，未发出模型请求）" if result.get("dry_run") else ""
+        print_formatted_text(HTML(
+            f"<ansigreen>✅ 已从断点续跑：新回合 {_esc(_undo_short_id(turn_id))}，"
+            f"回灌只读调用 {int(result.get('replayed') or 0)} 个{_esc(note)}。</ansigreen>"
+        ))
+        return
+    first = str(result.get("reason") or "")
+    print_formatted_text(HTML(f"<ansired>❌ 续跑未执行：{_esc(_resume_reason_text(first))}</ansired>"))
+
+
 def _undo_confirm(question: str) -> bool:
     """工作区锁外的交互确认；默认 N（直接回车不执行）。"""
     def _ask() -> bool:
@@ -2705,6 +2858,382 @@ def _update_cmd_install(args: list) -> None:
         print_formatted_text(HTML("<ansired>❌ 唤起安装包失败，请手动运行安装包。</ansired>"))
 
 
+# ---------------------------------------------------------------------------
+# /goal 目标模式（CLI 适配层）
+#
+# 状态机、完成判定与轮次循环都在 core/slash_commands/goal 里，这里只做编排：
+# 运行表（会话名 → 取消事件）、状态渲染、起 daemon 线程、把取消信号转给真实回合。
+# 与 gui_bridge 的同名实现是"同一套核心 + 各自适配层"，不在此复制任何判定逻辑，
+# 这样同一个目标在 GUI 与 CLI 跑出的结论才可能一致。
+# ---------------------------------------------------------------------------
+
+# 状态码 → 中文文案：把 running/blocked 这类英文码直接回显在中文界面里，
+# 用户会以为程序异常。集中成一张表，新增状态时只需补一行。
+_GOAL_STATUS_TEXT = {
+    "running": "进行中",
+    "awaiting_confirm": "待确认",
+    "achieved": "已达成",
+    "blocked": "受阻（轮次用尽）",
+    "stopped": "已停止",
+    "interrupted": "已中断",
+}
+
+# 只接受这三种状态 resume：achieved 再跑没有意义；awaiting_confirm 需要的是
+# "确认达成"而不是"再来一轮"；running 说明线程还在跑（重复启动会被拒）。
+# 取值必须与 core.slash_commands.goal.state 的 STATUS_* 一致——那里是权威定义，
+# 这里只是"可恢复集合"的适配层视图。
+_GOAL_RESUMABLE = ("blocked", "stopped", "interrupted")
+
+# 运行表：会话名 → 取消事件。用模块级 dict（而不是闭包）是为了让 `/goal stop`
+# 与 Ctrl+C 处理器能凭会话名找到另一个线程里的循环。读写一律持锁：UI 线程、
+# 后台 goal 线程、Ctrl+C 回调都可能同时访问。
+_GOAL_RUNS = {}
+_GOAL_RUNS_LOCK = threading.Lock()
+
+
+def _format_goal_status(state) -> str:
+    """把目标状态渲染成一行文案（纯函数，便于单测直接断言）。
+
+    没有状态文件是正常情况（用户只是问问进度），返回一句提示而不是报错。
+    """
+    if state is None:
+        return "当前会话没有进行中的目标"
+    summary = ""
+    if state.history:
+        summary = str(state.history[-1].get("summary") or "")
+    status_text = _GOAL_STATUS_TEXT.get(state.status, state.status)
+    return (
+        f"第 {state.round}/{state.max_rounds} 轮 · {status_text} · "
+        f"{summary or '（还没有完成任何一轮）'}"
+    )
+
+
+def _goal_notice(html_text: str) -> None:
+    """打印一行目标模式提示（跨线程安全）。
+
+    有 prompt_toolkit App 时统一经 schedule_ui 回到 UI 线程打印，遵守
+    "后台线程不直接调用 print_formatted_text" 的约定；没有 App（headless）时
+    schedule_ui 会静默丢弃回调，此时直接打印——否则目标每一轮的进展对用户
+    完全不可见，看起来像"启动了但什么都没发生"。
+    """
+    if app_instance is None:
+        try:
+            print_formatted_text(HTML(html_text))
+        except Exception:
+            pass
+        return
+    schedule_ui(lambda: print_formatted_text(HTML(html_text)))
+
+
+def _goal_store():
+    """打开目标状态仓库（与 GUI 端共用同一份 goals 目录）。"""
+    from core.slash_commands.goal.cli_executor import open_goal_store
+
+    return open_goal_store()
+
+
+def _submit_goal_turn(prompt: str, session_name: str) -> dict:
+    """把目标轮次的 prompt 作为一次普通用户消息投递进 CLI 回合链路。
+
+    结构必须与 headless 投递一致：session 快照要带上（否则排队期间用户切换会话
+    会把目标回合写进错误会话）；result 是 worker 收尾时回填成败的共享对象，
+    执行器靠"dict 里出现 ok 键"判定本轮真正结束——比轮询 is_thinking 精确，
+    后者在准备阶段之前还是 False，会让人误判回合已结束而读到上一轮的回复。
+    """
+    task = {
+        "text": prompt,
+        "was_queued": False,
+        "is_skill_call": False,
+        "session": session_name,
+        "result": {},
+    }
+    msg_queue.put(task)
+    return task["result"]
+
+
+def _goal_has_running() -> bool:
+    """是否有目标循环正在跑（运行表非空）。"""
+    with _GOAL_RUNS_LOCK:
+        return bool(_GOAL_RUNS)
+
+
+def _set_all_goal_cancel_events() -> int:
+    """置位所有目标循环的取消事件，返回置位数量。
+
+    Ctrl+C 的意图是"全部停下"：只中断当前模型回合而不置位目标循环的话，
+    本轮一结束循环会立刻开下一轮，用户会觉得 Ctrl+C 对目标模式无效。
+    """
+    with _GOAL_RUNS_LOCK:
+        events = list(_GOAL_RUNS.values())
+    count = 0
+    for event in events:
+        try:
+            event.set()
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _goal_start_run(state):
+    """起一条 daemon 线程驱动 run_goal_loop；返回 (是否启动成功, 失败说明)。"""
+    from core.slash_commands.goal.cli_executor import CliGoalExecutor
+    from core.slash_commands.goal.runner import run_goal_loop
+
+    session_name = state.session
+    with _GOAL_RUNS_LOCK:
+        existing = _GOAL_RUNS.get(session_name)
+        if existing is not None and not existing.is_set():
+            # 检查与写入必须在同一把锁内：每个会话最多一条循环，两条同时推进
+            # 会把同一份 history / 状态文件互相覆盖。
+            return False, "该会话已有运行中的目标"
+        cancel_event = threading.Event()
+        _GOAL_RUNS[session_name] = cancel_event
+    try:
+        store = _goal_store()
+    except Exception as exc:
+        with _GOAL_RUNS_LOCK:
+            if _GOAL_RUNS.get(session_name) is cancel_event:
+                _GOAL_RUNS.pop(session_name, None)
+        return False, f"打开目标状态仓库失败：{exc}"
+
+    # host 传当前模块自身（sys.modules[__name__]）：cli_executor 不能 `import main`
+    # ——CLI 以 `python main.py` 启动时入口模块名是 "__main__"，再 import main 会把
+    # 入口文件执行第二遍、得到另一份 msg_queue，目标回合就投进没人消费的队列了。
+    host = sys.modules[__name__]
+    executor = CliGoalExecutor(host, session_name)
+
+    def on_event(event, current_state):
+        """循环进度回调：只打印，不碰界面对象，也绝不把异常抛回循环。"""
+        try:
+            if event == "round_done":
+                summary = ""
+                if current_state.history:
+                    summary = str(current_state.history[-1].get("summary") or "")
+                _goal_notice(
+                    f"<ansicyan>🎯 目标第 {current_state.round}/{current_state.max_rounds} 轮：</ansicyan>"
+                    f"<ansigray>{_esc(summary)}</ansigray>"
+                )
+            elif event == "finished":
+                hint = (
+                    "，可用 /goal resume 继续"
+                    if current_state.status in _GOAL_RESUMABLE
+                    else ""
+                )
+                _goal_notice(
+                    f"<ansigreen>✔ 目标流程结束{hint}</ansigreen> "
+                    f"<ansigray>{_esc(_format_goal_status(current_state))}</ansigray>"
+                )
+        except Exception:
+            logging.getLogger("py.warnings").debug("目标进度提示打印失败", exc_info=True)
+
+    def worker():
+        try:
+            run_goal_loop(
+                state,
+                executor,
+                store,
+                on_event=on_event,
+                cancel_event=cancel_event,
+                run_check=executor.run_check,
+            )
+        except Exception as exc:  # 循环自身缺陷不该让后台线程静默死掉
+            logging.getLogger("py.warnings").exception("目标循环异常退出")
+            _goal_notice(f"<ansired>❌ 目标循环异常终止：{_esc(exc)}</ansired>")
+        finally:
+            # 只删自己那一条：期间用户可能 stop 后重建了新目标，误删会把新循环的
+            # 取消事件一起丢掉（之后 /goal stop 就失效了）。
+            with _GOAL_RUNS_LOCK:
+                if _GOAL_RUNS.get(session_name) is cancel_event:
+                    _GOAL_RUNS.pop(session_name, None)
+
+    # daemon 线程：目标是用户可见的长任务，不参与任何请求生命周期；状态每轮已
+    # 落盘，进程退出后仍可用 /goal resume 从断点继续。
+    thread = threading.Thread(
+        target=worker, name=f"goal-loop-{session_name}", daemon=True
+    )
+    thread.start()
+    return True, ""
+
+
+def _goal_handle_status(session_name) -> None:
+    """/goal status：输出轮次 / 状态 / 最近一轮摘要。"""
+    try:
+        state = _goal_store().load(session_name)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    if state is None:
+        print_formatted_text(
+            HTML(f"<ansiyellow>ℹ {_esc(_format_goal_status(None))}</ansiyellow>")
+        )
+        return
+    print_formatted_text(HTML(f"<ansicyan>🎯 {_esc(_format_goal_status(state))}</ansicyan>"))
+    if state.goal:
+        print_formatted_text(HTML(f"<ansigray>  目标：{_esc(state.goal)}</ansigray>"))
+    if state.check:
+        print_formatted_text(
+            HTML(f"<ansigray>  验证命令：{_esc(state.check)}</ansigray>")
+        )
+
+
+def _goal_handle_stop(session_name) -> None:
+    """/goal stop：置位该会话的取消事件，并中断正在跑的那一轮。"""
+    with _GOAL_RUNS_LOCK:
+        cancel_event = _GOAL_RUNS.get(session_name)
+    if cancel_event is None:
+        # 没有运行中的循环时说清楚，而不是静默成功让用户以为已经停了
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话没有运行中的目标（/goal status 查看进度）。</ansiyellow>"
+        ))
+        return
+    cancel_event.set()
+    # 光置位只影响"两轮之间"的检查点：用户停止时若正卡在一轮模型回复里，
+    # 要等整轮跑完才停，体验上像"停不掉"，所以同时走 CLI 既有取消通道中断在飞请求。
+    try:
+        _cancel_active_turn()
+    except Exception:
+        logging.getLogger("py.warnings").debug("中断目标回合失败", exc_info=True)
+    print_formatted_text(HTML(
+        "<ansigreen>✔ 已停止目标：本轮中断，不再自动续跑。</ansigreen>"
+    ))
+
+
+def _goal_handle_resume(session_name) -> None:
+    """/goal resume：把 blocked / stopped / interrupted 的目标重新跑起来。"""
+    from core.slash_commands.goal.state import STATUS_RUNNING
+
+    try:
+        store = _goal_store()
+        state = store.load(session_name)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    if state is None:
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话没有可恢复的目标，用 /goal &lt;目标&gt; 新建一个。</ansiyellow>"
+        ))
+        return
+    if state.status not in _GOAL_RESUMABLE:
+        hint = {
+            "achieved": "目标已达成，无需恢复；要跑新目标请用 /goal <目标>",
+            "awaiting_confirm": "目标在待确认状态，请确认是否达成，或用 /goal <目标> 重新设定",
+            "running": "目标已在运行中，无需重复恢复",
+        }.get(state.status, "")
+        status_text = _GOAL_STATUS_TEXT.get(state.status, state.status)
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 当前状态为「{_esc(status_text)}」，不能恢复。{_esc(hint)}</ansiyellow>"
+        ))
+        return
+    if state.round >= state.max_rounds:
+        # 轮次已用尽的目标恢复后会立刻再次 blocked（循环条件一开始就不成立），
+        # 让用户看到"说恢复了其实没跑"比直接说明更糟。
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 轮次已用尽（{state.round}/{state.max_rounds}），"
+            "请用 /goal &lt;目标&gt; [--rounds N] 重新设定目标与轮次。</ansiyellow>"
+        ))
+        return
+    # 用核心层的常量而不是字面量 "running"：状态机改名字时这里会立刻 ImportError，
+    # 而不是静默写进一个循环再也不认的状态值。
+    state.status = STATUS_RUNNING
+    try:
+        store.save(state)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    started, message = _goal_start_run(state)
+    if not started:
+        print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        return
+    print_formatted_text(HTML(
+        f"<ansigreen>✔ 已恢复目标（第 {state.round}/{state.max_rounds} 轮起）："
+        f"{_esc(state.goal)}</ansigreen>"
+    ))
+
+
+def _goal_handle_start(action, session_name) -> None:
+    """/goal <目标>：新建目标状态并启动后台循环。"""
+    from core.slash_commands.goal.state import GoalState
+    from core.slash_commands.goal_command import DEFAULT_MAX_ROUNDS, GOAL_USAGE
+
+    goal = str(action.get("goal") or "").strip()
+    if not goal:
+        # 理论上命令层已拦住空目标，这里兜底：没有目标的循环只会空转烧 token
+        print_formatted_text(HTML(f"<ansired>❌ 目标不能为空。{_esc(GOAL_USAGE)}</ansired>"))
+        return
+    try:
+        max_rounds = int(action.get("max_rounds") or 0)
+    except (TypeError, ValueError):
+        max_rounds = 0
+    if max_rounds <= 0:
+        max_rounds = DEFAULT_MAX_ROUNDS
+    with _GOAL_RUNS_LOCK:
+        existing = _GOAL_RUNS.get(session_name)
+    if existing is not None and not existing.is_set():
+        print_formatted_text(HTML(
+            "<ansired>❌ 当前会话已有运行中的目标，先 /goal stop 再重新设定。</ansired>"
+        ))
+        return
+    state = GoalState(
+        session=session_name,
+        goal=goal,
+        check=str(action.get("check") or "").strip(),
+        max_rounds=max_rounds,
+    )
+    try:
+        _goal_store().save(state)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    started, message = _goal_start_run(state)
+    if not started:
+        print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        return
+    suffix = f" · 验证命令：{_esc(state.check)}" if state.check else ""
+    print_formatted_text(HTML(
+        f"<ansigreen>✔ 已启动目标（最多 {state.max_rounds} 轮）：{_esc(state.goal)}"
+        f"{suffix}</ansigreen>"
+    ))
+    print_formatted_text(HTML(
+        "<ansigray>  进度自动播报；/goal status 查看，/goal stop 或 Ctrl+C 停止。</ansigray>"
+    ))
+
+
+def _run_goal_cli(args_text: str) -> None:
+    """/goal 的 CLI 入口：复用命令层解析，只按 action 做适配层该做的事。"""
+    from core.slash_commands.goal_command import GOAL_USAGE, handle_goal
+
+    result = handle_goal(args_text)
+    if not result.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>❌ {_esc(result.get('msg') or '目标参数无效')}</ansired>"
+        ))
+        return
+    action = result.get("action") or {}
+    kind = str(action.get("action") or "")
+    if kind == "goal_help":
+        print_formatted_text(HTML(f"<ansicyan>🎯 {_esc(GOAL_USAGE)}</ansicyan>"))
+        print_formatted_text(HTML(
+            "<ansigray>  控制: /goal status | /goal stop | /goal resume</ansigray>"
+        ))
+        print_formatted_text(HTML(
+            "<ansigray>  示例: /goal 把测试跑绿 --check pytest -q --rounds 5</ansigray>"
+        ))
+        return
+    session_name = current_session
+    if kind == "goal_status":
+        _goal_handle_status(session_name)
+    elif kind == "goal_stop":
+        _goal_handle_stop(session_name)
+    elif kind == "goal_resume":
+        _goal_handle_resume(session_name)
+    elif kind == "goal_start":
+        _goal_handle_start(action, session_name)
+    else:
+        # 命令表新增了动作却没在这里适配时给出明确提示，而不是静默成功
+        print_formatted_text(HTML(f"<ansired>❌ 未知目标动作: {_esc(kind)}</ansired>"))
+
+
 def handle_slash_command(command_text):
     """斜杠指令路由器"""
     global current_session, current_model, _turn_separator_needed
@@ -2765,6 +3294,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/plugins enable|disable &lt;name&gt;</ansicyan>        : 启用/禁用指定插件 (写回 plugin.json，重启后生效)"))
         print_formatted_text(HTML("  <ansicyan>/plugins reload</ansicyan>                       : 重新扫描插件目录刷新清单 (不重启)"))
         print_formatted_text(HTML("  <ansicyan>/hooks</ansicyan>                                : Hook 生命周期钩子管理 (查看清单/trust|deny|revoke|reset 序号 信任操作)"))
+        print_formatted_text(HTML("  <ansicyan>/hooks import</ansicyan>                         : <b>从 ZCode 配置导入 hook</b> (预览确认后写入;rollback 撤销导入)"))
         print_formatted_text(HTML("  <ansicyan>/mcp</ansicyan>                                 : MCP 服务管理 (open/status/tools/enable/disable/reconnect/edit)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
@@ -2790,6 +3320,13 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>Ctrl+T</ansicyan>                                : <b>切换展开/收起底部浮窗显示当前会话的背景记忆摘要</b>"))
         print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 星瑶Code 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 星瑶Code CLI"))
+        print_formatted_text(HTML(""))
+        print_formatted_text(HTML("<b><ansiyellow>【7. 目标模式 (自主迭代)】</ansiyellow></b>"))
+        print_formatted_text(HTML("  <ansicyan>/goal &lt;目标&gt; [--check &lt;命令&gt;] [--rounds &lt;N&gt;]</ansicyan> : 启动目标模式，自主迭代推进直到达成或轮次用尽 ( --check 退出码 0 视为达成，最可信；--rounds 默认 10)"))
+        print_formatted_text(HTML("  <ansicyan>/goal status</ansicyan>                          : 查看当前目标进度 (第 N/M 轮 · 状态 · 最近一轮摘要)"))
+        print_formatted_text(HTML("  <ansicyan>/goal stop</ansicyan>                            : 停止当前目标 (本轮中断，不再自动续跑；Ctrl+C 同效)"))
+        print_formatted_text(HTML("  <ansicyan>/goal resume</ansicyan>                          : 恢复已停止/受阻/中断的目标，从当前轮次继续跑"))
+        print_formatted_text(HTML("  <ansicyan>/goal help</ansicyan>                            : 查看 /goal 的参数用法 (不带参数的 /goal 也显示它)"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
 
     elif cmd in ("/models", "/model"):
@@ -3687,6 +4224,13 @@ def handle_slash_command(command_text):
             else:
                 print_formatted_text(HTML("<ansired>❌ 用法：/plan、/plan pause、/plan resume、/plan retry &lt;id&gt;、/plan cancel</ansired>"))
 
+    elif cmd == "/resume":
+        # 断点续跑（规格 §4.1 CLI 入口）：开关关闭只提示；否则打印断点 + 一次性确认。
+        try:
+            _handle_resume_command(current_session)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+
     elif cmd == "/undo":
         # 按回合撤销（规格 17）：/undo、/undo <turn_id>、list、preview、status、recover。
         # 预检 + 一次性令牌 + 多文件事务；默认确认 N，无 --force。
@@ -4027,7 +4571,83 @@ def handle_slash_command(command_text):
         except Exception as e:
             print_formatted_text(HTML(f"<ansired>⚠️ 读取 Hook 配置失败: {_esc(str(e))}</ansired>"))
 
-        if sub == "":
+        if sub == "import":
+            # ZCode hooks 导入（待开发/ZCode钩子与工作流导入/设计规格.md §2.1）：
+            # 扫描 → 预览（导入/跳过逐条点名，绝不静默丢条目）→ 确认 → 写入。
+            from core.hooks.zcode_import import apply_plan, plan_import
+
+            try:
+                plan = plan_import(workspace_root=workspace_root)
+            except Exception as e:
+                print_formatted_text(HTML(f"<ansired>⚠️ 扫描 ZCode 配置失败: {_esc(str(e))}</ansired>"))
+            else:
+                files = plan.get("files", [])
+                if not files:
+                    print_formatted_text(HTML(
+                        "<ansiyellow>ℹ 未发现任何 ZCode hooks 配置（扫描 ~/.zcode/cli/config.json、"
+                        "&lt;项目&gt;/.zcode/config.json、zcode.json、.zcode/settings.json）。</ansiyellow>"
+                    ))
+                else:
+                    total_entries = 0
+                    for file_report in files:
+                        label = file_report.get("label")
+                        path = file_report.get("path")
+                        if file_report.get("status") != "imported":
+                            print_formatted_text(HTML(
+                                f"  <ansigray>[跳过] {label}: {file_report.get('reason')}（{_esc(str(path))}）</ansigray>"
+                            ))
+                            continue
+                        for entry in file_report.get("entries", []):
+                            total_entries += 1
+                            print_formatted_text(HTML(
+                                f"  <ansigreen>[导入]</ansigreen> <b><ansicyan>{_esc(entry['event'])}</b></ansicyan>"
+                                f" matcher={_esc(entry['matcher'])} timeout={entry['timeout_ms']}ms"
+                                f" <ansigray>{_esc(entry['command'][:70])}</ansigray>"
+                            ))
+                        for item in file_report.get("skipped", []):
+                            print_formatted_text(HTML(
+                                f"  <ansiyellow>[跳过]</ansiyellow> {_esc(item.get('event', '?'))}"
+                                f" <ansigray>{_esc(item.get('reason', ''))}</ansigray>"
+                            ))
+                    if total_entries == 0:
+                        print_formatted_text(HTML("<ansiyellow>ℹ 没有可导入的条目（全部被跳过，原因见上）。</ansiyellow>"))
+                    else:
+                        try:
+                            answer = input(f"确认导入以上 {total_entries} 条 hook？(y/N) ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            answer = ""
+                        if answer in ("y", "yes"):
+                            summary = apply_plan(plan, workspace_root=workspace_root)
+                            for scope_item in summary.get("scopes", []):
+                                print_formatted_text(HTML(
+                                    f"<ansigreen>✔ 写入 {scope_item['written']} 条 → {_esc(scope_item['path'])}</ansigreen>"
+                                ))
+                            for err in summary.get("errors", []):
+                                print_formatted_text(HTML(f"<ansired>⚠️ {_esc(err)}</ansired>"))
+                            if summary.get("duplicates"):
+                                print_formatted_text(HTML(
+                                    f"<ansigray>  跳过 {summary['duplicates']} 条重复条目（目标文件已存在同事件同命令）。</ansigray>"
+                                ))
+                            print_formatted_text(HTML(
+                                "<ansigray>  项目级条目按既有信任流程生效（/hooks 查看）；撤销导入用 /hooks rollback。</ansigray>"
+                            ))
+                        else:
+                            print_formatted_text(HTML("<ansigray>已取消，未写入任何内容。</ansigray>"))
+
+        elif sub == "rollback":
+            # 撤销导入：只删带 imported_from=zcode: 标记的条目，星瑶原生条目不动。
+            from core.hooks.zcode_import import rollback_import
+
+            result = rollback_import(workspace_root=workspace_root)
+            if result.get("removed"):
+                for item in result["touched"]:
+                    print_formatted_text(HTML(
+                        f"<ansigreen>✔ 从 {_esc(item['path'])} 移除 {item['removed']} 条导入条目</ansigreen>"
+                    ))
+            else:
+                print_formatted_text(HTML("<ansiyellow>ℹ 没有找到任何 ZCode 导入条目。</ansiyellow>"))
+
+        elif sub == "":
             # 编号从 1 起，供 trust/deny/revoke/reset 引用（与 GUI 卡片同一数据源）
             if not entries:
                 print_formatted_text(HTML("<ansiyellow>ℹ 未配置任何 Hook。</ansiyellow>"))
@@ -4094,7 +4714,9 @@ def handle_slash_command(command_text):
                     print_formatted_text(HTML(f"<ansired>⚠️ {_esc(msg)}</ansired>"))
 
         else:
-            print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /hooks [trust|deny|revoke|reset &lt;序号&gt;]</ansired>"))
+            print_formatted_text(HTML(
+                "<ansired>⚠️ 未知子命令。用法: /hooks [import|rollback|trust|deny|revoke|reset &lt;序号&gt;]</ansired>"
+            ))
     elif cmd == "/doctor" or cmd.startswith("/doctor "):
         # 聚合自检（T3）：配置/凭据/数据/数据库/MCP/网络/GUI 运行时一站式体检；
         # --json 输出机器可读结果（供脚本采集/报障），默认人类可读。
@@ -4304,6 +4926,13 @@ def handle_slash_command(command_text):
             f"<ansiyellow>🧠 正在后台压缩会话记忆{'（强制模式）' if force else ''}...</ansiyellow>"
         ))
         threading.Thread(target=run_compress_bg, daemon=True).start()
+
+    elif cmd == "/goal" or cmd.startswith("/goal "):
+        # 参数取"原始输入去掉命令名"，而不是 parts[1:] 重组：--check 的值是整条
+        # 命令（含空格与引号），按 token 重组会把 `pytest -q` 拆成 `pytest`，
+        # 用户会看到"验证命令永远通过"的假达成。解析统一交给命令层 handle_goal。
+        _goal_args_text = command_text.strip()[len(parts[0]):].strip()
+        _run_goal_cli(_goal_args_text)
 
     elif cmd == "/exit":
         # 使用 print_formatted_text 避免 rich 在 prompt_toolkit patch_stdout 下出现 ANSI 乱码
@@ -4560,8 +5189,21 @@ def _make_input_app():
     def clear_input(event):
         """Ctrl+C: 如果星瑶正在执行，则中断执行；如果闲置，则清空输入框"""
         global is_thinking, confirm_prompt
-        if is_thinking or active_cancel_event is not None or confirm_prompt is not None:
+        if (
+            is_thinking
+            or active_cancel_event is not None
+            or confirm_prompt is not None
+            # 目标模式在两轮之间可能既没有在飞回合也没有确认框，此时 Ctrl+C
+            # 仍应被视为"停止目标"，而不是清空输入框
+            or _goal_has_running()
+        ):
             _cancel_active_turn()
+            # 目标循环的取消事件一并置位：只中断当前模型回合的话，本轮一结束
+            # 循环会立刻开下一轮，用户会觉得 Ctrl+C 对目标模式无效。
+            if _set_all_goal_cancel_events():
+                print_formatted_text(HTML(
+                    "<ansired>🎯 目标模式已收到停止信号，本轮结束后不再自动续跑。</ansired>"
+                ))
             # 同时丢弃排队中的消息：用户按 Ctrl+C 的意图是"全部停下"，
             # 只取消当前轮而继续执行队列里的旧消息会让人困惑。
             drained = 0

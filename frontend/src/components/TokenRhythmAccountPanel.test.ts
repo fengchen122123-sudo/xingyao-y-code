@@ -47,6 +47,7 @@ function installBridge(overrides: Record<string, any> = {}) {
     // 充值 tab 已随弹窗改版删除：这个 mock 只用于「充值不拉钱包流水」的反向断言
     tr_wallet_transactions: vi.fn(async () => ({ ok: true, data: {} })),
     ...overrides,
+    ...overrides,
   };
   (window as any).pywebview = { api };
   return api;
@@ -82,6 +83,25 @@ afterEach(() => {
   vi.restoreAllMocks();
   // 用例里伪造的卡片节点必须清掉，避免污染后续断言
   document.querySelectorAll('[data-test="side-user-card"]').forEach((el) => el.remove());
+});
+
+it('超长账号名只显示前 6 个字符，完整名挂在 title 上', async () => {
+  const longName = '基元律动请送我token我';
+  installBridge({
+    tr_account_overview: vi.fn(async () => okOverview({
+      user: { id: 7, name: longName, nickname: longName, phone: '13800138000' },
+    })),
+  });
+  const { store, wrapper: w } = setup();
+
+  await openPanel(store);
+
+  const nameEl = w!.get('[data-test="tr-acc-name"]');
+  expect(nameEl.text()).toBe('基元律动请送…');
+  // 完整名字留给悬停气泡，不丢信息
+  expect(nameEl.attributes('title')).toBe(longName);
+  // 头像仍取首字
+  expect(w!.get('[data-test="tr-acc-avatar"]').text()).toBe('基');
 });
 
 it('加载成功后展示两位小数余额、今日用量与千分位 Token', async () => {
@@ -461,4 +481,48 @@ it('接口未返回 temporary_credits 时临时额度显示占位符', async () 
 
   expect(w!.get('[data-test="tr-acc-temporary"]').text()).toBe('—');
   expect(w!.find('[data-test="tr-acc-temporary-expire"]').exists()).toBe(false);
+});
+
+// ── 存量回归：余额 / 临时额度 / 按钮区保持原样 ─────────────────────────
+it('余额、临时额度与按钮区保持原样', async () => {
+  installBridge();
+  const { store, wrapper: w } = setup();
+
+  await openPanel(store);
+
+  expect(w!.get('[data-test="tr-acc-name"]').text()).toBe('阿晨');
+  expect(w!.get('[data-test="tr-acc-balance"]').text()).toBe('¥298.10');
+  expect(w!.get('[data-test="tr-acc-today-cost"]').text()).toContain('¥1.23');
+  expect(w!.get('[data-test="tr-acc-temporary"]').text()).toBe('—');
+  expect(w!.get('[data-test="tr-acc-tokens"]').text()).toBe('34,567');
+  for (const btn of ['tr-acc-recharge', 'tr-acc-usage-detail', 'tr-acc-profile', 'tr-acc-logout']) {
+    expect(w!.find(`[data-test="${btn}"]`).exists()).toBe(true);
+  }
+});
+
+// ── 登录过期：面板内直接出现「重新登录」 ──────────────────────────────
+it('总览返回登录过期时给出「重新登录」，点击收起面板并拉起登录窗', async () => {
+  installBridge({
+    tr_account_overview: vi.fn(async () => ({ ok: false, msg: '登录已过期，请重新登录' })),
+  });
+  const { store, wrapper: w } = setup();
+
+  await openPanel(store);
+
+  expect(w!.get('[data-test="tr-acc-error"]').text()).toContain('登录已过期');
+  await w!.get('[data-test="tr-acc-relogin"]').trigger('click');
+  expect(store.trLoginModal.show).toBe(true);
+  expect(store.trAccountPanel.show).toBe(false);
+});
+
+it('非登录类失败不出现「重新登录」，只保留重试', async () => {
+  installBridge({
+    tr_account_overview: vi.fn(async () => ({ ok: false, msg: '余额服务不可用' })),
+  });
+  const { store, wrapper: w } = setup();
+
+  await openPanel(store);
+
+  expect(w!.find('[data-test="tr-acc-relogin"]').exists()).toBe(false);
+  expect(w!.find('[data-test="tr-acc-retry"]').exists()).toBe(true);
 });

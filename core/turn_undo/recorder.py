@@ -37,6 +37,7 @@ from core.turn_undo.models import (
     TurnUndoError,
     TurnUndoStatus,
     UndoErrorCode,
+    UNDO_RESULT_SKIPPED,
 )
 from core.turn_undo.storage import TurnUndoStorage, now_ms
 
@@ -348,6 +349,31 @@ def _require_active_context(*, need_owner: bool) -> RecorderContext:
     return ctx
 
 
+def _ensure_workspace_writable(ctx: RecorderContext) -> None:
+    """同一工作区同一时刻只允许一个前台回合写入（规格 9.2 并发保护）。
+
+    多会话同时写同一目录时，撤销记录彼此不可见，后写者会让先写者的
+    "中途外部改动"检测必然命中。这里在触盘前快速失败，让调用方等待重试，
+    而不是把整个回合判死。后台任务检查点按设计允许与父回合并存，不参与互斥。
+    """
+    if ctx.owner_kind == OwnerKind.BACKGROUND_TASK.value:
+        return
+    from core.turn_undo import coordinator as coordinator_mod
+
+    coordinator = coordinator_mod.get_coordinator()
+    active = coordinator.active_turn_id(ctx.workspace_root)
+    if active and active != ctx.turn_id:
+        raise TurnUndoError(
+            UndoErrorCode.WORKSPACE_BUSY,
+            f"该目录正在被另一个回合写入（回合 {active[:8]}），"
+            f"请等待其完成后再重试: {ctx.workspace_root}",
+            detail={
+                "active_turn_id": active,
+                "workspace_root": ctx.workspace_root,
+            },
+        )
+
+
 def prepare_mutation(
     *,
     display_path: str,
@@ -384,13 +410,21 @@ def prepare_mutation(
         )
 
     ctx = _require_active_context(need_owner=True)
+    _ensure_workspace_writable(ctx)
     storage = _storage_for_ctx()
     checkpoint = storage.get_checkpoint(ctx.checkpoint_id)
     if checkpoint.status_enum is not TurnUndoStatus.RECORDING:
+        reason = (checkpoint.last_error_message or "").strip()
         raise TurnUndoError(
             UndoErrorCode.CHECKPOINT_CLOSED,
             f"检查点已封闭（{checkpoint.status_enum.value}），拒绝新写入句柄: "
-            f"{ctx.checkpoint_id}",
+            f"{ctx.checkpoint_id}"
+            + (f"；原因：{reason}" if reason else ""),
+            detail={
+                "checkpoint_id": ctx.checkpoint_id,
+                "status": checkpoint.status_enum.value,
+                "reason": reason,
+            },
         )
 
     canonical_path = canonicalize_path(display_path)
@@ -414,19 +448,17 @@ def prepare_mutation(
         before_node, before_blob = _capture_before_with_blob(storage, canonical_path)
         _reject_unsupported(before_node, canonical_path)
 
-        # 中途外部改动检测：当前磁盘状态必须仍等于上一计划 after（首改除外）
+        # 中途外部改动检测：当前磁盘状态必须仍等于上一计划 after（首改除外）。
+        # 命中冲突时只让该文件退出本回合撤销范围，不再把整个检查点判死：
+        # 长回合里任何一次外部写入都不应让后续全部写入失效。
+        file_skipped = False
         if existing is not None:
             planned = _planned_after_state(existing)
             if not _state_matches_disk(planned, canonical_path):
-                _mark_unavailable(
-                    storage, ctx,
-                    reason="prepare 时发现文件与上一计划状态不一致（可能被外部修改）",
-                )
-                raise TurnUndoError(
-                    UndoErrorCode.FILE_CONFLICT,
-                    f"文件在回合内被外部修改，检查点不可安全撤销: "
-                    f"{display_path}",
-                    detail={"file": canonical_path},
+                file_skipped = True
+                logger.warning(
+                    "按回合撤销：文件在回合内被外部修改，退出撤销范围: %s",
+                    canonical_path,
                 )
 
         # 2. 计划 after 字节写入内容仓库
@@ -476,6 +508,15 @@ def prepare_mutation(
                         checkpoint_id=ctx.checkpoint_id, values=values,
                     )
                     first = False
+                if file_skipped:
+                    # 同事务标记：该文件退出本回合撤销范围，但 after 计划仍更新，
+                    # 保证后续写入不会重复命中同一条冲突
+                    storage.set_file_undo_result_locked(
+                        cursor,
+                        file_id=file_id,
+                        undo_result=UNDO_RESULT_SKIPPED,
+                        undo_error_code=UndoErrorCode.FILE_CONFLICT,
+                    )
                 storage.conn.commit()
             except Exception:
                 storage.conn.rollback()
@@ -670,15 +711,33 @@ def verify_after_mutation(handle: MutationHandle) -> NodeState:
     planned = handle.planned_after
 
     def _fail(reason: str):
-        _mark_unavailable(
-            storage, ctx,
-            reason=f"写入验证失败: {reason}",
-            code=UndoErrorCode.CHECKPOINT_UNAVAILABLE,
+        # 单文件验证失败：该文件退出撤销范围，回合其余写入继续可用。
+        with _record_lock:
+            with storage._manager._lock:
+                cursor = storage.conn.cursor()
+                try:
+                    storage.set_file_undo_result_locked(
+                        cursor,
+                        file_id=handle.file_id,
+                        undo_result=UNDO_RESULT_SKIPPED,
+                        undo_error_code=UndoErrorCode.FILE_CONFLICT,
+                    )
+                    storage.conn.commit()
+                except Exception:
+                    storage.conn.rollback()
+                    raise
+        logger.warning(
+            "按回合撤销：写入验证失败，文件退出撤销范围: %s (%s)",
+            canonical_path, reason,
         )
         raise TurnUndoError(
             UndoErrorCode.FILE_CONFLICT,
-            f"写入后实际状态与计划不一致，工具不得声称成功: {canonical_path}",
-            detail={"reason": reason, "file": canonical_path},
+            f"写入后实际状态与计划不一致，该文件已退出本回合撤销范围: {canonical_path}",
+            detail={
+                "reason": reason,
+                "file": canonical_path,
+                "undo_result": UNDO_RESULT_SKIPPED,
+            },
         )
 
     if planned.kind is NodeKind.MISSING:
@@ -869,17 +928,21 @@ def close_turn(
         return checkpoint.status_enum
 
     files = storage.list_files(ctx.checkpoint_id)
+    # 退出撤销范围的文件（回合内被外部修改）不参与完整性校验与净 diff；
+    # 记录仍保留，供撤销预检列出 skipped 清单。
+    active_files = [row for row in files if row.undo_result != UNDO_RESULT_SKIPPED]
     final_status = TurnUndoStatus.READY
     availability = SnapshotAvailability.AVAILABLE
     reason: Optional[str] = unavailable_reason
 
-    if not files:
+    if not files or not active_files:
+        # 没有任何受控修改，或全部文件都退出了撤销范围
         final_status = TurnUndoStatus.NO_CHANGES
         availability = SnapshotAvailability.NOT_REQUIRED
     else:
         stats: dict[str, tuple[int, int, str]] = {}
         with _record_lock:
-            for row in files:
+            for row in active_files:
                 if row.verified_at_ms is None:
                     final_status = TurnUndoStatus.UNAVAILABLE
                     reason = reason or "存在未通过写入后验证的文件记录"

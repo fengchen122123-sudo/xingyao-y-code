@@ -191,6 +191,7 @@ SECRETARY_ONLY_TOOLS = frozenset({
     "search_conversations",
     "dispatch_task",
     "open_session",
+    "create_project",
 })
 
 # 秘书会话的额外允许项：这些工具不是只读（network / system / 跨会话写），
