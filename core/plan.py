@@ -921,10 +921,13 @@ def plan_update(
 
 
 def plan_retry(item_id: str, force: bool = False) -> str:
-    """将失败/阻塞/取消的计划项重置为 pending，允许重新调度执行。
+    """将失败/阻塞/取消/已完成但需要重跑的计划项重置为 pending，允许重新调度。
 
     防盲目重试：当 attempts >= 2 且上次失败原因仍然存在时，调用方必须
     显式传 force=True，确认已经分析根因后才能重试。
+
+    completed 项同样可重开：子代理把「工具不可用」写成结论时会被误判为完成，
+    而重建计划被门禁拒绝，只能靠重开这一项走出死锁。
     """
     from core.task_scheduler import get_default_scheduler
 
@@ -966,7 +969,8 @@ def plan_retry(item_id: str, force: bool = False) -> str:
     return (
         f"无法重置计划项 '{item_id}'。"
         f"当前状态为 '{item.get('status', 'unknown')}'，"
-        f"只有 failed/blocked/cancelled 状态可以重试。"
+        f"只有 failed/blocked/cancelled/completed 状态可以重试"
+        f"（completed 项重开会清空原有结果）。"
     )
 
 

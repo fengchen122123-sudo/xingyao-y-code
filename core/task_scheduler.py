@@ -419,7 +419,11 @@ class TaskScheduler:
         item = self._item(item_id)
         if item is None:
             return False
-        if item["status"] not in {"failed", "blocked", "cancelled"}:
+        # completed 也允许重开：子代理把「工具不可用、未真实执行」当成结论返回时，
+        # 计划项会被错误地标记 completed，而重建计划又被门禁挡住（“不能重建已有
+        # 执行记录”），结果是主 Agent 既不能重跑这一项、也不能新建，彻底卡死。
+        # 重开时清空 result/error 与执行租约，语义等同一次全新尝试。
+        if item["status"] not in {"failed", "blocked", "cancelled", "completed"}:
             return False
         # 已经发生超时接手的项只能显式 resume_takeover；普通 retry 会把它
         # 重新下发给子代理，违反“超时一次后主 Agent 接手”的业务约束。

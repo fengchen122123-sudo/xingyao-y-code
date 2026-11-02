@@ -67,6 +67,41 @@ def _raise_if_cancelled(cancel_event):
         raise _ToolCancelledError()
 
 
+# 子代理只读工具基底：除本地文件与检索外，还必须覆盖主 Agent 侧常用的只读
+# 内置与插件工具（小说体检、办公文档读取等）。白名单是硬过滤——不在集合里的
+# 工具对子代理完全不可见。历史故障：计划项要求「跑 novel_audit 复核」，子代理
+# 只拿到 7 个基础工具，只能回「工具不可用」；而计划门禁又不许主 Agent 自己跑，
+# 整条链路死锁（2026-11-02 小说项目实测）。
+_SUBAGENT_READ_ONLY_TOOLS = frozenset({
+    "read_file", "list_directory", "search_code", "glob_files",
+    "find_definition", "tool_result_read",
+    "search_news", "fetch_url", "fetch_image", "get_weather",
+    "office_read",
+    "novel_status", "novel_wordcount", "novel_outline", "novel_audit",
+})
+
+# 各角色默认工具白名单；None 表示不限定（general 继承全部工具）。
+_SUBAGENT_DEFAULT_ALLOWED_TOOLS = {
+    "explore": _SUBAGENT_READ_ONLY_TOOLS,
+    "implement": _SUBAGENT_READ_ONLY_TOOLS | frozenset({
+        "write_file", "edit_file", "execute_command",
+        "office_write", "novel_init", "novel_track",
+    }),
+    "test": frozenset({
+        "read_file", "list_directory", "search_code", "glob_files",
+        "find_definition", "tool_result_read", "execute_command",
+        "novel_status", "novel_wordcount", "novel_audit",
+    }),
+    "review": _SUBAGENT_READ_ONLY_TOOLS,
+    "general": None,
+}
+
+
+def default_subagent_allowed_tools(role: str):
+    """内置角色默认工具白名单；未知角色按 general 处理（不限定）。"""
+    return _SUBAGENT_DEFAULT_ALLOWED_TOOLS.get(role, None)
+
+
 def _agent_display_name() -> str:
     """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
 
@@ -4331,29 +4366,11 @@ class SubagentManager:
             custom_system_prompt = ""
             custom_allowed_tools = None
 
-        default_allowed_tools = {
-            "explore": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "search_news", "fetch_url", "get_weather",
-            },
-            "implement": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "search_news", "fetch_url", "get_weather", "write_file",
-                "edit_file", "execute_command",
-            },
-            "test": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "execute_command",
-            },
-            "review": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "search_news", "fetch_url", "get_weather",
-            },
-            "general": None,
-        }
+        # 白名单定义在模块级 _SUBAGENT_DEFAULT_ALLOWED_TOOLS，便于单测直接断言
+        # 角色工具面（曾因局部硬编码遗漏 novel_audit 等只读插件工具导致计划死锁）。
         allowed_tools = (
             custom_allowed_tools if custom_allowed_tools is not None
-            else default_allowed_tools[role]
+            else default_subagent_allowed_tools(role)
         )
         # 自定义子 agent 的系统提示词优先；未配置时用内置 role_instructions
         instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]

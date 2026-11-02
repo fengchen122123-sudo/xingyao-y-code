@@ -950,8 +950,8 @@ class ToolPipeline:
             item.get("status") == "completed" for item in snapshot
         ):
             # 计划在同一回合内被清空，或所有项都已完成时，门禁失去意义。
-            # completed 项不能 plan_retry，必须放行主 Agent 核查/补救错误完成；
-            # failed/blocked/cancelled 项仍保持门禁，通过 plan_retry 正规恢复。
+            # completed 项可用 plan_retry 重开（子代理误报完成时），
+            # failed/blocked/cancelled 项通过 plan_retry 正规恢复。
             return None
         # 主 Agent scoped 接管放行：仅当存在归属当前回合的 active 接管项时，
         # 才允许主 Agent 直接调用任务工具继续该计划项；旧分支
@@ -967,6 +967,24 @@ class ToolPipeline:
         if ready:
             hints = ", ".join(f"'{item['id']}'({item['subject']})" for item in ready[:5])
             ready_hints = f" 当前可执行的计划项: [{hints}]。"
+        else:
+            # 没有可执行项时，光说“走 run_subagent”等于把模型留在原地打转：
+            # 必须指名卡住的项和唯一的恢复动作，否则模型会反复重试同一个被拒工具。
+            stalled = [
+                item
+                for item in snapshot
+                if item.get("status") in {"failed", "blocked", "cancelled", "completed"}
+            ]
+            if stalled:
+                names = ", ".join(
+                    f"'{item['id']}'({item.get('status')})" for item in stalled[:5]
+                )
+                ready_hints = (
+                    f" 当前没有可执行的计划项；不可直接执行的项: [{names}]。"
+                    "failed/blocked/cancelled/completed 项请先用 plan_retry 重置为 pending"
+                    "（被取消的 input_preparation 项重置后用 ask_user 重新提问），"
+                    "再用 run_subagent 执行。"
+                )
         return (
             f"{_PLAN_BYPASS_ERROR_PREFIX} {name} 必须通过 run_subagent(plan_item_id=...) 执行，"
             f"不能由主 Agent 直接绕过计划调用。{ready_hints}"
