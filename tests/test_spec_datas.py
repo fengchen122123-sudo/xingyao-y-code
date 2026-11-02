@@ -31,9 +31,6 @@ REQUIRED_TWO_TUPLE_DATAS = [
     ('vendor/mermaid/mermaid-11.17.2.min.js', 'vendor/mermaid'),
     ('frontend/dist', 'frontend/dist'),
     ('frontend-mobile/dist', 'frontend-mobile/dist'),
-    # 画布子应用（Excalidraw）：必须整目录随包到 _MEIPASS/frontend-canvas/dist，
-    # 否则安装后点开画布只会提示「画布子应用未构建」（canvas_dist_root() 定位规则）。
-    ('frontend-canvas/dist', 'frontend-canvas/dist'),
     ('frontend/mobile-shim.js', 'frontend'),
     ('skills', 'skills'),
     ('plugins', 'plugins'),

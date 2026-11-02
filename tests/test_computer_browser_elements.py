@@ -341,6 +341,35 @@ def test_click_element_hits_locator_selector(backend):
     assert page.last_locator.click_calls[0]["timeout"] == 10_000
 
 
+def test_click_element_uses_visual_hit_point(backend):
+    """E3：inline 元素自身盒退化时，按「视觉并集中心」用鼠标坐标点击。
+
+    回归场景：line-height:0 的 <a> 包一张 16px 图片，自身 rect 只有 1px 高、
+    中心不在图片上；旧实现 locator.click() 点空，游戏/网格类页面完全无响应。
+    """
+    _prepare_element(backend)
+    page = backend.active_page
+    page.element_hit_result = {
+        "x": 712, "y": 469, "contains": True, "inViewport": True,
+    }
+    backend.execute("run-a", parse_computer_action(_click_payload()))
+    assert ("click", 712, 469, "left") in page.mouse.calls
+    # 视觉点命中后不再走 locator.click（避免重复点击）
+    assert page.last_locator.click_calls == []
+
+
+def test_click_element_falls_back_when_visual_point_missed(backend):
+    """视觉点被遮挡/出视口时回落 locator.click，保留原有可点击性语义。"""
+    _prepare_element(backend)
+    page = backend.active_page
+    page.element_hit_result = {
+        "x": 10, "y": 10, "contains": False, "inViewport": True,
+    }
+    backend.execute("run-a", parse_computer_action(_click_payload()))
+    assert page.mouse.calls == []
+    assert len(page.last_locator.click_calls) == 1
+
+
 def test_set_value_element_fill_success(backend):
     """set_value_element 主路径：fill 直接设值（中文不过输入法）。"""
     _prepare_element(backend, kind="textbox", name="用户名")

@@ -72,10 +72,26 @@ def test_normal_frame_pairs_text_and_image(tmp_path):
     )
 
     assert message["content"][0]["text"] == provider_generic.OBSERVATION_FOLLOWUP_TEXT
-    # 无控件列表：说明文本之后是定位提示，图片始终在最后一块
-    assert message["content"][1]["text"] == provider_generic._OBSERVATION_REGION_HINT
+    # 无控件列表：说明文本之后是定位提示，图片始终在最后一块。
+    # 提示按 target 区分（E3）：browser 没有 observe_region，不能提示放大局部。
+    assert message["content"][1]["text"] == provider_generic._OBSERVATION_BROWSER_POINT_HINT
     assert message["content"][-1]["type"] == "image_url"
     assert message["content"][-1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_desktop_normal_frame_keeps_region_hint(tmp_path):
+    """desktop 无控件列表时保留 observe_region 放大提示（旧契约不变）。"""
+    from dataclasses import replace
+
+    observation = replace(
+        _observation(tmp_path, screen_sha="deadbeef" + "0" * 56), target="desktop"
+    )
+
+    message = provider_generic._observation_followup_message(
+        observation, run_id="run-1", ordinal=1
+    )
+
+    assert message["content"][1]["text"] == provider_generic._OBSERVATION_REGION_HINT
 
 
 def test_oversize_frame_falls_back_to_text(tmp_path, monkeypatch):

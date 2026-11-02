@@ -12,38 +12,13 @@
     data-test="canvas-pane-root"
     :style="gridVars"
   >
+    <!-- 画布只有一种形态：节点画布（vue-flow）。原 Excalidraw「自由画布」档已移除
+         ——要的是「A 图改出 B 图、两图连线」的素材链路，纯涂画板与之无关 -->
     <!-- 只有页签真正被激活过才挂载 vue-flow：它会注册全局 store、ResizeObserver
          和 window resize 监听，用户没打开过画布页签时不该付这份初始化的代价。
          挂载后不再卸载，避免来回切页签时丢视口位置 -->
-    <!-- 档位切换：左上角悬浮。默认进「自由画布」——用户明确表示原有节点画布
-         不是想要的形态，所以自由画布才是主入口，节点画布降为第二档保留能力 -->
-    <div class="cv-tools" data-test="canvas-tools">
-      <button
-        v-for="mode in canvasModes"
-        :key="mode.value"
-        class="cv-mode"
-        :class="{ 'cv-mode-on': canvasMode === mode.value }"
-        :data-test="`canvas-mode-${mode.value}`"
-        :title="mode.title"
-        @click="canvasMode = mode.value"
-      >{{ mode.label }}</button>
-    </div>
-
-    <!-- Excalidraw 自由画布：首次进入才挂载（v-if + hasOpenedFree），之后只切
-         显示状态。21MB 静态资源与一整套 React 运行时，用户只看节点画布时不该
-         为它付下载与初始化成本 -->
-    <ExcalidrawHost
-      v-if="hasOpenedFree"
-      v-show="canvasMode === 'free'"
-      class="cv-free"
-      data-test="canvas-free"
-    />
-
-    <!-- 节点画布用 v-show 而不是 v-if：vue-flow 卸载会丢掉视口位置（用户来回切
-         一次档位就得重新拖动定位），保持挂载只隐藏最省心 -->
     <VueFlow
       v-if="flowReady"
-      v-show="canvasMode === 'node'"
       id="canvas-flow"
       class="cv-flow"
       data-test="canvas-flow"
@@ -57,14 +32,14 @@
       @pane-click="onPaneClick"
       @node-click="onNodeClick"
       @node-drag-stop="onNodeDragStop"
+      @connect="onConnect"
+      @edge-double-click="onEdgeDoubleClick"
     />
     <div v-else class="cv-idle">画布尚未激活</div>
 
     <!-- 缩放控件自己画：vue-flow 的 Controls 组件用的是它自带的浅色主题，
-         与本项目的 CSS 变量体系对不上，自绘只花二十行还能跟着主题走。
-         只在节点画布显示：百分比读的是 vue-flow 视口，而自由画布档位下
-         Excalidraw 自带一套缩放 UI，这条留着只会叠在它的工具条上 -->
-    <div v-show="canvasMode === 'node'" class="cv-zoom" data-test="canvas-zoom">
+         与本项目的 CSS 变量体系对不上，自绘只花二十行还能跟着主题走 -->
+    <div class="cv-zoom" data-test="canvas-zoom">
       <button class="cv-zbtn" data-test="canvas-zoom-out" title="缩小" @click="zoomOut()">－</button>
       <span class="cv-zval">{{ zoomPercent }}%</span>
       <button class="cv-zbtn" data-test="canvas-zoom-in" title="放大" @click="zoomIn()">＋</button>
@@ -77,11 +52,8 @@
 
     <!-- 最近产出托盘（左下角）：对话里直接生成的图先停在这里，用户点哪张才落哪张。
          没有内容时整块不渲染，空白浮层会平白挡住画布左下角的节点 -->
-    <!-- 托盘里的图点一下会落成 vue-flow 节点；自由画布档位下没有节点可落，
-         留着会让用户点了没反应，所以只在节点画布显示 -->
     <div
       v-if="recentOutputs.length"
-      v-show="canvasMode === 'node'"
       class="cv-tray"
       data-test="canvas-recent-tray"
     >
@@ -124,7 +96,9 @@ import { computed, defineComponent, h, markRaw, ref, watch, type Component } fro
 import {
   VueFlow,
   useVueFlow,
+  type Connection,
   type Edge,
+  type EdgeMouseEvent,
   type Node,
   type NodeMouseEvent,
   // 仅类型：NodeTypesObject 由包内 ./types 汇总导出，被 index.d.ts 的 `export *` 带出；
@@ -146,7 +120,6 @@ import PromptNode from './nodes/PromptNode.vue';
 import GenerateNode from './nodes/GenerateNode.vue';
 import { fileBaseName, type NodeActionPayload } from './nodes/types';
 import CanvasDock from './CanvasDock.vue';
-import ExcalidrawHost from './ExcalidrawHost.vue';
 // 会话名 / 提示文案都从 appStore 拿：appStore 只单向引用 canvas store，
 // 这里反向引用 appStore 不会成环（canvas store 自身不 import 任何 store）
 import { useAppStore } from '../stores/appStore';
@@ -157,31 +130,9 @@ const props = defineProps<{ active: boolean }>();
 const store = useCanvasStore();
 const appStore = useAppStore();
 
-/**
- * 档位：free = Excalidraw 自由画布，node = 原有 vue-flow 节点画布。
- * 默认 free：用户明确说过现有节点画布不是想要的效果，自由画布才是主入口；
- * 节点画布的能力（历史演示图、托盘落图、缩放同步）原样保留，只是退到第二档。
- */
-type CanvasMode = 'free' | 'node';
-const canvasMode = ref<CanvasMode>('free');
-const canvasModes: { value: CanvasMode; label: string; title: string }[] = [
-  { value: 'free', label: '自由画布', title: 'Excalidraw 自由涂画（默认）' },
-  { value: 'node', label: '节点画布', title: '节点连线式工作台' },
-];
-
-/**
- * 自由画布是否已经进入过一次：进入过就保持挂载，之后靠 v-show 切换。
- * 不一开始就挂载是刻意的——iframe 里是 21MB 独立子应用，用户只想看节点画布时
- * 不该为它付下载与初始化时间。
- */
-const hasOpenedFree = ref(false);
-watch(
-  canvasMode,
-  (mode) => {
-    if (mode === 'free') hasOpenedFree.value = true;
-  },
-  { immediate: true },
-);
+// 画布只有节点画布一种形态（原 Excalidraw 自由画布档已移除）：
+// 对话产出的图 → 落成图片节点 → 送去修改 → 新图自动接「改图」边，
+// 这条链路全部由 canvas store 承担，组件层不再需要档位状态。
 
 // 显式传 id：让下面这行 useVueFlow 拿到的 store 与 <VueFlow id="canvas-flow">
 // 内部实例是同一个，否则两边各建一个实例，缩放进度同步不上
@@ -451,6 +402,23 @@ function onPaneClick() {
   // 点空白处取消选中
   store.selectNode(null);
 }
+
+/**
+ * 用户拖端口手动连线：源节点右侧出点 → 目标节点左侧入点。
+ * 合法性（自环 / 重复边 / 端点不存在）全部复用 store.addEdge 的校验，
+ * 它返回 null 时必须给出可见提示——拖完什么都没发生是最难自诊断的交互。
+ */
+function onConnect(conn: Connection): void {
+  if (!conn.source || !conn.target) return;
+  const edge = store.addEdge(conn.source, conn.target, '关联');
+  if (!edge) showTip('这两张图已经关联过了，或不能连到自己');
+}
+
+/** 双击连线删除关联：手连错了总得有路可退，不必删节点重建 */
+function onEdgeDoubleClick({ edge }: EdgeMouseEvent): void {
+  store.removeEdge(edge.id);
+  showTip('已删除这条关联');
+}
 </script>
 
 <style scoped>
@@ -480,55 +448,6 @@ function onPaneClick() {
   justify-content: center;
   color: var(--text-faint);
   font-size: 12px;
-}
-
-/* 自由画布宿主：撑满剩余高度（iframe 内部自己滚动，外层不给滚动条） */
-.cv-free {
-  flex: 1;
-  min-height: 0;
-}
-
-/* 档位切换条：左上角悬浮，和右下角缩放控件共用一套"浮在画布上"的语言。
-   用 absolute 而不是 fixed——右面板分区有 isolation，fixed 会被其它分区的
-   层叠上下文盖住；z-index 高于画布本身，低于告警浮层（.cv-tip 是 4） */
-.cv-tools {
-  position: absolute;
-  left: 10px;
-  top: 10px;
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  padding: 3px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  /* 半透明 + 模糊：自由画布档位下这块直接压在 Excalidraw 的画布上，
-     实底会像贴了一块膏药；节点画布档位下观感与原来的缩放条一致 */
-  background: color-mix(in srgb, var(--bg2) 92%, transparent);
-  backdrop-filter: blur(6px);
-}
-.cv-mode {
-  height: 22px;
-  padding: 0 10px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: 11.5px;
-  line-height: 1;
-  cursor: pointer;
-  transition: 0.15s;
-}
-.cv-mode:hover {
-  background: var(--bg3);
-  color: var(--text-bright);
-}
-/* 选中档位：与工具栏里其它按钮的"点亮"语感一致（accent 描边 + 柔光底） */
-.cv-mode-on {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  background: var(--accent-soft);
-  color: var(--accent);
 }
 
 /* 连线样式：.vue-flow__edge-path 由库内部渲染，scoped 下必须用 :deep 才能命中。

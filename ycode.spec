@@ -113,18 +113,6 @@ common_datas = [
     # _serve_mobile_static() 在打包环境从 _MEIPASS/frontend-mobile/dist 读取；
     # 缺失时手机扫码打开 /m/ 路径会 404（经典界面不受影响）
     ('frontend-mobile/dist', 'frontend-mobile/dist'),
-    # 画布子应用（Excalidraw，独立 React 子应用）：core/media_server.py 的
-    # canvas_dist_root() 在打包环境从 _MEIPASS/frontend-canvas/dist 读静态资源
-    # （index.html / assets / fonts / locales），由 gui_canvas_mixin 用 iframe 挂进
-    # 主界面右边栏。**必须整目录递归随包**：只带 index.html 会让子应用缺 JS/CSS/
-    # 字体/多语言包而白屏。缺失时点开画布直接提示「画布子应用未构建」——这是
-    # 打包版专属故障（源码仓库里开发者自己跑过 npm build，看不出问题），因此
-    # 这里与 frontend/dist 保持同一写法：源与 dest 都是两级相对路径
-    # 'frontend-canvas/dist'（canvas_dist_root() 硬编码了这两级结构，不能拍平）。
-    # 注意该目录被 .gitignore 的 dist/ 规则忽略，仓库里没有副本：构建前必须先执行
-    # npm --prefix frontend-canvas run build（build_release.py 的
-    # step0c_build_canvas 已自动化，见该函数注释）。
-    ('frontend-canvas/dist', 'frontend-canvas/dist'),
     # 手机远程控制传输 shim：LAN server 注入到手机端页面 <head>，
     # _serve_shim() 在打包环境从 _MEIPASS/frontend/ 读取；缺失时手机端
     # window.pywebview 永不注入，前端 30s 轮询超时后弹「pywebview API 不可用」

@@ -146,7 +146,10 @@ ELEMENT_COLLECT_SCRIPT = """() => {
   ].join(',');
 
   const MAX_NAME = 80;
-  const MAX_ELEMENTS = 200;
+  // 500 而不是 200：网格型页面（扫雷/表格/日历）一个盘面就有 256~480 个
+  // 可点击单元，200 会在盘面中部截断，模型永远点不到下半部分；500 覆盖
+  // 常见网格整盘，普通页面元素数远小于此，不受影响。
+  const MAX_ELEMENTS = 500;
 
   // ---- 可见性判定 ----
   // 优先用 checkVisibility()（现代 Chromium 支持，含祖先隐藏判定）；
@@ -226,12 +229,33 @@ ELEMENT_COLLECT_SCRIPT = """() => {
     return '';
   }
 
+  // ---- 视觉可点击区域（E3 修复） ----
+  // inline 元素（典型：line-height:0 的 <a> 包一张 <img>）自身的 border box
+  // 会退化成一整行 0~1px 高、并且落在图片基线下方——它既不覆盖图片，中心点
+  // 也不在图片上。按自身 rect 报 bounds 会让模型/click_element 系统性地点空
+  // （实测扫雷：a 的 rect 是 39x1、y 比格子底边还低 1px，点击后游戏毫无反应）。
+  // 因此 bounds 取「自身矩形 ∪ 可见图标类后代矩形」，即用户实际看到的、
+  // 鼠标能命中的那块区域。
+  function hitRect(el, rect) {
+    let left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom;
+    for (const child of el.querySelectorAll('img, svg, canvas, video')) {
+      const r = child.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      if (r.left < left) left = r.left;
+      if (r.top < top) top = r.top;
+      if (r.right > right) right = r.right;
+      if (r.bottom > bottom) bottom = r.bottom;
+    }
+    return { left: left, top: top, right: right, bottom: bottom };
+  }
+
   const out = [];
   let counter = 0;
   for (const el of document.querySelectorAll(SEL)) {
     if (counter >= MAX_ELEMENTS) break;
-    const rect = el.getBoundingClientRect();
-    if (!isVisible(el) || !inViewport(rect)) continue;
+    const rawRect = el.getBoundingClientRect();
+    if (!isVisible(el) || !inViewport(rawRect)) continue;
+    const rect = hitRect(el, rawRect);
     counter += 1;
     const ref = 'el-' + counter;
     el.setAttribute('data-ycode-ref', ref);
@@ -249,6 +273,39 @@ ELEMENT_COLLECT_SCRIPT = """() => {
     });
   }
   return out;
+}"""
+
+
+# E3（2026-11-02）元素点击点：按「视觉可点击区域」的中心点点击。
+# 为什么需要：click_element 之前用 locator.click()，Playwright 点的是元素自身
+# border box 的中心；对 line-height:0 的 inline <a>（典型的老式图片链接、网格
+# 游戏格子）这个中心会落在图标之外——实测扫雷页面 a 的 box 是 39x1、y 在 16px
+# 格子底边以下，点击后游戏毫无反应。这里实时计算「自身 ∪ 图标类后代」的并集
+# 中心，并用 elementFromPoint 复核该点确实命中元素本身或后代，命中才用鼠标
+# 点击；否则（被遮挡/已滚出视口）回落 locator.click 保留原有可点击性语义。
+ELEMENT_HIT_SCRIPT = """(ref) => {
+  const el = document.querySelector('[data-ycode-ref="' + CSS.escape(ref) + '"]');
+  if (!el) return null;
+  const base = el.getBoundingClientRect();
+  let left = base.left, top = base.top, right = base.right, bottom = base.bottom;
+  for (const child of el.querySelectorAll('img, svg, canvas, video')) {
+    const r = child.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    if (r.left < left) left = r.left;
+    if (r.top < top) top = r.top;
+    if (r.right > right) right = r.right;
+    if (r.bottom > bottom) bottom = r.bottom;
+  }
+  if (!(right > left && bottom > top)) return null;
+  const x = Math.round((left + right) / 2);
+  const y = Math.round((top + bottom) / 2);
+  const hit = document.elementFromPoint(x, y);
+  return {
+    x: x,
+    y: y,
+    contains: !!(hit && (hit === el || el.contains(hit))),
+    inViewport: x >= 0 && y >= 0 && x < innerWidth && y < innerHeight
+  };
 }"""
 
 
@@ -1604,6 +1661,8 @@ class BrowserComputerBackend:
             # 旧引用由 stale 校验拒绝）。
             elements = ()
         # 只有真正拿到 PNG 才落盘：降级路径不写文件、也绝不复用任何旧截图。
+        if png_bytes:
+            png_bytes = self._normalize_frame(png_bytes, page)
         path = self._store_screenshot(png_bytes) if png_bytes else None
         if self._observed_page_token != page_token:
             self._surface_generation += 1
@@ -1641,6 +1700,15 @@ class BrowserComputerBackend:
             "scale_x": 1.0,
             "scale_y": 1.0,
         }
+
+    def _normalize_frame(self, png_bytes: bytes, page) -> bytes:
+        """截图后、落盘前的帧归一化钩子：默认原样返回。
+
+        CDP 模式（内置 WebView2）覆写它，把截图重采样到 CSS 视口尺寸，保证
+        「模型看到的图片坐标 = 动作坐标」——否则高 DPI 下 PNG 是 视口×dpr，
+        模型按图片给的坐标会被当成 CSS 坐标直接点击，越往右下偏得越多。
+        """
+        return png_bytes
 
     def _cmd_execute(self, run_id: str, action: ComputerAction) -> None:
         if action.target != "browser":
@@ -1891,8 +1959,28 @@ class BrowserComputerBackend:
         与桌面元素动作错误码对齐。
         """
         locator = page.locator(f'[data-ycode-ref="{element_ref}"]')
+        # E3：优先点「视觉可点击区域」中心。老式 inline 链接的自身盒可能退化
+        # 成 1px 高且不覆盖图标，locator.click 会点空；实时求并集中心并复核
+        # 命中后走鼠标坐标点击，命中失败才回落 locator.click（保留自动等待与
+        # 可点击性检查）。求值失败一律回落，不让新路径成为新的失败面。
+        timeout = self._element_action_timeout_ms()
+        point = None
         try:
-            locator.click(timeout=self._element_action_timeout_ms())
+            point = page.evaluate(ELEMENT_HIT_SCRIPT, element_ref)
+        except Exception:
+            point = None
+        if (
+            isinstance(point, dict)
+            and point.get("contains")
+            and point.get("inViewport")
+        ):
+            try:
+                page.mouse.click(int(point["x"]), int(point["y"]))
+                return
+            except Exception as error:
+                self._raise_element_action_error(locator, element_ref, "点击", error)
+        try:
+            locator.click(timeout=timeout)
         except Exception as error:
             self._raise_element_action_error(locator, element_ref, "点击", error)
 

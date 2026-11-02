@@ -52,12 +52,12 @@ def parse_args():
     )
     parser.add_argument(
         "--skip-frontend", action="store_true",
-        help="跳过前端构建步骤，直接复用现有的 frontend/dist 与 frontend-canvas/dist 产物"
-             "（不存在也不会报错，但生成的 GUI 版启动后将无法加载界面，画布也会提示未构建）。",
+        help="跳过前端构建步骤，直接复用现有的 frontend/dist 产物"
+             "（不存在也不会报错，但生成的 GUI 版启动后将无法加载界面）。",
     )
     parser.add_argument(
         "--rebuild-frontend", action="store_true",
-        help="强制重新执行 npm run build（主前端与画布子应用），即使 dist/index.html 已经存在。",
+        help="强制重新执行 npm run build（主前端），即使 dist/index.html 已经存在。",
     )
     parser.add_argument(
         "--cli-only", action="store_true",
@@ -630,69 +630,6 @@ def step0_build_frontend(project_dir, args):
         print("❌ 移动端构建完成但未生成 frontend-mobile/dist/index.html，请检查 vite 配置。")
         sys.exit(1)
     print(f"✅ 移动端构建成功: {mobile_index}")
-
-
-def step0c_build_canvas(project_dir, args):
-    """构建 / 复用画布子应用产物 (frontend-canvas/dist)。
-
-    为什么必须有这一步：画布（Excalidraw）是独立构建的 React 子应用，它不打进
-    主前端 bundle，而是由 core/media_server.py 的 canvas_dist_root() 在运行期从
-    _MEIPASS/frontend-canvas/dist 读静态资源、再由 gui_canvas_mixin 用 iframe 挂进
-    主界面右边栏；ycode.spec 的 datas 也只是把这个目录原样拷进安装包。
-    该 dist 被 .gitignore 的 dist/ 规则忽略，仓库里没有副本 —— 不先构建就打包，
-    安装后的应用点开画布只会显示「画布子应用未构建」。这与 frontend/dist、
-    frontend-mobile/dist 是同一类问题，故按同样方式在打包前自动构建。
-
-    与 step0_build_frontend 的关系：独立成函数、由 build() 在该步骤之后无条件调用。
-    不写进 step0_build_frontend 内，是因为那个函数在「复用已有前端产物」时会直接
-    return（早退），加在它末尾的新步骤会被一起跳过；画布构建必须不受此影响。
-    """
-    print("\n[步骤 0.9/5] 构建 / 复用画布子应用产物 (frontend-canvas/dist)...")
-    canvas_dir = os.path.join(project_dir, "frontend-canvas")
-    canvas_dist = os.path.join(canvas_dir, "dist")
-    canvas_index = os.path.join(canvas_dist, "index.html")
-
-    if args.skip_frontend:
-        print("ℹ 已指定 --skip-frontend，同步跳过画布子应用构建。")
-        # ycode.spec 的 datas 把 frontend-canvas/dist 整个目录当源，目录本身必须
-        # 存在，否则 PyInstaller 会在 Analysis 阶段直接报错退出（与 frontend/dist
-        # 的处理方式一致）。
-        os.makedirs(canvas_dist, exist_ok=True)
-        if not os.path.exists(canvas_index):
-            print("⚠️ frontend-canvas/dist/index.html 不存在：打包后点开画布会提示"
-                  "「画布子应用未构建」，请手动执行 npm --prefix frontend-canvas run build。")
-        return
-
-    if os.path.exists(canvas_index) and not args.rebuild_frontend:
-        print(f"✅ 已检测到画布子应用产物: {canvas_index}（如需强制重新构建，请加上 --rebuild-frontend）。")
-        return
-
-    if not os.path.isdir(canvas_dir):
-        print(f"❌ 未找到画布子应用项目目录: {canvas_dir}")
-        sys.exit(1)
-
-    npm_bin = shutil.which("npm")
-    if npm_bin is None:
-        print("❌ PATH 环境变量中未找到 npm，无法构建画布子应用。")
-        sys.exit(1)
-    if not os.path.isdir(os.path.join(canvas_dir, "node_modules")):
-        print("🚀 画布子应用依赖缺失，正在执行 npm install ...")
-        install = subprocess.run([npm_bin, "install", "--no-audit", "--no-fund"], cwd=canvas_dir)
-        if install.returncode != 0:
-            print("❌ 画布子应用 npm install 失败。")
-            sys.exit(1)
-
-    print("🚀 正在执行画布子应用 npm run build ...")
-    # 该包的 prebuild 会先跑 scripts/sync-excalidraw-assets.mjs 同步 Excalidraw 的
-    # 字体/多语言资源到 dist，因此这里只调 build 即可（与 package.json 保持一致）。
-    result = subprocess.run([npm_bin, "run", "build"], cwd=canvas_dir)
-    if result.returncode != 0:
-        print(f"❌ 画布子应用构建失败（npm run build 退出码 {result.returncode}）。")
-        sys.exit(1)
-    if not os.path.exists(canvas_index):
-        print("❌ 画布子应用构建完成但未生成 frontend-canvas/dist/index.html，请检查 vite 配置。")
-        sys.exit(1)
-    print(f"✅ 画布子应用构建成功: {canvas_index}")
 
 
 # ============================================================================
@@ -1415,10 +1352,6 @@ def build():
             "vendor 随包资源校验",
         )
         step0_build_frontend(project_dir, args)
-        # 画布子应用（frontend-canvas/dist）独立于主前端构建，必须在打 spec 之前
-        # 产出：否则安装包里的 _MEIPASS/frontend-canvas/dist 为空，用户点开画布
-        # 只会看到「画布子应用未构建」。
-        step0c_build_canvas(project_dir, args)
         # playwright / ffmpeg / 网页搜索与安装包分离发布：组件包必须与同版本主安装包
         # 一起上传 Gitee Release（ffmpeg 缺失时 step0d 只告警，不阻断构建）
         step0b_build_playwright_component(project_dir)

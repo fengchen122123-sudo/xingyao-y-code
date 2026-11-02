@@ -263,6 +263,21 @@ _OBSERVATION_REGION_HINT = (
     "点击，不要凭整屏截图目测坐标。"
 )
 
+# 浏览器 target 的定位提示（E3 修复）：observe_region 只支持 desktop，浏览器
+# 没有局部放大动作；旧文案对 browser 一视同仁，模型照做只会拿到
+# computer_invalid_action。浏览器只能看整屏图，因此提示强调"坐标以截图为准"。
+_OBSERVATION_BROWSER_POINT_HINT = (
+    "【定位提示】本页没有可用的元素引用，请依据这张整屏截图判断位置，"
+    "坐标以截图左上角为 (0,0)，不要凭记忆复用旧坐标。"
+)
+
+# 「密集无名元素」判定阈值（元素数下限）：低于这个数量时逐行清单仍然便宜且
+# 有参考价值；超过它再叠加"命名元素占比 ≤20%"才判为清单无信息量。
+_DENSE_ELEMENT_MIN_COUNT = 60
+# 硬上限：元素多到这个量级时，即使都有名字，逐行清单也会把上下文吃掉，
+# 一律退化为「截图为主 + 显式 observe 可取全量」。
+_DENSE_ELEMENT_HARD_CAP = 300
+
 # 帧契约（2026-10-21，借 zcode frame-contract 的「体积上限 + 成对引用」思路）：
 # 单张观察图进上下文前必须有字节上限，否则长回合里截图会累积吃干上下文。
 # 2MB 是权衡值——1280 宽的界面截图 PNG 通常 100~600KB，超限基本意味着高分屏
@@ -435,12 +450,41 @@ def _elements_content_blocks(element_lines: list[str]) -> list[dict]:
     ]
 
 
+def _is_dense_unnamed_elements(elements) -> bool:
+    """密集且几乎无名的元素列表 → 逐行清单信息量极低。
+
+    图片型/自绘界面（老式图片网格游戏、canvas 外壳里的空链接）会一次返回
+    上百个 name='' 的元素：清单既定位不了"哪个格子是哪一格"，又每步吞掉大量
+    上下文，还把模型从"看图判断"引向"按 bounds 猜"。这类列表改为以截图为主，
+    只在显式 observe 时保留清单。
+    """
+    items = list(elements or ())
+    if len(items) >= _DENSE_ELEMENT_HARD_CAP:
+        # 元素本身已经多到一行一行发就会吃掉大部分上下文：不论有没有名字
+        # 都退化为「截图为主」，显式 observe 仍可取回完整清单。
+        return True
+    if len(items) < _DENSE_ELEMENT_MIN_COUNT:
+        return False
+    named = sum(1 for item in items if str(item.get("name") or "").strip())
+    return named * 5 <= len(items)
+
+
+def _dense_elements_note(count: int) -> str:
+    """密集无名元素时的替代说明：不给逐行清单，明确让模型看图/用坐标。"""
+    return (
+        f"【电脑观察·控件列表】本页 {count} 个可交互元素且几乎没有名称"
+        "（图片型/自绘界面），本次已省略逐行清单；请依据截图判断局面，"
+        "坐标以这张截图左上角为 (0,0)。需要精确点击密集小目标时，"
+        "显式调用 observe 可取回完整控件列表（el-N 引用）。"
+    )
+
+
 def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> dict:
     """观察的 follow-up user 消息（设计 10.2 + 阶段二双路径 + 帧契约）。
 
     四条路径按优先级：
-    1. 有 elements 且不是显式 observe：纯文本控件列表（a11y-first，请求不含
-       截图字节）；
+    1. 有 elements 且不是显式 observe、且不是「密集无名」：纯文本控件列表
+       （a11y-first，请求不含截图字节）；
     2. 画面与上一张完全相同（screen_unchanged 且不是显式 observe）：纯文本
        说明，不重复附图；
     3. 本次没有截图（png_path 为空，B 方案降级：窗口被遮挡/最小化导致截图
@@ -448,8 +492,12 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
        仍附控件列表（否则模型既没图也没 el-N 引用）；
     4. 其余：PNG 转 data:image/png;base64；显式 observe 有 elements 时先给
        控件列表再附图，受体积上限约束——超限先缩放，缩放后仍超限则退化为
-       纯文摘略（带控件列表）。无 elements 时在附图前追加放大局部的定位
-       提示（_OBSERVATION_REGION_HINT），避免模型凭整屏截图目测小控件。
+       纯文摘略（带控件列表）。无 elements 时按 target 追加定位提示：
+       desktop 引导 observe_region 放大局部，browser 只能看整屏图，改为明确
+       坐标语义（避免模型对 browser 调用 desktop 专属动作）。
+
+    密集无名元素（图片型/网格界面）走附图路径但不带逐行清单：这类页面必须
+    靠看图判断，纯 bounds 清单既看不懂也点不准；显式 observe 例外，仍给全量。
 
     tool result JSON、metadata 与日志绝不携带截图字节。_computer_v1 为私有
     元数据（run_id/ordinal/target，必要时带 image_omitted 原因）。
@@ -460,10 +508,25 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
         "target": observation.target,
     }
     frame_line = _frame_reference_line(observation)
+    elements = getattr(observation, "elements", ()) or ()
     element_lines = _element_lines(observation)
+    dense_unnamed = _is_dense_unnamed_elements(elements)
+    # 密集无名列表在「动作后的自动观察」里不逐行输出（每步几百行会吞掉大量
+    # 上下文），但显式 observe 是模型主动要看，必须给全，否则它永远拿不到
+    # el-N 引用、只能靠目测坐标点 16px 格子。
+    if dense_unnamed and getattr(observation, "action", "") != "observe":
+        list_blocks = [
+            {"type": "text", "text": _dense_elements_note(len(element_lines))}
+        ]
+    else:
+        list_blocks = _elements_content_blocks(element_lines)
     # 显式 observe 例外：模型主动要看画面时必须给图，同时保留控件列表，
     # 让它「看图认位置、用 el-N 精确点击」，而不是退回目测坐标。
-    if element_lines and getattr(observation, "action", "") != "observe":
+    if (
+        element_lines
+        and getattr(observation, "action", "") != "observe"
+        and not dense_unnamed
+    ):
         return {
             "role": "user",
             "content": _elements_content_blocks(element_lines),
@@ -484,7 +547,7 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
     if not str(getattr(observation, "png_path", "") or ""):
         return {
             "role": "user",
-            "content": _elements_content_blocks(element_lines) + [
+            "content": list_blocks + [
                 {"type": "text", "text": no_screenshot_observation_text(observation)},
                 {"type": "text", "text": frame_line},
             ],
@@ -498,7 +561,7 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
     if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
         return {
             "role": "user",
-            "content": _elements_content_blocks(element_lines) + [
+            "content": list_blocks + [
                 {
                     "type": "text",
                     "text": f"{_OBSERVATION_IMAGE_OMITTED_TEXT}\n"
@@ -508,13 +571,15 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
             "_computer_v1": {**meta, "image_omitted": "too_large"},
         }
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
-    content = _elements_content_blocks(element_lines)
+    content = list_blocks
     content.append({"type": "text", "text": OBSERVATION_FOLLOWUP_TEXT})
-    # 无控件列表（WebView2/Chromium 的 UIA 树 name 为空或元素过少）时模型只能
-    # 看整屏截图估坐标，32×33 这类小控件必然点偏——此时才追加放大局部的提示。
-    # 有控件列表时不加：模型用 click_element 精确点击即可，加了只白占 token。
+    # 定位提示按 target 区分：observe_region 是 desktop 专属动作，浏览器没有
+    # 局部放大能力（旧文案会让模型对 browser 调用它并直接吃 invalid_action）。
     if not element_lines:
-        content.append({"type": "text", "text": _OBSERVATION_REGION_HINT})
+        if observation.target == "browser":
+            content.append({"type": "text", "text": _OBSERVATION_BROWSER_POINT_HINT})
+        else:
+            content.append({"type": "text", "text": _OBSERVATION_REGION_HINT})
     content.append({"type": "image_url", "image_url": {"url": data_url}})
     return {
         "role": "user",

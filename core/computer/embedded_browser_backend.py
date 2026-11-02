@@ -11,12 +11,13 @@ Chrome DevTools Protocol「连接」它（playwright chromium.connect_over_cdp�
 
 close()/teardown 只断开 CDP 连接（面板保活）；视口坐标系 = 项目分辨率
 （逻辑像素，由 controller 冻结进 identity），面板以「适应窗口缩放」呈现
-同一逻辑视口，截图 PNG 与坐标空间的 dpr 差异经 observation 的
-original_width/height + scale_x/scale_y 表达。
+同一逻辑视口。高 DPI 下截图是物理像素，由 _normalize_frame 重采样回 CSS
+视口尺寸，保证「模型看到的图片坐标 = 动作坐标」。
 """
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from pathlib import Path
 from core.computer.browser_backend import BrowserComputerBackend
 from core.computer.models import ComputerControlError
 
+_LOGGER = logging.getLogger(__name__)
 _CDP_READY_POLL_INTERVAL = 0.25
 # CDP endpoint 必须是回环地址 + 1-65535 的合法端口
 _CDP_ENDPOINT_PREFIX = "http://127.0.0.1:"
@@ -157,8 +159,15 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
 
     def _observation_viewport(self, page) -> dict:
         """坐标空间 = 页面真实 CSS 视口（innerWidth/innerHeight，即项目分辨
-        率经面板缩放后的逻辑值）；原始像素 = 视口 × devicePixelRatio
-        （ZoomFactor 缩放渲染时 PNG 与逻辑坐标空间存在 dpr 差异）。"""
+        率经面板缩放后的逻辑值）。
+
+        E4（2026-11-02）：高 DPI 下 Playwright 截图是 视口 × devicePixelRatio
+        的物理像素，而 page.mouse 的坐标是 CSS 像素。旧实现把 PNG 原样发给
+        模型、却仍按 CSS 报 width/height，模型照图片给的坐标会被当成 CSS
+        坐标点击（1.25 倍缩放下越往右下偏得越多）。现在由 _normalize_frame
+        把截图重采样到 CSS 视口尺寸，因此 original 与 width 同值、scale=1：
+        图片坐标 = 动作坐标，三方一致。
+        """
         try:
             metrics = page.evaluate(
                 "() => ({ w: window.innerWidth, h: window.innerHeight,"
@@ -166,16 +175,44 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
             )
             width = max(1, int(metrics.get("w") or 0))
             height = max(1, int(metrics.get("h") or 0))
-            dpr = float(metrics.get("dpr") or 1.0)
         except Exception:
             return super()._observation_viewport(page)
         return {
             "width": width,
             "height": height,
-            "original_width": max(1, int(round(width * dpr))),
-            "original_height": max(1, int(round(height * dpr))),
+            "original_width": width,
+            "original_height": height,
             "origin_x": 0,
             "origin_y": 0,
-            "scale_x": dpr,
-            "scale_y": dpr,
+            "scale_x": 1.0,
+            "scale_y": 1.0,
         }
+
+    def _normalize_frame(self, png_bytes: bytes, page) -> bytes:
+        """把截图重采样到 CSS 视口尺寸（见 _observation_viewport 的说明）。
+
+        尽力而为：Pillow 不可用、解码失败或尺寸本来就一致时原样返回——绝不
+        因为重采样失败让整条观察链报错；此时只是退回到旧的高 DPI 坐标风险。
+        """
+        try:
+            import io
+
+            from PIL import Image
+        except Exception:
+            return png_bytes
+        try:
+            viewport = self._observation_viewport(page)
+            width = int(viewport["width"])
+            height = int(viewport["height"])
+            with Image.open(io.BytesIO(png_bytes)) as image:
+                if image.size == (width, height):
+                    return png_bytes
+                resized = image.convert("RGB").resize(
+                    (width, height), getattr(Image, "LANCZOS", 1)
+                )
+                buffer = io.BytesIO()
+                resized.save(buffer, format="PNG", optimize=True)
+                return buffer.getvalue()
+        except Exception:
+            _LOGGER.exception("内置浏览器截图重采样失败，按原图继续观察")
+            return png_bytes

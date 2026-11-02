@@ -196,6 +196,14 @@ export const useCanvasStore = defineStore('canvas', {
       return edge;
     },
 
+    /** 删除一条边（画布上双击边触发）；边不存在时静默返回 */
+    removeEdge(id: string): void {
+      const idx = this.edges.findIndex((e) => e.id === id);
+      if (idx < 0) return;
+      this.edges.splice(idx, 1);
+      this.dirty = true;
+    },
+
     selectNode(id: string | null): void {
       this.selectedNodeId = id;
     },

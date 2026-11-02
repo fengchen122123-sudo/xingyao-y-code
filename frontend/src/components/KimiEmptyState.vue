@@ -383,8 +383,12 @@ function handleKeydown(e: KeyboardEvent) {
 }
 
 /* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
-   侧栏展开挤窄首页卡片时禁止按钮换行，按 .kimi-card 容器宽度分档，
-   档位与对话中输入栏一致：≤540 权限·模型转图标 / ≤430 沙盒收成 开/限 */
+   侧栏/右侧栏展开挤窄首页卡片时禁止按钮换行，按 .kimi-card 容器宽度分档，
+   档位与对话中输入栏一致：≤660 权限·模型转图标 / ≤560 沙盒收成 开/限。
+   阈值必须大于“完整文字形态”的实际所需宽度（约 640px：左组 附件+截图+
+   完全访问+沙盒: 开 ≈292、右组 模型名+思考档位+发送 ≈326、卡片内边距 28）；
+   阈值偏小会留出“文字完整但放不下”的空档，此时 .kimi-bar-left 的
+   overflow:hidden 会把末尾的沙盒胶囊裁得只剩一条边框（成小方块） */
 .kimi-card {
   container-type: inline-size;
   container-name: composer;
@@ -428,7 +432,7 @@ function handleKeydown(e: KeyboardEvent) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-@container composer (max-width: 540px) {
+@container composer (max-width: 660px) {
   .permission-mode-btn .perm-label,
   .permission-mode-btn .permission-chevron,
   .model-chip .model-label,
@@ -440,7 +444,7 @@ function handleKeydown(e: KeyboardEvent) {
     display: inline-flex;
   }
 }
-@container composer (max-width: 430px) {
+@container composer (max-width: 560px) {
   .sandbox-label-full {
     display: none;
   }
@@ -453,7 +457,7 @@ function handleKeydown(e: KeyboardEvent) {
    发送按钮永远留在卡片内：≤400 截图隐藏、思考档位只留图标 /
    ≤340 沙盒隐藏 / ≤290 思考档位隐藏 / ≤210 工具按钮收紧内边距。
    隐藏的开关仍可在设置页与对话中输入栏调整 */
-@container composer (max-width: 400px) {
+@container composer (max-width: 470px) {
   .snip-pill {
     display: none;
   }
@@ -462,17 +466,17 @@ function handleKeydown(e: KeyboardEvent) {
     display: none;
   }
 }
-@container composer (max-width: 340px) {
+@container composer (max-width: 380px) {
   .sandbox-pill {
     display: none;
   }
 }
-@container composer (max-width: 290px) {
+@container composer (max-width: 310px) {
   .kimi-bar-right :deep(.reasoning-button) {
     display: none;
   }
 }
-@container composer (max-width: 210px) {
+@container composer (max-width: 240px) {
   .kimi-card-bar .kimi-bar-left {
     gap: 6px;
   }

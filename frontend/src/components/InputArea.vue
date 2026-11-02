@@ -811,9 +811,13 @@ textarea {
 /* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
    两侧面板展开挤窄输入栏时禁止按钮换行/压成竖条，按 #input-wrap 容器
    宽度分档收纳，任何档位都保持单行：
-   ≤540 权限/模型转手机版纯图标；
-   ≤430 沙盒收成 开/限 */
-@container composer (max-width: 540px) {
+   ≤660 权限/模型转手机版纯图标；
+   ≤560 沙盒收成 开/限。
+   首档阈值必须大于整条工具栏「完整文字形态」的实际所需宽度（约 640px：
+   附件+截图+完全访问+沙盒 ≈292，模型名+思考档位+发送 ≈302，内边距 20），
+   阈值偏小会留出「文字完整但仍放不下」的空档——模型名还完整显示时，
+   末尾的沙盒胶囊已经挤出可视区，只剩一条边框 */
+@container composer (max-width: 660px) {
   .permission-mode-btn .perm-label,
   .permission-mode-btn .permission-chevron,
   .model-chip .model-label,
@@ -825,7 +829,7 @@ textarea {
     display: inline-flex;
   }
 }
-@container composer (max-width: 430px) {
+@container composer (max-width: 560px) {
   .sandbox-label-full {
     display: none;
   }
@@ -835,9 +839,9 @@ textarea {
 }
 /* ── 极窄档：侧栏与右侧栏同时展开时输入栏只剩两百来像素 ──
    按重要性由低到高依次收纳次要入口，任何档位都保持单行、发送按钮不被挤出：
-   ≤400 截图隐藏、思考档位只留图标 / ≤340 沙盒 / ≤300 上下文圆环 / ≤260 思考档位。
+   ≤470 截图隐藏、思考档位只留图标 / ≤380 沙盒 / ≤320 上下文圆环 / ≤300 思考档位。
    隐藏的开关仍可从设置页与首页卡片调整 */
-@container composer (max-width: 400px) {
+@container composer (max-width: 470px) {
   .snip-btn {
     display: none;
   }
@@ -846,17 +850,17 @@ textarea {
     display: none;
   }
 }
-@container composer (max-width: 340px) {
+@container composer (max-width: 380px) {
   .sandbox-btn {
     display: none;
   }
 }
-@container composer (max-width: 300px) {
+@container composer (max-width: 320px) {
   .ctx-ring {
     display: none;
   }
 }
-@container composer (max-width: 260px) {
+@container composer (max-width: 300px) {
   #input-bar :deep(.reasoning-button) {
     display: none;
   }

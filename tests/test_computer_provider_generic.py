@@ -223,6 +223,70 @@ def test_explicit_observe_with_elements_attaches_image_and_position(tmp_path):
     assert "位置=画面右下角" in text
 
 
+def _dense_unnamed_elements(count=80):
+    """构造「密集且几乎无名」的元素列表（图片型/网格游戏页面的典型形态）。"""
+    return tuple(
+        {
+            "ref": f"el-{index}",
+            "kind": "link",
+            "name": "",
+            "bounds": (index, index, index + 16, index + 16),
+            "enabled": True,
+        }
+        for index in range(1, count + 1)
+    )
+
+
+def test_dense_unnamed_elements_after_action_switches_to_image(tmp_path):
+    """E3：密集无名元素在动作后的自动观察里不再逐行塞清单，改以截图为主。"""
+    from PIL import Image
+
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    png = tmp_path / "frame.png"
+    Image.new("RGB", (16, 16), (255, 255, 255)).save(png, format="PNG")
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="browser",
+        action="click_element",
+        png_path=str(png),
+        elements=_dense_unnamed_elements(),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    types = [block["type"] for block in message["content"]]
+    assert "image_url" in types
+    text = "\n".join(
+        block["text"] for block in message["content"] if block["type"] == "text"
+    )
+    assert "已省略逐行清单" in text
+    assert "el-1 link" not in text  # 逐行清单没有混进来
+
+
+def test_dense_unnamed_elements_explicit_observe_keeps_full_list(tmp_path):
+    """显式 observe 是模型主动要看：密集页面也必须给回 el-N 清单。"""
+    from PIL import Image
+
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    png = tmp_path / "frame.png"
+    Image.new("RGB", (16, 16), (255, 255, 255)).save(png, format="PNG")
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="browser",
+        action="observe",
+        png_path=str(png),
+        elements=_dense_unnamed_elements(),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    text = "\n".join(
+        block["text"] for block in message["content"] if block["type"] == "text"
+    )
+    assert "el-1 link" in text
+    assert "image_url" in [block["type"] for block in message["content"]]
+
+
 def test_no_elements_image_observation_hints_observe_region(tmp_path):
     """无控件列表时附图观察追加放大提示：模型只能看整屏截图估坐标，易点偏。"""
     from PIL import Image

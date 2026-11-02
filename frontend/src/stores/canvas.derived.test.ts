@@ -81,4 +81,36 @@ describe('canvas 改图溯源', () => {
       [b.id, store.nodes[2].id],
     ]);
   });
+
+  it('手动关联：合法连线建一条「关联」边，重复与自环被拒', () => {
+    const store = useCanvasStore();
+    const a = store.addNode({ type: 'image', file: SRC_FILE, title: 'a.png' });
+    const b = store.addNode({ type: 'image', file: DERIVED_FILE, title: 'b.png' });
+
+    const edge = store.addEdge(a.id, b.id, '关联');
+    expect(edge).toMatchObject({ fromNode: a.id, toNode: b.id, label: '关联' });
+    // 同方向再连一次：返回 null（不允许重复边），由调用方提示用户
+    expect(store.addEdge(a.id, b.id, '关联')).toBeNull();
+    // 自环：同样拒绝
+    expect(store.addEdge(a.id, a.id, '关联')).toBeNull();
+    // 反方向是另一条语义的边，允许
+    expect(store.addEdge(b.id, a.id, '关联')).not.toBeNull();
+    expect(store.edges).toHaveLength(2);
+  });
+
+  it('双击删边只删这条关联，两个节点都还在且文档标脏', () => {
+    const store = useCanvasStore();
+    const a = store.addNode({ type: 'image', file: SRC_FILE });
+    const b = store.addNode({ type: 'image', file: DERIVED_FILE });
+    const edge = store.addEdge(a.id, b.id, '关联');
+    expect(edge).not.toBeNull();
+
+    // addNode 已经把 dirty 置真，先清掉才能验证删边真的改动了文档
+    store.dirty = false;
+    store.removeEdge(edge?.id ?? '');
+
+    expect(store.edges).toHaveLength(0);
+    expect(store.nodes).toHaveLength(2);
+    expect(store.dirty).toBe(true);
+  });
 });

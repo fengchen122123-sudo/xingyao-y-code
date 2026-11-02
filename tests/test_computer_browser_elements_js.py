@@ -1,9 +1,10 @@
 """E1 元素收集脚本的真实浏览器行为测试（设计 9：T-E1-1~6）。
 
 用 Playwright 直连系统 Edge（headless）执行 ELEMENT_COLLECT_SCRIPT 的真实
-JS 语义：kind/name 推导、可见性与视口过滤、200/80 上限、data-ycode-ref
-打标、确定性。环境不可用（无 playwright 或无可用 Edge）时整组 skip——
-不伪造通过；fake 层集成语义由 test_computer_browser_elements.py 覆盖。
+JS 语义：kind/name 推导、可见性与视口过滤、500/80 上限、data-ycode-ref
+打标、确定性、inline 链接的视觉可点击区域。环境不可用（无 playwright 或无
+可用 Edge）时整组 skip——不伪造通过；fake 层集成语义由
+test_computer_browser_elements.py 覆盖。
 """
 
 from __future__ import annotations
@@ -149,14 +150,38 @@ def test_collect_is_deterministic_and_marks_elements(edge_page):
 
 
 def test_max_elements_and_name_truncation(edge_page):
+    # E3：上限从 200 提到 500（网格型页面一盘就有 256~480 个可点单元）。
+    # 200 个元素不再被截断，超出 500 才截断。
     buttons = "".join(f"<button>{i}</button>" for i in range(210))
     result = _collect(edge_page, buttons)
-    assert len(result) == 200
-    assert result[-1]["ref"] == "el-200"
+    assert len(result) == 210
+
+    many = "".join(f"<button>{i}</button>" for i in range(520))
+    truncated = _collect(edge_page, many)
+    assert len(truncated) == 500
+    assert truncated[-1]["ref"] == "el-500"
 
     long_name = "长" * 100
-    truncated = _collect(edge_page, f"<button>{long_name}</button>")
-    assert len(truncated[0]["name"]) == 80
+    truncated_name = _collect(edge_page, f"<button>{long_name}</button>")
+    assert len(truncated_name[0]["name"]) == 80
+
+
+def test_inline_anchor_bounds_cover_wrapped_icon(edge_page):
+    """E3 回归：line-height:0 的 inline <a> 自身盒退化成 1px 高且不覆盖图片，
+    bounds 必须取其与图标后代的并集（用户实际看到、鼠标能命中的区域）。"""
+    result = _collect(
+        edge_page,
+        """
+        <style>a.grid { display:inline; font-size:1px; line-height:0; }</style>
+        <a class="grid" href="#x" onclick="return false">
+          <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+               width="16" height="16" alt="">
+        </a>
+        """,
+    )
+    assert len(result) == 1
+    left, top, right, bottom = result[0]["bounds"]
+    assert (right - left, bottom - top) == (16, 16)
 
 
 def test_name_truncation_counts_code_points_not_utf16_units(edge_page):

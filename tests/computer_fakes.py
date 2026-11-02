@@ -40,7 +40,11 @@ from dataclasses import replace
 import pytest
 
 import config
-from core.computer.browser_backend import ELEMENT_COLLECT_SCRIPT, PAGE_TEXT_SCRIPT
+from core.computer.browser_backend import (
+    ELEMENT_COLLECT_SCRIPT,
+    ELEMENT_HIT_SCRIPT,
+    PAGE_TEXT_SCRIPT,
+)
 from core.computer.models import (
     ComputerCapability,
     ComputerControlError,
@@ -308,6 +312,10 @@ class FakePage:
         self.element_collect_result = None
         self.element_collect_error = None
         self.element_collect_hook = None
+        # E3 视觉点击点脚本注入点：None 表示求值失败（或没有可用中心点），
+        # click_element 回落 locator.click，与旧行为一致；给出 dict 时按
+        # contains/inViewport 决定是否走 page.mouse.click。
+        self.element_hit_result = None
         # B 方案（窗口被遮挡时的降级观察）：页面正文本注入点。默认空串；
         # error 非空时 evaluate 抛错，用于验证「正文读取失败不中断 observe」。
         self.page_text = ""
@@ -336,6 +344,8 @@ class FakePage:
             if self.element_collect_hook is not None:
                 self.element_collect_hook(self)
             return [] if result is None else result
+        if expression == ELEMENT_HIT_SCRIPT:
+            return self.element_hit_result
         if expression == PAGE_TEXT_SCRIPT:
             if self.page_text_error is not None:
                 raise self.page_text_error

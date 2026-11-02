@@ -161,8 +161,9 @@ def test_computer_result_adds_tool_then_user_observation(fake_controller, contex
         "role": "user",
         "content": [
             {"type": "text", "text": "【电脑观察】请只依据这张最新截图决定下一步。"},
-            # A5：无控件元素时附图前会追加 observe_region 定位提示，故为三块
-            {"type": "text", "text": "【定位提示】若目标控件较小、密集或看不清，先用 observe_region 放大该区域再点击，不要凭整屏截图目测坐标。"},
+            # E3：定位提示按 target 区分——browser 没有 observe_region，
+            # 只能给出坐标语义提示（旧文案会让模型调用 desktop 专属动作）
+            {"type": "text", "text": "【定位提示】本页没有可用的元素引用，请依据这张整屏截图判断位置，坐标以截图左上角为 (0,0)，不要凭记忆复用旧坐标。"},
             {"type": "image_url", "image_url": {"url": record.observation_data_url}},
         ],
         "_computer_v1": {"run_id": "run-a", "ordinal": 1, "target": "browser"},

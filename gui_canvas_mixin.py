@@ -2,9 +2,8 @@
 
 ApiBridge（前端与测试里也叫 GuiBridge）继承本混入；pywebview 反射暴露
 public snake_case 方法，前端只需 js_api.canvas_list / canvas_load /
-canvas_save / canvas_send_to_agent / canvas_resolve_media / canvas_iframe_url
-六个入口即可完成画布的全部持久化、"选中节点发到对话"、"本地路径换预览 URL"
-与"挂载 Excalidraw 自由画布子应用"。
+canvas_save / canvas_send_to_agent / canvas_resolve_media 五个入口即可完成
+画布的全部持久化、"选中节点发到对话"与"本地路径换预览 URL"。
 
 铁律（与 gui_git_mixin / gui_snip_mixin 同一套）：
 - 所有方法返回可 JSON 序列化的 dict，错误为 {"ok": False, "msg": ...}；
@@ -207,41 +206,6 @@ class CanvasBridgeMixin:
                     os.unlink(tmp_name)
                 except OSError:
                     pass
-
-    def canvas_iframe_url(self) -> Dict[str, Any]:
-        """「自由画布」档位里要挂的 Excalidraw 子应用地址。
-
-        为什么地址必须由后端给：子应用是独立构建产物（frontend-canvas/dist），
-        主窗口由 pywebview 内部随机端口从本地 html 提供，前端既不知道自己所在
-        的"同源路径"，也拿不到我们自己的 HTTP 服务端口与令牌；而子应用必须走
-        http（ES module、字体在 file:// 下会被 CORS 挡死）。这里复用媒体服务的
-        端口与令牌，把它当成一个只读静态站点。
-
-        令牌放在路径段里而不是 query：子应用 index.html 用相对路径引资源，
-        子资源请求会丢掉 ?t=，只有路径里的令牌能一路带下去。
-
-        成功: {"ok": True, "url": "http://127.0.0.1:<port>/canvas/<token>/index.html"}
-        未构建: {"ok": False, "msg": "画布子应用未构建"}
-        """
-        try:
-            from core.media_server import canvas_dist_root, media_server
-        except Exception as e:
-            logger.exception("canvas_iframe_url：媒体模块导入失败")
-            return {"ok": False, "msg": f"画布子应用不可用：{e}"}
-        try:
-            if not canvas_dist_root():
-                # 源码仓库里还没跑过 npm --prefix frontend-canvas run build
-                return {"ok": False, "msg": "画布子应用未构建"}
-            if not media_server.ensure_started():
-                return {"ok": False, "msg": "本地静态服务未启动"}
-            base = media_server.base_url()
-            token = media_server.access_token()
-            if not base or not token:
-                return {"ok": False, "msg": "本地静态服务未启动"}
-            return {"ok": True, "url": f"{base}/canvas/{token}/index.html"}
-        except Exception as e:
-            logger.exception("canvas_iframe_url 失败")
-            return {"ok": False, "msg": f"获取画布子应用地址失败：{e}"}
 
     def canvas_resolve_media(self, paths: Any = None) -> Dict[str, Any]:
         """把画布节点引用的本地图片/视频换成 WebView 能直接加载的媒体 URL。
