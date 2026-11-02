@@ -144,6 +144,14 @@ export const useCanvasStore = defineStore('canvas', {
     recentOutputs: [] as RecentOutput[],
     /** 等待认领的改图源节点；null 表示当前没有进行中的改图 */
     pendingEditSource: null as EditSource | null,
+    /**
+     * 正在改图的节点：nodeId → jobId（后端 canvas_edit_image 返回的句柄）。
+     *
+     * 纯 UI 态，刻意不进 toDoc()：它描述的是「这张图此刻正有个任务在跑」，
+     * 任务结束（或应用关掉）后这条记录毫无意义，写进画布文件只会让磁盘上
+     * 留下一堆过期 jobId，重开画布时反而要额外过滤一遍。
+     */
+    pendingEdits: {} as Record<string, string>,
   }),
 
   actions: {
@@ -356,6 +364,68 @@ export const useCanvasStore = defineStore('canvas', {
     /** 清空托盘（用户手动「清空」；不碰画布上的节点） */
     clearRecentOutputs(): void {
       this.recentOutputs = [];
+    },
+
+    /**
+     * 标记某张图「正在改」（jobId 只为排查问题时对得上后端日志）。
+     *
+     * 为什么不置 dirty：pendingEdits 是纯 UI 态（决定节点上要不要盖「改图中…」
+     * 遮罩、禁用按钮），既不参与 toDoc() 也不落盘——把一个几秒到几十秒就消失的
+     * 进行中状态标成「未保存」是错的：用户存盘并不能把它存掉，顶栏「未保存」会
+     * 莫名点亮且点保存也不消失。与 resolveMedia 回填 url 同理，这类派生/临时
+     * 状态一律不动 dirty。
+     */
+    markEditPending(nodeId: string, jobId: string): void {
+      const id = String(nodeId || '').trim();
+      if (!id) return;
+      this.pendingEdits[id] = String(jobId || '');
+    },
+
+    /**
+     * 让节点退出 pending（成功、失败、用户放弃都走这里）。
+     *
+     * 不置 dirty 同上：收回临时遮罩不是用户改了画布内容。
+     * 键不存在时静默返回，事件处理方不必自己先判一遍。
+     */
+    clearEditPending(nodeId: string): void {
+      const id = String(nodeId || '').trim();
+      if (!id) return;
+      delete this.pendingEdits[id];
+    },
+
+    /**
+     * 落一次改图结果（canvas_edit_result 事件的数据）。
+     *
+     * 返回布尔值是给组件层用的：true 表示产物已进画布/托盘，没什么要提示的；
+     * false 表示这次改图失败或没吐出文件，组件层据此 showTip 说明原因。
+     *
+     * 先无条件按 source_node_id 清 pending：不管成败这一轮都结束了，遮罩不能
+     * 挂着等一个不会再来的事件（失败时尤其糟，用户会以为任务还在跑）。
+     */
+    applyEditResult(payload: {
+      ok?: boolean;
+      source_node_id?: string;
+      path?: string;
+      url?: string;
+    }): boolean {
+      const data = payload ?? {};
+      const sourceId = String(data.source_node_id || '').trim();
+      if (sourceId) this.clearEditPending(sourceId);
+
+      const path = String(data.path || '').trim();
+      // 失败或没拿到产物：除了上面那次 pending 清理什么都不做，错误文案归组件层
+      if (!data.ok || !path) return false;
+
+      // 复用 pushRecentOutput：落下游节点、连「改图」边、写 meta.source_file 全在
+      // 那一处，改图与「先进托盘再点进画布」共享同一套溯源口径，两处各写一份
+      // 迟早漂移。源节点已被删除（用户中途关了画布/删了节点）时 pushRecentOutput
+      // 内部会降级成托盘条目：产物照样能捞，也不留指向空缺的悬空边——无需特判。
+      const entry = this.pushRecentOutput({
+        path,
+        url: data.url,
+        sourceNodeId: sourceId || undefined,
+      });
+      return entry !== null;
     },
 
     /**

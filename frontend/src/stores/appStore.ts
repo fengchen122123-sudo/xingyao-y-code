@@ -450,6 +450,51 @@ function computerTraceSummary(event: Record<string, unknown>): string {
   return COMPUTER_ACTION_KIND_LABELS[kind] || (kind ? `动作 ${kind}` : '电脑动作');
 }
 
+/**
+ * canvas_edit_result 事件的载荷解包（画布「就地改图 / 标注改图」的产出回执）。
+ *
+ * 为什么抽成纯函数：载荷在推送链路上可能已是对象、也可能是被序列化过一层的
+ * 字符串（不同桥/对端的历史差异），调用点不该各自 `as any` 猜字段。这里统一
+ * 容错：字段缺失一律收敛成安全默认值，解包失败也不抛——一个畸形事件绝不能
+ * 打断 handleBridgeEvent 整条链路（后面还有 token_delta 这类高频流要过）。
+ */
+export interface CanvasEditResultData {
+  ok: boolean;
+  source_node_id: string;
+  path: string;
+  url: string;
+  error: string;
+}
+
+export function parseCanvasEditResult(raw: unknown): CanvasEditResultData {
+  const fallback: CanvasEditResultData = {
+    ok: false,
+    source_node_id: '',
+    path: '',
+    url: '',
+    error: '',
+  };
+  let src: unknown = raw;
+  if (typeof src === 'string') {
+    try {
+      src = JSON.parse(src);
+    } catch {
+      // 坏 JSON：当作「什么都没收到」，上层按 ok:false 走失败提示
+      return fallback;
+    }
+  }
+  if (!src || typeof src !== 'object') return fallback;
+  const obj = src as Record<string, unknown>;
+  // ok 只认显式 true：后端成功时一定带布尔 true，字符串 "true" 之类不去猜
+  return {
+    ok: obj.ok === true,
+    source_node_id: String(obj.source_node_id ?? ''),
+    path: String(obj.path ?? ''),
+    url: String(obj.url ?? ''),
+    error: String(obj.error ?? ''),
+  };
+}
+
 export interface MessageMetrics {
   duration_s?: number;
   output_duration_s?: number;
@@ -5537,6 +5582,20 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (type === 'canvas_focus_node') {
         const nodeId = String(data.node_id || data.id || '');
         if (nodeId) useCanvasStore().selectNode(nodeId);
+        return;
+      }
+      // 画布改图产出回执（就地改图 / 标注改图共用一个事件）：落成源图的下游节点
+      // 或托盘条目，成败都清掉该节点的 pending 遮罩。独立支路，不参与会话
+      // runtime 归属，处理完直接 return；失败时才在本会话对话流里说一句原因，
+      // 成功不打扰用户（图自己出现在画布上就是最好的反馈）。
+      if (type === 'canvas_edit_result') {
+        const result = parseCanvasEditResult(data);
+        const done = useCanvasStore().applyEditResult(result);
+        if (!done && result.error) {
+          // 桥事件处理器必须走 notifyChatLocal：notifyChat/broadcastChatNotice
+          // 会把已广播过的事件再广播一次，各端重复插入
+          this.notifyChatLocal(`改图失败：${result.error}`, 'error');
+        }
         return;
       }
       // 内嵌浏览器页签归属（后台会话请求打开/导航）：只在目标会话自己的右栏

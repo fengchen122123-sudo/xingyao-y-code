@@ -405,6 +405,140 @@
   color: var(--text-bright);
   border-color: color-mix(in srgb, var(--text-faint) 45%, var(--border));
 }
+/* pending 期间按钮必须一眼看出「点不了」，否则用户会连点试探（每次都是钱） */
+.cv-act:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.cv-act:disabled:hover {
+  background: transparent;
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+/* ── 就地改图：遮罩 + 浮层 ─────────────────────────────────────── */
+/* 改图中：半透明盖住图区 + 一个转圈，图本身还透出来（用户要知道改的是哪张） */
+.cv-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: color-mix(in srgb, var(--bg0) 62%, transparent);
+  backdrop-filter: blur(1.5px);
+  color: var(--text-bright);
+  font-size: 11.5px;
+  letter-spacing: 0.2px;
+}
+.cv-mask::before {
+  content: '';
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  border-top-color: var(--accent);
+  animation: cv-spin 0.9s linear infinite;
+}
+@keyframes cv-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 浮层：左右各留 12px（264 - 24 = 240 宽），底边抬到 foot 之上，
+   整体落在节点内部——超出节点的部分会被画布的可视区域裁掉且点不到 */
+.cv-edit-pop {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 34px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg1) 97%, transparent);
+  box-shadow: 0 14px 30px -14px color-mix(in srgb, var(--bg0) 92%, transparent);
+  /* 浮层不是拖拽把手，光标也别摆出「可抓」的样子 */
+  cursor: default;
+}
+.cv-edit-input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg0);
+  color: var(--text-bright);
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.5;
+  /* 指令是短的：禁掉手动拉伸，否则用户一拉就把面板撑出节点 */
+  resize: none;
+  outline: none;
+}
+.cv-edit-input::placeholder {
+  color: var(--text-faint);
+}
+.cv-edit-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+}
+.cv-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cv-edit-spacer {
+  flex: 1;
+}
+/* 计费文案：等宽小字，与节点头部的 size / 时间同一档视觉重量 */
+.cv-edit-price {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.2px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+/* 「生成」是浮层里唯一的主操作：accent 底 + 亮字，和次要的「画笔标注」拉开层次 */
+.cv-act--primary {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cv-act--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--text-bright);
+  border-color: color-mix(in srgb, var(--accent) 75%, transparent);
+}
+/* 空指令等浮层内的内联提示：用 orange 而非红，语气是「提醒」不是「报错」 */
+.cv-edit-hint {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--orange);
+}
+/* 次要链接：无边框纯文字 + 虚线下划线，视觉重量低于两个按钮 */
+.cv-edit-link {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 10.5px;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  transition: color 0.12s ease;
+}
+.cv-edit-link:hover {
+  color: var(--accent);
+}
 
 /* ── 端口：9px 圆点，选中时描边转 accent ──────────────────────── */
 .cv-node .vue-flow__handle {

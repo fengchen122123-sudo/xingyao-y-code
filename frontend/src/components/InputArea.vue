@@ -811,20 +811,31 @@ textarea {
 /* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
    两侧面板展开挤窄输入栏时禁止按钮换行/压成竖条，按 #input-wrap 容器
    宽度分档收纳，任何档位都保持单行：
-   ≤660 权限/模型转手机版纯图标；
-   ≤560 沙盒收成 开/限。
-   首档阈值必须大于整条工具栏「完整文字形态」的实际所需宽度（约 640px：
-   附件+截图+完全访问+沙盒 ≈292，模型名+思考档位+发送 ≈302，内边距 20），
+   ≤660 权限转手机版纯图标；
+   ≤560 沙盒收成 开/限；
+   ≤520 模型转纯图标（模型名优先常驻，只有真挤不下才退化）。
+   首档阈值必须大于整条工具栏「完整文字形态」的实际所需宽度（约 610px：
+   附件+截图+完全访问+沙盒 ≈264，模型名+思考档位+发送 ≈317，内边距 20），
    阈值偏小会留出「文字完整但仍放不下」的空档——模型名还完整显示时，
    末尾的沙盒胶囊已经挤出可视区，只剩一条边框 */
+/* 权限文案先让位：模型名是工具栏里最需要常驻的可读信息，权限状态已由盾牌
+   图标与配色表达。此档只收权限文字，模型名继续完整显示 */
 @container composer (max-width: 660px) {
   .permission-mode-btn .perm-label,
-  .permission-mode-btn .permission-chevron,
+  .permission-mode-btn .permission-chevron {
+    display: none;
+  }
+  .perm-icon {
+    display: inline-flex;
+  }
+}
+/* 真挤不下才把模型收成图标：此时权限已图标化、沙盒多半也收成 开/限，
+   完整「模型名 + 思考档位 + 发送」仍放不下才退化为纯图标形态 */
+@container composer (max-width: 520px) {
   .model-chip .model-label,
   .model-chip .model-chevron {
     display: none;
   }
-  .perm-icon,
   .model-icon {
     display: inline-flex;
   }

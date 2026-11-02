@@ -384,9 +384,10 @@ function handleKeydown(e: KeyboardEvent) {
 
 /* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
    侧栏/右侧栏展开挤窄首页卡片时禁止按钮换行，按 .kimi-card 容器宽度分档，
-   档位与对话中输入栏一致：≤660 权限·模型转图标 / ≤560 沙盒收成 开/限。
-   阈值必须大于“完整文字形态”的实际所需宽度（约 640px：左组 附件+截图+
-   完全访问+沙盒: 开 ≈292、右组 模型名+思考档位+发送 ≈326、卡片内边距 28）；
+   档位与对话中输入栏一致：≤660 权限转图标 / ≤560 沙盒收成 开/限 /
+   ≤520 模型转图标（模型名优先保留，只有真挤不下才退化）。
+   阈值必须大于对应形态的实际所需宽度（完整文字约 610px：左组 附件+截图+
+   完全访问+沙盒: 开 ≈264、右组 模型名+思考档位+发送 ≈317、卡片内边距 28）；
    阈值偏小会留出“文字完整但放不下”的空档，此时 .kimi-bar-left 的
    overflow:hidden 会把末尾的沙盒胶囊裁得只剩一条边框（成小方块） */
 .kimi-card {
@@ -432,14 +433,25 @@ function handleKeydown(e: KeyboardEvent) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 权限文案先让位：模型名是工具栏里最需要常驻的可读信息（用户要能一眼看出
+   当前模型），而权限状态已由盾牌图标与配色表达。此档只收权限文字（省约 60px），
+   模型名继续完整显示 */
 @container composer (max-width: 660px) {
   .permission-mode-btn .perm-label,
-  .permission-mode-btn .permission-chevron,
+  .permission-mode-btn .permission-chevron {
+    display: none;
+  }
+  .perm-icon {
+    display: inline-flex;
+  }
+}
+/* 真挤不下才把模型收成图标：此时权限已图标化、沙盒多半也收成 开/限，
+   完整「模型名 + 思考档位 + 发送」仍放不下才退化为纯图标形态 */
+@container composer (max-width: 520px) {
   .model-chip .model-label,
   .model-chip .model-chevron {
     display: none;
   }
-  .perm-icon,
   .model-icon {
     display: inline-flex;
   }

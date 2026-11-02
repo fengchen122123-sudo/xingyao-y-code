@@ -8,13 +8,30 @@ import type { CanvasNode } from '../../stores/canvas';
 /** vue-flow 透传给自定义节点的 data：整条 CanvasNode，节点只读不写 */
 export interface CanvasNodeData {
   node: CanvasNode;
+  /**
+   * 该节点是否正在就地改图。
+   *
+   * 为什么走 data 而不是让节点自己读 store：vue-flow 传给节点组件的 props
+   * 是固定的一组（id/type/data/selected…），自定义字段只能塞进 data 才带得下来；
+   * 而节点「只负责画、不改数据」的既有原则也要求它只拿一个现成的布尔，
+   * 不去反查 store.pendingEdits——那会让节点与 store 双向耦合、也难单独渲染。
+   * 这个字段是纯 UI 态（不进 CanvasDoc），由 CanvasPane 从 store 映射后塞进来。
+   */
+  editPending?: boolean;
 }
 
 /** 节点操作按钮抛出的事件载荷：父级（CanvasPane）按 action 决定后续动作 */
 export interface NodeActionPayload {
   id: string;
-  /** edit=送去修改、config-shot=配置镜头 */
-  action: 'edit' | 'config-shot';
+  /**
+   * edit=送去修改（走对话）、config-shot=配置镜头、
+   * edit-inline=就地改图（浮层里直接出图，不经过对话）、
+   * annotate=画笔标注（阶段二的后端还没接，父级先只提示「即将支持」）。
+   * 后两个是本轮新增，旧值原样保留，父级的 switch 里没命中时自然降级。
+   */
+  action: 'edit' | 'config-shot' | 'edit-inline' | 'annotate';
+  /** 就地改图的用户指令；只有 action==='edit-inline' 时有值 */
+  prompt?: string;
 }
 
 /** 读 meta 上的字符串字段：非字符串一律当作没有，避免渲染出 [object Object] */

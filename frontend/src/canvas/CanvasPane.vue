@@ -88,11 +88,31 @@
     <!-- 内嵌对话坞：浮在画布容器右下偏中（absolute，不用 fixed——右面板分区
          有 isolation，fixed 会被其它分区的层叠上下文盖住） -->
     <CanvasDock />
+
+    <!-- 画笔标注浮层：打开期间盖住整块画布；底图只显示、笔迹画在透明层上，
+         合成交给后端（跨源图片 drawImage 进 canvas 会标脏，toBlob 会抛错） -->
+    <AnnotationDialog
+      v-if="annotateTarget"
+      :url="annotateTarget.url"
+      :title="annotateTarget.title"
+      :prompt="annotateTarget.prompt"
+      :submitting="annotateSubmitting"
+      @close="closeAnnotate"
+      @submit="onAnnotateSubmit"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, defineComponent, h, markRaw, ref, watch, type Component } from 'vue';
+import {
+  computed,
+  defineComponent,
+  h,
+  markRaw,
+  ref,
+  watch,
+  type Component,
+} from 'vue';
 import {
   VueFlow,
   useVueFlow,
@@ -118,8 +138,9 @@ import ImageNode from './nodes/ImageNode.vue';
 import VideoNode from './nodes/VideoNode.vue';
 import PromptNode from './nodes/PromptNode.vue';
 import GenerateNode from './nodes/GenerateNode.vue';
-import { fileBaseName, type NodeActionPayload } from './nodes/types';
+import { fileBaseName, type CanvasNodeData, type NodeActionPayload } from './nodes/types';
 import CanvasDock from './CanvasDock.vue';
+import AnnotationDialog from './AnnotationDialog.vue';
 // 会话名 / 提示文案都从 appStore 拿：appStore 只单向引用 canvas store，
 // 这里反向引用 appStore 不会成环（canvas store 自身不 import 任何 store）
 import { useAppStore } from '../stores/appStore';
@@ -216,6 +237,185 @@ async function onSendToAgent(payload: NodeActionPayload) {
 }
 
 /**
+ * 就地改图：写一句话直接出图，不经过对话、不占 token、不留对话记录。
+ *
+ * 与 onSendToAgent 的分工：这条链路只有「图 + 指令」，模型不参与理解图，
+ * 所以延迟与成本都低；需要模型先读图再帮你润 prompt 的场景仍走「送去对话修改」。
+ * 末位 confirmed 必须显式 true：后端入口靠它承担「用户点了生成」的授权语义
+ * （该工具声明 requires_permission=True，但本路径绕过了调度层的权限判定）。
+ */
+async function onEditInline(payload: NodeActionPayload) {
+  const node = store.nodes.find((n) => n.id === payload.id);
+  const file = node?.file;
+  if (!node || !file) {
+    showTip('这个节点还没有关联图片文件，先给它设置一张图再改');
+    return;
+  }
+  // 前端先挡一层：后端对同一画布也有并发闸门，但让用户先看到原因比往返一次好
+  if (store.pendingEdits[node.id]) {
+    showTip('这张图正在改，等它回来');
+    return;
+  }
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    showTip('请先写一句改图要求');
+    return;
+  }
+  const api = (window as unknown as { pywebview?: { api?: Record<string, unknown> } }).pywebview?.api;
+  const edit = api?.canvas_edit_image;
+  if (typeof edit !== 'function') {
+    showTip('后端桥未就绪，无法就地改图（请在桌面应用内重试）');
+    return;
+  }
+  try {
+    // model 传空串 = 用插件默认模型，不在前端硬编码模型名
+    const res = await (
+      edit as (
+        canvasId: string,
+        nodeFile: string,
+        prompt: string,
+        sourceNodeId: string,
+        model: string,
+        confirmed: boolean,
+      ) => Promise<unknown>
+    )(store.canvasId, file, prompt, node.id, '', true);
+    const result = res as { ok?: boolean; msg?: string; job_id?: string } | undefined;
+    if (result && result.ok === false) {
+      showTip(String(result.msg || '改图请求失败'));
+      return;
+    }
+    if (result?.ok !== true || !result.job_id) {
+      // 没拿到任务号 = 没起任务，绝不能进 pending（那会挂一个永远不消失的遮罩）
+      showTip('改图请求没有返回任务号，请重试');
+      return;
+    }
+    // 进入 pending 只为了画遮罩、禁用按钮；真正的产物由 canvas_edit_result 事件落节点
+    store.markEditPending(node.id, String(result.job_id));
+  } catch (err) {
+    showTip(`改图请求失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * 画笔标注：打开居中标注浮层（底图只显示，笔迹画在独立的透明 canvas 层上）。
+ * 前端不做合成：底图 url 来自本机媒体服务端口，属跨源图片，drawImage 进
+ * canvas 会把它标脏、toBlob 直接抛安全错误；合成交给后端 alpha_composite。
+ */
+interface AnnotateTarget {
+  nodeId: string;
+  file: string;
+  url: string;
+  title: string;
+  prompt: string;
+}
+
+const annotateTarget = ref<AnnotateTarget | null>(null);
+const annotateSubmitting = ref(false);
+
+function onAnnotate(payload: NodeActionPayload): void {
+  const node = store.nodes.find((n) => n.id === payload.id);
+  if (!node || !node.file) {
+    showTip('这个节点还没有关联图片文件，先给它设置一张图再标注');
+    return;
+  }
+  if (store.pendingEdits[node.id]) {
+    showTip('这张图正在改，等它回来');
+    return;
+  }
+  if (!node.url) {
+    // 没有预览 url 就没有底图可画，标注无从下手：顺手补一次解析再让用户重试
+    showTip('这张图还没有预览地址，稍等片刻再试');
+    void store.resolveMedia();
+    return;
+  }
+  annotateTarget.value = {
+    nodeId: node.id,
+    file: node.file,
+    url: node.url,
+    title: node.title || fileBaseName(node.file),
+    prompt: String(payload.prompt || ''),
+  };
+}
+
+/** 关浮层即丢弃笔迹：不做草稿保存，避免半张标注被当成完整意图误用 */
+function closeAnnotate(): void {
+  // 提交中不许关：请求已发出，关掉会让用户以为没生效而重复点（每次都是钱）
+  if (annotateSubmitting.value) return;
+  annotateTarget.value = null;
+}
+
+// canvas_edit_result 事件统一由 appStore 的 handleBridgeEvent 分发（那里是
+// window.onBridgeEvent 的唯一赋值点）。本组件不再包装/抢占它：包装层要靠
+// 定时器反复重挂才不被启动顺序顶掉，既会漏事件，也可能把主对话区的流式
+// 处理器踩掉——那会让主对话区整条流都没有信号。
+
+/**
+ * 标注改图提交：把「底图 + 笔迹 base64 + 一句要求」交给后端合成并出图。
+ *
+ * 与 onEditInline 只差一张标注层：后端会先 alpha_composite 再送模型，前端绝不
+ * 自己拼图（跨源底图一旦 drawImage 进 canvas 就被标脏，toBlob 直接抛安全错误）。
+ * 两者共用同一套 pending 契约：只有拿到 job_id 才进 pending，产物仍由
+ * canvas_edit_result 事件落到画布上。
+ */
+async function onAnnotateSubmit(payload: { annotationB64: string; prompt: string }): Promise<void> {
+  const target = annotateTarget.value;
+  // 目标为空（浮层已关）或正在提交：直接忽略，避免重复点击发两次请求（每次都是钱）
+  if (!target || annotateSubmitting.value) return;
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    showTip('请先写一句改图要求');
+    return;
+  }
+  const annotationB64 = String(payload.annotationB64 || '').trim();
+  if (!annotationB64) {
+    // 空白笔迹层等于没画：后端合成出来与原图一致，白花一次生成成本
+    showTip('先在图上圈出要改的地方');
+    return;
+  }
+  const api = (window as unknown as { pywebview?: { api?: Record<string, unknown> } }).pywebview?.api;
+  const edit = api?.canvas_edit_image_annotated;
+  if (typeof edit !== 'function') {
+    showTip('后端桥未就绪，无法按标注改图（请在桌面应用内重试）');
+    return;
+  }
+  annotateSubmitting.value = true;
+  try {
+    // model 传空串 = 用插件默认模型，不在前端硬编码模型名；
+    // 末位 confirmed 必须显式 true：后端入口靠它承担「用户点了生成」的授权语义
+    const res = await (
+      edit as (
+        canvasId: string,
+        nodeFile: string,
+        prompt: string,
+        sourceNodeId: string,
+        annotationB64: string,
+        model: string,
+        confirmed: boolean,
+      ) => Promise<unknown>
+    )(store.canvasId, target.file, prompt, target.nodeId, annotationB64, '', true);
+    const result = res as { ok?: boolean; msg?: string; job_id?: string } | undefined;
+    if (result && result.ok === false) {
+      showTip(String(result.msg || '改图请求失败'));
+      return;
+    }
+    if (result?.ok !== true || !result.job_id) {
+      // 没拿到任务号 = 没起任务，绝不能进 pending（那会挂一个永远不消失的遮罩）
+      showTip('改图请求没有返回任务号，请重试');
+      return;
+    }
+    // 进 pending 只为了画遮罩、禁用按钮；真正的产物由 canvas_edit_result 事件落节点
+    store.markEditPending(target.nodeId, String(result.job_id));
+    // 这里直接置 null 而不走 closeAnnotate：那个函数在 submitting 时会拒关，
+    // 可此刻请求已被受理，浮层必须收起，否则会一直盖在刚落的节点前面
+    annotateTarget.value = null;
+  } catch (err) {
+    showTip(`改图请求失败：${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    annotateSubmitting.value = false;
+  }
+}
+
+/**
  * 托盘里点一张图：把它作为图片节点落到视口中心附近。
  * 不自动落节点的原则只针对「刚生成」，用户主动点选就是明确要它进画布。
  */
@@ -246,14 +446,32 @@ function onClearTray(): void {
   store.clearRecentOutputs();
 }
 
-/** 把节点组件包一层，只做「子组件事件 → 画布」的转发，属性原样透传 */
-function bridgeNode(target: Component, name: string) {
+/**
+ * 把节点组件包一层，只做「子组件事件 → 画布」的转发，属性原样透传。
+ *
+ * 第三个参数 pendingAware 只给图片节点开：vue-flow 传给节点组件的 props 是
+ * 固定一组（id/type/data/selected…），节点想拿到「我正在改图」只能由画布塞进
+ * data 再提出来；这里顺势把它提成节点自己的 editPending prop，节点因此完全
+ * 不必认识 store。其它三类节点没声明这个 prop，传过去只会变成根元素上的
+ * 无意义属性，索性不传。
+ */
+function bridgeNode(target: Component, name: string, pendingAware = false) {
   return markRaw(
     defineComponent({
       name,
       inheritAttrs: false,
       setup(_, { attrs }) {
-        return () => h(target, { ...attrs, onSendToAgent });
+        return () =>
+          h(target, {
+            ...attrs,
+            onSendToAgent,
+            // 就地改图 / 画笔标注：与 send-to-agent 同一套转发，节点不必认识桥
+            onEditInline,
+            onAnnotate,
+            ...(pendingAware
+              ? { editPending: Boolean((attrs.data as CanvasNodeData | undefined)?.editPending) }
+              : {}),
+          });
       },
     }),
   );
@@ -261,7 +479,7 @@ function bridgeNode(target: Component, name: string) {
 
 // 四类节点的注册表：key 与 CanvasNodeType 中的视觉类型一一对应
 const nodeTypes = {
-  image: bridgeNode(ImageNode, 'CanvasImageNode'),
+  image: bridgeNode(ImageNode, 'CanvasImageNode', true),
   video: bridgeNode(VideoNode, 'CanvasVideoNode'),
   prompt: bridgeNode(PromptNode, 'CanvasPromptNode'),
   generate: bridgeNode(GenerateNode, 'CanvasGenerateNode'),
@@ -359,7 +577,7 @@ const flowNodes = computed<Node[]>(() =>
     type: n.type,
     position: { x: n.x, y: n.y },
     width: n.width,
-    data: { node: n },
+    data: { node: n, editPending: Boolean(store.pendingEdits[n.id]) },
     selected: n.id === store.selectedNodeId,
   })),
 );
