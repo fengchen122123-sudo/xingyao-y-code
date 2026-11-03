@@ -29,7 +29,7 @@
       ></textarea>
 
       <div class="kimi-card-bar">
-        <div class="kimi-bar-left">
+        <div ref="barLeftRef" class="kimi-bar-left">
           <button
             ref="attachBtnRef"
             data-test="attachment-button"
@@ -68,7 +68,7 @@
           ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
         </div>
 
-        <div class="kimi-bar-right">
+        <div ref="barRightRef" class="kimi-bar-right">
           <button
             ref="modelBtnRef"
             data-test="model-button"
@@ -251,6 +251,45 @@ const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onK
 const kimiCardRef = ref<HTMLElement | null>(null);
 onMounted(() => { if (kimiCardRef.value) bindDrop(kimiCardRef.value); });
 
+// 权限胶囊要不要收成纯图标，改由实测溢出决定：`.kimi-bar-left` 允许收缩到 0 宽
+// 并裁掉溢出内容，于是「完整形态需要多宽 / 实际可用多宽」一次量得准。
+// 固定容器阈值只能按最宽的模型名估算，正常宽度下也会先把权限文字收掉。
+const barLeftRef = ref<HTMLElement | null>(null);
+const barRightRef = ref<HTMLElement | null>(null);
+let barMeasureFrame = 0;
+let barObserver: ResizeObserver | null = null;
+
+function measureBarFit() {
+  const el = barLeftRef.value;
+  if (!el) return;
+  // 收起态量不到真实需求宽度：先摘掉 is-tight 同步量一次，再按结果决定是否戴回
+  if (el.classList.contains('is-tight')) el.classList.remove('is-tight');
+  if (el.scrollWidth > el.clientWidth + 1) el.classList.add('is-tight');
+}
+
+function scheduleBarMeasure() {
+  if (barMeasureFrame) cancelAnimationFrame(barMeasureFrame);
+  barMeasureFrame = requestAnimationFrame(() => {
+    barMeasureFrame = 0;
+    measureBarFit();
+  });
+}
+
+onMounted(() => {
+  scheduleBarMeasure();
+  if (typeof ResizeObserver === 'undefined') return;
+  // 卡片变窄、或右侧模型名变长都会挤占可用宽度，两处都要跟着重量
+  barObserver = new ResizeObserver(() => scheduleBarMeasure());
+  if (kimiCardRef.value) barObserver.observe(kimiCardRef.value);
+  if (barRightRef.value) barObserver.observe(barRightRef.value);
+});
+
+onUnmounted(() => {
+  barObserver?.disconnect();
+  barObserver = null;
+  if (barMeasureFrame) cancelAnimationFrame(barMeasureFrame);
+});
+
 onUnmounted(() => clearSuggest());
 
 async function handlePickFiles() {
@@ -399,6 +438,12 @@ function handleKeydown(e: KeyboardEvent) {
   container-type: inline-size;
   container-name: empty-page;
 }
+/* 卡片尽量吃满主区宽度（全局 .kimi-empty-container 左右各留 20px）：
+   卡片宽出来这 20px，正好是权限文字与「只显示图标」之间的差距 */
+.kimi-empty-container {
+  padding-left: 10px;
+  padding-right: 10px;
+}
 .kimi-empty-container .kimi-title {
   line-height: 1.25;
 }
@@ -415,7 +460,7 @@ function handleKeydown(e: KeyboardEvent) {
 .kimi-card-bar .kimi-bar-left {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 5px;
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -423,8 +468,19 @@ function handleKeydown(e: KeyboardEvent) {
 .kimi-card-bar .kimi-bar-right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   flex-shrink: 0;
+}
+/* 工具栏内边距整体收紧 2px：实测 600px 卡片里完整文字差 31px，
+   这些零碎宽度凑一凑就够，视觉上看不出区别，却能把权限文字留住 */
+.kimi-card-bar .kimi-bar-left .kimi-pill-btn,
+.kimi-card-bar .kimi-bar-right .kimi-pill-btn {
+  padding-left: 10px;
+  padding-right: 10px;
+}
+.kimi-card-bar .kimi-bar-left .permission-mode-btn {
+  padding-left: 8px;
+  padding-right: 8px;
 }
 /* 工作区标签：窄容器下省略号收尾，不折行把卡片撑高 */
 .workdir-label {
@@ -433,17 +489,15 @@ function handleKeydown(e: KeyboardEvent) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 权限文案先让位：模型名是工具栏里最需要常驻的可读信息（用户要能一眼看出
-   当前模型），而权限状态已由盾牌图标与配色表达。此档只收权限文字（省约 60px），
-   模型名继续完整显示 */
-@container composer (max-width: 660px) {
-  .permission-mode-btn .perm-label,
-  .permission-mode-btn .permission-chevron {
-    display: none;
-  }
-  .perm-icon {
-    display: inline-flex;
-  }
+/* 权限文案只在真放不下时让位：`.kimi-bar-left` 的可用宽度由右侧模型名长度决定，
+   固定容器阈值算不准（旧阈值 660 让 600px 左右的卡片也被收成纯图标，肉眼看着
+   明明还有空位）。改由脚本实测 scrollWidth，真溢出才加 .is-tight */
+.kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .perm-label,
+.kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .permission-chevron {
+  display: none;
+}
+.kimi-card-bar .kimi-bar-left.is-tight .perm-icon {
+  display: inline-flex;
 }
 /* 真挤不下才把模型收成图标：此时权限已图标化、沙盒多半也收成 开/限，
    完整「模型名 + 思考档位 + 发送」仍放不下才退化为纯图标形态 */

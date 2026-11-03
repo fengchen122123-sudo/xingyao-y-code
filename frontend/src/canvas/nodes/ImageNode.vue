@@ -92,6 +92,51 @@
       </div>
       <!-- 提示放在浮层内部而不是全局 tip：空指令是最常见的误点，就地提示不打断 -->
       <p v-if="promptHint" class="cv-edit-hint" data-test="canvas-edit-hint">{{ promptHint }}</p>
+      <!-- 以这张图为首帧生成视频：复用当前指令作为运动描述。计费口径
+           （720P/5秒约¥3 + 本地图换公网地址¥0.2）写在 title 里常显给用户 -->
+      <button
+        class="cv-edit-link"
+        data-test="canvas-generate-video"
+        title="以这张图为首帧生成 5 秒视频（720P，约 ¥3/次；本地图换公网地址另计 ¥0.2）"
+        @click.stop="onGenerateVideo"
+      >
+        以此图为首帧生成视频 →
+      </button>
+      <!-- P2 角色库入口：把这张图存成某个角色的参考（弹窗选角色/类型/主参考） -->
+      <button
+        class="cv-edit-link"
+        data-test="canvas-save-character-ref"
+        @click.stop="onSaveCharacterRef"
+      >
+        存为角色参考 →
+      </button>
+      <!-- 绑定过角色才出现：用该角色的主参考作垫图、档案拼装 prompt 出定妆图 -->
+      <button
+        v-if="boundCharacterCount === 1"
+        class="cv-edit-link"
+        data-test="canvas-generate-character-image"
+        title="用该角色的主参考图作垫图，自动拼入固定外貌句与画风（0.20 元/张）"
+        @click.stop="onGenerateCharacterImage"
+      >
+        用角色出定妆图 →
+      </button>
+      <!-- 绑定角色状态提示：单角色 = 注入预告；多角色 = 硬限制明示（多人同框
+           没有稳定方案，不假装能一键稳定双人，生成视频会被拒绝） -->
+      <p
+        v-if="boundCharacterCount === 1"
+        class="cv-edit-hint"
+        data-test="canvas-character-bound-hint"
+      >
+        已绑定角色：生成视频 / 定妆图会自动带入该角色的外貌与画风
+      </p>
+      <p
+        v-if="boundCharacterCount > 1"
+        class="cv-edit-hint is-warn"
+        data-test="canvas-character-multi-hint"
+      >
+        这张图绑定了 {{ boundCharacterCount }} 个角色：多人同框暂不支持一键稳定生成，
+        以它为首帧生成视频会被拒绝
+      </p>
       <!-- 次要链接：需要模型先读图、先想 prompt 的场景仍然走对话，行为与原来一字不改 -->
       <button
         class="cv-edit-link"
@@ -154,6 +199,12 @@ const emit = defineEmits<{
   (e: 'edit-inline', payload: NodeActionPayload): void;
   // 画笔标注：父级打开居中标注浮层（底图只显示，笔迹画在透明 canvas 层上）
   (e: 'annotate', payload: NodeActionPayload): void;
+  // 生成视频：父级调 canvas_generate_video（以这张图为首帧）
+  (e: 'generate-video', payload: NodeActionPayload): void;
+  // P2 存为角色参考：父级打开 CharacterRefDialog（选角色/参考类型/主参考）
+  (e: 'save-character-ref', payload: NodeActionPayload): void;
+  // P2 用角色出定妆图：父级调 canvas_character_generate_image（主参考垫图）
+  (e: 'generate-character-image', payload: NodeActionPayload): void;
 }>();
 
 /** 浮层开合与指令都和这一个节点绑死，用局部 ref 就够，不引入任何全局状态 */
@@ -253,6 +304,51 @@ function onAnnotate(): void {
 /** 送去对话修改：与原来的「送去修改」同一条链路，载荷保持 action='edit' */
 function onSendToAgent(): void {
   emit('send-to-agent', { id: props.id, action: 'edit' });
+  setPanel(false);
+}
+
+/**
+ * 以这张图为首帧生成视频：复用改图浮层里写好的指令当运动描述。
+ * 只往父级抛事件，节点不碰桥、不碰 store（单一职责，与改图同构）。
+ * 视频按秒计费且要跑 1~5 分钟，所以空指令在就地拦下，别让任务白排队。
+ */
+function onGenerateVideo(): void {
+  const prompt = promptText.value.trim();
+  if (!prompt) {
+    promptHint.value = '先写一句画面运动指令，例如「镜头缓缓推近，人物转头微笑」';
+    return;
+  }
+  emit('generate-video', { id: props.id, action: 'generate-video', prompt });
+  setPanel(false);
+}
+
+/**
+ * 节点绑定的角色（meta.character_ids）：「存为角色参考」成功后由画布层写回。
+ * 这里只读不写——节点不知道角色库，只根据绑定个数决定露出哪些入口与提示。
+ */
+const boundCharacterCount = computed(() => {
+  const value = node.value.meta?.character_ids;
+  return Array.isArray(value) ? value.length : 0;
+});
+
+/** 存为角色参考：只抛事件，弹窗（选角色/参考类型/主参考）由父级画布打开 */
+function onSaveCharacterRef(): void {
+  emit('save-character-ref', { id: props.id, action: 'save-character-ref' });
+  setPanel(false);
+}
+
+/** 用角色出定妆图：复用当前指令作镜头描述（如「正面半身定妆照」），父级拼装 */
+function onGenerateCharacterImage(): void {
+  const prompt = promptText.value.trim();
+  if (!prompt) {
+    promptHint.value = '先写一句画面描述，例如「正面半身定妆照，浅笑」';
+    return;
+  }
+  emit('generate-character-image', {
+    id: props.id,
+    action: 'generate-character-image',
+    prompt,
+  });
   setPanel(false);
 }
 

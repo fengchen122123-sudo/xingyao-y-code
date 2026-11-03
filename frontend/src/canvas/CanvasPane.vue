@@ -85,10 +85,6 @@
       </div>
     </div>
 
-    <!-- 内嵌对话坞：浮在画布容器右下偏中（absolute，不用 fixed——右面板分区
-         有 isolation，fixed 会被其它分区的层叠上下文盖住） -->
-    <CanvasDock />
-
     <!-- 画笔标注浮层：打开期间盖住整块画布；底图只显示、笔迹画在透明层上，
          合成交给后端（跨源图片 drawImage 进 canvas 会标脏，toBlob 会抛错） -->
     <AnnotationDialog
@@ -100,6 +96,18 @@
       @close="closeAnnotate"
       @submit="onAnnotateSubmit"
     />
+
+    <!-- 存为角色参考浮层：与画笔标注同一套遮罩语言；桥交互收在弹窗内，
+         这里只接 saved/close 两个出口 -->
+    <CharacterRefDialog
+      v-if="characterRefTarget"
+      :canvas-id="store.canvasId"
+      :node-file="characterRefTarget.file"
+      :node-id="characterRefTarget.nodeId"
+      :node-title="characterRefTarget.title"
+      @close="closeCharacterRef"
+      @saved="onCharacterRefSaved"
+    />
   </div>
 </template>
 
@@ -109,6 +117,7 @@ import {
   defineComponent,
   h,
   markRaw,
+  nextTick,
   ref,
   watch,
   type Component,
@@ -139,8 +148,8 @@ import VideoNode from './nodes/VideoNode.vue';
 import PromptNode from './nodes/PromptNode.vue';
 import GenerateNode from './nodes/GenerateNode.vue';
 import { fileBaseName, type CanvasNodeData, type NodeActionPayload } from './nodes/types';
-import CanvasDock from './CanvasDock.vue';
 import AnnotationDialog from './AnnotationDialog.vue';
+import CharacterRefDialog from './CharacterRefDialog.vue';
 // 会话名 / 提示文案都从 appStore 拿：appStore 只单向引用 canvas store，
 // 这里反向引用 appStore 不会成环（canvas store 自身不 import 任何 store）
 import { useAppStore } from '../stores/appStore';
@@ -159,7 +168,8 @@ const appStore = useAppStore();
 // 内部实例是同一个，否则两边各建一个实例，缩放进度同步不上
 // screenToFlowCoordinate：托盘点进来的图要落在用户当下看着的位置，得把
 // 屏幕坐标换算回世界坐标（否则永远落在原点，用户以为没反应）
-const { viewport, zoomIn, zoomOut, fitView, screenToFlowCoordinate } = useVueFlow('canvas-flow');
+const { viewport, zoomIn, zoomOut, fitView, setCenter, screenToFlowCoordinate } =
+  useVueFlow('canvas-flow');
 
 /** 画布容器：算视口中心要用它的 DOMRect */
 const rootRef = ref<HTMLElement | null>(null);
@@ -169,8 +179,10 @@ const recentOutputs = computed(() => store.recentOutputs);
 
 /**
  * 一次性操作提示。为什么不用 console：这类失败（桥没接上、附件丢了）用户
- * 无从判断，必须画出来；4 秒后自动消失，不打断后续操作
+ * 无从判断，必须画出来；8 秒后自动消失，不打断后续操作。
+ * 4 秒太短——用户点完还在看节点，横幅就没了，看起来就是「点了没反应」。
  */
+const TIP_DURATION_MS = 8000;
 const tip = ref('');
 let tipTimer: ReturnType<typeof setTimeout> | null = null;
 function showTip(message: string): void {
@@ -179,7 +191,17 @@ function showTip(message: string): void {
   tipTimer = setTimeout(() => {
     tip.value = '';
     tipTimer = null;
-  }, 4000);
+  }, TIP_DURATION_MS);
+}
+
+/**
+ * 改图/标注被拒时的反馈：横幅 + 对话流各留一份。
+ * 横幅会消失，用户没盯住顶部就等于没提示（改图链路的经典投诉是
+ * 「点了没反应」）；对话流那条会一直留在会话里，事后还能翻回来看到原因。
+ */
+function failTip(message: string): void {
+  showTip(message);
+  appStore.notifyChatLocal(`改图失败：${message}`, 'error');
 }
 
 /** 托盘里的一行文案：文件名优先（托盘很窄，不展示完整路径） */
@@ -248,23 +270,23 @@ async function onEditInline(payload: NodeActionPayload) {
   const node = store.nodes.find((n) => n.id === payload.id);
   const file = node?.file;
   if (!node || !file) {
-    showTip('这个节点还没有关联图片文件，先给它设置一张图再改');
+    failTip('这个节点还没有关联图片文件，先给它设置一张图再改');
     return;
   }
   // 前端先挡一层：后端对同一画布也有并发闸门，但让用户先看到原因比往返一次好
   if (store.pendingEdits[node.id]) {
-    showTip('这张图正在改，等它回来');
+    failTip('这张图正在改，等它回来');
     return;
   }
   const prompt = String(payload.prompt || '').trim();
   if (!prompt) {
-    showTip('请先写一句改图要求');
+    failTip('请先写一句改图要求');
     return;
   }
   const api = (window as unknown as { pywebview?: { api?: Record<string, unknown> } }).pywebview?.api;
   const edit = api?.canvas_edit_image;
   if (typeof edit !== 'function') {
-    showTip('后端桥未就绪，无法就地改图（请在桌面应用内重试）');
+    failTip('后端桥未就绪，无法就地改图（请在桌面应用内重试）');
     return;
   }
   try {
@@ -281,18 +303,232 @@ async function onEditInline(payload: NodeActionPayload) {
     )(store.canvasId, file, prompt, node.id, '', true);
     const result = res as { ok?: boolean; msg?: string; job_id?: string } | undefined;
     if (result && result.ok === false) {
-      showTip(String(result.msg || '改图请求失败'));
+      failTip(String(result.msg || '改图请求失败'));
       return;
     }
     if (result?.ok !== true || !result.job_id) {
       // 没拿到任务号 = 没起任务，绝不能进 pending（那会挂一个永远不消失的遮罩）
-      showTip('改图请求没有返回任务号，请重试');
+      failTip('改图请求没有返回任务号，请重试');
       return;
     }
     // 进入 pending 只为了画遮罩、禁用按钮；真正的产物由 canvas_edit_result 事件落节点
     store.markEditPending(node.id, String(result.job_id));
+    // 请求已受理：必须立刻告诉用户「点到了」。出图要等十几秒，中间这段静默
+    // 正是用户报的「点了没反应」
+    showTip('已提交改图，正在生成…');
   } catch (err) {
-    showTip(`改图请求失败：${err instanceof Error ? err.message : String(err)}`);
+    failTip(`改图请求失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * 以图片节点为首帧生成视频（tokenrhythm_video 插件 + canvas_generate_video 桥）。
+ * 与改图同一套异步模式，两点刻意不同：
+ * - pending 落在「受理时新建的视频节点」上而不是源图上：视频要跑 1~5 分钟，
+ *   源图期间还能继续改图/编辑，不该被遮住；视频节点自己盖「生成中」遮罩。
+ * - 前端先挡「同一画布已有视频在跑」：视频按秒计费（720P 约 ¥3/次），连点
+ *   只会烧钱，后端闸门之外再多一层嘴上提醒。
+ */
+async function onGenerateVideo(payload: NodeActionPayload) {
+  const node = store.nodes.find((n) => n.id === payload.id);
+  const file = node?.file;
+  if (!node || !file) {
+    failTip('这个节点还没有关联图片文件，先给它设置一张图再生成视频');
+    return;
+  }
+  if (Object.keys(store.pendingVideos).length > 0) {
+    failTip('这张画布已有视频在生成，等它回来再发下一个');
+    return;
+  }
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    failTip('请先写一句画面运动指令（视频会以这张图为首帧）');
+    return;
+  }
+  const api = (window as unknown as { pywebview?: { api?: Record<string, unknown> } }).pywebview?.api;
+  const generate = api?.canvas_generate_video;
+  if (typeof generate !== 'function') {
+    failTip('后端桥未就绪，无法生成视频（请在桌面应用内重试）');
+    return;
+  }
+  try {
+    // P2 角色注入：绑定过角色的节点把 meta.character_ids 一起带给桥（后端
+    // 拼装固定外貌句 + 画风；多角色会被后端硬拒绝——多人同框没有稳定方案，
+    // 不在前端假装能一键稳定双人）
+    const boundIds = Array.isArray(node.meta?.character_ids)
+      ? (node.meta.character_ids as unknown[])
+          .map((v) => Number(v))
+          .filter((v) => Number.isInteger(v) && v > 0)
+      : [];
+    // P1.5 OSS 直传：生图/改图落在 meta 里的 OSS 直链 + 落库时间。新鲜直链
+    // 直接给桥作首帧（省 ¥0.2 重绘），过期/缺失由桥回落重绘路径
+    const ossUrl =
+      typeof node.meta?.oss_url === 'string' ? (node.meta.oss_url as string) : '';
+    const ossSavedAt =
+      typeof node.meta?.oss_url_saved_at === 'number'
+        ? (node.meta.oss_url_saved_at as number)
+        : 0;
+    // duration 固定 5 秒、model 传空串用插件默认（wan3.0-video），
+    // 不在前端硬编码模型名；与改图调用同一套 confirmed=true 授权口径
+    const res = await (
+      generate as (
+        canvasId: string,
+        sourceNodeId: string,
+        nodeFile: string,
+        prompt: string,
+        duration: number,
+        model: string,
+        confirmed: boolean,
+        characterIds?: number[],
+        imageUrl?: string,
+        imageUrlSavedAt?: number,
+      ) => Promise<unknown>
+    )(store.canvasId, node.id, file, prompt, 5, '', true, boundIds, ossUrl, ossSavedAt);
+    const result = res as { ok?: boolean; msg?: string; job_id?: string } | undefined;
+    if (result && result.ok === false) {
+      failTip(String(result.msg || '视频请求失败'));
+      return;
+    }
+    if (result?.ok !== true || !result.job_id) {
+      failTip('视频请求没有返回任务号，请重试');
+      return;
+    }
+    // 受理即落 pending 视频节点（源图右侧 +「视频」边）：任务的受理、位置、
+    // 与源图的关系立刻可见；产物由 canvas_video_result 事件回填进这个节点
+    const created = store.addVideoJobNode(node.id, String(result.job_id), {
+      prompt,
+      duration: 5,
+      ...(boundIds.length ? { character_ids: boundIds } : {}),
+    });
+    if (!created) {
+      // 节点没落成（源图刚好被删）：任务仍在跑，产物事件会按 source 重建
+      showTip('视频任务已受理，正在生成…');
+      return;
+    }
+    showTip('已提交视频生成，通常需要 1~5 分钟，完成后会自动出现在画布上');
+  } catch (err) {
+    failTip(`视频请求失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * 存为角色参考：打开 CharacterRefDialog（选角色/新建 + 参考类型 + 主参考）。
+ * 真正的桥交互（列角色/建档/存参考）都在弹窗组件里，这里只负责开弹窗、
+ * 成功后把 character_ids 写回节点 meta 并弹提示。
+ */
+interface CharacterRefTarget {
+  nodeId: string;
+  file: string;
+  title: string;
+}
+
+const characterRefTarget = ref<CharacterRefTarget | null>(null);
+
+function onSaveCharacterRef(payload: NodeActionPayload): void {
+  const node = store.nodes.find((n) => n.id === payload.id);
+  if (!node || !node.file) {
+    showTip('这个节点还没有关联图片文件，先给它设置一张图再存为角色参考');
+    return;
+  }
+  characterRefTarget.value = {
+    nodeId: node.id,
+    file: node.file,
+    title: node.title || fileBaseName(node.file),
+  };
+}
+
+function closeCharacterRef(): void {
+  characterRefTarget.value = null;
+}
+
+function onCharacterRefSaved(info: {
+  characterId: number;
+  replacedPrimary: boolean;
+  refType: string;
+}): void {
+  const target = characterRefTarget.value;
+  if (target) {
+    // character_ids 去重合并：一张图可以同时是多个角色的参考（例如群像图
+    // 分别存给每个人），但以它为首帧生成视频时多角色会被后端硬拒绝——
+    // 那条限制在节点面板上明示过了
+    const existing = Array.isArray(store.nodes.find((n) => n.id === target.nodeId)?.meta?.character_ids)
+      ? ((store.nodes.find((n) => n.id === target.nodeId)?.meta as Record<string, unknown>)
+          .character_ids as unknown[])
+      : [];
+    const merged = Array.from(
+      new Set([...existing.map((v) => Number(v)), Number(info.characterId)]),
+    ).filter((v) => Number.isInteger(v) && v > 0);
+    store.mergeNodeMeta(target.nodeId, { character_ids: merged });
+  }
+  showTip(
+    info.replacedPrimary
+      ? '已存为角色参考（该角色的主参考已被这张图替换）'
+      : '已存为角色参考',
+  );
+}
+
+/**
+ * 用角色出定妆图：走桥层 canvas_character_generate_image——后端拿该角色的
+ * 主参考作垫图、拼入固定外貌句与画风（compose_character_prompt），产物仍走
+ * canvas_edit_result 事件通道落到本节点右侧。pending 契约与就地改图一致：
+ * 拿到 job_id 才挂遮罩，杜绝「受理失败但遮罩永远不消失」。
+ */
+async function onGenerateCharacterImage(payload: NodeActionPayload): Promise<void> {
+  const node = store.nodes.find((n) => n.id === payload.id);
+  const file = node?.file;
+  if (!node || !file) {
+    failTip('这个节点还没有关联图片文件，先给它设置一张图');
+    return;
+  }
+  const boundIds = Array.isArray(node.meta?.character_ids)
+    ? (node.meta.character_ids as unknown[])
+        .map((v) => Number(v))
+        .filter((v) => Number.isInteger(v) && v > 0)
+    : [];
+  // 只在恰好绑定一个角色时放行：多角色同框没有稳定方案，节点面板上已明示
+  if (boundIds.length !== 1) {
+    failTip('这张图没有绑定角色或绑定了多个角色：先「存为角色参考」绑定一个角色');
+    return;
+  }
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    failTip('请先写一句画面描述（例如「正面半身定妆照」）');
+    return;
+  }
+  if (store.pendingEdits[node.id]) {
+    failTip('这张图正在生成，等它回来');
+    return;
+  }
+  const api = (window as unknown as { pywebview?: { api?: Record<string, unknown> } }).pywebview?.api;
+  const generate = api?.canvas_character_generate_image;
+  if (typeof generate !== 'function') {
+    failTip('后端桥未就绪，无法生成定妆图（请在桌面应用内重试）');
+    return;
+  }
+  try {
+    const res = await (
+      generate as (
+        canvasId: string,
+        characterId: number,
+        prompt: string,
+        sourceNodeId: string,
+        model: string,
+        confirmed: boolean,
+      ) => Promise<unknown>
+    )(store.canvasId, boundIds[0], prompt, node.id, '', true);
+    const result = res as { ok?: boolean; msg?: string; job_id?: string } | undefined;
+    if (result && result.ok === false) {
+      failTip(String(result.msg || '定妆图请求失败'));
+      return;
+    }
+    if (result?.ok !== true || !result.job_id) {
+      failTip('定妆图请求没有返回任务号，请重试');
+      return;
+    }
+    store.markEditPending(node.id, String(result.job_id));
+    showTip('已提交角色定妆图，正在生成…');
+  } catch (err) {
+    failTip(`定妆图请求失败：${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -363,19 +599,19 @@ async function onAnnotateSubmit(payload: { annotationB64: string; prompt: string
   if (!target || annotateSubmitting.value) return;
   const prompt = String(payload.prompt || '').trim();
   if (!prompt) {
-    showTip('请先写一句改图要求');
+    failTip('请先写一句改图要求');
     return;
   }
   const annotationB64 = String(payload.annotationB64 || '').trim();
   if (!annotationB64) {
     // 空白笔迹层等于没画：后端合成出来与原图一致，白花一次生成成本
-    showTip('先在图上圈出要改的地方');
+    failTip('先在图上圈出要改的地方');
     return;
   }
   const api = (window as unknown as { pywebview?: { api?: Record<string, unknown> } }).pywebview?.api;
   const edit = api?.canvas_edit_image_annotated;
   if (typeof edit !== 'function') {
-    showTip('后端桥未就绪，无法按标注改图（请在桌面应用内重试）');
+    failTip('后端桥未就绪，无法按标注改图（请在桌面应用内重试）');
     return;
   }
   annotateSubmitting.value = true;
@@ -395,21 +631,22 @@ async function onAnnotateSubmit(payload: { annotationB64: string; prompt: string
     )(store.canvasId, target.file, prompt, target.nodeId, annotationB64, '', true);
     const result = res as { ok?: boolean; msg?: string; job_id?: string } | undefined;
     if (result && result.ok === false) {
-      showTip(String(result.msg || '改图请求失败'));
+      failTip(String(result.msg || '改图请求失败'));
       return;
     }
     if (result?.ok !== true || !result.job_id) {
       // 没拿到任务号 = 没起任务，绝不能进 pending（那会挂一个永远不消失的遮罩）
-      showTip('改图请求没有返回任务号，请重试');
+      failTip('改图请求没有返回任务号，请重试');
       return;
     }
     // 进 pending 只为了画遮罩、禁用按钮；真正的产物由 canvas_edit_result 事件落节点
     store.markEditPending(target.nodeId, String(result.job_id));
+    showTip('已提交改图，正在生成…');
     // 这里直接置 null 而不走 closeAnnotate：那个函数在 submitting 时会拒关，
     // 可此刻请求已被受理，浮层必须收起，否则会一直盖在刚落的节点前面
     annotateTarget.value = null;
   } catch (err) {
-    showTip(`改图请求失败：${err instanceof Error ? err.message : String(err)}`);
+    failTip(`改图请求失败：${err instanceof Error ? err.message : String(err)}`);
   } finally {
     annotateSubmitting.value = false;
   }
@@ -447,6 +684,39 @@ function onClearTray(): void {
 }
 
 /**
+ * 新节点落在视野外时把视图带过去。
+ *
+ * 改图产物固定落在源图右侧一条边距处：源图贴着视口右边时，产物就在屏幕外——
+ * 用户看到的是「遮罩消失、什么都没多出来」，与「点了没反应」毫无区别。
+ * 托盘落图本来就在视口中心，判定为可见，不会触发平移，所以这里不需要区分来源。
+ */
+watch(
+  () => store.nodes.length,
+  async (len, prev) => {
+    if (!Number.isFinite(prev) || len <= prev) return;
+    const created = store.nodes[len - 1];
+    if (!created) return;
+    await nextTick();
+    const rect = rootRef.value?.getBoundingClientRect();
+    if (!rect || !rect.width || !rect.height) return;
+    const zoom = viewport.value.zoom || 1;
+    // viewport.x/y 是「世界坐标 → 屏幕坐标」的平移量，除以 zoom 换成世界坐标边界
+    const left = -viewport.value.x / zoom;
+    const top = -viewport.value.y / zoom;
+    const right = left + rect.width / zoom;
+    const bottom = top + rect.height / zoom;
+    const width = created.width || CANVAS_DEFAULT_NODE_WIDTH;
+    const height = CANVAS_DEFAULT_NODE_HEIGHT;
+    // 只要有一部分可见就不打扰用户，完全在视野外才动视野
+    const visible =
+      created.x < right && created.x + width > left && created.y < bottom && created.y + height > top;
+    if (visible) return;
+    if (typeof setCenter !== 'function') return;
+    setCenter(created.x + width / 2, created.y + height / 2, { zoom, duration: 260 });
+  },
+);
+
+/**
  * 把节点组件包一层，只做「子组件事件 → 画布」的转发，属性原样透传。
  *
  * 第三个参数 pendingAware 只给图片节点开：vue-flow 传给节点组件的 props 是
@@ -455,7 +725,11 @@ function onClearTray(): void {
  * 不必认识 store。其它三类节点没声明这个 prop，传过去只会变成根元素上的
  * 无意义属性，索性不传。
  */
-function bridgeNode(target: Component, name: string, pendingAware = false) {
+function bridgeNode(
+  target: Component,
+  name: string,
+  pendingProp?: 'editPending' | 'videoPending',
+) {
   return markRaw(
     defineComponent({
       name,
@@ -465,11 +739,19 @@ function bridgeNode(target: Component, name: string, pendingAware = false) {
           h(target, {
             ...attrs,
             onSendToAgent,
-            // 就地改图 / 画笔标注：与 send-to-agent 同一套转发，节点不必认识桥
+            // 就地改图 / 画笔标注 / 生成视频：与 send-to-agent 同一套转发，节点不必认识桥
             onEditInline,
             onAnnotate,
-            ...(pendingAware
-              ? { editPending: Boolean((attrs.data as CanvasNodeData | undefined)?.editPending) }
+            onGenerateVideo,
+            // P2 角色库：存为角色参考（开弹窗）/ 用角色出定妆图（走桥层拼装）
+            onSaveCharacterRef,
+            onGenerateCharacterImage,
+            ...(pendingProp
+              ? {
+                  [pendingProp]: Boolean(
+                    (attrs.data as CanvasNodeData | undefined)?.[pendingProp],
+                  ),
+                }
               : {}),
           });
       },
@@ -479,8 +761,8 @@ function bridgeNode(target: Component, name: string, pendingAware = false) {
 
 // 四类节点的注册表：key 与 CanvasNodeType 中的视觉类型一一对应
 const nodeTypes = {
-  image: bridgeNode(ImageNode, 'CanvasImageNode', true),
-  video: bridgeNode(VideoNode, 'CanvasVideoNode'),
+  image: bridgeNode(ImageNode, 'CanvasImageNode', 'editPending'),
+  video: bridgeNode(VideoNode, 'CanvasVideoNode', 'videoPending'),
   prompt: bridgeNode(PromptNode, 'CanvasPromptNode'),
   generate: bridgeNode(GenerateNode, 'CanvasGenerateNode'),
   // vue-flow 的 NodeComponent 静态类型要求组件声明 NodeProps（id/type/selected…），
@@ -577,7 +859,13 @@ const flowNodes = computed<Node[]>(() =>
     type: n.type,
     position: { x: n.x, y: n.y },
     width: n.width,
-    data: { node: n, editPending: Boolean(store.pendingEdits[n.id]) },
+    data: {
+      node: n,
+      editPending: Boolean(store.pendingEdits[n.id]),
+      // 视频 pending 是「这个节点正在生成」而不是「源图在生成」：
+      // 任务受理时画布已先落了 pending 视频节点，遮罩盖在它自己身上
+      videoPending: Boolean(store.pendingVideos[n.id]),
+    },
     selected: n.id === store.selectedNodeId,
   })),
 );
@@ -738,7 +1026,7 @@ function onEdgeDoubleClick({ edge }: EdgeMouseEvent): void {
   color: var(--text);
 }
 
-/* 顶部一次性提示：与画布坞/托盘同一套半透明浮层语言，只借全局变量取色 */
+/* 顶部一次性提示：与最近产出托盘同一套半透明浮层语言，只借全局变量取色 */
 .cv-tip {
   position: absolute;
   top: 10px;
@@ -757,7 +1045,7 @@ function onEdgeDoubleClick({ edge }: EdgeMouseEvent): void {
   backdrop-filter: blur(6px);
 }
 
-/* 最近产出托盘：左下角，宽度比画布坞窄得多（它是边角料区，越窄挡住的节点越少） */
+/* 最近产出托盘：左下角窄条（它是边角料区，越窄挡住的节点越少） */
 .cv-tray {
   position: absolute;
   left: 10px;

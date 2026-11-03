@@ -32,11 +32,15 @@ _ALLOWED = {
     "forward": _COMMON,
     "reload": _COMMON,
     "request_user_takeover": _COMMON | {"reason_code"},
-    # R10 语义定位与局部观察（协议扩展；desktop only）。
+    # R10 语义定位与局部观察（协议扩展）：desktop 用 surface_ref/generation
+    # 定位候选窗口；browser（E5，2026-11-03）用 x/y/width/height 指定 CSS
+    # 视口内的区域，用于放大图片型/网格型界面里的小目标。
     "list_surfaces": _COMMON,
     "activate_surface": _COMMON | {"surface_ref", "surface_generation"},
     "invoke_surface": _COMMON | {"surface_ref", "surface_generation"},
-    "observe_region": _COMMON | {"surface_ref", "surface_generation"},
+    "observe_region": _COMMON | {
+        "surface_ref", "surface_generation", "x", "y", "width", "height",
+    },
     # 批量微动作（2026-09-06 协议扩展）：一次调用串行执行多个基本输入动作，
     # 中途不截图，完成后只返回最终截图。
     "sequence": _COMMON | {"steps"},
@@ -53,8 +57,7 @@ _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
 # 走同一套 Playwright locator 通路；list_elements 仍为桌面专属（浏览器版职责
 # 由 observe 直接承担，不提供独立动作，见设计规格 3.1）。
 _DESKTOP_ONLY_KINDS = frozenset(
-    {"list_surfaces", "activate_surface", "invoke_surface", "observe_region",
-     "list_elements"}
+    {"list_surfaces", "activate_surface", "invoke_surface", "list_elements"}
 )
 _BUTTONS = frozenset({"left", "right", "middle"})
 _REASON_CODES = frozenset({"login_required", "captcha_required", "credential_required"})
@@ -118,6 +121,8 @@ COMPUTER_ACTION_TOOL_SCHEMA = {
             "并回传候选的 surface_ref 与 surface_generation；候选只在最近一次"
             " list_surfaces 后有效；候选 bounds 为桌面物理坐标，与候选交互"
             "请先用 observe_region 取得局部观察再按其坐标点击。"
+            "browser 的 observe_region 用 x/y/width/height（CSS 视口坐标）"
+            "裁剪放大该区域；之后再点击时坐标以这块区域左上角为 (0,0)。"
         ),
         "parameters": {
             "type": "object",
@@ -159,6 +164,16 @@ COMPUTER_ACTION_TOOL_SCHEMA = {
                 "reason_code": {"type": "string", "enum": sorted(_REASON_CODES)},
                 "surface_ref": {"type": "string"},
                 "surface_generation": {"type": "integer", "minimum": 0},
+                "width": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "browser observe_region：区域宽度（CSS 像素）",
+                },
+                "height": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "browser observe_region：区域高度（CSS 像素）",
+                },
                 "element_ref": {
                     "type": "string",
                     "minLength": 1,
@@ -373,7 +388,7 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
             raise _invalid(f"reason_code 只支持 {sorted(_REASON_CODES)}，收到 {reason_code!r}")
         kwargs["reason_code"] = reason_code
 
-    if kind in ("activate_surface", "invoke_surface", "observe_region"):
+    if kind in ("activate_surface", "invoke_surface"):
         ref = payload.get("surface_ref")
         if not isinstance(ref, str) or not ref:
             raise _invalid(f"{kind} 需要非空 surface_ref（来自最近一次 list_surfaces）")
@@ -382,6 +397,37 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
             raise _invalid("surface_generation 必须是非负整数")
         kwargs["surface_ref"] = ref
         kwargs["surface_generation"] = generation
+
+    if kind == "observe_region":
+        if target == "desktop":
+            # desktop 沿用语义定位：按候选窗口边界裁剪，区域由候选决定。
+            ref = payload.get("surface_ref")
+            if not isinstance(ref, str) or not ref:
+                raise _invalid(
+                    f"{kind} 需要非空 surface_ref（来自最近一次 list_surfaces）"
+                )
+            generation = _strict_int(
+                payload.get("surface_generation"), "surface_generation"
+            )
+            if generation < 0:
+                raise _invalid("surface_generation 必须是非负整数")
+            kwargs["surface_ref"] = ref
+            kwargs["surface_generation"] = generation
+        else:
+            # browser（E5）：按 CSS 视口坐标显式指定区域，用于放大密集小目标。
+            if "surface_ref" in payload or "surface_generation" in payload:
+                raise _invalid("browser observe_region 不接受 surface_ref，请用 x/y/width/height")
+            if any(name not in payload for name in ("x", "y", "width", "height")):
+                raise _invalid("browser observe_region 必须同时提供 x/y/width/height")
+            x, y = _required_point(payload)
+            width = _strict_int(payload["width"], "width")
+            height = _strict_int(payload["height"], "height")
+            if width <= 0 or height <= 0:
+                raise _invalid("observe_region 的 width/height 必须是正整数")
+            if x < 0 or y < 0:
+                raise _invalid("observe_region 的 x/y 不能为负")
+            kwargs["x"], kwargs["y"] = x, y
+            kwargs["width"], kwargs["height"] = width, height
 
     if kind == "sequence":
         steps_raw = payload.get("steps")
@@ -426,6 +472,10 @@ def sanitized_action_summary(action: ComputerAction) -> dict:
         summary["x"] = action.x
     if action.y is not None:
         summary["y"] = action.y
+    if action.width is not None:
+        summary["width"] = action.width
+    if action.height is not None:
+        summary["height"] = action.height
     if action.path:
         summary["path_points"] = len(action.path)
     if action.button and action.button != "left":

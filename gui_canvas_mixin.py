@@ -34,8 +34,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -67,6 +69,16 @@ _CANVAS_EDIT_MISSING_TOOL_MSG = (
 # 连点会同时烧钱又互相覆盖节点状态，所以单画布同时只放 1 个任务进来。
 _CANVAS_EDIT_JOBS: Dict[str, str] = {}
 _CANVAS_EDIT_JOBS_LOCK = threading.Lock()
+# 视频生成走的插件工具名（tokenrhythm_video 插件提供）
+_CANVAS_VIDEO_TOOL = "tokenrhythm_generate_video"
+_CANVAS_VIDEO_MISSING_TOOL_MSG = (
+    "视频插件未启用，请在设置页启用 tokenrhythm_video 并配置 API Key"
+)
+# 视频并发闸门：canvas_id -> job_id。视频按秒计费（720P ¥0.6/秒，5 秒约 ¥3）且
+# 耗时分钟级（1~5 分钟），连点只会烧钱；与改图闸门刻意分开——改图和视频可以
+# 并行，视频自身单画布同时只放 1 个。
+_CANVAS_VIDEO_JOBS: Dict[str, str] = {}
+_CANVAS_VIDEO_JOBS_LOCK = threading.Lock()
 
 
 class CanvasBridgeMixin:
@@ -377,16 +389,16 @@ class CanvasBridgeMixin:
             # 本路径直接执行插件工具，绕过了调度层的权限判定，因此用
             # confirmed=True 把"用户点了生成"这个授权动作显式带进来
             if confirmed is not True:
-                return {"ok": False, "msg": "改图需要用户确认"}
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="改图需要用户确认")
             cid = str(canvas_id or "").strip()
             if not _CANVAS_ID_RE.match(cid):
-                return {"ok": False, "msg": "非法画布 ID"}
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="非法画布 ID")
             text = str(prompt or "").strip()
             if not text:
-                return {"ok": False, "msg": "请先写一句改图要求"}
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="请先写一句改图要求")
             source = self._canvas_edit_validate_source(node_file)
             if not source["ok"]:
-                return source
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason=source)
             return self._canvas_edit_start_job(
                 cid,
                 source_node_id,
@@ -408,6 +420,8 @@ class CanvasBridgeMixin:
         model: str,
         save_dir: str,
         annotation_path: str = "",
+        extra_event: Optional[Dict[str, Any]] = None,
+        on_done=None,
     ) -> None:
         """改图线程体：调插件工具 → 归档取预览 URL → 推事件 → 清闸门。
 
@@ -429,7 +443,17 @@ class CanvasBridgeMixin:
             "annotation_path": "",
             "annotation_abs_path": "",
             "error": "",
+            # P1.5：生图/改图接口返回的 OSS 直链 + 拿到的时间（前端写进节点
+            # meta，生成视频时新鲜直链可直接传 image 参数跳过 ¥0.2 重绘）
+            "oss_url": "",
+            "oss_url_saved_at": 0,
         }
+        # P2 扩展点：角色定妆图生成等复用本 worker 的调用方往事件里加字段
+        # （character_ids / character_ref_snapshot / final_prompt），普通改图
+        # 不传，行为与原来完全一致
+        if isinstance(extra_event, dict):
+            for key, value in extra_event.items():
+                data.setdefault(key, value)
         try:
             if annotation_path:
                 # 画笔标注链路才有的字段：把"喂给模型的合成图"回传一份，用户
@@ -458,6 +482,15 @@ class CanvasBridgeMixin:
             if getattr(result, "is_error", False):
                 data["error"] = str(getattr(result, "content", "") or "").strip() or "改图失败"
                 return
+            # P1.5：插件在 ToolResult.metadata 里带出接口返回的 OSS 直链
+            # （只在桥路径可得；对话路径前端只见文本，回落重绘）。拿到的时间
+            # 一起写，时效判定（约 50 分钟）靠它而不是解析 URL 签名
+            meta = getattr(result, "metadata", None) or {}
+            if isinstance(meta, dict):
+                oss_url = str(meta.get("oss_url") or "").strip()
+                if oss_url:
+                    data["oss_url"] = oss_url
+                    data["oss_url_saved_at"] = int(time.time() * 1000)
             changed = list(getattr(result, "changed_files", None) or [])
             new_path = str(changed[0] if changed else "").strip()
             if not new_path:
@@ -489,11 +522,27 @@ class CanvasBridgeMixin:
             data["ok"] = False
             data["error"] = f"改图失败：{e}"
         finally:
+            # 失败必须留痕：错误只回推给前端，日志里没有的话，事后无法回答
+            # 「这张图为什么一直没出来」—— 只看到前端一句转瞬即逝的提示
+            if not data["ok"]:
+                logger.warning(
+                    "canvas_edit_image 任务失败 job_id=%s canvas_id=%s：%s",
+                    job_id,
+                    canvas_id,
+                    data.get("error") or "未知原因",
+                )
             try:
                 self._emit_raw("canvas_edit_result", data)
             except Exception:
                 # 事件送不出去也要保证闸门被清，否则这张画布再也改不了图
                 logger.exception("canvas_edit_image：事件投递失败 job_id=%s", job_id)
+            # P2 扩展点：复用本 worker 的调用方（角色定妆图）在收尾时记账/
+            # 做后处理；普通改图不传，行为不变。回调里抛的异常只记日志
+            if callable(on_done):
+                try:
+                    on_done(data)
+                except Exception:
+                    logger.exception("canvas_edit_image：on_done 回调失败 job_id=%s", job_id)
             with _CANVAS_EDIT_JOBS_LOCK:
                 # 只清自己的占位：极端串行下已可能被新任务接手，不能误删别人
                 if _CANVAS_EDIT_JOBS.get(canvas_id) == job_id:
@@ -561,6 +610,23 @@ class CanvasBridgeMixin:
             logger.exception("canvas_edit_image_annotated 失败 canvas_id=%s", canvas_id)
             return {"ok": False, "msg": f"改图请求失败：{e}"}
 
+    def _canvas_edit_reject(self, cid_hint: Any, reason: Any) -> Dict[str, Any]:
+        """改图入口的统一拒绝出口：先记一条 warning，再把原因交给前端。
+
+        为什么必须记日志：这些分支对前端只回一句 msg（画布顶部横幅 8 秒后消失），
+        用户没盯住就是「点了没反应」，而事后翻日志又什么都查不到——入口到底被
+        哪个条件挡住的，只能靠这条日志回答。reason 允许直接传
+        _canvas_edit_validate_source 的返回值（dict，里面带 msg）。
+        """
+        if isinstance(reason, dict):
+            msg = str(reason.get("msg") or "改图请求被拒绝")
+        else:
+            msg = str(reason or "改图请求被拒绝")
+        logger.warning(
+            "canvas_edit_image 被拒绝 canvas_id=%s：%s", str(cid_hint or "")[:64], msg
+        )
+        return {"ok": False, "msg": msg}
+
     def _canvas_edit_validate_source(self, node_file: Any) -> Dict[str, Any]:
         """源图校验：存在 / ≤10MB / jpg-jpeg-png（两条改图入口共用）。
 
@@ -601,6 +667,8 @@ class CanvasBridgeMixin:
         model: str,
         save_dir: str = "",
         annotation_path: str = "",
+        extra_event: Optional[Dict[str, Any]] = None,
+        on_done=None,
     ) -> Dict[str, Any]:
         """过并发闸门 + 起守护线程（两条改图入口共用）。
 
@@ -624,7 +692,11 @@ class CanvasBridgeMixin:
             target=self._run_canvas_edit_job,
             args=(job_id, canvas_id, str(source_node_id or ""), image_path, prompt,
                   model, save_dir),
-            kwargs={"annotation_path": annotation_path},
+            kwargs={
+                "annotation_path": annotation_path,
+                "extra_event": extra_event,
+                "on_done": on_done,
+            },
             name=f"canvas-edit-{canvas_id}",
             daemon=True,
         )
@@ -637,6 +709,307 @@ class CanvasBridgeMixin:
                     _CANVAS_EDIT_JOBS.pop(canvas_id, None)
             return {"ok": False, "msg": f"改图任务启动失败：{e}"}
         return {"ok": True, "job_id": job_id}
+
+    # ------------------------------------------------------------------
+    # 画布生成视频（图片节点 → 图生视频，复用改图的异步 job 模式）
+    # ------------------------------------------------------------------
+    def canvas_generate_video(
+        self,
+        canvas_id: Any,
+        source_node_id: Any,
+        node_file: Any,
+        prompt: Any,
+        duration: Any = 5,
+        model: Any = "",
+        confirmed: Any = False,
+        character_ids: Any = None,
+        image_url: Any = "",
+        image_url_saved_at: Any = 0,
+    ) -> Dict[str, Any]:
+        """以画布图片节点为首帧生成视频：校验入参后丢给守护线程，立刻返回 job_id。
+
+        为什么照搬改图的异步模式：视频是异步轮询调用（实测 2s 480P 也要约
+        2 分钟），js_api 挂两分钟界面必冻。这里只做校验 + 起线程，结果通过
+        canvas_video_result 事件回推（字段与改图事件同构，另有 duration/model）。
+
+        P2 新增的可选参数：
+        - character_ids：节点 meta.character_ids 透传。同一镜头暂只支持单角色
+          （多人同框没有稳定方案，入口直接拒绝而不是假装能一键稳定双人）；
+          命中时拼装 final_prompt（镜头描述 + 角色固定外貌句 + 画风约束）并把
+          character_ref_snapshot（digest 列表）写进事件，角色档案后续更新不
+          破坏旧镜头复现。
+        - image_url / image_url_saved_at：节点 meta.oss_url（生图/改图返回的
+          OSS 直链）+ 落库时间。仍在保守时效（约 50 分钟）内就直接把 URL 传给
+          视频接口的 image 参数，跳过 ¥0.2 的本地图重绘；过期/缺失回落重绘路径。
+
+        成功: {"ok": True, "job_id": ...}
+        拒绝/异常: {"ok": False, "msg": ...}
+        """
+        try:
+            # 与改图同一条授权口径：本路径直接执行插件工具、绕过调度层权限判定
+            if confirmed is not True:
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="生成视频需要用户确认")
+            cid = str(canvas_id or "").strip()
+            if not _CANVAS_ID_RE.match(cid):
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="非法画布 ID")
+            text = str(prompt or "").strip()
+            if not text:
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="请先写一句画面运动指令")
+            # 首帧与改图源图同一套约束（1 张、≤10MB、jpg/jpeg/png）。
+            # OSS 直传路径也要求本地文件在：节点本来就是靠它兜底预览的
+            source = self._canvas_edit_validate_source(node_file)
+            if not source["ok"]:
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason=source)
+            # 时长：-1 智能时长，或 2~30 的整数。pywebview 会把 JS 数字传成
+            # float，先归一成 int 再挡掉 5.5 这类非整值
+            if isinstance(duration, bool):
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="非法视频时长")
+            try:
+                dur = int(duration)
+                if dur != float(duration):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self._canvas_edit_reject(
+                    cid_hint=canvas_id,
+                    reason="非法视频时长：必须是 2~30 秒的整数（或 -1 智能时长）",
+                )
+            if dur != -1 and not 2 <= dur <= 30:
+                return self._canvas_edit_reject(
+                    cid_hint=canvas_id,
+                    reason="非法视频时长：必须是 2~30 秒的整数（或 -1 智能时长）",
+                )
+
+            # ---- P2 角色注入：节点 meta.character_ids（0~1 个）----
+            char_ids = self._canvas_character_ids_param(character_ids)
+            if len(char_ids) > 1:
+                return self._canvas_edit_reject(
+                    cid_hint=canvas_id,
+                    reason=(
+                        "同一镜头暂只支持带入一个角色：多人同框还没有稳定的一致性方案，"
+                        "请分镜头单独生成，或先在对话里用固定构图法合成同框图再作首帧"
+                    ),
+                )
+            final_prompt = text
+            ref_snapshot: List[str] = []
+            if char_ids:
+                storage = self._canvas_character_storage()
+                if storage is None:
+                    return self._canvas_edit_reject(cid_hint=canvas_id, reason="角色库未初始化")
+                from core.character_store import compose_character_prompt
+
+                character = storage.get_character(char_ids[0])
+                if not character:
+                    return self._canvas_edit_reject(cid_hint=canvas_id, reason="角色不存在或已被删除")
+                final_prompt = compose_character_prompt(text, character)
+                ref_snapshot = [str(d) for d in storage.ref_snapshot(char_ids[0]) if d]
+
+            # ---- P1.5 OSS 直传：新鲜 URL 跳过 ¥0.2 本地图重绘 ----
+            frame_url = ""
+            if image_url:
+                from core.character_store import oss_url_still_fresh
+
+                if oss_url_still_fresh(str(image_url), image_url_saved_at):
+                    frame_url = str(image_url).strip()
+
+            return self._canvas_video_start_job(
+                cid, source_node_id, source["path"], text, dur, str(model or "").strip(),
+                character_ids=char_ids, ref_snapshot=ref_snapshot,
+                final_prompt=final_prompt, frame_url=frame_url,
+            )
+        except Exception as e:
+            logger.exception("canvas_generate_video 失败 canvas_id=%s", canvas_id)
+            return {"ok": False, "msg": f"视频请求失败：{e}"}
+
+    def _canvas_video_start_job(
+        self,
+        canvas_id: str,
+        source_node_id: Any,
+        image_path: str,
+        prompt: str,
+        duration: int,
+        model: str,
+        character_ids: List[int] | None = None,
+        ref_snapshot: List[str] | None = None,
+        final_prompt: str = "",
+        frame_url: str = "",
+    ) -> Dict[str, Any]:
+        """视频任务的闸门 + 起线程：与改图同构，但闸门独立（改图/视频可并行）。"""
+        try:
+            save_dir = str(self._canvas_media_dir())
+        except Exception as e:
+            logger.exception("canvas_generate_video：媒体目录创建失败")
+            return {"ok": False, "msg": f"创建画布媒体目录失败：{e}"}
+
+        job_id = uuid.uuid4().hex
+        with _CANVAS_VIDEO_JOBS_LOCK:
+            if _CANVAS_VIDEO_JOBS.get(canvas_id):
+                return {"ok": False, "msg": "这张画布已有视频在生成，等它回来"}
+            _CANVAS_VIDEO_JOBS[canvas_id] = job_id
+
+        worker = threading.Thread(
+            target=self._run_canvas_video_job,
+            args=(job_id, canvas_id, str(source_node_id or ""), image_path,
+                  prompt, duration, model, save_dir),
+            kwargs={
+                "character_ids": list(character_ids or []),
+                "ref_snapshot": list(ref_snapshot or []),
+                "final_prompt": final_prompt or prompt,
+                "frame_url": frame_url or "",
+            },
+            name=f"canvas-video-{canvas_id}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as e:
+            logger.exception("canvas_generate_video：线程启动失败")
+            with _CANVAS_VIDEO_JOBS_LOCK:
+                if _CANVAS_VIDEO_JOBS.get(canvas_id) == job_id:
+                    _CANVAS_VIDEO_JOBS.pop(canvas_id, None)
+            return {"ok": False, "msg": f"视频任务启动失败：{e}"}
+        return {"ok": True, "job_id": job_id}
+
+    def _run_canvas_video_job(
+        self,
+        job_id: str,
+        canvas_id: str,
+        source_node_id: str,
+        image_path: str,
+        prompt: str,
+        duration: int,
+        model: str,
+        save_dir: str,
+        character_ids: List[int] | None = None,
+        ref_snapshot: List[str] | None = None,
+        final_prompt: str = "",
+        frame_url: str = "",
+    ) -> None:
+        """视频线程体：调插件工具 → 归档取预览 URL → 推事件 → 清闸门。
+
+        与改图线程体同一套铁律：绝不动界面（只走 _emit_raw）、任何异常都消化
+        成 error 事件、finally 里只清自己的闸门占位。视频没有 width/height
+        （mp4 尺寸不进事件，前端用 <video> 自然布局），多了 duration/model。
+
+        P2 扩展（全部可选、默认零值，普通路径行为与 P1 完全一致）：
+        - character_ids / ref_snapshot / final_prompt：角色注入三件套。
+          工具吃 final_prompt（拼装后），事件同时带 prompt 与 final_prompt；
+          character_ref_snapshot（digest 列表）随事件回前端写进节点 meta，
+          角色档案后续更新不破坏旧镜头复现口径。
+        - frame_url：新鲜的 OSS 直链（入口已判时效）。有它就直接传给插件
+          image 参数（插件对 https URL 原样透传），跳过 ¥0.2 本地图重绘；
+          事件带 oss_direct=True 告知前端这次没花重绘钱。
+        - 无论成败都落一条生成台账（失败 cost 为 NULL），费用从插件
+          ToolResult.metadata.cost_cny 读，读不到就记 NULL 不硬编。
+        """
+        data: Dict[str, Any] = {
+            "ok": False,
+            "job_id": job_id,
+            "canvas_id": canvas_id,
+            "source_node_id": source_node_id,
+            "path": "",
+            "abs_path": "",
+            "url": "",
+            "duration": duration,
+            "model": model,
+            "error": "",
+            # 原始镜头描述与拼装后 prompt 都带：前者给前端展示，后者保证
+            # 旧镜头拿 meta 里的 final_prompt 就能复现
+            "prompt": prompt,
+            "character_ids": list(character_ids or []),
+            "character_ref_snapshot": list(ref_snapshot or []),
+            "final_prompt": final_prompt or prompt,
+            "oss_direct": bool(frame_url),
+            "cost_cny": None,
+        }
+        try:
+            # 懒单例：与改图同口径，这里不能提前 import 顶到模块层
+            from core import llm
+
+            registry = getattr(llm, "tool_registry")
+            kwargs: Dict[str, Any] = {
+                "prompt": data["final_prompt"],
+                "image": frame_url or image_path,
+                "duration": duration,
+                "save_dir": save_dir,
+            }
+            if model:
+                kwargs["model"] = model
+            try:
+                result = registry.execute_strict(_CANVAS_VIDEO_TOOL, **kwargs)
+            except KeyError:
+                data["error"] = _CANVAS_VIDEO_MISSING_TOOL_MSG
+                return
+            meta = getattr(result, "metadata", None) or {}
+            if isinstance(meta, dict) and meta.get("cost_cny") is not None:
+                try:
+                    data["cost_cny"] = float(meta["cost_cny"])
+                except (TypeError, ValueError):
+                    pass
+            if getattr(result, "is_error", False):
+                data["error"] = str(getattr(result, "content", "") or "").strip() or "视频生成失败"
+                return
+            changed = list(getattr(result, "changed_files", None) or [])
+            new_path = str(changed[0] if changed else "").strip()
+            if not new_path:
+                data["error"] = "视频已生成但没有拿到产物路径，请重试"
+                return
+            if not os.path.isfile(new_path):
+                data["error"] = "视频产物文件不存在，请重试"
+                return
+            data["abs_path"] = new_path
+            data["path"] = self._canvas_media_relpath(new_path)
+            # 预览 URL 与改图同口径：内容寻址仓库（media_store 原生支持 mp4
+            # ftyp 嗅探）+ 本机媒体服务。失败不推翻"视频已出好"的事实
+            try:
+                from core.media_server import media_server
+                from core.media_store import archive_media_file
+
+                item = archive_media_file(new_path)
+                data["url"] = media_server.public_url(
+                    item.get("digest") or "", item.get("ext") or ""
+                ) or ""
+            except Exception:
+                logger.debug("canvas_generate_video：预览 URL 生成失败", exc_info=True)
+            data["ok"] = True
+        except Exception as e:
+            logger.exception("canvas_generate_video 任务失败 job_id=%s", job_id)
+            data["ok"] = False
+            data["error"] = f"视频生成失败：{e}"
+        finally:
+            # 失败留痕：与改图同一条铁律
+            if not data["ok"]:
+                logger.warning(
+                    "canvas_generate_video 任务失败 job_id=%s canvas_id=%s：%s",
+                    job_id,
+                    canvas_id,
+                    data.get("error") or "未知原因",
+                )
+            # P2 生成台账：成败都落（失败费用为 NULL），best-effort 不阻断事件
+            self._record_character_generation_safe(
+                "video",
+                status="success" if data["ok"] else "failed",
+                error=str(data.get("error") or ""),
+                character_ids=list(data.get("character_ids") or []),
+                prompt=prompt,
+                final_prompt=str(data.get("final_prompt") or ""),
+                params={
+                    "duration": duration,
+                    "model": model or "wan3.0-video",
+                    "oss_direct": bool(data.get("oss_direct")),
+                },
+                ref_snapshot=list(data.get("character_ref_snapshot") or []),
+                cost_cny=data.get("cost_cny"),
+                result_path=str(data.get("path") or ""),
+                canvas_id=canvas_id,
+                source_node_id=source_node_id,
+            )
+            try:
+                self._emit_raw("canvas_video_result", data)
+            except Exception:
+                logger.exception("canvas_generate_video：事件投递失败 job_id=%s", job_id)
+            with _CANVAS_VIDEO_JOBS_LOCK:
+                if _CANVAS_VIDEO_JOBS.get(canvas_id) == job_id:
+                    _CANVAS_VIDEO_JOBS.pop(canvas_id, None)
 
     def _canvas_edit_compose_annotation(
         self, image_path: str, annotation_png_b64: Any, save_dir: str
@@ -737,6 +1110,296 @@ class CanvasBridgeMixin:
             "width": base.size[0],
             "height": base.size[1],
         }
+
+    # ------------------------------------------------------------------
+    # 角色库（P2：角色档案 / 参考图 / 带角色生成）
+    # ------------------------------------------------------------------
+    def _canvas_character_storage(self):
+        """取角色库进程级句柄；未注入（CLI/headless/裸测试桥）返回 None。"""
+        try:
+            from core.character_store import get_character_storage
+
+            return get_character_storage()
+        except Exception:
+            logger.debug("角色库句柄获取失败", exc_info=True)
+            return None
+
+    @staticmethod
+    def _canvas_character_ids_param(raw: Any) -> List[int]:
+        """前端传来的 character_ids 归一成去重的 int 列表（坏值全部丢弃）。"""
+        if isinstance(raw, (str, bytes)) or raw is None:
+            return []
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return []
+        out: List[int] = []
+        for item in raw:
+            try:
+                value = int(item)
+            except (TypeError, ValueError):
+                continue
+            if value > 0 and value not in out:
+                out.append(value)
+        return out
+
+    def _record_character_generation_safe(self, kind: str, **record: Any) -> None:
+        """生成台账落库（best-effort）：角色库未注入/落库失败只记日志，绝不阻断事件。"""
+        try:
+            storage = self._canvas_character_storage()
+            if storage is None:
+                return
+            record.setdefault("workdir", self._canvas_workdir())
+            storage.record_generation({"kind": kind, **record})
+        except Exception:
+            logger.warning("生成台账落库失败 kind=%s", kind, exc_info=True)
+
+    def canvas_character_list(self) -> Dict[str, Any]:
+        """当前项目的角色列表（含参考图）。前端「存为角色参考」弹窗拉这一份。
+
+        成功: {"ok": True, "characters": [{id, name, ..., refs: [...]}]}
+        角色库未注入: {"ok": False, "msg": ...}（弹窗降级提示，不炸界面）
+        """
+        try:
+            storage = self._canvas_character_storage()
+            if storage is None:
+                return {"ok": False, "msg": "角色库未初始化（桌面端启动后才可用）"}
+            return {"ok": True, "characters": storage.list_characters(self._canvas_workdir())}
+        except Exception as e:
+            logger.exception("canvas_character_list 失败")
+            return {"ok": False, "msg": f"读取角色库失败：{e}"}
+
+    def canvas_character_create(
+        self,
+        name: Any,
+        description: Any = "",
+        prompt_fragment: Any = "",
+        style_tags: Any = "",
+        seed: Any = None,
+    ) -> Dict[str, Any]:
+        """新建角色档案（项目内名字唯一）。
+
+        成功: {"ok": True, "character": {...}}；重名/空名: {"ok": False, "msg": ...}
+        """
+        try:
+            storage = self._canvas_character_storage()
+            if storage is None:
+                return {"ok": False, "msg": "角色库未初始化（桌面端启动后才可用）"}
+            seed_value: Optional[int] = None
+            if seed is not None and not isinstance(seed, bool):
+                try:
+                    seed_value = int(seed)
+                except (TypeError, ValueError):
+                    return {"ok": False, "msg": "seed 必须是整数"}
+            character = storage.create_character(
+                str(name or ""),
+                description=str(description or ""),
+                prompt_fragment=str(prompt_fragment or ""),
+                style_tags=str(style_tags or ""),
+                seed=seed_value,
+                workdir=self._canvas_workdir(),
+            )
+            return {"ok": True, "character": character}
+        except ValueError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("canvas_character_create 失败")
+            return {"ok": False, "msg": f"创建角色失败：{e}"}
+
+    def canvas_character_delete(self, character_id: Any) -> Dict[str, Any]:
+        """删角色档案（参考一起删；生成台账刻意保留历史）。"""
+        try:
+            storage = self._canvas_character_storage()
+            if storage is None:
+                return {"ok": False, "msg": "角色库未初始化（桌面端启动后才可用）"}
+            try:
+                cid = int(character_id)
+            except (TypeError, ValueError):
+                return {"ok": False, "msg": "非法角色 ID"}
+            removed = storage.delete_character(cid)
+            if not removed:
+                return {"ok": False, "msg": "角色不存在或已被删除"}
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("canvas_character_delete 失败")
+            return {"ok": False, "msg": f"删除角色失败：{e}"}
+
+    def canvas_character_add_ref(
+        self,
+        canvas_id: Any,
+        node_file: Any,
+        character_id: Any,
+        ref_type: Any,
+        is_primary: Any = False,
+        source_node_id: Any = "",
+    ) -> Dict[str, Any]:
+        """把画布图片节点存为角色参考图：归档拿 digest → 复制进项目 refs 目录 → 落库。
+
+        源图校验与改图同一套（1 张、≤10MB、jpg/jpeg/png）；归档走 media_store
+        内容寻址（digest 即身份），再复制一份到 .ycode/canvas/media/refs/ 下
+        带 digest 前缀的文件（同图去重），库里存项目相对路径，项目拷走不丢。
+
+        成功: {"ok": True, "ref": {...}, "replaced_primary": bool, "character_id": int}
+        replaced_primary=True 表示顶掉了旧主参考（前端据此提示「主参考已替换」）。
+        """
+        try:
+            storage = self._canvas_character_storage()
+            if storage is None:
+                return {"ok": False, "msg": "角色库未初始化（桌面端启动后才可用）"}
+            cid = str(canvas_id or "").strip()
+            if not _CANVAS_ID_RE.match(cid):
+                return {"ok": False, "msg": "非法画布 ID"}
+            try:
+                char_id = int(character_id)
+            except (TypeError, ValueError):
+                return {"ok": False, "msg": "非法角色 ID"}
+            from core.character_store import CHARACTER_REF_TYPES
+
+            ref = str(ref_type or "").strip()
+            if ref not in CHARACTER_REF_TYPES:
+                return {
+                    "ok": False,
+                    "msg": "非法参考类型：%r，可选 front(正面)/side(侧面)/outfit(服装)/style(风格)" % (ref,),
+                }
+            source = self._canvas_edit_validate_source(node_file)
+            if not source["ok"]:
+                return {"ok": False, "msg": str(source.get("msg") or source)}
+            from core.media_store import archive_media_file
+
+            try:
+                item = archive_media_file(source["path"])
+            except Exception as e:
+                logger.exception("canvas_character_add_ref：归档失败 path=%s", source["path"])
+                return {"ok": False, "msg": f"参考图归档失败：{e}"}
+            digest = str(item.get("digest") or "")
+            if not digest:
+                return {"ok": False, "msg": "参考图归档失败：未拿到内容摘要"}
+            # 项目内副本：digest 前缀天然去重，同名即同内容直接复用
+            try:
+                refs_dir = self._canvas_media_dir() / "refs"
+                refs_dir.mkdir(parents=True, exist_ok=True)
+                dest = refs_dir / ("ref_%s.%s" % (digest[:16], str(item.get("ext") or "png")))
+                if not dest.is_file():
+                    shutil.copy2(source["path"], dest)
+            except Exception as e:
+                logger.exception("canvas_character_add_ref：项目副本写入失败")
+                return {"ok": False, "msg": f"参考图写入项目失败：{e}"}
+            out = storage.add_ref(
+                char_id,
+                ref_type=ref,
+                media_digest=digest,
+                rel_path=self._canvas_media_relpath(str(dest)),
+                mime=str(item.get("mime") or ""),
+                width=item.get("width"),
+                height=item.get("height"),
+                source_node_id=str(source_node_id or ""),
+                is_primary=is_primary is True,
+            )
+            return {
+                "ok": True,
+                "ref": out["ref"],
+                "replaced_primary": bool(out["replaced_primary"]),
+                "character_id": char_id,
+            }
+        except ValueError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("canvas_character_add_ref 失败")
+            return {"ok": False, "msg": f"存为角色参考失败：{e}"}
+
+    def canvas_character_generate_image(
+        self,
+        canvas_id: Any,
+        character_id: Any,
+        prompt: Any,
+        source_node_id: Any,
+        model: Any = "",
+        confirmed: Any = False,
+    ) -> Dict[str, Any]:
+        """带角色生成定妆图：主参考图作垫图 + 拼装 prompt，复用改图 job 通道。
+
+        为什么复用 _canvas_edit_start_job 而不是新起一条链路：插件侧仍是
+        tokenrhythm_edit_image（垫图改图），差异只在「垫图固定为主参考图 +
+        prompt 由角色档案拼装」。普通改图入口 canvas_edit_image 一行未动；
+        事件仍是 canvas_edit_result（前端落节点的逻辑共用），额外带
+        character_ids / character_ref_snapshot / final_prompt 字段写进节点
+        meta。生成台账由 on_done 回调在收尾时落库（成败都记）。
+
+        成功: {"ok": True, "job_id": ...}；拒绝/异常: {"ok": False, "msg": ...}
+        """
+        try:
+            if confirmed is not True:
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="角色定妆图生成需要用户确认")
+            storage = self._canvas_character_storage()
+            if storage is None:
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="角色库未初始化")
+            cid = str(canvas_id or "").strip()
+            if not _CANVAS_ID_RE.match(cid):
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="非法画布 ID")
+            try:
+                char_id = int(character_id)
+            except (TypeError, ValueError):
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="非法角色 ID")
+            text = str(prompt or "").strip()
+            if not text:
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="请先写一句画面描述（例如「正面半身定妆照」）")
+            character = storage.get_character(char_id)
+            if not character:
+                return self._canvas_edit_reject(cid_hint=canvas_id, reason="角色不存在或已被删除")
+            primary = storage.primary_ref(char_id)
+            if not primary:
+                return self._canvas_edit_reject(
+                    cid_hint=canvas_id,
+                    reason="该角色还没有主参考图：先在图片节点上「存为角色参考」并勾选主参考",
+                )
+            ref_source = self._canvas_edit_validate_source(primary.get("rel_path"))
+            if not ref_source["ok"]:
+                return self._canvas_edit_reject(
+                    cid_hint=canvas_id,
+                    reason="主参考图文件已不在项目里（可能被移动/删除），请重新存一份",
+                )
+            from core.character_store import compose_character_prompt
+
+            final_prompt = compose_character_prompt(text, character)
+            ref_snapshot = [str(d) for d in storage.ref_snapshot(char_id) if d]
+            snapshot = list(ref_snapshot)
+            char_ids = [char_id]
+            canvas_id_for_record = cid
+            node_id_for_record = str(source_node_id or "")
+
+            def _on_done(data: Dict[str, Any]) -> None:
+                self._record_character_generation_safe(
+                    "image",
+                    status="success" if data.get("ok") else "failed",
+                    error=str(data.get("error") or ""),
+                    character_ids=char_ids,
+                    prompt=text,
+                    final_prompt=final_prompt,
+                    params={"model": str(model or "").strip() or "qwen-image-2.0"},
+                    ref_snapshot=snapshot,
+                    cost_cny=0.2 if data.get("ok") else None,
+                    result_path=str(data.get("path") or ""),
+                    canvas_id=canvas_id_for_record,
+                    source_node_id=node_id_for_record,
+                )
+
+            extra_event = {
+                "character_ids": char_ids,
+                "character_ref_snapshot": ref_snapshot,
+                "final_prompt": final_prompt,
+            }
+            return self._canvas_edit_start_job(
+                cid,
+                source_node_id,
+                ref_source["path"],
+                final_prompt,
+                str(model or "").strip(),
+                extra_event=extra_event,
+                on_done=_on_done,
+            )
+        except Exception as e:
+            logger.exception("canvas_character_generate_image 失败 canvas_id=%s", canvas_id)
+            return {"ok": False, "msg": f"角色定妆图请求失败：{e}"}
 
     # ------------------------------------------------------------------
     # 内部：上行指令文案

@@ -495,6 +495,60 @@ export function parseCanvasEditResult(raw: unknown): CanvasEditResultData {
   };
 }
 
+/**
+ * canvas_video_result 事件的载荷解包（画布「图片 → 视频」的产出回执）。
+ *
+ * 容错口径与 parseCanvasEditResult 完全一致；字段比改图多 job_id / duration /
+ * model——视频节点靠 meta.job_id 认领结果（任务受理时先落 pending 节点，
+ * 1~5 分钟后靠这个字段把产物回填进去），这三个字段缺了会认领失败。
+ */
+export interface CanvasVideoResultData {
+  ok: boolean;
+  job_id: string;
+  source_node_id: string;
+  path: string;
+  url: string;
+  duration: number;
+  model: string;
+  error: string;
+}
+
+export function parseCanvasVideoResult(raw: unknown): CanvasVideoResultData {
+  const fallback: CanvasVideoResultData = {
+    ok: false,
+    job_id: '',
+    source_node_id: '',
+    path: '',
+    url: '',
+    duration: 0,
+    model: '',
+    error: '',
+  };
+  let src: unknown = raw;
+  if (typeof src === 'string') {
+    try {
+      src = JSON.parse(src);
+    } catch {
+      return fallback;
+    }
+  }
+  if (!src || typeof src !== 'object') return fallback;
+  const obj = src as Record<string, unknown>;
+  const duration = typeof obj.duration === 'number' && Number.isFinite(obj.duration)
+    ? obj.duration
+    : 0;
+  return {
+    ok: obj.ok === true,
+    job_id: String(obj.job_id ?? ''),
+    source_node_id: String(obj.source_node_id ?? ''),
+    path: String(obj.path ?? ''),
+    url: String(obj.url ?? ''),
+    duration,
+    model: String(obj.model ?? ''),
+    error: String(obj.error ?? ''),
+  };
+}
+
 export interface MessageMetrics {
   duration_s?: number;
   output_duration_s?: number;
@@ -5595,6 +5649,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
           // 桥事件处理器必须走 notifyChatLocal：notifyChat/broadcastChatNotice
           // 会把已广播过的事件再广播一次，各端重复插入
           this.notifyChatLocal(`改图失败：${result.error}`, 'error');
+        }
+        return;
+      }
+      // 画布生成视频回执：把产物回填进受理时先落的 pending 视频节点（按
+      // meta.job_id 认领），成败都清 pending；失败在对话流里说一句原因，
+      // 成功不打扰（视频自己出现在画布上就是最好的反馈）。
+      if (type === 'canvas_video_result') {
+        const result = parseCanvasVideoResult(data);
+        const done = useCanvasStore().applyVideoResult(result);
+        if (!done && result.error) {
+          this.notifyChatLocal(`视频生成失败：${result.error}`, 'error');
         }
         return;
       }

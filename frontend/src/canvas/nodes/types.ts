@@ -18,6 +18,14 @@ export interface CanvasNodeData {
    * 这个字段是纯 UI 态（不进 CanvasDoc），由 CanvasPane 从 store 映射后塞进来。
    */
   editPending?: boolean;
+  /**
+   * 该节点是否正在生成视频（videoPending 与 editPending 同一套思路）。
+   *
+   * 与改图不同：视频任务受理时画布会先落一个没有产物的 pending 视频节点，
+   * 1~5 分钟后 canvas_video_result 事件把 file/url 回填进去；这个字段就是
+   * 那个节点的「我还在生成」标志，由 CanvasPane 从 store.pendingVideos 映射。
+   */
+  videoPending?: boolean;
 }
 
 /** 节点操作按钮抛出的事件载荷：父级（CanvasPane）按 action 决定后续动作 */
@@ -26,11 +34,20 @@ export interface NodeActionPayload {
   /**
    * edit=送去修改（走对话）、config-shot=配置镜头、
    * edit-inline=就地改图（浮层里直接出图，不经过对话）、
-   * annotate=画笔标注（阶段二的后端还没接，父级先只提示「即将支持」）。
-   * 后两个是本轮新增，旧值原样保留，父级的 switch 里没命中时自然降级。
+   * annotate=画笔标注、generate-video=以这张图为首帧生成视频、
+   * save-character-ref=把这张图存为角色参考（弹窗选角色/参考类型）、
+   * generate-character-image=用绑定角色出定妆图（主参考垫图 + 档案拼装 prompt）。
+   * 旧值原样保留，父级的 switch 里没命中时自然降级。
    */
-  action: 'edit' | 'config-shot' | 'edit-inline' | 'annotate';
-  /** 就地改图的用户指令；只有 action==='edit-inline' 时有值 */
+  action:
+    | 'edit'
+    | 'config-shot'
+    | 'edit-inline'
+    | 'annotate'
+    | 'generate-video'
+    | 'save-character-ref'
+    | 'generate-character-image';
+  /** 就地改图/生成视频的用户指令；只有 action 需要指令时有值 */
   prompt?: string;
 }
 

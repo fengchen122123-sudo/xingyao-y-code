@@ -837,6 +837,16 @@ class BrowserComputerBackend:
         self._profile_lock_key: str | None = None
         self._screenshot_dir: Path | None = None
         self._screenshot_counter = 0
+        # E5（2026-11-03）：browser 局部观察（observe_region）。
+        # _pending_region 由 execute(observe_region) 置位，紧随其后的 observe
+        # 据此裁剪区域（controller 每个动作后都会再 observe，所以区域观察就是
+        # 这次动作的返回画面）。_coord_frame 记录当前观察的坐标映射：
+        # (origin_x, origin_y, css_w, css_h, model_w, model_h)——模型坐标 → CSS。
+        self._pending_region: tuple[int, int, int, int] | None = None
+        self._coord_frame: tuple[int, int, int, int, int, int] | None = None
+        # 当前观察是否为局部视图（区域图不放大，尺寸与区域 CSS 相同，不能用
+        # 尺寸差异判断，必须单独记标志）。
+        self._region_view = False
 
     @property
     def browser(self) -> str:
@@ -1598,6 +1608,85 @@ class BrowserComputerBackend:
             return ""
         return raw[:_PAGE_TEXT_MAX_CHARS]
 
+    def _set_pending_region(self, page, action: ComputerAction) -> None:
+        """登记局部观察区域（CSS 视口坐标），并校验区域完整落在视口内。
+
+        不 clamp：越界区域直接拒绝，避免模型拿到"看起来是区域、实际被截断"
+        的图并按错误尺寸点坐标。
+        """
+        viewport = self._observation_viewport(page)
+        view_w = int(viewport["width"])
+        view_h = int(viewport["height"])
+        x = action.x
+        y = action.y
+        width = action.width
+        height = action.height
+        if not all(type(value) is int for value in (x, y, width, height)):
+            raise ComputerControlError(
+                "computer_invalid_action", "局部观察需要整数 x/y/width/height"
+            )
+        if width <= 0 or height <= 0:
+            raise ComputerControlError(
+                "computer_invalid_action", "局部观察的 width/height 必须是正整数"
+            )
+        if x < 0 or y < 0 or x + width > view_w or y + height > view_h:
+            raise ComputerControlError(
+                "computer_coordinate_out_of_bounds",
+                f"局部观察区域 ({x},{y},{width}x{height}) 超出浏览器视口 "
+                f"{view_w}x{view_h}，拒绝裁剪（不做 clamp）",
+            )
+        self._pending_region = (x, y, width, height)
+
+    def _build_region_frame(
+        self, png_bytes: bytes, region: tuple[int, int, int, int]
+    ) -> tuple[bytes, dict]:
+        """把归一化后的整屏 PNG 裁成区域图，返回 (png_bytes, 观察字段)。
+
+        PNG 此时已由 _normalize_frame 重采样到 CSS 视口尺寸，所以裁剪坐标
+        与模型坐标同一空间；区域不再放大——原分辨率已经比整屏清楚数倍，
+        放大只会插值糊化。
+        """
+        try:
+            import io
+
+            from PIL import Image
+        except Exception as error:  # noqa: BLE001
+            raise ComputerControlError(
+                "computer_backend_error",
+                "局部观察需要 Pillow 处理截图（未安装或导入失败）",
+            ) from error
+        x, y, width, height = region
+        try:
+            with Image.open(io.BytesIO(png_bytes)) as image:
+                image = image.convert("RGB")
+                if x + width > image.width or y + height > image.height:
+                    raise ComputerControlError(
+                        "computer_coordinate_out_of_bounds",
+                        f"局部观察区域 ({x},{y},{width}x{height}) 超出截图 "
+                        f"{image.width}x{image.height}（观察期间视口可能已变化）",
+                    )
+                cropped = image.crop((x, y, x + width, y + height))
+                buffer = io.BytesIO()
+                cropped.save(buffer, format="PNG", optimize=True)
+                cropped_bytes = buffer.getvalue()
+        except ComputerControlError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise ComputerControlError(
+                "computer_backend_error",
+                f"裁剪局部观察截图失败：{type(error).__name__}",
+            ) from error
+        return cropped_bytes, {
+            "width": width,
+            "height": height,
+            "original_width": width,
+            "original_height": height,
+            "origin_x": x,
+            "origin_y": y,
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+        }
+
     def _cmd_observe(self, run_id: str) -> ComputerObservation:
         page = self._resolve_active_page()
         page_token = self._page_token(page)
@@ -1610,8 +1699,16 @@ class BrowserComputerBackend:
         # B 方案（降级观察）：先做不依赖渲染的 DOM 收集。窗口被遮挡/最小化时
         # 渲染被节流而 DOM 求值照常，先把元素与正文拿到手，保证"这次观察至少
         # 有文本信息"；截图放到最后，失败也只降级、不让整条观察链报错。
-        elements = self._collect_interactive_elements(page)
-        page_text = self._collect_page_text(page)
+        pending_region = self._pending_region
+        self._pending_region = None
+        if pending_region is None:
+            elements = self._collect_interactive_elements(page)
+            page_text = self._collect_page_text(page)
+        else:
+            # 局部观察：模型要的是区域画面，不收集 DOM 清单（清空同时避免旧
+            # el-N 与新坐标系混用）。
+            elements = ()
+            page_text = ""
         png_bytes = b""
         screenshot_error = ""
         try:
@@ -1663,6 +1760,32 @@ class BrowserComputerBackend:
         # 只有真正拿到 PNG 才落盘：降级路径不写文件、也绝不复用任何旧截图。
         if png_bytes:
             png_bytes = self._normalize_frame(png_bytes, page)
+        # E5：局部观察在归一化之后裁剪（此时 PNG 与 CSS 视口同尺寸）。
+        viewport = self._observation_viewport(page)
+        region_fields: dict | None = None
+        action_name = "observe"
+        if pending_region is not None and png_bytes:
+            png_bytes, region_fields = self._build_region_frame(png_bytes, pending_region)
+            action_name = "observe_region"
+        if region_fields is None:
+            view_w = int(viewport["width"])
+            view_h = int(viewport["height"])
+            # 全屏观察：模型坐标就是 CSS 视口坐标。
+            self._coord_frame = (0, 0, view_w, view_h, view_w, view_h)
+            self._region_view = False
+            observation_view = viewport
+        else:
+            # 区域观察：模型坐标以区域左上角为原点，点击时加回 origin。
+            self._region_view = True
+            self._coord_frame = (
+                int(region_fields["origin_x"]),
+                int(region_fields["origin_y"]),
+                int(region_fields["original_width"]),
+                int(region_fields["original_height"]),
+                int(region_fields["width"]),
+                int(region_fields["height"]),
+            )
+            observation_view = region_fields
         path = self._store_screenshot(png_bytes) if png_bytes else None
         if self._observed_page_token != page_token:
             self._surface_generation += 1
@@ -1673,11 +1796,11 @@ class BrowserComputerBackend:
         return ComputerObservation(
             run_id=run_id,
             target="browser",
-            action="observe",
+            action=action_name,
             ok=True,
             screen_sha256=hashlib.sha256(png_bytes).hexdigest() if png_bytes else "",
             png_path=str(path) if path is not None else "",
-            **self._observation_viewport(page),
+            **observation_view,
             page_origin=origin,
             page_title=title[:_MAX_TITLE_CHARS],
             page_text=page_text,
@@ -1718,6 +1841,13 @@ class BrowserComputerBackend:
             )
         kind = action.kind
         if kind == "observe":
+            return
+        if kind == "observe_region":
+            # E5：browser 局部观察——只登记区域，真正的裁剪发生在紧随其后的
+            # observe（controller 在动作后统一再观察一次）。这里不产生输入。
+            page = self._resolve_active_page()
+            self._require_observed_surface(page)
+            self._set_pending_region(page, action)
             return
         if kind == "request_user_takeover":
             raise ComputerControlError(
@@ -2012,15 +2142,15 @@ class BrowserComputerBackend:
         points = action.path
         if len(points) < 2:
             raise ComputerControlError("computer_invalid_action", "drag 需要至少 2 个 path 点")
-        for point_x, point_y in points:
-            self._check_coordinates(point_x, point_y)
-        start_x, start_y = points[0]
+        # E5：逐点换算到 CSS 坐标（局部观察后模型坐标以区域左上角为原点）。
+        css_points = [self._point_to_css(point_x, point_y) for point_x, point_y in points]
+        start_x, start_y = css_points[0]
         button = action.button
         page.mouse.move(start_x, start_y)
         page.mouse.down(button=button)
         self._pressed_buttons.add(button)
         try:
-            for point_x, point_y in points[1:]:
+            for point_x, point_y in css_points[1:]:
                 page.mouse.move(point_x, point_y)
         finally:
             # try/finally 保证 mouse.up；up 失败时保留按下标记供 release_inputs 重试。
@@ -2036,8 +2166,33 @@ class BrowserComputerBackend:
         x, y = action.x, action.y
         if type(x) is not int or type(y) is not int:
             raise ComputerControlError("computer_invalid_action", "坐标 x/y 必须是整数")
-        self._check_coordinates(x, y)
-        return x, y
+        return self._point_to_css(x, y)
+
+    def _point_to_css(self, x: int, y: int) -> tuple[int, int]:
+        """模型坐标 → 浏览器 CSS 坐标（E5 起支持局部观察坐标系）。
+
+        全屏观察时两者恒等；局部观察后模型坐标以区域左上角为原点，需要按
+        「区域 CSS 尺寸 / 区域图片尺寸」缩放并加回 origin。模型坐标按当前
+        观察画面做半开区间校验，越界拒绝而不是 clamp。
+        """
+        frame = self._coord_frame
+        if frame is None:
+            self._check_coordinates(x, y)
+            return x, y
+        origin_x, origin_y, css_w, css_h, model_w, model_h = frame
+        if not (0 <= x < model_w and 0 <= y < model_h):
+            suffix = (
+                "（当前为局部观察，坐标以区域左上角为原点）"
+                if self._region_view
+                else ""
+            )
+            raise ComputerControlError(
+                "computer_coordinate_out_of_bounds",
+                f"坐标 ({x}, {y}) 超出当前观察画面 {model_w}x{model_h} 半开区间{suffix}",
+            )
+        css_x = origin_x + round(x * css_w / model_w)
+        css_y = origin_y + round(y * css_h / model_h)
+        return css_x, css_y
 
     def _check_coordinates(self, x: int, y: int) -> None:
         if not (0 <= x < self._viewport_width and 0 <= y < self._viewport_height):

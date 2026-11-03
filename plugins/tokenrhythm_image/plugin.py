@@ -186,28 +186,31 @@ def _save_image_from_result(
 ) -> tuple:
     """从接口响应取图并落盘：优先 data[0].b64_json，其次 data[0].url。
 
-    返回 (本地路径, 错误信息)，两者必有一为空。
+    返回 (本地路径, 错误信息, oss_url)，路径/错误必有一为空。第三个值把响应
+    里的原始 OSS 直链透传给调用方（ToolResult.metadata），桥层拿它做视频生成
+    的直传垫图（省 ¥0.2 重绘）；b64 形态没有 URL，返回空串。URL 只有约
+    60 分钟时效，用户侧始终以本地文件为准。
     """
     items = result.get("data") or []
     item = items[0] if items else {}
     if not isinstance(item, dict):
         item = {}
+    oss_url = str(item.get("url") or "").strip()
     b64 = str(item.get("b64_json") or "").strip()
     if b64:
         try:
-            return _save_b64_image(b64, save_dir, prefix, tool_name), ""
+            return _save_b64_image(b64, save_dir, prefix, tool_name), "", ""
         except Exception as exc:
-            return "", "接口返回的 base64 图片数据无法解码：%s" % (exc,)
-    url = str(item.get("url") or "").strip()
-    if url:
+            return "", "接口返回的 base64 图片数据无法解码：%s" % (exc,), ""
+    if oss_url:
         try:
-            return _download_image(url, save_dir, prefix, tool_name), ""
+            return _download_image(oss_url, save_dir, prefix, tool_name), "", oss_url
         except Exception as exc:
-            return "", "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, url)
+            return "", "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, oss_url), oss_url
     return "", (
         "接口响应缺少 data[0].b64_json / data[0].url，原始响应：%s"
         % json.dumps(result, ensure_ascii=False)[:500]
-    )
+    ), ""
 
 def _error_from_http(exc: urllib.error.HTTPError) -> ToolResult:
     """把 HTTPError 转成带排查提示的错误结果（detail 截前 500 字符）。"""
@@ -289,7 +292,7 @@ def generate_image(
     except Exception as exc:
         return ToolResult("生图请求失败：%s" % (exc,), is_error=True)
 
-    path, error = _save_image_from_result(result, save_dir, "tokenrhythm")
+    path, error, oss_url = _save_image_from_result(result, save_dir, "tokenrhythm")
     if error:
         return ToolResult(error, is_error=True)
 
@@ -301,7 +304,11 @@ def generate_image(
         "请务必在回复中直接用 Markdown 图片语法展示该图片（无需用户要求，用户可见）："
         "![生成的图片](%s)" % path,
     ]
-    return ToolResult("\n".join(lines), changed_files=[path])
+    # metadata 只给桥层用（对话路径模型看不到）：OSS 直链供视频生成直传垫图
+    return ToolResult(
+        "\n".join(lines), changed_files=[path],
+        metadata={"oss_url": oss_url, "cost_cny": cost_cny},
+    )
 
 
 def edit_image(
@@ -398,7 +405,7 @@ def edit_image(
     except Exception as exc:
         return ToolResult("改图请求失败：%s" % (exc,), is_error=True)
 
-    path, error = _save_image_from_result(
+    path, error, oss_url = _save_image_from_result(
         result, save_dir, "tokenrhythm_edit", tool_name="tokenrhythm_edit_image"
     )
     if error:
@@ -409,7 +416,12 @@ def edit_image(
         "请务必在回复中直接用 Markdown 图片语法展示该图片（无需用户要求，用户可见）："
         "![生成的图片](%s)" % path,
     ]
-    return ToolResult("\n".join(lines), changed_files=[path])
+    # 与生图同口径：OSS 直链（约 60 分钟时效）走 metadata 给桥层，垫图改图
+    # 固定 ¥0.2/次
+    return ToolResult(
+        "\n".join(lines), changed_files=[path],
+        metadata={"oss_url": oss_url, "cost_cny": 0.2},
+    )
 
 
 # ---------------------------------------------------------------------------

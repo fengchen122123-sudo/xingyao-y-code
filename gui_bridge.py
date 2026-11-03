@@ -1322,6 +1322,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         # core.workflows.runs.get_run_storage() 取进程级句柄（未注入时降级）
         from core.workflows.runs import init_run_storage, set_cancel_provider, set_event_sink
         self._workflow_run_storage = init_run_storage(self._memory)
+        # 角色库（P2）：同库同模式的新增表（characters / character_refs /
+        # character_generation_records），画布桥经 get_character_storage()
+        # 取进程级句柄（未注入的 CLI/headless 场景自动降级为不可用提示）
+        from core.character_store import init_character_storage
+
+        self._character_storage = init_character_storage(self._memory)
         # 解释执行器的实时事件 → 前端（window.onBridgeEvent 'workflow_run_progress'）
         set_event_sink(self._on_workflow_run_event)
         # 解释执行器的取消：读当前会话回合的取消事件（Esc 中断工作流运行）

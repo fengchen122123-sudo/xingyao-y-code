@@ -152,6 +152,13 @@ export const useCanvasStore = defineStore('canvas', {
      * 留下一堆过期 jobId，重开画布时反而要额外过滤一遍。
      */
     pendingEdits: {} as Record<string, string>,
+    /**
+     * 正在生成视频的节点：videoNodeId → jobId（后端 canvas_generate_video
+     * 返回的句柄）。与 pendingEdits 同一套语义：纯 UI 态，不进 toDoc()——
+     * 任务结束（或应用重启）后 jobId 就没意义了。节点认领迟到结果事件靠的是
+     * 落盘的 meta.job_id，不是这张表。
+     */
+    pendingVideos: {} as Record<string, string>,
   }),
 
   actions: {
@@ -312,6 +319,8 @@ export const useCanvasStore = defineStore('canvas', {
       url?: string;
       sourceNodeId?: string;
       sourceTitle?: string;
+      /** 额外写进产物节点 meta 的字段（角色上下文 / OSS 直链等，可选） */
+      extraMeta?: Record<string, unknown>;
     }): RecentOutput | null {
       const path = String(item?.path || '').trim();
       if (!path) return null;
@@ -334,6 +343,7 @@ export const useCanvasStore = defineStore('canvas', {
             source_node_id: source.id,
             source_file: source.file ?? '',
             source_title: source.title ?? item.sourceTitle ?? '',
+            ...(item.extraMeta ?? {}),
           },
         });
         this.addEdge(source.id, created.id, '改图');
@@ -407,6 +417,12 @@ export const useCanvasStore = defineStore('canvas', {
       source_node_id?: string;
       path?: string;
       url?: string;
+      // P1.5 / P2：桥层事件新增的可选字段（普通改图不带，行为不变）
+      oss_url?: string;
+      oss_url_saved_at?: number;
+      character_ids?: number[];
+      character_ref_snapshot?: string[];
+      final_prompt?: string;
     }): boolean {
       const data = payload ?? {};
       const sourceId = String(data.source_node_id || '').trim();
@@ -416,6 +432,24 @@ export const useCanvasStore = defineStore('canvas', {
       // 失败或没拿到产物：除了上面那次 pending 清理什么都不做，错误文案归组件层
       if (!data.ok || !path) return false;
 
+      // 角色定妆图产物把角色上下文一并写进 meta（旧镜头复现靠 character_ref_snapshot）；
+      // OSS 直链（约 60 分钟时效）+ 落库时间写进 meta，生成视频时直传可省 ¥0.2 重绘
+      const extraMeta: Record<string, unknown> = {};
+      if (typeof data.oss_url === 'string' && data.oss_url) {
+        extraMeta.oss_url = data.oss_url;
+        extraMeta.oss_url_saved_at =
+          typeof data.oss_url_saved_at === 'number' ? data.oss_url_saved_at : Date.now();
+      }
+      if (Array.isArray(data.character_ids) && data.character_ids.length) {
+        extraMeta.character_ids = data.character_ids;
+      }
+      if (Array.isArray(data.character_ref_snapshot)) {
+        extraMeta.character_ref_snapshot = data.character_ref_snapshot;
+      }
+      if (typeof data.final_prompt === 'string' && data.final_prompt) {
+        extraMeta.final_prompt = data.final_prompt;
+      }
+
       // 复用 pushRecentOutput：落下游节点、连「改图」边、写 meta.source_file 全在
       // 那一处，改图与「先进托盘再点进画布」共享同一套溯源口径，两处各写一份
       // 迟早漂移。源节点已被删除（用户中途关了画布/删了节点）时 pushRecentOutput
@@ -424,8 +458,178 @@ export const useCanvasStore = defineStore('canvas', {
         path,
         url: data.url,
         sourceNodeId: sourceId || undefined,
+        extraMeta,
       });
       return entry !== null;
+    },
+
+    /**
+     * 视频任务受理：在源图右侧立刻落一个没有产物的 pending 视频节点，
+     * 连「视频」边、记 pendingVideos。
+     *
+     * 为什么改图是「结果回来才落节点」而视频要「先落 pending 节点」：视频要
+     * 跑 1~5 分钟，只靠源图上一个小按钮的禁用态，用户根本看不出「我的视频
+     * 排到哪了」；落一个带「生成中」遮罩的视频节点，任务的受理、位置、
+     * 与源图的关系（边）都立刻可见。节点此刻没有 file，靠 meta.job_id 认领
+     * 迟到的 canvas_video_result 事件——应用中途重启也不丢。
+     */
+    addVideoJobNode(
+      sourceNodeId: string,
+      jobId: string,
+      opts: { prompt?: string; duration?: number; character_ids?: number[] } = {},
+    ): CanvasNode | null {
+      const sourceId = String(sourceNodeId || '').trim();
+      const job = String(jobId || '').trim();
+      const source = sourceId ? this.nodes.find((n) => n.id === sourceId) : undefined;
+      if (!source || !job) return null;
+
+      const meta: Record<string, unknown> = {
+        created_at: Date.now(),
+        job_id: job,
+        // 溯源口径与改图产物一致：边表达「谁是上游」，meta 表达来历
+        source_node_id: source.id,
+        source_file: source.file ?? '',
+        source_title: source.title ?? '',
+      };
+      if (opts.duration !== undefined) meta.duration_seconds = opts.duration;
+      if (opts.prompt) meta.prompt = opts.prompt;
+      // P2：受理时就知道带了哪些角色（result 事件回填前遮罩节点先带上，
+      // 与 applyVideoResult 的 meta 口径一致）
+      if (Array.isArray(opts.character_ids) && opts.character_ids.length) {
+        meta.character_ids = opts.character_ids;
+      }
+
+      const created = this.addNode({
+        type: 'video',
+        x: source.x + source.width + DERIVED_NODE_GAP_X,
+        y: source.y,
+        title: '视频生成中…',
+        meta,
+      });
+      this.addEdge(source.id, created.id, '视频');
+      this.selectNode(created.id);
+      this.pendingVideos[created.id] = job;
+      return created;
+    },
+
+    /** markEditPending 的视频版：同样不动 dirty（纯 UI 态） */
+    markVideoPending(nodeId: string, jobId: string): void {
+      const id = String(nodeId || '').trim();
+      if (!id) return;
+      this.pendingVideos[id] = String(jobId || '');
+    },
+
+    /** clearEditPending 的视频版 */
+    clearVideoPending(nodeId: string): void {
+      const id = String(nodeId || '').trim();
+      if (!id) return;
+      delete this.pendingVideos[id];
+    },
+
+    /**
+     * 合并写节点 meta（P2「存为角色参考」后把 character_ids 挂回节点用）。
+     * 覆盖式 patch：只动传入的键，已有的其它字段原样保留。这是用户可见的
+     * 画布内容变更（随画布落盘），所以置 dirty。
+     */
+    mergeNodeMeta(nodeId: string, patch: Record<string, unknown>): void {
+      const node = this.nodes.find((n) => n.id === nodeId);
+      if (!node) return;
+      node.meta = { ...(node.meta ?? {}), ...patch };
+      this.dirty = true;
+    },
+
+    /**
+     * 落一次视频结果（canvas_video_result 事件的数据）。
+     *
+     * 与改图的关键差异：产物不是新建节点，而是回填 addVideoJobNode 先落的
+     * pending 节点（按 meta.job_id 认领）。节点找不到（用户删了它 / 应用重启
+     * 丢了内存态）时按 source_node_id 重建下游节点兜底——视频按秒计费，产物
+     * 绝不能因为节点丢了就静默蒸发。失败把原因写进 meta.error 留在节点上：
+     * 视频失败常见且可重试，留一个带原因的节点比悄悄消失友好得多。
+     *
+     * 返回值语义与 applyEditResult 一致：true=产物已进画布，false=失败/没产物。
+     */
+    applyVideoResult(payload: {
+      ok?: boolean;
+      job_id?: string;
+      source_node_id?: string;
+      path?: string;
+      url?: string;
+      duration?: number;
+      model?: string;
+      error?: string;
+      // P2 / P1.5：角色注入与 OSS 直传的事件字段（普通视频不带，行为不变）
+      prompt?: string;
+      final_prompt?: string;
+      character_ids?: number[];
+      character_ref_snapshot?: string[];
+      oss_direct?: boolean;
+      cost_cny?: number | null;
+    }): boolean {
+      const data = payload ?? {};
+      const jobId = String(data.job_id || '').trim();
+      const sourceId = String(data.source_node_id || '').trim();
+      const path = String(data.path || '').trim();
+
+      // 认领 pending 节点：优先 meta.job_id（重启后 pendingVideos 空了也能认）
+      const claimed = jobId
+        ? this.nodes.find(
+            (n) => n.type === 'video' && String(n.meta?.job_id || '') === jobId,
+          )
+        : undefined;
+
+      if (!data.ok || !path) {
+        if (claimed) {
+          claimed.meta = { ...(claimed.meta ?? {}), error: String(data.error || '视频生成失败') };
+          claimed.title = '视频生成失败';
+        }
+        this.clearVideoPending(claimed?.id ?? '');
+        return false;
+      }
+
+      // 回填目标：认领的 pending 节点 → 按源图重建下游节点 → 画布默认位置。
+      // 视频按秒计费，产物在任何情况下都不能静默蒸发。
+      let target = claimed ?? null;
+      if (!target && sourceId) {
+        target = this.addVideoJobNode(sourceId, jobId || 'claimed-late');
+      }
+      if (!target) {
+        target = this.addNode({ type: 'video', x: 240, y: 240, title: '视频' });
+      }
+      target.file = path;
+      const url = String(data.url || '');
+      if (url) target.url = url;
+      target.title = baseName(path);
+      const meta: Record<string, unknown> = { ...(target.meta ?? {}) };
+      delete meta.error;
+      if (typeof data.duration === 'number' && Number.isFinite(data.duration)) {
+        meta.duration_seconds = data.duration;
+      }
+      const model = String(data.model || '');
+      if (model) meta.model = model;
+      // P2 角色上下文：character_ids / character_ref_snapshot（digest 列表，
+      // 角色档案后续更新不破坏旧镜头复现）/ final_prompt（拿它就能复现）
+      if (Array.isArray(data.character_ids) && data.character_ids.length) {
+        meta.character_ids = data.character_ids;
+      }
+      if (Array.isArray(data.character_ref_snapshot)) {
+        meta.character_ref_snapshot = data.character_ref_snapshot;
+      }
+      const finalPrompt = String(data.final_prompt || '');
+      if (finalPrompt) meta.final_prompt = finalPrompt;
+      const rawPrompt = String(data.prompt || '');
+      if (rawPrompt) meta.prompt = rawPrompt;
+      // P1.5：本次首帧是否走了 OSS 直传（省 ¥0.2 重绘）与实测费用
+      if (data.oss_direct === true) meta.oss_direct = true;
+      if (typeof data.cost_cny === 'number' && Number.isFinite(data.cost_cny)) {
+        meta.cost_cny = data.cost_cny;
+      }
+      target.meta = meta;
+      this.dirty = true;
+      this.clearVideoPending(target.id);
+      // url 没拿到（媒体服务没起）：退回占位前先试一次批量解析
+      if (!url) void this.resolveMedia();
+      return true;
     },
 
     /**

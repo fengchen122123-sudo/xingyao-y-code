@@ -522,6 +522,11 @@
   line-height: 1.45;
   color: var(--orange);
 }
+/* 多角色绑定的硬限制明示：比普通提示更重的警示色（多人同框会被拒绝） */
+.cv-edit-hint.is-warn {
+  color: #e06c5f;
+  font-weight: 600;
+}
 /* 次要链接：无边框纯文字 + 虚线下划线，视觉重量低于两个按钮 */
 .cv-edit-link {
   align-self: flex-start;

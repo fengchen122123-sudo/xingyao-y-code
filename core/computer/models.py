@@ -106,6 +106,10 @@ class ComputerAction:
     target: str
     x: int | None = None
     y: int | None = None
+    # 局部观察区域尺寸（browser observe_region 专用；其他动作恒为 None）。
+    # 坐标语义：x/y 是区域左上角的 CSS 视口坐标，width/height 是区域宽高。
+    width: int | None = None
+    height: int | None = None
     path: tuple[tuple[int, int], ...] = ()
     button: str = "left"
     delta_x: int = 0

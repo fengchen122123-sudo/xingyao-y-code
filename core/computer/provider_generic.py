@@ -84,7 +84,10 @@ _GENERIC_DYNAMIC_PROMPT = (
     "7. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。\n"
     "8. 浏览器自动化在 GUI 右侧面板的内嵌浏览器里实时呈现（用户围观），页面按"
     "项目分辨率渲染（桌面页默认 1440×900，移动页建议 375×667）；与目标页面"
-    "不匹配时先用 browser_set_viewport 调整再导航。"
+    "不匹配时先用 browser_set_viewport 调整再导航。\n"
+    "   - 图片型/密集小目标（网格游戏、图表、地图）看不清时，用 observe_region"
+    " 指定 target=browser 与 x/y/width/height（CSS 视口坐标）放大该区域；"
+    "之后的点击坐标以这块区域左上角为 (0,0)，回到整屏用 observe。"
 )
 
 # Provider tool result 的稳定 JSON 序列化参数（设计 10.2）。
@@ -269,6 +272,13 @@ _OBSERVATION_REGION_HINT = (
 _OBSERVATION_BROWSER_POINT_HINT = (
     "【定位提示】本页没有可用的元素引用，请依据这张整屏截图判断位置，"
     "坐标以截图左上角为 (0,0)，不要凭记忆复用旧坐标。"
+)
+
+# 局部观察（browser observe_region）的坐标语义提示（E5，2026-11-03）：
+# 区域图的坐标原点不是页面左上角，模型必须知道点击会按区域原点换算。
+_OBSERVATION_REGION_VIEW_HINT = (
+    "【局部观察】当前是页面局部画面：坐标以这块区域左上角为 (0,0)，"
+    "点击会换算回页面真实位置；需要回到整屏时调用 observe。"
 )
 
 # 「密集无名元素」判定阈值（元素数下限）：低于这个数量时逐行清单仍然便宜且
@@ -533,7 +543,11 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
             "_computer_v1": meta,
         }
     # 显式 observe 永远附图：模型主动要看画面时省略图片等于没回答它。
-    if getattr(observation, "screen_unchanged", False) and observation.action != "observe":
+    # 局部观察同理——模型点名要看这块区域，画面没变也必须给。
+    if (
+        getattr(observation, "screen_unchanged", False)
+        and observation.action not in ("observe", "observe_region")
+    ):
         return {
             "role": "user",
             "content": [
@@ -576,7 +590,11 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
     # 定位提示按 target 区分：observe_region 是 desktop 专属动作，浏览器没有
     # 局部放大能力（旧文案会让模型对 browser 调用它并直接吃 invalid_action）。
     if not element_lines:
-        if observation.target == "browser":
+        if getattr(observation, "action", "") == "observe_region":
+            content.append(
+                {"type": "text", "text": _OBSERVATION_REGION_VIEW_HINT}
+            )
+        elif observation.target == "browser":
             content.append({"type": "text", "text": _OBSERVATION_BROWSER_POINT_HINT})
         else:
             content.append({"type": "text", "text": _OBSERVATION_REGION_HINT})
