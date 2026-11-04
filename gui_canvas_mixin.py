@@ -8,7 +8,8 @@ public snake_case 方法，本任务（M2-T02）只提供持久化四方法：
 - ``canvas_save_project``    原子写单个画布项目
 - ``canvas_delete_project``  删除单个画布项目（幂等）
 
-媒体落盘（M2-T03）与生成类入口在后续任务里追加到本文件，本任务不实现。
+媒体落盘两方法（M2-T03，``canvas_save_media`` / ``canvas_resolve_media``）
+追加在本文件末段；生成类入口（生图 / 改图 / 视频 / 音频）在后续任务里追加。
 
 铁律（与 gui_git_mixin / gui_snip_mixin 同一套）：
 - 所有方法返回可 JSON 序列化的 dict，错误为 {"ok": False, "msg": ...}；
@@ -35,12 +36,14 @@ public snake_case 方法，本任务（M2-T02）只提供持久化四方法：
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -57,6 +60,37 @@ _PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _LEGACY_SCHEMA_MSG = "旧版数据，不支持"
 # 非法 ID 的统一话术
 _INVALID_ID_MSG = "非法画布 ID"
+# 画布媒体目录（相对会话工作目录）：<workdir>/.ycode/canvas/media
+# 跟着项目走：节点里只存相对路径，用户把项目目录整体拷走时图还在
+CANVAS_MEDIA_SUBDIR: tuple = CANVAS_SUBDIR + ("media",)
+# 单次落盘大小上限：先按 base64 长度预判，解码后再用真实字节数复核
+CANVAS_MEDIA_MAX_BYTES = 32 * 1024 * 1024  # 32MB
+_MEDIA_TOO_LARGE_MSG = "媒体文件超过 32MB 上限"
+# mime -> 扩展名白名单（前端 canvas.toDataURL / 上传给出的常见 mime）
+# 白名单外的 mime（如 image/svg+xml：可带脚本）一律拒绝，不猜扩展名
+_MEDIA_MIME_TO_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/wave": "wav",
+    "audio/x-wav": "wav",
+    "audio/mp4": "m4a",
+    "audio/m4a": "m4a",
+    "audio/x-m4a": "m4a",
+}
+# 纯 base64（无 dataURL 前缀）时按 hint_name 的扩展名兜底；svg/html 等不在内
+_MEDIA_EXT_WHITELIST = frozenset(
+    {"png", "jpg", "jpeg", "webp", "gif", "mp4", "webm", "mp3", "wav", "m4a"}
+)
+# media_id -> digest：允许前端多带一个扩展名后缀（"<digest>.png"），其余非法
+_MEDIA_ID_RE = re.compile(r"^([0-9a-f]{64})(?:\.[a-z0-9]{1,8})?$")
 
 
 class CanvasBridgeMixin:
@@ -303,3 +337,194 @@ class CanvasBridgeMixin:
         except Exception as e:
             logger.exception("canvas_delete_project 失败 project_id=%s", project_id)
             return {"ok": False, "msg": f"删除画布失败：{e}"}
+
+    # ------------------------------------------------------------------
+    # 内部工具：画布媒体目录（骨架照抄旧 canvas 桥的 _canvas_media_dir）
+    # ------------------------------------------------------------------
+    def _canvas_media_dir(self) -> Path:
+        """<workdir>/.ycode/canvas/media/（按需创建）。
+
+        与旧 canvas 桥同口径：媒体跟着项目走，节点里只存相对路径，用户把
+        项目目录整体拷走时图还在。创建失败直接抛给调用方转成 ok=False。
+        """
+        path = Path(self._canvas_workdir()).joinpath(*CANVAS_MEDIA_SUBDIR)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _canvas_media_relpath(self, abs_path: str) -> str:
+        """绝对路径 → 相对工作目录的 posix 路径（节点里就存这个）。
+
+        分隔符统一成 "/"，避免 Windows 反斜杠进 JSON 后再被前端当成转义。
+        """
+        try:
+            rel = os.path.relpath(str(abs_path), self._canvas_workdir())
+        except ValueError:
+            # Windows 跨盘符求不出相对路径：原样返回，前端仍能加载
+            return str(abs_path).replace("\\", "/")
+        return str(rel).replace("\\", "/")
+
+    @staticmethod
+    def _canvas_media_ext(mime: str, hint_name: Any) -> Optional[str]:
+        """定落盘扩展名：dataURL 的 mime 优先，其次 hint_name 的扩展名。
+
+        有 mime 但不在白名单 → 返回 None（调用方直接拒绝，不猜扩展名）；
+        没有 mime 时才看 hint_name，供"纯 base64 + 文件名提示"的调用方使用。
+        """
+        clean = str(mime or "").strip().lower().split(";", 1)[0]
+        if clean:
+            return _MEDIA_MIME_TO_EXT.get(clean)
+        hint = str(hint_name or "").strip()
+        ext = os.path.splitext(hint)[1].lstrip(".").lower()
+        return ext if ext in _MEDIA_EXT_WHITELIST else None
+
+    @staticmethod
+    def _canvas_media_digest(media_id: Any) -> str:
+        """media_id → 64 位十六进制 digest；非法格式返回空串（挡住路径注入）。"""
+        raw = str(media_id or "").strip().lower()
+        match = _MEDIA_ID_RE.match(raw)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _canvas_decode_media(data_url_or_bytes: Any) -> Dict[str, Any]:
+        """dataURL / 纯 base64 / bytes → {ok, payload, mime} 或 {ok: False, msg}。
+
+        大小上限在解码前先按 base64 长度预判（32MB 的 base64 有 44MB，先解码
+        再判会白吃一次内存），解码后再用真实字节数复核一次。
+        """
+        if isinstance(data_url_or_bytes, (bytes, bytearray, memoryview)):
+            payload = bytes(data_url_or_bytes)
+            if not payload:
+                return {"ok": False, "msg": "媒体数据为空"}
+            if len(payload) > CANVAS_MEDIA_MAX_BYTES:
+                return {"ok": False, "msg": _MEDIA_TOO_LARGE_MSG}
+            return {"ok": True, "payload": payload, "mime": ""}
+
+        raw = "".join(str(data_url_or_bytes or "").split())
+        mime = ""
+        if raw.startswith("data:"):
+            head, sep, body = raw.partition(",")
+            if not sep:
+                return {"ok": False, "msg": "dataURL 格式非法"}
+            meta = head[len("data:"):]
+            if ";base64" not in meta.lower():
+                return {"ok": False, "msg": "仅支持 base64 编码的 dataURL"}
+            mime = meta.split(";", 1)[0]
+            raw = body
+        if not raw:
+            return {"ok": False, "msg": "媒体数据为空"}
+        # 解码前预判：每 4 个 base64 字符 ≈ 3 字节；余量交给解码后复核
+        if len(raw) // 4 * 3 > CANVAS_MEDIA_MAX_BYTES:
+            return {"ok": False, "msg": _MEDIA_TOO_LARGE_MSG}
+        padded = raw + "=" * (-len(raw) % 4)
+        try:
+            # validate=True：宁可明确拒绝，也不让 b64decode 悄悄丢掉非法字符
+            # 后把"半个文件"写进项目目录
+            payload = base64.b64decode(padded, validate=True)
+        except Exception:
+            return {"ok": False, "msg": "媒体数据不是合法的 base64"}
+        if not payload:
+            return {"ok": False, "msg": "媒体数据为空"}
+        if len(payload) > CANVAS_MEDIA_MAX_BYTES:
+            return {"ok": False, "msg": _MEDIA_TOO_LARGE_MSG}
+        return {"ok": True, "payload": payload, "mime": mime}
+
+    # ------------------------------------------------------------------
+    # 对外桥方法：媒体落盘与预览 URL
+    # ------------------------------------------------------------------
+    def canvas_save_media(self, data_url_or_bytes: Any, hint_name: Any = "") -> Dict[str, Any]:
+        """把前端 dataURL / 纯 base64 落盘到画布媒体目录，并入内容寻址仓库。
+
+        成功: {"ok": True, "media_id", "path", "url", "width", "height", "bytes"}
+        失败: {"ok": False, "msg": ...}
+
+        - ``path`` 是项目内相对路径（正斜杠），节点里存它，项目搬走图还在；
+        - ``media_id`` 是仓库 digest，前端后续 resolve / 生成类接口用它引用媒体；
+        - 归档失败（不在 media_store 白名单，如 mp3/wav/m4a）不推翻"文件已落盘"
+          这件事：media_id / url 留空串，前端先画占位图（与旧改图链路同口径）。
+        """
+        try:
+            decoded = self._canvas_decode_media(data_url_or_bytes)
+            if not decoded.get("ok"):
+                return {"ok": False, "msg": decoded.get("msg") or "媒体数据非法"}
+            payload: bytes = decoded["payload"]
+            mime = str(decoded.get("mime") or "")
+            ext = self._canvas_media_ext(mime, hint_name)
+            if not ext:
+                if mime:
+                    return {"ok": False, "msg": f"不支持的媒体类型：{mime}"}
+                # 既没有 mime 也没有可用 hint：按 canvas 最常见的 png 兜底
+                ext = "png"
+            media_dir = self._canvas_media_dir()
+            target = media_dir / f"{uuid.uuid4().hex}.{ext}"
+            # uuid 文件名本身不可能越界；仍按 resolve 结果复核一次落域（双保险）
+            if not self._canvas_inside(target):
+                logger.warning("canvas_save_media：落盘路径越界，拒绝 %s", target)
+                return {"ok": False, "msg": "非法媒体路径"}
+            with open(target, "wb") as handle:
+                handle.write(payload)
+            rel_path = self._canvas_media_relpath(str(target))
+            media_id = ""
+            url = ""
+            width = height = None
+            try:
+                from core.media_server import media_server
+                from core.media_store import archive_media_file
+
+                item = archive_media_file(str(target))
+                media_id = str(item.get("digest") or "")
+                url = (
+                    media_server.public_url(media_id, str(item.get("ext") or "")) or ""
+                )
+                width = item.get("width")
+                height = item.get("height")
+            except Exception:
+                # 归档失败不推翻"文件已经落好了"：能预览就预览，预览不了前端占位；
+                # media_id 留空即"未入库"，前端据此不要再拿它去 resolve
+                logger.debug("canvas_save_media：归档失败 path=%s", rel_path, exc_info=True)
+                media_id = ""
+                url = ""
+                width = height = None
+            return {
+                "ok": True,
+                "media_id": media_id,
+                "path": rel_path,
+                "url": url,
+                "width": width,
+                "height": height,
+                "bytes": len(payload),
+            }
+        except Exception as e:
+            logger.exception("canvas_save_media 失败")
+            return {"ok": False, "msg": f"保存媒体失败：{e}"}
+
+    def canvas_resolve_media(self, media_id: Any) -> Dict[str, Any]:
+        """digest → 本机媒体服务预览 URL。
+
+        成功: {"ok": True, "url": str}；失败: {"ok": False, "msg": str}
+
+        与旧 canvas_resolve_media 同口径：WebView 里读不到本地文件（没有
+        file:// 权限），预览统一走"内容寻址仓库 + 本机媒体服务"的带令牌 URL。
+        媒体服务没起来（public_url 返回空串）也按失败返回，前端只画占位图。
+        """
+        try:
+            digest = self._canvas_media_digest(media_id)
+            if not digest:
+                return {"ok": False, "msg": "非法媒体 ID"}
+            from core.media_server import media_server
+            from core.media_store import SUPPORTED_MIME, blob_path_for
+
+            for mime in SUPPORTED_MIME:
+                try:
+                    blob_path = blob_path_for(digest, mime)
+                except Exception:
+                    continue
+                if not os.path.isfile(blob_path):
+                    continue
+                url = media_server.public_url(digest, SUPPORTED_MIME[mime].lstrip(".")) or ""
+                if not url:
+                    return {"ok": False, "msg": "媒体服务不可用"}
+                return {"ok": True, "url": url}
+            return {"ok": False, "msg": "媒体不存在"}
+        except Exception as e:
+            logger.exception("canvas_resolve_media 失败 media_id=%s", media_id)
+            return {"ok": False, "msg": f"解析媒体失败：{e}"}
