@@ -174,10 +174,10 @@
         <SubagentPane :active="activeTab === 'subagent'" />
       </div>
 
-      <!-- 无限画布：满幅渲染（flush），页签未激活时把 active 传下去，
-           让画布跳过测量/重绘这类只在可见时才有意义的工作 -->
+      <!-- 画布占位：旧画布已删除，M2 接入新画布面板（设计 §2.5）。
+           保留 data-test="canvas-pane" 与 flush 满幅口径，会话快照恢复不丢页签 -->
       <div v-show="visualTab === 'canvas'" class="rpane active" data-test="canvas-pane">
-        <CanvasPane :active="activeTab === 'canvas'" />
+        <div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary, #888)">画布重构中</div>
       </div>
       </template>
     </div>
@@ -229,9 +229,6 @@ import BrowserPane from './BrowserPane.vue';
 import GitPanel from './GitPanel.vue';
 import SubagentPane from './SubagentPane.vue';
 import NovelPane from './NovelPane.vue';
-// 画布工作台与数据层都放在 src/canvas|stores 下的画布域，与 components 里的
-// 通用面板区分，避免以后画布节点组件把 components 目录撑大
-import CanvasPane from '../canvas/CanvasPane.vue';
 import RightPanelSnip from './RightPanelSnip.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
