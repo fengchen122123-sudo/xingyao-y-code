@@ -22,7 +22,7 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
   venv\\Scripts\\python build_release.py                   完整构建
   venv\\Scripts\\python build_release.py --cli-only         只构建 CLI 相关产物，跳过主安装包
   venv\\Scripts\\python build_release.py --skip-frontend    跳过前端构建，直接用现有 frontend/dist
-  venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build（含画布子应用）
+  venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build
   venv\\Scripts\\python build_release.py --setup-only       只重建两个安装向导（复用现有载荷）
   venv\\Scripts\\python build_release.py --no-split-parts   跳过分卷切割（产物不分发到 Gitee 时用）
 """

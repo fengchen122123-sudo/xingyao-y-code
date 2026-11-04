@@ -1,8 +1,6 @@
 import { defineStore } from 'pinia';
 // Git 工作台事件转发（git_state_changed）；gitStore 不反向依赖 appStore，无环
 import { useGitStore } from './gitStore';
-// 新画布 store（M2-T04 恢复，设计 §3.1）：canvas_* 事件与生图产出采集的落点
-import { useCanvasStore } from './canvas';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
@@ -66,8 +64,6 @@ import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 import { requestFrontendReload } from '../utils/frontendUpdate';
 import type { MediaItem } from '../types/media';
 import type { AttachmentItem } from '../types/composer';
-// 画布「最近产出」托盘素材口径（collectGeneratedImages 的落点类型）
-import type { InsertAssetPayload } from '../canvas/types';
 import { formatPermMode } from '../utils/markdown';
 import {
   reduceExecutionState,
@@ -106,87 +102,6 @@ import {
   DISCLAIMER_VERSION,
   isDisclaimerVersionAccepted,
 } from '../data/disclaimer';
-
-// ── 生图产出采集（设计 §2.3 / §3.3：保留旧口径，落点改新画布 store）──
-// 生图类工具白名单：只有这三个工具的结果文本里出现本地图片路径才进「最近产出」。
-// 为什么是白名单而不是全量扫描：read_file / grep / 代码编辑的结果里也常出现
-// 图片路径，那些不是「刚生成的产出」，全量扫会把托盘刷成历史文件列表
-const IMAGE_OUTPUT_TOOL_NAMES = new Set([
-  'hunyuan_generate_image',
-  'tokenrhythm_generate_image',
-  'tokenrhythm_edit_image',
-]);
-
-// 从工具结果文本里抠本地图片路径，覆盖后端实际产出的两种形态：
-// 1) Markdown：`![生成的图片](C:\dir\hunyuan_20251101_104500.png)`
-//    —— core/hunyuan_image.py 与 plugins/tokenrhythm_image/plugin.py 结尾都要求
-//    模型用这种语法把图展示出来，所以它一定在结果文本里
-// 2) 纯文本：`图片已生成并保存：C:\dir\x.png`（生图）
-//    与 `图片已改图并保存：C:\dir\x.png`（tokenrhythm_edit_image 的文案不同，
-//    所以「生成」与「改图」两个字样都要认，否则改图产出永远进不了托盘）
-//
-// 路径字符类特意用 [^()\n\r] 而不是 \S：Windows 路径允许空格，用户目录里
-// 中文名 + 空格都常见，用 \S 会在第一个空格处截断，拿到一个不存在的路径
-const MARKDOWN_IMAGE_RE = /!\[[^\]]*\]\(\s*([^()\n\r]+?)\s*\)/g;
-const PLAIN_IMAGE_RE = /图片已(?:生成|改图)并保存[:：]\s*([^\n\r]+)/g;
-// 只认图片扩展名：同一行后面可能还跟着 URL、耗时、费用等文字，靠扩展名兜住
-const LOCAL_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|gif|bmp)$/i;
-
-/** 抽出文本里的本地图片路径（去重、保序）；网络地址不算本地产出 */
-function extractLocalImagePaths(text: string): string[] {
-  const out: string[] = [];
-  const push = (rawPath: string) => {
-    // 去掉可能包裹路径的引号/尖括号后再判断扩展名
-    const path = rawPath.trim().replace(/^["'`<]+/, '').replace(/["'`>]+$/, '').trim();
-    if (!path) return;
-    // 生图结果里也有远端 imageUrl（24 小时有效），它不会被归档，跳过
-    if (/^https?:\/\//i.test(path)) return;
-    if (!LOCAL_IMAGE_EXT_RE.test(path)) return;
-    if (!out.includes(path)) out.push(path);
-  };
-  // 两个模块级正则都带 g：复用前先复位游标，否则第二次调用会从上次位置继续
-  for (const re of [MARKDOWN_IMAGE_RE, PLAIN_IMAGE_RE]) {
-    re.lastIndex = 0;
-    let m: RegExpExecArray | null = re.exec(text);
-    while (m !== null) {
-      push(m[1] || '');
-      m = re.exec(text);
-    }
-  }
-  return out;
-}
-
-/** 磁盘路径 → 托盘素材标题（文件名去扩展名） */
-function imageTitleFromPath(path: string): string {
-  const name = path.replace(/\\/g, '/').split('/').pop() || path;
-  return name.replace(/\.[^.]+$/, '') || name;
-}
-
-/**
- * 生图工具收尾：把结果里的图片路径送进画布「最近产出」托盘。
- * 只入托盘、绝不自动 addNode——工具吐几张图就往画布上铺几张，会把用户
- * 精心摆好的构图冲散；要哪张由用户自己点。调用方负责 try/catch。
- *
- * M2-T04 改造：落点从旧画布的 pushRecentOutput 换成新 store 的
- * ingestGeneratedImages（InsertAssetPayload 口径，本地路径记为 storageKey，
- * dataUrl 存 file:// 预览地址，托盘 UI 在 M4-T05 接入）。
- */
-function collectGeneratedImages(toolName: string, resultText: string): void {
-  if (!IMAGE_OUTPUT_TOOL_NAMES.has(toolName)) return;
-  if (!resultText) return;
-  const paths = extractLocalImagePaths(resultText);
-  if (!paths.length) return;
-  const items: InsertAssetPayload[] = paths.map((path) => {
-    const url = toFileUrl(path);
-    return {
-      kind: 'image',
-      dataUrl: url || path,
-      title: imageTitleFromPath(path),
-      storageKey: path,
-    };
-  });
-  useCanvasStore().ingestGeneratedImages(items);
-}
 
 /**
  * 面板宽度启动恢复：读取 localStorage 中上次拖拽记忆的宽度，
@@ -236,10 +151,10 @@ export const SECRETARY_PERSONA_MAX_LEN = 20000;
 
 // 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页，
 // novel 是小说工作台（只读展示项目状态，设计 §7）
-export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent' | 'novel' | 'canvas';
+export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent' | 'novel';
 // 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
 const RIGHT_PANEL_TAB_IDS = new Set<RightPanelTabId>([
-  'files', 'git', 'browser', 'tasks', 'computer', 'subagent', 'novel', 'canvas',
+  'files', 'git', 'browser', 'tasks', 'computer', 'subagent', 'novel',
 ]);
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
@@ -451,105 +366,6 @@ function computerTraceSummary(event: Record<string, unknown>): string {
     return typeof length === 'number' && length >= 0 ? `输入 ${length} 个字符` : '输入文本';
   }
   return COMPUTER_ACTION_KIND_LABELS[kind] || (kind ? `动作 ${kind}` : '电脑动作');
-}
-
-/**
- * canvas_edit_result 事件的载荷解包（画布「就地改图 / 标注改图」的产出回执）。
- *
- * 为什么抽成纯函数：载荷在推送链路上可能已是对象、也可能是被序列化过一层的
- * 字符串（不同桥/对端的历史差异），调用点不该各自 `as any` 猜字段。这里统一
- * 容错：字段缺失一律收敛成安全默认值，解包失败也不抛——一个畸形事件绝不能
- * 打断 handleBridgeEvent 整条链路（后面还有 token_delta 这类高频流要过）。
- */
-export interface CanvasEditResultData {
-  ok: boolean;
-  source_node_id: string;
-  path: string;
-  url: string;
-  error: string;
-}
-
-export function parseCanvasEditResult(raw: unknown): CanvasEditResultData {
-  const fallback: CanvasEditResultData = {
-    ok: false,
-    source_node_id: '',
-    path: '',
-    url: '',
-    error: '',
-  };
-  let src: unknown = raw;
-  if (typeof src === 'string') {
-    try {
-      src = JSON.parse(src);
-    } catch {
-      // 坏 JSON：当作「什么都没收到」，上层按 ok:false 走失败提示
-      return fallback;
-    }
-  }
-  if (!src || typeof src !== 'object') return fallback;
-  const obj = src as Record<string, unknown>;
-  // ok 只认显式 true：后端成功时一定带布尔 true，字符串 "true" 之类不去猜
-  return {
-    ok: obj.ok === true,
-    source_node_id: String(obj.source_node_id ?? ''),
-    path: String(obj.path ?? ''),
-    url: String(obj.url ?? ''),
-    error: String(obj.error ?? ''),
-  };
-}
-
-/**
- * canvas_video_result 事件的载荷解包（画布「图片 → 视频」的产出回执）。
- *
- * 容错口径与 parseCanvasEditResult 完全一致；字段比改图多 job_id / duration /
- * model——视频节点靠 meta.job_id 认领结果（任务受理时先落 pending 节点，
- * 1~5 分钟后靠这个字段把产物回填进去），这三个字段缺了会认领失败。
- */
-export interface CanvasVideoResultData {
-  ok: boolean;
-  job_id: string;
-  source_node_id: string;
-  path: string;
-  url: string;
-  duration: number;
-  model: string;
-  error: string;
-}
-
-export function parseCanvasVideoResult(raw: unknown): CanvasVideoResultData {
-  const fallback: CanvasVideoResultData = {
-    ok: false,
-    job_id: '',
-    source_node_id: '',
-    path: '',
-    url: '',
-    duration: 0,
-    model: '',
-    error: '',
-  };
-  let src: unknown = raw;
-  if (typeof src === 'string') {
-    try {
-      src = JSON.parse(src);
-    } catch {
-      return fallback;
-    }
-  }
-  if (!src || typeof src !== 'object') return fallback;
-  const obj = src as Record<string, unknown>;
-  const duration = typeof obj.duration === 'number' && Number.isFinite(obj.duration)
-    ? obj.duration
-    : 0;
-  return {
-    ok: obj.ok === true,
-    job_id: String(obj.job_id ?? ''),
-    source_node_id: String(obj.source_node_id ?? ''),
-    path: String(obj.path ?? ''),
-    url: String(obj.url ?? ''),
-    duration,
-    model: String(obj.model ?? ''),
-    error: String(obj.error ?? ''),
-  };
 }
 
 export interface MessageMetrics {
@@ -5632,40 +5448,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.openBrowserTabForSession(session);
         return;
       }
-      // 画布节点聚焦（Agent 侧发起「带我去看这张图」）：只改画布 store 的选中态，
-      // 不参与会话 runtime 归属，处理完直接 return。
-      // 节点 id 缺失时什么都不做——静默忽略比清空选中更安全（清空会让用户
-      // 当前正在看的节点莫名丢失高亮）
-      if (type === 'canvas_focus_node') {
-        const nodeId = String(data.node_id || data.id || '');
-        if (nodeId) useCanvasStore().focusNode(nodeId);
-        return;
-      }
-      // 画布改图产出回执（就地改图 / 标注改图共用一个事件）：交给新 store 的
-      // applyEditResult（M4-T01 实装，M2 为占位）。独立支路，不参与会话
-      // runtime 归属，处理完直接 return；失败时才在本会话对话流里说一句原因，
-      // 成功不打扰用户（图自己出现在画布上就是最好的反馈）。
-      if (type === 'canvas_edit_result') {
-        const result = parseCanvasEditResult(data);
-        useCanvasStore().applyEditResult(result);
-        if (!result.ok && result.error) {
-          // 桥事件处理器必须走 notifyChatLocal：notifyChat/broadcastChatNotice
-          // 会把已广播过的事件再广播一次，各端重复插入
-          this.notifyChatLocal(`改图失败：${result.error}`, 'error');
-        }
-        return;
-      }
-      // 画布生成视频回执：产物回填进受理时先落的 pending 视频节点（按
-      // meta.job_id 认领，M4/M6 实装）。失败在对话流里说一句原因，
-      // 成功不打扰（视频自己出现在画布上就是最好的反馈）。
-      if (type === 'canvas_video_result') {
-        const result = parseCanvasVideoResult(data);
-        useCanvasStore().applyVideoResult(result);
-        if (!result.ok && result.error) {
-          this.notifyChatLocal(`视频生成失败：${result.error}`, 'error');
-        }
-        return;
-      }
       // 内嵌浏览器页签归属（后台会话请求打开/导航）：只在目标会话自己的右栏
       // 登记页签，不抢当前界面；切回该会话时原生控件才创建并加载地址。
       if (type === 'embedded_browser_assigned') {
@@ -6045,14 +5827,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
             label: String(d.label || d.name || 'tool'),
             result,
           });
-        }
-        // 生图产出识别：结果文本里出现的本地图片路径放进画布「最近产出」托盘。
-        // 单独 try/catch 包住——正则解析出任何意外都只丢托盘这一条，
-        // 绝不影响上面已经完成的 tool 结果记录（工具轨迹比托盘重要得多）
-        try {
-          collectGeneratedImages(String(d.name || ''), String(d.result || ''));
-        } catch (err) {
-          console.debug('[canvas] 生图产出识别失败，已忽略', err);
         }
       } else if (type === 'plan_updated') {
         if (Array.isArray(data.items)) {

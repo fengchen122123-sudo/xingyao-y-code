@@ -82,15 +82,6 @@ class MediaServer:
     def check_token(self, token: str) -> bool:
         return bool(token) and hmac.compare_digest(token, self._token)
 
-    def access_token(self) -> str:
-        """只读访问器：把本进程的能力令牌交给宿主自己拼 URL 用。
-
-        令牌本来就写在每个媒体 URL 的 query 里（public_url 一直在用），这里补一个
-        不碰下划线的入口，免得 gui_canvas_mixin 去复制令牌逻辑或直接读 _token。
-        服务未启动时返回空串，调用方按"服务不可用"处理。
-        """
-        return self._token if self._server is not None else ""
-
     def public_url(self, digest: str, ext: str) -> str:
         """生成带令牌的媒体访问 URL；服务不可用时返回空串。"""
         if not self.ensure_started():

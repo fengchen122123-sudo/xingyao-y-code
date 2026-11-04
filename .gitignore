@@ -200,5 +200,3 @@ skills/tokenrhythm-account/reference.md
 /a.txt
 /y
 
-# 已下线的 Excalidraw 自由画布子应用的构建残骸（dist/public 字体与 locale 包，移除该子应用时遗留），不入库
-/frontend-canvas/

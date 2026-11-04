@@ -3,8 +3,8 @@
 
 复验「角色库与角色带入」的图像阶段端到端行为：桥层拼装函数与插件工具不改，
 这里用同一份 compose_character_prompt + tokenrhythm_edit_image 走真实 API。
-GUI 桥（pywebview）无法 headless 起，桥内编排已由 tests/test_canvas_character_bridge.py
-钉死；本探针只补「拼装后的 prompt + 主参考垫图真的喂给 API，模型服从度如何」。
+GUI 桥（pywebview）无法 headless 起，桥内编排改由单元测试覆盖；本探针只补
+「拼装后的 prompt + 主参考垫图真的喂给 API，模型服从度如何」。
 
 流程（全部最便宜档，合计预估 ¥0.4）：
     1. 文生图：写实少女半身像（tokenrhythm_generate_image，¥0.2）
@@ -114,7 +114,7 @@ def main() -> int:
     from core.memory import MemoryManager
 
     workdir = os.path.join(run_dir, "proj")
-    refs_dir = os.path.join(workdir, ".ycode", "canvas", "media", "refs")
+    refs_dir = os.path.join(workdir, ".ycode", "character_refs")
     os.makedirs(refs_dir, exist_ok=True)
     portrait_copy = os.path.join(refs_dir, "portrait.png")
     shutil.copy2(portrait, portrait_copy)

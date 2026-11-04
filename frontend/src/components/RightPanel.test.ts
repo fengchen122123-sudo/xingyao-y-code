@@ -124,7 +124,7 @@ it('中性入口展开面板：无页签先显示选择页六卡，点卡片开�
   await nextTick();
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
   expect(wrapper.findAll('.tp-card').map(c => c.text().trim()))
-    .toEqual(['文件', 'Git', '星眼 · 浏览器', '星港 · 后台任务', '星舰 · 子代理', '小说', '画布']);
+    .toEqual(['文件', 'Git', '星眼 · 浏览器', '星港 · 后台任务', '星舰 · 子代理', '小说']);
 
   await wrapper.find('[data-test="picker-card-files"]').trigger('click');
   await nextTick();

@@ -223,8 +223,8 @@ def _save_video_bytes(payload: bytes, save_dir: str, prefix: str) -> str:
     """视频字节落盘：先写 .part 再 os.replace（半截文件绝不顶着正式名字出现）。
 
     刻意不走生图插件的 turn_undo 快照链路：视频几十 MB，把产物字节整体
-    存进撤销记录既慢又会撑爆库；画布媒体目录的产物本也不属于回合撤销
-    （桥路径在回合外执行，prepare_mutation 会走 no_active_checkpoint 分支）。
+    存进撤销记录既慢又会撑爆库；本工具的产物本也不属于回合撤销
+    （落盘在回合外执行，prepare_mutation 会走 no_active_checkpoint 分支）。
     """
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(
@@ -474,7 +474,7 @@ def generate_video(
         lines.append("预估费用：%s 元（任务完成响应未带 billing，以控制台账单为准）" % (estimate,))
     lines.append("任务 id：%s" % task_id)
     lines.append(
-        "请务必在回复中直接告诉用户本地文件路径，并在桌面端画布或播放器中查看该视频。"
+        "请务必在回复中直接告诉用户本地文件路径，便于用户用本地播放器查看该视频。"
     )
     # metadata 给桥层记账用（对话路径模型看不到）：任务 id 与实测费用，
     # 生成台账（character_generation_records）从这里取数
@@ -497,7 +497,7 @@ def generate_video(
 _PERMISSION_KWARGS = dict(
     read_only=False,
     # 不声明 mutates_files：视频落的是本工具的 AI 产物（save_dir 缺省 → AI 生成
-    # 内容目录；画布路径落媒体目录且回合外执行），不属于受控源码编辑，且
+    # 内容目录；落盘在回合外执行），不属于受控源码编辑，且
     # _save_video_bytes 刻意不接入按回合撤销记录器（几十 MB 产物存快照既慢又
     # 撑库，见该函数注释）；与 screenshot_capture / clipboard_image 的 AI 产物
     # 口径一致。声明为 True 会让规格 9.5 的启动校验按"未接入记录器"直接失败。

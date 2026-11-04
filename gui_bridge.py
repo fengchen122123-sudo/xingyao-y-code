@@ -64,7 +64,6 @@ from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_
 from gui_git_mixin import GitBridgeMixin
 from gui_browser_mixin import BrowserBridgeMixin
 from gui_snip_mixin import SnipBridgeMixin
-from gui_canvas_mixin import CanvasBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -1682,7 +1681,7 @@ class _SecretaryDispatchService:
         return dict(row)
 
 
-class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridgeMixin):
+class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -1895,7 +1894,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         from core.workflows.runs import init_run_storage, set_cancel_provider, set_event_sink
         self._workflow_run_storage = init_run_storage(self._memory)
         # 角色库（P2）：同库同模式的新增表（characters / character_refs /
-        # character_generation_records），画布桥经 get_character_storage()
+        # character_generation_records），工具层经 get_character_storage()
         # 取进程级句柄（未注入的 CLI/headless 场景自动降级为不可用提示）
         from core.character_store import init_character_storage
 

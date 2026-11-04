@@ -27,7 +27,7 @@ _PLUGIN_DIR = os.path.join(
 )
 _PLUGIN_ENTRY = os.path.join(_PLUGIN_DIR, "plugin.py")
 
-# 1x1 真 PNG：让 PIL 能读出宽高（ratio 推导依赖它），与画布改图测试同一份字节
+# 1x1 真 PNG：让 PIL 能读出宽高（ratio 推导依赖它）
 _PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"

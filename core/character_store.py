@@ -11,7 +11,7 @@ P2「角色库与角色带入」的数据层：角色档案（外貌锚点句 + 
   （gui_bridge 启动时），未注入（CLI/headless/测试）时 ``get_character_storage()``
   返回 None，桥层 best-effort 降级为「角色库不可用」提示，绝不起死库。
 - 新增表不算 schema_version 变更：CREATE TABLE IF NOT EXISTS 幂等建表，与
-  harness/工作流等既有新增表同一口径；不触碰画布文档的 schema_version。
+  harness/工作流等既有新增表同一口径；不触碰既有表的 schema_version。
 - 主参考唯一性在 DB 层兜底：SQLite 部分唯一索引（WHERE is_primary = 1）保证
   每角色最多一行主参考；替换主参考由 add_ref 在同一事务里先清旧行再插新行。
 - character_ref_snapshot 只存 digest 列表：角色档案后续增删参考图不影响旧
