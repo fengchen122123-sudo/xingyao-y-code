@@ -174,10 +174,10 @@
         <SubagentPane :active="activeTab === 'subagent'" />
       </div>
 
-      <!-- 画布占位：旧画布已删除，M2 接入新画布面板（设计 §2.5）。
-           保留 data-test="canvas-pane" 与 flush 满幅口径，会话快照恢复不丢页签 -->
+      <!-- 画布：M2 起接入新画布面板（设计 §2.5/§3.1）。保留 data-test="canvas-pane"
+           与 flush 满幅口径，会话快照恢复不丢页签 -->
       <div v-show="visualTab === 'canvas'" class="rpane active" data-test="canvas-pane">
-        <div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary, #888)">画布重构中</div>
+        <CanvasPane :active="activeTab === 'canvas'" />
       </div>
       </template>
     </div>
@@ -229,6 +229,8 @@ import BrowserPane from './BrowserPane.vue';
 import GitPanel from './GitPanel.vue';
 import SubagentPane from './SubagentPane.vue';
 import NovelPane from './NovelPane.vue';
+// 画布面板（M2-T04）：入口在 canvas/ 下，RightPanel 只做挂载
+import CanvasPane from '../canvas/CanvasPane.vue';
 import RightPanelSnip from './RightPanelSnip.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
