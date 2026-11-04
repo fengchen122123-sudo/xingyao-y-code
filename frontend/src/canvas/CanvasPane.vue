@@ -46,7 +46,12 @@
         <InfiniteCanvas
           :viewport="store.project.viewport"
           :background-mode="store.project.backgroundMode"
+          :selected-node-ids="selectedNodeIdList"
+          :selected-connection-ids="selectedConnectionIdList"
           @update:viewport="store.setViewport"
+          @selection-change="onSelectionChange"
+          @selection-commit="onSelectionCommit"
+          @canvas-click-empty="store.clearSelection()"
         >
           <!-- 世界坐标内容层：按 project.nodes 逐节点渲染。
                节点只 emit action（不 import store、不写 project），落库统一回到本组件的
@@ -63,31 +68,58 @@
           >
             <component :is="NODE_COMPONENTS[node.type]" :node="node" @action="onNodeAction" />
           </NodeShell>
+          <!-- 框选矩形：与世界层同一 transform，左/top 直接吃世界坐标 -->
+          <SelectionBox :state="selectionBox" />
         </InfiniteCanvas>
         <!-- 空画布占位：浮在画布之上，不吃指针事件（不挡平移缩放） -->
         <div v-if="!store.project.nodes.length" class="canvas-empty-hint" data-test="canvas-empty-hint">
           拖入或生成素材开始
         </div>
+        <!-- 选区工具条：有选中才出现；按钮只 emit，落 store 由 onToolbarAction 负责 -->
+        <SelectionToolbar
+          :selected-node-count="store.selectedNodeIds.size"
+          :selected-connection-count="store.selectedConnectionIds.size"
+          :visible="hasSelection"
+          @action="onToolbarAction"
+        />
       </div>
     </section>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch, type CSSProperties } from 'vue';
+import { computed, ref, watch, type CSSProperties } from 'vue';
 
 import { useCanvasStore } from '../stores/canvas';
 import type { ProjectMeta } from '../canvas/bridge';
 import InfiniteCanvas from './render/InfiniteCanvas.vue';
+import SelectionBox from './render/SelectionBox.vue';
 import NodeShell from './nodes/NodeShell.vue';
 import { NODE_COMPONENTS } from './nodes';
 import type { NodeActionPayload } from './nodes/actions';
-import { CanvasNodeType, type CanvasNodeData } from './types';
+import SelectionToolbar from './tools/SelectionToolbar.vue';
+import { CanvasNodeType, type CanvasNodeData, type SelectionBoxState } from './types';
+import {
+  getNodesInSelectionRect,
+  type SelectionCommitPayload,
+  type SelectionToolbarAction,
+} from './utils/canvas-selection';
 
 const props = withDefaults(defineProps<{ active?: boolean }>(), { active: false });
 
 const store = useCanvasStore();
 const creating = ref(false);
+
+/** 框选帧内的矩形态：由 InfiniteCanvas 的 selection-change 推来，只用于渲染 SelectionBox */
+const selectionBox = ref<SelectionBoxState | null>(null);
+
+// 传给 InfiniteCanvas 的选中集快照（Shift 加选基底）：用数组 prop 而非 Set，
+// 只在 store 选中集变化时重算，不随指针帧刷新
+const selectedNodeIdList = computed(() => Array.from(store.selectedNodeIds));
+const selectedConnectionIdList = computed(() => Array.from(store.selectedConnectionIds));
+const hasSelection = computed(
+  () => store.selectedNodeIds.size + store.selectedConnectionIds.size > 0,
+);
 
 /** 节点在世界层的盒模型：位置/尺寸取 store，z 序对齐参考仓（分组 5 / 普通 10 / 选中 50） */
 function nodeStyle(node: CanvasNodeData): CSSProperties {
@@ -132,7 +164,8 @@ function onNodeAction(payload: NodeActionPayload): void {
       store.commitGroupSnap(nodeId);
       return;
     case 'select':
-      selectNode(nodeId, args?.additive === true);
+      // M3-T03：换成 store 的正式选中 action（单击/Shift 点选口径统一收在 store）
+      store.selectNode(nodeId, args?.additive === true);
       return;
     default:
       // update-title / open-director 等：M3-T05（历史栈）、M7（导演台）再接线，先不吞掉证据
@@ -140,18 +173,39 @@ function onNodeAction(payload: NodeActionPayload): void {
   }
 }
 
-/**
- * 选中落点。M3-T03 会换成 store.setSelection(nodeIds, connectionIds, additive)；
- * 在此之前先直接读写 selectedNodeIds（store 目前没有正式选中 action）。
- */
-function selectNode(nodeId: string, additive: boolean): void {
-  if (!store.project) return;
-  const next = new Set(additive ? store.selectedNodeIds : []);
-  if (additive && next.has(nodeId)) next.delete(nodeId);
-  else next.add(nodeId);
-  store.selectedNodeIds = next;
-  if (!additive) store.selectedConnectionIds = new Set<string>();
+/** 框选帧内：只更新本地矩形态（渲染 SelectionBox），不进 store、不落盘 */
+function onSelectionChange(state: SelectionBoxState): void {
+  selectionBox.value = state;
 }
+
+/**
+ * 框选提交：世界坐标矩形与节点包围盒求交 → store.setSelection（additive=Shift 加选）。
+ * 连线命中随 M3-T04 的 connectionIntersectsWorldRect 一起接（本任务 connectionIds 传空集）。
+ */
+function onSelectionCommit(payload: SelectionCommitPayload): void {
+  selectionBox.value = null;
+  const project = store.project;
+  if (!project) return;
+  const nodeIds = getNodesInSelectionRect(project.nodes, payload.rect);
+  store.setSelection(nodeIds, [], payload.additive);
+}
+
+/**
+ * 选区工具条 → store 的唯一落点。
+ * 删除/复制依赖历史栈与剪贴板（M3-T05）；成组/取消组依赖分组 action（store 尚未提供）。
+ * 本任务先把按钮事件接到这里并留痕，绝不静默改 project。
+ */
+function onToolbarAction(action: SelectionToolbarAction): void {
+  console.debug('[canvas] 选区工具条动作（待后续任务实装）', action, selectedNodeIdList.value);
+}
+
+/** 换项目时清掉可能残留的框（避免上一个项目的框画在新项目上） */
+watch(
+  () => store.project?.id,
+  () => {
+    selectionBox.value = null;
+  },
+);
 
 /** 只刷新列表、不动当前打开的项目：切页签回来不应把编辑中的画布重置掉 */
 function refreshList(): void {

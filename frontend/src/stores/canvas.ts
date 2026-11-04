@@ -328,6 +328,61 @@ export const useCanvasStore = defineStore('canvas', {
       }
     },
 
+    // ── M3-T03 选中集（正式取代 CanvasPane 里 T02 的临时直改 selectedNodeIds）──
+    // 选中态是纯内存态、不落盘：不进 scheduleSave，也不进 M3-T05 的历史栈。
+
+    /**
+     * 整体/并集写选中集。
+     * - additive=false：用新集合覆盖（框选/单击都是这个口径）；
+     * - additive=true：与现有选中取并集（Shift 框选，参考仓 initialSelected* 快照 + 命中）。
+     * id 过滤掉空串与重复，避免脏数据把选中集撑大。
+     */
+    setSelection(nodeIds: string[], connectionIds: string[], additive: boolean): void {
+      if (!this.project) return;
+      const nodes = Array.isArray(nodeIds) ? nodeIds.filter((id) => typeof id === 'string' && id) : [];
+      const connections = Array.isArray(connectionIds)
+        ? connectionIds.filter((id) => typeof id === 'string' && id)
+        : [];
+      if (!additive) {
+        this.selectedNodeIds = new Set(nodes);
+        this.selectedConnectionIds = new Set(connections);
+        return;
+      }
+      const nextNodes = new Set(this.selectedNodeIds);
+      for (const id of nodes) nextNodes.add(id);
+      const nextConnections = new Set(this.selectedConnectionIds);
+      for (const id of connections) nextConnections.add(id);
+      this.selectedNodeIds = nextNodes;
+      this.selectedConnectionIds = nextConnections;
+    },
+
+    /** 清空选中（点空白画布 / Esc 口径；连线选中一同清掉） */
+    clearSelection(): void {
+      this.selectedNodeIds = new Set<string>();
+      this.selectedConnectionIds = new Set<string>();
+    },
+
+    /**
+     * 单击选中单个节点。
+     * - additive（Shift/Ctrl）：已选中则移除、未选中则加入（参考仓 shift 点选是切换）；
+     * - 非 additive：只留这一个节点，并清掉连线选中；但若该节点已在多选集里，则保留多选
+     *   （参考仓 `else if (!nextSelected.has(nodeId))` 同口径），否则多选后拖任一节点会掉成单选。
+     */
+    selectNode(nodeId: string, additive = false): void {
+      if (!this.project || typeof nodeId !== 'string' || !nodeId) return;
+      if (additive) {
+        const next = new Set(this.selectedNodeIds);
+        if (next.has(nodeId)) next.delete(nodeId);
+        else next.add(nodeId);
+        this.selectedNodeIds = next;
+        this.selectedConnectionIds = new Set<string>();
+        return;
+      }
+      const keepMulti = this.selectedNodeIds.has(nodeId) && this.selectedNodeIds.size > 1;
+      if (!keepMulti) this.selectedNodeIds = new Set([nodeId]);
+      this.selectedConnectionIds = new Set<string>();
+    },
+
     /** NodeShell 的 update-text 落点：文本节点正文（聊天侧 collect 走 metadata.content） */
     updateNodeText(id: string, text: string): void {
       const project = this.project;
