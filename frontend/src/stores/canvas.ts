@@ -7,13 +7,21 @@ import { defineStore } from 'pinia';
 import { canvasBridge, type ProjectMeta } from '../canvas/bridge';
 import { CanvasNodeType } from '../canvas/types';
 import type {
+  CanvasBackgroundMode,
   CanvasConnection,
   CanvasNodeData,
   CanvasProject,
+  CanvasNodeMetadata,
   InsertAssetPayload,
   ViewportTransform,
 } from '../canvas/types';
-import { cloneNodes, deserializeNodes, serializeNodes } from '../canvas/utils/clipboard';
+import {
+  CANVAS_CLIPBOARD_PREFIX,
+  CANVAS_CLIPBOARD_VERSION,
+  cloneNodes,
+  deserializeNodes,
+  serializeNodes,
+} from '../canvas/utils/clipboard';
 import {
   GROUP_PADDING,
   findGroupDropTarget,
@@ -100,6 +108,47 @@ function cloneProject(project: CanvasProject): CanvasProject {
     viewport: { ...project.viewport },
     sidePanel: { ...project.sidePanel },
   };
+}
+
+/** JSON 直读值窄化：导入件来自用户文件，任何字段都可能是脏的 */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** 导入只认已知节点类型：未知 type 到了 CanvasPane 找不到渲染组件，只会留一个点不动的空白壳 */
+function isKnownNodeType(type: unknown): boolean {
+  return typeof type === 'string' && (Object.values(CanvasNodeType) as string[]).includes(type);
+}
+
+/** 导入件的视口：三项都是有限数才认，k 非法（NaN/<=0）回落 1 */
+function readImportedViewport(value: unknown): ViewportTransform {
+  if (isPlainObject(value)) {
+    const { x, y, k } = value;
+    if ([x, y, k].every((item) => typeof item === 'number' && Number.isFinite(item))) {
+      const scale = k as number;
+      return { x: x as number, y: y as number, k: scale > 0 ? scale : 1 };
+    }
+  }
+  return { x: 0, y: 0, k: 1 };
+}
+
+/** 背景模式只认三档，其余（缺字段/脏字符串）回落 grid */
+function readImportedBackground(value: unknown): CanvasBackgroundMode {
+  return value === 'dots' || value === 'plain' ? value : 'grid';
+}
+
+/**
+ * 导出前的 metadata 剥离：jobId / progress / startedAt 是「本机这一次会话」的运行态，
+ * 带进导出件只会让重新导入的节点挂在 loading 上等一个永远不来的回填。
+ */
+function stripRuntimeMetadata(metadata: CanvasNodeMetadata | undefined): CanvasNodeMetadata | undefined {
+  if (!metadata) return undefined;
+  const next: CanvasNodeMetadata = { ...metadata };
+  delete next.jobId;
+  delete next.progress;
+  delete next.startedAt;
+  if (next.status === 'loading') next.status = 'idle';
+  return next;
 }
 
 /**
@@ -220,6 +269,114 @@ export const useCanvasStore = defineStore('canvas', {
       this.project = clean;
       this.selectedNodeIds = new Set<string>();
       this.selectedConnectionIds = new Set<string>();
+    },
+
+    /**
+     * 导入项目文件（M3-T07）：JSON 文本 → schema_version 校验 → 形状清洗 → id 全量重生成 → 新建项目落盘。
+     * 复用剪贴板那套纯逻辑：deserializeNodes 做节点/连线形状校验并剔除悬空连线，cloneNodes 做 id
+     * 重生成与 metadata 内引用（groupId/批次/首尾帧）重映射——导入件里的 id 一律不复用，
+     * 免得和当前项目、历史存档的 id 撞车。失败只回 { ok:false, msg }，不新建项目、不动当前 project。
+     */
+    async importProject(raw: string): Promise<{ ok: boolean; msg?: string }> {
+      if (typeof raw !== 'string' || !raw.trim()) return { ok: false, msg: '导入文件为空' };
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return { ok: false, msg: '不是有效的 JSON 文件' };
+      }
+      if (!isPlainObject(parsed)) return { ok: false, msg: '不是有效的画布数据' };
+      // 与后端 canvas_load_project 同口径：v1 明确拒绝，「尽力兼容」只会把缺字段的画布
+      // 转成看着能开、实则丢连线/分组信息的残档。
+      if (parsed.schema_version !== 2) return { ok: false, msg: '旧版数据，不支持' };
+      const rawNodes = parsed.nodes;
+      if (!Array.isArray(rawNodes)) return { ok: false, msg: '画布数据缺少节点列表' };
+
+      // 空画布也允许导入（导出的空项目要能原样回来）；「有节点但一个都不合法」才报错
+      let base = { nodes: [] as CanvasNodeData[], connections: [] as CanvasConnection[] };
+      if (rawNodes.length) {
+        const decoded = deserializeNodes(
+          `${CANVAS_CLIPBOARD_PREFIX}${JSON.stringify({
+            version: CANVAS_CLIPBOARD_VERSION,
+            nodes: rawNodes,
+            connections: Array.isArray(parsed.connections) ? parsed.connections : [],
+          })}`,
+        );
+        if (!decoded) return { ok: false, msg: '画布数据里没有可用的节点' };
+        base = decoded;
+      }
+
+      // 偏移 0：导入要保持原布局（粘贴才需要右下错位）
+      const regenerated = cloneNodes(base, 0);
+      const nodes = regenerated.nodes.filter((node) => isKnownNodeType(node.type));
+      const nodeIds = new Set(nodes.map((node) => node.id));
+      const connections = regenerated.connections.filter(
+        (connection) => nodeIds.has(connection.fromNodeId) && nodeIds.has(connection.toNodeId),
+      );
+
+      const now = Date.now();
+      const project: CanvasProject = {
+        id: newProjectId(),
+        title:
+          typeof parsed.title === 'string' && parsed.title.trim() ? parsed.title.trim() : '未命名画布',
+        createdAt: now,
+        updatedAt: now,
+        nodes,
+        connections,
+        viewport: readImportedViewport(parsed.viewport),
+        backgroundMode: readImportedBackground(parsed.backgroundMode),
+        // 侧栏是纯 UI 态：导入后一律收起，别把导出方的展开状态/节点选中带过来
+        sidePanel: { open: false, width: 320, nodeId: null },
+        nodeCount: nodes.length,
+        connectionCount: connections.length,
+        schema_version: 2,
+      };
+
+      this.project = project;
+      this.selectedNodeIds = new Set<string>();
+      this.selectedConnectionIds = new Set<string>();
+      this.loadError = '';
+      // 与 createProject 同语义：新项目立刻落盘 + 刷列表，不等防抖（否则刷新页面就没了）
+      await this.saveNow();
+      await this.refreshProjectList();
+      return { ok: true };
+    },
+
+    /**
+     * 导出当前项目为 JSON 文本（文件名由调用方按 `<title>.canvas.json` 拼）。
+     * 纯内存、同步：导出不该等桥，也不该有落盘副作用。
+     * 剥运行期字段、剔除悬空连线并同步计数——导出件要能被 importProject 原样吃回来。
+     */
+    exportProjectJson(): string {
+      const project = this.project;
+      if (!project) return '';
+      const nodes = project.nodes.map((node) => ({
+        ...node,
+        position: { ...node.position },
+        metadata: stripRuntimeMetadata(node.metadata),
+      }));
+      const nodeIds = new Set(nodes.map((node) => node.id));
+      const connections = project.connections
+        .filter(
+          (connection) =>
+            nodeIds.has(connection.fromNodeId) && nodeIds.has(connection.toNodeId),
+        )
+        .map((connection) => ({ ...connection }));
+      const payload: CanvasProject = {
+        ...project,
+        nodes,
+        connections,
+        viewport: { ...project.viewport },
+        sidePanel: { ...project.sidePanel },
+        nodeCount: nodes.length,
+        connectionCount: connections.length,
+      };
+      try {
+        return JSON.stringify(payload, null, 2);
+      } catch {
+        // 混进不可序列化值（函数/symbol）：回空串让调用方提示失败，而不是写出一个坏文件
+        return '';
+      }
     },
 
     async refreshProjectList(): Promise<void> {

@@ -1,40 +1,21 @@
 <template>
   <div ref="rootRef" class="canvas-wrap" data-test="canvas-pane-root" tabindex="0">
-    <!-- 左列：项目列表。v1 旧数据照列但置灰（后端 supported=false），
-         提示「旧版数据，不支持」而不隐藏——用户至少能看到并手动清理 -->
-    <aside class="canvas-projects" data-test="canvas-project-list">
-      <div class="cp-head">
-        <span class="cp-title">画布项目</span>
-        <button
-          class="cp-new"
-          data-test="canvas-new-project"
-          :disabled="store.saving || creating"
-          title="新建空白画布"
-          @click="createProject()"
-        >新建</button>
-      </div>
+    <!-- 左列：画布项目侧栏（M3-T07）。列表/新建/改名/删除在 ProjectList 内，
+         导入/导出入口也从侧栏 emit 上来，落 store 与文件读写统一留在本组件 -->
+    <ProjectList @import="openImportPicker" @export="exportOpen = true" />
 
-      <div v-if="store.loadError" class="cp-error" data-test="canvas-error">{{ store.loadError }}</div>
+    <!-- 导入用隐藏文件选择器：accept 限定 .json，读完内容即清空 value（同一文件可重复选） -->
+    <input
+      ref="importInputRef"
+      class="canvas-import-input"
+      type="file"
+      accept=".json,application/json"
+      data-test="canvas-import-input"
+      @change="onImportFileChange"
+    />
 
-      <div v-if="!store.projectList.length" class="cp-empty" data-test="canvas-project-empty">
-        暂无画布项目
-      </div>
-
-      <button
-        v-for="p in store.projectList"
-        :key="p.id"
-        class="cp-item"
-        :class="{ active: store.project?.id === p.id, disabled: !p.supported }"
-        :disabled="!p.supported"
-        :title="p.supported ? p.title : '旧版数据，不支持'"
-        :data-test="'canvas-project-' + p.id"
-        @click="openProject(p)"
-      >
-        <span class="cp-name">{{ p.title }}</span>
-        <span v-if="!p.supported" class="cp-badge" data-test="canvas-v1-badge">旧版数据，不支持</span>
-        <span v-else class="cp-time">{{ formatTime(p.updatedAt) }}</span>
-      </button>
-    </aside>
+    <!-- 导出对话框（M3-T07）：项目 JSON 下载 + 选中图片逐张下载 -->
+    <ExportDialog :open="exportOpen" @close="exportOpen = false" />
 
     <!-- 右列：画布舞台（InfiniteCanvas 承载世界层 transform 与平移缩放手势） -->
     <section class="canvas-stage" data-test="canvas-stage">
@@ -153,7 +134,8 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch, type CSSProperties } from 'vue';
 
 import { useCanvasStore } from '../stores/canvas';
-import type { ProjectMeta } from '../canvas/bridge';
+import ProjectList from './canvas-side-panel/ProjectList.vue';
+import ExportDialog from './tools/ExportDialog.vue';
 import InfiniteCanvas from './render/InfiniteCanvas.vue';
 import ConnectionPath from './render/ConnectionPath.vue';
 import SelectionBox from './render/SelectionBox.vue';
@@ -186,7 +168,10 @@ import {
 const props = withDefaults(defineProps<{ active?: boolean }>(), { active: false });
 
 const store = useCanvasStore();
-const creating = ref(false);
+/** 导出对话框开关（M3-T07）：纯 UI 态，不进 store */
+const exportOpen = ref(false);
+/** 导入用文件选择器句柄（模板里的隐藏 input） */
+const importInputRef = ref<HTMLInputElement | null>(null);
 /** InfiniteCanvas 暴露的 clientToWorld：拉线虚线要按指针位置算世界坐标 */
 const canvasRef = ref<InstanceType<typeof InfiniteCanvas> | null>(null);
 
@@ -579,32 +564,27 @@ watch(
   },
 );
 
-/** 只刷新列表、不动当前打开的项目：切页签回来不应把编辑中的画布重置掉 */
-function refreshList(): void {
-  void store.refreshProjectList();
+/** 侧栏「导入」：打开系统文件选择器（.json 由模板上的 accept 限定） */
+function openImportPicker(): void {
+  importInputRef.value?.click();
 }
 
-async function createProject(): Promise<void> {
-  if (creating.value) return;
-  creating.value = true;
+/**
+ * 导入落点：读文件文本 → store.importProject（校验 schema_version=2、清洗、id 全部重生成、建项目保存）。
+ * 不管成功失败都清空 input.value，否则同一个文件第二次选不会触发 change。
+ * 成功/失败都复用右上角短提示（走 showConnectError 的同一套定时清理）。
+ */
+async function onImportFileChange(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file) return;
   try {
-    await store.createProject();
-  } finally {
-    creating.value = false;
-  }
-}
-
-function openProject(meta: ProjectMeta): void {
-  if (!meta.supported || store.project?.id === meta.id) return;
-  void store.openProject(meta.id);
-}
-
-function formatTime(ts: number): string {
-  if (!ts) return '';
-  try {
-    return new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+    const res = await store.importProject(await file.text());
+    showConnectError(res.ok ? '导入成功' : res.msg || '导入失败');
   } catch {
-    return '';
+    showConnectError('导入失败：读不出文件内容');
+  } finally {
+    if (input) input.value = '';
   }
 }
 
@@ -613,7 +593,7 @@ function formatTime(ts: number): string {
 watch(
   () => props.active,
   (active) => {
-    if (active) refreshList();
+    if (active) void store.refreshProjectList();
   },
   { immediate: true },
 );
