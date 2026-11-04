@@ -1,10 +1,14 @@
 export type Position = { x: number; y: number };
 export type ViewportTransform = { x: number; y: number; k: number }; // topwin 口径 k，不是 zoom
 
-export enum CanvasNodeType {
-  Image = 'image', Panorama = 'panorama', Text = 'text', Config = 'config',
-  Video = 'video', Audio = 'audio', Director = 'director', Group = 'group',
-}
+// 节点类型用 const 对象 + 同名类型别名，而不是 enum：tsconfig 的
+// erasableSyntaxOnly 只允许可擦除语法（enum 会被编译成运行期对象，属不可擦除），
+// 而这一层值只有类型侧使用，没必要为此放宽整个项目的编译约束。
+export const CanvasNodeType = {
+  Image: 'image', Panorama: 'panorama', Text: 'text', Config: 'config',
+  Video: 'video', Audio: 'audio', Director: 'director', Group: 'group',
+} as const;
+export type CanvasNodeType = (typeof CanvasNodeType)[keyof typeof CanvasNodeType];
 export type CanvasNodeStatus = 'idle' | 'success' | 'loading' | 'error';
 export type CanvasGenerationMode = 'text' | 'image' | 'video' | 'audio';
 export type CanvasImageGenerationType = 'generation' | 'edit';
