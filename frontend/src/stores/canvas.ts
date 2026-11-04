@@ -5,6 +5,7 @@
 import { defineStore } from 'pinia';
 
 import { canvasBridge, type ProjectMeta } from '../canvas/bridge';
+import { CanvasNodeType } from '../canvas/types';
 import type {
   CanvasConnection,
   CanvasNodeData,
@@ -12,6 +13,7 @@ import type {
   InsertAssetPayload,
   ViewportTransform,
 } from '../canvas/types';
+import { findGroupDropTarget, snapNodesIntoGroup } from '../canvas/utils/canvas-group';
 // 只借类型、不引入运行期依赖：appStore 反向 import 本 store（value import），
 // 这里若用 value import 会成环；`import type` 编译期擦除，安全。
 import type { CanvasEditResultData, CanvasVideoResultData } from './appStore';
@@ -28,6 +30,8 @@ export interface CanvasJob {
 const RECENT_OUTPUT_LIMIT = 24;
 /** 落盘防抖窗口（拖拽/缩放期间保持高频改内存，不炸桥） */
 const SAVE_DEBOUNCE_MS = 800;
+/** 节点缩放下限：与 M2 fitNodeSize / NodeShell 手柄同口径 */
+const NODE_MIN_SIZE = 48;
 
 type SanitizeTarget = Pick<CanvasProject, 'nodes' | 'connections' | 'nodeCount' | 'connectionCount'>;
 type Sanitizer = <T extends SanitizeTarget>(project: T) => T;
@@ -220,6 +224,118 @@ export const useCanvasStore = defineStore('canvas', {
     setViewport(v: ViewportTransform): void {
       if (!this.project) return;
       this.project.viewport = { ...v };
+      this.scheduleSave();
+    },
+
+    // ── M3-T02 拖拽 / 缩放 / 分组吸附 ─────────────────────────────
+    // 全部只做「内存 + scheduleSave」：历史栈（M3-T05）在这四个 action 外面接，
+    // 现在若自己 push 快照会和后续 stack 重入，反而丢步骤。
+
+    /**
+     * 按世界坐标增量平移节点。
+     * 组拖动带动组内子节点（metadata.groupId === group.id）；子节点若本身就出现在 ids 里，
+     * 用集合去重保证只位移一次（否则「组 + 子节点」同时选中时子节点会被拖两次）。
+     */
+    moveNodes(ids: string[], dx: number, dy: number): void {
+      const project = this.project;
+      if (!project || !Array.isArray(ids) || !ids.length) return;
+      if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+      if (dx === 0 && dy === 0) return;
+
+      const moving = new Set(ids.filter((id) => typeof id === 'string' && id));
+      if (!moving.size) return;
+
+      // 先补齐「组 → 子节点」，再统一位移（不能边遍历边加，避免嵌套组连坐）
+      for (const node of project.nodes) {
+        if (node.type !== CanvasNodeType.Group || !moving.has(node.id)) continue;
+        for (const child of project.nodes) {
+          if (child.metadata?.groupId === node.id) moving.add(child.id);
+        }
+      }
+
+      let changed = false;
+      for (const node of project.nodes) {
+        if (!moving.has(node.id)) continue;
+        node.position = { x: node.position.x + dx, y: node.position.y + dy };
+        changed = true;
+      }
+      if (changed) this.scheduleSave();
+    },
+
+    /**
+     * 缩放单个节点（rect 为世界坐标绝对值，x/y 可省略即只改尺寸）。
+     * - 宽高最小 48；
+     * - metadata.freeResize 为真 → 完全自由；
+     * - 否则锁当前纵横比（媒体节点建节点时尺寸已按 naturalWidth/Height 定，锁比例即锁媒体比例），
+     *   手柄拖哪个方向就跟着放大哪个方向，另一维按比例回算。
+     */
+    resizeNode(id: string, rect: { x?: number; y?: number; width: number; height: number }): void {
+      const project = this.project;
+      if (!project || !rect) return;
+      const node = project.nodes.find((n) => n.id === id);
+      if (!node) return;
+      if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)) return;
+
+      let width = Math.max(NODE_MIN_SIZE, rect.width);
+      let height = Math.max(NODE_MIN_SIZE, rect.height);
+
+      if (!node.metadata?.freeResize && node.width > 0 && node.height > 0) {
+        const ratio = node.width / node.height;
+        const scaleW = width / node.width;
+        const scaleH = height / node.height;
+        // 单一方向手柄（只看其中一维）时无法判断意图，按变化更大的一维作主导
+        const scale = Math.abs(scaleW - 1) >= Math.abs(scaleH - 1) ? scaleW : scaleH;
+        width = Math.max(NODE_MIN_SIZE, node.width * scale);
+        height = Math.max(NODE_MIN_SIZE, width / ratio);
+        if (height < NODE_MIN_SIZE) {
+          height = NODE_MIN_SIZE;
+          width = Math.max(NODE_MIN_SIZE, height * ratio);
+        }
+      }
+
+      node.width = width;
+      node.height = height;
+      node.position = {
+        x: Number.isFinite(rect.x) ? (rect.x as number) : node.position.x,
+        y: Number.isFinite(rect.y) ? (rect.y as number) : node.position.y,
+      };
+      this.scheduleSave();
+    },
+
+    /**
+     * 拖拽/缩放结束时调用：落点组内 → 吸附到 GROUP_PADDING 并写 metadata.groupId；
+     * 落点不在任何组 → 清除原 groupId（出组）。分组节点自身不参与吸附。
+     */
+    commitGroupSnap(id: string): void {
+      const project = this.project;
+      if (!project || !id) return;
+      const node = project.nodes.find((n) => n.id === id);
+      if (!node || node.type === CanvasNodeType.Group) return;
+
+      const moved = new Set([id]);
+      const target = findGroupDropTarget(moved, project.nodes);
+      if (target) {
+        project.nodes = snapNodesIntoGroup(moved, project.nodes, target);
+        this.scheduleSave();
+        return;
+      }
+      if (node.metadata?.groupId) {
+        // 用 delete 而不是置 undefined：落盘 JSON 里不留 `"groupId": null` 这类脏字段
+        const nextMeta = { ...node.metadata };
+        delete nextMeta.groupId;
+        node.metadata = nextMeta;
+        this.scheduleSave();
+      }
+    },
+
+    /** NodeShell 的 update-text 落点：文本节点正文（聊天侧 collect 走 metadata.content） */
+    updateNodeText(id: string, text: string): void {
+      const project = this.project;
+      if (!project) return;
+      const node = project.nodes.find((n) => n.id === id);
+      if (!node || typeof text !== 'string') return;
+      if ((node.metadata?.content ?? '') === text) return;
+      node.metadata = { ...node.metadata, content: text };
       this.scheduleSave();
     },
 

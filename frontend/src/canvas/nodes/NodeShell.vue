@@ -12,6 +12,7 @@
     :data-node-type="node.type"
     :data-selected="selected ? 'true' : 'false'"
     data-test="node-shell"
+    @pointerdown="onBodyPointerDown"
   >
     <!-- 标题栏：普通节点挂在边框上方（参考仓 left-3 top-[-28px]），分组标题落在容器内左上角 -->
     <div class="ns-titlebar" :class="{ 'in-group': isGroup }" data-test="node-shell-titlebar" @dblclick.stop="startTitleEdit" @pointerdown.stop>
@@ -41,8 +42,7 @@
         <slot></slot>
       </div>
 
-      <!-- 八向缩放手柄：本任务只渲染控件（不接拖拽），world 坐标下的指针换算与
-           freeResize/纵横比约束由 M3-T02 接 -->
+      <!-- 八向缩放手柄：M3-T02 起接指针拖拽，按 freeResize 与纵横比约束 emit resize-node -->
       <div
         v-for="handle in RESIZE_HANDLES"
         :key="handle"
@@ -51,16 +51,18 @@
         :data-test="'node-resize-handle'"
         :data-handle="handle"
         aria-hidden="true"
+        @pointerdown.stop="onResizePointerDown($event, handle)"
       ></div>
 
       <!-- 左右连接端口：本任务只渲染（不接线），拖拽连线由 M3-T04 接。
-           与参考仓一致：分组只有右侧 source，生成配置没有右侧 source -->
+           pointerdown.stop：端口上按下不能触发节点拖拽，否则 M3-T04 拉线会顺带挪节点 -->
       <div
         v-if="!isGroup"
         class="ns-port left"
         data-test="node-port"
         data-side="left"
         aria-hidden="true"
+        @pointerdown.stop
       ></div>
       <div
         v-if="!isConfig"
@@ -68,6 +70,7 @@
         data-test="node-port"
         data-side="right"
         aria-hidden="true"
+        @pointerdown.stop
       ></div>
 
       <!-- loading 遮罩：metadata.status === 'loading'（M4 起由 job 状态驱动） -->
@@ -93,7 +96,7 @@
 //   - 缩放手柄参考仓只有四角，本任务按计划稿要求铺八向（角 4 + 边 4）；
 //   - 连接端口 left=target / right=source，鼠标悬停或选中时显现；
 //   - 分组为半透明虚线容器，标题在容器内。
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref } from 'vue';
 
 import type { CanvasNodeData } from '../types';
 import { CanvasNodeType } from '../types';
@@ -104,8 +107,10 @@ defineOptions({ name: 'NodeShell' });
 const props = defineProps<{
   node: CanvasNodeData;
   selected: boolean;
-  /** 只读/拖拽模式下隐藏手柄与端口（M3-T02/T03 用于只读呈现），M3-T01 恒为 true */
+  /** 只读/拖拽模式下隐藏手柄与端口（M3-T03 框选期用于只读呈现），M3-T01/T02 恒为 true */
   interactive: boolean;
+  /** 世界层当前缩放 k：屏幕像素 → 世界坐标的唯一换算因子（M3-T02），缺省 1 */
+  scale?: number;
 }>();
 
 const emit = defineEmits<NodeActionEmits>();
@@ -162,6 +167,214 @@ function finishTitleEdit(): void {
 function cancelTitleEdit(): void {
   editingTitle.value = false;
 }
+
+// ── M3-T02 指针拖拽 / 缩放 ───────────────────────────────────────
+// 几何状态一律由 store 持有：拖拽期间逐帧 emit action（move-nodes / resize-node），
+// 组件自己不留位移副本——否则 NodeShell 根元素的 left/top 由 CanvasPane 的 style
+// 透传（fallthrough 优先级高于组件自身 style），本地预览会被覆盖，反而两套真相。
+const DRAG_THRESHOLD = 3;
+const MIN_NODE_SIZE = 48;
+
+type GestureKind = 'move' | 'resize';
+
+interface GestureState {
+  kind: GestureKind;
+  pointerId: number;
+  handle: string;
+  startClientX: number;
+  startClientY: number;
+  lastClientX: number;
+  lastClientY: number;
+  /** 越过 3px 阈值后置真：未越过的按下-抬起按「点击」处理（只选中，不落位移） */
+  moved: boolean;
+  additive: boolean;
+  /** 手势开始瞬间的世界坐标矩形，缩放全程以它为基准（props.node 会随 store 逐帧变化） */
+  startRect: { x: number; y: number; width: number; height: number };
+}
+
+let gesture: GestureState | null = null;
+
+/** 世界坐标换算因子：k 非法（0 / NaN / 负）时退化为 1，绝不让一次脏视口把节点拖飞 */
+const worldScale = computed(() => {
+  const k = props.scale;
+  return typeof k === 'number' && Number.isFinite(k) && k > 0 ? k : 1;
+});
+
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || typeof el.closest !== 'function') return false;
+  // 表单/媒体/按钮/链接上的按下属于控件自身，不当作节点拖拽
+  return Boolean(el.closest('input, textarea, button, video, audio, a, select, [data-no-node-drag]'));
+}
+
+function onBodyPointerDown(event: PointerEvent): void {
+  if (!props.interactive || event.button !== 0) return;
+  if (editingTitle.value || gesture) return;
+  if (isInteractiveTarget(event.target)) return;
+  beginGesture(event, 'move', '');
+}
+
+function onResizePointerDown(event: PointerEvent, handle: string): void {
+  if (!props.interactive || event.button !== 0) return;
+  if (gesture) return;
+  beginGesture(event, 'resize', handle);
+}
+
+function beginGesture(event: PointerEvent, kind: GestureKind, handle: string): void {
+  gesture = {
+    kind,
+    pointerId: event.pointerId,
+    handle,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    lastClientX: event.clientX,
+    lastClientY: event.clientY,
+    moved: false,
+    additive: event.shiftKey,
+    startRect: {
+      x: props.node.position.x,
+      y: props.node.position.y,
+      width: props.node.width,
+      height: props.node.height,
+    },
+  };
+  // 监听挂 window：指针移出节点（甚至移出画布）也要跟手；jsdom 下同样可用
+  window.addEventListener('pointermove', onGestureMove);
+  window.addEventListener('pointerup', onGestureEnd);
+  window.addEventListener('pointercancel', onGestureCancel);
+}
+
+function detachGestureListeners(): void {
+  window.removeEventListener('pointermove', onGestureMove);
+  window.removeEventListener('pointerup', onGestureEnd);
+  window.removeEventListener('pointercancel', onGestureCancel);
+}
+
+function onGestureMove(event: PointerEvent): void {
+  const g = gesture;
+  if (!g || (event.pointerId !== undefined && g.pointerId !== event.pointerId)) return;
+  // 丢了 pointerup 的兜底：按键已全松 → 按松手收尾
+  if (event.buttons === 0) {
+    finishGesture(g);
+    return;
+  }
+
+  const totalDx = event.clientX - g.startClientX;
+  const totalDy = event.clientY - g.startClientY;
+
+  if (!g.moved) {
+    if (Math.abs(totalDx) < DRAG_THRESHOLD && Math.abs(totalDy) < DRAG_THRESHOLD) return;
+    g.moved = true;
+    // 越过阈值的第一帧把阈值内积累的位移一并补上，节点才不会「落后手 3px」
+    applyGesture(g, totalDx, totalDy);
+    g.lastClientX = event.clientX;
+    g.lastClientY = event.clientY;
+    return;
+  }
+
+  if (g.kind === 'move') {
+    // 平移是世界坐标增量：按上一帧到这一帧的差量下发
+    applyGesture(g, event.clientX - g.lastClientX, event.clientY - g.lastClientY);
+  } else {
+    // 缩放是绝对值：始终相对手势起点重算，累积误差不会滚雪球
+    applyGesture(g, totalDx, totalDy);
+  }
+  g.lastClientX = event.clientX;
+  g.lastClientY = event.clientY;
+}
+
+function applyGesture(g: GestureState, dxScreen: number, dyScreen: number): void {
+  const k = worldScale.value;
+  if (g.kind === 'move') {
+    const dx = dxScreen / k;
+    const dy = dyScreen / k;
+    if (dx === 0 && dy === 0) return;
+    // ids 只给本节点：分组拖动要带动子节点，展开逻辑在 store.moveNodes 里统一做
+    emit('action', { nodeId: props.node.id, action: 'move-nodes', args: { ids: [props.node.id], dx, dy } });
+    return;
+  }
+  const rect = resizeRect(g.startRect, g.handle, dxScreen / k, dyScreen / k, props.node.metadata?.freeResize === true);
+  emit('action', { nodeId: props.node.id, action: 'resize-node', args: { rect } });
+}
+
+/**
+ * 八向手柄 → 新矩形（世界坐标）。
+ * 未开 freeResize 时锁纵横比：角手柄取变化更大的一维作主导，边手柄只看自己那一维，
+ * 另一维按比例回算，并把未拖动的边/轴固定住（拖右边不挪左边，拖上下边水平居中）。
+ */
+function resizeRect(
+  start: { x: number; y: number; width: number; height: number },
+  handle: string,
+  dx: number,
+  dy: number,
+  free: boolean,
+): { x: number; y: number; width: number; height: number } {
+  const west = handle.includes('left');
+  const east = handle.includes('right');
+  const north = handle.startsWith('top');
+  const south = handle.startsWith('bottom');
+  const startRight = start.x + start.width;
+  const startBottom = start.y + start.height;
+
+  let width = start.width + (east ? dx : 0) - (west ? dx : 0);
+  let height = start.height + (south ? dy : 0) - (north ? dy : 0);
+  width = Math.max(MIN_NODE_SIZE, width);
+  height = Math.max(MIN_NODE_SIZE, height);
+
+  if (!free && start.width > 0 && start.height > 0) {
+    const ratio = start.width / start.height;
+    const scaleW = width / start.width;
+    const scaleH = height / start.height;
+    const scale = west || east
+      ? (north || south
+        ? (Math.abs(scaleW - 1) >= Math.abs(scaleH - 1) ? scaleW : scaleH)
+        : scaleW)
+      : scaleH;
+    width = Math.max(MIN_NODE_SIZE, start.width * scale);
+    height = Math.max(MIN_NODE_SIZE, width / ratio);
+    if (height < MIN_NODE_SIZE) {
+      // 触到下限时以高度为准回算宽度，保证比例与 48px 下限同时成立
+      height = MIN_NODE_SIZE;
+      width = Math.max(MIN_NODE_SIZE, height * ratio);
+    }
+  }
+
+  const x = west ? startRight - width : east ? start.x : start.x + (start.width - width) / 2;
+  const y = north ? startBottom - height : south ? start.y : start.y + (start.height - height) / 2;
+  return { x, y, width, height };
+}
+
+function onGestureEnd(event: PointerEvent): void {
+  const g = gesture;
+  if (!g || (event.pointerId !== undefined && g.pointerId !== event.pointerId)) return;
+  finishGesture(g);
+}
+
+function onGestureCancel(event: PointerEvent): void {
+  const g = gesture;
+  if (!g || (event.pointerId !== undefined && g.pointerId !== event.pointerId)) return;
+  // 取消也算收尾：已落下的位移保持在 store 里，但仍走一次吸附，避免节点半挂在组边界
+  finishGesture(g);
+}
+
+function finishGesture(g: GestureState): void {
+  detachGestureListeners();
+  gesture = null;
+
+  // 阈值内＝点击：只做选中（M3-T03 会换成 store.setSelection 正式 action）
+  if (!g.moved) {
+    emit('action', { nodeId: props.node.id, action: 'select', args: { additive: g.additive } });
+    return;
+  }
+  // 拖拽/缩放收尾：交给 store 做进组/出组判定（进组写 groupId，出组清除）
+  emit('action', { nodeId: props.node.id, action: 'commit-group-snap', args: {} });
+}
+
+onBeforeUnmount(() => {
+  detachGestureListeners();
+  gesture = null;
+});
+
 </script>
 
 <style scoped>

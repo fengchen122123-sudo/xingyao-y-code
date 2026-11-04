@@ -57,6 +57,7 @@
             :node="node"
             :selected="store.selectedNodeIds.has(node.id)"
             :interactive="true"
+            :scale="store.project.viewport.k"
             :style="nodeStyle(node)"
             @action="onNodeAction"
           >
@@ -104,11 +105,52 @@ function nodeStyle(node: CanvasNodeData): CSSProperties {
 
 /**
  * 节点 → 画布 的唯一上行入口（八个节点组件 + NodeShell 都 emit 到这里）。
- * M3-T01 只做 console 级占位：update-title / update-text / open-director 等动作
- * 从 M3-T02 起在这里翻译成 store action（节点自身永远不 import store）。
+ * M3-T02 接线：update-text / move-nodes / resize-node / commit-group-snap / select；
+ * 未列出的动作（update-title、open-director…）先留痕，待后续任务落 store。
  */
 function onNodeAction(payload: NodeActionPayload): void {
-  console.debug('[canvas] node action（M3-T02 前仅占位）', payload);
+  const { nodeId, action, args } = payload;
+  switch (action) {
+    case 'update-text':
+      store.updateNodeText(nodeId, typeof args?.content === 'string' ? args.content : '');
+      return;
+    case 'move-nodes': {
+      const ids = Array.isArray(args?.ids) ? (args.ids as string[]) : [nodeId];
+      const dx = Number(args?.dx);
+      const dy = Number(args?.dy);
+      if (Number.isFinite(dx) && Number.isFinite(dy)) store.moveNodes(ids, dx, dy);
+      return;
+    }
+    case 'resize-node': {
+      const rect = args?.rect as { x?: number; y?: number; width: number; height: number } | undefined;
+      if (rect && Number.isFinite(rect.width) && Number.isFinite(rect.height)) {
+        store.resizeNode(nodeId, rect);
+      }
+      return;
+    }
+    case 'commit-group-snap':
+      store.commitGroupSnap(nodeId);
+      return;
+    case 'select':
+      selectNode(nodeId, args?.additive === true);
+      return;
+    default:
+      // update-title / open-director 等：M3-T05（历史栈）、M7（导演台）再接线，先不吞掉证据
+      console.debug('[canvas] node action（未接线）', payload);
+  }
+}
+
+/**
+ * 选中落点。M3-T03 会换成 store.setSelection(nodeIds, connectionIds, additive)；
+ * 在此之前先直接读写 selectedNodeIds（store 目前没有正式选中 action）。
+ */
+function selectNode(nodeId: string, additive: boolean): void {
+  if (!store.project) return;
+  const next = new Set(additive ? store.selectedNodeIds : []);
+  if (additive && next.has(nodeId)) next.delete(nodeId);
+  else next.add(nodeId);
+  store.selectedNodeIds = next;
+  if (!additive) store.selectedConnectionIds = new Set<string>();
 }
 
 /** 只刷新列表、不动当前打开的项目：切页签回来不应把编辑中的画布重置掉 */
