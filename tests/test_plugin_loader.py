@@ -1,6 +1,9 @@
 """core/plugin_loader.py 的单元测试。"""
 
 import json
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -657,3 +660,83 @@ def test_prune_orphan_providers_keeps_account_provider(monkeypatch):
     assert [p["id"] for p in written["data"]["providers"]] == ["tr1", "p_plugin", "p_user"]
     # 激活模型属于被删厂商时才清空，属于保留厂商时不受影响
     assert written["data"]["active_model_id"] is None
+
+
+# ── 并发安全：信任确认不阻塞后台线程 / 刷新串行化（2026-11-04 卡死事故回归） ──
+
+def test_confirm_plugin_trust_never_prompts_from_worker_thread(monkeypatch):
+    """后台线程（工具调用 / 前端 RPC）绝不落到控制台 input()。
+
+    事故：plugin_manage 触发的 get_plugins 在 worker 线程刷新插件，未信任插件
+    走到 input()，提示打在隐藏控制台里无人回答，回合线程卡死 5.5 小时，停止
+    按钮也无法中断。回归要求：非主线程直接判定未信任并返回。
+    """
+    prompts = []
+
+    class _Tty:
+        def isatty(self):
+            return True
+
+    def _fake_input(prompt=""):
+        prompts.append(prompt)
+        raise AssertionError("后台线程不应调用 input()")
+
+    monkeypatch.setattr(plugin_loader, "_trust_prompt", None)
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", _REAL_CONFIRM)
+    monkeypatch.setattr("sys.stdin", _Tty())
+    monkeypatch.setattr("sys.stdout", _Tty())
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    result = []
+
+    def _run():
+        result.append(
+            plugin_loader._confirm_plugin_trust(Path("demo"), "demo", "fp")
+        )
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    worker.join(5)
+
+    assert result == [False]
+    assert prompts == []
+
+
+def test_refresh_plugins_serializes_concurrent_loads(plugin_env, monkeypatch):
+    """并发 refresh_plugins 只加载一次：不串行会让同一插件被重复 exec+register。"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "serial", "serial_demo", _GOOD_PLUGIN)
+    plugin_loader._PLUGIN_INFOS.clear()
+
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+    real_load = plugin_loader._load_one
+
+    def _slow_load(plugin_dir, registry):
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.1)
+            return real_load(plugin_dir, registry)
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setattr(plugin_loader, "_load_one", _slow_load)
+
+    registry = ToolRegistry()
+    threads = [
+        threading.Thread(target=plugin_loader.refresh_plugins, args=(registry,))
+        for _ in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert max_active == 1
+    loaded = [i for i in plugin_loader.get_plugin_infos() if i["name"] == "serial_demo"]
+    assert len(loaded) == 1

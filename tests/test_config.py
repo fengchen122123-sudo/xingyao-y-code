@@ -264,8 +264,8 @@ def test_fixed_reasoning_model_rejects_changes_without_writing(tmp_path, monkeyp
     """固定思考模型不能被设置接口伪装成可关闭模型。"""
     data = _provider_config()
     model = data["providers"][0]["models"][0]
-    model["name"] = "kimi-k2.7-code"
-    model["litellm_model"] = "openai/kimi-k2.7-code"
+    model["name"] = "minimax-m2.5"
+    model["litellm_model"] = "openai/minimax-m2.5"
     cfg = _use_tmp_config(tmp_path, monkeypatch, data)
     model_manager.load_config()
     before = cfg.read_bytes()

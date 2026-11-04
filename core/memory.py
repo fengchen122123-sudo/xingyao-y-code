@@ -916,6 +916,36 @@ class MemoryManager:
                         created_at TEXT
                     )
                 ''')
+                # 秘书派活台账：一条派活一行，派活时落库、回合收尾回写终态。
+                # 读写走 core/secretary_dispatches.py 的 DispatchStore（复用本连接
+                # 与 _lock，不开第二个写句柄）。字段名与
+                # docs/superpowers/specs/2026-11-04-secretary-upgrade-design.md 3.1 一致。
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS secretary_dispatches (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        secretary_session TEXT NOT NULL,
+                        target_session    TEXT NOT NULL,
+                        target_display   TEXT NOT NULL DEFAULT '',
+                        workdir          TEXT NOT NULL DEFAULT '',
+                        title            TEXT NOT NULL DEFAULT '',
+                        prompt           TEXT NOT NULL,
+                        status           TEXT NOT NULL DEFAULT 'running',
+                        depends_on       TEXT NOT NULL DEFAULT '[]',
+                        batch_id         TEXT NOT NULL DEFAULT '',
+                        started_at       TEXT NOT NULL DEFAULT '',
+                        finished_at      TEXT NOT NULL DEFAULT '',
+                        result_excerpt   TEXT NOT NULL DEFAULT '',
+                        error            TEXT NOT NULL DEFAULT ''
+                    )
+                ''')
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_secretary_dispatches_target "
+                    "ON secretary_dispatches(target_session)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_secretary_dispatches_secretary "
+                    "ON secretary_dispatches(secretary_session, status)"
+                )
                 # token 用量统计表：每次流式响应结束后追加一条真实用量记录，
                 # 供 /usage 按模型与日期区间聚合（今日/近7天/近30天）
                 cursor.execute('''

@@ -1540,6 +1540,12 @@ def _configured_reasoning_choice(model_cfg, capability):
 
     if legacy_enabled is True and "on" in capability.options:
         return "on"
+    # 历史 enable_thinking=true 迁移到无 on 档的强度模型（如 qwen 全系
+    # default/off/low/medium/xhigh）：显式开启意图不能丢。default 档不注入
+    # 参数（跟随服务端默认），这里取最低真实档 low——enable_thinking_effort
+    # 策略会同时注入 enable_thinking=true，保住"开启思考"语义且开销最小。
+    if legacy_enabled is True and "low" in capability.options:
+        return "low"
     return "default"
 
 
@@ -1583,7 +1589,11 @@ def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=Fa
                 result["output_config"] = {"effort": choice}
                 result["allowed_openai_params"] = ["output_config"]
                 return capability
-            if normalized_model not in _K3_REASONING_MODEL_NAMES:
+            # kimi 家族全系（含 k2.5/k2.6/k2.7-code）与 K3 同档，Anthropic 路由统一翻译为 thinking.budget_tokens。
+            if (
+                normalized_model not in _K3_REASONING_MODEL_NAMES
+                and not normalized_model.split("/")[-1].startswith("kimi")
+            ):
                 raise ValueError("Anthropic 路由不支持该模型的 reasoning_effort 参数")
             budget_tokens = _ANTHROPIC_REASONING_BUDGETS[choice]
             result["thinking"] = {

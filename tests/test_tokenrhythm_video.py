@@ -410,9 +410,10 @@ class RegisterTest(unittest.TestCase):
         self.assertIn("duration", props)
         self.assertIn("resolution", props)
         self.assertIn("save_dir", props)
-        # 权限口径与生图插件一致（写文件 + 网络副作用 + 可取消）
+        # 视频是 AI 产物（默认落 AI 生成内容目录，刻意不接入按回合撤销记录器），
+        # 因此不声明 mutates_files；审批/取消口径仍与生图插件一致
         self.assertFalse(spec.read_only)
-        self.assertTrue(spec.mutates_files)
+        self.assertFalse(spec.mutates_files)
         self.assertTrue(spec.requires_permission)
         self.assertTrue(spec.cancellable)
         self.assertEqual(spec.side_effect_scope, "network")

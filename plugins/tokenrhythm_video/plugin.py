@@ -496,7 +496,12 @@ def generate_video(
 
 _PERMISSION_KWARGS = dict(
     read_only=False,
-    mutates_files=True,          # 会下载视频写入本地文件
+    # 不声明 mutates_files：视频落的是本工具的 AI 产物（save_dir 缺省 → AI 生成
+    # 内容目录；画布路径落媒体目录且回合外执行），不属于受控源码编辑，且
+    # _save_video_bytes 刻意不接入按回合撤销记录器（几十 MB 产物存快照既慢又
+    # 撑库，见该函数注释）；与 screenshot_capture / clipboard_image 的 AI 产物
+    # 口径一致。声明为 True 会让规格 9.5 的启动校验按"未接入记录器"直接失败。
+    mutates_files=False,
     requires_permission=True,    # 视频按条计费且耗时分钟级，写操作走用户审批
     cancellable=True,            # 轮询+下载耗时长，允许用户中断
     parallel_safe=False,

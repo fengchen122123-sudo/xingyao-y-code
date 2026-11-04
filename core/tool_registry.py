@@ -528,9 +528,97 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="检索历史会话",
             side_effect_scope="none",
         ),
+        # 派活台账只读查询（升级设计 2026-11-04 第 3.4 节）：同样仅秘书会话可见，
+        # 让秘书能回答「刚才那些任务怎么样」而不必重新检索会话或让用户复述。
+        ToolSpec(
+            name="list_dispatches",
+            description=(
+                "查询秘书派出的任务台账（秘书专用）：按状态 / 项目目录 / 目标会话"
+                "（会话名或显示名子串）列出最近的派活记录，每条含任务编号、标题、"
+                "目标会话、状态、起止时间与结论摘要（截 200 字）。用户问「刚才那个"
+                "怎么样」「派出去的任务跑完了吗」时先查这里；需要完整结论或错误用 "
+                "get_dispatch_result。返回 JSON 字符串；无命中返回可读文本。"
+            ),
+            input_schema=_schema({
+                "status": {"type": "string", "default": "", "description": "按状态过滤：queued / running / done / failed / cancelled / blocked（可选）"},
+                "workdir": {"type": "string", "default": "", "description": "按项目目录过滤（可选，精确匹配）"},
+                "target": {"type": "string", "default": "", "description": "按目标会话名或显示名做子串过滤（可选）"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "最多返回的任务数（上限 50）"},
+            }),
+            execute=tools.list_dispatches,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询派活记录",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="get_dispatch_result",
+            description=(
+                "查一条派活任务的完整详情（秘书专用）：dispatch_id 取 list_dispatches "
+                "返回的编号，返回完整任务正文（prompt）、完整结论摘要（不截断）、"
+                "错误信息、依赖任务与批次号等全字段。汇报「那个任务到底干了什么 / "
+                "为什么失败」时用它。编号不存在会给可读提示。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "dispatch_id": {"type": "integer", "description": "任务编号（必填），取自 list_dispatches 返回的 id"},
+            }, ["dispatch_id"]),
+            execute=tools.get_dispatch_result,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询派活任务详情",
+            side_effect_scope="none",
+        ),
+        # 项目画像只读（升级设计 2026-11-04 第 5.2 节）：scope=none，秘书会话
+        # 天然放行；普通会话看不到（名字在 core.secretary 的 SECRETARY_ONLY_TOOLS）。
+        ToolSpec(
+            name="read_project_profile",
+            description=(
+                "读某个项目的画像（秘书专用）：跨会话积累的长期记忆，含技术栈 / "
+                "架构决策 / 硬约束 / 踩坑记录 / 用户偏好 / 任务流水六章。workdir "
+                "为空时取当前会话的项目目录。用户问「这个项目以前定过什么规矩 / "
+                "踩过哪些坑」时先读它，不要凭印象猜。没有画像时返回可读文本。"
+            ),
+            input_schema=_schema({
+                "workdir": {"type": "string", "default": "", "description": "项目目录（可选，空 = 当前会话的工作目录）"},
+            }),
+            execute=tools.read_project_profile,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="读取项目画像",
+            side_effect_scope="none",
+        ),
     ]
 
     mutating_specs = [
+        # 项目画像写入（升级设计 2026-11-04 第 5.2 节）：只写
+        # ~/.ycode/memory/projects/，路径校验在 core.project_profile 内。
+        # requires_permission=False：这是秘书自己的长期记忆，写的是 memory 目录
+        # 而非项目文件（路径越界直接拒绝），逐次弹确认只会卡住汇总流程。
+        ToolSpec(
+            name="remember_decision",
+            description=(
+                "把一条项目级结论记进项目画像（秘书专用）：section 只能是 技术栈 / "
+                "架构决策 / 硬约束 / 踩坑记录 / 用户偏好，workdir 为空时取当前会话的"
+                "项目目录。技术栈 / 架构决策 / 硬约束三节会在下次向该项目派活时自动"
+                "带入任务正文，用户不用重复交代。只写记忆目录，不碰项目文件。"
+            ),
+            input_schema=_schema({
+                "workdir": {"type": "string", "default": "", "description": "项目目录（可选，空 = 当前会话的工作目录）"},
+                "section": {
+                    "type": "string",
+                    "enum": ["技术栈", "架构决策", "硬约束", "踩坑记录", "用户偏好"],
+                    "description": "写到哪一节（必填，取值见枚举）",
+                },
+                "content": {"type": "string", "description": "要记住的内容（必填，1200 字以内，越短越有效）"},
+            }, ["section", "content"]),
+            execute=tools.remember_decision,
+            requires_permission=False,
+            activity_description="记录项目决策",
+            side_effect_scope="workspace",
+        ),
         ToolSpec(
             name="ask_user",
             description="向用户提出一个需要选择的澄清问题。必须提供 1 到 3 个选项；有计划时只能绑定独立的用户输入准备项。",
@@ -1249,6 +1337,43 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             parallel_safe=False,
             activity_description="派发任务给会话",
             side_effect_scope="system",  # 表未覆盖：会向其它会话投递消息并触发真实执行
+        ),
+        ToolSpec(
+            name="dispatch_batch",
+            description=(
+                "一次派出多条任务并声明批次内依赖（秘书专用，升级设计 2026-11-04 第 6.1 节）："
+                "tasks 每项含 title / prompt / target / workdir / depends_on，depends_on 填"
+                "同批次其它任务的**下标**（从 0 开始）。无依赖项立刻并行派发；有依赖项先挂起，"
+                "等上游全部完成后自动启动，不必再催。单批最多 8 条；下标越界 / 指向自身 / "
+                "成环会被直接拒绝。用户一句话交代多个有先后关系的小任务时优先用它。"
+                "返回 JSON 字符串（含 batch_id 与每项 state）。"
+            ),
+            input_schema=_schema({
+                "tasks": {
+                    "type": "array",
+                    "description": "任务数组（1..8 条）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "default": "", "description": "任务标题（可选，缺省取 prompt 前 40 字）"},
+                            "prompt": {"type": "string", "description": "任务正文（必填），会作为用户消息投递给目标会话"},
+                            "target": {"type": "string", "default": "", "description": "目标会话名或显示名；留空或填「新会话」表示新建会话"},
+                            "workdir": {"type": "string", "default": "", "description": "仅新建会话时生效：新会话归属的项目目录"},
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "同批次内上游任务的下标（从 0 开始）；留空表示无依赖，可立即派发",
+                            },
+                        },
+                        "required": ["prompt"],
+                    },
+                },
+            }, ["tasks"]),
+            execute=tools.dispatch_batch,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="批量派发任务",
+            side_effect_scope="system",  # 与 dispatch_task 同口径：向多个会话投递消息并触发真实执行
         ),
         ToolSpec(
             name="open_session",

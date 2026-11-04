@@ -466,8 +466,46 @@ def test_init_failure_is_recorded_for_error_reporting():
     )
     assert "0x8007139F" in ctrl._init_error
     assert ctrl._ready is False
-    ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
-    assert ctrl._init_error == ""
+    # 失败控件已作废（见下个用例），错误只在重建后的新控件成功时被清空
+    ctrl2, _core2 = _fake_ready_controller()
+    ctrl2._init_error = "old"
+    ctrl2._on_init_completed(ctrl2._webview, SimpleNamespace(IsSuccess=True))
+    assert ctrl2._init_error == ""
+
+
+def test_init_failure_recycles_control_so_next_open_can_recreate():
+    """初始化失败的控件必须作废，否则面板白板到进程结束。
+
+    _create_control 以「self._webview is not None」为幂等判据：失败后若仍留着
+    引用，后续每次 open 都命中幂等分支直接返回，永远没有重建入口
+    （2026-11-02/03/04 各出现过一次的 0x8007139F 就是这样僵死的）。
+    """
+    ctrl, _core = _fake_ready_controller()
+    ctrl._on_init_completed(
+        ctrl._webview,
+        SimpleNamespace(IsSuccess=False, InitializationException="boom (0x8007139F)"),
+    )
+    assert ctrl._webview is None  # 引用已清：下次 open 会走重建
+    assert ctrl._ready is False
+    assert ctrl._visible is False
+    assert ctrl._pending_url == ""
+
+
+def test_set_bounds_restores_visibility_of_recreated_control():
+    """控件被自动化重建后（新控件默认 Visible=False），前端只会反复发
+    set_bounds 而不会重新 open；set_bounds 必须顺手把可见性拉回来，否则面板
+    永远是「框和地址栏都在、内容区空白」的白板，且没有任何自愈路径。
+    """
+    ctrl, _core = _fake_ready_controller()
+    ctrl._webview.Visible = False
+    ctrl._visible = False
+    ctrl._apply_bounds = lambda *_args, **_kwargs: None  # 跳过 WinForms 依赖
+
+    result = ctrl.set_bounds({"x": 10, "y": 20, "width": 300, "height": 200})
+
+    assert result["ok"] is True
+    assert ctrl._webview.Visible is True
+    assert ctrl._visible is True
 
 
 def test_probe_cdp_endpoint_gives_up_within_timeout():

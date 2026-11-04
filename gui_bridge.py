@@ -49,6 +49,16 @@ from core.memory import MemoryManager
 from core import novel_service
 from core import secretary
 from core.secretary_dispatch import SecretaryDispatchError
+from core.secretary_dispatches import (
+    STATUS_BLOCKED,
+    STATUS_CANCELLED,
+    STATUS_DONE,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    DispatchStore,
+)
+from core import project_profile
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_terminal
 from gui_git_mixin import GitBridgeMixin
@@ -629,12 +639,22 @@ def _media_save_filename(suggested_name: str, ext: str) -> str:
 
 # 检索返回上限：超过此值直接夹紧（一次倾倒几百条会话既无用又费 token）
 _SECRETARY_SEARCH_LIMIT_MAX = 50
+# 派活台账查询上限与列表摘要长度（与 core.tools 的 _SECRETARY_LIST_EXCERPT_CHARS
+# 及升级设计 2026-11-04 第 3.4 节口径一致）
+_SECRETARY_DISPATCH_LIMIT_MAX = 50
+_SECRETARY_DISPATCH_EXCERPT_CHARS = 200
 # 同一会话最多回带几条命中片段（与 memory 检索口径一致，防止长会话刷屏）
 _SECRETARY_SNIPPET_MAX = 3
 # 新建会话的草稿名口径：与 create_session 一致
 _SECRETARY_DRAFT_NAME_RE = re.compile(r"^session_[a-f0-9]{6}$")
 # target 命中这些语义别名时走"按目录新建会话"分支
 _SECRETARY_NEW_SESSION_MARKS = ("新会话", "新对话", "new", "new_session")
+# 派活时自动注入项目画像的两行标题（升级设计 2026-11-04 第 5.3 节文案，
+# 测试与提示词都按这串文本断言，改动需同步）
+_SECRETARY_PROFILE_HEADER = "【项目背景（自动带入，可忽略）】"
+_SECRETARY_TASK_HEADER = "【任务】"
+# 单批派活上限（升级设计 2026-11-04 第 6.1 节：与子代理并行上限同量级）
+_SECRETARY_BATCH_MAX = 8
 
 
 def _secretary_parse_date(value: str, field: str) -> str:
@@ -665,6 +685,118 @@ def _secretary_in_date_range(updated_at: str, date_from: str, date_to: str) -> b
     return True
 
 
+def _secretary_batch_cycle_path(dep_map: Dict[int, List[int]]) -> List[int]:
+    """在批次依赖图上找一条环路径（如 ``[0, 1, 0]``）；无环返回空列表。
+
+    三色 DFS：白色未访问 / 灰色在栈上 / 黑色已完成。命中灰色节点即发现回边，
+    顺着当前栈切出环路径，报错文案据此直接指认"谁依赖谁"，模型才好改。
+    """
+    unvisited, on_stack, finished = 0, 1, 2
+    color = {index: unvisited for index in dep_map}
+    stack: List[int] = []
+    stack_pos: Dict[int, int] = {}
+
+    def _visit(node: int) -> List[int]:
+        color[node] = on_stack
+        stack_pos[node] = len(stack)
+        stack.append(node)
+        for upstream in dep_map.get(node) or []:
+            if upstream not in color:
+                continue
+            if color[upstream] == on_stack:
+                start = stack_pos.get(upstream, 0)
+                return list(stack[start:]) + [upstream]
+            if color[upstream] == unvisited:
+                found = _visit(upstream)
+                if found:
+                    return found
+        stack.pop()
+        stack_pos.pop(node, None)
+        color[node] = finished
+        return []
+
+    for index in sorted(dep_map):
+        if color[index] != unvisited:
+            continue
+        found = _visit(index)
+        if found:
+            return found
+    return []
+
+
+def _secretary_parse_batch_tasks(tasks) -> List[Dict[str, Any]]:
+    """校验批量派活入参并归一化；任何非法都抛 ``SecretaryDispatchError``。
+
+    校验项：非空数组、单批 ≤ 8 条、每项是对象且 ``prompt`` 非空、
+    ``depends_on`` 是整数数组且不越界 / 不指向自身 / 无重复、整体无环。
+    这是"派发前拒绝"的唯一入口——进到派发阶段就不再回头校验依赖关系。
+    """
+    if isinstance(tasks, (str, bytes)) or not isinstance(tasks, (list, tuple)):
+        raise SecretaryDispatchError("dispatch_batch 的 tasks 需要是任务数组")
+    items = list(tasks)
+    if not items:
+        raise SecretaryDispatchError("dispatch_batch 至少需要一条任务")
+    if len(items) > _SECRETARY_BATCH_MAX:
+        raise SecretaryDispatchError(
+            f"单批最多 {_SECRETARY_BATCH_MAX} 条任务，收到 {len(items)} 条；"
+            "请拆成多批，或先挑最急的几条"
+        )
+    total = len(items)
+    normalized: List[Dict[str, Any]] = []
+    dep_map: Dict[int, List[int]] = {}
+    for index, task in enumerate(items):
+        if not isinstance(task, dict):
+            raise SecretaryDispatchError(
+                f"第 {index + 1} 条任务需要是对象（含 prompt / target / depends_on 等字段）"
+            )
+        prompt_text = str(task.get("prompt") or "").strip()
+        if not prompt_text:
+            raise SecretaryDispatchError(f"第 {index + 1} 条任务的 prompt（任务正文）不能为空")
+        raw_depends = task.get("depends_on")
+        dep_indices: List[int] = []
+        if raw_depends is not None and raw_depends != "":
+            if isinstance(raw_depends, (int, str)):
+                raw_depends = [raw_depends]
+            if not isinstance(raw_depends, (list, tuple, set, frozenset)):
+                raise SecretaryDispatchError(
+                    f"第 {index + 1} 条任务的 depends_on 需要是下标数组"
+                )
+            for raw in raw_depends:
+                try:
+                    parsed = int(raw)
+                except (TypeError, ValueError):
+                    raise SecretaryDispatchError(
+                        f"第 {index + 1} 条任务的 depends_on 含非整数项：{raw!r}"
+                    )
+                if parsed < 0 or parsed >= total:
+                    raise SecretaryDispatchError(
+                        f"第 {index + 1} 条任务的 depends_on 下标 {parsed} 越界"
+                        f"（合法范围 0..{total - 1}）"
+                    )
+                if parsed == index:
+                    raise SecretaryDispatchError(
+                        f"第 {index + 1} 条任务的 depends_on 不能指向自己"
+                    )
+                if parsed not in dep_indices:
+                    dep_indices.append(parsed)
+        dep_map[index] = list(dep_indices)
+        normalized.append({
+            "title": str(task.get("title") or "").strip(),
+            "prompt": prompt_text,
+            "target": str(task.get("target") or "").strip(),
+            "workdir": str(task.get("workdir") or "").strip(),
+            "depends_on": list(dep_indices),
+        })
+    cycle = _secretary_batch_cycle_path(dep_map)
+    if cycle:
+        # 下标在提示里按人类习惯从 1 数起，避免与"依赖数组下标 0"混淆
+        path_text = " → ".join(f"#{position + 1}" for position in cycle)
+        raise SecretaryDispatchError(
+            f"任务依赖成环（循环依赖）：{path_text}；请调整 depends_on 后重试"
+        )
+    return normalized
+
+
 class _SecretaryDispatchService:
     """秘书调度台能力的桥侧实现（注册为 core.secretary_dispatch 的句柄）。
 
@@ -679,6 +811,14 @@ class _SecretaryDispatchService:
 
     def __init__(self, bridge: "ApiBridge") -> None:
         self._bridge = bridge
+        # 派活台账（P0）：与记忆库共用同一个连接（DispatchStore 内部全程吞异常，
+        # 写失败只记 debug，不影响派活与回合收尾）。取不到 manager 时置 None，
+        # 调用处一律判空，台账缺失不得让派活失败。
+        try:
+            self._store = DispatchStore(bridge._memory)
+        except Exception:
+            logger.debug("初始化派活台账失败", exc_info=True)
+            self._store = None
 
     # ------------------------------------------------------------------
     # 内部：会话清单、显示名、目标解析
@@ -894,13 +1034,89 @@ class _SecretaryDispatchService:
     # 能力二：派活
     # ------------------------------------------------------------------
     def dispatch_task(self, target: str = "", prompt: str = "", workdir: str = "",
-                      model_id: str = "", permission_mode: str = "") -> Dict[str, Any]:
+                      model_id: str = "", permission_mode: str = "",
+                      task_title: str = "") -> Dict[str, Any]:
         """把任务投递给已有会话，或按 workdir 懒创建新会话执行。
 
         投递语义与用户亲手发消息**完全一致**：走既有 _spawn_turn_worker，不传
         display_text / internal_kind，目标会话里看到的是一条普通 role=user 消息；
         目标会话忙则进既有 _message_queues（FIFO，回合结束自动补发），全程持
         _turn_start_lock 保证"检查 + 启动"原子。
+
+        task_title 是台账里的任务标题（可选）：缺省取 prompt 前 40 字，供秘书
+        后续按标题回查任务，也是 notice 里引用的「任务 #N」对应的那条记录。
+
+        单条派活 = 解析计划（``_prepare_dispatch``）→ 启动回合
+        （``_launch_dispatch``）→ 落台账。批量派活（``dispatch_batch``）复用前
+        两步，但它自己先建台账行，因此不会为同一条任务重复落库。
+        """
+        plan = self._prepare_dispatch(
+            target=target,
+            prompt=prompt,
+            workdir=workdir,
+            model_id=model_id,
+            permission_mode=permission_mode,
+            task_title=task_title,
+        )
+        if plan.get("ok") is False:
+            # 目标命中多条：原样回候选列表，由上层追问用户确认后重派
+            return plan
+        state, queued_entry, dispatch_context = self._launch_dispatch(plan)
+
+        # 落台账（P0）：已启动或已入队之后才写，保证状态与真实投递一致。台账任何
+        # 异常都不得让派活失败——store 缺失 / create 返回 None 时 dispatch_id 传空，
+        # notice 退化成不带任务编号的旧文案，其余流程照旧。dispatch_context 是同一
+        # 个 dict 对象（worker 收尾时才读），此处补写两个键的时序是安全的。
+        task_title_text = plan["task_title"]
+        dispatch_id = None
+        try:
+            store = getattr(self, "_store", None)
+            if store is not None:
+                dispatch_id = store.create(
+                    secretary_session=plan["notify_session"],
+                    target_session=plan["target_session"],
+                    target_display=plan["display_name"],
+                    workdir=plan["workdir"],
+                    title=task_title_text,
+                    prompt=plan["prompt"],
+                    status=STATUS_QUEUED if state == STATUS_QUEUED else STATUS_RUNNING,
+                )
+        except Exception:
+            logger.debug("派活台账落库失败", exc_info=True)
+            dispatch_id = None
+        self._bind_ledger_to_dispatch(
+            dispatch_context, queued_entry, dispatch_id, task_title_text
+        )
+        return {
+            "ok": True,
+            "target_session": plan["target_session"],
+            "display_name": plan["display_name"],
+            "workdir": plan["workdir"],
+            "state": state,
+            "dispatch_id": dispatch_id,
+            "task_title": task_title_text,
+        }
+
+    # ------------------------------------------------------------------
+    # 能力二·内部：解析计划 / 启动回合 / 台账绑定
+    # 拆成"纯解析"与"启动"两步，是为了让单条派活（dispatch_task）、批量派活
+    # （dispatch_batch）与依赖推进器（resume_dispatch）共用同一条投递通道：
+    # 解析不产生副作用，启动才是唯一真正派发的地方。
+    # ------------------------------------------------------------------
+    def _prepare_dispatch(self, target: str = "", prompt: str = "", workdir: str = "",
+                          model_id: str = "", permission_mode: str = "",
+                          task_title: str = "") -> Dict[str, Any]:
+        """解析一次派发（目标会话 / 投递文本 / 通知归属），**不碰回合通道**。
+
+        返回以 ``ok`` 区分两种结局：``{"ok": False, "msg", "candidates"}`` 表示
+        target 命中多个会话（原样回上层追问）；其余情况返回可直接启动的组合：
+        target_session / display_name / workdir / pending_workdir / is_new /
+        pending_permission / notify_session / delivery_text / prompt /
+        task_title / model_id。
+
+        参数非法一律抛 ``SecretaryDispatchError``（可读原因）。因为纯解析无副作用，
+        批量派活可以先把整批计划算完再建台账行——不会出现"第三条第目标写错，
+        前两条却已经落库/派出去"的半批状态。
         """
         bridge = self._bridge
         prompt_text = str(prompt or "").strip()
@@ -965,49 +1181,331 @@ class _SecretaryDispatchService:
 
         # 完成通知按"发起会话"路由：用户在秘书会话里看不到目标会话的流式输出
         notify_session = str(getattr(bridge, "_current_session", "") or "")
-        dispatch_context = {"display_name": display_name, "notify_session": notify_session}
-        queued_permission = pending_permission if is_new else ""
+        resolved_workdir = pending_workdir or self._session_workdir(session_name)
+        return {
+            "ok": True,
+            "target_session": session_name,
+            "display_name": display_name,
+            "workdir": resolved_workdir,
+            "pending_workdir": pending_workdir,
+            "is_new": is_new,
+            "pending_permission": pending_permission,
+            "notify_session": notify_session,
+            "delivery_text": self._delivery_text(prompt_text, resolved_workdir),
+            "prompt": prompt_text,
+            "task_title": str(task_title or "").strip() or prompt_text[:40],
+            "model_id": clean_model_id,
+        }
+
+    def _delivery_text(self, prompt_text: str, workdir: str) -> str:
+        """投递文本：项目画像注入后拼在任务正文前；任何异常回落原文（派活不受影响）。
+
+        只改**投递**文本（落库的 role=user 消息内容），台账仍记原始 prompt。
+        """
+        try:
+            injection = project_profile.build_injection(workdir)
+            if injection:
+                return (
+                    f"{_SECRETARY_PROFILE_HEADER}\n{injection}\n\n"
+                    f"{_SECRETARY_TASK_HEADER}\n{prompt_text}"
+                )
+        except Exception:
+            logger.debug("派活注入项目画像失败", exc_info=True)
+            return prompt_text
+        return prompt_text
+
+    def _presumed_status(self, session_name: str) -> str:
+        """建台账行时预判的派发状态：目标忙 → queued，否则 running。
+
+        真实状态由 ``_launch_dispatch`` 在 _turn_start_lock 内给出，两者不一致时
+        由 ``_reconcile_ledger_status`` 纠正（正常情况下二者必然一致）。
+        """
+        try:
+            return STATUS_QUEUED if self._bridge._is_turn_active(session_name) else STATUS_RUNNING
+        except Exception:
+            return STATUS_RUNNING
+
+    def _pending_workdir_for(self, session_name: str, workdir: str) -> str:
+        """待建会话的懒创建工作目录：目标会话尚未落库时返回该目录，否则空串。
+
+        批量派活里"派给新会话的活"会先落 blocked，解锁时那个 session_xxxxxx 还
+        不存在，必须把 workdir 透传给 worker 才能绑到正确项目；已存在的会话一律
+        以自身归属为准（与 ``_automation_pending_workdir`` 同口径）。
+        """
+        raw = str(workdir or "").strip()
+        if not raw:
+            return ""
+        try:
+            for item in self._candidate_sessions(include_archived=True):
+                if str(item.get("name")) == session_name:
+                    return ""
+        except Exception:
+            logger.debug("查询派活目标会话归属失败", exc_info=True)
+            return ""
+        return raw
+
+    def _bind_ledger_to_dispatch(self, dispatch_context, queued_entry,
+                                 dispatch_id, task_title) -> None:
+        """把台账 id / 标题绑到回合上下文与排队条目上。
+
+        收尾回写（``_finalize_secretary_dispatch``）靠 dispatch_context 里的
+        dispatch_id，排队补发（``_drain_message_queue``）靠排队条目里的同名键；
+        两处必须同时写，否则排队派活跑完不会回写台账。
+        """
+        if isinstance(dispatch_context, dict):
+            dispatch_context["dispatch_id"] = dispatch_id
+            dispatch_context["task_title"] = task_title
+        if isinstance(queued_entry, dict):
+            queued_entry["secretary_dispatch_id"] = dispatch_id
+            queued_entry["secretary_dispatch_task_title"] = task_title
+
+    def _reconcile_ledger_status(self, store, dispatch_id, presumed: str, actual: str) -> None:
+        """实际派发状态与建行时的预判不一致时纠正台账。
+
+        只在新行仍处于预判状态时才改：回合可能在本方法返回前就跑完并写进终态，
+        那种情况下绝不能把它改回 running（宁可留个中间态也不覆盖已出的结论）。
+        """
+        if presumed == actual:
+            return
+        try:
+            row = store.get(dispatch_id)
+            if not isinstance(row, dict):
+                return
+            if str(row.get("status") or "") != presumed:
+                return
+            store.mark_status(dispatch_id, actual)
+        except Exception:
+            logger.debug("派活台账状态纠正失败", exc_info=True)
+
+    def _launch_dispatch(self, plan, *, dispatch_id=None, task_title="") -> tuple:
+        """按计划启动（或入队）一个回合；返回 (state, queued_entry, dispatch_context)。
+
+        全程持 _turn_start_lock，与用户亲手发消息的"检查 + 启动"原子语义一致；
+        不传 display_text / internal_kind，保证落库与展示同用户手输消息同形。
+        """
+        bridge = self._bridge
+        session_name = plan["target_session"]
+        display_name = plan["display_name"]
+        pending_workdir = str(plan.get("pending_workdir") or "")
+        queued_permission = plan["pending_permission"] if plan["is_new"] else ""
+        dispatch_context = {
+            "display_name": display_name,
+            "notify_session": plan["notify_session"],
+            "dispatch_id": dispatch_id,
+            "task_title": task_title,
+        }
+        queued_entry: Optional[Dict[str, Any]] = None
         with bridge._turn_start_lock:
             if bridge._is_turn_active(session_name):
-                bridge._message_queues.setdefault(session_name, []).append({
+                queued_entry = {
                     "id": f"q_{uuid.uuid4().hex[:8]}",
-                    "text": prompt_text,
+                    "text": plan["delivery_text"],
                     "attachments": [],
                     "queued_at": time.time(),
                     # 派活等同用户亲手发消息：不写 display_text（前端按原文渲染气泡）
                     "turn_source": "local",
                     "pending_workdir": pending_workdir,
-                    "secretary_model_id": clean_model_id,
+                    "secretary_model_id": plan["model_id"],
                     "secretary_permission_mode": queued_permission,
                     "secretary_dispatch_display_name": display_name,
-                    "secretary_dispatch_notify_session": notify_session,
-                })
+                    "secretary_dispatch_notify_session": plan["notify_session"],
+                }
+                bridge._message_queues.setdefault(session_name, []).append(queued_entry)
                 # 快照在锁内发：与用户消息排队路径同序
                 bridge._emit_message_queue_snapshot(session_name)
-                state = "queued"
+                state = STATUS_QUEUED
             else:
                 try:
                     bridge._spawn_turn_worker(
-                        prompt_text,
+                        plan["delivery_text"],
                         session_name,
                         pending_workdir=pending_workdir,
                         # 派活是本地入口：turn_source 固定 local；不传 display_text /
                         # internal_kind，保证落库与展示与用户手输消息同形（硬要求）
                         turn_source="local",
-                        pending_model_id=clean_model_id,
+                        pending_model_id=plan["model_id"],
                         pending_permission_mode=queued_permission,
                         secretary_dispatch_context=dispatch_context,
                     )
                 except Exception as e:
                     logger.exception("秘书派活启动回合失败")
                     raise SecretaryDispatchError(f"派活失败：{e}")
-                state = "running"
+                state = STATUS_RUNNING
+        return state, queued_entry, dispatch_context
+
+    def dispatch_batch(self, tasks=None) -> Dict[str, Any]:
+        """一次派出多条任务，支持同批次内的下标依赖（P3 批量派活）。
+
+        入参每项 ``{title, prompt, target, workdir, depends_on}``，``depends_on``
+        指向同批次内其它任务的下标（从 0 开始）。语义（升级设计 2026-11-04 6.1）：
+        无依赖项立刻派发（通道与 ``dispatch_task`` 完全相同）；有依赖项先落
+        ``blocked`` 不派发，等上游全部 done 后由桥侧依赖推进器自动启动；
+        单批上限 8 条，下标越界 / 指向自身 / 成环在派发前直接拒绝。
+
+        流程：整批计划先解析完 → 为所有任务建台账行（无依赖按 running/queued，
+        有依赖落 blocked）→ 把下标依赖翻译成真实 dispatch_id 用
+        ``set_depends_on`` 回写 → 只对无依赖项真正启动回合。因此同一条任务只会
+        落一条台账，不存在"预建行 + 派发再建行"的重复。
+
+        返回 ``{ok, batch_id, items: [{index, dispatch_id, state}]}``；同批次所有
+        记录的 batch_id 相同，秘书可用 list_dispatches 按批汇总。
+        """
+        entries = _secretary_parse_batch_tasks(tasks)
+        store = self._ledger_store()
+        batch_id = f"batch_{uuid.uuid4().hex[:8]}"
+
+        # 1) 整批计划先解析完：任何一条目标不明确都在写台账行之前整批拒绝
+        plans: List[Dict[str, Any]] = []
+        for index, entry in enumerate(entries):
+            try:
+                plan = self._prepare_dispatch(
+                    target=entry["target"],
+                    prompt=entry["prompt"],
+                    workdir=entry["workdir"],
+                    task_title=entry["title"],
+                )
+            except SecretaryDispatchError as exc:
+                raise SecretaryDispatchError(f"第 {index + 1} 条任务无法派发：{exc}")
+            if plan.get("ok") is False:
+                candidates = plan.get("candidates") or []
+                names = "、".join(str(c.get("session_name") or "") for c in candidates)
+                raise SecretaryDispatchError(
+                    f"第 {index + 1} 条任务的目标「{entry['target']}」命中多个会话"
+                    f"（{names}），请指明具体会话后再批量派活"
+                )
+            plans.append(plan)
+
+        # 2) 建台账行：有依赖落 blocked（不派发），无依赖按当前忙碌情况预判状态
+        index_to_id: Dict[int, int] = {}
+        presumed: Dict[int, str] = {}
+        for index, entry in enumerate(entries):
+            plan = plans[index]
+            status = (
+                STATUS_BLOCKED if entry["depends_on"]
+                else self._presumed_status(plan["target_session"])
+            )
+            dispatch_id = store.create(
+                secretary_session=plan["notify_session"],
+                target_session=plan["target_session"],
+                target_display=plan["display_name"],
+                workdir=plan["workdir"],
+                title=plan["task_title"],
+                prompt=plan["prompt"],
+                status=status,
+                batch_id=batch_id,
+            )
+            if dispatch_id is None:
+                raise SecretaryDispatchError(
+                    f"派活台账写入失败（第 {index + 1} 条任务），本批已中止，未派发任何任务"
+                )
+            index_to_id[index] = dispatch_id
+            presumed[index] = status
+
+        # 3) 下标 → 真实 dispatch_id：依赖关系只能等整批 id 都拿到后才能落
+        for index, entry in enumerate(entries):
+            if not entry["depends_on"]:
+                continue
+            store.set_depends_on(
+                index_to_id[index],
+                [index_to_id[dep_index] for dep_index in entry["depends_on"]],
+            )
+
+        # 4) 只派发无依赖项；有依赖项保持 blocked，等上游 done 后由推进器启动
+        results: List[Dict[str, Any]] = []
+        for index, entry in enumerate(entries):
+            dispatch_id = index_to_id[index]
+            plan = plans[index]
+            upstream_ids = [index_to_id[dep_index] for dep_index in entry["depends_on"]]
+            if upstream_ids:
+                results.append({
+                    "index": index,
+                    "dispatch_id": dispatch_id,
+                    "state": STATUS_BLOCKED,
+                    "depends_on": upstream_ids,
+                })
+                continue
+            try:
+                state, queued_entry, dispatch_context = self._launch_dispatch(
+                    plan, dispatch_id=dispatch_id, task_title=plan["task_title"]
+                )
+            except Exception as exc:
+                logger.debug("批量派活第 %s 条启动失败", index + 1, exc_info=True)
+                store.mark_status(dispatch_id, STATUS_FAILED, error=str(exc))
+                # 上游起不来等同上游失败：立刻级联阻断它的下游，别让下游白等
+                try:
+                    self._bridge._advance_dependents(dispatch_id)
+                except Exception:
+                    logger.debug("批量派活失败项的下游阻断失败", exc_info=True)
+                results.append({
+                    "index": index,
+                    "dispatch_id": dispatch_id,
+                    "state": STATUS_FAILED,
+                    "error": str(exc),
+                })
+                continue
+            self._bind_ledger_to_dispatch(
+                dispatch_context, queued_entry, dispatch_id, plan["task_title"]
+            )
+            self._reconcile_ledger_status(store, dispatch_id, presumed[index], state)
+            results.append({"index": index, "dispatch_id": dispatch_id, "state": state})
+        return {"ok": True, "batch_id": batch_id, "items": results}
+
+    def resume_dispatch(self, dispatch_id: int = 0) -> Dict[str, Any]:
+        """把一条落 ``blocked`` 的台账恢复派发（依赖满足后由推进器调用，P3）。
+
+        与 ``dispatch_task`` 的区别：**不新建台账行**——目标会话、任务正文、目录、
+        标题全部取自台账行，派发时带着同一个 dispatch_id，收尾才回到同一条记录。
+        返回 ``{ok, dispatch_id, state, target_session}``；台账行不存在 / 缺关键
+        字段时抛 ``SecretaryDispatchError``（推进器按吞异常处理）。
+        """
+        store = self._ledger_store()
+        try:
+            parsed_id = int(dispatch_id)
+        except (TypeError, ValueError):
+            raise SecretaryDispatchError(f"dispatch_id 需要是整数，收到：{dispatch_id!r}")
+        row = store.get(parsed_id)
+        if not isinstance(row, dict):
+            raise SecretaryDispatchError(f"没有找到任务 #{parsed_id}")
+        current = str(row.get("status") or "")
+        if current != STATUS_BLOCKED:
+            # 幂等护栏：两个上游同时完成时可能并发推进到同一条下游，
+            # 只有仍处于 blocked 的记录才需要（且允许）被重新启动
+            raise SecretaryDispatchError(
+                f"任务 #{parsed_id} 当前状态为 {current or '未知'}，不需要重新启动"
+            )
+        session_name = str(row.get("target_session") or "").strip()
+        prompt_text = str(row.get("prompt") or "").strip()
+        if not session_name or not prompt_text:
+            raise SecretaryDispatchError(
+                f"任务 #{parsed_id} 的台账缺少目标会话或任务正文，无法自动启动"
+            )
+        workdir = str(row.get("workdir") or "").strip()
+        plan = {
+            "target_session": session_name,
+            "display_name": str(row.get("target_display") or "") or session_name,
+            "workdir": workdir,
+            "pending_workdir": self._pending_workdir_for(session_name, workdir),
+            "is_new": False,
+            "pending_permission": "",
+            "notify_session": str(row.get("secretary_session") or ""),
+            "delivery_text": self._delivery_text(prompt_text, workdir),
+            "prompt": prompt_text,
+            "model_id": "",
+            "task_title": str(row.get("title") or ""),
+        }
+        state, queued_entry, dispatch_context = self._launch_dispatch(
+            plan, dispatch_id=parsed_id, task_title=plan["task_title"]
+        )
+        self._bind_ledger_to_dispatch(
+            dispatch_context, queued_entry, parsed_id, plan["task_title"]
+        )
+        # 台账行此刻还是 blocked：用它当"预判值"做一次条件更新，跑完的回合不会被覆盖
+        self._reconcile_ledger_status(store, parsed_id, STATUS_BLOCKED, state)
         return {
             "ok": True,
-            "target_session": session_name,
-            "display_name": display_name,
-            "workdir": pending_workdir or self._session_workdir(session_name),
+            "dispatch_id": parsed_id,
             "state": state,
+            "target_session": session_name,
         }
 
     # ------------------------------------------------------------------
@@ -1114,6 +1612,75 @@ class _SecretaryDispatchService:
             "workdir": workdir,
         }
 
+    # ------------------------------------------------------------------
+    # 能力五：派活台账查询（升级设计 2026-11-04 第 3.4 节）
+    # 只读：直接落到 DispatchStore（与写台账共用同一个连接），不碰回合通道。
+    # ------------------------------------------------------------------
+    def _ledger_store(self):
+        """取派活台账 store；记忆库未就绪（构造时可能置 None）时抛可读错误。"""
+        store = getattr(self, "_store", None)
+        if store is None:
+            raise SecretaryDispatchError(
+                "派活台账不可用（记忆库尚未就绪），暂时查不到任务记录"
+            )
+        return store
+
+    def list_dispatches(self, status: str = "", workdir: str = "",
+                        target: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        """列出派活台账：status / workdir 精确过滤，target 按会话名或显示名子串过滤。
+
+        target 的子串过滤交给 SQL（``DispatchStore.list`` 的 ``target_like``）：
+        先按上限取一窗再在内存里筛的旧做法，在台账条数超过窗口上限后必然漏
+        记录——更早的命中项根本没被取出来。现在过滤与 limit 一起生效。
+        """
+        store = self._ledger_store()
+        try:
+            size = int(limit or 20)
+        except (TypeError, ValueError):
+            raise SecretaryDispatchError(
+                f"limit 需要是 1..{_SECRETARY_DISPATCH_LIMIT_MAX} 的整数"
+            )
+        size = max(1, min(size, _SECRETARY_DISPATCH_LIMIT_MAX))
+        rows = store.list(
+            status=str(status or "").strip(),
+            workdir=str(workdir or "").strip(),
+            target_like=str(target or "").strip(),
+            limit=size,
+        )
+        out: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            out.append({
+                "id": row.get("id"),
+                "title": str(row.get("title") or ""),
+                "target_display": str(row.get("target_display") or ""),
+                "workdir": str(row.get("workdir") or ""),
+                "status": str(row.get("status") or ""),
+                "started_at": str(row.get("started_at") or ""),
+                "finished_at": str(row.get("finished_at") or ""),
+                "result_excerpt": str(row.get("result_excerpt") or "")[
+                    :_SECRETARY_DISPATCH_EXCERPT_CHARS
+                ],
+            })
+            if len(out) >= size:
+                break
+        return out
+
+    def get_dispatch_result(self, dispatch_id: int = 0) -> Optional[Dict[str, Any]]:
+        """按 id 取一条派活的完整详情（prompt 与摘要都不截断）；不存在返回 None。"""
+        store = self._ledger_store()
+        try:
+            parsed_id = int(dispatch_id)
+        except (TypeError, ValueError):
+            raise SecretaryDispatchError(
+                f"dispatch_id 需要是整数，收到：{dispatch_id!r}"
+            )
+        row = store.get(parsed_id)
+        if not isinstance(row, dict):
+            return None
+        return dict(row)
+
 
 class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridgeMixin):
     _active_turn_lock = threading.Lock()
@@ -1171,6 +1738,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         # 每会话当前回合的 turn_id（session:xxx 复合 ID）：权限请求的 owner
         # 是 turn_id 而非会话名，stop_current_turn 要按它精确取消权限等待
         self._active_turn_ids: dict[str, str] = {}
+        # 回合无进展看门狗的活动时钟：事件循环与子代理轮询每推进一步就刷新一次；
+        # 超过阈值仍未刷新说明回合线程卡在不可取消的同步调用上（控制台 input、
+        # 外部锁、原生库），由看门狗强制收尾，避免会话永久显示运行中。
+        self._turn_activity_lock = threading.Lock()
+        self._turn_activity: dict[str, float] = {}
         # 按回合撤销：turn_id（新协议为全局随机 UUID）→ 会话名 的归属映射。
         # 权限请求事件按它路由会话，不再从 turn_id 字符串前缀推导（规格 20.1）
         self._turn_owner_sessions: dict[str, str] = {}
@@ -3093,6 +3665,30 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             self._cancel_events[session_name] = threading.Event()
         return self._cancel_events[session_name]
 
+    def _touch_turn_activity(self, session_name: str) -> None:
+        """刷新回合活动时钟（回合无进展看门狗的唯一进度信号）。
+
+        任何真实的推进都算进展：模型流事件、工具开始/结束、子代理进度心跳。
+        工具阻塞在不可取消的同步调用上时这些信号全部停止，看门狗据此判定卡死。
+        裸实例（测试 __new__ 构造）没有这两个字段时静默跳过。
+        """
+        lock = getattr(self, "_turn_activity_lock", None)
+        activity = getattr(self, "_turn_activity", None)
+        if lock is None or activity is None:
+            return
+        with lock:
+            activity[session_name] = time.monotonic()
+
+    def _turn_idle_seconds(self, session_name: str) -> float:
+        """距上次回合活动过去的秒数；没有记录时返回 0（视为刚开始，不误杀）。"""
+        lock = getattr(self, "_turn_activity_lock", None)
+        activity = getattr(self, "_turn_activity", None)
+        if lock is None or activity is None:
+            return 0.0
+        with lock:
+            last = activity.get(session_name)
+        return time.monotonic() - last if last else 0.0
+
     def _is_turn_active(self, session_name: str) -> bool:
         """检查指定会话是否有正在运行的回合。"""
         # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__
@@ -4364,8 +4960,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
     def select_workspace_by_path(self, path: str) -> Dict[str, Any]:
         """按绝对路径直接切换项目工作区（手机端内置浏览器的确认动作）。
 
-        与 select_workspace_folder 的收尾逻辑一致：登记工作区、迁移 GLOBAL
-        会话归属、返回文件树与会话列表；但跳过原生对话框，由前端传入路径。
+        与 select_workspace_folder 的收尾逻辑一致：登记工作区、返回文件树
+        与会话列表；但跳过原生对话框，由前端传入路径。
         """
         try:
             selected_path = _resolve_real_path(str(path or ""))
@@ -4373,9 +4969,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
                 return {"ok": False, "msg": "路径不是有效文件夹"}
             if self._memory is None:
                 return {"ok": False, "msg": "后端未就绪"}
+            # 只登记目录，不改写任何已有会话的归属：引入文件夹分不清"会话
+            # 确实在新项目干活"与"聊着天顺手引入新目录"，自动迁移会误伤
+            # GLOBAL 自由对话（见 select_workspace_folder 同口径说明）。
             self._memory.add_workspace(selected_path)
-            if self._current_session and self._session_workdir(self._current_session) == "GLOBAL":
-                self._memory.update_session_workdir(self._current_session, selected_path)
             return {
                 "ok": True,
                 "workdir": selected_path,
@@ -4402,13 +4999,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             selected_path = _resolve_real_path(result[0])
             if not os.path.isdir(selected_path):
                 return {"ok": False, "msg": "选择的路径不是文件夹"}
+            # 只登记目录，绝不改写已有会话归属：曾在此把当前 GLOBAL 会话
+            # 自动迁进所选目录（a9a509cb），但"聊着天引入新工作区"也会被
+            # 误搬走。需要迁移时由用户在侧栏拖拽 / 右键显式操作。
             self._memory.add_workspace(selected_path)
-            # 仅全局自由对话（GLOBAL）跟随迁入所选工作区：否则启动时挂在 GLOBAL
-            # 的会话即使已在项目文件夹里干活，侧栏仍会一直显示在"对话"分组下。
-            # 已归属其他项目的会话绝不能在此改写归属（否则引入新目录会把别的
-            # 项目的会话"搬"进新目录）
-            if self._current_session and self._session_workdir(self._current_session) == "GLOBAL":
-                self._memory.update_session_workdir(self._current_session, selected_path)
             return {
                 "ok": True,
                 "workdir": selected_path,
@@ -8620,6 +9214,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
                                 entry.get("secretary_dispatch_display_name") or ""
                             ),
                             "notify_session": secretary_notify_session,
+                            # 台账主键随排队条目透传：补发回合收尾要按同一 id 回写，
+                            # 缺了它排队派活的结果就永远不会落进台账
+                            "dispatch_id": entry.get("secretary_dispatch_id"),
+                            "task_title": str(
+                                entry.get("secretary_dispatch_task_title") or ""
+                            ),
                         } if secretary_notify_session else None,
                     )
                 except Exception:
@@ -8847,6 +9447,312 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         from core import secretary_dispatch
 
         secretary_dispatch.register(_SecretaryDispatchService(self))
+
+    # ------------------------------------------------------------------
+    # 秘书派活台账：落库后的收尾回写与 notice
+    # ------------------------------------------------------------------
+    def _secretary_dispatch_store(self):
+        """取派活台账 store：优先用已注册调度服务的实例，取不到返回 None。
+
+        台账是"锦上添花"：服务未注册时回落直接构造，连管理器都取不到就返回
+        None，调用方判空跳过，绝不让回写路径抛异常。
+        """
+        try:
+            from core import secretary_dispatch as _dispatch_module
+
+            service = _dispatch_module.get()
+            store = getattr(service, "_store", None) if service is not None else None
+            if store is not None:
+                return store
+            manager = getattr(self, "_memory", None)
+            if manager is None:
+                return None
+            return DispatchStore(manager)
+        except Exception:
+            logger.debug("获取派活台账失败", exc_info=True)
+            return None
+
+    def _secretary_dispatch_last_assistant(self, session_name: str, limit: int = 800) -> str:
+        """目标会话最后一条有正文的 assistant 消息（截 limit 字）；没有返回空串。
+
+        工具调用消息（content 为空）与纯思考消息都要跳过，否则 notice 会出现
+        「已完成：」后面空着。
+        """
+        try:
+            history = self._memory.get_history(session_name) or []
+        except Exception:
+            logger.debug("读取派活目标会话历史失败", exc_info=True)
+            return ""
+        for message in reversed(list(history)):
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                chunks = []
+                for block in content:
+                    if isinstance(block, str):
+                        chunks.append(block)
+                    elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                        chunks.append(block["text"])
+                text = "".join(chunks)
+            else:
+                text = ""
+            text = text.strip()
+            if text:
+                return text[:limit]
+        return ""
+
+    def _finalize_secretary_dispatch(self, context, session_name: str, *,
+                                     cancelled: bool = False,
+                                     terminal_error: str = "") -> None:
+        """秘书派活回合收尾：回写台账 → 推送 notice → 推进下游依赖。
+
+        三种终态：cancelled / failed（terminal_error 非空）/ done（取目标会话最后
+        一条 assistant 正文截 800 字）。台账缺失或写失败一律只记 debug，notice
+        退化成不带任务编号的旧文案，收尾流程完全不受影响。
+        """
+        try:
+            ctx = dict(context or {})
+            notify_session = str(ctx.get("notify_session") or "") or session_name
+            label = str(ctx.get("display_name") or "") or session_name
+            dispatch_id = ctx.get("dispatch_id")
+            try:
+                dispatch_id = None if dispatch_id in (None, "", 0) else int(dispatch_id)
+            except Exception:
+                dispatch_id = None
+            id_suffix = f"（任务 #{dispatch_id}）" if dispatch_id is not None else ""
+
+            # 1) 按终态回写台账（异常只记 debug，绝不外抛）。成功终态的摘要先取
+            # 出来，台账写失败也仍能用于 notice（摘要只是结论预览，不依赖落库）
+            result_excerpt = ""
+            if dispatch_id is not None and not cancelled and not terminal_error:
+                result_excerpt = self._secretary_dispatch_last_assistant(session_name)
+            ledger_written = False
+            if dispatch_id is not None:
+                store = self._secretary_dispatch_store()
+                if store is not None:
+                    try:
+                        if cancelled:
+                            store.mark_status(dispatch_id, "cancelled")
+                        elif terminal_error:
+                            store.mark_status(
+                                dispatch_id, "failed", error=str(terminal_error)[:500]
+                            )
+                        else:
+                            store.mark_status(
+                                dispatch_id, "done", result_excerpt=result_excerpt
+                            )
+                        ledger_written = True
+                    except Exception:
+                        logger.debug("派活台账回写失败", exc_info=True)
+                    # 台账落终态成功后，往该项目画像的「任务流水」追加一行
+                    # （设计 5.1）：流水记「什么时候派了什么、结果如何」，下次
+                    # 派活前能直接回看。整段吞异常——流水是附带记录，绝不能
+                    # 影响 notice 推送与回合收尾。
+                    if ledger_written:
+                        self._write_dispatch_task_log(store, dispatch_id)
+
+            # 2) notice 文案（spec 3.5）：「已完成：摘要」只在台账存在（有任务编号，
+            # 用户可回查）时启用；没有编号就回落旧文案，避免出现无从回查的摘要
+            if cancelled:
+                notice_message = f"「{label}」已取消{id_suffix}"
+            elif terminal_error:
+                notice_message = (
+                    f"「{label}」执行失败：{str(terminal_error)[:80]}{id_suffix}"
+                )
+            elif id_suffix and result_excerpt:
+                preview = result_excerpt[:60]
+                ellipsis = "…" if len(result_excerpt) > 60 else ""
+                notice_message = f"「{label}」已完成：{preview}{ellipsis}{id_suffix}"
+            else:
+                notice_message = f"任务已在「{label}」会话执行完成{id_suffix}"
+            self.emit_event("notice", {
+                "message": notice_message,
+                "session_name": notify_session,
+            })
+
+            # 3) 回写成功后推进下游依赖（P3）：done 解锁下游、failed/cancelled 级联
+            # 阻断，具体在独立 daemon 线程里跑，本回合收尾不等它
+            if ledger_written:
+                try:
+                    self._advance_dependents(dispatch_id)
+                except Exception:
+                    logger.debug("派活依赖推进失败", exc_info=True)
+        except Exception:
+            logger.debug("秘书派活收尾处理失败", exc_info=True)
+
+    def _write_dispatch_task_log(self, store, dispatch_id) -> None:
+        """把已落终态的派活追加进该项目画像的「任务流水」（升级设计 5.1）。
+
+        行格式：``- YYYY-MM-DD #<id> 「<title>」<status>：<摘要前 40 字>``。
+        workdir 为 ``GLOBAL`` 或空（没有项目归属）时跳过；任何异常只记
+        debug——流水是附带记录，绝不能影响 notice 与回合收尾。
+        """
+        try:
+            row = store.get(dispatch_id) if store is not None else None
+            if not isinstance(row, dict):
+                return
+            workdir = str(row.get("workdir") or "").strip()
+            if not workdir or workdir.upper() == "GLOBAL":
+                return
+            excerpt = " ".join(str(row.get("result_excerpt") or "").split())
+            line = "%s #%s 「%s」%s：%s" % (
+                time.strftime("%Y-%m-%d"),
+                dispatch_id,
+                str(row.get("title") or "").strip(),
+                str(row.get("status") or "").strip(),
+                excerpt[:40],
+            )
+            project_profile.append_task_log(workdir, line)
+        except Exception:
+            logger.debug("追加派活任务流水失败", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # 秘书派活依赖推进器（P3：升级设计 2026-11-04 6.2）
+    # 上游落终态后由 _finalize_secretary_dispatch 调用，全部在独立 daemon 线程里
+    # 跑：查库与起下游回合都可能耗时，绝不能拖慢回合收尾；调用方不等待。
+    # ------------------------------------------------------------------
+    def _advance_dependents(self, dispatch_id) -> None:
+        """上游落终态后推进依赖：done → 解锁下游；failed/cancelled → 级联阻断。
+
+        只做线程编排，真正的判定与派发在 ``_advance_dependents_worker`` 里。线程
+        起不来（极端资源耗尽）也只记 debug：下游保持 blocked 下次还能等人救，
+        比把回合收尾带崩划算。
+        """
+        try:
+            parsed_id = int(dispatch_id)
+        except (TypeError, ValueError):
+            logger.debug("派活依赖推进跳过：dispatch_id 非法 %r", dispatch_id)
+            return
+        try:
+            threading.Thread(
+                target=self._advance_dependents_worker,
+                args=(parsed_id,),
+                daemon=True,
+                name="secretary-dispatch-advance",
+            ).start()
+        except Exception:
+            logger.debug("启动派活依赖推进线程失败", exc_info=True)
+
+    def _advance_dependents_worker(self, dispatch_id: int) -> None:
+        """依赖推进主体：按上游终态选择"解锁下游"或"级联阻断"；全程吞异常。"""
+        try:
+            store = self._secretary_dispatch_store()
+            if store is None:
+                return
+            row = store.get(dispatch_id)
+            if not isinstance(row, dict):
+                return
+            status = str(row.get("status") or "")
+            if status == STATUS_DONE:
+                self._unlock_dependents(store, dispatch_id)
+            elif status in (STATUS_FAILED, STATUS_CANCELLED):
+                self._block_dependents(
+                    store,
+                    parent_id=dispatch_id,
+                    root_id=dispatch_id,
+                    cancelled=(status == STATUS_CANCELLED),
+                    seen={dispatch_id},
+                )
+        except Exception:
+            logger.debug("派活依赖推进失败", exc_info=True)
+
+    def _unlock_dependents(self, store, dispatch_id: int) -> None:
+        """把依赖全部 done 的直接下游置 running 并派发，同时给发起会话推 notice。"""
+        try:
+            unlocked = store.unlocked_dependents(dispatch_id) or []
+        except Exception:
+            logger.debug("查询已解锁下游失败", exc_info=True)
+            return
+        service = self._secretary_dispatch_service_handle()
+        for downstream in unlocked:
+            try:
+                downstream_id = int(downstream.get("id"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                if service is None:
+                    logger.debug("派活服务未注册，下游 #%s 无法自动启动", downstream_id)
+                    continue
+                # resume_dispatch 复用台账行（不新建），dispatch_context 里带的是
+                # 下游自己的 id，因此它的收尾会正确回写到下游那条记录上
+                service.resume_dispatch(downstream_id)
+            except Exception:
+                logger.debug("自动启动下游任务 #%s 失败", downstream_id, exc_info=True)
+                continue
+            label = (
+                str(downstream.get("target_display") or "").strip()
+                or str(downstream.get("target_session") or "").strip()
+                or "目标会话"
+            )
+            try:
+                self.emit_event("notice", {
+                    "message": (
+                        f"「{label}」已自动启动（依赖的上游 #{dispatch_id} 已完成）"
+                        f"（任务 #{downstream_id}）"
+                    ),
+                    "session_name": str(downstream.get("secretary_session") or ""),
+                })
+            except Exception:
+                logger.debug("自动启动下游的 notice 推送失败", exc_info=True)
+
+    def _block_dependents(self, store, *, parent_id: int, root_id: int,
+                          cancelled: bool, seen: set) -> None:
+        """上游失败/取消：把直接下游标 blocked，并递归级联到更深下游。
+
+        ``root_id`` 是失效源头（真正 failed/cancelled 的那条），``parent_id`` 是
+        当前层的直接上游。两条信息都写进 error：直接下游看到「上游 #N 失败」，
+        更深层看到「上游 #M 的上游 #N 失败，依赖链中断」，用户一眼能看出断点。
+        """
+        verb = "已取消" if cancelled else "执行失败"
+        try:
+            downstream_list = store.dependents_of(parent_id) or []
+        except Exception:
+            logger.debug("查询下游失败", exc_info=True)
+            return
+        for downstream in downstream_list:
+            try:
+                downstream_id = int(downstream.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if downstream_id in seen:
+                continue
+            seen.add(downstream_id)
+            status = str(downstream.get("status") or "")
+            if status in (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED):
+                # 已跑出结果的记录不改写，也不重复级联（它的下游由它自己的收尾处理）
+                continue
+            # blocked 也要重新标注：批量派活建行时下游本来就是 blocked 且没有原因，
+            # 这里补上"上游 #N 失败/取消"，并继续向下级联
+            if parent_id == root_id:
+                reason = f"上游 #{root_id} {verb}，本任务未启动"
+            else:
+                reason = f"上游 #{parent_id} 的上游 #{root_id} {verb}，依赖链中断"
+            try:
+                store.mark_status(downstream_id, STATUS_BLOCKED, error=reason)
+            except Exception:
+                logger.debug("阻断下游任务 #%s 失败", downstream_id, exc_info=True)
+            self._block_dependents(
+                store,
+                parent_id=downstream_id,
+                root_id=root_id,
+                cancelled=cancelled,
+                seen=seen,
+            )
+
+    def _secretary_dispatch_service_handle(self):
+        """取已注册的调度服务实例（推进器用它恢复被解锁的下游）；取不到返回 None。"""
+        try:
+            from core import secretary_dispatch as _dispatch_module
+
+            return _dispatch_module.get()
+        except Exception:
+            logger.debug("获取秘书调度服务失败", exc_info=True)
+            return None
 
     def get_automation_tasks(self) -> Dict[str, Any]:
         try:
@@ -9283,6 +10189,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
         _phase_last = _phase_t0
         _turn_watchdog_stop: Optional[threading.Event] = None
         _FINISH_WATCHDOG_SECONDS = 5.0
+        # 回合无进展看门狗：默认 30 分钟收不到任何事件 / 子代理心跳即判定卡死。
+        # 阈值刻意远大于单次工具上限（execute_command 600s、权限确认 300s），
+        # 只兜底「线程卡在不可取消的同步调用上」这类停止按钮也无效的极端情况。
+        _stall_stop: Optional[threading.Event] = None
+        _STALL_TIMEOUT_SECONDS = 1800.0
+        _STALL_POLL_SECONDS = 60.0
 
         def _phase_mark(label: str) -> None:
             nonlocal _phase_last
@@ -9363,6 +10275,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             self.emit_event("turn_finish", {"session_name": event_session_name})
             if _turn_watchdog_stop is not None:
                 _turn_watchdog_stop.set()
+            # 正常收尾后停止无进展看门狗；卡死路径由看门狗自己收尾，不走这里
+            if _stall_stop is not None:
+                _stall_stop.set()
             _js_queue = getattr(self, "_js_queue", None)
             logger.info(
                 "回合计时 [%s] turn_finish 已入队：finish_once 内 %.0fms（JS 队列剩余 %d 条）",
@@ -9372,6 +10287,115 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             )
             self._emit_token_usage()
             self._clear_session_last_error(session_name)
+
+        def _start_stall_watchdog() -> None:
+            """回合长时间无任何进展时强制收尾（停止按钮也无效的卡死兜底）。
+
+            进度信号由 _touch_turn_activity 提供：模型/工具事件、子代理轮询心跳。
+            工具若阻塞在不可取消的同步调用上（控制台 input、外部锁、原生库），
+            回合线程永远不会回到取消检查点；这里在超阈值后置位 cancel、封闭撤销
+            检查点、回写 harness 终态并解锁会话，避免整会话永久显示运行中。
+            """
+            nonlocal _stall_stop
+            if _stall_stop is not None:
+                return
+            _stall_stop = threading.Event()
+            _stop = _stall_stop
+
+            def _watch() -> None:
+                nonlocal undo_finished
+                while not _stop.wait(_STALL_POLL_SECONDS):
+                    # 回合已在看门狗触发前正常收尾（finish_once 置位）则不再误杀
+                    if _stop.is_set() or turn_finished:
+                        return
+                    idle = self._turn_idle_seconds(session_name)
+                    if idle < _STALL_TIMEOUT_SECONDS:
+                        continue
+                    logger.warning(
+                        "回合无进展看门狗 [%s]：已 %.0f 秒无任何进展，强制收尾",
+                        session_name, idle,
+                    )
+                    # 卡死现场线程栈：定位阻塞在哪个不可取消的调用上
+                    try:
+                        import sys as _sys
+                        import traceback as _tb
+
+                        for _tid, _frame in _sys._current_frames().items():
+                            logger.warning(
+                                "线程栈 tid=%s：\n%s", _tid, "".join(_tb.format_stack(_frame))
+                            )
+                    except Exception:
+                        logger.exception("回合无进展看门狗抓取线程栈失败")
+                    try:
+                        cancel_event.set()
+                        from core.llm import abort_inflight_streams
+
+                        abort_inflight_streams(cancel_event)
+                    except Exception:
+                        logger.debug("看门狗取消在飞请求失败", exc_info=True)
+                    try:
+                        self.emit_event("turn_error", {
+                            "message": (
+                                f"本回合已连续 {int(_STALL_TIMEOUT_SECONDS // 60)} 分钟没有任何进展，"
+                                "判定为卡死，已强制结束并解锁会话。"
+                                "常见原因是工具阻塞在系统弹窗或不可中断的同步调用上，"
+                                "完整线程栈已写入运行日志。"
+                            ),
+                            "session_name": session_name,
+                        })
+                    except Exception:
+                        logger.debug("看门狗推送 turn_error 失败", exc_info=True)
+                    if undo_ctx is not None and not undo_finished:
+                        try:
+                            from core.turn_undo import service as _tu_service
+
+                            _tu_service.finish_turn(
+                                undo_ctx,
+                                aborted=True,
+                                reason="回合长时间无进展，看门狗强制结束",
+                            )
+                            undo_finished = True
+                        except Exception:
+                            logger.exception("看门狗封闭按回合撤销检查点失败")
+                    # harness 终态回写：卡死线程不会再走 TurnRuntime.fail，
+                    # 这里补一次，避免残留 running 行干扰断点续跑/恢复扫描。
+                    try:
+                        if turn_id:
+                            record = self._memory.get_harness_turn(turn_id) or {}
+                            if record.get("status") in (
+                                "created", "preparing", "running", "cancelling",
+                            ):
+                                self._memory.transition_harness_turn(
+                                    turn_id,
+                                    str(record.get("status")),
+                                    "failed",
+                                    int(time.time() * 1000),
+                                    error_code="TurnStalled",
+                                )
+                    except Exception:
+                        logger.debug("看门狗回写 harness 回合终态失败", exc_info=True)
+                    # 解锁会话：清掉运行态登记，新消息可立即开新回合
+                    try:
+                        if self._cancel_events.get(session_name) is cancel_event:
+                            self._cancel_events.pop(session_name, None)
+                        self._active_turns.pop(session_name, None)
+                        self._active_turn_ids.pop(session_name, None)
+                        if turn_id:
+                            with self._turn_owner_lock:
+                                self._turn_owner_sessions.pop(turn_id, None)
+                        with self._active_turn_lock:
+                            self._active_turn_snapshots.pop(session_name, None)
+                        with self._turn_activity_lock:
+                            self._turn_activity.pop(session_name, None)
+                    except Exception:
+                        logger.debug("看门狗清理回合运行态失败", exc_info=True)
+                    _stop.set()
+                    finish_once()
+                    return
+
+            threading.Thread(
+                target=_watch, daemon=True, name="gui-turn-stall-watchdog"
+            ).start()
 
         # 多会话并行：不再用全局 _task_status 表示"执行中"——它会被另一会话回合结束时的
         # idle 覆盖，也会让仍在跑的会话状态错乱。各会话的活跃状态由 self._active_turns
@@ -9561,6 +10585,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
                 workspace_root=turn_workdir,
                 description=str(user_text)[:80],
             )
+            # 检查点已建立 → 启动无进展看门狗。放在这里而不是更早：看门狗收尾
+            # 需要 undo_ctx；更早的启动阶段卡住由外层异常路径兜底封闭检查点。
+            _start_stall_watchdog()
+            # 起点先记一次活动时间：模型首个 token 到来前的合法等待不应被误判
+            self._touch_turn_activity(session_name)
             # 3) 用户消息与 message_turn_links 原子落库
             self._memory.add_message(
                 session_name, "user", parsed_content,
@@ -9732,17 +10761,18 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
                         )
                 except Exception:
                     logger.debug("更新回合最终 assistant 关联失败", exc_info=True)
-                try:
-                    from core.turn_undo import service as _tu_service
+                if undo_ctx is not None and not undo_finished:
+                    try:
+                        from core.turn_undo import service as _tu_service
 
-                    _tu_service.finish_turn(
-                        undo_ctx,
-                        aborted=bool(cancelled),
-                        reason="回合被用户取消" if cancelled else "",
-                    )
-                    undo_finished = True
-                except Exception:
-                    logger.exception("封闭按回合撤销检查点失败")
+                        _tu_service.finish_turn(
+                            undo_ctx,
+                            aborted=bool(cancelled),
+                            reason="回合被用户取消" if cancelled else "",
+                        )
+                        undo_finished = True
+                    except Exception:
+                        logger.exception("封闭按回合撤销检查点失败")
 
             _phase_mark("模型流结束、撤销检查点已封闭")
             if cancelled:
@@ -9867,26 +10897,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             # 缺省会串到用户当前查看的会话。
             if secretary_dispatch_context:
                 try:
-                    notify_session = str(
-                        secretary_dispatch_context.get("notify_session") or ""
-                    ) or session_name
-                    dispatch_label = str(
-                        secretary_dispatch_context.get("display_name") or ""
-                    ) or session_name
-                    terminal_error = str(error_state.get("terminal_message") or "")
-                    if cancelled:
-                        notice_message = f"任务在「{dispatch_label}」会话已取消。"
-                    elif terminal_error:
-                        notice_message = (
-                            f"任务在「{dispatch_label}」会话执行失败："
-                            f"{terminal_error[:120]}"
-                        )
-                    else:
-                        notice_message = f"任务已在「{dispatch_label}」会话执行完成"
-                    self.emit_event("notice", {
-                        "message": notice_message,
-                        "session_name": notify_session,
-                    })
+                    # 台账回写 + notice 文案（三种终态 + 空摘要回落）统一在
+                    # _finalize_secretary_dispatch 里做，内部全程吞异常；目标会话
+                    # 可能已被首轮自动改名，取历史要用改名后的 drain_session_name
+                    self._finalize_secretary_dispatch(
+                        secretary_dispatch_context,
+                        drain_session_name or session_name,
+                        cancelled=bool(cancelled),
+                        terminal_error=str(error_state.get("terminal_message") or ""),
+                    )
                 except Exception:
                     logger.debug("秘书派活完成通知推送失败", exc_info=True)
             # 回合运行期间若有后台子代理进入终态（当时不能并发起新回合），
@@ -10123,6 +11142,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
                 # 没有任务且上一轮也没有任务时不推事件，避免空轮询刷屏
                 if tasks or had_tasks:
                     had_tasks = bool(tasks)
+                    # 子代理还在跑 = 父回合仍在推进：run_subagent 同步等待期间
+                    # 父事件流不产出任何事件，靠这条心跳喂看门狗，避免误杀长任务
+                    if tasks:
+                        self._touch_turn_activity(session_name)
                     self.emit_event("subagent_progress", {"tasks": tasks, "session_name": session_name})
             except Exception:
                 logger.debug("推送子代理进度失败", exc_info=True)
@@ -10208,6 +11231,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridg
             request_reason=request_reason,
             resume_turn=resume_turn,
         ):
+            # 每个模型/工具事件都算一次真实推进，喂给回合无进展看门狗
+            self._touch_turn_activity(session_name)
             if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
                 cancelled = True
                 break

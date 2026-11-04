@@ -25,16 +25,16 @@ class ReasoningCapability:
 HIDDEN_REASONING_CAPABILITY = ReasoningCapability("hidden", (), "hidden")
 
 # 未登记进能力表的模型（厂商新增、网关自定义名）：没有可依据的厂商事实，
-# 给出通用强度能力（默认/关闭/低/中/高/最高），由用户自行决定是否注入
-# reasoning_effort。不提供 "on"：effort_switch 策略下"开启但不定档"没有
-# 可靠表达，宁可不给这个档位，也不发一个会被网关拒绝的值。
+# 给出通用强度能力（默认/关闭/低/中/高/极高/最高），显示全部档位供用户
+# 自行选择是否注入 reasoning_effort。不提供 "on"：effort_switch 策略下
+# "开启但不定档"没有可靠表达，宁可不给这个档位，也不发一个会被网关拒绝的值。
 # 编码策略选 effort_switch（只注入顶层 reasoning_effort）而不是厂商私有的
 # thinking 对象：未登记模型多为网关自定义名，OpenAI 标准字段被接受的概率更高。
 # 与 HIDDEN_REASONING_CAPABILITY 的区别：hidden 是"已确认该模型不支持思考"的
 # 精确事实（显式登记），本兜底只是"尚未登记"，GUI 必须显示可操作的选项。
 UNKNOWN_REASONING_CAPABILITY = ReasoningCapability(
     "effort",
-    ("default", "off", "low", "medium", "high", "max"),
+    ("default", "off", "low", "medium", "high", "xhigh", "max"),
     "effort_switch",
 )
 REASONING_CAPABILITIES: dict[str, ReasoningCapability] = {}
@@ -45,85 +45,7 @@ def _register(names: tuple[str, ...], capability: ReasoningCapability) -> None:
         REASONING_CAPABILITIES[name.lower()] = capability
 
 
-_register(
-    ("k3", "k3-256k", "kimi-k3", "kimi-k3-256k"),
-    ReasoningCapability(
-        "effort", ("default", "low", "high", "max"), "always_on_effort"
-    ),
-)
-_register(
-    (
-        "deepseek-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-flash-0731",
-        "deepseek-v4.1-flash",
-    ),
-    ReasoningCapability(
-        "effort",
-        ("default", "off", "low", "high", "xhigh", "max"),
-        "thinking_object_effort",
-        default_choice="high",
-    ),
-)
-_register(
-    ("deepseek-v4-pro",),
-    ReasoningCapability(
-        "effort",
-        ("default", "off", "high", "max"),
-        "thinking_object_effort",
-        default_choice="high",
-    ),
-)
-_register(
-    ("deepseek-v4-pro-0813",),
-    ReasoningCapability(
-        "effort",
-        ("default", "off", "low", "high", "max"),
-        "thinking_object_effort",
-        default_choice="high",
-    ),
-)
-_register(
-    ("qwen3.8-max",),
-    ReasoningCapability(
-        "effort",
-        ("default", "off", "low", "medium", "xhigh"),
-        "enable_thinking_effort",
-    ),
-)
-# qwen38-27b 是 qwen3.8-27b 的同模型别名，两者档位一致。
-_register(
-    ("qwen3.8-27b", "qwen38-27b"),
-    ReasoningCapability(
-        "effort",
-        ("default", "off", "low", "medium", "xhigh"),
-        "enable_thinking_effort",
-    ),
-)
-# qwen38-flash / qwen3.8-falsh 是同模型别名及拼写容错，档位与 qwen3.8-max 一致。
-_register(
-    ("qwen3.8-flash", "qwen38-flash", "qwen3.8-falsh", "qwen38-falsh"),
-    ReasoningCapability(
-        "effort",
-        ("default", "off", "low", "medium", "xhigh"),
-        "enable_thinking_effort",
-    ),
-)
-_register(
-    ("glm-5.2",),
-    ReasoningCapability(
-        "effort", ("default", "off", "high", "max"), "thinking_object_effort"
-    ),
-)
-# GLM-5.3/5.3-flash 强制思考：不支持关闭（thinking.type 传 disabled 会报错），
-# reasoning_effort 仅支持 low/high/max。glm-5.3-free 为同系免费变体
-# （tokenrouter 等网关挂载名 z-ai/glm-5.3-free，经别名折叠归一）。
-_register(
-    ("glm-5.3", "glm-5.3-flash", "glm-5.3-free"),
-    ReasoningCapability(
-        "effort", ("default", "low", "high", "max"), "thinking_object_effort"
-    ),
-)
+
 _register(
     ("seed-2.1-turbo", "seed-2.1-pro", "doubao-seed-2.0-code"),
     ReasoningCapability(
@@ -161,35 +83,13 @@ _register(
     ),
 )
 _register(
-    (
-        "kimi-k2.6",
-        "kimi-k2.5",
-        "glm-5",
-        "glm-5.1",
-        "minimax-m3",
-        "longcat-2.0",
-    ),
+    ("minimax-m3", "longcat-2.0"),
     ReasoningCapability(
         "toggle", ("default", "off", "on"), "thinking_object_toggle"
     ),
 )
 _register(
-    ("qwen3.7-max",),
-    ReasoningCapability(
-        "toggle", ("default", "off", "on"), "enable_thinking_toggle"
-    ),
-)
-# kimi-for-coding 现指向 K2.8 Preview：与 K3 一致支持 reasoning_effort 的 low/high/max
-# 三档（默认 max），思考不可关闭（无 off/on 档）。
-_register(
-    ("kimi-for-coding",),
-    ReasoningCapability(
-        "effort", ("default", "low", "high", "max"), "always_on_effort",
-        default_choice="max",
-    ),
-)
-_register(
-    ("kimi-k2.7-code", "minimax-m2.5", "minimax-m2.7"),
+    ("minimax-m2.5", "minimax-m2.7"),
     ReasoningCapability("fixed", (), "always_on", "该模型始终开启思考"),
 )
 # neohorse-1-9b（tokenrhythm.studio）：实测为带 reasoning_content 的推理模型，
@@ -269,11 +169,50 @@ _AGNES_PREFIX_CAPABILITY = ReasoningCapability(
     "toggle", ("default", "off", "on"), "agnes_enable_thinking"
 )
 
-# GLM-5.3 家族：强制思考（thinking.type 传 disabled 会报错），reasoning_effort
-# 仅支持 low/high/max。精确登记之外的变体名（网关挂载名、后缀变体如 flashx）
-# 按"glm-5.3 前缀"统一继承该能力，无需逐个登记；其他 GLM 代际不受影响。
-_GLM53_PREFIX_CAPABILITY = ReasoningCapability(
-    "effort", ("default", "low", "high", "max"), "thinking_object_effort"
+# Kimi K3 官方：reasoning_effort 仅支持 low/high/max，默认 max，思考不可关闭
+# （无 off/on 档）。K2.5/K2.6/K2.7-code 及 kimi-for-coding（K2.8 Preview）按
+# 家族统一走同一能力；任何 kimi 前缀模型（不区分大小写，含未来新版本）统一
+# 继承，无需逐个登记。裸名 k3 / k3-256k 不带 kimi 前缀，需精确登记指向
+# 同一常量；kimi-for-coding 一并显式登记（见下方 _register）。
+_KIMI_PREFIX_CAPABILITY = ReasoningCapability(
+    "effort", ("default", "low", "high", "max"), "always_on_effort",
+    default_choice="max",
+)
+
+# GLM 家族：按用户决策全系统一 low/high/max 不可关。官方 5.2 支持关闭思考，
+# 但 5.3 强制思考（thinking.type 传 disabled 会报错），取家族交集：
+# reasoning_effort 仅 low/high/max，默认 max。任何 glm 前缀模型（不区分
+# 大小写，含未来代际）统一继承，无需逐个登记。
+_GLM_PREFIX_CAPABILITY = ReasoningCapability(
+    "effort", ("default", "low", "high", "max"), "thinking_object_effort",
+    default_choice="max",
+)
+
+# Qwen 官方（百炼 3.8 系文档）：reasoning_effort 支持 low/medium/xhigh，默认
+# xhigh，none 关闭思考（映射为 off 档）；OpenAI 兼容路由用 enable_thinking +
+# reasoning_effort 编码。按用户决策 qwen 全家族统一（不限 3.8 代际）：任何
+# qwen 前缀模型（含裸名 qwen、老代际 qwen3.7 与未来代际）统一继承。
+_QWEN_PREFIX_CAPABILITY = ReasoningCapability(
+    "effort",
+    ("default", "off", "low", "medium", "xhigh"),
+    "enable_thinking_effort",
+    default_choice="xhigh",
+)
+
+# 裸名/别名精确登记：不带家族前缀的名字（k3 / k3-256k / kimi-for-coding）
+# 与 qwen38 缩写、拼写容错别名，统一指向对应家族常量。
+_register(("k3", "k3-256k", "kimi-for-coding"), _KIMI_PREFIX_CAPABILITY)
+_register(
+    (
+        "qwen3.8-max",
+        "qwen3.8-27b",
+        "qwen38-27b",
+        "qwen3.8-flash",
+        "qwen38-flash",
+        "qwen3.8-falsh",
+        "qwen38-falsh",
+    ),
+    _QWEN_PREFIX_CAPABILITY,
 )
 
 
@@ -309,12 +248,17 @@ def get_reasoning_capability(model_name: str) -> ReasoningCapability:
     registered = REASONING_CAPABILITIES.get(normalized)
     if registered is not None:
         return registered
-    if _model_leaf_name(normalized).startswith("deepseek"):
+    leaf = _model_leaf_name(normalized)
+    if leaf.startswith("deepseek"):
         return _DEEPSEEK_PREFIX_CAPABILITY
-    if _model_leaf_name(normalized).startswith("agnes"):
+    if leaf.startswith("agnes"):
         return _AGNES_PREFIX_CAPABILITY
-    if _model_leaf_name(normalized).startswith("glm-5.3"):
-        return _GLM53_PREFIX_CAPABILITY
+    if leaf.startswith("kimi"):
+        return _KIMI_PREFIX_CAPABILITY
+    if leaf.startswith("glm"):
+        return _GLM_PREFIX_CAPABILITY
+    if leaf.startswith("qwen"):
+        return _QWEN_PREFIX_CAPABILITY
     # 未登记（厂商新增 / 网关自定义名）：没有可依据的厂商事实，给通用开关兜底，
     # 让 GUI 仍能显示可操作的思考开关；显式的 hidden 登记已在上面命中返回。
     return UNKNOWN_REASONING_CAPABILITY

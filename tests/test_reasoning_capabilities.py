@@ -55,16 +55,21 @@ def test_glm53_variant_names_inherit_family_capability():
 
 
 def test_glm53_prefix_rule_does_not_spill_to_other_glm_generations():
-    """前缀规则只作用于 glm-5.3 家族，其他代际未知变体不继承其强制思考能力。
+    """glm 全家族统一 default/low/high/max（不可关闭），glm-5.3 前缀规则不再特殊。
 
-    glm-5.4 / glm-5.2-plus 等未登记代际走兜底通用强度（可关可定档），而不是
-    glm-5.3 那套不可关闭的 low/high/max 强度档。
+    glm-5.4 / glm-5.2-plus 等未登记代际按 glm 家族规则适配；形似而并非
+    glm 前缀的 my-glm-5.3-clone 落到未登记模型的七档兜底通用强度。
     """
-    for name in ("glm-5.4", "glm-5.2-plus", "my-glm-5.3-clone"):
+    for name in ("glm-5.4", "glm-5.2-plus"):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name
-        assert capability.options == ("default", "off", "low", "medium", "high", "max"), name
-        assert capability.request_strategy == "effort_switch", name
+        assert capability.options == ("default", "low", "high", "max"), name
+        assert capability.request_strategy == "thinking_object_effort", name
+
+    clone = get_reasoning_capability("my-glm-5.3-clone")
+    assert clone.kind == "effort"
+    assert clone.options == ("default", "off", "low", "medium", "high", "xhigh", "max")
+    assert clone.request_strategy == "effort_switch"
 
 
 def test_prefix_rules_do_not_leak_to_lookalike_names():
@@ -77,18 +82,20 @@ def test_prefix_rules_do_not_leak_to_lookalike_names():
         "some-future-model",
         "my-deepseek-clone",
         "my-agnes-clone",
-        "qwen3.9-max",
+        "my-qwen-clone",
     ):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name
-        assert capability.options == ("default", "off", "low", "medium", "high", "max"), name
+        assert capability.options == (
+            "default", "off", "low", "medium", "high", "xhigh", "max"
+        ), name
         assert capability.request_strategy == "effort_switch", name
 
 
 def test_unregistered_models_fall_back_to_generic_effort():
     """未登记模型不能因为没进能力表就隐藏 GUI 思考按钮。
 
-    未登记模型统一返回通用强度能力：kind=effort、六档 默认/关闭/低/中/高/最高、
+    未登记模型统一返回通用强度能力：kind=effort、七档 默认/关闭/低/中/高/极高/最高、
     request_strategy=effort_switch，由用户在 GUI 上自行选择是否注入 reasoning_effort。
     """
     for name in (
@@ -100,12 +107,13 @@ def test_unregistered_models_fall_back_to_generic_effort():
         "LongCat-2.5-Preview",
         "intern-latest",
         "senseaudio-s2",
-        "cn:kimi-k3-1",
         "https://gateway.example/v1/some-custom-model",
     ):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name
-        assert capability.options == ("default", "off", "low", "medium", "high", "max"), name
+        assert capability.options == (
+            "default", "off", "low", "medium", "high", "xhigh", "max"
+        ), name
         assert capability.request_strategy == "effort_switch", name
 
 
@@ -152,16 +160,16 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "deepseek-flash": ("default", "off", "low", "high", "xhigh", "max"),
         "deepseek-v4-flash-0731": ("default", "off", "low", "high", "xhigh", "max"),
         "deepseek-v4.1-flash": ("default", "off", "low", "high", "xhigh", "max"),
-        "deepseek-v4-pro": ("default", "off", "high", "max"),
-        "deepseek-v4-pro-0813": ("default", "off", "low", "high", "max"),
+        "deepseek-v4-pro": ("default", "off", "low", "high", "xhigh", "max"),
+        "deepseek-v4-pro-0813": ("default", "off", "low", "high", "xhigh", "max"),
         "qwen3.8-max": ("default", "off", "low", "medium", "xhigh"),
         "qwen3.8-flash": ("default", "off", "low", "medium", "xhigh"),
         "qwen38-flash": ("default", "off", "low", "medium", "xhigh"),
         "qwen3.8-falsh": ("default", "off", "low", "medium", "xhigh"),
         "qwen3.8-27b": ("default", "off", "low", "medium", "xhigh"),
         "qwen38-27b": ("default", "off", "low", "medium", "xhigh"),
-        "glm-5.2": ("default", "off", "high", "max"),
-        "zai-org/GLM-5.2": ("default", "off", "high", "max"),
+        "glm-5.2": ("default", "low", "high", "max"),
+        "zai-org/GLM-5.2": ("default", "low", "high", "max"),
         "seed-2.1-turbo": ("default", "off", "low", "medium", "high"),
         "seed-2.1-pro": ("default", "off", "low", "medium", "high"),
         "doubao-seed-2.0-code": ("default", "off", "low", "medium", "high"),
@@ -171,11 +179,11 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "mimo-v2.5": ("default", "off", "on"),
         "mimo-v2.5-pro": ("default", "off", "on"),
         "sensenova-6.8-flash-lite": ("default", "off", "low", "medium", "high"),
-        "kimi-k2.6": ("default", "off", "on"),
-        "kimi-k2.5": ("default", "off", "on"),
-        "qwen3.7-max": ("default", "off", "on"),
-        "glm-5": ("default", "off", "on"),
-        "glm-5.1": ("default", "off", "on"),
+        "kimi-k2.6": ("default", "low", "high", "max"),
+        "kimi-k2.5": ("default", "low", "high", "max"),
+        "qwen3.7-max": ("default", "off", "low", "medium", "xhigh"),
+        "glm-5": ("default", "low", "high", "max"),
+        "glm-5.1": ("default", "low", "high", "max"),
         "MiniMax-M3": ("default", "off", "on"),
         "LongCat-2.0": ("default", "off", "on"),
         "step-3.7-flash": ("default", "low", "medium", "high"),
@@ -192,7 +200,6 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
 def test_fixed_models_are_visible_locked_on_and_explicit_hidden_models_are_hidden():
     """固定思考必须显示为禁用的开启；显式登记为不支持思考的模型必须隐藏。"""
     for model_name in (
-        "kimi-k2.7-code",
         "minimax-m2.5",
         "minimax-m2.7",
     ):
@@ -228,12 +235,13 @@ def test_fixed_models_are_visible_locked_on_and_explicit_hidden_models_are_hidde
             {"value": "low", "label": "低"},
             {"value": "medium", "label": "中"},
             {"value": "high", "label": "高"},
+            {"value": "xhigh", "label": "极高"},
             {"value": "max", "label": "最高"},
         ]
 
 
 def test_unregistered_model_snapshot_exposes_effort_menu():
-    """未登记模型的 GUI 快照必须给出可操作的通用六档强度菜单。"""
+    """未登记模型的 GUI 快照必须给出可操作的通用七档强度菜单。"""
     snapshot = build_reasoning_snapshot({"name": "hy4-preview"})
     assert snapshot == {
         "kind": "effort",
@@ -248,6 +256,7 @@ def test_unregistered_model_snapshot_exposes_effort_menu():
             {"value": "low", "label": "低"},
             {"value": "medium", "label": "中"},
             {"value": "high", "label": "高"},
+            {"value": "xhigh", "label": "极高"},
             {"value": "max", "label": "最高"},
         ],
     }
@@ -273,18 +282,19 @@ def test_builtin_default_choice_only_for_models_with_official_facts():
     assert get_reasoning_capability("deepseek-flash").default_choice == "high"
     assert get_reasoning_capability("openai/DeepSeek-v9-future").default_choice == "high"
     assert get_reasoning_capability("kimi-for-coding").default_choice == "max"
+    assert get_reasoning_capability("kimi-k2.6").default_choice == "max"
+    assert get_reasoning_capability("kimi-k3").default_choice == "max"
+    assert get_reasoning_capability("k3").default_choice == "max"
+    assert get_reasoning_capability("glm-5").default_choice == "max"
+    assert get_reasoning_capability("glm-5.2").default_choice == "max"
+    assert get_reasoning_capability("glm-5.3").default_choice == "max"
+    assert get_reasoning_capability("qwen3.8-max").default_choice == "xhigh"
+    assert get_reasoning_capability("qwen3.7-max").default_choice == "xhigh"
     assert get_reasoning_capability("sensenova-6.8-flash-lite").default_choice == "medium"
     assert get_reasoning_capability("mimo-v2.6-pro").default_choice == "on"
 
     for name in (
-        "k3",
-        "glm-5",
-        "glm-5.2",
-        "glm-5.3",
-        "qwen3.7-max",
-        "qwen3.8-max",
         "seed-2.1-turbo",
-        "kimi-k2.6",
         "step-3.7-flash",
         "hy4-preview",
     ):
@@ -295,6 +305,95 @@ def test_snapshot_carries_builtin_default_choice():
     """快照必须带上内置默认档位，前端据此自动预选。"""
     assert build_reasoning_snapshot({"name": "deepseek-v4-pro"})["default_choice"] == "high"
     assert build_reasoning_snapshot({"name": "kimi-for-coding"})["default_choice"] == "max"
-    assert build_reasoning_snapshot({"name": "k3"})["default_choice"] == ""
-    assert build_reasoning_snapshot({"name": "kimi-k2.7-code"})["default_choice"] == ""
+    assert build_reasoning_snapshot({"name": "k3"})["default_choice"] == "max"
+    assert build_reasoning_snapshot({"name": "kimi-k2.7-code"})["default_choice"] == "max"
     assert build_reasoning_snapshot({"name": "sensenova-6.7-flash-lite"})["default_choice"] == ""
+
+
+def test_kimi_prefix_family_uses_always_on_effort_with_official_default():
+    """kimi 全家族统一 default/low/high/max（不可关闭），官方默认 max。"""
+    for name in (
+        "kimi-k2.6",
+        "kimi-k2.7-code",
+        "kimi-k9-future",
+        "openai/KIMI-K2.5",
+        "https://gateway.example/v1/kimi-custom",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "low", "high", "max"), name
+        assert capability.request_strategy == "always_on_effort", name
+        assert capability.default_choice == "max", name
+
+
+def test_glm_prefix_family_uses_thinking_object_effort_with_official_default():
+    """glm 全家族统一 default/low/high/max（不可关闭），官方默认 max。"""
+    for name in (
+        "glm-5",
+        "glm-5.1",
+        "glm-5.2",
+        "glm-5.4-future",
+        "zai-org/glm-6",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "low", "high", "max"), name
+        assert capability.request_strategy == "thinking_object_effort", name
+        assert capability.default_choice == "max", name
+
+
+def test_qwen_prefix_family_keeps_enable_thinking_effort_with_official_default():
+    """qwen 全家族统一 default/off/low/medium/xhigh，官方默认 xhigh（按用户决策，
+    不再限定 3.8 代际：老代际/未来代际/裸名都走家族规则）。"""
+    for name in (
+        "qwen3.8-max-preview",
+        "qwen3.8-omni-flash",
+        "qwen3.8-2.4t-a95b",
+        "qwen3.7-max",
+        "qwen3.9-max",
+        "qwen-max",
+        "qwen-plus",
+        "qwen",
+        "openai/qwen",
+        "openai/QWEN3.6-PLUS",
+        "https://gateway.example/v1/qwen-custom",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "off", "low", "medium", "xhigh"), name
+        assert capability.request_strategy == "enable_thinking_effort", name
+        assert capability.default_choice == "xhigh", name
+
+
+def test_bare_family_names_hit_family_rules():
+    """裸名 openai/deepseek、openai/kimi、openai/glm 等（无版本号后缀）
+    也必须命中家族规则，不能掉进兜底。"""
+    expectations = {
+        "openai/deepseek": (("default", "off", "low", "high", "xhigh", "max"), "thinking_object_effort", "high"),
+        "deepseek": (("default", "off", "low", "high", "xhigh", "max"), "thinking_object_effort", "high"),
+        "openai/kimi": (("default", "low", "high", "max"), "always_on_effort", "max"),
+        "kimi": (("default", "low", "high", "max"), "always_on_effort", "max"),
+        "openai/glm": (("default", "low", "high", "max"), "thinking_object_effort", "max"),
+        "anthropic/kimi": (("default", "low", "high", "max"), "always_on_effort", "max"),
+    }
+    for name, (options, strategy, default) in expectations.items():
+        capability = get_reasoning_capability(name)
+        assert capability.options == options, name
+        assert capability.request_strategy == strategy, name
+        assert capability.default_choice == default, name
+
+
+def test_family_prefix_rules_do_not_match_lookalike_names():
+    """形似名（my-kimi-clone / my-glm-clone / my-qwen-clone）仍走七档兜底。
+
+    家族判定用前缀匹配：qwenx 虽非通义千问，但按家族前缀规则会命中
+    qwen 能力（与 deepseekx/glmx 同理），这是前缀策略的既定取舍。
+    """
+    for name in ("my-kimi-clone", "my-glm-clone", "my-qwen-clone"):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == (
+            "default", "off", "low", "medium", "high", "xhigh", "max"
+        ), name
+        assert capability.request_strategy == "effort_switch", name
+        assert capability.default_choice == "", name

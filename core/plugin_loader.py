@@ -40,6 +40,7 @@ import importlib.util
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,12 @@ def _builtin_plugin_dir() -> Path:
 # 最近一次 load_and_register 的扫描结果（含禁用/失败/被覆盖的插件），
 # 供 /plugins 命令与诊断查询；每次扫描开头会整体重建。
 _PLUGIN_INFOS: list[dict] = []
+
+# 插件扫盘串行锁：get_plugins 会被前端轮询与工具调用并发触发，而
+# refresh_plugins 是「扫盘 → 信任确认 → exec + register」的复合操作。
+# 不加锁时多线程会同时对同一插件执行加载（2026-11-04 实测：一次并发刷新
+# 把同一个插件热加载了 15 次，起了 15 个网关监听端口）。
+_REFRESH_LOCK = threading.RLock()
 
 # 已加载插件的模块引用：留着是为了插件被禁用时能调用它可选的 cleanup() 钩子。
 # key 为插件名；禁用或加载失败时移除。
@@ -216,6 +223,18 @@ def _confirm_plugin_trust(plugin_dir: Path, name: str, fingerprint: str) -> bool
             return bool(callback(str(plugin_dir), name, fingerprint))
         except Exception:
             return False
+    # 非主线程绝不落到 input()：插件刷新常由工具调用 / 前端 RPC 的 worker 线程
+    # 触发，控制台提示用户看不见，input() 会永久阻塞该线程——回合因此卡死，
+    # 停止按钮也打不断（2026-11-04 实测：plugin_manage 调用卡了 5.5 小时，
+    # 同时 15 个刷新线程一起阻塞在 stdin 上）。GUI / 后台场景请在插件页
+    # 手动「信任并启用」，或由入口层注册 set_trust_prompt 回调。
+    if threading.current_thread() is not threading.main_thread():
+        _logger.warning(
+            "插件 %s (%s) 需要信任确认，但当前在后台线程，已跳过控制台确认"
+            "（请在插件页手动信任，或用 set_trust_prompt 注册回调）",
+            name, plugin_dir,
+        )
+        return False
     # 默认：交互终端（CLI）弹确认；非交互/headless 环境直接拒绝
     if sys.stdin is not None and sys.stdout is not None \
             and sys.stdin.isatty() and sys.stdout.isatty():
@@ -618,7 +637,17 @@ def refresh_plugins(registry=None) -> None:
     解决"运行期间安装的插件要重启进程才显示"的问题（此前 _PLUGIN_INFOS 只在
     启动时 load_and_register 扫一次盘）。已加载的插件不会重复注册；
     单插件失败仅记录，不影响其他插件。registry 缺省取运行时注册表单例。
+
+    并发安全：扫描、信任确认与加载注册的全区间由 _REFRESH_LOCK 串行化。
+    get_plugins 会被前端轮询与工具调用并发触发，不串行时多个线程会同时对
+    同一插件执行 exec + register（重复热加载、重复启动插件后台服务）。
     """
+    with _REFRESH_LOCK:
+        _refresh_plugins_locked(registry)
+
+
+def _refresh_plugins_locked(registry=None) -> None:
+    """refresh_plugins 的锁内实现；调用方必须已持有 _REFRESH_LOCK。"""
     if registry is None:
         registry = _live_registry()
 

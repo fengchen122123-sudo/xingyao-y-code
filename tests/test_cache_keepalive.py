@@ -312,8 +312,11 @@ def test_glm_forced_thinking_keepalive_preserves_thinking_and_raises_output():
     assert keepalive["tool_choice"] == "none"
 
 
-def test_glm_closable_thinking_keepalive_still_flips_disabled():
-    from core.cache_keepalive import build_keepalive_request
+def test_glm_family_thinking_keepalive_keeps_enabled():
+    from core.cache_keepalive import (
+        KEEPALIVE_THINKING_MODEL_MAX_TOKENS,
+        build_keepalive_request,
+    )
 
     original = {
         "model": "openai/glm-5.2",
@@ -326,10 +329,12 @@ def test_glm_closable_thinking_keepalive_still_flips_disabled():
 
     keepalive = build_keepalive_request(original)
 
-    # 有关闭档的 GLM 模型沿用既有行为：翻转 disabled + 1 token 上限
-    assert keepalive["extra_body"]["thinking"] == {"type": "disabled"}
+    # GLM 全系按家族统一为不可关思考（5.3 传 disabled 会报错，取家族交集）：
+    # 保活保留 enabled、去掉强度档并抬高 token 上限，与 glm-5.3 行为一致。
+    assert keepalive["extra_body"]["thinking"] == {"type": "enabled"}
     assert "reasoning_effort" not in keepalive["extra_body"]
-    assert keepalive["max_tokens"] == 1
+    assert keepalive["max_tokens"] == KEEPALIVE_THINKING_MODEL_MAX_TOKENS
+    assert keepalive["max_tokens"] > 1
 
 
 def test_keepalive_timeout_scales_with_prompt_size():

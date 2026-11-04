@@ -190,8 +190,23 @@ def get_active_agent_name() -> str:
 SECRETARY_ONLY_TOOLS = frozenset({
     "search_conversations",
     "dispatch_task",
+    # 批量派活（升级设计 2026-11-04 第 6.1 节）：一次派出多条并可声明批次内
+    # 依赖，无依赖项并行、有依赖项等上游完成后自动起。走同一条回合通道，
+    # 秘书仍无任何项目写权限。
+    "dispatch_batch",
     "open_session",
     "create_project",
+    # 派活台账只读查询（升级设计 2026-11-04 第 3.4 节）：秘书据此回答
+    # 「刚才那个任务怎么样」，普通会话工具集零变化。
+    "list_dispatches",
+    "get_dispatch_result",
+    # 项目画像（升级设计 2026-11-04 第 5.2 节）：read_project_profile 是只读
+    # （scope=none，本可自动放行，列出来是为了普通会话看不到它）；
+    # remember_decision 是 workspace 作用域，必须显式放行才不被只读门控拦下
+    # ——它唯一的写目标是 ~/.ycode/memory/projects/，路径越界由
+    # core.project_profile 直接拒绝，秘书仍无项目目录写权限。
+    "read_project_profile",
+    "remember_decision",
 })
 
 # 秘书会话的额外允许项：这些工具不是只读（network / system / 跨会话写），

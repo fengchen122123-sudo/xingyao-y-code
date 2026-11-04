@@ -4,6 +4,7 @@
 重点验证「派活等价于用户在目标会话亲手发一条消息」这一语义（spawn 入参里绝不出现
 display_text / internal_kind），避免在单测里真起回合线程。
 """
+import json
 import os
 import sys
 import threading
@@ -15,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import core.app_context as app_context
 import core.secretary as secretary
 from core import secretary_dispatch
+from core import tools
 from core.memory import MemoryManager
+from core.secretary_dispatches import STATUS_DONE, STATUS_FAILED, DispatchStore
 from gui_bridge import ApiBridge
 
 
@@ -564,3 +567,180 @@ def test_create_project_rejects_existing_file(manager, tmp_path):
 
     assert "同名文件已存在" in str(exc.value)
     assert target.read_text(encoding="utf-8") == "x"
+
+
+# ---------------------------------------------------------------------------
+# 能力五 / 六：派活台账查询 list_dispatches / get_dispatch_result
+# （升级设计 2026-11-04 第 3.4 节）
+# ---------------------------------------------------------------------------
+
+# 500 字结论：远超列表的 200 字截断线，用来区分「列表截断 / 详情不截断」
+_LONG_EXCERPT = "结论" * 250
+
+
+def _seed_ledger(manager, **overrides):
+    """直接往台账塞一条记录（绕过派活链路，专测查询工具的过滤与截断）。"""
+    params = dict(
+        secretary_session="s_secretary",
+        target_session="proj_a",
+        target_display="项目甲",
+        workdir="D:/proj/a",
+        title="补 README",
+        prompt="把 README 补一版",
+        status=STATUS_DONE,
+    )
+    params.update(overrides)
+    return DispatchStore(manager).create(**params)
+
+
+def test_ledger_tools_visible_in_secretary_schema_only(manager, monkeypatch):
+    """可见性：秘书会话 schema 含两个台账工具，普通会话 schema 一个都不含。"""
+    import core.llm as llm
+
+    class _NoMcp:
+        def get_schemas(self):
+            return []
+
+    # 屏蔽 MCP schema 合并：本用例只比较内置工具集，且不能真去连 MCP
+    monkeypatch.setattr(llm, "_get_mcp_manager", lambda: _NoMcp())
+
+    secretary_names = {s["function"]["name"] for s in llm._secretary_tools_schema()}
+    assert "list_dispatches" in secretary_names
+    assert "get_dispatch_result" in secretary_names
+
+    registry_names = {s["function"]["name"] for s in llm.tool_registry.api_schemas()}
+    ordinary_names = {
+        s["function"]["name"]
+        for s in llm._ordinary_tools_schema(secretary.SECRETARY_ONLY_TOOLS)
+    }
+    assert "list_dispatches" not in ordinary_names
+    assert "get_dispatch_result" not in ordinary_names
+    # 普通会话工具集 = 注册表全量剔除秘书专属项（与改动前逐项一致）
+    assert ordinary_names == registry_names - set(secretary.SECRETARY_ONLY_TOOLS)
+
+
+def test_ledger_tools_pass_secretary_gate(manager):
+    """门控：秘书会话里两个台账工具都被放行（不是只读门控的漏网之鱼）。"""
+    manager.create_session_explicit(
+        "s_sec", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
+    )
+    app_context.set_current_session("s_sec")
+    secretary.invalidate_secretary_cache()
+
+    assert secretary.is_secretary_session() is True
+    for name in ("list_dispatches", "get_dispatch_result"):
+        assert name in secretary.SECRETARY_ONLY_TOOLS
+        assert name in secretary.SECRETARY_ALLOWED_TOOLS
+        assert secretary.is_secretary_tool_blocked(name, "none") is False
+
+
+def test_list_dispatches_filters_and_truncates_excerpt(manager):
+    """列表：status / workdir / target 过滤生效，result_excerpt 截到 200 字。"""
+    done_id = _seed_ledger(manager, status=STATUS_DONE)
+    failed_id = _seed_ledger(
+        manager,
+        target_session="proj_b",
+        target_display="项目乙",
+        workdir="D:/proj/b",
+        title="跑测试",
+        prompt="跑一遍测试",
+        status=STATUS_FAILED,
+    )
+    store = DispatchStore(manager)
+    store.mark_status(done_id, STATUS_DONE, result_excerpt=_LONG_EXCERPT)
+    store.mark_status(failed_id, STATUS_FAILED, error="命令退出码 1")
+    _make_bridge(manager)
+
+    all_rows = json.loads(tools.list_dispatches())
+    assert all_rows["count"] == 2
+    # 按 id 倒序：最新的失败任务在前
+    assert [row["id"] for row in all_rows["dispatches"]] == [failed_id, done_id]
+    for field in ("id", "title", "target_display", "workdir", "status",
+                  "started_at", "finished_at", "result_excerpt"):
+        assert field in all_rows["dispatches"][0]
+
+    by_status = json.loads(tools.list_dispatches(status=STATUS_FAILED))
+    assert [row["id"] for row in by_status["dispatches"]] == [failed_id]
+
+    by_workdir = json.loads(tools.list_dispatches(workdir="D:/proj/a"))
+    assert [row["id"] for row in by_workdir["dispatches"]] == [done_id]
+    excerpt = by_workdir["dispatches"][0]["result_excerpt"]
+    assert len(excerpt) == 200
+    assert excerpt == _LONG_EXCERPT[:200]
+
+    # target 同时匹配会话名与显示名的子串
+    assert [row["id"] for row in json.loads(tools.list_dispatches(target="项目乙"))["dispatches"]] == [failed_id]
+    assert [row["id"] for row in json.loads(tools.list_dispatches(target="proj_a"))["dispatches"]] == [done_id]
+
+    # 无命中：纯文本提示，不是空 JSON
+    assert tools.list_dispatches(status="running") == "没有符合条件的派活记录"
+
+
+def test_get_dispatch_result_returns_full_fields(manager):
+    """详情：prompt / result_excerpt 都不截断，error / depends_on / batch_id 齐全。"""
+    dispatch_id = _seed_ledger(
+        manager,
+        prompt="把 README 补一版并跑测试",
+        depends_on=[7],
+        batch_id="batch-1",
+    )
+    DispatchStore(manager).mark_status(
+        dispatch_id, STATUS_DONE, result_excerpt=_LONG_EXCERPT
+    )
+    _make_bridge(manager)
+
+    payload = json.loads(tools.get_dispatch_result(dispatch_id))
+    assert payload["ok"] is True
+    assert payload["id"] == dispatch_id
+    assert payload["status"] == STATUS_DONE
+    assert payload["prompt"] == "把 README 补一版并跑测试"
+    # 完整摘要：500 字原样返回（列表口径只有 200 字）
+    assert payload["result_excerpt"] == _LONG_EXCERPT
+    assert len(payload["result_excerpt"]) == 500
+    assert payload["depends_on"] == [7]
+    assert payload["batch_id"] == "batch-1"
+    assert payload["target_display"] == "项目甲"
+    assert payload["workdir"] == "D:/proj/a"
+    assert payload["finished_at"]
+    assert payload["error"] == ""
+
+    brief = json.loads(tools.list_dispatches())["dispatches"][0]
+    assert len(brief["result_excerpt"]) == 200
+
+
+def test_get_dispatch_result_reports_missing_and_bad_id(manager):
+    """编号不存在 / 缺失 / 非整数：给可读文本，绝不抛异常。"""
+    _make_bridge(manager)
+
+    missing = tools.get_dispatch_result(999)
+    assert "没有找到任务 #999" in missing
+
+    assert "不能为空" in tools.get_dispatch_result()
+    assert "不能为空" in tools.get_dispatch_result("")
+    bad = tools.get_dispatch_result("abc")
+    assert "需要是整数" in bad
+    assert "abc" in bad
+    # 台账不可用（服务已注册但 store 为 None）也不能抛异常
+    secretary_dispatch.get()._store = None
+    assert "派活台账不可用" in tools.list_dispatches()
+    assert "派活台账不可用" in tools.get_dispatch_result(1)
+
+
+def test_list_dispatches_clamps_limit(manager):
+    """limit：超上限夹到 50，非法值回落默认 20。"""
+    for index in range(55):
+        _seed_ledger(manager, title=f"任务{index}")
+    _make_bridge(manager)
+
+    capped = json.loads(tools.list_dispatches(limit=999))
+    assert capped["count"] == 50
+    assert capped["dispatches"][0]["title"] == "任务54"
+
+    fallback = json.loads(tools.list_dispatches(limit="abc"))
+    assert fallback["count"] == 20
+
+
+def test_ledger_tools_report_unavailable_without_service(manager):
+    """句柄未注册（CLI / headless）：返回可读提示，不是异常。"""
+    assert "秘书调度能力当前不可用" in tools.list_dispatches()
+    assert "秘书调度能力当前不可用" in tools.get_dispatch_result(1)

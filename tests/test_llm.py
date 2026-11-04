@@ -283,8 +283,8 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         ),
         (
             "openai/kimi-k2.6",
-            "off",
-            {"max_tokens": 128000, "extra_body": {"thinking": {"type": "disabled"}}},
+            "high",
+            {"max_tokens": 128000, "extra_body": {"reasoning_effort": "high"}},
         ),
         (
             "openai/LongCat-2.0",
@@ -334,8 +334,8 @@ def test_model_reasoning_choice_uses_its_exact_request_contract(
     [
         (
             "openai/kimi-k2.6",
-            "off",
-            {"max_tokens": 128000, "extra_body": {"thinking": {"type": "disabled"}}},
+            "high",
+            {"max_tokens": 128000, "extra_body": {"reasoning_effort": "high"}},
         ),
         (
             "openai/qwen3.7-max",
@@ -375,7 +375,9 @@ def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
         (
             "openai/qwen3.7-max",
             {"enable_thinking": True},
-            {"max_tokens": 131000, "extra_body": {"enable_thinking": True}},
+            # 历史显式开启迁移为最低真实档 low（qwen 全系无 on 档），
+            # 同时注入 enable_thinking=true 保住开启语义。
+            {"max_tokens": 131000, "extra_body": {"enable_thinking": True, "reasoning_effort": "low"}},
         ),
         (
             "openai/kimi-k3",
@@ -385,6 +387,7 @@ def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
         (
             "openai/qwen3.7-max",
             {"thinking_budget": 4096},
+            # 仅配置 thinking_budget、无显式开关：不注入思考参数（历史行为）。
             {"max_tokens": 131000},
         ),
     ],
@@ -504,6 +507,38 @@ def test_k3_reasoning_choice_maps_to_anthropic_thinking_budget(
     assert opts["max_tokens"] == 131072
     assert "reasoning_effort" not in opts
     assert "reasoning_effort" not in opts.get("extra_body", {})
+
+
+@pytest.mark.parametrize(
+    ("choice", "budget_tokens"), [("low", 1024), ("high", 4096), ("max", 16384)]
+)
+def test_kimi_family_reasoning_choice_maps_to_anthropic_thinking_budget(
+    monkeypatch, choice, budget_tokens
+):
+    """kimi 家族（k2.6 等）与 K3 同档：Anthropic 路由统一翻译为 token 预算。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": choice})
+
+    opts = _provider_request_options(
+        "anthropic/kimi-k2.6", "https://api.moonshot.cn/anthropic"
+    )
+
+    assert opts["thinking"] == {"type": "enabled", "budget_tokens": budget_tokens}
+    assert "reasoning_effort" not in opts
+    assert "reasoning_effort" not in opts.get("extra_body", {})
+
+
+def test_kimi_k27_code_reasoning_choice_injects_effort(monkeypatch):
+    """kimi-k2.7-code 不再是固定开启：可选档位并注入 reasoning_effort。"""
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": "max"})
+
+    opts = _provider_request_options("openai/kimi-k2.7-code", "https://gateway.example/v1")
+
+    assert opts["extra_body"]["reasoning_effort"] == "max"
 
 
 @pytest.mark.parametrize(
@@ -849,7 +884,7 @@ def test_unregistered_model_default_choice_leaves_request_untouched():
         )
 
         assert capability.kind == "effort"
-        assert capability.options == ("default", "off", "low", "medium", "high", "max")
+        assert capability.options == ("default", "off", "low", "medium", "high", "xhigh", "max")
         assert result == {}
 
 

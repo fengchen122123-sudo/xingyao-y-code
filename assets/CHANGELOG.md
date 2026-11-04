@@ -2,6 +2,7 @@
 
 ## 1.3.9 (2026-11-01)
 
+- 新增：提示词扩写技能 `prompt-expansion`（内置技能）——把一句话需求先扩写成「复现级」执行规格再动手。`references/domain-specs.md` 收录 Web 单页 / 3D 图形 / 音视频 / Windows 批处理 / 后端接口 / 文档写作 / Agent 编排七个领域的必填槽位与领域坑位；`scripts/spec_lint.py` 是可执行门禁，检查结构完整度、量化密度、模糊词、验收可勾选性、假设条数与五项硬门禁，按 10 项评分且低于 16 分拒绝进入执行（实测糊弄版 1/20 被拦、合格版 20/20 通过）；`references/example.md` 给出「手机视频批量压缩」的完整对照范例与反例
 - 新增：办公文档读取工具 `office_read`（内置插件 `plugins/office`）——把 xlsx / xlsm / docx / pptx / pdf 转成结构化 Markdown 供模型理解：xlsx 按工作表输出表格、docx 保留标题层级与表格、pptx 与 pdf 按页输出文本。只读，不修改文件；大文件可用 `sheet` / `max_rows` / `max_chars` 控制返回量。xlsx 走 openpyxl、pdf 走 pypdf（两者是新增依赖，已写入 `requirements.txt` 并由 `ycode.spec` 的 `collect_all` 随包收集），docx/pptx 用标准库 `zipfile` + `ElementTree` 直接解析 OOXML，不引入额外依赖
 - 新增：Excel 生成工具 `office_write`（同属 `plugins/office`）——传入二维数据即按办公室默认规范出表：表头蓝底白字加粗居中、正文微软雅黑 10.5、细边框、偶数行斑马纹、列宽按显示宽度自适应（中文按 2 计）、冻结首行、首行自动筛选、横向打印并缩放到一页宽、跨页重复表头；支持多工作表。目标文件已存在时默认拒绝写入，需显式 `overwrite=true`，避免误覆盖旧表
 - 新增：办公文档处理技能 `office-format`——沉淀「先读再写、大表限量读取、覆盖前先告知、Word/PPT 暂不直出」的处理规范与交付前自检项

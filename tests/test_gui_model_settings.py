@@ -692,10 +692,10 @@ def test_fetch_provider_models_enriches_from_spec_table(tmp_path, monkeypatch):
 def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypatch):
     """模型条目必须带上思考设置字段，供模型编辑弹窗回填「思考设置」下拉。
 
-    - 已登记模型（deepseek-v4-pro）给出真实档位 default/off/high/max，
+    - 已登记模型（deepseek-v4-pro）给出真实档位 default/off/low/high/xhigh/max，
       并带上官方默认档位 high；
-    - 未登记模型回落通用强度兜底 default/off/low/medium/high/max（无内置默认
-      档位，default_choice 为空串），而不是隐藏思考设置。
+    - 未登记模型回落通用强度兜底 default/off/low/medium/high/xhigh/max（无内置
+      默认档位，default_choice 为空串），而不是隐藏思考设置。
     """
     data = _configured_data()
     data["providers"][0]["models"] = [
@@ -725,7 +725,7 @@ def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypat
     assert "default" in [opt["value"] for opt in known["reasoning_options"]]
     assert known["reasoning_disabled_reason"] == ""
     assert [opt["value"] for opt in known["reasoning_options"]] == [
-        "default", "off", "high", "max"
+        "default", "off", "low", "high", "xhigh", "max"
     ]
     # 已登记模型的官方默认档位随条目下发，供弹窗自动预选
     assert known["reasoning_default_choice"] == "high"
@@ -734,7 +734,7 @@ def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypat
     unknown = _snapshot_models()["m2"]
     assert unknown["reasoning_visible"] is True
     assert [opt["value"] for opt in unknown["reasoning_options"]] == [
-        "default", "off", "low", "medium", "high", "max"
+        "default", "off", "low", "medium", "high", "xhigh", "max"
     ]
     assert unknown["reasoning_default_choice"] == ""
 
@@ -843,14 +843,14 @@ def test_update_model_rejects_unsupported_reasoning_choice_without_failing(
 
 
 def test_stale_reasoning_choice_keeps_row_visible(tmp_path, monkeypatch):
-    """配置里存了能力表已不支持的档位（deepseek-v4-pro 无 low）时：
+    """配置里存了能力表已不支持的档位（glm-5.3 全系无 off）时：
 
     整行思考设置必须仍然可见（reasoning_visible is True），只把选择回退成
     默认档。若在这里把 visible 置 False，用户就再也无法从 UI 改回合法档位
     ——回归：此前 get_model_settings 的兜底会把整行隐藏。
     """
-    data = _data_with_model("deepseek-v4-pro")
-    data["providers"][0]["models"][0]["reasoning_choice"] = "low"
+    data = _data_with_model("glm-5.3")
+    data["providers"][0]["models"][0]["reasoning_choice"] = "off"
     _use_tmp_config(tmp_path, monkeypatch, data)
 
     item = next(
@@ -862,7 +862,7 @@ def test_stale_reasoning_choice_keeps_row_visible(tmp_path, monkeypatch):
     assert item["reasoning_kind"] == "effort"
     assert item["reasoning_choice"] == "default"
     assert [opt["value"] for opt in item["reasoning_options"]] == [
-        "default", "off", "high", "max"
+        "default", "low", "high", "max"
     ]
 
 
@@ -874,7 +874,7 @@ def test_get_reasoning_snapshot_by_name():
     assert known["ok"] is True
     assert known["reasoning"]["kind"] == "effort"
     assert [opt["value"] for opt in known["reasoning"]["options"]] == [
-        "default", "off", "high", "max"
+        "default", "off", "low", "high", "xhigh", "max"
     ]
     assert known["reasoning"]["choice"] == "default"
     assert known["reasoning"]["visible"] is True
@@ -884,7 +884,7 @@ def test_get_reasoning_snapshot_by_name():
     assert unknown["ok"] is True
     assert unknown["reasoning"]["kind"] == "effort"
     assert [opt["value"] for opt in unknown["reasoning"]["options"]] == [
-        "default", "off", "low", "medium", "high", "max"
+        "default", "off", "low", "medium", "high", "xhigh", "max"
     ]
     assert unknown["reasoning"]["default_choice"] == ""
     assert unknown["reasoning"]["visible"] is True

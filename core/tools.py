@@ -35,6 +35,9 @@ from core.lsp import _get_rg_executable
 from core.subagent_common import build_subagent_common_block
 # 秘书调度台的错误类型：仅用于把服务层的可读原因转成提示文本（纯类型，无 I/O）
 from core.secretary_dispatch import SecretaryDispatchError
+# 项目画像（跨项目记忆，升级设计 2026-11-04 第 5 节）：纯 stdlib 的文件读写，
+# 只在 ~/.ycode/memory/projects/ 下操作，不涉及项目目录
+from core import project_profile
 
 
 HTTP_TIMEOUT_SECONDS = 20
@@ -5685,6 +5688,43 @@ def dispatch_task(
     return _secretary_json(payload)
 
 
+def dispatch_batch(tasks=None, cancel_event=None):
+    """一次派出多条任务，并声明同批次内的依赖关系（秘书专用：能力九）。
+
+    升级设计 2026-11-04 第 6.1 节。``tasks`` 是任务数组，每项
+    ``{title, prompt, target, workdir, depends_on}``：
+
+    - ``depends_on`` 填**同批次内其它任务的下标**（从 0 开始），不填表示无依赖；
+    - 无依赖项立即并行派发，有依赖项先落 ``blocked``，等上游全部完成后由
+      依赖推进器自动启动，用户不必再催；
+    - 单批最多 8 条；下标越界 / 指向自身 / 成环会被直接拒绝（成环会给出环路径）。
+
+    返回 JSON 字符串 ``{ok, batch_id, items: [{index, dispatch_id, state}]}``；
+    ``batch_id`` 可用于 ``list_dispatches`` 汇总本批结果。参数非法时返回可读
+    提示文本，不抛异常。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    if isinstance(tasks, (str, bytes)) or not isinstance(tasks, (list, tuple)):
+        return "🚨 批量派活失败：tasks 需要是任务数组（每项含 prompt 等字段）。"
+    if not tasks:
+        return "🚨 批量派活失败：tasks 至少需要一条任务。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.dispatch_batch(tasks=[dict(t) if isinstance(t, dict) else t for t in tasks])
+    except SecretaryDispatchError as exc:
+        return f"🚨 批量派活失败：{exc}"
+    except Exception as exc:
+        return f"🚨 批量派活失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 批量派活失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    return _secretary_json(payload)
+
+
 def open_session(target="", cancel_event=None):
     """把用户带到某个历史会话（秘书调度台：能力三）。
 
@@ -5743,3 +5783,225 @@ def create_project(path="", cancel_event=None):
     payload = dict(result)
     payload.setdefault("ok", True)
     return _secretary_json(payload)
+
+
+# ---------------------------------------------------------------------------
+# 秘书派活台账查询（升级设计 2026-11-04 第 3.4 节）
+# 两个只读工具同样只对秘书会话可见（core.secretary 的工具策略），能力由 GUI 侧
+# 实现并经 core.secretary_dispatch 注册；未注册时返回同一句可读提示，不抛异常。
+# 用途：用户隔一轮问「刚才那个怎么样」，秘书直接查台账即可答出结论摘要与状态，
+# 不用重新检索会话、也不用用户复述。
+# ---------------------------------------------------------------------------
+
+#: 列表里的结论摘要长度上限（完整摘要走 get_dispatch_result）
+_SECRETARY_LIST_EXCERPT_CHARS = 200
+
+#: 详情返回的字段（顺序即阅读顺序；prompt / result_excerpt 都不截断）
+_SECRETARY_DISPATCH_DETAIL_FIELDS = (
+    "id",
+    "title",
+    "target_session",
+    "target_display",
+    "workdir",
+    "status",
+    "started_at",
+    "finished_at",
+    "prompt",
+    "result_excerpt",
+    "error",
+    "depends_on",
+    "batch_id",
+    "secretary_session",
+)
+
+
+def _secretary_dispatch_brief(row) -> dict:
+    """台账行 → 列表项：只留定位与该轮结论，摘要截 ``_SECRETARY_LIST_EXCERPT_CHARS``。"""
+    return {
+        "id": row.get("id"),
+        "title": str(row.get("title") or ""),
+        "target_display": str(row.get("target_display") or ""),
+        "workdir": str(row.get("workdir") or ""),
+        "status": str(row.get("status") or ""),
+        "started_at": str(row.get("started_at") or ""),
+        "finished_at": str(row.get("finished_at") or ""),
+        "result_excerpt": str(row.get("result_excerpt") or "")[
+            :_SECRETARY_LIST_EXCERPT_CHARS
+        ],
+    }
+
+
+def _secretary_dispatch_detail(row) -> dict:
+    """台账行 → 详情：全字段原样输出（prompt / result_excerpt 不做截断）。"""
+    payload = {"ok": True}
+    for field in _SECRETARY_DISPATCH_DETAIL_FIELDS:
+        value = row.get(field)
+        if field == "depends_on":
+            dependency_ids = []
+            for item in value or []:
+                try:
+                    dependency_ids.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            payload[field] = dependency_ids
+            continue
+        if isinstance(value, str) or value is None or isinstance(value, int):
+            payload[field] = value
+        else:
+            payload[field] = str(value)
+    return payload
+
+
+def list_dispatches(status="", workdir="", target="", limit=20, cancel_event=None):
+    """列出秘书派出的任务台账（秘书专用：能力五）。
+
+    用来回答「刚才派出去的那些任务怎么样」：按状态 / 项目目录 / 目标会话
+    （会话名或显示名子串）过滤，按任务编号倒序返回最近的若干条。每条含
+    id / title / target_display / workdir / status / started_at / finished_at /
+    result_excerpt（截 200 字）；要看完整结论与错误用 ``get_dispatch_result``。
+
+    无命中返回纯文本「没有符合条件的派活记录」（不是空 JSON，便于直接回话）。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    _raise_if_cancelled(cancel_event)
+    try:
+        rows = service.list_dispatches(
+            status=str(status or ""),
+            workdir=str(workdir or ""),
+            target=str(target or ""),
+            limit=_secretary_scope_limit(limit),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 查询派活记录失败：{exc}"
+    except Exception as exc:
+        return f"🚨 查询派活记录失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    items = [_secretary_dispatch_brief(row) for row in (rows or []) if isinstance(row, dict)]
+    if not items:
+        return "没有符合条件的派活记录"
+    return _secretary_json({"count": len(items), "dispatches": items})
+
+
+def get_dispatch_result(dispatch_id=None, cancel_event=None):
+    """查一条派活任务的完整详情（秘书专用：能力六）。
+
+    ``dispatch_id`` 取 ``list_dispatches`` 返回的 id。返回 JSON 字符串：上面列表
+    的全部字段 + 完整 ``prompt`` / 完整 ``result_excerpt``（不截断）/ ``error`` /
+    ``depends_on`` / ``batch_id`` / ``secretary_session``。编号缺失或非整数、
+    编号不存在都给可读提示而不抛异常。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    raw = "" if dispatch_id is None else str(dispatch_id).strip()
+    if not raw:
+        return "🚨 查询任务详情失败：dispatch_id（任务编号）不能为空。"
+    try:
+        parsed_id = int(raw)
+    except (TypeError, ValueError):
+        return f"🚨 查询任务详情失败：dispatch_id 需要是整数，收到「{raw}」。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        row = service.get_dispatch_result(dispatch_id=parsed_id)
+    except SecretaryDispatchError as exc:
+        return f"🚨 查询任务详情失败：{exc}"
+    except Exception as exc:
+        return f"🚨 查询任务详情失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(row, dict):
+        return f"没有找到任务 #{parsed_id}"
+    payload = _secretary_dispatch_detail(row)
+    payload["id"] = parsed_id
+    return _secretary_json(payload)
+
+
+# ---------------------------------------------------------------------------
+# 项目画像（跨项目记忆：升级设计 2026-11-04 第 5 节）
+# read_project_profile 只读（scope=none），remember_decision 写
+# ~/.ycode/memory/projects/（scope=workspace）。两者都只对秘书会话可见
+# （core.secretary 的工具策略），普通会话的工具集零变化。画像路径、章节枚举与
+# 越界校验统一放在 core.project_profile，这里只做入参校验与可读文本转换。
+# ---------------------------------------------------------------------------
+
+#: remember_decision 单条内容上限（与 core.project_profile 同源，避免两处漂移）
+_REMEMBER_DECISION_MAX_CHARS = project_profile.MAX_SECTION_CONTENT_CHARS
+
+#: 不是磁盘目录的保留分组标识：空 workdir 落在这些分组时不允许写画像
+_PROFILE_RESERVED_WORKDIRS = frozenset({"GLOBAL", "SECRETARY"})
+
+
+def _current_session_workdir():
+    """当前会话的工作目录文本（取不到返回空串；绝不抛）。"""
+    try:
+        from core.workspace_context import get_workdir
+
+        return str(get_workdir() or "")
+    except Exception:
+        return ""
+
+
+def read_project_profile(workdir="", cancel_event=None):
+    """读某个项目的画像（秘书专用：能力七）。
+
+    ``workdir`` 为空时取当前会话的工作目录。返回画像全文（Markdown：技术栈 /
+    架构决策 / 硬约束 / 踩坑记录 / 用户偏好 / 任务流水 六章）。该项目还没有
+    画像时返回可读文本「该项目还没有画像」，绝不抛异常。
+
+    典型用法：用户问「这个项目以前定过什么规矩」时先读画像，再回答。
+    """
+    target = str(workdir or "").strip() or _current_session_workdir()
+    _raise_if_cancelled(cancel_event)
+    try:
+        text = project_profile.read_profile(target)
+    except Exception as exc:
+        return f"🚨 读取项目画像失败：{exc}"
+    if not str(text or "").strip():
+        where = target or "未指定工作目录"
+        return (
+            f"该项目还没有画像（{where}）。"
+            "可以用 remember_decision 先把技术栈 / 架构决策 / 硬约束记下来。"
+        )
+    return text
+
+
+def remember_decision(workdir="", section="", content="", cancel_event=None):
+    """把一条项目级结论记进项目画像（秘书专用：能力八）。
+
+    ``section`` 只能是 技术栈 / 架构决策 / 硬约束 / 踩坑记录 / 用户偏好；
+    ``workdir`` 为空时取当前会话的工作目录。写入位置固定在
+    ``~/.ycode/memory/projects/<hash>.md``，**不碰项目目录**，越界路径由
+    ``core.project_profile`` 直接拒绝。返回可读文本：成功是
+    ``已记入「项目名」的「章节」``，失败是带原因的提示（不抛异常）。
+    """
+    name = str(section or "").strip()
+    if name not in project_profile.SECTION_ALLOWED:
+        return (
+            "🚨 记录失败：section 只能是 %s，收到「%s」。"
+            % ("、".join(project_profile.SECTION_ALLOWED), name or "(空)")
+        )
+    body = str(content or "").strip()
+    if not body:
+        return "🚨 记录失败：content（要记住的内容）不能为空。"
+    if len(body) > _REMEMBER_DECISION_MAX_CHARS:
+        return (
+            f"🚨 记录失败：content 太长（{len(body)} 字），"
+            f"上限 {_REMEMBER_DECISION_MAX_CHARS} 字，请精简后再记。"
+        )
+    _raise_if_cancelled(cancel_event)
+    target = str(workdir or "").strip() or _current_session_workdir()
+    if not str(target or "").strip() or str(target).strip().upper() in _PROFILE_RESERVED_WORKDIRS:
+        return (
+            "🚨 记录失败：无法确定项目目录（当前会话没有归属项目）。"
+            "请在 workdir 里给出该项目的完整路径。"
+        )
+    try:
+        message = project_profile.append_section(target, name, body)
+    except ValueError as exc:
+        return f"🚨 记录失败：{exc}"
+    except Exception as exc:
+        return f"🚨 记录失败：{exc}"
+    if not message:
+        return f"🚨 记录失败：项目画像没有写成（{target}），请稍后重试。"
+    return message

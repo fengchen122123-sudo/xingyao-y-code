@@ -493,6 +493,13 @@ class EmbeddedBrowserController:
                     "内嵌 WebView2 初始化失败: %s",
                     getattr(args, "InitializationException", "unknown"),
                 )
+                # 这个控件的内核永远起不来了，而 _create_control 是幂等的
+                # （self._webview is not None 直接 return）：不在这里作废，
+                # 就再也没有重建入口，用户看到的是永久白板，只有重启进程能救。
+                # 只有当前控件自己的事件才回收——控件被重建后，旧控件迟到的
+                # 回调不能把新控件的引用清掉。
+                if sender is self._webview:
+                    self._recycle_failed_control()
                 return
             self._init_error = ""
             core = self._webview.CoreWebView2
@@ -538,6 +545,46 @@ class EmbeddedBrowserController:
             self._schedule_emit()
         except Exception:
             logger.warning("内嵌 WebView2 事件挂接失败", exc_info=True)
+
+    def _recycle_failed_control(self) -> None:
+        """作废初始化失败的原生控件：清引用让下次 open 走重建，并延迟释放控件。
+
+        为什么必须做：_create_control 以「self._webview is not None」为幂等判据，
+        控件一旦初始化失败却又留在引用上，后续每次 open 都命中幂等分支直接返回，
+        面板永远白板（2026-11-02/03/04 各出现过一次 0x8007139F）。
+
+        时序：清引用在本回调里同步做，保证紧接着的 open 立刻看到 _webview is None；
+        Dispose 推到下一轮 GUI 消息——此刻 WebView2 正在派发初始化完成事件，
+        在回调栈内同步销毁 sender 会让返回时的内部状态悬空。
+        """
+        try:
+            webview = self._webview
+            if webview is None:
+                return
+            self._webview = None
+            self._ready = False
+            self._visible = False
+            self._zoom = 1.0
+            with self._lock:
+                self._pending_url = ""
+            form = self._form
+
+            def _dispose():
+                try:
+                    parent = getattr(webview, "Parent", None)
+                    if parent is not None:
+                        parent.Controls.Remove(webview)
+                except Exception:
+                    logger.debug("移除初始化失败的 WebView2 控件失败", exc_info=True)
+                try:
+                    webview.Dispose()
+                except Exception:
+                    logger.debug("释放初始化失败的 WebView2 控件失败", exc_info=True)
+
+            if form is None or not self._begin_invoke(form, _dispose):
+                _dispose()
+        except Exception:
+            logger.debug("回收初始化失败的 WebView2 控件失败", exc_info=True)
 
     def _on_source_changed(self, sender, args) -> None:
         try:
@@ -751,6 +798,16 @@ class EmbeddedBrowserController:
             def _apply():
                 try:
                     self._apply_bounds(form, rect, zoom)
+                    # 可见性自愈：控件可能刚被自动化路径（prepare_automation）
+                    # 重建，新控件默认 Visible=False，而前端的显隐去重
+                    # （useEmbeddedBrowserSurface 的 lastVisible）只在翻转时才
+                    # 调 open，之后只会反复 set_bounds——不在这里补一刀，面板
+                    # 就是「框和地址栏都在、内容区永久白板」。前端肯调
+                    # set_bounds 本身即表示它认为这块表面该显示，因此顺手拉回
+                    # 可见性：前端 2s 心跳会在两秒内把白板救回来。
+                    if not self._visible and self._webview is not None:
+                        self._webview.Visible = True
+                        self._visible = True
                     box["ok"] = True
                 except Exception as exc:
                     box["ok"] = False
