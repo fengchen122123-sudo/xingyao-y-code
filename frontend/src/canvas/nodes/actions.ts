@@ -12,3 +12,13 @@ export type NodeActionPayload = {
 
 /** defineEmits 的签名片段：统一写法，避免各节点各写一套结构类型 */
 export type NodeActionEmits = { action: [payload: NodeActionPayload] };
+
+/**
+ * 端口拉线的落点（M3-T04）：起点节点已由目标端口的宿主 NodeShell 从
+ * connection-drag 单例里读出，这里只带 from/to 两个 id。
+ * 合法性不进组件：CanvasPane 收到后调 store.connect（guard 在 store 里过）。
+ */
+export type CanvasConnectRequest = { fromNodeId: string; toNodeId: string };
+
+/** 只有 NodeShell 需要：目标端口松手时上抛连线请求 */
+export type NodeConnectEmits = { 'connect-request': [payload: CanvasConnectRequest] };

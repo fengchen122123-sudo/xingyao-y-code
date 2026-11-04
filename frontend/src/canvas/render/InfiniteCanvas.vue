@@ -376,7 +376,16 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointercancel', onWindowPointerUp);
 });
 
-defineExpose({ screenToWorld, worldToScreen });
+/**
+ * 客户端坐标（event.clientX/Y）→ 世界坐标。
+ * M3-T04 拉线用：端口手势拿到的是 client 坐标，画虚线要的是世界坐标。
+ */
+function clientToWorld(clientX: number, clientY: number): Position {
+  const local = localPoint(clientX, clientY);
+  return screenToWorld(local.x, local.y);
+}
+
+defineExpose({ screenToWorld, worldToScreen, clientToWorld });
 </script>
 
 <style scoped>

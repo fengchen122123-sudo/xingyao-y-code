@@ -14,6 +14,7 @@ import type {
   ViewportTransform,
 } from '../canvas/types';
 import { findGroupDropTarget, snapNodesIntoGroup } from '../canvas/utils/canvas-group';
+import { validateConnection } from '../canvas/utils/canvas-reference-guard';
 // 只借类型、不引入运行期依赖：appStore 反向 import 本 store（value import），
 // 这里若用 value import 会成环；`import type` 编译期擦除，安全。
 import type { CanvasEditResultData, CanvasVideoResultData } from './appStore';
@@ -92,6 +93,22 @@ function cloneProject(project: CanvasProject): CanvasProject {
     viewport: { ...project.viewport },
     sidePanel: { ...project.sidePanel },
   };
+}
+
+/**
+ * 连线 id：`c_` + 递增序号（取现有最大序号 +1，并跳过被占用的号）。
+ * 递增而不是纯随机：一是同一次会话里 id 可预期、调试好认；二是删了再连不会和旧 id 撞车。
+ */
+function newConnectionId(connections: CanvasConnection[]): string {
+  let max = 0;
+  for (const connection of connections) {
+    const match = /^c_(\d+)$/.exec(connection.id || '');
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  const used = new Set(connections.map((connection) => connection.id));
+  let next = max + 1;
+  while (used.has(`c_${next}`)) next += 1;
+  return `c_${next}`;
 }
 
 /** 托盘去重键：图片看 storageKey/dataUrl，音视频看 storageKey/url，文本看内容 */
@@ -224,6 +241,53 @@ export const useCanvasStore = defineStore('canvas', {
     setViewport(v: ViewportTransform): void {
       if (!this.project) return;
       this.project.viewport = { ...v };
+      this.scheduleSave();
+    },
+
+    // ── M3-T04 连线（资源引用）─────────────────────────────────────
+    // 合法性全在 canvas-reference-guard 里判（类型兼容表 + 自连 + 重复 + 环），
+    // store 只负责「过了就建、并落盘」，绝不在两处各写一套规则。
+
+    /**
+     * 建立一条 from → to 的引用连线。
+     * 失败不落盘、不改内存，直接把 reason 交给调用方（CanvasPane 弹 toast）。
+     * 成功即写 connectionCount 并走 800ms 防抖落盘（拉线是单次操作，不必立即 save）。
+     */
+    connect(fromNodeId: string, toNodeId: string): { ok: boolean; reason?: string } {
+      const project = this.project;
+      if (!project) return { ok: false, reason: '没有打开的画布' };
+      const check = validateConnection({
+        fromNodeId,
+        toNodeId,
+        nodes: project.nodes,
+        connections: project.connections,
+      });
+      if (!check.ok) return { ok: false, reason: check.reason || '连线不可用' };
+
+      const connection: CanvasConnection = {
+        id: newConnectionId(project.connections),
+        fromNodeId,
+        toNodeId,
+      };
+      project.connections.push(connection);
+      project.connectionCount = project.connections.length;
+      this.scheduleSave();
+      return { ok: true };
+    },
+
+    /** 删除一条连线；连带把它从选中集里摘掉（否则工具条会显示已删除的连线） */
+    disconnect(connectionId: string): void {
+      const project = this.project;
+      if (!project || typeof connectionId !== 'string' || !connectionId) return;
+      const next = project.connections.filter((connection) => connection.id !== connectionId);
+      if (next.length === project.connections.length) return;
+      project.connections = next;
+      project.connectionCount = next.length;
+      if (this.selectedConnectionIds.has(connectionId)) {
+        const selected = new Set(this.selectedConnectionIds);
+        selected.delete(connectionId);
+        this.selectedConnectionIds = selected;
+      }
       this.scheduleSave();
     },
 

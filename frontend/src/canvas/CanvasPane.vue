@@ -44,6 +44,7 @@
       <div v-else class="canvas-mount" data-test="canvas-mount">
         <!-- 受控视口：手势结束/滚轮时 emit，store.setViewport 走 800ms 防抖落盘 -->
         <InfiniteCanvas
+          ref="canvasRef"
           :viewport="store.project.viewport"
           :background-mode="store.project.backgroundMode"
           :selected-node-ids="selectedNodeIdList"
@@ -56,6 +57,17 @@
           <!-- 世界坐标内容层：按 project.nodes 逐节点渲染。
                节点只 emit action（不 import store、不写 project），落库统一回到本组件的
                onNodeAction —— M3-T01 先占位，M3-T02 起在这里翻译成 store action -->
+          <!-- 连线画在节点下面：世界坐标 SVG，线宽按 1/k 反缩（M3-T04） -->
+          <ConnectionPath
+            v-for="item in renderedConnections"
+            :key="item.connection.id"
+            :connection="item.connection"
+            :from="item.from"
+            :to="item.to"
+            :selected="store.selectedConnectionIds.has(item.connection.id)"
+            :scale="canvasScale"
+            @select="onConnectionSelect"
+          />
           <NodeShell
             v-for="node in store.project.nodes"
             :key="node.id"
@@ -65,12 +77,36 @@
             :scale="store.project.viewport.k"
             :style="nodeStyle(node)"
             @action="onNodeAction"
+            @connect-request="onConnectRequest"
           >
             <component :is="NODE_COMPONENTS[node.type]" :node="node" @action="onNodeAction" />
           </NodeShell>
+          <!-- 拉线中的虚线：起点取源节点右端口，终点跟指针（世界坐标，与连线同公式） -->
+          <svg
+            v-if="activeConnectionPathD"
+            class="canvas-active-connection"
+            data-test="canvas-active-connection"
+            width="1"
+            height="1"
+            :style="ACTIVE_SVG_STYLE"
+            aria-hidden="true"
+          >
+            <path
+              :d="activeConnectionPathD"
+              fill="none"
+              stroke="#2f80ff"
+              :stroke-width="activeStrokeWidth"
+              stroke-dasharray="5,5"
+              data-test="canvas-active-connection-line"
+            />
+          </svg>
           <!-- 框选矩形：与世界层同一 transform，左/top 直接吃世界坐标 -->
           <SelectionBox :state="selectionBox" />
         </InfiniteCanvas>
+        <!-- 连线被拒绝的原因（store.connect 的 reason）：右上角短提示，2.4s 自动消失 -->
+        <div v-if="connectError" class="canvas-connect-toast" data-test="canvas-connect-toast">
+          {{ connectError }}
+        </div>
         <!-- 空画布占位：浮在画布之上，不吃指针事件（不挡平移缩放） -->
         <div v-if="!store.project.nodes.length" class="canvas-empty-hint" data-test="canvas-empty-hint">
           拖入或生成素材开始
@@ -88,17 +124,23 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch, type CSSProperties } from 'vue';
+import { computed, onBeforeUnmount, ref, watch, type CSSProperties } from 'vue';
 
 import { useCanvasStore } from '../stores/canvas';
 import type { ProjectMeta } from '../canvas/bridge';
 import InfiniteCanvas from './render/InfiniteCanvas.vue';
+import ConnectionPath from './render/ConnectionPath.vue';
 import SelectionBox from './render/SelectionBox.vue';
 import NodeShell from './nodes/NodeShell.vue';
 import { NODE_COMPONENTS } from './nodes';
-import type { NodeActionPayload } from './nodes/actions';
+import type { CanvasConnectRequest, NodeActionPayload } from './nodes/actions';
+import { connectionDrag } from './nodes/connection-drag';
 import SelectionToolbar from './tools/SelectionToolbar.vue';
 import { CanvasNodeType, type CanvasNodeData, type SelectionBoxState } from './types';
+import {
+  buildActiveConnectionPathD,
+  getConnectionsInSelectionRect,
+} from './utils/canvas-connection-path';
 import {
   getNodesInSelectionRect,
   type SelectionCommitPayload,
@@ -109,6 +151,8 @@ const props = withDefaults(defineProps<{ active?: boolean }>(), { active: false 
 
 const store = useCanvasStore();
 const creating = ref(false);
+/** InfiniteCanvas 暴露的 clientToWorld：拉线虚线要按指针位置算世界坐标 */
+const canvasRef = ref<InstanceType<typeof InfiniteCanvas> | null>(null);
 
 /** 框选帧内的矩形态：由 InfiniteCanvas 的 selection-change 推来，只用于渲染 SelectionBox */
 const selectionBox = ref<SelectionBoxState | null>(null);
@@ -120,6 +164,85 @@ const selectedConnectionIdList = computed(() => Array.from(store.selectedConnect
 const hasSelection = computed(
   () => store.selectedNodeIds.size + store.selectedConnectionIds.size > 0,
 );
+
+/** 世界层缩放：传给 ConnectionPath 做线宽反缩（k 非法时退化为 1） */
+const canvasScale = computed(() => {
+  const k = store.project?.viewport.k;
+  return typeof k === 'number' && Number.isFinite(k) && k > 0 ? k : 1;
+});
+
+/** 拉线虚线容器的样式：世界层内绝对定位 + overflow visible，常量避免每帧新建对象 */
+const ACTIVE_SVG_STYLE: CSSProperties = {
+  position: 'absolute',
+  left: '0px',
+  top: '0px',
+  overflow: 'visible',
+  pointerEvents: 'none',
+};
+
+/**
+ * 已存在连线 → 可渲染的 from/to 实体。
+ * 悬空连线（节点已删）直接跳过：宁可少画一根线，也不画出没有端点的半截线。
+ */
+const renderedConnections = computed(() => {
+  const project = store.project;
+  if (!project) return [];
+  const byId = new Map(project.nodes.map((node) => [node.id, node]));
+  return project.connections.flatMap((connection) => {
+    const from = byId.get(connection.fromNodeId);
+    const to = byId.get(connection.toNodeId);
+    return from && to ? [{ connection, from, to }] : [];
+  });
+});
+
+/**
+ * 拉线中的虚线路径（世界坐标）：起点取源节点右端口，终点取指针所在世界坐标。
+ * 换算走 InfiniteCanvas 的 clientToWorld（含手势期间的实时视口），拖动画布再拉线也不会偏。
+ */
+const activeConnectionPathD = computed(() => {
+  if (!connectionDrag.active) return '';
+  const from = store.project?.nodes.find((node) => node.id === connectionDrag.fromNodeId);
+  if (!from) return '';
+  const start = { x: from.position.x + from.width, y: from.position.y + from.height / 2 };
+  const end = canvasRef.value?.clientToWorld(connectionDrag.clientX, connectionDrag.clientY) ?? start;
+  return buildActiveConnectionPathD(start, end);
+});
+
+/** 虚线线宽同样按 1/k 反缩：缩放画布时粗细不变 */
+const activeStrokeWidth = computed(() => 2 / canvasScale.value);
+
+/** 点连线 → 只选中这条连线（清掉节点选中，与参考仓点线口径一致） */
+function onConnectionSelect(connectionId: string): void {
+  if (!connectionId) return;
+  store.setSelection([], [connectionId], false);
+}
+
+// ── M3-T04 连线被拒绝的提示（右上角 toast，不引第三方依赖） ──────────
+const CONNECT_ERROR_MS = 2400;
+const connectError = ref('');
+let connectErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+function showConnectError(reason: string): void {
+  connectError.value = reason;
+  if (connectErrorTimer !== null) clearTimeout(connectErrorTimer);
+  connectErrorTimer = setTimeout(() => {
+    connectErrorTimer = null;
+    connectError.value = '';
+  }, CONNECT_ERROR_MS);
+}
+
+/** 目标端口松手 → store.connect；guard 拒绝时把 reason 原样展示，不吞掉原因 */
+function onConnectRequest(payload: CanvasConnectRequest): void {
+  const result = store.connect(payload.fromNodeId, payload.toNodeId);
+  if (!result.ok) showConnectError(result.reason || '连线不可用');
+}
+
+onBeforeUnmount(() => {
+  if (connectErrorTimer !== null) {
+    clearTimeout(connectErrorTimer);
+    connectErrorTimer = null;
+  }
+});
 
 /** 节点在世界层的盒模型：位置/尺寸取 store，z 序对齐参考仓（分组 5 / 普通 10 / 选中 50） */
 function nodeStyle(node: CanvasNodeData): CSSProperties {
@@ -180,22 +303,36 @@ function onSelectionChange(state: SelectionBoxState): void {
 
 /**
  * 框选提交：世界坐标矩形与节点包围盒求交 → store.setSelection（additive=Shift 加选）。
- * 连线命中随 M3-T04 的 connectionIntersectsWorldRect 一起接（本任务 connectionIds 传空集）。
+ * 连线命中（M3-T04）：与 ConnectionPath 同一套贝塞尔公式（connectionIntersectsWorldRect），
+ * 框住线本身也算选中——否则 2px 宽的视觉线几乎点不到。
  */
 function onSelectionCommit(payload: SelectionCommitPayload): void {
   selectionBox.value = null;
   const project = store.project;
   if (!project) return;
   const nodeIds = getNodesInSelectionRect(project.nodes, payload.rect);
-  store.setSelection(nodeIds, [], payload.additive);
+  const connectionIds = getConnectionsInSelectionRect(project.connections, project.nodes, {
+    x: payload.rect.x,
+    y: payload.rect.y,
+    w: payload.rect.width,
+    h: payload.rect.height,
+  });
+  store.setSelection(nodeIds, connectionIds, payload.additive);
 }
 
 /**
  * 选区工具条 → store 的唯一落点。
- * 删除/复制依赖历史栈与剪贴板（M3-T05）；成组/取消组依赖分组 action（store 尚未提供）。
- * 本任务先把按钮事件接到这里并留痕，绝不静默改 project。
+ * M3-T04 只接「删连线」：节点删除要连带清理分组/历史栈，留给 M3-T05 统一做；
+ * 其余动作保持留痕，绝不静默改 project。
  */
 function onToolbarAction(action: SelectionToolbarAction): void {
+  if (action === 'delete') {
+    const connectionIds = [...store.selectedConnectionIds];
+    if (connectionIds.length) {
+      for (const id of connectionIds) store.disconnect(id);
+      return;
+    }
+  }
   console.debug('[canvas] 选区工具条动作（待后续任务实装）', action, selectedNodeIdList.value);
 }
 
@@ -378,5 +515,23 @@ watch(
   justify-content: center;
   height: 100%;
   color: var(--text-secondary, #888);
+}
+
+/* 连线被拒绝的短提示（M3-T04）：右上角浮层，不吃指针事件，不挡画布操作 */
+.canvas-connect-toast {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 60;
+  max-width: 320px;
+  padding: 6px 10px;
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  border-radius: 8px;
+  background: rgba(127, 29, 29, 0.92);
+  color: #fee2e2;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
+  pointer-events: none;
 }
 </style>

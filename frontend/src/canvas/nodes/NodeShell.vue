@@ -54,8 +54,9 @@
         @pointerdown.stop="onResizePointerDown($event, handle)"
       ></div>
 
-      <!-- 左右连接端口：本任务只渲染（不接线），拖拽连线由 M3-T04 接。
-           pointerdown.stop：端口上按下不能触发节点拖拽，否则 M3-T04 拉线会顺带挪节点 -->
+      <!-- 左右连接端口（M3-T04 接线）：右端口起拉线，左端口接松手落点。
+           - 两端 pointerdown 都 .stop：端口上按下不能触发节点拖拽，否则拉线会顺带挪节点；
+           - 左端 pointerup 不 .stop：要让源节点挂在 window 上的收尾监听照常跑（清拖拽态） -->
       <div
         v-if="!isGroup"
         class="ns-port left"
@@ -63,6 +64,7 @@
         data-side="left"
         aria-hidden="true"
         @pointerdown.stop
+        @pointerup="onTargetPortPointerUp"
       ></div>
       <div
         v-if="!isConfig"
@@ -70,7 +72,7 @@
         data-test="node-port"
         data-side="right"
         aria-hidden="true"
-        @pointerdown.stop
+        @pointerdown.stop="onPortPointerDown($event, 'right')"
       ></div>
 
       <!-- loading 遮罩：metadata.status === 'loading'（M4 起由 job 状态驱动） -->
@@ -100,7 +102,13 @@ import { computed, nextTick, onBeforeUnmount, ref } from 'vue';
 
 import type { CanvasNodeData } from '../types';
 import { CanvasNodeType } from '../types';
-import type { NodeActionEmits } from './actions';
+import type { NodeActionEmits, NodeConnectEmits } from './actions';
+import {
+  connectionDrag,
+  endConnectionDrag,
+  moveConnectionDrag,
+  startConnectionDrag,
+} from './connection-drag';
 
 defineOptions({ name: 'NodeShell' });
 
@@ -113,7 +121,7 @@ const props = defineProps<{
   scale?: number;
 }>();
 
-const emit = defineEmits<NodeActionEmits>();
+const emit = defineEmits<NodeActionEmits & NodeConnectEmits>();
 
 /** 八向手柄：角 4 个 + 边 4 个（顺序固定，方便 M3-T02 按 data-handle 挂拖拽） */
 const RESIZE_HANDLES = [
@@ -370,8 +378,62 @@ function finishGesture(g: GestureState): void {
   emit('action', { nodeId: props.node.id, action: 'commit-group-snap', args: {} });
 }
 
+// ── M3-T04 端口拉线 ─────────────────────────────────────────────
+// 分工：源节点（右端口）只负责「起手势 + 跟手更新 connectionDrag」；
+// 目标节点（左端口）在 pointerup 时从单例里读出起点并 emit connect-request。
+// 类型兼容/自连/重复/环一律不进节点组件——guard 在 store.connect 里过（M3-T01 约定）。
+
+function onPortPointerDown(event: PointerEvent, side: 'left' | 'right'): void {
+  if (!props.interactive || event.button !== 0) return;
+  // 左端是 target 端：只接松手落点，不发起拉线
+  if (side !== 'right') return;
+  if (gesture) return;
+  startConnectionDrag(props.node.id, event);
+  // 监听挂 window：指针移出节点/移出画布也要跟手，jsdom 下同样可用
+  window.addEventListener('pointermove', onConnectionMove);
+  window.addEventListener('pointerup', onConnectionUp);
+  window.addEventListener('pointercancel', onConnectionUp);
+}
+
+function detachConnectionListeners(): void {
+  window.removeEventListener('pointermove', onConnectionMove);
+  window.removeEventListener('pointerup', onConnectionUp);
+  window.removeEventListener('pointercancel', onConnectionUp);
+}
+
+function onConnectionMove(event: PointerEvent): void {
+  if (!connectionDrag.active) return;
+  // 丢了 pointerup 的兜底：按键已全松 → 收尾（空白松手＝不建线）
+  if (event.buttons === 0) {
+    finishConnectionDrag();
+    return;
+  }
+  moveConnectionDrag(event.clientX, event.clientY);
+}
+
+function onConnectionUp(): void {
+  finishConnectionDrag();
+}
+
+function finishConnectionDrag(): void {
+  detachConnectionListeners();
+  endConnectionDrag();
+}
+
+/**
+ * 目标端口松手：有进行中的拉线就请求连线（自连也照样上抛，让 guard 回一句
+ * 「不能把节点连到自己」，比默默没反应更容易理解）。
+ */
+function onTargetPortPointerUp(): void {
+  if (!connectionDrag.active) return;
+  const fromNodeId = connectionDrag.fromNodeId;
+  if (!fromNodeId) return;
+  emit('connect-request', { fromNodeId, toNodeId: props.node.id });
+}
+
 onBeforeUnmount(() => {
   detachGestureListeners();
+  detachConnectionListeners();
   gesture = null;
 });
 
