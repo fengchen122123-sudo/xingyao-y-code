@@ -36,13 +36,24 @@
       </button>
     </aside>
 
-    <!-- 右列：画布舞台。InfiniteCanvas 由 M2-T06 挂进 canvas-mount -->
+    <!-- 右列：画布舞台（InfiniteCanvas 承载世界层 transform 与平移缩放手势） -->
     <section class="canvas-stage" data-test="canvas-stage">
       <div v-if="!store.project" class="canvas-hint" data-test="canvas-stage-empty">
         选择左侧项目，或新建一个画布开始
       </div>
       <div v-else class="canvas-mount" data-test="canvas-mount">
-        <!-- M2-T06 在此挂入 InfiniteCanvas（受控 viewport + update:viewport） -->
+        <!-- 受控视口：手势结束/滚轮时 emit，store.setViewport 走 800ms 防抖落盘 -->
+        <InfiniteCanvas
+          :viewport="store.project.viewport"
+          :background-mode="store.project.backgroundMode"
+          @update:viewport="store.setViewport"
+        >
+          <!-- 世界坐标内容层：M3 起按 project.nodes 渲染节点 -->
+        </InfiniteCanvas>
+        <!-- 空画布占位：浮在画布之上，不吃指针事件（不挡平移缩放） -->
+        <div v-if="!store.project.nodes.length" class="canvas-empty-hint" data-test="canvas-empty-hint">
+          拖入或生成素材开始
+        </div>
       </div>
     </section>
   </div>
@@ -53,6 +64,7 @@ import { ref, watch } from 'vue';
 
 import { useCanvasStore } from '../stores/canvas';
 import type { ProjectMeta } from '../canvas/bridge';
+import InfiniteCanvas from './render/InfiniteCanvas.vue';
 
 const props = withDefaults(defineProps<{ active?: boolean }>(), { active: false });
 
@@ -211,6 +223,17 @@ watch(
 .canvas-mount {
   position: absolute;
   inset: 0;
+}
+
+.canvas-empty-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary, #888);
+  /* 占位文案不抢指针：平移/缩放/后续框选都要能穿过去 */
+  pointer-events: none;
 }
 
 .canvas-hint {
