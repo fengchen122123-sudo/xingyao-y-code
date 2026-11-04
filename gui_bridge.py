@@ -54,7 +54,7 @@ from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_
 from gui_git_mixin import GitBridgeMixin
 from gui_browser_mixin import BrowserBridgeMixin
 from gui_snip_mixin import SnipBridgeMixin
-from gui_canvas_mixin import CanvasBridgeMixin
+# 画布桥已随旧画布删除；M2 在此恢复新 CanvasBridgeMixin 的同位 import（设计 §4）
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -1115,7 +1115,7 @@ class _SecretaryDispatchService:
         }
 
 
-class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, CanvasBridgeMixin):
+class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
