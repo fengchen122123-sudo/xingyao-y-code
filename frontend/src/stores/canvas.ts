@@ -13,8 +13,10 @@ import type {
   InsertAssetPayload,
   ViewportTransform,
 } from '../canvas/types';
+import { cloneNodes, deserializeNodes, serializeNodes } from '../canvas/utils/clipboard';
 import { findGroupDropTarget, snapNodesIntoGroup } from '../canvas/utils/canvas-group';
 import { validateConnection } from '../canvas/utils/canvas-reference-guard';
+import { HistoryStack, type CanvasHistorySnapshot } from '../canvas/utils/history';
 // 只借类型、不引入运行期依赖：appStore 反向 import 本 store（value import），
 // 这里若用 value import 会成环；`import type` 编译期擦除，安全。
 import type { CanvasEditResultData, CanvasVideoResultData } from './appStore';
@@ -126,6 +128,33 @@ function clearSaveTimer(): void {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
+}
+
+// ── M3-T05 历史栈 / 剪贴板 ────────────────────────────────────
+// 放模块级而不是 state：HistoryStack 是带内部队列的类，塞进 Pinia state 会被 reactive
+// 代理包一层（每次读写都过 Proxy，纯浪费）；且它只服务「当前打开的项目」，换项目即清。
+const history = new HistoryStack();
+/** 剪贴板内容（带 `xingyao-canvas:nodes:` 标记的字符串）；放模块级 = 跨项目可粘贴 */
+let clipboardRaw = '';
+/** 历史栈归属的项目 id：换项目懒清栈（免得在新建/打开/删除每条路径上都写一遍 clear） */
+let historyProjectId = '';
+
+/** 取「当前状态」快照：HistoryStack.push/undo 内部会深拷贝，这里给引用即可 */
+function currentSnapshot(project: CanvasProject): CanvasHistorySnapshot {
+  return { nodes: project.nodes, connections: project.connections };
+}
+
+/** 项目换了就清栈：跨项目撤销毫无意义，还可能把 A 的节点还到 B 里 */
+function ensureHistoryProject(project: CanvasProject): void {
+  if (historyProjectId === project.id) return;
+  historyProjectId = project.id;
+  history.clear();
+}
+
+/** 同步 nodeCount / connectionCount（删除/粘贴后必然变，sanitize 只在落盘前才跑） */
+function syncProjectCounts(project: CanvasProject): void {
+  project.nodeCount = project.nodes.length;
+  project.connectionCount = project.connections.length;
 }
 
 export const useCanvasStore = defineStore('canvas', {
@@ -244,6 +273,164 @@ export const useCanvasStore = defineStore('canvas', {
       this.scheduleSave();
     },
 
+    // ── M3-T05 撤销/重做 · 复制粘贴 · 删除 ────────────────────────
+    // 约定：动作在真正改 project【之前】调 pushHistory()，栈里存的是「变更前的状态」；
+    // undo 时把当前状态作为 current 交给栈，它压进 redo 侧，redo 才能回到撤销前的样子。
+    // 选中态与视口不进历史（纯 UI 状态，撤销不该把它们也倒回去）。
+
+    /** 记录一次「变更前」的快照（合并窗口 300ms / 容量 50 由 HistoryStack 管） */
+    pushHistory(): void {
+      const project = this.project;
+      if (!project) return;
+      ensureHistoryProject(project);
+      history.push(currentSnapshot(project));
+    },
+
+    /** 撤销一步：恢复节点与连线，摘掉已失效的选中，走防抖落盘。栈空返回 false */
+    undo(): boolean {
+      const project = this.project;
+      if (!project) return false;
+      ensureHistoryProject(project);
+      const snapshot = history.undo(currentSnapshot(project));
+      if (!snapshot) return false;
+      project.nodes = snapshot.nodes;
+      project.connections = snapshot.connections;
+      syncProjectCounts(project);
+      this.pruneSelection();
+      this.scheduleSave();
+      return true;
+    },
+
+    /** 重做一步：与 undo 对称（栈空返回 false，调用方据此不拦默认按键行为） */
+    redo(): boolean {
+      const project = this.project;
+      if (!project) return false;
+      ensureHistoryProject(project);
+      const snapshot = history.redo(currentSnapshot(project));
+      if (!snapshot) return false;
+      project.nodes = snapshot.nodes;
+      project.connections = snapshot.connections;
+      syncProjectCounts(project);
+      this.pruneSelection();
+      this.scheduleSave();
+      return true;
+    },
+
+    /** 把选中集里已经不存在的 id 摘掉（撤销/删除后指针还停在老 id 上会点不中任何东西） */
+    pruneSelection(): void {
+      const project = this.project;
+      if (!project) return;
+      const nodeIds = new Set(project.nodes.map((node) => node.id));
+      const connectionIds = new Set(project.connections.map((connection) => connection.id));
+      this.selectedNodeIds = new Set([...this.selectedNodeIds].filter((id) => nodeIds.has(id)));
+      this.selectedConnectionIds = new Set(
+        [...this.selectedConnectionIds].filter((id) => connectionIds.has(id)),
+      );
+    },
+
+    /**
+     * 复制选中节点到内部剪贴板（含它们之间的内部连线）。
+     * 不走系统剪贴板：浏览器 clipboard API 要用户手势 + 权限，且画布是结构化数据；
+     * 模块级字符串即可满足「跨项目粘贴」，也不会被别的程序误读。
+     */
+    copySelection(): boolean {
+      const project = this.project;
+      if (!project || !this.selectedNodeIds.size) return false;
+      const nodes = project.nodes.filter((node) => this.selectedNodeIds.has(node.id));
+      if (!nodes.length) return false;
+      const raw = serializeNodes(nodes, project.connections);
+      if (!raw) return false;
+      clipboardRaw = raw;
+      return true;
+    },
+
+    /**
+     * 粘贴：id 全量重生成 + 位置偏移 24px。
+     * raw 显式传入时优先用它（外部来源/跨项目数据走这条），否则用最近一次复制的内部内容。
+     */
+    pasteClipboard(raw?: string): boolean {
+      const project = this.project;
+      if (!project) return false;
+      const source = typeof raw === 'string' && raw ? raw : clipboardRaw;
+      const payload = deserializeNodes(source);
+      if (!payload) return false;
+      const cloned = cloneNodes(payload);
+      if (!cloned.nodes.length) return false;
+
+      this.pushHistory();
+      project.nodes = [...project.nodes, ...cloned.nodes];
+      project.connections = [...project.connections, ...cloned.connections];
+      syncProjectCounts(project);
+      // 粘完把选中换成新节点：接着拖/复制都是刚粘出来的那一批
+      this.selectedNodeIds = new Set(cloned.nodes.map((node) => node.id));
+      this.selectedConnectionIds = new Set<string>();
+      this.scheduleSave();
+      return true;
+    },
+
+    /**
+     * 删除选中：节点连带挂在它们身上的连线一起走；被删分组下的残余子节点解除 groupId
+     * （否则会留下指向不存在分组的悬空归属）；只选了连线时只删连线。
+     */
+    deleteSelection(): boolean {
+      const project = this.project;
+      if (!project) return false;
+      const selectedNodes = this.selectedNodeIds;
+      const selectedConnections = this.selectedConnectionIds;
+      if (!selectedNodes.size && !selectedConnections.size) return false;
+
+      const removedNodes = new Set(
+        [...selectedNodes].filter((id) => project.nodes.some((node) => node.id === id)),
+      );
+      const removedConnections = new Set(
+        [...selectedConnections].filter((id) => project.connections.some((c) => c.id === id)),
+      );
+      if (!removedNodes.size && !removedConnections.size) return false;
+
+      this.pushHistory();
+      if (removedNodes.size) {
+        const kept: CanvasNodeData[] = [];
+        for (const node of project.nodes) {
+          if (removedNodes.has(node.id)) continue;
+          const groupId = node.metadata?.groupId;
+          if (groupId && removedNodes.has(groupId)) {
+            // 用 delete 而不是置 undefined：落盘 JSON 里不留空 groupId 这类脏字段
+            const nextMeta = { ...node.metadata };
+            delete nextMeta.groupId;
+            kept.push({ ...node, metadata: nextMeta });
+            continue;
+          }
+          kept.push(node);
+        }
+        project.nodes = kept;
+      }
+      project.connections = project.connections.filter(
+        (connection) =>
+          !removedConnections.has(connection.id) &&
+          !removedNodes.has(connection.fromNodeId) &&
+          !removedNodes.has(connection.toNodeId),
+      );
+      syncProjectCounts(project);
+      this.selectedNodeIds = new Set<string>();
+      this.selectedConnectionIds = new Set<string>();
+      this.scheduleSave();
+      return true;
+    },
+
+    /** Ctrl+D：复制 + 粘贴一次（复制失败就整体失败，不留半截状态） */
+    duplicateSelection(): boolean {
+      if (!this.copySelection()) return false;
+      return this.pasteClipboard();
+    },
+
+    /** Ctrl+A：全选节点与连线（选中态不落盘） */
+    selectAll(): void {
+      const project = this.project;
+      if (!project) return;
+      this.selectedNodeIds = new Set(project.nodes.map((node) => node.id));
+      this.selectedConnectionIds = new Set(project.connections.map((connection) => connection.id));
+    },
+
     // ── M3-T04 连线（资源引用）─────────────────────────────────────
     // 合法性全在 canvas-reference-guard 里判（类型兼容表 + 自连 + 重复 + 环），
     // store 只负责「过了就建、并落盘」，绝不在两处各写一套规则。
@@ -264,6 +451,7 @@ export const useCanvasStore = defineStore('canvas', {
       });
       if (!check.ok) return { ok: false, reason: check.reason || '连线不可用' };
 
+      this.pushHistory();
       const connection: CanvasConnection = {
         id: newConnectionId(project.connections),
         fromNodeId,
@@ -281,6 +469,7 @@ export const useCanvasStore = defineStore('canvas', {
       if (!project || typeof connectionId !== 'string' || !connectionId) return;
       const next = project.connections.filter((connection) => connection.id !== connectionId);
       if (next.length === project.connections.length) return;
+      this.pushHistory();
       project.connections = next;
       project.connectionCount = next.length;
       if (this.selectedConnectionIds.has(connectionId)) {
@@ -292,8 +481,8 @@ export const useCanvasStore = defineStore('canvas', {
     },
 
     // ── M3-T02 拖拽 / 缩放 / 分组吸附 ─────────────────────────────
-    // 全部只做「内存 + scheduleSave」：历史栈（M3-T05）在这四个 action 外面接，
-    // 现在若自己 push 快照会和后续 stack 重入，反而丢步骤。
+    // 一律「先 pushHistory 打点（变更前），再改内存，最后 scheduleSave」：
+    // 打点顺序反了会把改完的状态当成撤销目标，撤销等于没撤。
 
     /**
      * 按世界坐标增量平移节点。
@@ -317,6 +506,10 @@ export const useCanvasStore = defineStore('canvas', {
         }
       }
 
+      // 没命中任何节点就别打点（避免空转污染历史栈）
+      if (!project.nodes.some((node) => moving.has(node.id))) return;
+      // 变更前打点：拖拽会连打几十次，300ms 合并窗口收成一步
+      this.pushHistory();
       let changed = false;
       for (const node of project.nodes) {
         if (!moving.has(node.id)) continue;
@@ -357,6 +550,7 @@ export const useCanvasStore = defineStore('canvas', {
         }
       }
 
+      this.pushHistory();
       node.width = width;
       node.height = height;
       node.position = {
@@ -378,6 +572,9 @@ export const useCanvasStore = defineStore('canvas', {
 
       const moved = new Set([id]);
       const target = findGroupDropTarget(moved, project.nodes);
+      // 既不在组里、也没落到任何组上 → 无变更，不打历史点
+      if (!target && !node.metadata?.groupId) return;
+      this.pushHistory();
       if (target) {
         project.nodes = snapNodesIntoGroup(moved, project.nodes, target);
         this.scheduleSave();
@@ -454,6 +651,7 @@ export const useCanvasStore = defineStore('canvas', {
       const node = project.nodes.find((n) => n.id === id);
       if (!node || typeof text !== 'string') return;
       if ((node.metadata?.content ?? '') === text) return;
+      this.pushHistory();
       node.metadata = { ...node.metadata, content: text };
       this.scheduleSave();
     },

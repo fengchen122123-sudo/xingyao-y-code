@@ -1,5 +1,5 @@
 <template>
-  <div class="canvas-wrap" data-test="canvas-pane-root">
+  <div ref="rootRef" class="canvas-wrap" data-test="canvas-pane-root" tabindex="0">
     <!-- 左列：项目列表。v1 旧数据照列但置灰（后端 supported=false），
          提示「旧版数据，不支持」而不隐藏——用户至少能看到并手动清理 -->
     <aside class="canvas-projects" data-test="canvas-project-list">
@@ -124,7 +124,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch, type CSSProperties } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch, type CSSProperties } from 'vue';
 
 import { useCanvasStore } from '../stores/canvas';
 import type { ProjectMeta } from '../canvas/bridge';
@@ -237,7 +237,62 @@ function onConnectRequest(payload: CanvasConnectRequest): void {
   if (!result.ok) showConnectError(result.reason || '连线不可用');
 }
 
+// ── M3-T05 快捷键（画布内键位）─────────────────────────────────
+const rootRef = ref<HTMLElement | null>(null);
+
+/** 焦点在可编辑控件里就不接管：聊天输入框、节点标题/正文编辑都该走浏览器原生行为 */
+function isEditableTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || typeof el.tagName !== 'string') return false;
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+  if (el.isContentEditable) return true;
+  return typeof el.closest === 'function' ? el.closest('[contenteditable="true"]') !== null : false;
+}
+
+/**
+ * 键位：Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+D / Delete（含 Backspace）/ Ctrl+Z /
+ * Ctrl+Y 与 Ctrl+Shift+Z / Ctrl+A。mac 上用 metaKey 同效。
+ * 只在「画布面板激活 + 焦点没落在别处输入控件里」时接管；store action 返回 false
+ * （无选中/无可撤销）就不 preventDefault，把浏览器原生行为留给用户。
+ */
+function onKeydown(event: KeyboardEvent): void {
+  if (!props.active || !store.project) return;
+  if (event.defaultPrevented || isEditableTarget(event.target)) return;
+  const root = rootRef.value;
+  const target = event.target as Node | null;
+  // 焦点既不在画布内、也不在 body（说明用户正在别处：聊天框/侧栏）→ 不抢键
+  if (root && target && target !== document.body && !root.contains(target)) return;
+
+  const mod = event.ctrlKey || event.metaKey;
+  const key = event.key.toLowerCase();
+  let handled = false;
+
+  if (mod && key === 'z' && !event.shiftKey) handled = store.undo();
+  else if (mod && (key === 'y' || (key === 'z' && event.shiftKey))) handled = store.redo();
+  else if (mod && key === 'c') handled = store.copySelection();
+  else if (mod && key === 'v') handled = store.pasteClipboard();
+  else if (mod && key === 'x') handled = store.copySelection() && store.deleteSelection();
+  else if (mod && key === 'd') handled = store.duplicateSelection();
+  else if (mod && key === 'a') {
+    store.selectAll();
+    handled = true;
+  } else if (!mod && (event.key === 'Delete' || event.key === 'Backspace')) {
+    handled = store.deleteSelection();
+  }
+
+  if (handled) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown);
+});
+
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown);
   if (connectErrorTimer !== null) {
     clearTimeout(connectErrorTimer);
     connectErrorTimer = null;
@@ -322,18 +377,20 @@ function onSelectionCommit(payload: SelectionCommitPayload): void {
 
 /**
  * 选区工具条 → store 的唯一落点。
- * M3-T04 只接「删连线」：节点删除要连带清理分组/历史栈，留给 M3-T05 统一做；
- * 其余动作保持留痕，绝不静默改 project。
+ * M3-T05 接「删除/复制」：删除走 store.deleteSelection（节点 + 连线 + 分组归属 + 历史点一次处理），
+ * 复制走 store.copySelection（内部剪贴板，Ctrl+V 可再粘出来）。
+ * 成组/取消组留给后续任务，先留痕，绝不静默改 project。
  */
 function onToolbarAction(action: SelectionToolbarAction): void {
   if (action === 'delete') {
-    const connectionIds = [...store.selectedConnectionIds];
-    if (connectionIds.length) {
-      for (const id of connectionIds) store.disconnect(id);
-      return;
-    }
+    store.deleteSelection();
+    return;
   }
-  console.debug('[canvas] 选区工具条动作（待后续任务实装）', action, selectedNodeIdList.value);
+  if (action === 'copy') {
+    store.copySelection();
+    return;
+  }
+  console.debug('[canvas] 选区工具条动作（成组/取消组待后续任务实装）', action, selectedNodeIdList.value);
 }
 
 /** 换项目时清掉可能残留的框（避免上一个项目的框画在新项目上） */
@@ -392,6 +449,11 @@ watch(
   background: var(--bg-primary, #1b1b1f);
   color: var(--text-primary, #ddd);
   font-size: 12px;
+}
+
+/* tabindex=0 只为把键盘焦点从输入框收回来，不需要可见焦点圈 */
+.canvas-wrap:focus {
+  outline: none;
 }
 
 .canvas-projects {
