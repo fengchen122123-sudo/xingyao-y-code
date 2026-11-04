@@ -48,7 +48,20 @@
           :background-mode="store.project.backgroundMode"
           @update:viewport="store.setViewport"
         >
-          <!-- 世界坐标内容层：M3 起按 project.nodes 渲染节点 -->
+          <!-- 世界坐标内容层：按 project.nodes 逐节点渲染。
+               节点只 emit action（不 import store、不写 project），落库统一回到本组件的
+               onNodeAction —— M3-T01 先占位，M3-T02 起在这里翻译成 store action -->
+          <NodeShell
+            v-for="node in store.project.nodes"
+            :key="node.id"
+            :node="node"
+            :selected="store.selectedNodeIds.has(node.id)"
+            :interactive="true"
+            :style="nodeStyle(node)"
+            @action="onNodeAction"
+          >
+            <component :is="NODE_COMPONENTS[node.type]" :node="node" @action="onNodeAction" />
+          </NodeShell>
         </InfiniteCanvas>
         <!-- 空画布占位：浮在画布之上，不吃指针事件（不挡平移缩放） -->
         <div v-if="!store.project.nodes.length" class="canvas-empty-hint" data-test="canvas-empty-hint">
@@ -60,16 +73,43 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, type CSSProperties } from 'vue';
 
 import { useCanvasStore } from '../stores/canvas';
 import type { ProjectMeta } from '../canvas/bridge';
 import InfiniteCanvas from './render/InfiniteCanvas.vue';
+import NodeShell from './nodes/NodeShell.vue';
+import { NODE_COMPONENTS } from './nodes';
+import type { NodeActionPayload } from './nodes/actions';
+import { CanvasNodeType, type CanvasNodeData } from './types';
 
 const props = withDefaults(defineProps<{ active?: boolean }>(), { active: false });
 
 const store = useCanvasStore();
 const creating = ref(false);
+
+/** 节点在世界层的盒模型：位置/尺寸取 store，z 序对齐参考仓（分组 5 / 普通 10 / 选中 50） */
+function nodeStyle(node: CanvasNodeData): CSSProperties {
+  const selected = store.selectedNodeIds.has(node.id);
+  // 分组垫在子节点下面，选中节点抬到最上层（与参考仓 canvas-node.tsx 的 z-index 同口径）
+  const zIndex = node.type === CanvasNodeType.Group ? 5 : selected ? 50 : 10;
+  return {
+    left: `${node.position.x}px`,
+    top: `${node.position.y}px`,
+    width: `${node.width}px`,
+    height: `${node.height}px`,
+    zIndex,
+  };
+}
+
+/**
+ * 节点 → 画布 的唯一上行入口（八个节点组件 + NodeShell 都 emit 到这里）。
+ * M3-T01 只做 console 级占位：update-title / update-text / open-director 等动作
+ * 从 M3-T02 起在这里翻译成 store action（节点自身永远不 import store）。
+ */
+function onNodeAction(payload: NodeActionPayload): void {
+  console.debug('[canvas] node action（M3-T02 前仅占位）', payload);
+}
 
 /** 只刷新列表、不动当前打开的项目：切页签回来不应把编辑中的画布重置掉 */
 function refreshList(): void {
