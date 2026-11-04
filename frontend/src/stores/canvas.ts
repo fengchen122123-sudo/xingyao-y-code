@@ -14,7 +14,12 @@ import type {
   ViewportTransform,
 } from '../canvas/types';
 import { cloneNodes, deserializeNodes, serializeNodes } from '../canvas/utils/clipboard';
-import { findGroupDropTarget, snapNodesIntoGroup } from '../canvas/utils/canvas-group';
+import {
+  GROUP_PADDING,
+  findGroupDropTarget,
+  getNodeBounds,
+  snapNodesIntoGroup,
+} from '../canvas/utils/canvas-group';
 import { validateConnection } from '../canvas/utils/canvas-reference-guard';
 import { HistoryStack, type CanvasHistorySnapshot } from '../canvas/utils/history';
 // 只借类型、不引入运行期依赖：appStore 反向 import 本 store（value import），
@@ -111,6 +116,14 @@ function newConnectionId(connections: CanvasConnection[]): string {
   let next = max + 1;
   while (used.has(`c_${next}`)) next += 1;
   return `c_${next}`;
+}
+
+/** 节点 id：`n_` + 时间戳 36 进制 + 4 位随机（与剪贴板 cloneNodes 的 n_ 前缀同族） */
+function newNodeId(nodes: CanvasNodeData[]): string {
+  const used = new Set(nodes.map((node) => node.id));
+  let id = `n_${Date.now().toString(36)}${randomSuffix()}`;
+  while (used.has(id)) id = `n_${Date.now().toString(36)}${randomSuffix()}`;
+  return id;
 }
 
 /** 托盘去重键：图片看 storageKey/dataUrl，音视频看 storageKey/url，文本看内容 */
@@ -429,6 +442,100 @@ export const useCanvasStore = defineStore('canvas', {
       if (!project) return;
       this.selectedNodeIds = new Set(project.nodes.map((node) => node.id));
       this.selectedConnectionIds = new Set(project.connections.map((connection) => connection.id));
+    },
+
+    // ── M3-T06 成组 / 取消组（右键菜单与选区工具条共用）────────────────
+
+    /**
+     * 把 ≥2 个选中节点打成一个分组：新建 group 节点包住它们的包围盒（外扩 GROUP_PADDING），
+     * 并给每个子节点写 metadata.groupId（分组归属靠这个字段，节点位置仍是世界坐标平铺）。
+     * 选中里已含分组节点时忽略它们：分组不嵌套，避免自己套自己。
+     */
+    groupSelection(): boolean {
+      const project = this.project;
+      if (!project) return false;
+      const selected = project.nodes.filter(
+        (node) => this.selectedNodeIds.has(node.id) && node.type !== CanvasNodeType.Group,
+      );
+      if (selected.length < 2) return false;
+
+      const bounds = getNodeBounds(selected);
+      if (!Number.isFinite(bounds.left) || !Number.isFinite(bounds.top)) return false;
+
+      this.pushHistory();
+      const group: CanvasNodeData = {
+        id: newNodeId(project.nodes),
+        type: CanvasNodeType.Group,
+        title: '分组',
+        position: { x: bounds.left - GROUP_PADDING, y: bounds.top - GROUP_PADDING },
+        width: bounds.right - bounds.left + GROUP_PADDING * 2,
+        height: bounds.bottom - bounds.top + GROUP_PADDING * 2,
+        metadata: {},
+      };
+      const memberIds = new Set(selected.map((node) => node.id));
+      project.nodes = [
+        group,
+        ...project.nodes.map((node) =>
+          memberIds.has(node.id)
+            ? { ...node, metadata: { ...node.metadata, groupId: group.id } }
+            : node,
+        ),
+      ];
+      syncProjectCounts(project);
+      // 成组后选中的是新分组：接着拖/拆都作用在它身上
+      this.selectedNodeIds = new Set([group.id]);
+      this.selectedConnectionIds = new Set<string>();
+      this.scheduleSave();
+      return true;
+    },
+
+    /**
+     * 取消组：选中分组节点 → 删掉分组节点、清掉它名下子节点的 groupId；
+     * 选中普通节点且它带 groupId → 只清它自己的归属（不动整个分组）。
+     * 两种情况都没有就返回 false（调用方据此不做无意义提示）。
+     */
+    ungroupSelection(): boolean {
+      const project = this.project;
+      if (!project) return false;
+      const selected = project.nodes.filter((node) => this.selectedNodeIds.has(node.id));
+      if (!selected.length) return false;
+
+      const removedGroupIds = new Set(
+        selected.filter((node) => node.type === CanvasNodeType.Group).map((node) => node.id),
+      );
+      const looseIds = new Set(
+        selected
+          .filter((node) => node.type !== CanvasNodeType.Group && node.metadata?.groupId)
+          .map((node) => node.id),
+      );
+      if (!removedGroupIds.size && !looseIds.size) return false;
+
+      this.pushHistory();
+      if (removedGroupIds.size) {
+        project.nodes = project.nodes.filter((node) => !removedGroupIds.has(node.id));
+        project.connections = project.connections.filter(
+          (connection) =>
+            !removedGroupIds.has(connection.fromNodeId) && !removedGroupIds.has(connection.toNodeId),
+        );
+      }
+
+      const nextSelected = new Set<string>();
+      project.nodes = project.nodes.map((node) => {
+        const groupId = node.metadata?.groupId;
+        const wasInRemovedGroup = !!groupId && removedGroupIds.has(groupId);
+        if (wasInRemovedGroup) nextSelected.add(node.id);
+        if (!wasInRemovedGroup && !looseIds.has(node.id)) return node;
+        // 用 delete 而不是置 undefined：落盘 JSON 里不留 `"groupId": null` 这类脏字段
+        const nextMeta = { ...node.metadata };
+        delete nextMeta.groupId;
+        return { ...node, metadata: nextMeta };
+      });
+      syncProjectCounts(project);
+      // 拆完把选中换成刚放出来的子节点，方便用户接着操作
+      this.selectedNodeIds = nextSelected;
+      this.selectedConnectionIds = new Set<string>();
+      this.scheduleSave();
+      return true;
     },
 
     // ── M3-T04 连线（资源引用）─────────────────────────────────────

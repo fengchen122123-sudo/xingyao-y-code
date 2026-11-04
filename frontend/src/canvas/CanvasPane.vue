@@ -41,7 +41,13 @@
       <div v-if="!store.project" class="canvas-hint" data-test="canvas-stage-empty">
         选择左侧项目，或新建一个画布开始
       </div>
-      <div v-else class="canvas-mount" data-test="canvas-mount">
+      <div
+        v-else
+        ref="canvasMountRef"
+        class="canvas-mount"
+        data-test="canvas-mount"
+        @contextmenu="onCanvasContextMenu"
+      >
         <!-- 受控视口：手势结束/滚轮时 emit，store.setViewport 走 800ms 防抖落盘 -->
         <InfiniteCanvas
           ref="canvasRef"
@@ -118,6 +124,26 @@
           :visible="hasSelection"
           @action="onToolbarAction"
         />
+        <!-- M3-T06：右下角小地图 / 左下角缩放控件 / 右键菜单（都只 emit，落 store 在本组件） -->
+        <MiniMap
+          :nodes="store.project.nodes"
+          :viewport="store.project.viewport"
+          :container-size="containerSize"
+          @navigate="onMiniMapNavigate"
+        />
+        <ZoomControls
+          :viewport="store.project.viewport"
+          :container-size="containerSize"
+          @update:viewport="store.setViewport"
+          @fit="fitViewToContent"
+        />
+        <NodeContextMenu
+          :state="contextMenu"
+          :can-group="canGroupSelection"
+          :can-ungroup="canUngroupSelection"
+          @action="onContextMenuAction"
+          @close="contextMenu = null"
+        />
       </div>
     </section>
   </div>
@@ -136,7 +162,17 @@ import { NODE_COMPONENTS } from './nodes';
 import type { CanvasConnectRequest, NodeActionPayload } from './nodes/actions';
 import { connectionDrag } from './nodes/connection-drag';
 import SelectionToolbar from './tools/SelectionToolbar.vue';
-import { CanvasNodeType, type CanvasNodeData, type SelectionBoxState } from './types';
+import MiniMap from './render/MiniMap.vue';
+import ZoomControls from './render/ZoomControls.vue';
+import NodeContextMenu from './tools/NodeContextMenu.vue';
+import {
+  CanvasNodeType,
+  type CanvasNodeData,
+  type ContextMenuState,
+  type Position,
+  type SelectionBoxState,
+} from './types';
+import { getNodeBounds } from './utils/canvas-group';
 import {
   buildActiveConnectionPathD,
   getConnectionsInSelectionRect,
@@ -292,6 +328,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  resizeObserver?.disconnect();
+  resizeObserver = null;
   window.removeEventListener('keydown', onKeydown);
   if (connectErrorTimer !== null) {
     clearTimeout(connectErrorTimer);
@@ -390,7 +428,146 @@ function onToolbarAction(action: SelectionToolbarAction): void {
     store.copySelection();
     return;
   }
-  console.debug('[canvas] 选区工具条动作（成组/取消组待后续任务实装）', action, selectedNodeIdList.value);
+  if (action === 'group') {
+    store.groupSelection();
+    return;
+  }
+  store.ungroupSelection();
+}
+
+// ── M3-T06 小地图 / 缩放控件 / 右键菜单 ───────────────────────
+/** 画布容器元素：量尺寸、算右键菜单相对坐标都要用它 */
+const canvasMountRef = ref<HTMLElement | null>(null);
+/** 画布容器实测尺寸：小地图按它算视口矩形，fit 与导航也要用它做居中 */
+const containerSize = ref({ width: 0, height: 0 });
+let resizeObserver: ResizeObserver | null = null;
+
+function measureContainer(): void {
+  const el = canvasMountRef.value;
+  if (!el) return;
+  const rect = el.getBoundingClientRect();
+  containerSize.value = {
+    width: el.clientWidth || Math.round(rect.width),
+    height: el.clientHeight || Math.round(rect.height),
+  };
+}
+
+function observeContainer(el: HTMLElement | null): void {
+  resizeObserver?.disconnect();
+  resizeObserver = null;
+  if (!el) return;
+  measureContainer();
+  if (typeof ResizeObserver === 'undefined') return;
+  resizeObserver = new ResizeObserver(() => measureContainer());
+  resizeObserver.observe(el);
+}
+
+watch(canvasMountRef, (el) => observeContainer(el), { flush: 'post' });
+
+/** 小地图点击/拖拽 → 把该世界坐标居中：x = 容器宽/2 - worldX * k */
+function onMiniMapNavigate(center: Position): void {
+  const project = store.project;
+  if (!project) return;
+  const { width, height } = containerSize.value;
+  if (!(width > 0) || !(height > 0)) return;
+  const k = canvasScale.value;
+  store.setViewport({ x: width / 2 - center.x * k, y: height / 2 - center.y * k, k });
+}
+
+/** 「适应内容」内边距（计划口径 padding 80） */
+const FIT_PADDING = 80;
+
+/** 适应内容：节点包围盒 + padding 80 → k 与平移，写回 store.setViewport（空画布回落 100% 居中） */
+function fitViewToContent(): void {
+  const project = store.project;
+  if (!project) return;
+  const { width, height } = containerSize.value;
+  if (!(width > 0) || !(height > 0)) return;
+  if (!project.nodes.length) {
+    store.setViewport({ x: width / 2, y: height / 2, k: 1 });
+    return;
+  }
+  const bounds = getNodeBounds(project.nodes);
+  const contentWidth = Math.max(bounds.right - bounds.left, 1);
+  const contentHeight = Math.max(bounds.bottom - bounds.top, 1);
+  const fitW = Math.max((width - FIT_PADDING * 2) / contentWidth, 0.05);
+  const fitH = Math.max((height - FIT_PADDING * 2) / contentHeight, 0.05);
+  const k = Math.min(fitW, fitH, 5);
+  store.setViewport({
+    x: (width - contentWidth * k) / 2 - bounds.left * k,
+    y: (height - contentHeight * k) / 2 - bounds.top * k,
+    k,
+  });
+}
+
+/** 右键菜单态（相对画布容器的像素坐标；null = 不显示） */
+const contextMenu = ref<ContextMenuState | null>(null);
+
+/** 成组要至少两个非分组节点（与选区工具条 canGroup 同口径） */
+const canGroupSelection = computed(() => {
+  const project = store.project;
+  if (!project) return false;
+  return (
+    project.nodes.filter(
+      (node) => store.selectedNodeIds.has(node.id) && node.type !== CanvasNodeType.Group,
+    ).length >= 2
+  );
+});
+
+/** 选中里含分组节点或带归属的子节点 → 显示「取消组」 */
+const canUngroupSelection = computed(() => {
+  const project = store.project;
+  if (!project) return false;
+  return project.nodes.some(
+    (node) =>
+      store.selectedNodeIds.has(node.id) &&
+      (node.type === CanvasNodeType.Group || Boolean(node.metadata?.groupId)),
+  );
+});
+
+/**
+ * 画布右键：节点 → 节点菜单，连线 → 连线菜单，空白 → 关闭菜单。
+ * 原生菜单一律 preventDefault（画布内不需要浏览器菜单）。
+ */
+function onCanvasContextMenu(event: MouseEvent): void {
+  const project = store.project;
+  const mount = canvasMountRef.value;
+  if (!project || !mount) return;
+  event.preventDefault();
+  const rect = mount.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const target = event.target as Element | null;
+
+  const nodeId = (target?.closest('[data-node-id]') as HTMLElement | null)?.getAttribute('data-node-id') || '';
+  if (nodeId) {
+    if (!store.selectedNodeIds.has(nodeId)) store.selectNode(nodeId);
+    contextMenu.value = { type: 'node', x, y, nodeId };
+    return;
+  }
+  const connectionId =
+    (target?.closest('[data-connection-id]') as HTMLElement | null)?.getAttribute('data-connection-id') || '';
+  if (connectionId) {
+    store.setSelection([], [connectionId], false);
+    contextMenu.value = { type: 'connection', x, y, connectionId };
+    return;
+  }
+  contextMenu.value = null;
+}
+
+/** 菜单动作 → store 既有 action（复制/删除/成组/取消组/删连线） */
+function onContextMenuAction(payload: { type: 'node' | 'connection'; id: string; action: string }): void {
+  contextMenu.value = null;
+  if (payload.type === 'connection') {
+    if (payload.action === 'delete') store.disconnect(payload.id);
+    return;
+  }
+  // 右键的那个节点若不在选中集里：先选中它，动作才作用在「你点的那个」上
+  if (!store.selectedNodeIds.has(payload.id)) store.selectNode(payload.id);
+  if (payload.action === 'copy') store.copySelection();
+  else if (payload.action === 'delete') store.deleteSelection();
+  else if (payload.action === 'group') store.groupSelection();
+  else if (payload.action === 'ungroup') store.ungroupSelection();
 }
 
 /** 换项目时清掉可能残留的框（避免上一个项目的框画在新项目上） */
@@ -398,6 +575,7 @@ watch(
   () => store.project?.id,
   () => {
     selectionBox.value = null;
+    contextMenu.value = null;
   },
 );
 
