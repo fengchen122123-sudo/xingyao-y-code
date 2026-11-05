@@ -103,6 +103,15 @@ import {
   isDisclaimerVersionAccepted,
 } from '../data/disclaimer';
 
+// 停止回合的兜底解锁定时器（按会话名）。T12 兜底的初衷是「后端没回 turn_cancelled
+// 时本地强制解锁」，而不是「10s 后无条件清一次运行态」：用户点停止后马上重发，
+// 新回合的 turn_start 会把会话重新放回 runningSessions，旧定时器到点看到会话在跑，
+// 就把它误判成「停止没生效」一并解锁——表现为重发后 1s 左右「正在干活」消失、
+// 停在「本轮工作 xx」的结束态，后端却仍在执行。故：权威运行态一旦被改写
+// （终态事件 / 新回合开始 / 发送失败回滚）就撤掉该会话的定时器，只留真正丢失
+// 终态事件的那条路径生效。定时器不参与响应式，放模块级。
+const stopFallbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 /**
  * 面板宽度启动恢复：读取 localStorage 中上次拖拽记忆的宽度，
  * 非法/越界值经 computeRestoredWidth 夹取或回默认；存储不可用（隐私模式）
@@ -1411,7 +1420,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 撤掉某个会话的停止兜底定时器：该会话运行态已有权威来源，兜底使命结束
+    _clearStopFallbackTimer(this: any, sessionName: string) {
+      const timer = stopFallbackTimers.get(sessionName);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        stopFallbackTimers.delete(sessionName);
+      }
+    },
+
     _setSessionRunning(this: any, sessionName: string, running: boolean) {
+      // 运行态被本函数权威改写（新回合开始 / 发送失败回滚 / 兜底自身解锁）：
+      // 旧兜底定时器不能再对这个会话动手，否则会清掉期间新开的回合
+      this._clearStopFallbackTimer(sessionName);
       const runtime = this._getSessionRuntime(sessionName);
       runtime.running = running;
       if (sessionName === this.currentSessionName) this.running = running;
@@ -4748,26 +4769,59 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (!api) return;
       // T12 修复：若后端未回发 turn_cancelled（进程异常退出/事件丢失），
       // runningSessions 将永久残留该会话，sendMessage 的拦截判定会让用户永远无法再发送。
-      // 加 10s 本地兜底定时器：超时后强制清除该会话运行态；
-      // 若 turn_cancelled 正常到达，runningSessions 已不含该会话，定时器为无操作。
+      // 加 10s 本地兜底定时器：超时后强制清除该会话运行态。
+      // 兜底只在「停止之后该会话运行态没被任何权威来源改写」时才该生效：终态事件、
+      // 新回合开始、发送失败回滚都会撤掉它（_clearStopFallbackTimer）。否则用户
+      // 停止后立刻重发，10s 到点时看到会话又在跑，会把新回合误判成「停止没生效」
+      // 一并解锁，界面上「正在干活」消失、停在上一轮的结束态。
       // 验证思路：mock stop_current_turn 成功但不派发 turn_cancelled，
-      // 10s 后 runningSessions 应不再包含该会话且发送恢复可用。
+      // 10s 后 runningSessions 应不再包含该会话且发送恢复可用；若 10s 内已收到
+      // turn_cancelled 并开始新回合，则新回合的运行态不得被定时器清掉。
+      this._clearStopFallbackTimer(sessionName);
       const stopFallbackTimer = setTimeout(() => {
-        if (this.runningSessions.includes(sessionName)) {
+        stopFallbackTimers.delete(sessionName);
+        // 判定用「运行会话表 ∪ 顶层运行标记」：两者不一致时（终态事件缺 session_name、
+        // 事件错序等边界会留下半残态）只看运行会话表会永远判不到，界面就一直转，
+        // 用户点多少次停止都没反应。顶层标记也当运行处理，兜底才能真正兜住。
+        const stillRunning = this.runningSessions.includes(sessionName)
+          || (sessionName === this.currentSessionName && this.running);
+        if (stillRunning) {
           console.warn(`[T12] stopCurrentTurn 后 10s 未收到 turn_cancelled，本地兜底解锁会话: ${sessionName}`);
           this._setSessionRunning(sessionName, false);
         }
       }, 10000);
+      stopFallbackTimers.set(sessionName, stopFallbackTimer);
       try {
         const res = await api.stop_current_turn(sessionName);
         if (!res || !res.ok) {
-          clearTimeout(stopFallbackTimer);
+          this._clearStopFallbackTimer(sessionName);
           this.broadcastChatNotice('中断请求未成功送达', 'error', sessionName);
         } else {
-          this.notifyChat('已中断当前回合');
+          // 后端权威结论 idle：该会话本来就没有活跃回合（回合已收尾，终态事件
+          // 早已发过）。此时本地若还挂着运行态，就是永远不会再被事件纠正的残留，
+          // 直接按权威结论解锁——用户点一次停止就恢复，而不是反复点都没反应。
+          if ((res as { idle?: boolean }).idle) {
+            this.notifyChat('当前没有正在执行的回合');
+            if (this.runningSessions.includes(sessionName)
+                || (sessionName === this.currentSessionName && this.running)) {
+              console.warn(`[stop] 后端回报无活跃回合，本地按权威结论解锁: ${sessionName}`);
+              this._setSessionRunning(sessionName, false);
+            }
+          } else {
+            this.notifyChat('已中断当前回合');
+            // 自愈：后端已受理停止，而本会话有运行标记却没进权威运行会话表——
+            // 本地状态已经失真（事件错序 / 终态事件缺 session_name 都会留下半残态），
+            // 这种态下不会再有事件来解锁，点多少次停止界面都不会变。
+            // 只在「就是当前查看的会话」时动手，绝不误清后台会话的合法运行态。
+            if (sessionName === this.currentSessionName && this.running
+                && !this.runningSessions.includes(sessionName)) {
+              console.warn(`[stop] 运行标记与会话表不一致，按停止请求本地自愈解锁: ${sessionName}`);
+              this._setSessionRunning(sessionName, false);
+            }
+          }
         }
       } catch (err) {
-        clearTimeout(stopFallbackTimer);
+        this._clearStopFallbackTimer(sessionName);
         this.connected = false;
         this.broadcastChatNotice('中断请求失败: ' + err, 'error', sessionName);
       }
@@ -5554,17 +5608,34 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.runningSessions = this.runningSessions.filter(s => s !== finSession);
           // 批次D：终态同时清除排队标记（排队中被停止也会走到这里）
           this.queuedSessions = this.queuedSessions.filter(s => s !== finSession);
+          // 终态已权威到达：停止兜底定时器到此失效，不再需要（也不允许）它插手
+          this._clearStopFallbackTimer(finSession);
+          // 当前 reducer 已绑定到目标 runtime，终态只更新目标会话。
+          this.running = false;
+          this.turnStartedAt = 0;
+          this.subagentTasks = [];
+        } else if (this.running && this.runningSessions.length === 0) {
+          // 反向不一致的自愈：运行会话表是空的、界面却还在运行——终态只可能属于
+          // 当前显示的会话（顶层 running 就是它的运行标记），按当前会话收尾。
+          // 不处理的话这个残留运行态没有任何事件能纠正，用户只能反复点停止。
+          console.warn(`[H2] 终态事件 ${type} 无归属且运行表为空，按当前会话 ${currentRuntimeKey} 收尾`);
+          this._clearStopFallbackTimer(currentRuntimeKey);
+          this.running = false;
+          this.turnStartedAt = 0;
+          this.subagentTasks = [];
         }
-        // 当前 reducer 已绑定到目标 runtime，终态只更新目标会话。
-        this.running = false;
-        this.turnStartedAt = 0;
-        this.subagentTasks = [];
+        // 无法推断归属且运行表非空：按 H2 契约「不更新任何会话运行态」，
+        // 不能像旧实现那样把 this.running 无条件置 false——那会把正在跑的
+        // 当前会话按成空闲，留下 running=false 而 runningSessions 仍有条目
+        // 的反向错态（界面空闲、发送却被排队拦截）。
         // M31 修复：会话列表刷新统一在各终态分支里只做一次，
         // 不再在此处与 turn_finish/turn_cancelled 分支重复触发
       }
 
       if (type === 'turn_start') {
         const turnSession = String(data.session_name || '');
+        // 新回合已经开始：上一轮的停止请求必定已生效，兜底定时器不得再对该会话解锁
+        this._clearStopFallbackTimer(turnSession);
         // 记录活跃会话
         if (turnSession && !this.runningSessions.includes(turnSession)) {
           this.runningSessions.push(turnSession);
@@ -6029,6 +6100,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.runningSessions = this.runningSessions.map(s => (s === data.old ? data.new : s));
           // 排队标记同样随重命名迁移
           this.queuedSessions = this.queuedSessions.map(s => (s === data.old ? data.new : s));
+          // 停止兜底定时器同样跟名字走：首轮自动重命名常发生在停止附近，
+          // 留在旧名下到点会因「旧名不在 runningSessions」而静默失效
+          const pendingStopTimer = stopFallbackTimers.get(String(data.old));
+          if (pendingStopTimer !== undefined) {
+            stopFallbackTimers.delete(String(data.old));
+            stopFallbackTimers.set(String(data.new), pendingStopTimer);
+          }
           // 状态提醒点随重命名迁移 key，避免旧 key 残留/丢失
           if (data.old in this.sessionStatusDots) {
             this.sessionStatusDots[data.new] = this.sessionStatusDots[data.old];
@@ -6071,7 +6149,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (Array.isArray(data.archived_sessions)) this.archivedSessions = data.archived_sessions;
         else void this.loadArchivedSessions();
       } else if (type === 'turn_finish' || type === 'turn_idle') {
-        this.running = false;
+        // 归属不明的终态事件（缺 session_name 且无法唯一推断）不碰运行态：
+        // 否则会把正在跑的会话按成空闲，留下 running=false 而 runningSessions
+        // 仍有条目的反向错态——界面看着空闲、发送却被排队拦截
+        if (eventSession) this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
         // 回合封闭后检查点进入 ready/no_changes：刷新批量撤销状态，
@@ -6094,7 +6175,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 非当前窗口执行完成 → 绿点
         this._setSessionStatusDot(eventSession, 'green');
       } else if (type === 'turn_cancelled') {
-        this.running = false;
+        if (eventSession) this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
         const last = this.messages[this.messages.length - 1];
@@ -6111,7 +6192,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         void this.refreshNavIndex(eventSession || undefined);
       } else if (type === 'turn_error') {
         const errorMsg = String(data.message || data.error || '');
-        this.running = false;
+        if (eventSession) this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
         let last = this.messages[this.messages.length - 1];

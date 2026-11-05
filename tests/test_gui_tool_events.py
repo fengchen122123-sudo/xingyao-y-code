@@ -875,6 +875,37 @@ def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch
     clear_plan_auto_continue_suppression("session")
 
 
+def test_stop_current_turn_reports_idle_when_no_active_turn(monkeypatch):
+    """停止请求没命中活跃回合时必须明确回 idle=True。
+
+    回归背景：旧实现 `_cancel_events.get(target)` 为空时静默返回 ok，前端既不
+    收到任何新事件、也拿不到「本来就没在跑」的结论，界面上的残留运行态永远
+    不会被纠正，表现为用户反复点停止毫无反应。命中活跃回合时 idle=False，
+    前端才继续等 turn_cancelled 终态事件。
+    """
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._cancel_events = {}
+    bridge._active_turn_ids = {}
+    bridge._user_cancelled_sessions = set()
+
+    res = bridge.stop_current_turn("session")
+
+    assert res["ok"] is True
+    assert res["idle"] is True
+
+    bridge._cancel_events["session"] = threading.Event()
+    res = bridge.stop_current_turn("session")
+
+    assert res["ok"] is True
+    assert res["idle"] is False
+    assert bridge._cancel_events["session"].is_set()
+
+    from core.plan import clear_plan_auto_continue_suppression
+
+    clear_plan_auto_continue_suppression("session")
+
+
 def test_turn_finish_emits_empty_plan_updated_when_plan_all_terminal(tmp_path, monkeypatch):
     import core.plan as plan
 

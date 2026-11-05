@@ -108,6 +108,31 @@ from core.updater import (
 
 logger = logging.getLogger(__name__)
 
+# 回合强制收尾阈值（秒）
+# - _STALL_TIMEOUT_SECONDS：长时间收不到任何进展信号即判定卡死（原有兜底）
+# - _STOP_WATCHDOG_SECONDS：用户已经点了停止却迟迟退不出来时的快速兜底。
+#   原来只有 30 分钟那一档，对「我已经点了停止」这个场景太宽松——期间用户只能
+#   反复点停止、界面一直转。停止后 60 秒仍无任何进展，基本可以断定回合线程卡在
+#   不可取消的同步调用上，直接强制收尾并解锁会话。
+# - _STALL_POLL_SECONDS：看门狗轮询间隔，决定上面阈值实际生效的粒度。
+_STALL_TIMEOUT_SECONDS = 1800.0
+_STOP_WATCHDOG_SECONDS = 60.0
+_STALL_POLL_SECONDS = 10.0
+
+
+def _force_finish_reason(idle_seconds: float, stop_requested: bool) -> Optional[str]:
+    """看门狗判定：返回强制收尾原因 "stop" / "stall"，未达阈值返回 None。
+
+    抽成纯函数便于单测：看门狗本体依赖真实线程与挂钟，测试里难以复现。
+    停止兜底优先于无进展兜底——两者都要收尾，但日志与提示文案不同。
+    """
+    if stop_requested and idle_seconds >= _STOP_WATCHDOG_SECONDS:
+        return "stop"
+    if idle_seconds >= _STALL_TIMEOUT_SECONDS:
+        return "stall"
+    return None
+
+
 # CLI 的 prompt_toolkit 着色标记（<ansiyellow> 等）：GUI 不渲染，桥接层统一剥离，
 # 否则用户会在提示里看到 <ansiyellow> 原文。CLI 路径不经此处，不受影响。
 _ANSI_MARKUP_RE = re.compile(r"</?ansi\w*>")
@@ -10017,6 +10042,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 优先取消指定会话，未指定则取消当前会话
             target = session_name or self._current_session
             evt = self._cancel_events.get(target)
+            if evt is None:
+                # 该会话没有在跑的回合（多半是刚收尾，终态事件已发过）。
+                # 旧实现静默返回 ok，前端既不收到新事件也没有任何线索，
+                # 界面上就表现为「反复点停止毫无反应」。这里记一条 warning
+                # 带上活跃会话清单便于事后定位，并在返回值里明确回 idle，
+                # 让前端立刻按权威结论解锁，不必干等一个永远不会再来的事件。
+                logger.warning(
+                    "停止请求未命中活跃回合：target=%s，活跃会话=%s",
+                    target,
+                    sorted(self._cancel_events.keys()),
+                )
             if evt:
                 evt.set()
                 # 硬中断在飞 LLM 请求：直接关闭底层 HTTP 流，阻塞读立即退出，
@@ -10062,7 +10098,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     subagent_manager.cancel_foreground(target, turn_id)
                 except Exception:
                     logger.debug("停止回合时取消前台子代理失败", exc_info=True)
-            return {"ok": True}
+            # idle=True：该会话本就没有活跃回合，前端据此立即解锁运行态。
+            # 保留 ok=True 兼容旧前端（它们忽略这个字段，行为与以前一致）。
+            return {"ok": True, "idle": evt is None}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -10192,8 +10230,6 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 阈值刻意远大于单次工具上限（execute_command 600s、权限确认 300s），
         # 只兜底「线程卡在不可取消的同步调用上」这类停止按钮也无效的极端情况。
         _stall_stop: Optional[threading.Event] = None
-        _STALL_TIMEOUT_SECONDS = 1800.0
-        _STALL_POLL_SECONDS = 60.0
 
         def _phase_mark(label: str) -> None:
             nonlocal _phase_last
@@ -10308,12 +10344,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     if _stop.is_set() or turn_finished:
                         return
                     idle = self._turn_idle_seconds(session_name)
-                    if idle < _STALL_TIMEOUT_SECONDS:
+                    reason = _force_finish_reason(idle, cancel_event.is_set())
+                    if reason is None:
                         continue
-                    logger.warning(
-                        "回合无进展看门狗 [%s]：已 %.0f 秒无任何进展，强制收尾",
-                        session_name, idle,
-                    )
+                    if reason == "stop":
+                        # 用户已经点过停止：这条路径下更要快速收尾，不能再等 30 分钟
+                        logger.warning(
+                            "停止看门狗 [%s]：用户已请求停止，但 %.0f 秒无任何进展仍未退出，强制收尾",
+                            session_name, idle,
+                        )
+                    else:
+                        logger.warning(
+                            "回合无进展看门狗 [%s]：已 %.0f 秒无任何进展，强制收尾",
+                            session_name, idle,
+                        )
                     # 卡死现场线程栈：定位阻塞在哪个不可取消的调用上
                     try:
                         import sys as _sys
@@ -10333,8 +10377,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     except Exception:
                         logger.debug("看门狗取消在飞请求失败", exc_info=True)
                     try:
+                        _stalled_by_stop = reason == "stop"
                         self.emit_event("turn_error", {
                             "message": (
+                                f"已请求停止，但回合 {int(_STOP_WATCHDOG_SECONDS)} 秒内没有任何进展，"
+                                "判定为卡在不可中断的同步调用上，已强制结束并解锁会话。"
+                                "完整线程栈已写入运行日志。"
+                                if _stalled_by_stop
+                                else
                                 f"本回合已连续 {int(_STALL_TIMEOUT_SECONDS // 60)} 分钟没有任何进展，"
                                 "判定为卡死，已强制结束并解锁会话。"
                                 "常见原因是工具阻塞在系统弹窗或不可中断的同步调用上，"
