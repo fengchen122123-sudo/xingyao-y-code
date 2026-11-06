@@ -108,13 +108,19 @@ it('缺桥（没有 write_preview_page）时 md 直接回退预览弹窗', async
   expect(previewCalls).toEqual(['D:\\proj\\docs\\a.md']);
 });
 
-it('pdf 直接交右栏浏览器（不做渲染中转）', async () => {
+it('pdf 进「文档」页签由 pdf.js 渲染，不写浏览器导航请求', async () => {
   const store = useAppStore();
+  store.rightPanelCollapsed = true;
 
   await store.openInRightPanel('D:\\proj\\doc.pdf');
 
-  expect(store.browserNavRequest).toEqual({
-    url: 'file:///D:/proj/doc.pdf',
-    path: 'D:\\proj\\doc.pdf',
-  });
+  expect(store.docPreviewRequest).toEqual({ path: 'D:\\proj\\doc.pdf', name: 'doc.pdf' });
+  expect(store.docPreviewNonce).toBe(1);
+  expect(store.rightPanelTabs).toContain('doc');
+  expect(store.rightPanelActiveTab).toBe('doc');
+  expect(store.rightPanelCollapsed).toBe(false);
+  // 不再经过内嵌浏览器
+  expect(store.browserNavRequest).toBeNull();
+  expect(store.browserNavNonce).toBe(0);
+  expect(store.rightPanelTabs).not.toContain('browser');
 });

@@ -173,7 +173,7 @@
             id="send-btn"
             data-test="send-button"
             :class="{ stop: sendStopMode, active: !sendStopMode && hasInputContent }"
-            :title="sendStopMode ? '停止生成 (Esc)' : (store.currentSessionRunning ? '排队发送 (Enter)' : '发送消息 (Enter)')"
+            :title="sendStopMode ? '停止生成' : (store.currentSessionRunning ? '排队发送 (Enter)' : '发送消息 (Enter)')"
             @click="handleSend"
           >
             <AppIcon v-if="sendStopMode" name="square" :size="14" :stroke-width="2" />
@@ -222,7 +222,7 @@
       </div>
       <div class="r keyboard-hints" data-test="keyboard-hints">
         <span class="ctx-percent" :class="tokenClass" :title="ctxTooltip">{{ ctxPctLabel }}</span>
-        <span class="hint-full"><span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">Esc</span> 中断</span>
+        <span class="hint-full"><span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行</span>
       </div>
     </div>
   </div>
@@ -396,12 +396,11 @@ function onKeydown(e: KeyboardEvent) {
   // 先让 composable 处理补全导航键（方向键/Tab/Enter/Esc）
   suggestKeydown(e);
   if (e.defaultPrevented) return;
-  // 补全未拦截：Enter 发送，Escape 停止
+  // 补全未拦截：Enter 发送。
+  // Esc 不再中断当前任务（原先误触就会杀掉整个回合），停止请点右侧停止按钮
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     handleSend();
-  } else if (e.key === 'Escape') {
-    store.stopCurrentTurn();
   }
 }
 

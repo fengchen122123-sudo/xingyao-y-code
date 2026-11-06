@@ -61,9 +61,10 @@ describe('token statistics store', () => {
     expect(store.tokenStatisticsLoading).toBe(false);
   });
 
-  it('loads the lifetime (365 days) snapshot', async () => {
+  it('loads the lifetime (all history) snapshot', async () => {
     const lifetimeSnapshot = structuredClone(snapshot);
-    lifetimeSnapshot.range.days = 365;
+    // 累计范围下后端回填实际覆盖天数，而不是固定 365
+    lifetimeSnapshot.range.days = 120;
     const getStatistics = vi.fn().mockResolvedValue(lifetimeSnapshot);
     (window as any).pywebview = { api: { get_token_usage_statistics: getStatistics } };
     const store = useAppStore() as any;
@@ -71,8 +72,8 @@ describe('token statistics store', () => {
     const result = await store.loadTokenStatisticsLifetime(true);
 
     expect(result?.ok).toBe(true);
-    expect(getStatistics).toHaveBeenCalledWith(365);
-    expect(store.tokenStatisticsLifetime.range.days).toBe(365);
+    expect(getStatistics).toHaveBeenCalledWith(0);
+    expect(store.tokenStatisticsLifetime.range.days).toBe(120);
     expect(store.tokenStatisticsLifetimeLoading).toBe(false);
   });
 

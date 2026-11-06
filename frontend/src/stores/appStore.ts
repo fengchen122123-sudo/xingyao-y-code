@@ -57,7 +57,7 @@ import type {
   GoalStateInfo,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
-import { isMarkdownFilePath, isOfficeFilePath, toFileUrl } from '../utils/localPath';
+import { isDocxFilePath, isMarkdownFilePath, isOfficeFilePath, isPdfFilePath, toFileUrl } from '../utils/localPath';
 import { fileExt } from '../utils/fileIcon';
 import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 // 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
@@ -143,6 +143,17 @@ function restoredRightPanelWidth(): number {
   }
 }
 
+/**
+ * PDF 编辑保存用的本地时间戳（YYYYMMDD_HHMMSS，逐段补零）。
+ * 后端默认命名用同一形状；Office 转换文档的副本路径要前端自己拼，
+ * 两边保持一致，用户在同目录里能一眼认出哪些是同一批导出。
+ */
+function pdfEditTimestamp(now: Date = new Date()): string {
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+    + `_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
 // 底部内嵌终端面板持久化键与尺寸边界（与 'ycode-*' 前缀约定一致）
 export const TERMINAL_PANEL_OPEN_KEY = 'ycode-terminal-open';
 export const TERMINAL_PANEL_HEIGHT_KEY = 'ycode-terminal-height';
@@ -159,11 +170,13 @@ export const SECRETARY_NAME_MAX_LEN = 20;
 export const SECRETARY_PERSONA_MAX_LEN = 20000;
 
 // 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页，
-// novel 是小说工作台（只读展示项目状态，设计 §7）
-export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent' | 'novel';
+// novel 是小说工作台（只读展示项目状态，设计 §7），doc 是文档阅读器
+// （PDF / Word / Excel / PPT，前端 pdf.js 自绘，不经过内嵌浏览器）
+export type RightPanelTabId =
+  | 'files' | 'git' | 'browser' | 'doc' | 'tasks' | 'computer' | 'subagent' | 'novel';
 // 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
 const RIGHT_PANEL_TAB_IDS = new Set<RightPanelTabId>([
-  'files', 'git', 'browser', 'tasks', 'computer', 'subagent', 'novel',
+  'files', 'git', 'browser', 'doc', 'tasks', 'computer', 'subagent', 'novel',
 ]);
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
@@ -915,8 +928,18 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 观察到（内容相同的对象引用不变时 watch 不触发）。null = 无待处理请求。
     browserNavRequest: null as null | { url: string; path: string; session?: string },
     browserNavNonce: 0,
+    // 右栏「文档」页签的外部打开请求（对话正文 / 文件树点击 PDF、Office 文档）：
+    // DocumentPane 消费这条请求去读文件、用 pdf.js 渲染；nonce 自增保证同一文件
+    // 重复点击也能被观察到。name 是给用户看的文件名（Office 文档转出的 PDF 用的是
+    // 缓存文件名，标题要显示源文档名）；sourcePath 是用户在磁盘上点开的那个源文件
+    // （Office 文档的 path 是缓存 PDF，所以「在文件夹中打开」必须用 sourcePath）。
+    // null = 无待处理请求。
+    docPreviewRequest: null as null | {
+      path: string; name: string; sourcePath?: string; session?: string;
+    },
+    docPreviewNonce: 0,
     // Office 文档转 PDF 预览的进行中提示（首次转换要拉起 Office，10~25 秒）：
-    // 非空期间 BrowserPane 在面板里显示「正在把 xxx 转换成预览页」浮层，
+    // 非空期间「文档」页签在面板里显示「正在把 xxx 转换成 PDF」浮层，
     // 转换结束（成功/失败）一定清空。null = 没有进行中的转换。
     officePreviewPending: null as null | { path: string; name: string },
     themeLight: false,
@@ -986,7 +1009,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
     tokenUsageOverviewLoading: false,
     tokenStatistics: null as TokenStatisticsSnapshot | null,
     tokenStatisticsLoading: false,
-    tokenStatisticsDays: 30 as 1 | 7 | 30,
+    // 0 = 累计全量（旧版统计页的「累计」页签），其余为固定窗口
+    tokenStatisticsDays: 30 as 0 | 1 | 7 | 30,
     tokenStatisticsLifetime: null as TokenStatisticsSnapshot | null,
     tokenStatisticsLifetimeLoading: false,
 
@@ -1708,6 +1732,125 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.openRightPanelTab('browser');
     },
 
+    // 文档在右栏「文档」页签里打开：PDF 由前端 pdf.js 自绘（Word/Excel/PPT 先由
+    // 后端转成 PDF），完全不走内嵌浏览器——用户明确要求点文档不要弹出浏览器 UI。
+    // 这里只写请求 + 摊开页签，真正的读文件与渲染由 DocumentPane 负责（宿主没有
+    // read_file_preview 时由它回退提示「在系统中打开」）。
+    // sourcePath：用户在磁盘上的源文件路径。Office 文档的 path 是后端转出的缓存
+    // PDF，「在文件夹中打开」要定位的是源文档，所以单独记一份。
+    openDocumentInRightPanel(this: any, path: string, displayName?: string, sourcePath?: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      const name = String(displayName || '').trim()
+        || target.split(/[\\/]/).pop()
+        || target;
+      this.docPreviewRequest = {
+        path: target,
+        name,
+        sourcePath: String(sourcePath || '').trim() || undefined,
+        session: this.currentSessionName || undefined,
+      };
+      this.docPreviewNonce += 1;
+      this.openRightPanelTab('doc', { expand: true });
+    },
+
+    // PDF 编辑结果落盘：ops 是 DocumentPane 维护的操作列表（PDF point 坐标契约，
+    // 与 core/pdf_edit.py 的 ops 一致）。mode=copy 另存副本，overwrite 由后端先
+    // 备份原文件再覆盖。成功后返回 {ok,path,pages,backup}，path 指向落盘的新文件，
+    // 并由本动作把它重新开进「文档」页签（再编辑针对的是新文件）。
+    //
+    // Office 文档（docx/xlsx/pptx）在这里是「后端转出的缓存 PDF + 源文档路径」的
+    // 组合：overwrite 会写坏用户的 .docx，一律拦下；copy 的副本必须落在源文档同
+    // 目录，否则用户拿到的是缓存目录里的 PDF，回头根本找不到。
+    async savePdfEdits(this: any, ops: any[], mode: 'copy' | 'overwrite' = 'copy') {
+      const req = this.docPreviewRequest;
+      const source = String(req?.sourcePath || req?.path || '').trim();
+      if (!source) {
+        this.notifyModal('PDF 编辑', '没有正在编辑的文档');
+        return null;
+      }
+      const api = this._api();
+      if (!api || typeof api.save_pdf_edits !== 'function') {
+        this.notifyModal('PDF 编辑', '当前宿主不支持保存编辑，请重启应用后再试');
+        return null;
+      }
+      const isConverted = !!req?.sourcePath && !/\.pdf$/i.test(String(req.sourcePath));
+      if (isConverted && mode === 'overwrite') {
+        this.notifyModal('PDF 编辑', '这是 Office 文档转换出来的预览，不能覆盖原文档；请用「保存副本」');
+        return null;
+      }
+      // 普通 PDF 交给后端默认命名（源文件同目录 <stem>_已编辑_<时间戳>.pdf）；
+      // 转换文档只有缓存 PDF，落点要前端自己拼到源文档目录。
+      let outPath = '';
+      if (isConverted) {
+        const dir = source.replace(/[\\/][^\\/]*$/, '');
+        const base = source.split(/[\\/]/).pop() || 'document';
+        const stem = base.replace(/\.[^.]+$/, '') || base;
+        const fileName = `${stem}_已编辑_${pdfEditTimestamp()}.pdf`;
+        outPath = dir ? `${dir}\\${fileName}` : fileName;
+      }
+      let res: any = null;
+      try {
+        res = await api.save_pdf_edits(source, ops, mode, outPath);
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('PDF 编辑', '保存失败: ' + String(err || ''));
+        return null;
+      }
+      // 失败不重载：DocumentPane 的编辑态与历史都还在，用户可以改完再试
+      if (!res || !res.ok) {
+        this.notifyModal('PDF 编辑', '保存失败: ' + (res?.msg || '未知错误'));
+        return null;
+      }
+      if (mode === 'overwrite' && res.backup) {
+        this.notifyModal('PDF 编辑', `覆盖保存已完成（备份：${res.backup}）`);
+      } else {
+        this.notifyModal('PDF 编辑', `已保存：${res.path}`);
+      }
+      const newPath = String(res.path || '');
+      if (newPath) {
+        // 第三个参数不传：sourcePath 指向新 PDF 自己，后续编辑针对的都是这份新文件
+        this.openDocumentInRightPanel(newPath, newPath.split(/[\\/]/).pop() || '文档.pdf');
+      }
+      return res;
+    },
+
+    // 「在文件夹中打开」：资源管理器定位到该文件（Windows 上是打开所在目录并
+    // 选中文件）。旧后端没有 reveal_in_explorer 时退回只打开所在目录；两者都
+    // 不可用才提示失败，不静默无反应。
+    async revealInExplorer(this: any, path: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      const api = this._api();
+      if (!api) {
+        this.notifyModal('在文件夹中打开', '宿主桥不可用，无法定位文件');
+        return;
+      }
+      const dir = target.replace(/[\\/][^\\/]*$/, '');
+      try {
+        if (typeof api.reveal_in_explorer === 'function') {
+          const res = await api.reveal_in_explorer(target);
+          if (res && res.ok) return;
+          if (dir && typeof api.open_folder_in_explorer === 'function') {
+            const fallback = await api.open_folder_in_explorer(dir);
+            if (fallback && fallback.ok) return;
+          }
+          this.notifyModal('在文件夹中打开', (res && res.msg) || '定位失败');
+          return;
+        }
+        if (dir && typeof api.open_folder_in_explorer === 'function') {
+          const res = await api.open_folder_in_explorer(dir);
+          if (res && res.ok) return;
+          this.notifyModal('在文件夹中打开', (res && res.msg) || '定位失败');
+          return;
+        }
+        this.notifyModal('在文件夹中打开', '当前宿主不支持在文件夹中打开');
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('在文件夹中打开', '定位失败: ' + err);
+      }
+    },
+
     // 基元律动控制台页面（充值 / 用量明细 / 个人信息）在应用内打开：复用右栏
     // 内嵌浏览器页签，不再拉起系统浏览器。宿主确认不支持内嵌浏览器（非 Windows
     // 桌面端 GUI）时回退外部打开，保证任何宿主上点按钮都落得了地。
@@ -1759,10 +1902,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    // Office 文档（doc/docx/xls/ppt/odt...）在右栏预览：右栏渲染不了 Office 二进制，
+    // Office 文档（doc/xls/ppt/odt...）在右栏预览：右栏渲染不了 Office 二进制，
     // 先让后端把它转成 PDF（core 侧走 Office COM，首次要拉起进程 10~25 秒，之后按
-    // 源文件 mtime 命中缓存是毫秒级），转好的 PDF 再交给内嵌浏览器（WebView2 内置
-    // 查看器），与 pdf 链接同一条路径。
+    // 源文件 mtime 命中缓存是毫秒级），转好的 PDF 交「文档」页签由前端 pdf.js 渲染
+    // ——与 pdf 链接同一条渲染链，不经过内嵌浏览器。
+    // 唯一例外是 .docx：它由「文档」页签里的 docx-preview 直接渲染 OOXML，不走转换
+    // （见下面的 isDocxFilePath 分支）。
     //
     // 两个刻意的设计：
     // 1) 转换前先把右栏摊开并置 officePreviewPending 提示——二十秒的转换期间界面
@@ -1782,21 +1927,30 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.notifyModal('Office 预览', 'Office 文档右侧预览仅支持在本机桌面端使用');
         return;
       }
+      const name = target.split(/[\\/]/).pop() || target;
+      // docx 不走转换：直接把源文件路径交给「文档」页签，由 docx-preview 解析 OOXML
+      // 渲染。这条路秒开、不需要本机装 Office/WPS，也不会出现「正在转成 PDF」的等待。
+      // 只认 .docx —— 老式二进制 .doc / rtf / odt 仍然走下面的 COM 转换。
+      if (isDocxFilePath(target)) {
+        this.openDocumentInRightPanel(target, name);
+        return;
+      }
       const api = this._api();
       // 旧后端 / 桥未注入：没有转换能力，回退源码预览弹窗（至少能看文本）
       if (!api || typeof api.preview_office_doc !== 'function') {
         await this.openFilePreview(target);
         return;
       }
-      const name = target.split(/[\\/]/).pop() || target;
-      // 先把浏览器页签摊开（提示浮层就挂在 BrowserPane 里），再置进行中提示
-      this.openRightPanelTab('browser', { expand: true });
+      // 先把「文档」页签摊开（转换进行中的浮层就挂在 DocumentPane 里），再置提示
+      this.openRightPanelTab('doc', { expand: true });
       this.officePreviewPending = { path: target, name };
       let failMsg = '';
       try {
         const res = await api.preview_office_doc(target);
         if (res && res.ok && res.path) {
-          this.openLocalFileInBrowser(String(res.path));
+          // 打开的是转换后的缓存 PDF，但标题显示源文档名、定位也用源文档路径
+          // （「在文件夹中打开」要落到用户点的那个 .docx 上，不是缓存目录）
+          this.openDocumentInRightPanel(String(res.path), name, target);
           return;
         }
         failMsg = (res && res.msg) || '';
@@ -1815,8 +1969,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
 
     // 本地文件在右栏显示的统一入口（对话正文 / 文件树的点击分流）：
-    // html / pdf 直接交给内嵌浏览器（pdf 走 WebView2 内置查看器）；md 先渲染成
-    // 预览页；office 文档先转 PDF；其它类型回退源码预览弹窗。
+    // pdf / office 文档进「文档」页签（pdf.js 自绘，office 先转 PDF）；md 先渲染成
+    // 预览页、html 当网页渲染，两者仍走内嵌浏览器页签；其它类型回退源码预览弹窗。
     async openInRightPanel(this: any, path: string) {
       const target = String(path || '').trim();
       if (!target) return;
@@ -1826,6 +1980,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
       if (isMarkdownFilePath(target)) {
         await this.openMarkdownInRightPanel(target);
+        return;
+      }
+      if (isPdfFilePath(target)) {
+        this.openDocumentInRightPanel(target);
         return;
       }
       this.openLocalFileInBrowser(target);
@@ -7552,7 +7710,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async loadTokenStatistics(days: 1 | 7 | 30 = 30, force = false) {
+    async loadTokenStatistics(days: 0 | 1 | 7 | 30 = 30, force = false) {
       if (!force && this.tokenStatistics && this.tokenStatisticsDays === days) {
         return this.tokenStatistics;
       }
@@ -7585,7 +7743,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (!api) return null;
       this.tokenStatisticsLifetimeLoading = true;
       try {
-        const result = await api.get_token_usage_statistics(365);
+        // 0 = 累计全量：新版热力图与累计摘要按全部历史统计，不再按 365 天截断
+        const result = await api.get_token_usage_statistics(0);
         if (!result || !result.ok) {
           this.notifyModal('Token 统计', '加载 Token 统计失败: ' + (result?.msg || '未知错误'));
           return result;

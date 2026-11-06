@@ -638,6 +638,84 @@ describe('useSuggest', () => {
     vi.useRealTimers();
   });
 
+  it('@ 无命中后继续输入达到软阈值：面板自动收起', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({ ok: true, sessions: [] });
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggest, suggestEmpty } = useSuggest(inputVal, taRef);
+
+    // 短 query 两侧都无命中：先展示空态（这是原有行为，不能被破坏）
+    const short = '@登录bug';
+    inputVal.value = short;
+    taRef.value = mockTextarea(short, short.length);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggest.value?.mode).toBe('file');
+    expect(suggestEmpty.value).toBe('没有匹配的对话或文件');
+
+    // 继续输入到超过软阈值（14）：用户显然在写正文，面板自己收起
+    const long = '@' + '文'.repeat(14);
+    inputVal.value = long;
+    taRef.value = mockTextarea(long, long.length);
+    detectToken();
+    expect(suggest.value).toBeNull();
+    expect(suggestEmpty.value).toBe('');
+
+    // 继续输入不会把面板重新挂回来，也不该再发起检索
+    const callsBefore = searchSessions.mock.calls.length;
+    const longer = long + '字';
+    inputVal.value = longer;
+    taRef.value = mockTextarea(longer, longer.length);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggest.value).toBeNull();
+    expect(suggestEmpty.value).toBe('');
+    expect(searchSessions.mock.calls.length).toBe(callsBefore);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('@ 有命中时逐字输入不受软阈值影响，超硬上限才收起', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({
+      ok: true,
+      sessions: [{ name: '登录bug排查', count: 3, updated_at: '', workdir: '' }],
+    });
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggest } = useSuggest(inputVal, taRef);
+
+    // 20 个字符但有命中：软阈值只管空态，候选照常展示
+    const mid = '@' + 'x'.repeat(19);
+    inputVal.value = mid;
+    taRef.value = mockTextarea(mid, mid.length);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggest.value?.mode).toBe('file');
+
+    // 达到硬上限（query 40 个字符）：无论有无命中一律收起
+    const hard = '@' + 'x'.repeat(40);
+    inputVal.value = hard;
+    taRef.value = mockTextarea(hard, hard.length);
+    detectToken();
+    expect(suggest.value).toBeNull();
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
   it('会话检索失败且文件无结果时提示检索失败（与真的没命中区分）', async () => {
     vi.useFakeTimers();
     const searchSessions = vi.fn().mockRejectedValue(new Error('bridge error'));

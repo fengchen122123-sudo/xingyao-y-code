@@ -67,7 +67,9 @@
       </button>
     </div>
 
-    <div id="right-content" :class="{ flush: visualTab === 'browser' }">
+<!-- 浏览器与文档工作台都要「满幅」：去掉内容区内边距，让内部占位区/滚动区
+         自己撑满并接管滚动（浏览器靠这个矩形叠加原生控件） -->
+    <div id="right-content" :class="{ flush: visualTab === 'browser' || visualTab === 'doc' }">
       <!-- 打开标签页选择页（ZCode 式侧板）：无页签/点"+"时出现，从卡片
            追加页签；已打开的页签保留在页签条上随时可切回。定向入口经
            openRightPanelTab 直接开页签跳过本页 -->
@@ -123,6 +125,14 @@
       <!-- 电脑操控面板（设计 16.2）：出现过 run 后自动切入的“操控”工作台 -->
       <div v-show="visualTab === 'computer' && !!store.computerRun.run_id" class="rpane active" data-test="computer-pane">
         <ComputerControlPane />
+      </div>
+
+      <!-- 文档工作台：PDF / Word / Excel / PPT 在面板里用 pdf.js 自绘阅读，
+           不叠加原生浏览器表面（用户要求点文档不要弹出浏览器 UI）。
+           与浏览器页签互不影响：激活本页签时 BrowserPane 的 active 转 false，
+           原生表面自动 hide。 -->
+      <div v-show="visualTab === 'doc'" class="rpane active" data-test="doc-pane">
+        <DocumentPane :active="activeTab === 'doc'" />
       </div>
 
       <!-- 浏览器工作台：DOM 工具栏 + 原生表面占位区；真实网页由宿主叠加的
@@ -220,6 +230,7 @@ import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
 import ComputerControlPane from './ComputerControlPane.vue';
 import BrowserPane from './BrowserPane.vue';
+import DocumentPane from './DocumentPane.vue';
 import GitPanel from './GitPanel.vue';
 import SubagentPane from './SubagentPane.vue';
 import NovelPane from './NovelPane.vue';
@@ -334,6 +345,7 @@ function isActiveTab(tab: RightPanelTabId) {
 const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> = [
   { id: 'files', label: '文件', icon: 'folder' },
   { id: 'git', label: 'Git', icon: 'git-branch' },
+  { id: 'doc', label: '文档', icon: 'file' },
   { id: 'browser', label: '星眼 · 浏览器', icon: 'globe' },
   { id: 'tasks', label: '星港 · 后台任务', icon: 'square-terminal' },
   { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' },
@@ -343,6 +355,7 @@ const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> =
 const PANE_LABELS: Record<RightPanelTabId, string> = {
   files: '文件',
   git: 'Git',
+  doc: '文档',
   browser: '星眼 · 浏览器',
   tasks: '星港 · 后台任务',
   computer: '操控',
@@ -353,6 +366,7 @@ const PANE_LABELS: Record<RightPanelTabId, string> = {
 const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
   files: 'folder',
   git: 'git-branch',
+  doc: 'file',
   browser: 'globe',
   tasks: 'square-terminal',
   computer: 'scan',

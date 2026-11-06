@@ -28,6 +28,57 @@ def test_at_file_text_attachment(tmp_path, monkeypatch):
     assert any("note.txt" in m for m in msgs)
 
 
+def test_at_file_chinese_name_attachment(tmp_path, monkeypatch):
+    """@引用带中文的文件名/路径段必须能附加内容。
+
+    历史实现的正则是 @([a-zA-Z0-9_\\-\\.\\/\\\\]+)，字符集只含 ASCII：@ 后紧跟中文时
+    整段匹配不上，附件被静默丢弃，模型只看到「@接口文档.md」这串文本，用户侧表现为
+    「@ 了文件但内容没传过去」。
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "接口文档.md").write_text("GET /api/users 返回用户列表", encoding="utf-8")
+
+    content, msgs = parse_user_input("根据这个 @接口文档.md 开发一个")
+
+    assert "GET /api/users 返回用户列表" in content
+    assert "@接口文档.md" not in content
+    assert any("接口文档.md" in m for m in msgs)
+
+
+def test_at_file_chinese_path_segment_attachment(tmp_path, monkeypatch):
+    """路径中间某一段是中文（@docs/接口文档.md）同样要能附加。"""
+    monkeypatch.chdir(tmp_path)
+    docs = tmp_path / "接口目录"
+    docs.mkdir()
+    (docs / "接口文档.md").write_text("POST /api/orders 建单", encoding="utf-8")
+
+    content, msgs = parse_user_input("@接口目录/接口文档.md 按这个实现")
+
+    assert "POST /api/orders 建单" in content
+    assert any("接口文档.md" in m for m in msgs)
+
+
+def test_at_file_chinese_trailing_punctuation(tmp_path, monkeypatch):
+    """中文句读作为 @ token 的天然边界：@文件 后紧跟「，」不应影响解析。"""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "接口文档.md").write_text("DELETE /api/users/1", encoding="utf-8")
+
+    content, msgs = parse_user_input("@接口文档.md，按这个实现")
+
+    assert "DELETE /api/users/1" in content
+    assert any("接口文档.md" in m for m in msgs)
+
+
+def test_at_file_chinese_missing_file_keeps_text(tmp_path, monkeypatch):
+    """不存在的中文 @ 引用不得改动正文（避免把正文里的 @ 提及当附件吞掉）。"""
+    monkeypatch.chdir(tmp_path)
+
+    content, msgs = parse_user_input("@不存在的文档.md 帮我看下")
+
+    assert content == "@不存在的文档.md 帮我看下"
+    assert msgs == []
+
+
 def test_attachment_declares_data_not_instruction(tmp_path, monkeypatch):
     """T1.2 信源声明：附件内容声明为「作为数据对待、非更高优先级指令」。"""
     monkeypatch.chdir(tmp_path)

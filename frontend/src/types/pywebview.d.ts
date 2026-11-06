@@ -1893,7 +1893,8 @@ export interface PyWebViewAPI {
 
   get_token_usage(): Promise<TokenUsage>;
   get_token_usage_overview(limit?: number): Promise<TokenUsageOverview>;
-  get_token_usage_statistics(days: 1 | 7 | 30 | 365): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
+  // days=0 表示累计全量（最早记录日至今天）；其余为固定窗口
+  get_token_usage_statistics(days: 0 | 1 | 7 | 30 | 365): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
   refresh_skills(): Promise<{ ok: boolean; skills?: SkillInfo[]; msg?: string }>;
@@ -1976,6 +1977,14 @@ export interface PyWebViewAPI {
   open_folder_in_explorer(path: string): Promise<any>;
   // Office 转 PDF 预览：首次会拉起 Office 进程（十几秒），结果按源文件 mtime 缓存
   preview_office_doc(path: string): Promise<any>;
+  // PDF 编辑结果落盘：mode=copy 另存副本 / overwrite 先备份再覆盖；out_path 为空时
+  // 后端默认在源文件同目录写 <stem>_已编辑_<时间戳>.pdf
+  save_pdf_edits(
+    path: string,
+    ops: any[],
+    mode: 'copy' | 'overwrite',
+    out_path: string,
+  ): Promise<{ ok: boolean; path?: string; pages?: number; backup?: string; msg?: string }>;
   // 侧栏排序快照：权威副本在数据目录 ui_layout.json，localStorage 只是缓存
   // （WebView2 的 localStorage 在"拖完立刻重启"时会被 leveldb 丢弃）
   get_ui_layout(): Promise<{ ok: boolean; group_order?: string[]; session_order?: Record<string, string[]>; msg?: string }>;

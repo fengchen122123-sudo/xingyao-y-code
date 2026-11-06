@@ -20,6 +20,19 @@ DEFAULT_MAX_IMAGE_OUTPUT_BYTES = 1024 * 1024  # 压缩后目标上限（字节�
 # @{会话名} 引用标记：} 定界，不允许跨行，标题上限 80 字符
 SESSION_REF_PATTERN = re.compile(r"@\{([^}\n]{1,80})\}")
 
+# @文件 的 token 边界：空白、@、花括号（@{会话名} 由 extract_session_refs 处理），
+# 以及中文句读。中文标点几乎不会出现在合法路径里，而中文输入法下 @ 引用后
+# 常紧跟句读（"看下 @接口文档.md，然后…"），以它作边界才能切出干净的路径。
+# 英文 . , ; 等不列入边界——它们是文件名与路径的常见组成（a.md / dir,1）。
+AT_PATH_TOKEN_PATTERN = re.compile(r"@([^\s@{}，。；！？：、）」】》]+)")
+
+# 尾部标点裁剪集合：token 末尾紧贴这些字符时逐层剥掉再判断文件是否存在。
+# 英文标点保留原有成员，中文句读一并覆盖（含全角）
+_TRAILING_PUNCTUATION = {
+    ",", ".", ";", "!", "?", ":", ")", "]", "}", '"', "'",
+    "，", "。", "；", "！", "？", "：", "）", "】", "》", "」", "、", "”", "’",
+}
+
 
 @dataclass(frozen=True)
 class CompressedImage:
@@ -216,10 +229,22 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
                 extracted_files.append(str(Path(ep).resolve()))
 
     # 1. 提取 @文件名 格式
-    at_matches = re.findall(r'@([a-zA-Z0-9_\-\.\/\\]+)', text)
-    for match in at_matches:
-        if os.path.exists(match):
-            extracted_files.append(match)
+    #    字符集放开到「任意非空白、非花括号、非中文句读」：历史实现只认 ASCII，
+    #    「@接口文档.md」这类中文文件名（以及 @docs/接口文档.md 这种路径段含中文）
+    #    整段匹配不上，附件被静默丢弃——用户侧表现为「@ 了文件但内容没传过去」。
+    #    token 末尾紧贴的标点再从长到短逐层剥掉，命中真实文件即采用。
+    for match in AT_PATH_TOKEN_PATTERN.findall(text):
+        candidate = match
+        resolved = ""
+        while candidate:
+            if os.path.exists(candidate):
+                resolved = candidate
+                break
+            if candidate[-1] not in _TRAILING_PUNCTUATION:
+                break
+            candidate = candidate[:-1]
+        if resolved:
+            extracted_files.append(resolved)
             # 把 @xxx 从原始文本中删掉（只替换首个匹配，避免误删正文相同字串）
             text = text.replace(f"@{match}", "", 1).strip()
 
@@ -231,7 +256,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
         # 只接受原始候选路径精确匹配到真实文件的情况；
         # 若路径末尾紧贴常见标点（如逗号、句号），循环去掉尾部标点直到找到真实文件或不再是标点。
         # 注意：仅对标点字符做裁剪，避免把有效路径（如 D:data.txt）末尾字母切掉。
-        _TRAILING_PUNCTUATION = {',', '.', ';', '!', '?', ':', ')', ']', '}', '"', "'"}
         trimmed = candidate
         while len(trimmed) > 1 and trimmed[-1] in _TRAILING_PUNCTUATION:
             if os.path.exists(trimmed) and os.path.isfile(trimmed):

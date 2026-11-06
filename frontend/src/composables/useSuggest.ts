@@ -19,6 +19,17 @@ export function useSuggest(
   // 和「功能坏了」——这正是「删掉 @ 再输入就不出东西」的观感来源。
   const suggestEmpty = ref('');
   let fileSuggestTimer: number | undefined;
+  // @ 提及的「长度退场」：@ 在中文正文里也常被当普通符号用（「@了他一下」），
+  // 这时没有命中结果的面板会一直挂在输入框上方挡内容，用户还得手动按 Esc。
+  // 两档阈值负责让它自己收起来：
+  //   软阈值——已经展示「没有匹配」空态后继续输入达到该长度：用户显然在写正文；
+  //   硬阈值——无论有无命中一律收起：会话名/文件名前缀不可能这么长。
+  const AT_QUERY_SOFT_LIMIT = 14;
+  const AT_QUERY_HARD_LIMIT = 40;
+  // 收起后记下 token 起点与当时长度：同一段 token 内继续输入保持收起，
+  // 否则下一次按键空态又挂回来；用户把 query 改短才允许重新检索。
+  let atDismissStart = -1;
+  let atDismissLen = 0;
   // 方向键导航后 keyup 会触发 detectToken，用此标志跳过一次避免高亮被重置回第一项
   let suppressDetect = false;
 
@@ -238,6 +249,26 @@ export function useSuggest(
     if (am) {
       const query = am[1];
       const start = pos - query.length - 1;
+      // 同一段 token 已经因过长收起过、且 query 没有变短：维持收起，
+      // 避免下一次按键又重开面板重新检索（那样无命中空态会反复挂回来）。
+      if (atDismissStart === start && query.length >= atDismissLen) {
+        window.clearTimeout(fileSuggestTimer);
+        suggest.value = null;
+        suggestItems.value = [];
+        return;
+      }
+      // 无命中空态（两侧检索都完成且 0 条）下继续输入，说明用户在写正文；
+      // 一旦有候选命中就不走软阈值分支，逐字输入路径片段照样能看到候选。
+      const emptyStuck = !suggestItems.value.length && !!suggestEmpty.value;
+      if (
+        query.length >= AT_QUERY_HARD_LIMIT ||
+        (emptyStuck && query.length >= AT_QUERY_SOFT_LIMIT)
+      ) {
+        atDismissStart = start;
+        atDismissLen = query.length;
+        clearSuggest();
+        return;
+      }
       // 同一次按键会连续触发 input / keyup（有时还有 click），三者落在同一个
       // token 上。250ms 内的同 token 直接复用上一轮检索，避免同一 query 反复
       // 打穿桥接层和 SQL（真机单次近百毫秒，重复两次就是双倍卡顿）；
@@ -258,9 +289,13 @@ export function useSuggest(
       fetchAtItems(query);
       return;
     }
+    // token 结束（@ 被删掉、或后面出现空格/@）：清掉长度退场记忆，
+    // 下一次重新打 @ 是一段新 token，该重新检索就得重新检索
     suggest.value = null;
     suggestItems.value = [];
     suggestEmpty.value = '';
+    atDismissStart = -1;
+    atDismissLen = 0;
   }
 
   function applySuggest(item: SuggestItem) {

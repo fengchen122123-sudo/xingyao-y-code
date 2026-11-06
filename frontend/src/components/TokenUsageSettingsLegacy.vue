@@ -66,7 +66,7 @@
           </div>
         </div>
 
-        <div :class="['daily-grid', { compact: statistics.range.days === 30 }]">
+        <div :class="['daily-grid', { compact: statistics.range.days > 7 }]">
           <article v-for="day in statistics.days" :key="day.date" :class="['day-card', { empty: day.total === 0 }]">
             <div
               class="usage-ring"
@@ -148,6 +148,8 @@ const ranges = [
   { days: 1 as const, label: '今日' },
   { days: 7 as const, label: '近 7 天' },
   { days: 30 as const, label: '近 30 天' },
+  // 0 = 累计全量：后端以最早一条用量记录为起点，覆盖所有历史
+  { days: 0 as const, label: '累计' },
 ];
 
 function formatRate(value: number | null) {
@@ -166,7 +168,7 @@ function dayAriaLabel(day: TokenStatisticsDay) {
   return `${day.date}，${day.total} Token，${models}`;
 }
 
-async function selectRange(days: 1 | 7 | 30) {
+async function selectRange(days: 0 | 1 | 7 | 30) {
   await store.loadTokenStatistics(days, true);
 }
 

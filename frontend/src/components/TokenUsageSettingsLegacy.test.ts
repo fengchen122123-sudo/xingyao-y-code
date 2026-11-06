@@ -74,4 +74,21 @@ describe('TokenUsageSettingsLegacy', () => {
     expect(wrapper.text()).toContain('暂无 Token 用量记录');
     expect(wrapper.findAll('[role="img"]')).toHaveLength(1);
   });
+
+  it('新增「累计」页签：点击后拉取全量统计', async () => {
+    const store = useAppStore() as any;
+    store.tokenStatistics = structuredClone(snapshot);
+    store.tokenStatisticsDays = 30;
+    const load = vi.spyOn(store, 'loadTokenStatistics').mockResolvedValue(snapshot as any);
+
+    const wrapper = mount(TokenUsageSettingsLegacy);
+    await flushPromises();
+
+    const labels = wrapper.findAll('.range-switch button').map(button => button.text());
+    expect(labels).toEqual(['今日', '近 7 天', '近 30 天', '累计']);
+
+    await wrapper.find('[data-test="range-0"]').trigger('click');
+
+    expect(load).toHaveBeenLastCalledWith(0, true);
+  });
 });

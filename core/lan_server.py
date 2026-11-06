@@ -355,6 +355,12 @@ class LanServer:
         # force_new=True 会轮换 token 把其他已配对设备踢下线（配对二维码本就由
         # 桌面展示、手机扫码，手机无需调用）。三者 frontend-mobile 均零引用。
         "remove_mcp_server", "open_external_url", "get_remote_bind_qr",
+        # PDF 编辑保存：写盘（mode="copy" 落新文件、mode="overwrite" 备份后覆盖
+        # 源文件），路径鉴权用的是桌面会话工作区——手机端既访问不到桌面的这份
+        # 文档，也没有远程改写桌面文件的场景，与已封的 open_path /
+        # ide_write_file 同一边界（桌面文件写入口，设计 18 fail-closed）。
+        # 只读的 read_file_preview 保持放行（手机端可预览 PDF）。
+        "save_pdf_edits",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器

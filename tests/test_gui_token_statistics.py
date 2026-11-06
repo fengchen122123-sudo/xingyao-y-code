@@ -119,7 +119,7 @@ def test_gui_token_statistics_rejects_unsupported_range_without_querying(days):
 
     result = bridge.get_token_usage_statistics(days)
 
-    assert result == {"ok": False, "msg": "统计范围仅支持 1、7、30、365 天"}
+    assert result == {"ok": False, "msg": "统计范围仅支持 0、1、7、30、365 天"}
 
 
 def test_gui_token_statistics_supports_full_year_range():
@@ -139,4 +139,50 @@ def test_gui_token_statistics_supports_full_year_range():
     ).isoformat()
     assert len(result["days"]) == 365
     assert result["days"][-1]["total"] == 440
+    assert result["days"][0]["total"] == 0
+
+
+def test_gui_token_statistics_supports_lifetime_range():
+    """days=0 累计全量：区间起点取最早一条用量记录，不受 365 天限制。"""
+    bridge = object.__new__(gui_bridge.ApiBridge)
+    bridge._memory = MemoryManager(":memory:")
+    today = date.today()
+    first_day = today - timedelta(days=400)
+    bridge._memory.add_token_usage(
+        "openai", "m1", 400, 40, 340, 440,
+        session_id="old", ts=_local_noon(first_day),
+    )
+    bridge._memory.add_token_usage(
+        "openai", "m1", 200, 20, 170, 220,
+        session_id="today", ts=_local_noon(today),
+    )
+
+    result = bridge.get_token_usage_statistics(0)
+
+    assert result["ok"] is True
+    assert result["range"] == {
+        "days": 401,
+        "start_date": first_day.isoformat(),
+        "end_date": today.isoformat(),
+    }
+    assert len(result["days"]) == 401
+    assert result["days"][0]["total"] == 440
+    assert result["days"][-1]["total"] == 220
+    assert result["summary"]["total"] == 660
+
+
+def test_gui_token_statistics_lifetime_without_records_covers_today_only():
+    """累计范围没有历史记录时只返回今天一格，不生成空日期。"""
+    bridge = object.__new__(gui_bridge.ApiBridge)
+    bridge._memory = MemoryManager(":memory:")
+
+    result = bridge.get_token_usage_statistics(0)
+
+    assert result["ok"] is True
+    assert result["range"] == {
+        "days": 1,
+        "start_date": date.today().isoformat(),
+        "end_date": date.today().isoformat(),
+    }
+    assert len(result["days"]) == 1
     assert result["days"][0]["total"] == 0

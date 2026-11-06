@@ -1094,10 +1094,19 @@ def execute_command(
                     break
                 if process.poll() is not None:
                     break
-                if time.time() - start_time >= timeout_seconds:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout_seconds:
                     _stop_process_tree(process)
                     return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
-                time.sleep(0.1)
+                # 轮询节奏随时长退避：短命令保持 0.1s 灵敏响应，长命令降频省 CPU。
+                # 代价：超时/取消/输出超限最多晚 0.5s 被察觉，属预期可接受。
+                if elapsed < 2.0:
+                    interval = 0.1
+                elif elapsed < 10.0:
+                    interval = 0.25
+                else:
+                    interval = 0.5
+                time.sleep(interval)
 
             if _execution_result is not None:
                 _execution_result.returncode = process.returncode

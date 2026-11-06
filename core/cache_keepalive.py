@@ -387,19 +387,34 @@ class CacheKeepaliveService:
                     return True
                 self._condition.wait(timeout=min(remaining, 1.0))
 
-    def _execute_with_retry(self, session_key, snapshot, telemetry, revision):
+    def _execute_with_retry(
+        self, session_key, snapshot, telemetry, revision, retry_template=None
+    ):
         """执行一次保活并记账：瞬时失败有界退避重试。
 
         返回空串表示成功；否则为最后错误的类名（含被同会话新注册打断的情况，
-        由调用方按 revision 区分是让位还是停用该会话）。每次尝试用快照的
-        深拷贝，防止 provider 客户端改写参数污染后续重试。
+        由调用方按 revision 区分是让位还是停用该会话）。
+
+        snapshot 是本周期已拷好的发送副本，首发直接用它发送，不再二次整上下文
+        深拷贝（快照含完整 messages/tools，多会话每周期多一份副本是常驻内存
+        与周期 CPU 的来源）。重试才从 retry_template（条目快照本体，服务只对
+        它做拷贝、从不就地改写）重新深拷贝：provider 客户端会就地改写传入的
+        messages/tools（如插入 cache_control），复用同一份对象会让上一次尝试
+        的改写污染后续重试。发送内容始终来自独立副本，原快照后续被改写/替换
+        不影响本次发送。
         """
         last_error = ""
         for attempt in range(KEEPALIVE_MAX_ATTEMPTS):
             try:
                 from core.llm import _dispatch_completion
 
-                response = _dispatch_completion(**deepcopy(snapshot))
+                if attempt == 0:
+                    payload = snapshot
+                else:
+                    payload = deepcopy(
+                        snapshot if retry_template is None else retry_template
+                    )
+                response = _dispatch_completion(**payload)
                 account_keepalive_response(response, telemetry or {})
                 return ""
             except Exception as exc:
@@ -449,11 +464,13 @@ class CacheKeepaliveService:
                 snapshot = deepcopy(entry["snapshot"])
                 telemetry = deepcopy(entry["telemetry"])
                 revision = entry["revision"]
+                # 重试须从条目快照本体重新拷贝：snapshot 会被 provider 就地改写
+                retry_template = entry["snapshot"]
                 # 立即回拨该条目，避免重试期间被自身重复触发
                 entry["last_activity"] = time.monotonic()
 
             error_name = self._execute_with_retry(
-                session_key, snapshot, telemetry, revision
+                session_key, snapshot, telemetry, revision, retry_template
             )
             if not error_name:
                 with self._condition:

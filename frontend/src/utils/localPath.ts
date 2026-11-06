@@ -68,15 +68,16 @@ export function toAbsoluteLocalPath(raw: string, workdir: string): string | null
 
 const HTML_EXTENSIONS = new Set(['html', 'htm']);
 const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown']);
-// Office 文档：右栏不能直接渲染，需先由后端转成 PDF 再交 WebView2 查看器。
+const PDF_EXTENSIONS = new Set(['pdf']);
+// Office 文档：右栏不能直接渲染，需先由后端转成 PDF，再交「文档」页签（pdf.js）。
 // rtf/odt/ods/odp 一并算进来（WPS/LibreOffice 的另存格式，后端转换器同样吃）。
 export const OFFICE_EXTENSIONS = new Set([
   'doc', 'docx', 'rtf', 'odt',
   'xls', 'xlsx', 'ods',
   'ppt', 'pptx', 'odp',
 ]);
-// 右栏内嵌浏览器能打开的文件类型：html/htm（网页）、pdf（WebView2 内置查看器）、
-// md/markdown（先由前端渲染成预览 HTML 再打开）、office 文档（先由后端转 PDF）。
+// 右栏能打开的文件类型：pdf 与 office（进「文档」页签，pdf.js 自绘）、
+// html/htm（内嵌浏览器当网页渲染）、md/markdown（先渲染成预览 HTML 再交内嵌浏览器）。
 // 其它类型仍走源码预览弹窗。
 const RIGHT_PANEL_EXTENSIONS = new Set([
   'html', 'htm', 'pdf', 'md', 'markdown',
@@ -102,7 +103,28 @@ export function isOfficeFilePath(path: string): boolean {
   return OFFICE_EXTENSIONS.has(normalizedExt(path));
 }
 
-/** 是否该交给右栏内嵌浏览器打开（html / pdf / md / office 四类） */
+/**
+ * 是否是新版 Word 文档（.docx）。
+ *
+ * docx 与其它 Office 格式走两条不同的预览链：docx 由前端 docx-preview 直接渲染
+ * （秒开、不依赖本机 Office），而 .doc/.rtf/.odt 与 Excel/PPT 仍是后端转 PDF。
+ * 分流判定必须只认 .docx：docx-preview 不认老式二进制 .doc。
+ */
+export function isDocxFilePath(path: string): boolean {
+  return normalizedExt(path) === 'docx';
+}
+
+/**
+ * 是否是 PDF（忽略查询串与锚点）。
+ *
+ * PDF 不再交内嵌浏览器：右栏「文档」页签用前端 pdf.js 自绘，所以调用方要按它
+ * 单独分流（Office 文档转出的缓存 PDF 也走同一条渲染链）。
+ */
+export function isPdfFilePath(path: string): boolean {
+  return PDF_EXTENSIONS.has(normalizedExt(path));
+}
+
+/** 是否该在右栏里打开（pdf / office → 文档页签；html / md → 内嵌浏览器） */
 export function canOpenInRightPanel(path: string): boolean {
   return RIGHT_PANEL_EXTENSIONS.has(normalizedExt(path));
 }

@@ -115,7 +115,7 @@ it('文本预览：kind=text 时仍渲染代码块，不出现 <img>', async () 
 
 // ── 多页签容器：页签条 + 单独关闭 + 选择页追加 ──
 
-it('中性入口展开面板：无页签先显示选择页六卡，点卡片开出对应页签', async () => {
+it('中性入口展开面板：无页签先显示选择页卡片，点卡片开出对应页签', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
@@ -124,7 +124,7 @@ it('中性入口展开面板：无页签先显示选择页六卡，点卡片开�
   await nextTick();
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
   expect(wrapper.findAll('.tp-card').map(c => c.text().trim()))
-    .toEqual(['文件', 'Git', '星眼 · 浏览器', '星港 · 后台任务', '星舰 · 子代理', '小说']);
+    .toEqual(['文件', 'Git', '文档', '星眼 · 浏览器', '星港 · 后台任务', '星舰 · 子代理', '小说']);
 
   await wrapper.find('[data-test="picker-card-files"]').trigger('click');
   await nextTick();
@@ -152,7 +152,27 @@ it('浏览器卡片开出浏览器页签并挂载 BrowserPane', async () => {
   expect(pane.exists()).toBe(true);
   expect(pane.isVisible()).toBe(true);
   expect(pane.find('browser-pane-stub').exists()).toBe(true);
-  expect(wrapper.find('[data-test="tab-browser"]').classes()).toContain('active');
+expect(wrapper.find('[data-test="tab-browser"]').classes()).toContain('active');
+  wrapper.unmount();
+});
+
+it('文档卡片开出文档页签并挂载 DocumentPane（不挂浏览器表面）', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  store.toggleRightPanel();
+  await nextTick();
+  await wrapper.find('[data-test="picker-card-doc"]').trigger('click');
+  await nextTick();
+
+  const pane = wrapper.find('[data-test="doc-pane"]');
+  expect(pane.exists()).toBe(true);
+  expect(pane.isVisible()).toBe(true);
+  // 文档页签是纯 DOM 阅读器：空态引导在，浏览器页签同时被 v-show 收起
+  expect(pane.find('[data-test="doc-pane-root"]').exists()).toBe(true);
+  expect(pane.find('[data-test="dc-empty"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="tab-doc"]').classes()).toContain('active');
+  expect(wrapper.find('[data-test="browser-pane"]').attributes('style')).toContain('display: none');
   wrapper.unmount();
 });
 

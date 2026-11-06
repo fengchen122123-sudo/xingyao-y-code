@@ -381,6 +381,16 @@ PERMISSION_TIMEOUT_SECONDS = 300
 FILE_PREVIEW_MAX_BYTES = 256 * 1024
 # 图片预览上限：20MB（base64 传输体积再膨胀约 33%）
 IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024
+# PDF 预览上限：32MB。右栏「文档」页签由前端 pdf.js 自行渲染，字节经 base64
+# data URL 过桥（体积再膨胀约 33%）；更大的文档请走「在系统中打开」
+PDF_PREVIEW_MAX_BYTES = 32 * 1024 * 1024
+# docx 预览上限：32MB（与 PDF 同档）。docx 不再转 PDF，而是把原始 OOXML 字节经
+# base64 data URL 交给前端 docx-preview 直接渲染，所以这里按源文件大小卡上限
+DOCX_PREVIEW_MAX_BYTES = 32 * 1024 * 1024
+# docx 的 MIME：docx-preview 只认字节内容，不看这个头，但保持标准值便于排查
+DOCX_PREVIEW_MIME = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
 # 可应用内预览的图片扩展名 → MIME（<img> 加载 data URL 时 SVG 脚本不执行，无 XSS 风险）
 IMAGE_PREVIEW_MIME = {
     ".png": "image/png",
@@ -458,6 +468,58 @@ def _resolve_real_path(path: str) -> str:
         return os.path.abspath(path)
     except Exception:
         return os.path.abspath(path)
+
+
+def _is_app_preview_artifact(real_path: str) -> bool:
+    """是否本程序自己写出的预览产物（数据目录下 exports/preview 里的文件）。
+
+    这些文件由本地预览链路生成（Markdown 预览页、Office 转出的 PDF），内容就是
+    用户自己点开的那个文件；它们不在会话工作区里，若照常受「工作区外需解除沙盒」
+    约束，沙盒未解除时 Office 转换出来的 PDF 会被自己的路径策略拦下（白等 20 秒）。
+    只放行这一层目录：数据目录顶层的 config.json / mcp.json 等凭据文件仍然拒绝。
+    """
+    try:
+        from core import web_preview
+
+        preview_dir = os.path.normcase(os.path.realpath(str(web_preview.get_preview_dir())))
+        candidate = os.path.normcase(os.path.realpath(str(real_path)))
+        return os.path.dirname(candidate) == preview_dir
+    except Exception:
+        return False
+def _reveal_via_shell_api(path: str) -> bool:
+    """用 SHOpenFolderAndSelectItems 打开所在目录并选中文件（仅 Windows）。
+
+    返回 True 表示已成功发起。必须先在当前线程 CoInitialize：pywebview 的桥调用
+    可能落在没初始化 COM 的工作线程上，否则会拿到 CO_E_NOTINITIALIZED
+    (0x800401F0，实测如此)。不依赖命令行解析，路径里有空格/引号类字符也不会变形；
+    失败时由调用方退回 `explorer /select,"..."` 整串命令。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        ole32 = ctypes.windll.ole32
+        shell32 = ctypes.windll.shell32
+        ole32.CoInitialize(None)
+        shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+        shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+        shell32.SHOpenFolderAndSelectItems.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_ulong,
+        ]
+        shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+        pidl = shell32.ILCreateFromPathW(path)
+        if not pidl:
+            return False
+        try:
+            hr = shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+            return (hr & 0xFFFFFFFF) == 0
+        finally:
+            shell32.ILFree(pidl)
+    except Exception:
+        logger.debug("SHOpenFolderAndSelectItems 不可用，退回 explorer 命令行", exc_info=True)
+        return False
 
 
 def _app_install_dir() -> str:
@@ -10604,6 +10666,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         attached_msgs = list(attached_msgs) + [
                             f"💬 已引用对话: {name}" for name in session_refs
                         ]
+                        # 引用失败必须让用户看见：@{会话名} 是前端补全插入的专用语法，
+                        # 用户不可能手打，出现却解析不到会话一定是真问题（会话被归档/
+                        # 删除/改名）。此前这条路径完全静默——用户只在模型回一句
+                        # 「我没收到内容」时才知道引用没生效，反馈里无法区分是哪一步坏的。
+                        try:
+                            from core.agent_service import describe_session_ref_skips
+                            attached_msgs = list(attached_msgs) + describe_session_ref_skips(
+                                self._memory, session_refs, session_name
+                            )
+                        except Exception:
+                            logger.debug("引用失败提示生成失败（不影响回合）", exc_info=True)
             except Exception:
                 logger.debug("解析用户输入失败，退回纯文本", exc_info=True)
                 parsed_content, attached_msgs = user_text, []
@@ -11698,19 +11771,43 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     # Token 用量
     # ------------------------------------------------------------------
     def get_token_usage_statistics(self, days: int = 30) -> Dict[str, Any]:
-        """按 CLI /usage 口径返回 GUI 的每日与模型 Token 统计。"""
-        if type(days) is not int or days not in (1, 7, 30, 365):
-            return {"ok": False, "msg": "统计范围仅支持 1、7、30、365 天"}
+        """按 CLI /usage 口径返回 GUI 的每日与模型 Token 统计。
+
+        days=0 表示累计全量：区间取最早一条用量记录到今天，
+        实际天数回填到 range.days，供前端区分展示密度。
+        """
+        if type(days) is not int or days not in (0, 1, 7, 30, 365):
+            return {"ok": False, "msg": "统计范围仅支持 0、1、7、30、365 天"}
         range_days = days
 
         try:
             from datetime import date, timedelta
 
             end_date = date.today()
-            start_date = end_date - timedelta(days=range_days - 1)
-            rows = self._memory.query_token_usage_by_day_and_model(
-                start_date.isoformat(), end_date.isoformat()
-            )
+            if range_days == 0:
+                # 先取全量记录，再以最早记录日收紧起点，
+                # 避免历史为空时生成成千上万个空日期格子。
+                rows = self._memory.query_token_usage_by_day_and_model(
+                    "0000-01-01", end_date.isoformat()
+                )
+                start_date = end_date
+                earliest = min(
+                    (str(row.get("date") or "") for row in rows if row.get("date")),
+                    default="",
+                )
+                if earliest:
+                    try:
+                        earliest_date = date.fromisoformat(earliest[:10])
+                    except ValueError:
+                        earliest_date = end_date
+                    if earliest_date < start_date:
+                        start_date = earliest_date
+                range_days = (end_date - start_date).days + 1
+            else:
+                start_date = end_date - timedelta(days=range_days - 1)
+                rows = self._memory.query_token_usage_by_day_and_model(
+                    start_date.isoformat(), end_date.isoformat()
+                )
             metric_names = (
                 "prompt", "completion", "cached", "cache_prompt",
                 "total", "requests",
@@ -12928,7 +13025,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             allowed, deny_msg = gui_path_access_allowed(
                 real_path, workspace, action="preview", session_id=self._current_session
             )
-            if not allowed:
+            # 例外：数据目录 exports/preview 下的文件是本程序自己生成的预览产物
+            # （Markdown 预览页、Office 转出的 PDF），不受工作区沙箱约束
+            if not allowed and not _is_app_preview_artifact(real_path):
                 return {"ok": False, "msg": deny_msg}
             if not os.path.isfile(real_path):
                 # 目录路径（模型常在回复中输出文件夹路径，点击预览属常见操作）
@@ -12953,6 +13052,67 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     "data_url": f"data:{IMAGE_PREVIEW_MIME[ext]};base64,{b64}",
                     "path": real_path,
                 }
+            if ext == ".docx":
+                # docx 走前端 docx-preview 直接渲染（解析 OOXML 生成 DOM），不再由
+                # core.office_preview 调 Word COM 转 PDF：省掉 10~25 秒的冷启动，
+                # 也不要求本机装 Office/WPS。字节经 base64 data URL 过桥，所以按
+                # 源文件大小卡上限；超出请走「在系统中打开」。
+                if size > DOCX_PREVIEW_MAX_BYTES:
+                    return {"ok": False, "msg": (
+                        f"Word 文档过大（{size / 1024 / 1024:.1f} MB，"
+                        f"上限 {DOCX_PREVIEW_MAX_BYTES // 1024 // 1024} MB），请使用「在系统中打开」"
+                    )}
+                # 扩展名不可信：见过「把 PDF 改名成 .docx」和「PDF 转 Word 工具写坏」
+                # 两种情况。docx 本质是 ZIP（PK\x03\x04），不是的话 docx-preview 的
+                # JSZip 会抛出英文的 "Can't find end of central directory"，用户看不懂。
+                with open(real_path, "rb") as f:
+                    head = f.read(8)
+                if head.startswith(b"%PDF-"):
+                    # 内容其实是 PDF：降级走下面的 pdf.js 分支，至少能正常看
+                    ext = ".pdf"
+                elif not head.startswith(b"PK\x03\x04"):
+                    stem = os.path.splitext(real_path)[0]
+                    sibling_pdf = stem + ".pdf"
+                    hint = (
+                        f"；同目录下的 {os.path.basename(sibling_pdf)} 是本来的 PDF，可以直接打开它"
+                        if os.path.isfile(sibling_pdf) else ""
+                    )
+                    return {"ok": False, "msg": (
+                        "这个 .docx 不是有效的 Word 文档（内容既不是 docx 压缩包也不是 PDF，"
+                        f"常见于「PDF 转 Word」失败后留下的空壳文件）{hint}"
+                    )}
+                else:
+                    import base64
+                    with open(real_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("ascii")
+                    return {
+                        "ok": True,
+                        "kind": "docx",
+                        "data_url": f"data:{DOCX_PREVIEW_MIME};base64,{b64}",
+                        "size": size,
+                        "path": real_path,
+                    }
+            if ext == ".pdf":
+                # PDF 走 base64 data URL 交给前端 pdf.js 渲染：右栏「文档」页签
+                # 自己画工具栏（页码/缩放/适应宽度），不再经过内嵌浏览器的
+                # Edge PDF 查看器。docx 已改为前端 docx-preview 直接渲染（见上），
+                # 仍然走这条链的只有真 PDF，以及 Excel/PPT/旧版 doc 由
+                # core.office_preview 转出来的缓存 PDF。
+                if size > PDF_PREVIEW_MAX_BYTES:
+                    return {"ok": False, "msg": (
+                        f"PDF 过大（{size / 1024 / 1024:.1f} MB，"
+                        f"上限 {PDF_PREVIEW_MAX_BYTES // 1024 // 1024} MB），请使用「在系统中打开」"
+                    )}
+                import base64
+                with open(real_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                return {
+                    "ok": True,
+                    "kind": "pdf",
+                    "data_url": f"data:application/pdf;base64,{b64}",
+                    "size": size,
+                    "path": real_path,
+                }
             truncated = size > FILE_PREVIEW_MAX_BYTES
             with open(real_path, "rb") as f:
                 raw = f.read(FILE_PREVIEW_MAX_BYTES)
@@ -12970,6 +13130,76 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:
             logger.exception("read_file_preview 失败")
             return {"ok": False, "msg": str(e)}
+
+    def save_pdf_edits(self, path: str, ops: list = None, mode: str = "copy", out_path: str = "") -> Dict[str, Any]:
+        """保存右栏 PDF 编辑器里的改动（页面增删/旋转/移动 + 批注覆盖层）。
+
+        参数:
+            path: 源 PDF 路径（必须落在会话语义允许的范围内，规则同 read_file_preview）
+            ops: 编辑操作数组，schema 见 core/pdf_edit.py（坐标原点在页面左上角）
+            mode: "copy"（默认，另存新文件）或 "overwrite"（先备份再覆盖源文件）
+            out_path: mode=copy 时的输出路径；留空则同目录生成
+                      ``<stem>_已编辑_<YYYYMMDD_HHMMSS>.pdf``
+        返回:
+            {"ok": True, "path": 输出绝对路径, "pages": 页数, "backup": 备份路径或 ""}
+            / {"ok": False, "msg": 一行中文原因}
+        """
+        try:
+            from core.gui_path_policy import gui_path_access_allowed
+            from core.pdf_edit import apply_edits
+
+            real_path = _resolve_real_path(path)
+            workspace = self._session_workdir(self._current_session)
+            allowed, deny_msg = gui_path_access_allowed(
+                real_path, workspace, action="preview", session_id=self._current_session
+            )
+            # 与 read_file_preview 同一条例外：数据目录 exports/preview 下的
+            # 预览产物是本程序自己写出来的，不受工作区沙箱约束
+            if not allowed and not _is_app_preview_artifact(real_path):
+                return {"ok": False, "msg": deny_msg}
+            if not os.path.isfile(real_path):
+                return {"ok": False, "msg": "文件不存在或不是普通文件"}
+            if os.path.splitext(real_path)[1].lower() != ".pdf":
+                return {"ok": False, "msg": "只支持保存 PDF 文件的编辑结果"}
+            if not isinstance(ops, (list, tuple)):
+                return {"ok": False, "msg": "编辑操作格式不正确（应为数组）"}
+
+            import datetime
+
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            stem = os.path.splitext(real_path)[0]
+            backup_path = ""
+            if str(mode or "").lower() == "overwrite":
+                backup_path = f"{stem}.bak_{stamp}.pdf"
+                shutil.copy2(real_path, backup_path)
+                target_path = real_path
+            else:
+                if out_path:
+                    target_path = os.path.abspath(out_path)
+                    # 输出路径同样要过路径策略：桥层可能被非常规调用，不能让
+                    # 「保存编辑」变成往任意可写目录写文件的口子
+                    out_ok, out_msg = gui_path_access_allowed(
+                        target_path, workspace, action="preview",
+                        session_id=self._current_session,
+                    )
+                    if not out_ok:
+                        return {"ok": False, "msg": f"输出路径不允许: {out_msg}"}
+                else:
+                    target_path = f"{stem}_已编辑_{stamp}.pdf"
+
+            result = apply_edits(real_path, list(ops), target_path)
+            return {
+                "ok": True,
+                "path": os.path.abspath(target_path),
+                "pages": int(result.get("pages", 0)),
+                "backup": backup_path,
+            }
+        except Exception as exc:
+            # 校验失败（ValueError）与真正的异常走同一出口：日志留全量堆栈，
+            # 前端只拿到一行摘要（弹提示用）
+            logger.exception("save_pdf_edits 失败")
+            summary = str(exc).strip().splitlines()
+            return {"ok": False, "msg": summary[0][:300] if summary else exc.__class__.__name__}
 
     def open_path(self, path: str) -> Dict[str, Any]:
         try:
@@ -13025,6 +13255,47 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": True}
         except Exception as e:
             logger.exception("open_folder_in_explorer 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def reveal_in_explorer(self, path: str) -> Dict[str, Any]:
+        """在文件资源管理器中定位文件：打开所在目录并选中该文件。
+
+        与 open_path 的区别：只开资源管理器窗口，不启动文件本身（文档页签工具栏
+        「在文件夹中打开」用）。与 open_folder_in_explorer 一样不要求路径落在会话
+        工作区内——用户点的是自己刚打开的那个文件。
+        """
+        try:
+            if not path:
+                return {"ok": False, "msg": "路径为空"}
+            real_path = _resolve_real_path(path)
+            if not os.path.exists(real_path):
+                return {"ok": False, "msg": f"路径不存在: {real_path}"}
+            if os.path.isdir(real_path):
+                opener = getattr(os, "startfile", None)
+                if opener is not None:
+                    opener(real_path)
+                    return {"ok": True}
+                import subprocess
+                cmd = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([cmd, real_path])
+                return {"ok": True}
+            import subprocess
+            if sys.platform == "win32":
+                # 首选 Shell API：不经命令行解析，路径里有空格/中文都不会变形。
+                # 退回命令行时必须是「整串命令」——用参数列表 subprocess 会给引号
+                # 加转义，explorer 解析不到 /select, 的路径就退回打开「桌面」
+                # （2026-11-06 用户实测踩到）。
+                if _reveal_via_shell_api(real_path):
+                    return {"ok": True}
+                subprocess.Popen(f'explorer /select,"{real_path}"')
+                return {"ok": True}
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", real_path])
+                return {"ok": True}
+            subprocess.Popen(["xdg-open", os.path.dirname(real_path)])
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("reveal_in_explorer 失败")
             return {"ok": False, "msg": str(e)}
 
     def preview_office_doc(self, path: str) -> Dict[str, Any]:

@@ -43,7 +43,26 @@ it('为键盘快捷键提示提供独立的手机端隐藏标记', () => {
   expect(hints.classes()).toContain('keyboard-hints');
   expect(hints.text()).toContain('Enter');
   expect(hints.text()).toContain('Shift+Enter');
-  expect(hints.text()).toContain('Esc');
+  // Esc 不再承担中断任务的语义，提示里也不应再出现（防止误触杀回合）
+  expect(hints.text()).not.toContain('Esc');
+  wrapper.unmount();
+});
+
+it('运行中按 Esc 不会中断当前任务（防误触）', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  store.runningSessions = ['session-b'];
+  const stopSpy = vi.spyOn(store, 'stopCurrentTurn').mockResolvedValue(undefined);
+
+  const wrapper = mount(InputArea);
+  const textarea = wrapper.get('textarea');
+  await textarea.setValue('改到一半的想法');
+  await textarea.trigger('keydown', { key: 'Escape' });
+  await textarea.trigger('keydown', { key: 'Escape' });
+
+  expect(stopSpy).not.toHaveBeenCalled();
+  // 输入内容原样保留，不会因为按 Esc 被清空或提交
+  expect((textarea.element as HTMLTextAreaElement).value).toBe('改到一半的想法');
   wrapper.unmount();
 });
 

@@ -1384,3 +1384,124 @@ def test_append_context_suffix_reports_injection():
         [{"role": "user", "content": "你好"}], "", "", "", mgr, "s"
     ) is False
 
+
+
+def test_build_referenced_sessions_block_marks_media_only_session():
+    """被引用对话的可见内容全是图片时，引用块必须留显式占位。
+
+    原实现直接跳过非字符串 content，摘要里只剩「无可展示的文本消息」，
+    模型据此判定「引用内容为空／没收到附件」，用户侧表现为
+    「@ 了对话但内容没传过去」。占位要说明「有内容但未内联」并给出下一步。
+    """
+    from core.agent_service import build_referenced_sessions_block
+
+    mgr = _make_manager()
+    mgr.ensure_session("图片对话")
+    mgr.add_message("图片对话", "user", [
+        {"type": "text", "text": "接口文档截图"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ])
+
+    block = build_referenced_sessions_block(mgr, ["图片对话"], current_session="当前对话")
+
+    assert "图片/多媒体" in block
+    assert "未内联" in block
+    assert "重新发一次" in block
+    assert "无可展示的文本消息" not in block
+
+
+def test_build_referenced_sessions_block_keeps_text_alongside_media():
+    """文本与图片混排时：文本照常内联，另附一条媒体占位。"""
+    from core.agent_service import build_referenced_sessions_block
+
+    mgr = _make_manager()
+    mgr.ensure_session("混合对话")
+    mgr.add_message("混合对话", "user", "先看这个接口：GET /api/users")
+    mgr.add_message("混合对话", "assistant", [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+    ])
+
+    block = build_referenced_sessions_block(mgr, ["混合对话"], current_session="当前对话")
+
+    assert "GET /api/users" in block
+    assert "图片/多媒体" in block
+
+
+def test_describe_session_ref_skips_reports_missing_session():
+    """UI 提示通道：@{不存在的会话} 必须给出可读原因。
+
+    @{...} 是前端补全插入的专用语法，用户不可能手打，因此出现却解析不到
+    一定是真问题（会话被归档/删除/改名）。此前完全静默，用户只能靠模型
+    回一句「我没收到内容」猜，反馈里无法定位。
+    """
+    from core.agent_service import describe_session_ref_skips
+
+    mgr = _make_manager()
+    mgr.ensure_session("当前对话")
+
+    notes = describe_session_ref_skips(mgr, ["已经删掉的对话"], current_session="当前对话")
+
+    assert len(notes) == 1
+    assert "已经删掉的对话" in notes[0]
+    assert "不存在或已删除" in notes[0]
+    assert notes[0].startswith("⚠️")
+
+
+def test_describe_session_ref_skips_reports_self_reference():
+    """引用当前会话自己同样要给提示（否则模型只会说「内容为空」）。"""
+    from core.agent_service import describe_session_ref_skips
+
+    mgr = _make_manager()
+    mgr.ensure_session("当前对话")
+
+    notes = describe_session_ref_skips(mgr, ["当前对话"], current_session="当前对话")
+
+    assert len(notes) == 1
+    assert "是当前会话" in notes[0]
+
+
+def test_describe_session_ref_skips_silent_on_success():
+    """引用成功时不得产生任何提示（正常消息零噪音）。"""
+    from core.agent_service import describe_session_ref_skips
+
+    mgr = _make_manager()
+    mgr.ensure_session("目标对话")
+    mgr.add_message("目标对话", "user", "旧结论")
+    mgr.ensure_session("当前对话")
+
+    assert describe_session_ref_skips(mgr, ["目标对话"], current_session="当前对话") == []
+    assert describe_session_ref_skips(mgr, [], current_session="当前对话") == []
+
+
+def test_describe_ref_skips_matches_build_block_verdict():
+    """提示口径与注入口径必须一致：块里说跳过的，提示里也要出现。"""
+    from core.agent_service import (
+        build_referenced_sessions_block,
+        describe_session_ref_skips,
+    )
+
+    mgr = _make_manager()
+    mgr.ensure_session("当前对话")
+    refs = ["不存在的对话", "当前对话"]
+
+    block = build_referenced_sessions_block(mgr, refs, current_session="当前对话")
+    notes = describe_session_ref_skips(mgr, refs, current_session="当前对话")
+
+    assert "不存在或已删除" in block
+    assert len(notes) == 2
+    assert sum(1 for n in notes if "不存在或已删除" in n) == 1
+    assert sum(1 for n in notes if "是当前会话" in n) == 1
+
+
+def test_describe_ref_skips_silent_when_index_unavailable():
+    """会话表查不到任何一条时不提示：存储故障不得批量误报「已删除」。"""
+    from core.agent_service import describe_session_ref_skips
+
+    mgr = _make_manager()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    mgr.get_all_sessions = _boom  # type: ignore[method-assign]
+
+    assert describe_session_ref_skips(mgr, ["任意对话"], current_session="当前对话") == []

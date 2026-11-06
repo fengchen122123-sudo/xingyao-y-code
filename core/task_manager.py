@@ -125,11 +125,23 @@ def _read_log_tail(task_id, max_chars=2000):
 
 
 def _watch_task_completion(task_id, process, command, session_id):
-    """监听线程：0.5s 节拍同步任务状态（日志大小/进程退出），退出后触发完成回调（仅一次）。
+    """监听线程：自适应节拍同步任务状态（日志大小/进程退出），退出后触发完成回调（仅一次）。
 
     每拍在 _TASKS_COND 内执行 _sync_task_locked：日志 size 变化或进程退出都会
     bump revision 并 notify_all，manage_task(wait) 的等待方据此即时被唤醒。
+
+    节拍按任务已运行时长自适应：前 10s 用 0.5s 节拍快速捕捉短命任务退出，之后
+    降到 2.0s，避免长期驻留服务（如 dev server）永久高频空转轮询。代价是这类
+    任务退出最晚约 2s 才被发现，终态通知相应延后（预期行为）。
     """
+    # 节拍基准时间戳：优先取任务 info 里的 start_time，缺失/异常时回落本地时钟
+    started_at = time.time()
+    with _TASKS_COND:
+        _initial_info = ACTIVE_TASKS.get(task_id)
+        if _initial_info is not None:
+            _info_start_time = _initial_info.get("start_time")
+            if isinstance(_info_start_time, (int, float)):
+                started_at = float(_info_start_time)
     returncode = None
     while True:
         try:
@@ -162,7 +174,11 @@ def _watch_task_completion(task_id, process, command, session_id):
                     _save_tasks()
         if returncode is not None:
             break
-        time.sleep(0.5)
+        # 自适应节拍：运行不足 10s 的任务用 0.5s 快速响应，长跑任务降到 2.0s
+        if time.time() - started_at < 10.0:
+            time.sleep(0.5)
+        else:
+            time.sleep(2.0)
     cb = _on_task_finished
     if cb is not None:
         try:

@@ -14,7 +14,7 @@
     </div>
 
     <template v-else>
-      <!-- 累计摘要条：数据来自 365 天 lifetime 快照，无数据时占位 -- -->
+      <!-- 累计摘要条：数据来自累计（全量）lifetime 快照，无数据时占位 -- -->
       <section class="summary-strip" data-test="token-summary-strip" aria-label="累计用量概览">
         <div v-for="item in lifetimeItems" :key="item.label" class="summary-strip-item" data-test="token-summary-item">
           <div class="summary-strip-value">{{ item.value }}</div>
@@ -344,7 +344,7 @@ const donutRows = computed(() => {
   });
 });
 
-// 点选明细：日期集合取自选中的格子（单日一格 / 整列 7 天），明细数据来自 365 天快照，
+// 点选明细：日期集合取自选中的格子（单日一格 / 整列 7 天），明细数据来自累计（全量）快照，
 // 热力图窗口本身也是 52 周，所以点击不会触达快照范围外。
 const selectionDetail = computed(() => {
   const current = selection.value;
@@ -407,8 +407,10 @@ async function refreshAll() {
 }
 
 onMounted(() => {
-  // 旧版入口可能留下 1 天范围；新版没有「今日」tab，进入时回落到近 7 天。
-  const days = store.tokenStatisticsDays === 1 ? 7 : store.tokenStatisticsDays;
+  // 旧版入口可能留下「今日」（1）或「累计」（0）范围；新版没有这两个 tab，进入时回落到近 7 天。
+  const days = store.tokenStatisticsDays === 1 || store.tokenStatisticsDays === 0
+    ? 7
+    : store.tokenStatisticsDays;
   void store.loadTokenStatistics(
     store.tokenStatistics ? days : 30,
     false,

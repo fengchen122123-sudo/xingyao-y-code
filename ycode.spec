@@ -77,6 +77,14 @@ tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hiddenimports = collect_
 openpyxl_datas, openpyxl_binaries, openpyxl_hiddenimports = collect_all('openpyxl')
 pypdf_datas, pypdf_binaries, pypdf_hiddenimports = collect_all('pypdf')
 
+# PDF 编辑后端（core/pdf_edit.py）：pypdf 改页树 + reportlab 生成批注 overlay。
+# core/pdf_edit.py 由 gui_bridge.save_pdf_edits 在函数内 import（字面 import，
+# 字节码扫描能识别），Python 模块本身不会漏收；必须 collect_all 的是 reportlab
+# 的 datas（内置字体 AFM/TTF、barcode 与 graphics 的模板数据），缺了它们打包版
+# canvas 一初始化就报找不到字体文件。同上，这里也顺带被
+# build_release.verify_spec_collect_all_targets 纳入构建前环境硬校验。
+reportlab_datas, reportlab_binaries, reportlab_hiddenimports = collect_all('reportlab')
+
 # Playwright（电脑操控，Task 16 / 设计 23.1）：**不再随包收集**（原先这里是
 # collect_all('playwright')）。原因：运行时只用系统 Edge/Chrome
 # （channel="msedge"/"chrome"，见 core/computer/browser_backend.py），
@@ -126,7 +134,7 @@ common_datas = [
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
     ('assets/CHANGELOG.md', 'assets'),
 ] + pyfiglet_datas + tiktoken_ext_datas + pywinpty_datas \
-  + openpyxl_datas + pypdf_datas
+  + openpyxl_datas + pypdf_datas + reportlab_datas
 
 # 【ffmpeg 不再随安装包分发】历史上这里会把 vendor/ffmpeg/ffmpeg.exe 与
 # NOTICE.txt 追加进 common_datas（打进 _MEIPASS/vendor/ffmpeg）。96.4 MiB 的
@@ -143,12 +151,13 @@ common_datas = [
 
 common_binaries = (
     tiktoken_ext_binaries + pywinpty_binaries
-    + openpyxl_binaries + pypdf_binaries
+    + openpyxl_binaries + pypdf_binaries + reportlab_binaries
 )
 
 common_hiddenimports = (
     pyfiglet_hiddenimports + tiktoken_ext_hiddenimports
     + pywinpty_hiddenimports + openpyxl_hiddenimports + pypdf_hiddenimports
+    + reportlab_hiddenimports
 ) + [
     # core.hunyuan_image 只被内置插件 plugins/hunyuan_image 在运行时动态 import，
     # PyInstaller 静态分析不可达，必须显式声明，否则打包后插件调用直接

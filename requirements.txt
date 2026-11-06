@@ -28,6 +28,10 @@ pytest-mock>=3.0.0
 openpyxl>=3.1
 pypdf>=4.0
 
+# PDF 编辑（core/pdf_edit.py）：用 reportlab 画批注/白块/文本框的 overlay 层，
+# 再由 pypdf 合并进原页面。BSD 许可，可随包分发。
+reportlab>=4.0
+
 # Computer control dependencies (system Edge/Chrome channel; browsers are NOT downloaded)
 playwright>=1.55,<2
 # UI Automation（comtypes 运行时生成 UIAutomationCore 绑定）仅 Windows 桌面

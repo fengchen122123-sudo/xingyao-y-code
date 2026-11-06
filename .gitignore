@@ -98,6 +98,9 @@ output/
 # pytest 临时工作目录
 tmp/
 
+# pytest 全量运行的输出记录（本地回归对比用，不入库）
+/pytest_*.txt
+
 # 临时产物：图片生成脚本（内含密钥，严禁入库）与本地测试生成的图片/图表
 gen_images.py
 img1_*.png

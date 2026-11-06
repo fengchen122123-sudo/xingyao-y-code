@@ -52,6 +52,43 @@ _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _ZOOM_MIN = 0.25
 _ZOOM_MAX = 8.0
 
+# 内嵌 WebView2 的默认内存/CPU 参数（唯一数据源：gui_main 也 import 这一个常量
+# 注入 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS，不允许在别处再抄一份字面量）。
+# 只包含两条低风险开关：
+#   --disable-features=CalculateNativeWinOcclusion
+#       关闭窗口遮挡检测。WebView2 会持续判断自身是否被其它窗口遮住来决定是否
+#       降帧/停绘，内嵌控件尺寸随面板频繁变化的场景下这份判断纯属浪费 CPU。
+#   --disk-cache-size=52428800
+#       磁盘缓存上限压到 50MB（默认量级约 250MB）。内嵌浏览器只用于预览与
+#       自动化，不需要大缓存，省磁盘也省缓存淘汰的开销。
+# 取舍（刻意不做的事）：**不**限制渲染进程数量、**不**动 V8 堆、**不**关 GPU
+# （即不使用 --renderer-process-limit / --js-flags / --disable-gpu /
+# --single-process）。这些会改变渲染进程布局或让部分站点直接崩，风险不可控；
+# 本常量只保留上面两条纯行为开关，最坏影响是缓存变小、绘制略快，不影响页面
+# 能否正常打开。
+_DEFAULT_BROWSER_MEMORY_ARGS = (
+    "--disable-features=CalculateNativeWinOcclusion --disk-cache-size=52428800"
+)
+
+
+def _merge_additional_browser_args(*groups: str) -> str:
+    """按参数键合并多组 Chromium 参数串，保证结果里没有重复项。
+
+    键取 "=" 之前的部分（如 --disk-cache-size）；同键后出现的一项覆盖先出现的
+    一项，但保留首次出现的位置——于是默认参数在前、调用方参数在后时，调用方
+    对同一开关的取值优先，同时不会产生两条同键参数（Chromium 对重复开关的
+    取值行为依赖参数顺序，不能留重复项赌运气）。
+    """
+    order = []
+    by_key = {}
+    for group in groups:
+        for token in str(group or "").split():
+            key = token.split("=", 1)[0]
+            if key not in by_key:
+                order.append(key)
+            by_key[key] = token
+    return " ".join(by_key[key] for key in order)
+
 # CDP 端点就绪等待：控件创建是异步的（EnsureCoreWebView2Async），端口要等
 # 浏览器进程起来才可连。有界轮询，超时即视为本次自动化准备失败——绝不把
 # 一个连不上的端口当成功返回。
@@ -466,8 +503,14 @@ class EmbeddedBrowserController:
         except Exception:
             logger.debug("创建浏览器 profile 目录失败", exc_info=True)
         props.UserDataFolder = str(profile)
-        if additional_browser_args:
-            props.AdditionalBrowserArguments = additional_browser_args
+        # 默认内存参数 + 调用方参数合并去重后写入（默认在前，调用方同键取值优先）。
+        # 必须在 EnsureCoreWebView2Async 之前落到 CreationProperties 上，之后再写
+        # 不会生效。
+        merged_args = _merge_additional_browser_args(
+            _DEFAULT_BROWSER_MEMORY_ARGS, additional_browser_args
+        )
+        if merged_args:
+            props.AdditionalBrowserArguments = merged_args
         wv.CreationProperties = props
         wv.Visible = False
         wv.CoreWebView2InitializationCompleted += self._on_init_completed

@@ -922,6 +922,20 @@ def _audit_config_keys() -> None:
 
 def main():
     _configure_runtime_logging()
+    # 内嵌 WebView2 的默认内存参数：进程级环境变量注入（pywebview 的
+    # edgechromium 后端以及 core.embedded_browser 直接 new 的控件都会读到它）。
+    # 必须用 setdefault——用户系统里已有的 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+    # 优先，绝不覆盖；参数串的唯一数据源是 core.embedded_browser 里的常量，这里
+    # 不重复写一份字面量，避免两处漂移。只能在此处（任何 WebView2 实例化之前）
+    # 注入：WebView2 环境在首次创建控件时就固化了。
+    try:
+        from core.embedded_browser import _DEFAULT_BROWSER_MEMORY_ARGS
+
+        os.environ.setdefault(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", _DEFAULT_BROWSER_MEMORY_ARGS
+        )
+    except Exception:
+        logger.debug("注入 WebView2 默认内存参数失败（保持浏览器默认行为）", exc_info=True)
     # 无条件记录本进程身份：诊断"venv 与系统 Python / 安装版双进程共存"
     # 时可直接从日志判断每个启动的进程来自哪个可执行文件
     logger.info(
