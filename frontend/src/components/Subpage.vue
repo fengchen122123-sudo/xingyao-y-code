@@ -634,6 +634,7 @@ async function testModelRow(m: ModelInfo) {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0;
 }
 .sub-back:hover {
   border-color: var(--accent);
@@ -641,10 +642,15 @@ async function testModelRow(m: ModelInfo) {
 }
 .sub-head h2 {
   font-size: 15px;
+  white-space: nowrap;
 }
 .sub-head .sub-desc {
   font-size: 12px;
   color: var(--text-faint);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .sub-note {
   max-width: 960px;
@@ -657,6 +663,7 @@ async function testModelRow(m: ModelInfo) {
   flex: 1;
   overflow-y: auto;
   padding: 22px 26px;
+  min-width: 0;
 }
 .sub-grid {
   max-width: 960px;
@@ -681,6 +688,8 @@ async function testModelRow(m: ModelInfo) {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  min-width: 0;
+  max-width: 100%;
 }
 .auto-tabs {
   display: inline-flex;

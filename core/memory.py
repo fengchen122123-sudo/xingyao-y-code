@@ -2788,6 +2788,30 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
+    def get_session_workdir(self, session_name):
+        """取会话绑定的工作目录；会话不存在 / 字段为空返回空串。
+
+        供「项目状态注入」等按会话解析项目画像的调用方使用：只读、不加锁写、
+        任何异常都回落空串（调用方据此自行兜底到当前工作目录）。
+        """
+        name = str(session_name or "").strip()
+        if not name:
+            return ""
+        try:
+            with self._lock:
+                cursor = self.conn.cursor()
+                cursor.execute('SELECT id, workdir FROM sessions WHERE session_name = ?', (name,))
+                row = cursor.fetchone()
+        except Exception as exc:
+            logging.debug("读取会话工作目录失败：%s（%s）", name, exc)
+            return ""
+        if not row:
+            return ""
+        try:
+            return str(row[1] or "").strip()
+        except Exception:
+            return ""
+
     def set_session_model_id(self, session_name: str, model_id: str | None) -> bool:
         """绑定会话级主模型。传 None/空字符串则清除绑定，回退到全局默认模型。"""
         mid = str(model_id or "").strip() or None

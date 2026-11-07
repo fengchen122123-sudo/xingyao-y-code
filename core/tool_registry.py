@@ -617,7 +617,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             execute=tools.remember_decision,
             requires_permission=False,
             activity_description="记录项目决策",
-            side_effect_scope="workspace",
+            side_effect_scope="system",  # 只写 ~/.ycode/memory/projects/（跨项目记忆，非工作区）
         ),
         ToolSpec(
             name="ask_user",

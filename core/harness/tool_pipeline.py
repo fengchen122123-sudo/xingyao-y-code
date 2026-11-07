@@ -57,6 +57,9 @@ _PLAN_ROOT_CONTROL_TOOLS = frozenset({
 _PLAN_READ_ONLY_TOOLS = frozenset({
     "read_file", "list_directory", "search_code", "find_definition", "glob_files",
     "fetch_url", "search_news", "get_weather", "manage_task",
+    # 项目画像写入（特性 1）：只往 ~/.ycode/memory/projects/ 追加记忆，不改
+    # 工作区文件，计划模式下按只读口径放行。
+    "remember_decision",
 })
 _PLAN_BOUND_ORCHESTRATORS = frozenset({"run_subagent", "ask_user"})
 

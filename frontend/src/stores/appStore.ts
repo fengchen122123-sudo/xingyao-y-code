@@ -173,10 +173,10 @@ export const SECRETARY_PERSONA_MAX_LEN = 20000;
 // novel 是小说工作台（只读展示项目状态，设计 §7），doc 是文档阅读器
 // （PDF / Word / Excel / PPT，前端 pdf.js 自绘，不经过内嵌浏览器）
 export type RightPanelTabId =
-  | 'files' | 'git' | 'browser' | 'doc' | 'tasks' | 'computer' | 'subagent' | 'novel';
+  | 'files' | 'git' | 'browser' | 'doc' | 'tasks' | 'computer' | 'subagent' | 'novel' | 'project';
 // 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
 const RIGHT_PANEL_TAB_IDS = new Set<RightPanelTabId>([
-  'files', 'git', 'browser', 'doc', 'tasks', 'computer', 'subagent', 'novel',
+  'files', 'git', 'browser', 'doc', 'tasks', 'computer', 'subagent', 'novel', 'project',
 ]);
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {

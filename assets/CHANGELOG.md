@@ -2,31 +2,16 @@
 
 ## 1.3.9 (2026-11-01)
 
-- 新增：右栏「文档」页签——PDF / Word / Excel / PPT 在面板里直接读，不再套浏览器壳。PDF 由前端 pdf.js 逐页画进 canvas（页码、缩放、适应宽度、在文件夹中打开、用系统程序打开等工具栏全部自建，`frontend/src/components/DocumentPane.vue`），Office 文档仍由后端 `core/office_preview` 转 PDF 后走同一条渲染链；pdf.js 走动态 import，不点文档的用户不付首屏体积。后端 `read_file_preview` 新增 `.pdf` 分支，按 base64 data URL 回传（上限 32MB，超限提示改用系统程序打开）；「在文件夹中打开」走 `reveal_in_explorer`，Windows 用 `SHOpenFolderAndSelectItems`（先 CoInitialize）定位并选中源文件，取不到时退回 `explorer /select,"…"` 整串命令——用参数列表会让 explorer 解析失败、退回打开桌面；Office 文档定位的是源文档而非转换缓存 PDF
-- 优化：点 pdf 不再拉起内嵌浏览器（原先落到 WebView2 自带的 Edge PDF 查看器），「星眼 · 浏览器」页签只留给网页与 markdown 预览；Office 转换进行中的提示浮层也随页签搬到文档页签里
-- 新增：文档页签「编辑模式」——批注（高亮/下划线/删除线/方框/箭头/自由笔/便签/印章）、覆盖改写（白块遮盖 + 文本框）、页面操作（删页/旋转/插入空白页）三类编辑，保存时由后端 `core/pdf_edit.py`（reportlab 画 overlay + pypdf 合并页面）合成新 PDF；默认另存 `<原名>_已编辑_<时间戳>.pdf`，覆盖保存先备份 `.bak_<时间戳>.pdf` 再原子替换；Office 转换出的预览不允许覆盖原文档（会落到源文档同目录）
-- 优化：编辑模式的补齐——标注支持点选/拖动（SVG transform 实时预览，松手才入历史）/Delete 删除，`drawItems` 改用全局下标避免多页时删错条目；批注 `width` 后端真正生效（rect/arrow/下划线/删除线）；前端校验阈值与后端对齐（字号 1..300、rects ≤500、笔迹点数 ≤5000、矩形边长 ≤20000pt、线宽 0.1..50）；copy 模式的输出路径补上路径策略校验
-
-- 新增：提示词扩写技能 `prompt-expansion`（内置技能）——把一句话需求先扩写成「复现级」执行规格再动手。`references/domain-specs.md` 收录 Web 单页 / 3D 图形 / 音视频 / Windows 批处理 / 后端接口 / 文档写作 / Agent 编排七个领域的必填槽位与领域坑位；`scripts/spec_lint.py` 是可执行门禁，检查结构完整度、量化密度、模糊词、验收可勾选性、假设条数与五项硬门禁，按 10 项评分且低于 16 分拒绝进入执行（实测糊弄版 1/20 被拦、合格版 20/20 通过）；`references/example.md` 给出「手机视频批量压缩」的完整对照范例与反例
-- 新增：办公文档读取工具 `office_read`（内置插件 `plugins/office`）——把 xlsx / xlsm / docx / pptx / pdf 转成结构化 Markdown 供模型理解：xlsx 按工作表输出表格、docx 保留标题层级与表格、pptx 与 pdf 按页输出文本。只读，不修改文件；大文件可用 `sheet` / `max_rows` / `max_chars` 控制返回量。xlsx 走 openpyxl、pdf 走 pypdf（两者是新增依赖，已写入 `requirements.txt` 并由 `ycode.spec` 的 `collect_all` 随包收集），docx/pptx 用标准库 `zipfile` + `ElementTree` 直接解析 OOXML，不引入额外依赖
-- 新增：Excel 生成工具 `office_write`（同属 `plugins/office`）——传入二维数据即按办公室默认规范出表：表头蓝底白字加粗居中、正文微软雅黑 10.5、细边框、偶数行斑马纹、列宽按显示宽度自适应（中文按 2 计）、冻结首行、首行自动筛选、横向打印并缩放到一页宽、跨页重复表头；支持多工作表。目标文件已存在时默认拒绝写入，需显式 `overwrite=true`，避免误覆盖旧表
-- 新增：办公文档处理技能 `office-format`——沉淀「先读再写、大表限量读取、覆盖前先告知、Word/PPT 暂不直出」的处理规范与交付前自检项
-- 新增：桌面版斜杠命令——只提供按钮无法替代的 13 条（`/goal`、`/agent`、`/skill`、`/remember`、`/forget`、`/fix`、`/review`、`/init`、`/test`、`/explain`、`/compact`、`/commit`、`/workflow`），输入 `/` 弹出候选，未命中命令表的文本按普通消息发送
-- 新增：`/goal` 目标模式——自主迭代直到达成，支持 `--check` 命令验证与 `--rounds` 轮次上限；未提供验证命令时由模型自评并转人工确认；GUI 与 CLI 共享状态机，`status` / `stop` / `resume` 双端可用
-- 新增：GUI 目标状态条——展示目标、当前轮次与状态，可停止与恢复
-- 新增：共享核心 `core/slash_commands`（解析、注册表、提示词模板、分发、目标状态机），GUI 与 CLI 共用同一套实现，CLI 侧另接 `msg_queue` 执行器
-- 新增：`/compact` 接入真实压缩入口（后台线程 + 进度回显）
-- 优化：`/commit` 与 `/forget` 改为两阶段执行：先统计与提示，`--yes` 才真正提交/删除，避免误操作
-- 优化：`/skill` 直接读取技能正文注入；`/agent`、`/workflow` 仍为提示词降级
-- 优化：`TURN_SOURCES` 新增 `goal` 来源，GUI 与模型侧受控值集合保持一致
-- 修复：草稿会话首条消息即 `/goal` 时工作目录丢失——斜杠命令在落库前就地执行，前端携带的 workdir 无人接收，目标循环按进程启动目录落库，导致会话归组与每轮 cwd 全错；现由斜杠层一路透传到目标启动，先按目录落库
-- 修复：目标状态随会话改名迁移，并在目标运行期间禁止改名（否则后续轮次会写进旧名的幽灵会话）
-- 测试：斜杠命令与 `/goal` 相关后端用例 82 项、turn_source 相关 23 项通过；前端全量 158 个文件 1502 项通过
-- 修复：`office_write` 未接入按回合撤销记录器——它声明了 `mutates_files` 却没走 `prepare_mutation`，启动校验直接抛 `RuntimeError`，导致 7 个测试文件在收集阶段中断；现落盘统一走 `_save_with_turn_undo`（工作区锁 → 撤销句柄 → 落盘 → 校验），检查点封闭时拒绝触盘，并补进记录器覆盖白名单
-- 修复：`openpyxl` / `pypdf` 此前未在任何依赖清单中声明，安装包不会携带，office 工具一用即报 `ModuleNotFoundError`；现补进 `requirements.txt` 与 `ycode.spec` 的 `collect_all`，`build_release` 的构建前校验同步覆盖这两个包
-- 修复：`office_read` 声明为只读却标了 `side_effect_scope="workspace"` 写类范围，按声明契约改为 `none`
-- 修复：思考档位标签被收敛成 value 本身，`/effort` 输出 `○ off(off)`、GUI 选择器退化为英文；恢复中文标签（默认 / 关闭 / 开启 / 低 / 中 / 高 / 极高 / 最高）
-- 优化：缺少 openpyxl / pypdf 时不再抛裸 `ModuleNotFoundError`，改为「缺什么、怎么装」的可执行提示
+- 新增：右栏「文档」页签——PDF / Word / Excel / PPT 直接在面板里查看，不再另开浏览器窗口；支持页码跳转、缩放、适应宽度、在文件夹中定位原文件
+- 新增：文档编辑模式——可加批注（高亮、下划线、删除线、方框、箭头、自由笔、便签、印章），可用白块遮盖后覆盖改写，也能删页、旋转、插入空白页；保存生成新 PDF，覆盖保存前自动备份
+- 新增：办公文档工具——可直接读取 xlsx / docx / pptx / pdf 的内容，也能把数据一键生成规范 Excel（表头样式、斑马纹、冻结首行、自动筛选、打印排版一并处理好）
+- 新增：内置「提示词扩写」技能——把一句话需求先扩写成可执行的详细规格，再动手做事
+- 新增：桌面版斜杠命令 13 条（`/goal`、`/fix`、`/review`、`/commit`、`/compact` 等），输入 `/` 弹出候选
+- 新增：`/goal` 目标模式——给一个目标，自动迭代到完成为止，可配验证命令与轮次上限；界面带状态条，随时停止或继续
+- 优化：`/commit`、`/forget` 改为先统计提示、确认后才执行，避免误操作
+- 修复：目标模式下会话工作目录丢失、会话改名后目标状态丢失的问题
+- 修复：思考档位显示成英文 `off(off)`，恢复中文标签
+- 修复：办公文档工具缺依赖时没有安装提示、生成的 Excel 未纳入按回合撤销等若干问题
 
 ## 1.3.8 (2026-10-24)
 

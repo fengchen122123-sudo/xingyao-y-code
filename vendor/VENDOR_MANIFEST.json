@@ -11,11 +11,11 @@
     },
     {
       "path": "vendor/ffmpeg/NOTICE.txt",
-      "optional": true,
+      "optional": false,
       "hash_mode": "text_lf",
-      "sha256": "ab16770778986f2e6228f23769200dbcc5d0540c326eb1a194d414dbf61cb738",
-      "version": "1",
-      "source": "本项目自撰说明文件：记录 vendor/ffmpeg/ffmpeg.exe 的版本、构建配置、许可证与体积影响"
+      "sha256": "caa669a2caa263472efc65211cfe98dce28b4c728b5a5ae099a38236c06f9d5b",
+      "version": "2",
+      "source": "本项目自撰说明文件：ffmpeg 组件版本、构建来源、GPLv3 许可与对应源码获取方式，内嵌 GPLv3 全文；随组件包分发给下载者以履行 GPLv3 第 4-6 条分发义务"
     },
     {
       "path": "vendor/ripgrep/rg.exe",

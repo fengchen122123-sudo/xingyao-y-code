@@ -1,0 +1,59 @@
+/* ============================================================
+   晨光 Daybreak（builtin.daybreak）主题专属样式层
+   作用域：html[data-gui-theme-id="builtin.daybreak"]，
+   仅该主题激活时生效，其余主题（内置深浅 / QQ2009 / 田野笔记 / 深夜工位 / 用户主题）不受影响。
+
+   这层只处理 token 表达不了的六件事，不改任何组件结构、不加 padding、
+   不动布局盒模型（脊线全部用 inset box-shadow 画在元素内边缘）：
+   1. 状态栏：读数等宽对齐
+   2. 会话时间列：等宽 + 右对齐，杜绝"刚刚/4分钟/1天"宽度跳动
+   3. 当前会话：2px 赭石脊替代整块底色
+   4. 助手消息：去卡片底，改左侧脊线
+   5. 用户气泡：论文纸面
+   6. 输入卡片聚焦：细边替代 3px 光晕
+   ============================================================ */
+
+/* ---- 1. 状态栏：数字等宽，次要项退一格 ---- */
+html[data-gui-theme-id="builtin.daybreak"] #statusbar {
+  font-variant-numeric: tabular-nums;
+}
+
+html[data-gui-theme-id="builtin.daybreak"] #statusbar .si {
+  letter-spacing: 0.01em;
+}
+
+html[data-gui-theme-id="builtin.daybreak"] #statusbar .status-ai-notice {
+  opacity: 0.6;
+}
+
+/* ---- 2. 会话时间列：等宽 + tabular，右列数字不再左右跳 ---- */
+html[data-gui-theme-id="builtin.daybreak"] #sidebar .session-item .m {
+  font-family: var(--theme-font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  letter-spacing: 0;
+}
+
+/* ---- 3. 当前会话：2px 赭石脊 + 极轻底，不再整块灰 ---- */
+html[data-gui-theme-id="builtin.daybreak"] #sidebar .session-item.active {
+  background: var(--theme-background-panel);
+  box-shadow: inset 2px 0 0 var(--theme-accent);
+}
+
+/* ---- 4. 助手消息：去掉卡片底，改左侧 1px 脊线（本主题签名） ---- */
+html[data-gui-theme-id="builtin.daybreak"] .msg-assistant {
+  background: transparent;
+  box-shadow: inset 1px 0 0 var(--theme-border);
+}
+
+/* ---- 5. 用户气泡：纸面 + 细线，与助手消息拉开材质差异 ---- */
+html[data-gui-theme-id="builtin.daybreak"] .msg-user .bubble {
+  background: var(--theme-background-card);
+  border: 1px solid var(--theme-border);
+}
+
+/* ---- 6. 输入卡片聚焦：细赭石边替代 3px 光晕 ---- */
+html[data-gui-theme-id="builtin.daybreak"] .kimi-card:focus-within {
+  border-color: var(--theme-accent);
+  box-shadow: none;
+}

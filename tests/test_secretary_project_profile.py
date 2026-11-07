@@ -262,13 +262,19 @@ def test_profile_tools_visible_in_secretary_schema_only(monkeypatch):
         s["function"]["name"]
         for s in llm._ordinary_tools_schema(secretary.SECRETARY_ONLY_TOOLS)
     }
-    assert "read_project_profile" not in ordinary_names
-    assert "remember_decision" not in ordinary_names
+    # 特性 1（2026-11-07）：项目画像两工具已对普通会话开放（项目状态查看/编辑）
+    assert "read_project_profile" in ordinary_names
+    assert "remember_decision" in ordinary_names
+    assert "read_project_profile" not in secretary.SECRETARY_ONLY_TOOLS
+    assert "remember_decision" not in secretary.SECRETARY_ONLY_TOOLS
+    assert "remember_decision" in secretary.SECRETARY_ALLOWED_TOOLS
     # 普通会话工具集 = 注册表全量剔除秘书专属项
     assert ordinary_names == registry_names - set(secretary.SECRETARY_ONLY_TOOLS)
 
-    # 门控：workspace 作用域的 remember_decision 必须被显式放行
-    assert secretary.secretary_allows_tool("remember_decision", "workspace") is True
+    # 门控：remember_decision 作用域已改为 system（只写记忆目录），须按名字放行
+    scopes = llm._registry_scope_map()
+    assert scopes.get("remember_decision") == "system"
+    assert secretary.secretary_allows_tool("remember_decision", "system") is True
     assert secretary.secretary_allows_tool("read_project_profile", "none") is True
     # 未列入白名单的写类工具仍被拒（放行是按名字，不是按作用域开口子）
     assert secretary.secretary_allows_tool("write_file", "workspace") is False

@@ -205,8 +205,10 @@ SECRETARY_ONLY_TOOLS = frozenset({
     # remember_decision 是 workspace 作用域，必须显式放行才不被只读门控拦下
     # ——它唯一的写目标是 ~/.ycode/memory/projects/，路径越界由
     # core.project_profile 直接拒绝，秘书仍无项目目录写权限。
-    "read_project_profile",
-    "remember_decision",
+    # 2026-11-07（特性 1）：read_project_profile / remember_decision 已对普通
+    # 会话开放（项目状态查看与编辑入口），故从本集合移除；remember_decision
+    # 落在记忆目录（跨项目、非工作区），作用域已改 system，必须在
+    # SECRETARY_ALLOWED_TOOLS 里显式放行，否则秘书反而用不了。
 })
 
 # 秘书会话的额外允许项：这些工具不是只读（network / system / 跨会话写），
@@ -216,6 +218,9 @@ SECRETARY_ALLOWED_TOOLS = SECRETARY_ONLY_TOOLS | frozenset({
     "get_weather",
     "search_news",
     "fetch_url",
+    # 项目画像写入：作用域 system（只写 ~/.ycode/memory/projects/，跨项目），
+    # 必须按名字显式放行；普通会话同样可见（特性 1）。
+    "remember_decision",
 })
 
 

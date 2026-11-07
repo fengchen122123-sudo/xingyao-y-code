@@ -1103,6 +1103,37 @@ def _trigger_background_precompress(
     return True
 
 
+def _build_project_state_prompt(manager, session_name) -> str:
+    """按会话工作目录拼出「项目状态」注入块（特性 1）。
+
+    取目录顺序：会话绑定 workdir → 当前线程工作目录 → 无（不注入）。
+    ``GLOBAL``（自由对话分组）没有项目归属，与空目录同样不注入。任何异常
+    只记 debug 并返回空串——注入是增强项，绝不允许把回合带崩。
+    """
+    try:
+        from core import project_profile
+
+        workdir = ""
+        if manager is not None and session_name:
+            try:
+                workdir = manager.get_session_workdir(session_name) or ""
+            except Exception:
+                workdir = ""
+        if not str(workdir or "").strip():
+            try:
+                from core.workspace_context import get_workdir
+
+                workdir = str(get_workdir() or "")
+            except Exception:
+                workdir = ""
+        if not str(workdir or "").strip():
+            return ""
+        return project_profile.build_state_section(workdir)
+    except Exception:
+        logger.debug("项目状态注入失败（已跳过）", exc_info=True)
+        return ""
+
+
 def build_resume_messages(manager, session_name: str, *, is_gui: bool = True) -> list:
     """断点续跑专用消息组装：只读、不改库、不压缩、不重写历史字节。
 
@@ -1386,6 +1417,14 @@ def prepare_turn_messages(
 
     runtime = build_runtime_context(model_name, permission_mode, api_base=api_base, turn_source=turn_source)
     dynamic_prompt = build_dynamic_prompt(runtime)
+    # 【特性 1：项目状态接入所有会话】按会话工作目录读取项目画像的三节
+    # （技术栈 / 架构决策 / 硬约束）拼成当轮注入块。必须挂在这里而不是稳定
+    # 提示词通道：稳定段是会话级字节快照，会被首轮定格；本值每轮现算，
+    # 由 _append_context_suffix_to_last_user 内联到末条 user 消息末尾。
+    # 注入失败一律静默降级（返回空串 = 与改动前逐字节一致）。
+    project_state = _build_project_state_prompt(manager, session_name)
+    if project_state:
+        dynamic_prompt = f"{dynamic_prompt}\n\n{project_state}" if dynamic_prompt else project_state
     history.insert(0, system_message)
 
     # 2) 动态运行上下文块 + 后台汇总 + 时间注记统一内联到最后一条 user 消息末尾。

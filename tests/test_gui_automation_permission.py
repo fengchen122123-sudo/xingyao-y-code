@@ -60,7 +60,9 @@ def _clean_broker():
 def test_automation_permission_auto_denied_with_notice(manager, _clean_broker):
     bridge = _make_bridge(manager)
     turn_id = "turn-automation-1"
-    bridge._automation_turn_labels[turn_id] = {"run_id": "run-1", "task_name": "每日摘要"}
+    bridge._automation_turn_labels[turn_id] = {
+        "run_id": "run-1", "task_name": "每日摘要", "session_name": "星轨自动化任务",
+    }
 
     request = _enqueue_request(turn_id)
     broker_module.permission_broker.set_prompt_handlers(
@@ -78,6 +80,8 @@ def test_automation_permission_auto_denied_with_notice(manager, _clean_broker):
     notices = [e for e in bridge._events if e[0] == "notice"]
     assert notices and "无人值守已自动拒绝" in notices[0][1]["message"]
     assert "每日摘要" in notices[0][1]["message"]
+    # 必须带归属会话：前端按 session_name 路由，缺省会串到当前查看的其他会话
+    assert notices[0][1]["session_name"] == "星轨自动化任务"
 
 
 def test_human_permission_request_unaffected(manager, _clean_broker):

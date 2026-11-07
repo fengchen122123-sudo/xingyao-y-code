@@ -44,6 +44,8 @@ __all__ = [
     "SECTION_ORDER",
     "INJECT_SECTIONS",
     "DEFAULT_INJECTION_LIMIT",
+    "STATE_HEADER",
+    "STATE_STALE_DAYS",
     "MAX_SECTION_CONTENT_CHARS",
     "projects_root",
     "normalize_workdir",
@@ -52,6 +54,9 @@ __all__ = [
     "append_section",
     "append_task_log",
     "build_injection",
+    "build_state_section",
+    "read_state",
+    "set_section",
 ]
 
 logger = logging.getLogger(__name__)
@@ -82,6 +87,12 @@ INJECT_SECTIONS = (SECTION_STACK, SECTION_ARCHITECTURE, SECTION_CONSTRAINT)
 
 #: 注入正文的默认字符上限（设计第 5.3 节）
 DEFAULT_INJECTION_LIMIT = 800
+
+#: 会话级「项目状态」注入块的标题行（每轮现算，不进稳定快照）
+STATE_HEADER = "【项目状态】以下为本工作目录已记录的项目背景（自动注入，无需向用户复述来源）："
+
+#: 画像 frontmatter ``updated`` 超过该天数即标注「状态可能已过期」
+STATE_STALE_DAYS = 30
 
 #: 单条记录的内容上限，防止一轮把画像写成日志
 MAX_SECTION_CONTENT_CHARS = 1200
@@ -416,3 +427,149 @@ def build_injection(workdir, limit: int = DEFAULT_INJECTION_LIMIT) -> str:
     if len(injection) > parsed_limit:
         injection = injection[: max(0, parsed_limit - 1)].rstrip() + "…"
     return injection
+
+
+# ---------------------------------------------------------------------------
+# 结构化读写（GUI 项目状态面板：查看 + 每节编辑保存）
+# ---------------------------------------------------------------------------
+def read_state(workdir) -> dict:
+    """结构化读画像三节（技术栈 / 架构决策 / 硬约束），给 GUI 面板用。
+
+    返回 ``{"workdir", "exists", "updated", "sections"}``；``exists`` 表示画像
+    文件已有内容，``updated`` 是 frontmatter 时间原文（缺失为空串）。任何异常
+    都返回同结构的空值，不抛。
+    """
+    empty = {
+        "workdir": normalize_workdir(workdir),
+        "exists": False,
+        "updated": "",
+        "sections": {name: "" for name in INJECT_SECTIONS},
+    }
+    try:
+        text = read_profile(workdir)
+        if not text.strip():
+            return empty
+        sections = _section_map(text)
+        updated = _frontmatter_updated(text)
+        return {
+            "workdir": normalize_workdir(workdir),
+            "exists": True,
+            "updated": updated.strftime(_TIME_FMT) if updated else "",
+            "sections": {
+                name: str(sections.get(name) or "").strip() for name in INJECT_SECTIONS
+            },
+        }
+    except Exception as exc:
+        logger.debug("读取项目状态失败：%s", exc)
+        return empty
+
+
+def set_section(workdir, section, content) -> bool:
+    """**整节覆盖**写入（GUI 编辑框提交的就是该节新正文）；空内容 = 清空该节。
+
+    与 ``append_section`` 的差别只在"替换 vs 追加"。章节非法抛 ``ValueError``
+    （调用方入参错误）；workdir 为空 / 写盘失败（含越界被拒）返回 ``False``。
+    """
+    section_name = str(section or "").strip()
+    if section_name not in SECTION_ALLOWED:
+        raise ValueError(
+            "不支持的章节：%s；可选：%s"
+            % (section_name or "(空)", "、".join(SECTION_ALLOWED))
+        )
+    path = profile_path(workdir)
+    if path is None:
+        return False
+    normalized = normalize_workdir(workdir)
+    stamp = datetime.now().strftime(_TIME_FMT)
+    existing = _read_text(path)
+    known: dict = {}
+    extras: List[Tuple[str, str]] = []
+    preamble = ""
+    for name, body in _split_blocks(_strip_frontmatter(existing)):
+        if not name:
+            preamble = body
+            continue
+        if name in SECTION_ORDER:
+            if name in known and known[name]:
+                known[name] = (known[name] + "\n" + body).strip() if body else known[name]
+            else:
+                known[name] = body
+            continue
+        extras.append((name, body))
+    known[section_name] = str(content or "").strip()
+    text = _render(normalized, known, extras, preamble, stamp)
+    return _write_text(path, text)
+
+
+# ---------------------------------------------------------------------------
+# 会话级「项目状态」注入（特性 1）
+# ---------------------------------------------------------------------------
+def _frontmatter_updated(text: str) -> Optional[datetime]:
+    """取 frontmatter 里的 ``updated:`` 时间；缺失或格式非法返回 ``None``。"""
+    lines = str(text or "").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if not stripped.startswith("updated:"):
+            continue
+        raw = stripped[len("updated:"):].strip()
+        for fmt in (_TIME_FMT, "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return None
+    return None
+
+
+def build_state_section(workdir, limit: int = DEFAULT_INJECTION_LIMIT) -> str:
+    """拼出会话级「项目状态」注入块（技术栈 / 架构决策 / 硬约束）。
+
+    与 ``build_injection``（派活用）同源同口径，差别只有三点：
+
+    - 头部带固定标题行，让模型知道这段是自动注入的背景；
+    - frontmatter ``updated`` 超过 ``STATE_STALE_DAYS`` 天时补「状态可能已过期」；
+    - 总长（标题 + 提示 + 正文）不超过 ``limit``；正文预算扣掉标题占用后
+      复用 ``build_injection`` 的截断逻辑。
+
+    任何异常 / 无画像 / 三节全空都返回空串，调用方据此"不注入"。
+    """
+    try:
+        try:
+            parsed_limit = int(limit)
+        except Exception:
+            parsed_limit = DEFAULT_INJECTION_LIMIT
+        if parsed_limit <= 0:
+            parsed_limit = DEFAULT_INJECTION_LIMIT
+        text = read_profile(workdir)
+        if not text.strip():
+            return ""
+        sections = _section_map(text)
+        if not any(str(sections.get(name) or "").strip() for name in INJECT_SECTIONS):
+            return ""
+        prefix: List[str] = [STATE_HEADER]
+        updated = _frontmatter_updated(text)
+        if updated is not None:
+            try:
+                age_days = (datetime.now() - updated).days
+            except Exception:
+                age_days = 0
+            if age_days > STATE_STALE_DAYS:
+                prefix.append(
+                    "（注意：本画像最近更新于 %s，已超过 %d 天，状态可能已过期，请与用户确认。）"
+                    % (updated.strftime("%Y-%m-%d"), STATE_STALE_DAYS)
+                )
+        occupied = sum(len(item) for item in prefix) + len(prefix)
+        budget = parsed_limit - occupied
+        if budget <= 0:
+            return ""
+        body = build_injection(workdir, budget)
+        if not body:
+            return ""
+        return "\n".join(prefix + [body])
+    except Exception as exc:
+        logger.debug("构建项目状态注入块失败：%s", exc)
+        return ""

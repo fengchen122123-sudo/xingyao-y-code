@@ -563,12 +563,14 @@ function durationText(r: { started_at?: string | null; finished_at?: string | nu
 
 <style scoped>
 .ap-wrap {
-  max-width: 960px;
+max-width: min(960px, 100%);
   margin: 0 auto;
+  min-width: 0;
 }
 .ap-banner {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   font-size: 12px;
   color: var(--text-dim);
@@ -578,6 +580,7 @@ function durationText(r: { started_at?: string | null; finished_at?: string | nu
   padding: 10px 14px;
   margin-bottom: 14px;
   line-height: 1.6;
+  max-width: 100%;
 }
 .ap-flex { flex: 1; }
 .ap-new { margin-left: auto; flex-shrink: 0; }
@@ -594,6 +597,7 @@ function durationText(r: { started_at?: string | null; finished_at?: string | nu
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 14px 16px;
+  max-width: 100%;
 }
 .ap-card-top { display: flex; align-items: center; gap: 10px; }
 .ap-name { font-size: 13.5px; font-weight: 600; }
@@ -661,6 +665,8 @@ function durationText(r: { started_at?: string | null; finished_at?: string | nu
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 16px;
+  min-width: 0;
+  max-width: 100%;
 }
 .ap-form-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
 .ap-form-errors {
@@ -689,9 +695,10 @@ function durationText(r: { started_at?: string | null; finished_at?: string | nu
 .ap-row input:focus, .ap-row select:focus, textarea:focus { border-color: var(--accent); }
 .ap-wrap textarea {
   width: 100%; box-sizing: border-box; resize: vertical; line-height: 1.6;
+  max-width: 100%;
 }
-.ap-row > input:first-child { flex: 1; min-width: 180px; }
-.ap-row select { min-width: 150px; }
+.ap-row > input:first-child { flex: 1 1 180px; min-width: 0; }
+.ap-row > input, .ap-row > select { min-width: 0; max-width: 100%; }
 .ap-unit { font-size: 11.5px; color: var(--text-faint); }
 .ap-workdir-hint { margin: -4px 0 10px; }
 .ap-weekday {

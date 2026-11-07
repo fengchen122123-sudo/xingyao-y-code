@@ -163,6 +163,8 @@ def test_list_themes_includes_builtin_and_user_summaries(tmp_path):
         {"id": "builtin.light", "name": "内置浅色", "appearance": "light", "extends": "builtin.light", "builtin": True},
         {"id": "builtin.qq2009", "name": "内置 QQ2009", "appearance": "light", "extends": "builtin.qq2009", "builtin": True},
         {"id": "builtin.field-notes", "name": "内置 田野笔记", "appearance": "light", "extends": "builtin.field-notes", "builtin": True},
+        {"id": "builtin.lamp", "name": "内置 深夜工位", "appearance": "dark", "extends": "builtin.lamp", "builtin": True},
+        {"id": "builtin.daybreak", "name": "内置 晨光", "appearance": "light", "extends": "builtin.daybreak", "builtin": True},
         {"id": "rose", "name": "rose", "appearance": "light", "extends": "builtin.light", "builtin": False},
     ]
 
@@ -186,7 +188,8 @@ def test_builtin_qq2009_theme_is_available_and_valid(tmp_path):
     assert copy["regions"]["statusbar"]["background"] == "#D5E5F4"
     assert copy["tokens"]["radius_medium"] == 5
     assert [item["id"] for item in repo.list_themes()] == [
-        "builtin.dark", "builtin.light", "builtin.qq2009", "builtin.field-notes", "qq2009-copy",
+        "builtin.dark", "builtin.light", "builtin.qq2009", "builtin.field-notes",
+        "builtin.lamp", "builtin.daybreak", "qq2009-copy",
     ]
 
 
@@ -208,6 +211,45 @@ def test_builtin_field_notes_theme_is_available_and_valid(tmp_path):
     assert copy["regions"]["workspace"]["background"] == "#EFEADB"
     assert copy["regions"]["statusbar"]["background"] == "#1D3A2F"
     assert copy["tokens"]["radius_medium"] == 2
+
+
+def test_builtin_lamp_theme_is_available_and_valid(tmp_path):
+    repo = make_repo(tmp_path)
+    theme = repo.get_theme("builtin.lamp")
+    assert theme["builtin"] is True
+    assert theme["name"] == "内置 深夜工位"
+    assert theme["appearance"] == "dark"
+    assert set(theme["regions"]) == set(REGION_IDS)
+    assert theme["tokens"]["accent"] == "#D9A05B"
+    assert theme["tokens"]["background_app"] == "#131210"
+    assert theme["native_titlebar"]["mode"] == "dark"
+    # 复制路径会对清单走完整 Schema 校验：借此证明内置深夜工位的取值合法、可派生用户主题
+    copy = repo.copy_theme("builtin.lamp", "lamp-copy", "深夜工位副本")
+    assert copy["builtin"] is False
+    assert copy["extends"] == "builtin.lamp"
+    assert copy["regions"]["sidebar"]["background"] == "#161512"
+    assert copy["regions"]["workspace"]["background"] == "#131210"
+    assert copy["regions"]["statusbar"]["background"] == "#181714"
+    assert copy["tokens"]["radius_large"] == 12
+
+
+def test_builtin_daybreak_theme_is_available_and_valid(tmp_path):
+    repo = make_repo(tmp_path)
+    theme = repo.get_theme("builtin.daybreak")
+    assert theme["builtin"] is True
+    assert theme["name"] == "内置 晨光"
+    assert theme["appearance"] == "light"
+    assert set(theme["regions"]) == set(REGION_IDS)
+    assert theme["tokens"]["accent"] == "#9C5B33"
+    assert theme["tokens"]["background_app"] == "#F7F5F0"
+    assert theme["native_titlebar"]["mode"] == "light"
+    # 复制路径会对清单走完整 Schema 校验：借此证明内置晨光的取值合法、可派生用户主题
+    copy = repo.copy_theme("builtin.daybreak", "daybreak-copy", "晨光副本")
+    assert copy["builtin"] is False
+    assert copy["extends"] == "builtin.daybreak"
+    assert copy["regions"]["sidebar"]["background"] == "#F4F1EB"
+    assert copy["regions"]["workspace"]["background"] == "#F7F5F0"
+    assert copy["tokens"]["radius_large"] == 12
 
 
 def test_old_light_flag_migrates_once(tmp_path):

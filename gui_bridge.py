@@ -4879,6 +4879,51 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.exception("save_novel_chapter 失败")
             return {"ok": False, "error": str(e)}
 
+    def get_project_profile(self, workdir: str) -> Dict[str, Any]:
+        """读取当前项目的画像三节（技术栈 / 架构决策 / 硬约束），供右侧面板展示。
+
+        业务逻辑全部委托 core.project_profile.read_state（只读、不写文件）；
+        本方法只做目录校验与异常兜底，不复制解析口径。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw.upper() == "GLOBAL":
+                return {"ok": False, "error": "当前会话没有归属项目目录（自由对话分组不记录项目状态）"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            state = project_profile.read_state(path)
+            state["ok"] = True
+            return state
+        except Exception as e:
+            logger.exception("get_project_profile 失败")
+            return {"ok": False, "error": str(e)}
+
+    def save_project_profile(self, workdir: str, section: str, content: str) -> Dict[str, Any]:
+        """整节覆盖保存画像的一节，返回保存后的结构化状态（同 get_project_profile）。
+
+        写入一律走 core.project_profile.set_section：路径只能落在
+        ``~/.ycode/memory/projects/``，越界由它直接拒绝（回 ok=False），本方法
+        不做任何自建路径拼接。
+        """
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw.upper() == "GLOBAL":
+                return {"ok": False, "error": "当前会话没有归属项目目录（自由对话分组不记录项目状态）"}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": False, "error": f"项目文件夹不存在: {raw}"}
+            if not project_profile.set_section(path, section, content):
+                return {"ok": False, "error": "项目状态没有写成（写入被拒绝或目录不可写）"}
+            state = project_profile.read_state(path)
+            state["ok"] = True
+            return state
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            logger.exception("save_project_profile 失败")
+            return {"ok": False, "error": str(e)}
+
     def list_novel_projects(self, workdir: str) -> Dict[str, Any]:
         """列出工作区内的小说项目（多书切换数据源）。
 
@@ -7809,6 +7854,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     def _auto_deny_automation_permission(self, request, label: Dict[str, str]) -> None:
         """星轨自动化回合的权限请求自动拒绝：定位拒绝项，找不到则按取消收尾。"""
         task_name = str(label.get("task_name") or "星轨自动化任务")
+        # 归属会话：提示只进任务自己的会话，避免串到用户正在看的其他窗口
+        # （空串与 post_notice 一致：前端视作缺省，落当前会话）
+        notice_session = str(label.get("session_name") or "")
         try:
             if request.function_name == "ask_user":
                 # 提问类没有"拒绝项"概念：与人工回合超时语义一致走取消，
@@ -7824,6 +7872,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         f"星轨自动化任务「{task_name}」无人值守已自动取消提问："
                         "模型可在无人应答时自行继续。"
                     ),
+                    "session_name": notice_session,
                 })
                 return
             deny_key = next(
@@ -7855,6 +7904,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     f"{request.function_name}。如需放行，请在任务设置中选择"
                     "accept_edits/full 档位。"
                 ),
+                "session_name": notice_session,
             })
         except Exception:
             logger.exception("自动化权限自动拒绝失败")
@@ -10690,9 +10740,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 星轨自动化：登记 turn_id → 任务名（无人值守权限自动拒绝依据），
             # 并把 turn_id 回填到运行记录供追踪
             if automation_run_id:
+                # session_name 一并登记：无人值守拒绝提示要按归属会话路由，
+                # 缺省会落到用户当时正在查看的会话（跨会话串扰）
                 self._automation_turn_labels[turn_id] = {
                     "run_id": automation_run_id,
                     "task_name": automation_task_name,
+                    "session_name": session_name,
                 }
                 try:
                     self._automation_storage.set_run_turn_id(automation_run_id, turn_id)

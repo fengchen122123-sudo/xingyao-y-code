@@ -1661,6 +1661,18 @@ export interface NovelChapterSaveDto {
   visible_chars?: number;
 }
 
+// get_project_profile / save_project_profile（特性 1）：项目画像三节的结构化视图。
+// exists=false 表示该项目还没写过画像；sections 恒含三节（缺的为空串），
+// updated 是 frontmatter 时间原文（缺失为空串）。
+export interface ProjectProfileDto {
+  ok?: boolean;
+  error?: string;
+  workdir?: string;
+  exists?: boolean;
+  updated?: string;
+  sections?: Record<string, string>;
+}
+
 // list_novel_projects 单个小说项目（多书切换用）。path 是相对工作区的 posix
 // 路径，工作区自身（.novel.json 在根目录）为 "."；chapters_written 只给章数，
 // 不逐章读正文（只读扫描，快）。
@@ -1710,6 +1722,16 @@ export interface PyWebViewAPI {
     chapter: number | string,
     content: string,
   ): Promise<NovelChapterSaveDto>;
+  // 项目状态（特性 1）：读当前项目画像三节（技术栈 / 架构决策 / 硬约束）。
+  // 后端委托 core.project_profile.read_state，只读不写；失败回 { ok:false, error }
+  get_project_profile(workdir: string): Promise<ProjectProfileDto>;
+  // 整节覆盖保存（空内容 = 清空该节）：写入位置只能在
+  // ~/.ycode/memory/projects/ 下，越界由后端拒绝；成功回保存后的同结构状态
+  save_project_profile(
+    workdir: string,
+    section: string,
+    content: string,
+  ): Promise<ProjectProfileDto>;
   // 列出工作区内的小说项目（多书切换数据源）：只读扫描 .novel.json，不逐章
   // 读正文；工作区自身不是小说项目时 projects 为空数组，不算错误
   list_novel_projects(workdir: string): Promise<NovelProjectListDto>;

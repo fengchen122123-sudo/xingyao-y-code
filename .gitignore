@@ -164,7 +164,14 @@ gzh-tokenrhythm/
 _day3_imggen.py
 
 # 随包第三方二进制：ffmpeg.exe 约 96MB，体积过大不入库，按需本地下载（来源与 SHA256 见 vendor/VENDOR_MANIFEST.json）
-/vendor/ffmpeg/
+# 注意用 `/vendor/ffmpeg/*` 而不是 `/vendor/ffmpeg/`：后者会连目录本身一起排除，
+# 白名单规则对已被排除目录内的文件不生效。
+#
+# NOTICE.txt 必须入库（白名单例外）：它承载 GPLv3 的分发义务（许可证全文 +
+# 源码获取方式），同时是 build_release.py::step0d 产出 ffmpeg 组件包时的必需
+# 文件（FFMPEG_COMPONENT_FILES）。它只是文本，不占体积，没有任何理由不入库。
+/vendor/ffmpeg/*
+!/vendor/ffmpeg/NOTICE.txt
 # 误操作产生的空文件（2026-10-17 命令重定向写坏），不入库
 /'
 
