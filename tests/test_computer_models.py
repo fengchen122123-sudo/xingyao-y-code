@@ -583,6 +583,8 @@ def test_capability_and_enums_have_design_values():
         "sequence",
         # 2026-09-06 协议扩展：UIA 元素观察与元素引用动作（提速计划 Task 10）。
         "list_elements", "click_element", "set_value_element",
+        # 2026-11-09 协议扩展（Windows-MCP 对齐）：desktop 条件等待。
+        "wait_for",
     }
     capability = ComputerCapability(
         enabled=True, protocol="generic", targets=("browser", "desktop"),

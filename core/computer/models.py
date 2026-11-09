@@ -77,6 +77,9 @@ class ComputerActionKind(str, Enum):
     LIST_ELEMENTS = "list_elements"
     CLICK_ELEMENT = "click_element"
     SET_VALUE_ELEMENT = "set_value_element"
+    # Windows-MCP 对齐（2026-11-09 协议扩展，desktop only）：条件等待，
+    # 按 condition 轮询界面直到命中或超时，替代 wait 加反复 observe。
+    WAIT_FOR = "wait_for"
 
 
 class ComputerControlError(Exception):
@@ -135,6 +138,13 @@ class ComputerAction:
     # 阶段二元素引用动作（click_element/set_value_element）引用的控件 ref；
     # 仅在最近一次 list_elements 后有效，普通动作恒为 None。
     element_ref: str | None = None
+    # wait_for 条件等待（2026-11-09 协议扩展，desktop only）：condition 取值见
+    # actions.WAIT_FOR_CONDITIONS，window_name 限定窗口标题子串，timeout_ms/
+    # interval_ms 为总等待上限与轮询间隔；非 wait_for 动作这四项恒为 None。
+    condition: str | None = None
+    window_name: str | None = None
+    timeout_ms: int | None = None
+    interval_ms: int | None = None
 
 
 @dataclass(frozen=True)

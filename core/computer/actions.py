@@ -48,6 +48,12 @@ _ALLOWED = {
     "list_elements": _COMMON,
     "click_element": _COMMON | {"element_ref"},
     "set_value_element": _COMMON | {"element_ref", "text"},
+    # Windows-MCP 对齐（2026-11-09 协议扩展，desktop only）条件等待：
+    # 按 condition 轮询界面直到命中或超时，元素引用必须来自最近一次
+    # list_elements；不提供 duration_ms（那是 wait 的固定休眠语义）。
+    "wait_for": _COMMON | {
+        "condition", "text", "window_name", "element_ref", "timeout_ms", "interval_ms",
+    },
 }
 
 _TARGETS = ("browser", "desktop")
@@ -57,7 +63,7 @@ _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
 # 走同一套 Playwright locator 通路；list_elements 仍为桌面专属（浏览器版职责
 # 由 observe 直接承担，不提供独立动作，见设计规格 3.1）。
 _DESKTOP_ONLY_KINDS = frozenset(
-    {"list_surfaces", "activate_surface", "invoke_surface", "list_elements"}
+    {"list_surfaces", "activate_surface", "invoke_surface", "list_elements", "wait_for"}
 )
 _BUTTONS = frozenset({"left", "right", "middle"})
 _REASON_CODES = frozenset({"login_required", "captcha_required", "credential_required"})
@@ -78,6 +84,21 @@ MAX_WAIT_MS = 10000
 MAX_KEYS = 8
 MIN_PATH_POINTS = 2
 MAX_PATH_POINTS = 256
+
+# wait_for 条件等待（Windows-MCP 对齐，2026-11-09 协议扩展，desktop only）：
+# - condition 缺省 text_exists；每个条件只认自己的必填字段，无关字段拒绝；
+# - text / window_name 为 1~MAX_WAIT_FOR_NAME_CODEPOINTS 个字符；window_name
+#   在非 window_active 条件下可选作范围限定；
+# - timeout_ms / interval_ms 有默认值，越界直接拒绝（不裁剪、不静默收敛）。
+WAIT_FOR_CONDITIONS = ("text_exists", "element_exists", "element_enabled", "window_active")
+WAIT_FOR_DEFAULT_CONDITION = "text_exists"
+WAIT_FOR_DEFAULT_TIMEOUT_MS = 8000
+WAIT_FOR_DEFAULT_INTERVAL_MS = 300
+MIN_WAIT_FOR_TIMEOUT_MS = 1000
+MAX_WAIT_FOR_TIMEOUT_MS = 30000
+MIN_WAIT_FOR_INTERVAL_MS = 100
+MAX_WAIT_FOR_INTERVAL_MS = 2000
+MAX_WAIT_FOR_NAME_CODEPOINTS = 200
 
 # sequence 批量动作（2026-09-06 协议扩展）：
 # - 子步骤白名单：无副作用定位的基本输入动作。observe/request_user_takeover
@@ -178,6 +199,36 @@ COMPUTER_ACTION_TOOL_SCHEMA = {
                     "type": "string",
                     "minLength": 1,
                     "description": "元素引用（来自最近一次 list_elements 返回的 ref）",
+                },
+                "condition": {
+                    "type": "string",
+                    "enum": list(WAIT_FOR_CONDITIONS),
+                    "description": (
+                        "wait_for 的等待条件，缺省 text_exists：text_exists 需 text；"
+                        "element_exists/element_enabled 需 element_ref；"
+                        "window_active 需 window_name"
+                    ),
+                },
+                "window_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_WAIT_FOR_NAME_CODEPOINTS,
+                    "description": (
+                        "wait_for：窗口标题子串（window_active 必填，"
+                        "其余条件可选作范围限定）"
+                    ),
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": MIN_WAIT_FOR_TIMEOUT_MS,
+                    "maximum": MAX_WAIT_FOR_TIMEOUT_MS,
+                    "description": "wait_for：总等待上限（毫秒，默认 8000）",
+                },
+                "interval_ms": {
+                    "type": "integer",
+                    "minimum": MIN_WAIT_FOR_INTERVAL_MS,
+                    "maximum": MAX_WAIT_FOR_INTERVAL_MS,
+                    "description": "wait_for：轮询间隔（毫秒，默认 300）",
                 },
                 "steps": {
                     "type": "array",
@@ -456,6 +507,77 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
         if not isinstance(ref, str) or not ref:
             raise _invalid(f"{kind} 需要非空 element_ref（来自最近一次 list_elements）")
         kwargs["element_ref"] = ref
+
+    if kind == "wait_for":
+        # 条件等待（Windows-MCP 对齐，desktop only）：condition 缺省 text_exists；
+        # 每个条件只认自己的必填字段，不属于该条件的字段一律拒绝（不静默忽略），
+        # timeout_ms / interval_ms 越界直接拒绝，不裁剪也不静默收敛。
+        condition = payload.get("condition", WAIT_FOR_DEFAULT_CONDITION)
+        if not isinstance(condition, str) or condition not in WAIT_FOR_CONDITIONS:
+            raise _invalid(
+                f"wait_for 的 condition 只支持 {list(WAIT_FOR_CONDITIONS)}，"
+                f"收到 {condition!r}"
+            )
+        kwargs["condition"] = condition
+        if condition == "text_exists":
+            text = payload.get("text")
+            if (
+                not isinstance(text, str)
+                or not 1 <= len(text) <= MAX_WAIT_FOR_NAME_CODEPOINTS
+            ):
+                raise _invalid(
+                    "wait_for 的 text_exists 需要 text"
+                    f"（1-{MAX_WAIT_FOR_NAME_CODEPOINTS} 个字符）"
+                )
+            kwargs["text"] = text
+        elif "text" in payload:
+            raise _invalid(
+                f"wait_for 的 {condition} 不接受 text，只有 text_exists 使用 text"
+            )
+        if condition in ("element_exists", "element_enabled"):
+            ref = payload.get("element_ref")
+            if not isinstance(ref, str) or not ref:
+                raise _invalid(
+                    f"wait_for 的 {condition} 需要非空 element_ref"
+                    "（来自最近一次 list_elements）"
+                )
+            kwargs["element_ref"] = ref
+        elif "element_ref" in payload:
+            raise _invalid(
+                f"wait_for 的 {condition} 不接受 element_ref，"
+                "只有 element_exists / element_enabled 使用 element_ref"
+            )
+        if "window_name" in payload:
+            window_name = payload["window_name"]
+            if (
+                not isinstance(window_name, str)
+                or not 1 <= len(window_name) <= MAX_WAIT_FOR_NAME_CODEPOINTS
+            ):
+                raise _invalid(
+                    "wait_for 的 window_name 需要 1-"
+                    f"{MAX_WAIT_FOR_NAME_CODEPOINTS} 个字符"
+                )
+            kwargs["window_name"] = window_name
+        elif condition == "window_active":
+            raise _invalid("wait_for 的 window_active 需要 window_name（窗口标题子串）")
+        timeout_ms = _strict_int(
+            payload.get("timeout_ms", WAIT_FOR_DEFAULT_TIMEOUT_MS), "timeout_ms"
+        )
+        if not MIN_WAIT_FOR_TIMEOUT_MS <= timeout_ms <= MAX_WAIT_FOR_TIMEOUT_MS:
+            raise _invalid(
+                f"wait_for 的 timeout_ms 必须在 {MIN_WAIT_FOR_TIMEOUT_MS}-"
+                f"{MAX_WAIT_FOR_TIMEOUT_MS} 毫秒之间"
+            )
+        interval_ms = _strict_int(
+            payload.get("interval_ms", WAIT_FOR_DEFAULT_INTERVAL_MS), "interval_ms"
+        )
+        if not MIN_WAIT_FOR_INTERVAL_MS <= interval_ms <= MAX_WAIT_FOR_INTERVAL_MS:
+            raise _invalid(
+                f"wait_for 的 interval_ms 必须在 {MIN_WAIT_FOR_INTERVAL_MS}-"
+                f"{MAX_WAIT_FOR_INTERVAL_MS} 毫秒之间"
+            )
+        kwargs["timeout_ms"] = timeout_ms
+        kwargs["interval_ms"] = interval_ms
 
     return ComputerAction(**kwargs)
 
