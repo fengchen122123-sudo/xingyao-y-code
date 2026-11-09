@@ -26,7 +26,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
-from core.computer.actions import MAX_WAIT_MS, MIN_WAIT_MS
+from core.computer.actions import (
+    MAX_WAIT_MS,
+    MIN_WAIT_MS,
+    WAIT_FOR_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_DEFAULT_TIMEOUT_MS,
+)
 from core.computer.models import (
     ComputerAction,
     ComputerControlError,
@@ -328,6 +333,9 @@ class WindowsComputerBackend:
 
     def execute(self, run_id: str, action: ComputerAction) -> None:
         wait_duration: int | None = None
+        # wait_for（2026-11-09 Windows-MCP 对齐）：锁内只记录动作本体，轮询在
+        # 锁外进行——条件等待最长 30s，持锁会阻塞 close/停止收尾（与 wait 同层）。
+        wait_for_action: ComputerAction | None = None
         with self._lock:
             self._ensure_started_locked()
             if action.target != "desktop":
@@ -360,6 +368,10 @@ class WindowsComputerBackend:
                         f"duration_ms 必须在 {MIN_WAIT_MS}-{MAX_WAIT_MS} 毫秒之间",
                     )
                 wait_duration = duration
+            elif kind == "wait_for":
+                # 只读条件等待：不改变界面状态，不需要画面基线（不要求先 observe），
+                # 但每次动作前的 interactive desktop 检查已在上面做过。
+                wait_for_action = action
             elif kind in _ELEMENT_KINDS:
                 self._dispatch_element_locked(action)
                 return
@@ -379,7 +391,11 @@ class WindowsComputerBackend:
                 self._dispatch_locked(action)
                 return
         # R8：wait 在锁外分片等待，close 可收尾、停止可中断。
-        if wait_duration is not None:
+        if wait_for_action is not None:
+            self._wait_for_interruptible(
+                int(self._adapter.foreground_window_id()), wait_for_action
+            )
+        elif wait_duration is not None:
             self._wait_interruptible(wait_duration)
 
     # ---------------- 阶段二：UIA 元素观察与元素引用动作 ----------------
@@ -629,6 +645,80 @@ class WindowsComputerBackend:
                 raise ComputerControlError(
                     "computer_cancelled", "显式等待被停止中断"
                 )
+
+    # ---------------- wait_for：只读条件轮询（锁外执行） ----------------
+
+    def _wait_for_interruptible(self, hwnd: int, action: ComputerAction) -> None:
+        """按 interval_ms 分片轮询只读条件，直到命中或超时（锁外执行）。
+
+        设计红线（2026-11-09 设计 5.1 / 计划 Task 2 硬约束）：轮询**绝不**调用
+        ``element_locator.collect``——collect 会整体替换 ref 全集
+        （windows_elements_uia.py 的 collect 末尾 ``self._elements = elements``），
+        模型手里的 el-N 会在等待期间全部失效。这里只走 ``locator.probe`` 的只读
+        探测，全程不重建映射、不重新编号。
+
+        分片语义：每片不超过 interval_ms，且不超过剩余时间；每片都用
+        ``_stop_event.wait`` 等待，停止/关闭立即中断（computer_cancelled），
+        绝不空转到超时。超时抛 computer_wait_timeout，message 提示改用 observe。
+        """
+        condition = str(action.condition or "text_exists")
+        timeout_ms = int(action.timeout_ms or WAIT_FOR_DEFAULT_TIMEOUT_MS)
+        interval_ms = int(action.interval_ms or WAIT_FOR_DEFAULT_INTERVAL_MS)
+        matcher = {
+            "condition": condition,
+            "text": action.text,
+            "element_ref": action.element_ref,
+        }
+        window_name = str(action.window_name or "").casefold()
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            if self._stop_event.is_set():
+                raise ComputerControlError(
+                    "computer_cancelled", "条件等待被停止中断"
+                )
+            if self._wait_for_match(int(hwnd), condition, matcher, window_name):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ComputerControlError(
+                    "computer_wait_timeout",
+                    f"条件 {condition} 未在 {timeout_ms} ms 内满足；"
+                    "可改用 observe 检查当前画面（或调整 text/window_name 后重试）",
+                )
+            if self._stop_event.wait(min(interval_ms / 1000, remaining)):
+                raise ComputerControlError(
+                    "computer_cancelled", "条件等待被停止中断"
+                )
+
+    def _wait_for_match(
+        self, hwnd: int, condition: str, matcher: dict, window_name: str
+    ) -> dict | None:
+        """单轮条件检查：window_active 走顶层窗口标题，其余走只读 probe。"""
+        if condition == "window_active":
+            if not window_name:
+                return None
+            for title in self._adapter.list_top_window_titles() or ():
+                folded = str(title).casefold()
+                if window_name in folded:
+                    return {"condition": condition, "title": str(title)}
+            return None
+        if window_name:
+            # window_name 作范围限定：前台窗口标题不含该子串时本轮不命中
+            # （不切换窗口、不激活任何窗口，纯只读判断）。
+            try:
+                title = str(self._adapter.foreground_window_title() or "").casefold()
+            except Exception:
+                _LOGGER.exception("读取前台窗口标题失败")
+                title = ""
+            if window_name not in title:
+                return None
+        locator = self._element_locator
+        if locator is None:
+            raise ComputerControlError(
+                "computer_elements_unavailable",
+                "当前桌面 backend 未提供 UIA 元素探测能力，无法执行该等待条件",
+            )
+        return locator.probe(int(hwnd), matcher)
 
     def _surface_signature_current_locked(
         self, origin_x: int, origin_y: int, width: int, height: int

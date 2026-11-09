@@ -364,6 +364,33 @@ def _ctypes_window_title(hwnd: int) -> str:
     return str(buffer.value)
 
 
+def _ctypes_top_window_titles() -> tuple[str, ...]:
+    """枚举可见且有标题的顶层窗口标题（wait_for window_active 的只读探测）。
+
+    ctypes EnumWindows + IsWindowVisible + GetWindowTextW；隐藏窗口、无标题窗口
+    （大量壳窗口/工具窗口）一律跳过。HWND 只在本函数内使用，绝不外传。
+    """
+    user32 = ctypes.windll.user32
+    titles: list[str] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _on_window(hwnd, _lparam):  # noqa: ANN001 - ctypes 回调签名固定
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = int(user32.GetWindowTextLengthW(hwnd))
+        if length <= 0:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        title = str(buffer.value or "").strip()
+        if title:
+            titles.append(title)
+        return True
+
+    user32.EnumWindows(_on_window, 0)
+    return tuple(titles)
+
+
 def _ctypes_system_metrics(index: int) -> int:
     return int(ctypes.windll.user32.GetSystemMetrics(index))
 
@@ -411,6 +438,7 @@ class Win32InputAdapter:
         set_clipboard_text: Callable[[str], None] | None = None,
         window_from_point: Callable[[int, int], int] | None = None,
         set_foreground_window: Callable[[int], bool] | None = None,
+        list_top_window_titles: Callable[[], tuple[str, ...]] | None = None,
     ) -> None:
         self._send_input = send_input if send_input is not None else _ctypes_send_input
         if platform is None:
@@ -449,6 +477,11 @@ class Win32InputAdapter:
         )
         self._set_foreground = (
             set_foreground_window if set_foreground_window is not None else _ctypes_set_foreground_window
+        )
+        self._list_top_window_titles = (
+            list_top_window_titles
+            if list_top_window_titles is not None
+            else _ctypes_top_window_titles
         )
         self._pressed_keys: list[str] = []
         self._pressed_buttons: set[str] = set()
@@ -524,6 +557,21 @@ class Win32InputAdapter:
         """
         hwnd = self._get_foreground_window()
         return int(hwnd) if hwnd else 0
+
+    def list_top_window_titles(self) -> tuple[str, ...]:
+        """枚举可见且有标题的顶层窗口标题（wait_for window_active 只读探测）。
+
+        best-effort：枚举失败返回空元组并留痕——条件等待会继续轮询到超时，
+        绝不因为一次枚举异常直接判失败。只返回非空字符串标题。
+        """
+        try:
+            titles = self._list_top_window_titles()
+        except Exception:
+            _LOGGER.exception("枚举顶层窗口标题失败")
+            return ()
+        return tuple(
+            str(title) for title in (titles or ()) if isinstance(title, str) and title
+        )
 
     def window_from_point(self, x: int, y: int) -> int:
         """物理坐标点所属顶层窗口 HWND（通用化重构 Task C 输入前置激活）。
