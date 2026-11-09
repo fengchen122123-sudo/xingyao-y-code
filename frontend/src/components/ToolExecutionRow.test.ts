@@ -77,7 +77,7 @@ function runningRowWithoutDuration(): ToolTraceRow {
 
 function subagentRow(): ToolTraceRow {
   return {
-    id: 'sub-1', kind: 'tool', status: 'running', action: '运行子代理',
+    id: 'sub-1', kind: 'subagent', status: 'running', action: '运行子代理',
     detail: '', command: '', errorSummary: '', count: 1,
     metrics: {},
     calls: [{
@@ -152,8 +152,9 @@ describe('ToolExecutionRow', () => {
     expect(wrapper.get('.trace-meta').text()).toBe('5.0s');
   });
 
-  it('renders run_subagent task snapshots after expanding', async () => {
+it('labels a run_subagent row as 星舰 instead of 工具', async () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: subagentRow() } });
+    expect(wrapper.get('.trace-kind').text()).toBe('星舰');
     await wrapper.get('[data-row-toggle]').trigger('click');
     const tasks = wrapper.findAll('.subagent-task');
     expect(tasks).toHaveLength(2);

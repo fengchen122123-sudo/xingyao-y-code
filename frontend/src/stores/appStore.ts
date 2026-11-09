@@ -6462,16 +6462,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
         } else {
           (msg.legacy_diffs ??= []).push(diff);
         }
-      } else if (type === 'subagent_progress') {
+        } else if (type === 'subagent_progress') {
         const d = data as SubagentProgressEventData;
-        // 快照归属到当前仍在串行运行的 run_subagent 调用；该调用完成后
-        // 不再接受更新，最后一次快照自然冻结在调用上
+        // 快照按「派生它的 run_subagent 调用」分组：每张卡片只展示自己创建
+        // 的子代理，绝不把会话内所有（含历史）子代理堆到同一张卡上。
         const last = this.messages[this.messages.length - 1];
         if (!last || last.role !== 'assistant') return;
-        const target = [...(last.tool_calls || [])]
-          .reverse()
-          .find(c => c.name === 'run_subagent' && !c.result);
-        if (!target) return;
+        const calls = (last.tool_calls || []).filter(c => c.name === 'run_subagent');
+        if (!calls.length) return;
         const snapshots = (d.tasks || []).map((t: any): SubagentTaskSnapshot => ({
           id: String(t.id || ''),
           description: String(t.description || ''),
@@ -6481,6 +6479,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           elapsed: Number(t.elapsed || 0),
           ...(t.type ? { type: String(t.type) } : {}),
           ...(t.background ? { background: true } : {}),
+          ...(t.tool_call_id ? { tool_call_id: String(t.tool_call_id) } : {}),
           ...(Array.isArray(t.stages) ? {
             stages: t.stages.map((s: any) => ({
               name: String(s.name || ''),
@@ -6489,7 +6488,29 @@ navItems: [] as Array<{ id: number; preview: string }>,
             })),
           } : {}),
         }));
-        target.subagent_tasks = snapshots;
+        // 按调用 id 分组后整体替换（事件每轮携带全会话快照，追加会重复）；
+        // 无归属 id 的快照（后台任务 / 旧后端）沿用旧语义：挂到仍在串行
+        // 运行的那个调用上。有归属 id 但不在本条消息里的，属于更早回合的
+        // 卡片，这里不重复展示（否则又退化回"全会话聚合"）。
+        const orphans: SubagentTaskSnapshot[] = [];
+        const grouped = new Map<string, SubagentTaskSnapshot[]>();
+        for (const snapshot of snapshots) {
+          if (!snapshot.tool_call_id) {
+            orphans.push(snapshot);
+            continue;
+          }
+          const bucket = grouped.get(snapshot.tool_call_id) ?? [];
+          bucket.push(snapshot);
+          grouped.set(snapshot.tool_call_id, bucket);
+        }
+        for (const call of calls) {
+          const own = grouped.get(call.id);
+          if (own) call.subagent_tasks = own;
+        }
+        if (orphans.length) {
+          const target = [...calls].reverse().find(c => !c.result);
+          if (target) target.subagent_tasks = orphans;
+        }
         this.subagentTasks = snapshots;
       } else if (type === 'background_subagent_terminal') {
         const statusLabel: Record<string, string> = {

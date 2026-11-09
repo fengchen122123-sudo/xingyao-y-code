@@ -199,8 +199,11 @@ describe('buildToolTraceRows', () => {
       displayedCall('agent-2', 'run_subagent', 'other', true),
     ]);
 
-    expect(rows.map((row) => row.kind)).toEqual(['mutation', 'mutation', 'tool', 'tool']);
+    // run_subagent 单独一类（对话区显示为「星舰」）：不并入普通工具、也不聚合
+    expect(rows.map((row) => row.kind)).toEqual(['mutation', 'mutation', 'subagent', 'subagent']);
     expect(rows.every((row) => row.count === 1)).toBe(true);
+    expect(rows[2].id).toBe('subagent:agent-1');
+    expect(rows[3].id).toBe('subagent:agent-2');
   });
 
   it('preserves a diff only on its explicitly bound call', () => {
@@ -278,7 +281,7 @@ describe('buildToolTraceRows', () => {
     const rows = buildToolTraceRows([displayedCall('', 'run_subagent', 'other')]);
 
     expect(rows).toHaveLength(1);
-    expect(rows[0].id).toBe('tool:missing-1');
+    expect(rows[0].id).toBe('subagent:missing-1');
     expect(rows[0].calls[0].id).toBe('');
   });
 });

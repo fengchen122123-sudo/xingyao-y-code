@@ -127,3 +127,44 @@ def test_subagent_progress_poller_emits_stage_history(monkeypatch):
     assert all(s["at"] > 0 for s in tool_stages)
     # s2 的任务不进本次推送
     assert all(t["description"] != "其他会话任务" for t in data["tasks"])
+
+
+def test_subagent_progress_poller_carries_tool_call_id(monkeypatch):
+    """子代理归属信息（派生它的 run_subagent 调用 id）必须随进度事件推送。
+
+    前端据此把每张卡片限定在自己创建的子代理上；缺这个字段就会退回
+    "全会话子代理聚合成一块"的旧行为。
+    """
+    manager = SubagentManager(runner=lambda record: "结果正文")
+    manager.run(
+        "归属任务的子代理",
+        "s1",
+        "t1",
+        timeout_seconds=30,
+        tool_call_id="call-abc123",
+    )
+    manager.wait_for_idle(2)
+    bridge = _bare_bridge(monkeypatch, manager)
+    captured = []
+    monkeypatch.setattr(bridge, "emit_event", lambda kind, data: captured.append((kind, data)))
+    stop = threading.Event()
+    stop.set()
+
+    bridge._subagent_progress_poller("s1", stop)
+
+    kind, data = captured[0]
+    assert kind == "subagent_progress"
+    assert [t["tool_call_id"] for t in data["tasks"]] == ["call-abc123"]
+
+
+def test_tool_call_scope_stamps_and_restores_current_call_id():
+    """工具调用 id 的线程级绑定必须可嵌套且退出后恢复（否则串卡）。"""
+    from core import app_context
+
+    assert app_context.get_thread_tool_call_id() is None
+    with app_context.tool_call_scope("call-outer"):
+        assert app_context.get_thread_tool_call_id() == "call-outer"
+        with app_context.tool_call_scope("call-inner"):
+            assert app_context.get_thread_tool_call_id() == "call-inner"
+        assert app_context.get_thread_tool_call_id() == "call-outer"
+    assert app_context.get_thread_tool_call_id() is None

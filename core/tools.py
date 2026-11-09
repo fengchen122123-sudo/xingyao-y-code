@@ -3133,6 +3133,9 @@ class SubagentTaskSnapshot:
     execution_elapsed: float
     approval_wait_elapsed: float
     partial_result: str = ""
+    # 派生该子代理的工具调用 id（run_subagent 的 call_id）。GUI 卡片按此
+    # 把子代理归属到自己那张卡上，不再把会话内所有子代理堆在一张卡里。
+    tool_call_id: str = ""
 
 
 @dataclass
@@ -3142,6 +3145,8 @@ class SubagentTask:
     parent_turn_id: str
     description: str
     workdir: str = ""
+    # 派生该子代理的工具调用 id（见 SubagentTaskSnapshot.tool_call_id）
+    tool_call_id: str = ""
     subagent_type: str = "general"
     plan_item_id: str = ""
     run_in_background: bool = False
@@ -3384,6 +3389,7 @@ class SubagentManager:
         model_config: tuple | None = None,
         event_callback: Callable | None = None,
         task_id: str | None = None,
+        tool_call_id: str = "",
     ) -> str:
         """运行一个子代理任务。
 
@@ -3424,6 +3430,7 @@ class SubagentManager:
             parent_turn_id=str(parent_turn_id or ""),
             description=description,
             workdir=str(get_workdir()),
+            tool_call_id=str(tool_call_id or ""),
             subagent_type=normalized_type,
             plan_item_id=str(plan_item_id or ""),
             run_in_background=bool(run_in_background),
@@ -4224,6 +4231,7 @@ class SubagentManager:
             execution_elapsed=task.execution_elapsed,
             approval_wait_elapsed=task.approval_wait_elapsed,
             partial_result=task.partial_result,
+            tool_call_id=task.tool_call_id,
         )
 
     def _record_partial(self, task_id: str, text: str) -> None:
@@ -4695,6 +4703,20 @@ def make_authorized_verification_runner(
     return authorized_verification_runner
 
 
+def _current_tool_call_id() -> str:
+    """当前线程正在执行的工具调用 id（由工具管线在调用期间绑定）。
+
+    取不到时返回空串：子代理任务仍会创建，只是 GUI 卡片无法按调用分组
+    （CLI 调用、测试直连等非工具链路径）。
+    """
+    try:
+        import core.app_context as _app_context
+
+        return str(_app_context.get_thread_tool_call_id() or "")
+    except Exception:
+        return ""
+
+
 def run_subagent(
     task_description,
     run_in_background=False,
@@ -5001,6 +5023,9 @@ def run_subagent(
             terminal_callback=terminal_callback if scheduler is not None else None,
             event_callback=event_callback,
             task_id=delegated_task_id if scheduler is not None else None,
+            # 归属到派生本任务的 run_subagent 调用：GUI 每张卡片只展示
+            # 自己创建的子代理。取不到（CLI/非工具链调用）时留空。
+            tool_call_id=_current_tool_call_id(),
         )
     except Exception as error:
         # 启动失败（如容量满）时回滚计划项，释放 _in_flight_files 占用

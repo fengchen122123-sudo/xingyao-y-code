@@ -376,6 +376,39 @@ def get_thread_session() -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 工具调用归属（子代理卡片按派生它的调用分组）
+# ---------------------------------------------------------------------------
+# 并行工具线程各自绑定本线程正在执行的调用 id：run_subagent 创建子代理时
+# 据此把任务归属到派生它的调用上。GUI 卡片据此只展示自己创建的子代理，
+# 而不是把会话内所有（含历史）子代理都堆到同一张卡上。
+_thread_tool_call_tls = threading.local()
+
+
+def set_thread_tool_call_id(call_id: str | None) -> None:
+    """绑定/解绑当前线程正在执行的工具调用 id。"""
+    _thread_tool_call_tls.call_id = str(call_id).strip() if call_id else None
+
+
+def get_thread_tool_call_id() -> str | None:
+    return getattr(_thread_tool_call_tls, "call_id", None)
+
+
+@contextlib.contextmanager
+def tool_call_scope(call_id: str | None):
+    """线程内临时绑定工具调用 id，退出时恢复原值（支持嵌套）。
+
+    必须用 scope 而非裸设置：并行工具线程会被复用，裸设置一旦有异常路径
+    漏了解绑，后续调用创建的子代理会记到上一个调用 id 上（串卡）。
+    """
+    previous = getattr(_thread_tool_call_tls, "call_id", None)
+    set_thread_tool_call_id(call_id)
+    try:
+        yield
+    finally:
+        _thread_tool_call_tls.call_id = previous
+
+
+# ---------------------------------------------------------------------------
 # 任务状态
 # ---------------------------------------------------------------------------
 

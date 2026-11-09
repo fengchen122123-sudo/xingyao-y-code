@@ -49,6 +49,8 @@ export interface SubagentTaskSnapshot {
   elapsed: number;
   type?: string;
   background?: boolean;
+  /** 派生该子代理的 run_subagent 调用 id（旧后端缺省） */
+  tool_call_id?: string;
   stages?: SubagentStage[];
 }
 
@@ -79,6 +81,7 @@ export interface ToolTraceRow {
     | 'mutation'
     | 'skill'
     | 'computer'
+    | 'subagent'
     | 'tool'
     | 'legacy-diffs';
   status: ToolCallStatus;
@@ -92,6 +95,9 @@ export interface ToolTraceRow {
   calls: ToolExecutionCall[];
   legacyDiffs?: LegacyDiff[];
 }
+
+/** 派发子代理的工具名：对话区单独渲染为「星舰」一行 */
+export const SUBAGENT_TOOL_NAME = 'run_subagent';
 
 const LEGACY_CATEGORIES: Readonly<Record<string, ToolCategory>> = {
   read_file: 'read',
@@ -119,7 +125,10 @@ function statusFor(call: ToolExecutionCall, state: ExecutionState): ToolCallStat
   return state === 'completed' ? 'completed' : 'running';
 }
 
-function kindFor(category: ToolCategory): ToolTraceRow['kind'] {
+function kindFor(category: ToolCategory, name = ''): ToolTraceRow['kind'] {
+  // 子代理派发单独一类（对话区显示为「星舰」）：它派生的是子代理任务，
+  // 不并入 tool 的通用「工具」文案。
+  if (name === SUBAGENT_TOOL_NAME) return 'subagent';
   if (category === 'read') return 'read-group';
   if (category === 'search') return 'search-group';
   if (category === 'command') return 'command';
@@ -142,10 +151,11 @@ function durationFor(call: ToolExecutionCall): number | undefined {
 function rowFor(call: ToolExecutionCall, index: number, state: ExecutionState): ToolTraceRow {
   const display = displayFor(call);
   const category = categoryFor(call);
+  const kind = kindFor(category, call.name);
   const durationMs = durationFor(call);
   return {
-    id: `${kindFor(category)}:${call.id || `missing-${index + 1}`}`,
-    kind: kindFor(category),
+    id: `${kind}:${call.id || `missing-${index + 1}`}`,
+    kind,
     status: statusFor(call, state),
     action: display?.action || call.label || call.name,
     detail: display?.target || '',

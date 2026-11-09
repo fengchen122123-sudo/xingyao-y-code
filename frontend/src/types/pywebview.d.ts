@@ -1208,6 +1208,9 @@ export interface SubagentProgressEventData {
     stage_detail?: string;
     elapsed: number;
     background?: boolean;
+    // 派生该子代理的 run_subagent 调用 id：卡片按它分组，只展示自己创建的
+    // 子代理；旧后端不带此字段时前端回落到旧行为
+    tool_call_id?: string;
     stages?: SubagentStagePayload[];
   }>;
 }

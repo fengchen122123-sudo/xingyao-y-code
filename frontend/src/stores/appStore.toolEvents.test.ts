@@ -172,6 +172,37 @@ it('moves subagent snapshots into the running run_subagent call and freezes on c
   expect(message.tool_calls![0].subagent_tasks).toHaveLength(1);
 });
 
+it('routes each subagent snapshot to the call that spawned it', () => {
+  const store = useAppStore();
+  store.handleBridgeEvent(event('turn_start', { user_text: '并行调研' }));
+  store.handleBridgeEvent(event('tool_start', { id: 'sub-1', name: 'run_subagent', label: '运行子代理', display: {} }));
+  store.handleBridgeEvent(event('tool_start', { id: 'sub-2', name: 'run_subagent', label: '运行子代理', display: {} }));
+  // 后端每轮推送全会话快照（含更早回合的历史任务）：带归属 id 的任务只落到
+  // 派生它的那张卡片，历史任务（sub-0）不属于本条消息，不重复展示
+  store.handleBridgeEvent(event('subagent_progress', {
+    tasks: [
+      { id: 'old', description: '上一回合的子代理', status: 'completed', stage: 'completed', elapsed: 9, tool_call_id: 'sub-0' },
+      { id: 't1', description: '调研代码结构', status: 'running', stage: 'tool', elapsed: 3, tool_call_id: 'sub-1' },
+      { id: 't2', description: '跑测试', status: 'running', stage: 'thinking', elapsed: 4, tool_call_id: 'sub-2' },
+    ],
+  }));
+
+  const calls = store.messages.at(-1)!.tool_calls!;
+  expect(calls[0].subagent_tasks!.map(t => t.id)).toEqual(['t1']);
+  expect(calls[1].subagent_tasks!.map(t => t.id)).toEqual(['t2']);
+
+  // 再来一轮：整体替换而非追加，避免重复堆叠
+  store.handleBridgeEvent(event('subagent_progress', {
+    tasks: [
+      { id: 't1', description: '调研代码结构', status: 'running', stage: 'model', elapsed: 6, tool_call_id: 'sub-1' },
+      { id: 't2', description: '跑测试', status: 'running', stage: 'thinking', elapsed: 7, tool_call_id: 'sub-2' },
+    ],
+  }));
+  expect(calls[0].subagent_tasks!.map(t => t.id)).toEqual(['t1']);
+  expect(calls[0].subagent_tasks![0].stage).toBe('model');
+  expect(calls[1].subagent_tasks!).toHaveLength(1);
+});
+
 it('carries stage history into subagent snapshots for the right-panel flow view', () => {
   const store = useAppStore();
   store.handleBridgeEvent(event('turn_start', { user_text: '并行调研' }));

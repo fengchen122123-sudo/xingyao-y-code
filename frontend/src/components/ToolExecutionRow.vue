@@ -135,6 +135,7 @@ const NODE_TONES: Record<ToolTraceRow['kind'], string> = {
   mutation: 'mutation',
   skill: 'skill',
   computer: 'computer',
+  subagent: 'subagent',
   tool: 'tool',
   'legacy-diffs': 'legacy',
 };
@@ -145,6 +146,8 @@ const KIND_LABELS: Record<ToolTraceRow['kind'], string> = {
   mutation: '编辑',
   skill: '技能',
   computer: '电脑',
+  // run_subagent 派生的是子代理任务，与右侧「星舰 · 子代理」面板同名
+  subagent: '星舰',
   tool: '工具',
   'legacy-diffs': '变更',
 };
@@ -428,6 +431,7 @@ function diffLineClass(line: string) {
 .trace-icon.node-mutation { color: var(--orange); }
 .trace-icon.node-skill { color: var(--purple); }
 .trace-icon.node-computer { color: var(--cyan); }
+.trace-icon.node-subagent { color: var(--purple); }
 .trace-icon.node-tool { color: var(--text-dim); }
 .trace-icon.node-legacy { color: var(--yellow); }
 .status-failed .trace-icon { color: var(--red); }

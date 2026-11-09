@@ -11461,6 +11461,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                         "stage_detail": last_detail,
                         "elapsed": elapsed,
                         "background": bool(snap.run_in_background),
+                        # 派生该子代理的 run_subagent 调用 id：前端按它把卡片分组，
+                        # 每张卡片只展示自己创建的子代理（不再全会话聚合）
+                        "tool_call_id": snap.tool_call_id,
                         # 完整阶段历史：右面板"子代理"工作台渲染执行流程时间线
                         "stages": [
                             {"name": s.name, "at": s.at, "detail": s.detail}

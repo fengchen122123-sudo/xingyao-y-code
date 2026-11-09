@@ -550,7 +550,10 @@ class ToolBatchExecutor:
 
     def _execute_timed(self, decoded, context):
         started_at = self.clock()
-        message = self.execute_decoded(decoded, context)
+        # 绑定本次调用 id：run_subagent 创建子代理时据此把任务归属到派生它的
+        # 调用上，GUI 卡片才能只展示"自己正在执行的这个"子代理。
+        with app_context.tool_call_scope(decoded.call_id):
+            message = self.execute_decoded(decoded, context)
         duration_ms = round((self.clock() - started_at) * 1000)
         return message, max(0, duration_ms)
 
