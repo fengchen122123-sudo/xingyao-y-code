@@ -1,7 +1,7 @@
 {
   "name": "windows_tools",
   "version": "0.1.0",
-  "description": "Windows 系统能力：进程查看与结束（windows_process）、剪贴板文本读写（windows_clipboard）。仅在 Windows 注册，非 Windows 平台与 CLI 轻量模式（YCODE_TOOL_PROFILE=cli）不占用任何工具 schema；零新增第三方依赖（进程走 psutil，剪贴板走 ctypes 调 user32/kernel32）。",
+  "description": "Windows 系统能力：进程查看（windows_process_list，免审批）与结束（windows_process_kill，需审批）、剪贴板读取（windows_clipboard_get，免审批）与写入（windows_clipboard_set，需审批）、只读注册表查询（windows_registry）、系统提示框提醒（windows_notify）。仅在 Windows 注册，非 Windows 平台与 CLI 轻量模式（YCODE_TOOL_PROFILE=cli）不占用任何工具 schema；零新增依赖（进程走 psutil，剪贴板走 ctypes 调 user32/kernel32，注册表走标准库 winreg，通知走 pywin32 的 win32gui）。",
   "entry": "plugin.py",
   "enabled": true
 }
