@@ -1260,3 +1260,79 @@ def test_action_finished_reports_input_and_wait_segments(service, running_run, o
         assert failed and isinstance(failed[-1].get("duration_ms"), (int, float))
     finally:
         service.stop()
+
+
+# ---------------- Task 3：wait_for 计入等待阶段计时 ----------------
+
+
+def test_wait_for_finished_reports_wait_not_input(service, owner_a, capability):
+    """wait_for 是条件等待而非输入：finished 事件 input_ms=0、wait_ms>=0。
+
+    条件等待的轮询耗时属于等待阶段，绝不能混进 input_ms——否则"输入耗时"
+    会把被动等待算成按键/点击耗时。fake backend 直接返回，不真实等待。
+    """
+    events = []
+    service.add_listener(events.append)
+    run = service.start_run(owner_a, capability, target="desktop")
+    try:
+        service.execute(
+            run.run_id, owner_a, ComputerAction(kind="observe", target="desktop")
+        )
+        service.execute(
+            run.run_id, owner_a,
+            ComputerAction(
+                kind="wait_for",
+                target="desktop",
+                condition="text_exists",
+                text="登录完成",
+                timeout_ms=8000,
+                interval_ms=300,
+            ),
+        )
+        finished = [
+            event for event in events
+            if event["type"] == "computer_action_finished"
+            and event["action_kind"] == "wait_for"
+        ]
+        assert len(finished) == 1 and finished[0]["ok"] is True
+        assert finished[0]["input_ms"] == 0
+        assert isinstance(finished[0]["wait_ms"], (int, float))
+        assert finished[0]["wait_ms"] >= 0
+    finally:
+        service.stop()
+
+
+def test_wait_for_timeout_also_reports_wait_segment(service, owner_a, capability):
+    """超时失败同样按等待阶段计时：input_ms=0、wait_ms>=0。"""
+    events = []
+    service.add_listener(events.append)
+    run = service.start_run(owner_a, capability, target="desktop")
+    try:
+        service.execute(
+            run.run_id, owner_a, ComputerAction(kind="observe", target="desktop")
+        )
+        service.backend.execute_error = ComputerControlError(
+            "computer_wait_timeout", "条件等待超时"
+        )
+        with pytest.raises(ComputerControlError) as raised:
+            service.execute(
+                run.run_id, owner_a,
+                ComputerAction(
+                    kind="wait_for",
+                    target="desktop",
+                    condition="window_active",
+                    window_name="记事本",
+                ),
+            )
+        assert raised.value.code == "computer_wait_timeout"
+        failed = [
+            event for event in events
+            if event["type"] == "computer_action_finished"
+            and event["action_kind"] == "wait_for"
+        ]
+        assert failed and failed[-1]["ok"] is False
+        assert failed[-1]["input_ms"] == 0
+        assert isinstance(failed[-1]["wait_ms"], (int, float))
+        assert failed[-1]["wait_ms"] >= 0
+    finally:
+        service.stop()

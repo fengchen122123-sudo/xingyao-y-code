@@ -848,10 +848,21 @@ class ComputerControlService:
                                 self._raise_if_action_aborted_locked(run)
                             backend.execute(run_id, step)
                     finally:
-                        input_ms = round((time.perf_counter() - input_started) * 1000, 3)
+                        elapsed_ms = round((time.perf_counter() - input_started) * 1000, 3)
                         if action.kind == "wait":
-                            # 显式等待阶段单列；不把条件等待混进输入耗时。
-                            wait_ms = input_ms
+                            # 显式等待阶段单列：wait 的时长等待由 backend 完成，
+                            # 仍是同一段耗时，故 input_ms 与 wait_ms 同为实测值。
+                            input_ms = elapsed_ms
+                            wait_ms = elapsed_ms
+                        elif action.kind == "wait_for":
+                            # 条件等待单列（Global：不改变既有 wait 语义）：
+                            # wait_for 只轮询界面、不产生任何输入，故 input_ms 记
+                            # 0（真正的零输入），轮询耗时全部计入 wait_ms，绝不
+                            # 把被动等待混进输入耗时。
+                            input_ms = 0
+                            wait_ms = elapsed_ms
+                        else:
+                            input_ms = elapsed_ms
                 with self._lock:
                     # backend 输入返回后、开始可能耗时的 observe 前复核取消。
                     self._raise_if_action_aborted_locked(run)
