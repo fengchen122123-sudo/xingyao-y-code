@@ -134,3 +134,69 @@ it('下载完成事件会在已选视频时自动重探预检信息（无需重�
   // 装好后没有「未检测到 ffmpeg」的旧提示
   expect(wrapper.find('[data-test="ffmpeg-component-error"]').exists()).toBe(false);
 });
+
+// 兜底场景：done 事件丢了（WebView 重连/事件队列断开），进页时组件状态是
+// 磁盘探测来的「已就绪」，但预检快照还停留在缺 ffmpeg 的旧结论。
+// 这时必须自动重探一次，否则用户只能手动点「重新检测」。
+it('进页时组件已就绪但旧预检说缺 ffmpeg：自动重探', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.bgConvert.video = {
+    path: 'C:\\clip.mp4',
+    name: 'clip.mp4',
+    bytes: 1024,
+    ffmpeg_available: false,
+    max_bytes: 10485760,
+    max_dimension: 8192,
+    duration: 5,
+    width: 1280,
+    height: 720,
+    can_convert: false,
+    blockers: ['未找到视频转换组件（ffmpeg）'],
+    warnings: [],
+  };
+  api.get_ffmpeg_component_status.mockResolvedValue({
+    ok: true,
+    component: { ...emptyComponent, installed: true, version: '6.1.1' },
+  });
+  api.describe_background_video.mockResolvedValue({
+    ok: true,
+    ...store.bgConvert.video,
+    ffmpeg_available: true,
+    can_convert: true,
+    blockers: [],
+  });
+
+  mount(BackgroundConvert, { global: { plugins: [pinia] } });
+  await flushPromises();
+
+  expect(api.describe_background_video).toHaveBeenCalledWith('C:\\clip.mp4');
+  expect(store.bgConvert.video?.can_convert).toBe(true);
+});
+
+// 反面：组件没装时不重探——多跑一次 ffprobe 没有意义，预检结论也不会变。
+it('进页时组件未安装：不重探预检', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.bgConvert.video = {
+    path: 'C:\\clip.mp4',
+    name: 'clip.mp4',
+    bytes: 1024,
+    ffmpeg_available: false,
+    max_bytes: 10485760,
+    max_dimension: 8192,
+    duration: 5,
+    width: 1280,
+    height: 720,
+    can_convert: false,
+    blockers: ['未找到视频转换组件（ffmpeg）'],
+    warnings: [],
+  };
+
+  mount(BackgroundConvert, { global: { plugins: [pinia] } });
+  await flushPromises();
+
+  expect(api.describe_background_video).not.toHaveBeenCalled();
+});

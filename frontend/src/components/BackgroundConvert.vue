@@ -326,9 +326,23 @@ function recheckVideo() {
   void withFfmpegBusy(() => store.redescribeBackgroundVideo());
 }
 
-// 进入本页先同步一次组件真实安装态：Store 可能是上次会话留下的旧快照
-onMounted(() => {
-  void store.refreshFfmpegComponentStatus();
+// 进入本页先同步一次组件真实安装态：Store 可能是上次会话留下的旧快照。
+// 快照回来后再补一次兜底重探：组件其实已就绪、而预检快照仍记着
+// 「ffmpeg 不可用」（下载完成的 done 事件丢失时就是这个状态），自动重探一次，
+// 免得用户必须手动点「重新检测」或重选视频。判定用后端返回的
+// ffmpeg_available，而不是匹配 blocker 里的中文文案（文案改字就失效）。
+// 只在「装好 + 已选视频 + 旧快照缺 ffmpeg」时多跑一次 ffprobe，其余情况零开销。
+onMounted(async () => {
+  await store.refreshFfmpegComponentStatus();
+  const current = video.value;
+  if (
+    ffmpegComponent.value.installed
+    && current
+    && !current.can_convert
+    && current.ffmpeg_available === false
+  ) {
+    void recheckVideo();
+  }
 });
 </script>
 
