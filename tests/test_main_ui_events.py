@@ -1093,15 +1093,16 @@ def test_effort_command_shows_current_level(monkeypatch):
 
 
 def test_effort_command_shows_toggle_off_choice(monkeypatch):
-    # toggle 型模型（如 kimi-k2.6）选"关闭"后，无参查看必须显示 off/关闭，
-    # 而不是兼容接口 get_model_reasoning_effort 返回 None 导致的错误 "default"
+    # toggle 型模型（如 minimax-m3）选"关闭"后，无参查看必须显示 off/关闭，
+    # 而不是兼容接口 get_model_reasoning_effort 返回 None 导致的错误 "default"。
+    # 注：kimi 家族已统一为 always_on_effort（不可关闭），不再适用本用例。
     import core.model_manager as mm
 
     printed = []
     cfg = {
         "active_model_id": "m1",
         "providers": [
-            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/kimi-k2.6"}]}
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/minimax-m3"}]}
         ],
     }
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
@@ -1115,14 +1116,15 @@ def test_effort_command_shows_toggle_off_choice(monkeypatch):
 
 
 def test_effort_command_fixed_model_hint(monkeypatch):
-    # fixed 型模型（如 kimi-k2.7-code）始终开启思考，应给提示而非档位列表
+    # fixed 型模型（如 minimax-m2.5）始终开启思考，应给提示而非档位列表。
+    # 注：kimi-k2.7-code 已并入 kimi 家族的能力档位列表，不再属 fixed 型。
     import core.model_manager as mm
 
     printed = []
     cfg = {
         "active_model_id": "m1",
         "providers": [
-            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/kimi-k2.7-code"}]}
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/minimax-m2.5"}]}
         ],
     }
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))

@@ -97,7 +97,9 @@ def test_verify_rejects_bom_injected_size_plus_one(tmp_path):
 def test_verify_rejects_head_mismatch_same_size(tmp_path):
     """同长度但首字节被改写（如 BOM 替换首字节）也必须检出。"""
     body = os.urandom(1024)
-    tampered = b"\xff" + body[1:]
+    # 首字节用异或翻转，保证一定与原文不同：固定写 0xff 时，若随机首字节本就是
+    # 0xff，篡改样本与原文完全相同，用例会以约 1/256 的概率偶发失败。
+    tampered = bytes([body[0] ^ 0xFF]) + body[1:]
     local = _make_local_file(tmp_path, body)
     with patch("urllib.request.urlopen") as m:
         m.return_value = _fake_response("application/octet-stream", tampered)
