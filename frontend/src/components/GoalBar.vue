@@ -21,6 +21,16 @@
       data-test="goal-summary"
     >{{ goalState.last_summary }}</span>
     <span class="gb-spacer"></span>
+    <!-- 待确认是自评档的必经状态：模型自称完成但用户还没点头，这里必须给出
+         确认入口，否则状态条只剩「停止」，用户看到"待确认"却无处确认 -->
+    <button
+      v-if="canConfirm"
+      class="chip-btn ok"
+      data-test="goal-confirm"
+      title="确认目标已达成：自评档要你点头才会收尾"
+      :disabled="busy"
+      @click.stop="onConfirm"
+    >确认达成</button>
     <button
       v-if="canStop"
       class="chip-btn danger"
@@ -102,6 +112,9 @@ const canResume = computed(
     || statusKey.value === 'stopped'
     || statusKey.value === 'interrupted',
 );
+// 待确认（自评档）：模型自己打了达成标记，但自评不可信，必须用户点头。
+// 这一态同时保留「停止」——用户认为没达成时可以停掉，再「继续」接着跑剩余轮次。
+const canConfirm = computed(() => statusKey.value === 'awaiting_confirm');
 
 const visible = computed(() => !!goalState.value && !achievedHidden.value);
 
@@ -176,6 +189,16 @@ async function onResume() {
   busy.value = true;
   try {
     await store.resumeGoal();
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function onConfirm() {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    await store.confirmGoal();
   } finally {
     busy.value = false;
   }
@@ -286,6 +309,15 @@ async function onResume() {
 .chip-btn.danger:hover:not(:disabled) {
   background: rgba(248, 81, 73, 0.15);
   border-color: var(--red);
+}
+/* 确认达成是"好消息"按钮：与整体达成态同色系，比普通操作更醒目 */
+.chip-btn.ok {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 45%, var(--border));
+}
+.chip-btn.ok:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--green) 15%, transparent);
+  border-color: color-mix(in srgb, var(--green) 70%, var(--border));
 }
 
 /* 窄屏：摘要先折叠（次要信息），目标原文与按钮永不隐藏 */

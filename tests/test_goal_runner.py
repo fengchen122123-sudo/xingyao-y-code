@@ -332,3 +332,48 @@ def test_finished_callback_sees_persisted_state(tmp_path):
     run_goal_loop(state, executor, store, on_event, threading.Event())
 
     assert seen == {"status": "awaiting_confirm", "round": 1}
+
+
+def test_state_file_tracks_round_while_running(tmp_path):
+    """每轮执行期间状态文件就要反映本轮轮次（GUI 状态条与 /goal status 都读文件）。
+
+    回归背景：只在循环收尾保存时，界面整轮都停在"第 0/10 轮"，用户以为目标
+    没推进；这里断言「轮次一开跑就落盘」与「round_done 时摘要已落盘」。
+    """
+    store = GoalStore(tmp_path / "goals")
+    snapshots = []
+
+    class PeekExecutor:
+        """执行期间偷看状态文件，记录磁盘上的轮次/状态/历史条数。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def run_round(self, prompt, *, cancel_event=None):
+            self.calls += 1
+            disk = store.load("s1")
+            snapshots.append(
+                (disk.round, disk.status, len(disk.history)) if disk else None
+            )
+            return RoundOutcome(
+                status="completed", reply_text=f"第 {self.calls} 轮做完了"
+            )
+
+    events = []
+
+    def on_event(name, state):
+        if name == "round_done":
+            disk = store.load("s1")
+            events.append((disk.round, len(disk.history)))
+
+    state = _make_state(max_rounds=3)
+    run_goal_loop(state, PeekExecutor(), store, on_event, threading.Event())
+
+    # 第 1、2、3 轮执行中，文件里分别已经是 1、2、3，且历史是已完成的前几轮
+    assert snapshots == [
+        (1, "running", 0),
+        (2, "running", 1),
+        (3, "running", 2),
+    ]
+    # round_done 广播时本轮摘要已经写进文件：状态条的"最近一轮进展"靠它
+    assert events == [(1, 1), (2, 2), (3, 3)]

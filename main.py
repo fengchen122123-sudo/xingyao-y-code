@@ -1135,7 +1135,7 @@ COMMAND_COMPLETIONS = [
     ("/doctor", "聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 机器可读；export 导出诊断包)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
-    ("/goal", "目标模式：自主迭代直到达成（支持 status / stop / resume / --check / --rounds）"),
+    ("/goal", "目标模式：自主迭代直到达成（支持 status / stop / resume / confirm / --check / --rounds）"),
     ("/undo", "按回合撤销文件修改 (list/preview/status/recover)"),
     ("/resume", "断点续跑：从本会话最近中断的回合继续 (需 resume.enabled=true)"),
     ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
@@ -3279,6 +3279,50 @@ def _goal_handle_resume(session_name) -> None:
     ))
 
 
+def _goal_handle_confirm(session_name) -> None:
+    """/goal confirm：自评达成后由用户点头，把目标收敛为 achieved。
+
+    只认 awaiting_confirm：running 时循环还在跑（提前确认会把剩余轮次吞掉），
+    achieved 重复确认是空操作，其余终态该走 resume 而不是确认。
+    """
+    from core.slash_commands.goal.state import (
+        STATUS_ACHIEVED,
+        STATUS_AWAITING_CONFIRM,
+    )
+
+    try:
+        store = _goal_store()
+        state = store.load(session_name)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    if state is None:
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话没有可确认的目标，用 /goal &lt;目标&gt; 新建一个。</ansiyellow>"
+        ))
+        return
+    if state.status != STATUS_AWAITING_CONFIRM:
+        status_text = _GOAL_STATUS_TEXT.get(state.status, state.status)
+        hint = {
+            "running": "目标还在跑，等出现「待确认」再确认达成",
+            "achieved": "目标已达成，无需重复确认；要跑新目标请用 /goal <目标>",
+        }.get(state.status, "")
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 当前状态为「{_esc(status_text)}」，无需确认。{_esc(hint)}</ansiyellow>"
+        ))
+        return
+    state.status = STATUS_ACHIEVED
+    try:
+        store.save(state)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    print_formatted_text(HTML(
+        f"<ansigreen>✔ 已确认目标达成（第 {state.round}/{state.max_rounds} 轮）："
+        f"{_esc(state.goal)}</ansigreen>"
+    ))
+
+
 def _goal_handle_start(action, session_name) -> None:
     """/goal <目标>：新建目标状态并启动后台循环。"""
     from core.slash_commands.goal.state import GoalState
@@ -3342,7 +3386,7 @@ def _run_goal_cli(args_text: str) -> None:
     if kind == "goal_help":
         print_formatted_text(HTML(f"<ansicyan>🎯 {_esc(GOAL_USAGE)}</ansicyan>"))
         print_formatted_text(HTML(
-            "<ansigray>  控制: /goal status | /goal stop | /goal resume</ansigray>"
+            "<ansigray>  控制: /goal status | /goal stop | /goal resume | /goal confirm（自评达成后确认收尾）</ansigray>"
         ))
         print_formatted_text(HTML(
             "<ansigray>  示例: /goal 把测试跑绿 --check pytest -q --rounds 5</ansigray>"
@@ -3355,6 +3399,8 @@ def _run_goal_cli(args_text: str) -> None:
         _goal_handle_stop(session_name)
     elif kind == "goal_resume":
         _goal_handle_resume(session_name)
+    elif kind == "goal_confirm":
+        _goal_handle_confirm(session_name)
     elif kind == "goal_start":
         _goal_handle_start(action, session_name)
     else:

@@ -101,8 +101,12 @@ class _GoalBridgeStub(_NoticeCollector):
     _goal_status = gui_bridge.ApiBridge._goal_status
     _goal_stop = gui_bridge.ApiBridge._goal_stop
     _goal_resume = gui_bridge.ApiBridge._goal_resume
+    _goal_confirm = gui_bridge.ApiBridge._goal_confirm
     _goal_start = gui_bridge.ApiBridge._goal_start
     _start_goal_run = gui_bridge.ApiBridge._start_goal_run
+    _goal_target_model_id = gui_bridge.ApiBridge._goal_target_model_id
+    _known_model_ids = gui_bridge.ApiBridge._known_model_ids
+    _inherit_goal_session_model = gui_bridge.ApiBridge._inherit_goal_session_model
 
     def __init__(self):
         super().__init__()
@@ -294,27 +298,99 @@ def test_materialize_goal_session_guards():
     )
 
 
-def test_dispatch_slash_passes_workdir_into_goal_start():
-    """workdir 必须一路透传到 goal 分支：斜杠层丢参数就是本次 bug 的根因。"""
+def test_dispatch_slash_passes_workdir_and_model_into_goal_start():
+    """workdir/model_id 必须一路透传到 goal 分支：斜杠层丢参数就是这两次 bug 的根因。
+
+    workdir 丢了 → 目标会话挂到进程目录；model_id 丢了 → 草稿 /goal 落库的新会话
+    没有模型绑定，目标循环每轮回退全局默认模型（用户"用什么模型敲就用什么模型"）。
+    """
     stub = _make_draft_stub()
     stub._dispatch_slash = gui_bridge.ApiBridge._dispatch_slash.__get__(stub)
     stub._run_slash_action = gui_bridge.ApiBridge._run_slash_action.__get__(stub)
     calls = []
     stub._goal_start = (
-        lambda action, session_name, workdir="", turn_source="local": calls.append(
-            (action, session_name, workdir)
-        )
+        lambda action, session_name, workdir="", turn_source="local", model_id="":
+        calls.append((action, session_name, workdir, model_id))
         or {"ok": True, "slash": True}
     )
 
     result = stub._dispatch_slash(
-        "/goal 把测试跑绿", "session_ff00aa", "/goal 把测试跑绿", workdir="D:\\x"
+        "/goal 把测试跑绿",
+        "session_ff00aa",
+        "/goal 把测试跑绿",
+        workdir="D:\\x",
+        model_id="m-deepseek",
     )
 
     assert result is not None and result.get("slash") is True
     assert calls, "goal_start 应被调用"
     assert calls[0][1] == "session_ff00aa"
     assert calls[0][2] == "D:\\x"
+    assert calls[0][3] == "m-deepseek"
+
+
+def test_goal_start_inherits_triggering_model_on_draft_session():
+    """草稿 /goal 落库后必须把触发模型绑到目标会话：否则目标循环回退全局默认模型。
+
+    回归场景：用户用 A 模型敲 `/goal …`，草稿会话落库成新会话后没有任何模型绑定，
+    目标循环每轮 get_active_model(session) 都读到全局默认，看起来像"换了模型"。
+    """
+    stub = _make_draft_stub()
+    stub._known_model_ids = lambda: {"m-deepseek"}
+    bound = []
+    stub._memory = types.SimpleNamespace(
+        get_last_message_id=lambda name: 0,
+        get_history_with_ids=lambda name: [
+            {
+                "role": "assistant",
+                "content": f"做完了 {GOAL_ACHIEVED_MARKER}",
+                "_msg_id": 1,
+            }
+        ],
+        get_session_model_id=lambda name: None,
+        set_session_model_id=lambda name, mid: bound.append((name, mid)) or True,
+    )
+
+    result = stub._goal_start(
+        {"goal": "写完第7章", "check": "", "max_rounds": 1},
+        "session_a1b2c3",
+        workdir="D:\\fengchenhao\\小说",
+        model_id="m-deepseek",
+    )
+
+    assert result["ok"] is True
+    # 落库不改名，绑定必须落在最终会话名上；模型必须是用户触发时用的那个
+    assert bound == [("session_a1b2c3", "m-deepseek")]
+    _wait_goal_runs_empty(stub, "session_a1b2c3")
+
+
+def test_goal_start_keeps_existing_session_model():
+    """目标会话已有绑定时不覆盖：用户在该会话里显式选过模型，是更强的意图。"""
+    stub = _make_draft_stub()
+    stub._known_model_ids = lambda: {"m-deepseek", "m-other"}
+    bound = []
+    stub._memory = types.SimpleNamespace(
+        get_last_message_id=lambda name: 0,
+        get_history_with_ids=lambda name: [
+            {
+                "role": "assistant",
+                "content": f"做完了 {GOAL_ACHIEVED_MARKER}",
+                "_msg_id": 1,
+            }
+        ],
+        get_session_model_id=lambda name: "m-other",
+        set_session_model_id=lambda name, mid: bound.append((name, mid)) or True,
+    )
+
+    result = stub._goal_start(
+        {"goal": "把测试跑绿", "check": "", "max_rounds": 1},
+        "sess_existing",
+        model_id="m-deepseek",
+    )
+
+    assert result["ok"] is True
+    assert bound == []
+    _wait_goal_runs_empty(stub, "sess_existing")
 
 
 def test_run_slash_action_unwraps_goal_action_dict():
@@ -499,4 +575,68 @@ def test_manual_rename_rejected_while_goal_running():
     assert result["ok"] is False
     assert "/goal stop" in result["msg"]
     assert result["name"] == "session_bbb222"
+
+
+# ---------------------------------------------------------------------------
+# 四、待确认状态的确认入口（回归：状态条只有「停止」，用户无处确认）
+# ---------------------------------------------------------------------------
+
+def test_confirm_keyword_maps_to_goal_confirm():
+    """`/goal confirm` 必须映射到确认动作：自评档的达成要由用户点头才收尾。"""
+    result = handle_goal("confirm")
+
+    assert result["ok"] is True
+    assert result["action"]["action"] == "goal_confirm"
+
+
+def test_goal_confirm_marks_awaiting_state_achieved():
+    """待确认 → 确认达成：只在这一态改状态，并把 achieved 落盘。
+
+    回归场景：循环停在 awaiting_confirm 等用户确认，但当时既没有 `/goal confirm`
+    也没有状态条按钮，用户看到「待确认」却只能"停止"。
+    """
+    from core.slash_commands.goal.state import (
+        STATUS_ACHIEVED,
+        STATUS_AWAITING_CONFIRM,
+        GoalState,
+    )
+
+    stub = _GoalBridgeStub()
+    store = stub._goal_store()
+    session = "sess_confirm_ok"
+    store.clear(session)
+    store.save(
+        GoalState(
+            session=session,
+            goal="修完前 100 章的病句与漏洞",
+            round=5,
+            max_rounds=10,
+            status=STATUS_AWAITING_CONFIRM,
+        )
+    )
+
+    result = stub._goal_confirm(session)
+
+    assert result == {"ok": True, "slash": True}
+    assert store.load(session).status == STATUS_ACHIEVED
+    assert any("已确认目标达成" in item["message"] for item in stub.notices)
+    store.clear(session)
+
+
+def test_goal_confirm_rejects_running_state():
+    """运行中不能确认：提前点头会把剩余轮次吞掉，状态必须原样不动。"""
+    from core.slash_commands.goal.state import STATUS_RUNNING, GoalState
+
+    stub = _GoalBridgeStub()
+    store = stub._goal_store()
+    session = "sess_confirm_running"
+    store.clear(session)
+    store.save(GoalState(session=session, goal="继续推进", round=1, status=STATUS_RUNNING))
+
+    result = stub._goal_confirm(session)
+
+    assert result == {"ok": True, "slash": True}
+    assert store.load(session).status == STATUS_RUNNING
+    assert any("无需确认" in item["message"] for item in stub.notices)
+    store.clear(session)
 

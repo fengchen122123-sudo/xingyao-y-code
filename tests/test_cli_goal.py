@@ -214,3 +214,47 @@ def test_cli_executor_falls_back_to_msg_queue(monkeypatch):
     assert task["was_queued"] is False
     # 返回的是本轮共享结果字典：worker 收尾时回填 ok，执行器靠它判定轮次结束
     assert result is task["result"]
+
+
+# ---------------------------------------------------------------------------
+# 五、待确认状态的确认入口（CLI 侧回归：以前只有 status/stop/resume）
+# ---------------------------------------------------------------------------
+
+def test_goal_confirm_dispatches_from_slash_command(monkeypatch, tmp_path):
+    """`/goal confirm` 从分派到落盘整条链路：把待确认收敛成 achieved。
+
+    回归场景：自评档停在 awaiting_confirm 等用户点头，但 CLI 既没有 confirm
+    子命令也没有对应分支，用户敲完 `/goal confirm` 只会得到"未知目标动作"。
+    """
+    store = GoalStore(tmp_path)
+    session = main.current_session
+    store.save(
+        GoalState(
+            session=session,
+            goal="修完前 100 章的病句与漏洞",
+            max_rounds=10,
+            round=5,
+            status="awaiting_confirm",
+        )
+    )
+    monkeypatch.setattr(main, "_goal_store", lambda: store)
+
+    printed = _patch_main_print(monkeypatch)
+    main.handle_slash_command("/goal confirm")
+
+    assert store.load(session).status == "achieved"
+    assert any("已确认目标达成" in line for line in printed)
+
+
+def test_goal_confirm_rejects_non_awaiting_state(monkeypatch, tmp_path):
+    """运行中不能确认：提前点头会把剩余轮次吞掉，状态必须原样不动。"""
+    store = GoalStore(tmp_path)
+    session = "sess_cli_confirm_running"
+    store.save(GoalState(session=session, goal="继续跑", round=1, status="running"))
+    monkeypatch.setattr(main, "_goal_store", lambda: store)
+
+    printed = _patch_main_print(monkeypatch)
+    main._goal_handle_confirm(session)
+
+    assert store.load(session).status == "running"
+    assert any("无需确认" in line for line in printed)

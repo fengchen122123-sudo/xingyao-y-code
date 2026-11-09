@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -22,6 +23,8 @@ from core.slash_commands.goal.state import (
     GoalState,
     GoalStore,
 )
+
+logger = logging.getLogger(__name__)
 
 # 自评档的达成标记。用独立标签而不是"完成/已完成"这类词：模型正常叙述里随时
 # 可能出现那些词，标签是唯一的机器可判定信号。
@@ -142,6 +145,19 @@ def judge(state: GoalState, outcome: RoundOutcome, run_check=None) -> str:
     return "continue"
 
 
+def _persist(store: GoalStore, state: GoalState) -> None:
+    """把当前内存状态落盘；写失败只记日志，绝不打断循环。
+
+    为什么每轮都要落盘：GUI 的 GoalBar（每 5 秒轮询 get_goal_state）与 CLI 的
+    `/goal status` 都读状态文件，而循环只在收尾时保存——一整轮跑几十秒到几分钟
+    期间，界面会一直停在创建时的「第 0/10 轮」，用户以为目标没推进。
+    """
+    try:
+        store.save(state)
+    except Exception:  # noqa: BLE001 - 落盘失败不该让多轮循环终止
+        logger.warning("目标状态落盘失败", exc_info=True)
+
+
 def _notify(on_event, event: str, state: GoalState) -> None:
     """发送进度事件，吞掉回调异常。
 
@@ -181,6 +197,9 @@ def run_goal_loop(
 
         state.round += 1
         prompt = build_round_prompt(state)
+        # 本轮一开跑就写盘：GUI 状态条与 /goal status 读的是文件，若等收尾那次
+        # save，整个回合期间界面会一直停在上一轮的轮次（用户看到「第 0/10 轮」）。
+        _persist(store, state)
 
         try:
             outcome = executor.run_round(prompt, cancel_event=cancel_event)
@@ -206,6 +225,8 @@ def run_goal_loop(
                     "summary": f"失败: {outcome.error or '未知错误'}",
                 }
             )
+            # 先落盘再广播：状态条收到进度后会立刻重拉，文件里必须已含本轮摘要
+            _persist(store, state)
             _notify(on_event, "round_done", state)
             continue
 
@@ -213,6 +234,7 @@ def run_goal_loop(
         state.history.append(
             {"round": state.round, "summary": summarize(outcome.reply_text)}
         )
+        _persist(store, state)
         _notify(on_event, "round_done", state)
 
         if verdict == "achieved":

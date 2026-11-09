@@ -1967,9 +1967,11 @@ export interface PyWebViewAPI {
   list_slash_commands(): Promise<{ ok: boolean; commands?: SlashCommandInfo[]; msg?: string }>;
   // /goal 目标状态（GoalBar 数据源）：无目标时 state=null；会话名缺省用当前会话
   get_goal_state(sessionName?: string): Promise<{ ok: boolean; state?: GoalStateInfo | null; msg?: string }>;
-  // /goal 的停止/继续：复用 /goal stop、/goal resume 的语义，成功后前端重拉状态
+  // /goal 的停止/继续/确认：复用 /goal stop、/goal resume、/goal confirm 的语义，
+  // 成功后前端重拉状态（确认只对待确认状态生效）
   goal_stop(sessionName?: string): Promise<{ ok: boolean; msg?: string }>;
   goal_resume(sessionName?: string): Promise<{ ok: boolean; msg?: string }>;
+  goal_confirm(sessionName?: string): Promise<{ ok: boolean; msg?: string }>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
   remove_mcp_server(name: string): Promise<any>;

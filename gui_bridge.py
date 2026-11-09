@@ -8405,12 +8405,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             self.post_notice("压缩失败: " + str(exc), session_name, "error")
             return {"ok": False, "msg": str(exc)}
 
-    def _dispatch_slash(self, clean_text, session_name, full_text, workdir="", turn_source="local"):
+    def _dispatch_slash(self, clean_text, session_name, full_text, workdir="", turn_source="local", model_id=""):
         """把可能以 "/" 开头的输入交给斜杠命令分发层，返回 None 表示按普通消息继续。
 
         workdir/turn_source 原样带到动作层：本地命令在草稿会话上执行时（最常见
         是 /goal），必须知道前端这次要落库到哪个目录，否则会话会被目标循环
-        按进程 cwd 错挂到星瑶自己的源码目录。
+        按进程 cwd 错挂到星瑶自己的源码目录。model_id 同理：前端始终携带当前
+        激活模型，/goal 提前返回走不到普通消息的模型绑定分支，得靠它把「用户
+        用哪个模型敲的命令」带到目标会话上，避免目标循环回退全局默认模型。
 
         为什么放在桥上而不是入口层：GUI 是唯一同时具备 notice 卡片、git 面板与
         子代理编排能力的入口，命令动作（/commit /agent ...）必须由桥执行副作用；
@@ -8439,13 +8441,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": result.error, "slash": True}
         if result.kind == "action":
             return self._run_slash_action(
-                result.action, session_name, workdir=workdir, turn_source=turn_source
+                result.action,
+                session_name,
+                workdir=workdir,
+                turn_source=turn_source,
+                model_id=model_id,
             )
         # 剩下的就是 notice：本地命令已就地完成，只需要一句提示
         self.post_notice(result.notice, session_name)
         return {"ok": True, "slash": True}
 
-    def _run_slash_action(self, action, session_name, workdir="", turn_source="local"):
+    def _run_slash_action(self, action, session_name, workdir="", turn_source="local", model_id=""):
         """执行工具类命令产出的动作描述；核心层只给数据，副作用全在这里。
 
         危险动作（提交代码、删长期记忆）不可逆，因此先给出确认提示并返回
@@ -8454,7 +8460,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
         workdir/turn_source 是入口上下文：/goal 这类"本地命令 + 后续真实回合"
         的动作在草稿会话上要先按 workdir 落库，参数在斜杠层丢掉就是本次
-        「在小说目录执行 /goal 却开到了源码目录」的根因。
+        「在小说目录执行 /goal 却开到了源码目录」的根因。model_id 是前端携带
+        的当前激活模型，/goal 要在落库时把它绑到目标会话上（见 _goal_start）。
         """
         """执行工具类命令产出的动作描述；核心层只给数据，副作用全在这里。
 
@@ -8491,9 +8498,21 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return self._goal_stop(session_name)
         if kind == "goal_resume":
             return self._goal_resume(session_name)
+        if kind == "goal_confirm":
+            # 自评达成后由用户点头收尾：没有这个分支时 awaiting_confirm 只能"停止"，
+            # 状态条上写着「待确认」却找不到确认入口（状态条与 /goal confirm 共用它）
+            return self._goal_confirm(session_name)
         if kind == "goal_start":
-            # workdir/turn_source 必须透传：草稿首条消息是 /goal 时靠它们落库归组
-            return self._goal_start(action, session_name, workdir=workdir, turn_source=turn_source)
+            # workdir/turn_source/model_id 必须透传：草稿首条消息是 /goal 时靠前两者
+            # 落库归组，靠 model_id 把用户当前选的模型继承到新会话（否则目标循环
+            # 每轮回退全局默认模型）
+            return self._goal_start(
+                action,
+                session_name,
+                workdir=workdir,
+                turn_source=turn_source,
+                model_id=model_id,
+            )
         # 翻译成一句提示词交给模型，由模型在回合内调用对应工具完成，
         # 这样本任务只做最小接入，不必在桥上重建一遍编排逻辑。
         # /skill 的动作里带着技能正文（core 层已查表命中的 body）时，直接把正文
@@ -8782,6 +8801,18 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": "会话不存在"}
         return self._goal_resume(target_session)
 
+    def goal_confirm(self, session_name: str = "") -> Dict[str, Any]:
+        """状态条上的「确认达成」：把 awaiting_confirm 的目标收敛为 achieved。
+
+        为什么必须是独立入口：自评档（没配 --check）的达成标记只代表模型自认为
+        做完了，不可信；循环因此停在 awaiting_confirm 等用户点头。没有这个接口时
+        状态条上只剩「停止」，用户看到"待确认"却无处确认。
+        """
+        target_session = str(session_name or "") or self._current_session
+        if not target_session:
+            return {"ok": False, "msg": "会话不存在"}
+        return self._goal_confirm(target_session)
+
     def _goal_status(self, session_name):
         """/goal status：输出轮次/状态/最近一轮摘要。"""
         try:
@@ -8874,6 +8905,52 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         )
         return {"ok": True, "slash": True}
 
+    def _goal_confirm(self, session_name):
+        """/goal confirm：自评达成后由用户点头，把目标收敛为 achieved。
+
+        只认 awaiting_confirm：running 时循环还在跑（提前确认会把剩余轮次吞掉），
+        achieved 重复确认是空操作，其余终态该走 resume 而不是确认。
+        """
+        from core.slash_commands.goal.state import (
+            STATUS_ACHIEVED,
+            STATUS_AWAITING_CONFIRM,
+        )
+
+        try:
+            store = self._goal_store()
+            state = store.load(session_name)
+        except Exception as exc:
+            logger.exception("读取目标状态失败")
+            self.post_notice(f"读取目标状态失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+        if state is None:
+            self.post_notice(
+                "当前会话没有可确认的目标，用 /goal <目标> 新建一个", session_name
+            )
+            return {"ok": True, "slash": True}
+        if state.status != STATUS_AWAITING_CONFIRM:
+            status_text = self._GOAL_STATUS_TEXT.get(state.status, state.status)
+            hint = {
+                "running": "目标还在跑，等出现「待确认」再确认达成",
+                "achieved": "目标已达成，无需重复确认；要跑新目标请用 /goal <目标>",
+            }.get(state.status, "")
+            self.post_notice(
+                f"当前状态为「{status_text}」，无需确认。{hint}".strip(), session_name
+            )
+            return {"ok": True, "slash": True}
+        state.status = STATUS_ACHIEVED
+        try:
+            store.save(state)
+        except Exception as exc:
+            logger.exception("保存目标状态失败")
+            self.post_notice(f"保存目标状态失败：{exc}", session_name, "error")
+            return {"ok": False, "msg": str(exc), "slash": True}
+        self.post_notice(
+            f"已确认目标达成（第 {state.round}/{state.max_rounds} 轮）：{state.goal}",
+            session_name,
+        )
+        return {"ok": True, "slash": True}
+
     def _materialize_goal_session(self, session_name, workdir, goal, turn_source="local"):
         """草稿会话在 /goal 启动前先按 workdir 落库，返回可用的会话名。
 
@@ -8908,12 +8985,80 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             logger.debug("goal 草稿落库失败", exc_info=True)
             return session_name
 
-    def _goal_start(self, action, session_name, workdir="", turn_source="local"):
+    def _known_model_ids(self):
+        """配置中真实存在的模型 id 集合（防陈旧显示值被落成真实绑定）。
+
+        与 send_user_message 的普通消息分支同一道防线：显示态一旦被旧全局值
+        污染，不能让错误 id 变成会话的真实绑定（宁可回退全局默认）。
+        """
+        return {
+            str(m.get("id"))
+            for p in load_config().get("providers", []) or []
+            for m in (p.get("models") or [])
+        }
+
+    def _goal_target_model_id(self, session_name, model_id=""):
+        """目标会话该用的模型：优先本次请求携带的选择，其次沿用会话已有的绑定。
+
+        为什么必须显式传：模型绑定只写在普通消息分支里，/goal 在斜杠层就地返回，
+        走不到那段；不补这一步，目标循环每轮读到的都是全局默认模型，用户会觉得
+        "我用 A 模型敲的命令，目标却换了个模型在跑"。
+        """
+        candidate = str(model_id or "").strip()
+        if candidate:
+            try:
+                known_ids = self._known_model_ids()
+            except Exception:
+                known_ids = set()
+            if not known_ids or candidate in known_ids:
+                return candidate
+        # 回退：触发时所在会话的绑定（旧客户端/其他入口不带 model_id 时）。
+        # 直接读库里的值，不需要再校验——能被绑进会话的 id 本来就是合法的。
+        getter = getattr(getattr(self, "_memory", None), "get_session_model_id", None)
+        if getter is None:
+            return ""
+        for name in (session_name, getattr(self, "_current_session", "")):
+            if not name:
+                continue
+            try:
+                bound = str(getter(name) or "").strip()
+            except Exception:
+                bound = ""
+            if bound:
+                return bound
+        return ""
+
+    def _inherit_goal_session_model(self, session_name, model_id):
+        """把触发 /goal 时的模型绑到目标会话；已有绑定不覆盖。
+
+        已有绑定代表用户在该会话里显式选过模型，是更强的意图；没有绑定则必须补，
+        否则目标循环每轮都退回全局默认模型（本问题的表现）。
+        """
+        if not model_id or not session_name:
+            return
+        memory = getattr(self, "_memory", None)
+        if memory is None:
+            return
+        getter = getattr(memory, "get_session_model_id", None)
+        setter = getattr(memory, "set_session_model_id", None)
+        if setter is None:
+            return
+        try:
+            if getter is not None and getter(session_name):
+                return
+            # 草稿会话若没能落库（无 workdir），这里无行可更，返回 False 即可：
+            # 后续普通回合还会按首条消息补绑定，不该拦住目标启动
+            setter(session_name, model_id)
+        except Exception:
+            logger.debug("目标会话模型继承失败", exc_info=True)
+
+    def _goal_start(self, action, session_name, workdir="", turn_source="local", model_id=""):
         """/goal <目标>：新建目标状态并启动后台循环。
 
         workdir/turn_source 由斜杠派发层透传：草稿会话的首条消息是 /goal 时，
         必须先按携带目录落库（见 _materialize_goal_session），否则目标循环会把
-        会话错挂到进程启动目录。
+        会话错挂到进程启动目录。model_id 是前端携带的当前激活模型，落库后要绑到
+        目标会话上，否则目标循环每轮回退全局默认模型。
         """
         from core.slash_commands.goal.state import GoalState
         from core.slash_commands.goal_command import DEFAULT_MAX_ROUNDS, GOAL_USAGE
@@ -8936,6 +9081,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "当前会话已有运行中的目标，先 /goal stop 再重新设定", session_name, "error"
             )
             return {"ok": False, "msg": "已有运行中的目标", "slash": True}
+        # 落库会把 _current_session 切到新会话，之后再问"用户当时用哪个模型"
+        # 就只剩全局默认了；先在切走之前定格。
+        goal_model_id = self._goal_target_model_id(session_name, model_id)
         # 草稿会话先按前端携带的目录落库：/goal 就地执行走不到普通消息的落库
         # 分支，缺这步会让目标循环首轮把会话错挂到进程启动目录（本次 bug）
         final_session = self._materialize_goal_session(
@@ -8945,6 +9093,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 后台循环、运行表与状态文件全部改用最终名：改名后旧名不复存在，
             # 否则 GoalBar / stop / resume 都查不到这个目标
             session_name = final_session
+        # 目标循环的每一轮都按会话绑定取模型：草稿会话刚落库还没有绑定，
+        # 不补这一步就会回退全局默认（"用 A 模型敲的命令，跑成了 B 模型"）。
+        self._inherit_goal_session_model(session_name, goal_model_id)
         state = GoalState(
             session=session_name,
             goal=goal,
@@ -9091,13 +9242,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 都不需要进入回合临界区；若放进锁内，命令里的 post_notice 广播会在持锁
             # 期间触发前端回调，容易和排队/补发逻辑互相等待。
             # workdir/turn_source 一并带入：草稿首条消息是 /goal 这类"本地命令 +
-            # 后续真实回合"时，动作层要按本条消息携带的目录先落库（见 _goal_start）
+            # 后续真实回合"时，动作层要按本条消息携带的目录先落库（见 _goal_start）；
+            # model_id 同样要带进去，否则 /goal 新建的会话拿不到用户当前选的模型
             slash = self._dispatch_slash(
                 clean_text,
                 target_session,
                 full_text,
                 workdir=str(workdir or ""),
                 turn_source=turn_source,
+                model_id=clean_model_id,
             )
             if slash is not None:
                 if "prompt" in slash:

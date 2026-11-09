@@ -7318,6 +7318,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
       await this.loadGoalState();
     },
 
+    // 状态条「确认达成」：自评档的达成标记不可信，循环停在 awaiting_confirm 等
+    // 用户点头；后端 /goal confirm 只认这个状态，调用后重拉让徽标变「已完成」
+    async confirmGoal() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.goal_confirm !== 'function') return;
+      try {
+        await api.goal_confirm(this.currentSessionName);
+      } catch (err) {
+        console.error('确认目标达成失败:', err);
+      }
+      await this.loadGoalState();
+    },
+
     // ---------------- 内嵌终端（右侧面板版已下线，交互式终端见 ptyTerminal*） ----------------
 
     async exportSession(fmt: 'md' | 'html' | 'json') {

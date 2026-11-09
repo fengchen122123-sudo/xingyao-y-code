@@ -13,6 +13,7 @@ const api = {
   get_goal_state: vi.fn().mockResolvedValue({ ok: true, state: null }),
   goal_stop: vi.fn().mockResolvedValue({ ok: true }),
   goal_resume: vi.fn().mockResolvedValue({ ok: true }),
+  goal_confirm: vi.fn().mockResolvedValue({ ok: true }),
 };
 
 beforeEach(() => {
@@ -97,5 +98,29 @@ it('achieved 状态用成功样式并在文案上标出「已完成」', async (
   expect(wrapper.find('[data-test="goal-stop"]').exists()).toBe(false);
   expect(wrapper.find('[data-test="goal-resume"]').exists()).toBe(false);
 
+  wrapper.unmount();
+});
+
+it('awaiting_confirm 渲染「确认达成」与「停止」，不给「继续」', async () => {
+  const { wrapper } = await mountWith(goal({ status: 'awaiting_confirm', round: 5 }));
+
+  expect(wrapper.get('[data-test="goal-status"]').text()).toBe('待确认');
+  // 自评不可信：必须给出确认入口，否则用户看到"待确认"却无处确认
+  expect(wrapper.find('[data-test="goal-confirm"]').exists()).toBe(true);
+  // 认为没达成时可以「停止」再「继续」跑剩余轮次，所以停止按钮同时保留
+  expect(wrapper.find('[data-test="goal-stop"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="goal-resume"]').exists()).toBe(false);
+
+  wrapper.unmount();
+});
+
+it('点击「确认达成」调用 store.confirmGoal', async () => {
+  const { wrapper, store } = await mountWith(goal({ status: 'awaiting_confirm', round: 5 }));
+  const confirmSpy = vi.spyOn(store, 'confirmGoal').mockResolvedValue(undefined);
+
+  await wrapper.get('[data-test="goal-confirm"]').trigger('click');
+  await flushPromises();
+
+  expect(confirmSpy).toHaveBeenCalledTimes(1);
   wrapper.unmount();
 });

@@ -36,6 +36,9 @@ _KEYWORD_ACTIONS = {
     "status": "goal_status",
     "stop": "goal_stop",
     "resume": "goal_resume",
+    # 自评达成（模型自己打标记）不能由循环直接收尾，必须由用户点头；没有这个
+    # 关键词时 awaiting_confirm 是个死胡同——状态条上只剩"停止"，用户无从确认。
+    "confirm": "goal_confirm",
 }
 
 
