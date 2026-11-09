@@ -75,6 +75,46 @@ def test_parse_sequence_rejects_empty_steps():
         parse_computer_action({"kind": "sequence", "target": "desktop", "steps": []})
 
 
+def test_parse_sequence_accepts_element_actions():
+    """sequence 接受元素引用动作：点按钮 → 填输入框可一次打包（Task 4）。"""
+    action = parse_computer_action({
+        "kind": "sequence",
+        "target": "desktop",
+        "steps": [
+            {"kind": "click_element", "target": "desktop", "element_ref": "el-1"},
+            {"kind": "set_value_element", "target": "desktop",
+             "element_ref": "el-2", "text": "发票号 A-001"},
+        ],
+    })
+    assert action.kind == "sequence"
+    assert [s.kind for s in action.steps] == ["click_element", "set_value_element"]
+    assert [s.element_ref for s in action.steps] == ["el-1", "el-2"]
+    assert action.steps[1].text == "发票号 A-001"
+
+
+def test_parse_sequence_still_rejects_list_elements():
+    """list_elements 仍不在 sequence 白名单：它会刷新 ref，必须单独调用。"""
+    with pytest.raises(ComputerControlError) as exc:
+        parse_computer_action({
+            "kind": "sequence",
+            "target": "desktop",
+            "steps": [{"kind": "list_elements", "target": "desktop"}],
+        })
+    assert exc.value.code == "computer_invalid_action"
+    assert "list_elements" in exc.value.message
+
+
+def test_parse_sequence_element_step_target_must_match():
+    """元素子步骤沿用既有 target 一致性校验，不放宽。"""
+    with pytest.raises(ComputerControlError) as exc:
+        parse_computer_action({
+            "kind": "sequence",
+            "target": "desktop",
+            "steps": [{"kind": "click_element", "target": "browser", "element_ref": "el-1"}],
+        })
+    assert "target" in exc.value.message
+
+
 # ---------------- Task 2：controller 执行 ----------------
 
 

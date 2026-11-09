@@ -104,10 +104,25 @@ MAX_WAIT_FOR_NAME_CODEPOINTS = 200
 # - 子步骤白名单：无副作用定位的基本输入动作。observe/request_user_takeover
 #   改变操控状态、语义定位依赖观察候选、navigate 是 browser 专属跳转，
 #   均不允许打包（必须单独调用并逐次观察）。
+# - 2026-11-09（Windows-MCP 对齐）：click_element / set_value_element 可打包，
+#   让模型把「点按钮 → 填输入框」按元素引用一次提交，减少往返；它们只按
+#   el-N 引用操作，不刷新 ref 表。list_elements 会整体刷新 ref（它之前解析的
+#   子步骤引用会失效），故仍必须单独调用、不允许进 sequence。
 # - 子步骤 target 必须与 sequence 本身一致；schema 层 items 故意宽松
 #   （嵌套完整动作 schema 会成倍膨胀 tools 字节），严格校验在 parse 层。
 _SEQUENCE_STEP_KINDS = frozenset(
-    {"click", "double_click", "move", "drag", "scroll", "type_text", "keypress", "wait"}
+    {
+        "click",
+        "double_click",
+        "move",
+        "drag",
+        "scroll",
+        "type_text",
+        "keypress",
+        "wait",
+        "click_element",
+        "set_value_element",
+    }
 )
 MAX_SEQUENCE_STEPS = 10
 
@@ -238,8 +253,9 @@ COMPUTER_ACTION_TOOL_SCHEMA = {
                     "description": (
                         "sequence 打包的子动作列表；每项是与 computer_action 相同格式的"
                         "单个动作对象，kind 限 click/double_click/move/drag/scroll/"
-                        "type_text/keypress/wait，target 必须与本动作一致，按顺序执行，"
-                        "中途不截图"
+                        "type_text/keypress/wait/click_element/set_value_element"
+                        "（list_elements 会刷新 ref，必须单独调用），target 必须与本"
+                        "动作一致，按顺序执行，中途不截图"
                     ),
                 },
             },
