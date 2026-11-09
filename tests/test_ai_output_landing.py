@@ -48,6 +48,10 @@ def _patch_hunyuan_http(monkeypatch, payload: bytes) -> None:
 
     body = json.dumps({"imageUrl": "https://example.com/gen.png"}).encode("utf-8")
     monkeypatch.setattr(hunyuan_image, "_resolve_api_key", lambda: "test-key")
+    # 接口地址也一并假造：不依赖开发机真实的 HUNYUAN_IMAGE_ENDPOINT 环境变量。
+    monkeypatch.setattr(
+        hunyuan_image, "_resolve_api_url", lambda: "https://example.com/gen"
+    )
     monkeypatch.setattr(
         hunyuan_image.urllib.request,
         "urlopen",
