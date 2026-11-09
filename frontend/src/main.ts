@@ -4,10 +4,6 @@ import './style.css';
 import './themes/field-notes.css';
 // 内置 QQ2009 皮肤的专属质感层（渐变标题栏/橙色悬停等平色 token 表达不了的效果）
 import './themes/qq2009.css';
-// 内置深夜工位皮肤的专属细节层（状态栏等宽读数、当前项脊线、助手消息签名线）
-import './themes/lamp.css';
-// 内置晨光皮肤的专属细节层（读数对齐、时间列等宽、助手消息去卡片化）
-import './themes/daybreak.css';
 import App from './App.vue';
 import { applyBootTheme } from './themes/runtime';
 import { useAppStore } from './stores/appStore';

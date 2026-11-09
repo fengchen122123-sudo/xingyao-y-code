@@ -179,12 +179,7 @@
         <NovelPane :active="activeTab === 'novel'" />
       </div>
 
-      <!-- 项目状态（特性 1）：三节项目画像只读展示 + 每节可编辑保存，激活时拉一次 -->
-      <div v-show="visualTab === 'project'" class="rpane active" data-test="project-pane-wrap">
-        <ProjectPane :active="activeTab === 'project'" />
-      </div>
-
-      <!-- 子代理执行过程：聊天卡片“查看”触发，1 秒轮询任务阶段历史 -->
+<!-- 子代理执行过程：聊天卡片“查看”触发，1 秒轮询任务阶段历史 -->
       <div v-show="visualTab === 'subagent'" class="rpane active" data-test="subagent-pane">
         <SubagentPane :active="activeTab === 'subagent'" />
       </div>
@@ -239,7 +234,6 @@ import DocumentPane from './DocumentPane.vue';
 import GitPanel from './GitPanel.vue';
 import SubagentPane from './SubagentPane.vue';
 import NovelPane from './NovelPane.vue';
-import ProjectPane from './ProjectPane.vue';
 import RightPanelSnip from './RightPanelSnip.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
@@ -355,9 +349,7 @@ const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> =
   { id: 'browser', label: '星眼 · 浏览器', icon: 'globe' },
   { id: 'tasks', label: '星港 · 后台任务', icon: 'square-terminal' },
   { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' },
-  { id: 'novel', label: '小说', icon: 'file' },
-  // 项目状态（特性 1）：三节项目画像的查看与编辑入口
-  { id: 'project', label: '项目状态', icon: 'layers' }
+  { id: 'novel', label: '小说', icon: 'file' }
 ];
 
 const PANE_LABELS: Record<RightPanelTabId, string> = {
@@ -368,8 +360,7 @@ const PANE_LABELS: Record<RightPanelTabId, string> = {
   tasks: '星港 · 后台任务',
   computer: '操控',
   subagent: '星舰 · 子代理',
-  novel: '小说',
-  project: '项目状态'
+  novel: '小说'
 };
 // 小说页签图标：图标表里没有 book，用「稿件」语义的 file（不新增图标资源）
 const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
@@ -380,9 +371,7 @@ const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
   tasks: 'square-terminal',
   computer: 'scan',
   subagent: 'blocks',
-  novel: 'file',
-  // 项目状态用「分层」语义（技术栈 / 架构决策 / 硬约束三层）
-  project: 'layers'
+  novel: 'file'
 };
 
 // run 开始时首次自动切入操控工作台（设计 16.2）：每个 run 只开一次（记录到

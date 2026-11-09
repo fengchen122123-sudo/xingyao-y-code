@@ -26,7 +26,6 @@ SCHEMA_VERSION = 1
 THEME_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 BUILTIN_IDS = (
     "builtin.dark", "builtin.light", "builtin.qq2009", "builtin.field-notes",
-    "builtin.lamp", "builtin.daybreak",
 )
 REGION_IDS = (
     "app_header", "sidebar", "conversation_toolbar", "workspace",
@@ -231,68 +230,6 @@ BUILTIN_THEMES = {
             "composer": _region("#E5DFCB", "#29271F", "#D8D2BE", "#E04E10"),
             "right_panel": _region("#E5DFCB", "#29271F", "#D8D2BE", "#E04E10"),
             "statusbar": _region("#1D3A2F", "#8FA493", "#163026", "#E04E10"),
-        },
-    ),
-    # 内置深夜工位：深夜桌面的暖石墨底 + 台灯琥珀强调。
-    # 底色向木色微偏暖（去掉默认的冷灰），强调色从编码工具的默认蓝换成灯下那点
-    # 琥珀；语义色统一降饱和，让状态色与暖灰同处一个灰度带，不再抢主色。
-    "builtin.lamp": _builtin_theme(
-        "builtin.lamp",
-        "dark",
-        {
-            "background_app": "#131210", "background_panel": "#181714", "background_card": "#1E1C18",
-            "background_elevated": "#26231E", "border": "#2B2820",
-            "text_primary": "#EBE6DC", "text_bright": "#FFF8EC", "text_secondary": "#A49D8F",
-            "text_faint": "#8F8678", "accent": "#D9A05B", "accent_secondary": "#C08A45",
-            "accent_soft": "#D9A05B29", "success": "#6F9F7D", "warning": "#B98B3C",
-            "danger": "#C96A5E", "orange": "#C97F45", "info": "#6F9A96", "purple": "#9A86B8",
-            "code_background": "#100F0D", "float_background": "#181714F7",
-            "font_sans": "'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
-            "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
-            "radius_small": 4, "radius_medium": 8, "radius_large": 12,
-            "shadow_color": "#000000", "shadow_strength": 0.40,
-        },
-        {"background": "#181714", "text": "#EBE6DC", "border": "#2B2820", "mode": "dark"},
-        name="内置 深夜工位",
-        regions={
-            "app_header": _region("#181714", "#A49D8F", "#2B2820", "#D9A05B"),
-            "sidebar": _region("#161512", "#CFC8BA", "#2B2820", "#D9A05B"),
-            "conversation_toolbar": _region("#131210", "#A49D8F", "#2B2820", "#D9A05B"),
-            "workspace": _region("#131210", "#EBE6DC", "#2B2820", "#D9A05B"),
-            "composer": _region("#131210", "#EBE6DC", "#2B2820", "#D9A05B"),
-            "right_panel": _region("#161512", "#A49D8F", "#2B2820", "#D9A05B"),
-            "statusbar": _region("#181714", "#8F8678", "#2B2820", "#D9A05B"),
-        },
-    ),
-    # 内置晨光：浅色底上的"纸与墨"版本。底色从冷灰白移到暖纸白，
-    # 强调色收成低饱和赭石（浅底上对比度 4.9:1），语义色整体降饱和，
-    # 让满屏的徽章与状态标签先退回中性，只留风险态一个颜色。
-    "builtin.daybreak": _builtin_theme(
-        "builtin.daybreak",
-        "light",
-        {
-            "background_app": "#F7F5F0", "background_panel": "#FFFFFF", "background_card": "#F1EEE7",
-            "background_elevated": "#FFFFFF", "border": "#E3DED4",
-            "text_primary": "#2A2721", "text_bright": "#14120E", "text_secondary": "#5F5A50",
-            "text_faint": "#6F6758", "accent": "#9C5B33", "accent_secondary": "#7E4826",
-            "accent_soft": "#9C5B331F", "success": "#3D7A52", "warning": "#8A6A1A",
-            "danger": "#A94B3C", "orange": "#A8622B", "info": "#3E7370", "purple": "#6E5C90",
-            "code_background": "#EFEBE3", "float_background": "#FFFFFFF7",
-            "font_sans": "'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
-            "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
-            "radius_small": 4, "radius_medium": 8, "radius_large": 12,
-            "shadow_color": "#2A2721", "shadow_strength": 0.12,
-        },
-        {"background": "#FFFFFF", "text": "#2A2721", "border": "#E3DED4", "mode": "light"},
-        name="内置 晨光",
-        regions={
-            "app_header": _region("#FFFFFF", "#5F5A50", "#E3DED4", "#9C5B33"),
-            "sidebar": _region("#F4F1EB", "#2A2721", "#E3DED4", "#9C5B33"),
-            "conversation_toolbar": _region("#FFFFFF", "#5F5A50", "#E3DED4", "#9C5B33"),
-            "workspace": _region("#F7F5F0", "#2A2721", "#E3DED4", "#9C5B33"),
-            "composer": _region("#FFFFFF", "#2A2721", "#E3DED4", "#9C5B33"),
-            "right_panel": _region("#F4F1EB", "#5F5A50", "#E3DED4", "#9C5B33"),
-            "statusbar": _region("#F4F1EB", "#6F6758", "#E3DED4", "#9C5B33"),
         },
     ),
 }
