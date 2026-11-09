@@ -460,6 +460,8 @@ def test_delete_session_stays_fast_with_many_harness_events(tmp_path):
     外键索引缺失时这条链退化成 O(父行数 × harness_events 行数)：本用例规模
     （300 消息 / 300 step / 40000 事件）实测无索引 823 ms、补索引 127 ms，
     真实库上 388 条消息的长会话是 2153 ms → 13 ms。
+    阈值取 900 ms：Python 3.14 + SQLite 3.50 下补索引后本机约 400 ms，仍远低于
+    无索引的 800 ms 量级；索引存在性由下方断言单独兜底，不靠时间阈值判断。
     """
     manager = MemoryManager(str(tmp_path / "del_perf.db"))
     session_name = "长会话"
@@ -499,8 +501,20 @@ def test_delete_session_stays_fast_with_many_harness_events(tmp_path):
     )
     manager.conn.commit()
 
+    # 防退化的硬约束：外键列索引必须存在。耗时阈值会随 SQLite 版本与磁盘波动
+    # （Python 3.14 + SQLite 3.50 下约 400 ms），但索引缺失会直接退化成
+    # O(父行数 × 事件数)，所以先断言索引，再卡一个宽松的耗时上限兜底。
+    index_names = {
+        row[0]
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'harness_events'"
+        )
+    }
+    assert "idx_harness_events_step_id" in index_names
+    assert "idx_harness_events_message_id" in index_names
+
     started = time.perf_counter()
     manager.delete_session(session_name)
     elapsed = time.perf_counter() - started
 
-    assert elapsed < 0.35, f"删除长会话耗时 {elapsed * 1000:.0f} ms，疑似外键索引缺失"
+    assert elapsed < 0.9, f"删除长会话耗时 {elapsed * 1000:.0f} ms，疑似外键索引缺失"
