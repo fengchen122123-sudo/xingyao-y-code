@@ -30,6 +30,16 @@ _SESSION_TOKEN_TIME_BOUND_SQL = (
     "OR t.ts >= CAST(strftime('%s', s.created_at, 'utc') AS INTEGER))"
 )
 
+# 删除会话时流水不物理删除，而是改挂到墓碑名下：真实消耗必须留在按日/
+# 按模型/总计统计里（用户删会话不该让历史用量凭空蒸发），而改名又让同名
+# 新会话无法继承这批历史。会话弹层走 JOIN sessions，墓碑行不会出现在列表。
+_TOKEN_USAGE_TOMBSTONE_PREFIX = "deleted::"
+
+
+def _token_usage_tombstone_name(session_name):
+    """已删会话流水的墓碑名：保留原名便于追溯，同时与活会话名天然隔离。"""
+    return f"{_TOKEN_USAGE_TOMBSTONE_PREFIX}{session_name}"
+
 
 def _canonicalize_api_base(value):
     """规范 endpoint 身份并移除 userinfo/query/fragment，避免分桶漂移或泄密。"""
@@ -3882,11 +3892,13 @@ class MemoryManager:
                         'DELETE FROM session_summary_generations WHERE session_name = ?',
                         (session_name,),
                     )
-                    # token 流水按 session_name 记账，会话行删除后流水若留下，
-                    # 同名新会话会把它当作自己的历史累计（2026-09-29 状态行
-                    # 显示 3200 万输入即此因），故与消息同事务一并清理。
+                    # token 流水不随会话删除而消失：真实消耗要留在按日/按模型/
+                    # 总计统计里。改挂墓碑名即可两全——既不会被同名新会话继承
+                    # （2026-09-29 状态行 3200 万输入即同名残留所致），也不会出现
+                    # 在会话弹层（list_token_usage_by_sessions 走 JOIN sessions）。
                     cursor.execute(
-                        'DELETE FROM token_usage WHERE session_id = ?', (session_name,)
+                        'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
+                        (_token_usage_tombstone_name(session_name), session_name),
                     )
                     cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
                     self.conn.commit()
@@ -3926,12 +3938,13 @@ class MemoryManager:
                         f'WHERE session_name IN ({placeholders})',
                         deleted_names,
                     )
-                    # 同 delete_session：会话行删除必须连带清理按名字记账的
-                    # token 流水，否则同名新会话会继承这批历史累计。
-                    cursor.execute(
-                        f'DELETE FROM token_usage WHERE session_id IN ({placeholders})',
-                        deleted_names,
-                    )
+                    # 同 delete_session：流水保留为墓碑行，历史统计不丢，
+                    # 同名新会话也不会继承这批累计。
+                    for deleted_name in deleted_names:
+                        cursor.execute(
+                            'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
+                            (_token_usage_tombstone_name(deleted_name), deleted_name),
+                        )
                 cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
                 cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (workdir_norm,))
                 self.conn.commit()

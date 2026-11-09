@@ -5,7 +5,8 @@
 继承同名旧会话的历史流水——2026-09-29 状态行显示 3200 万输入即此因
 （8-23 一个同名会话已删除，残留 227 行 3226 万 prompt 被今天的新会话算入）。
 
-同时验证会话删除会连带清理流水，避免继续产生孤儿行。
+同时验证会话删除不会丢流水：已删会话的用量改挂 deleted:: 墓碑名，
+既保留在按日/按模型/总计统计里，又不会被同名新会话继承。
 """
 
 import time
@@ -96,8 +97,8 @@ def test_list_token_usage_by_sessions_ignores_earlier_residue():
     assert row["requests"] == 1
 
 
-def test_delete_session_removes_token_usage_rows():
-    """删除会话必须连带清理按名字记账的流水，避免留下孤儿行。"""
+def test_delete_session_keeps_token_usage_in_statistics():
+    """删除会话不得丢掉真实消耗：流水改挂墓碑名，总量统计保持完整。"""
     manager = MemoryManager(":memory:")
     manager.create_session_explicit(SESSION_NAME)
     _add_usage(manager, ts=int(time.time()), prompt=321, completion=5)
@@ -106,15 +107,47 @@ def test_delete_session_removes_token_usage_rows():
 
     manager.delete_session(SESSION_NAME)
 
+    # 活会话名下不再有流水，按会话查询归零
     cursor = manager.conn.execute(
         "SELECT COUNT(*) FROM token_usage WHERE session_id = ?", (SESSION_NAME,)
     )
     assert cursor.fetchone()[0] == 0
     assert manager.get_token_usage_by_session(SESSION_NAME)["prompt"] == 0
 
+    # 但流水本身仍在墓碑名下，全局总计不缩水
+    tombstones = manager.conn.execute(
+        "SELECT COUNT(*) FROM token_usage WHERE session_id LIKE 'deleted::%'"
+    ).fetchone()[0]
+    assert tombstones == 1
+    assert manager.get_token_usage_totals()["prompt"] == 321
 
-def test_delete_sessions_by_workdir_removes_token_usage_rows(tmp_path):
-    """按工作目录批量删除会话时同样清理流水。"""
+    # 与 GUI / CLI 统计同源的按日聚合口径同样不能缩水
+    today = time.strftime("%Y-%m-%d")
+    day_rows = manager.query_token_usage_by_day_and_model(today, today)
+    assert sum(row["prompt"] for row in day_rows) == 321
+    assert sum(row["requests"] for row in day_rows) == 1
+
+
+def test_deleted_session_rows_not_inherited_by_same_name_new_session():
+    """墓碑行不会被同名新会话算进自己的累计，也不进会话弹层列表。"""
+    manager = MemoryManager(":memory:")
+    manager.create_session_explicit(SESSION_NAME)
+    _add_usage(manager, ts=int(time.time()), prompt=9000)
+    manager.delete_session(SESSION_NAME)
+
+    manager.create_session_explicit(SESSION_NAME)
+    _add_usage(manager, ts=int(time.time()), prompt=12, completion=1)
+
+    assert manager.get_token_usage_by_session(SESSION_NAME)["prompt"] == 12
+    listed = {item["session_id"] for item in manager.list_token_usage_by_sessions(limit=20)}
+    assert SESSION_NAME in listed
+    assert all(not name.startswith("deleted::") for name in listed)
+    # 历史消耗仍留在全局总计
+    assert manager.get_token_usage_totals()["prompt"] == 9012
+
+
+def test_delete_sessions_by_workdir_keeps_token_usage_in_statistics(tmp_path):
+    """按工作目录批量删除会话时同样保留流水统计。"""
     workdir = str(tmp_path)
     manager = MemoryManager(":memory:")
     names = ["workspace-token-a", "workspace-token-b"]
@@ -125,7 +158,12 @@ def test_delete_sessions_by_workdir_removes_token_usage_rows(tmp_path):
     manager.delete_sessions_by_workdir(workdir)
 
     cursor = manager.conn.execute("SELECT COUNT(*) FROM token_usage")
-    assert cursor.fetchone()[0] == 0
+    assert cursor.fetchone()[0] == 2
+    tombstones = manager.conn.execute(
+        "SELECT COUNT(*) FROM token_usage WHERE session_id LIKE 'deleted::%'"
+    ).fetchone()[0]
+    assert tombstones == 2
+    assert manager.get_token_usage_totals()["requests"] == 2
 
 
 def test_session_without_created_at_keeps_legacy_behavior():
