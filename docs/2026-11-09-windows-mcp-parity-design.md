@@ -34,8 +34,8 @@
 |---|---|---|
 | `WaitFor` 条件轮询 | 只有固定 `wait` 毫秒 | 新增 `wait_for` 动作 |
 | `MultiSelect` / `MultiEdit` | `sequence` 不支持元素动作 | `sequence` 白名单加入元素动作 |
-| `Process` list/kill | 仅 `execute_command` 间接 | 插件 `windows_process` |
-| `Clipboard` 文本 | 仅剪贴板图片 | 插件 `windows_clipboard` |
+| `Process` list/kill | 仅 `execute_command` 间接 | 插件 `windows_process_list` / `windows_process_kill` |
+| `Clipboard` 文本 | 仅剪贴板图片 | 插件 `windows_clipboard_get` / `windows_clipboard_set` |
 | `Registry` 读 | 无 | 插件 `windows_registry`（只读） |
 | `Notification` Toast | 无 | 插件 `windows_notify` |
 | `DisplayInventory` | `list_surfaces` 已含候选几何 | 不新增（现有能力覆盖） |
@@ -50,8 +50,8 @@ flowchart TD
         A2["sequence 支持元素动作"]
     end
     subgraph SYS["系统能力层：内置插件 plugins/windows_tools"]
-        B1["windows_process"]
-        B2["windows_clipboard"]
+        B1["windows_process_list / windows_process_kill"]
+        B2["windows_clipboard_get / windows_clipboard_set"]
         B3["windows_registry（只读）"]
         B4["windows_notify"]
     end
@@ -131,29 +131,44 @@ plugins/windows_tools/
 **平台动态注册**：`register()` 内先判断 `sys.platform != "win32"` 则直接返回，
 不注册任何工具——避免在 macOS/Linux 上白占 tools schema 字节。
 
-四个工具：
+六个工具（读写对半拆分）：
 
 | 工具 | 关键参数 | `read_only` | `requires_permission` | `side_effect_scope` |
 |---|---|---|---|---|
-| `windows_process` | `mode=list/kill`、`filter`、`sort_by`、`limit`、`pid`、`name`、`force` | False | kill=True / list=False | `system` |
-| `windows_clipboard` | `mode=get/set`、`text` | False | set=True / get=False | `system` |
+| `windows_process_list` | `filter`、`sort_by`、`limit` | True | False | `none` |
+| `windows_process_kill` | `pid` / `name`、`force` | False | True | `system` |
+| `windows_clipboard_get` | 无 | True | False | `none` |
+| `windows_clipboard_set` | `text` | False | True | `system` |
 | `windows_registry` | `mode=get/list`、`path`、`name`、`view` | True | False | `none` |
 | `windows_notify` | `title`、`message` | False | False | `none` |
 
+**为什么拆成 6 个而不是 4 个双模式工具**：`ToolSpec.requires_permission` 是
+工具级静态标记（审批判定只看这个布尔值，运行期无法按入参 `mode` 再改），
+若进程与剪贴板各用一个双模式工具，只读的 `list` / `get` 也会被迫走审批，
+或写入的 `kill` / `set` 被免审批放行——两种都不是想要的口径。因此把读、写
+拆成两个工具，让静态标记与真实副作用一一对应：只读工具 `read_only=True`、
+`requires_permission=False`、`side_effect_scope="none"`；写工具
+`read_only=False`、`requires_permission=True`、`side_effect_scope="system"`。
+`windows_registry` 本就只读（不提供写入/删除），无需拆分。
+
 实现要点：
 
-- `windows_process` 走 `psutil`（已在 `requirements.txt:9`），`kill` 前校验
-  PID 存在且不是当前进程/父进程，拒杀 `System Idle Process`、`System`、
-  `csrss.exe` 等关键进程，返回稳定错误码 `windows_process_protected`。
-- `windows_clipboard` 文本读写走 `ctypes` 调 `user32`/`kernel32`
-  （`OpenClipboard` / `GetClipboardData(CF_UNICODETEXT)`），不新增依赖；
-  读取失败统一返回「剪贴板暂无文本」而不是抛栈。
+- `windows_process_list` / `windows_process_kill` 走 `psutil`（已在
+  `requirements.txt:9`）；`kill` 前校验 PID 存在且不是当前进程/父进程，
+  拒杀 `System Idle Process`、`System`、`csrss.exe` 等关键进程，返回稳定
+  错误码 `windows_process_protected`。
+- `windows_clipboard_get` / `windows_clipboard_set` 文本读写走 `ctypes` 调
+  `user32`/`kernel32`（`OpenClipboard` / `GetClipboardData(CF_UNICODETEXT)`），
+  不新增依赖；读取失败统一返回「剪贴板暂无文本」而不是抛栈。
 - `windows_registry` 只用标准库 `winreg`；路径必须以
   `HKEY_CURRENT_USER\`、`HKEY_LOCAL_MACHINE\` 或 `HKEY_CLASSES_ROOT\` 开头，
   拒绝相对路径、`..` 与空路径；`mode=set/delete` 直接返回「本版本不提供写入」。
-- `windows_notify` 用 `win32api` 创建临时托盘图标并发气球通知
-  （`Shell_NotifyIconW`）后可立即销毁；失败时降级为返回提示文本，
-  不重试、不阻塞回合。
+- `windows_notify` 用 `win32gui.MessageBox`（前台窗口、`MB_OK |
+  MB_ICONINFORMATION`）弹系统提示框，**阻塞到用户点「确定」为止**，因此
+  工具描述明确要求只在用户确实需要立刻被提醒时使用，不得用来播报进度；
+  缺少 pywin32 时返回 `windows_notify_unavailable`。原先设计的托盘气球
+  （`Shell_NotifyIconW`）需要额外注册窗口类与图标，代码量与失败面更大且可能
+  被系统静默丢弃，故改为此实现。
 - 所有工具在 `YCODE_TOOL_PROFILE == "cli"` 时不注册（与电脑操控的 CLI 禁用口径
   一致）。
 
@@ -178,9 +193,9 @@ plugins/windows_tools/
 
 - `wait_for` 只读，不改变界面状态。
 - `windows_registry` 只读；写入/删除在 v1 直接拒绝并说明原因。
-- `windows_process` 的 kill 走审批（`requires_permission=True`），并内置关键进程
+- `windows_process_kill` 走审批（`requires_permission=True`），并内置关键进程
   保护；`side_effect_scope="system"`。
-- `windows_clipboard` 的 set 会覆盖用户剪贴板，走审批。
+- `windows_clipboard_set` 会覆盖用户剪贴板，走审批。
 - 所有动作沿用现有权限档位（`core/app_context.py` 的线程级绑定）与 owner lease，
   不新增旁路。
 
@@ -200,7 +215,7 @@ plugins/windows_tools/
 - P0：本设计文档评审通过。
 - P1：`wait_for` 协议扩展（actions/models/backend/controller）+ 测试。
 - P2：`sequence` 元素动作扩展 + 测试。
-- P3：`plugins/windows_tools` 四个工具 + 测试。
+- P3：`plugins/windows_tools` 六个工具（进程/剪贴板读写拆分 + 只读注册表 + 通知）+ 测试。
 - P4：提示词同步、黄金字节固化、构建与体积验收。
 
 P1/P2/P3 之间无文件冲突，可在不同分支或同一分支按序提交；P4 必须最后做。
@@ -211,7 +226,7 @@ P1/P2/P3 之间无文件冲突，可在不同分支或同一分支按序提交�
 |---|---|
 | `wait_for` 轮询阻塞回合 | 单次上限 30s，每轮检查 cancel_event；不引入后台线程 |
 | UIA 在部分应用（Chromium 自定义控件）匹配不到 | 错误码明确提示改用 observe + 元素列表，不静默成功 |
-| 插件工具增加 tools schema 字节 | 仅 Windows 注册；四个工具描述合计控制在约 400 字 |
+| 插件工具增加 tools schema 字节 | 仅 Windows 注册；六个工具描述合计控制在约 600 字 |
 | 注册表读取泄露敏感配置 | 只读 + 路径白名单 + 结果长度上限 4000 字符 |
 | 回滚 | 新增 kind 与插件均为纯增量，删除对应代码/目录即可回到当前行为；黄金字节随版本提交 |
 
@@ -220,6 +235,6 @@ P1/P2/P3 之间无文件冲突，可在不同分支或同一分支按序提交�
 1. 在 Windows 本机用视觉模型跑通：`wait_for(text_exists)` 命中后直接
    `click_element`，不出现 ref 失效。
 2. `sequence` 一次打包「点搜索框 → 输入 → 回车」成功。
-3. 四个插件工具在审批、只读标记、平台门控上行为符合第 5.3 节。
+3. 六个插件工具在审批、只读标记、平台门控上行为符合第 5.3 节。
 4. `venv\Scripts\python -m pytest tests/test_computer_*.py tests/test_plugin_windows_tools.py tests/test_prompt_byte_stability.py` 全绿。
 5. 构建后 `dist/ycode` 体积增量 < 1 MB。

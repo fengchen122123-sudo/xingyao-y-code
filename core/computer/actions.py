@@ -159,6 +159,13 @@ COMPUTER_ACTION_TOOL_SCHEMA = {
             "请先用 observe_region 取得局部观察再按其坐标点击。"
             "browser 的 observe_region 用 x/y/width/height（CSS 视口坐标）"
             "裁剪放大该区域；之后再点击时坐标以这块区域左上角为 (0,0)。"
+            "等待界面变化优先用 wait_for（text_exists / element_exists /"
+            " element_enabled / window_active，desktop only），不要用 wait 加"
+            "反复 observe 轮询：wait_for 命中后直接返回新观察，超时返回"
+            " computer_wait_timeout，此时改用 observe 检查画面再决定下一步。"
+            "sequence 可以打包 click_element / set_value_element 等元素动作，但"
+            "元素引用必须来自 sequence 之前最近一次 list_elements 返回的 ref，"
+            "否则会报 computer_element_stale。"
         ),
         "parameters": {
             "type": "object",

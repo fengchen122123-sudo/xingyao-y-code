@@ -92,14 +92,15 @@ Files:
 - Create: tests/test_plugin_windows_tools.py
 
 Steps:
-1) 写失败测试：非 Windows 注册为空；Windows 注册顺序为 windows_process、windows_clipboard、windows_registry、windows_notify（后者 Task 6 补齐）。
+1) 写失败测试：非 Windows 注册为空；Windows 注册顺序为 windows_process_list、windows_process_kill、windows_clipboard_get、windows_clipboard_set、windows_registry、windows_notify（后两者 Task 6 补齐）。
 2) 确认失败（目录不存在）。
 3) 实现：
    - plugin.json：name=windows_tools、version=0.1.0、entry=plugin.py、enabled=true。
    - register()：sys.platform != "win32" 或 YCODE_TOOL_PROFILE=cli 直接 return。
-   - _process_tool：list 用 psutil.process_iter(["pid","name","memory_info"])，支持 filter/sort_by/limit；kill 支持 pid 或 name，拒绝 _PROTECTED_NAMES（system、system idle process、csrss.exe、wininit.exe、winlogon.exe、services.exe、lsass.exe）与 pid 0/4/当前进程；force 用 kill，否则 terminate。
-   - _clipboard_tool：get 用 OpenClipboard + GetClipboardData(13) + GlobalLock + wstring_at；set 用 EmptyClipboard + GlobalAlloc(0x0042) + SetClipboardData；finally CloseClipboard。
-   - 两个 ToolSpec：read_only=False、requires_permission=True、side_effect_scope="system"。
+   - _process_list_tool：psutil.process_iter(["pid","name","memory_info"])，支持 filter/sort_by/limit。
+   - _process_kill_tool：支持 pid 或 name，拒绝 _PROTECTED_NAMES（system、system idle process、csrss.exe、wininit.exe、winlogon.exe、services.exe、lsass.exe）与 pid 0/4/当前进程；force 用 kill，否则 terminate。
+   - _clipboard_get_tool：OpenClipboard + GetClipboardData(13) + GlobalLock + wstring_at；_clipboard_set_tool：EmptyClipboard + GlobalAlloc(0x0042) + SetClipboardData；两者 finally CloseClipboard。
+   - 四个 ToolSpec（读写拆分，非双模式工具）：windows_process_list / windows_clipboard_get 为只读（read_only=True、requires_permission=False、side_effect_scope="none"）；windows_process_kill / windows_clipboard_set 为写（read_only=False、requires_permission=True、side_effect_scope="system"）。拆分原因：ToolSpec.requires_permission 是工具级静态标记，运行期无法按入参 mode 变化，双模式工具会让只读的 list/get 也走审批或让写动作免审批。
 4) pytest tests/test_plugin_windows_tools.py -q 通过。
 5) git commit -m "feat(plugin): windows_tools 进程与剪贴板能力"
 
@@ -123,11 +124,11 @@ Steps:
 
 ## Task 7 提示词与工具描述同步
 
-Files: core/computer/actions.py、system_prompt.md、system_prompt_gui.md
+Files: core/computer/actions.py、core/computer/provider_generic.py（电脑操控说明的真实注入点；system_prompt.md / system_prompt_gui.md 全文没有电脑操控段落，不硬造）
 Steps:
-1) COMPUTER_ACTION_TOOL_SCHEMA description 末尾追加：等待界面变化优先用 wait_for（四个 condition），不要用 wait 加反复 observe；超时返回 computer_wait_timeout。两个 system_prompt 的电脑操控段落追加：sequence 打包元素动作时，元素引用必须来自之前最近一次 list_elements。
+1) COMPUTER_ACTION_TOOL_SCHEMA description 末尾追加：等待界面变化优先用 wait_for（text_exists / element_exists / element_enabled / window_active），不要用 wait 加反复 observe 轮询；wait_for 命中后返回新观察，超时返回 computer_wait_timeout，此时改用 observe 检查画面；sequence 现在可以打包 click_element / set_value_element，元素引用必须来自 sequence 之前最近一次 list_elements。_GENERIC_DYNAMIC_PROMPT（电脑操控动态说明）追加：等待界面变化用 wait_for 条件等待，超时改 observe；sequence 打包元素动作时元素引用必须来自之前最近一次 list_elements，否则报 computer_element_stale。
 2) pytest tests/test_prompt_byte_stability.py tests/test_computer_llm_generic.py tests/test_computer_provider_generic.py -q。若固定摘要或工具数量断言失败，按有意协议扩展处理并在提交信息注明。
-3) git commit -m "docs(computer): 同步 wait_for 与 sequence 元素动作说明"
+3) 同步更新设计/计划文档（设计 §5.3 改为六个工具及各自 read_only / requires_permission / side_effect_scope；Task 5/6 工具名与本计划保持一致），git commit -m "docs(computer): 同步 wait_for 与 windows_tools 说明"
 
 ---
 
