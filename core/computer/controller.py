@@ -95,8 +95,19 @@ _TERMINAL_STATUSES = frozenset(
 # request_user_takeover 由 controller 处理、不进入 backend，也不计数（设计 14.4）。
 # R10：list_surfaces/observe_region 是观察类动作，同样不计数；
 # activate_surface 预期改变前台（参与计数，变化即归零）。
+# wait_for：条件等待命中时画面本来就可能不变（等的是稳定态，如窗口标题
+# 仍是「保存成功」），不产生任何输入，不能按无进展处理——否则连续
+# wait_for 会被误停为 computer_no_progress。
 _NO_PROGRESS_EXEMPT_KINDS = frozenset(
-    {"move", "observe", "wait", "request_user_takeover", "list_surfaces", "observe_region"}
+    {
+        "move",
+        "observe",
+        "wait",
+        "wait_for",
+        "request_user_takeover",
+        "list_surfaces",
+        "observe_region",
+    }
 )
 _NO_PROGRESS_LIMIT = 3
 
@@ -115,7 +126,8 @@ def next_progress_state(
     """无进展计数纯函数（R6）。
 
     1. 画面/有效目标状态改变：计数归零（不设为 1）并更新基线；
-    2. move/observe/wait/request_user_takeover 不增加失败计数；
+    2. move/observe/wait/wait_for/request_user_takeover 等不产生输入的
+       动作不增加失败计数（wait_for 命中时画面可能不变）；
     3. 豁免动作观察到真实变化同样归零并更新基线（不留过期基线）；
     4. 豁免动作且画面不变：保留既有失败次数（不得靠插入 observe 掩盖
        重复失败）。

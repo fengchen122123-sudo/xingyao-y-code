@@ -471,6 +471,35 @@ def test_observe_and_wait_do_not_count_no_progress(service, running_run, owner_a
     assert service.backend.close_count == 0
 
 
+def test_consecutive_wait_for_does_not_count_no_progress(service, owner_a, capability):
+    """连续 wait_for 不触发 computer_no_progress（画面不变是等待的常态）。
+
+    条件等待命中稳定态时画面天然不变（例如标题仍是「保存成功」），若按无进展
+    计数，连续 wait_for 会在第 4 次被误停为 computer_no_progress。
+    """
+    run = service.start_run(owner_a, capability, target="desktop")
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="desktop"))
+    backend = service.backend
+    assert backend.target == "desktop"
+    backend._screen_hashes = ["same"] * 12
+    for _ in range(6):
+        observation = service.execute(
+            run.run_id,
+            owner_a,
+            ComputerAction(
+                kind="wait_for",
+                target="desktop",
+                condition="text_exists",
+                text="保存成功",
+                timeout_ms=1000,
+                interval_ms=100,
+            ),
+        )
+        assert observation.ok
+    assert service.snapshot().status == "running"
+    assert service.backend.close_count == 0
+
+
 # ---------------- 事件 ----------------
 
 
