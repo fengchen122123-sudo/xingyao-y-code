@@ -94,6 +94,27 @@ def test_iteration_startup_only_on_first(storage):
     assert len(recorder.calls) == 1
 
 
+def test_iteration_startup_retriggers_on_new_process(storage):
+    """回归：应用重启（新引擎实例）时 startup 任务重新触发一次。"""
+    task = _insert_task(storage, trigger_type="startup", trigger_config={}, due=False)
+    clock = {"now": 1000.0}
+
+    def time_fn():
+        return clock["now"]
+
+    first = DispatchRecorder()
+    AutomationEngine(storage, first, time_fn=time_fn)._run_iteration()
+    assert first.call_count(task["id"]) == 1
+    assert first.calls[0][2] == "startup"
+    storage.finish_run(first.calls[0][1], "completed")
+    # 下一次应用启动：进程启动时刻晚于上次写入的认领标记
+    clock["now"] = 1000.0 + 86400
+    second = DispatchRecorder()
+    AutomationEngine(storage, second, time_fn=time_fn)._run_iteration()
+    assert second.call_count(task["id"]) == 1
+    assert second.calls[0][2] == "startup"
+
+
 def test_iteration_single_flight_does_not_dispatch(storage):
     task = _insert_task(storage)
     storage._insert_run_raw(new_automation_id("run"), task["id"], "会话", "running")

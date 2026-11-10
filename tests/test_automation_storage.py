@@ -342,6 +342,45 @@ def test_claim_startup_only_on_first_iteration(storage):
     assert second == []
 
 
+def test_claim_startup_no_repeat_within_same_process(storage):
+    """给了进程启动时刻后，同一进程的后续轮次不重复触发 startup。"""
+    task_id = storage.save_task(_task(trigger_type="startup", trigger_config={}))
+    boot = time.time()
+    first = storage.claim_due_tasks(
+        boot, _compute(None), include_startup=True, catchup_enabled=False, startup_since=boot
+    )
+    assert len(first) == 1 and first[0][2] == "startup"
+    assert first[0][0]["id"] == task_id
+    storage.finish_run(first[0][1], "completed")
+    again = storage.claim_due_tasks(
+        boot + 1800, _compute(None), include_startup=True, catchup_enabled=False, startup_since=boot
+    )
+    assert again == []
+
+
+def test_claim_startup_retriggers_on_next_process(storage):
+    """回归：应用再次启动时 startup 任务必须重新触发。
+
+    修复前认领标记写入 next_run_at 后就再不为 NULL，而认领条件要求它是 NULL，
+    导致 startup 任务一生只触发一次。
+    """
+    task_id = storage.save_task(_task(trigger_type="startup", trigger_config={}))
+    boot1 = time.time()
+    first = storage.claim_due_tasks(
+        boot1, _compute(None), include_startup=True, catchup_enabled=False, startup_since=boot1
+    )
+    assert len(first) == 1 and first[0][2] == "startup"
+    storage.finish_run(first[0][1], "completed")
+    # 下一次应用启动：进程启动时刻晚于上次写入的认领标记
+    boot2 = boot1 + 86400
+    second = storage.claim_due_tasks(
+        boot2, _compute(None), include_startup=True, catchup_enabled=False, startup_since=boot2
+    )
+    assert len(second) == 1
+    assert second[0][0]["id"] == task_id
+    assert second[0][2] == "startup"
+
+
 def test_catchup_skip_policy_records_and_reschedules(storage):
     task = _insert_due_task(storage, next_run_at=time.time() - 3600, missed_run_policy="skip")
     now = time.time()

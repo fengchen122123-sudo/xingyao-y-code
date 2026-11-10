@@ -42,6 +42,9 @@ class AutomationEngine:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._first_iteration = True
+        # 本轮进程（引擎生命周期）的启动时刻：startup 任务按它与认领标记比较，
+        # 保证每个进程启动恰好触发一次，而不是标记写过一次就永久失效。
+        self._process_started_at = float(self._time_fn())
 
     # -- 生命周期 --
 
@@ -50,6 +53,7 @@ class AutomationEngine:
             return
         self._stop.clear()
         self._first_iteration = True
+        self._process_started_at = float(self._time_fn())
         self._thread = threading.Thread(
             target=self._loop, name="automation-engine", daemon=True
         )
@@ -92,6 +96,7 @@ class AutomationEngine:
                 compute_next_run,
                 include_startup=include_first,
                 catchup_enabled=include_first,
+                startup_since=self._process_started_at if include_first else None,
             )
         except Exception as exc:
             logger.error("自动化任务认领失败，本轮跳过: %s", exc)

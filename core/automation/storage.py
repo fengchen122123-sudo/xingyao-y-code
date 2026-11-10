@@ -566,12 +566,17 @@ class AutomationStorage:
         *,
         include_startup: bool = False,
         catchup_enabled: bool = False,
+        startup_since: Optional[float] = None,
     ) -> list[tuple[dict, str, str]]:
         """原子认领到期任务，返回 [(task_snapshot, run_id, trigger_kind)]。
 
         - 常规：CAS UPDATE 认领（trigger_kind="scheduled"）；
-        - include_startup（引擎首轮）：startup 任务按 ``next_run_at IS NULL`` CAS
-          认领一次（认领后写入 last_run_at/next_run_at 标记，本轮进程不再触发）；
+        - include_startup（引擎首轮）：startup 任务认领一次（认领后写入
+          last_run_at/next_run_at 标记，本轮进程不再触发）。标记是持久化的，
+          所以不能用「next_run_at IS NULL」判定：标记写过一次就再不为 NULL，
+          任务会永久失效。传 startup_since（本次进程启动时刻）时按「标记早于
+          启动时刻」认领——每个进程生命周期恰好触发一次；不传则退化为
+          「next_run_at IS NULL 才认领」（仅用于不带进程时钟的裸调用）；
         - catchup_enabled（引擎首轮）：next_run_at 早于容差的启用任务按
           missed_run_policy 处理——skip 留痕重算；run_once 以 "catchup" 认领一次；
         - 单飞：认领前检查同任务是否有 queued/running 运行，命中则写 skipped 行
@@ -582,13 +587,31 @@ class AutomationStorage:
         with self._manager._lock:
             cursor = self.conn.cursor()
             if include_startup:
+                if startup_since is None:
+                    startup_where = (
+                        "enabled = 1 AND status = 'active' AND trigger_type = 'startup' "
+                        "AND next_run_at IS NULL"
+                    )
+                    startup_params: tuple = ()
+                else:
+                    startup_where = (
+                        "enabled = 1 AND status = 'active' AND trigger_type = 'startup' "
+                        "AND (next_run_at IS NULL OR next_run_at < ?)"
+                    )
+                    startup_params = (float(startup_since),)
                 for row in self._select_tasks_locked(
-                    cursor,
-                    "enabled = 1 AND status = 'active' AND trigger_type = 'startup' AND next_run_at IS NULL",
+                    cursor, startup_where, startup_params
                 ):
                     task = _row_to_task(row)
                     self._claim_or_skip_locked(
-                        cursor, task, None, "startup", claimed, fired, now_ts
+                        cursor,
+                        task,
+                        None,
+                        "startup",
+                        claimed,
+                        fired,
+                        now_ts,
+                        startup_since=startup_since,
                     )
             if catchup_enabled:
                 threshold = now_ts - CATCHUP_GRACE_SECONDS
@@ -676,6 +699,8 @@ class AutomationStorage:
         claimed: list[tuple[dict, str, str]],
         fired: list[dict],
         now_ts: float,
+        *,
+        startup_since: Optional[float] = None,
     ) -> None:
         """CAS 认领一个到期任务；单飞命中或 CAS 失败时不派发。"""
         if self._has_active_run_locked(cursor, task["id"]):
@@ -692,11 +717,21 @@ class AutomationStorage:
             )
             return
         if trigger_kind == "startup":
-            # startup 无计划时刻：以 next_run_at IS NULL 作为认领标记，防同进程重复触发
-            cursor.execute(
-                "UPDATE automation_tasks SET next_run_at = ?, last_run_at = ? WHERE id = ? AND enabled = 1 AND next_run_at IS NULL",
-                (now_ts, iso_now(), task["id"]),
-            )
+            # startup 无计划时刻：用 next_run_at 存「本轮进程已触发」的标记。
+            # 标记持久化在库里，故 CAS 不能要求它恒为 NULL（那样标记一写就
+            # 永久失效）；传了 startup_since（进程启动时刻）时，条件放宽为
+            # 「标记早于本次启动」，同一进程内第二轮仍不会重复触发。
+            marker = float(now_ts)
+            if startup_since is None:
+                cursor.execute(
+                    "UPDATE automation_tasks SET next_run_at = ?, last_run_at = ? WHERE id = ? AND enabled = 1 AND next_run_at IS NULL",
+                    (marker, iso_now(), task["id"]),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE automation_tasks SET next_run_at = ?, last_run_at = ? WHERE id = ? AND enabled = 1 AND (next_run_at IS NULL OR next_run_at < ?)",
+                    (marker, iso_now(), task["id"], float(startup_since)),
+                )
         else:
             cursor.execute(
                 "UPDATE automation_tasks SET next_run_at = ?, last_run_at = ? WHERE id = ? AND enabled = 1 AND next_run_at IS ?",
