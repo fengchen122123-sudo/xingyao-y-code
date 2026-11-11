@@ -3,7 +3,7 @@ ycode_uninstall.py
 Y-code 官方 Windows 卸载向导（经典 Windows 安装程序样式 GUI，与安装向导一致）。
 
 会清理完整版 (GUI + 可选 CLI) 或独立 CLI 安装留下的全部痕迹：
-  - 桌面快捷方式 (Y-code.lnk / Y-code CLI.lnk / 旧版 Y-code TUI.lnk，都尝试删除)
+  - 桌面快捷方式 (星瑶code.lnk / 旧命名 Y-code.lnk / Y-code CLI.lnk / 旧版 Y-code TUI.lnk，都尝试删除)
   - HKCU\\Environment\\PATH（user 范围）或系统 PATH（machine 范围）里的安装目录
   - HKCU/HKLM\\...\\Uninstall 下的注册表项 (Y-code / Y-code-CLI / 旧版 Y-code-TUI)
   - 可选：~/.ycode 用户配置与会话记录
@@ -24,30 +24,16 @@ import time
 import ctypes
 import winreg
 
-# 复用安装向导一侧已实现并测试过的基础工具（桌面路径/环境变量广播/管理员检测）
-from ycode_setup import (
+# 复用安装/卸载向导共享的基础工具（桌面路径/环境变量广播/管理员检测/reparse 判定）。
+# 从 installer_common 导入而不是 ycode_setup：避免把安装向导的 tkinter/PIL
+# 依赖树拖进卸载器二进制（32MB → ~25MB）。
+from installer_common import (
+    _is_reparse_path,
     broadcast_environment_change,
-    get_desktop_dir,
     get_common_desktop_dir,
+    get_desktop_dir,
     is_user_an_admin,
 )
-
-try:
-    # 修复 #2：优先直接复用安装器里已单测过的挂载点（符号链接/目录联接）检测，
-    # 保证安装/卸载两侧对 reparse point 的判定完全一致。
-    from ycode_setup import _is_reparse_path
-except ImportError:  # 卸载器被单独拷出、安装器不在 sys.path 时的兜底等价实现
-    def _is_reparse_path(path):
-        """判断已存在路径是否会重定向文件系统遍历（符号链接/目录联接）。
-
-        os.path.islink 覆盖符号链接；os.path.isjunction（Python 3.12+，
-        基于 GetFileAttributesW 的 FILE_ATTRIBUTE_REPARSE_POINT 属性）
-        覆盖目录联接等挂载点。
-        """
-        if os.path.islink(path):
-            return True
-        isjunction = getattr(os.path, "isjunction", None)
-        return bool(isjunction and isjunction(path))
 
 
 def _resolve_ycode_data_dir():
@@ -134,8 +120,9 @@ def _registry_marker_matches(install_dir):
 # 卸载注册表项（完整版入口 + 独立 CLI 入口 + 旧版 TUI 命名兼容清理，都尝试移除；
 # "Y-code-TUI" 是兼容旧版安装的历史数据，不属于代码中的界面命名）
 UNINSTALL_KEY_NAMES = ("Y-code", "Y-code-CLI", "Y-code-TUI")
-# 桌面快捷方式（GUI 版 + CLI 版 + 旧版 TUI 命名兼容清理）
-SHORTCUT_NAMES = ("Y-code.lnk", "Y-code CLI.lnk", "Y-code TUI.lnk")
+# 桌面快捷方式（新品牌名「星瑶code」+ GUI 版旧命名 + CLI 版 + 旧版 TUI 命名兼容清理，
+# 老用户桌面上遗留的旧命名快捷方式仍要能一并清掉）
+SHORTCUT_NAMES = ("星瑶code.lnk", "Y-code.lnk", "Y-code CLI.lnk", "Y-code TUI.lnk")
 
 
 # ============================================================================

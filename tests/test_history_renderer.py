@@ -251,3 +251,29 @@ def test_blank_line_between_assistant_blocks_in_replay():
     assert "\n🤖" in plain(rendered) or "\n\x1b" in rendered
     # 第二个 assistant 块头部前必须有空行
     assert "\n\x1b[35m🤖" in rendered
+
+
+def test_history_replay_skips_system_injected_user_messages():
+    """后台任务回报/护栏催促/hook 上下文等系统注入 user 消息：
+    CLI 历史回放一律跳过，不冒充用户发言（与 GUI 气泡、红点导航同一裁决）。"""
+    history = [
+        {"role": "user", "content": "真正的问题"},
+        {
+            "role": "user",
+            "content": (
+                "<task-notification>\n"
+                "  <task-id>subagent-d66d7cca</task-id>\n"
+                "  <status>timed_out</status>\n"
+                "</task-notification>"
+            ),
+        },
+        {"role": "user", "content": "计划尚未执行完毕，仍有可执行的计划项: ['P1'](x)。"},
+        {"role": "assistant", "content": "回答"},
+    ]
+
+    rendered = plain(render_session_history(history, width=60))
+
+    assert "真正的问题" in rendered
+    assert "task-notification" not in rendered
+    assert "计划尚未执行完毕" not in rendered
+    assert "回答" in rendered

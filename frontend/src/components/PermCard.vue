@@ -11,6 +11,33 @@
       </div>
     </div>
     <div class="pc-body">{{ store.permRequest.summary }}</div>
+    <!-- 按回合撤销：undo_turn 卡片展示服务预检的影响摘要与警告 -->
+    <div v-if="store.permRequest.functionName === 'undo_turn' && undoImpact" class="pc-undo-impact">
+      <template v-if="undoImpact.available">
+        <div class="pc-undo-line">
+          回合 {{ undoImpact.short_id }}：共 {{ undoImpact.file_count }} 个文件 —
+          恢复原内容 {{ undoImpact.restore_content_count }}，
+          删除本轮新建 {{ undoImpact.delete_created_count }}，
+          恢复本轮删除 {{ undoImpact.restore_deleted_count }}
+        </div>
+        <div v-if="(undoImpact.created_files || []).length" class="pc-undo-line">
+          将删除的新建文件：{{ undoImpact.created_files.join('、') }}
+        </div>
+        <div class="pc-undo-line muted">聊天历史保留，星瑶将记住文件结果已失效。</div>
+        <div v-if="undoImpact.has_uncovered_command_effects" class="pc-undo-line warn">
+          ⚠️ 本轮执行过通用命令：仅恢复受控文件，命令的其他副作用不撤销。
+        </div>
+        <div v-if="(undoImpact.subsequent_completed_turns || 0) > 0" class="pc-undo-line warn">
+          ⚠️ 目标回合之后还有 {{ undoImpact.subsequent_completed_turns }} 个已完成回合，可能存在语义依赖，撤销后请重新检查或测试。
+        </div>
+        <div v-if="(undoImpact.conflicts || []).length" class="pc-undo-line warn">
+          ⚠️ 预检发现冲突文件，批准后将拒绝整轮撤销、零文件写入。
+        </div>
+      </template>
+      <template v-else>
+        <div class="pc-undo-line warn">⚠️ 预检未通过：{{ undoImpact.message || '预检不可用' }}（批准后执行会拒绝写入）</div>
+      </template>
+    </div>
     <!-- ask_user 澄清问题：选项列表，每个选项一行 -->
     <div v-if="store.permRequest.functionName === 'ask_user' && store.permRequest.options.length" class="pc-choices">
       <button
@@ -63,10 +90,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 const store = useAppStore();
+
+// 按回合撤销：undo_turn 权限卡附带的服务预检影响摘要
+const undoImpact = computed(() => store.permRequest.undoImpact ?? null);
 
 // ask_user 第四项：自定义回答（选项都不合适时直接输入告诉星瑶）
 const customAnswer = ref('');
@@ -141,6 +171,27 @@ watch(() => store.permRequest.reqId, () => {
   display: flex;
   gap: 9px;
   justify-content: flex-end;
+}
+/* 按回合撤销：undo_turn 影响摘要 */
+.pc-undo-impact {
+  margin: 0 16px 12px;
+  padding: 10px 14px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+.pc-undo-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.pc-undo-line.warn {
+  color: var(--orange);
+}
+.pc-undo-line.muted {
+  color: var(--text-faint);
 }
 .pc-btn {
   border-radius: 8px;

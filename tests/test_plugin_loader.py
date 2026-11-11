@@ -1,6 +1,9 @@
 """core/plugin_loader.py 的单元测试。"""
 
 import json
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -47,6 +50,39 @@ _NO_REGISTER_PLUGIN = """
 X = 1
 """
 
+# 插件在加载期直接抛 SystemExit（B5-04：修复前会穿透 except Exception 中断加载流程）
+_SYSEXIT_PLUGIN = """
+import sys
+sys.exit(9)
+"""
+
+# 插件加载期抛 KeyboardInterrupt：必须维持传播（不能被插件隔离吞掉）
+_KEYBOARD_INTERRUPT_PLUGIN = """
+raise KeyboardInterrupt("插件要求中断")
+"""
+
+# 正常注册工具，但 cleanup() 禁用钩子抛 SystemExit（B5-04 同类路径）
+_CLEANUP_SYSEXIT_PLUGIN = """
+import sys
+
+from core.tool_protocol import ToolSpec
+
+
+def register(registry):
+    registry.register(ToolSpec(
+        name="cleanup_demo_tool",
+        description="demo",
+        input_schema={"type": "object", "properties": {}},
+        execute=lambda: "ok",
+        read_only=True,
+        requires_permission=False,
+    ))
+
+
+def cleanup():
+    sys.exit(3)
+"""
+
 
 @pytest.fixture
 def plugin_env(tmp_path, monkeypatch):
@@ -89,6 +125,79 @@ def test_broken_plugin_is_skipped_without_crashing(plugin_env):
 
     assert loaded == ["demo"]
     assert registry.execute("demo_tool", x="ok").content == "hello ok"
+
+
+# ── SystemExit / KeyboardInterrupt 隔离（B5-04） ─────────────────────
+
+def test_sysexit_plugin_is_skipped_without_crashing(plugin_env):
+    """插件抛 SystemExit 只算该插件加载失败，不穿透中断加载流程（B5-04）"""
+    user_dir, _ = plugin_env
+    # 命名保证 SystemExit 插件排在正常插件之前被扫描，验证"继续加载其他插件"
+    _make_plugin(user_dir / "aa_exiter", "aa_exiter", _SYSEXIT_PLUGIN)
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == ["demo"]
+    assert registry.execute("demo_tool", x="ok").content == "hello ok"
+    infos = {i["name"]: i for i in plugin_loader.get_plugin_infos()}
+    assert infos["aa_exiter"]["status"] == "failed"
+    assert "9" in infos["aa_exiter"]["error"]
+
+
+def test_sysexit_plugin_during_refresh_is_skipped(plugin_env):
+    """运行期间出现的 SystemExit 插件：热刷新只记失败，不中断刷新流程（B5-04）"""
+    user_dir, _ = plugin_env
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    _make_plugin(user_dir / "aa_exiter", "aa_exiter", _SYSEXIT_PLUGIN)
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    plugin_loader.refresh_plugins(registry)
+
+    infos = {i["name"]: i for i in plugin_loader.get_plugin_infos()}
+    assert infos["aa_exiter"]["status"] == "failed"
+    assert registry.execute("demo_tool", x="hot").content == "hello hot"
+
+
+def test_keyboard_interrupt_from_plugin_propagates(plugin_env):
+    """KeyboardInterrupt 必须维持传播：插件隔离不能吞掉用户中断"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "ki", "ki", _KEYBOARD_INTERRUPT_PLUGIN)
+
+    registry = ToolRegistry()
+    with pytest.raises(KeyboardInterrupt):
+        plugin_loader.load_and_register(registry)
+
+
+def test_toggle_enable_sysexit_plugin_reports_hot_failure(plugin_env, monkeypatch):
+    """热启用时插件抛 SystemExit：只报热切换失败，不穿透中断调用方（B5-04）"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "exiter", "exiter", _SYSEXIT_PLUGIN, enabled=False)
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+
+    ok, msg = plugin_loader.toggle_plugin("exiter", True)
+
+    assert ok is True
+    assert "热切换失败" in msg
+    assert "重启后生效" in msg
+
+
+def test_toggle_disable_cleanup_sysexit_does_not_fail_disable(plugin_env, monkeypatch):
+    """禁用时插件 cleanup() 抛 SystemExit：禁用动作仍成功（B5-04）"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "c", "c", _CLEANUP_SYSEXIT_PLUGIN)
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == ["c"]
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+
+    ok, msg = plugin_loader.toggle_plugin("c", False)
+
+    assert ok is True
+    assert "清理失败" in msg
 
 
 def test_plugin_without_register_function_is_skipped(plugin_env):
@@ -487,3 +596,147 @@ def test_trust_plugin_persists_fingerprint_entry(plugin_env, tmp_path):
         str((user_dir / "demo").resolve()):
             plugin_loader._plugin_fingerprint(user_dir / "demo")
     }
+
+
+def test_core_managed_markers_include_tokenrhythm_account_provider():
+    """基元律动账号托管的标记值必须被识别为核心托管，不是插件名。"""
+    from core.tokenrhythm_auth import MANAGED_PROVIDER_VALUE
+
+    assert MANAGED_PROVIDER_VALUE in plugin_loader._core_managed_markers()
+
+
+def test_prune_orphan_providers_keeps_account_provider(monkeypatch):
+    """孤儿清理不能删基元律动账号创建的厂商，否则重启一次 Key 就没了。
+
+    真实事故：登录成功 → 创建 provider 与 API Key → 重启时插件加载完毕触发清理，
+    把 managed_by="tokenrhythm" 当成"来源插件未加载"整个删掉，用户看到的就是
+    「明明登录了但 Key 没配置成功」。
+    """
+    import config as config_module
+    import core.model_manager as model_manager
+
+    cfg = {
+        "providers": [
+            # 账号绑定自动创建：必须保留（连它名下的模型一起）
+            {
+                "id": "tr1",
+                "name": "基元律动（基元律动请送…）",
+                "managed_by": "tokenrhythm",
+                "models": [{"id": "m_tr"}],
+            },
+            # 已加载插件托管的：保留
+            {
+                "id": "p_plugin",
+                "name": "免费通道",
+                "managed_by": "tokenrhythm_image",
+                "models": [],
+            },
+            # 用户手配、没有标记：永远不碰
+            {"id": "p_user", "name": "手动厂商", "models": [{"id": "m_user"}]},
+            # 插件已卸载/禁用的孤儿：这次要被清掉
+            {
+                "id": "p_orphan",
+                "name": "被禁用的插件厂商",
+                "managed_by": "gone_plugin",
+                "models": [{"id": "m_orphan"}],
+            },
+        ],
+        "active_model_id": "m_orphan",
+    }
+
+    monkeypatch.setattr(model_manager, "load_config", lambda: cfg)
+    written = {}
+
+    def _fake_update_config(mutator):
+        data = json.loads(json.dumps(cfg))
+        mutator(data)
+        written["data"] = data
+
+    monkeypatch.setattr(config_module, "update_config", _fake_update_config)
+
+    removed = plugin_loader._prune_orphan_providers({"tokenrhythm_image"})
+
+    assert removed == ["被禁用的插件厂商"]
+    assert [p["id"] for p in written["data"]["providers"]] == ["tr1", "p_plugin", "p_user"]
+    # 激活模型属于被删厂商时才清空，属于保留厂商时不受影响
+    assert written["data"]["active_model_id"] is None
+
+
+# ── 并发安全：信任确认不阻塞后台线程 / 刷新串行化（2026-11-04 卡死事故回归） ──
+
+def test_confirm_plugin_trust_never_prompts_from_worker_thread(monkeypatch):
+    """后台线程（工具调用 / 前端 RPC）绝不落到控制台 input()。
+
+    事故：plugin_manage 触发的 get_plugins 在 worker 线程刷新插件，未信任插件
+    走到 input()，提示打在隐藏控制台里无人回答，回合线程卡死 5.5 小时，停止
+    按钮也无法中断。回归要求：非主线程直接判定未信任并返回。
+    """
+    prompts = []
+
+    class _Tty:
+        def isatty(self):
+            return True
+
+    def _fake_input(prompt=""):
+        prompts.append(prompt)
+        raise AssertionError("后台线程不应调用 input()")
+
+    monkeypatch.setattr(plugin_loader, "_trust_prompt", None)
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", _REAL_CONFIRM)
+    monkeypatch.setattr("sys.stdin", _Tty())
+    monkeypatch.setattr("sys.stdout", _Tty())
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    result = []
+
+    def _run():
+        result.append(
+            plugin_loader._confirm_plugin_trust(Path("demo"), "demo", "fp")
+        )
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    worker.join(5)
+
+    assert result == [False]
+    assert prompts == []
+
+
+def test_refresh_plugins_serializes_concurrent_loads(plugin_env, monkeypatch):
+    """并发 refresh_plugins 只加载一次：不串行会让同一插件被重复 exec+register。"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "serial", "serial_demo", _GOOD_PLUGIN)
+    plugin_loader._PLUGIN_INFOS.clear()
+
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+    real_load = plugin_loader._load_one
+
+    def _slow_load(plugin_dir, registry):
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.1)
+            return real_load(plugin_dir, registry)
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setattr(plugin_loader, "_load_one", _slow_load)
+
+    registry = ToolRegistry()
+    threads = [
+        threading.Thread(target=plugin_loader.refresh_plugins, args=(registry,))
+        for _ in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert max_active == 1
+    loaded = [i for i in plugin_loader.get_plugin_infos() if i["name"] == "serial_demo"]
+    assert len(loaded) == 1

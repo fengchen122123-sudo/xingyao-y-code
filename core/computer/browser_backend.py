@@ -10,7 +10,8 @@ worker 退出都明确失败（稳定错误码），绝不在调用线程重建 
 无降级原则（设计 21）：所选浏览器启动失败抛 ``computer_browser_unavailable``，
 绝不 fallback 另一个浏览器；profile 锁冲突抛 ``computer_profile_locked``；
 context/page 被用户关闭后后续动作抛 ``computer_browser_closed``，不自动重开；
-截图失败抛错，绝不复用旧截图。
+截图失败不再让观察报错（窗口被遮挡/最小化时渲染被节流），而是降级为纯 DOM
+观察（元素列表 + 页面正文 + screenshot_error 说明），且绝不复用旧截图。
 
 隐私（设计 22）：观察只暴露 ``scheme://netloc`` origin 与截断 200 字符的 title；
 不读取 DOM 输入值、Cookie、localStorage 或密码库。
@@ -93,6 +94,232 @@ _KEY_NAME_MAP = {
 # R5 受控页可见性探针：只读取 visibilityState/hasFocus 两个状态，绝不读取
 # 表单值、凭据或其他 DOM 内容（隐私边界，设计 22）。
 _VISIBILITY_PROBE = "() => [document.visibilityState, document.hasFocus()]"
+
+# E1 元素列表的防御性截断上限（对齐桌面 windows_elements.py 的 MAX_NAME_CHARS；
+# 注入脚本内的 MAX_NAME 已做同样截断，这里兜底协议/求值结果的异常形态）。
+_ELEMENT_MAX_NAME_CHARS = 80
+
+# E2 元素动作超时（毫秒）：明显小于命令预算（默认 30s），元素等待/可点击性
+# 检查失败时由元素语义错误码（computer_element_unsupported）返回，而不是拖到
+# 命令超时变成笼统的 computer_action_timeout；实际取与命令剩余预算的较小值。
+_ELEMENT_ACTION_TIMEOUT_MS = 10_000
+
+# B 方案（窗口被遮挡时的降级观察）常量。
+# _SCREENSHOT_TIMEOUT_MS：截图超时必须显式设短（Playwright 默认 30s）。浏览器
+# 窗口被遮挡/最小化后 WebView2 渲染被节流，screenshot 等不到新帧会一直阻塞，
+# 默认超时基本等于把整个命令预算（30s）用完，调用侧只剩"观察超时失败"；3s
+# 足够识别"这次取不到图"，把剩余预算留给 DOM 观察与返回。
+_SCREENSHOT_TIMEOUT_MS = 3000
+
+# _PAGE_TEXT_MAX_CHARS：页面正文摘要上限。按 Python 码点切片截断（与前端
+# Array.from 的码点语义一致），够模型判断页面内容，又不把整篇长文塞进上下文。
+_PAGE_TEXT_MAX_CHARS = 6000
+
+# B 方案：页面正文提取脚本（降级观察的唯一 DOM 来源）。
+# - 隐私铁律：只读可见文本（innerText 已排除 display:none / visibility:hidden
+#   的内容），绝不读 input.value / textarea.value 里的用户输入，绝不读 cookie、
+#   localStorage 或 sessionStorage；脚本源码不得出现这些字样。
+# - 为什么用 innerText 而不是 textContent：innerText 近似"用户看到的文本"，
+#   不含隐藏文本与脚本内容，泄露面最小。
+# - 为什么不需要可见性/焦点：窗口被遮挡时 DOM 求值照常返回，正是降级要用的通道。
+PAGE_TEXT_SCRIPT = """() => {
+  const root = document.body || document.documentElement;
+  if (!root) return "";
+  return (root.innerText || "").trim();
+}"""
+
+# E1 浏览器元素收集脚本（设计 2.2~2.4）：一次 JS 求值收集视口内可交互元素。
+# - 隐私铁律：只读标签/ARIA/文本等结构信息，绝不读输入值、Cookie 或存储
+#   （脚本源码不得出现 .value / cookie / localStorage / sessionStorage 字样）；
+# - 确定性：querySelectorAll 的文档顺序 + 顺序编号，无随机数/时间戳，bounds
+#   取整方式固定（Math.round），同一页面状态产生逐字节相同的结果；
+# - 副作用：给选中元素打 data-ycode-ref 标记（E2 的 Playwright locator 依赖它；
+#   属性随页面生命周期结束自然消失，不主动清理、不监听不加事件）；
+# - 视口外元素不收集：模型看不到截图也无法点击，滚动后重新观察即可。
+ELEMENT_COLLECT_SCRIPT = """() => {
+  const SEL = [
+    'a[href]', 'button', 'input:not([type=hidden])', 'select', 'textarea',
+    '[role="button"]', '[role="link"]', '[role="textbox"]', '[role="checkbox"]',
+    '[role="radio"]', '[role="combobox"]', '[role="menuitem"]', '[role="tab"]',
+    '[role="switch"]', '[role="searchbox"]', '[role="option"]',
+    '[contenteditable="true"]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+  ].join(',');
+
+  const MAX_NAME = 80;
+  // 500 而不是 200：网格型页面（扫雷/表格/日历）一个盘面就有 256~480 个
+  // 可点击单元，200 会在盘面中部截断，模型永远点不到下半部分；500 覆盖
+  // 常见网格整盘，普通页面元素数远小于此，不受影响。
+  const MAX_ELEMENTS = 500;
+
+  // ---- 可见性判定 ----
+  // 优先用 checkVisibility()（现代 Chromium 支持，含祖先隐藏判定）；
+  // 不可用时回落到 getBoundingClientRect + computedStyle 组合判定。
+  function isVisible(el) {
+    if (typeof el.checkVisibility === 'function') {
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    return style.visibility !== 'hidden'
+        && style.display !== 'none'
+        && parseFloat(style.opacity) !== 0;
+  }
+
+  // ---- 视口内判定 ----
+  function inViewport(rect) {
+    return rect.bottom > 0
+        && rect.right > 0
+        && rect.top < window.innerHeight
+        && rect.left < window.innerWidth;
+  }
+
+  // ---- kind 推导：HTML/ARIA 原生语义（不映射 UIA 控件类型名） ----
+  function deriveKind(el) {
+    const role = el.getAttribute('role');
+    if (role) return role;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'input') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'submit' || type === 'button' || type === 'reset') return 'button';
+      if (type === 'search') return 'searchbox';
+      return 'textbox';
+    }
+    if (tag === 'a') return 'link';
+    if (tag === 'button') return 'button';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    return tag;
+  }
+
+  // ---- name 推导：对齐 W3C AccName 主流实现顺序，绝不读表单值 ----
+  function deriveName(el) {
+    const ariaLabel = el.getAttribute('aria-label');
+    if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
+
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const texts = labelledBy.split(/\\s+/)
+        .map(id => document.getElementById(id))
+        .filter(Boolean)
+        .map(node => (node.innerText || '').trim())
+        .filter(Boolean);
+      if (texts.length) return texts.join(' ');
+    }
+
+    if (el.id) {
+      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (label && label.innerText.trim()) return label.innerText.trim();
+    }
+    const wrappingLabel = el.closest('label');
+    if (wrappingLabel && wrappingLabel.innerText.trim()) return wrappingLabel.innerText.trim();
+
+    const placeholder = el.getAttribute('placeholder');
+    if (placeholder && placeholder.trim()) return placeholder.trim();
+    const title = el.getAttribute('title');
+    if (title && title.trim()) return title.trim();
+    const alt = el.getAttribute('alt');
+    if (alt && alt.trim()) return alt.trim();
+
+    const text = (el.innerText || '').trim();
+    if (text) return text;
+
+    return '';
+  }
+
+  // ---- 视觉可点击区域（E3 修复） ----
+  // inline 元素（典型：line-height:0 的 <a> 包一张 <img>）自身的 border box
+  // 会退化成一整行 0~1px 高、并且落在图片基线下方——它既不覆盖图片，中心点
+  // 也不在图片上。按自身 rect 报 bounds 会让模型/click_element 系统性地点空
+  // （实测扫雷：a 的 rect 是 39x1、y 比格子底边还低 1px，点击后游戏毫无反应）。
+  // 因此 bounds 取「自身矩形 ∪ 可见图标类后代矩形」，即用户实际看到的、
+  // 鼠标能命中的那块区域。
+  function hitRect(el, rect) {
+    let left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom;
+    for (const child of el.querySelectorAll('img, svg, canvas, video')) {
+      const r = child.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      if (r.left < left) left = r.left;
+      if (r.top < top) top = r.top;
+      if (r.right > right) right = r.right;
+      if (r.bottom > bottom) bottom = r.bottom;
+    }
+    return { left: left, top: top, right: right, bottom: bottom };
+  }
+
+  const out = [];
+  let counter = 0;
+  for (const el of document.querySelectorAll(SEL)) {
+    if (counter >= MAX_ELEMENTS) break;
+    const rawRect = el.getBoundingClientRect();
+    if (!isVisible(el) || !inViewport(rawRect)) continue;
+    const rect = hitRect(el, rawRect);
+    counter += 1;
+    const ref = 'el-' + counter;
+    el.setAttribute('data-ycode-ref', ref);
+    out.push({
+      ref: ref,
+      kind: deriveKind(el),
+      // 按码点截断（Array.from），避免 UTF-16 代理对（emoji 等）被切半；
+      // 与 Python 侧 [:_ELEMENT_MAX_NAME_CHARS] 的码点语义对齐。
+      name: Array.from(deriveName(el)).slice(0, MAX_NAME).join(''),
+      bounds: [
+        Math.round(rect.left), Math.round(rect.top),
+        Math.round(rect.right), Math.round(rect.bottom)
+      ],
+      enabled: !el.disabled && el.getAttribute('aria-disabled') !== 'true',
+    });
+  }
+  return out;
+}"""
+
+
+# E3（2026-11-02）元素点击点：按「视觉可点击区域」的中心点点击。
+# 为什么需要：click_element 之前用 locator.click()，Playwright 点的是元素自身
+# border box 的中心；对 line-height:0 的 inline <a>（典型的老式图片链接、网格
+# 游戏格子）这个中心会落在图标之外——实测扫雷页面 a 的 box 是 39x1、y 在 16px
+# 格子底边以下，点击后游戏毫无反应。这里实时计算「自身 ∪ 图标类后代」的并集
+# 中心，并用 elementFromPoint 复核该点确实命中元素本身或后代，命中才用鼠标
+# 点击；否则（被遮挡/已滚出视口）回落 locator.click 保留原有可点击性语义。
+ELEMENT_HIT_SCRIPT = """(ref) => {
+  const el = document.querySelector('[data-ycode-ref="' + CSS.escape(ref) + '"]');
+  if (!el) return null;
+  const base = el.getBoundingClientRect();
+  let left = base.left, top = base.top, right = base.right, bottom = base.bottom;
+  for (const child of el.querySelectorAll('img, svg, canvas, video')) {
+    const r = child.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    if (r.left < left) left = r.left;
+    if (r.top < top) top = r.top;
+    if (r.right > right) right = r.right;
+    if (r.bottom > bottom) bottom = r.bottom;
+  }
+  if (!(right > left && bottom > top)) return null;
+  const x = Math.round((left + right) / 2);
+  const y = Math.round((top + bottom) / 2);
+  const hit = document.elementFromPoint(x, y);
+  return {
+    x: x,
+    y: y,
+    contains: !!(hit && (hit === el || el.contains(hit))),
+    inViewport: x >= 0 && y >= 0 && x < innerWidth && y < innerHeight
+  };
+}"""
+
+
+def _normalize_element_bounds(value) -> list[int]:
+    """bounds 防御归一化：4 元 int list（对齐桌面脱敏 dict 形状），非法值取 0。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return [0, 0, 0, 0]
+    normalized: list[int] = []
+    for component in value:
+        try:
+            normalized.append(int(component))
+        except (TypeError, ValueError):
+            normalized.append(0)
+    return normalized
 
 
 def _map_playwright_key(name: str) -> str:
@@ -201,6 +428,10 @@ class _WorkerProcessTransport:
         self._proc: subprocess.Popen | None = None
         self._job = None
         self._lock = threading.Lock()
+        # stdin 写入串行化：execute（回合线程）与 release/close（停止线程）
+        # 可并发写管道，单行 JSON 被拆多次 WriteFile 时可能交错、子进程解析
+        # 失败即自杀。_lock 只覆盖序号/登记，刻意保持小临界区，故独立锁。
+        self._stdin_lock = threading.Lock()
         self._seq = 0
         self._pending: dict[int, _PendingCommand] = {}
         self._ready = threading.Event()
@@ -268,10 +499,11 @@ class _WorkerProcessTransport:
             pending = _PendingCommand()
             self._pending[command_id] = pending
         try:
-            line = _encode_worker_request(command_id, op, **payload)
-            assert self._proc is not None and self._proc.stdin is not None
-            self._proc.stdin.write((line + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
+            with self._stdin_lock:
+                line = _encode_worker_request(command_id, op, **payload)
+                assert self._proc is not None and self._proc.stdin is not None
+                self._proc.stdin.write((line + "\n").encode("utf-8"))
+                self._proc.stdin.flush()
         except (OSError, ValueError) as error:
             self._fail_pending_closed()
             raise ComputerControlError(
@@ -336,6 +568,13 @@ class _WorkerProcessTransport:
                 str(message.get("error_message") or "受管执行进程启动失败"),
             )
             self._ready.set()
+        elif event == "worker_protocol_error":
+            # 会话期协议错误：worker 随即退出（EOF 路径统一归一
+            # computer_browser_closed），此处只留痕
+            _LOGGER.warning(
+                "受管浏览器执行进程报告协议错误：%s",
+                message.get("error_message"),
+            )
 
     def _fail_pending_closed(self) -> None:
         with self._lock:
@@ -523,9 +762,12 @@ class BrowserComputerBackend:
         use_process_worker: bool = False,
         worker_command: list[str] | None = None,
         process_guard_slack: float = _PROCESS_GUARD_SLACK,
+        viewport: tuple[int, int] = (_VIEWPORT_WIDTH, _VIEWPORT_HEIGHT),
     ) -> None:
         # 构造函数只校验参数，绝不导入或启动 Playwright。
-        if type(browser) is not str or browser not in _CHANNELS:
+        # "embedded" 仅由 EmbeddedBrowserBackend（CDP 直连内置 WebView2）使用：
+        # 不在 _CHANNELS 中，其启动/收尾分支由子类完全接管。
+        if type(browser) is not str or browser not in (*_CHANNELS, "embedded"):
             raise ComputerControlError(
                 "computer_invalid_config",
                 f"不支持的浏览器：{browser!r}，只支持 edge 或 chrome",
@@ -538,6 +780,12 @@ class BrowserComputerBackend:
         self._command_timeout = float(command_timeout)
         self._start_timeout = float(start_timeout)
         self._on_page_change = on_page_change
+        # 观察坐标系（逻辑视口）：外部浏览器 = 启动视口（dsf=1）；
+        # CDP 模式由子类覆写为项目分辨率/页面真实视口。
+        self._viewport_width, self._viewport_height = (int(viewport[0]), int(viewport[1]))
+        # 是否拥有 context 的关闭权：外部浏览器 owned（teardown 关 context）；
+        # CDP 直连内置浏览器时浏览器归 GUI 所有，teardown 绝不触碰 context。
+        self._owns_context = True
         # R5：系统侧窗口标题提示（平台层提供）；None 时退化为 DOM 可见性裁决。
         self._window_hint_provider = window_hint_provider
         self._browser_pid: int | None = None
@@ -573,6 +821,14 @@ class BrowserComputerBackend:
         self._page_tokens: dict[int, int] = {}
         self._page_serial = 0
         self._observed_page_token: int | None = None
+        # E1：最近一次观察收集到的元素 ref 全集。与 _observed_page_token 同
+        # 生命周期——每次观察整体替换（空集即旧 ref 全部失效）；E2 的
+        # click_element/set_value_element 依赖它做 computer_element_stale 校验。
+        self._observed_element_refs: frozenset[str] = frozenset()
+        # E2：最近一次观察时的页面 URL。页面 token 不随同页导航变化（SPA 路由/
+        # 整页跳转仍落在同一 Page 对象上），URL 对比补全「页面变化 → 旧 ref 失效」
+        # 的产品决定（验收场景 4）；与 _observed_element_refs 同生命周期。
+        self._observed_url: str = ""
         self._surface_generation = 0
         self._pressed_buttons: set[str] = set()
         # 修饰键按下记录绑定按下时的 page（R3）：popup 切换 active page 后
@@ -581,6 +837,16 @@ class BrowserComputerBackend:
         self._profile_lock_key: str | None = None
         self._screenshot_dir: Path | None = None
         self._screenshot_counter = 0
+        # E5（2026-11-03）：browser 局部观察（observe_region）。
+        # _pending_region 由 execute(observe_region) 置位，紧随其后的 observe
+        # 据此裁剪区域（controller 每个动作后都会再 observe，所以区域观察就是
+        # 这次动作的返回画面）。_coord_frame 记录当前观察的坐标映射：
+        # (origin_x, origin_y, css_w, css_h, model_w, model_h)——模型坐标 → CSS。
+        self._pending_region: tuple[int, int, int, int] | None = None
+        self._coord_frame: tuple[int, int, int, int, int, int] | None = None
+        # 当前观察是否为局部视图（区域图不放大，尺寸与区域 CSS 相同，不能用
+        # 尺寸差异判断，必须单独记标志）。
+        self._region_view = False
 
     @property
     def browser(self) -> str:
@@ -628,6 +894,14 @@ class BrowserComputerBackend:
     def _default_worker_command(self) -> list[str]:
         if self._worker_command_override is not None:
             return list(self._worker_command_override)
+        # 项目视口随 argv 传入受管执行进程（进程模式的 Playwright 在子进程，
+        # 启动视口在子进程 _boot 生效）。
+        viewport_args = [
+            "--viewport-width",
+            str(self._viewport_width),
+            "--viewport-height",
+            str(self._viewport_height),
+        ]
         if getattr(sys, "frozen", False):
             return [
                 sys.executable,
@@ -638,6 +912,7 @@ class BrowserComputerBackend:
                 str(self._profile_dir),
                 "--command-timeout",
                 str(self._command_timeout),
+                *viewport_args,
             ]
         return [
             sys.executable,
@@ -649,6 +924,7 @@ class BrowserComputerBackend:
             str(self._profile_dir),
             "--command-timeout",
             str(self._command_timeout),
+            *viewport_args,
         ]
 
     def _start_process_worker(self) -> None:
@@ -723,7 +999,15 @@ class BrowserComputerBackend:
     def observe(self, run_id: str) -> ComputerObservation:
         if self._transport is not None:
             response = self._remote_call("observe", {"run_id": run_id}, "observe")
-            return ComputerObservation(**response["observation"])
+            from core.computer.browser_worker_protocol import (
+                normalize_observation_payload,
+            )
+
+            # JSON 往返会把 elements 外层 tuple 变成 list：归一化后再构造，
+            # 保证进程模式与线程模式的观察形状一致。
+            return ComputerObservation(
+                **normalize_observation_payload(response["observation"])
+            )
         return self._call("observe", lambda: self._cmd_observe(run_id))
 
     def execute(self, run_id: str, action: ComputerAction) -> None:
@@ -899,6 +1183,17 @@ class BrowserComputerBackend:
         factory = self._playwright_factory
         if factory is None:
             # 惰性导入：只有真实启动时才触碰 playwright，且发生在 worker 线程。
+            # 安装包已不再自带 playwright（见 ycode.spec）：先确保按需组件就绪，
+            # 再导入。组件缺失/未装好时转成电脑操控领域错误码，提示用户去
+            # 「设置 → 电脑操控」点下载组件，而不是抛裸 ImportError。
+            from core.components import ComponentError, ensure_playwright
+
+            try:
+                ensure_playwright()
+            except ComponentError as error:
+                raise ComputerControlError(
+                    "playwright_component_missing", str(error)
+                ) from error
             from playwright.sync_api import sync_playwright as factory
         try:
             self._runtime = factory()
@@ -915,7 +1210,7 @@ class BrowserComputerBackend:
                 user_data_dir=resolved,
                 channel=_CHANNELS[self._browser],
                 headless=False,
-                viewport={"width": _VIEWPORT_WIDTH, "height": _VIEWPORT_HEIGHT},
+                viewport={"width": self._viewport_width, "height": self._viewport_height},
                 device_scale_factor=1,
             )
         except Exception as error:
@@ -1009,7 +1304,7 @@ class BrowserComputerBackend:
     def _teardown(self) -> None:
         context = self._context
         self._context = None
-        if context is not None:
+        if context is not None and self._owns_context:
             try:
                 context.close()
             except Exception:
@@ -1032,6 +1327,8 @@ class BrowserComputerBackend:
         self._pressed_keys = []
         self._page_tokens = {}
         self._observed_page_token = None
+        self._observed_element_refs = frozenset()
+        self._observed_url = ""
         self._active_page = None
 
     # ---------------- worker 内：页面事件 ----------------
@@ -1218,24 +1515,226 @@ class BrowserComputerBackend:
                 "受控页面已切换，旧坐标已失效，必须重新观察（observe）后再操作",
             )
 
+    def _require_ref_valid(self, page, element_ref: str) -> None:
+        """元素动作前复核（E2）：ref 必须属于最近一次观察且页面未变化。
+
+        三项检查全部抛 computer_element_stale（与桌面 UIA 的 ref 失效语义
+        一致，不发明新码；元素动作的错误码统一 stale，不用 surface_changed）：
+        1. 页面 token——从未观察（None）与受控页切换（popup/新前台页）都让
+           旧 ref 失效，但文案区分：前者引导先 observe，后者说明页面已切换；
+        2. URL 对比——裁决点：token 不随同页导航变化（SPA 路由、整页跳转仍
+           落在同一 Page 对象上），URL 对比补全「页面变化 → 旧 ref 失效」的
+           产品决定，对齐验收场景 4（导航到新 URL 后旧 ref 必须 stale）；
+        3. ref 集合——ref 不在最近一次 observe 收集的元素集合内。
+        """
+        if self._observed_page_token is None:
+            raise ComputerControlError(
+                "computer_element_stale",
+                "尚未观察页面，请先 observe 再操作元素",
+            )
+        if self._page_token(page) != self._observed_page_token:
+            raise ComputerControlError(
+                "computer_element_stale",
+                "页面已切换，元素引用失效，请重新 observe",
+            )
+        if page.url != self._observed_url:
+            raise ComputerControlError(
+                "computer_element_stale",
+                "页面地址已变化，元素引用失效，请重新 observe",
+            )
+        if element_ref not in self._observed_element_refs:
+            raise ComputerControlError(
+                "computer_element_stale",
+                f"元素引用 {element_ref} 已失效，请重新 observe",
+            )
+
     # ---------------- worker 内：命令实现 ----------------
+
+    def _collect_interactive_elements(self, page) -> tuple:
+        """收集视口内可交互元素（E1）；任何失败都归一为空 tuple，绝不中断观察。
+
+        为什么吞掉异常：元素不可用时回落截图路径是产品决定（设计 1.5/8.2），
+        observe 的截图与页面信息仍然有效；E2 侧凭空 ref 集合拒绝旧引用，
+        不会静默点错。返回 tuple of dict（ref/kind/name/bounds/enabled），
+        bounds 为 4 元 int list，与桌面 windows_elements_uia 的脱敏形状对齐。
+        """
+        try:
+            raw = page.evaluate(ELEMENT_COLLECT_SCRIPT)
+        except Exception:
+            _LOGGER.warning("浏览器元素收集失败，本次观察回落截图路径", exc_info=True)
+            return ()
+        if not isinstance(raw, (list, tuple)):
+            _LOGGER.warning(
+                "浏览器元素收集返回非列表（%s），本次观察回落截图路径",
+                type(raw).__name__,
+            )
+            return ()
+        listing: list[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue  # 非 dict 项无法被引用，直接丢弃
+            ref = item.get("ref")
+            if not isinstance(ref, str) or not ref:
+                continue  # 无 ref 的项无法被 E2 的 locator 引用
+            kind = item.get("kind")
+            name = item.get("name")
+            enabled = item.get("enabled")
+            listing.append({
+                "ref": ref,
+                "kind": kind if isinstance(kind, str) else "",
+                "name": (name if isinstance(name, str) else "")[:_ELEMENT_MAX_NAME_CHARS],
+                "bounds": _normalize_element_bounds(item.get("bounds")),
+                "enabled": enabled if isinstance(enabled, bool) else True,
+            })
+        return tuple(listing)
+
+    def _collect_page_text(self, page) -> str:
+        """提取页面可见正文摘要（B 方案降级观察的文本来源）。
+
+        为什么需要：窗口被遮挡/最小化后 WebView2 渲染被节流，截图会卡住或失败；
+        DOM 求值不受渲染节流影响，所以正文是"没有截图的观察"里最可靠的信息。
+        任何失败都归一为空串并留 warning，绝不中断观察（缺正文比观察失败更轻）。
+        返回前按 _PAGE_TEXT_MAX_CHARS 码点截断，正文绝不写日志（隐私设计 22）。
+        """
+        try:
+            raw = page.evaluate(PAGE_TEXT_SCRIPT)
+        except Exception:
+            _LOGGER.warning("浏览器页面正文读取失败，本次观察仅保留元素与截图", exc_info=True)
+            return ""
+        if not isinstance(raw, str):
+            _LOGGER.warning(
+                "浏览器页面正文返回非字符串（%s），按空正文处理", type(raw).__name__
+            )
+            return ""
+        return raw[:_PAGE_TEXT_MAX_CHARS]
+
+    def _set_pending_region(self, page, action: ComputerAction) -> None:
+        """登记局部观察区域（CSS 视口坐标），并校验区域完整落在视口内。
+
+        不 clamp：越界区域直接拒绝，避免模型拿到"看起来是区域、实际被截断"
+        的图并按错误尺寸点坐标。
+        """
+        viewport = self._observation_viewport(page)
+        view_w = int(viewport["width"])
+        view_h = int(viewport["height"])
+        x = action.x
+        y = action.y
+        width = action.width
+        height = action.height
+        if not all(type(value) is int for value in (x, y, width, height)):
+            raise ComputerControlError(
+                "computer_invalid_action", "局部观察需要整数 x/y/width/height"
+            )
+        if width <= 0 or height <= 0:
+            raise ComputerControlError(
+                "computer_invalid_action", "局部观察的 width/height 必须是正整数"
+            )
+        if x < 0 or y < 0 or x + width > view_w or y + height > view_h:
+            raise ComputerControlError(
+                "computer_coordinate_out_of_bounds",
+                f"局部观察区域 ({x},{y},{width}x{height}) 超出浏览器视口 "
+                f"{view_w}x{view_h}，拒绝裁剪（不做 clamp）",
+            )
+        self._pending_region = (x, y, width, height)
+
+    def _build_region_frame(
+        self, png_bytes: bytes, region: tuple[int, int, int, int]
+    ) -> tuple[bytes, dict]:
+        """把归一化后的整屏 PNG 裁成区域图，返回 (png_bytes, 观察字段)。
+
+        PNG 此时已由 _normalize_frame 重采样到 CSS 视口尺寸，所以裁剪坐标
+        与模型坐标同一空间；区域不再放大——原分辨率已经比整屏清楚数倍，
+        放大只会插值糊化。
+        """
+        try:
+            import io
+
+            from PIL import Image
+        except Exception as error:  # noqa: BLE001
+            raise ComputerControlError(
+                "computer_backend_error",
+                "局部观察需要 Pillow 处理截图（未安装或导入失败）",
+            ) from error
+        x, y, width, height = region
+        try:
+            with Image.open(io.BytesIO(png_bytes)) as image:
+                image = image.convert("RGB")
+                if x + width > image.width or y + height > image.height:
+                    raise ComputerControlError(
+                        "computer_coordinate_out_of_bounds",
+                        f"局部观察区域 ({x},{y},{width}x{height}) 超出截图 "
+                        f"{image.width}x{image.height}（观察期间视口可能已变化）",
+                    )
+                cropped = image.crop((x, y, x + width, y + height))
+                buffer = io.BytesIO()
+                cropped.save(buffer, format="PNG", optimize=True)
+                cropped_bytes = buffer.getvalue()
+        except ComputerControlError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise ComputerControlError(
+                "computer_backend_error",
+                f"裁剪局部观察截图失败：{type(error).__name__}",
+            ) from error
+        return cropped_bytes, {
+            "width": width,
+            "height": height,
+            "original_width": width,
+            "original_height": height,
+            "origin_x": x,
+            "origin_y": y,
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+        }
 
     def _cmd_observe(self, run_id: str) -> ComputerObservation:
         page = self._resolve_active_page()
         page_token = self._page_token(page)
+        url = page.url if isinstance(page.url, str) else ""
+        # E2：同步观察时的 URL，供 _require_ref_valid 做「页面地址已变化」校验
+        # （token 不随同页导航变化，URL 对比是旧 ref 失效裁决的补全）。
+        self._observed_url = url
+        parts = urlsplit(url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        # B 方案（降级观察）：先做不依赖渲染的 DOM 收集。窗口被遮挡/最小化时
+        # 渲染被节流而 DOM 求值照常，先把元素与正文拿到手，保证"这次观察至少
+        # 有文本信息"；截图放到最后，失败也只降级、不让整条观察链报错。
+        pending_region = self._pending_region
+        self._pending_region = None
+        if pending_region is None:
+            elements = self._collect_interactive_elements(page)
+            page_text = self._collect_page_text(page)
+        else:
+            # 局部观察：模型要的是区域画面，不收集 DOM 清单（清空同时避免旧
+            # el-N 与新坐标系混用）。
+            elements = ()
+            page_text = ""
+        png_bytes = b""
+        screenshot_error = ""
         try:
-            png = page.screenshot(type="png")
+            # 显式短超时：默认 30s 在窗口被遮挡时会一直等新帧，把命令预算耗尽
+            # 变成笼统超时；短超时能快速判定"这次取不到图"并落到文本降级。
+            png = page.screenshot(type="png", timeout=_SCREENSHOT_TIMEOUT_MS)
         except ComputerControlError:
             raise
         except Exception as error:
-            raise ComputerControlError(
-                "computer_action_failed",
-                f"浏览器截图失败：{type(error).__name__}",
-            ) from error
-        if not isinstance(png, (bytes, bytearray)) or not bytes(png):
-            raise ComputerControlError("computer_action_failed", "浏览器截图未返回 PNG bytes")
-        png_bytes = bytes(png)
-        # 截图后再验证仍是同一受控页：期间切换则本次观察作废（R5）。
+            # 不抛错：窗口被遮挡/最小化时截图等不到新帧属于预期内的环境状态，
+            # 抛错会让模型完全失去观察能力；降级为纯 DOM 观察更有用。
+            screenshot_error = (
+                f"浏览器窗口不可见或被遮挡，本次未取到截图：{type(error).__name__}"
+            )
+            _LOGGER.warning(
+                "浏览器截图失败，本次降级为纯文本观察：%s", type(error).__name__
+            )
+            png = None
+        if png is not None:
+            if not isinstance(png, (bytes, bytearray)) or not bytes(png):
+                raise ComputerControlError(
+                    "computer_action_failed", "浏览器截图未返回 PNG bytes"
+                )
+            png_bytes = bytes(png)
+        # 截图后再验证仍是同一受控页：期间切换则本次观察作废（R5）。降级路径
+        # 同样必须复核——页面切换时旧页的文本/元素不得冒充新页观察。
         if self._page_token(self._resolve_active_page()) != page_token:
             raise ComputerControlError(
                 "computer_surface_changed",
@@ -1250,33 +1749,89 @@ class BrowserComputerBackend:
             ) from error
         if not isinstance(title, str):
             title = ""
-        url = page.url if isinstance(page.url, str) else ""
-        parts = urlsplit(url)
-        origin = f"{parts.scheme}://{parts.netloc}"
-        path = self._store_screenshot(png_bytes)
+        if elements and (
+            self._page_token(self._resolve_active_page()) != page_token
+            or (page.url if isinstance(page.url, str) else "") != url
+        ):
+            # 收集期间页面再次变化（活动页切换 / 同页导航）：元素与页面身份
+            # 快照不同源，整体清空回落截图路径（E2 的 ref 集合随之置空，
+            # 旧引用由 stale 校验拒绝）。
+            elements = ()
+        # 只有真正拿到 PNG 才落盘：降级路径不写文件、也绝不复用任何旧截图。
+        if png_bytes:
+            png_bytes = self._normalize_frame(png_bytes, page)
+        # E5：局部观察在归一化之后裁剪（此时 PNG 与 CSS 视口同尺寸）。
+        viewport = self._observation_viewport(page)
+        region_fields: dict | None = None
+        action_name = "observe"
+        if pending_region is not None and png_bytes:
+            png_bytes, region_fields = self._build_region_frame(png_bytes, pending_region)
+            action_name = "observe_region"
+        if region_fields is None:
+            view_w = int(viewport["width"])
+            view_h = int(viewport["height"])
+            # 全屏观察：模型坐标就是 CSS 视口坐标。
+            self._coord_frame = (0, 0, view_w, view_h, view_w, view_h)
+            self._region_view = False
+            observation_view = viewport
+        else:
+            # 区域观察：模型坐标以区域左上角为原点，点击时加回 origin。
+            self._region_view = True
+            self._coord_frame = (
+                int(region_fields["origin_x"]),
+                int(region_fields["origin_y"]),
+                int(region_fields["original_width"]),
+                int(region_fields["original_height"]),
+                int(region_fields["width"]),
+                int(region_fields["height"]),
+            )
+            observation_view = region_fields
+        path = self._store_screenshot(png_bytes) if png_bytes else None
         if self._observed_page_token != page_token:
             self._surface_generation += 1
             self._observed_page_token = page_token
+        # ref 集合与页面身份同生命周期：每次观察以本次结果整体替换，
+        # 空集即旧 ref 全部失效（E2 据此拒绝过期引用，不静默失败）。
+        self._observed_element_refs = frozenset(item["ref"] for item in elements)
         return ComputerObservation(
             run_id=run_id,
             target="browser",
-            action="observe",
+            action=action_name,
             ok=True,
-            screen_sha256=hashlib.sha256(png_bytes).hexdigest(),
-            png_path=str(path),
-            width=_VIEWPORT_WIDTH,
-            height=_VIEWPORT_HEIGHT,
-            original_width=_VIEWPORT_WIDTH,
-            original_height=_VIEWPORT_HEIGHT,
-            origin_x=0,
-            origin_y=0,
-            scale_x=1.0,
-            scale_y=1.0,
+            screen_sha256=hashlib.sha256(png_bytes).hexdigest() if png_bytes else "",
+            png_path=str(path) if path is not None else "",
+            **observation_view,
             page_origin=origin,
             page_title=title[:_MAX_TITLE_CHARS],
+            page_text=page_text,
+            screenshot_error=screenshot_error,
             surface_id=f"page-{page_token}",
             surface_generation=self._surface_generation,
+            elements=elements,
         )
+
+    def _observation_viewport(self, page) -> dict:
+        """观察坐标系：外部浏览器 = 启动视口常量（device_scale_factor=1，
+        PNG 像素与坐标空间 1:1）。CDP 模式由子类覆写为页面真实视口。"""
+        return {
+            "width": self._viewport_width,
+            "height": self._viewport_height,
+            "original_width": self._viewport_width,
+            "original_height": self._viewport_height,
+            "origin_x": 0,
+            "origin_y": 0,
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+        }
+
+    def _normalize_frame(self, png_bytes: bytes, page) -> bytes:
+        """截图后、落盘前的帧归一化钩子：默认原样返回。
+
+        CDP 模式（内置 WebView2）覆写它，把截图重采样到 CSS 视口尺寸，保证
+        「模型看到的图片坐标 = 动作坐标」——否则高 DPI 下 PNG 是 视口×dpr，
+        模型按图片给的坐标会被当成 CSS 坐标直接点击，越往右下偏得越多。
+        """
+        return png_bytes
 
     def _cmd_execute(self, run_id: str, action: ComputerAction) -> None:
         if action.target != "browser":
@@ -1286,6 +1841,13 @@ class BrowserComputerBackend:
             )
         kind = action.kind
         if kind == "observe":
+            return
+        if kind == "observe_region":
+            # E5：browser 局部观察——只登记区域，真正的裁剪发生在紧随其后的
+            # observe（controller 在动作后统一再观察一次）。这里不产生输入。
+            page = self._resolve_active_page()
+            self._require_observed_surface(page)
+            self._set_pending_region(page, action)
             return
         if kind == "request_user_takeover":
             raise ComputerControlError(
@@ -1302,7 +1864,12 @@ class BrowserComputerBackend:
             self._wait_interruptible(duration)
             return
         page = self._resolve_active_page()
-        self._require_observed_surface(page)
+        if kind in ("click_element", "set_value_element"):
+            # E2：元素动作按 ref 校验（页面 token + URL + ref 集合），错误码
+            # 统一 computer_element_stale；坐标动作维持 surface_changed 语义。
+            self._require_ref_valid(page, action.element_ref)
+        else:
+            self._require_observed_surface(page)
         try:
             self._dispatch_action(page, action)
         except ComputerControlError:
@@ -1344,6 +1911,14 @@ class BrowserComputerBackend:
         if deadline is None or deadline == float("inf"):
             return int(self._command_timeout * 1000)
         return max(1, int((deadline - time.monotonic()) * 1000))
+
+    def _element_action_timeout_ms(self) -> int:
+        """元素动作单段超时：10s 上限，并为命令收尾预留 1s 余量。
+
+        防止 fill/click/type 累计耗时越过命令 deadline——越过会触发调用侧
+        超时并封闭实例，而不是返回元素语义错误码（E2 评审修复）。
+        """
+        return max(1, min(_ELEMENT_ACTION_TIMEOUT_MS, self._remaining_budget_ms() - 1000))
 
     def _wait_interruptible(self, duration_ms: int) -> None:
         """显式 wait：服务取消/页面事件，stop 时立即中断（不用整段 sleep 伪装就绪）。"""
@@ -1476,25 +2051,106 @@ class BrowserComputerBackend:
             page.reload(
                 wait_until="domcontentloaded", timeout=self._remaining_budget_ms()
             )
+        elif kind == "click_element":
+            self._exec_click_element(page, action.element_ref)
+        elif kind == "set_value_element":
+            self._exec_set_value_element(page, action.element_ref, action.text)
         else:
             raise ComputerControlError(
                 "computer_invalid_action",
                 f"浏览器 backend 不支持动作：{kind!r}",
             )
 
+    def _raise_element_action_error(self, locator, element_ref: str, label: str, error: Exception) -> None:
+        """元素动作失败分类：元素不在 DOM → stale（引导重新 observe）；存在但不可操作 → unsupported。
+
+        同 URL 整页重载/DOM 重建时，token/URL/ref 集合三项校验都看不出来；
+        以 locator 命中数兜底（E2 评审修复）。
+        """
+        try:
+            missing = locator.count() == 0
+        except Exception:
+            missing = False
+        if missing:
+            raise ComputerControlError(
+                "computer_element_stale",
+                f"元素 {element_ref} 已不存在于页面，请重新 observe",
+            ) from error
+        raise ComputerControlError(
+            "computer_element_unsupported",
+            f"元素 {element_ref} {label}失败：{type(error).__name__}",
+        ) from error
+
+    def _exec_click_element(self, page, element_ref: str) -> None:
+        """按元素引用点击（E2）：ref 有效性已在 _cmd_execute 校验。
+
+        Playwright locator 白送自动等待/滚动到视口/可点击性检查；元素存在但
+        不可点击（被遮挡/禁用/超时）时按元素语义报 computer_element_unsupported，
+        与桌面元素动作错误码对齐。
+        """
+        locator = page.locator(f'[data-ycode-ref="{element_ref}"]')
+        # E3：优先点「视觉可点击区域」中心。老式 inline 链接的自身盒可能退化
+        # 成 1px 高且不覆盖图标，locator.click 会点空；实时求并集中心并复核
+        # 命中后走鼠标坐标点击，命中失败才回落 locator.click（保留自动等待与
+        # 可点击性检查）。求值失败一律回落，不让新路径成为新的失败面。
+        timeout = self._element_action_timeout_ms()
+        point = None
+        try:
+            point = page.evaluate(ELEMENT_HIT_SCRIPT, element_ref)
+        except Exception:
+            point = None
+        if (
+            isinstance(point, dict)
+            and point.get("contains")
+            and point.get("inViewport")
+        ):
+            try:
+                page.mouse.click(int(point["x"]), int(point["y"]))
+                return
+            except Exception as error:
+                self._raise_element_action_error(locator, element_ref, "点击", error)
+        try:
+            locator.click(timeout=timeout)
+        except Exception as error:
+            self._raise_element_action_error(locator, element_ref, "点击", error)
+
+    def _exec_set_value_element(self, page, element_ref: str, text: str) -> None:
+        """按元素引用写值（E2）：fill 优先，失败回落「点击聚焦 + 键盘输入」。
+
+        fill 直接设值不经输入法（中文免疫 IME 乱码）且触发 input/change 事件；
+        contenteditable/部分富文本编辑器不支持 fill，此时回落键盘输入。裁决：
+        回落仍失败按与 click 失败对齐的语义报 computer_element_unsupported
+        （不用坐标动作的 surface_changed / 命令超时错误码）。
+        """
+        locator = page.locator(f'[data-ycode-ref="{element_ref}"]')
+        try:
+            locator.fill(text, timeout=self._element_action_timeout_ms())
+            return
+        except Exception as error:
+            _LOGGER.debug(
+                "元素 %s fill 失败，回落键盘输入：%s", element_ref, type(error).__name__
+            )
+        try:
+            # 回落 click 单独重算剩余预算：fill 已消耗的时间不得让 click 越过
+            # 命令 deadline（越过触发调用侧超时并封闭实例，E2 评审修复）。
+            locator.click(timeout=self._element_action_timeout_ms())
+            page.keyboard.type(text)
+        except Exception as error:
+            self._raise_element_action_error(locator, element_ref, "写入", error)
+
     def _exec_drag(self, page, action: ComputerAction) -> None:
         points = action.path
         if len(points) < 2:
             raise ComputerControlError("computer_invalid_action", "drag 需要至少 2 个 path 点")
-        for point_x, point_y in points:
-            self._check_coordinates(point_x, point_y)
-        start_x, start_y = points[0]
+        # E5：逐点换算到 CSS 坐标（局部观察后模型坐标以区域左上角为原点）。
+        css_points = [self._point_to_css(point_x, point_y) for point_x, point_y in points]
+        start_x, start_y = css_points[0]
         button = action.button
         page.mouse.move(start_x, start_y)
         page.mouse.down(button=button)
         self._pressed_buttons.add(button)
         try:
-            for point_x, point_y in points[1:]:
+            for point_x, point_y in css_points[1:]:
                 page.mouse.move(point_x, point_y)
         finally:
             # try/finally 保证 mouse.up；up 失败时保留按下标记供 release_inputs 重试。
@@ -1510,14 +2166,40 @@ class BrowserComputerBackend:
         x, y = action.x, action.y
         if type(x) is not int or type(y) is not int:
             raise ComputerControlError("computer_invalid_action", "坐标 x/y 必须是整数")
-        self._check_coordinates(x, y)
-        return x, y
+        return self._point_to_css(x, y)
 
-    def _check_coordinates(self, x: int, y: int) -> None:
-        if not (0 <= x < _VIEWPORT_WIDTH and 0 <= y < _VIEWPORT_HEIGHT):
+    def _point_to_css(self, x: int, y: int) -> tuple[int, int]:
+        """模型坐标 → 浏览器 CSS 坐标（E5 起支持局部观察坐标系）。
+
+        全屏观察时两者恒等；局部观察后模型坐标以区域左上角为原点，需要按
+        「区域 CSS 尺寸 / 区域图片尺寸」缩放并加回 origin。模型坐标按当前
+        观察画面做半开区间校验，越界拒绝而不是 clamp。
+        """
+        frame = self._coord_frame
+        if frame is None:
+            self._check_coordinates(x, y)
+            return x, y
+        origin_x, origin_y, css_w, css_h, model_w, model_h = frame
+        if not (0 <= x < model_w and 0 <= y < model_h):
+            suffix = (
+                "（当前为局部观察，坐标以区域左上角为原点）"
+                if self._region_view
+                else ""
+            )
             raise ComputerControlError(
                 "computer_coordinate_out_of_bounds",
-                f"坐标 ({x}, {y}) 超出浏览器视口 {_VIEWPORT_WIDTH}x{_VIEWPORT_HEIGHT} 半开区间",
+                f"坐标 ({x}, {y}) 超出当前观察画面 {model_w}x{model_h} 半开区间{suffix}",
+            )
+        css_x = origin_x + round(x * css_w / model_w)
+        css_y = origin_y + round(y * css_h / model_h)
+        return css_x, css_y
+
+    def _check_coordinates(self, x: int, y: int) -> None:
+        if not (0 <= x < self._viewport_width and 0 <= y < self._viewport_height):
+            raise ComputerControlError(
+                "computer_coordinate_out_of_bounds",
+                f"坐标 ({x}, {y}) 超出浏览器视口 "
+                f"{self._viewport_width}x{self._viewport_height} 半开区间",
             )
 
     # ---------------- worker 内：截图短期存储 ----------------

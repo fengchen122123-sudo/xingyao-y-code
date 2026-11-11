@@ -56,7 +56,7 @@ def _capture(
         return iter([_chunk()])
 
     if protocol == "responses":
-        monkeypatch.setattr(llm, "_litellm_responses", completion)
+        monkeypatch.setattr(llm, "_dispatch_responses", completion)
     else:
         monkeypatch.setattr(llm, "completion", completion)
     list(llm.chat_with_model_events(model, "golden-secret", messages, api_base, persist=False,
@@ -88,6 +88,41 @@ def test_deepseek_non_thinking_provider_kwargs_are_byte_golden(monkeypatch):
         "extra_body": {"thinking": {"type": "disabled"}},
         "tool_choice": "auto",
         "api_base": "https://api.deepseek.com",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+    assert_exact_provider_kwargs(captured, expected)
+
+
+def test_deepseek_on_maas_aggregate_domain_provider_kwargs_are_byte_golden(monkeypatch):
+    """deepseek 名 × maas 聚合域：聚合域不得改写请求字节（Task 1a 的回归防线）。
+
+    该 (model, api_base) 组合此前落在 Qwen 域名兜底里，会被追加
+    x-dashscope-session-cache 头并把 content 改写成 cache_control 块；
+    名称优先后应与官方 api.deepseek.com 的 deepseek 金样只差 api_base。
+    """
+    import core.llm as llm
+
+    captured = _capture(
+        monkeypatch, model="openai/deepseek-v4.1-flash",
+        api_base="https://workspace-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        protocol="openai", model_cfg={"enable_thinking": False},
+        messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "inspect"}],
+    )
+    expected = {
+        "model": "openai/deepseek-v4.1-flash",
+        "api_key": "<redacted>",
+        "messages": [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "inspect"},
+        ],
+        "tools": [ALPHA_TOOL, ZETA_TOOL],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        "max_tokens": 384000,
+        "extra_body": {"thinking": {"type": "disabled"}},
+        "tool_choice": "auto",
+        "api_base": "https://workspace-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
     }
     assert_exact_provider_kwargs(captured, expected)
@@ -308,7 +343,7 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("model", "model_cfg", "provider_tail", "tools"),
+    ("model", "model_cfg", "provider_tail", "tools", "expected_messages"),
     [
         (
             "openai/deepseek-v4-flash",
@@ -319,17 +354,41 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
                 "reasoning_effort": "high",
                 "allowed_openai_params": ["reasoning_effort"],
             },
-            [ZETA_TOOL, ALPHA_TOOL],
+            [ALPHA_TOOL, ZETA_TOOL],
+            None,
         ),
         (
             "openai/qwen3.7-max",
             {"reasoning_choice": "off", "enable_thinking": False},
             {
                 "max_tokens": 131000,
+                "extra_headers": {"x-dashscope-session-cache": "enable"},
                 "extra_body": {"enable_thinking": False},
                 "tool_choice": "auto",
             },
-            [ZETA_TOOL, ALPHA_TOOL],
+            [ALPHA_TOOL, ZETA_TOOL],
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "stable",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "inspect",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
         ),
         (
             "openai/qwen3.8-max",
@@ -340,13 +399,36 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
             },
             {
                 "max_tokens": 131000,
+                "extra_headers": {"x-dashscope-session-cache": "enable"},
                 "extra_body": {
                     "enable_thinking": True,
                     "reasoning_effort": "medium",
                 },
                 "tool_choice": "auto",
             },
-            [ZETA_TOOL, ALPHA_TOOL],
+            [ALPHA_TOOL, ZETA_TOOL],
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "stable",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "inspect",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
         ),
         (
             "openai/LongCat-2.0",
@@ -357,21 +439,26 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
                 "tool_choice": "auto",
             },
             [ZETA_TOOL, ALPHA_TOOL],
+            None,
         ),
         (
             "openai/kimi-k3",
             {"reasoning_choice": "high", "enable_thinking": True, "reasoning_effort": "high"},
             {
                 "max_tokens": 131072,
-                "extra_body": {"reasoning_effort": "high"},
+                "extra_body": {
+                    "prompt_cache_key": "ycode-a47c32959586-50a50ebc13bc62a9",
+                    "reasoning_effort": "high",
+                },
                 "tool_choice": "auto",
             },
             [ZETA_TOOL, ALPHA_TOOL],
+            None,
         ),
     ],
 )
 def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
-    monkeypatch, model, model_cfg, provider_tail, tools
+    monkeypatch, model, model_cfg, provider_tail, tools, expected_messages
 ):
     """新思考策略的最终 provider 字节必须精确，不允许混入第二套开关。"""
     import core.llm as llm
@@ -380,7 +467,8 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "inspect"},
     ]
-    expected_messages = deepcopy(messages)
+    if expected_messages is None:
+        expected_messages = deepcopy(messages)
     captured = _capture(
         monkeypatch,
         model=model,
@@ -388,6 +476,7 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
         protocol="openai",
         model_cfg=model_cfg,
         messages=messages,
+        cache_session_id="golden-reasoning-choice",
     )
     expected = {
         "model": model,
@@ -406,26 +495,14 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
 
 
 @pytest.fixture
-def _fake_supports_tool_choice(monkeypatch):
-    """固定 litellm 模型清单查询结果，避免用例随 litellm 版本漂移。"""
-    import litellm.utils as litellm_utils
-
-    holder = {"supports": True}
-    monkeypatch.setattr(
-        litellm_utils, "supports_tool_choice",
-        lambda *, model, custom_llm_provider=None: holder["supports"],
-    )
-    return holder
-
-
 def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
-    monkeypatch, _fake_supports_tool_choice
+    monkeypatch,
 ):
-    """中转站未知 gpt-5* 模型：litellm 客户端会直接拒 tool_choice，请求必须
-    追加 allowed_openai_params 放行；其余字节与普通 openai 路由完全一致。"""
+    """中转站未知 gpt-5* 模型（历史 litellm 时代需放行 allowed_openai_params）：
+    自研引擎无内置清单校验，tool_choice 原样透传，请求不含放行字段，
+    其余字节与普通 openai 路由完全一致。"""
     import core.llm as llm
 
-    _fake_supports_tool_choice["supports"] = False
     messages = [
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "inspect"},
@@ -446,7 +523,6 @@ def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
         "num_retries": 2,
         "max_tokens": 32000,
         "tool_choice": "auto",
-        "allowed_openai_params": ["tool_choice"],
         "api_base": "https://relay.example/v1",
         "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
     }
@@ -454,12 +530,11 @@ def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
 
 
 def test_known_gpt5_model_request_stays_free_of_tool_choice_allowlist(
-    monkeypatch, _fake_supports_tool_choice
+    monkeypatch,
 ):
-    """litellm 已收录的 gpt-5 模型（官方路由）不触发放行，请求不新增字段。"""
+    """gpt-5* 模型请求不含放行字段（自研引擎透传 tool_choice，无需白名单）。"""
     import core.llm as llm
 
-    _fake_supports_tool_choice["supports"] = True
     captured = _capture(
         monkeypatch, model="openai/gpt-5.6-sol",
         api_base="https://relay.example/v1", protocol="openai",
@@ -470,21 +545,6 @@ def test_known_gpt5_model_request_stays_free_of_tool_choice_allowlist(
     assert "allowed_openai_params" not in captured[0]
     assert captured[0]["tool_choice"] == "auto"
 
-
-def test_tool_choice_rejection_probe_short_circuits_non_gpt5_names(monkeypatch):
-    """非 gpt-5 名字必须短路返回 False，不得触碰 litellm 清单查询。"""
-    import core.llm as llm
-
-    def _explode(*_args, **_kwargs):
-        raise AssertionError("非 gpt-5 模型不应查询 litellm 清单")
-
-    monkeypatch.setattr(
-        "litellm.utils.supports_tool_choice", _explode, raising=False
-    )
-    assert llm._litellm_rejects_tool_choice("openai/deepseek-v4-pro") is False
-    assert llm._litellm_rejects_tool_choice("openai/glm-5.3-flash") is False
-    assert llm._litellm_rejects_tool_choice("anthropic/step-3.7-flash") is False
-    assert llm._litellm_rejects_tool_choice("") is False
 
 
 def test_native_computer_first_and_continuation_requests_are_byte_golden(
@@ -553,7 +613,7 @@ def test_native_computer_first_and_continuation_requests_are_byte_golden(
     )
     monkeypatch.setattr(llm, "_describe_images_with_secondary", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(llm, "get_computer_control_service", lambda: controller)
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
     list(llm.chat_with_model_events(
         "openai/gpt-native-golden",
         "golden-secret",
@@ -635,7 +695,7 @@ def test_exact_model_id_reaches_final_provider_payload(monkeypatch):
         "model": "openai/deepseek-v4-flash",
         "api_key": "<redacted>",
         "messages": [{"role": "user", "content": "inspect"}],
-        "tools": [ZETA_TOOL, ALPHA_TOOL],
+        "tools": [ALPHA_TOOL, ZETA_TOOL],
         "stream": True,
         "stream_options": {"include_usage": True},
         "num_retries": 2,

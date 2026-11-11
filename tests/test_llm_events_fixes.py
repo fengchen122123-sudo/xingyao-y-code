@@ -554,22 +554,34 @@ def test_edit_file_dispatch_passes_replace_all(mocker, tmp_path):
 
 
 def test_write_file_old_content_falls_back_to_gbk(mocker, tmp_path):
-    """GBK 文件被 write_file 覆写时，旧内容读取回退 GBK，undo 快照不退化为空串。"""
+    """GBK 文件被 write_file 覆写时，按回合撤销快照保存原始 GBK 字节，
+    不得把解码替换字符写入快照（新记录器契约，替代旧 set_undo_state）。"""
+    import hashlib
+
     import core.llm as llm
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
+    from core.turn_undo import recorder as tu_recorder
+    from core.turn_undo.models import OwnerKind
 
     target = tmp_path / "gbk-file.txt"
-    target.write_bytes("中文内容".encode("gbk"))
-    snapshots = {}
+    original = "中文内容".encode("gbk")
+    target.write_bytes(original)
+
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = tu_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.add_messages("gbk-sess", [("user", "hi")])
+    session_id = storage.resolve_session_id("gbk-sess")
+    checkpoint, ctx = tu_service.begin_turn(
+        session_id=session_id,
+        turn_id="turn-gbk-write",
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
 
     mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
-    mocker.patch(
-        "core.memory.set_undo_state",
-        side_effect=lambda path, old, **metadata: snapshots.update(
-            path=path,
-            old=old,
-            **metadata,
-        ),
-    )
 
     tool_call = {
         "id": "call-gbk-write",
@@ -578,12 +590,19 @@ def test_write_file_old_content_falls_back_to_gbk(mocker, tmp_path):
             "arguments": '{"file_path": "%s", "content": "new"}' % str(target).replace("\\", "\\\\"),
         },
     }
-    result = llm._execute_single_tool_call(
-        tool_call,
-        event_callback=lambda *args, **kwargs: None,
-    )
+    try:
+        result = llm._execute_single_tool_call(
+            tool_call,
+            event_callback=lambda *args, **kwargs: None,
+        )
+    finally:
+        tu_service.finish_turn(ctx)
 
-    assert snapshots["old"] == "中文内容"
+    files = storage.list_files(checkpoint.checkpoint_id)
+    assert len(files) == 1
+    row = files[0]
+    assert row.before_sha256 == hashlib.sha256(original).hexdigest()
+    assert storage.blob_store.read_bytes(row.before_blob_sha256) == original
     assert result["content"].startswith("已成功将内容写入文件")
 
 
@@ -1054,8 +1073,12 @@ def test_unverifiable_path_never_prompts_or_executes_a_file_tool(
         "check_permission_and_ask",
         lambda *args, **kwargs: prompted.append((args, kwargs)) or True,
     )
+    # patch 类属性而非 _LazyToolRegistry 实例：实例 setattr 会把 fake 经
+    # __setattr__ 落到进程级缓存的内部注册表上（还原不可靠，见 test_llm_events）。
+    from core.tool_registry import ToolRegistry
+
     monkeypatch.setattr(
-        llm_mod.tool_registry,
+        ToolRegistry,
         "execute",
         lambda *args, **kwargs: (
             executed.append((args, kwargs))
@@ -1104,8 +1127,10 @@ def test_external_missing_edit_requests_sandbox_access_before_existence_probe(tm
         "check_permission_and_ask",
         lambda permission, arguments, **kwargs: prompts.append((permission, arguments)) or False,
     )
+    import os as _os
+
     monkeypatch.setattr(
-        llm_mod.os.path,
+        _os.path,
         "isfile",
         lambda path: probes.append(path) or False,
     )
@@ -1269,8 +1294,10 @@ def test_plan_mode_blocks_modifying_tools(monkeypatch):
 
     monkeypatch.setattr(llm_mod.app_context, "get_permission_mode", lambda: "plan")
     executed = []
+    from core.tool_registry import ToolRegistry
+
     monkeypatch.setattr(
-        llm_mod.tool_registry, "execute",
+        ToolRegistry, "execute",
         lambda name, **kw: executed.append(name),
     )
 
@@ -1370,11 +1397,6 @@ def test_supports_vision_unknown_default_false(monkeypatch):
     import core.llm as llm_mod
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {"providers": []})
-    monkeypatch.setattr(
-        llm_mod.litellm, "supports_vision",
-        lambda model: False,
-        raising=False,
-    )
     assert llm_mod._supports_vision("openai/step-3.7-flash") is False
     assert llm_mod._supports_vision("anthropic/K3") is False
     assert llm_mod._supports_vision("deepseek/deepseek-chat") is False
@@ -1748,6 +1770,87 @@ def test_wait_notice_emitted_during_slow_request(mocker, monkeypatch):
     assert "超时上限" in str(notices[0].payload["message"])
 
 
+def test_wait_notice_flushed_realtime_not_batched_after_first_chunk(mocker, monkeypatch):
+    """等待提示必须实时到达消费端，而不是积压到首个正文 chunk 之后一次性冲刷。
+
+    status 事件经回调进 pending_events，若等待期不 yield 空心跳，外层适配层
+    只会在拿到首个正文 chunk 时才 drain——GUI 上表现为“通了之后扎堆弹出”。
+    以 completion 返回时刻为界：至少一条提示必须在其之前到达。
+    """
+    import time as _time
+
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_INTERVAL_SECONDS", 0.05)
+
+    completion_returned_at = []
+
+    def slow_completion(**kwargs):
+        _time.sleep(0.4)
+        completion_returned_at.append(_time.monotonic())
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=slow_completion)
+
+    notice_times = []
+    for event in chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "慢请求"}],
+        persist=False,
+        turn_id="turn-wait-notice-realtime",
+        consume_background_notifications=False,
+    ):
+        if (
+            event.kind == "status"
+            and "模型响应中" in str(event.payload.get("message", ""))
+        ):
+            notice_times.append(_time.monotonic())
+
+    assert notice_times, "慢请求期间必须上报“模型响应中”状态事件"
+    assert completion_returned_at, "slow_completion 必须真实返回过"
+    assert min(notice_times) < completion_returned_at[0], (
+        "等待提示必须在 completion 返回（首个正文可用）之前实时到达，"
+        "而不是积压到首个正文 chunk 之后一次性冲刷"
+    )
+
+
+def test_request_wait_give_up_ends_turn_at_hard_cap_without_retry(mocker, monkeypatch):
+    """等待达到硬上限必须结束本轮并发出 turn_error，且绝不进入 API 重试循环
+    （重试只会再等一个上限时长）。"""
+    import time as _time
+
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr("core.llm.REQUEST_WAIT_GIVE_UP_SECONDS", 0.25)
+
+    def hanging_completion(**kwargs):
+        # 永不返回流：等待硬上限必须先于任何响应触发
+        _time.sleep(5)
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=hanging_completion)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "挂起请求"}],
+        persist=False,
+        turn_id="turn-wait-give-up",
+        consume_background_notifications=False,
+    ))
+
+    give_up_errors = [
+        e for e in events
+        if e.kind == "turn_error" and "仍未收到首字节" in str(e.payload.get("message", ""))
+    ]
+    assert give_up_errors, "等待硬上限必须以 turn_error 结束本轮"
+    retry_notices = [
+        e for e in events
+        if e.kind == "status" and "重试" in str(e.payload.get("message", ""))
+    ]
+    assert not retry_notices, "等待硬上限绝不允许进入 API 重试循环"
+
+
 def test_fold_old_media_for_estimate_keeps_only_latest_image():
     """token 估算时历史图片必须折叠为占位符（与请求时的折叠规则一致），
     仅最近一条带图用户消息保留原样，避免 base64 字符量虚高误触发压缩。"""
@@ -1780,7 +1883,7 @@ def test_fold_old_media_for_estimate_keeps_only_latest_image():
 
 
 def test_estimate_tokens_ignores_old_image_base64(mocker):
-    """estimate_tokens 走 litellm 计数时，历史图片必须先折叠，base64 不得参与计数。"""
+    """estimate_tokens 计数时，历史图片必须先折叠，base64 不得参与计数。"""
     import core.llm as llm_module
     from core.llm import estimate_tokens
 
@@ -1803,10 +1906,10 @@ def test_estimate_tokens_ignores_old_image_base64(mocker):
         return 123
 
     llm_module._token_estimate_cache["sig"] = None  # 避免命中签名缓存
-    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+    mocker.patch("core.llm._token_counter", side_effect=fake_counter)
 
     assert estimate_tokens("fake-model", messages) == 123
-    assert counted, "必须调用 litellm 计数"
+    assert counted, "必须调用 _token_counter 计数"
     assert base64_blob not in str(counted[0])
     assert "[图片]" in str(counted[0])
 
@@ -1962,7 +2065,7 @@ def test_estimate_tokens_incremental_counts_only_tail(mocker):
         counted_batches.append(len(msgs))
         return sum(len(str(m.get("content", ""))) for m in msgs) // 10
 
-    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+    mocker.patch("core.llm._token_counter", side_effect=fake_counter)
 
     history = [{"role": "user", "content": "x" * 1000} for _ in range(50)]
     v1 = estimate_tokens("fake-model", history)
@@ -1994,7 +2097,7 @@ def test_estimate_tokens_prefix_changed_falls_back_to_full_count(mocker):
         counted_batches.append(len(msgs))
         return sum(len(str(m.get("content", ""))) for m in msgs) // 10
 
-    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+    mocker.patch("core.llm._token_counter", side_effect=fake_counter)
 
     history = [{"role": "user", "content": "x" * 1000} for _ in range(50)]
     estimate_tokens("fake-model", history)
@@ -2031,7 +2134,7 @@ def test_estimate_tokens_cache_snapshot_cannot_mix_concurrent_models(monkeypatch
     )
     monkeypatch.setattr(
         llm_mod,
-        "_litellm_token_counter",
+        "_token_counter",
         lambda model, messages: 100 if model == "model-a" else 200,
     )
     messages = [{"role": "user", "content": "hello"}]
@@ -2054,38 +2157,10 @@ def test_estimate_tokens_cache_snapshot_cannot_mix_concurrent_models(monkeypatch
     assert llm_mod.estimate_tokens("model-b", messages) == 200
 
 
-def test_litellm_patch_preserves_stream_usage_details():
-    """litellm 1.83.7 流式 usage 为 dict 时只取三个字段重建 Usage，
-    prompt_tokens_details.cached_tokens 被丢弃导致命中记账恒为 0。
-    补丁必须将 dict usage 转成 litellm.Usage 并保留缓存明细。"""
-    from types import SimpleNamespace
-
-    import core.llm as llm_mod
-
-    litellm = llm_mod._get_litellm()
-    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
-
-    fake_chunk = SimpleNamespace(
-        choices=[],
-        usage={
-            "prompt_tokens": 673,
-            "completion_tokens": 16,
-            "total_tokens": 689,
-            "prompt_tokens_details": {"cached_tokens": 512},
-            "prompt_cache_hit_tokens": 512,
-            "prompt_cache_miss_tokens": 161,
-        },
-    )
-    result = CustomStreamWrapper.handle_openai_chat_completion_chunk(object(), fake_chunk)
-    usage = result["usage"]
-    assert isinstance(usage, litellm.Usage), "补丁后 usage 必须是 litellm.Usage 实例"
-    assert usage.prompt_tokens_details is not None
-    assert usage.prompt_tokens_details.cached_tokens == 512
-
 
 def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
-    """litellm 流式包装器会把 finish 后的最终 usage chunk 吞进 wrapper.chunks
-    而不再 yield，迭代中拿到的 usage 不含缓存明细（命中记账恒为 0）。
+    """流式包装器会把 finish 后的最终 usage chunk 留在 wrapper.chunks
+    而不再对外 yield，迭代中拿到的 usage 不含缓存明细（命中记账恒为 0）。
     记账必须从 chunks 尾部补取最终 usage。"""
     import core.llm as llm_mod
 
@@ -2096,7 +2171,7 @@ def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
     )
 
     class FakeStream:
-        """模拟 litellm CustomStreamWrapper：迭代只给内容 chunk，
+        """模拟流包装对象：迭代只给内容 chunk，
         真实 usage 留在 chunks 属性里。"""
 
         chunks = [SimpleNamespace(usage=final_usage)]
@@ -2473,3 +2548,69 @@ def test_protocol_empty_content_marker_is_not_persisted_or_rendered(
     assert persisted_tool_request["content"] is None
     assert persisted_tool_request["tool_calls"][0]["id"] == "read-1"
     assert marker not in str(manager.get_history("session"))
+
+
+# ── neohorse 网关：仅允许一条开头 system 消息（记忆注入兼容性）──
+
+
+def test_neohorse_merges_leading_system_messages():
+    """子代理形态：[system, system(记忆注入), user] 必须合并为一条开头 system。
+
+    neohorse（tokenrhythm 网关）对多条 system 或中段 system 一律 400：
+    "System message must be at the beginning."
+    """
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "system", "content": "你是子代理。"},
+        {"role": "system", "content": "# Auto Memory\n- 记忆索引"},
+        {"role": "user", "content": "读取文件并总结。"},
+    ]
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/neohorse-1-9b",
+        "https://tokenrhythm.studio/v1",
+    )
+    systems = [m for m in fixed if m["role"] == "system"]
+    assert len(systems) == 1
+    assert fixed[0]["role"] == "system"
+    assert "你是子代理。" in fixed[0]["content"]
+    assert "# Auto Memory" in fixed[0]["content"]
+
+
+def test_neohorse_merges_mid_conversation_system():
+    """主 Agent 长会话形态：对话中间的 system 也必须折叠进开头一条。"""
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "system", "content": "主提示词"},
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "第一答"},
+        {"role": "system", "content": "# Auto Memory 段落"},
+        {"role": "user", "content": "第二问"},
+    ]
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/neohorse-1-9b",
+        "https://tokenrhythm.studio/v1",
+    )
+    assert [m["role"] for m in fixed] == ["system", "user", "assistant", "user"]
+    assert "主提示词" in fixed[0]["content"]
+    assert "# Auto Memory 段落" in fixed[0]["content"]
+
+
+def test_other_providers_keep_separate_system_messages():
+    """非 neohorse 路由行为不变：连续 system 消息保持原样不合并。"""
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "system", "content": "你是子代理。"},
+        {"role": "system", "content": "# Auto Memory 段落"},
+        {"role": "user", "content": "任务"},
+    ]
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/deepseek-flash",
+        "https://api.deepseek.com",
+    )
+    assert [m["role"] for m in fixed] == ["system", "system", "user"]

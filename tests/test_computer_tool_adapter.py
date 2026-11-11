@@ -96,7 +96,16 @@ def execute_one_computer_action(controller, context, *, target="browser",
         message=record.message,
         followup_messages=record.followup_messages,
         observation_data_url=(
-            followup["content"][1]["image_url"]["url"] if followup else None
+            next(
+                (
+                    item["image_url"]["url"]
+                    for item in followup["content"]
+                    if item.get("type") == "image_url"
+                ),
+                None,
+            )
+            if followup
+            else None
         ),
     )
 
@@ -152,6 +161,9 @@ def test_computer_result_adds_tool_then_user_observation(fake_controller, contex
         "role": "user",
         "content": [
             {"type": "text", "text": "【电脑观察】请只依据这张最新截图决定下一步。"},
+            # E3：定位提示按 target 区分——browser 没有 observe_region，
+            # 只能给出坐标语义提示（旧文案会让模型调用 desktop 专属动作）
+            {"type": "text", "text": "【定位提示】本页没有可用的元素引用，请依据这张整屏截图判断位置，坐标以截图左上角为 (0,0)，不要凭记忆复用旧坐标。"},
             {"type": "image_url", "image_url": {"url": record.observation_data_url}},
         ],
         "_computer_v1": {"run_id": "run-a", "ordinal": 1, "target": "browser"},
@@ -306,9 +318,14 @@ def test_missing_png_returns_error_without_stale_image(fake_controller, context)
     fake_controller.png_path = ""
     record = execute_one_computer_action(fake_controller, context, target="browser")
     payload = json.loads(record.message["content"])
-    assert payload["ok"] is False
-    assert payload["error_code"] == "computer_backend_error"
-    assert record.followup_messages == ()
+    # png 缺失走 B 方案降级观察（不再是错误），但绝不能夹带陈旧图片
+    assert payload["ok"] is True
+    # 降级观察仍会给模型一条纯文本 follow-up，但绝不能夹带陈旧图片
+    assert all(
+        item.get("type") != "image_url"
+        for message in record.followup_messages
+        for item in message["content"]
+    )
 
 
 def test_forged_non_computer_name_stays_on_normal_resolution_path(context):
@@ -338,6 +355,8 @@ def test_computer_action_tool_spec_semantics():
     assert spec.cancellable is True
     assert spec.parallel_safe is False
     assert spec.mutates_files is False
+    # 规格 03 §3.2：computer_action 归 system（A 阶段评审补修缺口）。
+    assert spec.side_effect_scope == "system"
 
 
 def test_reserved_computer_tool_names_are_frozen():

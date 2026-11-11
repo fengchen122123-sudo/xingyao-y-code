@@ -28,6 +28,8 @@ import AppIcon from './AppIcon.vue';
 import type { FileNode } from '../types/pywebview';
 import { useAppStore } from '../stores/appStore';
 import { extIcon } from '../utils/fileIcon';
+import { canOpenInRightPanel } from '../utils/localPath';
+import { useIsMobile } from '../composables/useViewport';
 
 const props = defineProps<{
   node: FileNode;
@@ -35,6 +37,8 @@ const props = defineProps<{
 }>();
 
 const store = useAppStore();
+// 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
+const isMobile = useIsMobile();
 // FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
 const fullPath = computed(() => {
   return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
@@ -49,6 +53,12 @@ const icon = computed(() => (props.node.d ? '' : extIcon(props.node.n)));
 
 async function toggle() {
   if (!props.node.d) {
+    // html / pdf / md 交给右栏（网页直接渲染，md 先渲染成预览页）；
+    // 移动端没有右面板，一律回退源码预览弹窗
+    if (canOpenInRightPanel(fullPath.value) && !isMobile.value) {
+      void store.openInRightPanel(fullPath.value);
+      return;
+    }
     store.openFilePreview(fullPath.value);
     return;
   }
@@ -85,7 +95,9 @@ async function toggle() {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 4px 8px;
+  /* 行高按设计稿 .row 定 24px（原来由字体行高决定，约 25.5px） */
+  min-height: 24px;
+  padding: 2px 8px;
   padding-right: 16px;
   border-radius: 6px;
   cursor: pointer;
@@ -121,9 +133,10 @@ async function toggle() {
   white-space: nowrap;
 }
 .file-children {
-  margin-left: 16px;
+  /* 每层缩进 14px（含 1px 竖向引导线），对齐设计稿 .row 的 padding-left 递进 */
+  margin-left: 10px;
   border-left: 1px solid var(--border);
-  padding-left: 6px;
+  padding-left: 4px;
 }
 .file-loading {
   padding: 3px 8px;

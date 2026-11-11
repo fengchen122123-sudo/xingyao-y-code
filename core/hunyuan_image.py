@@ -21,12 +21,11 @@ import time
 import urllib.error
 import urllib.request
 
+from pathlib import Path
+
 from core.tool_protocol import ToolResult
 
-_API_URL = (
-    "https://test-d0g2437q5595821f7.api.tcloudbasegateway.com"
-    "/v1/functions/generateImage-NRxNPj"
-)
+_API_URL = os.environ.get("HUNYUAN_IMAGE_ENDPOINT", "")
 
 # Server API Key 仅从本机环境变量读取，不写入发布包。
 VALID_SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280")
@@ -34,6 +33,11 @@ VALID_SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280")
 def _resolve_api_key() -> str:
     """解析生图 Server API Key：仅从环境变量 HUNYUAN_API_KEY 读取。"""
     return os.environ.get("HUNYUAN_API_KEY", "").strip()
+
+
+def _resolve_api_url() -> str:
+    """解析生图接口地址：优先取调用时的 HUNYUAN_IMAGE_ENDPOINT，其次导入时的值。"""
+    return os.environ.get("HUNYUAN_IMAGE_ENDPOINT", _API_URL).strip()
 
 # 图生图（垫图）模式使用的模型；传入 image 参数时自动切换，文生图不指定模型
 _I2I_MODEL = "HY-Image-v3.0-I2I-ToB-v1.0.1"
@@ -51,7 +55,7 @@ def _detect_ext(head: bytes) -> str:
     return ".img"
 
 
-def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", footnote: str = " ", image: str = "") -> ToolResult:
+def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = None, footnote: str = " ", image: str = "") -> ToolResult:
     """调用混元生图接口生成图片并下载保存，返回本地路径等信息。
 
     作为插件工具 hunyuan_generate_image 的执行体被注册。
@@ -73,6 +77,12 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", fo
     api_key = _resolve_api_key()
     if not api_key:
         return ToolResult("缺少 HUNYUAN_API_KEY：请在本机配置 CloudBase Server API Key。", is_error=True)
+    api_url = _resolve_api_url()
+    if not api_url:
+        return ToolResult(
+            "缺少 HUNYUAN_IMAGE_ENDPOINT：请在本机配置生图接口地址（CloudBase 生图网关 URL）。",
+            is_error=True,
+        )
     payload = {"prompt": prompt, "size": size}
     if footnote is not None:
         payload["footnote"] = footnote
@@ -87,7 +97,7 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", fo
         payload["model"] = _I2I_MODEL
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        _API_URL,
+        api_url,
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -125,7 +135,13 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", fo
             is_error=True,
         )
 
-    # imageUrl 仅 24 小时有效，立即下载保存
+    # imageUrl 仅 24 小时有效，立即下载保存。
+    # 未传 save_dir → AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）；
+    # 显式传值（含 "."）→ 尊重原参数，不做隐式改道。
+    if save_dir is None:
+        from core.ai_output_paths import resolve_ai_output_dir
+
+        save_dir = str(resolve_ai_output_dir())
     save_dir = os.path.abspath(save_dir or ".")
     os.makedirs(save_dir, exist_ok=True)
     base = os.path.join(save_dir, "hunyuan_%s" % time.strftime("%Y%m%d_%H%M%S"))
@@ -135,7 +151,40 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", fo
         with open(tmp, "rb") as f:
             head = f.read(8)
         path = base + _detect_ext(head)
-        os.replace(tmp, path)
+        # 按回合撤销：插件声明的受控文件修改同样先快照后落盘（规格 9.5）
+        from core.turn_undo import coordinator as _tu_coordinator
+        from core.turn_undo import recorder as _tu_recorder
+        from core.turn_undo.models import NodeKind, TurnUndoError
+
+        with open(tmp, "rb") as f:
+            payload = f.read()
+        handle = None
+        with _tu_coordinator.get_coordinator().workspace_lock(_tu_coordinator.thread_workspace_root()):
+            try:
+                handle = _tu_recorder.prepare_mutation(
+                    display_path=path,
+                    after_kind=NodeKind.REGULAR_FILE,
+                    after_content=payload,
+                    tool_name="hunyuan_generate_image",
+                    tool_call_id="",
+                )
+            except TurnUndoError as error:
+                if error.code == "no_active_checkpoint":
+                    handle = None
+                elif error.code == "workspace_busy":
+                    return ToolResult(
+                        f"🚨 该目录正在被另一个回合写入，图片未写入：{error.message}\n"
+                        f"请稍后重试。",
+                        is_error=True,
+                    )
+                else:
+                    return ToolResult(
+                        f"🚨 撤销检查点已封闭，迟到的图片写入已被拒绝：{error.message}",
+                        is_error=True,
+                    )
+            os.replace(tmp, path)
+            if handle is not None:
+                _tu_recorder.verify_after_mutation(handle)
     except Exception as exc:
         try:
             if os.path.exists(tmp):

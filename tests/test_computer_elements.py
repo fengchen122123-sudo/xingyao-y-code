@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from core.computer.models import ComputerAction, ComputerControlError
@@ -114,15 +116,37 @@ def test_parse_element_actions():
     )
 
 
-def test_element_actions_reject_browser_target():
+def test_element_actions_allow_browser_except_list_elements():
+    """E2 有意协议变更：click_element / set_value_element 支持 browser target。
+
+    变更前这两个动作是 desktop 专属；E2 后浏览器 observe 携带元素列表（el-N），
+    元素动作按 ref 走 Playwright locator 通路。list_elements 仍为桌面专属：
+    浏览器版职责由 observe 直接承担（设计 3.1），不提供独立动作。
+    """
     from core.computer.actions import parse_computer_action
 
-    with pytest.raises(ComputerControlError):
-        parse_computer_action(
-            {"kind": "click_element", "target": "browser", "element_ref": "el-1"}
-        )
-    with pytest.raises(ComputerControlError):
+    click = parse_computer_action(
+        {"kind": "click_element", "target": "browser", "element_ref": "el-1"}
+    )
+    assert click.element_ref == "el-1"
+    set_value = parse_computer_action(
+        {"kind": "set_value_element", "target": "browser",
+         "element_ref": "el-2", "text": "中文内容"}
+    )
+    assert set_value.element_ref == "el-2"
+    assert set_value.text == "中文内容"
+    with pytest.raises(ComputerControlError) as exc:
         parse_computer_action({"kind": "list_elements", "target": "browser"})
+    assert exc.value.code == "computer_invalid_action"
+
+
+def test_desktop_only_kinds_reflect_e2_protocol_change():
+    """白名单断言：click/set_value 已移除（双 target），list_elements 仍桌面专属。"""
+    from core.computer.actions import _DESKTOP_ONLY_KINDS
+
+    assert "click_element" not in _DESKTOP_ONLY_KINDS
+    assert "set_value_element" not in _DESKTOP_ONLY_KINDS
+    assert "list_elements" in _DESKTOP_ONLY_KINDS
 
 
 def test_summary_includes_element_ref():
@@ -385,8 +409,12 @@ def _pil_backend(locator, adapter=None):
     )
 
 
-def test_list_elements_observe_is_annotated_and_differs_from_plain():
-    """list_elements 后紧邻 observe：观察附带元素表且 PNG 与普通观察不同。"""
+def test_list_elements_observe_refreshes_table_and_annotation():
+    """显式 list_elements 后紧邻 observe：元素表刷新为新一代并重新标注。
+
+    观察本身已自动携带元素（见自动补表用例），这里验证 list_elements 的显式
+    结果优先——新表只含 el-1，与自动补的首个观察（3 个控件）不同，PNG 随之变化。
+    """
     from pathlib import Path
 
     locator, _host = _locator_with_fake()
@@ -394,14 +422,15 @@ def test_list_elements_observe_is_annotated_and_differs_from_plain():
     backend.start()
     run_id = "run-som"
     try:
-        plain = backend.observe(run_id)
-        plain_bytes = Path(plain.png_path).read_bytes()
+        auto = backend.observe(run_id)
+        auto_bytes = Path(auto.png_path).read_bytes()
         backend.execute(run_id, ComputerAction(kind="list_elements", target="desktop"))
         annotated = backend.observe(run_id)
         annotated_bytes = Path(annotated.png_path).read_bytes()
+        assert [item["ref"] for item in auto.elements] == ["el-1", "el-2", "el-3"]
         assert annotated.elements and annotated.elements[0]["ref"] == "el-1"
-        assert annotated.screen_sha256 != plain.screen_sha256
-        assert annotated_bytes != plain_bytes
+        assert annotated.screen_sha256 != auto.screen_sha256
+        assert annotated_bytes != auto_bytes
     finally:
         backend.close()
 
@@ -426,31 +455,153 @@ def test_elements_reused_while_generation_stable():
         backend.close()
 
 
-def test_generation_change_clears_elements_and_refs():
-    """画面代数变化：元素表清空、locator ref 失效、观察退回普通截图。"""
+def test_generation_change_invalidates_old_table_and_recollects():
+    """画面代数变化：旧元素表作废（locator ref 失效）、观察重新收集当前表。
+
+    旧契约是"代数变化即清空元素表"，自动补表后观察始终携带当前窗口元素：
+    旧表绝不沿用（invalidate + 缓存清零），改为重新收集一次。
+    """
     from pathlib import Path
 
     from tests.computer_fakes import FakeWin32Adapter
 
     locator, _host = _locator_with_fake()
+
+    class _RecordingLocator:
+        """包一层记录 invalidate 调用（旧 ref 失效的唯一入口）。"""
+
+        def __init__(self, inner):
+            self.inner = inner
+            self.invalidate_calls = 0
+
+        def collect(self, hwnd):
+            return self.inner.collect(hwnd)
+
+        def invalidate(self):
+            self.invalidate_calls += 1
+            return self.inner.invalidate()
+
+        def click(self, ref):
+            return self.inner.click(ref)
+
+        def close(self):
+            return self.inner.close()
+
+    recording = _RecordingLocator(locator)
     adapter = FakeWin32Adapter()
-    backend = _pil_backend(locator, adapter=adapter)
+    backend = _pil_backend(recording, adapter=adapter)
     backend.start()
     run_id = "run-som3"
     try:
-        plain = backend.observe(run_id)
-        plain_bytes = Path(plain.png_path).read_bytes()
-        backend.execute(run_id, ComputerAction(kind="list_elements", target="desktop"))
-        annotated = backend.observe(run_id)
-        assert annotated.elements
-        # 用户切走窗口：前台身份变化 → 代数递增
+        first = backend.observe(run_id)
+        assert [item["ref"] for item in first.elements] == ["el-1", "el-2", "el-3"]
+        first_bytes = Path(first.png_path).read_bytes()
+        # 用户切走窗口：前台身份变化 → 代数递增 → 旧表作废并重新收集
         adapter.foreground_id = 2002
         switched = backend.observe(run_id)
-        assert switched.elements == ()
-        assert switched.surface_generation == annotated.surface_generation + 1
-        assert Path(switched.png_path).read_bytes() == plain_bytes
+        assert switched.surface_generation == first.surface_generation + 1
+        assert recording.invalidate_calls == 1
+        # 第 2 代收集只剩 el-1：旧表不沿用，PNG 按新表重新标注
+        assert [item["ref"] for item in switched.elements] == ["el-1"]
+        assert Path(switched.png_path).read_bytes() != first_bytes
         with pytest.raises(ComputerControlError) as exc:
-            locator.click("el-1")
+            locator.click("el-2")
         assert exc.value.code == "computer_element_stale"
+        locator.click("el-1")  # 新表 ref 立即可用
+    finally:
+        backend.close()
+
+
+# ---------------- 桌面 observe 自动携带 UIA 元素表 ----------------
+
+
+def test_observe_auto_collects_elements_without_list_elements():
+    """首次 observe 无需 list_elements 即携带元素表，且 ref 可直接点击。"""
+    locator, host = _locator_with_fake()
+    backend = _pil_backend(locator)
+    backend.start()
+    run_id = "run-auto1"
+    try:
+        observation = backend.observe(run_id)
+        assert [item["ref"] for item in observation.elements] == [
+            "el-1",
+            "el-2",
+            "el-3",
+        ]
+        assert host.collect_calls == 1
+        backend.execute(
+            run_id,
+            ComputerAction(kind="click_element", target="desktop", element_ref="el-2"),
+        )
+        assert host.click_calls == ["el-2"]
+    finally:
+        backend.close()
+
+
+def test_observe_auto_collect_failure_does_not_block_observation(caplog):
+    """元素提取失败：吞掉异常、留日志，观察照常成功且退回普通截图。"""
+
+    class _BrokenLocator:
+        def collect(self, hwnd):
+            raise RuntimeError("UIA 树读取失败")
+
+        def invalidate(self):
+            raise AssertionError("首次观察不应调用 invalidate")
+
+        def close(self):
+            pass
+
+    backend = _backend_with_locator(_BrokenLocator())
+    backend.start()
+    try:
+        with caplog.at_level(logging.ERROR):
+            observation = backend.observe("run-auto2")
+        assert observation.ok is True
+        assert observation.elements == ()
+        assert str(observation.png_path)
+        assert "自动提取前台窗口元素失败" in caplog.text
+    finally:
+        backend.close()
+
+
+def test_observe_auto_collect_caps_element_count():
+    """自动补表按上限截断，避免超大树把一次观察拖成数百条控件。"""
+    from core.computer.windows_backend import _MAX_OBSERVE_ELEMENTS
+
+    listing = [
+        {
+            "ref": f"el-{n}",
+            "kind": "ButtonControl",
+            "name": f"控件{n}",
+            "bounds": [0, 0, 10, 10],
+            "enabled": True,
+        }
+        for n in range(1, 251)
+    ]
+
+    class _BigLocator:
+        def collect(self, hwnd):
+            return list(listing)
+
+        def close(self):
+            pass
+
+    backend = _pil_backend(_BigLocator())
+    backend.start()
+    try:
+        observation = backend.observe("run-auto3")
+        assert len(observation.elements) == _MAX_OBSERVE_ELEMENTS == 200
+        assert observation.elements[-1]["ref"] == "el-200"
+    finally:
+        backend.close()
+
+
+def test_observe_without_locator_has_empty_elements():
+    """未挂元素定位器：观察元素表仍为空（保持既有契约）。"""
+    backend = _backend_with_locator(None)
+    backend.start()
+    try:
+        observation = backend.observe("run-auto4")
+        assert observation.elements == ()
     finally:
         backend.close()

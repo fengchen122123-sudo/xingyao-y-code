@@ -7,11 +7,205 @@ import os
 import sys
 import json
 import logging
+import shutil
 import socket
 import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+
+# ============================================================================
+# 内置 CLI 模式（--cli）：安装包只保留一份 Python 载荷
+#
+# 背景（合并方案，见 packaging/ycode_launcher.cs）：原先 Y-code.exe(GUI) 与
+# ycode.exe(CLI) 各带一份约 31MB 的 PyInstaller 字节码归档，其中约 30.83MB 是
+# 两份完全相同的共用模块、CLI 独有模块只有 0.12MB。现在 ycode.exe 退化为几 KB 的
+# C# 控制台启动器，它把调用方参数原样透传并追加 --cli 拉起本程序；本模块必须在
+# 任何 GUI 重模块（webview / gui_bridge / core.gui_*）被 import 之前识别该标志并
+# 转交 CLI 主流程，否则会先白付一遍 GUI 导入开销，还会把
+# hide_child_console_windows 这类 GUI 专属兜底带进控制台程序。
+# ============================================================================
+_CLI_FLAG = "--cli"
+# CLI 模式自救时打开的 CONOUT$/CONIN$ 流必须持有引用：main.py 会把 sys.stdout
+# 重新包一层 TextIOWrapper，旧对象一旦被 GC 回收就会顺带关闭底层 buffer。
+_CLI_STDIO_STREAMS = []
+
+
+def _stream_usable(stream) -> bool:
+    """标准流是否真的可用（None 与 runtime hook 的哑对象都应视为不可用）。"""
+    if stream is None:
+        return False
+    try:
+        stream.fileno()
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_cli_stdio() -> None:
+    """修复 CLI 模式下的标准流。
+
+    打包版是 console=False 的 GUI 子系统程序，Python 初始化时 sys.stdout /
+    sys.stderr 常常是 None（runtime hook packaging/runtime_hook_nullstdout.py 会把
+    它们换成哑对象，详见该文件说明）。但本进程是被 ycode.exe 启动器用「继承标准
+    句柄」拉起的，通常与调用方共享同一个控制台：先 AttachConsole(父进程) 再打开
+    CONOUT$/CONIN$；拿不到控制台（从资源管理器双击、或输出被重定向到管道）时退回
+    os.devnull，保证任何 print() 都不会因 None/哑对象而崩溃，交互式检查也能给出
+    "不是终端"的清晰结论而不是 AttributeError。
+    """
+    if sys.platform != "win32":
+        for name, mode in (("stdin", "r"), ("stdout", "w"), ("stderr", "w")):
+            if _stream_usable(getattr(sys, name, None)):
+                continue
+            try:
+                stream = open(os.devnull, mode, encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            _CLI_STDIO_STREAMS.append(stream)
+            setattr(sys, name, stream)
+        return
+
+    try:
+        import ctypes
+
+        # ATTACH_PARENT_PROCESS(-1)：附着到启动器所在的控制台。已经附着时返回
+        # 失败（ERROR_ACCESS_DENIED），属正常过渡，忽略即可。
+        ctypes.windll.kernel32.AttachConsole(-1)
+    except Exception:
+        pass
+
+    for name, device, mode in (
+        ("stdin", "CONIN$", "r"),
+        ("stdout", "CONOUT$", "w"),
+        ("stderr", "CONOUT$", "w"),
+    ):
+        if _stream_usable(getattr(sys, name, None)):
+            continue
+        stream = None
+        for target in (device, os.devnull):
+            try:
+                stream = open(
+                    target, mode, encoding="utf-8", errors="replace",
+                    buffering=1 if mode == "w" else -1,
+                )
+                break
+            except Exception:
+                stream = None
+        if stream is None:
+            continue
+        _CLI_STDIO_STREAMS.append(stream)
+        setattr(sys, name, stream)
+
+
+def _run_cli_entry(cli_main) -> int:
+    """按 main.py 结尾 `__main__` 块的分派语义启动 CLI 主流程。
+
+    main.py 目前没有统一的 main() 包装，只有 run_cli() / run_headless()：这里
+    照搬它的三段顺序（配置未知键自检 → -p/--prompt 判定 → 交互式/headless），
+    保持 `ycode`、`ycode -p ...`、`ycode --help` 的行为与独立 CLI exe 一致。
+    若将来 main.py 补上 main() 包装，_dispatch_cli_argv 会优先调用它，本函数
+    自动退居兜底。
+    """
+    # T2 配置未知键自检：与 main.py 的 __main__ 块一致（strict_config=true 时
+    # 退出码 2，与 headless「2=配置错误」语义一致）。
+    try:
+        from config import UnknownConfigKeysError, audit_config_keys
+
+        audit_config_keys()
+    except UnknownConfigKeysError as config_key_error:
+        print(f"\n🚨 配置校验失败：{config_key_error}", file=sys.stderr)
+        print("请修正 config.json 中的未知键（或删除拼错的键）后重试。", file=sys.stderr)
+        return 2
+    except Exception:
+        # 自检属于 best-effort 诊断，自身故障绝不能反过来阻断启动
+        pass
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="ycode",
+        description="星瑶Code 终端 AI 编程助手",
+        add_help=False,  # 交互模式下 argparse 的 -h/--help 会干扰；只在显式 -p 时启用
+    )
+    parser.add_argument("-p", "--prompt", dest="prompt",
+                        help="Headless 模式：执行一次性任务后退出（- 读取 stdin）")
+    parser.add_argument("--session", dest="session", default=None,
+                        help="指定会话名（headless 模式下有效）")
+    parser.add_argument("-h", "--help", action="help",
+                        help="显示帮助信息")
+
+    args, _unknown = parser.parse_known_args()
+
+    if args.prompt is not None:
+        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码
+        return cli_main.run_headless(prompt=args.prompt, session_name=args.session)
+    # 交互式模式（默认）
+    cli_main.run_cli()
+    return 0
+
+
+def _dispatch_cli_argv() -> None:
+    """命中 --cli（ycode.exe 启动器注入）时，在 GUI 重模块 import 前转交 CLI。
+
+    不在 --cli 模式下本函数零副作用，原 GUI 启动路径完全不受影响。
+    """
+    if _CLI_FLAG not in sys.argv:
+        return
+
+    # 只摘掉启动器注入的那一个（它紧随 argv[0]）：用户参数里若也出现同样字面量
+    # （例如 -p "--cli foo"），保留原样交给 CLI 解析，不做批量清除。
+    try:
+        sys.argv.remove(_CLI_FLAG)
+    except ValueError:
+        pass
+    # CLI 轻量档位：core.llm 在 import 期按该变量构建工具表（剔除 GUI 专属工具，
+    # 每个请求少约 5.6k tokens 的工具定义）。main.py 只在自身作为 __main__ 运行时
+    # 设置它，这里是同一个「真实入口」语义，必须早于 import main。
+    os.environ.setdefault("YCODE_TOOL_PROFILE", "cli")
+    # 必须先修好标准流：main.py 导入期就会按 isatty() 决定是否打印启动提示。
+    _ensure_cli_stdio()
+
+    import main as cli_main
+
+    entry = getattr(cli_main, "main", None)
+    if callable(entry):
+        raise SystemExit(entry())
+    raise SystemExit(_run_cli_entry(cli_main))
+
+
+def _dispatch_office_convert_argv() -> None:
+    """Office 转 PDF 子进程入口；命中后只做一次转换，不导入或启动 GUI。
+
+    打包版（PyInstaller 冻结）的 sys.executable 就是本 exe，`-m core.office_preview`
+    无法成立，core.office_preview._convert_argv 因此改传 WORKER_ARGV_FLAG 回落到
+    这里。先做纯字符串预检再 import：core.office_preview 会连带 import
+    core.web_preview，而普通 GUI 启动用不到它（字面量必须与 WORKER_ARGV_FLAG 保持
+    一致，import 后仍做一次兜底校验）。
+    """
+    if "--ycode-office-convert" not in sys.argv:
+        return
+    from core.office_preview import (
+        WORKER_ARGV_FLAG,
+        _write_worker_stderr,
+        run_convert_worker,
+    )
+
+    if WORKER_ARGV_FLAG not in sys.argv:
+        return
+    index = sys.argv.index(WORKER_ARGV_FLAG)
+    # 标志之后必须正好跟 src / dst 两个参数（顺序即位置参数，不做批量 remove）
+    pair = sys.argv[index + 1:index + 3]
+    if len(pair) < 2:
+        _write_worker_stderr("Office 转换子进程参数不足（需要 SRC 与 DST）")
+        raise SystemExit(2)
+    raise SystemExit(run_convert_worker(pair[0], pair[1]))
+
+
+# 必须排在 CLI 分派之前：本进程是被 core.office_preview 用 sys.executable 直接
+# 拉起的转换子进程，即使外层启动器（ycode.exe）再注入 --cli，也要先接住转换标志。
+_dispatch_office_convert_argv()
+_dispatch_cli_argv()
 
 
 def _dispatch_browser_worker_argv() -> bool:
@@ -27,9 +221,19 @@ def _dispatch_browser_worker_argv() -> bool:
 
 
 _dispatch_browser_worker_argv()
+
+# 兜底：安装版是 console=False 的 GUI 子系统程序，本进程没有控制台。第三方库
+# （mcp SDK 经 anyio 启动 stdio MCP 服务器）启动控制台子进程时无处传
+# creationflags，Windows 会弹出可见的控制台窗口；这里尽早统一兜底，且仅在
+# 无控制台时生效（源码调试/CLI 版行为不变）。
+from core.gui_lifecycle import hide_child_console_windows
+
+hide_child_console_windows()
+
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle
+from core.gui_runtime_check import check_webview2_runtime, warn_render_failure
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 
 logger = logging.getLogger("gui_main")
@@ -45,6 +249,39 @@ _INSTANCE_INFO_NAME = "gui_instance.json"
 
 def _data_dir() -> Path:
     return Path(os.environ.get("YCODE_DATA_DIR") or (Path.home() / ".ycode"))
+
+
+# 前端 HTTP 端口按启动形态固定：安装版沿用 pywebview 默认 42001（终端用户的
+# localStorage 偏好保持同一 origin），源码开发版独占 42002。背景（2026-09-19）：
+# 两个形态共用同一数据目录的 WebView2 缓存且 origin 相同，安装版在输入了
+# no-cache 头的版本更新后，其 index.html 会被启发式缓存数天——开发版随后在同
+# 一 origin 启动时命中过期入口，轻则加载到安装版的旧前端 bundle（表现为新功能
+# "消失"），重则旧哈希资产 404 整窗白屏。端口隔离后两形态互不可见对方的缓存。
+_HTTP_PORT_FROZEN = 42001
+_HTTP_PORT_SOURCE = 42002
+
+
+def _frontend_http_port() -> int:
+    """按启动形态选择前端 HTTP 端口（安装版 / 源码版 origin 隔离）。"""
+    return _HTTP_PORT_FROZEN if getattr(sys, "frozen", False) else _HTTP_PORT_SOURCE
+
+
+def _webview_start_options() -> dict:
+    """webview.start 的启动参数。
+
+    private_mode 必须关闭：pywebview 默认 True 时 WebView2 不保留 localStorage，
+    且内置 HTTP 服务退化为随机端口（http.py：``server.port = http_port or
+    _get_random_port()``），每次启动前端 origin 都在变。两者叠加会让所有基于
+    localStorage 的界面偏好（侧栏宽度、输入框高度、会话分组折叠态）重启必丢，
+    表现为"收起的分组重启后又全部展开"。关闭后端口按启动形态固定、
+    网站数据落到应用数据目录，偏好才能真正跨重启保持。
+    """
+    return {
+        "debug": _debug_enabled(),
+        "private_mode": False,
+        "storage_path": str(_data_dir() / "webview"),
+        "http_port": _frontend_http_port(),
+    }
 
 
 def _write_instance_info():
@@ -135,14 +372,153 @@ def _configure_runtime_logging():
         pass
 
 
+def _clear_stale_webview_cache():
+    """前端产物更新后清理 WebView2 持久化 HTTP 缓存（自愈「更新后还是旧界面」）。
+
+    private_mode=False 让界面偏好（localStorage）跨重启保留，副作用是 HTTP
+    缓存同样落盘。实测部分 WebView2 版本在 no-store 响应头下仍直接复用缓存
+    的旧 index.html/JS（2026-09-19：「获取模型列表」功能上线后用户打开仍是
+    旧界面）。以 dist/index.html 的 mtime+size 为构建指纹：与上次启动记录
+    不一致即清 Cache/Code Cache/GPUCache——只清缓存目录，Local Storage
+    （界面偏好）原样保留。任何失败都不影响启动。
+    """
+    try:
+        index_path = os.path.join(_get_base_dir(), "frontend", "dist", "index.html")
+        if not os.path.exists(index_path):
+            return
+        stat = os.stat(index_path)
+        fingerprint = f"{int(stat.st_mtime)}:{stat.st_size}"
+        marker = _data_dir() / "webview" / "dist_fingerprint.txt"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == fingerprint:
+            return
+        default_root = _data_dir() / "webview" / "EBWebView" / "Default"
+        for cache_name in ("Cache", "Code Cache", "GPUCache"):
+            shutil.rmtree(default_root / cache_name, ignore_errors=True)
+        marker.write_text(fingerprint, encoding="utf-8")
+        logger.info("检测到前端产物更新（%s），已清理 WebView2 缓存", fingerprint)
+    except Exception:
+        logger.debug("清理 WebView2 缓存失败（不影响启动）", exc_info=True)
+
+
+# 前端产物运行期监控参数：每 2 秒采样一次；发现与基线不同后等 1.5 秒复核
+# （vite build 会先清理/覆盖 dist，期间存在"文件缺失或指纹抖动"的中间态，
+# 必须等构建落盘、复核指纹稳定后才视为有效变更）。
+_DIST_WATCH_INTERVAL_SECONDS = 2.0
+_DIST_WATCH_CONFIRM_SECONDS = 1.5
+
+
+def _frontend_dist_fingerprint():
+    """采样 frontend/dist/index.html 的构建指纹：(int(mtime), size)；缺失返回 None。
+
+    路径与指纹算法和启动期 _clear_stale_webview_cache 保持一致——两处判定
+    必须是同一个"构建标识"，避免运行期变更通知与启动期缓存清理对不上。
+    任何采样失败（文件不存在、构建中被独占删除等）都返回 None，不抛异常。
+    """
+    try:
+        index_path = os.path.join(_get_base_dir(), "frontend", "dist", "index.html")
+        stat = os.stat(index_path)
+    except OSError:
+        return None
+    return (int(stat.st_mtime), stat.st_size)
+
+
+def _frontend_dist_watch_loop(
+    sampler=None,
+    emit=None,
+    stop_event=None,
+    sleep_fn=None,
+    interval=_DIST_WATCH_INTERVAL_SECONDS,
+    confirm_seconds=_DIST_WATCH_CONFIRM_SECONDS,
+):
+    """前端产物运行期变更监控核心循环（依赖全部可注入，便于单测）。
+
+    判定规则：
+    1. 先取一次基线（值即使为 None 也记录：启动时本就没有 dist 不算"变更"）；
+    2. 每 interval 秒采样一次，与基线相同则继续等待；
+    3. 发现不同后等待 confirm_seconds 再复核：复核指纹与首次发现一致且不为
+       None（构建已完成、文件存在）才算有效变更——更新基线并 emit 通知；
+       复核不一致或文件仍缺失（仍处于构建中间态）则不推送、不更新基线，
+       后续循环再采样重新判定；
+    4. 去重由基线机制保证：基线更新后同一指纹不会重复触发推送。
+    stop_event 被 set 后在下一次等待点退出（调用方的收集线程为 daemon 兜底）。
+    """
+    sampler = sampler or _frontend_dist_fingerprint
+    emit = emit if emit is not None else (lambda _fingerprint: None)
+    sleep_fn = sleep_fn or time.sleep
+
+    def _stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    def _wait(seconds: float) -> bool:
+        """等待 seconds 秒；返回 True 表示收到停止请求（调用方应立即退出）。"""
+        if stop_event is not None:
+            return bool(stop_event.wait(seconds))
+        sleep_fn(seconds)
+        return False
+
+    baseline = sampler()
+    while not _stopped():
+        if _wait(interval):
+            return
+        current = sampler()
+        if current == baseline:
+            continue
+        # 首次发现变化：先等构建写盘，再复核是否稳定
+        if _wait(confirm_seconds):
+            return
+        confirmed = sampler()
+        if confirmed is None or confirmed != current:
+            continue
+        baseline = confirmed
+        fingerprint = f"{confirmed[0]}:{confirmed[1]}"
+        logger.info("检测到前端产物运行期更新（%s），已通知前端刷新", fingerprint)
+        try:
+            emit(fingerprint)
+        except Exception:
+            # 通知失败不影响继续监控（best-effort，与启动流程各看门狗一致）
+            logger.exception("推送前端产物更新事件失败")
+
+
+def _start_frontend_dist_watchdog(api):
+    """启动前端产物运行期变更监控线程（daemon，name="gui-dist-watchdog"）。
+
+    背景：运行中的 WebView2 页面已按旧构建哈希加载 chunk，重新构建
+    frontend/dist 后旧哈希 chunk 404（典型表现：mermaid 报「渲染器加载失败」）。
+    本线程 2 秒采样 dist/index.html 指纹，确认构建完成后经事件管线推送
+    frontend_dist_updated（payload: fingerprint "mtime:size"），由前端自愈
+    刷新；本线程只负责感知与通知，不清缓存、不改动 dist_fingerprint.txt。
+    返回 stop_event 句柄：GUI 退出收尾时 set() 停止（daemon=True 兜底）。
+    """
+    stop_event = threading.Event()
+
+    def _emit(fingerprint: str) -> None:
+        # 后台线程安全：emit_event 内部走 _queue_js_payload 单消费者派发
+        api.emit_event("frontend_dist_updated", {"fingerprint": fingerprint})
+
+    def _watch():
+        try:
+            _frontend_dist_watch_loop(emit=_emit, stop_event=stop_event)
+        except Exception:
+            # 监控是 best-effort：线程异常绝不能影响 GUI 主流程
+            logger.exception("前端产物运行期监控线程异常退出")
+
+    try:
+        threading.Thread(target=_watch, daemon=True, name="gui-dist-watchdog").start()
+    except Exception:
+        logger.exception("启动前端产物监控线程失败（前端将不会感知运行期重建）")
+    return stop_event
+
+
 def is_port_open(host="127.0.0.1", port=5173) -> bool:
     """检查 Vite 开发服务器端口 5173 是否处于打开监听状态"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        res = s.connect_ex((host, port))
-        s.close()
-        return res == 0
+        try:
+            s.settimeout(0.5)
+            return s.connect_ex((host, port)) == 0
+        finally:
+            s.close()
     except Exception:
         return False
 
@@ -166,6 +542,34 @@ def _get_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _frontend_missing_dialog(message: str) -> bool:
+    """前端入口缺失时的原生告警（不依赖 WebView，可显示任何内容的弹窗）。
+
+    打包版是 console=False 的 GUI 子系统程序：stderr 无处可看，用户面对的是
+    "双击图标毫无反应、无日志、无弹窗"。这里在退出前用 Windows 原生
+    MessageBoxW（MB_ICONERROR | MB_TOPMOST）把问题与修复建议直接摆到用户面前；
+    非 Windows（或弹窗失败）回退 stderr 打印。返回 True 表示已用原生弹窗告知。
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                message,
+                "星瑶Code · 启动失败",
+                0x10 | 0x00040000,  # MB_ICONERROR | MB_TOPMOST
+            )
+            return True
+        except Exception:
+            logger.exception("前端入口缺失告警弹窗失败（回退 stderr）")
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+    return False
+
+
 def get_frontend_url() -> str:
     # 1. 优先检查 Vite 实时热更新开发服务 (http://localhost:5173)
     #    仅限源码开发模式：打包后的安装版绝不能走这条——用户机器上任何
@@ -186,7 +590,22 @@ def get_frontend_url() -> str:
         print(f"Loading compiled Vue 3 production dist from: {dist_path}")
         return dist_path
 
+    # 3. 两个入口都不存在：启动无法继续。绝不能只 print+exit——打包版没有
+    #    控制台（console=False），用户看到的是"双击无反应"。先弹不依赖 WebView
+    #    的原生告警（含期望路径与修复建议），再退出。
     print(f"Error: No valid frontend entry point found!", file=sys.stderr)
+    logger.error(
+        "未找到前端入口（期望 %s）",
+        os.path.join(base_dir, "frontend", "dist", "index.html"),
+    )
+    _frontend_missing_dialog(
+        "未找到前端入口文件，星瑶Code 无法启动。\n\n"
+        f"期望的前端入口：\n{dist_path}\n"
+        "（即程序目录下的 frontend/dist/index.html）\n\n"
+        "请重新安装 星瑶Code；如果是源码运行，请在 frontend 目录执行\n"
+        "npm install 后 npm run build 重新构建前端产物。\n\n"
+        f"运行日志：{_data_dir() / 'logs' / 'gui-runtime.log'}"
+    )
     sys.exit(1)
 
 
@@ -219,11 +638,6 @@ def _initial_gui_theme() -> dict:
     }
 
 
-def _initial_theme_light() -> bool:
-    """Compatibility helper retained for callers from the boolean-theme release."""
-    return _initial_gui_theme()["appearance"] == "light"
-
-
 def _build_gui_theme_fragment(gui_theme: dict) -> str:
     fragment = (
         f"theme={gui_theme['appearance']}"
@@ -246,19 +660,17 @@ def _debug_enabled() -> bool:
 
 
 def _start_preload_thread():
-    """后台预热 LLM 引擎：litellm import + tiktoken 编码加载 + 视觉能力探测。
+    """后台预热 LLM 引擎：token 估算器首次调用 + 视觉能力探测。
 
     GUI 的界面渲染在独立 WebView 进程，Python 侧后台预热不会卡 UI 首帧
     （与 CLI 必须同步预热不同，见 main.py 启动预热段的注释）。
-    不做预热时，首个回合会在工作线程里现场完成这些 import，
-    表现为“第一条消息要等很久”。线程安全由 core.llm._litellm_lock 保证。
-    """
+    不做预热时，首个回合会在工作线程里现场完成这些初始化，
+    表现为“第一条消息要等很久”。"""
     import threading
 
     def _preload():
         try:
-            from core.llm import _get_litellm, _litellm_token_counter, _supports_vision
-            _get_litellm()
+            from core.llm import _token_counter, _supports_vision
             model = None
             try:
                 from core.model_manager import get_active_model
@@ -266,7 +678,7 @@ def _start_preload_thread():
             except Exception:
                 pass
             try:
-                _litellm_token_counter(
+                _token_counter(
                     model or "openai/gpt-4o-mini",
                     [{"role": "user", "content": "预热"}],
                 )
@@ -354,7 +766,7 @@ def _acquire_single_instance() -> bool:
     # 再按标题精确匹配（与 gui_bridge._find_own_hwnd 同款实现，但跨进程查找）。
     # 同时从互斥体持有者取 PID，而不是盲目枚举所有 Y-code 进程。
     def _find_instance_hwnd():
-        title = "Y-CODE · 星瑶"
+        title = "星瑶Code · 星瑶"
         found = []
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -410,10 +822,10 @@ def _acquire_single_instance() -> bool:
     logger.warning("检测到已有实例但主窗口始终未创建，弹窗提示用户")
     user32.MessageBoxW(
         0,
-        "检测到 Y-code 已在运行，但主窗口当前不可见。\n\n"
-        "如果右下角托盘已有 Y-code 图标，请右键托盘图标选择“显示主窗口”。\n"
+        "检测到 星瑶Code 已在运行，但主窗口当前不可见。\n\n"
+        "如果右下角托盘已有 星瑶Code 图标，请右键托盘图标选择“显示主窗口”。\n"
         "如果程序卡死在启动页面，请稍后从托盘菜单退出后重新启动。",
-        "Y-code · 星瑶",
+        "星瑶Code · 星瑶",
         0x40,  # MB_ICONINFORMATION
     )
     return True
@@ -424,10 +836,12 @@ def _create_main_window(api, url: str, gui_theme: dict):
     # 启动 PyWebView 无边框桌面窗口（自绘标题栏；背景色与主题一致，加载前不闪反色）
     # easy_drag=False：只有 .pywebview-drag-region 标记的标题栏区域可拖拽移动窗口
     return webview.create_window(
-        title="Y-CODE · 星瑶",
+        title="星瑶Code · 星瑶",
         url=url,
         js_api=api,
-        width=1320,
+        # 默认宽度演变：初版 1320 → 缩 15%（1122，缓解宽屏下对话行过长）→
+        # 回调 5%（1178）；用户可随时拖拽调节，高度与最小尺寸不变
+        width=1178,
         height=840,
         min_size=(960, 640),
         text_select=True,
@@ -477,8 +891,51 @@ def _finalize_gui_exit(lifecycle) -> None:
     _shutdown_computer_runtime()
 
 
+def _audit_config_keys() -> None:
+    """T2 配置未知键自检：默认仅写 GUI 运行日志（现有警告通道）；
+    strict_config=true 时原生弹窗报错并拒绝启动（严格模式的配置错误必须用户可见）。"""
+    try:
+        from config import UnknownConfigKeysError, audit_config_keys
+
+        audit_config_keys()
+    except UnknownConfigKeysError as error:
+        logger.error("配置校验失败（strict_config=true）：%s", error)
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "config.json 存在未知配置键，且已开启严格校验（strict_config=true），"
+                "启动已中止。\n\n"
+                f"{error}\n\n"
+                "请修正或删除这些键后重新启动。",
+                "星瑶Code · 配置错误",
+                0x10 | 0x00040000,  # MB_ICONERROR | MB_TOPMOST
+            )
+        except Exception:
+            logger.exception("配置错误告警弹窗失败")
+        sys.exit(1)
+    except Exception:
+        # 自检属于 best-effort 诊断，自身故障绝不能反过来阻断启动
+        logger.debug("配置未知键自检失败（忽略）", exc_info=True)
+
+
 def main():
     _configure_runtime_logging()
+    # 内嵌 WebView2 的默认内存参数：进程级环境变量注入（pywebview 的
+    # edgechromium 后端以及 core.embedded_browser 直接 new 的控件都会读到它）。
+    # 必须用 setdefault——用户系统里已有的 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+    # 优先，绝不覆盖；参数串的唯一数据源是 core.embedded_browser 里的常量，这里
+    # 不重复写一份字面量，避免两处漂移。只能在此处（任何 WebView2 实例化之前）
+    # 注入：WebView2 环境在首次创建控件时就固化了。
+    try:
+        from core.embedded_browser import _DEFAULT_BROWSER_MEMORY_ARGS
+
+        os.environ.setdefault(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", _DEFAULT_BROWSER_MEMORY_ARGS
+        )
+    except Exception:
+        logger.debug("注入 WebView2 默认内存参数失败（保持浏览器默认行为）", exc_info=True)
     # 无条件记录本进程身份：诊断"venv 与系统 Python / 安装版双进程共存"
     # 时可直接从日志判断每个启动的进程来自哪个可执行文件
     logger.info(
@@ -491,13 +948,78 @@ def main():
     # 单实例保护：已有实例运行时直接激活其窗口并退出本进程，避免双开
     if _acquire_single_instance():
         sys.exit(0)
+    # T2 配置未知键自检：放在单例判定之后，双开场景不打扰既有实例
+    _audit_config_keys()
     # 显式传入真正的 MCP 单例，避免桥接层拿到空的 MCP 管理器
     try:
         from core.mcp_client import mcp_manager
     except Exception:
         mcp_manager = None
+    # GUI 进程没有可交互的终端（stdin 可能连着隐藏控制台）：插件信任确认必须
+    # 走显式入口（插件页「信任并启用」），绝不能落到 _confirm_plugin_trust 的
+    # 控制台 input()——提示打印在用户看不见的地方，等待输入会把触发刷新的
+    # 回合线程永久挂住（2026-11-04 实测：plugin_manage 卡死 5.5 小时，且停止
+    # 按钮无法中断阻塞的 input）。回调恒返回 False 仅表示"不在 GUI 里自动确认"，
+    # 不影响插件页的显式信任。
+    try:
+        from core.plugin_loader import set_trust_prompt
+
+        set_trust_prompt(lambda _path, _name, _fingerprint: False)
+    except Exception:
+        logger.debug("注册 GUI 插件信任回调失败（不影响启动）", exc_info=True)
     api = ApiBridge(mcp_manager=mcp_manager)
     _start_preload_thread()
+    # 星瑶浏览器自动化默认走 GUI 内置浏览器：注入进程级默认值（仅影响
+    # 配置缺省，不覆盖用户显式设置）与 CDP endpoint 提供者（embedded 专属，
+    # 确保内嵌控件带调试端口并通知前端面板呈现项目分辨率）。失败只留痕。
+    try:
+        from core.computer.controller import get_computer_control_service
+        from core.computer.settings import (
+            register_browser_viewport_listener,
+            set_process_default_browser,
+        )
+
+        set_process_default_browser("embedded")
+        get_computer_control_service().set_embedded_endpoint_provider(
+            api.embedded_browser_automation_endpoint
+        )
+
+        def _on_browser_viewport_changed(_workdir, viewport):
+            # 事件必须带发起会话：browser_set_viewport 由某个会话的回合调用，前端据此
+            # 把浏览器页签开进该会话。缺 session_name 时前端只能回落「当前查看的会话」，
+            # 后台会话改一次分辨率就会把浏览器面板抢到用户正在看的另一个窗口上
+            # （2026-10-28 用户反馈：B 会话调 browser_set_viewport，页签冒到 A 会话）。
+            try:
+                from core import app_context
+
+                session_name = (
+                    app_context.get_thread_session()
+                    or app_context.get_current_session()
+                    or ""
+                )
+            except Exception:
+                session_name = ""
+            api.emit_event(
+                "embedded_browser_automation",
+                {
+                    "width": viewport[0],
+                    "height": viewport[1],
+                    "session_name": session_name,
+                },
+            )
+
+        register_browser_viewport_listener(_on_browser_viewport_changed)
+    except Exception:
+        logger.exception("接线内置浏览器自动化通道失败（保持外部浏览器可用）")
+
+    # 启动前环境体检：Windows GUI 走 pywebview 的 edgechromium 后端，强依赖系统
+    # WebView2 Runtime。该运行时缺失/损坏时 pywebview 的 on_webview_ready 只记一条
+    # 日志就 return——不导航、不弹窗、不回退，而窗口本身已创建，用户只看到一片
+    # 纯色空白（#1a1a18）且毫无线索。这里提前探测并给原生告警（可一键打开官方
+    # 下载页），把"哑巴黑屏"变成可读结论。非 Windows 与已安装两种情况均无副作用。
+    check_webview2_runtime()
+
+    _clear_stale_webview_cache()
     url = get_frontend_url()
     gui_theme = _initial_gui_theme()
     url += ("&" if "#" in url else "#") + _build_gui_theme_fragment(gui_theme)
@@ -516,6 +1038,12 @@ def main():
     api._exit_application = lifecycle.exit_application
     lifecycle.start_tray()
     window.events.closing += lifecycle.on_closing
+
+    # 星轨自动化任务：窗口/托盘就绪后启动调度引擎（恢复遗留运行 + 常驻调度）
+    try:
+        api.start_automation_engine()
+    except Exception:
+        logging.getLogger(__name__).exception("启动自动化调度引擎失败")
 
     # 电脑操控运行时（Task 16，设计 23.2）：轻量容器——开关开启时注册全局
     # 紧急停止热键，观察截图预览发布器接到 controller（惰性启动）。
@@ -561,12 +1089,23 @@ def main():
                     logger.info("pywebview 桥重新注入成功")
                     return
             logger.error("pywebview 桥重新注入后仍未就绪，前端将提示连接失败")
+            # 原生兜底告警：此刻前端大概率根本没起来（WebView2 初始化失败、
+            # 渲染进程被安全软件拦截等），用户面对的是一片空白窗口。原生弹窗
+            # 不依赖 WebView，黑屏下依然可见，且直接给出日志路径——否则反馈者
+            # 只能提供一张纯色截图（见 2026-09-16 Win10 黑屏反馈）。
+            warn_render_failure(_data_dir() / "logs" / "gui-runtime.log")
 
         threading.Thread(
             target=_watch, daemon=True, name="gui-bridge-watchdog"
         ).start()
 
     _register_bridge_watchdog()
+
+    # 前端产物运行期变更监控：运行中的页面已按旧构建哈希加载 chunk，重建
+    # dist 后旧哈希 chunk 404（表现为 mermaid「渲染器加载失败」）。这里 2 秒
+    # 采样一次 dist/index.html 构建指纹，确认构建完成后经事件管线推送
+    # frontend_dist_updated，由前端自愈刷新（本线程只负责感知与通知）。
+    dist_watchdog_stop = _start_frontend_dist_watchdog(api)
 
     # pywebview 6.2+ 的拖拽文件完整路径注入：WebView2 只在
     # _dnd_state['num_listeners'] > 0（即通过 dom.on('drop') 注册过）时才
@@ -613,14 +1152,31 @@ def main():
 
     threading.Thread(target=_register_dnd, daemon=True, name="gui-dnd-register").start()
 
+    # pywebview 的 asset 路由先 set_header 再 return static_file(...)，bottle
+    # 会丢弃前者——no-cache 从未真正发出，WebView2 启发式缓存 index.html 后，
+    # 端口复用 + dist 更新会让启动加载过期入口资产直接白屏。必须在服务器开始
+    # 服务前补上真正的缓存控制头。
+    from core.webview_no_cache import apply as apply_webview_no_cache
+
+    apply_webview_no_cache()
+
     # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
     logger.info("准备启动 WebView 消息主循环（webview.start）")
     try:
-        webview.start(debug=_debug_enabled())
+        webview.start(**_webview_start_options())
         logger.info("webview.start 已返回（窗口/消息循环结束）")
+    except Exception:
+        # 打包版是 console=False 的 GUI 子系统程序，未捕获异常只会让程序
+        # "打开又立刻消失"且无处可看。这里落日志并用原生弹窗告知用户。
+        logger.exception("webview.start 异常退出（GUI 未能启动）")
+        warn_render_failure(_data_dir() / "logs" / "gui-runtime.log")
     finally:
         # 退出收尾固定顺序（Task 16）：回合级 shutdown（含取消/线程 drain）
         # 先于电脑操控运行时统一关闭；异常路径同样经过本 finally。
+        # 前端产物监控线程先停：webview 主循环已结束，无前端可通知
+        # （daemon=True 兜底，句柄为 None 时跳过，退出收尾不受影响）。
+        if dist_watchdog_stop is not None:
+            dist_watchdog_stop.set()
         _finalize_gui_exit(lifecycle)
         _remove_instance_info()
 

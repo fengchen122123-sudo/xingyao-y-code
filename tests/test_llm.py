@@ -115,6 +115,24 @@ def _patch_model_cfg(monkeypatch, cfg):
     )
 
 
+def _without_cache_extras(result):
+    """剥离缓存附加项（Qwen 会话缓存头 / Kimi 亲和键）。
+
+    思考档位契约测试只校验推理参数编码；缓存附加项由家族判定测试
+    （test_cache_family_routing.py）与 qwen/kimi 专项用例覆盖。
+    """
+    cleaned = dict(result)
+    cleaned.pop("extra_headers", None)
+    extra_body = cleaned.get("extra_body")
+    if isinstance(extra_body, dict):
+        cleaned["extra_body"] = {
+            key: value
+            for key, value in extra_body.items()
+            if key != "prompt_cache_key"
+        }
+    return cleaned
+
+
 def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
     """OpenAI 兼容路由携带会话级稳定且不暴露原会话名的缓存键。"""
     from core.llm import _provider_request_options
@@ -135,8 +153,8 @@ def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
     assert opts["max_tokens"] == 131072
 
 
-def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
-    """第三方 OpenAI 网关未声明支持 Kimi 私有字段时不得发送 prompt_cache_key。"""
+def test_kimi_third_party_openai_route_sends_cache_key(monkeypatch):
+    """第三方 OpenAI 网关同样发送缓存亲和键：判定只看模型家族。"""
     from core.llm import _provider_request_options
 
     _patch_session(monkeypatch, "session_abc123")
@@ -147,7 +165,7 @@ def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
     )
 
     assert opts["max_tokens"] == 128000
-    assert "prompt_cache_key" not in opts.get("extra_body", {})
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
 
 
 @pytest.mark.parametrize("api_base", [
@@ -157,9 +175,8 @@ def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
     "https://api.kimi.com:8443/coding/v1",
     "https://api.kimi.com/coding-evil/v1",
 ])
-def test_kimi_cache_affinity_rejects_noncanonical_official_urls(
-    monkeypatch, api_base
-):
+def test_kimi_cache_affinity_covers_noncanonical_api_bases(monkeypatch, api_base):
+    """任意 api_base（含非规范官方 URL）都发送缓存亲和键：判定只看模型家族。"""
     from core.llm import _provider_request_options, _supports_cache_keepalive
 
     _patch_session(monkeypatch, "session_abc123")
@@ -167,8 +184,8 @@ def test_kimi_cache_affinity_rejects_noncanonical_official_urls(
 
     opts = _provider_request_options("openai/kimi-k3", api_base)
 
-    assert "prompt_cache_key" not in opts.get("extra_body", {})
-    assert _supports_cache_keepalive("openai/kimi-k3", api_base) is False
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
+    assert _supports_cache_keepalive("openai/kimi-k3", api_base) is True
 
 
 def test_kimi_anthropic_route_sends_metadata_user_id(monkeypatch):
@@ -266,8 +283,8 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         ),
         (
             "openai/kimi-k2.6",
-            "off",
-            {"max_tokens": 128000, "extra_body": {"thinking": {"type": "disabled"}}},
+            "high",
+            {"max_tokens": 128000, "extra_body": {"reasoning_effort": "high"}},
         ),
         (
             "openai/LongCat-2.0",
@@ -275,14 +292,13 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
             {"max_tokens": 128000, "extra_body": {"thinking": {"type": "enabled"}}},
         ),
         (
-            "openai/mimo-v2.5-pro",
-            "off",
-            {
-                "max_tokens": 256000,
-                "reasoning_effort": "none",
-                "allowed_openai_params": ["reasoning_effort"],
-            },
-        ),
+                "openai/mimo-v2.5-pro",
+                "off",
+                {"max_tokens": 131072, "extra_body": {"thinking": {"type": "disabled"}}},        ),
+        (
+                "openai/mimo-v2.6-pro",
+                "on",
+                {"max_tokens": 131072, "extra_body": {"thinking": {"type": "enabled"}}},        ),
         (
             "openai/qwen3.7-max",
             "off",
@@ -310,7 +326,7 @@ def test_model_reasoning_choice_uses_its_exact_request_contract(
 
     result = _provider_request_options(model_name, "https://gateway.example/v1")
 
-    assert result == expected
+    assert _without_cache_extras(result) == expected
 
 
 @pytest.mark.parametrize(
@@ -318,8 +334,8 @@ def test_model_reasoning_choice_uses_its_exact_request_contract(
     [
         (
             "openai/kimi-k2.6",
-            "off",
-            {"max_tokens": 128000, "extra_body": {"thinking": {"type": "disabled"}}},
+            "high",
+            {"max_tokens": 128000, "extra_body": {"reasoning_effort": "high"}},
         ),
         (
             "openai/qwen3.7-max",
@@ -350,7 +366,7 @@ def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
 
     if result.get("max_tokens") is None:
         result.pop("max_tokens", None)
-    assert result == expected
+    assert _without_cache_extras(result) == expected
 
 
 @pytest.mark.parametrize(
@@ -359,7 +375,9 @@ def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
         (
             "openai/qwen3.7-max",
             {"enable_thinking": True},
-            {"max_tokens": 131000, "extra_body": {"enable_thinking": True}},
+            # 历史显式开启迁移为最低真实档 low（qwen 全系无 on 档），
+            # 同时注入 enable_thinking=true 保住开启语义。
+            {"max_tokens": 131000, "extra_body": {"enable_thinking": True, "reasoning_effort": "low"}},
         ),
         (
             "openai/kimi-k3",
@@ -369,6 +387,7 @@ def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
         (
             "openai/qwen3.7-max",
             {"thinking_budget": 4096},
+            # 仅配置 thinking_budget、无显式开关：不注入思考参数（历史行为）。
             {"max_tokens": 131000},
         ),
     ],
@@ -381,7 +400,8 @@ def test_registered_models_migrate_legacy_reasoning_without_double_encoding(
 
     _patch_model_cfg(monkeypatch, model_cfg)
 
-    assert _provider_request_options(model_name, "https://gateway.example/v1") == expected
+    result = _provider_request_options(model_name, "https://gateway.example/v1")
+    assert _without_cache_extras(result) == expected
 
 
 def test_provider_options_use_exact_model_id_when_routes_are_duplicated(monkeypatch):
@@ -413,9 +433,10 @@ def test_default_reasoning_choice_adds_no_user_override(monkeypatch):
 
     _patch_model_cfg(monkeypatch, {"reasoning_choice": "default"})
 
-    assert _provider_request_options(
+    result = _provider_request_options(
         "openai/qwen3.8-max", "https://gateway.example/v1"
-    ) == {"max_tokens": 131000}
+    )
+    assert _without_cache_extras(result) == {"max_tokens": 131000}
 
 
 def test_effort_without_enabled_thinking_fails_before_transport():
@@ -486,6 +507,38 @@ def test_k3_reasoning_choice_maps_to_anthropic_thinking_budget(
     assert opts["max_tokens"] == 131072
     assert "reasoning_effort" not in opts
     assert "reasoning_effort" not in opts.get("extra_body", {})
+
+
+@pytest.mark.parametrize(
+    ("choice", "budget_tokens"), [("low", 1024), ("high", 4096), ("max", 16384)]
+)
+def test_kimi_family_reasoning_choice_maps_to_anthropic_thinking_budget(
+    monkeypatch, choice, budget_tokens
+):
+    """kimi 家族（k2.6 等）与 K3 同档：Anthropic 路由统一翻译为 token 预算。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": choice})
+
+    opts = _provider_request_options(
+        "anthropic/kimi-k2.6", "https://api.moonshot.cn/anthropic"
+    )
+
+    assert opts["thinking"] == {"type": "enabled", "budget_tokens": budget_tokens}
+    assert "reasoning_effort" not in opts
+    assert "reasoning_effort" not in opts.get("extra_body", {})
+
+
+def test_kimi_k27_code_reasoning_choice_injects_effort(monkeypatch):
+    """kimi-k2.7-code 不再是固定开启：可选档位并注入 reasoning_effort。"""
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": "max"})
+
+    opts = _provider_request_options("openai/kimi-k2.7-code", "https://gateway.example/v1")
+
+    assert opts["extra_body"]["reasoning_effort"] == "max"
 
 
 @pytest.mark.parametrize(
@@ -750,8 +803,13 @@ def test_overflow_refill_preserves_extra_system_blocks_and_drops_legacy_db_syste
     [
         ("openai/deepseek-v4-pro", "https://api.deepseek.com", 384000),
         (
-            "openai/deepseek-v4.1-flash-expires-on-0910",
+            "openai/deepseek-v4.1-flash",
             "https://tokenrhythm.studio/v1",
+            384000,
+        ),
+        (
+            "openai/DeepSeek-v9-future-model",
+            "https://gateway.example/v1",
             384000,
         ),
         ("openai/glm-5", "https://gateway.example/v1", 128000),
@@ -771,7 +829,10 @@ def test_overflow_refill_preserves_extra_system_blocks_and_drops_legacy_db_syste
         ("openai/LongCat-2.0", "https://gateway.example/v1", 128000),
         ("openai/seed-2.1-pro", "https://gateway.example/v1", 131000),
         ("openai/seed-2.1-turbo", "https://gateway.example/v1", 131000),
-        ("openai/mimo-v2.5-pro", "https://gateway.example/v1", 256000),
+        ("openai/mimo-v2.5-pro", "https://gateway.example/v1", 131072),
+        ("openai/mimo-v2.6-pro", "https://gateway.example/v1", 131072),
+        ("openai/mimo-v2.6-flash", "https://gateway.example/v1", 131072),
+        ("openai/mimo-v2.6-pro-ultraspeed", "https://gateway.example/v1", 131072),
         ("openai/minimax-m2.5", "https://gateway.example/v1", 200000),
         ("openai/minimax-m2.7", "https://gateway.example/v1", 192000),
         ("openai/gpt-4o", "https://gateway.example/v1", 32000),
@@ -805,3 +866,121 @@ def test_explicit_config_max_tokens_wins_over_builtin_table(monkeypatch):
     )
 
     assert opts["max_tokens"] == 8192
+
+
+def test_unregistered_model_default_choice_leaves_request_untouched():
+    """未登记模型在默认档绝不污染请求体：不注入任何思考参数。
+
+    未登记进能力表的模型（厂商新增、网关自定义名）不再是 hidden——那会让它们
+    凭空失去可操作的思考开关。现在它们拿通用 effort 能力，但"没存过任何思考
+    选择"时必须保持请求体零变化，这是老 hidden 静默回落想守护的核心意图。
+    """
+    from core.llm import _apply_reasoning_choice
+
+    for model_cfg in ({}, {"reasoning_choice": "default"}):
+        result = {}
+        capability = _apply_reasoning_choice(
+            result, "openai/brand-new-model", model_cfg
+        )
+
+        assert capability.kind == "effort"
+        assert capability.options == ("default", "off", "low", "medium", "high", "xhigh", "max")
+        assert result == {}
+
+
+def test_unregistered_model_default_choice_keeps_other_params_intact():
+    """默认档的零注入只针对思考参数，不得清改请求里已有的其他字段。"""
+    from core.llm import _apply_reasoning_choice
+
+    result = {"max_tokens": 128000}
+    capability = _apply_reasoning_choice(
+        result,
+        "openai/qwen-unknown-variant",
+        {},
+    )
+
+    assert capability.kind == "effort"
+    assert result == {"max_tokens": 128000}
+
+
+def test_unregistered_model_explicit_choice_injects_reasoning_effort():
+    """未登记模型显式选择强度时只注入顶层 reasoning_effort，关闭注入 none。
+
+    未登记模型多为网关自定义名，走 OpenAI 标准字段（effort_switch）比厂商私有
+    的 thinking 对象被接受的概率更高。
+    """
+    from core.llm import _apply_reasoning_choice
+
+    for choice, expected in (("high", "high"), ("medium", "medium"), ("off", "none")):
+        result = {}
+        capability = _apply_reasoning_choice(
+            result,
+            "openai/brand-new-model",
+            {"reasoning_choice": choice},
+        )
+
+        assert capability.kind == "effort"
+        assert result["reasoning_effort"] == expected
+        assert "extra_body" not in result
+
+
+def test_explicitly_hidden_model_silently_falls_back_without_injection():
+    """显式登记为 hidden 的模型存过任何思考选择时依然静默回落、零注入。
+
+    hidden 是"已确认该模型不支持思考"的精确事实（如 sensenova-6.7-flash-lite），
+    与"只是没登记的新模型"不同：后者拿 toggle 可操作开关，前者必须继续走
+    _apply_reasoning_choice 里的 hidden 短路分支，不因残留的历史思考选择报错，
+    也不往请求体里注入任何思考参数。
+    """
+    from core.llm import _apply_reasoning_choice
+
+    for model_cfg in (
+        {"reasoning_choice": "on"},
+        {"reasoning_choice": "off"},
+        {"enable_thinking": True},
+        {"enable_thinking": False},
+        {"reasoning_effort": "high"},
+    ):
+        result = {"max_tokens": 128000}
+        capability = _apply_reasoning_choice(
+            result, "openai/sensenova-6.7-flash-lite", model_cfg
+        )
+
+        assert capability.kind == "hidden"
+        assert capability.options == ()
+        assert result == {"max_tokens": 128000}
+
+
+
+def test_unknown_deepseek_prefixed_model_applies_official_thinking_encoding(
+    monkeypatch,
+):
+    """任意厂商的 deepseek 前缀新模型按官方思考协议编码，不报错。
+
+    依据 https://api-docs.deepseek.com/zh-cn/guides/thinking_mode：
+    关闭 = thinking.type=disabled；开启 = thinking.type=enabled + reasoning_effort。
+    """
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(
+        monkeypatch, {"reasoning_choice": "off", "enable_thinking": False}
+    )
+    opts = _provider_request_options(
+        "openai/DeepSeek-Flash-X1", "https://gateway.example/v1"
+    )
+
+    assert opts["max_tokens"] == 384000
+    assert opts["extra_body"]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in opts
+
+    _patch_model_cfg(
+        monkeypatch, {"reasoning_choice": "high", "enable_thinking": True}
+    )
+    opts = _provider_request_options(
+        "openai/DeepSeek-Flash-X1", "https://gateway.example/v1"
+    )
+
+    assert opts["extra_body"]["thinking"] == {"type": "enabled"}
+    assert opts["reasoning_effort"] == "high"
+    assert opts["allowed_openai_params"] == ["reasoning_effort"]

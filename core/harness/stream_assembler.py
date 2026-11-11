@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -53,6 +54,60 @@ def complete_thinking_blocks(delta):
         )
     ]
     return complete or None
+
+
+def _wire_valid_tool_arguments(arguments) -> str | None:
+    """把流式组装出的 arguments 规整为可回放给 provider 的 JSON 字符串。
+
+    三段解析与 tool_pipeline._tool_call_arguments 对齐：原文 → 控制字符
+    转义 → 截断修复，择取最先可解析的字节作为回放参数，保证执行层与
+    下一轮历史回放看到同一份参数。全部失败返回 None，调用方应整体丢弃
+    该 tool call（原样回放必然被严格网关拒绝）。
+    """
+    raw = arguments if isinstance(arguments, str) else ""
+    if not raw.strip():
+        # 无参数调用：回放 "{}"，避免空串被严格网关判为非法 JSON
+        return "{}"
+    from core.harness.tool_pipeline import (
+        _escape_control_chars_in_json_strings,
+        _repair_truncated_json,
+    )
+
+    for candidate in (
+        raw,
+        _escape_control_chars_in_json_strings(raw),
+        _repair_truncated_json(raw),
+    ):
+        try:
+            json.loads(candidate)
+        except ValueError:
+            continue
+        return candidate
+    return None
+
+
+def _replayable_tool_call(call: dict) -> dict | None:
+    """规整单个组装完成的 tool call；函数名为空或参数无法规整时返回 None。
+
+    背景：部分网关（如 Agnes AI）对请求历史中的 assistant.tool_calls 做
+    严格校验，函数名为空或 arguments 不是合法 JSON 时整个请求 400
+    （"Assistant tool call \"\" arguments must be valid JSON"），且坏记录
+    一旦落库会让该会话每轮复现 400。流式分片偶发缺失 name/arguments
+    （中转协议转换毛刺），必须在进入内存历史/DB/DeepSeek 账本之前收口。
+    """
+    function = call.get("function") or {}
+    name = str(function.get("name") or "").strip()
+    if not name:
+        return None
+    arguments = _wire_valid_tool_arguments(function.get("arguments"))
+    if arguments is None:
+        return None
+    if name != function.get("name") or arguments != function.get("arguments"):
+        call = {
+            **call,
+            "function": {**function, "name": name, "arguments": arguments},
+        }
+    return call
 
 
 class StreamAssembler:
@@ -187,15 +242,20 @@ class StreamAssembler:
             self._accumulated_content
         )
         self._raw_reasoning_content = reasoning_content
-        tool_calls = [
-            self._tool_calls[index]
-            for index in sorted(self._tool_calls)
-        ]
+        tool_calls = []
+        for index in sorted(self._tool_calls):
+            replayable = _replayable_tool_call(self._tool_calls[index])
+            if replayable is not None:
+                tool_calls.append(replayable)
 
         replay_reasoning = reasoning_content or None
         if not self._keep_reasoning_fields:
             replay_reasoning = None
-        elif tool_calls and self._require_tool_call_reasoning:
+        elif self._require_tool_call_reasoning:
+            # DeepSeek thinking 契约：历史里的 assistant 消息必须携带字符串
+            # reasoning_content。带 tool_calls 的轮次原样回放推理内容；没有
+            # 工具调用、或本轮未输出思考内容时用空串占位——留 None 会让上游
+            # 按"历史消息缺少 reasoning_content"拒绝整轮请求。
             replay_reasoning = reasoning_content
 
         if (

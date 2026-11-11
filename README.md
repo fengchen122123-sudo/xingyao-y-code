@@ -1,11 +1,13 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.2.22](https://img.shields.io/badge/Version-1.2.22-green.svg)](core/version.py)
+[![Version 1.3.8](https://img.shields.io/badge/Version-1.3.8-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
 > 一个国产终端 AI 编程助手，代号「星瑶」。支持 TUI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
+
+> **使用须知**：本项目是运行在你本地设备上的 AI 编程辅助工具，自身不提供模型服务，模型需你自行配置并直接与其通信。AI 生成内容可能不准确、需你自行审查验证；软件具备文件读写与命令执行能力，请在使用前阅读下方「免责条款」——安装向导与首次启动都会提示确认。
 
 ## ✨ 功能亮点
 
@@ -22,7 +24,7 @@
 
 ### 模型与工具
 
-- **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / Agnes 等多种协议，由 `LiteLLM` 统一调用
+- **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / Agnes 等多种协议，由自研 HTTPX 引擎（`core/llm_native_transport.py`）统一调用
 - **副模型机制**：可配置副模型承担视觉识别、记忆压缩、子代理调用等任务，主副分工
 - **29 个内置工具**：文件读写、代码搜索、命令执行、网页抓取、图片下载与生图、天气查询、LSP 符号查找、计划编排、智能路由等
 - **工具结果缓存**：相同搜索/读取自动走本地缓存，节省 token 与时间
@@ -38,14 +40,14 @@
 ### 高级编排
 
 - **子代理系统**：5 种内置类型（explore / implement / test / review / general）+ 自定义子代理，支持依赖感知并行调度与嵌套（最深 3 层）
-- **计划执行模式**：复杂任务先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
+- **计划执行模式**：多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
 - **后台任务管理**：长周期命令后台执行，`/tasks` 查看状态、`/tasks tail` 看日志、`/tasks kill` 终结
 - **权限系统**：四种模式（confirm 变更前确认 / accept_edits 自动编辑 / plan 计划模式 / full 完全访问），沙盒控制工作目录访问边界
 
 ### 记忆与上下文
 
-- **SQLite 会话记忆**：多会话切换、`/undo` 撤销文件修改并同步抹除模型记忆
-- **会话级检查点**：每轮对话前自动打 checkpoint，`/checkpoint restore` 整轮回滚
+- **SQLite 会话记忆**：多会话切换；撤销不改写历史，聊天完整保留
+- **按回合撤销**：每个回合的受控文件修改持久化快照，`/undo` 整轮预检后一键撤销；冲突零写入、崩溃可恢复，模型通过上下文得知文件结果已失效
 - **长期记忆系统**：四类记忆（user / feedback / project / reference）+ 每日日志 + Dream 整理线程，支持「记住 XXX」指令
 - **智能记忆压缩**：历史 token 占用达 70% 自动压缩，工具结果预截断，tiktoken 精确估算
 - **会话导出**：`/share` 一键导出为 Markdown / HTML / JSON
@@ -56,6 +58,7 @@
 - **插件系统（Plugins）**：进程内插件扩展工具能力，零核心侵入，单插件异常不影响启动；内置混元文生图插件，支持用户级插件热加载
 - **MCP 客户端**：全屏 CLI 配置器 + 10+ 预设模板（飞书 / 高德 / B 站 / SQLite / Postgres 等），AI 可自配置 MCP
 - **Git Worktree**：`/worktree` 管理多分支并行工作区
+- **Git 工作台**：GUI「源代码管理」页签 + CLI `/git` 命令（状态/Diff/暂存/提交/分支/同步/Stash/历史/冲突），支持外部变化自动刷新、仓库信任确认与高风险操作二次确认；AI 在对话中的 Git 操作仍走原有权限流程
 
 ## 🚀 快速开始
 
@@ -79,7 +82,7 @@ source venv/bin/activate
 pip install -e .
 ```
 
-> 会自动安装全部运行依赖：`rich`、`litellm`、`prompt_toolkit`、`pyfiglet`、`ddgs`、`mcp`、`psutil`、`pillow`。
+> 会自动安装全部运行依赖：`rich`、`prompt_toolkit`、`pyfiglet`、`ddgs`、`mcp`、`psutil`、`pillow`。
 
 ### 3. 配置 API 密钥
 
@@ -108,9 +111,12 @@ cp config.example.json config.json
       "models": [
         {
           "id": "model_1",
-          "name": "agnes-2.0-flash",
-          "litellm_model": "openai/agnes-2.0-flash",
-          "context_window": 128000
+          "name": "agnes-3.0-flash",
+          "litellm_model": "openai/agnes-3.0-flash",
+          "context_window": 512000,
+          "supports_vision": true,
+          "supports_function_calling": true,
+          "max_tokens": 65535
         },
         {
           "id": "model_2",
@@ -125,7 +131,40 @@ cp config.example.json config.json
 }
 ```
 
-### 4. 启动星瑶
+### 4.（可选）接入飞书：在飞书里和星瑶对话
+
+配好后在飞书里给机器人发一句话即可驱动一轮任务；执行完成卡、权限审批卡、提问卡、
+待拍板收件箱、卡住提醒与指令集都在飞书闭环。
+
+**飞书侧（一次性，三步）**
+
+1. 在[飞书开放平台](https://open.feishu.cn/)建一个**企业自建应用**，拿到 App ID 与 App Secret。
+2. 给应用开通权限：`im:message`（读消息）、`im:message:send_as_bot`（发消息）；
+   需要在群里 @ 机器人时再加 `im:message.group_at_msg`。
+3. 在「事件与回调」里把订阅方式切到**使用长连接接收事件**，然后**两块都要加**：
+   - **事件订阅**：`im.message.receive_v1`（收消息）
+   - **回调 / 卡片回调**：`card.action.trigger`（卡片按钮回传）
+
+   > 第二块最容易漏。只配事件不配回调时，消息能收到、机器人也能回话，但卡片上的
+   > 按钮（批准 / 拒绝 / 面板 / 翻页）点了没有任何反应。改完订阅记得**重新发布版本**。
+
+> 长连接由星瑶主动连飞书，**不需要公网 IP、也不需要内网穿透**，更不用配回调地址与校验密钥。
+
+**星瑶侧**：打开 GUI → **设置 → 飞书集成**，填入 App ID / App Secret，
+可选填「审批白名单」（open_id 列表）与「固定推送会话 ID」，点「测试连接」校验后保存即生效。
+
+- **审批白名单**决定谁能在飞书点「批准 / 拒绝」。留空时飞书侧**不可审批**（卡片只做提醒，
+  仍需回桌面端处理）——这是有意的 fail-closed 设计。
+  **不知道自己的 open_id？** 在飞书里给机器人发 `/whoami`，它会回你的 open_id，复制进白名单即可
+  （open_id 按应用区分，必须用星瑶看到的这个值）。
+- 设置页内置飞书侧**六步配置说明**与**配置检查清单**；连不上时先看说明里的排查顺序
+  （事件订阅是否选了长连接、应用是否已发布、权限是否已开通）。
+- 也可以手改 `config.json`：`feishu_enabled` / `feishu_app_id` / `feishu_app_secret` /
+  `feishu_approvers` / `feishu_notify_chat_id`；密钥建议在界面里填（会自动加密存储）。
+- 默认关闭；关闭或未配置时星瑶行为与未接入前完全一致。
+- 在飞书里发 `/help` 看全部指令（`/panel` `/status` `/new` `/list` `/switch` `/model` `/inbox` `/stop`）。
+
+### 5. 启动星瑶
 
 ```bash
 # CLI 控制台版（推荐）
@@ -135,7 +174,7 @@ python main.py
 ycode
 ```
 
-### 5.（可选）启动 GUI 窗口版
+### 6.（可选）启动 GUI 窗口版
 
 GUI 模式基于 `pywebview` + Vue 3 前端。前端构建产物 `frontend/dist/` 不随仓库提交，首次使用需先构建：
 
@@ -152,7 +191,7 @@ python gui_main.py
 
 > 前端开发调试时也可改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，CLI 模式不受影响。
 
-### 6.（可选）构建 Windows 安装包
+### 7.（可选）构建 Windows 安装包
 
 ```bash
 # 完整构建（GUI 主安装包 + 可选 CLI 组件）
@@ -203,9 +242,9 @@ venv\Scripts\python build_release.py --setup-only
 
 也可从「Windows 设置 → 应用 → 已安装的应用 → Y-code」发起卸载。
 
-## ⌨️ 斜杠命令
+## ⌨️ 斜杠命令（CLI）
 
-在输入框中输入以下命令（支持 Tab 补全）：
+在 CLI 输入框中输入以下命令（支持 Tab 补全）。桌面版（GUI）只提供按钮无法替代的 13 条命令，见下方《桌面版斜杠命令》。
 
 ### 会话与历史
 
@@ -217,7 +256,7 @@ venv\Scripts\python build_release.py --setup-only
 | `/session rename <新名称>` | 重命名当前会话 |
 | `/session delete <名称>` | 物理删除指定会话 |
 | `/new` | 创建并切换到全新会话 |
-| `/undo` | 撤销上一次文件修改（同步抹除模型记忆） |
+| `/undo` | 按回合撤销文件修改（`list` / `preview` / `status` / `recover <操作ID>`；默认确认 N） |
 | `/checkpoint` | 检查点管理（`list` 查看 / `restore <turn_id>` 整轮回滚） |
 | `/share [md\|html\|json]` | 导出当前会话（默认 md） |
 
@@ -291,6 +330,30 @@ venv\Scripts\python build_release.py --setup-only
 | `Ctrl + D` | 退出程序 |
 | `Tab` | 命令 / 文件名补全 |
 
+## 🖥️ 桌面版斜杠命令
+
+桌面版不为 GUI 已有按钮的功能做命令（模型切换、主题、权限、会话管理等都走界面），只保留需要自由文本参数、按钮表达不了的 13 条。输入框输入 `/` 会弹出候选；未命中命令表的 `/` 开头文本按普通消息发送，例如 `/usr/bin 是什么` 不会被当成命令。
+
+| 命令 | 说明 |
+|------|------|
+| `/goal <目标> [--check 命令] [--rounds N]` | 目标模式：自主迭代直到达成。`/goal status` 查看、`/goal stop` 停止、`/goal resume` 恢复 |
+| `/agent <类型> <任务>` | 派一个子代理执行任务 |
+| `/skill <名称> [要求]` | 查询已启用技能并直接把技能正文注入本轮任务 |
+| `/remember <内容>` | 追加一条规则或偏好到长期记忆 |
+| `/forget <关键词>` | 统计当日日志与 MEMORY.md 中命中的行并给样例；确认后执行 `/forget --yes <关键词>` 真实删除，范围仅限这两处 |
+| `/fix <报错>` | 定位根因并修复，改完跑验证 |
+| `/review [范围]` | 代码审查 |
+| `/init` | 扫描项目生成 AGENTS.md |
+| `/test [目标]` | 运行测试、失败修复、重跑 |
+| `/explain <文件:行>` | 解释指定代码 |
+| `/compact [保留指令]` | 后台触发会话压缩，压缩进度会以提示卡片回显 |
+| `/commit [说明]` | 暂存全部改动并显示待提交文件；确认后执行 `/commit --yes [说明]` 完成提交，不传说明时自动生成「更新 N 个文件」 |
+| `/workflow <名称> [JSON参数]` | 运行工作流 |
+
+`/goal` 的完成判定按优先级三档：给了 `--check` 时以命令退出码判定（可信）；没给时由模型在回复末尾输出 `<goal-status>achieved</goal-status>` 自评，需要人工确认；达到 `--rounds` 上限仍未达成则转为「已达上限」并输出各轮摘要。目标状态落盘后可跨会话恢复，`/goal stop` 会同时中断当前回合。
+
+`/agent` 与 `/workflow` 目前仍以提示词方式交由模型调用对应工具，不是直接调用：命令本身不启动子代理、也不执行工作流，只把类型、名称与参数写进本轮提示词，由模型据此调用对应工具。
+
 ## 🛠️ 内置工具
 
 Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工具），分为只读与变更两组：
@@ -328,9 +391,6 @@ Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工
 | `plan_retry` | 重置失败项为 pending |
 | `plan_finish` | 完成主 Agent 接管的计划项（并执行验证命令） |
 | `plan_resume_takeover` | 恢复因超时移交主 Agent 的计划项 |
-| `smart_router_status` | 查看智能路由当前状态与统计 |
-| `smart_router_config` | 配置智能路由（模型分层 / 开关） |
-| `smart_router_toggle` | 快速开关智能路由 |
 | `mcp_add_server` | 新增 MCP server 配置 |
 | `mcp_remove_server` | 删除 MCP server 配置 |
 | `mcp_set_enabled` | 启用 / 禁用 MCP server |
@@ -364,7 +424,7 @@ Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工
 
 ### 计划模式（Plan Mode）
 
-复杂任务（3+ 文件、50+ 行改动）先用 `plan_write` 建立可执行计划：
+多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划：
 
 1. `plan_write` 建立计划（含依赖图、阶段、验证方式）
 2. 主 Agent 通用工具被限制，只能用 `run_subagent` / `ask_user` / `plan_read` / `plan_retry` / `plan_update`
@@ -414,8 +474,8 @@ CLI 与 GUI 共用 `permissions.json` 中的项目白名单。设置页可手动
 
 ### 短期记忆
 - **SQLite 持久化**：聊天记录按会话隔离存储
-- **`/undo` 撤销**：按会话隔离，多 worker 线程安全
-- **会话级检查点**：每轮对话前自动打 checkpoint，`/checkpoint restore <turn_id>` 整轮回滚
+- **按回合撤销**：回合内 write/edit/download 的原始字节在写入前快照到内容寻址仓库；`/undo` 预检（指纹冲突零写入）→ 一次性令牌 → 逐文件原子恢复；中断事务冻结影响路径并支持继续/取消恢复
+- **会话级检查点**：每轮对话前自动创建持久化检查点，`/checkpoint restore <turn_id>` 整轮回滚
 
 ### 长期记忆（`~/.ycode/memory/`）
 
@@ -469,7 +529,8 @@ CLI 与 GUI 共用 `permissions.json` 中的项目白名单。设置页可手动
 3. 项目级：通过 `config.json` 的 `skill_search_paths` 显式配置
 
 **内置技能随安装包发布**：安装包内置的 `skills/` 会在首次启动时释放到 `~/.ycode/skills/`
-并默认启用；不覆盖用户已改动的同名技能，也不会复活用户主动删除的技能。
+并默认启用；**已释放且内容未被用户改动过的内置技能，会随新版本自动升级**；
+用户改动过的一律保留，用户主动删除的也不会复活。
 
 **技能文件格式**：
 ```markdown
@@ -504,7 +565,6 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 | 插件 | 位置 | 功能 |
 |------|------|------|
 | 混元文生图 | 仓库 `plugins/hunyuan_image/` | 腾讯混元文本生图，数据随包编译进 PYZ；Key 仅从环境变量 `HUNYUAN_API_KEY` 读取，代码中不存储 Key，未配置时工具明确报错 |
-| 智能路由 | `~/.ycode/plugins/smart_router/` | 按任务复杂度自动选择合适模型，省 token 且保质量，关闭后不影响原有行为 |
 | iMOM 定位器 | `~/.ycode/plugins/imom_locator/` | iMOM/MES 多项目代码定位：动态发现 publish、系统识别、页面索引构建与毫秒级定位 |
 
 > 用户级插件放在 `~/.ycode/plugins/<插件名>/`，同名插件会覆盖内置/仓库版本。
@@ -523,7 +583,7 @@ xingyao-y-code/
 │   ├── version.py           # 版本号（单一来源）
 │   ├── agent_service.py     # 对话服务（CLI/GUI 共源）
 │   ├── harness/             # 固定主代理内核（严格状态机 / SQLite Journal / 工具管线）
-│   ├── llm.py               # LiteLLM 调用与工具编排
+│   ├── llm.py               # 模型请求入口与工具编排（自研 HTTPX 引擎）
 │   ├── tools.py             # 本地工具实现
 │   ├── tool_registry.py     # 工具注册表
 │   ├── tool_protocol.py     # 工具协议（ToolSpec 元数据）
@@ -734,6 +794,17 @@ venv\Scripts\python.exe scripts\smoke_computer_control.py --desktop-input --conf
 - 提交 Issue：<https://gitee.com/feng-chenhao/xingyao-y-code/issues>
 - 提交 PR 前请先本地跑通 `pytest`，并遵循 `AGENTS.md` 中的开发规范
 - 如果你发现代码里有敏感信息泄露，请第一时间通过 Issue 提醒维护者
+
+## ⚖️ 免责条款
+
+使用本软件即表示你已阅读并同意以下要点（完整条款共 8 章，可在软件内「设置 → 法律 → 免责条款」查看；安装向导与首次启动均会提示确认）：
+
+- **软件性质**：本软件是在你本地设备运行的 AI 编程辅助工具，自身不提供、不运营任何生成式人工智能模型服务；模型服务由你自行选择、配置并直接与其通信。
+- **AI 生成内容**：模型基于概率机制生成内容，可能不准确、不完整或已过时；本软件不对其真实性、准确性、完整性、合法性或适用性作任何保证，生成内容亦不构成任何专业领域意见。
+- **你的责任**：采纳、执行或分发生成内容前，你应自行审查、验证与测试，并对最终结果负全部责任；软件具备文件读写、命令执行与电脑操控能力，请自行确认影响范围并做好数据备份。
+- **数据与隐私**：配置、会话记录与记忆数据默认存储在你的本地设备；使用过程中会话内容将按你的配置直接发送至你所选的模型服务提供者。
+- **合规使用**：你不得利用本软件从事违反法律法规的活动，不得生成、传播违法有害信息。
+- **责任限制**：**在法律允许的最大范围内**，本软件的著作权人及贡献者不对因使用或无法使用本软件造成的任何损失承担责任（包括但不限于数据丢失、设备损坏、业务中断、利润损失及第三方索赔等直接或间接损失）；本软件按「现状」提供，不作任何明示或默示担保。
 
 ## 📄 License
 

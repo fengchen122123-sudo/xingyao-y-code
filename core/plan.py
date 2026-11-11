@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from copy import deepcopy
 from pathlib import Path
@@ -70,6 +71,35 @@ def _starts_with_cjk(text: str) -> bool:
 def _contains_cjk(text: str) -> bool:
     """检查文本是否包含任何 CJK 统一表意文字（中日韩汉字）。"""
     return any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in str(text or ""))
+
+
+# 会话 ID 由用户消息派生（首行截断），可能含 `/` `\` `:` `*` 等 Windows 非法
+# 文件名字符。直接拿会话 ID 当计划文件名会让持久化抛 WinError 123，而计划落盘
+# 失败会连带卡死计划门禁（主 Agent 工具被锁、连计划都清不掉），因此统一清洗。
+_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_FILENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+SAFE_SESSION_FILENAME_MAX_CHARS = 100
+
+
+def safe_session_filename(session_id: str) -> str:
+    """把会话 ID 转成合法且稳定的计划文件名（不含扩展名）。
+
+    非法字符替换为下划线；去掉首尾空白与结尾的点（Windows 不允许）；命中 Windows
+    保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）时加前缀；清洗后为空回落 "session"；
+    超长按 100 字符截断。合法会话名（如 "session-1"）清洗后不变，保证既有计划
+    文件仍能正常加载。
+    """
+    name = _UNSAFE_FILENAME_CHARS.sub("_", str(session_id or "")).strip().rstrip(".")
+    name = name[:SAFE_SESSION_FILENAME_MAX_CHARS].rstrip(". ")
+    if not name:
+        return "session"
+    if name.upper() in _WINDOWS_RESERVED_FILENAMES:
+        return f"_{name}"
+    return name
 
 
 class PlanManager:
@@ -398,7 +428,9 @@ class PlanManager:
     def storage_path(self) -> Path | None:
         if not self._session_id:
             return None
-        return self._storage_dir / f"{self._session_id}.json"
+        # 会话 ID 可能派生自用户消息（含非法文件名字符），落盘前统一清洗；
+        # 合法会话名清洗后不变，既有计划文件照常命中。
+        return self._storage_dir / f"{safe_session_filename(self._session_id)}.json"
 
     def _normalize_item(self, raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
@@ -601,6 +633,17 @@ def get_bound_plan_session() -> str | None:
     """返回当前线程绑定的计划会话；未绑定返回 None（走进程级单例）。"""
     sid = getattr(_plan_route_tls, "session_id", None)
     return str(sid) if sid else None
+
+
+def get_plan_route() -> tuple[str | None, str | None]:
+    """返回当前线程的计划路由快照 (session_id, storage_dir)。
+
+    供并行工具线程在派发入口显式继承计划会话路由（线程本地状态不会自动
+    进入新线程）。storage_dir 必须一并携带：会话管理器若尚未注册，缺省会
+    按新线程的工作目录重新推导落盘位置，可能指向错误目录。未绑定时返回
+    (None, None)，语义与 get_bound_plan_session 一致（走进程级单例）。
+    """
+    return get_bound_plan_session(), getattr(_plan_route_tls, "storage_dir", None)
 
 
 def get_plan_manager_for(session_id: str, *, storage_dir=None) -> PlanManager:
@@ -878,10 +921,13 @@ def plan_update(
 
 
 def plan_retry(item_id: str, force: bool = False) -> str:
-    """将失败/阻塞/取消的计划项重置为 pending，允许重新调度执行。
+    """将失败/阻塞/取消/已完成但需要重跑的计划项重置为 pending，允许重新调度。
 
     防盲目重试：当 attempts >= 2 且上次失败原因仍然存在时，调用方必须
     显式传 force=True，确认已经分析根因后才能重试。
+
+    completed 项同样可重开：子代理把「工具不可用」写成结论时会被误判为完成，
+    而重建计划被门禁拒绝，只能靠重开这一项走出死锁。
     """
     from core.task_scheduler import get_default_scheduler
 
@@ -923,7 +969,8 @@ def plan_retry(item_id: str, force: bool = False) -> str:
     return (
         f"无法重置计划项 '{item_id}'。"
         f"当前状态为 '{item.get('status', 'unknown')}'，"
-        f"只有 failed/blocked/cancelled 状态可以重试。"
+        f"只有 failed/blocked/cancelled/completed 状态可以重试"
+        f"（completed 项重开会清空原有结果）。"
     )
 
 
@@ -958,7 +1005,16 @@ def plan_resume_takeover(
         and str(item.get("takeover_turn_id", "")) == turn_id
     ):
         return f"计划项 '{item_key}' 已由当前主 Agent 回合接管，无需重复恢复。"
-    if item.get("status") not in {"failed", "blocked", "cancelled", "pending"}:
+    # 排队等待接管的 in_progress 项必须允许恢复：它的 status 仍是 in_progress，
+    # 但 execution_mode=takeover_queued，属于「等主 Agent 接手」而不是「正在执行」。
+    queued_in_progress = (
+        item.get("status") == "in_progress"
+        and item.get("execution_mode") == "takeover_queued"
+    )
+    if (
+        item.get("status") not in {"failed", "blocked", "cancelled", "pending"}
+        and not queued_in_progress
+    ):
         return (
             f"🚨 计划项 '{item_key}' 当前状态为 {item.get('status')}，"
             "不允许恢复接管。"

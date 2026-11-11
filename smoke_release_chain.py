@@ -2,8 +2,9 @@
 
 1. 拖拽管线：模拟 _on_body_drop 的 items 构造 + emit_event 序列化，
    断言 payload 与前端 __ycode_on_drop_paths 期望的结构一致
-2. 自动更新：对已发布的 v1.2.9 Release 走 fetch_latest_release（分卷识别）
-   + UpdateDownloader 真实下载最小的 part4（7.7MB，含重试/Cookie/防线逻辑）
+2. 自动更新：对当前 latest Release 走 fetch_latest_release（分卷识别）
+   + UpdateDownloader 真实下载 part4 分卷（含重试/Cookie/防线逻辑，
+   尺寸断言按本地同名分卷动态比对）
 3. 安装防线：对下载产物做 PE 头校验函数的真实调用
 """
 import json
@@ -14,7 +15,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core import updater
-from core.updater import UpdateDownloader, fetch_latest_release, launch_installer_and_cleanup
+from core.updater import UpdateDownloader, fetch_latest_release, launch_installer
 
 PASS = []
 FAIL = []
@@ -71,11 +72,18 @@ check("分卷下载完成（重试/Cookie/防线全走真实链路）",
 downloaded = result.get("ok", "")
 if downloaded and os.path.isfile(downloaded):
     size = os.path.getsize(downloaded)
-    check("下载产物大小与分卷一致（~7.7MB）", 7 * 1024 * 1024 < size < 9 * 1024 * 1024, f"{size/1048576:.1f}MB")
     # 完整性黄金对照：与本地构建的同名分卷逐字节一致（part4 是尾片无 MZ 头，
     # PE 头校验只对拼接后的整包有意义——真实更新流程在 SHA256 全包校验后执行）
     remote_name = part4_url.rsplit("/", 1)[-1]
     local_part4 = os.path.join("dist", "release_parts", remote_name)
+    # 尺寸断言按本地同名分卷动态取：分卷是按 ≤95MB 均衡切分的，安装包体积一变
+    # 写死阈值就会误报（1.2.9 时代的 part4 是 7.7MB，1.2.23 已是 87.4MB）
+    expected_size = os.path.getsize(local_part4) if os.path.isfile(local_part4) else 0
+    if expected_size:
+        check("下载产物大小与本地分卷一致", size == expected_size,
+              f"{size/1048576:.1f}MB vs {expected_size/1048576:.1f}MB")
+    else:
+        check("下载产物大小合理（>1MB）", size > 1024 * 1024, f"{size/1048576:.1f}MB")
     if os.path.isfile(local_part4):
         h_down = updater._sha256_file(downloaded)
         h_local = updater._sha256_file(local_part4)

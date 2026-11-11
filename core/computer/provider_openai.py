@@ -147,7 +147,7 @@ def _field(value, key, default=None):
 
 
 def _normalized_type(event_type) -> str:
-    """事件 type 归一化为 'response.*' 字符串（litellm 桥接枚举走 .value）。"""
+    """事件 type 归一化为 'response.*' 字符串（桥接枚举走 .value）。"""
     if isinstance(event_type, str):
         return event_type
     value = getattr(event_type, "value", None)
@@ -591,8 +591,47 @@ def build_computer_call_output(call, observation) -> dict:
     Computer use 请求 schema 未定义 acknowledged_safety_checks 契约前绝不
     产出——pending safety 时 execute_native_computer_call 已先行返回
     provider_safety_required，本函数只服务已执行成功的批次）。
+
+    B 方案降级：浏览器窗口被遮挡/最小化时渲染被节流，本次观察可能没有截图
+    （png_path 为空）。此时不调 _read_png_bytes（空路径必抛错、整批动作的
+    结果全丢），改发纯文本观察（无截图说明 + 页面正文）。
     """
+    if not str(getattr(observation, "png_path", "") or ""):
+        from core.computer.provider_generic import no_screenshot_observation_text
+
+        return {
+            "type": "computer_call_output",
+            "call_id": call.call_id,
+            "output": [
+                {"type": "input_text", "text": no_screenshot_observation_text(observation)}
+            ],
+        }
     png_bytes = _read_png_bytes(observation)
+    # 与 provider_generic 同一上限（2MB/1280 边）：高分屏整屏 PNG 直接 base64
+    # 会显著放大请求体；超限先缩放，仍超限发纯文本观察（原生协议无省略图
+    # 专用字段，退回 input_text 与 B 方案降级同构）。
+    from core.computer.provider_generic import (
+        _OBSERVATION_IMAGE_MAX_BYTES,
+        _downscale_png,
+        no_screenshot_observation_text,
+    )
+
+    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+        scaled = _downscale_png(png_bytes)
+        if scaled:
+            png_bytes = scaled
+    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+        return {
+            "type": "computer_call_output",
+            "call_id": call.call_id,
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": no_screenshot_observation_text(observation)
+                    + "\n（截图体积超过上限，已省略）",
+                }
+            ],
+        }
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
     return {
         "type": "computer_call_output",

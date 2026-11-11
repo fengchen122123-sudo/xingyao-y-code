@@ -1,0 +1,7 @@
+{
+  "name": "novel_workspace",
+  "version": "0.1.0",
+  "description": "小说工作区：建书、进度、追踪、审查",
+  "entry": "plugin.py",
+  "enabled": true
+}

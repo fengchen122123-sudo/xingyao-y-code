@@ -292,8 +292,8 @@ def test_execute_command_passes_shell_override_to_background_tasks(monkeypatch):
 
     captured = {}
 
-    def fake_start(command, session_id="", shell_id=""):
-        captured.update(command=command, session_id=session_id, shell_id=shell_id)
+    def fake_start(command, session_id="", shell_id="", turn_id=""):
+        captured.update(command=command, session_id=session_id, shell_id=shell_id, turn_id=turn_id)
         return "task-1"
 
     monkeypatch.setattr("core.task_manager.start_background_task", fake_start)
@@ -385,53 +385,6 @@ def test_plan_verification_uses_the_selected_interpreter(tmp_path, monkeypatch):
     assert calls[0][1]["shell"] is False
 
 
-def test_embedded_terminal_uses_the_selected_interpreter(tmp_path, monkeypatch):
-    import threading
-    import subprocess
-
-    from gui_bridge import ApiBridge
-
-    _use_tmp_config(tmp_path, monkeypatch, {"command_shell": "cmd"})
-    executable = r"C:\Windows\System32\cmd.exe"
-    monkeypatch.setattr(
-        "core.command_shell.shutil.which",
-        lambda name: executable if name == "cmd.exe" else None,
-    )
-    calls = []
-
-    class FakeStdout:
-        def readline(self):
-            return b""
-
-    class FakeProcess:
-        stdout = FakeStdout()
-
-        def poll(self):
-            return 0
-
-        def wait(self, timeout=None):
-            return 0
-
-    bridge = ApiBridge.__new__(ApiBridge)
-    bridge._current_session = "session"
-    bridge._term_proc = None
-    bridge._term_lock = threading.Lock()
-    bridge._session_workdir = lambda _session: str(tmp_path)
-    bridge.emit_event = lambda _kind, _data: None
-    monkeypatch.setattr(
-        subprocess,
-        "Popen",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or FakeProcess(),
-    )
-
-    result = bridge.run_terminal_command("echo hi")
-
-    assert result["ok"] is True
-    assert calls[0][0][0] == "echo hi"
-    assert calls[0][1]["shell"] is True
-    assert calls[0][1]["executable"] == executable
-
-
 def test_system_settings_include_active_model_computer_capability(monkeypatch, tmp_path):
     """设置负载携带活动模型电脑操控资格（与 Turn 起点同一判定函数）。"""
     from tests.computer_fakes import use_temp_config
@@ -483,6 +436,48 @@ def test_system_settings_include_active_model_computer_capability(monkeypatch, t
     hint = payload["computer_active_model_capability"]
     assert hint["eligible"] is True
     assert hint["protocol"] == "generic"
+
+
+def test_system_settings_capability_hint_follows_caller_model(monkeypatch, tmp_path):
+    """GUI 传入会话生效模型时按它判定，缺省仍读全局默认。"""
+    from tests.computer_fakes import use_temp_config
+    import core.computer.settings as computer_settings
+
+    use_temp_config(tmp_path, monkeypatch, {
+        "active_model_id": "m-vision",
+        "browser_control_enabled": True,
+        "computer_control_enabled": True,
+        "computer_browser": "edge",
+        "providers": [{
+            "protocol": "openai", "base_url": "https://example.test/v1", "api_key": "k",
+            "models": [
+                {
+                    "id": "m-vision", "name": "vision-model", "litellm_model": "openai/t-v",
+                    "supports_vision": True, "supports_function_calling": True,
+                },
+                {
+                    "id": "m-text", "name": "text-model", "litellm_model": "openai/t-t",
+                    "supports_vision": False, "supports_function_calling": True,
+                },
+            ],
+        }],
+    })
+    monkeypatch.setattr(
+        computer_settings, "list_browser_options", lambda platform=None: ()
+    )
+
+    from core import command_shell
+
+    # 会话绑定的模型是纯文本模型，全局仍是视觉模型：必须按会话模型判定
+    hint = command_shell.get_system_settings(
+        active_model_id="m-text"
+    )["computer_active_model_capability"]
+    assert hint["model"] == "text-model"
+    assert hint["eligible"] is False
+
+    # 不传（CLI 场景）沿用全局默认
+    hint = command_shell.get_system_settings()["computer_active_model_capability"]
+    assert hint["model"] == "vision-model"
 
 
 def test_system_settings_capability_hint_fail_closed_when_model_missing(monkeypatch, tmp_path):

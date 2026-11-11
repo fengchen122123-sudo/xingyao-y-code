@@ -26,7 +26,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
-from core.computer.actions import MAX_WAIT_MS, MIN_WAIT_MS
+from core.computer.actions import (
+    MAX_WAIT_MS,
+    MIN_WAIT_MS,
+    WAIT_FOR_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_DEFAULT_TIMEOUT_MS,
+)
 from core.computer.models import (
     ComputerAction,
     ComputerControlError,
@@ -53,10 +58,15 @@ _ACTIVATION_SETTLE_S = 0.15
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
 # 阶段二（2026-09-06）：UIA 元素观察与元素引用动作（desktop only）。
 _ELEMENT_KINDS = frozenset({"list_elements", "click_element", "set_value_element"})
+# 自动补表的元素上限（与 WindowsElementLocator.MAX_ELEMENTS 对齐）：超大树
+# 只截前 N 个，避免把一次观察拖成整树遍历后的超长上下文。
+_MAX_OBSERVE_ELEMENTS = 200
 # R10：语义定位与局部观察动作（不做 surface 输入复核——它们自带 ref+代数校验）。
 _SEMANTIC_DESKTOP_KINDS = frozenset(
     {"list_surfaces", "activate_surface", "invoke_surface", "observe_region"}
 )
+# 键盘类动作：没有目标点，发送前必须复核前台窗口仍是最近一次点击的目标窗口。
+_KEYBOARD_KINDS = frozenset({"type_text", "keypress"})
 
 
 def default_image_grab():
@@ -178,6 +188,10 @@ class WindowsComputerBackend:
         # Task C（P3）：本动作是否发生了前台切换；observe 构造观察时消费
         # （写入 input_activated 并清零），输入动作分发前重置。
         self._last_activation_changed = False
+        # 键盘焦点护栏：最近一次 pointer 动作（click/double_click/drag）的目标
+        # 窗口身份；键盘动作发送前比对当前前台，不一致即 computer_foreground_lost。
+        # 新观察会重建焦点基线（清空该参照），届时回落到观察记录的前台窗口。
+        self._last_pointer_target_hwnd: int | None = None
 
     @classmethod
     def create_default(cls) -> "WindowsComputerBackend":
@@ -222,6 +236,9 @@ class WindowsComputerBackend:
             if signature != self._surface_signature:
                 self._surface_generation += 1
                 self._surface_signature = signature
+            # 观察重建焦点基线：清空 pointer 目标参照，键盘护栏回落到本次前台，
+            # 避免「先点 B、再观察 C」时拿旧点击目标误判焦点丢失。
+            self._last_pointer_target_hwnd = None
             if pending_region is not None:
                 # R10 局部观察：从原始分辨率整屏裁剪候选区域，区域原点/尺寸
                 # 进入观察的 origin/original_*，坐标反算沿用既有公式结构。
@@ -259,6 +276,14 @@ class WindowsComputerBackend:
                                 self._element_locator.invalidate()
                             except Exception:
                                 _LOGGER.exception("失效旧元素引用失败")
+                    # 自动补表：没有新 list_elements 时直接抓一次前台窗口元素，
+                    # 模型第一次 observe 就能拿到 ref 用 click_element 精确点击
+                    # （32×33 像素的小按钮靠截图目测必然点偏）。best-effort：
+                    # 失败只留痕，观察照常返回普通截图。
+                    elements = self._collect_elements_locked()
+                    if elements:
+                        self._last_elements = elements
+                        self._elements_surface_generation = self._surface_generation
                 effective_elements = elements
                 if elements:
                     png = self._annotate_elements_locked(
@@ -308,6 +333,9 @@ class WindowsComputerBackend:
 
     def execute(self, run_id: str, action: ComputerAction) -> None:
         wait_duration: int | None = None
+        # wait_for（2026-11-09 Windows-MCP 对齐）：锁内只记录动作本体，轮询在
+        # 锁外进行——条件等待最长 30s，持锁会阻塞 close/停止收尾（与 wait 同层）。
+        wait_for_action: ComputerAction | None = None
         with self._lock:
             self._ensure_started_locked()
             if action.target != "desktop":
@@ -340,6 +368,10 @@ class WindowsComputerBackend:
                         f"duration_ms 必须在 {MIN_WAIT_MS}-{MAX_WAIT_MS} 毫秒之间",
                     )
                 wait_duration = duration
+            elif kind == "wait_for":
+                # 只读条件等待：不改变界面状态，不需要画面基线（不要求先 observe），
+                # 但每次动作前的 interactive desktop 检查已在上面做过。
+                wait_for_action = action
             elif kind in _ELEMENT_KINDS:
                 self._dispatch_element_locked(action)
                 return
@@ -353,10 +385,17 @@ class WindowsComputerBackend:
                 # 微信群聊。键盘输入的焦点漂移维持 R5 fail-closed：前台与最近
                 # 观察不一致即拒绝，强制重新 observe 后再输入。
                 self._require_current_surface_locked()
+                if kind in _KEYBOARD_KINDS:
+                    # 键盘没有目标点：额外复核前台仍是最近一次 pointer 目标窗口。
+                    self._require_keyboard_focus_locked()
                 self._dispatch_locked(action)
                 return
         # R8：wait 在锁外分片等待，close 可收尾、停止可中断。
-        if wait_duration is not None:
+        if wait_for_action is not None:
+            self._wait_for_interruptible(
+                int(self._adapter.foreground_window_id()), wait_for_action
+            )
+        elif wait_duration is not None:
             self._wait_interruptible(wait_duration)
 
     # ---------------- 阶段二：UIA 元素观察与元素引用动作 ----------------
@@ -388,6 +427,28 @@ class WindowsComputerBackend:
             )
         locator.set_value(action.element_ref, action.text)
 
+    def _collect_elements_locked(self) -> tuple:
+        """自动补元素表（调用方持有锁）：前台窗口 UIA 元素，best-effort。
+
+        observe 没有新的 list_elements 结果、也没有代数未变的上代元素表时调用：
+        直接抓一次前台窗口元素，模型第一次观察即可用 click_element 精确点击，
+        不必退回截图目测坐标（小控件只有几十像素，目测必然点偏）。
+
+        任何失败（UIA 不可用、窗口关闭、COM 异常）只记日志并返回空表——观察
+        退回普通截图，绝不因为补表失败阻断观察。元素数量按
+        ``_MAX_OBSERVE_ELEMENTS`` 截断，避免超大树拖慢观察。
+        """
+        locator = self._element_locator
+        if locator is None:
+            return ()
+        try:
+            hwnd = self._adapter.foreground_window_id()
+            listing = tuple(locator.collect(hwnd))
+        except Exception:
+            _LOGGER.exception("自动提取前台窗口元素失败，观察退回普通截图")
+            return ()
+        return listing[:_MAX_OBSERVE_ELEMENTS]
+
     # ---------------- Task C：输入前置激活（best-effort，绝不阻断输入） ----------------
 
     def _ensure_target_window_active_locked(self, point: tuple[int, int]) -> bool:
@@ -396,22 +457,40 @@ class WindowsComputerBackend:
         - 目标 = 输入点所属顶层窗口（WindowFromPoint，64 位安全经 adapter）：
           点击命中点所在窗口是权威目标，激活它不改变动作语义；
         - 已是前台/查询失败/无目标：不切换，返回 False；
-        - SetForegroundWindow 失败：返回 False，输入照常发送（best-effort）。
+        - SetForegroundWindow 失败或激活过程异常：抛 ComputerControlError 中止本次输入。
+          旧实现是 best-effort 直接继续发送，输入会落到仍在前台的旧窗口，
+          表现为失去焦点、点到别处，因此改为显式失败。
 
         仅用于 pointer 类动作（click/double_click/drag）；键盘动作没有目标点，
         不做前置激活（真机验收修正：键盘激活会把旧观察窗口抢回前台）。
+
+        查询到的目标窗口无论是否发生切换，都记为「最近一次 pointer 目标窗口」，
+        供后续键盘动作复核焦点（_require_keyboard_focus_locked）。
         """
         try:
             hwnd = self._adapter.window_from_point(int(point[0]), int(point[1]))
+            if hwnd:
+                # 记录最近一次 pointer 动作的目标窗口（键盘焦点参照）。
+                self._last_pointer_target_hwnd = int(hwnd)
             if not hwnd or hwnd == self._adapter.foreground_window_id():
                 return False
             if not self._adapter.set_foreground_window(hwnd):
-                return False
+                raise ComputerControlError(
+                    "computer_foreground_activation_failed",
+                    "目标窗口未能置前，已在发送输入前中止，避免输入落到其他窗口。请先调用 activate_surface 激活目标窗口，或重新 observe 建立基线后再试。",
+                    {"hwnd": int(hwnd), "point": [int(point[0]), int(point[1])]},
+                )
             time.sleep(_ACTIVATION_SETTLE_S)
             return True
-        except Exception:
-            _LOGGER.exception("输入前置激活失败（继续原输入路径）")
-            return False
+        except ComputerControlError:
+            raise
+        except Exception as exc:
+            _LOGGER.exception("输入前置激活失败")
+            raise ComputerControlError(
+                "computer_foreground_activation_failed",
+                "激活目标窗口时出错，已在发送输入前中止，避免输入落到错误窗口。请重新 observe 建立基线后再试。",
+                {"point": [int(point[0]), int(point[1])], "reason": str(exc)},
+            ) from exc
 
     # ---------------- Task B：SoM 编号标注（best-effort，绝不阻断观察） ----------------
 
@@ -452,8 +531,22 @@ class WindowsComputerBackend:
         kind = action.kind
         if kind == "list_surfaces":
             # 枚举经候选落进紧随其后的观察；多候选原样返回，不自动选第一个。
+            # 窗口列表与托盘图标是两条独立路径：窗口走纯 Win32 枚举（快且稳），
+            # 托盘走 UIA 遍历（依赖缺失/调用超时会失败）。两者不得绑成一个原子
+            # 动作——托盘失败只降级为「托盘候选为空」，已经枚举到的窗口候选必须
+            # 照常返回，否则用户拿不到任何候选、无法用 activate_surface 调前台。
             windows = locator.list_windows()
-            tray = locator.list_tray_icons()
+            try:
+                tray = locator.list_tray_icons()
+            except Exception as error:
+                # 降级可诊断：带失败原因留痕，绝不静默吞错。
+                _LOGGER.warning(
+                    "托盘图标枚举失败，list_surfaces 降级为仅窗口候选：%s: %s",
+                    type(error).__name__,
+                    error,
+                    exc_info=True,
+                )
+                tray = ()
             self._pending_surface_candidates = tuple(
                 {
                     "ref": candidate.ref,
@@ -553,6 +646,80 @@ class WindowsComputerBackend:
                     "computer_cancelled", "显式等待被停止中断"
                 )
 
+    # ---------------- wait_for：只读条件轮询（锁外执行） ----------------
+
+    def _wait_for_interruptible(self, hwnd: int, action: ComputerAction) -> None:
+        """按 interval_ms 分片轮询只读条件，直到命中或超时（锁外执行）。
+
+        设计红线（2026-11-09 设计 5.1 / 计划 Task 2 硬约束）：轮询**绝不**调用
+        ``element_locator.collect``——collect 会整体替换 ref 全集
+        （windows_elements_uia.py 的 collect 末尾 ``self._elements = elements``），
+        模型手里的 el-N 会在等待期间全部失效。这里只走 ``locator.probe`` 的只读
+        探测，全程不重建映射、不重新编号。
+
+        分片语义：每片不超过 interval_ms，且不超过剩余时间；每片都用
+        ``_stop_event.wait`` 等待，停止/关闭立即中断（computer_cancelled），
+        绝不空转到超时。超时抛 computer_wait_timeout，message 提示改用 observe。
+        """
+        condition = str(action.condition or "text_exists")
+        timeout_ms = int(action.timeout_ms or WAIT_FOR_DEFAULT_TIMEOUT_MS)
+        interval_ms = int(action.interval_ms or WAIT_FOR_DEFAULT_INTERVAL_MS)
+        matcher = {
+            "condition": condition,
+            "text": action.text,
+            "element_ref": action.element_ref,
+        }
+        window_name = str(action.window_name or "").casefold()
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            if self._stop_event.is_set():
+                raise ComputerControlError(
+                    "computer_cancelled", "条件等待被停止中断"
+                )
+            if self._wait_for_match(int(hwnd), condition, matcher, window_name):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ComputerControlError(
+                    "computer_wait_timeout",
+                    f"条件 {condition} 未在 {timeout_ms} ms 内满足；"
+                    "可改用 observe 检查当前画面（或调整 text/window_name 后重试）",
+                )
+            if self._stop_event.wait(min(interval_ms / 1000, remaining)):
+                raise ComputerControlError(
+                    "computer_cancelled", "条件等待被停止中断"
+                )
+
+    def _wait_for_match(
+        self, hwnd: int, condition: str, matcher: dict, window_name: str
+    ) -> dict | None:
+        """单轮条件检查：window_active 走顶层窗口标题，其余走只读 probe。"""
+        if condition == "window_active":
+            if not window_name:
+                return None
+            for title in self._adapter.list_top_window_titles() or ():
+                folded = str(title).casefold()
+                if window_name in folded:
+                    return {"condition": condition, "title": str(title)}
+            return None
+        if window_name:
+            # window_name 作范围限定：前台窗口标题不含该子串时本轮不命中
+            # （不切换窗口、不激活任何窗口，纯只读判断）。
+            try:
+                title = str(self._adapter.foreground_window_title() or "").casefold()
+            except Exception:
+                _LOGGER.exception("读取前台窗口标题失败")
+                title = ""
+            if window_name not in title:
+                return None
+        locator = self._element_locator
+        if locator is None:
+            raise ComputerControlError(
+                "computer_elements_unavailable",
+                "当前桌面 backend 未提供 UIA 元素探测能力，无法执行该等待条件",
+            )
+        return locator.probe(int(hwnd), matcher)
+
     def _surface_signature_current_locked(
         self, origin_x: int, origin_y: int, width: int, height: int
     ) -> tuple:
@@ -594,6 +761,37 @@ class WindowsComputerBackend:
                     "局部观察区域对应的窗口/控件已移动或消失，"
                     "必须重新 list_surfaces 观察后再操作",
                 )
+
+    def _require_keyboard_focus_locked(self) -> None:
+        """键盘动作发送前复核：前台窗口必须是最近一次 pointer 动作的目标窗口。
+
+        键盘没有目标点，焦点被抢走后按键会静默打进错误窗口。R5 只比对「最近
+        一次观察」基线：用户从刚点击的窗口切回观察过的窗口时基线仍吻合，缺口
+        正在这里——键盘输入会送到不该收键的窗口。参照优先级：
+
+        1. 最近一次 pointer 动作（click/double_click/drag）的目标窗口；
+        2. 没有 pointer 参照时回落到最近一次观察记录的前台窗口。
+
+        两者都没有（尚未观察、也没点过）时放行，不阻塞首次键盘输入。不一致即
+        零输入 + 显式报错，由模型 click 或 activate_surface 重建焦点。
+        """
+        expected = self._last_pointer_target_hwnd
+        if expected is None:
+            signature = self._surface_signature
+            expected = None if signature is None else int(signature[0])
+        if expected is None:
+            return
+        current = int(self._adapter.foreground_window_id())
+        if current == int(expected):
+            return
+        raise ComputerControlError(
+            "computer_foreground_lost",
+            f"前台窗口（hwnd {current}）已不是最近一次点击的目标窗口"
+            f"（hwnd {int(expected)}），键盘输入会落到错误窗口，已在发送前中止。"
+            "请先用 click 点回目标窗口，或用 activate_surface 重新激活目标窗口"
+            "后再输入。",
+            {"expected_hwnd": int(expected), "current_hwnd": current},
+        )
 
     def release_inputs(self) -> None:
         """尽力释放所有按下的键和鼠标键；失败只留痕不抛出。"""

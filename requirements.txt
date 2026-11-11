@@ -1,15 +1,19 @@
 # Y-code CLI runtime dependencies
 rich>=13.0.0
-litellm>=1.0.0
 prompt_toolkit>=3.0.0
 pyfiglet>=0.8.0
 ddgs>=9.0.0
 mcp>=1.0.0
+# 工作流 frontmatter（ZCode .dwf.ts 导入）的 YAML 解析；此前经 mcp 传递引入，
+# core/workflows 直接依赖后在此显式声明
+pyyaml>=6.0
 psutil>=5.9.0
 tenacity>=8.0.0
 
 # GUI dependencies
 pywebview>=6.0.0
+# 内嵌交互式终端（底部面板）的 Windows ConPTY 封装
+pywinpty>=2.0; sys_platform == "win32"
 pillow>=10.0.0
 pystray>=0.19.5
 keyring>=25.0.0; sys_platform != "win32"
@@ -19,6 +23,14 @@ qrcode>=7.4
 # Development / test dependencies
 pytest>=7.0.0
 pytest-mock>=3.0.0
+
+# office plugin (plugins/office): xlsx read/write + pdf text extraction
+openpyxl>=3.1
+pypdf>=4.0
+
+# PDF 编辑（core/pdf_edit.py）：用 reportlab 画批注/白块/文本框的 overlay 层，
+# 再由 pypdf 合并进原页面。BSD 许可，可随包分发。
+reportlab>=4.0
 
 # Computer control dependencies (system Edge/Chrome channel; browsers are NOT downloaded)
 playwright>=1.55,<2

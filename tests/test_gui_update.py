@@ -7,6 +7,7 @@ tests/test_gui_update.py
 import json
 import os
 import tempfile
+import time
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -17,7 +18,7 @@ from core.updater import (
     cleanup_old_installers,
     fetch_latest_release,
     get_update_cache_dir,
-    launch_installer_and_cleanup,
+    launch_installer,
     parse_version,
     parse_release_sha256,
     _collect_split_parts,
@@ -115,28 +116,50 @@ def test_fetch_latest_release_same_version():
         assert res["latest_version"] == YCODE_VERSION
 
 
-def test_cleanup_old_installers():
-    """测试旧安装包与临时文件清理。"""
-    cache_dir = get_update_cache_dir()
-    os.makedirs(cache_dir, exist_ok=True)
-    dummy_exe = os.path.join(cache_dir, "test_old_setup.exe")
-    dummy_tmp = os.path.join(cache_dir, "test_download.tmp")
+def test_cleanup_old_installers(tmp_path, monkeypatch):
+    """更新缓存清理策略：老化残留与下载残片被清掉，且完全隔离到 tmp_path。"""
+    monkeypatch.setattr("core.updater.get_update_cache_dir", lambda: str(tmp_path))
+    dummy_exe = os.path.join(str(tmp_path), "test_old_setup.exe")
+    dummy_tmp = os.path.join(str(tmp_path), "Y-CODE-Setup-v9.9.9.exe.downloading")
     with open(dummy_exe, "w") as f:
         f.write("dummy")
     with open(dummy_tmp, "w") as f:
         f.write("dummy")
+    # 把非标准命名残留的时间拨到 30 天前，命中 keep_days 老化分支
+    old_ts = time.time() - 30 * 24 * 3600
+    os.utime(dummy_exe, (old_ts, old_ts))
 
     assert os.path.exists(dummy_exe)
     assert os.path.exists(dummy_tmp)
 
-    cleaned = cleanup_old_installers()
-    assert cleaned >= 2
+    cleaned = cleanup_old_installers(current_version="1.2.5", keep_days=7)
+    assert cleaned == 2
     assert not os.path.exists(dummy_exe)
     assert not os.path.exists(dummy_tmp)
 
 
 def test_launch_installer_missing_file():
-    assert launch_installer_and_cleanup("C:/non_existent_path_123.exe") is False
+    assert launch_installer("C:/non_existent_path_123.exe") is False
+
+
+def test_launch_installer_starts_wizard_without_deleting_package(tmp_path):
+    """启动命令必须是 start /wait "" "<路径>"，且不能带 & del
+    —— 否则用户一关掉安装向导包就被删了，必须重新下载。"""
+    installer = os.path.join(str(tmp_path), "Y-CODE-Setup-v1.2.6.exe")
+    with open(installer, "wb") as f:
+        f.write(b"MZ" + b"\x00" * 64)
+
+    norm_path = os.path.normpath(installer)
+    with patch("subprocess.Popen") as mock_popen:
+        assert launch_installer(installer) is True
+
+    assert mock_popen.call_count == 1
+    cmd = mock_popen.call_args[0][0]
+    assert cmd == f'start /wait "" "{norm_path}"'
+    assert "del" not in cmd
+    assert "&" not in cmd
+    # 启动后安装包必须仍在（清理责任已移交向导 / 启动时策略清理）
+    assert os.path.exists(installer)
 
 
 def test_gui_bridge_update_api():
@@ -333,6 +356,124 @@ def test_pick_main_installer_exe_prefers_gui_installer():
     # 兜底：只有 CLI 时选 CLI
     assert _pick_main_installer_exe(assets[:1], "1.2.6")["url"] == "cli"
     assert _pick_main_installer_exe([], "1.2.6") is None
+
+
+def test_pick_main_installer_group_prefers_new_brand_name_either_order():
+    """新命名主安装包 XingYaoCode-{版本}.exe 与 CLI 分卷组共存时，必须选主安装包
+    那组，且结果不依赖分组在字典中的插入顺序（前后两种顺序都测）。"""
+    from core.updater import _pick_main_installer_group
+
+    main_parts = [
+        {"name": "XingYaoCode-1.2.28.exe.part1", "size": 1},
+        {"name": "XingYaoCode-1.2.28.exe.part2", "size": 2},
+        {"name": "XingYaoCode-1.2.28.exe.part3", "size": 3},
+    ]
+    cli_parts = [
+        {"name": "Y-code-cli-1.2.28.exe.part1", "size": 1},
+        {"name": "Y-code-cli-1.2.28.exe.part2", "size": 2},
+        {"name": "Y-code-cli-1.2.28.exe.part3", "size": 3},
+    ]
+
+    # 顺序一：主安装包组在前
+    base, parts = _pick_main_installer_group(
+        {"XingYaoCode-1.2.28.exe": main_parts, "Y-code-cli-1.2.28.exe": cli_parts},
+        "1.2.28",
+    )
+    assert base == "XingYaoCode-1.2.28.exe"
+    assert [p["name"] for p in parts] == [p["name"] for p in main_parts]
+
+    # 顺序二：CLI 组在前（老客户端只按插入顺序取第一组，此处必须靠精确名纠正）
+    base2, parts2 = _pick_main_installer_group(
+        {"Y-code-cli-1.2.28.exe": cli_parts, "XingYaoCode-1.2.28.exe": main_parts},
+        "1.2.28",
+    )
+    assert base2 == "XingYaoCode-1.2.28.exe"
+    assert [p["name"] for p in parts2] == [p["name"] for p in main_parts]
+
+
+def test_pick_main_installer_group_uses_new_brand_prefix_when_version_mismatch():
+    """版本名对不上（精确名未命中）时，前缀兜底仍要选新命名主安装包组而非 CLI 组。"""
+    from core.updater import _pick_main_installer_group
+
+    complete = {
+        "Y-code-cli-9.9.9.exe": [{"name": "Y-code-cli-9.9.9.exe.part1"}],
+        "XingYaoCode-9.9.9.exe": [{"name": "XingYaoCode-9.9.9.exe.part1"}],
+    }
+    base, _ = _pick_main_installer_group(complete, "1.2.28")
+    assert base == "XingYaoCode-9.9.9.exe"
+
+
+def test_pick_main_installer_group_accepts_legacy_ycode_name():
+    """兼容旧命名：assets 只有 Y-code-1.2.28.exe.part1/part2 时仍能挑出该组。"""
+    from core.updater import _pick_main_installer_group
+
+    parts = [{"name": "Y-code-1.2.28.exe.part1", "size": 1},
+             {"name": "Y-code-1.2.28.exe.part2", "size": 2}]
+    base, picked = _pick_main_installer_group({"Y-code-1.2.28.exe": parts}, "1.2.28")
+    assert base == "Y-code-1.2.28.exe"
+    assert picked is parts
+
+
+def test_pick_main_installer_group_keeps_unbranded_fallback():
+    """极端兜底未被破坏：只有一组无品牌前缀的完整分卷时仍返回该组
+    （老客户端依赖此兜底，改造后不得抛错或返回 None）。"""
+    from core.updater import _pick_main_installer_group
+
+    parts = [{"name": "installer.exe.part1"}, {"name": "installer.exe.part2"}]
+    base, picked = _pick_main_installer_group({"installer.exe": parts}, "1.2.28")
+    assert base == "installer.exe"
+    assert picked is parts
+
+
+def test_pick_main_installer_exe_prefers_new_brand_name():
+    """单 exe 场景：新命名主安装包与 CLI 安装包共存时必须挑主安装包，顺序无关。"""
+    from core.updater import _pick_main_installer_exe
+
+    assets = [
+        {"name": "Y-code-cli-1.2.28.exe", "url": "cli"},
+        {"name": "XingYaoCode-1.2.28.exe", "url": "main"},
+    ]
+    assert _pick_main_installer_exe(assets, "1.2.28")["url"] == "main"
+    assert _pick_main_installer_exe(list(reversed(assets)), "1.2.28")["url"] == "main"
+
+
+def test_pick_main_installer_exe_accepts_legacy_ycode_name():
+    """单 exe 场景：只有旧命名 Y-code-1.2.28.exe 时也要能挑到它。"""
+    from core.updater import _pick_main_installer_exe
+
+    assets = [{"name": "Y-code-1.2.28.exe", "url": "legacy"}]
+    assert _pick_main_installer_exe(assets, "1.2.28")["url"] == "legacy"
+
+
+def test_fetch_latest_release_picks_new_brand_split_group_either_order():
+    """端到端：Release 同时挂新命名主安装包分卷与 CLI 分卷时，part_urls 取主安装包组，
+    且与附件先后顺序无关（CLI 组分别排前 / 排后两种情况）。"""
+    main_assets = [
+        {"name": "XingYaoCode-99.0.0.exe.part1", "browser_download_url": "https://gitee.com/m1", "size": 100},
+        {"name": "XingYaoCode-99.0.0.exe.part2", "browser_download_url": "https://gitee.com/m2", "size": 80},
+    ]
+    cli_assets = [
+        {"name": "Y-code-cli-99.0.0.exe.part1", "browser_download_url": "https://gitee.com/c1", "size": 60},
+        {"name": "Y-code-cli-99.0.0.exe.part2", "browser_download_url": "https://gitee.com/c2", "size": 60},
+    ]
+    for assets in (cli_assets + main_assets, main_assets + cli_assets):
+        fake_release = {
+            "tag_name": "v99.0.0",
+            "name": "Y-CODE v99.0.0",
+            "body": "- 分卷发布",
+            "assets": list(assets),
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps([fake_release]).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = fetch_latest_release(repo="mock/repo")
+
+        assert res["is_split"] is True
+        assert res["asset_name"] == "XingYaoCode-99.0.0.exe"
+        assert res["part_urls"] == ["https://gitee.com/m1", "https://gitee.com/m2"]
+        assert res["asset_size"] == 180
 
 
 def test_fetch_latest_release_with_split_parts():
@@ -610,7 +751,7 @@ def test_launch_installer_rejects_non_pe_file():
         f.write(b"<!DOCTYPE html><html><body>not an exe</body></html>")
 
     try:
-        assert launch_installer_and_cleanup(fake_exe) is False
+        assert launch_installer(fake_exe) is False
     finally:
         os.remove(fake_exe)
 
@@ -696,6 +837,85 @@ def test_split_download_rejects_sha256_mismatch():
     assert "校验失败" in result["err"] or "SHA256" in result["err"]
     assert not os.path.exists(dest_path)   # 产物不落盘
     assert not os.path.exists(tmp_path)    # 临时拼接文件已清理
+
+
+class _ChunkedPartResp:
+    """模拟不带 Content-Length 的分卷响应（chunked 传输形态）。
+
+    与 _FakePartResp 的唯一差别：headers 里没有 Content-Length。下载器
+    这时既拿不到片长度、也没有 Release 元数据提供的总大小，进度分母
+    只能按「片数比例」混算。
+    """
+
+    def __init__(self, payload: bytes, content_type: str = "application/octet-stream"):
+        self.headers = {"Content-Type": content_type}
+        self._payload = payload
+        self._pos = 0
+
+    def read(self, n):
+        chunk = self._payload[self._pos : self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_split_download_survives_missing_content_length():
+    """分卷 + 无总大小元数据 + 响应不带 Content-Length 时，下载必须正常完成。
+
+    Gitee 公开 API 不返回附件 size（total_size_hint 恒为 0），进度分母平时
+    靠首片 Content-Length 兜底。本用例覆盖「连 Content-Length 也没有」的
+    chunked 形态：应退化为按片数比例混算进度，绝不能因进度回调抛异常
+    （NameError/作用域问题）而让整次更新失败。
+    """
+    from core.updater import UpdateDownloader
+    import hashlib
+    import threading
+
+    part1 = b"A" * (1024 * 1024 + 100)
+    part2 = b"B" * (1024 * 1024 + 50)
+    full = part1 + part2
+    good_sha = hashlib.sha256(full).hexdigest()
+
+    cache_dir = get_update_cache_dir()
+    dest_path = os.path.join(cache_dir, "Y-CODE-Setup-v4.4.4.exe")
+    tmp_path = os.path.join(cache_dir, "Y-CODE-Setup-v4.4.4.exe.downloading")
+    for p in (dest_path, tmp_path):
+        if os.path.exists(p):
+            os.remove(p)
+
+    responses = [_ChunkedPartResp(part1), _ChunkedPartResp(part2)]
+    progress_events = []
+    done = threading.Event()
+    result = {}
+
+    downloader = UpdateDownloader()
+    with patch("urllib.request.urlopen", side_effect=lambda req, timeout=None: responses.pop(0)):
+        started = downloader.start_download(
+            download_url="",
+            target_version="4.4.4",
+            on_progress=lambda d: progress_events.append(dict(d)),
+            on_complete=lambda p: (result.update(ok=p), done.set()),
+            on_error=lambda m: (result.update(err=m), done.set()),
+            part_urls=["https://gitee.com/p1", "https://gitee.com/p2"],
+            expected_sha256=good_sha,
+            total_size_hint=0,
+        )
+        assert started is True
+        assert done.wait(timeout=10)
+
+    assert "ok" in result and "err" not in result, result
+    with open(result["ok"], "rb") as f:
+        assert f.read() == full
+    # 没有 Content-Length 也要有按片数推进的进度，且收尾必须报 100%
+    assert progress_events
+    assert progress_events[-1]["percent"] == 100
+    assert progress_events[-1]["downloaded"] == len(full)
+    os.remove(result["ok"])
 
 
 def test_split_download_reports_part_progress():

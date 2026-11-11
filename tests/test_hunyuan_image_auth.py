@@ -38,7 +38,10 @@ class GenerateImageAuthTest(TestCase):
         with tempfile.TemporaryDirectory() as save_dir:
             with mock.patch.dict(
                 os.environ,
-                {"HUNYUAN_API_KEY": "legacy-server-key-must-not-be-sent"},
+                {
+                    "HUNYUAN_API_KEY": "legacy-server-key-must-not-be-sent",
+                    "HUNYUAN_IMAGE_ENDPOINT": "https://example.invalid/v1/functions/generateImage",
+                },
             ), mock.patch.object(
                 hunyuan_image.urllib.request, "urlopen", fake_urlopen
             ), mock.patch.object(

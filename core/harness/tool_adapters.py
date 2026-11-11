@@ -8,9 +8,7 @@ import logging
 import os
 from copy import copy
 from contextlib import nullcontext
-from typing import Callable
 
-from core.harness.tool_contracts import ResolvedTool
 from core.tool_protocol import ToolResult
 from core.tools import (
     edit_file as _edit_file,
@@ -226,6 +224,18 @@ def classify_path_access(
             return "credential_write"
         return "trusted_read"
 
+    # AI 生成内容目录（规格 6.1）：AI 产物（生图 / 下载图 / 临时脚本）按设置统一落到
+    # 该目录，目录由用户在设置页显式指定，视为已授权落点——读写都不算越界访问。
+    # 判定必须与 _sandbox_outside_guard 保持一致，否则权限层免问、执行层又弹确认。
+    try:
+        from core.ai_output_paths import is_ai_output_path
+
+        if is_ai_output_path(str(path_value)):
+            return "trusted_read"
+    except Exception:
+        # 豁免判定属于安全边界：无法确认时不得放行，按普通越界路径处理
+        pass
+
     if function_name in _TRUSTED_READONLY_TOOLS:
         try:
             from core.skills import is_trusted_read_path
@@ -336,6 +346,20 @@ def _sandbox_outside_guard(
             if is_trusted_paste_path(str(path_value)) or is_session_user_attached_path(str(path_value)):
                 return sandbox_bypass(), None
         except Exception:
+            pass
+    # AI 生成内容目录豁免（规格 6.1）：AI 产出的临时脚本 / 中间产物按设置统一落到该
+    # 目录，目录由用户在设置页显式指定，视为已授权。这里对**写工具同样放行**——
+    # 旧实现只豁免 _TRUSTED_READONLY_TOOLS，导致 AI 往该目录写文件仍多弹一次越界确认。
+    # 边界：① 只豁免该目录自身及其子路径，其他任何路径的写保护不受影响；
+    # ② 凭据写入（credential_write）优先，绝不被本豁免绕过。
+    if not credential_write:
+        try:
+            from core.ai_output_paths import is_ai_output_path
+
+            if is_ai_output_path(path_value):
+                return sandbox_bypass(), None
+        except Exception:
+            # 安全边界：判定失败时不放行，继续走下方询问流程（fail-closed）
             pass
     if getattr(tools_module._sandbox_tls, "depth", 0) > 0:
         return None, None
@@ -537,17 +561,9 @@ class ToolAdapterSet:
         if isinstance(write_result, str) and write_result.startswith(TOOL_ERROR_PREFIX):
             return ToolResult(write_result, is_error=True)
 
-        # 默认 registry 处理器 core.tools.write_file 已记录解析后的绝对路径、
-        # 文件是否原本存在以及原始字节。这里只为测试/嵌入方显式注入的覆盖处理器
-        # 保留兼容记录，避免把默认处理器刚写入的精确快照覆盖成文本快照。
-        if self._uses_override(self.write_file, _write_file):
-            from core.memory import set_undo_state
-
-            set_undo_state(
-                str(resolved_path),
-                old_content,
-                existed_before=existed_before,
-            )
+        # 旧 set_undo_state 兼容记录已删除（规格 23.2）：默认处理器经
+        # FileMutationRecorder 记录按回合撤销快照；注入的覆盖处理器不接入
+        # 记录器，也不伪造快照。
         self.show_file_diff(
             str(resolved_path),
             old_content,
@@ -574,15 +590,21 @@ class ToolAdapterSet:
                 f"不超过 {max_target_len} 字符的小段后重试；如需整体重写，请改用 write_file。",
                 is_error=True,
             )
-        if not os.path.isfile(file_path or ""):
-            return ToolResult(
-                f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
-                "edit_file 只能修改已有文件；创建新文件请改用 write_file。",
-                is_error=True,
-            )
+        # 与 execute_write_file 同一口径：bypass 临界区内先按线程级 workdir
+        # 解析再判存。进程 cwd 在 GUI 打包版停在安装目录，裸用原始相对路径
+        # 会按 cwd 判存，把合法编辑误报成"文件不存在"；而解析必须放在
+        # bypass 之内——工作区外的路径（守卫已批准）在临界区外会被
+        # _resolve_workspace_path 的越界检查直接拒绝。
         with bypass if bypass is not None else self.sandbox_bypass():
+            resolved_path = _resolve_workspace_path(file_path)
+            if not resolved_path.is_file():
+                return ToolResult(
+                    f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
+                    "edit_file 只能修改已有文件；创建新文件请改用 write_file。",
+                    is_error=True,
+                )
             try:
-                old_content = self.read_text(file_path)
+                old_content = self.read_text(str(resolved_path))
             except OSError as read_error:
                 logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_error)
                 old_content = ""
@@ -599,12 +621,12 @@ class ToolAdapterSet:
             ).to_message_content()
             if not result.startswith(TOOL_ERROR_PREFIX):
                 try:
-                    new_content = self.read_text(file_path)
+                    new_content = self.read_text(str(resolved_path))
                 except OSError as read_error:
                     logger.warning("读取新文件内容失败 (%s): %s", file_path, read_error)
                     new_content = ""
                 self.show_file_diff(
-                    file_path,
+                    str(resolved_path),
                     old_content,
                     new_content,
                     context.event_callback,
@@ -823,6 +845,24 @@ class ToolAdapterSet:
 
     def execute(self, resolved_tool, arguments, context) -> ToolResult:
         name = resolved_tool.spec.name
+        # 按回合撤销：登记当前工具名与 call_id（TLS），记录器采集修改来源
+        try:
+            from core.turn_undo import recorder as _tu_recorder
+
+            _tu_recorder.set_tool_context(name, self.tool_call_id)
+        except Exception:
+            pass
+        try:
+            return self._execute_dispatch(name, resolved_tool, arguments, context)
+        finally:
+            try:
+                from core.turn_undo import recorder as _tu_recorder
+
+                _tu_recorder.clear_tool_context()
+            except Exception:
+                pass
+
+    def _execute_dispatch(self, name, resolved_tool, arguments, context) -> ToolResult:
         if name == "read_file":
             return self.execute_read_file(resolved_tool, arguments, context)
         if name == "write_file":

@@ -6,11 +6,15 @@ from typing import Any
 
 
 def _agent_display_name() -> str:
-    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
-    try:
-        from core.persona_settings import get_agent_display_name
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
 
-        return get_agent_display_name()
+    走 core.secretary 而非直接读设置页：工具提示里的名字属于“当前会话内的自称”，
+    秘书会话必须显示该会话的秘书名；读取失败回落默认“星瑶”（与原行为一致）。
+    """
+    try:
+        from core.secretary import get_active_agent_name
+
+        return get_active_agent_name()
     except Exception:
         return "星瑶"
 
@@ -40,7 +44,83 @@ _TOOL_CATEGORIES = {
     "execute_command": "command",
     "write_file": "mutation",
     "edit_file": "mutation",
+    # 电脑操控单独一类：前端据此用「动作动词 + 目标」的紧凑行渲染，
+    # 而不是落到 other 变成"使用工具 computer_action"。
+    "computer_action": "computer",
 }
+
+# computer_action 的 kind → 中文动词。与 actions.py 的 schema 枚举对齐，
+# 未收录的 kind 回落「操作」（新增 kind 时不至于展示成空白）。
+_COMPUTER_ACTION_VERBS = {
+    "observe": "观察",
+    "click": "点击",
+    "double_click": "双击",
+    "move": "移动",
+    "drag": "拖拽",
+    "scroll": "滚动",
+    "type_text": "输入",
+    "keypress": "按键",
+    "wait": "等待",
+    "navigate": "打开网址",
+    "back": "后退",
+    "forward": "前进",
+    "reload": "刷新",
+    "request_user_takeover": "请求接管",
+    "list_surfaces": "列出窗口",
+    "activate_surface": "切换窗口",
+    "invoke_surface": "唤醒窗口",
+    "observe_region": "局部观察",
+    "sequence": "连续操作",
+    "list_elements": "列出控件",
+    "click_element": "点击控件",
+    "set_value_element": "填写控件",
+}
+
+
+def _computer_action_target(arguments: dict) -> str:
+    """动作目标的一行摘要：控件引用 > 网址 > 组合键 > 坐标 > 窗口 > 文本长度。
+
+    优先级按"最能识别目标"排序；所有字段都只是入参原值，不含截图或正文
+    （text 只输出字数，绝不回显用户输入）。
+    """
+    ref = str(arguments.get("element_ref") or "").strip()
+    if ref:
+        return ref
+    url = str(arguments.get("url") or "").strip()
+    if url:
+        return url
+    keys = arguments.get("keys")
+    if isinstance(keys, (list, tuple)) and keys:
+        return "+".join(str(key) for key in keys)
+    surface_ref = str(arguments.get("surface_ref") or "").strip()
+    if surface_ref:
+        return surface_ref
+    x, y = arguments.get("x"), arguments.get("y")
+    if isinstance(x, int) and isinstance(y, int):
+        return f"({x}, {y})"
+    text = str(arguments.get("text") or "")
+    if text:
+        return f"{len(text)} 字"
+    return ""
+
+
+def _computer_action_display(arguments: dict, result: dict, ok: bool | None) -> dict[str, object]:
+    """电脑操控动作的展示投影：动作动词 + 目标，供对话区紧凑行渲染。"""
+    kind = str(arguments.get("kind") or "").strip().lower()
+    error_summary = ""
+    if ok is False:
+        error_content = str(result.get("content", "") or "").lstrip("🚨").strip()
+        error_summary = sanitize_tool_display_text(error_content, 160)
+    return {
+        "category": "computer",
+        "action": _COMPUTER_ACTION_VERBS.get(kind, "操作"),
+        "target": sanitize_tool_display_text(_computer_action_target(arguments), 160),
+        "command": "",
+        "metrics": {},
+        "error_summary": error_summary,
+        "is_skill": False,
+        "background": False,
+    }
 
 _TOOL_ACTIONS = {
     "read_file": "读取文件",
@@ -155,6 +235,9 @@ def build_tool_display(
     target = skill_name or tool_target(name, arguments)
     command = str(arguments.get("command", "")) if name == "execute_command" else ""
     result_data: dict[str, Any] = result or {}
+    if name == "computer_action":
+        # 电脑操控走独立展示投影（动作动词 + 目标），不走通用「使用工具」文案。
+        return _computer_action_display(arguments, result_data, ok)
     metrics: dict[str, int] = {}
     if name == "read_file" and ok is True:
         content = result_data.get("content")

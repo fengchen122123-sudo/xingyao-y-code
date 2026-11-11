@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable
 
+from core.automation import tool_policy as automation_tool_policy
 from core.computer.tool_adapter import RESERVED_COMPUTER_TOOL_NAMES
 from core.tool_protocol import ToolResult, ToolSpec
 
@@ -66,20 +67,25 @@ class ToolRegistry:
             }
         return arguments
 
-    def execute_strict(self, name: str, **arguments: Any) -> ToolResult:
-        """Execute a registered tool while preserving execution exceptions."""
-        spec = self.get(name)
+    def execute_strict(self, tool_name: str, **arguments: Any) -> ToolResult:
+        """Execute a registered tool while preserving execution exceptions.
+
+        首个形参刻意命名为 ``tool_name``：工具自身的参数里可能包含名叫 ``name`` 的
+        字段（如 mcp_add_server / automation_create），若形参叫 ``name`` 会与
+        ``**arguments`` 冲突（TypeError: multiple values for argument 'name'）。
+        """
+        spec = self.get(tool_name)
         result = spec.execute(**self._filtered_arguments(spec, arguments))
         if isinstance(result, ToolResult):
             return result
         return ToolResult(content=str(result) if result is not None else "")
 
-    def execute(self, name: str, **arguments: Any) -> ToolResult:
-        spec = self._specs.get(name)
+    def execute(self, tool_name: str, **arguments: Any) -> ToolResult:
+        spec = self._specs.get(tool_name)
         if spec is None:
-            return ToolResult(content=f"Unknown tool: {name}", is_error=True)
+            return ToolResult(content=f"Unknown tool: {tool_name}", is_error=True)
         try:
-            return self.execute_strict(name, **arguments)
+            return self.execute_strict(tool_name, **arguments)
         except Exception as exc:
             return ToolResult(content=f"Tool execution error: {exc}", is_error=True)
 
@@ -118,7 +124,93 @@ def filter_reserved_tool_schemas(schemas: Iterable[dict[str, Any]]) -> list[dict
     return allowed
 
 
-def build_default_registry() -> ToolRegistry:
+# ── 运行形态档位（CLI 轻量档）────────────────────────────────────────
+# CLI 的定位是"开发者终端里写代码"，不与 GUI 共享全部富交互面板能力。
+# 下列工具在 CLI 下要么必然不可用（内嵌浏览器面板、星轨自动化、选区截图），
+# 要么与写代码无关（皮肤/人设/飞书/局域网/决策面板/图片生成/更新向导），
+# 注册它们只会让每次请求都多背约 5.6k tokens 的工具定义，因此在 CLI 档位剔除。
+# 注意：这里只裁"对模型暴露的工具表"，对应的斜杠命令与业务能力不受影响。
+CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
+    # 外观与人设
+    "theme_manage",
+    "persona_manage",
+    # 星轨自动化（CLI/headless 下服务句柄未注册，调用必然失败）
+    "automation_list",
+    "automation_create",
+    "automation_update",
+    "automation_delete",
+    "automation_run_now",
+    # 星流工作流（用户明确 CLI 不需要工作流：管理走 GUI 星流面板，创建/执行走对话）
+    "workflow_list",
+    "workflow_run",
+    "workflow_save",
+    "workflow_finish",
+    # 外部集成与决策面板
+    "feishu_manage",
+    "lan_manage",
+    "decision_manage",
+    # 交互面板（GUI 专属 UI 能力）
+    "computer_control",
+    "pty_manage",
+    "browser_pane",
+    "screenshot_capture",
+    "browser_set_viewport",
+    "clipboard_image",
+    # 跨会话派发 / 秘书
+    "dispatch_task",
+    "open_session",
+    "secretary_probe",
+    # 运维与内容生成
+    "update_manage",
+    "diagram_manage",
+    # 只读查询类：斜杠命令（/usage /share /doctor）或已保留的同名工具
+    # （search_sessions）完全覆盖，不必再占一份 schema。
+    "usage_stats",
+    "session_export",
+    "doctor_run",
+    "search_conversations",
+    # 会话/模型配置：斜杠命令 /session、/models 覆盖；保留 skill_manage /
+    # plugin_manage / hook_manage / mcp_* / system_settings 的对话式配置能力。
+    "session_manage",
+    "model_manage",
+    # 与写代码无关（fetch_image 只在网页图文并茂展示时用，写代码不需要）
+    "get_weather",
+    "search_news",
+    "fetch_image",
+})
+
+VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli")
+
+
+def _resolve_tool_profile(profile: str | None = None) -> str:
+    """解析工具表档位：显式参数 > 环境变量 > app_context UI 形态 > full。
+
+    环境变量优先于 app_context，是因为 core.llm 在模块导入期就会构建工具表，
+    此时入口层往往还没来得及 set_ui_flavor；main.py 在 import core.llm 之前
+    用 YCODE_TOOL_PROFILE=cli 声明形态。
+    """
+    candidate = str(profile or "").strip().lower()
+    if candidate in VALID_TOOL_PROFILES:
+        return candidate
+    try:
+        import os
+
+        env_value = os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower()
+        if env_value in VALID_TOOL_PROFILES:
+            return env_value
+    except Exception:
+        pass
+    try:
+        from core.app_context import get_ui_flavor
+
+        if get_ui_flavor() == "cli":
+            return "cli"
+    except Exception:
+        pass
+    return "full"
+
+
+def build_default_registry(profile: str | None = None) -> ToolRegistry:
     from core import tools
     from core import lsp as _lsp
     from core.ask_user import ask_user
@@ -131,6 +223,20 @@ def build_default_registry() -> ToolRegistry:
         plan_write,
     )
 
+    # 管理类工具（21 个）：各模块自带 build_specs() 提供 ToolSpec 契约，
+    # 注册表只做装配与分组，不在此重复定义任何工具或实现；模块内部执行逻辑
+    # 一律函数内惰性导入，注册阶段仅构造 ToolSpec 对象，不触发扫描/网络/写盘。
+    from core import tools_admin_integration
+    from core import tools_admin_interaction
+    from core import tools_admin_look
+    from core import tools_admin_model
+    from core import tools_admin_ops
+    from core import tools_admin_session
+    from core import tools_admin_skill
+
+    # side_effect_scope 归类依据《03-工具调度拓扑化设计规格》3.2 取值表
+    # （none / workspace / git / network / system）；表未覆盖的工具按语义归类，
+    # 行尾注释说明理由。该字段 v1 不参与调度决策，仅为契约元数据。
     read_specs = [
         ToolSpec(
             name="read_file",
@@ -147,6 +253,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="读取文件",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="list_directory",
@@ -160,6 +267,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="查看目录",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="search_code",
@@ -173,6 +281,123 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="搜索代码",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="find_definition",
+            description=(
+                "查找符号（函数/类/方法）的定义位置。比 search_code 更精确——"
+                "只匹配定义位置（def/class/function/func 等关键字），不匹配调用或字符串字面量。"
+                "支持 Python/JS/TS/Go/Rust/Java/C/C++/C#。返回 file:line 格式，可直接用 read_file 跳转。"
+            ),
+            input_schema=_schema({
+                "symbol": {"type": "string", "description": "要查找的符号名（函数名/类名/方法名）"},
+                "dir_path": {"type": "string", "default": "."},
+                "file_extensions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "限定文件扩展名（如 ['.py', '.ts']），不传则全语言",
+                },
+            }, ["symbol"]),
+            execute=_lsp.find_definition,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查找符号定义",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="recall_history",
+            description=(
+                "回溯当前会话更早被压缩归档的原始对话消息。before_msg_id 取自记忆摘要块"
+                "尾部[更早摘要回溯]索引中的 msg_id（或上一批回溯结果里最早一条的 msg_id 减 1，"
+                "避免重复返回该条），返回该边界及其之前（含边界自身）、摘要水位覆盖范围内的"
+                "原始消息（时间正序，含角色）。"
+                "仅用于恢复更早对话的细节；当前活跃上下文里已有的内容无需回溯。"
+            ),
+            input_schema=_schema({
+                "before_msg_id": {"type": "integer", "description": "读取该 msg_id 及其之前（含边界自身）的已压缩消息", "minimum": 1},
+                "limit": {"type": "integer", "default": 16, "minimum": 1, "maximum": 50, "description": "最多返回的消息条数"},
+            }, ["before_msg_id"]),
+            execute=tools.recall_history,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="回溯已压缩的历史消息",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="search_sessions",
+            description=(
+                "跨会话按关键词全文检索历史消息（含已被压缩归档、不再出现在当前"
+                "上下文里的早期消息），用于找回早前讨论过的细节。"
+                "中文按两字 bigram 匹配（搜“缓存”可命中“缓存命中率”），英文/数字按整词"
+                "匹配；每次检索前会先把新消息增量补进索引。"
+                "这不是文件搜索：搜代码/文件请用 search_code 或 glob_files。"
+            ),
+            input_schema=_schema({
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词（中文两字词即可；英文/数字为整词匹配）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "最多返回的消息条数",
+                },
+                "session": {
+                    "type": "string",
+                    "description": "可选：限定只在某个会话（按会话名）内检索，不传则跨全部会话",
+                },
+            }, ["query"]),
+            execute=tools.search_sessions,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="全文检索历史消息",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="tool_result_read",
+            description=(
+                "按句柄取回被折叠（snip/elide）的工具结果原始内容。"
+                "句柄来自工具结果 marker 里的 #xxxxxxxx（形如"
+                "[snipped tool result #ab12cd34 — read_file, ...] 或 "
+                "[elided tool result #ab12cd34 — ...]）。"
+                "仅在折叠后确实需要原始细节时使用；未折叠的结果仍在上下文里，无需取回。"
+                "mode=head/tail 按行读取，grep 按关键字检索带行号命中行，full 取全文。"
+            ),
+            input_schema=_schema({
+                "handle": {
+                    "type": "string",
+                    "description": "归档句柄：marker 里 # 后的 8 位小写十六进制（如 ab12cd34）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["head", "tail", "grep", "full"],
+                    "default": "head",
+                    "description": "head 前 N 行 / tail 后 N 行 / grep 关键字命中行 / full 全文",
+                },
+                "lines": {
+                    "type": "integer",
+                    "default": 80,
+                    "minimum": 1,
+                    "maximum": 2000,
+                    "description": "head/tail 读取的行数",
+                },
+                "grep": {
+                    "type": "string",
+                    "description": "mode=grep 时必填：要搜索的文本（不区分大小写的正则）",
+                },
+            }, ["handle"]),
+            execute=tools.tool_result_read,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="取回完整工具结果",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="find_definition",
@@ -208,6 +433,45 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="联网搜索",
+            side_effect_scope="network",
+        ),
+        ToolSpec(
+            name="fetch_url",
+            description="使用本机 HTTP 客户端获取网页或 JSON。需要实时网页数据时使用，不要用它代替项目代码搜索。",
+            input_schema=_schema({
+                "url": {"type": "string", "description": "完整的 http 或 https 地址"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 60,
+                },
+            }, ["url"]),
+            execute=tools.fetch_url,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="访问网址",
+            side_effect_scope="network",
+        ),
+        ToolSpec(
+            name="get_weather",
+            description="查询指定城市的实时天气和短期预报。必须明确传入城市；不要使用 search_news 查询天气。",
+            input_schema=_schema({
+                "city": {"type": "string", "description": "城市名，例如北京、上海或 Shanghai"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 60,
+                },
+            }, ["city"]),
+            execute=tools.get_weather,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询天气",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="fetch_url",
@@ -257,10 +521,162 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="匹配文件",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="automation_list",
+            description=(
+                "查看星轨自动化任务：列出全部任务的 id/名称/启用状态/触发器摘要/"
+                "下次触发时间/目标会话/权限档位/上次运行时间；传入 task_id 时查看单个任务"
+                "的完整详情与最近 10 条运行记录（状态/触发方式/起止时间/错误）。"
+                "仅 GUI 运行期间可用（CLI/headless 下会提示不可用）。"
+            ),
+            input_schema=_schema({
+                "task_id": {
+                    "type": "string",
+                    "description": "可选，查看某个星轨自动化任务的详情与最近运行记录",
+                },
+            }),
+            execute=_automation_list_wrapper,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查看星轨自动化任务",
+            side_effect_scope="none",  # 表未覆盖：只读查询，无持久副作用
+        ),
+        ToolSpec(
+            name="workflow_list",
+            description=(
+                "查看星瑶工作流（.dwf.ts 文件，含导入的与新建的）：列出全部工作流的"
+                "名称/描述/适用场景/参数声明/来源档位；传 name 查看单个工作流的"
+                "完整定义（参数表 + 脚本原文）。解析失败的文件会单独列出、"
+                "不参与执行。工作流用 workflow_run 执行，用 workflow_save 创建或更新。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "可选，查看某个工作流的完整定义"},
+            }),
+            execute=_workflow_list_wrapper,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查看工作流",
+            side_effect_scope="none",  # 表未覆盖：只读查询，无持久副作用
+        ),
+        # 秘书调度台（设计 2026-10-15 第 3 节）：仅秘书会话可见（core.secretary
+        # 的 SECRETARY_ONLY_TOOLS），普通会话的工具集零变化。
+        ToolSpec(
+            name="search_conversations",
+            description=(
+                "检索历史会话（秘书专用）：按关键词 / 日期区间（YYYY-MM-DD）/ 项目"
+                "目录找到用户以前聊过某个话题的会话，返回每个命中的会话名、显示名、"
+                "归属目录、更新时间和命中片段。关键词与日期都为空会被拒绝；先检索再"
+                "回答，不要凭印象猜会话名。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "keyword": {"type": "string", "default": "", "description": "要检索的关键词（可选，与日期至少给一个）"},
+                "date_from": {"type": "string", "default": "", "description": "起始日期 YYYY-MM-DD（可选，含当天）"},
+                "date_to": {"type": "string", "default": "", "description": "结束日期 YYYY-MM-DD（可选，含当天）"},
+                "workdir": {"type": "string", "default": "", "description": "按项目目录过滤（可选）"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "最多返回的会话数（上限 50）"},
+            }),
+            execute=tools.search_conversations,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="检索历史会话",
+            side_effect_scope="none",
+        ),
+        # 派活台账只读查询（升级设计 2026-11-04 第 3.4 节）：同样仅秘书会话可见，
+        # 让秘书能回答「刚才那些任务怎么样」而不必重新检索会话或让用户复述。
+        ToolSpec(
+            name="list_dispatches",
+            description=(
+                "查询秘书派出的任务台账（秘书专用）：按状态 / 项目目录 / 目标会话"
+                "（会话名或显示名子串）列出最近的派活记录，每条含任务编号、标题、"
+                "目标会话、状态、起止时间与结论摘要（截 200 字）。用户问「刚才那个"
+                "怎么样」「派出去的任务跑完了吗」时先查这里；需要完整结论或错误用 "
+                "get_dispatch_result。返回 JSON 字符串；无命中返回可读文本。"
+            ),
+            input_schema=_schema({
+                "status": {"type": "string", "default": "", "description": "按状态过滤：queued / running / done / failed / cancelled / blocked（可选）"},
+                "workdir": {"type": "string", "default": "", "description": "按项目目录过滤（可选，精确匹配）"},
+                "target": {"type": "string", "default": "", "description": "按目标会话名或显示名做子串过滤（可选）"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "最多返回的任务数（上限 50）"},
+            }),
+            execute=tools.list_dispatches,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询派活记录",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="get_dispatch_result",
+            description=(
+                "查一条派活任务的完整详情（秘书专用）：dispatch_id 取 list_dispatches "
+                "返回的编号，返回完整任务正文（prompt）、完整结论摘要（不截断）、"
+                "错误信息、依赖任务与批次号等全字段。汇报「那个任务到底干了什么 / "
+                "为什么失败」时用它。编号不存在会给可读提示。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "dispatch_id": {"type": "integer", "description": "任务编号（必填），取自 list_dispatches 返回的 id"},
+            }, ["dispatch_id"]),
+            execute=tools.get_dispatch_result,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询派活任务详情",
+            side_effect_scope="none",
+        ),
+        # 项目画像只读（升级设计 2026-11-04 第 5.2 节）：scope=none，秘书会话
+        # 天然放行；普通会话看不到（名字在 core.secretary 的 SECRETARY_ONLY_TOOLS）。
+        ToolSpec(
+            name="read_project_profile",
+            description=(
+                "读某个项目的画像（秘书专用）：跨会话积累的长期记忆，含技术栈 / "
+                "架构决策 / 硬约束 / 踩坑记录 / 用户偏好 / 任务流水六章。workdir "
+                "为空时取当前会话的项目目录。用户问「这个项目以前定过什么规矩 / "
+                "踩过哪些坑」时先读它，不要凭印象猜。没有画像时返回可读文本。"
+            ),
+            input_schema=_schema({
+                "workdir": {"type": "string", "default": "", "description": "项目目录（可选，空 = 当前会话的工作目录）"},
+            }),
+            execute=tools.read_project_profile,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="读取项目画像",
+            side_effect_scope="none",
         ),
     ]
 
     mutating_specs = [
+        # 项目画像写入（升级设计 2026-11-04 第 5.2 节）：只写
+        # ~/.ycode/memory/projects/，路径校验在 core.project_profile 内。
+        # requires_permission=False：这是秘书自己的长期记忆，写的是 memory 目录
+        # 而非项目文件（路径越界直接拒绝），逐次弹确认只会卡住汇总流程。
+        ToolSpec(
+            name="remember_decision",
+            description=(
+                "把一条项目级结论记进项目画像（秘书专用）：section 只能是 技术栈 / "
+                "架构决策 / 硬约束 / 踩坑记录 / 用户偏好，workdir 为空时取当前会话的"
+                "项目目录。技术栈 / 架构决策 / 硬约束三节会在下次向该项目派活时自动"
+                "带入任务正文，用户不用重复交代。只写记忆目录，不碰项目文件。"
+            ),
+            input_schema=_schema({
+                "workdir": {"type": "string", "default": "", "description": "项目目录（可选，空 = 当前会话的工作目录）"},
+                "section": {
+                    "type": "string",
+                    "enum": ["技术栈", "架构决策", "硬约束", "踩坑记录", "用户偏好"],
+                    "description": "写到哪一节（必填，取值见枚举）",
+                },
+                "content": {"type": "string", "description": "要记住的内容（必填，1200 字以内，越短越有效）"},
+            }, ["section", "content"]),
+            execute=tools.remember_decision,
+            requires_permission=False,
+            activity_description="记录项目决策",
+            side_effect_scope="system",  # 只写 ~/.ycode/memory/projects/（跨项目记忆，非工作区）
+        ),
         ToolSpec(
             name="ask_user",
             description="向用户提出一个需要选择的澄清问题。必须提供 1 到 3 个选项；有计划时只能绑定独立的用户输入准备项。",
@@ -277,6 +693,7 @@ def build_default_registry() -> ToolRegistry:
             execute=ask_user,
             requires_permission=False,
             activity_description="等待用户回答",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="plan_write",
@@ -301,6 +718,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["items"]),
             execute=plan_write,
             activity_description="更新任务计划",
+            side_effect_scope="workspace",  # 表未覆盖：持久化修改任务计划状态（.ycode_tasks/plans）
         ),
         ToolSpec(
             name="plan_update",
@@ -319,6 +737,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_update,
             activity_description="更新计划项",
+            side_effect_scope="workspace",  # 表未覆盖：持久化修改计划项元数据
         ),
         ToolSpec(
             name="plan_read",
@@ -329,6 +748,7 @@ def build_default_registry() -> ToolRegistry:
             execute=plan_read,
             read_only=True,
             activity_description="查看计划状态",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="plan_retry",
@@ -339,6 +759,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_retry,
             activity_description="重试计划项",
+            side_effect_scope="workspace",  # 表未覆盖：修改计划项状态
         ),
         ToolSpec(
             name="plan_resume_takeover",
@@ -352,6 +773,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_resume_takeover,
             activity_description="恢复主 Agent 接管",
+            side_effect_scope="workspace",  # 表未覆盖：修改计划项接管状态
         ),
         ToolSpec(
             name="plan_finish",
@@ -369,6 +791,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id", "result"]),
             execute=plan_finish,
             activity_description="完成接管计划项",
+            side_effect_scope="system",  # 表未覆盖：会真实执行 verification shell 命令
         ),
         ToolSpec(
             name="write_file",
@@ -380,6 +803,7 @@ def build_default_registry() -> ToolRegistry:
             execute=tools.write_file,
             mutates_files=True,
             activity_description="写入文件",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="edit_file",
@@ -391,6 +815,9 @@ def build_default_registry() -> ToolRegistry:
                 "两条路径互斥：传了 start_line/end_line 就跳过 target_content 匹配。\n"
                 "路径A 适合小文件/唯一代码段，target_content 应包含唯一上下文（≤1500 字符），多次出现需补上下文或 replace_all=True。\n"
                 "路径B 适合大文件/重复代码段，建议先 read_file(with_line_numbers=True) 获取行号。\n"
+                "⚠ 编辑前必须先读取该文件：路径A 的 target_content 必须与文件实际内容一致，"
+                "路径B 的行号必须来自真实文件——不要凭记忆或旧快照改文件。\n"
+                "若文件在本次编辑的「读取→写入」窗口内被外部修改，写入会中止并提示重新读取（防并发覆盖）。\n"
                 "严禁用 write_file 覆盖已有大文件来替代 edit_file。"
             ),
             input_schema=_schema({
@@ -410,6 +837,48 @@ def build_default_registry() -> ToolRegistry:
             execute=tools.edit_file,
             mutates_files=True,
             activity_description="修改文件",
+            side_effect_scope="workspace",
+        ),
+        ToolSpec(
+            name="fetch_image",
+            description="下载网页中的图片到本地并返回本地路径。仅当 fetch_url / search_news 结果中含与主题直接相关的图片、需要图文并茂展示时使用；广告/图标/头像等无关图片不要下载。成功后按界面形态展示：GUI 会话用 Markdown 图片语法 ![](本地路径) 内嵌（远程 URL 前端不渲染，必须下载成本地路径）；CLI 终端直接给出本地路径。图片落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）。仅支持 http/https，仅 png/jpg/jpeg/gif/webp，上限 10MB。",
+            input_schema=_schema({
+                "url": {"type": "string", "description": "完整的 http 或 https 图片地址"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 60,
+                },
+            }, ["url"]),
+            execute=tools.fetch_image,
+            read_only=False,
+            mutates_files=True,
+            requires_permission=False,
+            cancellable=True,
+            activity_description="下载图片",
+            side_effect_scope="network",
+        ),
+        ToolSpec(
+            name="undo_turn",
+            description=(
+                "撤销某一次回合的全部受控文件修改（用户明确要求“撤销/回滚这轮文件改动”时使用）。"
+                "撤销前会先预检每个文件的实际状态：任一文件在回合结束后被修改过，整轮拒绝、零文件写入。"
+                "聊天历史保留，模型会通过上下文得知该回合的文件结果已失效。"
+                "终端命令等其他副作用不在撤销范围内。"
+            ),
+            input_schema=_schema({
+                "turn_id": {
+                    "type": "string",
+                    "description": (
+                        "要撤销的回合 ID（可使用 8 位短 ID）。省略时撤销最近一个可撤销回合。"
+                        "不接受文件路径或其他参数。"
+                    ),
+                },
+            }),
+            execute=tools.undo_turn,
+            activity_description="撤销回合文件修改",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="fetch_image",
@@ -441,7 +910,15 @@ def build_default_registry() -> ToolRegistry:
                 "PowerShell 中 & 是调用运算符（用于执行字符串命令），非 Bash 风格的命令串联符。"
                 "错误示例：cd path & javac Foo.java（会抛 ParserError，退出码 2）"
                 "正确示例：cd path; javac Foo.java; java Foo\n"
-                "3) 条件串联用 if ($LASTEXITCODE -eq 0) { next }，PowerShell 7+ 才支持 && 运算符"
+                "3) 条件串联用 if ($LASTEXITCODE -eq 0) { next }，PowerShell 7+ 才支持 && 运算符\n"
+                "单次执行输出总量上限 1MB（stdout+stderr）：超限会终止进程树并返回截断结果；"
+                "可能长时间刷屏的命令请自行收敛输出（重定向到文件、加 head 或限制范围）。\n"
+                "后台模式（run_in_background=true）禁止在命令末尾接 "
+                "| Select-Object -Last、| tail、| head 等缓冲/截断管道："
+                "输出会实时写入任务日志，用户在界面「后台任务」面板实时查看执行过程，"
+                "完成后系统自动取日志尾部汇总，无需自行截尾；"
+                "这类管道（尤其 Select-Object -Last）必须收齐全部输入才开始输出，"
+                "接上去整个运行期日志都只有启动标记一行，用户全程看不到执行进度。"
             ),
             input_schema=_schema({
                 "command": {"type": "string"},
@@ -460,6 +937,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["command"]),
             execute=tools.execute_command,
             activity_description="执行命令",
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="manage_task",
@@ -489,6 +967,7 @@ def build_default_registry() -> ToolRegistry:
             execute=tools.manage_task,
             requires_permission=False,
             activity_description="管理后台任务",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="run_subagent",
@@ -498,6 +977,9 @@ def build_default_registry() -> ToolRegistry:
                 "回合结束后的下一回合自动注入「📦 后台子代理任务结果汇总」；"
                 "回合内可用 manage_task(status/wait, task_id=\"subagent-…\") 主动查询进度或等待终态，"
                 "不要拖延回合空等。"
+                "子代理状态非 completed（failed/timed_out/cancelled）一律视为失败："
+                "读完失败原因与失败工具列表后由主 Agent 用自己的工具兜底完成，"
+                "同一子任务最多重试 1 次且必须改变任务描述（换工具/换方法），禁止原样重试。"
             ),
             input_schema=_schema({
                 "task_description": {"type": "string"},
@@ -522,6 +1004,488 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="启动子 Agent",
+            side_effect_scope="system",  # 表未覆盖：子代理可执行任意工具，副作用范围不可预知（保守归 system）
+        ),
+        # ── MCP 服务配置工具（让 AI 能自己配置/启用/禁用 MCP server）─────
+        ToolSpec(
+            name="mcp_add_server",
+            description=(
+                "新增一个 MCP server 配置并立即重连生效。用于让 AI 帮用户配置 MCP（如 Firecrawl、wigolo 等）。"
+                "会写入 ~/.ycode/mcp.json 并触发重连。若已存在同名 server 会失败，需先调用 mcp_remove_server。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "server 名称（用作工具名前缀，如 'firecrawl'）"},
+                "command": {"type": "string", "description": "启动命令，通常为 'npx'"},
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "命令参数数组，如 ['-y', 'firecrawl-mcp']",
+                },
+                "env": {
+                    "type": "object",
+                    "description": "环境变量字典（可选），如 {\"FIRECRAWL_API_KEY\": \"fc-xxx\"}",
+                },
+                "enabled": {"type": "boolean", "default": True},
+            }, ["name", "command", "args"]),
+            execute=lambda name, command, args, env=None, enabled=True: _mcp_add_server_wrapper(name, command, args, env, enabled),
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="新增 MCP server",
+            side_effect_scope="system",  # 表未覆盖：写 mcp.json 且以任意 command/args 启动外部进程
+        ),
+        ToolSpec(
+            name="mcp_remove_server",
+            description=(
+                "删除一个 MCP server 配置并立即重连生效。"
+                "会从 ~/.ycode/mcp.json 移除该 server 并关闭其子进程。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "要删除的 server 名称"},
+            }, ["name"]),
+            execute=lambda name: _mcp_remove_server_wrapper(name),
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="删除 MCP server",
+            side_effect_scope="system",  # 表未覆盖：关闭外部进程并写 mcp.json
+        ),
+        ToolSpec(
+            name="mcp_set_enabled",
+            description=(
+                "启用或禁用某个 MCP server（写回 mcp.json + 重连）。"
+                "禁用时配置保留，随时可重新启用。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "server 名称"},
+                "enabled": {"type": "boolean", "description": "true=启用, false=禁用"},
+            }, ["name", "enabled"]),
+            execute=lambda name, enabled: _mcp_set_enabled_wrapper(name, enabled),
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="切换 MCP server 开关",
+            side_effect_scope="system",  # 表未覆盖：可能启动外部进程并写 mcp.json
+        ),
+        ToolSpec(
+            name="mcp_list_servers",
+            description=(
+                "列出所有已配置的 MCP server（含 enabled/command/args/env/connected 字段）。"
+                "env 中的 API Key 会做掩码处理（前4位+****+后4位），避免敏感信息泄露。"
+                "用于 AI 在配置前查看现状。"
+            ),
+            input_schema=_schema({}),
+            execute=lambda **kwargs: _mcp_list_servers_wrapper(),
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查看 MCP 服务列表",
+            side_effect_scope="none",  # 表未覆盖：只读查询
+        ),
+        # ── 项目浏览器分辨率（星瑶按项目自设视口）─────────────────────────
+        ToolSpec(
+            name="browser_set_viewport",
+            description=(
+                "设置当前项目的浏览器分辨率（逻辑视口宽×高，单位像素），按项目持久化。"
+                "星瑶做浏览器操作时页面按该分辨率渲染：GUI 内置浏览器以适应窗口缩放呈现，"
+                "外部浏览器作为窗口视口。适配移动端页面用 375×667，桌面页面用 1440×900。"
+                "当前会话未关联项目时无法设置。"
+            ),
+            input_schema=_schema({
+                "width": {"type": "integer", "description": "视口宽度（像素），120-8192"},
+                "height": {"type": "integer", "description": "视口高度（像素），120-8192"},
+            }, ["width", "height"]),
+            execute=lambda width, height: _browser_set_viewport_wrapper(width, height),
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="设置项目浏览器分辨率",
+            side_effect_scope="workspace",
+        ),
+        # ── 工作流执行与创建（设计 待开发/ZCode钩子与工作流导入/设计规格.md §3.4）──
+        ToolSpec(
+            name="workflow_run",
+            description=(
+                "按名称执行一个星瑶工作流（.dwf.ts）：校验 args 后返回转译执行"
+                "指令，随后你在本回合按指令完成各阶段——phase 建计划项、agent 派"
+                "子代理、world.run 走 execute_command 正常审批、report 逐条汇报"
+                "产物。args 必须匹配工作流声明的参数：未声明的参数会被拒绝，"
+                "全部错误一次性列出。先用 workflow_list 查看可用工作流与参数表。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "要执行的工作流名"},
+                "args": {
+                    "type": "object",
+                    "description": "工作流参数（参数名 → 值）；按声明的类型提供，可选参数可省略",
+                },
+            }, ["name"]),
+            execute=_workflow_run_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="执行工作流",
+            side_effect_scope="workspace",
+        ),
+        ToolSpec(
+            name="workflow_save",
+            description=(
+                "创建或更新一个星瑶工作流（.dwf.ts 文件），并把编排任务落成可复用"
+                "的资产：用户在对话里描述「以后都按这个流程做」时用本工具保存，"
+                "之后说「运行工作流 名」即可触发（workflow_run）。\n"
+                "字段：name（字母/数字/点/横线/下划线，1-64 字符）、description、"
+                "script（编排脚本正文，见下）；可选 when_to_use（何时使用）与 args"
+                "（参数声明：每个参数是 {type: string|number|boolean|json, "
+                "description, required, default}）。\n"
+                "scope：project（默认，存 <项目>/.ycode/workflows，随仓库共享）或 "
+                "user（全局 ~/.ycode/workflows）。同名已存在时默认报错；用户明确"
+                "同意覆盖时才传 overwrite=true。\n"
+                "script 是编排脚本：phase(\"阶段名\") 划分阶段（必填）、"
+                "agent(名字).ask<类型>(指令) 派子代理（interface+注释是子代理输出"
+                "契约）、world.run(命令, 参数) 执行命令、report(条目) 汇报产物、"
+                "log(消息) 打进度、files/git 只读查询。保存成功后自动生成同名技能。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "工作流名（即文件名，字母/数字/点/横线/下划线）"},
+                "description": {"type": "string", "description": "一句话描述这个工作流做什么"},
+                "script": {"type": "string", "description": "编排脚本正文（TypeScript 子集，phase/agent/world.run/report）"},
+                "when_to_use": {"type": "string", "description": "可选：何时该用这个工作流"},
+                "args": {
+                    "type": "object",
+                    "description": "可选：参数声明 {参数名: {type, description, required, default}}",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "user"],
+                    "default": "project",
+                    "description": "保存档位：project=当前项目（默认）/ user=全局",
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "同名已存在时是否覆盖；必须先征得用户同意",
+                },
+                "plan": {
+                    "type": "object",
+                    "description": (
+                        "可选但强烈建议：运行计划（确定性解释执行的步骤图），保存后"
+                        "执行时逐步发事件、实时可见。结构：{steps: [{op: "
+                        "phase|agent|command|report|log|parallel|loop|fallback, ...}]}。"
+                        "要点：agent={op:'agent', name, instructions(可含 {变量} 引用), "
+                        "subagent_type?, timeout_seconds?(30..3600), bind?}；"
+                        "command={op:'command', argv:[字面量], timeout_seconds?(1..600), "
+                        "bind?}（绑定 {bind.output}）；report/log 的 value/message 支持 "
+                        "{变量}；loop={max:1..20, while?:条件, steps}；"
+                        "parallel={steps:[单步骤分支]}（≤8）；fallback={steps, fallback}。"
+                        "while 条件只允许比较/and/or/not。不提供 plan 时执行走转译模式。"
+                    ),
+                },
+            }, ["name", "description", "script"]),
+            execute=_workflow_save_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="保存工作流",
+            side_effect_scope="workspace",
+        ),
+        ToolSpec(
+            name="workflow_finish",
+            description=(
+                "工作流执行收尾（台账回写）：一次 workflow_run 执行的全部阶段结束"
+                "后必须调用一次——run_id 见执行指令里的「运行信息」块。ok=是否顺利"
+                "完成（失败传 false），summary=一句话结论或失败原因。未知 run_id 或"
+                "重复调用会被静默接受，不会报错，不要因此重试。"
+            ),
+            input_schema=_schema({
+                "run_id": {"type": "string", "description": "执行指令运行信息块里的 run_id"},
+                "ok": {"type": "boolean", "default": True, "description": "是否顺利完成"},
+                "summary": {"type": "string", "default": "", "description": "一句话结论或失败原因"},
+            }, ["run_id"]),
+            execute=_workflow_finish_wrapper,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="工作流收尾",
+            side_effect_scope="none",  # 表未覆盖：仅运行台账回写，无工作区副作用
+        ),
+        # ── 星轨自动化工具（对话里创建/修改/删除/立即执行定时任务）───────
+        ToolSpec(
+            name="automation_create",
+            description=(
+                "创建一个星轨自动化任务（定时在某个会话里自动执行一段提示词）。"
+                "用户说「每天/每周/每隔多久执行某任务」时用本工具创建。\n"
+                "触发器参数形态（trigger_type）：\n"
+                "1) interval=每隔固定分钟数：必须传 interval_minutes（整数分钟，1..10080，即最多 7 天）；\n"
+                "2) daily=每天定点：必须传 time（零填充 24 小时制 HH:MM，例如 09:05、20:00）；\n"
+                "3) weekly=每周若干天定点：必须传 time 与 weekdays（整数数组，1=周一、2=周二、"
+                "3=周三、4=周四、5=周五、6=周六、7=周日，例如 [1,5] 表示周一和周五）；\n"
+                "4) startup=应用启动时执行一次：不需要任何触发器参数；\n"
+                "5) once=只触发一次：必须传 delay_minutes（距现在多少分钟后，整数分钟 "
+                "1..10080）。用户说「X 分钟后/小时后」「明早 9 点跑一次」这类一次性诉求全用 "
+                "once + delay_minutes——你并不知道当前确切时间，绝不能自行换算成绝对时刻；"
+                "换算被拒绝时错误信息会带上当前时刻，据此重算 delay_minutes 再试一次。\n"
+                "permission_mode：无人值守权限档位，只能是 confirm（默认，需要确认）或 "
+                "accept_edits（自动接受文件编辑）；plan/full 等更高档位不允许在对话里设置，"
+                "需要时请让用户在 GUI 星轨自动化面板里手动设置。\n"
+                "target_session 省略时默认使用当前对话所属会话。\n"
+                "max_runs：有限次任务——传 N（整数 ≥1）表示共执行 N 次后任务自动完成，"
+                "手动立即执行不计入次数；省略 = 不限次（按触发器一直重复）。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "任务名称（不超过 50 字）"},
+                "prompt": {"type": "string", "description": "触发的每个回合要执行的提示词"},
+                "trigger_type": {
+                    "type": "string",
+                    "enum": ["interval", "daily", "weekly", "startup", "once"],
+                    "description": "触发器类型：interval/daily/weekly/startup/once",
+                },
+                "interval_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080,
+                    "description": "interval 触发器：间隔分钟数（1..10080）",
+                },
+                "delay_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080,
+                    "description": (
+                        "once 触发器：距现在多少分钟后触发一次（1..10080）；"
+                        "相对时间一律用它，不要自行换算绝对时刻"
+                    ),
+                },
+                "time": {
+                    "type": "string",
+                    "description": "daily/weekly 触发器：零填充 24 小时制 HH:MM，如 09:05、20:00",
+                },
+                "weekdays": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                    "description": "weekly 触发器：星期数组，1=周一 … 7=周日，如 [1,5] 表示周一、周五",
+                },
+                "target_session": {
+                    "type": "string",
+                    "description": "任务运行的目标会话名；省略时默认当前会话",
+                },
+                "permission_mode": {
+                    "type": "string",
+                    "enum": ["confirm", "accept_edits"],
+                    "default": "confirm",
+                    "description": "无人值守权限档位，仅支持 confirm / accept_edits",
+                },
+                "missed_run_policy": {
+                    "type": "string",
+                    "enum": ["skip", "run_once"],
+                    "default": "skip",
+                    "description": "应用未运行而错过触发时的策略：skip=跳过（默认）/ run_once=补跑一次",
+                },
+                "notify_on_success": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "任务成功完成后是否通知用户，默认 false",
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "可选，任务运行的工作目录；留空则跟随目标会话",
+                },
+                "model_id": {
+                    "type": "string",
+                    "description": "可选，指定模型 id；留空跟随会话绑定/全局默认",
+                },
+                "max_runs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "可选，最多执行多少次：共执行 N 次后任务自动完成，"
+                        "手动立即执行不计入；省略 = 不限次"
+                    ),
+                },
+            }, ["name", "prompt", "trigger_type"]),
+            execute=_automation_create_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="创建星轨自动化任务",
+            side_effect_scope="workspace",
+        ),
+        ToolSpec(
+            name="automation_update",
+            description=(
+                "修改一个已存在的星轨自动化任务：只传需要改的字段，其余字段保持原值。"
+                "可改 name/prompt/触发器（trigger_type 及 interval_minutes/time/weekdays）、"
+                "target_session/permission_mode/missed_run_policy/notify_on_success/workdir/model_id，"
+                "并可用 enabled=true/false 启用或停用任务。\n"
+                "触发器参数形态同 automation_create：interval 需 interval_minutes（1..10080）；"
+                "daily 需 time（零填充 HH:MM）；weekly 需 time 与 weekdays（1=周一 … 7=周日）；"
+                "startup 无参数。只传 time/weekdays 时会沿用任务原有的触发器类型。\n"
+                "permission_mode：无人值守权限档位只能是 confirm 或 accept_edits，"
+                "plan/full 等更高档位请在 GUI 星轨自动化面板里手动设置。"
+            ),
+            input_schema=_schema({
+                "task_id": {"type": "string", "description": "要修改的任务 id"},
+                "name": {"type": "string", "description": "新的任务名称"},
+                "prompt": {"type": "string", "description": "新的提示词"},
+                "trigger_type": {
+                    "type": "string",
+                    "enum": ["interval", "daily", "weekly", "startup"],
+                    "description": "新的触发器类型",
+                },
+                "interval_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080,
+                    "description": "interval 触发器：间隔分钟数（1..10080）",
+                },
+                "time": {
+                    "type": "string",
+                    "description": "daily/weekly 触发器：零填充 24 小时制 HH:MM",
+                },
+                "weekdays": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                    "description": "weekly 触发器：星期数组，1=周一 … 7=周日",
+                },
+                "target_session": {"type": "string", "description": "新的目标会话名"},
+                "permission_mode": {
+                    "type": "string",
+                    "enum": ["confirm", "accept_edits"],
+                    "description": "无人值守权限档位，仅支持 confirm / accept_edits",
+                },
+                "missed_run_policy": {
+                    "type": "string",
+                    "enum": ["skip", "run_once"],
+                    "description": "错过触发的处理策略",
+                },
+                "notify_on_success": {
+                    "type": "boolean",
+                    "description": "成功完成后是否通知用户",
+                },
+                "workdir": {"type": "string", "description": "新的工作目录；传空字符串表示跟随目标会话"},
+                "model_id": {"type": "string", "description": "新的模型 id；传空字符串表示跟随默认"},
+                "enabled": {"type": "boolean", "description": "true=启用，false=停用该任务"},
+            }, ["task_id"]),
+            execute=_automation_update_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="修改星轨自动化任务",
+            side_effect_scope="workspace",
+        ),
+        ToolSpec(
+            name="automation_delete",
+            description=(
+                "删除一个星轨自动化任务（连同它的运行记录）。"
+                "删除前应先用 automation_list 确认 task_id 与任务名称。"
+            ),
+            input_schema=_schema({
+                "task_id": {"type": "string", "description": "要删除的任务 id"},
+            }, ["task_id"]),
+            execute=_automation_delete_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="删除星轨自动化任务",
+            side_effect_scope="workspace",
+        ),
+        ToolSpec(
+            name="automation_run_now",
+            description=(
+                "立即手动执行一次某个星轨自动化任务（不影响它原有的定时计划）。"
+                "任务上一次运行尚未结束时会被拒绝。"
+            ),
+            input_schema=_schema({
+                "task_id": {"type": "string", "description": "要立即执行的任务 id"},
+            }, ["task_id"]),
+            execute=_automation_run_now_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="立即执行星轨自动化任务",
+            side_effect_scope="workspace",
+        ),
+        # 秘书调度台（设计 2026-10-15 第 4/5 节）：仅秘书会话可见；派活/跳转会
+        # 改动别的会话与界面视图，按保守口径归 system。
+        ToolSpec(
+            name="dispatch_task",
+            description=(
+                "把任务派给指定会话执行（秘书专用）：等价于用户在那个会话亲手发一条"
+                "消息——内容以用户消息落库、界面正常显示、触发一轮真实执行，目标会话忙"
+                "则排队。target 传会话名/显示名，或留空并给 workdir 以新建会话。调用前"
+                "先向用户确认要派给哪个会话以及任务内容；派出去就可能真实改文件。"
+                "返回 JSON 字符串（含 target_session / state）。"
+            ),
+            input_schema=_schema({
+                "target": {"type": "string", "default": "", "description": "目标会话名或显示名；留空或填「新会话」表示新建会话"},
+                "prompt": {"type": "string", "description": "任务正文（必填），会作为用户消息投递给目标会话"},
+                "workdir": {"type": "string", "default": "", "description": "仅新建会话时生效：新会话归属的项目目录"},
+                "model_id": {"type": "string", "default": "", "description": "可选，指定目标使用的模型；留空沿用会话默认"},
+                "permission_mode": {"type": "string", "default": "", "description": "可选，指定目标会话的权限档位；留空沿用会话自身档位"},
+            }, ["prompt"]),
+            execute=tools.dispatch_task,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="派发任务给会话",
+            side_effect_scope="system",  # 表未覆盖：会向其它会话投递消息并触发真实执行
+        ),
+        ToolSpec(
+            name="dispatch_batch",
+            description=(
+                "一次派出多条任务并声明批次内依赖（秘书专用，升级设计 2026-11-04 第 6.1 节）："
+                "tasks 每项含 title / prompt / target / workdir / depends_on，depends_on 填"
+                "同批次其它任务的**下标**（从 0 开始）。无依赖项立刻并行派发；有依赖项先挂起，"
+                "等上游全部完成后自动启动，不必再催。单批最多 8 条；下标越界 / 指向自身 / "
+                "成环会被直接拒绝。用户一句话交代多个有先后关系的小任务时优先用它。"
+                "返回 JSON 字符串（含 batch_id 与每项 state）。"
+            ),
+            input_schema=_schema({
+                "tasks": {
+                    "type": "array",
+                    "description": "任务数组（1..8 条）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "default": "", "description": "任务标题（可选，缺省取 prompt 前 40 字）"},
+                            "prompt": {"type": "string", "description": "任务正文（必填），会作为用户消息投递给目标会话"},
+                            "target": {"type": "string", "default": "", "description": "目标会话名或显示名；留空或填「新会话」表示新建会话"},
+                            "workdir": {"type": "string", "default": "", "description": "仅新建会话时生效：新会话归属的项目目录"},
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "同批次内上游任务的下标（从 0 开始）；留空表示无依赖，可立即派发",
+                            },
+                        },
+                        "required": ["prompt"],
+                    },
+                },
+            }, ["tasks"]),
+            execute=tools.dispatch_batch,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="批量派发任务",
+            side_effect_scope="system",  # 与 dispatch_task 同口径：向多个会话投递消息并触发真实执行
+        ),
+        ToolSpec(
+            name="open_session",
+            description=(
+                "把用户带到某个历史会话（秘书专用）：纯系统层切换，界面直接切过去，"
+                "不打断目标会话正在执行的回合。target 传会话名 / 显示名 / 关键词；"
+                "命中多条时要先问清是哪一条。返回 JSON 字符串。"
+            ),
+            input_schema=_schema({
+                "target": {"type": "string", "description": "会话名、显示名或关键词（必填）"},
+            }, ["target"]),
+            execute=tools.open_session,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="跳转到会话",
+            side_effect_scope="system",  # 表未覆盖：切换当前会话与界面视图
+        ),
+        ToolSpec(
+            name="create_project",
+            description=(
+                "新建项目文件夹并引入为工作区（秘书专用）：等价于用户点侧栏「添加/"
+                "引入项目文件夹」选中该目录——目录不存在则逐级创建，已存在则直接"
+                "复用，随后侧栏出现该项目分组，之后可用 dispatch_task 的 workdir "
+                "参数在里面建会话干活。path 必须是完整绝对路径（如 D:\\\\work\\\\demo），"
+                "不接受相对路径或只给文件夹名；调用前先向用户问清要建在哪，不要自己"
+                "猜位置。返回 JSON 字符串（含 workdir / created）。"
+            ),
+            input_schema=_schema({
+                "path": {"type": "string", "description": "项目文件夹的完整路径（必填，如 D:\\\\work\\\\demo；不存在会自动创建）"},
+            }, ["path"]),
+            execute=tools.create_project,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="新建并引入项目文件夹",
+            side_effect_scope="system",  # 表未覆盖：创建磁盘目录、登记工作区并改变侧栏分组
         ),
         # ── MCP 服务配置工具（让 AI 能自己配置/启用/禁用 MCP server）─────
         ToolSpec(
@@ -593,7 +1557,29 @@ def build_default_registry() -> ToolRegistry:
             activity_description="查看 MCP 服务列表",
         ),
     ]
-    registry = ToolRegistry([*read_specs, *mutating_specs])
+
+    # ── 管理类工具（21 个）─────────────────────────────────────────────
+    # 会话 / 模型 / 技能插件 hook / 运维系统设置 / 外观人设 / 集成 / 交互面板。
+    # 各模块 build_specs() 返回的就是可直接注册的 ToolSpec（含 execute 可调用
+    # 对象与 side_effect_scope 元数据），此处仅按来源分组拼接。
+    admin_specs = [
+        # 会话与上下文管理（1）
+        *tools_admin_session.build_specs(),
+        # 模型与供应商管理（1）
+        *tools_admin_model.build_specs(),
+        # 技能 / 插件 / hook 管理（3）
+        *tools_admin_skill.build_specs(),
+        # 运维与诊断：用量、导出、更新、系统设置、架构图、体检（6）
+        *tools_admin_ops.build_specs(),
+        # 外观与人设：主题、人格设定（2）
+        *tools_admin_look.build_specs(),
+        # 集成与协作：飞书、局域网、决策记录（3）
+        *tools_admin_integration.build_specs(),
+        # 交互面板：pty、浏览器面板、截图、剪贴板、电脑操控（5）
+        *tools_admin_interaction.build_specs(),
+    ]
+
+    registry = ToolRegistry([*read_specs, *mutating_specs, *admin_specs])
     # 加载进程内插件（plugins/ 与 ~/.ycode/plugins/）。插件加载全程隔离，
     # 任何失败只记录日志，绝不影响内置工具的可用性。
     try:
@@ -601,7 +1587,45 @@ def build_default_registry() -> ToolRegistry:
         plugin_loader.load_and_register(registry)
     except Exception:
         pass
+    # CLI 轻量档位：剔除 GUI 专属工具（见 CLI_EXCLUDED_TOOLS 说明）。
+    # 放在插件加载之后，避免插件重新注册同名工具又把它们带回来。
+    if _resolve_tool_profile(profile) == "cli":
+        removed = 0
+        for _name in sorted(CLI_EXCLUDED_TOOLS):
+            try:
+                registry.unregister(_name)
+            except KeyError:
+                continue
+            removed += 1
+        if removed:
+            _LOGGER.debug("CLI 轻量档位已剔除 %d 个 GUI 专属工具", removed)
+    _apply_managed_tool_filter(registry)
     return registry
+
+
+def _apply_managed_tool_filter(registry: ToolRegistry) -> None:
+    """受管策略 ``disabled_tools``：注册（含插件加载）完成后过滤禁用工具。
+
+    无策略/无禁用项时不做任何事（零行为变化）；管理端未列出的工具照常可用。
+    禁用了本发行版未安装的工具名时静默忽略（管理文件可能面向多版本分发）。
+    """
+    try:
+        from core.managed_policy import disabled_tool_names, load_managed_policy
+
+        disabled = disabled_tool_names(load_managed_policy())
+    except Exception:
+        return
+    if not disabled:
+        return
+    removed: list[str] = []
+    for name in disabled:
+        try:
+            registry.unregister(name)
+        except KeyError:
+            continue
+        removed.append(name)
+    if removed:
+        _LOGGER.warning("受管策略已禁用工具: %s", ", ".join(sorted(removed)))
 
 
 # ── MCP 配置工具的执行包装函数 ──────────────────────────────────────
@@ -626,3 +1650,773 @@ def _mcp_set_enabled_wrapper(name, enabled):
 def _mcp_list_servers_wrapper():
     from core.mcp_client import mcp_manager
     return ToolResult(content=mcp_manager.list_servers(), is_error=False)
+
+
+# ── 项目浏览器分辨率工具的执行包装函数 ──────────────────────────────
+def _browser_set_viewport_wrapper(width, height):
+    from core.computer.models import ComputerControlError
+    from core.computer.settings import set_project_browser_viewport
+    from core.workspace_context import get_workdir
+
+    workdir = get_workdir()
+    try:
+        viewport = set_project_browser_viewport(workdir, width, height)
+    except ComputerControlError as error:
+        return ToolResult(content=f"{error.code}: {error.message}", is_error=True)
+    except Exception as error:
+        return ToolResult(content=f"browser_set_viewport 执行失败：{error}", is_error=True)
+    return ToolResult(
+        content=(
+            f"已设置当前项目的浏览器分辨率：{viewport[0]}×{viewport[1]}"
+            "（逻辑像素，按项目持久化）。GUI 内置浏览器已即时按适应窗口缩放"
+            "呈现该分辨率；之后的浏览器自动化也会使用该视口。"
+        ),
+        is_error=False,
+    )
+
+
+# ── 星轨自动化（automation_*）工具的执行包装函数 ──────────────────────
+#
+# 全部经 core.automation.service 句柄访问桥侧能力：工具层不读写数据库、不
+# 发事件、不唤醒引擎；CLI/headless 未注册句柄时统一提示能力不可用。
+_AUTOMATION_SERVICE_UNAVAILABLE = "星轨自动化仅在 GUI 运行期间可用（当前为 CLI/headless）"
+# 无人值守权限档位：对话创建的星轨自动化任务只允许 confirm / accept_edits，
+# 更高档位必须由用户在 GUI 星轨自动化面板里手动设置（design：无人值守安全边界）。
+_AUTOMATION_ALLOWED_PERMISSION_MODES = ("confirm", "accept_edits")
+_AUTOMATION_PERMISSION_MODE_MESSAGE = (
+    "无人值守权限档位只支持 confirm 或 accept_edits；"
+    "需要更高档位请在 GUI 星轨自动化面板里手动设置"
+)
+
+
+def _automation_service_or_error():
+    """取服务句柄；未注册（CLI/headless）时返回 (None, 错误结果)。"""
+    from core.automation import service as automation_service
+
+    svc = automation_service.get()
+    if svc is None:
+        return None, ToolResult(
+            content=_AUTOMATION_SERVICE_UNAVAILABLE, is_error=True
+        )
+    return svc, None
+
+
+def _automation_permission_mode_error(permission_mode):
+    """校验无人值守权限档位；非法（plan/full/未知）时返回错误结果。"""
+    if permission_mode is None:
+        return None
+    mode = str(permission_mode).strip()
+    if not mode:
+        return None
+    if mode not in _AUTOMATION_ALLOWED_PERMISSION_MODES:
+        return ToolResult(
+            content=_AUTOMATION_PERMISSION_MODE_MESSAGE, is_error=True
+        )
+    return None
+
+
+def _automation_bridge_error_text(resp) -> str:
+    """把桥侧返回值里的 errors/msg 拼成人类可读文本。"""
+    if isinstance(resp, dict):
+        errors = resp.get("errors")
+        if isinstance(errors, (list, tuple)) and errors:
+            return "；".join(str(item) for item in errors)
+        msg = resp.get("msg")
+        if msg:
+            return str(msg)
+        if resp.get("ok"):
+            return ""
+    if resp is None:
+        return "自动化服务未返回结果"
+    return str(resp)
+
+
+def _automation_build_trigger_config(
+    trigger_type, interval_minutes, time, weekdays, delay_minutes=None
+):
+    """按触发器类型组装 trigger_config；返回 (config, 错误文本)。
+
+    只做「参数是否齐备」的检查，取值范围/格式由桥侧 validate_task 兜底并原样
+    透出错误，避免 core 层出现两套校验。例外：once 触发器在对话内只收相对延迟
+    ``delay_minutes``，绝对时刻 ``run_at`` 由本层用服务端真实时钟换算，模型不得
+    自算（设计规格 3.1 的 ZCode 1.4-2 移植）。
+    """
+    trigger_type = str(trigger_type or "").strip()
+    if trigger_type == "interval":
+        if interval_minutes is None:
+            return None, "interval 触发器必须提供 interval_minutes（整数分钟，1..10080）"
+        return {"interval_minutes": interval_minutes}, None
+    if trigger_type == "daily":
+        if time is None:
+            return None, "daily 触发器必须提供 time（零填充 24 小时制 HH:MM，如 09:05）"
+        return {"time": time}, None
+    if trigger_type == "weekly":
+        if time is None or weekdays is None:
+            return (
+                None,
+                "weekly 触发器必须同时提供 time（HH:MM）与 weekdays（1=周一 … 7=周日）",
+            )
+        return {"time": time, "weekdays": weekdays}, None
+    if trigger_type == "startup":
+        return {}, None
+    if trigger_type == "once":
+        from datetime import datetime
+        from time import time as _wall_clock
+
+        from core.automation.scheduling import MAX_INTERVAL_MINUTES, RUN_AT_FORMAT
+
+        if delay_minutes is None:
+            return (
+                None,
+                "once 触发器在对话里只接受 delay_minutes（距现在多少分钟后触发一次，"
+                f"整数分钟 1..{MAX_INTERVAL_MINUTES}）。不要自行换算绝对时刻："
+                f"现在是 {datetime.now().strftime('%H:%M')}，请按「距现在多少分钟」"
+                "重新调用一次。",
+            )
+        if (
+            isinstance(delay_minutes, bool)
+            or not isinstance(delay_minutes, int)
+            or not 1 <= delay_minutes <= MAX_INTERVAL_MINUTES
+        ):
+            return (
+                None,
+                f"once 触发器的 delay_minutes 必须是 1..{MAX_INTERVAL_MINUTES} 的整数分钟。",
+            )
+        fire_at = datetime.fromtimestamp(
+            _wall_clock() + delay_minutes * 60
+        ).strftime(RUN_AT_FORMAT)
+        return {"run_at": fire_at}, None
+    return (
+        None,
+        f"未知触发器类型: {trigger_type!r}（可用：interval / daily / weekly / startup / once）",
+    )
+
+
+def _automation_trigger_summary(task: dict) -> str:
+    """取/算任务的触发器摘要（DTO 可能已带 trigger_summary）。"""
+    summary = task.get("trigger_summary")
+    if summary:
+        return str(summary)
+    try:
+        from core.automation.models import trigger_summary as _summarize
+
+        return _summarize(task.get("trigger_type"), task.get("trigger_config") or {})
+    except Exception:
+        return str(task.get("trigger_type") or "未知触发器")
+
+
+def _automation_format_ts(value) -> str:
+    if value in (None, ""):
+        return "未计划"
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
+def _automation_run_count_text(task: dict) -> str:
+    """次数文案：已执行 N/M 次（有限次）/ 已执行 N 次（不限次）。"""
+    count = int(task.get("scheduled_run_count") or 0)
+    max_runs = task.get("max_runs")
+    if isinstance(max_runs, bool) or not isinstance(max_runs, int):
+        return f"已执行 {count} 次"
+    return f"已执行 {count}/{max_runs} 次"
+
+
+def _automation_task_line(task: dict) -> str:
+    enabled = "启用" if task.get("enabled") else "停用"
+    status = "已完成" if str(task.get("status") or "") == "completed" else "进行中"
+    return (
+        f"- {task.get('name')}｜id={task.get('id')}｜{enabled}"
+        f"｜{_automation_trigger_summary(task)}"
+        f"｜状态={status}｜{_automation_run_count_text(task)}"
+        f"｜下次触发={_automation_format_ts(task.get('next_run_at'))}"
+        f"｜上次运行={_automation_format_ts(task.get('last_run_at'))}"
+        f"｜目标会话={task.get('target_session')}"
+        f"｜权限档位={task.get('permission_mode')}"
+    )
+
+
+def _automation_run_line(run: dict) -> str:
+    return (
+        f"- {run.get('id')}｜状态={run.get('status')}"
+        f"｜触发方式={run.get('trigger_kind')}"
+        f"｜开始={run.get('started_at') or run.get('queued_at')}"
+        f"｜结束={run.get('finished_at')}"
+        + (f"｜错误={run.get('error')}" if run.get("error") else "")
+    )
+
+
+# ── 工作流工具 wrapper（ZCode 导入，core/workflows）──────────────────
+
+
+def _workflow_workspace_root():
+    """项目档目录锚点：会话线程工作目录（GUI 多会话并行时进程 cwd 不可信）。"""
+    try:
+        from core.workspace_context import get_workdir
+
+        return str(get_workdir())
+    except Exception:
+        return None
+
+
+def _workflow_args_summary(args: dict) -> str:
+    if not args:
+        return "无参数"
+    return ", ".join(
+        f"{arg_name}:{decl.get('type', 'json')}{'*' if decl.get('required') else ''}"
+        for arg_name, decl in args.items()
+    )
+
+
+def _workflow_list_wrapper(name=None, **_ignored):
+    from core.workflows import store as workflow_store
+
+    root = _workflow_workspace_root()
+    name = str(name or "").strip()
+    if name:
+        try:
+            entry = workflow_store.get_workflow(name, root)
+        except LookupError as exc:
+            return ToolResult(content=f"查看工作流失败：{exc}", is_error=True)
+        lines = [f"工作流「{entry['name']}」（{entry['scope']} 档）", f"描述：{entry['description']}"]
+        if entry.get("when_to_use"):
+            lines.append(f"适用场景：{entry['when_to_use']}")
+        lines.append(f"参数：{_workflow_args_summary(entry.get('args') or {})}")
+        lines.append(f"来源文件：{entry['path']}")
+        body = (entry.get("body") or "").strip()
+        if body:
+            preview = body if len(body) <= 4000 else body[:4000] + "\n…（超长截断，完整内容见来源文件）"
+            lines.append(f"脚本原文：\n```typescript\n{preview}\n```")
+        return ToolResult(content="\n".join(lines))
+
+    data = workflow_store.list_workflows(root)
+    workflows, invalid = data["workflows"], data["invalid"]
+    if not workflows and not invalid:
+        return ToolResult(
+            content=(
+                "当前没有任何工作流。可以在对话里让我创建（描述流程后我会用 "
+                "workflow_save 保存），或把 .dwf.ts 工作流文件放进 "
+                "~/.ycode/workflows（全局）或 <项目>/.ycode/workflows（项目档）。"
+            )
+        )
+    lines = ["已导入的工作流："]
+    for entry in workflows:
+        lines.append(
+            f"- {entry['name']}（{entry['scope']} 档）：{entry['description']}"
+            f" [{_workflow_args_summary(entry.get('args') or {})}]"
+        )
+    if invalid:
+        lines.append("")
+        lines.append("解析失败（不参与执行，可修复或删除）：")
+        for bad in invalid:
+            lines.append(f"- {bad['name']}（{bad['scope']} 档）：{bad['error']}")
+    return ToolResult(content="\n".join(lines))
+
+def _workflow_run_wrapper(*, name, args=None, **_ignored):
+    from core.workflows import store as workflow_store
+    from core.workflows.args import validate_workflow_args
+    from core.workflows.frontmatter import ParsedWorkflow
+    from core.workflows.prompt import build_execution_directive
+
+    name = str(name or "").strip()
+    if not name:
+        return ToolResult(content="workflow_run 需要 name 参数（工作流名）", is_error=True)
+    root = _workflow_workspace_root()
+    try:
+        entry = workflow_store.get_workflow(name, root)
+    except LookupError as exc:
+        available = ", ".join(
+            item["name"] for item in workflow_store.list_workflows(root)["workflows"]
+        ) or "（无）"
+        return ToolResult(
+            content=f"执行工作流失败：{exc}。可用工作流：{available}", is_error=True
+        )
+    if args is not None and not isinstance(args, dict):
+        return ToolResult(content="args 必须是对象（参数名 → 值）", is_error=True)
+    errors, effective = validate_workflow_args(entry.get("args") or {}, args)
+    if errors:
+        return ToolResult(
+            content="工作流参数校验未通过（一次性列出全部问题）：\n- "
+            + "\n- ".join(errors),
+            is_error=True,
+        )
+    parsed = ParsedWorkflow(
+        description=entry["description"],
+        when_to_use=entry.get("when_to_use", ""),
+        args=entry.get("args") or {},
+        body=entry.get("body") or "",
+    )
+    # 运行台账（best-effort）：登记 running 记录拿 run_id，产物目录随 run 命名；
+    # 台账不可用（CLI/headless 未注入）时照常执行，只是无运行记录与收尾要求
+    run = None
+    try:
+        from pathlib import Path as _Path
+
+        from core.workflows.runs import get_run_storage
+
+        storage = get_run_storage()
+        if storage is not None:
+            session = ""
+            try:
+                from core import app_context
+
+                session = str(app_context.get_thread_session() or "")
+            except Exception:
+                session = ""
+            run = storage.create_run(
+                entry["name"],
+                scope=entry.get("scope", ""),
+                session_name=session,
+                args=effective,
+                artifact_dir=str(
+                    _Path(root or _Path.cwd()) / ".ycode" / "workflow-artifacts" / ""
+                ).replace("\\", "/"),
+            )
+            run["artifact_dir"] = run["artifact_dir"].rstrip("/") + "/" + run["id"]
+    except Exception:
+        run = None
+
+    # 有合法 plan 边车 → 确定性解释执行（每步发事件，实时可见）；
+    # 没有 → 回退转译执行（模型照契约在回合内演）
+    plan = entry.get("plan")
+    if isinstance(plan, dict) and not plan.get("__invalid__"):
+        from core.workflows.executor import execute_plan
+        from core.workflows.runs import get_cancel_provider, publish_run_event
+
+        permission_mode = "confirm"
+        try:
+            from core import app_context
+
+            permission_mode = app_context.get_permission_mode()
+        except Exception:
+            permission_mode = "confirm"
+        cancel_event = None
+        try:
+            provider = get_cancel_provider()
+            if provider is not None:
+                cancel_event = provider()
+        except Exception:
+            cancel_event = None
+        summary = execute_plan(
+            plan,
+            run_id=(run or {}).get("id", ""),
+            publish=lambda kind, payload, _rid=(run or {}).get("id", ""): publish_run_event(
+                _rid, kind, payload
+            ),
+            cancel_event=cancel_event,
+            permission_mode=permission_mode,
+            initial_scope=effective,
+        )
+        if run is not None:
+            try:
+                from core.workflows.runs import get_run_storage as _grs
+
+                _grs().finish_run(
+                    run["id"], "completed" if summary["ok"] else "failed", summary["summary"]
+                )
+            except Exception:
+                pass
+        lines = [f"工作流「{entry['name']}」解释执行结束：{summary['summary']}"]
+        if summary.get("reports"):
+            lines.append("工作流产物：")
+            lines.extend(f"- {item}" for item in summary["reports"])
+        if not summary["ok"]:
+            lines.append("如需命令步骤生效，请切到 accept_edits/full 权限档后重跑。")
+        return ToolResult(content="\n".join(lines))
+
+    return ToolResult(
+        content=build_execution_directive(entry["name"], parsed, effective, run=run)
+    )
+
+
+def _workflow_finish_wrapper(*, run_id, ok=None, summary="", **_ignored):
+    """运行台账收尾：只在 run 仍为 running 时生效，未知/重复调用静默接受。"""
+    from core.workflows.runs import get_run_storage
+
+    storage = get_run_storage()
+    if storage is None:
+        return ToolResult(content="运行台账不可用，无需收尾（执行结果以对话内容为准）")
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return ToolResult(content="workflow_finish 需要 run_id 参数", is_error=True)
+    status = "failed" if ok is False else "completed"
+    try:
+        updated = storage.finish_run(run_id, status, str(summary or ""))
+    except ValueError as exc:
+        return ToolResult(content=f"收尾失败：{exc}", is_error=True)
+    if updated:
+        return ToolResult(content=f"运行 {run_id} 已记录为 {status}")
+    # 未知 run_id 或已终态：幂等接受，不让模型卡在收尾上
+    return ToolResult(content=f"运行 {run_id} 无需收尾（不存在或已结束）")
+
+
+def _workflow_save_wrapper(
+    *,
+    name,
+    description,
+    script,
+    when_to_use=None,
+    args=None,
+    scope=None,
+    overwrite=None,
+    plan=None,
+    **_ignored,
+):
+    from core.workflows.store import save_workflow
+
+    workflow_name = str(name or "").strip()
+    if not workflow_name:
+        return ToolResult(content="workflow_save 需要 name 参数（工作流名）", is_error=True)
+    root = _workflow_workspace_root()
+    error = save_workflow(
+        workflow_name,
+        description=str(description or ""),
+        when_to_use=str(when_to_use or ""),
+        args=args if isinstance(args, dict) else {},
+        body=str(script or ""),
+        scope=str(scope or "project").strip(),
+        workspace_root=root,
+        overwrite=bool(overwrite),
+        plan=plan if isinstance(plan, dict) else None,
+    )
+    if error:
+        return ToolResult(content=f"保存工作流失败：{error}", is_error=True)
+    has_plan = isinstance(plan, dict)
+    return ToolResult(
+        content=(
+            f"已保存工作流「{workflow_name}」（{scope or 'project'} 档），"
+            "并生成同名技能；"
+            + (
+                "运行计划已随存，执行时走确定性解释器逐步发事件。"
+                if has_plan
+                else "未提供 plan，执行时将走转译模式。"
+            )
+            + f"对话里说「运行工作流 {workflow_name}」或调 workflow_run 即可执行。"
+        )
+    )
+
+
+def _automation_list_wrapper(task_id=None, **_ignored):
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if task_id:
+        task = svc.get_task(task_id)
+        if not isinstance(task, dict):
+            return ToolResult(content=f"未找到星轨自动化任务：{task_id}", is_error=True)
+        lines = [f"星轨自动化任务详情：{task.get('name')}", _automation_task_line(task)]
+        if task.get("prompt"):
+            lines.append(f"提示词：{task.get('prompt')}")
+        runs_resp = svc.get_runs(task_id, 10)
+        if isinstance(runs_resp, dict) and runs_resp.get("ok"):
+            runs = runs_resp.get("runs") or []
+            lines.append(f"最近运行记录（最多 10 条，共 {len(runs)} 条）：")
+            if runs:
+                lines.extend(_automation_run_line(run) for run in runs)
+            else:
+                lines.append("（暂无运行记录）")
+        else:
+            lines.append(
+                f"读取运行记录失败：{_automation_bridge_error_text(runs_resp)}"
+            )
+        return ToolResult(content="\n".join(lines))
+
+    resp = svc.list_tasks()
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"读取星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    tasks = resp.get("tasks") or []
+    if not tasks:
+        return ToolResult(content="当前没有任何星轨自动化任务。")
+    lines = [f"共 {len(tasks)} 个星轨自动化任务："]
+    lines.extend(_automation_task_line(task) for task in tasks)
+    return ToolResult(content="\n".join(lines))
+
+
+def _automation_create_wrapper(
+    *,
+    name,
+    prompt,
+    trigger_type,
+    interval_minutes=None,
+    delay_minutes=None,
+    time=None,
+    weekdays=None,
+    target_session=None,
+    permission_mode=None,
+    missed_run_policy=None,
+    notify_on_success=None,
+    workdir=None,
+    model_id=None,
+    max_runs=None,
+    **_ignored,
+):
+    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
+    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
+    if automation_tool_policy.automation_write_denied():
+        return ToolResult(
+            content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,
+            is_error=True,
+        )
+
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    perm_err = _automation_permission_mode_error(permission_mode)
+    if perm_err is not None:
+        return perm_err
+
+    # 最多执行次数：省略 = 不限次；给出则必须是 ≥1 的整数（bool 不算整数）
+    if max_runs is not None and (
+        isinstance(max_runs, bool) or not isinstance(max_runs, int) or max_runs < 1
+    ):
+        return ToolResult(
+            content=(
+                "max_runs（最多执行次数）必须是 ≥1 的整数，"
+                "例如 3 表示共执行 3 次后任务自动完成；省略表示不限次。"
+            ),
+            is_error=True,
+        )
+
+    config, config_err = _automation_build_trigger_config(
+        trigger_type, interval_minutes, time, weekdays, delay_minutes
+    )
+    if config_err:
+        return ToolResult(content=config_err, is_error=True)
+
+    session = str(target_session).strip() if target_session else ""
+    if not session:
+        from core import app_context
+
+        session = str(app_context.get_thread_session() or "").strip()
+    if not session:
+        return ToolResult(
+            content=(
+                "未指定 target_session，且当前回合没有绑定会话；"
+                "请显式指定要运行该任务的会话名（target_session）。"
+            ),
+            is_error=True,
+        )
+
+    task = {
+        "name": name,
+        "prompt": prompt,
+        "trigger_type": str(trigger_type or "").strip(),
+        "trigger_config": config,
+        "target_session": session,
+        "permission_mode": str(permission_mode).strip() if permission_mode else "confirm",
+        "missed_run_policy": (
+            str(missed_run_policy).strip() if missed_run_policy else "skip"
+        ),
+        "notify_on_success": bool(notify_on_success),
+        "enabled": True,
+    }
+    if workdir is not None:
+        task["workdir"] = str(workdir).strip()
+    if model_id is not None:
+        task["model_id"] = str(model_id).strip()
+    if max_runs is not None:
+        task["max_runs"] = int(max_runs)
+
+    resp = svc.save_task(task)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"创建星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    task_id = resp.get("id")
+    return ToolResult(
+        content=(
+            f"已创建星轨自动化任务「{task.get('name')}」：id={task_id}"
+            f"｜{_automation_trigger_summary(task)}"
+            f"｜目标会话={task['target_session']}｜权限档位={task['permission_mode']}"
+        )
+    )
+
+
+def _automation_update_wrapper(
+    *,
+    task_id,
+    name=None,
+    prompt=None,
+    trigger_type=None,
+    interval_minutes=None,
+    time=None,
+    weekdays=None,
+    target_session=None,
+    permission_mode=None,
+    missed_run_policy=None,
+    notify_on_success=None,
+    workdir=None,
+    model_id=None,
+    enabled=None,
+    **_ignored,
+):
+    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
+    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
+    if automation_tool_policy.automation_write_denied():
+        return ToolResult(
+            content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,
+            is_error=True,
+        )
+
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return ToolResult(content="必须提供 task_id。", is_error=True)
+
+    perm_err = _automation_permission_mode_error(permission_mode)
+    if perm_err is not None:
+        return perm_err
+
+    old = svc.get_task(task_id)
+    if not isinstance(old, dict):
+        return ToolResult(content=f"未找到星轨自动化任务：{task_id}", is_error=True)
+
+    # 桥侧 save_task 是整体覆盖：先取旧任务，只把传入（非 None）字段合并进去，
+    # 未传字段必须保持原值，否则会被清空。
+    task = dict(old)
+    changed: list[str] = []
+    if name is not None:
+        task["name"] = name
+        changed.append("名称")
+    if prompt is not None:
+        task["prompt"] = prompt
+        changed.append("提示词")
+    if target_session is not None:
+        task["target_session"] = str(target_session).strip()
+        changed.append("目标会话")
+    if permission_mode is not None:
+        task["permission_mode"] = str(permission_mode).strip()
+        changed.append("权限档位")
+    if missed_run_policy is not None:
+        task["missed_run_policy"] = str(missed_run_policy).strip()
+        changed.append("错过策略")
+    if notify_on_success is not None:
+        task["notify_on_success"] = bool(notify_on_success)
+        changed.append("成功通知")
+    if workdir is not None:
+        task["workdir"] = str(workdir).strip()
+        changed.append("工作目录")
+    if model_id is not None:
+        task["model_id"] = str(model_id).strip()
+        changed.append("指定模型")
+
+    trigger_touched = trigger_type is not None or any(
+        value is not None for value in (interval_minutes, time, weekdays)
+    )
+    if trigger_touched:
+        old_config = task.get("trigger_config")
+        if not isinstance(old_config, dict):
+            old_config = {}
+        effective_type = (
+            trigger_type if trigger_type is not None else task.get("trigger_type")
+        )
+        config, config_err = _automation_build_trigger_config(
+            effective_type,
+            interval_minutes if interval_minutes is not None else old_config.get("interval_minutes"),
+            time if time is not None else old_config.get("time"),
+            weekdays if weekdays is not None else old_config.get("weekdays"),
+        )
+        if config_err:
+            return ToolResult(content=config_err, is_error=True)
+        task["trigger_type"] = str(effective_type or "").strip()
+        task["trigger_config"] = config
+        changed.append("触发器")
+
+    if not changed and enabled is None:
+        return ToolResult(
+            content="请至少提供一个要修改的字段（名称/提示词/触发器/目标会话/权限档位等，或 enabled）。",
+            is_error=True,
+        )
+
+    if changed:
+        resp = svc.save_task(task)
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return ToolResult(
+                content=f"更新星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+                is_error=True,
+            )
+
+    if enabled is not None:
+        # 启停走桥侧专用方法（轻量、并发安全）；已保存的合并结果不覆盖它。
+        resp = svc.set_enabled(task_id, bool(enabled))
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return ToolResult(
+                content=f"切换星轨自动化任务启停失败：{_automation_bridge_error_text(resp)}",
+                is_error=True,
+            )
+
+    parts = []
+    if changed:
+        parts.append(f"已更新{('、'.join(changed))}")
+    if enabled is not None:
+        parts.append("已" + ("启用" if enabled else "停用"))
+    return ToolResult(content=f"星轨自动化任务 {task_id}：{'，'.join(parts)}。")
+
+
+def _automation_delete_wrapper(*, task_id, **_ignored):
+    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
+    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
+    if automation_tool_policy.automation_write_denied():
+        return ToolResult(
+            content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,
+            is_error=True,
+        )
+
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return ToolResult(content="必须提供 task_id。", is_error=True)
+
+    resp = svc.delete_task(task_id)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"删除星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    if not resp.get("deleted"):
+        return ToolResult(content=f"未找到星轨自动化任务：{task_id}", is_error=True)
+    return ToolResult(content=f"已删除星轨自动化任务 {task_id}。")
+
+
+def _automation_run_now_wrapper(*, task_id, **_ignored):
+    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
+    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
+    if automation_tool_policy.automation_write_denied():
+        return ToolResult(
+            content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,
+            is_error=True,
+        )
+
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return ToolResult(content="必须提供 task_id。", is_error=True)
+
+    resp = svc.run_now(task_id)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"立即执行星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    return ToolResult(
+        content=f"已触发星轨自动化任务 {task_id} 立即执行：run_id={resp.get('run_id')}"
+    )

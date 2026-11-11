@@ -1,4 +1,5 @@
 import io
+import time
 from types import SimpleNamespace
 
 import core.task_manager as task_manager
@@ -31,6 +32,33 @@ def test_background_task_log_is_opened_as_binary(tmp_path, monkeypatch):
         handle.close()
 
 
+def test_background_task_env_disables_color_output(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(pid=12346)
+
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(task_manager, "ACTIVE_TASKS", {})
+    monkeypatch.setattr(task_manager.subprocess, "Popen", fake_popen)
+    # 继承环境里的 FORCE_COLOR 优先级高于 NO_COLOR，必须被移除
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    task_id = task_manager.start_background_task("demo")
+
+    handle = captured["stdout"]
+    try:
+        env = captured["env"]
+        assert env["NO_COLOR"] == "1"
+        assert "FORCE_COLOR" not in env
+        assert task_id in task_manager.ACTIVE_TASKS
+    finally:
+        handle.close()
+
+
 def test_background_task_output_decodes_raw_log_bytes(tmp_path, monkeypatch):
     task_id = "raw-log"
     raw = "星期六\n".encode("gbk")
@@ -58,6 +86,41 @@ def test_background_task_output_decodes_raw_log_bytes(tmp_path, monkeypatch):
 
     assert decoded == [(raw, "gbk")]
     assert output == "星期六\n"
+
+
+def test_get_task_output_strips_ansi_escape_sequences(tmp_path, monkeypatch):
+    task_id = "ansi-log"
+    # 模拟 vitest 在管道下的彩色输出：颜色码与正文混在日志原文里
+    raw = (
+        "\x1b[0;39m\x1b[33mHTMLCanvasElement's getContext()\x1b[39m not implemented\n"
+        "\x1b[32mPASS\x1b[0m src/app.test.ts (14ms)\n"
+    ).encode("ascii")
+    (tmp_path / f"task_{task_id}.log").write_bytes(raw)
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "ACTIVE_TASKS", {})
+
+    output = task_manager.get_task_output(task_id)
+
+    assert output == (
+        "HTMLCanvasElement's getContext() not implemented\n"
+        "PASS src/app.test.ts (14ms)\n"
+    )
+    assert "\x1b" not in output
+    assert "[0;39m" not in output
+
+
+def test_read_log_tail_strips_ansi_escape_sequences(tmp_path, monkeypatch):
+    # 纯 ASCII 内容：log_tail 的解码编码随平台控制台变化，中文在这里有
+    # "合法 GBK 误读" 的歧义，不适合做跨机器断言
+    task_id = "ansi-tail"
+    (tmp_path / f"task_{task_id}.log").write_bytes(
+        "\x1b[31mBUILD FAILED\x1b[0m: missing dependency\n".encode("ascii")
+    )
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+
+    tail = task_manager._read_log_tail(task_id)
+
+    assert tail == "BUILD FAILED: missing dependency\n"
 
 
 def test_start_failure_closes_log_file_handle(tmp_path, monkeypatch):
@@ -437,3 +500,93 @@ def test_kill_detailed_reports_not_found_for_unknown_task(tmp_path, monkeypatch)
         task_manager.kill_background_task_detailed("missing")
         == task_manager.KILL_RESULT_NOT_FOUND
     )
+
+
+def test_list_active_tasks_reports_output_heartbeat(tmp_path, monkeypatch):
+    """list_active_tasks 携带输出心跳：字节数/距最后输出秒数/尚无实际输出标记。
+
+    GUI 任务面板据此在运行期区分"仍在运行只是暂无输出"（缓冲管道命令的
+    运行期日志天然只有启动标记一行）与"任务已失联"。
+    """
+    task_id = "heartbeat"
+    log_path = tmp_path / f"task_{task_id}.log"
+    log_path.write_bytes("[turn:004b1e8b] 后台任务启动\n".encode("utf-8"))
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            task_id: {
+                "id": task_id,
+                "command": "demo",
+                "process": None,
+                "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(log_path),
+                "log_handle": None,
+                "start_time": time.time(),
+                "output_encoding": "utf-8",
+                "turn_id": "004b1e8b-rest-of-uuid",
+                "session_id": "sess",
+            }
+        },
+    )
+    monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 1000.0)
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: True)
+
+    rows = task_manager.list_active_tasks()
+
+    assert len(rows) == 1
+    row = rows[0]
+    # 日志只有启动标记（约 30 字节）：no_output_yet=True 且心跳字段齐备
+    assert row["no_output_yet"] is True
+    assert 0 < row["output_size"] <= task_manager._STARTUP_MARKER_MAX_BYTES
+    assert isinstance(row["last_output_age"], int)
+    assert row["last_output_age"] >= 0
+    assert row["turn_id"] == "004b1e8b-rest-of-uuid"
+    assert row["session_id"] == "sess"
+
+    # 日志出现实际输出后 no_output_yet 翻转，字节数跟随增长
+    log_path.write_bytes("[turn:004b1e8b] 后台任务启动\n".encode("utf-8") + b"x" * 200)
+    row = task_manager.list_active_tasks()[0]
+    assert row["no_output_yet"] is False
+    assert row["output_size"] > 200
+
+
+def test_list_active_tasks_missing_log_reports_zero_output(tmp_path, monkeypatch):
+    """日志文件缺失（被清理/尚未创建）时心跳字段安全回退，不抛异常。"""
+    task_id = "no-log"
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            task_id: {
+                "id": task_id,
+                "command": "demo",
+                "process": None,
+                "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(tmp_path / "task_no_log.log"),
+                "log_handle": None,
+                "start_time": time.time(),
+                "output_encoding": "utf-8",
+            }
+        },
+    )
+    monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 1000.0)
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: True)
+
+    row = task_manager.list_active_tasks()[0]
+
+    assert row["output_size"] == 0
+    assert row["last_output_age"] is None
+    assert row["no_output_yet"] is True

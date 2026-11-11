@@ -1,4 +1,5 @@
 import pytest
+import hashlib
 import json
 import threading
 import time
@@ -54,6 +55,51 @@ def _all_tasks_terminal(manager):
     return bool(snapshots) and all(
         s.status in _SUBAGENT_TERMINAL_STATUSES for s in snapshots
     )
+
+
+# 本文件共享的 turn_undo 服务（module 级装配，见 _turn_undo_service_ready）
+_TURN_UNDO_SHARED: dict = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _turn_undo_module_service(tmp_path_factory):
+    """本文件装配一次共享 turn_undo 服务（后台子代理启动要建独立撤销检查点）。
+
+    configure_default_manager 会重建工具注册表做记录器接入校验（约 0.7s），
+    不能每用例执行，故 module 级只做一次；每个用例的绑定/还原在
+    _turn_undo_service_ready 里完成。
+    """
+    from core.memory import MemoryManager
+    from core.turn_undo import service as turn_undo_service
+
+    root = tmp_path_factory.mktemp("turn-undo-module")
+    manager = MemoryManager(str(root / "module.db"))
+    _TURN_UNDO_SHARED["storage"] = turn_undo_service.configure_default_manager(
+        manager, blob_root=root / "blobs"
+    )
+    _TURN_UNDO_SHARED["manager"] = manager
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _turn_undo_service_ready():
+    """每个用例前把进程级默认 turn_undo 指回本文件共享服务，结束还原。
+
+    此前本文件的 run_in_background 子代理用例依赖同文件更早用例配置后
+    遗留的进程级全局——单独运行或顺序变化时报"turn_undo service 尚未配置"，
+    子代理线程在启动段崩溃，started 事件永不置位（2s 启动等待超时）。
+    用例内自行 configure_default_manager 的（撤销记录断言类用例）其配置
+    在用例期间优先生效，结束后由本夹具还原，不跨用例泄漏。
+    """
+    from core.turn_undo import service as turn_undo_service
+
+    with turn_undo_service._service_lock:
+        prev = (turn_undo_service._default_manager, turn_undo_service._default_storage)
+        turn_undo_service._default_manager = _TURN_UNDO_SHARED["manager"]
+        turn_undo_service._default_storage = _TURN_UNDO_SHARED["storage"]
+    yield
+    with turn_undo_service._service_lock:
+        turn_undo_service._default_manager, turn_undo_service._default_storage = prev
 
 
 def test_declared_search_dependency_uses_renamed_ddgs_package():
@@ -293,6 +339,8 @@ def test_execute_command_rejects_catastrophic_commands_before_spawn(monkeypatch)
 
     assert result.startswith("🚨")
     assert "危险命令" in result
+    # B2-03：拒绝对话需提示文档/文件内容改走 write_file 通道
+    assert "write_file" in result
 
 
 def test_skill_command_reports_missing_dependencies_without_installing(tmp_path, monkeypatch):
@@ -361,12 +409,30 @@ def test_foreground_subagent_waits_and_returns_public_result():
 
 
 def test_subagent_write_is_recorded_in_parent_turn_checkpoint(tmp_path, monkeypatch):
-    from core.memory import begin_turn_checkpoint, end_turn_checkpoint
+    """前台子代理的文件写入应归入父回合的持久化撤销检查点（规格 9.2）。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as turn_undo_service
+    from core.turn_undo import recorder as turn_undo_recorder
+    from core.turn_undo.models import OwnerKind, NodeKind
 
     monkeypatch.chdir(tmp_path)
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    turn_undo_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.add_messages("checkpoint-session", [("user", "hi")])
+    session_id = turn_undo_service.get_default_storage().resolve_session_id(
+        "checkpoint-session"
+    )
+    checkpoint, ctx = turn_undo_service.begin_turn(
+        session_id=session_id,
+        turn_id="checkpoint-turn",
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+
     target = tmp_path / "subagent-owned.txt"
     target.write_bytes(b"before")
-    begin_turn_checkpoint("checkpoint-session", "checkpoint-turn", 0)
 
     def runner(_record):
         assert "写入成功" in write_file(str(target), "after")
@@ -380,54 +446,19 @@ def test_subagent_write_is_recorded_in_parent_turn_checkpoint(tmp_path, monkeypa
             timeout_seconds=30,
         )
     finally:
-        checkpoint = end_turn_checkpoint()
+        status = turn_undo_service.finish_turn(ctx)
 
     assert result == "子代理写入完成"
-    assert checkpoint["file_snapshots"] == [{
-        "file_path": str(target),
-        "old_content": "before",
-        "existed_before": True,
-        "old_bytes": b"before",
-    }]
-
-
-def test_completed_parent_checkpoint_rejects_late_subagent_snapshot(tmp_path):
-    from core.memory import (
-        begin_turn_checkpoint,
-        bind_turn_checkpoint,
-        clear_turn_checkpoint_binding,
-        end_turn_checkpoint,
-        record_file_snapshot_for_current_turn,
-    )
-
-    bound = threading.Event()
-    continue_after_parent_commit = threading.Event()
-    begin_turn_checkpoint("late-session", "late-turn", 0)
-
-    def late_subagent():
-        try:
-            assert bind_turn_checkpoint("late-session", "late-turn") is True
-            bound.set()
-            assert continue_after_parent_commit.wait(timeout=10)
-            record_file_snapshot_for_current_turn(
-                str(tmp_path / "late.txt"),
-                "before",
-                existed_before=True,
-                old_bytes=b"before",
-            )
-        finally:
-            clear_turn_checkpoint_binding()
-
-    thread = threading.Thread(target=late_subagent, daemon=True)
-    thread.start()
-    assert bound.wait(timeout=10)
-    checkpoint = end_turn_checkpoint()
-    continue_after_parent_commit.set()
-    thread.join(timeout=10)
-
-    assert not thread.is_alive()
-    assert checkpoint["file_snapshots"] == []
-
+    assert status.value == "ready"
+    files = turn_undo_service.get_default_storage().list_files(checkpoint.checkpoint_id)
+    assert len(files) == 1
+    row = files[0]
+    assert row.display_path == "subagent-owned.txt"
+    assert row.before_sha256 == hashlib.sha256(b"before").hexdigest()
+    assert row.after_sha256 == hashlib.sha256(b"after").hexdigest()
+    assert row.verified_at_ms is not None
+    # 子代理（借记录权线程）的写入必须严格标记为 subagent 来源（规格 5.4）
+    assert row.last_source_kind == "subagent"
 
 def test_subagent_records_role_and_plan_item():
     manager = SubagentManager(runner=lambda record: "完成")
@@ -566,7 +597,7 @@ def test_subagent_cancel_terminates_running_task():
         daemon=True,
     )
     thread.start()
-    assert started.wait(2.0), "子代理未在 2 秒内启动"
+    assert started.wait(10.0), "子代理未在 10 秒内启动"
 
     # 找到运行中的 task_id 并取消
     snapshots = manager.snapshot()
@@ -772,7 +803,7 @@ def test_is_plan_item_running_returns_true_for_running_task():
         daemon=True,
     )
     thread.start()
-    assert started.wait(2.0), "子代理应在 2s 内启动"
+    assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
         # 任务运行中：应返回 True
@@ -939,7 +970,7 @@ def test_drain_terminal_background_tasks_skips_running_and_foreground():
         daemon=True,
     )
     thread1.start()
-    assert started.wait(2.0), "子代理应在 2s 内启动"
+    assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
         # drain：不应返回运行中的任务
@@ -979,7 +1010,7 @@ def test_has_running_background_tasks_detects_running():
         daemon=True,
     )
     thread.start()
-    assert started.wait(2.0), "子代理应在 2s 内启动"
+    assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
         # 有运行中的任务：应返回 True
@@ -1255,6 +1286,38 @@ def test_background_subagent_returns_task_id_immediately():
     assert manager.snapshot()[0].status in {"pending", "running"}
     release.set()
     assert manager.wait_for_idle(1)
+
+
+def test_background_subagent_startup_failure_reaches_terminal_state():
+    """启动段异常（如 turn_undo 未配置）必须落成 failed 终态，不得留僵尸 running。
+
+    回归守护：_run_task 启动段兜底前，线程带 running 状态裸崩——无终态回调、
+    无 done_event，started 等待方只能靠超时失败。
+    """
+    from core.turn_undo import service as turn_undo_service
+
+    manager = SubagentManager(runner=lambda record: "不应被执行到")
+    with turn_undo_service._service_lock:
+        prev = (turn_undo_service._default_manager, turn_undo_service._default_storage)
+        turn_undo_service._default_manager = None
+        turn_undo_service._default_storage = None
+    try:
+        result = manager.run(
+            "后台任务",
+            "s1",
+            "t1",
+            run_in_background=True,
+            timeout_seconds=30,
+        )
+        assert "subagent-" in result
+        assert _wait_until(lambda: _all_tasks_terminal(manager)), "启动失败应落成终态"
+        snapshot = manager.snapshot()[0]
+        assert snapshot.status == "failed"
+        assert "启动失败" in snapshot.error
+        assert "turn_undo" in snapshot.error
+    finally:
+        with turn_undo_service._service_lock:
+            turn_undo_service._default_manager, turn_undo_service._default_storage = prev
 
 
 def test_background_notifications_are_scoped_to_parent_session():
@@ -1579,23 +1642,17 @@ def test_edit_file_rejects_non_unique_target(tmp_path, monkeypatch):
 
 
 def test_edit_file_failure_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    import core.memory as memory_module
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "undo.py"
     target.write_text("alpha\n", encoding="utf-8")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
     result = edit_file("undo.py", "不存在的片段", "beta")
 
     assert result.startswith("🚨")
-    assert captured == []
+    # 失败编辑不得改动文件（因此也不产生任何可撤销记录）
+    assert target.read_text(encoding="utf-8") == "alpha\n"
 
 
 def test_edit_file_preserves_gbk_encoding_and_crlf(tmp_path, monkeypatch):
@@ -2386,8 +2443,8 @@ def test_subagent_result_keeps_only_text_after_last_tool_call(monkeypatch):
 
 def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
     """回归：未显式传 timeout_seconds 时按角色解析默认超时
-    （explore 240 / review 300 / test 480 / implement、general 600）。
-    只读子代理的设计目标是快，不能默认给 10 分钟。"""
+    （explore 300 / review 420 / test、implement、general 900）。
+    只读子代理的设计目标是快，预算仍明显低于写代码/跑测试角色。"""
     import core.tools as tools_module
 
     captured = {}
@@ -2400,8 +2457,8 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
     monkeypatch.setattr(tools_module, "subagent_manager", _FakeManager())
 
     for role, expected in [
-        ("explore", 240), ("review", 300), ("test", 480),
-        ("implement", 600), ("general", 600), ("custom-agent", 600),
+        ("explore", 300), ("review", 420), ("test", 900),
+        ("implement", 900), ("general", 900), ("custom-agent", 900),
     ]:
         captured.clear()
         tools_module.run_subagent(
@@ -2410,7 +2467,15 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
         )
         assert captured["timeout_seconds"] == expected, role
 
-    # 显式传入时以显式值为准，但受前台硬上限 600 秒约束（Task 8）
+    # 后台任务不阻塞用户，默认预算按系数放宽（explore 300 × 1.5 = 450）
+    captured.clear()
+    tools_module.run_subagent(
+        "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
+        subagent_type="explore", run_in_background=True,
+    )
+    assert captured["timeout_seconds"] == 450
+
+    # 显式传入时以显式值为准（后台不放大），但受前台硬上限约束
     captured.clear()
     tools_module.run_subagent(
         "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
@@ -2420,7 +2485,7 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
     captured.clear()
     tools_module.run_subagent(
         "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
-        subagent_type="explore", timeout_seconds=601,
+        subagent_type="explore", timeout_seconds=901,
     )
     assert "timeout_seconds" not in captured
 
@@ -2891,50 +2956,60 @@ def test_edit_file_by_lines_no_change_returns_error(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_writes_undo_stack(tmp_path, monkeypatch):
-    """行号路径成功时应写入撤销栈（与字符串路径行为一致）。"""
-    import core.memory as memory_module
+    """行号路径成功时应写入按回合撤销记录（与字符串路径行为一致）。"""
+    import hashlib
+
+    from core.memory import MemoryManager
     from core.tools import edit_file
+    from core.turn_undo import service as turn_undo_service
+    from core.turn_undo.models import OwnerKind
 
     monkeypatch.chdir(tmp_path)
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = turn_undo_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.add_messages("undo-sess", [("user", "hi")])
+    session_id = storage.resolve_session_id("undo-sess")
+    checkpoint, ctx = turn_undo_service.begin_turn(
+        session_id=session_id,
+        turn_id="undo-turn-lines",
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+
     target = tmp_path / "undo.py"
     # 用 write_bytes 确保 LF 换行，避免 Windows write_text 默认转 CRLF
     target.write_bytes(b"original\n")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
-    result = edit_file("undo.py", replacement_content="modified", start_line=1, end_line=1)
+    try:
+        result = edit_file(
+            "undo.py", replacement_content="modified", start_line=1, end_line=1
+        )
+    finally:
+        turn_undo_service.finish_turn(ctx)
 
     assert result.startswith("✔")
-    assert len(captured) == 1
-    undo_file, undo_content = captured[0]
-    assert undo_file == "undo.py"
-    assert undo_content == "original\n"  # 撤销栈保存的是修改前的内容
+    files = storage.list_files(checkpoint.checkpoint_id)
+    assert len(files) == 1
+    row = files[0]
+    assert row.before_sha256 == hashlib.sha256(b"original\n").hexdigest()
+    assert row.after_sha256 == hashlib.sha256(b"modified\n").hexdigest()
+    assert row.verified_at_ms is not None
 
 
 def test_edit_file_by_lines_failed_validation_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    """行号路径校验失败时不应写入撤销栈。"""
-    import core.memory as memory_module
+    """行号路径校验失败时不应产生任何可撤销记录或文件改动。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "safe.txt"
     target.write_text("a\nb\n", encoding="utf-8")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
     # start_line 越界，应失败且不写撤销栈
     result = edit_file("safe.txt", replacement_content="new", start_line=100, end_line=200)
 
     assert result.startswith("🚨")
-    assert captured == []
     assert target.read_text(encoding="utf-8") == "a\nb\n"  # 文件未被修改
 
 
@@ -3413,19 +3488,12 @@ def test_smart_replace_rejects_low_similarity_candidate(tmp_path, monkeypatch):
 
 
 def test_edit_file_write_failure_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    """Low：写入失败（os.replace 异常）时撤销栈不被提前污染。"""
-    import core.memory as memory_module
+    """Low：写入失败（os.replace 异常）时计划记录被回滚，文件不变。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "undo2.py"
     target.write_text("alpha\n", encoding="utf-8")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
     def failing_replace(*args, **kwargs):
         raise OSError("disk full")
@@ -3435,7 +3503,6 @@ def test_edit_file_write_failure_does_not_pollute_undo_stack(tmp_path, monkeypat
     result = edit_file("undo2.py", "alpha", "beta")
 
     assert result.startswith("🚨")
-    assert captured == []
     assert target.read_text(encoding="utf-8") == "alpha\n"
 
 
@@ -3565,7 +3632,7 @@ def test_execute_command_background_echo_redacts_inline_credentials(monkeypatch)
     """M8：后台任务启动回显中的内联凭据被脱敏。"""
     monkeypatch.setattr(
         "core.task_manager.start_background_task",
-        lambda command, session_id="": "abc12345",
+        lambda command, session_id="", turn_id="": "abc12345",
     )
 
     result = execute_command(
@@ -4314,7 +4381,7 @@ def test_run_subagent_rejects_oversized_description(monkeypatch):
 
 
 def test_run_subagent_enforces_foreground_hard_timeout(monkeypatch):
-    """前台子代理硬上限 600 秒：内部调用传 601 返回参数错误，不启动子代理。"""
+    """前台子代理硬上限 900 秒：内部调用传 901 返回参数错误，不启动子代理。"""
     import core.tools as tools_module
 
     class UnusedManager:
@@ -4323,11 +4390,11 @@ def test_run_subagent_enforces_foreground_hard_timeout(monkeypatch):
 
     monkeypatch.setattr(tools_module, "subagent_manager", UnusedManager())
     result = tools_module.run_subagent(
-        "长任务", parent_session="s", parent_turn_id="t", timeout_seconds=601,
+        "长任务", parent_session="s", parent_turn_id="t", timeout_seconds=901,
     )
     payload = json.loads(result)
     assert payload["status"] == "failed"
-    assert "600" in payload["error"]
+    assert "900" in payload["error"]
     assert "manage_task" in payload["error"]
 
 
@@ -4415,3 +4482,282 @@ def test_foreground_waits_for_failed_terminal_callback_before_returning():
     assert thread.is_alive() is False
     assert task.done_event.is_set() is True
     assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# 子代理部分工具失败不应一票否决整任务
+# ---------------------------------------------------------------------------
+# 历史问题：_run_default_subagent 把 ok=False 的 tool_finished 记进 tool_errors，
+# _run_task 里 `elif task.tool_errors:` 直接把整任务判 failed 并丢弃 result。
+# 于是子代理只要有一个工具报错（如 edit_file 打在不存在的文件上返回 🚨），
+# 整任务失败、成果全丢。修复：有成功工具调用时降级为结果尾部告警。
+
+def test_subagent_partial_tool_failure_still_completes():
+    conclusion = "已完成 core/tools.py 的改动，共修改 3 处，验证命令通过。" * 6
+
+    def runner(record):
+        record.tool_success_count = 3
+        record.tool_errors["edit_file"] = "文件不存在：core/foo.py"
+        return conclusion
+
+    manager = SubagentManager(runner=runner)
+    result = manager.run("改代码", "s1", "t1", timeout_seconds=30)
+
+    assert manager.snapshot()[0].status == "completed"
+    assert "已完成 core/tools.py 的改动" in result
+    assert "子代理执行期有工具报错" in result
+    assert "edit_file" in result
+
+
+def test_edit_file_missing_file_suggests_write_file():
+    import core.tools as tools_mod
+
+    result = tools_mod.edit_file(
+        "不存在的文件_xyz_不要创建.py",
+        target_content="a",
+        replacement_content="b",
+    )
+
+    assert result.startswith("🚨")
+    assert "write_file" in result
+
+
+def test_subagent_edit_file_missing_file_suggests_write_file():
+    """别名入口：让 `pytest -k subagent` 也能覆盖 edit_file 缺文件的提示。"""
+    test_edit_file_missing_file_suggests_write_file()
+
+
+# ---------------------------------------------------------------------------
+# 子代理超时/取消不再丢弃已产出正文
+# ---------------------------------------------------------------------------
+# 历史问题：正文只写 task.result，_terminate 只写 error。子代理线程返回正文
+# 时若 cancel_event 已置位（超时/取消），result 被整块丢弃，主 Agent 只看到
+# "foreground timeout"，无法判断成果是否已落地（文件可能已经改完）。
+
+def test_subagent_timeout_salvages_partial_result():
+    body = "已完成的现场：" + "改动 core/tools.py 并跑通验证。" * 12
+
+    def runner(record):
+        record.cancel_event.set()
+        return body
+
+    manager = SubagentManager(runner=runner)
+    result = manager.run("长任务", "s1", "t1", timeout_seconds=30)
+
+    snapshot = manager.snapshot()[0]
+    assert snapshot.status == "cancelled"
+    assert body in snapshot.partial_result
+    assert "已完成的部分" in result
+
+
+# ---------------------------------------------------------------------------
+# 回合级中止原因（无进展熔断/轮次上限）不再被静默吞掉
+# ---------------------------------------------------------------------------
+# 历史问题：熔断只走 _notify_event(..., "turn_error", ...) 后 return，不 yield
+# 正文；_run_default_subagent 的事件循环收到 turn_error 却不处理，最终只留下
+# "subagent returned no public answer"，真实原因丢失。
+
+def test_subagent_captures_turn_error_event(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    def fake_events(*args, **kwargs):
+        yield TurnEvent("t1", 1, "assistant_delta", {"text": "先读一下文件"})
+        yield TurnEvent(
+            "t1", 2, "turn_error",
+            {"message": "连续 12 轮没有检测到状态变化，回合已终止"},
+        )
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+
+    manager = SubagentManager()
+    result = manager.run("测试", "s1", "t1", timeout_seconds=30)
+
+    assert manager.snapshot()[0].status == "failed"
+    assert "连续 12 轮" in result
+
+
+# ---------------------------------------------------------------------------
+# 熔断/轮次上限中止后不再白打一次总结续写请求
+# ---------------------------------------------------------------------------
+# 历史问题：summary_continuation 只查 cancel_event，而熔断不置位 cancel_event；
+# 修复前续写产出还有机会救回任务，修复后 turn_error 一律判 failed，
+# 这次续写请求的产出只能以截断 partial 出现在失败文本里，纯浪费。
+
+def test_subagent_turn_error_skips_summary_continuation(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    calls = []
+
+    def fake_events(*args, **kwargs):
+        calls.append(1)
+        yield TurnEvent(
+            "t1", 1, "turn_error",
+            {"message": "连续 12 轮没有检测到状态变化，回合已终止"},
+        )
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+
+    manager = SubagentManager()
+    result = manager.run("测试", "s1", "t1", timeout_seconds=30)
+
+    assert manager.snapshot()[0].status == "failed"
+    assert "连续 12 轮" in result
+    # 正文为空必然满足续写长度条件：只允许主循环这一次请求
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 事件循环中途抛异常时尾部正文也要打捞
+# ---------------------------------------------------------------------------
+# 历史问题：runner 抛异常（如网络中断）会跳过事件循环后的最终打捞，
+# 周期 flush 只保到最后一个 2000 字符边界，尾部不足 2000 的正文丢失。
+
+def test_subagent_partial_salvaged_when_event_loop_raises(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    def fake_events(*args, **kwargs):
+        yield TurnEvent(
+            "t1", 1, "assistant_delta",
+            {"text": "已定位问题：core/foo.py 第 10 行循环边界写反，"},
+        )
+        raise RuntimeError("网络连接中断")
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+
+    manager = SubagentManager()
+    result = manager.run("测试", "s1", "t1", timeout_seconds=30)
+
+    snapshot = manager.snapshot()[0]
+    assert snapshot.status == "failed"
+    assert "core/foo.py" in snapshot.partial_result
+    assert "已完成的部分" in result
+    assert "core/foo.py" in result
+
+
+# ---------------------------------------------------------------------------
+# 头截断保尾规则统一：_foreground_result 与 task_tool status 共用 helper
+# ---------------------------------------------------------------------------
+
+def test_truncate_subagent_result_keeps_warning_footer():
+    from core.tools import SUBAGENT_WARNING_MARKER, _truncate_subagent_result
+
+    footer = (
+        SUBAGENT_WARNING_MARKER
+        + "（1 个，可能影响结论可靠性，供主 Agent 判断是否复核）：\n"
+        + "  - edit_file: 文件不存在：core/foo.py"
+    )
+    out = _truncate_subagent_result(
+        "x" * 20000 + footer,
+        16000,
+        "\n\n... [子代理结果已截断，省略 {omitted} 字符]",
+    )
+
+    assert "edit_file: 文件不存在：core/foo.py" in out
+    assert "省略" in out and "字符]" in out
+    # 截断说明插在正文与告警块之间，不重复、不重叠
+    assert out.index("... [子代理结果已截断") < out.index(SUBAGENT_WARNING_MARKER)
+
+    # 无告警尾时退化为普通头截断，省略数正确
+    plain = _truncate_subagent_result(
+        "y" * 20000, 16000, "\n\n... [省略 {omitted} 字符]"
+    )
+    assert plain.startswith("y")
+    assert "省略 4000 字符" in plain
+    assert SUBAGENT_WARNING_MARKER not in plain
+
+    # 未超长原样返回
+    assert _truncate_subagent_result("short", 16000, "省略 {omitted}") == "short"
+
+# ── 子代理时间预算：软着陆提醒与超时交付增强 ──────────────────────────────
+
+
+def test_subagent_budget_notice_thresholds_and_dedup():
+    """预算提醒按 25% / 10% 两级触发，同一级别只发一次；不越级重复轰炸。"""
+    from core.tools import build_subagent_budget_notice
+
+    # 预算充足：不提醒
+    assert build_subagent_budget_notice(600, 600, 0) == (0, None)
+    assert build_subagent_budget_notice(151, 600, 0) == (0, None)
+
+    # 跨过 25%（max(90, 150) = 150）：收尾提醒，级别 1
+    level, text = build_subagent_budget_notice(150, 600, 0)
+    assert level == 1
+    assert "时间预算提醒" in text and "600s" in text and "150s" in text
+
+    # 级别 1 已发：同一阈值不再重复
+    assert build_subagent_budget_notice(140, 600, 1) == (1, None)
+
+    # 跨过 10%（max(45, 60) = 60）：终止提醒，级别 2
+    level, text = build_subagent_budget_notice(60, 600, 1)
+    assert level == 2
+    assert "时间预算即将耗尽" in text
+
+    # 级别 2 已发：不再提醒
+    assert build_subagent_budget_notice(20, 600, 2) == (2, None)
+
+    # 短预算任务：10% 阈值有 45s 下限，30s 直接进终止提醒
+    level, text = build_subagent_budget_notice(30, 300, 0)
+    assert level == 2 and "即将耗尽" in text
+
+    # 非法输入不抛异常
+    assert build_subagent_budget_notice(0, 0, 0) == (0, None)
+    assert build_subagent_budget_notice("bad", 600, 0) == (0, None)
+
+
+def test_subagent_timeout_failure_text_delivers_partial_and_progress():
+    """超时交付：部分产出按完整上限给到主 Agent，并附进度与"不要重做"指引。"""
+    from core.tools import (
+        SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS,
+        SubagentManager,
+        SubagentTask,
+    )
+
+    manager = SubagentManager(runner=lambda record: "")
+    task = SubagentTask(
+        task_id="subagent-test",
+        parent_session="s",
+        parent_turn_id="t",
+        description="大改造",
+        subagent_type="implement",
+        status="timed_out",
+        stage="tool",
+        timeout_seconds=900,
+        execution_elapsed=900.0,
+        approval_wait_elapsed=3.0,
+        tool_success_count=7,
+        partial_result="已完成一半的改动说明\n" * 2000,
+    )
+    text = manager._format_failure_text(task)
+
+    assert "进度: 阶段 tool / 工具成功 7 次" in text
+    assert "预算 900s" in text
+    assert "不要从头重做" in text
+    assert "部分产出已截断" in text
+    # 交付量必须接近最终结果上限，而不是旧的 1500 字符
+    assert len(text) > 10000
+    assert len(text) < len(task.partial_result)
+
+
+def test_subagent_timeout_without_partial_still_guides_direct_completion():
+    from core.tools import SubagentManager, SubagentTask
+
+    manager = SubagentManager(runner=lambda record: "")
+    task = SubagentTask(
+        task_id="subagent-empty",
+        parent_session="s",
+        parent_turn_id="t",
+        description="空任务",
+        subagent_type="explore",
+        status="timed_out",
+        stage="tool",
+        timeout_seconds=300,
+        execution_elapsed=300.0,
+    )
+    text = manager._format_failure_text(task)
+
+    # 无部分产出时引导直接用自身工具完成，而不是"接着 partial 做"
+    assert "直接用自身工具完成" in text
+    assert "不要从头重做" not in text

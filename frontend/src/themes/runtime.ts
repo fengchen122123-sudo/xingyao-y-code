@@ -170,11 +170,19 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
   }
 
   for (const [name, value] of values) document.documentElement.style.setProperty(name, value);
+  // 启动期 applyBootTheme 会把首屏主题的背景实色写进 body 的 inline
+  // background-color（防止主题变量异步就位前白闪）。运行期切换主题必须清掉
+  // 它，否则 body 背景停在旧主题的实色上：深色主题下侧栏与主区、主区与右侧
+  // 面板之间的 1px 缝隙会露出这层旧色，看起来像两条亮线。
+  document.body.style.removeProperty('background-color');
   // light 类必须同时落在 html 与 body 上：html 上的 :root.light 提供无主题时的
   // 浅色语义默认值，运行时写入 documentElement 的 inline 主题变量才能覆盖它；
   // body 上的 light 继续服务既有 body.light 后代选择器（代码高亮等）。
   document.documentElement.classList.toggle('light', theme.appearance === 'light');
   document.body.classList.toggle('light', theme.appearance === 'light');
+  // 主题身份钩子：主题专属 CSS（如 qq2009.css）用 html[data-gui-theme-id="..."]
+  // 作为作用域选择器，仅当该主题激活时生效；切换主题时本函数重新执行会覆盖该属性。
+  document.documentElement.dataset.guiThemeId = theme.id;
 
   let disposed = false;
   return {

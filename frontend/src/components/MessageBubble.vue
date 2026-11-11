@@ -2,10 +2,25 @@
   <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : msg.role === 'notice' ? 'msg-notice' : 'msg-assistant'">
     <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大）；气泡下方悬停浮现操作栏 -->
     <template v-if="msg.role === 'user'">
-      <div class="bubble user-bubble">
-        <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
+      <!-- QQ2009 皮肤专属：用户消息昵称行（仅内置 QQ2009 主题激活时渲染；
+           样式在 themes/qq2009.css，本组件不加样式） -->
+      <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-msg-sender">
+        <b class="qq09-sender-name">木偶</b>
+      </div>
+      <div class="bubble user-bubble" :class="{ 'is-editing': editing }">
+        <textarea
+          v-if="editing"
+          ref="editInputRef"
+          v-model="editText"
+          class="user-edit-input"
+          data-test="user-edit-input"
+          rows="3"
+          @keydown="onEditKeydown"
+          @paste="onEditPaste"
+        ></textarea>
+        <div v-else-if="msg.content" class="user-text">{{ msg.content }}</div>
         <div
-          v-if="msg.images && msg.images.length"
+          v-if="!editing && msg.images && msg.images.length"
           class="img-grid"
           :class="{ single: msg.images.length === 1, duo: msg.images.length === 2 }"
         >
@@ -18,6 +33,24 @@
             @click="store.openLightbox(msg.images!, i)"
           >
         </div>
+        <!-- 编辑态：图片可逐张移除，新图由下方「添加图片」追加 -->
+        <div
+          v-if="editing && editImages.length"
+          class="edit-img-grid"
+          data-test="user-edit-images"
+        >
+          <div v-for="(img, i) in editImages" :key="i" class="edit-img-cell">
+            <img :src="img" class="edit-img" alt="待发送的图片">
+            <button
+              type="button"
+              class="edit-img-remove"
+              title="移除这张图片"
+              data-test="user-edit-image-remove"
+              :disabled="editSubmitting"
+              @click="removeEditImage(i)"
+            >×</button>
+          </div>
+        </div>
         <div
           v-if="msg.attachment_notes && msg.attachment_notes.length"
           class="attachment-notes"
@@ -29,8 +62,60 @@
           >{{ note }}</div>
         </div>
       </div>
-      <!-- 用户消息操作栏：气泡下方，悬停气泡时浮现，点击复制本条消息文本 -->
-      <div v-if="msg.content" class="user-action-bar">
+      <!-- 编辑态操作区：保存即截断本条之后的历史并重新生成；被截断回合的
+           文件改动不会回滚，所以就地提示一句，避免用户以为代码也退回去了 -->
+      <div v-if="editing" class="user-edit-bar">
+        <span class="user-edit-hint">{{ editHint }}</span>
+        <input
+          ref="editImageInput"
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp"
+          multiple
+          class="edit-file-input"
+          data-test="user-edit-image-input"
+          @change="onEditImagesPicked"
+        >
+        <button
+          type="button"
+          class="msg-copy-btn"
+          data-test="user-edit-image-add"
+          :disabled="editSubmitting"
+          @click="pickEditImages"
+        >
+          <span>添加图片</span>
+        </button>
+        <button
+          type="button"
+          class="msg-copy-btn"
+          data-test="user-edit-cancel"
+          :disabled="editSubmitting"
+          @click="cancelEdit"
+        >
+          <span>取消</span>
+        </button>
+        <button
+          type="button"
+          class="msg-copy-btn user-edit-submit"
+          data-test="user-edit-submit"
+          :disabled="editSubmitting || (!editText.trim() && !editImages.length)"
+          @click="submitEdit"
+        >
+          <span>{{ editSubmitting ? '处理中…' : '保存并重新生成' }}</span>
+        </button>
+      </div>
+      <!-- 用户消息操作栏：气泡下方，悬停气泡时浮现；点击编辑或复制本条消息 -->
+      <div v-else-if="msg.content" class="user-action-bar">
+        <button
+          v-if="canEdit"
+          type="button"
+          class="msg-copy-btn"
+          title="编辑并重新生成"
+          data-test="user-edit-btn"
+          @click="startEdit"
+        >
+          <AppIcon name="pencil" :size="13" :stroke-width="2" />
+          <span>编辑</span>
+        </button>
         <button
           class="msg-copy-btn"
           :class="{ copied: userCopied }"
@@ -47,17 +132,37 @@
     <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
       <div class="assistant-body">
-        <div class="assistant-name">
-          <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+        <!-- 名字行：一个回合只在最前面显示一次（由 TurnGroup 决定归属），
+             其余轮次的助手消息不再重复「星瑶 · 模型」；「已取消」徽标始终保留 -->
+        <div v-if="showName || msg.cancelled" class="assistant-name">
+          <template v-if="showName">
+            <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+          </template>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 
-        <!-- 思考过程 Block（FoldCard 统一折叠体系，箭头在标题右侧） -->
+        <!-- 思考过程 Block（对齐 ZCode 思考块形态：脑图标 + 灰色状态文案 + 悬停才出现的箭头，
+             无底色无边框；展开后弱灰正文、左侧 1px 细线、限高内滚 + 上下边缘渐隐 + 默认吸底） -->
         <div v-if="msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
-          <FoldCard v-model:open="thinkingOpen" title="思考过程" caret="end">
-            <div class="tk-cnt">
-              {{ msg.reasoning_content }}
-            </div>
+          <FoldCard v-model:open="thinkingOpen" caret="end">
+            <template #title>
+              <span class="tk-head">
+                <AppIcon class="tk-brain" name="brain" :size="13" :stroke-width="1.7" />
+                <span class="tk-label" :class="{ 'is-thinking': !!thinkLiveLine }">{{ thinkLabel }}</span>
+                <template v-if="thinkLiveLine">
+                  <span class="tk-sep">·</span>
+                  <span class="tk-live" data-test="think-live-line">
+                    <span class="tk-live-text">{{ thinkLiveLine }}</span>
+                  </span>
+                </template>
+              </span>
+            </template>
+            <div
+              ref="tkScrollRef"
+              class="tk-cnt"
+              :class="{ 'is-scrollable': tkScrollable, 'at-top': tkAtTop, 'at-bottom': tkAtBottom }"
+              @scroll="syncTkScroll"
+            >{{ msg.reasoning_content }}</div>
           </FoldCard>
         </div>
 
@@ -68,9 +173,10 @@
           v-if="msg.content && msg.content.trim()"
           ref="mdBodyRef"
           class="md-body"
-          v-html="renderMarkdown(msg.content, mediaCtx)"
           @click="onMdBodyClick"
-        ></div>
+        >
+          <div v-for="b in mdBlocks" :key="b.key" class="md-block" v-html="b.html"></div>
+        </div>
 
         <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
         <ToolExecutionTrace
@@ -85,6 +191,42 @@
           <AppIcon name="triangle-alert" :size="13" /> {{ msg.error_note }}
         </div>
 
+        <!-- 登录态失效：错误提示下方直接出现「重新登录」，点一下拉起登录窗 -->
+        <div v-if="msg.error_note && isLoginExpiredError(msg.error_note)" class="login-again-row">
+          <button
+            type="button"
+            class="login-again-btn"
+            data-test="login-again-btn"
+            @click="onLoginAgain"
+          >
+            <AppIcon name="refresh" :size="12" /> 重新登录
+          </button>
+        </div>
+
+        <!-- 断点续跑（S4）：仅当后端 resume_plan 判定可续跑时出现（开关关闭时不出现）。
+             按钮只续跑无写操作的调用；含写操作的调用需人工重做，blockers 列表就地展示 -->
+        <div v-if="msg.error_note && store.resumeAvailable" class="resume-continue" data-test="resume-continue">
+          <button
+            type="button"
+            class="resume-btn"
+            data-test="resume-continue-btn"
+            :disabled="store.resumeBusy"
+            @click="store.runResume()"
+          >
+            <AppIcon name="play" :size="12" /> 从断点继续
+          </button>
+          <span class="resume-hint">仅回灌已完成的调用；含写操作的调用需手动重做</span>
+        </div>
+        <ul v-if="msg.error_note && store.resumeBlockers.length" class="resume-blockers" data-test="resume-blockers">
+          <li
+            v-for="item in store.resumeBlockers"
+            :key="item.call_ordinal"
+            data-test="resume-blocker-item"
+          >
+            第 {{ item.call_ordinal }} 个调用 {{ item.tool_name }} 需手动重做
+          </li>
+        </ul>
+
         <!-- 等待模型响应期间的动态反馈（对齐 CLI 的"正在干活"） -->
         <div v-if="showWorking" class="working-line">
           <span class="spin"></span>
@@ -94,7 +236,7 @@
 
         <!-- 流式生成中的实时速度指示胶囊 -->
         <div v-else-if="isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
-          <AppIcon name="zap" :size="12" class="zap-pulse" />
+          <AppIcon name="orbit" :size="12" class="zap-pulse" />
           <span>{{ liveSpeedText }}</span>
         </div>
 
@@ -106,7 +248,7 @@
           data-test="msg-metrics"
         >
           <span v-if="msg.metrics.token_speed" class="metric-item">
-            <AppIcon name="zap" :size="12" class="metric-icon" />
+            <AppIcon name="orbit" :size="12" class="metric-icon" />
             <span class="metric-val">{{ msg.metrics.token_speed }}</span> t/s
           </span>
           <span v-if="msg.metrics.token_speed && msg.metrics.duration_s" class="metric-sep">·</span>
@@ -125,6 +267,18 @@
       <div class="error-body">
         <div class="error-title">运行错误</div>
         <div class="error-text">{{ msg.content }}</div>
+        <!-- 登录过期（账号 cookie / 专属 Key 失效）：错误旁直接给登录入口，
+             不要求用户自己去找左下角账号卡片 -->
+        <div v-if="isLoginExpiredError(msg.content)" class="login-again-row">
+          <button
+            type="button"
+            class="login-again-btn"
+            data-test="login-again-btn"
+            @click="onLoginAgain"
+          >
+            <AppIcon name="refresh" :size="12" /> 重新登录
+          </button>
+        </div>
       </div>
     </div>
 
@@ -140,23 +294,39 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
-import { renderMarkdown, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
+import { renderMarkdownDetailed, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
+import { splitStableBlocks } from '../utils/markdownBlocks';
 import { renderMermaidBlocks } from '../utils/mermaidRenderer';
-import { toAbsoluteLocalPath } from '../utils/localPath';
+import { canOpenInRightPanel, toAbsoluteLocalPath } from '../utils/localPath';
+import { useIsMobile } from '../composables/useViewport';
 import { formatTokenSpeed, formatDuration } from '../utils/tokenSpeed';
+import { isLoginExpiredError } from '../utils/loginExpired';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   msg: ChatMessage;
-}>();
+  /** 是否显示「星瑶 · 模型」名字行：一个回合只在最前面显示一次 */
+  showName?: boolean;
+}>(), {
+  showName: true,
+});
 
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
 // 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
 const store = useAppStore();
+
+// 登录过期提示上的「重新登录」：拉起基元律动登录窗，并顺手刷新一次登录态
+// （接口抖动时状态能立即回正，用户关掉弹窗也不会继续看到过期的账号信息）。
+function onLoginAgain() {
+  store.openTrLoginModal();
+  void store.refreshTrAuth();
+}
+// 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
+const isMobile = useIsMobile();
 // 用户消息复制按钮的「已复制」反馈状态与定时器
 const userCopied = ref(false);
 let userCopiedTimer: number | undefined;
@@ -241,10 +411,196 @@ const thinkingOpen = computed({
   set: (v: boolean) => { localThinkOverride.value = v; },
 });
 
+// 折叠态标题行预览的最大字符数：超长行只留结尾（"正在输出"的尾部才是最新推进内容），
+// 避免一整段没有换行的思考把标题塞满开头几个字、看上去像不动
+const THINK_LIVE_MAX = 90;
+
+// 去掉行首 markdown 标记（标题 # / 引用 > / 列表 - * 1. / 代码围栏）与行内强调符号，
+// 只留一行纯文本给折叠标题用
+function toPlainHeadline(line: string): string {
+  const plain = line
+    .replace(/^\s*```[A-Za-z0-9_+-]*/, '')
+    .replace(/^[\s>#*+\-–—\d.、:：)）]+/, '')
+    .replace(/\*\*|__|`/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return plain.length > THINK_LIVE_MAX ? `…${plain.slice(-THINK_LIVE_MAX)}` : plain;
+}
+
+// 折叠态要显示的实时思考行：仅在「本条最新气泡仍在流式生成」时给值，
+// 展开态（用户要看全文）与生成结束后都返回空串，回落到固定标签"思考"
+const thinkLiveLine = computed(() => {
+  if (thinkingOpen.value) return '';
+  if (!store.running || !isLatestAssistant.value) return '';
+  const raw = props.msg.reasoning_content || '';
+  if (!raw.trim()) return '';
+  const lines = raw.split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const plain = toPlainHeadline(lines[i]);
+    if (plain) return plain;
+  }
+  return '';
+});
+
+/* ── 思考耗时（对齐 ZCode 的「思考 · N 秒」）──────────────────────────
+   只有在本条气泡还处于流式态时才有可信的起始时刻；历史消息挂载时已经
+   结束，拿不到起始时间，就不编造耗时，标签只显示「思考」。 */
+const thinkStartAt = ref<number | null>(null);
+const thinkEndedAt = ref<number | null>(null);
+const thinkTick = ref(Date.now());
+let thinkTicker: number | null = null;
+
+const thinkStreaming = computed(() => {
+  const raw = (props.msg.reasoning_content || '').trim();
+  return !!raw && store.running && isLatestAssistant.value;
+});
+
+watch(
+  thinkStreaming,
+  (streaming) => {
+    if (streaming) {
+      if (thinkStartAt.value === null) {
+        thinkStartAt.value = Date.now();
+        thinkTick.value = thinkStartAt.value;
+      }
+      return;
+    }
+    if (thinkStartAt.value !== null && thinkEndedAt.value === null) {
+      thinkEndedAt.value = Date.now();
+      thinkTick.value = thinkEndedAt.value;
+    }
+  },
+  { immediate: true },
+);
+
+const thinkDurationSec = computed(() => {
+  const start = thinkStartAt.value;
+  if (start === null) return null;
+  const end = thinkEndedAt.value ?? thinkTick.value;
+  return Math.max(1, Math.round((end - start) / 1000));
+});
+
+// 收起 + 流式中显示「正在思考 · <最新一行>」；其余显示「思考」，有耗时时追加「· N 秒」
+const thinkLabel = computed(() => {
+  if (thinkLiveLine.value) return '正在思考';
+  const sec = thinkDurationSec.value;
+  return sec === null ? '思考' : `思考 · ${sec} 秒`;
+});
+
+// 耗时只在「展开 + 流式中」每秒刷新：收起态看不到秒数，没必要触发整块重渲染
+watch(
+  () => thinkingOpen.value && thinkStreaming.value,
+  (ticking) => {
+    if (thinkTicker !== null) {
+      window.clearInterval(thinkTicker);
+      thinkTicker = null;
+    }
+    if (ticking) {
+      thinkTicker = window.setInterval(() => {
+        thinkTick.value = Date.now();
+      }, 1000);
+    }
+  },
+  { immediate: true },
+);
+
+/* ── 展开区滚动：边缘渐隐状态 + 默认吸底 ────────────────────────────── */
+const tkScrollRef = ref<HTMLElement | null>(null);
+const tkAtTop = ref(true);
+const tkAtBottom = ref(true);
+const tkScrollable = ref(false);
+
+function syncTkScroll() {
+  const el = tkScrollRef.value;
+  if (!el) return;
+  tkScrollable.value = el.scrollHeight > el.clientHeight + 1;
+  tkAtTop.value = el.scrollTop <= 1;
+  tkAtBottom.value = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
+}
+
+// 思考内容流式追加时默认跟到底部；用户自己往上滚离底部后不再抢滚动位置
+watch(
+  () => props.msg.reasoning_content,
+  async () => {
+    await nextTick();
+    const el = tkScrollRef.value;
+    if (!el) return;
+    if (tkAtBottom.value) el.scrollTop = el.scrollHeight;
+    syncTkScroll();
+  },
+);
+
+// 收起态是 v-show 隐藏（clientHeight=0），重新展开后要重算遮罩与吸底状态
+watch(thinkingOpen, async () => {
+  await nextTick();
+  syncTkScroll();
+});
+
+onMounted(async () => {
+  await nextTick();
+  syncTkScroll();
+});
+
+onUnmounted(() => {
+  if (thinkTicker !== null) {
+    window.clearInterval(thinkTicker);
+    thinkTicker = null;
+  }
+});
+
 // 媒体渲染上下文：media_v1 清单按 ordinal 与正文中的媒体语法对齐
 const mediaCtx = computed(() =>
   props.msg.media && props.msg.media.length ? { items: props.msg.media } : undefined
 );
+
+// 媒体清单指纹。清单是回合收尾（message_final）才补挂到消息上的，而流式期间图片
+// 语法已经先按「无清单」退化渲染成文件链接并写进 blockCache；缓存 key 只含「起始
+// 媒体序号 + 块源码」，清单后补时 key 不变，旧 HTML 会被直接命中，图片永远不显示
+// （切走再回来才恢复）。因此指纹一变必须整体失效已完成块缓存。
+const mediaSignature = computed(() =>
+  (props.msg.media || [])
+    .map((m) => `${m.kind}:${m.url || m.error_code || m.digest || ''}`)
+    .join('|')
+);
+let lastMediaSig: string | null = null;
+
+// 块级增量渲染：已完成块的 HTML 按「起始媒体序号 + 块源码」缓存，
+// 流式期间只重渲染尾部块。缓存是组件级的，随组件销毁回收，不跨消息串味。
+const blockCache = new Map<string, { html: string; mediaCount: number }>();
+
+interface MdBlock {
+  key: string;
+  html: string;
+}
+
+const mdBlocks = computed<MdBlock[]>(() => {
+  // media 清单指纹变化即整体失效已完成块缓存（原因见 mediaSignature 注释）
+  if (mediaSignature.value !== lastMediaSig) {
+    lastMediaSig = mediaSignature.value;
+    blockCache.clear();
+  }
+  const src = props.msg.content || '';
+  if (!src.trim()) return [];
+  const { blocks, tail } = splitStableBlocks(src);
+  const out: MdBlock[] = [];
+  let ordinal = 0;
+  for (const block of blocks) {
+    const key = `${ordinal}|${block}`;
+    let cached = blockCache.get(key);
+    if (!cached) {
+      const rendered = renderMarkdownDetailed(block, mediaCtx.value, ordinal);
+      cached = { html: rendered.html, mediaCount: rendered.mediaCount };
+      blockCache.set(key, cached);
+    }
+    ordinal += cached.mediaCount;
+    out.push({ key, html: cached.html });
+  }
+  out.push({
+    key: 'tail',
+    html: renderMarkdownDetailed(tail, mediaCtx.value, ordinal).html,
+  });
+  return out;
+});
 
 // 复制文本到剪贴板：优先 Clipboard API，失败回退 execCommand（pywebview/旧内核兼容）
 async function copyToClipboard(text: string): Promise<void> {
@@ -271,6 +627,14 @@ function onMdBodyClick(e: MouseEvent) {
     e.preventDefault();
     const src = copyBtn.getAttribute('data-copy-src') || '';
     if (src) copyMdImageToClipboard(src, copyBtn as HTMLButtonElement);
+    return;
+  }
+
+  const saveBtn = (e.target as HTMLElement).closest('button.md-img-save, button.md-video-save');
+  if (saveBtn) {
+    e.preventDefault();
+    const src = saveBtn.getAttribute('data-save-src') || '';
+    if (src) saveMdImageAs(src, saveBtn.getAttribute('data-save-name') || '', saveBtn as HTMLButtonElement);
     return;
   }
 
@@ -305,6 +669,12 @@ function onMdBodyClick(e: MouseEvent) {
     const target = toAbsoluteLocalPath(raw, store.workdir);
     if (!target) {
       store.notifyModal('文件预览', '当前会话未绑定工作目录，无法解析相对路径');
+      return;
+    }
+    // html / pdf / md 交给右栏（网页直接渲染，md 先渲染成预览页）；
+    // 移动端没有右面板，一律回退源码预览弹窗
+    if (canOpenInRightPanel(target) && !isMobile.value) {
+      void store.openInRightPanel(target);
       return;
     }
     store.openFilePreview(target);
@@ -379,6 +749,35 @@ async function copyMdImageToClipboard(src: string, btn: HTMLButtonElement) {
     setFeedback(true);
   } catch {
     setFeedback(false);
+  }
+}
+
+// "另存为"：后端弹原生保存对话框，把仓库里的原文件复制到用户选择的位置。
+// 图片与视频共用本函数（按钮由 Markdown 渲染层产出，类名不同、属性约定一致）。
+// 用户取消不提示失败；成功/失败都在按钮上短暂反馈，不打断阅读。
+async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButtonElement) {
+  const label = btn.querySelector('.md-img-save-text, .md-video-save-text');
+  const restore = () => {
+    btn.classList.remove('saved', 'save-failed');
+    if (label) label.textContent = '另存为';
+  };
+  const feedback = (text: string, cls: string) => {
+    btn.classList.add(cls);
+    if (label) label.textContent = text;
+    window.setTimeout(restore, 1500);
+  };
+  btn.disabled = true;
+  try {
+    const res = await store.saveMediaImage(src, suggestedName);
+    if (res && res.ok) {
+      feedback('已保存', 'saved');
+    } else if (!res || !res.cancelled) {
+      // 取消对话框不是错误，静默复原；其余失败给出可见提示
+      feedback('保存失败', 'save-failed');
+      if (res && res.msg) store.notifyChat(`另存失败：${res.msg}`);
+    }
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -476,6 +875,146 @@ async function copyUserMessage() {
   if (userCopiedTimer) window.clearTimeout(userCopiedTimer);
   userCopiedTimer = window.setTimeout(() => { userCopied.value = false; }, 1500);
 }
+
+// 编辑已发送消息：气泡就地变输入框，提交后由 store 截断历史并重新发送。
+// 生成中也能编辑：提交会先打断当前回合并等它收尾，再回滚重发
+const editing = ref(false);
+const editText = ref('');
+const editSubmitting = ref(false);
+const editInputRef = ref<HTMLTextAreaElement | null>(null);
+// 编辑态的图片：初始是本条消息原有的 dataURL；新增的（选文件/粘贴）也是 dataURL，
+// 提交时统一经 saveClipboardImage 落盘成路径，交给 sendMessage 的附件链路
+const editImages = ref<string[]>([]);
+const editImageInput = ref<HTMLInputElement | null>(null);
+
+const canEdit = computed(() => !!props.msg._msg_id);
+
+// 提示要说清后果：运行中会中断当前回合并丢弃它产生的记录
+const editHint = computed(() => (store.running
+  ? '保存将中断当前回合，并删除该回合产生的记录'
+  : '该回合的文件改动不会随编辑回滚'));
+
+async function startEdit() {
+  if (!canEdit.value) return;
+  editText.value = props.msg.content || '';
+  editImages.value = [...(props.msg.images || [])];
+  editing.value = true;
+  await nextTick();
+  const el = editInputRef.value;
+  if (el) {
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }
+}
+
+function cancelEdit() {
+  if (editSubmitting.value) return;
+  editing.value = false;
+  editText.value = '';
+  editImages.value = [];
+}
+
+function removeEditImage(index: number) {
+  if (editSubmitting.value) return;
+  editImages.value.splice(index, 1);
+}
+
+function pickEditImages() {
+  if (editSubmitting.value) return;
+  editImageInput.value?.click();
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => resolve('');
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addEditImageFiles(files: File[]) {
+  for (const file of files) {
+    // 与 save_clipboard_image 支持的格式对齐：不支持的当场挡掉，
+    // 免得提交时才报错、用户还得重新选一遍
+    if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) continue;
+    const url = await readFileAsDataUrl(file);
+    if (url) editImages.value.push(url);
+  }
+}
+
+async function onEditImagesPicked(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  input.value = '';   // 复位后同一个文件可以再次选择
+  await addEditImageFiles(files);
+}
+
+async function onEditPaste(e: ClipboardEvent) {
+  const items = Array.from(e.clipboardData?.items || []);
+  const files: File[] = [];
+  for (const item of items) {
+    if (item.kind === 'file' && item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  if (!files.length) return;
+  // 有图片就拦下默认粘贴，避免把图片当成路径文本塞进输入框
+  e.preventDefault();
+  await addEditImageFiles(files);
+}
+
+function sameImages(a: string[], b: string[]) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+async function submitEdit() {
+  if (editSubmitting.value) return;
+  const text = editText.value.trim();
+  const imagesChanged = !sameImages(editImages.value, props.msg.images || []);
+  // 文本和图都没动 = 取消；文本和图都空 = 没内容可发
+  if (!text && !editImages.value.length) return;
+  if (text === (props.msg.content || '').trim() && !imagesChanged) {
+    cancelEdit();
+    return;
+  }
+  editSubmitting.value = true;
+  try {
+    // 历史图与新图都是 dataURL：统一落盘成路径后走 sendMessage 的附件链路
+    const paths: string[] = [];
+    for (const url of editImages.value) {
+      if (!url.startsWith('data:')) {
+        paths.push(url);
+        continue;
+      }
+      const saved = await store.saveClipboardImage(url);
+      // 落盘失败（超 8MB / 格式不支持）已由 store 提示，中止以免图片静默丢失
+      if (!saved) return;
+      paths.push(saved);
+    }
+    const ok = await store.editUserMessage(props.msg, text, paths);
+    // 成功后本组件对应的消息已被移出列表；失败留在编辑态便于重试
+    if (ok) editing.value = false;
+  } finally {
+    editSubmitting.value = false;
+  }
+}
+
+function onEditKeydown(e: KeyboardEvent) {
+  // 输入法组合中的 Enter 是在确认候选词，不能当成提交
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    void submitEdit();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    cancelEdit();
+  }
+}
 </script>
 
 <style scoped>
@@ -565,6 +1104,83 @@ async function copyUserMessage() {
 .msg-user:hover .user-action-bar {
   opacity: 1;
 }
+/* 编辑态：气泡变可编辑文本框，操作区常驻（不随 hover 淡出） */
+.user-bubble.is-editing {
+  max-width: 80%;
+}
+.user-edit-input {
+  width: 100%;
+  min-width: 260px;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  line-height: 1.65;
+  resize: vertical;
+}
+.user-edit-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.user-edit-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.user-edit-submit {
+  color: var(--text-bright);
+  border-color: var(--accent);
+}
+.user-edit-bar .msg-copy-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+/* 编辑态的图片网格：与只读缩略图分开，右上角带移除按钮 */
+.edit-img-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.edit-img-cell {
+  position: relative;
+}
+.edit-img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+}
+.edit-img-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(15, 15, 15, 0.66);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.edit-img-remove:hover {
+  background: rgba(15, 15, 15, 0.88);
+}
+.edit-file-input {
+  display: none;
+}
 .msg-copy-btn {
   display: inline-flex;
   align-items: center;
@@ -606,25 +1222,135 @@ async function copyUserMessage() {
   padding: 1px 7px;
 }
 
+/* 思考块（对齐 ZCode）：整块无底色无边框，折叠头是一行轻量灰字——
+   脑图标 +「思考 · N 秒」+ 悬停才浮现的小箭头 */
 .think-block {
-  border-left: 2px solid var(--purple);
-  background: rgba(188, 140, 255, 0.06);
-  border-radius: 0 8px 8px 0;
-  padding: 8px 12px;
-  margin: 8px 0;
+  margin: 10px 0;
   font-size: 12.5px;
-  color: var(--purple);
+  color: var(--text-faint);
 }
-/* 思考块内的折叠头跟随块体紫色（覆盖 FoldCard 默认的 faint 灰） */
+/* 折叠头改成贴合内容的行内宽度（ZCode 的 trigger 是 self-start，不铺满整行） */
 .think-block :deep(.fold-head) {
+  width: fit-content;
+  max-width: 100%;
+  gap: 6px;
+  padding: 1px 0;
   color: inherit;
 }
+.think-block :deep(.fold-head:hover) {
+  color: var(--text-dim);
+}
+.tk-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.tk-brain {
+  flex: none;
+  opacity: 0.85;
+}
+.tk-label {
+  flex: none;
+  font-weight: 500;
+  white-space: nowrap;
+}
+/* 流式中的标签走极轻的扫光渐变，比"呼吸圆点"更安静 */
+.tk-label.is-thinking {
+  background: linear-gradient(
+    90deg,
+    var(--text-faint) 0%,
+    var(--text-bright) 45%,
+    var(--text-faint) 90%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: tk-shimmer 2.4s linear infinite;
+}
+@keyframes tk-shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
+}
+.tk-sep {
+  flex: none;
+  opacity: 0.5;
+}
+/* 收起态的流式摘要：单行省略，占用标签之后的剩余宽度 */
+.tk-live {
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--text-dim);
+}
+.tk-live-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 箭头平时不出现，悬停 / 键盘聚焦 / 已展开时才浮现（与 ZCode 的 hover-only 一致） */
+.think-block :deep(.fold-caret) {
+  opacity: 0;
+  transition: opacity 0.12s ease, transform 0.15s ease;
+}
+.think-block :deep(.fold-head:hover .fold-caret),
+.think-block :deep(.fold-head:focus-visible .fold-caret),
+.think-block :deep(.fold-caret.is-open) {
+  opacity: 1;
+}
 .tk-cnt {
-  margin-top: 6px;
+  margin: 4px 0 0 6px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+  /* 展开后默认只占 10 行高度（1.6em 即一行行高），超出部分内部滚动查看，
+     避免超长思考把整个对话拉成一条；+2px 抵消行高小数的取整误差，防止
+     恰好 10 行时露出 1px 滚动条 */
+  max-height: calc(1.6em * 10 + 2px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   white-space: pre-wrap;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.6;
+  color: var(--text-faint);
+}
+/* 滚动边缘渐隐：在顶部只淡出底边，在底部只淡出顶边，在中间两侧都淡 */
+.tk-cnt.is-scrollable.at-bottom:not(.at-top) {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+}
+.tk-cnt.is-scrollable.at-top:not(.at-bottom) {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent 100%);
+}
+.tk-cnt.is-scrollable:not(.at-top):not(.at-bottom) {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 14px,
+    #000 calc(100% - 14px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 14px,
+    #000 calc(100% - 14px),
+    transparent 100%
+  );
+}
+@media (prefers-reduced-motion: reduce) {
+  .tk-label.is-thinking {
+    animation: none;
+    background: none;
+    color: var(--text-faint);
+  }
 }
 
 .spin {
@@ -752,12 +1478,36 @@ async function copyUserMessage() {
   cursor: zoom-in;
   object-fit: contain;
 }
-/* 悬停浮现的"复制原图"按钮：图片右上角。配色固定为深色底白字（不随主题变
-   量走），保证压在任意明暗的图片内容上都有足够对比度 */
-.md-body :deep(.md-img-copy) {
+/* 悬停浮现的媒体操作区（图片：复制原图 / 另存为；视频：另存为）：压在媒体
+   右上角，按钮横向排列。视频原生控件条在底部，与顶部操作区不重叠。
+   配色固定为深色底白字（不随主题变量走），保证压在任意明暗的图片/画面上
+   都有足够对比度 */
+.md-body :deep(.md-img-actions),
+.md-body :deep(.md-video-actions) {
   position: absolute;
   top: 14px;
   right: 14px;
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.md-body :deep(.md-media-wrap:hover .md-img-actions),
+.md-body :deep(.md-media-wrap:hover .md-video-actions),
+.md-body :deep(.md-img-actions:focus-within),
+.md-body :deep(.md-video-actions:focus-within),
+/* 按钮自身处于反馈态时（点击后鼠标移开）操作区继续保持可见 */
+.md-body :deep(.md-img-actions:has(.copied)),
+.md-body :deep(.md-img-actions:has(.saved)),
+.md-body :deep(.md-img-actions:has(.copy-failed)),
+.md-body :deep(.md-img-actions:has(.save-failed)),
+.md-body :deep(.md-video-actions:has(.saved)),
+.md-body :deep(.md-video-actions:has(.save-failed)) {
+  opacity: 1;
+}
+.md-body :deep(.md-img-copy),
+.md-body :deep(.md-img-save),
+.md-body :deep(.md-video-save) {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -769,29 +1519,36 @@ async function copyUserMessage() {
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
   backdrop-filter: blur(4px);
 }
-.md-body :deep(.md-img-copy svg) {
+.md-body :deep(.md-img-copy svg),
+.md-body :deep(.md-img-save svg),
+.md-body :deep(.md-video-save svg) {
   width: 13px;
   height: 13px;
 }
-.md-body :deep(.md-media-wrap:hover .md-img-copy),
-.md-body :deep(.md-img-copy:focus-visible),
-.md-body :deep(.md-img-copy.copied),
-.md-body :deep(.md-img-copy.copy-failed) {
-  opacity: 1;
+.md-body :deep(.md-img-copy:disabled),
+.md-body :deep(.md-img-save:disabled),
+.md-body :deep(.md-video-save:disabled) {
+  cursor: default;
+  opacity: 0.75;
 }
-.md-body :deep(.md-img-copy:hover) {
+.md-body :deep(.md-img-copy:hover),
+.md-body :deep(.md-img-save:hover),
+.md-body :deep(.md-video-save:hover) {
   background: rgba(15, 15, 15, 0.9);
   border-color: rgba(255, 255, 255, 0.55);
   color: #fff;
 }
-.md-body :deep(.md-img-copy.copied) {
+.md-body :deep(.md-img-copy.copied),
+.md-body :deep(.md-img-save.saved),
+.md-body :deep(.md-video-save.saved) {
   color: #4ade80;
 }
-.md-body :deep(.md-img-copy.copy-failed) {
+.md-body :deep(.md-img-copy.copy-failed),
+.md-body :deep(.md-img-save.save-failed),
+.md-body :deep(.md-video-save.save-failed) {
   color: #f87171;
 }
 .md-body :deep(video.md-video) {
@@ -877,7 +1634,7 @@ async function copyUserMessage() {
   color: var(--text);
 }
 .md-body :deep(.mermaid-block[data-state='error'])::after {
-  content: '⚠️ 图表渲染失败，已显示 Mermaid 源码。可点击「复制源码」到其他渲染工具查看。';
+  content: '⚠️ 图表渲染失败，已显示 Mermaid 源码。' attr(data-error-reason) '可点击「复制源码」到其他渲染工具查看。';
   display: block;
   font-size: 12px;
   color: var(--orange);
@@ -906,6 +1663,70 @@ async function copyUserMessage() {
   border-radius: 8px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 登录过期：错误提示旁直接出现的「重新登录」入口 */
+.login-again-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+.login-again-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg3));
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 6px;
+  cursor: pointer;
+}
+.login-again-btn:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg3));
+}
+
+/* 断点续跑入口（S4）：紧贴错误条，说明"只续跑无写操作的调用" */
+.resume-continue {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+.resume-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.resume-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.resume-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.resume-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.resume-blockers {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--red);
 }
 
 .msg-error {

@@ -138,11 +138,14 @@ def get_selected_command_shell() -> str:
     return value or DEFAULT_COMMAND_SHELL
 
 
-def _computer_active_model_capability(computer) -> dict[str, Any]:
+def _computer_active_model_capability(computer, active_model_id: str | None = None) -> dict[str, Any]:
     """当前活动模型的电脑操控资格摘要（设置面板展示用，只读）。
 
     与 Turn 起点走同一个判定函数（resolve_computer_capability，local 来源），
     保证设置页提示与真实执行门槛一致；模型未配置/读取失败时不影响设置页。
+
+    active_model_id 由调用方传入「真正会执行任务的模型」（GUI 按会话绑定模型，
+    全局 active_model_id 只在会话未绑定时才生效）；缺省时退回全局值。
     """
     try:
         from core.computer.capability import resolve_computer_capability
@@ -151,7 +154,7 @@ def _computer_active_model_capability(computer) -> dict[str, Any]:
         # 不走 model_manager.load_config（其模块级 _CONFIG_FILE 快照与设置
         # 路径可能不一致）。
         data = config._load()
-        active_id = str(data.get("active_model_id") or "")
+        active_id = str(active_model_id or data.get("active_model_id") or "")
         model = None
         provider = {}
         for candidate in data.get("providers", []):
@@ -189,7 +192,9 @@ def _computer_active_model_capability(computer) -> dict[str, Any]:
         }
 
 
-def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
+def get_system_settings(
+    *, platform: str | None = None, active_model_id: str | None = None
+) -> dict[str, Any]:
     selected = get_selected_command_shell()
     options = list_command_shell_options(platform=platform)
     selected_option = next((item for item in options if item["id"] == selected), None)
@@ -197,7 +202,7 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         error = f"未知的命令解释器配置：{selected}"
         selected_available = False
     elif not selected_option["available"]:
-        error = f"{selected_option['label']} 未安装或不在 Y-CODE 的 PATH 中"
+        error = f"{selected_option['label']} 未安装或不在 星瑶Code 的 PATH 中"
         selected_available = False
     else:
         error = ""
@@ -216,6 +221,21 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
 
     hotkey = get_emergency_hotkey_snapshot()
     computer_run = get_computer_control_service().snapshot()
+    # AI 生成内容目录（设置项 ai_output_dir）：同样走函数内惰性导入，
+    # 避免模块级 import 造成 command_shell ↔ ai_output_paths 循环依赖。
+    from core.ai_output_paths import (
+        default_ai_output_dir as _default_ai_output_dir,
+        get_ai_output_dir_setting as _get_ai_output_dir_setting,
+        resolve_ai_output_dir as _resolve_ai_output_dir,
+    )
+    # 上下文水位基准（memory_compression.watermark_base_tokens）：同样走函数内惰性导入，
+    # None 表示不设基准、按真实模型窗口的比例线计算。
+    from core.context_watermark import (
+        MAX_WATERMARK_BASE,
+        MIN_WATERMARK_BASE,
+        load_watermark_base,
+    )
+
     return {
         "command_shell": selected,
         "command_shell_options": options,
@@ -225,6 +245,10 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "agent_turn_step_limit": load_turn_step_limit(),
         "agent_turn_step_limit_min": MIN_TURN_STEP_LIMIT,
         "agent_turn_step_limit_max": MAX_TURN_STEP_LIMIT,
+        # 上下文水位基准：生效值（None = 不设基准、跟随真实窗口）/ 合法区间（设置页校验用）
+        "context_watermark_base": load_watermark_base(),
+        "context_watermark_base_min": MIN_WATERMARK_BASE,
+        "context_watermark_base_max": MAX_WATERMARK_BASE,
         "browser_control_enabled": computer.browser_control_enabled,
         "computer_control_enabled": computer.computer_control_enabled,
         "computer_browser": computer.computer_browser,
@@ -234,7 +258,13 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "computer_hotkey_available": hotkey.available,
         "computer_hotkey": "Ctrl+Alt+Esc",
         "computer_run": computer_run.to_public_dict(),
-        "computer_active_model_capability": _computer_active_model_capability(computer),
+        "computer_active_model_capability": _computer_active_model_capability(
+            computer, active_model_id
+        ),
+        # AI 生成内容目录：生效绝对路径 / 原始配置值（设置页回显）/ 默认目录
+        "ai_output_dir": str(_resolve_ai_output_dir()),
+        "ai_output_dir_setting": _get_ai_output_dir_setting(),
+        "ai_output_dir_default": str(_default_ai_output_dir()),
     }
 
 
@@ -245,7 +275,7 @@ def set_selected_command_shell(shell_id: str, *, platform: str | None = None) ->
     if selected is None:
         raise ValueError(f"不支持的命令解释器：{shell_id or '空值'}")
     if not selected["available"]:
-        raise CommandShellUnavailableError(f"{selected['label']} 未安装或不在 Y-CODE 的 PATH 中")
+        raise CommandShellUnavailableError(f"{selected['label']} 未安装或不在 星瑶Code 的 PATH 中")
     if not config.save_config_value(COMMAND_SHELL_CONFIG_KEY, shell_id):
         raise CommandShellError("命令解释器配置保存失败")
     return get_system_settings(platform=platform)
@@ -259,7 +289,7 @@ def _selected_option(platform: str, shell_id: str | None = None) -> dict[str, An
         raise CommandShellError(f"未知的命令解释器配置：{selected_id}")
     if not selected["available"]:
         raise CommandShellUnavailableError(
-            f"{selected['label']} 未安装或不在 Y-CODE 的 PATH 中，请在系统设置中重新选择"
+            f"{selected['label']} 未安装或不在 星瑶Code 的 PATH 中，请在系统设置中重新选择"
         )
     return selected
 

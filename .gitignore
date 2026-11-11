@@ -39,6 +39,8 @@ mytemp/
 # 任务日志与本地运行状态（含个人路径，不入库）
 .ycode_tasks/*.log
 .ycode_tasks/tasks.json
+# 项目内运行时数据目录（画布文档/媒体副本/生成产物，用户数据不入库）
+.ycode/
 # 会话计划快照（运行时状态，不入库）
 .zcode/
 
@@ -73,6 +75,11 @@ zip/
 # Build logs
 build_log.txt
 
+# 根目录临时日志与草稿（不入库）
+# 注意：/*.log 只匹配仓库根目录，不要写成 *.log，否则会误伤 assets 等子目录中的正常文件
+/*.log
+/*.txt.tmp
+
 # DB debug exports (temporary debug dumps)
 db_*.txt
 
@@ -88,8 +95,11 @@ test20*/
 # Runtime diagnostic output (playwright screenshots, contact sheets, etc.)
 output/
 
-# pytest ��ʱ����Ŀ¼
+# pytest 临时工作目录
 tmp/
+
+# pytest 全量运行的输出记录（本地回归对比用，不入库）
+/pytest_*.txt
 
 # 临时产物：图片生成脚本（内含密钥，严禁入库）与本地测试生成的图片/图表
 gen_images.py
@@ -104,3 +114,99 @@ docs/harness_execution_flow.md
 
 # Node dependencies
 node_modules/
+
+# SQLite WAL sidecar files - runtime state
+*.db-shm
+*.db-wal
+
+# 内部合规材料：含系统弱点与风险分析，仅本地留存，禁止入库/推送
+# 覆盖合规审查报告、整改方案、PII 处置报告（含后续新增版本）
+docs/合规审查报告*
+docs/合规整改方案*
+docs/PII*
+
+# 内部审查/弱点报告（英文命名）：公开仓库即泄漏弱点清单，禁止入库/推送（A2-01）
+# 根目录审查与系统审查报告
+/代码审查与优化报告.md
+/系统审查报告-*.md
+# docs 顶层治理/审查/计算机控制测试报告
+docs/AUDIT-REMEDIATION-REPORT.md
+docs/REVIEW_TODO_*.md
+docs/HANDOVER-*.md
+docs/computer-audit-*
+docs/computer-control-audit-*
+docs/computer-control-repair-*
+docs/computer-repair-*
+docs/memory-compression-repair-*
+# superpowers 开发文档（plans/specs/reviews）整体不再跟踪
+docs/superpowers/
+
+hunyuan_*.jpg
+tokenrhythm_*.png
+.tmp_skill_src/
+build_*.log
+dryrun_*.log
+publish_*.log
+
+# Y-code GUI 本地运行数据（后台任务日志/计划/任务设置），仅本地留存
+.ycode_tasks/
+
+# One-off design exploration mockups (prototypes, not shipped)
+# 实际目录名为 mockups/，design_mockups/ 为旧名，两者都忽略
+mockups/
+design_mockups/
+
+# 公众号内容工作区（本地草稿与配图，不入库）
+/公众号/
+gzh-tokenrhythm/
+
+# 一次性临时生图脚本（本地使用，不入库）
+_day3_imggen.py
+
+# 随包第三方二进制：ffmpeg.exe 约 96MB，体积过大不入库，按需本地下载（来源与 SHA256 见 vendor/VENDOR_MANIFEST.json）
+# 注意用 `/vendor/ffmpeg/*` 而不是 `/vendor/ffmpeg/`：后者会连目录本身一起排除，
+# 白名单规则对已被排除目录内的文件不生效。
+#
+# NOTICE.txt 必须入库（白名单例外）：它承载 GPLv3 的分发义务（许可证全文 +
+# 源码获取方式），同时是 build_release.py::step0d 产出 ffmpeg 组件包时的必需
+# 文件（FFMPEG_COMPONENT_FILES）。它只是文本，不占体积，没有任何理由不入库。
+/vendor/ffmpeg/*
+!/vendor/ffmpeg/NOTICE.txt
+# 误操作产生的空文件（2026-10-17 命令重定向写坏），不入库
+/'
+
+# 公众号内容工作区（本地草稿与配图，不入库）—— 与 /公众号/、gzh-tokenrhythm/ 同类
+gzh-loomy/
+
+# 电脑操控内部审计与修复方案（含系统弱点清单，公开仓库即泄漏），禁止入库/推送
+# —— 与 docs/computer-audit-* 系列同类
+docs/电脑操控审计与修复方案*
+
+# 内部开发方案草稿（不公开）
+/待开发/
+
+# docs 顶层其余内部审计/交接数据与临时工作文档（已从索引移除，规则防止再次入库）
+docs/computer-soak-*.json
+docs/computer-local-benchmark.json
+docs/computer-model-loop-benchmark.json
+docs/computer-apps-matrix.json
+docs/2026-10-23-computer-efficiency-report.md
+docs/2026-10-27-edit-message-and-release-review-todo.md
+docs/对话可操作性审计-*.md
+docs/opensquilla-可借鉴方案-*.md
+docs/task.md
+
+# JVM 崩溃转储（保底规则：GPU/OCR 等 Java 依赖崩溃时会写在工作目录根部，不入库）
+hs_err_pid*.log
+replay_pid*.log
+
+# 一次性开发补丁脚本（含内部实现细节，不入库）
+_patch_tr_*.py
+
+# 第三方平台接口逆向清单（本地参考，不公开）
+skills/tokenrhythm-account/reference.md
+
+# 误操作产生的临时文件（命令重定向写坏 / 空文件），不入库
+/a.txt
+/y
+

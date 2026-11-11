@@ -36,7 +36,7 @@ def test_load_session_messages_extracts_metrics():
     }
     bridge._memory.add_message(session, "assistant", msg)
 
-    loaded = bridge._load_session_messages(session)
+    loaded, _, _ = bridge._load_session_messages(session)
     assert len(loaded) == 1
     assert loaded[0]["role"] == "assistant"
     assert loaded[0]["content"] == "测试回复"
@@ -54,7 +54,7 @@ def test_load_session_messages_handles_missing_metrics():
     bridge._memory.create_session_explicit(session)
     bridge._memory.add_message(session, "assistant", "普通纯文本回复")
 
-    loaded = bridge._load_session_messages(session)
+    loaded, _, _ = bridge._load_session_messages(session)
     assert len(loaded) == 1
     assert loaded[0]["metrics"] is None
 
@@ -109,7 +109,7 @@ def test_step_metrics_handles_mock_stream_gracefully(monkeypatch):
         ]
 
     monkeypatch.setattr(model_manager, "get_model_protocol", lambda *_: "responses")
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
 
     events = list(
         llm.chat_with_model_events(

@@ -87,6 +87,17 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="token-statistics-page"]').exists()).toBe(true);
   });
 
+  it('switches to the legacy token statistics view', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'loadTokenStatistics').mockResolvedValue(null);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="token-statistics-legacy-nav"]').trigger('click');
+
+    expect(wrapper.find('[data-test="token-statistics-page-legacy"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="token-statistics-page"]').exists()).toBe(false);
+  });
+
   it('opens the GUI appearance page from settings navigation', async () => {
     const wrapper = mount(SettingsPage);
 
@@ -101,6 +112,23 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="system-settings-nav"]').trigger('click');
 
     expect(wrapper.get('[data-test="system-settings-page"]').isVisible()).toBe(true);
+  });
+
+  it('opens the hooks page from settings navigation and refreshes the list', async () => {
+    const store = useAppStore();
+    const refreshSpy = vi.spyOn(store, 'refreshHooks').mockResolvedValue(undefined);
+    const wrapper = mount(SettingsPage);
+
+    // 默认落在模型配置分区，钩子分区未挂载
+    expect(wrapper.find('[data-test="hook-new-btn"]').exists()).toBe(false);
+    expect(refreshSpy).not.toHaveBeenCalled();
+
+    await wrapper.get('[data-test="hooks-nav"]').trigger('click');
+
+    expect(wrapper.text()).toContain('钩子 Hooks');
+    expect(wrapper.get('[data-test="hook-new-btn"]').isVisible()).toBe(true);
+    // 进入钩子分区挂载组件时自动刷新一次列表
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
   });
 
   it('opens a model editor with the multimodal choice', async () => {
@@ -157,7 +185,8 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="model-supports-function-calling"]').setValue(true);
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
-    expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '');
+    // 新增模型未定 ID、后端无从判断思考能力 → reasoningChoice 传 null（不落键）
+    expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '', 0, null);
   });
 
   it('blocks saving generic protocol without vision and function calling', async () => {
@@ -194,7 +223,7 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="model-computer-protocol-error"]').exists()).toBe(false);
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
-    expect(addModel).toHaveBeenCalledWith('p1', 'vision-model', 128000, true, true, 'generic');
+    expect(addModel).toHaveBeenCalledWith('p1', 'vision-model', 128000, true, true, 'generic', 0, null);
     expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(false);
   });
 
@@ -260,25 +289,149 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(true);
   });
 
+  it('renders no reasoning controls and sends null for the reasoning choice', async () => {
+    // 思考设置已从编辑弹窗下线：弹窗里不该有任何思考相关控件；
+    // 提交时一律传 null（后端语义 = 不落键），避免改上下文窗口这类无关操作覆盖既有档位。
+    // fixed 模型（始终开启思考）后端一律拒绝写入，若前端把回填的 "on" 传出去，
+    // 用户只改上下文窗口也会收到"思考设置未生效"的虚假警告。
+    const store = useAppStore();
+    const updateSpy = vi.spyOn(store, 'updateModel').mockResolvedValue({ ok: true } as never);
+    store.$patch({
+      providers: [
+        {
+          id: 'p1',
+          name: '测试厂商',
+          base_url: 'https://api.example.com',
+          protocol: 'responses',
+          has_api_key: true,
+          models: [
+            {
+              id: 'm1',
+              name: 'kimi-k2.7-code',
+              provider_id: 'p1',
+              provider_name: '测试厂商',
+              context_window: 200000,
+              supports_vision: true,
+              supports_function_calling: true,
+              computer_protocol: '',
+              // 与后端 build_reasoning_snapshot 的真实输出一致：fixed 的 options 为空
+              reasoning_choice: 'on',
+              reasoning_options: [],
+              reasoning_visible: true,
+              reasoning_kind: 'fixed',
+              reasoning_disabled_reason: '该模型始终开启思考',
+            },
+          ],
+        },
+      ],
+    });
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const editButton = wrapper.findAll('.configured-model-row .row-actions button')
+      .find(button => button.text() === '编辑');
+    await editButton!.trigger('click');
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+    await flushPromises();
+
+    expect(wrapper.findAll('[data-test^="model-reasoning"]').length).toBe(0);
+
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    expect(updateSpy.mock.calls[0]![8]).toBeNull();
+  });
+
+  it('keeps a stored reasoning level untouched when saving an unrelated edit', async () => {
+    const store = useAppStore();
+    const updateSpy = vi.spyOn(store, 'updateModel').mockResolvedValue({ ok: true } as never);
+    store.$patch({
+      providers: [
+        {
+          id: 'p1',
+          name: '测试厂商',
+          base_url: 'https://api.example.com',
+          protocol: 'responses',
+          has_api_key: true,
+          models: [
+            {
+              id: 'm1',
+              name: 'deepseek-v4-pro',
+              provider_id: 'p1',
+              provider_name: '测试厂商',
+              context_window: 200000,
+              supports_vision: true,
+              supports_function_calling: true,
+              computer_protocol: '',
+              reasoning_choice: 'default',
+              reasoning_options: [
+                { value: 'default', label: '默认' },
+                { value: 'off', label: '关闭' },
+                { value: 'high', label: '高' },
+                { value: 'max', label: '最高' },
+              ],
+              reasoning_visible: true,
+              reasoning_kind: 'effort',
+              reasoning_disabled_reason: '',
+            },
+          ],
+        },
+      ],
+    });
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const editButton = wrapper.findAll('.configured-model-row .row-actions button')
+      .find(button => button.text() === '编辑');
+    await editButton!.trigger('click');
+    // 编辑弹窗不再管理思考设置：弹窗里没有相关控件，保存时第 9 个参数必须传 null，
+    // 由后端保留用户已存的档位，而不是被弹窗里的默认值覆盖。
+    expect(wrapper.findAll('[data-test^="model-reasoning"]').length).toBe(0);
+
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+    await flushPromises();
+
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    const args = updateSpy.mock.calls[0];
+    // 思考设置是 updateModel 的第 9 个参数
+    expect(args.length).toBe(9);
+    expect(args[args.length - 1]).toBeNull();
+  });
+
+  it('does not probe reasoning capabilities while typing a model name', async () => {
+    // 编辑弹窗不再展示思考设置，输入模型名时不该再发探测请求
+    const store = useAppStore();
+    const probeSpy = vi.spyOn(store, 'getReasoningSnapshotByName').mockResolvedValue(null);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('deepseek-v4-pro');
+    await new Promise(resolve => setTimeout(resolve, 450));
+    await flushPromises();
+
+    expect(probeSpy).not.toHaveBeenCalled();
+  });
+
   it('reveals the configured API key when clicking 显示', async () => {
     const store = useAppStore();
     const spy = vi.spyOn(store, 'getProviderApiKey').mockResolvedValue('sk-real-key');
     const wrapper = mount(SettingsPage);
 
     await wrapper.get('[data-test="provider-p1"]').trigger('click');
-    const input = wrapper.get('[data-test="provider-api-key"]');
-    expect(input.attributes('type')).toBe('password');
+    const textarea = wrapper.get('[data-test="provider-api-key"]');
+    // textarea 不支持 type=password：隐藏态改由 key-masked class（-webkit-text-security: disc）实现
+    expect(textarea.attributes('type')).toBeUndefined();
+    expect(textarea.classes()).toContain('key-masked');
 
     await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
     await flushPromises();
 
     expect(spy).toHaveBeenCalledWith('p1');
-    expect((input.element as HTMLInputElement).value).toBe('sk-real-key');
-    expect(input.attributes('type')).toBe('text');
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('sk-real-key');
+    expect(textarea.classes()).not.toContain('key-masked');
 
     await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
     await flushPromises();
-    expect(input.attributes('type')).toBe('password');
+    expect(textarea.classes()).toContain('key-masked');
   });
 
   it('does not reveal when the key cannot be loaded', async () => {
@@ -290,7 +443,7 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
     await flushPromises();
 
-    expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
+    expect(wrapper.get('[data-test="provider-api-key"]').classes()).toContain('key-masked');
   });
 
   it('adds and removes a command permission rule', async () => {
@@ -337,7 +490,138 @@ describe('SettingsPage', () => {
     await flushPromises();
 
     expect(writeText).toHaveBeenCalledWith('sk-real-key');
-    // 复制后输入框仍为掩码态，仅剪贴板拿到明文
-    expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
+    // 复制后仍为掩码态，仅剪贴板拿到明文
+    expect(wrapper.get('[data-test="provider-api-key"]').classes()).toContain('key-masked');
+  });
+
+  it('saves a multi-line API key as-is through updateProvider', async () => {
+    const store = useAppStore();
+    const updateSpy = vi.spyOn(store, 'updateProvider').mockResolvedValue({ ok: true } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const textarea = wrapper.get('[data-test="provider-api-key"]');
+    expect(textarea.element.tagName).toBe('TEXTAREA');
+    // 多 Key：一行一个；保存时原样（含换行）传给后端
+    await textarea.setValue('k1\nk2');
+    await textarea.trigger('input');
+
+    const saveButton = wrapper.findAll('button').find(button => button.text() === '保存厂商配置');
+    expect(saveButton).toBeDefined();
+    await saveButton!.trigger('click');
+    await flushPromises();
+
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    expect(updateSpy).toHaveBeenCalledWith('p1', '测试厂商', 'https://api.example.com', 'k1\nk2', 'responses');
+  });
+
+  it('accepts a multi-line API key for preset providers', async () => {
+    const store = useAppStore();
+    const addSpy = vi.spyOn(store, 'addPresetProvider').mockResolvedValue({ ok: true, provider_id: 'p1' } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-provider-toggle"]').trigger('click');
+    await wrapper.get('[data-test="preset-deepseek"]').trigger('click');
+
+    const textarea = wrapper.get('[data-test="preset-api-key"]');
+    expect(textarea.element.tagName).toBe('TEXTAREA');
+    // 多 Key：一行一个；保存时原样（含换行）传给后端
+    await textarea.setValue('k1\nk2');
+    await textarea.trigger('input');
+
+    const saveButton = wrapper.findAll('button').find(button => button.text() === '保存并添加厂商');
+    expect(saveButton).toBeDefined();
+    await saveButton!.trigger('click');
+    await flushPromises();
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith('deepseek', 'k1\nk2');
+  });
+
+  it('accepts a multi-line API key for custom providers', async () => {
+    const store = useAppStore();
+    const addSpy = vi.spyOn(store, 'addProvider').mockResolvedValue({ ok: true, provider_id: 'p1' } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-provider-toggle"]').trigger('click');
+    await wrapper.get('[data-test="add-custom-provider"]').trigger('click');
+
+    await wrapper.get('[data-test="custom-name"]').setValue('团队网关');
+    await wrapper.get('[data-test="custom-base-url"]').setValue('https://gw.example.com/v1');
+    const textarea = wrapper.get('[data-test="custom-api-key"]');
+    expect(textarea.element.tagName).toBe('TEXTAREA');
+    await textarea.setValue('k1\nk2');
+    await textarea.trigger('input');
+
+    const addButton = wrapper.findAll('button.primary-button').find(button => button.text() === '添加厂商');
+    expect(addButton).toBeDefined();
+    await addButton!.trigger('click');
+    await flushPromises();
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith('团队网关', 'https://gw.example.com/v1', 'k1\nk2', 'openai');
+  });
+
+  it('renders the disclaimer document with all clauses intact', async () => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="disclaimer-nav"]').trigger('click');
+
+    expect(wrapper.get('.settings-header h1').text()).toBe('免责条款');
+    const doc = wrapper.get('[data-test="disclaimer-doc"]');
+    // 8 个条款章节完整渲染
+    expect(wrapper.findAll('.disclaimer-clause').length).toBe(8);
+    // 条款版本与更新日期可见（修改条款正文后需同步更新）
+    expect(wrapper.get('[data-test="disclaimer-version"]').text()).toBe('v1.0');
+    // 关键法定免责边界必须存在，防止后续编辑误删
+    const text = doc.text();
+    expect(text).toContain('不提供、不运营任何生成式人工智能模型服务');
+    expect(text).toContain('责任限制');
+    expect(text).toContain('法律允许的最大范围内');
+    expect(text).toContain('按「现状」提供');
+  });
+
+  it('displays the micro error banner (Option B) when model test fails and allows copying/dismissing', async () => {
+    const store = useAppStore();
+    const rawError = 'litellm.AuthenticationError: AuthenticationError: OpenAIException - Invalid Authentication';
+    vi.spyOn(store, 'testModel').mockResolvedValue({ ok: false, msg: rawError } as never);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const testBtn = wrapper.findAll('.row-actions button').find(b => b.text().includes('测试'));
+    expect(testBtn).toBeDefined();
+    await testBtn!.trigger('click');
+    await flushPromises();
+
+    // 方案 B：微型警告条展开
+    const banner = wrapper.find('[data-test="model-error-banner"]');
+    expect(banner.exists()).toBe(true);
+    expect(banner.text()).toContain('API Key 无效或未授权');
+    expect(banner.text()).toContain('请检查该厂商配置的 API Key');
+
+    // 点击复制报错
+    await wrapper.get('[data-test="copy-test-error"]').trigger('click');
+    expect(writeText).toHaveBeenCalledWith(rawError);
+
+    // 点击关闭警告条
+    await wrapper.get('[data-test="dismiss-test-error"]').trigger('click');
+    expect(wrapper.find('[data-test="model-error-banner"]').exists()).toBe(false);
+  });
+
+  it('displays inline success indicator when model test succeeds without error banner', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'testModel').mockResolvedValue({ ok: true, msg: '连接成功' } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const testBtn = wrapper.findAll('.row-actions button').find(b => b.text().includes('测试'));
+    await testBtn!.trigger('click');
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="model-error-banner"]').exists()).toBe(false);
+    expect(wrapper.find('.test-result.ok').exists()).toBe(true);
+    expect(wrapper.get('.test-result.ok').text()).toContain('连接成功');
   });
 });

@@ -232,37 +232,79 @@ def test_rename_session_migrates_task_permission_grants():
     assert permission_grants.matches_command("git push origin dev", "新任务") is True
 
 
-def test_terminal_command_normalizes_global_workdir(monkeypatch, tmp_path):
-    """M19：GLOBAL 自由对话的内嵌终端不能把字符串 "GLOBAL" 当 Popen cwd。"""
-    import subprocess
+def _collect_events(bridge):
+    """替换 emit_event 收集事件，返回 [(event_type, payload), ...]。"""
+    events = []
+    bridge.emit_event = lambda kind, data: events.append((kind, data))
+    return events
 
+
+def _session_names_in_payload(payload):
+    return {s.get("name") for group in payload["sessions"] for s in group["sessions"]}
+
+
+def test_rename_session_emits_session_renamed_event():
+    """手动重命名成功后推送 session_renamed，前端据此迁移运行态与当前会话名。"""
     bridge = _bare_gui_bridge()
-    bridge._current_session = "global-session"
-    bridge._term_proc = None
-    bridge._term_lock = __import__("threading").Lock()
-    bridge._session_workdir = lambda _session: "GLOBAL"
-    bridge.emit_event = lambda _kind, _data: None
+    bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
+    events = _collect_events(bridge)
 
-    monkeypatch.chdir(tmp_path)
-    captured = {}
+    res = bridge.rename_session("旧名", "新名")
 
-    class FakeProc:
-        def __init__(self):
-            self.stdout = type("Out", (), {"readline": lambda self: b""})()
+    assert res["ok"] is True and res["name"] == "新名"
+    assert len(events) == 1
+    kind, payload = events[0]
+    assert kind == "session_renamed"
+    assert payload["old"] == "旧名" and payload["new"] == "新名"
+    # 兼容旧字段名，与 _rename_session_to_title 的负载保持一致
+    assert payload["old_name"] == "旧名" and payload["new_name"] == "新名"
+    assert "新名" in _session_names_in_payload(payload)
 
-        def poll(self):
-            return None
 
-        def wait(self, timeout=None):
-            return 0
+def test_rename_session_refused_while_turn_active_emits_no_event():
+    """回合运行中重命名被拒时不推事件，避免前端把状态迁到未生效的新名。"""
+    bridge = _bare_gui_bridge()
+    bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
+    bridge._active_turns = {"旧名": _AliveThread()}
+    events = _collect_events(bridge)
 
-    def fake_popen(command, **kwargs):
-        captured.update(kwargs)
-        return FakeProc()
+    res = bridge.rename_session("旧名", "新名")
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    assert res["ok"] is False
+    assert events == []
 
-    res = bridge.run_terminal_command("echo hi")
 
-    assert res["ok"] is True
-    assert captured["cwd"] == gui_bridge._resolve_real_path(str(tmp_path))
+def test_rename_session_emit_failure_still_reports_success():
+    """事件推送失败不改判结果：DB 与授权迁移已生效，报失败会让前端以为没改名。"""
+    bridge = _bare_gui_bridge()
+    bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
+
+    def _boom(kind, data):
+        raise RuntimeError("窗口已销毁")
+
+    bridge.emit_event = _boom
+
+    res = bridge.rename_session("旧名", "新名")
+
+    assert res["ok"] is True and res["name"] == "新名"
+    assert any(
+        s.get("name") == "新名"
+        for s in bridge._memory.get_all_sessions(workdir=None, include_empty=True)
+    )
+
+
+def test_rename_session_snapshot_failure_returns_ok_without_sessions():
+    """取列表失败仍返回 ok=True 且 sessions=None：前端据此跳过列表覆盖，不清空侧栏。"""
+    bridge = _bare_gui_bridge()
+    bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
+    _collect_events(bridge)
+
+    def _boom():
+        raise RuntimeError("数据库繁忙")
+
+    bridge.get_sessions = _boom
+
+    res = bridge.rename_session("旧名", "新名")
+
+    assert res["ok"] is True and res["name"] == "新名"
+    assert res["sessions"] is None

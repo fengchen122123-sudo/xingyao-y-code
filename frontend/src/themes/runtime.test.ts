@@ -68,6 +68,45 @@ afterEach(() => {
 });
 
 describe('applyGuiTheme', () => {
+  it('清除 body 上启动期写入的 inline 背景色，避免旧主题实色残留在面板缝隙', async () => {
+    // 启动时 applyBootTheme 会把首屏主题的背景实色写进 body.style（防白闪）；
+    // 运行期切换主题后若不清除，深色主题下 body 仍是旧浅色，面板之间 1px
+    // 的缝隙会露出这层旧色，看上去像两条亮线。
+    document.body.style.backgroundColor = 'rgb(244, 244, 241)';
+
+    const applied = await applyGuiTheme(theme(), fakeApi());
+
+    expect(document.body.style.backgroundColor).toBe('');
+    applied.dispose();
+  });
+
+  it('把主题 ID 写到 documentElement 的 data-gui-theme-id，供主题专属 CSS 作用域激活', async () => {
+    // 主题专属样式表（如 qq2009.css）用 html[data-gui-theme-id="builtin.qq2009"]
+    // 限定作用域，只有该主题激活时才生效。
+    const value = theme();
+    value.id = 'builtin.qq2009';
+
+    const applied = await applyGuiTheme(value, fakeApi());
+
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.qq2009');
+    applied.dispose();
+  });
+
+  it('切换主题时覆盖 data-gui-theme-id，不残留上一个主题的身份', async () => {
+    const first = theme();
+    first.id = 'builtin.qq2009';
+    const firstApplied = await applyGuiTheme(first, fakeApi());
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.qq2009');
+    firstApplied.dispose();
+
+    const second = theme();
+    second.id = 'builtin.rose';
+    const secondApplied = await applyGuiTheme(second, fakeApi());
+
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.rose');
+    secondApplied.dispose();
+  });
+
   it('maps semantic and region tokens without injecting a style element', async () => {
     const applied = await applyGuiTheme(theme(), fakeApi());
 

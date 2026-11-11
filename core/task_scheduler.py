@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import threading
 import subprocess
 import time
@@ -12,6 +13,8 @@ from copy import deepcopy
 from typing import Any, Callable
 
 from core.plan import PlanManager
+
+_LOGGER = logging.getLogger(__name__)
 
 
 TaskRunner = Callable[[dict[str, Any]], Any]
@@ -309,6 +312,34 @@ class TaskScheduler:
                 self.fail(item["id"], "验证命令未通过")
         return [item["id"] for item in selected]
 
+    def _report_writeback_rejected(
+        self, item_id: str, action: str, item: dict[str, Any] | None
+    ) -> None:
+        """完成/失败回写被拒时显式上报，不再静默 return False。
+
+        回写只认 in_progress。子代理回调晚于回合结束（项已被降级为
+        pending/takeover_queued）时，静默丢弃会让"任务已干完、状态却一直不动"
+        没有任何可观测线索，因此这里同时写日志并发 plan_writeback_rejected 事件，
+        由 CLI/GUI 提示用户。
+        """
+        if item is None:
+            reason = f"{action} 回写被拒绝：计划项不存在。"
+        else:
+            reason = (
+                f"{action} 回写被拒绝：计划项当前状态为"
+                f" '{item.get('status')}'"
+                f"（execution_mode='{item.get('execution_mode') or 'none'}'），"
+                "只有 in_progress 状态才允许回写。"
+            )
+        _LOGGER.warning("计划项 %s %s", item_id, reason)
+        # 事件名不带 plan_item_ 前缀：CLI 把该前缀一律按"计划项状态变化"渲染，
+        # 复用会把该项显示成它原本的 pending 状态，反而误导用户
+        self._emit("plan_writeback_rejected", {
+            "item_id": str(item_id),
+            "action": str(action),
+            "reason": reason,
+        })
+
     def complete(
         self,
         item_id: str,
@@ -323,6 +354,7 @@ class TaskScheduler:
             return False
         item = self._item(item_id)
         if item is None or item.get("status") != "in_progress":
+            self._report_writeback_rejected(item_id, "complete", item)
             return False
         verification_type = str(item.get("verification_type", "result") or "result").strip().lower()
         command = str(item.get("verification") or "").strip()
@@ -357,6 +389,7 @@ class TaskScheduler:
     def fail(self, item_id: str, error: str, *, result: str = "") -> bool:
         item = self._item(item_id)
         if item is None or item.get("status") != "in_progress":
+            self._report_writeback_rejected(item_id, "fail", item)
             return False
         updated = self.plan.mark_failed(item_id, error, result=result)
         if updated:
@@ -386,7 +419,11 @@ class TaskScheduler:
         item = self._item(item_id)
         if item is None:
             return False
-        if item["status"] not in {"failed", "blocked", "cancelled"}:
+        # completed 也允许重开：子代理把「工具不可用、未真实执行」当成结论返回时，
+        # 计划项会被错误地标记 completed，而重建计划又被门禁挡住（“不能重建已有
+        # 执行记录”），结果是主 Agent 既不能重跑这一项、也不能新建，彻底卡死。
+        # 重开时清空 result/error 与执行租约，语义等同一次全新尝试。
+        if item["status"] not in {"failed", "blocked", "cancelled", "completed"}:
             return False
         # 已经发生超时接手的项只能显式 resume_takeover；普通 retry 会把它
         # 重新下发给子代理，违反“超时一次后主 Agent 接手”的业务约束。
@@ -602,29 +639,34 @@ class TaskScheduler:
                 int(candidate.get("takeover_sequence", 0) or 0),
                 candidate["id"],
             ))
-            candidate = queued[0]
-            files = set(candidate.get("files", []))
-            if not self._files_available_locked(candidate["id"], files):
-                return None
-            claimed = self.plan.transition_execution(
-                candidate["id"],
-                expected_status={"pending", "in_progress"},
-                expected_mode="takeover_queued",
-                expected_takeover_required=True,
-                status="in_progress",
-                execution_mode="main_takeover",
-                owner=f"main:{turn_id}",
-                takeover_turn_id=turn_id,
-                takeover_required=True,
-                error="",
-            )
-            if claimed is not None:
+            # FIFO 只决定优先级，不保证队首一定可执行：队首声明的 files 若与
+            # 在途租约冲突，继续尝试后面的项，避免单个占位项堵死整条接管队列
+            for candidate in queued:
+                files = set(candidate.get("files", []))
+                if not self._files_available_locked(candidate["id"], files):
+                    continue
+                claimed = self.plan.transition_execution(
+                    candidate["id"],
+                    expected_status={"pending", "in_progress"},
+                    expected_mode="takeover_queued",
+                    expected_takeover_required=True,
+                    status="in_progress",
+                    execution_mode="main_takeover",
+                    owner=f"main:{turn_id}",
+                    takeover_turn_id=turn_id,
+                    takeover_required=True,
+                    error="",
+                )
+                if claimed is None:
+                    # CAS 失败只跳过本项，不放弃整条队列
+                    continue
                 if not self._claim_files_locked(candidate["id"], files):
                     raise RuntimeError(
                         f"接管项 {candidate['id']} 已认领但文件租约登记失败，调度不变量被破坏"
                     )
                 claimed["queue_position"] = 0
-            return claimed
+                return claimed
+            return None
 
     def release_takeover_for_turn(
         self,
@@ -674,9 +716,19 @@ class TaskScheduler:
             return None
         with self._lock:
             item = self._item(item_id)
+            # takeover_queued 的 in_progress 项同样允许恢复：它是「等待主 Agent
+            # 接管」的排队态，旧守卫只看 status 会把它误判为正在执行而永久锁死。
+            queued_in_progress = (
+                item is not None
+                and item.get("status") == "in_progress"
+                and item.get("execution_mode") == "takeover_queued"
+            )
             if (
                 item is None
-                or item.get("status") not in {"failed", "blocked", "cancelled", "pending"}
+                or (
+                    item.get("status") not in {"failed", "blocked", "cancelled", "pending"}
+                    and not queued_in_progress
+                )
                 or not bool(item.get("takeover_required", False))
                 or self._active_takeover_locked() is not None
             ):
@@ -727,30 +779,33 @@ class TaskScheduler:
                 int(candidate.get("takeover_sequence", 0) or 0),
                 candidate["id"],
             ))
-            candidate = queued[0]
-            files = set(candidate.get("files", []))
-            # 崩溃恢复的 queued 接管必须先成功认领文件租约才能晋升；
-            # 冲突时保持 queued，绝不无锁运行
-            if not self._files_available_locked(candidate["id"], files):
-                return None
-            promoted = self.plan.transition_execution(
-                candidate["id"],
-                expected_status={"pending", "in_progress"},
-                expected_mode="takeover_queued",
-                expected_takeover_required=True,
-                status="in_progress",
-                execution_mode="main_takeover",
-                owner=f"main:{parent_turn_id}",
-                takeover_turn_id=str(parent_turn_id),
-                takeover_required=True,
-            )
-            if promoted is not None:
+            # 崩溃恢复的 queued 接管必须先成功认领文件租约才能晋升，绝不无锁运行；
+            # 队首冲突时顺延到后面的可执行项，而不是让整条队列一起等待
+            for candidate in queued:
+                files = set(candidate.get("files", []))
+                if not self._files_available_locked(candidate["id"], files):
+                    continue
+                promoted = self.plan.transition_execution(
+                    candidate["id"],
+                    expected_status={"pending", "in_progress"},
+                    expected_mode="takeover_queued",
+                    expected_takeover_required=True,
+                    status="in_progress",
+                    execution_mode="main_takeover",
+                    owner=f"main:{parent_turn_id}",
+                    takeover_turn_id=str(parent_turn_id),
+                    takeover_required=True,
+                )
+                if promoted is None:
+                    # CAS 失败只跳过本项，不放弃整条队列
+                    continue
                 if not self._claim_files_locked(candidate["id"], files):
                     raise RuntimeError(
                         f"接管项 {candidate['id']} 已晋升但文件租约登记失败，调度不变量被破坏"
                     )
                 promoted["queue_position"] = 0
-            return promoted
+                return promoted
+            return None
 
     def _active_takeover_locked(self) -> dict[str, Any] | None:
         for item in self.plan.snapshot():

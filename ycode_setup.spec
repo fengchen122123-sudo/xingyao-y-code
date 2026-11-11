@@ -27,8 +27,9 @@ datas = [
     ('system_prompt.md', '.'),
     # GUI 专用提示词：与通用版并列随包，GUI 严格使用自己的，不回退混用
     ('system_prompt_gui.md', '.'),
-    # GUI 向导资源：虚化背景图 + 窗口图标
-    ('assets/ycode.png', 'assets'),
+    # GUI 向导资源：侧栏 logo（构建期预缩放到 168x168 的 PNG，运行期用
+    # tk.PhotoImage 直接读，因此不再需要随包 Pillow）+ 窗口图标
+    ('assets/ycode-logo-168.png', 'assets'),
     ('assets/ycode.ico', 'assets'),
 ]
 # 核心程序载荷：优先单文件压缩包（onefile 启动解压快），
@@ -52,7 +53,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # excludes 与 build_release.py 的 build_setup_variant 保持同步：安装向导
+    # 只用标准库 + tkinter，PIL（~15MB）与 numpy（~31MB，PIL 的可选依赖）
+    # 都不需要——logo 已在构建期预缩放为 168x168 PNG。
+    excludes=['PIL', 'numpy'],
     noarchive=False,
     optimize=0,
 )

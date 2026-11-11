@@ -34,7 +34,7 @@ def _t(style: str, text: str):
 def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
                           manager=None, current_session=None):
     """
-    提供全屏终端 UI 用于浏览、切换、删除会话记录。
+    提供全屏终端 UI 用于浏览、切换、重命名、删除、归档会话记录。
 
     参数 manager / current_session 由调用方（main.py）显式传入；
     未传入时回落到 app_context 中注册的运行时上下文。
@@ -60,16 +60,36 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
         "current": cur_session,
         "notice": "",
         "confirm_delete": None,
+        # False = 活跃列表（默认，不显示归档会话）；True = 已归档列表
+        "archived_view": False,
     }
+
+    def reload_sessions():
+        """按当前视图重取数据源，并按现有边界防御修正光标。"""
+        if mgr:
+            try:
+                state["sessions"] = mgr.get_all_sessions(
+                    workdir=os.getcwd(), archived_only=state["archived_view"]
+                )
+            except Exception:
+                # DB 锁定等异常不能让全屏 UI 崩溃：保留旧列表，用户仍可 Esc 退出
+                pass
+        # 光标边界防御
+        if state["cursor"] >= len(state["sessions"]):
+            state["cursor"] = max(0, len(state["sessions"]) - 1)
 
     def render_list():
         out = []
-        out += [_t("class:header", "  Y-code 历史会话管家 (Sessions)\n")]
+        view_label = "已归档列表" if state["archived_view"] else "活跃列表"
+        out += [_t("class:header", f"  星瑶Code 历史会话管家 (Sessions) · {view_label}\n")]
         out += [_t("class:footer", f"  当前目录: {os.getcwd()}\n")]
         out += [_t("", "  -----------------------------------------\n")]
 
         if not state["sessions"]:
-            out += [_t("class:empty", "  (当前目录下没有任何历史会话。)\n")]
+            if state["archived_view"]:
+                out += [_t("class:empty", "  (当前目录下没有已归档会话。)\n")]
+            else:
+                out += [_t("class:empty", "  (当前目录下没有任何历史会话。)\n")]
         else:
             for i, session in enumerate(state["sessions"]):
                 is_cursor = (i == state["cursor"])
@@ -98,7 +118,11 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
         out += [_t("", "\n")]
         if state["notice"]:
             out += [_t("class:empty", f"  {state['notice']}\n")]
-        out += [_t("class:footer", "  [↑/↓] 移动   [Enter] 切换到选中的会话   [R/F2] 重命名会话   [Delete/Backspace] 删除   [Esc] 退出\n")]
+        if state["archived_view"]:
+            hint = "  [↑/↓] 移动   [Enter] 切换到选中的会话(自动取消归档)   [U] 取消归档   [Tab] 回到活跃列表   [Delete/Backspace] 删除   [Esc] 退出\n"
+        else:
+            hint = "  [↑/↓] 移动   [Enter] 切换到选中的会话   [R/F2] 重命名会话   [A] 归档会话   [Tab] 查看已归档   [Delete/Backspace] 删除   [Esc] 退出\n"
+        out += [_t("class:footer", hint)]
         return out
 
     kb = KeyBindings()
@@ -123,6 +147,10 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
             return
             
         cur = state["sessions"][state["cursor"]]
+        # 不变量：切换到归档会话时自动取消归档，避免「会话处于归档态却正在被使用」；
+        # 同时保证主程序关闭选择器后不会把「不在默认列表里」误判成会话已被删除
+        if state["archived_view"] and mgr:
+            mgr.unarchive_session(cur["name"])
         if on_switch:
             on_switch(cur["name"])
         event.app.exit()
@@ -137,6 +165,48 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
         if on_rename:
             on_rename(cur["name"])
         event.app.exit()
+
+    @kb.add("a")
+    def _archive(event):
+        # 归档视图里全是已归档会话，没有「归档」语义
+        if state["archived_view"] or not state["sessions"]:
+            return
+
+        cur = state["sessions"][state["cursor"]]
+        # 与「不能删除当前活跃会话」同源的保护：归档当前会话会让正在使用的会话
+        # 从默认列表消失，用户下次打开管家就找不到它了
+        if cur["name"] == state["current"]:
+            state["notice"] = "⚠️ 不能归档当前活跃会话，请先切换到其它会话。"
+            return
+
+        # 归档可逆（随时可 u / tab 恢复），因此不做二次确认，只给底部状态行反馈
+        name = cur["name"]
+        if mgr and mgr.archive_session(name):
+            state["notice"] = f"✔ 已归档：{name}（按 tab 查看归档区）"
+            reload_sessions()
+        else:
+            state["notice"] = f"❌ 归档失败：{name}"
+
+    @kb.add("u")
+    def _unarchive(event):
+        # 取消归档只在归档视图中有意义（活跃视图的提示行不出现该键位）
+        if not state["archived_view"] or not state["sessions"]:
+            return
+
+        name = state["sessions"][state["cursor"]]["name"]
+        if mgr and mgr.unarchive_session(name):
+            state["notice"] = f"✔ 已取消归档：{name}（已恢复回活跃列表）"
+            reload_sessions()
+        else:
+            state["notice"] = f"❌ 取消归档失败：{name}"
+
+    @kb.add("tab")
+    def _toggle_view(event):
+        state["archived_view"] = not state["archived_view"]
+        state["cursor"] = 0
+        state["confirm_delete"] = None
+        state["notice"] = ""
+        reload_sessions()
 
     # 注意：不绑定 backspace——退格是几乎所有界面里的"返回"习惯键，
     # 绑定成删除会话会造成误触（即使有二次确认也很吓人）
@@ -161,10 +231,7 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
         state["notice"] = ""
         if mgr:
             mgr.delete_session(cur["name"])
-            state["sessions"] = mgr.get_all_sessions(workdir=os.getcwd())
-            # 光标边界防御
-            if state["cursor"] >= len(state["sessions"]):
-                state["cursor"] = max(0, len(state["sessions"]) - 1)
+            reload_sessions()
 
     @kb.add("c-c")
     @kb.add("c-d")

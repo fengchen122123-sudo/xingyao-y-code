@@ -1,0 +1,1064 @@
+"""core.embedded_browser 的纯函数与控制器的 headless 测试。
+
+不 import clr / WinForms：纯函数全覆盖，控制器在 get_form 返回 None 时
+所有方法必须优雅失败而不抛异常。
+"""
+
+import logging
+from types import SimpleNamespace
+import time
+
+import pytest
+
+from core import embedded_browser as eb
+
+
+# ------------------------------------------------------------------ 纯函数
+
+@pytest.mark.parametrize(
+    ("rect", "scale", "expected"),
+    [
+        ({"x": 10, "y": 20, "width": 300, "height": 200}, 1.0, (10, 20, 300, 200)),
+        ({"x": 4, "y": 8, "width": 40, "height": 80}, 1.25, (5, 10, 50, 100)),
+        ({"x": 10, "y": 20, "width": 300, "height": 200}, 2.0, (20, 40, 600, 400)),
+        # 负值截 0（面板可能短暂上报负偏移）
+        ({"x": -5, "y": -3, "width": -40, "height": -80}, 1.0, (0, 0, 0, 0)),
+        ({"x": -5, "y": 10, "width": 40, "height": 80}, 2.0, (0, 20, 80, 160)),
+        # 缺键按 0 处理
+        ({"x": 7}, 1.0, (7, 0, 0, 0)),
+    ],
+)
+def test_css_rect_to_physical(rect, scale, expected):
+    assert eb.css_rect_to_physical(rect, scale) == expected
+
+
+def test_css_rect_to_physical_handles_bad_scale_and_values():
+    # scale 非法 → 退回 1.0；数值非法 → 0
+    assert eb.css_rect_to_physical({"x": "abc", "y": 5}, None) == (0, 5, 0, 0)
+    assert eb.css_rect_to_physical({"x": 3}, "bad") == (3, 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", ""),
+        ("   ", ""),
+        ("about:blank", "about:blank"),
+        ("  about:blank  ", "about:blank"),
+        ("https://example.com/a", "https://example.com/a"),
+        ("http://example.com", "http://example.com"),
+        ("//example.com/x", "https://example.com/x"),
+        ("example.com", "https://example.com"),
+        ("example.com:8080/path?q=1", "https://example.com:8080/path?q=1"),
+        ("localhost:3000", "https://localhost:3000"),
+        ("localhost", "https://localhost"),
+        ("192.168.1.1", "https://192.168.1.1"),
+        ("192.168.1.1:8080", "https://192.168.1.1:8080"),
+        # 显式危险 scheme 一律拒绝
+        ("javascript:alert(1)", ""),
+        ("data:text/html,<h1>x</h1>", ""),
+        ("mailto:a@b.com", ""),
+        ("about:config", ""),
+        # 本地文件放行：file:// URL 与盘符 / UNC 绝对路径都规范成 file:// URI
+        ("file:///C:/x.txt", "file:///C:/x.txt"),
+        ("file:///D:/proj/a.html", "file:///D:/proj/a.html"),
+        ("C:\\proj\\a.html", "file:///C:/proj/a.html"),
+        ("D:/proj/index.html", "file:///D:/proj/index.html"),
+        ("\\\\srv\\share\\a.html", "file://srv/share/a.html"),
+        # 空格 / 中文按百分号编码（本地路径带空格与中文是常态）
+        ("file:///D:/My Docs/a b.html", "file:///D:/My%20Docs/a%20b.html"),
+        ("file:///D:/文档/a.html", "file:///D:/%E6%96%87%E6%A1%A3/a.html"),
+        # file: 的非标准写法 / 相对路径 / 含 ".." 的路径一律拒绝
+        ("file:relative.txt", ""),
+        ("file://relative.txt", ""),
+        ("file:///D:/a/../b.html", ""),
+        ("../a.html", ""),
+        # 搜索词 / 含空格
+        ("hello world", ""),
+        ("just-a-word", ""),
+        ("foo.123", ""),
+    ],
+)
+def test_normalize_url(raw, expected):
+    assert eb.normalize_url(raw) == expected
+
+
+def test_normalize_url_rejects_non_string():
+    assert eb.normalize_url(None) == ""
+    assert eb.normalize_url(123) == ""
+
+
+def test_is_supported_matches_platform(monkeypatch):
+    monkeypatch.setattr(eb.sys, "platform", "win32")
+    assert eb.is_supported() is True
+    monkeypatch.setattr(eb.sys, "platform", "linux")
+    assert eb.is_supported() is False
+
+
+# ------------------------------------------------------------------ 控制器
+
+def _controller():
+    return eb.EmbeddedBrowserController(on_state=lambda _state: None, get_form=lambda: None)
+
+
+def test_controller_open_without_form_fails_gracefully(monkeypatch):
+    monkeypatch.setattr(eb.sys, "platform", "win32")
+    ctrl = _controller()
+    result = ctrl.open({"x": 0, "y": 0, "width": 100, "height": 100}, "https://example.com")
+    assert result["ok"] is False
+    assert result["error"] == "form_unavailable"
+
+
+def test_controller_open_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(eb.sys, "platform", "linux")
+    ctrl = _controller()
+    result = ctrl.open({"x": 0, "y": 0, "width": 10, "height": 10})
+    assert result == {"ok": False, "error": "unsupported_platform"}
+
+
+def test_controller_methods_never_raise_without_form():
+    ctrl = _controller()
+    rect = {"x": 0, "y": 0, "width": 100, "height": 100}
+    for result in (
+        ctrl.set_bounds(rect),
+        ctrl.back(),
+        ctrl.forward(),
+        ctrl.reload(),
+        ctrl.stop(),
+        ctrl.hide(),
+    ):
+        assert isinstance(result, dict)
+        assert result["ok"] is False
+    # get_state 即使未打开也返回结构化结果，不抛
+    state = ctrl.get_state()
+    assert isinstance(state, dict)
+    assert state["ok"] is True
+    assert state["state"]["visible"] is False
+    # shutdown 在未创建时是安全 no-op
+    assert ctrl.shutdown() == {"ok": True}
+
+
+def test_controller_navigate_rejects_invalid_url():
+    ctrl = _controller()
+    result = ctrl.navigate("javascript:alert(1)")
+    assert result == {"ok": False, "error": "invalid_url"}
+
+
+# ------------------------------------------- B1：内核未就绪的 pending 补导航
+
+def test_navigate_before_open_queues_pending_url():
+    """navigate 先于 open 到达（pywebview 各 api 调用独立派发线程，顺序无
+    保证）时不能丢：缓存 pending 目标并返回 ok，等初始化完成补导航。"""
+    ctrl = _controller()
+    result = ctrl.navigate("https://example.com")
+    assert result["ok"] is True
+    assert ctrl._pending_url == "https://example.com"
+    # 乐观 URL 进快照，前端地址栏与后端状态一致
+    assert ctrl.get_state()["state"]["url"] == "https://example.com"
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
+class _FakeSettings:
+    IsStatusBarEnabled = True
+
+
+class _FakeCookieManager:
+    """CookieManager 桩：记录 CreateCookie / AddOrUpdateCookie 的调用。"""
+
+    def __init__(self):
+        self.created = []
+        self.added = []
+
+    def CreateCookie(self, name, value, domain, path):
+        cookie = SimpleNamespace(
+            Name=name,
+            Value=value,
+            Domain=domain,
+            Path=path,
+            IsHttpOnly=False,
+            IsSecure=False,
+        )
+        self.created.append(cookie)
+        return cookie
+
+    def AddOrUpdateCookie(self, cookie):
+        self.added.append(cookie)
+
+
+class _FakeCore:
+    def __init__(self):
+        self.navigated = []
+        self.Settings = _FakeSettings()
+        self.CookieManager = _FakeCookieManager()
+        self.Source = ""
+        self.DocumentTitle = ""
+        self.CanGoBack = False
+        self.CanGoForward = False
+        self.SourceChanged = _FakeEvent()
+        self.DocumentTitleChanged = _FakeEvent()
+        self.NavigationStarting = _FakeEvent()
+        self.NavigationCompleted = _FakeEvent()
+        self.NewWindowRequested = _FakeEvent()
+
+    def Navigate(self, url):
+        self.navigated.append(url)
+
+
+class _FakeHandle:
+    def ToInt32(self):
+        return 1
+
+
+class _FakeForm:
+    """Invoke 直接同步执行回调（headless 下 _make_delegate 退回原可调用）。"""
+
+    def __init__(self):
+        self.Handle = _FakeHandle()
+        self.invoked = 0
+
+    def Invoke(self, delegate):
+        self.invoked += 1
+        delegate()
+
+
+def _fake_ready_controller():
+    ctrl = eb.EmbeddedBrowserController(on_state=lambda _state: None, get_form=lambda: None)
+    core = _FakeCore()
+    ctrl._webview = SimpleNamespace(CoreWebView2=core, Visible=False)
+    ctrl._form = _FakeForm()
+    return ctrl, core
+
+
+def test_pending_url_flushed_on_init_completed():
+    ctrl, core = _fake_ready_controller()
+    ctrl._pending_url = "https://example.com"
+    ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
+    assert ctrl._ready is True
+    assert core.navigated == ["https://example.com"]
+    assert ctrl._pending_url == ""
+
+
+def test_navigate_when_ready_goes_straight_to_core():
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+    result = ctrl.navigate("example.com")
+    assert result["ok"] is True
+    assert core.navigated == ["https://example.com"]
+    assert ctrl._url == "https://example.com"
+
+
+def test_navigate_queues_when_core_not_ready_then_flushes():
+    """完整时序：open 创建控件（内核异步初始化中）→ navigate 缓存 →
+    初始化完成回调补导航。"""
+    ctrl, core = _fake_ready_controller()
+    result = ctrl.navigate("https://example.com")  # _ready 仍为 False
+    assert result["ok"] is True
+    assert core.navigated == []
+    ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
+    assert core.navigated == ["https://example.com"]
+
+
+class _ZoomProbe:
+    """记录 ZoomFactor 赋值次数的桩：验证同值幂等（不重复触碰控件）。"""
+
+    def __init__(self):
+        self.zoom_sets = 0
+        self._zoom = None
+
+    @property
+    def ZoomFactor(self):
+        return self._zoom
+
+    @ZoomFactor.setter
+    def ZoomFactor(self, value):
+        self.zoom_sets += 1
+        self._zoom = value
+
+
+def test_apply_zoom_clamps_to_webview_range():
+    ctrl, _core = _fake_ready_controller()
+    probe = _ZoomProbe()
+    ctrl._webview = probe
+
+    ctrl._apply_zoom(0.01)
+    assert probe.ZoomFactor == 0.25
+    ctrl._apply_zoom(99)
+    assert probe.ZoomFactor == 8.0
+
+
+def test_apply_zoom_skips_unchanged_value():
+    ctrl, _core = _fake_ready_controller()
+    probe = _ZoomProbe()
+    ctrl._webview = probe
+
+    ctrl._apply_zoom(0.5)
+    assert probe.zoom_sets == 1
+    ctrl._apply_zoom(0.5)  # 幂等：心跳重复上报同值不得反复触碰控件
+    ctrl._apply_zoom(0.7)
+    ctrl._apply_zoom(0.7)
+    assert probe.ZoomFactor == 0.7
+    assert probe.zoom_sets == 2
+
+
+def test_apply_zoom_tolerates_bad_input():
+    ctrl, _core = _fake_ready_controller()
+    probe = _ZoomProbe()
+    ctrl._webview = probe
+
+    for bad in (None, "abc", float("nan")):
+        ctrl._apply_zoom(bad)
+    assert probe.zoom_sets == 0
+    assert probe.ZoomFactor is None
+
+
+# ---------------- 星瑶自动化准备（prepare_automation） ----------------
+
+
+def test_automation_profile_dir_reflects_shared_profile():
+    """两套控件已合并：面板控件从创建起就带 CDP 调试端口，自动化接管的就是用户
+    看到的那个浏览器（共享登录态），两者共用 profile_dir()，不再有第二个
+    WebView2 环境，也就不存在同目录二次带参建环境（0x8007139F）的约束。"""
+    assert eb.profile_dir().name == "browser_profile"
+    # automation_profile_dir 仅为兼容旧引用的历史符号，已不用于创建任何控件
+    assert eb.automation_profile_dir().name == "browser_profile_cdp"
+
+
+def test_prepare_automation_creates_hidden_control_with_cdp_args():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    ctrl._webview = None
+    ctrl._cdp_probe = lambda port, timeout: (True, "ready")
+    calls: dict = {}
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
+        calls["args"] = additional_browser_args
+        calls["port"] = cdp_port
+        # 未传目录即等价于 _create_control 的缺省 profile_dir()（两套控件共用）
+        calls["folder"] = eb.profile_dir() if user_data_folder is None else user_data_folder
+        ctrl._webview = SimpleNamespace()
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    result = ctrl.prepare_automation()
+    assert result["ok"] is True
+    assert result["recreated"] is False
+    assert result["endpoint"] == f"http://127.0.0.1:{calls['port']}"
+    assert calls["args"].startswith("--remote-debugging-port=")
+    assert calls["args"] == f"--remote-debugging-port={calls['port']}"
+    assert calls["folder"] == eb.profile_dir()
+
+
+def test_prepare_automation_is_idempotent_when_port_present():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    ctrl._webview = SimpleNamespace()
+    ctrl._cdp_port = 9321
+    probed: list = []
+    ctrl._cdp_probe = lambda port, timeout: (probed.append(port), (True, "ready"))[1]
+    created: list = []
+    ctrl._create_control = lambda *args, **kwargs: created.append(args)
+    result = ctrl.prepare_automation()
+    assert result == {"ok": True, "endpoint": "http://127.0.0.1:9321", "recreated": False}
+    assert created == []  # 幂等：端口可用时不重复创建/重建控件
+    assert probed == [9321]  # 但必须真实探测，不能凭"控件带端口"就返回
+
+
+def test_prepare_automation_rebuilds_when_existing_port_is_dead():
+    """控件已带端口但 probe 失败（面板控件创建路径从不 probe，端口可能已死）：
+    必须丢弃该控件、带新端口重建，重建后 probe 通过才把 endpoint 交给上层。"""
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    disposed: list = []
+    ctrl._webview = SimpleNamespace(Dispose=lambda: disposed.append(1))
+    ctrl._cdp_port = 9321
+    probes: list = []
+
+    def _probe(port, timeout):
+        probes.append(port)
+        if port == 9321:  # 旧端口已死
+            return False, "URLError: connection refused"
+        return True, "ready"
+
+    ctrl._cdp_probe = _probe
+    created: dict = {}
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
+        created["port"] = cdp_port
+        created["args"] = additional_browser_args
+        ctrl._webview = SimpleNamespace()
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    result = ctrl.prepare_automation()
+    assert result["ok"] is True
+    assert result["recreated"] is True
+    assert disposed == [1]  # 死端点控件被丢弃，不留在主窗体上
+    assert created["port"] is not None and created["port"] != 9321
+    assert created["args"] == f"--remote-debugging-port={created['port']}"
+    assert result["endpoint"] == f"http://127.0.0.1:{created['port']}"
+    assert probes == [9321, created["port"]]  # 旧端口一次 + 重建端口一次
+
+
+def test_prepare_automation_recreates_control_without_port():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    ctrl._cdp_probe = lambda port, timeout: (True, "ready")
+    disposed: list = []
+    ctrl._webview = SimpleNamespace(Dispose=lambda: disposed.append(1))
+    ctrl._cdp_port = None
+    ctrl._ready = True
+    created: dict = {}
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
+        created["port"] = cdp_port
+        ctrl._webview = SimpleNamespace()
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    result = ctrl.prepare_automation()
+    assert result["ok"] is True
+    assert result["recreated"] is True
+    assert disposed == [1]
+    assert ctrl._ready is False  # 重建后内核重新初始化
+    assert created["port"] is not None
+    assert result["endpoint"] == f"http://127.0.0.1:{created['port']}"
+
+
+def test_prepare_automation_reports_real_error_when_cdp_never_ready():
+    """控件建了但 CDP 端口起不来（如 WebView2 初始化失败 0x8007139F）：
+    必须丢弃控件并返回真实错误，绝不返回连不上的死端点——否则上层会拿着
+    它去建 backend，最终只表现为"启动超时"，真因被掩盖。重建一次仍失败时
+    同样丢弃并报错（两次都探不到就认输）。"""
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    ctrl._webview = None
+    ctrl._cdp_probe = lambda port, timeout: (False, "URLError: connection refused")
+    disposed: list = []
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
+        ctrl._webview = SimpleNamespace(Dispose=lambda: disposed.append(1))
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    ctrl._init_error = "(0x8007139F): 组或资源的状态不是执行请求操作的正确状态。"
+    result = ctrl.prepare_automation()
+    assert result["ok"] is False
+    assert "CDP 端点不可用" in result["error"]
+    assert "0x8007139F" in result["error"]
+    assert disposed == [1, 1]  # 首次创建 + 重建各丢弃一次死控件，都不留在主窗体上
+    assert ctrl._webview is None
+    assert ctrl._cdp_port is None  # 清端口：下次准备必须重新创建
+
+
+def test_init_failure_is_recorded_for_error_reporting():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._on_init_completed(
+        ctrl._webview,
+        SimpleNamespace(IsSuccess=False, InitializationException="boom (0x8007139F)"),
+    )
+    assert "0x8007139F" in ctrl._init_error
+    assert ctrl._ready is False
+    # 失败控件已作废（见下个用例），错误只在重建后的新控件成功时被清空
+    ctrl2, _core2 = _fake_ready_controller()
+    ctrl2._init_error = "old"
+    ctrl2._on_init_completed(ctrl2._webview, SimpleNamespace(IsSuccess=True))
+    assert ctrl2._init_error == ""
+
+
+def test_init_failure_recycles_control_so_next_open_can_recreate():
+    """初始化失败的控件必须作废，否则面板白板到进程结束。
+
+    _create_control 以「self._webview is not None」为幂等判据：失败后若仍留着
+    引用，后续每次 open 都命中幂等分支直接返回，永远没有重建入口
+    （2026-11-02/03/04 各出现过一次的 0x8007139F 就是这样僵死的）。
+    """
+    ctrl, _core = _fake_ready_controller()
+    ctrl._on_init_completed(
+        ctrl._webview,
+        SimpleNamespace(IsSuccess=False, InitializationException="boom (0x8007139F)"),
+    )
+    assert ctrl._webview is None  # 引用已清：下次 open 会走重建
+    assert ctrl._ready is False
+    assert ctrl._visible is False
+    assert ctrl._pending_url == ""
+
+
+def test_set_bounds_restores_visibility_of_recreated_control():
+    """控件被自动化重建后（新控件默认 Visible=False），前端只会反复发
+    set_bounds 而不会重新 open；set_bounds 必须顺手把可见性拉回来，否则面板
+    永远是「框和地址栏都在、内容区空白」的白板，且没有任何自愈路径。
+    """
+    ctrl, _core = _fake_ready_controller()
+    ctrl._webview.Visible = False
+    ctrl._visible = False
+    ctrl._apply_bounds = lambda *_args, **_kwargs: None  # 跳过 WinForms 依赖
+
+    result = ctrl.set_bounds({"x": 10, "y": 20, "width": 300, "height": 200})
+
+    assert result["ok"] is True
+    assert ctrl._webview.Visible is True
+    assert ctrl._visible is True
+
+
+def test_probe_cdp_endpoint_gives_up_within_timeout():
+    """探测必须有界：连不上的端口要在超时后返回失败，绝不无限等。"""
+    started = time.monotonic()
+    ok, detail = eb.probe_cdp_endpoint(1, timeout=0.3)
+    assert ok is False
+    assert detail
+    assert time.monotonic() - started < 5.0
+
+
+def test_prepare_automation_requires_form():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._webview = None
+    ctrl._get_form = lambda: None
+    result = ctrl.prepare_automation()
+    assert result == {"ok": False, "error": "form_unavailable"}
+
+
+# ---------------- 页面自身发起的顶层导航 scheme 兜底 ----------------
+
+
+class _NavArgs:
+    """NavigationStartingEventArgs 桩：只有 Uri 与可写的 Cancel。"""
+
+    def __init__(self, uri):
+        self.Uri = uri
+        self.Cancel = False
+
+
+@pytest.mark.parametrize(
+    ("uri", "cancelled"),
+    [
+        # 点击链接 / location.href / meta refresh 绕过后端 normalize_url 的入口
+        ("javascript:alert(1)", True),
+        ("data:text/html,<h1>x</h1>", True),
+        ("about:config", True),
+        ("file:relative.txt", True),
+        # 白名单：http/https、about:blank，以及本地文件（本地 html 页内互链、
+        # meta refresh 到另一个本地页都按系统浏览器行为放行）
+        ("https://example.com/page", False),
+        ("http://example.com/page", False),
+        ("about:blank", False),
+        ("file:///C:/Windows/win.ini", False),
+        ("file:///D:/proj/a.html", False),
+    ],
+)
+def test_navigation_starting_enforces_scheme_whitelist(uri, cancelled):
+    ctrl = _controller()
+    args = _NavArgs(uri)
+
+    ctrl._on_navigation_starting(None, args)
+
+    assert args.Cancel is cancelled
+
+
+def test_navigation_starting_without_uri_does_not_miskill():
+    """Uri 取不到（旧版内核 / args 为 None）时不得误杀导航。"""
+    ctrl = _controller()
+
+    args = SimpleNamespace(Cancel=False)
+    ctrl._on_navigation_starting(None, args)
+    assert args.Cancel is False
+
+    ctrl._on_navigation_starting(None, None)  # 不抛
+
+
+def test_is_navigation_allowed_matches_normalize_url():
+    assert eb.is_navigation_allowed("https://example.com") is True
+    assert eb.is_navigation_allowed("about:blank") is True
+    assert eb.is_navigation_allowed(None) is True  # 取不到 -> 不误杀
+    assert eb.is_navigation_allowed("") is True
+    assert eb.is_navigation_allowed("javascript:alert(1)") is False
+    # 本地文件已放行（右栏内嵌浏览器渲染本地 html）；非绝对路径写法仍拒绝
+    assert eb.is_navigation_allowed("file:///C:/x.txt") is True
+    assert eb.is_navigation_allowed("file:relative.txt") is False
+
+
+# ---------------- 本地文件 URI 规整 ----------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("file:///C:/x.txt", "file:///C:/x.txt"),
+        ("file://C:/x.txt", "file:///C:/x.txt"),
+        ("C:\\proj\\a.html", "file:///C:/proj/a.html"),
+        ("C:/proj/a.html", "file:///C:/proj/a.html"),
+        ("\\\\srv\\share\\a.html", "file://srv/share/a.html"),
+        ("  file:///C:/x.txt  ", "file:///C:/x.txt"),
+    ],
+)
+def test_normalize_file_url_forms(raw, expected):
+    assert eb.normalize_file_url(raw) == expected
+
+
+def test_normalize_file_url_rejects_unsafe_inputs():
+    assert eb.normalize_file_url(None) == ""
+    assert eb.normalize_file_url(123) == ""
+    assert eb.normalize_file_url("") == ""
+    assert eb.normalize_file_url("file:") == ""
+    assert eb.normalize_file_url("file:C:/x.txt") == ""  # 非 file:// 标准写法
+    assert eb.normalize_file_url("relative/a.html") == ""  # 相对路径无基准目录
+    assert eb.normalize_file_url("file:///C:/a/../b.html") == ""  # 含 .. 视为异常输入
+
+
+def test_path_to_file_uri_rejects_relative_and_root_only():
+    assert eb.path_to_file_uri("./a.html") == ""
+    assert eb.path_to_file_uri("") == ""
+    assert eb.path_to_file_uri("C:") == ""  # 只有盘符、无文件名
+
+
+# ---------------- shutdown 释放契约 ----------------
+
+
+def test_shutdown_disposes_control_and_clears_cdp_port():
+    """shutdown 必须一并清 _cdp_port：否则下一次 prepare_automation 会
+    误认"控件仍带调试端口"而返回已失效的 endpoint。"""
+    ctrl, core = _fake_ready_controller()
+    disposed = []
+    ctrl._webview = SimpleNamespace(
+        CoreWebView2=core, Dispose=lambda: disposed.append(1)
+    )
+    ctrl._cdp_port = 9321
+
+    assert ctrl.shutdown() == {"ok": True}
+
+    assert disposed == [1]
+    assert ctrl._cdp_port is None
+    assert ctrl._webview is None
+
+
+def test_shutdown_clears_cdp_port_without_control():
+    ctrl = _controller()
+    ctrl._cdp_port = 9321
+
+    assert ctrl.shutdown() == {"ok": True}
+
+    assert ctrl._cdp_port is None
+
+
+def test_browser_mixin_releases_cached_controller_on_shutdown(monkeypatch):
+    """gui_browser_mixin：控制器释放后必须清掉桥层缓存引用，后续脑跳调用与
+    "从未打开"语义一致（set_bounds -> not_open），不再打到已 Dispose 的控件。
+
+    注：gui_browser_mixin 共用 core.embedded_browser 的释放契约，测试放这里
+    与控制器释放契约同处一文件。
+    """
+    import gui_browser_mixin
+
+    class _Bridge(gui_browser_mixin.BrowserBridgeMixin):
+        def __init__(self):
+            self._window = SimpleNamespace(uid="master")
+
+        def emit_event(self, *_args):
+            pass
+
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    bridge = _Bridge()
+    ctrl = bridge._browser_controller()
+    assert ctrl is not None
+    assert bridge._embedded_browser is ctrl
+
+    ctrl.shutdown()  # ApiBridge.shutdown 的调用形态
+
+    assert getattr(bridge, "_embedded_browser", None) is None
+    rect = {"x": 0, "y": 0, "width": 100, "height": 100}
+    assert bridge.browser_pane_set_bounds(rect) == {"ok": False, "error": "not_open"}
+    assert bridge.browser_pane_get_state() == {"ok": True, "state": None}
+    assert bridge.browser_pane_hide() == {"ok": True}
+
+
+# ---------------- 会话 cookie 注入（内嵌控件没有自己的登录态） ----------------
+
+def test_set_session_cookies_waits_for_core_ready_then_replays():
+    """内核异步初始化：就绪前只记录不外写，_on_init_completed 必须补写。
+
+    只在 set_session_cookies 调用时写一次会永久丢掉登录态（控件此刻内核还没起）。
+    """
+    ctrl, core = _fake_ready_controller()
+    assert ctrl._ready is False
+
+    ctrl.set_session_cookies([{"name": "sid", "value": "secret-1"}])  # 不得抛
+
+    assert ctrl._session_cookies[0]["name"] == "sid"
+    assert ctrl._session_cookie_domain == "tokenrhythm.studio"
+    assert core.CookieManager.added == []  # 内核未就绪，此时不写
+
+    ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
+
+    assert ctrl._ready is True
+    assert [c.Name for c in core.CookieManager.added] == ["sid"]
+    cookie = core.CookieManager.added[0]
+    assert (cookie.Domain, cookie.Path) == ("tokenrhythm.studio", "/")
+
+
+def test_set_session_cookies_without_control_is_safe():
+    """控件尚未创建（_webview=None）时只记录，不抛异常，等初始化回放。"""
+    ctrl = _controller()
+    ctrl.set_session_cookies([{"name": "sid", "value": "v"}])
+
+    assert ctrl._webview is None
+    assert [item["name"] for item in ctrl._session_cookies] == ["sid"]
+
+
+def test_set_session_cookies_writes_every_valid_cookie():
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies(
+        [
+            {"name": "sid", "value": "v1"},
+            {"name": "", "value": "v2"},  # 缺 name
+            {"name": "no_value"},  # 缺 value
+            {"value": "v3"},  # 缺 name
+            {
+                "name": "keep",
+                "value": "v4",
+                "domain": "app.example.com",
+                "path": "/app",
+                "http_only": True,
+                "secure": True,
+            },
+        ]
+    )
+
+    manager = core.CookieManager
+    assert [(c.Name, c.Value) for c in manager.created] == [
+        ("sid", "v1"),
+        ("keep", "v4"),
+    ]
+    assert manager.added == manager.created  # 每个 CreateCookie 都 AddOrUpdate 一次
+    first, second = manager.created
+    assert (first.Domain, first.Path) == ("tokenrhythm.studio", "/")
+    assert (second.Domain, second.Path) == ("app.example.com", "/app")
+    assert (first.IsHttpOnly, first.IsSecure) == (False, False)
+    assert (second.IsHttpOnly, second.IsSecure) == (True, True)
+
+
+def test_tr_csrf_cookie_is_visible_to_page_js():
+    """tr_csrf 必须对页面 JS 可见。
+
+    官方前端的请求包装从 document.cookie 读 tr_csrf 并回填 X-CSRF-Token；
+    若按 httpOnly 注入，所有非 GET 请求都会被服务端判 CSRF_INVALID，
+    充值页的「查看报价」就是这样失败的。会话凭据 tr_session 仍保持 httpOnly。
+    """
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies(
+        [
+            {"name": "tr_session", "value": "s", "http_only": True},
+            {"name": "tr_csrf", "value": "c", "http_only": True},
+        ]
+    )
+
+    session, csrf = core.CookieManager.created
+    assert session.IsHttpOnly is True
+    assert csrf.IsHttpOnly is False
+
+
+def test_set_session_cookies_tolerates_bad_items():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._ready = True
+
+    ctrl.set_session_cookies([None, "sid=v", {"name": None, "value": None}])
+
+    assert ctrl._session_cookies == []
+
+
+def test_navigate_replays_session_cookies_before_navigating():
+    """每次导航前重放：页面把 cookie 清掉后下一次导航也能补回登录态。"""
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+    ctrl.set_session_cookies([{"name": "sid", "value": "v1"}])
+    assert len(core.CookieManager.added) == 1
+
+    core.CookieManager.created.clear()
+    core.CookieManager.added.clear()
+    result = ctrl.navigate("example.com")
+
+    assert result["ok"] is True
+    assert core.navigated == ["https://example.com"]
+    assert [c.Name for c in core.CookieManager.added] == ["sid"]
+
+
+def test_session_cookie_value_never_logged(caplog):
+    """cookie 的 value 是登录凭据：写入失败走 debug 日志，但 value 不得出现。"""
+    caplog.set_level(logging.DEBUG, logger=eb.logger.name)
+    secret = "SESSION-SECRET-DO-NOT-LOG"
+    ctrl, core = _fake_ready_controller()
+    ctrl._ready = True
+
+    def _boom(name, value, domain, path):
+        raise RuntimeError("CreateCookie failed")
+
+    core.CookieManager.CreateCookie = _boom
+    ctrl.set_session_cookies([{"name": "sid", "value": secret}])
+
+    assert "写入会话 cookie 失败" in caplog.text  # 失败路径确实记了日志
+    assert secret not in caplog.text  # 但 value 绝不入日志
+
+
+# ------------------------------------------------ 滚动后重绘 nudge（异步投递）
+
+class _FakeRect:
+    """System.Drawing.Rectangle 桩：避免 headless 测试依赖 pythonnet/clr。"""
+
+    def __init__(self, x, y, w, h):
+        self.X, self.Y = int(x), int(y)
+        self.Width, self.Height = int(w), int(h)
+
+    def as_tuple(self):
+        return (self.X, self.Y, self.Width, self.Height)
+
+
+def _rect_factory(x, y, w, h):
+    return _FakeRect(x, y, w, h)
+
+
+class _NudgeForm:
+    """BeginInvoke 只入队、不立即执行，由测试 run_next() 逐个驱动。
+
+    真实实现依赖 BeginInvoke 把「+1」与「还原」分到两个 GUI 消息轮次；同步执行
+    的桩会把两帧合并成一次布局，无法断言航次，所以这里必须排队驱动。
+    """
+
+    def __init__(self):
+        self.Handle = _FakeHandle()  # 覆盖 _begin_invoke 的句柄预检分支
+        self.queue = []
+        self.begin_invoke_calls = 0
+
+    def BeginInvoke(self, delegate):
+        self.begin_invoke_calls += 1
+        self.queue.append(delegate)
+
+    def run_next(self):
+        assert self.queue, "没有待驱动的 BeginInvoke 投递"
+        self.queue.pop(0)()
+
+
+class _BoundsProbe:
+    """控件桩：记录每一次 Bounds 赋值（顺序 + 矩形）。"""
+
+    def __init__(self):
+        self.writes = []
+        self._bounds = None
+        self.Visible = False
+        self.CoreWebView2 = None
+
+    @property
+    def Bounds(self):
+        return self._bounds
+
+    @Bounds.setter
+    def Bounds(self, rect):
+        self._bounds = rect
+        self.writes.append(rect.as_tuple())
+
+
+class _FakeMessageArgs:
+    """WebView2 WebMessageReceivedEventArgs 桩：两种取值形态都可控。"""
+
+    def __init__(self, text=None, json_value=None):
+        self._text = text
+        self._json = json_value
+
+    def TryGetWebMessageAsString(self):
+        if self._text is None:
+            raise RuntimeError("消息不是字符串形态")
+        return self._text
+
+    @property
+    def WebMessageAsJson(self):
+        if self._json is None:
+            raise RuntimeError("JSON 形态不可用")
+        return self._json
+
+
+def _nudge_controller(monkeypatch=None, bounds=(10, 20, 300, 200)):
+    ctrl = eb.EmbeddedBrowserController(on_state=lambda _state: None, get_form=lambda: None)
+    form = _NudgeForm()
+    probe = _BoundsProbe()
+    ctrl._form = form
+    ctrl._webview = probe
+    ctrl._ready = True
+    ctrl._visible = True
+    ctrl._loading = False
+    ctrl._bounds = bounds
+    ctrl._last_nudge = 0.0  # 远早于节流窗口：默认可立即投递
+    if monkeypatch is not None:
+        # 矩形由 System.Drawing 提供（headless 不可用）；被测点是 +1/还原的算术
+        monkeypatch.setattr(ctrl, "_make_rectangle", _rect_factory, raising=False)
+    return ctrl, form, probe
+
+
+def test_scroll_nudge_script_carries_ms_threshold():
+    """脚本里的节流毫秒值必须由 _SCROLL_NUDGE_MIN_INTERVAL 派生，不写死。"""
+    expected = str(max(1, int(eb._SCROLL_NUDGE_MIN_INTERVAL * 1000)))
+    assert "__YCODE_NUDGE_MS__" not in eb._SCROLL_NUDGE_SCRIPT
+    assert "now - last < " + expected + ")" in eb._SCROLL_NUDGE_SCRIPT
+
+
+def test_non_nudge_web_message_does_not_trigger_nudge(monkeypatch):
+    """消息里没有 scroll-nudge 时一律忽略：不进入节流、不投递任何回调。"""
+    ctrl, form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs(text="hello"))
+    ctrl._on_web_message_received(None, _FakeMessageArgs(json_value='{"type":"hello"}'))
+    ctrl._on_web_message_received(None, _FakeMessageArgs(text=""))
+
+    assert calls == []
+    assert form.begin_invoke_calls == 0
+
+
+def test_scroll_nudge_web_message_triggers_nudge(monkeypatch):
+    """主路径：TryGetWebMessageAsString 命中字符串 scroll-nudge。"""
+    ctrl, _form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs(text="scroll-nudge"))
+
+    assert calls == [1]
+
+
+def test_scroll_nudge_json_fallback_triggers_nudge(monkeypatch):
+    """非字符串形态：主路径抛异常后回退 WebMessageAsJson，仍能识别。"""
+    ctrl, _form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs(json_value='"scroll-nudge"'))
+
+    assert calls == [1]
+
+
+def test_scroll_nudge_unreadable_args_ignored(monkeypatch):
+    """两种取值形态都不可用：静默放弃，绝不抛异常给 WebView2 消息循环。"""
+    ctrl, _form, _probe = _nudge_controller()
+    calls = []
+    monkeypatch.setattr(ctrl, "_nudge_after_scroll", lambda: calls.append(1))
+
+    ctrl._on_web_message_received(None, _FakeMessageArgs())
+
+    assert calls == []
+
+
+def test_nudge_throttled_within_window():
+    """节流窗口内立即 return；窗口过去后才投递一次。"""
+    ctrl, form, probe = _nudge_controller()
+    ctrl._last_nudge = time.monotonic()
+
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 0
+    assert form.queue == []
+    assert probe.writes == []
+
+    ctrl._last_nudge = time.monotonic() - eb._SCROLL_NUDGE_MIN_INTERVAL - 0.01
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 1
+    assert len(form.queue) == 1
+    assert ctrl._last_nudge > 0.0  # 成功后推进节流起点
+
+    # 刚投递过：紧接着再滚动仍被节流，不产生第二次投递
+    ctrl._nudge_after_scroll()
+    assert form.begin_invoke_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("_ready", False),
+        ("_webview", None),
+        ("_visible", False),
+        ("_loading", True),
+        ("_bounds", None),
+    ],
+)
+def test_nudge_guard_blocks_dispatch(field, value):
+    """守卫命中时既不投递也不推进节流起点（顺序：ready/webview/visible/loading/bounds）。"""
+    ctrl, form, probe = _nudge_controller()
+    setattr(ctrl, field, value)
+
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 0
+    assert form.queue == []
+    assert probe.writes == []
+    assert ctrl._last_nudge == 0.0
+
+
+def test_nudge_bumps_height_by_one_then_restores(monkeypatch):
+    """+1 与还原落在两次投递（两个 GUI 轮次），x/y/w 全程不变。"""
+    ctrl, form, probe = _nudge_controller(monkeypatch, bounds=(10, 20, 300, 200))
+
+    ctrl._nudge_after_scroll()
+
+    assert len(form.queue) == 1
+    assert probe.writes == []  # 只排队，尚未执行
+    assert form.queue[0] is not None
+
+    form.run_next()  # 驱动第一帧：+1
+    assert probe.writes == [(10, 20, 300, 201)]
+    assert ctrl._bounds == (10, 20, 300, 200)  # 状态矩形不被 nudge 改写
+    assert len(form.queue) == 1  # 还原单独投递到「下一帧」
+
+    form.run_next()  # 驱动第二帧：还原
+    assert probe.writes == [(10, 20, 300, 201), (10, 20, 300, 200)]
+    assert form.queue == []
+
+
+def test_nudge_restore_follows_latest_bounds(monkeypatch):
+    """两帧之间 set_bounds 换了新矩形：还原必须用新值，不能覆盖用户新尺寸。"""
+    ctrl, form, probe = _nudge_controller(monkeypatch, bounds=(10, 20, 300, 200))
+
+    ctrl._nudge_after_scroll()
+    form.run_next()  # +1：旧矩形
+
+    ctrl._bounds = (50, 60, 400, 500)  # 模拟中途 set_bounds
+    form.run_next()  # 还原
+
+    assert probe.writes == [(10, 20, 300, 201), (50, 60, 400, 500)]
+
+
+def test_nudge_swallows_dispatch_failure():
+    """BeginInvoke 抛异常时 nudge 静默放弃，绝不影响浏览器主流程。"""
+    ctrl, form, probe = _nudge_controller()
+
+    def _boom(delegate):
+        raise RuntimeError("BeginInvoke failed")
+
+    form.BeginInvoke = _boom
+
+    ctrl._nudge_after_scroll()  # 不抛
+
+    assert probe.writes == []
+    assert form.queue == []
+
+
+def test_nudge_skips_zero_size_bounds_inside_callback(monkeypatch):
+    """w/h<=0 的判断在回调内（守卫只判 _bounds 是否为空）：会投递一次，
+    但绝不写入非法矩形。
+    """
+    ctrl, form, probe = _nudge_controller(monkeypatch, bounds=(10, 20, 0, 0))
+
+    ctrl._nudge_after_scroll()
+
+    assert form.begin_invoke_calls == 1
+    form.run_next()
+    assert probe.writes == []
+    assert form.queue == []  # 还原也没投递

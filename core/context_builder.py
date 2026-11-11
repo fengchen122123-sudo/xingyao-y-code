@@ -6,18 +6,20 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from core.injection_markers import DYNAMIC_CONTEXT_PREFIX, TIME_NOTE_PREFIX
+
 if TYPE_CHECKING:
     from core.computer.models import ComputerCapability
 
 
 _DECISION_POLICY = """【决策与行动规则】
-1. 明确且简单的任务只做一次判断，然后立即执行，不为已经清楚的目标增加额外流程。
+1. 任务先拆解再动手；子任务不超过 3 条的直接执行（只做一次判断，不为已经清楚的目标增加额外流程）；超过 3 条的先建立计划再逐条执行。
 2. 没有新证据时，不得反复重新讨论已经排除的方案、工具或风险。
 3. 接到任务先对照【可用技能目录】检查匹配的技能（任何工具调用或文件修改之前）；哪怕只有轻微相关也先 read_file 读取对应 SKILL.md 再动手，发现不匹配再放弃；确定无关的技能不加载。
 4. 需要多个互不依赖的工具或子任务时一次性并行发出，拿到结果后直接汇总。
 5. 推理只服务于确定下一步动作；证据充分后立即行动。
 6. 需要实时天气时使用 get_weather 并传入明确城市；城市未知时先询问；需要读取网页或 JSON 时使用 fetch_url；search_news 仅用于新闻。
-7. 复杂任务先创建包含依赖、角色、文件范围、阶段、verification_type 和验证内容的计划，再按 ready 项执行；信息查询使用 result 验证，只有真实 Shell 命令使用 command 验证。
+7. 子任务超过 3 条的任务先创建包含依赖、角色、文件范围、阶段、verification_type 和验证内容的计划，再按 ready 项执行；信息查询使用 result 验证，只有真实 Shell 命令使用 command 验证。
 8. Plan 阶段只读分析，Build 阶段负责实现，Review 阶段只读审查；每个计划项必须关联具体 plan_item_id。`ask_user` 的 options 只能提供 1 到 3 个选项。用户选择必须单独建立准备项并设置 kind=input_preparation，执行项通过 depends_on 依赖该准备项并保持 kind=execution；ask_user(plan_item_id=...) 只能绑定准备项，不得把 ask_user 绑定到真正执行查询或修改的计划项。不能在计划失败后绕过计划直接调用普通工具。
 9. 始终使用与用户一致的语言输出；用户使用中文时，所有可见内容（含计划评审、进度说明、最终结论）必须使用中文，不得夹带英文段落。
 """
@@ -37,6 +39,11 @@ class RuntimeContext:
     # Turn 起点冻结的电脑操控能力（Task 10，设计 9.3）：默认 None，
     # disabled/None 时动态块字节与历史版本完全一致。
     computer_capability: "ComputerCapability | None" = None
+    # 按回合撤销纠正动态块（规格 15.3）：无纠正时为空串，动态块字节不变。
+    workspace_corrections: str = ""
+    # AI 生成内容目录（Task 6）：配置级稳定值（默认 ~/.ycode/tmp），
+    # 跨轮不变，符合动态块"不放每轮必变字段"的约束。
+    ai_output_dir: str = ""
 
 
 def build_stable_prompt(base_prompt: str) -> str:
@@ -51,8 +58,9 @@ def build_stable_prompt(base_prompt: str) -> str:
     return "\n\n".join(parts)
 
 
-DYNAMIC_CONTEXT_PREFIX = "【当前运行上下文】"
-TIME_NOTE_PREFIX = "【当前时间】"
+# 保留标记的唯一来源已收敛到 core/injection_markers.py（T1.5 防伪造基础设施），
+# 由文件顶部 import 引入。常量值逐字未变，且
+# `from core.context_builder import DYNAMIC_CONTEXT_PREFIX` 等既有引用路径保持可用。
 
 
 def build_dynamic_prompt(runtime: RuntimeContext) -> str:
@@ -68,6 +76,28 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
 
     电脑操控说明（Task 10，设计 10.1）：只在 Turn 冻结的 capability 开启时
     追加到块末尾；默认 None / disabled 时返回值与历史版本逐字节一致。
+
+    渲染方式（规格 02 §3.2 步骤 2 渲染接管）：本函数不再手工拼段，而是遍历
+    注入注册表的 PERSISTED/SYSTEM 通道——注入点 3（_build_runtime_context_block）
+    / 注入点 6（电脑操控说明）/ 注入点 7（按回合撤销纠正）——按登记顺序取非空段
+    并以 "\\n\\n" 连接。分段点正落在改造前手工追加 "\\n\\n" 的位置，故输出逐字节
+    一致。防递归：注册表的 runtime_context_block builder 指向基础块函数
+    _build_runtime_context_block，绝不回调本函数。
+    """
+    from core.context_injection import build_default_injection_registry
+
+    registry = build_default_injection_registry(runtime_provider=lambda: runtime)
+    sections = [section for section in registry.build_persisted_sections() if section]
+    return "\n\n".join(sections)
+
+
+def _build_runtime_context_block(runtime: RuntimeContext) -> str:
+    """运行上下文基础块（注入点 3）：不含电脑操控说明与按回合撤销纠正。
+
+    为什么从 build_dynamic_prompt 里拆出来：注册表把基础块 / 电脑操控说明 /
+    按回合纠正登记为三条独立 PERSISTED/SYSTEM source（规格 02 §2.2），每条
+    builder 必须能独立取值，否则会出现"基础块已含 6/7、注册表再拼一次"的双份
+    注入；同时这也避免注册表 builder 回调 build_dynamic_prompt 造成的无限递归。
     """
     plan_instruction = ""
     if runtime.permission_mode == "plan":
@@ -84,13 +114,13 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         f"默认命令解释器：{runtime.command_shell}\n"
         "生成命令时必须优先使用该解释器的语法；命令失败后根据错误调整语法，"
         "必要时可通过 execute_command 的 shell_id 显式选择其他已安装解释器。\n"
+        f"AI 生成内容目录：{runtime.ai_output_dir}\n"
+        "AI 产出的图片、下载文件与临时脚本一律写到该目录；"
+        "用户显式指定了保存位置时以用户指定为准。\n"
         f"当前计划：{runtime.active_plan}\n"
         f"{plan_instruction}"
         "（若上下文中存在多份本块，以最新一份为准）"
     )
-    computer_section = _build_computer_prompt_section(runtime.computer_capability)
-    if computer_section:
-        prompt = prompt + "\n\n" + computer_section
     return prompt
 
 

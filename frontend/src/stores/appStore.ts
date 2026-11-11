@@ -1,19 +1,33 @@
 import { defineStore } from 'pinia';
+// Git 工作台事件转发（git_state_changed）；gitStore 不反向依赖 appStore，无环
+import { useGitStore } from './gitStore';
 import type {
+  AutomationRunInfo,
+  AutomationTaskInfo,
+  WorkflowInfo,
+  WorkflowInvalidInfo,
+  WorkflowRunInfo,
   ModelInfo,
   ProviderInfo,
   ApiProtocolInfo,
   PresetProviderInfo,
   ModelSettingsSnapshot,
   SessionGroup,
+  ArchivedSessionInfo,
+  ArchiveBatchResult,
   SkillInfo,
   McpInfo,
   PluginInfo,
+  HookInfo,
   FileNode,
   BridgeEvent,
+  BackgroundVideoInfo,
   PlanData,
   BackgroundTask,
   TokenUsage,
+  ContextBreakdownItem,
+  SessionTokenTotals,
+  TokenUsageOverview,
   TokenStatisticsSnapshot,
   PermissionMode,
   ReasoningChoice,
@@ -23,14 +37,33 @@ import type {
   ComputerActionTrace,
   ComputerControlEvent,
   ComputerRunSnapshot,
+  FfmpegComponentStatus,
+  SearchComponentStatus,
+  PlaywrightComponentStatus,
   PyWebViewAPI,
   ToolStartEventData,
   ToolFinishEventData,
   DiffReadyEventData,
   SubagentProgressEventData,
   QueuedMessage,
+  TurnUndoStateSummary,
+  TurnUndoPreviewPayload,
+  TurnUndoExecutePayload,
+  TurnUndoRecoveryPreviewPayload,
+  TurnUndoRecoveryExecutePayload,
+  ResumePlanSnapshot,
+  ResumeBlockerItem,
+  SlashCommandInfo,
+  GoalStateInfo,
 } from '../types/pywebview';
+import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
+import { isDocxFilePath, isMarkdownFilePath, isOfficeFilePath, isPdfFilePath, toFileUrl } from '../utils/localPath';
+import { fileExt } from '../utils/fileIcon';
+import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
+// 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
+import { requestFrontendReload } from '../utils/frontendUpdate';
 import type { MediaItem } from '../types/media';
+import type { AttachmentItem } from '../types/composer';
 import { formatPermMode } from '../utils/markdown';
 import {
   reduceExecutionState,
@@ -62,8 +95,22 @@ import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
   SIDEBAR_WIDTH_KEY,
+  computeRestoredRatioWidth,
   computeRestoredWidth,
 } from '../composables/usePanelResize';
+import {
+  DISCLAIMER_VERSION,
+  isDisclaimerVersionAccepted,
+} from '../data/disclaimer';
+
+// 停止回合的兜底解锁定时器（按会话名）。T12 兜底的初衷是「后端没回 turn_cancelled
+// 时本地强制解锁」，而不是「10s 后无条件清一次运行态」：用户点停止后马上重发，
+// 新回合的 turn_start 会把会话重新放回 runningSessions，旧定时器到点看到会话在跑，
+// 就把它误判成「停止没生效」一并解锁——表现为重发后 1s 左右「正在干活」消失、
+// 停在「本轮工作 xx」的结束态，后端却仍在执行。故：权威运行态一旦被改写
+// （终态事件 / 新回合开始 / 发送失败回滚）就撤掉该会话的定时器，只留真正丢失
+// 终态事件的那条路径生效。定时器不参与响应式，放模块级。
+const stopFallbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /**
  * 面板宽度启动恢复：读取 localStorage 中上次拖拽记忆的宽度，
@@ -77,6 +124,60 @@ function storedPanelWidth(key: string, def: number, min: number, max: number): n
     return def;
   }
 }
+
+/**
+ * 右面板宽度启动恢复（视口比例语义）：记忆的是“占视口宽度的比例”，
+ * 按当前视口换算成像素（兼容旧版像素记忆），并夹取到
+ * [min, min(配置上限, 视口 50%)]；未自定义或存储不可用回默认宽度。
+ * 窗口缩放时的等比跟随由 usePanelResize(viewportRatio) 的 resize 监听负责。
+ */
+function restoredRightPanelWidth(): number {
+  try {
+    return computeRestoredRatioWidth(
+      localStorage.getItem(RIGHT_PANEL_WIDTH_KEY),
+      RIGHT_PANEL_MIN_WIDTH,
+      RIGHT_PANEL_MAX_WIDTH,
+    ) ?? RIGHT_PANEL_DEFAULT_WIDTH;
+  } catch {
+    return RIGHT_PANEL_DEFAULT_WIDTH;
+  }
+}
+
+/**
+ * PDF 编辑保存用的本地时间戳（YYYYMMDD_HHMMSS，逐段补零）。
+ * 后端默认命名用同一形状；Office 转换文档的副本路径要前端自己拼，
+ * 两边保持一致，用户在同目录里能一眼认出哪些是同一批导出。
+ */
+function pdfEditTimestamp(now: Date = new Date()): string {
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+    + `_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+// 底部内嵌终端面板持久化键与尺寸边界（与 'ycode-*' 前缀约定一致）
+export const TERMINAL_PANEL_OPEN_KEY = 'ycode-terminal-open';
+export const TERMINAL_PANEL_HEIGHT_KEY = 'ycode-terminal-height';
+export const TERMINAL_PANEL_DEFAULT_HEIGHT = 300;
+export const TERMINAL_PANEL_MIN_HEIGHT = 140;
+export const TERMINAL_PANEL_MAX_HEIGHT = 720;
+
+// 秘书名字长度上限：与后端 core.secretary.validate_secretary_name 的口径一致
+// （去首尾空白后 1-20 个字符）。前端只做「禁用按钮 + 可见提示」，不做截断——
+// 悄悄把用户输入砍短会让身份名字与用户输入不符，后端仍会二次校验。
+export const SECRETARY_NAME_MAX_LEN = 20;
+// 秘书专属人设长度上限：与后端 core.secretary.MAX_PERSONA_LEN 一致；留空合法
+// （= 使用内置默认秘书人设），只在超长时拦下并给出可见提示
+export const SECRETARY_PERSONA_MAX_LEN = 20000;
+
+// 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页，
+// novel 是小说工作台（只读展示项目状态，设计 §7），doc 是文档阅读器
+// （PDF / Word / Excel / PPT，前端 pdf.js 自绘，不经过内嵌浏览器）
+export type RightPanelTabId =
+  | 'files' | 'git' | 'browser' | 'doc' | 'tasks' | 'computer' | 'subagent' | 'novel';
+// 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
+const RIGHT_PANEL_TAB_IDS = new Set<RightPanelTabId>([
+  'files', 'git', 'browser', 'doc', 'tasks', 'computer', 'subagent', 'novel',
+]);
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
   // Pinia exposes state through Vue proxies, which structuredClone rejects.
@@ -125,6 +226,45 @@ function enqueueGuiThemeOperation<T extends object>(
   return result;
 }
 
+// 上下文来源占比快照：旧后端缺失→[]；过滤非法 source 与非正 chars（容错不炸）
+const CONTEXT_BREAKDOWN_SOURCES = new Set<ContextBreakdownItem['source']>([
+  'messages',
+  'system_prompt',
+  'skills',
+  'runtime_context',
+  'system_tools',
+  'mcp_tools',
+]);
+
+const normalizeContextBreakdown = (value: unknown): ContextBreakdownItem[] => {
+  if (!Array.isArray(value)) return [];
+  const items: ContextBreakdownItem[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') continue;
+    const source = (raw as { source?: unknown }).source;
+    if (typeof source !== 'string') continue;
+    if (!CONTEXT_BREAKDOWN_SOURCES.has(source as ContextBreakdownItem['source'])) continue;
+    const chars = Number((raw as { chars?: unknown }).chars);
+    if (!Number.isFinite(chars) || chars <= 0) continue;
+    items.push({ source: source as ContextBreakdownItem['source'], chars });
+  }
+  return items;
+};
+
+export const normalizeSessionTokenTotals = (data: any = {}): SessionTokenTotals => ({
+  session_id: String(data.session_id ?? ''),
+  prompt: Number(data.prompt ?? 0),
+  completion: Number(data.completion ?? 0),
+  cached: Number(data.cached ?? 0),
+  cache_prompt: Number(data.cache_prompt ?? 0),
+  total: Number(data.total ?? 0),
+  requests: Number(data.requests ?? 0),
+  last_ts: data.last_ts === null || data.last_ts === undefined ? null : Number(data.last_ts),
+  keepalive_prompt: Number(data.keepalive_prompt ?? 0),
+  keepalive_cached: Number(data.keepalive_cached ?? 0),
+  keepalive_requests: Number(data.keepalive_requests ?? 0),
+});
+
 export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
   const nullableNumber = (value: unknown): number | null => {
     if (value === null || value === undefined) return null;
@@ -148,6 +288,15 @@ export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
     total_prompt: Number(data.total_prompt ?? 0),
     total_completion: Number(data.total_completion ?? 0),
     total_cached: Number(data.total_cached ?? 0),
+    // 车道身份与保活单列：命中率按 (会话, 模型, 接口, scope) 独立，
+    // 界面必须标清楚数字属于哪条车道；旧后端无这些字段时回落 ""/null（不冒充 0%）
+    cache_lane_model: String(data.cache_lane_model ?? ''),
+    cache_lane_api_base: String(data.cache_lane_api_base ?? ''),
+    cache_keepalive_hot_pct: nullableNumber(data.cache_keepalive_hot_pct),
+    cache_keepalive_session_pct: nullableNumber(data.cache_keepalive_session_pct),
+    // 本会话口径（落库聚合，重启不清零）；旧后端无此字段时回落全零 + 空 session_id
+    session_totals: normalizeSessionTokenTotals(data.session_totals),
+    context_breakdown: normalizeContextBreakdown(data.context_breakdown),
   };
 };
 
@@ -176,6 +325,9 @@ const COMPUTER_BAR_STATUSES = [
   'starting', 'running', 'paused', 'waiting_for_user',
   'provider_safety_required', 'stopping', 'failed',
 ];
+
+// run 终态（2026-09-10 设计）：页签关闭入口与自动关闭计时的共同判据
+const COMPUTER_TERMINAL_STATUSES = ['completed', 'stopped', 'failed'];
 
 // 内存轨迹上限（设计 16.2）：只保留最新 200 条
 const COMPUTER_TRACE_MAX = 200;
@@ -248,6 +400,8 @@ export interface MessageMetrics {
 
 export interface ChatMessage {
   id?: string;
+  // 后端历史行的稳定 id（分页游标 / 红点导航按 id 定位用；本地新消息可能缺省）
+  _msg_id?: number;
   // notice：对话流内的系统提示（取代原 Toast，不自动消失）
   role: 'user' | 'assistant' | 'tool' | 'error' | 'notice';
   content?: string;
@@ -275,6 +429,10 @@ export interface ChatMessage {
   media?: MediaItem[];
   // 生成耗时与速率指标（后端权威结算或历史持久化透传）
   metrics?: MessageMetrics;
+  // 按回合撤销：权威回合归属（message_turn_links 持久化元数据，旧消息缺省为空串）。
+  // turnId 是撤销定位键；positionKind 标识本条消息在回合中的位置种类
+  turnId?: string;
+  positionKind?: string;
 }
 
 const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
@@ -352,7 +510,17 @@ export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] 
     if (m.role === 'tool' && m.tool_call_id) toolMessages.set(m.tool_call_id, m);
   }
   const paired: ChatMessage[] = [];
-  for (const m of messages) {
+  for (const raw of messages) {
+    // 按回合撤销：后端消息携带 snake_case 的回合关联元数据，统一映射
+    const m: ChatMessage = (() => {
+      const anyRaw = raw as any;
+      if (anyRaw.turn_id === undefined && anyRaw.position_kind === undefined) return raw;
+      return {
+        ...raw,
+        turnId: anyRaw.turn_id || '',
+        positionKind: anyRaw.position_kind || '',
+      } as ChatMessage;
+    })();
     if (m.role === 'tool' && m.tool_call_id && toolMessages.has(m.tool_call_id)) continue;
     if (m.role === 'assistant') {
       paired.push({
@@ -395,11 +563,37 @@ export interface PermReqState {
   permissionOptions: Array<{ key: string; label: string }>;
   // 请求来源工具名：'ask_user' 时为澄清问题，否则为标准权限请求
   functionName: string;
+  // 按回合撤销：undo_turn 权限卡附带的服务预检影响摘要（其余工具为 null）
+  undoImpact?: Record<string, any> | null;
 }
 
-export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
+export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations' | 'workflows';
+
+// 星流工作流：导入结果（成功条目 / 失败原因，exists=同名已存在待确认覆盖）
+export interface WorkflowImportedItem { name: string; path: string; }
+export interface WorkflowImportFailure { name: string; error: string; exists?: boolean; }
 
 const speedTracker = new StreamingSpeedTracker();
+
+// 页面是否由本机回环地址加载（桌面 pywebview 宿主）：
+// 手机经局域网 IP 访问时 hostname 是 192.168.x.x 之类，桌面专属桥
+// （open_path / preview_office_doc 等）在 LanServer.FORBIDDEN_METHODS 里被
+// fail-closed 封禁，调用只会拿到 "method not allowed"。桌面专属分支据此提前
+// 收手并给出可读提示，不发起注定失败的调用。无主机名（file:// 等）按本机处理，
+// 避免误伤不经过 HTTP 的宿主形态。
+export function isLoopbackHostName(host: unknown): boolean {
+  const h = String(host ?? '').trim().toLowerCase();
+  if (!h) return true;
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
+function isLoopbackPageHost(): boolean {
+  try {
+    return isLoopbackHostName(window.location.hostname);
+  } catch {
+    return true;
+  }
+}
 
 export const useAppStore = defineStore('app', {
   state: () => ({
@@ -420,6 +614,23 @@ export const useAppStore = defineStore('app', {
     // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享后端配置
     sandboxEnabled: false,
 
+    // 飞书集成快照（密钥只回 has_secret，明文按需单独取）
+    feishuSettings: {
+      enabled: false,
+      app_id: '',
+      has_secret: false,
+      approvers: [] as string[],
+      notify_chat_id: '',
+      status: {
+        state: 'disabled',
+        running: false,
+        last_error: '',
+        received_events: 0,
+        duplicate_events: 0,
+        uptime_seconds: 0,
+      },
+    },
+
     // 系统设置使用独立快照，后续新增系统级选项时继续扩展该对象。
     systemSettings: {
       command_shell: 'auto',
@@ -430,6 +641,15 @@ export const useAppStore = defineStore('app', {
       agent_turn_step_limit: 200,
       agent_turn_step_limit_min: 10,
       agent_turn_step_limit_max: 1000,
+      // 上下文水位基准：默认未设置（null，跟随模型真实窗口），
+      // 真实值一律以后端快照覆盖
+      context_watermark_base: null,
+      context_watermark_base_min: 50000,
+      context_watermark_base_max: 2000000,
+      // AI 生成内容目录：默认目录与生效路径一律以后端快照覆盖，前端不猜路径
+      ai_output_dir: '',
+      ai_output_dir_setting: '',
+      ai_output_dir_default: '',
       // 电脑操控默认关闭（设计 8.1）：真实值一律以后端快照覆盖
       browser_control_enabled: false,
       computer_control_enabled: false,
@@ -453,6 +673,10 @@ export const useAppStore = defineStore('app', {
     // （设置读取快照）相互独立；轨迹为内存态，run 结束保留到下一个 run
     computerRun: emptyComputerRun(),
     computerTrace: [] as ComputerActionTrace[],
+    // 每帧截图索引：screen_sha256 → loopback 预览 URL。computer_observation 事件
+    // 同时带画面哈希与预览地址，按哈希记住后在对话区的电脑动作行里反查该动作
+    // 当帧的画面——不用给每个动作单独存截图，也不会把旧图错配到新动作上。
+    computerShots: {} as Record<string, string>,
     // 操控页签自动打开标志：run 开始时首次自动切到操控页签一次，
     // 用户手动切走后不抢回（设计 16.2），新 run 再开一次
     computerLastAutoOpenedRunId: '',
@@ -460,6 +684,54 @@ export const useAppStore = defineStore('app', {
     // 与动作起始毫秒（finished 事件缺 duration_ms 时计算耗时）
     _computerEventSeq: 0,
     _computerActionStartMs: {} as Record<number, number>,
+    // 已关闭 run 黑名单（不参与渲染）：清空运行态后拒绝该 run 的迟到事件与快照，
+    // 防止「操控」页签被旧事件复活
+    _computerClosedRunId: '',
+
+    // Playwright 按需组件（core/components.py）：安装包不再内置 Playwright，
+    // 设置页「浏览器操控组件」卡片按需下载。真值一律以后端快照覆盖，
+    // 下载进度经 playwright_component_progress 桥事件增量合并（不做乐观进度）
+    playwrightComponent: {
+      installed: false,
+      version: '',
+      downloading: false,
+      percent: 0,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      error: '',
+      stage: '',
+      dir: '',
+    } as PlaywrightComponentStatus,
+
+    // ffmpeg 按需组件（背景图转换依赖）：安装包不再内置 ffmpeg，转换页
+    // 「视频转换组件」卡片按需下载。口径与 playwrightComponent 完全一致——
+    // 真值一律以后端快照覆盖，进度经 ffmpeg_component_progress 桥事件增量合并
+    ffmpegComponent: {
+      installed: false,
+      version: '',
+      downloading: false,
+      percent: 0,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      error: '',
+      stage: '',
+      dir: '',
+    } as FfmpegComponentStatus,
+
+    // 网页搜索按需组件（ddgs 链路）：安装包不再内置 ddgs/primp/lxml/fake_useragent，
+    // web_search 工具按需下载组件后才能用。口径与前两个组件完全一致——
+    // 真值一律以后端快照覆盖，进度经 search_component_progress 桥事件增量合并
+    searchComponent: {
+      installed: false,
+      version: '',
+      downloading: false,
+      percent: 0,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      error: '',
+      stage: '',
+      dir: '',
+    } as SearchComponentStatus,
 
     // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
     reasoning: {
@@ -473,6 +745,9 @@ export const useAppStore = defineStore('app', {
 
     // 会话 / 项目工作区
     sessionGroups: [] as SessionGroup[],
+    // 归档会话（get_archived_sessions 的扁平列表，按归档时刻倒序）：设置页
+    // 「会话归档」分区的数据源，不参与主列表渲染
+    archivedSessions: [] as ArchivedSessionInfo[],
     currentSessionName: '',
     currentSessionDisplayName: '新对话',
     // 懒创建会话：点“新会话”只进入空白状态不落库；发首条消息时才真正创建，
@@ -499,22 +774,65 @@ export const useAppStore = defineStore('app', {
     // 本回合实际用到的技能名（从 is_skill 工具调用收集）：turn_start 时清空，
     // 回合结束后固化为本回合结果，状态栏"技能"项据此显示；随会话 runtime 保存/恢复
     usedSkills: [] as string[],
+    // 按回合撤销：turn_id → 检查点状态摘要（批量查询 + turn_undo_updated 事件维护）。
+    // 卡片按权威 turnId 绑定状态；页面刷新/切换会话后由批量查询重建
+    turnUndoStates: {} as Record<string, TurnUndoStateSummary>,
+    turnUndoReqSeq: 0,
     // M31 修复：各类异步刷新的请求序号，响应返回时序号已过期则丢弃，
     // 避免并发/重复刷新时旧快照覆盖新快照
     sessionsReqSeq: 0,
+    // 归档会话列表刷新序号（同上：过期快照不覆盖新快照）
+    archivedSessionsReqSeq: 0,
     tokenUsageReqSeq: 0,
     mcpReqSeq: 0,
     pluginsReqSeq: 0,
+    // C11：Hook 状态刷新请求序号，过期响应不覆盖新快照
+    hooksReqSeq: 0,
     // M27 修复：文件预览请求序号，旧响应不覆盖新打开文件的内容
     filePreviewReqSeq: 0,
 
     // 技能 / MCP / 插件
     skills: [] as SkillInfo[],
+    // 技能列表是否仍在后台扫描中：首屏 get_initial_state 不再同步扫盘（改为
+    // skills_loaded 事件推送），初始为空数组并不代表"没有技能"，技能页据此
+    // 显示"加载中"而不是"暂无可用技能"，避免误导用户
+    skillsLoading: false,
     mcps: [] as McpInfo[],
     plugins: [] as PluginInfo[],
+    // 斜杠命令清单（后端注册表只读投影）：输入框 "/" 补全的候选源之一。
+    // 默认空数组：接口不可用/加载失败时补全面板退化为「技能 + MCP」两路，不报错
+    slashCommands: [] as SlashCommandInfo[],
+    // /goal 目标状态快照（GoalBar 的数据源）：null = 当前会话没有目标 / 尚未加载。
+    // 取数由组件驱动（挂载探测 + 有目标时每 5 秒轮询），store 只提供 loadGoalState，
+    // 类目上跟 slashCommands 一样属于"后端只读投影"，失败静默不打断对话
+    goalState: null as GoalStateInfo | null,
+    // 目标状态请求序号：轮询/切会话并发时，过期响应不覆盖新会话的状态条
+    goalStateReqSeq: 0,
+    // C11：Hook 信任卡片数据源（项目级命令逐条信任，信任前不执行）
+    hooks: [] as HookInfo[],
+    hooksLoading: false,
+
+    // 星轨自动化任务：任务列表 + 每任务运行历史（事件幂等替换）
+    automationTasks: [] as AutomationTaskInfo[],
+    automationRuns: {} as Record<string, AutomationRunInfo[]>,
+
+    // 星流工作流（ZCode 导入）：清单 + 坏文件（打开面板时刷新）
+    workflows: [] as WorkflowInfo[],
+    workflowInvalid: [] as WorkflowInvalidInfo[],
+    workflowsLoading: false,
+    // 每工作流运行历史（面板按需加载）
+    workflowRuns: {} as Record<string, WorkflowRunInfo[]>,
+    // 解释执行器节点级实时事件（run_id → 事件列表，桥事件推送，上限 100 条/run）
+    workflowLiveEvents: {} as Record<string, import('../types/pywebview').WorkflowRunEvent[]>,
 
     // 对话消息流
     messages: [] as ChatMessage[],
+// 会话历史分页（懒加载）：当前会话的工作副本，随 _captureRuntime/_bindSessionRuntime 切换保存恢复
+historyHasMore: false,
+historyOldestId: null as number | null,
+historyLoading: false,
+// 红点导航全量索引（user 消息 id+预览，不分页）：MessageNavRail 全量渲染数据源
+navItems: [] as Array<{ id: number; preview: string }>,
     running: false,
     // 当前会话本轮回合开始时间戳（毫秒）："已工作 xx秒"计时用，随会话切换恢复
     turnStartedAt: 0,
@@ -533,8 +851,19 @@ export const useAppStore = defineStore('app', {
     // 非当前会话的状态提醒点：sessionName → 'green'(完成) | 'yellow'(待确认) | 'red'(报错)
     // 仅给非当前窗口打点，切换到该会话时清除
     sessionStatusDots: {} as Record<string, 'green' | 'yellow' | 'red'>,
+    // 断点续跑（S4）：后端 resume_plan 判定的可续跑快照（父回合 / 断点位置 /
+    // 待确认项）。仅当它存在且没有降级原因时，错误条旁才出现「从断点继续」按钮
+    resumePlan: null as ResumePlanSnapshot | null,
+    // resume_execute 回 confirm_required 时的写操作清单（列表展示，暂不逐项确认）
+    resumeBlockers: [] as ResumeBlockerItem[],
+    resumeBusy: false,
     // 每个会话独立保存流式消息和回合状态；切换会话不丢失后台事件
     sessionRuntimeByName: {} as Record<string, SessionRuntimeState>,
+    // 会话切换加载中：切到"已有会话"时，目标会话历史仍在后端返回路上（消息区为空）
+    // 的加载态。用于把"加载中"与"真正的新对话/空会话"区分开，避免切换瞬间
+    // 先渲染空消息区而闪出首屏空状态（新对话欢迎页）卡片。
+    // 仅 switchSession 置位/复位，新建会话（createGlobalSession/createSessionInGroup）直接置 false。
+    sessionSwitching: false,
     showThinking: false,
 
     // 图片大图查看（Lightbox）
@@ -543,8 +872,11 @@ export const useAppStore = defineStore('app', {
     // 后端连接状态 / 版本号
     connected: false,
     version: '',
-    // 启动初始化是否完成（控制 Y-CODE 启动画面，完成后淡出进入对话）
+    // 启动初始化是否完成（控制 星瑶Code 启动画面，完成后淡出进入对话）
     initialized: false,
+    // JS 桥完成首次验证（initFromBackend 拿到 api）：底部终端等惰性能力
+    // 以此为启动信号，避免在 pywebview 注入完成前触达 _api() 弹连接失败框
+    bridgeReady: false,
 
     // 侧栏与面板开合状态
     // 移动端（<=768px）默认收起侧栏：侧栏作为 fixed 覆盖层，展开时滑入，
@@ -553,11 +885,63 @@ export const useAppStore = defineStore('app', {
       typeof window !== 'undefined' &&
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(max-width: 768px)').matches,
-    rightPanelCollapsed: false,
+    // 右侧计划/任务/终端/文件/Git 栏默认收起：启动不摊开主对话区，
+    // 仅由顶栏“切换面板”按钮或底栏 Git 分支项手动展开；
+    // 展开状态不持久化，每次启动都从收起开始
+    rightPanelCollapsed: true,
+    // “打开标签页”选择页可见性：顶栏按钮等中性入口展开面板时先选择要看的内容，
+    // 底栏 Git 分支项等定向入口经 openRightPanelTab 直接开页签（不持久化）。
+    // 页签全部关闭时也回到选择页
+    rightPanelPicker: false,
+    // 右面板多页签：当前会话打开的页签与激活页签（'' = 停在选择页）。
+    // 页签集/激活页签/展开态都会话隔离：随 _captureRuntime/_bindSessionRuntime
+    // 按会话保存恢复，A 会话打开的浏览器页签不会出现在 B 会话
+    rightPanelTabs: [] as RightPanelTabId[],
+    rightPanelActiveTab: '' as RightPanelTabId | '',
+    // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
+    // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
+    // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
+    // 模态瞬态，不持久化也不会话隔离
+    rightPanelSnipActive: false,
     // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
+    // 右面板按视口比例记忆（窗口缩放等比跟随），侧栏按固定像素记忆；
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
-    rightPanelWidth: storedPanelWidth(RIGHT_PANEL_WIDTH_KEY, RIGHT_PANEL_DEFAULT_WIDTH, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
+    rightPanelWidth: restoredRightPanelWidth(),
+    // 内嵌浏览器（右侧面板浏览器页签）：真实网页由宿主叠加的原生 WebView2
+    // 渲染，前端只持有状态（地址栏/前进后退能力/加载态）并做乐观更新；
+    // supported=false 表示宿主平台不支持（非 Windows 桌面端 GUI 或缺桥）。
+    embeddedBrowser: {
+      url: '',
+      title: '',
+      can_go_back: false,
+      can_go_forward: false,
+      loading: false,
+      ready: false,
+      visible: false,
+      supported: true,
+      // 星瑶浏览器自动化的项目分辨率（适应窗口呈现）；null = 无自动化视口
+      automationViewport: null as [number, number] | null,
+    },
+    // 右栏浏览器「外部请求导航」（对话正文 / 文件树点击 html 文件触发）：
+    // BrowserPane 消费这条请求去导航；nonce 自增保证同一文件重复点击也能被
+    // 观察到（内容相同的对象引用不变时 watch 不触发）。null = 无待处理请求。
+    browserNavRequest: null as null | { url: string; path: string; session?: string },
+    browserNavNonce: 0,
+    // 右栏「文档」页签的外部打开请求（对话正文 / 文件树点击 PDF、Office 文档）：
+    // DocumentPane 消费这条请求去读文件、用 pdf.js 渲染；nonce 自增保证同一文件
+    // 重复点击也能被观察到。name 是给用户看的文件名（Office 文档转出的 PDF 用的是
+    // 缓存文件名，标题要显示源文档名）；sourcePath 是用户在磁盘上点开的那个源文件
+    // （Office 文档的 path 是缓存 PDF，所以「在文件夹中打开」必须用 sourcePath）。
+    // null = 无待处理请求。
+    docPreviewRequest: null as null | {
+      path: string; name: string; sourcePath?: string; session?: string;
+    },
+    docPreviewNonce: 0,
+    // Office 文档转 PDF 预览的进行中提示（首次转换要拉起 Office，10~25 秒）：
+    // 非空期间「文档」页签在面板里显示「正在把 xxx 转换成 PDF」浮层，
+    // 转换结束（成功/失败）一定清空。null = 没有进行中的转换。
+    officePreviewPending: null as null | { path: string; name: string },
     themeLight: false,
     guiTheme: null as GuiTheme | null,
     savedGuiTheme: null as GuiTheme | null,
@@ -579,14 +963,32 @@ export const useAppStore = defineStore('app', {
       isRoot: true,
       selected: '',
       dirs: [] as Array<{ name: string; path: string }>,
+      // 纯选目录模式：非空时确认只把所选路径交给该回调（不登记工作区、
+      // 不迁移会话归属），供星轨自动化任务表单等场景使用
+      plainPick: null as null | ((path: string) => void),
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact',
-    // 智能体显示名：设置页「人设设置」自定义后全局生效（界面文案/执行过程/思考提示）
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'decision' | 'plugins' | 'about' | 'contact' | 'disclaimer',
+    // JEV 决策记录实时流：decision_recorded 事件累加未读徽章；面板按 tick 拉取刷新
+    decisionUnread: 0,
+    decisionEventTick: 0,
+    // 决策入口可见性：只有真的产生过决策记录才显示头部「决策」入口，
+    // 没做过决策（未启用 / 启用了但从未调用）时不给用户一个空入口
+    decisionHasRecords: false,
+    // 智能体显示名：当前会话生效名——普通会话为设置页「人设设置」的名字，
+    // 秘书会话为该会话自己的秘书名（界面文案/执行过程/思考提示都跟随它）
     agentName: '星瑶',
+    // 设置页人设名：秘书会话里 agentName 会被秘书名占住，等切回普通会话 /
+    // 进入尚未落库的草稿会话时要回落，故与 agentName 分开单独留一份
+    personaAgentName: '星瑶',
     // 智能体对用户的称呼；空串表示不使用特定称呼
     userTitle: '',
+    // 免责条款同意状态：requiredVersion 为当前生效的条款版本，acceptedVersion
+    // 为空或与之不一致时弹首次使用确认框。两者均由后端落盘到
+    // ~/.ycode/disclaimer_consent.json，前端只负责展示判定与触发确认。
+    disclaimerRequiredVersion: '',
+    disclaimerAcceptedVersion: '',
     // 主题预览模式：设置页"预览效果"收起设置、直接看真实首页（草稿已实时渲染），
     // 顶部浮条提供返回编辑；保存/取消/切主题时退出该模式
     themePreviewMode: false,
@@ -594,11 +996,23 @@ export const useAppStore = defineStore('app', {
     // 计划、后台任务、Token 用量
     planData: { title: '', items: [], progress: 0 } as PlanData,
     backgroundTasks: [] as BackgroundTask[],
+    // 右面板“后台任务”详情：当前查看的任务 id 与打开 nonce（执行条“详情”触发）
+    bgTaskDetailId: '',
+    bgTaskOpenNonce: 0,
+    // 右面板“子代理”详情：当前查看的任务 id 与打开 nonce（卡片“查看”触发）
+    subagentDetailId: '',
+    subagentOpenNonce: 0,
     subagentTasks: [] as SubagentTaskSnapshot[],
     tokenUsage: emptyTokenUsage(),
+    // 会话 token 弹层（点击状态行时按需拉取；打开即刷新，不做后台轮询）
+    tokenUsageOverview: null as TokenUsageOverview | null,
+    tokenUsageOverviewLoading: false,
     tokenStatistics: null as TokenStatisticsSnapshot | null,
     tokenStatisticsLoading: false,
-    tokenStatisticsDays: 30 as 1 | 7 | 30,
+    // 0 = 累计全量（旧版统计页的「累计」页签），其余为固定窗口
+    tokenStatisticsDays: 30 as 0 | 1 | 7 | 30,
+    tokenStatisticsLifetime: null as TokenStatisticsSnapshot | null,
+    tokenStatisticsLifetimeLoading: false,
 
     // 软件更新状态
     updateState: {
@@ -626,11 +1040,69 @@ export const useAppStore = defineStore('app', {
     // 确认弹窗（notice 模式时退化为单按钮提示框，用户点击"确定"才关闭）
     confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎', notice: false } as ConfirmState,
 
+    // 会话全局检索模态框（Command Palette）
+    sessionSearchModal: {
+      show: false,
+    },
+
+    // 基元律动（TokenRhythm）账号：登录成功后由后端自动写入 API Key，前端只
+    // 维护展示态。status='unknown' 表示还没探测过（桥未就绪），避免把"未探测
+    // 到"误显示成"未登录"。
+    trAuth: {
+      status: 'unknown' as 'unknown' | 'anonymous' | 'loggedIn',
+      user: null as Record<string, any> | null,
+      configured: false,
+      loading: false,
+    },
+    // 登录弹窗显隐：与 sessionSearchModal 同一套 store 布尔控制约定
+    trLoginModal: { show: false },
+    // 账号浮层（左下角用户卡片上方的小窗）显隐：登录成功后点卡片切换
+    trAccountPanel: { show: false },
+    // 账号总览快照：一次 tr_account_overview() 取回 user / wallet / usage_today。
+    // data 为 null 且 error 为空时表示"还没取过"，浮层据此显示加载态
+    trOverview: {
+      loading: false,
+      data: null as Record<string, any> | null,
+      error: '',
+    },
+
+    // 账号中心原生弹窗（用量明细 / 个人信息）：居中遮罩，直连官方接口
+    // 拿真实数据展示，免去内嵌浏览器二次登录。tab 决定当前渲染哪一块，
+    // 两个按钮共用这一个弹窗实例，关闭后状态清空。
+    trDialog: {
+      show: false,
+      tab: 'usage' as 'usage' | 'profile',
+      loading: false,
+      error: '',
+      data: null as Record<string, any> | null,
+      // 用量明细与调用日志分页游标（仅 usage 视图内部使用）
+      usagePage: 1,
+      usageRange: '7d' as string,
+      logsPage: 1,
+    },
+
     // 权限请求弹窗
     permRequest: { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '' } as PermReqState,
 
     // 二级抽屉页面：技能 / MCP / 模型管理
     subpage: { show: false, type: 'skills' as SubpageType },
+
+    // ── 背景图转换（mp4 → 动画 WebP；后端 gui_bridge 的 bg_convert_* 接口）──
+    bgConvert: {
+      video: null as BackgroundVideoInfo | null,
+      outputDir: '',
+      fps: 12,
+      quality: 78,
+      pingpong: true,
+      running: false,
+      percent: 0,
+      stage: '',
+      etaSeconds: null as number | null,
+      resultPath: '',
+      resultBytes: 0,
+      message: '',
+      error: '',
+    },
 
     // 文件预览弹窗（RightPanel 文件树点击文件时使用）
     // kind=image 时正文渲染 dataUrl（base64 图片），否则渲染 content 文本
@@ -651,12 +1123,36 @@ export const useAppStore = defineStore('app', {
     // frameless 窗口最大化状态（后端 window_maximize_state 事件推送）
     windowMaximized: false,
 
-    // 内嵌终端（右侧面板）
-    terminalOutput: '',
-    terminalRunning: false,
+    // 底部内嵌交互式终端面板（ZCode 弹出式终端）：
+    // open 持久化到 localStorage，height 记忆拖拽结果；默认收起
+    terminalPanelOpen: (() => {
+      try { return localStorage.getItem(TERMINAL_PANEL_OPEN_KEY) === '1'; } catch { return false; }
+    })(),
+    terminalPanelHeight: (() => {
+      try {
+        const n = Number(localStorage.getItem(TERMINAL_PANEL_HEIGHT_KEY));
+        return Number.isFinite(n) && n >= TERMINAL_PANEL_MIN_HEIGHT
+          ? Math.min(n, TERMINAL_PANEL_MAX_HEIGHT)
+          : TERMINAL_PANEL_DEFAULT_HEIGHT;
+      } catch { return TERMINAL_PANEL_DEFAULT_HEIGHT; }
+    })(),
   }),
 
   getters: {
+    // 是否需要弹免责条款确认框：未同意过，或已同意的版本落后于当前条款版本
+    // （条款版本升级后须重新确认）。
+    // requiredVersion 为空表示后端初始状态校验尚未完成，启动期间绝不提前弹窗。
+    disclaimerNeedsAccept(state): boolean {
+      if (!state.disclaimerRequiredVersion) return false;
+      return !isDisclaimerVersionAccepted(state.disclaimerAcceptedVersion, state.disclaimerRequiredVersion);
+    },
+
+    // 已加载消息流中首条带 _msg_id 的消息 id（红点导航已加载/未加载分界）
+    firstLoadedMsgId(state): number | null {
+      const m = (state.messages as any[]).find(x => typeof x?._msg_id === 'number');
+      return m ? (m._msg_id as number) : null;
+    },
+
     currentSessionRunning(state): boolean {
       // M30 修复：判定源统一为 runningSessions（与 sendMessage 的拦截判定一致），
       // 避免此前 sessionRuntimeByName[key].running 与 runningSessions 不同步时
@@ -664,6 +1160,16 @@ export const useAppStore = defineStore('app', {
       // 注意 runningSessions 只记录真实会话名，pending 草稿会话不在其中
       // （首条消息发出前本就允许发送），与 sendMessage 拦截语义完全一致。
       return !!state.currentSessionName && state.runningSessions.includes(state.currentSessionName);
+    },
+
+    // 断点续跑（S4）：仅"快照属于当前会话 + 没有降级原因 + 当前没有回合在跑"时
+    // 才显示入口，避免按钮指向别的会话或与运行中的回合并发
+    resumeAvailable(state): boolean {
+      const plan = state.resumePlan as ResumePlanSnapshot | null;
+      if (!plan || !plan.session_name) return false;
+      if (state.currentSessionName && plan.session_name !== state.currentSessionName) return false;
+      if (plan.aborts && plan.aborts.length > 0) return false;
+      return !state.running;
     },
 
     // 批次D：当前会话是否在排队等其他会话的回合释放锁（turn_queued）
@@ -676,9 +1182,43 @@ export const useAppStore = defineStore('app', {
       return (state.currentSessionName && state.messageQueues[state.currentSessionName]) || [];
     },
 
-    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示
+    // 当前会话发起的后台任务（底部执行条渲染源）：快照带 session_id 归属，
+    // 只显示本会话启动的任务，其他会话（或 CLI）启动的任务不跨会话串显；
+    // 无归属的旧记录不属于任何会话，任何会话的执行条都不显示
+    currentSessionBackgroundTasks(state): BackgroundTask[] {
+      const sess = state.currentSessionName;
+      if (!sess) return [];
+      return state.backgroundTasks.filter(t => t.session_id === sess);
+    },
+
+    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示。
+    // 注意：这是全局判据（RightPanel 自动登记操控页签也用它），不区分会话
     computerControlBarVisible(state): boolean {
       return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
+    },
+
+    // 浏览器操控（target=browser）走「就地围观」：右侧只呈现浏览器页签，
+    // 不自动弹「操控」工作台、不显示顶部安全条——浏览器操控要的是「直接操作
+    // 浏览器」的观感，操控面板只在桌面目标或用户手动打开时出现。
+    // target 为空（旧后端快照）时按非浏览器处理，保留原有安全入口。
+    computerRunIsBrowser(state): boolean {
+      return state.computerRun.target === 'browser';
+    },
+
+    // 顶部安全条的会话归属（对齐 currentSessionBackgroundTasks 的既有约定）：
+    // 只在本会话发起的 run 里渲染，run 在 A 会话启动、用户正看 B 会话时不串显；
+    // 归属未知（owner_session_id 为空，如旧后端快照）时回落显示，
+    // 避免用户失去条上的暂停/停止入口
+    computerBarVisibleInCurrentSession(state): boolean {
+      if (!COMPUTER_BAR_STATUSES.includes(state.computerRun.status)) return false;
+      const owner = state.computerRun.owner_session_id;
+      if (!owner) return true;
+      return owner === state.currentSessionName;
+    },
+
+    // run 是否处于终态：驱动页签关闭入口与终态自动关闭计时
+    computerRunTerminal(state): boolean {
+      return COMPUTER_TERMINAL_STATUSES.includes(state.computerRun.status);
     },
 
     // 暂停/恢复按钮语义（设计 16.1）：starting/running 显示“暂停”，paused 显示“恢复”，
@@ -715,9 +1255,34 @@ export const useAppStore = defineStore('app', {
     themeDirty(state): boolean {
       return JSON.stringify(state.guiThemeDraft) !== JSON.stringify(state.savedGuiTheme);
     },
+
+    // C11：待信任的项目级 Hook（pending/stale 才需要用户决策；trusted 已生效）
+    pendingProjectHooks(state): HookInfo[] {
+      return state.hooks.filter(
+        h => h.scope === 'project' && (h.status === 'pending' || h.status === 'stale'),
+      );
+    },
   },
 
   actions: {
+    /** 记录用户已接受免责条款；返回空串表示成功，否则为错误提示文案。 */
+    async acceptDisclaimer(this: any): Promise<string> {
+      const api = this._api();
+      if (!api?.accept_disclaimer) return '无法连接本地服务，请重启软件后重试。';
+      try {
+        const res = await api.accept_disclaimer();
+        if (res?.ok) {
+          // 版本号以服务端回执为准：前端缓存旧版本时不得据此跳过再次确认
+          this.disclaimerRequiredVersion = String(res.disclaimer_version || this.disclaimerRequiredVersion);
+          this.disclaimerAcceptedVersion = String(res.accepted_version || '');
+          return '';
+        }
+        return String(res?.msg || '保存同意记录失败，请重试。');
+      } catch {
+        return '保存同意记录失败，请重试。';
+      }
+    },
+
     _pendingRuntimeKey(this: any): string {
       return `__pending__:${this.pendingWorkdir || 'GLOBAL'}`;
     },
@@ -734,7 +1299,11 @@ export const useAppStore = defineStore('app', {
       return this.sessionRuntimeByName[key];
     },
 
-    _captureRuntime(this: any, sessionName = this.currentSessionName) {
+    // opts.skipLayout：跳过右面板页签/开合/任务详情等布局态捕获。事件管线
+    // （handleBridgeEvent）跨会话临时绑到目标会话时必须传 true——此时顶层
+    // 布局仍是当前查看会话的实时状态，捕获进目标会话会用 A 的布局污染 B 的
+    // 快照，用户真实切回 B 时恢复出错误页签/开合。
+    _captureRuntime(this: any, sessionName = this.currentSessionName, opts?: { skipLayout?: boolean }) {
       const runtime = this._getSessionRuntime(sessionName);
       runtime.messages = this.messages;
       runtime.streamingText = this.currentStreamingText;
@@ -748,8 +1317,31 @@ export const useAppStore = defineStore('app', {
       // 模型选择随会话保存：切换会话时各会话恢复各自的模型，互不覆盖
       runtime.modelId = this.activeModelId;
       runtime.modelName = this.activeModelName;
+      // 权限档位随会话保存：选择只影响当前会话，不再全局生效
+      runtime.permMode = this.permissionMode;
       // 本回合用到的技能随会话保存
       runtime.usedSkills = this.usedSkills;
+      // 历史分页游标随会话保存（loading 为瞬态不保存，bind 时强制复位）
+      runtime.historyHasMore = this.historyHasMore;
+      runtime.historyOldestId = this.historyOldestId;
+      // 导航索引随会话保存：切回时展示该会话自己的红点
+      runtime.navItems = this.navItems;
+      // 右面板多页签随会话保存：页签集、激活页签与面板展开态都按会话隔离，
+      // 切回时恢复该会话自己的浏览器/Git 等页签。事件管线的临时捕获
+      // （skipLayout）不保存这段：顶层布局此时仍属于当前查看的会话
+      if (!opts?.skipLayout) {
+      // 注意：本行**每次都换一个新数组引用**。S3-T8 报告里「回写当前 store 的同一批
+      // 引用、值相等时 Vue hasChanged 不触发更新」那条论断只适用于上面按引用直赋的
+      // 字段（messages / tokenUsage / modelId / navItems 等），**不适用于 rightPanelTabs**。
+      // 这里没有性能后果：该字段只在切会话时被读写，不在高频事件路径上。
+      runtime.rightPanelTabs = [...this.rightPanelTabs];
+      runtime.rightPanelActiveTab = this.rightPanelActiveTab;
+      runtime.rightPanelExpanded = !this.rightPanelCollapsed;
+      // 后台任务详情查看对象随会话保存：切回时恢复该会话自己的查看对象
+      runtime.bgTaskDetailId = this.bgTaskDetailId;
+      // 子代理详情查看对象同口径随会话保存：切会话不残留上一个会话的查看 id
+      runtime.subagentDetailId = this.subagentDetailId;
+      }
     },
 
     _captureCurrentRuntime(this: any) {
@@ -767,9 +1359,20 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    _bindSessionRuntime(this: any, sessionName = this.currentSessionName) {
+    // opts.skipLayout：跳过右面板页签/开合/任务详情等布局态恢复。事件管线
+    // （handleBridgeEvent）跨会话临时绑回当前会话时必须传 true——布局只随
+    // 用户真实切换会话恢复，否则该会话旧快照会把用户刚点的面板开合覆盖掉
+    // （表现为"关了又自动打开 / 打开又自动关闭"）。
+    _bindSessionRuntime(this: any, sessionName = this.currentSessionName, opts?: { skipLayout?: boolean }) {
       const runtime = this._getSessionRuntime(sessionName);
       this.messages = runtime.messages;
+      // 历史分页游标随会话恢复；loading 为瞬态，切会话强制复位防卡死翻页
+      this.historyHasMore = runtime.historyHasMore ?? false;
+      this.historyOldestId = runtime.historyOldestId ?? null;
+      this.historyLoading = false;
+      // 导航索引随会话切换：目标会话没拉过索引时立即清空，
+      // 否则会显示上一个会话的红点与悬停预览（跨会话串数据）
+      this.navItems = runtime.navItems ?? [];
       this.currentStreamingText = runtime.streamingText;
       this.currentThinkingText = runtime.thinkingText;
       this.running = runtime.running;
@@ -792,9 +1395,68 @@ export const useAppStore = defineStore('app', {
           this.activeModelName = runtime.modelName || this.activeModelName;
         }
       }
+      // 权限档位随会话即时恢复（不等后端 switch_session 响应）：
+      // 该会话选过档位才恢复，否则保持当前值由后端响应校正
+      if (runtime.permMode) {
+        this.permissionMode = runtime.permMode as PermissionMode;
+      }
+      // 右面板多页签随会话恢复：目标会话从未展开过面板（undefined）→ 收起、
+      // 无页签；展开过的会话恢复自己的页签集与激活页签。浏览器原生表面随
+      // BrowserPane 的 active prop 翻转自动隐藏/重显，不需要额外桥调用。
+      // 事件管线的临时回绑（skipLayout）不恢复这段：布局属用户实时操作面，
+      // 回滚到旧快照会吃掉用户刚做的开合/页签变更
+      if (!opts?.skipLayout) {
+      const savedTabs = runtime.rightPanelTabs;
+      // 按合法页签白名单过滤：旧快照里可能残留已删除的 id，直接 as 强转会让
+      // RightPanel 的 PANE_LABELS[tab] 取到 undefined（页签标题/图标变空白）
+      let tabs: RightPanelTabId[] = savedTabs
+        ? (savedTabs as string[]).filter(
+            (t: string): t is RightPanelTabId => RIGHT_PANEL_TAB_IDS.has(t as RightPanelTabId),
+          )
+        : [];
+      // 操控页签依附于全局唯一的 run：终态自动收场可能发生在别的会话上
+      // （closeRightPanelTab 只作用于当前页签集），run 已清场后残留的操控
+      // 页签恢复出来只会是一片空白，恢复时一并丢弃
+      if (!this.computerRun.run_id) {
+        tabs = tabs.filter(t => t !== 'computer');
+      }
+      this.rightPanelTabs = tabs;
+      const savedActive = runtime.rightPanelActiveTab;
+      this.rightPanelActiveTab = savedActive && this.rightPanelTabs.includes(savedActive as RightPanelTabId)
+        ? savedActive
+        : this.rightPanelTabs[this.rightPanelTabs.length - 1] || '';
+      // 该会话从未展开过面板（undefined）→ 收起，让它显示正常会话页面；
+      // 展开过的会话恢复自己的开合态
+      this.rightPanelCollapsed = runtime.rightPanelExpanded === undefined
+        ? true
+        : !runtime.rightPanelExpanded;
+      // 无页签 → 选择页；有页签 → 显示激活页签
+      this.rightPanelPicker = this.rightPanelTabs.length === 0;
+      // 后台任务详情查看对象随会话恢复：切会话不残留上一个会话的任务详情
+      this.bgTaskDetailId = runtime.bgTaskDetailId || '';
+      // 子代理详情查看对象同口径恢复：切会话不残留上一个会话的查看 id，
+      // 否则 SubagentPane 会用新会话名去查上一会话的任务 id，详情串场
+      this.subagentDetailId = runtime.subagentDetailId || '';
+      // 画笔截图模态（冻结帧覆盖层）是会话瞬态：切会话后置位残留会让新会话的
+      // 浏览器原生表面被持续压住、覆盖层显示上一会话的冻结帧，这里随会话强制退出
+      // （覆盖层的本地快照 ref 由 RightPanel 监听 currentSessionName 一并清除）
+      this.rightPanelSnipActive = false;
+      }
+    },
+
+    // 撤掉某个会话的停止兜底定时器：该会话运行态已有权威来源，兜底使命结束
+    _clearStopFallbackTimer(this: any, sessionName: string) {
+      const timer = stopFallbackTimers.get(sessionName);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        stopFallbackTimers.delete(sessionName);
+      }
     },
 
     _setSessionRunning(this: any, sessionName: string, running: boolean) {
+      // 运行态被本函数权威改写（新回合开始 / 发送失败回滚 / 兜底自身解锁）：
+      // 旧兜底定时器不能再对这个会话动手，否则会清掉期间新开的回合
+      this._clearStopFallbackTimer(sessionName);
       const runtime = this._getSessionRuntime(sessionName);
       runtime.running = running;
       if (sessionName === this.currentSessionName) this.running = running;
@@ -821,14 +1483,133 @@ export const useAppStore = defineStore('app', {
       return api;
     },
 
+    // 底部终端专用的静默桥访问：不用 _api()（它缺桥时会弹窗），终端在
+    // bridgeReady 之前根本不发起调用，这里兜底返回 null 即可
+    _ptyApi(): PyWebViewAPI | null {
+      return (window.pywebview && window.pywebview.api) || null;
+    },
+
     // 回合级事件（tool_start / tool_finish / diff_ready）必须落在当前助手消息上；
-    // 缺失说明后端事件序列违反契约，直接抛出显式错误而不是静默丢弃。
+    // 缺失时：若当前会话处于运行态（如中途扫码接入），自愈补齐 running 占位卡片避免崩溃；
+    // 若非运行态到达则严格抛出契约错误。
     activeAssistantOrThrow(): ChatMessage {
-      const last = this.messages[this.messages.length - 1];
+      let last = this.messages[this.messages.length - 1];
       if (!last || last.role !== 'assistant') {
-        throw new Error('桥接契约错误：回合级事件到达时不存在活动助手消息');
+        const isRunning = this.running || this.runningSessions.includes(this.currentSessionName);
+        if (isRunning) {
+          console.warn('[Harness] 活跃会话收到回合级事件时不存在活动助手消息，自动补齐 running 占位卡片');
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
+          throw new Error('桥接契约错误：回合级事件到达时不存在活动助手消息');
+        }
       }
       return last;
+    },
+
+    // 恢复运行中回合的快照（中途扫码连入手机或切换到正在执行的会话）
+    _restoreActiveTurnSnapshot(snap: any, targetSessionName: string = '') {
+      if (!snap || typeof snap !== 'object') return;
+      const sess = targetSessionName || snap.session_name || this.currentSessionName;
+      const isCurrent = this.currentSessionName === sess;
+      const runtime = this._getSessionRuntime(sess);
+      const msgs = isCurrent ? this.messages : runtime.messages;
+
+      // 1. 用户消息去重与补齐
+      const userText = String(snap.display_text || snap.user_text || '').trim();
+      if (userText) {
+        const hasUser = msgs.some(m => m.role === 'user' && m.content === userText);
+        if (!hasUser) {
+          msgs.push({ role: 'user', content: userText });
+        }
+      }
+
+      // 2. 助手卡片还原/补齐
+      // 快照是「整回合」粒度：只有末尾气泡确实是当前正在执行的轮次（running）时才允许
+      // 就地补齐；末尾是已完成气泡 / 非 assistant / 无消息时必须新建 running 气泡，
+      // 否则整回合文本会被灌进已完成的旧气泡，后续 token_delta 继续往同一气泡堆。
+      const lastMsg = msgs[msgs.length - 1];
+      const runningMsg: ChatMessage | null =
+        lastMsg && lastMsg.role === 'assistant' && lastMsg.execution_state === 'running' ? lastMsg : null;
+      let assistantMsg: ChatMessage;
+      const streamingText = String(snap.streaming_text || '');
+      const thinkingText = String(snap.thinking_text || '');
+      const toolCalls = Array.isArray(snap.tool_calls)
+        ? snap.tool_calls.map((tc: any): ToolExecutionCall => ({
+            id: String(tc.id || ''),
+            name: String(tc.name || 'tool'),
+            label: String(tc.label || tc.name || 'tool'),
+            started_at_ms: tc.started_at_ms || Date.now(),
+            display: normalizeToolDisplay(tc.display),
+            result: (tc.summary || tc.result || tc.error) ? {
+              ok: !!tc.ok,
+              summary: String(tc.summary || ''),
+              result: String(tc.result || tc.error || ''),
+              duration_ms: tc.duration_ms !== undefined && tc.duration_ms !== null ? Number(tc.duration_ms) : undefined,
+            } : undefined,
+            diff: tc.diff,
+          }))
+        : [];
+
+      if (!runningMsg) {
+        assistantMsg = {
+          role: 'assistant',
+          content: streamingText,
+          reasoning_content: thinkingText,
+          tool_calls: toolCalls,
+          legacy_diffs: [],
+          execution_state: 'running',
+        };
+        msgs.push(assistantMsg);
+      } else {
+        assistantMsg = runningMsg;
+        assistantMsg.execution_state = 'running';
+        if (streamingText && (!assistantMsg.content || streamingText.length > assistantMsg.content.length)) {
+          assistantMsg.content = streamingText;
+        }
+        if (thinkingText && (!assistantMsg.reasoning_content || thinkingText.length > assistantMsg.reasoning_content.length)) {
+          assistantMsg.reasoning_content = thinkingText;
+        }
+        if (toolCalls.length > 0 && (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0)) {
+          assistantMsg.tool_calls = toolCalls;
+        }
+      }
+
+      // 3. 恢复运行态与流式变量
+      runtime.running = true;
+      if (!this.runningSessions.includes(sess)) {
+        this.runningSessions.push(sess);
+      }
+      if (isCurrent) {
+        this.running = true;
+        this.currentStreamingText = assistantMsg.content || streamingText;
+        this.currentThinkingText = assistantMsg.reasoning_content || thinkingText;
+        if (snap.started_at_ms) {
+          this.turnStartedAt = Number(snap.started_at_ms);
+        }
+      }
+    },
+
+    // 把消息里的图片另存到用户选择的位置（后端弹原生"另存为"对话框，
+    // 只接受本地媒体仓库 URL；取消不算错误，用 cancelled 标记区分）
+    async saveMediaImage(url: string, suggestedName = '') {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '后端连接失败，无法另存' };
+      try {
+        const res = await api.save_media_image(url, suggestedName);
+        return res || { ok: false, msg: '另存失败：桥接无返回' };
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: `另存失败：${err}` };
+      }
     },
 
     openLightbox(images: string[], index: number) {
@@ -850,8 +1631,458 @@ export const useAppStore = defineStore('app', {
       this.sidebarCollapsed = !this.sidebarCollapsed;
     },
 
+    // 顶栏“切换面板”按钮等中性入口：收起/展开面板。展开时该会话已有页签 →
+    // 直接显示激活页签；一个页签都没开过 → 先进选择页
     toggleRightPanel() {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
+      if (!this.rightPanelCollapsed) {
+        this.rightPanelPicker = this.rightPanelTabs.length === 0;
+      }
+    },
+
+    // ── 右面板多页签（会话级隔离）─────────────────────────────────
+    // 打开（或切换到）指定页签：不存在则追加，激活并停在该页签。定向入口
+    // （Git 分支项、执行条详情、子代理卡片、浏览器自动化）统一走这里：
+    // 面板上已有其他页签时是“加页签”，不再互相覆盖。
+    // opts.expand=false：只登记页签不摊开面板（操控 run 自动切入沿用旧设计，
+    // 用户手动展开面板时直接落在操控页签）
+    openRightPanelTab(this: any, tab: RightPanelTabId, opts?: { expand?: boolean }) {
+      if (!this.rightPanelTabs.includes(tab)) this.rightPanelTabs.push(tab);
+      this.rightPanelActiveTab = tab;
+      this.rightPanelPicker = false;
+      if (opts?.expand !== false) this.rightPanelCollapsed = false;
+      // 详情页签缺省查看对象：只在本会话有后台任务时自动选第一个，
+      // 其他会话的任务不跨会话代选（与执行条的会话过滤口径一致）
+      if (tab === 'tasks' && !this.bgTaskDetailId && this.currentSessionBackgroundTasks.length) {
+        this.bgTaskDetailId = this.currentSessionBackgroundTasks[0].task_id;
+      }
+      if (tab === 'subagent' && !this.subagentDetailId && this.subagentTasks.length) {
+        this.subagentDetailId = this.subagentTasks[0].id;
+      }
+    },
+
+    // 关闭单个页签：激活页签被关时优先切换到右侧邻居（保持视线位置），
+    // 没有右侧则取最后一个；全部关完回选择页（面板保持展开，可再开新页签）
+    closeRightPanelTab(this: any, tab: RightPanelTabId) {
+      const idx = this.rightPanelTabs.indexOf(tab);
+      if (idx < 0) return;
+      this.rightPanelTabs.splice(idx, 1);
+      if (this.rightPanelActiveTab === tab) {
+        this.rightPanelActiveTab =
+          this.rightPanelTabs[Math.min(idx, this.rightPanelTabs.length - 1)] || '';
+      }
+      if (this.rightPanelTabs.length === 0) {
+        this.rightPanelActiveTab = '';
+        this.rightPanelPicker = true;
+      }
+      // 关闭页签同步清理该页签的瞬态查看对象：否则重开瞬间会先渲染旧详情
+      // （tasks 残留 bgTaskDetailId、subagent 残留查看 id 与 SubagentPane 内部 detail）
+      if (tab === 'tasks') this.bgTaskDetailId = '';
+      if (tab === 'subagent') this.subagentDetailId = '';
+    },
+
+    // 页签条点击：切到已打开的页签
+    activateRightPanelTab(this: any, tab: RightPanelTabId) {
+      if (!this.rightPanelTabs.includes(tab)) return;
+      this.rightPanelActiveTab = tab;
+      this.rightPanelPicker = false;
+    },
+
+    // 页签条“+”：展开面板并显示选择页（保留已开页签，选卡后追加/激活）
+    showRightPanelPicker(this: any) {
+      this.rightPanelCollapsed = false;
+      this.rightPanelPicker = true;
+    },
+
+    // 把浏览器页签开进指定会话的右面板（会话归属）：当前会话直接开；
+    // 其他会话只写入其 runtime（含展开态），不抢当前界面——切回该会话时
+    // 浏览器页签随之出现。浏览器原生表面随页签失活自动隐藏，不跨界显示
+    openBrowserTabForSession(this: any, sessionName: string) {
+      if (!sessionName || sessionName === this.currentSessionName) {
+        this.openRightPanelTab('browser');
+        return;
+      }
+      const runtime = this._getSessionRuntime(sessionName);
+      const tabs: RightPanelTabId[] = runtime.rightPanelTabs
+        ? ([...runtime.rightPanelTabs] as RightPanelTabId[])
+        : [];
+      if (!tabs.includes('browser')) tabs.push('browser');
+      runtime.rightPanelTabs = tabs;
+      runtime.rightPanelActiveTab = 'browser';
+      runtime.rightPanelExpanded = true;
+    },
+
+    // 本地 html 在右栏内嵌浏览器里按网页渲染（对话正文 / 文件树点击 html 的入口）。
+    // 路径转成 file:// URL 后写一条导航请求并摊开浏览器页签；转换失败（相对路径
+    // 等非绝对路径）直接回退源码预览弹窗，不静默失败。宿主不支持内嵌浏览器
+    // （非 Windows 桌面端 GUI）时，由 BrowserPane 消费请求时再回退预览。
+    openLocalFileInBrowser(this: any, path: string) {
+      const url = toFileUrl(path);
+      if (!url) {
+        void this.openFilePreview(path);
+        return;
+      }
+      // session 只在非空时写入：空会话名不产生多余字段，兼容既有导航请求结构
+      this.browserNavRequest = {
+        url,
+        path,
+        session: this.currentSessionName || undefined,
+      };
+      this.browserNavNonce += 1;
+      this.openRightPanelTab('browser');
+    },
+
+    // 文档在右栏「文档」页签里打开：PDF 由前端 pdf.js 自绘（Word/Excel/PPT 先由
+    // 后端转成 PDF），完全不走内嵌浏览器——用户明确要求点文档不要弹出浏览器 UI。
+    // 这里只写请求 + 摊开页签，真正的读文件与渲染由 DocumentPane 负责（宿主没有
+    // read_file_preview 时由它回退提示「在系统中打开」）。
+    // sourcePath：用户在磁盘上的源文件路径。Office 文档的 path 是后端转出的缓存
+    // PDF，「在文件夹中打开」要定位的是源文档，所以单独记一份。
+    openDocumentInRightPanel(this: any, path: string, displayName?: string, sourcePath?: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      const name = String(displayName || '').trim()
+        || target.split(/[\\/]/).pop()
+        || target;
+      this.docPreviewRequest = {
+        path: target,
+        name,
+        sourcePath: String(sourcePath || '').trim() || undefined,
+        session: this.currentSessionName || undefined,
+      };
+      this.docPreviewNonce += 1;
+      this.openRightPanelTab('doc', { expand: true });
+    },
+
+    // PDF 编辑结果落盘：ops 是 DocumentPane 维护的操作列表（PDF point 坐标契约，
+    // 与 core/pdf_edit.py 的 ops 一致）。mode=copy 另存副本，overwrite 由后端先
+    // 备份原文件再覆盖。成功后返回 {ok,path,pages,backup}，path 指向落盘的新文件，
+    // 并由本动作把它重新开进「文档」页签（再编辑针对的是新文件）。
+    //
+    // Office 文档（docx/xlsx/pptx）在这里是「后端转出的缓存 PDF + 源文档路径」的
+    // 组合：overwrite 会写坏用户的 .docx，一律拦下；copy 的副本必须落在源文档同
+    // 目录，否则用户拿到的是缓存目录里的 PDF，回头根本找不到。
+    async savePdfEdits(this: any, ops: any[], mode: 'copy' | 'overwrite' = 'copy') {
+      const req = this.docPreviewRequest;
+      const source = String(req?.sourcePath || req?.path || '').trim();
+      if (!source) {
+        this.notifyModal('PDF 编辑', '没有正在编辑的文档');
+        return null;
+      }
+      const api = this._api();
+      if (!api || typeof api.save_pdf_edits !== 'function') {
+        this.notifyModal('PDF 编辑', '当前宿主不支持保存编辑，请重启应用后再试');
+        return null;
+      }
+      const isConverted = !!req?.sourcePath && !/\.pdf$/i.test(String(req.sourcePath));
+      if (isConverted && mode === 'overwrite') {
+        this.notifyModal('PDF 编辑', '这是 Office 文档转换出来的预览，不能覆盖原文档；请用「保存副本」');
+        return null;
+      }
+      // 普通 PDF 交给后端默认命名（源文件同目录 <stem>_已编辑_<时间戳>.pdf）；
+      // 转换文档只有缓存 PDF，落点要前端自己拼到源文档目录。
+      let outPath = '';
+      if (isConverted) {
+        const dir = source.replace(/[\\/][^\\/]*$/, '');
+        const base = source.split(/[\\/]/).pop() || 'document';
+        const stem = base.replace(/\.[^.]+$/, '') || base;
+        const fileName = `${stem}_已编辑_${pdfEditTimestamp()}.pdf`;
+        outPath = dir ? `${dir}\\${fileName}` : fileName;
+      }
+      let res: any = null;
+      try {
+        res = await api.save_pdf_edits(source, ops, mode, outPath);
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('PDF 编辑', '保存失败: ' + String(err || ''));
+        return null;
+      }
+      // 失败不重载：DocumentPane 的编辑态与历史都还在，用户可以改完再试
+      if (!res || !res.ok) {
+        this.notifyModal('PDF 编辑', '保存失败: ' + (res?.msg || '未知错误'));
+        return null;
+      }
+      if (mode === 'overwrite' && res.backup) {
+        this.notifyModal('PDF 编辑', `覆盖保存已完成（备份：${res.backup}）`);
+      } else {
+        this.notifyModal('PDF 编辑', `已保存：${res.path}`);
+      }
+      const newPath = String(res.path || '');
+      if (newPath) {
+        // 第三个参数不传：sourcePath 指向新 PDF 自己，后续编辑针对的都是这份新文件
+        this.openDocumentInRightPanel(newPath, newPath.split(/[\\/]/).pop() || '文档.pdf');
+      }
+      return res;
+    },
+
+    // 「在文件夹中打开」：资源管理器定位到该文件（Windows 上是打开所在目录并
+    // 选中文件）。旧后端没有 reveal_in_explorer 时退回只打开所在目录；两者都
+    // 不可用才提示失败，不静默无反应。
+    async revealInExplorer(this: any, path: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      const api = this._api();
+      if (!api) {
+        this.notifyModal('在文件夹中打开', '宿主桥不可用，无法定位文件');
+        return;
+      }
+      const dir = target.replace(/[\\/][^\\/]*$/, '');
+      try {
+        if (typeof api.reveal_in_explorer === 'function') {
+          const res = await api.reveal_in_explorer(target);
+          if (res && res.ok) return;
+          if (dir && typeof api.open_folder_in_explorer === 'function') {
+            const fallback = await api.open_folder_in_explorer(dir);
+            if (fallback && fallback.ok) return;
+          }
+          this.notifyModal('在文件夹中打开', (res && res.msg) || '定位失败');
+          return;
+        }
+        if (dir && typeof api.open_folder_in_explorer === 'function') {
+          const res = await api.open_folder_in_explorer(dir);
+          if (res && res.ok) return;
+          this.notifyModal('在文件夹中打开', (res && res.msg) || '定位失败');
+          return;
+        }
+        this.notifyModal('在文件夹中打开', '当前宿主不支持在文件夹中打开');
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('在文件夹中打开', '定位失败: ' + err);
+      }
+    },
+
+    // 基元律动控制台页面（充值 / 用量明细 / 个人信息）在应用内打开：复用右栏
+    // 内嵌浏览器页签，不再拉起系统浏览器。宿主确认不支持内嵌浏览器（非 Windows
+    // 桌面端 GUI）时回退外部打开，保证任何宿主上点按钮都落得了地。
+    // 账号浮层先收起：它相对左下角卡片定位并盖在内容之上，留着会压住刚摊开的右栏。
+    openTrConsolePage(this: any, url: string) {
+      const target = String(url || '').trim();
+      if (!target) return;
+      this.closeTrAccountPanel();
+      if (this.embeddedBrowser.supported === false) {
+        void this.openExternalUrl(target);
+        return;
+      }
+      this.browserNavRequest = {
+        url: target,
+        path: '',
+        session: this.currentSessionName || undefined,
+      };
+      this.browserNavNonce += 1;
+      this.openRightPanelTab('browser');
+    },
+
+    // markdown 在右栏浏览器里按阅读样式打开：浏览器直接打开 .md 只显示源码文本，
+    // 所以先用与消息气泡同一套渲染器生成预览 HTML，经桥落盘（core.web_preview）
+    // 后再交浏览器打开。任一环节不可用（缺桥 / 读文件失败 / 落盘失败）都回退
+    // 源码预览弹窗，不静默失败。
+    async openMarkdownInRightPanel(this: any, path: string) {
+      const api = this._api();
+      if (!api || typeof api.read_file_preview !== 'function'
+        || typeof api.write_preview_page !== 'function') {
+        await this.openFilePreview(path);
+        return;
+      }
+      try {
+        const res = await api.read_file_preview(path);
+        if (!res || !res.ok || typeof res.content !== 'string') {
+          await this.openFilePreview(path);
+          return;
+        }
+        const name = path.split(/[\\/]/).pop() || path;
+        const page = buildMarkdownPreviewHtml(res.content, path, name);
+        const written = await api.write_preview_page(page, path);
+        if (!written || !written.ok || !written.path) {
+          await this.openFilePreview(path);
+          return;
+        }
+        this.openLocalFileInBrowser(String(written.path));
+      } catch {
+        await this.openFilePreview(path);
+      }
+    },
+
+    // Office 文档（doc/xls/ppt/odt...）在右栏预览：右栏渲染不了 Office 二进制，
+    // 先让后端把它转成 PDF（core 侧走 Office COM，首次要拉起进程 10~25 秒，之后按
+    // 源文件 mtime 命中缓存是毫秒级），转好的 PDF 交「文档」页签由前端 pdf.js 渲染
+    // ——与 pdf 链接同一条渲染链，不经过内嵌浏览器。
+    // 唯一例外是 .docx：它由「文档」页签里的 docx-preview 直接渲染 OOXML，不走转换
+    // （见下面的 isDocxFilePath 分支）。
+    //
+    // 两个刻意的设计：
+    // 1) 转换前先把右栏摊开并置 officePreviewPending 提示——二十秒的转换期间界面
+    //    必须有反馈，否则用户以为点击没生效会反复点（每次都排一次转换）；
+    // 2) 转换失败不弹窗打断（用户此刻只想看文档），直接用系统默认程序打开源文件兜底；
+    //    连 open_path 都没有（极旧宿主）才退化成一句模态提示。
+    async openOfficeInRightPanel(this: any, path: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      // 桌面专属能力的两道前置判定：
+      // 1) 非桌面宿主（确认缺内嵌浏览器）：转出 PDF 也没地方显示，不白等 20 秒；
+      // 2) 手机经局域网访问桌面 dist 时 hostname 不是回环地址，而 preview_office_doc /
+      //    open_path 都在 LanServer.FORBIDDEN_METHODS 里被 fail-closed 封禁，LAN shim
+      //    又是 Proxy（任何方法名都返回函数），调过去只会拿到 "method not allowed"。
+      //    这种情况直接给可读提示，不发起注定失败的桥调用。
+      if (this.embeddedBrowser.supported === false || !isLoopbackPageHost()) {
+        this.notifyModal('Office 预览', 'Office 文档右侧预览仅支持在本机桌面端使用');
+        return;
+      }
+      const name = target.split(/[\\/]/).pop() || target;
+      // docx 不走转换：直接把源文件路径交给「文档」页签，由 docx-preview 解析 OOXML
+      // 渲染。这条路秒开、不需要本机装 Office/WPS，也不会出现「正在转成 PDF」的等待。
+      // 只认 .docx —— 老式二进制 .doc / rtf / odt 仍然走下面的 COM 转换。
+      if (isDocxFilePath(target)) {
+        this.openDocumentInRightPanel(target, name);
+        return;
+      }
+      const api = this._api();
+      // 旧后端 / 桥未注入：没有转换能力，回退源码预览弹窗（至少能看文本）
+      if (!api || typeof api.preview_office_doc !== 'function') {
+        await this.openFilePreview(target);
+        return;
+      }
+      // 先把「文档」页签摊开（转换进行中的浮层就挂在 DocumentPane 里），再置提示
+      this.openRightPanelTab('doc', { expand: true });
+      this.officePreviewPending = { path: target, name };
+      let failMsg = '';
+      try {
+        const res = await api.preview_office_doc(target);
+        if (res && res.ok && res.path) {
+          // 打开的是转换后的缓存 PDF，但标题显示源文档名、定位也用源文档路径
+          // （「在文件夹中打开」要落到用户点的那个 .docx 上，不是缓存目录）
+          this.openDocumentInRightPanel(String(res.path), name, target);
+          return;
+        }
+        failMsg = (res && res.msg) || '';
+      } catch (err) {
+        failMsg = String(err || '');
+      } finally {
+        // 成功/失败/异常一律清空：浮层是"转换进行中"的唯一信号，残留会永远转圈
+        this.officePreviewPending = null;
+      }
+      // 兜底：系统默认程序打开源文件（openInSystem 内部失败会自己 notifyModal）
+      if (typeof api.open_path === 'function') {
+        await this.openInSystem(target);
+        return;
+      }
+      this.notifyModal('Office 预览', failMsg || '转换失败');
+    },
+
+    // 本地文件在右栏显示的统一入口（对话正文 / 文件树的点击分流）：
+    // pdf / office 文档进「文档」页签（pdf.js 自绘，office 先转 PDF）；md 先渲染成
+    // 预览页、html 当网页渲染，两者仍走内嵌浏览器页签；其它类型回退源码预览弹窗。
+    async openInRightPanel(this: any, path: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      if (isOfficeFilePath(target)) {
+        await this.openOfficeInRightPanel(target);
+        return;
+      }
+      if (isMarkdownFilePath(target)) {
+        await this.openMarkdownInRightPanel(target);
+        return;
+      }
+      if (isPdfFilePath(target)) {
+        this.openDocumentInRightPanel(target);
+        return;
+      }
+      this.openLocalFileInBrowser(target);
+    },
+
+    // 把任意页签开进指定会话的右面板（会话归属）：当前会话直接开；其他会话只
+    // 写入其 runtime（含展开态），不抢当前界面——切回该会话时页签随之出现。
+    // 供「run 归属会话」的电脑操控页签等使用：run 在 A 会话启动、用户正看 B
+    // 会话时，操控页签应写进 A 的 runtime，不能把 B 的页签集写脏。
+    openRightPanelTabForSession(this: any, sessionName: string, tab: RightPanelTabId, opts?: { expand?: boolean }) {
+      if (!sessionName || sessionName === this.currentSessionName) {
+        this.openRightPanelTab(tab, opts);
+        return;
+      }
+      const runtime = this._getSessionRuntime(sessionName);
+      const tabs: RightPanelTabId[] = runtime.rightPanelTabs
+        ? (runtime.rightPanelTabs as string[]).filter(
+            (t: string): t is RightPanelTabId => RIGHT_PANEL_TAB_IDS.has(t as RightPanelTabId),
+          )
+        : [];
+      if (!tabs.includes(tab)) tabs.push(tab);
+      runtime.rightPanelTabs = tabs;
+      runtime.rightPanelActiveTab = tab;
+      if (opts?.expand !== false) runtime.rightPanelExpanded = true;
+    },
+
+    // 执行条“详情”：记录目标任务并打开后台任务页签（nonce 每次自增，
+    // 同一任务重复点击也能从其他页签切回）
+    openBackgroundTaskDetail(this: any, taskId: string) {
+      if (!taskId) return;
+      this.bgTaskDetailId = taskId;
+      this.bgTaskOpenNonce += 1;
+      this.openRightPanelTab('tasks');
+    },
+
+    // 子代理卡片"查看"按钮：记录目标任务 id 并打开子代理页签
+    // （nonce 每次自增，同一任务重复点击也能从其他页签切回）
+    openSubagentDetail(taskId: string) {
+      if (!taskId) return;
+      this.subagentDetailId = taskId;
+      this.subagentOpenNonce += 1;
+      this.openRightPanelTab('subagent');
+    },
+
+    // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
+    toggleTerminalPanel() {
+      this.terminalPanelOpen = !this.terminalPanelOpen;
+      try {
+        if (this.terminalPanelOpen) {
+          localStorage.setItem(TERMINAL_PANEL_OPEN_KEY, '1');
+        } else {
+          localStorage.removeItem(TERMINAL_PANEL_OPEN_KEY);
+        }
+      } catch { /* 存储不可用时仅本次会话生效 */ }
+    },
+
+    setTerminalPanelHeight(height: number) {
+      this.terminalPanelHeight = Math.round(
+        Math.min(TERMINAL_PANEL_MAX_HEIGHT, Math.max(TERMINAL_PANEL_MIN_HEIGHT, height))
+      );
+      try {
+        localStorage.setItem(TERMINAL_PANEL_HEIGHT_KEY, String(this.terminalPanelHeight));
+      } catch { /* 忽略 */ }
+    },
+
+    /** 确保后端常驻 shell 存在（首次打开面板或上次进程退出后调用） */
+    async ensurePtyTerminal(cols: number, rows: number): Promise<{ ok: boolean; cwd?: string; reused?: boolean; msg?: string }> {
+      const api = this._ptyApi();
+      if (!api?.pty_terminal_ensure) return { ok: false, msg: '后端桥未就绪' };
+      try {
+        const res = await api.pty_terminal_ensure(cols, rows);
+        if (res && res.ok === false && res.msg) {
+          this.notifyChatLocal(`终端启动失败：${res.msg}`, 'notice');
+        }
+        return res || { ok: false, msg: '未知错误' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async ptyTerminalWrite(text: string) {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_write) {
+        try { await api.pty_terminal_write(text); } catch { /* 输入丢弃即可 */ }
+      }
+    },
+
+    async ptyTerminalResize(cols: number, rows: number) {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_resize) {
+        try { await api.pty_terminal_resize(cols, rows); } catch { /* 下次 resize 再试 */ }
+      }
+    },
+
+    async ptyTerminalKill() {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_kill) {
+        try { await api.pty_terminal_kill(); } catch { /* 忽略 */ }
+      }
     },
 
     async _resyncAuthoritativeGuiTheme(this: any, failure: GuiThemeFailure): Promise<GuiThemeFailure> {
@@ -905,12 +2136,17 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean) {
+    _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean, guiThemeId: string | undefined) {
       if (rootStyle === null) document.documentElement.removeAttribute('style');
       else document.documentElement.setAttribute('style', rootStyle);
       // light 类在 html 与 body 上成对维护（见 runtime.applyGuiTheme）
       document.documentElement.classList.toggle('light', light);
       document.body.classList.toggle('light', light);
+      // 主题身份钩子（data-gui-theme-id，主题专属 CSS 的作用域）随快照一起回滚：
+      // 候选主题的原生标题栏桥失败时若不回滚该属性，html 上停留的是候选主题的 id，
+      // 与 store.guiTheme（旧主题）不一致，旧主题会被候选主题的皮肤 CSS 染色。
+      if (guiThemeId === undefined) delete document.documentElement.dataset.guiThemeId;
+      else document.documentElement.dataset.guiThemeId = guiThemeId;
     },
 
     async _applyGuiThemeCandidate(
@@ -924,6 +2160,7 @@ export const useAppStore = defineStore('app', {
       const previousHandle = this._appliedGuiTheme as AppliedTheme | null;
       const previousRootStyle = document.documentElement.getAttribute('style');
       const previousLight = document.body.classList.contains('light');
+      const previousGuiThemeId = document.documentElement.dataset.guiThemeId;
       let candidateHandle: AppliedTheme;
       try {
         candidateHandle = await applyGuiTheme(theme, api);
@@ -936,7 +2173,7 @@ export const useAppStore = defineStore('app', {
           const result = await api.preview_native_titlebar(theme.native_titlebar);
           if (!result.ok) {
             candidateHandle.dispose();
-            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
             const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
             if (!rollback.ok) return rollback;
             return result;
@@ -946,7 +2183,7 @@ export const useAppStore = defineStore('app', {
           const result = await api.restore_native_titlebar();
           if (!result.ok) {
             candidateHandle.dispose();
-            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
             const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
             if (!rollback.ok) return rollback;
             return result;
@@ -955,7 +2192,7 @@ export const useAppStore = defineStore('app', {
         }
       } catch (error) {
         candidateHandle.dispose();
-        this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+        this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
         const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
         if (!rollback.ok) return rollback;
         return guiThemeFailure(error, 'native_titlebar');
@@ -1339,6 +2576,274 @@ export const useAppStore = defineStore('app', {
       this.confirmModal.show = false;
     },
 
+    openSessionSearchModal() {
+      this.sessionSearchModal.show = true;
+    },
+
+    closeSessionSearchModal() {
+      this.sessionSearchModal.show = false;
+    },
+
+    // ── 基元律动账号（TokenRhythm）────────────────────────────────────────
+    // 后端 tr_auth_* 系列不在 PyWebViewAPI 类型声明里（这批接口由后加的解
+    // 决方案提供），这里统一做一次存在性检查 + any 收窄，避免登录入口在旧后
+    // 端上直接抛错。
+    async _trAuthCall(method: string, label: string, args: any[] = []): Promise<any> {
+      const api = this._api() as any;
+      if (!api) return { ok: false, msg: '后端连接不可用，请启动应用后再试' };
+      const fn = api[method];
+      if (typeof fn !== 'function') {
+        return { ok: false, msg: '当前后端版本不支持基元律动登录，请更新到最新版本' };
+      }
+      try {
+        return await fn(...args);
+      } catch (err) {
+        console.error(`${method} 失败:`, err);
+        return { ok: false, msg: `${label}失败：${String(err)}` };
+      }
+    },
+
+    openTrLoginModal() {
+      this.trLoginModal.show = true;
+    },
+
+    closeTrLoginModal() {
+      this.trLoginModal.show = false;
+    },
+
+    // 账号浮层：打开即拉一次总览（余额 / 今日用量会变，不能只依赖上一次快照）。
+    // 拉取失败不清空已有登录态，只在浮层里展示后端原因 + 重试入口。
+    openTrAccountPanel() {
+      this.trAccountPanel.show = true;
+      void this.refreshTrOverview();
+    },
+
+    closeTrAccountPanel() {
+      this.trAccountPanel.show = false;
+    },
+
+    toggleTrAccountPanel() {
+      if (this.trAccountPanel.show) this.closeTrAccountPanel();
+      else this.openTrAccountPanel();
+    },
+
+    // 账号总览：桥接 tr_account_overview()。与 refreshTrAuth 一样按后台探测处理，
+    // 桥未就绪时不弹"连接失败"框，而是把原因写进 error 交给浮层展示。
+    async refreshTrOverview() {
+      const api = (window.pywebview && window.pywebview.api) as any;
+      if (!api || typeof api.tr_account_overview !== 'function') {
+        this.trOverview.data = null;
+        this.trOverview.error = api
+          ? '当前后端版本不支持账号总览，请更新到最新版本'
+          : '后端连接不可用，请启动应用后再试';
+        return null;
+      }
+      this.trOverview.loading = true;
+      this.trOverview.error = '';
+      try {
+        const res = await api.tr_account_overview();
+        if (res && res.ok) {
+          // 原样保存后端快照（user / wallet / usage_today / partial），展示口径交给组件
+          this.trOverview.data = res as Record<string, any>;
+          this.trOverview.error = '';
+        } else {
+          // 未登录也走这条分支：后端 msg 是中文原因，原样展示
+          this.trOverview.data = null;
+          this.trOverview.error = String((res && res.msg) || '账号信息获取失败，请稍后重试');
+        }
+        return res;
+      } catch (err) {
+        console.error('tr_account_overview 失败:', err);
+        this.trOverview.data = null;
+        this.trOverview.error = `账号信息获取失败：${String(err)}`;
+        return null;
+      } finally {
+        this.trOverview.loading = false;
+      }
+    },
+
+    // 查询基元律动登录状态：属后台静默探测（侧栏启动就会调一次），桥未就绪
+    // 时直接返回 null，不弹"连接失败"框骚扰用户。
+    async refreshTrAuth() {
+      const api = (window.pywebview && window.pywebview.api) as any;
+      if (!api || typeof api.tr_auth_status !== 'function') return null;
+      this.trAuth.loading = true;
+      try {
+        const res = await api.tr_auth_status();
+        if (res && res.ok) {
+          this.trAuth.status = res.logged_in ? 'loggedIn' : 'anonymous';
+          this.trAuth.user = res.logged_in && res.user && typeof res.user === 'object' ? res.user : null;
+          this.trAuth.configured = !!res.configured;
+        }
+        return res;
+      } catch (err) {
+        console.error('tr_auth_status 失败:', err);
+        return null;
+      } finally {
+        this.trAuth.loading = false;
+      }
+    },
+
+    // 登录结果落地：ok=true 才算登录成功；bind_ok=false 表示账号已登录但 Key
+    // 没绑上，configured 保持 false，由登录弹窗把 bind_error 原样提示出来。
+    _applyTrLoginResult(res: any) {
+      if (!res || !res.ok) return;
+      this.trAuth.status = 'loggedIn';
+      this.trAuth.user = res.user && typeof res.user === 'object' ? res.user : null;
+      this.trAuth.configured = res.bind_ok !== false;
+      // settings 是完整 get_model_settings() 快照，合并进现有模型设置状态，
+      // 登录后无需再进设置页即可直接对话
+      if (res.settings && Array.isArray(res.settings.models)) {
+        this.applyModelSettings(res.settings);
+      }
+    },
+
+    // 第二个参数是阿里云人机验证 success 回调给出的 captchaVerifyParam，必须原样透传；
+    // 人机验证不可用时省略该参数（后端签名已归一为空串，不会因此报错）
+    async trSendSms(phone: string, captchaVerifyParam?: string) {
+      const args: any[] = [phone];
+      if (captchaVerifyParam) args.push(captchaVerifyParam);
+      return this._trAuthCall('tr_auth_send_sms', '发送验证码', args);
+    },
+
+    // 第三个参数是邀请码（选填）：未填时传空串，后端会归一成 None 且不上送 inviteCode
+    async trSmsLogin(phone: string, code: string, inviteCode?: string) {
+      const res = await this._trAuthCall('tr_auth_sms_login', '登录', [phone, code, inviteCode ?? '']);
+      this._applyTrLoginResult(res);
+      return res;
+    },
+
+    async trPasswordLogin(account: string, password: string) {
+      const res = await this._trAuthCall('tr_auth_password_login', '登录', [account, password]);
+      this._applyTrLoginResult(res);
+      return res;
+    },
+
+    // 退出只清进程内账号会话，后端不动已绑定的 API Key，故这里重新探测状态
+    // 而不是凭本地猜测（configured 仍由后端权威返回）
+    async trLogout() {
+      const res = await this._trAuthCall('tr_auth_logout', '退出登录');
+      if (res && res.ok) {
+        await this.refreshTrAuth();
+        // 账号已退出：浮层里的余额/用量属于上一个账号，必须清掉并收起，
+        // 否则下次打开会先闪一帧旧数据
+        this.trOverview.data = null;
+        this.trOverview.error = '';
+        this.trAccountPanel.show = false;
+      }
+      return res;
+    },
+
+    // ── 账号中心原生弹窗（用量明细 / 个人信息）────────────────────
+    // 两个入口共用一个居中遮罩弹窗，按 tab 渲染不同视图；数据直连官方接口，
+    // 不再走内嵌浏览器（独立 WebView2 会话无登录态，会逼用户二次登录）。
+    openTrDialog(this: any, tab: 'usage' | 'profile') {
+      this.trDialog.tab = tab;
+      this.trDialog.show = true;
+      this.trDialog.loading = false;
+      this.trDialog.error = '';
+      this.trDialog.data = null;
+      this.trDialog.usagePage = 1;
+      this.trDialog.logsPage = 1;
+      this.trDialog.usageRange = '7d';
+      // 浮层若开着先收起，避免两层 UI 叠在一起
+      this.closeTrAccountPanel();
+      void this.fetchTrDialog();
+    },
+
+    closeTrDialog() {
+      this.trDialog.show = false;
+    },
+
+    // 按当前 tab 拉取对应官方接口数据；桥未就绪 / 未登录 / 接口报错都收敛成
+    // error 文本，由弹窗展示"重试"，不弹第二个窗。
+    async fetchTrDialog(this: any) {
+      const api = (window.pywebview && window.pywebview.api) as any;
+      if (!api) {
+        this.trDialog.error = '后端连接不可用，请启动应用后再试';
+        return;
+      }
+      const methodByTab: Record<string, string> = {
+        usage: 'tr_usage_detail',
+        profile: 'tr_profile',
+      };
+      const method = methodByTab[this.trDialog.tab];
+      if (typeof api[method] !== 'function') {
+        this.trDialog.error = '当前后端版本不支持该账号中心功能，请更新到最新版本';
+        return;
+      }
+      this.trDialog.loading = true;
+      this.trDialog.error = '';
+      try {
+        let res: any;
+        if (this.trDialog.tab === 'usage') {
+          res = await api[method](this.trDialog.usageRange, this.trDialog.usagePage, 20);
+        } else {
+          res = await api[method]();
+        }
+        if (res && res.ok) {
+          this.trDialog.data = (res.data && typeof res.data === 'object') ? res.data : null;
+          this.trDialog.error = '';
+        } else {
+          this.trDialog.data = null;
+          this.trDialog.error = String((res && res.msg) || (res && res.reason) || '数据获取失败，请稍后重试');
+        }
+      } catch (err) {
+        console.error(`${method} 失败:`, err);
+        this.trDialog.data = null;
+        this.trDialog.error = `数据获取失败：${String(err)}`;
+      } finally {
+        this.trDialog.loading = false;
+      }
+    },
+
+    // 用量明细翻页：改页后重新拉用法面板（不切换 tab）
+    async trDialogChangeUsagePage(this: any, page: number) {
+      if (this.trDialog.tab !== 'usage') return;
+      this.trDialog.usagePage = Math.max(1, page);
+      await this.fetchTrDialog();
+    },
+
+    // 用量明细切换时间窗（today / 7d / 30d 等），重置到第 1 页
+    async trDialogChangeUsageRange(this: any, range: string) {
+      if (this.trDialog.tab !== 'usage') return;
+      this.trDialog.usageRange = range;
+      this.trDialog.usagePage = 1;
+      await this.fetchTrDialog();
+    },
+
+    // 调用日志翻页：usage 视图下半截的日志列表单独用 logsPage 游标，
+    // 切页后重新拉用法面板（同一接口已含 list 分页）。
+    async trDialogChangeLogsPage(this: any, page: number) {
+      if (this.trDialog.tab !== 'usage') return;
+      this.trDialog.logsPage = Math.max(1, page);
+      await this.fetchTrDialog();
+    },
+
+    async searchSessionsFull(
+      query: string,
+      scope: 'all' | 'title' | 'content' = 'all',
+      workdir?: string,
+      limit: number = 30,
+      includeArchived: boolean = false,
+    ) {
+      const api = this._api();
+      if (!api || !api.search_sessions_full) {
+        return { ok: false, total: 0, results: [], msg: '后端未就绪' };
+      }
+      try {
+        // include_archived 只在开启时作为第 5 个参数透传：默认路径保持原有 4 参
+        // 签名，归档前行为与旧后端完全不变。
+        if (includeArchived) {
+          return await api.search_sessions_full(query, scope, workdir, limit, true);
+        }
+        return await api.search_sessions_full(query, scope, workdir, limit);
+      } catch (err: any) {
+        console.error('search_sessions_full 失败:', err);
+        return { ok: false, total: 0, results: [], msg: String(err) };
+      }
+    },
+
     async initFromBackend() {
       // 无论初始状态拉取是否成功，都先挂好事件监听，保证后续事件不丢失
       window.onBridgeEvent = (event: BridgeEvent) => {
@@ -1359,6 +2864,11 @@ export const useAppStore = defineStore('app', {
         await finishSplash();
         return;
       }
+      this.bridgeReady = true;
+      // 星轨自动化：启动时主动拉一次任务快照（引擎启动推送可能早于页面就绪被丢弃）
+      void this.refreshAutomations();
+      // 基元律动账号状态：侧栏左下角用户卡片据此显示昵称 / 手机号
+      void this.refreshTrAuth();
       this.themeLight = document.body.classList.contains('light');
       try {
         const init = await api.get_initial_state();
@@ -1393,15 +2903,33 @@ export const useAppStore = defineStore('app', {
         // 人设设置：智能体显示名与对用户的称呼（启动快照随 init 一起下发）
         const personaInit = (init as any).persona_settings;
         if (personaInit && typeof personaInit === 'object') {
-          this.agentName = String(personaInit.agent_name || '星瑶');
+          this.personaAgentName = String(personaInit.agent_name || '星瑶');
+          this.agentName = this.personaAgentName;
           this.userTitle = String(personaInit.user_title || '');
           this.syncDocumentTitle();
+        }
+        // 免责条款同意状态：未同意过（或已同意版本落后）时弹确认框，
+        // 同意后由 acceptDisclaimer 就地更新状态，弹窗随之卸载
+        const disclaimerInit = (init as any).disclaimer;
+        if (disclaimerInit && typeof disclaimerInit === 'object') {
+          const backendVer = String(disclaimerInit.disclaimer_version || '');
+          this.disclaimerRequiredVersion = backendVer || DISCLAIMER_VERSION;
+          this.disclaimerAcceptedVersion = String(disclaimerInit.accepted_version || '');
+        } else {
+          this.disclaimerRequiredVersion = DISCLAIMER_VERSION;
         }
         if (init.reasoning) this.reasoning = init.reasoning;
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
+        // 初始快照为空即代表后端首屏跳过了同步扫描，正在后台扫：
+        // 置为"加载中"态，等 skills_loaded 事件到达后再切回真实空态
+        this.skillsLoading = this.skills.length === 0;
         this.mcps = init.mcps || [];
         this.plugins = (init as any).plugins || [];
+        // C11：启动时拉取 Hook 信任状态（信任卡片数据源）
+        void this.refreshHooks();
+        // 斜杠命令清单：与技能/MCP 同为首屏补全数据源，失败不阻塞启动
+        void this.loadSlashCommands();
         this.workdir = init.workdir || '';
         this.currentSessionName = (init as any).current_session || '';
         // 工作区标签以“当前会话归属”为准：GLOBAL 会话显示“对话”，
@@ -1412,7 +2940,14 @@ export const useAppStore = defineStore('app', {
           : '对话';
         // 启动时后端自动恢复最近一次对话：同步消息列表与标题
         this.messages = pairHistoryToolMessages((init as any).messages || []);
-        // 批次D：窗口重载/崩溃重建期间终态事件已丢失，后端通过 active_sessions
+      this.historyHasMore = !!(init as any).history_has_more;
+      this.historyOldestId = (init as any).history_oldest_id ?? null;        void this.refreshNavIndex();
+        // 按回合撤销：启动批量拉取当前会话的检查点状态（重建撤销卡片）
+        void this.refreshTurnUndoStates();
+        // 决策入口按当前会话探测：必须在 currentSessionName 就绪之后调用
+        // （App.vue 的启动探测发生在 initFromBackend 未完成的时刻，那时还没有
+        // 会话名，会按口径直接跳过，故这里补一次）
+        void this.refreshDecisionAvailability();// 批次D：窗口重载/崩溃重建期间终态事件已丢失，后端通过 active_sessions
         // 告知仍有活跃回合的会话名列表。据此恢复各会话 running 态与顶层标记，
         // 让运行中的会话正确显示运行中（含发送拦截/停止按钮）而不是看似空闲。
         const activeSessions: string[] = Array.isArray((init as any).active_sessions)
@@ -1428,6 +2963,18 @@ export const useAppStore = defineStore('app', {
         }
         this.running = !!this.currentSessionName && activeSessions.includes(this.currentSessionName);
         this._captureCurrentRuntime();
+        // 活跃回合快照还原：手机扫码接入或前端重载时，还原当前及后台会话正在执行的思考、流式正文与工具卡片
+        const snapshots = (init as any).active_turn_snapshots || {};
+        const curSnap = (init as any).active_turn_snapshot || snapshots[this.currentSessionName];
+        if (curSnap) {
+          this._restoreActiveTurnSnapshot(curSnap, this.currentSessionName);
+        }
+        for (const [sName, snap] of Object.entries(snapshots)) {
+          if (sName !== this.currentSessionName) {
+            this._restoreActiveTurnSnapshot(snap, sName);
+          }
+        }
+        this._captureCurrentRuntime();
         for (const g of this.sessionGroups) {
           const hit = (g.sessions || []).find((s: any) => s.name === this.currentSessionName);
           if (hit) {
@@ -1441,6 +2988,9 @@ export const useAppStore = defineStore('app', {
         this.connected = true;
         // 启动后静默检查更新（不打扰用户）
         this.checkUpdate(false);
+        // 启动自动恢复的会话可能是秘书会话：显示名以桥上的「当前生效名」为准
+        // （拉不到时内部回落设置页名字，不打断启动流程）
+        void this.refreshActiveAgentName();
       } catch (err) {
         this.connected = false;
         this.notifyModal('连接失败', '后端连接失败：' + err);
@@ -1552,14 +3102,35 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 按模型名预览思考能力（新增/改名时用）：仅查询不落库，
+    // 失败或异常一律返回 null，由调用方跳过更新，不弹提示打扰用户
+    async getReasoningSnapshotByName(modelName: string) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_reasoning_snapshot_by_name(modelName);
+        if (res && res.ok) return res.reasoning;
+        return null;
+      } catch (err) {
+        this.connected = false;
+        return null;
+      }
+    },
+
     async setPermissionMode(mode: PermissionMode) {
       const prev = this.permissionMode;
       const api = this._api();
       if (!api) return;
+      // 权限选择是会话级的：只绑定当前会话，不再全局生效
+      const sessionName = this.currentSessionName;
       try {
-        const res = await api.set_permission_mode(mode);
+        const res = await api.set_permission_mode(mode, sessionName || undefined);
         if (res && res.ok) {
           this.permissionMode = res.permission_mode || mode;
+          // pending 草稿会话后端绑不上（还没落库），先存运行时，
+          // 首条消息发送时随 send_user_message 带给后端补绑定
+          const runtime = this._getSessionRuntime(sessionName);
+          runtime.permMode = this.permissionMode;
           // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
           if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
             this.notifyChat('权限模式已调整: ' + formatPermMode(this.permissionMode));
@@ -1601,7 +3172,74 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async refreshSystemSettings() {
+    // ---- 飞书集成（设置 → 飞书集成）----
+
+    async refreshFeishuSettings() {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const result = await api.get_feishu_settings();
+        if (result && result.ok && result.settings) {
+          this.feishuSettings = result.settings;
+          return result.settings;
+        }
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('飞书集成', '加载飞书设置失败: ' + err);
+        return null;
+      }
+    },
+
+    /** 保存飞书设置；app_secret 留空表示不修改已有密钥 */
+    async saveFeishuSettings(payload: {
+      enabled: boolean;
+      app_id: string;
+      app_secret?: string;
+      approvers: string[];
+      notify_chat_id: string;
+    }): Promise<{ ok: boolean; msg: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥接不可用' };
+      try {
+        const result = await api.set_feishu_settings(payload);
+        if (result && result.ok) {
+          if (result.settings) this.feishuSettings = result.settings;
+          return { ok: true, msg: '' };
+        }
+        return { ok: false, msg: (result && result.msg) || '保存失败' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    /** 按需取 app_secret 明文（仅用户点「显示」时调用） */
+    async revealFeishuSecret(): Promise<string> {
+      const api = this._api();
+      if (!api) return '';
+      try {
+        const result = await api.get_feishu_secret();
+        return result && result.ok ? String(result.app_secret || '') : '';
+      } catch {
+        return '';
+      }
+    },
+
+    /** 测试连接：用传入凭据或已保存凭据请求飞书长连接接入点 */
+    async testFeishuConnection(appId: string, appSecret: string): Promise<{ ok: boolean; msg: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥接不可用' };
+      try {
+        const result = await api.test_feishu_connection(appId, appSecret);
+        return { ok: !!(result && result.ok), msg: (result && result.msg) || '' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    // silent：后台静默刷新（模型切换、其它端推送触发的），失败不弹模态框、
+    // 不把连接状态打成断开——用户没有主动请求，不该被打扰
+    async refreshSystemSettings(options: { silent?: boolean } = {}) {
       const api = this._api();
       if (!api) return null;
       try {
@@ -1609,8 +3247,10 @@ export const useAppStore = defineStore('app', {
         this.systemSettings = settings;
         return settings;
       } catch (err) {
-        this.connected = false;
-        this.notifyModal('系统设置', '加载系统设置失败: ' + err);
+        if (!options.silent) {
+          this.connected = false;
+          this.notifyModal('系统设置', '加载系统设置失败: ' + err);
+        }
         return null;
       }
     },
@@ -1618,15 +3258,78 @@ export const useAppStore = defineStore('app', {
     // 人设设置（名称/称呼）保存后即时同步全局显示；快照由 PersonaSettings 页传入
     applyPersonaSettings(snapshot: { agent_name?: string; user_title?: string }) {
       if (!snapshot || typeof snapshot !== 'object') return;
-      if (snapshot.agent_name) this.agentName = String(snapshot.agent_name);
+      if (snapshot.agent_name) {
+        this.personaAgentName = String(snapshot.agent_name);
+        this.agentName = this.personaAgentName;
+      }
       this.userTitle = String(snapshot.user_title || '');
+      this.syncDocumentTitle();
+      // 秘书会话显示的是秘书名，不吃设置页名字：这时要多问一次桥把名字换回来
+      // （普通会话 / 草稿会话新名字就是生效名，不必多打一次后端）
+      if (this._isSecretarySession(this.currentSessionName)) void this.refreshActiveAgentName();
+    },
+
+    /** 统一改写生效显示名：agentName 与窗口标题同步，避免两处文案分叉 */
+    _applyAgentName(name: string) {
+      if (!name) return;
+      this.agentName = name;
       this.syncDocumentTitle();
     },
 
-    // 页面标题跟随智能体显示名（webview/浏览器预览均可见；默认名时保持 Y-CODE 简洁形态）
+    // 刷新「当前会话生效名」：秘书会话是桥上的秘书名，其余会话是设置页名字。
+    // 任何异常 / 旧后端没有该方法 / 返回空都静默回落设置页名字——显示名只是
+    // 展示层，绝不能因为它失败而打断切换会话、建会话这些主流程。
+    async refreshActiveAgentName() {
+      // 草稿会话（尚未落库）：后端当前会话还停在上一个真实会话上，此刻问桥
+      // 会把上一个会话（可能是秘书）的名字搬进来，故直接按普通会话呈现
+      if (!this.currentSessionName) {
+        this._applyAgentName(this.personaAgentName);
+        return;
+      }
+      // 静默取桥：刷新动作可能在启动早期（bridgeReady 之前）被触发，
+      // _api() 缺桥时会弹「连接失败」，为此弹窗不值得
+      const api = (window.pywebview && window.pywebview.api) as PyWebViewAPI | null;
+      if (!api || typeof api.get_active_agent_name !== 'function') {
+        this._applyAgentName(this.personaAgentName);
+        return;
+      }
+      const sessionAtCall = this.currentSessionName;
+      try {
+        const res = await api.get_active_agent_name();
+        // 竞态：在途期间用户可能已切走，过期名字不覆盖当前会话的显示名
+        if (this.currentSessionName !== sessionAtCall) return;
+        const name = res && typeof res === 'object' ? String(res.agent_name || '') : '';
+        this._applyAgentName(name || this.personaAgentName);
+      } catch (err) {
+        console.error('刷新当前会话生效名失败:', err);
+        this._applyAgentName(this.personaAgentName);
+      }
+    },
+
+    /** 在当前分组树里定位会话条目；返回 { session, group }，找不到返回 null */
+    _findSessionEntry(sessionName: string): { session: any; group: any } | null {
+      if (!sessionName) return null;
+      for (const g of this.sessionGroups || []) {
+        const hit = (g.sessions || []).find((s: any) => s && s.name === sessionName);
+        if (hit) return { session: hit, group: g };
+      }
+      return null;
+    },
+
+    // 会话是否属于「秘书」：条目自带的 secretary_name（后端对秘书会话都会带，
+    // 未命名回落「秘书」）与分组标记 is_secretary 任一命中即为真——历史遗留的
+    // 未命名会话靠分组标记兜底，避免被当成普通会话改了 session_name
+    _isSecretarySession(sessionName: string): boolean {
+      const hit = this._findSessionEntry(sessionName);
+      if (!hit) return false;
+      if (hit.group && (hit.group as any).is_secretary) return true;
+      return typeof hit.session.secretary_name === 'string';
+    },
+
+    // 页面标题跟随智能体显示名（webview/浏览器预览均可见；默认名时保持 星瑶Code 简洁形态）
     syncDocumentTitle() {
       const name = this.agentName || '星瑶';
-      document.title = name === '星瑶' ? 'Y-CODE' : `Y-CODE · ${name}`;
+      document.title = name === '星瑶' ? '星瑶Code' : `星瑶Code · ${name}`;
     },
 
     async setCommandShell(shellId: string): Promise<boolean> {
@@ -1646,6 +3349,30 @@ export const useAppStore = defineStore('app', {
         this.systemSettings = previous;
         this.connected = false;
         this.notifyModal('系统设置', '命令解释器设置失败: ' + err);
+        return false;
+      }
+    },
+
+    // AI 生成内容目录（Task 5）：成功/失败都以返回快照校准本地 systemSettings，
+    // 失败时后端快照本身即回滚值；桥接异常兜底回滚到调用前的快照
+    async setAiOutputDir(path: string): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_ai_output_dir(path);
+        if (result && result.ok) {
+          this.systemSettings = result.settings || previous;
+          this.notifyModal('系统设置', result.msg || 'AI 生成内容目录已更新');
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', 'AI 生成内容目录设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', 'AI 生成内容目录设置失败: ' + err);
         return false;
       }
     },
@@ -1688,6 +3415,27 @@ export const useAppStore = defineStore('app', {
         this.systemSettings = previous;
         this.connected = false;
         this.notifyModal('系统设置', '单任务最大模型轮次设置失败: ' + err);
+        return false;
+      }
+    },
+
+    async setContextWatermarkBase(value: number): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_context_watermark_base(value);
+        if (result && result.ok) {
+          this.systemSettings = result.settings;
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', '上下文水位基准设置失败: ' + err);
         return false;
       }
     },
@@ -1749,6 +3497,182 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // ── Playwright 按需组件（core/components.py）：三个动作都以桥返回的
+    //    组件状态快照回写本地，进度则由 playwright_component_progress 事件
+    //    增量合并；失败只弹提示，不回滚已下载进度 ──
+
+    async refreshPlaywrightComponentStatus(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.get_playwright_component_status();
+        if (result && result.component) this.playwrightComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('浏览器操控组件', '读取组件状态失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('浏览器操控组件', '读取组件状态失败: ' + err);
+        return false;
+      }
+    },
+
+    async downloadPlaywrightComponent(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.download_playwright_component();
+        if (result && result.component) this.playwrightComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('浏览器操控组件', '下载组件失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('浏览器操控组件', '下载组件失败: ' + err);
+        return false;
+      }
+    },
+
+    async cancelPlaywrightComponentDownload(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.cancel_playwright_component_download();
+        if (result && result.component) this.playwrightComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('浏览器操控组件', '取消下载失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('浏览器操控组件', '取消下载失败: ' + err);
+        return false;
+      }
+    },
+
+    // ── ffmpeg 按需组件（背景图转换依赖）：结构与 playwright 三兄弟逐一对齐，
+    //    失败提示统一挂「视频转换组件」标题；进度由 ffmpeg_component_progress
+    //    事件增量合并，错误不回滚已下载字节 ──
+
+    async refreshFfmpegComponentStatus(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.get_ffmpeg_component_status();
+        if (result && result.component) this.ffmpegComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('视频转换组件', '读取组件状态失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('视频转换组件', '读取组件状态失败: ' + err);
+        return false;
+      }
+    },
+
+    async downloadFfmpegComponent(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.download_ffmpeg_component();
+        if (result && result.component) this.ffmpegComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('视频转换组件', '下载组件失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        // 桥返回即表示下载任务已受理（真下载在后台线程），这里不改下载态：
+        // downloading/percent 一律等 ffmpeg_component_progress 事件推动
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('视频转换组件', '下载组件失败: ' + err);
+        return false;
+      }
+    },
+
+    async cancelFfmpegComponentDownload(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.cancel_ffmpeg_component_download();
+        if (result && result.component) this.ffmpegComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('视频转换组件', '取消下载失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('视频转换组件', '取消下载失败: ' + err);
+        return false;
+      }
+    },
+
+    // ── 网页搜索按需组件（ddgs 链路）：第三个组件，结构与前两个逐一对齐，
+    //    失败提示统一挂「网页搜索组件」标题；进度由 search_component_progress
+    //    事件增量合并，错误不回滚已下载字节 ──
+
+    async refreshSearchComponentStatus(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.get_search_component_status();
+        if (result && result.component) this.searchComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('网页搜索组件', '读取组件状态失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('网页搜索组件', '读取组件状态失败: ' + err);
+        return false;
+      }
+    },
+
+    async downloadSearchComponent(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.download_search_component();
+        if (result && result.component) this.searchComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('网页搜索组件', '下载组件失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('网页搜索组件', '下载组件失败: ' + err);
+        return false;
+      }
+    },
+
+    async cancelSearchComponentDownload(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.cancel_search_component_download();
+        if (result && result.component) this.searchComponent = result.component;
+        if (!result || !result.ok) {
+          this.notifyModal('网页搜索组件', '取消下载失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('网页搜索组件', '取消下载失败: ' + err);
+        return false;
+      }
+    },
+
     // ── 电脑操控运行态（Task 13b，设计 16.4）：
     //    纯事件 reducer + Bridge 快照校准 + 暂停/恢复/停止控制 ──
 
@@ -1764,6 +3688,9 @@ export const useAppStore = defineStore('app', {
       const runId = String(raw.run_id || '');
       const seq = Number(raw.event_seq) || 0;
       if (!runId) return;
+      // 已关闭 run 的迟到事件一律丢弃：清空后 Store 无 run，若无此门闩
+      // reducer 的「首个事件直接认领」分支会把旧事件当成新 run
+      if (runId === this._computerClosedRunId) return;
       const currentRunId = this.computerRun.run_id;
       const isNewRun = runId !== currentRunId && (
         currentRunId === ''
@@ -1774,14 +3701,22 @@ export const useAppStore = defineStore('app', {
         if (seq <= this._computerEventSeq) return;
       }
       this._computerEventSeq = seq;
+      // 归属会话随事件信封下发（后端每个事件都带 owner_session_id）：run 首帧
+      // 就必须知道「谁发起的」，否则「操控」页签只能按当前查看的会话登记，
+      // 后台会话发起的操控会串到用户正在看的另一个会话上（2026-10-30 反馈）
+      const ownerSession = typeof raw.owner_session_id === 'string' ? raw.owner_session_id : '';
       if (isNewRun) {
         this.computerRun = {
           ...emptyComputerRun(),
           run_id: runId,
           status: type === 'computer_state' ? String(raw.status || '') || 'starting' : 'starting',
+          owner_session_id: ownerSession,
         };
         this.computerTrace = [];
         this._computerActionStartMs = {};
+      } else if (ownerSession && !this.computerRun.owner_session_id) {
+        // 旧后端不带归属时 owner 一直为空；一旦后续事件/快照带来归属就补上
+        this.computerRun = { ...this.computerRun, owner_session_id: ownerSession };
       }
       if (type === 'computer_state') {
         const status = String(raw.status || '');
@@ -1797,6 +3732,8 @@ export const useAppStore = defineStore('app', {
         // observation 只带 loopback token URL 与当前窗口/页面摘要，无截图内容
         const previewUrl = String(raw.preview_url || '');
         const surface = String(raw.origin_or_window || '');
+        const shotSha = String(raw.screen_sha256 || '');
+        if (previewUrl && shotSha) this._rememberComputerShot(shotSha, previewUrl);
         this.computerRun = {
           ...this.computerRun,
           ...(previewUrl ? { preview_url: previewUrl } : {}),
@@ -1832,6 +3769,19 @@ export const useAppStore = defineStore('app', {
       );
     },
 
+    // 每帧截图索引：按画面哈希记 loopback 预览地址，供对话区电脑动作行反查
+    // 该动作当帧的画面。只保留最近 80 帧（Map 语义按插入顺序淘汰最旧），
+    // 避免长回合里无界增长；同一帧重复观察只刷新不新增。
+    _rememberComputerShot(sha: string, url: string) {
+      const shots = this.computerShots;
+      if (shots[sha] === url) return;
+      shots[sha] = url;
+      const keys = Object.keys(shots);
+      if (keys.length > 80) {
+        for (const key of keys.slice(0, keys.length - 80)) delete shots[key];
+      }
+    },
+
     // 轨迹行 upsert：行内只有五个契约字段（绝不透传事件原始字段），新行插到
     // 最前（新到旧），超过 200 条时丢弃最旧（尾部）
     _upsertComputerTrace(
@@ -1859,6 +3809,19 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 关闭「操控」面板（用户点 × 或终态自动关闭共用）：
+    // 先把当前 run_id 记入黑名单，再清空运行态与内存轨迹
+    clearComputerRun() {
+      const runId = this.computerRun.run_id;
+      if (!runId) return;
+      this._computerClosedRunId = runId;
+      this.computerRun = emptyComputerRun();
+      this.computerTrace = [];
+      this.computerShots = {};
+      this._computerActionStartMs = {};
+      this._computerEventSeq = 0;
+    },
+
     // Bridge 快照校准（设计 16.4）：_js_queue 满时允许丢新事件，终态不能只依赖
     // 事件推送——控制操作返回值、窗口重新聚焦、切到操控页签都走这里复核。
     // 快照发现不同 run_id 时按新 run 重置轨迹与记账；同一 run 只合并已知字段，
@@ -1866,6 +3829,8 @@ export const useAppStore = defineStore('app', {
     _applyComputerSnapshot(raw: Record<string, unknown>) {
       const runId = String(raw.run_id || '');
       if (!runId) return;
+      // 已关闭 run 的快照不得复活运行态（新 run_id 不受影响）
+      if (runId === this._computerClosedRunId) return;
       if (runId !== this.computerRun.run_id) {
         this.computerRun = { ...emptyComputerRun(), run_id: runId };
         this.computerTrace = [];
@@ -1976,20 +3941,48 @@ export const useAppStore = defineStore('app', {
     },
 
     async switchSession(sessionName: string, displayName?: string, targetWorkdir?: string) {
-      // 切换到已有会话时丢弃未发送的空白 pending 会话
+      // 切换到已有会话时丢弃未发送的空白 pending 会话；
+      // 同时收起子页面：切会话即要看该会话的聊天视图（删除会话后的
+      // 自动切换、通知路由等非侧栏入口同样生效）
+      this.subpage.show = false;
       this._captureCurrentRuntime();
       this.pendingWorkdir = null;
       this.currentSessionName = sessionName;
       if (displayName) this.currentSessionDisplayName = displayName;
+      // 目标状态条属于会话级数据：切会话先清空再重拉，避免上一个会话的目标串显
+      // 在新会话上（在途响应由 loadGoalState 的序号 + 会话名校验丢弃）
+      this.goalState = null;
+      void this.loadGoalState();
       this.permRequest.show = this.permRequest.sessionName === sessionName;
       // 进入该会话即视为已读，清除其状态提醒点
       this._clearSessionStatusDot(sessionName);
       // 优先恢复内存中的实时 runtime；运行中的会话不能被旧数据库快照覆盖
       const runtime = this._getSessionRuntime(sessionName);
       this._bindSessionRuntime(sessionName);
+      // 目标会话还没有内存缓存（无消息且未运行）⇒ 历史还在后端返回路上，消息区暂空：
+      // 置加载态，把"加载中"与"真正的新对话/空会话"区分开
+      this.sessionSwitching = !runtime.running && runtime.messages.length === 0;
 
       const api = this._api();
-      if (!api) return;
+      // 后端不可用时不能残留加载态；显示名只用本地分组树兜底（秘书会话取条目里
+      // 的秘书名），同样不能停在上一个会话的名字上
+      if (!api) {
+        this.sessionSwitching = false;
+        const hit = this._findSessionEntry(sessionName);
+        const localName = hit && hit.session.secretary_name
+          ? String(hit.session.secretary_name)
+          : this.personaAgentName;
+        this._applyAgentName(localName);
+        return;
+      }
+      // 通知宿主把内嵌浏览器归属切到目标会话：该会话若有后台积压的
+      // 「打开浏览器」意图，后端回放 embedded_browser_activation；没有则
+      // 收起仍挂着旧会话内容的原生控件（跨端兜底）。
+      try {
+        void api.browser_pane_set_active_session?.(sessionName);
+      } catch {
+        /* 非 GUI / 旧后端无此桥：忽略，不影响会话切换 */
+      }
       // 模型版本快照：响应在途期间用户若又切了模型（setModel 递增版本），
       // 后端响应携带的是切换前的旧模型快照，不再覆盖本地选择
       const modelVersion = this._sessionModelVersion[sessionName] || 0;
@@ -2000,15 +3993,33 @@ export const useAppStore = defineStore('app', {
         if (this.currentSessionName !== sessionName) return;
         if (!runtime.running && runtime.messages.length === 0) {
           runtime.messages = pairHistoryToolMessages(res.messages || []);
+          // 历史分页元信息：后端首页游标写入顶层与 runtime（缓存命中分支靠 bind 恢复）
+          this.historyHasMore = !!res.history_has_more;
+          this.historyOldestId = res.history_oldest_id ?? null;
+          runtime.historyHasMore = this.historyHasMore;
+          runtime.historyOldestId = this.historyOldestId;
+          // 按回合撤销：切换会话后批量拉取该会话的检查点状态（卡片随会话重建）
+          void this.refreshTurnUndoStates();
           this._bindSessionRuntime(sessionName);
+        } else if (!runtime.running && res.messages && res.messages.length > 0) {
+          // 同步最新的 error_note 与 execution_state（如后台会话已落库或附带了错误标注）
+          const lastRes = res.messages[res.messages.length - 1];
+          const lastLocal = runtime.messages[runtime.messages.length - 1];
+          if (lastRes && lastRes.error_note && lastLocal && lastLocal.role === 'assistant') {
+            lastLocal.error_note = lastRes.error_note;
+            lastLocal.execution_state = 'error';
+          }
         }
 
-        // 多会话并行：切到正在运行回合的会话时，历史最后一条往往不是
-        // assistant（本轮 assistant 消息尚未落库，历史停留在 user 或
-        // 上一轮 completed）。此时该回合后续的 tool_start/tool_finish/
-        // diff_ready 需要挂在活动助手消息上，缺失会触发桥接契约错误，
-        // 因此按 running 状态补一条占位消息，让后续回合级事件有处可挂。
-        if (this.runningSessions.includes(sessionName)) {
+        // 红点索引无条件重拉：只在「首次加载该会话」时刷新会漏掉离开期间
+        // 新增的用户消息（后台回合、手机端发送），表现为切回后红点少最后一条
+        void this.refreshNavIndex(sessionName);
+
+        // 目标会话运行态恢复：优先用后端下发的实时流式快照完整还原（正文/思考/工具卡片），
+        // 若后端无快照但处于 runningSessions，则回退构造空 running 占位防止事件挂载报错。
+        if (res.active_turn_snapshot) {
+          this._restoreActiveTurnSnapshot(res.active_turn_snapshot, sessionName);
+        } else if (this.runningSessions.includes(sessionName)) {
           const last = this.messages[this.messages.length - 1];
           const needsPlaceholder = !last ||
             last.role !== 'assistant' ||
@@ -2061,10 +4072,100 @@ export const useAppStore = defineStore('app', {
           runtime2.modelId = this.activeModelId;
           runtime2.modelName = this.activeModelName;
         }
+
+        // 会话级权限档位：以后端落库绑定（或全局兜底）校正本地显示，
+        // 避免 A 会话选的档位串到 B 会话
+        if (res.permission_mode) {
+          this.permissionMode = res.permission_mode;
+          const runtimePerm = this._getSessionRuntime(sessionName);
+          runtimePerm.permMode = res.permission_mode;
+        }
+
+        // 生效显示名随会话走：秘书会话显示秘书名，普通会话回到设置页名字
+        // （不 await：显示名刷新失败不能拖住会话切换，内部自带回落）
+        void this.refreshActiveAgentName();
+
+        // 决策入口按会话重探：先复位再按目标会话探测，切换后入口只反映本会话
+        // （不 await：探测失败不能拖住切换，内部自带复位兜底）
+        void this.refreshDecisionAvailability(sessionName);
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
+      } finally {
+        // 加载态复位：仅在仍是当前会话时清除——快速连点不同会话时，
+        // 过期响应返回不得清掉当前会话的加载态
+        if (this.currentSessionName === sessionName) {
+          this.sessionSwitching = false;
+          // C11：切换流程末端刷新 Hook 信任状态（项目工作目录随会话变化）
+          void this.refreshHooks();
+        }
       }
+    },
+
+    // 历史分页懒加载：滚动到顶触发，向前翻一页并 prepend 到消息流头部。
+    // 守卫（无更多/加载中/无游标/后端不可用）与竞态丢弃（在途切会话）必须保持。
+    // force=true（红点跨页跳转通道）：跳过 historyHasMore 入口守卫。该标记随
+    // 会话 runtime 保存/恢复，可能是过期值或被失败响应清空的坏值——一旦为
+    // false 而游标其实还有更早历史，onNavJump 的「无进展」判定会立刻 break，
+    // 表现为点未加载区红点没反应/落点不对（1.3.6 改过循环终止判定，漏了这里）。
+    // force 时交后端用游标裁决；historyLoading 重入保护保留（并发翻页仍需挡）。
+    async loadOlderMessages(force: boolean = false) {
+      // 游标自愈：has_more=false 且游标为空，是「分页状态从未初始化 / 被失败响应
+      // 清空」的特征——真到最早时后端会带回非空 oldest_id。不修的话守卫会永久
+      // 短路：滚到顶不加载更早消息、点未加载红点没反应，而且这份坏状态会随会话
+      // 保存/恢复，切走再切回依然失效（用户反馈过「怎么都无法加载到最上面」）。
+      // 兜底口径：用已加载消息流里最旧的 _msg_id 当游标，交后端裁决是否还有更早。
+      if (!this.historyOldestId) {
+        const oldestLoaded = (this.messages as any[]).find(m => typeof m?._msg_id === 'number');
+        if (!oldestLoaded) return;
+        this.historyOldestId = oldestLoaded._msg_id as number;
+        this.historyHasMore = true;
+      }
+      if ((!this.historyHasMore && !force) || this.historyLoading) return;
+      const api = this._api();
+      if (!api || typeof (api as any).load_older_messages !== 'function') return;
+      const sessionAtCall = this.currentSessionName;
+      const oldestAtCall = this.historyOldestId;
+      this.historyLoading = true;
+      try {
+        const res = await (api as any).load_older_messages(sessionAtCall, oldestAtCall);
+        if (this.currentSessionName !== sessionAtCall) return; // 竞态：切会话后丢弃过期响应
+        if (res?.ok) {
+          const older = pairHistoryToolMessages(res.messages || []);
+          this.messages = [...older, ...this.messages];
+          this.historyHasMore = !!res.has_more;
+          this.historyOldestId = res.oldest_id ?? null;
+        }
+        // res.ok === false（读库失败等）：保持原分页状态不变，下次滚动/跳转自动重试；
+        // 绝不写成「没有更早历史」，否则翻页会被永久关掉
+      } catch (err) {
+        this.notifyChat('加载更早历史失败: ' + err);
+      } finally {
+        if (this.currentSessionName === sessionAtCall) this.historyLoading = false;
+      }
+    },
+
+    // 红点导航全量索引：切会话/回合结束/启动后刷新，供 MessageNavRail 全量渲染。
+    // sessionName 缺省为当前显示会话；回合终态事件必须显式传入事件所属会话——
+    // 只按当前显示会话刷新时，后台会话跑完的回合不会更新它自己的索引，
+    // 切回该会话又命中「有内存缓存不重拉」分支，红点会永远少最后一条
+    // （2026-09-18 用户反馈：最后一句「修改更新记录」在红点导航里没有红点）。
+    async refreshNavIndex(sessionName?: string) {
+      const api = this._api();
+      if (!api || typeof (api as any).get_session_nav_index !== 'function') return;
+      const sessionAtCall = sessionName || this.currentSessionName;
+      try {
+        const res = await (api as any).get_session_nav_index(sessionAtCall);
+        if (this.currentSessionName !== sessionAtCall) {
+          // 竞态：为仍可能切回来的会话补写 runtime，避免切回后暂时空档
+          if (res?.ok) this._getSessionRuntime(sessionAtCall).navItems = res.items || [];
+          return;
+        }
+        if (res?.ok) {
+          this.navItems = res.items || [];
+          this._getSessionRuntime(sessionAtCall).navItems = this.navItems;
+        }
+      } catch { /* 导航索引失败静默，不影响主流程 */ }
     },
 
     async loadFileTreeInBackground(sessionName: string, workdir: string) {
@@ -2131,12 +4232,17 @@ export const useAppStore = defineStore('app', {
 
     async createGlobalSession() {
       // 懒创建：只切换到空白自由对话状态，首条消息发出时才真正落库
+      // 新会话意味着回到聊天视图：Skills/MCP/插件/自动化等子页面打开时
+      // 点侧栏"+"也要收起子页面，否则状态已切换但界面停在子页（像没反应）
+      this.subpage.show = false;
       const inheritedModelId = this.activeModelId;
       const inheritedModelName = this.activeModelName;
       this._captureCurrentRuntime();
       this.pendingWorkdir = 'GLOBAL';
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新对话';
+      // 草稿会话没有目标：清掉上一个会话的状态条，避免新对话里挂着旧目标
+      this.goalState = null;
       this._bindSessionRuntime('');
       // 新会话继承用户当前窗口正在使用的模型。pending 会话尚未落库，
       // 首条消息发送时通过 draftModelId 一并提交，不能回退到全局默认模型。
@@ -2153,11 +4259,16 @@ export const useAppStore = defineStore('app', {
       this.planData = { title: '', items: [], progress: 0 };
       this.tokenUsage = emptyTokenUsage();
       this.running = false;
+      // 新会话/新对话不是"历史加载中"：显式清除切换加载态
+      this.sessionSwitching = false;
       this._captureRuntime('');
       this.currentWorkdirLabel = '对话';
       this.workdir = '';
       this.fileTree = [];
       this.fileTreeExpanded = [];
+      // 新对话是普通会话：生效名回到设置页名字（草稿态尚未落库，问桥会拿回
+      // 上一个会话的名字，故 refreshActiveAgentName 内部对草稿直接走回落）
+      void this.refreshActiveAgentName();
     },
 
     // 顶栏“新会话”按钮：跟随当前上下文——在项目中就在该项目新建，
@@ -2173,7 +4284,8 @@ export const useAppStore = defineStore('app', {
     async createSessionInGroup(targetWorkdir: string) {
       // 秒开：前端已有工作区上下文（新会话首条消息发出时才懒落库），
       // 不再同步等后端 get_workspace_state 扫文件树（大目录要数秒，
-      // 表现为“点新会话特别慢”）。
+      // 表现为“点新会话特别慢”）。同 createGlobalSession：收起子页面回聊天视图
+      this.subpage.show = false;
       const treeMatches = this.workdir === targetWorkdir;
       const inheritedModelId = this.activeModelId;
       const inheritedModelName = this.activeModelName;
@@ -2181,6 +4293,8 @@ export const useAppStore = defineStore('app', {
       this.pendingWorkdir = targetWorkdir;
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新会话';
+      // 同 createGlobalSession：草稿态没有目标，先清空状态条
+      this.goalState = null;
       this._bindSessionRuntime('');
       const runtime = this._getSessionRuntime('');
       runtime.modelId = inheritedModelId;
@@ -2195,6 +4309,8 @@ export const useAppStore = defineStore('app', {
       this.planData = { title: '', items: [], progress: 0 };
       this.tokenUsage = emptyTokenUsage();
       this.running = false;
+      // 新会话/新对话不是"历史加载中"：显式清除切换加载态
+      this.sessionSwitching = false;
       this._captureRuntime('');
       this.workdir = targetWorkdir;
       this.currentWorkdirLabel = targetWorkdir.split('\\').pop() || targetWorkdir;
@@ -2204,6 +4320,89 @@ export const useAppStore = defineStore('app', {
         this.fileTree = [];
         this.fileTreeExpanded = [];
         this.loadFileTreeInBackground('', targetWorkdir);
+      }
+      // 同 createGlobalSession：新会话（草稿态）的生效名回到设置页名字
+      void this.refreshActiveAgentName();
+    },
+
+    // 秘书会话：后端建会话时立即落库并切为当前会话（不存在草稿态），所以这里
+    // 不能复用 createGlobalSession 的懒创建分支，要按 switchSession 的口径把
+    // 会话级状态整体复位到返回的 session_name 上（旧会话状态先由
+    // _captureCurrentRuntime 存回它自己的 runtime）。
+    // 名字必填：它是这个秘书的身份标识（显示名 + 提示词自称），没有名字就只能
+    // 落一个既无名又已切走的会话。前端先做可见校验、非法值不发请求且不截断
+    // （后端 validate_secretary_name 会二次校验并回 ok:false）。
+    // persona 可选：每个秘书是用户自己创建的独立 agent，人设只属于它这个会话；
+    // 留空就用内置默认秘书人设（与设置页的星瑶人设完全无关）。
+    async createSecretarySession(name: string, persona = '') {
+      const normalized = (name || '').trim();
+      // 用码点计数与后端 len() 对齐：emoji 这类代理对不会被算成两个字符
+      const nameLength = [...normalized].length;
+      if (!normalized) {
+        this.notifyModal('新建秘书会话', '请先给这位秘书起个名字（1-20 个字符）');
+        return;
+      }
+      if (nameLength > SECRETARY_NAME_MAX_LEN) {
+        this.notifyModal(
+          '新建秘书会话',
+          `秘书名字最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${nameLength} 个`,
+        );
+        return;
+      }
+      // 人设空白视为"没填"，正常放行（走默认人设）
+      const personaDraft = (persona || '').trim();
+      if (personaDraft.length > SECRETARY_PERSONA_MAX_LEN) {
+        this.notifyModal(
+          '新建秘书会话',
+          `秘书人设最多 ${SECRETARY_PERSONA_MAX_LEN} 个字符，当前 ${personaDraft.length} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return; // _api() 缺桥时已弹「连接失败」，这里不再二次打扰
+      try {
+        // 标题固定「新会话」：侧栏与欢迎页显示的都是秘书名（后端 display_name），
+        // 会话名（session_xxx）不参与命名，这里不需要用户可见的会话标题
+        const res = await api.create_secretary_session('新会话', normalized, personaDraft);
+        if (!res || !res.ok) {
+          // 建会话是用户显式动作：失败必须可见，不做静默降级
+          this.notifyModal('新建秘书会话', (res && res.msg) || '创建失败');
+          return;
+        }
+        // 新会话意味着回到聊天视图：子页面打开时也要收起，否则状态已切换但
+        // 界面停在子页（表现为"点了没反应"），与 createGlobalSession 同口径
+        this.subpage.show = false;
+        this._captureCurrentRuntime();
+        // 已落库的真实会话：清掉草稿工作区标记，避免首条消息再走"草稿落库"分支
+        this.pendingWorkdir = null;
+        // 权限确认框属于上一个会话，新会话不该继承它（switchSession 按会话名判定同口径）
+        this.permRequest.show = false;
+        this.currentSessionName = res.session_name;
+        // 显示名优先用秘书名：侧栏条目、欢迎页、对话头部都读它
+        this.currentSessionDisplayName = String(res.secretary_name || res.display_name || normalized);
+        this._bindSessionRuntime(res.session_name);
+        this.messages = [];
+        this.currentStreamingText = '';
+        this.currentThinkingText = '';
+        this.subagentTasks = [];
+        this.planData = { title: '', items: [], progress: 0 };
+        this.tokenUsage = emptyTokenUsage();
+        this.running = false;
+        // 新会话不是"历史加载中"：显式清除切换加载态
+        this.sessionSwitching = false;
+        this._captureRuntime(res.session_name);
+        // 秘书会话固定 workdir=GLOBAL：按「对话」工作区呈现，不加载文件树
+        this.workdir = '';
+        this.currentWorkdirLabel = '对话';
+        this.fileTree = [];
+        this.fileTreeExpanded = [];
+        // 后端已落库：用最新分组树重建列表，新会话立刻出现在秘书分组里
+        await this.refreshSessions();
+        // 生效名以后端为准（会话已切过去、秘书名已落库），与侧栏显示同一来源
+        await this.refreshActiveAgentName();
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('新建秘书会话', '创建失败: ' + err);
       }
     },
 
@@ -2230,7 +4429,7 @@ export const useAppStore = defineStore('app', {
     },
 
     async deleteFolderGroup(workdir: string, folderTitle: string) {
-      // 确认动作已内联在分组头的红色小按钮上，不再弹大确认窗；
+      // 调用方（侧栏分组头 ✕）已用 askConfirm 弹窗完成二次确认；
       // 后端 delete_folder_group 会连同组内对话记录一起删除（不动磁盘文件）
       const api = this._api();
       if (!api) return;
@@ -2266,6 +4465,10 @@ export const useAppStore = defineStore('app', {
           // 排队消息随会话删除一并清理（后端已同步清空，此处防快照事件丢失残留）
           delete this.messageQueues[sessionName];
           delete this.sessionRuntimeByName[sessionName];
+          // 归档区行内删除同样走这里：归档会话不在 sessionGroups 中，
+          // 故单独摘除并刷新归档列表，避免已删除的条目残留在「已归档」区
+          this.archivedSessions = this.archivedSessions.filter(s => s.name !== sessionName);
+          void this.loadArchivedSessions();
           if (sessionName === this.currentSessionName && res.current_session) {
             await this.switchSession(res.current_session, '新会话');
           }
@@ -2276,6 +4479,331 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyModal('会话管理', '删除会话失败: ' + err);
+      }
+    },
+
+    // 手动重命名会话（侧栏右键菜单入口）。
+    // 成功静默完成：后端撞名会自动加后缀，返回的 sessions 才是最终列表，直接覆盖同步；
+    // 会话名迁移（当前会话/运行态/状态点）主要由后端 session_renamed 事件负责，
+    // 但事件在重连窗口期可能丢失（emit 失败后端也不改判成功），故此处按 res.name 兜底迁移。
+    async renameSession(oldName: string, newName: string) {
+      const target = (newName || '').trim();
+      // 空白名视为无改动，不发请求
+      if (!target) return;
+      // 秘书会话改的是「秘书名」（secretary_name），不是会话名：先分流。
+      // 秘书名与 session_xxx 永不相等，混在下面「与旧名相同」的判断里虽然不会
+      // 误伤，但两者语义完全不同，分开更不容易埋坑
+      if (this._isSecretarySession(oldName)) return this.renameSecretarySession(oldName, target);
+      // 与原会话名相同视为无改动，不发请求
+      if (target === oldName) return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.rename_session(oldName, target);
+        if (res && res.ok) {
+          if (res.sessions) this.sessionGroups = res.sessions;
+          // 兜底迁移当前会话名：漏掉会导致侧栏高亮消失、后续请求仍用旧名
+          if (res.name && res.name !== oldName && this.currentSessionName === oldName) {
+            this.currentSessionName = res.name;
+            this.currentSessionDisplayName = res.name;
+          }
+        } else {
+          this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
+    // 跨文件夹移动会话（侧栏右键「移动到…」入口）。
+    // 只改归属：消息、摘要、token 统计、会话级模型绑定都按 session_id 关联，不受影响。
+    // 移动的是当前会话时，工作区标签与文件树要一并切到新目录，否则界面仍显示旧项目的文件。
+    async moveSessionToWorkdir(sessionName: string, workdir: string) {
+      const target = (workdir || '').trim();
+      // 空目标不发请求（后端也拒绝）：侧栏只会给出真实分组或 "GLOBAL"
+      if (!target) return;
+      // 秘书会话归属由 source 决定，后端会拒绝移动，这里先拦掉不发无谓请求
+      if (this._isSecretarySession(sessionName)) return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.move_session_to_workdir(sessionName, target);
+        if (res && res.ok) {
+          // 后端回带最新分组树：整份覆盖，免得前端再算一遍分组归属
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else void this.refreshSessions();
+          if (sessionName === this.currentSessionName) {
+            const wd = String(res.workdir || 'GLOBAL');
+            this.workdir = wd;
+            this.currentWorkdirLabel = wd === 'GLOBAL' ? '对话' : (wd.split('\\').pop() || wd);
+            if (wd === 'GLOBAL') {
+              this.fileTree = [];
+              this.fileTreeExpanded = [];
+            } else {
+              // 与 switchSession 同款：文件树后台异步加载，不阻塞交互
+              this.loadFileTreeInBackground(this.currentSessionName, wd);
+            }
+          }
+          this.notifyChat(res.moved === false ? '会话已在目标分组' : '会话已移动到新分组');
+        } else {
+          this.notifyModal('会话管理', '移动失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '移动失败: ' + err);
+      }
+    },
+
+    // 秘书会话改名（右键「重命名」入口，目标为秘书会话时由 renameSession 分流到此）。
+    // 只改后端的 secretary_name：session_name 仍是建会话时生成的 session_xxx，
+    // 所以消息 / 摘要 / 快照 / 侧栏高亮的键都不需要迁移，与普通会话重命名口径不同。
+    async renameSecretarySession(sessionName: string, newName: string) {
+      const target = (newName || '').trim();
+      if (!target) {
+        this.notifyModal('会话管理', '秘书名字不能为空（1-20 个字符）');
+        return;
+      }
+      if ([...target].length > SECRETARY_NAME_MAX_LEN) {
+        this.notifyModal(
+          '会话管理',
+          `秘书名字最多 ${SECRETARY_NAME_MAX_LEN} 个字符，当前 ${[...target].length} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.rename_secretary_session(sessionName, target);
+        if (res && res.ok) {
+          // 后端回带最新分组树（条目里的秘书名已更新），直接覆盖同步
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else void this.refreshSessions();
+          // 改的是当前会话时还要刷新生效名：侧栏条目已变，欢迎页 / 对话头部
+          // 读的是 store.agentName，漏掉会出现"侧栏已改名、页面还叫旧名"
+          if (this.currentSessionName === sessionName) {
+            this.currentSessionDisplayName = String(res.secretary_name || res.display_name || target);
+            await this.refreshActiveAgentName();
+          }
+        } else {
+          this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
+    // 设置秘书专属人设（右键「编辑人设」入口，仅秘书会话可用）。
+    // 人设只落该会话自己的 secretary_persona，不碰会话名 / 消息 / 摘要，
+    // 也不影响设置页的星瑶人设；传空串 = 恢复内置默认秘书人设。
+    async updateSecretaryPersona(sessionName: string, persona: string) {
+      if (!this._isSecretarySession(sessionName)) return;
+      const draft = (persona || '').trim();
+      if (draft.length > SECRETARY_PERSONA_MAX_LEN) {
+        this.notifyModal(
+          '秘书人设',
+          `秘书人设最多 ${SECRETARY_PERSONA_MAX_LEN} 个字符，当前 ${draft.length} 个`,
+        );
+        return;
+      }
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_secretary_persona(sessionName, draft);
+        if (res && res.ok) {
+          // 后端回带最新分组树（条目里的人设已更新），直接覆盖同步
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else void this.refreshSessions();
+          // 人设是在下一轮请求里生效的：当前会话提示"改完即生效"要如实说明
+          this.notifyChat(draft ? '秘书人设已更新，下一轮对话生效' : '已恢复默认秘书人设');
+        } else {
+          this.notifyModal('秘书人设', '保存失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('秘书人设', '保存失败: ' + err);
+      }
+    },
+
+    // 加载归档会话列表（设置页「会话归档」分区数据源）。
+    // 旧后端 / 纯浏览器预览没有该方法时静默保持现状，不弹连接失败框。
+    async loadArchivedSessions() {
+      const api = (window.pywebview && window.pywebview.api) as PyWebViewAPI | null;
+      if (!api || typeof api.get_archived_sessions !== 'function') return;
+      const seq = ++this.archivedSessionsReqSeq;
+      try {
+        const list = await api.get_archived_sessions();
+        if (seq !== this.archivedSessionsReqSeq) return;
+        if (Array.isArray(list)) this.archivedSessions = list;
+      } catch (err) {
+        // 静默失败：归档区不是主路径，下一次归档动作/事件到达时会重新拉取
+        console.error('加载归档会话失败:', err);
+      }
+    },
+
+    /** 取会话的展示名（归档 / 取消归档的反馈文案用；查不到时退回会话名） */
+    _sessionDisplayName(sessionName: string): string {
+      const hit = this.sessionGroups
+        .flatMap(g => g.sessions || [])
+        .find(s => s.name === sessionName);
+      if (hit && hit.display_name) return hit.display_name;
+      const archived = this.archivedSessions.find(s => s.name === sessionName);
+      return (archived && archived.display_name) || sessionName;
+    },
+
+    // 归档会话（侧栏行内 ⤓ 入口）。入口侧已改为行内二次确认（点确认才真正归档），
+    // 成功后与删除一致静默完成——会话从列表消失、归档区出现即是反馈，不再弹提示框。
+    // 后端 session_archived 事件在重连窗口期可能丢失，故按返回值/主动刷新兜底，
+    // 不做乐观更新（失败时保持原状）。
+    async archiveSession(sessionName: string) {
+      const api = this._api();
+      if (!api || !sessionName) return false;
+      // 归档与「禁止删除当前活跃会话」同源的保护：归档态会话正在被使用是自相矛盾的状态
+      if (sessionName === this.currentSessionName) {
+        this.notifyModal('会话归档', '不能归档当前活跃会话，请先切换到其它会话');
+        return false;
+      }
+      try {
+        const res = await api.archive_session(sessionName);
+        if (res && res.ok) {
+          if (Array.isArray(res.sessions)) {
+            this.sessionGroups = res.sessions;
+          } else {
+            // 桥接方法不回传列表时本地摘除，避免「已归档却仍在主列表」的中间态
+            this.sessionGroups = this.sessionGroups.map(g => ({
+              ...g,
+              sessions: (g.sessions || []).filter(s => s.name !== sessionName),
+            }));
+          }
+          if (Array.isArray(res.archived_sessions)) {
+            this.archivedSessions = res.archived_sessions;
+          } else {
+            await this.loadArchivedSessions();
+          }
+          // 归档成功静默完成：入口侧的二次确认已表明意图，列表刷新即为反馈
+          return true;
+        }
+        this.notifyModal('会话归档', '归档失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '归档失败: ' + err);
+        return false;
+      }
+    },
+
+    // 取消归档（归档区行内 ↩ 入口）：会话恢复回主列表。同样可逆、不弹确认框。
+    async unarchiveSession(sessionName: string) {
+      const api = this._api();
+      if (!api || !sessionName) return false;
+      const display = this._sessionDisplayName(sessionName);
+      try {
+        const res = await api.unarchive_session(sessionName);
+        if (res && res.ok) {
+          if (Array.isArray(res.archived_sessions)) {
+            this.archivedSessions = res.archived_sessions;
+          } else {
+            this.archivedSessions = this.archivedSessions.filter(s => s.name !== sessionName);
+            await this.loadArchivedSessions();
+          }
+          if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+          else await this.refreshSessions();
+          this.notifyModal('会话归档', `已取消归档「${display}」，已恢复到会话列表`);
+          return true;
+        }
+        this.notifyModal('会话归档', '取消归档失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '取消归档失败: ' + err);
+        return false;
+      }
+    },
+
+    /** 批量归档操作的结果收尾：采用后端回传的两侧快照，缺省时主动刷新兜底 */
+    _applyArchiveBatchLists(res: ArchiveBatchResult | null | undefined) {
+      if (!res) return;
+      if (Array.isArray(res.sessions)) this.sessionGroups = res.sessions;
+      else void this.refreshSessions();
+      if (Array.isArray(res.archived_sessions)) this.archivedSessions = res.archived_sessions;
+      else void this.loadArchivedSessions();
+    },
+
+    // 批量取消归档（设置页归档区多选恢复）：与单条 unarchiveSession 同语义（可逆、
+    // 幂等、不弹确认框），差别只在一次桥接处理多个会话、只弹一次结果提示。
+    // 返回本次成功恢复的会话名数组；失败项不回传，调用方据此保留这些行的勾选。
+    async batchUnarchiveSessions(sessionNames: string[]): Promise<string[]> {
+      const api = this._api();
+      const names = (sessionNames || []).filter(n => !!n);
+      if (!api || !names.length) return [];
+      try {
+        const res = await api.unarchive_sessions(names);
+        if (!res || !res.ok) {
+          this.notifyModal('会话归档', '批量恢复失败: ' + (res && res.msg ? res.msg : '未知错误'));
+          return [];
+        }
+        this._applyArchiveBatchLists(res);
+        const done = Array.isArray(res.names) ? res.names : [];
+        const failed = Array.isArray(res.failed) ? res.failed : [];
+        this.notifyModal(
+          '会话归档',
+          failed.length
+            ? `已恢复 ${done.length} 个会话，${failed.length} 个失败：${failed.map(f => f.msg || f.name).join('；')}`
+            : `已恢复 ${done.length} 个会话到会话列表`,
+        );
+        return done;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话归档', '批量恢复失败: ' + err);
+        return [];
+      }
+    },
+
+    // 批量删除归档会话（设置页归档区多选删除）：二次确认由调用方（设置页）负责，
+    // 这里只落盘并同步本地状态。返回本次真正删除的会话名数组。
+    async batchDeleteArchivedSessions(sessionNames: string[]): Promise<string[]> {
+      const api = this._api();
+      const names = (sessionNames || []).filter(n => !!n);
+      if (!api || !names.length) return [];
+      try {
+        const res = await api.delete_archived_sessions(names);
+        const done = res && res.ok && Array.isArray(res.names) ? res.names : [];
+        if (!done.length) {
+          const failed = res && Array.isArray(res.failed) ? res.failed : [];
+          const reason = failed.length
+            ? failed.map(f => f.msg || f.name).join('；')
+            : (res && res.msg ? res.msg : '未知错误');
+          this.notifyModal('会话管理', '批量删除失败: ' + reason);
+          // 一项都没删掉时列表可能已被别的入口改动，仍刷新一次兜底
+          void this.loadArchivedSessions();
+          return [];
+        }
+        this._applyArchiveBatchLists(res);
+        // 逐个清理前端运行态残留（照 deleteSingleSession 的 T11 修复：否则
+        // runningSessions / sessionRuntimeByName 里留下已删会话的孤儿条目）
+        done.forEach(name => {
+          this.runningSessions = this.runningSessions.filter(s => s !== name);
+          this.queuedSessions = this.queuedSessions.filter(s => s !== name);
+          delete this.messageQueues[name];
+          delete this.sessionRuntimeByName[name];
+        });
+        // 极端并发下删到了当前活跃会话：后端已补建 GLOBAL 会话，跟随切换
+        if (res && res.current_session && done.includes(this.currentSessionName)) {
+          await this.switchSession(res.current_session, '新会话');
+        }
+        const failed = Array.isArray(res.failed) ? res.failed : [];
+        if (failed.length) {
+          this.notifyModal(
+            '会话管理',
+            `已删除 ${done.length} 个归档会话，${failed.length} 个失败：${failed.map(f => f.msg || f.name).join('；')}`,
+          );
+        }
+        return done;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '批量删除失败: ' + err);
+        return [];
       }
     },
 
@@ -2338,6 +4866,26 @@ export const useAppStore = defineStore('app', {
 
     closeRemoteDirBrowser() {
       this.remoteDirBrowser.show = false;
+      this.remoteDirBrowser.plainPick = null;
+    },
+
+    // ---- 纯选目录（星轨自动化任务表单等）：桌面走原生对话框，失败回退内置浏览器 ----
+    async pickFolderPlain(cb: (path: string) => void) {
+      const api = this._api();
+      if (!api) return;
+      if (!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches)) {
+        try {
+          const res = await (api as any).pick_folder_dialog();
+          if (res && res.ok && res.path) {
+            cb(String(res.path));
+            return;
+          }
+          // 用户主动取消原生对话框：静默返回，不弹内置浏览器
+          if (res && !res.ok && res.msg === '已取消选择') return;
+        } catch { /* 原生对话框不可用时回退内置浏览器 */ }
+      }
+      this.remoteDirBrowser.plainPick = cb;
+      await this.openRemoteDirBrowser();
     },
 
     async confirmRemoteWorkspace(useCurrent = false) {
@@ -2346,6 +4894,14 @@ export const useAppStore = defineStore('app', {
       // 未勾选时允许直接把当前浏览目录作为工作区（"使用当前目录"按钮）
       const path = this.remoteDirBrowser.selected
         || (useCurrent ? this.remoteDirBrowser.current : '');
+      // 纯选目录模式：只把路径交给回调，不登记工作区、不迁移会话归属
+      if (this.remoteDirBrowser.plainPick) {
+        if (!path) return;
+        const picked = this.remoteDirBrowser.plainPick;
+        this.closeRemoteDirBrowser();
+        picked(path);
+        return;
+      }
       if (!path) return;
       try {
         const res = await (api as any).select_workspace_by_path(path);
@@ -2371,26 +4927,59 @@ export const useAppStore = defineStore('app', {
       if (!api) return;
       // T12 修复：若后端未回发 turn_cancelled（进程异常退出/事件丢失），
       // runningSessions 将永久残留该会话，sendMessage 的拦截判定会让用户永远无法再发送。
-      // 加 10s 本地兜底定时器：超时后强制清除该会话运行态；
-      // 若 turn_cancelled 正常到达，runningSessions 已不含该会话，定时器为无操作。
+      // 加 10s 本地兜底定时器：超时后强制清除该会话运行态。
+      // 兜底只在「停止之后该会话运行态没被任何权威来源改写」时才该生效：终态事件、
+      // 新回合开始、发送失败回滚都会撤掉它（_clearStopFallbackTimer）。否则用户
+      // 停止后立刻重发，10s 到点时看到会话又在跑，会把新回合误判成「停止没生效」
+      // 一并解锁，界面上「正在干活」消失、停在上一轮的结束态。
       // 验证思路：mock stop_current_turn 成功但不派发 turn_cancelled，
-      // 10s 后 runningSessions 应不再包含该会话且发送恢复可用。
+      // 10s 后 runningSessions 应不再包含该会话且发送恢复可用；若 10s 内已收到
+      // turn_cancelled 并开始新回合，则新回合的运行态不得被定时器清掉。
+      this._clearStopFallbackTimer(sessionName);
       const stopFallbackTimer = setTimeout(() => {
-        if (this.runningSessions.includes(sessionName)) {
+        stopFallbackTimers.delete(sessionName);
+        // 判定用「运行会话表 ∪ 顶层运行标记」：两者不一致时（终态事件缺 session_name、
+        // 事件错序等边界会留下半残态）只看运行会话表会永远判不到，界面就一直转，
+        // 用户点多少次停止都没反应。顶层标记也当运行处理，兜底才能真正兜住。
+        const stillRunning = this.runningSessions.includes(sessionName)
+          || (sessionName === this.currentSessionName && this.running);
+        if (stillRunning) {
           console.warn(`[T12] stopCurrentTurn 后 10s 未收到 turn_cancelled，本地兜底解锁会话: ${sessionName}`);
           this._setSessionRunning(sessionName, false);
         }
       }, 10000);
+      stopFallbackTimers.set(sessionName, stopFallbackTimer);
       try {
         const res = await api.stop_current_turn(sessionName);
         if (!res || !res.ok) {
-          clearTimeout(stopFallbackTimer);
+          this._clearStopFallbackTimer(sessionName);
           this.broadcastChatNotice('中断请求未成功送达', 'error', sessionName);
         } else {
-          this.notifyChat('已中断当前回合');
+          // 后端权威结论 idle：该会话本来就没有活跃回合（回合已收尾，终态事件
+          // 早已发过）。此时本地若还挂着运行态，就是永远不会再被事件纠正的残留，
+          // 直接按权威结论解锁——用户点一次停止就恢复，而不是反复点都没反应。
+          if ((res as { idle?: boolean }).idle) {
+            this.notifyChat('当前没有正在执行的回合');
+            if (this.runningSessions.includes(sessionName)
+                || (sessionName === this.currentSessionName && this.running)) {
+              console.warn(`[stop] 后端回报无活跃回合，本地按权威结论解锁: ${sessionName}`);
+              this._setSessionRunning(sessionName, false);
+            }
+          } else {
+            this.notifyChat('已中断当前回合');
+            // 自愈：后端已受理停止，而本会话有运行标记却没进权威运行会话表——
+            // 本地状态已经失真（事件错序 / 终态事件缺 session_name 都会留下半残态），
+            // 这种态下不会再有事件来解锁，点多少次停止界面都不会变。
+            // 只在「就是当前查看的会话」时动手，绝不误清后台会话的合法运行态。
+            if (sessionName === this.currentSessionName && this.running
+                && !this.runningSessions.includes(sessionName)) {
+              console.warn(`[stop] 运行标记与会话表不一致，按停止请求本地自愈解锁: ${sessionName}`);
+              this._setSessionRunning(sessionName, false);
+            }
+          }
         }
       } catch (err) {
-        clearTimeout(stopFallbackTimer);
+        this._clearStopFallbackTimer(sessionName);
         this.connected = false;
         this.broadcastChatNotice('中断请求失败: ' + err, 'error', sessionName);
       }
@@ -2514,16 +5103,29 @@ export const useAppStore = defineStore('app', {
           attachList,
           pendingDir,
           pendingDir ? (this.draftModelId || undefined) : (this.activeModelId || undefined),
+          // pending 草稿会话选过的权限档位随首条消息带给后端补绑定
+          this._getSessionRuntime(sessionName).permMode || undefined,
         );
         if (res && res.ok) {
           // 草稿模型已随后端落库（或本就不存在），不再保留待重发状态
           this.draftModelId = '';
+          // /goal 是本地直执行命令：桥内起后台循环并立刻落盘状态，不产生任何
+          // 回合事件，一次 send_user_message 就结束了。这里补一次目标状态刷新，
+          // 让 GoalBar 立刻出现/更新——空状态下组件不轮询，没有这个触发就只能
+          // 等用户切会话才看得到刚设的目标。
+          if (/^\/goal(\s|$)/i.test(text.trim())) void this.loadGoalState();
           if (pendingDir) {
           // 让新会话立即出现在左侧列表（自动重命名事件随后会再刷新一次）
           this.refreshSessions();
           }
         }
         if (!res || !res.ok) {
+          // 基元律动登录会话失效：后端返回 need_login 时直接把登录窗口拉起来，
+          // 比只显示一行错误更省事——点一下就能重新登录。
+          if (res && (res as any).need_login) {
+            this.openTrLoginModal();
+            void this.refreshTrAuth();
+          }
           // #13 修复：失败分支不再无条件 _bindSessionRuntime(sessionName)。
           // await 期间用户可能已切换到其他会话，重新绑定会把 store 顶层
           // 引用切回失败会话的运行态，覆盖用户当前正在查看的会话。
@@ -2565,6 +5167,70 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 编辑已发送的用户消息：后端截断该条及其之后的历史（含摘要作废），本地同步
+    // 截断后复用 sendMessage 重新发送——乐观渲染、排队与错误提示不另写一套。
+    // 文件副作用不回滚：那条回合的工具已改过磁盘，界面在编辑条上提示用户。
+    async editUserMessage(
+      msg: ChatMessage, newText: string, imagePaths: string[] = [],
+    ): Promise<boolean> {
+      const text = (newText || '').trim();
+      // 图片由调用方先落盘成路径（历史图是 dataURL，需经 saveClipboardImage）；
+      // 纯图片编辑（文字清空只留图）合法，所以判断依据是「文本和图片都空」
+      const paths = (imagePaths || []).filter(p => !!p);
+      if (!text && !paths.length) return false;
+      const msgId = msg._msg_id;
+      if (!msgId) {
+        this.broadcastChatNotice('该消息尚未入库，暂时无法编辑', 'error');
+        return false;
+      }
+      const api = this._api();
+      if (!api || typeof api.edit_user_message !== 'function') {
+        this.broadcastChatNotice('当前后端不支持编辑消息，请重启软件后重试', 'error');
+        return false;
+      }
+      const sessionName = this.currentSessionName;
+      try {
+        const res = await api.edit_user_message(sessionName, msgId, text);
+        if (!res || !res.ok) {
+          this.broadcastChatNotice(
+            '编辑失败: ' + ((res && res.msg) || '未知错误'), 'error', sessionName,
+          );
+          return false;
+        }
+      } catch (err) {
+        this.broadcastChatNotice('编辑失败: ' + err, 'error', sessionName);
+        return false;
+      }
+      // 后端已截断：本地从该条开始（含这条）丢弃，historyHasMore 保持原值——
+      // 更早的历史仍在库里，向前翻页游标依然有效。
+      // 截断必须落在发起编辑的会话视图上：await 期间用户可能已切走，
+      // this.messages 已指向别的会话（绝不能动），故取该会话自己的 runtime；
+      // 仍停在原会话时顶层 messages 就是它的视图（_bindSessionRuntime 绑同一数组）
+      const view = this.currentSessionName === sessionName
+        ? this.messages
+        : this._getSessionRuntime(sessionName).messages;
+      const idx = view.findIndex(m => m._msg_id === msgId);
+      if (idx >= 0) view.splice(idx);
+      // 本地历史已截断：右侧红点导航的索引要同步少掉被截断的条目，
+      // 否则已删除的消息还能在导轨里点进去（索引是后端按库重建的）
+      void this.refreshNavIndex(sessionName);
+      // 会话已切换就不能再 sendMessage：它按 currentSessionName 发送，会把编辑后的
+      // 文本发到新会话，而两者工作目录可能不同，模型会按错误上下文执行工具
+      if (this.currentSessionName !== sessionName) {
+        this.broadcastChatNotice('会话已切换，编辑已保存但未重新生成', 'error', sessionName);
+        return false;
+      }
+      // 编辑已落库（截断 + 新文本由本地历史承载），重发生成失败不能把它算成
+      // 编辑失败：异常抛出去界面只会显示「编辑失败」，用户会以为改动丢了
+      try {
+        await this.sendMessage(text, paths);
+      } catch {
+        this.broadcastChatNotice('编辑已保存，但重新生成失败，请手动重发', 'error', sessionName);
+        return false;
+      }
+      return true;
+    },
+
     async refreshSessions() {
       const api = this._api();
       if (!api) return;
@@ -2595,6 +5261,23 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 会话 token 弹层数据：每次打开都重拉（面板是瞬时视图，不做增量维护）
+    async loadTokenUsageOverview(limit = 20) {
+      const api = this._api();
+      if (!api) return null;
+      this.tokenUsageOverviewLoading = true;
+      try {
+        const result = await api.get_token_usage_overview(limit);
+        if (result && result.ok) this.tokenUsageOverview = result;
+        return result;
+      } catch (err) {
+        console.error('加载会话 Token 概览失败:', err);
+        return null;
+      } finally {
+        this.tokenUsageOverviewLoading = false;
+      }
+    },
+
     // ── frameless 关闭确认（现代三选框） ──
     async _handleCloseRequested(this: any, hasRunningWork: boolean, trayAvailable: boolean) {
       const api = this._api();
@@ -2621,6 +5304,178 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    /** 合并宿主回推的内嵌浏览器状态快照（字段强转，容忍缺省/多余字段） */
+    applyEmbeddedBrowserState(this: any, data: Record<string, unknown> | null | undefined) {
+      const src = (data || {}) as Record<string, unknown>;
+      // 归属会话：原生控件全进程唯一，状态事件带 session_name。只认领当前
+      // 查看会话的状态，后台会话的导航/标题/加载态不得污染当前界面
+      // （空值 = 旧后端/未占用，按当前会话处理）。
+      const owner = String(src.session_name || '');
+      if (owner && owner !== this.currentSessionName) return;
+      const s = this.embeddedBrowser;
+      s.url = String(src.url ?? '');
+      s.title = String(src.title ?? '');
+      s.can_go_back = !!src.can_go_back;
+      s.can_go_forward = !!src.can_go_forward;
+      s.loading = !!src.loading;
+      s.ready = !!src.ready;
+      s.visible = !!src.visible;
+    },
+
+    /**
+     * 秘书调度台 open_session 桥事件处理：把界面带到后端已切好的目标会话。
+     *
+     * 视图切换复用用户点会话的那条路径（switchSession：丢弃 pending 草稿、
+     * 清流式态、按会话拉历史、恢复模型/权限/排队消息、刷新生效名），
+     * 这里只做「取载荷 + 兜底」两件事，不复制切换逻辑。
+     * 会话名缺失（后端解析异常 / 事件字段缺失）时静默记一条日志：跳转失败
+     * 不该弹窗、更不该让桥事件管线抛错。切换失败同理，只留日志。
+     */
+    async _handleOpenSessionEvent(event: BridgeEvent) {
+      // 载荷口径：后端信封是 {type, data}；个别来源可能用 {type, payload} 平铺
+      const raw = ((event as any).data ?? (event as any).payload ?? {}) as Record<string, unknown>;
+      const sessionName = String(raw.session_name || '').trim();
+      if (!sessionName) {
+        console.warn('[open_session] 桥事件缺少 session_name，已忽略本次跳转');
+        return;
+      }
+      const displayName = String(raw.display_name || '').trim();
+      try {
+        // 不传 workdir：目标是后端已存在的会话，其归属目录由后端权威副本决定
+        // （display_name 只在后端给了生效名时才覆盖本地兜底名）
+        await this.switchSession(sessionName, displayName || undefined);
+      } catch (err) {
+        // switchSession 内部已弹「切换会话失败」提示，这里只补一条静默日志，
+        // 绝不让异常冒泡回桥事件派发点
+        console.warn(`[open_session] 跳转到会话 ${sessionName} 失败:`, err);
+      }
+    },
+
+    // ── 背景图转换（视频 → 动画 WebP 动态背景）─────────────────────
+    // 后端：GuiBridge.pick_background_video / describe_background_video /
+    // pick_background_output_dir / start_background_convert /
+    // cancel_background_convert / install_converted_background
+    async pickBackgroundVideo() {
+      const api = this._api();
+      if (!api) return;
+      this.bgConvert.message = '';
+      this.bgConvert.error = '';
+      const res = await api.pick_background_video();
+      if (!res || !res.ok) {
+        const message = (res as { error?: { message?: string } } | undefined)?.error?.message || '';
+        // 用户主动取消不算错误
+        if (message && !message.includes('取消')) this.bgConvert.error = message;
+        return;
+      }
+      const info = res as unknown as BackgroundVideoInfo;
+      this.bgConvert.video = info;
+      this.bgConvert.resultPath = '';
+      this.bgConvert.resultBytes = 0;
+      this.bgConvert.percent = 0;
+      this.bgConvert.etaSeconds = null;
+      // 输出目录默认取源视频所在目录（用户仍可自行改选）
+      if (!this.bgConvert.outputDir) {
+        this.bgConvert.outputDir = info.path.replace(/[\\/][^\\/]*$/, '');
+      }
+    },
+    // 重新探测「已选视频」的预检信息（不重新弹文件选择框）。
+    // 为什么需要：ffmpeg 组件是按需下载的，预检快照是选视频那一刻算出来的，
+    // 装好组件后旧快照里的「未检测到 ffmpeg」blocker 不会自己消失，
+    // 用户会被迫重选一次视频。下载完成事件与「重新检测」按钮都走这里，
+    // 让 can_convert / blockers 按当前环境重算。
+    // 只在已有视频时调用：没选视频时不做无意义探测；转换进行中也不重探，
+    // 避免覆盖正在展示的预检信息。
+    async redescribeBackgroundVideo(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      const current = this.bgConvert.video;
+      if (!current || !current.path) return false;
+      if (this.bgConvert.running) return false;
+      try {
+        const res = await api.describe_background_video(current.path);
+        if (!res || !res.ok) {
+          const message = (res as { error?: { message?: string } } | undefined)?.error?.message || '';
+          // 探测失败只在有消息时提示，不覆盖用户已看到的转换结果区
+          if (message) this.bgConvert.error = message;
+          return false;
+        }
+        this.bgConvert.video = res as unknown as BackgroundVideoInfo;
+        // 重新探测的结果是权威的：之前因缺组件留下的错误提示要清掉
+        this.bgConvert.error = '';
+        return true;
+      } catch (err) {
+        // 桥异常不该冒泡到点击点，留一条日志即可（用户还能手动再点一次）
+        console.warn('[bg_convert] 重新探测视频信息失败:', err);
+        return false;
+      }
+    },
+    async pickBackgroundOutputDir() {
+      const api = this._api();
+      if (!api) return;
+      this.bgConvert.error = '';
+      const res = await api.pick_background_output_dir();
+      if (res && res.ok) {
+        this.bgConvert.outputDir = (res as unknown as { path: string }).path;
+      } else {
+        const message = (res as { error?: { message?: string } } | undefined)?.error?.message || '';
+        if (message && !message.includes('取消')) this.bgConvert.error = message;
+      }
+    },
+    async startBackgroundConvert() {
+      const api = this._api();
+      if (!api) return;
+      let video = this.bgConvert.video;
+      if (!video) { this.bgConvert.error = '请先选择要转换的视频'; return; }
+      // 兜底放行：预检快照可能是「ffmpeg 组件还没下载」时算的，此刻组件若已就绪，
+      // 先按当前环境重探一次再判定，避免用户装好组件后还得重选视频
+      if (!video.can_convert && this.ffmpegComponent.installed) {
+        await this.redescribeBackgroundVideo();
+        video = this.bgConvert.video;
+        if (!video) { this.bgConvert.error = '请先选择要转换的视频'; return; }
+      }
+      if (!video.can_convert) {
+        this.bgConvert.error = video.blockers[0] || '该视频无法转换';
+        return;
+      }
+      if (!this.bgConvert.outputDir) { this.bgConvert.error = '请先选择输出文件夹'; return; }
+      this.bgConvert.error = '';
+      this.bgConvert.message = '';
+      this.bgConvert.percent = 0;
+      this.bgConvert.etaSeconds = null;
+      this.bgConvert.resultPath = '';
+      this.bgConvert.resultBytes = 0;
+      const res = await api.start_background_convert(
+        video.path, this.bgConvert.outputDir,
+        this.bgConvert.fps, this.bgConvert.quality, this.bgConvert.pingpong,
+      );
+      if (!res || !res.ok) {
+        this.bgConvert.error = (res && res.msg) || '启动转换失败';
+        return;
+      }
+      this.bgConvert.running = true;
+      this.bgConvert.resultPath = res.output || '';
+    },
+    async cancelBackgroundConvert() {
+      const api = this._api();
+      if (!api) return;
+      await api.cancel_background_convert();
+    },
+    async installConvertedBackground() {
+      const api = this._api();
+      if (!api) return;
+      const path = this.bgConvert.resultPath;
+      if (!path) return;
+      this.bgConvert.message = '';
+      this.bgConvert.error = '';
+      const res = await api.install_converted_background(path);
+      if (res && res.ok) {
+        this.bgConvert.message = '已设为当前主题的全局背景图（重启应用或切换主题后生效）';
+      } else {
+        this.bgConvert.error =
+          (res as { error?: { message?: string } } | undefined)?.error?.message || '应用到主题失败';
+      }
+    },
+
     handleBridgeEvent(event: BridgeEvent) {
       const type = event.type;
       const data = event.data || {};
@@ -2636,11 +5491,137 @@ export const useAppStore = defineStore('app', {
       }
 
       const currentRuntimeKey = this._runtimeKey();
+      // Git 工作台事件（规格 §10）：外部变化只触发失效刷新，转发给 gitStore，
+      // 不参与会话 runtime 归属
+      if (type === 'git_state_changed') {
+        useGitStore().onExternalChange(data);
+        return;
+      }
       // 拖放文件路径推送（GUI 线程死锁修复后改走 _js_queue 事件管线）：
       // 转发给 useAttachments 挂在 window 上的匹配逻辑，不参与会话 runtime 归属
       if (type === 'dropped_paths_push') {
         const push = (window as unknown as { __ycode_on_drop_paths?: (p: unknown) => void }).__ycode_on_drop_paths;
         if (push) push(data);
+        return;
+      }
+      // ── 背景图转换进度（GuiBridge 的 bg_convert_* 事件）──
+      // 全局单任务，不与会话 runtime 归属相关，处理完直接返回
+      if (type === 'bg_convert_progress') {
+        this.bgConvert.percent = Number(data.percent) || 0;
+        this.bgConvert.stage = String(data.stage || '');
+        this.bgConvert.etaSeconds =
+          typeof data.eta_seconds === 'number' ? data.eta_seconds : null;
+        if (data.stage === 'starting' || data.stage === 'extracting'
+            || data.stage === 'assembling' || data.stage === 'encoding'
+            || data.stage === 'converting') {
+          this.bgConvert.running = true;
+        }
+        return;
+      }
+      if (type === 'bg_convert_done') {
+        this.bgConvert.running = false;
+        this.bgConvert.percent = 100;
+        this.bgConvert.stage = 'done';
+        this.bgConvert.etaSeconds = null;
+        this.bgConvert.resultPath = String(data.path || '');
+        this.bgConvert.resultBytes = Number(data.bytes) || 0;
+        this.bgConvert.message = '转换完成';
+        return;
+      }
+      if (type === 'bg_convert_error') {
+        this.bgConvert.running = false;
+        this.bgConvert.etaSeconds = null;
+        this.bgConvert.error = String(data.message || '转换失败');
+        return;
+      }
+      // ── Playwright 按需组件下载进度（GuiBridge 的 playwright_component_progress）──
+      // 全局单任务，不参与会话 runtime 归属，处理完直接返回；
+      // 进度事件不推断安装态：payload 缺 installed/version 时保留本地原值
+      if (type === 'playwright_component_progress') {
+        const next: PlaywrightComponentStatus = { ...this.playwrightComponent };
+        next.stage = String(data.stage || '');
+        next.percent = Number(data.percent) || 0;
+        next.downloaded_bytes = Number(data.downloaded_bytes) || 0;
+        next.total_bytes = Number(data.total_bytes) || 0;
+        next.error = String(data.error || '');
+        if (typeof data.installed === 'boolean') next.installed = data.installed;
+        if (typeof data.version === 'string') next.version = data.version;
+        // 下载中标记只由阶段决定：downloading/extracting 视为进行中，
+        // done/error 由后端状态机收尾，前端不做额外乐观判断
+        next.downloading = next.stage === 'downloading' || next.stage === 'extracting';
+        if (next.stage === 'done') {
+          next.downloading = false;
+          next.percent = 100;
+        }
+        this.playwrightComponent = next;
+        // 终态事件补一次快照刷新：安装完成时 installed/version 只有磁盘探测才知道
+        if (next.stage === 'done' || next.stage === 'error') {
+          void this.refreshPlaywrightComponentStatus();
+        }
+        return;
+      }
+      // ── ffmpeg 按需组件下载进度（GuiBridge 的 ffmpeg_component_progress）──
+      // 合并口径与 playwright 分支完全一致：进度事件不推断安装态，
+      // downloading 由 stage 推导，终态补一次状态刷新（installed/version 需磁盘探测）
+      if (type === 'ffmpeg_component_progress') {
+        const next: FfmpegComponentStatus = { ...this.ffmpegComponent };
+        next.stage = String(data.stage || '');
+        next.percent = Number(data.percent) || 0;
+        next.downloaded_bytes = Number(data.downloaded_bytes) || 0;
+        next.total_bytes = Number(data.total_bytes) || 0;
+        next.error = String(data.error || '');
+        if (typeof data.installed === 'boolean') next.installed = data.installed;
+        if (typeof data.version === 'string') next.version = data.version;
+        next.downloading = next.stage === 'downloading' || next.stage === 'extracting';
+        if (next.stage === 'done') {
+          next.downloading = false;
+          next.percent = 100;
+        }
+        this.ffmpegComponent = next;
+        if (next.stage === 'done' || next.stage === 'error') {
+          void this.refreshFfmpegComponentStatus();
+        }
+        // 关键：ffmpeg 就绪后要让「已经选好的视频」立即可用。
+        // 预检快照（bgConvert.video）是选视频那一刻算的，里面可能还写着
+        // 「未检测到 ffmpeg」的 blocker；不重算的话用户必须重选视频才能转换。
+        // 只在 done 且确实已选了视频时才重探，没选视频时不做无意义调用
+        if (next.stage === 'done' && this.bgConvert.video) {
+          void this.redescribeBackgroundVideo();
+        }
+        return;
+      }
+      // ── 网页搜索组件下载进度（GuiBridge 的 search_component_progress）──
+      // 合并口径与前两个组件完全一致：进度事件不推断安装态，downloading 由
+      // stage 推导，终态补一次状态刷新（installed/version 只有磁盘探测才知道）
+      if (type === 'search_component_progress') {
+        const next: SearchComponentStatus = { ...this.searchComponent };
+        next.stage = String(data.stage || '');
+        next.percent = Number(data.percent) || 0;
+        next.downloaded_bytes = Number(data.downloaded_bytes) || 0;
+        next.total_bytes = Number(data.total_bytes) || 0;
+        next.error = String(data.error || '');
+        if (typeof data.installed === 'boolean') next.installed = data.installed;
+        if (typeof data.version === 'string') next.version = data.version;
+        next.downloading = next.stage === 'downloading' || next.stage === 'extracting';
+        if (next.stage === 'done') {
+          next.downloading = false;
+          next.percent = 100;
+        }
+        this.searchComponent = next;
+        if (next.stage === 'done' || next.stage === 'error') {
+          void this.refreshSearchComponentStatus();
+        }
+        return;
+      }
+      // 前端构建产物运行期更新（gui_main 的 dist watchdog 推送 fingerprint）：
+      // 触发「资源版本失配自愈」——等界面空闲时自动刷新到最新版本，
+      // 避免旧构建哈希 chunk 404（mermaid 等懒加载失败）；
+      // 不参与会话 runtime 归属，处理完直接返回
+      if (type === 'frontend_dist_updated') {
+        // 把后端 fingerprint（mtime:size）纳入判断：与上次触发刷新的指纹相同
+        // 说明构建并未真正更替，自愈模块会拦下重复刷新（防同一指纹反复整页重载）
+        const fingerprint = typeof data.fingerprint === 'string' ? data.fingerprint : undefined;
+        requestFrontendReload('dist-updated', fingerprint);
         return;
       }
       // frameless 自绘标题栏关闭请求：弹现代确认框（替代 win32 原生 MessageBox），
@@ -2652,6 +5633,95 @@ export const useAppStore = defineStore('app', {
       // frameless 最大化状态变更（原生双击/Snap/拖拽还原路径）：同步到 store
       if (type === 'window_maximize_state') {
         this.windowMaximized = !!data.maximized;
+        return;
+      }
+      // 内嵌浏览器状态推送（宿主 WebView2 控件的导航/标题/加载态回推）：
+      // 独立支路，不参与会话 runtime 归属，合并完直接返回
+      if (type === 'embedded_browser') {
+        this.applyEmbeddedBrowserState(data);
+        return;
+      }
+      // 内置浏览器自动化（星瑶经 CDP 驱动右侧面板浏览器）：携带项目分辨率，
+      // 面板切到浏览器页签并按该分辨率做适应窗口呈现（用户实时围观）。
+      // 独立支路，不参与会话 runtime 归属；页签按会话归属打开——
+      // A 会话发起的自动化不在当前查看的 B 会话抢屏
+      if (type === 'embedded_browser_automation') {
+        const width = Number(data.width);
+        const height = Number(data.height);
+        if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+          // 每次换新数组引用：相同分辨率再次下发时组件侧 watch 也能触发
+          this.embeddedBrowser.automationViewport = [width, height];
+        }
+        // 缺会话归属时只应用分辨率、不打开任何页签：此前回落成「当前查看会话」，
+        // 后台会话改一次分辨率就会在用户正看着的窗口里冒出一个浏览器页签
+        // （2026-10-28 反馈：B 调 browser_set_viewport，页签开到 A）。
+        const session = String(data.session_name || '');
+        if (!session) return;
+        this.openBrowserTabForSession(session);
+        return;
+      }
+      // 内嵌浏览器页签归属（后台会话请求打开/导航）：只在目标会话自己的右栏
+      // 登记页签，不抢当前界面；切回该会话时原生控件才创建并加载地址。
+      if (type === 'embedded_browser_assigned') {
+        const session = String(data.session_name || '');
+        if (!session) return;
+        this.openBrowserTabForSession(session);
+        if (session === this.currentSessionName && data.url) {
+          this.browserNavRequest = { url: String(data.url), path: '', session };
+          this.browserNavNonce += 1;
+        }
+        return;
+      }
+      // 切回持有会话：回放该会话待加载的地址（页签在 assigned 时已开好）
+      if (type === 'embedded_browser_activation') {
+        const session = String(data.session_name || '');
+        if (!session || session !== this.currentSessionName) return;
+        this.openBrowserTabForSession(session);
+        if (data.url) {
+          this.browserNavRequest = { url: String(data.url), path: '', session };
+          this.browserNavNonce += 1;
+        }
+        return;
+      }
+      // 秘书调度台跳转（系统层带用户去看某个会话）：后端 open_session 工具切换
+      // 当前会话后推本事件。视图切换一律复用 switchSession（清流式态、按会话拉
+      // 历史、刷新生效名），这里不另写一套；独立支路，不参与会话 runtime 归属，
+      // 处理完直接返回（切换过程是异步的，故 void 掉，内部自带兜底不抛）
+      if (type === 'open_session') {
+        void this._handleOpenSessionEvent(event);
+        return;
+      }
+      // 决策记录实时推送（JEV 每次决策落审计后由桥转发）：头部「决策」按钮
+      // 累加未读徽章，面板开着时按 tick 拉取刷新；独立支路，不参与会话
+      // runtime 归属，处理完直接返回
+      if (type === 'decision_recorded') {
+        // 入口与徽章口径是「当前会话」：其他会话的决策只让面板按 tick 重拉，
+        // 既不累加未读、也不点亮当前会话入口（否则切到 A 会话会看到 B 的决策）
+        const decisionSession = String(data.session_id || '').trim();
+        if (decisionSession && decisionSession !== this.currentSessionName) {
+          this.decisionEventTick += 1;
+          return;
+        }
+        this.decisionEventTick += 1;
+        // 探针（scene="probe"）只证明链路通了，不算真实决策：与后端
+        // has_business_records 的口径保持一致。否则跑一次探针就会点亮入口，
+        // 而下次启动探测又按 has_business_records=false 把它熄灭（入口闪烁）。
+        if (String(data.scene || '') === 'probe') return;
+        this.decisionUnread += 1;
+        // 刚发生一次真实决策：入口立刻出现，不用等下次启动探测
+        this.decisionHasRecords = true;
+        return;
+      }
+      // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。
+      // 只更新对应会话和回合，不串到当前正在查看的其他会话（规格 16/25.5）
+      if (type === 'turn_undo_updated') {
+        const undoSession = String(data.session_name || '');
+        if (undoSession === this.currentSessionName && data.turn_id) {
+          void this.refreshTurnUndoStates();
+        }
+        if (data.message) {
+          this.notifyChatLocal(String(data.message), 'notice', undoSession || undefined);
+        }
         return;
       }
       // H2 修复：终态事件缺失 session_name 时，不能落到当前显示会话
@@ -2675,7 +5745,17 @@ export const useAppStore = defineStore('app', {
       }
       const targetRuntimeKey = eventSession || currentRuntimeKey;
       const switchedRuntime = targetRuntimeKey !== currentRuntimeKey;
-      if (switchedRuntime) this._bindSessionRuntime(targetRuntimeKey);
+      if (switchedRuntime) {
+        // 绑走前先快照当前会话：翻页 prepend 的历史、推进的分页游标等顶层
+        // 实时进度只在顶层、尚未入快照；直接绑走会被目标会话快照覆盖丢弃，
+        // finally 回绑时拿到旧快照——后台会话有事件到达时，用户刚翻上去的
+        // 历史被反复弹回、再也加载不出来（2026-10-15 用户反馈）。
+        this._captureRuntime(currentRuntimeKey, { skipLayout: true });
+        // 跨会话临时绑定只切换会话数据，不恢复目标会话布局：顶层布局保持
+        // 当前查看会话的实时状态，事件处理完在 finally 原样带回（否则目标
+        // 会话的布局快照会覆盖用户刚对面板做的开合/页签操作）
+        this._bindSessionRuntime(targetRuntimeKey, { skipLayout: true });
+      }
 
       try {
 
@@ -2686,17 +5766,34 @@ export const useAppStore = defineStore('app', {
           this.runningSessions = this.runningSessions.filter(s => s !== finSession);
           // 批次D：终态同时清除排队标记（排队中被停止也会走到这里）
           this.queuedSessions = this.queuedSessions.filter(s => s !== finSession);
+          // 终态已权威到达：停止兜底定时器到此失效，不再需要（也不允许）它插手
+          this._clearStopFallbackTimer(finSession);
+          // 当前 reducer 已绑定到目标 runtime，终态只更新目标会话。
+          this.running = false;
+          this.turnStartedAt = 0;
+          this.subagentTasks = [];
+        } else if (this.running && this.runningSessions.length === 0) {
+          // 反向不一致的自愈：运行会话表是空的、界面却还在运行——终态只可能属于
+          // 当前显示的会话（顶层 running 就是它的运行标记），按当前会话收尾。
+          // 不处理的话这个残留运行态没有任何事件能纠正，用户只能反复点停止。
+          console.warn(`[H2] 终态事件 ${type} 无归属且运行表为空，按当前会话 ${currentRuntimeKey} 收尾`);
+          this._clearStopFallbackTimer(currentRuntimeKey);
+          this.running = false;
+          this.turnStartedAt = 0;
+          this.subagentTasks = [];
         }
-        // 当前 reducer 已绑定到目标 runtime，终态只更新目标会话。
-        this.running = false;
-        this.turnStartedAt = 0;
-        this.subagentTasks = [];
+        // 无法推断归属且运行表非空：按 H2 契约「不更新任何会话运行态」，
+        // 不能像旧实现那样把 this.running 无条件置 false——那会把正在跑的
+        // 当前会话按成空闲，留下 running=false 而 runningSessions 仍有条目
+        // 的反向错态（界面空闲、发送却被排队拦截）。
         // M31 修复：会话列表刷新统一在各终态分支里只做一次，
         // 不再在此处与 turn_finish/turn_cancelled 分支重复触发
       }
 
       if (type === 'turn_start') {
         const turnSession = String(data.session_name || '');
+        // 新回合已经开始：上一轮的停止请求必定已生效，兜底定时器不得再对该会话解锁
+        this._clearStopFallbackTimer(turnSession);
         // 记录活跃会话
         if (turnSession && !this.runningSessions.includes(turnSession)) {
           this.runningSessions.push(turnSession);
@@ -2708,6 +5805,9 @@ export const useAppStore = defineStore('app', {
         this.running = true;
         // 本回合技能收集重置：从这一刻起的 is_skill 工具调用归入本回合
         this.usedSkills = [];
+        // 断点续跑：新回合一开始就丢弃上一回合的续跑入口与待确认清单
+        this.resumePlan = null;
+        this.resumeBlockers = [];
         this.streamingSpeed = 0;
         speedTracker.reset();
         // 记录本轮回合开始时间戳，供"已工作 xx秒"计时（随会话切换恢复，不重置）
@@ -2724,6 +5824,29 @@ export const useAppStore = defineStore('app', {
         );
         if (!alreadyHasUser) {
           this.messages.push({ role: 'user', content: turnUserText });
+        }
+        // 按回合撤销：权威 turn_id 绑定到本轮用户消息（撤销卡片定位键）。
+        // 乐观渲染的消息在 turn_start 到达时补上权威 turnId
+        if (data.turn_id) {
+          for (let i = this.messages.length - 1; i >= 0; i--) {
+            const m = this.messages[i] as ChatMessage;
+            if (m.role === 'user' && m.content === turnUserText && !m.turnId) {
+              m.turnId = String(data.turn_id);
+              break;
+            }
+          }
+        }
+        // 编辑已发送消息：乐观渲染的气泡同样缺数据库 id，靠 turn_start 一并补上。
+        // 不回填的话刚发出的这条要切会话重载历史才拿得到 _msg_id，表现为
+        // 「旧消息能编辑、刚发的不能」，同一个按钮两种行为
+        if (data.user_msg_id) {
+          for (let i = this.messages.length - 1; i >= 0; i--) {
+            const m = this.messages[i] as ChatMessage;
+            if (m.role === 'user' && m.content === turnUserText && !m._msg_id) {
+              m._msg_id = Number(data.user_msg_id);
+              break;
+            }
+          }
         }
         // 占位 assistant：仅当末尾不是空 running 占位时才补（乐观渲染已加则复用）
         const tail = this.messages[this.messages.length - 1];
@@ -2764,16 +5887,18 @@ export const useAppStore = defineStore('app', {
       if (type === 'round_started') {
         // 每个 LLM 轮次一条 assistant 消息：与历史重放的分段结构对齐（分段思考）。
         // 若当前 assistant 气泡还是空的（回合第一轮），幂等跳过。
+        // 轮次边界一律清零流式累积变量：即使尾部混入 error/notice 等非 assistant 消息，
+        // 新气泡也不能继承上一轮正文（否则整回合正文会被塞进同一个气泡）。
+        this.currentStreamingText = '';
+        this.currentThinkingText = '';
+        this.streamingSpeed = 0;
+        speedTracker.reset();
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant' &&
             ((last.reasoning_content && last.reasoning_content.trim()) ||
              (last.content && last.content.trim()) ||
              (last.tool_calls && last.tool_calls.length))) {
           last.execution_state = 'completed';
-          this.currentStreamingText = '';
-          this.currentThinkingText = '';
-          this.streamingSpeed = 0;
-          speedTracker.reset();
           this.messages.push({
             role: 'assistant',
             content: '',
@@ -2787,15 +5912,37 @@ export const useAppStore = defineStore('app', {
         // 后端约 60ms 批量推送，data.text 可能包含多字符/多行，直接拼接即可
         this.currentThinkingText += data.text || '';
         this.streamingSpeed = speedTracker.addChunk(data.text || '');
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
+        let last = this.messages[this.messages.length - 1];
+        if (!last || last.role !== 'assistant') {
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
           last.reasoning_content = this.currentThinkingText;
         }
       } else if (type === 'token_delta') {
         this.currentStreamingText += data.text || '';
         this.streamingSpeed = speedTracker.addChunk(data.text || '');
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
+        let last = this.messages[this.messages.length - 1];
+        if (!last || last.role !== 'assistant') {
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
           last.content = this.currentStreamingText;
         }
       } else if (type === 'message_final') {
@@ -2947,7 +6094,8 @@ export const useAppStore = defineStore('app', {
             items,
             progress,
           };
-          this._captureRuntime(targetRuntimeKey);
+          // 事件中转捕获：跨会话事件跳过布局段（顶层布局仍属当前查看会话）
+          this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         }
       } else if (type === 'plan_item_handoff') {
         // 子 Agent 超时接管可见性：只更新本会话计划项的执行模式/owner，
@@ -2984,7 +6132,8 @@ export const useAppStore = defineStore('app', {
               ...patched,
             } as any);
           }
-          this._captureRuntime(targetRuntimeKey);
+          // 事件中转捕获：跨会话事件跳过布局段（顶层布局仍属当前查看会话）
+          this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         }
       } else if (type === 'user_message_images') {
         // 后端解析附件后补发的图片：挂到当前会话最后一条用户气泡上
@@ -3027,6 +6176,9 @@ export const useAppStore = defineStore('app', {
             })).filter((option: { key: string; label: string }) => option.key && option.label)
             : [],
           functionName: String(data.function_name || ''),
+          undoImpact: (data.undo_impact && typeof data.undo_impact === 'object')
+            ? data.undo_impact
+            : null,
         };
         this.permRequest.show = this.permRequest.sessionName === this.currentSessionName;
         // 非当前窗口等待用户确认 → 黄点
@@ -3035,7 +6187,7 @@ export const useAppStore = defineStore('app', {
         // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留。
         // 必须整体重置：仅 show=false 会残留 reqId/sessionName，
         // switchSession 重显逻辑会把已失效的卡片复活，点击后报“权限响应发送失败”
-        this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '' };
+        this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '', undoImpact: null };
       } else if (type === 'message_queue') {
         // 排队消息全量快照：幂等替换该会话队列。后端在入队/取消/插队/补发
         // 后都会推送，前端不做增量合并，天然免疫事件乱序与丢失漂移
@@ -3055,6 +6207,32 @@ export const useAppStore = defineStore('app', {
             delete this.messageQueues[qSession];
           }
         }
+      } else if (type === 'automation_tasks_changed') {
+        // 星轨自动化：任务全量快照，幂等替换（与 message_queue 快照同模式）
+        const tasks = Array.isArray(data.tasks) ? (data.tasks as AutomationTaskInfo[]) : [];
+        this.automationTasks = tasks;
+      } else if (type === 'workflow_run_progress') {
+        // 星流工作流：解释执行器节点级实时事件（阶段/子代理/命令/产物）
+        const runId = String(data.run_id || '');
+        if (runId) {
+          const list = this.workflowLiveEvents[runId] || [];
+          list.push({
+            run_id: runId,
+            kind: String(data.kind || ''),
+            payload: (data.payload as Record<string, any>) || {},
+          });
+          if (list.length > 100) list.splice(0, list.length - 100);
+          this.workflowLiveEvents[runId] = list;
+        }
+      } else if (type === 'automation_run_updated') {
+        // 星轨自动化：单条运行行更新——按 id 幂等替换或插入历史头部，上限 50 条
+        const run = data.run as AutomationRunInfo | undefined;
+        if (run && run.task_id) {
+          const list = this.automationRuns[run.task_id] || [];
+          const idx = list.findIndex(r => r.id === run.id);
+          const next = idx >= 0 ? list.map(r => (r.id === run.id ? run : r)) : [run, ...list];
+          this.automationRuns = { ...this.automationRuns, [run.task_id]: next.slice(0, 50) };
+        }
       } else if (type === 'notice') {
         // 后端桥事件 notice：写入对应会话的对话流（双端同步的统一回环落点）。
         // 注意必须走本地插入，不能再调 broadcastChatNotice，否则会回环再广播。
@@ -3062,6 +6240,12 @@ export const useAppStore = defineStore('app', {
           const kind = data.kind === 'error' ? 'error' : 'notice';
           const sessionName = data.session_name ? String(data.session_name) : undefined;
           this.notifyChatLocal(String(data.message), kind, sessionName);
+        }
+      } else if (type === 'active_session_changed') {
+        // 多端会话同步：电脑端切换了活动会话，手机端若处于非该会话，点亮提醒点以提示用户
+        const remoteSession = String(data.session_name || '');
+        if (remoteSession && remoteSession !== this.currentSessionName) {
+          this._setSessionStatusDot(remoteSession, 'yellow');
         }
       } else if (type === 'session_renamed') {
         if (this.currentSessionName === data.old) {
@@ -3074,6 +6258,13 @@ export const useAppStore = defineStore('app', {
           this.runningSessions = this.runningSessions.map(s => (s === data.old ? data.new : s));
           // 排队标记同样随重命名迁移
           this.queuedSessions = this.queuedSessions.map(s => (s === data.old ? data.new : s));
+          // 停止兜底定时器同样跟名字走：首轮自动重命名常发生在停止附近，
+          // 留在旧名下到点会因「旧名不在 runningSessions」而静默失效
+          const pendingStopTimer = stopFallbackTimers.get(String(data.old));
+          if (pendingStopTimer !== undefined) {
+            stopFallbackTimers.delete(String(data.old));
+            stopFallbackTimers.set(String(data.new), pendingStopTimer);
+          }
           // 状态提醒点随重命名迁移 key，避免旧 key 残留/丢失
           if (data.old in this.sessionStatusDots) {
             this.sessionStatusDots[data.new] = this.sessionStatusDots[data.old];
@@ -3091,10 +6282,40 @@ export const useAppStore = defineStore('app', {
             }
           });
         });
+      } else if (type === 'session_moved') {
+        // 跨文件夹移动会话（事件可能来自其他客户端，如手机端）：整份覆盖分组列表即可。
+        // 移动只改归属，消息/摘要/token/模型绑定都按 session_id 关联，无需迁移任何会话态
+        if (Array.isArray(data.sessions)) this.sessionGroups = data.sessions;
+        else void this.refreshSessions();
+        // 被移动的正是本端当前会话：工作区标签与文件树跟着切到新目录
+        if (data.name && data.name === this.currentSessionName && data.workdir) {
+          const wd = String(data.workdir);
+          this.workdir = wd;
+          this.currentWorkdirLabel = wd === 'GLOBAL' ? '对话' : (wd.split('\\').pop() || wd);
+          if (wd === 'GLOBAL') {
+            this.fileTree = [];
+            this.fileTreeExpanded = [];
+          } else {
+            this.loadFileTreeInBackground(this.currentSessionName, wd);
+          }
+        }
+      } else if (type === 'session_archived' || type === 'session_unarchived' || type === 'session_deleted') {
+        // 归档态变化（多端同步，含归档区批量删除）：负载带最新两侧快照时直接采用；
+        // 缺失时主动刷新兜底。不做乐观增删——迟到的旧快照不得让已归档会话在主列表里「复活」。
+        if (Array.isArray(data.sessions)) this.sessionGroups = data.sessions;
+        else void this.refreshSessions();
+        if (Array.isArray(data.archived_sessions)) this.archivedSessions = data.archived_sessions;
+        else void this.loadArchivedSessions();
       } else if (type === 'turn_finish' || type === 'turn_idle') {
-        this.running = false;
+        // 归属不明的终态事件（缺 session_name 且无法唯一推断）不碰运行态：
+        // 否则会把正在跑的会话按成空闲，留下 running=false 而 runningSessions
+        // 仍有条目的反向错态——界面看着空闲、发送却被排队拦截
+        if (eventSession) this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
+        // 回合封闭后检查点进入 ready/no_changes：刷新批量撤销状态，
+        // 让本轮文件卡片切到权威净 diff 与撤销按钮
+        void this.refreshTurnUndoStates();
         // turn_finish 只在仍处于 running 时置为 completed；已取消/出错的状态不被覆盖
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
@@ -3106,10 +6327,13 @@ export const useAppStore = defineStore('app', {
         this.refreshTokenUsage();
         // 对话结束后消息数已变化，刷新侧栏会话列表（否则计数停留在启动快照）
         this.refreshSessions();
+        // 按事件会话刷新红点索引：用户可能已切走，此时只刷当前显示会话
+        // 会让这个会话的红点永久缺最后一条
+        void this.refreshNavIndex(eventSession || undefined);
         // 非当前窗口执行完成 → 绿点
         this._setSessionStatusDot(eventSession, 'green');
       } else if (type === 'turn_cancelled') {
-        this.running = false;
+        if (eventSession) this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
         const last = this.messages[this.messages.length - 1];
@@ -3122,14 +6346,35 @@ export const useAppStore = defineStore('app', {
         this.subagentTasks = [];
         this.refreshTokenUsage();
         this.refreshSessions();
+        // 取消的回合里用户消息同样已落库：不刷新则红点缺这一条
+        void this.refreshNavIndex(eventSession || undefined);
       } else if (type === 'turn_error') {
-        // 终态错误（toast 由随后的 error 事件负责展示）
-        this.running = false;
+        const errorMsg = String(data.message || data.error || '');
+        if (eventSession) this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
+        let last = this.messages[this.messages.length - 1];
+        if (!last || last.role !== 'assistant') {
+          // 末尾不是 assistant 时（如中途接入、缺少占位或提问后立即报错），
+          // 补齐带 execution_state='error' 与 error_note 的助手卡片，确保各端必能看到报错
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'error',
+            error_note: errorMsg,
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
           last.execution_state = reduceExecutionState(last.execution_state, 'turn_error');
+          if (errorMsg) {
+            if (!last.error_note || !last.error_note.split('\n').includes(errorMsg)) {
+              last.error_note = last.error_note ? last.error_note + '\n' + errorMsg : errorMsg;
+            }
+          }
         }
         this.currentStreamingText = '';
         this.currentThinkingText = '';
@@ -3137,8 +6382,13 @@ export const useAppStore = defineStore('app', {
         // Low 修复：turn_error 也补一次会话列表刷新（此前仅在公共终态块中
         // 按 runningSessions 为空兜底，与 turn_finish 重复且 turn_error 无覆盖）
         this.refreshSessions();
+        // 报错的回合里用户消息同样已落库：不刷新则红点缺这一条
+        void this.refreshNavIndex(eventSession || undefined);
         // 非当前窗口报错中断 → 红点
         this._setSessionStatusDot(eventSession, 'red');
+        // 断点续跑（S4）：问一次后端「这回合能不能续」。开关关闭时后端回 disabled，
+        // 快照保持为空、按钮不出现（R-T1：关闭态界面零变化）。
+        void this.loadResumePlan(eventSession || this.currentSessionName);
       } else if (type === 'token_usage') {
         this.tokenUsage = normalizeTokenUsage(data);
       } else if (type === 'token_usage_updated') {
@@ -3168,6 +6418,9 @@ export const useAppStore = defineStore('app', {
           if (newId || newName) {
             this._sessionModelVersion[eventSession] = (this._sessionModelVersion[eventSession] || 0) + 1;
           }
+          // 系统设置里的「当前模型电脑操控资格」跟着生效模型走，换模型后
+          // 旧快照立刻过期；后台静默重拉，设置页再打开时不会是陈旧的模型名
+          void this.refreshSystemSettings({ silent: true });
         }
       } else if (type === 'file_tree_loaded') {
         // 异步文件树加载完成（后端 _async_load_file_tree 推送）：
@@ -3177,6 +6430,16 @@ export const useAppStore = defineStore('app', {
         const treeWorkdir = String(data.workdir || '');
         if (treeWorkdir && treeWorkdir === this.workdir) {
           this.fileTree = Array.isArray(data.file_tree) ? data.file_tree : [];
+        }
+      } else if (type === 'skills_loaded') {
+        // 异步技能扫描完成（后端 _async_build_skill_list 推送）：
+        // get_initial_state 不再同步扫盘（冷盘首次可达 25s+，会让已出现的窗口一直转圈），
+        // 改为先返回上次缓存、后台扫完通过此事件推送到前端刷新技能页与 / 补全候选。
+        if (Array.isArray(data.skills)) {
+          this.skills = data.skills;
+          // 事件已到达即代表"扫描结束"，无论结果是否为空：空列表是真实的"无技能"，
+          // 技能页据此从"加载中"切回"暂无可用技能"
+          this.skillsLoading = false;
         }
       } else if (type === 'mcp_status') {
         if (data.mcps) this.mcps = data.mcps;
@@ -3199,16 +6462,14 @@ export const useAppStore = defineStore('app', {
         } else {
           (msg.legacy_diffs ??= []).push(diff);
         }
-      } else if (type === 'subagent_progress') {
+        } else if (type === 'subagent_progress') {
         const d = data as SubagentProgressEventData;
-        // 快照归属到当前仍在串行运行的 run_subagent 调用；该调用完成后
-        // 不再接受更新，最后一次快照自然冻结在调用上
+        // 快照按「派生它的 run_subagent 调用」分组：每张卡片只展示自己创建
+        // 的子代理，绝不把会话内所有（含历史）子代理堆到同一张卡上。
         const last = this.messages[this.messages.length - 1];
         if (!last || last.role !== 'assistant') return;
-        const target = [...(last.tool_calls || [])]
-          .reverse()
-          .find(c => c.name === 'run_subagent' && !c.result);
-        if (!target) return;
+        const calls = (last.tool_calls || []).filter(c => c.name === 'run_subagent');
+        if (!calls.length) return;
         const snapshots = (d.tasks || []).map((t: any): SubagentTaskSnapshot => ({
           id: String(t.id || ''),
           description: String(t.description || ''),
@@ -3216,8 +6477,40 @@ export const useAppStore = defineStore('app', {
           stage: String(t.stage || ''),
           ...(t.stage_detail ? { stage_detail: String(t.stage_detail) } : {}),
           elapsed: Number(t.elapsed || 0),
+          ...(t.type ? { type: String(t.type) } : {}),
+          ...(t.background ? { background: true } : {}),
+          ...(t.tool_call_id ? { tool_call_id: String(t.tool_call_id) } : {}),
+          ...(Array.isArray(t.stages) ? {
+            stages: t.stages.map((s: any) => ({
+              name: String(s.name || ''),
+              at: Number(s.at) || 0,
+              detail: String(s.detail || ''),
+            })),
+          } : {}),
         }));
-        target.subagent_tasks = snapshots;
+        // 按调用 id 分组后整体替换（事件每轮携带全会话快照，追加会重复）；
+        // 无归属 id 的快照（后台任务 / 旧后端）沿用旧语义：挂到仍在串行
+        // 运行的那个调用上。有归属 id 但不在本条消息里的，属于更早回合的
+        // 卡片，这里不重复展示（否则又退化回"全会话聚合"）。
+        const orphans: SubagentTaskSnapshot[] = [];
+        const grouped = new Map<string, SubagentTaskSnapshot[]>();
+        for (const snapshot of snapshots) {
+          if (!snapshot.tool_call_id) {
+            orphans.push(snapshot);
+            continue;
+          }
+          const bucket = grouped.get(snapshot.tool_call_id) ?? [];
+          bucket.push(snapshot);
+          grouped.set(snapshot.tool_call_id, bucket);
+        }
+        for (const call of calls) {
+          const own = grouped.get(call.id);
+          if (own) call.subagent_tasks = own;
+        }
+        if (orphans.length) {
+          const target = [...calls].reverse().find(c => !c.result);
+          if (target) target.subagent_tasks = orphans;
+        }
         this.subagentTasks = snapshots;
       } else if (type === 'background_subagent_terminal') {
         const statusLabel: Record<string, string> = {
@@ -3225,34 +6518,38 @@ export const useAppStore = defineStore('app', {
         };
         const label = statusLabel[data.status] || data.status;
         const desc = data.description ? `：${data.description}` : '';
+        // 按归属会话路由（eventSession 来自 data.session_name）：提示落在
+        // 任务所属会话，不串到用户正在查看的其他会话
         if (data.status === 'completed') {
-          this.notifyChatLocal(`后台子代理${label}${desc}`);
+          this.notifyChatLocal(`后台子代理${label}${desc}`, 'notice', eventSession);
         } else {
           // 与 error 事件一致：回合进行中不插队，挂在当前助手消息上展示
           const last = this.messages[this.messages.length - 1];
           if (last && last.role === 'assistant') {
             last.error_note = `后台子代理${label}${desc}`;
-            this.notifyChatLocal(`后台子代理${label}${desc}`);
+            this.notifyChatLocal(`后台子代理${label}${desc}`, 'notice', eventSession);
           } else {
             this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
           }
         }
       } else if (type === 'background_task_finished') {
-        // 后台命令任务（execute_command 的 run_in_background，如打包）完成通知
+        // 后台命令任务（execute_command 的 run_in_background，如打包）完成通知；
+        // 按归属会话路由，缺省（旧后端）才落到当前会话
         const code = Number(data.returncode);
         const tid = String(data.task_id || '');
         const statusText = code === 0 ? '已完成' : `已结束（退出码 ${code}）`;
-        this.notifyChatLocal(`后台任务 ${tid} ${statusText}`);
-      } else if (type === 'terminal_output') {
-        this.terminalOutput += data.text || '';
-        // 输出上限 200K 字符：超出后从头部截断，避免长任务把内存拖爆
-        if (this.terminalOutput.length > 200_000) {
-          this.terminalOutput = '…[输出过长，头部已截断]\n' + this.terminalOutput.slice(-160_000);
-        }
-      } else if (type === 'terminal_finished') {
-        this.terminalRunning = false;
-        const code = data.code;
-        this.terminalOutput += `\n[进程已退出，代码 ${code}]\n\n`;
+        this.notifyChatLocal(`后台任务 ${tid} ${statusText}`, 'notice', String(data.session_name || '') || undefined);
+      } else if (type === 'pty_data') {
+        // 底部内嵌交互式终端：原始输出直接走 ptyBus 给 xterm，不进响应式状态
+        emitPtyData(String(data.text ?? ''));
+      } else if (type === 'pty_exit') {
+        emitPtyExit(Number(data.code ?? 0));
+      } else if (type === 'snip_attachment_ready') {
+        // 屏幕截图「发到输入框」（宿主 gui_snip_mixin.SnipBridgeMixin）：把
+        // 回传的图片路径加入当前会话输入框附件。与 pty_data 同约定——必须
+        // 接进本函数这条既有 type-if 链（window.onBridgeEvent 唯一赋值点），
+        // 另开通道等于绕开单消费者约定
+        void this._attachSnipToComposer(String(data.path || ''));
       } else if (type === 'update_download_progress') {
         this.updateState.status = 'downloading';
         this.updateState.downloadProgress = Number(data.percent) || 0;
@@ -3269,20 +6566,21 @@ export const useAppStore = defineStore('app', {
         this.notifyModal('更新下载失败', `下载安装包时出错：${data.message || '未知错误'}`);
       } else if (type === 'error') {
         const msgText = String(data.message || '运行错误');
-        // 回合进行中：错误挂在当前助手消息上展示，避免插队成独立 error 消息
-        // 破坏"最后一条是 assistant"的事件契约（否则后续 tool_finish 会抛错、
-        // "正在干活"指示器卡死）。回合结束/空闲时的错误仍写入对话流。
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
-          // Low 修复：多条错误累计展示，不再被最后一条覆盖
-          last.error_note = last.error_note ? last.error_note + '\n' + msgText : msgText;
-          this.notifyChatLocal(msgText);
+          // 避免与 turn_error 重复追加完全相同的错误文本
+          if (!last.error_note || !last.error_note.split('\n').includes(msgText)) {
+            last.error_note = last.error_note ? last.error_note + '\n' + msgText : msgText;
+          }
+          this.notifyChatLocal(msgText, 'notice', eventSession);
         } else {
           this.messages.push({ role: 'error', content: msgText });
         }
       }
       } finally {
-        this._captureRuntime(targetRuntimeKey);
+        // 同会话事件全量捕获（用户的面板开合由此落入快照）；跨会话事件
+        // 跳过布局段，避免把当前会话的实时布局写进目标会话的快照
+        this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         if (type === 'session_renamed' && data.old && data.new) {
           const oldKey = String(data.old);
           const newKey = String(data.new);
@@ -3292,7 +6590,10 @@ export const useAppStore = defineStore('app', {
           }
           if (this.currentSessionName === newKey) this._bindSessionRuntime(newKey);
         } else if (switchedRuntime) {
-          this._bindSessionRuntime(currentRuntimeKey);
+          // 回绑只恢复会话数据（消息/流式/运行态等），不恢复面板布局：
+          // 用户在事件间隙对右面板做的开合是实时操作面，被旧快照回滚即
+          // "切换面板点了没反应/自动弹回"的根因
+          this._bindSessionRuntime(currentRuntimeKey, { skipLayout: true });
         }
       }
     },
@@ -3384,12 +6685,65 @@ export const useAppStore = defineStore('app', {
         const res = await api.toggle_skill(skillId, enabled);
         if (res && res.ok) {
           this.skills = res.skills || this.skills;
+          // 同步交互拿到的是最终列表（后端已顺带更新其缓存），结束"加载中"态
+          this.skillsLoading = false;
         } else {
           this.notifyModal('技能', '切换技能状态失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
         this.notifyModal('技能', '切换技能状态失败: ' + err);
+      }
+    },
+
+    async refreshSkills(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        if (api.refresh_skills) {
+          const res = await api.refresh_skills();
+          if (res && res.ok && Array.isArray(res.skills)) {
+            this.skills = res.skills;
+            // 手动刷新拿到的是最终结果，结束"加载中"态
+            this.skillsLoading = false;
+            return true;
+          }
+        }
+        if (api.get_skills) {
+          const skills = await api.get_skills();
+          if (Array.isArray(skills)) {
+            this.skills = skills;
+            this.skillsLoading = false;
+            return true;
+          }
+        }
+        return false;
+      } catch (err) {
+        this.notifyModal('技能', '刷新技能列表失败: ' + err);
+        return false;
+      }
+    },
+
+    // 恢复内置版本：用内置源覆盖用户改动后的技能副本。
+    // 与 refreshSkills 同风格——成功时直接用后端回传的 skills 覆盖列表，
+    // 失败统一走 notifyModal 提示 msg，不静默吞掉错误。
+    async restoreSkill(skillId: string): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.restore_skill(skillId);
+        if (res && res.ok && Array.isArray(res.skills)) {
+          this.skills = res.skills;
+          // 同步交互拿到的是最终列表，结束"加载中"态
+          this.skillsLoading = false;
+          return true;
+        }
+        this.notifyModal('技能', '恢复内置版本失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('技能', '恢复内置版本失败: ' + err);
+        return false;
       }
     },
 
@@ -3428,6 +6782,24 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 删除自定义 MCP 服务：从 mcp.json 移除配置，结果通过 mcp_status 事件回推
+    async removeMcpServer(name: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.remove_mcp_server(name);
+        if (res && res.ok) {
+          this.mcps = res.mcps || this.mcps;
+          this.notifyModal('MCP 服务', res.msg || '已删除');
+        } else {
+          this.notifyModal('MCP 服务', '删除失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('MCP 服务', '删除 MCP 服务失败: ' + err);
+      }
+    },
+
     async refreshPlugins() {
       const api = this._api();
       if (!api) return;
@@ -3449,6 +6821,11 @@ export const useAppStore = defineStore('app', {
         const res = await api.toggle_plugin(name, enabled);
         if (res && res.ok) {
           this.plugins = res.plugins || this.plugins;
+          // 插件启停会增删 provider 与模型（opencode_zen 启用时自举 provider、
+          // 禁用时按来源标记回收），只更新 plugins 会让模型列表停在旧快照，
+          // 用户必须重启星瑶才能看到变化。与 add_provider 同一模式：
+          // 后端回传 settings 就即时应用，模型选择器随开关立即刷新。
+          if (res.settings) this.applyModelSettings(res.settings);
           this.notifyModal('插件', res.msg || '插件状态已更新');
         } else {
           this.notifyModal('插件', '插件状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -3473,6 +6850,397 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyModal('插件', '插件信任失败: ' + err);
+      }
+    },
+
+    // 插件设置页：页面快照由插件每次返回完整结构（服务端驱动），前端不做增量合并。
+    async loadPluginSettings(name: string): Promise<any> {
+      const api = this._api();
+      if (!api || typeof api.get_plugin_settings !== 'function') {
+        return { ok: false, msg: '当前版本不支持插件设置页' };
+      }
+      try {
+        return await api.get_plugin_settings(name);
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: '读取插件设置页失败: ' + err };
+      }
+    },
+
+    async runPluginSettingsAction(name: string, action: string, params: Record<string, unknown> = {}): Promise<any> {
+      const api = this._api();
+      if (!api || typeof api.run_plugin_settings_action !== 'function') {
+        return { ok: false, msg: '当前版本不支持插件设置动作' };
+      }
+      try {
+        return await api.run_plugin_settings_action(name, action, params);
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: '执行插件动作失败: ' + err };
+      }
+    },
+
+    async openExternalUrl(url: string): Promise<boolean> {
+      const api = this._api();
+      if (!api || typeof api.open_external_url !== 'function') return false;
+      try {
+        const res = await api.open_external_url(url);
+        return !!(res && res.ok);
+      } catch {
+        return false;
+      }
+    },
+
+    // C11：Hook 信任状态刷新（启动/切会话/信任动作后重拉最新快照）
+    async refreshHooks() {
+      const api = this._api();
+      // 旧桥接没有 get_hooks：静默跳过，信任卡片不显示
+      if (!api || typeof api.get_hooks !== 'function') return;
+      // 序号防护：过期响应不覆盖新快照
+      const seq = ++this.hooksReqSeq;
+      this.hooksLoading = true;
+      try {
+        const res = await api.get_hooks();
+        if (seq !== this.hooksReqSeq) return;
+        if (res && res.ok) this.hooks = res.hooks || [];
+      } catch {
+        // 静默失败，保留现有列表
+      } finally {
+        if (seq === this.hooksReqSeq) this.hooksLoading = false;
+      }
+    },
+
+    // C11：Hook 信任动作统一入口（method: grant/deny/revoke/reset_hook_trust）
+    async _hookTrustAction(this: any, method: string, digest: string) {
+      const api = this._api();
+      if (!api || typeof (api as any)[method] !== 'function') return;
+      try {
+        const res = await (api as any)[method](digest);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+          // 递增刷新序号：本次动作已拿到最新快照，在途的旧 refreshHooks 响应作废
+          this.hooksReqSeq++;
+        } else if (res && res.msg) {
+          this.notifyModal('Hook 信任', res.msg);
+        }
+      } catch (err) {
+        // 连接状态由事件流维护：信任动作失败不等于桥接断线，不在此误置 connected
+        console.error('Hook 信任操作失败:', err);
+        this.notifyModal('Hook 信任', 'Hook 信任操作失败: ' + err);
+      }
+    },
+
+    grantHookTrust(digest: string) { return this._hookTrustAction('grant_hook_trust', digest); },
+    denyHookTrust(digest: string) { return this._hookTrustAction('deny_hook_trust', digest); },
+    revokeHookTrust(digest: string) { return this._hookTrustAction('revoke_hook_trust', digest); },
+    resetHookTrust(digest: string) { return this._hookTrustAction('reset_hook_trust', digest); },
+
+    // C13：Hook 手动配置（新建/编辑/删除/启停；成功后回传刷新列表，失败返回 { ok:false, msg } 由调用方提示）
+    async saveHook(payload: Record<string, any>): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.save_hook(payload);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+          // 递增刷新序号：本次动作已拿到最新快照，在途的旧 refreshHooks 响应作废
+          this.hooksReqSeq++;
+          return { ok: true };
+        }
+        return { ok: false, msg: (res && res.msg) || '保存 Hook 失败' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async deleteHook(sourcePath: string, digest: string): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.delete_hook(sourcePath, digest);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+          this.hooksReqSeq++;
+          return { ok: true };
+        }
+        return { ok: false, msg: (res && res.msg) || '删除 Hook 失败' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async setHookDisabled(sourcePath: string, digest: string, disabled: boolean): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.set_hook_disabled(sourcePath, digest, disabled);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+          this.hooksReqSeq++;
+          return { ok: true };
+        }
+        return { ok: false, msg: (res && res.msg) || (disabled ? '禁用 Hook 失败' : '启用 Hook 失败') };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    // C11：一键信任/拒绝全部待决项目级 Hook（先快照数组，逐个串行避免遍历中变更）
+    async grantAllPendingHookTrusts() {
+      const pending = [...this.pendingProjectHooks];
+      for (const hook of pending) {
+        await this.grantHookTrust(hook.digest);
+      }
+    },
+
+    async denyAllPendingHookTrusts() {
+      const pending = [...this.pendingProjectHooks];
+      for (const hook of pending) {
+        await this.denyHookTrust(hook.digest);
+      }
+    },
+
+    // ---- 星流工作流（ZCode 导入）----
+    async refreshWorkflows(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      this.workflowsLoading = true;
+      try {
+        const res = await api.get_workflows(this.workdir || '');
+        if (res && res.ok && Array.isArray(res.workflows)) {
+          this.workflows = res.workflows;
+          this.workflowInvalid = Array.isArray(res.invalid) ? res.invalid : [];
+          return true;
+        }
+        return false;
+      } catch (err) {
+        this.notifyModal('星流工作流', '读取工作流清单失败: ' + err);
+        return false;
+      } finally {
+        this.workflowsLoading = false;
+      }
+    },
+
+    async pickWorkflowFiles(): Promise<string[] | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.pick_workflow_files();
+        if (res && res.ok && Array.isArray(res.paths) && res.paths.length) return res.paths;
+        return null; // 取消 / 未选 / 桥失败都按「无文件」处理
+      } catch {
+        return null;
+      }
+    },
+
+    async importWorkflows(
+      paths: string[],
+      scope: 'project' | 'user',
+      overwrite = false,
+    ): Promise<{ imported: WorkflowImportedItem[]; failed: WorkflowImportFailure[] | null }> {
+      const api = this._api();
+      if (!api) {
+        this.notifyModal('星流工作流', '桥未就绪');
+        return { imported: [], failed: null };
+      }
+      try {
+        const res = await api.import_workflows(paths, this.workdir || '', scope, overwrite);
+        if (res && res.ok) {
+          await this.refreshWorkflows();
+          return {
+            imported: (res.imported || []).map(i => ({ name: i.name, path: i.path })),
+            failed: res.failed || [],
+          };
+        }
+        this.notifyModal('星流工作流', '导入失败: ' + ((res && res.msg) || '未知错误'));
+        return { imported: [], failed: null };
+      } catch (err) {
+        this.notifyModal('星流工作流', '导入失败: ' + err);
+        return { imported: [], failed: null };
+      }
+    },
+
+    async saveWorkflow(payload: {
+      name: string;
+      description: string;
+      when_to_use?: string;
+      args?: Record<string, any>;
+      body: string;
+      scope: 'project' | 'user';
+      overwrite?: boolean;
+    }): Promise<{ ok: boolean; errors?: string[]; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, errors: ['桥未就绪'] };
+      try {
+        const res = await api.save_workflow({ ...payload, workspace_root: this.workdir || '' });
+        if (res && res.ok) await this.refreshWorkflows();
+        return res || { ok: false, errors: ['未知错误'] };
+      } catch (err) {
+        return { ok: false, errors: [String(err)] };
+      }
+    },
+
+    async deleteWorkflow(name: string, scope: 'project' | 'user'): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.delete_workflow(name, scope, this.workdir || '');
+        if (res && res.ok) {
+          await this.refreshWorkflows();
+          return true;
+        }
+        this.notifyModal('星流工作流', '删除失败: ' + ((res && res.msg) || '未知错误'));
+        return false;
+      } catch (err) {
+        this.notifyModal('星流工作流', '删除失败: ' + err);
+        return false;
+      }
+    },
+
+    async loadWorkflowDetail(name: string): Promise<(WorkflowInfo & { body?: string }) | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_workflow_detail(name, this.workdir || '');
+        if (res && res.ok && res.workflow) return res.workflow;
+        return null;
+      } catch {
+        return null;
+      }
+    },
+
+    async loadWorkflowRuns(name: string): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.get_workflow_runs(name, 20);
+        if (res && res.ok) {
+          this.workflowRuns[name] = res.runs || [];
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    },
+
+    async clearWorkflowRuns(name: string): Promise<void> {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.clear_workflow_runs(name);
+        if (res && res.ok) await this.loadWorkflowRuns(name);
+      } catch {
+        /* 清空失败静默：下次加载仍显示旧历史 */
+      }
+    },
+
+    // 预填当前会话输入框（星流面板「通过对话创建」等工作流引导用）：
+    // 只写草稿不发送，用户在对话里补全描述后自行回车
+    prefillComposer(text: string) {
+      this._getSessionRuntime().composerText = text;
+    },
+
+    // ---- 星轨自动化任务 ----
+    async refreshAutomations(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.get_automation_tasks();
+        if (res && res.ok && Array.isArray(res.tasks)) {
+          this.automationTasks = res.tasks;
+          return true;
+        }
+        return false;
+      } catch (err) {
+        this.notifyModal('星轨自动化任务', '读取星轨自动化任务失败: ' + err);
+        return false;
+      }
+    },
+
+    async saveAutomationTask(task: Record<string, any>): Promise<{ ok: boolean; errors?: string[]; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.save_automation_task(task);
+        // 字段校验错误原样透传给表单逐条展示
+        if (res && !res.ok && Array.isArray(res.errors)) return res;
+        if (res && res.ok) await this.refreshAutomations();
+        return res || { ok: false, msg: '未知错误' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async toggleAutomationTask(taskId: string, enabled: boolean) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_automation_task_enabled(taskId, enabled);
+        if (!res || !res.ok) {
+          this.notifyModal('星轨自动化任务', '启停失败: ' + ((res && res.msg) || '未知错误'));
+        }
+      } catch (err) {
+        this.notifyModal('星轨自动化任务', '启停失败: ' + err);
+      }
+    },
+
+    async deleteAutomationTask(taskId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.delete_automation_task(taskId);
+        if (res && res.ok) {
+          const runs = { ...this.automationRuns };
+          delete runs[taskId];
+          this.automationRuns = runs;
+          await this.refreshAutomations();
+        } else {
+          this.notifyModal('星轨自动化任务', '删除失败: ' + ((res && res.msg) || '未知错误'));
+        }
+      } catch (err) {
+        this.notifyModal('星轨自动化任务', '删除失败: ' + err);
+      }
+    },
+
+    async runAutomationTaskNow(taskId: string): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.run_automation_task_now(taskId);
+        if (res && !res.ok && res.msg) {
+          this.notifyModal('星轨自动化任务', res.msg);
+        }
+        return res || { ok: false, msg: '未知错误' };
+      } catch (err) {
+        this.notifyModal('星轨自动化任务', '执行失败: ' + err);
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async loadAutomationRuns(taskId: string, limit = 50) {
+      const api = this._api();
+      if (!api || !taskId) return;
+      try {
+        const res = await api.get_automation_runs(taskId, limit);
+        if (res && res.ok && Array.isArray(res.runs)) {
+          this.automationRuns = { ...this.automationRuns, [taskId]: res.runs };
+        }
+      } catch {
+        // 历史加载失败不打断页面，重开抽屉会重试
+      }
+    },
+
+    async clearAutomationRuns(taskId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.clear_automation_runs(taskId);
+        if (res && res.ok) {
+          this.automationRuns = { ...this.automationRuns, [taskId]: [] };
+        }
+      } catch {
+        // 同上：静默重试路径
       }
     },
 
@@ -3507,42 +7275,84 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    // ---------------- 内嵌终端 ----------------
-    async runTerminalCommand(command: string) {
-      const cmd = (command || '').trim();
-      if (!cmd || this.terminalRunning) return;
-      const api = this._api();
-      if (!api) return;
-      this.terminalOutput += `$ ${cmd}\n`;
-      this.terminalRunning = true;
+    // 斜杠命令清单：只读接口、无副作用，加载失败时保持空数组（补全面板自动
+    // 退化为技能 + MCP 两路候选），绝不向前端抛错打断输入
+    async loadSlashCommands() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.list_slash_commands !== 'function') return;
       try {
-        const res = await api.run_terminal_command(cmd);
-        if (!res || !res.ok) {
-          this.terminalRunning = false;
-          this.terminalOutput += `[启动失败: ${(res && res.msg) || '未知错误'}]\n`;
+        const res = await api.list_slash_commands();
+        if (res && res.ok && Array.isArray(res.commands)) {
+          this.slashCommands = res.commands;
         }
       } catch (err) {
-        this.terminalRunning = false;
-        this.terminalOutput += `[启动失败: ${err}]\n`;
+        // 旧版桥没有该方法 / 桥报错：静默保持既有清单
+        console.error('加载斜杠命令清单失败:', err);
       }
     },
 
-    async killTerminalCommand() {
-      const api = this._api();
-      if (!api) return;
+    // ---------------- /goal 目标状态（GoalBar 数据源） ----------------
+
+    // 拉取当前会话的目标状态：没有目标、接口缺失或桥报错一律写 null，
+    // 状态条据此静默隐藏——目标模式是辅助功能，不能因为读状态失败打断对话。
+    // 序号 + 会话名双重防护：轮询请求可能跨会话返回，过期响应不能覆盖新会话。
+    async loadGoalState() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.get_goal_state !== 'function') return;
+      const session = this.currentSessionName;
+      const seq = ++this.goalStateReqSeq;
       try {
-        const res = await api.kill_terminal_command();
-        if (!res || !res.ok) {
-          this.notifyModal('后台任务', (res && res.msg) || '终止命令失败');
+        const res = await api.get_goal_state(session);
+        if (seq !== this.goalStateReqSeq || session !== this.currentSessionName) return;
+        this.goalState = res && res.ok ? (res.state ?? null) : null;
+      } catch {
+        // 静默失败但清空：读不到就当作没有目标，避免旧会话的状态条一直挂着
+        if (seq === this.goalStateReqSeq && session === this.currentSessionName) {
+          this.goalState = null;
         }
-      } catch (err) {
-        this.notifyModal('后台任务', '终止命令失败: ' + err);
       }
     },
 
-    clearTerminal() {
-      this.terminalOutput = '';
+    // 状态条「停止」：桥里复用 /goal stop 的取消语义（含 awaiting_confirm 的状态
+    // 收敛），调用后立刻重拉状态，让按钮切换与徽标更新不必等下一次轮询
+    async stopGoal() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.goal_stop !== 'function') return;
+      try {
+        await api.goal_stop(this.currentSessionName);
+      } catch (err) {
+        console.error('停止目标失败:', err);
+      }
+      await this.loadGoalState();
     },
+
+    // 状态条「继续」：桥里复用 /goal resume（仅 blocked/stopped/interrupted 可恢复，
+    // 其余状态由后端给出提示），同样调用后重拉状态刷新按钮
+    async resumeGoal() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.goal_resume !== 'function') return;
+      try {
+        await api.goal_resume(this.currentSessionName);
+      } catch (err) {
+        console.error('恢复目标失败:', err);
+      }
+      await this.loadGoalState();
+    },
+
+    // 状态条「确认达成」：自评档的达成标记不可信，循环停在 awaiting_confirm 等
+    // 用户点头；后端 /goal confirm 只认这个状态，调用后重拉让徽标变「已完成」
+    async confirmGoal() {
+      const api = window.pywebview && window.pywebview.api;
+      if (!api || typeof api.goal_confirm !== 'function') return;
+      try {
+        await api.goal_confirm(this.currentSessionName);
+      } catch (err) {
+        console.error('确认目标达成失败:', err);
+      }
+      await this.loadGoalState();
+    },
+
+    // ---------------- 内嵌终端（右侧面板版已下线，交互式终端见 ptyTerminal*） ----------------
 
     async exportSession(fmt: 'md' | 'html' | 'json') {
       const api = this._api();
@@ -3596,27 +7406,119 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async undoLastEdit() {
-      const ok = await this.askConfirm(
-        '撤销文件修改',
-        `此操作将撤销${this.agentName}最近一次的文件改动`,
-        `撤销${this.agentName}上一次的文件修改？`,
-        '确定撤销 ⏎'
-      );
-      if (!ok) return;
+    // ------------------------------------------------------------------
+    // 按回合撤销（规格 16）：批量状态、预检/执行、惰性 diff、中断恢复
+    // ------------------------------------------------------------------
 
+    async refreshTurnUndoStates() {
       const api = this._api();
-      if (!api) return;
+      const session = this.currentSessionName;
+      if (!api || !session || !api.list_turn_undo_states) return;
+      const seq = ++this.turnUndoReqSeq;
       try {
-        const res = await api.undo_last_edit();
-        if (res && res.ok) {
-          this.notifyChat(res.msg || '已撤销上一次文件修改');
-        } else {
-          this.notifyChat('撤销失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        const res = await api.list_turn_undo_states(session);
+        if (seq !== this.turnUndoReqSeq || !res || !res.ok) return;
+        const map: Record<string, TurnUndoStateSummary> = {};
+        for (const state of res.states || []) {
+          map[state.turn_id] = state;
         }
+        this.turnUndoStates = map;
+      } catch {
+        // 批量状态查询失败不打断会话；卡片退回旧展示
+      }
+    },
+
+    async previewTurnUndo(turnId: string):
+        Promise<{ preview: TurnUndoPreviewPayload; token: string } | null> {
+      const api = this._api();
+      if (!api || !api.preview_turn_undo) return null;
+      try {
+        const res = await api.preview_turn_undo(this.currentSessionName, turnId);
+        if (res && res.ok) {
+          return { preview: res.preview, token: res.preview_token || '' };
+        }
+        this.notifyChat(res.msg || '预检失败');
+        return null;
       } catch (err) {
-        this.connected = false;
+        this.notifyChat('预检失败: ' + err);
+        return null;
+      }
+    },
+
+    async executeTurnUndo(turnId: string, previewToken: string): Promise<TurnUndoExecutePayload | null> {
+      const api = this._api();
+      if (!api || !api.execute_turn_undo) return null;
+      try {
+        const res = await api.execute_turn_undo(this.currentSessionName, turnId, previewToken);
+        if (res && res.ok) {
+          await this.refreshTurnUndoStates();
+          return res.result;
+        }
+        this.notifyChat(res.msg || '撤销失败');
+        await this.refreshTurnUndoStates();
+        return null;
+      } catch (err) {
         this.notifyChat('撤销失败: ' + err);
+        return null;
+      }
+    },
+
+    async fetchTurnUndoStatus(turnId: string) {
+      const api = this._api();
+      if (!api || !api.get_turn_undo_status) return null;
+      try {
+        const res = await api.get_turn_undo_status(this.currentSessionName, turnId);
+        return res && res.ok ? res.status : null;
+      } catch {
+        return null;
+      }
+    },
+
+    async fetchTurnUndoFileDiff(turnId: string, fileId: string) {
+      const api = this._api();
+      if (!api || !api.get_turn_undo_file_diff) return null;
+      try {
+        const res = await api.get_turn_undo_file_diff(this.currentSessionName, turnId, fileId);
+        return res && res.ok ? res.diff : null;
+      } catch {
+        return null;
+      }
+    },
+
+    async previewTurnUndoRecovery(operationId: string, action: 'continue_revert' | 'cancel_revert'):
+        Promise<{ preview: TurnUndoRecoveryPreviewPayload; token: string } | null> {
+      const api = this._api();
+      if (!api || !api.preview_turn_undo_recovery) return null;
+      try {
+        const res = await api.preview_turn_undo_recovery(this.currentSessionName, operationId, action);
+        if (res && res.ok) {
+          return { preview: res.preview, token: res.preview_token || '' };
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+
+    async executeTurnUndoRecovery(
+      operationId: string, action: 'continue_revert' | 'cancel_revert', previewToken: string,
+    ): Promise<TurnUndoRecoveryExecutePayload | null> {
+      const api = this._api();
+      if (!api || !api.execute_turn_undo_recovery) return null;
+      try {
+        const res = await api.execute_turn_undo_recovery(
+          this.currentSessionName, operationId, action, previewToken,
+        );
+        if (res && res.ok) {
+          await this.refreshTurnUndoStates();
+          return res.result;
+        }
+        this.notifyChat(res.msg || '恢复操作失败');
+        await this.refreshTurnUndoStates();
+        return null;
+      } catch (err) {
+        this.notifyChat('恢复操作失败: ' + err);
+        return null;
       }
     },
 
@@ -3663,6 +7565,38 @@ export const useAppStore = defineStore('app', {
         console.error('获取附件缩略图失败:', err);
       }
       return result;
+    },
+
+    // 屏幕截图「发到输入框」桥事件（snip_attachment_ready）落库：把图片路径
+    // 加入当前会话输入框附件。不复用 useAttachments.addPaths——composable 绑
+    // 定组件生命周期（onUnmounted 注册等），store 内写等价最小实现：
+    // 去重 → 查文件信息补全 name/ext/size（失败退化为 baseName）→ 补缩略图
+    async _attachSnipToComposer(path: string): Promise<void> {
+      if (!path) return;
+      const runtime = this._getSessionRuntime();
+      if (!runtime.composerAttachments) runtime.composerAttachments = [];
+      const target = runtime.composerAttachments;
+      // 去重：事件重放或重复截图同一文件时不叠加 chip
+      if (target.some(a => a.path === path)) return;
+      const infos = await this.getFilesInfo([path]);
+      const info = infos.find(i => i.path === path);
+      const sepIdx = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
+      const baseName = sepIdx >= 0 ? path.slice(sepIdx + 1) : path;
+      const name = info?.name || baseName;
+      const item: AttachmentItem = {
+        path,
+        name,
+        ext: info?.ext ?? fileExt(name),
+        size: info?.size ?? null,
+      };
+      target.push(item);
+      // 缩略图是增强能力：归档取受控媒体 URL 后补挂，失败静默
+      try {
+        const thumbs = await this.fetchAttachmentThumbnails([path]);
+        const url = thumbs.get(path);
+        if (url) item.thumb = url;
+      } catch { /* 缩略图失败静默，不影响附件 */ }
+      this.notifyChat('截图已加入输入框附件');
     },
 
     // 保存剪贴板粘贴的图片，返回落盘后的文件路径（失败返回空串并 toast）
@@ -3810,7 +7744,7 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async loadTokenStatistics(days: 1 | 7 | 30 = 30, force = false) {
+    async loadTokenStatistics(days: 0 | 1 | 7 | 30 = 30, force = false) {
       if (!force && this.tokenStatistics && this.tokenStatisticsDays === days) {
         return this.tokenStatistics;
       }
@@ -3824,7 +7758,7 @@ export const useAppStore = defineStore('app', {
           return result;
         }
         this.tokenStatistics = result;
-        this.tokenStatisticsDays = result.range.days;
+        this.tokenStatisticsDays = days;
         return result;
       } catch (err) {
         this.connected = false;
@@ -3832,6 +7766,31 @@ export const useAppStore = defineStore('app', {
         return null;
       } finally {
         this.tokenStatisticsLoading = false;
+      }
+    },
+
+    async loadTokenStatisticsLifetime(force = false) {
+      if (!force && this.tokenStatisticsLifetime) {
+        return this.tokenStatisticsLifetime;
+      }
+      const api = this._api();
+      if (!api) return null;
+      this.tokenStatisticsLifetimeLoading = true;
+      try {
+        // 0 = 累计全量：新版热力图与累计摘要按全部历史统计，不再按 365 天截断
+        const result = await api.get_token_usage_statistics(0);
+        if (!result || !result.ok) {
+          this.notifyModal('Token 统计', '加载 Token 统计失败: ' + (result?.msg || '未知错误'));
+          return result;
+        }
+        this.tokenStatisticsLifetime = result;
+        return result;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('Token 统计', '加载 Token 统计失败: ' + err);
+        return null;
+      } finally {
+        this.tokenStatisticsLifetimeLoading = false;
       }
     },
 
@@ -3854,25 +7813,6 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyModal('供应商', '添加预置厂商失败: ' + err);
-        return null;
-      }
-    },
-
-    async syncPresetModels(presetId: string) {
-      const api = this._api();
-      if (!api) return null;
-      try {
-        const res = await api.sync_preset_models(presetId);
-        if (res?.ok && res.settings) {
-          this.applyModelSettings(res.settings);
-          this.notifyModal('供应商', res.msg || '预置模型已同步');
-          return res;
-        }
-        this.notifyModal('供应商', '同步预置模型失败: ' + (res?.msg || '未知错误'));
-        return null;
-      } catch (err) {
-        this.connected = false;
-        this.notifyModal('供应商', '同步预置模型失败: ' + err);
         return null;
       }
     },
@@ -3930,11 +7870,11 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '') {
+    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol);
+        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
@@ -3951,11 +7891,11 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '') {
+    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null, reasoningChoice: string | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol);
+        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens, reasoningChoice);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
           this.notifyModal('模型', res.msg || '模型已更新');
@@ -3966,6 +7906,18 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyModal('模型', '更新模型失败: ' + err);
+        return null;
+      }
+    },
+
+    async fetchProviderModels(providerId: string): Promise<{ ok: boolean; msg?: string; models?: { id: string; model_type?: string }[]; count?: number } | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        return await api.fetch_provider_models(providerId);
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('获取模型列表', '获取失败: ' + err);
         return null;
       }
     },
@@ -4009,6 +7961,10 @@ export const useAppStore = defineStore('app', {
     // ============================================================================
     openUpdateModal() {
       this.updateState.showUpdateModal = true;
+      // 打开弹窗时刷新一次更新信息：后端会顺带探测本地缓存安装包，
+      // 已下载过的包直接呈现为"已就绪"。复用静默检查（沿用其冷却窗口
+      // 与在途去重），不会重复请求、也不会再次打开弹窗。
+      void this.checkUpdate(false);
     },
 
     closeUpdateModal() {
@@ -4021,6 +7977,113 @@ export const useAppStore = defineStore('app', {
       return busyTurns || busyTasks;
     },
 
+    // 后台任务快照（list_active_tasks 只返回 running 项）：任务对话框打开、
+    // 应用启动等时机调用；桥未就绪（浏览器开发态）时静默保留上次快照
+    async refreshBackgroundTasks() {
+      if (!(window.pywebview && window.pywebview.api)) return;
+      try {
+        const list = await window.pywebview.api.get_background_tasks();
+        // list_active_tasks 只返回 running 任务且字段为 duration/pid：统一归一为
+        // 前端展示字段（status 恒为 running，running_time 取 duration）；
+        // session_id 为发起会话名，执行条经 currentSessionBackgroundTasks 按会话过滤；
+        // output_size/last_output_age/no_output_yet 为输出心跳，右面板任务页签
+        // 运行期提示用（旧后端缺省 undefined/null）
+        this.backgroundTasks = (Array.isArray(list) ? list : []).map((t: any) => ({
+          task_id: String(t?.task_id ?? ''),
+          command: String(t?.command ?? ''),
+          status: 'running',
+          running_time: String(t?.duration ?? '') || '活跃',
+          session_id: String(t?.session_id ?? ''),
+          pid: Number(t?.pid ?? 0) || undefined,
+          turn_id: String(t?.turn_id ?? ''),
+          output_size: Number(t?.output_size ?? 0),
+          last_output_age: (t?.last_output_age ?? null) === null ? null : Number(t.last_output_age),
+          no_output_yet: t?.no_output_yet === true,
+        }));
+      } catch {
+        // 拉取失败保留上次快照，不打断界面
+      }
+    },
+
+    // 断点续跑（S4）：拉取可续跑快照。开关关闭时后端回 disabled，这里静默清空，
+    // 界面与改动前完全一致（R-T1）。
+    async loadResumePlan(sessionName?: string) {
+      const api = window.pywebview && window.pywebview.api;
+      const target = (sessionName || this.currentSessionName || '').trim();
+      this.resumePlan = null;
+      this.resumeBlockers = [];
+      if (!api || typeof (api as any).resume_plan !== 'function' || !target) return;
+      try {
+        const res = await (api as any).resume_plan(target);
+        // 只有「存在可续跑回合 + 无降级原因」才保留快照（按钮出现条件）
+        if (res && res.ok && res.resumable && res.plan
+          && (!res.aborts || res.aborts.length === 0)) {
+          this.resumePlan = res.plan as ResumePlanSnapshot;
+        }
+      } catch {
+        // 探测失败按不可续跑处理：不显示入口，也不打断错误条
+      }
+    },
+
+    // 断点续跑（S4）：confirmed 传空数组 = 只续跑无写操作的调用；命中写操作时
+    // 后端回 confirm_required + blockers，这里以列表展示（含写操作的调用需手动重做）。
+    async runResume(sessionName?: string) {
+      if (this.resumeBusy) return;
+      const api = window.pywebview && window.pywebview.api;
+      const target = (sessionName || this.currentSessionName || '').trim();
+      if (!api || typeof (api as any).resume_execute !== 'function' || !target) return;
+      this.resumeBusy = true;
+      try {
+        const res = await (api as any).resume_execute(target, []);
+        this.resumeBlockers = Array.isArray(res?.blockers)
+          ? (res.blockers as ResumeBlockerItem[])
+          : [];
+        if (res && res.ok) {
+          this.resumePlan = null;
+          this.resumeBlockers = [];
+          const suffix = res.dry_run ? '（预演：未发请求）' : '';
+          this.notifyChatLocal(`已从断点续跑：新回合 ${String(res.turn_id || '')}${suffix}`);
+          return;
+        }
+        if (res && res.reason === 'confirm_required') {
+          this.notifyChatLocal('断点续跑需要确认写操作：含写操作的调用需手动重做', 'notice');
+          return;
+        }
+        this.notifyChatLocal(
+          `断点续跑未执行：${String(res?.msg || res?.reason || '未知原因')}`,
+          'error',
+        );
+      } catch (err) {
+        this.notifyChatLocal(
+          `断点续跑失败：${String((err as Error)?.message || err)}`,
+          'error',
+        );
+      } finally {
+        this.resumeBusy = false;
+      }
+    },
+
+    // 决策入口可见性探测：入口显示口径是「当前会话是否产生过真实业务决策」，
+    // 全局历史不再点亮（别的会话做过决策不能让当前会话出现入口）。
+    // 后端只认业务场景记录（排除 scene="probe" 的探针）。启动时调一次；
+    // 桥未就绪（浏览器开发态）静默跳过。
+    async refreshDecisionAvailability(sessionName?: string) {
+      // 每次探测先复位：避免上一会话的 true 残留，把入口错误地留在当前会话上
+      this.decisionHasRecords = false;
+      if (!(window.pywebview && window.pywebview.api)) return;
+      const target = (sessionName ?? this.currentSessionName ?? '').trim();
+      // 无会话名（新会话懒创建阶段）时不请求后端：不能退回全局口径
+      if (!target) return;
+      try {
+        const res = await window.pywebview.api.get_decision_audit_summary(1, target);
+        if (res?.ok && res.has_business_records === true) {
+          this.decisionHasRecords = true;
+        }
+      } catch {
+        // 探测失败按"没有记录"处理：入口不显示，不影响其余头部功能
+      }
+    },
+
     async checkUpdate(manual: boolean = false) {
       const api = this._api();
       if (!api) return;
@@ -4029,6 +8092,9 @@ export const useAppStore = defineStore('app', {
       // 反复请求 Gitee API 触发限流；手动检查不受限制
       const UPDATE_CHECK_COOLDOWN_MS = 3600 * 1000;
       if (!manual) {
+        // 在途去重：已有静默/手动检查正在跑时不重复发请求（如启动静默检查
+        // 与打开更新弹窗几乎同时触发）
+        if (this.updateState.status === 'checking') return;
         try {
           const last = Number(localStorage.getItem('ycode-last-update-check') || '0');
           if (last && Date.now() - last < UPDATE_CHECK_COOLDOWN_MS) {
@@ -4054,6 +8120,17 @@ export const useAppStore = defineStore('app', {
           this.updateState.partUrls = Array.isArray(res.part_urls) ? res.part_urls.map(String) : [];
           this.updateState.sha256 = String(res.sha256 || '');
           this.updateState.status = res.has_update ? 'available' : 'idle';
+
+          // 缓存命中：后端在更新缓存目录里找到了目标版本安装包且校验通过，
+          // 直接进入"已就绪"态（不触发下载），"立即安装并重启"即安装该包
+          const cachedInstaller = String(res.cached_installer || '');
+          if (res.has_update && cachedInstaller) {
+            this.updateState.status = 'downloaded';
+            this.updateState.installerPath = cachedInstaller;
+            this.updateState.downloadProgress = 100;
+            this.updateState.downloadedBytes = this.updateState.assetSize;
+            this.updateState.totalBytes = this.updateState.assetSize;
+          }
 
           if (res.has_update && manual) {
             this.openUpdateModal();
@@ -4119,7 +8196,7 @@ export const useAppStore = defineStore('app', {
       if (!busy) {
         const ok = await this.askConfirm(
           '新版本已就绪',
-          `Y-CODE v${this.updateState.latestVersion} 安装包下载完成`,
+          `星瑶Code v${this.updateState.latestVersion} 安装包下载完成`,
           '安装包已下载就绪，是否立即启动安装程序并重启软件？',
           '立即安装 ⏎'
         );
@@ -4149,7 +8226,7 @@ export const useAppStore = defineStore('app', {
       } else {
         const ok = await this.askConfirm(
           '启动安装',
-          `准备安装 Y-CODE v${this.updateState.latestVersion}`,
+          `准备安装 星瑶Code v${this.updateState.latestVersion}`,
           '是否立即启动安装向导并退出当前程序？',
           '立即安装 ⏎'
         );

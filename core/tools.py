@@ -19,11 +19,25 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from xml.sax.saxutils import escape
 
-from ddgs import DDGS
+# 网页搜索依赖（ddgs）已做成「按需下载组件」，因此**不再**在模块级 import：
+# 它连带 primp（Rust 扩展）、lxml、fake_useragent 等二进制包，主安装包不再内置。
+# 若仍写 ``from ddgs import DDGS``，缺组件时连 ``import core.tools`` 都会失败——
+# 那是灾难性的：CLI 起不来、所有工具（不止搜索）全部不可用。
+#
+# 这里保留一个同名模块级占位 ``DDGS``，语义与懒加载器 _load_ddgs() 约定如下：
+#   - None  → 尚未加载，首次搜索时才真正导入（并按需插入组件目录到 sys.path）；
+#   - 非 None → 已加载的类，或测试 monkeypatch 注入的假 DDGS（沿用旧打桩方式）。
+DDGS = None
 
 from core.version import __version__ as YCODE_VERSION
 from core import tool_cache as _tool_cache
 from core.lsp import _get_rg_executable
+from core.subagent_common import build_subagent_common_block
+# 秘书调度台的错误类型：仅用于把服务层的可读原因转成提示文本（纯类型，无 I/O）
+from core.secretary_dispatch import SecretaryDispatchError
+# 项目画像（跨项目记忆，升级设计 2026-11-04 第 5 节）：纯 stdlib 的文件读写，
+# 只在 ~/.ycode/memory/projects/ 下操作，不涉及项目目录
+from core import project_profile
 
 
 HTTP_TIMEOUT_SECONDS = 20
@@ -56,12 +70,51 @@ def _raise_if_cancelled(cancel_event):
         raise _ToolCancelledError()
 
 
-def _agent_display_name() -> str:
-    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
-    try:
-        from core.persona_settings import get_agent_display_name
+# 子代理只读工具基底：除本地文件与检索外，还必须覆盖主 Agent 侧常用的只读
+# 内置与插件工具（小说体检、办公文档读取等）。白名单是硬过滤——不在集合里的
+# 工具对子代理完全不可见。历史故障：计划项要求「跑 novel_audit 复核」，子代理
+# 只拿到 7 个基础工具，只能回「工具不可用」；而计划门禁又不许主 Agent 自己跑，
+# 整条链路死锁（2026-11-02 小说项目实测）。
+_SUBAGENT_READ_ONLY_TOOLS = frozenset({
+    "read_file", "list_directory", "search_code", "glob_files",
+    "find_definition", "tool_result_read",
+    "search_news", "fetch_url", "fetch_image", "get_weather",
+    "office_read",
+    "novel_status", "novel_wordcount", "novel_outline", "novel_audit",
+})
 
-        return get_agent_display_name()
+# 各角色默认工具白名单；None 表示不限定（general 继承全部工具）。
+_SUBAGENT_DEFAULT_ALLOWED_TOOLS = {
+    "explore": _SUBAGENT_READ_ONLY_TOOLS,
+    "implement": _SUBAGENT_READ_ONLY_TOOLS | frozenset({
+        "write_file", "edit_file", "execute_command",
+        "office_write", "novel_init", "novel_track",
+    }),
+    "test": frozenset({
+        "read_file", "list_directory", "search_code", "glob_files",
+        "find_definition", "tool_result_read", "execute_command",
+        "novel_status", "novel_wordcount", "novel_audit",
+    }),
+    "review": _SUBAGENT_READ_ONLY_TOOLS,
+    "general": None,
+}
+
+
+def default_subagent_allowed_tools(role: str):
+    """内置角色默认工具白名单；未知角色按 general 处理（不限定）。"""
+    return _SUBAGENT_DEFAULT_ALLOWED_TOOLS.get(role, None)
+
+
+def _agent_display_name() -> str:
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
+
+    走 core.secretary 而非直接读设置页：子代理提示词里的名字是“当前会话内的自称”，
+    必须跟着会话走；读取失败回落默认“星瑶”（与原行为一致）。
+    """
+    try:
+        from core.secretary import get_active_agent_name
+
+        return get_active_agent_name()
     except Exception:
         return "星瑶"
 
@@ -434,6 +487,16 @@ def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
                 return candidate
         except Exception:
             pass
+    # AI 生成内容目录写入豁免：AI 产出的临时脚本 / 中间产物按设置统一落该目录，
+    # 不属于越界访问（规格 6.1）。目录由用户在设置页指定，视为已授权；
+    # 豁免只针对该目录，其余路径的沙盒判定不受影响。
+    try:
+        from core.ai_output_paths import is_ai_output_path
+
+        if is_ai_output_path(candidate):
+            return candidate
+    except Exception:
+        pass
     # 沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
     # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
     from core.workspace_context import get_workdir
@@ -586,6 +649,19 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
     _tool_cache.read_file_put(cache_key, final)
     if session_id:
         _tool_cache.shared_put(session_id, ("read_file", cache_key), final)
+
+    # 登记本次读取指纹，供写前新鲜度守卫校验。
+    # 只有「一个字节都没截断」（start == 0 且 end >= total）才算完整读取；
+    # 登记失败绝不影响 read_file 正常返回，因此异常全部吞掉。
+    try:
+        from core.fresh_read_guard import record_read
+        record_read(
+            session_id or "",
+            str(resolved),
+            full_read=(start == 0 and end >= total),
+        )
+    except Exception:
+        pass
     return final
 
 def write_file(file_path, content):
@@ -596,6 +672,43 @@ def write_file(file_path, content):
     导致 diff 全红、Token 浪费以及误删未改动的代码。
     """
     resolved = _resolve_workspace_path(file_path)
+
+    # 写前新鲜度守卫：覆盖已有文件前必须本会话完整读过，且内容未变
+    from core.fresh_read_guard import (
+        StaleReadError,
+        is_guard_enabled,
+        require_fresh_read,
+    )
+    try:
+        require_fresh_read(
+            _tool_cache.get_current_session() or "",
+            str(resolved),
+            tool_name="write_file",
+            skip=not is_guard_enabled(),
+        )
+    except StaleReadError as e:
+        return f"🚨 {e}"
+
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.turn_undo import recorder as _tu_recorder
+    from core.turn_undo.models import NodeKind, TurnUndoError
+
+    coordinator = _tu_coordinator.get_coordinator()
+    # 中断撤销事务冻结的路径：文件工具显式拒绝（规格 13/21）
+    if coordinator.is_path_frozen_any(str(resolved)):
+        return (
+            f"🚨 目标路径处于撤销中断事务的冻结范围，已拒绝修改：{file_path}\n"
+            f"请先在 GUI 或 /undo recover 中选择继续撤销或取消撤销。"
+        )
+    # 规格锁序（H1）：与撤销事务同一把锁键——线程规范化工作区根，
+    # 子目录文件的 prepare → 写入 → verify 全区间与撤销互斥
+    with coordinator.workspace_lock(_tu_coordinator.thread_workspace_root()):
+        return _write_file_locked(resolved, file_path, content,
+                                  _tu_recorder, _tu_coordinator, NodeKind, TurnUndoError)
+
+
+def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, NodeKind, TurnUndoError):
+    """write_file 主体；调用方已持工作区协调锁。"""
 
     # 并发防护：同一文件的 检查→写入 全过程串行化，写前做 mtime 乐观校验
     with _edit_file_lock(resolved):
@@ -651,6 +764,37 @@ def write_file(file_path, content):
                 f"请检查路径是否正确，或权限是否充足。"
             )
 
+        # 按回合撤销：prepare（捕获 before + 持久化计划 after）成功后才允许触盘。
+        # 快照失败 → 放弃写入；无活动回合检查点 → 退化为普通写入。
+        new_bytes = content.encode("utf-8")
+        handle = None
+        try:
+            handle = _tu_recorder.prepare_mutation(
+                display_path=str(resolved),
+                after_kind=NodeKind.REGULAR_FILE,
+                after_content=new_bytes,
+                tool_name="write_file",
+                tool_call_id="",
+            )
+        except TurnUndoError as error:
+            if error.code == "no_active_checkpoint":
+                # 回合外调用（无检查点上下文）：保持既有行为，不做可撤销记录
+                handle = None
+            elif error.code == "workspace_busy":
+                # 同目录另有活跃回合：可重试，未触盘，不产生不可撤销修改
+                return (
+                    f"🚨 该目录正在被另一个回合写入，本次未修改文件（{file_path}）：\n"
+                    f"{error.message}\n"
+                    f"请稍后重试。"
+                )
+            else:
+                # 检查点已封闭（迟到写入）：必须在触盘前失败（规格 9.2）
+                return (
+                    f"🚨 该回合的撤销检查点已封闭，迟到的写入已被拒绝（{file_path}）：\n"
+                    f"{error.message}\n"
+                    f"请重新发起新回合后再试，避免产生不可撤销的文件修改。"
+                )
+
         fd, temp_name = tempfile.mkstemp(
             prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
         )
@@ -663,6 +807,8 @@ def write_file(file_path, content):
                     os.unlink(temp_name)
                 except OSError:
                     pass
+                if handle is not None:
+                    _tu_recorder.rollback_prepared_mutation(handle)
                 return conflict
             os.replace(temp_name, resolved)
         except BaseException:
@@ -672,15 +818,20 @@ def write_file(file_path, content):
                 os.unlink(temp_name)
             except OSError:
                 pass
+            if handle is not None:
+                try:
+                    _tu_recorder.rollback_prepared_mutation(handle)
+                except Exception:
+                    pass
             raise
-        # 与 edit_file 对齐：仅在写入成功后入撤销栈。
-        from core.memory import set_undo_state
-        set_undo_state(
-            str(resolved),
-            old_content,
-            existed_before=existed_before,
-            old_bytes=old_bytes,
-        )
+        if handle is not None:
+            try:
+                _tu_recorder.verify_after_mutation(handle)
+            except TurnUndoError as error:
+                return (
+                    f"🚨 文件已写入但未能通过可撤销性验证，本轮撤销保证失效"
+                    f"（{file_path}）：\n{error.message}"
+                )
     return f"✔ 文件 {file_path} 写入成功！"
 
 # --- 下面是给星瑶装配的两个新神装 ---
@@ -777,11 +928,35 @@ def execute_command(
     _execution_result: _CommandExecutionResult | None = None,
 ):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
-    from core.command_policy import is_dangerous_command
+    from core.command_policy import (
+        build_child_env,
+        is_dangerous_command,
+        load_shell_env_policy,
+    )
     from core.workspace_context import get_workdir
 
+    # 撤销中断期间冻结该工作区的一切星瑶侧写入（命令可绕过文件工具冻结，规格 21）
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.workspace_context import get_workdir as _get_workdir
+
+    if _tu_coordinator.get_coordinator().any_frozen_paths(get_workdir() or os.getcwd()):
+        return (
+            "🚨 当前工作区存在未完成的撤销中断事务，已拒绝执行命令。\n"
+            "请先在 GUI 或 /undo recover 中选择继续撤销或取消撤销。"
+        )
+
     if is_dangerous_command(command):
-        return "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+        return (
+            "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+            "若这是文档/文件内容（而非要执行的命令），请改用文件写入工具（write_file）保存。"
+        )
+
+    # 按回合撤销边界（M6）：仅在实际放行执行的命令上持久化"未覆盖副作用"
+    # 事实——被冻结/危险策略拒绝的命令零副作用，不打虚假标记（规格 10）。
+    from core.turn_undo import recorder as _tu_recorder
+
+    _tu_recorder.mark_uncovered_command_effects("execute_command")
+
     try:
         timeout_seconds = int(timeout_seconds)
     except (TypeError, ValueError):
@@ -812,7 +987,15 @@ def execute_command(
                 )
             except Exception:
                 session_id = _tool_cache.get_current_session() or ""
-            background_kwargs = {"session_id": session_id}
+            # T4 回合关联：登记发起本任务的父回合（以 turn_undo 按工作区登记的
+            # 活动回合为准；任务记录与任务日志据此可追溯到回合）
+            try:
+                turn_id = _tu_coordinator.get_coordinator().active_turn_id(
+                    get_workdir() or os.getcwd()
+                ) or ""
+            except Exception:
+                turn_id = ""
+            background_kwargs = {"session_id": session_id, "turn_id": turn_id}
             if shell_id:
                 background_kwargs["shell_id"] = shell_id
             task_id = start_background_task(command, **background_kwargs)
@@ -834,7 +1017,10 @@ def execute_command(
         from core.task_scheduler import _stop_process_tree
 
         output_encoding = platform_console_encoding()
-        env = os.environ.copy()
+        # T1 安全默认：子进程默认不继承敏感环境变量（*KEY*/*SECRET*/*TOKEN*/*PASSWORD*），
+        # 逃生门 config.json "shell_env_policy": {"exclude_sensitive": false}；
+        # 编码注入在 build_child_env 结果之上显式叠加，不受策略裁剪影响。
+        env = build_child_env(os.environ, policy=load_shell_env_policy())
         env["PYTHONIOENCODING"] = output_encoding
         env["PYTHONUTF8"] = "0"
 
@@ -855,6 +1041,8 @@ def execute_command(
             sink.seek(0)
             return sink.read(min(size, EXECUTE_COMMAND_MAX_OUTPUT_BYTES)), size
 
+        # Workspace Process Registry 句柄先于内层 try 初始化，保证 finally 可安全引用
+        _git_registry_handle = ""
         try:
             try:
                 invocation = build_command_invocation(command, shell_id=shell_id)
@@ -873,6 +1061,19 @@ def execute_command(
             }
             if invocation.executable:
                 popen_kwargs["executable"] = invocation.executable
+            # Workspace Process Registry 登记（规格 §9.2）：登记失败绝不影响命令执行
+            try:
+                from core.git import process_registry as _proc_registry
+
+                _git_registry_handle = _proc_registry.register_process(
+                    popen_kwargs.get("cwd") or os.getcwd(),
+                    kind="execute_command",
+                    foreground=True,
+                    long_running=False,
+                    risk_class=_proc_registry.risk_class_for_command(command),
+                ).handle
+            except Exception:
+                _git_registry_handle = ""
             process = subprocess.Popen(
                 invocation.argv,
                 **popen_kwargs,
@@ -893,16 +1094,32 @@ def execute_command(
                     break
                 if process.poll() is not None:
                     break
-                if time.time() - start_time >= timeout_seconds:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout_seconds:
                     _stop_process_tree(process)
                     return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
-                time.sleep(0.1)
+                # 轮询节奏随时长退避：短命令保持 0.1s 灵敏响应，长命令降频省 CPU。
+                # 代价：超时/取消/输出超限最多晚 0.5s 被察觉，属预期可接受。
+                if elapsed < 2.0:
+                    interval = 0.1
+                elif elapsed < 10.0:
+                    interval = 0.25
+                else:
+                    interval = 0.5
+                time.sleep(interval)
 
             if _execution_result is not None:
                 _execution_result.returncode = process.returncode
             stdout_raw, stdout_size = _read_sink_capped(stdout_sink)
             stderr_raw, stderr_size = _read_sink_capped(stderr_sink)
         finally:
+            if _git_registry_handle:
+                try:
+                    from core.git import process_registry as _proc_registry
+
+                    _proc_registry.unregister_process(_git_registry_handle)
+                except Exception:
+                    pass
             try:
                 stdout_sink.close()
                 stderr_sink.close()
@@ -948,8 +1165,107 @@ def execute_command(
 
 # --- 星瑶的新神装：新闻搜索 ---
 
+# 组件缺失时回给模型的可读提示（不是异常）：搜索是可选能力，缺组件只应让本次
+# 工具调用「不可用」，不能让整个 agent 轮次炸掉。提示里必须带设置页路径，
+# 这样模型可以把原话转述给用户，用户点两下就能装好。
+_SEARCH_COMPONENT_MISSING_HINT = (
+    "网页搜索需要先安装「网页搜索组件」。请在 设置 → 网页搜索 中点击下载，"
+    "或改用其它方式获取信息。"
+)
+
+
+def _load_ddgs():
+    """按需返回 ``ddgs.DDGS`` 类；网页搜索组件不可用时返回 None（不抛异常）。
+
+    流程（与 core.components.ensure_playwright 同一范式）：
+      1. 模块级 ``DDGS`` 已被填充（此前加载成功，或测试注入的桩）→ 直接返回；
+      2. ``ensure_search_component()``：已能 import ddgs 就直接通过，否则把组件
+         目录插进 sys.path 再试一次；
+      3. 组件缺失/导入失败一律返回 None，由调用方转成中文提示——这里刻意不抛
+         ComponentError，避免「没装搜索组件」把 search_news 的返回变成异常路径。
+    """
+    global DDGS
+    if DDGS is not None:
+        return DDGS
+    try:
+        # 惰性导入：core.tools 被大量模块早期引用，避免 import 期就把组件探测
+        # （含可能的 sys.path/import 动作）拖进启动路径。
+        from core.components import ensure_search_component
+
+        ensure_search_component()
+    except Exception as error:
+        _logger.info("网页搜索组件不可用：%s", error)
+        return None
+    try:
+        from ddgs import DDGS as _DDGS
+    except Exception as error:
+        # 走到这里说明组件目录里缺依赖（常见：primp/lxml 二进制扩展缺失）
+        _logger.info("导入 ddgs 失败：%s", error)
+        return None
+    DDGS = _DDGS
+    return DDGS
+
+
+# search 场景的决策题：让 JEV 按检索词判断本次需要几条结果。
+# 3 = 单一事实即可，5 = 常规，8 = 需要多来源交叉核对。
+_SEARCH_NUM_RESULTS_QUESTION = {
+    "type": "choice",
+    "instructions": "判断这次联网检索的信息量需求：3=单一事实即可，5=常规，8=需要多来源交叉核对。只依据查询词本身判断。",
+    # 上游 choice 题的 criteria 是「选项名 → 描述」的对象，不可省略
+    "criteria": {
+        3: "单一事实即可（如某个具体数字、日期、定义）",
+        5: "常规信息量（一般性的资讯或说明）",
+        8: "需要多来源交叉核对（争议话题、对比评估、时效性强的动态）",
+    },
+}
+_SEARCH_NUM_RESULTS_OPTIONS = (3, 5, 8)
+# search 场景单次决策超时（与 decision_service.DEFAULT_CONFIG["scenes"]["search"] 对齐）
+_SEARCH_DECISION_TIMEOUT_MS = 250
+
+
+def _decide_search_num_results(query):
+    """search 场景接入：让 JEV 按查询词决定本次 news 请求的结果条数。
+
+    返回采纳的条数（int）；未启用 / 影子 / 上游失败 / 答案非法 / 任何异常一律
+    返回 ``None``，调用方据此沿用原有的 num_results——**JEV 全关时本函数恒为
+    None，零网络请求、零审计副作用**，因此 search_news 的行为与接入前完全一致。
+
+    隐私约束：``state`` 只放查询词本身。这段文本会真实发送给决策模型，
+    绝不拼接会话历史、文件内容或任何用户隐私文本。
+    """
+    try:
+        # 惰性导入：避免 core.tools 与 core.decision_gateway 之间的循环依赖，
+        # 也避免模块导入期就拉起决策链路的副作用（tools 被大量模块早期引用）。
+        from core.decision_gateway import decide
+
+        state = f"用户检索词：{query}"
+        question = dict(_SEARCH_NUM_RESULTS_QUESTION)
+        picked = decide(
+            "search",
+            state,
+            question,
+            options=_SEARCH_NUM_RESULTS_OPTIONS,
+            timeout_ms=_SEARCH_DECISION_TIMEOUT_MS,
+        )
+    except Exception as error:
+        # 网关本身已兜底；这里再加一层，确保决策永远不成为检索的故障点
+        _logger.debug("search 场景决策失败，沿用原 num_results: %s", error)
+        return None
+    # 只接受 int 档位并做范围保护：越界值一律丢弃（布尔是 int 子类，需排除）
+    if isinstance(picked, bool) or not isinstance(picked, int):
+        return None
+    if not 1 < picked < 50:
+        return None
+    return picked
+
+
 def search_news(query, num_results=5, cancel_event=None):
     """🌐 现代化新闻搜索工具：稳定可靠的联网引擎"""
+    # 组件就绪性最先检查：ddgs 现在是按需下载的「网页搜索组件」，缺它时直接给
+    # 模型一段可读提示并正常返回（不抛异常），也不白跑一次 JEV 决策与网络请求。
+    ddgs_cls = _load_ddgs()
+    if ddgs_cls is None:
+        return _SEARCH_COMPONENT_MISSING_HINT
     try:
         # 钳制结果数：模型传 100000 会触发 DuckDuckGo 限流
         try:
@@ -958,7 +1274,14 @@ def search_news(query, num_results=5, cancel_event=None):
             num_results = 5
         num_results = max(1, min(num_results, 20))
         _raise_if_cancelled(cancel_event)
-        with DDGS() as ddgs:
+        # JEV 决策接入点：真正发请求前问一次「这次需要几条结果」。
+        # 拿到合法档位就用它；None 表示未启用/影子/失败/低置信，此时保持上面
+        # 算好的 num_results 不变（尊重调用方传值，而非回落到硬编码 5）。
+        decided_num_results = _decide_search_num_results(query)
+        if decided_num_results is not None:
+            # 仍走同一套钳制，保证 ddgs 的限流保护不被决策链路绕过
+            num_results = max(1, min(decided_num_results, 20))
+        with ddgs_cls() as ddgs:
             results = list(ddgs.news(query, max_results=num_results))
             _raise_if_cancelled(cancel_event)
 
@@ -1342,19 +1665,62 @@ def fetch_image(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
                         f"图片体积超过 {IMAGE_MAX_BYTES // (1024 * 1024)}MB 限制，已中止下载"
                     )
             _raise_if_cancelled(cancel_event)
+        # 落点：AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp），
+        # 不再用进程 cwd——打包版会把图片写进安装目录（规格 5）。
+        from core.ai_output_paths import resolve_ai_output_dir
+
+        target_dir = resolve_ai_output_dir()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"download_{timestamp}.{extension}"
-        target = Path.cwd() / filename
+        target = target_dir / filename
         # 同秒重复/并发下载时避免互相覆盖
         counter = 2
         while target.exists():
             filename = f"download_{timestamp}_{counter}.{extension}"
-            target = Path.cwd() / filename
+            target = target_dir / filename
             counter += 1
-        target.write_bytes(bytes(data))
+        payload = bytes(data)
+        # 按回合撤销：下载图片也是受控文件修改（fetch_image 注册 mutates_files）。
+        # prepare（持久化计划 after）失败 → 放弃写盘；无回合检查点 → 普通写入。
+        from core.turn_undo import coordinator as _tu_coordinator
+        from core.turn_undo import recorder as _tu_recorder
+        from core.turn_undo.models import NodeKind, TurnUndoError
+
+        coordinator = _tu_coordinator.get_coordinator()
+        handle = None
+        with coordinator.workspace_lock(_tu_coordinator.thread_workspace_root()):
+            try:
+                handle = _tu_recorder.prepare_mutation(
+                    display_path=str(target),
+                    after_kind=NodeKind.REGULAR_FILE,
+                    after_content=payload,
+                    tool_name="fetch_image",
+                    tool_call_id="",
+                )
+            except TurnUndoError as error:
+                if error.code == "no_active_checkpoint":
+                    handle = None
+                elif error.code == "workspace_busy":
+                    return (
+                        f"🚨 该目录正在被另一个回合写入，图片未写入（{target}）：\n"
+                        f"{error.message}\n请稍后重试。"
+                    )
+                else:
+                    return (
+                        f"🚨 该回合的撤销检查点已封闭，迟到的图片写入已被拒绝（{target}）：\n"
+                        f"{error.message}"
+                    )
+            target.write_bytes(payload)
+            if handle is not None:
+                try:
+                    _tu_recorder.verify_after_mutation(handle)
+                except TurnUndoError as error:
+                    return (
+                        f"🚨 图片已下载但未能通过可撤销性验证（{target}）：\n{error.message}"
+                    )
         return (
             f"HTTP {status} ({content_type})\n"
-            f"图片已下载到本地：{target}（{len(data)} 字节）\n"
+            f"图片已下载到本地：{target}（{len(payload)} 字节）\n"
             f"GUI 会话中用 Markdown 图片语法 ![]({target}) 内嵌展示；CLI 终端直接给出该路径即可。"
         )
     except _ToolCancelledError:
@@ -1800,12 +2166,13 @@ def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, e
         if include_result:
             result = str(snap.result or "")
             if result:
-                if len(result) > _SUBAGENT_STATUS_RESULT_MAX_CHARS:
-                    omitted = len(result) - _SUBAGENT_STATUS_RESULT_MAX_CHARS
-                    result = (
-                        result[:_SUBAGENT_STATUS_RESULT_MAX_CHARS]
-                        + f"… [结果已截断，省略 {omitted} 字符；完整结果将在回合结束后的自动汇总中注入]"
-                    )
+                # 与 _foreground_result 同一套头截断保尾规则：status 视图也要
+                # 保住尾部工具报错告警块，只吃正文会让主 Agent 看不到结果存疑。
+                result = _truncate_subagent_result(
+                    result,
+                    _SUBAGENT_STATUS_RESULT_MAX_CHARS,
+                    "… [结果已截断，省略 {omitted} 字符；完整结果将在回合结束后的自动汇总中注入]",
+                )
                 payload["result"] = result
             if snap.error:
                 payload["error"] = str(snap.error)
@@ -2115,15 +2482,13 @@ def _edit_file_by_lines(
             f"未发生实际修改（{file_path}）。"
         )
 
-    # 原子写入（含 mtime 乐观校验），成功后才写入撤销栈，避免失败编辑污染撤销历史
-    write_err = _atomic_write_edit_file(
+    # 按回合撤销记录写入：prepare → 原子写 → verify（无回合检查点时退化为普通写入）
+    write_err = _recorded_atomic_write(
         resolved, encoding, new_content,
         file_path=file_path, expected_mtime_ns=expected_mtime_ns,
     )
     if write_err:
         return write_err
-    from core.memory import set_undo_state
-    set_undo_state(file_path, content)
 
     # 构建预览：被替换的原文前 3 行 + 后 2 行（超过 5 行时省略中间）
     replaced_preview_lines = replaced_block.splitlines()
@@ -2181,6 +2546,85 @@ def _atomic_write_edit_file(resolved, encoding, new_content, file_path=None, exp
         except OSError:
             pass
         return f"🚨 精准修改发生异常: {str(e)}"
+    return None
+
+
+def _recorded_atomic_write(resolved, encoding, new_content, *, file_path=None,
+                           expected_mtime_ns=None, tool_name="edit_file"):
+    """edit_file 三条写入路径统一的"按回合撤销"记录写入口。
+
+    契约：
+    - prepare（捕获 before + 持久化计划 after）成功后才允许触盘；
+      快照失败 → 返回错误、文件不变。
+    - 写入后立即 verify；实际状态与计划不一致 → 检查点标记不可撤销并报错，
+      工具不得声称成功。
+    - 无活动回合检查点（CHECKPOINT_CLOSED）时退化为普通原子写入——严格
+      撤销保证只覆盖回合作用域内的受控修改。
+    - mtime 乐观冲突是正常拒绝路径，先检查再 prepare，避免污染检查点。
+    """
+    # 1. 先做乐观校验（正常拒绝路径，不产生任何记录）
+    if expected_mtime_ns is not None:
+        conflict = _mtime_conflict_error(
+            file_path or str(resolved), resolved, expected_mtime_ns
+        )
+        if conflict:
+            return conflict
+
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.turn_undo import recorder as _tu_recorder
+    from core.turn_undo.models import NodeKind, TurnUndoError
+
+    coordinator = _tu_coordinator.get_coordinator()
+    # 中断撤销事务冻结的路径：文件工具显式拒绝（规格 13/21）
+    if coordinator.is_path_frozen_any(str(resolved)):
+        return (
+            f"🚨 目标路径处于撤销中断事务的冻结范围，已拒绝修改"
+            f"（{file_path or resolved}）：\n请先完成撤销恢复（GUI 或 /undo recover）。"
+        )
+    new_bytes = new_content.encode(encoding)
+
+    # 2. prepare → 写入 → verify 全程持工作区锁（规格 21；锁键=线程工作区根）
+    with coordinator.workspace_lock(_tu_coordinator.thread_workspace_root()):
+        handle = None
+        try:
+            handle = _tu_recorder.prepare_mutation(
+                display_path=str(resolved),
+                after_kind=NodeKind.REGULAR_FILE,
+                after_content=new_bytes,
+                tool_name=tool_name,
+                tool_call_id="",
+            )
+        except TurnUndoError as error:
+            if error.code == "no_active_checkpoint":
+                # 回合外调用：保持既有行为，不做可撤销记录
+                return _atomic_write_edit_file(
+                    resolved, encoding, new_content,
+                    file_path=file_path, expected_mtime_ns=None,
+                )
+            if error.code == "workspace_busy":
+                return (
+                    f"🚨 该目录正在被另一个回合写入，本次未修改文件"
+                    f"（{file_path or resolved}）：\n{error.message}\n请稍后重试。"
+                )
+            # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
+            return (
+                f"🚨 该回合的撤销检查点已封闭，迟到的修改已被拒绝"
+                f"（{file_path or resolved}）：\n{error.message}"
+            )
+        try:
+            write_err = _atomic_write_edit_file(
+                resolved, encoding, new_content,
+                file_path=file_path, expected_mtime_ns=None,
+            )
+            if write_err:
+                _tu_recorder.rollback_prepared_mutation(handle)
+                return write_err
+            _tu_recorder.verify_after_mutation(handle)
+        except TurnUndoError as error:
+            return (
+                f"🚨 本次修改未能通过可撤销性验证，请重读文件后重试"
+                f"（{file_path or resolved}）：\n{error.message}"
+            )
     return None
 
 
@@ -2371,11 +2815,32 @@ def edit_file(
     # 并发防护：同一文件的 读→改→写 全过程按路径串行化（多子代理并发编辑同一
     # 文件时后写者不再静默覆盖），写前另有 mtime 乐观校验检测外部修改
     with _edit_file_lock(resolved):
+        # 写前新鲜度守卫：未完整读过或读后文件被外部改过时拒绝修改
+        from core.fresh_read_guard import (
+            StaleReadError,
+            is_guard_enabled,
+            require_fresh_read,
+        )
+        try:
+            require_fresh_read(
+                _tool_cache.get_current_session() or "",
+                str(resolved),
+                tool_name="edit_file",
+                skip=not is_guard_enabled(),
+            )
+        except StaleReadError as e:
+            return f"🚨 {e}"
+
         # 先记录 mtime 再读取：写入前若 mtime 变化即拒绝覆盖。
         # 宁可误报冲突（让调用方重读），也不放过读后写前的外部修改窗口。
         expected_mtime_ns = _stat_mtime_ns(resolved)
         try:
             raw = resolved.read_bytes()
+        except FileNotFoundError:
+            return (
+                f"🚨 精准修改失败！文件不存在：{file_path}。"
+                "edit_file 只能修改已存在的文件；新建文件请改用 write_file。"
+            )
         except OSError as e:
             return f"🚨 精准修改失败！无法读取文件 {file_path}: {e}"
         try:
@@ -2420,15 +2885,13 @@ def edit_file(
                     f"🚨 edit_file 智能替换失败：在 {file_path} 中未找到与 replacement_content "
                     f"足够相似的代码段（建议显式提供 target_content 或 start_line/end_line）。"
                 )
-            # 原子写入（含 mtime 校验），成功后才写入撤销栈，避免失败编辑污染撤销历史
-            write_err = _atomic_write_edit_file(
+            # 按回合撤销记录写入：prepare → 原子写 → verify
+            write_err = _recorded_atomic_write(
                 resolved, encoding, new_content,
                 file_path=file_path, expected_mtime_ns=expected_mtime_ns,
             )
             if write_err:
                 return write_err
-            from core.memory import set_undo_state
-            set_undo_state(file_path, content)
             return (
                 f"✔ 智能修改 {file_path}（自动定位最相似代码段，共 {occurrences} 处替换）\n"
                 f"被替换的原文（前 5 行）：\n{replaced_preview}"
@@ -2465,15 +2928,13 @@ def edit_file(
         if new_content == content:
             return f"🚨 精准修改失败！定位成功但替换后的内容与原文相同，未发生实际修改（{file_path}）。"
 
-        # 原子写入（含 mtime 校验），成功后才写入撤销栈，避免失败的编辑污染撤销历史
-        write_err = _atomic_write_edit_file(
+        # 按回合撤销记录写入：prepare → 原子写 → verify
+        write_err = _recorded_atomic_write(
             resolved, encoding, new_content,
             file_path=file_path, expected_mtime_ns=expected_mtime_ns,
         )
         if write_err:
             return write_err
-        from core.memory import set_undo_state
-        set_undo_state(file_path, content)
         return f"✔ 已修改文件：{file_path}"
 
 _SUBAGENT_TERMINAL_STATUSES = {
@@ -2515,9 +2976,107 @@ _SUBAGENT_APPROVAL_WAIT_LIMIT = 300
 # 与 core/llm.py 工具结果入上下文的截断上限（16000）对齐。
 SUBAGENT_RESULT_MAX_CHARS = 16000
 
+# 超时/失败时交付给主 Agent 的部分产出上限（字符）。
+# 此前固定 1500：长任务即便已完成大半，主 Agent 也只拿到一小段残片，只能
+# 从头重做，链路被拉长成"再派一次 → 再超时"。与最终结果上限同量级后，
+# "在已有成果上接着做"才成为可行选项。
+SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS = 12000
+
+# 时间预算提醒阈值：(剩余比例, 最小剩余秒数, 提醒级别)。
+# 按紧急程度从高到低排列，命中即返回；同一级别只提示一次。
+# 设最小秒数是为了短预算任务（如 explore 240s）不会一开跑就被提醒淹没。
+_SUBAGENT_BUDGET_NOTICE_RATIOS = ((0.10, 45, 2), (0.25, 90, 1))
+
+
+def build_subagent_budget_notice(remaining, budget, stage):
+    """构造子代理时间预算提醒，返回 (新 stage, 提醒文本或 None)。
+
+    stage：0 未提醒 / 1 已发收尾提醒 / 2 已发终止提醒。纯函数，便于单测：
+    manager 每步调用一次，只有跨过阈值且尚未提醒过该级别时才返回文本。
+    """
+    try:
+        remaining = float(remaining)
+        budget = float(budget)
+        stage = int(stage)
+    except (TypeError, ValueError):
+        return stage, None
+    if budget <= 0 or remaining <= 0:
+        return stage, None
+    for ratio, floor, level in _SUBAGENT_BUDGET_NOTICE_RATIOS:
+        if stage >= level:
+            continue
+        if remaining > max(float(floor), budget * ratio):
+            continue
+        budget_text = f"{int(budget)}s"
+        remaining_text = f"{int(max(0.0, remaining))}s"
+        if level >= 2:
+            return level, (
+                f"⏳ 时间预算即将耗尽：本次子任务总预算 {budget_text}，"
+                f"剩余约 {remaining_text}。立即停止一切探索、读取和新增工具调用，"
+                "把你已经完成的工作整理成最终结论输出（已改动的文件、已验证的结果、"
+                "未完成的部分都要写清）。不要再调用任何工具。"
+            )
+        return level, (
+            f"⏳ 时间预算提醒：本次子任务总预算 {budget_text}，"
+            f"剩余约 {remaining_text}。请立即收敛范围：优先完成手头最关键的一步，"
+            "随后直接输出当前结论，不要再开启新的探索或大范围改动。"
+        )
+    return stage, None
+
 
 def _has_meaningful_subagent_result(text: str) -> bool:
     return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
+
+
+_SUBAGENT_WARNING_MAX_ITEMS = 5
+_SUBAGENT_WARNING_ITEM_MAX_CHARS = 200
+# 结果尾部告警的起始标记：结果截断时据此保住告警
+SUBAGENT_WARNING_MARKER = "\n\n⚠️ 子代理执行期有工具报错"
+
+
+def _with_tool_error_footer(result: str, tool_errors: dict, turn_error: str = "") -> str:
+    """把工具报错降级为结果尾部的告警清单，不再一票否决整任务。"""
+    if not tool_errors and not turn_error:
+        return result
+    items = list(tool_errors.items())
+    shown = items[:_SUBAGENT_WARNING_MAX_ITEMS]
+    lines = [
+        SUBAGENT_WARNING_MARKER
+        + f"（{len(items)} 个，可能影响结论可靠性，供主 Agent 判断是否复核）："
+    ]
+    if turn_error:
+        lines.append(f"  - 回合级中止原因: {turn_error}")
+    for name, detail in shown:
+        text = str(detail)
+        if len(text) > _SUBAGENT_WARNING_ITEM_MAX_CHARS:
+            text = text[:_SUBAGENT_WARNING_ITEM_MAX_CHARS] + "..."
+        lines.append(f"  - {name}: {text}")
+    if len(items) > len(shown):
+        lines.append(f"  ... 另有 {len(items) - len(shown)} 个未展开")
+    return result + "\n".join(lines)
+
+
+def _truncate_subagent_result(result: str, max_len: int, trailer: str) -> str:
+    """超长子代理结果头截断，但尾部告警块（SUBAGENT_WARNING_MARKER 起）原样保留。
+
+    截断只吃正文，不能连工具报错告警一起吃掉。告警块自身超过一半预算
+    （budget < max_len // 2）或与正文截断点重叠时放弃保留，退化为普通头截断。
+    trailer 中的 {omitted} 会替换为实际省略字符数；_foreground_result 与
+    task_tool status 视图共用此规则，避免两处截断行为漂移。
+    """
+    if len(result) <= max_len:
+        return result
+    tail = ""
+    marker_at = result.rfind(SUBAGENT_WARNING_MARKER)
+    if marker_at != -1:
+        candidate = result[marker_at:]
+        budget = max_len - len(candidate)
+        if budget >= max_len // 2 and budget <= marker_at:
+            tail = candidate
+    keep = max_len - len(tail)
+    head = result[:keep]
+    omitted = len(result) - len(head) - len(tail)
+    return head + trailer.replace("{omitted}", str(omitted)) + tail
 
 
 _ADVISOR_TAG_RE = re.compile(
@@ -2573,6 +3132,10 @@ class SubagentTaskSnapshot:
     stages: tuple[SubagentStage, ...]
     execution_elapsed: float
     approval_wait_elapsed: float
+    partial_result: str = ""
+    # 派生该子代理的工具调用 id（run_subagent 的 call_id）。GUI 卡片按此
+    # 把子代理归属到自己那张卡上，不再把会话内所有子代理堆在一张卡里。
+    tool_call_id: str = ""
 
 
 @dataclass
@@ -2582,6 +3145,8 @@ class SubagentTask:
     parent_turn_id: str
     description: str
     workdir: str = ""
+    # 派生该子代理的工具调用 id（见 SubagentTaskSnapshot.tool_call_id）
+    tool_call_id: str = ""
     subagent_type: str = "general"
     plan_item_id: str = ""
     run_in_background: bool = False
@@ -2589,8 +3154,15 @@ class SubagentTask:
     started_at: float | None = None
     finished_at: float | None = None
     result: str = ""
+    # 现场打捞：超时/取消/失败时已产出的正文（不改变任务终态）。
+    # 终态判定可能早于线程返回，正文若只写 result 会被整块丢弃。
+    partial_result: str = ""
     error: str = ""
     tool_errors: dict[str, str] = field(default_factory=dict, repr=False)
+    # 回合级中止原因（无进展熔断/轮次上限只走 turn_error 事件通道，
+    # 不 yield 正文；不单独记录就会退化成"子代理无公开结论"）
+    turn_error: str = ""
+    tool_success_count: int = 0
     stage: str = "queued"
     stages: list[SubagentStage] = field(default_factory=list)
     execution_elapsed: float = 0.0
@@ -2612,6 +3184,9 @@ class SubagentTask:
     thread: threading.Thread | None = field(default=None, repr=False)
     custom_config: dict | None = field(default=None, repr=False)
     timeout_seconds: int = field(default=600, repr=False)
+    # 已发出的时间预算提醒级别（0 未提醒 / 1 已提醒收尾 / 2 已提醒终止）。
+    # 由子代理线程在每步边界读取 execution_elapsed 后写回，避免同一级别反复注入。
+    budget_notice_stage: int = field(default=0, repr=False)
     # 并发名额生命周期标记：超时/取消是协作式，线程可能仍卡在不可中断的
     # LLM 请求里，但名额要立即归还（见 _release_slot），两者都必须幂等
     slot_acquired: bool = field(default=False, repr=False)
@@ -2620,6 +3195,10 @@ class SubagentTask:
     # ""=未移交；"main_takeover"/"takeover_queued"=移交成功；
     # "failed"=移交失败（保留 timed_out 事实，不得改写为普通 failed 重新委派）
     handoff: str = field(default="", repr=False)
+    # 父回合创建子代理时快照的权限档位（线程本地，子代理线程不继承）。
+    # 子代理线程执行工具时用它包裹，鉴权路径据此读到会话档位而非全局默认，
+    # 否则父会话 full + 全局 confirm/accept_edits 时子代理仍会反复弹审批。
+    permission_mode: str | None = field(default=None, repr=False)
 
 
 SubagentRunner = Callable[[SubagentTask], str]
@@ -2720,6 +3299,17 @@ def _unpack_model_config(model_config: tuple | None):
     raise ValueError("model_config 必须是 (model, key, base_url[, model_id])")
 
 
+def _format_tool_stage_duration(duration_ms) -> str:
+    """tool_finished 阶段详情里的耗时片段：≥1s 显示秒，否则毫秒。"""
+    try:
+        ms = max(0, int(duration_ms or 0))
+    except (TypeError, ValueError):
+        return ""
+    if ms <= 0:
+        return ""
+    return f"{ms / 1000:.1f}s" if ms >= 1000 else f"{ms}ms"
+
+
 def _permission_owner_waiting(owner_id: str) -> bool:
     from core.permission_broker import permission_broker
 
@@ -2799,6 +3389,7 @@ class SubagentManager:
         model_config: tuple | None = None,
         event_callback: Callable | None = None,
         task_id: str | None = None,
+        tool_call_id: str = "",
     ) -> str:
         """运行一个子代理任务。
 
@@ -2829,12 +3420,17 @@ class SubagentManager:
                 custom_config = None
 
         from core.workspace_context import get_workdir
+        # 权限档位随任务快照：子代理线程不继承调用线程的线程本地档位，
+        # 必须在创建时（仍处于父回合线程）取值，_run_task 内再用 scope 恢复。
+        from core import app_context as _app_context
+        _parent_permission_mode = _app_context.get_permission_mode()
         task = SubagentTask(
             task_id=str(task_id or _new_subagent_task_id()),
             parent_session=str(parent_session or ""),
             parent_turn_id=str(parent_turn_id or ""),
             description=description,
             workdir=str(get_workdir()),
+            tool_call_id=str(tool_call_id or ""),
             subagent_type=normalized_type,
             plan_item_id=str(plan_item_id or ""),
             run_in_background=bool(run_in_background),
@@ -2843,6 +3439,7 @@ class SubagentManager:
             model_config=model_config,
             custom_config=custom_config,
             event_callback=event_callback,
+            permission_mode=_parent_permission_mode,
         )
         with self._lock:
             if task.task_id in self._tasks:
@@ -2925,6 +3522,12 @@ class SubagentManager:
                 )
                 break
 
+        # 超时/取消：给 worker 一个短暂的打捞窗口，等它在 finally 里把最后一段
+        # 正文写进 partial_result 再返回。abort_inflight_streams 已关闭在飞请求，
+        # 正常情况毫秒级退出；不 join 会让主 Agent 拿到 2000 字符前的旧快照，
+        # 部分产出越完整，"在已有成果上继续"才越可行。
+        if task.status in {"timed_out", "cancelled"} and task.thread is not None:
+            task.thread.join(timeout=2.0)
         return self._foreground_result(task.task_id)
 
     def _watch_background(
@@ -3007,6 +3610,20 @@ class SubagentManager:
                 )
                 return
         task.slot_acquired = True
+        _own_undo_turn = None  # 按回合撤销：后台任务拥有的独立检查点 (checkpoint, ctx)
+        # 线程本地权限档位作用域：子代理线程不继承父回合的线程绑定，必须用
+        # 创建时快照的档位重新绑定，否则鉴权路径回退到全局默认（父会话 full、
+        # 全局 confirm/accept_edits 时子代理工具仍反复弹审批）。
+        from contextlib import nullcontext as _nullcontext
+
+        from core import app_context as _subagent_app_context
+
+        _permission_scope = (
+            _subagent_app_context.permission_mode_scope(task.permission_mode)
+            if task.permission_mode
+            else _nullcontext()
+        )
+        _permission_scope.__enter__()
         try:
             with self._lock:
                 if task.status != "pending":
@@ -3015,24 +3632,48 @@ class SubagentManager:
                 task.started_at = time.time()
                 self._record_stage_locked(task, "running")
 
-            # 子代理线程标记父会话，使工具级共享缓存可被复用
-            _tool_cache.set_current_session(task.parent_session)
-            # 子代理线程继承父回合的工作目录上下文（多会话并行隔离）
-            from core.workspace_context import set_workdir
-            if task.workdir:
-                set_workdir(task.workdir)
-            # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
-            # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
-            # 不会串到其他并行会话
-            import core.app_context as _subagent_app_context
+            # 启动段（会话/工作目录/undo 检查点绑定）异常兜底：这里抛错会让
+            # 线程带着 running 状态裸崩（永无终态回调与 done_event），必须
+            # 落成终态让等待方可见（取消中 → cancelled，其余 → failed）
+            try:
+                # 子代理线程标记父会话，使工具级共享缓存可被复用
+                _tool_cache.set_current_session(task.parent_session)
+                # 子代理线程继承父回合的工作目录上下文（多会话并行隔离）
+                from core.workspace_context import set_workdir
+                if task.workdir:
+                    set_workdir(task.workdir)
+                # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
+                # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
+                # 不会串到其他并行会话
+                _subagent_app_context.set_thread_session(task.parent_session)
+                from core.plan import set_current_plan_session as _bind_plan_route
 
-            _subagent_app_context.set_thread_session(task.parent_session)
-            from core.plan import set_current_plan_session as _bind_plan_route
+                _bind_plan_route(task.parent_session)
+                # 按回合撤销归属（规格 9.2）：
+                # - 前台同步子代理共享父回合检查点（只借记录权）；
+                # - 可能迟于父回合结束的后台任务从启动时拥有独立检查点，
+                #   并以 parent_checkpoint_id 关联来源回合。
+                from core.turn_undo import recorder as _tu_recorder
+                from core.turn_undo import service as _tu_service
 
-            _bind_plan_route(task.parent_session)
-            from core.memory import bind_turn_checkpoint as _bind_turn_checkpoint
-
-            _bind_turn_checkpoint(task.parent_session, task.parent_turn_id)
+                _own_undo_turn = None
+                if task.run_in_background:
+                    _own_undo_turn = _tu_service.begin_background_task_turn(
+                        parent_turn_id=task.parent_turn_id,
+                        description=f"后台子代理 {task.task_id}: {task.description[:60]}",
+                    )
+                else:
+                    _tu_recorder.bind_thread_for_turn(task.parent_turn_id, owner=False)
+            except BaseException as error:
+                _logger.warning("子代理启动段失败 %s: %s", task.task_id, error)
+                _tool_cache.set_current_session(None)
+                if task.cancel_event.is_set():
+                    self._terminate(task.task_id, "cancelled", "task cancelled")
+                else:
+                    self._terminate(
+                        task.task_id, "failed", f"子代理启动失败: {error}"
+                    )
+                return
             try:
                 result = _strip_advisor_tags(str(self._runner(task) or "").strip())
             except BaseException as error:
@@ -3041,26 +3682,73 @@ class SubagentManager:
                 else:
                     self._terminate(task.task_id, "failed", str(error))
                 _tool_cache.set_current_session(None)
+                if _own_undo_turn is not None:
+                    try:
+                        _tu_service.finish_background_task_turn(
+                            _own_undo_turn[1], reason="后台任务异常终止"
+                        )
+                    except Exception:
+                        pass
                 return
+
+            # 现场打捞：终态判定前先把已产出的正文落进 partial_result
+            self._record_partial(task.task_id, result)
 
             try:
                 if task.cancel_event.is_set():
                     self._terminate(task.task_id, "cancelled", "task cancelled")
-                elif task.tool_errors:
+                elif task.turn_error or not _has_meaningful_subagent_result(result):
+                    # 无有效正文、或回合被熔断/轮次上限中止（正文只是中止前的
+                    # 过程叙述，不是结论）才判失败；此时工具错误与回合级原因
+                    # 是最有价值的诊断信息
+                    reason = (
+                        f"子代理回合被中止：{task.turn_error}"
+                        if task.turn_error
+                        else "subagent returned no public answer"
+                    )
+                    if not task.turn_error and task.tool_errors:
+                        reason += "；工具错误: " + "; ".join(
+                            f"{name}: {detail}"
+                            for name, detail in task.tool_errors.items()
+                        )
+                    self._terminate(task.task_id, "failed", reason)
+                elif task.tool_errors and task.tool_success_count == 0:
+                    # 所有工具调用都失败：结论只是错误复述，不能当成功
                     details = "; ".join(
                         f"{name}: {detail}" for name, detail in task.tool_errors.items()
                     )
                     self._terminate(task.task_id, "failed", details)
-                elif not _has_meaningful_subagent_result(result):
-                    self._terminate(task.task_id, "failed", "subagent returned no public answer")
                 else:
-                    self._complete(task.task_id, result)
+                    self._complete(
+                        task.task_id,
+                        _with_tool_error_footer(
+                            result, task.tool_errors, task.turn_error
+                        ),
+                    )
             finally:
                 _tool_cache.set_current_session(None)
         finally:
-            from core.memory import clear_turn_checkpoint_binding
+            if _own_undo_turn is not None:
+                try:
+                    from core.turn_undo import service as _tu_service
 
-            clear_turn_checkpoint_binding()
+                    _tu_service.finish_background_task_turn(_own_undo_turn[1])
+                except Exception:
+                    pass
+            # H2：子代理线程的检查点绑定必须解除，避免下一任务复用线程时
+            # TLS 残留旧 ctx 触发"检查点已封闭"误拒或跨回合串记录
+            try:
+                from core.turn_undo import recorder as _tu_recorder
+
+                _tu_recorder.unbind_thread()
+            except Exception:
+                pass
+            # 线程本地权限档位必须随任务结束解绑，避免复用线程（如测试主线程
+            # 直调）时档位残留到下一个任务
+            try:
+                _permission_scope.__exit__(None, None, None)
+            except Exception:
+                pass
             self._release_slot(task)
 
     def _complete(self, task_id: str, result: str) -> bool:
@@ -3179,15 +3867,13 @@ class SubagentManager:
             task = self._tasks[task_id]
             if task.status == "completed":
                 result = str(task.result or "")
-                # 子代理结果过长时截断，避免完整大段内容进入主代理上下文浪费 token。
-                max_len = SUBAGENT_RESULT_MAX_CHARS
-                if len(result) > max_len:
-                    omitted = len(result) - max_len
-                    result = (
-                        result[:max_len]
-                        + f"\n\n... [子代理结果已截断，省略 {omitted} 字符]"
-                    )
-                return result
+                # 子代理结果过长时截断，避免完整大段内容进入主代理上下文浪费 token；
+                # 尾部告警块（工具报错/回合级中止原因）由 helper 原样保留。
+                return _truncate_subagent_result(
+                    result,
+                    SUBAGENT_RESULT_MAX_CHARS,
+                    "\n\n... [子代理结果已截断，省略 {omitted} 字符]",
+                )
             if task.status == "timed_out" and task.handoff:
                 # 计划项子代理超时移交：返回结构化 JSON，让主 Agent 直接进入
                 # 接管核查流程（检查现场 → 继续执行 → plan_finish），
@@ -3200,6 +3886,9 @@ class SubagentManager:
                     "inspection_required": True,
                     "stage": task.stage,
                     "execution_elapsed": round(task.execution_elapsed, 1),
+                    "partial_result": str(task.partial_result or "")[
+                        :SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS
+                    ],
                     "error": task.error,
                 }, ensure_ascii=False)
             # 失败/超时/取消：返回结构化文本，让主 agent 能快速理解决策下一步
@@ -3237,7 +3926,17 @@ class SubagentManager:
         # 下一步建议（根据失败类型给不同指引）
         hints = []
         if task.status == "timed_out":
-            hints.append("子代理超时，主 Agent 应直接用自身工具完成该任务，或拆分为更小的子任务")
+            if str(task.partial_result or "").strip():
+                hints.append(
+                    "子代理超时，但已产出部分成果：先用 read_file/list_directory 核对"
+                    "工作区实际改动，确认哪些已完成，再在已有成果基础上继续；"
+                    "不要从头重做已完成的工作。剩余工作量仍大时拆成更小的子任务。"
+                )
+            else:
+                hints.append(
+                    "子代理超时且没有可交付正文：主 Agent 应直接用自身工具完成该任务，"
+                    "或拆分为更小的子任务后重新派发"
+                )
         elif task.status == "cancelled":
             hints.append("子代理被取消（可能是父轮次结束），如仍需执行请重新发起")
         elif tool_lines:
@@ -3261,7 +3960,23 @@ class SubagentManager:
         if tool_lines:
             parts.append("失败工具清单:")
             parts.extend(tool_lines)
-        parts.append(f"耗时: 执行 {round(task.execution_elapsed, 1)}s / 等待审批 {round(task.approval_wait_elapsed, 1)}s")
+        partial = str(task.partial_result or "").strip()
+        if partial:
+            if len(partial) > SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS:
+                partial = (
+                    partial[:SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS]
+                    + "\n... [部分产出已截断，完整内容以工作区实际改动为准]"
+                )
+            parts.append(
+                "已完成的部分（超时/失败前已产出的正文，据此判断成果是否已落地；"
+                "通常可直接采用或在其基础上继续，不要从头重做）:"
+            )
+            parts.append(partial)
+        parts.append(
+            f"进度: 阶段 {task.stage} / 工具成功 {task.tool_success_count} 次 / "
+            f"执行 {round(task.execution_elapsed, 1)}s（预算 {task.timeout_seconds}s）"
+            f" / 等待审批 {round(task.approval_wait_elapsed, 1)}s"
+        )
         parts.append("下一步建议:")
         for h in hints:
             parts.append(f"  {h}")
@@ -3375,25 +4090,6 @@ class SubagentManager:
                     task.run_in_background
                     and task.parent_session == parent_session
                     and not task.done_event.is_set()
-                ):
-                    return True
-            return False
-
-    def has_unconsumed_terminal_background_tasks(self, parent_session: str) -> bool:
-        """检查指定会话是否有未消费的终态后台子代理任务（成功+失败都算）。
-
-        用于决定是否在 turn 开始时注入汇总上下文。
-        """
-        if not parent_session:
-            return False
-        with self._lock:
-            for task in self._tasks.values():
-                if (
-                    task.run_in_background
-                    and task.parent_session == parent_session
-                    and task.status in _SUBAGENT_TERMINAL_STATUSES
-                    and task.done_event.is_set()
-                    and not task.notification_consumed
                 ):
                     return True
             return False
@@ -3534,7 +4230,21 @@ class SubagentManager:
             stages=tuple(task.stages),
             execution_elapsed=task.execution_elapsed,
             approval_wait_elapsed=task.approval_wait_elapsed,
+            partial_result=task.partial_result,
+            tool_call_id=task.tool_call_id,
         )
+
+    def _record_partial(self, task_id: str, text: str) -> None:
+        """现场打捞：记录已产出的正文，不改变任务终态（终态判定可能早于线程返回）。"""
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            if len(cleaned) > len(task.partial_result):
+                task.partial_result = cleaned
 
     def _record_stage(self, task_id: str, name: str, detail: str = "") -> None:
         with self._lock:
@@ -3570,13 +4280,19 @@ class SubagentManager:
 
     @staticmethod
     def _notification(task: SubagentTask) -> str:
-        summary = f"子任务「{task.description[:40]}」{task.status}"
+        # B1-01：子代理产出是数据——进上下文前中和保留标记（仅内容值；
+        # 包装标签与 XML 转义不受影响），防伪造标记与误截断。
+        from core.injection_markers import neutralize_reserved_markers
+
+        summary = neutralize_reserved_markers(
+            f"子任务「{task.description[:40]}」{task.status}"
+        )
         return f"""<task-notification>
   <task-id>{escape(task.task_id)}</task-id>
   <status>{escape(task.status)}</status>
   <summary>{escape(summary)}</summary>
-  <result>{escape(task.result)}</result>
-  <error>{escape(task.error)}</error>
+  <result>{escape(neutralize_reserved_markers(task.result))}</result>
+  <error>{escape(neutralize_reserved_markers(task.error))}</error>
 </task-notification>"""
 
     def _run_default_subagent(self, task: SubagentTask) -> str:
@@ -3670,32 +4386,19 @@ class SubagentManager:
             custom_system_prompt = ""
             custom_allowed_tools = None
 
-        default_allowed_tools = {
-            "explore": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "search_news", "fetch_url", "get_weather",
-            },
-            "implement": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "search_news", "fetch_url", "get_weather", "write_file",
-                "edit_file", "execute_command",
-            },
-            "test": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "execute_command",
-            },
-            "review": {
-                "read_file", "list_directory", "search_code", "glob_files",
-                "search_news", "fetch_url", "get_weather",
-            },
-            "general": None,
-        }
+        # 白名单定义在模块级 _SUBAGENT_DEFAULT_ALLOWED_TOOLS，便于单测直接断言
+        # 角色工具面（曾因局部硬编码遗漏 novel_audit 等只读插件工具导致计划死锁）。
         allowed_tools = (
             custom_allowed_tools if custom_allowed_tools is not None
-            else default_allowed_tools[role]
+            else default_subagent_allowed_tools(role)
         )
         # 自定义子 agent 的系统提示词优先；未配置时用内置 role_instructions
         instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]
+        # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪 / 信源分级五条对内置与自定义子代理
+        # 一律生效。拼进 instruction_text 而非仅在首请求拼接——后续「续写总结」请求
+        # （cont_messages）同样复用 instruction_text，两处请求自动带上同一份约束。
+        # 顺序：身份正文在前、公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
+        instruction_text = instruction_text + "\n" + build_subagent_common_block(allowed_tools)
         messages = [
             {
                 "role": "system",
@@ -3707,6 +4410,9 @@ class SubagentManager:
                     "【速度要求】子任务必须快速收敛：优先用 search_code / glob_files / "
                     "list_directory 定位关键位置后精读相关片段，不要逐文件全文通读；"
                     "信息足以支撑结论时立即停止探索并输出最终结论，不要追求穷尽。"
+                    "【结论格式】最终结论只写主 Agent 决策所需的事实：做了什么、"
+                    "改了哪些文件、验证结果、未完成项与风险。不要复述任务描述，"
+                    "不要逐条回顾工具调用过程，不要做与任务无关的推测性延伸。"
                     "所有输出必须使用中文，包括过程说明与最终结论；"
                     "不要输出 [Advisor consultation] 等内部协议标记，"
                     "也不要在正文中书写 <function_calls>/<advisor-request> 之类的 XML 伪工具调用。"
@@ -3717,6 +4423,30 @@ class SubagentManager:
                 "content": f"请完成以下子任务：\n{task.description}",
             },
         ]
+        def _budget_notice_provider():
+            """每步边界返回一次时间预算提醒，无新提醒时返回 None。
+
+            execution_elapsed 由 manager 的监管循环累加（排队与审批等待不计时），
+            子代理线程只读；提醒级别写回 task，保证同一级别只注入一次。
+            提醒文本以 user 消息插在 Step 边界，工具调用与结果配对始终完整。
+            """
+            budget = int(task.timeout_seconds or 0)
+            remaining = budget - float(task.execution_elapsed or 0.0)
+            level, text = build_subagent_budget_notice(
+                remaining,
+                budget,
+                task.budget_notice_stage,
+            )
+            if text is None:
+                return None
+            task.budget_notice_stage = level
+            self._record_stage(
+                task.task_id,
+                "budget_notice",
+                f"剩余约 {int(max(0.0, remaining))}s 已提醒收尾",
+            )
+            return text
+
         self._record_stage(task.task_id, "model")
         # 子代理执行具体计划项时，不应继承父会话的计划锁约束；
         # 否则子代理会被剥夺 write_file/edit_file/execute_command 等必要工具，
@@ -3739,62 +4469,112 @@ class SubagentManager:
             cache_scope=f"subagent:{role}",
             cache_session_id=task.parent_session,
             model_id=current_model_id,
+            budget_notice_provider=_budget_notice_provider,
         )
+
         answer = []
         tool_errors: dict[str, str] = {}
+        success_count = 0
+        partial_parts: list[str] = []
+        partial_len = 0
+        partial_flushed = 0
+        turn_error_message = ""
         # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度。
         # 必须把事件消费循环包在作用域内，因为生成器创建时并不执行子代理逻辑；
         # 若只包生成器创建语句，深度会在真正执行前复位，嵌套深度限制将永久失效。
-        with _subagent_depth_scope():
-            for event in events:
-                if event.kind == "thinking_started":
-                    self._record_stage(task.task_id, "thinking")
-                elif event.kind == "tool_started":
-                    self._record_stage(
-                        task.task_id,
-                        "tool",
-                        str(event.payload.get("name", "")),
-                    )
-                    # 结果只保留最后一次工具调用之后的文本。工具调用前的过程叙述
-                    # （"我先给你一版初步结论，继续补读…"）不是最终结论，拼进结果
-                    # 会让主 Agent 把中间思路当成事实汇总（软件识别会话的真实事故）。
-                    answer.clear()
-                elif event.kind == "permission_requested":
-                    self._record_stage(task.task_id, "waiting_approval")
-                elif event.kind == "permission_resolved":
-                    self._record_stage(task.task_id, "running", "approval resolved")
-                elif event.kind == "assistant_delta":
-                    self._record_stage(task.task_id, "composing")
-                    answer.append(str(event.payload.get("text", "")))
-                elif event.kind == "tool_finished":
-                    name = str(event.payload.get("name", "tool"))
-                    if event.payload.get("ok") is False:
-                        tool_errors[name] = str(
-                            event.payload.get("summary")
-                            or event.payload.get("error")
-                            or "工具执行失败"
+        try:
+            with _subagent_depth_scope():
+                for event in events:
+                    if event.kind == "thinking_started":
+                        self._record_stage(task.task_id, "thinking")
+                    elif event.kind == "tool_started":
+                        self._record_stage(
+                            task.task_id,
+                            "tool",
+                            str(event.payload.get("name", "")),
                         )
-                    else:
-                        tool_errors.pop(name, None)
-                elif event.kind == "diff_ready":
-                    # 子代理修改文件产生的 diff 必须转发回父回合，否则父回合的
-                    # "文件更改"面板会丢失子代理的改动。tool_call_id 是子代理
-                    # 内部的调用 id，父端匹配不到会归入 legacy_diffs 兜底，
-                    # 仍能汇总展示。后台子代理在父回合结束后才转发时，父端
-                    # 事件流已收尾，转发为 best-effort（失败不影响主流程）。
-                    if task.event_callback is not None:
-                        try:
-                            task.event_callback("diff_ready", dict(event.payload))
-                        except Exception:
-                            logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+                        # 结果只保留最后一次工具调用之后的文本。工具调用前的过程叙述
+                        # （"我先给你一版初步结论，继续补读…"）不是最终结论，拼进结果
+                        # 会让主 Agent 把中间思路当成事实汇总（软件识别会话的真实事故）。
+                        answer.clear()
+                    elif event.kind == "permission_requested":
+                        self._record_stage(task.task_id, "waiting_approval")
+                    elif event.kind == "permission_resolved":
+                        self._record_stage(task.task_id, "running", "approval resolved")
+                    elif event.kind == "assistant_delta":
+                        self._record_stage(task.task_id, "composing")
+                        text = str(event.payload.get("text", ""))
+                        answer.append(text)
+                        # 现场打捞用：partial_parts 不随 tool_started 清空
+                        partial_parts.append(text)
+                        partial_len += len(text)
+                        if partial_len - partial_flushed >= 2000:
+                            self._record_partial(task.task_id, "".join(partial_parts))
+                            partial_flushed = partial_len
+                    elif event.kind == "tool_finished":
+                        name = str(event.payload.get("name", "tool"))
+                        if event.payload.get("ok") is False:
+                            err = str(
+                                event.payload.get("summary")
+                                or event.payload.get("error")
+                                or "工具执行失败"
+                            )
+                            tool_errors[name] = err
+                            # 阶段历史带上失败摘要，右面板执行流程能看到卡在哪一步
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                f"{name} ✗ {' '.join(err.split())[:120]}",
+                            )
+                        else:
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                f"{name} ✓ {_format_tool_stage_duration(event.payload.get('duration_ms'))}",
+                            )
+                            tool_errors.pop(name, None)
+                            success_count += 1
+                    elif event.kind == "turn_error":
+                        # 无进展熔断/轮次上限只走事件通道，不 yield 正文
+                        turn_error_message = str(
+                            event.payload.get("message") or turn_error_message
+                        )
+                    elif event.kind == "diff_ready":
+                        # 子代理修改文件产生的 diff 必须转发回父回合，否则父回合的
+                        # "文件更改"面板会丢失子代理的改动。tool_call_id 是子代理
+                        # 内部的调用 id，父端匹配不到会归入 legacy_diffs 兜底，
+                        # 仍能汇总展示。后台子代理在父回合结束后才转发时，父端
+                        # 事件流已收尾，转发为 best-effort（失败不影响主流程）。
+                        if task.event_callback is not None:
+                            try:
+                                task.event_callback("diff_ready", dict(event.payload))
+                            except Exception:
+                                _logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+        finally:
+            # 现场打捞兜底：与循环内的周期 flush 幂等（_record_partial 只在更长时覆盖）。
+            # 事件循环中途抛异常（如网络错误）时，周期 flush 只保到最后一个
+            # 2000 字符边界，靠这里把尾部不足 2000 的正文也捞住，不改变异常传播。
+            self._record_partial(task.task_id, "".join(partial_parts))
         task.tool_errors.update(tool_errors)
+        task.tool_success_count = success_count
+        task.turn_error = turn_error_message
         result_text = "".join(answer)
 
         # summary_continuation：结果过短或为空时追加要求展开，避免子代理敷衍
         # 参考 Kimi Code 的 SUMMARY_MIN_LENGTH 机制。
         # 为空也要触发：最后一次工具调用之后模型可能没再输出文本（结果提取
         # 只保留末次工具调用后的内容），此时必须补一轮总结才有可交付结论。
-        if len(result_text.strip()) < 200 and not task.cancel_event.is_set():
+        # 无进展熔断/轮次上限中止（turn_error）后不再续写：终态已注定 failed，
+        # 续写产出只会以截断 partial 出现在失败文本里，白烧一次 LLM 请求。
+        # 阈值 120：只拦"搞定/完成"这类敷衍（以及末次工具调用后无正文的空结果），
+        # 不再把 150 字左右的精炼结论判为过短。与系统提示的【结论格式】配套：
+        # 只加约束不降阈值，会出现"写了精炼结论 → 被判太短 → 被迫展开"的自相矛盾，
+        # 白烧一次完整请求（大任务上下文下这一步本身就要 10s+）。
+        if (
+            len(result_text.strip()) < 120
+            and not task.cancel_event.is_set()
+            and not turn_error_message
+        ):
             continuation_prompt = (
                 "你之前的回答过于简短。请提供更完整的总结，包含：\n"
                 "1. 具体的技术细节和实现要点\n"
@@ -3859,12 +4639,18 @@ subagent_manager = SubagentManager()
 # 按角色的默认超时（秒）：只读角色必须快速收敛，写代码/跑测试允许更久。
 # 调用方显式传 timeout_seconds 时以显式值为准。
 _SUBAGENT_DEFAULT_TIMEOUTS = {
-    "explore": 240,
-    "review": 300,
-    "test": 480,
-    "implement": 600,
-    "general": 600,
+    "explore": 300,
+    "review": 420,
+    "test": 900,
+    "implement": 900,
+    "general": 900,
 }
+
+# 前台子代理的等待上限（秒）：前台会阻塞父回合，不能无限拉长；
+# 超过该预算的大任务应转后台（后台默认预算按系数放宽）。
+SUBAGENT_FOREGROUND_MAX_TIMEOUT = 900
+# 后台子代理预算系数：后台不阻塞用户，允许在角色默认值上放宽 1.5 倍。
+SUBAGENT_BACKGROUND_TIMEOUT_FACTOR = 1.5
 
 
 def make_authorized_verification_runner(
@@ -3917,6 +4703,20 @@ def make_authorized_verification_runner(
     return authorized_verification_runner
 
 
+def _current_tool_call_id() -> str:
+    """当前线程正在执行的工具调用 id（由工具管线在调用期间绑定）。
+
+    取不到时返回空串：子代理任务仍会创建，只是 GUI 卡片无法按调用分组
+    （CLI 调用、测试直连等非工具链路径）。
+    """
+    try:
+        import core.app_context as _app_context
+
+        return str(_app_context.get_thread_tool_call_id() or "")
+    except Exception:
+        return ""
+
+
 def run_subagent(
     task_description,
     run_in_background=False,
@@ -3961,17 +4761,17 @@ def run_subagent(
                 "plan_item_id": str(plan_item_id or ""),
                 "error": "timeout_seconds 必须在 30 到 3600 秒之间。",
             }, ensure_ascii=False)
-        if not run_in_background and timeout_seconds > 600:
+        if not run_in_background and timeout_seconds > SUBAGENT_FOREGROUND_MAX_TIMEOUT:
             # 前台硬上限（内部调用同样受限）：模型不得把前台子 Agent 超时扩大到
             # 2400/3600 秒；长命令应使用后台任务 + manage_task(wait) 等待。
             return json.dumps({
                 "status": "failed",
                 "plan_item_id": str(plan_item_id or ""),
                 "error": (
-                    "前台子代理 timeout_seconds 硬上限为 600 秒（当前 {} 秒）。"
+                    "前台子代理 timeout_seconds 硬上限为 {} 秒（当前 {} 秒）。"
                     "长任务请拆分为更小的计划项，或改用 run_in_background=true "
                     "启动后台任务并用 manage_task(action='wait') 等待结果。"
-                ).format(timeout_seconds),
+                ).format(SUBAGENT_FOREGROUND_MAX_TIMEOUT, timeout_seconds),
             }, ensure_ascii=False)
     if not str(task_description or "").strip():
         return json.dumps({
@@ -4002,6 +4802,36 @@ def run_subagent(
             (item for item in scheduler.plan.snapshot() if item["id"] == str(plan_item_id)),
             None,
         )
+        if plan_item is None:
+            # 计划项查无此项时必须区分两种根因，否则会把平台侧路由缺陷
+            # 谎报成“计划项不存在”，误导模型放弃或改写计划：
+            #   1) 执行线程未绑定计划会话（绑定环境缺失，如并行工具线程
+            #      未继承计划路由）——可重试的环境问题；
+            #   2) 绑定会话内确实没有该 id——模型应核对 id 而不是重试。
+            from core.plan import get_bound_plan_session
+
+            bound_session = get_bound_plan_session()
+            if bound_session is None:
+                return json.dumps({
+                    "status": "blocked",
+                    "reason": "plan_binding_missing",
+                    "plan_item_id": str(plan_item_id),
+                    "error": (
+                        f"无法定位计划项 '{plan_item_id}'：当前执行线程未绑定计划会话"
+                        "（绑定环境缺失，属平台侧计划路由问题，不是计划项状态冲突）。"
+                        "请重试本项；若持续失败可改用单发（非同批并发）方式派发，"
+                        "并先用 plan_read 核对计划项 id。"
+                    ),
+                }, ensure_ascii=False)
+            return json.dumps({
+                "status": "blocked",
+                "reason": "plan_item_not_found",
+                "plan_item_id": str(plan_item_id),
+                "error": (
+                    f"计划会话 '{bound_session}' 中不存在计划项 '{plan_item_id}'，"
+                    "请先用 plan_read 核对当前会话的计划项 id。"
+                ),
+            }, ensure_ascii=False)
         if plan_item is not None and plan_item.get("kind") == "input_preparation":
             return json.dumps({
                 "status": "blocked",
@@ -4169,10 +4999,16 @@ def run_subagent(
         return None
 
     # 此时 subagent_type 已最终确定（含计划 stage 自动映射），解析角色默认超时。
-    # 只读角色（explore/review）默认更短：子代理设计目标是"快"，
-    # 10 分钟级别的探索/审查违背设计初衷（自定义类型回落到 600 秒）。
+    # 只读角色（explore/review）预算更短：子代理设计目标是"快"；
+    # 写代码/跑测试角色按实测 p99 给到 900s，避免"快做完被硬砍"。
+    # 后台任务不阻塞用户，默认预算再放宽 1.5 倍；显式传入的预算不做放大。
     if timeout_seconds is None:
-        timeout_seconds = _SUBAGENT_DEFAULT_TIMEOUTS.get(str(subagent_type or "general"), 600)
+        timeout_seconds = _SUBAGENT_DEFAULT_TIMEOUTS.get(str(subagent_type or "general"), 900)
+        if run_in_background:
+            timeout_seconds = min(
+                3600,
+                int(timeout_seconds * SUBAGENT_BACKGROUND_TIMEOUT_FACTOR),
+            )
 
     try:
         return subagent_manager.run(
@@ -4187,6 +5023,9 @@ def run_subagent(
             terminal_callback=terminal_callback if scheduler is not None else None,
             event_callback=event_callback,
             task_id=delegated_task_id if scheduler is not None else None,
+            # 归属到派生本任务的 run_subagent 调用：GUI 每张卡片只展示
+            # 自己创建的子代理。取不到（CLI/非工具链调用）时留空。
+            tool_call_id=_current_tool_call_id(),
         )
     except Exception as error:
         # 启动失败（如容量满）时回滚计划项，释放 _in_flight_files 占用
@@ -4216,6 +5055,199 @@ def dream_consolidation():
         return "🚨 整理失败：大模型密钥尚未配置，无法提炼记忆。"
         
     return run_dream_consolidation_sync(task_model, task_key, task_url)
+
+def recall_history(before_msg_id, limit=16, cancel_event=None):
+    """回溯当前会话更早被压缩归档的原始消息（recall_history 工具执行体）。
+
+    只服务摘要水位覆盖的范围：活跃区消息模型本就可见，重复注入只会浪费
+    上下文。会话身份取执行线程绑定，取不到时回退全局当前会话。
+    """
+    import core.app_context as _app_context
+
+    session_name = ""
+    try:
+        session_name = str(
+            _app_context.get_thread_session() or _app_context.get_current_session() or ""
+        ).strip()
+    except Exception:
+        session_name = ""
+    if not session_name:
+        return "无法确定当前会话，无法回溯历史。"
+    try:
+        manager = _app_context.get_manager()
+    except Exception:
+        manager = None
+    if manager is None:
+        return "会话存储未就绪，无法回溯历史。"
+
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+
+    try:
+        rows = manager.get_compressed_messages(session_name, before_msg_id, limit)
+    except Exception as exc:
+        return f"回溯历史失败：{exc}"
+    if not rows:
+        return (
+            "该范围内没有已压缩的原始消息。before_msg_id 需指向摘要水位覆盖的"
+            "区间（取值见记忆摘要块尾部的[更早摘要回溯]索引中的 msg_id）。"
+        )
+
+    lines = []
+    for row in rows:
+        content = str(row.get("content") or "").strip()
+        if len(content) > 600:
+            content = content[:600] + "...[该条过长，已截断]"
+        lines.append(f"#msg_id={row.get('id')} [{row.get('role')}]\n{content}")
+    header = (
+        f"共回溯 {len(rows)} 条已压缩原始消息（按时间正序；before_msg_id 含边界自身）。"
+        "需要更早的内容时，把 before_msg_id 设为本批最早一条的 msg_id 减 1 再调用。"
+    )
+    return header + "\n\n" + "\n\n".join(lines)
+
+def search_sessions(query, limit=10, session=None, cancel_event=None):
+    """跨会话全文检索历史消息（search_sessions 工具执行体）。
+
+    检索覆盖当前数据库内 messages 表已写入的全部消息（含已被压缩归档、
+    不再出现在活跃上下文里的早期消息）。索引在每次检索前增量补齐，因此
+    刚写入的消息也能立刻搜到。纯只读，不改任何状态。
+    """
+    keyword = str(query or "").strip()
+    if not keyword:
+        return "🚨 请提供要检索的关键词（query 不能为空）。"
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+    try:
+        import core.app_context as _app_context
+        manager = _app_context.get_manager()
+    except Exception:
+        manager = None
+    if manager is None:
+        return "会话存储未就绪，无法全文检索历史消息。"
+    try:
+        limit_n = int(limit)
+    except (TypeError, ValueError):
+        limit_n = 10
+    limit_n = max(1, min(50, limit_n))
+    session_name = str(session or "").strip() or None
+    try:
+        rows = manager.search_messages(
+            keyword, limit=limit_n, session_name=session_name
+        )
+    except Exception as exc:
+        return f"全文检索失败：{exc}"
+    if rows is None:
+        return "当前 SQLite 未启用 FTS5，全文检索不可用（不影响其它功能）。"
+    if not rows:
+        return (
+            "未找到匹配消息；检索覆盖当前数据库内已写入的消息，"
+            "索引会在每次检索前增量补齐。"
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+
+    lines = []
+    for row in rows:
+        if cancel_event is not None and cancel_event.is_set():
+            return "🛑 操作已被用户取消。"
+        snippet = str(row.get("snippet") or "").replace("\n", " ").strip()
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "…"
+        if not snippet:
+            snippet = "(该条无可见片段)"
+        display = row.get("display_name") or row.get("session_name") or "(未知)"
+        lines.append(
+            f"#msg_id={row.get('id')} [{row.get('role')}] 会话: {display}\n{snippet}"
+        )
+    scope = f"（限定会话: {session_name}）" if session_name else "（跨全部会话）"
+    header = (
+        f"命中 {len(rows)} 条消息{scope}，按相关度排序，最多返回 {limit_n} 条；"
+        "片段中的 《》 标记匹配到的关键词。"
+    )
+    return header + "\n\n" + "\n\n".join(lines)
+
+def tool_result_read(handle, mode="head", lines=80, grep=None, cancel_event=None):
+    """取回被 snip/elide 折叠的工具结果原文（tool_result_read 工具执行体）。
+
+    句柄取自 marker 里的 `#xxxxxxxx`，如
+    `[snipped tool result #ab12cd34 — read_file, ...]`。纯只读，不改任何状态。
+    """
+    from core.tool_result_maintenance import is_valid_handle
+
+    if not is_valid_handle(handle):
+        return (
+            "🚨 无效的句柄。句柄是 marker 里 `#` 后的 8 位小写十六进制"
+            "（形如 [snipped tool result #ab12cd34 — read_file, ...]）。"
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+    try:
+        import core.app_context as _app_context
+        manager = _app_context.get_manager()
+    except Exception:
+        manager = None
+    if manager is None:
+        return "会话存储未就绪，无法取回工具结果。"
+    try:
+        row = manager.get_tool_result_archive(handle)
+    except Exception as exc:
+        return f"取回工具结果失败：{exc}"
+    if not row:
+        return (
+            f"归档中没有句柄 #{handle} 的记录。归档仅覆盖被 snip/elide 折叠过的"
+            "工具结果（未折叠的结果仍在上下文里，无需取回）。"
+        )
+    content = str(row.get("content") or "")
+    body_lines = content.split("\n")
+    total_lines = len(body_lines)
+    header = (
+        f"归档工具结果 #{row.get('handle')}｜来源工具: {row.get('tool_name') or '(未知)'}"
+        f"｜原始 {row.get('bytes')} 字节 / {total_lines} 行"
+        f"｜改写前保存于 {row.get('created_at') or '(未知)'}"
+    )
+    mode = str(mode or "head").strip().lower()
+    if mode not in ("head", "tail", "grep", "full"):
+        mode = "head"
+    try:
+        line_limit = int(lines)
+    except (TypeError, ValueError):
+        line_limit = 80
+    line_limit = max(1, min(2000, line_limit))
+    if mode == "grep":
+        pattern = str(grep or "").strip()
+        if not pattern:
+            return header + "\n\n🚨 mode=grep 需要同时提供 grep 参数（要搜索的文本）。"
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            regex = None
+        hits = []
+        for idx, line in enumerate(body_lines, 1):
+            if cancel_event is not None and idx % 200 == 0 and cancel_event.is_set():
+                return "🛑 操作已被用户取消。"
+            if (regex.search(line) if regex else pattern.lower() in line.lower()):
+                hits.append(f"{idx}:{line[:500]}")
+                if len(hits) >= 100:
+                    break
+        if not hits:
+            return header + f"\n\n命中 0 行（grep={pattern!r}）。"
+        return header + f"\n\n命中 {len(hits)} 行（最多 100 行，格式 行号:内容）:\n" + "\n".join(hits)
+    if mode == "full":
+        # 全文保护上限：超过 200000 字符时截断，避免把一次折叠省下的字节又灌回上下文
+        full_text = content
+        note = ""
+        if len(full_text) > 200000:
+            full_text = full_text[:200000]
+            note = "\n\n[... 全文超过 200000 字符，已截断；建议改用 mode=grep 精确检索]"
+        return header + f"\n\n全文（{len(content)} 字符）:\n" + full_text + note
+    if mode == "tail":
+        selected = body_lines[-line_limit:]
+        start = total_lines - len(selected) + 1
+        label = f"末尾 {len(selected)} 行（从第 {start} 行开始）"
+    else:
+        selected = body_lines[:line_limit]
+        label = f"开头 {len(selected)} 行"
+    return header + f"\n\n{label}（全文共 {total_lines} 行）:\n" + "\n".join(selected)
 
 def glob_files(pattern, dir_path=".", cancel_event=None):
     """快速文件模式匹配：使用 glob 表达式在项目目录中搜索匹配的文件路径列表。优先尝试 ripgrep。"""
@@ -4315,3 +5347,695 @@ def glob_files(pattern, dir_path=".", cancel_event=None):
         return result_text
     except Exception as e:
         return f"🚨 快速匹配工具发生异常: {str(e)}"
+
+
+def undo_turn(turn_id=""):
+    """按回合撤销工具（规格 18）：撤销指定回合（缺省为最近可撤销回合）的
+    全部受控文件修改。
+
+    只接受回合标识；不接收文件路径、force 或任意撤销参数。权限由管线在
+    执行前经权限中介卡片确认（卡片内展示服务预检的影响摘要）；一次性
+    确认令牌在服务内部消费，绝不返回给模型或进入消息历史。
+    """
+    from core.turn_undo import service as tu_service
+    from core.turn_undo.models import TurnUndoError, TurnUndoStatus
+
+    from core import app_context
+
+    session_name = app_context.get_thread_session() or ""
+    if not session_name:
+        return "🚨 无法确定当前会话，撤销工具不可用。"
+    session_id = None
+    resolved = None
+    try:
+        session_id = tu_service.resolve_session_id(session_name)
+        resolved = tu_service.resolve_turn_id_in_session(session_id, turn_id)
+        preview, token = tu_service.preview_turn_undo(session_id, resolved)
+    except TurnUndoError as error:
+        # 已撤销回合重复调用：幂等成功摘要，不再修改文件（规格 17.3）
+        try:
+            checkpoint = tu_service.get_default_storage().get_checkpoint_by_turn(
+                session_id, resolved
+            )
+        except Exception:
+            checkpoint = None
+        if checkpoint is not None and checkpoint.status_enum is TurnUndoStatus.REVERTED:
+            return "ℹ 该回合此前已撤销过，本次未修改任何文件（聊天历史保留）。"
+        return f"🚨 无法撤销：{error.message}"
+    except RuntimeError as error:
+        return f"🚨 无法撤销：{error}"
+
+    if preview.conflicts:
+        lines = ["🚨 预检发现文件冲突，本次没有修改任何文件："]
+        for conflict in preview.conflicts:
+            reasons = "；".join(conflict.reasons) or "状态不一致"
+            lines.append(f"- {conflict.display_path}: {reasons}")
+        lines.append("提示：磁盘文件与回合结束时状态不一致，已拒绝整轮撤销。")
+        return "\n".join(lines)
+
+    if preview.status is not TurnUndoStatus.READY:
+        return f"🚨 无法撤销：回合当前状态为 {preview.status.value}，本次没有修改任何文件。"
+
+    try:
+        result = tu_service.execute_turn_undo(session_id, resolved, token)
+    except TurnUndoError as error:
+        if error.code in ("revert_interrupted", "recovery_required"):
+            return (
+                f"🚨 撤销事务中断：{error.message}\n"
+                "文件可能处于部分恢复状态，受影响路径已冻结；"
+                "请通过 GUI 恢复选项或 /undo recover 显式继续或取消。"
+            )
+        return f"🚨 撤销失败：{error.message}"
+
+    if result.idempotent:
+        return "ℹ 该回合此前已撤销过，本次未修改任何文件（聊天历史保留）。"
+
+    total = (len(result.restored_files) + len(result.deleted_created_files)
+             + len(result.restored_deleted_files))
+    lines = [
+        f"✔ 已撤销回合 {result.turn_id[:8]} 的 {total} 个文件修改"
+        f"（恢复原内容 {len(result.restored_files)}，"
+        f"删除本轮新建 {len(result.deleted_created_files)}，"
+        f"恢复本轮删除 {len(result.restored_deleted_files)}）。",
+        "聊天历史保留；终端命令与外部副作用未随文件恢复。",
+        "后续继续相关工作前必须重新读取磁盘文件。",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 秘书调度台工具（设计 2026-10-15 第 3/4/5 节）
+# 三个工具只对秘书会话可见（core/secretary 的工具策略），真实能力由 GUI 侧实现
+# 并经 core.secretary_dispatch 注册；core 层不 import gui_bridge。CLI / 脚本等
+# 未注册场景返回可读中文错误，绝不抛异常。
+# ---------------------------------------------------------------------------
+
+_SECRETARY_DISPATCH_UNAVAILABLE = (
+    "🚨 秘书调度能力当前不可用：会话检索 / 派活 / 跳转由界面进程提供，"
+    "需要 GUI 运行中（CLI / 脚本场景下不可用）。"
+)
+
+
+def _secretary_dispatch_service():
+    """取调度服务句柄；未注册或加载失败时返回 (None, 可读错误文本)。"""
+    try:
+        from core import secretary_dispatch as _dispatch
+    except Exception as exc:
+        return None, f"🚨 秘书调度能力加载失败：{exc}"
+    try:
+        service = _dispatch.get()
+    except Exception as exc:
+        return None, f"🚨 秘书调度能力加载失败：{exc}"
+    if service is None:
+        return None, _SECRETARY_DISPATCH_UNAVAILABLE
+    return service, ""
+
+
+def _secretary_scope_limit(value, default=20, maximum=50):
+    """limit 归一化：非法 / 非正数回落默认值，超出上限截到上限。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return min(parsed, maximum)
+
+
+def _secretary_json(payload) -> str:
+    """统一序列化出口：中文不转义，保证模型与日志可读。"""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def search_conversations(
+    keyword="", date_from="", date_to="", workdir="", limit=20, cancel_event=None
+):
+    """检索历史会话（秘书调度台：能力一）。
+
+    按关键词 / 日期区间（YYYY-MM-DD）/ 项目目录过滤；关键词与日期都为空时由
+    服务层拒绝（避免把全部会话倾倒进上下文）。返回 JSON 字符串：
+    ``{"count": n, "results": [{session_name, display_name, is_secretary,
+    workdir, updated_at, message_count, snippets}, ...]}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    _raise_if_cancelled(cancel_event)
+    try:
+        results = service.search_conversations(
+            keyword=str(keyword or ""),
+            date_from=str(date_from or ""),
+            date_to=str(date_to or ""),
+            workdir=str(workdir or ""),
+            limit=_secretary_scope_limit(limit),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 检索会话失败：{exc}"
+    except Exception as exc:
+        return f"🚨 检索会话失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    rows = [row for row in (results or []) if isinstance(row, dict)]
+    payload = {"count": len(rows), "results": rows}
+    if not rows:
+        payload["hint"] = "没找到匹配的会话，可换关键词或放宽日期范围。"
+    return _secretary_json(payload)
+
+
+# ---------------------------------------------------------------------------
+# secretary 场景的 JEV 决策接线（设计文档 2026-10-18 第 3 节）
+# 只在「调用方没有显式指定 target」时介入：让决策模型在「已有的最近若干会话」
+# 与「新建会话」之间挑一个。任何异常 / 无候选 / 答案不合法都回落原逻辑。
+# ---------------------------------------------------------------------------
+
+# 选择项里的「新建会话」标记（与调度服务的 new 语义标记无关，仅本题内部使用）
+_SECRETARY_NEW_OPTION = "new"
+_SECRETARY_TARGET_INSTRUCTIONS = (
+    "判断这条任务应该派发到哪个已有会话执行；如果没有明显相关的会话，"
+    "选 new 表示新建会话。只依据任务描述与会话名判断。"
+)
+# 与 decision_service.DEFAULT_CONFIG["scenes"]["secretary"]["timeout_ms"] 对齐
+_SECRETARY_DECISION_TIMEOUT_MS = 250
+# 候选上限：只把最近的 10 个会话交给模型，避免题目与上下文膨胀
+_SECRETARY_CANDIDATE_LIMIT = 10
+# state 里任务描述的截断长度（这段文本会真实发送给决策模型）
+_SECRETARY_STATE_PROMPT_CHARS = 300
+# 秘书检索协议要求「关键词或日期至少给一个」（否则会抛错拒绝全表倾倒）。这里给
+# 一个早于任何数据的日期下界，语义等价于「按最近更新时间取候选会话」；刻意不拿
+# 任务正文当 LIKE 关键词——任务正文通常是整句，几乎必然零命中，决策永远发不出去。
+_SECRETARY_CANDIDATE_DATE_FLOOR = "1970-01-01"
+
+
+def _secretary_decision_armed():
+    """secretary 场景当前是否需要发起决策（关 / 未启用 → False）。
+
+    这条前置判断的意义：JEV 全关时必须在**调用调度服务之前**就退出，保证
+    ``dispatch_task`` 对调度服务的调用次数与接入前完全一致（不白跑一次会话检索）。
+    读取配置失败一律视为未启用。
+    """
+    try:
+        from core import decision_service as _decision
+
+        config = _decision.load_decision_config()
+    except Exception as error:
+        _logger.debug("secretary 场景读取决策配置失败，按未启用处理: %s", error)
+        return False
+    if not isinstance(config, dict) or not bool(config.get("enabled")):
+        return False
+    scenes = config.get("scenes")
+    if not isinstance(scenes, dict):
+        return False
+    scene_config = scenes.get("secretary")
+    if not isinstance(scene_config, dict):
+        return False
+    return bool(scene_config.get("enabled"))
+
+
+def _secretary_candidate_rows(service, workdir):
+    """取候选会话：最近的 ``_SECRETARY_CANDIDATE_LIMIT`` 个，按 updated_at 倒序。
+
+    走调度服务既有的 ``search_conversations``（协议见 core/secretary_dispatch.py），
+    不复用任何私有实现。取不到（抛错 / 结构异常 / 全无 session_name）一律返回
+    空列表，调用方据此完全不发决策。
+    """
+    try:
+        rows = service.search_conversations(
+            keyword="",
+            date_from=_SECRETARY_CANDIDATE_DATE_FLOOR,
+            date_to="",
+            workdir=str(workdir or ""),
+            limit=_SECRETARY_CANDIDATE_LIMIT,
+        )
+    except Exception as error:
+        # 检索失败（未实现 / 参数被拒 / 底层异常）不是派活失败：只是不发决策
+        _logger.debug("secretary 场景取候选会话失败，跳过决策: %s", error)
+        return []
+    if not isinstance(rows, (list, tuple)):
+        return []
+    candidates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("session_name") or "").strip()
+        if not name:
+            continue
+        candidates.append(
+            {
+                "session_name": name,
+                "display_name": str(row.get("display_name") or "").strip() or name,
+                "updated_at": str(row.get("updated_at") or ""),
+            }
+        )
+    # 服务端已按 updated_at 倒序，这里再兜一次（协议未强制顺序）
+    candidates.sort(key=lambda item: item["updated_at"], reverse=True)
+    return candidates[:_SECRETARY_CANDIDATE_LIMIT]
+
+
+def _secretary_decision_state(prompt, workdir, candidates):
+    """构造决策 state：任务描述前 300 字符 + 候选会话名 + 工作目录。
+
+    隐私约束：这段文本会真实发送给决策模型，只允许出现任务描述截断、会话名
+    （session_name / display_name）与 workdir；**绝不拼接会话历史、检索片段、
+    文件内容或任何密钥**。
+    """
+    head = str(prompt or "").strip()[:_SECRETARY_STATE_PROMPT_CHARS]
+    lines = [f"任务描述：{head}", "候选会话："]
+    for candidate in candidates:
+        name = candidate["session_name"]
+        display = candidate["display_name"]
+        if display and display != name:
+            lines.append(f"- {name}（{display}）")
+        else:
+            lines.append(f"- {name}")
+    lines.append(f"工作目录：{str(workdir or '').strip() or 'GLOBAL'}")
+    return "\n".join(lines)
+
+
+def _decide_secretary_target(service, prompt, workdir):
+    """secretary 场景接入：未指定目标时让 JEV 挑一个已有会话作为派发目标。
+
+    返回采纳的 ``session_name``；``None`` 表示未启用 / 影子 / 无候选 / 上游失败 /
+    选了「新建会话」/ 答案不在候选内 / 任何异常——调用方此时保持 ``target=""``，
+    走原有「按 workdir 懒建新会话」的路径。因此 JEV 全关时本函数恒为 None，
+    派发目标、调用次数、返回文本与接入前完全一致。
+    """
+    try:
+        if not _secretary_decision_armed():
+            return None
+        candidates = _secretary_candidate_rows(service, workdir)
+        if not candidates:
+            # 没有候选就没有选择余地：不打扰决策模型，等价于新建会话
+            return None
+        # 惰性导入：避免 core.tools 与 core.decision_gateway 循环依赖
+        from core.decision_gateway import decide
+
+        names = [candidate["session_name"] for candidate in candidates]
+        options = [_SECRETARY_NEW_OPTION] + names
+        # 上游 choice 题的 criteria 是「选项名 → 描述」的对象（传数组会 422）
+        criteria = {_SECRETARY_NEW_OPTION: "新建一个会话来处理这条任务"}
+        for candidate in candidates:
+            session_name = candidate["session_name"]
+            display = str(candidate.get("display_name") or "").strip()
+            criteria[session_name] = f"派给已有会话：{display or session_name}"
+        question = {
+            "type": "choice",
+            "instructions": _SECRETARY_TARGET_INSTRUCTIONS,
+            "criteria": criteria,
+        }
+        state = _secretary_decision_state(prompt, workdir, candidates)
+        picked = decide(
+            "secretary",
+            state,
+            question,
+            options=options,
+            timeout_ms=_SECRETARY_DECISION_TIMEOUT_MS,
+        )
+    except Exception as error:
+        # gateway 已兜底；这里再兜一层，决策永远不能成为派活的故障点
+        _logger.debug("secretary 场景决策失败，沿用原派发规则: %s", error)
+        return None
+    if not isinstance(picked, str):
+        return None
+    picked = picked.strip()
+    # "new"（新建会话）、空串、候选之外的名字（脏数据）统统视为「不改变目标」
+    if picked not in names:
+        return None
+    return picked
+
+
+def dispatch_task(
+    target="", prompt="", workdir="", model_id="", permission_mode="", cancel_event=None
+):
+    """把任务派给指定会话（秘书调度台：能力二）。
+
+    语义等价于**用户在目标会话亲手发一条消息**：内容以 role=user 落库、界面
+    正常显示并触发一轮真实执行；不传任何"自动化"显示标记。``target`` 为空或
+    「新会话」时按 ``workdir`` 懒创建新会话。返回 JSON 字符串：
+    ``{ok, target_session, display_name, workdir, state}``；目标不唯一时返回
+    ``{ok: false, candidates: [...]}``，由调用方向用户确认。
+
+    JEV 决策（secretary 场景）：**只有调用方没指定 target 时**才问一次决策模型
+    「这条任务该派给哪个已有会话」，采纳时把 target 换成该会话并在返回里带上
+    ``decision_note``；选「new」/ 无候选 / 未启用 / 影子 / 失败一律沿用原逻辑。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    text = str(prompt or "").strip()
+    if not text:
+        return "🚨 派活失败：prompt（任务正文）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    # JEV 决策接入点：仅在 target 为空（真有选择余地）时介入。
+    # None = 未启用/影子/无候选/失败/选了新建会话 → 保持 target 原样。
+    target_value = str(target or "")
+    decision_note = ""
+    if not target_value.strip():
+        decided_target = _decide_secretary_target(service, text, workdir)
+        if decided_target:
+            target_value = decided_target
+            decision_note = f"已按决策模型建议派发到 {decided_target}"
+            _logger.info("secretary 派活采纳决策建议: %s", decided_target)
+    try:
+        result = service.dispatch_task(
+            target=target_value,
+            prompt=text,
+            workdir=str(workdir or ""),
+            model_id=str(model_id or ""),
+            permission_mode=str(permission_mode or ""),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 派活失败：{exc}"
+    except Exception as exc:
+        return f"🚨 派活失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 派活失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    # 只在决策真正被采纳时加说明，保证 JEV 全关时返回文本逐字节不变
+    if decision_note:
+        payload["decision_note"] = decision_note
+    if payload.get("ok") is False and payload.get("candidates"):
+        payload["hint"] = (
+            "目标不唯一：请把候选里的 session_name 交给用户确认后，用确定的"
+            "target 重新派活。"
+        )
+    return _secretary_json(payload)
+
+
+def dispatch_batch(tasks=None, cancel_event=None):
+    """一次派出多条任务，并声明同批次内的依赖关系（秘书专用：能力九）。
+
+    升级设计 2026-11-04 第 6.1 节。``tasks`` 是任务数组，每项
+    ``{title, prompt, target, workdir, depends_on}``：
+
+    - ``depends_on`` 填**同批次内其它任务的下标**（从 0 开始），不填表示无依赖；
+    - 无依赖项立即并行派发，有依赖项先落 ``blocked``，等上游全部完成后由
+      依赖推进器自动启动，用户不必再催；
+    - 单批最多 8 条；下标越界 / 指向自身 / 成环会被直接拒绝（成环会给出环路径）。
+
+    返回 JSON 字符串 ``{ok, batch_id, items: [{index, dispatch_id, state}]}``；
+    ``batch_id`` 可用于 ``list_dispatches`` 汇总本批结果。参数非法时返回可读
+    提示文本，不抛异常。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    if isinstance(tasks, (str, bytes)) or not isinstance(tasks, (list, tuple)):
+        return "🚨 批量派活失败：tasks 需要是任务数组（每项含 prompt 等字段）。"
+    if not tasks:
+        return "🚨 批量派活失败：tasks 至少需要一条任务。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.dispatch_batch(tasks=[dict(t) if isinstance(t, dict) else t for t in tasks])
+    except SecretaryDispatchError as exc:
+        return f"🚨 批量派活失败：{exc}"
+    except Exception as exc:
+        return f"🚨 批量派活失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 批量派活失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    return _secretary_json(payload)
+
+
+def open_session(target="", cancel_event=None):
+    """把用户带到某个历史会话（秘书调度台：能力三）。
+
+    纯系统层切换（不模拟点击）：解析目标（会话名 / 显示名 / 关键词唯一命中）、
+    已归档先取消归档、切换当前会话并推送界面事件。返回 JSON 字符串：
+    ``{ok, session_name, display_name, workdir}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    wanted = str(target or "").strip()
+    if not wanted:
+        return "🚨 跳转失败：target（会话名或显示名）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.open_session(target=wanted)
+    except SecretaryDispatchError as exc:
+        return f"🚨 跳转失败：{exc}"
+    except Exception as exc:
+        return f"🚨 跳转失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 跳转失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    return _secretary_json(payload)
+
+
+def create_project(path="", cancel_event=None):
+    """新建项目文件夹并引入为工作区（秘书调度台：能力四）。
+
+    等价于用户点侧栏「添加/引入项目文件夹」并选中该目录：目录不存在则逐级
+    创建，已存在则直接复用；登记进工作区表后侧栏立刻出现对应分组，之后
+    ``dispatch_task(workdir=该路径)`` 即可在其中建会话执行任务。
+
+    只接受完整路径（用户已明确「在对话里说清建在哪」），不做相对路径推断——
+    秘书自己猜位置最容易建到意料之外的目录里。返回 JSON 字符串：
+    ``{ok, workdir, created, display_name}``。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    wanted = str(path or "").strip()
+    if not wanted:
+        return "🚨 新建项目失败：path（完整路径）不能为空。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        result = service.create_project(path=wanted)
+    except SecretaryDispatchError as exc:
+        return f"🚨 新建项目失败：{exc}"
+    except Exception as exc:
+        return f"🚨 新建项目失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(result, dict):
+        return f"🚨 新建项目失败：调度服务返回了无法识别的结果：{result!r}"
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    return _secretary_json(payload)
+
+
+# ---------------------------------------------------------------------------
+# 秘书派活台账查询（升级设计 2026-11-04 第 3.4 节）
+# 两个只读工具同样只对秘书会话可见（core.secretary 的工具策略），能力由 GUI 侧
+# 实现并经 core.secretary_dispatch 注册；未注册时返回同一句可读提示，不抛异常。
+# 用途：用户隔一轮问「刚才那个怎么样」，秘书直接查台账即可答出结论摘要与状态，
+# 不用重新检索会话、也不用用户复述。
+# ---------------------------------------------------------------------------
+
+#: 列表里的结论摘要长度上限（完整摘要走 get_dispatch_result）
+_SECRETARY_LIST_EXCERPT_CHARS = 200
+
+#: 详情返回的字段（顺序即阅读顺序；prompt / result_excerpt 都不截断）
+_SECRETARY_DISPATCH_DETAIL_FIELDS = (
+    "id",
+    "title",
+    "target_session",
+    "target_display",
+    "workdir",
+    "status",
+    "started_at",
+    "finished_at",
+    "prompt",
+    "result_excerpt",
+    "error",
+    "depends_on",
+    "batch_id",
+    "secretary_session",
+)
+
+
+def _secretary_dispatch_brief(row) -> dict:
+    """台账行 → 列表项：只留定位与该轮结论，摘要截 ``_SECRETARY_LIST_EXCERPT_CHARS``。"""
+    return {
+        "id": row.get("id"),
+        "title": str(row.get("title") or ""),
+        "target_display": str(row.get("target_display") or ""),
+        "workdir": str(row.get("workdir") or ""),
+        "status": str(row.get("status") or ""),
+        "started_at": str(row.get("started_at") or ""),
+        "finished_at": str(row.get("finished_at") or ""),
+        "result_excerpt": str(row.get("result_excerpt") or "")[
+            :_SECRETARY_LIST_EXCERPT_CHARS
+        ],
+    }
+
+
+def _secretary_dispatch_detail(row) -> dict:
+    """台账行 → 详情：全字段原样输出（prompt / result_excerpt 不做截断）。"""
+    payload = {"ok": True}
+    for field in _SECRETARY_DISPATCH_DETAIL_FIELDS:
+        value = row.get(field)
+        if field == "depends_on":
+            dependency_ids = []
+            for item in value or []:
+                try:
+                    dependency_ids.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            payload[field] = dependency_ids
+            continue
+        if isinstance(value, str) or value is None or isinstance(value, int):
+            payload[field] = value
+        else:
+            payload[field] = str(value)
+    return payload
+
+
+def list_dispatches(status="", workdir="", target="", limit=20, cancel_event=None):
+    """列出秘书派出的任务台账（秘书专用：能力五）。
+
+    用来回答「刚才派出去的那些任务怎么样」：按状态 / 项目目录 / 目标会话
+    （会话名或显示名子串）过滤，按任务编号倒序返回最近的若干条。每条含
+    id / title / target_display / workdir / status / started_at / finished_at /
+    result_excerpt（截 200 字）；要看完整结论与错误用 ``get_dispatch_result``。
+
+    无命中返回纯文本「没有符合条件的派活记录」（不是空 JSON，便于直接回话）。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    _raise_if_cancelled(cancel_event)
+    try:
+        rows = service.list_dispatches(
+            status=str(status or ""),
+            workdir=str(workdir or ""),
+            target=str(target or ""),
+            limit=_secretary_scope_limit(limit),
+        )
+    except SecretaryDispatchError as exc:
+        return f"🚨 查询派活记录失败：{exc}"
+    except Exception as exc:
+        return f"🚨 查询派活记录失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    items = [_secretary_dispatch_brief(row) for row in (rows or []) if isinstance(row, dict)]
+    if not items:
+        return "没有符合条件的派活记录"
+    return _secretary_json({"count": len(items), "dispatches": items})
+
+
+def get_dispatch_result(dispatch_id=None, cancel_event=None):
+    """查一条派活任务的完整详情（秘书专用：能力六）。
+
+    ``dispatch_id`` 取 ``list_dispatches`` 返回的 id。返回 JSON 字符串：上面列表
+    的全部字段 + 完整 ``prompt`` / 完整 ``result_excerpt``（不截断）/ ``error`` /
+    ``depends_on`` / ``batch_id`` / ``secretary_session``。编号缺失或非整数、
+    编号不存在都给可读提示而不抛异常。
+    """
+    service, error = _secretary_dispatch_service()
+    if service is None:
+        return error
+    raw = "" if dispatch_id is None else str(dispatch_id).strip()
+    if not raw:
+        return "🚨 查询任务详情失败：dispatch_id（任务编号）不能为空。"
+    try:
+        parsed_id = int(raw)
+    except (TypeError, ValueError):
+        return f"🚨 查询任务详情失败：dispatch_id 需要是整数，收到「{raw}」。"
+    _raise_if_cancelled(cancel_event)
+    try:
+        row = service.get_dispatch_result(dispatch_id=parsed_id)
+    except SecretaryDispatchError as exc:
+        return f"🚨 查询任务详情失败：{exc}"
+    except Exception as exc:
+        return f"🚨 查询任务详情失败：{exc}"
+    _raise_if_cancelled(cancel_event)
+    if not isinstance(row, dict):
+        return f"没有找到任务 #{parsed_id}"
+    payload = _secretary_dispatch_detail(row)
+    payload["id"] = parsed_id
+    return _secretary_json(payload)
+
+
+# ---------------------------------------------------------------------------
+# 项目画像（跨项目记忆：升级设计 2026-11-04 第 5 节）
+# read_project_profile 只读（scope=none），remember_decision 写
+# ~/.ycode/memory/projects/（scope=workspace）。两者都只对秘书会话可见
+# （core.secretary 的工具策略），普通会话的工具集零变化。画像路径、章节枚举与
+# 越界校验统一放在 core.project_profile，这里只做入参校验与可读文本转换。
+# ---------------------------------------------------------------------------
+
+#: remember_decision 单条内容上限（与 core.project_profile 同源，避免两处漂移）
+_REMEMBER_DECISION_MAX_CHARS = project_profile.MAX_SECTION_CONTENT_CHARS
+
+#: 不是磁盘目录的保留分组标识：空 workdir 落在这些分组时不允许写画像
+_PROFILE_RESERVED_WORKDIRS = frozenset({"GLOBAL", "SECRETARY"})
+
+
+def _current_session_workdir():
+    """当前会话的工作目录文本（取不到返回空串；绝不抛）。"""
+    try:
+        from core.workspace_context import get_workdir
+
+        return str(get_workdir() or "")
+    except Exception:
+        return ""
+
+
+def read_project_profile(workdir="", cancel_event=None):
+    """读某个项目的画像（秘书专用：能力七）。
+
+    ``workdir`` 为空时取当前会话的工作目录。返回画像全文（Markdown：技术栈 /
+    架构决策 / 硬约束 / 踩坑记录 / 用户偏好 / 任务流水 六章）。该项目还没有
+    画像时返回可读文本「该项目还没有画像」，绝不抛异常。
+
+    典型用法：用户问「这个项目以前定过什么规矩」时先读画像，再回答。
+    """
+    target = str(workdir or "").strip() or _current_session_workdir()
+    _raise_if_cancelled(cancel_event)
+    try:
+        text = project_profile.read_profile(target)
+    except Exception as exc:
+        return f"🚨 读取项目画像失败：{exc}"
+    if not str(text or "").strip():
+        where = target or "未指定工作目录"
+        return (
+            f"该项目还没有画像（{where}）。"
+            "可以用 remember_decision 先把技术栈 / 架构决策 / 硬约束记下来。"
+        )
+    return text
+
+
+def remember_decision(workdir="", section="", content="", cancel_event=None):
+    """把一条项目级结论记进项目画像（秘书专用：能力八）。
+
+    ``section`` 只能是 技术栈 / 架构决策 / 硬约束 / 踩坑记录 / 用户偏好；
+    ``workdir`` 为空时取当前会话的工作目录。写入位置固定在
+    ``~/.ycode/memory/projects/<hash>.md``，**不碰项目目录**，越界路径由
+    ``core.project_profile`` 直接拒绝。返回可读文本：成功是
+    ``已记入「项目名」的「章节」``，失败是带原因的提示（不抛异常）。
+    """
+    name = str(section or "").strip()
+    if name not in project_profile.SECTION_ALLOWED:
+        return (
+            "🚨 记录失败：section 只能是 %s，收到「%s」。"
+            % ("、".join(project_profile.SECTION_ALLOWED), name or "(空)")
+        )
+    body = str(content or "").strip()
+    if not body:
+        return "🚨 记录失败：content（要记住的内容）不能为空。"
+    if len(body) > _REMEMBER_DECISION_MAX_CHARS:
+        return (
+            f"🚨 记录失败：content 太长（{len(body)} 字），"
+            f"上限 {_REMEMBER_DECISION_MAX_CHARS} 字，请精简后再记。"
+        )
+    _raise_if_cancelled(cancel_event)
+    target = str(workdir or "").strip() or _current_session_workdir()
+    if not str(target or "").strip() or str(target).strip().upper() in _PROFILE_RESERVED_WORKDIRS:
+        return (
+            "🚨 记录失败：无法确定项目目录（当前会话没有归属项目）。"
+            "请在 workdir 里给出该项目的完整路径。"
+        )
+    try:
+        message = project_profile.append_section(target, name, body)
+    except ValueError as exc:
+        return f"🚨 记录失败：{exc}"
+    except Exception as exc:
+        return f"🚨 记录失败：{exc}"
+    if not message:
+        return f"🚨 记录失败：项目画像没有写成（{target}），请稍后重试。"
+    return message

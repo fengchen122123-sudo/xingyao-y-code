@@ -19,15 +19,32 @@ from typing import Any, Callable
 _LOCK = threading.RLock()
 _MAX_ENTRIES = 128
 
+# 单条缓存值的字节上限（1MB）。read_file 的缓存键包含 offset/limit/compress 等维度，
+# 同一个大文件可能同时存在多份副本，单条值理论上可达数 MB；只按条数裁剪无法防止
+# 少数超大条目吃光进程内存，因此超过该上限的条目直接不入缓存（只降低命中率，
+# 不影响返回值语义）。
+_MAX_ENTRY_BYTES = 1024 * 1024
+# 单张缓存表的总字节预算（16MB）。条数上限 128 配上 MB 级单条值仍可能占用数百 MB，
+# 所以在条数裁剪之后再按字节预算从最旧（LRU 顺序）开始淘汰，给内存占用兜底。
+_MAX_TABLE_BYTES = 16 * 1024 * 1024
+
 # Per-tool caches: separate OrderedDicts keep hit/miss stats independent.
 _read_file_cache: OrderedDict[tuple, str] = OrderedDict()
 _search_cache: OrderedDict[tuple, str] = OrderedDict()
 _glob_cache: OrderedDict[tuple, str] = OrderedDict()
 _lsp_cache: OrderedDict[tuple, str] = OrderedDict()
 
+# 每张缓存表对应的 key -> 字节数 计量表，与上面的表同步增删，用于字节预算裁剪。
+_read_file_sizes: dict[tuple, int] = {}
+_search_sizes: dict[tuple, int] = {}
+_glob_sizes: dict[tuple, int] = {}
+_lsp_sizes: dict[tuple, int] = {}
+
 # Shared cache scoped to a parent session.  Subagents and the main agent can
 # share read/search results to avoid re-scanning the same codebase in parallel.
 _shared_cache: dict[str, OrderedDict[tuple, Any]] = {}
+# 每个会话子表同样有 key -> 字节数 计量表（会话 id 维度）。
+_shared_sizes: dict[str, dict[tuple, int]] = {}
 
 # Thread-local session id used to route shared-cache lookups from subagents.
 _session_tls = threading.local()
@@ -51,9 +68,73 @@ def _record(tool: str, hit: bool) -> None:
         entry["misses"] += 1
 
 
-def _prune(cache: OrderedDict) -> None:
+def _entry_size(value: Any) -> int:
+    """估算一条缓存值的 UTF-8 字节数（缓存值基本是 str，其余类型做兜底估算）。"""
+    if isinstance(value, str):
+        try:
+            return len(value.encode("utf-8"))
+        except UnicodeEncodeError:
+            # 孤立代理项等无法编码的字符，按替换后长度计算，保证不抛异常。
+            return len(value.encode("utf-8", "replace"))
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    if value is None:
+        return 0
+    try:
+        return len(repr(value).encode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - 计量失败不应该影响缓存写入
+        return 0
+
+
+def _pop_oldest(cache: OrderedDict, sizes: dict | None) -> None:
+    """淘汰最旧一条，并同步删除它的字节计量。"""
+    try:
+        key, _value = cache.popitem(last=False)
+    except KeyError:
+        return
+    if sizes is not None:
+        sizes.pop(key, None)
+
+
+def _prune(cache: OrderedDict, sizes: dict | None = None) -> None:
+    """按条数裁剪（保持原有行为），并同步清理字节计量。"""
     while len(cache) > _MAX_ENTRIES:
-        cache.popitem(last=False)
+        _pop_oldest(cache, sizes)
+
+
+def _evict_to_budget(cache: OrderedDict, sizes: dict | None) -> None:
+    """按字节预算从最旧开始淘汰，直到该表总字节数 <= _MAX_TABLE_BYTES。"""
+    if sizes is None:
+        return
+    total = sum(sizes.values())
+    while total > _MAX_TABLE_BYTES and cache:
+        try:
+            key, _value = cache.popitem(last=False)
+        except KeyError:
+            break
+        total -= sizes.pop(key, 0)
+
+
+def _cache_set(
+    cache: OrderedDict,
+    sizes: dict | None,
+    key: tuple,
+    value: Any,
+) -> bool:
+    """统一写入入口：先判单条上限，再依次做条数裁剪与字节预算裁剪。
+
+    返回 True 表示已写入缓存；False 表示值超过 _MAX_ENTRY_BYTES 被静默跳过
+    （调用方无需处理，功能正确性不依赖缓存是否命中）。
+    """
+    size = _entry_size(value)
+    if size > _MAX_ENTRY_BYTES:
+        return False
+    cache[key] = value
+    if sizes is not None:
+        sizes[key] = size
+    _prune(cache, sizes)
+    _evict_to_budget(cache, sizes)
+    return True
 
 
 def _get_dir_mtime(path: str) -> float:
@@ -112,8 +193,7 @@ def read_file_get(key: tuple) -> str | None:
 
 def read_file_put(key: tuple, value: str) -> None:
     with _LOCK:
-        _read_file_cache[key] = value
-        _prune(_read_file_cache)
+        _cache_set(_read_file_cache, _read_file_sizes, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +230,11 @@ def search_get(key: tuple) -> str | None:
 
 def search_put(key: tuple, value: str) -> None:
     with _LOCK:
-        cache = _search_cache if key[0] == "search_code" else _lsp_cache
-        cache[key] = value
-        _prune(cache)
+        if key[0] == "search_code":
+            cache, sizes = _search_cache, _search_sizes
+        else:
+            cache, sizes = _lsp_cache, _lsp_sizes
+        _cache_set(cache, sizes, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +262,7 @@ def glob_get(key: tuple) -> str | None:
 
 def glob_put(key: tuple, value: str) -> None:
     with _LOCK:
-        _glob_cache[key] = value
-        _prune(_glob_cache)
+        _cache_set(_glob_cache, _glob_sizes, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +286,7 @@ def shared_get(session_id: str, key: tuple) -> Any | None:
             _record("shared", hit=False)
             return None
         if key in session:
+            session.move_to_end(key)
             _record("shared", hit=True)
             return session[key]
         _record("shared", hit=False)
@@ -214,15 +296,19 @@ def shared_get(session_id: str, key: tuple) -> Any | None:
 def shared_put(session_id: str, key: tuple, value: Any) -> None:
     with _LOCK:
         session = _shared_cache.setdefault(session_id, OrderedDict())
-        session[key] = value
-        # Keep shared cache bounded to avoid unbounded growth.
-        if len(session) > _MAX_ENTRIES:
-            session.popitem(last=False)
+        sizes = _shared_sizes.setdefault(session_id, {})
+        # 会话子表与 per-tool 表受同一套约束：单条上限 + 条数裁剪 + 字节预算裁剪。
+        _cache_set(session, sizes, key, value)
+        if not session:
+            # 超大条目被跳过且会话内没有任何条目时，不留下空会话壳子。
+            _shared_cache.pop(session_id, None)
+            _shared_sizes.pop(session_id, None)
 
 
 def shared_clear(session_id: str) -> None:
     with _LOCK:
         _shared_cache.pop(session_id, None)
+        _shared_sizes.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -302,3 +388,9 @@ def clear_all() -> None:
         _glob_cache.clear()
         _lsp_cache.clear()
         _shared_cache.clear()
+        # 字节计量表随缓存一起清空，避免残留的旧尺寸干扰后续裁剪。
+        _read_file_sizes.clear()
+        _search_sizes.clear()
+        _glob_sizes.clear()
+        _lsp_sizes.clear()
+        _shared_sizes.clear()

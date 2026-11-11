@@ -5,15 +5,25 @@
       <div class="nav-section">基础设置</div>
       <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
       <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
+      <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
+      <button data-test="hooks-nav" class="nav-item" :class="{ active: activeSection === 'hooks' }" @click="activeSection = 'hooks'"><span class="nav-ico"><AppIcon name="zap" :size="14" /></span>钩子 Hooks</button>
       <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
+      <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
       <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
+      <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
+      <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
+      <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
+      <div class="nav-section">插件设置</div>
+      <button v-for="p in pluginNavItems" :key="p.name" :data-test="`plugin-nav-${p.name}`" class="nav-item" :class="{ active: activePluginName === p.name }" @click="openPluginSection(p.name)"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>{{ p.name }}</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
+      <div class="nav-section">法律</div>
+      <button data-test="disclaimer-nav" class="nav-item" :class="{ active: activeSection === 'disclaimer' }" @click="activeSection = 'disclaimer'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>免责条款</button>
       <div class="nav-spacer"></div>
-      <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><AppIcon name="settings" :size="13" /></div>
+      <div class="settings-user"><span class="avatar">Y</span><span>星瑶Code</span><AppIcon name="settings" :size="13" /></div>
     </aside>
 
     <main class="settings-main">
@@ -38,7 +48,7 @@
             @click="selectProvider(provider.id)"
           >
             <span class="provider-logo cube"><AppIcon name="hexagon" :size="13" /></span>
-            <span class="provider-name">{{ provider.name }}</span>
+            <span class="provider-name" :title="provider.name">{{ shortLabel(provider.name) }}</span>
             <span class="provider-state ready"></span>
           </button>
           <div v-if="!store.providers.length" class="provider-empty">暂无已配置厂商</div>
@@ -102,24 +112,16 @@
             <div class="readonly-field">{{ selectedPreset.base_url }}</div>
             <label class="field-label">API Key</label>
             <div class="key-field">
-              <input
+              <textarea
                 v-model="presetApiKey"
                 data-test="preset-api-key"
-                :type="showPresetKey ? 'text' : 'password'"
-                placeholder="输入 API Key"
-              />
+                rows="3"
+                :class="{ 'key-masked': !showPresetKey }"
+                placeholder="一行一个 API Key，可配置多个"
+              ></textarea>
               <button @click="showPresetKey = !showPresetKey">{{ showPresetKey ? '隐藏' : '显示' }}</button>
             </div>
-            <div class="model-preview-title">将添加以下模型</div>
-            <div class="preset-models">
-              <div v-for="model in selectedPreset.models" :key="model.name" class="preset-model-row">
-                <span class="mono">{{ model.name }}</span>
-                <span>{{ formatContext(model.context_window) }}</span>
-                <span :class="['vision-tag', { on: model.supports_vision }]">
-                  {{ model.supports_vision ? '多模态' : '纯文本' }}
-                </span>
-              </div>
-            </div>
+            <p class="modal-field-hint">预置厂商仅预填名称与接口地址；添加后通过「获取模型列表」选择模型并自动填充参数。</p>
             <button class="primary-button" :disabled="saving" @click="savePreset">
               {{ configuredPresetIds.has(selectedPreset.id) ? '更新 API Key' : '保存并添加厂商' }}
             </button>
@@ -128,7 +130,9 @@
           <template v-else-if="selectedProvider">
             <div class="detail-title-row">
               <div>
-                <h2>{{ selectedProvider.name }}</h2>
+                <!-- 厂商名可任意长：只展示前 6 个字符，完整名字放进 title 作悬停气泡，
+                     否则长标题会撑开标题行并压住右侧删除按钮 -->
+                <h2 class="detail-title" :title="selectedProvider.name">{{ shortLabel(selectedProvider.name) }}</h2>
                 <p>{{ selectedProvider.preset_id ? '预置厂商配置' : '自定义模型供应商' }}</p>
               </div>
               <button class="danger-icon" title="删除厂商" @click="store.deleteProvider(selectedProvider)"><AppIcon name="trash" :size="16" /></button>
@@ -155,12 +159,13 @@
 
             <label class="field-label">API Key</label>
             <div class="key-field">
-              <input
+              <textarea
                 v-model="providerForm.api_key"
                 data-test="provider-api-key"
-                :type="showProviderKey ? 'text' : 'password'"
-                :placeholder="selectedProvider.has_api_key ? '已配置；留空表示不修改' : '输入 API Key'"
-              />
+                rows="3"
+                :class="{ 'key-masked': !showProviderKey }"
+                :placeholder="selectedProvider.has_api_key ? '已配置；一行一个 Key，留空表示不修改' : '一行一个 API Key，可配置多个'"
+              ></textarea>
               <button
                 class="icon-button"
                 title="复制 API Key"
@@ -177,31 +182,85 @@
                 <h3>模型列表</h3>
                 <span>{{ selectedProvider.models?.length || 0 }} 个模型</span>
               </div>
-              <button data-test="add-model" class="secondary-button compact" @click="openModelModal()"><AppIcon name="plus" :size="12" /> 添加模型</button>
+              <div class="model-list-actions">
+                <button data-test="add-model" class="secondary-button compact" @click="openModelModal()"><AppIcon name="plus" :size="12" /> 添加模型</button>
+              </div>
             </div>
             <div v-if="!selectedProvider.models?.length" class="empty-models">该厂商暂无模型</div>
             <div v-else class="configured-models">
-              <div v-for="model in selectedProvider.models" :key="model.id" class="configured-model-row">
-                <div class="model-main">
-                  <span class="mono model-id">{{ model.name }}</span>
-                  <span>{{ formatContext(model.context_window) }}</span>
-                  <span :class="['vision-tag', { on: model.supports_vision }]">
-                    {{ model.supports_vision ? '多模态' : '纯文本' }}
+              <div v-for="model in selectedProvider.models" :key="model.id" class="configured-model-item">
+                <div class="configured-model-row">
+                  <div class="model-main">
+                    <span class="mono model-id" :title="model.name">{{ model.name }}</span>
+                    <span class="model-meta-ctx">{{ formatContext(model.context_window) }}</span>
+                    <span :class="['vision-tag', { on: model.supports_vision }]">
+                      {{ model.supports_vision ? '多模态' : '纯文本' }}
+                    </span>
+                  </div>
+                  <span
+                    v-if="testResults[model.id] && testResults[model.id].status !== 'fail'"
+                    class="test-result"
+                    :class="testResults[model.id].status"
+                  >
+                    <AppIcon
+                      v-if="testResults[model.id].status === 'ok'"
+                      name="check"
+                      :size="12"
+                      :stroke-width="2.25"
+                    />
+                    <AppIcon
+                      v-else-if="testResults[model.id].status === 'testing'"
+                      name="loader"
+                      :size="12"
+                      class="icon-spin"
+                    />
+                    {{ testResults[model.id].msg }}
                   </span>
+                  <div class="row-actions">
+                    <button :disabled="testingId === model.id" @click="testModel(model)">
+                      {{ testingId === model.id ? '测试中…' : '测试' }}
+                    </button>
+                    <button @click="openModelModal(model)">编辑</button>
+                    <button class="danger" @click="store.deleteModel(model)">删除</button>
+                  </div>
                 </div>
-                <span v-if="testResults[model.id]" class="test-result" :class="testResults[model.id].status">
-                  <AppIcon
-                    v-if="testResults[model.id].status !== 'testing'"
-                    :name="testResults[model.id].status === 'ok' ? 'check' : 'x'"
-                    :size="12"
-                    :stroke-width="2.25"
-                  />
-                  {{ testResults[model.id].msg }}
-                </span>
-                <div class="row-actions">
-                  <button :disabled="testingId === model.id" @click="testModel(model)">测试</button>
-                  <button @click="openModelModal(model)">编辑</button>
-                  <button class="danger" @click="store.deleteModel(model)">删除</button>
+
+                <!-- 方案 B：行内展开微型警告条 -->
+                <div
+                  v-if="testResults[model.id]?.status === 'fail'"
+                  class="model-error-banner"
+                  data-test="model-error-banner"
+                >
+                  <div class="error-banner-content">
+                    <AppIcon name="triangle-alert" :size="13" class="error-banner-icon" />
+                    <span class="error-banner-title">{{ testResults[model.id].friendly?.title || '连接失败' }}</span>
+                    <span
+                      v-if="testResults[model.id].friendly?.detail"
+                      class="error-banner-desc"
+                      :title="testResults[model.id].friendly?.detail"
+                    >
+                      — {{ testResults[model.id].friendly?.detail }}
+                    </span>
+                  </div>
+                  <div class="error-banner-actions">
+                    <button
+                      class="banner-action-btn"
+                      data-test="copy-test-error"
+                      title="复制完整报错信息"
+                      @click="copyTestError(model.id)"
+                    >
+                      <AppIcon :name="copiedErrorId === model.id ? 'check' : 'copy'" :size="11" />
+                      <span>{{ copiedErrorId === model.id ? '已复制' : '复制报错' }}</span>
+                    </button>
+                    <button
+                      class="banner-action-btn close-btn"
+                      data-test="dismiss-test-error"
+                      title="关闭此条提示"
+                      @click="dismissTestResult(model.id)"
+                    >
+                      <AppIcon name="x" :size="12" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -245,9 +304,18 @@
             <label class="field-label">名称</label>
             <input v-model="customForm.name" data-test="custom-name" class="text-field" placeholder="如：团队网关" />
             <label class="field-label">Base URL</label>
-            <input v-model="customForm.base_url" class="text-field mono" placeholder="https://api.example.com/v1" />
+            <input v-model="customForm.base_url" data-test="custom-base-url" class="text-field mono" placeholder="https://api.example.com/v1" />
             <label class="field-label">API Key</label>
-            <input v-model="customForm.api_key" type="password" class="text-field" placeholder="输入 API Key" />
+            <div class="key-field">
+              <textarea
+                v-model="customForm.api_key"
+                data-test="custom-api-key"
+                rows="3"
+                :class="{ 'key-masked': !showCustomKey }"
+                placeholder="一行一个 API Key，可配置多个"
+              ></textarea>
+              <button @click="showCustomKey = !showCustomKey">{{ showCustomKey ? '隐藏' : '显示' }}</button>
+            </div>
             <label class="field-label">API 格式</label>
             <select v-model="customForm.protocol" class="text-field">
               <option v-for="protocol in store.modelProtocols" :key="protocol.id" :value="protocol.id">
@@ -262,7 +330,7 @@
       </section>
       </template>
       <template v-else-if="activeSection === 'permissions'">
-        <header class="settings-header">
+        <header class="settings-header settings-header--narrow">
           <div>
             <h1>权限与沙盒</h1>
             <p>与 CLI 的 /sandbox、/whitelist 共享同一份配置与存储。</p>
@@ -349,6 +417,16 @@
           </div>
         </section>
       </template>
+      <template v-else-if="activeSection === 'hooks'">
+        <header class="settings-header settings-header--narrow">
+          <div>
+            <h1>钩子 Hooks</h1>
+            <p>用户级与项目级生命周期钩子（支持手动配置，信任确认后生效）。</p>
+          </div>
+        </header>
+
+        <HooksSettings />
+      </template>
       <template v-else-if="activeSection === 'contact'">
         <header class="settings-header">
           <div>
@@ -385,7 +463,7 @@
             <div class="contact-qr-wrap" @click="enlargedQr = { src: qrcodeWechat, alt: '微信群二维码' }">
               <img :src="qrcodeWechat" alt="微信群二维码" class="contact-qr" data-test="contact-wechat-qr" />
             </div>
-            <p class="contact-expiry">该二维码 7 天内（9月8日前）有效，过期后请重新获取</p>
+            <p class="contact-expiry">该二维码 7 天内（10月7日前）有效，过期后请重新获取</p>
           </section>
 
           <section class="contact-card">
@@ -402,10 +480,10 @@
         </div>
       </template>
       <template v-else-if="activeSection === 'about'">
-        <header class="settings-header">
+        <header class="settings-header settings-header--narrow">
           <div>
             <h1>关于</h1>
-            <p>Y-CODE · {{ store.agentName }} —— 你的 AI 编程搭档。</p>
+            <p>{{ store.agentName }} —— 你的 AI 编程搭档。</p>
           </div>
         </header>
 
@@ -450,9 +528,187 @@
           <p v-else class="changelog-empty">更新内容加载中…</p>
         </section>
       </template>
+      <template v-else-if="activeSection === 'disclaimer'">
+        <header class="settings-header settings-header--narrow">
+          <div>
+            <h1>免责条款</h1>
+            <p>使用本软件前，请阅读并理解以下条款。继续使用本软件，即视为你已阅读并接受本条款。</p>
+          </div>
+        </header>
+
+        <section class="perm-settings-card disclaimer-card" data-test="disclaimer-doc">
+          <div class="disclaimer-meta">
+            <span class="mono" data-test="disclaimer-version">{{ disclaimerVersion }}</span>
+            <span>更新日期 {{ disclaimerUpdatedAt }}</span>
+            <span>适用于本软件全部发行版本</span>
+            <span
+              class="disclaimer-status"
+              :class="isDisclaimerVersionAccepted(store.disclaimerAcceptedVersion, disclaimerVersion) ? 'disclaimer-status--accepted' : 'disclaimer-status--pending'"
+            >
+              {{ isDisclaimerVersionAccepted(store.disclaimerAcceptedVersion, disclaimerVersion) ? `已同意本版本 (${store.disclaimerAcceptedVersion})` : '待确认最新条款' }}
+            </span>
+          </div>
+
+          <article v-for="(clause, i) in disclaimerClauses" :key="i" class="disclaimer-clause">
+            <h3>{{ clause.title }}</h3>
+            <ol class="disclaimer-list">
+              <li v-for="(item, j) in clause.items" :key="j">{{ item }}</li>
+            </ol>
+          </article>
+
+          <footer class="disclaimer-foot">
+            <p>本条款是软件使用条款的组成部分。若你不同意其中任何内容，请停止使用本软件。</p>
+            <p>如对条款有疑问，可通过「联系我们」中的邮箱与我们沟通。</p>
+          </footer>
+        </section>
+      </template>
+      <!-- 会话归档：原侧栏底部「已归档」区的完整入口，交互语义不变（可逆恢复 + 两段确认删除） -->
+      <template v-else-if="activeSection === 'session-archive'">
+        <header class="settings-header settings-header--narrow">
+          <div>
+            <h1>会话归档</h1>
+            <p>归档的会话不会出现在会话列表里，数据完整保留，可随时恢复。</p>
+          </div>
+          <div class="archive-head-actions">
+            <button
+              v-if="orderedArchivedSessions.length"
+              class="secondary-button compact"
+              data-test="session-archive-batch-toggle"
+              :title="archiveBatchMode ? '退出批量管理' : '多选批量恢复或删除'"
+              @click="toggleArchiveBatchMode"
+            >{{ archiveBatchMode ? '退出批量' : '批量管理' }}</button>
+            <button class="icon-button" title="刷新归档会话" @click="store.loadArchivedSessions()"><AppIcon name="refresh" :size="14" /></button>
+          </div>
+        </header>
+
+        <section class="perm-settings-card archive-settings-card" data-test="session-archive-page">
+          <!-- 批量操作栏：仅在批量模式出现，退出模式即收起（勾选同时清空） -->
+          <div v-if="archiveBatchMode" class="archive-batch-bar" data-test="session-archive-batch-bar">
+            <label class="archive-check">
+              <input type="checkbox" data-test="session-archive-select-all" :checked="archiveAllSelected" @change="toggleArchiveSelectAll" />
+              <span>全选</span>
+            </label>
+            <span class="archive-batch-count" data-test="session-archive-selected-count">已选 {{ archiveSelected.length }} 项</span>
+            <div class="archive-batch-actions">
+              <button
+                class="secondary-button compact"
+                data-test="session-archive-batch-restore"
+                title="取消归档，恢复到会话列表"
+                :disabled="!archiveSelected.length || archiveBusy"
+                @click="batchRestoreArchived"
+              >恢复选中</button>
+              <button
+                class="archive-del-btn archive-del-btn--confirm archive-batch-delete"
+                data-test="session-archive-batch-delete"
+                title="永久删除选中的归档会话"
+                :disabled="!archiveSelected.length || archiveBusy"
+                @click="batchDeleteArchived"
+              >删除选中</button>
+            </div>
+          </div>
+          <div v-if="!orderedArchivedSessions.length" class="wl-empty" data-test="session-archive-empty">暂无归档会话</div>
+          <!-- 按归属目录折叠分组：组头点击收起/展开，批量模式下组头勾选框按目录整组选择 -->
+          <div
+            v-for="g in archiveGroups"
+            :key="g.key"
+            class="archive-group"
+            :data-archive-group="g.key"
+            data-test="session-archive-group"
+          >
+            <div class="archive-group-head">
+              <label v-if="archiveBatchMode" class="archive-check archive-check--group">
+                <input
+                  type="checkbox"
+                  data-test="session-archive-group-select"
+                  :checked="archiveGroupSelectState(g.key) === 'all'"
+                  :indeterminate.prop="archiveGroupSelectState(g.key) === 'some'"
+                  :title="`选择「${g.label}」下全部 ${g.sessions.length} 项`"
+                  @change="toggleArchiveGroupSelect(g.key)"
+                />
+              </label>
+              <button
+                class="archive-group-toggle"
+                data-test="session-archive-group-toggle"
+                :title="archiveGroupCollapsed(g.key) ? `展开 ${g.path}` : `收起 ${g.path}`"
+                @click="toggleArchiveGroup(g.key)"
+              >
+                <AppIcon :name="archiveGroupCollapsed(g.key) ? 'chevron-right' : 'chevron-down'" :size="13" />
+                <span class="archive-group-name" data-test="session-archive-group-name">{{ g.label }}</span>
+                <span class="mono archive-group-path" data-test="session-archive-group-path" :title="g.path">{{ g.path }}</span>
+                <span class="archive-group-count" data-test="session-archive-group-count">{{ g.sessions.length }}</span>
+              </button>
+            </div>
+            <template v-if="!archiveGroupCollapsed(g.key)">
+              <div
+                v-for="s in g.sessions"
+                :key="s.name"
+                class="archive-row"
+                :class="{ confirming: archiveConfirmName === s.name, picked: archiveBatchMode && archiveSelected.includes(s.name) }"
+                :data-archived-name="s.name"
+                data-test="session-archive-item"
+              >
+                <label v-if="archiveBatchMode" class="archive-check">
+                  <input type="checkbox" data-test="session-archive-select" :checked="archiveSelected.includes(s.name)" @change="toggleArchiveSelect(s.name)" />
+                </label>
+                <div class="archive-main" :class="{ 'archive-main--pick': archiveBatchMode }" @click="archiveBatchMode && toggleArchiveSelect(s.name)">
+                  <div class="archive-title" :title="s.name">{{ s.display_name || s.name }}</div>
+                  <div class="archive-meta">
+                    <span data-test="session-archive-time" :title="`归档于 ${s.archived_at || ''}`">{{ relativeTime(s.archived_at) }}</span>
+                    <span class="archive-sep">·</span>
+                    <span data-test="session-archive-count">{{ s.count || 0 }} 条消息</span>
+                    <span class="archive-sep">·</span>
+                    <span class="mono archive-workdir" data-test="session-archive-workdir" :title="s.workdir || ''">{{ s.workdir || '未知目录' }}</span>
+                  </div>
+                </div>
+                <!-- 批量模式下隐藏行内单项恢复/删除：批量语义与单项语义混排容易误触 -->
+                <div v-if="!archiveBatchMode" class="archive-actions">
+                  <button
+                    class="secondary-button compact"
+                    data-test="session-archive-restore-btn"
+                    title="取消归档，恢复到会话列表"
+                    @click="restoreArchivedSession(s.name)"
+                  >恢复</button>
+                  <button
+                    v-if="archiveConfirmName !== s.name"
+                    class="archive-del-btn"
+                    data-test="session-archive-delete-btn"
+                    title="删除此对话"
+                    @click="askArchiveDelete(s.name)"
+                  ><AppIcon name="x" :size="13" /></button>
+                  <button
+                    v-else
+                    class="archive-del-btn archive-del-btn--confirm"
+                    data-test="session-archive-delete-confirm"
+                    title="点击确认删除"
+                    @click="confirmArchiveDelete(s.name)"
+                  >确认</button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </section>
+      </template>
+      <!-- 插件设置页：内容由插件通过 plugin_settings 声明，前端只负责挂载 -->
+      <template v-else-if="activePluginName">
+        <header class="settings-header">
+          <div>
+            <h1>{{ activePluginName }}</h1>
+            <p>插件设置页：内容与配置项由插件自己声明。</p>
+          </div>
+          <button class="icon-button" :title="`刷新 ${activePluginName} 设置页`" :data-test="`plugin-nav-refresh-${activePluginName}`" @click="pluginReloadKey += 1"><AppIcon name="refresh" :size="14" /></button>
+        </header>
+        <section class="plugin-nav-card" :data-test="`plugin-nav-page-${activePluginName}`">
+          <PluginSettingsPanel :name="activePluginName" :reload-key="pluginReloadKey" />
+        </section>
+      </template>
+      <PluginsSettings v-else-if="activeSection === 'plugins'" />
       <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
+      <TokenUsageSettingsLegacy v-else-if="activeSection === 'tokens-legacy'" />
       <SystemSettings v-else-if="activeSection === 'system'" />
       <PersonaSettings v-else-if="activeSection === 'persona'" />
+      <DecisionSettings v-else-if="activeSection === 'decision'" />
+      <FeishuSettings v-else-if="activeSection === 'feishu'" />
+      <BackgroundConvert v-else-if="activeSection === 'bg-convert'" />
 
       <!-- 外观与主题常驻挂载（v-show）：切换设置分区不丢失未保存的主题草稿 -->
       <div v-show="activeSection === 'appearance'" class="appearance-section">
@@ -462,6 +718,10 @@
             <p>为 GUI 创建、编辑和切换可视化主题；CLI 的 /theme 配置保持独立、互不影响。</p>
           </div>
         </header>
+
+        <!-- 全局玻璃层：主题编辑卡里是「全局颜色 → 背景图片」，玻璃层就贴在那层壁纸之上，
+             故放在主题卡片之前（与位置语义一致：壁纸 → 玻璃 → 界面） -->
+        <AppGlassCard />
 
         <section class="appearance-settings-card">
           <GuiThemeSettings ref="themeEditorRef" />
@@ -479,8 +739,26 @@
         <div class="modal-head"><h3>{{ modelModal.model_id ? '编辑模型' : '添加模型' }}</h3><button type="button" @click="closeModelModal">×</button></div>
         <label class="field-label">模型 ID</label>
         <input v-model="modelModal.name" class="text-field mono" placeholder="模型 ID" />
-        <label class="field-label">上下文窗口</label>
-        <input v-model.number="modelModal.context_window" class="text-field" type="number" min="1" />
+        <button type="button" class="secondary-button" data-test="fetch-models" :disabled="fetchingModels" @click="fetchRemoteModels">
+          {{ fetchingModels ? '获取中…' : (remoteModels && remoteModels.length ? `重新获取（${remoteModels.length} 个）` : '获取模型列表') }}
+        </button>
+        <select v-if="remoteModels && remoteModels.length" class="text-field" data-test="remote-model-select" @change="pickRemoteModel">
+          <option value="">共 {{ remoteModels.length }} 个模型，点选自动填充</option>
+          <option v-for="entry in remoteModels" :key="entry.id" :value="entry.id">
+            {{ entry.id }}{{ entry.model_type ? `（${entry.model_type}）` : '' }}
+          </option>
+        </select>
+        <div class="modal-field-row">
+          <div class="modal-field">
+            <label class="field-label">上下文窗口</label>
+            <input v-model.number="modelModal.context_window" class="text-field" type="number" min="1" />
+          </div>
+          <div class="modal-field">
+            <label class="field-label">最大输出</label>
+            <input v-model.number="modelModal.max_tokens" class="text-field" type="number" min="0" placeholder="留空使用默认" />
+          </div>
+        </div>
+        <p class="modal-field-hint">最大输出留空时使用按模型家族内置的默认输出上限（如 DeepSeek 384K、GLM-5.3 131K、其余 32K）。</p>
         <label class="vision-choice">
           <input v-model="modelModal.supports_vision" data-test="model-supports-vision" type="checkbox" />
           <span><b>是否支持多模态</b><small>启用后允许向该模型发送图片内容</small></span>
@@ -536,20 +814,248 @@ import { computed, onMounted, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
+import { shortLabel } from '../utils/shortLabel';
 import type { ChangelogEntry, ComputerProtocolChoice, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
+import TokenUsageSettingsLegacy from './TokenUsageSettingsLegacy.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
+import BackgroundConvert from './BackgroundConvert.vue';
+import AppGlassCard from './AppGlassCard.vue';
 import SystemSettings from './SystemSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
+import DecisionSettings from './DecisionSettings.vue';
+import FeishuSettings from './FeishuSettings.vue';
+import PluginsSettings from './PluginsSettings.vue';
+import PluginSettingsPanel from './PluginSettingsPanel.vue';
+import HooksSettings from './HooksSettings.vue';
 import { useIsMobile } from '../composables/useViewport';
 import qrcodeWechat from '../assets/qrcode-wechat.png';
 import qrcodeFeishu from '../assets/qrcode-feishu.png';
+// 免责条款正文与版本号：设置页展示与首次使用确认弹窗共用同一事实源
+import {
+  DISCLAIMER_CLAUSES as disclaimerClauses,
+  DISCLAIMER_UPDATED_AT as disclaimerUpdatedAt,
+  DISCLAIMER_VERSION as disclaimerVersion,
+  isDisclaimerVersionAccepted,
+} from '../data/disclaimer';
+import { parseModelTestError, type ParsedModelError } from '../utils/errorParser';
 
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'bg-convert' | 'system' | 'persona' | 'decision' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
+
+// ── 插件设置页入口（提供 plugin_settings 钩子的插件直接挂在左侧导航）────
+const PLUGIN_SECTION_PREFIX = 'plugin:';
+// 只有 has_settings === true（已启用且入口模块声明了设置页）的插件才进导航
+const pluginNavItems = computed(() => (store.plugins || []).filter((p: any) => p && p.has_settings));
+const activePluginName = computed(() =>
+  activeSection.value.startsWith(PLUGIN_SECTION_PREFIX)
+    ? activeSection.value.slice(PLUGIN_SECTION_PREFIX.length)
+    : ''
+);
+// 刷新按钮自增该值，通知面板重新拉取设置页快照
+const pluginReloadKey = ref(0);
+function openPluginSection(name: string) {
+  activeSection.value = `${PLUGIN_SECTION_PREFIX}${name}`;
+}
+
+// ── 会话归档分区（原侧栏底部「已归档」区搬入设置页）────────────
+// 归档列表不进主会话列表，故进入该分区时按需拉取（首次直接落在该分区也拉一次）。
+watch(activeSection, (section) => {
+  if (section === 'session-archive') void store.loadArchivedSessions();
+}, { immediate: true });
+
+/** 归档列表展示顺序：按 archived_at 倒序（后端已排好，前端再排一次以免快照顺序漂移） */
+const orderedArchivedSessions = computed(() => {
+  return (store.archivedSessions || []).slice().sort((a, b) => {
+    const ta = a.archived_at || '';
+    const tb = b.archived_at || '';
+    if (ta === tb) return (a.name || '').localeCompare(b.name || '');
+    return ta < tb ? 1 : -1;
+  });
+});
+
+// ── 归档列表按归属目录折叠分组 ─────────────────────────────
+// 归档会话攒多了单层平铺找不着，按 workdir 分成可折叠的目录组：
+// 组头 = 目录名 + 完整路径 + 会话数；组顺序 = 组内最新归档时间倒序
+// （orderedArchivedSessions 已按 archived_at 倒序，Map 插入顺序天然给出这个顺序），组内保持同一倒序。
+type ArchiveSessionItem = (typeof store.archivedSessions)[number];
+interface ArchiveDirGroup {
+  key: string;
+  /** 组头主标题：目录末级名；全局会话 / 无目录会话用固定文案 */
+  label: string;
+  /** 组头副标题（完整路径，hover 可见），用于区分同名的不同目录 */
+  path: string;
+  sessions: ArchiveSessionItem[];
+}
+
+/** 路径末级目录名：兼容 Windows 反斜杠与 POSIX 斜杠，忽略末尾分隔符 */
+function lastPathSegment(path: string) {
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+const archiveGroups = computed<ArchiveDirGroup[]>(() => {
+  const groups = new Map<string, ArchiveDirGroup>();
+  for (const s of orderedArchivedSessions.value) {
+    const workdir = (s.workdir || '').trim();
+    // 全局会话（workdir='GLOBAL'、is_global=true）不属于任何磁盘目录，单独成组
+    const isGlobal = !!s.is_global || workdir.toUpperCase() === 'GLOBAL';
+    const key = isGlobal ? '__GLOBAL__' : (workdir || '__UNKNOWN__');
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        key,
+        label: isGlobal ? '全局会话' : (lastPathSegment(workdir) || '未关联目录'),
+        path: isGlobal ? 'GLOBAL' : (workdir || '未关联目录'),
+        sessions: [],
+      };
+      groups.set(key, group);
+    }
+    group.sessions.push(s);
+  }
+  return [...groups.values()];
+});
+
+/** 已收起的目录组 key：默认全部展开；设置页组件常驻，切分区再回来时保留收起状态 */
+const collapsedArchiveGroups = ref<string[]>([]);
+
+function archiveGroupCollapsed(key: string) {
+  return collapsedArchiveGroups.value.includes(key);
+}
+
+function toggleArchiveGroup(key: string) {
+  const idx = collapsedArchiveGroups.value.indexOf(key);
+  if (idx >= 0) collapsedArchiveGroups.value.splice(idx, 1);
+  else collapsedArchiveGroups.value.push(key);
+}
+
+// 删除沿用侧栏归档区的两段确认：先点 ✕ 进入确认态，再点「确认」才真正删除
+const archiveConfirmName = ref('');
+
+function askArchiveDelete(name: string) {
+  archiveConfirmName.value = name;
+}
+
+function confirmArchiveDelete(name: string) {
+  archiveConfirmName.value = '';
+  void store.deleteSingleSession(name);
+}
+
+// 取消归档：可逆操作，不弹确认框
+function restoreArchivedSession(name: string) {
+  void store.unarchiveSession(name);
+}
+
+// ── 归档区批量管理（多选恢复 / 多选删除）────────────────────
+// 进入批量模式后每行左侧出现勾选框、行内单项操作隐藏；恢复沿用「可逆操作不弹确认框」
+// 的既有语义，删除则弹一次带数量提示的二次确认（与行内删除同一保护级别）。
+const archiveBatchMode = ref(false);
+const archiveSelected = ref<string[]>([]);
+const archiveBusy = ref(false);
+
+const archiveAllSelected = computed(() => {
+  const total = orderedArchivedSessions.value.length;
+  return total > 0 && archiveSelected.value.length === total;
+});
+
+function toggleArchiveBatchMode() {
+  archiveBatchMode.value = !archiveBatchMode.value;
+  // 退出模式即清空勾选，避免下次进入时残留上一次的选择
+  archiveSelected.value = [];
+  // 顺带退出行内删除确认态，避免残留红色高亮
+  archiveConfirmName.value = '';
+}
+
+function toggleArchiveSelect(name: string) {
+  const idx = archiveSelected.value.indexOf(name);
+  if (idx >= 0) archiveSelected.value.splice(idx, 1);
+  else archiveSelected.value.push(name);
+}
+
+function toggleArchiveSelectAll() {
+  archiveSelected.value = archiveAllSelected.value
+    ? []
+    : orderedArchivedSessions.value.map(s => s.name);
+}
+
+/** 目录组在批量模式下的勾选态：all=整组已选 / some=半选 / none=未选（组头勾选框据此显示 indeterminate） */
+function archiveGroupSelectState(key: string): 'all' | 'some' | 'none' {
+  const group = archiveGroups.value.find(g => g.key === key);
+  if (!group || !group.sessions.length) return 'none';
+  const picked = group.sessions.filter(s => archiveSelected.value.includes(s.name)).length;
+  if (picked === 0) return 'none';
+  return picked === group.sessions.length ? 'all' : 'some';
+}
+
+/** 组头勾选：未全选则补齐该组全部会话，已全选则整组取消（按目录批量操作） */
+function toggleArchiveGroupSelect(key: string) {
+  const group = archiveGroups.value.find(g => g.key === key);
+  if (!group) return;
+  const names = group.sessions.map(s => s.name);
+  if (names.every(n => archiveSelected.value.includes(n))) {
+    archiveSelected.value = archiveSelected.value.filter(n => !names.includes(n));
+  } else {
+    archiveSelected.value = [...new Set([...archiveSelected.value, ...names])];
+  }
+}
+
+async function batchRestoreArchived() {
+  const names = archiveSelected.value.slice();
+  if (!names.length) return;
+  archiveBusy.value = true;
+  const done = await store.batchUnarchiveSessions(names);
+  archiveBusy.value = false;
+  // 只清成功项的勾选：失败项留在勾选里，用户可直接重试
+  if (done.length) archiveSelected.value = archiveSelected.value.filter(n => !done.includes(n));
+}
+
+async function batchDeleteArchived() {
+  const names = archiveSelected.value.slice();
+  if (!names.length) return;
+  const ok = await store.askConfirm(
+    '批量删除归档会话',
+    `共 ${names.length} 个会话`,
+    `确定要永久删除选中的 ${names.length} 个归档会话吗？对话记录会从数据库物理删除，无法恢复。`,
+    '确认删除 ⏎',
+  );
+  if (!ok) return;
+  archiveBusy.value = true;
+  const done = await store.batchDeleteArchivedSessions(names);
+  archiveBusy.value = false;
+  if (done.length) archiveSelected.value = archiveSelected.value.filter(n => !done.includes(n));
+}
+
+// 列表变化（本端操作或其它端同步）后：清掉已不在列表里的勾选；列表空时退出批量模式
+watch(orderedArchivedSessions, (list) => {
+  const names = new Set(list.map(s => s.name));
+  const kept = archiveSelected.value.filter(n => names.has(n));
+  if (kept.length !== archiveSelected.value.length) archiveSelected.value = kept;
+  if (!list.length && archiveBatchMode.value) {
+    archiveBatchMode.value = false;
+    archiveSelected.value = [];
+  }
+});
+
+// ZCode 风格的紧凑相对时间：刚刚 / 5分钟 / 3小时 / 13天 / 2个月（与侧栏归档区同一口径）
+function relativeTime(archivedAt?: string) {
+  if (!archivedAt) return '';
+  const t = new Date(archivedAt.replace(' ', 'T')).getTime();
+  if (isNaN(t)) return '';
+  const diff = Math.max(0, Date.now() - t);
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return '刚刚';
+  if (min < 60) return `${min}分钟`;
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour}小时`;
+  const day = Math.floor(hour / 24);
+  if (day < 30) return `${day}天`;
+  const mon = Math.floor(day / 30);
+  if (mon < 12) return `${mon}个月`;
+  return `${Math.floor(mon / 12)}年`;
+}
 // ── 手机端钻取式布局（≤768px）────────────────────────────────
 // 桌面：分区侧栏 + 厂商列表 + 详情三栏并排（isMobile=false，模板不变）。
 // 手机：厂商列表全宽；点选后列表/详情互斥显示，详情顶栏带"返回列表"。
@@ -564,11 +1070,19 @@ const showAddProviders = ref(false);
 const presetApiKey = ref('');
 const showPresetKey = ref(false);
 const showProviderKey = ref(false);
+const showCustomKey = ref(false);
 const keyCopied = ref(false);
 let keyCopyTimer: ReturnType<typeof setTimeout> | null = null;
 const saving = ref(false);
 const testingId = ref('');
-const testResults = reactive<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
+interface TestResultState {
+  status: 'testing' | 'ok' | 'fail';
+  msg: string;
+  friendly?: ParsedModelError;
+}
+const testResults = reactive<Record<string, TestResultState>>({});
+const copiedErrorId = ref('');
+let copiedErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
 const providerForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const customForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
@@ -584,17 +1098,26 @@ const secondaryRoles = computed({
   get: () => store.secondaryModelRoles,
   set: (v: { vision: boolean; compression: boolean; subagent: boolean }) => { store.secondaryModelRoles = v; },
 });
+
 const modelModal = reactive({
   show: false,
   model_id: '',
   name: '',
+  // 打开弹窗时的原始模型名：用于判断用户是否改过名字（未改名不必探测）
+  original_name: '',
   context_window: 128000,
+  // 最大输出：'' = 留空（请求时走内置默认表）
+  max_tokens: '' as number | '',
   supports_vision: false,
   // 电脑操控能力契约（设计 9.1）：generic 必须同时具备视觉与工具调用；
-  // 缺省 ''（自动）= 视觉+工具调用双勾即可操控，无需逐个配置协议
-  supports_function_calling: false,
+  // 缺省 ''（自动）= 视觉+工具调用双勾即可操控，无需逐个配置协议。
+  // 工具调用新模型默认勾选（Agent 模型本就以工具调用驱动，用户要求默认支持）
+  supports_function_calling: true,
   computer_protocol: '' as ComputerProtocolChoice,
 });
+// 「获取模型列表」：拉取厂商 /v1/models 的一键填充候选
+const remoteModels = ref<{ id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[] | null>(null);
+const fetchingModels = ref(false);
 
 // 与后端 model_manager._validate_computer_combination 同一校验原因（Task 12，
 // 2026-09-05 修订：工具调用未声明视为支持，显式关闭才是拒绝理由）
@@ -716,6 +1239,16 @@ function selectSecondary() {
 }
 
 function startCustomProvider() {
+  // customForm 与设置页同生命周期：上次填写/保存后不重置，再次进入会看到
+  // 上一次的名称、Base URL 甚至 API Key 明文（表现为"历史缓存"）。
+  // 仅在从其它视图进入时重置，已在表单中重复点击则保留正在编辑的内容。
+  if (selectedKind.value !== 'custom') {
+    customForm.name = '';
+    customForm.base_url = '';
+    customForm.api_key = '';
+    customForm.protocol = 'openai';
+    showCustomKey.value = false;
+  }
   selectedKind.value = 'custom';
   selectedId.value = '';
   openMobileDetail();
@@ -786,12 +1319,51 @@ function openModelModal(model?: ModelInfo) {
   modelModal.show = true;
   modelModal.model_id = model?.id || '';
   modelModal.name = model?.name || '';
+  modelModal.original_name = model?.name || '';
   modelModal.context_window = model?.context_window || 128000;
+  modelModal.max_tokens = model?.max_tokens || '';
   modelModal.supports_vision = model?.supports_vision || false;
-  // 旧模型缺省 false/'none'，不自动获得电脑操控资格（设计 9.1）
-  modelModal.supports_function_calling = model?.supports_function_calling || false;
+  // 新增模型默认支持工具调用；编辑时保留该模型的既有值（显式关闭仍是关闭）
+  modelModal.supports_function_calling = model ? !!model.supports_function_calling : true;
   // 后端缺键模型返回 ''（自动）；显式 none/generic/native_openai 原样回填
   modelModal.computer_protocol = model?.computer_protocol || '';
+  remoteModels.value = null;
+}
+
+async function fetchRemoteModels() {
+  const provider = selectedProvider.value;
+  if (!provider || fetchingModels.value) return;
+  fetchingModels.value = true;
+  const res = await store.fetchProviderModels(provider.id);
+  fetchingModels.value = false;
+  if (res?.ok) {
+    remoteModels.value = res.models || [];
+    if (!remoteModels.value.length) {
+      store.notifyModal('获取模型列表', '服务端返回了空列表');
+    }
+  } else {
+    store.notifyModal('获取模型列表', res?.msg || '未知错误');
+  }
+}
+
+function pickRemoteModel(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (!value) return;
+  modelModal.name = value;
+  // 厂商元数据 + 本地规格表：能填的都填（未提供的字段保持表单原值）
+  const entry = (remoteModels.value || []).find((m) => m.id === value);
+  if (!entry) return;
+  if (entry.context_window && entry.context_window > 0) {
+    modelModal.context_window = entry.context_window;
+  }
+  if (entry.max_tokens && entry.max_tokens > 0) {
+    modelModal.max_tokens = entry.max_tokens;
+  } else {
+    modelModal.max_tokens = '';
+  }
+  if (entry.supports_vision !== undefined && entry.supports_vision !== null) {
+    modelModal.supports_vision = entry.supports_vision;
+  }
 }
 
 function closeModelModal() {
@@ -810,17 +1382,24 @@ async function saveModel() {
     return;
   }
   saving.value = true;
+  // 最大输出：留空 = 0（后端语义：新增不落键 / 编辑清除键，回到内置默认）
+  const maxTokens = modelModal.max_tokens === '' ? 0 : Number(modelModal.max_tokens);
+  // 思考设置在编辑弹窗里已下线：一律传 null（后端语义 = 不落键、不改动既有配置），
+  // 避免改上下文窗口这类无关操作意外覆盖用户已保存的思考档位。
+  const reasoningChoice = null;
   let result;
   if (modelModal.model_id) {
     result = await store.updateModel(
       provider.id, modelModal.model_id, modelModal.name.trim(),
       Number(modelModal.context_window), modelModal.supports_vision,
       modelModal.supports_function_calling, modelModal.computer_protocol,
+      maxTokens, reasoningChoice,
     );
   } else {
     result = await store.addModel(
       provider.id, modelModal.name.trim(), Number(modelModal.context_window), modelModal.supports_vision,
       modelModal.supports_function_calling, modelModal.computer_protocol,
+      maxTokens, reasoningChoice,
     );
   }
   saving.value = false;
@@ -831,10 +1410,37 @@ async function testModel(model: ModelInfo) {
   testingId.value = model.id;
   testResults[model.id] = { status: 'testing', msg: '测试中…' };
   const result = await store.testModel(model.id);
-  testResults[model.id] = result.ok
-    ? { status: 'ok', msg: '连接成功' }
-    : { status: 'fail', msg: result.msg };
+  if (result.ok) {
+    testResults[model.id] = { status: 'ok', msg: '连接成功' };
+  } else {
+    const friendly = parseModelTestError(result.msg);
+    testResults[model.id] = {
+      status: 'fail',
+      msg: friendly.title,
+      friendly,
+    };
+  }
   testingId.value = '';
+}
+
+function dismissTestResult(modelId: string) {
+  delete testResults[modelId];
+}
+
+async function copyTestError(modelId: string) {
+  const item = testResults[modelId];
+  const text = item?.friendly?.raw || item?.msg || '';
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // 剪贴板不可用时降级
+  }
+  copiedErrorId.value = modelId;
+  if (copiedErrorTimer) clearTimeout(copiedErrorTimer);
+  copiedErrorTimer = setTimeout(() => {
+    if (copiedErrorId.value === modelId) copiedErrorId.value = '';
+  }, 2000);
 }
 
 async function onSecondaryModelChange() {
@@ -973,9 +1579,17 @@ const currentEntry = computed<ChangelogEntry | null>(() => {
 });
 
 // ------------------------------------------------------------------
+// 免责条款页（法律声明）
+// ------------------------------------------------------------------
+// 条款正文与版本号统一维护在 ../data/disclaimer.ts，设置页与首次使用
+// 确认弹窗共用同一事实源。修改条款只需改该文件，并同步递增后端
+// core/disclaimer_consent.py 的 DISCLAIMER_VERSION（否则已同意旧版本的
+// 用户不会重新看到确认弹窗）。
+
+// ------------------------------------------------------------------
 // 联系我们页
 // ------------------------------------------------------------------
-const contactEmail = 'fchyjy@qq.com';
+const contactEmail = 'contact@xingyaocode.cn';
 const emailCopied = ref(false);
 const enlargedQr = ref<{ src: string; alt: string } | null>(null);
 let emailCopyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -992,6 +1606,8 @@ async function copyEmail() {
 }
 
 onMounted(async () => {
+  // 插件导航项依赖 has_settings，进设置页先刷一次插件列表（store 内部已静默失败）
+  void store.refreshPlugins();
   // 直接读 window.pywebview 而非 store._api()：后者为空时会弹
   // "连接失败" 模态框，更新内容拉取失败不该打扰用户
   const api = window.pywebview?.api;
@@ -1012,7 +1628,11 @@ onMounted(async () => {
 
 <style scoped>
 .settings-page { position: relative; flex: 1; min-width: 0; z-index: 80; display: flex; background: var(--bg0); color: var(--text); }
-.settings-nav { width: 220px; padding: 22px 12px 14px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+/* 导航列：条目多于一屏时自身滚动（min-height:0 是 flex 子项允许收缩的前提，
+   否则内容溢出可见、按钮被压扁，底部用户区被顶到容器外与状态栏重叠） */
+.settings-nav { width: 220px; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 22px 12px 14px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+/* 导航项不参与纵向压缩，宁可整体滚动也不压扁按钮 */
+.settings-nav > * { flex-shrink: 0; }
 .back-workspace, .nav-item { width: 100%; border: 0; background: transparent; color: var(--text-dim); text-align: left; border-radius: 9px; padding: 10px 12px; }
 .back-workspace:hover, .nav-item:hover { color: var(--text); background: var(--bg2); }
 .nav-section { margin: 28px 12px 8px; color: var(--text-faint); font-size: 11px; }
@@ -1024,6 +1644,8 @@ onMounted(async () => {
 .avatar { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: var(--bg3); color: var(--text); }
 .settings-main { flex: 1; min-width: 0; overflow: auto; padding: 46px 5vw; }
 .settings-header { max-width: 1120px; margin: 0 auto 26px; display: flex; align-items: flex-end; justify-content: space-between; }
+/* 权限与沙盒 / 关于：正文卡片宽度 860px，标题栏收窄到同宽，保证左边缘对齐且整体居中 */
+.settings-header--narrow { max-width: 860px; }
 .settings-header h1 { margin: 0 0 10px; font-size: 32px; letter-spacing: -1px; }
 .settings-header p, .detail-title-row p { margin: 0; color: var(--text-faint); font-size: 13px; }
 .icon-button { background: transparent; color: var(--text-dim); border: 0; font-size: 20px; }
@@ -1068,7 +1690,10 @@ onMounted(async () => {
 .secondary-entry-row .provider-name { font-size: 13px; }
 .provider-detail { min-width: 0; padding: 38px; overflow-y: auto; }
 .detail-title-row { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 28px; }
+/* 标题列允许收缩：长厂商名不再把右侧删除按钮挤出可见区（名称本身已按 6 字符截断） */
+.detail-title-row > div { min-width: 0; }
 .detail-title-row h2 { margin: 0 0 8px; font-size: 20px; }
+.detail-title-row h2.detail-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .protocol-badge, .vision-tag { align-self: flex-start; padding: 4px 9px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-faint); font-size: 11px; }
 .field-label { display: block; margin: 16px 0 7px; color: var(--text-dim); font-size: 12px; }
 .text-field, .readonly-field, .key-field { width: 100%; min-height: 42px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--text); font-size: 13px; }
@@ -1076,6 +1701,9 @@ onMounted(async () => {
 .readonly-field { display: flex; align-items: center; padding: 0 13px; color: var(--text-dim); }
 .key-field { display: flex; align-items: center; overflow: hidden; }
 .key-field input { flex: 1; min-width: 0; height: 40px; padding: 0 13px; border: 0; background: transparent; color: var(--text); outline: 0; }
+/* 多 Key textarea：一行一个 Key；隐藏态用 -webkit-text-security 遮蔽（textarea 不支持 type=password） */
+.key-field textarea { flex: 1; min-width: 0; min-height: 76px; padding: 10px 13px; border: 0; background: transparent; color: var(--text); outline: 0; resize: vertical; font-family: var(--mono); font-size: 13px; line-height: 1.5; box-sizing: border-box; }
+.key-field .key-masked { -webkit-text-security: disc; }
 .key-field button, .row-actions button { border: 0; background: transparent; color: var(--text-faint); }
 .key-field button { padding: 0 13px; }
 .key-field .icon-button { display: flex; align-items: center; padding: 0 10px; cursor: pointer; }
@@ -1083,11 +1711,15 @@ onMounted(async () => {
 .mono { font-family: var(--mono); }
 .model-preview-title { margin: 24px 0 9px; color: var(--text-dim); font-size: 12px; }
 .preset-models, .configured-models { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-.preset-model-row, .configured-model-row { min-height: 48px; display: flex; align-items: center; gap: 14px; padding: 0 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
-.preset-model-row:last-child, .configured-model-row:last-child { border-bottom: 0; }
+.configured-model-item { border-bottom: 1px solid var(--border); }
+.configured-model-item:last-child { border-bottom: 0; }
+.preset-model-row, .configured-model-row { min-height: 48px; display: flex; align-items: center; gap: 14px; padding: 0 14px; font-size: 12px; }
+.preset-model-row { border-bottom: 1px solid var(--border); }
+.preset-model-row:last-child { border-bottom: 0; }
 .preset-model-row .mono { flex: 1; color: var(--text); }
-.vision-tag { padding: 2px 7px; }
+.vision-tag { padding: 2px 7px; flex-shrink: 0; white-space: nowrap; }
 .vision-tag.on { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, var(--border)); }
+.model-meta-ctx { flex-shrink: 0; white-space: nowrap; color: var(--text-dim); }
 .primary-button, .secondary-button { min-height: 38px; margin-top: 20px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--border); font-weight: 600; }
 .primary-button { background: var(--text); color: var(--bg0); }
 .secondary-button { background: var(--bg3); color: var(--text); }
@@ -1095,24 +1727,106 @@ onMounted(async () => {
 .danger-icon { border: 0; background: transparent; color: var(--text-faint); font-size: 18px; }
 .danger-icon:hover, .row-actions .danger:hover { color: var(--red); }
 .model-list-header { display: flex; align-items: center; justify-content: space-between; margin: 34px 0 10px; }
+.model-list-actions { display: flex; align-items: center; gap: 8px; }
 .model-list-header h3 { margin: 0 0 4px; font-size: 14px; }
 .model-list-header span { color: var(--text-faint); font-size: 11px; }
 .model-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; }
-.model-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.model-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .test-result {
   color: var(--text-faint);
   font-size: 11px;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .test-result.ok { color: var(--green); }
-.test-result.fail { color: var(--red); }
-.row-actions { display: flex; gap: 7px; }
+.test-result.testing { color: var(--accent); }
+.row-actions { display: flex; gap: 7px; flex-shrink: 0; white-space: nowrap; }
+.row-actions button { flex-shrink: 0; white-space: nowrap; }
 .row-actions button:hover { color: var(--accent); }
+
+/* ---------- 方案 B：模型测试失败行内微型警告条 ---------- */
+.model-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  background: color-mix(in srgb, var(--red) 7%, var(--bg1));
+  border-top: 1px dashed color-mix(in srgb, var(--red) 25%, var(--border));
+  font-size: 11.5px;
+  animation: banner-slide-down 0.18s ease-out;
+}
+@keyframes banner-slide-down {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.error-banner-content {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.error-banner-icon {
+  color: var(--red);
+  flex-shrink: 0;
+}
+.error-banner-title {
+  color: var(--red);
+  font-weight: 600;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.error-banner-desc {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.error-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.banner-action-btn {
+  border: 1px solid color-mix(in srgb, var(--red) 28%, var(--border));
+  background: color-mix(in srgb, var(--bg2) 80%, transparent);
+  color: var(--text-dim);
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.banner-action-btn:hover {
+  background: var(--bg2);
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+.banner-action-btn.close-btn {
+  padding: 2px 4px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-faint);
+}
+.banner-action-btn.close-btn:hover {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
 .empty-models, .empty-detail { padding: 48px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
 .modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; background: rgba(0, 0, 0, .68); backdrop-filter: blur(8px); }
 .model-modal { width: min(560px, calc(100vw - 40px)); padding: 24px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); }
+.modal-field-row { display: flex; gap: 12px; }
+.modal-field-row .modal-field { flex: 1; min-width: 0; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; }
 .modal-head h3 { margin: 0; }
 .modal-head button { border: 0; background: transparent; color: var(--text-dim); font-size: 20px; }
@@ -1127,7 +1841,7 @@ onMounted(async () => {
 .contact-value { font-size: 14px; padding: 8px 14px; background: var(--bg2); border-radius: 6px; margin-bottom: 14px; word-break: break-all; }
 .contact-copy-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; font-size: 12px; }
 .contact-copy-btn.copied { opacity: 0.85; }
-.contact-qr-wrap { width: 160px; height: 160px; border-radius: 8px; overflow: hidden; background: #fff; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; padding: 6px; cursor: zoom-in; transition: transform 0.15s; }
+.contact-qr-wrap { width: 170px; aspect-ratio: 2 / 3; height: auto; border-radius: 8px; overflow: hidden; background: #fff; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; padding: 6px; cursor: zoom-in; transition: transform 0.15s; }
 .contact-qr-wrap:hover { transform: scale(1.03); }
 .contact-qr { width: 100%; height: 100%; object-fit: contain; }
 .qr-enlarge-mask { position: fixed; inset: 0; z-index: 999; background: rgba(0, 0, 0, 0.7); display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
@@ -1159,7 +1873,24 @@ onMounted(async () => {
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 
 /* ── 权限与沙盒分区 ── */
-.perm-settings-card { max-width: 860px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
+.perm-settings-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
+/* 插件设置页分区：与其它分区同款卡片外框，面板自带内边距 */
+.plugin-nav-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); overflow: hidden; }
+.plugin-nav-card :deep(.provider-detail) { padding: 26px 28px; }
+
+/* ── 免责条款分区（法律声明）── */
+.disclaimer-card { padding: 6px 32px 30px; }
+.disclaimer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 18px 0 2px; color: var(--text-faint); font-size: 12px; }
+.disclaimer-meta .mono { color: var(--text-dim); }
+.disclaimer-status { padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 1.6; }
+.disclaimer-status--accepted { background: rgba(34, 197, 94, 0.12); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.28); }
+.disclaimer-status--pending { background: rgba(234, 179, 8, 0.12); color: #eab308; border: 1px solid rgba(234, 179, 8, 0.28); }
+.disclaimer-clause { padding-top: 22px; }
+.disclaimer-clause h3 { margin: 0 0 10px; font-size: 14px; }
+.disclaimer-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; }
+.disclaimer-list li { color: var(--text-dim); font-size: 12.5px; line-height: 1.85; }
+.disclaimer-foot { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }
+.disclaimer-foot p { margin: 0 0 6px; color: var(--text-faint); font-size: 12px; line-height: 1.8; }
 
 /* ── 外观与主题分区 ── */
 .appearance-section { width: 100%; min-width: 0; }
@@ -1181,6 +1912,45 @@ onMounted(async () => {
 .wl-item > span { flex: 1; min-width: 0; word-break: break-all; }
 .wl-remove { flex: none; border: 0; background: transparent; color: var(--red); cursor: pointer; padding: 4px 6px; }
 .wl-empty { padding: 26px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
+
+/* ── 会话归档分区 ── */
+.archive-settings-card { padding: 8px 24px 20px; }
+.archive-head-actions { display: flex; align-items: center; gap: 10px; }
+/* 目录分组：组间靠一行细分隔线区分（组内末行自带的下边框已由 .archive-row:last-child 去掉） */
+.archive-group + .archive-group { border-top: 1px solid var(--border); }
+.archive-group-head { display: flex; align-items: center; gap: 10px; padding: 10px 0 8px; }
+.archive-check--group { padding-left: 2px; }
+.archive-group-toggle {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+  padding: 0; border: 0; background: transparent; color: var(--text-dim);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.archive-group-toggle:hover .archive-group-name { color: var(--accent); }
+.archive-group-name { flex: none; max-width: 40%; color: var(--text); font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-group-path { flex: 1; min-width: 0; color: var(--text-faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-group-count { flex: none; margin-left: auto; padding: 1px 7px; border-radius: 999px; background: rgba(148, 163, 184, 0.16); color: var(--text-dim); font-size: 11px; line-height: 16px; }
+.archive-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+.archive-row:last-child { border-bottom: 0; }
+.archive-row.confirming { background: rgba(239, 68, 68, 0.08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
+/* 批量模式下被勾选的行给一层浅色底：滚动长列表时也不丢选中位置 */
+.archive-row.picked { background: rgba(99, 102, 241, 0.08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
+.archive-main { flex: 1; min-width: 0; }
+.archive-main--pick { cursor: pointer; }
+.archive-batch-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 12px 0; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
+.archive-batch-count { color: var(--text-dim); font-size: 12px; }
+.archive-batch-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.archive-batch-actions button:disabled, .archive-batch-delete:disabled { opacity: 0.45; cursor: not-allowed; }
+.archive-check { display: inline-flex; align-items: center; gap: 6px; flex: none; color: var(--text-dim); font-size: 12px; cursor: pointer; user-select: none; }
+.archive-check input { accent-color: var(--accent); cursor: pointer; }
+.archive-batch-delete { height: 30px; padding: 0 12px; }
+.archive-title { color: var(--text); font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; color: var(--text-faint); font-size: 11.5px; }
+.archive-sep { color: var(--border); }
+.archive-workdir { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-actions { flex: none; display: flex; align-items: center; gap: 8px; }
+.archive-del-btn { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--border); border-radius: 7px; background: transparent; color: var(--text-faint); cursor: pointer; }
+.archive-del-btn:hover { color: var(--red); border-color: var(--red); }
+.archive-del-btn--confirm { width: auto; padding: 0 9px; border-color: var(--red); color: var(--red); font-size: 11.5px; }
 /* ── 手机端钻取式布局（≤768px）──────────────────────────────
    分区导航变顶部横滑条；模型配置卡片单列，列表/详情互斥显示。
    仅在窄断点生效，桌面端布局不受任何影响。 */
@@ -1216,6 +1986,7 @@ onMounted(async () => {
     border-right: 0;
     border-bottom: 1px solid var(--border);
     overflow-x: auto;
+    overflow-y: hidden; /* 横滑胶囊条只横向滚动，避免出现多余的纵向滚动条 */
     -webkit-overflow-scrolling: touch;
     flex: none;
   }
@@ -1254,6 +2025,7 @@ onMounted(async () => {
 
   /* 其余分区的卡片跟随收紧（Token 统计等子组件自带适配，此处只调容器） */
   .settings-page--mobile .perm-settings-card { padding: 6px 16px 20px; }
+  .settings-page--mobile .plugin-nav-card :deep(.provider-detail) { padding: 18px 16px 22px; }
   .settings-page--mobile .whitelist-head { align-items: flex-start; flex-direction: column; }
   .settings-page--mobile .wl-form { align-items: stretch; flex-direction: column; }
   .settings-page--mobile .wl-form select { flex-basis: auto; }

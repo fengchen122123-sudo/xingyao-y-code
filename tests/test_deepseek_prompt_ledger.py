@@ -77,8 +77,8 @@ def test_deepseek_generation_rejects_stale_append():
         raise AssertionError("stale append must fail")
 
 
-def test_deepseek_generation_identity_isolated_from_kimi_and_endpoints():
-    """防止不同 Provider 或 endpoint 误用同一缓存账本。"""
+def test_deepseek_generation_identity_isolated_from_kimi_and_scopes():
+    """防止不同 Provider 或非主会话 scope 误用同一缓存账本。"""
     from core.llm import _uses_deepseek_prompt_ledger
 
     assert _uses_deepseek_prompt_ledger(
@@ -87,7 +87,8 @@ def test_deepseek_generation_identity_isolated_from_kimi_and_endpoints():
     assert not _uses_deepseek_prompt_ledger(
         "anthropic/kimi-k2.5", "https://api.kimi.com/coding", "main", True, "s1"
     )
-    assert not _uses_deepseek_prompt_ledger(
+    # 家族判定：任意 endpoint 的 deepseek 主会话都进账本
+    assert _uses_deepseek_prompt_ledger(
         "openai/deepseek-v4-pro", "https://relay.example/v1", "main", True, "s1"
     )
     assert not _uses_deepseek_prompt_ledger(
@@ -338,3 +339,180 @@ def test_deleted_session_rejects_new_or_appended_ledger_messages():
             assert "不存在" in str(error)
         else:
             raise AssertionError("deleted session must reject ledger writes")
+
+
+# ---------------------------------------------------------------------------
+# 缓存优化路由家族化：is_deepseek_ledger_route 纯模型家族判定（旧
+# deepseek_cache_routes 配置键已废弃不再读取，见 core/llm_dialects.py 顶部备注）
+# ---------------------------------------------------------------------------
+
+
+def test_any_gateway_enters_ledger_for_deepseek_family():
+    """任意网关进账本：非本族不误放，官方端点照样进账本。"""
+    from core.llm import is_deepseek_ledger_route
+
+    assert is_deepseek_ledger_route(
+        "openai/deepseek-v4-flash-0731", "https://relay.example/v1"
+    )
+    assert not is_deepseek_ledger_route(
+        "openai/kimi-for-coding", "https://tokenrhythm.studio/v1"
+    )
+    assert is_deepseek_ledger_route(
+        "openai/deepseek-v4-pro", "https://api.deepseek.com/v1"
+    )
+
+
+def test_deepseek_family_route_sorts_tools_without_config():
+    """家族判定下任意渠道排序 tools：MCP 顺序抖动不得击穿缓存前缀。"""
+    from core.llm import _select_request_tools_for_route
+
+    tools = [
+        {"type": "function", "function": {"name": "zeta", "parameters": {}}},
+        {"type": "function", "function": {"name": "alpha", "parameters": {}}},
+    ]
+
+    sorted_tools = _select_request_tools_for_route(
+        "openai/deepseek-v4-flash-0731", "https://relay.example/v1", tools
+    )
+
+    assert [tool["function"]["name"] for tool in sorted_tools] == ["alpha", "zeta"]
+    assert sorted_tools is not tools
+
+
+# ---------------------------------------------------------------------------
+# 改造项 ③：轮换与 miss 可观测（换代原因写进 cache_request_diagnostics）
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_rotation_reasons_for_first_and_header_changes():
+    """换代原因必须写明：首代、system 头变化、tools 契约变化各归其因。"""
+    from core.llm import _prepare_deepseek_ledger_request
+
+    manager = _manager("reason-header")
+    base = "https://api.deepseek.com"
+    tools_v1 = [{"type": "function", "function": {"name": "alpha", "parameters": {}}}]
+
+    first = _prepare_deepseek_ledger_request(
+        manager, "reason-header", "openai/deepseek-v4-pro", base, "main",
+        [_message("system", "stable"), _message("user", "u1")], tools_v1,
+    )
+    assert first["rotation_reason"] == "first_generation"
+
+    changed_system = [
+        _message("system", "changed"), _message("user", "u1"),
+    ]
+    second = _prepare_deepseek_ledger_request(
+        manager, "reason-header", "openai/deepseek-v4-pro", base, "main",
+        changed_system, tools_v1,
+    )
+    assert second["rotation_reason"] == "header_system_changed"
+
+    tools_v2 = tools_v1 + [
+        {"type": "function", "function": {"name": "beta", "parameters": {}}}
+    ]
+    third = _prepare_deepseek_ledger_request(
+        manager, "reason-header", "openai/deepseek-v4-pro", base, "main",
+        changed_system, tools_v2,
+    )
+    assert third["rotation_reason"] == "header_tools_changed"
+
+    appended = changed_system + [_message("user", "u2")]
+    fourth = _prepare_deepseek_ledger_request(
+        manager, "reason-header", "openai/deepseek-v4-pro", base, "main",
+        appended, tools_v2,
+    )
+    assert fourth["rotation_reason"] == ""
+
+
+def test_ledger_rotation_reasons_for_pending_and_ambiguous_boundary():
+    """主动轮换与追加边界失败也必须归因，不能与头变化混为一谈。"""
+    from core.llm import (
+        _prepare_deepseek_ledger_request,
+        mark_deepseek_generation_rotation,
+    )
+
+    base = "https://api.deepseek.com"
+    manager = _manager("reason-pending")
+    seed = [_message("user", "a"), _message("user", "b")]
+    _prepare_deepseek_ledger_request(
+        manager, "reason-pending", "openai/deepseek-v4-pro", base, "main", seed, [],
+    )
+
+    # 追加边界不唯一：账本尾条在当前历史里出现两次，且前缀不整体匹配。
+    # 种子刻意不含 system 消息——否则 _deepseek_stable_header_matches 会先以
+    # header_system_changed 短路，走不到边界判定分支。
+    ambiguous = [
+        _message("user", "a"), _message("user", "c"),
+        _message("user", "b"), _message("user", "b"),
+    ]
+    rotated = _prepare_deepseek_ledger_request(
+        manager, "reason-pending", "openai/deepseek-v4-pro", base, "main",
+        ambiguous, [],
+    )
+    assert rotated["rotation_reason"] == "boundary_ambiguous"
+
+    mark_deepseek_generation_rotation("reason-pending")
+    forced = _prepare_deepseek_ledger_request(
+        manager, "reason-pending", "openai/deepseek-v4-pro", base, "main",
+        ambiguous, [],
+    )
+    assert forced["rotation_reason"] == "pending_rotation"
+
+    caller = _prepare_deepseek_ledger_request(
+        manager, "reason-pending", "openai/deepseek-v4-pro", base, "main",
+        ambiguous, [], force_new=True,
+    )
+    assert caller["rotation_reason"] == "caller_force_new"
+
+
+def test_ledger_rotation_reason_reaches_cache_diagnostics(monkeypatch):
+    """换代原因必须落到 cache_request_diagnostics：否则线上 miss 无法归因。"""
+    import core.app_context as app_context
+    import core.llm as llm
+    from types import SimpleNamespace
+    from copy import deepcopy
+
+    manager = _manager("diag-rotation")
+    monkeypatch.setattr(app_context, "get_manager", lambda: manager)
+    monkeypatch.setattr(llm, "get_tools_schema", lambda: [])
+    monkeypatch.setattr(
+        "core.model_manager.get_model_protocol", lambda model, api_base=None: "openai"
+    )
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda model, api_base=None: {"enable_thinking": False},
+    )
+
+    def completion(**kwargs):
+        delta = SimpleNamespace(
+            content="answer", reasoning_content=None, tool_calls=None,
+            provider_specific_fields=None,
+        )
+        chunk = SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason="stop")],
+            usage=None,
+        )
+        return iter([chunk])
+
+    monkeypatch.setattr(llm, "completion", completion)
+
+    def turn(messages, turn_id):
+        list(llm.chat_with_model_events(
+            "openai/deepseek-v4-pro", "key", deepcopy(messages),
+            "https://api.deepseek.com", persist=True,
+            parent_session="diag-rotation", turn_id=turn_id,
+            cache_session_id="diag-rotation",
+            consume_background_notifications=False,
+        ))
+
+    turn([_message("system", "stable"), _message("user", "u1")], "diag-turn-1")
+    turn([_message("system", "changed"), _message("user", "u1")], "diag-turn-2")
+
+    reasons = [
+        row["request_reason"]
+        for row in manager.query_cache_request_diagnostics(session_id="diag-rotation")
+    ]
+    # 首行是账本原因而非形状差分的「冷启动」：rotation_reason 非空即覆写，口径统一。
+    # 两者在 query_cache_diagnostic_summary 的 explicit_categories 里同归 cold_start，
+    # 汇总口径不受影响；_account_server_usage 侧也同属"非热启动"，统计语义不变。
+    assert reasons == ["first_generation", "header_system_changed"]

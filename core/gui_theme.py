@@ -24,7 +24,9 @@ import config
 
 SCHEMA_VERSION = 1
 THEME_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
-BUILTIN_IDS = ("builtin.dark", "builtin.light")
+BUILTIN_IDS = (
+    "builtin.dark", "builtin.light", "builtin.qq2009", "builtin.field-notes",
+)
 REGION_IDS = (
     "app_header", "sidebar", "conversation_toolbar", "workspace",
     "composer", "right_panel", "statusbar",
@@ -99,17 +101,26 @@ def _builtin_theme(
     appearance: str,
     tokens: dict[str, Any],
     titlebar: dict[str, Any],
+    *,
+    name: str | None = None,
+    regions: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     region_defaults = _region(
         tokens["background_panel"], tokens["text_primary"], tokens["border"], tokens["accent"],
     )
-    regions = {region_id: copy.deepcopy(region_defaults) for region_id in REGION_IDS}
-    regions["workspace"]["background"] = tokens["background_app"]
-    regions["statusbar"]["background"] = tokens["background_card"]
+    built_regions = {region_id: copy.deepcopy(region_defaults) for region_id in REGION_IDS}
+    built_regions["workspace"]["background"] = tokens["background_app"]
+    built_regions["statusbar"]["background"] = tokens["background_card"]
+    if regions is not None:
+        # 按分区覆盖默认配色；未知分区直接报错，避免悄悄失效
+        for region_id, overrides in regions.items():
+            if region_id not in REGION_IDS:
+                raise ValueError(f"未知分区：{region_id}")
+            built_regions[region_id].update(overrides)
     return {
         "schema_version": SCHEMA_VERSION,
         "id": theme_id,
-        "name": "内置深色" if appearance == "dark" else "内置浅色",
+        "name": name if name is not None else ("内置深色" if appearance == "dark" else "内置浅色"),
         "appearance": appearance,
         "extends": theme_id,
         "builtin": True,
@@ -121,7 +132,7 @@ def _builtin_theme(
             "image_size": "cover",
             "image_position": "center",
         },
-        "regions": regions,
+        "regions": built_regions,
     }
 
 
@@ -162,6 +173,64 @@ BUILTIN_THEMES = {
             "shadow_color": "#000000", "shadow_strength": 0.16,
         },
         {"background": "#ffffff", "text": "#2c2c2a", "border": "#e3e3de", "mode": "light"},
+    ),
+    # 内置 QQ2009：经典蓝色皮肤（蓝色渐变标题栏、浅蓝面板、橙色强调）
+    "builtin.qq2009": _builtin_theme(
+        "builtin.qq2009",
+        "light",
+        {
+            "background_app": "#F7FBFF", "background_panel": "#EAF3FB", "background_card": "#DCEBFA",
+            "background_elevated": "#F2F8FE", "border": "#A9C8E4",
+            "text_primary": "#152E42", "text_bright": "#0B2237", "text_secondary": "#4A5A6A",
+            "text_faint": "#7A8A9A", "accent": "#3A8FD0", "accent_secondary": "#2E7CC4",
+            "accent_soft": "#3A8FD026", "success": "#2E8B3D", "warning": "#B87700",
+            "danger": "#C0392B", "orange": "#F39C00", "info": "#0B61A4", "purple": "#7E5FC0",
+            "code_background": "#F0F6FC", "float_background": "#FFFFFFF7",
+            "font_sans": "'宋体', SimSun, Tahoma, 'Microsoft YaHei', sans-serif",
+            "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
+            "radius_small": 3, "radius_medium": 5, "radius_large": 8,
+            "shadow_color": "#0A2A4A", "shadow_strength": 0.18,
+        },
+        {"background": "#3A8FD0", "text": "#FFFFFF", "border": "#1F6CB5", "mode": "light"},
+        name="内置 QQ2009",
+        regions={
+            "app_header": _region("#6FB3E5", "#0E3352", "#3A8FD0", "#1F5C96"),
+            "sidebar": _region("#E9F3FC", "#123A5C", "#A9C8E4", "#3A8FD0"),
+            "conversation_toolbar": _region("#DCEBF9", "#123A5C", "#A9C8E4", "#3A8FD0"),
+            "workspace": _region("#FFFFFF", "#152E42", "#C6DBEF", "#3A8FD0"),
+            "composer": _region("#F2F8FE", "#123A5C", "#A9C8E4", "#3A8FD0"),
+            "right_panel": _region("#E9F3FC", "#123A5C", "#A9C8E4", "#3A8FD0"),
+            "statusbar": _region("#D5E5F4", "#2B5A7A", "#A9C8E4", "#3A8FD0"),
+        },
+    ),
+    # 内置田野笔记：纸质笔记本皮肤（墨绿框架 + 米色纸面 + 朱橙强调，直角、细边框、硬投影）
+    "builtin.field-notes": _builtin_theme(
+        "builtin.field-notes",
+        "light",
+        {
+            "background_app": "#EFEADB", "background_panel": "#E5DFCB", "background_card": "#FBF8EF",
+            "background_elevated": "#FDFBF5", "border": "#D8D2BE",
+            "text_primary": "#29271F", "text_bright": "#1B1913", "text_secondary": "#6F6A59",
+            "text_faint": "#9A9480", "accent": "#E04E10", "accent_secondary": "#B83E0B",
+            "accent_soft": "#E04E1026", "success": "#2F9E5F", "warning": "#B08A1E",
+            "danger": "#C4442A", "orange": "#C97A10", "info": "#3A7D8C", "purple": "#7D64A8",
+            "code_background": "#E7E1CE", "float_background": "#FBF8EFF7",
+            "font_sans": "'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
+            "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
+            "radius_small": 0, "radius_medium": 2, "radius_large": 5,
+            "shadow_color": "#29271F", "shadow_strength": 0.20,
+        },
+        {"background": "#1D3A2F", "text": "#E8E2D4", "border": "#122A21", "mode": "dark"},
+        name="内置 田野笔记",
+        regions={
+            "app_header": _region("#1D3A2F", "#E8E2D4", "#122A21", "#E04E10"),
+            "sidebar": _region("#1D3A2F", "#DCE5D8", "#163026", "#E04E10"),
+            "conversation_toolbar": _region("#E5DFCB", "#29271F", "#D8D2BE", "#E04E10"),
+            "workspace": _region("#EFEADB", "#29271F", "#D8D2BE", "#E04E10"),
+            "composer": _region("#E5DFCB", "#29271F", "#D8D2BE", "#E04E10"),
+            "right_panel": _region("#E5DFCB", "#29271F", "#D8D2BE", "#E04E10"),
+            "statusbar": _region("#1D3A2F", "#8FA493", "#163026", "#E04E10"),
+        },
     ),
 }
 
@@ -379,8 +448,15 @@ class ThemeRepository:
         if not self.root.exists():
             return summaries
         for directory in sorted(self.root.iterdir(), key=lambda item: item.name):
-            if directory.is_dir():
+            # 跳过点前缀目录：staging（.gui-theme-*，建在 root 内，崩溃/占用
+            # 清理失败会残留）与用户随手放进来的杂项目录。无差别 get_theme 会让
+            # 一个不匹配 THEME_ID_RE 的目录把整个主题列表打挂到手动删除为止。
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            try:
                 summaries.append(self._summary(self.get_theme(directory.name)))
+            except ThemeError:
+                continue
         return summaries
 
     def get_theme(self, theme_id: str) -> dict[str, Any]:
@@ -419,6 +495,11 @@ class ThemeRepository:
             raise ThemeError("builtin_read_only", "id", "内置主题不能重命名")
         source_theme = self.get_theme(theme_id)
         manifest = self._manifest_for_copy(source_theme, new_id, new_name)
+        if new_id == theme_id:
+            # 仅改名称：ID 与目录不变，原地重写清单即可，无需搬迁目录或改活动主题配置。
+            theme_dir = self._theme_directory(theme_id)
+            self._write_manifest(theme_dir / "theme.json", manifest)
+            return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
         destination = self._require_free_destination(new_id)
         staging_dir = self._staging_directory()
         retired_directory = self.root.parent / f".gui-theme-retired-{theme_id}-{uuid.uuid4().hex}"

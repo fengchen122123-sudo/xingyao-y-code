@@ -12,7 +12,7 @@
   （brief Step 1 逐字协议），固定顺序 controller.stop（活动 run 停止：owner
   cancel → Provider 流中断 → backend release/close，retained browser 一并
   清理）→ preview.stop（删除临时 PNG）→ hotkey.close（注销热键）。每步独立
-  try/except 留痕，绝不向上传播；不关闭 LiteLLM 共享连接池，不自动恢复
+  try/except 留痕，绝不向上传播；不触碰共享 HTTP 连接池，不自动恢复
   interrupted run。
 - ``shutdown_process_computer_runtime(reason)``：GUI close / CLI 退出 / 异常
   finally 的进程级入口——收集单例后按上述顺序统一关闭。
@@ -130,6 +130,22 @@ def sweep_stale_computer_temp_dirs(
                 entry.name.startswith(prefix) for prefix in _STALE_TEMP_DIR_PREFIXES
             ):
                 continue
+            if entry.name == "ycode-computer-preview":
+                # 预览根目录只是容器，绝不整体 rmtree：根自身 mtime 只随子目录
+                # 增删变化，长驻实例 24h 无子目录变动时根 mtime 过老，后启动
+                # 实例会把存活实例的 preview 目录一并删掉。逐子目录
+                # （preview-* 按进程隔离）判 mtime。
+                for child in entry.iterdir():
+                    try:
+                        if not child.name.startswith("preview-"):
+                            continue
+                        if now - child.stat().st_mtime < max_age_s:
+                            continue
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                    except OSError:
+                        _LOGGER.exception("清扫预览进程目录失败：%s", child)
+                continue
             if now - entry.stat().st_mtime < max_age_s:
                 continue
             shutil.rmtree(entry, ignore_errors=True)
@@ -152,8 +168,12 @@ def _default_controller_provider():
 
 
 def _emergency_stop(controller_provider):
-    """Ctrl+Alt+Esc 回调：停止当前活动 run（controller 固定停止顺序内含
-    owner cancel 与 Provider 在飞流中断）；run 已收尾（竞态）无事发生。"""
+    """Ctrl+Alt+Esc 回调：停止当前活动 run。
+
+    走 stop_for_user：紧急热键同样是"用户"的停止意图，只应结束电脑操控 run，
+    不能置位回合 cancel_event 把对话回合整条掐掉（模型会毫不知情地被打断）；
+    抑制态与通知由 stop_for_user 统一记账。run 已收尾（竞态）无事发生。
+    """
 
     def _on_hotkey_stop() -> None:
         try:
@@ -171,7 +191,7 @@ def _emergency_stop(controller_provider):
         if not run_id or status in _TERMINAL_RUN_STATUSES:
             return
         try:
-            controller.stop(run_id, "emergency_hotkey")
+            controller.stop_for_user(run_id, "emergency_hotkey")
         except ComputerControlError:
             # run 已在停止收尾（竞态）：紧急停止的目标已达成
             _LOGGER.info("紧急停止热键触发时 run 已在收尾（忽略）")
@@ -213,10 +233,13 @@ def _make_hotkey(hotkey_factory, controller_provider):
         )
         hotkey.start()
         return hotkey
-    except ComputerControlError:
-        _LOGGER.warning(
-            "全局紧急停止热键注册失败，紧急停止能力不可用", exc_info=True
-        )
+    except ComputerControlError as error:
+        # 注册失败是可预期降级（热键被别的进程占用 / 平台不支持），不是故障。
+        # 只在 INFO 留痕、堆栈只在 DEBUG：CLI 没有自定义 handler，WARNING 及以上
+        # 会经 logging.lastResort 直打控制台，启动界面必须保持零提示
+        # （能力状态另有快照供设置页展示，信息不会丢）。
+        _LOGGER.info("全局紧急停止热键不可用：%s", error)
+        _LOGGER.debug("紧急停止热键注册失败详情", exc_info=True)
     except Exception:
         _LOGGER.exception("全局紧急停止热键注册异常，紧急停止能力不可用")
     return None
@@ -348,7 +371,7 @@ def shutdown_computer_runtime(
     固定顺序 controller.stop（活动 run 停止 + Provider 流中断 + backend
     release/close，retained browser 一并清理）→ preview.stop（关闭 loopback
     服务并删除本进程全部临时 PNG）→ hotkey.close（注销全局热键）。每步独立
-    try/except 留痕，绝不向上传播、绝不掩盖后续清理；不关闭 LiteLLM 共享
+    try/except 留痕，绝不向上传播、绝不掩盖后续清理；不触碰共享
     连接池，不自动恢复 interrupted run。
     """
     if controller is not None:

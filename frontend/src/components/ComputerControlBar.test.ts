@@ -1,5 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
+import { nextTick } from 'vue';
 import { mount } from '@vue/test-utils';
 
 import ComputerControlBar from './ComputerControlBar.vue';
@@ -32,6 +33,23 @@ function piniaWithRunningComputer() {
     browser: 'edge',
     action_count: 3,
     current_surface: 'https://example.com/docs',
+  };
+  return { plugins: [pinia] };
+}
+
+// 桌面操控的运行态：安全条按设计 16.1 正常显示（浏览器目标改为「就地围观」后
+// 不再渲染安全条，需要条的用例统一用桌面目标构造）
+function piniaWithRunningDesktop() {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-1',
+    status: 'running',
+    target: 'desktop',
+    action_count: 3,
+    current_surface: '记事本 - 未命名',
   };
   return { plugins: [pinia] };
 }
@@ -69,7 +87,7 @@ it('recalibrates from bridge snapshot after queue drops events', async () => {
 
 
 it('always shows stop and pause controls on the compact bar', () => {
-  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningComputer() });
+  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningDesktop() });
   expect(wrapper.get('[data-test="computer-pause"]').isVisible()).toBe(true);
   expect(wrapper.get('[data-test="computer-stop"]').isVisible()).toBe(true);
   wrapper.unmount();
@@ -183,11 +201,19 @@ it.each([['idle'], ['stopped'], ['completed'], ['completing']])(
 );
 
 it('renders the target, action count and current surface on the bar', () => {
-  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningComputer() });
+  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningDesktop() });
   const text = wrapper.get('[data-test="computer-control-bar"]').text();
-  expect(text).toContain('Edge');
+  expect(text).toContain('桌面');
   expect(text).toContain('3');
-  expect(text).toContain('example.com');
+  expect(text).toContain('记事本');
+  wrapper.unmount();
+});
+
+it('hides the bar for browser runs: browser control shows only the browser pane', () => {
+  // 浏览器操控改为「就地围观」：右侧只留浏览器页签，不再显示操控安全条
+  // （停止入口收进浏览器工具栏，见 BrowserPane 的 bp-computer-stop）
+  const wrapper = mount(ComputerControlBar, { global: piniaWithRunningComputer() });
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
   wrapper.unmount();
 });
 
@@ -229,4 +255,63 @@ it('pause and stop buttons drive the bridge with the current run id', async () =
   expect(api.stop_computer_control).toHaveBeenCalledWith('run-1');
   expect(store.computerRun.status).toBe('stopped');
   wrapper.unmount();
+});
+
+// ── 安全条的会话归属：其他会话发起的操控不串显到当前会话 ──
+
+// 挂载辅助：指定 run 的归属会话与当前查看的会话
+function mountBarForSession(ownerSession: string, viewingSession: string) {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.currentSessionName = viewingSession;
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-1',
+    status: 'running',
+    target: 'desktop',
+    owner_session_id: ownerSession,
+  };
+  const wrapper = mount(ComputerControlBar, { global: { plugins: [pinia] } });
+  return { store, wrapper };
+}
+
+it('hides the bar while another session owns the running computer', () => {
+  const { wrapper } = mountBarForSession('A', 'B');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('shows the bar when the running computer belongs to the current session', () => {
+  const { wrapper } = mountBarForSession('A', 'A');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+it('keeps the bar when the run owner is unknown (legacy snapshot)', () => {
+  const { wrapper } = mountBarForSession('', 'B');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+it('hides the bar as soon as the user switches away from the owner session', async () => {
+  const { store, wrapper } = mountBarForSession('A', 'A');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  store.currentSessionName = 'B';
+  await nextTick();
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('keeps the global bar getter session-agnostic for the right panel', () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.currentSessionName = 'B';
+  store.computerRun = {
+    ...store.computerRun, run_id: 'run-1', status: 'running', owner_session_id: 'A',
+  };
+  // 全局判据（RightPanel 自动登记操控页签依赖）仍为 true，会话归属只在条自身生效
+  expect(store.computerControlBarVisible).toBe(true);
+  expect(store.computerBarVisibleInCurrentSession).toBe(false);
 });

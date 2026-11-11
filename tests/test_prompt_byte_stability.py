@@ -37,7 +37,7 @@ def test_stable_prompt_has_fixed_sha256(monkeypatch):
 
     monkeypatch.setattr(agent_service, "load_system_prompt", lambda is_gui=False: "base")
     digest = hashlib.sha256(_bytes(build_stable_prompt(agent_service.load_system_prompt()))).hexdigest()
-    assert digest == "626f1ab481c68e14aa4a0d0fd356e5f61c94121c6b8b7d64e0f92830c1a26c9a"
+    assert digest == "bedde81d1a0b0b66858cfb4e6521886dfceefe8ae6f652cdfecf3fb65788b248"
 
 
 def test_stable_system_message_has_fixed_sha256(monkeypatch):
@@ -51,7 +51,7 @@ def test_stable_system_message_has_fixed_sha256(monkeypatch):
     monkeypatch.setattr(skills, "get_active_skills_catalog", lambda: "skills")
     monkeypatch.setattr(subagent_registry, "get_custom_subagents_catalog", lambda: "subagents")
     digest = hashlib.sha256(_bytes(agent_service.build_stable_system_message())).hexdigest()
-    assert digest == "ef286e513e9a5275cb79ecd48dd81da343f086c54575c921550985309e83c1e5"
+    assert digest == "493b2eee5532445c9f7f0fd3629bc004045aaf4f5eaede2c59aa3b21fde7d5c9"
 
 
 def test_tools_schema_serialization_is_deterministic():

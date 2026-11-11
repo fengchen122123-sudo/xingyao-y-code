@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 
-from core.process_io import decode_process_output, platform_console_encoding
+from core.process_io import decode_process_output, platform_console_encoding, strip_ansi_escapes
 from core.workspace_context import get_workdir
 
 _logger = logging.getLogger("py.warnings")
@@ -70,13 +70,23 @@ _LOADED = False
 
 # get_task_output 只从日志尾部读取的字节数上限，避免 GB 级日志撑爆内存
 _TAIL_READ_BYTES = 256 * 1024
+# 日志"仅有启动标记、尚无实际命令输出"的判定阈值：turn 标记行约 30 字节，
+# 低于该值说明命令还没有任何输出落盘（list_active_tasks 据此给 GUI 面板
+# 提供 no_output_yet 字段，运行中提示由前端渲染）
+_STARTUP_MARKER_MAX_BYTES = 64
 # 最多保留的历史任务日志数量（超出后按修改时间滚动清理）
 _MAX_TASK_LOGS = 50
 
-# get_task_output 的 task_id 白名单，防止路径穿越读取任意日志文件
-_TASK_ID_PATTERN = re.compile(r"^[\w-]{1,64}$")
+# get_task_output 的 task_id 白名单，防止路径穿越读取任意日志文件；
+# 必须用 fullmatch 校验（去掉 ^/$ 锚点，避免 $ 放行 "abc\n" 这类尾随换行）
+_TASK_ID_PATTERN = re.compile(r"[\w-]{1,64}")
 
-from core.command_policy import is_dangerous_command, redact_sensitive_text
+from core.command_policy import (
+    build_child_env,
+    is_dangerous_command,
+    load_shell_env_policy,
+    redact_sensitive_text,
+)
 
 # 兼容已有内部调用和测试；策略实现集中在 command_policy。
 _is_dangerous_command = is_dangerous_command
@@ -106,17 +116,32 @@ def _read_log_tail(task_id, max_chars=2000):
             f.seek(max(0, size - max_chars))
             raw = f.read()
         from core.process_io import decode_process_output, platform_console_encoding
-        return decode_process_output(raw, platform_console_encoding())
+        # 日志是子进程原始字节，可能带 ANSI 颜色码；log_tail 直接进 LLM 上下文，先清洗
+        return strip_ansi_escapes(
+            decode_process_output(raw, platform_console_encoding())
+        )
     except Exception:
         return ""
 
 
 def _watch_task_completion(task_id, process, command, session_id):
-    """监听线程：0.5s 节拍同步任务状态（日志大小/进程退出），退出后触发完成回调（仅一次）。
+    """监听线程：自适应节拍同步任务状态（日志大小/进程退出），退出后触发完成回调（仅一次）。
 
     每拍在 _TASKS_COND 内执行 _sync_task_locked：日志 size 变化或进程退出都会
     bump revision 并 notify_all，manage_task(wait) 的等待方据此即时被唤醒。
+
+    节拍按任务已运行时长自适应：前 10s 用 0.5s 节拍快速捕捉短命任务退出，之后
+    降到 2.0s，避免长期驻留服务（如 dev server）永久高频空转轮询。代价是这类
+    任务退出最晚约 2s 才被发现，终态通知相应延后（预期行为）。
     """
+    # 节拍基准时间戳：优先取任务 info 里的 start_time，缺失/异常时回落本地时钟
+    started_at = time.time()
+    with _TASKS_COND:
+        _initial_info = ACTIVE_TASKS.get(task_id)
+        if _initial_info is not None:
+            _info_start_time = _initial_info.get("start_time")
+            if isinstance(_info_start_time, (int, float)):
+                started_at = float(_info_start_time)
     returncode = None
     while True:
         try:
@@ -149,13 +174,24 @@ def _watch_task_completion(task_id, process, command, session_id):
                     _save_tasks()
         if returncode is not None:
             break
-        time.sleep(0.5)
+        # 自适应节拍：运行不足 10s 的任务用 0.5s 快速响应，长跑任务降到 2.0s
+        if time.time() - started_at < 10.0:
+            time.sleep(0.5)
+        else:
+            time.sleep(2.0)
     cb = _on_task_finished
     if cb is not None:
         try:
             cb(task_id, command, returncode, session_id, _read_log_tail(task_id))
         except Exception as error:
             _logger.warning("后台任务完成回调失败 %s: %s", task_id, error)
+    # 进程注册表注销（幂等）：任务进入终态后不再阻塞 Git 面板操作
+    try:
+        from core.git import process_registry as _proc_registry
+
+        _proc_registry.unregister_process(task_id)
+    except Exception as error:
+        _logger.warning("后台任务注销进程注册表失败 %s: %s", task_id, error)
 
 
 def _ensure_paths():
@@ -281,6 +317,8 @@ def _load_tasks():
                     info.get("output_encoding")
                     or platform_console_encoding()
                 ),
+                "turn_id": info.get("turn_id") or "",
+                "session_id": str(info.get("session_id") or ""),
                 "status": TASK_STATUS_RUNNING,
                 "exit_code": None,
                 "revision": 0,
@@ -310,6 +348,11 @@ def _save_tasks():
                             info.get("output_encoding")
                             or platform_console_encoding()
                         ),
+                        # T4 回合关联：父回合随任务记录持久化（旧记录无此键，读取侧 .get 兼容）
+                        "turn_id": info.get("turn_id") or "",
+                        # 会话归属随任务记录持久化：GUI 重启接管后任务仍归属发起会话，
+                        # 执行条据此做会话过滤（旧记录无此键，读取侧 .get 兼容）
+                        "session_id": str(info.get("session_id") or ""),
                     }
             # 跨进程合并读：GUI/CLI 双进程并发写同一份 tasks.json 时，
             # 把磁盘上其他进程新启动的任务记录合并进来，避免内存全量覆盖写
@@ -341,10 +384,21 @@ def _save_tasks():
         _logger.warning("写入任务记录失败 %s: %s", TASK_DB_PATH, error)
 
 
-def start_background_task(command: str, session_id: str = "", shell_id: str = "") -> str:
+def turn_short_code(turn_id: str | None) -> str:
+    """回合短码：turn_id 前 8 位（与 turn_undo prompt_context 的展示惯例一致）。
+
+    用于 /tasks 展示与任务日志标注；无值返回空串。
+    """
+    return str(turn_id or "")[:8]
+
+
+def start_background_task(
+    command: str, session_id: str = "", shell_id: str = "", turn_id: str = ""
+) -> str:
     """在后台开启一个异步长周期任务（如 npm run dev），重定向日志输出。
 
     session_id 记录发起该任务所属的会话，完成回调据此触发 LLM 总结。
+    turn_id 记录发起该任务的父回合（T4 回合关联：/tasks 展示与日志标注）。
     """
     _ensure_paths()
     _ensure_loaded()
@@ -367,11 +421,19 @@ def start_background_task(command: str, session_id: str = "", shell_id: str = ""
         log_file = open(log_file_path, "wb")
 
         # 注入环境变量，强制让 Python 的输出不进行缓冲，实时写入日志文件
-        env = os.environ.copy()
+        # T1 安全默认：后台子进程默认不继承敏感环境变量（*KEY*/*SECRET*/*TOKEN*/*PASSWORD*），
+        # 逃生门 config.json "shell_env_policy": {"exclude_sensitive": false}；
+        # 实时日志所需的注入在 build_child_env 结果之上显式叠加。
+        env = build_child_env(os.environ, policy=load_shell_env_policy())
         output_encoding = platform_console_encoding()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = output_encoding
         env["PYTHONUTF8"] = "0"
+        # 管道日志只认纯文本：禁用子进程彩色输出（vitest 等在 CI/FORCE_COLOR 下
+        # 非 TTY 也会上色）。FORCE_COLOR 优先级高于 NO_COLOR，必须一并移除；
+        # 读取侧 get_task_output 仍会兜底剥离，防止不认 NO_COLOR 的工具漏网
+        env.setdefault("NO_COLOR", "1")
+        env.pop("FORCE_COLOR", None)
 
         # 启动后台进程
         # stdout 和 stderr 都合并写入日志文件
@@ -400,11 +462,24 @@ def start_background_task(command: str, session_id: str = "", shell_id: str = ""
             log_file = None
             raise
 
+        # T4 回合关联：任务日志首行标注父回合短码（副作用任务日志可追溯到回合）
+        if turn_id:
+            try:
+                log_file.write(
+                    f"[turn:{turn_short_code(turn_id)}] 后台任务启动\n".encode(
+                        output_encoding, errors="replace"
+                    )
+                )
+                log_file.flush()
+            except Exception:
+                pass
+
         with _TASKS_LOCK:
             ACTIVE_TASKS[task_id] = {
                 "id": task_id,
                 "command": command,
                 "session_id": session_id,
+                "turn_id": str(turn_id or ""),
                 "process": process,
                 "pid": process.pid,
                 "create_time": _process_create_time(process.pid),
@@ -418,6 +493,21 @@ def start_background_task(command: str, session_id: str = "", shell_id: str = ""
                 "last_log_size": 0,
             }
             _save_tasks()
+        # Workspace Process Registry 登记（规格 §9.2）：后台任务为长期监听服务，
+        # 登记失败只记日志，绝不影响任务本身
+        try:
+            from core.git import process_registry as _proc_registry
+
+            _proc_registry.register_process(
+                get_workdir(),
+                handle=task_id,
+                kind="background_task",
+                foreground=False,
+                long_running=True,
+                risk_class=_proc_registry.risk_class_for_command(command),
+            )
+        except Exception as reg_error:
+            _logger.warning("后台任务登记进程注册表失败 %s: %s", task_id, reg_error)
         _prune_old_logs()
         # 启动完成监听线程：进程退出后触发完成回调，向前端推送通知
         _watcher = threading.Thread(
@@ -661,6 +751,7 @@ def _evict_terminal_locked():
 def list_active_tasks():
     """返回当前所有仍在运行的任务列表（返回值结构与历史一致，只含 running 任务）。
 
+    每行附带 session_id（发起会话名）：GUI 执行条据此只显示当前会话的任务。
     死亡任务不再直接删除，而是标记终态保留在 ACTIVE_TASKS 供快照/wait 查询；
     终态记录超过 _TERMINAL_KEEP_CAP 时淘汰最旧；磁盘库只保存 running 任务。
     """
@@ -685,11 +776,26 @@ def list_active_tasks():
             proc = info.get("process")
             pid = info.get("pid")
             running_time = int(time.time() - info["start_time"])
+            # 输出心跳：日志字节数 + 距最后一次写入的秒数。GUI 任务面板据此在
+            # 运行期区分"仍在运行只是暂无输出"与"面板失联"（缓冲管道命令的
+            # 运行期日志天然只有启动标记一行，size 长期停在几十字节）
+            log_file_path = info.get("log_file_path")
+            try:
+                output_size = os.path.getsize(log_file_path) if log_file_path else 0
+                last_output_age = max(0, int(time.time() - os.path.getmtime(log_file_path))) \
+                    if log_file_path and output_size > 0 else None
+            except OSError:
+                output_size, last_output_age = 0, None
             results.append({
                 "task_id": tid,
                 "command": info["command"],
                 "pid": pid or (proc.pid if proc else -1),
-                "duration": f"{running_time}秒"
+                "duration": f"{running_time}秒",
+                "turn_id": info.get("turn_id") or "",
+                "session_id": info.get("session_id") or "",
+                "output_size": output_size,
+                "last_output_age": last_output_age,
+                "no_output_yet": output_size <= _STARTUP_MARKER_MAX_BYTES,
             })
 
         if _evict_terminal_locked():
@@ -703,7 +809,7 @@ def list_active_tasks():
 def get_task_output(task_id: str, tail_lines: int = 30) -> str:
     """读取指定任务的日志输出尾部"""
     _ensure_paths()
-    if not _TASK_ID_PATTERN.match(str(task_id or "")):
+    if not _TASK_ID_PATTERN.fullmatch(str(task_id or "")):
         return f"🚨 无效的任务 ID: {task_id}"
     log_file_path = os.path.join(LOG_DIR, f"task_{task_id}.log")
     if not os.path.exists(log_file_path):
@@ -729,6 +835,10 @@ def get_task_output(task_id: str, tail_lines: int = 30) -> str:
             f.seek(max(0, size - _TAIL_READ_BYTES))
             raw = f.read()
         output = decode_process_output(raw, output_encoding)
+        # 子进程写文件的原始字节常带 ANSI 颜色码（vitest 在 CI/FORCE_COLOR 下
+        # 非 TTY 也上色），日志尾部同时供 GUI 面板、CLI /tasks 与任务快照消费，
+        # 统一在此清洗成纯文本；CSI 序列不含换行，剥离不影响分行截断逻辑
+        output = strip_ansi_escapes(output)
         lines = output.splitlines(keepends=True)
         if truncated and lines:
             # 丢弃被截断的首行残片

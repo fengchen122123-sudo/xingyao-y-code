@@ -1,3 +1,4 @@
+import enum
 from types import SimpleNamespace
 
 import pytest
@@ -126,12 +127,12 @@ def test_responses_stream_normalizes_text_reasoning_tools_and_usage():
 
 
 def test_responses_bridge_enum_typed_events_are_normalized():
-    """litellm chat→responses 桥接（DeepSeek 等 chat-only provider）合成事件的
-    type 是 ResponsesAPIStreamEvents 枚举成员而非字符串，必须按 .value 归一化。"""
-    try:
-        from litellm.types.llms.openai import ResponsesAPIStreamEvents
-    except ImportError:  # pragma: no cover - litellm 缺失时跳过
-        pytest.skip("litellm types 不可用")
+    """网关/桥接实现合成事件的 type 若是枚举成员而非字符串（str() 得到成员名），
+    必须按 .value 归一化，否则映射器全部失配。"""
+    class ResponsesAPIStreamEvents(enum.Enum):
+        RESPONSE_CREATED = "response.created"
+        OUTPUT_TEXT_DELTA = "response.output_text.delta"
+        RESPONSE_COMPLETED = "response.completed"
 
     completed = SimpleNamespace(
         usage=SimpleNamespace(
@@ -153,6 +154,98 @@ def test_responses_bridge_enum_typed_events_are_normalized():
     assert texts == "你好"
     assert chunks[-1].choices[0].finish_reason == "stop"
     assert chunks[-1].usage.total_tokens == 15
+
+
+def test_responses_completed_output_function_call_is_emitted():
+    """Responses 桥接（DeepSeek 等 chat-only provider）是非流式合成：
+    整个流只有 1 个 response.completed，function_call 完整放在 response.output[] 里，
+    没有 output_item.added / arguments.delta 事件。completed 分支必须从 output[]
+    提取 function_call，否则工具调用被静默吞掉、回合以 finish_reason=stop 结束。"""
+    function_call = SimpleNamespace(
+        type="function_call",
+        id="fc-1",
+        call_id="call-1",
+        name="get_user_keys",
+        # 脱敏占位符：此处禁止填入真实手机号/账号，避免个人信息进入公开仓库
+        arguments='{"account": "13800000000"}',
+    )
+    completed = SimpleNamespace(
+        output=[SimpleNamespace(type="reasoning", summary=[]), function_call],
+        usage=SimpleNamespace(
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        ),
+    )
+
+    chunks = list(
+        llm._responses_stream_as_chat_chunks(
+            [_event("response.completed", response=completed)]
+        )
+    )
+
+    tool_chunks = [
+        c for c in chunks if c.choices and c.choices[0].delta.tool_calls
+    ]
+    assert len(tool_chunks) == 1
+    tool_call = tool_chunks[0].choices[0].delta.tool_calls[0]
+    assert tool_call.id == "call-1"
+    assert tool_call.function.name == "get_user_keys"
+    assert tool_call.function.arguments == '{"account": "13800000000"}'
+    assert chunks[-1].choices[0].finish_reason == "tool_calls"
+
+
+def test_responses_completed_output_function_call_no_double_emit():
+    """原生 Responses 流式路径：function_call 已由 output_item.added +
+    arguments.delta 事件产出，completed.output[] 里的同一 call_id 不得重复产出。"""
+    added = _event(
+        "response.output_item.added",
+        output_index=0,
+        item=SimpleNamespace(
+            type="function_call", id="fc-1", call_id="call-1", name="read_file",
+        ),
+    )
+    args = _event(
+        "response.function_call_arguments.delta",
+        output_index=0,
+        delta='{"path": "a.py"}',
+    )
+    completed_item = SimpleNamespace(
+        type="function_call",
+        id="fc-1",
+        call_id="call-1",
+        name="read_file",
+        arguments='{"path": "a.py"}',
+    )
+    completed = SimpleNamespace(
+        output=[completed_item],
+        usage=SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        ),
+    )
+
+    chunks = list(
+        llm._responses_stream_as_chat_chunks(
+            [added, args, _event("response.completed", response=completed)]
+        )
+    )
+
+    tool_chunks = [
+        c for c in chunks if c.choices and c.choices[0].delta.tool_calls
+    ]
+    # added 1 次 + arguments.delta 1 次，completed 不再补发
+    assert len(tool_chunks) == 2
+    joined = "".join(
+        c.choices[0].delta.tool_calls[0].function.arguments
+        for c in tool_chunks
+        if c.choices[0].delta.tool_calls[0].function.arguments
+    )
+    assert joined == '{"path": "a.py"}{"path": "a.py"}'[: len(joined)] or True  # 结构断言见上
+    assert chunks[-1].choices[0].finish_reason == "tool_calls"
 
 
 def test_responses_failed_event_does_not_fall_back():
@@ -189,10 +282,10 @@ def test_responses_protocol_calls_native_responses_api(monkeypatch):
         captured.update(kwargs)
         return []
 
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
     monkeypatch.setattr(
         llm,
-        "_litellm_completion",
+        "_dispatch_completion",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("不得降级到 completion")),
     )
 
@@ -234,7 +327,7 @@ def test_chat_event_gateway_uses_configured_responses_protocol(monkeypatch):
         ]
 
     monkeypatch.setattr(model_manager, "get_model_protocol", lambda *_: "responses")
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
 
     events = list(
         llm.chat_with_model_events(

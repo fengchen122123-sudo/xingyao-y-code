@@ -49,6 +49,14 @@ _SHA256_RE = re.compile(r"SHA256\s*[:：]\s*([0-9a-fA-F]{64})", re.IGNORECASE)
 # 分卷附件名尾部序号（如 Y-code-1.2.6.exe.part2）
 _PART_SUFFIX_RE = re.compile(r"\.part(\d+)$", re.IGNORECASE)
 
+# 更新缓存目录里的正式安装包命名：Y-CODE-Setup-v{版本}.exe
+_INSTALLER_NAME_RE = re.compile(r"^Y-CODE-Setup-v(.+)\.exe$", re.IGNORECASE)
+
+# 复用缓存安装包的最小体积兜底（字节）：Release 既无 SHA256 也无 size 时，
+# 仅凭文件名无法识别半截下载/HTML 错误页，至少要像正常安装包（与下载器
+# 拒绝 <1MB 分片的阈值保持一致）。
+_MIN_INSTALLER_BYTES = 1024 * 1024
+
 
 def is_safe_version_string(version: str) -> bool:
     """校验版本号仅含安全字符（数字/字母/点/横线/下划线），防路径穿越与 shell 注入。"""
@@ -94,18 +102,19 @@ def _pick_main_installer_group(
 ) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
     """从多组完整分卷里挑主安装包（GUI 版）那组。
 
-    优先精确匹配主安装包分发名 Y-code-{版本}.exe；退而求其次取
-    Y-code 前缀且不含 cli 的基名；都没有时返回第一组（极端兜底，
-    总比拒绝更新好）。找不到任何完整分卷时返回 None。
+    优先精确匹配主安装包分发名 XingYaoCode-{版本}.exe；为兼容旧命名，
+    再匹配 Y-code-{版本}.exe；退而求其次取基名小写以 xingyaocode 或
+    y-code 开头且不含 cli 的组；都没有时返回第一组（极端兜底，总比拒绝
+    更新好）。找不到任何完整分卷时返回 None。
     """
     if not complete:
         return None
-    exact = f"Y-code-{version}.exe"
-    if exact in complete:
-        return exact, complete[exact]
+    for exact in (f"XingYaoCode-{version}.exe", f"Y-code-{version}.exe"):
+        if exact in complete:
+            return exact, complete[exact]
     for stem in complete:
         low = stem.lower()
-        if low.startswith("y-code") and "cli" not in low:
+        if (low.startswith("xingyaocode") or low.startswith("y-code")) and "cli" not in low:
             return stem, complete[stem]
     stem = next(iter(complete))
     return stem, complete[stem]
@@ -117,7 +126,8 @@ def _pick_main_installer_exe(
     """从单 exe 附件里挑主安装包（GUI 版）。
 
     同 Release 可能同时挂主安装包与 CLI 安装包两个 exe，自动更新必须
-    优先选主安装包：精确名 > Y-code 前缀且非 cli > 任意 exe。
+    优先选主安装包：精确名 XingYaoCode-{版本}.exe（兼容旧命名
+    Y-code-{版本}.exe）> xingyaocode / y-code 前缀且非 cli > 任意 exe。
     """
     exe_assets = [
         a for a in (assets or [])
@@ -125,13 +135,13 @@ def _pick_main_installer_exe(
     ]
     if not exe_assets:
         return None
-    exact = f"Y-code-{version}.exe"
-    for asset in exe_assets:
-        if str(asset.get("name")) == exact:
-            return asset
+    for exact in (f"XingYaoCode-{version}.exe", f"Y-code-{version}.exe"):
+        for asset in exe_assets:
+            if str(asset.get("name")) == exact:
+                return asset
     for asset in exe_assets:
         low = str(asset.get("name") or "").lower()
-        if low.startswith("y-code") and "cli" not in low:
+        if (low.startswith("xingyaocode") or low.startswith("y-code")) and "cli" not in low:
             return asset
     return exe_assets[0]
 
@@ -175,27 +185,187 @@ def get_update_cache_dir() -> str:
     return cache_dir
 
 
-def cleanup_old_installers() -> int:
-    """清理历史残留安装包与临时文件，返回清理的文件数量。"""
+def _remove_file_quietly(path: str) -> bool:
+    """删除单个文件，失败只记 debug 日志（不抛出）。返回是否删除成功。"""
+    try:
+        os.remove(path)
+        return True
+    except Exception as e:
+        logger.debug("删除文件 %s 失败: %s", path, e)
+        return False
+
+
+def cleanup_old_installers(current_version: str = "", keep_days: int = 7) -> int:
+    """按策略清理更新缓存目录，返回清理的条目数（异常不抛出，仅告警）。
+
+    策略（不再整个清空缓存目录）：
+      1. Y-CODE-Setup-v{X}.exe 且 X <= 当前运行版本 → 删除
+         （该版本已装上或已过时，留着无用）；
+      2. Y-CODE-Setup-v{X}.exe 且 X > 当前运行版本 → 保留
+         （用户可能还要手动安装这个包）；
+      3. 命名不符合上述模式的文件 → 按最后修改时间，超过 keep_days 天删除；
+      4. 任何 .downloading 残片（含 *.exe.downloading）→ 一律删除；
+      5. current_version 缺省时取 core/version.py 的 __version__；取不到时
+         视为"无法比较"，此时不动任何 exe，只清残片。
+
+    本函数在启动后台线程中被调用（gui_bridge），全程只做本地文件操作，
+    无阻塞、无交互。
+    """
     cleaned = 0
     try:
+        if not current_version:
+            try:
+                from core.version import __version__ as _current
+                current_version = str(_current or "")
+            except Exception as e:
+                logger.debug("读取当前版本号失败，按无法比较处理: %s", e)
+                current_version = ""
+
+        # 当前版本可比较时才允许按版本号删包（空版本号 = 无法比较）
+        can_compare = bool(current_version)
+
         cache_dir = get_update_cache_dir()
         if not os.path.isdir(cache_dir):
             return 0
+
+        now = time.time()
+        max_age_seconds = max(int(keep_days), 0) * 24 * 60 * 60
+
         for fname in os.listdir(cache_dir):
             fpath = os.path.join(cache_dir, fname)
             try:
-                if os.path.isfile(fpath):
-                    os.remove(fpath)
-                    cleaned += 1
-                elif os.path.isdir(fpath):
+                if os.path.isdir(fpath):
                     shutil.rmtree(fpath, ignore_errors=True)
                     cleaned += 1
+                    continue
+                if not os.path.isfile(fpath):
+                    continue
+
+                # 下载残片一律清理（不完整文件没有复用价值）
+                if fname.lower().endswith(".downloading"):
+                    if _remove_file_quietly(fpath):
+                        logger.info("清理下载残片: %s", fpath)
+                        cleaned += 1
+                    continue
+
+                m = _INSTALLER_NAME_RE.match(fname)
+                ver_str = m.group(1) if m else ""
+                # 版本号里必须含数字才算解析成功（parse_version 对无数字串返回 (0,0,0)）
+                if ver_str and re.search(r"\d", ver_str) and can_compare:
+                    if compare_versions(ver_str, current_version) <= 0:
+                        if _remove_file_quietly(fpath):
+                            logger.info(
+                                "清理已过时安装包（v%s <= 当前 v%s）: %s",
+                                ver_str, current_version, fpath,
+                            )
+                            cleaned += 1
+                    # X > current_version：版本更新，保留给用户安装
+                    continue
+
+                # 走到这里：命名非标准，或当前版本不可比较。
+                # 无法比较时不删任何 exe（可能是用户还要装的包）
+                if not can_compare and fname.lower().endswith(".exe"):
+                    continue
+
+                try:
+                    mtime = os.path.getmtime(fpath)
+                except OSError as e:
+                    logger.debug("读取修改时间失败，跳过 %s: %s", fpath, e)
+                    continue
+                if max_age_seconds > 0 and now - mtime > max_age_seconds:
+                    if _remove_file_quietly(fpath):
+                        logger.info("清理超期残留文件（>%d 天）: %s", keep_days, fpath)
+                        cleaned += 1
             except Exception as e:
                 logger.debug("清理文件 %s 失败: %s", fpath, e)
     except Exception as e:
         logger.warning("扫描更新缓存目录失败: %s", e)
     return cleaned
+
+
+def find_cached_installer(
+    target_version: str,
+    expected_sha256: str = "",
+    expected_size: int = 0,
+) -> str:
+    """在更新缓存目录中查找可复用的安装包，返回路径；不可用时返回空串。
+
+    严格校验（SHA256 优先，其次大小，再叠加 PE 头/体积兜底）：
+      1. 必须存在文件 Y-CODE-Setup-v{target_version}.exe，否则返回 ""；
+      2. 体积小于 _MIN_INSTALLER_BYTES，或 expected_size > 0 且实际大小不符
+         → 视为不完整下载：删除该文件、记录 warning 并返回 ""（重新下载）；
+      3. 文件头不是 PE 的 MZ 魔数（HTML 错误页/损坏文件）→ 删除并返回 ""；
+      4. expected_sha256 非空 → 用 _sha256_file 比对（大小写不敏感），
+         不匹配则删除该文件、记录 warning 并返回 ""；
+      5. 校验全部通过才返回路径。
+
+    第 2、3 条是兜底：Release 既无 SHA256 也无附件大小时，只按文件名复用会让
+    坏包被反复当成「已就绪」，而启动时又必被 launch_installer 的 MZ 检查拒绝，
+    且这类包版本高于当前运行版本、不会被启动清理带走，用户会卡在装不上的状态。
+    """
+    try:
+        if not target_version or not is_safe_version_string(target_version):
+            logger.warning("非法目标版本号，跳过缓存查找: %r", target_version)
+            return ""
+        cache_dir = get_update_cache_dir()
+        cached_path = os.path.join(cache_dir, f"Y-CODE-Setup-v{target_version}.exe")
+        if not os.path.isfile(cached_path):
+            return ""
+
+        try:
+            actual_size = os.path.getsize(cached_path)
+        except OSError as e:
+            logger.warning("读取缓存安装包大小失败，视为无效: %s - %s", cached_path, e)
+            return ""
+
+        if expected_size and int(expected_size) > 0 and actual_size != int(expected_size):
+            logger.warning(
+                "缓存安装包大小不符（期望 %d，实际 %d），删除并重新下载: %s",
+                int(expected_size), actual_size, cached_path,
+            )
+            _remove_file_quietly(cached_path)
+            return ""
+
+        if actual_size < _MIN_INSTALLER_BYTES:
+            logger.warning(
+                "缓存安装包体积异常（%d 字节 < %d），视为未完成下载，删除并重新下载: %s",
+                actual_size, _MIN_INSTALLER_BYTES, cached_path,
+            )
+            _remove_file_quietly(cached_path)
+            return ""
+
+        try:
+            with open(cached_path, "rb") as f:
+                magic = f.read(2)
+        except OSError as e:
+            logger.warning("读取缓存安装包文件头失败，视为无效: %s - %s", cached_path, e)
+            return ""
+        if magic != b"MZ":
+            logger.warning(
+                "缓存安装包不是有效的 Windows 可执行文件（MZ 头缺失），删除并重新下载: %s",
+                cached_path,
+            )
+            _remove_file_quietly(cached_path)
+            return ""
+
+        if expected_sha256:
+            try:
+                actual_hash = _sha256_file(cached_path)
+            except Exception as e:
+                logger.warning("计算缓存安装包 SHA256 失败，视为无效: %s - %s", cached_path, e)
+                return ""
+            if actual_hash.lower() != str(expected_sha256).strip().lower():
+                logger.warning(
+                    "缓存安装包 SHA256 校验失败（期望 %s，实际 %s），删除并重新下载: %s",
+                    str(expected_sha256).strip().lower(), actual_hash, cached_path,
+                )
+                _remove_file_quietly(cached_path)
+                return ""
+
+        return cached_path
+    except Exception as e:
+        logger.warning("查找缓存安装包失败: %s", e)
+        return ""
 
 
 def fetch_latest_release(
@@ -282,7 +452,7 @@ def fetch_latest_release(
     raw_tag = data.get("tag_name") or ""
     # 清洗 tag 中的版本号（如 'v1.2.6' -> '1.2.6'）
     latest_version = raw_tag.lstrip("vV").strip() or raw_tag
-    release_title = data.get("name") or f"Y-CODE v{latest_version}"
+    release_title = data.get("name") or f"星瑶Code v{latest_version}"
     release_notes = data.get("body") or "暂无更新说明。"
     official_sha256 = parse_release_sha256(release_notes)
 
@@ -458,14 +628,21 @@ class UpdateDownloader:
                 last_percent = -1
                 part_index = 0
 
-                def _report_progress(force: bool = False):
+                def _report_progress(
+                    force: bool = False, part_done: int = 0, part_size: int = 0
+                ):
+                    # part_done / part_size 必须由调用方显式传入：它们本是
+                    # _download_one_part 的局部变量，而本闭包的外层作用域是
+                    # _worker（并未绑定这两个名字），直接引用会 NameError
+                    # ——响应用 chunked 传输、拿不到 Content-Length 时即触发，
+                    # 会让整次更新以"下载失败"收场。
                     nonlocal last_emit_time, last_percent
                     now = time.monotonic()
                     if len(urls) > 1 and grand_total <= 0:
                         # 分卷且无总大小元数据（Gitee 公开 API 附件不带 size）：
                         # 按片数比例混算（片完成度 + 当前片内进度），避免末片
                         # 偏小导致"估总分母"进度漂移（如 77% 直接跳 100%）
-                        part_frac = part_downloaded / part_total if part_total > 0 else 0
+                        part_frac = part_done / part_size if part_size > 0 else 0
                         percent = int(min(99, ((part_index - 1 + part_frac) / len(urls)) * 100))
                     else:
                         percent = (
@@ -567,7 +744,10 @@ class UpdateDownloader:
                                         f.write(chunk)
                                         part_downloaded += len(chunk)
                                         downloaded_total += len(chunk)
-                                        _report_progress()
+                                        _report_progress(
+                                            part_done=part_downloaded,
+                                            part_size=part_total,
+                                        )
                         except (urllib.error.URLError, OSError) as error:
                             last_reason = f"网络错误 ({error})"
                             continue
@@ -658,10 +838,15 @@ class UpdateDownloader:
 updater_downloader = UpdateDownloader()
 
 
-def launch_installer_and_cleanup(installer_path: str) -> bool:
-    """启动安装程序并在安装完成后由外部批处理自动清理安装包文件。
+def launch_installer(installer_path: str) -> bool:
+    """启动安装向导（此处不再删除安装包）。
 
-    使用 cmd.exe /c start /wait 运行安装包，等待安装程序完全关闭后 del 删除文件。
+    安装包的清理责任已移交，避免"向导一退出包就被删"导致用户必须重新下载：
+      * 安装成功：由安装向导（ycode_setup.py）在退出前自行清理安装包；
+      * 未安装成功（用户中途关闭向导、安装失败、需要重试）：安装包保留，
+        交由下次启动时的 cleanup_old_installers 按策略清理。
+
+    使用 cmd.exe /c start /wait 运行安装包（隐藏黑框），只负责启动，不删除任何文件。
     """
     if not os.path.isfile(installer_path):
         logger.error("安装程序不存在: %s", installer_path)
@@ -688,9 +873,10 @@ def launch_installer_and_cleanup(installer_path: str) -> bool:
     if not is_safe_version_string(base_name.replace(".exe", "")):
         logger.error("安装包文件名含特殊字符，拒绝启动: %s", norm_path)
         return False
-    # cmd 批处理命令：等待安装向导退出后自删除安装包
-    cmd = f'start /wait "" "{norm_path}" & del /f /q "{norm_path}"'
-    logger.info("唤起安装程序自清理脚本: %s", cmd)
+    # cmd 批处理命令：只启动安装向导（安装包清理由向导/启动策略清理负责，
+    # 这里绝不能跟 & del，否则用户关掉向导包就没了，必须重新下载）
+    cmd = f'start /wait "" "{norm_path}"'
+    logger.info("唤起安装程序（不在此处清理安装包）: %s", cmd)
 
     try:
         # 隐藏批处理黑框

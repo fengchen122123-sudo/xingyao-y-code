@@ -70,6 +70,18 @@ def test_tool_finish_payload_has_duration_result_and_display():
     assert payload["result"] == "one\ntwo"
 
 
+def _patch_registry_execute(mocker, **kwargs):
+    """patch ToolRegistry.execute 类属性。
+
+    不能 patch _LazyToolRegistry 实例（core.llm.tool_registry）：fake 会经
+    __setattr__ 落到进程级缓存的内部注册表上，而 teardown 的还原对
+    __slots__ 包装器必然失败，fake executor 从此泄漏并污染后续所有测试。
+    """
+    from core.tool_registry import ToolRegistry
+
+    return mocker.patch.object(ToolRegistry, "execute", **kwargs)
+
+
 def test_repaired_arguments_are_shared_by_event_payload_and_executor(mocker):
     import core.llm as llm
 
@@ -92,7 +104,12 @@ def test_repaired_arguments_are_shared_by_event_payload_and_executor(mocker):
         return FakeToolResult()
 
     mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
-    mocker.patch.object(llm.tool_registry, "execute", side_effect=fake_execute)
+    # 不能 patch _LazyToolRegistry 实例：fake 会经 __setattr__ 落到进程级
+    # 缓存的内部注册表上，而 teardown 的还原对 __slots__ 包装器必然失败，
+    # fake executor 就此泄漏并污染后续所有测试。patch 类属性可被可靠还原。
+    from core.tool_registry import ToolRegistry
+
+    mocker.patch.object(ToolRegistry, "execute", side_effect=fake_execute)
 
     payload = llm._tool_event_payload(tc)
     llm._execute_single_tool_call(tc, event_callback=lambda *_args: None)
@@ -524,9 +541,8 @@ def test_kimi_k3_request_uses_anthropic_high_thinking_budget(mocker):
 
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 4096}
     assert captured["max_tokens"] == 131072
-    # litellm 客户端参数校验只把 Claude 系列识别为支持 thinking 的 anthropic 模型，
-    # 对 "K3" 这类陌生模型名会直接抛 UnsupportedParamsError（请求根本发不出去），
-    # 必须显式声明 allowed_openai_params 豁免校验。
+    # thinking 对 OpenAI 兼容语义是非标准参数，必须显式声明
+    # allowed_openai_params，保证网关按白名单放行。
     assert captured["allowed_openai_params"] == ["thinking"]
     assert "reasoning_effort" not in captured
 
@@ -564,7 +580,7 @@ def test_chat_request_uses_explicit_cache_scope_and_actual_tool_contract(mocker)
     assert captured["extra_body"]["prompt_cache_key"] == expected
 
 
-def test_kimi_k3_generic_anthropic_route_also_bypasses_litellm_param_check(mocker):
+def test_kimi_k3_generic_anthropic_route_also_bypasses_param_check(mocker):
     """非 kimi coding 的 anthropic 兼容端点（经销商网关等）同样必须带豁免参数。"""
     captured = {}
 
@@ -1008,7 +1024,10 @@ def test_existing_pending_plan_rejects_direct_root_tool(mocker):
     previous_session = plan.session_id
     bind_default_plan_session("existing-pending-plan-test")
     plan.replace([{"id": "weather", "subject": "查询天气"}])
-    execute = mocker.patch.object(llm.tool_registry, "execute")
+    # 同上：patch ToolRegistry 类属性，避免 _LazyToolRegistry 实例 patch 泄漏。
+    from core.tool_registry import ToolRegistry
+
+    execute = mocker.patch.object(ToolRegistry, "execute")
 
     result = llm._execute_single_tool_call(
         {
@@ -1476,8 +1495,8 @@ def test_stalled_plan_after_repeated_failures_allows_direct_diagnosis(mocker):
     bind_default_plan_session("stalled-plan-escape-test")
     plan.replace([{"id": "impl", "subject": "实现功能", "stage": "build"}])
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "写入成功"
         )
     )
@@ -1524,8 +1543,8 @@ def test_cleared_plan_turn_releases_tool_gate(mocker):
     plan.replace([])
     llm._mark_plan_turn("turn-cleared-gate")
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "执行成功"
         )
     )
@@ -1568,8 +1587,8 @@ def test_completed_plan_turn_releases_tool_gate(mocker):
     }])
     llm._mark_plan_turn("turn-terminal-gate")
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "执行成功"
         )
     )
@@ -1617,8 +1636,8 @@ def test_unresolved_plan_keeps_tool_gate_across_turns(mocker, statuses):
         for index, status in enumerate(statuses)
     ])
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute", return_value=mocker.Mock(
+    execute = _patch_registry_execute(
+        mocker, return_value=mocker.Mock(
             to_message_content=lambda: "不应执行"
         )
     )
@@ -1657,8 +1676,8 @@ def test_plan_retry_repeat_calls_are_not_suppressed(mocker):
     bind_default_plan_session("plan-retry-repeat-guard-test")
     plan.replace([{"id": "t1", "subject": "任务"}])
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
-    execute = mocker.patch.object(
-        llm.tool_registry, "execute",
+    execute = _patch_registry_execute(
+        mocker,
         return_value=mocker.Mock(to_message_content=lambda: "计划项已重置为 pending。"),
     )
     responses = [
@@ -2089,3 +2108,65 @@ def test_alternating_plan_control_failures_abort_after_twelve_stalled_steps():
         _progress_record("cycle-11", name, content)
     ])) is False
     assert guard.should_abort() is True
+
+
+def test_budget_notice_provider_injects_at_step_boundary(mocker):
+    """子代理预算提醒必须以 user 消息插在 Step 边界，并随事件流上报。
+
+    注入位置错误（例如插在 tool_calls 与 tool 结果之间）会制造悬空
+    tool_calls，OpenAI/Anthropic 都会 400，所以这条契约必须锁住。
+    """
+    from types import SimpleNamespace
+
+    seen_messages = []
+
+    def completion(**kwargs):
+        seen_messages.append([dict(m) for m in kwargs.get("messages", [])])
+        return iter([_chunk("done")])
+
+    mocker.patch("core.llm.completion", side_effect=completion)
+    notices = ["⏳ 时间预算提醒：剩余 100s"]
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "执行子任务"}],
+        persist=False,
+        turn_id="subagent-budget",
+        parent_session="session",
+        parent_turn_id="turn",
+        budget_notice_provider=lambda: notices.pop(0) if notices else None,
+    ))
+
+    assert any(event.kind == "budget_notice" for event in events)
+    first_request = seen_messages[0]
+    assert first_request[-1]["role"] == "user"
+    assert "时间预算提醒" in first_request[-1]["content"]
+    # 只注入一次：provider 返回 None 后不再追加
+    assert sum(
+        1 for m in first_request if "时间预算提醒" in str(m.get("content"))
+    ) == 1
+
+
+def test_budget_notice_provider_failure_never_breaks_turn(mocker):
+    """提醒通道异常必须被吞掉：预算提示失败不能中断子代理回合。"""
+    def completion(**kwargs):
+        return iter([_chunk("ok")])
+
+    mocker.patch("core.llm.completion", side_effect=completion)
+
+    def broken_provider():
+        raise RuntimeError("provider boom")
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "任务"}],
+        persist=False,
+        turn_id="subagent-budget-broken",
+        parent_session="session",
+        parent_turn_id="turn",
+        budget_notice_provider=broken_provider,
+    ))
+
+    assert any(event.kind == "turn_finished" for event in events)

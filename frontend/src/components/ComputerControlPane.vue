@@ -17,7 +17,7 @@
           {{ store.computerControlPausable === 'pause' ? '暂停' : '恢复' }}
         </button>
         <button
-          v-if="store.computerRun.run_id"
+          v-if="store.computerRun.run_id && !store.computerRunTerminal"
           class="chip-btn danger"
           data-test="computer-stop"
           title="立即停止当前操控（快捷键 Ctrl+Alt+Esc）"
@@ -48,39 +48,14 @@
         <span>{{ reasonText }}</span>
       </div>
 
-      <!-- 操作轨迹：按新到旧，最多 200 行（内存态，run 结束保留到下一个 run） -->
-      <div class="cp-trace-head">
-        <span class="cp-trace-title">操作轨迹</span>
-        <span class="cp-trace-note">最多 200 条 · 新到旧</span>
-      </div>
-      <ul v-if="store.computerTrace.length" class="cp-trace" data-test="computer-trace-list">
-        <li
-          v-for="row in store.computerTrace"
-          :key="row.action_ordinal"
-          class="cp-trace-row"
-          :class="row.status"
-          data-test="computer-trace-row"
-        >
-          <span class="cp-row-ico">
-            <AppIcon
-              :name="row.status === 'done' ? 'check' : (row.status === 'failed' ? 'x' : 'loader')"
-              :size="12"
-              :stroke-width="2"
-              :class="{ 'icon-spin': row.status === 'running' }"
-            />
-          </span>
-          <span class="cp-row-text">
-            <span class="cp-row-summary">{{ row.action_ordinal }}. {{ row.summary }}</span>
-            <span v-if="row.error_code" class="cp-row-error">{{ row.error_code }}</span>
-          </span>
-          <span v-if="row.duration_ms" class="cp-row-duration">{{ row.duration_ms }}ms</span>
-        </li>
-      </ul>
-      <p v-else class="cp-trace-empty">本 run 暂无已记录的操作轨迹</p>
+      <!-- 动作明细不再在这里堆列表：每个动作已经以「点击 · 目标 · 耗时」的
+           紧凑行长在对话区，点开还能看当帧截图。面板只保留控制与最新一张图，
+           避免同一批动作在两处重复展示、列表越滚越长。 -->
     </template>
 
     <p v-else class="cp-empty" data-test="computer-empty-state">
-      暂无电脑操控会话。{{ store.agentName }}开始操控浏览器或桌面时，这里会实时显示截图预览与操作轨迹。
+      暂无电脑操控会话。{{ store.agentName }}开始操控浏览器或桌面时，这里会显示最新画面与运行控制，
+      每个动作的明细与当帧截图在对话区逐行展示。
     </p>
   </div>
 </template>
@@ -131,7 +106,13 @@ const surface = computed(() => String(store.computerRun.current_surface || ''));
 const reasonText = computed(() => {
   const run = store.computerRun;
   if (run.status === 'paused') return run.pause_reason ? `暂停原因：${run.pause_reason}` : '已暂停，等待恢复';
-  if (run.status === 'waiting_for_user' && run.pause_reason) return `等待用户接管：${run.pause_reason}`;
+  // 接管态（waiting_for_user）是 2026-10-01 修复的一部分：回合正常收尾后已自动交还租约与浏览器连接，
+  // 下一回合星瑶会重新接管同一页面继续操作，用户不必点“立即停止”，只需在对话里说一声即可。
+  // 因此即使 pause_reason 为空也要给出这段交还指引，避免用户误以为必须手动停止。
+  if (run.status === 'waiting_for_user') {
+    const reasonPart = run.pause_reason ? `：${run.pause_reason}` : '';
+    return `等待你接管${reasonPart} · 在右侧面板操作完成后，直接在对话里说一声，星瑶会重新接管继续。`;
+  }
   if (run.status === 'stopped') return run.stop_reason ? `停止原因：${run.stop_reason}` : '本 run 已停止';
   if (run.status === 'provider_safety_required') {
     return run.error_code

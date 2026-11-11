@@ -1,7 +1,7 @@
+import difflib
 import json
 import hashlib
 import logging
-import os
 import queue
 import random
 import re
@@ -9,13 +9,11 @@ import subprocess
 import threading
 import time
 import uuid
-from types import SimpleNamespace
-from urllib.parse import urlsplit
+from collections import deque
 # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
-from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
+from concurrent.futures import TimeoutError
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Dict, List
 
 from core.harness.request_envelope import (
@@ -28,6 +26,52 @@ from core.harness.request_envelope import (
 )
 from core.harness.journal import journal_storage_supported
 from core.harness.runtime import TurnRuntime
+import core.app_context as app_context
+from core import permission_grants, permission_store
+from core.command_policy import (
+    _session_rule_is_exact,
+    classify_command_risk,
+    command_matches_session_rule,
+    parse_manual_command_rule,
+    session_rule_for_command,
+)
+from core.harness.stream_assembler import StreamAssembler, complete_thinking_blocks
+from core.permission_broker import (
+    CANCELLED_RESULT,
+    PermissionOption,
+    PermissionOptionKey,
+    permission_broker,
+)
+from core.permission_policy import (
+    PermissionAction,
+    PermissionFacts,
+    PermissionRisk,
+    decide_permission,
+)
+from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
+from core.tool_presenter import (
+    build_tool_display,
+    summarize_tool_finished,
+    summarize_tool_started,
+)
+from core.tools import (
+    edit_file,
+    execute_command,
+    fetch_url,
+    get_weather,
+    glob_files,
+    is_outside_workspace,
+    list_directory,
+    manage_task,
+    read_file,
+    run_subagent,
+    sandbox_bypass,
+    search_code,
+    search_news,
+    write_file,
+)
+from core.turn_events import TurnEventFactory
+from core.injection_markers import ORCHESTRATION_NUDGE_TEXT as _ORCHESTRATION_NUDGE_TEXT
 
 # 电脑操控（Task 10，设计 9.3/19）：包级轻量依赖，绝不触碰键鼠/浏览器；
 # controller 顶层也不 import core.llm，无循环导入。测试通过 monkeypatch
@@ -62,7 +106,8 @@ from core.computer.provider_openai import (
     native_computer_call_from_stream,
     native_has_dual_targets,
 )
-from core.computer.settings import load_computer_settings
+# load_computer_settings 延迟到能力解析时再 import：它连带 core.computer.platforms
+# 与 config（冷启动约 36ms），CLI 轻量模式下能力恒为禁用，不需要在启动期付这笔成本。
 from core.computer.tool_adapter import (
     COMPUTER_ACTION_TOOL_NAME,
     RESERVED_COMPUTER_TOOL_NAMES,
@@ -76,1069 +121,135 @@ _COMPUTER_RUN_TERMINAL_STATUSES = frozenset({
     ComputerRunStatus.FAILED.value,
 })
 
-# 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
-# （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
-# 必须在 import litellm 之前设置该环境变量才生效
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-
-# 屏蔽 LiteLLM 启动时的调试噪音，但保留 WARNING 及以上的有用告警
-logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-logging.getLogger("litellm").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 
-def _agent_display_name() -> str:
-    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
-    try:
-        from core.persona_settings import get_agent_display_name
+from core.llm_transport import (
+    API_REQUEST_MAX_TIMEOUT_SECONDS,
+    API_REQUEST_TIMEOUT_SECONDS,
+    REQUEST_WAIT_GIVE_UP_SECONDS,
+    WAIT_NOTICE_INTERVAL_SECONDS,
+    WAIT_NOTICE_THRESHOLD_SECONDS,
+    RequestWaitGiveUpError,
+    _InflightStream,
+    _close_stream_quietly,
+    _inflight_lock,
+    _inflight_streams,
+    _context_overflow_error,
+    _dispatch_completion,
+    _dispatch_responses,
+    _register_inflight_stream,
+    _submit_daemon_call,
+    _token_counter,
+    _unregister_inflight_stream,
+    abort_inflight_streams,
+    is_rate_limit_error,
+)
 
-        return get_agent_display_name()
-    except Exception:
-        return "星瑶"
+# --- 上游错误分类（修复③：额度/鉴权类确定性失败 fail-fast 复用）---
+from core.llm_error_mapper import map_llm_error
 
-
-def _submit_daemon_call(function, *args, **kwargs):
-    """Run a blocking call without adding a non-daemon interpreter-exit hook."""
-    future = Future()
-
-    def runner():
-        if not future.set_running_or_notify_cancel():
-            return
-        try:
-            future.set_result(function(*args, **kwargs))
-        except BaseException as error:
-            future.set_exception(error)
-
-    threading.Thread(target=runner, daemon=True, name="ycode-blocking-call").start()
-    return future
-
-# ---------------------------------------------------------------------------
-# 在飞 LLM 请求硬中断注册表
-# 协作式取消（cancel_event）只能让主循环在下一个检查点退出，阻塞中的 HTTP 读
-# 仍要等到数据到达或超时（随载荷放大，封顶数百秒），用户点“停止”后连接仍在静默
-# 接收。这里把每个在飞流登记到对应 cancel_event 名下，停止路径调用
-# abort_inflight_streams() 直接关闭底层流，让阻塞读立即抛错退出。
-# 铁律：只关闭单个 response 流，绝不触碰 litellm 共享的连接池/client；
-# 关闭动作本身绝不向外抛异常（中断路径不能制造新故障）。
-# ---------------------------------------------------------------------------
-_inflight_lock = threading.Lock()
-_inflight_streams: Dict["threading.Event", List["_InflightStream"]] = {}
+# 确定性失败类别：重试无意义（额度耗尽 / 鉴权失败 / 权限受限 / 模型不存在），
+# 命中即 fail-fast 直接抛出，走既有失败收尾；瞬时类（rate_limit 等）保持重试。
+_DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
+    "insufficient_quota",
+    "auth_invalid",
+    "permission_denied",
+    "model_not_found",
+})
 
 
-def _close_stream_quietly(stream):
-    """尽力关闭单个流对象（不触碰共享 client/连接池），吞掉一切异常。
+def _is_deterministic_api_failure(exc):
+    """判断异常是否属于"重试无意义"的确定性上游失败（纯函数，便于单测）。
 
-    litellm 的 CustomStreamWrapper 没有 close()，真正的可关闭对象藏在
-    .completion_stream（openai SDK Stream，close() 会关底层 httpx response）
-    或 .response（httpx.Response）里，逐层探测。
-    """
-    seen = set()
-    queue = [stream]
-    while queue:
-        target = queue.pop(0)
-        if target is None or id(target) in seen:
-            continue
-        seen.add(id(target))
-        close = getattr(target, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-            return
-        queue.append(getattr(target, "completion_stream", None))
-        queue.append(getattr(target, "response", None))
-
-
-class _InflightStream:
-    """一个在飞 LLM 请求的可关闭句柄；attach 前/后调用 close 都安全且幂等。"""
-
-    __slots__ = ("stream", "closed")
-
-    def __init__(self):
-        self.stream = None
-        self.closed = False
-
-    def attach(self, stream):
-        with _inflight_lock:
-            if not self.closed:
-                self.stream = stream
-                return
-        # attach 前已被 abort：立即关闭新建流，避免泄漏连接
-        _close_stream_quietly(stream)
-
-    def close(self):
-        with _inflight_lock:
-            if self.closed:
-                return
-            self.closed = True
-            stream = self.stream
-        if stream is not None:
-            _close_stream_quietly(stream)
-
-
-def _register_inflight_stream(cancel_event):
-    """请求发出前登记；返回句柄，由流消费方在结束后 _unregister_inflight_stream。"""
-    if cancel_event is None:
-        return None
-    holder = _InflightStream()
-    with _inflight_lock:
-        _inflight_streams.setdefault(cancel_event, []).append(holder)
-    return holder
-
-
-def _unregister_inflight_stream(cancel_event, holder):
-    if cancel_event is None or holder is None:
-        return
-    with _inflight_lock:
-        holders = _inflight_streams.get(cancel_event)
-        if not holders:
-            return
-        try:
-            holders.remove(holder)
-        except ValueError:
-            pass
-        if not holders:
-            _inflight_streams.pop(cancel_event, None)
-
-
-def abort_inflight_streams(cancel_event):
-    """硬中断指定取消事件名下的全部在飞 LLM 请求（停止按钮/Ctrl+C 路径调用）。
-
-    调用方必须先 set cancel_event 再调用本函数：这样被关闭一侧的读循环
-    会把中断识别为用户取消（KeyboardInterrupt 打捞路径），而非网络错误重试。
-    """
-    if cancel_event is None:
-        return
-    with _inflight_lock:
-        holders = list(_inflight_streams.get(cancel_event, ()))
-    for holder in holders:
-        try:
-            holder.close()
-        except Exception:
-            pass
-
-# ---------------------------------------------------------------------------
-# litellm 懒加载：启动性能优化
-# ---------------------------------------------------------------------------
-# 旧实现：顶部直接 import litellm，导致每次启动都要等 litellm 加载（本地实测 ~1.4s，
-#   打包后首次启动 litellm 会让 UI 等待 3-5s 才出现）。
-# 新实现：UI 启动路径（main.py import core.llm）不再触发 litellm 加载，
-#   只有后台 worker 首次真正调用 LLM 或 estimate_tokens 时才加载。
-# 通过 _get_litellm() 单次懒加载 + 缓存，保证 litellm 只在第一次使用时被导入。
-_litellm_module = None
-_litellm_lock = threading.Lock()
-
-
-def _patch_litellm_stream_usage_details(_litellm):
-    """修复 litellm 1.83.7 流式 usage 丢失 prompt_tokens_details 的问题。
-
-    部分 OpenAI 兼容通道（如 DeepSeek 中转）流式最终 chunk 的 usage 以 dict 形式
-    穿过 CustomStreamWrapper，litellm 在组装响应时只取 prompt/completion/total
-    三个字段重建 Usage，prompt_tokens_details.cached_tokens 被丢弃，
-    导致 ycode 的缓存命中记账恒为 0（状态栏“命中 0 (0%)”）。
-    这里把 dict usage 提前转成 litellm.Usage（其构造器保留全部明细字段），
-    下游 isinstance(usage, Usage) 分支即原样透传。
-    升级 litellm 后若官方已修复，此补丁无害（转换是幂等的）。
+    整体用 try/except 兜底：分类失败时返回 False（保守），不改变既有重试行为。
     """
     try:
-        from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
-    except Exception:
-        return
-    if getattr(CustomStreamWrapper, _STREAM_USAGE_PATCH_FLAG, False):
-        return
-    _original = CustomStreamWrapper.handle_openai_chat_completion_chunk
-
-    def _patched(self, chunk):
-        response_obj = _original(self, chunk)
-        if response_obj is None:
-            return response_obj
-        usage = response_obj.get("usage")
-        if isinstance(usage, dict) and (
-            "prompt_tokens_details" in usage or "prompt_cache_hit_tokens" in usage
-        ):
-            try:
-                response_obj["usage"] = _litellm.Usage(**usage)
-            except Exception:
-                pass
-        return response_obj
-
-    CustomStreamWrapper.handle_openai_chat_completion_chunk = _patched
-    setattr(CustomStreamWrapper, _STREAM_USAGE_PATCH_FLAG, True)
-
-
-_STREAM_USAGE_PATCH_FLAG = "_ycode_stream_usage_patched"
-
-
-def _get_litellm():
-    """懒加载 litellm 模块，首次调用时 import 并执行一次性配置，后续调用直接返回缓存。
-
-    线程安全：多线程并发首次调用时通过 _litellm_lock 保证只 import 一次。
-    """
-    global _litellm_module
-    if _litellm_module is not None:
-        return _litellm_module
-    with _litellm_lock:
-        if _litellm_module is not None:
-            return _litellm_module
-        import litellm as _litellm
-        # 屏蔽启动调试噪音
-        _litellm.suppress_debug_info = True
-        _patch_litellm_stream_usage_details(_litellm)
-        _litellm_module = _litellm
-        return _litellm
-
-
-def _litellm_completion(**kwargs):
-    """litellm.completion 的懒加载包装。"""
-    return _get_litellm().completion(**kwargs)
-
-
-def _litellm_responses(**kwargs):
-    """litellm.responses 的懒加载包装。"""
-    return _get_litellm().responses(**kwargs)
-
-
-def _litellm_token_counter(model, messages):
-    """litellm.token_counter 的懒加载包装。"""
-    return _get_litellm().token_counter(model=model, messages=messages)
-
-
-def _litellm_supports_vision(model):
-    """litellm.supports_vision 的懒加载包装。"""
-    try:
-        return _get_litellm().supports_vision(model=model)
+        return map_llm_error(exc).category in _DETERMINISTIC_API_FAILURE_CATEGORIES
     except Exception:
         return False
 
 
-def _litellm_context_overflow_error():
-    """litellm.ContextWindowExceededError 异常类的懒加载包装。"""
-    return _get_litellm().ContextWindowExceededError
+# 多 Key 粘性故障转移（设计见
+# docs/superpowers/specs/2026-10-12-provider-multi-key-failover-design.md）：
+# 仅这三类失败视为「厂商 Key 不可用」，命中时静默切换到下一个可用 Key 重发；
+# model_not_found / context_overflow / rate_limit / 网络类等与 Key 无关，
+# 维持既有 fail-fast / 退避重试逻辑。
+_KEY_RELATED_FAILURE_CATEGORIES = frozenset({
+    "insufficient_quota",
+    "auth_invalid",
+    "permission_denied",
+})
 
 
-def is_rate_limit_error(exc: Exception) -> tuple[bool, float | None]:
-    """判断异常是否属于速率限制（429 / RateLimit / TooManyRequests）。
-    返回 (is_rate_limit, retry_after_seconds)。
+def _is_key_related_failure(exc):
+    """判断异常是否属于"换 Key 可能解决"的厂商 Key 类失败（纯函数，便于单测）。
+
+    整体用 try/except 兜底：分类失败时返回 False（保守），绝不误触发换 Key。
     """
-    if exc is None:
-        return False, None
-    retry_after = None
-    # 1. 尝试从 response headers 读取 retry-after
     try:
-        resp = getattr(exc, "response", None)
-        if resp is not None and hasattr(resp, "headers"):
-            raw_ra = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
-            if raw_ra:
-                val = float(raw_ra)
-                if 0 < val <= 60.0:
-                    retry_after = val
+        return map_llm_error(exc).category in _KEY_RELATED_FAILURE_CATEGORIES
     except Exception:
-        pass
-
-    # 2. 检查 status_code
-    status_code = getattr(exc, "status_code", None)
-    if status_code == 429:
-        return True, retry_after
-
-    # 3. 检查异常类型
-    exc_type = type(exc).__name__.lower()
-    if "ratelimit" in exc_type:
-        return True, retry_after
-
-    try:
-        litellm_rate_err = _get_litellm().exceptions.RateLimitError
-        if isinstance(exc, litellm_rate_err):
-            return True, retry_after
-    except Exception:
-        pass
-
-    # 4. 字符串内容匹配（不区分大小写，包含常见中文/英文关键词与无空格形式）
-    err_str = str(exc).lower()
-    if any(k in err_str for k in (
-        "rate limit", "ratelimit", "too many requests",
-        "too frequent", "请求过于频繁", "accountratelimitexceeded",
-        "throttl",
-    )):
-        return True, retry_after
-
-    return False, None
-
-
-# 单次 API 请求超时（秒）：长思考模型的首个 token 可能较慢，不宜过紧
-API_REQUEST_TIMEOUT_SECONDS = 90
-
-# 单次 API 请求超时上限（秒）：超时随载荷 token 数放大（大上下文 + 深度思考
-# 本来就需要几分钟），但必须有上限，避免挂起的连接无限等待
-API_REQUEST_MAX_TIMEOUT_SECONDS = 600
-
-# 单次请求等待反馈：超过阈值后按间隔向 UI 报一次“模型响应中”，
-# 避免大载荷请求长时间无反馈被误判为卡死
-WAIT_NOTICE_THRESHOLD_SECONDS = 60.0
-WAIT_NOTICE_INTERVAL_SECONDS = 15.0
-
-# 工具结果中的错误哨兵前缀（统一在此定义，供结果判断与构造处引用）
-TOOL_ERROR_PREFIX = "🚨"
-ASK_USER_ERROR_PREFIX = "无法提问："
-TOOL_INTERNAL_ERROR_PREFIX = "Tool execution error:"
-PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
-PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
-# 计划模式硬拦截：只读工具（requires_permission=False）不受影响；
-# 沙盒外只读访问仍由 _sandbox_outside_guard 逐次询问
-PLAN_MODE_DENIED_MESSAGE = (
-    f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息、执行明确的只读查询和制定计划，"
-    "不允许执行修改或删除操作。请改用 plan_write 把操作步骤写入计划，"
-    "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
-)
-PERMISSION_SYSTEM_ERROR_MESSAGE = (
-    f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
-    f"这不是用户拒绝，请稍后重试或检查权限组件状态。"
-)
-PATH_VALIDATION_ERROR_MESSAGE = (
-    f"{TOOL_ERROR_PREFIX} 无法验证路径是否位于当前工作区，已拒绝执行。"
-)
-
-
-class PermissionSystemError(Exception):
-    """权限询问流程自身发生异常（如 UI 事件丢失、broker 状态不一致）。
-
-    与"用户拒绝"(False)区分，避免模型把系统故障误解为用户主动拒绝。
-    """
-    pass
-
-
-@dataclass(frozen=True)
-class AuthorizationResult:
-    allowed: bool
-    reason: str
-    sandbox_bypass: bool = False
-    cancelled: bool = False
-
-# 🌟 注意这里：我们把四个工具全都引进来了！
-from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace
-# 注意：core.mcp_client 不在此处顶部 import（mcp 包会连带 pydantic/httpx/anyio，
-# 冷启动约 1.1s）。mcp_manager 通过下方模块级 __getattr__ 惰性加载，首次访问时
-# 才 import core.mcp_client；启动时的预热由 main.py 的 _preload_mcp 后台线程负责。
-from core.permission_broker import (
-    CANCELLED_RESULT,
-    PermissionOption,
-    PermissionOptionKey,
-    permission_broker,
-)
-from core.command_policy import (
-    _session_rule_is_exact,
-    classify_command_risk,
-    command_matches_session_rule,
-    parse_manual_command_rule,
-    session_rule_for_command,
-)
-from core.permission_policy import (
-    PermissionAction,
-    PermissionFacts,
-    PermissionRisk,
-    decide_permission,
-)
-from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
-from core.harness.stream_assembler import StreamAssembler, complete_thinking_blocks
-from core.tool_presenter import (
-    build_tool_display,
-    summarize_tool_finished,
-    summarize_tool_started,
-)
-from core.turn_events import TurnEventFactory
-import core.app_context as app_context
-from core import permission_grants, permission_store
-
-# 兼容旧调用方的动态集合视图；实际所有权在 core.permission_grants，
-# 通过稳定任务 ID 路由，切换可见界面不会清除授权。
-session_allowed_commands = permission_grants.task_set_view("commands")
-session_allowed_write_files = permission_grants.task_set_view("write_files")
-session_allowed_edit_files = permission_grants.task_set_view("edit_files")
-session_allowed_exact_commands = permission_grants.task_set_view("exact_commands")
-_SESSION_GRANTS = permission_grants._TASK_GRANTS
-_last_tracked_session = None
-_raw_permission_lock = threading.Lock()
-_session_whitelist_lock = permission_grants._GRANTS_LOCK
-
-
-def clear_session_grants(session_id: str) -> None:
-    """清空指定任务的授权桶（任务删除时调用）。"""
-    permission_grants.clear_task(session_id)
-
-
-def _grant_command_add(prefix: tuple[str, ...]) -> None:
-    permission_grants.grant_command_rule(prefix)
-
-
-def _grant_write_add(canonical_path: str) -> None:
-    permission_grants.grant_file("write", canonical_path)
-
-
-def _grant_edit_add(canonical_path: str) -> None:
-    permission_grants.grant_file("edit", canonical_path)
-
-
-def _grant_command_hit(command: str) -> bool:
-    return permission_grants.matches_command(command)
-
-
-def _grant_exact_command_add(command: str) -> None:
-    permission_grants.grant_exact_command(command)
-
-
-def _grant_exact_command_hit(command: str) -> bool:
-    return permission_grants.matches_exact_command(command)
-
-
-def _grant_write_hit(canonical_path: str) -> bool:
-    return permission_grants.matches_file("write", canonical_path)
-
-
-def _grant_edit_hit(canonical_path: str) -> bool:
-    return permission_grants.matches_file("edit", canonical_path)
-
-
-def _canonical_permission_path(value):
-    # 相对路径按线程本地 workdir 解析（GUI 多会话并行时进程 cwd 可能停在
-    # 安装目录，裸 abspath 会把相对路径规范化到错误位置，白名单授予与命中
-    # 错位）；绝对路径行为与原 realpath+normcase 一致。
-    try:
-        from core.tools import _resolve_against_workdir
-
-        return os.path.normcase(str(_resolve_against_workdir(value)))
-    except (OSError, ValueError, TypeError):
-        return ""
-_plan_turn_lock = threading.Lock()
-_plan_turn_started_at = {}
-
-# GUI 模式权限回调：由 gui_bridge.py 在启动时注册
-# 签名: (function_name: str, arguments: dict) -> bool
-_gui_permission_callback = None
-_PLAN_BYPASS_ERROR_PREFIX = "计划已创建：工具"
-_PLAN_ROOT_CONTROL_TOOLS = frozenset({
-    "plan_write",
-    "plan_update",
-    "plan_read",
-    "plan_retry",
-    "run_subagent",
-    "ask_user",
-})
-# 只读探索类工具在计划模式下仍允许主 Agent 直接使用，
-# 便于主 Agent 验证子代理产出、读取上下文，避免事事都开子代理导致超时循环。
-_PLAN_READ_ONLY_TOOLS = frozenset({
-    "read_file",
-    "list_directory",
-    "search_code",
-    "find_definition",
-    "glob_files",
-    "fetch_url",
-    "search_news",
-    "get_weather",
-    # 后台任务监控必须放行：manage_task 统一管理两类后台任务（shell 后台命令与
-    # subagent-* 子代理任务，子代理注册表已桥接）。模型用 run_subagent(
-    # run_in_background=True) 启动子代理后，可在回合内用 manage_task(list/status/wait)
-    # 查询进度或等待终态；子代理结果的正规回流是回合结束后的自动汇总注入，
-    # manage_task 用于回合内主动收割，拦截会让主 Agent 对自己启动的后台任务完全失明
-    # （kill 操作有独立的用户确认，不受此白名单影响）
-    "manage_task",
-})
-_PLAN_BOUND_ORCHESTRATORS = frozenset({"run_subagent", "ask_user"})
-
-
-def _mark_plan_turn(turn_id):
-    if not turn_id:
-        return
-    now = time.monotonic()
-    with _plan_turn_lock:
-        _plan_turn_started_at[str(turn_id)] = now
-        cutoff = now - 3600
-        for stale_id, started_at in list(_plan_turn_started_at.items()):
-            if started_at < cutoff:
-                _plan_turn_started_at.pop(stale_id, None)
-
-
-def _is_plan_turn(turn_id):
-    if not turn_id:
-        return False
-    with _plan_turn_lock:
-        return str(turn_id) in _plan_turn_started_at
-
-
-def _has_pending_plan(session_id):
-    if not session_id:
-        return False
-    from core.plan import get_default_plan_manager
-
-    plan = get_default_plan_manager()
-    if plan.session_id != str(session_id):
-        return False
-    # Keep the gate active until every plan item is completed.  Failed,
-    # blocked, and cancelled items still require an explicit plan_retry.
-    return any(item.get("status") != "completed" for item in plan.snapshot())
-
-def check_session_reset():
-    global _last_tracked_session
-    # 授权按稳定任务 ID 分桶。这里只保留兼容跟踪值，切换可见任务不清理；
-    # 物理删除任务时由入口层显式调用 clear_session_grants。
-    _last_tracked_session = permission_grants.current_task_id()
-
-
-def _session_prefix_for_command(cmd):
-    """兼容历史扩展名称，委托给结构化命令授权策略。"""
-    return session_rule_for_command(cmd)
-
-
-def _command_matches_prefix(cmd, prefix):
-    """兼容历史扩展名称，使用完整 token 元素匹配。"""
-    return command_matches_session_rule(cmd, prefix)
-
-
-def _format_session_command_rule(rule):
-    command = subprocess.list2cmdline(rule)
-    if _session_rule_is_exact(rule):
-        return f"精确规则：{command}"
-    return f"子命令规则：{command}（允许后续参数）"
-
-def safe_print(formatted_text):
-    """线程安全地在 CLI 终端输出格式化文本，避免破坏屏幕布局"""
-    from prompt_toolkit import print_formatted_text
-    _app = app_context.get_app_instance()
-    if _app and _app.loop:
-        _app.loop.call_soon_threadsafe(lambda: print_formatted_text(formatted_text))
-    else:
-        try:
-            print_formatted_text(formatted_text)
-        except Exception:
-            pass
-
-def ask_in_raw_terminal(function_name, arguments, *, options=()):
-    """
-    纯文本原始终端兜底：只在确实没有活动 CLI App 时才被调用（例如管道重定向或早期初始化时）。
-    不使用任何 ANSI 转义序列或 msvcrt 菜单，直接用 print/input 避免污染 CLI 屏幕。
-    """
-    mode_display = {
-        "confirm": "每次确认",
-        "accept_edits": "自动编辑",
-        "plan": "计划确认",
-        "full": "完全访问",
-    }
-    mode_tip = mode_display.get(app_context.get_permission_mode(), "确认")
-    option_keys = {str(option.key) for option in options}
-    allow_task = PermissionOptionKey.ALLOW_TASK.value in option_keys
-    allow_task_sandbox = (
-        PermissionOptionKey.ALLOW_TASK_SANDBOX.value in option_keys
-    )
-    
-    print("")  # 空行分隔
-    if function_name == "write_file":
-        file_path = arguments.get("file_path", "未知文件")
-        content = arguments.get("content", "")
-        print(f"[写入文件] {_agent_display_name()}申请写入文件: {file_path}")
-        lines = content.splitlines()
-        if lines:
-            preview = "\n".join(lines[:5])
-            if len(lines) > 5:
-                preview += f"\n   ... (共 {len(lines)} 行)"
-            print(f"   [预览]:\n   {preview}")
-    elif function_name == "edit_file":
-        file_path = arguments.get("file_path", "未知文件")
-        target = arguments.get("target_content", "")
-        repl = arguments.get("replacement_content", "")
-        print(f"[修改文件] {_agent_display_name()}申请修改文件: {file_path}")
-        print(f"   [-] 计划删除: {target.strip()[:100]}")
-        print(f"   [+] 计划替换: {repl.strip()[:100]}")
-    elif function_name == "execute_command":
-        cmd = arguments.get("command", "")
-        shell_id = str(arguments.get("shell_id") or "").strip()
-        bg = arguments.get("run_in_background", False)
-        bg_str = " (后台运行)" if bg else ""
-        print(f"[执行命令] {_agent_display_name()}申请执行命令{bg_str}: {cmd}")
-        if shell_id:
-            print(f"   [解释器显式覆盖]: {shell_id}")
-    
-    # 纯文本 input 模式，不含任何 ANSI 序列
-    try:
-        shell_override = (
-            function_name == "execute_command"
-            and bool(str(arguments.get("shell_id") or "").strip())
-        )
-        if shell_override:
-            print("请输入 [y]es 同意本次, [n]o 拒绝（解释器覆盖不支持加入白名单）")
-            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
-        elif function_name == "sandbox_outside_access" and allow_task_sandbox:
-            # 沙盒外路径访问可任务级放行，但不做持久化落盘
-            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 本任务内放行沙盒外访问")
-            res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
-        elif function_name == "sandbox_outside_access":
-            print("请输入 [y]es 同意本次, [n]o 拒绝")
-            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
-        elif allow_task:
-            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前任务放行)")
-            res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
-        else:
-            print("请输入 [y]es 同意本次, [n]o 拒绝")
-            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
-        
-        if shell_override:
-            return res in ("", "y", "yes")
-
-        if res in ("n", "no"):
-            return False
-            
-        if res in ("a", "always", "y*"):
-            # 严格服从本次请求实际下发的 option keys；凭据写等只允许
-            # allow_once/deny 的请求不能借 raw terminal 额外创建长期授权。
-            if not (allow_task or allow_task_sandbox):
-                return False
-            if function_name == "execute_command":
-                cmd = arguments.get("command", "")
-                prefix = _session_prefix_for_command(cmd)
-                if prefix is None:
-                    print("[内联执行命令不做任务前缀放行，仅本次通过]")
-                else:
-                    _grant_command_add(prefix)
-                    print(f"[当前任务已放行] {_format_session_command_rule(prefix)}")
-            elif function_name == "write_file":
-                file_path = arguments.get("file_path", "")
-                if file_path:
-                    _grant_write_add(_canonical_permission_path(file_path))
-                    print(f"[当前任务已放行写入]：{file_path}")
-            elif function_name == "edit_file":
-                file_path = arguments.get("file_path", "")
-                if file_path:
-                    _grant_edit_add(_canonical_permission_path(file_path))
-                    print(f"[当前任务已放行修改]：{file_path}")
-            elif function_name == "sandbox_outside_access":
-                # 任务级放行（不落盘）：本任务内后续沙盒外访问免询问
-                from core.tools import set_session_sandbox_bypass
-
-                set_session_sandbox_bypass(True)
-                print("[当前任务已放行沙盒外访问]")
-            return True
-            
-        return res in ("", "y", "yes")
-    except (KeyboardInterrupt, EOFError):
-        print("\n[操作已取消]")
         return False
 
-_PLAN_INTERNAL_PERMISSION_TOOLS = frozenset({
-    "plan_write",
-    "plan_read",
-    "plan_update",
-    "plan_retry",
-    "plan_finish",
-    "ask_user",
-})
-_KNOWN_QUERY_TOOLS = frozenset({
-    "read_file",
-    "list_directory",
-    "search_code",
-    "find_definition",
-    "glob_files",
-    "fetch_url",
-    "search_news",
-    "get_weather",
-})
-_SENSITIVE_TOOL_NAMES = frozenset({
-    "delete_file",
-    "remove_file",
-    "kill_process",
-    "git_commit",
-    "git_push",
-})
-
-
-def _permission_risk(function_name, arguments, tool_spec, path_access):
-    if function_name == "sandbox_outside_access":
-        return PermissionRisk.QUERY
-    if function_name == "execute_command":
-        if bool(str(arguments.get("shell_id") or "").strip()):
-            return PermissionRisk.SENSITIVE_MUTATION
-        return classify_command_risk(str(arguments.get("command", "")))
-    if function_name == "manage_task":
-        action = str(arguments.get("action", "")).strip().lower()
-        return (
-            PermissionRisk.SENSITIVE_MUTATION
-            if action in {"kill", "stop", "terminate", "cancel"}
-            else PermissionRisk.QUERY
-        )
-    if path_access == "credential_write" or function_name in _SENSITIVE_TOOL_NAMES:
-        return PermissionRisk.SENSITIVE_MUTATION
-    if function_name in _PLAN_INTERNAL_PERMISSION_TOOLS:
-        return PermissionRisk.NORMAL_MUTATION
-    if function_name == "run_subagent":
-        return PermissionRisk.QUERY
-    if function_name in _KNOWN_QUERY_TOOLS or bool(getattr(tool_spec, "read_only", False)):
-        return PermissionRisk.QUERY
-    if bool(getattr(tool_spec, "mutates_files", False)):
-        return PermissionRisk.NORMAL_MUTATION
-    if bool(getattr(tool_spec, "requires_permission", True)):
-        return PermissionRisk.NORMAL_MUTATION
-    return PermissionRisk.QUERY
-
-
-def _permission_rule_facts(function_name, arguments):
-    task_hit = False
-    project_hit = False
-    task_grant = None
-    project_rule = None
-    shell_override = (
-        function_name == "execute_command"
-        and bool(str(arguments.get("shell_id") or "").strip())
-    )
-    rules = permission_store.project_rules()
-
-    if function_name == "execute_command":
-        command = str(arguments.get("command", ""))
-        if not shell_override:
-            task_hit = permission_grants.matches_command(command)
-            project_hit = any(
-                command_matches_session_rule(command, prefix)
-                for prefix in rules["commands"]
-            )
-            task_grant = ("command", command)
-            try:
-                parse_manual_command_rule(command)
-            except ValueError:
-                project_rule = None
-            else:
-                project_rule = ("command", command)
-    elif function_name in {"write_file", "edit_file"}:
-        kind = "write" if function_name == "write_file" else "edit"
-        field = "write_files" if kind == "write" else "edit_files"
-        canonical = _canonical_permission_path(arguments.get("file_path", ""))
-        if canonical:
-            task_hit = permission_grants.matches_file(kind, canonical)
-            project_hit = canonical in rules[field]
-            task_grant = (kind, canonical)
-            project_rule = (kind, canonical)
-    return task_hit, project_hit, task_grant, project_rule
-
-
-def _permission_options(*, sandbox_request, credential_write, task_grant, project_rule):
-    if credential_write:
-        # ~/.ycode 顶层凭据/配置写入必须逐次确认，不能生成任务级或项目级
-        # 持久放行选项，否则后续写入会绕过安全边界。
-        return (
-            PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
-            PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
-        )
-    if sandbox_request:
-        return (
-            PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
-            PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
-            PermissionOption(
-                PermissionOptionKey.ALLOW_TASK_SANDBOX.value,
-                "本任务内放行沙盒外访问",
-            ),
-        )
-    options = [
-        PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
-        PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
-    ]
-    if task_grant is not None:
-        options.append(
-            PermissionOption(
-                PermissionOptionKey.ALLOW_TASK.value,
-                "本任务同类操作放行",
-            )
-        )
-    if project_rule is not None:
-        options.append(
-            PermissionOption(
-                PermissionOptionKey.ALLOW_PROJECT.value,
-                "加入项目白名单",
-            )
-        )
-    return tuple(options)
-
-
-def _wait_permission_option(
-    function_name,
-    arguments,
-    options,
-    *,
-    event_callback,
-    permission_owner,
-    parent_turn_id,
-    permission_source,
-    cancel_event,
-):
-    _notify_event(event_callback, "permission_requested", {
-        "function_name": function_name,
-        "arguments": dict(arguments),
-        "source": permission_source,
-    })
-
-    if not permission_broker.has_prompt_handlers():
-        gui_callback = app_context.get_permission_callback()
-        if gui_callback is not None:
-            return (
-                PermissionOptionKey.ALLOW_ONCE.value
-                if gui_callback(function_name, arguments)
-                else PermissionOptionKey.DENY.value
-            )
-        app = app_context.get_app_instance()
-        if (not app or not app.loop) and app_context.get_ui_flavor() != "gui":
-            with _raw_permission_lock:
-                return (
-                    PermissionOptionKey.ALLOW_ONCE.value
-                    if ask_in_raw_terminal(function_name, arguments, options=options)
-                    else PermissionOptionKey.DENY.value
-                )
-
-    owner_id = str(permission_owner or parent_turn_id or threading.current_thread().name)
-    turn_id = str(parent_turn_id or owner_id)
-    request = permission_broker.enqueue(
-        function_name,
-        arguments,
-        owner_id,
-        turn_id,
-        permission_source,
-        options=options,
-    )
-    try:
-        while True:
-            if request.future.done():
-                choice_index = request.future.result()
-                break
-            if cancel_event is not None and cancel_event.is_set():
-                permission_broker.cancel_owner(owner_id)
-                choice_index = CANCELLED_RESULT
-                break
-            try:
-                choice_index = request.future.result(timeout=0.1)
-                break
-            except (TimeoutError, _FutureTimeoutError):
-                continue
-        if choice_index == CANCELLED_RESULT:
-            return "cancelled"
-        try:
-            return request.option_keys[int(choice_index)]
-        except (IndexError, TypeError, ValueError) as exc:
-            raise PermissionSystemError("权限响应选项无效") from exc
-    finally:
-        if not request.future.done():
-            permission_broker.cancel_owner(owner_id)
-
-
-def authorize_tool_call(
-    function_name,
-    arguments,
-    *,
-    tool_spec,
-    outside_workspace=False,
-    event_callback=None,
-    permission_owner=None,
-    parent_turn_id=None,
-    permission_source="主代理",
-    cancel_event=None,
-):
-    check_session_reset()
-    sandbox_access_request = function_name == "sandbox_outside_access"
-    effective_function_name = function_name
-    effective_arguments = arguments
-    if sandbox_access_request:
-        effective_function_name = str(arguments.get("operation") or "").strip()
-        if not effective_function_name:
-            raise PermissionSystemError("沙箱外访问缺少有效的原始操作类型")
-        path_value = arguments.get("path")
-        effective_arguments = dict(arguments)
-        if effective_function_name in {"read_file", "write_file", "edit_file"}:
-            effective_arguments["file_path"] = path_value
-        elif effective_function_name in {"list_directory", "directory_tree", "search_code", "find_definition", "glob_files"}:
-            effective_arguments["dir_path"] = path_value
-        else:
-            effective_arguments.setdefault("path", path_value)
-        try:
-            from core.tool_registry import tool_registry
-            effective_spec = tool_registry.get(effective_function_name)
-            if effective_spec is not None:
-                tool_spec = effective_spec
-        except Exception:
-            pass
-    else:
-        path_value = arguments.get("file_path") or arguments.get("dir_path") or arguments.get("path")
-
-    outside_hint = bool(outside_workspace or sandbox_access_request)
-    path_access = "outside" if outside_hint else "inside"
-    if path_value:
-        try:
-            from core.harness.tool_adapters import classify_path_access
-
-            path_access = classify_path_access(
-                effective_function_name,
-                path_value,
-                # Pipeline 已在任何文件存在性探测前完成路径边界分类；这里
-                # 只复用该结论，并继续识别 ~/.ycode 顶层 credential_write。
-                is_outside_workspace=lambda _path: outside_hint,
-            )
-        except Exception as exc:
-            raise PermissionSystemError(f"路径权限分类失败: {exc}") from exc
-        if outside_hint and path_access == "inside":
-            path_access = "outside"
-
-    risk = _permission_risk(
-        effective_function_name, effective_arguments, tool_spec, path_access
-    )
-    plan_internal = effective_function_name in _PLAN_INTERNAL_PERMISSION_TOOLS
-    task_hit, project_hit, task_grant, project_rule = _permission_rule_facts(
-        effective_function_name,
-        effective_arguments,
-    )
-
-    outside = path_access in {"outside", "credential_write"}
-    try:
-        from core.model_manager import load_config
-
-        sandbox_restricted = not bool(
-            load_config().get("allow_outside_workspace", False)
-        )
-    except Exception as exc:
-        raise PermissionSystemError(f"读取沙盒配置失败: {exc}") from exc
-    if path_access == "credential_write":
-        sandbox_restricted = True
-    from core.tools import is_session_sandbox_bypass_enabled
-
-    credential_write = path_access == "credential_write"
-    task_sandbox_bypass = (
-        False if credential_write else is_session_sandbox_bypass_enabled()
-    )
-    decision = decide_permission(PermissionFacts(
-        mode=app_context.get_permission_mode(),
-        risk=risk,
-        plan_internal=plan_internal,
-        outside_workspace=outside,
-        sandbox_restricted=sandbox_restricted,
-        task_sandbox_bypass=task_sandbox_bypass,
-        task_grant_hit=task_hit,
-        project_rule_hit=project_hit,
-    ))
-
-    if decision.action is PermissionAction.ALLOW:
-        _notify_event(event_callback, "permission_resolved", {
-            "approved": True,
-            "automatic": True,
-            "reason": decision.reason,
-        })
-        return AuthorizationResult(True, decision.reason, sandbox_bypass=outside)
-    if decision.action is PermissionAction.DENY:
-        return AuthorizationResult(False, decision.reason)
-
-    sandbox_request = decision.reason == "sandbox_boundary_requires_confirmation"
-    options = _permission_options(
-        sandbox_request=sandbox_request,
-        credential_write=credential_write,
-        task_grant=task_grant,
-        project_rule=project_rule,
-    )
-    prompt_as_sandbox = sandbox_access_request or sandbox_request
-    try:
-        option_key = _wait_permission_option(
-            "sandbox_outside_access" if prompt_as_sandbox else function_name,
-            (
-                {
-                    "path": str(path_value or ""),
-                    "operation": effective_function_name,
-                }
-                if prompt_as_sandbox
-                else arguments
-            ),
-            options,
-            event_callback=event_callback,
-            permission_owner=permission_owner,
-            parent_turn_id=parent_turn_id,
-            permission_source=permission_source,
-            cancel_event=cancel_event,
-        )
-        if option_key == "cancelled":
-            _notify_event(event_callback, "permission_resolved", {
-                "approved": False,
-                "cancelled": True,
-            })
-            return AuthorizationResult(False, "cancelled", cancelled=True)
-        if option_key == PermissionOptionKey.DENY.value:
-            _notify_event(event_callback, "permission_resolved", {"approved": False})
-            return AuthorizationResult(False, "user_denied")
-        if option_key == PermissionOptionKey.ALLOW_TASK.value:
-            if task_grant is None:
-                raise PermissionSystemError("当前操作不支持任务级授权")
-            kind, value = task_grant
-            if kind == "command":
-                permission_grants.grant_command(value)
-            else:
-                permission_grants.grant_file(kind, value)
-        elif option_key == PermissionOptionKey.ALLOW_PROJECT.value:
-            if project_rule is None:
-                raise PermissionSystemError("当前操作不能加入项目白名单")
-            kind, value = project_rule
-            mutation = permission_store.add_rule(kind, value)
-            if mutation.status not in {"added", "exists"}:
-                raise PermissionSystemError(
-                    f"项目白名单写入失败: {mutation.status}"
-                )
-        elif option_key == PermissionOptionKey.ALLOW_TASK_SANDBOX.value:
-            from core.tools import set_session_sandbox_bypass
-
-            set_session_sandbox_bypass(True)
-        elif option_key != PermissionOptionKey.ALLOW_ONCE.value:
-            raise PermissionSystemError(f"未知权限选项: {option_key}")
-    except PermissionSystemError:
-        raise
-    except Exception as exc:
-        raise PermissionSystemError(str(exc)) from exc
-
-    _notify_event(event_callback, "permission_resolved", {
-        "approved": True,
-        "option_key": option_key,
-    })
-    return AuthorizationResult(True, option_key, sandbox_bypass=outside)
-
-
-def check_permission_and_ask(
-    function_name,
-    arguments,
-    event_callback=None,
-    permission_owner=None,
-    parent_turn_id=None,
-    permission_source="主代理",
-    cancel_event=None,
-    *,
-    tool_spec=None,
-    outside_workspace=None,
-    structured=False,
-):
-    if tool_spec is None:
-        try:
-            tool_spec = tool_registry.get(function_name)
-        except Exception:
-            tool_spec = SimpleNamespace(
-                name=function_name,
-                read_only=function_name in _KNOWN_QUERY_TOOLS,
-                mutates_files=function_name in {"write_file", "edit_file"},
-                requires_permission=True,
-            )
-    outside = outside_workspace
-    if outside is None:
-        outside = function_name == "sandbox_outside_access"
-        if function_name in {"read_file", "write_file", "edit_file"}:
-            try:
-                outside = is_outside_workspace(arguments.get("file_path", ""))
-            except Exception:
-                outside = False
-    result = authorize_tool_call(
-        function_name,
-        arguments,
-        tool_spec=tool_spec,
-        outside_workspace=bool(outside),
-        event_callback=event_callback,
-        permission_owner=permission_owner,
-        parent_turn_id=parent_turn_id,
-        permission_source=permission_source,
-        cancel_event=cancel_event,
-    )
-    return result if structured else result.allowed
+# --- Re-exported from core.permission_terminal ---
+from core.permission_terminal import (
+    ASK_USER_ERROR_PREFIX,
+    PATH_VALIDATION_ERROR_MESSAGE,
+    PERMISSION_CANCELLED_MESSAGE,
+    PERMISSION_DENIED_MESSAGE,
+    PERMISSION_SYSTEM_ERROR_MESSAGE,
+    PLAN_MODE_DENIED_MESSAGE,
+    TOOL_ERROR_PREFIX,
+    TOOL_INTERNAL_ERROR_PREFIX,
+    AuthorizationResult,
+    PermissionSystemError,
+    _KNOWN_QUERY_TOOLS,
+    _PLAN_BOUND_ORCHESTRATORS,
+    _PLAN_BYPASS_ERROR_PREFIX,
+    _PLAN_INTERNAL_PERMISSION_TOOLS,
+    _PLAN_READ_ONLY_TOOLS,
+    _PLAN_ROOT_CONTROL_TOOLS,
+    _SENSITIVE_TOOL_NAMES,
+    _SESSION_GRANTS,
+    _agent_display_name,
+    _canonical_permission_path,
+    _command_matches_prefix,
+    _format_session_command_rule,
+    _grant_command_add,
+    _grant_command_hit,
+    _grant_edit_add,
+    _grant_edit_hit,
+    _grant_exact_command_add,
+    _grant_exact_command_hit,
+    _grant_write_add,
+    _grant_write_hit,
+    _gui_permission_callback,
+    _has_pending_plan,
+    _is_plan_turn,
+    _last_tracked_session,
+    _mark_plan_turn,
+    _notify_event,
+    _permission_options,
+    _permission_risk,
+    _permission_rule_facts,
+    _plan_turn_lock,
+    _plan_turn_started_at,
+    _raw_permission_lock,
+    _session_prefix_for_command,
+    _session_whitelist_lock,
+    _wait_permission_option,
+    ask_in_raw_terminal,
+    authorize_tool_call,
+    check_permission_and_ask,
+    check_session_reset,
+    clear_session_grants,
+    safe_print,
+    session_allowed_commands,
+    session_allowed_edit_files,
+    session_allowed_exact_commands,
+    session_allowed_write_files,
+)
 
 
 def _pipeline_permission_checker(function_name, arguments, **context):
@@ -1154,710 +265,105 @@ def _pipeline_permission_checker(function_name, arguments, **context):
         **context,
     )
 
-# 全局变量：分离“本次窗口占比”和“整体累积消耗”
-session_token_usage = {
-    # 累积消耗（用来算钱）
-    "cumulative_total": 0,
-    "cumulative_prompt": 0,
-    "cumulative_completion": 0,
-    "cumulative_cached": 0,
-    "cumulative_cache_prompt": 0,
-    
-    # 窗口占用（用来防止爆 128k 上下文）
-    "latest_total": 0,
-    "latest_prompt": 0,
-    "latest_cached": 0,
 
-    # 缓存遥测（仅主代理镜像到状态栏；按会话独立累计）
-    "cache_latest_rate": 0.0,
-    "cache_hot_rate": 0.0,
-    "cache_cumulative_rate": 0.0,
-    "cache_hot_turns": 0,
-    "cache_cumulative_cached": 0,
-    "cache_invalidation_reason": "",
-    
-    "max_window": 128000  # 默认最大上下文窗口配置
-}
-# session_token_usage 会被后台 worker 线程与 UI 线程同时读写，所有读写必须走锁
-token_usage_lock = threading.Lock()
+def _current_agent_display_name() -> str:
+    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
 
-# 记账完成回调：GUI（gui_bridge.py）启动时注册 _emit_token_usage，
-# 让统计栏/上下文圆圈在每次 LLM 请求记账后立即刷新，而不必等整个
-# 回合结束。CLI 不注册则完全无感。仅保存回调引用，不持锁调用，
-# 避免回调里再取 token_usage_lock 时死锁。
-_token_usage_listener = None
-
-
-def set_token_usage_listener(callback):
-    """注册/注销（传 None）token 记账完成监听器；幂等且线程安全（GIL 原子赋值）。"""
-    global _token_usage_listener
-    _token_usage_listener = callback
-
-_cache_request_states = {}
-_cache_usage_states = {}
-
-
-def _cache_usage_key(session_id, model_name, api_base, cache_scope="main"):
-    """生成缓存遥测身份；同会话的不同模型、接口与作用域绝不合并。"""
-    return (
-        str(session_id),
-        str(model_name or "").lower(),
-        str(api_base or "").rstrip("/").lower(),
-        str(cache_scope or "main"),
-    )
-
-
-def _cache_message_fingerprints(messages):
-    fingerprints = []
-    for message in messages or []:
-        normalized = {
-            key: value
-            for key, value in message.items()
-            if key != "cache_control"
-        }
-        payload = _canonical_diagnostic_json(normalized)
-        fingerprints.append(hashlib.sha256(payload.encode("utf-8")).hexdigest())
-    return tuple(fingerprints)
-
-
-def _canonical_diagnostic_json(value):
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _build_cache_request_diagnostic(
-    session_id,
-    cache_scope,
-    model_name,
-    api_base,
-    tools,
-    messages,
-):
-    """构建不含正文的确定性请求形状诊断。"""
-    normalized_messages = [
-        {key: value for key, value in message.items() if key != "cache_control"}
-        for message in (messages or [])
-    ]
-    system_messages = [
-        message for message in normalized_messages
-        if message.get("role") == "system"
-    ]
-    normalized_tools = list(tools or [])
-    messages_json = _canonical_diagnostic_json(normalized_messages)
-    system_json = _canonical_diagnostic_json(system_messages)
-    tools_json = _canonical_diagnostic_json(normalized_tools)
-    return {
-        "session_id": str(session_id),
-        "model": str(model_name or "").lower(),
-        "api_base": str(api_base or "").rstrip("/").lower(),
-        "cache_scope": str(cache_scope or "main"),
-        "messages_sha256": hashlib.sha256(messages_json.encode("utf-8")).hexdigest(),
-        "system_sha256": hashlib.sha256(system_json.encode("utf-8")).hexdigest(),
-        "tools_sha256": hashlib.sha256(tools_json.encode("utf-8")).hexdigest(),
-        "message_count": len(normalized_messages),
-        "system_message_count": len(system_messages),
-        "request_bytes": len(messages_json.encode("utf-8")),
-        "system_bytes": len(system_json.encode("utf-8")),
-        "tools_bytes": len(tools_json.encode("utf-8")),
-        "_message_fingerprints": _cache_message_fingerprints(normalized_messages),
-    }
-
-
-def _classify_cache_request_details(
-    session_id,
-    cache_scope,
-    model_name,
-    api_base,
-    tool_contract,
-    messages,
-    tools=None,
-):
-    """记录请求形状并返回可持久化的原因、哈希与公共前缀长度。"""
-    state_key = (str(session_id), str(cache_scope or "main"))
-    details = _build_cache_request_diagnostic(
-        session_id, cache_scope, model_name, api_base, tools, messages
-    )
-    current = {
-        "model": details["model"],
-        "api_base": details["api_base"],
-        "tool_contract": str(tool_contract or details["tools_sha256"]),
-        "messages": details["_message_fingerprints"],
-    }
-    with token_usage_lock:
-        previous = _cache_request_states.get(state_key)
-        common_prefix = 0
-        if previous is not None:
-            for old_hash, new_hash in zip(previous["messages"], current["messages"]):
-                if old_hash != new_hash:
-                    break
-                common_prefix += 1
-        if previous is None:
-            reason = "冷启动"
-        elif (
-            previous["model"] != current["model"]
-            or previous["api_base"] != current["api_base"]
-        ):
-            reason = "模型或接口变化"
-        elif previous["tool_contract"] != current["tool_contract"]:
-            reason = "工具契约变化"
-        elif common_prefix != len(previous["messages"]):
-            reason = "上下文压缩或历史重写"
-        else:
-            reason = ""
-        _cache_request_states[state_key] = current
-        if len(_cache_request_states) > 128:
-            _cache_request_states.pop(next(iter(_cache_request_states)))
-    details["request_reason"] = reason
-    details["common_prefix_messages"] = common_prefix
-    del details["_message_fingerprints"]
-    return details
-
-
-def _classify_cache_request(
-    session_id,
-    cache_scope,
-    model_name,
-    api_base,
-    tool_contract,
-    messages,
-):
-    """记录请求形状并返回确定性的缓存失效原因；空字符串表示严格追加。"""
-    return _classify_cache_request_details(
-        session_id,
-        cache_scope,
-        model_name,
-        api_base,
-        tool_contract,
-        messages,
-    )["request_reason"]
-
-
-def _record_cache_usage(
-    session_id,
-    cache_scope,
-    prompt_tokens,
-    cached_tokens,
-    invalidation_reason,
-    model_name="",
-    api_base="",
-):
-    """分别累计当前轮、热启动与会话总命中率，并返回该通道的最新快照。"""
-    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens < 0:
-        raise ValueError("prompt_tokens must be a non-negative integer")
-    if isinstance(cached_tokens, bool) or not isinstance(cached_tokens, int) or cached_tokens < 0:
-        raise ValueError("cached_tokens must be a non-negative integer")
-    if cached_tokens > prompt_tokens:
-        raise ValueError("cached_tokens cannot exceed prompt_tokens")
-    prompt = prompt_tokens
-    cached = cached_tokens
-    state_key = _cache_usage_key(
-        session_id, model_name, api_base, cache_scope
-    )
-    with token_usage_lock:
-        state = _cache_usage_states.setdefault(state_key, {
-            "cumulative_prompt": 0,
-            "cumulative_cached": 0,
-            "hot_prompt": 0,
-            "hot_cached": 0,
-            "hot_turns": 0,
-            "latest_prompt": 0,
-            "latest_cached": 0,
-            "usage_valid": True,
-            "usage_error": "",
-            "invalidation_reason": "",
-        })
-        state["latest_prompt"] = prompt
-        state["latest_cached"] = cached
-        state["cumulative_prompt"] += prompt
-        state["cumulative_cached"] += cached
-        if not invalidation_reason:
-            state["hot_prompt"] += prompt
-            state["hot_cached"] += cached
-            state["hot_turns"] += 1
-        state["usage_valid"] = True
-        state["usage_error"] = ""
-        state["invalidation_reason"] = str(invalidation_reason or "")
-
-        snapshot = dict(state)
-        snapshot["latest_rate"] = (cached / prompt * 100) if prompt else 0.0
-        snapshot["hot_rate"] = (
-            state["hot_cached"] / state["hot_prompt"] * 100
-            if state["hot_prompt"] else 0.0
-        )
-        snapshot["cumulative_rate"] = (
-            state["cumulative_cached"] / state["cumulative_prompt"] * 100
-            if state["cumulative_prompt"] else 0.0
-        )
-        snapshot["invalidation_reason"] = str(invalidation_reason or "")
-
-        if str(cache_scope or "main") == "main":
-            session_token_usage["cache_latest_rate"] = snapshot["latest_rate"]
-            session_token_usage["cache_hot_rate"] = snapshot["hot_rate"]
-            session_token_usage["cache_cumulative_rate"] = snapshot["cumulative_rate"]
-            session_token_usage["cache_hot_turns"] = snapshot["hot_turns"]
-            session_token_usage["cache_cumulative_cached"] = snapshot["cumulative_cached"]
-            session_token_usage["cache_invalidation_reason"] = snapshot["invalidation_reason"]
-        return snapshot
-
-
-def _mark_cache_usage_unavailable(
-    session_id,
-    model_name,
-    api_base,
-    cache_scope="main",
-    reason="usage 不可用",
-):
-    """标记最新缓存 usage 不可用，同时保留此前已验证的累计计数。"""
-    state_key = _cache_usage_key(
-        session_id, model_name, api_base, cache_scope
-    )
-    with token_usage_lock:
-        state = _cache_usage_states.setdefault(state_key, {
-            "cumulative_prompt": 0,
-            "cumulative_cached": 0,
-            "hot_prompt": 0,
-            "hot_cached": 0,
-            "hot_turns": 0,
-            "latest_prompt": 0,
-            "latest_cached": 0,
-            "usage_valid": False,
-            "usage_error": "",
-            "invalidation_reason": "",
-        })
-        state["usage_valid"] = False
-        state["usage_error"] = str(reason or "usage 不可用")
-        if str(cache_scope or "main") == "main":
-            session_token_usage["cache_invalidation_reason"] = state["usage_error"]
-
-
-def get_token_usage_snapshot(
-    session_id,
-    model_name,
-    api_base,
-    cache_scope="main",
-):
-    """返回线程安全的 token 与当前缓存身份快照，不暴露内部可变状态。"""
-    state_key = _cache_usage_key(
-        session_id, model_name, api_base, cache_scope
-    )
-    with token_usage_lock:
-        state = _cache_usage_states.get(state_key)
-        window = {
-            "latest_total": int(session_token_usage.get("latest_total", 0) or 0),
-            "latest_prompt": int(session_token_usage.get("latest_prompt", 0) or 0),
-            "latest_cached": int(session_token_usage.get("latest_cached", 0) or 0),
-            "max_window": int(session_token_usage.get("max_window", 0) or 0),
-        }
-        process = {
-            "cumulative_total": int(session_token_usage.get("cumulative_total", 0) or 0),
-            "cumulative_prompt": int(session_token_usage.get("cumulative_prompt", 0) or 0),
-            "cumulative_completion": int(
-                session_token_usage.get("cumulative_completion", 0) or 0
-            ),
-            "cumulative_cached": int(session_token_usage.get("cumulative_cached", 0) or 0),
-            "cumulative_cache_prompt": int(
-                session_token_usage.get("cumulative_cache_prompt", 0) or 0
-            ),
-        }
-        if state is None:
-            cache = {
-                "available": False,
-                "usage_valid": False,
-                "latest": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
-                "hot": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
-                "session_all": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
-                "hot_turns": 0,
-                "invalidation_reason": "",
-            }
-        else:
-            valid = bool(state.get("usage_valid", True))
-
-            def _rate(cached_value, prompt_value):
-                if not valid or not prompt_value:
-                    return None
-                return cached_value / prompt_value * 100
-
-            latest_prompt = int(state.get("latest_prompt", 0) or 0)
-            latest_cached = int(state.get("latest_cached", 0) or 0)
-            hot_prompt = int(state.get("hot_prompt", 0) or 0)
-            hot_cached = int(state.get("hot_cached", 0) or 0)
-            cumulative_prompt = int(state.get("cumulative_prompt", 0) or 0)
-            cumulative_cached = int(state.get("cumulative_cached", 0) or 0)
-            cache = {
-                "available": valid,
-                "usage_valid": valid,
-                "latest": {
-                    "prompt_tokens": latest_prompt,
-                    "cached_tokens": latest_cached,
-                    "rate": _rate(latest_cached, latest_prompt),
-                },
-                "hot": {
-                    "prompt_tokens": hot_prompt,
-                    "cached_tokens": hot_cached,
-                    "rate": _rate(hot_cached, hot_prompt),
-                },
-                "session_all": {
-                    "prompt_tokens": cumulative_prompt,
-                    "cached_tokens": cumulative_cached,
-                    "rate": _rate(cumulative_cached, cumulative_prompt),
-                },
-                "hot_turns": int(state.get("hot_turns", 0) or 0),
-                "invalidation_reason": str(
-                    state.get("usage_error")
-                    if not valid
-                    else state.get("invalidation_reason", "")
-                ),
-            }
-    return {"window": window, "process": process, "cache": cache}
-
-
-def rename_cache_usage_session(old_name, new_name):
-    """会话重命名时原子迁移缓存请求形状与 usage 遥测。"""
-    old_key = str(old_name)
-    new_key = str(new_name)
-    if old_key == new_key:
-        return
-    with token_usage_lock:
-        for mapping in (_cache_request_states, _cache_usage_states):
-            moves = [
-                (key, (new_key, *key[1:]), value)
-                for key, value in list(mapping.items())
-                if key and key[0] == old_key
-            ]
-            for source, target, value in moves:
-                mapping[target] = value
-                del mapping[source]
-
-
-def clear_cache_usage_session(session_name):
-    """清理指定会话的进程内缓存遥测，防止同名新会话继承旧状态。"""
-    session_key = str(session_name)
-    with token_usage_lock:
-        for mapping in (_cache_request_states, _cache_usage_states):
-            for key in [key for key in mapping if key and key[0] == session_key]:
-                del mapping[key]
-
-
-def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
-                         cached_tokens, total_tokens, session_id=None,
-                         api_base="", cache_scope="legacy"):
-    """把本轮真实 token 用量追加到本地 token_usage 表，供 /usage 按模型/日期统计。
-
-    失败仅记日志，绝不影响对话主流程。model_name 为 litellm 模型串
-    （如 "openai/deepseek-v4-pro"），按第一个 "/" 拆出 provider 与 model。
+    与权限终端的 `_agent_display_name` 分工不同：后者是进程级文案（跟着设置页走），
+    而终端回合提示属于“当前会话内的自称”，必须跟随会话；解析失败回落原实现，
+    保证兜底文案与改动前一致。
     """
     try:
-        from core import app_context
-        manager = app_context.get_manager()
-        if manager is None:
-            return
-        full_name = str(model_name or "")
-        if "/" in full_name:
-            provider, model = full_name.split("/", 1)
-        else:
-            provider, model = "", full_name
-        manager.add_token_usage(
-            provider=provider,
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cached_tokens=cached_tokens,
-            total_tokens=total_tokens,
-            session_id=session_id,
-            api_base=api_base,
-            cache_scope=cache_scope,
-        )
-    except Exception as _persist_err:
-        try:
-            logger.debug("token 用量持久化失败（已忽略）: %s", _persist_err)
-        except Exception:
-            pass
+        from core.secretary import get_active_agent_name
 
+        return get_active_agent_name()
+    except Exception:
+        return _agent_display_name()
 
-_USAGE_FIELD_MISSING = object()
-
-
-def _usage_field(value, name):
-    """读取 dict 或 SDK 对象字段，并保留“缺失”与显式 None/0 的区别。"""
-    if isinstance(value, dict):
-        return value[name] if name in value else _USAGE_FIELD_MISSING
-    if value is None:
-        return _USAGE_FIELD_MISSING
-    return getattr(value, name, _USAGE_FIELD_MISSING)
-
-
-def _optional_nonnegative_int(raw, field_name, errors):
-    """把服务端整数规范为 int；拒绝会丢精度或掩盖异常的隐式转换。"""
-    if raw is _USAGE_FIELD_MISSING or raw is None:
-        return None
-    if isinstance(raw, bool):
-        errors.append(f"{field_name} must be a non-negative integer")
-        return None
-    if isinstance(raw, int):
-        value = raw
-    elif isinstance(raw, str) and raw.strip().isdigit():
-        value = int(raw.strip())
-    else:
-        errors.append(f"{field_name} must be a non-negative integer")
-        return None
-    if value < 0:
-        errors.append(f"{field_name} must be a non-negative integer")
-        return None
-    return value
-
-
-def _normalize_server_usage(usage):
-    """归一化并严格校验一次服务端 usage，不估算或夹断任何真实 token。"""
-    errors = []
-    prompt_raw = _usage_field(usage, "prompt_tokens")
-    completion_raw = _usage_field(usage, "completion_tokens")
-    total_raw = _usage_field(usage, "total_tokens")
-
-    # Anthropic 协议端点（Kimi /coding、聚合网关等）返回 input_tokens/
-    # output_tokens 且通常不返回 total_tokens。OpenAI 字段缺失时改读
-    # anthropic 字段兜底，避免整条记账被 "prompt_tokens is required" 拒绝。
-    if prompt_raw is _USAGE_FIELD_MISSING or prompt_raw is None:
-        anthropic_prompt = _usage_field(usage, "input_tokens")
-        if anthropic_prompt is not _USAGE_FIELD_MISSING and anthropic_prompt is not None:
-            prompt_raw = anthropic_prompt
-    if completion_raw is _USAGE_FIELD_MISSING or completion_raw is None:
-        anthropic_completion = _usage_field(usage, "output_tokens")
-        if anthropic_completion is not _USAGE_FIELD_MISSING and anthropic_completion is not None:
-            completion_raw = anthropic_completion
-
-    prompt = _optional_nonnegative_int(prompt_raw, "prompt_tokens", errors)
-    completion = _optional_nonnegative_int(
-        completion_raw, "completion_tokens", errors
-    )
-    total = _optional_nonnegative_int(total_raw, "total_tokens", errors)
-
-    if prompt_raw is _USAGE_FIELD_MISSING or prompt_raw is None:
-        errors.append("prompt_tokens is required")
-    if total_raw is _USAGE_FIELD_MISSING or total_raw is None:
-        # Anthropic 协议不返回 total_tokens：由 input+output 推导，不算缺失。
-        if prompt is not None and completion is not None:
-            total = prompt + completion
-        else:
-            errors.append("total_tokens is required")
-
-    details = _usage_field(usage, "prompt_tokens_details")
-    details_cached_raw = _usage_field(details, "cached_tokens")
-    direct_cached_raw = _usage_field(usage, "prompt_cache_hit_tokens")
-    anthropic_cached_raw = _usage_field(usage, "cache_read_input_tokens")
-    miss_raw = _usage_field(usage, "prompt_cache_miss_tokens")
-
-    details_cache_reported = (
-        details_cached_raw is not _USAGE_FIELD_MISSING
-        and details_cached_raw is not None
-    )
-    direct_cache_reported = (
-        direct_cached_raw is not _USAGE_FIELD_MISSING
-        and direct_cached_raw is not None
-    )
-    details_cached = _optional_nonnegative_int(
-        details_cached_raw, "prompt_tokens_details.cached_tokens", errors
-    )
-    direct_cached = _optional_nonnegative_int(
-        direct_cached_raw, "prompt_cache_hit_tokens", errors
-    )
-    if (
-        details_cache_reported
-        and direct_cache_reported
-        and details_cached is not None
-        and direct_cached is not None
-        and details_cached != direct_cached
-    ):
-        errors.append("cached token sources disagree")
-
-    if details_cache_reported:
-        cached_raw = details_cached_raw
-    elif direct_cache_reported:
-        cached_raw = direct_cached_raw
-    else:
-        cached_raw = anthropic_cached_raw
-    cache_reported = cached_raw is not _USAGE_FIELD_MISSING and cached_raw is not None
-    miss_reported = miss_raw is not _USAGE_FIELD_MISSING and miss_raw is not None
-
-    cached = _optional_nonnegative_int(cached_raw, "cached_tokens", errors)
-    cache_miss = _optional_nonnegative_int(miss_raw, "cache_miss_tokens", errors)
-
-    completion_was_reported = (
-        completion_raw is not _USAGE_FIELD_MISSING and completion_raw is not None
-    )
-    if not completion_was_reported and prompt is not None and total is not None:
-        if total < prompt:
-            errors.append("total_tokens is smaller than prompt_tokens")
-        else:
-            completion = total - prompt
-
-    if (
-        prompt is not None
-        and completion is not None
-        and total is not None
-        and prompt + completion != total
-    ):
-        errors.append("prompt + completion does not equal total_tokens")
-    if cached is not None and prompt is not None and cached > prompt:
-        errors.append("cached_tokens exceeds prompt_tokens")
-    if miss_reported and not cache_reported:
-        errors.append("cache miss reported without cache hit")
-    if (
-        cache_reported
-        and miss_reported
-        and cached is not None
-        and cache_miss is not None
-        and prompt is not None
-        and cached + cache_miss != prompt
-    ):
-        errors.append("cache hit + miss does not equal prompt_tokens")
-
-    return {
-        "valid": not errors,
-        "errors": tuple(errors),
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
-        "cached_tokens": cached if cache_reported else None,
-        "cache_miss_tokens": cache_miss if miss_reported else None,
-        "cache_reported": cache_reported,
-    }
-
-
-def _extract_cached_tokens(usage):
-    """兼容旧调用方：读取缓存命中 token；未报告时返回 0。"""
-    record = _normalize_server_usage(usage)
-    return int(record["cached_tokens"] or 0)
-
-
-def _persist_cache_request_diagnostic(request_details, usage):
-    """补齐 usage 并持久化请求诊断；失败不影响回复或正式 token 记账。"""
-    if not request_details:
-        logger.warning("缓存请求诊断缺少请求形状，已跳过持久化")
-        return
-    if usage is None:
-        usage_record = {
-            "valid": False,
-            "errors": ("usage missing",),
-            "prompt_tokens": None,
-            "cached_tokens": None,
-            "cache_miss_tokens": None,
-            "cache_reported": False,
-        }
-    else:
-        usage_record = _normalize_server_usage(usage)
-    diagnostic = dict(request_details)
-    diagnostic.update({
-        "prompt_tokens": usage_record["prompt_tokens"],
-        "cached_tokens": usage_record["cached_tokens"],
-        "cache_miss_tokens": usage_record["cache_miss_tokens"],
-        "cache_reported": usage_record["cache_reported"],
-        "usage_valid": usage_record["valid"],
-        "usage_errors": tuple(usage_record["errors"]),
-    })
-    try:
-        manager = app_context.get_manager()
-        if manager is not None:
-            manager.add_cache_request_diagnostic(diagnostic)
-    except Exception as exc:
-        logger.warning("缓存请求诊断持久化失败: %s", exc)
-
-
-def _account_server_usage(
-    usage,
-    *,
-    model_name,
-    api_base,
-    session_id,
-    cache_scope,
-    invalidation_reason,
-):
-    """校验并一次性记账最终 usage；无效记录绝不进入正式统计。"""
-    record = _normalize_server_usage(usage)
-    if not record["valid"]:
-        reason = "usage 不一致: " + "; ".join(record["errors"])
-        if str(cache_scope or "main") == "main":
-            _mark_cache_usage_unavailable(
-                session_id, model_name, api_base, cache_scope, reason
-            )
-        logger.warning(
-            "拒绝 token 记账 model=%s api_base=%s session=%s scope=%s errors=%s raw=%r",
-            model_name,
-            api_base,
-            session_id,
-            cache_scope,
-            record["errors"],
-            usage,
-        )
-        return None
-
-    prompt_tokens = record["prompt_tokens"]
-    completion_tokens = record["completion_tokens"]
-    total_tokens = record["total_tokens"]
-    cached_tokens = record["cached_tokens"]
-    cache_reported = record["cache_reported"]
-    main_scope = str(cache_scope or "main") == "main"
-
-    with token_usage_lock:
-        session_token_usage["cumulative_total"] += total_tokens
-        session_token_usage["cumulative_prompt"] += prompt_tokens
-        session_token_usage["cumulative_completion"] += completion_tokens
-        if cache_reported:
-            session_token_usage["cumulative_cached"] += cached_tokens
-            session_token_usage["cumulative_cache_prompt"] += prompt_tokens
-        if main_scope:
-            session_token_usage["latest_total"] = total_tokens
-            session_token_usage["latest_prompt"] = prompt_tokens
-            session_token_usage["latest_cached"] = cached_tokens or 0
-
-    if main_scope:
-        if cache_reported:
-            _record_cache_usage(
-                session_id,
-                cache_scope,
-                prompt_tokens,
-                cached_tokens,
-                invalidation_reason,
-                model_name,
-                api_base,
-            )
-        else:
-            _mark_cache_usage_unavailable(
-                session_id,
-                model_name,
-                api_base,
-                cache_scope,
-                "服务端未报告缓存 token 明细",
-            )
-
-    _persist_token_usage(
-        model_name,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cached_tokens=cached_tokens,
-        total_tokens=total_tokens,
-        session_id=session_id,
-        api_base=api_base,
-        cache_scope=cache_scope,
-    )
-
-    # 记账落库已完成，立即通知 UI 监听器（GUI 推送 token_usage 事件实现
-    # 统计栏/上下文圆圈逐请求实时刷新）。监听器异常只记日志，绝不影响
-    # 记账主流程（持久化已完成后调用，失败也不会丢账）。
-    listener = _token_usage_listener
-    if listener is not None:
-        try:
-            listener()
-        except Exception:
-            logger.debug("token_usage 监听器执行失败", exc_info=True)
-    return record
+# --- Re-exported from core.llm_diagnostics ---
+from core.llm_diagnostics import (
+    _USAGE_FIELD_MISSING,
+    _account_server_usage,
+    _build_cache_request_diagnostic,
+    _cache_control_request_metrics,
+    _cache_message_fingerprints,
+    _cache_request_states,
+    _cache_usage_key,
+    _cache_usage_states,
+    _canonical_diagnostic_json,
+    _classify_cache_request,
+    _classify_cache_request_details,
+    _extract_cached_tokens,
+    _mark_cache_usage_unavailable,
+    _normalize_server_usage,
+    _optional_nonnegative_int,
+    _persist_cache_request_diagnostic,
+    _persist_token_usage,
+    _record_cache_usage,
+    _strip_cache_control_markers,
+    _usage_field,
+    clear_cache_usage_session,
+    get_token_usage_snapshot,
+    rename_cache_usage_session,
+    session_token_usage,
+    set_token_usage_listener,
+    token_usage_lock,
+)
 
 # The registry is the canonical capability metadata source.
 from core.tool_registry import build_default_registry, filter_reserved_tool_schemas
-tool_registry = build_default_registry()
+# 秘书工具策略的单一事实源（纯读模块，模块级 import 无循环依赖）
+from core import secretary
+
+
+class _LazyToolRegistry:
+    """首次被访问时才真正构建默认工具表。
+
+    构建要装配 60+ 个 ToolSpec 并扫描插件目录（实测冷启动约 0.6s），而它
+    只在"第一次真正要发请求 / 查工具"时才有用。改成惰性后，入口层可以先
+    铺界面，再由后台线程预热；首轮请求正常情况下已经命中缓存。
+    """
+
+    __slots__ = ("_inner", "_building")
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_inner", None)
+        object.__setattr__(self, "_building", False)
+
+    def _load(self):
+        inner = object.__getattribute__(self, "_inner")
+        if inner is not None:
+            return inner
+        with _TOOL_REGISTRY_BUILD_LOCK:
+            inner = object.__getattribute__(self, "_inner")
+            if inner is not None:
+                return inner
+            if object.__getattribute__(self, "_building"):
+                # 构建期内的同线程回环访问（插件加载链路可能向上取活跃表）：
+                # 返回空表占位，避免无限递归。
+                from core.tool_registry import ToolRegistry
+
+                return ToolRegistry()
+            object.__setattr__(self, "_building", True)
+            try:
+                inner = build_default_registry()
+            finally:
+                object.__setattr__(self, "_building", False)
+            object.__setattr__(self, "_inner", inner)
+            return inner
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._load(), name, value)
+
+
+_TOOL_REGISTRY_BUILD_LOCK = threading.RLock()
+
+# 保持模块级属性名不变：permission_terminal / plugin_loader / tool_pipeline
+# 以及测试都通过 getattr(llm, "tool_registry") 取"当前活跃注册表"。
+tool_registry = _LazyToolRegistry()
 
 
 _mcp_first_wait_done = False
@@ -1871,6 +377,131 @@ def _get_mcp_manager():
     return mcp_manager
 
 
+# 【临时诊断】开关文件存在时，把每步请求的工具列表落盘
+_DEBUG_TOOLS_DUMP_FLAG = r"D:\ycodesso\llm_tools_dump.on"
+_DEBUG_TOOLS_DUMP_PATH = r"D:\ycodesso\llm_tools_dump.jsonl"
+
+
+def _debug_dump_request_tools(model_name, api_base, request_tools):
+    """【纯旁路 / 临时诊断】把即将发往上游的工具列表落盘。
+
+    为什么需要：上游对 tools[].function.description 做必填校验时只回「tools[N]
+    缺 description」，N 是它看到的数组下标；本地复算不出真实列表就只能靠这份
+    落盘对齐。仅在开关文件存在时写，任何异常只记 debug，绝不改变发送字节。
+    """
+    try:
+        import hashlib as _hashlib
+        import os as _os
+        import time as _time
+
+        if not _os.path.exists(_DEBUG_TOOLS_DUMP_FLAG):
+            return
+        tools = [tool for tool in (request_tools or []) if isinstance(tool, dict)]
+        blob = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        row = {
+            "ts": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model": str(model_name or ""),
+            "api_base": str(api_base or ""),
+            "count": len(tools),
+            "bytes": len(blob.encode("utf-8")),
+            "sha256": _hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+            "tools": [
+                {
+                    "i": index,
+                    "name": tool.get("function", {}).get("name"),
+                    "desc": tool.get("function", {}).get("description"),
+                }
+                for index, tool in enumerate(tools)
+            ],
+        }
+        with open(_DEBUG_TOOLS_DUMP_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("工具列表落盘失败（旁路，已忽略）", exc_info=True)
+
+
+def _snapshot_tool_breakdown(request_tools):
+    """【纯旁路】按 MCP 工具名集合拆分统计工具定义字符量（设计规格 §3.3；
+    2026-09-23 拆分系统/MCP）。失败仅记 debug，绝不改变 request_tools 与发送字节。"""
+    try:
+        from core.context_breakdown import update_source as _update_ctx_source
+        mcp_tool_names = {
+            s.get("function", {}).get("name")
+            for s in _get_mcp_manager().get_schemas()
+        }
+        system_tools = [
+            s for s in request_tools
+            if s.get("function", {}).get("name") not in mcp_tool_names
+        ]
+        mcp_tools = [
+            s for s in request_tools
+            if s.get("function", {}).get("name") in mcp_tool_names
+        ]
+        # 空组写 0（而非 '[]' 的 2），前端过滤 chars<=0 不会渲染 0 占比行
+        _update_ctx_source(
+            "system_tools",
+            len(json.dumps(system_tools, ensure_ascii=False)) if system_tools else 0,
+        )
+        _update_ctx_source(
+            "mcp_tools",
+            len(json.dumps(mcp_tools, ensure_ascii=False)) if mcp_tools else 0,
+        )
+    except Exception:
+        logger.debug("工具定义字符量统计失败（旁路，已忽略）", exc_info=True)
+
+
+def _registry_scope_map() -> dict[str, str]:
+    """注册表里的 {工具名: side_effect_scope}；读取失败返回空表（不抛错）。
+
+    只读判定依赖作用域，registry 的 api_schemas() 不带该字段，故单独取。
+    """
+    scopes: dict[str, str] = {}
+    try:
+        for spec in tool_registry.all():
+            scopes[str(getattr(spec, "name", "") or "")] = str(
+                getattr(spec, "side_effect_scope", "") or ""
+            )
+    except Exception:
+        logger.debug("读取工具作用域失败（旁路，按未知作用域处理）", exc_info=True)
+    return scopes
+
+
+def _secretary_tools_schema() -> list[dict]:
+    """秘书会话的工具 schema：只留策略放行的内置工具，且不合并任何 MCP（设计第 7 节）。"""
+    from core.secretary import secretary_allows_tool
+
+    scopes = _registry_scope_map()
+    schemas: list[dict] = []
+    for schema in tool_registry.api_schemas():
+        name = str(schema.get("function", {}).get("name", "") or "")
+        try:
+            allowed = bool(name) and secretary_allows_tool(name, scopes.get(name, ""))
+        except Exception:
+            allowed = False
+        if allowed:
+            schemas.append(schema)
+    return schemas
+
+
+def _ordinary_tools_schema(excluded_names) -> list[dict]:
+    """普通会话的工具 schema：注册表全量（剔除秘书专属项）+ MCP（保留名过滤后）。
+
+    设计第 2/7 节硬约束：三个调度工具只对秘书会话可见，普通会话工具集与本次
+    改动前逐元素一致（工具列表逐字节稳定是前缀缓存命中的前提）。
+    """
+    excluded = {str(name) for name in (excluded_names or ())}
+    schemas = list(tool_registry.api_schemas())
+    if excluded:
+        schemas = [
+            schema for schema in schemas
+            if str(schema.get("function", {}).get("name", "") or "") not in excluded
+        ]
+    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
+    # computer_action / computer_select_target 由固定 Harness 适配器提供，
+    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
+    return schemas + filter_reserved_tool_schemas(_get_mcp_manager().get_schemas())
+
+
 def get_tools_schema():
     """每次构建请求时新鲜获取工具 schema（registry 静态 + MCP 动态）。
 
@@ -1880,6 +511,10 @@ def get_tools_schema():
     进程内首次调用时同步等待 MCP 连接就绪（有界超时，空配置立即返回）：
     否则 MCP schema 会在第 N 轮突然出现在 tools 列表里，DeepSeek/Kimi
     前缀缓存从头部整体失效。后续调用恢复非阻塞，避免每轮都承担连接延迟。
+
+    秘书会话（core.secretary.is_secretary_session）走另一条路径：只暴露只读
+    与调度类内置工具，并跳过 MCP schema 合并（设计 2026-10-15 第 7 节）；
+    普通会话路径与改动前逐元素一致。
     """
     global _mcp_first_wait_done
     if not _mcp_first_wait_done:
@@ -1888,246 +523,56 @@ def get_tools_schema():
             _get_mcp_manager()._ensure_connected()
         except Exception:
             pass
-    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
-    # computer_action / computer_select_target 由固定 Harness 适配器提供，
-    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
-    return tool_registry.api_schemas() + filter_reserved_tool_schemas(
-        _get_mcp_manager().get_schemas()
-    )
+    try:
+        # 秘书身份解析异常按普通会话处理：绝不因策略组件故障改变普通对话的工具集
+        is_secretary = bool(secretary.is_secretary_session())
+    except Exception:
+        logger.debug("秘书会话判定失败（旁路，按普通会话处理）", exc_info=True)
+        is_secretary = False
+    if is_secretary:
+        try:
+            return _secretary_tools_schema()
+        except Exception:
+            logger.debug("秘书工具 schema 过滤失败（旁路，回落普通路径）", exc_info=True)
+    # 自动化回合（G3）：额外隐藏写类自动化工具，防任务自我繁殖。策略读取
+    # 异常按空集处理并走与原逻辑完全一致的调用——普通回合的工具列表必须与
+    # 改动前逐字节一致（前缀缓存命中的前提）。
+    hidden = frozenset()
+    try:
+        from core.automation import tool_policy as _automation_tool_policy
+
+        hidden = _automation_tool_policy.hidden_tool_names_for_current_turn()
+    except Exception:
+        logger.debug("自动化回合工具过滤失败（旁路，按普通回合处理）", exc_info=True)
+        hidden = frozenset()
+    if hidden:
+        return _ordinary_tools_schema(
+            set(secretary.SECRETARY_ONLY_TOOLS) | {str(name) for name in hidden}
+        )
+    return _ordinary_tools_schema(secretary.SECRETARY_ONLY_TOOLS)
 
 
 def completion(**kwargs):
-    """litellm.completion 的模块级导出的包装函数（可被测试 mocker.patch 拦截）。"""
-    return _litellm_completion(**kwargs)
+    """模型请求入口（自研 HTTPX 引擎唯一路径，可被测试 mocker.patch 拦截）。
 
-
-def _obj_value(value, key, default=None):
-    if isinstance(value, dict):
-        return value.get(key, default)
-    return getattr(value, key, default)
-
-
-def _chat_chunk(*, content="", reasoning="", tool_calls=None, finish_reason=None,
-                usage=None, computer_call=None):
-    delta = SimpleNamespace(
-        content=content,
-        reasoning_content=reasoning,
-        tool_calls=tool_calls or [],
-        computer_call=computer_call,
-    )
-    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], usage=usage)
-
-
-def _merge_stream_response_id(current, seen):
-    """合并流中出现的 response id；不同 id 显式冲突失败。
-
-    冲突错误消息绝不内嵌任一 response id 原文（11b 用户裁决，Task 16
-    隐私审计）——该 RuntimeError 可经 turn_error 外泄到 UI/持久化面。
+    实际传输由 core.llm_transport._dispatch_completion 分派到
+    core.llm_native_transport.native_completion。
     """
-    seen = str(seen or "")
-    if not seen:
-        return current
-    if current and current != seen:
-        raise RuntimeError(
-            "Responses 流的 response id 冲突（两个不同的 id，原文不回显）"
-        )
-    return seen
+    return _dispatch_completion(**kwargs)
 
 
-def _plain_value(value):
-    """把 litellm 事件对象树规范化为纯 dict/list/标量（computer_call 载荷用）。"""
-    if isinstance(value, dict):
-        return {key: _plain_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain_value(item) for item in value]
-    if isinstance(value, SimpleNamespace):
-        return {key: _plain_value(item) for key, item in vars(value).items()}
-    return value
-
-
-def _responses_usage_as_chat_usage(response):
-    usage = _obj_value(response, "usage")
-    if usage is None:
-        return None
-    input_details = _obj_value(usage, "input_tokens_details")
-    cached_tokens = int(_obj_value(input_details, "cached_tokens", 0) or 0)
-    prompt_tokens = int(_obj_value(usage, "input_tokens", 0) or 0)
-    completion_tokens = int(_obj_value(usage, "output_tokens", 0) or 0)
-    total_tokens = int(
-        _obj_value(usage, "total_tokens", prompt_tokens + completion_tokens)
-        or prompt_tokens + completion_tokens
-    )
-    return SimpleNamespace(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
-    )
-
-
-def _responses_stream_as_chat_chunks(events):
-    """Responses 原始流 → chat chunks 的映射；生成器关闭时连带关闭底层流。"""
-    try:
-        yield from _responses_events_as_chat_chunks(events)
-    finally:
-        _close_stream_quietly(events)
-
-
-def _normalize_responses_event_type(event_type) -> str:
-    """Responses 事件 type 统一归一化为 'response.*' 字符串。
-
-    原生 OpenAI 流事件的 type 是裸字符串；而 litellm 对无原生 Responses API
-    的 provider（DeepSeek 等 chat-only 模型）走 chat→responses 桥接，合成事件
-    的 type 直接填 ResponsesAPIStreamEvents 枚举成员，str() 得到的是成员名
-    （如 'ResponsesAPIStreamEvents.RESPONSE_COMPLETED'）而非事件值，必须用
-    .value 还原，否则映射器全部失配。
-    """
-    if isinstance(event_type, str):
-        return event_type
-    value = getattr(event_type, "value", None)
-    if isinstance(value, str):
-        return value
-    return str(event_type or "")
-
-
-def _responses_events_as_chat_chunks(events):
-    """将 Responses SSE 事件严格映射成现有工具循环消费的 chat chunks。"""
-    saw_tool_calls = False
-    response_id = ""
-    ignored = {
-        "response.in_progress",
-        "response.content_part.added",
-        "response.content_part.done",
-        "response.output_text.done",
-        "response.refusal.done",
-        "response.output_text.annotation.added",
-        "response.function_call_arguments.done",
-        "response.reasoning_summary_text.done",
-        "response.reasoning_summary_part.added",
-        "response.reasoning_summary_part.done",
-    }
-    for event in events:
-        event_type = _normalize_responses_event_type(_obj_value(event, "type", ""))
-        if event_type == "response.output_text.delta":
-            yield _chat_chunk(content=str(_obj_value(event, "delta", "")))
-        elif event_type == "response.reasoning_summary_text.delta":
-            yield _chat_chunk(reasoning=str(_obj_value(event, "delta", "")))
-        elif event_type == "response.refusal.delta":
-            yield _chat_chunk(content=str(_obj_value(event, "delta", "")))
-        elif event_type == "response.created":
-            # Task 11a：记录 response id，供 computer_call 载荷与原生续传使用
-            response_id = _merge_stream_response_id(
-                response_id,
-                _obj_value(_obj_value(event, "response"), "id", ""),
-            )
-        elif event_type == "response.output_item.added":
-            item = _obj_value(event, "item")
-            if _obj_value(item, "type") != "function_call":
-                # 半截 computer_call（added 事件）绝不转发：禁止基于半截 JSON
-                # 触发执行，终态载荷只来自 output_item.done / completed。
-                continue
-            saw_tool_calls = True
-            output_index = int(_obj_value(event, "output_index", 0) or 0)
-            call_id = _obj_value(item, "call_id") or _obj_value(item, "id")
-            name = _obj_value(item, "name")
-            if not call_id or not name:
-                raise RuntimeError("Responses function_call 缺少 call_id 或 name")
-            tool_call = SimpleNamespace(
-                index=output_index,
-                id=str(call_id),
-                function=SimpleNamespace(name=str(name), arguments=""),
-            )
-            yield _chat_chunk(tool_calls=[tool_call])
-        elif event_type == "response.function_call_arguments.delta":
-            saw_tool_calls = True
-            tool_call = SimpleNamespace(
-                index=int(_obj_value(event, "output_index", 0) or 0),
-                id=None,
-                function=SimpleNamespace(
-                    name="",
-                    arguments=str(_obj_value(event, "delta", "")),
-                ),
-            )
-            yield _chat_chunk(tool_calls=[tool_call])
-        elif event_type == "response.output_item.done":
-            item = _obj_value(event, "item")
-            if _obj_value(item, "type") == "computer_call":
-                # Task 11a：终态完整 computer_call 载荷，转发给 assembler 合并
-                saw_tool_calls = True
-                yield _chat_chunk(computer_call={
-                    "response_id": response_id,
-                    "item": _plain_value(item),
-                })
-            # 其余 item 类型维持忽略（function_call 已由 added+delta 事件覆盖）
-            continue
-        elif event_type == "response.completed":
-            response = _obj_value(event, "response")
-            response_id = _merge_stream_response_id(
-                response_id, _obj_value(response, "id", "")
-            )
-            # 非流式桥接可能只在 completed 的 output[] 里给出 computer_call
-            for output_item in (_obj_value(response, "output", None) or ()):
-                if _obj_value(output_item, "type") == "computer_call":
-                    saw_tool_calls = True
-                    yield _chat_chunk(computer_call={
-                        "response_id": response_id,
-                        "item": _plain_value(output_item),
-                    })
-            yield _chat_chunk(
-                finish_reason="tool_calls" if saw_tool_calls else "stop",
-                usage=_responses_usage_as_chat_usage(response),
-            )
-        elif event_type == "response.incomplete":
-            response = _obj_value(event, "response")
-            details = _obj_value(response, "incomplete_details")
-            reason = str(_obj_value(details, "reason", ""))
-            if reason == "max_output_tokens":
-                yield _chat_chunk(
-                    finish_reason="length",
-                    usage=_responses_usage_as_chat_usage(response),
-                )
-                continue
-            raise RuntimeError(f"Responses 请求未完成: {reason or '未知原因'}")
-        elif event_type in {"response.failed", "error"}:
-            response = _obj_value(event, "response", event)
-            error = _obj_value(response, "error", response)
-            message = _obj_value(error, "message") or str(error)
-            raise RuntimeError(f"Responses 请求失败: {message}")
-        elif event_type in ignored:
-            continue
-        else:
-            raise RuntimeError(f"未支持的 Responses 流事件: {event_type or '<empty>'}")
-
-
-def _native_continuation_instructions(request_kwargs) -> str:
-    """从产生 computer_call 的 Step 请求中提取续传必须重发的 instructions。
-
-    首请求的系统上下文位于 input 的 system/developer 条目（prepare_stream_request
-    语义）；continuation 请求已有 instructions 键则直接复用。多个 system 条目按
-    出现顺序以空行连接。设计 11.3：官方 Responses 的 instructions 不会经
-    previous_response_id 自动继承，漏发会导致 system prompt 语义漂移。
-    """
-    instructions = request_kwargs.get("instructions")
-    if isinstance(instructions, str):
-        return instructions
-    parts = []
-    for item in request_kwargs.get("input") or ():
-        if not isinstance(item, dict) or item.get("role") not in ("system", "developer"):
-            continue
-        content = item.get("content")
-        if isinstance(content, str):
-            if content:
-                parts.append(content)
-        elif isinstance(content, list):
-            text = "".join(
-                str(block.get("text") or "")
-                for block in content
-                if isinstance(block, dict) and block.get("type") in ("text", "input_text")
-            )
-            if text:
-                parts.append(text)
-    return "\n\n".join(parts)
+# --- Re-exported from core.harness.responses_adapter ---
+from core.harness.responses_adapter import (
+    _chat_chunk,
+    _merge_stream_response_id,
+    _native_continuation_instructions,
+    _normalize_responses_event_type,
+    _obj_value,
+    _plain_value,
+    _responses_events_as_chat_chunks,
+    _responses_stream_as_chat_chunks,
+    _responses_usage_as_chat_usage,
+)
 
 
 def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_event=None):
@@ -2153,7 +598,7 @@ def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_e
                 holder.attach(stream)
             return stream, holder
         # 可关闭对象是底层原始流，不是外层映射生成器（生成器在执行中无法 close）
-        raw_stream = _litellm_responses(**prepared.kwargs)
+        raw_stream = _dispatch_responses(**prepared.kwargs)
         if holder is not None:
             holder.attach(raw_stream)
         return _responses_stream_as_chat_chunks(raw_stream), holder
@@ -2163,20 +608,7 @@ def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_e
         raise
 
 
-def __getattr__(name):
-    # 兼容别名：惰性计算，避免 import 时触发 MCP 连接
-    if name == "TOOLS_SCHEMA":
-        return get_tools_schema()
-    if name == "litellm":
-        return _get_litellm()
-    if name == "mcp_manager":
-        # 惰性加载 mcp_manager 单例：避免 import core.llm 时就拉起 mcp 包全家桶
-        # （~1.1s 启动开销）。不缓存到 globals，保证外部属性访问始终反映
-        # core.mcp_client.mcp_manager 的当前值（测试 monkeypatch 友好）。
-        return _get_mcp_manager()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-# estimate_tokens 结果缓存：tiktoken 全量编码整个历史相当慢（长会话可达秒级），
+# estimate_tokens 结果缓存：token 估算整个历史开销可观（长会话消息多），
 # 而 UI 状态栏、压缩判断等会在内容未变时反复调用。用 (模型, 消息数, 总字符数)
 # 作为签名，未变化时直接复用上次结果。
 _token_estimate_cache = {"sig": None, "value": 0}
@@ -2189,7 +621,7 @@ _token_cache_lock = threading.RLock()
 def _sanitize_error_text(text):
     """异常文本入 UI / 落库前脱敏。
 
-    litellm / 网关异常文本常携带完整请求 URL 与请求上下文（query 里的 api_key、
+    网关 / Provider 异常文本常携带完整请求 URL 与请求上下文（query 里的 api_key、
     Authorization: Bearer 头、URL userinfo 等），直接发 error/turn_error 事件会把
     凭据泄露到界面与会话记录。这里对 URL 凭据段与常见密钥模式做不可逆脱敏。
     """
@@ -2215,12 +647,22 @@ def _sanitize_error_text(text):
     )
 
 
+def _format_user_facing_error(exc):
+    """将异常转换为用户友好的中文诊断说明，并确保脱敏。"""
+    try:
+        from core.llm_error_mapper import format_user_facing_error
+
+        return format_user_facing_error(exc)
+    except Exception:
+        return _sanitize_error_text(exc)
+
+
 def _fold_old_media_for_estimate(messages):
     """估算前把历史图片折叠为占位符（与请求时 _strip_media_and_merge 的规则一致）。
 
     base64 原图动辄几十万字符，按字符数估算会虚高几个数量级，导致携带大图片的
-    会话反复误触发记忆压缩。仅最近一条带图用户消息保留原样（交给 litellm 按
-    图片实际规格估算），更早的一律折叠为短占位符。
+    会话反复误触发记忆压缩。仅最近一条带图用户消息保留原样（贴近真实请求形状），
+    更早的一律折叠为短占位符。
     """
     last_media_idx = -1
     for idx in range(len(messages) - 1, -1, -1):
@@ -2282,7 +724,7 @@ def _estimate_tokens_locked(model_name, messages):
     def _count(msgs):
         try:
             # 历史图片先折叠再计数：base64 字符量与图片真实 token 消耗无关
-            return _litellm_token_counter(model_name, _fold_old_media_for_estimate(msgs))
+            return _token_counter(model_name, _fold_old_media_for_estimate(msgs))
         except Exception:
             # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
             return len(str(_fold_old_media_for_estimate(msgs))) // 2
@@ -2318,18 +760,121 @@ def _yield_content(text):
         yield char
 
 
+# 填充词词表（修复①「填充词判据收紧」）。取舍是“宁可漏判、不可误判”：
+# 漏掉一个填充词只会少熔断一次，误判正常短回复则会触发下游护栏误熔断。
+# 首版照方案给定元素，唯一例外是不收录“完成”——它是常见的合法最终短回复
+# （仓库内多处用例即以 "完成" 作为模型收尾正文，属方案自身边界所言的
+# “正常短回复不得被误判”），收录它会让正常收尾被判为空正文并误触发催促。
+_FILLER_TOKENS = frozenset(
+    {
+        "好", "好的", "嗯", "哦", "噢", "ok", "okay", "行", "可以",
+        "收到", "明白", "了解", "继续", "输出", "完毕",
+        "yes", "no",
+    }
+)
+
+# 与 _is_meaningful_assistant_content 同款的“空白/标点/Markdown 符号”噪声字符类，
+# 剥离与切分共用同一口径，避免两处正则漂移。
+# 相较原判据补入省略号“…”（U+2026），否则“收到……”这类“填充词+省略号”无法被剥离，
+# 纯标点语义不变（仅标点仍由原判据判空）。
+_ASSISTANT_NOISE_PATTERN = r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\…]+"
+
+
+def _is_filler_only(text):
+    """判断文本是否只由填充词构成（修复①判据收紧的辅助函数）。
+
+    来历：原判定只剥离噪声字符，对 ``"好。"`` 剥完仍剩 ``"好"`` 而被判为有效正文，
+    使得慢步熔断 / 总结催促 / 收尾报错三道护栏同时短路。此处要求：剥完噪声后，
+    按标点切出的每个片段都命中 ``_FILLER_TOKENS``（比对前小写化），且残余长度 ≤6，
+    才算“纯填充词”。宁可漏判（放过个别填充词），也不误判（把正常短回复当空正文）。
+    """
+    raw = text or ""
+    stripped = re.sub(_ASSISTANT_NOISE_PATTERN, "", raw)
+    # 残余为空属于“空正文”语义，交回原判据处理，本函数不判假（不改变空串行为）。
+    if not stripped:
+        return False
+    # 残余过长，不可能只是短应答式填充词。
+    if len(stripped) > 6:
+        return False
+    fragments = [seg for seg in re.split(_ASSISTANT_NOISE_PATTERN, raw) if seg]
+    if not fragments:
+        return False
+    return all(seg.lower() in _FILLER_TOKENS for seg in fragments)
+
+
 def _is_meaningful_assistant_content(text):
-    return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
+    """是否含有效正文：原判据为真，且不是“剥完只剩填充词”。
+
+    函数名与签名保持不变（下游调用与回归用例依赖）。
+    """
+    if not bool(re.sub(_ASSISTANT_NOISE_PATTERN, "", text or "")):
+        return False
+    return not _is_filler_only(text)
 
 
-def _read_text_with_encoding_fallback(file_path):
-    """读取文本文件：优先 UTF-8，失败回退 GBK（与 core.tools.edit_file 解码策略一致）。"""
-    with open(file_path, "rb") as f:
-        raw = f.read()
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("gbk", errors="replace")
+# --- 退化（复读）检测（修复②）：流式装配层的"连续复读"护栏 -------------------
+# 与修复①的分工：修复①管"单步只有填充词"，这里管"多步反复同一段短内容"。
+# 两者都是为了解决同一类卡死——模型既不调工具也不给结论，只反复刷同样的话，
+# 而 progress_guard 只看确定性状态、不读自然语言（有意设计），追不上这种模式。
+_DEGENERATE_WINDOW = 3
+# "连续相同"判据只对短内容生效：长正文逐位相同更像模型复述上下文，交给相似度判据。
+_DEGENERATE_MAX_FINGERPRINT_CHARS = 20
+_DEGENERATE_SIMILARITY_THRESHOLD = 0.9
+# 退化收敛催促的次数上限：首次命中催促一次，再次命中直接熔断收尾。
+_DEGENERATE_MAX_NUDGES = 1
+
+
+def _degenerate_fingerprint(text):
+    """退化指纹：剥离噪声字符（与修复①同一口径）后的字符串。
+
+    复用 ``_ASSISTANT_NOISE_PATTERN``，避免两处正则各写一份造成口径漂移。
+    """
+    return re.sub(_ASSISTANT_NOISE_PATTERN, "", text or "")
+
+
+def _fingerprint_similarity(left, right):
+    """两个指纹的相似度（0~1）：取“编辑距离比例”与“字符集包含度”的较大者。
+
+    只用标准库（difflib）实现，不引入第三方依赖。包含度是必要补充：中文短复读的
+    指纹常只差一两个字（如 "好" vs "好的"），编辑距离比例只有 0.67，会漏判；包含度
+    按 ``|A∩B| / min(|A|, |B|)`` 计算，能把“一方基本被另一方覆盖”的近似复读判出来。
+    """
+    if not left or not right:
+        return 0.0
+    edit_ratio = difflib.SequenceMatcher(None, left, right).ratio()
+    left_set, right_set = set(left), set(right)
+    containment = len(left_set & right_set) / min(len(left_set), len(right_set))
+    return max(edit_ratio, containment)
+
+
+def _is_degenerate_repeat(fingerprints):
+    """最近若干步指纹是否构成“退化复读”（纯函数，便于单测）。
+
+    判定口径（实施方案 §T2）：滑窗内连续 3 步指纹逐位相同且单步长度 ≤20 字符；
+    或滑窗内指纹两两相似度 ≥0.9。空指纹（工具调用步无正文、无思考）不参与判定，
+    避免把“连续只调工具”的正常步骤误判为复读。
+    """
+    window = list(fingerprints)[-_DEGENERATE_WINDOW:]
+    if len(window) < _DEGENERATE_WINDOW:
+        return False
+    if not all(window):
+        return False
+    if (
+        len(set(window)) == 1
+        and len(window[0]) <= _DEGENERATE_MAX_FINGERPRINT_CHARS
+    ):
+        return True
+    return all(
+        _fingerprint_similarity(earlier, later)
+        >= _DEGENERATE_SIMILARITY_THRESHOLD
+        for index, earlier in enumerate(window)
+        for later in window[index + 1:]
+    )
+
+
+# _read_text_with_encoding_fallback 的唯一实现位于 core/llm_execution.py，
+# 由下方 re-export 区导入（utf-8 → gbk → latin-1 → utf-8(replace)），
+# 此处不得保留同名副本，避免模块内出现两份行为不一致的实现。
 
 
 def chat_with_model(
@@ -2382,6 +927,16 @@ def _claim_takeover_at_turn_start(
     return scheduler, claimed
 
 
+# 入口层受控回合来源白名单：只有入口层（GUI/CLI 本地、LAN 手机端、飞书通道、
+# 手机端 MCP 客户端经局域网 MCP 服务投递、/goal 目标模式自动续跑）能设置，
+# 绝不来自用户消息或模型参数。
+# 非 local 的回合一律按「远程」处理（禁用电脑操控、不解析 @{会话名}、不抢桌面当前
+# 会话），见 core/computer/capability.py 与 core/agent_service.py 的
+# turn_source != "local" 分支。
+# 新增来源时必须同时更新 gui_bridge.TURN_SOURCES（有测试断言两者一致）。
+COMPUTER_TURN_SOURCES = ("local", "lan", "feishu", "mcp", "goal")
+
+
 def resolve_turn_computer_capability(
     model_name,
     api_base=None,
@@ -2393,7 +948,7 @@ def resolve_turn_computer_capability(
     按请求路由在 config 中查找模型条目，与请求实际使用的 base_url/protocol
     一起交给纯函数 resolve_computer_capability 冻结为不可变快照；同一 Turn
     的每个 Step 复用该快照，不做二次决策。turn_source 只接受入口层受控值
-    local|lan（不得来自用户消息或模型参数）。设置快照读取失败按
+    local|lan|feishu|mcp（不得来自用户消息或模型参数）。设置快照读取失败按
     computer_invalid_config 拒绝（fail-closed），绝不中断普通对话。
     """
     from core.model_manager import get_model_config_by_litellm_model, get_model_protocol
@@ -2404,6 +959,8 @@ def resolve_turn_computer_capability(
         "base_url": api_base,
     }
     try:
+        from core.computer.settings import load_computer_settings
+
         settings = load_computer_settings()
     except ComputerControlError as error:
         return ComputerCapability(
@@ -2434,6 +991,9 @@ def chat_with_model_events(
     model_id=None,
     computer_turn_source="local",
     computer_capability=None,
+    budget_notice_provider=None,
+    request_reason: str = "",
+    resume_turn: bool = False,
 ):
     """Yield ordered :class:`TurnEvent` snapshots for one model turn.
 
@@ -2441,17 +1001,26 @@ def chat_with_model_events(
     the event-oriented entry point used by the CLI and is deliberately kept
     separate while the existing tool loop is migrated incrementally.
 
-    computer_turn_source 是入口层给出的受控回合来源（local|lan）：LAN/mobile
-    发起的 Turn 在 resolve_computer_capability 内固定禁用电脑操控。
+    computer_turn_source 是入口层给出的受控回合来源（local|lan|feishu）：LAN/mobile
+    与飞书通道发起的 Turn 在 resolve_computer_capability 内固定禁用电脑操控。
 
     computer_capability（Task 11a F1 收敛）是调用方显式传入的 Turn 能力快照；
     未传时优先取同线程 prepare 阶段（agent_service.build_runtime_context）存入
     的 handoff，仍无才自行解析（兼容旧调用方）。三条路径合起来保证同一生产
     Turn 的 capability 只解析一次；子代理回合（allow_subagents=False）始终为
     None，不解析也不注入电脑操控。
+
+    request_reason 是回合意图标记（断点续跑接线）：与缓存失效原因
+    （RequestEnvelope.request_reason 取值域"冷启动"/"上下文压缩或历史重写"/
+    "工具契约变化"/"模型或接口变化"/""）严格分离，只经 turn_reason 落到
+    harness_steps.request_reason 的续跑标记位，不参与缓存诊断；空字符串＝
+    普通回合。resume_turn=True 表示该 turn_id 的行已被 ResumeExecutor 建好，
+    TurnRuntime.start 不再重复 INSERT（否则 harness_turns 主键冲突）。
     """
-    if computer_turn_source not in ("local", "lan"):
-        raise ValueError("computer_turn_source 只允许受控值 local 或 lan")
+    if computer_turn_source not in COMPUTER_TURN_SOURCES:
+        raise ValueError(
+            f"computer_turn_source 只允许受控值 {'|'.join(COMPUTER_TURN_SOURCES)}"
+        )
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
     resolved_parent_turn_id = parent_turn_id or resolved_turn_id
     # Turn 起点解析一次电脑操控能力（Task 10 接线点①，设计 9.3）：局部不可变
@@ -2483,6 +1052,7 @@ def chat_with_model_events(
             manager=_manager,
             cancel_event=cancel_event,
             clock_ms=lambda: time.time_ns() // 1_000_000,
+            create_row=not resume_turn,
         )
     factory = TurnEventFactory(resolved_turn_id)
     pending_events = []
@@ -2584,6 +1154,8 @@ def chat_with_model_events(
             model_id=model_id,
             harness_runtime=harness_runtime,
             computer_capability=computer_turn_capability,
+            budget_notice_provider=budget_notice_provider,
+            request_reason=request_reason,
         )
         for chunk in generator:
             yield from drain_public_events()
@@ -2626,7 +1198,7 @@ def chat_with_model_events(
             ),
         )
         yield from drain_public_events()
-        yield factory.emit("turn_error", {"message": _sanitize_error_text(exc)})
+        yield factory.emit("turn_error", {"message": _format_user_facing_error(exc)})
         raise
     finally:
         # 消费端主动 close 会以 GeneratorExit 跳过上面的两个异常分支；这里
@@ -2640,1379 +1212,89 @@ def chat_with_model_events(
             ),
         )
 
-# 支持原生推理字段回传的 provider 白名单（按 litellm model 前缀匹配）
-_REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek", "moonshot")
-
-_KIMI_NAME_RE = re.compile(r"(?:^|[-_/])k(?:2|3)(?:[._-]\d+)?(?:$|[-_])")
-
-
-def _is_kimi_family(model_name, api_base=""):
-    """判断是否 Kimi/Moonshot 系模型（模型名优先，api_base 兜底）。
-
-    经销商/聚合网关（api.scnet.cn、OpenRouter 等）的 base_url 不含
-    moonshot 字样，必须靠模型名识别，否则所有 Kimi 深度适配全部失效。
-    """
-    m = str(model_name or "").split("/")[-1].lower()
-    if "kimi" in m or "moonshot" in m:
-        return True
-    if _KIMI_NAME_RE.search(m):
-        return True
-    b = str(api_base or "").lower()
-    return "moonshot" in b or "kimi" in b
-
-
-def _is_official_kimi_route(api_base=""):
-    """只识别已知支持 Kimi 缓存亲和私有字段的官方 API。"""
-    try:
-        parsed = urlsplit(str(api_base or ""))
-        host = str(parsed.hostname or "").lower()
-        path = str(parsed.path or "").rstrip("/").lower()
-        port = parsed.port
-    except Exception:
-        return False
-    if (
-        str(parsed.scheme or "").lower() != "https"
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in (None, 443)
-        or parsed.query
-        or parsed.fragment
-    ):
-        return False
-    if host == "api.kimi.com":
-        return path in {"/coding", "/coding/v1"}
-    return (
-        host in {"api.moonshot.cn", "api.moonshot.ai"}
-        and path in {"", "/v1"}
-    )
-
-
-def _is_deepseek_family(model_name, api_base=""):
-    model = str(model_name or "").split("/")[-1].lower()
-    return "deepseek" in model or _is_official_deepseek_route(api_base)
-
-
-def _is_official_deepseek_route(api_base=""):
-    normalized = str(api_base or "").rstrip("/").lower()
-    return normalized in {
-        "https://api.deepseek.com",
-        "https://api.deepseek.com/v1",
-        "https://api.deepseek.com/beta",
-    }
-
-
-def _is_official_zhipu_route(api_base=""):
-    """只识别智谱官方隐式缓存路由（open.bigmodel.cn）。
-
-    智谱上下文缓存为服务端隐式自动命中（无亲和参数、无显式标记），仅官方
-    直连可确定生效；聚合网关/经销商挂载的 GLM 模型不放行。
-    同域官方端点覆盖普通 API 与 CodingPlan 两种套餐（OpenAI/Anthropic 协议）。
-    """
-    try:
-        parsed = urlsplit(str(api_base or ""))
-        host = str(parsed.hostname or "").lower()
-        path = str(parsed.path or "").rstrip("/").lower()
-        port = parsed.port
-    except Exception:
-        return False
-    if (
-        str(parsed.scheme or "").lower() != "https"
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in (None, 443)
-        or parsed.query
-        or parsed.fragment
-    ):
-        return False
-    return host == "open.bigmodel.cn" and path in {
-        "",
-        "/api/paas/v4",
-        "/api/coding/paas/v4",
-        "/api/anthropic",
-    }
-
-
-def _is_glm_family(model_name, api_base=""):
-    """判断是否智谱 GLM 系模型（模型名优先，api_base 兜底）。"""
-    model = str(model_name or "").split("/")[-1].lower()
-    return "glm" in model or _is_official_zhipu_route(api_base)
-
-
-def _is_official_dashscope_route(api_base=""):
-    """只识别阿里云百炼/灵积官方端点（dashscope.aliyuncs.com、maas.aliyuncs.com 等）。"""
-    try:
-        parsed = urlsplit(str(api_base or ""))
-        host = str(parsed.hostname or "").lower()
-        port = parsed.port
-    except Exception:
-        return False
-    if (
-        str(parsed.scheme or "").lower() != "https"
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in (None, 443)
-        or parsed.query
-        or parsed.fragment
-    ):
-        return False
-    if host in {"dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com"}:
-        return True
-    if host.endswith(".aliyuncs.com") and "dashscope" in host:
-        return True
-    if host.endswith(".maas.aliyuncs.com"):
-        return True
-    return False
-
-
-def _is_qwen_family(model_name, api_base=""):
-    """判断是否 Qwen/通义千问系模型（模型名优先，api_base 兜底）。
-
-    api_base 只认官方百炼/灵积端点（_is_official_dashscope_route 严格校验
-    https + 域名），不做 "dashscope" 子串宽匹配——否则 base_url 恰含该
-    子串的第三方中转会把其上的非 Qwen 模型误判进 Qwen 家族，导致
-    _supports_reasoning_fields 等按 Qwen 语义处理消息。
-    """
-    model = str(model_name or "").split("/")[-1].lower()
-    if "qwen" in model or "dashscope" in model:
-        return True
-    return _is_official_dashscope_route(api_base)
-
-
-_QWEN_CACHE_CONFIG_KEYS = (
-    "enable_prompt_cache",
-    "prompt_cache",
-    "enable_cache_control",
-    "cache_control",
+# --- Re-exported from core.llm_dialects ---
+from core.llm_dialects import (
+    _affinity_disabled_lock,
+    _affinity_disabled_routes,
+    _affinity_route_disabled,
+    _ANTHROPIC_REASONING_BUDGETS,
+    _BUILTIN_DEFAULT_MAX_TOKENS,
+    _CACHE_CONTROL_PROVIDERS,
+    _CACHE_CONTROL_REJECTION_TTL_SECONDS,
+    _K3_REASONING_MODEL_NAMES,
+    _KIMI_NAME_RE,
+    _QWEN_CACHE_CFG_TTL_SECONDS,
+    _QWEN_CACHE_CONFIG_KEYS,
+    _REASONING_EFFORT_LEVELS,
+    _REASONING_FIELD_PROVIDERS,
+    _STEPFUN_ANTHROPIC_EFFORT_MODELS,
+    _apply_cache_control,
+    _apply_reasoning_choice,
+    _assert_reasoning_request_consistent,
+    _attach_kimi_request_extras,
+    _attach_qwen_request_extras,
+    _builtin_default_max_tokens,
+    _cache_affinity_session_id,
+    _cache_control_disabled_lock,
+    _cache_control_disabled_routes,
+    _cache_control_route_disabled,
+    _cache_control_route_key,
+    _configured_reasoning_choice,
+    _deepseek_stable_header_matches,
+    _deepseek_thinking_enabled,
+    _disable_affinity_route,
+    _disable_cache_control_route,
+    _flatten_media_content,
+    _glm_keepalive_thinking_locked,
+    _is_cache_control_rejection,
+    _is_deepseek_family,
+    _is_glm_family,
+    _is_kimi_affinity_rejection,
+    _is_kimi_family,
+    _is_official_dashscope_route,
+    _is_official_deepseek_route,
+    _is_official_kimi_route,
+    _is_official_zhipu_route,
+    _is_qwen_family,
+    _merge_system_messages_into_leading,
+    _model_system_prompt_extra,
+    _new_tail_after_ledger_prefix,
+    _pending_ledger_rotations,
+    _pending_ledger_rotations_lock,
+    _prepare_deepseek_ledger_request,
+    _provider_cache_affinity_options,
+    _provider_request_options,
+    _qwen_cache_cfg_cache,
+    _qwen_cache_cfg_lock,
+    _qwen_cache_config_stamp,
+    _qwen_cache_control_configured,
+    _qwen_cache_enabled,
+    _requires_single_leading_system,
+    _requires_tool_call_reasoning,
+    _resolve_cache_session_identity,
+    _resolve_model_config,
+    _select_request_tools_for_route,
+    _strip_cache_affinity_options,
+    _strip_media_and_merge,
+    _supports_cache_control,
+    _supports_cache_keepalive,
+    _supports_reasoning_fields,
+    _supports_vision,
+    _supports_vision_locked,
+    _tool_contract_fingerprint,
+    _uses_deepseek_prompt_ledger,
+    _vision_support_cache,
+    consume_deepseek_generation_rotation,
+    is_deepseek_ledger_route,
+    mark_deepseek_generation_rotation,
 )
-
-# 缓存开关判定在一轮对话里会被反复触发（_qwen_cache_enabled / _supports_cache_control /
-# _supports_cache_keepalive / tools 规范化），而 load_config 每次都要读盘并解析整个
-# config.json。这里按 (模型, 路由) 记忆解析结果，并用「配置指纹」做失效：
-# 指纹 = load_config 函数身份（热重载/测试替换）+ 配置文件 mtime（用户真实编辑），
-# 再叠加短 TTL 兜底，保证配置变更最迟 _QWEN_CACHE_CFG_TTL_SECONDS 秒后被看到。
-_qwen_cache_cfg_cache = {}
-_qwen_cache_cfg_lock = threading.RLock()
-_QWEN_CACHE_CFG_TTL_SECONDS = 10.0
-
-
-def _qwen_cache_config_stamp():
-    """返回配置来源指纹；拿不到时返回 None，此时宁可不缓存也不给出过期结论。"""
-    try:
-        import config as config_module
-        from core.model_manager import load_config as loader
-    except Exception:
-        return None
-    try:
-        mtime = os.stat(str(config_module._CONFIG_FILE)).st_mtime_ns
-    except Exception:
-        mtime = 0
-    # 连同 loader 引用一起返回：持有引用可防止该对象被回收后 id 被新函数复用
-    return (id(loader), loader, mtime)
-
-
-def _resolve_model_config(model_name, api_base="", model_cfg=None):
-    """获取模型/厂商配置（优先使用传入的 model_cfg，否则从 config.json 读取并继承 provider 缓存配置）。"""
-    cfg = dict(model_cfg) if isinstance(model_cfg, dict) and model_cfg else None
-    if cfg is not None and any(k in cfg for k in _QWEN_CACHE_CONFIG_KEYS):
-        return cfg
-
-    # 显式传入 model_cfg 时不缓存：它的字段要参与本次合并，缓存会丢掉调用方上下文
-    stamp = None if cfg else _qwen_cache_config_stamp()
-    key = (str(model_name or "").strip(), str(api_base or "").rstrip("/").lower())
-    now = time.monotonic()
-    if stamp is not None:
-        with _qwen_cache_cfg_lock:
-            cached = _qwen_cache_cfg_cache.get(key)
-            if cached and cached[0] > now and cached[1] == stamp:
-                return cached[2]
-
-    resolved = None
-    try:
-        from core.model_manager import load_config
-
-        data = load_config()
-        m_str = str(model_name or "").strip()
-        base_url = str(api_base or "").rstrip("/").lower()
-        for provider in data.get("providers", []):
-            p_base = str(provider.get("base_url") or "").rstrip("/").lower()
-            for model in provider.get("models", []):
-                if model.get("litellm_model") != m_str:
-                    continue
-                if base_url and p_base and p_base != base_url:
-                    continue
-                merged = {}
-                for k in _QWEN_CACHE_CONFIG_KEYS:
-                    if k in provider:
-                        merged[k] = provider[k]
-                merged.update(model)
-                if cfg:
-                    merged.update(cfg)
-                resolved = merged
-                break
-            if resolved is not None:
-                break
-    except Exception:
-        pass
-    if resolved is None:
-        resolved = cfg or {}
-    if stamp is not None:
-        with _qwen_cache_cfg_lock:
-            _qwen_cache_cfg_cache[key] = (
-                now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, resolved,
-            )
-    return resolved
-
-
-def _qwen_cache_enabled(model_name, api_base="", model_cfg=None):
-    """判断当前 Qwen 模型路由是否开启了缓存加速（官方百炼或配置显式开启）。"""
-    if not _is_qwen_family(model_name, api_base):
-        return False
-    if _is_official_dashscope_route(api_base):
-        return True
-    cfg = _resolve_model_config(model_name, api_base, model_cfg)
-    return bool(cfg.get("enable_prompt_cache") or cfg.get("prompt_cache"))
-
-
-def _qwen_cache_control_configured(model_name, api_base="", model_cfg=None):
-    """Qwen 路由是否启用了显式 cache_control 断点（官方百炼或配置显式开启）。
-
-    不含运行期 400 黑名单降级：黑名单只关掉标记本身，tools 规范化等请求
-    形状稳定措施不随 TTL 黑名单来回翻转（形状抖动比标记更伤缓存前缀）。
-    """
-    if not _is_qwen_family(model_name, api_base):
-        return False
-    if _is_official_dashscope_route(api_base):
-        return True
-    cfg = _resolve_model_config(model_name, api_base, model_cfg)
-    return bool(cfg.get("enable_cache_control") or cfg.get("cache_control"))
-
-
-def _litellm_rejects_tool_choice(model_name):
-    """litellm 是否会在客户端拒绝该模型的 tool_choice 参数。
-
-    litellm 的 OpenAIGPT5Config 对名字含 gpt-5 的模型按 supports_tool_choice
-    查内置模型清单，中转站/聚合网关的自定义名（如 gpt-5.6-sol）查不到即按
-    False 保守回退，把 tool_choice 从支持列表剔除，请求未发出就抛
-    UnsupportedParamsError。已知模型（官方 gpt-5 等）返回 True 不触发；
-    非 gpt-5 名字走通用 OpenAIGPTConfig，其支持列表固定含 tool_choice。
-    与 litellm 触发条件逐项对齐，避免给其他路由附加额外请求字段。
-    """
-    model = str(model_name or "").split("/")[-1].lower()
-    if "gpt-5" not in model:
-        return False
-    try:
-        from litellm.utils import supports_tool_choice
-
-        return not supports_tool_choice(model=model)
-    except Exception:
-        return False
-
-
-def _glm_keepalive_thinking_locked(model_name):
-    """GLM 强制思考模型判定：思考没有关闭档，保活不得翻转成 disabled。
-
-    能力表里 glm-5.3 / glm-5.3-flash 强制思考（thinking.type=disabled 直接
-    报错），无 off/on 关闭档即视为强制思考。显式限定 GLM 家族：Kimi-K3、
-    kimi-for-coding、minimax 等同样没有关闭档的非 GLM 模型不进此分支，
-    其保活快照保持既有字节不变。
-    """
-    if not _is_glm_family(model_name):
-        return False
-    from core.reasoning_capabilities import get_reasoning_capability
-
-    capability = get_reasoning_capability(model_name)
-    if capability.kind == "hidden":
-        return False
-    return not ({"off", "on"} & set(capability.options))
-
-
-def _uses_deepseek_prompt_ledger(
-    model_name, api_base, cache_scope, persist, parent_session
-):
-    """Select the isolated ledger only for official DeepSeek main sessions."""
-    return bool(
-        persist
-        and parent_session
-        and str(cache_scope or "main") == "main"
-        and _is_deepseek_family(model_name, api_base)
-        and _is_official_deepseek_route(api_base)
-    )
-
-
-def _select_request_tools_for_route(model_name, api_base, tools, model_cfg=None):
-    """Canonicalize tools for cache-optimized routes; preserve every other provider payload.
-
-    覆盖官方 DeepSeek 路由、Qwen session-cache 路由（官方百炼或
-    enable_prompt_cache 配置）以及仅配置 enable_cache_control 的 Qwen
-    第三方网关——tools 字母序是缓存前缀字节稳定的前提，任何开启缓存
-    优化的路由都必须排序，否则 MCP 工具顺序一抖动前缀整体失效。
-    """
-    canonicalize = (
-        _is_deepseek_family(model_name, api_base)
-        and _is_official_deepseek_route(api_base)
-    ) or _qwen_cache_enabled(model_name, api_base, model_cfg) or (
-        _qwen_cache_control_configured(model_name, api_base, model_cfg)
-    )
-    if not canonicalize:
-        return tools
-    selected = deepcopy(list(tools or []))
-    return sorted(
-        selected,
-        key=lambda tool: str(tool.get("function", {}).get("name") or ""),
-    )
-
-
-def _deepseek_stable_header_matches(generation, current_messages, current_tools):
-    """Compare the stable request header represented by this OpenAI payload."""
-    if generation["tools"] != current_tools:
-        return False
-    old_messages = generation["messages"]
-    if not old_messages or not current_messages:
-        return old_messages == current_messages
-    old_system = old_messages[0] if old_messages[0].get("role") == "system" else None
-    current_system = (
-        current_messages[0] if current_messages[0].get("role") == "system" else None
-    )
-    return old_system == current_system
-
-
-def _new_tail_after_ledger_prefix(ledger_messages, current_messages):
-    """Return the append-only tail without trusting rewritten normal history.
-
-    The common case is a literal prefix.  After normal-history maintenance, the
-    immutable ledger prefix may no longer occur in full; in that case its final
-    message must occur exactly once in the current request and acts as the
-    explicit hand-off boundary.  Ambiguous or missing boundaries fail loudly.
-    """
-    if current_messages[:len(ledger_messages)] == ledger_messages:
-        return deepcopy(current_messages[len(ledger_messages):])
-    if not ledger_messages:
-        return deepcopy(current_messages)
-    boundary = ledger_messages[-1]
-    matches = [
-        index for index, message in enumerate(current_messages)
-        if message == boundary
-    ]
-    if len(matches) != 1:
-        raise RuntimeError(
-            "DeepSeek prompt 账本无法与当前历史建立唯一追加边界"
-        )
-    return deepcopy(current_messages[matches[0] + 1:])
-
-
-def _prepare_deepseek_ledger_request(
-    manager, session_name, model_name, api_base, cache_scope, messages, tools,
-    *, force_new=False
-):
-    """Build and persist the immutable request view for one DeepSeek call."""
-    generation = manager.get_or_create_deepseek_prompt_generation(
-        session_name,
-        model_name,
-        api_base,
-        cache_scope,
-        deepcopy(messages),
-        deepcopy(tools),
-        force_new=force_new,
-    )
-    if generation.get("created"):
-        return {
-            "generation_id": generation["id"],
-            "messages": generation["messages"],
-            "tools": generation["tools"],
-        }
-    if not _deepseek_stable_header_matches(generation, messages, tools):
-        generation = manager.get_or_create_deepseek_prompt_generation(
-            session_name,
-            model_name,
-            api_base,
-            cache_scope,
-            deepcopy(messages),
-            deepcopy(tools),
-            force_new=True,
-        )
-        return {
-            "generation_id": generation["id"],
-            "messages": generation["messages"],
-            "tools": generation["tools"],
-        }
-    try:
-        tail = _new_tail_after_ledger_prefix(generation["messages"], messages)
-    except RuntimeError:
-        generation = manager.get_or_create_deepseek_prompt_generation(
-            session_name,
-            model_name,
-            api_base,
-            cache_scope,
-            deepcopy(messages),
-            deepcopy(tools),
-            force_new=True,
-        )
-        return {
-            "generation_id": generation["id"],
-            "messages": generation["messages"],
-            "tools": generation["tools"],
-        }
-    if tail:
-        manager.append_deepseek_prompt_messages(
-            generation["id"], tail, expected_count=len(generation["messages"])
-        )
-        generation["messages"].extend(tail)
-    return {
-        "generation_id": generation["id"],
-        "messages": generation["messages"],
-        "tools": generation["tools"],
-    }
-
-
-def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
-    if not _is_deepseek_family(model_name, api_base):
-        return False
-    cfg = model_cfg or {}
-    if isinstance(cfg.get("enable_thinking"), bool):
-        return cfg["enable_thinking"]
-    if not _is_official_deepseek_route(api_base):
-        return False
-    model = str(model_name or "").split("/")[-1].lower()
-    return "v4" in model or "reasoner" in model
-
-
-def _supports_cache_keepalive(model_name, api_base="", model_cfg=None):
-    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi/智谱/百炼官方路由（或 Qwen 显式配置开启缓存）。"""
-    return (
-        _is_kimi_family(model_name, api_base)
-        and _is_official_kimi_route(api_base)
-    ) or (
-        _is_deepseek_family(model_name, api_base)
-        and _is_official_deepseek_route(api_base)
-    ) or (
-        _is_glm_family(model_name, api_base)
-        and _is_official_zhipu_route(api_base)
-    ) or _qwen_cache_enabled(model_name, api_base, model_cfg)
-
-
-def _supports_reasoning_fields(model_name, api_base=""):
-    prefix = str(model_name or "").split("/")[0].lower()
-    if prefix in _REASONING_FIELD_PROVIDERS:
-        return True
-    # Kimi / DeepSeek / Qwen 推理模型（含各类经销商 openai/ 路由）：多轮工具调用要求 assistant
-    # 消息保留 reasoning_content，剥掉会导致 400、推理链断裂或 KV cache 前缀断层失效
-    return (
-        _is_kimi_family(model_name, api_base)
-        or _is_deepseek_family(model_name, api_base)
-        or _is_qwen_family(model_name, api_base)
-    )
-
-
-def _requires_tool_call_reasoning(model_name, api_base=""):
-    """DeepSeek thinking 模式：带 tool_calls 的 assistant 必须回传 reasoning_content key。"""
-    try:
-        from core.model_manager import get_model_config_by_litellm_model
-        model_cfg = get_model_config_by_litellm_model(model_name, api_base) or {}
-    except Exception:
-        model_cfg = {}
-    return _deepseek_thinking_enabled(model_name, api_base, model_cfg)
-
-
-# 需要显式 cache_control 标记才启用 prompt caching 的 provider 白名单（按 litellm 前缀）：
-#   - anthropic: 必须显式标记，命中后缓存 token 按 1/10 计费
-# Qwen 不在此白名单里，但走官方百炼路由或 config.json 显式声明
-# enable_cache_control / cache_control 时同样启用（见 _supports_cache_control）；
-# 其余 OpenAI 兼容网关默认不标记——隐式缓存本就命中，而显式标记可能被严格校验的
-# 网关拒绝为 400（真被拒绝时由 _disable_cache_control_route 临时降级兜底）。
-_CACHE_CONTROL_PROVIDERS = ("anthropic",)
-
-# 被上游以 400 明确拒绝过 cache_control 的路由 -> 恢复时间戳（monotonic）。
-# 只临时拉黑：一次误判（例如中转站偶发的参数校验抖动）不该把该路由的优化
-# 永久关掉直到进程重启，到期后自动再给一次机会。
-_cache_control_disabled_routes = {}
-_cache_control_disabled_lock = threading.RLock()
-_CACHE_CONTROL_REJECTION_TTL_SECONDS = 900.0
-
-
-def _cache_control_route_key(model_name, api_base):
-    return (str(model_name or ""), str(api_base or "").rstrip("/").lower())
-
-
-def _disable_cache_control_route(model_name, api_base, ttl_seconds=None):
-    """临时禁用某路由的 cache_control 标记，返回被拉黑的路由 key。"""
-    ttl = (
-        _CACHE_CONTROL_REJECTION_TTL_SECONDS
-        if ttl_seconds is None else float(ttl_seconds)
-    )
-    key = _cache_control_route_key(model_name, api_base)
-    with _cache_control_disabled_lock:
-        _cache_control_disabled_routes[key] = time.monotonic() + ttl
-    return key
-
-
-def _cache_control_route_disabled(model_name, api_base):
-    """该路由是否仍在 cache_control 拉黑期内（过期条目顺手清理）。"""
-    key = _cache_control_route_key(model_name, api_base)
-    now = time.monotonic()
-    with _cache_control_disabled_lock:
-        expire_at = _cache_control_disabled_routes.get(key)
-        if expire_at is None:
-            return False
-        if expire_at <= now:
-            _cache_control_disabled_routes.pop(key, None)
-            return False
-        return True
-
-
-def _is_cache_control_rejection(api_err):
-    """判定上游是否以 400/bad request 明确拒绝了 cache_control 字段。
-
-    必须同时满足两个条件，缺一不判：
-    1. 状态码确为 400（或类型是 litellm 的 BadRequestError）；
-    2. 错误文本点名 cache_control / ephemeral 这类缓存断点字段。
-    只按文案关键词（"400"/"invalid"/"schema"）宽泛匹配的话，一次无关故障
-    （网络抖动文案里带字节数、上游 5xx）就会把该路由的优化整体关掉。
-    """
-    if api_err is None:
-        return False
-    is_bad_request = (
-        getattr(api_err, "status_code", None) == 400
-        or type(api_err).__name__ == "BadRequestError"
-    )
-    if not is_bad_request:
-        return False
-    text = str(api_err).lower()
-    return "cache_control" in text or "cache control" in text or "ephemeral" in text
-
-
-def _supports_cache_control(model_name, api_base="", model_cfg=None):
-    """判断 provider 是否支持 cache_control 字段。
-
-    保守策略：
-    - Anthropic：始终支持
-    - Qwen 家族：官方百炼路由默认启用；第三方网关若配置了 enable_cache_control / cache_control 则启用
-    - 若先前已被上游 400 拒绝，降级一段时间（TTL 到期后自动恢复）
-    """
-    if _cache_control_route_disabled(model_name, api_base):
-        return False
-
-    prefix = str(model_name or "").split("/")[0].lower()
-    if prefix in _CACHE_CONTROL_PROVIDERS:
-        return True
-
-    return _qwen_cache_control_configured(model_name, api_base, model_cfg)
-
-
-def _tool_contract_fingerprint(tools):
-    """返回最终工具 schema 的确定性指纹，用于隔离不同请求契约的缓存通道。"""
-    payload = json.dumps(
-        tools or [],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
-
-def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disabled=False):
-    """给消息列表加 cache_control 标记，启用 provider 侧 prompt caching。
-
-    标记策略：
-    - system 消息：必缓存（固定前缀，单次会话内不变）
-    - 最后一条 assistant 消息：设置缓存边界。
-      选择 assistant 而非倒数第 2 条，是因为工具轮次中 messages[-2] 可能是 tool 结果
-      而非稳定前缀（多 tool 结果会让断点每轮移动，二级缓存几乎永远 miss）。
-      最后一条 assistant 消息是上一轮的回复，在当前轮 tool 调用期间保持稳定，
-      provider 可以缓存到该位置，下一轮 tool 结果追加时前缀稳定命中。
-    - 尾部 user 消息（Qwen 分支）：把本轮新增内容当场写入缓存，省掉一个轮次的
-      miss 窗口。详见下方第 3 步注释。
-
-    Anthropic / DashScope 限制：单次请求最多 4 个 cache_control 标记。
-    本策略最多用 3 个（system + 上一条 assistant + 尾部 user），留 1 个余量。
-
-    对于 DashScope / Qwen 兼容模式：格式为 content 文本块内的 cache_control: {"type": "ephemeral"}；
-    对于 Anthropic 协议：格式为消息顶层 cache_control: {"type": "ephemeral"}，由 LiteLLM 处理。
-
-    本函数原地修改并返回 messages；调用方已通过 _strip_media_and_merge 处理过副本，
-    不会污染 messages 列表本身。
-    """
-    if disabled:
-        return messages
-    if not _supports_cache_control(model_name, api_base, model_cfg):
-        return messages
-    if not messages:
-        return messages
-
-    is_qwen = _is_qwen_family(model_name, api_base)
-
-    # 清除已有标记，避免累积（_strip_media_and_merge 不传 cache_control，但兜底防御）
-    for msg in messages:
-        if isinstance(msg, dict):
-            msg.pop("cache_control", None)
-            content = msg.get("content")
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict):
-                        item.pop("cache_control", None)
-
-    def _mark_message(msg):
-        """打缓存断点；返回是否实际标上（Qwen 空文本 content 打不上块标记）。"""
-        if is_qwen:
-            content = msg.get("content")
-            if isinstance(content, str) and content:
-                msg["content"] = [
-                    {
-                        "type": "text",
-                        "text": content,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
-                return True
-            if isinstance(content, list) and content:
-                for item in reversed(content):
-                    if isinstance(item, dict) and item.get("type") in ("text", "input_text"):
-                        item["cache_control"] = {"type": "ephemeral"}
-                        return True
-                return False
-            return False
-        msg["cache_control"] = {"type": "ephemeral"}
-        return True
-
-    # 1. 标记 system 消息（如果有）
-    if messages[0].get("role") == "system":
-        _mark_message(messages[0])
-
-    # 2. 标记最后一条 assistant 消息（缓存边界）
-    #    遍历从后往前找第一条 role=="assistant" 的消息。
-    #    如果最后一条已经是 assistant（无 tool 调用），就标它；
-    #    如果末尾是 tool 结果，就标它们之前的 assistant（更稳定）。
-    #    Qwen 空文本 assistant（纯工具调用轮的典型形态）打不上 content 块
-    #    断点，且 tool 消息受协议约束不可标记：继续向前找最近一条可标记的
-    #    assistant。否则工具循环内的各 Step 只剩 system 断点，循环新增内容
-    #    （用户问题 + 全部工具结果）每步全额 miss；把边界推进到循环前最后
-    #    一条文本 assistant，至少让前缀覆盖到循环起点，且与上一轮请求字节
-    #    （该 assistant 当时已带标记）保持一致。
-    last_assistant_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "assistant":
-            last_assistant_idx = i
-            if _mark_message(messages[i]):
-                break
-
-    # 3. 尾部断点（仅 Qwen content 块形态）：把本轮新增内容立刻写进缓存，
-    #    下一轮的前缀就能覆盖到它——稳态 miss 从「上一轮 + 本轮新增」降到
-    #    「仅本轮新增」。基元律动实测：热轮 miss 105 → 52 token，hot_rate +0.43pp。
-    #    约束：
-    #    - 只标 user 尾部。tool 消息在 OpenAI 兼容协议里 content 必须是字符串，
-    #      改成 content 块会被上游判非法载荷；工具轮次里新增的 tool 结果本来就在
-    #      下一个 assistant 断点之前，会随断点前移被写入缓存，无需额外标记。
-    #    - 尾部已是刚标过的 assistant 时不重复标记（省断点配额）。
-    #    - 与 system、上一条 assistant 合计 3 个，仍低于 provider 的 4 个上限。
-    if is_qwen and len(messages) - 1 != last_assistant_idx:
-        tail = messages[-1]
-        if isinstance(tail, dict) and tail.get("role") == "user":
-            _mark_message(tail)
-
-    return messages
-
-
-# _supports_vision 结果缓存（30s TTL）：该函数在工具循环里每轮都会被调用
-# （最多 100 次/用户轮），底层的 litellm.supports_vision 查表并不便宜。
-_vision_support_cache = {}
-_vision_support_cache_lock = threading.RLock()
-
-
-def _supports_vision(model_name):
-    """判断模型是否支持图像输入。
-
-    判定顺序：
-    1. 模型配置中的 supports_vision 显式标注（config.json 的 models 条目，可选）
-    2. LiteLLM 内置模型信息（知名模型）
-    3. 未知模型默认按不支持处理，避免把 image_url 负载发给纯文本模型触发
-       "Model only support text input" 等 400 错误
-    """
-    if not model_name:
-        return False
-    with _vision_support_cache_lock:
-        return _supports_vision_locked(model_name)
-
-
-def _supports_vision_locked(model_name):
-    cached = _vision_support_cache.get(model_name)
-    if cached is not None and cached[1] > time.monotonic():
-        return cached[0]
-    result = False
-    try:
-        from core.model_manager import load_config
-        for provider in load_config().get("providers", []):
-            for model in provider.get("models", []):
-                if model.get("litellm_model") == model_name and "supports_vision" in model:
-                    result = bool(model["supports_vision"])
-                    _vision_support_cache[model_name] = (result, time.monotonic() + 30)
-                    return result
-    except Exception:
-        pass
-    try:
-        if _litellm_supports_vision(model_name):
-            result = True
-    except Exception:
-        pass
-    _vision_support_cache[model_name] = (result, time.monotonic() + 30)
-    return result
-
-
-def _flatten_media_content(content_list):
-    """把多模态 list 内容折叠为纯文本：图片用短占位符，文档也折叠为占位说明，绝不内联原始 base64 数据。"""
-    text_parts = []
-    for item in content_list:
-        if isinstance(item, dict):
-            item_type = item.get("type")
-            if item_type == "text":
-                text_parts.append(item.get("text", ""))
-            elif item_type in ("image", "image_url"):
-                text_parts.append("[图片]")
-            elif item_type == "document":
-                text_parts.append("[文档]")
-            else:
-                text_parts.append(str(item)[:200])
-        else:
-            text_parts.append(str(item))
-    return " ".join(text_parts)
-
-
-def _strip_media_and_merge(messages, model_name=None, api_base=""):
-    """
-    1. 视觉输入处理：支持视觉的模型保留最近一条消息中的图片/视频（多模态负载原样透传），
-       更早的历史图片一律折叠为占位符，避免每轮重复发送烧 Token；
-       不支持视觉的模型把图片折叠为占位符（绝不把 base64 当文本发给模型）。
-       文档/文本文件已在 input_parser 中转为普通文本，此处不视为视觉输入。
-    2. 合并连续相同 role 的消息，满足 LiteLLM / Anthropic 对 user/assistant 严格轮流的要求
-    3. reasoning_content / thinking_blocks 仅对支持的 provider 完整回传，避免其他
-       provider 报 400，同时保持 Kimi 等模型要求的连续 provider 消息信封
-
-    返回 (fixed_messages, folded_media_count, keep_media)。
-    """
-    keep_reasoning_fields = _supports_reasoning_fields(model_name, api_base)
-    keep_thinking_blocks = str(model_name or "").split("/")[0].lower() == "anthropic"
-    keep_media = _supports_vision(model_name)
-
-    # 仅保留最近一条用户消息中的视觉输入（图片/视频），
-    # 更早的历史图片全部折叠为占位符，避免重复发送、浪费 Token。
-    last_media_idx = -1
-    if keep_media:
-        for idx in range(len(messages) - 1, -1, -1):
-            msg = messages[idx]
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if isinstance(content, list) and any(
-                isinstance(item, dict) and item.get("type") in ("image", "image_url")
-                for item in content
-            ):
-                last_media_idx = idx
-            break
-
-    folded_count = 0
-    cleaned = []
-    for idx, msg in enumerate(messages):
-        role = msg.get("role")
-        content = msg.get("content")
-
-        if isinstance(content, list):
-            if idx == last_media_idx:
-                # 多模态负载保留，模型按 image_url 接收图片；
-                # 剥离本地私有的 source_path 字段，避免严格校验的 provider 报 400
-                cleaned_msg = {"role": role, "content": [
-                    {k: v for k, v in item.items() if k != "source_path"}
-                    if isinstance(item, dict) else item
-                    for item in content
-                ]}
-            else:
-                cleaned_msg = {"role": role, "content": _flatten_media_content(content)}
-                folded_count += sum(
-                    1
-                    for item in content
-                    if isinstance(item, dict) and item.get("type") in ("image", "image_url")
-                )
-        else:
-            cleaned_msg = {"role": role, "content": str(content) if content is not None else ""}
-
-        # 保留工具链和 provider 原生推理字段，避免工具轮次破坏签名思考块。
-        if "tool_calls" in msg and msg["tool_calls"]:
-            cleaned_msg["tool_calls"] = msg["tool_calls"]
-        if "tool_call_id" in msg:
-            cleaned_msg["tool_call_id"] = msg["tool_call_id"]
-        if "name" in msg:
-            cleaned_msg["name"] = msg["name"]
-        # 支持原生推理字段的 provider 需要收到自己上轮返回的完整消息信封。
-        # 是否存在 tool_calls 不能作为删除条件：Kimi OpenAI 路由会在普通 assistant
-        # 消息中返回 reasoning_content，Anthropic 路由还可能返回签名 thinking_blocks。
-        if keep_reasoning_fields and msg.get("reasoning_content") is not None:
-            cleaned_msg["reasoning_content"] = msg["reasoning_content"]
-        if keep_reasoning_fields and keep_thinking_blocks and msg.get("thinking_blocks") is not None:
-            cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
-        # DeepSeek thinking 契约：带 tool_calls 的 assistant 必须携带
-        # reasoning_content 字符串字段。流组装层正常会保留显式空串；但
-        # 从数据库重建或中途切换思考开关的历史消息可能缺失该字段（None
-        # 或非字符串），这里回填空串占位，避免整轮请求被契约校验卡死。
-        if (
-            role == "assistant"
-            and cleaned_msg.get("tool_calls")
-            and _requires_tool_call_reasoning(model_name, api_base)
-            and not isinstance(cleaned_msg.get("reasoning_content"), str)
-        ):
-            cleaned_msg["reasoning_content"] = ""
-
-        # 净化 assistant 消息：若 content 包含 protocol sanitised 占位符且有 tool_calls/reasoning，将 content 重置为空字符串
-        if role == "assistant" and isinstance(cleaned_msg.get("content"), str):
-            if "[System: Empty message content sanitised to satisfy protocol]" in cleaned_msg["content"]:
-                cleaned_msg["content"] = ""
-
-        # 过滤完全没有内容的空白 assistant 消息（无 content, 无 tool_calls, 无 reasoning）
-        if role == "assistant":
-            has_text = bool(cleaned_msg.get("content"))
-            has_tools = bool(cleaned_msg.get("tool_calls"))
-            has_reasoning = bool(cleaned_msg.get("reasoning_content") or cleaned_msg.get("thinking_blocks"))
-            if not (has_text or has_tools or has_reasoning):
-                continue
-
-        cleaned.append(cleaned_msg)
-        
-    # 合并同角色消息 (注意：不要合并有 tool_calls 或 role 是 tool/system 的消息)
-    fixed = []
-    if cleaned:
-        fixed.append(cleaned[0])
-        for msg in cleaned[1:]:
-            can_merge = (
-                msg["role"] == fixed[-1]["role"] and
-                msg["role"] not in ("tool", "system") and
-                "tool_calls" not in msg and
-                "tool_calls" not in fixed[-1] and
-                "reasoning_content" not in msg and
-                "reasoning_content" not in fixed[-1] and
-                "thinking_blocks" not in msg and
-                "thinking_blocks" not in fixed[-1] and
-                # 多模态 list 内容不参与文本合并
-                not isinstance(msg["content"], list) and
-                not isinstance(fixed[-1]["content"], list)
-            )
-            if can_merge:
-                fixed[-1]["content"] = (fixed[-1]["content"] or "") + "\n" + (msg["content"] or "")
-            else:
-                fixed.append(msg)
-    return fixed, folded_count, keep_media
-
-
-def _resolve_cache_session_identity(cache_session_id=None):
-    """解析请求所属会话；后台任务可用捕获值覆盖当前 UI 会话。"""
-    global _process_cache_key_fallback
-    sid = str(cache_session_id or "").strip()
-    if not sid:
-        try:
-            sid = str(app_context.get_current_session() or "").strip()
-        except Exception:
-            sid = ""
-    if not sid:
-        if not _process_cache_key_fallback:
-            _process_cache_key_fallback = uuid.uuid4().hex
-        sid = _process_cache_key_fallback
-    return sid
-
-
-def _cache_affinity_session_id(
-    *,
-    cache_scope="main",
-    model_name="",
-    api_base="",
-    tool_contract="",
-    cache_session_id=None,
-):
-    """返回 Kimi prompt 缓存亲和使用的会话级隔离 ID。
-
-    Moonshot 后端是多集群架构，请求带 prompt_cache_key（OpenAI 路由）或
-    metadata.user_id（Anthropic 路由）时，网关会把同 ID 的请求优先路由到
-    持有其前缀 KV cache 的集群，显著提高缓存命中率（命中部分自动折扣计费）。
-    官方建议该值在会话生命周期内保持稳定，会话恢复后沿用原值——正好对应
-    app_context 的 current_session；后台任务可显式传入启动时捕获的父会话，避免 UI
-    切换会话后串线。原始会话名只参与 SHA-256，不发送给 provider。
-
-    通道维度包含角色、模型、API 路由与工具契约。这样主代理、不同子代理角色、
-    不同工具 schema 不会共用同一个 prompt_cache_key。
-    """
-    sid = _resolve_cache_session_identity(cache_session_id)
-
-    session_hash = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:12]
-    lane_material = json.dumps(
-        {
-            "scope": str(cache_scope or "main"),
-            "model": str(model_name or "").lower(),
-            "api_base": str(api_base or "").rstrip("/").lower(),
-            "tool_contract": str(tool_contract or ""),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    lane_hash = hashlib.sha256(lane_material.encode("utf-8")).hexdigest()[:16]
-    return f"ycode-{session_hash}-{lane_hash}"
-
-
-_process_cache_key_fallback = None
-
-_REASONING_EFFORT_LEVELS = ("low", "high", "max")
-_K3_REASONING_MODEL_NAMES = frozenset(
-    {"k3", "k3-256k", "kimi-k3", "kimi-k3-256k"}
-)
-# 阶跃星辰 Anthropic 兼容端点（/step_plan/v1/messages）不接受 Anthropic 原生
-# thinking/budget_tokens，推理深度由官方扩展字段 output_config.effort 控制
-# （step-3.7-flash 取 low/medium/high）。litellm ≥1.92 原生透传该字段。
-_STEPFUN_ANTHROPIC_EFFORT_MODELS = frozenset(
-    {"step-3.7-flash", "step-router-v1"}
-)
-_ANTHROPIC_REASONING_BUDGETS = {
-    "low": 1024,
-    "high": 4096,
-    "max": 16384,
-}
-
-
-def _attach_kimi_request_extras(
-    result,
-    model_name,
-    model_cfg,
-    *,
-    api_base="",
-    cache_scope="main",
-    cache_session_id=None,
-    tool_contract="",
-):
-    """给 Kimi 系模型的请求参数附加缓存亲和配置（原地修改 result）。
-
-    - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id。
-    """
-    anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
-
-    session_id = None
-    if _is_official_kimi_route(api_base):
-        session_id = _cache_affinity_session_id(
-            cache_scope=cache_scope,
-            model_name=model_name,
-            api_base=api_base,
-            tool_contract=tool_contract,
-            cache_session_id=cache_session_id,
-        )
-    if session_id:
-        if anthropic_route:
-            result.setdefault("metadata", {"user_id": session_id})
-        else:
-            result.setdefault("extra_body", {})["prompt_cache_key"] = session_id
-
-
-def _attach_qwen_request_extras(
-    result,
-    model_name,
-    model_cfg,
-    *,
-    api_base="",
-    cache_scope="main",
-    cache_session_id=None,
-    tool_contract="",
-):
-    """给 Qwen 系模型的请求参数附加缓存优化配置（原地修改 result）。
-
-    - 官方路由（dashscope.aliyuncs.com 等）或配置显式开启缓存：
-      主会话、基准测试及子代理请求（main, benchmark:main, subagent:*）
-      附加 extra_headers={"x-dashscope-session-cache": "enable"}
-      开启服务端多轮会话自动上下文缓存。
-    """
-    scope_str = str(cache_scope or "main")
-    scope_eligible = scope_str in {"main", "benchmark:main"} or scope_str.startswith("subagent")
-    if scope_eligible and _qwen_cache_enabled(model_name, api_base, model_cfg):
-        if not isinstance(result.get("extra_headers"), dict):
-            result["extra_headers"] = {}
-        result["extra_headers"]["x-dashscope-session-cache"] = "enable"
-
-
-def _configured_reasoning_choice(model_cfg, capability):
-    """把新选择字段和历史配置统一成能力表中的一个合法选择。"""
-    configured_choice = str(model_cfg.get("reasoning_choice") or "").strip().lower()
-    if configured_choice:
-        if configured_choice not in capability.options:
-            raise ValueError(
-                f"模型不支持思考选项 {configured_choice!r}，"
-                f"仅支持 {', '.join(capability.options) or '固定开启'}"
-            )
-        return configured_choice
-
-    legacy_enabled = model_cfg.get("enable_thinking")
-    if legacy_enabled is False and "off" in capability.options:
-        return "off"
-
-    legacy_effort = str(model_cfg.get("reasoning_effort") or "").strip().lower()
-    if legacy_effort:
-        if legacy_effort not in capability.options:
-            raise ValueError(
-                f"模型 reasoning_effort={legacy_effort!r} 不受支持，"
-                f"仅支持 {', '.join(capability.options) or '固定开启'}"
-            )
-        return legacy_effort
-
-    if legacy_enabled is True and "on" in capability.options:
-        return "on"
-    return "default"
-
-
-def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=False):
-    """按模型能力表把思考选择编码为该模型的精确请求参数。"""
-    from core.reasoning_capabilities import (
-        get_reasoning_capability,
-        normalize_reasoning_model_name,
-    )
-
-    capability = get_reasoning_capability(model_name)
-    has_explicit_choice = bool(str(model_cfg.get("reasoning_choice") or "").strip())
-    has_legacy_choice = (
-        bool(str(model_cfg.get("reasoning_effort") or "").strip())
-        or isinstance(model_cfg.get("enable_thinking"), bool)
-    )
-    if not has_explicit_choice and not has_legacy_choice:
-        return capability
-
-    if capability.kind == "hidden":
-        if has_explicit_choice:
-            raise ValueError(f"模型 {model_name!r} 没有已确认的思考参数能力")
-        return capability
-    if capability.kind == "fixed":
-        if has_explicit_choice:
-            raise ValueError(f"模型 {model_name!r} 的思考固定开启，不能设置思考选项")
-        logger.info("模型 %s 的思考固定开启，忽略历史思考配置", model_name)
-        return capability
-
-    choice = _configured_reasoning_choice(model_cfg, capability)
-    if choice == "default":
-        return capability
-
-    strategy = capability.request_strategy
-    if strategy == "always_on_effort":
-        if anthropic_route:
-            normalized_model = normalize_reasoning_model_name(model_name)
-            if normalized_model in _STEPFUN_ANTHROPIC_EFFORT_MODELS:
-                # 阶跃 Anthropic 兼容路由：思考深度用官方 output_config.effort 表达，
-                # 不接受 K3 那套 thinking.budget_tokens（服务端按未列字段拒绝）。
-                result["output_config"] = {"effort": choice}
-                result["allowed_openai_params"] = ["output_config"]
-                return capability
-            if normalized_model not in _K3_REASONING_MODEL_NAMES:
-                raise ValueError("Anthropic 路由不支持该模型的 reasoning_effort 参数")
-            budget_tokens = _ANTHROPIC_REASONING_BUDGETS[choice]
-            result["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": budget_tokens,
-            }
-            result["max_tokens"] = max(
-                int(result.get("max_tokens") or 0), budget_tokens + 1
-            )
-        else:
-            result.setdefault("extra_body", {})["reasoning_effort"] = choice
-    elif strategy == "thinking_object_effort":
-        enabled = choice != "off"
-        result.setdefault("extra_body", {})["thinking"] = {
-            "type": "enabled" if enabled else "disabled"
-        }
-        if enabled:
-            result["reasoning_effort"] = choice
-            result["allowed_openai_params"] = ["reasoning_effort"]
-        else:
-            result.pop("reasoning_effort", None)
-    elif strategy == "enable_thinking_effort":
-        enabled = choice != "off"
-        extra_body = result.setdefault("extra_body", {})
-        extra_body["enable_thinking"] = enabled
-        if enabled:
-            extra_body["reasoning_effort"] = choice
-        else:
-            extra_body.pop("reasoning_effort", None)
-    elif strategy == "effort_switch":
-        result["reasoning_effort"] = "none" if choice == "off" else choice
-        result["allowed_openai_params"] = ["reasoning_effort"]
-    elif strategy == "thinking_object_toggle":
-        result.setdefault("extra_body", {})["thinking"] = {
-            "type": "enabled" if choice == "on" else "disabled"
-        }
-    elif strategy == "enable_thinking_toggle":
-        result.setdefault("extra_body", {})["enable_thinking"] = choice == "on"
-    elif strategy == "agnes_enable_thinking":
-        # Agnes AI 的 OpenAI 兼容接口把思考开关嵌套在 chat_template_kwargs 下。
-        result.setdefault("extra_body", {}).setdefault(
-            "chat_template_kwargs", {}
-        )["enable_thinking"] = choice == "on"
-    else:
-        raise ValueError(f"未实现的思考请求策略: {strategy}")
-    return capability
-
-
-def _assert_reasoning_request_consistent(result, capability):
-    """禁止把思考强度单独发送给需要显式开启思考的模型。"""
-    extra_body = result.get("extra_body") or {}
-    top_level_thinking_enabled = (
-        (result.get("thinking") or {}).get("type") == "enabled"
-    )
-    extra_thinking_disabled = (
-        (extra_body.get("thinking") or {}).get("type") == "disabled"
-        or extra_body.get("enable_thinking") is False
-    )
-    if top_level_thinking_enabled and extra_thinking_disabled:
-        raise ValueError("请求同时包含开启和关闭两套冲突的思考参数")
-    has_effort = "reasoning_effort" in result or "reasoning_effort" in extra_body
-    if not has_effort:
-        return
-
-    strategy = capability.request_strategy
-    if strategy in {"always_on_effort", "effort_switch"}:
-        return
-    if strategy == "thinking_object_effort":
-        enabled = (extra_body.get("thinking") or {}).get("type") == "enabled"
-    elif strategy == "enable_thinking_effort":
-        enabled = extra_body.get("enable_thinking") is True
-    else:
-        enabled = False
-    if not enabled:
-        raise ValueError("请求包含思考强度，但未开启思考")
-
-
-def _provider_cache_affinity_options(
-    model_name,
-    api_base,
-    *,
-    cache_scope,
-    cache_session_id=None,
-    tool_contract="",
-):
-    """仅返回 provider 缓存亲和参数，不改变输出长度或推理配置。"""
-    result = {}
-    if _is_kimi_family(model_name, api_base):
-        _attach_kimi_request_extras(
-            result,
-            model_name,
-            {},
-            api_base=api_base,
-            cache_scope=cache_scope,
-            cache_session_id=cache_session_id,
-            tool_contract=tool_contract,
-        )
-    elif _is_qwen_family(model_name, api_base):
-        _attach_qwen_request_extras(
-            result,
-            model_name,
-            {},
-            api_base=api_base,
-            cache_scope=cache_scope,
-            cache_session_id=cache_session_id,
-            tool_contract=tool_contract,
-        )
-    return result
-
-
-_BUILTIN_DEFAULT_MAX_TOKENS = 32000
-
-
-def _builtin_default_max_tokens(model_name, api_base=""):
-    """返回内置默认输出上限（config.json 未显式配置 max_tokens 时使用）。
-
-    规则按序匹配，先命中先返回；仅看模型名与路由，不读取用户配置。
-    """
-    model = str(model_name or "").split("/")[-1].lower()
-    base = str(api_base or "").lower()
-    if "kimi-k2.7-code" in model and "tokenrhythm.studio" in base:
-        return 16000
-    if _is_deepseek_family(model_name, api_base):
-        return 384000
-    if _is_glm_family(model_name, api_base):
-        if "glm-5.3" in model:
-            return 131000
-        if "glm-5" in model:
-            return 128000
-        return _BUILTIN_DEFAULT_MAX_TOKENS
-    if _is_qwen_family(model_name, api_base):
-        return 131000
-    if "kimi-k2.5" in model:
-        return 64000
-    if "kimi-k2.6" in model:
-        return 128000
-    if "kimi-k2.7-code" in model:
-        return 128000
-    if "k3" in model:
-        return 131072
-    if "longcat" in model:
-        return 128000
-    if "seed-2.1-pro" in model or "seed-2.1-turbo" in model:
-        return 131000
-    if "mimo-v2.5-pro" in model:
-        return 256000
-    if "minimax-m2.5" in model:
-        return 200000
-    if "minimax-m2.7" in model:
-        return 192000
-    return _BUILTIN_DEFAULT_MAX_TOKENS
-
-
-def _provider_request_options(
-    model_name,
-    api_base,
-    *,
-    model_id=None,
-    cache_scope="main",
-    cache_session_id=None,
-    tool_contract="",
-):
-    """Return options required by a known provider/model pair.
-
-    优先级：
-    1. config.json 中模型条目的显式 thinking_budget / max_tokens / enable_thinking
-    2. 内置模型默认输出上限表
-    3. 其他模型兜底 max_tokens=32000
-
-    无论走哪个分支，Kimi 系模型都会附加缓存亲和配置。思考参数随后按模型能力表编码。
-    """
-    normalized_base = str(api_base or "").rstrip("/").lower()
-    normalized_model = str(model_name or "").split("/")[-1].lower()
-
-    # 1. 读取用户在 config.json 中的显式配置
-    try:
-        from core.model_manager import (
-            get_model_config_by_id,
-            get_model_config_by_litellm_model,
-        )
-        model_cfg = (
-            get_model_config_by_id(model_id)
-            if model_id
-            else get_model_config_by_litellm_model(model_name, api_base)
-        ) or {}
-    except Exception:
-        if model_id:
-            raise
-        model_cfg = {}
-    if model_id and not model_cfg:
-        raise ValueError(f"未找到模型配置: {model_id}")
-
-    cfg_max_tokens = model_cfg.get("max_tokens")
-    cfg_thinking_budget = model_cfg.get("thinking_budget")
-    cfg_enable_thinking = model_cfg.get("enable_thinking")
-    has_reasoning_choice = bool(str(model_cfg.get("reasoning_choice") or "").strip())
-    has_legacy_reasoning_choice = (
-        isinstance(cfg_enable_thinking, bool)
-        or bool(str(model_cfg.get("reasoning_effort") or "").strip())
-    )
-    from core.reasoning_capabilities import get_reasoning_capability
-    configured_capability = get_reasoning_capability(model_name)
-    has_registered_reasoning = configured_capability.kind != "hidden"
-
-    # 判定同时看模型名与 api_base（经销商/聚合网关的 base_url 千奇百怪，
-    # 只认 base 会漏判，比如 api.scnet.cn 上的 Kimi-K2.6）。
-    kimi_family = _is_kimi_family(model_name, api_base)
-    deepseek_family = _is_deepseek_family(model_name, api_base)
-    deepseek_thinking = _deepseek_thinking_enabled(
-        model_name, api_base, model_cfg
-    )
-    route_prefix = str(model_name or "").split("/")[0].lower()
-    anthropic_route = route_prefix == "anthropic"
-
-    result = {}
-
-    if cfg_max_tokens is not None:
-        result["max_tokens"] = int(cfg_max_tokens)
-    else:
-        result["max_tokens"] = _builtin_default_max_tokens(model_name, api_base)
-
-    if deepseek_family:
-        if not has_reasoning_choice and (
-            not has_registered_reasoning or not has_legacy_reasoning_choice
-        ):
-            if _is_official_deepseek_route(api_base) or isinstance(cfg_enable_thinking, bool):
-                result.setdefault("extra_body", {})["thinking"] = {
-                    "type": "enabled" if deepseek_thinking else "disabled"
-                }
-            if deepseek_thinking:
-                effort = str(model_cfg.get("reasoning_effort") or "max").strip().lower()
-                if effort not in _REASONING_EFFORT_LEVELS:
-                    raise ValueError(
-                        "DeepSeek reasoning_effort 仅支持 low/high/max，"
-                        f"实际为 {effort!r}"
-                    )
-                result["reasoning_effort"] = effort
-                # LiteLLM 对尚未内置识别的 OpenAI 兼容模型会在客户端拒绝
-                # reasoning_effort。这里按参数白名单精确放行，不能用全局
-                # drop_params，否则会静默丢失用户要求的推理强度。
-                result["allowed_openai_params"] = ["reasoning_effort"]
-    elif not has_reasoning_choice and not has_registered_reasoning and (
-        cfg_max_tokens is not None
-        or cfg_thinking_budget is not None
-        or (cfg_enable_thinking is not None and not has_reasoning_choice)
-    ):
-        # thinking 仅在显式启用或配置了 budget 时注入
-        if cfg_enable_thinking is True or cfg_thinking_budget is not None:
-            budget = int(cfg_thinking_budget) if cfg_thinking_budget is not None else 2048
-            result["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            result["allowed_openai_params"] = ["thinking"]
-    elif kimi_family:
-        # 2. 内置默认表：Kimi/Moonshot 深度适配。
-        is_kimi_coding = "api.kimi.com/coding" in normalized_base
-
-        def _match_any(keys):
-            return any(k in normalized_model for k in keys)
-
-        is_k3 = _match_any(("k3",)) or "for-coding" in normalized_model
-
-        if anthropic_route:
-            # Anthropic 协议路由（api.kimi.com/coding 等 anthropic 兼容端点）：
-            # 接受 Anthropic 形状的 thinking 参数。
-            # 必须同时声明 allowed_openai_params：litellm 的客户端参数校验只把
-            # Claude 系列识别为支持 thinking 的 anthropic 模型，对 "K3" 这类陌生
-            # 模型名会直接抛 UnsupportedParamsError（请求根本发不出去），需要显式豁免。
-            if is_k3:
-                result.setdefault("thinking", {
-                    "type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048,
-                })
-            else:
-                result.setdefault("thinking", {"type": "enabled", "budget_tokens": 2048})
-            result.setdefault("allowed_openai_params", ["thinking"])
-        # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：绝不发送 Anthropic
-        # 形状的 thinking 参数——Moonshot 的 /v1/chat/completions 不认这个键，
-        # 发了会直接 400。Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生
-        # 输出 reasoning_content，无需显式开启；输出上限由内置默认表统一给出。
-
-    if kimi_family:
-        _attach_kimi_request_extras(
-            result,
-            model_name,
-            model_cfg,
-            api_base=api_base,
-            cache_scope=cache_scope,
-            cache_session_id=cache_session_id,
-            tool_contract=tool_contract,
-        )
-    if _is_qwen_family(model_name, api_base):
-        _attach_qwen_request_extras(
-            result,
-            model_name,
-            model_cfg,
-            api_base=api_base,
-            cache_scope=cache_scope,
-            cache_session_id=cache_session_id,
-            tool_contract=tool_contract,
-        )
-    capability = _apply_reasoning_choice(
-        result,
-        model_name,
-        model_cfg,
-        anthropic_route=anthropic_route,
-    )
-    _assert_reasoning_request_consistent(result, capability)
-    return result
-
 
 def _complete_thinking_blocks(delta):
     """Extract only complete provider blocks that are safe to round-trip."""
     return complete_thinking_blocks(delta)
 
-def _notify_event(event_callback, kind, payload):
-    if event_callback is not None:
-        event_callback(kind, payload)
+# _notify_event 唯一实现位于 core/permission_terminal.py，经上方 re-export
+# 进入本命名空间，此处不得保留同名副本。
 
 
 def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_cancelled, inflight_holder=None, cancel_event=None):
@@ -4023,7 +1305,9 @@ def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_ca
     “慢”与“卡死”。改为后台线程 pump + 主线程带 0.5s 超时的队列读取：
     空闲超阈值后按间隔上报等待状态，同时保持对取消事件的响应能力。
     注意：调用方提前放弃（取消/异常）时 pump 线程会继续读到流结束，线程为
-    daemon 且流自身有读超时，不会泄漏存活。
+    daemon；native 流 read 超时为 None
+    （读超时由本看门狗全权管控），因此 give-up 路径必须先经 inflight_holder
+    显式关流再抛出，否则 pump 会永久阻塞在 socket 读且 abort 再也够不到它。
     inflight_holder：本流在在飞注册表中的句柄，消费结束（无论正常/异常/取消）
     统一摘除；用户取消时流已被 abort_inflight_streams 关闭，pump 抛出的读错误
     需经 raise_if_cancelled 归一为用户取消，避免误入网络错误分支。
@@ -4050,6 +1334,20 @@ def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_ca
                 ok, item = chunks_queue.get(timeout=0.5)
             except queue.Empty:
                 idle = time.monotonic() - idle_started_at
+                if idle >= REQUEST_WAIT_GIVE_UP_SECONDS:
+                    # 连续空闲硬上限：连接已死透，继续等只会拖满整轮。
+                    # 先经注册表句柄关掉底层流再抛出：native 流无读超时，
+                    # 不关流会让 pump 线程永久阻塞且泄漏连接池名额。
+                    if inflight_holder is not None:
+                        try:
+                            inflight_holder.close()
+                        except Exception:
+                            pass
+                    raise RequestWaitGiveUpError(
+                        f"模型流式响应已连续 {int(idle)} 秒"
+                        f"（约 {int(REQUEST_WAIT_GIVE_UP_SECONDS // 60)} 分钟上限）"
+                        "无新数据，本轮已自动结束；可重试或检查模型服务状态"
+                    )
                 if (
                     idle >= WAIT_NOTICE_THRESHOLD_SECONDS
                     and time.monotonic() - last_notice_at >= WAIT_NOTICE_INTERVAL_SECONDS
@@ -4063,6 +1361,8 @@ def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_ca
                         print(f"\n[⏳ {wait_message}]")
                     else:
                         _notify_event(event_callback, "status", {"message": wait_message})
+                        # None 哨兵：消费侧转成空心跳 yield，实时冲刷积压的 status 事件
+                        yield None
                 continue
             idle_started_at = time.monotonic()
             last_notice_at = idle_started_at
@@ -4078,817 +1378,170 @@ def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_ca
         _unregister_inflight_stream(cancel_event, inflight_holder)
 
 
-def _tool_call_arguments(tc):
-    raw_arguments = tc["function"].get("arguments", "{}")
-    if not isinstance(raw_arguments, str):
-        raise ValueError("工具参数 JSON 必须是字符串")
+# --- Re-exported from core.llm_execution ---
+from core.llm_execution import (
+    CLAIM_NEGATION_PREFIXES,
+    COMMAND_TOOL_NAME_MARKERS,
+    PROMOTED_REASONING_PREVIEW_CHARS,
+    SLOW_STEP_ABORT_SECONDS,
+    SLOW_STEP_MAX_NUDGES,
+    TOOL_RESULT_EVENT_MAX_CHARS,
+    VERIFY_CLAIM_MARKERS,
+    VERIFY_CLAIM_MAX_NUDGES,
+    VERIFY_CLAIM_NUDGE_TEXT,
+    _PLAN_STATE_RESULT_TOOLS,
+    _RepeatCallGuard,
+    _TOOL_RESULT_EXEMPT,
+    _TOOL_RESULT_LIMITS,
+    _TOOL_RESULT_MAX_CHARS,
+    _TOOL_RESULT_TAIL_TOOLS,
+    _build_tool_pipeline_and_context,
+    _call_vision_model_for_content,
+    _canonical_arguments_signature,
+    _claims_verification_without_evidence,
+    _describe_images_with_secondary,
+    _escape_control_chars_in_json_strings,
+    _execute_single_tool_call,
+    _get_imom_active_publish_root,
+    _persisted_tool_calls,
+    _raw_tool_call_arguments,
+    _read_file_result_limit,
+    _read_text_with_encoding_fallback,
+    _refill_messages_after_compression,
+    _repair_truncated_json,
+    _sandbox_outside_guard,
+    _show_file_diff,
+    _step_progress_observation,
+    _tool_call_activity_kinds,
+    _tool_call_arguments,
+    _tool_call_name,
+    _tool_event_parts,
+    _tool_event_payload,
+    _tool_event_payload_from_parts,
+    _tool_finished_event_payload,
+    _tool_output_preview,
+    _tool_result_ok,
+    _tool_result_text,
+    _truncate_tool_result_for_context,
+    _unplanned_subagent_progress_part,
+    _vision_fallback_text,
+)
 
-    try:
-        arguments = json.loads(raw_arguments)
-    except ValueError as direct_error:
-        try:
-            arguments = json.loads(
-                _escape_control_chars_in_json_strings(raw_arguments)
-            )
-        except ValueError:
-            try:
-                arguments = json.loads(_repair_truncated_json(raw_arguments))
-            except ValueError as repair_error:
-                raise ValueError(
-                    f"工具参数 JSON 解析失败：{repair_error}"
-                ) from direct_error
+# ── 编排提醒：多步未建计划时的软提醒（每回合最多 1 次）────────────────
 
-    if not isinstance(arguments, dict):
-        raise ValueError("工具参数 JSON 必须是对象")
-    return arguments
+# 阈值口径：计数对象是“实质操作数”而非模型拆解出的子任务条数——前者由
+# _count_substantive_ops 统计（write_file / edit_file / 非只读 execute_command
+# 的调用数），与后者是近似映射（一步实质操作 ≈ 推进一条子任务），仅作运行时兜底
+# 估计。阈值语义是“超过 3”（即 ≥ 4）才提醒，恰好 3 步及以内不提醒，与提醒文案及
+# system_prompt.md / system_prompt_gui.md 的“子任务超过 3 条（即 ≥ 4 条）必须先用
+# plan_write、3 条及以内直接执行”保持一致。
+_ORCHESTRATION_NUDGE_THRESHOLD = 3
+_ORCHESTRATION_COUNTED_TOOLS = frozenset({"write_file", "edit_file"})
+_ORCHESTRATION_COMMAND_TOOL = "execute_command"
+# 文案常量迁至 core.injection_markers（展示层过滤前缀与文案同源，防漂移）；
+# 顶部以别名导入并保留 _ORCHESTRATION_NUDGE_TEXT 名称供既有引用使用。
+
+# 慢步催促文案（core/tools.py 无该生成点；此处抽为模块级常量便于展示层过滤
+# 前缀与生成点对账，防止文案漂移）。
+SLOW_STEP_NUDGE_TEXT = (
+    "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何"
+    "正文内容，已出现明显的思考空转。请立即停止自检和复述思考过程，"
+    "直接输出最终结论：任务已完成就给出中文结论，仍需操作就立即"
+    "调用相应工具。禁止继续只输出思考内容。"
+)
+# 总结催促文案（工具已跑完却无结论）。
+SUMMARY_NUDGE_TOOL_DONE_TEXT = (
+    "工具已经执行完毕。现在必须只输出最终中文检查结论，"
+    "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
+)
+# 总结催促文案（只输出思考、既无工具也无正文）。
+SUMMARY_NUDGE_THINKING_ONLY_TEXT = (
+    "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
+    "也没有给出正式回复。请立即继续：需要执行操作就调用相应工具，"
+    "任务已完成就直接输出中文结论；不要只输出思考内容。"
+)
+# 计划续推催促文案（{hints} 由调用处填充）。
+PLAN_CONTINUE_NUDGE_TEXT = (
+    "计划尚未执行完毕，仍有可执行的计划项: [{hints}]。"
+    "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项；"
+    "若某项确实无法完成，请先用 plan_read 查看状态并明确说明原因，"
+    "不要在计划未完成时直接结束回答。"
+)
+
+# 按 turn_id 的进程内去重：同一 turn_id 异常重入（生成器被重复驱动）时，
+# 编排提醒只注入一次。写法参考 core/permission_terminal.py 的
+# _plan_turn_started_at（带 TTL + 过期清理，避免无限增长）。
+_orchestration_nudged_turns: dict[str, float] = {}
+_orchestration_nudged_lock = threading.Lock()
+_ORCHESTRATION_NUDGE_TURN_TTL_SECONDS = 3600
 
 
-def _tool_call_name(tool_call) -> str:
-    """dict / 属性两种 tool_call 形态统一取 function.name。"""
-    if isinstance(tool_call, dict):
-        return str(((tool_call.get("function") or {}).get("name")) or "")
-    function = getattr(tool_call, "function", None)
-    return str(getattr(function, "name", "") or "")
+def _orchestration_turn_already_nudged(turn_id) -> bool:
+    """该 turn_id 是否已注入过编排提醒（只读，不登记）。"""
+    if turn_id is None:
+        return False
+    with _orchestration_nudged_lock:
+        return str(turn_id) in _orchestration_nudged_turns
 
 
-def _persisted_tool_calls(tool_calls):
-    """落库 tool_calls 的脱敏副本（设计 22.3/22.4，Task 16 隐私审计）。
+def _register_orchestration_nudge(turn_id, *, now=None) -> None:
+    """登记某 turn_id 已注入编排提醒，并顺带清理过期条目（TTL 防无限增长）。"""
+    if turn_id is None:
+        return
+    now = time.monotonic() if now is None else now
+    with _orchestration_nudged_lock:
+        _orchestration_nudged_turns[str(turn_id)] = now
+        cutoff = now - _ORCHESTRATION_NUDGE_TURN_TTL_SECONDS
+        for stale_id, started_at in list(_orchestration_nudged_turns.items()):
+            if started_at < cutoff:
+                _orchestration_nudged_turns.pop(stale_id, None)
 
-    computer 保留名的参数只留 computer_tool_arguments_projection 摘要
-    （输入正文/组合键/URL 只存 code point 数与 SHA-256），其余工具原样。
-    Provider 请求侧的 message_to_append 不经本函数——assistant tool_calls
-    与 tool 结果必须原样配对重发（协议要求），脱敏只作用于持久化副本。
+
+def _count_substantive_ops(tool_calls):
+    """一批工具调用中的实质操作数：write_file / edit_file / 非只读 execute_command。
+
+    execute_command 的只读判定与计划门禁同口径（classify_command_risk）；
+    参数解析失败的调用按保守原则计入，空命令不计。
     """
-    projected = []
-    for tool_call in tool_calls:
-        name = _tool_call_name(tool_call)
-        if name not in RESERVED_COMPUTER_TOOL_NAMES:
-            projected.append(tool_call)
+    from core.permission_policy import PermissionRisk
+
+    count = 0
+    for tool_call in tool_calls or ():
+        function = tool_call.get("function") or {}
+        name = str(function.get("name") or "")
+        if name in _ORCHESTRATION_COUNTED_TOOLS:
+            count += 1
             continue
-        sanitized = computer_tool_arguments_projection(
-            name, _raw_tool_call_arguments(tool_call)
-        )
-        if isinstance(tool_call, dict):
-            copy_of_call = dict(tool_call)
-            function = dict(copy_of_call.get("function") or {})
-            function["arguments"] = json.dumps(
-                sanitized, ensure_ascii=False, sort_keys=True
-            )
-            copy_of_call["function"] = function
-            projected.append(copy_of_call)
-        else:
-            # 属性形态（桥接层透传）：绝不让原始参数落库
-            projected.append({
-                "id": getattr(tool_call, "id", None),
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(
-                        sanitized, ensure_ascii=False, sort_keys=True
-                    ),
-                },
-            })
-    return projected
-
-
-def _raw_tool_call_arguments(tool_call):
-    """取 tool_call 的原始 arguments（JSON 字符串或已解析 dict），绝不解析失败。"""
-    if isinstance(tool_call, dict):
-        return (tool_call.get("function") or {}).get("arguments", "")
-    function = getattr(tool_call, "function", None)
-    return getattr(function, "arguments", "")
-
-
-def _tool_event_parts(tool_call):
-    if isinstance(tool_call, dict):
-        return (
-            tool_call.get("id", ""),
-            tool_call["function"]["name"],
-            _tool_call_arguments(tool_call),
-        )
-    return tool_call.call_id, tool_call.name, tool_call.arguments
-
-
-def _tool_event_payload_from_parts(call_id, function_name, arguments):
-    if function_name in RESERVED_COMPUTER_TOOL_NAMES:
-        # 设计 22.3（Task 16 隐私审计）：输入动作正文不进 GUI/CLI trace——
-        # computer 保留名工具的事件参数只携带脱敏投影（kind/target + 长度/
-        # 哈希），preview 恒空；summary/display 用空参数生成，绝不拼接原文。
-        return {
-            "id": call_id,
-            "name": function_name,
-            "preview": "",
-            "arguments": computer_tool_arguments_projection(
-                function_name, arguments
-            ),
-            "summary": summarize_tool_started(function_name, {}),
-            "display": build_tool_display(function_name, {}),
-        }
-    preview = ""
-    if function_name in ("read_file", "write_file", "edit_file"):
-        preview = arguments.get("file_path", "")
-    elif function_name in ("search_code", "search_news"):
-        preview = arguments.get("query", "")
-    elif function_name == "fetch_url":
-        preview = arguments.get("url", "")
-    elif function_name == "get_weather":
-        preview = arguments.get("city", "") or "自动定位"
-    elif function_name == "execute_command":
-        preview = arguments.get("command", "")
-        # 长命令（尤其 PowerShell / curl / python -c）预览截短，避免刷屏
-        if preview and len(preview) > 40:
-            preview = preview[:37] + "..."
-    elif function_name == "glob_files":
-        preview = arguments.get("pattern", "")
-    elif function_name == "list_directory":
-        preview = arguments.get("dir_path", ".")
-    elif function_name == "run_subagent":
-        preview = arguments.get("task_description", "")
-    return {
-        "id": call_id,
-        "name": function_name,
-        "preview": str(preview)[:120],
-        "arguments": arguments,
-        "summary": summarize_tool_started(function_name, arguments),
-        "display": build_tool_display(function_name, arguments),
-    }
-
-
-def _tool_event_payload(tool_call):
-    return _tool_event_payload_from_parts(*_tool_event_parts(tool_call))
-
-
-def _tool_finished_event_payload(tool_call, result, duration_ms):
-    call_id, function_name, arguments = _tool_event_parts(tool_call)
-    ok = _tool_result_ok(function_name, result)
-    return {
-        **_tool_event_payload_from_parts(call_id, function_name, arguments),
-        "ok": ok,
-        "summary": _tool_output_preview(function_name, arguments, result),
-        "result": _tool_result_text(result),
-        "duration_ms": max(0, int(duration_ms)),
-        "display": build_tool_display(function_name, arguments, result, ok=ok),
-    }
-
-
-def _tool_output_preview(function_name, arguments, result):
-    """Return a stable terminal summary without exposing raw tool output."""
-    ok = _tool_result_ok(function_name, result)
-    return summarize_tool_finished(function_name, arguments, result, ok)
-
-
-# tool_finished 事件里携带的完整工具结果上限（字符数）：
-# GUI 需要展开查看原始输出，但不能让单条事件把 IPC 通道撑爆。
-TOOL_RESULT_EVENT_MAX_CHARS = 4000
-
-# 模型只输出思考未生成正文时，促升为公开回复的思考预览长度上限（字符数）。
-# 思考原文可能长达数万字，全量展示会把大段内心独白倾倒给用户。
-PROMOTED_REASONING_PREVIEW_CHARS = 600
-
-
-def _tool_result_text(result):
-    """把工具消息正文取出并截断，作为 tool_finished 事件的 result 字段。
-
-    这是附加字段：CLI 只读 summary，多出的 result 对它无副作用。
-    """
-    try:
-        content = result.get("content", "") if isinstance(result, dict) else result
-    except Exception:
-        content = ""
-    text = str(content or "")
-    if len(text) > TOOL_RESULT_EVENT_MAX_CHARS:
-        return text[:TOOL_RESULT_EVENT_MAX_CHARS] + "...（已截断）"
-    return text
-
-
-def _tool_result_ok(function_name, result):
-    content = str(result.get("content", "") or "")
-    if function_name in {"run_subagent", "ask_user"}:
+        if name != _ORCHESTRATION_COMMAND_TOOL:
+            continue
+        raw = str(function.get("arguments") or "")
         try:
-            payload = json.loads(content)
+            arguments = json.loads(raw) if raw.strip() else {}
         except (TypeError, ValueError):
-            payload = None
-        if isinstance(payload, dict) and payload.get("status"):
-            return payload["status"] in {"running", "completed", "selected"}
-    return not content.startswith((
-        TOOL_ERROR_PREFIX,
-        ASK_USER_ERROR_PREFIX,
-        TOOL_INTERNAL_ERROR_PREFIX,
-        _PLAN_BYPASS_ERROR_PREFIX,
-        "计划执行约束：",
-        "计划配置错误：",
-        "计划运行状态由真实调度器管理",
-        "新建计划项必须是 pending",
-    ))
-
-
-# 计划控制工具的结果正文不作为进展信号：真实状态转换已由计划 canonical
-# 快照指纹单独捕获。否则模型只需在 plan_update/plan_retry/plan_finish 等返回
-# 文案之间来回切换，就会令 tool_results_sha256 每步变化并永久绕过无进展熔断。
-# run_subagent 需要区分计划绑定与无计划调用，不能在这里全局忽略，详见
-# _unplanned_subagent_progress_part。
-_PLAN_STATE_RESULT_TOOLS = frozenset({
-    "plan_write",
-    "plan_update",
-    "plan_read",
-    "plan_retry",
-    "plan_resume_takeover",
-    "plan_finish",
-    "ask_user",
-})
-
-
-def _canonical_arguments_signature(name, tool_call):
-    """读取签名 = tool name + canonical arguments 的 SHA-256（仅存 Turn 内存）。"""
-    raw = ""
-    if tool_call:
-        raw = str((tool_call.get("function") or {}).get("arguments") or "")
-    try:
-        canonical = json.dumps(
-            json.loads(raw or "{}"),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    except (TypeError, ValueError):
-        canonical = raw
-    return hashlib.sha256(f"{name}:{canonical}".encode("utf-8")).hexdigest()
-
-
-def _unplanned_subagent_progress_part(message, tool_call):
-    """返回无计划子任务的稳定进展材料；计划绑定调用返回 None。
-
-    参数签名区分模型实际派发的不同工作。结果只保留稳定的 status/result，
-    明确排除 task_id、耗时与 error 等运行噪声；计划绑定调用则完全交给计划
-    快照指纹判定，不能靠改描述或动态任务 id 重置停滞计数。
-    """
-    raw_arguments = ""
-    if tool_call:
-        raw_arguments = str(
-            (tool_call.get("function") or {}).get("arguments") or ""
-        )
-    try:
-        arguments = json.loads(raw_arguments or "{}")
-    except (TypeError, ValueError):
-        arguments = {}
-    if isinstance(arguments, dict) and str(
-        arguments.get("plan_item_id", "") or ""
-    ).strip():
-        return None
-    if not _tool_result_ok("run_subagent", message):
-        return None
-
-    content = str(message.get("content", "") or "")
-    try:
-        payload = json.loads(content)
-    except (TypeError, ValueError):
-        payload = None
-    if isinstance(payload, dict):
-        stable_result = {"status": str(payload.get("status", "") or "")}
-        if "result" in payload:
-            stable_result["result"] = payload.get("result")
-    else:
-        # 前台 completed 路径直接返回子代理正文；正文就是实际成果信号。
-        stable_result = {"status": "completed", "result": content}
-    return [
-        "run_subagent",
-        _canonical_arguments_signature("run_subagent", tool_call),
-        stable_result,
-    ]
-
-
-def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
-    """构造本 Step 的确定性进展观察（供 TurnProgressGuard 判定）。
-
-    只聚合确定性状态：后台任务指纹、计划 canonical 快照指纹、
-    非观察类工具结果哈希、修改类提交标记；不读取模型自然语言。
-    附加本步只读工具签名，供 guard 做有界（MAX_UNIQUE_READS）读取进展
-    判定（所有会话通用，普通只读调查链不再被误判停滞）；签名不写 Journal。
-    """
-    from core.harness.progress_guard import ProgressObservation
-    from core.harness.tool_pipeline import (
-        _PLAN_READ_ONLY_TOOLS,
-        REPEAT_CALL_BLOCKED_TEXT,
-    )
-    from core.plan import plan_state_fingerprint
-    from core.task_manager import background_tasks_fingerprint
-
-    result_parts = []
-    mutation_committed = False
-    read_signatures = []
-    for record in records or ():
-        message = getattr(record, "message", None) or {}
-        name = str(message.get("name", "") or "")
-        content = str(message.get("content", "") or "")
-        # RepeatCallGuard 拦截结果是固定文案，不代表任何业务状态变化
-        if content == REPEAT_CALL_BLOCKED_TEXT:
+            count += 1
             continue
-        ok = _tool_result_ok(name, message)
-        if ok and name in {"write_file", "edit_file"}:
-            mutation_committed = True
-        elif ok and name == "execute_command" and tool_calls_by_id:
-            command = ""
-            tool_call = tool_calls_by_id.get(message.get("tool_call_id")) or {}
-            try:
-                command = str(
-                    json.loads(tool_call.get("function", {}).get("arguments") or "{}")
-                    .get("command", "")
-                )
-            except (TypeError, ValueError):
-                command = ""
-            if command:
-                from core.command_policy import classify_command_risk
-                from core.permission_policy import PermissionRisk
-
-                if classify_command_risk(command) is not PermissionRisk.QUERY:
-                    mutation_committed = True
-        if ok and name in _PLAN_READ_ONLY_TOOLS and tool_calls_by_id is not None:
-            read_signatures.append(
-                _canonical_arguments_signature(
-                    name, tool_calls_by_id.get(message.get("tool_call_id"))
-                )
-            )
-        if name == "run_subagent":
-            progress_part = _unplanned_subagent_progress_part(
-                message,
-                (tool_calls_by_id or {}).get(message.get("tool_call_id")),
-            )
-            if progress_part is not None:
-                result_parts.append(progress_part)
-            continue
-        if name not in _PLAN_READ_ONLY_TOOLS and name not in _PLAN_STATE_RESULT_TOOLS:
-            result_parts.append([name, content])
-
-    canonical = json.dumps(
-        result_parts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return ProgressObservation(
-        task_snapshots_sha256=background_tasks_fingerprint(),
-        plan_snapshot_sha256=plan_state_fingerprint(session_id),
-        tool_results_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        mutation_committed=mutation_committed,
-        read_signatures=tuple(read_signatures),
-    )
+        command = str((arguments or {}).get("command") or "")
+        if command and classify_command_risk(command) is not PermissionRisk.QUERY:
+            count += 1
+    return count
 
 
-def _raise_if_tool_cancelled(cancel_event):
-    # 取消判断只认每 turn 传入的 cancel_event，不再读全局粘性布尔
-    if cancel_event is not None and cancel_event.is_set():
-        raise KeyboardInterrupt("用户终止了工具执行。")
+def _should_nudge_orchestration(*, allow_subagents, count, session_id, turn_id, already_sent):
+    """是否注入编排提醒：主代理回合 + 实质操作超过阈值 + 无计划在途 + 未提醒过。
 
-
-def _escape_control_chars_in_json_strings(text):
-    """只转义字符串值内部的裸控制字符（\\n/\\r/\\t），结构空白与合法转义保持不动。"""
-    escapes = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
-    out = []
-    in_string = False
-    escaped = False
-    for ch in text:
-        if in_string:
-            if escaped:
-                out.append(ch)
-                escaped = False
-            elif ch == "\\":
-                out.append(ch)
-                escaped = True
-            elif ch == '"':
-                out.append(ch)
-                in_string = False
-            elif ch in escapes:
-                out.append(escapes[ch])
-            else:
-                out.append(ch)
-        else:
-            out.append(ch)
-            if ch == '"':
-                in_string = True
-    return "".join(out)
-
-
-def _repair_truncated_json(raw):
-    """修复被截断的 JSON 字符串：补全未闭合的字符串、括号、花括号。
-
-    当 LLM 生成的 tool call arguments 超过 API 传输限制时被截断，
-    json.loads 会报 "Unterminated string" 错误。本函数只处理末尾截断：
-    1. 补全未闭合的字符串（在末尾加引号）
-    2. 移除对象/数组末尾多余的逗号
-    3. 按栈顺序闭合所有未闭合的 [ { 括号
-    4. 如果末尾是冒号（缺值），补空字符串
-
-    注意：如果截断处之后还混入了非 JSON 文本（如模型把对话历史写进参数），
-    本函数不再 aggressive 地回退截断，而是让 json.loads 继续失败，由调用方
-    返回明确的参数解析错误，避免用被篡改的参数继续执行工具。
+    阈值口径：count 必须"超过" _ORCHESTRATION_NUDGE_THRESHOLD（即 ≥ 4）才提醒，
+    恰好 3 步及以内不提醒（与提醒文案及 system_prompt*.md 一致）。
     """
-    if not raw or not raw.strip():
-        return raw
-
-    in_string = False
-    escaped = False
-    stack = []
-
-    for ch in raw:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch in "[{":
-                stack.append(ch)
-            elif ch == "]":
-                if stack and stack[-1] == "[":
-                    stack.pop()
-            elif ch == "}":
-                if stack and stack[-1] == "{":
-                    stack.pop()
-
-    repaired = raw.rstrip()
-
-    # 如果末尾在字符串内（未闭合），先补上引号
-    if in_string:
-        # 移除末尾可能残留的反斜杠（避免转义刚补的引号）
-        if repaired.endswith("\\"):
-            repaired = repaired[:-1]
-        repaired += '"'
-
-    # 移除末尾多余的逗号（在闭合括号前）
-    repaired = repaired.rstrip()
-    while repaired.endswith(","):
-        repaired = repaired[:-1].rstrip()
-
-    # 如果末尾是冒号（缺值），补空字符串
-    if repaired.endswith(":"):
-        repaired += ' ""'
-
-    # 按栈的逆序闭合括号
-    closing_map = {"[": "]", "{": "}"}
-    while stack:
-        opener = stack.pop()
-        repaired += closing_map[opener]
-
-    return repaired
-
-
-def _show_file_diff(
-    file_path,
-    old_content,
-    new_content,
-    event_callback,
-    panel_title,
-    truncated_note,
-    tool_call_id="",
-):
-    """Compatibility wrapper for the extracted diff adapter."""
-    from core.harness.tool_adapters import _show_file_diff as _render_file_diff
-
-    return _render_file_diff(
-        file_path,
-        old_content,
-        new_content,
-        event_callback,
-        panel_title,
-        truncated_note,
-        tool_call_id=tool_call_id,
-    )
-
-def _get_imom_active_publish_root():
-    """Compatibility wrapper for the extracted imom adapter."""
-    from core.harness.tool_adapters import _get_imom_active_publish_root as _get_root
-
-    return _get_root()
-
-def _sandbox_outside_guard(
-    function_name,
-    path_value,
-    event_callback,
-    permission_owner,
-    parent_turn_id,
-    permission_source,
-    cancel_event,
-    **kwargs,
-):
-    """Compatibility wrapper for the extracted sandbox adapter."""
-    from core.harness.tool_adapters import _sandbox_outside_guard as _guard
-
-    return _guard(
-        function_name,
-        path_value,
-        event_callback,
-        permission_owner,
-        parent_turn_id,
-        permission_source,
-        cancel_event,
-        permission_checker=kwargs.get("permission_checker", check_permission_and_ask),
-        is_outside_workspace=kwargs.get("is_outside_workspace", is_outside_workspace),
-        sandbox_bypass=kwargs.get("sandbox_bypass", sandbox_bypass),
-        permission_error_type=kwargs.get("permission_error_type", PermissionSystemError),
-    )
-
-def _build_tool_pipeline_and_context(
-    event_callback=None,
-    *,
-    parent_session=None,
-    parent_turn_id=None,
-    cancel_event=None,
-    allow_subagents=True,
-    permission_owner=None,
-    permission_source="主代理",
-    computer_lease=None,
-    computer_native_selection=None,
-):
-    from core.harness.tool_adapters import ToolAdapterSet
-    from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
-    from core.tool_registry import ToolRegistry
-
-    bound_execute = tool_registry.execute
-    registry_execute_override = (
-        bound_execute
-        if getattr(bound_execute, "__func__", None) is not ToolRegistry.execute
-        else None
-    )
-    adapters = ToolAdapterSet(
-        read_file=read_file,
-        write_file=write_file,
-        edit_file=edit_file,
-        run_subagent=run_subagent,
-        manage_task=manage_task,
-        show_file_diff=_show_file_diff,
-        get_imom_active_publish_root=_get_imom_active_publish_root,
-        sandbox_guard=_sandbox_outside_guard,
-        sandbox_bypass=sandbox_bypass,
-        read_text=_read_text_with_encoding_fallback,
-        notify_event=_notify_event,
-        mark_plan_turn=_mark_plan_turn,
-        registry_execute_override=registry_execute_override,
-        is_outside_workspace=is_outside_workspace,
-        safe_print=safe_print,
-    )
-    context = ToolExecutionContext(
-        event_callback=event_callback,
-        parent_session=parent_session,
-        parent_turn_id=parent_turn_id,
-        cancel_event=cancel_event,
-        allow_subagents=allow_subagents,
-        permission_owner=permission_owner,
-        permission_source=permission_source,
-        permission_checker=_pipeline_permission_checker,
-        registry=tool_registry,
-        mcp_manager=_get_mcp_manager(),
-        computer_lease=computer_lease,
-        computer_native_selection=computer_native_selection,
-    )
-    pipeline = ToolPipeline(
-        adapters,
-        permission_error_type=PermissionSystemError,
-        truncate_result=_truncate_tool_result_for_context,
-        plan_turn_checker=_is_plan_turn,
-        pending_plan_checker=_has_pending_plan,
-    )
-    return pipeline, context
-
-
-def _execute_single_tool_call(
-    tc,
-    event_callback=None,
-    *,
-    parent_session=None,
-    parent_turn_id=None,
-    cancel_event=None,
-    allow_subagents=True,
-    permission_owner=None,
-    permission_source="主代理",
-):
-    """Compatibility wrapper around the extracted deterministic pipeline."""
-    pipeline, context = _build_tool_pipeline_and_context(
-        event_callback,
-        parent_session=parent_session,
-        parent_turn_id=parent_turn_id,
-        cancel_event=cancel_event,
-        allow_subagents=allow_subagents,
-        permission_owner=permission_owner,
-        permission_source=permission_source,
-    )
-    return pipeline.execute_one(tc, context)
+    if not allow_subagents or already_sent:
+        return False
+    if count <= _ORCHESTRATION_NUDGE_THRESHOLD:
+        return False
+    if _orchestration_turn_already_nudged(turn_id):
+        return False
+    return not (_has_pending_plan(session_id) or _is_plan_turn(turn_id))
 
 
 _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL = _execute_single_tool_call
-
-# 旧测试和外部调用方可能仍从 core.llm 导入该内部兼容名；实现只保留在
-# 固定 Harness 管线中，避免形成第二套重复调用判定逻辑。
-from core.harness.tool_pipeline import RepeatCallGuard as _RepeatCallGuard
-
-# ─── 工具结果入上下文前的截断 ────────────────────────────────────
-# 这是最大的 token 泄漏点：一次 fetch_url 可以塞进 512KB（≈13 万 token）原文，
-# 一次 pip install 的 stdout 可以是几 MB。截断只影响送进模型上下文/落库的内容，
-# 不影响工具本身的执行结果与终端展示。
-_TOOL_RESULT_MAX_CHARS = 24000            # 默认上限（约 8K token）
-_TOOL_RESULT_LIMITS = {
-    "execute_command": 16000,             # 保留头尾：报错信息几乎都在结尾
-    "fetch_url": 16000,                   # 保留头部：正文开头信息密度最高
-    "search_news": 8000,
-}
-_TOOL_RESULT_TAIL_TOOLS = {"execute_command"}
-# read_file 自带行数/字节上限，且编辑流程依赖完整内容，默认不做二次截断。
-# 但大文件全文读入是前缀缓存条目膨胀的最大来源（单个结果可达数万 token），
-# 在按容量驱逐的网关上更容易被挤掉、失效后的重建成本也更高。可在 config.json
-# 顶层设 "read_file_result_max_chars": 24000 启用截断（保头尾），中间锚点丢失
-# 可能影响 edit 流程，故默认保持不限。
-_TOOL_RESULT_EXEMPT = {"read_file"}
-
-
-def _read_file_result_limit():
-    """read_file 结果入上下文的字符上限；0/缺省 = 不限。配置读取失败时静默不限。"""
-    try:
-        from core.model_manager import load_config
-        return int(load_config().get("read_file_result_max_chars", 0) or 0)
-    except Exception:
-        return 0
-
-
-def _truncate_tool_result_for_context(function_name, text):
-    if function_name in _TOOL_RESULT_EXEMPT:
-        limit = _read_file_result_limit() if function_name == "read_file" else 0
-        if not limit or len(text) <= limit:
-            return text
-        head_len = limit // 2
-        tail = text[-(limit - head_len):]
-        return (
-            f"{text[:head_len]}\n"
-            f"…[文件过长，中间省略 {len(text) - limit} 字符。"
-            f"如需中间内容请按行号范围重新 read_file]…\n{tail}"
-        )
-    limit = _TOOL_RESULT_LIMITS.get(function_name, _TOOL_RESULT_MAX_CHARS)
-    if len(text) <= limit:
-        return text
-    dropped = len(text) - limit
-    if function_name in _TOOL_RESULT_TAIL_TOOLS:
-        head_len = limit // 4
-        head = text[:head_len]
-        tail = text[-(limit - head_len):]
-        return f"{head}\n…[输出过长，中间省略 {dropped} 字符]…\n{tail}"
-    return (
-        f"{text[:limit]}\n"
-        f"…[结果过长，已截断 {dropped} 字符。如需后续内容请用更精确的参数重新调用]"
-    )
-
-def _call_vision_model_for_content(secondary, content, cancel_event=None, max_retries=3):
-    """调用支持视觉的副模型，传入完整 content（含图片），返回回复文本；失败返回空字符串。"""
-    kwargs = {
-        "model": secondary["litellm_model"],
-        "messages": [{"role": "user", "content": content}],
-        "api_key": secondary["api_key"],
-        "api_base": secondary["base_url"],
-        "max_tokens": 2048,
-        "timeout": API_REQUEST_TIMEOUT_SECONDS,
-    }
-    kwargs.update(_provider_cache_affinity_options(
-        secondary["litellm_model"],
-        secondary["base_url"],
-        cache_scope="secondary:vision",
-        tool_contract="no-tools",
-    ))
-
-    warning_logger = logging.getLogger("py.warnings")
-
-    for attempt in range(max_retries):
-        try:
-            future = _submit_daemon_call(_litellm_completion, **kwargs)
-            try:
-                while not future.done():
-                    if cancel_event is not None and cancel_event.is_set():
-                        future.cancel()
-                        return ""
-                    try:
-                        future.result(timeout=0.1)
-                    except Exception:
-                        pass
-                exc = future.exception()
-                if exc is not None:
-                    raise exc
-                resp = future.result()
-            finally:
-                future.cancel()
-
-            if resp and getattr(resp, "choices", None):
-                c = resp.choices[0].message.content
-                if c is not None:
-                    text = str(c).strip()
-                    if text:
-                        return text
-            if attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-        except Exception as e:
-            warning_logger.warning(
-                "副模型图片分析失败 (attempt %d/%d): %s %s",
-                attempt + 1, max_retries, type(e).__name__, e,
-            )
-            if attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-    return ""
-
-
-def _vision_fallback_text(user_text=""):
-    """图片分析失败时替换用的提示文本，明确让主模型直接回复用户。"""
-    hint = (
-        "[当前主模型和副模型均不支持图片输入或图片分析失败，无法处理图片。"
-        "请直接回复用户：无法分析图片，不要调用任何工具。]"
-    )
-    if user_text:
-        return f"{user_text}\n\n{hint}"
-    return hint
-
-
-def _describe_images_with_secondary(messages, main_model_name, event_callback=None, cancel_event=None):
-    """主模型不识图时，直接用副模型分析本轮最新图片并替换为文字描述/回答。"""
-    if _supports_vision(main_model_name):
-        return
-
-    # 只处理最近一条用户消息中的图片；历史图片即使还在上下文里也不再重复分析
-    target_msg = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            target_msg = msg
-            break
-    if target_msg is None:
-        return
-
-    content = target_msg.get("content")
-    if not isinstance(content, list):
-        return
-    image_items = [
-        item for item in content
-        if isinstance(item, dict) and item.get("type") in ("image", "image_url")
-    ]
-    if not image_items:
-        return
-    text_items = [
-        item for item in content
-        if isinstance(item, dict) and item.get("type") == "text"
-    ]
-
-    user_text = " ".join(t.get("text", "") for t in text_items).strip()
-
-    from core.model_manager import get_secondary_model, get_secondary_roles
-    roles = get_secondary_roles()
-    secondary = get_secondary_model() if roles.get("vision") else None
-
-    if not secondary or not _supports_vision(secondary["litellm_model"]):
-        _notify_event(event_callback, "notice", {
-            "message": "当前主模型不支持图片输入，且副模型无法分析图片，已将图片替换为占位说明。",
-        })
-        target_msg["content"] = _vision_fallback_text(user_text)
-        return
-
-    _notify_event(event_callback, "notice", {
-        "message": f"主模型不支持图片输入，正在使用副模型 {secondary['name']} 分析图片...",
-    })
-
-    # 把用户的问题也一起给副模型，让副模型直接作答
-    if user_text:
-        vision_prompt = f"请基于图片的视觉内容回答以下问题：{user_text}"
-    else:
-        vision_prompt = (
-            "请以视觉助手身份理解这张图片：先判断图片类型（如截图/海报/照片/图表/界面截图等），"
-            "再说明图片的主题、关键视觉元素和传达的信息；"
-            "如果图片包含文字，提炼文字核心要点而非逐字复制。"
-        )
-    sec_content = [{"type": "text", "text": vision_prompt}] + image_items
-
-    answer = _call_vision_model_for_content(secondary, sec_content, cancel_event=cancel_event)
-    if answer:
-        if user_text:
-            target_msg["content"] = f"{user_text}\n\n[图片分析结果]\n{answer}"
-        else:
-            target_msg["content"] = f"[图片分析结果]\n{answer}"
-    else:
-        target_msg["content"] = _vision_fallback_text(user_text)
-
-
-def _refill_messages_after_compression(messages, manager, session):
-    """上下文超限强制压缩后，原地用压缩后的 DB 历史重建请求消息列表。
-
-    历史必须走 get_history_for_llm：剔除刚被摘要排除的消息（水位之后才是
-    活跃区）、挂载记忆摘要并修复 tool_call 配对。此前误用全量 get_history
-    ——刚被压缩排除的消息被原样塞回，重试载荷不降反升，兜底路径必然再次
-    超限并报出误导性的「压缩后仍超窗」错误，且记忆摘要挂载整条丢失。
-    首部系统提示词（稳定前缀 + 会话内注入块）每轮现组、不落库，从原
-    列表完整保留并前置；DB 中旧格式遗留的 system 上下文块与
-    prepare_turn_messages 的清理口径一致，重读时整体丢弃。
-    """
-    system_blocks = [
-        m for m in messages if isinstance(m, dict) and m.get("role") == "system"
-    ]
-    refreshed = manager.get_history_for_llm(session)
-    refreshed = [
-        m for m in refreshed if not (isinstance(m, dict) and m.get("role") == "system")
-    ]
-    messages[:] = system_blocks + refreshed
 
 
 def _chat_with_model_generator(
@@ -4912,6 +1565,8 @@ def _chat_with_model_generator(
     *,
     harness_runtime=None,
     computer_capability=None,
+    budget_notice_provider=None,
+    request_reason: str = "",
 ):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
@@ -4925,12 +1580,38 @@ def _chat_with_model_generator(
     if request_protocol is None:
         request_protocol = "anthropic" if str(model_name).startswith("anthropic/") else "openai"
     turn_snapshot = deepcopy(messages)
+    # 电脑操控「用户已停止」抑制态与待投递通知（core/computer/stop_notice.py）：
+    # 函数内导入而非模块顶层，让依赖方向保持单向（stop_notice 只用标准库，
+    # 不反向依赖 llm）。恢复条件②在这里生效：用户新消息命中恢复关键词即解除
+    # 抑制——停止不再终止回合后模型会被硬拦（computer_user_stopped），必须留
+    # 一条用户侧的解除路径，否则用户说"继续操作"也解不开。只扫最后一条 user
+    # 消息：更早的历史消息代表过去的意图，不能用来解除当前抑制。
+    from core.computer import stop_notice as _stop_notice
+
+    for _turn_msg in reversed(messages):
+        if isinstance(_turn_msg, dict) and _turn_msg.get("role") == "user":
+            _resume_content = _turn_msg.get("content")
+            if isinstance(_resume_content, list):
+                # 多模态 user 消息只拼文本片段，忽略图片/附件对象。
+                _resume_content = " ".join(
+                    str(_part.get("text") or "")
+                    for _part in _resume_content
+                    if isinstance(_part, dict)
+                )
+            if _stop_notice.user_message_resumes_control(str(_resume_content or "")):
+                _stop_notice.deactivate_user_stop("user_message")
+            break
     keepalive_interval = 0
     if cache_scope == "main":
         from core.cache_keepalive import cache_keepalive_service, load_keepalive_interval
         configured_keepalive = load_keepalive_interval()
-        # 每次主模型请求先停掉旧快照，防止切换 provider 后仍保活旧模型。
-        cache_keepalive_service.register_request({}, interval=0)
+        # 主模型请求开始只停掉"本会话"的旧快照，防止切换 provider 后仍保活旧模型；
+        # 其他会话（后台/多窗口切换）的快照继续保活，切回时不再全量 miss。
+        cache_keepalive_service.register_request(
+            {},
+            interval=0,
+            session_key=_resolve_cache_session_identity(cache_session_id),
+        )
         if request_protocol != "responses" and _supports_cache_keepalive(model_name, api_base):
             keepalive_interval = configured_keepalive
     # 1. 自动注入 KAIROS 长期记忆指示与 MEMORY.md 索引。
@@ -4960,6 +1641,20 @@ def _chat_with_model_generator(
     # "只思考不产出"时的最终总结重试上限：连续多次欠佳仍尝试补救，
     # 避免长任务中一两轮失败就静默收尾（用户反馈"任务未执行完就结束"）。
     FINAL_SUMMARY_MAX_RETRIES = 2
+    # 慢步熔断已触发的强催促次数（随本轮会话循环生命周期）。
+    slow_step_nudge_count = 0
+    # 退化（复读）检测：最近 3 步的正文指纹滑窗 + 已触发的收敛催促次数。
+    # 与 slow_step_nudge_count 同生命周期（随回合重置），且只存本回合内存：
+    # 不写 Journal、不入库、不落盘（与 read_signatures 同策略，避免污染缓存与历史）。
+    recent_content_fingerprints = deque(maxlen=_DEGENERATE_WINDOW)
+    degenerate_nudge_count = 0
+    # D 方案：验证声明护栏已触发的提醒次数（随本轮会话循环生命周期）。
+    verify_claim_nudge_count = 0
+    # C8/C9：本回合工具调用总次数（Stop hook 输入字段；无 hooks 配置时零影响）。
+    turn_tool_call_count = 0
+    # 本回合是否出现过写入类/命令执行类工具（按工具名累计，只读不写请求）。
+    used_write_tools = False
+    used_command_tools = False
     # 重复工具调用抑制：同一签名成功 2 次后拦截，随本轮会话循环生命周期
     from core.harness.tool_pipeline import RepeatCallGuard
 
@@ -5017,19 +1712,70 @@ def _chat_with_model_generator(
                 # complete 也不 stop。
                 return
             if computer_exit_kind == "completed":
+                # L1（2026-10-01 "接管—交还"修复）：用户接管态
+                # （waiting_for_user）同样走"完成"路径终结并交还排他租约。
+                # 转移表放行 waiting_for_user → completing 之前，这一步会抛
+                # 非法状态转换并被吞成 warning，run 既无终态也无租约释放，
+                # 下一回合被 computer_session_busy 挡死（2026-10-01 实机故障，
+                # 日志 gui-runtime.log:11174/11519）。
+                # retain 必须为 True、与普通收尾完全一致：外部 Edge/Chrome 上
+                # 关闭 backend 会连用户此刻正在手动操作的浏览器窗口一起关掉，
+                # 而接管场景恰恰正在用那个窗口；内置浏览器上保留会话也让下一
+                # 回合免去 CDP 重连。面板页面属于 GUI 的 WebView2 控件，与 run
+                # 是否保留无关。
                 computer_controller.complete_run(
                     computer_run_id, computer_owner, retain_browser_session=True
                 )
             else:
+                # cancel_owner=False：owner 的 cancel_event 就是 gui_bridge
+                # 判定"回合是否被用户取消"的事件（gui_bridge.py:6220 与 :6377）。
+                # cancelled/failed/stopped 三类非正常收尾里只有真取消才该保留该
+                # 语义，而真取消时 event 早已由停止按钮/Ctrl+C 路径置位，收尾不
+                # 需要也不应再设它：否则一次普通失败（如上游 402 额度不足）会被
+                # 误标成"已取消"，界面上错误原因全部丢失（2026-10-01 实机故障，
+                # 日志 gui-runtime.log 20:14-20:28 连续 8 次）。与下方
+                # turn_end_finalize_fallback 兜底口径保持一致。
                 computer_controller.stop(
                     computer_run_id,
                     "turn_cancelled" if computer_exit_kind == "cancelled" else "turn_stopped",
+                    cancel_owner=False,
                 )
-        except ComputerControlError as error:
+        except Exception as error:
+            # 捕获范围必须宽于 ComputerControlError（2026-10-01 审查补修）：
+            # snapshot()/complete_run()/stop() 可能抛出非领域异常，若任其逃逸，
+            # 既没有兜底释放租约，还会把异常抛进回合 finally、打断整个收尾流程。
             logger.warning(
-                "电脑操控 run 收尾失败（run=%s kind=%s）：%s",
-                computer_run_id, computer_exit_kind, error,
+                "电脑操控 run 收尾失败（run=%s kind=%s，%s）：%s",
+                computer_run_id, computer_exit_kind, type(error).__name__, error,
             )
+            # L2（2026-10-01 "接管—交还"修复）：收尾失败兜底，保证"回合结束绝不
+            # 留活租约"。complete_run 不可达的一切情形（paused 与
+            # starting/completing/stopping 等非终态——paused → completing 属于
+            # 既有契约明令拒绝的转移）以及其他导致收尾动作失败的异常，都在此
+            # 强制 stop 释放租约，否则 run 会既无终态也无租约释放，下一回合被
+            # computer_session_busy 挡死。整段兜底只 warning，绝不向上抛，也不
+            # 掩盖回合原本结局（provider_safety_required 的提前 return 语义不受
+            # 影响：该分支在上面已 return，不会进入这里）。
+            try:
+                fallback_snapshot = computer_controller.snapshot()
+                if (
+                    fallback_snapshot is not None
+                    and fallback_snapshot.run_id == computer_run_id
+                    and fallback_snapshot.status not in _COMPUTER_RUN_TERMINAL_STATUSES
+                ):
+                    # cancel_owner=False：gui_bridge.py:6220 与 :6377 用该 owner 的
+                    # cancel_event 判定"回合是否被用户取消"，收尾兜底不得把正常
+                    # 结束的回合误标成"已取消"。
+                    computer_controller.stop(
+                        computer_run_id,
+                        "turn_end_finalize_fallback",
+                        cancel_owner=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "电脑操控 run 收尾兜底释放失败（run=%s kind=%s，已忽略）",
+                    computer_run_id, computer_exit_kind, exc_info=True,
+                )
         # 截图清除（2026-09-06 提速计划 Task 6）：回合终结后该会话所有电脑操控
         # 观察图立即折叠为占位符。provider_safety_required 的提前 return 不会
         # 走到这里（run 仍存活，模型恢复后还需要最后一张图）。
@@ -5047,11 +1793,16 @@ def _chat_with_model_generator(
             logger.warning("折叠电脑操控观察截图失败（已忽略）", exc_info=True)
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
+    # 编排提醒：本回合是否已注入、实质操作累计（每回合重置）
+    orchestration_nudge_sent = False
+    substantive_op_count = 0
     pending_persistence = []
     persistence_failure = None
     current_step = None
     current_tool_calls = []
     pending_tool_records = {}
+    # 当前 step 的流式组装器（A1-02：通用异常路径打捞部分正文时读取；每 step 重建）
+    stream_assembler = None
 
     def _model_display_snapshot(metrics=None):
         """为落库的 assistant 消息附加"生成所用模型"及性能指标的显示元数据。
@@ -5070,7 +1821,9 @@ def _chat_with_model_generator(
                         disp["model_name"] = model.get("name") or model_name
                         break
         except Exception:
-            pass
+            # 读配置失败不影响落库：保留回退为 model_name 原值的行为，仅记录
+            # 调试日志留下痕迹，便于排查显示名缺失。
+            logger.debug("读取模型显示名配置失败，回退为 model_name", exc_info=True)
         if metrics:
             disp["metrics"] = metrics
         return {"_display": disp}
@@ -5184,6 +1937,34 @@ def _chat_with_model_generator(
                         "content": cancelled_content,
                     }))
 
+    def salvage_streaming_partial():
+        """A1-02：流式中断时把本 step 已生成的部分内容打捞进待写队列。
+
+        仅在组装器存在、尚未 finish 且确有公开正文时生效（半截 tool_calls
+        不带入，避免历史非法；纯思考不产生消息）。公开正文带
+        「[本轮流式中断]」标注落库，reasoning 一并携带。异常发生在组装
+        完成后（assembler 已 finish）时静默跳过；上游调用后仍需
+        flush_persistence()。
+        """
+        assembler = stream_assembler
+        if assembler is None:
+            return
+        try:
+            assembled = assembler.finish()
+        except Exception:
+            return
+        public_content = (assembled.content or "").strip()
+        if not public_content:
+            return
+        salvaged_message = {
+            "role": "assistant",
+            "content": f"{public_content}\n\n[本轮流式中断]",
+        }
+        if assembled.reasoning_content:
+            salvaged_message["reasoning_content"] = assembled.reasoning_content
+        salvaged_message.update(_model_display_snapshot())
+        pending_persistence.append(("assistant", salvaged_message))
+
     # 2. 注入后台子 Agent 回报数据 (XML task-notification)
     from core.tools import subagent_manager
     drained_notifications = []
@@ -5198,11 +1979,18 @@ def _chat_with_model_generator(
             pending_persistence.append(("user", notif))
         flush_persistence()
 
+    # 电脑操控「用户已停止」通知由 _stop_notice（回合入口已导入）提供，本处只
+    # 准备"本轮已 drain"的镜像列表：异常/取消回滚时要像后台通知一样把已 drain
+    # 的文案放回内存 messages，否则同一轮的后续步骤会看不到这条事实。
+    drained_stop_notices = []
+
     def rollback_turn_messages():
         """回滚本轮新增的消息残影；已 drain 的后台通知重新保留，避免丢失。"""
         messages[:] = turn_snapshot
         for notif in drained_notifications:
             messages.append({"role": "user", "content": notif})
+        for stop_notice_text in drained_stop_notices:
+            messages.append({"role": "user", "content": stop_notice_text})
 
     # 注意：不因“计划进行中”裁剪 tools——计划约束由执行层
     # （_execute_single_tool_call 的 plan_enforced 拦截）统一保证，裁剪是双重保险。
@@ -5242,6 +2030,11 @@ def _chat_with_model_generator(
     request_tools = _select_request_tools_for_route(
         model_name, api_base, request_tools
     )
+    # 【纯旁路】工具定义字符量快照（设计规格 §3.3；2026-09-23 拆分系统/MCP）：
+    # 每步请求都会走到，重复更新无害；失败仅记 debug，绝不改变发送字节。
+    _snapshot_tool_breakdown(request_tools)
+    # 【纯旁路 / 临时诊断】把最终工具列表落盘，供定位上游校验失败（用完即撤）。
+    _debug_dump_request_tools(model_name, api_base, request_tools)
     # 原生 OpenAI 协议（Task 11a，设计 11.1/11.2）：native tools 不进
     # request_tools（chat 格式），而是经 prepare_stream_request 的
     # native_computer_tools 参数追加在 flattened function tools 之后；
@@ -5320,6 +2113,22 @@ def _chat_with_model_generator(
                 request_model_id = str(bound_model.get("id") or "") or None
         except Exception:
             request_model_id = None
+    # 模型级系统提示扩展（system_prompt_extra）：只对显式配置了该字段的模型生效，
+    # 在请求消息最前面插入一条独立 system 消息。必须构造新列表——messages 是调用
+    # 方共享的同一 list，原地 append 会污染调用方与持久化历史；未配置时完全不介入，
+    # 请求字节与既有行为逐字节一致（稳定前缀逻辑因此完全不受影响）。
+    model_system_extra = _model_system_prompt_extra(
+        model_name, api_base, model_id=request_model_id
+    )
+    extra_injected_message = None
+    original_messages = None
+    original_message_ids = frozenset()
+    if model_system_extra:
+        original_messages = messages
+        original_message_ids = frozenset(id(item) for item in messages)
+        extra_injected_message = {"role": "system", "content": model_system_extra}
+        messages = [extra_injected_message] + list(messages)
+        kwargs["messages"] = messages
     kwargs.update(_provider_request_options(
         model_name,
         api_base,
@@ -5334,14 +2143,6 @@ def _chat_with_model_generator(
     )
     if not deepseek_thinking_request:
         kwargs["tool_choice"] = "auto"
-        # 中转站的未知 gpt-5* 模型会被 litellm 客户端直接拒绝 tool_choice
-        #（见 _litellm_rejects_tool_choice），按参数追加放行；不能用全局
-        # drop_params——那会把 reasoning_effort 等推理强度静默吞掉。
-        if _litellm_rejects_tool_choice(model_name):
-            kwargs["allowed_openai_params"] = list(dict.fromkeys([
-                *(kwargs.get("allowed_openai_params") or []),
-                "tool_choice",
-            ]))
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
     # 导致长回复被静默截断。若 provider 已显式配置则尊重其值；内置默认表未覆盖的
@@ -5427,6 +2228,43 @@ def _chat_with_model_generator(
                 return
             if harness_runtime is not None:
                 current_step = harness_runtime.begin_step()
+            # 用户点过"停止电脑操控"时，把那条模型可见通知插在 Step 边界：上一
+            # Step 的工具结果已经全部 append 并 flush，assistant(tool_calls) 与
+            # tool 结果配对完整；插在 Step 中间会制造悬空 tool_calls（Anthropic/
+            # OpenAI 都会 400）。放在这里也保证"先落库工具结果，再落库通知"。
+            _drained_stop_notices = _stop_notice.drain_stop_notices()
+            if _drained_stop_notices:
+                for _stop_notice_text in _drained_stop_notices:
+                    _stop_notice_msg = {
+                        "role": "user",
+                        "content": _stop_notice_text,
+                    }
+                    messages.append(_stop_notice_msg)
+                    pending_persistence.append(("user", _stop_notice_msg))
+                drained_stop_notices.extend(_drained_stop_notices)
+                flush_persistence()
+            # 时间预算提醒（子代理专用）：provider 每步返回一次提醒文本或 None。
+            # 只在 Step 边界插入——上一 Step 的工具调用与结果已配对并 flush，
+            # 插在 Step 中间会制造悬空 tool_calls（OpenAI/Anthropic 都会 400）。
+            # 主回合不传 provider，行为完全不变。
+            if budget_notice_provider is not None:
+                try:
+                    _budget_notice_text = budget_notice_provider()
+                except Exception:
+                    _budget_notice_text = None
+                if _budget_notice_text:
+                    _budget_notice_msg = {
+                        "role": "user",
+                        "content": str(_budget_notice_text),
+                    }
+                    messages.append(_budget_notice_msg)
+                    pending_persistence.append(("user", _budget_notice_msg))
+                    flush_persistence()
+                    _notify_event(
+                        event_callback,
+                        "budget_notice",
+                        {"message": str(_budget_notice_text)},
+                    )
             if turn > 0:
                 # 轮次边界事件：GUI 流式渲染据此把每个 LLM 轮次拆成独立消息块，
                 # 与历史重放（每轮一条 DB 记录）的结构对齐；CLI/子代理只认已知事件，自动忽略
@@ -5435,7 +2273,27 @@ def _chat_with_model_generator(
             # API 调用指数退避与 Jitter 抖动重试
             response_stream = None
             inflight_holder = None
+            # 多 Key 粘性故障转移：每个 Step 重建「本请求链已尝试 Key」集合
+            # （同 Step 重试循环共享、跨 Step 重置），Key 池自身（sticky/冷却）
+            # 为进程内存态跨 Step 保留。单 Key / 路由未知 / 任何异常时
+            # key_failover=None，行为与现状完全一致；绝不打印 Key 明文。
+            key_failover = None
+            try:
+                from core.provider_keys import build_key_failover
+
+                key_failover = build_key_failover(
+                    model_name, api_base, model_id=request_model_id
+                )
+                if key_failover is not None:
+                    kwargs["api_key"] = key_failover.initial_key()
+            except Exception:
+                key_failover = None
+                logger.debug("多 Key 池初始化失败，退回单 Key 行为", exc_info=True)
+            key_tried = set()  # 本请求链已尝试过的 Key（防同链重复试同一 Key）
             max_api_retries = 5
+            if key_failover is not None:
+                # 每个 Key 至少有一次尝试机会；单 Key 维持 5 次不变
+                max_api_retries = max(5, key_failover.key_count + 2)
             base_delay = 1.0
             # 超窗自动压缩只允许一次：压缩后仍超限说明单条消息/附件本身过大，
             # 继续重试只会反复重发超大载荷空烧额度
@@ -5446,7 +2304,9 @@ def _chat_with_model_generator(
             request_diagnostic = None
             active_deepseek_generation_id = None
             active_deepseek_message_count = None
+            active_deepseek_rotation_reason = ""
             cache_control_downgraded = False
+            affinity_downgraded = False
             wait_started_at = None
 
             for attempt in range(max_api_retries):
@@ -5477,11 +2337,14 @@ def _chat_with_model_generator(
                         kwargs["tools"] = effective_request_tools
                         active_deepseek_generation_id = ledger_request["generation_id"]
                         active_deepseek_message_count = len(cleaned_messages)
+                        active_deepseek_rotation_reason = (
+                            ledger_request.get("rotation_reason") or ""
+                        )
                     if _is_kimi_family(model_name, api_base):
                         # Moonshot 推理模型要求所有带 tool_calls 的 assistant 消息
                         # 携带 reasoning_content；从数据库重建的历史消息可能已被剥掉，
-                        # 这里补空格占位符（litellm 的 moonshot/ 路由会自动做，
-                        # 但经销商常用的 openai/ 路由不会）。
+                        # 这里补空格占位符，保证从数据库重建的历史消息也满足
+                        # Moonshot 官方与经销商网关的该校验。
                         for _m in cleaned_messages:
                             if (
                                 _m.get("role") == "assistant"
@@ -5491,6 +2354,13 @@ def _chat_with_model_generator(
                                 _m["reasoning_content"] = " "
                     current_message_shape = _cache_message_fingerprints(cleaned_messages)
                     if current_message_shape != classified_message_shape:
+                        # 覆盖指纹只进诊断记录（route_override_sha256），不塞进
+                        # _provider_request_options 的返回值——后者直接交给
+                        # litellm/native，多一个自定义键会触发未识别参数告警。
+                        from core.route_overrides import (  # 局部导入，避免模块循环依赖
+                            resolve_route_override,
+                        )
+
                         request_diagnostic = _classify_cache_request_details(
                             telemetry_session_id,
                             cache_scope,
@@ -5499,8 +2369,20 @@ def _chat_with_model_generator(
                             _tool_contract_fingerprint(effective_request_tools),
                             cleaned_messages,
                             tools=effective_request_tools,
+                            route_override_fingerprint=(
+                                resolve_route_override(model_name, api_base)["fingerprint"]
+                            ),
                         )
                         request_cache_reason = request_diagnostic["request_reason"]
+                        if active_deepseek_rotation_reason:
+                            # 账本换代原因比形状差分更精确（形状差分只能笼统看出
+                            # "上下文压缩或历史重写"）。非空即换代：request_cache_reason
+                            # 同步覆写，语义保持一致——两者都算"非热启动"，
+                            # 汇总侧 explicit_categories 也已把账本原因映射到既有分类。
+                            request_diagnostic["request_reason"] = (
+                                active_deepseek_rotation_reason
+                            )
+                            request_cache_reason = active_deepseek_rotation_reason
                         classified_message_shape = current_message_shape
                     kwargs["messages"] = _apply_cache_control(
                         cleaned_messages,
@@ -5508,6 +2390,15 @@ def _chat_with_model_generator(
                         api_base,
                         disabled=cache_control_downgraded,
                     )
+                    if request_diagnostic is not None:
+                        # Task 2：同一行同时回答「客户端逻辑前缀变了吗」（上方打标前
+                        # 构建的 sha256 / request_bytes）与「线上字节带几个显式标记」。
+                        # 此处按打标后的真实载荷补测；_apply_cache_control 是原地改写，
+                        # kwargs["messages"] 即最终上线字节。
+                        (
+                            request_diagnostic["cache_control_markers"],
+                            request_diagnostic["request_bytes_final"],
+                        ) = _cache_control_request_metrics(kwargs["messages"])
                     # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
                     # 超时随载荷放大：超大上下文 + 深度思考的首个 token 可能要几分钟，
                     # 90s 一刀切会让大载荷反复超时重发（每次重发输入都全额计费）
@@ -5551,15 +2442,23 @@ def _chat_with_model_generator(
                             attempt_timeout,
                             native_computer_tools=step_native_tools,
                         )
-                    request_envelope = RequestEnvelope.capture(
-                        prepared_request,
-                        cache_scope=cache_scope,
-                        request_reason=request_cache_reason,
-                        attempt=attempt + 1,
-                        deepseek_generation_id=active_deepseek_generation_id,
-                        deepseek_message_count=active_deepseek_message_count,
-                    )
-                    if current_step is not None:
+                    # 指纹层只观察请求：序列化失败（NaN/不可序列化对象等）不能
+                    # 杀掉主请求，跳过捕获并告警（该 step 缺指纹，不影响续跑——
+                    # resume 对缺指纹的 started-not-finished 一律 BLOCK）
+                    try:
+                        request_envelope = RequestEnvelope.capture(
+                            prepared_request,
+                            cache_scope=cache_scope,
+                            request_reason=request_cache_reason,
+                            attempt=attempt + 1,
+                            deepseek_generation_id=active_deepseek_generation_id,
+                            deepseek_message_count=active_deepseek_message_count,
+                            turn_reason=request_reason,
+                        )
+                    except Exception:
+                        logger.warning("请求指纹捕获失败（跳过，不影响请求）", exc_info=True)
+                        request_envelope = None
+                    if current_step is not None and request_envelope is not None:
                         current_step.capture_request(request_envelope)
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 在飞请求登记到 cancel_event 名下，停止路径可硬中断底层连接。
@@ -5582,6 +2481,16 @@ def _chat_with_model_generator(
                             # 等待超过阈值后按间隔报一次等待状态，避免大载荷请求
                             # 长时间无反馈被误判为“卡死”（重试提示只在异常后才有）
                             waited = time.monotonic() - wait_started_at
+                            if waited >= REQUEST_WAIT_GIVE_UP_SECONDS:
+                                # 等待硬上限：上层重试会把单次超时在
+                                # 同一 Step 内放大数倍，这里按客户端真实等待时长兜底，
+                                # 到点结束本轮而非无限等
+                                raise RequestWaitGiveUpError(
+                                    f"等待模型响应已达 {int(waited)} 秒"
+                                    f"（约 {int(REQUEST_WAIT_GIVE_UP_SECONDS // 60)} 分钟上限）"
+                                    "仍未收到首字节，本轮已自动结束；"
+                                    "可重试、缩小上下文或检查模型服务状态"
+                                )
                             if (
                                 waited >= WAIT_NOTICE_THRESHOLD_SECONDS
                                 and time.monotonic() - last_wait_notice_at >= WAIT_NOTICE_INTERVAL_SECONDS
@@ -5596,6 +2505,10 @@ def _chat_with_model_generator(
                                     print(f"\n[⏳ {wait_message}]")
                                 else:
                                     _notify_event(event_callback, "status", {"message": wait_message})
+                                    # 空心跳唤醒外层适配层的 drain_public_events()：
+                                    # status 事件只进 pending_events，若等待期不 yield，
+                                    # 会积压到首个正文 chunk 才一次性冲刷（提示扎堆弹出）
+                                    yield ""
                         if future.cancelled():
                             raise KeyboardInterrupt("用户终止了对话。")
                         exc = future.exception()
@@ -5607,16 +2520,27 @@ def _chat_with_model_generator(
                     finally:
                         # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
                         future.cancel()
+                    if key_failover is not None:
+                        # 粘性锚定到本次成功的 Key 并清除其冷却；
+                        # 记账失败绝不影响请求成功本身
+                        try:
+                            key_failover.on_success(str(kwargs.get("api_key") or ""))
+                        except Exception:
+                            pass
                     break
                 except Exception as api_err:
                     # 硬中断（用户取消关闭在飞流）会让请求线程抛连接错误；
                     # 先走取消判定，确保不误入下面的网络错误重试
                     raise_if_cancelled()
+                    if isinstance(api_err, RequestWaitGiveUpError):
+                        # 等待硬上限不是可重试错误：已等满上限时长，
+                        # 重试只会再等一个上限，直接结束本轮
+                        raise
                     err_str = str(api_err).lower()
                     # 上下文窗口超限自动压缩历史记录并重试：
                     # 优先按异常类型判断，字符串匹配作为兜底且要求上下文相关关键词组合，
                     # 避免把 rate limit 等错误误判为超限
-                    is_context_overflow = isinstance(api_err, _litellm_context_overflow_error())
+                    is_context_overflow = isinstance(api_err, _context_overflow_error())
                     if not is_context_overflow:
                         is_context_overflow = (
                             "prompt is too long" in err_str
@@ -5704,6 +2628,50 @@ def _chat_with_model_generator(
                         if attempt < max_api_retries - 1:
                             continue
 
+                    # 上游以 400 明确拒绝 Kimi 缓存亲和键（prompt_cache_key /
+                    # metadata.user_id）：本轮剥离亲和字段立即重发，并按路由
+                    # 临时拉黑（TTL 到期自愈），与 cache_control 降级完全同构。
+                    if not affinity_downgraded and _is_kimi_affinity_rejection(api_err):
+                        affinity_downgraded = True
+                        _disable_affinity_route(model_name, api_base)
+                        _strip_cache_affinity_options(kwargs)
+                        warn_msg = (
+                            "上游拒绝缓存亲和参数 (400)，已剥离并降级重试；"
+                            f"该路由的缓存亲和键在 {int(_CACHE_CONTROL_REJECTION_TTL_SECONDS // 60)} 分钟内不再启用。"
+                        )
+                        if event_callback is None:
+                            print(f"\n[⚠️ {warn_msg}]")
+                        else:
+                            _notify_event(event_callback, "status", {"message": warn_msg})
+                        if attempt < max_api_retries - 1:
+                            continue
+
+                    # 修复③：额度耗尽 / 鉴权失败 / 权限受限 / 模型不存在等确定性失败
+                    # 重试无意义，只会反复空烧额度、拖长用户等待；命中即直接抛出，
+                    # 走既有失败收尾（与五次重试耗尽后的路径一致）。分类失败保守回退
+                    # 既有重试行为，不改变瞬时错误（429 等）的退避口径。
+                    if _is_deterministic_api_failure(api_err):
+                        # 多 Key 粘性故障转移：Key 类失败（额度/鉴权/权限）静默切换
+                        # 到下一个未试过的 Key 重发——不发任何 UI 事件，仅 logger
+                        # 留痕（绝不打印 Key 明文）；其余确定性失败维持 fail-fast；
+                        # 全部 Key 试完 → 抛原错误走既有失败收尾。
+                        if key_failover is not None and _is_key_related_failure(api_err):
+                            current_key = str(kwargs.get("api_key") or "")
+                            key_tried.add(current_key)
+                            next_key = None
+                            try:
+                                next_key = key_failover.on_failure(current_key, key_tried)
+                            except Exception:
+                                next_key = None
+                            if next_key:
+                                kwargs["api_key"] = next_key
+                                logger.info(
+                                    "多 Key 静默切换：厂商 Key 不可用，"
+                                    "已切换下一个 Key 重发（不打印 Key 值）"
+                                )
+                                continue
+                        raise api_err
+
                     if attempt < max_api_retries - 1:
                         # 速率限制（429 / TooManyRequests / RateLimitError）需要更长退避，
                         # 普通网络抖动用短退避即可。优先遵守上游 retry-after 头。
@@ -5754,14 +2722,19 @@ def _chat_with_model_generator(
                 inflight_holder=inflight_holder, cancel_event=cancel_event,
             ):
                 raise_if_cancelled()
+                if chunk is None:
+                    # 流中段等待心跳：空正文让外层适配层 drain_public_events()
+                    # 实时冲刷积压的 status 事件（流挂起期间提示不再扎堆延迟）
+                    yield ""
+                    continue
                 if first_token_time is None:
                     first_token_time = time.monotonic()
                 update = stream_assembler.consume(chunk)
                 if update.public_text:
                     yield update.public_text
 
-            # litellm 流式包装器在 finish 之后收到的最终 usage chunk 会被吞进
-            # wrapper.chunks 而不再 yield（StopIteration 分支）。迭代中拿到的
+            # 流式包装器在 finish 之后收到的最终 usage chunk 可能只落入
+            # wrapper.chunks 而不再对外 yield（StopIteration 分支）。迭代中拿到的
             # 最后一个 usage 可能是不含缓存明细的中间态（prompt_tokens_details=None），
             # 导致 DeepSeek 等通道命中记账恒为 0。流结束后从 chunks 尾部补取最终 usage。
             _tail_chunks = getattr(response_stream, "chunks", None)
@@ -5811,7 +2784,7 @@ def _chat_with_model_generator(
 
             # 输出耗时与流速判定：
             # 1) 真实逐 chunk 流式：首 token 到末 chunk 之间的实际流式输出时长；
-            # 2) 假流式/批式投递（如 LiteLLM MockResponsesAPIStreamingIterator 或网关整包缓冲）：
+            # 2) 假流式/批式投递（如网关整包缓冲的 MockResponses 流）：
             #    首 token 与末 chunk 在 Python 内存中迭代仅耗费毫秒级（如 0.01s~0.03s），
             #    此时若直接除以 raw_output_duration 会算出几万 t/s 的荒谬除零毛刺。
             #    当流式输出时长极短（< 0.15s 且 token 较多）或速度算出来超出物理极限（> 1000 t/s）时，
@@ -5860,6 +2833,7 @@ def _chat_with_model_generator(
                 _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
 
             if cache_scope == "main" and keepalive_interval:
+                # session_key 与会话身份对齐：多会话各自保活，互不顶替
                 cache_keepalive_service.register_request(
                     kwargs,
                     interval=keepalive_interval,
@@ -5868,6 +2842,7 @@ def _chat_with_model_generator(
                         "api_base": api_base,
                         "session_id": telemetry_session_id,
                     },
+                    session_key=telemetry_session_id,
                 )
 
             # 流结束：按最终 usage chunk 严格校验并统一记账一次。
@@ -6012,6 +2987,10 @@ def _chat_with_model_generator(
             # 思考原文可能极长（数万字），直接全量促升会把大段内心独白倾倒给用户，
             # 因此只保留开头一段预览，其余截断。
             raw_content_meaningful = _is_meaningful_assistant_content(public_content)
+            # 促升前的原始正文快照：退化（复读）检测的指纹必须取这里的值。
+            # 一旦走到下面的促升分支，public_content 会被改写成思考预览，
+            # 此时再取指纹等于拿思考内容当正文指纹（口径错误，见下方退化检测块）。
+            pre_promotion_content = public_content
             promoted_reasoning = False
             if (
                 not assembled_response.tool_calls
@@ -6044,7 +3023,127 @@ def _chat_with_model_generator(
             current_tool_calls = tool_calls_list
             replay_reasoning_content = assembled_response.reasoning_content
             provider_thinking_blocks = assembled_response.thinking_blocks
-                
+
+            # 退化（复读）检测（修复②）：模型连续多步只重复同一段短正文
+            # （"好。""嗯。"这类填充词或其近似变体）时，既不产出结论也不推进任务，
+            # 前端气泡持续刷屏、状态栏长期停在"生成中"，用户视角等同卡死。
+            # progress_guard 只比确定性状态、不读正文（有意设计），对这类失效不敏感，
+            # 因此在这里按正文指纹滑窗补一道护栏：首次命中发 notice 并要求收敛，
+            # 二次命中发 error 后走慢步熔断同一收尾路径结束回合。
+            # 注意：正文指纹取 pre_promotion_content（促升前的原始正文快照）——
+            # 上面的 reasoning 促升分支会把 public_content 改写成思考预览，若在促升后
+            # 取指纹（曾经就是如此），退化检测会拿思考预览当正文指纹（口径错误），
+            # 于是"连续几步只输出思考"被误判成正文复读，抢走促升兜底与总结催促的职责。
+            # 口径修正：退化判定只保留正文指纹，思考指纹不再参与熔断。理由是思考内容
+            # 在多步推理中天然高度相似（模型自检 / 复述思考），拿它做复读判据会误伤正常
+            # 推理；而"只输出思考、无正文"的场景本就由既有的 reasoning 促升兜底与总结
+            # 催促（FINAL_SUMMARY_MAX_RETRIES）护栏负责，并有专门测试守着。退化熔断因此
+            # 只针对正文复读这一种故障模式——故障现场正是"每步只输出'好。''嗯。''OK。'
+            # 这类填充词正文"。
+            # 收紧（修复②）：判定只针对"空转步"——有工具调用说明模型正在推进任务，
+            # 不属于"既不调工具也不给结论"的故障模式。若对有工具调用的步也判定，
+            # 首次命中会 continue 直接丢弃该步真实 tool_calls（工具不执行、assistant
+            # 消息不入历史），把"连续几步回相似短句但各自调用不同工具"的正常多步任务
+            # 误杀。这里与慢步熔断的 `not tool_calls_list` 前置条件保持同一口径：
+            # 只有无工具调用的步才累计指纹并参与判定。
+            if not tool_calls_list:
+                recent_content_fingerprints.append(
+                    _degenerate_fingerprint(pre_promotion_content)
+                )
+                if _is_degenerate_repeat(recent_content_fingerprints):
+                    if degenerate_nudge_count < _DEGENERATE_MAX_NUDGES:
+                        degenerate_nudge_count += 1
+                        _notify_event(event_callback, "notice", {
+                            "message": "检测到模型连续多步复读相同内容，已要求其立即收敛并给出结论。",
+                        })
+                        # 与慢步熔断同一通道：同时写内存与持久化，并立即 flush，
+                        # 否则下一轮重建历史时这条催促会丢失。
+                        degenerate_nudge = {
+                            "role": "user",
+                            "content": SLOW_STEP_NUDGE_TEXT,
+                        }
+                        messages.append(degenerate_nudge)
+                        pending_persistence.append(("user", degenerate_nudge))
+                        flush_persistence()
+                        # 复读本身无确定性状态变化：计入进展观察（停滞计数 +1）
+                        progress_guard.observe(
+                            _step_progress_observation(None, session_id=parent_session)
+                        )
+                        # Step 状态机要求 STREAMING → ASSISTANT_READY → COMPLETED，
+                        # 此处尚未走常规 mark_assistant_ready 路径，先补迁移再进入下一轮。
+                        if current_step is not None:
+                            current_step.mark_assistant_ready()
+                            if turn + 1 < max_turns:
+                                current_step.complete()
+                        continue
+                    # 催促过仍未收敛：发 error 让用户可见（禁止静默收尾），并走慢步
+                    # 熔断同一收尾路径结束循环、返回已产出的内容。
+                    _notify_event(event_callback, "error", {
+                        "message": "模型连续多步复读相同内容且未收敛，已触发退化熔断结束本回合。",
+                    })
+                    if promoted_reasoning and public_content:
+                        yield from _yield_content(public_content)
+                    flush_persistence()
+                    if current_step is not None:
+                        current_step.mark_assistant_ready()
+                        current_step.complete()
+                    if harness_runtime is not None:
+                        harness_runtime.complete()
+                    computer_exit_kind = "completed"
+                    return
+
+            # 慢步熔断（防止推理型小模型思考失控、静默空转、零产出）：
+            # 单步耗时超过 SLOW_STEP_ABORT_SECONDS 且既未产出正文、也未发起工具
+            # 调用时，说明模型在空转烧时间。首次触发先追加一条强催促（要求立即
+            # 输出最终结论、禁止继续自检或复述思考）再进入下一轮；达到上限后再次
+            # 触发则直接结束循环、返回已产出的内容，不再让它继续空转。
+            # 未超过阈值时该分支恒不进入——对既有逻辑与稳定前缀字节零影响。
+            if (
+                duration_s > SLOW_STEP_ABORT_SECONDS
+                and not raw_content_meaningful
+                and not tool_calls_list
+            ):
+                if slow_step_nudge_count < SLOW_STEP_MAX_NUDGES:
+                    slow_step_nudge_count += 1
+                    _notify_event(event_callback, "notice", {
+                        "message": "检测到单步长时间无产出，已要求模型立即收敛输出结论。",
+                    })
+                    slow_step_nudge = {
+                        "role": "user",
+                        "content": SLOW_STEP_NUDGE_TEXT,
+                    }
+                    # 空的 assistant 消息（content 为 None）不入库也不留内存，只追加
+                    # 强催促；催促使消息同样需要持久化，避免下一轮重建历史时上下文缺失。
+                    messages.append(slow_step_nudge)
+                    pending_persistence.append(("user", slow_step_nudge))
+                    flush_persistence()
+                    # 空转本身无确定性状态变化：计入进展观察（停滞计数 +1）
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
+                    # Step 状态机要求 STREAMING → ASSISTANT_READY → COMPLETED，
+                    # 此处尚未走常规 mark_assistant_ready 路径，先补迁移再收尾。
+                    if current_step is not None:
+                        current_step.mark_assistant_ready()
+                        if turn + 1 < max_turns:
+                            current_step.complete()
+                    continue
+                # 达到催促上限仍空转：结束循环，返回已产出的内容，避免继续消耗。
+                _notify_event(event_callback, "error", {
+                    "message": "模型连续多步耗时过长且无任何产出，已触发慢步熔断结束本回合。",
+                })
+                if promoted_reasoning and public_content:
+                    yield from _yield_content(public_content)
+                flush_persistence()
+                if current_step is not None:
+                    current_step.mark_assistant_ready()
+                    current_step.complete()
+                if harness_runtime is not None:
+                    harness_runtime.complete()
+                computer_exit_kind = "completed"
+                return
+
+
             message_to_append = {
                 "role": "assistant",
                 "content": public_content or None,
@@ -6140,20 +3239,11 @@ def _chat_with_model_generator(
                     # 留在历史里会让下一轮 API 报 400（Anthropic 拒绝空 content）
                     messages.pop()
                     if tool_activity_seen:
-                        nudge_text = (
-                            "工具已经执行完毕。现在必须只输出最终中文检查结论，"
-                            "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
-                            + length_hint
-                        )
+                        nudge_text = SUMMARY_NUDGE_TOOL_DONE_TEXT + length_hint
                     else:
                         # 模型只输出思考、未调用任何工具也未给出正文：催促它真正行动，
                         # 而不是把内心独白当成交付结果。
-                        nudge_text = (
-                            "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
-                            "也没有给出正式回复。请立即继续：需要执行操作就调用相应工具，"
-                            "任务已完成就直接输出中文结论；不要只输出思考内容。"
-                            + length_hint
-                        )
+                        nudge_text = SUMMARY_NUDGE_THINKING_ONLY_TEXT + length_hint
                     summary_request = {
                         "role": "user",
                         "content": nudge_text,
@@ -6170,6 +3260,35 @@ def _chat_with_model_generator(
                         current_step.complete()
                     # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
                     # 这里不再发 status 通知暴露"模型未生成结论"的内部细节。
+                    continue
+                # D 方案：验证声明护栏——模型口头声称"测试通过/已验证"，但本回合
+                # 既用过写入类工具、又完全没执行过命令（无验证证据）时，追加一次
+                # 提醒要求它真实运行并贴出原始输出，避免"看起来有依据"的谎报收尾。
+                # 未命中时该分支恒不进入，对既有请求字节与流程零影响。
+                if (
+                    verify_claim_nudge_count < VERIFY_CLAIM_MAX_NUDGES
+                    and _claims_verification_without_evidence(
+                        public_content, used_write_tools, used_command_tools
+                    )
+                ):
+                    verify_claim_nudge_count += 1
+                    _notify_event(event_callback, "notice", {
+                        "message": "检测到验证声明但本回合未执行任何命令，已要求模型补充真实运行输出。",
+                    })
+                    claim_nudge = {
+                        "role": "user",
+                        "content": VERIFY_CLAIM_NUDGE_TEXT,
+                    }
+                    messages.append(claim_nudge)
+                    # 催促消息同样需要持久化，否则下一轮重建历史时上下文会缺失
+                    pending_persistence.append(("user", claim_nudge))
+                    flush_persistence()
+                    # 催促本身无确定性状态变化：计入进展观察（停滞计数 +1）
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
+                    if current_step is not None and turn + 1 < max_turns:
+                        current_step.complete()
                     continue
                 # 计划仍有可执行项时不允许提前收尾：向模型注入续推消息，
                 # 要求继续通过 run_subagent 完成剩余计划项（最多续推 2 次，
@@ -6205,13 +3324,14 @@ def _chat_with_model_generator(
                         )
                         nudge_request = {
                             "role": "user",
-                            "content": (
-                                f"计划尚未执行完毕，仍有可执行的计划项: [{hints}]。"
-                                "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项；"
-                                "若某项确实无法完成，请先用 plan_read 查看状态并明确说明原因，"
-                                "不要在计划未完成时直接结束回答。"
-                            ),
+                            "content": PLAN_CONTINUE_NUDGE_TEXT.format(hints=hints),
                         }
+                        # 注入催促消息后继续下一轮（与下方 Stop-hook 续跑同模式：
+                        # append + pending_persistence + flush_persistence）。
+                        # v1.1.51 重构时曾丢失这两行 append，导致模型从未真正
+                        # 收到催促、只有 UI 在空提醒——此处按 v1.1.25 原实现恢复。
+                        messages.append(nudge_request)
+                        pending_persistence.append(("user", nudge_request))
                         _notify_event(event_callback, "notice", {
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })
@@ -6223,6 +3343,59 @@ def _chat_with_model_generator(
                         if current_step is not None and turn + 1 < max_turns:
                             current_step.complete()
                         continue
+                # C8/C9（规格 01 §5.2/§5.5）：Stop hook——模型准备结束回合时询问
+                # 用户配置的 Stop hook；请求续跑且未达上限（5 次）时注入上下文
+                # 继续下一轮，超限强制结束并告警。无 hooks 配置时 evaluate_stop
+                # 返回 None，整段零开销、行为与改造前完全一致。
+                try:
+                    from core.hooks.lifecycle import (
+                        evaluate_stop,
+                        get_default_hook_runner,
+                        get_stop_continue_state,
+                    )
+
+                    _stop_decision = evaluate_stop(
+                        get_stop_continue_state(),
+                        get_default_hook_runner(),
+                        session_id=parent_session,
+                        turn_id=parent_turn_id,
+                        response_preview=str(public_content or "")[:200],
+                        tool_call_count=turn_tool_call_count,
+                    )
+                except Exception:
+                    _stop_decision = None
+                if (
+                    _stop_decision is not None
+                    and _stop_decision.get("continue")
+                    and turn + 1 < max_turns
+                ):
+                    for _stop_msg in _stop_decision.get("messages") or ():
+                        messages.append(_stop_msg)
+                        pending_persistence.append(("user", _stop_msg))
+                    flush_persistence()
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
+                    if current_step is not None and turn + 1 < max_turns:
+                        current_step.complete()
+                    continue
+                if (
+                    _stop_decision is not None
+                    and _stop_decision.get("continue")
+                    and turn + 1 >= max_turns
+                ):
+                    # 审查修复：hook 请求续跑但已达回合步数上限——不再注入
+                    # 上下文，显式告警（原实现静默丢弃，用户无从感知）。
+                    _notify_event(event_callback, "notice", {
+                        "message": (
+                            "Stop hook 请求继续执行，但已达本回合步数上限，"
+                            "未能续跑（如需继续请开启新回合）。"
+                        ),
+                    })
+                if _stop_decision is not None and _stop_decision.get("limit_hit"):
+                    _notify_event(event_callback, "notice", {
+                        "message": str(_stop_decision.get("warning") or ""),
+                    })
                 # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
                 # "思考完成" 后陷入沉默（常见于某些模型只输出 reasoning 或空回复）。
                 # 判断用促升前的原始正文（raw_content_meaningful）：促升兜底本身
@@ -6287,6 +3460,15 @@ def _chat_with_model_generator(
                 continue
 
             tool_activity_seen = True
+            # C8/C9：累计本回合工具调用总次数（Stop hook 的 tool_call_count 输入）。
+            turn_tool_call_count += len(tool_calls_list)
+            # D 方案：累计本回合的工具类别（写入类/命令执行类），供收尾时的验证
+            # 声明护栏判定；只看本轮已发的 tool_calls，不改动请求或执行流程。
+            step_used_write_tools, step_used_command_tools = _tool_call_activity_kinds(
+                tool_calls_list
+            )
+            used_write_tools = used_write_tools or step_used_write_tools
+            used_command_tools = used_command_tools or step_used_command_tools
             if event_callback is None:
                 app_context.set_task_status('executing')
                 app_context.invalidate_ui()
@@ -6365,6 +3547,46 @@ def _chat_with_model_generator(
 
             from core.harness.tool_pipeline import ToolBatchExecutor
 
+            def _harness_journal_sink(kind, facts):
+                """把工具事件的脱敏事实写进 harness journal（断点续跑依据）。
+
+                只落哈希与元数据；任何异常都吞掉，绝不影响工具执行。
+                """
+                try:
+                    journal = getattr(
+                        getattr(current_step, "turn", None), "journal", None
+                    )
+                    if journal is None:
+                        return
+                    from core.harness.models import (
+                        HarnessEventKind,
+                        JournalEventDraft,
+                    )
+
+                    if kind == "tool_started":
+                        event_kind = HarnessEventKind.TOOL_STARTED
+                    elif kind == "tool_finished":
+                        event_kind = HarnessEventKind.TOOL_FINISHED
+                    else:
+                        return
+                    journal.append_event(
+                        current_step.turn.turn_id,
+                        JournalEventDraft(
+                            kind=event_kind,
+                            step_id=getattr(current_step, "step_id", None),
+                            tool_name=facts.get("tool_name"),
+                            call_ordinal=facts.get("call_ordinal"),
+                            arguments_sha256=facts.get("arguments_sha256"),
+                            result_sha256=facts.get("result_sha256"),
+                            duration_ms=facts.get("duration_ms"),
+                            result_status=facts.get("result_status"),
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "harness journal sink failed for %s", kind, exc_info=True
+                    )
+
             tool_pipeline, tool_context = _build_tool_pipeline_and_context(
                 event_callback,
                 parent_session=parent_session,
@@ -6375,6 +3597,11 @@ def _chat_with_model_generator(
                 permission_source=permission_source,
                 computer_lease=computer_lease,
                 computer_native_selection=native_selection,
+                # 续跑记录（S1-b）：没有 harness 回合时保持 None，行为不变。
+                journal_event_sink=(
+                    _harness_journal_sink if current_step is not None else None
+                ),
+                harness_step=current_step,
             )
             tool_calls_by_id = {
                 tool_call["id"]: tool_call for tool_call in tool_calls_list
@@ -6411,6 +3638,13 @@ def _chat_with_model_generator(
             notify_tool_event = (
                 lambda kind, payload: _notify_event(event_callback, kind, payload)
             )
+            # 续跑打点：记录本轮计划执行的工具调用总数。生产路径不走
+            # ToolBatchExecutor.execute()，必须在这里补一次，否则该列始终为空。
+            if current_step is not None:
+                try:
+                    current_step.mark_tool_call_count(len(tool_calls_list))
+                except Exception:
+                    logger.warning("mark tool call count failed", exc_info=True)
             for prepared_batch in batch_executor.prepare(
                 tool_calls_list,
                 tool_context,
@@ -6431,6 +3665,11 @@ def _chat_with_model_generator(
                 records,
                 key=lambda record: record.call_ordinal,
             ))
+
+            # 编排提醒（软）：多步实质操作仍未建计划时拉一把，每回合最多一次。
+            # 实质操作数在此累计；提醒本体的 append 推迟到全部 tool 结果（含
+            # follow-up 观察消息）之后，见下方"工具结果全部入列后再追加"处。
+            substantive_op_count += _count_substantive_ops(tool_calls_list)
 
             results = [record.message for record in records]
             # follow-up 观察 user 消息按 call ordinal 追加在全部 tool results
@@ -6453,6 +3692,40 @@ def _chat_with_model_generator(
                     pending_persistence.extend(
                         ("user", followup) for followup in followup_messages
                     )
+
+            # 工具结果全部入列后，再追加编排提醒：保证 messages 顺序为
+            # assistant(tool_calls) → tool(...)（含 follow-up 观察消息）→ user(提醒)，
+            # 满足 Anthropic「tool_use 后必须紧跟 tool_result」与 OpenAI「tool_calls
+            # 必须被 tool 消息应答」的约束；pending_persistence 入队顺序与之一致。
+            # 同一 turn 只注入一次：除生成器局部 orchestration_nudge_sent 外，还按
+            # turn_id 做进程内去重（异常重入时不再重复注入）。
+            if _should_nudge_orchestration(
+                allow_subagents=allow_subagents,
+                count=substantive_op_count,
+                session_id=parent_session,
+                turn_id=parent_turn_id,
+                already_sent=orchestration_nudge_sent,
+            ):
+                orchestration_nudge_sent = True
+                _register_orchestration_nudge(parent_turn_id)
+                orchestration_request = {
+                    "role": "user",
+                    "content": _ORCHESTRATION_NUDGE_TEXT,
+                }
+                messages.append(orchestration_request)
+                # 此处不重复加 if stream 守卫：flush_persistence() 内部已以
+                # `if stream and pending_persistence` 整体兜底，非持久化会话
+                # （stream=False，即 persist=False 的内部调用）下该 append 与随后的
+                # flush 均为 no-op，行为等价；与 slow_step_nudge / summary_request /
+                # claim_nudge 等既有 nudge 注入保持同一种写法（统一由 flush_persistence
+                # 兜底，不逐点加守卫）。
+                pending_persistence.append(("user", orchestration_request))
+                # 静默注入：不发 notice 事件（UI 不弹提示卡片），只留 debug 日志
+                logger.debug("已静默注入编排提醒（session=%s turn=%s）", parent_session, parent_turn_id)
+                flush_persistence()
+                progress_guard.observe(
+                    _step_progress_observation(None, session_id=parent_session)
+                )
 
             if event_callback is None:
                 app_context.set_task_status('executing')
@@ -6526,7 +3799,13 @@ def _chat_with_model_generator(
             # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
             rollback_turn_messages()
         if harness_runtime is not None:
-            harness_runtime.cancel()
+            # 取消收尾 best-effort：cancel() 内 journal CAS 失败若抛出会顶替
+            # 原始 KeyboardInterrupt，外层把"用户取消"渲染成 FAILED；残留的
+            # 非终态 Turn 由崩溃恢复路径标 interrupted 收敛。
+            try:
+                harness_runtime.cancel()
+            except Exception:
+                logger.warning("用户取消的 harness 收尾失败（交由恢复路径收敛）", exc_info=True)
         raise
     except GeneratorExit:
         # GUI 消费端检测到取消后 break，生成器在 yield 点被 close：这条路径
@@ -6547,7 +3826,11 @@ def _chat_with_model_generator(
                 harness_runtime.fail(type(salvage_error).__name__)
             raise
         if harness_runtime is not None:
-            harness_runtime.cancel()
+            # 同 KeyboardInterrupt 路径：收尾 best-effort，不顶替原始异常
+            try:
+                harness_runtime.cancel()
+            except Exception:
+                logger.warning("生成器取消的 harness 收尾失败（交由恢复路径收敛）", exc_info=True)
         raise
     except Exception as e:
         computer_exit_kind = "failed"
@@ -6555,6 +3838,17 @@ def _chat_with_model_generator(
             response_stream.close()
         except Exception:
             pass
+        # A1-02：连接中断等通用异常同样先把本 step 已生成的部分正文与待写
+        # 队列打捞落库（带「[本轮流式中断]」标注）——否则用户所见正文重开
+        # 会话即消失（DB 与所见分叉）。打捞为 best-effort：失败不掩盖原始
+        # 异常的报告流程，仅记录 harness 失败原因。
+        try:
+            salvage_streaming_partial()
+            salvage_persistence_on_cancel()
+            flush_persistence()
+        except Exception as salvage_error:
+            if harness_runtime is not None:
+                harness_runtime.fail(type(salvage_error).__name__)
         # 异常路径同样回滚本轮未持久化的内存消息：既避免留下带 tool_calls 却无
         # tool 响应的悬空 assistant 消息（下一轮 API 会 400），也保持内存历史与 DB 一致
         rollback_turn_messages()
@@ -6563,19 +3857,51 @@ def _chat_with_model_generator(
         if e is persistence_failure:
             raise
         if event_callback is not None:
+            user_facing_msg = _format_user_facing_error(e)
             _notify_event(event_callback, "error", {
-                "message": _sanitize_error_text(e),
+                "message": user_facing_msg,
             })
             # 专用结束事件：chat_with_model_events 不再为异常回合发 turn_finished
             _notify_event(event_callback, "turn_error", {
-                "message": _sanitize_error_text(e),
+                "message": user_facing_msg,
             })
         else:
             from prompt_toolkit.formatted_text import HTML
 
-            safe_print(HTML(f"<ansiyellow>{_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
+            safe_print(HTML(f"<ansiyellow>{_current_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
         return
     finally:
+        # 注入了 system_prompt_extra 时，messages 是本次请求专用的新列表：循环里
+        # 追加的 assistant/tool 消息仍要按原样回写到调用方共享的原始列表，保持既有
+        # 语义不变（例如非流式 chat_with_model 依赖 messages[-1] 读取最终回复）。
+        # 只回写"新出现的"元素，注入的 system 消息本身绝不写回调用方列表。
+        if original_messages is not None:
+            original_messages.extend(
+                item
+                for item in messages
+                if item is not extra_injected_message
+                and id(item) not in original_message_ids
+            )
         # 电脑操控 run 收尾（Task 10，设计 14.2）：任何 Turn 终态二选一调用
         # complete_run/stop，不留 running 租约；无 run 时是幂等 no-op。
         _finalize_computer_run()
+
+
+def __getattr__(name):
+    """PEP 562 模块级动态属性解析。
+
+    - _token_usage_listener：set_token_usage_listener 运行期重绑的是
+      core.llm_diagnostics 的模块全局，静态 re-export 会把导入时的 None 快照
+      永久留在 core.llm 上误导内省；动态读取保证始终反映当前监听器。
+    - mcp_manager / TOOLS_SCHEMA：兼容别名，惰性求值，避免 import
+      core.llm 时就拉起 mcp 包全家桶（~1.1s）；不缓存到
+      globals，保证外部属性访问始终反映当前值（测试 monkeypatch 友好）。
+    """
+    if name == "_token_usage_listener":
+        from core import llm_diagnostics
+        return getattr(llm_diagnostics, "_token_usage_listener")
+    if name == "TOOLS_SCHEMA":
+        return get_tools_schema()
+    if name == "mcp_manager":
+        return _get_mcp_manager()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,5 +1,7 @@
 """core/skills.py 内置技能释放（sync_builtin_skills）的单元测试。"""
 
+import os
+
 import pytest
 
 import config
@@ -92,3 +94,199 @@ def test_sync_ignores_dirs_without_skill_md(sync_env):
 
     assert not (user_base / "not-a-skill").exists()
     assert skills.get_active_skill_ids() == []
+
+
+# ------------------------------------------------------------------
+# 已释放内置技能的跟随升级：用户没改过 → 跟随新版；改过 → 绝不覆盖
+# ------------------------------------------------------------------
+
+def _rewrite_builtin_skill(src, name, body):
+    """模拟新版发布：改写内置源中的技能正文（目录已存在）。"""
+    (src / name / "SKILL.md").write_text(
+        f"---\nname: {name}\n---\n{body}\n", encoding="utf-8"
+    )
+
+
+def _resync():
+    """模拟应用重启：解除一次性守卫后再次同步。"""
+    skills._BUILTIN_SYNC_DONE = False
+    skills.sync_builtin_skills()
+
+
+def test_sync_upgrades_unmodified_builtin_skill(sync_env):
+    """用户没改动过的内置技能，应跟随新版本自动升级"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 旧版正文")
+    skills.sync_builtin_skills()
+    assert "旧版正文" in (user_base / "plugin-creator" / "SKILL.md").read_text(encoding="utf-8")
+
+    _rewrite_builtin_skill(src, "plugin-creator", "# 新版正文")
+    _resync()
+
+    assert "新版正文" in (user_base / "plugin-creator" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_sync_does_not_upgrade_user_modified_skill(sync_env):
+    """用户改过的内置技能，即使内置源发布了新版本也不能被覆盖"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 旧版正文")
+    skills.sync_builtin_skills()
+    (user_base / "plugin-creator" / "SKILL.md").write_text("用户自定义内容", encoding="utf-8")
+
+    _rewrite_builtin_skill(src, "plugin-creator", "# 新版正文")
+    _resync()
+
+    assert (user_base / "plugin-creator" / "SKILL.md").read_text(encoding="utf-8") == "用户自定义内容"
+
+
+def test_sync_upgrade_replaces_whole_directory(sync_env):
+    """升级为整目录替换：新版本删掉的文件不应残留在用户目录"""
+    src, user_base, _ = sync_env
+    builtin_dir = _make_builtin_skill(src, "plugin-creator", body="# 旧版正文")
+    (builtin_dir / "legacy.md").write_text("旧版遗留", encoding="utf-8")
+    skills.sync_builtin_skills()
+    assert (user_base / "plugin-creator" / "legacy.md").is_file()
+
+    (builtin_dir / "legacy.md").unlink()
+    _rewrite_builtin_skill(src, "plugin-creator", "# 新版正文")
+    _resync()
+
+    assert not (user_base / "plugin-creator" / "legacy.md").exists()
+    assert "新版正文" in (user_base / "plugin-creator" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_sync_upgrade_keeps_builtin_source_label(sync_env):
+    """升级后应刷新内容索引，该技能来源仍被识别为内置"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 旧版正文")
+    skills.sync_builtin_skills()
+
+    _rewrite_builtin_skill(src, "plugin-creator", "# 新版正文")
+    _resync()
+
+    index = skills.load_builtin_skill_index()
+    assert skills.classify_skill_source(str(user_base / "plugin-creator"), index) == "builtin"
+
+
+# ------------------------------------------------------------------
+# 恢复内置版本（restore_builtin_skill）：用户显式发起的覆盖，不做"是否改过"判断
+# ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# 指纹口径迁移：口径版本变化时按当前算法一次性重建索引（保守）
+# ------------------------------------------------------------------
+
+def _write_stale_index_and_drop_version(recorded):
+    """模拟"老安装"：索引里是旧口径的记录值，且没有口径版本文件。"""
+    config._atomic_write_json(
+        skills._builtin_skills_index_file(), {"plugin-creator": recorded}, indent=None
+    )
+    version_file = skills._builtin_skills_index_version_file()
+    if os.path.exists(version_file):
+        os.remove(version_file)
+    return version_file
+
+
+def test_sync_rebuilds_index_when_algo_version_missing(sync_env):
+    """口径迁移：版本文件缺失时按当前算法重建索引，未改动过的技能重新入库为 builtin。"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 内置正文")
+    skills.sync_builtin_skills()
+    user_dir = user_base / "plugin-creator"
+    real_fp = skills._skill_dir_fingerprint(str(user_dir))
+    version_file = _write_stale_index_and_drop_version("old-algo")
+
+    _resync()
+
+    assert skills.load_builtin_skill_index()["plugin-creator"] == real_fp
+    assert skills.classify_skill_source(str(user_dir)) == "builtin"
+    # 迁移完成后必须落脚版本文件，避免每次启动全量重算
+    assert os.path.exists(version_file)
+
+
+def test_sync_migration_keeps_user_modified_skill_out_of_index(sync_env):
+    """口径迁移必须保守：用户改动过的技能不得被写回索引（否则会被误标内置且失去升级保护）。"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 内置正文")
+    skills.sync_builtin_skills()
+    user_dir = user_base / "plugin-creator"
+    (user_dir / "SKILL.md").write_text("用户自定义内容", encoding="utf-8")
+    _write_stale_index_and_drop_version("old-algo")
+
+    _resync()
+
+    assert skills.classify_skill_source(
+        str(user_dir), skills.load_builtin_skill_index()
+    ) == "user"
+    assert (user_dir / "SKILL.md").read_text(encoding="utf-8") == "用户自定义内容"
+    assert os.path.exists(skills._builtin_skills_index_version_file())
+
+
+def test_get_released_builtin_names_without_file(sync_env):
+    """没有任何释放记录时返回空集合，且不抛异常"""
+    _ = sync_env
+    assert skills.get_released_builtin_names() == set()
+
+
+def test_get_released_builtin_names_after_release(sync_env):
+    """释放过技能后能读出对应技能名"""
+    src, _, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator")
+    skills.sync_builtin_skills()
+
+    assert "plugin-creator" in skills.get_released_builtin_names()
+
+
+def test_restore_builtin_skill_overwrites_user_modification(sync_env):
+    """恢复被用户改过的内置技能：内容回到内置源版本"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 内置正文")
+    skills.sync_builtin_skills()
+    (user_base / "plugin-creator" / "SKILL.md").write_text("用户自定义内容", encoding="utf-8")
+
+    result = skills.restore_builtin_skill("plugin-creator")
+
+    assert result.get("ok") is True
+    assert "内置正文" in (user_base / "plugin-creator" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_restore_builtin_skill_recreates_deleted_skill(sync_env):
+    """恢复被用户删除的内置技能：目录重新出现且内容正确"""
+    import shutil
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 内置正文")
+    skills.sync_builtin_skills()
+    shutil.rmtree(user_base / "plugin-creator")
+    assert not (user_base / "plugin-creator").exists()
+
+    result = skills.restore_builtin_skill("plugin-creator")
+
+    assert result.get("ok") is True
+    assert (user_base / "plugin-creator" / "SKILL.md").is_file()
+    assert "内置正文" in (user_base / "plugin-creator" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_restore_builtin_skill_missing_in_source(sync_env):
+    """内置源中不存在该技能：返回 ok=False 且带提示"""
+    src, _, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator")
+    skills.sync_builtin_skills()
+
+    result = skills.restore_builtin_skill("no-such-skill")
+
+    assert result.get("ok") is False
+    assert result.get("msg") == "内置源中不存在该技能"
+
+
+def test_restore_builtin_skill_refreshes_index(sync_env):
+    """恢复后应刷新内容索引，该技能重新被识别为内置"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 内置正文")
+    skills.sync_builtin_skills()
+    (user_base / "plugin-creator" / "SKILL.md").write_text("用户自定义内容", encoding="utf-8")
+    assert skills.classify_skill_source(str(user_base / "plugin-creator")) == "user"
+
+    skills.restore_builtin_skill("plugin-creator")
+
+    index = skills.load_builtin_skill_index()
+    assert skills.classify_skill_source(str(user_base / "plugin-creator"), index) == "builtin"

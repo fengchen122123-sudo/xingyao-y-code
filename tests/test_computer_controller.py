@@ -142,12 +142,30 @@ def running_run(service, owner_a, capability):
 # ---------------- brief Step 1 样例（逐字） ----------------
 
 
+def test_every_event_carries_owner_session_id(service, owner_a, capability):
+    """事件信封必须带 run 归属会话：前端用首个事件建立运行态，「操控」页签按
+    归属会话登记——归属只在快照里时，首帧只能回落当前查看的会话，后台会话
+    发起的操控会串到用户眼前的另一个会话（2026-10-30 反馈）。"""
+    events = []
+    service.add_listener(events.append)
+    run = service.start_run(owner_a, capability, target=None)
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+
+    assert events
+    assert {"computer_state", "computer_observation"} <= {event["type"] for event in events}
+    assert all(event["owner_session_id"] == "session-a" for event in events)
+
+
 def test_second_owner_cannot_take_active_lease(service, owner_a, owner_b, capability):
     run = service.start_run(owner_a, capability, target="desktop")
     with pytest.raises(ComputerControlError) as raised:
         service.start_run(owner_b, capability, target="desktop")
     assert raised.value.code == "computer_session_busy"
-    assert raised.value.details == {"owner_session_label": owner_a.session_label}
+    assert raised.value.details["owner_session_label"] == owner_a.session_label
+    # L3 可诊断性：占用错误必须说明被占 run 当前处于什么状态，
+    # 否则用户只看到"被占用"，无法判断该等它结束还是该手动停止。
+    assert raised.value.details["owner_run_status"] == "running"
+    assert "当前状态：running" in raised.value.message
     assert service.snapshot().run_id == run.run_id
 
 
@@ -188,12 +206,52 @@ def test_complete_run_releases_lease_but_retains_browser_session(service, runnin
     assert new_run.run_id != running_run.run_id
 
 
+def test_complete_run_from_waiting_for_user_releases_lease(
+    service, running_run, owner_a, owner_b, capability
+):
+    """L1：用户接管态（waiting_for_user）的 run 也能按“完成”收尾并释放租约。
+
+    回合以 completed 收尾时必须允许 waiting_for_user → completing；否则 run
+    既不终结也不清理，租约留活，下一回合被 computer_session_busy 永久挡死。
+    """
+    service.execute(
+        running_run.run_id, owner_a,
+        ComputerAction(kind="request_user_takeover", target="browser", reason_code="login_required"),
+    )
+    assert service.snapshot().status == "waiting_for_user"
+    snapshot = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
+    assert snapshot.status == "completed"
+    # 接管态收尾与普通收尾同为 retain=True：绝不能关闭 backend —— 外部
+    # Edge/Chrome 上 close() 会直接关掉用户此刻正在手动操作的浏览器窗口
+    # （接管场景恰恰正在用那个窗口）；内置浏览器上 close() 虽只断 CDP
+    # 连接，但保留会话还能让下一回合免去重连。
+    assert service.backend.close_count == 0
+    assert service.backend.release_count == 1
+    # 租约已释放：另一 owner 立即可以开新 run，不抛 computer_session_busy。
+    new_run_id = service.start_run(owner_b, capability, target="browser").run_id
+    assert new_run_id != running_run.run_id
+
+
 def test_stop_is_idempotent_and_releases_inputs_once(service, running_run):
     first = service.stop(running_run.run_id, "hotkey")
     second = service.stop(running_run.run_id, "hotkey")
     assert first.status == second.status == "stopped"
     assert service.backend.release_count == 1
     assert service.backend.close_count == 1
+
+
+def test_stop_from_stopping_is_idempotent(service, running_run):
+    """L2：停止在途（stopping）时再次 stop 必须幂等返回，而不是抛非法状态转换。
+
+    现状 stopping → stopping 非法，会把正在进行的清理链打断；且幂等路径
+    不得重复释放/关闭 backend，也不得终结 run。
+    """
+    service._transition(service._run, "stopping")
+    snapshot = service.stop(running_run.run_id, "again")
+    assert snapshot.status == "stopping"
+    assert service.backend.release_count == 0
+    assert service.backend.close_count == 0
+    assert service.snapshot().run_id == running_run.run_id
 
 
 # ---------------- 状态机与租约 ----------------
@@ -409,6 +467,35 @@ def test_observe_and_wait_do_not_count_no_progress(service, running_run, owner_a
             running_run.run_id, owner_a,
             ComputerAction(kind="wait", target="browser", duration_ms=100),
         )
+    assert service.snapshot().status == "running"
+    assert service.backend.close_count == 0
+
+
+def test_consecutive_wait_for_does_not_count_no_progress(service, owner_a, capability):
+    """连续 wait_for 不触发 computer_no_progress（画面不变是等待的常态）。
+
+    条件等待命中稳定态时画面天然不变（例如标题仍是「保存成功」），若按无进展
+    计数，连续 wait_for 会在第 4 次被误停为 computer_no_progress。
+    """
+    run = service.start_run(owner_a, capability, target="desktop")
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="desktop"))
+    backend = service.backend
+    assert backend.target == "desktop"
+    backend._screen_hashes = ["same"] * 12
+    for _ in range(6):
+        observation = service.execute(
+            run.run_id,
+            owner_a,
+            ComputerAction(
+                kind="wait_for",
+                target="desktop",
+                condition="text_exists",
+                text="保存成功",
+                timeout_ms=1000,
+                interval_ms=100,
+            ),
+        )
+        assert observation.ok
     assert service.snapshot().status == "running"
     assert service.backend.close_count == 0
 
@@ -1200,5 +1287,81 @@ def test_action_finished_reports_input_and_wait_segments(service, running_run, o
             if event["type"] == "computer_action_finished" and event["ok"] is False
         ]
         assert failed and isinstance(failed[-1].get("duration_ms"), (int, float))
+    finally:
+        service.stop()
+
+
+# ---------------- Task 3：wait_for 计入等待阶段计时 ----------------
+
+
+def test_wait_for_finished_reports_wait_not_input(service, owner_a, capability):
+    """wait_for 是条件等待而非输入：finished 事件 input_ms=0、wait_ms>=0。
+
+    条件等待的轮询耗时属于等待阶段，绝不能混进 input_ms——否则"输入耗时"
+    会把被动等待算成按键/点击耗时。fake backend 直接返回，不真实等待。
+    """
+    events = []
+    service.add_listener(events.append)
+    run = service.start_run(owner_a, capability, target="desktop")
+    try:
+        service.execute(
+            run.run_id, owner_a, ComputerAction(kind="observe", target="desktop")
+        )
+        service.execute(
+            run.run_id, owner_a,
+            ComputerAction(
+                kind="wait_for",
+                target="desktop",
+                condition="text_exists",
+                text="登录完成",
+                timeout_ms=8000,
+                interval_ms=300,
+            ),
+        )
+        finished = [
+            event for event in events
+            if event["type"] == "computer_action_finished"
+            and event["action_kind"] == "wait_for"
+        ]
+        assert len(finished) == 1 and finished[0]["ok"] is True
+        assert finished[0]["input_ms"] == 0
+        assert isinstance(finished[0]["wait_ms"], (int, float))
+        assert finished[0]["wait_ms"] >= 0
+    finally:
+        service.stop()
+
+
+def test_wait_for_timeout_also_reports_wait_segment(service, owner_a, capability):
+    """超时失败同样按等待阶段计时：input_ms=0、wait_ms>=0。"""
+    events = []
+    service.add_listener(events.append)
+    run = service.start_run(owner_a, capability, target="desktop")
+    try:
+        service.execute(
+            run.run_id, owner_a, ComputerAction(kind="observe", target="desktop")
+        )
+        service.backend.execute_error = ComputerControlError(
+            "computer_wait_timeout", "条件等待超时"
+        )
+        with pytest.raises(ComputerControlError) as raised:
+            service.execute(
+                run.run_id, owner_a,
+                ComputerAction(
+                    kind="wait_for",
+                    target="desktop",
+                    condition="window_active",
+                    window_name="记事本",
+                ),
+            )
+        assert raised.value.code == "computer_wait_timeout"
+        failed = [
+            event for event in events
+            if event["type"] == "computer_action_finished"
+            and event["action_kind"] == "wait_for"
+        ]
+        assert failed and failed[-1]["ok"] is False
+        assert failed[-1]["input_ms"] == 0
+        assert isinstance(failed[-1]["wait_ms"], (int, float))
+        assert failed[-1]["wait_ms"] >= 0
     finally:
         service.stop()

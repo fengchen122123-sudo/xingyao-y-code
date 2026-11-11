@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import subprocess
 import sys
 import threading
 from typing import Callable
@@ -11,14 +13,77 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 
+def _console_window_handle():
+    """返回本进程挂着的控制台窗口句柄，判定失败返回 None（表示"不知道"）。
+
+    抽成独立小函数，方便测试 monkeypatch（不依赖真实控制台环境）。
+    """
+    try:
+        import ctypes
+
+        return int(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:
+        logger.debug("读取控制台窗口句柄失败，跳过子进程控制台兜底", exc_info=True)
+        return None
+
+
+def hide_child_console_windows() -> bool:
+    """无控制台时，让此后创建的所有子进程默认带 CREATE_NO_WINDOW（兜底）。
+
+    为什么需要这道兜底：
+    - 安装版主程序是 PyInstaller 以 console=False 打出来的 Windows GUI 子
+      系统程序，进程自身没有控制台。
+    - 无控制台的父进程去启动一个控制台子进程时（哪怕只是 cmd.exe 包装脚本），
+      Windows 会为该子进程新建一个**可见**的控制台窗口：用户会看到窗口先弹出、
+      停留几秒（MCP 连接超时后子进程被终止）再消失。
+    - 项目自身的子进程调用点（core/tools.py、core/task_manager.py、
+      core/updater.py、gui_bridge.py 等）已显式传了 CREATE_NO_WINDOW；但第三方
+      链路（mcp SDK → anyio/asyncio 启动 stdio MCP 服务器，命令可能是
+      npm 包装脚本 xxx.cmd）没有任何地方能把 creationflags 传下去，于是只能
+      在此统一兜底：包装 subprocess.Popen.__init__，为所有子进程补上该标志。
+
+    生效条件（保证既有行为不变）：
+    - 仅 Windows 生效，其它平台直接返回 False；
+    - 仅当本进程**没有**控制台窗口时生效：源码调试 `python gui_main.py`、CLI 版
+      `ycode.exe` 都有控制台，直接返回 False，子进程输出照旧可见；
+    - ctypes 判定失败（拿不到结果）时也返回 False，宁可不生效也不改变行为；
+    - 幂等：已包装过则直接返回 False，不重复包装。
+
+    :return: 本次调用是否真正安装了兜底包装。
+    """
+    if os.name != "nt":
+        return False
+    handle = _console_window_handle()
+    if handle is None or handle != 0:
+        # 判定不了，或本进程有控制台（调试/CLI）：保持既有行为不动。
+        return False
+
+    original_init = subprocess.Popen.__init__
+    if getattr(original_init, "_ycode_hides_console", False):
+        # 已经包装过（本函数被重复调用），不重复叠加。
+        return False
+
+    @functools.wraps(original_init)
+    def _popen_init_without_console_window(self, *args, **kwargs):
+        kwargs["creationflags"] = (
+            kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+        )
+        original_init(self, *args, **kwargs)
+
+    _popen_init_without_console_window._ycode_hides_console = True
+    subprocess.Popen.__init__ = _popen_init_without_console_window
+    logger.debug("已为无控制台 GUI 进程启用子进程 CREATE_NO_WINDOW 兜底")
+    return True
+
+
 def _app_title() -> str:
     """窗口/托盘标题：含设置页自定义的智能体显示名。"""
     try:
         from core.persona_settings import get_agent_display_name
 
-        return f"Y-CODE · {get_agent_display_name()}"
+        return f"星瑶Code · {get_agent_display_name()}"
     except Exception:
-        return "Y-CODE · 星瑶"
+        return "星瑶Code · 星瑶"
 
 
 class ApplicationLifecycle:
@@ -155,7 +220,7 @@ class ApplicationLifecycle:
                 text = (
                     "有对话回合仍在执行。\n\n"
                     "【是】最小化到托盘继续运行\n"
-                    "【否】停止回合并退出 Y-CODE\n"
+                    "【否】停止回合并退出 星瑶Code\n"
                     "【取消】返回窗口"
                 )
                 ret = ctypes.windll.user32.MessageBoxW(
@@ -169,7 +234,7 @@ class ApplicationLifecycle:
                 return "cancel"
             text = (
                 "有对话回合仍在执行（系统托盘不可用，无法后台驻留）。\n\n"
-                "【是】停止回合并退出 Y-CODE\n"
+                "【是】停止回合并退出 星瑶Code\n"
                 "【否】返回窗口"
             )
             ret = ctypes.windll.user32.MessageBoxW(

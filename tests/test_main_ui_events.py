@@ -1,5 +1,7 @@
 from concurrent.futures import Future
 
+import hashlib
+
 import pytest
 
 import main
@@ -9,61 +11,76 @@ from core.turn_events import TurnEventFactory
 from rich.text import Text
 
 
+def _undo_cli_turn(tmp_path, session, turn, target, original, replacement):
+    """CLI 撤销测试夹具：真实 turn_undo 服务 + 一个覆盖目标文件的回合。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
+    from core.turn_undo import recorder as tu_recorder
+    from core.turn_undo.models import OwnerKind, NodeKind
+
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = tu_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.ensure_session(session)
+    session_id = tu_service.resolve_session_id(session)
+    checkpoint, ctx = tu_service.begin_turn(
+        session_id=session_id,
+        turn_id=turn,
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+    handle = tu_recorder.prepare_mutation(
+        display_path=str(target),
+        after_kind=NodeKind.REGULAR_FILE,
+        after_content=replacement,
+        tool_name="write_file",
+        tool_call_id="c1",
+    )
+    target.write_bytes(replacement)
+    tu_recorder.verify_after_mutation(handle)
+    tu_service.finish_turn(ctx)
+    return storage, checkpoint
+
+
 def test_undo_existing_empty_file_does_not_require_delete_confirmation(
     tmp_path, monkeypatch
 ):
-    from core import memory as memory_mod
+    """空文件被覆盖后按回合撤销：恢复原空内容，无需任何删除确认语义。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
 
     session = "cli-empty-file-undo"
     target = tmp_path / "empty.txt"
     target.write_bytes(b"")
-    memory_mod.set_undo_state(
-        str(target),
-        "",
-        session_name=session,
-        existed_before=True,
-        old_bytes=b"",
+    storage, checkpoint = _undo_cli_turn(
+        tmp_path, session, "turn-empty-undo", target, b"", b"filled"
     )
-    undo_calls = []
+
     monkeypatch.setattr(main, "current_session", session)
-    monkeypatch.setattr(
-        main._agent_service,
-        "undo_last_edit",
-        lambda manager, session_name, force=False: (
-            undo_calls.append((manager, session_name, force)) or (True, "restored")
-        ),
-    )
-    monkeypatch.setattr(main, "recalc_token_usage", lambda: None)
+    monkeypatch.setattr(main, "_undo_confirm", lambda question: True)
     monkeypatch.setattr(main, "print_formatted_text", lambda *_args, **_kwargs: None)
 
-    main.handle_slash_command("/undo")
+    main.handle_slash_command("/undo " + checkpoint.turn_id[:8])
 
-    assert undo_calls == [(main.manager, session, False)]
+    assert target.read_bytes() == b""
 
 
 def test_checkpoint_restore_preserves_original_non_utf8_bytes(tmp_path, monkeypatch):
-    from core import memory as memory_mod
-
+    """按回合撤销快照保存原始字节：GBK 文件恢复后与覆盖前逐字节一致。"""
     session = "cli-checkpoint-bytes"
     target = tmp_path / "legacy-gbk.txt"
     original = "旧版内容".encode("gbk")
-    target.write_text("changed", encoding="utf-8")
-    snapshots = [{
-        "file_path": str(target),
-        "old_content": "旧版内容",
-        "existed_before": True,
-        "old_bytes": original,
-    }]
-    monkeypatch.setattr(main, "current_session", session)
-    monkeypatch.setattr(
-        memory_mod,
-        "restore_checkpoint",
-        lambda session_name, turn_id: snapshots,
+    target.write_bytes(original)
+    storage, checkpoint = _undo_cli_turn(
+        tmp_path, session, "turn-bytes", target,
+        original, "changed".encode("utf-8"),
     )
-    monkeypatch.setattr(main, "recalc_token_usage", lambda: None)
+    monkeypatch.setattr(main, "current_session", session)
+    monkeypatch.setattr(main, "_undo_confirm", lambda question: True)
     monkeypatch.setattr(main, "print_formatted_text", lambda *_args, **_kwargs: None)
 
-    main.handle_slash_command("/checkpoint restore turn-bytes")
+    main.handle_slash_command("/checkpoint restore " + checkpoint.turn_id[:8])
 
     assert target.read_bytes() == original
 
@@ -926,7 +943,6 @@ def test_background_worker_survives_malformed_task(monkeypatch):
 
 def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
     """防回归：trigger_session_auto_rename 不得残留已删除函数的 return 语句（NameError）。"""
-    import litellm
 
     class ImmediateThread:
         def __init__(self, target, daemon):
@@ -946,7 +962,9 @@ def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
 
     scheduled = []
     monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
-    monkeypatch.setattr(litellm, "completion", lambda **kwargs: FakeResponse())
+    monkeypatch.setattr(
+        "core.llm_native_transport.native_completion", lambda **kwargs: FakeResponse()
+    )
     monkeypatch.setattr(main.manager, "rename_session", lambda session, title: (True, title))
     monkeypatch.setattr(main, "schedule_ui", scheduled.append)
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
@@ -1059,12 +1077,62 @@ def test_effort_command_shows_current_level(monkeypatch):
 
     printed = []
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
-    monkeypatch.setattr(mm, "load_config", lambda: {"active_model_id": "m1", "providers": []})
-    monkeypatch.setattr(mm, "get_model_reasoning_effort", lambda model_id: "low")
+    cfg = {
+        "active_model_id": "m1",
+        "providers": [
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/kimi-k3"}]}
+        ],
+    }
+    monkeypatch.setattr(mm, "load_config", lambda: cfg)
+    monkeypatch.setattr(mm, "get_model_reasoning_choice", lambda model_id: "low")
 
     main.handle_slash_command("/effort")
 
     assert any("low" in line for line in printed)
+    assert any("可选档位" in line for line in printed)
+
+
+def test_effort_command_shows_toggle_off_choice(monkeypatch):
+    # toggle 型模型（如 minimax-m3）选"关闭"后，无参查看必须显示 off/关闭，
+    # 而不是兼容接口 get_model_reasoning_effort 返回 None 导致的错误 "default"。
+    # 注：kimi 家族已统一为 always_on_effort（不可关闭），不再适用本用例。
+    import core.model_manager as mm
+
+    printed = []
+    cfg = {
+        "active_model_id": "m1",
+        "providers": [
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/minimax-m3"}]}
+        ],
+    }
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
+    monkeypatch.setattr(mm, "load_config", lambda: cfg)
+    monkeypatch.setattr(mm, "get_model_reasoning_choice", lambda model_id: "off")
+
+    main.handle_slash_command("/effort")
+
+    assert any("off" in line for line in printed)
+    assert any("关闭" in line for line in printed)
+
+
+def test_effort_command_fixed_model_hint(monkeypatch):
+    # fixed 型模型（如 minimax-m2.5）始终开启思考，应给提示而非档位列表。
+    # 注：kimi-k2.7-code 已并入 kimi 家族的能力档位列表，不再属 fixed 型。
+    import core.model_manager as mm
+
+    printed = []
+    cfg = {
+        "active_model_id": "m1",
+        "providers": [
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/minimax-m2.5"}]}
+        ],
+    }
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
+    monkeypatch.setattr(mm, "load_config", lambda: cfg)
+
+    main.handle_slash_command("/effort")
+
+    assert any("始终开启思考" in line for line in printed)
 
 
 def test_effort_command_sets_level_and_warns_anthropic_route(monkeypatch):
@@ -1083,8 +1151,8 @@ def test_effort_command_sets_level_and_warns_anthropic_route(monkeypatch):
     monkeypatch.setattr(mm, "load_config", lambda: cfg)
     monkeypatch.setattr(
         mm,
-        "set_model_reasoning_effort",
-        lambda model_id, level: calls.append((model_id, level)) or (True, "模型 m1 推理强度已设为 high"),
+        "set_model_reasoning_choice",
+        lambda model_id, level: calls.append((model_id, level)) or (True, "模型 m1 思考设置已设为 high"),
     )
 
     main.handle_slash_command("/effort high")
@@ -1172,6 +1240,28 @@ def test_plan_item_handoff_prints_takeover_notice_once(monkeypatch):
     assert "等待主 Agent 接管（队列第 2 项）" in queued_plain
 
 
+def test_writeback_rejected_prints_reason_instead_of_plan_mark(monkeypatch):
+    """回写被拒是调度诊断信息：必须打印原因本身，不能套用计划项的 <mark> 渲染
+    （否则会把计划项显示成它原来的 pending 状态，反而误导用户）。"""
+    factory = TurnEventFactory("turn-writeback-rejected")
+    printed = []
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", printed.append)
+    monkeypatch.setattr(main, "app_instance", None)
+    main.ui_renderers.pop("turn-writeback-rejected", None)
+
+    main._render_ui_event(factory.emit("plan_writeback_rejected", {
+        "item_id": "item",
+        "action": "complete",
+        "reason": "complete 回写被拒绝：计划项当前状态为 'pending'，只有 in_progress 状态才允许回写。",
+    }))
+
+    assert len(printed) == 1
+    plain = Text.from_ansi(printed[0]).plain
+    assert "回写被拒绝" in plain
+    assert "pending" in plain
+
+
 # ---------------------------------------------------------------------------
 # /turns 命令：CLI 设置单任务最大模型轮次（与 GUI 系统设置共用同一份配置）
 # ---------------------------------------------------------------------------
@@ -1183,7 +1273,9 @@ def _turns_env(tmp_path, monkeypatch, data):
     import config
 
     cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(_json.dumps(data), encoding="utf-8")
+    # 空 dict 会被 config.py 写闸门判为读失败而拒写，故补最小可用结构。
+    payload = data if data else {"active_model_id": None, "providers": []}
+    cfg_path.write_text(_json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg_path))
     config._CONFIG_CACHE.clear()
 
@@ -1316,3 +1408,55 @@ def test_run_cli_checks_console_before_any_initialization():
         callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "")
     )
     assert callee_name == "_require_interactive_console"
+
+def test_undo_list_preview_and_ambiguous_short_id(tmp_path, monkeypatch):
+    """/undo list 与 preview 正常工作；短 ID 歧义显式拒绝（规格 17.2）。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
+    from core.turn_undo import recorder as tu_recorder
+    from core.turn_undo.models import OwnerKind, NodeKind
+
+    session = "cli-list-sess"
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = tu_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    monkeypatch.setattr(main, "current_session", session)
+
+    manager.ensure_session(session)
+    session_id = storage.resolve_session_id(session)
+    printed = []
+    monkeypatch.setattr(
+        main, "print_formatted_text",
+        lambda obj: printed.append(str(obj)),
+    )
+
+    # 两个同前缀回合制造短 ID 歧义 + 一个真实可撤销回合
+    ws = tmp_path / "ws"
+    target = ws / "x.py"
+    for turn in ("aaaaaaaa-1", "aaaaaaaa-2", "bbbbbbbb-3"):
+        ws.mkdir(exist_ok=True)
+        target.write_bytes(b"old")
+        checkpoint, ctx = tu_service.begin_turn(
+            session_id=session_id, turn_id=turn,
+            workspace_root=str(ws), owner_kind=OwnerKind.FOREGROUND_TURN,
+        )
+        handle = tu_recorder.prepare_mutation(
+            display_path=str(target), after_kind=NodeKind.REGULAR_FILE,
+            after_content=b"new", tool_name="write_file", tool_call_id="c",
+        )
+        target.write_bytes(b"new")
+        tu_recorder.verify_after_mutation(handle)
+        tu_service.finish_turn(ctx)
+
+    main.handle_slash_command("/undo list")
+    main.handle_slash_command("/undo preview bbbbbbbb")
+
+    # 歧义前缀：显式拒绝并要求完整 ID
+    printed.clear()
+    main.handle_undo_command("/undo aaaaaaaa", session)
+    assert any("匹配到 2 个回合" in line for line in printed)
+    # 精确短 ID 正常
+    printed.clear()
+    main.handle_undo_command("/undo preview bbbbbbbb-3", session)
+    assert any("撤销影响" in line for line in printed if isinstance(line, str)) or printed

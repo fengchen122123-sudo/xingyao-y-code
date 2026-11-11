@@ -503,6 +503,18 @@ def test_observation_repr_never_exposes_png_path():
     assert "D:\\shots" not in repr(observation)
 
 
+def test_observation_repr_never_exposes_page_text():
+    """B 方案：页面正文与截图路径同级别隐私，绝不进 repr（也就不进日志）。"""
+    observation = _sample_observation(
+        page_text="账户余额 123 元-秘密正文",
+        screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
+    )
+    assert "秘密正文" not in repr(observation)
+    assert observation.page_text == "账户余额 123 元-秘密正文"
+    # 无截图原因只是简短说明，允许出现在 repr（不含正文/URL/堆栈）
+    assert "TimeoutError" in repr(observation)
+
+
 def test_observation_provider_projection_is_minimal_and_deterministic():
     observation = _sample_observation()
     projection = observation_provider_projection(observation)
@@ -571,6 +583,8 @@ def test_capability_and_enums_have_design_values():
         "sequence",
         # 2026-09-06 协议扩展：UIA 元素观察与元素引用动作（提速计划 Task 10）。
         "list_elements", "click_element", "set_value_element",
+        # 2026-11-09 协议扩展（Windows-MCP 对齐）：desktop 条件等待。
+        "wait_for",
     }
     capability = ComputerCapability(
         enabled=True, protocol="generic", targets=("browser", "desktop"),

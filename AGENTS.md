@@ -68,6 +68,20 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 - `_connect_server` 幂等：同名重连先关旧连接，schema 按 server 名替换不追加；
   取消竞态会清理已入 `self.servers` 的孤儿连接；`call_tool_sync` 超时返回 🚨 友好文本并取消底层调用。
 
+- mcp.json 的 env 值加密失败按明文落盘（可用性优先的显式降级），`list_servers`
+  会以 `env_plaintext` 字段标出未加密的键名；server 名禁止含 `__`（与
+  `f"{server}__{tool}"` 工具名前缀分隔符冲突，否则重连按前缀替换会剥掉别家工具）。
+
+## 📡 LAN/MCP 远程服务安全基线
+
+- `LanServer.FORBIDDEN_METHODS` 是 fail-closed 黑名单：新增桌面桥方法若属
+  「写持久配置→让桌面长期执行」（hook/插件信任/MCP/权限白名单/自动化任务）、
+  「明文凭据读取」或「桌面专属生命周期」，必须同步入名单；判定标准见名单内
+  注释，frontend-mobile 零引用是入名单的必要条件。
+- `LanServer.broadcast` 只向每客户端有界出站队列 put_nowait（满则丢弃并计数），
+  网络 IO 收敛到每客户端发送线程——事件生产线程（回合 worker）绝不因单个
+  失联手机阻塞在 send 上；测试直连桩无队列时回落同步发送。
+
 ---
 
 ## 🧭 固定 Harness 内核
@@ -85,10 +99,17 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   Kimi 缓存亲和值原文。
 
 - 一个 Step 对应一次真实模型请求；Provider 内部重试必须留在同一个 Step，工具结果后
-  再次请求模型才创建下一个 Step。非法状态转换、Journal 序列化或数据库写入必须显式失败。
+  再次请求模型才创建下一个 Step。非法状态转换与状态迁移的 CAS 写库必须显式失败；
+  journal 的事件 sink（STEP_CREATED 等辅助事件）失败只告警不阻断回合——续跑对
+  started-not-finished 一律 BLOCK，遥测缺失不会伪装成已提交。
 
 - 崩溃恢复只把未完成 Turn/Step 标记为 `interrupted`，绝不自动重放模型请求、命令、
   文件写入或其他副作用工具。
+
+- owner 心跳双通道：journal 操作搭车续租之外，`TurnRuntime` 为持久回合起
+  `harness-heartbeat-*` 守护线程按 2s 节拍续租（turn 终态即退）——长工具执行
+  >10s 期间不再因零心跳被另一进程的 `interrupt_stale_harness_runs` 误标
+  interrupted（GUI 与 CLI 共享 ycode.db 的场景）。
 
 - 修改请求构造、消息规范化、system prompt、tools、metadata、`extra_body` 或缓存亲和
   逻辑前，必须先运行 Provider 请求 byte-golden 与 prompt byte-stability 回归；黄金字节
@@ -105,6 +126,9 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 - `core/tool_result_maintenance.py`：工具结果 Snip/Elide 纯函数层，marker 幂等，
   每条消息字节最多改写两次（snip 一次 + elide 升级一次），改写后永久冻结。
+  注意 tier>=1 的规则精简 reducer（`core/memory.py:maintain_tool_results` 前置）
+  是另一类独立改写：精简 → snip → elide 三段各自最多一次、方向单调，
+  snip/elide 的两次上限在自身类别内成立。
 
 - `core/memory.py:maintain_tool_results`：DB 层维护入口，尾部 8000 估算 token 保护区不改写；
   `_fold_stale_media_locked` 在含媒体新消息入库的同一事务内折叠旧媒体。
@@ -125,6 +149,14 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   执行工具门禁必须解除，不能继续要求 plan_item_id。
   DeepSeek thinking 路由为带 tool_calls 的 assistant 回补空 `reasoning_content` key。
 
+- `core/task_scheduler.py` 接管队列约定：FIFO 只决定优先级，不保证队首一定可执行。
+  `claim_takeover_for_turn` / `promote_next_takeover` 在队首 files 与在途租约冲突时必须
+  顺延到下一个可认领项，绝不让单个占位项堵死整条队列（否则 queued 项会永久停在原状态）。
+  完成/失败回写只认 in_progress；被拒时经 `_report_writeback_rejected` 写日志并发
+  `plan_writeback_rejected` 事件，由 CLI/GUI 提示用户，不再静默 return False。
+  铁律：该诊断事件名不得使用 `plan_item_` 前缀——CLI 把该前缀一律当"计划项状态变化"
+  渲染，复用会把计划项显示成它原有的 pending 状态，反而误导用户。
+
 - `core/llm.py:_stream_chunks_with_idle_notice`：流式 chunk 由守护线程 pump、主线程带超时读队列，
   流中段 stalled 超阈值按间隔上报等待状态（此前首 chunk 后最长静默一整个请求超时）。
 
@@ -132,11 +164,39 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   但 `_release_slot` 幂等立即归还名额，排队超过任务自身超时预算直接判 timed_out，
   避免泄漏线程占满 5 个名额导致前台回合无限阻塞。
 
+- 权限档位传播铁律：会话级档位由 `core/app_context.py` 的线程级绑定承载
+  （`set_thread_permission_mode` / `permission_mode_scope`），鉴权路径
+  `get_permission_mode()` 线程级优先、回退全局。任何新建执行线程都必须显式
+  传播该档位，否则回退全局默认，出现"会话开了 full 仍弹审批"：
+  GUI 回合在 `gui_bridge._run_turn_worker` 绑定；子代理在 `core/tools.py`
+  的 `SubagentTask.permission_mode` 创建时快照、`_run_task` 内 scope 恢复；
+  并行工具线程在 `core/harness/tool_pipeline._submit_daemon_call` 传播。
+  `set_permission_mode()` 对已绑定线程同步更新绑定，避免语义割裂。
+
 - `core/cache_keepalive.py`：前缀缓存保活默认 120 秒（0 关闭，最小 60），仅 DeepSeek/Kimi 路由生效。
 
+- 插入式压缩（`memory_compression.insert_mode` 默认开）：复用 `get_session_snapshot()`
+  的会话最后主请求字节（ledger 消息 + tools + 亲和参数原样）尾部追加压缩指令，单请求
+  完成摘要后走既有 CAS 落库。快照缺失（保活关闭/路由不支持/主请求在飞）、model/key/base
+  三元组不符或窗口预算不足一律静默回退分段路径，绝不硬失败——因此 insert_mode 依赖
+  保活开关：`prompt_cache_keepalive_seconds=0` 时恒走分段路径。
+
+- `session_summary_generations` 归档表（memory.py）+ `recall_history` 只读工具：每次压缩
+  成功追加一代（摘要/topics/until_msg_id），`get_history_for_llm` 在 history[0] 摘要块尾部
+  注入 ≤10 代回溯索引。会话改名必须随迁、undo/清空/删会话/删工作区必须同事务清理该表，
+  否则回溯索引静默丢失并留孤儿行。
+
+- `core/idle_maintenance.py`：用户空闲 N 秒（`memory_compression.idle_maintenance_seconds`
+  默认 240，0 关闭）后跑本地水位维护与压缩。GUI/CLI 在回合开始/结束接线
+  `on_turn_started`/`on_turn_finished`；回合开始撤销未触发任务并协作中断在跑压缩——
+  cancel_event 注册期由 `done_event` 延长到压缩真正结束（`_trigger_background_precompress`
+  发射后即返回，worker 必须等 done 才弹事件），注册表复用不覆盖。
+
 - 智谱 GLM 缓存路线：官方隐式自动缓存（无亲和参数、无显式标记、命中五折、TTL 不透明），
-  客户端走「稳定字节 + 保活」。`core/llm.py:_supports_cache_keepalive` 对官方
-  open.bigmodel.cn（`_is_official_zhipu_route`）放行，第三方中转的 GLM 模型不放行。
+  客户端走「稳定字节 + 保活」。`core/llm.py:_supports_cache_keepalive` 对 DeepSeek/
+  GLM/Kimi/Qwen 四族按模型名判定、任意渠道路由放行（第三方中转同样保活），无名模型
+  回退域名判定（官方 open.bigmodel.cn 放行）；上有车道证据门兜底——某车道实测命中率
+  < 0.5 且样本 >= 10 轮即停该车道保活（小时级自愈），第三方中转若确实不缓存会自动停。
   特例：GLM 强制思考模型（glm-5.3/5.3-flash，能力表无关闭档，`thinking.type=disabled`
   直接报错）的保活快照必须保留 thinking.enabled 并把 max_tokens 抬到
   `KEEPALIVE_THINKING_MODEL_MAX_TOKENS=1024`（`core/cache_keepalive.py`，
@@ -147,7 +207,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   （`_inflight_streams` 注册表），停止路径（GUI stop / CLI Ctrl+C / 子代理 `_terminate`）
   先 set cancel_event 再调 `abort_inflight_streams()` 直接关闭底层流，阻塞读立即抛错退出，
   不再静默接收数据直到请求超时。铁律：只关单个 response 流（逐层探测 close/completion_stream/
-  response），绝不触碰 litellm 共享连接池；关闭动作吞掉一切异常；先 set 事件再 abort，
+  response），绝不触碰共享 HTTP 连接池；关闭动作吞掉一切异常；先 set 事件再 abort，
   让被关闭一侧归一为用户取消（KeyboardInterrupt 打捞路径）而非网络错误重试。
 
 - 铁律：请求路径绝不改写历史中间字节；任何历史改写必须一次性、幂等、DB 层完成。

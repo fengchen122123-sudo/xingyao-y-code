@@ -47,18 +47,41 @@ STYLE = Style.from_dict({
     "focused  cursor-column": "bg:#2a3a4a",
 })
 
-from core.model_catalog import get_preset_providers, litellm_model_name, protocol_choices
+from core.model_catalog import get_preset_providers, provider_route_name, protocol_choices
 
 PROTOCOLS = protocol_choices()
 PRESET_PROVIDERS = get_preset_providers()
 
 
 def _test_model_connection(protocol: str, model: str, base_url: str, api_key: str):
-    """使用与正式对话完全相同的协议入口验证模型连接。"""
+    """使用与正式对话完全相同的协议入口验证模型连接。
+
+    多 Key（换行 / 逗号 / 分号分隔）时逐 Key 尝试，任一成功即通过；
+    全部失败抛出最后一个错误（调用方的错误格式化与展示逻辑不变）；
+    单 Key / 空 Key 行为与现状完全一致。
+    """
+    from core.provider_keys import split_provider_keys
+
+    keys = split_provider_keys(api_key)
+    if not keys:
+        # 空串或非字符串输入：维持现状——不带 api_key 直接请求一次
+        keys = [api_key]
+    last_error: Exception | None = None
+    for key in keys:
+        try:
+            _test_model_connection_once(protocol, model, base_url, key)
+            return
+        except Exception as exc:
+            last_error = exc
+    raise last_error if last_error is not None else RuntimeError("连接测试失败")
+
+
+def _test_model_connection_once(protocol: str, model: str, base_url: str, api_key: str):
+    """单 Key 连接测试：正式对话同源协议入口（不做多 Key 遍历）。"""
     from core.llm import _request_stream
 
     kwargs = {
-        "model": litellm_model_name(protocol, model),
+        "model": provider_route_name(protocol, model),
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 5,
         "stream": True,
@@ -436,7 +459,7 @@ def open_model_selector(on_model_selected=None):
 
     def render_list():
         out = []
-        out += [_t("class:header", "  Y-code 模型管理器\n")]
+        out += [_t("class:header", "  星瑶Code 模型管理器\n")]
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
 
         cfg = load_config()

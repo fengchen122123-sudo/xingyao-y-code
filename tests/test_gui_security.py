@@ -169,7 +169,81 @@ def test_open_path_credential_config_denied(tmp_path, monkeypatch):
     bridge._current_session = "session"
     bridge._session_workdir = lambda session: "GLOBAL"
 
+# 凭据文件必须拒绝，且不能真的去启动它
     res = bridge.open_path(str(f))
 
     assert res["ok"] is False
     assert opened == []
+
+
+# ---------------------------------------------------------------------------
+# reveal_in_explorer：只开资源管理器定位，不启动文件本身（文档页签工具栏用）
+# ---------------------------------------------------------------------------
+
+
+def test_reveal_in_explorer_prefers_shell_api(tmp_path, monkeypatch):
+    import gui_bridge as gb
+
+    f = tmp_path / "报告.docx"
+    f.write_text("hi", encoding="utf-8")
+    popped = []
+    monkeypatch.setattr(gb, "_reveal_via_shell_api", lambda path: True)
+    monkeypatch.setattr("subprocess.Popen", lambda args, **kw: popped.append(args))
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._session_workdir = lambda session: "GLOBAL"
+
+    res = bridge.reveal_in_explorer(str(f))
+
+    assert res["ok"] is True
+    # Shell API 成功时不再拼命令行（避免任何解析变形）
+    assert popped == []
+
+
+def test_reveal_in_explorer_falls_back_to_single_command_string(tmp_path, monkeypatch):
+    import sys
+
+    import gui_bridge as gb
+
+    if sys.platform != "win32":
+        return
+    f = tmp_path / "报告 with space.docx"
+    f.write_text("hi", encoding="utf-8")
+    popped = []
+    # Shell API 不可用（没 CoInitialize 的老环境等）时走命令行兜底
+    monkeypatch.setattr(gb, "_reveal_via_shell_api", lambda path: False)
+    monkeypatch.setattr("subprocess.Popen", lambda args, **kw: popped.append(args))
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._session_workdir = lambda session: "GLOBAL"
+
+    res = bridge.reveal_in_explorer(str(f))
+
+    assert res["ok"] is True
+    # 必须是整串命令：用参数列表时 subprocess 会转义引号，explorer 解析不到
+    # /select, 的路径，会退回打开「桌面」（2026-11-06 用户实测踩到）
+    assert popped == [f'explorer /select,"{f.resolve()}"']
+
+
+def test_reveal_in_explorer_opens_directory_itself(tmp_path, monkeypatch):
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda path: opened.append(path), raising=False)
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._session_workdir = lambda session: "GLOBAL"
+
+    res = bridge.reveal_in_explorer(str(tmp_path))
+
+    assert res["ok"] is True
+    assert opened == [str(tmp_path.resolve())]
+
+
+def test_reveal_in_explorer_missing_path(tmp_path):
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._session_workdir = lambda session: "GLOBAL"
+
+    res = bridge.reveal_in_explorer(str(tmp_path / "nope.docx"))
+
+    assert res["ok"] is False
+    assert "不存在" in res["msg"]

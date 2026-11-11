@@ -97,7 +97,9 @@ def test_verify_rejects_bom_injected_size_plus_one(tmp_path):
 def test_verify_rejects_head_mismatch_same_size(tmp_path):
     """同长度但首字节被改写（如 BOM 替换首字节）也必须检出。"""
     body = os.urandom(1024)
-    tampered = b"\xff" + body[1:]
+    # 首字节用异或翻转，保证一定与原文不同：固定写 0xff 时，若随机首字节本就是
+    # 0xff，篡改样本与原文完全相同，用例会以约 1/256 的概率偶发失败。
+    tampered = bytes([body[0] ^ 0xFF]) + body[1:]
     local = _make_local_file(tmp_path, body)
     with patch("urllib.request.urlopen") as m:
         m.return_value = _fake_response("application/octet-stream", tampered)
@@ -191,3 +193,72 @@ def test_safe_part_boundary_rejects_utf16_like_head(tmp_path):
     with open(fpath, "rb") as f:
         f.seek(new_off)
         assert not build_release._looks_like_utf16_text(f.read(512))
+
+
+# ---------------------------------------------------------------------------
+# B8-03：vendor 完整性校验脚本（scripts/verify_vendor.py）行为回归
+# ---------------------------------------------------------------------------
+
+def _load_verify_vendor():
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts",
+        "verify_vendor.py",
+    )
+    spec = importlib.util.spec_from_file_location("verify_vendor_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_vendor_tree(root, *, record_digest, extra_file=None):
+    import hashlib
+    import json as _json
+
+    vendor = root / "vendor"
+    vendor.mkdir(exist_ok=True)
+    body = b"hello"
+    (vendor / "x.bin").write_bytes(body)
+    if extra_file:
+        (vendor / extra_file).write_bytes(b"unlisted")
+    manifest = {
+        "files": [
+            {
+                "path": "vendor/x.bin",
+                "sha256": record_digest or hashlib.sha256(body).hexdigest(),
+                "hash_mode": "binary",
+            }
+        ]
+    }
+    (vendor / "VENDOR_MANIFEST.json").write_text(
+        _json.dumps(manifest), encoding="utf-8"
+    )
+
+
+def test_verify_vendor_detects_tamper_and_gaps(tmp_path):
+    """B8-03：记录一致通过；哈希不符 / 未登记文件 / 缺记录分别失败。"""
+    import hashlib
+
+    mod = _load_verify_vendor()
+    good = hashlib.sha256(b"hello").hexdigest()
+
+    # 一致 → 通过
+    _write_vendor_tree(tmp_path, record_digest=good)
+    assert mod.verify_vendor(str(tmp_path), printer=lambda *a, **k: None) == []
+
+    # 哈希不符
+    _write_vendor_tree(tmp_path, record_digest="0" * 64)
+    problems = mod.verify_vendor(str(tmp_path), printer=lambda *a, **k: None)
+    assert any("SHA256 不一致" in p for p in problems)
+
+    # 未登记文件
+    _write_vendor_tree(tmp_path, record_digest=good, extra_file="y.bin")
+    problems = mod.verify_vendor(str(tmp_path), printer=lambda *a, **k: None)
+    assert any("未登记" in p for p in problems)
+
+    # 缺记录文件
+    (tmp_path / "vendor" / "VENDOR_MANIFEST.json").unlink()
+    problems = mod.verify_vendor(str(tmp_path), printer=lambda *a, **k: None)
+    assert any("记录文件不存在" in p for p in problems)

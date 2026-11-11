@@ -1,11 +1,21 @@
 <template>
   <div id="topbar" data-theme-region="app_header">
-    <button class="icon-btn no-drag" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
-      <AppIcon name="menu" :size="17" />
-    </button>
-    <div class="logo no-drag" :title="store.version ? ('Y-CODE ' + store.agentName + ' v' + store.version) : ('Y-CODE ' + store.agentName)">
-      <img class="mark" :src="'/icon.png'" alt="Y-CODE">
-      <div><span class="name">Y-CODE</span></div>
+    <!-- 侧栏开合入口：点击左上角星瑶图标收起/展开左侧栏
+         （热区只覆盖图标本身，右侧文字标题不参与；原独立汉堡按钮已移除） -->
+    <div class="logo no-drag" :title="logoTitle">
+      <img
+        class="mark"
+        id="btn-toggle-side"
+        role="button"
+        tabindex="0"
+        :src="'/icon.png'"
+        alt="星瑶Code"
+        :title="store.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
+        @click="store.toggleSidebar()"
+        @keydown.enter.prevent="store.toggleSidebar()"
+        @keydown.space.prevent="store.toggleSidebar()"
+      >
+      <div><span class="name">星瑶Code</span></div>
     </div>
 
     <!-- 标题栏拖拽区：mousedown 延迟进原生移动循环（SC_MOVE+HTCAPTION），
@@ -34,6 +44,9 @@
       <span v-if="store.updateState.status === 'downloading'" class="progress-tag">{{ store.updateState.downloadProgress }}%</span>
     </button>
 
+    <button class="icon-btn no-drag" id="btn-terminal" title="切换终端" data-test="btn-terminal" @click="store.toggleTerminalPanel()">
+      <AppIcon name="square-terminal" :size="16" />
+    </button>
     <button class="icon-btn no-drag" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
       <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" />
     </button>
@@ -156,6 +169,11 @@ onBeforeUnmount(() => {
   cancelPendingDrag();
 });
 
+// logo 文字区域的悬停提示：显示版本信息（侧栏开合提示挂在星瑶图标上）
+const logoTitle = computed(() =>
+  store.version ? `星瑶Code ${store.agentName} v${store.version}` : `星瑶Code ${store.agentName}`
+);
+
 const topbarUpdateLabel = computed(() => {
   if (store.updateState.status === 'downloaded') return '立即安装更新';
   if (store.updateState.status === 'downloading') return '下载中';
@@ -187,6 +205,12 @@ function handleUpdateClick() {
   gap: 12px;
   flex-shrink: 0;
 }
+
+/* 顶栏图标按钮（终端 / 主题 / 面板）：32×32 方形热区，圆角拉满成正圆。
+   与侧栏底部手机按钮同口径；窗口控制按钮（.win-btn，40×32）保持原圆角不动。 */
+#topbar .icon-btn {
+  border-radius: 50%;
+}
 #topbar .logo {
   display: flex;
   align-items: center;
@@ -199,6 +223,16 @@ function handleUpdateClick() {
   border-radius: 7px;
   object-fit: cover;
   display: block;
+  /* 兼作侧栏开合入口：热区只在图标本身 */
+  cursor: pointer;
+  transition: filter 0.12s;
+}
+#topbar .logo .mark:hover {
+  filter: brightness(1.12);
+}
+#topbar .logo .mark:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 #topbar .logo .name {
   font-weight: 600;
@@ -250,6 +284,7 @@ function handleUpdateClick() {
   color: #fff;
 }
 
+/* 更新提示按钮 */
 /* 更新提示按钮 */
 .update-topbar-btn {
   display: flex;

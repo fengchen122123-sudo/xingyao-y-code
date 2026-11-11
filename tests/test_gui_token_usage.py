@@ -350,3 +350,109 @@ def test_ensure_fits_active_window_skips_when_compressing(tmp_path, monkeypatch)
     bridge._ensure_fits_active_window("comp-session")
     assert bg_started.wait(timeout=0.1) is False
 
+
+# —— 跨渠道缓存命中率修复 · Task 4：GUI 侧 lane 维度与保活单列 ——
+
+# 改动前 get_token_usage 成功路径的键集合金样；新键只能增加，不能减少。
+_LEGACY_GUI_TOKEN_KEYS = {
+    "used", "window", "cached_pct", "cumulative",
+    "cache_latest_pct", "cache_hot_pct", "cache_session_pct",
+    "cache_available", "cache_hot_turns", "cache_invalidation_reason",
+    "prompt_tokens", "cached_tokens",
+    "total_prompt", "total_completion", "total_cached", "context_breakdown",
+}
+
+
+def _snapshot_with_scopes():
+    snapshot = _snapshot()
+    snapshot["cache_scopes"] = {
+        "main": dict(snapshot["cache"]),
+        "keepalive": {
+            "available": True,
+            "usage_valid": True,
+            "latest": {"prompt_tokens": 1000, "cached_tokens": 100, "rate": 10.0},
+            "hot": {"prompt_tokens": 1000, "cached_tokens": 100, "rate": 10.0},
+            "session_all": {"prompt_tokens": 1000, "cached_tokens": 100, "rate": 10.0},
+            "hot_turns": 1,
+            "invalidation_reason": "",
+        },
+    }
+    return snapshot
+
+
+def test_gui_token_payload_exposes_lane_dimension_keeping_legacy_keys(monkeypatch):
+    """GUI 下发车道身份 + 保活单列命中率，且现有键一个都不少、语义不变（前端已在读）。"""
+    bridge = _bridge_without_init()
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/deepseek-v4",
+        "base_url": "https://gui.example/v1",
+        "context_window": 1000000,
+    })
+    monkeypatch.setattr(
+        llm, "get_token_usage_snapshot", lambda *args, **kwargs: _snapshot_with_scopes()
+    )
+
+    payload = bridge.get_token_usage()
+
+    # 金样式：改动前的键必须仍是子集
+    assert _LEGACY_GUI_TOKEN_KEYS <= set(payload)
+    # 车道身份：前端面板用它标注「这个数字属于哪条车道」
+    assert payload["cache_lane_model"] == "openai/deepseek-v4"
+    assert payload["cache_lane_api_base"] == "https://gui.example/v1"
+    # 保活单列（与主口径同分母的是 session_all，hot 另给一格与 CLI 状态栏同源）
+    assert payload["cache_keepalive_session_pct"] == 10.0
+    assert payload["cache_keepalive_hot_pct"] == 10.0
+    assert payload["cache_hot_pct"] == 98.8
+
+
+def test_gui_token_payload_does_not_duplicate_existing_rate_keys(monkeypatch):
+    """车道命中率不重复下发：与既有 cache_hot_pct / cache_session_pct 同值的键必须不存在。
+
+    车道身份是新增信息，命中率本身早已按 (会话, 模型, 接口) 算好并下发；
+    再复制一份只涨载荷、并给前端留下「两个数字该信谁」的歧义。
+    """
+    bridge = _bridge_without_init()
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/deepseek-v4",
+        "base_url": "https://gui.example/v1",
+        "context_window": 1000000,
+    })
+    monkeypatch.setattr(
+        llm, "get_token_usage_snapshot", lambda *args, **kwargs: _snapshot_with_scopes()
+    )
+
+    payload = bridge.get_token_usage()
+
+    assert "cache_lane_hot_pct" not in payload
+    assert "cache_lane_session_pct" not in payload
+    assert "cache_lane_scope" not in payload
+
+
+def test_gui_keepalive_lane_rate_unreported_is_none_not_zero(monkeypatch):
+    """铁律「未报告 ≠ 0」：保活全是 cache_reported=0 时 GUI 字段为 None。"""
+    bridge = _bridge_without_init()
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/local-vllm",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "context_window": 1000000,
+    })
+    snapshot = _snapshot()
+    snapshot["cache_scopes"] = {
+        "keepalive": {
+            "available": False,
+            "usage_valid": False,
+            "latest": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+            "hot": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+            "session_all": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+            "hot_turns": 0,
+            "invalidation_reason": "usage 不一致",
+        },
+    }
+    monkeypatch.setattr(llm, "get_token_usage_snapshot", lambda *args, **kwargs: snapshot)
+
+    payload = bridge.get_token_usage()
+
+    assert _LEGACY_GUI_TOKEN_KEYS <= set(payload)
+    assert payload["cache_keepalive_hot_pct"] is None
+    assert payload["cache_keepalive_session_pct"] is None
+

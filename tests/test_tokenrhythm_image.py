@@ -45,6 +45,18 @@ class _Response:
         return False
 
 
+def _request_header(request, name):
+    """大小写不敏感读取 urllib.request.Request 的请求头。
+
+    Python 3.14 起 Request.get_header() 不再做 capitalize 规范化，
+    与 add_header 的存储键不再对称、会取不到值；测试统一走本例遍历。
+    """
+    return next(
+        (value for key, value in request.headers.items() if key.lower() == name.lower()),
+        None,
+    )
+
+
 class _FakeRegistry:
     def __init__(self):
         self.specs = []
@@ -161,7 +173,116 @@ class GenerateImageTest(unittest.TestCase):
         self.assertTrue(result.is_error)
         self.assertIn("401", result.content)
         self.assertIn("Key 无效", result.content)
+    def test_wan_model_requests_b64_and_saves_decoded_bytes(self):
+        """wan2.7-image 让服务端直接回 base64：不再走 URL 下载。"""
+        import base64
 
+        captured = {}
+        raw = b"\x89PNG\r\n\x1a\n" + b"wan-image-bytes" * 4
+
+        def fake_urlopen(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return _Response({"data": [{"b64_json": base64.b64encode(raw).decode("ascii")}]})
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve") as fake_retrieve:
+                result = self.tr.generate_image("雪山日出", model="wan2.7-image", save_dir=save_dir)
+
+            self.assertFalse(result.is_error)
+            self.assertEqual(captured["payload"]["response_format"], "b64_json")
+            fake_retrieve.assert_not_called()
+            path = result.changed_files[0]
+            self.assertTrue(path.endswith(".png"))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), raw)
+
+    def test_wan_model_falls_back_to_url_when_server_returns_url(self):
+        """服务端未按 base64 返回时兜底走 URL 下载，不报错。"""
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return _Response({"data": [{"url": "https://example.invalid/wan.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.generate_image("雪山日出", model="wan2.7-image", save_dir=save_dir)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["payload"]["response_format"], "b64_json")
+        self.assertTrue(result.changed_files[0].endswith(".png"))
+
+    def test_broken_b64_returns_error_without_crash(self):
+        """base64 数据损坏时返回错误结果，不抛异常。"""
+
+        def fake_urlopen(request, timeout):
+            return _Response({"data": [{"b64_json": "!!!broken!!!"}]})
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen):
+                result = self.tr.generate_image("雪山日出", model="wan2.7-image", save_dir=save_dir)
+
+        self.assertTrue(result.is_error)
+        self.assertIn("base64", result.content)
+
+    def test_generate_request_carries_tokenrhythm_agent_header(self):
+        """生图请求头必须携带 X-TokenRhythm-Agent 客户端标识（纯标识、不带版本号）。"""
+        from core.llm_policy import TOKENRHYTHM_AGENT_NAME
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["agent"] = _request_header(request, "X-TokenRhythm-Agent")
+            return _Response({"data": [{"url": "https://example.invalid/x.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0")
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.generate_image("橘猫", save_dir=save_dir)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["agent"], TOKENRHYTHM_AGENT_NAME)
+
+    def test_generate_request_carries_session_id_header(self):
+        """绑定执行会话时，生图请求头携带 X-Session-Id（本地会话与平台调用关联）。"""
+        from core import app_context
+
+        old_session = app_context.get_thread_session()
+        self.addCleanup(app_context.set_thread_session, old_session)
+        app_context.set_thread_session("session_tr42")
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["session_id"] = _request_header(request, "X-Session-Id")
+            return _Response({"data": [{"url": "https://example.invalid/x.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0")
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.generate_image("橘猫", save_dir=save_dir)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["session_id"], "session_tr42")
 
 class EditImageTest(unittest.TestCase):
     def setUp(self):
@@ -251,6 +372,85 @@ class EditImageTest(unittest.TestCase):
         self.assertFalse(result.is_error)
         self.assertIn(b'name="size"', captured["body"])
         self.assertIn(b"1024x1024", captured["body"])
+
+    def test_edit_with_wan_model_requests_b64_and_saves(self):
+        """图生图选 wan2.7-image 时同样要求服务端回 base64 并直接落盘。"""
+        import base64
+
+        captured = {}
+        raw = b"\x89PNG\r\n\x1a\n" + b"edited-bytes" * 3
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = request.data
+            return _Response({"data": [{"b64_json": base64.b64encode(raw).decode("ascii")}]})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png = self._make_png(tmp)
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve") as fake_retrieve:
+                result = self.tr.edit_image(
+                    prompt="换背景", image=png, model="wan2.7-image", save_dir=tmp
+                )
+
+            self.assertFalse(result.is_error)
+            self.assertIn(b'name="response_format"', captured["body"])
+            self.assertIn(b"b64_json", captured["body"])
+            fake_retrieve.assert_not_called()
+            with open(result.changed_files[0], "rb") as f:
+                self.assertEqual(f.read(), raw)
+
+    def test_edit_request_carries_tokenrhythm_agent_header(self):
+        """垫图改图请求头同样携带 X-TokenRhythm-Agent 客户端标识（纯标识、不带版本号）。"""
+        from core.llm_policy import TOKENRHYTHM_AGENT_NAME
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["agent"] = _request_header(request, "X-TokenRhythm-Agent")
+            return _Response({"data": [{"url": "https://example.invalid/edited.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png = self._make_png(tmp)
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.edit_image(prompt="把背景换成雪景", image=png, save_dir=tmp)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["agent"], TOKENRHYTHM_AGENT_NAME)
+
+    def test_edit_request_carries_session_id_header(self):
+        """绑定执行会话时，垫图改图请求头同样携带 X-Session-Id。"""
+        from core import app_context
+
+        old_session = app_context.get_thread_session()
+        self.addCleanup(app_context.set_thread_session, old_session)
+        app_context.set_thread_session("session_tr42")
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["session_id"] = _request_header(request, "X-Session-Id")
+            return _Response({"data": [{"url": "https://example.invalid/edited.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png = self._make_png(tmp)
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.edit_image(prompt="把背景换成雪景", image=png, save_dir=tmp)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["session_id"], "session_tr42")
 
 
 class PluginMetadataTest(unittest.TestCase):

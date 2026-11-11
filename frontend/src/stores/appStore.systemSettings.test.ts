@@ -2,9 +2,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 
 import { useAppStore } from './appStore';
+import type { SystemSettingsSnapshot } from '../types/pywebview';
 
 
-const settings = {
+// 显式标注快照类型：context_watermark_base 的 null 字面量会被推断为 null 类型，
+// 导致构造「保存成功」新快照时赋数值报 TS2322
+const settings: SystemSettingsSnapshot = {
   command_shell: 'powershell',
   command_shell_available: true,
   command_shell_error: '',
@@ -12,6 +15,12 @@ const settings = {
   agent_turn_step_limit: 200,
   agent_turn_step_limit_min: 10,
   agent_turn_step_limit_max: 1000,
+  context_watermark_base: null,
+  context_watermark_base_min: 50000,
+  context_watermark_base_max: 2000000,
+  ai_output_dir: 'C:\\ycode-data\\tmp',
+  ai_output_dir_setting: '',
+  ai_output_dir_default: 'C:\\ycode-data\\tmp',
   browser_control_enabled: false,
   computer_control_enabled: false,
   computer_browser: 'edge',
@@ -28,7 +37,7 @@ const settings = {
       label: 'Google Chrome',
       available: false,
       executable: '',
-      unavailable_reason: '未安装或不在 Y-CODE 的 PATH 中',
+      unavailable_reason: '未安装或不在 星瑶Code 的 PATH 中',
     },
   ],
   computer_profile_path: 'C:\\ycode-data\\browser-profiles\\edge',
@@ -134,6 +143,51 @@ describe('system settings store', () => {
     expect(store.systemSettings.agent_turn_step_limit).toBe(200);
   });
 
+  // ── 上下文水位基准：同样只以后端返回快照覆盖，不做乐观持久值 ──
+
+  it('persists a context watermark base and applies the returned snapshot', async () => {
+    const next = structuredClone(settings);
+    next.context_watermark_base = 800000;
+    const setBase = vi.fn().mockResolvedValue({ ok: true, settings: next });
+    (window as any).pywebview = { api: { set_context_watermark_base: setBase } };
+    const store = useAppStore();
+    store.systemSettings = structuredClone(settings);
+
+    const ok = await store.setContextWatermarkBase(800000);
+
+    expect(ok).toBe(true);
+    expect(setBase).toHaveBeenCalledWith(800000);
+    expect(store.systemSettings.context_watermark_base).toBe(800000);
+  });
+
+  it('restores the backend snapshot when saving the watermark base is rejected', async () => {
+    const unchanged = structuredClone(settings);
+    const setBase = vi.fn().mockResolvedValue({ ok: false, msg: '范围错误', settings: unchanged });
+    (window as any).pywebview = { api: { set_context_watermark_base: setBase } };
+    const store = useAppStore();
+    store.systemSettings = structuredClone(settings);
+    // 本地陈旧值（如上一轮快照漂移）也必须被后端真实快照覆盖，失败输入不得改坏快照
+    store.systemSettings.context_watermark_base = 700000;
+
+    const ok = await store.setContextWatermarkBase(2000001);
+
+    expect(ok).toBe(false);
+    expect(setBase).toHaveBeenCalledWith(2000001);
+    expect(store.systemSettings.context_watermark_base).toBeNull();
+    expect(store.systemSettings.agent_turn_step_limit).toBe(200);
+  });
+
+  it('returns false for the watermark base when the bridge is unavailable', async () => {
+    delete (window as any).pywebview;
+    const store = useAppStore();
+    store.systemSettings = structuredClone(settings);
+
+    const ok = await store.setContextWatermarkBase(800000);
+
+    expect(ok).toBe(false);
+    expect(store.systemSettings.context_watermark_base).toBeNull();
+  });
+
   // ── 电脑操控设置（Task 12）：只以后端返回快照覆盖，不做乐观持久值 ──
 
   it('rolls back to backend snapshot when browser enable preflight fails', async () => {
@@ -209,5 +263,47 @@ describe('system settings store', () => {
     expect(ok).toBe(true);
     expect(enable).toHaveBeenCalledWith(true);
     expect(store.systemSettings.computer_control_enabled).toBe(true);
+  });
+
+  // ── AI 生成内容目录（Task 5）：只以后端返回快照覆盖，失败即回滚 ──
+
+  it('persists the AI output directory and applies the returned snapshot', async () => {
+    const next = structuredClone(settings);
+    next.ai_output_dir = 'D:\\ai_out';
+    next.ai_output_dir_setting = 'D:\\ai_out';
+    const setDir = vi.fn().mockResolvedValue({
+      ok: true,
+      settings: next,
+      msg: 'AI 生成内容目录已更新：D:\\ai_out',
+    });
+    (window as any).pywebview = { api: { set_ai_output_dir: setDir } };
+    const store = useAppStore();
+    store.systemSettings = structuredClone(settings);
+
+    const ok = await store.setAiOutputDir('D:\\ai_out');
+
+    expect(ok).toBe(true);
+    expect(setDir).toHaveBeenCalledWith('D:\\ai_out');
+    expect(store.systemSettings.ai_output_dir).toBe('D:\\ai_out');
+    expect(store.confirmModal.message).toContain('AI 生成内容目录已更新');
+  });
+
+  it('rolls back to the backend snapshot when the AI output directory is rejected', async () => {
+    const unchanged = structuredClone(settings);
+    const setDir = vi.fn().mockResolvedValue({
+      ok: false,
+      msg: '目录不可写或无法创建：D:\\blocked',
+      settings: unchanged,
+    });
+    (window as any).pywebview = { api: { set_ai_output_dir: setDir } };
+    const store = useAppStore();
+    store.systemSettings = structuredClone(settings);
+
+    const ok = await store.setAiOutputDir('D:\\blocked');
+
+    expect(ok).toBe(false);
+    expect(setDir).toHaveBeenCalledWith('D:\\blocked');
+    expect(store.systemSettings.ai_output_dir_setting).toBe('');
+    expect(store.confirmModal.message).toContain('目录不可写或无法创建');
   });
 });

@@ -636,3 +636,183 @@ def test_promote_refuses_queued_item_without_takeover_flag():
     assert item["status"] == "pending"
     assert item["execution_mode"] == "takeover_queued"
     assert scheduler._in_flight_ids == set()
+
+
+def _queued_takeover_item(item_id, *, sequence, files=None):
+    """构造一个崩溃恢复形态的排队接管项（pending + takeover_queued）。"""
+    item = {
+        "id": item_id,
+        "subject": item_id,
+        "status": "pending",
+        "execution_mode": "takeover_queued",
+        "takeover_required": True,
+        "takeover_sequence": sequence,
+        "handoff_task_id": f"subagent-{item_id}",
+    }
+    if files is not None:
+        item["files"] = list(files)
+    return item
+
+
+def test_claim_takeover_skips_queued_item_blocked_by_file_lease():
+    """FIFO 只决定优先级：队首文件租约被占用时必须顺延认领后面的接管项，
+    否则单个占位项会把整条接管队列永久堵死。"""
+    plan = PlanManager()
+    plan.replace([
+        {"id": "holder", "subject": "占用共享文件", "files": ["shared.py"]},
+        _queued_takeover_item("blocked", sequence=1, files=["shared.py"]),
+        _queued_takeover_item("free", sequence=2, files=["free.py"]),
+    ])
+    scheduler = TaskScheduler(plan, max_workers=3)
+    assert scheduler.start_delegated_item(
+        "holder", "subagent-holder", "subagent:implement", None
+    ) is True
+
+    claimed = scheduler.claim_takeover_for_turn("turn-1")
+
+    assert claimed is not None
+    assert claimed["id"] == "free"
+    assert claimed["status"] == "in_progress"
+    assert claimed["execution_mode"] == "main_takeover"
+    assert claimed["takeover_turn_id"] == "turn-1"
+    items = {item["id"]: item for item in plan.snapshot()}
+    assert items["blocked"]["status"] == "pending"
+    assert items["blocked"]["execution_mode"] == "takeover_queued"
+
+
+def test_claim_takeover_returns_none_when_every_queued_item_is_file_blocked():
+    """所有排队项都被文件租约占用时保持队列不动，绝不无锁运行。"""
+    plan = PlanManager()
+    plan.replace([
+        {"id": "holder", "subject": "占用共享文件", "files": ["shared.py"]},
+        _queued_takeover_item("blocked", sequence=1, files=["shared.py"]),
+    ])
+    scheduler = TaskScheduler(plan, max_workers=2)
+    assert scheduler.start_delegated_item(
+        "holder", "subagent-holder", "subagent:implement", None
+    ) is True
+
+    assert scheduler.claim_takeover_for_turn("turn-1") is None
+    assert plan.snapshot()[1]["execution_mode"] == "takeover_queued"
+
+
+def test_promote_next_takeover_skips_queued_item_blocked_by_file_lease():
+    """plan_finish 后的提升同样不得被队首文件冲突卡住整条队列。"""
+    plan = PlanManager()
+    plan.replace([
+        {"id": "holder", "subject": "占用共享文件", "files": ["shared.py"]},
+        _queued_takeover_item("blocked", sequence=1, files=["shared.py"]),
+        _queued_takeover_item("free", sequence=2, files=["free.py"]),
+    ])
+    scheduler = TaskScheduler(plan, max_workers=3)
+    assert scheduler.start_delegated_item(
+        "holder", "subagent-holder", "subagent:implement", None
+    ) is True
+
+    promoted = scheduler.promote_next_takeover("turn-1")
+
+    assert promoted is not None
+    assert promoted["id"] == "free"
+    assert promoted["execution_mode"] == "main_takeover"
+    items = {item["id"]: item for item in plan.snapshot()}
+    assert items["blocked"]["execution_mode"] == "takeover_queued"
+
+
+def _released_takeover_item():
+    """构造"子代理超时移交后又因回合结束被降级排队"的计划项。"""
+    plan = PlanManager()
+    plan.replace([{"id": "item", "subject": "delegated work"}])
+    scheduler = TaskScheduler(plan)
+    assert scheduler.start_delegated_item(
+        "item", "subagent-abcd", "subagent:implement", None
+    ) is True
+    assert scheduler.handoff_to_main(
+        "item", "subagent-abcd", "turn-1", "foreground timeout"
+    ) is not None
+    assert scheduler.release_takeover_for_turn(
+        "turn-1", cancelled=False, reason="turn ended before plan_finish"
+    ) is not None
+    return plan, scheduler
+
+
+def test_complete_rejected_reports_reason_instead_of_silent_drop():
+    """迟到的完成回写被拒时必须可观测：静默 return False 会让"干完了状态却不动"
+    无从排查。"""
+    plan, scheduler = _released_takeover_item()
+    events = []
+    scheduler.set_event_callback(lambda kind, payload: events.append((kind, payload)))
+
+    assert scheduler.complete("item", "迟到的完成回写") is False
+
+    rejected = [
+        payload for kind, payload in events if kind == "plan_writeback_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["item_id"] == "item"
+    assert rejected[0]["action"] == "complete"
+    assert "pending" in rejected[0]["reason"]
+    assert plan.snapshot()[0]["status"] == "pending"
+
+
+def test_fail_rejected_reports_reason_instead_of_silent_drop():
+    """失败回写同样不得静默丢弃，否则子代理的真实失败原因会消失。"""
+    plan, scheduler = _released_takeover_item()
+    events = []
+    scheduler.set_event_callback(lambda kind, payload: events.append((kind, payload)))
+
+    assert scheduler.fail("item", "迟到的失败回调") is False
+
+    rejected = [
+        payload for kind, payload in events if kind == "plan_writeback_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["item_id"] == "item"
+    assert rejected[0]["action"] == "fail"
+    assert "pending" in rejected[0]["reason"]
+    assert plan.snapshot()[0]["status"] == "pending"
+
+
+def test_writeback_rejected_event_keeps_plan_items_render_path_clean():
+    """诊断事件不能复用 plan_item_* 前缀：CLI 会把该前缀一律当计划项状态渲染。"""
+    plan, scheduler = _released_takeover_item()
+    events = []
+    scheduler.set_event_callback(lambda kind, payload: events.append((kind, payload)))
+
+    scheduler.complete("item", "迟到的完成回写")
+
+    kinds = [kind for kind, _ in events]
+    assert kinds == ["plan_writeback_rejected"]
+
+
+def test_resume_takeover_accepts_queued_in_progress_item():
+    """排队等待接管的 in_progress 项必须能恢复为 main_takeover。
+
+    回归场景：子代理超时移交后，项停在 status=in_progress +
+    execution_mode=takeover_queued。旧 resume_takeover 只认
+    failed/blocked/cancelled/pending，导致这类项既不能 resume、也不能 finish、
+    更不能 retry，永久锁死整条依赖链。
+    """
+    plan = PlanManager()
+    item = _queued_takeover_item("stuck", sequence=1, files=["a.py"])
+    item["status"] = "in_progress"
+    plan.replace([item])
+    scheduler = TaskScheduler(plan)
+
+    resumed = scheduler.resume_takeover("stuck", "turn-9")
+
+    assert resumed is not None
+    assert resumed["status"] == "in_progress"
+    assert resumed["execution_mode"] == "main_takeover"
+    assert resumed["takeover_turn_id"] == "turn-9"
+
+
+def test_resume_takeover_still_rejects_delegated_in_progress_item():
+    """在途 delegated 项不得被 resume 抢走：只放行 takeover_queued。"""
+    plan = PlanManager()
+    plan.replace([{"id": "running", "subject": "执行中", "files": ["b.py"]}])
+    scheduler = TaskScheduler(plan)
+    assert scheduler.start_delegated_item(
+        "running", "subagent-x", "subagent:implement", None
+    ) is True
+
+    assert scheduler.resume_takeover("running", "turn-9") is None

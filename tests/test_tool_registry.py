@@ -322,3 +322,99 @@ def test_mcp_reserved_schemas_are_filtered_from_tools_schema(monkeypatch):
     }
     assert "computer_action" not in names
     assert "remote" in names
+
+
+# ── A2：side_effect_scope 契约校验（03 规格 3.2） ──
+
+_VALID_SIDE_EFFECT_SCOPES = {"none", "workspace", "git", "network", "system"}
+
+# build_default_registry 的 31 个内置工具（不含插件与固定 computer 适配器）
+_BUILTIN_TOOL_NAMES = (
+    "read_file", "list_directory", "search_code", "find_definition", "search_news",
+    "fetch_url", "get_weather", "glob_files", "automation_list", "ask_user",
+    "plan_write", "plan_update", "plan_read", "plan_retry", "plan_resume_takeover",
+    "plan_finish", "write_file", "edit_file", "fetch_image", "undo_turn",
+    "execute_command", "manage_task", "run_subagent", "mcp_add_server",
+    "mcp_remove_server", "mcp_set_enabled", "mcp_list_servers", "automation_create",
+    "automation_update", "automation_delete", "automation_run_now",
+)
+
+
+def test_all_builtin_tools_have_valid_side_effect_scope():
+    """所有内置工具的 side_effect_scope 非空且属于合法集合（03 规格 T-T10）。"""
+    registry = build_default_registry()
+
+    for name in _BUILTIN_TOOL_NAMES:
+        scope = registry.get(name).side_effect_scope
+        assert scope, f"{name} 的 side_effect_scope 不得为空"
+        assert scope in _VALID_SIDE_EFFECT_SCOPES, f"{name} 的 scope 非法: {scope!r}"
+
+
+def test_side_effect_scope_matches_spec_categories():
+    """03 规格 3.2 取值表的代表性归类不得漂移。"""
+    registry = build_default_registry()
+
+    assert registry.get("read_file").side_effect_scope == "none"
+    assert registry.get("plan_read").side_effect_scope == "none"
+    assert registry.get("fetch_url").side_effect_scope == "network"
+    assert registry.get("fetch_image").side_effect_scope == "network"
+    assert registry.get("write_file").side_effect_scope == "workspace"
+    assert registry.get("undo_turn").side_effect_scope == "workspace"
+    assert registry.get("execute_command").side_effect_scope == "system"
+
+
+def _load_plugin_module_by_path(module_name, plugin_dir):
+    """按文件路径加载插件薄壳（与 plugin_loader 的加载方式一致）。
+
+    直接走 importlib 而不用插件加载器：本测试只验证插件源码里的 ToolSpec
+    声明，不应依赖插件启用状态 / 信任状态 / 全局注册表等外部环境。
+    """
+    import importlib.util
+    import os
+
+    entry = os.path.join(plugin_dir, "plugin.py")
+    spec = importlib.util.spec_from_file_location(module_name, entry)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_image_plugin_tools_declare_network_scope():
+    """A 阶段评审修复：生图插件工具必须声明 side_effect_scope=network。
+
+    规格 03 §3.2 取值表点名 hunyuan_generate_image / tokenrhythm_* 归
+    network；此前插件未声明导致取默认 none，本测试锁定该契约。
+    """
+    import os
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    plugins_root = os.path.join(project_root, "plugins")
+
+    hunyuan = _load_plugin_module_by_path(
+        "_test_hunyuan_image_plugin", os.path.join(plugins_root, "hunyuan_image")
+    )
+    tokenrhythm = _load_plugin_module_by_path(
+        "_test_tokenrhythm_image_plugin", os.path.join(plugins_root, "tokenrhythm_image")
+    )
+
+    registry = ToolRegistry()
+    hunyuan.register(registry)
+    tokenrhythm.register(registry)
+
+    for name in (
+        "hunyuan_generate_image",
+        "tokenrhythm_generate_image",
+        "tokenrhythm_edit_image",
+    ):
+        assert registry.get(name).side_effect_scope == "network", name
+
+
+def test_fixed_computer_adapter_declares_system_scope():
+    """A 阶段评审补修：固定 computer 适配器必须声明 side_effect_scope=system。
+
+    规格 03 §3.2 取值表点名 computer_action 归 system；此前未声明导致取默认
+    none，本测试锁定该契约（与生图插件 network 同理，不经注册表加载）。
+    """
+    from core.computer.tool_adapter import computer_action_tool_spec
+
+    assert computer_action_tool_spec().side_effect_scope == "system"

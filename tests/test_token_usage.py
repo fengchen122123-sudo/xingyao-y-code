@@ -546,3 +546,545 @@ def test_format_cache_diagnostic_summary_omits_empty_summary():
     assert main._format_cache_diagnostic_summary({
         "count": 0, "lost_tokens": 0, "unreported": 0, "categories": {}
     }) == ""
+
+
+# —— 跨渠道缓存命中率修复 · Task 4：口径修复与展示 ——
+
+def test_status_cache_metrics_take_current_lane_hot_rate_not_process_mix():
+    """状态栏主指标 = 当前会话 × 当前车道的热命中率：跨渠道切换不串数。
+
+    阿里云车道 4 轮 950/1000 = 95%，基元律动车道 2 轮 100/1000 = 10%；
+    进程级累计混算会是 66.6%。这里断言两个具体数字，杜绝回到混算口径。
+    """
+    import core.llm as llm
+
+    session, model = "task4-lane-switch", "openai/deepseek-v4.1-flash"
+    aliyun = "https://aliyun-token-plan.example/v1"
+    tokenrhythm = "https://tokenrhythm.example/v1"
+    for _ in range(4):
+        llm._record_cache_usage(session, "main", 1000, 950, "", model, aliyun)
+    for _ in range(2):
+        llm._record_cache_usage(session, "main", 1000, 100, "", model, tokenrhythm)
+
+    aliyun_metrics = main._status_cache_metrics(session, model, aliyun)
+    tokenrhythm_metrics = main._status_cache_metrics(session, model, tokenrhythm)
+
+    assert aliyun_metrics["hot_rate"] == 95.0
+    assert tokenrhythm_metrics["hot_rate"] == 10.0
+    assert aliyun_metrics["hot_prompt"] == 4000
+    assert tokenrhythm_metrics["hot_prompt"] == 2000
+
+
+def test_status_cache_metrics_keep_keepalive_scope_out_of_main():
+    """保活不污染 main：keepalive 低命中轮次绝不动 main 指标，且自身单独可得。"""
+    import core.llm as llm
+
+    session, model = "task4-keepalive-isolation", "openai/deepseek-v4.1-flash"
+    base = "https://aliyun-token-plan.example/v1"
+    for _ in range(4):
+        llm._record_cache_usage(session, "main", 1000, 950, "", model, base)
+
+    before = main._status_cache_metrics(session, model, base)
+    for _ in range(6):
+        llm._record_cache_usage(session, "keepalive", 10000, 0, "", model, base)
+    after = main._status_cache_metrics(session, model, base)
+
+    assert before["hot_rate"] == 95.0
+    # §1.7 的 11.5pp 假跌：保活 0 命中不得把 main 从 95% 拖下来
+    assert after["hot_rate"] == 95.0
+    assert after["hot_prompt"] == 4000
+    assert after["hot_cached"] == 3800
+    # 保活自身指标单独可得
+    assert after["keepalive_rate"] == 0.0
+    assert after["keepalive_prompt"] == 60000
+    assert after["keepalive_cached"] == 0
+
+
+def test_status_cache_metrics_unreported_lane_is_none_not_zero():
+    """铁律「未报告 ≠ 0」：usage_valid=0 的车道指标为 None，不冒充 0% 命中。"""
+    import core.llm as llm
+
+    session, model = "task4-unreported", "openai/local-vllm"
+    base = "http://127.0.0.1:8000/v1"
+
+    llm._record_cache_usage(session, "main", 1000, 950, "", model, base)
+    llm._mark_cache_usage_unavailable(session, model, base, "main", "usage 不一致")
+
+    metrics = main._status_cache_metrics(session, model, base)
+
+    assert metrics["hot_rate"] is None
+    assert metrics["session_rate"] is None
+    # 已报告的累计分母不因「最新一轮未报告」而丢失
+    assert metrics["hot_prompt"] == 1000
+
+
+def test_usage_model_label_separates_routes_and_keepalive_scope():
+    """同一模型在不同渠道 / 不同 scope 必须产出不同标签，不再合并成一条。"""
+    row = {
+        "provider": "openai",
+        "model": "deepseek-v4-flash",
+        "api_base": "https://aliyun-token-plan.example/v1",
+        "cache_scope": "main",
+    }
+    other = {**row, "api_base": "https://tokenrhythm.example/v1"}
+    keepalive = {**row, "cache_scope": "keepalive"}
+
+    aliyun_label = main._usage_model_label(row, row["api_base"], row["cache_scope"])
+    tokenrhythm_label = main._usage_model_label(
+        other, other["api_base"], other["cache_scope"]
+    )
+    keepalive_label = main._usage_model_label(
+        keepalive, keepalive["api_base"], keepalive["cache_scope"]
+    )
+
+    assert aliyun_label == (
+        "openai/deepseek-v4-flash @ https://aliyun-token-plan.example/v1"
+    )
+    assert tokenrhythm_label != aliyun_label
+    assert keepalive_label != aliyun_label
+    assert "[keepalive]" in keepalive_label
+    # 同 model + 同 api_base + 同 scope 标签稳定
+    assert main._usage_model_label(
+        row, row["api_base"], row["cache_scope"]
+    ) == aliyun_label
+
+
+def test_token_usage_snapshot_exposes_per_scope_views_without_changing_cache_keys():
+    """快照新增按 scope 分离视图；现有 cache 键语义不变（仍是当前 scope 视图）。"""
+    import core.llm as llm
+
+    session, model = "task4-scope-views", "openai/deepseek-v4.1-flash"
+    base = "https://aliyun-token-plan.example/v1"
+    llm._record_cache_usage(session, "main", 1000, 950, "", model, base)
+    llm._record_cache_usage(session, "keepalive", 1000, 100, "", model, base)
+
+    snapshot = llm.get_token_usage_snapshot(session, model, base, "main")
+
+    assert snapshot["cache"]["hot"]["rate"] == 95.0
+    assert snapshot["cache"]["hot"]["prompt_tokens"] == 1000
+    assert snapshot["cache_scopes"]["main"]["hot"]["rate"] == 95.0
+    assert snapshot["cache_scopes"]["keepalive"]["hot"]["rate"] == 10.0
+    assert snapshot["cache_scopes"]["keepalive"]["hot"]["prompt_tokens"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# Task 7（跨渠道缓存命中率修复）：缓存读 / 写分列记账——写入轮 ≠ 未命中
+# ---------------------------------------------------------------------------
+
+
+def test_persist_token_usage_forwards_cache_write_tokens(monkeypatch):
+    """写入量必须透传到落库层；未报告时传 None（绝不冒充 0）。"""
+    recorded = {}
+
+    class _FakeManager:
+        def add_token_usage(self, **kwargs):
+            recorded.update(kwargs)
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: _FakeManager())
+    _persist_token_usage(
+        "anthropic/kimi-k3",
+        prompt_tokens=1000,
+        completion_tokens=20,
+        cached_tokens=None,
+        total_tokens=1020,
+        session_id="sess-write",
+        api_base="https://api.kimi.com/coding/v1",
+        cache_scope="main",
+        cache_write_tokens=800,
+    )
+    assert recorded["cache_write_tokens"] == 800
+
+    recorded.clear()
+    _persist_token_usage(
+        "openai/m1",
+        prompt_tokens=1000,
+        completion_tokens=20,
+        cached_tokens=100,
+        total_tokens=1020,
+        session_id="sess-write",
+        api_base="https://relay.example/v1",
+        cache_scope="main",
+    )
+    # 未报告时不带该键（既有调用方对 kwargs 做精确断言），落库层默认 None。
+    assert recorded.get("cache_write_tokens") is None
+
+
+def test_token_usage_cache_write_tokens_column_keeps_null_vs_zero(tmp_path):
+    """落库语义：未报告 → NULL，已报告 → 真实值（含 0），查询原样返回。"""
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(str(tmp_path / "token-write.db"))
+    try:
+        manager.add_token_usage(
+            "anthropic", "kimi-k3", 1000, 20, None, 1020,
+            session_id="write-null", cache_write_tokens=None,
+        )
+        manager.add_token_usage(
+            "anthropic", "kimi-k3", 1000, 20, 0, 1020,
+            session_id="write-zero", cache_write_tokens=0,
+        )
+        manager.add_token_usage(
+            "anthropic", "kimi-k3", 1000, 20, None, 1020,
+            session_id="write-real", cache_write_tokens=800,
+        )
+
+        assert manager.get_last_token_usage("write-null")["cache_write_tokens"] is None
+        assert manager.get_last_token_usage("write-zero")["cache_write_tokens"] == 0
+        assert manager.get_last_token_usage("write-real")["cache_write_tokens"] == 800
+    finally:
+        manager.close()
+
+
+def test_extract_cache_write_tokens_candidates_and_unreported():
+    """写入量候选名三形态；未报告 → None（写入轮 ≠ 未命中，绝不冒充 0）。"""
+    from core.llm_diagnostics import _extract_cache_write_tokens
+
+    assert _extract_cache_write_tokens(None) is None
+    assert _extract_cache_write_tokens({"prompt_tokens": 1000}) is None
+    assert _extract_cache_write_tokens({"cache_creation_input_tokens": 700}) == 700
+    assert _extract_cache_write_tokens({"cache_write_tokens": 300}) == 300
+    assert _extract_cache_write_tokens(
+        {"prompt_tokens_details": {"cache_creation_tokens": 400}}
+    ) == 400
+    # details 内嵌优先于直读与 Anthropic 形态
+    assert _extract_cache_write_tokens({
+        "prompt_tokens_details": {"cache_creation_tokens": 400},
+        "cache_write_tokens": 300,
+        "cache_creation_input_tokens": 700,
+    }) == 400
+    # 报告了 0 是真实 0，与「未报告」严格区分
+    assert _extract_cache_write_tokens({"cache_write_tokens": 0}) == 0
+    # 非法值按未报告处理，不猜、不夹断（拒绝口径与 cached_tokens 一致）
+    assert _extract_cache_write_tokens({"cache_write_tokens": -1}) is None
+
+
+def test_cache_diagnostic_table_keeps_null_vs_zero_for_cache_write(tmp_path):
+    """诊断表写入量列：未报告 → NULL，已报告 → 真实值（含 0）。"""
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(str(tmp_path / "diag-write.db"))
+    try:
+        base = {
+            "model": "anthropic/kimi-k3",
+            "api_base": "https://api.kimi.com/coding/v1",
+            "cache_scope": "main",
+            "request_reason": "",
+            "messages_sha256": "a" * 64,
+            "system_sha256": "b" * 64,
+            "tools_sha256": "c" * 64,
+            "message_count": 2,
+            "system_message_count": 1,
+            "common_prefix_messages": 0,
+            "request_bytes": 100,
+            "system_bytes": 40,
+            "tools_bytes": 0,
+            "cache_reported": True,
+            "usage_valid": True,
+            "usage_errors": (),
+        }
+        manager.add_cache_request_diagnostic(dict(base, session_id="dw-null"))
+        manager.add_cache_request_diagnostic(
+            dict(base, session_id="dw-zero", cache_write_tokens=0)
+        )
+        manager.add_cache_request_diagnostic(
+            dict(base, session_id="dw-real", cache_write_tokens=800)
+        )
+
+        rows = {
+            row["session_id"]: row
+            for row in manager.query_cache_request_diagnostics()
+        }
+        assert rows["dw-null"]["cache_write_tokens"] is None
+        assert rows["dw-zero"]["cache_write_tokens"] == 0
+        assert rows["dw-real"]["cache_write_tokens"] == 800
+    finally:
+        manager.close()
+
+
+def test_legacy_diagnostic_table_migrates_cache_write_column(tmp_path):
+    """老诊断库缺 cache_write_tokens 时自动补列；老行 NULL；重开幂等。"""
+    import sqlite3
+
+    from core.memory import MemoryManager
+
+    db_path = tmp_path / "legacy-write.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE cache_request_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            api_base TEXT NOT NULL,
+            cache_scope TEXT NOT NULL,
+            request_reason TEXT NOT NULL,
+            messages_sha256 TEXT NOT NULL,
+            system_sha256 TEXT NOT NULL,
+            tools_sha256 TEXT NOT NULL,
+            message_count INTEGER NOT NULL,
+            system_message_count INTEGER NOT NULL,
+            common_prefix_messages INTEGER NOT NULL,
+            request_bytes INTEGER NOT NULL,
+            system_bytes INTEGER NOT NULL,
+            tools_bytes INTEGER NOT NULL,
+            prompt_tokens INTEGER,
+            cached_tokens INTEGER,
+            cache_miss_tokens INTEGER,
+            cache_reported INTEGER NOT NULL,
+            usage_valid INTEGER NOT NULL,
+            usage_errors TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO cache_request_diagnostics ("
+        "ts, session_id, model, api_base, cache_scope, request_reason, "
+        "messages_sha256, system_sha256, tools_sha256, message_count, "
+        "system_message_count, common_prefix_messages, request_bytes, "
+        "system_bytes, tools_bytes, cache_reported, usage_valid, usage_errors"
+        ") VALUES (1, 'legacy-write-row', 'openai/qwen3.8-max', "
+        "'https://dashscope.aliyuncs.com/compatible-mode/v1', 'main', '', "
+        "'a', 'b', 'c', 1, 1, 0, 188, 90, 0, 0, 0, '[]')"
+    )
+    conn.commit()
+    conn.close()
+
+    manager = MemoryManager(str(db_path))
+    try:
+        columns = {
+            row[1]
+            for row in manager.conn.execute(
+                "PRAGMA table_info(cache_request_diagnostics)"
+            )
+        }
+        assert "cache_write_tokens" in columns
+        legacy = manager.conn.execute(
+            "SELECT cache_write_tokens FROM cache_request_diagnostics "
+            "WHERE session_id = 'legacy-write-row'"
+        ).fetchone()
+        assert legacy == (None,)
+    finally:
+        manager.close()
+
+    reopened = MemoryManager(str(db_path))
+    try:
+        assert "cache_write_tokens" in {
+            row[1]
+            for row in reopened.conn.execute(
+                "PRAGMA table_info(cache_request_diagnostics)"
+            )
+        }
+    finally:
+        reopened.close()
+
+
+def test_account_server_usage_forwards_cache_write_from_anthropic_shape(monkeypatch):
+    """Anthropic 形态的写入量经记账链落到 persist kwargs；未报告则不带该键。"""
+    import core.llm as llm
+
+    persisted = []
+    monkeypatch.setattr(
+        llm, "_persist_token_usage",
+        lambda *args, **kwargs: persisted.append(kwargs),
+    )
+    try:
+        llm._account_server_usage(
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 20,
+                "total_tokens": 1020,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 700,
+            },
+            model_name="anthropic/kimi-k3",
+            api_base="https://api.kimi.com/coding/v1",
+            session_id="accounting-write",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+        assert persisted and persisted[0]["cache_write_tokens"] == 700
+
+        persisted.clear()
+        llm._account_server_usage(
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 20,
+                "total_tokens": 1020,
+                "prompt_cache_hit_tokens": 200,
+            },
+            model_name="openai/deepseek-v4",
+            api_base="https://relay.example/v1",
+            session_id="accounting-write-none",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+        assert persisted and "cache_write_tokens" not in persisted[0]
+    finally:
+        with llm.token_usage_lock:
+            for key in [
+                k for k in llm._cache_usage_states
+                if str(k[0]).startswith("accounting-write")
+            ]:
+                del llm._cache_usage_states[key]
+
+
+def test_usage_table_keeps_numeric_columns_aligned_for_long_route_labels(monkeypatch):
+    """长渠道标签（模型 @ api_base [scope]）不得撑破列宽上限导致数字列错行。
+
+    本次改动把 api_base / scope 放回标签后，标签宽度可达 80+ 格，而模型列宽
+    上限是 60 且只补齐不压缩——超出的部分会把该行的数字列整体右推，
+    同一张表的表头/数据行/小计再也对不齐。
+    """
+    import re
+
+    rows = [
+        {
+            "provider": "openai", "model": "deepseek-v4.1-flash",
+            "api_base": "https://cn-beijing.maas.aliyuncs.com/api/v1",
+            "cache_scope": "main",
+            "prompt": 100000, "completion": 500, "cached": 88000,
+            "cache_prompt": 100000, "total": 100500,
+        },
+        {
+            "provider": "openai", "model": "deepseek-v4.1-flash",
+            "api_base": "https://cn-beijing.maas.aliyuncs.com/api/v1",
+            "cache_scope": "keepalive",
+            "prompt": 50000, "completion": 20, "cached": 2000,
+            "cache_prompt": 50000, "total": 50020,
+        },
+    ]
+
+    class Manager:
+        def query_token_usage_by_model(self, start, end):
+            return rows
+
+        def query_cache_diagnostic_summary(self, *args, **kwargs):
+            return {"count": 0, "lost_tokens": 0, "unreported": 0, "categories": {}}
+
+    captured = []
+    monkeypatch.setattr(
+        main, "print_formatted_text",
+        lambda html, *args, **kwargs: captured.append(str(html)),
+    )
+
+    main._render_usage_section(Manager(), "今日", "2026-08-09", "2026-08-09")
+
+    lines = [re.sub(r"<[^>]+>", "", line) for line in captured]
+    table_lines = lines[1:]  # 跳过标题行
+    assert len(table_lines) >= 4, lines  # 表头 + 两条数据行 + 小计
+    # 列对齐的等价判据：所有表格行的显示宽度必须一致（列宽固定，
+    # 超宽标签若不压缩就会把该行撑开，于是行宽不再相等）。
+    widths = {main._term_display_width(line) for line in table_lines}
+    assert len(widths) == 1, (widths, table_lines)
+
+
+def test_status_token_info_reports_process_scope_only():
+    """状态栏只报进程累计口径：「本车道命中」「全局」标签、保活段都已移除。"""
+    text = main._compose_status_token_info(
+        prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
+        ctx_pct="3%", ctx_used="4K", ctx_max="128K",
+    )
+
+    assert "本车道" not in text
+    assert text.startswith("↑ 40.0M · ↓ 2.1M · ⚡ 700.4K (71%)")
+    assert "上下文 3% (4K/128K)" in text
+    assert "全局" not in text
+    assert "保活" not in text
+
+
+def test_usage_model_label_cell_is_bounded_but_keeps_channel_and_scope():
+    """列宽压缩保留首尾：渠道尾部与 [scope] 标记必须仍然可见。"""
+    label = (
+        "openai/deepseek-v4.1-flash @ "
+        "https://cn-beijing.maas.aliyuncs.com/api/v1 [keepalive]"
+    )
+    cell = main._truncate_visible(label, 60)
+
+    assert main._term_display_width(cell) <= 60
+    assert cell.startswith("openai/deepseek-v4.1-flash @ h")
+    assert cell.endswith("iyuncs.com/api/v1 [keepalive]")
+    assert "…" in cell
+    # 不超宽时原样返回，不做任何压缩
+    assert main._truncate_visible("a/b", 60) == "a/b"
+
+
+def test_get_token_usage_by_session_aggregates_conversation_and_keepalive_separately():
+    """本会话口径：main/legacy 聚合为主，保活单列；未报告行不进命中率分母。"""
+    manager = MemoryManager(":memory:")
+    assert manager.get_token_usage_by_session("s1")["prompt"] == 0
+
+    # main 轮次：一轮已报告缓存（cached=5），一轮未报告（cached=None）
+    manager.add_token_usage(
+        "openai", "m1", 300, 30, 5, 335, session_id="s1",
+        api_base="https://a.example/v1", cache_scope="main", ts=1000,
+    )
+    manager.add_token_usage(
+        "openai", "m1", 200, 20, None, 220, session_id="s1",
+        api_base="https://a.example/v1", cache_scope="main", ts=2000,
+    )
+    # legacy 迁移行并入对话口径
+    manager.add_token_usage(
+        "openai", "m1", 100, 10, 50, 160, session_id="s1", cache_scope="legacy", ts=2500,
+    )
+    # 保活单列，绝不混进对话口径
+    manager.add_token_usage(
+        "openai", "m1", 10, 1, 10, 11, session_id="s1",
+        api_base="https://a.example/v1", cache_scope="keepalive", ts=2600,
+    )
+    # 其他会话不串数
+    manager.add_token_usage("openai", "m1", 999, 99, 0, 1098, session_id="s2")
+
+    totals = manager.get_token_usage_by_session("s1")
+    assert totals["prompt"] == 600
+    assert totals["completion"] == 60
+    assert totals["cached"] == 55
+    # 命中率分母只含已报告缓存明细的行：300 + 100 = 400（200 那轮未报告 ≠ 0）
+    assert totals["cache_prompt"] == 400
+    assert totals["total"] == 715
+    assert totals["requests"] == 3
+    assert totals["last_ts"] == 2500
+    assert totals["keepalive_prompt"] == 10
+    assert totals["keepalive_requests"] == 1
+
+    assert manager.get_token_usage_by_session("missing")["requests"] == 0
+
+
+def test_list_token_usage_by_sessions_orders_by_total_and_skips_deleted():
+    """会话列表按合计降序、只列现存会话；全部合计不分会话不分 scope。"""
+    manager = MemoryManager(":memory:")
+    manager.create_session_explicit("live-a")
+    manager.create_session_explicit("live-b")
+    # 残留流水行：sessions 表无同名会话（已删/从未存在），不应进列表
+    manager.add_token_usage("openai", "m1", 10000, 100, 0, 10100, session_id="deleted")
+
+    manager.add_token_usage("openai", "m1", 300, 30, 5, 335, session_id="live-a")
+    manager.add_token_usage("openai", "m1", 100, 10, 0, 110, session_id="live-b")
+    manager.add_token_usage(
+        "openai", "m1", 10, 1, 10, 11, session_id="live-a", cache_scope="keepalive",
+    )
+
+    rows = manager.list_token_usage_by_sessions(limit=10)
+    assert [row["session_id"] for row in rows] == ["live-a", "live-b"]
+    assert rows[0]["total"] == 335
+    assert rows[0]["cache_prompt"] == 300
+    assert rows[1]["total"] == 110
+    # 已删会话行不进列表，但进全部合计（真实计费）
+    totals = manager.get_token_usage_totals()
+    assert totals["prompt"] == 300 + 100 + 10000 + 10
+    assert totals["requests"] == 4
+
+
+def test_rename_session_migrates_token_usage_rows_in_same_transaction():
+    """改名必须随迁 token_usage.session_id，否则按会话统计静默丢历史。"""
+    manager = MemoryManager(":memory:")
+    manager.create_session_explicit("old-name")
+    manager.add_token_usage("openai", "m1", 300, 30, 5, 335, session_id="old-name")
+
+    success, final_name = manager.rename_session("old-name", "new-name")
+    assert success is True
+
+    moved = manager.get_token_usage_by_session("new-name")
+    assert moved["prompt"] == 300
+    assert moved["requests"] == 1
+    assert manager.get_token_usage_by_session("old-name")["requests"] == 0

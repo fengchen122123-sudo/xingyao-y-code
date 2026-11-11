@@ -529,6 +529,43 @@ def test_active_theme_rename_updates_authoritative_id(tmp_path):
     assert repo.get_active()["id"] == "rose-new"
 
 
+def test_rename_theme_with_unchanged_id_only_updates_name(tmp_path):
+    """重命名对话框默认沿用当前主题 ID：只改名称时不能报“主题已存在”。"""
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}", encoding="utf-8")
+    repo = ThemeRepository(tmp_path / "themes", config_file)
+    repo.copy_theme("builtin.light", "rose", "Rose")
+    repo.set_active("rose")
+    asset = repo.root / "rose" / "assets" / "keep.png"
+    asset.parent.mkdir(parents=True, exist_ok=True)
+    asset.write_bytes(b"asset")
+
+    renamed = repo.rename_theme("rose", "rose", "Rose New")
+
+    assert renamed["id"] == "rose"
+    assert renamed["name"] == "Rose New"
+    assert repo.get_theme("rose")["name"] == "Rose New"
+    assert repo.get_active()["id"] == "rose"
+    assert asset.read_bytes() == b"asset"
+    assert json.loads(config_file.read_text(encoding="utf-8"))["gui_theme_id"] == "rose"
+    assert sorted(item.name for item in repo.root.iterdir()) == ["rose"]
+
+
+def test_rename_theme_to_another_existing_id_still_rejected(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}", encoding="utf-8")
+    repo = ThemeRepository(tmp_path / "themes", config_file)
+    repo.copy_theme("builtin.light", "rose", "Rose")
+    repo.copy_theme("builtin.light", "sakura", "Sakura")
+
+    with pytest.raises(ThemeError) as exc:
+        repo.rename_theme("rose", "sakura", "Sakura")
+
+    assert exc.value.code == "theme_exists"
+    assert repo.get_theme("rose")["name"] == "Rose"
+    assert repo.get_theme("sakura")["name"] == "Sakura"
+
+
 def test_active_rename_partial_old_cleanup_keeps_complete_new_active(tmp_path, monkeypatch):
     config_file = tmp_path / "config.json"
     config_file.write_text("{}", encoding="utf-8")

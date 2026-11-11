@@ -84,6 +84,10 @@ def render_session_history(
 ) -> str:
     # 窄终端钳制：render_markdown_to_ansi 要求 width >= 20
     width = max(20, width)
+    # 系统注入 user 消息识别：电脑操控观察跟进（core.computer 可能较重，
+    # 惰性导入，与 memory.py 同一裁决）+ 后台任务回报/护栏催促/hook 上下文
+    from core.computer.provider_generic import is_observation_protocol_message
+    from core.injection_markers import is_system_injected_user_text
     # 历史回放默认显示工具行：查看历史时需要完整工具执行轨迹。
     # 调用方可显式传 tool_verbose=False 静默工具行（仅用于测试）。
     if tool_verbose is None:
@@ -98,6 +102,15 @@ def render_session_history(
     for message in history:
         role = message.get("role")
         if role == "user":
+            # 系统注入的 user 消息（后台任务回报/护栏催促/hook 追加上下文/
+            # 电脑操控观察跟进）不是用户发送的内容，历史回放一律跳过，
+            # 避免冒充用户发言；与 GUI 气泡、红点导航同一裁决。
+            if (
+                is_observation_protocol_message(message)
+                or is_observation_protocol_message(message.get("content"))
+                or is_system_injected_user_text(message.get("content"))
+            ):
+                continue
             content = _sanitize_user_content(message.get("content"))
             if prev_block is not None:
                 output.append("\n" + separator + "\n")
@@ -126,12 +139,18 @@ def render_session_history(
                 if prev_block not in (None, "user"):
                     output.append("\n")
                 try:
-                    from core.persona_settings import get_agent_display_name
-                    _agent_label = get_agent_display_name()
+                    # 历史回放里的自称是“当前会话内的自称”：秘书会话显示秘书名
+                    from core.secretary import get_active_agent_name
+
+                    _agent_label = get_active_agent_name()
                 except Exception:
                     _agent_label = "星瑶"
                 output.append(f"{ANSI_MAGENTA}🤖 {_agent_label} >{ANSI_RESET}\n")
-                output.append(render_markdown_to_ansi(content, width))
+                try:
+                    output.append(render_markdown_to_ansi(content, width))
+                except Exception:
+                    # 单块病态 markdown 只降级为原文，不能让整个历史回放失败
+                    output.append(content or "")
                 prev_block = "assistant"
             continue
 

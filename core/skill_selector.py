@@ -5,7 +5,13 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
 
-from core.skills import scan_all_skills, get_active_skill_ids, save_active_skill_ids, get_skill_dirs
+from core.skills import (
+    scan_all_skills,
+    get_active_skill_ids,
+    save_active_skill_ids,
+    get_skill_dirs,
+    skill_source_label,
+)
 
 STYLE = Style.from_dict({
     "header":        "bold #00b4d8",
@@ -35,7 +41,7 @@ def open_skill_selector(on_closed=None):
     # ── Header（固定在顶部）──────────────────────────────────────────────
     def render_header():
         out = []
-        out += [_t("class:header", "  Y-code 技能插件管理器 (通用 SKILL.md)\n")]
+        out += [_t("class:header", "  星瑶Code 技能插件管理器 (通用 SKILL.md)\n")]
         out += [_t("", "  -----------------------------------------\n")]
         active_dirs = get_skill_dirs()
         if active_dirs:
@@ -73,7 +79,9 @@ def open_skill_selector(on_closed=None):
                 desc = skill["description"]
                 if len(desc) > 40:
                     desc = desc[:37] + "..."
-                line = f"{prefix}{check} {skill['name']} - {desc}\n"
+                # 来源标注（内置 / 用户）：与 /skills list 口径一致
+                src_tag = f"[{skill_source_label(skill)}]"
+                line = f"{prefix}{check} {skill['name']} {src_tag} - {desc}\n"
                 out.append(_t(st, line))
         return out
 

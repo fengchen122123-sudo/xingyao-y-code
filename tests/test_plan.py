@@ -2,6 +2,39 @@ from core.plan import PlanManager
 import pytest
 
 
+def test_storage_path_sanitizes_session_id_with_illegal_chars(tmp_path):
+    r"""会话 ID 派生自用户消息时可能含 Windows 非法文件名字符（`:` `\` 等）；
+    计划落盘前必须清洗，否则持久化抛 WinError 123 并卡死计划门禁。"""
+    bad_session_id = "位置：C:\\Users\\feng"
+    plan = PlanManager(storage_dir=tmp_path, session_id=bad_session_id)
+    plan.replace([{"id": "1", "subject": "test", "status": "pending"}])
+
+    path = plan.storage_path()
+    assert path is not None
+    assert path.exists()
+    assert path.name == "位置：C__Users_feng.json"
+
+    restored = PlanManager(storage_dir=tmp_path, session_id=bad_session_id)
+    assert restored.snapshot()[0]["subject"] == "test"
+
+
+def test_storage_path_keeps_legal_session_id(tmp_path):
+    """合法会话名保持原文件名，既有计划文件不受清洗影响。"""
+    plan = PlanManager(storage_dir=tmp_path, session_id="session-1")
+    assert plan.storage_path() == tmp_path / "session-1.json"
+
+
+def test_safe_session_filename_edge_cases():
+    from core.plan import SAFE_SESSION_FILENAME_MAX_CHARS, safe_session_filename
+
+    assert safe_session_filename("") == "session"
+    assert safe_session_filename("   ") == "session"
+    assert safe_session_filename("a:b/c\\d") == "a_b_c_d"
+    assert safe_session_filename("name.") == "name"
+    assert safe_session_filename("CON") == "_CON"
+    assert len(safe_session_filename("x" * 300)) == SAFE_SESSION_FILENAME_MAX_CHARS
+
+
 def test_plan_update_rejects_unknown_status():
     plan = PlanManager()
     plan.replace([{"id": "1", "subject": "test", "status": "pending"}])

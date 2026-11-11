@@ -26,6 +26,8 @@ def _restore_entry_layer_globals():
     ——全量套件在 test_harness_runtime 挂起的根因（D1，见
     docs/superpowers/reviews/2026-08-29-full-test-findings-and-fix-plan.md）。
     快照/还原保证测试之间互不污染，而不是只修补个别测试。
+    线程级电脑操控 handoff（core.computer.capability）同样按「测试后清空」处理：
+    它是一次性取出语义，桩掉模型入口的测试会让它残留到同线程的下一个测试。
     """
     from core import app_context
     from core import llm
@@ -84,6 +86,26 @@ def _restore_entry_layer_globals():
         from core.tools import _clear_sandbox_state_for_tests
 
         _clear_sandbox_state_for_tests()
+    except Exception:
+        pass
+    # 线程级电脑操控 handoff 是「一次性取出」语义：桩掉 _consume_turn_events 的
+    # 测试（如 test_gui_automation_dispatch 的 _WorkerHarness）会在 prepare 阶段
+    # 存入却无人取出，泄漏给同线程的下一个测试——对方直接从 handoff 拿到能力
+    # 快照，不再走 resolve_computer_capability，表现为组合跑才出现的假失败。
+    try:
+        from core.computer.capability import take_turn_computer_capability
+
+        take_turn_computer_capability()
+    except Exception:
+        pass
+    # 用户停止电脑操控的抑制态同样是进程级模块变量（core/computer/stop_notice.py）：
+    # 紧急热键用例会真的走 controller.stop_for_user 并置位它，残留后同进程后续用例的
+    # start_run / computer_turn_context_error 会被硬拦成 computer_user_stopped
+    # ——只在组合跑才出现的假失败。
+    try:
+        from core.computer import stop_notice
+
+        stop_notice.deactivate_user_stop("test_reset")
     except Exception:
         pass
 

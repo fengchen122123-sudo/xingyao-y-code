@@ -21,6 +21,12 @@ type MermaidApi = {
 let mermaidModulePromise: Promise<MermaidApi | null> | null = null;
 let initialized = false;
 let renderSeq = 0;
+// 加载失败后的冷却期：流式期间每个 delta 都会重建 DOM 并触发渲染，
+// 没有冷却会让每次触发都重发一次动态 import
+const LOAD_RETRY_COOLDOWN_MS = 5000;
+let loadFailedAt = 0;
+// 抽成变量便于测试注入（生产默认就是动态 import）
+let mermaidImporter: () => Promise<unknown> = () => import('mermaid');
 
 const svgCache = new Map<string, string>();
 const MAX_CACHE_ENTRIES = 50;
@@ -34,9 +40,12 @@ function isDarkTheme(): boolean {
 
 function loadMermaid(): Promise<MermaidApi | null> {
   if (!mermaidModulePromise) {
+    if (loadFailedAt && Date.now() - loadFailedAt < LOAD_RETRY_COOLDOWN_MS) {
+      return Promise.resolve(null);
+    }
     // 动态 import：mermaid 体积大（约 1.4MB min），拆成独立 chunk 按需加载，
     // 首个 mermaid 块出现才拉取；加载/初始化失败返回 null，块降级显示源码
-    mermaidModulePromise = import('mermaid')
+    mermaidModulePromise = mermaidImporter()
       .then((mod) => {
         const mermaid = ((mod as Record<string, unknown>).default ?? mod) as MermaidApi;
         if (!initialized) {
@@ -49,7 +58,12 @@ function loadMermaid(): Promise<MermaidApi | null> {
         }
         return mermaid;
       })
-      .catch(() => null);
+      .catch(() => {
+        // 失败不缓存：清空 promise 并进入冷却，冷却后允许重试
+        mermaidModulePromise = null;
+        loadFailedAt = Date.now();
+        return null;
+      });
   }
   return mermaidModulePromise;
 }
@@ -87,8 +101,80 @@ export function sanitizeSvg(svg: string): string {
   }
 }
 
+// 节点标签自动修复：模型输出常把 [DOC]、[VALUES] 这类方括号（以及裸圆括号）
+// 直接写进标签文本（如 E[说明 [DOC] 关键词]），mermaid 的 jison 解析器把
+// [ ] 当节点定界符直接 Parse error；官方解法是整段标签用双引号包裹
+// （E["说明 [DOC] 关键词"]）。本函数只在首次渲染失败后作为兜底重试调用——
+// 最坏结果 = 修复后仍失败、维持原降级显示，绝不影响本来合法的源码。
+// 用逐字符扫描而非正则：嵌套方括号（G[[VALUES]...]）的闭合边界正则识别不了。
+export function autofixMermaidSource(source: string): string {
+  // 标签内裸写这些字符都会让 jison 解析失败，是触发引号包裹的条件
+  const SPECIAL_CHARS = /[[\](){}]/;
+  const lines = source.split('\n');
+  let changed = false;
+  const fixed = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('%%')) return line;
+    let out = '';
+    let i = 0;
+    let lineChanged = false;
+    while (i < line.length) {
+      const ch = line[i];
+      // 节点标签起点：'[' 且前驱是标识符字符（ID[...] 形态）。
+      // 边标签 |...|、markdown 链接等场景不满足该形态，天然跳过
+      if (ch === '[' && /[A-Za-z0-9_]/.test(out[out.length - 1] ?? '')) {
+        if (line[i + 1] === '"') {
+          // 已引号包裹的合法标签：原样复制到配对引号，闭合 ']' 走普通路径
+          let j = i + 2;
+          while (j < line.length && line[j] !== '"') j++;
+          const end = Math.min(j + 1, line.length);
+          out += line.slice(i, end);
+          i = end;
+          continue;
+        }
+        // 扫描标签内容找真实闭合位置：内层 '[' 加深、']' 回退，深度归零才是
+        // 该标签的边界（G[[VALUES]表.字段 查码值] 这类错乱写法靠它识别）
+        let depth = 1;
+        let j = i + 1;
+        let hasQuote = false;
+        while (j < line.length && depth > 0) {
+          const c = line[j];
+          if (c === '[') depth++;
+          else if (c === ']') depth--;
+          else if (c === '"') hasQuote = true;
+          j++;
+        }
+        if (depth !== 0) {
+          // 括号未闭合：无法定位标签边界，放弃修复，本行剩余原样保留
+          out += line.slice(i);
+          i = line.length;
+          continue;
+        }
+        const inner = line.slice(i + 1, j - 1);
+        // 内容已含双引号时放弃包裹（包裹反而会引入新的语法错误）
+        if (!hasQuote && SPECIAL_CHARS.test(inner)) {
+          out += `["${inner}"]`;
+          lineChanged = true;
+        } else {
+          out += line.slice(i, j);
+        }
+        i = j;
+        continue;
+      }
+      out += ch;
+      i++;
+    }
+    if (lineChanged) changed = true;
+    return lineChanged ? out : line;
+  });
+  return changed ? fixed.join('\n') : source;
+}
+
 function injectSvg(block: HTMLElement, svg: string): void {
   block.setAttribute('data-state', 'done');
+  // 幂等兜底：气泡重挂载等场景下同一块可能被并发 watcher 重复注入，
+  // 先清掉旧 SVG 再挂新的，杜绝一卡双图
+  block.querySelectorAll(':scope > .mermaid-svg').forEach((n) => n.remove());
   const holder = document.createElement('div');
   holder.className = 'mermaid-svg';
   holder.innerHTML = svg;
@@ -97,9 +183,12 @@ function injectSvg(block: HTMLElement, svg: string): void {
   if (source) source.setAttribute('hidden', '');
 }
 
-function markError(block: HTMLElement): void {
+function markError(block: HTMLElement, reason = ''): void {
   block.setAttribute('data-state', 'error');
-  // 错误态展示源码供用户复制自救（CSS 按状态控制显隐）
+  // 透出 mermaid 原始报错（如 "Parse error on line 2"），让用户一眼区分
+  // 「源码语法写错」和「渲染器故障」；多行信息截成一行、限长 120
+  const detail = String(reason || '').split('\n').filter(Boolean)[0]?.slice(0, 120) ?? '';
+  block.setAttribute('data-error-reason', detail ? `原因：${detail} ` : '');
   const source = block.querySelector('pre.mermaid-src');
   if (source) source.removeAttribute('hidden');
 }
@@ -125,16 +214,23 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
     const key = block.dataset.mermaidKey || '';
     const source = block.querySelector('pre.mermaid-src')?.textContent ?? '';
     if (!key || !source.trim()) {
-      markError(block);
+      markError(block, '源码为空');
       continue;
     }
     const cached = svgCache.get(key);
     if (cached) {
-      injectSvg(block, cached);
+      // 缓存路径必须复核状态：气泡 DOM 重建（设置页往返/会话切回/回合折叠切换）
+      // 会带着已预热的缓存触发两次以上收集，若不复核，每次收集都注入一份 SVG，
+      // 图就会重复两遍（渲染路径的 state==='rendering' 守卫只护得住未命中缓存的并发）。
+      if (block.dataset.state === 'pending') {
+        injectSvg(block, cached);
+      }
       continue;
     }
     if (!mermaid) {
-      markError(block);
+      // 动态 import 失败最常见的根因是旧构建哈希 chunk 404（dist 运行期更新），
+      // 文案补上「可刷新界面恢复」指路；frontendUpdate 自愈会另行触发整页刷新
+      markError(block, '渲染器加载失败（可刷新界面恢复）');
       continue;
     }
     block.setAttribute('data-state', 'rendering');
@@ -148,8 +244,30 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
       if (block.isConnected && block.dataset.state === 'rendering') {
         injectSvg(block, clean);
       }
-    } catch {
-      if (block.isConnected) markError(block);
+    } catch (err) {
+      // 失败兜底：模型输出的常见语法瑕疵（标签内裸写 [ ] ( ) 等特殊字符）
+      // 做一次自动修复重试；成功则正常出图并写缓存，失败才走原降级。
+      // 只在失败路径触发，合法源码的渲染行为完全不变。
+      const fixed = autofixMermaidSource(source);
+      let recovered = false;
+      if (fixed !== source) {
+        try {
+          const { svg } = await mermaid.render(`mmd-${key}-${++renderSeq}`, fixed);
+          const clean = sanitizeSvg(svg);
+          if (clean) {
+            cachePut(key, clean);
+            if (block.isConnected && block.dataset.state === 'rendering') {
+              injectSvg(block, clean);
+            }
+            recovered = true;
+          }
+        } catch {
+          // 修复后仍失败：落入原降级，透出首次报错便于定位
+        }
+      }
+      if (!recovered && block.isConnected) {
+        markError(block, err instanceof Error ? err.message : String(err));
+      }
     }
   }
 }
@@ -159,5 +277,14 @@ export function __resetMermaidRendererForTest(): void {
   mermaidModulePromise = null;
   initialized = false;
   renderSeq = 0;
+  loadFailedAt = 0;
+  mermaidImporter = () => import('mermaid');
   svgCache.clear();
+}
+
+// 测试专用：替换 mermaid 动态加载器（模拟加载失败与重试），生产路径不变
+export function __setMermaidImporterForTest(
+  importer: (() => Promise<unknown>) | null,
+): void {
+  mermaidImporter = importer ?? (() => import('mermaid'));
 }

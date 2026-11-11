@@ -23,6 +23,8 @@ beforeEach(() => {
 it('桌面端渲染左右两个面板拖拽手柄', () => {
   const store = useAppStore();
   store.initialized = true;
+  // 右侧面板默认收起（appStore.rightPanelDefault 测试锁定）；手柄渲染属于展开态行为
+  store.rightPanelCollapsed = false;
   const wrapper = mount(App, { global: { stubs } });
 
   expect(wrapper.find('[data-test="sidebar-resizer"]').exists()).toBe(true);
@@ -45,6 +47,20 @@ it('面板折叠时对应手柄隐藏，展开后恢复', async () => {
   await wrapper.vm.$nextTick();
   expect(wrapper.find('[data-test="sidebar-resizer"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="right-panel-resizer"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+// 右侧面板必须走 right-panel-slide 过场：v-show 单独使用时 display: none 与
+// margin 在同一帧切换，负 margin 的过渡来不及生效，面板会"直接出现"
+it('右侧面板套在 right-panel-slide 过场里', () => {
+  const store = useAppStore();
+  store.initialized = true;
+  const wrapper = mount(App, { global: { stubs } });
+
+  const slides = wrapper
+    .findAllComponents({ name: 'Transition' })
+    .filter(item => item.props('name') === 'right-panel-slide');
+  expect(slides).toHaveLength(1);
   wrapper.unmount();
 });
 

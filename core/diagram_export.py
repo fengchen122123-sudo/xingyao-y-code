@@ -36,8 +36,10 @@ _LAST_EXPORT: Path | None = None
 
 
 def get_diagrams_dir() -> Path:
-    """图表 HTML 的落盘目录：与 /share 导出共用 ~/.ycode/exports 约定。"""
-    return Path.home() / ".ycode" / "exports" / "diagrams"
+    """图表 HTML 的落盘目录：与 /share 导出共用目录约定（跟随 YCODE_DATA_DIR）。"""
+    from core.share import default_export_dir
+
+    return default_export_dir() / "diagrams"
 
 
 def get_mermaid_js_path() -> Path | None:
@@ -94,7 +96,7 @@ def build_diagram_html(sources: list[str]) -> str:
             "</section>"
         )
     generated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Y-code 流程图 · {generated_at}"
+    title = f"星瑶Code 流程图 · {generated_at}"
     if js_uri:
         mermaid_script = (
             f'<script src="{html.escape(js_uri, quote=True)}" '
@@ -165,9 +167,11 @@ def handle_diagram_command(command_text: str) -> str:
     if sub == "open":
         files = get_recent_diagrams()
         if not files:
+            # 提示文案里的自称跟随当前会话（秘书会话 → 秘书名）
             try:
-                from core.persona_settings import get_agent_display_name
-                _agent = get_agent_display_name()
+                from core.secretary import get_active_agent_name
+
+                _agent = get_active_agent_name()
             except Exception:
                 _agent = "星瑶"
             return f"🚨 还没有生成过流程图。{_agent}输出 Mermaid 代码块后会自动生成网页文件。"
@@ -256,11 +260,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 <header>
   <h1>__TITLE__</h1>
-  <div class="meta">由 Y-code 生成 · 在浏览器本地渲染，不经过任何远程服务</div>
+  <div class="meta">由 星瑶Code 生成 · 在浏览器本地渲染，不经过任何远程服务</div>
 </header>
 <div id="no-mermaid-banner">
   ⚠️ 本地渲染器缺失（vendor/mermaid/mermaid-*.min.js），当前仅显示图表源码。
-  源码可粘贴到任何 Mermaid 渲染工具查看，或重新安装 Y-code 修复。
+  源码可粘贴到任何 Mermaid 渲染工具查看，或重新安装 星瑶Code 修复。
 </div>
 __SECTIONS__
 __MERMAID_SCRIPT__

@@ -43,7 +43,38 @@ it('为键盘快捷键提示提供独立的手机端隐藏标记', () => {
   expect(hints.classes()).toContain('keyboard-hints');
   expect(hints.text()).toContain('Enter');
   expect(hints.text()).toContain('Shift+Enter');
-  expect(hints.text()).toContain('Esc');
+  // Esc 不再承担中断任务的语义，提示里也不应再出现（防止误触杀回合）
+  expect(hints.text()).not.toContain('Esc');
+  wrapper.unmount();
+});
+
+it('运行中按 Esc 不会中断当前任务（防误触）', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  store.runningSessions = ['session-b'];
+  const stopSpy = vi.spyOn(store, 'stopCurrentTurn').mockResolvedValue(undefined);
+
+  const wrapper = mount(InputArea);
+  const textarea = wrapper.get('textarea');
+  await textarea.setValue('改到一半的想法');
+  await textarea.trigger('keydown', { key: 'Escape' });
+  await textarea.trigger('keydown', { key: 'Escape' });
+
+  expect(stopSpy).not.toHaveBeenCalled();
+  // 输入内容原样保留，不会因为按 Esc 被清空或提交
+  expect((textarea.element as HTMLTextAreaElement).value).toBe('改到一半的想法');
+  wrapper.unmount();
+});
+
+it('右侧栏展开时根节点带 right-panel-open 标记（CSS 据此隐藏快捷键提示）', async () => {
+  const store = useAppStore();
+  store.rightPanelCollapsed = true;
+  const wrapper = mount(InputArea);
+
+  expect(wrapper.get('#input-area').classes()).not.toContain('right-panel-open');
+  store.rightPanelCollapsed = false;
+  await wrapper.vm.$nextTick();
+  expect(wrapper.get('#input-area').classes()).toContain('right-panel-open');
   wrapper.unmount();
 });
 
@@ -228,5 +259,131 @@ it('输入组件因设置页卸载后重新挂载仍恢复当前会话草稿', a
 
   wrapper = mount(InputArea);
   expect(wrapper.get('textarea').element.value).toBe('设置往返后仍保留');
+  wrapper.unmount();
+});
+
+// —— 上下文用量面板：悬停圆环打开 / 延迟关闭 / 面板内保持 ——
+
+function mountInput() {
+  return mount(InputArea, { global: { stubs: { teleport: true } } });
+}
+
+it('悬停上下文圆环打开用量面板，移出后延迟关闭', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const store = useAppStore();
+    store.tokenUsage = { ...store.tokenUsage, used: 12345, window: 128000 };
+    const wrapper = mountInput();
+    const ring = wrapper.get('[data-test="context-ring"]');
+
+    // 原生 title 已移除，改为悬停详情面板
+    expect(ring.attributes('title')).toBeUndefined();
+
+    await ring.trigger('mouseenter');
+    expect(wrapper.get('.ctx-usage-panel').classes()).toContain('show');
+    expect(wrapper.get('[data-test="ctx-usage-summary"]').text())
+      .toBe('12,345 / 128,000（9.6%）');
+
+    // 移出圆环：延迟期内仍显示（留给鼠标移入面板的过渡时间）
+    await ring.trigger('mouseleave');
+    expect(wrapper.get('.ctx-usage-panel').classes()).toContain('show');
+
+    vi.advanceTimersByTime(300);
+    await nextTick();
+    expect(wrapper.get('.ctx-usage-panel').classes()).not.toContain('show');
+    wrapper.unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('鼠标移入面板取消关闭，移出面板后延迟关闭', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const wrapper = mountInput();
+    const ring = wrapper.get('[data-test="context-ring"]');
+    await ring.trigger('mouseenter');
+    await ring.trigger('mouseleave');
+
+    const panel = wrapper.get('.ctx-usage-panel');
+    await panel.trigger('mouseenter');
+    vi.advanceTimersByTime(300);
+    await nextTick();
+    expect(panel.classes()).toContain('show');
+
+    await panel.trigger('mouseleave');
+    vi.advanceTimersByTime(300);
+    await nextTick();
+    expect(wrapper.get('.ctx-usage-panel').classes()).not.toContain('show');
+    wrapper.unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('触摸设备点按上下文圆环切换面板', async () => {
+  const originalMatchMedia = window.matchMedia;
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: (query: string) => ({ matches: query.includes('pointer'), media: query }),
+  });
+  try {
+    const wrapper = mountInput();
+    const ring = wrapper.get('[data-test="context-ring"]');
+
+    await ring.trigger('click');
+    expect(wrapper.get('.ctx-usage-panel').classes()).toContain('show');
+
+    await ring.trigger('click');
+    expect(wrapper.get('.ctx-usage-panel').classes()).not.toContain('show');
+    wrapper.unmount();
+  } finally {
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia });
+  }
+});
+
+// —— QQ2009 皮肤专属工具栏行：默认主题不渲染，仅真实功能按钮 ——
+
+it('默认主题下不渲染 QQ2009 工具栏行', () => {
+  const wrapper = mount(InputArea);
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('QQ2009 主题下渲染工具栏行，两个附件按钮都调用真实的附件入口', async () => {
+  const store = useAppStore();
+  store.guiTheme = { id: 'builtin.qq2009' } as any;
+  // 附件入口最终落点是 store.pickFiles（系统文件对话框），断言真实函数被调用
+  const pickSpy = vi.spyOn(store, 'pickFiles').mockResolvedValue([]);
+
+  const wrapper = mount(InputArea);
+  const toolbar = wrapper.get('[data-test="qq09-toolbar"]');
+  // 动作清单：图片 + 文件（星瑶无独立图片菜单，两者共用同一附件入口）
+  const buttons = toolbar.findAll('.qq09-tb-btn');
+  expect(buttons).toHaveLength(2);
+  expect(buttons[0].attributes('title')).toContain('图片');
+  expect(buttons[1].attributes('title')).toContain('文件');
+  // 图标为 inline SVG（stroke 风格），非 emoji
+  expect(buttons[0].find('svg').exists()).toBe(true);
+
+  await buttons[0].trigger('click');
+  await buttons[1].trigger('click');
+  await flushPromises();
+  expect(pickSpy).toHaveBeenCalledTimes(2);
+  wrapper.unmount();
+});
+
+it('切换到 QQ2009 主题时工具栏行实时出现，切回默认主题后消失', async () => {
+  const store = useAppStore();
+  const wrapper = mount(InputArea);
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(false);
+
+  store.guiTheme = { id: 'builtin.qq2009' } as any;
+  await nextTick();
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(true);
+
+  store.guiTheme = { id: 'builtin.dark' } as any;
+  await nextTick();
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(false);
   wrapper.unmount();
 });

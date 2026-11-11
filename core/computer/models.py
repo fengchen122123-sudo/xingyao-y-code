@@ -1,6 +1,6 @@
 """电脑操控领域的不可变值对象、枚举、错误类型与 backend 协议。
 
-本模块不导入 GUI、CLI、LiteLLM、Playwright 或全局配置（设计第 6 节规则 1）。
+本模块不导入 GUI、CLI、LLM 传输层、Playwright 或全局配置（设计第 6 节规则 1）。
 枚举取值、错误码与字段形状以 docs/superpowers/specs/2026-09-02-computer-control-design.md
 第 7、9.3、21 节为准。
 """
@@ -77,6 +77,9 @@ class ComputerActionKind(str, Enum):
     LIST_ELEMENTS = "list_elements"
     CLICK_ELEMENT = "click_element"
     SET_VALUE_ELEMENT = "set_value_element"
+    # Windows-MCP 对齐（2026-11-09 协议扩展，desktop only）：条件等待，
+    # 按 condition 轮询界面直到命中或超时，替代 wait 加反复 observe。
+    WAIT_FOR = "wait_for"
 
 
 class ComputerControlError(Exception):
@@ -106,6 +109,10 @@ class ComputerAction:
     target: str
     x: int | None = None
     y: int | None = None
+    # 局部观察区域尺寸（browser observe_region 专用；其他动作恒为 None）。
+    # 坐标语义：x/y 是区域左上角的 CSS 视口坐标，width/height 是区域宽高。
+    width: int | None = None
+    height: int | None = None
     path: tuple[tuple[int, int], ...] = ()
     button: str = "left"
     delta_x: int = 0
@@ -131,6 +138,13 @@ class ComputerAction:
     # 阶段二元素引用动作（click_element/set_value_element）引用的控件 ref；
     # 仅在最近一次 list_elements 后有效，普通动作恒为 None。
     element_ref: str | None = None
+    # wait_for 条件等待（2026-11-09 协议扩展，desktop only）：condition 取值见
+    # actions.WAIT_FOR_CONDITIONS，window_name 限定窗口标题子串，timeout_ms/
+    # interval_ms 为总等待上限与轮询间隔；非 wait_for 动作这四项恒为 None。
+    condition: str | None = None
+    window_name: str | None = None
+    timeout_ms: int | None = None
+    interval_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +172,13 @@ class ComputerObservation:
     window_title: str = ""
     page_origin: str = ""
     page_title: str = ""
+    # B 方案（窗口被遮挡时的降级观察）：页面正文摘要（只含可见文本，已按码点
+    # 截断）。窗口最小化/被遮挡时 WebView2 渲染被节流，截图可能卡住或失败，
+    # 此时模型仍能凭正文判断页面内容。repr=False：正文属于页面内容，绝不进日志。
+    page_text: str = field(default="", repr=False)
+    # 本次未取到截图的原因（空串表示截图正常）：只含异常类名的简短中文说明，
+    # 绝不含堆栈或页面 URL，用于告知模型"这次没有图"而不是让它以为页面空白。
+    screenshot_error: str = ""
     error_code: str = ""
     error_message: str = ""
     before_fingerprint: str = ""
@@ -178,6 +199,10 @@ class ComputerObservation:
     # 通用化重构 Task C：本动作是否发生了前台切换（输入前置激活），仅本地
     # 自愈判定使用；绝不加入 observation_provider_projection 投影（投影字节不变）。
     input_activated: bool = False
+    # 帧契约（2026-10-21）：本步截图与**上一步**截图完全相同。用于在 Provider
+    # 投影层省掉重复附图的字节——同画面重复发图只烧上下文，模型从上一张图就能
+    # 读到内容。同样不进 observation_provider_projection，投影字节保持稳定。
+    screen_unchanged: bool = False
 
 
 @dataclass(frozen=True)
@@ -186,13 +211,17 @@ class BackendIdentity:
 
     browser/profile_path 取自 Turn 冻结能力快照与领取时解析的规范绝对路径；
     desktop 的 browser/profile_path 恒为空串。身份绝不进入 Provider 消息或
-    Journal。
+    Journal。cdp_endpoint 仅 embedded（内置 WebView2 CDP 直连）模式使用，
+    是 retained 会话身份的一部分：端口变化即视为配置变更、不复用旧实例。
     """
 
     platform: str
     target: str
     browser: str = ""
     profile_path: str = ""
+    cdp_endpoint: str = ""
+    viewport_width: int = 0
+    viewport_height: int = 0
 
 
 @dataclass(frozen=True)

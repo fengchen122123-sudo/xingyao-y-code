@@ -17,6 +17,24 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
+// 代码块模式：renderMarkdown 提取与 findCodeBlockRanges 共用同一 pattern，
+// 保证切分器与渲染器对「代码块范围」的判定完全一致。
+// 围栏后的换行允许 \r：Windows 剪贴板/工具输出常带 CRLF，只匹配 \n 会导致
+// 整块围栏（含 mermaid 图）识别不到，被当作纯文本显示。
+const CODE_BLOCK_PATTERN = '```(\\w*)\\r?\\n([\\s\\S]*?)```';
+
+/** 返回所有已闭合代码块的 [start, end) 字符范围。 */
+export function findCodeBlockRanges(source: string): Array<[number, number]> {
+  if (!source) return [];
+  const ranges: Array<[number, number]> = [];
+  const re = new RegExp(CODE_BLOCK_PATTERN, 'g');
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(source)) !== null) {
+    ranges.push([match.index, match.index + match[0].length]);
+  }
+  return ranges;
+}
+
 // 仅允许 http / https / mailto 协议的链接，其余一律拦截为 #，防止 javascript: 等注入
 export function sanitizeHref(href: string): string {
   if (!href) return '#';
@@ -59,6 +77,9 @@ export const COPY_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
 export const CHECK_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+// "另存为"按钮的下载图标（同上，v-html 内联）
+export const SAVE_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>';
 
 function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): string {
   if (item.kind === 'error') {
@@ -72,14 +93,26 @@ function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): strin
     return `<span class="md-media-error">⚠ ${escapeHtml(name)}：媒体服务不可用</span>`;
   }
   if (item.kind === 'video') {
-    return `<video class="md-video" controls preload="metadata" playsinline src="${escapeHtml(src)}"></video>`;
+    const alt = caption || item.caption || item.source_name || '视频';
+    // controlslist 必须全小写（HTML 属性）；nodownload 让原生 ⋮ 溢出菜单不再出现
+    // 「下载」项——那套菜单在 Chromium shadow DOM 里，JS 改不了文字、也拦不到单项点击。
+    return `<span class="md-media-wrap md-video-wrap">`
+      + `<video class="md-video" controls controlslist="nodownload" preload="metadata" playsinline src="${escapeHtml(src)}"></video>`
+      + `<span class="md-video-actions">`
+      + `<button class="md-video-save" type="button" title="另存为" aria-label="另存为" data-save-src="${escapeHtml(src)}" data-save-name="${escapeHtml(alt)}">${SAVE_ICON_SVG}<span class="md-video-save-text">另存为</span></button>`
+      + `</span>`
+      + `</span>`;
   }
   const alt = caption || item.caption || item.source_name || '图片';
-  // 悬停浮现"复制原图"按钮：src 放 data 属性，点击经 MessageBubble 事件委托
-  // fetch 原图写入剪贴板（媒体服务已带 CORS 头）
+  // 悬停浮现操作区：src 放 data 属性，点击经 MessageBubble 事件委托处理。
+  // 两个按钮共用 .md-img-actions 容器（各自绝对定位会互相重叠）；
+  // data-save-name 是另存为的默认文件名建议（后端会清理并补真实扩展名）。
   return `<span class="md-media-wrap">`
     + `<img class="md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" data-media-ordinal="${ordinal}" loading="lazy">`
+    + `<span class="md-img-actions">`
     + `<button class="md-img-copy" type="button" title="复制原图" aria-label="复制原图" data-copy-src="${escapeHtml(src)}">${COPY_ICON_SVG}<span class="md-img-copy-text">复制</span></button>`
+    + `<button class="md-img-save" type="button" title="另存为" aria-label="另存为" data-save-src="${escapeHtml(src)}" data-save-name="${escapeHtml(alt)}">${SAVE_ICON_SVG}<span class="md-img-save-text">另存为</span></button>`
+    + `</span>`
     + `</span>`;
 }
 
@@ -96,7 +129,15 @@ export function mermaidCacheKey(code: string): string {
 }
 
 export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
-  if (!md) return '';
+  return renderMarkdownDetailed(md, mediaCtx).html;
+}
+
+export function renderMarkdownDetailed(
+  md: string,
+  mediaCtx?: MediaContext,
+  startMediaOrdinal = 0,
+): { html: string; mediaCount: number } {
+  if (!md) return { html: '', mediaCount: 0 };
   let text = md;
 
   // 占位符用 Unicode 私有区字符包裹：早期版本用 ___CODE_BLOCK_0___ 这种
@@ -108,7 +149,9 @@ export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
   const codeBlocks: string[] = [];
   const fileLinks: string[] = [];
   const links: string[] = [];
-  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+  text = text.replace(new RegExp(CODE_BLOCK_PATTERN, 'g'), (_, lang, rawCode) => {
+    // CRLF 归一化：行尾残留的 \r 会被当成源码内容送进 mermaid 解析器
+    const code = String(rawCode ?? '').replace(/\r\n?/g, '\n');
     const idx = codeBlocks.length;
     // mermaid 块：renderMarkdown 保持纯同步——这里只产出带缓存 key 的占位
     // 容器 + 隐藏源码（均已转义），SVG 渲染由 mermaidRenderer 在 DOM 挂载后
@@ -150,7 +193,7 @@ export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
   // ordinal 与 mediaCtx.items 对齐；无清单（旧消息/迁移前）或 ordinal 越界时退回
   // 文件链接渲染。远程 URL 不是媒体项，原样返回走普通链接管线。
   const mediaItems: string[] = [];
-  let mediaOrdinal = 0;
+  let mediaOrdinal = startMediaOrdinal;
   text = text.replace(MEDIA_SYNTAX_RE, (_m, imgCaption, imgPath, vidCaption, vidPath) => {
     const caption = String(imgCaption ?? vidCaption ?? '').trim();
     const path = String(imgPath ?? vidPath ?? '').trim();
@@ -311,7 +354,7 @@ export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
     html = html.replace(`${PH}MD${idx}${PH}`, () => mi);
   });
 
-  return html;
+  return { html, mediaCount: mediaOrdinal - startMediaOrdinal };
 }
 
 // 权限模式：规范值(canonical) -> 中文展示文案。store 内一律保存规范值，

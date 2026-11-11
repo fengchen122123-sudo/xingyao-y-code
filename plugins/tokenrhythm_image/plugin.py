@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from core.llm_policy import session_id_headers, tokenrhythm_agent_headers
 from core.tool_protocol import ToolResult, ToolSpec
 
 _API_BASE = "https://tokenrhythm.studio/v1"
@@ -42,7 +43,7 @@ _EDIT_MAX_BYTES = 10 * 1024 * 1024
 _EDIT_ALLOWED_EXTS = (".jpg", ".jpeg", ".png")
 
 _NOT_CONFIGURED_MSG = (
-    "未配置基元律动（TokenRhythm）API Key：请在 Y-code 设置页添加提供商"
+    "未配置基元律动（TokenRhythm）API Key：请在 星瑶Code 设置页添加提供商"
     "（base_url=https://tokenrhythm.studio/v1）并填入 Key，或确认"
     " ~/.ycode/config.json providers 中已有该条目，随后在插件页启用本插件。"
 )
@@ -85,27 +86,131 @@ def _detect_ext(head: bytes) -> str:
     return ".img"
 
 
-def _download_image(url: str, save_dir: str, prefix: str) -> str:
-    """立即下载图片到本地：先写 .part 再按文件头确定扩展名 os.replace。"""
-    save_dir = os.path.abspath(save_dir or ".")
+def _response_format_for(model: str) -> str:
+    """wan2.7-image 让服务端直接回 base64；其余模型沿用 url。"""
+    return "b64_json" if model == "wan2.7-image" else "url"
+
+
+def _resolve_save_dir(save_dir: str | None) -> str:
+    """解析图片保存目录：未传 → AI 生成内容目录；显式传值 → 原样尊重。
+
+    未传（None）时统一落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp），
+    不再跟进程 cwd 走；显式传值（含 "."）保持旧行为，不做隐式改道。
+    """
+    if save_dir is None:
+        from core.ai_output_paths import resolve_ai_output_dir
+
+        return str(resolve_ai_output_dir())
+    return os.path.abspath(save_dir or ".")
+
+
+def _save_image_bytes(
+    payload: bytes, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+) -> str:
+    """把图片字节写入本地，扩展名按文件头判断。
+
+    按回合撤销：落盘前先持久化计划 after 快照（插件声明的受控文件修改
+    同样接入 FileMutationRecorder，规格 9.5）。
+    """
+    save_dir = _resolve_save_dir(save_dir)
     os.makedirs(save_dir, exist_ok=True)
-    base = os.path.join(save_dir, "%s_%s" % (prefix, time.strftime("%Y%m%d_%H%M%S")))
-    tmp = base + ".part"
+    path = os.path.join(
+        save_dir,
+        "%s_%s%s" % (
+            prefix,
+            time.strftime("%Y%m%d_%H%M%S"),
+            _detect_ext(bytes(payload[:8])),
+        ),
+    )
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.turn_undo import recorder as _tu_recorder
+    from core.turn_undo.models import NodeKind, TurnUndoError
+
+    handle = None
+    with _tu_coordinator.get_coordinator().workspace_lock(_tu_coordinator.thread_workspace_root()):
+        try:
+            handle = _tu_recorder.prepare_mutation(
+                display_path=path,
+                after_kind=NodeKind.REGULAR_FILE,
+                after_content=payload,
+                tool_name=tool_name,
+                tool_call_id="",
+            )
+        except TurnUndoError as error:
+            if error.code != "no_active_checkpoint":
+                # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
+                raise
+            handle = None
+        with open(path, "wb") as f:
+            f.write(payload)
+        if handle is not None:
+            _tu_recorder.verify_after_mutation(handle)
+    return path
+
+
+def _download_image(url: str, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image") -> str:
+    """下载 URL 内容后落盘：先写 .part，读完即删，再按文件头确定扩展名。"""
+    save_dir = _resolve_save_dir(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    tmp = os.path.join(save_dir, ".tokenrhythm_%s.part" % uuid.uuid4().hex)
     try:
         urllib.request.urlretrieve(url, tmp)
         with open(tmp, "rb") as f:
-            head = f.read(8)
-        path = base + _detect_ext(head)
-        os.replace(tmp, path)
-        return path
-    except Exception:
+            payload = f.read()
+    finally:
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
             pass
-        raise
+    return _save_image_bytes(payload, save_dir, prefix, tool_name)
 
+
+def _save_b64_image(
+    b64: str, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+) -> str:
+    """服务端直接回 base64 时解码落盘（wan2.7-image 走这条路径）。"""
+    import base64
+
+    text = str(b64 or "").strip()
+    if "base64," in text:  # 兼容 data URL 前缀写法
+        text = text.split("base64,", 1)[1]
+    data = base64.b64decode(text)
+    if not data:
+        raise ValueError("base64 解码结果为空")
+    return _save_image_bytes(data, save_dir, prefix, tool_name)
+
+
+def _save_image_from_result(
+    result: dict, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+) -> tuple:
+    """从接口响应取图并落盘：优先 data[0].b64_json，其次 data[0].url。
+
+    返回 (本地路径, 错误信息, oss_url)，路径/错误必有一为空。第三个值把响应
+    里的原始 OSS 直链透传给调用方（ToolResult.metadata），桥层拿它做视频生成
+    的直传垫图（省 ¥0.2 重绘）；b64 形态没有 URL，返回空串。URL 只有约
+    60 分钟时效，用户侧始终以本地文件为准。
+    """
+    items = result.get("data") or []
+    item = items[0] if items else {}
+    if not isinstance(item, dict):
+        item = {}
+    oss_url = str(item.get("url") or "").strip()
+    b64 = str(item.get("b64_json") or "").strip()
+    if b64:
+        try:
+            return _save_b64_image(b64, save_dir, prefix, tool_name), "", ""
+        except Exception as exc:
+            return "", "接口返回的 base64 图片数据无法解码：%s" % (exc,), ""
+    if oss_url:
+        try:
+            return _download_image(oss_url, save_dir, prefix, tool_name), "", oss_url
+        except Exception as exc:
+            return "", "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, oss_url), oss_url
+    return "", (
+        "接口响应缺少 data[0].b64_json / data[0].url，原始响应：%s"
+        % json.dumps(result, ensure_ascii=False)[:500]
+    ), ""
 
 def _error_from_http(exc: urllib.error.HTTPError) -> ToolResult:
     """把 HTTPError 转成带排查提示的错误结果（detail 截前 500 字符）。"""
@@ -128,9 +233,13 @@ def generate_image(
     size: str = "1024x1024",
     model: str = "qwen-image-2.0",
     n: int = 1,
-    save_dir: str = ".",
+    save_dir: str | None = None,
 ) -> ToolResult:
-    """文生图：POST /v1/images/generations，取 data[0].url 立即下载保存。"""
+    """文生图：POST /v1/images/generations，落盘 data[0].b64_json 或 data[0].url。
+
+    wan2.7-image 请求服务端直接回 base64（response_format=b64_json），
+    其余模型沿用 url；两种形态都能落盘，服务端不按 b64 回时自动兜底下载。
+    """
     prompt = (prompt or "").strip()
     if not prompt:
         return ToolResult("缺少 prompt 参数：请提供图片描述文字。", is_error=True)
@@ -157,7 +266,7 @@ def generate_image(
         "prompt": prompt,
         "n": n,
         "size": size,
-        "response_format": "url",
+        "response_format": _response_format_for(model),
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -166,6 +275,8 @@ def generate_image(
         headers={
             "Content-Type": "application/json",
             "Authorization": "Bearer " + api_key,
+            **tokenrhythm_agent_headers(_GENERATE_URL),
+            **session_id_headers(),
         },
         method="POST",
     )
@@ -181,23 +292,11 @@ def generate_image(
     except Exception as exc:
         return ToolResult("生图请求失败：%s" % (exc,), is_error=True)
 
-    items = result.get("data") or []
-    image_url = items[0].get("url") if items else ""
-    if not image_url:
-        return ToolResult(
-            "接口响应缺少 data[0].url，原始响应：%s"
-            % json.dumps(result, ensure_ascii=False)[:500],
-            is_error=True,
-        )
+    path, error, oss_url = _save_image_from_result(result, save_dir, "tokenrhythm")
+    if error:
+        return ToolResult(error, is_error=True)
 
     cost_cny = 0.20 * n
-    try:
-        path = _download_image(image_url, save_dir, "tokenrhythm")
-    except Exception as exc:
-        return ToolResult(
-            "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, image_url),
-            is_error=True,
-        )
 
     lines = [
         "图片已生成并保存：%s" % path,
@@ -205,7 +304,11 @@ def generate_image(
         "请务必在回复中直接用 Markdown 图片语法展示该图片（无需用户要求，用户可见）："
         "![生成的图片](%s)" % path,
     ]
-    return ToolResult("\n".join(lines), changed_files=[path])
+    # metadata 只给桥层用（对话路径模型看不到）：OSS 直链供视频生成直传垫图
+    return ToolResult(
+        "\n".join(lines), changed_files=[path],
+        metadata={"oss_url": oss_url, "cost_cny": cost_cny},
+    )
 
 
 def edit_image(
@@ -213,7 +316,7 @@ def edit_image(
     image: str,
     size: str = "",
     model: str = "qwen-image-2.0",
-    save_dir: str = ".",
+    save_dir: str | None = None,
 ) -> ToolResult:
     """图生图（垫图改图）：multipart 上传 1 张原图 + 文字指令，POST /v1/images/edits。"""
     prompt = (prompt or "").strip()
@@ -254,6 +357,13 @@ def edit_image(
         lines.append('Content-Disposition: form-data; name="size"')
         lines.append("")
         lines.append(size)
+    response_format = _response_format_for(model)
+    if response_format == "b64_json":
+        # wan2.7-image：让服务端直接回 base64，省掉一次 URL 下载
+        lines.append("--%s" % boundary)
+        lines.append('Content-Disposition: form-data; name="response_format"')
+        lines.append("")
+        lines.append(response_format)
     with open(img_path, "rb") as f:
         image_bytes = f.read()
     lines.append("--%s" % boundary)
@@ -279,6 +389,8 @@ def edit_image(
         headers={
             "Content-Type": "multipart/form-data; boundary=%s" % boundary,
             "Authorization": "Bearer " + api_key,
+            **tokenrhythm_agent_headers(_EDITS_URL),
+            **session_id_headers(),
         },
         method="POST",
     )
@@ -293,29 +405,23 @@ def edit_image(
     except Exception as exc:
         return ToolResult("改图请求失败：%s" % (exc,), is_error=True)
 
-    items = result.get("data") or []
-    image_url = items[0].get("url") if items else ""
-    if not image_url:
-        return ToolResult(
-            "接口响应缺少 data[0].url，原始响应：%s"
-            % json.dumps(result, ensure_ascii=False)[:500],
-            is_error=True,
-        )
-
-    try:
-        path = _download_image(image_url, save_dir, "tokenrhythm_edit")
-    except Exception as exc:
-        return ToolResult(
-            "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, image_url),
-            is_error=True,
-        )
+    path, error, oss_url = _save_image_from_result(
+        result, save_dir, "tokenrhythm_edit", tool_name="tokenrhythm_edit_image"
+    )
+    if error:
+        return ToolResult(error, is_error=True)
 
     lines = [
         "图片已改图并保存：%s" % path,
         "请务必在回复中直接用 Markdown 图片语法展示该图片（无需用户要求，用户可见）："
         "![生成的图片](%s)" % path,
     ]
-    return ToolResult("\n".join(lines), changed_files=[path])
+    # 与生图同口径：OSS 直链（约 60 分钟时效）走 metadata 给桥层，垫图改图
+    # 固定 ¥0.2/次
+    return ToolResult(
+        "\n".join(lines), changed_files=[path],
+        metadata={"oss_url": oss_url, "cost_cny": 0.2},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +434,9 @@ _PERMISSION_KWARGS = dict(
     requires_permission=True,    # 写操作走用户审批
     cancellable=True,            # 生图耗时长，允许用户中断
     parallel_safe=False,
+    # 规格 03 §3.2 取值表：tokenrhythm_* 生图类工具归 network（发起外部
+    # 网络请求）；两个工具共享本 kwargs，此处统一补全声明（A 阶段评审修复）。
+    side_effect_scope="network",
 )
 
 
@@ -372,7 +481,7 @@ def register(registry):
                 },
                 "save_dir": {
                     "type": "string",
-                    "description": "图片保存目录，默认当前工作目录",
+                    "description": "图片保存目录；不传则落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）",
                 },
             },
             "required": ["prompt"],
@@ -416,7 +525,7 @@ def register(registry):
                 },
                 "save_dir": {
                     "type": "string",
-                    "description": "图片保存目录，默认当前工作目录",
+                    "description": "图片保存目录；不传则落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）",
                 },
             },
             "required": ["prompt", "image"],

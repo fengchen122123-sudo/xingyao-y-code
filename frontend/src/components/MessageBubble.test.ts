@@ -106,8 +106,11 @@ describe('MessageBubble', () => {
     expect(wrapper.find('.tool-card').exists()).toBe(false);
     expect(wrapper.find('.diff-list').exists()).toBe(false);
     const trace = wrapper.get('.exec-trace');
-    expect(trace.text()).toContain('运行命令');
-    expect(trace.text()).toContain('未绑定的历史文件变更');
+    // 轨迹行改用「类别 + 目标」摘要：命令行给「运行 npm test」，
+    // 历史遗留 Diff 行给「变更 old.py」，不再有整句"未绑定的历史文件变更"
+    expect(trace.text()).toContain('运行');
+    expect(trace.text()).toContain('变更');
+    expect(trace.text()).toContain('old.py');
     wrapper.unmount();
   });
 
@@ -310,6 +313,255 @@ describe('MessageBubble', () => {
     expect(wrapper.find('.streaming-speed-pill').exists()).toBe(false);
     wrapper.unmount();
   });
+
+  it('点击图片"另存为"按钮调用桥接，成功后按钮显示已保存', async () => {
+    const store = useAppStore();
+    const saveMediaImage = vi
+      .spyOn(store, 'saveMediaImage')
+      .mockResolvedValue({ ok: true, path: 'D:/tmp/qr.png' });
+    const msg = assistantMessage({
+      content: '![微信群二维码](a.png)',
+      media: [{ ordinal: 0, kind: 'image', url: 'http://127.0.0.1:1/m/a.png?t=k', caption: '微信群二维码' }],
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+    await flushPromises();
+
+    const btn = wrapper.get('button.md-img-save');
+    await btn.trigger('click');
+    await flushPromises();
+
+    expect(saveMediaImage).toHaveBeenCalledWith('http://127.0.0.1:1/m/a.png?t=k', '微信群二维码');
+    expect(btn.classes()).toContain('saved');
+    expect(btn.text()).toContain('已保存');
+    wrapper.unmount();
+  });
+
+  it('用户取消另存为时不报错也不提示失败', async () => {
+    const store = useAppStore();
+    const notifyChat = vi.spyOn(store, 'notifyChat').mockImplementation(() => {});
+    vi.spyOn(store, 'saveMediaImage').mockResolvedValue({ ok: false, cancelled: true, msg: '已取消保存' });
+    const msg = assistantMessage({
+      content: '![图](a.png)',
+      media: [{ ordinal: 0, kind: 'image', url: 'http://127.0.0.1:1/m/a.png?t=k', caption: '图' }],
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+    await flushPromises();
+
+    const btn = wrapper.get('button.md-img-save');
+    await btn.trigger('click');
+    await flushPromises();
+
+    expect(btn.classes()).not.toContain('save-failed');
+    expect(btn.text()).toContain('另存为');
+    expect(notifyChat).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it('另存为失败时按钮提示失败并弹出说明', async () => {
+    const store = useAppStore();
+    const notifyChat = vi.spyOn(store, 'notifyChat').mockImplementation(() => {});
+    vi.spyOn(store, 'saveMediaImage').mockResolvedValue({ ok: false, msg: '该图片不在本地媒体仓库中，无法另存' });
+    const msg = assistantMessage({
+      content: '![图](a.png)',
+      media: [{ ordinal: 0, kind: 'image', url: 'http://127.0.0.1:1/m/a.png?t=k', caption: '图' }],
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+    await flushPromises();
+
+    const btn = wrapper.get('button.md-img-save');
+    await btn.trigger('click');
+    await flushPromises();
+
+    expect(btn.classes()).toContain('save-failed');
+    expect(notifyChat).toHaveBeenCalled();
+    wrapper.unmount();
+  });
 });
 
+describe('MessageBubble 文件链接点击分流', () => {
+  function mountWithContent(content: string) {
+    const store = useAppStore();
+    const panelCalls: string[] = [];
+    const previewCalls: string[] = [];
+    store.openInRightPanel = (async (p: string) => { panelCalls.push(p); }) as any;
+    store.openFilePreview = (async (p: string) => { previewCalls.push(p); }) as any;
+    const msg = assistantMessage({ content });
+    return { wrapper: mount(MessageBubble, { props: { msg } }), panelCalls, previewCalls };
+  }
 
+  it('正文里的 html 路径点击走右栏内嵌浏览器（不再是源码预览弹窗）', async () => {
+    const { wrapper, panelCalls, previewCalls } = mountWithContent('看这个 D:\\proj\\index.html');
+    await flushPromises();
+
+    await wrapper.get('a[data-file-link]').trigger('click');
+
+    expect(panelCalls).toEqual(['D:\\proj\\index.html']);
+    expect(previewCalls).toEqual([]);
+    wrapper.unmount();
+  });
+
+  it('正文里的 pdf / md 路径同样走右栏', async () => {
+    const pdf = mountWithContent('看这个 D:\\proj\\doc.pdf');
+    await flushPromises();
+    await pdf.wrapper.get('a[data-file-link]').trigger('click');
+    expect(pdf.panelCalls).toEqual(['D:\\proj\\doc.pdf']);
+    pdf.wrapper.unmount();
+
+    const md = mountWithContent('看这个 D:\\proj\\readme.md');
+    await flushPromises();
+    await md.wrapper.get('a[data-file-link]').trigger('click');
+    expect(md.panelCalls).toEqual(['D:\\proj\\readme.md']);
+    md.wrapper.unmount();
+  });
+
+  it('正文里的其它文件路径点击仍走源码预览弹窗', async () => {
+    const { wrapper, panelCalls, previewCalls } = mountWithContent('看这个 D:\\proj\\app.py');
+    await flushPromises();
+
+    await wrapper.get('a[data-file-link]').trigger('click');
+
+    expect(previewCalls).toEqual(['D:\\proj\\app.py']);
+    expect(panelCalls).toEqual([]);
+    wrapper.unmount();
+  });
+});
+
+describe('MessageBubble 思考块折叠态实时预览', () => {
+  function mountStreaming(reasoning: string) {
+    const store = useAppStore();
+    store.running = true;
+    store.showThinking = false;
+    store.messages.push(assistantMessage({ reasoning_content: reasoning, execution_state: 'running' }));
+    // 走 store 响应式代理，模拟 App.vue 的 v-for 传参
+    const msg = store.messages[store.messages.length - 1];
+    return { wrapper: mount(MessageBubble, { props: { msg } }), store };
+  }
+
+  it('折叠态标题行显示正在输出的当前行，而不是固定的“思考过程”', () => {
+    const { wrapper } = mountStreaming('先分析结构\n\n然后确认渲染细节');
+
+    const head = wrapper.get('.think-block .fold-head');
+    expect(head.find('[data-test="think-live-line"]').exists()).toBe(true);
+    expect(head.text()).toContain('然后确认渲染细节');
+    expect(head.text()).not.toContain('思考过程');
+    // 折叠态：v-show 隐藏全文容器，只留标题行预览
+    expect(wrapper.get('.tk-cnt').isVisible()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('标题行去掉行首 markdown 标记，只留纯文本', () => {
+    const { wrapper } = mountStreaming('先分析结构\n- **确认** 分支覆盖');
+    expect(wrapper.get('.think-block .tk-live-text').text()).toBe('确认 分支覆盖');
+    wrapper.unmount();
+  });
+
+  it('展开后标题切为「思考 · 耗时」并显示全文，再折叠回到实时行', async () => {
+    const { wrapper } = mountStreaming('先分析结构\n然后确认渲染细节');
+    const head = wrapper.get('.think-block .fold-head');
+
+    await head.trigger('click');
+    // 展开态不再显示流式摘要，标签回到「思考」（有可信耗时时带秒数）
+    expect(wrapper.get('.think-block .tk-label').text()).toMatch(/^思考/);
+    expect(wrapper.find('.think-block [data-test="think-live-line"]').exists()).toBe(false);
+    expect(wrapper.get('.tk-cnt').text()).toContain('先分析结构');
+
+    await head.trigger('click');
+    expect(wrapper.get('.think-block .tk-live-text').text()).toBe('然后确认渲染细节');
+    wrapper.unmount();
+  });
+
+  it('生成结束后标签退回「思考」并带走流式摘要', async () => {
+    const { wrapper, store } = mountStreaming('先分析结构\n然后确认渲染细节');
+    expect(wrapper.get('.think-block .tk-live-text').text()).toBe('然后确认渲染细节');
+    expect(wrapper.get('.think-block .tk-label').text()).toBe('正在思考');
+
+    store.running = false;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get('.think-block .tk-label').text()).toMatch(/^思考/);
+    expect(wrapper.find('.think-block [data-test="think-live-line"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+});
+
+describe('MessageBubble QQ2009 用户昵称行', () => {
+  it('默认主题（未设置 guiTheme）下用户消息不渲染 QQ2009 昵称行', () => {
+    const store = useAppStore();
+    expect(store.guiTheme).toBeNull();
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'user', content: '帮你查一下库存' } },
+    });
+
+    expect(wrapper.find('.qq09-msg-sender').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('QQ2009 主题激活时用户消息渲染「木偶」昵称行', () => {
+    const store = useAppStore();
+    // 门控只读主题 id，其余字段与本用例无关，故用最小对象占位（不构造完整 GuiTheme）
+    store.guiTheme = { id: 'builtin.qq2009' } as any;
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'user', content: '帮你查一下库存' } },
+    });
+
+    const sender = wrapper.get('.qq09-msg-sender');
+    expect(sender.get('.qq09-sender-name').text()).toBe('木偶');
+    // 昵称行在用户气泡之前（气泡仍是文案承载者）
+    expect(wrapper.get('.msg-user').html()).toContain('qq09-msg-sender');
+    wrapper.unmount();
+  });
+
+  it('助手消息在任何主题下都不渲染 QQ2009 昵称行', () => {
+    const store = useAppStore();
+    const msg = assistantMessage({ content: '回复内容' });
+
+    const defaultTheme = mount(MessageBubble, { props: { msg } });
+    expect(defaultTheme.find('.qq09-msg-sender').exists()).toBe(false);
+    defaultTheme.unmount();
+
+    store.guiTheme = { id: 'builtin.qq2009' } as any;
+    const qq09Theme = mount(MessageBubble, { props: { msg } });
+    expect(qq09Theme.find('.qq09-msg-sender').exists()).toBe(false);
+    qq09Theme.unmount();
+  });
+});
+
+describe('MessageBubble 登录过期入口', () => {
+  it('助手消息上的登录失效错误旁出现「重新登录」按钮，点击拉起登录窗', async () => {
+    const store = useAppStore();
+    const wrapper = mount(MessageBubble, {
+      props: {
+        msg: assistantMessage({
+          execution_state: 'error',
+          error_note: '基元律动登录已失效，请重新登录后再使用该模型',
+        }),
+      },
+    });
+
+    const btn = wrapper.get('[data-test="login-again-btn"]');
+    expect(btn.text()).toContain('重新登录');
+    await btn.trigger('click');
+    expect(store.trLoginModal.show).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('独立运行错误卡片里的登录过期同样给按钮', async () => {
+    const store = useAppStore();
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'error', content: '登录已过期，请重新登录' } },
+    });
+
+    await wrapper.get('[data-test="login-again-btn"]').trigger('click');
+    expect(store.trLoginModal.show).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('非登录类错误不出现该按钮', () => {
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'error', content: '余额不足' } },
+    });
+    expect(wrapper.find('[data-test="login-again-btn"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+});

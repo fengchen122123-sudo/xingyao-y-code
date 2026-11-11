@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 
@@ -15,7 +16,10 @@ from core.harness.models import (
     transition_turn,
 )
 from core.harness.request_envelope import RequestEnvelope
-from core.memory import MemoryManager
+from core.memory import MemoryManager, canonicalize_api_base
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _STEP_TERMINAL = frozenset(
@@ -34,6 +38,10 @@ _TURN_TERMINAL = frozenset(
         TurnStatus.INTERRUPTED,
     }
 )
+
+# 回合存续期间的心跳兜底节拍（与 journal._HEARTBEAT_INTERVAL_MS 对齐；
+# journal.heartbeat 内部再按同一间隔节流，双保险不多写）。
+_HEARTBEAT_SIDEKAR_INTERVAL_SECONDS = 2.0
 
 
 class TurnRuntime:
@@ -60,6 +68,8 @@ class TurnRuntime:
         self.status = TurnStatus.CREATED
         self.current_step: StepRuntime | None = None
         self._ordinal = 0
+        self._heartbeat_stop: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
 
     @classmethod
     def start(
@@ -71,6 +81,7 @@ class TurnRuntime:
         manager: MemoryManager | None,
         cancel_event: threading.Event | None,
         clock_ms: Callable[[], int],
+        create_row: bool = True,
     ) -> "TurnRuntime":
         if not turn_id:
             raise ValueError("turn_id must not be empty")
@@ -94,13 +105,56 @@ class TurnRuntime:
             journal=journal,
         )
         if journal is not None:
-            journal.create_turn(turn_id, session_name)
-            journal.append_event(
-                turn_id,
-                JournalEventDraft(HarnessEventKind.TURN_CREATED),
-            )
+            # create_row=False（断点续跑）：ResumeExecutor 已用同一 turn_id 建过
+            # harness_turns 行（主键），重复 create_turn 会 IntegrityError；
+            # 因此跳过建行与 TURN_CREATED 事件，直接在本进程接管既有行，
+            # 随后 CREATED→PREPARING 的 CAS 在该行上天然成立。
+            if create_row:
+                journal.create_turn(turn_id, session_name)
+                journal.append_event(
+                    turn_id,
+                    JournalEventDraft(HarnessEventKind.TURN_CREATED),
+                )
+            runtime._start_heartbeat_sidecar()
         runtime._transition(TurnStatus.PREPARING)
         return runtime
+
+    def _start_heartbeat_sidecar(self) -> None:
+        """回合存续期间的 owner 心跳兜底线程。
+
+        此前心跳只搭车在 journal 操作与 raise_if_cancelled 上：单个工具执行
+        超过 _OWNER_STALE_AFTER_MS（10s）期间零心跳，另一进程（GUI 与 CLI
+        共享 ycode.db）的任意 journal 操作即把本进程在飞 Turn/Step 误标
+        interrupted（stale owner 误中断，回合随后 CAS 失败莫名报错）。
+        本线程按节流间隔续租，turn 进入终态即退出；journal 为 None 的
+        非持久回合不启动（保持原行为）。
+        """
+        if self.journal is None:
+            return
+        stop = threading.Event()
+        self._heartbeat_stop = stop
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(stop,),
+            name=f"harness-heartbeat-{self.turn_id}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self, stop: threading.Event) -> None:
+        while not stop.wait(_HEARTBEAT_SIDEKAR_INTERVAL_SECONDS):
+            try:
+                self.journal.heartbeat()
+            except Exception:
+                # 单次心跳失败不影响回合；下一拍重试（DB 锁竞争等瞬态）
+                _LOGGER.debug("harness heartbeat sidecar beat failed", exc_info=True)
+
+    def _stop_heartbeat_sidecar(self) -> None:
+        stop = self._heartbeat_stop
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+        if stop is not None:
+            stop.set()
 
     def heartbeat(self) -> bool:
         return False if self.journal is None else self.journal.heartbeat()
@@ -131,6 +185,8 @@ class TurnRuntime:
                 error_code=error_code,
             )
         self.status = target
+        if target in _TURN_TERMINAL:
+            self._stop_heartbeat_sidecar()
         self._append_status_event(error_code=error_code)
 
     def mark_running(self) -> None:
@@ -149,13 +205,28 @@ class TurnRuntime:
         )
         if self.journal is not None:
             self.journal.create_step(step.step_id, self.turn_id, step.ordinal)
-            self.journal.append_event(
-                self.turn_id,
-                JournalEventDraft(
-                    HarnessEventKind.STEP_CREATED,
-                    step_id=step.step_id,
-                ),
-            )
+            try:
+                self.journal.append_event(
+                    self.turn_id,
+                    JournalEventDraft(
+                        HarnessEventKind.STEP_CREATED,
+                        step_id=step.step_id,
+                    ),
+                )
+            except Exception:
+                # 行已建、事件失败：补一个 created→interrupted 收敛，否则该行
+                # 停在 created 且本进程 owner 一直活跃，崩溃恢复永远不会收它
+                try:
+                    self.journal.transition_step(
+                        step.step_id, StepStatus.CREATED, StepStatus.INTERRUPTED
+                    )
+                except Exception:
+                    _LOGGER.warning(
+                        "orphan step compensating transition failed: %s",
+                        step.step_id,
+                        exc_info=True,
+                    )
+                raise
         self.current_step = step
         step._transition(StepStatus.REQUESTING)
         return step
@@ -257,6 +328,7 @@ class StepRuntime:
                 try:
                     cursor.execute(
                         "UPDATE harness_steps SET protocol = ?, cache_scope = ?, "
+                        "model = ?, api_base = ?, "
                         "messages_sha256 = ?, system_sha256 = ?, tools_sha256 = ?, "
                         "options_sha256 = ?, cache_lane_sha256 = ?, message_count = ?, "
                         "system_message_count = ?, request_bytes = ?, system_bytes = ?, "
@@ -266,6 +338,10 @@ class StepRuntime:
                         (
                             envelope.protocol,
                             envelope.cache_scope,
+                            str(getattr(envelope, "model", "") or ""),
+                            canonicalize_api_base(
+                                getattr(envelope, "api_base", "") or ""
+                            ),
                             fingerprint.messages_sha256,
                             fingerprint.system_sha256,
                             fingerprint.tools_sha256,
@@ -277,7 +353,7 @@ class StepRuntime:
                             fingerprint.system_bytes,
                             fingerprint.tools_bytes,
                             fingerprint.options_bytes,
-                            envelope.request_reason,
+                            envelope.turn_reason or envelope.request_reason,
                             envelope.attempt,
                             envelope.deepseek_generation_id,
                             self.step_id,
@@ -308,6 +384,47 @@ class StepRuntime:
 
     def mark_tools_running(self) -> None:
         self._transition(StepStatus.TOOLS_RUNNING)
+
+    def mark_tool_call_count(self, count: int) -> None:
+        """记录本轮工具调用数（续跑需要知道"原本要执行几个"）。
+
+        只在 tools_running 状态下更新；非该状态（批处理尾部、已提交）静默跳过，
+        避免把调用方的收尾逻辑打断。状态正确但更新行数异常时抛错，与
+        capture_request 的并发防护口径一致。
+        """
+        try:
+            total = int(count)
+        except (TypeError, ValueError):
+            raise ValueError("tool call count must be an integer")
+        if total < 0:
+            raise ValueError("tool call count must be non-negative")
+        if self.turn.manager is None:
+            return
+        with self.turn.manager.acquire_lock():
+            row = self.turn.manager.get_harness_step(self.step_id)
+            status = "" if row is None else str(row.get("status") or "")
+            if status != StepStatus.TOOLS_RUNNING.value:
+                _LOGGER.warning(
+                    "skip tool call count for step %s in status %s",
+                    self.step_id,
+                    status or "unknown",
+                )
+                return
+            cursor = self.turn.manager.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE harness_steps SET tool_call_count = ? "
+                    "WHERE step_id = ? AND status = 'tools_running'",
+                    (total, self.step_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"stale harness tool count: {self.step_id}"
+                    )
+                self.turn.manager.conn.commit()
+            except Exception:
+                self.turn.manager.conn.rollback()
+                raise
 
     def mark_tools_committed(self) -> None:
         self._transition(StepStatus.TOOLS_COMMITTED)

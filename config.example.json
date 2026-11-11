@@ -16,6 +16,17 @@
   },
   "search_exclude_dirs": ["target", "out", "bin", "obj"],
   "prompt_cache_keepalive_seconds": 0,
+  "route_request_overrides": [
+    {
+      "match": "gateway.example.com",
+      "headers": {
+        "X-Example-Agent": "XingYaoCode/0.0.0"
+      },
+      "body": {
+        "thinking": { "type": "enabled" }
+      }
+    }
+  ],
   "memory_compression": {
     "retain_count": 8,
     "retain_count_force": 4,
@@ -23,7 +34,12 @@
     "tool_result_preview_limit_chars": 800,
     "tool_result_token_limit": 600,
     "summary_length_first": 250,
-    "summary_length_merge": 350
+    "summary_length_merge": 350,
+    "inter_chunk_delay_seconds": 0,
+    "precompress_ratio": 0.85
+  },
+  "resume": {
+    "enabled": false
   },
   "providers": [
     {
@@ -35,11 +51,12 @@
       "models": [
         {
           "id": "model_1",
-          "name": "agnes-2.0-flash",
-          "litellm_model": "openai/agnes-2.0-flash",
-          "context_window": 128000,
-          "supports_vision": false,
-          "max_tokens": 8192,
+          "name": "agnes-3.0-flash",
+          "litellm_model": "openai/agnes-3.0-flash",
+          "context_window": 512000,
+          "supports_vision": true,
+          "supports_function_calling": true,
+          "max_tokens": 65535,
           "thinking_budget": null,
           "enable_thinking": null,
           "reasoning_effort": null
@@ -62,7 +79,7 @@
       "name": "深度求索",
       "base_url": "https://api.deepseek.com",
       "api_key": "sk-your-deepseek-api-key-here",
-      "protocol": "responses",
+      "protocol": "openai",
       "preset_id": "deepseek",
       "models": [
         {
@@ -76,21 +93,11 @@
           "reasoning_effort": "max"
         },
         {
-          "id": "deepseek_v4_flash",
-          "name": "deepseek-v4-flash",
-          "litellm_model": "openai/deepseek-v4-flash",
+          "id": "deepseek_flash",
+          "name": "deepseek-flash",
+          "litellm_model": "openai/deepseek-flash",
           "context_window": 1000000,
           "supports_vision": false,
-          "max_tokens": 8192,
-          "enable_thinking": true,
-          "reasoning_effort": "max"
-        },
-        {
-          "id": "deepseek_v4_flash_vision_exp",
-          "name": "deepseek-v4-flash-vision-exp",
-          "litellm_model": "openai/deepseek-v4-flash-vision-exp",
-          "context_window": 1000000,
-          "supports_vision": true,
           "max_tokens": 8192,
           "enable_thinking": true,
           "reasoning_effort": "max"

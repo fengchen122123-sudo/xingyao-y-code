@@ -3,6 +3,13 @@ import shutil
 import sys
 import io
 
+# CLI 轻量档位：必须在后续任何 core.* 导入之前声明——core.llm 会在模块导入期
+# 按该档位构建工具表（剔除 GUI 专属工具，每个请求少约 5.6k tokens 的工具定义）。
+# 只在真实入口生效（__name__ == "__main__"），避免测试 `import main` 时污染
+# 同进程后续构建的工具表；GUI 入口不设此变量，保持 full 档位。
+if __name__ == "__main__":
+    os.environ.setdefault("YCODE_TOOL_PROFILE", "cli")
+
 
 def _agent_name() -> str:
     """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
@@ -15,6 +22,11 @@ def _agent_name() -> str:
 
 
 def _dispatch_browser_worker_argv() -> bool:
+    # 先做纯字符串预检再 import：core.computer.browser_backend 会连带拉起
+    # core.computer 全套（实测冷启动约 0.45s），而普通 CLI 启动根本用不到。
+    # 字面量必须与 WORKER_ARGV_FLAG 保持一致，import 后仍做一次兜底校验。
+    if "--ycode-browser-worker" not in sys.argv:
+        return False
     from core.computer.browser_backend import WORKER_ARGV_FLAG
 
     if WORKER_ARGV_FLAG not in sys.argv:
@@ -27,6 +39,35 @@ def _dispatch_browser_worker_argv() -> bool:
 
 _dispatch_browser_worker_argv()
 
+
+def _dispatch_office_convert_argv() -> bool:
+    """Office 转 PDF 子进程入口（冻结版 exe 被 core.office_preview 重新拉起时）。
+
+    打包后 sys.executable 是本程序的 exe，`-m core.office_preview` 不成立，
+    core.office_preview._convert_argv 改用 WORKER_ARGV_FLAG 回落；GUI 与 CLI 共用
+    同一个载荷，两条入口都必须能接住这个标志，少一处就会漏（例如 CLI 形态的 exe
+    被当作 sys.executable 时）。同样先字面量预检，避免普通 CLI 启动白付 import。
+    """
+    if "--ycode-office-convert" not in sys.argv:
+        return False
+    from core.office_preview import (
+        WORKER_ARGV_FLAG,
+        _write_worker_stderr,
+        run_convert_worker,
+    )
+
+    if WORKER_ARGV_FLAG not in sys.argv:
+        return False
+    index = sys.argv.index(WORKER_ARGV_FLAG)
+    pair = sys.argv[index + 1:index + 3]
+    if len(pair) < 2:
+        _write_worker_stderr("Office 转换子进程参数不足（需要 SRC 与 DST）")
+        raise SystemExit(2)
+    raise SystemExit(run_convert_worker(pair[0], pair[1]))
+
+
+_dispatch_office_convert_argv()
+
 # Windows GBK 终端在输出 emoji/非 BMP 字符时会触发 UnicodeEncodeError 崩溃。
 # 强制 stdout/stderr 使用 UTF-8 + replace 错误策略：无法显示的字符会变成 �，
 # 保证程序不崩溃；现代 Windows Terminal 已支持 UTF-8，旧版 conhost 最多显示乱码。
@@ -34,12 +75,24 @@ _dispatch_browser_worker_argv()
 # 按 GBK 解释，非 BMP emoji（🚨 🤖 等）照样乱码。启动时尽量把控制台代码页切到
 # UTF-8(65001)，让旧版 conhost 也能正确显示。
 if sys.platform == "win32":
+    # 只在"真的需要改控制台代码页"时才 import ctypes：ctypes 首次加载在冷启动
+    # 实测约 0.25~0.36s，而管道/headless（非 tty）输出根本不经过控制台渲染，
+    # 现代 UTF-8 终端也不需要切代码页。只在旧版 GBK 交互终端里付这笔成本。
+    _needs_codepage_switch = False
     try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-        ctypes.windll.kernel32.SetConsoleCP(65001)
+        _needs_codepage_switch = bool(
+            sys.stdout is not None and sys.stdout.isatty()
+        ) and "utf" not in str(getattr(sys.stdout, "encoding", "") or "").lower()
     except Exception:
-        pass
+        _needs_codepage_switch = False
+    if _needs_codepage_switch:
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
 if sys.stdout and hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", None) != "utf-8":
     try:
         sys.stdout = io.TextIOWrapper(
@@ -82,6 +135,7 @@ from core.runtime_warnings import configure_runtime_warnings
 configure_runtime_warnings()
 import datetime
 import logging
+import math
 import re
 import time
 import threading
@@ -125,14 +179,36 @@ from core.ui_markers import ANSI_GRAY, ANSI_RESET, plan_color, plan_html_color, 
 from core.plan import bind_default_plan_session, get_default_plan_manager
 from core.model_manager import get_active_model
 from core.version import __version__ as YCODE_VERSION
-# 电脑操控 CLI 运行控制（Task 14）：cli 模块只依赖纯模型层，import 无副作用
-from core.computer.cli import ComputerCliEvent
 # 警告：from-import 会在 import 时冻结常量值。新增调用方禁止 from-import 这些常量，
 # 应 import config 后动态读取（如 config.MY_MODEL），以便配置热更新生效。
 # config.py 已通过模块级 __getattr__ 动态解析 MY_* 常量，必须走模块属性访问。
 import config
 
 manager = MemoryManager(db_path=config.DB_FILE)
+
+# 保活止损证据跨进程续用：CLI 启动时同样把上一个进程落库的 keepalive 轮次播进内存
+# 证据桶，否则每次重启都要重新白烧 10 轮全价前缀才够判一次止损。失败不阻断启动。
+try:
+    from core.llm_diagnostics import seed_keepalive_lane_evidence_from_store
+
+    seed_keepalive_lane_evidence_from_store(manager=manager)
+except Exception:  # 启动兜底：证据播种失败最多退回「重启后重新攒 10 轮」的旧行为
+    pass
+
+# 按回合撤销：注册进程级存储并执行启动恢复扫描（收敛中断事务、重建路径
+# 冻结、清理跨 boot 失效令牌；不自动重放任何文件写入）
+from core.turn_undo import service as _turn_undo_service
+
+_turn_undo_service.configure_default_manager(manager)
+try:
+    _interrupted_ops = _turn_undo_service.startup_recovery_scan()
+    if _interrupted_ops:
+        _TURN_UNDO_SCAN_LOGGER = logging.getLogger("py.warnings")
+        _TURN_UNDO_SCAN_LOGGER.warning(
+            "按回合撤销：启动恢复收敛了 %d 个未终态操作", len(_interrupted_ops)
+        )
+except Exception:  # 启动扫描失败不阻断主流程；下次启动重试
+    pass
 
 # ---------------------------------------------------------------------------
 # 全局状态所有权约定（为后续 AppState 结构化重构铺路）：
@@ -178,11 +254,15 @@ active_cancel_event = None
 active_turn_id = None
 app_instance = None
 is_thinking = False
-# LLM 引擎（litellm/tiktoken/模型能力探测）是否已在后台预热完成。
+# LLM 引擎（token 估算/模型能力探测）是否已在后台预热完成。
 # 首轮对话若赶在预热完成前发出，状态行会显示“正在启动模型引擎”而不是
 # 让用户误以为卡死。
 _llm_engine_ready = False
 task_status = 'idle'  # 全局运行状态：'idle' (闲置), 'thinking' (思考中), 'executing' (执行中), 'waiting' (等待确认)
+# 状态栏吐字速度：最近一次 LLM 请求的实测 token 速度（t/s），来源是
+# core.llm 请求结束时发出的 step_metrics（上游 usage 的 completion_tokens
+# 除以真实流式输出时长，批式投递已由 core.llm 兜底校正）。None 表示还没测到。
+_last_token_speed: float | None = None
 think_start_time = 0
 # 底部活动指示区使用的独立墙钟计时起点：思考开始/首个工具开始时刷新，
 # 避免工具执行阶段复用上一次思考的起始时间。
@@ -334,6 +414,41 @@ def _pad_left(text, width):
     return " " * max(0, width - _term_display_width(text)) + text
 
 
+def _truncate_visible(text, width, ellipsis="…"):
+    """把文本压到 width 显示宽度以内：保留首尾、中间省略。
+
+    列宽有上限（如 /usage 的模型列）时，超宽文本只补齐不压缩会把该行的
+    数字列整体右推，同一张表的表头/数据行/小计再也对不齐。只截尾又会把
+    渠道域名尾部与 `[scope]` 标记切掉——这两段正是用来区分车道的部分，
+    因此按显示宽度保留首尾、中间用省略号收尾。
+    """
+    text = str(text)
+    if width <= 0:
+        return ""
+    if _term_display_width(text) <= width:
+        return text
+    ellipsis_width = _term_display_width(ellipsis)
+    if ellipsis_width >= width:
+        return ellipsis[:width]
+    budget = width - ellipsis_width
+    head_budget = (budget + 1) // 2
+
+    def _take(chars, limit):
+        taken = []
+        used = 0
+        for char in chars:
+            char_width = _term_display_width(char)
+            if used + char_width > limit:
+                break
+            taken.append(char)
+            used += char_width
+        return "".join(taken), used
+
+    head, head_used = _take(text, head_budget)
+    tail, _ = _take(reversed(text), budget - head_used)
+    return head + ellipsis + "".join(reversed(tail))
+
+
 def _parse_usage_date_args(args):
     """解析 /usage 的日期参数。
 
@@ -367,7 +482,11 @@ def _render_usage_section(manager, label, start_s, end_s):
     if not rows:
         print_formatted_text(HTML("  <ansigray>暂无记录</ansigray>"))
         return False
-    display_rows = [(row, _usage_model_label(row)) for row in rows]
+    # 展开 api_base 与 scope：同名模型的不同渠道/保活分行显示，main 不再被合并
+    display_rows = [
+        (row, _usage_model_label(row, row.get("api_base"), row.get("cache_scope")))
+        for row in rows
+    ]
     name_w = max(
         12,
         min(60, max(_term_display_width(name) for _, name in display_rows) + 2),
@@ -385,8 +504,11 @@ def _render_usage_section(manager, label, start_s, end_s):
     for r, route_label in display_rows:
         _cache_prompt = int(r.get("cache_prompt", 0) or 0)
         _rate = _format_cache_hit_rate(r["cached"], _cache_prompt)
+        # 标签含 api_base / [scope] 时可能远超列宽上限：先按显示宽度压缩到列宽、
+        # 再补齐，最后才转义（转义会插入 &amp; 等实体，先转义会让宽度测量失真）。
+        _name_cell = _esc(_pad_right(_truncate_visible(route_label, name_w), name_w))
         print_formatted_text(HTML(
-            f"  {_pad_right(_esc(route_label), name_w)} {r['prompt']:>14} "
+            f"  {_name_cell} {r['prompt']:>14} "
             f"{r['completion']:>14} {_cache_prompt:>14} {r['cached']:>14} "
             f"{_rate:>10} {r['total']:>14}"
         ))
@@ -454,12 +576,111 @@ def _format_cache_hit_rate(cached_tokens, cache_prompt_tokens):
     return f"{cached_tokens / cache_prompt_tokens * 100:.1f}%"
 
 
-def _usage_model_label(row):
-    """用量表只显示 provider/model；接口域名/path 哈希/缓存作用域标签
-    对日常使用是噪音（历史遗留的 @ host path#xx [scope] 已按用户要求移除）。"""
+def _status_cache_metrics(session_id, model_name, api_base, cache_scope="main"):
+    """口径查询：当前会话 × 当前车道的热命中率（主指标）。
+
+    车道键与 core/llm_diagnostics._cache_usage_key 完全一致
+    （lower + 去尾斜杠 + scope）。keepalive 从 cache_scopes 单列取，
+    不混进 main；进程级累计（所有会话/渠道/scope 混算）不在此函数内。
+    rate 为 None 表示该车道 usage 未报告，展示层按 "--" 处理（未报告 ≠ 0）。
+
+    注意：状态栏已不再消费本函数（保活段与车道热口径都已从状态栏移除），
+    这里保留为 /usage 之类明细视图与口径测试的查询入口。
+    """
+    snapshot = get_token_usage_snapshot(session_id, model_name, api_base, cache_scope)
+    cache = snapshot.get("cache") or {}
+    scopes = snapshot.get("cache_scopes") or {}
+    current_scope = str(cache_scope or "main")
+    keepalive = cache if current_scope == "keepalive" else (scopes.get("keepalive") or {})
+    hot = cache.get("hot") or {}
+    session_all = cache.get("session_all") or {}
+    keepalive_hot = keepalive.get("hot") or {}
+    return {
+        "hot_rate": hot.get("rate"),
+        "hot_prompt": int(hot.get("prompt_tokens", 0) or 0),
+        "hot_cached": int(hot.get("cached_tokens", 0) or 0),
+        "session_rate": session_all.get("rate"),
+        "keepalive_rate": keepalive_hot.get("rate"),
+        "keepalive_prompt": int(keepalive_hot.get("prompt_tokens", 0) or 0),
+        "keepalive_cached": int(keepalive_hot.get("cached_tokens", 0) or 0),
+    }
+
+
+def _compose_status_token_info(
+    *,
+    prompt,
+    completion,
+    cached,
+    global_rate,
+    ctx_pct,
+    ctx_used,
+    ctx_max,
+):
+    """状态栏 Token 概览文字：进程累计口径 + 上下文占用。
+
+    输入/输出/命中都是进程累计（跨会话、渠道、scope 混算），早年用「全局」
+    前缀标注口径，现按需求去掉——状态栏一行宽度有限，标签比数字更不值钱。
+    保活命中率同样不再进状态栏（需要时用 /usage 查看明细）。所有传参均为已
+    格式化文本；未报告的 rate 由调用方传 "--"。
+
+    标签改用符号（↑ 输入 / ↓ 输出 / ⚡ 命中）压缩宽度：状态栏一行还要塞
+    上下文与吐字速度，中文标签两字占 4 格，符号只占 1~2 格。符号均取自
+    BMP 常见区段，Windows Terminal 与常见等宽字体都有字形。
+    """
+    return (
+        f"↑ {prompt} · ↓ {completion} · ⚡ {cached} ({global_rate}) · "
+        f"上下文 {ctx_pct} ({ctx_used}/{ctx_max})"
+    )
+
+
+def _format_token_speed(speed) -> str:
+    """状态栏吐字速度文本：只认实测的正值，未测到一律显示 "-- t/s"。
+
+    速度全部由 core.llm 的 step_metrics 提供（completion_tokens ÷ 真实流式
+    输出时长），这里只做格式化，绝不按字符数/耗时之类自行估算凑数。
+    """
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        return "-- t/s"
+    if not math.isfinite(value) or value <= 0:
+        return "-- t/s"
+    return f"{value:.1f} t/s"
+
+
+def _compose_status_task_segment(task_status, speed):
+    """状态栏最右段（text, style）三元组：一律展示实测吐字速度。
+
+    运行中原本还要显示「思考中…／正在干活…」文字，但速度位一旦有数字滚动
+    就已经说明在工作，多一段文字只占宽度、还会随状态反复跳变。现在除
+    「等待授权确认」外一律显示 t/s——那一个标签需要用户立刻动手，必须显眼。
+    运行中的旋转动画由调用方补在速度前面，保留最低限度的活动反馈。
+    """
+    speed_label = f" {_format_token_speed(speed)} "
+    status_map = {
+        "idle": (speed_label, "class:status.task_speed"),
+        "thinking": (speed_label, "class:status.task_speed"),
+        "executing": (speed_label, "class:status.task_speed"),
+        "waiting": (" 等待授权确认... ", "class:status.task_active"),
+    }
+    # 未知状态按闲置处理（与历史默认值一致），同样落回实测速度位
+    return status_map.get(task_status, (speed_label, "class:status.task_speed"))
+
+
+def _usage_model_label(row, api_base=None, cache_scope=None):
+    """用量表标签：provider/model；显式传入 api_base / cache_scope 时展开身份，
+    让同一模型在不同渠道、不同作用域（如保活）的命中率分行显示，不再被合并。
+    默认不展开（保持历史精简输出：不带接口域名/path 哈希/scope 后缀）。"""
     provider = str(row.get("provider") or "")
     model = str(row.get("model") or "")
-    return f"{provider}/{model}" if provider else model
+    label = f"{provider}/{model}" if provider else model
+    base = str(api_base or "").strip()
+    if base:
+        label = f"{label} @ {base}"
+    scope = str(cache_scope or "").strip()
+    if scope and scope != "main":
+        label = f"{label} [{scope}]"
+    return label
 
 
 def set_terminal_title(title: str) -> None:
@@ -647,6 +868,16 @@ def _permission_source_line(prompt: dict) -> str:
     return f"请求来源：{_esc(source)}\n"
 
 
+def _undo_turn_impact_for_card(args: dict) -> dict:
+    """undo_turn 权限卡富化：服务预检的影响摘要（只读）。"""
+    try:
+        from core.turn_undo import service as tu_service
+
+        return tu_service.undo_turn_permission_impact(dict(args or {}))
+    except Exception as exc:  # 预检失败时卡片显示退化信息
+        return {"available": False, "message": str(exc)}
+
+
 def _confirm_prompt_text(prompt: dict | None) -> str:
     if not prompt:
         return ""
@@ -680,6 +911,33 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
     elif func == "sandbox_outside_access":
         text += f"🛡  {_agent_name()}申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
         text += "    （沙盒模式下默认仅限工作目录内；可选择在本任务内放行，或用 /sandbox on 长期开放）\n"
+    elif func == "undo_turn":
+        # 按回合撤销权限卡：预检影响摘要 + 未覆盖副作用 + 后续回合语义依赖警告
+        text += f"↩️  {_agent_name()}申请撤销一整轮的文件修改: {_esc(str(args.get('turn_id') or '最近可撤销回合'))}\n"
+        impact = _undo_turn_impact_for_card(args)
+        if impact.get("available"):
+            lines = [
+                f"    回合 {_esc(impact['short_id'])}：共 {impact['file_count']} 个文件 — "
+                f"恢复原内容 {impact['restore_content_count']}，"
+                f"删除本轮新建 {impact['delete_created_count']}，"
+                f"恢复本轮删除 {impact['restore_deleted_count']}",
+            ]
+            if impact.get("created_files"):
+                lines.append(f"    将删除的新建文件: {_esc('、'.join(impact['created_files']))}")
+            lines.append("    聊天历史保留，星瑶将记住文件结果已失效。")
+            if impact.get("has_uncovered_command_effects"):
+                lines.append("    ⚠️ 本轮执行过通用命令：仅恢复受控文件，命令的其他副作用不撤销。")
+            if impact.get("subsequent_completed_turns", 0) > 0:
+                lines.append(
+                    f"    ⚠️ 目标回合之后还有 {impact['subsequent_completed_turns']} 个已完成回合，"
+                    "可能存在语义依赖，撤销后请重新检查或测试。"
+                )
+            if impact.get("conflicts"):
+                lines.append("    ⚠️ 预检发现冲突文件，批准后将拒绝整轮撤销、零文件写入。")
+            text += "\n".join(lines) + "\n"
+        else:
+            msg = impact.get("message") or "预检不可用"
+            text += f"    ⚠️ 预检未通过：{_esc(msg)}（批准后执行会拒绝写入）\n"
     else:
         # 默认分支：其余工具（含 MCP 工具）展示函数名与参数摘要，不再显示空白
         summary = ", ".join(
@@ -768,65 +1026,64 @@ def _reset_turn_state():
         app_instance.invalidate()
 
 
-def _stop_active_computer_run_for_cancel() -> None:
-    """Ctrl+C 先停止活动电脑操控 run，再走 Turn 级取消（Task 14）。
+# 状态栏不再展示 Git 段：本机实测 `git status` 约 1.0s、`git rev-parse` 约 0.9s
+# （仓库索引大 + 实时防护），任何同步调用都会卡住首帧与键盘回显；放后台线程又
+# 因为缺少权限上下文拿不到快照（返回空）。Git 信息统一走 `/git status` 或
+# `/git` 管理器按需查看，绝不再占渲染路径。
 
-    controller.stop(run_id, "cli_ctrl_c") 内部按固定顺序触发 owner cancel
-    与 Provider 在飞流中断；无活动 run 时是空操作。Task 14 审查裁决④：
-    与 Bridge 的 _stop_computer_runs_for_disabled_switch 对齐加兜底
-    except——取消路径绝不因电脑操控清理异常而中断 Turn 级取消。
+
+def _ensure_cli_disclaimer_consent() -> None:
+    """CLI 首次使用（及条款版本升级后）的免责条款确认。
+
+    与 GUI 共用同一份同意记录（~/.ycode/disclaimer_consent.json）：任一形态
+    下同意过，另一形态不再重复询问。只在交互式终端询问——非 TTY 已由
+    _require_interactive_console 提前拦截；headless（-p）用于 CI/脚本，
+    不做交互拦截以免破坏自动化。
     """
+    from core.disclaimer_consent import (
+        DISCLAIMER_VERSION,
+        accept_disclaimer,
+        needs_acceptance,
+    )
+
     try:
-        from core.computer.cli import stop_active_run_for_cancel
-        from core.computer.controller import get_computer_control_service
-
-        stop_active_run_for_cancel(get_computer_control_service())
+        if not needs_acceptance():
+            return
     except Exception:
-        logging.getLogger("main.computer").exception(
-            "Ctrl+C 停止活动电脑操控 run 失败（已忽略，继续 Turn 级取消）"
-        )
+        # 状态不可读时不阻断启动（与 GUI 侧同一降级口径）
+        return
 
-
-def _computer_status_bar_segment() -> str:
-    """CLI 底部状态栏的电脑操控段（设计 17.2，Task 14 审查裁决①）。
-
-    活动 run 时为 ``电脑操控: 运行中 · Edge · N 步``；否则空串（状态栏
-    布局不变）。读取失败一律返回空串——状态栏渲染绝不因电脑操控异常抖动。
-    """
+    width = 66
+    print()
+    print("=" * width)
+    print(f"  免责条款确认（{DISCLAIMER_VERSION}）")
+    print("=" * width)
+    print("  本软件是本地 AI 编程辅助工具，自身不提供、不运营任何生成式")
+    print("  人工智能模型服务；模型服务由你自行配置。")
+    print()
+    print("  · AI 生成内容可能不准确、不完整或已过时，需你自行审查验证；")
+    print("  · 软件可读写文件、执行命令，请确认影响范围并自行备份数据；")
+    print("  · 会话内容将按你的配置发送至所选模型服务提供者；")
+    print("  · 不得利用本软件从事违反法律法规的活动。")
+    print()
+    print("  在法律允许的最大范围内，作者不对使用本软件造成的任何损失")
+    print("  承担责任；本软件按「现状」提供，不作任何明示或默示担保。")
+    print()
+    print("  完整条款（共 8 章）：GUI「设置 → 法律 → 免责条款」")
+    print("=" * width)
+    print()
     try:
-        from core.computer.cli import render_computer_status_bar
-        from core.computer.controller import get_computer_control_service
-
-        return render_computer_status_bar(get_computer_control_service().snapshot())
-    except Exception:
-        return ""
-
-
-def _startup_computer_runtime_for_cli() -> None:
-    """启动轻量电脑操控运行时（Task 16）：开关开启时注册全局紧急停止热键。
-
-    默认关闭路径零额外导入（不触碰 Playwright/浏览器/截图）；失败只留痕。
-    """
-    try:
-        from core.computer.runtime import start_computer_runtime
-
-        start_computer_runtime()
-    except Exception:
-        logging.getLogger("main.computer").exception(
-            "启动电脑操控运行时失败（已忽略）"
-        )
-
-
-def _shutdown_computer_runtime_for_cli() -> None:
-    """CLI 退出统一收尾（Task 16）：controller（活动 run+retained）→ preview → hotkey。"""
-    try:
-        from core.computer.runtime import shutdown_process_computer_runtime
-
-        shutdown_process_computer_runtime("cli_exit")
-    except Exception:
-        logging.getLogger("main.computer").exception(
-            "CLI 退出时关闭电脑操控运行时失败（已忽略）"
-        )
+        answer = input("  输入 y 并回车表示已阅读并同意，其它输入将退出软件：").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer in ("y", "yes"):
+        try:
+            accept_disclaimer()
+        except Exception:
+            print("  提示：同意记录保存失败，请检查 ~/.ycode 目录是否可写。", file=sys.stderr)
+        return
+    print("  未接受免责条款，已退出。", file=sys.stderr)
+    sys.exit(0)
 
 
 def _require_interactive_console() -> None:
@@ -857,18 +1114,30 @@ def _require_interactive_console() -> None:
     raise SystemExit(2)
 
 
-# 斜杠命令输入补全表（Task 14 审查裁决③：补 /computer；从 _make_input_app
-# 提取到模块层供测试断言，SlashCommandCompleter 经局部别名引用不变）。
+# 斜杠命令输入补全表（从 _make_input_app 提取到模块层供测试断言，
+# SlashCommandCompleter 经局部别名引用不变）。
+# 注：CLI 轻量模式不提供电脑/浏览器操控，/computer 已下线。
 COMMAND_COMPLETIONS = [
     ("/help", "查看系统指令说明"),
     ("/session", "切换或创建新的记忆会话"),
     ("/new", "创建并切换到全新会话"),
     ("/models", "打开模型管理器"),
-    ("/effort", "切换当前模型推理强度 (low/high/max/default)"),
+    ("/effort", "切换当前模型思考模式 (档位随模型, 无参查看可选档位)"),
+    ("/clear-history", "清空当前会话全部历史消息 (y 确认)"),
+    ("/persona", "人设设置 (name/title/text/reset)"),
+    ("/shell", "选择默认命令解释器 (无参查看列表)"),
+    ("/open", "在系统中打开文件/目录 (无参=当前工作区)"),
+    ("/queue", "排队消息管理 (list/cancel 序号/clear)"),
+    ("/paste-image", "发送剪贴板图片 (可附说明文字)"),
+    ("/update", "更新检查与安装 (check/download/cancel/install)"),
+    ("/changes", "查看最近 N 个回合的文件变更汇总 (默认 3)"),
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
+    ("/doctor", "聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 机器可读；export 导出诊断包)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
-    ("/undo", "撤销上一次修改的代码"),
+    ("/goal", "目标模式：自主迭代直到达成（支持 status / stop / resume / confirm / --check / --rounds）"),
+    ("/undo", "按回合撤销文件修改 (list/preview/status/recover)"),
+    ("/resume", "断点续跑：从本会话最近中断的回合继续 (需 resume.enabled=true)"),
     ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
     ("/share", "导出会话为 Markdown/HTML/JSON"),
     ("/diagram", "打开/列出 Mermaid 流程图网页 (open 序号/list)"),
@@ -877,28 +1146,112 @@ COMMAND_COMPLETIONS = [
     ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),
     ("/memory", "查阅长期记忆索引 (MEMORY.md) 内容"),
     ("/worktree", "Git worktree 管理 (list/create/remove)"),
+    ("/git", "Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log)"),
     ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
     ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
-    ("/skills", "查看或安装/开启/禁用技能插件"),
+    ("/hooks", "Hook 管理 (查看清单/信任确认/撤销)"),
+    ("/hooks import", "从 ZCode 配置导入 hook (预览确认后写入,rollback 撤销)"),
+    ("/skills", "技能管理 (list/refresh/enable/disable 或开选择器)"),
     ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
     ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
     ("/turns", "设置单任务最大模型轮次 (10-1000)"),
     ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
     ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
-    ("/computer", "电脑操控运行控制 (status/pause/resume/stop)"),
     ("/clear", "清理当前屏幕"),
-    ("/exit", "退出 Y-code"),
+    ("/exit", "退出 星瑶Code"),
 ]
+
+# /session 的子命令补全（与 /session 分支的实际分支保持一致）
+SESSION_SUBCOMMANDS = [
+    ("all", "列出所有目录下的历史会话"),
+    ("archive", "归档指定会话（从默认列表隐藏，数据保留可恢复）"),
+    ("unarchive", "取消归档，恢复回默认会话列表"),
+    ("archived", "列出全部已归档会话"),
+    ("rename", "重命名当前活动会话"),
+    ("delete", "物理删除指定会话"),
+]
+
+
+def _active_reasoning_snapshot():
+    """返回 (active_model_id, model_dict, 思考能力快照)；无激活模型时前两者为 None。
+
+    快照与 GUI 思考选择器共用 build_reasoning_snapshot：kind 区分
+    effort 强度型 / toggle 开关型 / fixed 强制思考 / hidden 不支持，
+    options 为该模型真实可用的档位（value + 中文 label）。
+    """
+    from core.model_manager import load_config, get_model_reasoning_choice
+    from core.reasoning_capabilities import build_reasoning_snapshot
+
+    cfg = load_config()
+    active_id = cfg.get("active_model_id")
+    if not active_id:
+        return None, None, None
+    model = None
+    for provider in cfg.get("providers", []):
+        for m in provider.get("models", []):
+            if str(m.get("id")) == str(active_id):
+                model = m
+                break
+        if model is not None:
+            break
+    return active_id, model, build_reasoning_snapshot(model, get_model_reasoning_choice(active_id))
+
+
+_REASONING_COMPLETION_CACHE = {"key": None, "ts": 0.0, "rows": ()}
+
+
+def _reasoning_options_for_completion(ttl: float = 5.0):
+    """当前激活模型的思考档位 (value, label, 是否当前)，供 /effort 参数补全。
+
+    补全随按键高频触发，按激活模型 id 做短 TTL 缓存避免反复读盘；
+    任何异常（无模型/配置损坏）静默返回空，不影响正常命令补全。
+    """
+    try:
+        active_id, _model, snapshot = _active_reasoning_snapshot()
+        key = str(active_id)
+        now = time.monotonic()
+        cached = _REASONING_COMPLETION_CACHE
+        if cached["key"] == key and now - cached["ts"] < ttl:
+            return cached["rows"]
+        rows = tuple(
+            (o["value"], o["label"], o["value"] == snapshot["choice"])
+            for o in snapshot.get("options", [])
+        ) if (active_id and snapshot) else ()
+        cached.update(key=key, ts=now, rows=rows)
+        return rows
+    except Exception:
+        return ()
+
+
+_COMMAND_SHELL_COMPLETION_CACHE = {"ts": 0.0, "rows": ()}
+
+
+def _command_shell_options_for_completion(ttl: float = 5.0):
+    """可选命令解释器 (id, label, available)，供 /shell 参数补全。
+
+    list_command_shell_options 每次调用都做可执行文件探测，补全随按键高频
+    触发，按短 TTL 缓存；异常静默返回空，不影响正常命令补全。
+    """
+    try:
+        now = time.monotonic()
+        cached = _COMMAND_SHELL_COMPLETION_CACHE
+        if now - cached["ts"] < ttl:
+            return cached["rows"]
+        from core.command_shell import list_command_shell_options
+        rows = tuple(
+            (o["id"], o["label"], bool(o["available"]))
+            for o in list_command_shell_options()
+        )
+        cached.update(ts=now, rows=rows)
+        return rows
+    except Exception:
+        return ()
 
 
 def _cancel_active_turn() -> None:
     from core.tools import subagent_manager
     from core.task_scheduler import get_default_scheduler
     from core.plan import suppress_plan_auto_continue
-
-    # Ctrl+C：先停止活动电脑操控 run（owner cancel + Provider 流中断在其
-    # 内部按固定顺序触发），再走 Turn 级取消收尾（Task 14）
-    _stop_active_computer_run_for_cancel()
 
     # 取消完全由每 turn 的 cancel_event 驱动（core.llm 已不再读取模块级 cancel_requested）
     if active_cancel_event is not None:
@@ -1097,13 +1450,6 @@ def _echo_user_input(html_text: str) -> None:
     print_formatted_text(HTML(html_text))
 
 
-def _format_thinking_elapsed(elapsed: float) -> str:
-    # 短思考（< 1s）用毫秒显示，避免全部显示成 "0.0s" 让用户误以为没思考
-    if elapsed < 1.0:
-        return f"{int(elapsed * 1000)}ms"
-    return f"{elapsed:.1f}s"
-
-
 def _render_public_answer_block(turn_id: str, text: str) -> None:
     block = str(text or "").strip()
     if not block:
@@ -1215,13 +1561,7 @@ def _render_ui_event(event):
     global active_thinking_text, active_thinking_turn_id, _active_tool_status
     global _thinking_panel_linger
     global _last_printed_plan_state
-    if isinstance(event, ComputerCliEvent):
-        # 电脑操控动作摘要（Task 14）：listener 在 worker 线程只入队，
-        # 这里在 UI 线程单行打印已脱敏的纯文本
-        text = str(event.payload.get("text", ""))
-        if text:
-            _print_ui_fragment(f"{text}\n")
-        return
+    global _last_token_speed
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
         # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，不显示具体工具调用细节。
@@ -1244,6 +1584,20 @@ def _render_ui_event(event):
         message = str(event.payload.get("message", ""))
         if message:
             print_formatted_text(HTML(f"\n<ansigray>{_esc(message)}</ansigray>"))
+        return
+
+    if event.kind == "step_metrics":
+        # 状态栏吐字速度：只接收 core.llm 用上游 usage（completion_tokens）÷
+        # 真实流式输出时长算出的 token_speed。缺失/非正值一律不覆盖（保持
+        # "-- t/s"），绝不在这里按字符数自行推算，速度必须是实测的。
+        try:
+            speed = float(event.payload.get("token_speed") or 0)
+        except (TypeError, ValueError):
+            speed = 0.0
+        if math.isfinite(speed) and speed > 0:
+            _last_token_speed = speed
+            if app_instance is not None:
+                app_instance.invalidate()
         return
 
     if event.kind == "permission_requested":
@@ -1291,6 +1645,16 @@ def _render_ui_event(event):
                 if subject else "子 Agent 已超时，主 Agent 正在接管并核查现场"
             )
         _print_ui_fragment(f"\n⏵ {line}\n")
+        if app_instance is not None:
+            app_instance.invalidate()
+        return
+
+    if event.kind == "plan_writeback_rejected":
+        # 回写被拒属于调度诊断：打印原因本身，不套用计划项的 <mark> 渲染，
+        # 否则会把计划项显示成它原有的状态，反而看不出"为什么一直没动"
+        message = str(event.payload.get("reason") or "").replace("\x1b", "").strip()
+        if message:
+            _print_ui_fragment(f"{ANSI_RESET}! {message}\n")
         if app_instance is not None:
             app_instance.invalidate()
         return
@@ -1552,8 +1916,8 @@ def trigger_session_auto_rename(session_name, user_query, api_model, api_key, ap
                 f"用户提问：\"{query_text}\"\n"
                 "会话标题："
             )
-            from litellm import completion
-            response = completion(
+            from core.llm_native_transport import native_completion
+            response = native_completion(
                 model=api_model,
                 api_key=api_key,
                 api_base=api_url,
@@ -1605,7 +1969,7 @@ def print_logo(clear_screen=True):
             os.system('cls' if os.name == 'nt' else 'clear')
         
     custom_fig = pyfiglet.Figlet(font='slant')
-    logo_text = custom_fig.renderText('Y-CODE')
+    logo_text = custom_fig.renderText('XINGYAO')
     safe_logo = logo_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     from core.themes import THEMES
     theme_color = THEMES.get(current_theme, {}).get("border", "#00b4d8")
@@ -1661,7 +2025,7 @@ def print_logo(clear_screen=True):
         escaped_val = val_str.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         return make_box_line(f"{label}<ansigray>{escaped_val}</ansigray>")
 
-    avatar_row1 = f"  <style fg='{theme_color}'>▄▄    ▄▄</style>    <b>Welcome to Y-CODE CLI!</b>"
+    avatar_row1 = f"  <style fg='{theme_color}'>▄▄    ▄▄</style>    <b>欢迎使用 星瑶Code CLI</b>"
     avatar_row2 = f" <style fg='{theme_color}'>██████████</style>   {_agent_name()} (Hacker Girl) 为您服务"
     avatar_row3 = f" <style fg='{theme_color}'>██ █  █ ██</style>   输入 /help 获取帮助"
     avatar_row4 = f"  <style fg='{theme_color}'>▀██████▀</style>    "
@@ -1721,6 +2085,1329 @@ def show_session_history(session_name):
     print_formatted_text(HTML("<ansicyan><b>--------------------------------------</b></ansicyan>\n"))
 
 
+# ---------------------------------------------------------------------------
+# 按回合撤销（CLI）：/undo 系列、/checkpoint 迁移与回合结束摘要（规格 17）
+# ---------------------------------------------------------------------------
+
+def _undo_service():
+    from core.turn_undo import service as tu_service
+
+    return tu_service
+
+
+def _undo_session_id(session_name: str) -> int:
+    tu = _undo_service()
+    manager.ensure_session(session_name)
+    return tu.resolve_session_id(session_name)
+
+
+def _undo_workdir_root() -> str:
+    from core.turn_undo.coordinator import canonicalize_workspace_root
+    from core.workspace_context import get_workdir
+
+    return canonicalize_workspace_root(get_workdir() or os.getcwd())
+
+
+def _undo_status_label(s: dict) -> str:
+    """状态 + 快照保留状态的组合展示标签（规格 16.3 一致的 CLI 文案）。"""
+    status = s.get("status")
+    availability = s.get("snapshot_availability")
+    labels = {
+        "recording": "记录中",
+        "ready": "可撤销",
+        "no_changes": "无文件修改",
+        "unavailable": "不可撤销",
+        "conflicted": "撤销受阻（文件已变化）",
+        "reverting": "正在撤销",
+        "reverted": "已撤销",
+        "interrupted": "撤销中断",
+        "recovering": "正在恢复撤销事务",
+        "failed": "撤销失败",
+    }
+    label = labels.get(status, status)
+    if status == "reverted" and availability == "expired":
+        label = "已撤销（原 diff 已过期）"
+    elif status == "ready" and availability == "expired":
+        label = "撤销记录已过期"
+    elif status not in ("reverted", "ready") and availability == "expired":
+        label += "（快照已过期）"
+    return label
+
+
+def _undo_short_id(turn_id: str) -> str:
+    return turn_id[:8]
+
+
+def _undo_resolve_turn_id(session_name: str, value: str) -> str:
+    """短 ID 只在当前会话唯一匹配时接受；歧义显式要求完整 ID（规格 17.2）。"""
+    tu = _undo_service()
+    value = str(value or "").strip()
+    states = tu.list_turn_undo_states(_undo_session_id(session_name), limit=200)
+    exact = [s for s in states if s["turn_id"] == value]
+    if exact:
+        return value
+    prefix = [s for s in states if s["turn_id"].startswith(value)]
+    if len(prefix) == 1:
+        return prefix[0]["turn_id"]
+    if len(prefix) > 1:
+        raise ValueError(
+            f"回合 ID 前缀 {value} 匹配到 {len(prefix)} 个回合，请使用完整 ID"
+        )
+    raise ValueError(f"当前会话不存在回合: {value}")
+
+
+def _undo_print_preview(preview) -> None:
+    from core.turn_undo.models import TurnUndoStatus
+
+    if preview.status is TurnUndoStatus.CONFLICTED and preview.conflicts:
+        print_formatted_text(HTML("<ansired>⚠️ 撤销受阻：以下文件与回合结束时的状态不一致，本次没有修改任何文件：</ansired>"))
+        for c in preview.conflicts:
+            print_formatted_text(HTML(
+                f"  <ansired>✗</ansired> {_esc(c.display_path)}  "
+                f"<ansigray>预期 {_esc(node_kind_label(c.expected.kind))}，"
+                f"当前 {_esc(node_kind_label(c.actual.kind))}</ansigray>"
+            ))
+        print_formatted_text(HTML("<ansigray>  处理磁盘文件后可重新预检；不存在强制覆盖。</ansigray>"))
+        return
+    print_formatted_text(HTML(
+        f"<ansicyan>🔍 撤销影响：共 {preview.file_count} 个文件 — "
+        f"恢复原内容 {preview.restore_content_count}，"
+        f"删除本轮新建 {preview.delete_created_count}，"
+        f"恢复本轮删除 {preview.restore_deleted_count}</ansicyan>"
+    ))
+    if preview.created_files:
+        for path in preview.created_files:
+            print_formatted_text(HTML(f"  <ansiyellow>将删除新建文件: {_esc(path)}</ansiyellow>"))
+    print_formatted_text(HTML("<ansigray>  聊天历史保留，星瑶将记住文件结果已失效。</ansigray>"))
+    if preview.has_uncovered_command_effects:
+        print_formatted_text(HTML(
+            "<ansiyellow>⚠️ 本轮执行过通用命令：仅恢复列出的受控文件，"
+            "命令的其他副作用（进程/网络/数据库等）不撤销。</ansiyellow>"
+        ))
+    if preview.subsequent_completed_turns > 0:
+        print_formatted_text(HTML(
+            f"<ansiyellow>⚠️ 目标回合之后还有 {preview.subsequent_completed_turns} 个已完成回合，"
+            "可能存在语义依赖，撤销后请重新检查或运行测试。</ansiyellow>"
+        ))
+
+
+def node_kind_label(kind: str) -> str:
+    return {
+        "missing": "不存在",
+        "regular_file": "普通文件",
+        "symlink": "符号链接",
+        "directory": "目录",
+        "special": "特殊文件",
+    }.get(str(kind), str(kind))
+
+
+def _undo_print_result(result) -> None:
+    from core.turn_undo.models import TurnUndoStatus
+
+    if result.idempotent:
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 该回合此前已撤销过（{_esc(str(result.original_reverted_at_ms))}），"
+            "本次未修改任何文件。</ansiyellow>"
+        ))
+        return
+    total = (len(result.restored_files) + len(result.deleted_created_files)
+             + len(result.restored_deleted_files))
+    print_formatted_text(HTML(
+        f"<ansigreen>✅ 撤销完成：共 {total} 个文件 — "
+        f"恢复原内容 {len(result.restored_files)}，"
+        f"删除本轮新建 {len(result.deleted_created_files)}，"
+        f"恢复本轮删除 {len(result.restored_deleted_files)}。</ansigreen>"
+    ))
+    print_formatted_text(HTML("<ansigray>  聊天历史保留；通用命令与外部副作用未随文件恢复。</ansigray>"))
+
+
+# ── 断点续跑（规格 §4.1 CLI 入口，S4）─────────────────────────────
+# 与 /undo 同级：开关关闭时只提示不动作；开启后一律"打印断点 → 一次性确认 →
+# ResumeExecutor"，绝不静默续跑（规格 §9.9）。
+_RESUME_REASON_TEXT = {
+    "disabled": "断点续跑未启用（resume.enabled=false）",
+    "no_resumable_turn": "本会话没有可续跑的中断回合",
+    "anchor_missing": "缺少缓存锚点（父回合没有已完成的 Step），请手动重来",
+    "session_archived": "会话已归档，请先取消归档后再续跑",
+    "undo_recovering": "会话处于撤销恢复态，请先执行 /undo recover",
+    "owner_still_alive": "该回合可能仍在其他进程运行，已拒绝续跑",
+    "confirm_required": "仍有写操作待确认，已暂停（零工具执行、零模型请求）",
+    "hash_anchor_mismatch": "缓存锚点已变化（历史被改写），请手动重来",
+    "planner_failed": "规划层故障，无法确定断点，请手动重来",
+    "resume_cancelled": "续跑已取消",
+}
+
+
+def _resume_reason_text(code: str) -> str:
+    """把 §7 的错误码翻成用户能懂的一句中文（未知码原样回显）。"""
+    return _RESUME_REASON_TEXT.get(str(code or ""), str(code or "未知原因"))
+
+
+def _resume_switch_enabled() -> bool:
+    """读取 resume.enabled；读配置失败按关闭处理（宁可不可用也不误触发）。"""
+    try:
+        section = config._load().get("resume") or {}
+    except Exception:
+        return False
+    return bool(section.get("enabled")) if isinstance(section, dict) else False
+
+
+def _resume_make_planner(manager_obj):
+    """装配规划层；默认注册表构造失败降级为 None（planner 会判工具不可用→BLOCK）。"""
+    from core.harness.resume import ResumePlanner
+
+    registry = None
+    try:
+        from core.tool_registry import build_default_registry
+
+        registry = build_default_registry()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "断点续跑：默认工具注册表构造失败，按无注册表降级", exc_info=True
+        )
+        registry = None
+    return ResumePlanner(manager_obj, registry)
+
+
+def _resume_journal_writer(manager_obj):
+    """续跑专用 journal writer：与回合运行时统一 owner 租约。
+
+    ResumeExecutor 自建 journal 的 owner 是 ``harness-resume-<uuid>``，与
+    TurnRuntime 的 PROCESS_OWNER_ID 不同；10s 心跳过期后 recover_stale 会把
+    续跑 turn 判成 interrupted。显式注入同一 owner 的 HarnessJournal 规避。
+    manager 不支持 journal 存储（鸭子类型替身）时回退 None，行为同接线前。
+    """
+    from core.harness.journal import (
+        PROCESS_OWNER_ID,
+        HarnessJournal,
+        journal_storage_supported,
+    )
+
+    if not journal_storage_supported(manager_obj):
+        return None
+    return HarnessJournal(
+        manager_obj,
+        PROCESS_OWNER_ID,
+        clock_ms=lambda: time.time_ns() // 1_000_000,
+    )
+
+
+def _run_resume_turn_cli_worker(session_name: str, *, turn_id: str, parent_turn_id: str) -> None:
+    """CLI 断点续跑的真实请求线程体（daemon 线程）。
+
+    刻意不复用 _background_worker 的回合装配：那条路径会先把用户输入落库
+    （追加一条 user 消息）并开撤销检查点，等于篡改父回合历史。本方法只读
+    组装历史，然后以 resume_turn=True 直接发一次请求（该 turn 行已由
+    ResumeExecutor 建好，TurnRuntime.start 不能再重复 INSERT）。
+    """
+    global active_cancel_event, active_turn_id
+
+    cancel_event = None
+    try:
+        from core.agent_service import build_resume_messages
+        from core.llm import chat_with_model_events
+        from core.model_manager import get_active_model
+
+        active_model = get_active_model(session_name)
+        if not active_model or not active_model.get("litellm_model"):
+            schedule_ui(lambda: print_formatted_text(HTML(
+                "<ansired>❌ 断点续跑未执行：当前未激活任何 LLM 模型。</ansired>"
+            )))
+            return
+        model_name = active_model["litellm_model"]
+        api_key = active_model.get("api_key", "") or ""
+        api_base = active_model.get("base_url", "") or ""
+        model_id = active_model.get("id")
+        history = build_resume_messages(manager, session_name, is_gui=False)
+        cancel_event = threading.Event()
+        active_cancel_event = cancel_event
+        active_turn_id = turn_id
+        try:
+            from core import tool_cache as _tool_cache_cli
+
+            _tool_cache_cli.set_current_session(session_name)
+        except Exception:
+            pass
+        schedule_ui(lambda: print_formatted_text(HTML(
+            "<ansigray>↻ 断点续跑：正在从上次中断处继续…</ansigray>"
+        )))
+        response_gen = chat_with_model_events(
+            model_name,
+            api_key,
+            history,
+            api_base,
+            persist=True,
+            turn_id=turn_id,
+            cancel_event=cancel_event,
+            parent_session=session_name,
+            parent_turn_id=parent_turn_id,
+            permission_owner=turn_id,
+            permission_source="主代理",
+            model_id=model_id,
+            request_reason="resume",
+            resume_turn=True,
+        )
+        # 事件统一交回主 CLI 线程渲染（后台线程绝不直接 print）
+        _forward_response_events(response_gen)
+    except Exception as e:
+        logging.getLogger("py.warnings").exception(
+            "CLI 断点续跑回合失败 session=%s turn=%s", session_name, turn_id
+        )
+        message = _esc(str(e))
+        schedule_ui(lambda text=message: print_formatted_text(HTML(
+            f"<ansired>❌ 断点续跑失败：{text}</ansired>"
+        )))
+    finally:
+        if cancel_event is not None and active_cancel_event is cancel_event:
+            active_cancel_event = None
+        if active_turn_id == turn_id:
+            active_turn_id = None
+        schedule_ui(_reset_turn_state)
+
+
+def _resume_print_plan(plan, aborts) -> None:
+    """打印断点位置与待确认清单（只含序号/工具名/原因，不含参数与结果正文）。"""
+    anchor_state = "完整" if plan.anchor.complete() else "缺失"
+    print_formatted_text(HTML(
+        "<ansicyan><b>断点续跑</b></ansicyan> "
+        f"父回合 {_esc(_undo_short_id(plan.parent_turn_id))} · "
+        f"从第 {plan.resume_from_step_ordinal} 个 Step 继续 · 锚点{anchor_state}"
+    ))
+    if plan.replayable:
+        names = ", ".join(sorted({call.tool_name for call in plan.replayable}))
+        print_formatted_text(HTML(
+            f"<ansigray>  可回灌的只读调用 {len(plan.replayable)} 个（{_esc(names)}）："
+            "结果直接取自 messages，不会重新执行。</ansigray>"
+        ))
+    if plan.fresh:
+        names = ", ".join(sorted({call.tool_name for call in plan.fresh}))
+        print_formatted_text(HTML(
+            f"<ansigray>  需重新获取结果的只读调用 {len(plan.fresh)} 个（{_esc(names)}）。</ansigray>"
+        ))
+    if plan.blocked:
+        print_formatted_text(HTML("<ansiyellow>  待确认清单（写操作/不确定态，需逐项同意）：</ansiyellow>"))
+        for call in plan.blocked:
+            print_formatted_text(HTML(
+                f"<ansiyellow>    · 第 {call.call_ordinal} 个调用 {_esc(call.tool_name)}"
+                f" — {_esc(call.reason)}</ansiyellow>"
+            ))
+    if aborts:
+        reasons = "、".join(_resume_reason_text(code) for code in aborts)
+        print_formatted_text(HTML(f"<ansired>❌ 不可续跑：{_esc(reasons)}</ansired>"))
+
+
+def _handle_resume_command(session_name: str) -> None:
+    """`/resume`：打印断点 → 终端一次性确认（全部同意或取消）→ ResumeExecutor。
+
+    通过 resume_execute 同款 request_fn 发起真实请求：本函数在主提示循环里
+    同步执行，因此只负责"确认 + 建 turn + 起线程"，模型请求本身在 daemon
+    线程里跑（CLI 没有 emit_event，事件经 _forward_response_events 回显）。
+    """
+    if not _resume_switch_enabled():
+        print_formatted_text(HTML("<ansiyellow>断点续跑未启用（resume.enabled=false）。</ansiyellow>"))
+        print_formatted_text(HTML(
+            '<ansigray>  如需启用：在 config.json 写入 "resume": {"enabled": true} 后重启。</ansigray>'
+        ))
+        return
+    if not session_name:
+        print_formatted_text(HTML("<ansired>⚠️ 当前没有活动会话，无法确定续跑目标。</ansired>"))
+        return
+    from core.harness.resume import ResumeExecutor
+
+    planner = _resume_make_planner(manager)
+    plan = planner.plan(session_name)
+    if plan is None:
+        print_formatted_text(HTML("<ansigray>ℹ 没有断点信息（本会话最近没有中断的回合），请手动重来。</ansigray>"))
+        return
+    aborts = [str(code) for code in (planner.aborts(plan) or ())]
+    _resume_print_plan(plan, aborts)
+    if aborts:
+        return
+    question = "确认从断点继续？"
+    if plan.blocked:
+        question = f"确认从断点继续？将一次确认全部 {len(plan.blocked)} 项写操作"
+    if not _undo_confirm(question):
+        print_formatted_text(HTML("<ansigray>已取消（默认 N）：父回合保持中断，未做任何修改。</ansigray>"))
+        return
+    confirmed: set = {call.call_ordinal for call in plan.blocked}
+
+    def _request_resume_turn(
+        *, turn_id: str, parent_turn_id: str, request_reason: str = "resume"
+    ) -> None:
+        """request_fn 契约（core/harness/resume.py）：只发起，绝不阻塞。
+
+        本命令由 CLI 主提示循环同步调用：若在此同步跑完整个模型回合，界面会
+        整段冻住（既看不到输出也无法响应 Ctrl+C）。故起 daemon 线程后立即返回，
+        真实请求与事件渲染都由 _run_resume_turn_cli_worker 负责。
+        """
+        threading.Thread(
+            target=_run_resume_turn_cli_worker,
+            args=(session_name,),
+            kwargs={"turn_id": turn_id, "parent_turn_id": parent_turn_id},
+            daemon=True,
+            name=f"cli-resume-turn-{session_name}",
+        ).start()
+
+    result = ResumeExecutor(
+        manager,
+        planner,
+        writer=_resume_journal_writer(manager),
+        request_fn=_request_resume_turn,
+    ).run(plan, confirmed=confirmed)
+    if result.get("ok"):
+        turn_id = str(result.get("turn_id") or "")
+        note = (
+            "（dry-run：请求层未接线，未发出模型请求）"
+            if result.get("dry_run")
+            else "（模型请求已在后台线程发出，输出稍后到达）"
+        )
+        print_formatted_text(HTML(
+            f"<ansigreen>✅ 已从断点续跑：新回合 {_esc(_undo_short_id(turn_id))}，"
+            f"回灌只读调用 {int(result.get('replayed') or 0)} 个{_esc(note)}。</ansigreen>"
+        ))
+        return
+    first = str(result.get("reason") or "")
+    print_formatted_text(HTML(f"<ansired>❌ 续跑未执行：{_esc(_resume_reason_text(first))}</ansired>"))
+
+
+def _undo_confirm(question: str) -> bool:
+    """工作区锁外的交互确认；默认 N（直接回车不执行）。"""
+    def _ask() -> bool:
+        try:
+            answer = input(f"{question} [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer in ("y", "yes")
+    try:
+        return bool(run_in_terminal(_ask))
+    except Exception:
+        return _ask()
+
+
+def _undo_interactive_revert(session_name: str, turn_id: str) -> None:
+    tu = _undo_service()
+    session_id = _undo_session_id(session_name)
+    preview, token = tu.preview_turn_undo(session_id, turn_id)
+    _undo_print_preview(preview)
+    from core.turn_undo.models import TurnUndoStatus
+
+    if preview.status is TurnUndoStatus.CONFLICTED and preview.conflicts:
+        return
+    if not _undo_confirm(f"确认撤销回合 {_undo_short_id(turn_id)} 的全部文件修改?"):
+        print_formatted_text(HTML("<ansigray>已取消（默认 N），本次没有修改任何文件。</ansigray>"))
+        return
+    # 确认后重新预检拿新令牌（确认期间文件/版本可能已变化）
+    preview2, token2 = tu.preview_turn_undo(session_id, turn_id)
+    if preview2.status is TurnUndoStatus.CONFLICTED and preview2.conflicts:
+        _undo_print_preview(preview2)
+        return
+    try:
+        result = tu.execute_turn_undo(session_id, turn_id, token2)
+        _undo_print_result(result)
+    except Exception as e:
+        code = getattr(e, "code", "")
+        if code == "revert_interrupted":
+            print_formatted_text(HTML(
+                f"<ansired>⚠️ 撤销事务中断：{_esc(str(e))}</ansired>"
+            ))
+            _undo_print_recover_hint(session_id, turn_id)
+        elif code == "file_conflict":
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        else:
+            print_formatted_text(HTML(f"<ansired>⚠️ 撤销失败：{_esc(str(e))}</ansired>"))
+
+
+def _undo_print_recover_hint(session_id: int, turn_id: str) -> None:
+    status = _undo_service().get_turn_undo_status(session_id, turn_id)
+    if status and status.get("last_operation_id"):
+        print_formatted_text(HTML(
+            f"  <ansiyellow>使用 /undo recover {_esc(status['last_operation_id'])} "
+            "查看恢复选项（继续撤销或取消撤销）。</ansiyellow>"
+        ))
+
+
+def handle_undo_command(command_text: str, current_session: str) -> None:
+    """CLI /undo：按回合撤销（规格 17.2）。默认确认 N，无 --force。"""
+    tu = _undo_service()
+    parts = command_text.strip().split(maxsplit=2)
+    sub = parts[1] if len(parts) > 1 else ""
+
+    if sub == "list":
+        states = tu.list_turn_undo_states(_undo_session_id(current_session))
+        if not states:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有按回合撤销记录。</ansiyellow>"))
+            return
+        print_formatted_text(HTML(f"<ansicyan>📋 当前会话共 {len(states)} 个回合检查点:</ansicyan>"))
+        for s in states:
+            desc = s.get("description") or ""
+            if len(desc) > 40:
+                desc = desc[:37] + "..."
+            owner = " [后台任务]" if s.get("owner_kind") == "background_task" else ""
+            print_formatted_text(HTML(
+                f"  <ansigreen>{_esc(_undo_short_id(s['turn_id']))}</ansigreen> "
+                f"{_esc(_undo_status_label(s))}  "
+                f"文件: {s['file_count']}  <ansigray>+{s['net_added']} -{s['net_removed']} "
+                f"{_esc(desc)}{_esc(owner)}</ansigray>"
+            ))
+        return
+
+    if sub == "preview":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /undo preview &lt;turn_id&gt;</ansired>"))
+            return
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, parts[2])
+            preview, _ = tu.preview_turn_undo(_undo_session_id(current_session), turn_id)
+            _undo_print_preview(preview)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        return
+
+    if sub == "status":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /undo status &lt;turn_id&gt;</ansired>"))
+            return
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, parts[2])
+            status = tu.get_turn_undo_status(_undo_session_id(current_session), turn_id)
+            if status is None:
+                print_formatted_text(HTML(f"<ansired>⚠️ 未找到回合: {_esc(turn_id)}</ansired>"))
+                return
+            print_formatted_text(HTML(
+                f"<ansicyan>回合 {_esc(_undo_short_id(status['turn_id']))} "
+                f"({_esc(status['status'])})，快照: {_esc(status['snapshot_availability'])}，"
+                f"文件 {len(status.get('files', []))} 个</ansicyan>"
+            ))
+            for f in status.get("files", []):
+                print_formatted_text(HTML(
+                    f"  {_esc(f['display_path'])}  "
+                    f"<ansigray>+{f['net_added']} -{f['net_removed']} {_esc(f.get('diff_kind') or '')}</ansigray>"
+                ))
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        return
+
+    if sub == "recover":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /undo recover &lt;operation_id&gt;</ansired>"))
+            return
+        _undo_interactive_recovery(current_session, parts[2].strip())
+        return
+
+    if sub and sub not in ("list", "preview", "status", "recover"):
+        # /undo <turn_id>：指定回合
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, sub)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+            return
+        _undo_interactive_revert(current_session, turn_id)
+        return
+
+    # /undo 无参数：最近一个 ready 前台回合
+    session_id = _undo_session_id(current_session)
+    candidates = tu.get_default_storage().list_workdir_ready_checkpoints(
+        session_id, _undo_workdir_root()
+    )
+    candidates = [c for c in candidates if c.status_enum.value == "ready"]
+    if not candidates:
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话/工作区没有可撤销的回合。</ansiyellow>\n"
+            "<ansigray>  使用 /undo list 查看全部检查点状态。</ansigray>"
+        ))
+        return
+    _undo_interactive_revert(current_session, candidates[0].turn_id)
+
+
+def _undo_interactive_recovery(session_name: str, operation_id: str) -> None:
+    tu = _undo_service()
+    session_id = _undo_session_id(session_name)
+    try:
+        preview, token = tu.preview_turn_undo_recovery(session_id, operation_id, "continue_revert")
+    except Exception as e:
+        print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        return
+    print_formatted_text(HTML("<ansicyan>🔍 撤销中断恢复选项：</ansicyan>"))
+    if preview.processed_files:
+        print_formatted_text(HTML(f"  已恢复: {_esc('、'.join(preview.processed_files))}"))
+    if preview.remaining_files:
+        print_formatted_text(HTML(f"  未处理: {_esc('、'.join(preview.remaining_files))}"))
+    if preview.unknown_files:
+        print_formatted_text(HTML(
+            f"  <ansired>状态未知（需人工核对，已拒绝自动写入）: "
+            f"{_esc('、'.join(preview.unknown_files))}</ansired>"
+        ))
+        return
+    print_formatted_text(HTML("  1. 继续撤销 — 使用本轮开始前快照完成剩余撤销"))
+    print_formatted_text(HTML("  2. 取消撤销 — 把已处理路径恢复到点击撤销之前"))
+    choice = ""
+    try:
+        choice = run_in_terminal(lambda: input("选择恢复方向 [1=继续撤销 / 2=取消撤销 / 回车取消]: ").strip()) or ""
+    except Exception:
+        choice = ""
+    if choice not in ("1", "2"):
+        print_formatted_text(HTML("<ansigray>已取消，本次没有修改任何文件。</ansigray>"))
+        return
+    action = "continue_revert" if choice == "1" else "cancel_revert"
+    # 执行方向可能与预览方向不同：重新按所选方向预检拿令牌
+    try:
+        _, token = tu.preview_turn_undo_recovery(session_id, operation_id, action)
+        question = (
+            f"确认继续撤销（完成剩余 {len(preview.remaining_files)} 个文件）?"
+            if action == "continue_revert"
+            else "确认取消撤销（恢复已处理文件到点击撤销前的状态）?"
+        )
+        if not _undo_confirm(question):
+            print_formatted_text(HTML("<ansigray>已取消，本次没有修改任何文件。</ansigray>"))
+            return
+        result = tu.execute_turn_undo_recovery(session_id, operation_id, action, token)
+        if result.action.value == "continue_revert":
+            print_formatted_text(HTML(
+                f"<ansigreen>✅ 撤销已继续完成：{len(result.affected_files)} 个文件恢复。</ansigreen>"
+            ))
+        else:
+            print_formatted_text(HTML(
+                "<ansigreen>✅ 撤销事务已取消：文件恢复到点击撤销之前的状态，回合重新可撤销。</ansigreen>"
+            ))
+    except Exception as e:
+        print_formatted_text(HTML(f"<ansired>⚠️ 恢复失败：{_esc(str(e))}</ansired>"))
+
+
+def handle_checkpoint_command(command_text: str, current_session: str) -> None:
+    """/checkpoint：list 查看、restore 迁移为 TurnUndoService 兼容入口（规格 23.1）。"""
+    parts = command_text.strip().split(maxsplit=2)
+    sub = parts[1] if len(parts) > 1 else "list"
+
+    if sub == "list":
+        tu = _undo_service()
+        states = tu.list_turn_undo_states(_undo_session_id(current_session))
+        if not states:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有检查点记录。</ansiyellow>"))
+            print_formatted_text(HTML("<ansigray>  每轮对话开始前会自动创建持久化检查点，记录本轮受控文件修改。</ansigray>"))
+            print_formatted_text(HTML("<ansigray>  使用 /checkpoint restore &lt;turn_id&gt; 或 /undo 可整体回滚该轮文件修改。</ansigray>"))
+            return
+        print_formatted_text(HTML(f"<ansicyan>📋 当前会话共有 {len(states)} 个检查点:</ansicyan>"))
+        for s in states:
+            desc = s.get("description") or "(无描述)"
+            if len(desc) > 50:
+                desc = desc[:47] + "..."
+            print_formatted_text(HTML(
+                f"  <ansigreen>{_esc(_undo_short_id(s['turn_id']))}</ansigreen> "
+                f"{_esc(_undo_status_label(s))}  文件修改: {s['file_count']}  "
+                f"<ansigray>{_esc(desc)}</ansigray>"
+            ))
+        print_formatted_text(HTML(
+            "<ansigray>\n  使用 /checkpoint restore &lt;turn_id&gt; 或 /undo 整体回滚该轮所有文件修改</ansigray>"
+        ))
+        return
+
+    if sub == "restore":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /checkpoint restore &lt;turn_id&gt;</ansired>"))
+            return
+        # 迁移：恢复动作统一走 TurnUndoService（预检 + 一次性令牌 + 多文件事务）
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, parts[2].strip())
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+            print_formatted_text(HTML("<ansigray>  使用 /checkpoint list 查看所有可用的检查点 ID</ansigray>"))
+            return
+        _undo_interactive_revert(current_session, turn_id)
+        return
+
+    print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /checkpoint [list|restore &lt;turn_id&gt;]</ansired>"))
+
+
+def print_turn_file_summary_if_ready(session_name: str, turn_id: str) -> None:
+    """回合封闭后（worker 线程调用，经 schedule_ui 切回主线程）：检查点进入
+    ready 时在最终回答后显示文件修改摘要与 /undo 指引（规格 17.1）。"""
+    try:
+        tu = _undo_service()
+        session_id = tu.resolve_session_id(session_name)
+        status = tu.get_turn_undo_status(session_id, turn_id)
+        if status is None or status.get("status") != "ready":
+            return
+        files = status.get("files") or []
+        if not files:
+            return
+        net_added = sum(f.get("net_added") or 0 for f in files)
+        net_removed = sum(f.get("net_removed") or 0 for f in files)
+        print_formatted_text(HTML(""))
+        print_formatted_text(HTML("<ansicyan>文件修改</ansicyan>"))
+        print_formatted_text(HTML(
+            f"<ansigray>{len(files)} 个文件已编辑  </ansigray>"
+            f"<ansigreen>+{net_added}</ansigreen> <ansired>-{net_removed}</ansired>"
+        ))
+        shown = files[:5]
+        for f in shown:
+            print_formatted_text(HTML(
+                f"  {_esc(f.get('display_path') or '')}  "
+                f"<ansigreen>+{f.get('net_added') or 0}</ansigreen> "
+                f"<ansired>-{f.get('net_removed') or 0}</ansired>"
+            ))
+        if len(files) > 5:
+            print_formatted_text(HTML(f"  <ansigray>还有 {len(files) - 5} 个文件（/undo status 查看全部）</ansigray>"))
+        if status.get("has_uncovered_command_effects"):
+            print_formatted_text(HTML(
+                "<ansiyellow>⚠️ 本轮执行过通用命令：命令的其他副作用不在撤销范围内。</ansiyellow>"
+            ))
+        print_formatted_text(HTML(
+            f"可撤销本轮修改：<ansicyan>/undo {_esc(_undo_short_id(status['turn_id']))}</ansicyan>"
+        ))
+        print_formatted_text(HTML(""))
+    except Exception:
+        logging.getLogger("py.warnings").debug(
+            "回合文件摘要展示失败", exc_info=True
+        )
+
+
+# ---------------------------------------------------------------------------
+# /update 更新器 CLI 接入层（core/updater 的流程与 GUI 桥接对齐：
+# check → download（后台线程 + 主线程代理打印）→ install（门禁 + 确认 + 退出））
+# ---------------------------------------------------------------------------
+
+_update_downloader = None
+_last_update_installer = {"path": ""}
+
+
+def _get_update_downloader():
+    global _update_downloader
+    if _update_downloader is None:
+        from core.updater import UpdateDownloader
+        _update_downloader = UpdateDownloader()
+    return _update_downloader
+
+
+def _print_threadsafe(html_text: str) -> None:
+    """后台线程打印代理：有 UI 循环时把打印调度回主线程（AGENTS.md 线程铁律）；
+    无循环（测试/特殊环境）时按当前线程直接打印。"""
+    app = app_instance
+    loop = getattr(app, "loop", None) if app is not None else None
+    if loop is None:
+        print_formatted_text(HTML(html_text))
+        return
+    # 与 schedule_ui 同源的 closed-loop 防护：/models 等全屏选择器期间主 loop
+    # 已 close，此时调度会抛 RuntimeError 并从工作线程一路炸掉回调链（如下载线程），
+    # 静默丢弃即可——主界面恢复后下一帧进度会自然续上。
+    is_closed = getattr(loop, "is_closed", None)
+    if callable(is_closed) and is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(print_formatted_text, HTML(html_text))
+    except RuntimeError:
+        pass
+
+
+def _update_cmd_check() -> None:
+    # fetch_latest_release 网络超时最长 8 秒，必须放后台线程，否则冻结 UI；
+    # 结果统一经 _print_threadsafe 回主线程
+    from core.updater import fetch_latest_release
+    print_formatted_text(HTML("<ansigray>⏳ 正在检查更新…</ansigray>"))
+
+    def _worker():
+        try:
+            info = fetch_latest_release()
+        except Exception as exc:
+            _print_threadsafe(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>")
+            return
+        _print_threadsafe_update_check(info)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _print_threadsafe_update_check(info: dict) -> None:
+    """渲染检查结果（逐行经 _print_threadsafe 回主线程；测试可同步直调）。"""
+    if not info.get("ok"):
+        _print_threadsafe(f"<ansired>❌ {_esc(str(info.get('msg') or '检查更新失败'))}</ansired>")
+        return
+    current = str(info.get("current_version") or "")
+    if not info.get("has_update"):
+        _print_threadsafe(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(current)}）。</ansigreen>")
+        return
+    from core.updater import find_cached_installer
+    latest = str(info.get("latest_version") or "")
+    size_mb = int(info.get("asset_size") or 0) / (1024 * 1024)
+    split_mark = f" · 分卷 x{info.get('part_count')}" if info.get("is_split") else ""
+    _print_threadsafe(
+        f"<b><ansicyan>发现新版本 v{_esc(latest)}</ansicyan></b>（当前 v{_esc(current)}）"
+        f" · 包大小约 {size_mb:.1f} MB{split_mark}"
+    )
+    notes = str(info.get("release_notes") or "").strip()
+    if notes:
+        _print_threadsafe("<ansigray>更新日志（节选）：</ansigray>")
+        for line in notes.splitlines()[:40]:
+            _print_threadsafe(f"  {_esc(line)}")
+    cached = ""
+    try:
+        cached = find_cached_installer(
+            latest, str(info.get("sha256") or ""), int(info.get("asset_size") or 0)
+        ) or ""
+    except Exception:
+        cached = ""
+    if cached:
+        _print_threadsafe(f"<ansigreen>✔ 检测到已下载的安装包，可直接安装：</ansigreen> {_esc(cached)}")
+        _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 星瑶Code）。")
+    else:
+        _print_threadsafe("  输入 <ansicyan>/update download</ansicyan> 开始下载。")
+
+
+def _update_cmd_download() -> None:
+    downloader = _get_update_downloader()
+    if downloader.is_downloading():
+        print_formatted_text(HTML("<ansiyellow>ℹ 已有下载任务进行中，/update cancel 可取消。</ansiyellow>"))
+        return
+    from core.updater import fetch_latest_release
+    print_formatted_text(HTML("<ansigray>⏳ 正在获取版本信息…</ansigray>"))
+
+    def _worker():
+        try:
+            info = fetch_latest_release()
+        except Exception as exc:
+            _print_threadsafe(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>")
+            return
+        if not info.get("ok"):
+            # 网络失败必须显式报错，不得并入"已是最新版本"（代码审查 Important #1）
+            _print_threadsafe(f"<ansired>❌ {_esc(str(info.get('msg') or '检查更新失败'))}</ansired>")
+            return
+        if not info.get("has_update"):
+            _print_threadsafe(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(str(info.get('current_version') or ''))}），无需下载。</ansigreen>")
+            return
+        version = str(info.get("latest_version") or "")
+        part_urls = [str(u) for u in (info.get("part_urls") or []) if str(u).strip()]
+        progress_bucket = {"last": -1}
+
+        def _on_progress(data):
+            # downloader 工作线程：只经 _print_threadsafe 回主线程，按 10% 步进防刷屏
+            try:
+                percent = int(data.get("percent") or 0)
+            except Exception:
+                percent = 0
+            bucket = percent // 10
+            if bucket > progress_bucket["last"]:
+                progress_bucket["last"] = bucket
+                _print_threadsafe(f"<ansigray>  下载进度 {min(percent, 100)}%</ansigray>")
+
+        def _on_complete(dest_path):
+            _last_update_installer["path"] = str(dest_path)
+            _print_threadsafe(f"<ansigreen>✔ 安装包下载完成：{_esc(str(dest_path))}</ansigreen>")
+            _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 星瑶Code）。")
+
+        def _on_error(message):
+            _print_threadsafe(f"<ansired>❌ 下载失败：{_esc(str(message))}</ansired>")
+
+        started = downloader.start_download(
+            download_url=str(info.get("download_url") or ""),
+            target_version=version,
+            on_progress=_on_progress,
+            on_complete=_on_complete,
+            on_error=_on_error,
+            part_urls=part_urls,
+            expected_sha256=str(info.get("sha256") or "").strip().lower(),
+            total_size_hint=int(info.get("asset_size") or 0),
+        )
+        if started:
+            _print_threadsafe(
+                f"<ansicyan>⬇ 已开始下载 v{_esc(version)}"
+                "（进度按 10% 步进打印，/update cancel 可取消）。</ansicyan>"
+            )
+        else:
+            _print_threadsafe("<ansired>❌ 未能启动下载（可能已有任务在进行中）。</ansired>")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _update_cmd_install(args: list) -> None:
+    from core.updater import fetch_latest_release, find_cached_installer, launch_installer
+    # 支持两种顺序：/update install y（默认路径确认）与 /update install <路径> y；
+    # 路径支持引号包裹（含空格路径），与 /open 同口径
+    tokens = [str(t or "").strip() for t in args if str(t or "").strip()]
+    confirmed = any(t.lower() in ("y", "yes", "--force") for t in tokens)
+    path = " ".join(
+        t.strip('"').strip("'") for t in tokens if t.lower() not in ("y", "yes", "--force")
+    ).strip()
+    if not path:
+        path = _last_update_installer["path"]
+    if not path:
+        # 无最近下载：按线上 Release 探测本地缓存安装包
+        try:
+            info = fetch_latest_release()
+        except Exception:
+            info = {}
+        if info.get("has_update"):
+            try:
+                path = find_cached_installer(
+                    str(info.get("latest_version") or ""),
+                    str(info.get("sha256") or ""),
+                    int(info.get("asset_size") or 0),
+                ) or ""
+            except Exception:
+                path = ""
+    if not confirmed:
+        if path and os.path.isfile(path):
+            print_formatted_text(HTML(f"即将安装: {_esc(path)}"))
+            print_formatted_text(HTML("确认请输入: <ansicyan>/update install y</ansicyan>（安装会退出 星瑶Code）"))
+        else:
+            print_formatted_text(HTML("<ansiyellow>ℹ 未找到可安装的安装包。先 /update download，或指定路径: /update install &lt;路径&gt; y</ansiyellow>"))
+        return
+    if not path or not os.path.isfile(path):
+        print_formatted_text(HTML("<ansired>❌ 安装包不存在，请先 /update download。</ansired>"))
+        return
+    # 门禁：回合进行中 / 后台任务运行中一律拒绝（安装会退出进程）
+    if is_thinking:
+        print_formatted_text(HTML("<ansired>❌ 当前有正在执行的回合，请先 Ctrl+C 结束后再安装。</ansired>"))
+        return
+    try:
+        from core.task_manager import list_active_tasks
+        active_tasks = list_active_tasks()
+    except Exception:
+        active_tasks = []
+    if active_tasks:
+        print_formatted_text(HTML(
+            f"<ansired>❌ 还有 {len(active_tasks)} 个后台任务未结束（/tasks 查看），请先处理再安装。</ansired>"
+        ))
+        return
+    if launch_installer(path):
+        print_formatted_text(HTML("<ansigreen>✔ 安装向导已启动，星瑶Code 即将退出…</ansigreen>"))
+
+        def _exit_soon():
+            time.sleep(0.8)
+            # 先优雅退出 prompt_toolkit 事件循环恢复终端状态，再兜底硬退出
+            #（对齐 GUI _delayed_exit 的收尾顺序）
+            try:
+                app = app_instance
+                if app is not None:
+                    app.exit()
+            except Exception:
+                pass
+            os._exit(0)
+
+        threading.Thread(target=_exit_soon, daemon=True).start()
+    else:
+        print_formatted_text(HTML("<ansired>❌ 唤起安装包失败，请手动运行安装包。</ansired>"))
+
+
+# ---------------------------------------------------------------------------
+# /goal 目标模式（CLI 适配层）
+#
+# 状态机、完成判定与轮次循环都在 core/slash_commands/goal 里，这里只做编排：
+# 运行表（会话名 → 取消事件）、状态渲染、起 daemon 线程、把取消信号转给真实回合。
+# 与 gui_bridge 的同名实现是"同一套核心 + 各自适配层"，不在此复制任何判定逻辑，
+# 这样同一个目标在 GUI 与 CLI 跑出的结论才可能一致。
+# ---------------------------------------------------------------------------
+
+# 状态码 → 中文文案：把 running/blocked 这类英文码直接回显在中文界面里，
+# 用户会以为程序异常。集中成一张表，新增状态时只需补一行。
+_GOAL_STATUS_TEXT = {
+    "running": "进行中",
+    "awaiting_confirm": "待确认",
+    "achieved": "已达成",
+    "blocked": "受阻（轮次用尽）",
+    "stopped": "已停止",
+    "interrupted": "已中断",
+}
+
+# 只接受这三种状态 resume：achieved 再跑没有意义；awaiting_confirm 需要的是
+# "确认达成"而不是"再来一轮"；running 说明线程还在跑（重复启动会被拒）。
+# 取值必须与 core.slash_commands.goal.state 的 STATUS_* 一致——那里是权威定义，
+# 这里只是"可恢复集合"的适配层视图。
+_GOAL_RESUMABLE = ("blocked", "stopped", "interrupted")
+
+# 运行表：会话名 → 取消事件。用模块级 dict（而不是闭包）是为了让 `/goal stop`
+# 与 Ctrl+C 处理器能凭会话名找到另一个线程里的循环。读写一律持锁：UI 线程、
+# 后台 goal 线程、Ctrl+C 回调都可能同时访问。
+_GOAL_RUNS = {}
+_GOAL_RUNS_LOCK = threading.Lock()
+
+
+def _format_goal_status(state) -> str:
+    """把目标状态渲染成一行文案（纯函数，便于单测直接断言）。
+
+    没有状态文件是正常情况（用户只是问问进度），返回一句提示而不是报错。
+    """
+    if state is None:
+        return "当前会话没有进行中的目标"
+    summary = ""
+    if state.history:
+        summary = str(state.history[-1].get("summary") or "")
+    status_text = _GOAL_STATUS_TEXT.get(state.status, state.status)
+    return (
+        f"第 {state.round}/{state.max_rounds} 轮 · {status_text} · "
+        f"{summary or '（还没有完成任何一轮）'}"
+    )
+
+
+def _goal_notice(html_text: str) -> None:
+    """打印一行目标模式提示（跨线程安全）。
+
+    有 prompt_toolkit App 时统一经 schedule_ui 回到 UI 线程打印，遵守
+    "后台线程不直接调用 print_formatted_text" 的约定；没有 App（headless）时
+    schedule_ui 会静默丢弃回调，此时直接打印——否则目标每一轮的进展对用户
+    完全不可见，看起来像"启动了但什么都没发生"。
+    """
+    if app_instance is None:
+        try:
+            print_formatted_text(HTML(html_text))
+        except Exception:
+            pass
+        return
+    schedule_ui(lambda: print_formatted_text(HTML(html_text)))
+
+
+def _goal_store():
+    """打开目标状态仓库（与 GUI 端共用同一份 goals 目录）。"""
+    from core.slash_commands.goal.cli_executor import open_goal_store
+
+    return open_goal_store()
+
+
+def _submit_goal_turn(prompt: str, session_name: str) -> dict:
+    """把目标轮次的 prompt 作为一次普通用户消息投递进 CLI 回合链路。
+
+    结构必须与 headless 投递一致：session 快照要带上（否则排队期间用户切换会话
+    会把目标回合写进错误会话）；result 是 worker 收尾时回填成败的共享对象，
+    执行器靠"dict 里出现 ok 键"判定本轮真正结束——比轮询 is_thinking 精确，
+    后者在准备阶段之前还是 False，会让人误判回合已结束而读到上一轮的回复。
+    """
+    task = {
+        "text": prompt,
+        "was_queued": False,
+        "is_skill_call": False,
+        "session": session_name,
+        "result": {},
+    }
+    msg_queue.put(task)
+    return task["result"]
+
+
+def _goal_has_running() -> bool:
+    """是否有目标循环正在跑（运行表非空）。"""
+    with _GOAL_RUNS_LOCK:
+        return bool(_GOAL_RUNS)
+
+
+def _set_all_goal_cancel_events() -> int:
+    """置位所有目标循环的取消事件，返回置位数量。
+
+    Ctrl+C 的意图是"全部停下"：只中断当前模型回合而不置位目标循环的话，
+    本轮一结束循环会立刻开下一轮，用户会觉得 Ctrl+C 对目标模式无效。
+    """
+    with _GOAL_RUNS_LOCK:
+        events = list(_GOAL_RUNS.values())
+    count = 0
+    for event in events:
+        try:
+            event.set()
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _goal_start_run(state):
+    """起一条 daemon 线程驱动 run_goal_loop；返回 (是否启动成功, 失败说明)。"""
+    from core.slash_commands.goal.cli_executor import CliGoalExecutor
+    from core.slash_commands.goal.runner import run_goal_loop
+
+    session_name = state.session
+    with _GOAL_RUNS_LOCK:
+        existing = _GOAL_RUNS.get(session_name)
+        if existing is not None and not existing.is_set():
+            # 检查与写入必须在同一把锁内：每个会话最多一条循环，两条同时推进
+            # 会把同一份 history / 状态文件互相覆盖。
+            return False, "该会话已有运行中的目标"
+        cancel_event = threading.Event()
+        _GOAL_RUNS[session_name] = cancel_event
+    try:
+        store = _goal_store()
+    except Exception as exc:
+        with _GOAL_RUNS_LOCK:
+            if _GOAL_RUNS.get(session_name) is cancel_event:
+                _GOAL_RUNS.pop(session_name, None)
+        return False, f"打开目标状态仓库失败：{exc}"
+
+    # host 传当前模块自身（sys.modules[__name__]）：cli_executor 不能 `import main`
+    # ——CLI 以 `python main.py` 启动时入口模块名是 "__main__"，再 import main 会把
+    # 入口文件执行第二遍、得到另一份 msg_queue，目标回合就投进没人消费的队列了。
+    host = sys.modules[__name__]
+    executor = CliGoalExecutor(host, session_name)
+
+    def on_event(event, current_state):
+        """循环进度回调：只打印，不碰界面对象，也绝不把异常抛回循环。"""
+        try:
+            if event == "round_done":
+                summary = ""
+                if current_state.history:
+                    summary = str(current_state.history[-1].get("summary") or "")
+                _goal_notice(
+                    f"<ansicyan>🎯 目标第 {current_state.round}/{current_state.max_rounds} 轮：</ansicyan>"
+                    f"<ansigray>{_esc(summary)}</ansigray>"
+                )
+            elif event == "finished":
+                hint = (
+                    "，可用 /goal resume 继续"
+                    if current_state.status in _GOAL_RESUMABLE
+                    else ""
+                )
+                _goal_notice(
+                    f"<ansigreen>✔ 目标流程结束{hint}</ansigreen> "
+                    f"<ansigray>{_esc(_format_goal_status(current_state))}</ansigray>"
+                )
+        except Exception:
+            logging.getLogger("py.warnings").debug("目标进度提示打印失败", exc_info=True)
+
+    def worker():
+        try:
+            run_goal_loop(
+                state,
+                executor,
+                store,
+                on_event=on_event,
+                cancel_event=cancel_event,
+                run_check=executor.run_check,
+            )
+        except Exception as exc:  # 循环自身缺陷不该让后台线程静默死掉
+            logging.getLogger("py.warnings").exception("目标循环异常退出")
+            _goal_notice(f"<ansired>❌ 目标循环异常终止：{_esc(exc)}</ansired>")
+        finally:
+            # 只删自己那一条：期间用户可能 stop 后重建了新目标，误删会把新循环的
+            # 取消事件一起丢掉（之后 /goal stop 就失效了）。
+            with _GOAL_RUNS_LOCK:
+                if _GOAL_RUNS.get(session_name) is cancel_event:
+                    _GOAL_RUNS.pop(session_name, None)
+
+    # daemon 线程：目标是用户可见的长任务，不参与任何请求生命周期；状态每轮已
+    # 落盘，进程退出后仍可用 /goal resume 从断点继续。
+    thread = threading.Thread(
+        target=worker, name=f"goal-loop-{session_name}", daemon=True
+    )
+    thread.start()
+    return True, ""
+
+
+def _goal_handle_status(session_name) -> None:
+    """/goal status：输出轮次 / 状态 / 最近一轮摘要。"""
+    try:
+        state = _goal_store().load(session_name)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    if state is None:
+        print_formatted_text(
+            HTML(f"<ansiyellow>ℹ {_esc(_format_goal_status(None))}</ansiyellow>")
+        )
+        return
+    print_formatted_text(HTML(f"<ansicyan>🎯 {_esc(_format_goal_status(state))}</ansicyan>"))
+    if state.goal:
+        print_formatted_text(HTML(f"<ansigray>  目标：{_esc(state.goal)}</ansigray>"))
+    if state.check:
+        print_formatted_text(
+            HTML(f"<ansigray>  验证命令：{_esc(state.check)}</ansigray>")
+        )
+
+
+def _goal_handle_stop(session_name) -> None:
+    """/goal stop：置位该会话的取消事件，并中断正在跑的那一轮。"""
+    with _GOAL_RUNS_LOCK:
+        cancel_event = _GOAL_RUNS.get(session_name)
+    if cancel_event is None:
+        # 没有运行中的循环时说清楚，而不是静默成功让用户以为已经停了
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话没有运行中的目标（/goal status 查看进度）。</ansiyellow>"
+        ))
+        return
+    cancel_event.set()
+    # 光置位只影响"两轮之间"的检查点：用户停止时若正卡在一轮模型回复里，
+    # 要等整轮跑完才停，体验上像"停不掉"，所以同时走 CLI 既有取消通道中断在飞请求。
+    try:
+        _cancel_active_turn()
+    except Exception:
+        logging.getLogger("py.warnings").debug("中断目标回合失败", exc_info=True)
+    print_formatted_text(HTML(
+        "<ansigreen>✔ 已停止目标：本轮中断，不再自动续跑。</ansigreen>"
+    ))
+
+
+def _goal_handle_resume(session_name) -> None:
+    """/goal resume：把 blocked / stopped / interrupted 的目标重新跑起来。"""
+    from core.slash_commands.goal.state import STATUS_RUNNING
+
+    try:
+        store = _goal_store()
+        state = store.load(session_name)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    if state is None:
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话没有可恢复的目标，用 /goal &lt;目标&gt; 新建一个。</ansiyellow>"
+        ))
+        return
+    if state.status not in _GOAL_RESUMABLE:
+        hint = {
+            "achieved": "目标已达成，无需恢复；要跑新目标请用 /goal <目标>",
+            "awaiting_confirm": "目标在待确认状态，请确认是否达成，或用 /goal <目标> 重新设定",
+            "running": "目标已在运行中，无需重复恢复",
+        }.get(state.status, "")
+        status_text = _GOAL_STATUS_TEXT.get(state.status, state.status)
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 当前状态为「{_esc(status_text)}」，不能恢复。{_esc(hint)}</ansiyellow>"
+        ))
+        return
+    if state.round >= state.max_rounds:
+        # 轮次已用尽的目标恢复后会立刻再次 blocked（循环条件一开始就不成立），
+        # 让用户看到"说恢复了其实没跑"比直接说明更糟。
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 轮次已用尽（{state.round}/{state.max_rounds}），"
+            "请用 /goal &lt;目标&gt; [--rounds N] 重新设定目标与轮次。</ansiyellow>"
+        ))
+        return
+    # 用核心层的常量而不是字面量 "running"：状态机改名字时这里会立刻 ImportError，
+    # 而不是静默写进一个循环再也不认的状态值。
+    state.status = STATUS_RUNNING
+    try:
+        store.save(state)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    started, message = _goal_start_run(state)
+    if not started:
+        print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        return
+    print_formatted_text(HTML(
+        f"<ansigreen>✔ 已恢复目标（第 {state.round}/{state.max_rounds} 轮起）："
+        f"{_esc(state.goal)}</ansigreen>"
+    ))
+
+
+def _goal_handle_confirm(session_name) -> None:
+    """/goal confirm：自评达成后由用户点头，把目标收敛为 achieved。
+
+    只认 awaiting_confirm：running 时循环还在跑（提前确认会把剩余轮次吞掉），
+    achieved 重复确认是空操作，其余终态该走 resume 而不是确认。
+    """
+    from core.slash_commands.goal.state import (
+        STATUS_ACHIEVED,
+        STATUS_AWAITING_CONFIRM,
+    )
+
+    try:
+        store = _goal_store()
+        state = store.load(session_name)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    if state is None:
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话没有可确认的目标，用 /goal &lt;目标&gt; 新建一个。</ansiyellow>"
+        ))
+        return
+    if state.status != STATUS_AWAITING_CONFIRM:
+        status_text = _GOAL_STATUS_TEXT.get(state.status, state.status)
+        hint = {
+            "running": "目标还在跑，等出现「待确认」再确认达成",
+            "achieved": "目标已达成，无需重复确认；要跑新目标请用 /goal <目标>",
+        }.get(state.status, "")
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 当前状态为「{_esc(status_text)}」，无需确认。{_esc(hint)}</ansiyellow>"
+        ))
+        return
+    state.status = STATUS_ACHIEVED
+    try:
+        store.save(state)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    print_formatted_text(HTML(
+        f"<ansigreen>✔ 已确认目标达成（第 {state.round}/{state.max_rounds} 轮）："
+        f"{_esc(state.goal)}</ansigreen>"
+    ))
+
+
+def _goal_handle_start(action, session_name) -> None:
+    """/goal <目标>：新建目标状态并启动后台循环。"""
+    from core.slash_commands.goal.state import GoalState
+    from core.slash_commands.goal_command import DEFAULT_MAX_ROUNDS, GOAL_USAGE
+
+    goal = str(action.get("goal") or "").strip()
+    if not goal:
+        # 理论上命令层已拦住空目标，这里兜底：没有目标的循环只会空转烧 token
+        print_formatted_text(HTML(f"<ansired>❌ 目标不能为空。{_esc(GOAL_USAGE)}</ansired>"))
+        return
+    try:
+        max_rounds = int(action.get("max_rounds") or 0)
+    except (TypeError, ValueError):
+        max_rounds = 0
+    if max_rounds <= 0:
+        max_rounds = DEFAULT_MAX_ROUNDS
+    with _GOAL_RUNS_LOCK:
+        existing = _GOAL_RUNS.get(session_name)
+    if existing is not None and not existing.is_set():
+        print_formatted_text(HTML(
+            "<ansired>❌ 当前会话已有运行中的目标，先 /goal stop 再重新设定。</ansired>"
+        ))
+        return
+    state = GoalState(
+        session=session_name,
+        goal=goal,
+        check=str(action.get("check") or "").strip(),
+        max_rounds=max_rounds,
+    )
+    try:
+        _goal_store().save(state)
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        return
+    started, message = _goal_start_run(state)
+    if not started:
+        print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        return
+    suffix = f" · 验证命令：{_esc(state.check)}" if state.check else ""
+    print_formatted_text(HTML(
+        f"<ansigreen>✔ 已启动目标（最多 {state.max_rounds} 轮）：{_esc(state.goal)}"
+        f"{suffix}</ansigreen>"
+    ))
+    print_formatted_text(HTML(
+        "<ansigray>  进度自动播报；/goal status 查看，/goal stop 或 Ctrl+C 停止。</ansigray>"
+    ))
+
+
+def _run_goal_cli(args_text: str) -> None:
+    """/goal 的 CLI 入口：复用命令层解析，只按 action 做适配层该做的事。"""
+    from core.slash_commands.goal_command import GOAL_USAGE, handle_goal
+
+    result = handle_goal(args_text)
+    if not result.get("ok"):
+        print_formatted_text(HTML(
+            f"<ansired>❌ {_esc(result.get('msg') or '目标参数无效')}</ansired>"
+        ))
+        return
+    action = result.get("action") or {}
+    kind = str(action.get("action") or "")
+    if kind == "goal_help":
+        print_formatted_text(HTML(f"<ansicyan>🎯 {_esc(GOAL_USAGE)}</ansicyan>"))
+        print_formatted_text(HTML(
+            "<ansigray>  控制: /goal status | /goal stop | /goal resume | /goal confirm（自评达成后确认收尾）</ansigray>"
+        ))
+        print_formatted_text(HTML(
+            "<ansigray>  示例: /goal 把测试跑绿 --check pytest -q --rounds 5</ansigray>"
+        ))
+        return
+    session_name = current_session
+    if kind == "goal_status":
+        _goal_handle_status(session_name)
+    elif kind == "goal_stop":
+        _goal_handle_stop(session_name)
+    elif kind == "goal_resume":
+        _goal_handle_resume(session_name)
+    elif kind == "goal_confirm":
+        _goal_handle_confirm(session_name)
+    elif kind == "goal_start":
+        _goal_handle_start(action, session_name)
+    else:
+        # 命令表新增了动作却没在这里适配时给出明确提示，而不是静默成功
+        print_formatted_text(HTML(f"<ansired>❌ 未知目标动作: {_esc(kind)}</ansired>"))
+
+
 def handle_slash_command(command_text):
     """斜杠指令路由器"""
     global current_session, current_model, _turn_separator_needed
@@ -1730,25 +3417,37 @@ def handle_slash_command(command_text):
 
     if cmd == "/help":
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
-        print_formatted_text(HTML("🌟 <b><ansigreen>Y-code CLI 系统指令与操作指南</ansigreen></b>"))
+        print_formatted_text(HTML("🌟 <b><ansigreen>星瑶Code CLI 系统指令与操作指南</ansigreen></b>"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
         print_formatted_text(HTML("<b><ansiyellow>【1. 会话与上下文管理】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名)"))
+        print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名，A 归档，Tab 切归档区)"))
         print_formatted_text(HTML("  <ansicyan>/session &lt;会话名称&gt;</ansicyan>              : 按名称直接切换到指定会话 (不存在则创建)"))
         print_formatted_text(HTML("  <ansicyan>/session all</ansicyan>                         : 列出所有目录下的历史会话 (含归属路径与时间)"))
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
+        print_formatted_text(HTML("  <ansicyan>/session archive &lt;会话名称&gt;</ansicyan>         : 归档指定会话（从默认列表隐藏，数据保留、可恢复）"))
+        print_formatted_text(HTML("  <ansicyan>/session unarchive &lt;会话名称&gt;</ansicyan>       : 取消归档，恢复回默认会话列表"))
+        print_formatted_text(HTML("  <ansicyan>/session archived</ansicyan>                    : 列出全部已归档会话 (含归档时间与归属路径)"))
         print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
-        print_formatted_text(HTML(f"  <ansicyan>/undo [y]</ansicyan>                               : 撤销{_agent_name()}上一次修改的代码，并同步抹除模型记忆 (撤销新建文件时需追加 y 确认删除)"))
+        print_formatted_text(HTML(f"  <ansicyan>/undo [turn_id]</ansicyan>                      : 按回合撤销文件修改（整轮预检+确认；list 列表 / status 状态 / recover 恢复中断事务，默认确认 N，无 --force）"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
         print_formatted_text(HTML(f"  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（{_agent_name()}输出 mermaid 代码块时自动生成）"))
         print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
+        print_formatted_text(HTML("  <ansicyan>/git &lt;子命令&gt;</ansicyan>                          : Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log，高风险操作需 --confirm)"))
         print_formatted_text(HTML("  <ansicyan>/clear</ansicyan>                                  : 清理终端当前屏幕"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/models</ansicyan>                              : 打开全屏模型管理器 UI (切换模型、API 密钥、API 地址)"))
-        print_formatted_text(HTML("  <ansicyan>/effort &lt;low|high|max|default&gt;</ansicyan>      : 切换当前模型的推理强度档位 (按模型保存，下轮请求生效)"))
+        print_formatted_text(HTML("  <ansicyan>/effort &lt;档位&gt;</ansicyan>      : 切换当前模型思考模式 (档位随模型，无参查看可选档位；按模型保存，下轮请求生效)"))
+        print_formatted_text(HTML("  <ansicyan>/persona [name|title|text|reset]</ansicyan>   : 人设设置 (智能体名称/对你的称呼/人设文本，保存即全局生效)"))
+        print_formatted_text(HTML("  <ansicyan>/shell [id]</ansicyan>                         : 选择默认命令解释器 (AI 命令/后台任务统一使用；无参查看列表)"))
+        print_formatted_text(HTML("  <ansicyan>/open [path]</ansicyan>                          : 在系统中打开文件/目录 (无参=当前工作区)"))
+        print_formatted_text(HTML("  <ansicyan>/clear-history [y]</ansicyan>                   : 清空当前会话全部历史消息 (输入 /clear-history y 确认，不影响任务计划与长期记忆)"))
+        print_formatted_text(HTML("  <ansicyan>/queue [list|cancel 序号|clear]</ansicyan>      : 管理排队中的消息 (AI 忙碌时新消息会排队)"))
+        print_formatted_text(HTML("  <ansicyan>/paste-image [说明]</ansicyan>                  : 发送剪贴板图片给模型 (可附说明文字)"))
+        print_formatted_text(HTML("  <ansicyan>/update [check|download|cancel|install]</ansicyan> : 检查/下载/安装新版本 (安装会退出 星瑶Code)"))
+        print_formatted_text(HTML("  <ansicyan>/changes [N]</ansicyan>                          : 查看最近 N 个回合的文件变更汇总 (默认 3)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
@@ -1761,12 +3460,15 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("<b><ansiyellow>【3. 技能插件管理】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/skills</ansicyan>                              : 打开全屏技能选择器 UI (空格勾选开启/关闭)"))
         print_formatted_text(HTML("  <ansicyan>/skills list</ansicyan>                         : 在终端列出所有扫描到的技能，展示启用状态与短 ID"))
+        print_formatted_text(HTML("  <ansicyan>/skills refresh</ansicyan>                      : 重新扫描技能目录 (新装技能免重启生效)"))
         print_formatted_text(HTML("  <ansicyan>/skills enable &lt;短ID&gt;</ansicyan>             : 启用指定短 ID 对应的技能"))
         print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan>            : 禁用指定短 ID 对应的技能"))
         print_formatted_text(HTML(f"  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让{_agent_name()}为您执行任务"))
         print_formatted_text(HTML("  <ansicyan>/plugins</ansicyan>                             : 查看已安装的进程内插件 (名称/版本/来源/加载状态/提供的工具)"))
         print_formatted_text(HTML("  <ansicyan>/plugins enable|disable &lt;name&gt;</ansicyan>        : 启用/禁用指定插件 (写回 plugin.json，重启后生效)"))
         print_formatted_text(HTML("  <ansicyan>/plugins reload</ansicyan>                       : 重新扫描插件目录刷新清单 (不重启)"))
+        print_formatted_text(HTML("  <ansicyan>/hooks</ansicyan>                                : Hook 生命周期钩子管理 (查看清单/trust|deny|revoke|reset 序号 信任操作)"))
+        print_formatted_text(HTML("  <ansicyan>/hooks import</ansicyan>                         : <b>从 ZCode 配置导入 hook</b> (预览确认后写入;rollback 撤销导入)"))
         print_formatted_text(HTML("  <ansicyan>/mcp</ansicyan>                                 : MCP 服务管理 (open/status/tools/enable/disable/reconnect/edit)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
@@ -1775,7 +3477,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;任务ID&gt;</ansicyan>              : 查看任务最新 30 行日志 (子代理任务显示运行状态)"))
         print_formatted_text(HTML("  <ansicyan>/plan</ansicyan>                                : 查看当前任务计划与逐项状态"))
         print_formatted_text(HTML("  <ansicyan>/plan &lt;pause|resume|retry ID|cancel&gt;</ansicyan>       : 暂停、恢复、重试或取消计划"))
-        print_formatted_text(HTML("  <ansicyan>/computer &lt;status|pause|resume|stop&gt;</ansicyan>   : 电脑操控运行控制 (永久开关请在 GUI 系统设置页修改)"))
+        print_formatted_text(HTML("  <ansicyan>/doctor [--json]</ansicyan>                    : 聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 输出机器可读结果)"))
+        print_formatted_text(HTML("  <ansicyan>/doctor export [--full y]</ansicyan>           : 导出排障诊断包 zip (manifest/journal/doctor/日志；默认不含消息正文，--full 经脱敏+确认后追加)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【5. KAIROS 长期记忆系统】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/remember &lt;内容&gt;</ansicyan>                     : 手动追加一条规则、偏好或事实到今日的记忆日志"))
@@ -1789,8 +3492,15 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>Ctrl+N</ansicyan>                                    : 在输入框内输入新的一行换行符"))
         print_formatted_text(HTML(f"  <ansicyan>Ctrl+C</ansicyan>                                : <b>{_agent_name()}思考中时立即发送强行中断信号</b>；闲置时清空输入框"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+T</ansicyan>                                : <b>切换展开/收起底部浮窗显示当前会话的背景记忆摘要</b>"))
-        print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 Y-CODE 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
-        print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 Y-code CLI"))
+        print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 星瑶Code 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
+        print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 星瑶Code CLI"))
+        print_formatted_text(HTML(""))
+        print_formatted_text(HTML("<b><ansiyellow>【7. 目标模式 (自主迭代)】</ansiyellow></b>"))
+        print_formatted_text(HTML("  <ansicyan>/goal &lt;目标&gt; [--check &lt;命令&gt;] [--rounds &lt;N&gt;]</ansicyan> : 启动目标模式，自主迭代推进直到达成或轮次用尽 ( --check 退出码 0 视为达成，最可信；--rounds 默认 10)"))
+        print_formatted_text(HTML("  <ansicyan>/goal status</ansicyan>                          : 查看当前目标进度 (第 N/M 轮 · 状态 · 最近一轮摘要)"))
+        print_formatted_text(HTML("  <ansicyan>/goal stop</ansicyan>                            : 停止当前目标 (本轮中断，不再自动续跑；Ctrl+C 同效)"))
+        print_formatted_text(HTML("  <ansicyan>/goal resume</ansicyan>                          : 恢复已停止/受阻/中断的目标，从当前轮次继续跑"))
+        print_formatted_text(HTML("  <ansicyan>/goal help</ansicyan>                            : 查看 /goal 的参数用法 (不带参数的 /goal 也显示它)"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
 
     elif cmd in ("/models", "/model"):
@@ -1802,11 +3512,18 @@ def handle_slash_command(command_text):
             app_instance.exit()
 
     elif cmd in ("/skills", "/skill"):
-        from core.skills import scan_all_skills, get_active_skill_ids, save_active_skill_ids
+        from core.skills import scan_all_skills, get_active_skill_ids, save_active_skill_ids, skill_source_label
         
         if len(parts) > 1:
             sub = parts[1].lower()
-            if sub == "list":
+            if sub == "refresh":
+                # 显式重扫技能目录（新装技能无需重启即可被 /skills 与补全菜单看到）
+                skills = scan_all_skills()
+                active_ids = set(get_active_skill_ids())
+                active_count = sum(1 for s in skills if s["id"] in active_ids)
+                print_formatted_text(HTML(f"<ansigreen>✔ 技能目录已重新扫描：共 {len(skills)} 个技能，已启用 {active_count} 个。</ansigreen>"))
+                print_formatted_text(HTML("  输入 <ansicyan>/skills list</ansicyan> 查看清单，新增技能的 /补全 与 /短ID 调用立即生效。"))
+            elif sub == "list":
                 skills = scan_all_skills()
                 active_ids = set(get_active_skill_ids())
                 if not skills:
@@ -1817,7 +3534,8 @@ def handle_slash_command(command_text):
                         short_id = os.path.basename(os.path.dirname(s["id"]))
                         is_active = s["id"] in active_ids
                         check = "<ansigreen>[✓]</ansigreen>" if is_active else "<ansigray>[ ]</ansigray>"
-                        print_formatted_text(HTML(f"  {check} 短ID: <b><ansiyellow>{_esc(short_id)}</ansiyellow></b> | 名称: {_esc(s['name'])} - <ansigray>{_esc(s['description'])}</ansigray>"))
+                        src_label = skill_source_label(s)
+                        print_formatted_text(HTML(f"  {check} 短ID: <b><ansiyellow>{_esc(short_id)}</ansiyellow></b> | 名称: {_esc(s['name'])} - <ansigray>{_esc(s['description'])}</ansigray> <ansigray>| 来源: {_esc(src_label)}</ansigray>"))
             elif sub == "enable" and len(parts) > 2:
                 target = parts[2].lower()
                 skills = scan_all_skills()
@@ -1847,6 +3565,7 @@ def handle_slash_command(command_text):
             else:
                 print_formatted_text(HTML("<ansired>❌ 用法错误。可选指令：</ansired>"))
                 print_formatted_text(HTML("  <ansicyan>/skills list</ansicyan>             : 列出所有技能"))
+                print_formatted_text(HTML("  <ansicyan>/skills refresh</ansicyan>          : 重新扫描技能目录"))
                 print_formatted_text(HTML("  <ansicyan>/skills enable &lt;短ID&gt;</ansicyan>  : 启用指定技能"))
                 print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan> : 禁用指定技能"))
         else:
@@ -1939,32 +3658,350 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML("用法: <ansiyellow>/turns &lt;轮次&gt;</ansiyellow>"))
 
     elif cmd == "/effort":
-        # 推理强度按模型持久化；请求链路（core/llm.py）每轮新鲜读 config.json，改完下轮即生效
-        from core.model_manager import load_config, get_model_reasoning_effort, set_model_reasoning_effort
-        cfg = load_config()
-        active_id = cfg.get("active_model_id")
+        # 思考模式按模型持久化；请求链路（core/llm.py）每轮新鲜读 config.json，改完下轮即生效。
+        # 档位来自 core/reasoning_capabilities 能力表，与 GUI 思考选择器共用同一份快照；
+        # effort 强度型 / toggle 开关型模型档位不同，以无参展示的实际列表为准。
+        from core.model_manager import set_model_reasoning_choice
+        active_id, model, snapshot = None, None, None
+        snapshot_error = ""
+        try:
+            active_id, model, snapshot = _active_reasoning_snapshot()
+        except ValueError as exc:
+            # 配置里可能残留该模型已不支持的档位：只影响展示，设置路径仍可覆盖修复
+            snapshot_error = str(exc)
         if not active_id:
             print_formatted_text(HTML("<ansired>❌ 当前没有激活模型，请先用 /models 配置模型。</ansired>"))
         elif len(parts) > 1:
             level = parts[1].lower().strip("<>\"'")
-            ok, message = set_model_reasoning_effort(active_id, level)
+            ok, message = set_model_reasoning_choice(active_id, level)
             if ok:
                 print_formatted_text(HTML(f"<ansigreen>✔ {_esc(message)}（下一轮请求生效）</ansigreen>"))
-                litellm_model = ""
-                for provider in cfg.get("providers", []):
-                    for m in provider.get("models", []):
-                        if m.get("id") == active_id:
-                            litellm_model = str(m.get("litellm_model") or "")
+                litellm_model = str((model or {}).get("litellm_model") or "")
                 if litellm_model.split("/")[0].lower() == "anthropic":
-                    print_formatted_text(HTML("<ansiyellow>ℹ 当前模型走 Anthropic 路由：推理强度会按模型协议自动转换（Kimi K3 → thinking budget，阶跃 → output_config.effort）。</ansiyellow>"))
+                    print_formatted_text(HTML("<ansiyellow>ℹ 当前模型走 Anthropic 路由：思考档位会按模型协议自动转换（Kimi K3 → thinking budget，阶跃 → output_config.effort）。</ansiyellow>"))
                 if app_instance:
                     app_instance.invalidate()
             else:
                 print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        elif snapshot_error:
+            print_formatted_text(HTML(f"<ansired>❌ {_esc(snapshot_error)}</ansired>"))
+        elif model is None:
+            # 激活模型 id 残留但配置里已删该模型：按"未找到模型"提示而非笼统的
+            # "未声明思考能力"（代码审查 Minor #7）
+            print_formatted_text(HTML(f"<ansired>❌ 未在配置中找到激活模型（id: {_esc(str(active_id))}），请用 /models 重新选择。</ansired>"))
+        elif not snapshot["visible"]:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前模型未声明思考模式调节能力。</ansiyellow>"))
+        elif snapshot["disabled"]:
+            reason = snapshot.get("disabled_reason") or "该模型始终开启思考"
+            print_formatted_text(HTML(f"<ansiyellow>ℹ 当前模型始终开启思考（{_esc(reason)}），无需也无法切换档位。</ansiyellow>"))
         else:
-            current = get_model_reasoning_effort(active_id) or "default"
-            print_formatted_text(HTML(f"<b><ansicyan>当前模型推理强度: {current}</ansicyan></b> (low 最快 / max 最深思考)"))
-            print_formatted_text(HTML("用法: <ansiyellow>/effort &lt;low|high|max|default&gt;</ansiyellow>  (default = 恢复内置默认)"))
+            current = snapshot["choice"]
+            current_label = next((o["label"] for o in snapshot["options"] if o["value"] == current), current)
+            marks = "  ".join(
+                f"{'●' if o['value'] == current else '○'} {_esc(o['value'])}({_esc(o['label'])})"
+                for o in snapshot["options"]
+            )
+            print_formatted_text(HTML(f"<b><ansicyan>当前模型思考模式: {_esc(current_label)} ({_esc(current)})</ansicyan></b>"))
+            print_formatted_text(HTML(f"  可选档位: {marks}"))
+            print_formatted_text(HTML("用法: <ansiyellow>/effort &lt;档位&gt;</ansiyellow>  (default = 恢复模型默认，下一轮请求生效)"))
+
+    elif cmd == "/clear-history":
+        # 清空当前会话全部消息历史（保留会话本身；任务计划与长期记忆不受影响），
+        # 对齐 GUI 会话工具栏「清空」按钮（gui_bridge.clear_session_history 的 CLI 等价物）
+        from core.llm import session_token_usage, token_usage_lock
+        confirm = parts[1].lower() if len(parts) > 1 else ""
+        if confirm not in ("y", "yes", "--force"):
+            print_formatted_text(HTML(f"<ansiyellow>⚠️ 即将清空当前会话 <b>{_esc(current_session)}</b> 的全部历史消息，清空后无法恢复。</ansiyellow>"))
+            print_formatted_text(HTML("确认请输入: <ansicyan>/clear-history y</ansicyan>"))
+        else:
+            try:
+                deleted = manager.clear_session_messages(current_session)
+            except Exception as exc:
+                print_formatted_text(HTML(f"<ansired>❌ 清空失败：{_esc(str(exc))}</ansired>"))
+            else:
+                with token_usage_lock:
+                    session_token_usage["latest_total"] = 0
+                    session_token_usage["latest_prompt"] = 0
+                    session_token_usage["latest_cached"] = 0
+                print_formatted_text(HTML(f"<ansigreen>✔ 已清空 {deleted} 条历史记录，上下文用量已重置（下一轮请求生效）。</ansigreen>"))
+                if app_instance:
+                    app_instance.invalidate()
+
+    elif cmd == "/persona":
+        # 人设设置（对齐 GUI 人设页）：智能体名称 / 对用户的称呼 / 人设文本；
+        # save_persona_settings 校验并持久化，保存即全局生效（下一轮请求读取）
+        from core.persona_settings import DEFAULT_AGENT_NAME, get_persona_settings, save_persona_settings, PersonaSettingsError
+        try:
+            persona_snapshot = get_persona_settings()
+        except Exception:
+            persona_snapshot = {"agent_name": DEFAULT_AGENT_NAME, "persona": "", "user_title": ""}
+        if len(parts) > 1:
+            sub = parts[1].lower()
+            # 值取原始文本剩余部分（保留大小写/空格/换行），避免 split 丢格式
+            value_match = re.match(r"^/persona\s+\S+\s?(.*)$", command_text, re.S)
+            value = (value_match.group(1) if value_match else "").strip()
+            try:
+                if sub == "name":
+                    if not value:
+                        print_formatted_text(HTML("<ansired>❌ 用法: /persona name &lt;新名称&gt;</ansired>"))
+                    else:
+                        save_persona_settings(value, persona_snapshot.get("persona", ""), persona_snapshot.get("user_title", ""))
+                        print_formatted_text(HTML(f"<ansigreen>✔ 智能体名称已改为 {_esc(value)}（下一轮请求生效）。</ansigreen>"))
+                elif sub == "title":
+                    if not value:
+                        print_formatted_text(HTML("<ansired>❌ 用法: /persona title &lt;对你的称呼&gt; （/persona title - 表示清除称呼）</ansired>"))
+                    else:
+                        new_title = "" if value == "-" else value
+                        save_persona_settings(persona_snapshot.get("agent_name", DEFAULT_AGENT_NAME), persona_snapshot.get("persona", ""), new_title)
+                        print_formatted_text(HTML("<ansigreen>✔ 称呼已更新（下一轮请求生效）。</ansigreen>"))
+                elif sub == "text":
+                    if not value:
+                        print_formatted_text(HTML("<ansired>❌ 用法: /persona text &lt;人设全文&gt;</ansired>"))
+                    else:
+                        save_persona_settings(persona_snapshot.get("agent_name", DEFAULT_AGENT_NAME), value, persona_snapshot.get("user_title", ""))
+                        print_formatted_text(HTML(f"<ansigreen>✔ 人设文本已保存（共 {len(value)} 字，下一轮请求生效，取代内置人设但保留安全规范）。</ansigreen>"))
+                elif sub == "reset":
+                    save_persona_settings(DEFAULT_AGENT_NAME, "", "")
+                    print_formatted_text(HTML("<ansigreen>✔ 人设已恢复默认。</ansigreen>"))
+                else:
+                    print_formatted_text(HTML("<ansired>❌ 未知子命令。用法: /persona [name|title|text|reset] [值]</ansired>"))
+            except PersonaSettingsError as exc:
+                print_formatted_text(HTML(f"<ansired>❌ {_esc(str(exc))}</ansired>"))
+        else:
+            persona_text = str(persona_snapshot.get("persona") or "")
+            if len(persona_text) > 400:
+                persona_display = persona_text[:200] + "\n    ……（中间省略）……\n    " + persona_text[-200:]
+            else:
+                persona_display = persona_text or "（未设置，使用内置人设）"
+            print_formatted_text(HTML("<b><ansicyan>当前人设设置：</ansicyan></b>"))
+            print_formatted_text(HTML(f"  智能体名称: {_esc(persona_snapshot.get('agent_name') or DEFAULT_AGENT_NAME)}"))
+            print_formatted_text(HTML(f"  对你的称呼: {_esc(persona_snapshot.get('user_title') or '（不使用特定称呼）')}"))
+            print_formatted_text(HTML(f"  人设文本（{len(persona_text)} 字）:\n    {_esc(persona_display)}"))
+            print_formatted_text(HTML("用法: <ansicyan>/persona name|title|text|reset</ansicyan>  例: /persona text &lt;人设全文&gt;"))
+
+    elif cmd == "/shell":
+        # 默认命令解释器选择（对齐 GUI 系统设置页），AI 命令/后台任务/内嵌终端统一生效
+        from core.command_shell import CommandShellError, list_command_shell_options, set_selected_command_shell
+        options = list_command_shell_options()
+        if len(parts) > 1:
+            shell_id = parts[1].strip()
+            matched = next((o for o in options if o["id"] == shell_id), None)
+            if matched is None:
+                allowed = _esc("/".join(o["id"] for o in options))
+                print_formatted_text(HTML(f"<ansired>❌ 不支持的命令解释器: {_esc(shell_id)}（可选 {allowed}）</ansired>"))
+            elif not matched["available"]:
+                print_formatted_text(HTML(f"<ansired>❌ {_esc(matched['label'])} 未安装或不在 星瑶Code 的 PATH 中，无法选择。</ansired>"))
+            else:
+                try:
+                    set_selected_command_shell(shell_id)
+                except CommandShellError as exc:
+                    print_formatted_text(HTML(f"<ansired>❌ {_esc(str(exc))}</ansired>"))
+                else:
+                    print_formatted_text(HTML(f"<ansigreen>✔ 默认命令解释器已切换为 {_esc(matched['label'])}（{_esc(matched['id'])}），下一轮请求生效。</ansigreen>"))
+        else:
+            from core.command_shell import describe_selected_command_shell, get_selected_command_shell
+            current_shell_id = get_selected_command_shell()
+            print_formatted_text(HTML("<b><ansicyan>可选命令解释器：</ansicyan></b>"))
+            for o in options:
+                mark = "●" if o["available"] else "○"
+                current_mark = "<ansigreen>（当前）</ansigreen>" if o["id"] == current_shell_id else ""
+                reason = f" <ansigray>[{_esc(o['unavailable_reason'])}]</ansigray>" if not o["available"] else ""
+                print_formatted_text(HTML(f"  {mark} {_esc(o['id']):<12} {_esc(o['label'])} <ansigray>- {_esc(o['description'])}</ansigray>{reason} {current_mark}"))
+            print_formatted_text(HTML("用法: <ansicyan>/shell &lt;id&gt;</ansicyan>"))
+
+    elif cmd == "/open":
+        # 在系统中打开文件/目录（对齐 GUI open_path / open_folder_in_explorer）
+        raw = " ".join(parts[1:]).strip().strip('"').strip("'") if len(parts) > 1 else "."
+        from core.workspace_context import get_workdir
+        base_dir = get_workdir() or os.getcwd()
+        target_path = raw if os.path.isabs(raw) else os.path.join(base_dir, raw)
+        target_path = os.path.abspath(target_path)
+        if not os.path.exists(target_path):
+            print_formatted_text(HTML(f"<ansired>❌ 路径不存在: {_esc(target_path)}</ansired>"))
+        elif not hasattr(os, "startfile"):
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前平台不支持在系统中打开（仅支持 Windows）。</ansiyellow>"))
+        else:
+            try:
+                os.startfile(target_path)  # noqa: S606 - 用户显式请求打开本地路径
+            except OSError as exc:
+                print_formatted_text(HTML(f"<ansired>❌ 打开失败：{_esc(str(exc))}</ansired>"))
+
+    elif cmd == "/queue":
+        # 排队消息管理（对齐 GUI 排队条的 list/cancel/clear；插队依赖完整取消链路，
+        # 按实施计划列为后续）。queue.Queue 不可遍历：UI 线程内 get_nowait 全量取出
+        # → 处理 → 按原序回填。put 方有两个（代码审查 Important #3 修正）：
+        # Enter 处理器的用户消息 + _deferred_summary_check 守护线程的
+        # __ycode_internal__ 自动汇总指令（is_internal: True）——后者不参与序号
+        # 编排与 cancel/clear，回填时原位保留，避免后台任务汇总被静默丢弃。
+        queued = []
+        while True:
+            try:
+                queued.append(msg_queue.get_nowait())
+            except queue.Empty:
+                break
+        user_queued = [item for item in queued if not item.get("is_internal")]
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        if sub == "list":
+            for item in queued:
+                msg_queue.put(item)
+            if not user_queued:
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有排队中的消息。</ansiyellow>"))
+            else:
+                print_formatted_text(HTML(f"<b><ansicyan>排队中的消息（{len(user_queued)} 条）：</ansicyan></b>"))
+                for idx, item in enumerate(user_queued, 1):
+                    preview = str(item.get("text", "")).replace("\n", " ")[:60]
+                    kind = "技能" if item.get("is_skill_call") else "消息"
+                    session_mark = str(item.get("session") or "?")
+                    print_formatted_text(HTML(f"  {idx}. [{kind} → {_esc(session_mark)}] {_esc(preview)}"))
+        elif sub == "cancel" and len(parts) > 2:
+            try:
+                target_idx = int(parts[2])
+            except ValueError:
+                target_idx = 0
+            if not user_queued:
+                for item in queued:
+                    msg_queue.put(item)
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有排队中的消息。</ansiyellow>"))
+            elif 1 <= target_idx <= len(user_queued):
+                kept = []
+                user_seen = 0
+                removed = None
+                for item in queued:
+                    if not item.get("is_internal"):
+                        user_seen += 1
+                        if user_seen == target_idx:
+                            removed = item
+                            continue
+                    kept.append(item)
+                for item in kept:
+                    msg_queue.put(item)
+                preview = str(removed.get("text", "")).replace("\n", " ")[:60]
+                print_formatted_text(HTML(f"<ansigreen>✔ 已取消排队消息 {target_idx}：{_esc(preview)}</ansigreen>"))
+            else:
+                for item in queued:
+                    msg_queue.put(item)
+                print_formatted_text(HTML(f"<ansired>❌ 序号超出范围（当前共 {len(user_queued)} 条），用 /queue list 查看。</ansired>"))
+        elif sub == "clear":
+            # 只清用户消息；内部汇总指令原位保留（丢弃会让后台任务汇总无声丢失）
+            for item in queued:
+                if item.get("is_internal"):
+                    msg_queue.put(item)
+            note = f"（另有 {len(queued) - len(user_queued)} 条系统内部消息已保留）" if len(queued) > len(user_queued) else ""
+            print_formatted_text(HTML(f"<ansigreen>✔ 已清空 {len(user_queued)} 条排队消息。{note}</ansigreen>"))
+        else:
+            for item in queued:
+                msg_queue.put(item)
+            print_formatted_text(HTML("<ansired>❌ 用法: /queue [list|cancel &lt;序号&gt;|clear]</ansired>"))
+
+    elif cmd == "/paste-image":
+        # 剪贴板图片发送（对齐 GUI 粘贴图片）：抓取剪贴板 → 图片存临时 png（或
+        # 直接取文件路径列表）→ 经队列条目 explicit_paths 字段挂载，worker 侧走
+        # parse_user_input 的显式附件通道（压缩/视觉管线不变）。
+        # 不再把路径嵌进消息文本：input_parser 的文本路径提取不认含空格路径，
+        # 用户名带空格的机器上会静默丢图（审查 Important #4）。
+        # 临时文件不主动清理，交由系统临时目录自管（已知取舍，见实施计划第 8 节）。
+        note = command_text[len("/paste-image"):].strip() or "（剪贴板图片）"
+        explicit_paths = []
+        try:
+            from PIL import ImageGrab
+        except Exception:
+            print_formatted_text(HTML("<ansired>❌ 剪贴板图片需要 Pillow 支持，请检查依赖安装。</ansired>"))
+        else:
+            try:
+                grabbed = ImageGrab.grabclipboard()
+            except Exception as exc:
+                print_formatted_text(HTML(f"<ansired>❌ 读取剪贴板失败：{_esc(str(exc))}</ansired>"))
+            else:
+                import tempfile
+                if isinstance(grabbed, list) and grabbed:
+                    # 剪贴板里是文件路径列表（复制文件场景）：直接作为附件路径
+                    explicit_paths = [str(p) for p in grabbed if str(p).strip()]
+                elif grabbed is not None:
+                    try:
+                        fd, tmp_path = tempfile.mkstemp(prefix="ycode_clip_", suffix=".png")
+                        os.close(fd)
+                        grabbed.save(tmp_path, "PNG")
+                    except Exception as exc:
+                        print_formatted_text(HTML(f"<ansired>❌ 剪贴板图片保存失败：{_esc(str(exc))}</ansired>"))
+                    else:
+                        explicit_paths = [tmp_path]
+                else:
+                    print_formatted_text(HTML("<ansiyellow>ℹ 剪贴板中没有图片。</ansiyellow>"))
+        if explicit_paths:
+            was_queued = is_thinking
+            safe_note = _esc(note)
+            if was_queued:
+                _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) [剪贴板图片] {safe_note}</ansigray>")
+            else:
+                _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> [剪贴板图片] {safe_note}")
+            msg_queue.put({
+                "text": note,
+                "was_queued": was_queued,
+                "session": current_session,
+                "explicit_paths": explicit_paths,
+            })
+
+    elif cmd == "/update":
+        # 更新检查与安装（core/updater 此前仅 GUI 接入）；
+        # 下载回调经 _print_threadsafe 调度回主线程，遵守线程纪律
+        sub = parts[1].lower() if len(parts) > 1 else "check"
+        if sub == "check":
+            _update_cmd_check()
+        elif sub == "download":
+            _update_cmd_download()
+        elif sub == "cancel":
+            _get_update_downloader().cancel()
+            print_formatted_text(HTML("<ansigreen>✔ 已请求取消下载。</ansigreen>"))
+        elif sub == "install":
+            rest_match = re.match(r"^/update\s+install\s+(.*)$", command_text, re.S)
+            rest = rest_match.group(1).strip() if rest_match else ""
+            _update_cmd_install(rest.split())
+        else:
+            print_formatted_text(HTML("<ansired>❌ 用法: /update [check|download|cancel|install [路径] [y]]</ansired>"))
+
+    elif cmd == "/changes":
+        # 会话文件变更历史回看（数据源：turn_undo 检查点，只读消费）。
+        # 与每轮结束后的自动摘要互补：/changes 面向任意时刻的跨回合回看。
+        try:
+            limit_n = int(parts[1]) if len(parts) > 1 else 3
+        except ValueError:
+            limit_n = 3
+        limit_n = max(1, min(limit_n, 50))
+        tu = _undo_service()
+        session_id = _undo_session_id(current_session)
+        try:
+            states = tu.list_turn_undo_states(session_id, limit=50)
+        except Exception as exc:
+            print_formatted_text(HTML(f"<ansired>❌ 读取变更记录失败：{_esc(str(exc))}</ansired>"))
+            return
+        with_changes = [s for s in states if (s.get("file_count") or 0) > 0]
+        if not with_changes:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前会话还没有文件修改记录。</ansiyellow>"))
+            return
+        print_formatted_text(HTML(f"<b><ansicyan>最近文件变更（{min(limit_n, len(with_changes))} 个回合）：</ansicyan></b>"))
+        for s in with_changes[:limit_n]:
+            print_formatted_text(HTML(
+                f"  回合 <b>{_esc(_undo_short_id(s['turn_id']))}</b> · {_esc(_undo_status_label(s))}"
+                f" · {s.get('file_count') or 0} 文件"
+                f" <ansigreen>+{s.get('net_added') or 0}</ansigreen>"
+                f" <ansired>-{s.get('net_removed') or 0}</ansired>"
+            ))
+            try:
+                detail = tu.get_turn_undo_status(session_id, s["turn_id"])
+            except Exception:
+                detail = None
+            files = (detail or {}).get("files") or []
+            for f in files[:8]:
+                print_formatted_text(HTML(
+                    f"      {_esc(str(f.get('display_path') or ''))}"
+                    f"  <ansigreen>+{f.get('net_added') or 0}</ansigreen>"
+                    f" <ansired>-{f.get('net_removed') or 0}</ansired>"
+                ))
+            if len(files) > 8:
+                print_formatted_text(HTML(
+                    f"      <ansigray>还有 {len(files) - 8} 个文件（/undo status {_esc(_undo_short_id(s['turn_id']))} 查看全部）</ansigray>"
+                ))
+        print_formatted_text(HTML("<ansigray>  回滚某轮：/undo &lt;短ID&gt; 或 /checkpoint restore &lt;turn_id&gt;</ansigray>"))
 
     elif cmd == "/sandbox":
         # 沙盒开关：控制文件工具是否可访问当前工作目录之外的路径
@@ -2152,9 +4189,50 @@ def handle_slash_command(command_text):
                         print_formatted_text(HTML("<ansired>❌ 会话重命名失败。</ansired>"))
                 else:
                     print_formatted_text(HTML("<ansired>❌ 用法错误。请输入：/session rename &lt;新名称&gt;</ansired>"))
+            elif sub == "archive" and len(parts) > 2:
+                # 归档会话：从默认列表隐藏，数据零损失、可逆（提示风格对齐 /session delete）
+                target = parts[2].strip("<>")
+                safe_target = _esc(target)
+                if target == current_session:
+                    print_formatted_text(HTML("<ansired>❌ 不能归档当前活跃会话，请先切换到其它会话。</ansired>"))
+                    return
+                if not manager.archive_session(target):
+                    print_formatted_text(HTML(f"<ansired>❌ 会话 {safe_target} 不存在，未执行归档。</ansired>"))
+                    return
+                print_formatted_text(HTML(
+                    f"<ansigreen>✔ 会话 {safe_target} 已归档（数据保留，可用 /session unarchive {safe_target} 恢复）。</ansigreen>"
+                ))
+            elif sub == "unarchive" and len(parts) > 2:
+                # 取消归档：把会话恢复回默认列表（幂等，未归档会话调用同样安全）
+                target = parts[2].strip("<>")
+                safe_target = _esc(target)
+                if not manager.unarchive_session(target):
+                    print_formatted_text(HTML(f"<ansired>❌ 会话 {safe_target} 不存在，未执行取消归档。</ansired>"))
+                    return
+                print_formatted_text(HTML(f"<ansigreen>✔ 会话 {safe_target} 已取消归档，已恢复回会话列表。</ansigreen>"))
+            elif sub in ("archive", "unarchive"):
+                print_formatted_text(HTML(f"<ansired>❌ 用法错误。请输入：/session {sub} &lt;会话名称&gt;</ansired>"))
+            elif sub == "archived":
+                # 列出全部已归档会话（含归档时间、消息数、归属目录），格式对齐 /session all
+                archived_sessions = manager.get_all_sessions(archived_only=True)
+                if not archived_sessions:
+                    print_formatted_text(HTML("<ansiyellow>(没有任何已归档会话)</ansiyellow>"))
+                else:
+                    print_formatted_text(HTML("<b><ansicyan>已归档会话（按归档时间排序）：</ansicyan></b>"))
+                    for s in archived_sessions:
+                        time_str = (s.get("updated_at") or "-")[:16]
+                        archived_at = (s.get("archived_at") or "-")[:16]
+                        workdir = s.get("workdir") or "(历史遗留/全局)"
+                        print_formatted_text(HTML(
+                            f"  - <b>{_esc(s['name'])}</b>  [{_esc(time_str)}]  ({s['count']} 条消息)  <ansigray>{_esc(workdir)}</ansigray>  <ansigray>归档于 {_esc(archived_at)}</ansigray>"
+                        ))
             else:
                 # 向后兼容：默认会话切换 /session <会话名>
                 target = parts[1].strip("<>")
+                # 不变量：切换到归档会话时自动取消归档，避免「会话处于归档态却正在被使用」
+                if target in {s["name"] for s in manager.get_all_sessions(archived_only=True)}:
+                    manager.unarchive_session(target)
+                    print_formatted_text(HTML(f"<ansiyellow>✔ 会话 {_esc(target)} 已自动取消归档。</ansiyellow>"))
                 # 确保目标会话在数据库中已存在，避免后续 get_history/计划绑定/压缩
                 # 基于一个不存在的 session_name 工作，导致状态失配。
                 manager.create_session_explicit(target)
@@ -2171,7 +4249,9 @@ def handle_slash_command(command_text):
                 app_instance.exit()
 
     elif cmd in ("/tasks", "/task"):
-        from core.task_manager import list_active_tasks, get_task_output, kill_background_task
+        from core.task_manager import (
+            list_active_tasks, get_task_output, kill_background_task, turn_short_code,
+        )
         from core.tools import subagent_manager
 
         if len(parts) > 1:
@@ -2207,8 +4287,9 @@ def handle_slash_command(command_text):
                 if shell_log_available:
                     print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
                     # Low 修复：任务日志可能携带 ANSI 控制序列，直接 print 会注入终端样式；
-                    # 与 history_renderer 一致，剥离 ESC 字符后再输出。
-                    print(output.replace("\x1b", ""))
+                    # get_task_output 已整段剥离，这里兜底再过一次共享清洗函数
+                    from core.process_io import strip_ansi_escapes
+                    print(strip_ansi_escapes(output))
                 else:
                     # 再查子代理任务状态
                     sub_tasks = subagent_manager.snapshot()
@@ -2220,6 +4301,9 @@ def handle_slash_command(command_text):
                                        "cancelled": "ansigray", "timed_out": "ansired"}.get(t.status, "ansiyellow")
                         print_formatted_text(HTML(f"  状态: <{status_color}>{t.status}</{status_color}> | 类型: {t.subagent_type} | 阶段: {t.stage}"))
                         print_formatted_text(HTML(f"  执行: {round(t.execution_elapsed, 1)}s | 等待审批: {round(t.approval_wait_elapsed, 1)}s"))
+                        detail_turn_code = turn_short_code(t.parent_turn_id)
+                        if detail_turn_code:
+                            print_formatted_text(HTML(f"  回合: <ansigray>[turn:{detail_turn_code}]</ansigray>"))
                         desc_safe = (t.description or "")[:80].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                         print_formatted_text(HTML(f"  描述: {desc_safe}"))
                         if t.result:
@@ -2253,7 +4337,11 @@ def handle_slash_command(command_text):
                     print_formatted_text(HTML("<ansicyan><b>当前运行的后台进程（shell）：</b></ansicyan>"))
                     for t in shell_tasks:
                         safe_cmd = t['command'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                        print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']} | 命令: {safe_cmd}"))
+                        turn_code = turn_short_code(t.get('turn_id'))
+                        turn_suffix = (
+                            f" | 回合: <ansigray>[turn:{turn_code}]</ansigray>" if turn_code else ""
+                        )
+                        print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']}{turn_suffix} | 命令: {safe_cmd}"))
                 if bg_sub_snapshots:
                     if shell_tasks:
                         print_formatted_text(HTML(""))
@@ -2263,10 +4351,14 @@ def handle_slash_command(command_text):
                                        "cancelled": "ansigray", "timed_out": "ansired",
                                        "in_progress": "ansiyellow", "running": "ansiyellow"}.get(t.status, "ansigray")
                         desc_safe = (t.description or "")[:50].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        sub_turn_code = turn_short_code(t.parent_turn_id)
+                        sub_turn_suffix = (
+                            f" | 回合: <ansigray>[turn:{sub_turn_code}]</ansigray>" if sub_turn_code else ""
+                        )
                         print_formatted_text(HTML(
                             f"  <ansigreen>• ID: {t.task_id}</ansigreen> | 状态: <{status_color}>{t.status}</{status_color}> "
                             f"| 类型: <ansicyan>{t.subagent_type}</ansicyan> | 阶段: {t.stage} "
-                            f"| 执行: {round(t.execution_elapsed, 1)}s | 描述: {desc_safe}"
+                            f"| 执行: {round(t.execution_elapsed, 1)}s{sub_turn_suffix} | 描述: {desc_safe}"
                         ))
                 print_formatted_text(HTML("<ansigray>提示：你可以输入 `/tasks tail &lt;ID&gt;` 查看日志/状态，或 `/tasks kill &lt;ID&gt;` 终结任务。</ansigray>"))
 
@@ -2306,150 +4398,28 @@ def handle_slash_command(command_text):
             else:
                 print_formatted_text(HTML("<ansired>❌ 用法：/plan、/plan pause、/plan resume、/plan retry &lt;id&gt;、/plan cancel</ansired>"))
 
-    elif cmd == "/computer":
-        # 电脑操控运行控制（设计 17.1）：CLI 只 status/pause/resume/stop，
-        # 永久开关只能在 GUI 系统设置页修改（与 GUI 共用同一 controller 单例）
-        from core.computer.cli import handle_computer_command
-        from core.computer.controller import get_computer_control_service
-
-        result = handle_computer_command(command_text, get_computer_control_service())
-        color = "ansicyan" if result.ok else "ansiyellow"
-        print_formatted_text(HTML(f"<{color}>{_esc(result.text)}</{color}>"))
+    elif cmd == "/resume":
+        # 断点续跑（规格 §4.1 CLI 入口）：开关关闭只提示；否则打印断点 + 一次性确认。
+        try:
+            _handle_resume_command(current_session)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
 
     elif cmd == "/undo":
-        # 撤销的实际逻辑在 core/agent_service.undo_last_edit（与 GUI 共用），
-        # 这里只负责"删除新建文件"的二次确认与终端提示。
-        from core.memory import get_undo_state
-
-        state = get_undo_state(current_session)
-        file_path = state.get("file_path")
-        old_content = state.get("old_content")
-        # 删除新建文件是高危操作：要求显式确认，避免跨会话/误操作导致用户数据丢失
-        existed_before = state.get("existed_before")
-        if existed_before is None:
-            # 兼容旧版本只保存 old_content 的撤销记录。
-            existed_before = old_content != ""
-        will_delete = bool(file_path) and not bool(existed_before)
-        confirm = command_text.strip().split()
-        forced = len(confirm) >= 2 and confirm[1].lower() in ("y", "yes", "--force")
-        if will_delete and not forced:
-            print_formatted_text(
-                HTML(f"<ansiyellow>⚠️ 该操作将删除{_agent_name()}新建的文件 {_esc(file_path)}，"
-                     f"请在命令后追加 y/yes/--force 确认，例如：/undo y</ansiyellow>")
-            )
-            return
-
-        ok, message = _agent_service.undo_last_edit(manager, current_session, force=forced)
-        if ok:
-            print_formatted_text(HTML(f"<ansigreen>↩️ {_esc(message)}</ansigreen>"))
-            recalc_token_usage()  # 撤销后重新计算 token
-            print_formatted_text(HTML(f"<ansigreen>🧠 已同步抹除{_agent_name()}对刚才操作的记忆，防止幻觉复发。</ansigreen>"))
-        else:
-            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(message)}</ansired>"))
+        # 按回合撤销（规格 17）：/undo、/undo <turn_id>、list、preview、status、recover。
+        # 预检 + 一次性令牌 + 多文件事务；默认确认 N，无 --force。
+        try:
+            handle_undo_command(command_text, current_session)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
 
     elif cmd == "/checkpoint" or cmd.startswith("/checkpoint "):
-        # 会话级检查点管理：list 查看、restore <turn_id> 回滚整轮所有文件修改
-        # 设计参考 Grok Build 的 workspace 级 checkpoint
-        from core.memory import list_checkpoints, restore_checkpoint
-        parts = command_text.strip().split(maxsplit=3)
-        sub = parts[1] if len(parts) > 1 else "list"
-
-        if sub == "list":
-            checkpoints = list_checkpoints(current_session)
-            if not checkpoints:
-                print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有检查点记录。</ansiyellow>"))
-                print_formatted_text(HTML("<ansigray>  每轮对话开始前会自动打一个检查点，记录本轮所有文件修改的旧内容。</ansigray>"))
-                print_formatted_text(HTML("<ansigray>  使用 /checkpoint restore &lt;turn_id&gt; 可整体回滚到该检查点。</ansigray>"))
-            else:
-                print_formatted_text(HTML(f"<ansicyan>📋 当前会话共有 {len(checkpoints)} 个检查点:</ansicyan>"))
-                for cp in checkpoints:
-                    desc = cp.get("description", "") or "(无描述)"
-                    if len(desc) > 50:
-                        desc = desc[:47] + "..."
-                    n_files = len(cp.get("file_snapshots", []))
-                    print_formatted_text(HTML(
-                        f"  <ansigreen>{_esc(cp['turn_id'])}</ansigreen> "
-                        f"<ansigray>{_esc(cp['created_at'])}</ansigray> "
-                        f"文件修改: {n_files}  "
-                        f"<ansigray>{_esc(desc)}</ansigray>"
-                    ))
-                print_formatted_text(HTML("<ansigray>\n  使用 /checkpoint restore &lt;turn_id&gt; 整体回滚该轮所有文件修改</ansigray>"))
-
-        elif sub == "restore":
-            if len(parts) < 3:
-                print_formatted_text(HTML("<ansired>⚠️ 用法: /checkpoint restore &lt;turn_id&gt;</ansired>"))
-            else:
-                target_turn_id = parts[2].strip()
-                snapshots = restore_checkpoint(current_session, target_turn_id)
-                if snapshots is None:
-                    print_formatted_text(HTML(f"<ansired>⚠️ 未找到检查点: {_esc(target_turn_id)}</ansired>"))
-                    print_formatted_text(HTML("<ansigray>  使用 /checkpoint list 查看所有可用的检查点 ID</ansigray>"))
-                elif not snapshots:
-                    print_formatted_text(HTML(f"<ansiyellow>ℹ 检查点 {_esc(target_turn_id)} 没有文件修改记录（该轮没有写/编辑操作）。</ansiyellow>"))
-                else:
-                    # 旧记录用 old_content == "" 表示新建文件；新记录显式保存
-                    # existed_before，避免把原本存在的空文件误判为新建文件。
-                    # 若用户之后重建/修改了同名文件，静默删除会造成数据丢失——
-                    # 与 /undo 的删除确认保持一致，要求显式追加 y/yes/--force。
-                    confirm_flag = parts[3].strip().lower() if len(parts) > 3 else ""
-                    forced = confirm_flag in ("y", "yes", "--force")
-                    pending_deletes = [
-                        s for s in snapshots
-                        if not bool(
-                            s.get("existed_before")
-                            if s.get("existed_before") is not None
-                            else s.get("old_content") != ""
-                        )
-                        and os.path.exists(s.get("file_path") or "")
-                    ]
-                    if pending_deletes and not forced:
-                        print_formatted_text(HTML(
-                            f"<ansiyellow>⚠️ 回滚将删除 {len(pending_deletes)} 个检查点后新建的文件；"
-                            f"若这些文件之后被你重建或修改过，内容将一并丢失。"
-                            f"确认请追加 y/yes/--force，例如：/checkpoint restore {_esc(target_turn_id)} --force</ansiyellow>"
-                        ))
-                        for s in pending_deletes:
-                            print_formatted_text(HTML(f"  <ansigray>将删除: {_esc(s.get('file_path', '?'))}</ansigray>"))
-                        return
-                    print_formatted_text(HTML(f"<ansicyan>🔄 正在回滚检查点 {_esc(target_turn_id)}，共 {len(snapshots)} 个文件...</ansicyan>"))
-                    from core.agent_service import _restore_file_bytes
-                    from core.tools import sandbox_bypass
-                    success = 0
-                    failed = 0
-                    for snap in snapshots:
-                        try:
-                            file_path = snap["file_path"]
-                            old_content = snap["old_content"]
-                            existed_before = snap.get("existed_before")
-                            if existed_before is None:
-                                existed_before = old_content != ""
-                            if not existed_before:
-                                # 原本不存在该文件，删除
-                                if os.path.exists(file_path):
-                                    os.remove(file_path)
-                                print_formatted_text(HTML(f"  <ansigreen>✔ 删除新建文件: {_esc(file_path)}</ansigreen>"))
-                            else:
-                                # 回滚是用户显式发起的恢复操作：沙盒外路径也直接放行，
-                                # 避免之前单次批准写出的沙盒外文件无法回滚。新记录
-                                # 优先写回原始字节；旧记录按 UTF-8 文本兼容恢复。
-                                old_bytes = snap.get("old_bytes")
-                                if not isinstance(old_bytes, bytes):
-                                    old_bytes = str(old_content).encode("utf-8")
-                                with sandbox_bypass():
-                                    _restore_file_bytes(file_path, old_bytes)
-                                print_formatted_text(HTML(f"  <ansigreen>✔ 恢复文件: {_esc(file_path)}</ansigreen>"))
-                            success += 1
-                        except Exception as e:
-                            print_formatted_text(HTML(f"  <ansired>✗ 恢复失败 {_esc(snap.get('file_path', '?'))}: {_esc(e)}</ansired>"))
-                            failed += 1
-                    print_formatted_text(HTML(
-                        f"<ansigreen>✅ 检查点回滚完成：成功 {success} 个，失败 {failed} 个。</ansigreen>"
-                    ))
-                    if success > 0:
-                        recalc_token_usage()
-
-        else:
-            print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /checkpoint [list|restore &lt;turn_id&gt;]</ansired>"))
+        # 会话级检查点管理：list 查看、restore <turn_id> 整轮回滚。
+        # 恢复动作已迁移为 TurnUndoService 兼容入口（预检 + 令牌 + 多文件事务）
+        try:
+            handle_checkpoint_command(command_text, current_session)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
 
     elif cmd == "/share" or cmd.startswith("/share "):
         # 会话导出（参考 OpenCode 的 share 模块）
@@ -2499,6 +4469,12 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML(f"<ansigray>{_esc(prune_worktrees())}</ansigray>"))
         else:
             print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /worktree [list|create|remove|prune]</ansired>"))
+
+    elif cmd == "/git" or cmd.startswith("/git "):
+        # Git 工作台（规格 §12）：严格子命令解析 → GitApplicationService，
+        # 高风险操作两步确认（--confirm），绝不透传任意参数
+        from core.git_cli import handle_git_command
+        handle_git_command(command_text)
 
     elif cmd == "/mcp" or cmd.startswith("/mcp "):
         # MCP 服务管理：默认打开全屏 CLI 配置器，也支持子命令
@@ -2748,6 +4724,260 @@ def handle_slash_command(command_text):
                 "<ansired>⚠️ 未知子命令。用法: /plugins [enable &lt;name&gt;|disable &lt;name&gt;|reload]</ansired>"
             ))
 
+    elif cmd == "/hooks" or command_text.strip().startswith("/hooks "):
+        # Hook 生命周期钩子管理（规格 01 §8.4）：hook 执行不区分端；CLI 提供
+        # 只读清单与信任操作（写 ~/.ycode/hook_trust.json，与 GUI 共用同一存储）。
+        # 用法: /hooks                  -> 列出全部 hook（编号/事件/来源/状态/命令）
+        #       /hooks trust <序号>     -> 信任（pending/stale → trusted）
+        #       /hooks deny <序号>      -> 拒绝（pending → blocked，不再询问）
+        #       /hooks revoke <序号>    -> 撤销信任（trusted → revoked）
+        #       /hooks reset <序号>     -> 重置为待确认（blocked/revoked → pending）
+        from core.workspace_context import get_workdir
+        from core.hooks.trust import apply_hook_trust_action, list_hooks_with_status
+
+        sub_parts = command_text.strip().split()
+        sub = sub_parts[1].strip().lower() if len(sub_parts) > 1 else ""
+        workspace_root = str(get_workdir() or os.getcwd())
+
+        entries = []
+        try:
+            entries = list_hooks_with_status(workspace_root=workspace_root)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ 读取 Hook 配置失败: {_esc(str(e))}</ansired>"))
+
+        if sub == "import":
+            # ZCode hooks 导入（待开发/ZCode钩子与工作流导入/设计规格.md §2.1）：
+            # 扫描 → 预览（导入/跳过逐条点名，绝不静默丢条目）→ 确认 → 写入。
+            from core.hooks.zcode_import import apply_plan, plan_import
+
+            try:
+                plan = plan_import(workspace_root=workspace_root)
+            except Exception as e:
+                print_formatted_text(HTML(f"<ansired>⚠️ 扫描 ZCode 配置失败: {_esc(str(e))}</ansired>"))
+            else:
+                files = plan.get("files", [])
+                if not files:
+                    print_formatted_text(HTML(
+                        "<ansiyellow>ℹ 未发现任何 ZCode hooks 配置（扫描 ~/.zcode/cli/config.json、"
+                        "&lt;项目&gt;/.zcode/config.json、zcode.json、.zcode/settings.json）。</ansiyellow>"
+                    ))
+                else:
+                    total_entries = 0
+                    for file_report in files:
+                        label = file_report.get("label")
+                        path = file_report.get("path")
+                        if file_report.get("status") != "imported":
+                            print_formatted_text(HTML(
+                                f"  <ansigray>[跳过] {label}: {file_report.get('reason')}（{_esc(str(path))}）</ansigray>"
+                            ))
+                            continue
+                        for entry in file_report.get("entries", []):
+                            total_entries += 1
+                            print_formatted_text(HTML(
+                                f"  <ansigreen>[导入]</ansigreen> <b><ansicyan>{_esc(entry['event'])}</b></ansicyan>"
+                                f" matcher={_esc(entry['matcher'])} timeout={entry['timeout_ms']}ms"
+                                f" <ansigray>{_esc(entry['command'][:70])}</ansigray>"
+                            ))
+                        for item in file_report.get("skipped", []):
+                            print_formatted_text(HTML(
+                                f"  <ansiyellow>[跳过]</ansiyellow> {_esc(item.get('event', '?'))}"
+                                f" <ansigray>{_esc(item.get('reason', ''))}</ansigray>"
+                            ))
+                    if total_entries == 0:
+                        print_formatted_text(HTML("<ansiyellow>ℹ 没有可导入的条目（全部被跳过，原因见上）。</ansiyellow>"))
+                    else:
+                        try:
+                            answer = input(f"确认导入以上 {total_entries} 条 hook？(y/N) ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            answer = ""
+                        if answer in ("y", "yes"):
+                            summary = apply_plan(plan, workspace_root=workspace_root)
+                            for scope_item in summary.get("scopes", []):
+                                print_formatted_text(HTML(
+                                    f"<ansigreen>✔ 写入 {scope_item['written']} 条 → {_esc(scope_item['path'])}</ansigreen>"
+                                ))
+                            for err in summary.get("errors", []):
+                                print_formatted_text(HTML(f"<ansired>⚠️ {_esc(err)}</ansired>"))
+                            if summary.get("duplicates"):
+                                print_formatted_text(HTML(
+                                    f"<ansigray>  跳过 {summary['duplicates']} 条重复条目（目标文件已存在同事件同命令）。</ansigray>"
+                                ))
+                            print_formatted_text(HTML(
+                                "<ansigray>  项目级条目按既有信任流程生效（/hooks 查看）；撤销导入用 /hooks rollback。</ansigray>"
+                            ))
+                        else:
+                            print_formatted_text(HTML("<ansigray>已取消，未写入任何内容。</ansigray>"))
+
+        elif sub == "rollback":
+            # 撤销导入：只删带 imported_from=zcode: 标记的条目，星瑶原生条目不动。
+            from core.hooks.zcode_import import rollback_import
+
+            result = rollback_import(workspace_root=workspace_root)
+            if result.get("removed"):
+                for item in result["touched"]:
+                    print_formatted_text(HTML(
+                        f"<ansigreen>✔ 从 {_esc(item['path'])} 移除 {item['removed']} 条导入条目</ansigreen>"
+                    ))
+            else:
+                print_formatted_text(HTML("<ansiyellow>ℹ 没有找到任何 ZCode 导入条目。</ansiyellow>"))
+
+        elif sub == "":
+            # 编号从 1 起，供 trust/deny/revoke/reset 引用（与 GUI 卡片同一数据源）
+            if not entries:
+                print_formatted_text(HTML("<ansiyellow>ℹ 未配置任何 Hook。</ansiyellow>"))
+                print_formatted_text(HTML(
+                    "<ansigray>  钩子文件: 用户级 ~/.ycode/hooks.json 、项目级 &lt;项目&gt;/.ycode/hooks.json</ansigray>"
+                ))
+            else:
+                print_formatted_text(HTML(f"<ansicyan>🪝 已发现 {len(entries)} 个 Hook:</ansicyan>"))
+                for idx, item in enumerate(entries, start=1):
+                    status = item.get("status")
+                    if status == "trusted":
+                        check = "<ansigreen>[✓]</ansigreen>"
+                        state = "<ansigreen>已信任</ansigreen>"
+                    elif status == "pending":
+                        check = "<ansiyellow>[~]</ansiyellow>"
+                        state = "<ansiyellow>待确认</ansiyellow>"
+                    elif status == "stale":
+                        check = "<ansiyellow>[~]</ansiyellow>"
+                        state = "<ansiyellow>配置已变更</ansiyellow>"
+                    elif status == "blocked":
+                        check = "<ansired>[x]</ansired>"
+                        state = "<ansired>已拒绝</ansired>"
+                    elif status == "revoked":
+                        check = "<ansigray>[ ]</ansigray>"
+                        state = "<ansigray>已撤销</ansigray>"
+                    else:
+                        check = "<ansigray>[?]</ansigray>"
+                        state = f"<ansigray>{_esc(str(status))}</ansigray>"
+                    scope_label = "用户级" if item.get("scope") == "user" else "项目级"
+                    command_preview = str(item.get("command") or "")
+                    if len(command_preview) > 70:
+                        command_preview = command_preview[:70] + "..."
+                    print_formatted_text(HTML(
+                        f"  [{idx}] {check} <b><ansicyan>{_esc(str(item.get('event') or '?'))}</ansicyan></b>"
+                        f"  <ansigray>{scope_label}</ansigray> · {state}  <ansigray>{_esc(command_preview)}</ansigray>"
+                    ))
+                print_formatted_text(HTML(
+                    "<ansigray>  使用 /hooks trust|deny|revoke|reset &lt;序号&gt; 管理信任（序号以最近一次 /hooks 输出为准）。</ansigray>"
+                ))
+
+        elif sub in ("trust", "deny", "revoke", "reset"):
+            # 序号解析：越界/非数字一律给用法提示，绝不带着无效下标去调信任操作
+            index_text = sub_parts[2].strip() if len(sub_parts) > 2 else ""
+            index = None
+            if index_text.isdigit():
+                try:
+                    index = int(index_text)
+                except ValueError:
+                    index = None  # 如 "²"：isdigit() 为真但 int() 不可解析
+            if index is None or not (1 <= index <= len(entries)):
+                print_formatted_text(HTML(
+                    f"<ansired>⚠️ 用法: /hooks {sub} &lt;序号&gt;（先运行 /hooks 查看编号）</ansired>"
+                ))
+            else:
+                # CLI 子命令用 trust，信任层动作名是 grant（与 GUI 卡片同一动作词汇）
+                action = "grant" if sub == "trust" else sub
+                ok, msg = apply_hook_trust_action(
+                    action, entries[index - 1]["digest"], workspace_root=workspace_root
+                )
+                if ok:
+                    print_formatted_text(HTML(f"<ansigreen>✔ {_esc(msg)}</ansigreen>"))
+                    print_formatted_text(HTML("<ansigray>  运行 /hooks 查看最新状态。</ansigray>"))
+                else:
+                    print_formatted_text(HTML(f"<ansired>⚠️ {_esc(msg)}</ansired>"))
+
+        else:
+            print_formatted_text(HTML(
+                "<ansired>⚠️ 未知子命令。用法: /hooks [import|rollback|trust|deny|revoke|reset &lt;序号&gt;]</ansired>"
+            ))
+    elif cmd == "/doctor" or cmd.startswith("/doctor "):
+        # 聚合自检（T3）：配置/凭据/数据/数据库/MCP/网络/GUI 运行时一站式体检；
+        # --json 输出机器可读结果（供脚本采集/报障），默认人类可读。
+        # export 子命令（T5）：导出排障诊断包（默认精简、不含消息正文；
+        # --full 追加经脱敏的会话消息，需 y 交互确认后才执行）。
+        from core.doctor import run_checks
+
+        doctor_args = [part.lower() for part in parts[1:]]
+        if doctor_args and doctor_args[0] == "export":
+            from core.share import default_export_dir
+            from core.trace_export import export_diagnostics_bundle
+
+            export_args = doctor_args[1:]
+            bad_flags = [part for part in export_args if part not in ("--full", "y")]
+            full_requested = "--full" in export_args
+            confirmed = "y" in export_args
+            if bad_flags:
+                print_formatted_text(HTML(
+                    f"<ansired>❌ 未知参数「{_esc(bad_flags[0])}」。用法: /doctor export [--full y]</ansired>"
+                ))
+            elif full_requested and not confirmed:
+                print_formatted_text(HTML(
+                    "<ansiyellow>⚠️ --full 将在诊断包中追加当前会话消息正文（已按既有规则脱敏）。</ansiyellow>"
+                ))
+                print_formatted_text(HTML(
+                    "确认请输入: <ansicyan>/doctor export --full y</ansicyan> "
+                    "<ansigray>(分享前请人工复核包内内容)</ansigray>"
+                ))
+            else:
+                try:
+                    bundle_path = export_diagnostics_bundle(
+                        dest_dir=str(default_export_dir()),
+                        session_name=current_session,
+                        full=full_requested,
+                        confirm=confirmed,
+                    )
+                except Exception as exc:
+                    print_formatted_text(HTML(
+                        f"<ansired>❌ 诊断包导出失败：{_esc(str(exc))}</ansired>"
+                    ))
+                else:
+                    print_formatted_text(HTML(
+                        f"<ansigreen>✔ 诊断包已导出：{_esc(bundle_path)}</ansigreen>"
+                    ))
+                    print_formatted_text(HTML(
+                        "<ansigray>  包内：manifest.json / journal.jsonl（回合轨迹仅 ID 与元数据）"
+                        " / doctor.json / logs（日志存在时）。精简模式不含消息正文。</ansigray>"
+                    ))
+        else:
+            bad_flags = [part for part in doctor_args if part != "--json"]
+            if bad_flags:
+                print_formatted_text(HTML(
+                    f"<ansired>❌ 未知参数「{_esc(bad_flags[0])}」。用法: /doctor [--json] 或 /doctor export [--full y]</ansired>"
+                ))
+            else:
+                import json as _doctor_json
+
+                results = run_checks()
+                if "--json" in doctor_args:
+                    print_formatted_text(_doctor_json.dumps(
+                        [result.to_dict() for result in results], ensure_ascii=False, indent=2
+                    ))
+                else:
+                    status_marks = {
+                        "ok": "<ansigreen>✔ 通过</ansigreen>",
+                        "warn": "<ansiyellow>⚠ 警告</ansiyellow>",
+                        "fail": "<ansired>✖ 失败</ansired>",
+                        "skip": "<ansigray>○ 跳过</ansigray>",
+                    }
+                    counts = {key: 0 for key in ("ok", "warn", "fail", "skip")}
+                    print_formatted_text(HTML("<b><ansicyan>🩺 星瑶Code 聚合自检</ansicyan></b>"))
+                    for result in results:
+                        if result.status in counts:
+                            counts[result.status] += 1
+                        mark = status_marks.get(result.status, _esc(result.status))
+                        print_formatted_text(HTML(
+                            f"  {mark}  <b>{_esc(result.name)}</b>：{_esc(result.detail)}"
+                        ))
+                        if result.hint:
+                            print_formatted_text(HTML(f"      <ansigray>建议：{_esc(result.hint)}</ansigray>"))
+                    print_formatted_text(HTML(
+                        f"<b>总结</b>：{counts['ok']} 项通过 / {counts['warn']} 项警告 / "
+                        f"{counts['fail']} 项失败 / {counts['skip']} 项跳过"
+                    ))
+                    if counts["fail"] or counts["warn"]:
+                        print_formatted_text(HTML("<ansigray>  按上方建议逐项处理后重新运行 /doctor 复核。</ansigray>"))
+
     elif cmd == "/usage" or cmd.startswith("/usage "):
         # Token 用量统计：按模型分桶，精确数值（不做缩写）
         # 用法: /usage                            -> 今日/近7天/近30天
@@ -2871,6 +5101,13 @@ def handle_slash_command(command_text):
         ))
         threading.Thread(target=run_compress_bg, daemon=True).start()
 
+    elif cmd == "/goal" or cmd.startswith("/goal "):
+        # 参数取"原始输入去掉命令名"，而不是 parts[1:] 重组：--check 的值是整条
+        # 命令（含空格与引号），按 token 重组会把 `pytest -q` 拆成 `pytest`，
+        # 用户会看到"验证命令永远通过"的假达成。解析统一交给命令层 handle_goal。
+        _goal_args_text = command_text.strip()[len(parts[0]):].strip()
+        _run_goal_cli(_goal_args_text)
+
     elif cmd == "/exit":
         # 使用 print_formatted_text 避免 rich 在 prompt_toolkit patch_stdout 下出现 ANSI 乱码
         print_formatted_text(HTML(f"<ansigreen>👋 {_agent_name()}去休息啦，下次见！</ansigreen>"))
@@ -2890,8 +5127,8 @@ def _make_input_app():
     └──────────────────────────────────────┘
      model · session · dir     快捷键提示
     """
-    # COMMAND_COMPLETIONS 已提取为模块级常量（Task 14 审查裁决③：补
-    # /computer；模块层定义供测试断言，SlashCommandCompleter 引用不变）。
+    # COMMAND_COMPLETIONS 已提取为模块级常量（模块层定义供测试断言，
+    # SlashCommandCompleter 引用不变）。
     command_completions = COMMAND_COMPLETIONS
 
     class SlashCommandCompleter(Completer):
@@ -2900,6 +5137,43 @@ def _make_input_app():
             
             # 1. 尝试匹配斜杠命令
             if text.startswith('/'):
+                # /effort 参数动态补全：按当前激活模型的能力表给出真实思考档位，
+                # 命中后跳过通用命令列表（"/effort " 时 word 为空会列出全部命令，纯噪音）
+                effort_arg = re.match(r'^/effort\s+(\S*)$', text)
+                if effort_arg is not None:
+                    typed = effort_arg.group(1)
+                    for value, label, is_current in _reasoning_options_for_completion():
+                        if value.startswith(typed.lower()):
+                            yield Completion(
+                                value,
+                                start_position=-len(typed),
+                                display_meta="思考档位: " + label + (" (当前)" if is_current else ""),
+                            )
+                    return
+                # /shell 参数动态补全：列出探测到的命令解释器（未安装的带标记）
+                shell_arg = re.match(r'^/shell\s+(\S*)$', text)
+                if shell_arg is not None:
+                    typed = shell_arg.group(1)
+                    for opt_id, label, available in _command_shell_options_for_completion():
+                        if opt_id.startswith(typed.lower()):
+                            yield Completion(
+                                opt_id,
+                                start_position=-len(typed),
+                                display_meta="解释器: " + label + ("" if available else " (未安装)"),
+                            )
+                    return
+                # /session 子命令补全：让归档等子命令可被直接发现（对照 /shell 的写法）
+                session_arg = re.match(r'^/sessions?\s+(\S*)$', text)
+                if session_arg is not None:
+                    typed = session_arg.group(1)
+                    for sub_name, sub_desc in SESSION_SUBCOMMANDS:
+                        if sub_name.startswith(typed.lower()):
+                            yield Completion(
+                                sub_name,
+                                start_position=-len(typed),
+                                display_meta="会话子命令: " + sub_desc,
+                            )
+                    return
                 word = document.get_word_before_cursor(WORD=True)
                 for cmd, desc in command_completions:
                     if cmd.startswith(word):
@@ -2911,7 +5185,7 @@ def _make_input_app():
                         
                 # 额外动态补充已开启的技能插件到下拉菜单供主动调用
                 try:
-                    from core.skills import get_active_skills_list
+                    from core.skills import get_active_skills_list, skill_source_label
                     active_skills = get_active_skills_list()
                     for short_id, s in active_skills.items():
                         cmd = f"/{short_id}"
@@ -2919,7 +5193,7 @@ def _make_input_app():
                             yield Completion(
                                 cmd,
                                 start_position=-len(word),
-                                display_meta=f"⚡ 技能: {s['description']}"
+                                display_meta=f"⚡ {skill_source_label(s)}技能: {s['description']}"
                             )
                 except Exception:
                     pass
@@ -3089,8 +5363,21 @@ def _make_input_app():
     def clear_input(event):
         """Ctrl+C: 如果星瑶正在执行，则中断执行；如果闲置，则清空输入框"""
         global is_thinking, confirm_prompt
-        if is_thinking or active_cancel_event is not None or confirm_prompt is not None:
+        if (
+            is_thinking
+            or active_cancel_event is not None
+            or confirm_prompt is not None
+            # 目标模式在两轮之间可能既没有在飞回合也没有确认框，此时 Ctrl+C
+            # 仍应被视为"停止目标"，而不是清空输入框
+            or _goal_has_running()
+        ):
             _cancel_active_turn()
+            # 目标循环的取消事件一并置位：只中断当前模型回合的话，本轮一结束
+            # 循环会立刻开下一轮，用户会觉得 Ctrl+C 对目标模式无效。
+            if _set_all_goal_cancel_events():
+                print_formatted_text(HTML(
+                    "<ansired>🎯 目标模式已收到停止信号，本轮结束后不再自动续跑。</ansired>"
+                ))
             # 同时丢弃排队中的消息：用户按 Ctrl+C 的意图是"全部停下"，
             # 只取消当前轮而继续执行队列里的旧消息会让人困惑。
             drained = 0
@@ -3174,7 +5461,7 @@ def _make_input_app():
 
     @kb.add("s-tab")
     def toggle_permission_mode(event):
-        """Shift+Tab 循环切换 Y-CODE 权限模式"""
+        """Shift+Tab 循环切换 星瑶Code 权限模式"""
         global current_permission_mode
         modes = ["confirm", "accept_edits", "plan", "full"]
         try:
@@ -3192,7 +5479,8 @@ def _make_input_app():
         # 1. 提取短模型名（使用内存缓存，避免每次渲染都读盘解析 config.json）
         model_display = current_model_name or "未激活模型"
 
-        # 2. 读取统一快照：取计费累计与上下文窗口用量
+        # 2. 读取统一快照：输入/输出/命中取进程累计（跨会话/渠道/scope 混算）；
+        #    车道热命中率不进状态栏（一行宽度有限），明细改用 /usage 查看
         usage_snapshot = get_token_usage_snapshot(
             current_session, current_model, current_url, "main"
         )
@@ -3200,15 +5488,17 @@ def _make_input_app():
         latest_total = usage_snapshot["window"]["latest_total"]
         max_win = current_ctx_win
 
+        # 保活命中率与车道热口径都不再进状态栏：省掉一次 _status_cache_metrics
+        # 查询，需要看明细时用 /usage。
         cum_prompt = process_usage["cumulative_prompt"]
         cum_completion = process_usage["cumulative_completion"]
         cum_cached = process_usage["cumulative_cached"]
 
         # 命中率分母用 prompt tokens（缓存只可能命中输入部分），
-        # 用 total（含输出）会把比率稀释失真
-        hit_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else 0
+        # 用 total（含输出）会把比率稀释失真。未报告时为 None，显示 "--"。
+        global_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else None
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
-        
+
         def format_num(n):
             if n >= 1_000_000:
                 val = n / 1_000_000
@@ -3217,29 +5507,31 @@ def _make_input_app():
                 val = n / 1_000
                 return f"{int(val)}K" if val.is_integer() else f"{val:.1f}K"
             return str(n)
-            
+
         prompt_str = format_num(cum_prompt)
         completion_str = format_num(cum_completion)
         cached_str = format_num(cum_cached)
+        global_rate_str = f"{global_rate:.0f}%" if global_rate is not None else "--"
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 状态栏 Token 概览：输入/输出/命中/命中率/上下文
-        token_info = (
-            f"输入 {prompt_str} · 输出 {completion_str} · "
-            f"命中 {cached_str} ({hit_rate:.0f}%) · "
-            f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
+        # 状态栏 Token 概览：只报进程累计口径与上下文占用（车道热命中率与保活已移除）
+        token_info = _compose_status_token_info(
+            prompt=prompt_str,
+            completion=completion_str,
+            cached=cached_str,
+            global_rate=global_rate_str,
+            ctx_pct=f"{pct:.0f}%",
+            ctx_used=latest_total_str,
+            ctx_max=max_win_str,
         )
 
-        # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
-        # 直接读模块全局变量，不再 import main 自引用
-        status_map = {
-            "idle": (" 闲置 ", "class:status.task_idle"),
-            "thinking": (" 思考中... ", "class:status.task_active"),
-            "executing": (" 正在干活... ", "class:status.task_active"),
-            "waiting": (" 等待授权确认... ", "class:status.task_active"),
-        }
-        status_label, task_style = status_map.get(task_status, (" 闲置 ", "class:status.task_idle"))
+        # 3. 状态位：一律展示最近一次请求的实测吐字速度（t/s）——运行中只加
+        # 旋转动画，不再叠状态文字；仅「等待授权确认」保留文字提示，因为那一
+        # 步需要用户动手。直接读模块全局变量，不再 import main 自引用
+        status_label, task_style = _compose_status_task_segment(
+            task_status, _last_token_speed
+        )
 
         if task_status != "idle":
             # 播放流式旋转动画
@@ -3277,10 +5569,8 @@ def _make_input_app():
             ("class:status.sep",     "  |  "),
             (task_style,             task_info),
         ]
-        computer_segment = _computer_status_bar_segment()
-        if computer_segment:
-            segments.append(("class:status.sep", "  |  "))
-            segments.append(("class:status.token", f" {computer_segment} "))
+        # 状态栏不渲染 Git 段（git 子进程在本机约 1s，见 _ensure_cli_disclaimer_consent
+        # 上方的说明）；Git 信息按需用 /git status 查看，保证输入零阻塞。
         return segments
 
     def get_activity_text():
@@ -3291,8 +5581,8 @@ def _make_input_app():
             # elapsed），避免两个动画刷新率不一致导致的观感卡顿。
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             frame = frames[int(time.time() * 5) % len(frames)]
-            # 首轮对话赶在后台预热完成前发出时，litellm/tiktoken 的首次
-            # import 需要数秒——如实显示“启动模型引擎”，避免看似卡死。
+            # 首轮对话赶在后台预热完成前发出时，模型引擎首次初始化
+            # 需要时间——如实显示“启动模型引擎”，避免看似卡死。
             if not _llm_engine_ready and _active_tool_status is None:
                 return f"  {frame} {_agent_name()}正在启动模型引擎 · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
             return _format_activity_text(task_status, _active_tool_status, elapsed, frame)
@@ -3535,6 +5825,8 @@ def _build_cli_style(theme_name):
         "status.think":    "bold #e2e8f0",
         "status.task_active": "bold #39ff14",  # 矩阵亮绿
         "status.task_idle":   status_sep,
+        # 闲置位的实测吐字速度：用主题主色加粗，比原来的灰色"闲置"更醒目
+        "status.task_speed":  f"bold {border_color}",
         "status.permission_confirm":      "bold #50fa7b",
         "status.permission_accept_edits": "bold #f1fa8c",
         "status.permission_plan":         "bold #88c0d0",
@@ -3685,9 +5977,58 @@ def _background_worker():
             task_key = active_info.get("api_key", "")
             task_url = active_info.get("base_url", "")
             task_ctx_win = active_info.get("context_window", 128000)
+            # 本回合实际发请求所用的模型 id（默认=激活模型）。router 场景可能一次性
+            # 换成副模型 id；必须与 task_model 成对替换——llm_dialects 按 id 读
+            # thinking / max_tokens 等模型级配置，只换名字不换 id 会用错推理参数。
+            task_model_id = active_info.get("id")
+            # —— router 场景：回合级模型档位（与 GUI 入口同源，方案 A）——
+            # 只替换本回合的几个局部变量（task_model / task_key / task_url /
+            # task_ctx_win / task_model_id），是本回合的一次性覆盖：不写任何全局或
+            # 会话级模型绑定，子代理继承链继续用各自的会话/全局模型。
+            # JEV 关闭 / 影子时 router_scene_live() 为假：不读历史、不算 token、
+            # 不发决策请求，CLI 行为与接入前逐字一致。
+            try:
+                from core.turn_model_override import router_scene_live, resolve_turn_model
 
-            from core.input_parser import parse_user_input
+                if router_scene_live():
+                    from core.agent_service import get_session_token_baseline
+
+                    # 硬护栏基线：本会话当前上下文占用；拿不到就传 0 跳过这条护栏
+                    try:
+                        baseline_tokens = get_session_token_baseline(
+                            manager, task_session, task_model
+                        )
+                    except Exception:
+                        baseline_tokens = 0
+                    turn_override = resolve_turn_model(
+                        active_info,
+                        turn_source="local",
+                        pending_model_id="",
+                        baseline_tokens=baseline_tokens,
+                        user_text=user_input,
+                    )
+                    if turn_override:
+                        logging.getLogger("py.warnings").info(
+                            "router 场景覆盖本回合模型 [%s]：%s → %s（基线 %s tokens，副模型窗口 %s tokens）",
+                            task_session,
+                            task_model,
+                            turn_override["litellm_model"],
+                            baseline_tokens,
+                            turn_override["context_window"],
+                        )
+                        task_model = turn_override["litellm_model"]
+                        task_key = turn_override["api_key"]
+                        task_url = turn_override["base_url"]
+                        task_ctx_win = turn_override["context_window"]
+                        task_model_id = turn_override["model_id"]
+            except Exception:
+                logging.getLogger("py.warnings").debug(
+                    "router 场景模型档位覆盖失败，本回合沿用主模型", exc_info=True
+                )
+
+            from core.input_parser import parse_user_input, extract_session_refs
             if is_skill_call:
+                session_refs = []
                 # 提取短 ID 与实际的提问及挂载文件
                 parts = user_input.split(maxsplit=1)
                 skill_name = parts[0][1:]
@@ -3708,15 +6049,70 @@ def _background_worker():
                 else:
                     parsed_content = instruction + parsed_content
             else:
-                parsed_content, attached_msgs = parse_user_input(user_input)
+                # /paste-image 等来源会在队列条目携带显式附件路径（用户明确授权，
+                # 不受沙盒越界限制），经 parse_user_input 的 explicit_paths 通道
+                # 挂载——不依赖文本内路径提取，含空格路径也不会丢（审查 Important #4）
+                # @{会话名} 提取与 @文件解析同一 try：任一步骤异常都退回纯文本，
+                # 绝不让后台 worker 崩溃（与 GUI 侧解析段的异常兜底对齐）
+                try:
+                    explicit_paths = task_data.get("explicit_paths") or None
+                    _, session_refs = extract_session_refs(user_input)
+                    parsed_content, attached_msgs = parse_user_input(user_input, explicit_paths=explicit_paths)
+                except Exception:
+                    logging.getLogger("py.warnings").exception(
+                        "解析用户输入失败，退回纯文本"
+                    )
+                    session_refs = []
+                    parsed_content, attached_msgs = user_input, []
                 # 在终端打印挂载的文件提示
                 for msg in attached_msgs:
                     schedule_ui(lambda message=_esc(msg): print_formatted_text(
                         HTML(f"  <ansigreen>{message}</ansigreen>")
                     ))
+                if session_refs:
+                    for name in session_refs:
+                        schedule_ui(lambda n=_esc(name): print_formatted_text(
+                            HTML(f"  <ansigreen>💬 已引用对话: {n}</ansigreen>")
+                        ))
 
-            # 将用户最新输入存入数据库
-            manager.add_message(task_session, "user", parsed_content)
+            # --- 按回合撤销生命周期重排（规格 9.1）---
+            # 先确保会话行、生成全局唯一 turn_id（128 位随机 UUID）并创建
+            # 持久化检查点，再原子落库用户消息（+ message_turn_links）。
+            # 检查点创建失败则本轮不落任何消息（不留无法归组的孤儿消息）。
+            from core.turn_undo import service as _tu_service
+            from core.workspace_context import get_workdir
+
+            turn_id = uuid.uuid4().hex
+            try:
+                manager.ensure_session(task_session)
+                _tu_checkpoint, _tu_undo_ctx = _tu_service.begin_turn(
+                    session_id=_tu_service.resolve_session_id(task_session),
+                    turn_id=turn_id,
+                    workspace_root=get_workdir(),
+                    description=str(user_input)[:80],
+                )
+            except Exception:
+                import logging as _logging_mod
+
+                _logging_mod.getLogger("py.warnings").exception(
+                    "创建按回合撤销检查点失败，回合中止 session=%s", task_session
+                )
+                _report_task_result(task_data, False, "回合检查点创建失败，本轮未开始")
+                continue
+            try:
+                manager.add_message(
+                    task_session, "user", parsed_content,
+                    turn_checkpoint_id=_tu_checkpoint.checkpoint_id,
+                    turn_position_kind="user",
+                )
+            except Exception:
+                from core.turn_undo import service as _tu_service_inner
+
+                try:
+                    _tu_service_inner.finish_turn(_tu_undo_ctx, aborted=True, reason="用户消息落库失败")
+                except Exception:
+                    pass
+                raise
 
             # 组装本轮发给大模型的完整上下文：记忆压缩、系统提示词、运行上下文、
             # 后台子代理结果注入等步骤已下沉到 core/agent_service.py，与 GUI 共用同一套逻辑。
@@ -3724,24 +6120,42 @@ def _background_worker():
             def _turn_notify(kind, message):
                 schedule_ui(lambda text=message: print_formatted_text(HTML(text)))
 
-            history = _agent_service.prepare_turn_messages(
-                manager,
-                task_session,
-                task_model,
-                task_ctx_win,
-                permission_mode=current_permission_mode,
-                cancel_event=early_cancel,
-                notify=_turn_notify,
-                api_key=task_key,
-                api_base=task_url,
-                compress_threshold=MEMORY_COMPRESS_THRESHOLD,
-            )
+            # 闲时维护：回合开始即撤销本会话的空闲维护任务并协作中断在跑的
+            # 闲时压缩（见 core/idle_maintenance.py），结束在 finally 重新计时
+            try:
+                from core.idle_maintenance import idle_maintenance_service
+                idle_maintenance_service.on_turn_started(task_session)
+            except Exception:
+                pass
+
+            try:
+                history = _agent_service.prepare_turn_messages(
+                    manager,
+                    task_session,
+                    task_model,
+                    task_ctx_win,
+                    permission_mode=current_permission_mode,
+                    cancel_event=early_cancel,
+                    notify=_turn_notify,
+                    api_key=task_key,
+                    api_base=task_url,
+                    compress_threshold=MEMORY_COMPRESS_THRESHOLD,
+                    referenced_sessions=session_refs,
+                )
+            except Exception:
+                # 回合在进入下方 try/finally 之前早退：on_turn_started 已置位的
+                # 闲时维护忙位必须在这里收口，否则该会话的闲时任务在到期时
+                # 被忙闲复查跳过，直到下一个成功回合才自愈
+                try:
+                    idle_maintenance_service.on_turn_finished(task_session, notify=None)
+                except Exception:
+                    pass
+                raise
 
 
             # 后台线程只切换 UI 状态，不直接触碰 prompt_toolkit 布局。
             # turn 状态的建立（active_* 赋值）与清理在同一个 try/finally 作用域内，
             # 中途任何异常都不会留下永不清空的 cancel_event / executing 状态。
-            turn_id = f"{task_session}:{uuid.uuid4().hex[:8]}"
             turn_controller = TurnController(history)
             turn_controller.begin_turn()
             history = turn_controller.messages
@@ -3755,19 +6169,6 @@ def _background_worker():
             from core import tool_cache as _tool_cache
             _tool_cache.set_current_session(task_session)
             # 将 undo 状态绑定到当前会话，防止切会话后 /undo 误操作其他会话的文件
-            from core.memory import set_undo_session
-            set_undo_session(task_session)
-
-            # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
-            # 用户可通过 /checkpoint restore <turn_id> 整体回滚（含文件 + 对话上下文）
-            from core.memory import begin_turn_checkpoint, end_turn_checkpoint
-            begin_turn_checkpoint(
-                session_name=task_session,
-                turn_id=turn_id,
-                last_msg_id=len(history),
-                description=str(user_input)[:80],
-            )
-
             def mark_turn_started():
                 global is_thinking, think_start_time, task_status, activity_start_time
                 _clear_active_thinking()
@@ -3798,26 +6199,34 @@ def _background_worker():
                         parent_turn_id=turn_id,
                         permission_owner=turn_id,
                         permission_source="主代理",
-                        model_id=active_info.get("id"),
+                        model_id=task_model_id,
                     )
                     # 回复头部由 _render_ui_event 在主线程统一输出；
                     # 消息已由 generator 在生成迭代中实时持久化入库，此处不再重复写入
                     _forward_response_events(response_gen)
                     turn_controller.complete()
-                    # 提交本轮检查点到全局缓存（即使本轮没有文件修改也要记录，
-                    # 用户可借此回滚到"本轮对话开始前"的状态）
-                    end_turn_checkpoint()
+                    # 回合正常结束：标记最后一条 assistant 关联并封闭检查点
+                    # （即使本轮没有文件修改也封闭——no_changes 是正常终态）
+                    try:
+                        manager.mark_turn_final_assistant(_tu_checkpoint.checkpoint_id)
+                    except Exception:
+                        pass
+                    closed_status = _tu_service.finish_turn(_tu_undo_ctx)
+                    # 检查点进入 ready：在最终回答后显示文件修改摘要与 /undo 指引
+                    if closed_status and closed_status.value == "ready":
+                        schedule_ui(lambda s=task_session, t=turn_id:
+                                    print_turn_file_summary_if_ready(s, t))
                     schedule_ui(_reset_turn_state)
                 except KeyboardInterrupt:
                     # The queued turn_cancelled event renders the cancellation line.
                     turn_controller.cancel()
-                    end_turn_checkpoint()  # 取消也提交检查点（已记录的快照仍可用）
+                    _tu_service.finish_turn(_tu_undo_ctx, aborted=True, reason="回合被用户取消")
                     schedule_ui(_reset_turn_state)
                     turn_interrupted = True
                     turn_error = "已被用户取消"
                 except Exception as e:
                     turn_controller.cancel()
-                    end_turn_checkpoint()
+                    _tu_service.finish_turn(_tu_undo_ctx, aborted=True, reason=f"回合异常: {type(e).__name__}")
                     # 必须记录到 runtime-warnings.log，否则异常被静默吞掉，
                     # 用户消息已入库但 assistant 回复缺失，无法排查（session 97 类问题）
                     import logging as _logging_mod
@@ -3852,10 +6261,14 @@ def _background_worker():
                 is_thinking = False
                 task_status = "idle"
                 _clear_active_thinking()
+                # 闲时维护重新计时：空闲超过配置延时后跑水位线维护与压缩
+                # （默认开，config memory_compression.idle_maintenance_seconds = 0 关闭）
+                try:
+                    idle_maintenance_service.on_turn_finished(task_session, notify=_turn_notify)
+                except Exception:
+                    pass
                 from core import tool_cache as _tool_cache
-                from core.memory import clear_undo_session
                 _tool_cache.set_current_session(None)
-                clear_undo_session()
                 # 清理卡在 in_progress 的计划项：子 agent 异常退出（超时/崩溃/未调用 terminal_callback）
                 # 会导致计划项永久卡在 in_progress，turn 结束后仍显示在状态栏。
                 # 但必须跳过"后台子代理仍在运行"的 in_progress 项——否则会误杀正常后台任务
@@ -3976,7 +6389,7 @@ def run_headless(prompt, session_name=None) -> int:
         lambda: None,              # 不需要 dismiss
     )
 
-    set_terminal_title("Y-code (headless)")
+    set_terminal_title("星瑶Code (headless)")
 
     # 2. 处理 prompt 输入（支持 stdin）
     if prompt == "-":
@@ -4035,6 +6448,22 @@ def run_headless(prompt, session_name=None) -> int:
         # 给事件队列一点时间排空
         time.sleep(0.5)
 
+        # headless 没有 UI 消费者：回合失败只以 turn_error 事件留在
+        # ui_event_queue 里（交互模式由 UI 线程 drain 后打印），而 worker 侧
+        # 回合已"完整走完"会上报成功。必须在投递方这里排空队列检出失败，
+        # 否则失败任务也返回退出码 0，CI/脚本无法判败。
+        stream_error = None
+        while True:
+            try:
+                _queued_event = ui_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if _queued_event.kind == "turn_error" and stream_error is None:
+                stream_error = str((_queued_event.payload or {}).get("message") or "未知错误")
+        if stream_error is not None:
+            print(f"\n[headless 任务失败: {stream_error}]", file=sys.stderr)
+            return 1
+
         # High 8：失败与成功在队列层无法区分（task_done 在 finally 无条件调用），
         # 必须看 worker 通过共享 result 对象上报的成败；失败返回 1 让 CI 流水线判败。
         task_result = task_data.get("result") or {}
@@ -4084,6 +6513,9 @@ def run_cli():
     # 必须先于下方一切初始化副作用（模型选择器/后台线程/MCP 预热/首绘）
     _require_interactive_console()
 
+    # 免责条款确认：同样先于一切初始化副作用，不同意则直接退出
+    _ensure_cli_disclaimer_consent()
+
     # 运行时初始化副作用集中在入口执行（而非模块 import 时），保证 main.py 可被安全 import
     _app_ctx.set_ui_flavor("cli")
     bind_default_plan_session(current_session)
@@ -4094,12 +6526,12 @@ def run_cli():
     # MCP 状态打印器的注册移入 _preload_mcp 后台线程（见下文），避免在首绘前
     # 同步 import core.mcp_client（连带 mcp/pydantic/httpx，约 1.1~1.5s）。
 
-    set_terminal_title("Y-code")
+    set_terminal_title("星瑶Code")
 
     # 首次启动/完全无配置模型时，自动引导开启全屏模型配置选择器
     active_info = get_active_model()
     if not active_info:
-        print("\n🔑 欢迎使用 Y-CODE！检测到您尚未配置大模型。")
+        print("\n🔑 欢迎使用 星瑶Code！检测到您尚未配置大模型。")
         print("💡 正在自动为您开启模型管理界面，请选择厂商并配置 API Key...")
         time.sleep(1.2)
         from core.model_selector import open_model_selector
@@ -4135,7 +6567,11 @@ def run_cli():
         try:
             key_input = input("👉 API Key: ").strip()
             if key_input:
-                current_key = key_input
+                # 多 Key（换行/逗号/分号分隔）：运行时先用首个 Key；完整原文照常
+                # 写入配置，后续所有读取统一走 Key 池（get_active_model → 单 Key）。
+                from core.provider_keys import split_provider_keys
+                _parsed_keys = split_provider_keys(key_input)
+                current_key = _parsed_keys[0] if _parsed_keys else key_input
                 _sync_active_model_context()
                 from core.model_manager import load_config, _write_config
                 cfg = load_config()
@@ -4163,21 +6599,46 @@ def run_cli():
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()
 
-    # ── 启动预热（同步阶段，CLI 出现前完成）──────────────────────────────
-    # 设计取向：启动慢一点没关系，但进入界面后必须立即可用、输入不卡。
-    # 若改为后台预热，litellm/mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
-    # 抢 GIL，实测会把首帧绘制卡 8 秒、键盘输入无回显。因此三个预热任务在
-    # 此处并发执行、主线程显示进度动画并等全部完成后再进入 CLI。
+    # 按回合撤销：进入主交互前显示一次中断事务摘要（规格 24；扫描已在模块
+    # 加载时执行，这里只读展示受影响回合与恢复指引，不自动重放任何写入）
+    try:
+        from core.turn_undo import service as _tu_service_cli
+        from core.turn_undo.models import TurnUndoStatus as _TUS
 
-    def _preload_litellm():
-        """预热 LLM 引擎：litellm import、tiktoken 编码加载（token_counter
-        首次调用）、模型视觉能力探测（首个 generator 会调用）。"""
+        _interrupted_cps = _tu_service_cli.get_default_storage().list_checkpoints_by_status(
+            (_TUS.INTERRUPTED, _TUS.RECOVERING)
+        )
+        if _interrupted_cps:
+            print_formatted_text(HTML(
+                "<ansiyellow>⚠️ 检测到未完成的撤销事务：相关文件已被冻结保护"
+                "（星瑶的文件工具与命令在这些路径上暂不可用）。</ansiyellow>"
+            ))
+            for _cp in _interrupted_cps:
+                print_formatted_text(HTML(
+                    f"  回合 {_esc(_cp.turn_id[:8])}  "
+                    f"<ansigray>{_esc(_cp.last_error_message or '撤销中断')}</ansigray>"
+                ))
+            print_formatted_text(HTML(
+                "  处理方式：/undo list 查看状态，/undo recover &lt;操作ID&gt; 选择"
+                "继续撤销或取消撤销。\n"
+            ))
+    except Exception:
+        pass
+
+    # ── 启动预热 ────────────────────────────────────────────────────────
+    # 只同步等待 LLM 引擎：tiktoken 首次调用是 CPU 密集 import，若它与 TUI
+    # 渲染线程抢 GIL，会把首帧卡住数秒、键盘输入无回显，这一项必须等。
+    # MCP 连接是网络 I/O、Token 统计是本地 DB 读取，都不影响首屏可用性，
+    # 全部放纯后台，不再拖长启动时间。
+
+    def _preload_llm_engine():
+        """预热 LLM 引擎：token 估算器首次调用与模型视觉能力探测
+        （首个 generator 会调用）。"""
         global _llm_engine_ready
         try:
-            from core.llm import _get_litellm, _litellm_token_counter, _supports_vision
-            _get_litellm()
+            from core.llm import _token_counter, _supports_vision
             try:
-                _litellm_token_counter(
+                _token_counter(
                     current_model or "openai/gpt-4o-mini",
                     [{"role": "user", "content": "预热"}],
                 )
@@ -4189,7 +6650,7 @@ def run_cli():
             except Exception:
                 pass
         except Exception as e:
-            logging.getLogger("py.warnings").warning("预加载 litellm 失败: %s", e)
+            logging.getLogger("py.warnings").warning("预加载 LLM 引擎失败: %s", e)
         finally:
             _llm_engine_ready = True
 
@@ -4231,40 +6692,71 @@ def run_cli():
             logging.getLogger("py.warnings").warning("MCP 后台连接失败: %s", e)
 
     def _warm_token_usage():
-        """预热当前 session 的 Token 统计（会连带 tiktoken 首次加载），
+        """预热当前 session 的 Token 统计，
         同步完成后状态栏 token 数在首绘时就是准确值。"""
         try:
             recalc_token_usage()
         except Exception as e:
             logging.getLogger("py.warnings").warning("启动预热 recalc_token_usage 失败: %s", e)
 
-    _preload_threads = [
-        threading.Thread(target=_preload_litellm, daemon=True),
-        threading.Thread(target=_preload_mcp, daemon=True),
-        threading.Thread(target=_warm_token_usage, daemon=True),
-    ]
-    for _t in _preload_threads:
-        _t.start()
+    _preload_llm_thread = threading.Thread(target=_preload_llm_engine, daemon=True)
+    _preload_llm_thread.start()
+    # Token 统计是本地 DB 读取（毫秒级、几乎不占 GIL），可以立即后台跑。
+    # MCP 不在这里预热：mcp 全家桶（pydantic/httpx/anyio）冷加载约 1.1s，且是
+    # CPU 密型 import，与 TUI 渲染线程抢 GIL 会让输入框迟迟不出现、键盘无回显。
+    # 首次请求时由 get_tools_schema() 的惰性连接负责（有界超时，只等一次）。
+    threading.Thread(target=_warm_token_usage, daemon=True).start()
 
     # 进度动画：纯文本终端阶段（CLI 未启动），非 tty 时安静等待
     _preload_t0 = time.monotonic()
     _spin_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     _tty = sys.stdout is not None and sys.stdout.isatty()
     try:
-        while any(_t.is_alive() for _t in _preload_threads):
+        while _preload_llm_thread.is_alive():
             if _tty:
                 _frame = _spin_frames[int((time.monotonic() - _preload_t0) * 10) % len(_spin_frames)]
                 print(f"\r  {_frame} {_agent_name()}正在预热模型引擎 · {time.monotonic() - _preload_t0:.1f}s   ", end="", flush=True)
-            for _t in _preload_threads:
-                _t.join(timeout=0.1)
+            _preload_llm_thread.join(timeout=0.1)
     except KeyboardInterrupt:
         # Ctrl+C：跳过等待直接进入界面（后台 daemon 线程仍会继续预热）
         if _tty:
             print("\r  ⚠️ 已跳过预热等待，首轮对话可能稍慢。           ")
 
-    # 预热全部完成后才铺主界面：print_logo 会清屏，启动提示与预热动画随之消失，
-    # 用户直接看到完整可输入的主页面（logo + 输入框 + 准确的状态栏）
+    # LLM 引擎就绪即铺主界面：print_logo 会清屏，启动提示与预热动画随之消失，
+    # 用户直接看到可输入的主页面（MCP/Token 统计仍在后台补齐，不影响输入）
     print_logo()
+
+    # 工具表后台预热：界面已经可用，趁用户输入第一个问题的时间把工具表装配完
+    # （实测约 0.6s），首轮请求直接命中缓存，不必在请求路径上现构建。
+    def _warm_background_services():
+        # 两步都要避开 TUI 首帧：工具表装配（约 0.6s）与 MCP 连接（实测 7s，
+        # 含 mcp 全家桶 import）都是 CPU 密集操作，紧跟 print_logo 执行会和渲染
+        # 线程抢 GIL，表现为输入框迟迟不出现、键盘输入无回显。
+        # 先等界面稳定，再把本线程降到 BELOW_NORMAL；即使仍有竞争，主线程
+        # 也优先拿到调度，不会卡住键盘回显。
+        time.sleep(1.5)
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.SetThreadPriority(
+                    ctypes.windll.kernel32.GetCurrentThread(), -2  # BELOW_NORMAL
+                )
+            except Exception:
+                pass
+        try:
+            import core.llm as _llm_module
+
+            _llm_module.tool_registry.all()
+        except Exception:
+            pass
+        # 刻意不在这里连 MCP：amap 实测要 6~7s（npx 拉起 + mcp 全家桶 import），
+        # 全程 CPU 密集，会持续抢 GIL 让键盘回显一顿一顿。MCP 交给首次请求时
+        # 的惰性连接（get_tools_schema 的有界等待，只等一次），界面先保持流畅。
+        # 同理也不在后台预热 @文件清单：该缓存只在 UI 线程读写，跨线程会引入
+        # 竞态，而它只有 0.17s，留给第一次输入 @ 时现扫更划算。
+
+    threading.Thread(target=_warm_background_services, daemon=True).start()
 
     # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
     def _ui_refresher_loop():
@@ -4284,18 +6776,8 @@ def run_cli():
 
     threading.Thread(target=_ui_refresher_loop, daemon=True).start()
 
-    # 电脑操控事件桥（Task 14）：controller listener 在 worker 线程触发，
-    # 只向现有 UI 事件队列投递（post_ui_event → schedule_ui 回 UI 线程），
-    # 由 _render_ui_event 打印一行脱敏摘要；绝不直接 print / 改 layout。
-    from core.computer.cli import make_cli_event_listener
-    from core.computer.controller import get_computer_control_service as _get_computer_service
-
-    _get_computer_service().add_listener(make_cli_event_listener(post_ui_event))
-
-    # 电脑操控运行时（Task 16，设计 23.2）：轻量容器——任一开关开启时注册
-    # 全局紧急停止热键；默认关闭路径零额外导入（不触碰 Playwright/浏览器/
-    # 截图）。CLI 不接预览发布器（无预览 UI）。
-    _startup_computer_runtime_for_cli()
+    # CLI 轻量模式不加载电脑/浏览器操控：不注册 controller 监听、不启动运行时、
+    # 不注册紧急停止热键（能力层已在 core.computer.capability 统一禁用）。
 
     # 主循环：支持 /models 弹出选择器并重启主 App
     while True:
@@ -4468,6 +6950,21 @@ def run_cli():
 
 
 if __name__ == "__main__":
+    # T2 配置未知键自检：默认仅写 runtime-warnings 诊断日志（现有警告通道，
+    # 见 core.runtime_warnings）；strict_config=true 时拒绝启动（退出码 2，
+    # 与 headless「2=配置错误」语义一致）。
+    try:
+        from config import UnknownConfigKeysError, audit_config_keys
+
+        audit_config_keys()
+    except UnknownConfigKeysError as config_key_error:
+        print(f"\n🚨 配置校验失败：{config_key_error}", file=sys.stderr)
+        print("请修正 config.json 中的未知键（或删除拼错的键）后重试。", file=sys.stderr)
+        sys.exit(2)
+    except Exception:
+        # 自检属于 best-effort 诊断，自身故障绝不能反过来阻断启动
+        pass
+
     # Headless 模式：ycode -p "task" 一次性执行任务后退出，不进入交互式 CLI
     # 用途：CI/脚本/管道集成（参考 Grok Build/OpenCode 的 headless 模式）
     # 用法：
@@ -4477,7 +6974,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
         prog="ycode",
-        description="Y-code 终端 AI 编程助手",
+        description="星瑶Code 终端 AI 编程助手",
         add_help=False,  # 交互模式下 argparse 的 -h/--help 会干扰；只在显式 -p 时启用
     )
     parser.add_argument("-p", "--prompt", dest="prompt",
@@ -4490,16 +6987,9 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     if args.prompt is not None:
-        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码；
-        # finally 统一关闭电脑操控运行时（Task 16：controller→preview→hotkey）
-        try:
-            exit_code = run_headless(prompt=args.prompt, session_name=args.session)
-        finally:
-            _shutdown_computer_runtime_for_cli()
+        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码
+        exit_code = run_headless(prompt=args.prompt, session_name=args.session)
         sys.exit(exit_code)
     else:
-        # 交互式模式（默认）；finally 覆盖正常退出与异常退出两条路径
-        try:
-            run_cli()
-        finally:
-            _shutdown_computer_runtime_for_cli()
+        # 交互式模式（默认）
+        run_cli()

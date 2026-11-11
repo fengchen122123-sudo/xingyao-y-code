@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 
 import SystemSettings from './SystemSettings.vue';
@@ -10,6 +10,21 @@ const turnStepLimitFields = {
   agent_turn_step_limit: 200,
   agent_turn_step_limit_min: 10,
   agent_turn_step_limit_max: 1000,
+};
+
+// 上下文水位基准设置：null 表示未设置（跟随模型真实窗口），取值范围由 min/max 给出
+const contextWatermarkFields = {
+  context_watermark_base: null as number | null,
+  context_watermark_base_min: 50000,
+  context_watermark_base_max: 2000000,
+};
+
+// AI 生成内容目录设置（Task 5）：setting 为原始配置值（未配置为空串），
+// default 为默认目录（占位符与说明文案展示用）
+const aiOutputDirFields = {
+  ai_output_dir: 'C:\\ycode-data\\tmp',
+  ai_output_dir_setting: '',
+  ai_output_dir_default: 'C:\\ycode-data\\tmp',
 };
 
 // 电脑操控设置快照（Task 12）：两个开关默认关闭，浏览器选项独立探测
@@ -24,7 +39,7 @@ const computerSettings = {
     },
     {
       browser: 'chrome', label: 'Google Chrome', available: false,
-      executable: '', unavailable_reason: '未安装或不在 Y-CODE 的 PATH 中',
+      executable: '', unavailable_reason: '未安装或不在 星瑶Code 的 PATH 中',
     },
   ],
   computer_profile_path: 'C:\\ycode-data\\browser-profiles\\edge',
@@ -56,6 +71,8 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [
         {
@@ -87,6 +104,8 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [
         {
@@ -115,6 +134,8 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
     };
@@ -137,6 +158,8 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
     };
@@ -157,6 +180,8 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
     };
@@ -170,6 +195,252 @@ describe('SystemSettings', () => {
     expect(save).not.toHaveBeenCalled();
   });
 
+  // ── 上下文水位基准 ──
+
+  function mountWithContextWatermark(overrides: Record<string, unknown> = {}) {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+      ...overrides,
+    } as typeof store.systemSettings;
+    return { store, wrapper: mount(SystemSettings) };
+  }
+
+  it('renders the context watermark base row with the bounds from the snapshot', () => {
+    const { wrapper } = mountWithContextWatermark();
+
+    const input = wrapper.get<HTMLInputElement>('[data-test="context-watermark-base-input"]');
+    const row = input.element.closest('.setting-row') as HTMLElement;
+
+    expect(row.querySelector('h2')?.textContent).toBe('上下文水位基准');
+    expect(input.attributes('min')).toBe('50000');
+    expect(input.attributes('max')).toBe('2000000');
+  });
+
+  it('shows an empty draft and disables saving while the watermark base is unset', () => {
+    const { wrapper } = mountWithContextWatermark();
+
+    expect(wrapper.get<HTMLInputElement>('[data-test="context-watermark-base-input"]').element.value).toBe('');
+    expect(wrapper.get('[data-test="save-context-watermark-base"]').attributes('disabled')).toBeDefined();
+  });
+
+  it('rejects a watermark base below the minimum without calling the store', async () => {
+    const { store, wrapper } = mountWithContextWatermark();
+    const save = vi.spyOn(store, 'setContextWatermarkBase').mockResolvedValue(true);
+
+    await wrapper.get('[data-test="context-watermark-base-input"]').setValue('49999');
+
+    expect(wrapper.get('[data-test="context-watermark-base-error"]').text()).toContain('50000–2000000');
+    expect(wrapper.get('[data-test="save-context-watermark-base"]').attributes('disabled')).toBeDefined();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('rejects a watermark base above the maximum without calling the store', async () => {
+    const { store, wrapper } = mountWithContextWatermark();
+    const save = vi.spyOn(store, 'setContextWatermarkBase').mockResolvedValue(true);
+
+    await wrapper.get('[data-test="context-watermark-base-input"]').setValue('2000001');
+
+    expect(wrapper.get('[data-test="context-watermark-base-error"]').text()).toContain('50000–2000000');
+    expect(wrapper.get('[data-test="save-context-watermark-base"]').attributes('disabled')).toBeDefined();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('accepts 0 as the explicit no-baseline value and submits it', async () => {
+    const { store, wrapper } = mountWithContextWatermark({ context_watermark_base: 500000 });
+    const save = vi.spyOn(store, 'setContextWatermarkBase').mockResolvedValue(true);
+
+    await wrapper.get('[data-test="context-watermark-base-input"]').setValue('0');
+
+    // 0 是「不设基准」（跟随模型真实窗口），不受 min/max 约束
+    expect(wrapper.find('[data-test="context-watermark-base-error"]').exists()).toBe(false);
+    const button = wrapper.get('[data-test="save-context-watermark-base"]');
+    expect(button.attributes('disabled')).toBeUndefined();
+
+    await button.trigger('click');
+
+    expect(save).toHaveBeenCalledWith(0);
+  });
+
+  it('saves an in-range watermark base through the bridge', async () => {
+    const next = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      context_watermark_base: 800000,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const setBase = vi.fn().mockResolvedValue({ ok: true, settings: next });
+    (window as any).pywebview = { api: { set_context_watermark_base: setBase } };
+    try {
+      const { store, wrapper } = mountWithContextWatermark();
+      const input = wrapper.get('[data-test="context-watermark-base-input"]');
+
+      await input.setValue('800000');
+
+      const button = wrapper.get('[data-test="save-context-watermark-base"]');
+      expect(button.attributes('disabled')).toBeUndefined();
+
+      await button.trigger('click');
+      await flushPromises();
+
+      expect(setBase).toHaveBeenCalledWith(800000);
+      expect(store.systemSettings.context_watermark_base).toBe(800000);
+    } finally {
+      delete (window as any).pywebview;
+    }
+  });
+
+  it('shows the inline error and rolls the draft back when saving the watermark base fails', async () => {
+    const unchanged = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      context_watermark_base: 500000,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const setBase = vi.fn().mockResolvedValue({ ok: false, msg: '范围错误', settings: unchanged });
+    (window as any).pywebview = { api: { set_context_watermark_base: setBase } };
+    try {
+      const { wrapper } = mountWithContextWatermark({ context_watermark_base: 500000 });
+      const input = wrapper.get<HTMLInputElement>('[data-test="context-watermark-base-input"]');
+      expect(input.element.value).toBe('500000');
+
+      await input.setValue('800000');
+      await wrapper.get('[data-test="save-context-watermark-base"]').trigger('click');
+      await flushPromises();
+
+      expect(setBase).toHaveBeenCalledWith(800000);
+      expect(wrapper.get('[data-test="context-watermark-base-error"]').text()).toContain('保存失败');
+      expect(input.element.value).toBe('500000');
+    } finally {
+      delete (window as any).pywebview;
+    }
+  });
+
+  // ── AI 生成内容目录（Task 5）──
+
+  it('saves the AI output directory through the store', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
+    const wrapper = mount(SystemSettings);
+
+    // 占位符显示后端给出的默认目录，用户不填即恢复默认
+    const input = wrapper.get('[data-test="ai-output-dir-input"]');
+    expect(input.attributes('placeholder')).toBe('C:\\ycode-data\\tmp');
+
+    await input.setValue('D:/ai_out');
+    await wrapper.get('[data-test="save-ai-output-dir"]').trigger('click');
+
+    expect(save).toHaveBeenCalledWith('D:/ai_out');
+  });
+
+  it('shows the error and keeps the draft when saving the AI output directory fails', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(false);
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="ai-output-dir-input"]').setValue('D:/ai_out');
+    await wrapper.get('[data-test="save-ai-output-dir"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="ai-output-dir-error"]').text()).toContain('保存失败');
+    expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('D:/ai_out');
+  });
+
+  it('picks the AI output directory from the folder dialog, fills the draft and saves it', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
+    // 选择目录走 store.pickFolderPlain（桌面原生对话框 / 触屏内置浏览器统一入口）
+    const pick = vi.spyOn(store, 'pickFolderPlain').mockImplementation(async (cb: (path: string) => void) => {
+      cb('D:\\ai_out');
+    });
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="pick-ai-output-dir"]').trigger('click');
+    await flushPromises();
+
+    expect(pick).toHaveBeenCalled();
+    expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('D:\\ai_out');
+    expect(save).toHaveBeenCalledWith('D:\\ai_out');
+  });
+
+  it('keeps the draft and saves nothing when the folder dialog is cancelled', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
+    // 用户取消：pickFolderPlain 的回调不触发
+    vi.spyOn(store, 'pickFolderPlain').mockImplementation(async () => {});
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="pick-ai-output-dir"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('');
+    expect(save).not.toHaveBeenCalled();
+  });
+
   // ── 电脑操控区（Task 12）──
 
   function mountWithComputerSettings(overrides: Record<string, unknown> = {}) {
@@ -180,6 +451,8 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       ...overrides,
     } as typeof store.systemSettings;
@@ -193,7 +466,7 @@ describe('SystemSettings', () => {
     expect(wrapper.get('[data-test="computer-control-switch"]').attributes('aria-checked')).toBe('false');
     const chromeOption = wrapper.get('[data-test="browser-option-chrome"]');
     expect(chromeOption.attributes('disabled')).toBeDefined();
-    expect(chromeOption.text()).toContain('未安装或不在 Y-CODE 的 PATH 中');
+    expect(chromeOption.text()).toContain('未安装或不在 星瑶Code 的 PATH 中');
     expect(wrapper.get('[data-test="browser-option-edge"]').attributes('disabled')).toBeUndefined();
   });
 
@@ -251,7 +524,7 @@ describe('SystemSettings', () => {
 
     expect(wrapper.get('[data-test="computer-profile-path"]').text()).toContain('browser-profiles\\edge');
     expect(wrapper.get('[data-test="computer-privacy-notice"]').text()).toBe(
-      '开启后，当前页面或桌面截图会发送给当前模型 Provider；Y-CODE 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。',
+      '开启后，当前页面或桌面截图会发送给当前模型 Provider；星瑶Code 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。',
     );
   });
 
@@ -263,7 +536,7 @@ describe('SystemSettings', () => {
     expect(preflight).toContain('Microsoft Edge');
     expect(preflight).toContain('Ctrl+Alt+Esc');
     // 浏览器不可用必须显示原因，绝不静默换浏览器
-    expect(preflight).toContain('未安装或不在 Y-CODE 的 PATH 中');
+    expect(preflight).toContain('未安装或不在 星瑶Code 的 PATH 中');
   });
 
   it('hides the clickable enable controls on the mobile viewport', async () => {
@@ -299,6 +572,8 @@ describe('computer active model capability hint', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       ...overrides,
     } as typeof store.systemSettings;
@@ -323,13 +598,127 @@ describe('computer active model capability hint', () => {
 
   it('shows eligible summary when switches on and model qualifies', () => {
     const wrapper = mountWith({ browser_control_enabled: true });
-    const hint = wrapper.get('[data-test="computer-model-capability-hint"]');
+    // 合格提示是说明性内容，收在「环境检测与安全提示」折叠区里，不占主视图行
+    const hint = wrapper.get('[data-test="computer-diagnostics-capability-hint"]');
     expect(hint.text()).toContain('已具备电脑操控资格');
     expect(hint.classes()).not.toContain('blocked');
+    // 不合格时才是需要立刻看到的问题，仍然放在折叠区外
+    expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
   });
 
   it('hides the hint when both switches are off', () => {
     const wrapper = mountWith({});
     expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
+  });
+});
+
+// ── 运行自检（T3b）──
+
+describe('doctor self-check entry', () => {
+  const doctorApi = { run_doctor: vi.fn() };
+  const baseSettings = {
+    command_shell: 'auto',
+    command_shell_available: true,
+    command_shell_error: '',
+    remote_token_ttl: 86400,
+    ...turnStepLimitFields,
+    ...contextWatermarkFields,
+    ...aiOutputDirFields,
+    ...computerSettings,
+    command_shell_options: [],
+  };
+
+  function mountWithDoctor() {
+    setActivePinia(createPinia());
+    const store = useAppStore();
+    store.systemSettings = { ...baseSettings } as typeof store.systemSettings;
+    return { store, wrapper: mount(SystemSettings) };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (window as any).pywebview = { api: doctorApi };
+  });
+
+  afterEach(() => {
+    delete (window as any).pywebview;
+  });
+
+  it('runs the aggregate self-check through the bridge and renders name/status/detail/hint', async () => {
+    doctorApi.run_doctor.mockResolvedValue({
+      ok: true,
+      summary: { ok: 1, warn: 1, fail: 1, skip: 1 },
+      checks: [
+        { name: '环境与版本', status: 'ok', detail: '星瑶Code v1.0.0 · Python 3.11.9 · win32', hint: '' },
+        { name: '配置', status: 'warn', detail: '存在未知配置键：memory_compression.retain_cout', hint: '未知键多为拼写错误，请删除或修正' },
+        { name: '凭据', status: 'fail', detail: '1/1 个 API Key 解密失败', hint: '请在模型设置中重新填写并保存' },
+        { name: '模型端点', status: 'skip', detail: '已跳过网络探测（skip_network=True）', hint: '' },
+      ],
+    });
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(doctorApi.run_doctor).toHaveBeenCalledTimes(1);
+    expect(wrapper.get('[data-test="doctor-summary"]').text()).toBe('共 4 项：通过 1、警告 1、失败 1、跳过 1');
+
+    const failed = wrapper.get('[data-test="doctor-check-凭据"]');
+    expect(failed.text()).toContain('失败');
+    expect(failed.text()).toContain('1/1 个 API Key 解密失败');
+    expect(failed.text()).toContain('建议：请在模型设置中重新填写并保存');
+    expect(wrapper.get('[data-test="doctor-check-环境与版本"]').text()).toContain('通过');
+    expect(wrapper.get('[data-test="doctor-check-模型端点"]').text()).toContain('跳过');
+  });
+
+  it('disables the button while the self-check is running', async () => {
+    let resolveRun: ((report: unknown) => void) | null = null;
+    doctorApi.run_doctor.mockImplementation(
+      () => new Promise(resolve => { resolveRun = resolve; }),
+    );
+    const { wrapper } = mountWithDoctor();
+    const button = wrapper.get('[data-test="run-doctor-button"]');
+
+    await button.trigger('click');
+
+    expect(button.text()).toContain('检查中');
+    expect(button.attributes('disabled')).toBeDefined();
+
+    resolveRun!({ ok: true, checks: [], summary: { ok: 0, warn: 0, fail: 0, skip: 0 } });
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="run-doctor-button"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('shows the bridge error message when the report is not ok', async () => {
+    doctorApi.run_doctor.mockResolvedValue({ ok: false, msg: '检查器崩溃', checks: [] });
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('检查器崩溃');
+    expect(wrapper.find('[data-test="doctor-results"]').exists()).toBe(false);
+  });
+
+  it('shows an error when the bridge call rejects', async () => {
+    doctorApi.run_doctor.mockRejectedValue(new Error('bridge down'));
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('bridge down');
+  });
+
+  it('explains that pywebview is required when the bridge is unavailable', async () => {
+    delete (window as any).pywebview;
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('连接失败');
+    expect(doctorApi.run_doctor).not.toHaveBeenCalled();
   });
 });

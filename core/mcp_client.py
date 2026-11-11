@@ -213,6 +213,7 @@ class MCPManager:
         import config
         self.config_file = config.MCP_FILE
         self.servers = {} # name -> {"session": session, "stack": stack}
+        self.server_errors = {} # name -> 最近一次连接失败原因（连接成功时清除）
         self.tool_schemas = []
         self.server_of_tool = {} # tool_name -> server_name
         self.loop = asyncio.new_event_loop()
@@ -338,10 +339,13 @@ class MCPManager:
             # 手工编辑 mcp.json 会绕过 add_server 的校验，连接前强制复核同一套规则，
             # 校验失败拒绝 spawn，防止任意命令执行 / 危险环境变量注入。
             if env is not None and not isinstance(env, dict):
+                self.server_errors[name] = "env 必须是对象"
                 _emit_status(f"\n[MCP] 拒绝连接服务 {name}: env 必须是对象")
                 return None
             launch_ok, launch_error = _validate_mcp_launch(command, env)
             if not launch_ok:
+                # 记录失败原因，供 list_servers()/增删改接口如实反馈
+                self.server_errors[name] = launch_error
                 logging.getLogger(__name__).warning(
                     "MCP 服务 %s 启动校验失败，已拒绝连接: %s", name, launch_error
                 )
@@ -423,6 +427,8 @@ class MCPManager:
             self.server_of_tool = {**self.server_of_tool, **new_tool_map}
 
             _emit_status(f"\n[MCP] 成功连接服务: {name}")
+            # 连接成功：清除该服务此前留下的失败原因
+            self.server_errors.pop(name, None)
             # 连接成功后把仍是明文的 env 值回写为加密版本（一次性迁移）
             self._encrypt_plaintext_env_on_disk(name)
             return name
@@ -441,6 +447,8 @@ class MCPManager:
                 await stack.aclose()
             except Exception:
                 pass
+            # 记录脱敏后的失败原因（如 "Connection closed"），供上层如实反馈
+            self.server_errors[name] = _redact_text(e)
             _emit_status(f"\n[MCP] 连接服务 {name} 失败: {_redact_text(e)}")
             return None
 
@@ -491,6 +499,7 @@ class MCPManager:
             # 支持 enabled 字段：显式 false 时跳过连接，配置保留方便随时启用
             # 未设置 enabled 或 enabled=true 都按启用处理（向后兼容旧配置）
             if isinstance(conf, dict) and conf.get("enabled", True) is False:
+                # 主动跳过的服务不算连接失败，不写入 server_errors
                 _emit_status(f"\n[MCP] 跳过已禁用的服务: {name}")
                 continue
             names.append(name)
@@ -604,6 +613,7 @@ class MCPManager:
                 self.tool_schemas = []
                 self.server_of_tool = {}
                 self.servers = {}
+                self.server_errors = {}
                 self._connect_future = None
                 self._connect_future_is_placeholder = False
             # 3) 重新读盘 + 立即触发一次连接（不阻塞等待结果）
@@ -612,13 +622,25 @@ class MCPManager:
         except Exception as e:
             return False, f"重连失败: {_redact_text(e)}"
 
+    def _server_tool_count(self, name):
+        """统计某 server 当前已就绪的工具数（按工具名 "<server>__" 前缀计数）。"""
+        prefix = f"{name}__"
+        return sum(
+            1 for s in self.tool_schemas
+            if str(s.get("function", {}).get("name", "")).startswith(prefix)
+        )
+
+    def _connect_failure_reason(self, name):
+        """取该 server 最近一次连接失败原因，无记录时给出兜底文本。"""
+        return self.server_errors.get(name) or "未知原因"
+
     def set_server_enabled(self, name, enabled):
         """启用/禁用某个 MCP server，并立即重连生效。
 
         会写回 mcp.json：把 server.enabled 字段设为 True/False。
         若 server 不存在返回失败；若原本就没 enabled 字段，会新增。
         禁用后下次 reconnect 不会拉起该 server，但配置保留以便随时启用。
-        返回 (ok: bool, message: str)。
+        返回 (ok: bool, message: str)；消息按真实连接结果生成，不暗示未发生的连接成功。
         """
         if self._closed:
             return False, "MCP 管理器已关闭（进程退出中）"
@@ -637,8 +659,12 @@ class MCPManager:
             ok, msg = self.reconnect()
             if not ok:
                 return True, f"已更新 {name}.enabled={enabled}，但重连失败: {msg}"
-            action = "启用" if enabled else "禁用"
-            return True, f"已{action}服务 {name}，并重新发起连接"
+            if not enabled:
+                # 禁用后本就不该有连接，消息不得暗示连接成功
+                return True, f"已禁用服务 {name}（配置保留，可随时重新启用）"
+            if name in self.servers:
+                return True, f"已启用服务 {name}（{self._server_tool_count(name)} 个工具）"
+            return True, f"已启用 {name} 配置，但连接失败: {self._connect_failure_reason(name)}"
         except Exception as e:
             return False, f"更新失败: {_redact_text(e)}"
 
@@ -652,12 +678,18 @@ class MCPManager:
           args: 命令参数数组（如 ["-y", "firecrawl-mcp"]）
           env: 环境变量字典（如 {"FIRECRAWL_API_KEY": "fc-xxx"}），可为 None
           enabled: 是否立即启用，默认 True
-        返回 (ok: bool, message: str)。
+        返回 (ok: bool, message: str)；配置写盘成功时 ok 恒为 True，
+        但消息会如实说明是否真正连上（连不上时附带失败原因）。
         """
         if self._closed:
             return False, "MCP 管理器已关闭（进程退出中）"
         if not name or not isinstance(name, str):
             return False, "server 名称不能为空"
+        # 名称不得含 "__"：工具名形如 f"{server}__{tool}"，重连按前缀
+        # f"{name}__" 幂等替换 schema——名为 "a__b" 的 server 会剥掉
+        # server "a" 的 "b__*" 工具并把它们重路由到自己（本地配置内遮蔽）
+        if "__" in name:
+            return False, "server 名称不能包含双下划线（__，与工具名前缀分隔符冲突）"
         if not command or not isinstance(command, str):
             return False, "command 不能为空"
         if not isinstance(args, list):
@@ -686,7 +718,10 @@ class MCPManager:
             ok, msg = self.reconnect()
             if not ok:
                 return True, f"已写入 {name} 配置，但重连失败: {msg}"
-            return True, f"已新增服务 {name}（command={command}），并重新发起连接"
+            # 按真实结果反馈：只有该 server 真的连上才说“已新增服务”
+            if name in self.servers:
+                return True, f"已新增服务 {name}（{self._server_tool_count(name)} 个工具）"
+            return True, f"已写入 {name} 配置，但连接失败: {self._connect_failure_reason(name)}"
         except Exception as e:
             return False, f"新增失败: {_redact_text(e)}"
 
@@ -694,7 +729,7 @@ class MCPManager:
         """删除一个 MCP server 配置，并立即重连生效。
 
         供 AI 工具和 /mcp CLI 配置器调用。
-        返回 (ok: bool, message: str)。
+        返回 (ok: bool, message: str)；消息只陈述删除结果，不暗示连接成功。
         """
         if self._closed:
             return False, "MCP 管理器已关闭（进程退出中）"
@@ -711,15 +746,16 @@ class MCPManager:
             ok, msg = self.reconnect()
             if not ok:
                 return True, f"已删除 {name}，但重连失败: {msg}"
-            return True, f"已删除服务 {name}，并重新发起连接"
+            return True, f"已删除服务 {name}（已从 mcp.json 移除配置）"
         except Exception as e:
             return False, f"删除失败: {_redact_text(e)}"
 
     def list_servers(self):
         """返回所有 MCP server 配置的 JSON 字符串（供 AI 工具读取）。
 
-        包含 enabled/command/args/env 字段，env 中的 API Key 会做掩码处理
-        （前 4 位 + **** + 后 4 位），避免敏感信息泄露给 LLM。
+        包含 enabled/command/args/env/connected/last_error 字段，env 中的 API Key
+        会做全掩码处理（***），避免敏感信息泄露给 LLM。
+        last_error 为最近一次连接失败原因（无失败时为 null），便于排查连接问题。
         """
         try:
             with self._config_lock:
@@ -735,11 +771,22 @@ class MCPManager:
                     "command": conf.get("command", ""),
                     "args": _redact_arguments(conf.get("args", [])),
                     "connected": name in self.servers,
+                    "last_error": self.server_errors.get(name),
                 }
                 # MCP 配置返回给模型时，环境变量值一律隐藏。调用方无需读取明文。
                 env = conf.get("env")
                 if env:
                     item["env"] = {key: _redact_secret(value) for key, value in env.items()}
+                    # 加密失败的值按明文落盘（_encrypt_env_values 的可用性优先
+                    # 降级）：状态里显式标出，让 /mcp 的用户能发现该 server
+                    # 的 env 未加密，而不是只藏在日志里
+                    plaintext_keys = [
+                        key
+                        for key, value in env.items()
+                        if not str(value or "").startswith(("dpapi:", "keyring:"))
+                    ]
+                    if plaintext_keys:
+                        item["env_plaintext"] = plaintext_keys
                 else:
                     item["env"] = None
                 result.append(item)

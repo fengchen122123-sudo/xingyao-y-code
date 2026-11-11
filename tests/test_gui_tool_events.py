@@ -26,6 +26,27 @@ def test_session_from_turn_id_uses_the_prefix_before_the_last_separator():
     assert _session_from_turn_id("") == ""
 
 
+def _use_real_turn_undo(monkeypatch, tmp_path, session="session"):
+    """回合生命周期重排后 worker 依赖真实 turn_undo 服务与会话行。
+
+    用真实 MemoryManager 配置服务并预建会话行；worker 里的假 Memory 继续
+    承担消息/绑定桩。
+    """
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
+
+    manager = MemoryManager(str(tmp_path / "undo.db"))
+    tu_service.configure_default_manager(manager, blob_root=tmp_path / "blobs")
+    original_resolve = tu_service.resolve_session_id
+
+    def _resolving(session_name):
+        manager.ensure_session(session_name)
+        return original_resolve(session_name)
+
+    monkeypatch.setattr(tu_service, "resolve_session_id", _resolving)
+    return manager
+
+
 def test_session_is_created_before_model_binding_and_unchanged_binding_skips_update():
     """首回合必须先建 session；第二回合同模型不得重复 UPDATE+commit。"""
     calls = []
@@ -235,7 +256,7 @@ def test_bridge_forwards_diff_binding_and_full_counts(monkeypatch):
     assert diff["removed"] == 45
 
 
-def test_bridge_error_then_turn_error_has_single_message_owner(monkeypatch):
+def test_bridge_error_then_turn_error_has_single_message_owner(monkeypatch, tmp_path):
     events = make_events([
         ("error", {"message": "provider disconnected"}),
         ("turn_error", {"message": "provider disconnected"}),
@@ -250,7 +271,7 @@ def test_bridge_error_then_turn_error_has_single_message_owner(monkeypatch):
     assert turn_error_msgs == ["provider disconnected"]
 
 
-def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
+def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch, tmp_path):
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._bg_summary_pending_sessions = set()
     bridge._bg_summary_lock = threading.Lock()
@@ -265,6 +286,9 @@ def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
     bridge._emit_token_usage = lambda: None
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._message_queues = {}
     emitted = []
     bridge.emit_event = lambda kind, data: emitted.append((kind, data))
@@ -308,6 +332,9 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge._maybe_auto_rename = lambda _session_name: None
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
@@ -334,8 +361,6 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
         return []
 
     monkeypatch.setattr("core.agent_service.prepare_turn_messages", capture_context)
-    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None)
-    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
 
     bridge._run_turn_worker("inspect", "project-session")
 
@@ -345,7 +370,7 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     assert str(get_workdir()) == os.path.realpath(launch)
 
 
-def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(monkeypatch):
+def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(monkeypatch, tmp_path):
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {"session_abc123": threading.Event()}
     bridge._active_turns = {}
@@ -366,6 +391,9 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
     bridge._maybe_auto_rename = lambda _session_name: "检查项目"
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
@@ -390,10 +418,6 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
     monkeypatch.setattr(
         "core.agent_service.prepare_turn_messages", lambda *args, **kwargs: []
     )
-    monkeypatch.setattr(
-        "core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None
-    )
-    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
 
     bridge._run_turn_worker("检查项目", "session_abc123")
 
@@ -429,6 +453,7 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
 )
 def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     monkeypatch,
+    tmp_path,
     yielded_message,
     raised_message,
     expected_toast_messages,
@@ -453,6 +478,9 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     bridge._maybe_auto_rename = lambda session_name: None
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "set_workdir": lambda self, workdir: None,
@@ -479,10 +507,6 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     monkeypatch.setattr(
         "core.agent_service.prepare_turn_messages", lambda *args, **kwargs: []
     )
-    monkeypatch.setattr(
-        "core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None
-    )
-    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
     monkeypatch.setattr("core.llm.chat_with_model_events", failing_events)
 
     bridge._run_turn_worker("hello", "session")
@@ -597,6 +621,89 @@ def test_bridge_forwards_round_started_event(monkeypatch):
     assert any(kind == "round_started" and data.get("round") == 2 for kind, data in emitted)
 
 
+def _bare_bridge_with_snapshots(session_name, snapshots):
+    """构造只够驱动 _consume_turn_events 的桥接裸实例（与 consume_bridge_events 同套路），
+    区别是额外注入进行中回合快照，供断言按轮清零行为。"""
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._cancel_events = {session_name: threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
+    bridge._active_turn_snapshots = dict(snapshots)
+    bridge._active_turn_lock = threading.Lock()
+    return bridge
+
+
+def _consume_events_with_bridge(bridge, monkeypatch, events, session_name="session"):
+    """在给定裸实例上消费事件，返回 (kind, data) 列表。"""
+    monkeypatch.setattr(
+        "core.llm.chat_with_model_events",
+        lambda *args, **kwargs: iter(events),
+    )
+    emitted = []
+    bridge.emit_event = lambda kind, data: emitted.append((kind, data))
+    bridge._consume_turn_events(
+        [], "model", "key", None, session_name, "turn-gui-tools"
+    )
+    return emitted
+
+
+def test_round_started_clears_turn_snapshot_streaming_thinking_and_tool_calls(monkeypatch):
+    """round_started 必须按轮清零快照的流式/思考文本与工具列表。
+
+    快照若只累加不清零，中途接入或切换运行中会话时整回合文本会被灌进最后一个气泡。
+    """
+    bridge = _bare_bridge_with_snapshots("session", {
+        "session": {
+            "session_name": "session",
+            "thinking_text": "第一轮思考",
+            "streaming_text": "第一轮正文",
+            "tool_calls": [{"id": "cmd-1", "name": "execute_command"}],
+        },
+    })
+
+    _consume_events_with_bridge(
+        bridge, monkeypatch, make_events([("round_started", {"round": 2})])
+    )
+
+    snapshot = bridge._active_turn_snapshots["session"]
+    assert snapshot["streaming_text"] == ""
+    assert snapshot["thinking_text"] == ""
+    assert snapshot["tool_calls"] == []
+
+
+def test_round_started_clears_only_target_session_snapshot_and_still_forwards(monkeypatch):
+    """清零只作用于本会话：其他会话快照保持原值，且 round_started 仍照常透传。"""
+    bridge = _bare_bridge_with_snapshots("session", {
+        "session": {
+            "session_name": "session",
+            "thinking_text": "旧思考",
+            "streaming_text": "旧正文",
+            "tool_calls": [{"id": "cmd-1"}],
+        },
+        "other-session": {
+            "session_name": "other-session",
+            "thinking_text": "别人的思考",
+            "streaming_text": "别人的正文",
+            "tool_calls": [{"id": "cmd-2"}],
+        },
+    })
+
+    emitted = _consume_events_with_bridge(
+        bridge, monkeypatch, make_events([("round_started", {"round": 2})])
+    )
+
+    assert [kind for kind, _ in emitted] == ["round_started"]
+    assert emitted[0][1] == {"round": 2, "session_name": "session"}
+    other = bridge._active_turn_snapshots["other-session"]
+    assert other["streaming_text"] == "别人的正文"
+    assert other["thinking_text"] == "别人的思考"
+    assert other["tool_calls"] == [{"id": "cmd-2"}]
+
+
 class _AliveThread:
     """模拟存活的回合线程（is_alive 恒真）。"""
 
@@ -634,7 +741,7 @@ def test_stop_current_turn_cancels_permission_wait_and_foreground_subagents(monk
     assert cancelled_foreground == [("session", "session:turn-1")]
 
 
-def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
+def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch, tmp_path):
     """回合运行期间 _active_turn_ids 记录 session → turn_id，结束后清理；
     回合结束按 turn_id（不是会话名）清理权限 broker 的残留等待。"""
     bridge = ApiBridge.__new__(ApiBridge)
@@ -656,6 +763,9 @@ def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
     bridge._maybe_auto_rename = lambda _s: None
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *a, **k: None,
@@ -687,18 +797,18 @@ def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
     })
     monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
     monkeypatch.setattr("core.agent_service.prepare_turn_messages", lambda *a, **k: [])
-    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *a, **k: None)
-    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
 
     bridge._run_turn_worker("hello", "session")
 
-    assert seen_turn_ids and seen_turn_ids[0].startswith("session:")
+    # 新协议：turn_id 是 32 位随机 UUID（不透明、全局唯一，不嵌会话名）
+    assert seen_turn_ids and len(seen_turn_ids[0]) == 32
+    assert all(c in "0123456789abcdef" for c in seen_turn_ids[0])
     assert "session" not in bridge._active_turn_ids
     # 清理必须按 turn_id，历史实现传会话名永远不命中
     assert cancelled_owners == seen_turn_ids
 
 
-def test_bg_summary_pending_is_bucketed_per_session(monkeypatch):
+def test_bg_summary_pending_is_bucketed_per_session(monkeypatch, tmp_path):
     """M22：pending 按会话分桶，多会话并行时互不覆盖；回合结束只消费自己的桶。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._shutting_down = False
@@ -706,6 +816,9 @@ def test_bg_summary_pending_is_bucketed_per_session(monkeypatch):
     bridge._bg_summary_lock = threading.Lock()
     bridge._active_turns = {"s1": _AliveThread(), "s2": _AliveThread()}
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
 
     monkeypatch.setattr(
         "core.tools.subagent_manager.has_running_background_tasks",
@@ -718,7 +831,7 @@ def test_bg_summary_pending_is_bucketed_per_session(monkeypatch):
     assert bridge._bg_summary_pending_sessions == {"s1", "s2"}
 
 
-def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch):
+def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch, tmp_path):
     """用户点终止后：记录取消标记、清掉挂起的自动汇总、抑制计划续推；
     _maybe_start_bg_summary_turn 对该会话不再自动发起汇总回合。"""
     bridge = ApiBridge.__new__(ApiBridge)
@@ -744,6 +857,9 @@ def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch
     # 被用户取消的会话不自动发起汇总回合：提前返回，不入 triggered、不起线程
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._active_turns = {}
     bridge._bg_summary_triggered = set()
     import core.tools as core_tools
@@ -755,6 +871,37 @@ def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch
 
     assert "session" not in bridge._bg_summary_triggered
     assert "session" not in bridge._active_turns
+
+    clear_plan_auto_continue_suppression("session")
+
+
+def test_stop_current_turn_reports_idle_when_no_active_turn(monkeypatch):
+    """停止请求没命中活跃回合时必须明确回 idle=True。
+
+    回归背景：旧实现 `_cancel_events.get(target)` 为空时静默返回 ok，前端既不
+    收到任何新事件、也拿不到「本来就没在跑」的结论，界面上的残留运行态永远
+    不会被纠正，表现为用户反复点停止毫无反应。命中活跃回合时 idle=False，
+    前端才继续等 turn_cancelled 终态事件。
+    """
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._cancel_events = {}
+    bridge._active_turn_ids = {}
+    bridge._user_cancelled_sessions = set()
+
+    res = bridge.stop_current_turn("session")
+
+    assert res["ok"] is True
+    assert res["idle"] is True
+
+    bridge._cancel_events["session"] = threading.Event()
+    res = bridge.stop_current_turn("session")
+
+    assert res["ok"] is True
+    assert res["idle"] is False
+    assert bridge._cancel_events["session"].is_set()
+
+    from core.plan import clear_plan_auto_continue_suppression
 
     clear_plan_auto_continue_suppression("session")
 
@@ -788,6 +935,9 @@ def test_turn_finish_emits_empty_plan_updated_when_plan_all_terminal(tmp_path, m
     bridge._maybe_auto_rename = lambda _session_name: "检查项目"
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
@@ -807,8 +957,6 @@ def test_turn_finish_emits_empty_plan_updated_when_plan_all_terminal(tmp_path, m
     })
     monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
     monkeypatch.setattr("core.agent_service.prepare_turn_messages", lambda *args, **kwargs: [])
-    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None)
-    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
 
     bridge._run_turn_worker("检查项目", "sess-plan-cleared")
 
@@ -861,6 +1009,9 @@ def test_turn_finish_survives_plan_clear_failure(tmp_path, monkeypatch):
     bridge._maybe_auto_rename = lambda _session_name: "检查项目"
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
+    _use_real_turn_undo(monkeypatch, tmp_path)
     bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
@@ -880,8 +1031,6 @@ def test_turn_finish_survives_plan_clear_failure(tmp_path, monkeypatch):
     })
     monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
     monkeypatch.setattr("core.agent_service.prepare_turn_messages", lambda *args, **kwargs: [])
-    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None)
-    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
 
     bridge._run_turn_worker("检查项目", "sess-plan-clear-fail")
 

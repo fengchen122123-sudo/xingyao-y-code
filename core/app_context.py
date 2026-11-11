@@ -9,6 +9,7 @@ core/llm.py 及其他核心模块通过此模块统一访问运行时状态，
 """
 
 from __future__ import annotations
+import contextlib
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -143,18 +144,121 @@ def get_active_model_tuple() -> Optional[tuple]:
 # 权限相关
 # ---------------------------------------------------------------------------
 
+# 线程级权限档位：多会话并行时每个回合线程绑定自己的会话档位，鉴权路径
+# （get_permission_mode）据此判定，避免一个会话的档位污染其他会话。
+_permission_mode_tls = threading.local()
+
+
+def set_thread_permission_mode(mode: Any) -> None:
+    """绑定当前线程的权限档位（回合入口调用；传 None 解绑回退全局）。"""
+    if mode is None:
+        _permission_mode_tls.mode = None
+    else:
+        _permission_mode_tls.mode = normalize_permission_mode(mode)
+
+
+def get_thread_permission_mode() -> str | None:
+    """返回当前线程绑定的权限档位；未绑定返回 None。"""
+    return getattr(_permission_mode_tls, "mode", None)
+
+
+@contextlib.contextmanager
+def permission_mode_scope(mode: Any):
+    """线程内临时绑定权限档位，退出时恢复原值（支持嵌套）。
+
+    回合入口用会话生效档位包裹整段执行，回合期间档位冻结，下轮才可能变化。
+    与 workspace_scope 一样，裸设置在线程复用时可能残留，必须用 scope 恢复。
+    """
+    previous = getattr(_permission_mode_tls, "mode", None)
+    set_thread_permission_mode(mode)
+    try:
+        yield
+    finally:
+        _permission_mode_tls.mode = previous
+
+
+# ---------------------------------------------------------------------------
+# 自动化回合标记（G3：防任务自我繁殖）
+# ---------------------------------------------------------------------------
+
+# 线程级自动化回合标记：星轨自动化派发的回合线程绑定本次运行 id，工具 schema
+# 层（core.llm）与执行层（core.harness.tool_pipeline）据此隐藏/拒绝写类自动化
+# 工具。仅作为「本回合来源」标记，不承担跨线程权限判定（那是
+# _automation_turn_labels 的职责）。
+_automation_turn_tls = threading.local()
+
+
+def set_thread_automation_turn(run_id: Any) -> None:
+    """绑定当前线程的自动化回合标记（run_id 为空即解绑）。"""
+    _automation_turn_tls.run_id = str(run_id or "") or None
+
+
+def get_thread_automation_turn() -> str | None:
+    """返回当前线程所属的自动化运行 id；非自动化回合返回 None。"""
+    return getattr(_automation_turn_tls, "run_id", None)
+
+
+@contextlib.contextmanager
+def automation_turn_scope(run_id: Any):
+    """线程内临时标记「本回合由星轨自动化派发」，退出时恢复原值（支持嵌套）。
+
+    必须用 scope 而不是裸 set_thread_automation_turn：回合线程会被复用（同一
+    线程承接后续普通回合），裸设置只要有一条提前返回/异常路径漏了解绑，普通
+    会话就会永久丢掉 automation_* 写工具并被门控拒绝——正是 scope 的 finally
+    负责兜底恢复。
+    """
+    previous = getattr(_automation_turn_tls, "run_id", None)
+    set_thread_automation_turn(run_id)
+    try:
+        yield
+    finally:
+        _automation_turn_tls.run_id = previous
+
+
 def get_permission_mode() -> str:
-    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。"""
+    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。
+
+    线程级绑定优先（多会话并行时每个回合线程持有自己的会话档位），未绑定时
+    回退到入口层注册的全局值；鉴权路径（core.permission_terminal）据此判定，
+    因此会话级完整访问档位必须经 set_thread_permission_mode 写入才能生效。
+    受管策略存在时在此做上限兜底：任何来源（配置文件 / 会话切换 / 运行时命令）
+    的超限请求都在消费点降档，保证所有消费方拿到的都是合规模式。
+    """
+    thread_mode = getattr(_permission_mode_tls, "mode", None)
+    if thread_mode is not None:
+        return _apply_managed_ceiling(normalize_permission_mode(thread_mode))
     ctx = _context
     if ctx is None:
-        return normalize_permission_mode(_permission_mode_fallback)
-    return normalize_permission_mode(getattr(ctx, "permission_mode", _permission_mode_fallback))
+        mode = normalize_permission_mode(_permission_mode_fallback)
+    else:
+        mode = normalize_permission_mode(
+            getattr(ctx, "permission_mode", _permission_mode_fallback)
+        )
+    return _apply_managed_ceiling(mode)
+
+
+def _apply_managed_ceiling(mode: str) -> str:
+    """套用受管策略的权限模式上限（无策略/异常时原样返回）。"""
+    try:
+        # 延迟导入：本模块被大量模块导入，受管策略模块反向依赖本模块的规范化函数
+        from core.managed_policy import clamp_permission_mode
+
+        return clamp_permission_mode(mode)
+    except Exception:
+        return mode
 
 
 def set_permission_mode(value: Any) -> str:
-    """写入权限模式（自动规范化），返回最终生效的规范值。"""
+    """写入权限模式（自动规范化），返回最终生效的规范值。
+
+    若当前线程已绑定线程级档位（回合/子代理/并行工具线程内），同步更新该
+    绑定，避免"改了全局值但本线程仍按旧档位鉴权"的语义割裂；未绑定时只写
+    全局值（入口层切换会话默认档位的旧语义）。
+    """
     global _permission_mode_fallback
     canonical = normalize_permission_mode(value)
+    if getattr(_permission_mode_tls, "mode", None) is not None:
+        _permission_mode_tls.mode = canonical
     _permission_mode_fallback = canonical
     ctx = _context
     if ctx is not None:
@@ -208,14 +312,20 @@ def get_manager() -> Optional[Any]:
 
 
 def set_manager(manager: Any) -> None:
-    """显式注册 MemoryManager（没有 ctx 或 ctx 不暴露 manager 时的兜底通道）。"""
+    """显式注册 MemoryManager（没有 ctx 或 ctx 不暴露 manager 时的兜底通道）。
+
+    注意：ctx 已注册且其 manager 是只读视图（如 CLI 的 _CLIContext 代理到
+    模块全局）时，ctx 优先级高于本 fallback——调用方若需覆盖，必须先注销 ctx。
+    """
     global _manager_fallback
     _manager_fallback = manager
     ctx = _context
     if ctx is not None:
         try:
             ctx.manager = manager
-        except Exception:
+        except AttributeError:
+            # ctx 的 manager 是只读 property（CLI/GUI 代理到各自全局状态），
+            # 此时以 ctx 的实时值为准，fallback 仅作无 ctx 环境的兜底。
             pass
 
 
@@ -263,6 +373,39 @@ def set_thread_session(session_id: str | None) -> None:
 
 def get_thread_session() -> str | None:
     return getattr(_thread_session_tls, "session_id", None)
+
+
+# ---------------------------------------------------------------------------
+# 工具调用归属（子代理卡片按派生它的调用分组）
+# ---------------------------------------------------------------------------
+# 并行工具线程各自绑定本线程正在执行的调用 id：run_subagent 创建子代理时
+# 据此把任务归属到派生它的调用上。GUI 卡片据此只展示自己创建的子代理，
+# 而不是把会话内所有（含历史）子代理都堆到同一张卡上。
+_thread_tool_call_tls = threading.local()
+
+
+def set_thread_tool_call_id(call_id: str | None) -> None:
+    """绑定/解绑当前线程正在执行的工具调用 id。"""
+    _thread_tool_call_tls.call_id = str(call_id).strip() if call_id else None
+
+
+def get_thread_tool_call_id() -> str | None:
+    return getattr(_thread_tool_call_tls, "call_id", None)
+
+
+@contextlib.contextmanager
+def tool_call_scope(call_id: str | None):
+    """线程内临时绑定工具调用 id，退出时恢复原值（支持嵌套）。
+
+    必须用 scope 而非裸设置：并行工具线程会被复用，裸设置一旦有异常路径
+    漏了解绑，后续调用创建的子代理会记到上一个调用 id 上（串卡）。
+    """
+    previous = getattr(_thread_tool_call_tls, "call_id", None)
+    set_thread_tool_call_id(call_id)
+    try:
+        yield
+    finally:
+        _thread_tool_call_tls.call_id = previous
 
 
 # ---------------------------------------------------------------------------

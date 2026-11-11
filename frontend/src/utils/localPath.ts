@@ -8,6 +8,9 @@ const KNOWN_EXTENSIONS = new Set([
   'txt', 'log', 'csv', 'xml', 'sql', 'sh', 'bat', 'ps1', 'c', 'h', 'cpp',
   'hpp', 'java', 'go', 'rs', 'rb', 'php', 'kt', 'swift', 'cs', 'fs', 'm',
   'gradle', 'properties', 'env', 'gitignore',
+  // 办公文档：`报告.docx`、`docs/方案.pptx` 这类相对路径也要能被识别成可点链接
+  // （绝对路径本来就按盘符识别）。rtf/odt/ods/odp 覆盖 WPS/LibreOffice 另存格式。
+  'doc', 'docx', 'rtf', 'odt', 'xls', 'xlsx', 'ods', 'ppt', 'pptx', 'odp',
 ]);
 
 function extOf(s: string): string {
@@ -61,4 +64,102 @@ export function toAbsoluteLocalPath(raw: string, workdir: string): string | null
     baseSegs.push(seg);
   }
   return baseSegs.join('\\');
+}
+
+const HTML_EXTENSIONS = new Set(['html', 'htm']);
+const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown']);
+const PDF_EXTENSIONS = new Set(['pdf']);
+// Office 文档：右栏不能直接渲染，需先由后端转成 PDF，再交「文档」页签（pdf.js）。
+// rtf/odt/ods/odp 一并算进来（WPS/LibreOffice 的另存格式，后端转换器同样吃）。
+export const OFFICE_EXTENSIONS = new Set([
+  'doc', 'docx', 'rtf', 'odt',
+  'xls', 'xlsx', 'ods',
+  'ppt', 'pptx', 'odp',
+]);
+// 右栏能打开的文件类型：pdf 与 office（进「文档」页签，pdf.js 自绘）、
+// html/htm（内嵌浏览器当网页渲染）、md/markdown（先渲染成预览 HTML 再交内嵌浏览器）。
+// 其它类型仍走源码预览弹窗。
+const RIGHT_PANEL_EXTENSIONS = new Set([
+  'html', 'htm', 'pdf', 'md', 'markdown',
+  ...OFFICE_EXTENSIONS,
+]);
+
+function normalizedExt(path: string): string {
+  return extOf((path || '').trim().replace(/[?#].*$/, ''));
+}
+
+/** 是否是可当网页渲染的 HTML 文件（.html / .htm，忽略查询串与锚点） */
+export function isHtmlFilePath(path: string): boolean {
+  return HTML_EXTENSIONS.has(normalizedExt(path));
+}
+
+/** 是否是 markdown 文件（.md / .markdown） */
+export function isMarkdownFilePath(path: string): boolean {
+  return MARKDOWN_EXTENSIONS.has(normalizedExt(path));
+}
+
+/** 是否是 Office 文档（doc/docx/rtf/odt/xls/xlsx/ods/ppt/pptx/odp，忽略查询串与锚点） */
+export function isOfficeFilePath(path: string): boolean {
+  return OFFICE_EXTENSIONS.has(normalizedExt(path));
+}
+
+/**
+ * 是否是新版 Word 文档（.docx）。
+ *
+ * docx 与其它 Office 格式走两条不同的预览链：docx 由前端 docx-preview 直接渲染
+ * （秒开、不依赖本机 Office），而 .doc/.rtf/.odt 与 Excel/PPT 仍是后端转 PDF。
+ * 分流判定必须只认 .docx：docx-preview 不认老式二进制 .doc。
+ */
+export function isDocxFilePath(path: string): boolean {
+  return normalizedExt(path) === 'docx';
+}
+
+/**
+ * 是否是 PDF（忽略查询串与锚点）。
+ *
+ * PDF 不再交内嵌浏览器：右栏「文档」页签用前端 pdf.js 自绘，所以调用方要按它
+ * 单独分流（Office 文档转出的缓存 PDF 也走同一条渲染链）。
+ */
+export function isPdfFilePath(path: string): boolean {
+  return PDF_EXTENSIONS.has(normalizedExt(path));
+}
+
+/** 是否该在右栏里打开（pdf / office → 文档页签；html / md → 内嵌浏览器） */
+export function canOpenInRightPanel(path: string): boolean {
+  return RIGHT_PANEL_EXTENSIONS.has(normalizedExt(path));
+}
+
+// 与 Python 的 urllib.parse.quote(s, safe="") 对齐：encodeURIComponent 额外
+// 放过 ! ' ( ) *，这里补编码，保证前后端对同一路径产出同一个 file:// URI
+// （前端乐观显示与后端规范化结果不会出现两种写法）
+function encodeSeg(seg: string): string {
+  return encodeURIComponent(seg).replace(/[!'()*]/g, c =>
+    '%' + c.charCodeAt(0).toString(16).toUpperCase(),
+  );
+}
+
+/**
+ * 本地绝对路径 → file:// URL（正斜杠 + 百分号编码）；非绝对路径返回 ''。
+ *
+ * 只接受盘符路径（D:\x、D:/x）与 UNC 路径（\\server\share\x）：相对路径没有
+ * 可靠基准，调用方应先经 toAbsoluteLocalPath 拼成绝对路径再传进来。口径与
+ * 后端 core.embedded_browser.path_to_file_uri 保持一致（空格/中文按段编码、
+ * 含 .. 的路径拒绝）。
+ */
+export function toFileUrl(absPath: string): string {
+  const raw = (absPath || '').trim().replace(/^"|"$/g, '');
+  if (!raw) return '';
+  const p = raw.replace(/\\/g, '/');
+  const segs = (s: string) => s.split('/').filter(x => x !== '' && x !== '.');
+  if (/^[A-Za-z]:\//.test(p)) {
+    const rest = segs(p.slice(2));
+    if (!rest.length || rest.includes('..')) return '';
+    return 'file:///' + p.slice(0, 2) + '/' + rest.map(encodeSeg).join('/');
+  }
+  if (p.startsWith('//')) {
+    const parts = segs(p.slice(2));
+    if (parts.length < 2 || parts.includes('..')) return '';
+    return 'file://' + encodeSeg(parts[0]) + '/' + parts.slice(1).map(encodeSeg).join('/');
+  }
+  return '';
 }

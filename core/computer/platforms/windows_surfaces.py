@@ -133,14 +133,26 @@ class _ComThread:
     def start(self) -> None:
         self._thread.start()
         self._ready.wait(timeout=10)
+        self._raise_if_unavailable()
+
+    def _raise_if_unavailable(self) -> None:
+        """线程死亡或初始化失败时立即抛出明确错误，绝不伪装成「调用超时」。"""
         if self._init_error is not None:
             raise ComputerControlError(
                 "computer_surfaces_unavailable",
                 f"UI Automation 不可用：{type(self._init_error).__name__}",
             )
+        if not self._thread.is_alive():
+            # 线程未启动或已退出：队列不会有人消费，任何投递都必然空等。
+            raise ComputerControlError(
+                "computer_surfaces_unavailable",
+                "UI Automation 不可用：COM 线程已退出",
+            )
 
     def call(self, fn):
         """在 COM 线程执行 fn(uia) 并返回结果；UIA 对象绝不离开该线程。"""
+        # 投递前先确认线程可消费任务，避免把初始化失败/线程死亡伪装成超时。
+        self._raise_if_unavailable()
         done = threading.Event()
         holder: dict = {}
 
@@ -154,6 +166,8 @@ class _ComThread:
 
         self._queue.put(job)
         if not done.wait(timeout=10):
+            # 线程可能在等待窗口内死亡：优先报告真实原因。
+            self._raise_if_unavailable()
             raise ComputerControlError(
                 "computer_surfaces_unavailable", "UI Automation 调用超时"
             )
@@ -167,11 +181,11 @@ class _ComThread:
 
     def _main(self) -> None:
         try:
-            import comtypes
-            import comtypes.client
-
-            comtypes.CoInitialize()
             try:
+                import comtypes
+                import comtypes.client
+
+                comtypes.CoInitialize()
                 comtypes.client.GetModule("UIAutomationCore.dll")
                 from comtypes.gen.UIAutomationClient import IUIAutomation
 
@@ -179,10 +193,12 @@ class _ComThread:
                     _CUIAUTOMATION_CLSID, interface=IUIAutomation
                 )
             except BaseException as error:
+                # 初始化失败（comtypes 缺失、CoInitialize 失败等）必须落盘错误并
+                # 唤醒等待方；绝不让异常逸出线程、留下 ready 永不置位的假象。
                 self._init_error = error
-                self._ready.set()
                 return
-            self._ready.set()
+            finally:
+                self._ready.set()
             while True:
                 job = self._queue.get()
                 if job is None:
@@ -312,6 +328,7 @@ class _DefaultSurfaceHost:
 
         def collect(uia):
             buttons = []
+            registry: dict[int, object] = {}
             for hwnd in hosts:
                 try:
                     element = uia.ElementFromHandle(hwnd)
@@ -352,19 +369,23 @@ class _DefaultSurfaceHost:
                                 )
                             except Exception:
                                 can_invoke = False
-                            buttons.append((hwnd, name, bounds, can_invoke, item))
+                            # 元素引用只登记进本线程内的注册表并整体替换（旧
+                            # 引用随之在本线程释放）；返回值只带序号与纯数据——
+                            # COM 接口指针跨 apartment 传出/释放是未定义行为，
+                            # 此前把 item 直接带出线程违反了本文件头部的不变量。
+                            serial = id(item)
+                            registry[serial] = item
+                            buttons.append((hwnd, serial, name, bounds, can_invoke))
                         except Exception:
                             continue
+            self._elements = registry
             return buttons
 
         raw = com.call(collect)
-        # 控件对象与序号留在 COM 线程侧：以序号引用，元素本体由本 host 持有。
-        buttons = []
-        self._elements = getattr(self, "_elements", {})
-        self._element_source = getattr(self, "_element_source", {})
-        for hwnd, name, bounds, can_invoke, item in raw:
-            serial = id(item)
-            self._elements[serial] = item
+        # 序号→来源窗口类名（纯字符串，调用线程持有安全）
+        buttons: list[tuple[int, str, tuple[int, int, int, int], bool]] = []
+        self._element_source = {}
+        for hwnd, serial, name, bounds, can_invoke in raw:
             self._element_source[serial] = class_names.get(hwnd, "")
             buttons.append((serial, name, bounds, can_invoke))
         return buttons
@@ -374,15 +395,15 @@ class _DefaultSurfaceHost:
         return getattr(self, "_element_source", {}).get(int(serial), "")
 
     def invoke_button(self, serial: int) -> None:
-        elements = getattr(self, "_elements", {})
-        item = elements.get(int(serial))
-        if item is None:
-            raise ComputerControlError(
-                "computer_surface_unknown", "托盘候选已失效，请重新观察"
-            )
         com = self._com_thread()
 
         def invoke(_uia):
+            # 注册表只在 COM 线程内读写（见 list_tray_buttons）
+            item = getattr(self, "_elements", {}).get(int(serial))
+            if item is None:
+                raise ComputerControlError(
+                    "computer_surface_unknown", "托盘候选已失效，请重新观察"
+                )
             pattern = item.GetCurrentPattern(_UIA_INVOKE_PATTERN_ID)
             if not pattern:
                 raise ComputerControlError(
@@ -405,13 +426,13 @@ class _DefaultSurfaceHost:
             ) from error
 
     def element_bounds(self, serial: int) -> tuple[int, int, int, int] | None:
-        elements = getattr(self, "_elements", {})
-        item = elements.get(int(serial))
-        if item is None:
-            return None
         com = self._com_thread()
 
         def bounds(_uia):
+            # 注册表只在 COM 线程内读写（见 list_tray_buttons）
+            item = getattr(self, "_elements", {}).get(int(serial))
+            if item is None:
+                return None
             rect = item.CurrentBoundingRectangle
             return (
                 int(rect.left),
@@ -437,8 +458,13 @@ class _DefaultSurfaceHost:
         with self._com_lock:
             com = self._com
             self._com = None
-            self._elements = {}
         if com is not None:
+            # 元素注册表在 COM 线程内清空（引用随之在该线程释放），绝不从
+            # 调用线程丢弃 COM 引用
+            try:
+                com.call(lambda _uia: setattr(self, "_elements", {}))
+            except Exception:
+                pass
             com.close()
 
 

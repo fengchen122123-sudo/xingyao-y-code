@@ -242,7 +242,11 @@ def test_tool_progress_groups_work_and_continues_after_failure(tmp_path, mocker,
             return ToolResult(content="2 passed in 0.10s")
         return real_execute(name, **arguments)
 
-    mocker.patch.object(llm.tool_registry, "execute", side_effect=fake_execute)
+    # patch 类属性而非 _LazyToolRegistry 实例：实例 patch 的 fake 会经
+    # __setattr__ 落到进程级缓存的内部注册表上且无法还原（见 test_llm_events）。
+    from core.tool_registry import ToolRegistry
+
+    mocker.patch.object(ToolRegistry, "execute", side_effect=fake_execute)
 
     events = list(chat_with_model_events(
         "fake-model",

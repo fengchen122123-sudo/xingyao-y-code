@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 import core.llm as llm
 import core.model_selector as model_selector
 from core.model_manager import add_provider, load_config
@@ -24,7 +26,7 @@ def test_connection_uses_shared_protocol_request_path(monkeypatch):
     assert captured["timeout"] == 15
 
 
-def test_kimi_for_coding_has_parallel_openai_and_anthropic_presets():
+def test_kimi_for_coding_preset_is_openai_format():
     from core.model_selector import PRESET_PROVIDERS
 
     kimi_coding = [
@@ -33,11 +35,11 @@ def test_kimi_for_coding_has_parallel_openai_and_anthropic_presets():
     ]
 
     assert {(preset["protocol"], preset["base_url"]) for preset in kimi_coding} == {
-        ("anthropic", "https://api.kimi.com/coding"),
         ("openai", "https://api.kimi.com/coding/v1"),
     }
     openai_preset = next(preset for preset in kimi_coding if preset["protocol"] == "openai")
-    assert openai_preset["models"][0]["name"] == "kimi-for-coding"
+    # 预置厂商只含厂商信息，不携带模型
+    assert "models" not in openai_preset
 from core.model_selector import _latest_total_tokens
 
 
@@ -185,8 +187,8 @@ def test_update_provider_and_model_persists_supports_vision(monkeypatch, tmp_pat
     assert model["supports_vision"] is True
 
 
-def test_preset_add_via_selector_path_keeps_computer_metadata(monkeypatch, tmp_path):
-    """selector 的预置厂商添加入口必须透传目录中的电脑操控能力元数据。"""
+def test_preset_add_via_selector_path_adds_provider_without_models(monkeypatch, tmp_path):
+    """selector 的预置厂商添加入口只建厂商条目（模型由用户经「获取模型列表」添加）。"""
     import config as config_mod
     from core.model_manager import add_preset_provider_with_models, load_config
 
@@ -194,16 +196,55 @@ def test_preset_add_via_selector_path_keeps_computer_metadata(monkeypatch, tmp_p
     monkeypatch.setattr(config_mod, "_CONFIG_FILE", str(config_file))
     monkeypatch.setattr("core.model_manager._CONFIG_FILE", str(config_file))
 
-    preset = next(p for p in model_selector.PRESET_PROVIDERS if p["id"] == "deepseek")
+    preset = next(p for p in model_selector.PRESET_PROVIDERS if p["id"] == "kimi-coding-openai")
     pid = add_preset_provider_with_models(
         preset["name"], preset["base_url"], "key", preset["protocol"],
-        preset["models"], preset_id=preset["id"],
+        preset.get("models", []), preset_id=preset["id"],
     )
 
     cfg = load_config()
-    model = next(
-        m for p in cfg["providers"] if p["id"] == pid
-        for m in p["models"] if m["name"] == "deepseek-v4-flash-vision-exp"
+    provider = next(p for p in cfg["providers"] if p["id"] == pid)
+    assert provider["preset_id"] == "kimi-coding-openai"
+    assert provider["models"] == []
+
+
+# ---------------------------------------------------------------------------
+# 多 Key 连接测试（厂商多 Key 一致性适配）
+# ---------------------------------------------------------------------------
+
+
+def test_connection_falls_back_across_multiple_keys(monkeypatch):
+    """多 Key（换行分隔）连接测试：首 Key 失败后自动尝试下一个，任一成功即通过。"""
+    calls = []
+
+    def fake_request_stream(protocol, kwargs, *, timeout, cancel_event=None):
+        calls.append(kwargs.get("api_key"))
+        if kwargs.get("api_key") == "sk-bad":
+            raise RuntimeError("401 invalid api key")
+        return iter([object()]), None
+
+    monkeypatch.setattr("core.llm._request_stream", fake_request_stream)
+
+    model_selector._test_model_connection(
+        "openai", "model-a", "https://api.example.com", "sk-bad\nsk-good"
     )
-    assert model["computer_protocol"] == "generic"
-    assert model["supports_function_calling"] is True
+
+    assert calls == ["sk-bad", "sk-good"]
+
+
+def test_connection_raises_last_error_when_all_keys_fail(monkeypatch):
+    """多 Key 全部失败：抛出最后一个 Key 的错误（调用方错误展示逻辑不变）。
+
+    逗号分隔串也按逐 Key 解析，证明 split_provider_keys 的分隔口径生效。
+    """
+    errors = iter([RuntimeError("first-key-error"), RuntimeError("second-key-error")])
+
+    def fake_request_stream(protocol, kwargs, *, timeout, cancel_event=None):
+        raise next(errors)
+
+    monkeypatch.setattr("core.llm._request_stream", fake_request_stream)
+
+    with pytest.raises(RuntimeError, match="second-key-error"):
+        model_selector._test_model_connection(
+            "openai", "model-a", "https://api.example.com", "sk-1,sk-2"
+        )

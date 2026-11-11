@@ -22,6 +22,11 @@ listener 注册/事件发射 + start_run(run_id=)/pause/resume/stop 透传记录
 run_id 拒绝语义，供 Bridge 事件桥与控制 API 测试；绝不触碰真实键鼠/浏览器/截屏）。
 Task 16 给 FakeComputerBackend 增补 png_path（观察携带的虚拟截图路径，不读
 真实文件，供预览发布接线与隐私审计测试）。
+元素定位修复 E1 给 FakePage 增补元素收集脚本注入点（element_collect_result /
+element_collect_error，默认空列表，保证既有测试零影响）。
+元素定位修复 E2 给 FakePage 增补 locator 记录点（locator_calls / last_locator，
+FakeLocator 记录 click/fill 参数并支持异常注入），FakeKeyboard 增补 type
+（set_value_element 的键盘回落路径）。
 其余请求捕获 helper 由后续 Task 按需在本文件扩展，禁止平行实现。
 """
 
@@ -35,6 +40,11 @@ from dataclasses import replace
 import pytest
 
 import config
+from core.computer.browser_backend import (
+    ELEMENT_COLLECT_SCRIPT,
+    ELEMENT_HIT_SCRIPT,
+    PAGE_TEXT_SCRIPT,
+)
 from core.computer.models import (
     ComputerCapability,
     ComputerControlError,
@@ -51,7 +61,9 @@ def use_temp_config(tmp_path, monkeypatch, values):
     ~/.ycode/config.toml 对读取结果的只读覆盖。
     """
     cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+    # 空 dict 会被 config.py 写闸门判为读失败而拒写，故补最小可用结构。
+    payload = values if values else {"active_model_id": None, "providers": []}
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
     monkeypatch.setattr(config, "_TOML_CONFIG_FILE", str(tmp_path / "config.toml"))
     return cfg
@@ -114,8 +126,11 @@ DISABLED_CAPABILITY = ComputerCapability(
 class FakeHotkeyApi:
     """最小确定性 HotkeyApi fake：只记录注册/注销，绝不触碰真实系统热键。"""
 
-    def __init__(self, register_result: bool = True):
+    def __init__(self, register_result: bool = True, last_error_code: int = 0):
         self._register_result = register_result
+        # 与 WindowsHotkeyApi 对齐的可选诊断字段：注册失败时携带 Win32 错误码，
+        # 供 EmergencyStopHotkey 生成可读原因（如 1409 = 热键已被占用）。
+        self.last_error_code = last_error_code
         self.register_calls = 0
         self.unregister_calls = 0
         self.on_hotkey = None
@@ -213,6 +228,11 @@ class FakeKeyboard:
         self._runtime._record_call("keyboard.insert_text")
         self.calls.append(("insert_text", text))
 
+    def type(self, text, **kwargs):
+        # E2：set_value_element 的 fill 回落路径（点击聚焦 + 键盘逐字符输入）。
+        self._runtime._record_call("keyboard.type")
+        self.calls.append(("type", text))
+
     def down(self, key, **kwargs):
         self._runtime._record_call("keyboard.down")
         self._down_count += 1
@@ -225,6 +245,40 @@ class FakeKeyboard:
         self.calls.append(("up", key))
         if self.up_error is not None:
             raise self.up_error
+
+
+class FakeLocator:
+    """page.locator() fake（E2 元素动作）：记录 selector 与 click/fill 调用参数。
+
+    - ``click_calls``：按序记录 click 的 kwargs（含 timeout）；
+    - ``fill_calls``：按序记录 (text, kwargs)；
+    - ``click_error`` / ``fill_error``：注入异常，验证元素语义错误码与
+      set_value_element 的键盘回落路径；
+    - ``count_result``：locator.count() 返回值，用于验证「元素不在 DOM →
+      stale」的失效判定（E2 评审修复）；
+    - 绝不触碰真实页面 DOM 或 Playwright。
+    """
+
+    def __init__(self, selector):
+        self.selector = selector
+        self.click_calls = []
+        self.fill_calls = []
+        self.click_error = None
+        self.fill_error = None
+        self.count_result = 1
+
+    def click(self, **kwargs):
+        self.click_calls.append(dict(kwargs))
+        if self.click_error is not None:
+            raise self.click_error
+
+    def fill(self, text, **kwargs):
+        self.fill_calls.append((text, dict(kwargs)))
+        if self.fill_error is not None:
+            raise self.fill_error
+
+    def count(self, **kwargs):
+        return self.count_result
 
 
 class FakePage:
@@ -252,22 +306,70 @@ class FakePage:
         self.screenshot_delay = 0.0
         self.concurrency_violations = 0
         self._inside_screenshot = False
+        # E1 元素收集脚本注入点：None 表示返回空列表（既有测试零影响）；
+        # error 非空时 evaluate 抛错，用于验证「收集失败不中断 observe」；
+        # hook 非空时在收集脚本求值后调用（测试模拟收集期间页面变化）。
+        self.element_collect_result = None
+        self.element_collect_error = None
+        self.element_collect_hook = None
+        # E3 视觉点击点脚本注入点：None 表示求值失败（或没有可用中心点），
+        # click_element 回落 locator.click，与旧行为一致；给出 dict 时按
+        # contains/inViewport 决定是否走 page.mouse.click。
+        self.element_hit_result = None
+        # B 方案（窗口被遮挡时的降级观察）：页面正文本注入点。默认空串；
+        # error 非空时 evaluate 抛错，用于验证「正文读取失败不中断 observe」。
+        self.page_text = ""
+        self.page_text_error = None
+        # E2 元素动作注入点：locator 调用记录（selector 列表）与最近创建的
+        # FakeLocator（供断言 click/fill 参数与异常注入路径）；预设字段
+        # 在 locator 创建时应用到新对象（execute 前设置即可注入失败/命中数）。
+        self.locator_calls = []
+        self.last_locator = None
+        self.locator_click_error = None
+        self.locator_fill_error = None
+        self.locator_count = 1
 
     def is_closed(self):
         self._runtime._record_call("page.is_closed")
         return self.closed
 
     def evaluate(self, expression, *args, **kwargs):
-        """仅支持 R5 可见性探针表达式；其他表达式一律拒绝（隐私边界）。"""
+        """仅支持 R5 可见性探针、E1 元素收集与正文提取脚本；其他表达式一律拒绝（隐私边界）。"""
         self._runtime._record_call("page.evaluate")
         self.evaluate_calls.append(expression)
+        if expression == ELEMENT_COLLECT_SCRIPT:
+            if self.element_collect_error is not None:
+                raise self.element_collect_error
+            result = self.element_collect_result
+            if self.element_collect_hook is not None:
+                self.element_collect_hook(self)
+            return [] if result is None else result
+        if expression == ELEMENT_HIT_SCRIPT:
+            return self.element_hit_result
+        if expression == PAGE_TEXT_SCRIPT:
+            if self.page_text_error is not None:
+                raise self.page_text_error
+            return self.page_text
         if "visibilityState" in str(expression) and "hasFocus" in str(expression):
             return [self.visibility_state, self.focused]
-        raise AssertionError(f"fake page 只允许可见性探针，拒绝 evaluate: {expression!r}")
+        raise AssertionError(
+            f"fake page 只允许可见性探针、元素收集与正文提取脚本，拒绝 evaluate: {expression!r}"
+        )
 
     def title(self):
         self._runtime._record_call("page.title")
         return self.page_title
+
+    def locator(self, selector):
+        """E2：返回记录型 FakeLocator；每次调用创建独立对象并记为最近对象。"""
+        self._runtime._record_call("page.locator")
+        self.locator_calls.append(selector)
+        locator = FakeLocator(selector)
+        locator.click_error = self.locator_click_error
+        locator.fill_error = self.locator_fill_error
+        locator.count_result = self.locator_count
+        self.last_locator = locator
+        return locator
 
     def goto(self, url, **kwargs):
         self._runtime._record_call("page.goto")
@@ -786,7 +888,8 @@ class FakeBridgeController:
     - ``start_run(run_id=...)`` 建立活动 run；pause/resume/stop 记录透传调用
       并发出 computer_state 事件；run_id 与当前活动 run 不匹配抛
       computer_invalid_state（旧 UI 事件的 run id 拒绝语义，镜像
-      _require_active_run_locked）；
+      _require_active_run_locked）；``stop`` 接受 ``cancel_owner`` 关键字
+      （默认 True）并记录到 ``stop_cancel_owner``，行为不变；
     - ``snapshot()`` 返回真实 ComputerRunSnapshot（终态保留 run_id，
       镜像 _last_snapshot 语义）；
     - 绝不触碰真实键鼠、浏览器或截屏。
@@ -800,6 +903,9 @@ class FakeBridgeController:
         self.pause_calls = []
         self.resume_calls = []
         self.stop_calls = []
+        # 接管交还修复 L2：记录 stop 的 cancel_owner 关键字（默认 True），
+        # 使该桩能接受调用方传入的新关键字而不 TypeError。
+        self.stop_cancel_owner = []
 
     @property
     def listener_count(self):
@@ -898,12 +1004,19 @@ class FakeBridgeController:
         self.emit_state(run_id=run_id, event_seq=3, status="running", reason="resume")
         return self.snapshot()
 
-    def stop(self, run_id, reason):
+    def stop(self, run_id, reason, *, cancel_owner=True):
+        # 接受 stop 的 cancel_owner 关键字（镜像真实 controller 签名）：该桩
+        # 只记录、行为不变，避免调用方传新关键字时 TypeError。
         self._require_active_run(run_id)
         self.stop_calls.append((run_id, reason))
+        self.stop_cancel_owner.append(cancel_owner)
         self.status = "stopped"
         self.emit_state(run_id=run_id, event_seq=4, status="stopped", reason=reason)
         return self.snapshot()
+
+    def stop_for_user(self, run_id: str, reason: str = "user_stop"):
+        # 镜像真实 controller：用户停止只结束 run，不置位回合 cancel_event。
+        return self.stop(run_id, reason, cancel_owner=False)
 
     def snapshot(self):
         return ComputerRunSnapshot(
@@ -932,6 +1045,11 @@ class FakeController:
       ``complete_calls``/``completed_run_ids``/``complete_error``、
       ``stop_calls``/``stop_reasons``/``stop_error``；生命周期方法只记录调用，
       ``run_status`` 随 complete/stop 变化供 Turn 收尾判定；
+    - 接管交还修复 L1/L2 补充：``complete_run`` 记录 ``retain_browser_session``
+      到 ``complete_retain_flags``，``stop`` 记录 ``cancel_owner`` 到
+      ``stop_cancel_owner``（签名带默认值 True）；``execute`` 遇
+      ``request_user_takeover`` 时把 ``run_status`` 置为 ``waiting_for_user``
+      （镜像真实 controller 的接管交接），供「接管回合收尾」测试建模；
     - 绝不触碰真实键鼠、浏览器或截屏。
     """
 
@@ -956,6 +1074,11 @@ class FakeController:
         self.stop_reasons = []
         self.stop_error = None
         self.run_status = "running"
+        # 接管交还修复 L1/L2：记录每次 stop/complete_run 的关键关键字参数，
+        # 供 Turn 收尾测试断言「兜底 stop 传 cancel_owner=False」「接管态收尾
+        # 传 retain_browser_session=False」。
+        self.stop_cancel_owner = []
+        self.complete_retain_flags = []
 
     def start_run(self, owner, capability, target=None):
         self.start_calls += 1
@@ -972,12 +1095,14 @@ class FakeController:
         if self.complete_error is not None:
             raise self.complete_error
         self.completed_run_ids.append(run_id)
+        self.complete_retain_flags.append(retain_browser_session)
         self.run_status = "completed"
         return self.snapshot()
 
-    def stop(self, run_id, reason):
+    def stop(self, run_id, reason, *, cancel_owner=True):
         self.stop_calls += 1
         self.stop_reasons.append((run_id, reason))
+        self.stop_cancel_owner.append(cancel_owner)
         if self.stop_error is not None:
             raise self.stop_error
         self.run_status = "stopped"
@@ -1010,6 +1135,10 @@ class FakeController:
         base = self._observations.pop(0) if self._observations else (
             self._default_observation(run_id, action)
         )
+        if action.kind == "request_user_takeover":
+            # 镜像真实 controller 的接管交接行为：request_user_takeover 成功
+            # 执行后 run 转入 waiting_for_user，供「接管回合收尾」测试建模。
+            self.run_status = "waiting_for_user"
         return replace(
             base,
             run_id=run_id,
