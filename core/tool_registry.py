@@ -400,28 +400,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             side_effect_scope="none",
         ),
         ToolSpec(
-            name="find_definition",
-            description=(
-                "查找符号（函数/类/方法）的定义位置。比 search_code 更精确——"
-                "只匹配定义位置（def/class/function/func 等关键字），不匹配调用或字符串字面量。"
-                "支持 Python/JS/TS/Go/Rust/Java/C/C++/C#。返回 file:line 格式，可直接用 read_file 跳转。"
-            ),
-            input_schema=_schema({
-                "symbol": {"type": "string", "description": "要查找的符号名（函数名/类名/方法名）"},
-                "dir_path": {"type": "string", "default": "."},
-                "file_extensions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "限定文件扩展名（如 ['.py', '.ts']），不传则全语言",
-                },
-            }, ["symbol"]),
-            execute=_lsp.find_definition,
-            read_only=True,
-            requires_permission=False,
-            parallel_safe=True,
-            activity_description="查找符号定义",
-        ),
-        ToolSpec(
             name="search_news",
             description="搜索互联网新闻。",
             input_schema=_schema({
@@ -472,42 +450,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             parallel_safe=True,
             activity_description="查询天气",
             side_effect_scope="none",
-        ),
-        ToolSpec(
-            name="fetch_url",
-            description="使用本机 HTTP 客户端获取网页或 JSON。需要实时网页数据时使用，不要用它代替项目代码搜索。",
-            input_schema=_schema({
-                "url": {"type": "string", "description": "完整的 http 或 https 地址"},
-                "timeout_seconds": {
-                    "type": "integer",
-                    "default": 20,
-                    "minimum": 1,
-                    "maximum": 60,
-                },
-            }, ["url"]),
-            execute=tools.fetch_url,
-            read_only=True,
-            requires_permission=False,
-            parallel_safe=True,
-            activity_description="访问网址",
-        ),
-        ToolSpec(
-            name="get_weather",
-            description="查询指定城市的实时天气和短期预报。必须明确传入城市；不要使用 search_news 查询天气。",
-            input_schema=_schema({
-                "city": {"type": "string", "description": "城市名，例如北京、上海或 Shanghai"},
-                "timeout_seconds": {
-                    "type": "integer",
-                    "default": 20,
-                    "minimum": 1,
-                    "maximum": 60,
-                },
-            }, ["city"]),
-            execute=tools.get_weather,
-            read_only=True,
-            requires_permission=False,
-            parallel_safe=True,
-            activity_description="查询天气",
         ),
         ToolSpec(
             name="glob_files",
@@ -879,25 +821,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             execute=tools.undo_turn,
             activity_description="撤销回合文件修改",
             side_effect_scope="workspace",
-        ),
-        ToolSpec(
-            name="fetch_image",
-            description="下载网页中的图片到本地并返回本地路径。仅当 fetch_url / search_news 结果中含与主题直接相关的图片、需要图文并茂展示时使用；广告/图标/头像等无关图片不要下载。成功后按界面形态展示：GUI 会话用 Markdown 图片语法 ![](本地路径) 内嵌（远程 URL 前端不渲染，必须下载成本地路径）；CLI 终端直接给出本地路径。仅支持 http/https，仅 png/jpg/jpeg/gif/webp，上限 10MB。",
-            input_schema=_schema({
-                "url": {"type": "string", "description": "完整的 http 或 https 图片地址"},
-                "timeout_seconds": {
-                    "type": "integer",
-                    "default": 20,
-                    "minimum": 1,
-                    "maximum": 60,
-                },
-            }, ["url"]),
-            execute=tools.fetch_image,
-            read_only=False,
-            mutates_files=True,
-            requires_permission=False,
-            cancellable=True,
-            activity_description="下载图片",
         ),
         ToolSpec(
             name="execute_command",
@@ -1486,75 +1409,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             parallel_safe=False,
             activity_description="新建并引入项目文件夹",
             side_effect_scope="system",  # 表未覆盖：创建磁盘目录、登记工作区并改变侧栏分组
-        ),
-        # ── MCP 服务配置工具（让 AI 能自己配置/启用/禁用 MCP server）─────
-        ToolSpec(
-            name="mcp_add_server",
-            description=(
-                "新增一个 MCP server 配置并立即重连生效。用于让 AI 帮用户配置 MCP（如 Firecrawl、wigolo 等）。"
-                "会写入 ~/.ycode/mcp.json 并触发重连。若已存在同名 server 会失败，需先调用 mcp_remove_server。"
-            ),
-            input_schema=_schema({
-                "name": {"type": "string", "description": "server 名称（用作工具名前缀，如 'firecrawl'）"},
-                "command": {"type": "string", "description": "启动命令，通常为 'npx'"},
-                "args": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "命令参数数组，如 ['-y', 'firecrawl-mcp']",
-                },
-                "env": {
-                    "type": "object",
-                    "description": "环境变量字典（可选），如 {\"FIRECRAWL_API_KEY\": \"fc-xxx\"}",
-                },
-                "enabled": {"type": "boolean", "default": True},
-            }, ["name", "command", "args"]),
-            execute=lambda name, command, args, env=None, enabled=True: _mcp_add_server_wrapper(name, command, args, env, enabled),
-            requires_permission=True,
-            parallel_safe=False,
-            activity_description="新增 MCP server",
-        ),
-        ToolSpec(
-            name="mcp_remove_server",
-            description=(
-                "删除一个 MCP server 配置并立即重连生效。"
-                "会从 ~/.ycode/mcp.json 移除该 server 并关闭其子进程。"
-            ),
-            input_schema=_schema({
-                "name": {"type": "string", "description": "要删除的 server 名称"},
-            }, ["name"]),
-            execute=lambda name: _mcp_remove_server_wrapper(name),
-            requires_permission=True,
-            parallel_safe=False,
-            activity_description="删除 MCP server",
-        ),
-        ToolSpec(
-            name="mcp_set_enabled",
-            description=(
-                "启用或禁用某个 MCP server（写回 mcp.json + 重连）。"
-                "禁用时配置保留，随时可重新启用。"
-            ),
-            input_schema=_schema({
-                "name": {"type": "string", "description": "server 名称"},
-                "enabled": {"type": "boolean", "description": "true=启用, false=禁用"},
-            }, ["name", "enabled"]),
-            execute=lambda name, enabled: _mcp_set_enabled_wrapper(name, enabled),
-            requires_permission=True,
-            parallel_safe=False,
-            activity_description="切换 MCP server 开关",
-        ),
-        ToolSpec(
-            name="mcp_list_servers",
-            description=(
-                "列出所有已配置的 MCP server（含 enabled/command/args/env/connected 字段）。"
-                "env 中的 API Key 会做掩码处理（前4位+****+后4位），避免敏感信息泄露。"
-                "用于 AI 在配置前查看现状。"
-            ),
-            input_schema=_schema({}),
-            execute=lambda **kwargs: _mcp_list_servers_wrapper(),
-            read_only=True,
-            requires_permission=False,
-            parallel_safe=True,
-            activity_description="查看 MCP 服务列表",
         ),
     ]
 
