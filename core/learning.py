@@ -23,11 +23,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -85,14 +83,31 @@ def _data_root() -> Path:
         return Path(".")
 
 
+def _data_path(*parts) -> Path:
+    """经 identity_store 的统一路径校验解析数据文件路径。
+
+    此前这里自己拼 ``_data_root() / ...``，绕过了 identity_store 的越界校验，
+    同一层模块出现了两套路径口径。identity_store 不可用时回退裸拼接，保证可用。
+    """
+    try:
+        from core import identity_store as store
+
+        path = store.safe_data_path(*parts)
+        if path is not None:
+            return path
+    except Exception as exc:
+        logger.debug("经 identity_store 解析路径失败，回退裸路径：%s", exc)
+    return _data_root().joinpath(*parts)
+
+
 def _state_path() -> Path:
     """节流状态文件路径：<YCODE_DIR>/self/learning_state.json。"""
-    return _data_root() / "self" / "learning_state.json"
+    return _data_path("self", "learning_state.json")
 
 
 def _narrative_path() -> Path:
     """自传叙事文件路径：<YCODE_DIR>/self/narrative.md。"""
-    return _data_root() / "self" / "narrative.md"
+    return _data_path("self", "narrative.md")
 
 
 def _read_state() -> dict:
@@ -139,26 +154,19 @@ def _read_state() -> dict:
 
 
 def _write_state(state: dict) -> bool:
-    """原子写节流状态；失败只记 debug 返回 False。"""
-    path = _state_path()
-    tmp_path = None
+    """原子写节流状态；失败只记 debug 返回 False。
+
+    复用 identity_store.write_text_atomic（含 Windows 重试与回退），避免本模块
+    再维护一份同构实现——两份实现的行为一旦分叉，排查时很容易看错。
+    """
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(
-            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:6]}.tmp"
+        from core import identity_store as store
+
+        return store.write_text_atomic(
+            _state_path(), json.dumps(state, ensure_ascii=False, indent=2)
         )
-        tmp_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.replace(tmp_path, path)
-        return True
     except Exception as exc:
         logger.debug("写入 learning_state.json 失败：%s", exc)
-        try:
-            if tmp_path is not None:
-                tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
         return False
 
 
@@ -169,33 +177,104 @@ def _now() -> float:
         return 0.0
 
 
-def should_learn(session: str, new_user_messages: int) -> bool:
-    """判断当前是否允许触发一次学习。
+def _should_learn_state(state: dict, session: str, new_user_messages: int) -> bool:
+    """基于已读状态判断是否允许学习（纯函数，供原子占位复用）。
 
     三个条件必须同时满足：全局间隔 >= 600 秒、同会话间隔 >= 1800 秒、
-    新增用户消息数 >= 6。任何读取异常都按「不允许学习」处理。
+    新增用户消息数 >= 6。任何异常都按「不允许学习」处理。
     """
     try:
-        state = _read_state()
         now = _now()
         last_global = float(state.get("last_global_at") or 0)
-        if now - last_global < GLOBAL_INTERVAL_SECONDS:
+        # 负差值 = 系统时钟被回拨（NTP 校正 / 用户改时间）。不能当成「还没到
+        # 时间」，否则学习会被静默禁用，直到时钟追回为止。
+        if 0 <= now - last_global < GLOBAL_INTERVAL_SECONDS:
             return False
         sessions = state.get("sessions") or {}
         item = sessions.get(str(session)) or {}
         last_at = float(item.get("last_at") or 0)
-        if now - last_at < SESSION_INTERVAL_SECONDS:
+        if 0 <= now - last_at < SESSION_INTERVAL_SECONDS:
             return False
         try:
             count = int(new_user_messages)
         except Exception:
             count = 0
-        if count < MIN_NEW_USER_MESSAGES:
-            return False
-        return True
+        return count >= MIN_NEW_USER_MESSAGES
     except Exception as exc:
         logger.debug("学习节流判断失败：%s", exc)
         return False
+
+
+def should_learn(session: str, new_user_messages: int) -> bool:
+    """判断当前是否允许触发一次学习（纯检查，不占位）。"""
+    return _should_learn_state(_read_state(), session, new_user_messages)
+
+
+def _claim_learning(session: str, new_user_messages: int) -> dict | None:
+    """原子地「检查节流 + 占位」，成功返回占位前状态（供失败回滚）。
+
+    占位即先把 last_global_at / last_at 置为当前时间，让并发线程立刻被拦下；
+    真正的学习没发生（无凭据 / 抽取失败）时用 _release_learning 回滚。
+    """
+    try:
+        with _io_lock:
+            state = _read_state()
+            if not _should_learn_state(state, session, new_user_messages):
+                return None
+            item = (state.get("sessions") or {}).get(str(session)) or {}
+            previous = {
+                "last_global_at": state.get("last_global_at") or 0,
+                "session": dict(item) if isinstance(item, dict) else {},
+            }
+            now = _now()
+            state["last_global_at"] = now
+            sessions = state.get("sessions")
+            if not isinstance(sessions, dict):
+                sessions = {}
+            entry = sessions.get(str(session))
+            entry = (
+                dict(entry)
+                if isinstance(entry, dict)
+                else {"last_at": 0, "msg_count": 0}
+            )
+            entry["last_at"] = now
+            sessions[str(session)] = entry
+            state["sessions"] = sessions
+            _write_state(state)
+            return previous
+    except Exception as exc:
+        logger.debug("学习节流占位失败：%s", exc)
+        return None
+
+
+def _release_learning(session: str, previous: dict | None) -> None:
+    """回滚 _claim_learning 的占位：学习没有真正发生时调用。"""
+    if not isinstance(previous, dict):
+        return
+    try:
+        with _io_lock:
+            state = _read_state()
+            state["last_global_at"] = previous.get("last_global_at") or 0
+            sessions = state.get("sessions")
+            if not isinstance(sessions, dict):
+                sessions = {}
+            saved = previous.get("session") or {}
+            if saved:
+                sessions[str(session)] = dict(saved)
+            else:
+                sessions.pop(str(session), None)
+            state["sessions"] = sessions
+            # 回滚到「全空」时删掉状态文件：学习没发生就不该留下任何痕迹
+            # （否则调用方会看到凭空出现的 learning_state.json）。
+            if not state.get("last_global_at") and not sessions:
+                try:
+                    _state_path().unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
+            _write_state(state)
+    except Exception as exc:
+        logger.debug("回滚学习占位失败：%s", exc)
 
 
 def _mark_learned(session: str, user_message_count: int) -> bool:
@@ -232,6 +311,21 @@ def _clip(value, limit: int = MAX_ITEM_CHARS) -> str:
     text = "" if value is None else str(value)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit]
+
+
+def _clip_block(value, limit: int = MAX_NARRATIVE_CHARS) -> str:
+    """保留段落结构的多行裁剪：只收敛行尾空白与连续空行。
+
+    自传叙事靠分段读；``_clip`` 会把所有空白压成一个空格，段落结构直接没了。
+    """
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    collapsed: list[str] = []
+    for line in (raw.rstrip() for raw in text.split("\n")):
+        if not line and collapsed and not collapsed[-1]:
+            continue
+        collapsed.append(line)
+    return "\n".join(collapsed).strip()[:limit]
 
 
 def _has_directive(value) -> bool:
@@ -664,12 +758,29 @@ def _resolve_model_cfg(session, model_cfg=None):
     return (api_model, str(api_key), api_base)
 
 
+def _growth_settings() -> dict:
+    """读成长设置；读失败按「已开启」处理（与 identity_store 的默认值一致）。
+
+    局部导入避免 learning ↔ identity_store 的导入期耦合。
+    """
+    try:
+        from core import identity_store as store
+
+        return store.get_growth_settings()
+    except Exception as exc:
+        logger.debug("读取成长设置失败，按默认开启处理：%s", exc)
+        return {}
+
+
 def run_turn_learning(session, manager, model_cfg=None) -> bool:
     """回合结束后的学习入口：节流判断 → 抽取 → 落盘 → 更新节流状态。
 
     任何异常都被吞掉（只记 debug），绝不向调用方抛。
     """
     try:
+        # 设置页「启用经验学习」关闭后必须彻底停止：不再调用模型、不再落盘。
+        if not _growth_settings().get("learning_enabled", True):
+            return False
         if manager is None:
             return False
         try:
@@ -688,19 +799,37 @@ def run_turn_learning(session, manager, model_cfg=None) -> bool:
             known_count = max(0, int(item.get("msg_count") or 0))
         except Exception:
             known_count = 0
+        # 可见用户消息数不增反降 = 上下文被压缩（get_history_for_llm 只返回
+        # summarized_until_msg_id 之后的消息）或历史被回退。此时旧基线永久失效：
+        # 若继续用「可见数 - 旧基线」，差值恒为 0，长会话会永远学不到东西。
+        # 检测到回退就把基线归零，按当前可见消息重新计数。
+        if total_user_messages < known_count:
+            logger.debug(
+                "检测到会话 %s 历史回退（可见 %s < 基线 %s），重置学习基线",
+                session,
+                total_user_messages,
+                known_count,
+            )
+            known_count = 0
         new_messages = max(0, total_user_messages - known_count)
 
-        # 节流不通过时直接返回，且不更新 msg_count（避免漏计后续新增消息）
-        if not should_learn(session, new_messages):
+        # 「检查节流 + 占位」必须原子：否则多个会话同时空闲时，各线程都能通过
+        # 检查，并发发起多次模型请求并并发写档案（既费钱也会丢更新）。
+        claim = _claim_learning(session, new_messages)
+        if claim is None:
+            # 节流不通过时直接返回，且不更新 msg_count（避免漏计后续新增消息）
             return False
 
         resolved = _resolve_model_cfg(session, model_cfg)
         if not resolved:
+            # 无可用凭据：回滚占位，下一轮还能再试
+            _release_learning(session, claim)
             return False
 
         extracted = extract_turn_lessons(session, history, resolved)
         if not extracted:
-            # 抽取失败（网络/坏 JSON/无凭据）：不更新节流状态，下一轮可重试
+            # 抽取失败（网络/坏 JSON/无凭据）：回滚占位，下一轮可重试
+            _release_learning(session, claim)
             return False
 
         counts = apply_learning(extracted)
@@ -752,33 +881,26 @@ def _read_narrative() -> str:
 
 
 def _write_narrative(text: str) -> bool:
-    """原子写自传叙事（临时文件 + os.replace）；失败只记 debug。"""
-    path = _narrative_path()
-    tmp_path = None
+    """原子写自传叙事；复用 identity_store 的原子写（含重试与回退）。"""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(
-            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:6]}.tmp"
-        )
-        tmp_path.write_text(text, encoding="utf-8")
-        os.replace(tmp_path, path)
-        return True
+        from core import identity_store as store
+
+        return store.write_text_atomic(_narrative_path(), text)
     except Exception as exc:
         logger.debug("写入 narrative.md 失败：%s", exc)
-        try:
-            if tmp_path is not None:
-                tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
         return False
 
 
 def run_self_evolution_sync(api_model, api_key, api_base=None) -> str:
     """深度自我演化：重新审视自我模型并写回，返回简短中文摘要。
 
-    无 api_key 时返回 ``"skipped"``；任何异常都不抛出。
+    设置页「启用自我演化」关闭、或无 api_key 时返回 ``"skipped"``；
+    任何异常都不抛出。
     """
     try:
+        # 与 run_turn_learning 同一条原则：开关关闭后不再调用模型、不再改写自我模型。
+        if not _growth_settings().get("enabled", True):
+            return "skipped"
         if not api_key or not str(api_key).strip():
             return "skipped"
         if not api_model:
@@ -862,7 +984,7 @@ def run_self_evolution_sync(api_model, api_key, api_base=None) -> str:
         saved = store.save_self_model(patch)
 
         # ---- 自传叙事 ----
-        narrative_text = _clip(data.get("narrative"), MAX_NARRATIVE_CHARS)
+        narrative_text = _clip_block(data.get("narrative"), MAX_NARRATIVE_CHARS)
         narrative_written = False
         if narrative_text and not _has_directive(narrative_text):
             narrative_written = _write_narrative(narrative_text + "\n")

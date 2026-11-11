@@ -204,3 +204,137 @@ def test_long_text_is_clipped_to_200(ycode_dir):
     growth_log = store.get_self_model()["growth_log"]
     assert growth_log
     assert all(len(entry["note"]) <= 200 for entry in growth_log)
+
+
+# ---------------------------------------- 8) 容量满后新增笔记仍然落盘
+def test_apply_learning_keeps_new_note_when_growth_log_full(ycode_dir):
+    """growth_log 满 100 条后，新学到的笔记必须落盘且如实计数。
+
+    否则自我成长会静默停止，而调用方依旧收到「写入 N 条」的成功回执。
+    """
+    existing = [
+        {"date": "2026-01-01", "note": f"旧笔记{i}"} for i in range(store.MAX_GROWTH_LOG)
+    ]
+    assert store.save_self_model({"growth_log": existing}) is True
+
+    counts = learning.apply_learning(
+        {"user_facts": [], "lessons": [], "self_notes": ["刚学到的新笔记"]}
+    )
+    assert counts["self_notes"] == 1
+    log = store.get_self_model()["growth_log"]
+    assert len(log) == store.MAX_GROWTH_LOG
+    assert log[-1]["note"] == "刚学到的新笔记"
+
+
+# ------------------------------------ 9) 上下文压缩后学习不能被永久卡死
+def test_learning_recovers_after_history_compression(ycode_dir, monkeypatch):
+    """压缩后可见用户消息数骤降，学习基线必须重置而不是永久判定「没有新消息」。"""
+    _patch_completion(monkeypatch, GOOD_PAYLOAD)
+    manager = _FakeManager(_history(user_messages=8))
+    assert learning.run_turn_learning("sess-1", manager, MODEL_CFG) is True
+
+    # 模拟上下文压缩：可见历史从 8 条 user 降到 6 条；同时把节流时间拨回去
+    state_path = ycode_dir / "self" / "learning_state.json"
+    state = json.loads(state_path.read_text("utf-8"))
+    assert state["sessions"]["sess-1"]["msg_count"] == 8
+    state["last_global_at"] = 0
+    state["sessions"]["sess-1"]["last_at"] = 0
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    compressed = _FakeManager(_history(user_messages=6))
+    assert learning.run_turn_learning("sess-1", compressed, MODEL_CFG) is True
+
+
+# ----------------------------------- 10) 关闭经验学习后不发模型请求
+def test_learning_disabled_skips_llm_call(ycode_dir, monkeypatch):
+    """设置里关掉「经验学习」后，闲时学习不得再调用模型、不得落盘。"""
+    calls = _patch_completion(monkeypatch, GOOD_PAYLOAD)
+    store.save_growth_settings(learning_enabled=False)
+    manager = _FakeManager(_history(user_messages=8))
+
+    assert learning.run_turn_learning("sess-1", manager, MODEL_CFG) is False
+    assert calls == []
+    assert store.iter_lessons() == []
+    assert not (ycode_dir / "users").exists()
+    assert not (ycode_dir / "self" / "learning_state.json").exists()
+
+
+def test_self_evolution_disabled_skipped(ycode_dir, monkeypatch):
+    """设置里关掉「自我演化」后，深度演化不得再调用模型、不得改写自我模型。"""
+    calls = _patch_completion(monkeypatch, {"traits": ["新特质"], "narrative": "新叙事"})
+    store.save_growth_settings(enabled=False)
+
+    assert learning.run_self_evolution_sync("m", "sk-test") == "skipped"
+    assert calls == []
+    assert store.get_self_model()["traits"] == []
+
+
+# --------------------------------------- 11) 时钟回拨不得锁死学习
+def test_clock_rollback_does_not_disable_learning(ycode_dir):
+    """系统时钟回拨（now < last）时，「负间隔」不能被当成「还没到时间」。
+
+    否则 NTP 校正 / 用户改时间后，学习会被静默禁用到时钟追回为止。
+    """
+    state_path = ycode_dir / "self" / "learning_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"last_global_at": 9999999999.0, "sessions": {}}), "utf-8"
+    )
+    assert learning.should_learn("sess-1", 6) is True
+
+
+# ------------------------------------- 12) 节流检查与占位必须原子
+def test_concurrent_turn_learning_calls_llm_once(ycode_dir, monkeypatch):
+    """两个会话同时空闲时，节流只能放行一次模型调用。
+
+    旧实现「先检查、后记账」，两个线程都能通过检查，于是并发发起两次
+    60 秒的模型请求并并发写档案（既费钱也会丢更新）。
+    """
+    import threading
+    import time
+
+    import core.llm
+
+    calls = []
+
+    def slow_completion(**kwargs):
+        calls.append(kwargs)
+        time.sleep(0.2)
+        return _FakeResponse(json.dumps(GOOD_PAYLOAD, ensure_ascii=False))
+
+    monkeypatch.setattr(core.llm, "completion", slow_completion)
+
+    barrier = threading.Barrier(2)
+    results = []
+
+    def worker(session):
+        barrier.wait(timeout=10)
+        results.append(
+            learning.run_turn_learning(session, _FakeManager(_history(6)), MODEL_CFG)
+        )
+
+    threads = [threading.Thread(target=worker, args=(f"s{i}",)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert sorted(results) == [False, True]
+    assert len(calls) == 1
+
+
+# ------------------------------------ 13) 自传叙事必须保留段落结构
+def test_clip_block_keeps_paragraphs(ycode_dir):
+    """多行文本裁剪不能把段落压成一行（自传叙事靠分段读）。"""
+    text = learning._clip_block("第一段\n\n第二段\n\n\n第三段")
+    assert text == "第一段\n\n第二段\n\n第三段"
+
+
+def test_evolution_narrative_file_keeps_paragraphs(ycode_dir, monkeypatch):
+    """自我演化写出的 narrative.md 要保留段落分隔。"""
+    _patch_completion(monkeypatch, {"traits": [], "narrative": "第一段\n\n第二段"})
+    learning.run_self_evolution_sync("m", "sk-test")
+
+    content = (ycode_dir / "self" / "narrative.md").read_text(encoding="utf-8")
+    assert "第一段" in content and "第二段" in content
+    assert "\n\n" in content
