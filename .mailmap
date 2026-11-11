@@ -1,0 +1,9 @@
+# Git author identity mapping.
+# Maps historical commit emails to the maintainer's GitHub noreply address so
+# GitHub attributes every commit to the correct account without rewriting history.
+#
+# The noreply address is GitHub's built-in privacy email and needs no verification.
+
+feng-chenhao <299865327+fengchen122123-sudo@users.noreply.github.com> <feng-chenhao@users.noreply.gitee.com>
+feng-chenhao <299865327+fengchen122123-sudo@users.noreply.github.com> <17603110409@163.com>
+fengchenhao <299865327+fengchen122123-sudo@users.noreply.github.com> <204137222@qq.com>
