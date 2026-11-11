@@ -919,6 +919,37 @@ class ToolPipeline:
             f"[{', '.join(declared)}]。其他文件请先用 plan_update 调整计划项的 files 字段。"
         )
 
+    @staticmethod
+    def _plan_target_hint(name: str) -> str:
+        """缺 plan_item_id 时列出可绑定的计划项，让模型一次自纠而不是盲发。
+
+        run_subagent 只能绑执行项，ask_user 只能绑 input_preparation 项，
+        按工具类型给对应清单；一项都绑不上时指明 plan_read 这个恢复动作。
+        """
+        try:
+            from core.plan import get_default_plan_manager
+
+            snapshot = get_default_plan_manager().snapshot()
+        except Exception:
+            return ""
+        if not snapshot or all(item.get("status") == "completed" for item in snapshot):
+            return ""
+        want_prep = name == "ask_user"
+        targets = [
+            item
+            for item in snapshot
+            if (item.get("kind") == "input_preparation") == want_prep
+            and item.get("status") in {"pending", "in_progress"}
+        ]
+        # pending 排前：ask_user 只能绑 pending 准备项，优先把它摆到最前面
+        targets.sort(key=lambda item: item.get("status") != "pending")
+        if targets:
+            hints = ", ".join(
+                f"'{item['id']}'({item['subject']})" for item in targets[:5]
+            )
+            return f" 当前可绑定的计划项: [{hints}]。"
+        return " 当前没有可绑定的计划项，请先用 plan_read 查看各项状态再决定下一步。"
+
     def _plan_constraint(self, decoded, context):
         if not context.allow_subagents or not (
             self.plan_turn_checker(context.parent_turn_id)
@@ -943,7 +974,7 @@ class ToolPipeline:
         if name in _PLAN_BOUND_ORCHESTRATORS and not plan_item_id:
             return (
                 f"{_PLAN_BYPASS_ERROR_PREFIX} {name} 必须填写 plan_item_id，"
-                "不能执行未归属计划项的任务。"
+                f"不能执行未归属计划项的任务。{self._plan_target_hint(name)}"
             )
         if name in _PLAN_READ_ONLY_TOOLS or name in _PLAN_ROOT_CONTROL_TOOLS:
             return None
