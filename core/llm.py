@@ -1038,6 +1038,15 @@ def chat_with_model_events(
     else:
         computer_capability = None
     computer_turn_capability = computer_capability
+    # Turn 起点快照：编排三件套（run_subagent / plan_write / plan_update）是否可用。
+    # 设置页「子代理」开关关闭时整体不可用——计划项的执行器就是 run_subagent，
+    # 只关 run_subagent 而保留 plan_write/plan_update 会让计划停在 in_progress
+    # 永久死锁，因此必须整体关闭。快照按 Turn 固定（同一 Turn 内各 Step 复用），
+    # 设置改动从下一回合生效；惰性导入避免 core.subagent_settings → config 的
+    # 模块级循环依赖。
+    from core.subagent_settings import orchestration_allowed as _orchestration_allowed
+
+    allow_orchestration = _orchestration_allowed(allow_subagents)
     # Duck-type 管理器（未实现 Journal 存储接口的旧测试替身/外部调用方）
     # 不进入 Harness Journal，退回 legacy add_messages 持久化路径；
     # 真实 MemoryManager 始终具备完整接口，照常走 Journal。
@@ -1127,6 +1136,14 @@ def chat_with_model_events(
         # 只有真实主 Agent 回合允许认领；子 Agent 自身使用 allow_subagents=False，
         # 即使共享 parent_session 也不能窃取主回合的接管租约。认领与生成器构造
         # 都属于 Harness 准备阶段，必须位于异常收口范围内。
+        # 这里判定的是"是否为入口层主 Agent 回合"，与子代理开关无关：本处认领的
+        # 是子代理超时/失败后移交给主 Agent 的计划接管租约，认领后由主 Agent 用
+        # plan_resume_takeover / plan_finish 等普通工具自己推进，完全不依赖
+        # run_subagent。因此必须仍用 allow_subagents——若改成 allow_orchestration，
+        # 开关关闭后此前子代理超时留下的待接管计划项将永远无人认领（租约停留在
+        # takeover_queued，下一回合也不会重新认领）。工具表过滤用
+        # allow_orchestration（那才是"是否允许派子代理"的编排语义），两处语义
+        # 不同，不可混用。
         if allow_subagents:
             takeover_scheduler, takeover_claimed = _claim_takeover_at_turn_start(
                 parent_session,
@@ -2005,10 +2022,18 @@ def _chat_with_model_generator(
         _expose_mcp_admin = bool(_load_cfg_for_tools().get("expose_mcp_admin_tools", False))
     except Exception:
         _expose_mcp_admin = False
+    # Step 循环前的编排可用快照：子代理开关（设置 → 子代理）关闭时，编排三件套
+    # run_subagent / plan_write / plan_update 整体不可用——计划项的执行器就是
+    # run_subagent，只关 run_subagent 会让计划永久死锁在 in_progress。快照按 Turn
+    # 固定，设置改动从下一回合生效；电脑操控相关的 allow_subagents 判定不受影响
+    # （那是"是否入口层回合"语义，与本开关无关）。惰性导入避免核心层循环依赖。
+    from core.subagent_settings import orchestration_allowed as _orchestration_allowed
+
+    allow_orchestration = _orchestration_allowed(allow_subagents)
     request_tools = [
         schema
         for schema in get_tools_schema()
-        if allow_subagents
+        if allow_orchestration
         or schema.get("function", {}).get("name")
         not in {"run_subagent", "plan_write", "plan_update"}
         if allowed_tools is None
@@ -3293,7 +3318,9 @@ def _chat_with_model_generator(
                 # 计划仍有可执行项时不允许提前收尾：向模型注入续推消息，
                 # 要求继续通过 run_subagent 完成剩余计划项（最多续推 2 次，
                 # 避免模型坚持收尾时与续推消息无限打转）。
-                if allow_subagents and parent_session and plan_continue_nudges < 2:
+                # 计划续推属于编排能力：子代理开关关闭时 run_subagent 不在工具表
+                # 里，继续催模型调用它只会让它卡死，故改用 allow_orchestration。
+                if allow_orchestration and parent_session and plan_continue_nudges < 2:
                     try:
                         from core.plan import get_default_plan_manager as _get_plan_for_nudge
                         from core.plan import (
@@ -3700,7 +3727,9 @@ def _chat_with_model_generator(
             # 同一 turn 只注入一次：除生成器局部 orchestration_nudge_sent 外，还按
             # turn_id 做进程内去重（异常重入时不再重复注入）。
             if _should_nudge_orchestration(
-                allow_subagents=allow_subagents,
+                # 参数名为历史遗留（函数内只做布尔门禁）；这里传 Turn 起点的
+                # 编排可用快照，关闭子代理开关后不再催模型调用不存在的 run_subagent。
+                allow_subagents=allow_orchestration,
                 count=substantive_op_count,
                 session_id=parent_session,
                 turn_id=parent_turn_id,

@@ -44,6 +44,8 @@ const settings: SystemSettingsSnapshot = {
   computer_platform_supported: true,
   computer_hotkey_available: true,
   computer_hotkey: 'Ctrl+Alt+Esc',
+  // 全局子代理开关（后端默认开启）：作为快照必填字段需在 fixture 中补齐
+  subagent_enabled: true,
   computer_active_model_capability: { model: '', eligible: false },
   computer_run: {
     run_id: '',

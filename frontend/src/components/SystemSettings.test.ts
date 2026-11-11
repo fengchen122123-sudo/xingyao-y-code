@@ -29,6 +29,8 @@ const aiOutputDirFields = {
 
 // 电脑操控设置快照（Task 12）：两个开关默认关闭，浏览器选项独立探测
 const computerSettings = {
+  // 子代理开关（缺省开启）：不补该字段会让 SystemSettingsSnapshot 类型不完整
+  subagent_enabled: true,
   browser_control_enabled: false,
   computer_control_enabled: false,
   computer_browser: 'edge',
@@ -720,5 +722,62 @@ describe('doctor self-check entry', () => {
 
     expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('连接失败');
     expect(doctorApi.run_doctor).not.toHaveBeenCalled();
+  });
+});
+
+// ── 子代理开关 ──
+
+describe('subagent switch', () => {
+  const subagentApi = { set_subagent_enabled: vi.fn() };
+
+  function mountWithSubagent(overrides: Record<string, unknown> = {}) {
+    setActivePinia(createPinia());
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      ...overrides,
+    } as typeof store.systemSettings;
+    return { store, wrapper: mount(SystemSettings) };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (window as any).pywebview = { api: subagentApi };
+  });
+
+  afterEach(() => {
+    delete (window as any).pywebview;
+  });
+
+  it('renders the subagent switch as on when the snapshot enables it', () => {
+    const { wrapper } = mountWithSubagent();
+
+    const toggle = wrapper.get('[data-test="subagent-switch"]');
+    expect(toggle.attributes('aria-checked')).toBe('true');
+    expect(wrapper.get('[data-test="subagent-settings-section"]').text()).toContain('run_subagent');
+  });
+
+  it('turns the subagent switch off through the backend bridge', async () => {
+    subagentApi.set_subagent_enabled.mockResolvedValue({ ok: true, settings: null });
+    const { wrapper } = mountWithSubagent();
+
+    await wrapper.get('[data-test="subagent-switch"]').trigger('click');
+    await flushPromises();
+
+    expect(subagentApi.set_subagent_enabled).toHaveBeenCalledTimes(1);
+    expect(subagentApi.set_subagent_enabled).toHaveBeenCalledWith(false);
+  });
+
+  it('renders the subagent switch as off when the snapshot disables it', () => {
+    const { wrapper } = mountWithSubagent({ subagent_enabled: false });
+
+    expect(wrapper.get('[data-test="subagent-switch"]').attributes('aria-checked')).toBe('false');
   });
 });

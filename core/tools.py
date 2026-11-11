@@ -4789,6 +4789,21 @@ def run_subagent(
                 "请拆分为多个计划项/子任务，或精简任务描述；本次输入未被截断或改写。"
             ).format(len(str(task_description))),
         }, ensure_ascii=False)
+    # 全局子代理开关（设置 → 子代理）硬拦截：位于参数校验之后、认领计划项之前，
+    # 保证插件/hook/工作流/恢复等一切直调路径同样不派发子代理（模型侧虽已把
+    # run_subagent 从工具表摘除，直调仍需入口兜底）。返回结构与本函数其它失败
+    # 返回完全一致（status/plan_item_id/error）。
+    from core.subagent_settings import orchestration_allowed as _orchestration_allowed
+
+    if not _orchestration_allowed(True):
+        return json.dumps({
+            "status": "failed",
+            "plan_item_id": str(plan_item_id or ""),
+            "error": (
+                "子代理已在设置中关闭（设置 → 子代理），本次任务不派发子代理；"
+                "请使用你自己的工具按顺序完成该子任务。"
+            ),
+        }, ensure_ascii=False)
     if parent_session is None or parent_turn_id is None:
         import core.app_context as app_context
         parent_session = parent_session or app_context.get_current_session()

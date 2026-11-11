@@ -48,6 +48,7 @@ SUPPORTED_SETTING_KEYS = {
     "command_shell": "默认命令解释器",
     "turn_step_limit": "单任务最大轮次",
     "search_exclude_dirs": "搜索排除目录",
+    "subagent_enabled": "子代理开关",
     "ai_output_dir": "AI 输出目录",
 }
 
@@ -594,6 +595,15 @@ def _get_one_setting(key: str) -> dict[str, Any]:
             "note": "该列表在 search_code 的内置排除目录（.git/.venv/node_modules 等）之外追加",
         }
 
+    if key == "subagent_enabled":
+        from core.subagent_settings import subagent_enabled as _subagent_enabled
+
+        return {
+            "label": SUPPORTED_SETTING_KEYS[key],
+            "value": _subagent_enabled(),
+            "description": "关闭后不派发子代理，计划编排工具一并不可用；所有子任务由主 Agent 直接完成",
+        }
+
     # ai_output_dir
     from core.ai_output_paths import (
         default_ai_output_dir,
@@ -611,7 +621,7 @@ def _get_one_setting(key: str) -> dict[str, Any]:
 
 @_guard
 def system_settings(action: str = "get", key: str = "", value: str = "") -> str:
-    """读取 / 修改非安全设置项（命令解释器、单任务最大轮次、搜索排除目录、AI 输出目录）。"""
+    """读取 / 修改非安全设置项（命令解释器、单任务最大轮次、搜索排除目录、AI 输出目录、子代理开关）。"""
     act = str(action or "get").strip().lower()
     setting_key = str(key or "").strip()
 
@@ -677,6 +687,22 @@ def system_settings(action: str = "get", key: str = "", value: str = "") -> str:
 
         if not _config.save_config_value("search_exclude_dirs", entries):
             return _fail("搜索排除目录保存失败（config.json 写入失败）")
+        return _ok(action="set", key=setting_key, setting=_get_one_setting(setting_key))
+
+    if setting_key == "subagent_enabled":
+        from core.subagent_settings import SubagentSettingError, set_subagent_enabled
+
+        lowered = text.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on", "是", "开", "开启"}:
+            enabled = True
+        elif lowered in {"0", "false", "no", "n", "off", "否", "关", "关闭"}:
+            enabled = False
+        else:
+            return _fail(f"子代理开关只接受布尔值，收到 {value!r}")
+        try:
+            set_subagent_enabled(enabled)
+        except SubagentSettingError as exc:
+            return _fail(str(exc) or "子代理开关保存失败")
         return _ok(action="set", key=setting_key, setting=_get_one_setting(setting_key))
 
     # ai_output_dir

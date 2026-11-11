@@ -6550,6 +6550,24 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "settings": self.get_system_settings(),
             }
 
+    def set_subagent_enabled(self, value: bool) -> Dict[str, Any]:
+        """设置全局子代理开关；非法值显式拒绝且不写盘。"""
+        from core.subagent_settings import SubagentSettingError, set_subagent_enabled
+
+        try:
+            effective = set_subagent_enabled(value)
+            return {
+                "ok": True,
+                "settings": self.get_system_settings(),
+                "msg": f"子代理开关已{'开启' if effective else '关闭'}",
+            }
+        except (SubagentSettingError, ValueError) as error:
+            return {
+                "ok": False,
+                "msg": str(error),
+                "settings": self.get_system_settings(),
+            }
+
     # ------------------------------------------------------------------
     # /doctor 聚合自检（T3b：设置页「运行自检」入口）
     # ------------------------------------------------------------------

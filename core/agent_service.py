@@ -566,6 +566,10 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
     # AI 生成内容目录（Task 6）：配置级稳定值，注入动态块告知模型统一落点。
     from core.ai_output_paths import resolve_ai_output_dir
 
+    # 全局子代理开关（设置页「子代理」）：关闭时运行上下文块明确禁止派子代理
+    # 与建计划；默认开启，注入内容与改动前逐字节一致。
+    from core.subagent_settings import subagent_enabled
+
     return RuntimeContext(
         model_name=model_name,
         permission_mode=permission_mode,
@@ -576,6 +580,7 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
         computer_capability=computer_capability,
         workspace_corrections=workspace_corrections,
         ai_output_dir=str(resolve_ai_output_dir()),
+        subagent_enabled=subagent_enabled(),
     )
 
 

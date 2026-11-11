@@ -328,6 +328,8 @@ export interface SystemSettingsSnapshot {
   computer_hotkey_available: boolean;
   computer_hotkey: string;
   computer_run: ComputerRunSnapshot;
+  // 全局子代理开关：关闭后不派发子代理，计划编排工具一并不可用（后端快照为准）
+  subagent_enabled: boolean;
   // 当前活动模型的电脑操控资格（与 Turn 起点同一判定函数的只读展示）
   computer_active_model_capability: {
     model: string;
@@ -1818,6 +1820,8 @@ export interface PyWebViewAPI {
   // AI 生成内容目录：不可用路径显式拒绝（ok=false + msg），不做静默降级
   set_ai_output_dir(path: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // 子代理开关：关闭后不派发子代理，计划编排工具一并不可用
+  set_subagent_enabled(value: boolean): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   // 飞书集成：快照不含 app_secret 明文（只回 has_secret），明文按需 get_feishu_secret
   get_feishu_settings(): Promise<{ ok: boolean; settings?: FeishuSettingsSnapshot; msg?: string }>;
   set_feishu_settings(payload: {

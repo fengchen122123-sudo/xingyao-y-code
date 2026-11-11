@@ -686,6 +686,7 @@ Config file location: `~/.ycode/config.json`. A fresh install starts with a clea
 | `secondary_model_roles` | Secondary model role switches (vision / compression / subagent) |
 | `image_compression` | Image compression parameters (default: long edge 1536, quality 90, target 1MiB) |
 | `search_exclude_dirs` | Directories excluded from code search |
+| `subagent_enabled` | Global subagent switch: `false` disables subagent dispatch and plan orchestration tools (plan_write/plan_update); all subtasks are done directly by the main agent (default `true`) |
 | `memory_compression` | Memory compression parameters |
 | `providers` | List of model providers |
 | `theme` | Terminal color theme (9 available) |

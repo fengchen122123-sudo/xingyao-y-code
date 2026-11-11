@@ -701,6 +701,7 @@ xingyao-y-code/
 | `secondary_model_roles` | 副模型角色开关（vision / compression / subagent） |
 | `image_compression` | 图片压缩参数（默认长边 1536、质量 90、目标 1MiB） |
 | `search_exclude_dirs` | 代码搜索排除目录 |
+| `subagent_enabled` | 全局子代理开关：设为 `false` 时不派发子代理，计划编排工具（plan_write/plan_update）一并不可用，所有子任务由主 Agent 直接完成（默认 `true`） |
 | `memory_compression` | 记忆压缩参数 |
 | `providers` | 模型供应商列表 |
 | `theme` | 终端配色主题（9 种） |

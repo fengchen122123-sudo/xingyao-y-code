@@ -650,6 +650,8 @@ export const useAppStore = defineStore('app', {
       ai_output_dir: '',
       ai_output_dir_setting: '',
       ai_output_dir_default: '',
+      // 子代理开关：默认开启（缺省保持既有行为），真实值一律以后端快照覆盖
+      subagent_enabled: true,
       // 电脑操控默认关闭（设计 8.1）：真实值一律以后端快照覆盖
       browser_control_enabled: false,
       computer_control_enabled: false,
@@ -3457,6 +3459,26 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('电脑操控', '浏览器操控设置失败: ' + err);
+        return false;
+      }
+    },
+
+    // 子代理开关：与电脑操控开关一致，只以后端返回的 settings 快照覆盖本地，
+    // 不做乐观更新；失败时后端快照本身就是回滚值
+    async setSubagentEnabled(enabled: boolean): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_subagent_enabled(enabled);
+        if (result && result.settings) this.systemSettings = result.settings;
+        if (!result || !result.ok) {
+          this.notifyModal('子代理', '子代理开关设置失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('子代理', '子代理开关设置失败: ' + err);
         return false;
       }
     },

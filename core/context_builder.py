@@ -44,6 +44,9 @@ class RuntimeContext:
     # AI 生成内容目录（Task 6）：配置级稳定值（默认 ~/.ycode/tmp），
     # 跨轮不变，符合动态块"不放每轮必变字段"的约束。
     ai_output_dir: str = ""
+    # 全局子代理开关（设置页「子代理」）：默认 True，关闭时运行上下文块
+    # 明确告知模型不要派子代理、也不要建计划编排。
+    subagent_enabled: bool = True
 
 
 def build_stable_prompt(base_prompt: str) -> str:
@@ -106,6 +109,12 @@ def _build_runtime_context_block(runtime: RuntimeContext) -> str:
             "不得修改或删除工作区文件。最终回答必须输出可执行计划，并说明需要"
             "切换到变更前确认、自动编辑或完全访问模式后再实施。\n"
         )
+    subagent_instruction = ""
+    if not runtime.subagent_enabled:
+        subagent_instruction = (
+            "子代理：已关闭（设置 → 子代理）。run_subagent 与计划编排工具均不可用，"
+            "所有子任务由你自己按顺序完成，不要尝试派子代理，也不要创建计划。\n"
+        )
     prompt = (
         f"{DYNAMIC_CONTEXT_PREFIX}\n"
         f"当前模型：{runtime.model_name}\n"
@@ -119,6 +128,7 @@ def _build_runtime_context_block(runtime: RuntimeContext) -> str:
         "用户显式指定了保存位置时以用户指定为准。\n"
         f"当前计划：{runtime.active_plan}\n"
         f"{plan_instruction}"
+        f"{subagent_instruction}"
         "（若上下文中存在多份本块，以最新一份为准）"
     )
     return prompt

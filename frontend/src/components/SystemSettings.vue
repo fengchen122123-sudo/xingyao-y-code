@@ -159,6 +159,30 @@
       </p>
     </section>
 
+    <section class="subagent-settings" data-test="subagent-settings-section">
+      <header class="computer-header">
+        <h2 class="computer-title">子代理</h2>
+      </header>
+
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>启用子代理</h2>
+          <p>关闭后不再派发子代理（run_subagent），计划编排工具一并不可用，所有子任务由主 Agent 直接完成；已派出的后台子代理会继续跑完。修改后下一轮任务生效。</p>
+        </div>
+        <button
+          type="button"
+          class="setting-switch"
+          role="switch"
+          data-test="subagent-switch"
+          :aria-checked="store.systemSettings.subagent_enabled ? 'true' : 'false'"
+          :disabled="saving"
+          @click="toggleSubagentEnable"
+        >
+          <span class="switch-knob" />
+        </button>
+      </div>
+    </section>
+
     <section class="computer-settings" data-test="computer-settings-section">
       <header class="computer-header">
         <h2 class="computer-title"><AppIcon name="zap" :size="14" /> 电脑操控</h2>
@@ -754,6 +778,16 @@ async function toggleBrowserControl() {
   saving.value = true;
   try {
     await store.setBrowserControlEnabled(!store.systemSettings.browser_control_enabled);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function toggleSubagentEnable() {
+  if (saving.value) return;
+  saving.value = true;
+  try {
+    await store.setSubagentEnabled(!store.systemSettings.subagent_enabled);
   } finally {
     saving.value = false;
   }

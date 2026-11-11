@@ -823,6 +823,9 @@ KNOWN_CONFIG_KEYS = frozenset({
     "fetch_url_allow_hosts", "fetch_url_strict_ssrf",
     "expose_mcp_admin_tools", "project_hook_full_input",
     "ai_output_dir",
+    # 全局子代理开关（默认开启；false 时不派发子代理，计划编排工具
+    # plan_write/plan_update 一并不可用，所有子任务由主 Agent 直接完成）
+    "subagent_enabled",
     # 电脑操控
     "browser_control_enabled", "computer_control_enabled", "computer_browser",
     # 局域网远程控制

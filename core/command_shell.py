@@ -235,6 +235,9 @@ def get_system_settings(
         MIN_WATERMARK_BASE,
         load_watermark_base,
     )
+    # 全局子代理开关（设置项 subagent_enabled）：同样走函数内惰性导入，
+    # 读路径不抛异常，缺省视为开启。
+    from core.subagent_settings import subagent_enabled as _get_subagent_enabled
 
     return {
         "command_shell": selected,
@@ -265,6 +268,8 @@ def get_system_settings(
         "ai_output_dir": str(_resolve_ai_output_dir()),
         "ai_output_dir_setting": _get_ai_output_dir_setting(),
         "ai_output_dir_default": str(_default_ai_output_dir()),
+        # 全局子代理开关：关闭后不派发子代理、也不启用计划编排
+        "subagent_enabled": _get_subagent_enabled(),
     }
 
 
