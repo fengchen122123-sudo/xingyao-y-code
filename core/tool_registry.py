@@ -1903,8 +1903,21 @@ def _workflow_finish_wrapper(*, run_id, ok=None, summary="", **_ignored):
         return ToolResult(content=f"收尾失败：{exc}", is_error=True)
     if updated:
         return ToolResult(content=f"运行 {run_id} 已记录为 {status}")
-    # 未知 run_id 或已终态：幂等接受，不让模型卡在收尾上
-    return ToolResult(content=f"运行 {run_id} 无需收尾（不存在或已结束）")
+    # 未知 run_id 或已终态：幂等接受，不让模型卡在收尾上。
+    # 但要区分两种情况，否则模型会把「已完成」和「凭空编的 id」当成同一回事：
+    # 台账里根本没有这条记录，说明它把计划编排当成工作流，再编 id 也是白费。
+    existing = storage.get_run(run_id)
+    if existing is None:
+        return ToolResult(
+            content=(
+                f"运行 {run_id} 在台账中不存在，无需收尾。workflow_finish 只用于 "
+                "workflow_run 执行后的收尾；若本回合走的是 plan_write + run_subagent "
+                "计划编排，则不需要调用本工具，直接汇报结果即可。"
+            )
+        )
+    return ToolResult(
+        content=f"运行 {run_id} 无需收尾（已结束，状态 {existing.get('status')}）"
+    )
 
 
 def _workflow_save_wrapper(
