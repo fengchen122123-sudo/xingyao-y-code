@@ -1,9 +1,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.3.8](https://img.shields.io/badge/Version-1.3.8-green.svg)](core/version.py)
+[![Version 1.3.9](https://img.shields.io/badge/Version-1.3.9-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
+
+[English](README.en.md) | 中文
 
 > 一个国产终端 AI 编程助手，代号「星瑶」。支持 TUI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
 
@@ -65,7 +67,7 @@
 ### 1. 克隆仓库
 
 ```bash
-git clone https://gitee.com/feng-chenhao/xingyao-y-code.git
+git clone https://github.com/fengchen122123-sudo/xingyao-y-code.git
 cd xingyao-y-code
 ```
 
@@ -791,7 +793,7 @@ venv\Scripts\python.exe scripts\smoke_computer_control.py --desktop-input --conf
 
 欢迎提交 Issue 或 Pull Request：
 
-- 提交 Issue：<https://gitee.com/feng-chenhao/xingyao-y-code/issues>
+- 提交 Issue：<https://github.com/fengchen122123-sudo/xingyao-y-code/issues>
 - 提交 PR 前请先本地跑通 `pytest`，并遵循 `AGENTS.md` 中的开发规范
 - 如果你发现代码里有敏感信息泄露，请第一时间通过 Issue 提醒维护者
 
