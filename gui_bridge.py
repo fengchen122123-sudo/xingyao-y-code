@@ -9567,6 +9567,56 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return ""
         return raw
 
+    def _ensure_automation_run_session(self, task: dict, run_id: str) -> str:
+        """per_run 模式：确保本次运行的落点会话存在，返回会话名。
+
+        会话名为 ``{YYYY-MM-DD} {任务名}``（core/automation/session_naming）：
+        同一任务同一天无论触发多少次都复用同一会话，历史自然按天切开。
+        会话已存在时直接复用、不新建；新建时把会话绑定到任务配置的 workdir
+        （空则 "GLOBAL"，即侧栏「对话」分组）。先建会话再 spawn，保证新会话
+        归属正确。本方法全程不切换当前会话（任务在后台跑，不打断用户）。
+
+        建会话失败时把异常抛给 ``_dispatch_automation_run`` 兜底（置 error 终态）。
+        """
+        import datetime
+
+        from core.automation.session_naming import build_run_session_name
+
+        task_name = str(task.get("name") or "")
+        name = build_run_session_name(task_name, datetime.datetime.now())
+        existing = False
+        try:
+            # include_archived=True：归档的同名会话也必须认出来——sessions.session_name
+            # 有 UNIQUE 约束，同名再插入会被 INSERT OR IGNORE 静默丢弃，消息就会落进
+            # 已归档、列表里看不见的会话。命中归档会话时直接复活它（归档只是可见性
+            # 过滤，复活不影响任何消息）。
+            for s in self._memory.get_all_sessions(
+                workdir=None, include_empty=True, include_archived=True
+            ):
+                if s.get("name") == name:
+                    existing = True
+                    if s.get("archived_at"):
+                        try:
+                            self._memory.unarchive_session(name)
+                        except Exception:
+                            logger.debug("复活归档的运行会话失败", exc_info=True)
+                    break
+        except Exception:
+            logger.debug("查询运行会话是否存在失败，按不存在处理", exc_info=True)
+            existing = False
+        if existing:
+            return name
+        workdir = str(task.get("workdir") or "").strip() or "GLOBAL"
+        self._memory.create_session_explicit(name, workdir=workdir, source="GUI")
+        location = "对话分组" if workdir.upper() == "GLOBAL" else f"项目目录 {workdir}"
+        try:
+            self.emit_event("notice", {
+                "message": f"星轨任务「{task_name.strip()}」已新建会话「{name}」（{location}）",
+            })
+        except Exception:
+            logger.debug("推送运行会话新建提示失败", exc_info=True)
+        return name
+
     def _dispatch_automation_run(self, task: dict, run_id: str, trigger_kind: str) -> None:
         """引擎/手动触发共用：把任务提示词投递为目标会话的一次真实回合。
 
@@ -9574,10 +9624,51 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         内部回合（internal_kind="automation"，turn_start 带 internal 标记）。
         全程持 _turn_start_lock，与 send_user_message 的"检查+启动"原子语义一致。
         本方法在引擎线程或 js_api 线程执行，只做判定与登记，不做模型请求。
+
+        会话模式（设计规格第 4 节）：fixed＝沿用任务配置的固定会话；per_run
+        （默认）＝每次运行投递到当天新建的独立会话。
         """
         if self._shutting_down:
             return
-        target_session = str(task.get("target_session") or "").strip() or "星轨自动化任务"
+        # 运行会话模式：非法/空值一律按 per_run（与存储层默认值同口径）
+        session_mode = str(task.get("session_mode") or "per_run").strip() or "per_run"
+        if session_mode == "fixed":
+            target_session = str(task.get("target_session") or "").strip() or "星轨自动化任务"
+        else:
+            target_session = ""
+            try:
+                target_session = str(
+                    self._ensure_automation_run_session(task, run_id) or ""
+                ).strip()
+            except Exception as exc:
+                # 建会话失败：绝不让异常冒泡到引擎线程（会停摆整个调度循环）
+                logger.exception("星轨自动化运行会话创建失败")
+                target_session = ""
+                failure = f"新建运行会话失败: {exc}"[:500]
+            else:
+                failure = ""
+            if not target_session:
+                failure = failure or "新建运行会话失败"
+                try:
+                    self._automation_storage.finish_run(run_id, "error", failure)
+                except Exception:
+                    logger.exception("自动化运行错误终态写入失败")
+                try:
+                    self.emit_event("notice", {
+                        "message": (
+                            f"星轨自动化任务「{task.get('name')}」新建对话失败，"
+                            f"本次运行已取消：{failure}"
+                        ),
+                    })
+                except Exception:
+                    logger.debug("推送运行会话失败提示异常", exc_info=True)
+                return
+        # 回写运行行实际落点会话名（per_run 下与任务配置的 target_session 不同）；
+        # 回写失败只记日志，不影响派发
+        try:
+            self._automation_storage.set_run_session(run_id, target_session)
+        except Exception:
+            logger.warning("自动化运行会话名回写失败", exc_info=True)
         display_text = f"星轨自动化任务「{task.get('name')}」"
         # 任务指定的工作目录只对"懒创建的新会话"生效；已有会话沿用自身归属
         pending_workdir = self._automation_pending_workdir(

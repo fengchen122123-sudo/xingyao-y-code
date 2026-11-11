@@ -94,6 +94,27 @@ def test_model_id_roundtrip(storage):
     assert storage.get_task(mid)["model_id"] == ""
 
 
+def test_session_mode_defaults_to_per_run(storage):
+    """不传 session_mode 的任务落库为 per_run（每次运行新建会话）。"""
+    task_id = storage.save_task(_task())
+    assert storage.get_task(task_id)["session_mode"] == "per_run"
+    fixed_id = storage.save_task(_task(name="固定会话", session_mode="fixed"))
+    assert storage.get_task(fixed_id)["session_mode"] == "fixed"
+    # 空白值归一为 per_run；编辑可改写
+    blank_id = storage.save_task(_task(name="空白", session_mode="   "))
+    assert storage.get_task(blank_id)["session_mode"] == "per_run"
+    storage.save_task({**storage.get_task(fixed_id), "session_mode": "per_run"})
+    assert storage.get_task(fixed_id)["session_mode"] == "per_run"
+
+
+def test_missed_run_policy_defaults_to_run_once(storage):
+    """不传 missed_run_policy 时默认 run_once（错过就补跑一次）。"""
+    task = _task()
+    task.pop("missed_run_policy")
+    task_id = storage.save_task(task)
+    assert storage.get_task(task_id)["missed_run_policy"] == "run_once"
+
+
 def test_validate_task_rejects_non_string_model_id(storage):
     from core.automation.models import validate_task
 
@@ -152,6 +173,59 @@ def test_migration_adds_workdir_column_to_legacy_table(manager):
     reloaded = storage.get_task("t1")
     assert reloaded["workdir"] == "GLOBAL"
     assert reloaded["model_id"] == "m1"
+
+
+def test_migration_adds_session_mode_column_to_legacy_table(manager):
+    """旧版本任务表（无 session_mode 列）打开时自动补列，旧任务读到 per_run。"""
+    with manager._lock:
+        cursor = manager.conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS automation_tasks")
+        cursor.execute("""
+            CREATE TABLE automation_tasks (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                trigger_type TEXT NOT NULL,
+                trigger_config TEXT NOT NULL DEFAULT '{}',
+                target_session TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                permission_mode TEXT NOT NULL DEFAULT 'confirm',
+                missed_run_policy TEXT NOT NULL DEFAULT 'skip',
+                notify_on_success INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run_at TEXT,
+                next_run_at REAL,
+                workdir TEXT NOT NULL DEFAULT '',
+                model_id TEXT NOT NULL DEFAULT '',
+                max_runs INTEGER,
+                scheduled_run_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active'
+            )
+        """)
+        cursor.execute(
+            """
+            INSERT INTO automation_tasks (
+                id, name, trigger_type, trigger_config, target_session, prompt,
+                created_at, updated_at
+            ) VALUES (
+                't1', '旧任务', 'daily', '{"time": "09:30"}', '自动化任务', 'p',
+                '2026-01-01 00:00:00', '2026-01-01 00:00:00'
+            )
+            """
+        )
+        manager.conn.commit()
+    storage = AutomationStorage(manager)
+    loaded = storage.get_task("t1")
+    assert loaded is not None and loaded["session_mode"] == "per_run"
+    # 旧行已有策略值不被迁移改写
+    assert loaded["missed_run_policy"] == "skip"
+    # 补列后可正常编辑保存并按新列读写
+    storage.save_task({**loaded, "session_mode": "fixed"})
+    assert storage.get_task("t1")["session_mode"] == "fixed"
+    # 重复初始化幂等（不会因列已存在而报错）
+    AutomationStorage(manager)
+    assert storage.get_task("t1")["session_mode"] == "fixed"
 
 
 def test_list_tasks(storage):
@@ -230,6 +304,18 @@ def test_mark_running_and_finish_run(storage):
     # 终态 exactly-once：二次收尾是 no-op
     assert storage.finish_run(run_id, "error", "不应生效") is False
     assert storage.list_runs(task_id)[0]["status"] == "completed"
+
+
+def test_set_run_session_rewrites_session_name(storage):
+    """per_run 派发后把运行行回写为真实会话名；不存在的运行返回 False。"""
+    task_id = storage.save_task(_task())
+    run_id = new_automation_id("run")
+    storage._insert_run_raw(run_id, task_id, "自动化任务", "queued")
+    assert storage.set_run_session(run_id, "2026-11-11 每日站会摘要") is True
+    assert storage.list_runs(task_id)[0]["session_name"] == "2026-11-11 每日站会摘要"
+    # 状态不受影响（不触发 updated 回调噪声，只改落点）
+    assert storage.list_runs(task_id)[0]["status"] == "queued"
+    assert storage.set_run_session("run-不存在", "x") is False
 
 
 def test_finish_run_rejects_unknown_status(storage):

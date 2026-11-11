@@ -82,6 +82,7 @@ _TASK_COLUMNS = (
     "max_runs",
     "scheduled_run_count",
     "status",
+    "session_mode",
 )
 
 _RUN_COLUMNS = (
@@ -109,7 +110,7 @@ AUTOMATION_TABLE_DDL = (
         target_session TEXT NOT NULL,
         prompt TEXT NOT NULL,
         permission_mode TEXT NOT NULL DEFAULT 'confirm',
-        missed_run_policy TEXT NOT NULL DEFAULT 'skip',
+        missed_run_policy TEXT NOT NULL DEFAULT 'run_once',
         notify_on_success INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -119,7 +120,8 @@ AUTOMATION_TABLE_DDL = (
         model_id TEXT NOT NULL DEFAULT '',
         max_runs INTEGER,
         scheduled_run_count INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'active'
+        status TEXT NOT NULL DEFAULT 'active',
+        session_mode TEXT NOT NULL DEFAULT 'per_run'
     )
     """,
     """
@@ -217,6 +219,11 @@ class AutomationStorage:
                 cursor.execute(
                     "ALTER TABLE automation_tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
                 )
+            # 运行会话模式（设计规格 2）：存量任务自动切到 per_run（每次运行新建会话）
+            if "session_mode" not in existing_cols:
+                cursor.execute(
+                    "ALTER TABLE automation_tasks ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'per_run'"
+                )
             self.conn.commit()
 
     # -- 任务 CRUD --
@@ -293,10 +300,11 @@ class AutomationStorage:
                 str(task.get("target_session") or "").strip(),
                 str(task.get("prompt") or ""),
                 str(task.get("permission_mode") or "confirm"),
-                str(task.get("missed_run_policy") or "skip"),
+                str(task.get("missed_run_policy") or "run_once"),
                 1 if task.get("notify_on_success") else 0,
                 str(task.get("workdir") or "").strip(),
                 str(task.get("model_id") or "").strip(),
+                str(task.get("session_mode") or "per_run").strip() or "per_run",
             )
             if exists:
                 # 只允许改写 max_runs；scheduled_run_count / status 属于生命周期
@@ -307,7 +315,8 @@ class AutomationStorage:
                     SET name = ?, enabled = ?, trigger_type = ?, trigger_config = ?,
                         target_session = ?, prompt = ?, permission_mode = ?,
                         missed_run_policy = ?, notify_on_success = ?, workdir = ?,
-                        model_id = ?, updated_at = ?, next_run_at = ?, max_runs = ?
+                        model_id = ?, session_mode = ?, updated_at = ?,
+                        next_run_at = ?, max_runs = ?
                     WHERE id = ?
                     """,
                     (*fields, now, next_run, max_runs, task_id),
@@ -318,10 +327,10 @@ class AutomationStorage:
                     INSERT INTO automation_tasks (
                         id, name, enabled, trigger_type, trigger_config,
                         target_session, prompt, permission_mode, missed_run_policy,
-                        notify_on_success, workdir, model_id, max_runs,
+                        notify_on_success, workdir, model_id, session_mode, max_runs,
                         scheduled_run_count, status, created_at, updated_at,
                         last_run_at, next_run_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, NULL, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, NULL, ?)
                     """,
                     (task_id, *fields, max_runs, now, now, next_run),
                 )
@@ -438,6 +447,22 @@ class AutomationStorage:
                 "UPDATE automation_runs SET turn_id = ? WHERE id = ?", (turn_id, run_id)
             )
             self.conn.commit()
+
+    def set_run_session(self, run_id: str, session_name: str) -> bool:
+        """回写运行行实际落点的会话名（per_run 每次新建会话时用）。
+
+        只在运行中途纠偏，不改变运行状态，因此不触发 ``_fire_run_updated``，
+        避免刷新噪声；返回是否命中该运行行。
+        """
+        with self._manager._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE automation_runs SET session_name = ? WHERE id = ?",
+                (session_name, run_id),
+            )
+            updated = cursor.rowcount > 0
+            self.conn.commit()
+        return updated
 
     def finish_run(self, run_id: str, status: str, error: str = "") -> bool:
         """写入运行终态。exactly-once：只有 queued/running 能被收尾。"""

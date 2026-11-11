@@ -626,6 +626,9 @@ export interface AutomationTaskInfo {
   trigger_type: 'interval' | 'daily' | 'weekly' | 'startup' | 'once';
   trigger_config: Record<string, any>;
   target_session: string;
+  // 运行会话落点：per_run = 每次运行前新建/复用名为 "{YYYY-MM-DD} {任务名}" 的会话
+  // （此时 target_session 为空串）；fixed = 沿用 target_session 固定会话
+  session_mode: 'per_run' | 'fixed';
   // 任务指定的工作目录：'' = 跟随目标会话归属；'GLOBAL' = 新会话挂自由对话；
   // 其余为懒创建新会话时绑定的项目目录路径
   workdir?: string;

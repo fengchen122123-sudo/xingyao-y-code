@@ -35,7 +35,20 @@
           </label>
         </div>
         <div class="ap-meta">
-          <span class="ap-meta-item" :title="`目标会话：${t.target_session}`">💬 {{ t.target_session }}</span>
+          <!-- per_run 任务的 target_session 是空串（会话名在运行时按「日期 任务名」生成），
+               直接拼进去会渲染成孤立的「💬 」，这里改为说明运行会话落点 -->
+          <span
+            v-if="t.session_mode === 'per_run'"
+            class="ap-meta-item"
+            data-test="automation-task-session"
+            title="每次运行按「{日期} {任务名}」新建会话"
+          >💬 每次运行新建会话</span>
+          <span
+            v-else
+            class="ap-meta-item"
+            data-test="automation-task-session"
+            :title="`目标会话：${t.target_session}`"
+          >💬 {{ t.target_session }}</span>
           <span
             v-if="t.workdir === 'GLOBAL'"
             class="ap-meta-item"
@@ -92,13 +105,14 @@
 
       <div class="ap-row">
         <input v-model="form.name" data-test="automation-name" placeholder="任务名称（如：每日站会摘要）" maxlength="50" />
-        <select v-model="form.sessionMode" title="目标会话">
+        <!-- 目标会话只在「固定会话」模式下有意义：per_run 由后端按日期+任务名建会话 -->
+        <select v-if="form.runSessionMode === 'fixed'" v-model="form.sessionMode" title="目标会话">
           <option value="" disabled>选择目标会话</option>
           <option v-for="s in sessionOptions" :key="s" :value="s">{{ s }}</option>
           <option value="__new__">新建会话…</option>
         </select>
         <input
-          v-if="form.sessionMode === '__new__'"
+          v-if="form.runSessionMode === 'fixed' && form.sessionMode === '__new__'"
           v-model="form.newSession"
           data-test="automation-new-session"
           placeholder="新会话名称"
@@ -106,8 +120,18 @@
         />
       </div>
 
+      <!-- 运行会话落点：每次运行新建会话（默认）时隐藏目标会话，仅预览将要创建的会话名 -->
+      <div class="ap-row">
+        <span class="ap-unit">运行会话</span>
+        <select v-model="form.runSessionMode" data-test="automation-run-session-mode" title="每次运行的会话落点">
+          <option value="per_run">每次运行新建会话</option>
+          <option value="fixed">固定使用指定会话</option>
+        </select>
+        <span v-if="form.runSessionMode === 'per_run'" class="ap-unit ap-workdir-hint" data-test="automation-run-session-preview">{{ runSessionPreview }}</span>
+      </div>
+
       <!-- 新会话工作目录：目标会话不存在时由任务代为创建，归属目录必须在这里指定 -->
-      <div v-if="form.sessionMode === '__new__'" class="ap-row" data-test="automation-workdir-row">
+      <div v-if="form.sessionMode === '__new__' || form.runSessionMode === 'per_run'" class="ap-row" data-test="automation-workdir-row">
         <span class="ap-unit">工作目录</span>
         <select v-model="form.workdirMode" data-test="automation-workdir-mode" title="新会话归属">
           <option value="global">自由对话（不绑定项目）</option>
@@ -269,6 +293,8 @@ const form = reactive({
   id: '',
   name: '',
   sessionMode: '',
+  // 运行会话落点（与 sessionMode 语义不同：sessionMode 是"目标会话选择"）
+  runSessionMode: 'per_run' as 'per_run' | 'fixed',
   newSession: '',
   workdirMode: 'global' as 'global' | 'folder',
   workdir: '',
@@ -285,7 +311,7 @@ const form = reactive({
   maxRuns: '' as string | number,
   prompt: '',
   permissionMode: 'confirm' as AutomationTaskInfo['permission_mode'],
-  missedPolicy: 'skip' as 'skip' | 'run_once',
+  missedPolicy: 'run_once' as 'skip' | 'run_once',
   notifyOnSuccess: false,
   errors: [] as string[],
 });
@@ -311,10 +337,22 @@ const existingSessionWorkdir = computed(() => {
   return '';
 });
 
+// per_run 模式下本次运行将创建的会话名：{本地日期 YYYY-MM-DD} {任务名}
+// （与后端 core/automation/session_naming.build_run_session_name 保持同一格式）
+const runSessionPreview = computed(() => {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const date = `${now.getFullYear()}-${month}-${day}`;
+  const name = form.name.trim();
+  return name ? `${date} ${name}` : date;
+});
+
 function openCreate() {
   form.id = '';
   form.name = '';
   form.sessionMode = sessionOptions.value[0] || '__new__';
+  form.runSessionMode = 'per_run';
   form.newSession = '';
   form.workdirMode = 'global';
   form.workdir = '';
@@ -329,7 +367,7 @@ function openCreate() {
   form.maxRuns = '';
   form.prompt = '';
   form.permissionMode = 'confirm';
-  form.missedPolicy = 'skip';
+  form.missedPolicy = 'run_once';
   form.notifyOnSuccess = false;
   form.errors = [];
   form.show = true;
@@ -339,6 +377,7 @@ function openEdit(t: AutomationTaskInfo) {
   form.id = t.id;
   form.name = t.name;
   form.sessionMode = sessionOptions.value.includes(t.target_session) ? t.target_session : '__new__';
+  form.runSessionMode = t.session_mode === 'fixed' ? 'fixed' : 'per_run';
   form.newSession = sessionOptions.value.includes(t.target_session) ? '' : t.target_session;
   // 旧任务 workdir 为空（跟随会话归属）：编辑新建会话目标时默认给自由对话，
   // 需要项目目录的由用户显式选择
@@ -386,15 +425,20 @@ function pickWorkdir() {
 }
 
 async function onSave() {
-  const targetSession = form.sessionMode === '__new__' ? form.newSession.trim() : form.sessionMode;
-  if (!form.name.trim() || !form.prompt.trim() || !targetSession) {
-    form.errors = ['任务名称、目标会话与提示词均不能为空'];
+  // per_run：不要求目标会话，后端按 "{今天日期} {任务名}" 建/复用会话；
+  // fixed：沿用原有目标会话校验
+  const perRun = form.runSessionMode === 'per_run';
+  const targetSession = perRun
+    ? ''
+    : (form.sessionMode === '__new__' ? form.newSession.trim() : form.sessionMode);
+  if (!form.name.trim() || !form.prompt.trim() || (!perRun && !targetSession)) {
+    form.errors = [perRun ? '任务名称与提示词均不能为空' : '任务名称、目标会话与提示词均不能为空'];
     return;
   }
-  // 工作目录只在新建会话时指定：自由对话存 GLOBAL，项目任务存所选目录；
-  // 已有会话目标留空，运行时跟随会话自身归属
+  // 工作目录只在会新建会话时指定（per_run 或 fixed+新建会话）：自由对话存 GLOBAL，
+  // 项目任务存所选目录；已有会话目标留空，运行时跟随会话自身归属
   let workdir = '';
-  if (form.sessionMode === '__new__') {
+  if (perRun || form.sessionMode === '__new__') {
     if (form.workdirMode === 'folder') {
       workdir = form.workdir.trim();
       if (!workdir) {
@@ -446,6 +490,7 @@ async function onSave() {
       trigger_config: config,
       max_runs: maxRunsRaw === '' ? null : Number(maxRunsRaw),
       target_session: targetSession,
+      session_mode: form.runSessionMode,
       workdir,
       model_id: form.modelId,
       prompt: form.prompt,

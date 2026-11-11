@@ -15,6 +15,12 @@ function mountSubpage(api: Record<string, unknown> = {}) {
   });
 }
 
+// 运行会话落点默认是 per_run（目标会话控件隐藏，target_session 提交空串）。
+// 验证「绑定到已有会话/新建会话」的用例仍按原语义走固定会话模式。
+async function useFixedSession(wrapper: ReturnType<typeof mountSubpage>) {
+  await wrapper.find('[data-test="automation-run-session-mode"]').setValue('fixed');
+}
+
 const _task = {
   id: 'task-1',
   name: '每日摘要',
@@ -22,6 +28,7 @@ const _task = {
   trigger_type: 'daily',
   trigger_config: { time: '09:30' },
   target_session: '星轨自动化任务',
+  session_mode: 'fixed',
   prompt: '汇总昨日进展',
   permission_mode: 'confirm',
   missed_run_policy: 'skip',
@@ -119,6 +126,7 @@ describe('Subpage - 星轨自动化任务', () => {
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
     await wrapper.find('[data-test="automation-name"]').setValue('测试任务');
+    await useFixedSession(wrapper);
     (wrapper.find('[data-test="automation-new-session"]').element as HTMLInputElement).value = '';
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
@@ -152,6 +160,7 @@ describe('Subpage - 星轨自动化任务', () => {
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
     await wrapper.find('[data-test="automation-name"]').setValue('测试任务');
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
     await wrapper.find('[data-test="automation-model"]').setValue('m1');
@@ -193,6 +202,7 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(wrapper.find('[data-test="automation-risk-note"]').exists()).toBe(false);
 
     await wrapper.find('[data-test="automation-name"]').setValue('测试任务');
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
     await wrapper.find('[data-test="automation-save"]').trigger('click');
@@ -209,6 +219,7 @@ describe('Subpage - 星轨自动化任务', () => {
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
     await wrapper.find('[data-test="automation-name"]').setValue('测试任务');
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
 
@@ -230,6 +241,7 @@ describe('Subpage - 星轨自动化任务', () => {
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
     await wrapper.find('[data-test="automation-name"]').setValue('测试任务');
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
     await wrapper.find('[data-test="automation-workdir-mode"]').setValue('folder');
@@ -265,7 +277,8 @@ describe('Subpage - 星轨自动化任务', () => {
 
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
-    // 默认选中第一个既有会话
+    // 默认选中第一个既有会话（per_run 下目标会话控件隐藏，先切固定会话模式）
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-name"]').setValue('测试任务');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
     expect(wrapper.text()).toContain('该会话归属项目目录：E:\\proj');
@@ -312,6 +325,7 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(wrapper.find('[data-test="automation-run-at"]').exists()).toBe(false);
 
     await wrapper.find('[data-test="automation-name"]').setValue('一次性任务');
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
     await wrapper.find('[data-test="automation-delay-minutes"]').setValue('15');
@@ -339,6 +353,7 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(wrapper.find('[data-test="automation-delay-minutes"]').exists()).toBe(false);
 
     await wrapper.find('[data-test="automation-name"]').setValue('一次性任务');
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
     await wrapper.find('[data-test="automation-run-at"]').setValue('2030-01-02T08:15');
@@ -362,6 +377,7 @@ describe('Subpage - 星轨自动化任务', () => {
     const fillAndSave = async (maxRuns?: string) => {
       await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
       await wrapper.find('[data-test="automation-name"]').setValue('限次任务');
+      await useFixedSession(wrapper);
       await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
       await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
       const input = wrapper.find('[data-test="automation-max-runs"]');
@@ -439,6 +455,7 @@ describe('Subpage - 星轨自动化任务', () => {
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
     await wrapper.find('[data-test="automation-name"]').setValue('一次性任务');
+    await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-new-session"]').setValue('自动会话');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
     await wrapper.find('[data-test="automation-trigger-type"]').setValue('once');
@@ -453,5 +470,65 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(err.text()).toContain('一次性触发时刻已过');
     // 失败后表单保持打开，便于用户改时刻重试
     expect(wrapper.find('[data-test="automation-form"]').exists()).toBe(true);
+  });
+
+  it('默认「每次运行新建会话」：隐藏目标会话控件，提交空 target_session 与 per_run', async () => {
+    const store = useAppStore();
+    const saveSpy = vi.fn().mockResolvedValue({ ok: true });
+    store.saveAutomationTask = saveSpy as any;
+    store.sessionGroups = [{
+      folder_path: 'E:\\proj',
+      folder_name: 'proj',
+      sessions: [{ name: '既有会话', display_name: '既有会话', count: 3, workdir: 'E:\\proj' }],
+    }] as any;
+
+    const wrapper = mountSubpage();
+    await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
+
+    // 即使存在既有会话，per_run 也不渲染目标会话下拉与新建会话输入
+    expect((wrapper.find('[data-test="automation-run-session-mode"]').element as HTMLSelectElement).value)
+      .toBe('per_run');
+    expect(wrapper.find('[data-test="automation-new-session"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('该会话归属项目目录');
+
+    // 预览文本 = "{今天日期} {任务名}"
+    const today = new Date();
+    const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    await wrapper.find('[data-test="automation-name"]').setValue('每日摘要');
+    expect(wrapper.find('[data-test="automation-run-session-preview"]').text()).toBe(`${date} 每日摘要`);
+
+    await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
+    await wrapper.find('[data-test="automation-save"]').trigger('click');
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    const payload = saveSpy.mock.calls[0][0];
+    expect(payload.session_mode).toBe('per_run');
+    expect(payload.target_session).toBe('');
+    // 新会话默认挂自由对话，不落到应用启动目录
+    expect(payload.workdir).toBe('GLOBAL');
+  });
+
+  it('per_run 任务卡展示「每次运行新建会话」，fixed 任务卡仍展示目标会话名', async () => {
+    const store = useAppStore();
+    store.automationTasks = [
+      { ..._task, id: 't-per-run', name: '每次新建', target_session: '', session_mode: 'per_run', workdir: 'GLOBAL' },
+      { ..._task, id: 't-fixed', name: '固定会话', target_session: '星轨自动化任务', session_mode: 'fixed', workdir: '' },
+    ] as any;
+
+    const wrapper = mountSubpage();
+    const perRunCard = wrapper.find('[data-test="automation-card-每次新建"]');
+    expect(perRunCard.exists()).toBe(true);
+    const perRunMeta = perRunCard.find('[data-test="automation-task-session"]');
+    expect(perRunMeta.exists()).toBe(true);
+    expect(perRunMeta.text()).toContain('每次运行新建会话');
+
+    // target_session 为空串时不能渲染成孤立的「💬 」
+    for (const item of perRunCard.findAll('.ap-meta-item')) {
+      expect(item.text().trim()).not.toBe('💬');
+    }
+
+    const fixedMeta = wrapper.find('[data-test="automation-card-固定会话"] [data-test="automation-task-session"]');
+    expect(fixedMeta.text()).toContain('星轨自动化任务');
+    expect(fixedMeta.text()).not.toContain('每次运行新建会话');
   });
 });

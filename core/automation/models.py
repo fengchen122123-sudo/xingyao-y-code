@@ -14,6 +14,10 @@ PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
 # 错过触发（应用未运行）的处理策略。
 MISSED_RUN_POLICIES = ("skip", "run_once")
 
+# 运行会话落点模式：per_run=每次运行新建 {YYYY-MM-DD} {任务名} 会话（默认，
+# 见 core/automation/session_naming.py）；fixed=沿用 target_session 固定会话。
+SESSION_MODES = ("per_run", "fixed")
+
 # 任务生命周期状态：active=可触发；completed=执行次数耗尽（自然终态，不可逆——
 # 不允许 set_enabled 复活、不允许编辑改回 active，只能复制新建）。
 TASK_STATUSES = ("active", "completed")
@@ -64,10 +68,22 @@ def validate_task(task: dict) -> list[str]:
     elif len(prompt) > MAX_PROMPT_CHARS:
         errors.append(f"提示词不能超过 {MAX_PROMPT_CHARS} 个字符")
 
+    # 运行会话模式：缺省（None/空串）视为 per_run；取值必须显式列举
+    session_mode = task.get("session_mode")
+    if session_mode in (None, ""):
+        session_mode = "per_run"
+    elif isinstance(session_mode, str):
+        session_mode = session_mode.strip() or "per_run"
+    if session_mode not in SESSION_MODES:
+        errors.append(f"运行会话模式必须是 {'/'.join(SESSION_MODES)} 之一")
+
+    # 目标会话：仅 fixed 模式必填（旧行为）；per_run 允许空串（运行时按生成的
+    # 会话名落点），但长度上限对两种模式都生效。
     target_session = task.get("target_session")
-    if not isinstance(target_session, str) or not target_session.strip():
+    target_text = target_session.strip() if isinstance(target_session, str) else ""
+    if session_mode == "fixed" and not target_text:
         errors.append("目标会话不能为空")
-    elif len(target_session.strip()) > MAX_SESSION_CHARS:
+    elif len(target_text) > MAX_SESSION_CHARS:
         errors.append(f"目标会话名不能超过 {MAX_SESSION_CHARS} 个字符")
 
     # 工作目录可选：空 = 跟随目标会话归属（已有会话以其登记目录为权威）；

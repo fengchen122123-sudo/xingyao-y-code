@@ -11,6 +11,7 @@ const _task = {
   trigger_type: 'daily',
   trigger_config: { time: '09:30' },
   target_session: '星轨自动化任务',
+  session_mode: 'fixed',
   prompt: '汇总',
   permission_mode: 'confirm',
   missed_run_policy: 'skip',
