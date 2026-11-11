@@ -265,9 +265,14 @@ def _capture_request_tools(monkeypatch):
     monkeypatch.setattr(llm, "get_tools_schema", lambda: list(_FAKE_SCHEMAS))
     # 记忆/自我模型注入与本用例无关：桩成空串，避免读外部目录拖慢或抖动
     monkeypatch.setattr("core.memory_kairos.build_memory_system_section", lambda: "")
-    monkeypatch.setattr(
-        "core.self_prompt.build_identity_prompt_block_for_session", lambda _s: ""
-    )
+    try:
+        monkeypatch.setattr(
+            "core.self_prompt.build_identity_prompt_block_for_session", lambda _s: ""
+        )
+    except (ImportError, AttributeError):
+        # 成长系统（core.self_prompt）是独立提交的新模块：本分支上可能不存在，
+        # 缺席时无需打桩；llm 侧的注入逻辑本身有 try/except 兜底，不影响本用例。
+        pass
 
     generator = llm._chat_with_model_generator(
         "fake-model",
