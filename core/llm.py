@@ -1653,6 +1653,33 @@ def _chat_with_model_generator(
                     break
             messages.insert(insert_at, {"role": "system", "content": memory_section})
 
+    # 1b. 自我演变块（自我模型 + 当前用户档案）兜底注入。与记忆段同样作为独立
+    # system 消息插入到最后一条 user 消息之前，绝不改写 messages[0]（缓存稳定
+    # 前缀）；默认安装（无成长数据）该块为空串，此时不插入、提示词逐字节不变。
+    try:
+        _identity_already_injected = any(
+            msg.get("role") == "system"
+            and "# 自我模型" in str(msg.get("content") or "")
+            for msg in messages
+        )
+        if not _identity_already_injected:
+            from core.self_prompt import build_identity_prompt_block_for_session
+
+            identity_block = build_identity_prompt_block_for_session(
+                _resolve_cache_session_identity(cache_session_id)
+            )
+            if identity_block and identity_block.strip():
+                identity_insert_at = len(messages)
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("role") == "user":
+                        identity_insert_at = i
+                        break
+                messages.insert(
+                    identity_insert_at, {"role": "system", "content": identity_block}
+                )
+    except Exception:
+        pass
+
     tool_activity_seen = False
     final_summary_retry_count = 0
     # "只思考不产出"时的最终总结重试上限：连续多次欠佳仍尝试补救，

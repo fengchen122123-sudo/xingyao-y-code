@@ -6627,6 +6627,96 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 自我演化 / 成长设置（委托 core.identity_store，全部读操作不抛异常）
+    # ------------------------------------------------------------------
+    def get_growth_settings(self) -> Dict[str, Any]:
+        """返回成长设置 + 自我演化快照（含变更日志、自我模型、用户档案、经验摘要）。"""
+        from core import identity_store
+
+        try:
+            snapshot = dict(identity_store.get_growth_snapshot() or {})
+            snapshot["changelog"] = identity_store.get_changelog(50)
+            snapshot["self_model"] = identity_store.get_self_model()
+            snapshot["profile"] = identity_store.get_user_profile()
+            snapshot["lessons"] = [
+                {
+                    "slug": str(item.get("slug") or ""),
+                    "kind": str(item.get("kind") or ""),
+                    "hits": int(item.get("hits") or 0),
+                    "last_hit_at": str(item.get("last_hit_at") or ""),
+                }
+                for item in (identity_store.iter_lessons() or [])[:100]
+            ]
+            return {
+                "ok": True,
+                "settings": identity_store.get_growth_settings(),
+                "snapshot": snapshot,
+            }
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("get_growth_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_growth_settings(self, enabled=None, learning_enabled=None, user_key=None) -> Dict[str, Any]:
+        """保存成长设置；只提交非 None 字段，user_key 传空串表示恢复自动解析。"""
+        from core import identity_store
+
+        try:
+            patch: Dict[str, Any] = {}
+            if enabled is not None:
+                patch["enabled"] = enabled
+            if learning_enabled is not None:
+                patch["learning_enabled"] = learning_enabled
+            if user_key is not None:
+                patch["user_key"] = user_key
+            settings = identity_store.save_growth_settings(**patch)
+            return {"ok": True, "settings": settings}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("set_growth_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def reset_growth(self, scope: str = "all") -> Dict[str, Any]:
+        """重置成长数据；scope 取 self / user / all。"""
+        from core import identity_store
+
+        try:
+            scope_text = str(scope or "all").strip().lower()
+            if scope_text == "self":
+                identity_store.reset_self()
+            elif scope_text == "user":
+                identity_store.reset_user()
+            elif scope_text == "all":
+                identity_store.reset_all()
+            else:
+                return {"ok": False, "msg": "unknown scope"}
+            return {"ok": True, "scope": scope_text}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("reset_growth 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def export_growth_snapshot(self) -> Dict[str, Any]:
+        """导出自我演化快照（仅内存返回，不写盘）。"""
+        from core import identity_store
+
+        try:
+            snapshot = dict(identity_store.get_growth_snapshot() or {})
+            snapshot["changelog"] = identity_store.get_changelog(200)
+            snapshot["self_model"] = identity_store.get_self_model()
+            snapshot["profile"] = identity_store.get_user_profile()
+            snapshot["lessons"] = [
+                {
+                    "slug": str(item.get("slug") or ""),
+                    "kind": str(item.get("kind") or ""),
+                    "hits": int(item.get("hits") or 0),
+                    "last_hit_at": str(item.get("last_hit_at") or ""),
+                }
+                for item in (identity_store.iter_lessons() or [])[:100]
+            ]
+            return {"ok": True, "snapshot": snapshot}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("export_growth_snapshot 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # 决策模型（JEV）设置桥（Task 2：委托 core.decision_service，含异常兜底）
     # ------------------------------------------------------------------
     def get_decision_settings(self) -> Dict[str, Any]:

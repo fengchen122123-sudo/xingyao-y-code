@@ -346,6 +346,17 @@ def _render_stable_system_extra_sections(session_name=None) -> tuple[list[str], 
                 parts.append(persona_block)
         except Exception:
             pass
+    # 自我演变块（自我模型 + 当前用户档案）：与设置页人设块同口径渲染，默认安装
+    # （无任何成长数据）返回空串，不影响 byte-stability。跨轮内基本不变，归入稳定
+    # 前缀；秘书会话由 build_identity_prompt_block_for_session 自行返回空串。
+    try:
+        from core.self_prompt import build_identity_prompt_block_for_session
+
+        identity_block = build_identity_prompt_block_for_session(session_name)
+        if identity_block:
+            parts.append(identity_block)
+    except Exception:
+        pass
     parts.append(_GENERAL_CODING_STANDARDS)
     try:
         import core.memory_kairos as memory_kairos

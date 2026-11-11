@@ -28,6 +28,16 @@ BLOB_GC_MIN_INTERVAL_SECONDS = 3600
 ARCHIVE_SWEEP_MIN_INTERVAL_SECONDS = 3600
 
 
+def _run_self_learning(session, manager, model_cfg):
+    """线程体：跑一次回合学习；任何异常只记 debug，绝不外溢到线程外。"""
+    try:
+        from core.learning import run_turn_learning
+
+        run_turn_learning(session, manager, model_cfg)
+    except Exception:
+        _LOGGER.debug("会话 %s 回合学习失败（已忽略）", session, exc_info=True)
+
+
 def get_idle_maintenance_seconds():
     """闲时维护触发延时（秒，0 关闭）；读 config 失败回落默认值。"""
     try:
@@ -219,6 +229,38 @@ class IdleMaintenanceService:
                     )
         except Exception:
             _LOGGER.debug("会话 %s 归档治理失败", session, exc_info=True)
+
+        # 回合学习（自我演化接线）：闲时窗口恰好没有回合在跑，是跑一次学习的
+        # 最佳时机。学习要调大模型（60 秒超时），因此只起独立守护线程、绝不在
+        # 维护线程里同步等待——否则会拖住闲时压缩的推进与后续会话的维护排期。
+        # 取不到激活模型（含无 api_key）时直接跳过，不写日志噪声；线程内部
+        # 再包一层 try/except 只记 debug，异常一律不外溢。
+        try:
+            from core.model_manager import get_active_model
+
+            learning_active = get_active_model(session)
+        except Exception:
+            learning_active = None
+        if learning_active:
+            learning_model = (
+                learning_active.get("litellm_model") or learning_active.get("model") or ""
+            )
+            learning_key = learning_active.get("api_key") or ""
+            if learning_model and str(learning_key).strip():
+                model_cfg = (
+                    learning_model,
+                    learning_key,
+                    learning_active.get("base_url") or "",
+                )
+                try:
+                    threading.Thread(
+                        target=_run_self_learning,
+                        args=(session, manager, model_cfg),
+                        name=f"self-learning-{session}",
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    _LOGGER.debug("会话 %s 学习线程启动失败", session, exc_info=True)
 
         if cancel_event.is_set():
             return

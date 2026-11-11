@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import logging
 import threading
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
@@ -331,6 +332,24 @@ MEMORY.md is an index, not a memory — it should contain only links with brief 
     return section
 
 def run_dream_consolidation_sync(api_model, api_key, api_base=None):
+    """
+    dream 整理的统一入口：先跑整理实现，再尝试一次自我演化。
+
+    自我演化是附加动作——无论整理是正常完成、无内容可整理的提前返回，还是
+    模型调用失败的返回，都会尝试一次自我演化；自我演化的任何异常/超时都只
+    记 debug 日志，绝不改变整理的返回值，也不会让整理重复请求模型。
+    """
+    result = _run_dream_consolidation_impl(api_model, api_key, api_base)
+    try:
+        from core.learning import run_self_evolution_sync
+
+        run_self_evolution_sync(api_model, api_key, api_base)
+    except Exception as e:  # 自我演化失败不影响 dream 整理结果
+        logging.debug("梦境整理后的自我演化失败（已忽略）：%s", e)
+    return result
+
+
+def _run_dream_consolidation_impl(api_model, api_key, api_base=None):
     """
     后台执行 dream 归纳整理：
     1. 收集Logs文件夹中的所有今日日志与MEMORY.md内容；

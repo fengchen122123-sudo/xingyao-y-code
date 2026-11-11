@@ -12,6 +12,7 @@
       <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
       <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
+      <button data-test="growth-nav" class="nav-item" :class="{ active: activeSection === 'growth' }" @click="activeSection = 'growth'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>记忆与成长</button>
       <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
       <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
       <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
@@ -706,6 +707,7 @@
       <TokenUsageSettingsLegacy v-else-if="activeSection === 'tokens-legacy'" />
       <SystemSettings v-else-if="activeSection === 'system'" />
       <PersonaSettings v-else-if="activeSection === 'persona'" />
+      <GrowthSettings v-else-if="activeSection === 'growth'" />
       <DecisionSettings v-else-if="activeSection === 'decision'" />
       <FeishuSettings v-else-if="activeSection === 'feishu'" />
       <BackgroundConvert v-else-if="activeSection === 'bg-convert'" />
@@ -823,6 +825,7 @@ import BackgroundConvert from './BackgroundConvert.vue';
 import AppGlassCard from './AppGlassCard.vue';
 import SystemSettings from './SystemSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
+import GrowthSettings from './GrowthSettings.vue';
 import DecisionSettings from './DecisionSettings.vue';
 import FeishuSettings from './FeishuSettings.vue';
 import PluginsSettings from './PluginsSettings.vue';
@@ -843,7 +846,7 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'bg-convert' | 'system' | 'persona' | 'decision' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 
 // ── 插件设置页入口（提供 plugin_settings 钩子的插件直接挂在左侧导航）────
