@@ -470,6 +470,23 @@ def _resolve_real_path(path: str) -> str:
         return os.path.abspath(path)
 
 
+def _global_workspace_root() -> str:
+    """自由对话（GLOBAL 会话）的独立工作区根。
+
+    此前用进程 cwd 兜底，把所有 GLOBAL 会话并进了"GUI 启动目录"这个工作区：
+    它们既互相抢同一份回合活跃登记，也会把该目录下项目会话的写入挡成
+    workspace_busy（实测改 tmp 下的文件会被项目工作区的回合拦住）。
+    这里固定到数据目录下的 default_workspace，自由对话自成锁域，与项目隔离。
+    """
+    root = os.path.join(os.path.expanduser("~"), ".ycode", "default_workspace")
+    try:
+        os.makedirs(root, exist_ok=True)
+        return _resolve_real_path(root)
+    except OSError:
+        # 目录不可创建时退回旧行为，宁可共用工作区也不要让回合起不来
+        return _resolve_real_path(os.getcwd())
+
+
 def _is_app_preview_artifact(real_path: str) -> bool:
     """是否本程序自己写出的预览产物（数据目录下 exports/preview 里的文件）。
 
@@ -11009,8 +11026,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 必须在解析附件、组装运行上下文和执行任何工具前完成绑定。
             turn_workdir = session_workdir
             if turn_workdir == "GLOBAL":
-                # 自由对话无具体项目目录，线程本地 workdir 兜底进程 cwd
-                turn_workdir = _resolve_real_path(os.getcwd())
+                # 自由对话无具体项目目录：用独立工作区根（不再兜底进程 cwd，
+                # 否则会与启动目录下的项目会话抢同一个工作区锁域）
+                turn_workdir = _global_workspace_root()
             else:
                 turn_workdir = _resolve_real_path(turn_workdir)
                 if not os.path.isdir(turn_workdir):
@@ -11997,7 +12015,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             # 缺任一项都会让续跑回合里的工具调用读到别的会话或全局档位。
             turn_workdir = self._session_workdir(session_name)
             if turn_workdir == "GLOBAL":
-                turn_workdir = _resolve_real_path(os.getcwd())
+                turn_workdir = _global_workspace_root()
             else:
                 turn_workdir = _resolve_real_path(turn_workdir)
             workdir_scope = workspace_scope(turn_workdir)
@@ -12768,10 +12786,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     def _hook_workspace_root(self) -> str:
         """当前会话对应的工作根路径（与回合运行时的 workspace_identity 口径一致）。"""
         # _session_workdir 已含查不到时回退 _resolve_real_path(os.getcwd()) 的逻辑；
-        # GLOBAL 会话（自由对话）回合运行时用进程 cwd，这里同口径。
+        # GLOBAL 会话（自由对话）回合运行时用独立工作区根，这里同口径。
         session_workdir = self._session_workdir(self._current_session)
         if not session_workdir or session_workdir == "GLOBAL":
-            return _resolve_real_path(os.getcwd())
+            return _global_workspace_root()
         return _resolve_real_path(session_workdir)
 
     def get_hooks(self) -> Dict[str, Any]:

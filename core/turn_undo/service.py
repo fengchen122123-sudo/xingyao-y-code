@@ -127,7 +127,14 @@ def begin_turn(
     )
     ctx = _recorder.begin_recording(storage, checkpoint)
     coordinator = _coordinator_mod.get_coordinator()
-    coordinator.register_active_turn(root, turn_id)
+    # 后台任务检查点单独登记：它自身写入由 recorder._ensure_workspace_writable
+    # 按 owner_kind 直接放行（不参与前台互斥），若占用前台唯一槽位，就会把同工作区
+    # 的前台回合全部挡成 workspace_busy（实测一个跑 16 分钟的子代理足以让整个
+    # 工作区无法写入）。单独登记只用于撤销/恢复阶段的并发判定。
+    if owner_kind == OwnerKind.BACKGROUND_TASK:
+        coordinator.register_background_turn(root, turn_id)
+    else:
+        coordinator.register_active_turn(root, turn_id)
     return checkpoint, ctx
 
 
@@ -145,7 +152,9 @@ def finish_turn(ctx, *, aborted: bool = False, reason: str = "") -> TurnUndoStat
         else:
             status = _recorder.close_turn(ctx)
     finally:
+        # 前台/后台两张登记表都注销；两个方法都按 turn_id 精确匹配，互不误删
         coordinator.unregister_active_turn(ctx.workspace_root, ctx.turn_id)
+        coordinator.unregister_background_turn(ctx.workspace_root, ctx.turn_id)
     # 超限检查点快照过期（不触发生命周期事实，不扫描磁盘；GC 在启动扫描时执行）
     try:
         storage.expire_retained_checkpoints(ctx.session_id)

@@ -489,12 +489,12 @@ def execute_revert(
         )
 
     with coordinator.workspace_lock(root):
-        # 锁内复核：活跃回合互斥（规格 21）
-        active_turn = coordinator.active_turn_id(root)
-        if active_turn is not None:
+        # 锁内复核：活跃回合互斥（规格 21）。后台任务不参与前台写入互斥，
+        # 但它此刻可能正在写文件，撤销同样必须避开。
+        if coordinator.has_active_turn(root):
             raise TurnUndoError(
                 UndoErrorCode.WORKSPACE_BUSY,
-                f"工作区有正在进行的回合（{active_turn[:8]}…），请稍后再撤销",
+                "工作区有正在进行的回合或后台写入任务，请稍后再撤销",
             )
         if coordinator.active_undo_id(root) is not None:
             raise TurnUndoError(

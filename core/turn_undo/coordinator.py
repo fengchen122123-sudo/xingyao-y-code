@@ -44,8 +44,12 @@ class WorkspaceCoordinator:
     def __init__(self):
         self._registry_lock = threading.Lock()
         self._workspace_locks: dict[str, threading.RLock] = {}
-        # workspace_root -> turn_id：正在 recording 的回合（含后台任务检查点）
+        # workspace_root -> turn_id：正在 recording 的前台回合（参与写入互斥）
         self._active_turns: dict[str, str] = {}
+        # workspace_root -> set(turn_id)：正在 recording 的后台任务检查点。
+        # 与前台分开登记：后台任务按设计不参与写入互斥（recorder 依 owner_kind
+        # 直接放行），但它确实在写文件，撤销/恢复必须仍能看见并拒绝并发。
+        self._background_turns: dict[str, set[str]] = {}
         # workspace_root -> operation_id：进行中的撤销事务
         self._active_undos: dict[str, str] = {}
         # workspace_root -> set(frozen canonical path)（中断事务冻结路径）
@@ -86,6 +90,33 @@ class WorkspaceCoordinator:
         root = canonicalize_workspace_root(workspace_root)
         with self._registry_lock:
             return self._active_turns.get(root)
+
+    # -- 后台任务登记（不参与写入互斥，仅用于撤销/恢复的并发判定） --
+
+    def register_background_turn(self, workspace_root: str, turn_id: str) -> None:
+        root = canonicalize_workspace_root(workspace_root)
+        with self._registry_lock:
+            self._background_turns.setdefault(root, set()).add(turn_id)
+
+    def unregister_background_turn(self, workspace_root: str, turn_id: str) -> None:
+        root = canonicalize_workspace_root(workspace_root)
+        with self._registry_lock:
+            turns = self._background_turns.get(root)
+            if not turns:
+                return
+            turns.discard(turn_id)
+            if not turns:
+                self._background_turns.pop(root, None)
+
+    def has_active_turn(self, workspace_root: str) -> bool:
+        """该工作区是否有回合（前台或后台任务）正在写文件。
+
+        撤销/恢复用这个判断，而不是只看前台登记：后台任务虽然不参与前台
+        互斥，但它此刻确实可能在写文件，撤销必须避开。
+        """
+        root = canonicalize_workspace_root(workspace_root)
+        with self._registry_lock:
+            return bool(self._active_turns.get(root) or self._background_turns.get(root))
 
     # -- 撤销事务登记（须持有工作区锁调用） --
 

@@ -404,10 +404,10 @@ def execute_recovery(
 
     root = checkpoint.workspace_root
     with coordinator.workspace_lock(root):
-        if coordinator.active_turn_id(root) is not None:
+        if coordinator.has_active_turn(root):
             raise TurnUndoError(
                 UndoErrorCode.WORKSPACE_BUSY,
-                "工作区有正在进行的回合，请稍后恢复",
+                "工作区有正在进行的回合或后台写入任务，请稍后恢复",
             )
         if coordinator.active_undo_id(root) is not None:
             raise TurnUndoError(

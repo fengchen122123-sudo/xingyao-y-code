@@ -131,11 +131,16 @@ def test_hook_trust_action_swallows_exceptions(monkeypatch, tmp_path):
     assert "崩溃" in res["msg"]
 
 
-def test_hook_workspace_root_falls_back_to_cwd_for_global():
-    """GLOBAL 会话（自由对话）：与回合运行时同口径，回退进程 cwd。"""
+def test_hook_workspace_root_falls_back_to_global_workspace_for_global():
+    """GLOBAL 会话（自由对话）：与回合运行时同口径，用独立工作区根。
+
+    回合运行时已改为 ~/.ycode/default_workspace（不再兜底进程 cwd，否则自由
+    对话会与启动目录下的项目会话抢同一个工作区锁域），hook 必须同口径，
+    否则项目级 hook 的归属目录判定会与回合读写的目录不一致。
+    """
     bridge = _bare_bridge(workdir="GLOBAL")
 
-    assert bridge._hook_workspace_root() == gui_bridge._resolve_real_path(os.getcwd())
+    assert bridge._hook_workspace_root() == gui_bridge._global_workspace_root()
 
 
 def test_hook_workspace_root_resolves_session_workdir(tmp_path):
