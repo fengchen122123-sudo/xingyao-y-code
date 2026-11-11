@@ -69,6 +69,10 @@ def _task_dict(**overrides) -> dict:
         "permission_mode": "confirm",
         "missed_run_policy": "skip",
         "enabled": 1,
+        # 本文件的用例针对「投递到固定会话」的语义（固定会话名 + pending_workdir
+        # 懒创建）；per_run 是存储层的新默认值，需显式固定回 fixed，否则默认值
+        # 一改这批断言就全部失真。per_run 行为见文件末尾的专项用例。
+        "session_mode": "fixed",
     }
     base.update(overrides)
     return base
@@ -715,3 +719,74 @@ def test_run_now_single_flight_after_fix(manager, tmp_path):
     assert first["ok"] is True
     assert second["ok"] is False and "尚未结束" in second["msg"]
     assert len(bridge._message_queues["星轨自动化任务"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# 运行会话模式：per_run —— 每次运行投递到「{YYYY-MM-DD} {任务名}」会话
+# ---------------------------------------------------------------------------
+
+def _per_run_session_name(task_name="每日摘要"):
+    import datetime
+
+    return f"{datetime.datetime.now():%Y-%m-%d} {task_name}"
+
+
+def _session_names(manager):
+    return [
+        row["name"]
+        for row in manager.get_all_sessions(
+            workdir=None, include_empty=True, include_archived=True
+        )
+    ]
+
+
+def test_dispatch_per_run_creates_dated_session(manager, tmp_path):
+    """per_run（存储层默认）：投递到当天会话，并把实际落点回写到运行行。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, run = _create_task_with_run(bridge, session_mode="per_run")
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    expected = _per_run_session_name()
+    assert len(spawned) == 1
+    assert spawned[0][0][1] == expected  # 回合落在新建的当天会话
+    assert expected in _session_names(manager)
+    run_row = bridge._automation_storage.list_runs(task["id"])[0]
+    assert run_row["session_name"] == expected
+    assert run_row["status"] == "running"
+
+
+def test_dispatch_per_run_binds_task_workdir(manager, tmp_path):
+    """per_run：新会话在创建时就绑定任务 workdir，不再走 pending_workdir 懒创建。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    task, run = _create_task_with_run(
+        bridge, session_mode="per_run", workdir=str(project_dir)
+    )
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    expected = _per_run_session_name()
+    rows = manager.get_all_sessions(
+        workdir=None, include_empty=True, include_archived=True
+    )
+    row = next(r for r in rows if r["name"] == expected)
+    assert row["workdir"] == str(project_dir)
+    # 会话已预建并绑定归属，所以不再需要懒创建兜底
+    assert spawned[0][1]["pending_workdir"] == ""
+
+
+def test_dispatch_per_run_reuses_same_day_session(manager, tmp_path):
+    """同一天多次触发复用同一会话（历史按天切开），不会重复建会话。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, first_run = _create_task_with_run(bridge, session_mode="per_run")
+    bridge._dispatch_automation_run(task, first_run["id"], "scheduled")
+
+    second_run = bridge._automation_storage.create_run(task, trigger_kind="manual")
+    bridge._dispatch_automation_run(task, second_run["id"], "manual")
+
+    expected = _per_run_session_name()
+    assert _session_names(manager).count(expected) == 1
+    assert spawned[0][0][1] == expected
+    assert spawned[1][0][1] == expected
