@@ -547,32 +547,7 @@ def test_prepare_rejects_via_capture_poisoned_symlink(env, monkeypatch):
 # 工作区写入互斥与封闭原因可读性
 # ---------------------------------------------------------------------------
 
-def test_workspace_busy_blocks_concurrent_turn_write(env):
-    """同目录另一个回合活跃时，本回合写入在触盘前被拒，但检查点不被判死。"""
-    from core.turn_undo import coordinator as coord_mod
 
-    cp, ctx = _begin_turn(env, turn="turn-busy")
-    coordinator = coord_mod.get_coordinator()
-    coordinator.register_active_turn(ctx.workspace_root, "turn-busy")
-    coordinator.register_active_turn(ctx.workspace_root, "turn-other")
-    target = env["ws"] / "busy.txt"
-    try:
-        with pytest.raises(TurnUndoError) as exc:
-            _prepare(env, target, b"x")
-        assert exc.value.code == UndoErrorCode.WORKSPACE_BUSY
-        assert "turn-other"[:8] in exc.value.message
-        # 冲突是"忙"，不是"检查点封闭"：回合仍 recording，可重试
-        assert env["storage"].get_checkpoint(cp.checkpoint_id).status_enum \
-            is TurnUndoStatus.RECORDING
-        coordinator.unregister_active_turn(ctx.workspace_root, "turn-other")
-        handle = _prepare(env, target, b"x", call="retry")
-        target.write_bytes(b"x")
-        recorder.verify_after_mutation(handle)
-        assert recorder.close_turn(ctx) is TurnUndoStatus.READY
-    finally:
-        coordinator.unregister_active_turn(ctx.workspace_root, "turn-busy")
-        coordinator.unregister_active_turn(ctx.workspace_root, "turn-other")
-        recorder.release_context(cp.checkpoint_id)
 
 
 def test_checkpoint_closed_message_includes_reason(env):

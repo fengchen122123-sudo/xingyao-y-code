@@ -293,6 +293,17 @@ def release_context(checkpoint_id: str) -> None:
         ctx = _active_contexts.pop(checkpoint_id, None)
         if ctx is not None:
             _context_by_turn.pop(ctx.turn_id, None)
+    if ctx is not None:
+        # 回合结束兜底：清掉本回合遗留的文件级写入占用（异常路径没走
+        # verify/rollback 时也不会把这个文件永久标成"正在被写入"）
+        try:
+            from core.turn_undo import coordinator as coordinator_mod
+
+            coordinator_mod.get_coordinator().release_turn_paths(
+                ctx.workspace_root, ctx.turn_id,
+            )
+        except Exception:
+            logger.debug("清理回合文件写入占用失败", exc_info=True)
     if getattr(_tls, "ctx", None) is not None and _tls.ctx.checkpoint_id == checkpoint_id:
         unbind_thread()
 
@@ -348,31 +359,44 @@ def _require_active_context(*, need_owner: bool) -> RecorderContext:
         pass
     return ctx
 
+def _claim_path_for_write(ctx: RecorderContext, canonical_path: str) -> None:
+    """同一文件同一时刻只允许一个前台回合在写（规格 9.2 并发保护）。
 
-def _ensure_workspace_writable(ctx: RecorderContext) -> None:
-    """同一工作区同一时刻只允许一个前台回合写入（规格 9.2 并发保护）。
-
-    多会话同时写同一目录时，撤销记录彼此不可见，后写者会让先写者的
-    "中途外部改动"检测必然命中。这里在触盘前快速失败，让调用方等待重试，
-    而不是把整个回合判死。后台任务检查点按设计允许与父回合并存，不参与互斥。
+    互斥粒度是文件，不是目录：同目录下不同文件的两个任务互不影响（一个会话改
+    前端、另一个改后端本来就该并行；目录级独占会让一次长回合把整个工作区写死）。
+    只有真正同时写同一个文件，才会在 prepare→verify 这段写入窗口内快速失败，
+    让调用方等待重试。后台任务检查点按设计允许与父回合并存，不参与互斥。
     """
     if ctx.owner_kind == OwnerKind.BACKGROUND_TASK.value:
         return
     from core.turn_undo import coordinator as coordinator_mod
 
     coordinator = coordinator_mod.get_coordinator()
-    active = coordinator.active_turn_id(ctx.workspace_root)
-    if active and active != ctx.turn_id:
+    owner = coordinator.claim_path(ctx.workspace_root, canonical_path, ctx.turn_id)
+    if owner and owner != ctx.turn_id:
         raise TurnUndoError(
             UndoErrorCode.WORKSPACE_BUSY,
-            f"该目录正在被另一个回合写入（回合 {active[:8]}），"
-            f"请等待其完成后再重试: {ctx.workspace_root}",
+            f"该文件正在被另一个回合写入（回合 {owner[:8]}），"
+            f"请等待其完成后再重试: {canonical_path}",
             detail={
-                "active_turn_id": active,
-                "workspace_root": ctx.workspace_root,
+                "active_turn_id": owner,
+                "path": canonical_path,
             },
         )
 
+
+def _release_path_claim(ctx: Optional[RecorderContext], canonical_path: str) -> None:
+    """释放本回合对该文件的写入占用；重复调用无副作用。"""
+    if ctx is None or not canonical_path:
+        return
+    try:
+        from core.turn_undo import coordinator as coordinator_mod
+
+        coordinator_mod.get_coordinator().release_path(
+            ctx.workspace_root, canonical_path, ctx.turn_id,
+        )
+    except Exception:  # 释放失败只影响重试延迟，不能掩盖写入结果
+        logger.debug("释放文件写入占用失败: %s", canonical_path, exc_info=True)
 
 def prepare_mutation(
     *,
@@ -410,7 +434,6 @@ def prepare_mutation(
         )
 
     ctx = _require_active_context(need_owner=True)
-    _ensure_workspace_writable(ctx)
     storage = _storage_for_ctx()
     checkpoint = storage.get_checkpoint(ctx.checkpoint_id)
     if checkpoint.status_enum is not TurnUndoStatus.RECORDING:
@@ -428,6 +451,9 @@ def prepare_mutation(
         )
 
     canonical_path = canonicalize_path(display_path)
+    # 触盘前的文件级占用：同目录其它回合改别的文件完全不受影响。占用在
+    # verify_after_mutation / rollback_prepared_mutation 释放，回合封闭时兜底清理。
+    _claim_path_for_write(ctx, canonical_path)
     if source_kind is None:
         # 来源默认值（规格 5.4）：借记录权的线程（前台子代理，线程绑定 owner=False）
         # 与后台任务检查点都是子代理修改；只有线程 own 的主回合线程记为主代理
@@ -540,6 +566,8 @@ def rollback_prepared_mutation(handle: MutationHandle) -> None:
     - 后续修改：恢复被替换前的已验证 after 状态（写入未发生，磁盘未变；
       若磁盘已与上一计划不一致则显式失败——诚实暴露外部改动）。
     """
+    # 写入没成功：先放开文件占用，别的回合可立即重试同一文件
+    _release_path_claim(current_context(), handle.canonical_path)
     storage = _storage_for_ctx()
     if handle.is_first_mutation or handle.previous_after is None:
         with storage._manager._lock:
@@ -730,6 +758,7 @@ def verify_after_mutation(handle: MutationHandle) -> NodeState:
             "按回合撤销：写入验证失败，文件退出撤销范围: %s (%s)",
             canonical_path, reason,
         )
+        _release_path_claim(ctx, canonical_path)
         raise TurnUndoError(
             UndoErrorCode.FILE_CONFLICT,
             f"写入后实际状态与计划不一致，该文件已退出本回合撤销范围: {canonical_path}",
@@ -792,6 +821,7 @@ def verify_after_mutation(handle: MutationHandle) -> NodeState:
                     reason="验证结果落库失败，检查点不可安全撤销",
                 )
                 raise
+    _release_path_claim(ctx, canonical_path)
     return actual_state
 
 

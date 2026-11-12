@@ -44,8 +44,15 @@ class WorkspaceCoordinator:
     def __init__(self):
         self._registry_lock = threading.Lock()
         self._workspace_locks: dict[str, threading.RLock] = {}
-        # workspace_root -> turn_id：正在 recording 的前台回合（参与写入互斥）
-        self._active_turns: dict[str, str] = {}
+        # workspace_root -> set(turn_id)：正在 recording 的前台回合。
+        # 同一目录允许多个回合并存：不同文件互不影响，目录级独占会把"同目录
+        # 另一个会话干活"整片阻塞（实测一次长回合让整个工作区写不了文件）。
+        # 互斥粒度由下面的 _active_paths 收到文件级。
+        self._active_turns: dict[str, set[str]] = {}
+        # (workspace_root, canonical_path) -> turn_id：正在写该文件的前台回合。
+        # 只有真正同时写同一个文件才短暂互斥（prepare→verify 的写入窗口），
+        # 同目录不同文件的回合可以并行。
+        self._active_paths: dict[tuple[str, str], str] = {}
         # workspace_root -> set(turn_id)：正在 recording 的后台任务检查点。
         # 与前台分开登记：后台任务按设计不参与写入互斥（recorder 依 owner_kind
         # 直接放行），但它确实在写文件，撤销/恢复必须仍能看见并拒绝并发。
@@ -78,18 +85,28 @@ class WorkspaceCoordinator:
     def register_active_turn(self, workspace_root: str, turn_id: str) -> None:
         root = canonicalize_workspace_root(workspace_root)
         with self._registry_lock:
-            self._active_turns[root] = turn_id
+            # 并存登记：同目录多个回合各自入表，不再互相覆盖（覆盖式登记会让
+            # 先到的回合被后到的踢出活跃位，反过来把自己判成"另一个回合"）
+            self._active_turns.setdefault(root, set()).add(turn_id)
 
     def unregister_active_turn(self, workspace_root: str, turn_id: str) -> None:
         root = canonicalize_workspace_root(workspace_root)
         with self._registry_lock:
-            if self._active_turns.get(root) == turn_id:
+            turns = self._active_turns.get(root)
+            if not turns:
+                return
+            turns.discard(turn_id)
+            if not turns:
                 self._active_turns.pop(root, None)
 
     def active_turn_id(self, workspace_root: str) -> Optional[str]:
         root = canonicalize_workspace_root(workspace_root)
         with self._registry_lock:
-            return self._active_turns.get(root)
+            turns = self._active_turns.get(root)
+            if not turns:
+                return None
+            # 多回合并存时给一个确定性代表（后台任务只需记一个父回合）
+            return sorted(turns)[0]
 
     # -- 后台任务登记（不参与写入互斥，仅用于撤销/恢复的并发判定） --
 
@@ -117,6 +134,43 @@ class WorkspaceCoordinator:
         root = canonicalize_workspace_root(workspace_root)
         with self._registry_lock:
             return bool(self._active_turns.get(root) or self._background_turns.get(root))
+
+    # -- 文件级写入占用（同一文件同一时刻只允许一个前台回合在写） --
+
+    def claim_path(self, workspace_root: str, canonical_path: str,
+                   turn_id: str) -> Optional[str]:
+        """占用一个文件的写入窗口；已被别的回合占用时返回占用者 turn_id。
+
+        冲突时不回填自己：调用方直接失败，等对方 verify 释放后重试即可。
+        """
+        root = canonicalize_workspace_root(workspace_root)
+        key = (root, canonicalize_workspace_root(canonical_path))
+        with self._registry_lock:
+            owner = self._active_paths.get(key)
+            if owner and owner != turn_id:
+                return owner
+            self._active_paths[key] = turn_id
+            return None
+
+    def release_path(self, workspace_root: str, canonical_path: str,
+                     turn_id: Optional[str] = None) -> None:
+        """释放文件写入占用；turn_id 为空时无条件释放（写入失败回滚路径用）。"""
+        root = canonicalize_workspace_root(workspace_root)
+        key = (root, canonicalize_workspace_root(canonical_path))
+        with self._registry_lock:
+            owner = self._active_paths.get(key)
+            if owner is None:
+                return
+            if turn_id is None or owner == turn_id:
+                self._active_paths.pop(key, None)
+
+    def release_turn_paths(self, workspace_root: str, turn_id: str) -> None:
+        """回合封闭兜底：清掉该回合遗留的全部文件占用，防异常路径泄漏。"""
+        root = canonicalize_workspace_root(workspace_root)
+        with self._registry_lock:
+            for key in [k for k, owner in self._active_paths.items()
+                        if k[0] == root and owner == turn_id]:
+                self._active_paths.pop(key, None)
 
     # -- 撤销事务登记（须持有工作区锁调用） --
 

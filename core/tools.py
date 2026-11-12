@@ -783,7 +783,7 @@ def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, 
             elif error.code == "workspace_busy":
                 # 同目录另有活跃回合：可重试，未触盘，不产生不可撤销修改
                 return (
-                    f"🚨 该目录正在被另一个回合写入，本次未修改文件（{file_path}）：\n"
+                    f"🚨 该文件正在被另一个回合写入，本次未修改文件（{file_path}）：\n"
                     f"{error.message}\n"
                     f"请稍后重试。"
                 )
@@ -1702,7 +1702,7 @@ def fetch_image(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
                     handle = None
                 elif error.code == "workspace_busy":
                     return (
-                        f"🚨 该目录正在被另一个回合写入，图片未写入（{target}）：\n"
+                        f"🚨 该文件正在被另一个回合写入，图片未写入（{target}）：\n"
                         f"{error.message}\n请稍后重试。"
                     )
                 else:
@@ -2603,7 +2603,7 @@ def _recorded_atomic_write(resolved, encoding, new_content, *, file_path=None,
                 )
             if error.code == "workspace_busy":
                 return (
-                    f"🚨 该目录正在被另一个回合写入，本次未修改文件"
+                    f"🚨 该文件正在被另一个回合写入，本次未修改文件"
                     f"（{file_path or resolved}）：\n{error.message}\n请稍后重试。"
                 )
             # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
