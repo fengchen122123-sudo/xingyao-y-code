@@ -5,6 +5,7 @@ import type { HeatmapWeekColumn } from './tokenStatistics';
 import {
   CHART_SERIES_COLORS,
   RANKING_MAX_MODELS,
+  formatCostCell,
   buildDonutSlices,
   buildHeatmapMonthLabels,
   buildHeatmapWeeks,
@@ -524,5 +525,22 @@ describe('buildRankingChart', () => {
     expect(chart.hasData).toBe(false);
     expect(chart.series).toEqual([]);
     expect(chart.maxValue).toBe(0);
+  });
+});
+
+describe('formatCostCell（成本账本展示）', () => {
+  it('有金额时原样显示', () => {
+    expect(formatCostCell('¥0.0123', 0)).toBe('¥0.0123');
+  });
+
+  it('未计价显示破折号而不是 0', () => {
+    expect(formatCostCell(null, 0)).toBe('—');
+    expect(formatCostCell(undefined, 0)).toBe('—');
+    expect(formatCostCell('', 0)).toBe('—');
+  });
+
+  it('含未计价记录时加星号', () => {
+    expect(formatCostCell('¥0.0123', 2)).toBe('¥0.0123*');
+    expect(formatCostCell(null, 2)).toBe('—*');
   });
 });
