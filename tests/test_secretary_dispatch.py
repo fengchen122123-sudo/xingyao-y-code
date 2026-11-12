@@ -744,3 +744,31 @@ def test_ledger_tools_report_unavailable_without_service(manager):
     """句柄未注册（CLI / headless）：返回可读提示，不是异常。"""
     assert "秘书调度能力当前不可用" in tools.list_dispatches()
     assert "秘书调度能力当前不可用" in tools.get_dispatch_result(1)
+
+
+def test_dispatch_rejects_secretary_target(manager):
+    """派活目标命中秘书会话：派发前拒绝，绝不投进只读会话。
+
+    秘书会话受 core.secretary.secretary_allows_tool 只读门控约束，没有
+    execute_command / write_file。修复前这种派活会真的启动一个回合，目标只能回
+    "我没有命令执行和写文件工具"，用户看到的就是"秘书派出去的活干不了"。
+    """
+    manager.create_session_explicit(
+        "s_secretary", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
+    )
+    manager.create_session_explicit("s_work", workdir="GLOBAL", source="GUI")
+    secretary.invalidate_secretary_cache()
+
+    _bridge, spawned, _events = _make_bridge(manager)
+    service = secretary_dispatch.get()
+
+    with pytest.raises(secretary_dispatch.SecretaryDispatchError) as excinfo:
+        service.dispatch_task(target="s_secretary", prompt="跑一下测试")
+    assert "秘书会话" in str(excinfo.value)
+    # 拒绝发生在派发之前：没有任何回合被启动，不留一个注定失败的空回合
+    assert spawned == []
+
+    # 对照：普通项目会话照常派发
+    result = service.dispatch_task(target="s_work", prompt="跑一下测试")
+    assert result["ok"] is True
+    assert len(spawned) == 1

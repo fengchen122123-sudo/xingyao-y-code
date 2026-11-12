@@ -69,12 +69,31 @@ def validate_secretary_persona(persona) -> str:
 
 
 def _resolve_session_name(session_name):
-    """统一会话名入口：显式传入优先，缺省取当前会话；取不到返回空串。"""
+    """统一会话名入口：显式传入 > 本回合线程所属会话 > UI 当前会话。
+
+    为什么线程会话必须优先（2026-11-12 修复）：``get_current_session`` 的语义是
+    "UI 当前查看的会话"，会随用户在侧栏切换而变化。后台回合（秘书派活、星轨
+    自动化、忙时会话补发）跑在独立线程里，若只看 UI 当前会话，用户在秘书会话
+    里派活的那一刻，被派的目标会话就会被判成秘书会话：工具面被裁成秘书只读集
+    （实测 harness_steps.tools_bytes=25206，与秘书会话逐字节相同），系统提示词
+    也换成秘书契约，模型于是回答"本会话是秘书会话，不能执行命令、不能写文件"。
+    回合线程在 ``app_context.set_thread_session`` 里绑定了真实会话，它才是本回合
+    的身份事实源；没有线程绑定的交互路径仍回落到 UI 当前会话，行为与改动前一致。
+    （对应 app_context.py 对两者的区分：current=UI 视角，thread=回合视角）
+    """
     if session_name:
         return str(session_name)
     try:
         from core import app_context
 
+        thread_getter = getattr(app_context, "get_thread_session", None)
+        if thread_getter is not None:
+            try:
+                thread_session = str(thread_getter() or "")
+            except Exception:
+                thread_session = ""
+            if thread_session:
+                return thread_session
         return str(app_context.get_current_session() or "")
     except Exception:
         return ""

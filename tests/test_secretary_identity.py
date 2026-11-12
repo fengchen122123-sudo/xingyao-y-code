@@ -479,3 +479,95 @@ def test_bridge_rejects_bad_persona_and_non_secretary_session(manager):
     manager.create_session_explicit("s_plain_bridge", workdir="GLOBAL", source="GUI")
     secretary.invalidate_secretary_cache()
     assert bridge.set_secretary_persona("s_plain_bridge", "人设")["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 回合身份优先（2026-11-12 修复）：后台回合按线程会话判身份，不看 UI 当前会话
+# ---------------------------------------------------------------------------
+
+def test_thread_session_wins_over_ui_current_session(manager):
+    """复现秘书派活误判：UI 停在秘书会话，被派的普通会话仍须按普通会话处理。
+
+    修复前 ``is_secretary_session()`` 读 get_current_session（= UI 当前查看的
+    会话），派活那一轮把目标会话判成秘书会话：工具面裁成秘书只读集
+    （实测 tools_bytes=25206，与秘书会话逐字节相同）、系统提示词换成秘书契约，
+    表现为"派出去的工作说本会话是秘书会话、没有命令执行和写文件工具"。
+    """
+    manager.create_session_explicit(
+        "s_ui_secretary", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
+    )
+    manager.create_session_explicit("s_dispatched", workdir="GLOBAL", source="GUI")
+    secretary.invalidate_secretary_cache()
+
+    # UI 仍停在秘书会话上，但本回合跑的是被派的目标会话 → 必须按普通会话处理
+    app_context.set_current_session("s_ui_secretary")
+    app_context.set_thread_session("s_dispatched")
+    try:
+        assert secretary.is_secretary_session() is False
+        assert secretary.get_active_agent_name() != "星河"
+        # 显式传名依旧压倒线程绑定（回合门控传 parent_session 的既有用法不受影响）
+        assert secretary.is_secretary_session("s_ui_secretary") is True
+    finally:
+        app_context.set_thread_session(None)
+
+    # 反向：线程绑的确实是秘书会话时，必须按秘书处理
+    app_context.set_current_session("s_dispatched")
+    app_context.set_thread_session("s_ui_secretary")
+    try:
+        assert secretary.is_secretary_session() is True
+        assert secretary.get_active_agent_name() == "星河"
+    finally:
+        app_context.set_thread_session(None)
+
+    # 无线程绑定（UI 交互路径）回落 UI 当前会话，行为与改动前一致
+    app_context.set_current_session("s_ui_secretary")
+    assert secretary.is_secretary_session() is True
+    app_context.set_current_session("s_dispatched")
+    assert secretary.is_secretary_session() is False
+    app_context.set_current_session("")
+
+
+def test_dispatched_turn_gets_full_toolset(manager):
+    """派活回合的工具面必须是完整工具集：含命令执行与写文件。
+
+    这是"秘书派出去的活干不了"的直接判据：修复前 UI 停在秘书会话时，
+    被派会话的 get_tools_schema() 返回秘书只读集（实测 tools_bytes=25206，
+    与秘书会话逐字节相同），目标只能回"我没有命令执行和写文件工具"。
+    同时反向校验秘书护栏没被削弱——秘书回合仍然拿不到写类工具。
+    """
+    manager.create_session_explicit(
+        "s_ui_secretary", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
+    )
+    manager.create_session_explicit("s_dispatched", workdir="GLOBAL", source="GUI")
+    secretary.invalidate_secretary_cache()
+
+    import core.llm as llm
+
+    def _schema_names():
+        return {
+            str(schema.get("function", {}).get("name", ""))
+            for schema in llm.get_tools_schema()
+        }
+
+    # UI 停在秘书会话，但本回合跑的是被派的目标会话 → 完整工具面
+    app_context.set_current_session("s_ui_secretary")
+    app_context.set_thread_session("s_dispatched")
+    try:
+        names = _schema_names()
+        assert {"execute_command", "write_file", "edit_file"} <= names
+        # 派活的执行会话不该看见秘书专属调度工具
+        assert "dispatch_task" not in names
+    finally:
+        app_context.set_thread_session(None)
+
+    # 反向：线程确实是秘书会话 → 只读集，护栏未削弱
+    app_context.set_current_session("s_dispatched")
+    app_context.set_thread_session("s_ui_secretary")
+    try:
+        names = _schema_names()
+        assert "dispatch_task" in names
+        assert "execute_command" not in names
+        assert "write_file" not in names
+    finally:
+        app_context.set_thread_session(None)
+        app_context.set_current_session("")
