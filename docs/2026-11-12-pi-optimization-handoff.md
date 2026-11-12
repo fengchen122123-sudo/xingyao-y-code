@@ -169,3 +169,43 @@ tests/test_gui_token_statistics.py
 ### 关于计划状态的说明
 
 本轮执行中出现过计划项被标记 `completed` 但实际未落盘的情况（P3 前端、P5 运行器）。以上「未完成」清单以**磁盘实际状态**为准，不以计划状态为准。
+
+
+## 八、第三批改动（S2 运行器 + 前端工具层）
+
+### 已完成
+
+| 文件 | 变更 |
+|---|---|
+| `scripts/eval_run.py` | **新增**。用例加载校验（id 唯一 / assertions 非空 / 未知判据在加载期报错）、5 种确定性判据（file_exists / file_not_exists / file_contains / file_not_contains / tool_called，路径越界判失败）、`--dry-run` + `--simulate A=1,0`、复用 `core.eval_stats` 出配对报告（json + md）、退出码 0/2 门禁 |
+| `evals/cases/smoke/bom.json` + `fixtures/bom/doc.md` | **新增** 首个样例用例 |
+| `tests/test_eval_run.py` | **新增** 9 个用例：重复 id / 未知判据 / 空 assertions / 判据正反例 / 路径越界 / tool_called / dry-run 端到端 / 模拟序列不足报错 |
+| `frontend/src/utils/tokenStatistics.ts` | 新增 `formatCostCell(costText, unpriced)` 与 `COST_UNPRICED_TEXT`：未计价显示 `—`，含未计价记录加 `*` |
+| `frontend/src/utils/tokenStatistics.test.ts` | 新增 3 个用例 |
+| `frontend/src/types/pywebview.d.ts` | `TokenStatisticsMetrics` 补可选 `cost_micros` / `cost_currency` / `cost_text` / `unpriced` |
+
+验证：
+- `pytest tests/test_eval_run.py tests/test_eval_stats.py -q` → **20 passed**
+- `npm --prefix frontend run test -- --run src/utils/tokenStatistics.test.ts` → **39 passed**
+- CLI 实跑：`python scripts/eval_run.py --dry-run --cases evals\cases --profile A=x --profile B=y --runs 1 --simulate "A=1" "B=0" --out <tmp>` → `paired=1 informative=1 delta=1.000 verdict=ok`，退出码 0
+
+### 未完成：前端面板把费用显示出来（一行改动）
+
+`frontend/src/components/TokenUsageSettings.vue` **被另一回合持续占用**，本轮尝试写入 4 次全部被拒（`edit_file` 报「文件在本次读取后已被外部修改」），因此没能接上。
+
+当前该文件状态：
+- **已加**：`formatCostCell` 的 import（第 232 行附近）
+- **未加**：`donutRows` 里缺 `cost: formatCostCell(model?.cost_text, model?.unpriced ?? 0),`，模板 `model-row` 里也还缺渲染 `row.cost` 的位置
+
+补法（3 分钟）：
+```ts
+// TokenUsageSettings.vue，donutRows 返回值里加
+cost: formatCostCell(model?.cost_text, model?.unpriced ?? 0),
+```
+```html
+<!-- model-row 内，model-meta 之后 -->
+<span class="model-cost">{{ row.cost }}</span>
+```
+注意：现有测试断言摘要条固定 5 格、`find('table')===false`，新增 span 不要动这两处结构。
+
+**另外**：该文件现在有一个「已 import 未使用」的 `formatCostCell`，在接上之前 eslint 可能报 unused，属已知中间态。
