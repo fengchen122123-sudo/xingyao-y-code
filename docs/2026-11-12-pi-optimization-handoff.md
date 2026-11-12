@@ -209,3 +209,20 @@ cost: formatCostCell(model?.cost_text, model?.unpriced ?? 0),
 注意：现有测试断言摘要条固定 5 格、`find('table')===false`，新增 span 不要动这两处结构。
 
 **另外**：该文件现在有一个「已 import 未使用」的 `formatCostCell`，在接上之前 eslint 可能报 unused，属已知中间态。
+
+
+## 九、前端面板费用列已接上（补记）
+
+`frontend/src/components/TokenUsageSettings.vue` 已补完：
+- `donutRows` 增加 `cost: formatCostCell(model?.cost_text, model?.unpriced ?? 0)`
+- 模型行副文案追加 `· 费用 ¥0.0123`（未配价显示 `—`，含未计价记录加 `*`）
+- 修复了此前编辑造成的 import 缩进损坏（`formatDayFull` 行丢失缩进、`const store` 前空行被吞）
+
+新增用例 `模型行展示费用，未计价显示破折号并标注星号`。验证：
+`npm --prefix frontend run test -- --run src/components/TokenUsageSettings.test.ts` → **8 passed**
+
+### 剩余（都不影响已有功能）
+
+- 价格数据：`MODEL_PRICES` 仍为空，界面会显示「—」。填入报价即可生效（config 的 `price` 块优先）。
+- 设计文档 4.6 第 7 条的「整轮 e2e 成本测试」未写（约 20 分钟）。
+- S2 运行器只支持 `--dry-run`；真实 provider 调用按其设计显式 NotImplementedError。
