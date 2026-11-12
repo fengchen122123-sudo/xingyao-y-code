@@ -890,6 +890,8 @@ _KNOWN_MODEL_KEYS = frozenset({
     "supports_function_calling", "max_tokens", "thinking_budget", "enable_thinking",
     "reasoning_effort", "reasoning_choice", "computer_protocol", "system_prompt_extra",
     "enable_prompt_cache", "prompt_cache", "enable_cache_control", "cache_control",
+    # 成本账本：模型级价格块（见 core/cost_model.parse_price）
+    "price",
 })
 
 

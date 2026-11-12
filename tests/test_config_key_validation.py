@@ -392,3 +392,42 @@ def test_strict_config_true_with_cache_affinity_lanes_passes(
 
     assert config.audit_config_keys() == []
     assert captured_warnings == []
+def test_model_price_block_is_a_known_key():
+    """成本账本（S1）：模型条目里的 price 块不得被判成未知键。
+
+    否则 strict_config=true 会直接拒绝启动，文档里「在 config.json 配价格」
+    这条路径就断了。
+    """
+    data = {
+        "providers": [
+            {
+                "id": "p1",
+                "name": "厂商",
+                "base_url": "https://api.example.com",
+                "models": [
+                    {
+                        "id": "m1",
+                        "name": "模型",
+                        "litellm_model": "openai/m1",
+                        "context_window": 128000,
+                        "price": {
+                            "currency": "CNY",
+                            "tiers": [
+                                {
+                                    "up_to_input_tokens": None,
+                                    "input": 2000000,
+                                    "output": 8000000,
+                                    "cache_read": 200000,
+                                    "cache_write": 2500000,
+                                }
+                            ],
+                            "source": "https://example.com/pricing",
+                            "verified_at": "2026-11-12",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+
+    assert config.find_unknown_config_keys(data) == []
