@@ -210,3 +210,7 @@ skills/tokenrhythm-account/reference.md
 /a.txt
 /y
 
+# pelican-3d 一次性 3D 演示：源码与素材入库，QA 截图与中间产物不入库
+/pelican-3d/qa/
+/pelican-3d/assets/poster_raw.png
+
