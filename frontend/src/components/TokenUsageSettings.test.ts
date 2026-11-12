@@ -284,3 +284,19 @@ describe('TokenUsageSettings', () => {
     expect(detail.text()).toContain('共 200 Token');
   });
 });
+  it('模型行展示费用，未计价显示破折号并标注星号', async () => {
+    const priced = { ...m1, cost_text: '¥0.0123', unpriced: 0 };
+    const unpricedModel = { ...m2, cost_text: null, unpriced: 2 };
+    const { wrapper } = mountPage({
+      statistics: { ...statistics7, models: [priced, unpricedModel] },
+    });
+    await flushPromises();
+
+    const rows = wrapper.findAll('[data-test="model-usage-row"]');
+    expect(rows).toHaveLength(2);
+    // 有价：显示具体金额
+    expect(rows[0].text()).toContain('¥0.0123');
+    // 未计价：破折号 + 星号，且不能显示成 0 元
+    expect(rows[1].text()).toContain('—*');
+    expect(rows[1].text()).not.toContain('¥0.0000');
+  });

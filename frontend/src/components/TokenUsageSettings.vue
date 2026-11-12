@@ -229,6 +229,7 @@ import {
   donutDashOffset,
   formatDayFull,
   formatTokenCount,
+  formatCostCell,
 } from '../utils/tokenStatistics';
 
 const store = useAppStore();
@@ -339,7 +340,9 @@ const donutRows = computed(() => {
       label: slice.label,
       color: slice.color,
       share: slice.share,
-      meta: `${formatTokenCount(slice.total)} Token · 输入 ${formatTokenCount(metrics.prompt)} · 输出 ${formatTokenCount(metrics.completion)} · 缓存 ${formatTokenCount(metrics.cached)} · ${metrics.requests} 次请求`,
+      meta: `${formatTokenCount(slice.total)} Token · 输入 ${formatTokenCount(metrics.prompt)} · 输出 ${formatTokenCount(metrics.completion)} · 缓存 ${formatTokenCount(metrics.cached)} · ${metrics.requests} 次请求 · 费用 ${formatCostCell(model?.cost_text, model?.unpriced ?? 0)}`,
+      // 成本账本：后端按模型聚合下发 cost_text / unpriced；未配价显示「—」
+      cost: formatCostCell(model?.cost_text, model?.unpriced ?? 0),
     };
   });
 });
