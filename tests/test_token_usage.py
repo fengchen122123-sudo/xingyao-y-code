@@ -1094,3 +1094,119 @@ def test_rename_session_migrates_token_usage_rows_in_same_transaction():
     assert moved["prompt"] == 300
     assert moved["requests"] == 1
     assert manager.get_token_usage_by_session("old-name")["requests"] == 0
+
+
+def test_query_token_usage_by_model_exposes_cost_ledger_fields():
+    """按模型聚合要带出成本账本三字段：金额合计、未计价条数、币种。"""
+    manager = MemoryManager(":memory:")
+    today = _ts_of("2026-08-05")
+    common = {
+        "prompt_tokens": 1000, "completion_tokens": 10, "cached_tokens": 0,
+        "session_id": "s1", "ts": today,
+        "api_base": "https://api.example/v1", "cache_scope": "main",
+    }
+    manager.add_token_usage(
+        "openai", "m1", total_tokens=1010,
+        cost_micros=1234, cost_currency="CNY", price_source="config", **common,
+    )
+    manager.add_token_usage("openai", "m1", total_tokens=505, **common)
+    manager.add_token_usage(
+        "openai", "m2", total_tokens=101, **common
+    )
+
+    rows = {
+        row["model"]: row
+        for row in manager.query_token_usage_by_model("2026-08-05", "2026-08-05")
+    }
+
+    assert rows["m1"]["cost_micros"] == 1234
+    assert rows["m1"]["unpriced"] == 1
+    assert rows["m1"]["cost_currency"] == "CNY"
+    # 全部未计价：金额是 None（不是 0），币种是空串——缺失价不得冒充免费
+    assert rows["m2"]["cost_micros"] is None
+    assert rows["m2"]["unpriced"] == 1
+    assert rows["m2"]["cost_currency"] == ""
+
+
+def _usage_row(**overrides):
+    row = {
+        "provider": "openai", "model": "m1",
+        "api_base": "", "cache_scope": "main",
+        "prompt": 1000, "completion": 10, "cached": 990,
+        "cache_prompt": 1000, "total": 1010,
+        "cost_micros": None, "unpriced": 0, "cost_currency": "",
+    }
+    row.update(overrides)
+    return row
+
+
+def _render_usage_lines(monkeypatch, rows):
+    """跑一次 _render_usage_section，返回去掉颜色标签后的纯文本行。"""
+    import re
+
+    class Manager:
+        def query_token_usage_by_model(self, start, end):
+            return rows
+
+        def query_cache_diagnostic_summary(self, *args, **kwargs):
+            return {"count": 0, "lost_tokens": 0, "unreported": 0, "categories": {}}
+
+    captured = []
+    monkeypatch.setattr(
+        main, "print_formatted_text",
+        lambda html, *args, **kwargs: captured.append(str(html)),
+    )
+    main._render_usage_section(Manager(), "今日", "2026-08-09", "2026-08-09")
+    lines = []
+    for line in captured:
+        # HTML(...) 的 str() 会带上 "HTML('...')" 外壳，先脱壳再剥颜色标签
+        text = re.sub(r"<[^>]+>", "", line)
+        if text.startswith("HTML(") and text.endswith(")"):
+            text = text[len("HTML("):-1].strip("'\"")
+        lines.append(text)
+    return lines
+
+
+def test_usage_table_renders_cost_column_and_partial_unpriced_marker(monkeypatch):
+    """同币种：行显示金额，含未计价的打 *，小计累加并同样带 *，表下给出提示。"""
+    lines = _render_usage_lines(monkeypatch, [
+        _usage_row(model="m1", cost_micros=12340, cost_currency="CNY"),
+        _usage_row(model="m2", cost_micros=5000, cost_currency="CNY", unpriced=3),
+    ])
+
+    header, row1, row2, subtotal, hint = lines[1:6]
+
+    assert "费用" in header
+    assert "¥0.0123" in row1
+    assert "¥0.0050*" in row2
+    assert "¥0.0173*" in subtotal
+    assert hint.strip() == "* 含 3 条未计价记录"
+    # 新增列不得破坏既有对齐：表头/数据行/小计宽度一致
+    widths = {main._term_display_width(line) for line in (header, row1, row2, subtotal)}
+    assert len(widths) == 1, (widths, (header, row1, row2, subtotal))
+
+
+def test_usage_table_marks_unpriced_rows_and_mixed_currency_subtotal(monkeypatch):
+    """未计价行显示 —（不显示 ¥0.0000）；混币种小计不累加，显示 —。"""
+    lines = _render_usage_lines(monkeypatch, [
+        _usage_row(model="m1", cost_micros=2000000, cost_currency="CNY"),
+        _usage_row(model="m2", cost_micros=None, cost_currency="", unpriced=2),
+    ])
+
+    header, row1, row2, subtotal, hint = lines[1:6]
+
+    assert "¥2.0000" in row1
+    assert "—*" in row2
+    assert "0.0000" not in row2
+    assert "—" in subtotal
+    assert "¥" not in subtotal
+    assert hint.strip() == "* 含 2 条未计价记录"
+
+
+def test_format_usage_cost_never_turns_missing_price_into_zero():
+    assert main._format_usage_cost(None, "") == "—"
+    assert main._format_usage_cost(0, "") == "—"
+    assert main._format_usage_cost(None, "CNY") == "—"
+    assert main._format_usage_cost(1_500_000, "CNY") == "¥1.5000"
+    assert main._format_usage_cost(0, "USD") == "$0.0000"
+    assert main._format_usage_cost(1_000_000, "CNY", 1) == "¥1.0000*"

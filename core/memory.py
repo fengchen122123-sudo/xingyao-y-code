@@ -1738,7 +1738,11 @@ class MemoryManager:
 
         返回按合计 token 降序排列的字典列表:
         [{"provider", "model", "prompt", "completion", "cached",
-          "cache_prompt", "total"}, ...]
+          "cache_prompt", "total", "cost_micros", "unpriced",
+          "cost_currency"}, ...]
+
+        cost_micros 是微元整数合计（全部未计价时为 None），unpriced 是该组
+        未计价条数，cost_currency 是币种（全部未计价时为空串）。
         """
         with self._lock:
             cursor = self.conn.execute(
@@ -1747,7 +1751,10 @@ class MemoryManager:
                        SUM(prompt_tokens), SUM(completion_tokens),
                        SUM(cached_tokens),
                        SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
-                       SUM(total_tokens)
+                       SUM(total_tokens),
+                       SUM(cost_micros),
+                       SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END),
+                       MAX(cost_currency)
                 FROM token_usage
                 WHERE date >= ? AND date <= ?
                 GROUP BY provider, model, api_base, cache_scope
@@ -1766,6 +1773,10 @@ class MemoryManager:
                     "cached": row[6] or 0,
                     "cache_prompt": row[7] or 0,
                     "total": row[8] or 0,
+                    # 成本账本：NULL 表示未计价，unpriced 是该行的未计价条数
+                    "cost_micros": row[9],
+                    "unpriced": row[10] or 0,
+                    "cost_currency": row[11] or "",
                 }
                 for row in cursor.fetchall()
             ]

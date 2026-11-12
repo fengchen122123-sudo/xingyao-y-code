@@ -19,6 +19,12 @@ session_token_usage = {
     "cumulative_completion": 0,
     "cumulative_cached": 0,
     "cumulative_cache_prompt": 0,
+    # 会话级累计费用：micros 是「微元」整数（1 元 = 1_000_000 微元），
+    # 全程整数累加避免浮点误差；未计价的轮次单独计数，不当作 0 元——
+    # 「没配价」与「花了 0 元」必须可区分（铁律：未报告 ≠ 0）。
+    "cumulative_cost_micros": 0,
+    "cumulative_cost_currency": "",
+    "cumulative_cost_unpriced": 0,
 
     # 窗口占用（用来防止爆 128k 上下文）
     "latest_total": 0,
@@ -484,6 +490,16 @@ def get_token_usage_snapshot(
             "cumulative_cached": int(session_token_usage.get("cumulative_cached", 0) or 0),
             "cumulative_cache_prompt": int(
                 session_token_usage.get("cumulative_cache_prompt", 0) or 0
+            ),
+            # 会话级累计费用（与 session_token_usage 同名同义）：micros 是微元整数，
+            # 未计价的轮次只计数不按 0 元入账；跨币种不求和，currency 为空串表示
+            # 尚无任何已计价轮次（未报告 ≠ 0）。
+            "cost_micros": int(session_token_usage.get("cumulative_cost_micros", 0) or 0),
+            "cost_currency": str(
+                session_token_usage.get("cumulative_cost_currency", "") or ""
+            ),
+            "cost_unpriced": int(
+                session_token_usage.get("cumulative_cost_unpriced", 0) or 0
             ),
         }
         cache = _cache_usage_view(state)
@@ -1072,6 +1088,16 @@ def _account_server_usage(
     cache_reported = record["cache_reported"]
     main_scope = str(cache_scope or "main") == "main"
 
+    # 缓存写入量在「成本累计」与「落库」两处都要用：只解析一次 usage。
+    cache_write_tokens = _extract_cache_write_tokens(usage)
+    # 成本字段在锁外算：_resolve_model_price 要读模型配置（可能取 model_manager
+    # 的锁），持 token_usage_lock 做外部 I/O 有锁序反转风险（与本模块顶部的
+    # 监听器同款理由）。锁内只做三行整数累加。
+    cost_fields = compute_cost_fields(
+        model_name, prompt_tokens, completion_tokens,
+        cached_tokens, cache_write_tokens,
+    )
+
     with token_usage_lock:
         session_token_usage["cumulative_total"] += total_tokens
         session_token_usage["cumulative_prompt"] += prompt_tokens
@@ -1079,6 +1105,24 @@ def _account_server_usage(
         if cache_reported:
             session_token_usage["cumulative_cached"] += cached_tokens
             session_token_usage["cumulative_cache_prompt"] += prompt_tokens
+        # 会话级累计成本：micros 全程整数累加；无价（空字典）只递增 unpriced，
+        # 绝不按 0 元入账——「没配价」与「花了 0 元」必须可区分。
+        if cost_fields:
+            cost_currency = cost_fields["cost_currency"]
+            # 币种切换规则：跨币种绝不求和。切到新币种时先把 micros 归零再
+            # 累加，currency 随后更新——累计金额永远只反映「当前币种口径」，
+            # 混算的金额没有意义，历史其它币种的花费由落库明细追溯。
+            if (
+                session_token_usage["cumulative_cost_currency"]
+                and session_token_usage["cumulative_cost_currency"] != cost_currency
+            ):
+                session_token_usage["cumulative_cost_micros"] = 0
+            session_token_usage["cumulative_cost_micros"] += int(
+                cost_fields["cost_micros"]
+            )
+            session_token_usage["cumulative_cost_currency"] = cost_currency
+        else:
+            session_token_usage["cumulative_cost_unpriced"] += 1
         if main_scope:
             session_token_usage["latest_total"] = total_tokens
             session_token_usage["latest_prompt"] = prompt_tokens
@@ -1125,7 +1169,7 @@ def _account_server_usage(
     }
     # 未报告写入量时不带该键：调用方（含测试替身）对 kwargs 做精确断言，
     # 恒定多一个 None 键同样会改变既有契约。未报告 → 落库 NULL，语义不变。
-    cache_write_tokens = _extract_cache_write_tokens(usage)
+    # cache_write_tokens 已在上面为成本累计解析过一次，这里直接复用。
     if cache_write_tokens is not None:
         persist_kwargs["cache_write_tokens"] = cache_write_tokens
     persist(model_name, **persist_kwargs)
