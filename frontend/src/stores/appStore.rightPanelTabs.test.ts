@@ -199,3 +199,48 @@ it('embedded_browser_activation：当前会话收到回放地址时写入导航�
     session: 'B',
   });
 });
+
+it('子代理开关关闭：会话内外的子代理页签一并收掉，重新打开只恢复入口', async () => {
+  const store = useAppStore();
+  store.openRightPanelTab('files');
+  store.openRightPanelTab('subagent');
+  store.subagentDetailId = 'sub-1';
+  // 其它会话 runtime 里残留的子代理页签同口径清理
+  (store as any).sessionRuntimeByName['B'] = {
+    rightPanelTabs: ['subagent', 'git'],
+    rightPanelActiveTab: 'subagent',
+  };
+  (window as any).pywebview.api.set_subagent_enabled = vi.fn().mockResolvedValue({
+    ok: true,
+    settings: { ...store.systemSettings, subagent_enabled: false },
+  });
+
+  expect(await store.setSubagentEnabled(false)).toBe(true);
+  expect(store.systemSettings.subagent_enabled).toBe(false);
+  // 当前会话：激活的子代理页签被清，回退到左侧邻居，查看对象一并清理
+  expect(store.rightPanelTabs).toEqual(['files']);
+  expect(store.rightPanelActiveTab).toBe('files');
+  expect(store.subagentDetailId).toBe('');
+  // 其它会话：页签清掉，激活页签同步回退
+  const runtimeB = (store as any).sessionRuntimeByName['B'];
+  expect(runtimeB.rightPanelTabs).toEqual(['git']);
+  expect(runtimeB.rightPanelActiveTab).toBe('git');
+
+  // 重新打开只恢复入口，不自动把页签加回来
+  (window as any).pywebview.api.set_subagent_enabled = vi.fn().mockResolvedValue({
+    ok: true,
+    settings: { ...store.systemSettings, subagent_enabled: true },
+  });
+  expect(await store.setSubagentEnabled(true)).toBe(true);
+  expect(store.rightPanelTabs).toEqual(['files']);
+
+  // 关闭期间切回旧会话：旧快照里的子代理页签不复活
+  store.systemSettings.subagent_enabled = false;
+  store.sessionRuntimeByName['C'] = {
+    ...((store as any)._getSessionRuntime('C') || {}),
+    rightPanelTabs: ['subagent'],
+    rightPanelActiveTab: 'subagent',
+  } as any;
+  await store.switchSession('C');
+  expect(store.rightPanelTabs).not.toContain('subagent');
+});

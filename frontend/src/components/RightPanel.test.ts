@@ -743,3 +743,26 @@ it('QQ秀：QQ2009 主题下打开具体标签页（选择页隐藏）时不渲�
   expect(wrapper.find('[data-test="qq09-show"]').exists()).toBe(false);
   wrapper.unmount();
 });
+
+it('子代理开关关闭：选择页不出子代理卡片，重新打开即恢复', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel, { global: { plugins: [pinia] } });
+
+  store.showRightPanelPicker();
+  await nextTick();
+  expect(wrapper.find('[data-test="picker-card-subagent"]').exists()).toBe(true);
+
+  // 全局开关是后端真实设置，前端只跟随：关掉后卡片入口消失
+  store.systemSettings.subagent_enabled = false;
+  await nextTick();
+  expect(wrapper.find('[data-test="picker-card-subagent"]').exists()).toBe(false);
+  expect(wrapper.findAll('.tp-card').map(c => c.text().trim())).not.toContain('星舰 · 子代理');
+
+  store.systemSettings.subagent_enabled = true;
+  await nextTick();
+  expect(wrapper.find('[data-test="picker-card-subagent"]').exists()).toBe(true);
+  wrapper.unmount();
+});

@@ -342,15 +342,21 @@ function isActiveTab(tab: RightPanelTabId) {
 // 选择页六张卡（对齐 ZCode 官方侧板，外加小说工作台）；“操控”不进选择页，只在
 // 出现过电脑操控 run 后自动切入（设计 16.2）。星名只对应这一个场景（一名一景），
 // 页签/卡片统一用「星名 · 通用名」的写法，新用户第一眼就知道是什么
-const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> = [
-  { id: 'files', label: '文件', icon: 'folder' },
-  { id: 'git', label: 'Git', icon: 'git-branch' },
-  { id: 'doc', label: '文档', icon: 'file' },
-  { id: 'browser', label: '星眼 · 浏览器', icon: 'globe' },
-  { id: 'tasks', label: '星港 · 后台任务', icon: 'square-terminal' },
-  { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' },
-  { id: 'novel', label: '小说', icon: 'file' }
-];
+// 全局子代理开关关闭时不出子代理卡片：开关关掉就意味着不再派发子代理，
+// 卡片点开只会是一片空页，入口跟着消失；重新打开即恢复
+const pickerCards = computed<Array<{ id: RightPanelTabId; label: string; icon: string }>>(() => {
+  const cards: Array<{ id: RightPanelTabId; label: string; icon: string }> = [
+    { id: 'files', label: '文件', icon: 'folder' },
+    { id: 'git', label: 'Git', icon: 'git-branch' },
+    { id: 'doc', label: '文档', icon: 'file' },
+    { id: 'browser', label: '星眼 · 浏览器', icon: 'globe' },
+    { id: 'tasks', label: '星港 · 后台任务', icon: 'square-terminal' },
+    { id: 'subagent', label: '星舰 · 子代理', icon: 'blocks' },
+    { id: 'novel', label: '小说', icon: 'file' }
+  ];
+  if (store.systemSettings.subagent_enabled) return cards;
+  return cards.filter(card => card.id !== 'subagent');
+});
 
 const PANE_LABELS: Record<RightPanelTabId, string> = {
   files: '文件',

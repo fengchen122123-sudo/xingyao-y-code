@@ -1422,6 +1422,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (!this.computerRun.run_id) {
         tabs = tabs.filter(t => t !== 'computer');
       }
+      // 全局子代理开关关闭：子代理页签不再恢复（关闭期间残留在旧快照里的
+      // 页签不复活，与 pruneSubagentRightPanelTabs 同口径）
+      if (!this.systemSettings.subagent_enabled) {
+        tabs = tabs.filter(t => t !== 'subagent');
+      }
       this.rightPanelTabs = tabs;
       const savedActive = runtime.rightPanelActiveTab;
       this.rightPanelActiveTab = savedActive && this.rightPanelTabs.includes(savedActive as RightPanelTabId)
@@ -1681,6 +1686,26 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // （tasks 残留 bgTaskDetailId、subagent 残留查看 id 与 SubagentPane 内部 detail）
       if (tab === 'tasks') this.bgTaskDetailId = '';
       if (tab === 'subagent') this.subagentDetailId = '';
+    },
+
+    // 全局子代理开关关闭后，「星舰 · 子代理」页签一并收掉：开关关掉意味着不再
+    // 派发子代理，留着页签只会在选择页/页签条上诱人点出一片空白。所有会话的
+    // 页签集都清一遍（关闭期间切回旧会话也不会被旧快照复活）；当前激活页签被
+    // 清时沿用 closeRightPanelTab 的邻居回退、全关回选择页规则。开关重新打开
+    // 只恢复入口，不自动把页签加回来。
+    pruneSubagentRightPanelTabs(this: any) {
+      if (this.systemSettings.subagent_enabled) return;
+      const runtimes: Record<string, any> = this.sessionRuntimeByName || {};
+      for (const name of Object.keys(runtimes)) {
+        const runtime = runtimes[name];
+        if (!runtime || !Array.isArray(runtime.rightPanelTabs)) continue;
+        if (!runtime.rightPanelTabs.includes('subagent')) continue;
+        runtime.rightPanelTabs = runtime.rightPanelTabs.filter((t: string) => t !== 'subagent');
+        if (runtime.rightPanelActiveTab === 'subagent') {
+          runtime.rightPanelActiveTab = runtime.rightPanelTabs[runtime.rightPanelTabs.length - 1] || '';
+        }
+      }
+      if (this.rightPanelTabs.includes('subagent')) this.closeRightPanelTab('subagent');
     },
 
     // 页签条点击：切到已打开的页签
@@ -3247,6 +3272,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       try {
         const settings = await api.get_system_settings();
         this.systemSettings = settings;
+        // 开关可能被设置页以外的路径改动（其它端推送/刷新）：页签跟着快照收口
+        this.pruneSubagentRightPanelTabs();
         return settings;
       } catch (err) {
         if (!options.silent) {
@@ -3475,6 +3502,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.notifyModal('子代理', '子代理开关设置失败: ' + (result?.msg || '未知错误'));
           return false;
         }
+        // 关掉开关：右面板的子代理页签在选择页与页签条上一起消失
+        this.pruneSubagentRightPanelTabs();
         return true;
       } catch (err) {
         this.connected = false;
