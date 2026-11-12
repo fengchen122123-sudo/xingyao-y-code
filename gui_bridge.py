@@ -12240,11 +12240,29 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             )
 
             def empty_metrics() -> Dict[str, int]:
-                return {name: 0 for name in metric_names}
+                # 成本账本（S1）：与 CLI /usage 同口径——微元整数，
+                # 未计价单独计数（未计价 ≠ 0 元）
+                metrics = {name: 0 for name in metric_names}
+                metrics["cost_micros"] = 0
+                metrics["unpriced"] = 0
+                return metrics
 
             def add_metrics(target: Dict[str, Any], source: Dict[str, Any]) -> None:
                 for name in metric_names:
                     target[name] += int(source.get(name, 0) or 0)
+                unpriced_delta = int(source.get("unpriced", 0) or 0)
+                micros = source.get("cost_micros")
+                if micros is None:
+                    # 整行未计价：老数据没有 unpriced 字段时按该行请求数计
+                    target["unpriced"] = int(target.get("unpriced", 0) or 0) + (
+                        unpriced_delta or int(source.get("requests", 0) or 0)
+                    )
+                    return
+                target["cost_micros"] = int(target.get("cost_micros", 0) or 0) + int(micros)
+                target["unpriced"] = int(target.get("unpriced", 0) or 0) + unpriced_delta
+                currency = str(source.get("cost_currency") or "")
+                if currency:
+                    target.setdefault("cost_currency", currency)
 
             def with_rate(metrics: Dict[str, Any]) -> Dict[str, Any]:
                 result = dict(metrics)
@@ -12253,6 +12271,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     round(int(result.get("cached", 0) or 0) / cache_prompt * 100, 1)
                     if cache_prompt > 0 else None
                 )
+                # 无币种时给 None（未计价），前端据此不显示 ¥0
+                currency = str(result.get("cost_currency") or "")
+                if currency:
+                    from core.cost_model import CURRENCY_SYMBOLS
+
+                    symbol = CURRENCY_SYMBOLS.get(currency, currency + " ")
+                    result["cost_text"] = (
+                        f"{symbol}{int(result.get('cost_micros', 0) or 0) / 1_000_000:.4f}"
+                    )
+                else:
+                    result["cost_text"] = None
                 return result
 
             summary = empty_metrics()
@@ -12281,12 +12310,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
                 day_item = day_lookup[str(row.get("date") or "")]
                 add_metrics(day_item, row)
-                day_item["models"].append(with_rate({
+                item = {
                     "key": key,
                     "provider": provider,
                     "model": model,
-                    **{name: int(row.get(name, 0) or 0) for name in metric_names},
-                }))
+                    **empty_metrics(),
+                }
+                add_metrics(item, row)
+                day_item["models"].append(with_rate(item))
 
             models = [with_rate(item) for item in model_totals.values()]
             models.sort(key=lambda item: (-item["total"], item["key"]))

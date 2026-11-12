@@ -18,6 +18,7 @@
 | `core/llm_diagnostics.py` | 新增 `_resolve_model_price` / `compute_cost_fields`；`_persist_token_usage` 在记账时算成本（无价时不写成本键，保持旧契约） |
 | `core/model_manager.py` | `get_active_model` 返回值透传模型级 `price` 块 |
 | `core/tools_admin_ops.py` | `/usage` 统计（CLI 与工具共用）新增 `cost_micros` / `cost_text` / `unpriced`，跨币种不混算 |
+| `gui_bridge.py` | `get_token_usage_statistics`（GUI 用量面板）补同样的成本聚合与 `cost_text`，与 CLI 口径一致 |
 | `tests/test_cost_model.py` | **新增** 22 个用例：计价、阶梯边界、缺失字段、币种、解析校验、记账集成 |
 | `tests/test_token_usage.py` | 既有精确断言同步新增三个字段（契约变更，非放水） |
 
@@ -97,18 +98,16 @@ venv\Scripts\python.exe -m pytest tests -q -k "architecture or cost or token_usa
 
    末档 `up_to_input_tokens` 必须为 `null`；中间档出现 `null` 会被判为非法配置并整块丢弃（宁可未计价，也不要错档）。
 
-2. **GUI 用量面板还没接成本**。`tools_admin_ops.usage_stats`（CLI `/usage` 与工具共用）已经有 `cost_text`，但 `gui_bridge.get_token_usage_statistics` 走的是另一条聚合路径（`gui_bridge.py:12199`），没有成本列。下一步照搬 `_add_metrics` / `_with_cache_rate` 的改法即可。
-
-3. **既有测试的精确断言会被契约变更打脸**。`tests/test_token_usage.py` 里对返回字典做 `==` 比较，加字段必须同步改断言。以后改 `query_token_usage_by_day_and_model` 的返回结构要注意同类影响。
+2. **既有测试的精确断言会被契约变更打脸**。`tests/test_token_usage.py` 与 `tests/test_gui_token_statistics.py` 里对返回字典做 `==` 比较，加字段必须同步改断言。以后改 `query_token_usage_by_day_and_model` / `get_token_usage_statistics` 的返回结构要注意同类影响。
 
 4. **`architecture_report.py closure` 只扫单一 root**。默认 root 是 `core`，所以 `main.py` / `gui_main.py` 这类包外入口暂时进不来。若要覆盖，需要给 `_module_name` 支持空前缀（当前会拼出 `.core.x`），这是个已知的小坑。
 
 ## 四、建议的下一步（按优先级）
 
-1. **GUI 成本列**（约 1 小时）：改 `gui_bridge.get_token_usage_statistics`，与 CLI 口径对齐。
-2. **价格数据落地**（需要你提供/确认报价）：填 `MODEL_PRICES` 或 config `price`，然后跑一轮真实对话看 `/usage` 出金额。
-3. **S2 运行器**（1~2 天）：`scripts/eval_run.py` + 3 个样例 case，先用「临时工作区 + 子进程」跑，容器化留作可选后端。
-4. **入口闭包区分度**：四个入口闭包完全一样，说明 `core/llm` 被 `core.tools`/`core.memory` 反向依赖。如果要降低启动耦合，这是切入点。
+1. **价格数据落地**（需要你提供/确认报价）：填 `MODEL_PRICES` 或 config `price`，然后跑一轮真实对话看 `/usage` 出金额。
+2. **S2 运行器**（1~2 天）：`scripts/eval_run.py` + 3 个样例 case，先用「临时工作区 + 子进程」跑，容器化留作可选后端。
+3. **入口闭包区分度**：四个入口闭包完全一样，说明 `core/llm` 被 `core.tools`/`core.memory` 反向依赖。如果要降低启动耦合，这是切入点。
+4. **前端展示**：`cost_text` 已由后端返回，前端面板按需渲染即可（后端字段名固定为 `cost_text` / `unpriced`）。
 
 ## 五、恢复工作的第一步
 
@@ -134,6 +133,7 @@ core/llm_diagnostics.py
 core/model_manager.py
 core/model_spec_table.py
 core/tools_admin_ops.py
+gui_bridge.py
 scripts/architecture_report.py
 docs/architecture_baseline.json
 docs/2026-11-12-pi-inspired-optimization-design.md   新增
@@ -142,4 +142,5 @@ tests/test_cost_model.py               新增
 tests/test_eval_stats.py               新增
 tests/test_architecture_closure.py     新增
 tests/test_token_usage.py
+tests/test_gui_token_statistics.py
 ```

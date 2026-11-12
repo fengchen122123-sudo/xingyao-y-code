@@ -46,6 +46,10 @@ def test_gui_token_statistics_fills_dates_and_aggregates_models():
         "total": 770,
         "requests": 3,
         "cache_hit_rate": 80.0,
+        # 成本账本：全部未配价 → 未计价计数 3，金额为空（不是 0 元）
+        "cost_micros": 0,
+        "unpriced": 3,
+        "cost_text": None,
     }
     assert result["models"] == [
         {
@@ -59,6 +63,9 @@ def test_gui_token_statistics_fills_dates_and_aggregates_models():
             "total": 660,
             "requests": 2,
             "cache_hit_rate": 85.0,
+            "cost_micros": 0,
+            "unpriced": 2,
+            "cost_text": None,
         },
         {
             "key": "moonshot/m2",
@@ -71,6 +78,9 @@ def test_gui_token_statistics_fills_dates_and_aggregates_models():
             "total": 110,
             "requests": 1,
             "cache_hit_rate": 50.0,
+            "cost_micros": 0,
+            "unpriced": 1,
+            "cost_text": None,
         },
     ]
     assert [item["key"] for item in result["days"][-1]["models"]] == [
@@ -186,3 +196,29 @@ def test_gui_token_statistics_lifetime_without_records_covers_today_only():
     }
     assert len(result["days"]) == 1
     assert result["days"][0]["total"] == 0
+
+def test_gui_token_statistics_sums_cost_and_marks_unpriced():
+    """有价的行累加金额，无价的行只计 unpriced；两者不混。"""
+    bridge = object.__new__(gui_bridge.ApiBridge)
+    bridge._memory = MemoryManager(":memory:")
+    today = _local_noon(date.today())
+    bridge._memory.add_token_usage(
+        "openai", "m1", 100, 10, 0, 110, ts=today,
+        cost_micros=1500, cost_currency="CNY", price_source="config",
+    )
+    bridge._memory.add_token_usage(
+        "openai", "m1", 200, 20, 0, 220, ts=today,
+        cost_micros=2500, cost_currency="CNY", price_source="config",
+    )
+    bridge._memory.add_token_usage("openai", "m1", 300, 30, 0, 330, ts=today)
+
+    result = bridge.get_token_usage_statistics(1)
+
+    summary = result["summary"]
+    assert summary["cost_micros"] == 4000
+    assert summary["unpriced"] == 1
+    assert summary["cost_text"] == "¥0.0040"
+    # 日明细的模型行同样带成本
+    day_model = result["days"][0]["models"][0]
+    assert day_model["cost_micros"] == 4000
+    assert day_model["unpriced"] == 1
