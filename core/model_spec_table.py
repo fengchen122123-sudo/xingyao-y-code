@@ -91,3 +91,19 @@ def lookup_model_spec(model_id) -> tuple:
         return None, None
     context_window, max_tokens = spec
     return context_window or None, max_tokens or None
+
+
+# ---------------------------------------------------------------------------
+# 内置价格表（S1 成本账本）。
+#
+# 结构：模型叶子名（小写）-> {currency, tiers, source, verified_at}
+#   tiers 每档：{input, output, cache_read, cache_write, up_to_input_tokens}
+#   单位统一「微元/百万 token」：1 元/百万 token 记为 1_000_000。
+#
+# 收录原则（与 MODEL_SPECS 一致）：只收录能给出官方出处的模型，每条必须写
+# source 与 verified_at；未收录一律返回 None（未计价），绝不按同系列推测。
+#
+# 当前故意留空：仓库内的模型名多为渠道挂载名，官方价格需人工核对后填写。
+# 用户可在 config.json 的模型条目里用 price 块覆盖（优先于本表）。
+# ---------------------------------------------------------------------------
+MODEL_PRICES = {}

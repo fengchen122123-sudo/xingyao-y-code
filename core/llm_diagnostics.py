@@ -715,6 +715,66 @@ def clear_cache_usage_session(session_name):
         logger.debug("预压缩冷却清理失败（已忽略）", exc_info=True)
 
 
+def _resolve_model_price(model_name):
+    """按「模型配置 → 内置价格表」取价；取不到返回 None（未计价）。
+
+    配置价来自 models 条目里可选的 price 块（见 core/model_manager.get_active_model）。
+    任何异常都降级为 None：记账不能因为查价失败而中断主流程。
+    """
+    try:
+        from core.cost_model import resolve_price
+
+        config_price = None
+        try:
+            from core.model_manager import get_active_model
+
+            info = get_active_model()
+            if info and str(info.get("litellm_model") or "") == str(model_name or ""):
+                config_price = info.get("price")
+        except Exception:
+            config_price = None
+        return resolve_price(str(model_name or ""), config_price)
+    except Exception:
+        return None
+
+
+def compute_cost_fields(model_name, prompt_tokens, completion_tokens,
+                        cached_tokens, cache_write_tokens=None):
+    """算出可落库的成本字段；无价时返回空字典（不写 NULL 键，保持旧契约）。
+
+    prompt_tokens 语义上包含缓存命中与缓存写入部分，计费前先扣减，
+    避免同一批 token 既按 input 价又按 cache 价重复计费。
+    """
+    price = _resolve_model_price(model_name)
+    if price is None:
+        return {}
+    try:
+        from core.cost_model import compute_cost
+
+        prompt = max(0, int(prompt_tokens or 0))
+        cached = max(0, int(cached_tokens or 0))
+        cache_write = max(0, int(cache_write_tokens or 0))
+        input_tokens = max(0, prompt - cached - cache_write)
+        cost = compute_cost(
+            None,
+            price,
+            input_tokens=input_tokens,
+            output_tokens=max(0, int(completion_tokens or 0)),
+            cache_read_tokens=cached,
+            cache_write_tokens=cache_write,
+        )
+        if cost is None:
+            return {}
+        return {
+            "cost_micros": cost.total_micros,
+            "cost_currency": cost.currency,
+            "price_source": price.source or "config",
+        }
+    except Exception:
+        logger.debug("成本计算失败（已忽略）", exc_info=True)
+        return {}
+
+
 def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
                          cached_tokens, total_tokens, session_id=None,
                          api_base="", cache_scope="legacy",
@@ -745,6 +805,10 @@ def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
             api_base=api_base,
             cache_scope=cache_scope,
             cache_write_tokens=cache_write_tokens,
+            **compute_cost_fields(
+                model_name, prompt_tokens, completion_tokens,
+                cached_tokens, cache_write_tokens,
+            ),
         )
     except Exception as _persist_err:
         try:

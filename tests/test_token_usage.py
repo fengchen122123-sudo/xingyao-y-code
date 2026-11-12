@@ -126,6 +126,9 @@ def test_query_token_usage_by_day_and_model_keeps_days_and_models_separate():
             "cache_prompt": 100,
             "total": 330,
             "requests": 2,
+            "cost_micros": None,
+            "unpriced": 2,
+            "cost_currency": "",
         },
         {
             "date": "2026-08-09",
@@ -137,6 +140,9 @@ def test_query_token_usage_by_day_and_model_keeps_days_and_models_separate():
             "cache_prompt": 300,
             "total": 330,
             "requests": 1,
+            "cost_micros": None,
+            "unpriced": 1,
+            "cost_currency": "",
         },
     ]
 

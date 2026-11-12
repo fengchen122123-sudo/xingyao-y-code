@@ -469,6 +469,171 @@ def cmd_map(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----------------------------------------------------------------- closure
+
+# 默认入口：启动链路 + 主循环 + LLM 调用 + GUI。新增入口请显式传 --entries。
+DEFAULT_ENTRIES = (
+    "core.agent_service",
+    "core.llm",
+    "core.tools",
+    "core.memory",
+)
+
+
+def compute_closure_metrics(
+    root: Path, *, prefix: str | None = None, entries: tuple[str, ...] | list[str] = DEFAULT_ENTRIES
+) -> tuple[dict[str, dict[str, int]], list[str]]:
+    """计算每个入口的传递依赖闭包：模块数 / 行数 / 最大深度。
+
+    复用 deps 子命令的同一套 ast 解析（collect_dependencies），保证口径一致。
+    只统计 root 包内部模块；stdlib 与第三方不计入。
+    返回（入口→指标, 入口不存在列表）。
+    """
+    name = root.name if prefix is None else prefix
+    modules = {_module_name(root, name, path): path for path in iter_python_files(root)}
+    lines = {module: count_lines(path) for module, path in modules.items()}
+    graph, _failures = collect_dependencies(root, prefix=name)
+
+    metrics: dict[str, dict[str, int]] = {}
+    missing: list[str] = []
+    for entry in entries:
+        if entry not in graph:
+            missing.append(entry)
+            continue
+        seen: set[str] = set()
+        depth = {entry: 0}
+        queue = [entry]
+        while queue:
+            current = queue.pop(0)
+            for dep in graph.get(current, ()):  # 仅包内边
+                if dep in seen or dep == entry:
+                    continue
+                seen.add(dep)
+                depth[dep] = depth.get(current, 0) + 1
+                queue.append(dep)
+        metrics[entry] = {
+            "module_count": len(seen) + 1,
+            "total_lines": sum(lines.get(module, 0) for module in seen | {entry}),
+            "max_depth": max(depth.values()) if depth else 0,
+        }
+    return dict(sorted(metrics.items())), sorted(missing)
+
+
+def load_closure_baseline(path: Path) -> dict[str, dict[str, int]]:
+    """读取基线 JSON 的 closures 节；缺失/损坏返回 {}（按首次登记处理）。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    closures = data.get("closures") if isinstance(data, dict) else None
+    if not isinstance(closures, dict):
+        return {}
+    result: dict[str, dict[str, int]] = {}
+    for entry, value in closures.items():
+        if not isinstance(entry, str) or not isinstance(value, dict):
+            continue
+        cleaned = {
+            key: value[key]
+            for key in ("module_count", "total_lines", "max_depth")
+            if isinstance(value.get(key), int)
+        }
+        if {"module_count", "total_lines"} <= cleaned.keys():
+            result[entry] = cleaned
+    return dict(sorted(result.items()))
+
+
+def find_closure_alerts(
+    current: dict[str, dict[str, int]], baseline: dict[str, dict[str, int]]
+) -> list[tuple[str, str, int, int]]:
+    """返回 (entry, metric, current, baseline) 告警列表。
+
+    判定用整数比较 current*10 > baseline*11（与行数基线同款，避免浮点误差）；
+    首次出现的入口不告警（与 scan 的「首次全量登记」语义一致）。
+    """
+    alerts: list[tuple[str, str, int, int]] = []
+    for entry, values in current.items():
+        base = baseline.get(entry)
+        if not base:
+            continue
+        for metric in ("total_lines", "module_count"):
+            cur = int(values.get(metric, 0))
+            old = int(base.get(metric, 0))
+            if old > 0 and cur * 10 > old * 11:
+                alerts.append((entry, metric, cur, old))
+    return alerts
+
+
+def save_closure_baseline(path: Path, closures: dict[str, dict[str, int]]) -> None:
+    """把 closures 合并写回基线 JSON，保留既有 files 等字段（确定性输出）。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data["schema"] = BASELINE_SCHEMA
+    data["closure_growth_alert_ratio"] = GROWTH_ALERT_RATIO
+    data["closures"] = dict(sorted(closures.items()))
+    text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def cmd_closure(args: argparse.Namespace) -> int:
+    root = _resolve(args.root)
+    baseline_path = _resolve(args.baseline)
+    if not root.is_dir():
+        print(f"错误：根目录不存在：{root}")
+        return 2
+    entries = tuple(args.entries) if args.entries else DEFAULT_ENTRIES
+    current, missing = compute_closure_metrics(root, entries=entries)
+    baseline = load_closure_baseline(baseline_path)
+    alerts = find_closure_alerts(current, baseline)
+
+    if args.json:
+        payload = {
+            "root": root.name,
+            "entries": current,
+            "missing_entries": missing,
+            "alerts": [
+                {"entry": e, "metric": m, "current": c, "baseline": b}
+                for e, m, c, b in alerts
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if alerts and args.check else 0
+
+    for entry, values in current.items():
+        print(
+            f"{entry}: {values['module_count']} 个模块 / {values['total_lines']} 行 / "
+            f"最大深度 {values['max_depth']}"
+        )
+    if missing:
+        print(f"注意：{len(missing)} 个入口不存在，已跳过：{', '.join(missing)}")
+    for entry, metric, cur, old in alerts:
+        label = "行数" if metric == "total_lines" else "模块数"
+        print(
+            f"[告警] {entry} 闭包{label}超基线 +{int((GROWTH_ALERT_RATIO - 1) * 100)}%："
+            f"{cur} > 基线 {old}"
+        )
+
+    if args.check:
+        print(f"--check 模式：未写入基线；告警 {len(alerts)} 条。")
+        return 1 if alerts else 0
+
+    # 存量只登记不前移：与 scan 的基线语义一致
+    merged = {
+        entry: baseline.get(entry, values) for entry, values in current.items()
+    }
+    for entry, values in baseline.items():
+        if entry not in merged:
+            merged[entry] = values
+    save_closure_baseline(baseline_path, merged)
+    added = sum(1 for entry in current if entry not in baseline)
+    print(f"基线已写入 {baseline_path}（登记 {len(merged)} 个入口，其中新登记 {added} 个）。")
+    return 1 if alerts else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="architecture_report",
@@ -491,6 +656,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_map.add_argument("--root", default=DEFAULT_ROOT, help="扫描根目录（相对仓库根，默认 core）")
     p_map.add_argument("--output", default=DEFAULT_MAP_PATH, help="输出 Markdown 路径")
     p_map.set_defaults(func=cmd_map)
+
+    p_closure = sub.add_parser("closure", help="入口传递依赖闭包：模块数 / 行数 / 深度")
+    p_closure.add_argument("--root", default=DEFAULT_ROOT, help="扫描根目录（相对仓库根，默认 core）")
+    p_closure.add_argument("--baseline", default=DEFAULT_BASELINE_PATH, help="基线 JSON 路径")
+    p_closure.add_argument(
+        "--entries", nargs="*", default=None,
+        help="入口模块名列表（默认 core.agent_service / core.llm / core.tools / core.memory）",
+    )
+    p_closure.add_argument("--check", action="store_true", help="只检查不写入；超基线返回退出码 1")
+    p_closure.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    p_closure.set_defaults(func=cmd_closure)
     return parser
 
 
