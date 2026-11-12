@@ -20,6 +20,16 @@
       "max_depth": 7,
       "module_count": 177,
       "total_lines": 92927
+    },
+    "gui_main": {
+      "max_depth": 6,
+      "module_count": 252,
+      "total_lines": 142042
+    },
+    "main": {
+      "max_depth": 6,
+      "module_count": 216,
+      "total_lines": 112437
     }
   },
   "files": {
