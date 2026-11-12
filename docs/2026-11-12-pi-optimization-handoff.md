@@ -144,3 +144,28 @@ tests/test_architecture_closure.py     新增
 tests/test_token_usage.py
 tests/test_gui_token_statistics.py
 ```
+
+## 七、第二批改动（2026-11-12 下午补记）
+
+### 已完成
+
+| 文件 | 变更 |
+|---|---|
+| `main.py` | CLI `/usage` 表格新增「费用」列（`_format_usage_cost` + `_render_usage_section`），无价显示 `—`、部分未计价加 `*` 并在表下提示条数；状态栏追加累计费用片段（`_compose_status_cost_segment`） |
+| `core/llm_diagnostics.py` | `session_token_usage` 新增 `cumulative_cost_micros` / `cumulative_cost_currency` / `cumulative_cost_unpriced`，记账时累加；**跨币种先归零再累加**，不混算 |
+| `gui_bridge.py` | `get_token_usage` 暴露 `cost_micros` / `cost_currency` / `cost_unpriced`（取自已持锁的快照） |
+| `scripts/architecture_report.py` | `closure` 默认 `--root` 从 `core` 改为仓库根 `.`，支持 `main` / `gui_main` 入口；`plugins.*` 进入依赖图；新增 `CLOSURE_EXCLUDED_DIRS` 排除 venv/node_modules 等 |
+
+验证：`pytest tests/test_cost_model.py tests/test_token_usage.py tests/test_session_cost_accumulation.py tests/test_gui_token_statistics.py tests/test_architecture_closure.py tests/test_config_key_validation.py -q` → **119 passed**。
+
+### 未完成（如实记录）
+
+1. **前端用量面板费用列**：未做。`frontend/` 里没有任何 `cost_text` 引用。方案已定：`tokenStatistics.ts` 加 `formatCostCell(costText, unpriced)`；`TokenUsageSettings.vue` 的 model-list 加费用列；`pywebview.d.ts` 的 `TokenStatisticsMetrics` 补可选字段。**注意**：现有测试断言摘要条固定 5 格、`find('table')===false`，改动不能破坏它们。
+2. **S2 评测运行器**：`scripts/eval_run.py` 未落盘（曾因目录写锁连续失败）。统计层 `core/eval_stats.py` 已完成可用。落地只需：`load_cases` → `check_assertions`（file_exists / file_not_exists / file_contains / file_not_contains / tool_called）→ `core.eval_stats.group_runs` / `summarize` → 报告 md/json。
+3. **closure 基线未按新口径重算**：`docs/architecture_baseline.json` 的 `closures` 节仍是旧口径（core root，177 模块）。需跑一次：
+   `venv\Scripts\python.exe scripts\architecture_report.py closure`
+   注意 `--check` 在重算前可能因口径差异报增长（+1.13%，未超 10% 阈值，实际不会告警）。
+
+### 关于计划状态的说明
+
+本轮执行中出现过计划项被标记 `completed` 但实际未落盘的情况（P3 前端、P5 运行器）。以上「未完成」清单以**磁盘实际状态**为准，不以计划状态为准。
