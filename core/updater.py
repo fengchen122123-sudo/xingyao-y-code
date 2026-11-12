@@ -645,14 +645,17 @@ class UpdateDownloader:
                         part_frac = part_done / part_size if part_size > 0 else 0
                         percent = int(min(99, ((part_index - 1 + part_frac) / len(urls)) * 100))
                     else:
+                        # 分母是元数据/首片长度估出来的，实际字节可能略多
+                        # （重定向后响应头与实际不符等），这里兜到 100 以内，
+                        # 进度条绝不显示超过 100%
                         percent = (
-                            int(downloaded_total * 100 / grand_total)
+                            min(100, int(downloaded_total * 100 / grand_total))
                             if grand_total > 0
                             else 0
                         )
                     if force:
                         percent = 100
-                    if now - last_emit_time >= 0.15 or percent != last_percent:
+                    if force or now - last_emit_time >= 0.15 or percent != last_percent:
                         last_emit_time = now
                         last_percent = percent
                         on_progress(
@@ -690,6 +693,10 @@ class UpdateDownloader:
                         os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
                     )
                     last_reason = ""
+                    # 本片开始前已累计的字节数：重试时临时文件要截断回片起点，
+                    # 进度分子必须同步回滚到这里，否则上一轮失败前读到的字节会
+                    # 被重复计入，进度突破 100%（用户反馈过 76.7MB / 65.9MB = 116%）
+                    base_downloaded = downloaded_total
                     for attempt in range(len(RETRY_DELAYS) + 1):
                         if self._cancel_event.is_set():
                             _cleanup_tmp()
@@ -708,6 +715,8 @@ class UpdateDownloader:
                                     f.truncate(start_offset)
                             except OSError:
                                 pass
+                            # 文件回退了，进度分子必须同步回退，否则重复计数
+                            downloaded_total = base_downloaded
                         req = urllib.request.Request(
                             url, headers={"User-Agent": HTTP_USER_AGENT},
                         )

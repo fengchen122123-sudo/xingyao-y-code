@@ -957,6 +957,98 @@ def test_split_download_reports_part_progress():
         os.remove(dest)
 
 
+class _FlakyPartResp:
+    """模拟下到一半连接被重置的响应：读到 fail_after 字节后抛 URLError。
+
+    用于覆盖「断连 → 自动重试」路径上的进度计数：重试前临时文件被截断回
+    片起点，进度分子（downloaded_total）必须同步回滚，否则失败那一轮读到的
+    字节会被二次计入，进度突破 100%。
+    """
+
+    def __init__(self, payload: bytes, fail_after: int):
+        self.headers = {
+            "Content-Length": str(len(payload)),
+            "Content-Type": "application/octet-stream",
+        }
+        self._payload = payload
+        self._pos = 0
+        self._fail_after = fail_after
+
+    def read(self, n):
+        if self._pos >= self._fail_after:
+            raise urllib.error.URLError("connection reset by peer")
+        end = min(len(self._payload), self._pos + n)
+        chunk = self._payload[self._pos : end]
+        self._pos = end
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_retry_progress_never_exceeds_total():
+    """断连重试后进度必须回滚：percent 不得突破 100%，累计字节不得重复计数。
+
+    回归用例（用户实测 76.7 MB / 65.9 MB = 116%）：首轮下到一半连接被重置，
+    重试时临时文件已截断回片起点，但 downloaded_total 没有一起回退，导致
+    失败那一轮读到的字节在进度里被算了两次。安装包本身拼接是对的，只是
+    展示错——这个用例把「展示」也钉住。
+    """
+    from core.updater import UpdateDownloader
+    import threading
+
+    payload = b"R" * (3 * 1024 * 1024)  # 3MB，需 > 1MB 才不被当异常片
+    responses = [
+        _FlakyPartResp(payload, fail_after=1024 * 1024),  # 首轮 1MB 后断连
+        _FakePartResp(payload),                          # 重试成功
+    ]
+    progress_events = []
+    done = threading.Event()
+    result = {}
+
+    downloader = UpdateDownloader()
+    with patch("core.updater.RETRY_DELAYS", (0,)), patch(
+        "urllib.request.urlopen", side_effect=lambda req, timeout=None: responses.pop(0)
+    ):
+        started = downloader.start_download(
+            download_url="https://gitee.com/fake/x.exe",
+            target_version="8.8.8",
+            on_progress=lambda d: progress_events.append(dict(d)),
+            on_complete=lambda p: (result.update(ok=p), done.set()),
+            on_error=lambda m: (result.update(err=m), done.set()),
+            total_size_hint=len(payload),
+        )
+        assert started is True
+        assert done.wait(timeout=15)
+
+    dest = os.path.join(get_update_cache_dir(), "Y-CODE-Setup-v8.8.8.exe")
+    try:
+        assert "err" not in result, result
+        assert progress_events
+        # 关键断言：任何时刻都不允许出现 >100% 的进度
+        assert all(0 <= e["percent"] <= 100 for e in progress_events), [
+            e["percent"] for e in progress_events if e["percent"] > 100
+        ]
+        # 累计字节任何时刻都不能超过真实总量（重复计数的直接证据）
+        assert all(e["downloaded"] <= len(payload) for e in progress_events), [
+            e["downloaded"] for e in progress_events if e["downloaded"] > len(payload)
+        ]
+        last = progress_events[-1]
+        assert last["percent"] == 100
+        # 累计字节必须等于真实总量，不能把失败那轮重复计入
+        assert last["downloaded"] == len(payload)
+        # 产物本身必须完整（回滚只影响计数，不能影响落盘内容）
+        with open(result["ok"], "rb") as f:
+            assert f.read() == payload
+    finally:
+        for p in (dest, dest + ".downloading"):
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def test_single_part_url_falls_back_to_direct_download():
     """单片『分卷』没有拼接意义，自动降级为单文件直连下载。"""
     from core.updater import UpdateDownloader
