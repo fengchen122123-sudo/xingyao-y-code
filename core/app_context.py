@@ -11,7 +11,7 @@ core/llm.py 及其他核心模块通过此模块统一访问运行时状态，
 from __future__ import annotations
 import contextlib
 import threading
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import Any, Callable, Optional
 
 _context: Optional[Any] = None  # 当前注册的上下文实例
 

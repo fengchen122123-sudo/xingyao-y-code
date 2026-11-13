@@ -6,7 +6,6 @@
 core.plugin_loader 模块属性。
 """
 
-import pytest
 
 import core.plugin_loader as plugin_loader
 from gui_bridge import ApiBridge

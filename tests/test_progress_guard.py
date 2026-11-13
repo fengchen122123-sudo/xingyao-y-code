@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """TurnProgressGuard 纯单元测试：确定性进展观察与停滞熔断。"""
-import pytest
 
 from core.harness.progress_guard import ProgressObservation, TurnProgressGuard
 

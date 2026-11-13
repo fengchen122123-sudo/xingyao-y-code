@@ -2,7 +2,6 @@
 
 import json
 
-import pytest
 
 from core.feishu.bridge import FeishuBindingStore, FeishuBridge
 from core.feishu.cards import action_label, target_lines

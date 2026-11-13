@@ -18,7 +18,6 @@
 import threading
 import types
 
-import pytest
 
 import config
 import core.agent_service as agent_service

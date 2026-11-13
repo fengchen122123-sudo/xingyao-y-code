@@ -6,7 +6,7 @@
 import json
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 

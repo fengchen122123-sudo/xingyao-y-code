@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import threading
-import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import httpx

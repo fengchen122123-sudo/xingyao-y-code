@@ -17,7 +17,7 @@ import json
 import os
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from core.git.models import RepositoryIdentity, redact_text
 from core.git.repository import normalize_repo_path

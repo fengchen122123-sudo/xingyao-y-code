@@ -1,5 +1,4 @@
 """ResumePlanner（断点续跑 S2）单测：纯只读规划层，不写库、不发请求。"""
-import pytest
 
 from core.harness.journal import HarnessJournal
 from core.harness.models import HarnessEventKind, JournalEventDraft

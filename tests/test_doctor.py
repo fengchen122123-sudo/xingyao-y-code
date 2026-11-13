@@ -17,7 +17,6 @@ import json
 import sqlite3
 import sys
 
-import pytest
 
 import config
 import core.doctor as doctor

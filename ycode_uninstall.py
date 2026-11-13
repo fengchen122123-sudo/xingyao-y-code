@@ -20,7 +20,6 @@ import os
 import sys
 import shutil
 import subprocess
-import time
 import ctypes
 import winreg
 

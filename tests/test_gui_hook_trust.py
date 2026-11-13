@@ -6,7 +6,6 @@ __init__，只设置测试所需属性；桥接方法内部为局部导入
 需 patch 对应模块属性。全部用例打桩 core 层，不触碰真实 ~/.ycode。
 """
 
-import os
 import pathlib
 
 import pytest

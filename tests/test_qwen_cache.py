@@ -2,7 +2,6 @@
 
 import time
 
-import pytest
 from copy import deepcopy
 
 from core.llm import (

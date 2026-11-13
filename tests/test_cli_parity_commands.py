@@ -7,7 +7,6 @@ Batch B/C（/computer browser、/queue、/paste-image、/update、/changes）
 
 import os
 
-import pytest
 
 import main
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from core.git.models import GitError, GitErrorCode, RepositoryIdentity
 from core.git.runner import GitRunner

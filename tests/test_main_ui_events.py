@@ -1,6 +1,5 @@
 from concurrent.futures import Future
 
-import hashlib
 
 import pytest
 

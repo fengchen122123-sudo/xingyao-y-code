@@ -13,7 +13,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 _LOCK = threading.RLock()

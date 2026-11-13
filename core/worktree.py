@@ -14,7 +14,6 @@
 - 不绑定 session（避免引入复杂的状态管理）
 """
 
-import os
 from pathlib import Path
 
 from core.git.query_refs import parse_worktree_porcelain

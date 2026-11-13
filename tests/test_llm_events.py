@@ -1873,7 +1873,6 @@ def test_no_progress_abort_works_without_harness_runtime(mocker):
 
 
 def test_step_progress_observation_ignores_call_ids_and_plan_placeholder():
-    import hashlib
 
     from core.llm import _step_progress_observation
 

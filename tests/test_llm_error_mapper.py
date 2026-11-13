@@ -1,6 +1,5 @@
 """测试大模型上游报错中文映射与排查建议引擎。"""
 
-import pytest
 
 from core.llm_error_mapper import (
     format_user_facing_error,

@@ -3,7 +3,6 @@
 验证 SSE 解析、流块归一化、硬中断关闭、Token 快速估算与方言策略映射。
 """
 
-import io
 import json
 import pytest
 

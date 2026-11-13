@@ -4,7 +4,6 @@ core/model_selector.py
 预置厂商、模型元数据与 GUI 共用 core.model_catalog，只需输入 API Key。
 """
 import io
-import uuid
 import threading
 import contextlib
 from prompt_toolkit import Application

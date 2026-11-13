@@ -22,7 +22,6 @@ import json
 import os
 import shlex
 import subprocess
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 

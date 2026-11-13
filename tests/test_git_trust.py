@@ -3,7 +3,6 @@
 import json
 import os
 
-import pytest
 
 from core.git import trust as trust_mod
 from core.git.repository import resolve_repository

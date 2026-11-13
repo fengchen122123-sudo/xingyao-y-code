@@ -1,7 +1,5 @@
 """AI 生成内容目录解析测试（规格：2026-09-20-ai-output-dir-design.md）。"""
 
-import os
-import stat
 from pathlib import Path
 
 import pytest

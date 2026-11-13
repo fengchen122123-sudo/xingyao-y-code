@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import fields as dataclass_fields, is_dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from core.git.bootstrap import get_git_monitor, get_git_service
 from core.git.models import GitError, GitErrorCode, GitSnapshot, SnapshotVersions

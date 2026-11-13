@@ -5,7 +5,6 @@ import logging
 import queue
 import random
 import re
-import subprocess
 import threading
 import time
 import uuid

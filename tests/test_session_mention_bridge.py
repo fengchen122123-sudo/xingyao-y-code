@@ -8,7 +8,6 @@
 4. 有 query 时排序：前缀命中 + 名字长度升序，同名兄弟不被挤出前 N 条。
 """
 import sys
-import types
 import unittest
 from pathlib import Path
 

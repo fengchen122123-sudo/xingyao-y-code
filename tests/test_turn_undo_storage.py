@@ -2,7 +2,6 @@
 
 import hashlib
 import time
-import os
 import threading
 
 import pytest

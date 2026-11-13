@@ -6,7 +6,6 @@ wrapper 经 core.tool_registry 暴露给模型；这里直接调 wrapper 函数�
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest

@@ -2,7 +2,6 @@
 
 import threading
 
-import pytest
 
 from core.git.coordinator import (
     GitOperationCategory,

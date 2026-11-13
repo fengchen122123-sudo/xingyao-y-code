@@ -1,7 +1,6 @@
 """tests/test_media_server.py —— 受控媒体 HTTP 服务测试。"""
 
 import os
-import threading
 import urllib.error
 import urllib.request
 

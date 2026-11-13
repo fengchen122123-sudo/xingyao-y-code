@@ -2,7 +2,6 @@
 
 import json
 
-import pytest
 
 import config
 from core.feishu import config as feishu_config

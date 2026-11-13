@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional
 
 from core.git import mutation, patch as git_patch, query, query_refs
 from core.git.coordinator import (

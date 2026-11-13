@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 
-import pytest
 
 from core.workflows.executor import PlanExecutor, StepFailure
 

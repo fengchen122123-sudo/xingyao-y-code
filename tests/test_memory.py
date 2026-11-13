@@ -1,5 +1,3 @@
-import pytest
-import sqlite3
 import time
 from core.memory import MemoryManager, SessionManager
 

@@ -3,7 +3,6 @@
 import json
 import time
 
-import pytest
 
 from core.feishu.bridge import FeishuBindingStore, FeishuBridge
 from core.feishu.config import FeishuConfig
