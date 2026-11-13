@@ -975,16 +975,11 @@ export interface TokenStatisticsMetrics {
   completion: number;
   cached: number;
   cache_prompt: number;
-total: number;
-    requests: number;
-    cache_hit_rate: number | null;
-    // 成本账本（后端已返回）：cost_text 为 "¥0.0123" 形态，未计价为 null；
-    // unpriced 是该组未计价条数
-    cost_micros?: number;
-    cost_currency?: string;
-    cost_text?: string | null;
-    unpriced?: number;
-  }
+  total: number;
+  requests: number;
+  cache_hit_rate: number | null;
+}
+
 export interface TokenStatisticsModel extends TokenStatisticsMetrics {
   key: string;
   provider: string;

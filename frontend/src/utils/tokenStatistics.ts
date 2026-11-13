@@ -604,14 +604,3 @@ export function formatTokenCount(value: number): string {
   if (Math.abs(amount) >= 1_000) return format(amount / 1_000, 'K');
   return Math.round(amount).toLocaleString('zh-CN');
 }
-// 成本账本：后端返回的 cost_text 为 "¥0.0123" 形态，未计价为 null。
-// unpriced > 0 时加 * 提示「本组含未计价记录」，避免与真 0 元混淆。
-export const COST_UNPRICED_TEXT = "—";
-
-export function formatCostCell(
-  costText: string | null | undefined,
-  unpriced = 0,
-): string {
-  const text = typeof costText === "string" && costText.trim() ? costText.trim() : COST_UNPRICED_TEXT;
-  return Number(unpriced) > 0 ? `${text}*` : text;
-}

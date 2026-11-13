@@ -1,1 +1,0 @@
-{"id":"bom","prompt":"把标题改掉，保留文件既有格式","fixture":"fixtures/bom","assertions":[{"type":"file_exists","path":"doc.md"},{"type":"file_contains","path":"doc.md","value":"标题"}],"timeout_seconds":60,"max_cost_micros":0}

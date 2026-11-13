@@ -19,12 +19,6 @@ session_token_usage = {
     "cumulative_completion": 0,
     "cumulative_cached": 0,
     "cumulative_cache_prompt": 0,
-    # 会话级累计费用：micros 是「微元」整数（1 元 = 1_000_000 微元），
-    # 全程整数累加避免浮点误差；未计价的轮次单独计数，不当作 0 元——
-    # 「没配价」与「花了 0 元」必须可区分（铁律：未报告 ≠ 0）。
-    "cumulative_cost_micros": 0,
-    "cumulative_cost_currency": "",
-    "cumulative_cost_unpriced": 0,
 
     # 窗口占用（用来防止爆 128k 上下文）
     "latest_total": 0,
@@ -491,16 +485,6 @@ def get_token_usage_snapshot(
             "cumulative_cache_prompt": int(
                 session_token_usage.get("cumulative_cache_prompt", 0) or 0
             ),
-            # 会话级累计费用（与 session_token_usage 同名同义）：micros 是微元整数，
-            # 未计价的轮次只计数不按 0 元入账；跨币种不求和，currency 为空串表示
-            # 尚无任何已计价轮次（未报告 ≠ 0）。
-            "cost_micros": int(session_token_usage.get("cumulative_cost_micros", 0) or 0),
-            "cost_currency": str(
-                session_token_usage.get("cumulative_cost_currency", "") or ""
-            ),
-            "cost_unpriced": int(
-                session_token_usage.get("cumulative_cost_unpriced", 0) or 0
-            ),
         }
         cache = _cache_usage_view(state)
         current_scope = str(cache_scope or "main")
@@ -731,66 +715,6 @@ def clear_cache_usage_session(session_name):
         logger.debug("预压缩冷却清理失败（已忽略）", exc_info=True)
 
 
-def _resolve_model_price(model_name):
-    """按「模型配置 → 内置价格表」取价；取不到返回 None（未计价）。
-
-    配置价来自 models 条目里可选的 price 块（见 core/model_manager.get_active_model）。
-    任何异常都降级为 None：记账不能因为查价失败而中断主流程。
-    """
-    try:
-        from core.cost_model import resolve_price
-
-        config_price = None
-        try:
-            from core.model_manager import get_active_model
-
-            info = get_active_model()
-            if info and str(info.get("litellm_model") or "") == str(model_name or ""):
-                config_price = info.get("price")
-        except Exception:
-            config_price = None
-        return resolve_price(str(model_name or ""), config_price)
-    except Exception:
-        return None
-
-
-def compute_cost_fields(model_name, prompt_tokens, completion_tokens,
-                        cached_tokens, cache_write_tokens=None):
-    """算出可落库的成本字段；无价时返回空字典（不写 NULL 键，保持旧契约）。
-
-    prompt_tokens 语义上包含缓存命中与缓存写入部分，计费前先扣减，
-    避免同一批 token 既按 input 价又按 cache 价重复计费。
-    """
-    price = _resolve_model_price(model_name)
-    if price is None:
-        return {}
-    try:
-        from core.cost_model import compute_cost
-
-        prompt = max(0, int(prompt_tokens or 0))
-        cached = max(0, int(cached_tokens or 0))
-        cache_write = max(0, int(cache_write_tokens or 0))
-        input_tokens = max(0, prompt - cached - cache_write)
-        cost = compute_cost(
-            None,
-            price,
-            input_tokens=input_tokens,
-            output_tokens=max(0, int(completion_tokens or 0)),
-            cache_read_tokens=cached,
-            cache_write_tokens=cache_write,
-        )
-        if cost is None:
-            return {}
-        return {
-            "cost_micros": cost.total_micros,
-            "cost_currency": cost.currency,
-            "price_source": price.source or "config",
-        }
-    except Exception:
-        logger.debug("成本计算失败（已忽略）", exc_info=True)
-        return {}
-
-
 def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
                          cached_tokens, total_tokens, session_id=None,
                          api_base="", cache_scope="legacy",
@@ -821,10 +745,6 @@ def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
             api_base=api_base,
             cache_scope=cache_scope,
             cache_write_tokens=cache_write_tokens,
-            **compute_cost_fields(
-                model_name, prompt_tokens, completion_tokens,
-                cached_tokens, cache_write_tokens,
-            ),
         )
     except Exception as _persist_err:
         try:
@@ -1088,16 +1008,6 @@ def _account_server_usage(
     cache_reported = record["cache_reported"]
     main_scope = str(cache_scope or "main") == "main"
 
-    # 缓存写入量在「成本累计」与「落库」两处都要用：只解析一次 usage。
-    cache_write_tokens = _extract_cache_write_tokens(usage)
-    # 成本字段在锁外算：_resolve_model_price 要读模型配置（可能取 model_manager
-    # 的锁），持 token_usage_lock 做外部 I/O 有锁序反转风险（与本模块顶部的
-    # 监听器同款理由）。锁内只做三行整数累加。
-    cost_fields = compute_cost_fields(
-        model_name, prompt_tokens, completion_tokens,
-        cached_tokens, cache_write_tokens,
-    )
-
     with token_usage_lock:
         session_token_usage["cumulative_total"] += total_tokens
         session_token_usage["cumulative_prompt"] += prompt_tokens
@@ -1105,24 +1015,6 @@ def _account_server_usage(
         if cache_reported:
             session_token_usage["cumulative_cached"] += cached_tokens
             session_token_usage["cumulative_cache_prompt"] += prompt_tokens
-        # 会话级累计成本：micros 全程整数累加；无价（空字典）只递增 unpriced，
-        # 绝不按 0 元入账——「没配价」与「花了 0 元」必须可区分。
-        if cost_fields:
-            cost_currency = cost_fields["cost_currency"]
-            # 币种切换规则：跨币种绝不求和。切到新币种时先把 micros 归零再
-            # 累加，currency 随后更新——累计金额永远只反映「当前币种口径」，
-            # 混算的金额没有意义，历史其它币种的花费由落库明细追溯。
-            if (
-                session_token_usage["cumulative_cost_currency"]
-                and session_token_usage["cumulative_cost_currency"] != cost_currency
-            ):
-                session_token_usage["cumulative_cost_micros"] = 0
-            session_token_usage["cumulative_cost_micros"] += int(
-                cost_fields["cost_micros"]
-            )
-            session_token_usage["cumulative_cost_currency"] = cost_currency
-        else:
-            session_token_usage["cumulative_cost_unpriced"] += 1
         if main_scope:
             session_token_usage["latest_total"] = total_tokens
             session_token_usage["latest_prompt"] = prompt_tokens
@@ -1169,7 +1061,7 @@ def _account_server_usage(
     }
     # 未报告写入量时不带该键：调用方（含测试替身）对 kwargs 做精确断言，
     # 恒定多一个 None 键同样会改变既有契约。未报告 → 落库 NULL，语义不变。
-    # cache_write_tokens 已在上面为成本累计解析过一次，这里直接复用。
+    cache_write_tokens = _extract_cache_write_tokens(usage)
     if cache_write_tokens is not None:
         persist_kwargs["cache_write_tokens"] = cache_write_tokens
     persist(model_name, **persist_kwargs)

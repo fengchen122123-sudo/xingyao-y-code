@@ -970,9 +970,6 @@ class MemoryManager:
                         cached_tokens INTEGER,
                         cache_write_tokens INTEGER,
                         total_tokens INTEGER,
-                        cost_micros INTEGER,
-                        cost_currency TEXT,
-                        price_source TEXT,
                         session_id TEXT,
                         api_base TEXT NOT NULL DEFAULT '',
                         cache_scope TEXT NOT NULL DEFAULT 'legacy'
@@ -996,29 +993,6 @@ class MemoryManager:
                         cursor.execute(
                             "ALTER TABLE token_usage "
                             "ADD COLUMN cache_write_tokens INTEGER"
-                        )
-                    except Exception:
-                        pass
-                # 成本账本（S1）：三列可空。NULL 表示「未计价」，绝不与 0 元混淆。
-                # 币种单独存，跨币种聚合时由展示层分行，不混算。
-                if "cost_micros" not in token_usage_columns:
-                    try:
-                        cursor.execute(
-                            "ALTER TABLE token_usage ADD COLUMN cost_micros INTEGER"
-                        )
-                    except Exception:
-                        pass
-                if "cost_currency" not in token_usage_columns:
-                    try:
-                        cursor.execute(
-                            "ALTER TABLE token_usage ADD COLUMN cost_currency TEXT"
-                        )
-                    except Exception:
-                        pass
-                if "price_source" not in token_usage_columns:
-                    try:
-                        cursor.execute(
-                            "ALTER TABLE token_usage ADD COLUMN price_source TEXT"
                         )
                     except Exception:
                         pass
@@ -1490,13 +1464,8 @@ class MemoryManager:
     def add_token_usage(self, provider, model, prompt_tokens, completion_tokens,
                         cached_tokens, total_tokens, session_id=None, ts=None,
                         api_base="", cache_scope="legacy",
-                        cache_write_tokens=None, cost_micros=None,
-                        cost_currency=None, price_source=None):
-        """追加一条真实 token 用量记录（由 core/llm.py 流结束记账点调用）。
-
-        cost_* 三个参数缺省为 None（未计价），保持既有调用点零改动；
-        未计价落 NULL，绝不写 0——"未报告"与"真的不花钱"必须可区分。
-        """
+                        cache_write_tokens=None):
+        """追加一条真实 token 用量记录（由 core/llm.py 流结束记账点调用）。"""
         import time
         if ts is None:
             ts = int(time.time())
@@ -1507,8 +1476,8 @@ class MemoryManager:
                     "INSERT INTO token_usage "
                     "(ts, date, provider, model, prompt_tokens, completion_tokens, "
                     "cached_tokens, cache_write_tokens, total_tokens, session_id, "
-                    "api_base, cache_scope, cost_micros, cost_currency, price_source) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "api_base, cache_scope) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         int(ts), day, str(provider or ""), str(model or ""),
                         int(prompt_tokens or 0), int(completion_tokens or 0),
@@ -1522,9 +1491,6 @@ class MemoryManager:
                         str(session_id) if session_id is not None else None,
                         _canonicalize_api_base(api_base),
                         str(cache_scope or "legacy"),
-                        None if cost_micros is None else int(cost_micros),
-                        None if cost_currency is None else str(cost_currency),
-                        None if price_source is None else str(price_source),
                     ),
                 )
                 self.conn.commit()
@@ -1738,11 +1704,7 @@ class MemoryManager:
 
         返回按合计 token 降序排列的字典列表:
         [{"provider", "model", "prompt", "completion", "cached",
-          "cache_prompt", "total", "cost_micros", "unpriced",
-          "cost_currency"}, ...]
-
-        cost_micros 是微元整数合计（全部未计价时为 None），unpriced 是该组
-        未计价条数，cost_currency 是币种（全部未计价时为空串）。
+          "cache_prompt", "total"}, ...]
         """
         with self._lock:
             cursor = self.conn.execute(
@@ -1751,10 +1713,7 @@ class MemoryManager:
                        SUM(prompt_tokens), SUM(completion_tokens),
                        SUM(cached_tokens),
                        SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
-                       SUM(total_tokens),
-                       SUM(cost_micros),
-                       SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END),
-                       MAX(cost_currency)
+                       SUM(total_tokens)
                 FROM token_usage
                 WHERE date >= ? AND date <= ?
                 GROUP BY provider, model, api_base, cache_scope
@@ -1773,10 +1732,6 @@ class MemoryManager:
                     "cached": row[6] or 0,
                     "cache_prompt": row[7] or 0,
                     "total": row[8] or 0,
-                    # 成本账本：NULL 表示未计价，unpriced 是该行的未计价条数
-                    "cost_micros": row[9],
-                    "unpriced": row[10] or 0,
-                    "cost_currency": row[11] or "",
                 }
                 for row in cursor.fetchall()
             ]
@@ -1790,10 +1745,7 @@ class MemoryManager:
                        SUM(prompt_tokens), SUM(completion_tokens),
                        SUM(cached_tokens),
                        SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
-                       SUM(total_tokens), COUNT(*),
-                       SUM(cost_micros),
-                       SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END),
-                       MAX(cost_currency)
+                       SUM(total_tokens), COUNT(*)
                 FROM token_usage
                 WHERE date >= ? AND date <= ?
                 GROUP BY date, provider, model
@@ -1812,10 +1764,6 @@ class MemoryManager:
                     "cache_prompt": row[6] or 0,
                     "total": row[7] or 0,
                     "requests": row[8] or 0,
-                    # 成本账本：NULL 表示未计价，unpriced 是该行的未计价条数
-                    "cost_micros": row[9],
-                    "unpriced": row[10] or 0,
-                    "cost_currency": row[11] or "",
                 }
                 for row in cursor.fetchall()
             ]

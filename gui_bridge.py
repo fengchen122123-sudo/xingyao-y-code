@@ -1275,17 +1275,6 @@ class _SecretaryDispatchService:
                 )
             pending_workdir = ""
             display_name = self._display_name(session_name)
-            # 目标会话是秘书会话时提前拒绝（2026-11-12）：秘书会话受
-            # core.secretary.secretary_allows_tool 只读门控约束，派给它等于把
-            # 任务丢进一个没有 execute_command / write_file 的会话，目标回合只能
-            # 回"我没有命令执行和写文件工具"，用户看到的就是"派出去的活干不了"。
-            # 宁可在派发前给出可读原因和正确做法，也不让它静默跑成一个失败回合。
-            if self._is_secretary(session_name):
-                raise SecretaryDispatchError(
-                    f"「{display_name}」是秘书会话，只能检索 / 派活 / 跳转，"
-                    "本身不能执行命令或写文件；请把任务派给项目会话，"
-                    "或者不传 target 并给出 workdir 新建一个执行会话"
-                )
         if pending_permission and not is_new:
             # 已有会话：档位落在会话绑定上（等同用户在该会话里切换档位）
             try:
@@ -12251,29 +12240,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             )
 
             def empty_metrics() -> Dict[str, int]:
-                # 成本账本（S1）：与 CLI /usage 同口径——微元整数，
-                # 未计价单独计数（未计价 ≠ 0 元）
-                metrics = {name: 0 for name in metric_names}
-                metrics["cost_micros"] = 0
-                metrics["unpriced"] = 0
-                return metrics
+                return {name: 0 for name in metric_names}
 
             def add_metrics(target: Dict[str, Any], source: Dict[str, Any]) -> None:
                 for name in metric_names:
                     target[name] += int(source.get(name, 0) or 0)
-                unpriced_delta = int(source.get("unpriced", 0) or 0)
-                micros = source.get("cost_micros")
-                if micros is None:
-                    # 整行未计价：老数据没有 unpriced 字段时按该行请求数计
-                    target["unpriced"] = int(target.get("unpriced", 0) or 0) + (
-                        unpriced_delta or int(source.get("requests", 0) or 0)
-                    )
-                    return
-                target["cost_micros"] = int(target.get("cost_micros", 0) or 0) + int(micros)
-                target["unpriced"] = int(target.get("unpriced", 0) or 0) + unpriced_delta
-                currency = str(source.get("cost_currency") or "")
-                if currency:
-                    target.setdefault("cost_currency", currency)
 
             def with_rate(metrics: Dict[str, Any]) -> Dict[str, Any]:
                 result = dict(metrics)
@@ -12282,17 +12253,6 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     round(int(result.get("cached", 0) or 0) / cache_prompt * 100, 1)
                     if cache_prompt > 0 else None
                 )
-                # 无币种时给 None（未计价），前端据此不显示 ¥0
-                currency = str(result.get("cost_currency") or "")
-                if currency:
-                    from core.cost_model import CURRENCY_SYMBOLS
-
-                    symbol = CURRENCY_SYMBOLS.get(currency, currency + " ")
-                    result["cost_text"] = (
-                        f"{symbol}{int(result.get('cost_micros', 0) or 0) / 1_000_000:.4f}"
-                    )
-                else:
-                    result["cost_text"] = None
                 return result
 
             summary = empty_metrics()
@@ -12321,14 +12281,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
 
                 day_item = day_lookup[str(row.get("date") or "")]
                 add_metrics(day_item, row)
-                item = {
+                day_item["models"].append(with_rate({
                     "key": key,
                     "provider": provider,
                     "model": model,
-                    **empty_metrics(),
-                }
-                add_metrics(item, row)
-                day_item["models"].append(with_rate(item))
+                    **{name: int(row.get(name, 0) or 0) for name in metric_names},
+                }))
 
             models = [with_rate(item) for item in model_totals.values()]
             models.sort(key=lambda item: (-item["total"], item["key"]))
@@ -12411,12 +12369,6 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     process_usage.get("cumulative_completion", 0) or 0
                 ),
                 "total_cached": int(process_usage.get("cumulative_cached", 0) or 0),
-                # 会话级累计费用（微元整数 / 币种 / 未计价轮次）：直接取自
-                # get_token_usage_snapshot 的持锁快照，未计价与 0 元严格区分，
-                # 跨币种不求和（换币种即清零重计）。
-                "cost_micros": int(process_usage.get("cost_micros", 0) or 0),
-                "cost_currency": str(process_usage.get("cost_currency", "") or ""),
-                "cost_unpriced": int(process_usage.get("cost_unpriced", 0) or 0),
                 # 本会话口径（token_usage 落库聚合，重启不清零）：状态行默认
                 # 显示当前会话的输入/输出/命中；命中率分母用 cache_prompt
                 # （只含已报告缓存明细的轮次，未报告 ≠ 0）

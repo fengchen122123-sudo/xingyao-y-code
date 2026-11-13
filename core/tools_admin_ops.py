@@ -146,39 +146,16 @@ _USAGE_METRICS = ("prompt", "completion", "cached", "cache_prompt", "total", "re
 
 
 def _empty_metrics() -> dict[str, int]:
-    # 成本账本（S1）：cost_micros 为整数微元，unpriced 是未计价条数。
-    # 二者分开累计——未计价 ≠ 0 元，混在一起会让「省钱」与「没配价」看起来一样。
-    metrics = {name: 0 for name in _USAGE_METRICS}
-    metrics["cost_micros"] = 0
-    metrics["unpriced"] = 0
-    return metrics
+    return {name: 0 for name in _USAGE_METRICS}
 
 
 def _add_metrics(target: dict[str, Any], source: dict[str, Any]) -> None:
     for name in _USAGE_METRICS:
         target[name] += _as_int(source.get(name, 0), 0)
 
-    unpriced_delta = _as_int(source.get("unpriced", 0), 0)
-    micros = source.get("cost_micros")
-    if micros is None:
-        # 整行未计价：老数据没有 unpriced 字段时按该行请求数计
-        target["unpriced"] = target.get("unpriced", 0) + (
-            unpriced_delta or _as_int(source.get("requests", 0), 0)
-        )
-        return
-    target["cost_micros"] = target.get("cost_micros", 0) + _as_int(micros, 0)
-    target["unpriced"] = target.get("unpriced", 0) + unpriced_delta
-    currency = str(source.get("cost_currency") or "")
-    if currency:
-        target.setdefault("cost_currency", currency)
-
 
 def _with_cache_rate(metrics: dict[str, Any]) -> dict[str, Any]:
-    """补缓存命中率与成本展示。
-
-    命中率分母只统计已报告缓存明细的 prompt（与 GUI 口径一致）。
-    跨币种不求和：聚合层已按币种分开，这里只格式化。
-    """
+    """补缓存命中率：命中率分母只统计已报告缓存明细的 prompt（与 GUI 口径一致）。"""
     result = dict(metrics)
     cache_prompt = _as_int(result.get("cache_prompt", 0), 0)
     result["cache_hit_rate"] = (
@@ -186,20 +163,7 @@ def _with_cache_rate(metrics: dict[str, Any]) -> dict[str, Any]:
         if cache_prompt > 0
         else None
     )
-    result["cost_text"] = _format_cost(result)
     return result
-
-
-def _format_cost(metrics: dict[str, Any]) -> str | None:
-    """微元 → 人类可读金额；无币种时返回 None（未计价，不显示 ¥0）。"""
-    currency = str(metrics.get("cost_currency") or "")
-    if not currency:
-        return None
-    from core.cost_model import CURRENCY_SYMBOLS
-
-    micros = _as_int(metrics.get("cost_micros", 0), 0)
-    symbol = CURRENCY_SYMBOLS.get(currency, currency + " ")
-    return f"{symbol}{micros / 1_000_000:.4f}"
 
 
 @_guard
@@ -246,14 +210,16 @@ def usage_stats(days: int = 30) -> str:
             # 超出请求区间的脏数据不进日明细（SQL 已过滤，这里只是防御）
             continue
         _add_metrics(day_item, row)
-        item = {
-            "key": key,
-            "provider": provider,
-            "model": model,
-            **_empty_metrics(),
-        }
-        _add_metrics(item, row)
-        day_item["models"].append(_with_cache_rate(item))
+        day_item["models"].append(
+            _with_cache_rate(
+                {
+                    "key": key,
+                    "provider": provider,
+                    "model": model,
+                    **{name: _as_int(row.get(name, 0), 0) for name in _USAGE_METRICS},
+                }
+            )
+        )
 
     models = [_with_cache_rate(item) for item in model_totals.values()]
     models.sort(key=lambda item: (-item["total"], item["key"]))

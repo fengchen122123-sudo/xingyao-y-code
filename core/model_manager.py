@@ -238,8 +238,6 @@ def get_active_model(session_name: str | None = None) -> dict | None:
         "protocol":        provider.get("protocol", "openai"),
         "provider_name":   provider["name"],
         "id":              model["id"],
-        # 成本账本：模型级可选价格块（缺省 None → 回退内置价格表 → 未计价）
-        "price":           model.get("price"),
     }
 
 

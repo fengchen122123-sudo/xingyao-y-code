@@ -226,3 +226,18 @@ cost: formatCostCell(model?.cost_text, model?.unpriced ?? 0),
 - 价格数据：`MODEL_PRICES` 仍为空，界面会显示「—」。填入报价即可生效（config 的 `price` 块优先）。
 - 设计文档 4.6 第 7 条的「整轮 e2e 成本测试」未写（约 20 分钟）。
 - S2 运行器只支持 `--dry-run`；真实 provider 调用按其设计显式 NotImplementedError。
+
+
+## 十、范围变更：成本账本与配对评测已下线（2026-11-13）
+
+产品决策：本项目是免费开源 agent，模型与渠道由用户自行配置，**我们拿不到可信价格**，因此：
+
+- **成本账本（S1）整体下线**：删除 `core/cost_model.py`、成本三列迁移、CLI 费用列、状态栏金额、GUI/前端费用展示、`MODEL_PRICES`、config 的 `price` 键白名单。
+- **配对评测（S2）整体下线**：删除 `core/eval_stats.py`、`scripts/eval_run.py`、`evals/` 目录与相关测试。理由是「同一任务跑多次比对」会让开源用户实际多花 token，与定位冲突。
+- **保留**：`token_usage` 表的原有 token 记录（prompt/completion/cached/cache_write/total）、`/usage` 统计、GUI 用量面板——这些都不受本次下线影响。
+- **保留**：S3 依赖体积基线（`scripts/architecture_report.py closure` 与 `docs/architecture_baseline.json` 的 `closures` 节），与成本无关。
+
+回退方式：上述 16 个文件已回退到 `5364c8ff`（本次工作开始前的状态），验证：
+- `pytest tests/test_token_usage.py tests/test_gui_token_statistics.py tests/test_config_key_validation.py -q` → **78 passed**
+- `vitest run src/utils/tokenStatistics.test.ts src/components/TokenUsageSettings.test.ts` → **43 passed**
+- 全仓搜索 `cost_model|eval_stats|cost_micros|cost_text|MODEL_PRICES` → 零命中

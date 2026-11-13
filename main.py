@@ -474,23 +474,6 @@ def _parse_usage_date_args(args):
     return min(dates), max(dates)
 
 
-def _format_usage_cost(micros, currency, unpriced=0):
-    """一行费用文本：无币种（未计价）显示 `—`，有币种按微元折成金额。
-
-    unpriced > 0 表示该行还含未计价记录，金额只是已计价部分的下界，补 `*`。
-    绝不把缺失价当 0：没有 currency 一律 `—`，不显示 ¥0.0000。
-    """
-    from core.cost_model import CURRENCY_SYMBOLS
-
-    text = "—"
-    if currency and micros is not None:
-        symbol = CURRENCY_SYMBOLS.get(currency, currency + " ")
-        text = f"{symbol}{int(micros) / 1_000_000:.4f}"
-    if int(unpriced or 0) > 0:
-        text += "*"
-    return text
-
-
 def _render_usage_section(manager, label, start_s, end_s):
     """打印一个日期区间的按模型 token 用量统计段，返回该段是否有数据。"""
     title = f"{label} ({start_s})" if start_s == end_s else f"{label} ({start_s} ~ {end_s})"
@@ -499,8 +482,6 @@ def _render_usage_section(manager, label, start_s, end_s):
     if not rows:
         print_formatted_text(HTML("  <ansigray>暂无记录</ansigray>"))
         return False
-    # 本段未计价条数合计：用于表下 `*` 提示，避免把「没价格」读成「不花钱」。
-    unpriced_total = sum(int(r.get("unpriced", 0) or 0) for r in rows)
     # 展开 api_base 与 scope：同名模型的不同渠道/保活分行显示，main 不再被合并
     display_rows = [
         (row, _usage_model_label(row, row.get("api_base"), row.get("cache_scope")))
@@ -517,23 +498,19 @@ def _render_usage_section(manager, label, start_s, end_s):
         + " " + _pad_left("缓存输入", 14)
         + " " + _pad_left("缓存命中", 14)
         + " " + _pad_left("命中率", 10)
-        + " " + _pad_left("费用", 12)
         + " " + _pad_left("合计", 14)
     )
     print_formatted_text(HTML(f"<ansigray>{_header}</ansigray>"))
     for r, route_label in display_rows:
         _cache_prompt = int(r.get("cache_prompt", 0) or 0)
         _rate = _format_cache_hit_rate(r["cached"], _cache_prompt)
-        _cost_cell = _format_usage_cost(
-            r.get("cost_micros"), r.get("cost_currency"), r.get("unpriced", 0)
-        )
         # 标签含 api_base / [scope] 时可能远超列宽上限：先按显示宽度压缩到列宽、
         # 再补齐，最后才转义（转义会插入 &amp; 等实体，先转义会让宽度测量失真）。
         _name_cell = _esc(_pad_right(_truncate_visible(route_label, name_w), name_w))
         print_formatted_text(HTML(
             f"  {_name_cell} {r['prompt']:>14} "
             f"{r['completion']:>14} {_cache_prompt:>14} {r['cached']:>14} "
-            f"{_rate:>10} {_pad_left(_cost_cell, 12)} {r['total']:>14}"
+            f"{_rate:>10} {r['total']:>14}"
         ))
     if len(rows) > 1:
         sub = {
@@ -542,24 +519,10 @@ def _render_usage_section(manager, label, start_s, end_s):
         }
         # endpoint/scope 的缓存身份彼此独立，跨路由百分比没有诊断意义。
         _sub_rate = "--"
-        # 费用小计只在全员同币种时相加；混币种相加没有意义，显示 —。
-        _cost_currencies = {(r.get("cost_currency") or "") for r in rows}
-        _sub_cost = "—"
-        if len(_cost_currencies) == 1:
-            _only_currency = next(iter(_cost_currencies))
-            if _only_currency:
-                _sub_cost = _format_usage_cost(
-                    sum(int(r.get("cost_micros") or 0) for r in rows),
-                    _only_currency, unpriced_total,
-                )
         print_formatted_text(HTML(
             f"  <ansicyan>{_pad_right('小计', name_w)} {sub['prompt']:>14} "
             f"{sub['completion']:>14} {sub['cache_prompt']:>14} {sub['cached']:>14} "
-            f"{_sub_rate:>10} {_pad_left(_sub_cost, 12)} {sub['total']:>14}</ansicyan>"
-        ))
-    if unpriced_total > 0:
-        print_formatted_text(HTML(
-            f"  <ansigray>* 含 {unpriced_total} 条未计价记录</ansigray>"
+            f"{_sub_rate:>10} {sub['total']:>14}</ansicyan>"
         ))
     from core.cache_keepalive import load_keepalive_interval
     idle_seconds = int(load_keepalive_interval() or 120)
@@ -667,38 +630,7 @@ def _compose_status_token_info(
     return (
         f"↑ {prompt} · ↓ {completion} · ⚡ {cached} ({global_rate}) · "
         f"上下文 {ctx_pct} ({ctx_used}/{ctx_max})"
-        f"{_compose_status_cost_segment()}"
     )
-
-
-def _compose_status_cost_segment() -> str:
-    """状态栏末位追加的「会话累计费用」片段；没有可报的费用就返回空串。
-
-    三种情况严格区分（未报告 ≠ 0）：
-    - 已有已计价轮次 → 追加「 · ￥0.0123」，币种符号取自 CURRENCY_SYMBOLS；
-    - 只有未计价轮次（模型没配价）→ 追加「 · 未计价」，绝不显示 ¥0.0000；
-    - 两样都没有 → 追加空串，状态栏文案与历史完全一致。
-
-    金额是「当前币种口径」的累计微元：跨币种不求和（换币种即清零重计，
-    见 core.llm_diagnostics._account_server_usage），所以这里只报一个币种。
-    只给主代理状态栏用，不改变任何其它调用方。
-    """
-    try:
-        with token_usage_lock:
-            micros = int(session_token_usage.get("cumulative_cost_micros", 0) or 0)
-            currency = str(session_token_usage.get("cumulative_cost_currency", "") or "")
-            unpriced = int(session_token_usage.get("cumulative_cost_unpriced", 0) or 0)
-    except Exception:
-        # 状态栏刷新不能因为取数异常而中断（宁可少显示费用）
-        return ""
-    if currency:
-        from core.cost_model import CURRENCY_SYMBOLS
-
-        symbol = CURRENCY_SYMBOLS.get(currency, f"{currency} ")
-        return f" · {symbol}{micros / 1_000_000:.4f}"
-    if unpriced:
-        return " · 未计价"
-    return ""
 
 
 def _format_token_speed(speed) -> str:
