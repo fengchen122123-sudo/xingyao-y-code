@@ -1,37 +1,4 @@
 {
-  "closure_growth_alert_ratio": 1.1,
-  "closures": {
-    "core.agent_service": {
-      "max_depth": 7,
-      "module_count": 177,
-      "total_lines": 92927
-    },
-    "core.llm": {
-      "max_depth": 6,
-      "module_count": 177,
-      "total_lines": 92927
-    },
-    "core.memory": {
-      "max_depth": 7,
-      "module_count": 177,
-      "total_lines": 92927
-    },
-    "core.tools": {
-      "max_depth": 7,
-      "module_count": 177,
-      "total_lines": 92927
-    },
-    "gui_main": {
-      "max_depth": 6,
-      "module_count": 252,
-      "total_lines": 142042
-    },
-    "main": {
-      "max_depth": 6,
-      "module_count": 216,
-      "total_lines": 112437
-    }
-  },
   "files": {
     "core/__init__.py": 0,
     "core/agent_service.py": 1091,

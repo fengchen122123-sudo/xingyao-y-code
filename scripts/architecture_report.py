@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,28 +56,13 @@ class ModuleInfo:
 # --------------------------------------------------------------------- scan
 
 
-def iter_python_files(
-    root: Path, *, exclude_dirs: frozenset[str] | None = None
-) -> list[Path]:
-    """返回 root 下全部 .py 文件（跳过 __pycache__），按相对路径排序。
-
-    exclude_dirs：目录名集合；命中则整棵子树不进扫描（默认 None＝不排除，保持
-    scan / deps / map 既有行为）。仅在 root 为仓库根（closure 场景）时使用，
-    避免把 venv / node_modules 等第三方代码当成项目模块。
-    """
+def iter_python_files(root: Path) -> list[Path]:
+    """返回 root 下全部 .py 文件（跳过 __pycache__），按相对路径排序。"""
 
     def sort_key(path: Path) -> str:
         return path.relative_to(root).as_posix()
 
-    excluded = exclude_dirs or frozenset()
-    if not excluded:
-        files = [p for p in root.rglob("*.py") if "__pycache__" not in p.relative_to(root).parts]
-        return sorted(files, key=sort_key)
-    files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name not in excluded)
-        base = Path(dirpath)
-        files.extend(base / name for name in filenames if name.endswith(".py"))
+    files = [p for p in root.rglob("*.py") if "__pycache__" not in p.relative_to(root).parts]
     return sorted(files, key=sort_key)
 
 
@@ -157,18 +141,13 @@ def save_baseline(path: Path, files: dict[str, int], *, root_name: str) -> None:
 
 
 def _module_name(root: Path, prefix: str, path: Path) -> str:
-    """core/a/b.py → core.a.b；core/a/__init__.py → core.a；core/__init__.py → core。
-
-    prefix 为空串时直接返回相对路径拼出的模块名（不加前导点），用于
-    「root=仓库根」场景：main.py → main，core/a.py → core.a，plugins/x/plugin.py
-    → plugins.x.plugin。
-    """
+    """core/a/b.py → core.a.b；core/a/__init__.py → core.a；core/__init__.py → core。"""
     parts = list(path.relative_to(root).parts)
     if parts[-1] == "__init__.py":
         parts = parts[:-1]
     else:
         parts[-1] = path.stem
-    return ".".join(parts if not prefix else [prefix, *parts])
+    return ".".join([prefix, *parts])
 
 
 def _longest_module(candidate: str, modules: set[str]) -> str | None:
@@ -206,15 +185,14 @@ def _dependency_targets(stem: str, aliases: list[str], modules: set[str]) -> set
 
 
 def collect_dependencies(
-    root: Path, *, prefix: str | None = None, exclude_dirs: frozenset[str] | None = None
+    root: Path, *, prefix: str | None = None
 ) -> tuple[dict[str, set[str]], list[str]]:
     """ast 解析 root 内全部 .py，返回（模块→被依赖模块集合, 无法解析文件列表）。
 
     只登记 root 包内部依赖；stdlib / 第三方导入忽略。自环边忽略。
-    exclude_dirs 见 iter_python_files（默认 None＝不排除）。
     """
     name = root.name if prefix is None else prefix
-    files = iter_python_files(root, exclude_dirs=exclude_dirs)
+    files = iter_python_files(root)
     modules = {_module_name(root, name, path): path for path in files}
     module_set = set(modules)
     graph: dict[str, set[str]] = {module: set() for module in sorted(modules)}
@@ -227,8 +205,7 @@ def collect_dependencies(
                 path.read_text(encoding="utf-8-sig", errors="replace"), filename=str(path)
             )
         except SyntaxError:
-            rel = path.relative_to(root).as_posix()
-            failures.append(f"{name}/{rel}" if name else rel)
+            failures.append(f"{name}/{path.relative_to(root).as_posix()}")
             continue
         is_package = path.name == "__init__.py"
         package = module if is_package else module.rpartition(".")[0]
@@ -492,223 +469,6 @@ def cmd_map(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----------------------------------------------------------------- closure
-
-# 默认入口：启动链路 + 主循环 + LLM 调用 + GUI。新增入口请显式传 --entries。
-# main / gui_main 位于仓库根，需配合 closure 的「root=仓库根 + prefix=""」模式解析。
-DEFAULT_ENTRIES = (
-    "main",
-    "gui_main",
-    "core.agent_service",
-    "core.llm",
-    "core.tools",
-    "core.memory",
-)
-
-# closure 在 root=仓库根 时要跳过的目录名（第三方 / 构建产物 / 前端资源）。
-# 只影响 closure（显式传入）；scan / deps / map 不传该参数，行为不变。
-CLOSURE_EXCLUDED_DIRS = frozenset(
-    {
-        "venv",
-        ".venv",
-        "node_modules",
-        "dist",
-        "build",
-        "__pycache__",
-        ".git",
-        "packages",
-        "frontend",
-        "frontend-mobile",
-        "vendor",
-        "assets",
-    }
-)
-
-
-def compute_closure_metrics(
-    root: Path,
-    *,
-    prefix: str | None = None,
-    entries: tuple[str, ...] | list[str] = DEFAULT_ENTRIES,
-    exclude_dirs: frozenset[str] | None = None,
-) -> tuple[dict[str, dict[str, int]], list[str]]:
-    """计算每个入口的传递依赖闭包：模块数 / 行数 / 最大深度。
-
-    复用 deps 子命令的同一套 ast 解析（collect_dependencies），保证口径一致。
-    只统计 root 包内部模块；stdlib 与第三方不计入。
-    prefix="" 时是「root=仓库根」模式：模块名不带前导点，core.* 与 plugins.*、
-    根目录 main / gui_main 同处一张依赖图，入口可跨包（如 main → core.*）。
-    exclude_dirs 只在仓库根模式传入，用于跳过 venv / node_modules 等目录。
-    返回（入口→指标, 入口不存在列表）。
-    """
-    name = root.name if prefix is None else prefix
-    modules = {
-        _module_name(root, name, path): path
-        for path in iter_python_files(root, exclude_dirs=exclude_dirs)
-    }
-    lines = {module: count_lines(path) for module, path in modules.items()}
-    graph, _failures = collect_dependencies(root, prefix=name, exclude_dirs=exclude_dirs)
-
-    metrics: dict[str, dict[str, int]] = {}
-    missing: list[str] = []
-    for entry in entries:
-        if entry not in graph:
-            missing.append(entry)
-            continue
-        seen: set[str] = set()
-        depth = {entry: 0}
-        queue = [entry]
-        while queue:
-            current = queue.pop(0)
-            for dep in graph.get(current, ()):  # 仅包内边
-                if dep in seen or dep == entry:
-                    continue
-                seen.add(dep)
-                depth[dep] = depth.get(current, 0) + 1
-                queue.append(dep)
-        metrics[entry] = {
-            "module_count": len(seen) + 1,
-            "total_lines": sum(lines.get(module, 0) for module in seen | {entry}),
-            "max_depth": max(depth.values()) if depth else 0,
-        }
-    return dict(sorted(metrics.items())), sorted(missing)
-
-
-def load_closure_baseline(path: Path) -> dict[str, dict[str, int]]:
-    """读取基线 JSON 的 closures 节；缺失/损坏返回 {}（按首次登记处理）。"""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    closures = data.get("closures") if isinstance(data, dict) else None
-    if not isinstance(closures, dict):
-        return {}
-    result: dict[str, dict[str, int]] = {}
-    for entry, value in closures.items():
-        if not isinstance(entry, str) or not isinstance(value, dict):
-            continue
-        cleaned = {
-            key: value[key]
-            for key in ("module_count", "total_lines", "max_depth")
-            if isinstance(value.get(key), int)
-        }
-        if {"module_count", "total_lines"} <= cleaned.keys():
-            result[entry] = cleaned
-    return dict(sorted(result.items()))
-
-
-def find_closure_alerts(
-    current: dict[str, dict[str, int]], baseline: dict[str, dict[str, int]]
-) -> list[tuple[str, str, int, int]]:
-    """返回 (entry, metric, current, baseline) 告警列表。
-
-    判定用整数比较 current*10 > baseline*11（与行数基线同款，避免浮点误差）；
-    首次出现的入口不告警（与 scan 的「首次全量登记」语义一致）。
-    """
-    alerts: list[tuple[str, str, int, int]] = []
-    for entry, values in current.items():
-        base = baseline.get(entry)
-        if not base:
-            continue
-        for metric in ("total_lines", "module_count"):
-            cur = int(values.get(metric, 0))
-            old = int(base.get(metric, 0))
-            if old > 0 and cur * 10 > old * 11:
-                alerts.append((entry, metric, cur, old))
-    return alerts
-
-
-def save_closure_baseline(path: Path, closures: dict[str, dict[str, int]]) -> None:
-    """把 closures 合并写回基线 JSON，保留既有 files 等字段（确定性输出）。"""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError):
-        data = {}
-    data["schema"] = BASELINE_SCHEMA
-    data["closure_growth_alert_ratio"] = GROWTH_ALERT_RATIO
-    data["closures"] = dict(sorted(closures.items()))
-    text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
-
-
-def cmd_closure(args: argparse.Namespace) -> int:
-    root = _resolve(args.root)
-    baseline_path = _resolve(args.baseline)
-    if not root.is_dir():
-        print(f"错误：根目录不存在：{root}")
-        return 2
-    # root 为仓库根 → prefix="" 模式：模块名即仓库内相对点号路径（main / core.x /
-    # plugins.y），从而把包外入口与 plugins 一并纳入同一张依赖图。
-    at_repo_root = root.resolve() == REPO_ROOT.resolve()
-    prefix = "" if at_repo_root else root.name
-    exclude_dirs = CLOSURE_EXCLUDED_DIRS if at_repo_root else None
-    entries = tuple(args.entries) if args.entries else DEFAULT_ENTRIES
-    current, missing = compute_closure_metrics(
-        root, prefix=prefix, entries=entries, exclude_dirs=exclude_dirs
-    )
-    # 依赖图内的项目模块命名空间计数（不含 stdlib / 第三方）：用于确认 core 与
-    # plugins 是否都在同一张图里，不参与闭包指标与基线。
-    namespaces: dict[str, int] = {}
-    for path in iter_python_files(root, exclude_dirs=exclude_dirs):
-        rel = path.relative_to(root)
-        head = rel.parts[0] if len(rel.parts) > 1 else "(根目录文件)"
-        if head != "(根目录文件)" and (head.startswith(".") or not head.isidentifier()):
-            continue  # 隐藏目录 / 连字符目录（如 pelican-3d）不构成 Python 命名空间
-        namespaces[head] = namespaces.get(head, 0) + 1
-    baseline = load_closure_baseline(baseline_path)
-    alerts = find_closure_alerts(current, baseline)
-
-    if args.json:
-        payload = {
-            "root": root.name,
-            "entries": current,
-            "missing_entries": missing,
-            "module_namespaces": dict(sorted(namespaces.items())),
-            "alerts": [
-                {"entry": e, "metric": m, "current": c, "baseline": b}
-                for e, m, c, b in alerts
-            ],
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 1 if alerts and args.check else 0
-
-    print(
-        f"依赖图模块命名空间：{', '.join(f'{k}={v}' for k, v in sorted(namespaces.items()))}"
-    )
-    for entry, values in current.items():
-        print(
-            f"{entry}: {values['module_count']} 个模块 / {values['total_lines']} 行 / "
-            f"最大深度 {values['max_depth']}"
-        )
-    if missing:
-        print(f"注意：{len(missing)} 个入口不存在，已跳过：{', '.join(missing)}")
-    for entry, metric, cur, old in alerts:
-        label = "行数" if metric == "total_lines" else "模块数"
-        print(
-            f"[告警] {entry} 闭包{label}超基线 +{int((GROWTH_ALERT_RATIO - 1) * 100)}%："
-            f"{cur} > 基线 {old}"
-        )
-
-    if args.check:
-        print(f"--check 模式：未写入基线；告警 {len(alerts)} 条。")
-        return 1 if alerts else 0
-
-    # 存量只登记不前移：与 scan 的基线语义一致
-    merged = {
-        entry: baseline.get(entry, values) for entry, values in current.items()
-    }
-    for entry, values in baseline.items():
-        if entry not in merged:
-            merged[entry] = values
-    save_closure_baseline(baseline_path, merged)
-    added = sum(1 for entry in current if entry not in baseline)
-    print(f"基线已写入 {baseline_path}（登记 {len(merged)} 个入口，其中新登记 {added} 个）。")
-    return 1 if alerts else 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="architecture_report",
@@ -731,23 +491,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_map.add_argument("--root", default=DEFAULT_ROOT, help="扫描根目录（相对仓库根，默认 core）")
     p_map.add_argument("--output", default=DEFAULT_MAP_PATH, help="输出 Markdown 路径")
     p_map.set_defaults(func=cmd_map)
-
-    p_closure = sub.add_parser("closure", help="入口传递依赖闭包：模块数 / 行数 / 深度")
-    p_closure.add_argument(
-        "--root", default=".",
-        help="扫描根目录（相对仓库根，默认 . 即仓库根：覆盖 core.* / plugins.* / main 等入口）",
-    )
-    p_closure.add_argument("--baseline", default=DEFAULT_BASELINE_PATH, help="基线 JSON 路径")
-    p_closure.add_argument(
-        "--entries", nargs="*", default=None,
-        help=(
-            "入口模块名列表（默认 main / gui_main / core.agent_service / core.llm / "
-            "core.tools / core.memory）"
-        ),
-    )
-    p_closure.add_argument("--check", action="store_true", help="只检查不写入；超基线返回退出码 1")
-    p_closure.add_argument("--json", action="store_true", help="以 JSON 输出结果")
-    p_closure.set_defaults(func=cmd_closure)
     return parser
 
 
