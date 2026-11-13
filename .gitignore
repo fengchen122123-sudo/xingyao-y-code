@@ -209,8 +209,3 @@ skills/tokenrhythm-account/reference.md
 # 误操作产生的临时文件（命令重定向写坏 / 空文件），不入库
 /a.txt
 /y
-
-# pelican-3d 一次性 3D 演示：源码与素材入库，QA 截图与中间产物不入库
-/pelican-3d/qa/
-/pelican-3d/assets/poster_raw.png
-
