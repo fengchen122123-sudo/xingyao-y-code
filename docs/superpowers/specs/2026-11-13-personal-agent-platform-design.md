@@ -1,11 +1,12 @@
 # 星瑶 Personal Agent 平台架构设计
 
-> 修订 r2（2026-11-13）：按 `audit/design-review-r2.md` 的 M01-M20 修订。闭合 worker/relay epoch 与有限补发协议、三类 token 失效规则、Linux 浏览器完整调用链、截图 HTTP 鉴权、账号全通道隔离及 metrics 数据契约；重排 P1-P4 高风险门禁。本文是设计修订，不表示任何实现或运行验收已经完成。
+> 修订 r3（2026-11-13）：在 r2 上闭合第三轮审查仍开着的协议打架和「点了名没给契约」的项。r2 已吸收 M01-M20 的方向；r3 把仍会让两个实施者写出两套行为的地方收成唯一契约。第 10 节是施工覆盖条款，与前文不一致时以第 10 节为准。本文仍是设计，不表示任何实现或运行验收已经完成。
 
 日期：2026-11-13
-状态：r2 设计待复审；实施与实测未开始
+状态：r3 施工稿；实施与实测未开始
+基线：`dcb3bc01`（`dev`）。r3 引用的 file:line 按该提交核对。`audit/core-service.md`、`audit/remote-mobile.md`、`audit/platform-deploy.md` 不在该提交的树里，正文里只把它们当历史线索；实施以本文件和第 10 节为准，不依赖那三份缺失审计。
 取代：`2026-11-13-server-multi-tenant-design.md`（对外 SaaS 多租户方向已废弃，仅作素材归档）
-输入：`audit/core-service.md`、`audit/remote-mobile.md`、`audit/platform-deploy.md`（三份只读审计，本文所有 file:line 均引自审计并经本轮抽样复核）
+视觉参照：`website/personal-agent-prototype.html` 是静态可点原型，不是传输层，不实现协议。
 
 ---
 
@@ -24,7 +25,7 @@
 | R3 | Linux 服务器 Personal Agent + 专属极简 Web 前端 | `--serve` 无窗口常驻 + 新响应式 SPA，Docker + Caddy 部署 |
 | R4 | 安卓 App（Muse/Today 风格） | Capacitor 包装同一套 SPA，直连服务器 |
 | R5 | App 内「我的电脑」 | 手机 → 服务器 → 用户 Windows 上运行中的星瑶 GUI；桌面持设备 token 主动外连注册，服务器纯转发 |
-| R6 | 账号登录 + 对话隔离 | 每账号独立数据 / 会话 / 记忆 / Key，一账号一容器 |
+| R6 | 账号登录 + 对话隔离 | 每账号独立数据 / 会话 / 记忆 / 模型 Key，一账号一容器。受邀者各自填写自己的 Key，不复制主人的 Key |
 | R7 | 后台管理系统 | 账号管理、设备管理、worker 状态、用量查看 |
 
 ### 1.3 信任模型假设（全设计的前提）
@@ -38,14 +39,14 @@
 
 ## 2. 现状审计结论摘要
 
-三份报告全文见 `audit/` 目录，此处只摘取支撑本设计的关键结论（file:line 以当前工作区为准，本轮已抽样复核 frameless.py:101、gui_bridge.py:3809-3831、credentials.py:9、lan_server.py:1150、capability.py:87-103、browser_backend.py:46/1209-1215、tool_registry.py:182、config.py:430-458、linux.py 全文、settings.py:26/37-41、controller.py:517-528、browser_worker.py:37，全部吻合）。
+下面这些 file:line 在 `dcb3bc01` 上打开核对过，与描述一致：frameless.py:101、gui_bridge.py:3809-3831、credentials.py:9、lan_server.py:1150、capability.py:87-103、browser_backend.py:46 与 :1209-1215、tool_registry.py:182、config.py:430-458、linux.py 全文、settings.py:26 与 :37-41、controller.py:517-528、browser_worker.py:37。`audit/` 下的三份现状审计不在这个提交里，不要当成还能打开的附件。
 
 ### 2.1 核心服务化（audit/core-service.md）
 
 - 核心对话链无界面依赖，可复用：agent_service（headless 约束，agent_service.py:4-12）、MemoryManager 按路径实例化 + WAL（memory.py:501-510）、LanServer 构造仅需 bridge+port（lan_server.py:379-406）。
 - **四处必改**：① frameless 模块级 `ctypes.windll` Linux import 即崩（frameless.py:101-110，gui_bridge 顶层 import 连带）；② `_emit_raw` 无窗口先 return，LAN/飞书广播被掐断（gui_bridge.py:3809-3831）；③ 权限确认单槽队列 + gui flavor 跳过终端回退 → 无窗口无人应答时无限挂起（permission_terminal.py:524-539、gui_bridge.py:7934-7939）；④ 进程级全局单例决定**一账号一进程**（app_context.py:16-24、permission_broker.py:263、llm.py:361-365 等）。
 - LAN/MCP/飞书服务靠前端首屏触发（gui_bridge.py:4382-4398），serve 必须显式启动（gui_bridge.py:8106-8220）。
-- 数据隔离 ≈95% 完整，`YCODE_DATA_DIR` 主干可用（config.py:430-443），**5 处残留**需修（tokenrhythm_auth.py:64-68、workflows/store.py:44-45、hooks/zcode_import.py:385、harness/tool_adapters.py:154、skills.py:650-661）。
+- 数据目录主干可用：`YCODE_DATA_DIR` 在 config.py:430-432 决定 `YCODE_DIR`。残留要改的行（`dcb3bc01` 上打开核对过）：tokenrhythm_auth.py:64 与 :68、workflows/store.py:44-45、workflows/skill_sync.py:17-18、hooks/zcode_import.py:385、harness/tool_adapters.py:154、skills.py:682。skills.py:650-661 只是文档字符串，真正把 `~/.agents/skills` 加进扫描的是 :682。
 - 凭据加密 Linux 走 keyring 分支（credentials.py:51-56），headless 容器需 file 后端（部署项）。
 
 ### 2.2 远程链路与移动端（audit/remote-mobile.md）
@@ -141,17 +142,21 @@ flowchart TB
 | `/health` | GET | 无 | 存活探针 |
 
 **WS 路由语义（/ws/agent）**：
-- 首帧 10 秒超时；JWT 无效/过期 close **4401**，前端先 refresh 再重连，refresh 失效才回登录页。每个 REST/WS 请求还必须在统一 auth dependency 中读取账号当前 `disabled/role`；改密、禁用、降权时递增 `accounts.auth_epoch`，JWT 同时携带 epoch，不能只验签名与 exp。
+- 首帧 10 秒超时；JWT 无效、过期、epoch 不符或 jti 在吊销表里，close **4401**。前端先 refresh 再重连，refresh 失效才回登录页。每个 REST 请求和每条 WS 首帧都读账号当前的 `disabled/role/auth_epoch`。access JWT 带 `jti`、`auth_epoch`、`role`。登出只吊销这一枚 refresh，并把这一枚 access 的 `jti` 写入 `access_denylist` 直到它过期，同时关掉这一条 WS；不增加 `auth_epoch`，其它设备保持登录。改密、禁用、降权才 `auth_epoch += 1`，并吊销该账号全部 refresh。网关在 epoch 变化后 5 秒内主动关掉该账号全部 WS，不等下一条消息。禁用同时停容器、关闭 `/relay/device`。改密不使设备 token 失效。
 - 网关为每条前端连接单独 dial 一条 worker LanServer 连接，上游首帧统一为 `{"token":worker_token,"last_seq":<number|null>,"last_boot_id":<string|null>}`；全新连接两项均为 null。worker 的每客户端有界队列承担背压，补发缓冲在 worker 侧。
-- **worker epoch 的精确顺序**：LanServer 启动生成 `boot_id=secrets.token_hex(4)`。认证成功后首先发送 `{"type":"hello","data":{"boot_id":...}}`；若客户端 `last_boot_id` 与当前不同，随后发送 `{"type":"seq_reset","data":{"boot_id":...,"from_seq":0,"resync_required":true}}`，忽略旧 last_seq；然后按 seq 升序补发当前 128 帧窗口，最后进入实时帧。hello/seq_reset 均不得带 `id`，避免 shim 当作 RPC 应答。boot_id 相同才按 last_seq 过滤；旧服务端无 hello 时旧 shim 保持现行为，新 shim 对旧服务端进入 legacy 模式并强制初始快照；新服务端收到无 last_boot_id 的旧客户端按全新连接处理。
-- **shim 合并规则**：hello/seq_reset 在通用 `onBridgeEvent` 扇出前拦截。seq_reset/resync_required 时先暂停把 replay/live 交给 store，调用 `get_initial_state` 并以返回的权威快照替换对应会话状态，记录 `snapshot_epoch=boot_id` 与该连接当时已收到的 `snapshot_seq`；随后只处理同一 boot_id 且 seq 大于 snapshot_seq 的增量，其它旧帧丢弃。每连接按 boot_id 重置去重集合，不能以“事件类型”去重 token_delta 等合法重复事件。若事件发生在快照生成之后但乱序到达，以会话 revision/回合终态优先，终态后忽略迟到 delta；无法判定顺序时重新取快照，不猜测合并。Web 在 localStorage 按 `服务器 + account_id + profile` 持久化 `(boot_id,last_seq)`；Android 杀进程后清空水位并以全新快照自愈。退出换号、切服务器或 profile 时清空对应内存事件、设备列表、会话缓存与水位命名空间。
+- **worker epoch 的精确顺序**：LanServer 启动生成 `boot_id=secrets.token_hex(8)`，只活在本进程内存。认证成功后首先发送 `{"type":"hello","data":{"boot_id":...}}`，此帧不带 `id`。随后只走下面三条之一，再进入实时帧：
+  1. 客户端没带 `last_boot_id`，或与当前 `boot_id` 不同：发送 `{"type":"seq_reset","data":{"boot_id","reason":"boot","resync_required":true}}`（不带 `id`），忽略旧 `last_seq`，**不补发** 128 窗口。客户端必须先 `get_initial_state`。
+  2. `boot_id` 相同，但缓冲为空，或缓冲中最小 seq 大于 `last_seq+1`（空洞或 128 溢出）：同样发送 `seq_reset`，`reason` 为 `"gap"`，不补发残窗。
+  3. `boot_id` 相同且缓冲能盖住 `last_seq+1`：不发 `seq_reset`，只按 seq 升序补发 `seq > last_seq` 的帧，然后实时帧。
+  旧服务端没有 `hello` 时，旧 shim 保持现在的行为；新 shim 进入 legacy：强制 `get_initial_state`，并且不把内存水位当成跨进程事实。新服务端收到没有 `last_boot_id` 的旧客户端，按第 1 条处理。
+- **shim 合并规则**：`hello` / `seq_reset` 在调用 `onBridgeEvent` 之前拦截。收到 `resync_required:true` 时，暂停把 replay/live 交给 store，调用 `get_initial_state`，用返回值整份替换会话、队列和活跃回合。当前 `get_initial_state`（gui_bridge.py:4377，快照字段在 :4503-4517）**没有**会话 revision 字段，实施时不要发明这个字段。快照里的 `active_turn_snapshots` 已终态（完成、取消、错误）之后，丢掉该回合迟到的 `token_delta` / `thinking_delta`。快照替换完成前到达的帧先按 boot_id 暂存；替换后只应用同一 boot_id、且 seq 大于「暂停前已接收的最大 seq」的增量。无法判断某个 delta 是否已经含在快照里时，丢掉该 delta 并再取一次快照，不猜测合并。去重键是 `(boot_id, seq)`，禁止按事件类型去重，`token_delta` 可以合法重复。Web 把 `(boot_id,last_seq)` 写入 localStorage，键为 `服务器 + account_id + profile`。安卓（检测到 Capacitor）禁止把水位写入 localStorage、Preferences 或任何会熬过杀进程的存储；进程死了水位自然消失，重开走全新快照。退出、换号、切服务器、切 profile 时，先关旧 WS、取消未完成 RPC，再清该命名空间的内存事件、设备列表、会话缓存和水位。
 - worker 未运行：先 `docker start`，推 `{"type":"worker_starting","data":{"boot_id":null}}`；健康检查通过后才以 worker hello 为新 epoch。worker 崩溃时推 `worker_lost`，其 boot_id 取网关缓存的最后一次健康快照；缓存为空则 null。worker `/health` 改为 `{"ok":true,"boot_id":...}` JSON，网关缓存该值，不能要求启动前或崩溃后实时读取。
 - 本协议同时修改 `frontend/mobile-shim.js` 与 `core/lan_server.py` 内嵌兜底副本，Windows LAN 直连同步受益；新 `gateway-shim.ts` 复用同一状态机。修改现有 shim 属于 R1 的必要兼容改造，不是“完全不改 frontend”。
 
 **worker 生命周期**：
-- 按需启动：账号首次 WS 活动时拉起；容器命名 `xingyao-worker-<account_id>`，标签 `xingyao.account=<id>`，网关重启后按标签枚举重建映射。
-- 空闲回收：每 30s 轮询 worker `/metrics`（见 4.2）取 `last_activity_ts` 与 `active_turn`；空闲超 30 分钟且无进行中回合 → `docker stop`。
-- 容器加固基线（compose 片段语义）：非 root（uid 10001）、`cap_drop: ALL`、`security_opt: no-new-privileges`、`mem_limit: 2g`、`cpus: 2`、`pids_limit: 512`、`shm_size: 1g`、只挂本账号卷、接入内部 docker network、**不 publish 任何端口**。个人产品不做 egress 白名单（信任模型 1.3）。
+- 按需启动：账号首次 WS 活动时拉起；容器命名 `xingyao-worker-<account_id>`，标签 `xingyao.account=<id>`，网关重启后按标签枚举重建映射。网关只连 `http://xingyao-worker-<account_id>:8766`（第 10 节）。`docker start` 后 60 秒内 `/health` 未返回 `ok` 就向客户端推 `worker_lost` 并停止重试这一次，不无限等。
+- 空闲回收：每 30s 轮询 worker `/metrics` 取 `last_activity_ts` 与 `active_turn`；空闲超 30 分钟且无进行中回合 → `docker stop`。这 30 秒是指标轮询，不是第 4.6 节的 15 秒心跳。
+- 容器加固基线：非 root（uid 10001）、`cap_drop: ALL`、`security_opt: no-new-privileges`、`mem_limit: 2g`、`cpus: 2`、`pids_limit: 512`、`shm_size: 1g`、只挂本账号卷、接入内部网络 `xingyao`、**不 publish 任何端口、不挂 docker.sock**。只有网关进程能访问 docker.sock。`TZ=Asia/Shanghai`。个人产品不做 egress 白名单（信任模型 1.3）。
 
 **改造点**：gateway 全部新建；Q1 同时修改 worker `core/lan_server.py`、`frontend/mobile-shim.js` 与内嵌 shim 兜底，Q2 复用并抽取 dispatch/replay，不再声称“无现有代码改动”。
 
@@ -179,39 +184,47 @@ deploy/
 **职责**：容器内无窗口常驻，复用 ApiBridge + LanServer 全部现有能力；对网关暴露桥接协议与运维探针。
 
 **接口定义**：
-- 桥接协议：LanServer 现有 WS 协议原样（RPC/事件/seq 补发/4401，见 2.2），不新增业务帧。
+- 桥接协议：保留现有 RPC、事件、seq 补发和 4401。允许新增的只有不带 `id` 的控制帧 `hello` 与 `seq_reset`（形状见 4.1）。不新增 RPC 方法。4.1 与本节不一致时以 4.1 和本句为准。
 - `GET /health`：返回 `{"ok":true,"boot_id":...}` JSON，供网关缓存当前/最后健康 epoch。
-- `GET /metrics`（**新增**，serve 模式才注册路由；`Authorization: Bearer <worker_token>`，常量时间比较）：返回 `{"version","boot_id","uptime_s","last_activity_ts","active_turn":bool,"token_usage":[{model,prompt_tokens,completion_tokens,total_tokens}],"sessions":n,"turns_total":n}`。`token_usage` 是 DB 全表按 model 合并后的全量累计；`turns_total` 是持久化的已完成用户回合计数，不能用 LLM 请求行数冒充；`sessions` 仅是当前快照，不用于按日历史。
-- **用量入账契约**：网关新增 `usage_watermarks(account_id,model,prompt_tokens,completion_tokens,total_tokens,turns_total,updated_at)`。每轮在单个 SQLite 事务中读取水位→按字段计算 `max(0,current-watermark)`→写 `usage_daily`→更新水位；current 任一字段回退时，该模型整组按重置处理并记录审计事件。`usage_daily.day` 明确定义为**网关入账日（服务器时区）**，不是实际消耗日；换卷/清库、轮询后提交前崩溃、跨午夜都须有 fixtures。首版用量页展示 token 与 turns；按日 sessions 没有持久数据源，首版不展示该字段。统计只覆盖成功落库的有效 usage，不承诺与厂商账单绝对一致。
+- `GET /metrics`（**新增**，serve 模式才注册路由；`Authorization: Bearer <worker_token>`，常量时间比较）：返回 `{"version","boot_id","uptime_s","last_activity_ts","active_turn":bool,"token_usage":[{model,prompt_tokens,completion_tokens,total_tokens}],"sessions":n,"turns_total":n}`。`token_usage` 是 `token_usage` 表按 `model` 列 `SUM` 后的全量累计（同一 model 下的 provider/api_base/cache_scope 合并掉；`model` 为 NULL 时指标里写成空字符串 `""`）。`turns_total` 的唯一数据源是：
+
+  ```sql
+  SELECT COUNT(*) FROM harness_turns
+  WHERE status = 'completed'
+    AND COALESCE(turn_kind, '') <> 'resume'
+  ```
+
+  表在 memory.py:695-711，状态枚举在 core/harness/models.py:7-15，`completed` 才算数。`cancelled` / `failed` / `interrupted` 以及 `turn_kind='resume'` 都不算。禁止用 `token_usage` 行数冒充回合。`sessions` 只是当前会话行数快照，不入 `usage_daily`。
+- **用量入账契约**：网关表 `usage_watermarks` 存上次看到的累计值。每一轮在同一个 SQLite 事务里：读水位 → 各字段 `delta = current - watermark` → 若 prompt、completion、total、turns 任一 delta 为负，该 model 整组视为重置，delta 改取 current 全量，并写一条审计日志 → 把 delta 加进 `usage_daily` → 把水位更新为 current。映射是：`prompt_tokens → usage_daily.input_tokens`，`completion_tokens → usage_daily.output_tokens`。`total_tokens` 只留在水位里做回退检测，不进 `usage_daily`（该表没有 total 列）。`usage_daily.day` 是网关提交事务那一刻的 **Asia/Shanghai 日历日**（`YYYY-MM-DD`），代码里显式使用该时区，不依赖容器默认 UTC。这不是 `token_usage.date` 的实际消耗日；跨午夜的一整段增量记到入账日。模型改名视为新 model，不回溯改旧行。换卷、清库、轮询后提交前崩溃、跨午夜都要有测试夹具。首版用量页只展示 token 与 turns。统计只覆盖成功落进 `token_usage` 的记录，不承诺等于厂商账单。
 - 进程接口：`python gui_main.py --serve`（或薄入口 `serve.py`）；env：`YCODE_DATA_DIR=/data`、`YCODE_TOOL_PROFILE=server`、`LANG=C.UTF-8`；SIGTERM/SIGINT → 优雅停机。
 
 **启动序列**（照 core-service.md 1.3 表展开）：
 1. 入口在 import GUI 重模块之前识别 `--serve`（仿 `--cli` 分发范式，gui_main.py:148-174），设 `YCODE_TOOL_PROFILE=server`（先于任何 core.llm import，同 main.py:10-11 模式）。
 2. 复制：滚动日志（gui_main.py:326-372）、配置自检（:894-920，弹窗改日志+退出码）、mcp 单例（:954-957）、`set_trust_prompt(lambda: False)`（:958-969，防无终端 input 挂死）、`ApiBridge(mcp_manager=…)`（:970）、LLM 预热（可选，:662-696）。
-3. 跳过：WebView2/窗口/托盘/热键/内嵌浏览器全部步骤（gui_main.py:931-938、975-1013、1020-1166、858-875）。
-4. **显式启动服务**：`_ensure_lan_server()`；不依赖前端首屏触发。serve 默认禁用独立 MCP 监听，确需开启时只能绑定账号内部网络并列明端口；飞书按账号配置可选。
-5. **显式启动电脑运行时**：调用 `start_computer_runtime()` 与 `attach_preview_publisher()`（gui_main.py:858-875 的 GUI 调用点抽成共享函数），但不注册 Windows 全局热键；serve 使用 server 专用 browser preflight。没有 publisher 时不得声称围观已接线。
-6. per-account 锁：`YCODE_DIR/serve.lock` fcntl.flock + pid 文件；SIGTERM/SIGINT → `api.shutdown()` + `shutdown_process_computer_runtime("serve_exit")` + `lan.stop()`，确保 preview 与 Chromium 一并清理。
+3. 跳过：WebView2/窗口/托盘/内嵌浏览器（gui_main.py:931-938、975-1013、1020-1166）。**不要跳过 gui_main.py:858-875 的电脑运行时**；热键按下一步单独关掉。
+4. **显式启动服务**：`_ensure_lan_server()`，监听第 10 节规定的固定端口；不依赖前端首屏触发。serve 默认禁用独立 MCP 监听（现默认开在 config.py:454-458，端口 8765）。确需开启时只能绑在该账号容器内、不 publish。飞书按账号配置可选。
+5. **显式启动电脑运行时**：调用已存在的 `start_computer_runtime()` 与 `attach_preview_publisher()`（gui_main.py:873，函数定义在 core/computer/runtime.py:260 与 :344）。serve 传入的 `hotkey_factory` 直接抛 `ComputerControlError`，让 runtime.py:236-242 的既有降级路径跳过热键，不在 Linux 上碰 Win32。退出调用已存在的 `shutdown_process_computer_runtime("serve_exit")`（runtime.py:394）。没有 publisher 时不得声称围观已接线。
+6. per-account 锁：`YCODE_DIR/serve.lock`，`fcntl.flock` + pid 文件。SIGTERM/SIGINT → `api.shutdown()` + `shutdown_process_computer_runtime("serve_exit")` + `lan.stop()`，确认 preview 端口和 Chromium 进程都没了。
 
 **改造点清单**（对应 core-service.md 第二节 R1-R12）：
 
 | # | 改造点 | 证据 file:line | 改法（零回归约束） |
 |---|---|---|---|
-| S1 | frameless Linux import 即崩 | core/frameless.py:34、75-99、101-117、204/217；gui_bridge.py 顶层 `_MONITORINFO` import | Windows 原生绑定区整体守卫化/惰性化。**`_MONITORINFO/_MINMAXINFO` 不是纯平台无关 Structure**，其字段依赖 wintypes：选择为 Linux 定义等价 DWORD/RECT/POINT 等中立 ctypes 类型并保留结构，或把结构及 gui_bridge 顶层 import 一并平台隔离；不得只跳过 wintypes import。Windows 原生路径与 DWM 行为不变 |
+| S1 | frameless Linux import 即崩 | core/frameless.py:34、75-99、101-117、204/217；gui_bridge.py:47 顶层 `from core.frameless import _MONITORINFO` | **选定一种做法，不留二选一。** 在类定义之前提供等宽类型：win32 用 `wintypes`，其它平台用 `ctypes.c_uint32` / `c_long` / 自建 RECT、POINT。`_MONITORINFO` 与 `_MINMAXINFO` 继续无条件定义，这样 gui_bridge.py:47 在 Linux 能导入。`WINFUNCTYPE`、`windll.user32`（:101-117）和函数内 `dwmapi`（:204、:217）整段放进 `sys.platform == "win32"`。禁止只删掉 `from ctypes import wintypes` 却留下字段引用。Windows 上 DWM 行为不变。gui_bridge.py:186 起的光标贴边已经先判断 win32，不用改调用顺序 |
 | S2 | `_emit_raw` 无窗口掐断广播 | gui_bridge.py:3809-3831（早退 :3810-3811，LAN 广播 :3824-3826，飞书 :3829-3831） | **保留 `_shutting_down` 早退不变（审查 Q4 必改）**，仅移除 `not self._window` 条件：窗口存在才 `_queue_js_payload`；非关闭期 LAN/飞书（及 P4 云中转）广播无条件执行。有窗口时与关闭期的执行顺序均与现状完全一致 |
 | S3 | serve 入口与初始化序列 | gui_main.py:148-174、923-970；gui_bridge.py:4382-4398、8106-8220 | 新增 `--serve` 分支 + `serve_main()`（上文序列）；不动 `--cli` 与 GUI 分支 |
 | S4 | 权限无人应答挂死 | permission_terminal.py:524-539、551-564；gui_bridge.py:1951-1954、7915-7939 | ApiBridge 构造后 serve 必须显式替换 broker handler。默认有在线客户端时等待、10 分钟超时拒绝；**无在线客户端立即拒绝**，不创建无限等待请求；可配全自动拒绝。超时/人工应答/取消/断线/shutdown 以原子结算保证只完成一次，后到的应答返回已失效。GUI/CLI 原 handler 与无限等待语义不动 |
-| S5 | 凭据后端 | credentials.py:51-56、23-44 | 固定 `keyrings.alt.backends.file.EncryptedKeyring`（不得用明文 PlaintextKeyring），keyring 文件仅落 `/data/keyring/`；主秘密经 Docker secret/受控 env 注入，禁止写入 config.json、镜像或日志。写明重启解锁、轮换与备份恢复；验收直接检查卷内无 Key 明文。`_DataBlob`/wintypes 随 #9 平台隔离 |
+| S5 | 凭据后端 | credentials.py:51-56、23-44 | 非 Windows 固定 `keyrings.alt.file.EncryptedKeyring`，禁止 `PlaintextKeyring`。进程启动时 `keyring.set_keyring(...)`，文件目录只在 `/data/keyring/`（用该后端的 `file_path` 或 `XDG_DATA_HOME=/data`，二选一写进启动代码并加测试）。主口令来自 Docker secret 文件 `/run/secrets/keyring_password`，读入后赋给该后端的非交互口令入口。以容器里安装的 keyrings.alt 源码为准：若它认 `KEYRING_CRYPTFILE_PASSWORD`，就设这个变量；若只认属性，就设属性。禁止 `getpass`，stdin 不是 TTY 时必须立刻失败而不是卡住。口令不进 config.json、镜像、命令行参数和日志。重启用同一 secret 解锁。轮换口令 = 用旧口令读出全部 Key、用新口令写回、替换 secret、重启容器。验收：卷内文件检索不到模型 Key 明文。`_DataBlob` / wintypes 随浏览器清单第 9 项做平台隔离 |
 | S6 | 单实例锁 | gui_main.py:699-831（:721-722 非 win32 返回 False） | serve 用 flock + pid 文件；一账号一容器由网关保证 |
-| S7 | LanServer bind/对外地址 | lan_server.py:412-453、1123-1154 | 构造加 `bind` 并贯穿 `_serve` 与 start 返回（**默认 `0.0.0.0` 不变**）；`remote_public_url` 仅覆盖 bind_url 对外 HTTPS 前缀，不改变实际监听。容器不 publish 端口；serve 默认禁用 MCP，验收实际检查 Docker publish 与网络，而非只看 Caddyfile |
-| S8 | 数据目录 5 处残留 | tokenrhythm_auth.py:64-68；workflows/store.py:44-45（另 skill_sync.py:17-18）；hooks/zcode_import.py:385；harness/tool_adapters.py:154；skills.py:650-661 | 统一改走 `config.YCODE_DIR` 或显式读 env（照 hooks/registry.py:36-45 范式）；`~/.agents/skills` 兼容扫描在 server 档关闭。Windows 默认路径值不变（YCODE_DIR 缺省即 ~/.ycode） |
+| S7 | LanServer bind/对外地址 | 构造 lan_server.py:379；监听 `_serve` :1147-1154（:1150 写死 `host="0.0.0.0"`）；`start` 返回 :1145。:412-453 是 `_detect_lan_ip` / `bind_url`，里面拼的是带 `?token=` 的对外 URL，**不是监听地址** | 给构造函数加 `bind`，默认 `"0.0.0.0"`，并传到 :1150 和 :1145 的返回值。新增配置键 `remote_public_url`（当前仓库没有这个键），只替换 `bind_url` 的对外前缀，不改变监听。serve 使用第 10 节的固定端口 8766，不再 `port=0`。容器不 publish。验收看 `docker port` 和实际连入，不看 Caddyfile 文本 |
+| S8 | 数据目录残留 | tokenrhythm_auth.py:64 与 :68；workflows/store.py:44-45；skill_sync.py:17-18；hooks/zcode_import.py:385；harness/tool_adapters.py:154；skills.py:682 | 改走 `config.YCODE_DIR` 或像 hooks/registry.py:36-45 那样读 `YCODE_DATA_DIR`。server 档跳过 skills.py:682 的 `~/.agents/skills`。Windows 上不设 `YCODE_DATA_DIR` 时路径仍是 `~/.ycode` |
 | S9 | Windows 专属功能面 | gui_browser_mixin.py:6-7,48；gui_snip_mixin.py:365；gui_terminal.py:140；gui_main.py:858-875 | serve 不加载窗口步骤；桥方法保留 `unsupported_platform` 降级；工具表由 server 档裁剪（4.3 #10） |
 | S10 | 调试残留 | llm.py:379-397 | 改为默认关闭的 env 开关；优先保留原 Windows 路径开关的兼容行为，不得仅凭 Linux no-op 就声称删除对 Windows 无风险 |
 | S11 | 服务不依赖前端首屏 | gui_bridge.py:4377-4398 | S3 已覆盖：启动序列显式触发，`get_initial_state` 幂等保留 |
 | S12 | 退出收尾 | gui_main.py:1173-1181；gui_bridge.py:2419-2430；lan_server.py:1188-1198 | 信号 → shutdown 链；`shutdown` 已在远程黑名单（lan_server.py:316） |
 | S13 | `/metrics` 运维探针（新增） | lan_server.py:950-971（路由表）、memory.py:962（token_usage 表） | serve 模式注册 `/metrics` 路由，worker token 鉴权；GUI 模式不注册 |
 
-**worker token 供给**：网关在账号开通时生成 `secrets.token_urlsafe(24)`，预写账号卷 config.json 的 `remote_pair_token` / `remote_pair_token_expires_at`（config.py:450-451）+ `remote_token_ttl=0`（永久，lan_server.py:498-505）；worker 启动自动恢复（lan_server.py:630-639、1126）。轮换 = 网关重写 config + 重启容器（旧连接随进程消亡）。正式网关形态下浏览器/App 不持有 worker token；P1 无网关时，WS 配对 token 是明确的独立过渡例外，预览 HTTP 仍只由 Caddy 验权后向上游注入，P2 全部收回。
+**worker token 供给**：网关在账号开通时生成 `secrets.token_urlsafe(24)`，预写账号卷 config.json 的 `remote_pair_token` / `remote_pair_token_expires_at`（config.py:450-451），并把 `remote_token_ttl` 写成 0。lan_server.py:498 的注释说明 TTL≤0 表示永不过期；签发实现在 :504-505。worker 启动走 `_load_token_from_config`（:630 起，`start` 在 :1126 调用）。轮换 = 网关重写 config + 重启容器。这个 token 就是 LanServer 的 WS 凭据，不是另一种凭据。P2 起浏览器和 App 不持有它，由网关在服务器侧首帧送出。P1 没有网关时，页面上的配对 token **就是这同一枚 worker token**，现有 shim 还会把它写入 localStorage（frontend/mobile-shim.js:23-31）。P1 必须在登录页和威胁说明里写明这一点；P2 删除这条直连模式。预览 HTTP 从 P1 起就不把 worker token 放进浏览器，见 4.3。
 
 **新建文件清单**：
 ```
@@ -266,7 +279,7 @@ deploy/worker.Dockerfile      # 基于 playwright/python:v1.62.0-jammy，非 roo
 **传输层（复用 mobile-shim 协议，remote-mobile.md 第二节为规格）**：
 - `gateway-shim.ts`：复用 4.1 的完整 epoch 状态机，首帧 `{"jwt"[,"last_seq","last_boot_id"]}`；hello/seq_reset/resync_required 必须先于 RPC/事件扇出处理。4401 先 refresh 再重连，refresh 失效才回登录页。RPC Proxy/onBridgeEvent/2s 退避保留，水位键按服务器+账号+profile 隔离。
 - **双后端 profile**：`agent` 连 `/ws/agent`，`desktop` 连 `/relay/client` 并首帧提交 JWT/device_id。两 profile 复用协议但使用不同水位命名空间；切服务器、退出换号或切 profile 时先关闭旧 WS、取消 pending RPC，再清会话/事件/设备缓存，防止旧帧写入新账号 store。
-- P1 过渡：网关未就绪时支持 `token` 直连模式（Caddy 反代 worker，URL `?token=` 配对，与现有 shim 完全一致），P2 起切换 JWT 模式；传输层以接口抽象隔离两种鉴权。
+- P1 过渡只有一种例外：浏览器直连 worker 的 WS 仍走现有 shim 的 `?token=`（frontend/mobile-shim.js:8-9、:24）。这枚 token 就是 worker token，不是另一套口令。新的 `gateway-shim.ts` 在 P1 可以读 URL 一次，然后只放进 sessionStorage，关掉标签即丢；不要为了「和旧 shim 完全一致」再写进 localStorage。P2 起删除 `?token=` 模式，网关端点全部首帧 JWT。Caddy 访问日志按第 10 节打码。预览图不走这条例外。
 
 **页面清单**：
 | 路由 | 内容 | 参照资产 |
@@ -323,7 +336,19 @@ app/
 - 配对后业务帧沿用 LanServer：RPC `{"method","args","id"}` → `{"id","result"|"error"}`；事件 `{"type","data"[,"seq"]}`。网关只做 RPC id 命名空间化和传输级缓冲，不解析 method 语义。
 - **单连接与冒用处理**：每个 device_id 同时只允许一条注册连接；新合法注册使 `connection_generation` 原子递增，旧连接立即 close 4401，其后的帧与在途应答全部作废。设备 token 可独立冒充桌面接收主人后续 RPC，不能写成“无影响”；因此必须轮换/吊销即踢线、日志脱敏，并测试攻击者抢先注册与旧新桌面竞争。
 - **桌面侧有限补发**：EventReplayBuffer 与 seq 随 GUI 进程存活；relay 断开期间仍对白名单事件打 seq 并写入桌面 128 帧缓冲。重连注册成功后，先按序上传仍在窗口内的离线帧，再进入实时发送；网关按 `(device_id,boot_id,seq)` 去重，保留每设备 128 帧镜像。GUI 重启导致 boot_id 变化时，网关清空镜像并向所有配对 App 推 `{"type":"device_reset","data":{"device_id","boot_id"}}`，App 重置水位并 `get_initial_state`。
-- **App 持续在线也必须收敛**：每次桌面重新上线，网关都向该设备所有配对 App 推 `device_online{device_id,boot_id,connection_generation}`。App 比较自身水位与 device_online/后续 seq：窗口可覆盖则请求补发；boot_id 不同、出现序号空洞、128 帧溢出、桌面或网关出站队列丢帧时，服务端发 `resync_required`，App 停止应用旧 replay，清本地水位并通过 `get_initial_state` 全量自愈。只能承诺保留窗口内事件按协议去重及溢出后的最终状态收敛，不能承诺所有历史事件绝不丢失。
+- **App 持续在线也必须收敛**：桌面注册成功后，网关向该设备已连上的每个 App 推一帧，不要求 App 再发「请求补发」（没有这个方法）：
+
+  ```json
+  {"type":"device_online","data":{"device_id":"...","boot_id":"...","connection_generation":1,"oldest_seq":10,"newest_seq":20}}
+  ```
+
+  `oldest_seq` / `newest_seq` 来自网关手里的 128 帧镜像；镜像为空时两个都为 null。网关接着按 seq 升序把 App 还没见过的帧推下去。出现下面任一情况时不推残窗，改发：
+
+  ```json
+  {"type":"resync_required","data":{"device_id":"...","boot_id":"...","reason":"boot|gap|overflow|queue_drop"}}
+  ```
+
+  条件：`boot_id` 变了、`oldest_seq > app.last_seq+1`、镜像因为 128 上限丢过帧、出站队列丢过帧。App 收到后停用旧 replay，清本 profile 水位，调用 `get_initial_state`。只承诺窗口内事件去重，以及溢出之后最终状态能对齐。不承诺历史事件一条不丢。桌面 `boot_id` 由 `CloudRelayClient` 每进程生成一次（`secrets.token_hex(8)`），只出现在注册请求里。
 - **背压与在途 RPC**：CloudRelayClient 出站 500 条有界队列 + put_nowait，满则记录丢帧并触发 resync_required，绝不阻塞回合线程；relay 断开时在途 RPC 由网关立即回 `{"id":…,"error":"device_offline"}`，App 离线时发 RPC 同样即时报错。一台桌面并发 App 客户端上限 4。
 
 **桌面侧设计**（参考飞书五件套，remote-mobile.md 4.1；帧层弃用 lark protobuf，用 JSON 桥接协议）：
@@ -367,7 +392,7 @@ gateway/relay.py               # （已列于 4.1）
 - **设备**：列表（归属账号、在线状态、last_seen）；生成设备 token（`secrets.token_urlsafe(32)`，DB 只存 SHA-256 哈希，明文仅在创建响应中出现一次）；吊销（置 revoked + close 4401）；轮换（新 token 生效、旧 token 立即失效）。
 - **worker**：列表（账号、容器状态、uptime、last_activity、active_turn、版本）；手动 start/stop/restart；状态变更经 `/ws/admin` 实时推送。数据源 = Docker API + `/metrics` 轮询。
 - **用量**：按账号/网关入账日聚合 token 与持久 turns；首版不展示没有历史数据源的按日 sessions，不做计费。
-- **空库 bootstrap**：提供仅本机执行的 `gateway init-admin --username …`，创建首个 admin 后永久关闭；已有任一账号时拒绝。不得提供无凭据远程建 admin 的接口。
+- **空库 bootstrap**：只在服务器本机执行 `gateway init-admin --username …`。口令从 TTY 读入，不进 argv，不进 shell 历史。创建首个 admin 后永久关闭；库里已有任一账号时拒绝。没有无凭据的远程建号接口。
 
 **改造点**：全部新建（gateway/admin.py + web/src/admin/*）。worker 侧唯一依赖是 4.2 的 `/metrics`。
 
@@ -430,7 +455,18 @@ CREATE TABLE usage_watermarks (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (account_id, model)
 );
+CREATE TABLE access_denylist (
+  jti         TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL REFERENCES accounts(id),
+  expires_at  INTEGER NOT NULL
+);
+CREATE TABLE schema_migrations (
+  version    INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
 ```
+
+`usage_daily.day` 按 Asia/Shanghai 的日历日写入。`schema_migrations` 只有向前的整数版本；网关启动时先迁移，失败则拒绝接流量。当前脚本是 version 1。
 
 设备在线状态是内存态（连接注册表），不落库；`last_seen` 供离线展示。审计日志首版用结构化文件日志（gateway.log），不建表。
 
@@ -458,7 +494,7 @@ CREATE TABLE usage_watermarks (
 |---|---|---|---|---|
 | **账号 JWT**（access + refresh） | 网关 auth.py | 浏览器 localStorage / App Keystore 安全存储 | access 30min，含 auth_epoch；refresh 30d 轮换、DB 存哈希可吊销 | 登录态；所有 REST/WS/relay 均检查 disabled/role/auth_epoch |
 | **worker token** | 网关（账号开通时生成并预写账号卷 config） | **仅网关/Caddy 受控注入点**（workers 表明文）+ worker 自身 config | `token_urlsafe(24)`，TTL=0 永久；轮换=重写 config+重启容器 | LanServer、metrics 与内部预览鉴权；浏览器/App 不持有，P1 仅 WS 配对 token 是独立过渡例外 |
-| **设备 token** | 网关管理后台（admin 操作生成） | 用户 Windows 桌面 config.json（credentials 加密写盘） | `token_urlsafe(32)`，DB 存 SHA-256；可吊销、可轮换，吊销即 close 4401 | 仅 /relay/device 注册；不能调任何 API、不能连 /ws/agent |
+| **设备 token** | 网关管理后台（admin 操作生成） | 用户 Windows 桌面 config.json（credentials 加密写盘） | `token_urlsafe(32)`，DB 存 SHA-256；可吊销、可轮换，吊销即 close 4401 | 只能注册 `/relay/device`。不能调 REST，不能连 `/ws/agent`。**能冒充这台电脑并接收主人 App 随后发出的 RPC**，见 6.2 |
 
 现有 LAN 配对 token 机制（桌面自签自发、二维码、全量轮换，lan_server.py:495-517）在 Windows GUI 本地场景**原样保留**；服务器 worker 场景签发权移到网关；「我的电脑」场景由设备 token 取代（桌面不再向手机出示二维码，配对关系在网关设备注册表）。
 
@@ -495,8 +531,8 @@ flowchart LR
 
 | token | 泄露途径 | 影响 | 缓解 |
 |---|---|---|---|
-| 账号 JWT | XSS 偷 localStorage；URL query 泄露 | 冒用账号对话/审批/我的电脑 | WS 一律首帧鉴权；每请求校验 disabled/role/auth_epoch；改密/禁用/降权递增 epoch；logout/refresh 轮换吊销对应 refresh；SPA 整体预转义与 HTTPS |
-| worker token | gateway.db 或账号卷 config 被读 | 从内部网络直连 worker | 不 publish；库文件 600；浏览器/App 永远拿不到；P1 仅 WS 配对 token 是过渡例外，预览 HTTP 由 Caddy basic-auth 后向上游注入，P2 全收回；轮换重启踢线 |
+| 账号 JWT | XSS 偷 localStorage；URL query 泄露 | 冒用账号对话/审批/我的电脑 | WS 一律首帧鉴权；每请求校验 disabled/role/auth_epoch/jti；改密、禁用、降权递增 epoch 并在 5 秒内踢线；登出只废本机 refresh 和本机 jti。失效矩阵见 10.3。SPA 预转义，全站 HTTPS |
+| worker token | gateway.db 或账号卷 config 被读；P1 页面持有同一枚 token | 从内部网络直连 worker；P1 时 XSS 也能从浏览器拿走它 | 不 publish；库文件 600。P2 起浏览器/App 不持有。P1 页面持有的就是这枚 token，只许放 sessionStorage，并在界面写明。预览 HTTP 从 P1 起由 Caddy 在 basic-auth 通过后注入，不进图片 URL。P2 删掉直连模式。轮换后重启容器踢线 |
 | 设备 token | 桌面 config、粘贴过程或反向代理日志泄露 | **可冒充桌面并接收主人 App 后续 RPC/伪造事件**，并非无影响 | 首帧鉴权、DB 哈希、单连接 generation；吊销/轮换原子更新并 close 4401；账号禁用同时使设备连接失效；注册不授予其他 API |
 
 ### 6.3 远程回合限制沿用清单（服务器与我的电脑均生效）
@@ -514,27 +550,29 @@ flowchart LR
 
 ## 7. 分阶段实施计划
 
-**贯穿约束（R1/R2 零回归）**：先在同一 Windows 环境对基线提交运行 pytest、frontend、frontend-mobile，记录既有失败/跳过与依赖版本；候选版本以**无新增失败**为门槛。GUI、CLI 交互 run_cli、headless run_headless 分别验收，默认/cli/server 三档工具表分别快照。Q4 三组 sink、Windows headed、DPAPI、LAN 配对/重连、S10 诊断开关兼容按改动实测，不能用 Linux/安卓结果替代 Windows 结果。
+**贯穿约束（R1/R2 零回归）**：口径见第 10.6 节。基线提交固定为 `dcb3bc01`。候选版本的门槛是「没有新增失败」，不是「全绿」。既有失败只有在同一个测试节点、同一类错误上才豁免。GUI、CLI 交互、CLI headless 分开记。Linux 或安卓的结果不能代替 Windows。
 
 ### P1：服务器单账号链路（验证核心可行性）
 
-任务：
-1. **P1a 先做最小垂直切片**：从空配置/空卷验证 Linux import、`--serve` 启停、S1/S4/S5/S7/S8/S10-S12、连接级 turn_source、server 工具档、浏览器默认开启与 server preflight、controller 全链到 browser_worker、headless 点击/截图、preview publisher + 同源取图、SIGTERM/PGID 清理。tokenrhythm server 档禁用。
-2. **P1b 再做完整 Web**：先冻结 Q1 协议与两个既有 shim 的改造，完成 `/chat`、`/approvals`、围观面板。P1a 通过前不得以完整页面进度代替核心链路验收。
-3. 部署：worker.Dockerfile（Playwright 镜像、非 root、CJK、LANG=C.UTF-8、EncryptedKeyring）+ Caddy TLS/basic-auth；预览由 Caddy 验权后向上游注入 worker token，浏览器不持长期 worker token。Linux 测试在容器内执行。
-4. P1 出口拍板 server 默认权限（先以 ask+Web 审批实测），完成 Key/keyring 最小备份恢复；S13 metrics 与用量在 P2 落地。
+任务按这个顺序做，前一项没过不要并行铺下一项：
+1. **P1a0 骨架（第一个可交付切片）**：S1 与 credentials.py:9 的平台隔离 → `import core.credentials`、`import gui_bridge` 在 Linux 不抛 → `--serve` 监听 127.0.0.1:8766 → `/health` 返回 JSON → S2 让无窗口的 `_emit_raw` 把事件送到 WS → S4 无客户端立即拒绝 → S6 文件锁 → S7 固定端口 → S8 路径 → MCP 不监听 8765 → tokenrhythm 的 server 档禁用。S10 诊断开关保持默认关闭。
+2. **P1a1 浏览器链**：先做连接级 `turn_source=server`（M08）。没做之前，浏览器能力会被打成 `lan` 然后恒拒。然后做工厂与 chromium 白名单（M06），再做空配置默认只开 browser、server preflight 不要求热键（M07），然后 headless 点击/截图、preview、同源取图、SIGTERM 后按进程组清理 Chromium。
+3. **P1b Web**：P1a1 通过之后才做 `/chat`、`/approvals`、围观面板，并改两个既有 shim。页面进度不能代替 P1a0/P1a1。
+4. 部署按第 10.2 节的 Caddy 与 Dockerfile。预览由 Caddy 验权后注入 worker token。P1 的 WS 直连仍会让页面持有 worker token，这是写明的例外，不是「浏览器拿不到」。
+5. server 档默认权限已经定为 `ask`（第 9 节）。P1 出口做 Key/keyring 最小备份恢复。S13 用量留到 P2。
 
 验收标准：
-- P1a 从空 `config.json` 完成 headless Chromium 打开/点击/截图，证明调用链经过 `_default_backend_factory` 到 worker；真实 `<img>` 取图 200，错误凭据 401/403，日志无 token。SIGTERM 后无 Chromium 残留，serve 权限无客户端立即拒绝、有客户端等待/超时/全拒绝均只结算一次。
-- P1b 完成对话/工具/审批/中断/重连；worker 重启后按 hello→seq_reset→replay/live 与快照合并自愈，覆盖 boot 不匹配、旧服务端无 hello、重复补发、缓冲溢出。128 帧窗口外只验收 resync，不宣称历史事件不丢。
-- Windows 以基线失败集证明无新增失败；GUI/CLI 两套链路与三档工具表达标。容器重启及最小备份恢复后会话/记忆/Key 可用，卷内无明文 Key。
+- P1a0：空卷启动后进程不因 import 退出；`GET /health` 得到 `{"ok":true,"boot_id":"..."}`；测试客户端能收到一条无窗口广播；没有 WS 客户端时权限请求立即拒绝且只结算一次；`ss` 或等价命令看不到 8765。Windows 对照第 10.6 节无新增失败。
+- P1a1：空 `config.json` 完成 headless Chromium 打开/点击/截图，调用链经过 `_default_backend_factory` 到 browser worker；真实 `<img>` 取图 200，错误凭据 401/403，日志里没有 token。SIGTERM 后没有 Chromium 残留。
+- P1b：对话、工具、审批、中断、重连可用。worker 重启覆盖 boot 不匹配、同 boot 空洞、旧服务端无 hello、重复补发。空洞只验收 `resync_required`，不宣称历史事件不丢。
+- 容器重启及第 10.5 节的最小备份恢复后，会话、记忆、Key 可用，卷内没有明文 Key。
 
 风险：wintypes/frameless 之外可能还有未发现的 Linux import 崩溃（审计为静态推断）→ 预留排查时间，逐个 import 二分定位；headless Chromium 在容器内的字体/沙箱问题 → --no-sandbox + fonts-noto-cjk + shm 1g 预案；keyring file 后端兼容性 → 兜底方案 env 注入 Key。
 
 ### P2：多账号网关 + 账号隔离 + 管理后台
 
 任务：
-1. **入口先拍板模型 Key 归属与 server 默认权限**。先实现空库 init-admin、JWT disabled/role/auth_epoch、全端点隔离矩阵和 usage_watermarks 单事务，再做管理 UI。
+1. 模型 Key 归属和 server 默认权限已在第 9 节定稿，P2 按那个做，不再重开。先实现空库 init-admin、JWT 的 disabled/role/auth_epoch/jti、全端点隔离矩阵和 usage_watermarks 单事务，再做管理 UI。
 2. gateway auth/db/workers/ws_agent/admin 与 Caddy；web 切 JWT，P1 配对 token 过渡例外全部收回；预览改由网关 JWT 鉴权后注入 worker token。
 3. /metrics + 用量聚合 + 空闲回收；账号卷/gateway.db/worker token 的备份语义入口冻结、出口恢复演练。
 4. dispatch/EventReplayBuffer 的纯抽取及 Windows LAN 回归最迟本阶段完成，Q2 新行为留 P4。
@@ -550,10 +588,10 @@ flowchart LR
 
 ### P3：Capacitor 安卓 App
 
-任务：**开工前锁定 Keystore 安全存储插件与版本，统一 App 杀进程清水位语义**；先做安装、WSS/refresh、后台/断网、杀进程、Keystore 与大帧真机矩阵，再做视觉打磨。退出换号/切服务器删除凭据、缓存与水位。
+任务：开工前在锁文件里写上所选 Keystore 插件的包名和版本。水位语义已经定了：安卓不持久化 `(boot_id,last_seq)`。先做安装、WSS/refresh、后台、断网、杀进程、Keystore 与大帧，再做视觉。退出、换号、切服务器时删掉凭据、缓存和水位。不做前台服务，不做厂商保活。
 
 验收标准：
-- APK 真机安装，登录→对话→工具卡→权限审批→围观截图全链路可用；断网/切后台重连 last_seq 补发正确；**杀进程重开为全新会话（shim 水位内存态），经 get_initial_state 状态自愈、无重复消费**；登录态保持。
+- APK 真机安装，登录→对话→工具卡→权限审批→围观截图全链路可用。进程还在时，断网或切后台重连用内存里的 last_seq 补发。进程被系统杀掉之后，水位不在了，重开必须走 `get_initial_state`，不能靠 WebView 恢复出来的 localStorage。登录态在 Keystore 里，杀进程后仍在。
 - 与浏览器端同一账号并发使用互不干扰（每连接独占上游）。
 - 首版无原生业务代码（Kotlin 仅 Capacitor 模板）。
 
@@ -570,7 +608,7 @@ flowchart LR
 - 设备 token 吊销/轮换即时踢线；单连接 generation 使旧桌面失效，冒用者先注册与旧新桌面竞争有确定结果；两 App RPC id 不串，保留窗口内补发正确。
 - dispatch_rpc 黑名单在 relay 链路逐项抽测（至少覆盖凭据读取/hook 注入/shutdown/终端写入）；全量 pytest + Windows 零回归冒烟（云中转默认关闭，关闭时 GUI 行为与现状一致）。
 
-风险：EventReplayBuffer/dispatch_rpc 抽取是纯重构但触碰 LAN 主链路 → 现有 LAN 测试全量回归 + Windows 真机手机配对冒烟；多客户端 id 映射复杂度 → 集成测试覆盖并发 RPC；桌面网络代理环境（企业代理）WSS 外连失败 → 首版明确「需直连或系统代理支持」，代理配置列后续。
+风险：EventReplayBuffer / dispatch_rpc 抽取会碰到 LAN 主链路，所以现有 LAN 测试要全量回归，并用 Windows 真机做一次手机配对。企业代理和防火墙按第 10.8 节，不在 P4 再发明第三套规则。
 
 ---
 
@@ -585,13 +623,168 @@ flowchart LR
 - **计费系统、公开注册、邀请码风控**：账号由管理员手工创建。
 - **Linux desktop 电脑操控（X11/Wayland 输入）**：linux 适配器只做 browser target，desktop 保持抛 computer_unsupported_os。
 
-## 9. 开放问题
+## 9. 已定决策
 
-1. **模型 Key 归属**：个人产品默认主人自带 Key；受邀者是否共用主人的 Key（成本归主人）还是各填各的？影响账号开通流程与用量面板语义。P2 前拍板。
-2. **server 档权限默认档位**：新账号会话默认 ask 还是 full？信任模型下 full 体验更顺但风险更高；建议默认 ask + Web 审批，主人可自行切 full。P1 实测后定。
-3. ~~tokenrhythm 厂商登录在服务器形态~~ **已裁决（P1）**：server 档先禁用该厂商入口；将来需要时改用 keyring file 后端存会话凭据再开放。
-4. ~~/relay/client 与 /relay/device 的凭据传递~~ **已裁决（r2）**：全部首帧鉴权，长期 token/JWT 不进 URL；访问日志统一脱敏。
-5. **围观截图的带宽**：P1 记录真实 PNG 流量，P3 入口前决定是否降采样/WebP；不改变截图围观边界。
-6. **备份策略**：P1 验 Key/keyring 最小恢复；P2 入口冻结账号卷/gateway.db/worker token 恢复规则、出口演练；P4 入口冻结设备 token 恢复/轮换/吊销与长连/in-flight RPC 规则、出口演练。restic/cron 运维文档随 P2 交付。
-7. ~~多设备 relay 并发上限~~ **已裁决**：≤4，网关限制（见 4.6 背压条目）。
-8. ~~P1 无网关期的公网暴露~~ **已裁决**：HTTPS + basic-auth 必做，预览由 Caddy 验权后向上游注入 worker token；P2 改网关 JWT 鉴权并收回 WS 配对 token 过渡例外。
+这些原来是开放项。r3 直接定死，避免 P2 开工时再分叉。若产品主人要改，改完再动工，不要边做边改。
+
+1. **模型 Key：各填各的。** 开通账号不复制主人的 Key。受邀者在自己的设置页写入自己的 Key，进自己的 keyring 文件。用量记在该账号上。主人不想让对方自备 Key 时，由主人把 Key 粘进对方账号，这是一次人工复制，不是平台的共享密钥功能。
+2. **server 档默认权限：`ask`。** Web 上审批。会话级可以切到 `full`，全局档位仍被 `dispatch_rpc` 拒绝。
+3. **tokenrhythm**：server 档禁用。以后要开，再用 keyring 文件存会话，不在 P1 做。
+4. **鉴权位置**：网关的 REST 用 `Authorization` 头；网关的 WS 全部首帧，长期 token 和 JWT 不进 URL。唯一例外是 P1 直连 worker 的 `?token=`，P2 删除。日志规则见 10.2。
+5. **截图带宽**：P1 只记录真实 PNG 大小。P3 开工前再决定要不要降采样。首版保持 PNG。
+6. **备份**：规则已写在 10.5，不再推迟到阶段入口「再冻结」。
+7. **一台电脑同时连着的 App ≤ 4。**
+8. **P1 公网**：HTTPS + 站点级 basic-auth。basic-auth 是站点门锁，不是账号隔离。P2 改为 JWT，并删掉 WS 配对 token。
+
+---
+
+## 10. 施工契约
+
+本节覆盖前面点了名但没写死的部分。实施时按这里写代码和配置。下面的命令和配置是契约，**未在本环境运行过**。
+
+### 10.1 worker 怎么被找到
+
+- 容器内 `LanServer` 固定 `bind=0.0.0.0`、`port=8766`。不要用 `port=0`。8765 留给现在的 MCP 默认端口，serve 默认不听它。
+- 同一端口提供 HTTP 和 WS，路径是 `/`。`GET /health`、`GET /metrics`、WebSocket 都在 `8766`。
+- Docker 网络名 `xingyao`，不 attach 到默认 bridge 以外的公开网络。容器 DNS 名等于容器名 `xingyao-worker-<account_id>`。
+- 网关连接 `http://xingyao-worker-<account_id>:8766` 和 `ws://xingyao-worker-<account_id>:8766/`。P1 单账号时 compose 里的服务名就用 `worker`，Caddy 的上游写 `worker:8766`。
+- `docker start` 之后最多等 60 秒。超时则这次连接失败，推 `worker_lost`，不在后台无限重试。
+- worker 容器不挂 `/var/run/docker.sock`。只有网关进程需要它。
+
+### 10.2 Caddy
+
+P1 用下面这份作为起点。域名、邮箱和 basic-auth 哈希由部署者填，不进 git。实施时用 `caddy adapt` 检查语法；本文件没有跑过 Caddy。
+
+```caddyfile
+{
+    email {$ACME_EMAIL}
+}
+{$SITE_DOMAIN} {
+    encode gzip
+    basicauth {
+        {$BASIC_USER} {$BASIC_HASH}
+    }
+    log {
+        output file /var/log/caddy/access.log
+        format filter {
+            wrap json
+            fields {
+                uri query {
+                    replace token REDACTED
+                    replace jwt REDACTED
+                }
+            }
+        }
+    }
+    handle /computer-preview/* {
+        reverse_proxy worker:8766 {
+            header_up Authorization "Bearer {$WORKER_TOKEN}"
+        }
+    }
+    handle {
+        reverse_proxy worker:8766
+    }
+}
+```
+
+必须满足的行为，而不是「文件里有这几行」：
+
+- 公网只开 443。`docker port` 看不到 8766 和 8765。
+- 未通过 basic-auth 的 HTTP 和 WS 都进不了 worker。
+- 预览请求由 Caddy 加上 worker token。浏览器地址栏和页面 JS 里没有这枚 token。
+- 访问日志里不出现 `token=`、`jwt=` 的值，也不出现 `/computer-preview/<token>/` 里的那段 token。若所用 Caddy 版本的 filter 打不掉路径段，就改成不记录 `/computer-preview/` 的访问行，并加一条测试证明日志文件里搜不到已知 token。
+- P1 的 WS 仍可能由页面自己在首帧送出 worker token。这条例外只存在于 P1，日志同样要打码。
+- P2 把 `basicauth` 换成网关，上游变成 `gateway:8080`。预览先由网关验 JWT，再由网关注入 worker token。
+
+### 10.3 账号失效矩阵
+
+| 动作 | access | refresh | 已建立的 WS | 设备 token / `/relay/device` | worker 容器 |
+|---|---|---|---|---|---|
+| 本机登出 | 该 jti 进 denylist，立即作废 | 只废这一枚 | 只关这一条 | 不变 | 不变 |
+| 禁用账号 | epoch+1，全部作废 | 全部作废 | 5 秒内全关 | 立即 close 4401 | `docker stop` |
+| 改密 | epoch+1，全部作废 | 全部作废 | 5 秒内全关 | 不变 | 不重启 |
+| 降权 | epoch+1 | 全部作废，重新登录后是 user | admin 的 WS 关掉 | 不变 | 不重启 |
+
+「5 秒内」是网关扫连接表主动关，不是等下一条业务帧。测试要覆盖：禁用后旧 access 调 `/api/devices` 得到 401，而不只是「不能再登录」。
+
+### 10.4 用量
+
+- 指标和 SQL 以 4.2 为准。`turns_total` 只数 `harness_turns.status='completed'` 且 `turn_kind` 不是 `resume` 的行。
+- `day` 用 `zoneinfo.ZoneInfo("Asia/Shanghai")` 取提交时刻的日期。同时把网关和 worker 的 `TZ` 设为 `Asia/Shanghai`，避免日志和入账日差一天。
+- 空模型写成 `""`。模型字符串变了就当成新行，不改历史。
+- 轮询读到指标之后、事务提交之前崩溃：下一次用同一水位重算，不能出现两行增量。测试用注入的失败点证明这一点。
+
+### 10.5 备份和升级
+
+备份集合：
+
+- 每个账号卷：`/data/config.json`、`/data/ycode_gui.db`（含 wal/shm 先 checkpoint）、`/data/keyring/`、工作区目录。
+- 口令文件：`/run/secrets/keyring_password` 的离线副本，和卷分开存放。
+- P2 起加上 `gateway.db`。里面有密码哈希、refresh 哈希、设备 token 哈希、worker token 明文。文件权限 600。
+
+恢复：
+
+- 停掉对应容器或网关，把文件放回原路径，用同一口令启动。
+- 恢复是时点替换。恢复之后所有 WS 断开，用户重新登录。进行中的 RPC 直接失败，不自动重放。
+- worker token 以恢复出来的 config.json 和 gateway.db 为准。两边不一致时以 gateway.db 为准，由网关再写回 config 并重启该容器。
+- 已吊销的设备 token 以恢复出来的 `gateway.db` 为准。旧库会把后来的吊销「倒回去」，这是时点恢复的结果，要在运维说明里写一句，而不是假装吊销永存。
+- P1 的最小演练：写入一个模型 Key，停容器，只拷走上述文件和口令，换一个空目录启动，Key 能解密，卷内文件搜不到明文。
+- 升级：账号卷沿用现有 `MemoryManager` 的建表和 `ALTER`（memory.py 里已有）。网关只跑 `schema_migrations` 的向前脚本。迁移失败则进程以非 0 退出，不接流量。镜像标签等于 `core/version.py` 的版本号。换镜像时停容器、换镜像、原卷启动，不新建空卷。
+
+桌面 GUI 的 `~/.ycode` 和服务器账号卷不是同一份数据。首版不做同步。要搬家就停应用后手工拷数据库，不在本方案里做自动迁移。
+
+### 10.6 Windows 零回归怎么记
+
+基线提交：`dcb3bc01`。同一台 Windows、同一套已安装依赖，不在本方案里新装包。
+
+采集：
+
+- `python -m pytest tests/ -q --tb=line`，保存失败节点和错误类型。
+- `frontend` 与 `frontend-mobile` 各自的现有测试命令，同样保存失败节点。
+- 记录 Python 版本和两条前端的 lock 文件哈希。
+
+豁免：候选版本里，失败节点和错误类型都落在基线集合内，才算既有失败。新出现的失败、从通过变成失败、从失败变成另一种错误类型，都算新增失败。跳过原来通过的测试也算新增失败。门槛是没有新增失败。基线本身有失败时，不要求先修到全绿。
+
+CLI 分两次，用假模型和临时 `YCODE_DATA_DIR`：
+
+- 交互：`python gui_main.py --cli`，脚本喂一行消息、权限提示回答 `n`、再退出。比对退出码、关键 stdout/stderr、会话库里有没有那条用户消息。
+- headless：`python gui_main.py --cli -p <固定提示> --session <名>`。比对退出码和输出。
+- 再各跑一次 `YCODE_TOOL_PROFILE=cli`。未设置 profile 时工具表必须仍是 `full`。新增的 `server` 档不得改变上面四组结果。
+
+GUI 至少覆盖：启动到窗口出现、新建会话、发送一条消息并中断、权限卡允许/拒绝、LAN 配对后断开再连、Windows 上 headed 浏览器能打开、DPAPI 凭据重启后仍能读、关闭窗口过程中不再向 LAN/飞书送事件。S2 改动后加三组：有窗口时顺序仍是序列化 → JS → LAN → 飞书；无窗口且未关闭时 LAN/飞书收到、JS 不入队；关闭中三个 sink 都不调用。
+
+这些验收都还没跑。写「通过」时必须附上命令输出，不能引用本文。
+
+### 10.7 安卓
+
+- 同一套 SPA。运行时若存在 Capacitor，水位只用内存变量，禁止 localStorage 和 Preferences。杀进程后没有水位，重开调用 `get_initial_state`。
+- 切到后台不断言连接还在。回到前台如果 WS 已死，按普通重连。不做前台服务，不引导用户关闭电池优化。
+- JWT 和 refresh 只进 P3 选定的 Keystore 插件。服务器地址可以进 Preferences。
+- 首版 APK 自己安装，不进 `core/updater.py`，也不塞进 Gitee Release 的 Windows 安装包附件。
+
+### 10.8 Windows 防火墙、代理、分发
+
+- 「我的电脑」只有出站 WSS。不需要给星瑶加 Windows 入站防火墙规则。公司电脑拦截出站 443 时，本方案不提供绕过办法。
+- 代理只认进程能看见的环境变量 `HTTPS_PROXY` / `https_proxy`。不需要用户名密码的代理可以走系统环境。需要账号的代理、以及私有根证书的 TLS 拦截，首版不做配置界面。桌面若已把企业根证书放进系统信任库，就用默认 SSL 上下文；否则连接失败并在云中转卡片上显示错误，不重试到阻塞 GUI。
+- Windows GUI 和 CLI 继续用现有更新器：`core/updater.py` 从 Gitee `feng-chenhao/xingyao-y-code` 拉 Release。服务器镜像不走这条链路，在服务器上构建或 `docker load`。版本号只有 `core/version.py` 一处。
+- 安卓包的升级是用户重装 APK。不复用 exe 更新器。
+
+### 10.9 仍要产品主人点头的唯一变更
+
+第 9 节已经按推荐项写死。若主人不同意「受邀者自备 Key」或「默认 ask」，只改第 9 节对应两条和设置默认值，其它契约不用重开。
+
+### 10.10 引用修正
+
+`dcb3bc01` 上这几处和 r2 原稿不一致，实施时用下面的位置：
+
+| r2 写法 | 实际 |
+|---|---|
+| skills.py:650-661 | 文档在 :650-661，`~/.agents/skills` 的 `_add` 在 :682 |
+| lan_server.py:412-453 当作监听 bind | :412-453 是 `bind_url`（含 `?token=`）。监听在 :1150，构造在 :379，`start` 返回在 :1145 |
+| 会话 revision | `get_initial_state` 没有这个字段。快照在 gui_bridge.py:4503-4517 |
+| `turns_total` 未指数据源 | `harness_turns`，状态值是 `completed`（core/harness/models.py:12），不是 `finished` |
+| `remote_public_url` | 仓库里还没有这个键，按 S7 新增 |
+| command_shell.py:12 | 文件是 `core/command_shell.py`，:12 导入的是 settings |
+| gui_browser_mixin.py:6-7 | 那两行是文档字符串；win32 判断在 :48 |
+
+其余 r2 抽样（credentials.py:9 与 :23-24、controller.py:190-192 与 :575、tool_registry.py:182、lan_server.py:912 与 :921、lan_server.py:969-970、settings.py:102-104）在该提交上仍与描述一致。本表是静态对照，没有跑测试。
