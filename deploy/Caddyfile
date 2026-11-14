@@ -1,0 +1,29 @@
+{
+    email {$ACME_EMAIL}
+}
+{$SITE_DOMAIN} {
+    encode gzip
+    basicauth {
+        {$BASIC_USER} {$BASIC_HASH}
+    }
+    log {
+        output file /var/log/caddy/access.log
+        format filter {
+            wrap json
+            fields {
+                uri query {
+                    replace token REDACTED
+                    replace jwt REDACTED
+                }
+            }
+        }
+    }
+    handle /computer-preview/* {
+        reverse_proxy worker:8766 {
+            header_up Authorization "Bearer {$WORKER_TOKEN}"
+        }
+    }
+    handle {
+        reverse_proxy worker:8766
+    }
+}

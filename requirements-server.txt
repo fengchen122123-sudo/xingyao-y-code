@@ -1,0 +1,3 @@
+# server 档额外依赖。桌面 Windows 安装包不使用这份清单。
+keyrings.alt
+pycryptodome

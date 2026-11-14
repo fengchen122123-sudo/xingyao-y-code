@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>星瑶</title>
+</head>
+<body>
+  <p>服务器地址只存在这台手机的偏好里。登录凭据走系统密钥库，不写进偏好。</p>
+  <form id="server-form">
+    <input id="server" name="server" placeholder="https://你的服务器" required />
+    <button type="submit">保存</button>
+  </form>
+  <script>
+    const key = "xingyao.server";
+    const input = document.querySelector("#server");
+    const prefs = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Preferences;
+    if (prefs) {
+      prefs.get({ key: key }).then(function (result) {
+        if (result && result.value) input.value = result.value;
+      });
+    }
+    document.querySelector("#server-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (prefs) prefs.set({ key: key, value: input.value });
+    });
+  </script>
+</body>
+</html>

@@ -114,6 +114,14 @@ def main() -> int:
         from core.lan_server import PROCESS_BOOT_ID, LanServer
         from core.serve.permission_policy import install_serve_permission_policy
 
+        try:
+            from core.serve.keyring_setup import install_server_keyring
+
+            if not install_server_keyring(_data_dir()):
+                logger.info("未配置钥匙串口令文件，模型 Key 暂不能加密落盘")
+        except Exception:
+            logger.exception("安装文件钥匙串失败")
+
         api = ApiBridge(mcp_manager=mcp_manager)
         bind, port = _listen_endpoint()
         lan = LanServer(bridge=api, port=port, bind=bind)

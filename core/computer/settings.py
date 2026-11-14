@@ -8,6 +8,7 @@ profile 展示路径。不得导入 controller 或 hotkey，不得执行任何�
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ _settings_generation = 0
 _BROWSER_DEFINITIONS = {
     "edge": "Microsoft Edge",
     "chrome": "Google Chrome",
+    "chromium": "Chromium",
     "embedded": "星瑶内置浏览器",
 }
 
@@ -99,8 +101,15 @@ def _bump_settings_generation() -> None:
         _settings_generation += 1
 
 
+def _server_profile() -> bool:
+    return os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server"
+
+
 def _read_bool(data: dict, key: str) -> bool:
     if key not in data:
+        # serve 空配置默认只开浏览器。桌面开关缺省仍是关。
+        if key == BROWSER_CONTROL_CONFIG_KEY and _server_profile():
+            return True
         return False
     value = data[key]
     if type(value) is not bool:
@@ -110,13 +119,19 @@ def _read_bool(data: dict, key: str) -> bool:
 
 def _read_browser(data: dict) -> str:
     if COMPUTER_BROWSER_CONFIG_KEY not in data:
-        # 配置缺省：GUI 进程注入的默认值优先（embedded），否则 edge
-        return _process_default_browser or DEFAULT_COMPUTER_BROWSER
+        # 配置缺省：GUI 进程注入的默认值优先（embedded）。
+        # Windows 否则仍是 edge；Linux 回落到 chromium。
+        if _process_default_browser:
+            return _process_default_browser
+        # 桌面缺省仍是 edge。只有 serve 档在非 Windows 上改用 chromium。
+        if _server_profile() and sys.platform != "win32":
+            return "chromium"
+        return DEFAULT_COMPUTER_BROWSER
     value = data[COMPUTER_BROWSER_CONFIG_KEY]
     if type(value) is not str or value not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
             "computer_invalid_config",
-            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge、chrome 或 embedded",
+            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge、chrome、chromium 或 embedded",
         )
     return value
 
@@ -173,7 +188,7 @@ def get_browser_profile_dir(browser: str) -> Path:
     if type(browser) is not str or browser not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
             "computer_invalid_config",
-            f"不支持的浏览器：{browser!r}，只支持 edge、chrome 或 embedded",
+            f"不支持的浏览器：{browser!r}，只支持 edge、chrome、chromium 或 embedded",
         )
     if browser == "embedded":
         from core.embedded_browser import profile_dir
@@ -194,9 +209,12 @@ def load_computer_settings(*, platform: str | None = None) -> ComputerSettingsSn
     platform = platform or sys.platform
     data = config._load()
     browser = _read_browser(data)
+    desktop_enabled = _read_bool(data, COMPUTER_CONTROL_CONFIG_KEY)
+    if _server_profile():
+        desktop_enabled = False
     return ComputerSettingsSnapshot(
         browser_control_enabled=_read_bool(data, BROWSER_CONTROL_CONFIG_KEY),
-        computer_control_enabled=_read_bool(data, COMPUTER_CONTROL_CONFIG_KEY),
+        computer_control_enabled=desktop_enabled,
         computer_browser=browser,
         browser_options=list_browser_options(platform=platform),
         profile_display_path=str(get_browser_profile_dir(browser)),
@@ -253,7 +271,7 @@ def set_computer_browser(value: object, active_run: bool) -> ComputerSettingsSna
     if type(value) is not str or value not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
             "computer_invalid_config",
-            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge、chrome 或 embedded",
+            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge、chrome、chromium 或 embedded",
         )
     if not config.save_config_value(COMPUTER_BROWSER_CONFIG_KEY, value):
         raise ComputerControlError(

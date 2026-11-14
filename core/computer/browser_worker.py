@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--browser", required=True, choices=("edge", "chrome"))
+    parser.add_argument("--browser", required=True, choices=("edge", "chrome", "chromium"))
     parser.add_argument("--profile", required=True)
     parser.add_argument("--command-timeout", type=float, default=30.0)
     parser.add_argument("--viewport-width", type=int, default=1440)

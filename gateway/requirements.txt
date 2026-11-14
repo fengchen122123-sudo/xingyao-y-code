@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+websockets
+docker
+argon2-cffi
+pyjwt

@@ -93,19 +93,22 @@ def resolve_computer_capability(
     except Exception:
         pass
 
-    if turn_source != "local":
+    if turn_source not in ("local", "server"):
         return _rejected(
             settings, "computer_remote_forbidden", "局域网、手机或飞书等远程发起的回合不允许电脑操控"
         )
-    if not settings.platform_supported:
+    if turn_source != "server" and not settings.platform_supported:
         return _rejected(
-            settings, "computer_unsupported_os", "电脑操控目前仅支持 Windows"
+            settings,
+            "computer_unsupported_os",
+            "桌面电脑操控目前仅支持 Windows；Linux 服务只提供无头浏览器",
         )
 
     targets = []
     if settings.browser_control_enabled:
         targets.append(ComputerTarget.BROWSER.value)
-    if settings.computer_control_enabled:
+    # server 来源只允许浏览器。桌面目标即使配置打开也不放行。
+    if settings.computer_control_enabled and turn_source != "server":
         targets.append(ComputerTarget.DESKTOP.value)
     if not targets:
         return _rejected(settings, "computer_disabled", "电脑操控未开启")
