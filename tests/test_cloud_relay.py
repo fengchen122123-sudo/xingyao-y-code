@@ -35,6 +35,39 @@ def test_dispatch_strips_client_turn_source_and_blocks_private_methods(monkeypat
     assert denied["error"]["code"] == "method_not_allowed"
 
 
+def test_client_registers_on_an_open_socket_and_flushes_the_window():
+    from core.cloud_relay.client import CloudRelayClient
+
+    class Socket:
+        def __init__(self):
+            self.sent = []
+            self.incoming = [json.dumps({
+                "type": "relay_registered",
+                "data": {"device_id": "dev", "name": "家里的台式机", "connection_generation": 2},
+            })]
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+        def recv(self):
+            if not self.incoming:
+                raise ConnectionError("closed")
+            return self.incoming.pop(0)
+
+    delivered = []
+    client = CloudRelayClient(send=delivered.append, boot_id="boot")
+    client.submit("notice", {"message": "queued"})
+    socket = Socket()
+    client.pump(socket, "device-token", "dev")
+    first = json.loads(socket.sent[0])
+    assert first["type"] == "relay_register"
+    assert first["token"] == "device-token"
+    assert first["boot_id"] == "boot"
+    assert client.generation == 2
+    assert any("queued" in item for item in delivered)
+    assert client.connected is False
+
+
 def test_outbound_queue_does_not_block_when_full():
     sent = []
     client = CloudRelayClient(send=sent.append, boot_id="abc")

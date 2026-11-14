@@ -10,7 +10,7 @@ export const useAuthStore = defineStore("auth", {
     accountId: sessionStorage.getItem(SESSION_ACCOUNT) || "",
     credential: sessionStorage.getItem(SESSION_TOKEN) || "",
     role: "user",
-    mode: "gateway" as "gateway" | "worker",
+    mode: "gateway" as const,
   }),
   getters: {
     signedIn: (state) => Boolean(state.credential && state.server),
@@ -24,18 +24,14 @@ export const useAuthStore = defineStore("auth", {
       });
       if (!response.ok) throw new Error("登录没有通过");
       const body = await response.json();
-      this.remember(server, username, body.access_token, body.role || "user", "gateway");
+      this.remember(server, username, body.access_token, body.role || "user");
       sessionStorage.setItem("yc-refresh", body.refresh_token);
     },
-    connectWorker(server: string, token: string) {
-      this.remember(server, "worker", token, "user", "worker");
-    },
-    remember(server: string, accountId: string, credential: string, role: string, mode: "gateway" | "worker") {
+    remember(server: string, accountId: string, credential: string, role: string) {
       this.server = server;
       this.accountId = accountId;
       this.credential = credential;
       this.role = role;
-      this.mode = mode;
       sessionStorage.setItem(SESSION_SERVER, server);
       sessionStorage.setItem(SESSION_ACCOUNT, accountId);
       sessionStorage.setItem(SESSION_TOKEN, credential);

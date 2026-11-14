@@ -8279,6 +8279,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "settings": {
                     "enabled": bool(data.get(config.CLOUD_RELAY_ENABLED_KEY, False)),
                     "url": data.get(config.CLOUD_RELAY_URL_KEY) or "",
+                    "device_id": data.get(config.CLOUD_RELAY_DEVICE_ID_KEY) or "",
                     "state": state,
                 },
             }
@@ -8291,6 +8292,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             payload = payload or {}
             config.save_config_value(config.CLOUD_RELAY_ENABLED_KEY, bool(payload.get("enabled")))
             config.save_config_value(config.CLOUD_RELAY_URL_KEY, str(payload.get("url") or ""))
+            config.save_config_value(
+                config.CLOUD_RELAY_DEVICE_ID_KEY,
+                str(payload.get("device_id") or ""),
+            )
             token = str(payload.get("token") or "").strip()
             if token:
                 from core.credentials import protect_secret

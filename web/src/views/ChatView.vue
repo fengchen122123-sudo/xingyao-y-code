@@ -5,7 +5,8 @@
       <p class="muted"><span class="dot"></span> {{ app.status }}</p>
       <article v-for="message in app.messages" :key="message.id" class="bubble" :class="message.role">
         <div class="avatar" v-if="message.role === 'agent'">星</div>
-        <p>{{ message.text }}</p>
+        <p v-if="message.role === 'user'">{{ message.text }}</p>
+        <p v-else v-html="render(message.text)"></p>
       </article>
       <WatchPanel :src="app.previewUrl" />
     </div>
@@ -21,6 +22,11 @@ import { onMounted, ref } from "vue";
 import SessionDrawer from "../components/SessionDrawer.vue";
 import WatchPanel from "../components/WatchPanel.vue";
 import { useAppStore } from "../stores/app";
+import { renderMd } from "../utils/md";
+
+function render(text: string) {
+  return renderMd(text);
+}
 
 const app = useAppStore();
 const text = ref("");

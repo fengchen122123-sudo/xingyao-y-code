@@ -49,6 +49,25 @@ class CloudRelayClient:
                 return
             self._send(item)
 
+    def pump(self, socket, token: str, device_id: str) -> None:
+        """在一条已经接通的套接字上注册并读到断开。测试注入套接字，不在这里拨号。"""
+        socket.send(json.dumps(self.register_frame(token, device_id), ensure_ascii=False))
+        while True:
+            try:
+                raw = socket.recv()
+            except Exception:
+                self.connected = False
+                return
+            if not raw:
+                self.connected = False
+                return
+            frame = json.loads(raw)
+            if frame.get("type") == "relay_registered":
+                self.handle_registered(frame)
+                self.flush()
+            elif frame.get("type") == "ping":
+                socket.send(json.dumps({"type": "pong"}))
+
     def handle_registered(self, frame: dict) -> None:
         data = frame.get("data") if isinstance(frame, dict) else None
         if isinstance(data, dict):

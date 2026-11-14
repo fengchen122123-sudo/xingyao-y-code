@@ -128,3 +128,13 @@ class WorkerManager:
             return False
         self.stop(account_id)
         return True
+
+
+class IdleSupervisor:
+    """30 秒一次的指标轮询由调用方驱动。这里只根据一份指标决定要不要停。"""
+
+    def __init__(self, manager: WorkerManager):
+        self.manager = manager
+
+    def tick(self, account_id: str, metrics: dict, now: float) -> bool:
+        return self.manager.consider_idle(account_id, metrics, now)

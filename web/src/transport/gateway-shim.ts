@@ -10,7 +10,7 @@ export interface ShimOptions {
   capacitor: boolean;
 }
 
-/** JWT 或 P1 worker token 都走首帧，不放进 URL。P1 token 只留在 sessionStorage。 */
+/** 首帧只带 JWT。工人令牌由网关在服务器侧送出，不进入浏览器。 */
 export class GatewayShim {
   bootId = "";
   lastSeq = 0;
@@ -37,14 +37,8 @@ export class GatewayShim {
     this.socket = new WebSocket(url);
     this.socket.onopen = () => {
       const frame: Record<string, unknown> = {};
-      if (this.options.profile === "desktop") {
-        frame.jwt = this.options.credential;
-        frame.device_id = this.options.deviceId || "";
-      } else if (this.options.credential.split(".").length === 3) {
-        frame.jwt = this.options.credential;
-      } else {
-        frame.token = this.options.credential;
-      }
+      frame.jwt = this.options.credential;
+      if (this.options.profile === "desktop") frame.device_id = this.options.deviceId || "";
       if (this.bootId) {
         frame.last_boot_id = this.bootId;
         frame.last_seq = this.lastSeq;

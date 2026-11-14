@@ -11,6 +11,7 @@ from collections import deque
 MAX_APPS = 4
 MIRROR_LIMIT = 128
 OUTBOUND_LIMIT = 500
+OFFLINE_AFTER = 45
 
 
 def hash_token(token: str) -> str:
@@ -59,6 +60,7 @@ class RelayRegistry:
             "generation": generation,
             "connection": object(),
             "online": True,
+            "last_ping": time.time(),
         }
         database.execute(
             "UPDATE devices SET last_seen = ? WHERE id = ?",
@@ -138,6 +140,26 @@ class RelayRegistry:
             }
         frames = [payload for seq, payload in mirror if last_seq is None or seq > int(last_seq)]
         return {"type": "replay", "frames": frames}
+
+    def touch(self, device_id: str, now: float) -> None:
+        device = self.devices.get(device_id)
+        if device is not None:
+            device["last_ping"] = now
+            device["online"] = True
+
+    def sweep(self, now: float) -> list[dict]:
+        """45 秒没有心跳就标离线。15 秒是客户端的 ping 间隔，不在这里轮询。"""
+        events = []
+        for device_id, device in self.devices.items():
+            if not device.get("online"):
+                continue
+            if now - float(device.get("last_ping") or 0) > OFFLINE_AFTER:
+                device["online"] = False
+                events.append({
+                    "type": "device_status",
+                    "data": {"device_id": device_id, "online": False},
+                })
+        return events
 
     def enqueue(self, device_id: str) -> bool:
         count = self.dropped.get(device_id, 0)

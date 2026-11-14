@@ -9,7 +9,9 @@
       <h2>我的电脑</h2>
       <p v-if="!devices.devices.length" class="muted">还没有配对的电脑</p>
       <p v-for="device in devices.devices" :key="device.id">
-        {{ device.name }} · {{ device.online ? "在线" : "电脑上的星瑶未运行" }}
+        <button type="button" class="text-button" :disabled="!device.online" @click="useDesktop(device.id)">
+          {{ device.name }} · {{ device.online ? "在线" : "电脑上的星瑶未运行" }}
+        </button>
       </p>
     </section>
     <button class="text-button" type="button" @click="leave">退出</button>
@@ -27,6 +29,11 @@ const app = useAppStore();
 const devices = useDeviceStore();
 const router = useRouter();
 onMounted(() => devices.load().catch(() => undefined));
+
+function useDesktop(deviceId: string) {
+  app.disconnect();
+  app.connectDesktop(deviceId);
+}
 
 async function leave() {
   app.disconnect();

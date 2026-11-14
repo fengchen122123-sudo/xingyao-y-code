@@ -34,6 +34,22 @@ export const useAppStore = defineStore("app", {
       this.shim = shim;
       this.status = "正在连接";
     },
+    connectDesktop(deviceId: string) {
+      const auth = useAuthStore();
+      const capacitor = Boolean((window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.());
+      const shim = new GatewayShim({
+        server: auth.server,
+        accountId: auth.accountId,
+        profile: "desktop",
+        credential: auth.credential,
+        deviceId,
+        capacitor,
+      });
+      shim.onEvent((frame) => this.apply(frame));
+      shim.connect();
+      this.shim = shim;
+      this.status = "正在连接这台电脑";
+    },
     apply(frame: { type: string; data?: unknown }) {
       const data = (frame.data || {}) as Record<string, unknown>;
       if (frame.type === "hello") return;
