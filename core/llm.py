@@ -381,19 +381,31 @@ _DEBUG_TOOLS_DUMP_FLAG = r"D:\ycodesso\llm_tools_dump.on"
 _DEBUG_TOOLS_DUMP_PATH = r"D:\ycodesso\llm_tools_dump.jsonl"
 
 
+def _debug_tools_dump_enabled() -> bool:
+    """调试落盘默认关闭。Windows 标志文件仍可用，另外认 YCODE_DEBUG_TOOLS_DUMP=1。"""
+    try:
+        import os as _os
+
+        if _os.environ.get("YCODE_DEBUG_TOOLS_DUMP", "").strip() == "1":
+            return True
+        return _os.path.exists(_DEBUG_TOOLS_DUMP_FLAG)
+    except Exception:
+        return False
+
+
 def _debug_dump_request_tools(model_name, api_base, request_tools):
     """【纯旁路 / 临时诊断】把即将发往上游的工具列表落盘。
 
     为什么需要：上游对 tools[].function.description 做必填校验时只回「tools[N]
     缺 description」，N 是它看到的数组下标；本地复算不出真实列表就只能靠这份
-    落盘对齐。仅在开关文件存在时写，任何异常只记 debug，绝不改变发送字节。
+    落盘对齐。仅在开关打开时写，任何异常只记 debug，绝不改变发送字节。
     """
     try:
         import hashlib as _hashlib
         import os as _os
         import time as _time
 
-        if not _os.path.exists(_DEBUG_TOOLS_DUMP_FLAG):
+        if not _debug_tools_dump_enabled():
             return
         tools = [tool for tool in (request_tools or []) if isinstance(tool, dict)]
         blob = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

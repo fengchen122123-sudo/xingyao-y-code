@@ -179,7 +179,9 @@ CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "fetch_image",
 })
 
-VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli")
+# server：部署档。P1a0 只把它认成合法档位，工具表仍与 full 相同。
+# 浏览器链相关的裁剪留到 P1a1，避免这一步改掉 full/cli 的请求字节。
+VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli", "server")
 
 
 def _resolve_tool_profile(profile: str | None = None) -> str:
@@ -1443,6 +1445,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         pass
     # CLI 轻量档位：剔除 GUI 专属工具（见 CLI_EXCLUDED_TOOLS 说明）。
     # 放在插件加载之后，避免插件重新注册同名工具又把它们带回来。
+    # server 档不走这条剔除，P1a0 的工具表与 full 一致。
     if _resolve_tool_profile(profile) == "cli":
         removed = 0
         for _name in sorted(CLI_EXCLUDED_TOOLS):

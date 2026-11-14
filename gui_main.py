@@ -202,10 +202,29 @@ def _dispatch_office_convert_argv() -> None:
     raise SystemExit(run_convert_worker(pair[0], pair[1]))
 
 
+def _dispatch_serve_argv() -> None:
+    """命中 --serve 时，在导入窗口和 webview 之前转入无窗口入口。
+
+    工具档位必须在这里写成 server。core.llm 会在导入期按这个变量建工具表，
+    写晚了就来不及。setdefault 不够：外层如果已经设了 cli，这里要改过来。
+    """
+    if "--serve" not in sys.argv:
+        return
+    try:
+        sys.argv.remove("--serve")
+    except ValueError:
+        pass
+    os.environ["YCODE_TOOL_PROFILE"] = "server"
+    from serve_main import main as serve_entry
+
+    raise SystemExit(serve_entry())
+
+
 # 必须排在 CLI 分派之前：本进程是被 core.office_preview 用 sys.executable 直接
 # 拉起的转换子进程，即使外层启动器（ycode.exe）再注入 --cli，也要先接住转换标志。
 _dispatch_office_convert_argv()
 _dispatch_cli_argv()
+_dispatch_serve_argv()
 
 
 def _dispatch_browser_worker_argv() -> bool:

@@ -6,7 +6,6 @@ import base64
 import ctypes
 import hashlib
 import sys
-from ctypes import wintypes
 
 DPAPI_PREFIX = "dpapi:"
 KEYRING_PREFIX = "keyring:"
@@ -20,8 +19,13 @@ CRYPTPROTECT_UI_FORBIDDEN = 0x1
 _DPAPI_ENTROPY = b"Y-CODE-DPAPI-Entropy-v1"
 
 
-class _DataBlob(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+if sys.platform == "win32":
+    from ctypes import wintypes
+
+    class _DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+else:
+    _DataBlob = None
 
 
 def _crypt32():

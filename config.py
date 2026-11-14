@@ -456,6 +456,11 @@ REMOTE_MCP_ENABLED_KEY = "remote_mcp_enabled"
 REMOTE_MCP_ENABLED_DEFAULT = True
 REMOTE_MCP_PORT_KEY = "remote_mcp_port"
 REMOTE_MCP_PORT_DEFAULT = 8765
+# 对外公布的访问前缀（https://主机）。只替换二维码/绑定 URL 的公网部分，
+# 不改变进程实际监听的地址。
+REMOTE_PUBLIC_URL_KEY = "remote_public_url"
+# serve 进程：true 时权限请求不等待客户端，直接拒绝。
+SERVE_AUTO_DENY_KEY = "serve_auto_deny_permissions"
 
 # 飞书通道（在飞书里与星瑶对话）：默认关闭，未配置时不影响任何现有功能。
 # app_secret 写盘前经 core.credentials 加密（dpapi:/keyring: 前缀），读取时解密。
@@ -834,6 +839,7 @@ KNOWN_CONFIG_KEYS = frozenset({
     # 局域网 MCP 服务（供手机端 MCP 客户端调用；未登记会在 strict_config=true
     # 下被 UnknownConfigKeysError 阻断启动）
     "remote_mcp_enabled", "remote_mcp_port",
+    "remote_public_url", "serve_auto_deny_permissions",
     # 飞书通道（在飞书里与星瑶对话）
     "feishu_enabled", "feishu_app_id", "feishu_app_secret", "feishu_approvers",
     "feishu_notify_chat_id",
