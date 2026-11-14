@@ -31,9 +31,46 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
-from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
+
+# 结构体在所有平台都定义，这样 gui_bridge 可以在 Linux 上导入。
+# Windows 继续用 wintypes，布局与改动前一致；其它平台只用等价的 ctypes 类型，
+# 不在导入期触碰 windll / WINFUNCTYPE。
+if sys.platform == "win32":
+    from ctypes import wintypes
+
+    _DWORD = wintypes.DWORD
+    _LONG = wintypes.LONG
+    _BOOL = wintypes.BOOL
+    _HWND = wintypes.HWND
+    _UINT = wintypes.UINT
+    _WPARAM = wintypes.WPARAM
+    _LPARAM = wintypes.LPARAM
+    _HANDLE = wintypes.HANDLE
+    _RECT = wintypes.RECT
+    _POINT = wintypes.POINT
+else:
+
+    class _RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    _DWORD = ctypes.c_uint32
+    _LONG = ctypes.c_long
+    _BOOL = ctypes.c_int
+    _HWND = ctypes.c_void_p
+    _UINT = ctypes.c_uint
+    _WPARAM = ctypes.c_size_t
+    _LPARAM = ctypes.c_ssize_t
+    _HANDLE = ctypes.c_void_p
 
 WM_NCHITTEST = 0x0084
 WM_NCCALCSIZE = 0x0083
@@ -74,49 +111,51 @@ class _DWM_MARGINS(ctypes.Structure):
 
 class _MONITORINFO(ctypes.Structure):
     _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("rcMonitor", wintypes.RECT),
-        ("rcWork", wintypes.RECT),
-        ("dwFlags", wintypes.DWORD),
+        ("cbSize", _DWORD),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", _DWORD),
     ]
 
 
 class _MINMAXINFO(ctypes.Structure):
     _fields_ = [
-        ("ptReserved", wintypes.POINT),
-        ("ptMaxSize", wintypes.POINT),
-        ("ptMaxPosition", wintypes.POINT),
-        ("ptMinTrackSize", wintypes.POINT),
-        ("ptMaxTrackSize", wintypes.POINT),
+        ("ptReserved", _POINT),
+        ("ptMaxSize", _POINT),
+        ("ptMaxPosition", _POINT),
+        ("ptMinTrackSize", _POINT),
+        ("ptMaxTrackSize", _POINT),
     ]
 
 # 原生 WM_NCHITTEST 边缘命中宽度（物理像素）；页面层另有透明 CSS 热区，
 # 深层 WebView2 窗口接管命中时也能进入相同的系统 resize 循环。
 RESIZE_BORDER = 3
 
-_WNDPROC = ctypes.WINFUNCTYPE(
-    wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-)
+if sys.platform == "win32":
+    _WNDPROC = ctypes.WINFUNCTYPE(_LPARAM, _HWND, _UINT, _WPARAM, _LPARAM)
 
-_u32 = ctypes.windll.user32
-_u32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LPARAM]
-_u32.SetWindowLongPtrW.restype = wintypes.LPARAM
-_u32.CallWindowProcW.argtypes = [
-    wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-]
-_u32.CallWindowProcW.restype = wintypes.LPARAM
-_u32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
-_u32.SetWindowLongW.restype = wintypes.LONG
-_u32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-_u32.GetWindowLongW.restype = wintypes.LONG
-_u32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
-_u32.MonitorFromPoint.restype = wintypes.HANDLE
-_u32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-_u32.MonitorFromWindow.restype = wintypes.HANDLE
-_u32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFO)]
-_u32.GetMonitorInfoW.restype = wintypes.BOOL
-_u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-_u32.GetWindowRect.restype = wintypes.BOOL
+    _u32 = ctypes.windll.user32
+    _u32.SetWindowLongPtrW.argtypes = [_HWND, ctypes.c_int, _LPARAM]
+    _u32.SetWindowLongPtrW.restype = _LPARAM
+    _u32.CallWindowProcW.argtypes = [
+        _LPARAM, _HWND, _UINT, _WPARAM, _LPARAM,
+    ]
+    _u32.CallWindowProcW.restype = _LPARAM
+    _u32.SetWindowLongW.argtypes = [_HWND, ctypes.c_int, _LONG]
+    _u32.SetWindowLongW.restype = _LONG
+    _u32.GetWindowLongW.argtypes = [_HWND, ctypes.c_int]
+    _u32.GetWindowLongW.restype = _LONG
+    _u32.MonitorFromPoint.argtypes = [_POINT, _DWORD]
+    _u32.MonitorFromPoint.restype = _HANDLE
+    _u32.MonitorFromWindow.argtypes = [_HWND, _DWORD]
+    _u32.MonitorFromWindow.restype = _HANDLE
+    _u32.GetMonitorInfoW.argtypes = [_HANDLE, ctypes.POINTER(_MONITORINFO)]
+    _u32.GetMonitorInfoW.restype = _BOOL
+    _u32.GetWindowRect.argtypes = [_HWND, ctypes.POINTER(_RECT)]
+    _u32.GetWindowRect.restype = _BOOL
+else:
+    _WNDPROC = None
+    _u32 = None
 
 
 # 已子类化窗口的回调引用（防 GC 回收导致窗口过程悬空）
@@ -137,9 +176,11 @@ def _edge_code(hwnd: int, lparam: int, border: int, ref_hwnd: int | None = None)
     ref_hwnd：边缘判定相对该窗口的 rect（默认 hwnd 自身）。子窗口命中时传
     父窗口句柄——子窗口几乎填满客户区，必须按父窗口边缘判定。
     """
+    if _u32 is None:
+        return None
     x = _signed_short(lparam & 0xFFFF)
     y = _signed_short((lparam >> 16) & 0xFFFF)
-    rect = wintypes.RECT()
+    rect = _RECT()
     if not _u32.GetWindowRect(ref_hwnd or hwnd, ctypes.byref(rect)):
         return None
     px, py = x - rect.left, y - rect.top
@@ -172,6 +213,8 @@ def find_webview_child_hwnds(parent_hwnd: int) -> list[int]:
     WebView2 的鼠标命中发生在最深层后代（Chrome_WidgetWin_0 常有嵌套层级），
     只子类化第一层不够；且页面加载时这些窗口会销毁重建，调用方需延迟重装。
     """
+    if sys.platform != "win32":
+        return []
     found: list[int] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -190,6 +233,8 @@ def suppress_frame_border(hwnd: int) -> bool | None:
     早于 Windows 11 22000、公开 DWM API 不支持该能力（此时保留 1px 玻璃框
     延伸换取 Win10 DWM 系统阴影）。
     """
+    if sys.platform != "win32":
+        return False
     global _border_suppression_unsupported_logged
     if not hwnd:
         return False
@@ -251,6 +296,8 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     form 为 pywebview BrowserForm；必须在 GUI 线程外的调用线程里通过 form.Invoke
     送入执行。返回是否成功。幂等：重复调用只补样式位，不重复子类化。
     """
+    if sys.platform != "win32":
+        return False
     if not hasattr(form, "Invoke") or form.Handle is None:
         return False
     hwnd = form.Handle.ToInt32()

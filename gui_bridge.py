@@ -3807,7 +3807,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._emit_raw(event_type, data)
 
     def _emit_raw(self, event_type: str, data: Any):
-        if self._shutting_down or not self._window:
+        # 无窗口的 serve 进程没有 JS 桥，但局域网和飞书仍要收到同一条事件。
+        # 正在退出时三路都不发，和原来的关停语义一致。
+        if self._shutting_down:
             return
         try:
             # ensure_ascii=False 保留中文原文（体积更小、调试可读）；
@@ -3818,7 +3820,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:
             logger.warning("序列化事件 %s 失败: %s", event_type, e)
             return
-        self._queue_js_payload(payload)
+        if self._window:
+            self._queue_js_payload(payload)
         # 广播到局域网手机客户端（broadcast 内部已吞异常，不影响桌面 JS 派发）；
         # event_type 供 LAN 层判定断线补发白名单（丢事件类别不参与补发）
         lan = getattr(self, "_lan_server", None)
@@ -8139,6 +8142,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         下次调用可重试（端口被占用属运行时状况，不该让实例停留在半成品状态）。
         供手机端 MCP 客户端（阶跃 Amoo 等）调用，与远程控制共用同一配对 token。
         """
+        # server 档只走 8766 上的远程控制。这里若再绑 8765，容器里会多开一个
+        # 带配对 token 的入口，和「serve 不监听 8765」的约定相反。
+        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server":
+            return None
         if getattr(self, "_mcp_server", None) is not None:
             return self._mcp_server
         lock = getattr(self, "_mcp_server_lock", None)

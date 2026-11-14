@@ -41,6 +41,8 @@ def workflow_env(tmp_path, monkeypatch):
     home, root = tmp_path / "home", tmp_path / "proj"
     root.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
+    # 用户档工作流落在数据目录。测试隔离把这个目录指到假的 ~/.ycode。
+    monkeypatch.setenv("YCODE_DATA_DIR", str(home / ".ycode"))
     monkeypatch.setattr(
         "core.workspace_context.get_workdir", lambda: root, raising=False
     )

@@ -10,12 +10,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.workflows.store import validate_name, workflows_dir
+from core.workflows.store import user_data_dir, validate_name, workflows_dir
 
 
 def skill_dir(name: str, *, home=None) -> Path:
-    base = Path(home) if home is not None else Path.home()
-    return base / ".ycode" / "skills" / "zcode-workflows" / name
+    if home is not None:
+        base = Path(home) / ".ycode"
+    else:
+        base = user_data_dir()
+    return base / "skills" / "zcode-workflows" / name
 
 
 def _single_line(text: str) -> str:

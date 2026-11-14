@@ -42,6 +42,7 @@ def env(tmp_path, monkeypatch):
     home, root = tmp_path / "home", tmp_path / "proj"
     root.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("YCODE_DATA_DIR", str(home / ".ycode"))
     return home, root
 
 

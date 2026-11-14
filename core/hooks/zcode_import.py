@@ -382,6 +382,9 @@ def target_hooks_path(scope: str, workspace_root=None) -> Path:
     """星瑶侧目标文件：user → ~/.ycode/hooks.json；project → <root>/.ycode/hooks.json。"""
     if scope == "project":
         return Path(workspace_root or os.getcwd()) / ".ycode" / "hooks.json"
+    env_dir = os.environ.get("YCODE_DATA_DIR")
+    if env_dir and str(env_dir).strip():
+        return Path(env_dir) / "hooks.json"
     return Path.home() / ".ycode" / "hooks.json"
 
 

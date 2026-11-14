@@ -151,7 +151,11 @@ def _show_file_diff(
 def _get_imom_active_publish_root():
     """Read the active imom publish root using the established on-disk format."""
     try:
-        store_file = os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json")
+        env_dir = os.environ.get("YCODE_DATA_DIR")
+        if env_dir and str(env_dir).strip():
+            store_file = os.path.join(env_dir, "imom_projects.json")
+        else:
+            store_file = os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json")
         with open(store_file, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         active = data.get("active")

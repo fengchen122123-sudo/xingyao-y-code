@@ -37,12 +37,21 @@ NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _SCOPES = ("project", "user")
 
 
+def user_data_dir() -> Path:
+    """用户数据根：YCODE_DATA_DIR 优先，否则 ~/.ycode。"""
+    env_dir = os.environ.get("YCODE_DATA_DIR")
+    if env_dir and str(env_dir).strip():
+        return Path(env_dir)
+    return Path.home() / ".ycode"
+
+
 def workflows_dir(scope: str, workspace_root=None, *, home=None) -> Path:
     """星瑶侧工作流目录（不主动创建，列出/导入时按需建）。"""
     if scope == "project":
         return Path(workspace_root or os.getcwd()) / ".ycode" / "workflows"
-    base = Path(home) if home is not None else Path.home()
-    return base / ".ycode" / "workflows"
+    if home is not None:
+        return Path(home) / ".ycode" / "workflows"
+    return user_data_dir() / "workflows"
 
 
 def zcode_workflows_dir(scope: str, workspace_root=None, *, home=None) -> Path:

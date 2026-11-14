@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -60,12 +61,27 @@ _TERMS_CACHE_TTL = 30 * 60
 # 会话健康检查结果缓存时长：对话入口每轮都会问一次，60 秒内复用上次结论，
 # 避免每发一条消息都打一次 /api/auth/me。
 _SESSION_HEALTH_TTL = 60.0
+
+
+def _tokenrhythm_secret_dir() -> Path:
+    """会话与绑定文件所在目录。YCODE_DATA_DIR 优先，未设置时仍是 ~/.ycode。"""
+    env_dir = os.environ.get("YCODE_DATA_DIR")
+    root = Path(env_dir) if env_dir and str(env_dir).strip() else Path.home() / ".ycode"
+    return root / "secrets"
+
+
 # 登录会话落盘位置：只存 cookie（已加密），不存密码 / token。
-_SESSION_FILE = Path.home() / ".ycode" / "secrets" / "tokenrhythm_session.json"
+# 测试会整体替换这两个 Path，所以保持模块级常量，不改成每次现算。
+_TR_SECRET_DIR = _tokenrhythm_secret_dir()
+try:
+    _TR_SECRET_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+_SESSION_FILE = _TR_SECRET_DIR / "tokenrhythm_session.json"
 # 账号 ⇄ Key 绑定关系落盘位置：只存账号 id / 昵称、厂商 id、Key id、绑定时间
 # （不含任何 Key 明文，整体 DPAPI 加密），用于判断本地厂商是否属于当前登录账号，
 # 换账号时据此整体重建。
-_BINDING_FILE = Path.home() / ".ycode" / "secrets" / "tokenrhythm_binding.json"
+_BINDING_FILE = _TR_SECRET_DIR / "tokenrhythm_binding.json"
 
 # 短信发码阶段可能遇到的安全验证（阿里云验证码）错误码：需要给出可执行的中文提示。
 _CAPTCHA_ERROR_CODES = frozenset(
@@ -2242,6 +2258,53 @@ def sync_models(provider_id: str | None = None) -> dict:
         "skipped": skipped,
         "failed": failed,
     }
+
+
+def _server_profile() -> bool:
+    return os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server"
+
+
+def _server_disabled_payload() -> dict:
+    return {
+        "ok": False,
+        "logged_in": False,
+        "reason": "disabled",
+        "msg": "server 档已禁用基元律动",
+    }
+
+
+def _disable_on_server(fn):
+    """server 档不登录、不联网、不读绑定。其它档位原样调用。"""
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        if _server_profile():
+            if fn.__name__ == "binding_active":
+                return False
+            return _server_disabled_payload()
+        return fn(*args, **kwargs)
+
+    return wrapped
+
+
+for _server_gated_name in (
+    "password_login",
+    "send_sms_code",
+    "sms_login",
+    "account_status",
+    "export_session_cookies",
+    "session_health",
+    "binding_active",
+    "account_overview",
+    "user_profile",
+    "usage_detail",
+    "wallet_transactions",
+    "call_logs",
+    "logout",
+    "ensure_bound",
+    "sync_models",
+):
+    globals()[_server_gated_name] = _disable_on_server(globals()[_server_gated_name])
 
 
 __all__ = [

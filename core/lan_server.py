@@ -18,6 +18,7 @@ import secrets
 import socket
 import threading
 import time
+import uuid
 from collections import deque
 
 import qrcode
@@ -31,6 +32,9 @@ import config
 from config import save_config_value as _save_config_value
 
 logger = logging.getLogger(__name__)
+
+# 进程生命周期内不变。worker 重启才换代，健康检查和后续 epoch 都读这一个值。
+PROCESS_BOOT_ID = str(uuid.uuid4())
 
 # 手机端断线补发事件白名单：低频、状态关键、前端幂等（或自带去重）的事件。
 # 手机锁屏/切后台时 WebSocket 静默断开，断线窗口内的广播会永久丢失（表现为
@@ -376,9 +380,11 @@ class LanServer:
     # 个键），turn_source 只能由服务器以 keyword 唯一注入。
     MESSAGE_ENTRY_POSITIONAL_LIMIT = 5
 
-    def __init__(self, bridge=None, port=0):
+    def __init__(self, bridge=None, port=0, bind: str = "0.0.0.0"):
         self.bridge = bridge
         self.port = port
+        # 默认仍监听全部网卡，桌面 GUI 行为不变。serve 传入 127.0.0.1。
+        self.bind = str(bind or "0.0.0.0")
         self.lan_ip = self._detect_lan_ip()
         self._clients = []
         self._clients_lock = threading.Lock()
@@ -450,7 +456,23 @@ class LanServer:
             path = "/" + path
         if not path.endswith("/"):
             path += "/"
+        public = self._public_base()
+        if public:
+            return f"{public}{path}?token={token}"
         return f"http://{self.lan_ip}:{self.port}{path}?token={token}"
+
+    def _public_base(self) -> str:
+        """remote_public_url 只替换对外前缀，不改变监听地址。"""
+        try:
+            raw = str(config._load().get("remote_public_url") or "").strip()
+        except Exception:
+            return ""
+        return raw.rstrip("/")
+
+    def client_count(self) -> int:
+        """当前已接入的 WebSocket 客户端数量。serve 权限策略用它判断有没有人在线。"""
+        with self._clients_lock:
+            return len(self._clients)
 
     def _verify_token(self, token) -> bool:
         """校验配对 token：非空、未过期、常量时间比较；_token_expires 为 None 表示永久有效。"""
@@ -967,7 +989,11 @@ class LanServer:
         if path == "/theme":
             return self._serve_theme()
         if path == "/health":
-            return self._http_response(200, "ok", "text/plain; charset=utf-8")
+            body = json.dumps(
+                {"ok": True, "boot_id": PROCESS_BOOT_ID},
+                ensure_ascii=False,
+            )
+            return self._http_response(200, body, "application/json; charset=utf-8")
         return self._serve_static(path)
 
     @staticmethod
@@ -1120,8 +1146,12 @@ class LanServer:
     # 生命周期
     # ------------------------------------------------------------------ #
 
-    def start(self) -> Dict:
-        """启动单端口 HTTP + WebSocket 服务（阻塞 serve 放到 daemon 线程）。"""
+    def start(self, *, strict_port: bool = False) -> Dict:
+        """启动单端口 HTTP + WebSocket 服务（阻塞 serve 放到 daemon 线程）。
+
+        strict_port=True 时端口被占用直接失败，不再退回 port=0。
+        桌面 GUI 保持原来的回退（strict_port 默认 False）。
+        """
         # 启动时恢复上次的配对 token：保证应用重启后二维码 token 保持固定
         self._load_token_from_config()
         # 端口同样固定：优先复用上次持久化的端口，避免每次启动换端口导致
@@ -1130,6 +1160,8 @@ class LanServer:
         try:
             self._server = self._serve(preferred)
         except OSError:
+            if strict_port:
+                raise
             # 持久化端口被其他进程占用：回退动态分配，下方回填新的持久化端口
             self._server = self._serve(0)
         # port=0 时内核动态分配，真实端口回填
@@ -1142,12 +1174,12 @@ class LanServer:
             name="lan-remote-server",
         )
         self._thread.start()
-        return {"ok": True, "host": "0.0.0.0", "port": self.port, "lan_ip": self.lan_ip}
+        return {"ok": True, "host": self.bind, "port": self.port, "lan_ip": self.lan_ip}
 
     def _serve(self, port: int):
         return serve(
             self._handle_ws,
-            host="0.0.0.0",
+            host=self.bind,
             port=port,
             process_request=self._serve_http,
             max_size=70 * 1024 * 1024,  # 支持手机上传 ≤50MB 文件（base64 约 67MB）

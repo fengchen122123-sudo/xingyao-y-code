@@ -678,8 +678,10 @@ def get_skill_dirs():
             _log_warning("创建全局技能目录失败 %s: %s", global_skills, e)
     _add(global_skills)
 
-    # 2. 兼容用户级全局 .agents 目录
-    _add(os.path.join(user_home, ".agents", "skills"))
+    # 2. 兼容用户级全局 .agents 目录。server 档跑在账号容器里，不扫描
+    # 部署机家目录下的 ~/.agents/skills。
+    if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() != "server":
+        _add(os.path.join(user_home, ".agents", "skills"))
 
     # 3. 用户自定义目录（来自 config.json 的 skill_search_paths）
     for p in get_user_skill_search_paths():
