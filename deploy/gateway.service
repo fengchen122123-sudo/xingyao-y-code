@@ -1,0 +1,16 @@
+[Unit]
+Description=Xingyao personal agent gateway
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=xingyao
+Environment=XINGYAO_GATEWAY_DIR=/srv/xingyao/gateway
+Environment=XINGYAO_ACCOUNTS_ROOT=/srv/xingyao/accounts
+Environment=TZ=Asia/Shanghai
+ExecStart=/opt/xingyao/venv/bin/uvicorn gateway.app:app_from_env --factory --host 127.0.0.1 --port 8080
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

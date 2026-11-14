@@ -477,6 +477,16 @@ FEISHU_APPROVERS_DEFAULT: tuple = ()
 FEISHU_NOTIFY_CHAT_ID_KEY = "feishu_notify_chat_id"
 FEISHU_NOTIFY_CHAT_ID_DEFAULT = ""
 
+# 云中转（桌面主动外连网关）。默认关闭，不改变 Windows GUI 的现有行为。
+CLOUD_RELAY_ENABLED_KEY = "cloud_relay_enabled"
+CLOUD_RELAY_ENABLED_DEFAULT = False
+CLOUD_RELAY_URL_KEY = "cloud_relay_url"
+CLOUD_RELAY_URL_DEFAULT = ""
+CLOUD_RELAY_TOKEN_KEY = "cloud_relay_token"
+CLOUD_RELAY_TOKEN_DEFAULT = ""
+CLOUD_RELAY_DEVICE_ID_KEY = "cloud_relay_device_id"
+CLOUD_RELAY_DEVICE_ID_DEFAULT = ""
+
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):
     default_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -843,6 +853,7 @@ KNOWN_CONFIG_KEYS = frozenset({
     # 飞书通道（在飞书里与星瑶对话）
     "feishu_enabled", "feishu_app_id", "feishu_app_secret", "feishu_approvers",
     "feishu_notify_chat_id",
+    "cloud_relay_enabled", "cloud_relay_url", "cloud_relay_token", "cloud_relay_device_id",
     # 数据迁移
     "media_v1_migration_done",
     # 本任务新增：严格模式开关

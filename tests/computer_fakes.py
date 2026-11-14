@@ -31,6 +31,7 @@ FakeLocator 记录 click/fill 参数并支持异常注入），FakeKeyboard 增�
 """
 
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -64,6 +65,11 @@ def use_temp_config(tmp_path, monkeypatch, values):
     # 空 dict 会被 config.py 写闸门判为读失败而拒写，故补最小可用结构。
     payload = values if values else {"active_model_id": None, "providers": []}
     cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    # 配置读取按 mtime 缓存。同一秒里连写两次会被当成没变。
+    # 增量只加几秒，避免戳到文件系统的时间上限后被夹成同一个值。
+    use_temp_config._seq = getattr(use_temp_config, "_seq", 0) + 1
+    stamp = time.time() + use_temp_config._seq
+    os.utime(cfg, (stamp, stamp))
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
     monkeypatch.setattr(config, "_TOML_CONFIG_FILE", str(tmp_path / "config.toml"))
     return cfg

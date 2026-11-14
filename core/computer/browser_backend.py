@@ -25,6 +25,7 @@ import logging
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -43,7 +44,8 @@ from core.computer.models import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_CHANNELS = {"edge": "msedge", "chrome": "chrome"}
+# chromium 使用 Playwright 自带浏览器，channel 留空。
+_CHANNELS = {"edge": "msedge", "chrome": "chrome", "chromium": None}
 WORKER_ARGV_FLAG = "--ycode-browser-worker"
 _VIEWPORT_WIDTH = 1440
 _VIEWPORT_HEIGHT = 900
@@ -449,12 +451,16 @@ class _WorkerProcessTransport:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         try:
+            popen_kwargs = {}
+            if sys.platform != "win32":
+                popen_kwargs["start_new_session"] = True
             self._proc = subprocess.Popen(
                 self._worker_command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 env=env,
+                **popen_kwargs,
             )
         except OSError as error:
             self._close_job()
@@ -621,13 +627,24 @@ class _WorkerProcessTransport:
             kill_started = time.perf_counter()
             if self._job is not None:
                 _terminate_job(self._job)
+            elif sys.platform != "win32":
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
             try:
                 proc.wait(timeout=_PROCESS_HARD_EXIT)
             except subprocess.TimeoutExpired:
                 _LOGGER.error("受管执行进程在硬终止后仍未退出（%s）", proc.pid)
             if proc.poll() is None:
                 try:
-                    proc.kill()
+                    if sys.platform != "win32":
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
                     proc.wait(timeout=1.0)
                 except OSError:
                     pass
@@ -770,7 +787,7 @@ class BrowserComputerBackend:
         if type(browser) is not str or browser not in (*_CHANNELS, "embedded"):
             raise ComputerControlError(
                 "computer_invalid_config",
-                f"不支持的浏览器：{browser!r}，只支持 edge 或 chrome",
+                f"不支持的浏览器：{browser!r}，只支持 edge、chrome 或 chromium",
             )
         if not isinstance(profile_dir, Path):
             raise ComputerControlError("computer_invalid_config", "profile_dir 必须是 pathlib.Path")
@@ -1207,11 +1224,7 @@ class BrowserComputerBackend:
             ) from error
         try:
             self._context = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=resolved,
-                channel=_CHANNELS[self._browser],
-                headless=False,
-                viewport={"width": self._viewport_width, "height": self._viewport_height},
-                device_scale_factor=1,
+                **self._persistent_context_kwargs(resolved)
             )
         except Exception as error:
             raise self._map_launch_error(error) from error
@@ -1237,24 +1250,52 @@ class BrowserComputerBackend:
             _LOGGER.warning("解析受控浏览器进程 PID 失败，退化为 DOM 可见性裁决", exc_info=True)
             self._browser_pid = None
 
+    def _persistent_context_kwargs(self, user_data_dir: str) -> dict:
+        """Windows 保持有界面、不附加容器参数。Linux 恒无头。"""
+        kwargs = {
+            "user_data_dir": user_data_dir,
+            "headless": sys.platform != "win32",
+            "viewport": {"width": self._viewport_width, "height": self._viewport_height},
+            "device_scale_factor": 1,
+        }
+        channel = _CHANNELS[self._browser]
+        if channel:
+            kwargs["channel"] = channel
+        if sys.platform != "win32":
+            kwargs["args"] = ["--no-sandbox", "--disable-dev-shm-usage"]
+        return kwargs
+
     def _resolve_browser_pid(self) -> int | None:
         """按 profile 目录从进程命令行识别受控浏览器主进程（不读取用户浏览器）。"""
         import psutil
 
-        exe_name = {"edge": "msedge.exe", "chrome": "chrome.exe"}[self._browser]
-        profile_key = str(self._profile_dir.resolve()).lower().replace("/", "\\")
+        if sys.platform == "win32":
+            exe_names = {"edge": {"msedge.exe"}, "chrome": {"chrome.exe"}, "chromium": {"chrome.exe"}}
+            profile_key = str(self._profile_dir.resolve()).lower().replace("/", "\\")
+        else:
+            exe_names = {
+                "edge": {"msedge"},
+                "chrome": {"chrome", "chromium", "headless_shell"},
+                "chromium": {"chrome", "chromium", "headless_shell", "google-chrome"},
+            }
+            profile_key = os.path.normcase(str(self._profile_dir.resolve()))
+        allowed_names = exe_names[self._browser]
         matches = []
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             try:
-                name = str(proc.info.get("name") or "").lower()
-                if name != exe_name:
+                name = os.path.normcase(str(proc.info.get("name") or ""))
+                if sys.platform == "win32":
+                    name = name.lower()
+                if name not in allowed_names:
                     continue
                 cmdline = [str(arg) for arg in (proc.info.get("cmdline") or [])]
                 if any(arg.startswith("--type=") for arg in cmdline):
                     continue  # renderer/gpu 等子进程
                 if any(
                     arg.startswith("--user-data-dir=")
-                    and profile_key in arg.lower().replace("/", "\\")
+                    and profile_key in (
+                        arg.lower().replace("/", "\\") if sys.platform == "win32" else os.path.normcase(arg)
+                    )
                     for arg in cmdline
                 ):
                     matches.append(int(proc.info["pid"]))

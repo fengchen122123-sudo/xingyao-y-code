@@ -50,6 +50,14 @@ class UnavailablePlatformAdapter:
     def supported(self) -> bool:
         return False
 
+    @property
+    def browser_supported(self) -> bool:
+        return False
+
+    @property
+    def desktop_supported(self) -> bool:
+        return False
+
     def find_browser_executable(self, browser: str) -> str:
         return ""
 

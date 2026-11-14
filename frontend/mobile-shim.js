@@ -6,9 +6,9 @@
  * 复用全部组件与主题。
  *
  * 约定（与 core/lan_server.py 对齐）：
- * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验；断线重连时附带
- *   {"token", "last_seq"}，服务器按补发缓冲回放缺失的关键事件
- *   （turn_error/notice/permission_request 等，见 REPLAYABLE_EVENT_TYPES）。
+ * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验。新服务端会先回
+ *   hello，再按 boot_id 决定 seq_reset 或补发。重连附带 last_boot_id 与 last_seq。
+ *   hello / seq_reset 不交给 onBridgeEvent。
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
  * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
  *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
@@ -48,8 +48,62 @@
   var ws = null;
   var seq = 0;
   var lastSeq = 0;        // 最后收到的补发事件 seq（服务器侧单调递增）
+  var bootId = '';
+  var sawHello = false;
+  var legacy = false;
+  var resyncing = false;
+  var pausedSeq = 0;
+  var held = [];
+  var seen = {};
+  var refetchOnce = false;
   var hadConnection = false; // 是否发生过连接：区分全新页面与断线重连
   var pending = new Map(); // id -> {resolve, reject}
+
+  function isCapacitor() {
+    return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+  }
+
+  function watermarkKey() {
+    var account = window.__ycAccountId || '';
+    var profile = window.__ycProfile || 'lan';
+    return 'yc-watermark:' + window.location.origin + '|' + account + '|' + profile;
+  }
+
+  function loadWatermark() {
+    if (isCapacitor()) return;
+    try {
+      var raw = window.localStorage.getItem(watermarkKey());
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      bootId = parsed.boot_id || '';
+      lastSeq = Number(parsed.last_seq) || 0;
+    } catch (_) {}
+  }
+
+  function saveWatermark() {
+    if (isCapacitor() || legacy || !bootId) return;
+    try {
+      window.localStorage.setItem(watermarkKey(), JSON.stringify({
+        boot_id: bootId,
+        last_seq: lastSeq,
+      }));
+    } catch (_) {}
+  }
+
+  loadWatermark();
+
+  window.__ycClearTransport = function () {
+    bootId = '';
+    lastSeq = 0;
+    seen = {};
+    held = [];
+    try { window.localStorage.removeItem(watermarkKey()); } catch (_) {}
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+    }
+    pending.forEach(function (item) { item.reject(new Error('连接已关闭')); });
+    pending.clear();
+  };
 
   function rpc(method, args) {
     return new Promise(function (resolve, reject) {
@@ -63,12 +117,75 @@
     });
   }
 
+  function turnIsTerminal(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return false;
+    var status = snapshot.status || snapshot.state || '';
+    return status === 'completed' || status === 'cancelled' || status === 'canceled'
+      || status === 'error' || status === 'failed' || status === 'stopped'
+      || status === 'interrupted';
+  }
+
+  function acceptFrame(msg) {
+    var frameSeq = typeof msg.seq === 'number' ? msg.seq : null;
+    if (frameSeq !== null) {
+      var key = (bootId || '') + ':' + frameSeq;
+      if (seen[key]) return;
+      seen[key] = true;
+      if (frameSeq > lastSeq) lastSeq = frameSeq;
+      saveWatermark();
+    }
+    if (resyncing) {
+      held.push(msg);
+      return;
+    }
+    if (window.onBridgeEvent) window.onBridgeEvent(msg);
+  }
+
+  function beginResync() {
+    resyncing = true;
+    held = [];
+    pausedSeq = lastSeq;
+    rpc('get_initial_state', []).then(function (state) {
+      window.dispatchEvent(new CustomEvent('yc-initial-state', { detail: state }));
+      var batch = held;
+      held = [];
+      resyncing = false;
+      var snapshots = (state && state.active_turn_snapshots) || {};
+      var terminal = false;
+      if (snapshots && typeof snapshots === 'object') {
+        Object.keys(snapshots).forEach(function (name) {
+          if (turnIsTerminal(snapshots[name])) terminal = true;
+        });
+      }
+      var uncertain = false;
+      batch.forEach(function (frame) {
+        if (typeof frame.seq === 'number' && frame.seq <= pausedSeq) return;
+        if ((frame.type === 'token_delta' || frame.type === 'thinking_delta') && terminal) return;
+        if ((frame.type === 'token_delta' || frame.type === 'thinking_delta') && !state) {
+          uncertain = true;
+          return;
+        }
+        if (window.onBridgeEvent) window.onBridgeEvent(frame);
+      });
+      if (uncertain && !refetchOnce) {
+        refetchOnce = true;
+        beginResync();
+      }
+    }, function () {
+      resyncing = false;
+      held = [];
+    });
+  }
+
   function connect() {
     ws = new WebSocket(wsUrl);
     ws.onopen = function () {
+      sawHello = false;
       var auth = { token: token };
-      if (hadConnection) {
-        // 断线重连：携带水位请求补发，锁屏/切后台期间的关键事件不丢
+      if (bootId && !legacy) {
+        auth.last_boot_id = bootId;
+        auth.last_seq = lastSeq;
+      } else if (hadConnection && !legacy) {
         auth.last_seq = lastSeq;
       }
       hadConnection = true;
@@ -105,13 +222,26 @@
           }
         }
       } else if (msg && msg.type) {
-        if (typeof msg.seq === 'number' && msg.seq > lastSeq) {
-          lastSeq = msg.seq; // 先记录水位再派发，避免处理器抛错丢水位
+        if (msg.type === 'hello') {
+          sawHello = true;
+          bootId = (msg.data && msg.data.boot_id) || bootId;
+          saveWatermark();
+          return;
         }
-        if (window.onBridgeEvent) {
-          // 事件广播（对象 {type, data, seq?}）
-          window.onBridgeEvent(msg);
+        if (msg.type === 'seq_reset') {
+          sawHello = true;
+          bootId = (msg.data && msg.data.boot_id) || bootId;
+          lastSeq = 0;
+          seen = {};
+          saveWatermark();
+          if (msg.data && msg.data.resync_required) beginResync();
+          return;
         }
+        if (!sawHello && !legacy) {
+          legacy = true;
+          beginResync();
+        }
+        acceptFrame(msg);
       }
     };
     ws.onclose = function (event) {

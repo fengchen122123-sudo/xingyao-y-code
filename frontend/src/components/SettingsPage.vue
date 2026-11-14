@@ -15,6 +15,7 @@
       <button data-test="growth-nav" class="nav-item" :class="{ active: activeSection === 'growth' }" @click="activeSection = 'growth'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>记忆与成长</button>
       <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
       <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
+      <button data-test="cloud-relay-nav" class="nav-item" :class="{ active: activeSection === 'cloud-relay' }" @click="activeSection = 'cloud-relay'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>云中转</button>
       <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
       <div class="nav-section">插件设置</div>
       <button v-for="p in pluginNavItems" :key="p.name" :data-test="`plugin-nav-${p.name}`" class="nav-item" :class="{ active: activePluginName === p.name }" @click="openPluginSection(p.name)"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>{{ p.name }}</button>
@@ -710,6 +711,7 @@
       <GrowthSettings v-else-if="activeSection === 'growth'" />
       <DecisionSettings v-else-if="activeSection === 'decision'" />
       <FeishuSettings v-else-if="activeSection === 'feishu'" />
+      <CloudRelaySettings v-else-if="activeSection === 'cloud-relay'" />
       <BackgroundConvert v-else-if="activeSection === 'bg-convert'" />
 
       <!-- 外观与主题常驻挂载（v-show）：切换设置分区不丢失未保存的主题草稿 -->
@@ -828,6 +830,7 @@ import PersonaSettings from './PersonaSettings.vue';
 import GrowthSettings from './GrowthSettings.vue';
 import DecisionSettings from './DecisionSettings.vue';
 import FeishuSettings from './FeishuSettings.vue';
+import CloudRelaySettings from './CloudRelaySettings.vue';
 import PluginsSettings from './PluginsSettings.vue';
 import PluginSettingsPanel from './PluginSettingsPanel.vue';
 import HooksSettings from './HooksSettings.vue';
@@ -846,7 +849,7 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 
 // ── 插件设置页入口（提供 plugin_settings 钩子的插件直接挂在左侧导航）────

@@ -101,24 +101,54 @@ def test_gui_preflight_uses_platform_adapter(monkeypatch):
     assert calls == ["desktop", "hotkey"]
 
 
-@pytest.mark.parametrize("platform", ["darwin", "linux"])
-def test_reserved_settings_never_probe_windows_executables(platform, monkeypatch):
+def test_darwin_settings_do_not_probe_executables(monkeypatch):
     from core.computer.settings import list_browser_options
 
-    monkeypatch.setattr("shutil.which", lambda name: pytest.fail("unimplemented platform must not inspect Windows PATH"))
-    options = list_browser_options(platform=platform)
+    monkeypatch.setattr("shutil.which", lambda name: pytest.fail("darwin must not inspect PATH"))
+    options = list_browser_options(platform="darwin")
     assert all(not option.available and option.unavailable_reason for option in options)
 
 
+def test_linux_settings_only_probe_chromium(monkeypatch):
+    from core.computer.settings import list_browser_options
+
+    seen = []
+
+    def which(name):
+        seen.append(name)
+        return "/usr/bin/google-chrome" if name == "google-chrome" else None
+
+    monkeypatch.setattr("shutil.which", which)
+    options = list_browser_options(platform="linux")
+    chromium = next(option for option in options if option.browser == "chromium")
+    assert chromium.available is True
+    assert chromium.executable == "/usr/bin/google-chrome"
+    assert "msedge" not in seen
+    assert "chrome.exe" not in seen
+
+
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
-@pytest.mark.parametrize("target", ["browser", "desktop"])
-def test_default_factory_rejects_unimplemented_platform_before_construction(platform, target, monkeypatch):
+def test_default_factory_rejects_desktop_on_unimplemented_platform(platform, monkeypatch):
     from core.computer import controller, platforms
     from core.computer.models import BackendIdentity
 
     adapter = platforms.get_platform_adapter(platform)
     monkeypatch.setattr(platforms, "get_platform_adapter", lambda platform=None: adapter)
-    identity = BackendIdentity(platform=adapter.name, target=target, browser="edge")
+    identity = BackendIdentity(platform=adapter.name, target="desktop", browser="edge")
     with pytest.raises(ComputerControlError) as raised:
-        controller._default_backend_factory(target, identity)
+        controller._default_backend_factory("desktop", identity)
     assert raised.value.code == "computer_unsupported_os"
+
+
+def test_linux_factory_builds_browser_backend(monkeypatch):
+    from core.computer import controller, platforms
+    from core.computer.browser_backend import BrowserComputerBackend
+    from core.computer.models import BackendIdentity
+
+    adapter = platforms.get_platform_adapter("linux")
+    monkeypatch.setattr(platforms, "get_platform_adapter", lambda platform=None: adapter)
+    identity = BackendIdentity(
+        platform="linux", target="browser", browser="chromium", profile_path="/tmp/profile"
+    )
+    backend = controller._default_backend_factory("browser", identity)
+    assert isinstance(backend, BrowserComputerBackend)

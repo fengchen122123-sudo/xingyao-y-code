@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Iterable
 
 from core.automation import tool_policy as automation_tool_policy
@@ -10,6 +11,13 @@ from core.computer.tool_adapter import RESERVED_COMPUTER_TOOL_NAMES
 from core.tool_protocol import ToolResult, ToolSpec
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _absolute_path_example() -> str:
+    """full / cli 保持原来的 Windows 示例。server 档改成容器里的 POSIX 路径。"""
+    if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server":
+        return "/data/work/demo"
+    return "D:\\\\work\\\\demo"
 
 # 调度层（core/llm.py）会向 arguments 注入 schema 之外的内部上下文参数，
 # 过滤未知参数时必须放行这些键，否则会破坏取消/权限链路
@@ -179,8 +187,12 @@ CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "fetch_image",
 })
 
-# server：部署档。P1a0 只把它认成合法档位，工具表仍与 full 相同。
-# 浏览器链相关的裁剪留到 P1a1，避免这一步改掉 full/cli 的请求字节。
+# server：部署档。在 CLI 剔除集合上再拿掉技能/插件/钩子管理，
+# 但保留浏览器视口和电脑操控停止面板。full / cli 的工具表不走这里。
+SERVER_EXCLUDED_TOOLS: frozenset[str] = (
+    CLI_EXCLUDED_TOOLS - {"browser_set_viewport", "computer_control"}
+) | frozenset({"skill_manage", "plugin_manage", "hook_manage"})
+
 VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli", "server")
 
 
@@ -1399,12 +1411,14 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
                 "新建项目文件夹并引入为工作区（秘书专用）：等价于用户点侧栏「添加/"
                 "引入项目文件夹」选中该目录——目录不存在则逐级创建，已存在则直接"
                 "复用，随后侧栏出现该项目分组，之后可用 dispatch_task 的 workdir "
-                "参数在里面建会话干活。path 必须是完整绝对路径（如 D:\\\\work\\\\demo），"
+                "参数在里面建会话干活。path 必须是完整绝对路径（如 "
+                + _absolute_path_example()
+                + "），"
                 "不接受相对路径或只给文件夹名；调用前先向用户问清要建在哪，不要自己"
                 "猜位置。返回 JSON 字符串（含 workdir / created）。"
             ),
             input_schema=_schema({
-                "path": {"type": "string", "description": "项目文件夹的完整路径（必填，如 D:\\\\work\\\\demo；不存在会自动创建）"},
+                "path": {"type": "string", "description": "项目文件夹的完整路径（必填，如 " + _absolute_path_example() + "；不存在会自动创建）"},
             }, ["path"]),
             execute=tools.create_project,
             requires_permission=False,
@@ -1445,10 +1459,16 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         pass
     # CLI 轻量档位：剔除 GUI 专属工具（见 CLI_EXCLUDED_TOOLS 说明）。
     # 放在插件加载之后，避免插件重新注册同名工具又把它们带回来。
-    # server 档不走这条剔除，P1a0 的工具表与 full 一致。
-    if _resolve_tool_profile(profile) == "cli":
+    # server 档用自己的集合，不改 full / cli 的请求字节。
+    _profile_name = _resolve_tool_profile(profile)
+    _excluded = None
+    if _profile_name == "cli":
+        _excluded = CLI_EXCLUDED_TOOLS
+    elif _profile_name == "server":
+        _excluded = SERVER_EXCLUDED_TOOLS
+    if _excluded:
         removed = 0
-        for _name in sorted(CLI_EXCLUDED_TOOLS):
+        for _name in sorted(_excluded):
             try:
                 registry.unregister(_name)
             except KeyError:

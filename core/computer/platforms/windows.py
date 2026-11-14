@@ -18,6 +18,9 @@ class WindowsPlatformAdapter:
     unavailable_reason = ""
 
     def find_browser_executable(self, browser: str) -> str:
+        # chromium 只给 Linux serve 用。Windows 列出它为不可用，不探测、不抛错。
+        if browser == "chromium":
+            return ""
         if browser not in _BROWSER_INSTALLS:
             raise ComputerControlError("computer_invalid_config", f"不支持的浏览器：{browser!r}")
         executable_name, relative_path = _BROWSER_INSTALLS[browser]

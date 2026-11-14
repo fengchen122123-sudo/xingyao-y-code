@@ -945,7 +945,7 @@ def _claim_takeover_at_turn_start(
 # 会话），见 core/computer/capability.py 与 core/agent_service.py 的
 # turn_source != "local" 分支。
 # 新增来源时必须同时更新 gui_bridge.TURN_SOURCES（有测试断言两者一致）。
-COMPUTER_TURN_SOURCES = ("local", "lan", "feishu", "mcp", "goal")
+COMPUTER_TURN_SOURCES = ("local", "lan", "feishu", "mcp", "goal", "server")
 
 
 def resolve_turn_computer_capability(

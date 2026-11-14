@@ -1,0 +1,53 @@
+:root {
+  --bg: #f4f1ea;
+  --surface: #fffcf8;
+  --ink: #1c1b17;
+  --muted: #6f6a62;
+  --line: #e5e0d6;
+  --user: #e7f0e4;
+  --online: #2f8f55;
+  --shadow: 0 10px 28px rgba(48, 40, 24, .07);
+}
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  color: var(--ink);
+  background: var(--bg);
+  font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+}
+button, input, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+a { color: inherit; }
+.shell { height: 100%; display: flex; flex-direction: column; }
+.top {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px; background: #efebe3;
+}
+.avatar {
+  width: 36px; height: 36px; border-radius: 50%; background: var(--ink); color: #fff;
+  display: grid; place-items: center; font-weight: 650;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--online); display: inline-block; }
+.nav { margin-left: auto; display: flex; gap: 8px; }
+.nav a, .text-button, .send {
+  border: 0; background: transparent; color: var(--muted); text-decoration: none;
+}
+.page { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 16px; }
+.stream { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
+.bubble { max-width: 72%; padding: 12px 14px; border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); }
+.bubble.user { margin-left: auto; background: var(--user); }
+.composer { display: flex; gap: 8px; margin-top: 12px; }
+.composer input, .card input, .card textarea {
+  flex: 1; border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 12px 16px;
+}
+.send {
+  width: 42px; height: 42px; border-radius: 50%; background: var(--ink); color: #fff;
+}
+.card {
+  background: var(--surface); border-radius: 18px; padding: 16px; box-shadow: var(--shadow); margin-bottom: 12px;
+}
+.card h2 { margin: 0 0 8px; font-size: 16px; }
+.row { display: flex; gap: 8px; }
+.watch img { width: 100%; border-radius: 12px; }
+.muted { color: var(--muted); }
+.login { max-width: 420px; margin: 8vh auto; }

@@ -18,8 +18,6 @@ import secrets
 import socket
 import threading
 import time
-import uuid
-from collections import deque
 
 import qrcode
 from http import HTTPStatus
@@ -30,11 +28,12 @@ from websockets.sync.server import serve
 
 import config
 from config import save_config_value as _save_config_value
+from core.remote_transport import EventReplayBuffer
 
 logger = logging.getLogger(__name__)
 
-# 进程生命周期内不变。worker 重启才换代，健康检查和后续 epoch 都读这一个值。
-PROCESS_BOOT_ID = str(uuid.uuid4())
+# 进程生命周期内不变。worker 重启才换代，健康检查和 hello 都读这一个值。
+PROCESS_BOOT_ID = secrets.token_hex(8)
 
 # 手机端断线补发事件白名单：低频、状态关键、前端幂等（或自带去重）的事件。
 # 手机锁屏/切后台时 WebSocket 静默断开，断线窗口内的广播会永久丢失（表现为
@@ -76,9 +75,9 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
  * 复用全部组件与主题。
  *
  * 约定（与 core/lan_server.py 对齐）：
- * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验；断线重连时附带
- *   {"token", "last_seq"}，服务器按补发缓冲回放缺失的关键事件
- *   （turn_error/notice/permission_request 等，见 REPLAYABLE_EVENT_TYPES）。
+ * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验。新服务端会先回
+ *   hello，再按 boot_id 决定 seq_reset 或补发。重连附带 last_boot_id 与 last_seq。
+ *   hello / seq_reset 不交给 onBridgeEvent。
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
  * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
  *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
@@ -118,8 +117,62 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
   var ws = null;
   var seq = 0;
   var lastSeq = 0;        // 最后收到的补发事件 seq（服务器侧单调递增）
+  var bootId = '';
+  var sawHello = false;
+  var legacy = false;
+  var resyncing = false;
+  var pausedSeq = 0;
+  var held = [];
+  var seen = {};
+  var refetchOnce = false;
   var hadConnection = false; // 是否发生过连接：区分全新页面与断线重连
   var pending = new Map(); // id -> {resolve, reject}
+
+  function isCapacitor() {
+    return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+  }
+
+  function watermarkKey() {
+    var account = window.__ycAccountId || '';
+    var profile = window.__ycProfile || 'lan';
+    return 'yc-watermark:' + window.location.origin + '|' + account + '|' + profile;
+  }
+
+  function loadWatermark() {
+    if (isCapacitor()) return;
+    try {
+      var raw = window.localStorage.getItem(watermarkKey());
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      bootId = parsed.boot_id || '';
+      lastSeq = Number(parsed.last_seq) || 0;
+    } catch (_) {}
+  }
+
+  function saveWatermark() {
+    if (isCapacitor() || legacy || !bootId) return;
+    try {
+      window.localStorage.setItem(watermarkKey(), JSON.stringify({
+        boot_id: bootId,
+        last_seq: lastSeq,
+      }));
+    } catch (_) {}
+  }
+
+  loadWatermark();
+
+  window.__ycClearTransport = function () {
+    bootId = '';
+    lastSeq = 0;
+    seen = {};
+    held = [];
+    try { window.localStorage.removeItem(watermarkKey()); } catch (_) {}
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+    }
+    pending.forEach(function (item) { item.reject(new Error('连接已关闭')); });
+    pending.clear();
+  };
 
   function rpc(method, args) {
     return new Promise(function (resolve, reject) {
@@ -133,12 +186,75 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
     });
   }
 
+  function turnIsTerminal(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return false;
+    var status = snapshot.status || snapshot.state || '';
+    return status === 'completed' || status === 'cancelled' || status === 'canceled'
+      || status === 'error' || status === 'failed' || status === 'stopped'
+      || status === 'interrupted';
+  }
+
+  function acceptFrame(msg) {
+    var frameSeq = typeof msg.seq === 'number' ? msg.seq : null;
+    if (frameSeq !== null) {
+      var key = (bootId || '') + ':' + frameSeq;
+      if (seen[key]) return;
+      seen[key] = true;
+      if (frameSeq > lastSeq) lastSeq = frameSeq;
+      saveWatermark();
+    }
+    if (resyncing) {
+      held.push(msg);
+      return;
+    }
+    if (window.onBridgeEvent) window.onBridgeEvent(msg);
+  }
+
+  function beginResync() {
+    resyncing = true;
+    held = [];
+    pausedSeq = lastSeq;
+    rpc('get_initial_state', []).then(function (state) {
+      window.dispatchEvent(new CustomEvent('yc-initial-state', { detail: state }));
+      var batch = held;
+      held = [];
+      resyncing = false;
+      var snapshots = (state && state.active_turn_snapshots) || {};
+      var terminal = false;
+      if (snapshots && typeof snapshots === 'object') {
+        Object.keys(snapshots).forEach(function (name) {
+          if (turnIsTerminal(snapshots[name])) terminal = true;
+        });
+      }
+      var uncertain = false;
+      batch.forEach(function (frame) {
+        if (typeof frame.seq === 'number' && frame.seq <= pausedSeq) return;
+        if ((frame.type === 'token_delta' || frame.type === 'thinking_delta') && terminal) return;
+        if ((frame.type === 'token_delta' || frame.type === 'thinking_delta') && !state) {
+          uncertain = true;
+          return;
+        }
+        if (window.onBridgeEvent) window.onBridgeEvent(frame);
+      });
+      if (uncertain && !refetchOnce) {
+        refetchOnce = true;
+        beginResync();
+      }
+    }, function () {
+      resyncing = false;
+      held = [];
+    });
+  }
+
   function connect() {
     ws = new WebSocket(wsUrl);
     ws.onopen = function () {
+      sawHello = false;
       var auth = { token: token };
-      if (hadConnection) {
-        // 断线重连：携带水位请求补发，锁屏/切后台期间的关键事件不丢
+      if (bootId && !legacy) {
+        auth.last_boot_id = bootId;
+        auth.last_seq = lastSeq;
+      } else if (hadConnection && !legacy) {
         auth.last_seq = lastSeq;
       }
       hadConnection = true;
@@ -175,13 +291,26 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
           }
         }
       } else if (msg && msg.type) {
-        if (typeof msg.seq === 'number' && msg.seq > lastSeq) {
-          lastSeq = msg.seq; // 先记录水位再派发，避免处理器抛错丢水位
+        if (msg.type === 'hello') {
+          sawHello = true;
+          bootId = (msg.data && msg.data.boot_id) || bootId;
+          saveWatermark();
+          return;
         }
-        if (window.onBridgeEvent) {
-          // 事件广播（对象 {type, data, seq?}）
-          window.onBridgeEvent(msg);
+        if (msg.type === 'seq_reset') {
+          sawHello = true;
+          bootId = (msg.data && msg.data.boot_id) || bootId;
+          lastSeq = 0;
+          seen = {};
+          saveWatermark();
+          if (msg.data && msg.data.resync_required) beginResync();
+          return;
         }
+        if (!sawHello && !legacy) {
+          legacy = true;
+          beginResync();
+        }
+        acceptFrame(msg);
       }
     };
     ws.onclose = function (event) {
@@ -408,8 +537,10 @@ class LanServer:
         self._server = None
         self._thread: Optional[threading.Thread] = None
         # 断线补发：单调事件序号 + 白名单事件环形缓冲（见 REPLAYABLE_EVENT_TYPES）
+        self._replay = EventReplayBuffer(_REPLAY_BUFFER_MAX)
         self._event_seq = 0
-        self._replay_buffer: deque = deque(maxlen=_REPLAY_BUFFER_MAX)
+        self._replay_buffer = self._replay.items
+        self._preview_upstreams: Dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     # 网络探测 / URL / token
@@ -578,6 +709,27 @@ class LanServer:
             ]
             return True, replay
 
+    def _send_control(self, ws, event_type: str, data: dict) -> None:
+        """控制帧不带 id、不进补发缓冲。"""
+        payload = json.dumps({"type": event_type, "data": data}, ensure_ascii=False)
+        self._safe_send(ws, payload)
+
+    def _admission_plan(self, last_boot_id, last_seq):
+        """认证成功后只走三条之一：换代重置、空洞重置、或按序补发。"""
+        with self._clients_lock:
+            if not last_boot_id or last_boot_id != PROCESS_BOOT_ID:
+                return "reset", "boot", []
+            if not self._replay_buffer:
+                return "reset", "gap", []
+            oldest = self._replay_buffer[0][0]
+            if last_seq is None or oldest > int(last_seq) + 1:
+                return "reset", "gap", []
+            items = [
+                payload for seq, payload in self._replay_buffer
+                if seq > int(last_seq)
+            ]
+            return "replay", "", items
+
     def _outbound_sender_loop(self, ws, outbound: "queue_mod.Queue") -> None:
         """单客户端出站发送线程：逐条写出广播事件。
 
@@ -718,25 +870,9 @@ class LanServer:
     # ------------------------------------------------------------------ #
 
     def _stamp_and_buffer_locked(self, payload: str) -> str:
-        """白名单事件打序号并进补发缓冲；必须在 _clients_lock 内调用。
-
-        wire 消息追加 ``seq`` 字段（shim 据此记录接收水位）；解析/序列化
-        失败时原样返回不打标——该事件只是不参与补发，不影响实时投递。
-        """
-        try:
-            parsed = json.loads(payload)
-        except Exception:
-            return payload
-        if not isinstance(parsed, dict) or "type" not in parsed:
-            return payload
-        self._event_seq += 1
-        parsed["seq"] = self._event_seq
-        try:
-            stamped = json.dumps(parsed, ensure_ascii=False)
-        except Exception:
-            self._event_seq -= 1
-            return payload
-        self._replay_buffer.append((self._event_seq, stamped))
+        """白名单事件打序号并进补发缓冲；必须在 _clients_lock 内调用。"""
+        stamped = self._replay.stamp(payload)
+        self._event_seq = self._replay.seq
         return stamped
 
     def broadcast(self, payload: str, event_type: str = "") -> None:
@@ -751,6 +887,9 @@ class LanServer:
         客户端断线重连后按各自 last_seq 补发缺失（见 _handle_ws）。
         未传 event_type（历史调用方/测试）原样发送、不进缓冲。
         """
+        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server":
+            payload = self._rewrite_preview_url(payload, event_type)
+            self._note_serve_activity()
         with self._clients_lock:
             clients = list(self._clients)
             if event_type in REPLAYABLE_EVENT_TYPES:
@@ -791,14 +930,17 @@ class LanServer:
         except Exception:
             msg = None
         last_seq = None
+        last_boot_id = None
         if isinstance(msg, dict) and msg.get("last_seq") is not None:
             try:
                 last_seq = int(msg["last_seq"])
             except (TypeError, ValueError):
                 last_seq = None
+        if isinstance(msg, dict) and isinstance(msg.get("last_boot_id"), str):
+            last_boot_id = msg.get("last_boot_id").strip() or None
         token = msg.get("token") if isinstance(msg, dict) else None
-        registered, replay_items = self._register_and_collect_replay(
-            ws, token, last_seq
+        registered, _replay_ignored = self._register_and_collect_replay(
+            ws, token, None
         )
         if not registered:
             try:
@@ -806,7 +948,15 @@ class LanServer:
             except Exception:
                 pass
             return
-        if replay_items:
+        self._send_control(ws, "hello", {"boot_id": PROCESS_BOOT_ID})
+        kind, reason, replay_items = self._admission_plan(last_boot_id, last_seq)
+        if kind == "reset":
+            self._send_control(ws, "seq_reset", {
+                "boot_id": PROCESS_BOOT_ID,
+                "reason": reason,
+                "resync_required": True,
+            })
+        elif replay_items:
             self._send_replay(ws, replay_items)
         try:
             for raw in ws:
@@ -840,7 +990,7 @@ class LanServer:
             return
         self._safe_send(ws, json.dumps({"id": msg_id, "result": result}))
 
-    def dispatch_rpc(self, method, args) -> Dict[str, Any]:
+    def dispatch_rpc(self, method, args, turn_source: str | None = None) -> Dict[str, Any]:
         """单次 RPC 分发核心（WebSocket 路由与直调测试共用同一边界）。
 
         禁止方法统一返回 ``{"error": {"code": "method_not_allowed"}}``；
@@ -874,7 +1024,8 @@ class LanServer:
             return {"error": {"code": "method_not_allowed"}}
         extra_kwargs = None
         if method in self.MESSAGE_ENTRY_METHODS:
-            normalized = self._force_lan_turn_source(args)
+            source = turn_source if turn_source in ("lan", "server") else self._connection_turn_source()
+            normalized = self._force_lan_turn_source(args, turn_source=source)
             if normalized is None:
                 return {"ok": False, "msg": "消息参数无法规范化，已拒绝"}
             args, extra_kwargs = normalized
@@ -896,7 +1047,21 @@ class LanServer:
             value = ""
         return str(value or "").strip()
 
-    def _force_lan_turn_source(self, args):
+    def _note_serve_activity(self) -> None:
+        try:
+            from core.serve.metrics import note_activity
+
+            note_activity()
+        except Exception:
+            return
+
+    def _connection_turn_source(self) -> str:
+        """serve 进程里的连接是 server。桌面局域网保持 lan。"""
+        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server":
+            return "server"
+        return "lan"
+
+    def _force_lan_turn_source(self, args, turn_source: str = "lan"):
         """消息入口参数规范化：剥离客户端一切 turn_source 绑定与权限档位注入通道。
 
         真实 bridge 签名 send_user_message(text, session_name, attachments,
@@ -931,7 +1096,7 @@ class LanServer:
             ]
             if extra_keys:
                 logger.debug("LAN 消息入口剥离非法键: %s", extra_keys)
-            merged["turn_source"] = "lan"
+            merged["turn_source"] = turn_source if turn_source in ("lan", "server") else "lan"
             return merged, None
         if isinstance(args, list):
             items = list(args[: self.MESSAGE_ENTRY_POSITIONAL_LIMIT])
@@ -940,7 +1105,8 @@ class LanServer:
                 payload.pop("turn_source", None)
                 payload.pop("permission_mode", None)
                 items[0] = payload
-            return items, {"turn_source": "lan"}
+            source = turn_source if turn_source in ("lan", "server") else "lan"
+            return items, {"turn_source": source}
         return None
 
     def _call_bridge(self, method, args, extra_kwargs=None) -> Dict[str, Any]:
@@ -969,6 +1135,71 @@ class LanServer:
     # HTTP 静态服务（作为 websockets process_request 回调）
     # ------------------------------------------------------------------ #
 
+    def _bearer_token(self, request) -> str:
+        header = ""
+        try:
+            header = request.headers.get("Authorization") or ""
+        except Exception:
+            header = ""
+        if header.lower().startswith("bearer "):
+            return header[7:].strip()
+        return ""
+
+    def _worker_token_matches(self, presented: str) -> bool:
+        if not presented or not self._token:
+            return False
+        try:
+            return secrets.compare_digest(presented.encode(), self._token)
+        except Exception:
+            return False
+
+    def _serve_metrics(self, request):
+        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() != "server":
+            return self._http_response(404, "not found", "text/plain; charset=utf-8")
+        if not self._worker_token_matches(self._bearer_token(request)):
+            return self._http_response(401, "unauthorized", "text/plain; charset=utf-8")
+        from core.serve.metrics import collect_metrics
+
+        body = json.dumps(collect_metrics(), ensure_ascii=False)
+        return self._http_response(200, body, "application/json; charset=utf-8")
+
+    def _rewrite_preview_url(self, payload: str, event_type: str) -> str:
+        if event_type != "computer_observation":
+            return payload
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            return payload
+        data = parsed.get("data") if isinstance(parsed, dict) else None
+        if not isinstance(data, dict):
+            return payload
+        internal = str(data.get("preview_url") or "")
+        marker = "/computer-preview/"
+        index = internal.find(marker)
+        if index < 0 or not internal.startswith("http://127.0.0.1"):
+            return payload
+        public_path = internal[index:]
+        self._preview_upstreams[public_path] = internal
+        data["preview_url"] = public_path
+        parsed["data"] = data
+        return json.dumps(parsed, ensure_ascii=False)
+
+    def _serve_computer_preview(self, path: str, request):
+        if not self._worker_token_matches(self._bearer_token(request)):
+            return self._http_response(401, "unauthorized", "text/plain; charset=utf-8")
+        upstream = self._preview_upstreams.get(path)
+        if not upstream or not upstream.startswith("http://127.0.0.1"):
+            return self._http_response(404, "not found", "text/plain; charset=utf-8")
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(upstream, timeout=3) as response:
+                body = response.read()
+                content_type = response.headers.get("Content-Type") or "image/png"
+        except Exception:
+            return self._http_response(404, "not found", "text/plain; charset=utf-8")
+        return self._http_response(200, body, content_type)
+
     def _serve_http(self, connection, request):
         """websockets 的 ``process_request`` 回调：HTTP 路由，WS 升级放行。"""
         # WebSocket 升级请求返回 None，交回 websockets 完成握手
@@ -994,6 +1225,10 @@ class LanServer:
                 ensure_ascii=False,
             )
             return self._http_response(200, body, "application/json; charset=utf-8")
+        if path == "/metrics":
+            return self._serve_metrics(request)
+        if path.startswith("/computer-preview/"):
+            return self._serve_computer_preview(path, request)
         return self._serve_static(path)
 
     @staticmethod

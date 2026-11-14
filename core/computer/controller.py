@@ -188,7 +188,11 @@ def _default_backend_factory(target: str, identity: BackendIdentity) -> Computer
     if target not in ("browser", "desktop"):
         raise ComputerControlError("computer_invalid_action", f"未知电脑操控目标：{target!r}")
     adapter = get_platform_adapter()
-    if not adapter.supported:
+    browser_ok = getattr(adapter, "browser_supported", adapter.supported)
+    desktop_ok = getattr(adapter, "desktop_supported", adapter.supported)
+    if target == "browser" and not browser_ok:
+        raise ComputerControlError("computer_unsupported_os", adapter.unavailable_reason)
+    if target == "desktop" and not desktop_ok:
         raise ComputerControlError("computer_unsupported_os", adapter.unavailable_reason)
     if target == "browser":
         from core.computer.browser_backend import BrowserComputerBackend

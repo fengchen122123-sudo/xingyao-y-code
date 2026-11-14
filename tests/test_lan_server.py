@@ -886,11 +886,19 @@ def test_handle_ws_replays_missed_events_on_resume():
     token = srv._issue_token()
     srv.broadcast(json.dumps({"type": "turn_error", "data": {"message": "boom"}}), event_type="turn_error")
 
-    ws = _FakeResumeWS(json.dumps({"token": token, "last_seq": 0}))
+    from core.lan_server import PROCESS_BOOT_ID
+
+    ws = _FakeResumeWS(json.dumps({
+        "token": token,
+        "last_seq": 0,
+        "last_boot_id": PROCESS_BOOT_ID,
+    }))
     srv._handle_ws(ws)
 
-    assert len(ws.sent) == 1
-    assert json.loads(ws.sent[0])["data"]["message"] == "boom"
+    kinds = [json.loads(item)["type"] for item in ws.sent]
+    assert kinds[0] == "hello"
+    assert "seq_reset" not in kinds
+    assert json.loads(ws.sent[-1])["data"]["message"] == "boom"
 
 
 def test_handle_ws_rejects_invalid_token_without_replay():

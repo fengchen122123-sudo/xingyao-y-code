@@ -1,6 +1,7 @@
 """电脑操控设置（core/computer/settings.py）的严格行为测试。"""
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,7 +39,7 @@ def test_missing_computer_settings_are_safe_defaults(tmp_path, monkeypatch):
 @pytest.mark.parametrize("key,value", [
     ("browser_control_enabled", 1),
     ("computer_control_enabled", "false"),
-    ("computer_browser", "chromium"),
+    ("computer_browser", "firefox"),
 ])
 def test_explicit_invalid_config_is_rejected(tmp_path, monkeypatch, key, value):
     use_temp_config(tmp_path, monkeypatch, {key: value})
@@ -79,7 +80,7 @@ def test_non_bool_values_are_never_truthy_coerced(tmp_path, monkeypatch, value):
     assert exc_info.value.code == "computer_invalid_config"
 
 
-@pytest.mark.parametrize("value", ["chromium", "firefox", "EDGE", "", 1, None])
+@pytest.mark.parametrize("value", ["firefox", "EDGE", "", 1, None])
 def test_invalid_browser_value_is_rejected(tmp_path, monkeypatch, value):
     use_temp_config(tmp_path, monkeypatch, {"computer_browser": value})
     with pytest.raises(ComputerControlError) as exc_info:
@@ -102,6 +103,7 @@ def test_snapshot_exposes_static_fields_without_runtime_state(tmp_path, monkeypa
     assert {option.browser for option in snapshot.browser_options} == {
         "edge",
         "chrome",
+        "chromium",
         "embedded",
     }
     assert isinstance(snapshot.profile_display_path, str)
@@ -163,7 +165,7 @@ def test_browser_change_rejected_while_run_active(tmp_path, monkeypatch):
     assert json.loads(path.read_text(encoding="utf-8"))["computer_browser"] == "edge"
 
 
-@pytest.mark.parametrize("value", ["chromium", "EDGE", "", 1, None])
+@pytest.mark.parametrize("value", ["EDGE", "", 1, None])
 def test_browser_setter_rejects_invalid_value(tmp_path, monkeypatch, value):
     use_temp_config(tmp_path, monkeypatch, {})
     with pytest.raises(ComputerControlError) as exc_info:
@@ -195,7 +197,7 @@ def test_profile_dirs_are_isolated_per_browser(tmp_path, monkeypatch):
     assert chrome_dir.is_relative_to(root)
 
 
-@pytest.mark.parametrize("browser", ["..", "../evil", "edge/../chrome", "", "chromium", 1, None])
+@pytest.mark.parametrize("browser", ["..", "../evil", "edge/../chrome", "", "firefox", 1, None])
 def test_profile_dir_rejects_escape_or_unknown_browser(tmp_path, monkeypatch, browser):
     monkeypatch.setattr(config, "YCODE_DIR", str(tmp_path))
     with pytest.raises(ComputerControlError) as exc_info:
@@ -219,8 +221,13 @@ def _patch_no_explicit_installs(monkeypatch):
 
 
 def test_browser_detection_uses_which_and_explicit_paths(monkeypatch):
-    edge_exe = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+    program_files_x86 = r"C:\Program Files (x86)"
+    edge_exe = os.path.join(
+        program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"
+    )
     chrome_exe = r"C:\tools\chrome\chrome.exe"
+    monkeypatch.setenv("ProgramFiles(x86)", program_files_x86)
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
     monkeypatch.setattr(
         "core.computer.platforms.windows.shutil.which",
         lambda name: chrome_exe if name == "chrome.exe" else None,

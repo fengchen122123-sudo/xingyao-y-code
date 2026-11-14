@@ -166,7 +166,7 @@ HISTORY_PAGE_SIZE = 50
 # 由入口层注入，模型/用户正文无法设置（send_user_message 校验后拒绝非法值）。
 # 与 core.llm.COMPUTER_TURN_SOURCES 必须保持一致——低层还会再校验一次来源，
 # 两处不一致会让新来源的回合在模型请求处直接抛错（有测试断言两者相等）。
-TURN_SOURCES = ("local", "lan", "feishu", "mcp", "goal")
+TURN_SOURCES = ("local", "lan", "feishu", "mcp", "goal", "server")
 
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
@@ -1908,6 +1908,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 对现有功能零影响
         self._feishu_service = None
         self._feishu_lock = threading.Lock()
+        # 云中转默认关闭。未开启时不创建连接。
+        self._cloud_relay_service = None
+        self._cloud_relay_lock = threading.Lock()
         # 电脑操控事件桥：controller listener 注册标记（进程内建立一次、幂等，
         # 见 _ensure_computer_event_bridge；set_window 与各控制方法都会触发）
         self._computer_event_listener = None
@@ -2522,6 +2525,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 self._feishu_service.stop()
         except Exception:
             logger.exception("退出时停止飞书通道服务失败")
+
+        try:
+            if getattr(self, "_cloud_relay_service", None) is not None:
+                self._cloud_relay_service.stop()
+        except Exception:
+            logger.exception("退出时停止云中转失败")
 
         if self._mcp is not None:
             try:
@@ -3832,6 +3841,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         feishu = getattr(self, "_feishu_service", None)
         if feishu is not None:
             feishu.on_event(event_type, data)
+        relay = getattr(self, "_cloud_relay_service", None)
+        if relay is not None:
+            relay.on_event(event_type, data)
 
     def _queue_js_payload(self, payload: str) -> None:
         """唯一入队点：保证派发线程存在后 put_nowait；队列满丢弃新事件并计数。"""
@@ -4410,6 +4422,14 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             ).start()
         except Exception:
             logger.debug("飞书通道服务启动线程创建失败", exc_info=True)
+        try:
+            threading.Thread(
+                target=self._ensure_cloud_relay,
+                daemon=True,
+                name="cloud-relay-startup",
+            ).start()
+        except Exception:
+            logger.debug("云中转启动线程创建失败", exc_info=True)
         # 历史消息媒体清单迁移：一次性、幂等，后台执行不阻塞初始化
         try:
             threading.Thread(
@@ -8225,6 +8245,71 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             except Exception:
                 logger.exception("飞书通道服务启动失败")
                 return None
+
+    def _ensure_cloud_relay(self):
+        """默认关闭。配置开启后才创建服务，失败不抛给调用方。"""
+        if getattr(self, "_cloud_relay_service", None) is not None:
+            return self._cloud_relay_service
+        lock = getattr(self, "_cloud_relay_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._cloud_relay_lock = lock
+        with lock:
+            if getattr(self, "_cloud_relay_service", None) is not None:
+                return self._cloud_relay_service
+            try:
+                from core.cloud_relay.service import CloudRelayService
+
+                service = CloudRelayService(bridge=self)
+                if not service.start():
+                    return None
+                self._cloud_relay_service = service
+                return service
+            except Exception:
+                logger.exception("云中转启动失败")
+                return None
+
+    def get_cloud_relay_settings(self) -> Dict[str, Any]:
+        try:
+            data = config._load()
+            service = getattr(self, "_cloud_relay_service", None)
+            state = service.status()["state"] if service is not None else "disabled"
+            return {
+                "ok": True,
+                "settings": {
+                    "enabled": bool(data.get(config.CLOUD_RELAY_ENABLED_KEY, False)),
+                    "url": data.get(config.CLOUD_RELAY_URL_KEY) or "",
+                    "device_id": data.get(config.CLOUD_RELAY_DEVICE_ID_KEY) or "",
+                    "state": state,
+                },
+            }
+        except Exception as error:
+            logger.exception("读取云中转设置失败")
+            return {"ok": False, "msg": str(error)}
+
+    def save_cloud_relay_settings(self, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        try:
+            payload = payload or {}
+            config.save_config_value(config.CLOUD_RELAY_ENABLED_KEY, bool(payload.get("enabled")))
+            config.save_config_value(config.CLOUD_RELAY_URL_KEY, str(payload.get("url") or ""))
+            config.save_config_value(
+                config.CLOUD_RELAY_DEVICE_ID_KEY,
+                str(payload.get("device_id") or ""),
+            )
+            token = str(payload.get("token") or "").strip()
+            if token:
+                from core.credentials import protect_secret
+
+                config.save_config_value(config.CLOUD_RELAY_TOKEN_KEY, protect_secret(token))
+            current = getattr(self, "_cloud_relay_service", None)
+            if current is not None:
+                current.stop()
+                self._cloud_relay_service = None
+            self._ensure_cloud_relay()
+            return self.get_cloud_relay_settings()
+        except Exception as error:
+            logger.exception("保存云中转设置失败")
+            return {"ok": False, "msg": str(error)}
 
     def get_remote_bind_qr(self, force_new: bool = False, mobile: bool = False) -> Dict[str, Any]:
         """返回手机扫码绑定信息。
