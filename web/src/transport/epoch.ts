@@ -38,3 +38,26 @@ export function watermarkKey(server: string, accountId: string, profile: string)
 export function shouldPersistWatermark(isCapacitor: boolean): boolean {
   return !isCapacitor;
 }
+
+export interface LiveFrame {
+  type?: string;
+  seq?: number;
+  data?: { boot_id?: string; turn_id?: string };
+}
+
+/** 快照落地前先压住。同一 boot 里，序号不超过暂停点的帧丢掉；已结束回合的增量也丢掉。 */
+export function keepLiveFrame(
+  frame: LiveFrame,
+  pausedSeq: number,
+  bootId: string,
+  finishedTurns: ReadonlySet<string>,
+): boolean {
+  const frameBoot = frame.data?.boot_id || "";
+  if (frameBoot && bootId && frameBoot !== bootId) return false;
+  if (typeof frame.seq === "number" && frame.seq <= pausedSeq) return false;
+  const turnId = frame.data?.turn_id || "";
+  if (turnId && finishedTurns.has(turnId) && (frame.type === "token_delta" || frame.type === "thinking_delta")) {
+    return false;
+  }
+  return true;
+}

@@ -24,6 +24,7 @@ class RelayRegistry:
         self.mirrors = {}
         self.apps = {}
         self.dropped = {}
+        self.listeners = []
 
     def create_device(self, database, account_id: str, name: str) -> tuple[str, str]:
         device_id = str(uuid.uuid4())
@@ -97,7 +98,27 @@ class RelayRegistry:
         database.commit()
         current = self.devices.pop(device_id, None)
         self.mirrors.pop(device_id, None)
+        closer = current.get("connection") if current else None
+        if callable(closer):
+            closer()
         return current
+
+    def listen(self, account_id: str, device_id: str | None, send) -> tuple:
+        item = (account_id, device_id, send)
+        self.listeners.append(item)
+        return item
+
+    def unlisten(self, item) -> None:
+        if item in self.listeners:
+            self.listeners.remove(item)
+
+    def publish(self, account_id: str, device_id: str | None, frame: dict) -> None:
+        for listener_account, listener_device, send in list(self.listeners):
+            if listener_account != account_id:
+                continue
+            if listener_device not in (None, device_id):
+                continue
+            send(frame)
 
     def attach_app(self, device_id: str, app_id: str) -> dict:
         bucket = self.apps.setdefault(device_id, [])

@@ -19,7 +19,7 @@ import { useAppStore } from "../stores/app";
 const app = useAppStore();
 
 async function answer(id: string, allow: boolean) {
-  await app.shim?.rpc(allow ? "respond_permission_allow" : "respond_permission_deny", { id });
+  await app.shim?.rpc("respond_permission", { request_id: id, allow });
   app.approvals = app.approvals.filter((item) => item.id !== id);
 }
 </script>

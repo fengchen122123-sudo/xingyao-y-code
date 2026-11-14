@@ -79,6 +79,10 @@ export const useAppStore = defineStore("app", {
       }
       await this.shim.rpc("send_user_message", { text });
     },
+    async stop() {
+      await this.shim?.rpc("stop_current_turn", {});
+      this.status = "已停下";
+    },
     disconnect() {
       this.shim?.close();
       this.shim = null;

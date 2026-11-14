@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,16 +36,24 @@ def test_agent_socket_sends_worker_token_only_upstream(tmp_path):
     app = _app(tmp_path)
     client = TestClient(app)
     token = _login(client, "root")
-    link = {"token": "worker-secret", "sent": []}
+    downstream = queue.Queue()
+    link = {"token": "worker-secret", "sent": [], "downstream": downstream}
     app.state.dial_worker = lambda account_id: link
     with client.websocket_connect("/ws/agent") as socket:
         socket.send_text(json.dumps({"jwt": token, "last_seq": None, "last_boot_id": None}))
-        with pytest.raises(WebSocketDisconnect):
-            socket.receive_text()
+        socket.send_text(json.dumps({"method": "send_user_message", "id": 1}))
+        downstream.put(json.dumps({"type": "leak", "token": "worker-secret"}))
+        downstream.put(json.dumps({"type": "hello", "data": {"boot_id": "boot"}}))
+        heard = json.loads(socket.receive_text())
+        deadline = time.time() + 2
+        while time.time() < deadline and len(link["sent"]) < 2:
+            time.sleep(0.01)
+    assert heard == {"type": "hello", "data": {"boot_id": "boot"}}
     frame = link["sent"][0]
     assert frame["token"] == "worker-secret"
     assert frame["last_seq"] is None
     assert frame["last_boot_id"] is None
+    assert json.loads(link["sent"][1])["method"] == "send_user_message"
 
 
 def test_missing_worker_tells_the_browser_it_is_lost(tmp_path):
@@ -212,6 +223,178 @@ def test_device_goes_offline_after_45_seconds_without_a_ping():
     assert registry.sweep(140) == []
     events = registry.sweep(146)
     assert events[0]["data"]["online"] is False
+
+
+def test_revoking_a_device_closes_its_desktop(tmp_path):
+    app = _app(tmp_path)
+    client = TestClient(app)
+    admin = _login(client, "root")
+    ada = client.post(
+        "/api/admin/accounts",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"username": "ada", "password": "secret-secret"},
+    ).json()["id"]
+    created = client.post(
+        f"/api/admin/devices?account_id={ada}",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"name": "家里的台式机"},
+    ).json()
+    with client.websocket_connect("/relay/device") as socket:
+        socket.send_text(json.dumps({
+            "type": "relay_register",
+            "token": created["token"],
+            "device_id": created["id"],
+            "boot_id": "boot-1",
+        }))
+        assert json.loads(socket.receive_text())["type"] == "relay_registered"
+        deleted = client.delete(
+            f"/api/admin/devices/{created['id']}",
+            headers={"Authorization": f"Bearer {admin}"},
+        )
+        assert deleted.status_code == 200
+        with pytest.raises(WebSocketDisconnect) as raised:
+            socket.receive_text()
+    assert raised.value.code == 4401
+
+
+def test_phone_hears_the_desktop_come_online(tmp_path):
+    app = _app(tmp_path)
+    client = TestClient(app)
+    admin = _login(client, "root")
+    ada = client.post(
+        "/api/admin/accounts",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"username": "ada", "password": "secret-secret"},
+    ).json()["id"]
+    ada_token = _login(client, "ada")
+    created = client.post(
+        f"/api/admin/devices?account_id={ada}",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"name": "家里的台式机"},
+    ).json()
+    with client.websocket_connect("/ws/devices") as phone:
+        phone.send_text(json.dumps({"jwt": ada_token}))
+        assert json.loads(phone.receive_text())["type"] == "ready"
+        with client.websocket_connect("/relay/device") as desktop:
+            desktop.send_text(json.dumps({
+                "type": "relay_register",
+                "token": created["token"],
+                "device_id": created["id"],
+                "boot_id": "boot-1",
+            }))
+            assert json.loads(desktop.receive_text())["type"] == "relay_registered"
+            online = json.loads(phone.receive_text())
+    assert online["type"] == "device_online"
+    assert online["data"]["device_id"] == created["id"]
+
+
+def test_a_second_desktop_kicks_the_first(tmp_path):
+    app = _app(tmp_path)
+    client = TestClient(app)
+    admin = _login(client, "root")
+    ada = client.post(
+        "/api/admin/accounts",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"username": "ada", "password": "secret-secret"},
+    ).json()["id"]
+    created = client.post(
+        f"/api/admin/devices?account_id={ada}",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"name": "家里的台式机"},
+    ).json()
+    with client.websocket_connect("/relay/device") as first:
+        first.send_text(json.dumps({
+            "type": "relay_register",
+            "token": created["token"],
+            "device_id": created["id"],
+            "boot_id": "boot-1",
+        }))
+        assert json.loads(first.receive_text())["type"] == "relay_registered"
+        with client.websocket_connect("/relay/device") as second:
+            second.send_text(json.dumps({
+                "type": "relay_register",
+                "token": created["token"],
+                "device_id": created["id"],
+                "boot_id": "boot-2",
+            }))
+            assert json.loads(second.receive_text())["type"] == "relay_registered"
+            with pytest.raises(WebSocketDisconnect) as raised:
+                first.receive_text()
+    assert raised.value.code == 4401
+
+
+def test_one_account_cannot_start_two_containers(tmp_path):
+    from gateway.workers import WorkerManager
+
+    app = _app(tmp_path)
+    account = app.state.database.execute("SELECT id FROM accounts").fetchone()["id"]
+
+    class Docker:
+        def __init__(self):
+            self.names = set()
+            self.concurrent = 0
+            self.max_concurrent = 0
+            self.guard = threading.Lock()
+
+        def exists(self, name):
+            return name in self.names
+
+        def create(self, spec):
+            with self.guard:
+                self.concurrent += 1
+                self.max_concurrent = max(self.max_concurrent, self.concurrent)
+            time.sleep(0.05)
+            self.names.add(spec["name"])
+            with self.guard:
+                self.concurrent -= 1
+
+        def start(self, _name):
+            return None
+
+    docker = Docker()
+    manager = WorkerManager(docker, app.state.database, tmp_path, "image")
+    health = lambda _url: {"ok": True, "boot_id": "boot"}
+    threads = [
+        threading.Thread(target=manager.ensure_running, args=(account, health))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert docker.max_concurrent == 1
+    assert manager.volume_for(account) != manager.volume_for("someone-else")
+
+
+def test_restore_uses_the_gateway_worker_token(tmp_path):
+    from gateway.backup import reconcile_worker_token
+
+    app = _app(tmp_path)
+    account = app.state.database.execute("SELECT id FROM accounts").fetchone()["id"]
+    app.state.database.execute(
+        "INSERT INTO workers(account_id, container_name, worker_token, desired_state, updated_at) VALUES (?, ?, ?, 'running', 1)",
+        (account, f"xingyao-worker-{account}", "from-db"),
+    )
+    app.state.database.commit()
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    (volume / "config.json").write_text(json.dumps({"remote_pair_token": "from-volume"}), encoding="utf-8")
+    assert reconcile_worker_token(app.state.database, account, volume) == "from-db"
+    saved = json.loads((volume / "config.json").read_text(encoding="utf-8"))
+    assert saved["remote_pair_token"] == "from-db"
+
+
+def test_idle_poll_waits_thirty_seconds_between_checks():
+    from gateway.workers import IdleLoop, IdleSupervisor
+
+    class Manager:
+        def consider_idle(self, account_id, metrics, now):
+            return True
+
+    loop = IdleLoop(IdleSupervisor(Manager()), interval=30)
+    assert loop.advance(0, ["ada"], lambda _account: {"active_turn": False, "last_activity_ts": 0}) == ["ada"]
+    assert loop.advance(10, ["ada"], lambda _account: {}) == []
+    assert loop.advance(30, ["ada"], lambda _account: {}) == ["ada"]
 
 
 def test_usage_day_follows_shanghai_midnight():

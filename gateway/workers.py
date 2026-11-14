@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 import time
 from pathlib import Path
 
@@ -49,6 +50,16 @@ class WorkerManager:
         self.accounts_root = Path(accounts_root)
         self.image = image
         self.network = network
+        self._guard = threading.Lock()
+        self._account_locks: dict[str, threading.Lock] = {}
+
+    def _account_lock(self, account_id: str) -> threading.Lock:
+        with self._guard:
+            lock = self._account_locks.get(account_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._account_locks[account_id] = lock
+            return lock
 
     def volume_for(self, account_id: str) -> Path:
         path = self.accounts_root / account_id / "data"
@@ -86,6 +97,10 @@ class WorkerManager:
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
     def ensure_running(self, account_id: str, health, clock=time.monotonic) -> dict:
+        with self._account_lock(account_id):
+            return self._ensure_running_locked(account_id, health, clock)
+
+    def _ensure_running_locked(self, account_id: str, health, clock) -> dict:
         token = self.ensure_token(account_id)
         spec = container_spec(account_id, self.image, self.volume_for(account_id), self.network)
         if spec["ports"] or spec["docker_sock"]:
@@ -138,3 +153,24 @@ class IdleSupervisor:
 
     def tick(self, account_id: str, metrics: dict, now: float) -> bool:
         return self.manager.consider_idle(account_id, metrics, now)
+
+
+class IdleLoop:
+    """每 30 秒看一次指标。时钟由调用方推进，测试不必真等。"""
+
+    def __init__(self, supervisor: IdleSupervisor, interval: float = 30):
+        self.supervisor = supervisor
+        self.interval = interval
+        self.next_at = None
+
+    def advance(self, now: float, accounts: list[str], fetch) -> list[str]:
+        if self.next_at is None:
+            self.next_at = now
+        if now < self.next_at:
+            return []
+        self.next_at = now + self.interval
+        stopped = []
+        for account_id in accounts:
+            if self.supervisor.tick(account_id, fetch(account_id), now):
+                stopped.append(account_id)
+        return stopped

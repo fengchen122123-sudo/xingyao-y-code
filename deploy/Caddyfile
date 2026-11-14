@@ -1,11 +1,9 @@
+# P2：公网只进网关。JWT 和预览令牌由网关核对，Caddy 不再做 basic-auth。
 {
     email {$ACME_EMAIL}
 }
 {$SITE_DOMAIN} {
     encode gzip
-    basicauth {
-        {$BASIC_USER} {$BASIC_HASH}
-    }
     log {
         output file /var/log/caddy/access.log
         format filter {
@@ -18,12 +16,7 @@
             }
         }
     }
-    handle /computer-preview/* {
-        reverse_proxy worker:8766 {
-            header_up Authorization "Bearer {$WORKER_TOKEN}"
-        }
-    }
     handle {
-        reverse_proxy worker:8766
+        reverse_proxy gateway:8080
     }
 }

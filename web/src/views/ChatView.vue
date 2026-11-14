@@ -14,6 +14,7 @@
       <button class="text-button" type="button" @click="drawer = !drawer">会话</button>
       <input v-model="text" placeholder="跟星瑶说" />
       <button class="send" type="submit">送</button>
+      <button class="text-button" type="button" @click="app.stop()">停</button>
     </form>
   </main>
 </template>

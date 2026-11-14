@@ -1,24 +1,19 @@
-# P1 单账号。P2 起 worker 由网关按账号动态创建，不再写死在这里。
+# P2。worker 由网关按账号创建，不在这里写死，也不把 8766 发布到宿主机。
 services:
-  worker:
-    image: xingyao-worker:${YCODE_VERSION:-local}
-    container_name: xingyao-worker-local
-    user: "10001:10001"
+  gateway:
+    image: python:3.12-slim
     networks: [xingyao]
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 2g
-    cpus: 2
-    pids_limit: 512
-    shm_size: 1g
+    working_dir: /srv/xingyao
+    command: python -m uvicorn gateway.app:app_from_env --factory --host 0.0.0.0 --port 8080
     environment:
       TZ: Asia/Shanghai
-      YCODE_DATA_DIR: /data
-      YCODE_TOOL_PROFILE: server
-      YCODE_SERVE_BIND: 0.0.0.0
-      YCODE_SERVE_PORT: "8766"
+      XINGYAO_JWT_SECRET: ${XINGYAO_JWT_SECRET}
+      XINGYAO_GATEWAY_DIR: /srv/xingyao/gateway
+      XINGYAO_ACCOUNTS_ROOT: /srv/xingyao/accounts
     volumes:
-      - ./accounts/local/data:/data
+      - ..:/srv/xingyao
+      - gateway-data:/srv/xingyao/gateway
+      - /var/run/docker.sock:/var/run/docker.sock
   caddy:
     image: caddy:2
     networks: [xingyao]
@@ -27,9 +22,6 @@ services:
     environment:
       ACME_EMAIL: ${ACME_EMAIL}
       SITE_DOMAIN: ${SITE_DOMAIN}
-      BASIC_USER: ${BASIC_USER}
-      BASIC_HASH: ${BASIC_HASH}
-      WORKER_TOKEN: ${WORKER_TOKEN}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -40,5 +32,6 @@ networks:
     name: xingyao
 
 volumes:
+  gateway-data:
   caddy-data:
   caddy-logs:

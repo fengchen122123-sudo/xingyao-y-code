@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideFrame, shouldPersistWatermark, watermarkKey } from "./epoch";
+import { decideFrame, keepLiveFrame, shouldPersistWatermark, watermarkKey } from "./epoch";
 
 describe("epoch", () => {
   it("keeps hello and seq_reset out of the business stream", () => {
@@ -14,6 +14,13 @@ describe("epoch", () => {
 
   it("treats a server without hello as legacy", () => {
     expect(decideFrame({ type: "notice" }, false).kind).toBe("legacy");
+  });
+
+  it("drops stale deltas and keeps later frames from the same boot", () => {
+    const finished = new Set(["turn-1"]);
+    expect(keepLiveFrame({ type: "token_delta", seq: 3, data: { turn_id: "turn-1" } }, 4, "boot", finished)).toBe(false);
+    expect(keepLiveFrame({ type: "token_delta", seq: 8, data: { boot_id: "other" } }, 4, "boot", finished)).toBe(false);
+    expect(keepLiveFrame({ type: "notice", seq: 8, data: { boot_id: "boot" } }, 4, "boot", finished)).toBe(true);
   });
 
   it("scopes the watermark and refuses to persist it on Capacitor", () => {

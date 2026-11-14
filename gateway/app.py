@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -162,11 +163,9 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
             app.state.sockets.close_account(account_id)
             if app.state.workers is not None:
                 app.state.workers.stop(account_id)
-            app.state.relay.devices = {
-                key: value
-                for key, value in app.state.relay.devices.items()
-                if value.get("account_id") != account_id
-            }
+            for device_id, value in list(app.state.relay.devices.items()):
+                if value.get("account_id") == account_id:
+                    app.state.relay.revoke(database, device_id)
         elif body.role:
             bump_epoch(database, account_id, role=body.role)
             app.state.sockets.close_account(account_id)
@@ -264,11 +263,14 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         )
         for frame in opened["client_frames"]:
             await websocket.send_text(json.dumps(frame, ensure_ascii=False))
-        if opened["upstream_frame"] is not None:
-            link = opened["link"]
-            link["sent"].append(opened["upstream_frame"])
+        if opened["upstream_frame"] is None:
+            app.state.sockets.add(principal_now.account_id, principal_now.jti, websocket.close)
+            await websocket.close()
+            return
+        link = opened["link"]
+        link["sent"].append(opened["upstream_frame"])
         app.state.sockets.add(principal_now.account_id, principal_now.jti, websocket.close)
-        await websocket.close()
+        await _bridge(websocket, link)
 
     @app.websocket("/relay/device")
     async def relay_device(websocket: WebSocket):
@@ -287,11 +289,35 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         if not result.get("ok"):
             await websocket.close(code=4401)
             return
-        await websocket.send_text(json.dumps(result["registered"], ensure_ascii=False))
+        kicked = result.get("kicked")
+        if callable(kicked):
+            kicked()
         device_id = str(first.get("device_id") or "")
-        while True:
+        account_id = app.state.relay.devices[device_id]["account_id"]
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+
+        def closer() -> None:
+            loop.call_soon_threadsafe(stop.set)
+
+        app.state.relay.devices[device_id]["connection"] = closer
+        await websocket.send_text(json.dumps(result["registered"], ensure_ascii=False))
+        if result.get("online"):
+            app.state.relay.publish(account_id, device_id, result["online"])
+        while not stop.is_set():
+            receive = asyncio.create_task(websocket.receive_text())
+            kicked_wait = asyncio.create_task(stop.wait())
+            done, pending = await asyncio.wait(
+                {receive, kicked_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if stop.is_set():
+                await websocket.close(code=4401)
+                return
             try:
-                raw = await websocket.receive_text()
+                raw = receive.result()
             except Exception:
                 return
             frame = json.loads(raw)
@@ -319,7 +345,7 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
             return
         plan = app.state.relay.frames_for(device_id, first.get("last_seq"), first.get("last_boot_id"))
         await websocket.send_text(json.dumps(plan, ensure_ascii=False))
-        await websocket.close()
+        await _fanout(websocket, app.state.relay, user.account_id, device_id)
 
     @app.websocket("/ws/admin")
     async def admin_socket(websocket: WebSocket):
@@ -334,7 +360,7 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
             await websocket.close(code=4401)
             return
         await websocket.send_text(json.dumps({"type": "ready"}))
-        await websocket.close()
+        await _fanout(websocket, app.state.relay, user.account_id, None)
 
     @app.websocket("/ws/devices")
     async def device_socket(websocket: WebSocket):
@@ -349,7 +375,7 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
             await websocket.close(code=4401)
             return
         await websocket.send_text(json.dumps({"type": "ready", "data": {"account_id": user.account_id}}))
-        await websocket.close()
+        await _fanout(websocket, app.state.relay, user.account_id, None)
 
     @app.get("/api/admin/usage")
     def usage(_admin: Principal = Depends(admin)):
@@ -363,6 +389,64 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
 
     app.state.init_admin = lambda username, password: init_admin(database, username, password)
     return app
+
+
+async def _bridge(websocket: WebSocket, link: dict) -> None:
+    """浏览器帧原样交给上游。上游帧送回浏览器，其中不带工人令牌。"""
+    downstream = link.get("downstream")
+
+    async def from_browser() -> None:
+        while True:
+            link["sent"].append(await websocket.receive_text())
+
+    async def from_worker() -> None:
+        if downstream is None:
+            await asyncio.Future()
+            return
+        while True:
+            item = await asyncio.to_thread(downstream.get)
+            if item is None:
+                return
+            text = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+            if link.get("token") and link["token"] in text:
+                continue
+            await websocket.send_text(text)
+
+    tasks = {asyncio.create_task(from_browser()), asyncio.create_task(from_worker())}
+    _done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    if downstream is not None:
+        downstream.put(None)
+    for task in pending:
+        task.cancel()
+
+
+async def _fanout(websocket: WebSocket, relay, account_id: str, device_id: str | None) -> None:
+    loop = asyncio.get_running_loop()
+    pending_frames: asyncio.Queue = asyncio.Queue()
+
+    def send(frame: dict) -> None:
+        loop.call_soon_threadsafe(pending_frames.put_nowait, frame)
+
+    item = relay.listen(account_id, device_id, send)
+    try:
+        while True:
+            receive = asyncio.create_task(websocket.receive_text())
+            incoming = asyncio.create_task(pending_frames.get())
+            done, pending = await asyncio.wait(
+                {receive, incoming},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if incoming in done:
+                await websocket.send_text(json.dumps(incoming.result(), ensure_ascii=False))
+                continue
+            try:
+                receive.result()
+            except Exception:
+                return
+    finally:
+        relay.unlisten(item)
 
 
 def app_from_env():

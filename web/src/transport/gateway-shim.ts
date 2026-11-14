@@ -1,4 +1,4 @@
-import { decideFrame, shouldPersistWatermark, watermarkKey, type Watermark } from "./epoch";
+import { decideFrame, keepLiveFrame, shouldPersistWatermark, watermarkKey, type Watermark } from "./epoch";
 import { endpointFor, type AgentProfile } from "./profile";
 
 export interface ShimOptions {
@@ -18,6 +18,9 @@ export class GatewayShim {
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   private seq = 0;
   private sawHello = false;
+  private holding = false;
+  private pausedSeq = 0;
+  private held: { type?: string; seq?: number; data?: { boot_id?: string; turn_id?: string } }[] = [];
   private listeners = new Set<(frame: { type: string; data?: unknown }) => void>();
 
   constructor(private options: ShimOptions) {
@@ -84,11 +87,21 @@ export class GatewayShim {
     if (decision.kind === "hello" || decision.kind === "reset") {
       this.sawHello = true;
       this.bootId = decision.bootId || this.bootId;
-      if (decision.kind === "reset") this.lastSeq = 0;
+      if (decision.kind === "reset") {
+        this.pausedSeq = this.lastSeq;
+        this.lastSeq = 0;
+        this.holding = decision.resync;
+        this.held = [];
+      }
       this.writeWatermark();
       if (decision.resync) void this.rpc("get_initial_state", []).then((state) => {
         this.emit({ type: "yc_snapshot", data: state });
+        this.releaseHeld();
       });
+      return;
+    }
+    if (this.holding && msg.type) {
+      this.held.push(msg);
       return;
     }
     if (decision.kind === "legacy") this.sawHello = false;
@@ -97,6 +110,18 @@ export class GatewayShim {
       this.writeWatermark();
     }
     if (msg.type) this.emit({ type: msg.type, data: msg.data });
+  }
+
+  private releaseHeld(): void {
+    const finished = new Set<string>();
+    const pending = this.held;
+    this.held = [];
+    this.holding = false;
+    pending.forEach((frame) => {
+      if (keepLiveFrame(frame, this.pausedSeq, this.bootId, finished) && frame.type) {
+        this.emit({ type: frame.type, data: frame.data });
+      }
+    });
   }
 
   private emit(frame: { type: string; data?: unknown }): void {
