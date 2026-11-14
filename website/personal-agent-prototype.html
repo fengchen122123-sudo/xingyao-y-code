@@ -3,171 +3,247 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#ffffff">
+<meta name="theme-color" content="#f6f4ef">
 <title>星瑶</title>
 <style>
   :root {
-    --ink: #1a1a1a;
-    --muted: #5f5f5f;
-    --line: #e7e7e4;
-    --soft: #f4f4f2;
-    --paper: #f7f7f5;
-    --fill: #171717;
+    --bg: #f4f1ea;
+    --bg-deep: #ebe6dc;
+    --surface: #fffcf8;
+    --ink: #1c1b17;
+    --muted: #6f6a62;
+    --line: #e5e0d6;
+    --user: #e7f0e4;
+    --online: #2f8f55;
+    --shadow: 0 10px 28px rgba(48, 40, 24, .07);
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
     margin: 0;
     color: var(--ink);
-    background: #fff;
-    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
     font-size: 16px;
-    line-height: 1.6;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
   }
   button, textarea, input { font: inherit; color: inherit; }
   button { cursor: pointer; }
   button:disabled { cursor: default; }
+  h1, h2, p { margin: 0; }
   :focus { outline: none; }
-  :focus-visible { outline: 2px solid var(--fill); outline-offset: 3px; }
+  :focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
   .sr-only {
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
+  .icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; display: block; }
+  .avatar {
+    width: 36px; height: 36px; border-radius: 50%; flex: none;
+    background: var(--ink); color: #fff;
+    display: grid; place-items: center;
+    font-size: 14px; font-weight: 650;
+  }
+  .avatar.sm { width: 26px; height: 26px; font-size: 12px; }
+  .avatar.lg { width: 56px; height: 56px; font-size: 22px; }
+  .avatar .icon { stroke: #fff; width: 18px; height: 18px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #c8c2b6; display: inline-block; flex: none; }
+  .dot.on { background: var(--online); }
+  .dot.wait { background: #c4842f; }
 
   .switch {
     position: fixed; z-index: 5; top: 14px; right: 14px;
     display: flex; padding: 3px; border: 1px solid var(--line);
-    border-radius: 999px; background: #fff;
+    border-radius: 999px; background: var(--surface);
+    box-shadow: var(--shadow);
   }
   .switch button {
     border: 0; background: transparent; color: var(--muted);
-    border-radius: 999px; padding: 5px 12px; font-size: 12px;
+    border-radius: 999px; padding: 6px 12px; font-size: 12px;
   }
-  .switch button[aria-pressed="true"] { background: var(--fill); color: #fff; }
+  .switch button[aria-pressed="true"] { background: var(--ink); color: #fff; }
 
   .frame { height: 100%; }
-  body.phone { background: var(--paper); overflow: hidden; padding: 20px 0; }
+  body.phone { background: #e4dfd4; overflow: hidden; padding: 20px 0; }
   body.phone .frame {
-    width: 390px;
-    height: 100%;
-    margin: 0 auto;
-    border: 1px solid var(--line);
-    border-radius: 28px;
-    overflow: hidden;
-    background: #fff;
+    width: 390px; height: 100%; margin: 0 auto;
+    border-radius: 32px; overflow: hidden; background: var(--bg);
+    box-shadow: 0 24px 70px rgba(48, 40, 24, .16);
   }
 
-  .app { height: 100%; display: flex; background: #fff; min-height: 0; }
+  .app { height: 100%; display: flex; min-height: 0; background: var(--bg); }
   .side {
-    width: 248px; flex: none; background: var(--paper);
-    display: flex; flex-direction: column; padding: 18px 12px 12px; min-height: 0;
+    width: 280px; flex: none; display: flex; flex-direction: column;
+    padding: 18px 14px 12px; min-height: 0; background: #efebe3;
   }
-  .side-head, .top-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  .side-head { padding: 4px 8px 14px; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .mark { font-weight: 680; letter-spacing: -.03em; font-size: 16px; }
+  .new-chat {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    height: 42px; margin: 0 4px 16px; border-radius: 14px;
+    border: 1px solid var(--line); background: var(--surface);
+    font-size: 14px; font-weight: 600;
+    box-shadow: 0 1px 2px rgba(48, 40, 24, .04);
   }
-  .side-head { padding: 2px 10px 16px; }
-  .mark { font-weight: 650; letter-spacing: -0.03em; }
-  .text-btn {
-    border: 0; background: none; padding: 6px 2px; font-size: 13px; color: var(--ink);
+  .new-chat:hover { background: #fff; }
+  .side-label { margin: 0 10px 8px; font-size: 12px; color: var(--muted); }
+  .chats { overflow: auto; display: flex; flex-direction: column; gap: 4px; min-height: 0; }
+  .chat-btn, .side-link, .account-chip {
+    width: 100%; border: 0; background: transparent; text-align: left; border-radius: 14px;
   }
-  .chats { overflow: auto; display: flex; flex-direction: column; gap: 2px; }
-  .chat-btn, .side-link {
-    width: 100%; display: flex; align-items: center; justify-content: space-between;
-    gap: 12px; text-align: left; border: 0; background: transparent;
-    border-radius: 8px; padding: 9px 10px;
-  }
-  .chat-btn:hover, .side-link:hover { background: #eeeee9; }
-  .chat-btn.active { background: #e6e6e1; }
-  .chat-btn span, .device b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .chat-btn time, .side-link.quiet, .when { color: var(--muted); font-size: 12px; flex: none; }
-  .side-foot { margin-top: auto; padding-top: 12px; display: flex; flex-direction: column; }
+  .chat-btn { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; }
+  .chat-btn:hover, .side-link:hover, .account-chip:hover { background: rgba(255, 252, 248, .7); }
+  .chat-btn.active { background: var(--surface); box-shadow: 0 1px 2px rgba(48, 40, 24, .05); }
+  .chat-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .chat-title { font-size: 14px; font-weight: 650; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-btn time, .chat-preview, .side-link small { color: var(--muted); font-size: 12px; }
+  .chat-btn time { flex: none; }
+  .chat-preview { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .side-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; }
+  .side-link, .account-chip { display: flex; align-items: center; gap: 10px; padding: 10px; font-size: 14px; }
+  .account-chip { color: var(--muted); }
 
-  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-  .transcript { flex: 1; overflow: auto; padding: 28px 32px 8px; }
-  .column { max-width: 640px; margin: 0 auto; }
-  .doc-title { font-size: 15px; font-weight: 650; margin: 4px 0 26px; }
-  .back { border: 0; background: none; padding: 0 0 8px; color: var(--muted); font-size: 14px; }
-  .note, .empty, .warn, .watch, .ask.done { color: var(--muted); }
-  .note { font-size: 13px; margin: -14px 0 22px; }
-  .empty { margin: 8px 0 0; }
-  .warn { font-size: 13px; margin: 14px 0 0; }
-
-  .msg { margin: 0 0 22px; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .msg.user {
-    margin-left: auto; width: fit-content; max-width: min(78%, 460px);
-    background: var(--soft); border-radius: 16px; padding: 10px 14px;
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+  .top {
+    flex: none; display: flex; align-items: center; gap: 8px;
+    padding: 0 22px; min-height: 72px; border-bottom: 1px solid var(--line);
   }
-  .msg.agent { max-width: 62ch; }
+  .top-grow { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+  .top h1 { font-size: 16px; font-weight: 650; letter-spacing: -.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .status { display: flex; align-items: center; gap: 6px; margin-top: 2px; color: var(--muted); font-size: 12px; }
+  .icon-btn, .stop {
+    border: 0; background: transparent; border-radius: 999px;
+    display: grid; place-items: center;
+  }
+  .icon-btn { width: 36px; height: 36px; color: var(--ink); }
+  .icon-btn:hover, .stop:hover { background: rgba(28, 27, 23, .06); }
+  .stop { height: 34px; padding: 0 12px; font-size: 13px; color: var(--muted); }
+
+  .transcript { flex: 1; overflow: auto; padding: 22px 22px 8px; }
+  .column { max-width: 720px; margin: 0 auto; }
+  .msg { display: flex; gap: 10px; margin: 0 0 14px; align-items: flex-start; }
+  .msg .avatar { margin-top: 2px; }
+  .msg.user { justify-content: flex-end; }
+  .bubble { max-width: min(100%, 540px); border-radius: 18px; padding: 11px 14px; }
+  .msg.agent .bubble { background: var(--surface); border: 1px solid var(--line); border-bottom-left-radius: 6px; }
+  .msg.user .bubble { background: var(--user); border-bottom-right-radius: 6px; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.65; }
   .watch {
-    display: block; margin-top: 10px; padding: 0; border: 0; background: none;
-    color: var(--muted); font-size: 13px; text-align: left;
-    text-decoration: underline; text-underline-offset: 3px;
+    width: 100%; margin-top: 12px; padding: 8px 10px; border: 0; border-radius: 12px;
+    background: #f6f3ec; display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--ink); text-align: left;
   }
-  .shot {
-    margin-top: 10px; padding: 16px; border-radius: 12px; background: var(--paper);
+  .watch .chev { margin-left: auto; color: var(--muted); transition: transform .15s linear; }
+  .watch.open .chev { transform: rotate(90deg); }
+  .shot { margin-top: 8px; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: #fff; }
+  .shot-bar { height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #f6f3ec; }
+  .dots { display: flex; gap: 4px; }
+  .dots i { width: 7px; height: 7px; border-radius: 50%; background: #d5d0c6; display: block; }
+  .shot-bar span:last-child { font-size: 11px; color: var(--muted); }
+  .shot-body { padding: 16px 14px 14px; }
+  .sk { height: 8px; border-radius: 99px; background: #eeeae2; margin-bottom: 8px; }
+  .sk.w1 { width: 46%; } .sk.w2 { width: 72%; }
+  .sk-block { height: 54px; border-radius: 10px; background: linear-gradient(180deg, #f7f4ee, #efeae1); margin: 10px 0 8px; }
+  .shot-body p { font-size: 12px; color: var(--muted); }
+  .ask-card { margin-top: 12px; padding: 12px; border-radius: 14px; background: #f7f4ee; }
+  .ask-card p { font-size: 14px; }
+  .ask-card code {
+    display: block; margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+    background: #fff; font-family: ui-monospace, Consolas, monospace; font-size: 12px;
   }
-  .shot b { display: block; font-size: 14px; font-weight: 650; }
-  .shot span { color: var(--muted); font-size: 13px; }
-  .ask { margin: 14px 0 0; }
-  .choices { display: flex; gap: 8px; margin-top: 10px; }
+  .choices { display: flex; gap: 8px; margin-top: 12px; }
   .choices button {
-    min-height: 36px; padding: 0 14px; border-radius: 999px;
-    border: 1px solid var(--line); background: #fff; font-size: 14px;
+    flex: 1; height: 38px; border-radius: 12px; border: 1px solid var(--line);
+    background: #fff; font-size: 14px;
   }
-  .choices .yes { background: var(--fill); color: #fff; border-color: var(--fill); }
+  .choices .yes { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .done {
+    display: flex; align-items: center; gap: 8px; margin-top: 12px;
+    font-size: 13px; color: var(--muted);
+  }
+  .tick {
+    width: 18px; height: 18px; border-radius: 50%; background: #e5f2e8; color: var(--online);
+    display: grid; place-items: center; flex: none;
+  }
+  .tick .icon { width: 12px; height: 12px; stroke: var(--online); }
 
-  .dock { padding: 8px 32px 22px; }
-  .composer {
-    max-width: 640px; margin: 0 auto; display: flex; align-items: flex-end; gap: 8px;
-    border: 1px solid #dededb; border-radius: 14px; padding: 8px 8px 8px 14px;
+  .empty-state {
+    min-height: 48vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; color: var(--muted); text-align: center;
   }
-  .composer:focus-within { border-color: var(--fill); }
+  .dock { padding: 8px 22px 18px; }
+  .composer {
+    max-width: 720px; margin: 0 auto; display: flex; align-items: flex-end; gap: 8px;
+    background: var(--surface); border: 1px solid #e3ded3; border-radius: 24px;
+    padding: 8px 8px 8px 16px; box-shadow: var(--shadow);
+  }
+  .composer:focus-within { border-color: #cfc8ba; }
   .composer textarea {
     flex: 1; border: 0; resize: none; background: transparent; outline: none;
-    min-height: 28px; max-height: 140px; padding: 6px 0; line-height: 1.5; font-size: 15px;
+    min-height: 28px; max-height: 140px; padding: 8px 0; line-height: 1.5; font-size: 15px;
   }
-  .composer button {
-    border: 0; background: var(--fill); color: #fff; border-radius: 10px;
-    min-width: 64px; height: 36px; font-size: 14px;
+  .send {
+    width: 40px; height: 40px; border: 0; border-radius: 50%;
+    background: var(--ink); color: #fff; display: grid; place-items: center; flex: none;
   }
-  .composer button:disabled { background: var(--soft); color: #8d8d8d; }
+  .send:disabled { background: #ece7de; color: #b3aea4; }
+  .send .icon { width: 18px; height: 18px; }
 
-  .page-title { font-size: 15px; font-weight: 650; margin: 4px 0 8px; }
-  .lead { margin: 0 0 8px; color: var(--muted); font-size: 14px; }
   .device {
-    width: 100%; display: flex; justify-content: space-between; gap: 16px;
-    padding: 14px 0; border: 0; border-bottom: 1px solid var(--line);
-    background: none; text-align: left;
+    width: 100%; display: flex; align-items: center; gap: 12px;
+    padding: 14px; margin-bottom: 10px; border-radius: 18px;
+    border: 1px solid var(--line); background: var(--surface); text-align: left;
   }
-  .device b { font-weight: 600; }
-  .device span { color: var(--muted); font-size: 13px; flex: none; }
+  .device:hover { border-color: #d8d2c6; }
+  .device-ico {
+    width: 42px; height: 42px; border-radius: 14px; background: #f3efe6;
+    display: grid; place-items: center; flex: none;
+  }
+  .device-copy { min-width: 0; flex: 1; }
+  .device-copy b { display: block; font-size: 15px; font-weight: 640; }
+  .device-copy small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
   .device.off { color: var(--muted); }
-
-  .login { max-width: 320px; margin: 16vh auto 0; padding: 0 24px; }
-  .login h1 { font-size: 28px; line-height: 1.2; letter-spacing: -0.04em; margin: 0 0 8px; }
-  .login p { margin: 0; color: var(--muted); font-size: 14px; }
-  .login label { display: block; margin: 18px 0 6px; font-size: 13px; }
+  .warn {
+    margin-top: 4px; padding: 12px 14px; border-radius: 14px;
+    background: var(--surface); color: var(--muted); font-size: 13px; border: 1px solid var(--line);
+  }
+  .profile, .login {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 24px;
+    box-shadow: var(--shadow);
+  }
+  .profile { padding: 32px 24px; text-align: center; }
+  .profile .avatar, .login .avatar { margin: 0 auto 14px; }
+  .profile h2 { font-size: 20px; letter-spacing: -.03em; }
+  .profile p, .login > p { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .block-btn, .login button[type="submit"] {
+    height: 44px; margin-top: 20px; border-radius: 14px; font-size: 15px; font-weight: 600;
+  }
+  .block-btn { padding: 0 18px; border: 1px solid var(--line); background: #fff; }
+  .login-main { display: grid; place-items: center; }
+  .login { width: min(400px, calc(100% - 36px)); padding: 32px 28px 28px; }
+  .login h1 { text-align: center; font-size: 28px; letter-spacing: -.04em; }
+  .login > p { text-align: center; }
+  .login label { display: block; margin: 16px 0 6px; font-size: 13px; }
   .login input {
-    width: 100%; border: 1px solid #dededb; border-radius: 10px; padding: 10px 12px; background: #fff;
+    width: 100%; height: 46px; border-radius: 12px; border: 1px solid var(--line);
+    background: #faf8f4; padding: 0 12px;
   }
-  .login input:focus { border-color: var(--fill); }
-  .login button, .block-btn {
-    width: 100%; height: 42px; margin-top: 18px; border: 0; border-radius: 10px;
-    background: var(--fill); color: #fff;
-  }
-  .account p { margin: 6px 0 0; color: var(--muted); }
-  .account .block-btn { max-width: 240px; background: #fff; color: var(--ink); border: 1px solid var(--line); }
+  .login input:focus { border-color: #c9c2b4; background: #fff; }
+  .login button[type="submit"] { width: 100%; border: 0; background: var(--ink); color: #fff; }
 
-  .app.narrow .side { width: 100%; background: #fff; }
+  .transcript, .chats { scrollbar-width: thin; scrollbar-color: #ddd6c8 transparent; }
+  .app.narrow .side { width: 100%; background: var(--bg); padding: 16px 14px 12px; }
   .app.narrow.hide-side .side { display: none; }
   .app.narrow.hide-main .main { display: none; }
-  .app.narrow .transcript, .app.narrow .dock { padding-left: 18px; padding-right: 18px; }
-
+  .app.narrow .transcript, .app.narrow .dock, .app.narrow .top { padding-left: 14px; padding-right: 14px; }
   @media (max-width: 720px) {
     .switch { display: none; }
-    body.phone { background: #fff; }
-    body.phone .frame { width: auto; height: 100%; margin: 0; border: 0; border-radius: 0; }
+    body.phone { background: var(--bg); padding: 0; }
+    body.phone .frame { width: auto; border-radius: 0; box-shadow: none; }
   }
+  @media (prefers-reduced-motion: reduce) { .watch .chev { transition: none; } }
 </style>
 </head>
 <body>
@@ -182,6 +258,16 @@
 <script>
 const $ = (s, r = document) => r.querySelector(s);
 const live = (t) => { $('#live').textContent = t; };
+const svg = (inner) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${inner}</svg>`;
+const I = {
+  plus: svg('<path d="M12 5v14M5 12h14"/>'),
+  up: svg('<path d="M12 19V5M6 11l6-6 6 6"/>'),
+  back: svg('<path d="M15 5 8 12l7 7"/>'),
+  laptop: svg('<rect x="4" y="5" width="16" height="11" rx="2"/><path d="M2 19h20"/>'),
+  chev: svg('<path d="m9 6 6 6-6 6"/>'),
+  check: svg('<path d="m5 12 5 5L20 7"/>'),
+  globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"/>')
+};
 
 const chats = [
   {
@@ -192,7 +278,7 @@ const chats = [
         role: 'agent',
         text: '看过这周的记录，也打开了产品页。\n\n核心功能按计划，对话和确认已经连上。\n浏览器能打开页面、读取内容。',
         watch: '产品首页',
-        ask: '要存成 reports/2026-11-13.md 吗？'
+        ask: '要存成这个文件吗？'
       }
     ]
   },
@@ -223,12 +309,7 @@ const devices = [
   { id: 'home', name: '家里的台式机', online: true },
   { id: 'studio', name: '工作室电脑', online: false }
 ];
-
-const threads = {
-  home: { items: [] },
-  studio: { items: [] }
-};
-
+const threads = { home: { items: [] }, studio: { items: [] } };
 const state = {
   previewPhone: location.hash === '#phone',
   screen: 'chat',
@@ -244,13 +325,16 @@ const state = {
 const smallScreen = matchMedia('(max-width: 720px)');
 const narrow = () => state.previewPhone || smallScreen.matches;
 const chat = () => chats.find((c) => c.id === state.chatId);
-
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
-
+function snippet(c) {
+  const last = c.items.slice().reverse().find((m) => m.text);
+  if (!last) return '还没有消息';
+  return last.text.replace(/\s+/g, ' ').slice(0, 22);
+}
 function goBack() {
   if (state.screen === 'device') state.screen = 'computers';
   else if (narrow() && state.screen !== 'list') state.screen = 'list';
@@ -258,20 +342,16 @@ function goBack() {
   state.notice = '';
   render();
 }
-
 function render() {
   const isNarrow = narrow();
   document.body.classList.toggle('phone', state.previewPhone && !smallScreen.matches);
   $('#wideBtn').setAttribute('aria-pressed', String(!state.previewPhone));
   $('#phoneBtn').setAttribute('aria-pressed', String(state.previewPhone));
-  $('#wideBtn').classList.toggle('active', !state.previewPhone);
-
   const hideSide = !state.loggedIn || (isNarrow && state.screen !== 'list');
   const hideMain = state.loggedIn && isNarrow && state.screen === 'list';
   const app = $('#app');
   app.className = 'app' + (isNarrow ? ' narrow' : '') + (hideSide ? ' hide-side' : '') + (hideMain ? ' hide-main' : '');
-  app.innerHTML = sideHtml(isNarrow) + mainHtml(isNarrow);
-
+  app.innerHTML = sideHtml() + mainHtml(isNarrow);
   const box = $('#box');
   if (box) {
     box.addEventListener('input', () => {
@@ -286,27 +366,27 @@ function render() {
   state.focus = false;
   state.bottom = false;
 }
-
 function sideHtml() {
   if (!state.loggedIn) return '';
-  const items = chats.map((c) => `
-    <button class="chat-btn${c.id === state.chatId && state.screen === 'chat' ? ' active' : ''}" data-chat="${c.id}"${c.id === state.chatId && state.screen === 'chat' ? ' aria-current="page"' : ''}>
-      <span>${esc(c.title)}</span><time>${esc(c.when)}</time>
-    </button>`).join('');
-  return `
-    <aside class="side">
-      <div class="side-head">
-        <div class="mark">星瑶</div>
-        <button class="text-btn" data-action="new" type="button">新对话</button>
-      </div>
-      <nav class="chats" aria-label="对话">${items}</nav>
-      <div class="side-foot">
-        <button class="side-link" data-action="computers" type="button">我的电脑</button>
-        <button class="side-link quiet" data-action="account" type="button">${esc(state.account)}</button>
-      </div>
-    </aside>`;
+  const initial = esc(state.account.slice(0, 1) || '我');
+  const items = chats.map((c) => {
+    const on = c.id === state.chatId && state.screen === 'chat';
+    return `<button class="chat-btn${on ? ' active' : ''}" data-chat="${c.id}"${on ? ' aria-current="page"' : ''}>
+      <span class="chat-top"><span class="chat-title">${esc(c.title)}</span><time>${esc(c.when)}</time></span>
+      <span class="chat-preview">${esc(snippet(c))}</span>
+    </button>`;
+  }).join('');
+  return `<aside class="side">
+    <div class="side-head"><div class="brand"><span class="avatar sm">星</span><span class="mark">星瑶</span></div></div>
+    <button class="new-chat" data-action="new" type="button">${I.plus}新对话</button>
+    <p class="side-label">最近</p>
+    <nav class="chats" aria-label="对话">${items}</nav>
+    <div class="side-foot">
+      <button class="side-link" data-action="computers" type="button">${I.laptop}我的电脑</button>
+      <button class="account-chip" data-action="account" type="button"><span class="avatar sm">${initial}</span>${esc(state.account)}</button>
+    </div>
+  </aside>`;
 }
-
 function mainHtml(isNarrow) {
   if (!state.loggedIn) return loginHtml();
   if (isNarrow && state.screen === 'list') return '<main class="main"></main>';
@@ -317,105 +397,85 @@ function mainHtml(isNarrow) {
   else if (state.screen === 'account') body = accountHtml(isNarrow);
   return `<main class="main">${body}</main>`;
 }
-
-function backBtn(isNarrow, show) {
-  if (!show && !isNarrow) return '';
-  if (!isNarrow && !show) return '';
-  return '<button class="back" type="button" data-action="back">返回</button>';
+function backButton(show) {
+  if (!show) return '';
+  return `<button class="icon-btn" type="button" data-action="back" aria-label="返回">${I.back}</button>`;
 }
-
 function chatHtml(c, isNarrow, remote) {
-  const showBack = isNarrow || remote;
   const pending = c && c.approval === 'pending';
   const title = remote ? devices.find((d) => d.id === state.deviceId).name : c.title;
-  const note = remote ? '<p class="note">消息会原样转发到这台电脑。</p>' : '';
-  const stop = pending ? '<button class="text-btn" type="button" data-action="stop">停止</button>' : '';
-  const items = (c ? c.items : threads[state.deviceId].items);
+  const status = remote
+    ? '<i class="dot on"></i>消息转发到这台电脑'
+    : pending ? '<i class="dot wait"></i>等你确认' : '<i class="dot on"></i>在线';
+  const face = remote ? I.laptop : '星';
+  const items = c ? c.items : threads[state.deviceId].items;
   const messages = items.length
     ? items.map((m, i) => messageHtml(m, i, c)).join('')
-    : (remote ? '' : '<p class="empty">直接说你要做的事。</p>');
-  return `
-    <div class="transcript"><div class="column">
-      ${backBtn(isNarrow, showBack)}
-      <div class="doc-title top-row"><span>${esc(title)}</span>${stop}</div>
-      ${note}
-      ${messages}
-    </div></div>
+    : `<div class="empty-state"><div class="avatar lg">${remote ? I.laptop : '星'}</div><p>${remote ? '从这里给这台电脑发消息。' : '直接说你要做的事。'}</p></div>`;
+  return `<header class="top">
+      ${backButton(isNarrow || remote)}
+      <div class="top-grow"><div class="avatar">${face}</div><div style="min-width:0"><h1>${esc(title)}</h1><p class="status">${status}</p></div></div>
+      ${pending ? '<button class="stop" type="button" data-action="stop">停止</button>' : ''}
+    </header>
+    <div class="transcript"><div class="column">${messages}</div></div>
     ${composerHtml()}`;
 }
-
 function messageHtml(m, index, c) {
-  const klass = m.role === 'user' ? 'user' : 'agent';
+  const text = `<div class="text">${esc(m.text)}</div>`;
+  if (m.role === 'user') return `<article class="msg user"><div class="bubble">${text}</div></article>`;
   let extra = '';
   if (m.watch) {
-    extra += `<button class="watch" type="button" data-watch="${index}">看过${esc(m.watch)}</button>`;
-    if (c.watchOpen) extra += `<div class="shot"><b>${esc(m.watch)}</b><span>已打开并读取</span></div>`;
+    extra += `<button class="watch${c.watchOpen ? ' open' : ''}" type="button" data-watch="${index}">${I.globe}<span>看过${esc(m.watch)}</span><span class="chev">${I.chev}</span></button>`;
+    if (c.watchOpen) {
+      extra += `<div class="shot"><div class="shot-bar"><span class="dots"><i></i><i></i><i></i></span><span>${esc(m.watch)}</span></div><div class="shot-body"><div class="sk w1"></div><div class="sk w2"></div><div class="sk-block"></div><p>已打开并读取</p></div></div>`;
+    }
   }
   if (m.ask && c) {
     if (c.approval === 'pending') {
-      extra += `<p class="ask">${esc(m.ask)}</p><div class="choices"><button type="button" data-action="deny">先不存</button><button class="yes" type="button" data-action="allow">存下来</button></div>`;
-    } else if (c.approval === 'allowed') extra += '<p class="ask done">已存成 reports/2026-11-13.md</p>';
-    else if (c.approval === 'denied') extra += '<p class="ask done">没有保存。</p>';
-    else if (c.approval === 'stopped') extra += '<p class="ask done">已停止，没有保存。</p>';
+      extra += `<div class="ask-card"><p>${esc(m.ask)}</p><code>reports/2026-11-13.md</code><div class="choices"><button type="button" data-action="deny">先不存</button><button class="yes" type="button" data-action="allow">存下来</button></div></div>`;
+    } else if (c.approval === 'allowed') extra += `<p class="done"><span class="tick">${I.check}</span>已存成 reports/2026-11-13.md</p>`;
+    else if (c.approval === 'denied') extra += `<p class="done">没有保存。</p>`;
+    else if (c.approval === 'stopped') extra += `<p class="done">已停止，没有保存。</p>`;
   }
-  return `<div class="msg ${klass}">${esc(m.text)}${extra}</div>`;
+  return `<article class="msg agent"><div class="avatar" aria-hidden="true">星</div><div class="bubble">${text}${extra}</div></article>`;
 }
-
 function composerHtml() {
-  return `
-    <form class="dock" id="composer">
-      <div class="composer">
-        <label class="sr-only" for="box">消息</label>
-        <textarea id="box" rows="1" placeholder="说一件事"></textarea>
-        <button id="send" type="submit" disabled>发送</button>
-      </div>
-    </form>`;
+  return `<form class="dock" id="composer"><div class="composer">
+    <label class="sr-only" for="box">消息</label>
+    <textarea id="box" rows="1" placeholder="发消息给星瑶"></textarea>
+    <button id="send" class="send" type="submit" disabled aria-label="发送">${I.up}</button>
+  </div></form>`;
 }
-
 function computersHtml(isNarrow) {
-  const rows = devices.map((d) => `
-    <button class="device${d.online ? '' : ' off'}" type="button" data-device="${d.id}">
-      <b>${esc(d.name)}</b><span>${d.online ? '在线' : '没开'}</span>
-    </button>`).join('');
-  return `
-    <div class="transcript"><div class="column">
-      ${backBtn(isNarrow, true)}
-      <h1 class="page-title">我的电脑</h1>
-      <p class="lead">选一台开着的电脑。服务器只负责转发。</p>
-      ${rows}
-      ${state.notice ? `<p class="warn">${esc(state.notice)}</p>` : ''}
-    </div></div>`;
+  const rows = devices.map((d) => `<button class="device${d.online ? '' : ' off'}" type="button" data-device="${d.id}">
+    <span class="device-ico">${I.laptop}</span>
+    <span class="device-copy"><b>${esc(d.name)}</b><small>${d.online ? 'Windows · 在线' : 'Windows · 没开'}</small></span>
+    <i class="dot${d.online ? ' on' : ''}"></i>
+  </button>`).join('');
+  return `<header class="top">${backButton(true)}<div class="top-grow"><div style="min-width:0"><h1>我的电脑</h1><p class="status">服务器只负责转发</p></div></div></header>
+    <div class="transcript"><div class="column">${rows}${state.notice ? `<p class="warn">${esc(state.notice)}</p>` : ''}</div></div>`;
 }
-
 function deviceHtml(isNarrow) {
   const t = threads[state.deviceId];
   return chatHtml({ title: '', approval: null, items: t.items, watchOpen: false }, isNarrow, true);
 }
-
 function accountHtml(isNarrow) {
-  return `
-    <div class="transcript"><div class="column account">
-      ${backBtn(isNarrow, true)}
-      <h1 class="page-title">账号</h1>
-      <p>${esc(state.account)}</p>
-      <p>这个账号里的对话只属于你。</p>
-      <button class="block-btn" type="button" data-action="logout">退出</button>
-    </div></div>`;
+  const initial = esc(state.account.slice(0, 1) || '我');
+  return `<header class="top">${backButton(true)}<div class="top-grow"><div style="min-width:0"><h1>账号</h1><p class="status">对话按账号分开</p></div></div></header>
+    <div class="transcript"><div class="column"><section class="profile"><div class="avatar lg">${initial}</div><h2>${esc(state.account)}</h2><p>这个账号里的对话只属于你。</p><button class="block-btn" type="button" data-action="logout">退出登录</button></section></div></div>`;
 }
-
 function loginHtml() {
-  return `
-    <main class="main"><form class="login" id="login">
-      <h1>星瑶</h1>
-      <p>用账号把对话分开。</p>
-      <label for="who">账号</label>
-      <input id="who" name="who" autocomplete="username" value="木偶" required>
-      <label for="pass">密码</label>
-      <input id="pass" name="pass" type="password" autocomplete="current-password" placeholder="原型里随便填" required>
-      <button type="submit">进入</button>
-    </form></main>`;
+  return `<main class="main login-main"><form class="login" id="login">
+    <div class="avatar lg">星</div>
+    <h1>星瑶</h1>
+    <p>用账号把对话分开。</p>
+    <label for="who">账号</label>
+    <input id="who" name="who" autocomplete="username" value="木偶" required>
+    <label for="pass">密码</label>
+    <input id="pass" name="pass" type="password" autocomplete="current-password" placeholder="原型里随便填" required>
+    <button type="submit">进入</button>
+  </form></main>`;
 }
-
 function send(text) {
   const clean = text.trim();
   if (!clean) return;
@@ -436,7 +496,6 @@ function send(text) {
   state.focus = true;
   render();
 }
-
 $('#app').addEventListener('click', (e) => {
   const chatBtn = e.target.closest('[data-chat]');
   if (chatBtn) {
@@ -464,8 +523,7 @@ $('#app').addEventListener('click', (e) => {
   }
   const watch = e.target.closest('[data-watch]');
   if (watch) {
-    const c = chat();
-    c.watchOpen = !c.watchOpen;
+    chat().watchOpen = !chat().watchOpen;
     render();
     return;
   }
@@ -498,7 +556,6 @@ $('#app').addEventListener('click', (e) => {
     render();
   }
 });
-
 $('#app').addEventListener('submit', (e) => {
   e.preventDefault();
   if (e.target.id === 'login') {
@@ -511,7 +568,6 @@ $('#app').addEventListener('submit', (e) => {
   }
   if (e.target.id === 'composer') send($('#box').value);
 });
-
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && state.screen !== 'chat' && state.screen !== 'list') goBack();
   if (e.target.id === 'box' && e.key === 'Enter' && !e.shiftKey) {
@@ -519,14 +575,12 @@ document.addEventListener('keydown', (e) => {
     send(e.target.value);
   }
 });
-
 $('#wideBtn').addEventListener('click', () => { state.previewPhone = false; if (state.screen === 'list') state.screen = 'chat'; render(); });
 $('#phoneBtn').addEventListener('click', () => { state.previewPhone = true; render(); });
 smallScreen.addEventListener('change', () => {
   if (smallScreen.matches && state.screen === 'chat') state.screen = 'list';
   render();
 });
-
 if (smallScreen.matches) state.screen = 'list';
 render();
 </script>
