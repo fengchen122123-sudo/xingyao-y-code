@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>站点后台 — 星瑶Code</title>
+<meta name="theme-color" content="#faf5f1">
+<link rel="icon" type="image/png" href="/assets/xingyao-mark.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #faf5f1;
+  --sheet: #f3ece4;
+  --ink: #1c2a3a;
+  --ink-soft: #3d5166;
+  --blue: #1f6494;
+  --blue-deep: #184f76;
+  --scarf: #c41620;
+  --line: rgba(28, 42, 58, 0.14);
+  --serif: "Noto Serif SC", "Songti SC", "Source Han Serif SC", serif;
+  --sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { color-scheme: light; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.6;
+  font-synthesis: none;
+}
+button, input, textarea { font: inherit; color: inherit; }
+a { color: var(--blue); }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.nav {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+.nav-inner, .wrap {
+  width: min(880px, calc(100% - 40px));
+  margin: 0 auto;
+}
+.nav-inner {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.brand {
+  display: flex; align-items: flex-end; gap: 10px;
+  color: var(--blue); text-decoration: none;
+}
+.brand img { height: 48px; width: auto; }
+.brand-code { font-size: 14px; letter-spacing: 0.08em; padding-bottom: 10px; }
+.who { color: var(--ink-soft); font-size: 14px; }
+.nav-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 40px; padding: 0 16px;
+  border: 1.5px solid transparent; border-radius: 10px;
+  background: transparent; text-decoration: none; cursor: pointer;
+  font-weight: 600; font-size: 14px;
+  transition: background-color 180ms var(--ease), color 180ms var(--ease), border-color 180ms var(--ease);
+}
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn-fill { background: var(--blue); color: #fff; }
+.btn-fill:hover:not(:disabled) { background: var(--blue-deep); }
+.btn-line { border-color: var(--blue); color: var(--blue); }
+.btn-line:hover:not(:disabled) { background: rgba(31, 100, 148, 0.08); }
+.btn-quiet { color: var(--ink-soft); padding: 0 8px; }
+.btn-quiet:hover:not(:disabled) { color: var(--ink); }
+.btn-danger { color: var(--scarf); }
+.gate, main { padding: 48px 0 80px; }
+.gate { width: min(420px, calc(100% - 40px)); margin: 0 auto; }
+h1 {
+  margin: 0 0 8px;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 40px;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+}
+.lede { margin: 0 0 28px; color: var(--ink-soft); }
+.panel {
+  border-top: 1px solid var(--line);
+  padding: 28px 0;
+}
+.panel h2 {
+  margin: 0 0 6px;
+  font-family: var(--serif);
+  font-size: 26px;
+  font-weight: 600;
+}
+.hint { margin: 0 0 18px; color: var(--ink-soft); font-size: 14px; }
+label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
+input[type="text"], input[type="password"], input[type="url"], input[type="date"], textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 10px;
+  padding: 10px 12px;
+  min-height: 44px;
+}
+input[readonly] { background: var(--sheet); color: var(--ink-soft); }
+.modes { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.mode {
+  flex: 1 1 240px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: transparent;
+  padding: 12px 14px;
+  cursor: pointer;
+}
+.mode strong { display: block; font-size: 15px; }
+.mode span { display: block; color: var(--ink-soft); font-size: 13px; font-weight: 400; margin-top: 4px; }
+.mode[aria-pressed="true"] { border-color: var(--blue); background: rgba(31, 100, 148, 0.08); }
+.row-actions, .notice-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+#save-download-row { margin-top: 18px; }
+.notice {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 16px;
+  padding: 18px 0;
+  border-top: 1px solid var(--line);
+}
+.notice:first-child { border-top: 0; padding-top: 0; }
+.when { display: block; color: var(--ink-soft); font-size: 13px; }
+.notice h3 { margin: 2px 0; font-size: 18px; font-family: var(--serif); }
+.notice p { margin: 0; color: var(--ink-soft); }
+.badge {
+  display: inline-block;
+  margin-left: 8px;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--blue);
+}
+.badge.off { color: var(--ink-soft); }
+.bar {
+  position: sticky; bottom: 0;
+  background: var(--paper);
+  border-top: 1px solid var(--line);
+  padding: 12px 0;
+}
+.bar-inner {
+  width: min(880px, calc(100% - 40px));
+  margin: 0 auto;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.status { margin-right: auto; color: var(--ink-soft); font-size: 14px; min-height: 1.4em; }
+.status.bad { color: var(--scarf); }
+dialog {
+  border: 0;
+  border-radius: 16px;
+  padding: 24px;
+  width: min(520px, calc(100% - 32px));
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: 0 24px 80px rgba(28, 42, 58, 0.18);
+}
+dialog::backdrop { background: rgba(28, 42, 58, 0.28); }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.empty { color: var(--ink-soft); }
+@media (max-width: 640px) {
+  h1 { font-size: 32px; }
+  .notice { grid-template-columns: 1fr; }
+  .nav-title { display: none; }
+}
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="/" aria-label="星瑶Code 首页">
+      <img src="/assets/xingyao-lockup.png" width="400" height="164" alt="星瑶">
+      <span class="brand-code">Code</span>
+    </a>
+      <span class="nav-title">站点后台</span>
+      <span class="who" id="who" hidden></span>
+    <div class="nav-actions">
+      <a class="btn btn-quiet" href="/" target="_blank" rel="noopener">查看首页</a>
+      <a class="btn btn-quiet" href="/tokens.html" target="_blank" rel="noopener">查看公告</a>
+      <button class="btn btn-quiet" type="button" id="change-password" hidden>修改密码</button>
+      <button class="btn btn-quiet" type="button" id="logout" hidden>退出</button>
+    </div>
+  </div>
+</nav>
+
+<section class="gate" id="gate">
+  <h1>登录后台</h1>
+  <p class="lede">使用账号和密码登录。进入后可以修改密码。</p>
+  <form id="login-form">
+    <label for="username">账号</label>
+    <input id="username" type="text" autocomplete="username" required maxlength="32">
+    <label for="password">密码</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <p class="hint" id="login-error" role="alert"></p>
+    <button class="btn btn-fill" type="submit">进入</button>
+  </form>
+</section>
+
+<main id="desk" hidden>
+  <div class="wrap">
+    <h1>站点内容</h1>
+    <p class="lede">上架的公告会出现在「Token 领取公告」。下载地址和版本号会出现在首页。</p>
+
+    <section class="panel" aria-labelledby="download-title">
+      <h2 id="download-title">下载</h2>
+      <p class="hint">跟随 Gitee 时，版本号和下载地址按最新正式版自动填写。手动指定时，就固定用你填的内容。</p>
+      <div class="modes" role="group" aria-label="下载方式">
+        <button class="mode" type="button" id="mode-gitee" aria-pressed="false">
+          <strong>跟随 Gitee</strong>
+          <span>自动读取最新正式版，并写入下面的地址。</span>
+        </button>
+        <button class="mode" type="button" id="mode-manual" aria-pressed="false">
+          <strong>手动指定</strong>
+          <span>首页只用你保存的版本号和下载地址。</span>
+        </button>
+      </div>
+      <label for="version">版本号</label>
+      <input id="version" type="text" inputmode="decimal" autocomplete="off" spellcheck="false">
+      <label for="windows-url">下载地址</label>
+      <input id="windows-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://">
+      <label for="file-name">安装包文件名</label>
+      <input id="file-name" type="text" autocomplete="off" spellcheck="false" placeholder="XingYaoCode-1.3.9.exe">
+      <div class="row-actions" id="save-download-row">
+        <button class="btn btn-fill" type="button" id="save-download">保存下载设置</button>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="notice-title">
+      <div class="row-actions">
+        <h2 id="notice-title">Token 领取公告</h2>
+        <button class="btn btn-line" type="button" id="add-notice" style="margin-left:auto">新公告</button>
+      </div>
+      <p class="hint" id="notice-count"></p>
+      <p class="status" id="status" role="status"></p>
+      <div id="notice-list"></div>
+    </section>
+  </div>
+</main>
+
+<dialog id="editor" aria-labelledby="editor-title">
+  <form method="dialog" id="editor-form">
+    <h2 id="editor-title">公告</h2>
+    <label for="notice-title-input">标题</label>
+    <input id="notice-title-input" type="text" required maxlength="80">
+    <label for="notice-note">说明</label>
+    <textarea id="notice-note" maxlength="400"></textarea>
+    <label for="notice-href">领取链接</label>
+    <input id="notice-href" type="url" required placeholder="https://" spellcheck="false">
+    <label for="notice-guide">领取流程</label>
+    <input id="notice-guide" type="url" placeholder="https:// 选填，打开领取步骤" spellcheck="false">
+    <label for="notice-date">日期</label>
+    <input id="notice-date" type="date">
+    <label><input id="notice-published" type="checkbox" checked> 立即上架</label>
+    <p class="hint" id="editor-error" role="alert"></p>
+    <div class="dialog-actions">
+      <button class="btn btn-quiet" type="button" id="editor-cancel">取消</button>
+      <button class="btn btn-fill" type="submit" id="editor-submit" value="ok">新增</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="password-dialog" aria-labelledby="password-title">
+  <form id="password-form">
+    <h2 id="password-title">修改密码</h2>
+    <label for="current-password">当前密码</label>
+    <input id="current-password" type="password" autocomplete="current-password" required>
+    <label for="new-password">新密码</label>
+    <input id="new-password" type="password" autocomplete="new-password" required minlength="8">
+    <label for="confirm-password">再输入一次</label>
+    <input id="confirm-password" type="password" autocomplete="new-password" required minlength="8">
+    <p class="hint" id="password-error" role="alert"></p>
+    <div class="dialog-actions">
+      <button class="btn btn-quiet" type="button" id="password-cancel">取消</button>
+      <button class="btn btn-fill" type="submit">保存密码</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+var state = null;
+var editingId = "";
+
+function $(id) { return document.getElementById(id); }
+
+function today() {
+  var d = new Date();
+  var month = String(d.getMonth() + 1).padStart(2, "0");
+  var day = String(d.getDate()).padStart(2, "0");
+  return d.getFullYear() + "-" + month + "-" + day;
+}
+
+function api(path, options) {
+  options = options || {};
+  options.credentials = "same-origin";
+  options.headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
+  var prefix = location.pathname.indexOf("/xy/") === 0 ? "/xy" : "";
+  return fetch(prefix + path, options).then(function (res) {
+    return res.json().catch(function () { return {}; }).then(function (body) {
+      if (!res.ok) throw new Error(body.error || "请求失败");
+      return body;
+    });
+  });
+}
+
+function setStatus(text, bad) {
+  var el = $("status");
+  el.textContent = text || "";
+  el.className = bad ? "status bad" : "status";
+}
+
+function showDesk(data, options) {
+  state = data;
+  $("gate").hidden = true;
+  $("desk").hidden = false;
+  $("logout").hidden = false;
+  $("change-password").hidden = false;
+  $("version").value = data.download.version;
+  $("windows-url").value = data.download.windowsUrl;
+  $("file-name").value = data.download.fileName;
+  renderMode();
+  renderNotices();
+  var manual = data.download.mode === "manual";
+  setDownloadEditable(manual);
+  if (!manual && !(options && options.skipGitee)) {
+    syncDownloadFromGitee();
+    return;
+  }
+  setStatus(manual ? "手动指定时，改完要点「保存下载设置」。" : "下载地址跟随 Gitee 最新正式版。");
+}
+
+function setDownloadEditable(editable) {
+  $("version").readOnly = !editable;
+  $("windows-url").readOnly = !editable;
+  $("file-name").readOnly = !editable;
+  $("save-download-row").hidden = !editable;
+}
+
+function giteeReleaseFrom(release) {
+  var assets, i, name, asset, version, url;
+  if (!release || release.prerelease) return null;
+  assets = release.assets || [];
+  asset = null;
+  for (i = 0; i < assets.length; i++) {
+    name = assets[i] && assets[i].name ? assets[i].name : "";
+    if (/^XingYaoCode-.+\.exe$/i.test(name)) {
+      asset = assets[i];
+      break;
+    }
+  }
+  if (!asset) return null;
+  version = String(release.tag_name || "").replace(/^v/i, "");
+  url = asset.browser_download_url || "";
+  if (!/^https:\/\/\S+$/.test(url) && release.tag_name) {
+    url = "https://gitee.com/feng-chenhao/xingyao-y-code/releases/download/"
+      + encodeURIComponent(release.tag_name) + "/"
+      + encodeURIComponent(asset.name);
+  }
+  if (!version || !/^https:\/\/\S+$/.test(url)) return null;
+  return { version: version, windowsUrl: url, fileName: asset.name };
+}
+
+function syncDownloadFromGitee() {
+  setStatus("正在从 Gitee 读取最新正式版…");
+  return fetch("https://gitee.com/api/v5/repos/feng-chenhao/xingyao-y-code/releases/latest")
+    .then(function (res) {
+      if (!res.ok) throw new Error("release");
+      return res.json();
+    })
+    .then(function (release) {
+      var next = giteeReleaseFrom(release);
+      if (!next) throw new Error("empty");
+      var changed = state.download.version !== next.version
+        || state.download.windowsUrl !== next.windowsUrl
+        || state.download.fileName !== next.fileName;
+      state.download.mode = "gitee";
+      state.download.version = next.version;
+      state.download.windowsUrl = next.windowsUrl;
+      state.download.fileName = next.fileName;
+      $("version").value = next.version;
+      $("windows-url").value = next.windowsUrl;
+      $("file-name").value = next.fileName;
+      if (!changed) {
+        setStatus("下载地址已是 Gitee 最新正式版。");
+        return;
+      }
+      return saveContent("已按 Gitee 最新正式版更新下载地址。");
+    })
+    .catch(function () {
+      setStatus("没读到 Gitee 最新版，仍用下面保存的地址兜底。", true);
+    });
+}
+
+function readDownload() {
+  state.download.version = $("version").value.trim();
+  state.download.windowsUrl = $("windows-url").value.trim();
+  state.download.fileName = $("file-name").value.trim();
+}
+
+function renderMode() {
+  var manual = state.download.mode === "manual";
+  $("mode-gitee").setAttribute("aria-pressed", manual ? "false" : "true");
+  $("mode-manual").setAttribute("aria-pressed", manual ? "true" : "false");
+}
+
+function renderNotices() {
+  var list = $("notice-list");
+  var notices = state.notices;
+  var live = notices.filter(function (item) { return item.published; }).length;
+  $("notice-count").textContent = "已上架 " + live + " 条，共 " + notices.length + " 条。默认按日期从新到旧。上移、下移会改公告页上的位置。下架的不会出现。";
+  list.textContent = "";
+  if (!notices.length) {
+    var empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "还没有公告。";
+    list.appendChild(empty);
+    return;
+  }
+  notices.forEach(function (item, index) {
+    var row = document.createElement("article");
+    row.className = "notice";
+    var body = document.createElement("div");
+    if (item.date) {
+      var when = document.createElement("span");
+      when.className = "when";
+      when.textContent = item.date;
+      body.appendChild(when);
+    }
+    var title = document.createElement("h3");
+    title.textContent = item.title;
+    var badge = document.createElement("span");
+    badge.className = item.published ? "badge" : "badge off";
+    badge.textContent = item.published ? "已上架" : "已下架";
+    title.appendChild(badge);
+    body.appendChild(title);
+    if (item.note) {
+      var note = document.createElement("p");
+      note.textContent = item.note;
+      body.appendChild(note);
+    }
+    var actions = document.createElement("div");
+    actions.className = "notice-actions";
+    actions.appendChild(actionButton(item.published ? "下架" : "上架", function () {
+      item.published = !item.published;
+      saveContent("已" + (item.published ? "上架" : "下架") + "。");
+    }));
+    actions.appendChild(actionButton("编辑", function () { openEditor(item); }));
+    actions.appendChild(actionButton("上移", function () { moveNotice(index, -1); }, index === 0));
+    actions.appendChild(actionButton("下移", function () { moveNotice(index, 1); }, index === notices.length - 1));
+    actions.appendChild(actionButton("删除", function () { removeNotice(item); }, false, true));
+    row.appendChild(body);
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+function actionButton(label, onClick, disabled, danger) {
+  var button = document.createElement("button");
+  button.type = "button";
+  button.className = danger ? "btn btn-quiet btn-danger" : "btn btn-quiet";
+  button.textContent = label;
+  button.disabled = !!disabled;
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function noticeTime(item) {
+  return item && item.date ? item.date : "";
+}
+
+function insertNoticeByDate(item) {
+  var date = noticeTime(item);
+  var index = 0;
+  while (index < state.notices.length && noticeTime(state.notices[index]) >= date) index += 1;
+  state.notices.splice(index, 0, item);
+}
+
+function moveNotice(index, step) {
+  var next = index + step;
+  if (next < 0 || next >= state.notices.length) return;
+  var item = state.notices[index];
+  state.notices[index] = state.notices[next];
+  state.notices[next] = item;
+  renderNotices();
+  saveContent("显示位置已更新。刷新公告页就能看到。");
+}
+
+function removeNotice(item) {
+  if (!window.confirm("删除「" + item.title + "」？")) return;
+  state.notices = state.notices.filter(function (notice) { return notice.id !== item.id; });
+  saveContent("已删除。");
+}
+
+function openEditor(item) {
+  editingId = item ? item.id : "";
+  $("editor-title").textContent = item ? "编辑公告" : "新公告";
+  $("editor-submit").textContent = item ? "保存" : "新增";
+  $("notice-title-input").value = item ? item.title : "";
+  $("notice-note").value = item ? item.note : "";
+  $("notice-href").value = item ? item.href : "";
+  $("notice-guide").value = item && item.guide ? item.guide : "";
+  $("notice-date").value = item && item.date ? item.date : today();
+  $("notice-published").checked = item ? item.published : true;
+  $("editor-error").textContent = "";
+  $("editor").showModal();
+}
+
+function payloadFromState() {
+  readDownload();
+  return {
+    download: {
+      mode: state.download.mode,
+      version: state.download.version,
+      windowsUrl: state.download.windowsUrl,
+      fileName: state.download.fileName
+    },
+    notices: state.notices.map(function (item) {
+      return {
+        id: item.id,
+        title: item.title,
+        note: item.note,
+        href: item.href,
+        guide: item.guide || "",
+        date: item.date,
+        published: item.published
+      };
+    })
+  };
+}
+
+function saveContent(okText) {
+  setStatus("正在保存…");
+  return api("/api/content", { method: "PUT", body: JSON.stringify(payloadFromState()) })
+    .then(function (data) {
+      showDesk(data, { skipGitee: true });
+      setStatus(okText || "已保存。刷新首页和公告页就能看到。");
+    })
+    .catch(function (err) {
+      setStatus(err.message, true);
+    });
+}
+
+function showAccount(name) {
+  $("who").textContent = name || "";
+  $("who").hidden = !name;
+}
+
+$("login-form").addEventListener("submit", function (event) {
+  event.preventDefault();
+  $("login-error").textContent = "";
+  api("/api/login", {
+    method: "POST",
+    body: JSON.stringify({
+      username: $("username").value.trim(),
+      password: $("password").value
+    })
+  }).then(function (body) {
+    showAccount(body.username);
+    return api("/api/content");
+  }).then(showDesk).catch(function (err) {
+    $("login-error").textContent = err.message;
+  });
+});
+
+$("logout").addEventListener("click", function () {
+  api("/api/logout", { method: "POST", body: "{}" }).then(function () {
+    state = null;
+    showAccount("");
+    $("desk").hidden = true;
+    $("logout").hidden = true;
+    $("change-password").hidden = true;
+    $("gate").hidden = false;
+    $("password").value = "";
+  });
+});
+
+$("change-password").addEventListener("click", function () {
+  $("current-password").value = "";
+  $("new-password").value = "";
+  $("confirm-password").value = "";
+  $("password-error").textContent = "";
+  $("password-dialog").showModal();
+});
+$("password-cancel").addEventListener("click", function () {
+  $("password-dialog").close();
+});
+$("password-form").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var next = $("new-password").value;
+  if (next !== $("confirm-password").value) {
+    $("password-error").textContent = "两次输入的新密码不一致";
+    return;
+  }
+  $("password-error").textContent = "";
+  api("/api/password", {
+    method: "POST",
+    body: JSON.stringify({
+      currentPassword: $("current-password").value,
+      newPassword: next
+    })
+  }).then(function () {
+    $("password-dialog").close();
+    setStatus("密码已修改。下次用新密码登录。");
+  }).catch(function (err) {
+    $("password-error").textContent = err.message;
+  });
+});
+
+$("mode-gitee").addEventListener("click", function () {
+  state.download.mode = "gitee";
+  renderMode();
+  setDownloadEditable(false);
+  syncDownloadFromGitee();
+});
+$("mode-manual").addEventListener("click", function () {
+  state.download.mode = "manual";
+  renderMode();
+  setDownloadEditable(true);
+});
+$("add-notice").addEventListener("click", function () { openEditor(null); });
+$("editor-cancel").addEventListener("click", function () { $("editor").close(); });
+$("editor-form").addEventListener("submit", function (event) {
+  var href = $("notice-href").value.trim();
+  var guide = $("notice-guide").value.trim();
+  if (!/^https:\/\/\S+$/i.test(href)) {
+    event.preventDefault();
+    $("editor-error").textContent = "领取链接必须是 https:// 开头";
+    return;
+  }
+  if (guide && !/^https:\/\/\S+$/i.test(guide)) {
+    event.preventDefault();
+    $("editor-error").textContent = "领取流程必须是 https:// 开头，也可以留空";
+    return;
+  }
+  var item = {
+    id: editingId || ("n-" + Math.random().toString(16).slice(2, 14)),
+    title: $("notice-title-input").value.trim(),
+    note: $("notice-note").value.trim(),
+    href: href,
+    guide: guide,
+    date: $("notice-date").value,
+    published: $("notice-published").checked
+  };
+  if (editingId) {
+    var previous = null;
+    state.notices.forEach(function (notice) {
+      if (notice.id === editingId) previous = notice;
+    });
+    if (previous && noticeTime(previous) === noticeTime(item)) {
+      state.notices = state.notices.map(function (notice) {
+        return notice.id === editingId ? item : notice;
+      });
+    } else {
+      state.notices = state.notices.filter(function (notice) {
+        return notice.id !== editingId;
+      });
+      insertNoticeByDate(item);
+    }
+  } else {
+    insertNoticeByDate(item);
+  }
+  renderNotices();
+  saveContent(editingId ? "公告已更新。刷新公告页就能看到。" : "公告已新增。刷新公告页就能看到。");
+});
+
+$("save-download").addEventListener("click", function () {
+  saveContent("下载设置已保存。刷新首页就能看到。");
+});
+
+api("/api/session").then(function (body) {
+  if (!body.ok) return;
+  showAccount(body.username);
+  return api("/api/content").then(showDesk);
+}).catch(function () {});
+</script>
+</body>
+</html>

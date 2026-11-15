@@ -6,458 +6,641 @@
 <title>星瑶Code — 你的本地 AI 编程伙伴</title>
 <meta name="description" content="星瑶Code：一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。从一个想法，到可以运行的作品。">
 <meta name="keywords" content="星瑶Code,星瑶,AI编程,本地AI,编程助手">
+<meta name="theme-color" content="#faf5f1">
 <meta property="og:title" content="星瑶Code">
 <meta property="og:description" content="能执行任务、理解项目并长期记忆的本地 AI 编程伙伴">
-<meta property="og:image" content="https://xingyaocode.cn/assets/xingyaocode.png">
-<link rel="icon" type="image/png" href="assets/xingyaocode_logo.png">
-<link rel="preload" as="image" href="assets/xingyaocode_hero.webp" fetchpriority="high">
+<meta property="og:image" content="https://xingyaocode.cn/assets/xingyao-portrait.png">
+<meta property="og:locale" content="zh_CN">
+<link rel="icon" type="image/png" href="assets/xingyao-mark.png">
+<script>
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+</script>
+<link rel="apple-touch-icon" href="assets/xingyao-mark.png">
+<link rel="preload" as="image" href="assets/xingyao-portrait.png" fetchpriority="high">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@600;700&display=swap" rel="stylesheet">
 <style>
-/* ============ 基础与变量 ============ */
 :root {
-  --bg: #05070D;
-  --bg2: #0A0F1A;
-  --cyan: #3DE3FF;
-  --cyan-soft: rgba(61, 227, 255, .12);
-  --border: rgba(61, 227, 255, .16);
-  --text: #EAF4FF;
-  --dim: #93A7BC;
-  --gold: #D4B25E;
-  --card: rgba(255, 255, 255, .04);
-  --radius: 14px;
-  --font: system-ui, "Microsoft YaHei", "PingFang SC", "Segoe UI", "Helvetica Neue", sans-serif;
-  --mono: Consolas, "Cascadia Mono", "JetBrains Mono", monospace;
+  --paper: #faf5f1;
+  --sheet: #f3ece4;
+  --ink: #1c2a3a;
+  --ink-soft: #3d5166;
+  --blue: #1f6494;
+  --blue-deep: #184f76;
+  --scarf: #c41620;
+  --scarf-deep: #a5121a;
+  --line: rgba(28, 42, 58, 0.14);
+  --shadow: 0 18px 40px rgba(28, 42, 58, 0.10);
+  --serif: "Noto Serif SC", "Songti SC", "Source Han Serif SC", serif;
+  --sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
 }
-* { margin: 0; padding: 0; box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; color-scheme: light; }
+section, header { scroll-margin-top: 96px; }
 body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font);
-  line-height: 1.7;
-  overflow-x: hidden;
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 17px;
+  font-weight: 400;
+  line-height: 1.75;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
 }
-img { display: block; max-width: 100%; }
-a { color: var(--cyan); text-decoration: none; }
-a:focus-visible, button:focus-visible {
-  outline: 2px solid var(--cyan);
+img { display: block; max-width: 100%; height: auto; }
+a { color: var(--blue); text-underline-offset: 0.22em; }
+button, input { font: inherit; }
+::selection { background: var(--scarf); color: var(--paper); }
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: var(--paper); }
+::-webkit-scrollbar-thumb {
+  background: var(--ink);
+  border: 3px solid var(--paper);
+  border-radius: 8px;
+}
+html { scrollbar-color: var(--ink) var(--paper); }
+
+:focus-visible {
+  outline: 2px solid var(--blue);
   outline-offset: 3px;
-  border-radius: 6px;
-}
-section { position: relative; }
-.wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
-
-/* ============ 通用组件 ============ */
-.btn {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 13px 28px; border-radius: 10px;
-  font-size: 15px; font-weight: 600; font-family: var(--font);
-  cursor: pointer; border: 1px solid transparent;
-  transition: transform .2s ease, box-shadow .2s ease, background .2s ease;
-}
-.btn-primary {
-  background: var(--cyan); color: #032330;
-  box-shadow: 0 0 24px rgba(61, 227, 255, .35);
-}
-.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 0 36px rgba(61, 227, 255, .5); }
-.btn-ghost {
-  background: transparent; color: var(--text);
-  border-color: var(--border);
-}
-.btn-ghost:hover { border-color: var(--cyan); background: var(--cyan-soft); }
-.btn-disabled, .btn[disabled] {
-  background: var(--card); color: var(--dim);
-  border-color: rgba(255, 255, 255, .08);
-  cursor: not-allowed;
-}
-.section-title {
-  font-size: clamp(1.6rem, 3.4vw, 2.4rem);
-  font-weight: 700; letter-spacing: .02em;
-  text-align: center; margin-bottom: 14px;
-}
-.section-sub { color: var(--dim); text-align: center; margin-bottom: 52px; font-size: 15px; }
-.eyebrow {
-  color: var(--cyan); font-size: 13px; font-weight: 600;
-  letter-spacing: .28em; text-transform: uppercase;
-  text-align: center; margin-bottom: 12px;
 }
 
-/* ============ 导航 ============ */
+.skip {
+  position: absolute;
+  left: 16px;
+  top: -48px;
+  z-index: 20;
+  padding: 8px 14px;
+  background: var(--ink);
+  color: var(--paper);
+  border-radius: 8px;
+  text-decoration: none;
+}
+.skip:focus { top: 12px; }
+
+.wrap {
+  width: min(1120px, calc(100% - 48px));
+  margin-inline: auto;
+}
+
 .nav {
-  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
-  background: rgba(5, 7, 13, .72);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border-bottom: 1px solid rgba(255, 255, 255, .06);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
 }
 .nav-inner {
-  max-width: 1120px; margin: 0 auto; padding: 14px 24px;
-  display: flex; align-items: center; gap: 32px;
+  width: min(1240px, calc(100% - 40px));
+  margin: 0 auto;
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  gap: 28px;
 }
-.nav-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .05em; color: var(--text); }
-.nav-brand img { width: 30px; height: 30px; border-radius: 8px; }
-.nav-links { display: flex; gap: 26px; margin-left: auto; }
-.nav-links a { color: var(--dim); font-size: 14px; transition: color .2s; }
-.nav-links a:hover { color: var(--cyan); }
-.nav .btn { padding: 9px 20px; font-size: 14px; }
+.brand {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  color: var(--blue);
+  text-decoration: none;
+}
+.brand img { height: 54px; width: auto; }
+.brand-code {
+  font-weight: 500;
+  font-size: 15px;
+  letter-spacing: 0.08em;
+  padding-bottom: 11px;
+}
 
-/* ============ Hero 海报屏 ============ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 46px;
+  padding: 0 20px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color 180ms var(--ease), transform 180ms var(--ease), color 180ms var(--ease), border-color 180ms var(--ease);
+}
+.btn:hover { transform: translateY(-1px); }
+.btn:active { transform: translateY(1px) scale(0.98); }
+.btn-scarf { background: var(--scarf); color: var(--paper); }
+.btn-scarf:hover { background: var(--scarf-deep); color: var(--paper); }
+.btn-paper { background: var(--paper); color: var(--ink); }
+.btn-paper:hover { background: #fff; color: var(--ink); }
+.btn-line {
+  background: var(--paper);
+  color: var(--blue);
+  border: 1px solid var(--blue);
+}
+.btn-line:hover { background: #e7f1f8; color: var(--blue-deep); border-color: var(--blue-deep); }
+.nav .btn { min-height: 40px; padding: 0 16px; }
+.nav-notice { margin-left: auto; }
+
 .hero {
-  min-height: 100vh;
-  display: flex; align-items: center; justify-content: center;
-  text-align: center;
-  padding: 120px 24px 80px;
-  background:
-    radial-gradient(ellipse 55% 42% at 50% 26%, rgba(61, 227, 255, .13), transparent 70%),
-    radial-gradient(ellipse 38% 30% at 50% 62%, rgba(61, 227, 255, .05), transparent 70%),
-    var(--bg);
+  width: min(1240px, calc(100% - 48px));
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1.12fr) minmax(300px, 0.88fr);
+  gap: clamp(28px, 4vw, 72px);
+  align-items: center;
+  padding: 12px 0 72px;
 }
-.hero::after {
-  /* 底部淡出，平滑过渡到下一块 */
-  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 160px;
-  background: linear-gradient(transparent, var(--bg2));
-  pointer-events: none;
+.hero-art img {
+  width: min(100%, 680px);
+  background: var(--paper);
 }
-.hero-logo {
-  width: clamp(170px, 24vw, 300px);
-  margin: 0 auto 34px;
-  border-radius: 24%;
-  box-shadow:
-    0 0 60px rgba(61, 227, 255, .35),
-    0 0 140px rgba(61, 227, 255, .18);
-  animation: float 5.5s ease-in-out infinite;
+.hero-copy { max-width: 38rem; }
+.hero h1,
+.section-title,
+.persona h2,
+.scarf h2 {
+  font-family: var(--serif);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.18;
+  text-wrap: balance;
+  margin: 0;
 }
 .hero h1 {
-  font-size: clamp(2.4rem, 6vw, 4.6rem);
-  font-weight: 800; letter-spacing: .04em; line-height: 1.25;
-  margin-bottom: 20px;
-  text-shadow: 0 0 40px rgba(61, 227, 255, .25);
+  font-size: clamp(2.5rem, 4.4vw, 4.15rem);
 }
-.hero-tagline {
-  display: inline-block;
-  font-size: 13px; color: var(--cyan);
-  border: 1px solid var(--border); border-radius: 999px;
-  padding: 6px 16px; margin-bottom: 26px;
-  background: var(--cyan-soft);
-  letter-spacing: .1em;
+.rule {
+  width: 64px;
+  height: 2px;
+  margin: 26px 0 0;
+  background: var(--scarf);
+  border: 0;
+  transform-origin: left center;
 }
 .hero-desc {
-  max-width: 620px; margin: 0 auto 40px;
-  color: var(--dim); font-size: clamp(15px, 2vw, 17px);
+  margin: 22px 0 0;
+  max-width: 34em;
+  color: var(--ink-soft);
 }
-.hero-actions { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px 22px;
+  margin-top: 32px;
+}
+.quiet {
+  color: var(--ink-soft);
+  font-size: 14px;
+}
+.edition {
+  margin: 18px 0 0;
+  color: var(--ink-soft);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
 
-/* ============ 能力区 ============ */
-.features { background: var(--bg2); padding: 110px 0; }
-.feature-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px;
+.features { padding: 132px 0 88px; }
+.section-title { font-size: clamp(2rem, 3.4vw, 3.15rem); max-width: 16em; }
+.lede {
+  margin: 18px 0 0;
+  max-width: 34em;
+  color: var(--ink-soft);
 }
-.feature-card {
-  background: var(--card);
-  border: 1px solid rgba(255, 255, 255, .07);
-  border-radius: var(--radius);
-  padding: 30px 24px;
-  transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease;
+.feature-list { margin: 56px 0 0; }
+.feature-row {
+  display: grid;
+  grid-template-columns: minmax(11rem, 18rem) minmax(0, 1fr);
+  gap: 24px 40px;
+  align-items: baseline;
+  padding: 28px 0;
+  border-top: 1px solid var(--line);
 }
-.feature-card:hover {
-  transform: translateY(-6px);
-  border-color: var(--border);
-  box-shadow: 0 18px 40px rgba(0, 0, 0, .45), 0 0 24px rgba(61, 227, 255, .08);
+.feature-row:last-child { border-bottom: 1px solid var(--line); }
+.feature-row dt {
+  font-family: var(--serif);
+  font-size: clamp(1.35rem, 2vw, 1.7rem);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
 }
-.feature-no {
-  font-family: var(--mono); font-size: 13px; color: var(--cyan);
-  letter-spacing: .2em; margin-bottom: 16px;
+.feature-row dd {
+  margin: 0;
+  max-width: 40em;
+  color: var(--ink-soft);
 }
-.feature-card h3 { font-size: 18px; margin-bottom: 10px; }
-.feature-card p { color: var(--dim); font-size: 14px; }
 
-/* ============ 星瑶区 ============ */
-.persona { padding: 110px 0; background: var(--bg); }
-.persona-inner {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center;
+.persona { padding: 72px 0 128px; }
+.persona h2 {
+  font-size: clamp(2.4rem, 5vw, 4.6rem);
+  max-width: 10em;
 }
-.persona-quote {
-  font-size: clamp(1.8rem, 3.6vw, 2.6rem);
-  font-weight: 800; line-height: 1.4; margin-bottom: 22px;
+.persona h2 em {
+  font-style: normal;
+  color: var(--scarf);
 }
-.persona-quote em { color: var(--cyan); font-style: normal; }
-.persona-text { color: var(--dim); font-size: 15px; max-width: 460px; }
-.terminal {
-  background: #070B14;
-  border: 1px solid rgba(255, 255, 255, .09);
-  border-radius: var(--radius);
-  overflow: hidden;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, .5), 0 0 30px rgba(61, 227, 255, .06);
+.persona-body {
+  margin-top: 56px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
+  gap: 40px 72px;
+  align-items: end;
 }
-.terminal-bar {
-  display: flex; align-items: center; gap: 8px;
-  padding: 12px 16px;
-  background: rgba(255, 255, 255, .03);
-  border-bottom: 1px solid rgba(255, 255, 255, .06);
+.persona-text {
+  margin: 0;
+  max-width: 28em;
+  color: var(--ink-soft);
 }
-.dot { width: 11px; height: 11px; border-radius: 50%; }
-.dot.r { background: #FF5F57; } .dot.y { background: #FEBC2E; } .dot.g { background: #28C840; }
-.terminal-title { margin-left: 10px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
-.terminal-body {
-  padding: 22px 20px 26px;
-  font-family: var(--mono); font-size: 14px; line-height: 2.0;
+.term {
+  background: var(--sheet);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 26px 28px 30px;
 }
-.terminal-body .prompt { color: var(--cyan); }
-.terminal-body .reply { color: var(--text); }
+.term-label {
+  margin: 0 0 18px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+.cmd, .reply { margin: 0; }
+.cmd {
+  font-family: var(--mono);
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+.prompt { color: var(--blue); margin-right: 8px; }
+.reply {
+  margin-top: 10px;
+  font-size: 16px;
+  line-height: 1.7;
+}
 .cursor {
-  display: inline-block; width: 8px; height: 17px;
-  background: var(--cyan); vertical-align: -3px;
-  animation: blink 1.1s steps(1) infinite;
-}
-
-/* ============ 下载区 ============ */
-.download { padding: 110px 0; background: var(--bg2); }
-.version-tag {
-  display: inline-block; margin-top: 14px;
-  font-family: var(--mono); font-size: 13px;
-  color: var(--gold); border: 1px solid rgba(212, 178, 94, .35);
-  padding: 4px 14px; border-radius: 999px;
-}
-.download-head { text-align: center; }
-.download-grid {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 56px;
-}
-.platform-card {
-  background: var(--card);
-  border: 1px solid rgba(255, 255, 255, .07);
-  border-radius: var(--radius);
-  padding: 34px 26px; text-align: center;
-  display: flex; flex-direction: column; gap: 14px;
-}
-.platform-card.available { border-color: var(--border); box-shadow: 0 0 30px rgba(61, 227, 255, .08); }
-.platform-name { font-size: 20px; font-weight: 700; }
-.platform-desc { color: var(--dim); font-size: 13.5px; flex: 1; }
-.platform-card .btn { justify-content: center; }
-
-/* ============ 页脚 ============ */
-.footer {
-  padding: 56px 0 40px;
-  background: var(--bg);
-  border-top: 1px solid rgba(255, 255, 255, .06);
-}
-.footer-inner {
-  display: flex; flex-wrap: wrap; gap: 28px;
-  align-items: center; justify-content: space-between;
-}
-.footer-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .05em; }
-.footer-brand img { width: 26px; height: 26px; border-radius: 7px; }
-.footer-brand span { color: var(--dim); font-weight: 400; }
-.footer-links { display: flex; gap: 24px; font-size: 14px; }
-.footer-links a { color: var(--dim); transition: color .2s; }
-.footer-links a:hover { color: var(--cyan); }
-.footer-links a.disabled { color: rgba(147, 167, 188, .45); cursor: not-allowed; pointer-events: none; }
-.footer-copy { width: 100%; color: rgba(147, 167, 188, .55); font-size: 13px; margin-top: 22px; text-align: center; }
-.footer-beian { width: 100%; font-size: 13px; margin-top: 6px; text-align: center; }
-.footer-beian a { color: rgba(147, 167, 188, .55); transition: color .2s; }
-.footer-beian a:hover { color: var(--cyan); }
-.footer-beian .beian-icon {
   display: inline-block;
-  width: 14px; height: 14px;
+  width: 8px;
+  height: 1.05em;
+  margin-left: 2px;
+  background: var(--scarf);
+  vertical-align: -0.15em;
+}
+
+.scarf {
+  background: var(--paper);
+  color: var(--ink);
+  padding: 112px 0 124px;
+  border-top: 1px solid var(--line);
+}
+.scarf-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(240px, 0.7fr);
+  gap: 36px 48px;
+  align-items: end;
+}
+.scarf h2 { font-size: clamp(2.1rem, 4vw, 3.5rem); max-width: 9em; }
+.scarf .lede { color: var(--ink-soft); margin-top: 20px; }
+.scarf .edition { color: var(--ink-soft); }
+.scarf-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 18px; }
+.soon {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--ink-soft);
+  font-size: 15px;
+}
+.soon li + li { margin-top: 4px; }
+
+.footer { padding: 48px 0 36px; border-top: 1px solid var(--line); }
+.footer-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px 32px;
+}
+.footer-brand {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  color: var(--ink);
+  text-decoration: none;
+  font-weight: 600;
+}
+.footer-brand img { height: 42px; width: auto; }
+.footer-brand span {
+  font-weight: 500;
+  font-size: 14px;
+  letter-spacing: 0.12em;
+  color: var(--blue);
+  padding-bottom: 8px;
+}
+.footer-links { display: flex; flex-wrap: wrap; gap: 8px 22px; }
+.footer-links a,
+.footer-links span {
+  color: var(--ink-soft);
+  text-decoration: none;
+  font-size: 14px;
+  padding: 6px 0;
+}
+.footer-links a:hover { color: var(--scarf); }
+.legal {
+  margin-top: 32px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.8;
+}
+.legal a { color: var(--ink-soft); }
+.legal a:hover { color: var(--blue); }
+.disclaimer { margin-top: 8px; }
+.beian-icon {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
   vertical-align: -2px;
   margin-right: 4px;
 }
 
-/* ============ 演示弹窗 ============ */
 dialog#demo-modal {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: #0B1220;
-  color: var(--text);
-  padding: 36px 34px;
-  max-width: 400px; width: calc(100% - 48px);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
+  border: 0;
+  border-radius: 16px;
+  background: var(--paper);
+  color: var(--ink);
+  padding: 32px 32px 28px;
+  max-width: 420px;
+  width: calc(100% - 40px);
+  box-shadow: 0 28px 70px rgba(28, 42, 58, 0.22);
 }
-dialog#demo-modal::backdrop { background: rgba(2, 4, 9, .72); backdrop-filter: blur(4px); }
-dialog#demo-modal h3 { font-size: 19px; margin-bottom: 12px; }
-dialog#demo-modal p { color: var(--dim); font-size: 14.5px; margin-bottom: 26px; }
-dialog#demo-modal .btn { width: 100%; justify-content: center; }
-
-/* ============ 动画 ============ */
-@keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-14px); } }
-@keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
-
-/* ============ 响应式 ============ */
-@media (max-width: 980px) {
-  .feature-grid { grid-template-columns: repeat(2, 1fr); }
-  .persona-inner { grid-template-columns: 1fr; gap: 44px; }
-  .download-grid { grid-template-columns: 1fr; max-width: 460px; margin-left: auto; margin-right: auto; }
+dialog#demo-modal::backdrop { background: rgba(28, 42, 58, 0.46); }
+dialog#demo-modal h3 {
+  margin: 0 0 12px;
+  font-family: var(--serif);
+  font-size: 1.45rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
 }
+dialog#demo-modal p { margin: 0 0 24px; color: var(--ink-soft); font-size: 15px; }
+dialog#demo-modal .btn { min-width: 120px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .rule { animation: rule-draw 900ms var(--ease) both; }
+  .cursor { animation: blink 1.1s steps(1) infinite; }
+}
+@keyframes rule-draw {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@media (max-width: 900px) {
+  .hero {
+    grid-template-columns: 1fr;
+    min-height: 0;
+    align-items: start;
+    gap: 8px;
+    padding: 12px 0 64px;
+  }
+  .hero-art img { width: min(100%, 560px); }
+  .hero-copy { padding-bottom: 0; }
+  .feature-row,
+  .persona-body,
+  .scarf-grid { grid-template-columns: 1fr; }
+  .persona-body { gap: 36px; }
+  .scarf-actions { align-items: flex-start; }
+}
+
 @media (max-width: 720px) {
-  .nav-links { display: none; }
-  .nav-inner { gap: 16px; }
-  .feature-grid { grid-template-columns: 1fr; }
-  .hero { padding-top: 100px; }
+  .wrap, .hero { width: min(1120px, calc(100% - 40px)); }
+  .nav-inner {
+    min-height: 0;
+    padding: 10px 0;
+    gap: 8px 16px;
+  }
+  .brand img { height: 44px; }
+  .brand-code { padding-bottom: 8px; }
+  .features { padding-top: 88px; }
+  section, header { scroll-margin-top: 88px; }
+  .title-break { display: block; }
+  .legal a { display: block; }
+  .legal-sep { display: none; }
+  .persona { padding-bottom: 88px; }
+  .scarf { padding: 80px 0 88px; }
+  .hero h1 { font-size: 2.45rem; }
 }
-/* ============ 减少动画偏好 ============ */
+
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  *, *::before, *::after { animation: none !important; transition: none !important; }
+  .btn { transition: none; }
+  .btn:hover, .btn:active { transform: none; }
 }
 </style>
 </head>
 <body>
+<a class="skip" href="#top">跳到主要内容</a>
 
-<!-- ============ 导航 ============ -->
 <nav class="nav" aria-label="主导航">
   <div class="nav-inner">
-    <a class="nav-brand" href="#top" aria-label="星瑶Code 首页">
-      <img src="assets/xingyaocode_logo.png" alt="星瑶Code 标志">
-      星瑶Code
+    <a class="brand" href="#top" aria-label="星瑶Code 首页">
+      <img src="assets/xingyao-lockup.png" width="400" height="164" alt="星瑶">
+      <span class="brand-code">Code</span>
     </a>
-    <div class="nav-links">
-      <a href="#features">能力</a>
-      <a href="#xingyao">星瑶</a>
-      <a href="#download">下载</a>
-    </div>
-    <button class="btn btn-primary" type="button" data-download>免费下载</button>
+    <a class="btn btn-line nav-notice" href="tokens.html">Token 领取公告</a>
   </div>
 </nav>
 
-<!-- ============ Hero 海报屏 ============ -->
-<header class="hero" id="top">
-  <div class="hero-content">
-    <img class="hero-logo" src="assets/xingyaocode_hero.webp" alt="星瑶Code 像素机器人标志" fetchpriority="high">
-    <div class="hero-tagline">星瑶Code 已上线 · v<span class="js-version">1.3.3</span></div>
-    <h1>让代码，回应你的想象。</h1>
-    <p class="hero-desc">
-      一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。<br>
-      从一个想法，到可以运行的作品。
-    </p>
-    <div class="hero-actions">
-      <button class="btn btn-primary" type="button" data-download>Windows 免费下载</button>
-      <a class="btn btn-ghost" href="https://gitee.com/feng-chenhao/xingyao-y-code" target="_blank" rel="noopener">访问 Gitee</a>
-      <button class="btn btn-disabled" type="button" disabled title="GitHub 仓库即将上线">GitHub（即将上线）</button>
+<main id="top">
+  <header class="hero">
+    <div class="hero-art">
+      <img src="assets/xingyao-portrait.png" width="1024" height="1024" alt="星瑶侧脸肖像：黑发盘髻，红围巾，白外套，耳际有带白翼的圆形像素徽记，上方是蓝色星轨与星瑶二字" fetchpriority="high">
     </div>
-  </div>
-</header>
+    <div class="hero-copy">
+      <h1>让代码，<br>回应你的想象。</h1>
+      <hr class="rule">
+      <p class="hero-desc">一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。从一个想法，到可以运行的作品。</p>
+      <div class="hero-actions">
+        <button class="btn btn-scarf" type="button" data-download>Windows 免费下载</button>
+        <a class="btn btn-line" href="https://gitee.com/feng-chenhao/xingyao-y-code" target="_blank" rel="noopener">访问 Gitee</a>
+        <a class="btn btn-line" href="https://github.com/fengchen122123-sudo/xingyao-y-code" target="_blank" rel="noopener">访问 GitHub</a>
+      </div>
+      <p class="edition">星瑶Code 已上线 · v<span class="js-version">1.3.9</span></p>
+    </div>
+  </header>
 
-<!-- ============ 能力区 ============ -->
-<section class="features" id="features">
-  <div class="wrap">
-    <div class="eyebrow">Capabilities</div>
-    <h2 class="section-title">不是只回答。是把事情做完。</h2>
-    <p class="section-sub">从理解需求到交付可运行的结果，全程由它完成。</p>
-    <div class="feature-grid">
-      <div class="feature-card">
-        <div class="feature-no">01</div>
-        <h3>从计划到交付</h3>
-        <p>读取代码、修改文件、运行命令并验证结果——不只给建议，直接把事情做完。</p>
-      </div>
-      <div class="feature-card">
-        <div class="feature-no">02</div>
-        <h3>理解你的项目</h3>
-        <p>深入代码库结构与调用链，理解现有逻辑后再动手，不做盲目改动。</p>
-      </div>
-      <div class="feature-card">
-        <div class="feature-no">03</div>
-        <h3>长期记忆</h3>
-        <p>记住你的重要决定、偏好与项目上下文，跨会话保持连续协作。</p>
-      </div>
-      <div class="feature-card">
-        <div class="feature-no">04</div>
-        <h3>多代理并肩工作</h3>
-        <p>探索、实现、测试与审查可由多个子代理并行推进，复杂任务不排队。</p>
-      </div>
+  <section class="features" id="features">
+    <div class="wrap">
+      <h2 class="section-title">不是只回答。<span class="title-break">是把事情做完。</span></h2>
+      <p class="lede">从理解需求到交付可运行的结果，全程由它完成。</p>
+      <dl class="feature-list">
+        <div class="feature-row">
+          <dt>从计划到交付</dt>
+          <dd>读取代码、修改文件、运行命令并验证结果——不只给建议，直接把事情做完。</dd>
+        </div>
+        <div class="feature-row">
+          <dt>理解你的项目</dt>
+          <dd>深入代码库结构与调用链，理解现有逻辑后再动手，不做盲目改动。</dd>
+        </div>
+        <div class="feature-row">
+          <dt>长期记忆</dt>
+          <dd>记住你的重要决定、偏好与项目上下文，跨会话保持连续协作。</dd>
+        </div>
+        <div class="feature-row">
+          <dt>多代理并肩工作</dt>
+          <dd>探索、实现、测试与审查可由多个子代理并行推进，复杂任务不排队。</dd>
+        </div>
+      </dl>
     </div>
-  </div>
-</section>
+  </section>
 
-<!-- ============ 星瑶介绍 ============ -->
-<section class="persona" id="xingyao">
-  <div class="wrap persona-inner">
-    <div>
-      <div class="eyebrow" style="text-align:left">Meet Xingyao</div>
-      <h2 class="persona-quote">你负责想象，<br>剩下的交给<em>我们</em>。</h2>
-      <p class="persona-text">
-        星瑶不是装饰性吉祥物，而是星瑶Code 的人格化界面：
-        沉静、敏锐、可信，陪你穿过复杂代码，把想法落到能运行的作品上。
-      </p>
-    </div>
-    <div class="terminal" role="img" aria-label="终端演示：启动 xingyaocode 后星瑶回应已理解项目">
-      <div class="terminal-bar">
-        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-        <span class="terminal-title">xingyaocode — 终端</span>
-      </div>
-      <div class="terminal-body">
-        <div><span class="prompt">❯</span> xingyaocode</div>
-        <div class="reply">星瑶：已理解项目。我们从最关键的问题开始。<span class="cursor" aria-hidden="true"></span></div>
+  <section class="persona" id="xingyao">
+    <div class="wrap">
+      <h2>你负责想象，<br>剩下的交给<em>我们</em>。</h2>
+      <div class="persona-body">
+        <p class="persona-text">星瑶不是装饰性吉祥物，而是星瑶Code 的人格化界面：沉静、敏锐、可信，陪你穿过复杂代码，把想法落到能运行的作品上。</p>
+        <div class="term" role="img" aria-label="终端演示：启动 xingyaocode 后星瑶回应已理解项目">
+          <p class="term-label">xingyaocode — 终端</p>
+          <p class="cmd"><span class="prompt" aria-hidden="true">❯</span>xingyaocode</p>
+          <p class="reply">星瑶：已理解项目。我们从最关键的问题开始。<span class="cursor" aria-hidden="true"></span></p>
+        </div>
       </div>
     </div>
-  </div>
-</section>
+  </section>
 
-<!-- ============ 下载区 ============ -->
-<section class="download" id="download">
-  <div class="wrap">
-    <div class="download-head">
-      <div class="eyebrow">Download</div>
-      <h2 class="section-title">准备好，与星瑶并肩了吗？</h2>
-      <span class="version-tag">当前版本 v<span class="js-version">1.3.3</span> · Windows</span>
-    </div>
-    <div class="download-grid">
-      <div class="platform-card available">
-        <div class="platform-name">Windows</div>
-        <p class="platform-desc">Windows 10 / 11 安装包，开箱即用。</p>
-        <button class="btn btn-primary" type="button" data-download>免费下载</button>
+  <section class="scarf" id="download">
+    <div class="wrap scarf-grid">
+      <div>
+        <h2>准备好，与星瑶并肩了吗？</h2>
+        <p class="lede">Windows 10 / 11 安装包，开箱即用。</p>
+        <p class="edition">当前版本 v<span class="js-version">1.3.9</span> · Windows</p>
       </div>
-      <div class="platform-card">
-        <div class="platform-name">macOS</div>
-        <p class="platform-desc">macOS 版本正在筹备中。</p>
-        <button class="btn btn-disabled" type="button" disabled>敬请期待</button>
-      </div>
-      <div class="platform-card">
-        <div class="platform-name">Linux</div>
-        <p class="platform-desc">Linux 版本正在筹备中。</p>
-        <button class="btn btn-disabled" type="button" disabled>敬请期待</button>
+      <div class="scarf-actions">
+        <button class="btn btn-scarf" type="button" data-download>免费下载</button>
+        <ul class="soon">
+          <li>macOS 正在筹备中</li>
+          <li>Linux 正在筹备中</li>
+        </ul>
       </div>
     </div>
-  </div>
-</section>
+  </section>
+</main>
 
-<!-- ============ 页脚 ============ -->
 <footer class="footer">
-  <div class="wrap footer-inner">
-    <div class="footer-brand">
-      <img src="assets/xingyaocode_logo.png" alt="星瑶Code 标志">
-      星瑶Code <span>· 编程搭档</span>
+  <div class="wrap">
+    <div class="footer-row">
+      <a class="footer-brand" href="#top" aria-label="星瑶Code 首页">
+        <img src="assets/xingyao-lockup.png" width="400" height="164" alt="星瑶">
+        <span>Code</span>
+      </a>
+      <div class="footer-links">
+        <a href="#features">能力</a>
+        <a href="#xingyao">星瑶</a>
+        <a href="#download">下载</a>
+        <a href="https://gitee.com/feng-chenhao/xingyao-y-code" target="_blank" rel="noopener">Gitee</a>
+        <a href="https://github.com/fengchen122123-sudo/xingyao-y-code" target="_blank" rel="noopener">GitHub</a>
+      </div>
     </div>
-    <div class="footer-links">
-      <a href="#features">能力</a>
-      <a href="#xingyao">星瑶</a>
-      <a href="#download">下载</a>
-      <a href="https://gitee.com/feng-chenhao/xingyao-y-code" target="_blank" rel="noopener">Gitee</a>
-      <a class="disabled" aria-disabled="true" title="GitHub 仓库即将上线">GitHub</a>
-    </div>
-    <div class="footer-copy">© 2026 星瑶Code · 让代码，回应你的想象。</div>
-    <div class="footer-beian">
-      <a href="https://beian.mps.gov.cn/#/query/webSearch?code=11011402057329" target="_blank" rel="noreferrer"><img class="beian-icon" src="assets/beian_gongan.png" alt="">京公网安备11011402057329号</a>
-      <span aria-hidden="true"> · </span>
-      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener">京ICP备2026063481号-1</a>
+    <div class="legal">
+      <div>© 2026 星瑶Code · 让代码，回应你的想象。</div>
+      <div>
+        <a href="https://beian.mps.gov.cn/#/query/webSearch?code=11011402057329" target="_blank" rel="noreferrer"><img class="beian-icon" src="assets/beian_gongan.png" alt="">京公网安备11011402057329号</a>
+        <span class="legal-sep" aria-hidden="true"> · </span>
+        <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener">京ICP备2026063481号-1</a>
+      </div>
+      <div class="disclaimer">本站所有内容均由用户与网络公开信息聚合，仅供技术交流学习</div>
     </div>
   </div>
 </footer>
 
-<!-- ============ 演示下载弹窗 ============ -->
 <dialog id="demo-modal" aria-labelledby="demo-modal-title">
   <h3 id="demo-modal-title">在线演示版</h3>
-  <p>当前为在线演示版，下载通道尚未接入服务器。<br>安装包（<span class="js-filename">ycode_setup_v1.3.3.exe</span>）上线后，此按钮将直接开始下载。</p>
-  <button class="btn btn-primary" type="button" id="demo-modal-close">我知道了</button>
+  <p id="demo-modal-text">当前为在线演示版，下载通道尚未接入服务器。安装包（<span class="js-filename">XingYaoCode-1.3.9.exe</span>）上线后，此按钮将直接开始下载。</p>
+  <button class="btn btn-scarf" type="button" id="demo-modal-close">我知道了</button>
 </dialog>
 
 <script>
-/* ============ 下载配置：接入真实服务器时只需修改这里 ============ */
-const DOWNLOAD_CONFIG = {
-  mode: "live",                 // "demo" 演示弹窗 | "live" 真实下载
-  windowsUrl: "https://pan.quark.cn/s/e49cc60c7364",  // live 模式必填，必须是非空 https:// 地址
-  version: "1.3.3",             // 页面显示版本
-  fileName: "ycode_setup_v1.3.3.exe"
-};
+/* 刷新或再次打开时回到首屏，避免停在中段 */
+function showPageTop() {
+  if (location.hash && location.hash !== '#top') {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  window.scrollTo(0, 0);
+}
+window.addEventListener('pageshow', showPageTop);
+window.addEventListener('load', function () {
+  showPageTop();
+  requestAnimationFrame(function () { requestAnimationFrame(showPageTop); });
+});
 
-/* 版本号与文件名统一由 CONFIG 渲染，改一处全站生效 */
+/* 兜底版本：Gitee 接口失败时仍可下载。正常打开页面会改成最新正式发版。 */
+const DOWNLOAD_CONFIG = {
+  mode: "live",
+  windowsUrl: "https://gitee.com/feng-chenhao/xingyao-y-code/releases/download/v1.3.9/XingYaoCode-1.3.9.exe",
+  version: "1.3.9",
+  fileName: "XingYaoCode-1.3.9.exe"
+};
+const GITEE_LATEST = "https://gitee.com/api/v5/repos/feng-chenhao/xingyao-y-code/releases/latest";
+
+function versionFromTag(tag) {
+  return String(tag || "").replace(/^v/i, "");
+}
+
+function pickWindowsInstaller(assets) {
+  var i, asset, name;
+  assets = assets || [];
+  for (i = 0; i < assets.length; i++) {
+    asset = assets[i];
+    name = asset && asset.name ? asset.name : "";
+    if (/^XingYaoCode-.+\.exe$/i.test(name)) return asset;
+  }
+  return null;
+}
+
+function applyDownloadRelease(version, url, fileName) {
+  if (!version || !/^https:\/\/\S+$/.test(url || "")) return;
+  DOWNLOAD_CONFIG.version = version;
+  DOWNLOAD_CONFIG.windowsUrl = url;
+  if (fileName) DOWNLOAD_CONFIG.fileName = fileName;
+  document.querySelectorAll(".js-version").forEach(function (el) {
+    el.textContent = DOWNLOAD_CONFIG.version;
+  });
+  document.querySelectorAll(".js-filename").forEach(function (el) {
+    el.textContent = DOWNLOAD_CONFIG.fileName;
+  });
+  document.querySelectorAll("a[data-download]").forEach(function (a) {
+    a.href = DOWNLOAD_CONFIG.windowsUrl;
+  });
+}
+
+function refreshDownloadFromGitee() {
+  return fetch(GITEE_LATEST)
+    .then(function (res) {
+      if (!res.ok) throw new Error("release");
+      return res.json();
+    })
+    .then(function (release) {
+      if (!release || release.prerelease) return;
+      var asset = pickWindowsInstaller(release.assets);
+      if (!asset) return;
+      var url = asset.browser_download_url || "";
+      if (!/^https:\/\/\S+$/.test(url) && release.tag_name) {
+        url = "https://gitee.com/feng-chenhao/xingyao-y-code/releases/download/"
+          + encodeURIComponent(release.tag_name) + "/"
+          + encodeURIComponent(asset.name);
+      }
+      applyDownloadRelease(versionFromTag(release.tag_name), url, asset.name);
+    })
+    .catch(function () {});
+}
+
 document.querySelectorAll(".js-version").forEach(function (el) {
   el.textContent = DOWNLOAD_CONFIG.version;
 });
@@ -465,20 +648,27 @@ document.querySelectorAll(".js-filename").forEach(function (el) {
   el.textContent = DOWNLOAD_CONFIG.fileName;
 });
 
-/* 下载入口：live 模式把按钮原地替换成真实 <a> 链接（原生导航，不受弹窗拦截，
-   WebView/内嵌浏览器里 window.open 会被静默吞掉）；demo 模式弹演示窗 */
+function showDownloadNotice(title, text) {
+  document.getElementById("demo-modal-title").textContent = title;
+  document.getElementById("demo-modal-text").textContent = text;
+  document.getElementById("demo-modal").showModal();
+}
+
 function onDownloadClick() {
   var url = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
   if (DOWNLOAD_CONFIG.mode === "live") {
     if (!/^https:\/\/\S+$/.test(url)) {
       console.error("[星瑶Code] live 模式下 windowsUrl 必须是非空 https:// 地址，当前值无效。");
-      alert("下载配置无效，请稍后再试。");
+      showDownloadNotice("下载暂不可用", "下载配置无效，请稍后再试。");
       return;
     }
     window.open(url, "_blank", "noopener");
     return;
   }
-  document.getElementById("demo-modal").showModal();
+  showDownloadNotice(
+    "在线演示版",
+    "当前为在线演示版，下载通道尚未接入服务器。安装包（" + DOWNLOAD_CONFIG.fileName + "）上线后，此按钮将直接开始下载。"
+  );
 }
 
 function toDownloadAnchor(el) {
@@ -487,6 +677,7 @@ function toDownloadAnchor(el) {
   a.href = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
   a.target = "_blank";
   a.rel = "noopener";
+  a.setAttribute("data-download", "");
   a.innerHTML = el.innerHTML;
   el.replaceWith(a);
 }
@@ -498,6 +689,28 @@ document.querySelectorAll("[data-download]").forEach(function (el) {
   } else {
     el.addEventListener("click", onDownloadClick);
   }
+});
+
+function loadSiteData() {
+  return fetch("data/site.json", { cache: "no-store" })
+    .then(function (res) {
+      if (!res.ok) throw new Error("site");
+      return res.json();
+    })
+    .then(function (data) {
+      var download = data && data.download;
+      if (!download) return "gitee";
+      var mode = download.mode === "manual" ? "manual" : "gitee";
+      if (download.version && download.windowsUrl) {
+        applyDownloadRelease(download.version, download.windowsUrl, download.fileName);
+      }
+      return mode;
+    })
+    .catch(function () { return "gitee"; });
+}
+
+loadSiteData().then(function (mode) {
+  if (mode !== "manual") refreshDownloadFromGitee();
 });
 document.getElementById("demo-modal-close").addEventListener("click", function () {
   document.getElementById("demo-modal").close();

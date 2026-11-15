@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Token 领取公告 — 星瑶Code</title>
+<meta name="description" content="星瑶Code 收集的免费 Token 领取入口。">
+<meta name="theme-color" content="#faf5f1">
+<link rel="icon" type="image/png" href="assets/xingyao-mark.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #faf5f1;
+  --sheet: #f3ece4;
+  --ink: #1c2a3a;
+  --ink-soft: #3d5166;
+  --blue: #1f6494;
+  --blue-deep: #184f76;
+  --scarf: #c41620;
+  --line: rgba(28, 42, 58, 0.14);
+  --serif: "Noto Serif SC", "Songti SC", "Source Han Serif SC", serif;
+  --sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+* { box-sizing: border-box; }
+html { color-scheme: light; scrollbar-color: var(--ink) var(--paper); }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.75;
+  font-synthesis: none;
+}
+img { display: block; max-width: 100%; height: auto; }
+a { color: var(--blue); text-underline-offset: 0.22em; }
+::selection { background: var(--scarf); color: var(--paper); }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.skip {
+  position: absolute; left: 16px; top: -48px; z-index: 20;
+  padding: 8px 14px; background: var(--ink); color: var(--paper);
+  border-radius: 8px; text-decoration: none;
+}
+.skip:focus { top: 12px; }
+.nav {
+  position: sticky; top: 0; z-index: 10;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+.nav-inner {
+  width: min(1240px, calc(100% - 40px));
+  margin: 0 auto;
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+.brand {
+  display: flex; align-items: flex-end; gap: 10px;
+  color: var(--blue); text-decoration: none;
+}
+.brand img { height: 54px; width: auto; }
+.brand-code {
+  font-weight: 500; font-size: 15px;
+  letter-spacing: 0.08em; padding-bottom: 11px;
+}
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 46px; padding: 0 20px;
+  border: 0; border-radius: 10px;
+  background: transparent; color: var(--ink);
+  font-weight: 600; font-size: 15px;
+  text-decoration: none; cursor: pointer;
+  transition: background-color 180ms var(--ease), transform 180ms var(--ease), color 180ms var(--ease), border-color 180ms var(--ease);
+}
+.btn:hover { transform: translateY(-1px); }
+.btn:active { transform: translateY(1px) scale(0.98); }
+.btn-line {
+  background: var(--paper); color: var(--blue);
+  border: 1px solid var(--blue);
+}
+.btn-line:hover { background: #e7f1f8; color: var(--blue-deep); border-color: var(--blue-deep); }
+.nav .btn { min-height: 40px; padding: 0 16px; }
+.nav-notice { margin-left: auto; }
+.nav-notice[aria-current="page"] {
+  background: var(--blue); color: var(--paper); border-color: var(--blue);
+}
+.nav-notice[aria-current="page"]:hover { background: var(--blue-deep); color: var(--paper); }
+
+.wrap { width: min(860px, calc(100% - 48px)); margin: 0 auto; }
+.board { padding: 48px 0 96px; }
+.board h1 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: clamp(2.1rem, 4vw, 3.2rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  text-wrap: balance;
+}
+.lede { margin: 16px 0 0; max-width: 36em; color: var(--ink-soft); }
+.list { margin: 40px 0 0; padding: 0; list-style: none; }
+.item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px 32px;
+  align-items: center;
+  padding: 26px 0;
+  border-top: 1px solid var(--line);
+}
+.item:last-child { border-bottom: 1px solid var(--line); }
+.item h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.45rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.35;
+}
+.item p { margin: 6px 0 0; color: var(--ink-soft); }
+.item-actions { display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.when {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.empty {
+  margin: 48px 0 0;
+  padding: 28px 0;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+}
+.footer { padding: 36px 0 32px; border-top: 1px solid var(--line); }
+.footer-row {
+  width: min(1120px, calc(100% - 48px));
+  margin: 0 auto;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px 28px;
+}
+.footer-brand {
+  display: flex; align-items: flex-end; gap: 8px;
+  color: var(--ink); text-decoration: none; font-weight: 600;
+}
+.footer-brand img { height: 42px; width: auto; }
+.footer-brand span { font-weight: 500; font-size: 14px; letter-spacing: 0.12em; color: var(--blue); padding-bottom: 8px; }
+.legal {
+  width: min(1120px, calc(100% - 48px));
+  margin: 22px auto 0;
+  color: var(--ink-soft); font-size: 13px; line-height: 1.8;
+}
+.legal a { color: var(--ink-soft); }
+.legal a:hover { color: var(--blue); }
+.disclaimer { margin-top: 8px; }
+.beian-icon { display: inline-block; width: 14px; height: 14px; vertical-align: -2px; margin-right: 4px; }
+@media (max-width: 720px) {
+  .brand img { height: 44px; }
+  .brand-code { padding-bottom: 8px; }
+  .item { grid-template-columns: 1fr; }
+  .board { padding-top: 32px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn { transition: none; }
+  .btn:hover, .btn:active { transform: none; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#board">跳到公告</a>
+<nav class="nav" aria-label="主导航">
+  <div class="nav-inner">
+    <a class="brand" href="index.html" aria-label="星瑶Code 首页">
+      <img src="assets/xingyao-lockup.png" width="400" height="164" alt="星瑶">
+      <span class="brand-code">Code</span>
+    </a>
+    <a class="btn btn-line nav-notice" href="tokens.html" aria-current="page">Token 领取公告</a>
+  </div>
+</nav>
+<main class="board" id="board">
+  <div class="wrap">
+    <h1>Token 领取公告</h1>
+    <p class="lede">这里发布还能领取的免费 Token。点「去领取」打开领取页面；有「领取流程」的，可以先看步骤。额度和规则以对方页面为准。</p>
+    <p class="empty" id="empty" hidden>还没有公告。新的领取入口会列在这里。</p>
+    <ul class="list" id="list"></ul>
+  </div>
+</main>
+<footer class="footer">
+  <div class="footer-row">
+    <a class="footer-brand" href="index.html" aria-label="星瑶Code 首页">
+      <img src="assets/xingyao-lockup.png" width="400" height="164" alt="星瑶">
+      <span>Code</span>
+    </a>
+    <a href="index.html">回到首页</a>
+  </div>
+  <div class="legal">
+    <div>© 2026 星瑶Code · 让代码，回应你的想象。</div>
+    <div>
+      <a href="https://beian.mps.gov.cn/#/query/webSearch?code=11011402057329" target="_blank" rel="noreferrer"><img class="beian-icon" src="assets/beian_gongan.png" alt="">京公网安备11011402057329号</a>
+      <span aria-hidden="true"> · </span>
+      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener">京ICP备2026063481号-1</a>
+    </div>
+    <div class="disclaimer">本站所有内容均由用户与网络公开信息聚合，仅供技术交流学习</div>
+  </div>
+</footer>
+<script>
+/* 公告页优先读 data/site.json（后台保存的已上架公告）。
+   打不开这份文件时，才用下面这份兜底列表。
+*/
+let NOTICES = [
+  {
+    title: "DeepSeek 开放平台",
+    note: "新用户注册后可领取一段 API 体验额度，适合先跑通星瑶的对话和代码任务。",
+    href: "https://platform.deepseek.com/",
+    date: "2026-11-15"
+  },
+  {
+    title: "硅基流动",
+    note: "新账号通常带一笔免费 Token，模型种类多，领取后把密钥填进星瑶即可试用。",
+    href: "https://cloud.siliconflow.cn/",
+    date: "2026-11-12"
+  },
+  {
+    title: "智谱开放平台",
+    note: "GLM 新用户可领体验额度。额度用完后按对方页面的规则续领或充值。",
+    href: "https://open.bigmodel.cn/",
+    date: "2026-11-08"
+  },
+  {
+    title: "阿里云百炼",
+    note: "通义系列有新用户免费额度，控制台里开通后即可复制 API Key。",
+    href: "https://bailian.console.aliyun.com/",
+    date: "2026-11-03"
+  },
+  {
+    title: "Groq",
+    note: "海外可访问。注册后有免费推理额度，速度快，适合试对话和短代码。",
+    href: "https://console.groq.com/",
+    date: "2026-10-28"
+  }
+];
+
+function isClaimLink(href) {
+  return /^https:\/\/\S+$/i.test(String(href || "").trim());
+}
+
+function claimLink(href, label) {
+  var link = document.createElement("a");
+  link.className = "btn btn-line";
+  link.href = String(href).trim();
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = label;
+  return link;
+}
+
+function renderNotices() {
+  var list = document.getElementById("list");
+  var empty = document.getElementById("empty");
+  list.textContent = "";
+  var shown = 0;
+  NOTICES.forEach(function (item) {
+    if (!item || !item.title || !isClaimLink(item.href)) return;
+    var li = document.createElement("li");
+    li.className = "item";
+    var body = document.createElement("div");
+    if (item.date) {
+      var when = document.createElement("span");
+      when.className = "when";
+      when.textContent = item.date;
+      body.appendChild(when);
+    }
+    var title = document.createElement("h2");
+    title.textContent = item.title;
+    var note = document.createElement("p");
+    note.textContent = item.note || "";
+    body.appendChild(title);
+    if (item.note) body.appendChild(note);
+    var actions = document.createElement("div");
+    actions.className = "item-actions";
+    if (isClaimLink(item.guide)) {
+      actions.appendChild(claimLink(item.guide, "领取流程"));
+    }
+    actions.appendChild(claimLink(item.href, "去领取"));
+    li.appendChild(body);
+    li.appendChild(actions);
+    list.appendChild(li);
+    shown += 1;
+  });
+  empty.hidden = shown > 0;
+}
+
+function loadNotices() {
+  return fetch("data/site.json", { cache: "no-store" })
+    .then(function (res) {
+      if (!res.ok) throw new Error("site");
+      return res.json();
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.notices)) return;
+      NOTICES = data.notices.filter(function (item) {
+        return item && item.published !== false && item.title && isClaimLink(item.href);
+      });
+    })
+    .catch(function () {})
+    .then(renderNotices);
+}
+
+loadNotices();
+</script>
+</body>
+</html>
