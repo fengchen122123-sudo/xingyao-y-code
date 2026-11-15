@@ -1,7 +1,5 @@
 # P2：公网只进网关。JWT 和预览令牌由网关核对，Caddy 不再做 basic-auth。
-{
-    email {$ACME_EMAIL}
-}
+# 不填邮箱也能申请证书，只是收不到到期提醒。
 {$SITE_DOMAIN} {
     encode gzip
     log {

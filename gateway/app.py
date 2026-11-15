@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, WebSocket
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from gateway.sessions import SocketTable
+from gateway.sessions import SessionReaper, SocketTable, close_with_4401
 from gateway.ws_agent import open_agent, preview_request
 
 from gateway.auth import (
@@ -21,10 +24,12 @@ from gateway.auth import (
     issue_tokens,
     logout,
     read_access,
+    still_valid,
     token_hash,
 )
 from gateway.db import connect
-from gateway.relay import RelayRegistry
+from gateway.platform_models import PlatformModelStore
+from gateway.relay import OUTBOUND_LIMIT, DeviceSweeper, RelayRegistry
 
 
 class LoginBody(BaseModel):
@@ -44,6 +49,7 @@ class AccountBody(BaseModel):
     username: str
     password: str
     role: str = "user"
+    quota: dict | None = None
 
 
 class PasswordBody(BaseModel):
@@ -58,6 +64,21 @@ class PatchAccount(BaseModel):
     disabled: bool | None = None
     role: str | None = None
     password: str | None = None
+    quota: dict | None = None
+
+
+class ModelBody(BaseModel):
+    name: str
+    base_url: str
+    api_key: str | None = None
+    model_id: str
+    model_name: str
+    litellm_model: str
+
+
+class ModelsBody(BaseModel):
+    providers: list[ModelBody]
+    active_model_id: str = ""
 
 
 def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
@@ -68,8 +89,72 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
     app.state.relay = RelayRegistry()
     app.state.sockets = SocketTable()
     app.state.workers = None
+    app.state.model_store = None
+    app.state.health = lambda _url: {"ok": True, "boot_id": "x"}
     app.state.dial_worker = lambda _account_id: None
     app.state.fetch_preview = lambda request: (200, b"", "image/png")
+    app.state.accounts_root = Path(database_path).parent / "accounts"
+    app.state.keyring_password_file = None
+
+    def socket_valid(item: dict) -> bool:
+        return still_valid(
+            database,
+            item["account_id"],
+            item["jti"],
+            item["auth_epoch"],
+            item["role"],
+        )
+
+    app.state.reaper = SessionReaper(app.state.sockets, socket_valid)
+
+    def publish_relay(account_id: str, device_id: str, frame: dict, app_key: str | None = None) -> None:
+        app.state.relay.publish(account_id, device_id, frame, app_key=app_key)
+
+    def _announce_offline(account_id: str | None, device_id: str) -> None:
+        """踢线/吊销/轮换后主动播一次离线，App 与设备页都不用等 45 秒扫描。"""
+        if not account_id:
+            return
+        publish_relay(
+            account_id,
+            device_id,
+            {"type": "device_status", "data": {"device_id": device_id, "online": False}},
+        )
+
+    # 45 秒无心跳标离线（心跳 15s + 容差）；桌面侧断开立刻由路由自己标，这里兜底。
+    app.state.device_sweeper = DeviceSweeper(app.state.relay, publish_relay)
+
+    def start_reaper() -> None:
+        stop = asyncio.Event()
+        app.state.reaper_stop = stop
+        app.state.reaper_task = asyncio.create_task(app.state.reaper.run(stop))
+        sweep_stop = asyncio.Event()
+        app.state.sweep_stop = sweep_stop
+        app.state.sweep_task = asyncio.create_task(app.state.device_sweeper.run(sweep_stop))
+
+    async def stop_reaper() -> None:
+        stop = getattr(app.state, "reaper_stop", None)
+        if stop is not None:
+            stop.set()
+        task = getattr(app.state, "reaper_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        sweep_stop = getattr(app.state, "sweep_stop", None)
+        if sweep_stop is not None:
+            sweep_stop.set()
+        sweep_task = getattr(app.state, "sweep_task", None)
+        if sweep_task is not None:
+            sweep_task.cancel()
+            try:
+                await sweep_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    app.router.add_event_handler("startup", start_reaper)
+    app.router.add_event_handler("shutdown", stop_reaper)
 
     def principal(authorization: str = Header(default="")) -> Principal:
         if not authorization.lower().startswith("bearer "):
@@ -120,9 +205,9 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         return issue_tokens(database, account, jwt_secret)
 
     @app.post("/api/auth/logout")
-    def do_logout(body: LogoutBody, user: Principal = Depends(principal)):
+    async def do_logout(body: LogoutBody, user: Principal = Depends(principal)):
         logout(database, user, body.refresh_token)
-        app.state.sockets.pop(user.jti, None)
+        await app.state.sockets.pop(user.jti, None)
         return {"ok": True}
 
     @app.get("/api/devices")
@@ -147,29 +232,49 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
     @app.get("/api/admin/accounts")
     def list_accounts(_admin: Principal = Depends(admin)):
         rows = database.execute(
-            "SELECT id, username, role, disabled, auth_epoch, created_at FROM accounts"
+            "SELECT id, username, role, disabled, auth_epoch, quota_json, created_at FROM accounts"
         ).fetchall()
-        return {"accounts": [dict(row) for row in rows]}
+        return {"accounts": [_account_row(row) for row in rows]}
 
     @app.post("/api/admin/accounts")
     def add_account(body: AccountBody, _admin: Principal = Depends(admin)):
         account_id = create_account(database, body.username, body.password, body.role)
+        if body.quota is not None:
+            database.execute(
+                "UPDATE accounts SET quota_json = ? WHERE id = ?",
+                (json.dumps(body.quota, ensure_ascii=False), account_id),
+            )
+            database.commit()
         return {"id": account_id}
 
     @app.patch("/api/admin/accounts/{account_id}")
-    def patch_account(account_id: str, body: PatchAccount, _admin: Principal = Depends(admin)):
-        if body.disabled:
+    async def patch_account(account_id: str, body: PatchAccount, _admin: Principal = Depends(admin)):
+        account = database.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if account is None:
+            raise HTTPException(status_code=404)
+        if body.quota is not None:
+            database.execute(
+                "UPDATE accounts SET quota_json = ? WHERE id = ?",
+                (json.dumps(body.quota, ensure_ascii=False), account_id),
+            )
+            database.commit()
+        if body.disabled is True:
             bump_epoch(database, account_id, disabled=1)
-            app.state.sockets.close_account(account_id)
+            await app.state.sockets.close_account(account_id)
             if app.state.workers is not None:
                 app.state.workers.stop(account_id)
             for device_id, value in list(app.state.relay.devices.items()):
                 if value.get("account_id") == account_id:
-                    app.state.relay.revoke(database, device_id)
-        elif body.role:
+                    # 矩阵只要求「立即 close 4401」，不吊销设备 token。
+                    app.state.relay.disconnect(device_id)
+                    _announce_offline(account_id, device_id)
+        elif body.disabled is False:
+            database.execute("UPDATE accounts SET disabled = 0 WHERE id = ?", (account_id,))
+            database.commit()
+        if body.role and body.role != account["role"]:
             bump_epoch(database, account_id, role=body.role)
-            app.state.sockets.close_account(account_id)
-        elif body.password:
+            await app.state.sockets.close_account(account_id)
+        if body.password:
             from gateway.auth import hash_password
 
             database.execute(
@@ -178,7 +283,7 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
             )
             database.commit()
             bump_epoch(database, account_id)
-            app.state.sockets.close_account(account_id)
+            await app.state.sockets.close_account(account_id)
         return {"ok": True}
 
     @app.post("/api/admin/devices")
@@ -191,7 +296,9 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
 
     @app.delete("/api/admin/devices/{device_id}")
     def delete_device(device_id: str, _admin: Principal = Depends(admin)):
+        account_id = (app.state.relay.devices.get(device_id) or {}).get("account_id")
         app.state.relay.revoke(database, device_id)
+        _announce_offline(account_id, device_id)
         return {"ok": True}
 
     @app.get("/api/admin/devices")
@@ -199,14 +306,115 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         rows = database.execute(
             "SELECT id, account_id, name, revoked, last_seen FROM devices"
         ).fetchall()
-        return {"devices": [dict(row) for row in rows]}
+        return {
+            "devices": [
+                dict(dict(row), online=bool(app.state.relay.devices.get(row["id"], {}).get("online")))
+                for row in rows
+            ]
+        }
 
     @app.get("/api/admin/workers")
     def list_workers(_admin: Principal = Depends(admin)):
-        rows = database.execute(
-            "SELECT account_id, container_name, desired_state, last_activity FROM workers"
+        worker_rows = database.execute(
+            """
+            SELECT account_id, container_name, desired_state, last_activity, started_at,
+                   last_boot_id, version, active_turn, last_error, updated_at
+            FROM workers
+            """
         ).fetchall()
-        return {"workers": [dict(row) for row in rows]}
+        now = time.time()
+        workers = []
+        for row in worker_rows:
+            item = dict(row)
+            item["active_turn"] = bool(item.get("active_turn"))
+            started_at = item.get("started_at")
+            item["uptime_seconds"] = int(max(0.0, now - float(started_at))) if started_at else 0
+            if app.state.workers is not None:
+                item["container_state"] = app.state.workers.container_state(row["account_id"])
+            else:
+                item["container_state"] = "unknown"
+            workers.append(item)
+        return {"workers": workers}
+
+    @app.get("/api/admin/backup")
+    def backup_summary(_admin: Principal = Depends(admin)):
+        from gateway.backup import entry, restore_semantics
+
+        listed = database.execute("PRAGMA database_list").fetchone()
+        gateway_db = Path(listed["file"] or "")
+        accounts_root = app.state.accounts_root or gateway_db.parent / "accounts"
+        return {
+            "entry": entry(database, accounts_root, gateway_db, app.state.keyring_password_file),
+            "restore": restore_semantics(),
+        }
+
+    def model_store() -> PlatformModelStore:
+        if app.state.model_store is None:
+            raise HTTPException(status_code=503, detail="系统凭据存储不可用")
+        return app.state.model_store
+
+    @app.get("/api/admin/models")
+    def list_models(_admin: Principal = Depends(admin)):
+        return model_store().public()
+
+    @app.put("/api/admin/models")
+    def put_models(body: ModelsBody, _admin: Principal = Depends(admin)):
+        store = model_store()
+        if not body.providers:
+            # 空列表表示管理员清空模型：工人 config.json 也要跟着清掉旧 providers。
+            store.save([], "")
+            _stamp_workers()
+            return {"ok": True, "active_model_id": ""}
+        existing = {
+            str(provider.get("id")): provider
+            for provider in (store.references().get("providers") or [])
+            if isinstance(provider, dict)
+        }
+        providers = []
+        seen = set()
+        for item in body.providers:
+            provider_id = item.name.strip().lower().replace(" ", "-") or "provider"
+            seen.add(provider_id)
+            old = existing.get(provider_id) or {}
+            # 没带 api_key 表示沿用旧引用：钥匙串里的 Key 不能因为改个模型名就丢。
+            api_key = item.api_key if item.api_key else str(old.get("api_key") or "")
+            providers.append({
+                "id": provider_id,
+                "name": item.name,
+                "base_url": item.base_url,
+                "api_key": api_key,
+                "protocol": "openai",
+                "models": [{
+                    "id": item.model_id,
+                    "name": item.model_name,
+                    "litellm_model": item.litellm_model,
+                    "context_window": 1000000,
+                    "supports_vision": False,
+                }],
+            })
+        for provider_id, old in existing.items():
+            if provider_id not in seen:
+                providers.append(old)
+        active = body.active_model_id or (providers[0]["models"][0]["id"] if providers else "")
+        store.save(providers, active)
+        _stamp_workers()
+        return {"ok": True, "active_model_id": active}
+
+    def _stamp_workers() -> None:
+        if app.state.workers is None:
+            return
+        for row in database.execute("SELECT id FROM accounts").fetchall():
+            app.state.workers.ensure_token(row["id"])
+
+    @app.post("/api/admin/devices/{device_id}/rotate")
+    def rotate_device(device_id: str, _admin: Principal = Depends(admin)):
+        account_id = (app.state.relay.devices.get(device_id) or {}).get("account_id")
+        token = app.state.relay.rotate(database, device_id)
+        if token is None:
+            raise HTTPException(status_code=404)
+        # 轮换等于把旧桌面踢下线：App 侧也要立刻看到离线，别等 45 秒扫描。
+        _announce_offline(account_id, device_id)
+        return {"id": device_id, "token": token}
 
     @app.post("/api/admin/workers/{account_id}")
     def control_worker(account_id: str, action: str, _admin: Principal = Depends(admin)):
@@ -215,10 +423,16 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         if action == "stop":
             app.state.workers.stop(account_id)
         elif action == "start":
-            app.state.workers.ensure_running(account_id, health=lambda _url: {"ok": True, "boot_id": "x"})
+            result = app.state.workers.ensure_running(account_id, health=app.state.health)
+            if not result.get("ok"):
+                raise HTTPException(status_code=503, detail="worker_lost")
+        elif action == "restart":
+            result = app.state.workers.restart(account_id, health=app.state.health)
+            if not result.get("ok"):
+                raise HTTPException(status_code=503, detail="worker_lost")
         else:
             raise HTTPException(status_code=400)
-        return {"ok": True}
+        return {"ok": True, "desired_state": app.state.workers.desired_state(account_id)}
 
     @app.get("/computer-preview/{preview_token}/{run_id}/{name}")
     def computer_preview(
@@ -264,12 +478,24 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         for frame in opened["client_frames"]:
             await websocket.send_text(json.dumps(frame, ensure_ascii=False))
         if opened["upstream_frame"] is None:
-            app.state.sockets.add(principal_now.account_id, principal_now.jti, websocket.close)
+            app.state.sockets.add(
+                principal_now.account_id,
+                principal_now.jti,
+                close_with_4401(websocket),
+                auth_epoch=principal_now.auth_epoch,
+                role=principal_now.role,
+            )
             await websocket.close()
             return
         link = opened["link"]
         link["sent"].append(opened["upstream_frame"])
-        app.state.sockets.add(principal_now.account_id, principal_now.jti, websocket.close)
+        app.state.sockets.add(
+            principal_now.account_id,
+            principal_now.jti,
+            close_with_4401(websocket),
+            auth_epoch=principal_now.auth_epoch,
+            role=principal_now.role,
+        )
         await _bridge(websocket, link)
 
     @app.websocket("/relay/device")
@@ -280,9 +506,10 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         except Exception:
             await websocket.close(code=4401)
             return
+        device_id = str(first.get("device_id") or "")
         result = app.state.relay.register(
             database,
-            str(first.get("device_id") or ""),
+            device_id,
             str(first.get("token") or ""),
             str(first.get("boot_id") or ""),
         )
@@ -300,30 +527,81 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         def closer() -> None:
             loop.call_soon_threadsafe(stop.set)
 
-        app.state.relay.devices[device_id]["connection"] = closer
+        # 出站 500 条有界队列：满则丢帧并要求 App 整态自愈，绝不阻塞事件循环。
+        outgoing: asyncio.Queue = asyncio.Queue(maxsize=OUTBOUND_LIMIT)
+
+        def send_raw(text: str) -> bool:
+            def put() -> None:
+                try:
+                    outgoing.put_nowait(text)
+                except asyncio.QueueFull:
+                    lost = app.state.relay.enqueue(device_id)
+                    if lost is not None:
+                        publish_relay(account_id, device_id, lost)
+
+            loop.call_soon_threadsafe(put)
+            return True
+
+        device = app.state.relay.devices[device_id]
+        device["connection"] = closer
+        device["send"] = send_raw
         await websocket.send_text(json.dumps(result["registered"], ensure_ascii=False))
+        if result.get("reset"):
+            # GUI 重启换了 boot_id：先让已连上的 App 重置水位，再播在线。
+            publish_relay(account_id, device_id, result["reset"])
         if result.get("online"):
-            app.state.relay.publish(account_id, device_id, result["online"])
-        while not stop.is_set():
-            receive = asyncio.create_task(websocket.receive_text())
-            kicked_wait = asyncio.create_task(stop.wait())
-            done, pending = await asyncio.wait(
-                {receive, kicked_wait},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            if stop.is_set():
-                await websocket.close(code=4401)
-                return
-            try:
-                raw = receive.result()
-            except Exception:
-                return
-            frame = json.loads(raw)
-            if frame.get("type") == "ping":
-                app.state.relay.touch(device_id, time.time())
-                await websocket.send_text(json.dumps({"type": "pong"}))
+            publish_relay(account_id, device_id, result["online"])
+        try:
+            while not stop.is_set():
+                receive = asyncio.create_task(websocket.receive_text())
+                kicked_wait = asyncio.create_task(stop.wait())
+                from_phone = asyncio.create_task(outgoing.get())
+                done, pending = await asyncio.wait(
+                    {receive, kicked_wait, from_phone},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                if stop.is_set():
+                    await websocket.close(code=4401)
+                    return
+                if from_phone in done:
+                    await websocket.send_text(from_phone.result())
+                    continue
+                try:
+                    raw = receive.result()
+                except Exception:
+                    return
+                frame = json.loads(raw)
+                if frame.get("type") == "ping":
+                    app.state.relay.touch(device_id, time.time())
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                    continue
+                if frame.get("type") == "relay_lost":
+                    # 桌面出站队列满丢过帧：这段补不回来，只能让 App 整态自愈。
+                    lost = app.state.relay.enqueue(device_id)
+                    if lost is not None:
+                        publish_relay(account_id, device_id, lost)
+                    continue
+                seq = frame.get("seq")
+                if isinstance(seq, int):
+                    app.state.relay.remember(device_id, seq, raw)
+                route = app.state.relay.resolve_rpc(device_id, frame.get("id"))
+                if route is not None:
+                    # RPC 回程定向回原 App，并把网关加的前缀还原成 App 自己的 id。
+                    app_key, original = route
+                    reply = dict(frame)
+                    reply["id"] = original
+                    publish_relay(account_id, device_id, reply, app_key=app_key)
+                    continue
+                publish_relay(account_id, device_id, frame)
+        finally:
+            current = app.state.relay.devices.get(device_id) or {}
+            if current.get("send") is send_raw:
+                # 只有这条连接还占着设备时才标离线：新一代连接已接手就不能打掉它。
+                offline = app.state.relay.mark_offline(device_id)
+                if offline is not None:
+                    publish_relay(account_id, device_id, offline)
 
     @app.websocket("/relay/client")
     async def relay_client(websocket: WebSocket):
@@ -335,17 +613,41 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
             return
         user = read_access(database, str(first.get("jwt") or ""), jwt_secret)
         device_id = str(first.get("device_id") or "")
-        row = database.execute("SELECT account_id FROM devices WHERE id = ?", (device_id,)).fetchone()
-        if user is None or row is None or row["account_id"] != user.account_id:
+        row = database.execute(
+            "SELECT account_id, revoked FROM devices WHERE id = ?", (device_id,)
+        ).fetchone()
+        if user is None or row is None or row["account_id"] != user.account_id or int(row["revoked"]):
             await websocket.close(code=4401)
             return
         attached = app.state.relay.attach_app(device_id, user.jti)
         if not attached.get("ok"):
             await websocket.close(code=4401)
             return
-        plan = app.state.relay.frames_for(device_id, first.get("last_seq"), first.get("last_boot_id"))
-        await websocket.send_text(json.dumps(plan, ensure_ascii=False))
-        await _fanout(websocket, app.state.relay, user.account_id, device_id)
+        app_key = attached["key"]
+        try:
+            plan = app.state.relay.frames_for(device_id, first.get("last_seq"), first.get("last_boot_id"))
+            await websocket.send_text(json.dumps(plan, ensure_ascii=False))
+
+            def forward(raw: str) -> bool | dict:
+                send = (app.state.relay.devices.get(device_id) or {}).get("send")
+                if not callable(send):
+                    # 在途 RPC 由网关立即报错并带上 id，App 不用等到 30 秒超时。
+                    return _offline_reply(raw)
+                frame = _namespace_rpc(app.state.relay, device_id, app_key, raw)
+                send(json.dumps(frame, ensure_ascii=False) if frame is not None else raw)
+                return True
+
+            await _fanout(
+                websocket,
+                app.state.relay,
+                user.account_id,
+                device_id,
+                on_text=forward,
+                app_key=app_key,
+            )
+        finally:
+            # 断开/登出都要释放名额，否则名额泄漏会把第 5 个 App 误判成超限。
+            app.state.relay.detach_app(device_id, app_key)
 
     @app.websocket("/ws/admin")
     async def admin_socket(websocket: WebSocket):
@@ -381,14 +683,25 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
     def usage(_admin: Principal = Depends(admin)):
         rows = database.execute(
             """
-            SELECT account_id, day, model, input_tokens, output_tokens, turns
-            FROM usage_daily ORDER BY day, account_id, model
+            SELECT d.account_id, a.username, d.day, d.model, d.input_tokens, d.output_tokens, d.turns
+            FROM usage_daily AS d LEFT JOIN accounts AS a ON a.id = d.account_id
+            ORDER BY d.day, d.account_id, d.model
             """
         ).fetchall()
         return {"usage": [dict(row) for row in rows]}
 
     app.state.init_admin = lambda username, password: init_admin(database, username, password)
     return app
+
+
+def _account_row(row) -> dict:
+    item = dict(row)
+    try:
+        quota = json.loads(item.pop("quota_json", "{}") or "{}")
+    except json.JSONDecodeError:
+        quota = {}
+    item["quota"] = quota if isinstance(quota, dict) else {}
+    return item
 
 
 async def _bridge(websocket: WebSocket, link: dict) -> None:
@@ -420,14 +733,21 @@ async def _bridge(websocket: WebSocket, link: dict) -> None:
         task.cancel()
 
 
-async def _fanout(websocket: WebSocket, relay, account_id: str, device_id: str | None) -> None:
+async def _fanout(
+    websocket: WebSocket,
+    relay,
+    account_id: str,
+    device_id: str | None,
+    on_text=None,
+    app_key: str | None = None,
+) -> None:
     loop = asyncio.get_running_loop()
     pending_frames: asyncio.Queue = asyncio.Queue()
 
     def send(frame: dict) -> None:
         loop.call_soon_threadsafe(pending_frames.put_nowait, frame)
 
-    item = relay.listen(account_id, device_id, send)
+    item = relay.listen(account_id, device_id, send, app_key=app_key)
     try:
         while True:
             receive = asyncio.create_task(websocket.receive_text())
@@ -442,17 +762,104 @@ async def _fanout(websocket: WebSocket, relay, account_id: str, device_id: str |
                 await websocket.send_text(json.dumps(incoming.result(), ensure_ascii=False))
                 continue
             try:
-                receive.result()
+                raw = receive.result()
             except Exception:
                 return
+            if on_text is not None:
+                handled = on_text(raw)
+                if handled is False:
+                    await websocket.send_text(json.dumps({"error": "device_offline"}))
+                elif isinstance(handled, dict):
+                    await websocket.send_text(json.dumps(handled, ensure_ascii=False))
     finally:
         relay.unlisten(item)
 
 
+def _namespace_rpc(relay, device_id: str, app_key: str, raw: str) -> dict | None:
+    """只改传输层的 id：两个 App 各自的 id=1 不串，method/args 原样透传。"""
+    try:
+        frame = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(frame, dict) or "id" not in frame:
+        return None
+    frame["id"] = relay.namespace_rpc(device_id, app_key, frame["id"])
+    return frame
+
+
+def _offline_reply(raw: str) -> bool | dict:
+    """设备不在线：带 id 的 RPC 立刻回 device_offline，App 不必等超时。"""
+    try:
+        frame = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(frame, dict):
+        return False
+    return {"id": frame.get("id"), "error": "device_offline"}
+
+
+def _web_file(root: Path, relative: str) -> Path | None:
+    """只认打包目录内真实存在的文件；逃出目录或不存在都当没有。"""
+    if not relative:
+        return None
+    try:
+        candidate = (root / relative).resolve()
+        candidate.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def mount_web(app: FastAPI, directory: Path | None) -> None:
+    """把打包后的网页挂到根路径。目录里没有首页时保持只有接口。"""
+    if directory is None:
+        return
+    root = Path(directory)
+    index = root / "index.html"
+    if not index.is_file():
+        return
+    assets = root / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets), name="web-assets")
+
+    @app.get("/", include_in_schema=False)
+    def web_index():
+        return FileResponse(index)
+
+    @app.get("/{front_path:path}", include_in_schema=False)
+    def web_route(front_path: str):
+        """前端深链回首页：真实文件优先，接口与打包资源不动，带扩展名的缺文件仍 404。"""
+        if front_path.split("/", 1)[0] in {"api", "assets"}:
+            raise HTTPException(status_code=404)
+        real = _web_file(root, front_path)
+        if real is not None:
+            return FileResponse(real)
+        if PurePosixPath(front_path).suffix:
+            # /assets/xxx.js 已经挂了静态目录，这里只剩真的缺文件，不能拿首页冒充。
+            raise HTTPException(status_code=404)
+        return FileResponse(index)
+
+
 def app_from_env():
     from gateway.config import GatewayConfig
+    from gateway.runtime import attach_runtime
 
     config = GatewayConfig.from_env()
     if not config.jwt_secret:
         raise RuntimeError("缺少 XINGYAO_JWT_SECRET")
-    return create_app(config.database, config.jwt_secret)
+    app = create_app(config.database, config.jwt_secret)
+    try:
+        import keyring
+        from core.serve.keyring_setup import install_server_keyring
+    except ImportError as error:  # pragma: no cover - 依赖缺失时直接说清楚
+        raise RuntimeError(f"缺少共享钥匙串依赖：{error}") from error
+    password_file = Path(os.environ.get("XINGYAO_KEYRING_PASSWORD_FILE", "") or "")
+    if not password_file.is_file():
+        # 没有口令就不能悄悄退回系统凭据：部署时必须注入 secret 文件。
+        raise RuntimeError("缺少钥匙串口令：请用 secret 注入 XINGYAO_KEYRING_PASSWORD_FILE")
+    if not install_server_keyring(config.data_dir, password_file):
+        raise RuntimeError("钥匙串口令为空或不可用：请检查 XINGYAO_KEYRING_PASSWORD_FILE")
+    app.state.model_store = PlatformModelStore(app.state.database, keyring)
+    attach_runtime(app, config)
+    mount_web(app, config.web_dist)
+    return app

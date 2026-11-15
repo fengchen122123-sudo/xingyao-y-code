@@ -25,7 +25,7 @@
 | R3 | Linux 服务器 Personal Agent + 专属极简 Web 前端 | `--serve` 无窗口常驻 + 新响应式 SPA，Docker + Caddy 部署 |
 | R4 | 安卓 App（Muse/Today 风格） | Capacitor 包装同一套 SPA，直连服务器 |
 | R5 | App 内「我的电脑」 | 手机 → 服务器 → 用户 Windows 上运行中的星瑶 GUI；桌面持设备 token 主动外连注册，服务器纯转发 |
-| R6 | 账号登录 + 对话隔离 | 每账号独立数据 / 会话 / 记忆 / 模型 Key，一账号一容器。受邀者各自填写自己的 Key，不复制主人的 Key |
+| R6 | 账号登录 + 对话隔离 | 每账号独立数据 / 会话 / 记忆，一账号一容器。模型 Key 由管理员统一提供（网关钥匙串存一份，工人只拿引用），受邀者不自备 Key |
 | R7 | 后台管理系统 | 账号管理、设备管理、worker 状态、用量查看 |
 
 ### 1.3 信任模型假设（全设计的前提）
@@ -559,7 +559,7 @@ flowchart LR
 2. **P1a1 浏览器链**：先做连接级 `turn_source=server`（M08）。没做之前，浏览器能力会被打成 `lan` 然后恒拒。然后做工厂与 chromium 白名单（M06），再做空配置默认只开 browser、server preflight 不要求热键（M07），然后 headless 点击/截图、preview、同源取图、SIGTERM 后按进程组清理 Chromium。
 3. **P1b Web**：P1a1 通过之后才做 `/chat`、`/approvals`、围观面板，并改两个既有 shim。页面进度不能代替 P1a0/P1a1。
 4. 部署按第 10.2 节的 Caddy 与 Dockerfile。预览由 Caddy 验权后注入 worker token。P1 的 WS 直连仍会让页面持有 worker token，这是写明的例外，不是「浏览器拿不到」。
-5. server 档默认权限已经定为 `ask`（第 9 节）。P1 出口做 Key/keyring 最小备份恢复。S13 用量留到 P2。
+5. server 档默认权限已经定为 `full`（第 9 节），网关写工人 `config.json` 时直接落 `permission_mode=full`。P1 出口做 Key/keyring 最小备份恢复。S13 用量留到 P2。
 
 验收标准：
 - P1a0：空卷启动后进程不因 import 退出；`GET /health` 得到 `{"ok":true,"boot_id":"..."}`；测试客户端能收到一条无窗口广播；没有 WS 客户端时权限请求立即拒绝且只结算一次；`ss` 或等价命令看不到 8765。Windows 对照第 10.6 节无新增失败。
@@ -627,8 +627,8 @@ flowchart LR
 
 这些原来是开放项。r3 直接定死，避免 P2 开工时再分叉。若产品主人要改，改完再动工，不要边做边改。
 
-1. **模型 Key：各填各的。** 开通账号不复制主人的 Key。受邀者在自己的设置页写入自己的 Key，进自己的 keyring 文件。用量记在该账号上。主人不想让对方自备 Key 时，由主人把 Key 粘进对方账号，这是一次人工复制，不是平台的共享密钥功能。
-2. **server 档默认权限：`ask`。** Web 上审批。会话级可以切到 `full`，全局档位仍被 `dispatch_rpc` 拒绝。
+1. **模型 Key：管理员统一提供。** 开通账号不要求受邀者自备 Key。管理员在管理页写入一份模型 Key，加密存进网关钥匙串，工人 `config.json` 只拿引用（`gateway/workers.py` 的 `_write_worker_config` 把平台 provider 投影下去，Key 引用原样传递）。用量记在各自账号上，谁用的算谁的；账号卷与镜像里没有明文 Key。
+2. **server 档默认权限：`full`。** 网关写工人 config 时直接落 `permission_mode=full`（`gateway/workers.py:237`），远程回合按会话档位执行，不再逐条等 Web 审批。审批 UI 与 `core/serve/permission_policy.py` 保留：会话级档位被调低、或离线/超时场景仍走确认与自动拒绝。全局档位仍被 `dispatch_rpc` 黑名单拦（第 6 节 54 项不变）。
 3. **tokenrhythm**：server 档禁用。以后要开，再用 keyring 文件存会话，不在 P1 做。
 4. **鉴权位置**：网关的 REST 用 `Authorization` 头；网关的 WS 全部首帧，长期 token 和 JWT 不进 URL。唯一例外是 P1 直连 worker 的 `?token=`，P2 删除。日志规则见 10.2。
 5. **截图带宽**：P1 只记录真实 PNG 大小。P3 开工前再决定要不要降采样。首版保持 PNG。
@@ -771,7 +771,7 @@ GUI 至少覆盖：启动到窗口出现、新建会话、发送一条消息并�
 
 ### 10.9 仍要产品主人点头的唯一变更
 
-第 9 节已经按推荐项写死。若主人不同意「受邀者自备 Key」或「默认 ask」，只改第 9 节对应两条和设置默认值，其它契约不用重开。
+第 9 节已按产品主人拍板的结论写死：模型 Key 由管理员统一提供，server 档默认 `full`。这两条不再是待点头项；要改回去才需要重开第 9 节对应两条和设置默认值，其它契约不用动。
 
 ### 10.10 引用修正
 

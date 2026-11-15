@@ -6,10 +6,14 @@ Requires=docker.service
 [Service]
 Type=simple
 User=xingyao
-Environment=XINGYAO_GATEWAY_DIR=/srv/xingyao/gateway
-Environment=XINGYAO_ACCOUNTS_ROOT=/srv/xingyao/accounts
+Environment=XINGYAO_GATEWAY_DIR=/srv/xingyao-state/gateway
+Environment=XINGYAO_ACCOUNTS_ROOT=/srv/xingyao-state/accounts
+Environment=XINGYAO_WORKER_KEYRING_SOURCE=/srv/xingyao-state/gateway/keyring
 Environment=TZ=Asia/Shanghai
-ExecStart=/opt/xingyao/venv/bin/uvicorn gateway.app:app_from_env --factory --host 127.0.0.1 --port 8080
+# 钥匙串口令只经 systemd 凭据传入（chmod 0400 的 root-only 文件），不写进 unit。
+LoadCredential=keyring_password:/etc/xingyao/keyring_password
+Environment=XINGYAO_KEYRING_PASSWORD_FILE=%d/keyring_password
+ExecStart=/opt/xingyao/venv/bin/uvicorn gateway.app:app_from_env --factory --host 127.0.0.1 --port 18080
 Restart=on-failure
 
 [Install]

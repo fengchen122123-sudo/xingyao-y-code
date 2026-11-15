@@ -80,6 +80,24 @@ def test_outbound_queue_does_not_block_when_full():
     assert client.outbound.qsize() == OUTBOUND_LIMIT
 
 
+def test_online_events_are_sent_and_reconnect_does_not_duplicate_replay():
+    sent = []
+    client = CloudRelayClient(send=sent.append, boot_id="boot")
+    client.submit("notice", {"message": "first"})
+    client.flush()
+    assert len(sent) == 1
+
+    client.submit("notice", {"message": "while-online"})
+    client.flush()
+    assert len(sent) == 2
+
+    client.handle_registered({"data": {"connection_generation": 2}})
+    client.flush()
+    assert len(sent) == 3
+    assert client.connected is True
+    assert client.outbound.qsize() == 0
+
+
 def test_new_registration_kicks_the_previous_connection(tmp_path):
     database = connect(tmp_path / "gateway.db")
     registry = RelayRegistry()

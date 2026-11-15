@@ -333,6 +333,8 @@ def test_resolve_component_url_uses_release_asset(component_env, monkeypatch):
     import core.updater
 
     monkeypatch.delenv("YCODE_PLAYWRIGHT_COMPONENT_URL", raising=False)
+    # 单测不能依赖线上 Release：先隔离完整 Release 拉取，再验证摊平字段回退。
+    monkeypatch.setattr(components, "_fetch_latest_release_entry", lambda: {})
     monkeypatch.setattr(
         core.updater,
         "fetch_latest_release",
@@ -352,6 +354,7 @@ def test_resolve_component_url_raises_when_no_asset(component_env, monkeypatch):
     import core.updater
 
     monkeypatch.delenv("YCODE_PLAYWRIGHT_COMPONENT_URL", raising=False)
+    monkeypatch.setattr(components, "_fetch_latest_release_entry", lambda: {})
     monkeypatch.setattr(
         core.updater,
         "fetch_latest_release",

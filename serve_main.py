@@ -85,6 +85,13 @@ def _start_computer_runtime():
 
 def main() -> int:
     os.environ["YCODE_TOOL_PROFILE"] = "server"
+    # 配置模块在导入时就会解密模型 Key；钥匙串必须先于任何配置读取完成安装。
+    try:
+        from core.serve.keyring_setup import install_server_keyring
+
+        install_server_keyring(_data_dir())
+    except Exception:
+        pass
     _configure_logging()
     logger.info("serve 进程启动 pid=%s", os.getpid())
     _audit_config_or_exit()
@@ -113,14 +120,6 @@ def main() -> int:
         from gui_bridge import ApiBridge
         from core.lan_server import PROCESS_BOOT_ID, LanServer
         from core.serve.permission_policy import install_serve_permission_policy
-
-        try:
-            from core.serve.keyring_setup import install_server_keyring
-
-            if not install_server_keyring(_data_dir()):
-                logger.info("未配置钥匙串口令文件，模型 Key 暂不能加密落盘")
-        except Exception:
-            logger.exception("安装文件钥匙串失败")
 
         api = ApiBridge(mcp_manager=mcp_manager)
         bind, port = _listen_endpoint()

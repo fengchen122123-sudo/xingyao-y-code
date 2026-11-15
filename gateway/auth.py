@@ -108,6 +108,36 @@ def read_access(database, token: str, secret: str, now: int | None = None) -> Pr
     )
 
 
+def still_valid(
+    database,
+    account_id: str,
+    jti: str,
+    auth_epoch: int | None,
+    role: str,
+    now: int | None = None,
+) -> bool:
+    """连接建立之后账号又变了没有。reaper 每条连接逐次调用它。"""
+    now = int(time.time() if now is None else now)
+    account = database.execute(
+        "SELECT role, disabled, auth_epoch FROM accounts WHERE id = ?",
+        (account_id,),
+    ).fetchone()
+    if account is None or int(account["disabled"]):
+        return False
+    if role and account["role"] != role:
+        return False
+    if auth_epoch is not None and int(account["auth_epoch"]) != int(auth_epoch):
+        return False
+    if jti:
+        denied = database.execute(
+            "SELECT 1 FROM access_denylist WHERE jti = ? AND expires_at > ?",
+            (jti, now),
+        ).fetchone()
+        if denied:
+            return False
+    return True
+
+
 def logout(database, principal: Principal, refresh_token: str, now: int | None = None) -> None:
     """登出只废这一枚 refresh 和这一枚 access，不增加 auth_epoch。"""
     now = int(time.time() if now is None else now)

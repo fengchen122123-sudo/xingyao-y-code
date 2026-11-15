@@ -6,6 +6,7 @@ import ApprovalsView from "./views/ApprovalsView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import AdminLayout from "./admin/AdminLayout.vue";
 import AccountsView from "./admin/AccountsView.vue";
+import ModelsView from "./admin/ModelsView.vue";
 import DevicesView from "./admin/DevicesView.vue";
 import WorkersView from "./admin/WorkersView.vue";
 import UsageView from "./admin/UsageView.vue";
@@ -24,6 +25,7 @@ const router = createRouter({
       children: [
         { path: "", redirect: "/admin/accounts" },
         { path: "accounts", component: AccountsView },
+        { path: "models", component: ModelsView },
         { path: "devices", component: DevicesView },
         { path: "workers", component: WorkersView },
         { path: "usage", component: UsageView },

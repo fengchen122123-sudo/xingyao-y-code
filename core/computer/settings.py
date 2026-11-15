@@ -25,6 +25,10 @@ BROWSER_CONTROL_CONFIG_KEY = "browser_control_enabled"
 COMPUTER_CONTROL_CONFIG_KEY = "computer_control_enabled"
 COMPUTER_BROWSER_CONFIG_KEY = "computer_browser"
 DEFAULT_COMPUTER_BROWSER = "edge"
+# serve 档（容器/无窗口）的配置缺省：只认 Playwright 自带 headless chromium。
+# 桌面默认 edge 在容器里没有安装位置，内嵌 WebView2 也不存在，因此 serve 的
+# 缺省值必须是 chromium（设计 M07「从空 config.json 验收」）。
+DEFAULT_SERVER_BROWSER = "chromium"
 
 # 进程内内存设置 generation：任何成功写入的设置变更都递增；
 # 关闭开关的路径固定为「先持久化 false → 递增 generation → 返回快照」，
@@ -119,13 +123,14 @@ def _read_bool(data: dict, key: str) -> bool:
 
 def _read_browser(data: dict) -> str:
     if COMPUTER_BROWSER_CONFIG_KEY not in data:
+        # serve 档优先于 GUI 注入的进程默认值：无窗口进程里 embedded/edge 都
+        # 不可用，缺省必须是 chromium（M07「从空 config.json 验收」）。
+        if _server_profile():
+            return DEFAULT_SERVER_BROWSER
         # 配置缺省：GUI 进程注入的默认值优先（embedded）。
         # Windows 否则仍是 edge；Linux 回落到 chromium。
         if _process_default_browser:
             return _process_default_browser
-        # 桌面缺省仍是 edge。只有 serve 档在非 Windows 上改用 chromium。
-        if _server_profile() and sys.platform != "win32":
-            return "chromium"
         return DEFAULT_COMPUTER_BROWSER
     value = data[COMPUTER_BROWSER_CONFIG_KEY]
     if type(value) is not str or value not in _BROWSER_DEFINITIONS:
@@ -172,7 +177,11 @@ def _detect_browser(browser: str, platform: str) -> BrowserOption:
 
 def list_browser_options(*, platform: str | None = None) -> tuple[BrowserOption, ...]:
     platform = platform or sys.platform
-    return tuple(_detect_browser(browser, platform) for browser in _BROWSER_DEFINITIONS)
+    names = ["edge", "chrome", "embedded"]
+    # chromium 是 serve 档的 headless 选择，不混入桌面 GUI 的浏览器下拉框。
+    if _server_profile() or platform != "win32":
+        names.append("chromium")
+    return tuple(_detect_browser(browser, platform) for browser in names)
 
 
 def get_browser_profile_dir(browser: str) -> Path:

@@ -20,7 +20,11 @@ ENV TZ=Asia/Shanghai \
     YCODE_TOOL_PROFILE=server \
     YCODE_SERVE_BIND=0.0.0.0 \
     YCODE_SERVE_PORT=8766 \
-    HOME=/data/home
+    HOME=/data/home \
+    YCODE_KEYRING_FILE=/run/keyring/crypted_pass.cfg \
+    YCODE_KEYRING_PASSWORD_FILE=/run/secrets/keyring_password \
+    YCODE_KEYRING_READ_ONLY=1
 
 EXPOSE 8766
-CMD ["python", "gui_main.py", "--serve"]
+# 先解锁共享钥匙串（只读挂载网关的 crypted_pass.cfg），失败就别起服务。
+CMD ["sh", "-c", "python -m gateway.worker_bootstrap && exec python gui_main.py --serve"]

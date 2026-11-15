@@ -177,3 +177,91 @@ def test_password_change_bumps_epoch_without_touching_device_tokens(tmp_path):
     device = database.execute("SELECT revoked FROM devices").fetchone()
     assert int(device["revoked"]) == 0
     assert read_access(database, issue_tokens(database, account, "jwt-secret-jwt-secret-jwt-secret")["access_token"], "jwt-secret-jwt-secret-jwt-secret") is None
+
+
+def test_socket_table_awaits_real_async_websocket_close():
+    import asyncio
+
+    from gateway.sessions import SocketTable
+
+    async def scenario():
+        table = SocketTable()
+        closed = []
+
+        async def close():
+            await asyncio.sleep(0)
+            closed.append("closed")
+
+        table.add("account", "jti", close)
+        assert await table.close_jti("jti") == 1
+        assert closed == ["closed"]
+
+        table.add("account", "jti-2", close)
+        assert await table.close_account("account") == 1
+        assert closed == ["closed", "closed"]
+
+    asyncio.run(scenario())
+
+
+def test_web_root_serves_the_page_and_keeps_the_api(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from gateway.app import create_app, mount_web
+
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><title>星瑶</title>", encoding="utf-8")
+    (dist / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
+    app = create_app(tmp_path / "gateway.db", "jwt-secret-jwt-secret-jwt-secret")
+    mount_web(app, dist)
+    mount_web(app, tmp_path / "missing")
+    client = TestClient(app)
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "星瑶" in page.text
+    assert client.get("/assets/app.js").status_code == 200
+    assert client.get("/health").json()["ok"] is True
+    # 非接口路径由前端路由接走（见下一个用例），接口本身仍是 404。
+    assert client.get("/api/no-such-endpoint").status_code == 404
+
+
+def test_web_deep_link_falls_back_to_index_without_swallowing_api(tmp_path):
+    """SPA 深链回 index；/api、/assets、带扩展名的缺文件维持原样，穿越不外泄。"""
+    from fastapi.testclient import TestClient
+
+    from gateway.app import create_app, mount_web
+
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><title>深链首页</title>", encoding="utf-8")
+    (dist / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
+    (dist / "robots.txt").write_text("User-agent: *\n", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("TOP-SECRET-OUTSIDE-DIST", encoding="utf-8")
+
+    app = create_app(tmp_path / "gateway.db", "jwt-secret-jwt-secret-jwt-secret")
+    mount_web(app, dist)
+    client = TestClient(app)
+
+    for path in ("/login", "/approvals", "/chat", "/settings", "/admin/accounts"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert "深链首页" in response.text, path
+
+    # 真实文件优先：dist 根下的静态文件与打包资源照旧。
+    assert "User-agent" in client.get("/robots.txt").text
+    assert client.get("/assets/app.js").text == "console.log(1)"
+
+    # 接口和打包资源不能被回退吞掉。
+    assert client.get("/api/nope").status_code == 404
+    assert client.get("/api/admin/nope").status_code == 404
+    assert client.get("/assets/missing.js").status_code == 404
+    assert client.get("/missing.js").status_code == 404
+
+    # 路径穿越不返回 dist 之外的文件。
+    for path in ("/%2e%2e/secret.txt", "/../../secret.txt", "/assets/%2e%2e/%2e%2e/secret.txt"):
+        response = client.get(path)
+        assert "TOP-SECRET-OUTSIDE-DIST" not in response.text, path
+        assert "root:" not in response.text, path
+
+    # API 本身不受影响。
+    assert client.get("/health").json()["ok"] is True

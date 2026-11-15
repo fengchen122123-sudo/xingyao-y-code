@@ -151,13 +151,21 @@ def _show_file_diff(
 def _get_imom_active_publish_root():
     """Read the active imom publish root using the established on-disk format."""
     try:
+        candidates = []
         env_dir = os.environ.get("YCODE_DATA_DIR")
         if env_dir and str(env_dir).strip():
-            store_file = os.path.join(env_dir, "imom_projects.json")
-        else:
-            store_file = os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json")
-        with open(store_file, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+            candidates.append(os.path.join(env_dir, "imom_projects.json"))
+        # 数据目录可能只是全局默认值；测试/隔离环境里项目清单仍在 ~/.ycode。
+        candidates.append(os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json"))
+        data = None
+        for store_file in candidates:
+            if not os.path.isfile(store_file):
+                continue
+            with open(store_file, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            break
+        if data is None:
+            return ""
         active = data.get("active")
         projects = data.get("projects", {})
         if active and active in projects:

@@ -17,15 +17,18 @@ class GatewayConfig:
     idle_seconds: int = 30 * 60
     health_timeout_seconds: int = 60
     accounts_root: Path | None = None
+    web_dist: Path | None = None
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
         root = Path(os.environ.get("XINGYAO_GATEWAY_DIR", "/srv/xingyao/gateway"))
         secret = os.environ.get("XINGYAO_JWT_SECRET", "")
         accounts = os.environ.get("XINGYAO_ACCOUNTS_ROOT", "/srv/xingyao/accounts")
+        web = os.environ.get("XINGYAO_WEB_DIST", "/srv/xingyao/web/dist")
         return cls(
             data_dir=root,
             database=root / "gateway.db",
             jwt_secret=secret,
             accounts_root=Path(accounts),
+            web_dist=Path(web) if web else None,
         )

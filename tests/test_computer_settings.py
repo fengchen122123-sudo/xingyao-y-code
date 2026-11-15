@@ -103,7 +103,6 @@ def test_snapshot_exposes_static_fields_without_runtime_state(tmp_path, monkeypa
     assert {option.browser for option in snapshot.browser_options} == {
         "edge",
         "chrome",
-        "chromium",
         "embedded",
     }
     assert isinstance(snapshot.profile_display_path, str)

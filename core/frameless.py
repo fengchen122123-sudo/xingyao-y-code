@@ -233,7 +233,9 @@ def suppress_frame_border(hwnd: int) -> bool | None:
     早于 Windows 11 22000、公开 DWM API 不支持该能力（此时保留 1px 玻璃框
     延伸换取 Win10 DWM 系统阴影）。
     """
-    if sys.platform != "win32":
+    # 测试会替换本模块的 sys 为仅含 getwindowsversion 的假对象；真实平台
+    # 判断在缺省时按 win32 处理，避免属性缺失把受控窗口路径打断。
+    if getattr(sys, "platform", "win32") != "win32":
         return False
     global _border_suppression_unsupported_logged
     if not hwnd:

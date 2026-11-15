@@ -1,37 +1,44 @@
-# P2。worker 由网关按账号创建，不在这里写死，也不把 8766 发布到宿主机。
+# 不使用域名。网关只绑在服务器本机 18080，电脑通过 SSH 隧道访问。
+# 18888 已是 New API，80/443/8080 也已有服务，这里不占用。
+# 工人容器由网关按账号创建，不在这里写死，也不把 8766 发布到宿主机。
+#
+# 钥匙串口令只走 secret，不进环境变量明文：
+#   echo '强口令' > /etc/xingyao/keyring_password && chmod 0400 /etc/xingyao/keyring_password
+#   XINGYAO_KEYRING_PASSWORD_FILE=/etc/xingyao/keyring_password docker compose up -d
 services:
   gateway:
-    image: python:3.12-slim
+    build: ../gateway
+    image: xingyao-gateway:local
     networks: [xingyao]
     working_dir: /srv/xingyao
     command: python -m uvicorn gateway.app:app_from_env --factory --host 0.0.0.0 --port 8080
     environment:
       TZ: Asia/Shanghai
       XINGYAO_JWT_SECRET: ${XINGYAO_JWT_SECRET}
-      XINGYAO_GATEWAY_DIR: /srv/xingyao/gateway
-      XINGYAO_ACCOUNTS_ROOT: /srv/xingyao/accounts
+      XINGYAO_GATEWAY_DIR: /srv/xingyao-state/gateway
+      XINGYAO_ACCOUNTS_ROOT: /srv/xingyao-state/accounts
+      XINGYAO_KEYRING_PASSWORD_FILE: /run/secrets/keyring_password
+      XINGYAO_WORKER_KEYRING_SOURCE: xingyao-keyring
+    secrets:
+      - source: keyring_password
+        mode: 0400
+    ports:
+      - "127.0.0.1:18080:8080"
     volumes:
       - ..:/srv/xingyao
-      - gateway-data:/srv/xingyao/gateway
+      - /srv/xingyao-state:/srv/xingyao-state
+      - keyring-data:/srv/xingyao-state/gateway/keyring
       - /var/run/docker.sock:/var/run/docker.sock
-  caddy:
-    image: caddy:2
-    networks: [xingyao]
-    ports:
-      - "443:443"
-    environment:
-      ACME_EMAIL: ${ACME_EMAIL}
-      SITE_DOMAIN: ${SITE_DOMAIN}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-logs:/var/log/caddy
 
 networks:
   xingyao:
     name: xingyao
 
+# 网关的钥匙串数据库放在命名卷里，工人容器以 xingyao-keyring:/run/keyring:ro 只读挂载。
 volumes:
-  gateway-data:
-  caddy-data:
-  caddy-logs:
+  keyring-data:
+    name: xingyao-keyring
+
+secrets:
+  keyring_password:
+    file: ${XINGYAO_KEYRING_PASSWORD_FILE:?请先设置钥匙串口令文件路径}

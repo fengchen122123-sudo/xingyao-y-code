@@ -72,11 +72,18 @@
     box-shadow: 0 24px 70px rgba(48, 40, 24, .16);
   }
 
+  .frame { position: relative; }
   .app { height: 100%; display: flex; min-height: 0; background: var(--bg); }
   .side {
     width: 280px; flex: none; display: flex; flex-direction: column;
-    padding: 18px 14px 12px; min-height: 0; background: #efebe3;
+    padding: 18px 14px 12px; min-height: 0; background: #201f1b; color: #f5f2eb;
   }
+  .side .avatar { background: #f4f1ea; color: var(--ink); }
+  .side .side-label, .side .chat-btn time, .side .chat-preview, .side .account-chip { color: #aaa69c; }
+  .side .new-chat { border-color: #45423b; background: #2b2924; color: #fff; }
+  .side .new-chat:hover, .side .chat-btn:hover, .side .side-link:hover, .side .account-chip:hover { background: #2b2924; }
+  .side .chat-btn.active { background: #37342e; color: #fff; box-shadow: none; }
+  .side .side-foot { border-color: #3c3933; }
   .side-head { padding: 4px 8px 14px; }
   .brand { display: flex; align-items: center; gap: 10px; }
   .mark { font-weight: 680; letter-spacing: -.03em; font-size: 16px; }
@@ -113,6 +120,15 @@
   .top-grow { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
   .top h1 { font-size: 16px; font-weight: 650; letter-spacing: -.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .status { display: flex; align-items: center; gap: 6px; margin-top: 2px; color: var(--muted); font-size: 12px; }
+  .model-picker {
+    position: relative; flex: none; max-width: 160px; display: flex; align-items: center;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  }
+  .model-picker select {
+    width: 100%; height: 36px; padding: 0 32px 0 12px; border: 0; border-radius: inherit;
+    appearance: none; background: transparent; font-size: 13px; text-overflow: ellipsis;
+  }
+  .model-picker .icon { position: absolute; right: 9px; width: 15px; pointer-events: none; color: var(--muted); }
   .icon-btn, .stop {
     border: 0; background: transparent; border-radius: 999px;
     display: grid; place-items: center;
@@ -234,10 +250,28 @@
   .login button[type="submit"] { width: 100%; border: 0; background: var(--ink); color: #fff; }
 
   .transcript, .chats { scrollbar-width: thin; scrollbar-color: #ddd6c8 transparent; }
-  .app.narrow .side { width: 100%; background: var(--bg); padding: 16px 14px 12px; }
+  .app.narrow .side { width: 100%; padding: 16px 14px calc(76px + env(safe-area-inset-bottom)); }
   .app.narrow.hide-side .side { display: none; }
   .app.narrow.hide-main .main { display: none; }
   .app.narrow .transcript, .app.narrow .dock, .app.narrow .top { padding-left: 14px; padding-right: 14px; }
+  .app.narrow .main { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+  .app.narrow .top { gap: 7px; }
+  .app.narrow .top > .avatar { display: none; }
+  .app.narrow .model-picker { max-width: 120px; }
+  .app.narrow .model-picker select { padding-left: 10px; font-size: 12px; }
+  .app.narrow .dock { padding-bottom: 10px; }
+  .mobile-nav { display: none; }
+  .app.narrow .mobile-nav {
+    position: absolute; z-index: 4; inset: auto 0 0; min-height: 64px;
+    padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); display: flex;
+    border-top: 1px solid var(--line); background: rgba(255, 252, 248, .97);
+  }
+  .mobile-nav button {
+    min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 5px 2px; border: 0; background: transparent; color: var(--muted); font-size: 10px;
+  }
+  .mobile-nav button.active { color: var(--ink); }
+  .mobile-nav .icon { width: 21px; height: 21px; }
   @media (max-width: 720px) {
     .switch { display: none; }
     body.phone { background: var(--bg); padding: 0; }
@@ -266,6 +300,9 @@ const I = {
   laptop: svg('<rect x="4" y="5" width="16" height="11" rx="2"/><path d="M2 19h20"/>'),
   chev: svg('<path d="m9 6 6 6-6 6"/>'),
   check: svg('<path d="m5 12 5 5L20 7"/>'),
+  down: svg('<path d="m8 10 4 4 4-4"/>'),
+  chat: svg('<path d="M20 15a3 3 0 0 1-3 3H9l-5 3v-6a3 3 0 0 1-1-2V7a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3Z"/>'),
+  account: svg('<circle cx="12" cy="8" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/>'),
   globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"/>')
 };
 
@@ -317,6 +354,7 @@ const state = {
   deviceId: null,
   loggedIn: true,
   account: '木偶',
+  model: '星瑶 Pro',
   notice: '',
   focus: false,
   bottom: true
@@ -351,7 +389,7 @@ function render() {
   const hideMain = state.loggedIn && isNarrow && state.screen === 'list';
   const app = $('#app');
   app.className = 'app' + (isNarrow ? ' narrow' : '') + (hideSide ? ' hide-side' : '') + (hideMain ? ' hide-main' : '');
-  app.innerHTML = sideHtml() + mainHtml(isNarrow);
+  app.innerHTML = sideHtml() + mainHtml(isNarrow) + mobileNavHtml(isNarrow);
   const box = $('#box');
   if (box) {
     box.addEventListener('input', () => {
@@ -401,6 +439,23 @@ function backButton(show) {
   if (!show) return '';
   return `<button class="icon-btn" type="button" data-action="back" aria-label="返回">${I.back}</button>`;
 }
+function modelPicker() {
+  const options = ['星瑶 Pro', '星瑶 Lite', 'DeepSeek V4'].map((name) =>
+    `<option${state.model === name ? ' selected' : ''}>${name}</option>`
+  ).join('');
+  return `<label class="model-picker"><span class="sr-only">选择模型</span><select id="model">${options}</select>${I.down}</label>`;
+}
+function mobileNavHtml(isNarrow) {
+  if (!isNarrow || !state.loggedIn) return '';
+  const chatActive = state.screen === 'chat' || state.screen === 'list';
+  return `<nav class="mobile-nav" aria-label="主要导航">
+    <button type="button" class="${chatActive ? 'active' : ''}" data-nav="chat">${I.chat}<span>对话</span></button>
+    <button type="button" data-nav="approvals">${I.check}<span>确认</span></button>
+    <button type="button" data-nav="watch">${I.globe}<span>围观</span></button>
+    <button type="button" class="${state.screen === 'computers' || state.screen === 'device' ? 'active' : ''}" data-nav="computers">${I.laptop}<span>设备</span></button>
+    <button type="button" class="${state.screen === 'account' ? 'active' : ''}" data-nav="account">${I.account}<span>我的</span></button>
+  </nav>`;
+}
 function chatHtml(c, isNarrow, remote) {
   const pending = c && c.approval === 'pending';
   const title = remote ? devices.find((d) => d.id === state.deviceId).name : c.title;
@@ -415,6 +470,7 @@ function chatHtml(c, isNarrow, remote) {
   return `<header class="top">
       ${backButton(isNarrow || remote)}
       <div class="top-grow"><div class="avatar">${face}</div><div style="min-width:0"><h1>${esc(title)}</h1><p class="status">${status}</p></div></div>
+      ${remote ? '' : modelPicker()}
       ${pending ? '<button class="stop" type="button" data-action="stop">停止</button>' : ''}
     </header>
     <div class="transcript"><div class="column">${messages}</div></div>
@@ -496,7 +552,31 @@ function send(text) {
   state.focus = true;
   render();
 }
+$('#app').addEventListener('change', (e) => {
+  if (e.target.id === 'model') {
+    state.model = e.target.value;
+    live('已选择 ' + state.model);
+  }
+});
 $('#app').addEventListener('click', (e) => {
+  const navBtn = e.target.closest('[data-nav]');
+  if (navBtn) {
+    const name = navBtn.dataset.nav;
+    if (name === 'chat') state.screen = 'list';
+    else if (name === 'approvals') {
+      state.screen = 'chat';
+      state.chatId = 'week';
+      state.bottom = true;
+      window.setTimeout(() => document.querySelector('.ask-card')?.scrollIntoView({ block: 'center' }), 0);
+    } else if (name === 'watch') {
+      state.screen = 'chat';
+      state.chatId = 'week';
+      chat().watchOpen = true;
+    } else state.screen = name;
+    state.notice = '';
+    render();
+    return;
+  }
   const chatBtn = e.target.closest('[data-chat]');
   if (chatBtn) {
     state.chatId = chatBtn.dataset.chat;

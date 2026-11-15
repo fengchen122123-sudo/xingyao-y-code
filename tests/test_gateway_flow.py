@@ -397,6 +397,189 @@ def test_idle_poll_waits_thirty_seconds_between_checks():
     assert loop.advance(30, ["ada"], lambda _account: {}) == ["ada"]
 
 
+def test_admin_models_never_disclose_or_persist_plaintext_keys(tmp_path):
+    from gateway.platform_models import PlatformModelStore
+
+    class MemoryKeyring:
+        def __init__(self):
+            self.secrets = {}
+
+        def set_password(self, service, account, secret):
+            self.secrets[(service, account)] = secret
+
+        def get_password(self, service, account):
+            return self.secrets.get((service, account))
+
+    keyring = MemoryKeyring()
+    app = _app(tmp_path)
+    app.state.model_store = PlatformModelStore(app.state.database, keyring, "ycode-test")
+    client = TestClient(app)
+    token = _login(client, "root")
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "providers": [{
+            "name": "DeepSeek",
+            "base_url": "https://api.deepseek.com",
+            "api_key": "sk-super-secret",
+            "model_id": "deepseek-chat",
+            "model_name": "DeepSeek Chat",
+            "litellm_model": "openai/deepseek-chat",
+        }],
+        "active_model_id": "deepseek-chat",
+    }
+    assert client.put("/api/admin/models", json=body, headers=headers).status_code == 200
+    listed = client.get("/api/admin/models", headers=headers)
+    assert listed.status_code == 200
+    assert "sk-super-secret" not in listed.text
+    assert listed.json()["providers"][0]["api_key_configured"] is True
+    stored = app.state.database.execute(
+        "SELECT providers_json FROM platform_models WHERE id = 1"
+    ).fetchone()[0]
+    assert "sk-super-secret" not in stored
+    assert app.state.model_store.load()["providers"][0]["api_key"] == "sk-super-secret"
+
+
+def test_platform_models_are_stamped_into_each_account_volume(tmp_path):
+    from gateway.platform_models import load_platform_models, save_platform_models
+    from gateway.workers import WorkerManager
+
+    app = _app(tmp_path)
+    account = app.state.database.execute("SELECT id FROM accounts").fetchone()["id"]
+    save_platform_models(
+        app.state.database,
+        [{
+            "id": "deepseek",
+            "name": "深度求索",
+            "base_url": "https://api.deepseek.com",
+            "api_key": "sk-test",
+            "models": [{"id": "ds-v4-pro", "name": "deepseek-v4-pro", "litellm_model": "openai/deepseek-v4-pro"}],
+        }],
+        "ds-v4-pro",
+    )
+
+    class Docker:
+        def exists(self, _name):
+            return False
+
+        def create(self, _spec):
+            return None
+
+        def start(self, _name):
+            return None
+
+    manager = WorkerManager(
+        Docker(),
+        app.state.database,
+        tmp_path,
+        "image",
+        platform_models=lambda: load_platform_models(app.state.database),
+    )
+    manager.ensure_token(account)
+    saved = json.loads((manager.volume_for(account) / "config.json").read_text(encoding="utf-8"))
+    assert saved["providers"][0]["api_key"] == "sk-test"
+    assert saved["providers"][0]["base_url"] == "https://api.deepseek.com"
+    assert saved["active_model_id"] == "ds-v4-pro"
+    assert saved["permission_mode"] == "full"
+    assert saved["remote_pair_token"]
+
+
+def test_loopback_model_url_is_rewritten_for_the_worker(tmp_path):
+    from gateway.platform_models import load_platform_models, save_platform_models
+    from gateway.workers import WorkerManager, worker_base_url
+
+    assert worker_base_url("http://127.0.0.1:18888/v1", "172.18.0.1") == "http://172.18.0.1:18888/v1"
+    assert worker_base_url("https://api.deepseek.com/v1", "172.18.0.1") == "https://api.deepseek.com/v1"
+    app = _app(tmp_path)
+    account = app.state.database.execute("SELECT id FROM accounts").fetchone()["id"]
+    save_platform_models(
+        app.state.database,
+        [{
+            "id": "xingyao-api",
+            "name": "星瑶API",
+            "base_url": "http://127.0.0.1:18888/v1",
+            "api_key": "sk-test",
+            "models": [{"id": "deepseek-v4.1-flash-loomy", "name": "deepseek", "litellm_model": "deepseek-v4.1-flash-loomy"}],
+        }],
+        "deepseek-v4.1-flash-loomy",
+    )
+    manager = WorkerManager(
+        object(),
+        app.state.database,
+        tmp_path,
+        "image",
+        platform_models=lambda: load_platform_models(app.state.database),
+        host_gateway="172.18.0.1",
+    )
+    manager.ensure_token(account)
+    saved = json.loads((manager.volume_for(account) / "config.json").read_text(encoding="utf-8"))
+    assert saved["providers"][0]["base_url"] == "http://172.18.0.1:18888/v1"
+    assert saved["providers"][0]["api_key"] == "sk-test"
+
+
+def test_missing_worker_image_reports_lost_instead_of_raising(tmp_path):
+    from gateway.workers import WorkerManager
+
+    app = _app(tmp_path)
+    account = app.state.database.execute("SELECT id FROM accounts").fetchone()["id"]
+
+    class Docker:
+        def exists(self, _name):
+            return False
+
+        def create(self, _spec):
+            raise RuntimeError("No such image: xingyao-worker:local")
+
+        def start(self, _name):
+            raise AssertionError("镜像不存在时不应启动")
+
+    manager = WorkerManager(Docker(), app.state.database, tmp_path, "xingyao-worker:local", host_gateway="")
+    result = manager.ensure_running(account, health=lambda _url: {"ok": False})
+    assert result["ok"] is False
+    assert result["error"] == "worker_lost"
+
+
+def test_phone_rpc_is_forwarded_to_the_desktop(tmp_path):
+    app = _app(tmp_path)
+    client = TestClient(app)
+    admin = _login(client, "root")
+    ada = client.post(
+        "/api/admin/accounts",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"username": "ada", "password": "secret-secret"},
+    ).json()["id"]
+    ada_token = _login(client, "ada")
+    created = client.post(
+        f"/api/admin/devices?account_id={ada}",
+        headers={"Authorization": f"Bearer {admin}"},
+        json={"name": "家里的台式机"},
+    ).json()
+    with client.websocket_connect("/relay/client") as phone:
+        phone.send_text(json.dumps({"jwt": ada_token, "device_id": created["id"]}))
+        json.loads(phone.receive_text())
+        with client.websocket_connect("/relay/device") as desktop:
+            desktop.send_text(json.dumps({
+                "type": "relay_register",
+                "token": created["token"],
+                "device_id": created["id"],
+                "boot_id": "boot-1",
+            }))
+            assert json.loads(desktop.receive_text())["type"] == "relay_registered"
+            phone.send_text(json.dumps({"method": "send_user_message", "args": {"text": "hi"}, "id": 7}))
+            forwarded = json.loads(desktop.receive_text())
+            assert forwarded["method"] == "send_user_message"
+            # P4：网关只在传输层加 App 前缀（两个 App 各自的 id=7 不能串），回程再还原。
+            assert isinstance(forwarded["id"], str)
+            assert forwarded["id"] != 7
+            assert forwarded["id"].endswith(":7")
+            desktop.send_text(json.dumps({"id": forwarded["id"], "result": {"ok": True}}))
+            reply = {}
+            for _ in range(5):
+                reply = json.loads(phone.receive_text())
+                if "id" in reply:
+                    break
+    assert reply["id"] == 7
+
+
 def test_usage_day_follows_shanghai_midnight():
     from datetime import datetime, timezone
 

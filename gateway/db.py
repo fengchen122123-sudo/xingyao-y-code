@@ -38,7 +38,12 @@ CREATE TABLE IF NOT EXISTS workers (
   worker_token   TEXT NOT NULL,
   desired_state  TEXT NOT NULL DEFAULT 'stopped',
   last_activity  INTEGER,
-  updated_at     INTEGER NOT NULL
+  updated_at     INTEGER NOT NULL,
+  started_at     INTEGER,
+  last_boot_id   TEXT,
+  version        TEXT NOT NULL DEFAULT '',
+  active_turn    INTEGER NOT NULL DEFAULT 0,
+  last_error     TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
   account_id TEXT NOT NULL,
@@ -68,9 +73,26 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   version    INTEGER PRIMARY KEY,
   applied_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS platform_models (
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  providers_json  TEXT NOT NULL DEFAULT '[]',
+  active_model_id TEXT NOT NULL DEFAULT '',
+  updated_at      INTEGER NOT NULL
+);
 """
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 3
+
+# 向前迁移脚本。新库因为 SCHEMA 已经带上了列，重复加列按已应用处理。
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    3: (
+        "ALTER TABLE workers ADD COLUMN started_at INTEGER",
+        "ALTER TABLE workers ADD COLUMN last_boot_id TEXT",
+        "ALTER TABLE workers ADD COLUMN version TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE workers ADD COLUMN active_turn INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workers ADD COLUMN last_error TEXT NOT NULL DEFAULT ''",
+    ),
+}
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -90,6 +112,15 @@ def migrate(database: sqlite3.Connection) -> None:
     if current > CURRENT_VERSION:
         raise RuntimeError(f"网关数据库版本 {current} 高于程序 {CURRENT_VERSION}")
     if current < CURRENT_VERSION:
+        for version in range(current + 1, CURRENT_VERSION + 1):
+            for statement in MIGRATIONS.get(version, ()):
+                try:
+                    database.execute(statement)
+                except sqlite3.OperationalError as error:
+                    # 新库的 SCHEMA 已经建过这一列，重复加列不算迁移失败。
+                    if "duplicate column" not in str(error).lower():
+                        database.rollback()
+                        raise
         database.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
             (CURRENT_VERSION, int(time.time())),

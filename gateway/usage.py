@@ -15,14 +15,18 @@ def shanghai_day(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, SHANGHAI).strftime("%Y-%m-%d")
 
 
-def apply_usage(database, account_id: str, metrics: dict, now: float, *, fail_before_commit: bool = False) -> None:
+def apply_usage(database, account_id: str, metrics: dict, now: float, *, day: str | None = None, fail_before_commit: bool = False) -> None:
     """metrics.token_usage 是累计值。total_tokens 只留在水位里。
 
     worker 只有一个 turns_total。它记在每个模型的水位上，用来发现回退；
     日表的 turns 只加在第一条模型上，避免按模型乘倍。
+    turns 只认 worker 的持久回合计数（harness_turns 里 completed 且非 resume），
+    请求数一类的字段一律不进 turns 列。
     """
-    day = shanghai_day(now)
+    day = day or shanghai_day(now)
     turns_total = int(metrics.get("turns_total") or 0)
+    if "turns_total" not in metrics and any(key in metrics for key in ("requests_total", "request_count", "sessions_total")):
+        logger.warning("指标里只有请求数没有持久回合数，按 0 回合入账 account=%s", account_id)
     rows = list(metrics.get("token_usage") or [])
     if not rows:
         rows = [{"model": "", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}]

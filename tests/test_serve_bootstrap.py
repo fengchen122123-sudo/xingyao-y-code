@@ -321,6 +321,67 @@ def test_server_skips_agents_skills(monkeypatch, tmp_path):
     assert all(".agents" not in path for path in skipped)
 
 
+def _free_tcp_port() -> int:
+    holder = socket.socket()
+    try:
+        holder.bind(("127.0.0.1", 0))
+        return int(holder.getsockname()[1])
+    finally:
+        holder.close()
+
+
+def _port_listening(port: int) -> bool:
+    probe = socket.socket()
+    probe.settimeout(0.5)
+    try:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        probe.close()
+
+
+def _listening_pids(port: int) -> set[int]:
+    """返回本机监听 ``port`` 的 PID 集合（psutil → netstat 兜底）。
+
+    「serve 不得监听 8765」的真语义是「serve 进程不是 8765 的监听者」，
+    而不是「这台机器上 8765 必须空着」——开发机上 GUI 常驻时 8765 本来就
+    被 gui_main.py 占着，按端口判空会把环境噪声当成失败。取不到监听者时
+    返回空集合，此时调用方还有直接的端口探测兜底，不会把失败伪造成通过。
+    """
+    try:
+        import psutil
+
+        pids: set[int] = set()
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.status != psutil.CONN_LISTEN or not conn.laddr:
+                continue
+            if conn.laddr.port == port and conn.pid:
+                pids.add(int(conn.pid))
+        return pids
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return set()
+    try:
+        output = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout
+    except Exception:
+        return set()
+    pids = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if parts[3].upper() != "LISTENING" or not parts[4].isdigit():
+            continue
+        if parts[1].rsplit(":", 1)[-1] == str(port):
+            pids.add(int(parts[4]))
+    return pids
+
+
 def test_serve_process_answers_health_and_skips_mcp_port(tmp_path):
     port = 8766
     probe = socket.socket()
@@ -330,6 +391,19 @@ def test_serve_process_answers_health_and_skips_mcp_port(tmp_path):
         pytest.skip("127.0.0.1:8766 已被占用")
     finally:
         probe.close()
+
+    # 隔离检查用的 MCP 端口：serve 若（错误地）启动局域网 MCP，会绑到配置里
+    # 写的这个端口。断言它不被监听，就不必依赖「本机 8765 恰好空着」这种环境
+    # 前提，也不会因为开发机 GUI 常驻占着 8765 而假失败。
+    mcp_port = _free_tcp_port()
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"remote_mcp_enabled": True, "remote_mcp_port": mcp_port},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
 
     env = os.environ.copy()
     env["YCODE_DATA_DIR"] = str(tmp_path)
@@ -367,12 +441,16 @@ def test_serve_process_answers_health_and_skips_mcp_port(tmp_path):
         else:
             raise AssertionError(f"健康检查没有就绪: {last_error}")
 
-        mcp = socket.socket()
-        mcp.settimeout(0.5)
-        try:
-            assert mcp.connect_ex(("127.0.0.1", 8765)) != 0
-        finally:
-            mcp.close()
+        # 1) 配置里指定的 MCP 端口没有被 serve 绑定：MCP 服务完全没启动。
+        assert not _port_listening(mcp_port), "serve 进程启动了 MCP 服务"
+        # 2) 8765 的监听归属里没有 serve 子进程：即使本机已有 GUI 常驻 8765，
+        #    serve 也没有抢/复用它。
+        pids_on_8765_after = _listening_pids(8765)
+        assert process.pid not in pids_on_8765_after
+        if not pids_on_8765_after:
+            # 归属取不到时退回直接探测：只有原先无人监听、现在有人监听，
+            # 才能确定是 serve 新占用。
+            assert not _port_listening(8765), "8765 在 serve 运行期间被新占用"
     finally:
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)

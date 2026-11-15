@@ -1275,6 +1275,10 @@ class _SecretaryDispatchService:
                 )
             pending_workdir = ""
             display_name = self._display_name(session_name)
+            if self._is_secretary(session_name):
+                raise SecretaryDispatchError(
+                    "不能把任务派给秘书会话：秘书会话只读，没有命令执行和写文件工具"
+                )
         if pending_permission and not is_new:
             # 已有会话：档位落在会话绑定上（等同用户在该会话里切换档位）
             try:
@@ -8270,17 +8274,25 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 return None
 
     def get_cloud_relay_settings(self) -> Dict[str, Any]:
+        """给设置卡片一次性拿全：开关、网关地址、设备号、密钥是否已配、连接状态。"""
         try:
             data = config._load()
             service = getattr(self, "_cloud_relay_service", None)
-            state = service.status()["state"] if service is not None else "disabled"
+            detail = service.status() if service is not None else {"state": "disabled"}
             return {
                 "ok": True,
                 "settings": {
                     "enabled": bool(data.get(config.CLOUD_RELAY_ENABLED_KEY, False)),
                     "url": data.get(config.CLOUD_RELAY_URL_KEY) or "",
                     "device_id": data.get(config.CLOUD_RELAY_DEVICE_ID_KEY) or "",
-                    "state": state,
+                    # token 只回布尔：明文只在用户粘贴时上行，不回传给界面。
+                    "has_token": bool(str(data.get(config.CLOUD_RELAY_TOKEN_KEY) or "").strip()),
+                    "state": detail.get("state", "disabled"),
+                    "connected": bool(detail.get("connected", False)),
+                    "generation": int(detail.get("generation") or 0),
+                    "queued": int(detail.get("queued") or 0),
+                    "dropped": int(detail.get("dropped") or 0),
+                    "lost": int(detail.get("lost") or 0),
                 },
             }
         except Exception as error:
@@ -8305,10 +8317,40 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             if current is not None:
                 current.stop()
                 self._cloud_relay_service = None
+            if bool(payload.get("enabled")) and not token and not str(
+                config._load().get(config.CLOUD_RELAY_TOKEN_KEY) or ""
+            ).strip():
+                # 打开开关却没有设备 token：不建连接，state 报 disabled 而不是假装在连。
+                return self.get_cloud_relay_settings()
             self._ensure_cloud_relay()
             return self.get_cloud_relay_settings()
         except Exception as error:
             logger.exception("保存云中转设置失败")
+            return {"ok": False, "msg": str(error)}
+
+    def cloud_relay_connect(self) -> Dict[str, Any]:
+        """设置卡片「重连」按钮：丢掉旧连接按当前配置重拨，配置不变。"""
+        try:
+            current = getattr(self, "_cloud_relay_service", None)
+            if current is not None:
+                current.stop()
+                self._cloud_relay_service = None
+            self._ensure_cloud_relay()
+            return self.get_cloud_relay_settings()
+        except Exception as error:
+            logger.exception("云中转重连失败")
+            return {"ok": False, "msg": str(error)}
+
+    def cloud_relay_disconnect(self) -> Dict[str, Any]:
+        """设置卡片「断开」按钮：只断当前连接，不清配置（下次启动还会连）。"""
+        try:
+            current = getattr(self, "_cloud_relay_service", None)
+            if current is not None:
+                current.stop()
+                self._cloud_relay_service = None
+            return self.get_cloud_relay_settings()
+        except Exception as error:
+            logger.exception("云中转断开失败")
             return {"ok": False, "msg": str(error)}
 
     def get_remote_bind_qr(self, force_new: bool = False, mobile: bool = False) -> Dict[str, Any]:

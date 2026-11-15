@@ -37,3 +37,49 @@ def test_encrypted_keyring_roundtrip_hides_plaintext(tmp_path: Path, monkeypatch
         assert b"sk-secret-value" not in stored
     finally:
         keyring.set_keyring(previous)
+
+
+def test_model_store_uses_keyring_and_worker_config_only_gets_a_reference(tmp_path: Path):
+    pytest.importorskip("keyrings.alt")
+    import json
+    import keyring
+
+    from gateway.db import connect
+    from gateway.platform_models import PlatformModelStore
+    from gateway.workers import WorkerManager
+    from core.serve.keyring_setup import install_server_keyring
+
+    password = tmp_path / "keyring_password"
+    password.write_text("correct horse", encoding="utf-8")
+    previous = keyring.get_keyring()
+    try:
+        assert install_server_keyring(tmp_path, password)
+        database = connect(tmp_path / "gateway.db")
+        store = PlatformModelStore(database, keyring)
+        store.save([{
+            "id": "deepseek",
+            "name": "DeepSeek",
+            "base_url": "https://api.deepseek.com",
+            "api_key": "sk-never-store-plaintext",
+            "models": [{"id": "chat", "name": "Chat", "litellm_model": "openai/chat"}],
+        }], "chat")
+        stored = database.execute("SELECT providers_json FROM platform_models").fetchone()[0]
+        assert "sk-never-store-plaintext" not in stored
+        assert store.load()["providers"][0]["api_key"] == "sk-never-store-plaintext"
+
+        database.execute(
+            "INSERT INTO accounts(id, username, password_hash, role, created_at) VALUES ('a', 'a', 'x', 'user', 1)"
+        )
+        database.commit()
+        manager = WorkerManager(object(), database, tmp_path / "accounts", "image", platform_models=store.load)
+        manager.ensure_token("a")
+        worker_config = (manager.volume_for("a") / "config.json").read_text(encoding="utf-8")
+        assert "sk-never-store-plaintext" not in worker_config
+        saved = json.loads(worker_config)
+        assert saved["providers"][0]["api_key"].startswith("keyring:")
+        assert saved["permission_mode"] == "full"
+        from core.credentials import unprotect_secret
+        assert unprotect_secret(saved["providers"][0]["api_key"]) == "sk-never-store-plaintext"
+        assert b"sk-never-store-plaintext" not in (tmp_path / "keyring" / "crypted_pass.cfg").read_bytes()
+    finally:
+        keyring.set_keyring(previous)

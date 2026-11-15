@@ -1,14 +1,10 @@
 import { defineStore } from "pinia";
-import { useAuthStore } from "./auth";
+import { apiFetch } from "../transport/api";
 
 async function adminFetch(path: string, method = "GET", body?: unknown) {
-  const auth = useAuthStore();
-  const response = await fetch(new URL(path, auth.server), {
+  const response = await apiFetch(path, {
     method,
-    headers: {
-      Authorization: `Bearer ${auth.credential}`,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) throw new Error("管理接口没有通过");
@@ -21,6 +17,8 @@ export const useAdminStore = defineStore("admin", {
     devices: [] as { id: string; account_id: string; name: string; revoked: number }[],
     workers: [] as { account_id: string; container_name: string; desired_state: string }[],
     freshToken: "",
+    models: [] as { name: string; base_url: string; api_key: string; model_id: string; model_name: string; litellm_model: string }[],
+    activeModelId: "",
     usage: [] as { account_id: string; day: string; model: string; input_tokens: number; output_tokens: number; turns: number }[],
   }),
   actions: {
@@ -36,6 +34,29 @@ export const useAdminStore = defineStore("admin", {
       await adminFetch(`/api/admin/accounts/${accountId}`, "PATCH", { disabled: true });
       await this.loadAccounts();
     },
+    async resetPassword(accountId: string, password: string) {
+      await adminFetch(`/api/admin/accounts/${accountId}`, "PATCH", { password });
+      await this.loadAccounts();
+    },
+    async loadModels() {
+      const body = await adminFetch("/api/admin/models");
+      this.activeModelId = body.active_model_id || "";
+      this.models = (body.providers || []).flatMap((provider: { name?: string; base_url?: string; api_key?: string; models?: { id?: string; name?: string; litellm_model?: string }[] }) => {
+        const model = provider.models?.[0] || {};
+        return [{
+          name: provider.name || "",
+          base_url: provider.base_url || "",
+          api_key: provider.api_key || "",
+          model_id: model.id || "",
+          model_name: model.name || "",
+          litellm_model: model.litellm_model || "",
+        }];
+      });
+    },
+    async saveModels(providers: { name: string; base_url: string; api_key: string; model_id: string; model_name: string; litellm_model: string }[], activeModelId: string) {
+      await adminFetch("/api/admin/models", "PUT", { providers, active_model_id: activeModelId });
+      await this.loadModels();
+    },
     async loadDevices() {
       const body = await adminFetch("/api/admin/devices");
       this.devices = body.devices || [];
@@ -49,11 +70,16 @@ export const useAdminStore = defineStore("admin", {
       await adminFetch(`/api/admin/devices/${deviceId}`, "DELETE");
       await this.loadDevices();
     },
+    async rotateDevice(deviceId: string) {
+      const body = await adminFetch(`/api/admin/devices/${deviceId}/rotate`, "POST");
+      this.freshToken = body.token || "";
+      await this.loadDevices();
+    },
     async loadWorkers() {
       const body = await adminFetch("/api/admin/workers");
       this.workers = body.workers || [];
     },
-    async controlWorker(accountId: string, action: "start" | "stop") {
+    async controlWorker(accountId: string, action: "start" | "stop" | "restart") {
       await adminFetch(`/api/admin/workers/${accountId}?action=${action}`, "POST");
       await this.loadWorkers();
     },
