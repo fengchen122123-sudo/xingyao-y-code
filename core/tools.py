@@ -1259,15 +1259,35 @@ def _decide_search_num_results(query):
     return picked
 
 
+def _format_web_results(items, body_key):
+    """把统一结构的搜索结果渲染成给模型看的分条文本。
+
+    三种后端字段名不同：免费网页后端用 ``snippet``，ddgs 用 ``body``，
+    这里只按 key 取值，输出格式保持一致，调用方无感。
+    """
+    formatted_results = []
+    for i, r in enumerate(items):
+        title = r.get('title') or '无标题'
+        url = r.get('url') or ''
+        body = r.get(body_key) or '无摘要'
+        formatted_results.append(f"{i+1}. {title}\n   摘要: {body}\n   链接: {url}")
+    return "\n\n".join(formatted_results)
+
+
 def search_news(query, num_results=5, cancel_event=None):
-    """🌐 现代化新闻搜索工具：稳定可靠的联网引擎"""
-    # 组件就绪性最先检查：ddgs 现在是按需下载的「网页搜索组件」，缺它时直接给
-    # 模型一段可读提示并正常返回（不抛异常），也不白跑一次 JEV 决策与网络请求。
-    ddgs_cls = _load_ddgs()
-    if ddgs_cls is None:
-        return _SEARCH_COMPONENT_MISSING_HINT
+    """🌐 现代化新闻搜索工具：稳定可靠的联网引擎
+
+    检索路径（2026-11-15 起）：
+      1. 免费网页后端 core.web_search（360 优先、必应 RSS 兜底），无需 Key、不消耗额度；
+      2. 两者都不可用时才回退 ddgs——它原本是唯一实现，但国内网络下频繁空返回；
+      3. 仍然失败才返回 🚨 失败文本，并附上每条通道的具体失败原因。
+    返回格式保持不变（编号 + 标题 + 摘要 + 链接），调用方无需感知后端变化。
+    """
+    query = str(query or "").strip()
+    if not query:
+        return "🚨 新闻搜索失败：query 不能为空。"
     try:
-        # 钳制结果数：模型传 100000 会触发 DuckDuckGo 限流
+        # 钳制结果数：模型传 100000 会触发搜索引擎限流
         try:
             num_results = int(num_results)
         except (TypeError, ValueError):
@@ -1279,31 +1299,53 @@ def search_news(query, num_results=5, cancel_event=None):
         # 算好的 num_results 不变（尊重调用方传值，而非回落到硬编码 5）。
         decided_num_results = _decide_search_num_results(query)
         if decided_num_results is not None:
-            # 仍走同一套钳制，保证 ddgs 的限流保护不被决策链路绕过
+            # 仍走同一套钳制，保证限流保护不被决策链路绕过
             num_results = max(1, min(decided_num_results, 20))
-        with ddgs_cls() as ddgs:
-            results = list(ddgs.news(query, max_results=num_results))
+        # 免费后端内部按需探测取消状态，避免长时间抓取期间无法中断
+        cancel_check = cancel_event.is_set if cancel_event is not None else None
+        failures = []
+
+        # --- 通道一：免费网页后端（无需 Key） ---
+        from core.web_search import SearchCancelled, search_web
+
+        try:
+            items = search_web(query, num_results, cancel_check=cancel_check)
+        except SearchCancelled:
+            # 取消是用户意图，不是"后端故障"，不参与兜底也不拼进失败原因
+            return "🛑 操作已被用户取消。"
+        except Exception as error:
+            failures.append(f"360/必应 {type(error).__name__}: {error}")
+            items = []
+        if items:
             _raise_if_cancelled(cancel_event)
+            return _format_web_results(items, "snippet")
+        if not failures:
+            failures.append("360/必应未解析到结果")
 
-            if not results:
-                # 用 🚨 前缀让 _tool_result_ok 识别为工具失败，进而触发子代理 _terminate("failed")
-                # 这样主代理会收到结构化失败文本（含 search_news 失败的兜底建议），
-                # 而不是误判为 completed 后返回一段"我没搜到"的文本。
-                # 语义上"无结果"对 LLM 而言就是任务失败，应走失败流程让主代理决策兜底。
-                return (
-                    f"🚨 新闻搜索无结果：查询「{query}」未返回任何新闻。"
-                    f"可能原因：关键词过窄、网络受限或 DuckDuckGo 服务波动。"
-                    f"建议主 Agent 改用 fetch_url 抓取已知新闻站点，或告知用户当前无法联网。"
-                )
+        # --- 通道二：ddgs 兜底 ---
+        ddgs_cls = _load_ddgs()
+        if ddgs_cls is None:
+            failures.append("ddgs 网页搜索组件未安装")
+        else:
+            try:
+                with ddgs_cls() as ddgs:
+                    ddgs_items = list(ddgs.news(query, max_results=num_results))
+                _raise_if_cancelled(cancel_event)
+                if ddgs_items:
+                    return _format_web_results(ddgs_items, "body")
+                failures.append("ddgs 无结果")
+            except _ToolCancelledError:
+                return "🛑 操作已被用户取消。"
+            except Exception as error:
+                failures.append(f"ddgs {type(error).__name__}: {error}")
 
-            formatted_results = []
-            for i, r in enumerate(results):
-                title = r.get('title', '无标题')
-                url = r.get('url', '')
-                body = r.get('body', '无摘要')
-                formatted_results.append(f"{i+1}. {title}\n   摘要: {body}\n   链接: {url}")
-
-            return "\n\n".join(formatted_results)
+        # 用 🚨 前缀让 _tool_result_ok 识别为工具失败，进而触发子代理 _terminate("failed")
+        # 这样主代理会收到结构化失败文本（含兜底建议），而不是误判为 completed。
+        return (
+            f"🚨 新闻搜索无结果：查询「{query}」未返回任何网页结果。"
+            f"各通道失败原因：{'；'.join(failures)}。"
+            f"建议主 Agent 改用 fetch_url 抓取已知站点，或告知用户当前无法联网。"
+        )
 
     except _ToolCancelledError:
         return "🛑 操作已被用户取消。"

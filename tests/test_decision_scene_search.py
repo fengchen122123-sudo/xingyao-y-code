@@ -36,6 +36,22 @@ PROVIDER = {
 # 测试基础设施
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _disable_free_web_search(monkeypatch):
+    """禁用免费网页通道，让 search_news 落到 DDGS 桩上。
+
+    2026-11-15 起 search_news 先走 core.web_search（百度/360/必应），ddgs 退为兜底。
+    本文件断言的是「决策值如何传到检索请求」，因此固定走 DDGS 桩，保持口径不变；
+    免费通道自身由 tests/test_web_search.py 覆盖。
+    """
+    from core import web_search
+
+    def _unavailable(*args, **kwargs):
+        raise web_search.SearchBackendError("测试中禁用免费网页通道")
+
+    monkeypatch.setattr(web_search, "search_web", _unavailable)
+
 def _install_fake_ddgs(monkeypatch, results=None):
     """打桩 DDGS：记录每次 news() 请求的 max_results（= 真正发出去的条数）。"""
     requests = []

@@ -19,6 +19,22 @@ from core.tools import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _disable_free_web_search(monkeypatch):
+    """search_news 的用例以 DDGS 桩为契约，这里禁用免费网页通道。
+
+    2026-11-15 起 search_news 先走 core.web_search（百度/360/必应），ddgs 退为兜底。
+    本文件的用例靠替换 ``tools.DDGS`` 断言结果格式与失败语义，若免费通道先联网
+    就会绕过桩。免费通道自身的行为由 tests/test_web_search.py 覆盖。
+    """
+    from core import web_search
+
+    def _unavailable(*args, **kwargs):
+        raise web_search.SearchBackendError("测试中禁用免费网页通道")
+
+    monkeypatch.setattr(web_search, "search_web", _unavailable)
+
+
 def test_subagent_task_id_validation_is_strict():
     from core.tools import is_subagent_task_id
 

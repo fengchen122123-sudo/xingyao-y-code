@@ -415,7 +415,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         ),
         ToolSpec(
             name="search_news",
-            description="搜索互联网新闻。",
+            description="搜索互联网网页与新闻（免费多源通道，自动兜底）。",
             input_schema=_schema({
                 "query": {"type": "string"},
                 "num_results": {"type": "integer", "default": 5},
