@@ -326,10 +326,10 @@ wss://<DOMAIN>/relay/device
 
 ## 11.4 独立远端页
 
-除了把消息转发到本地电脑，Web 还支持为某台已配对电脑打开一个**独立远端页**，不混入服务器会话侧栏：
+除了把消息转发到本地电脑，Web 还支持为某台已配对电脑打开一个**独立远端页**，不混入服务器会话侧栏。该页加载的是桌面 GUI 的完整前端，通过云中转把 RPC/事件转发到本地电脑：
 
 ```text
-https://<DOMAIN>/#/remote/<DEVICE_ID>?token=<REMOTE_TOKEN>
+https://<DOMAIN>/desktop/<DEVICE_ID>?token=<REMOTE_TOKEN>
 ```
 
 流程：
@@ -346,6 +346,15 @@ https://<DOMAIN>/#/remote/<DEVICE_ID>?token=<REMOTE_TOKEN>
 - 远端令牌放在 URL 查询参数中，必须使用 HTTPS；Caddy 日志需对 `token` 查询参数脱敏。
 - 令牌过期或设备被吊销后需要重新生成。
 - 如果当前浏览器地址是 `127.0.0.1` 或局域网地址，手机扫码不能公网访问；必须使用公网域名打开服务器后再生成二维码。
+
+构建服务器侧的完整桌面 UI（独立于 `web/dist`）：
+
+```bash
+cd frontend
+npx vite build --base=/desktop-assets/ --outDir desktop-dist
+```
+
+网关通过 `XINGYAO_DESKTOP_DIST` 读取该目录，默认是 `/srv/xingyao/frontend/desktop-dist`。
 
 ---
 

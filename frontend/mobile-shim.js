@@ -43,7 +43,9 @@
     } catch (_) {}
   }
   var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
-  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
+  // 云中转的完整桌面 UI：服务器注入 __ycRelayDevice，直接连网关 relay。
+  var relayDevice = window.__ycRelayDevice || window.location.pathname.split('/')[2] || '';
+  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + (relayDevice ? '/relay/client?device_id=' + encodeURIComponent(relayDevice) : '/');
 
   var ws = null;
   var seq = 0;
@@ -182,6 +184,7 @@
     ws.onopen = function () {
       sawHello = false;
       var auth = { token: token };
+      if (relayDevice) auth.device_id = relayDevice;
       if (bootId && !legacy) {
         auth.last_boot_id = bootId;
         auth.last_seq = lastSeq;

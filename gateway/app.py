@@ -859,6 +859,32 @@ def mount_web(app: FastAPI, directory: Path | None) -> None:
         return FileResponse(index)
 
 
+def mount_desktop_ui(app: FastAPI, desktop_dir: Path | None) -> None:
+    """把完整 GUI 前端暴露为 /desktop/<device_id>，资源使用独立前缀。"""
+    if desktop_dir is None or not (desktop_dir / "index.html").is_file():
+        return
+    assets = desktop_dir / "assets"
+    if assets.is_dir():
+        app.mount("/desktop-assets", StaticFiles(directory=str(desktop_dir)), name="desktop-assets")
+    shim = desktop_dir.parent / "mobile-shim.js"
+
+    @app.get("/desktop-shim.js", include_in_schema=False)
+    def desktop_shim():
+        return FileResponse(str(shim), media_type="application/javascript; charset=utf-8")
+
+    @app.get("/desktop/{device_id}", include_in_schema=False)
+    def desktop_index(device_id: str):
+        from fastapi.responses import HTMLResponse
+
+        html = (desktop_dir / "index.html").read_text(encoding="utf-8")
+        injection = (
+            f"<script>window.__ycRelayDevice={json.dumps(device_id)};</script>"
+            '<script src="/desktop-shim.js"></script>'
+        )
+        html = html.replace("</head>", injection + "</head>", 1)
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
 def app_from_env():
     from gateway.config import GatewayConfig
     from gateway.runtime import attach_runtime
@@ -880,5 +906,9 @@ def app_from_env():
         raise RuntimeError("钥匙串口令为空或不可用：请检查 XINGYAO_KEYRING_PASSWORD_FILE")
     app.state.model_store = PlatformModelStore(app.state.database, keyring)
     attach_runtime(app, config)
+    mount_desktop_ui(
+        app,
+        Path(os.environ.get("XINGYAO_DESKTOP_DIST", "/srv/xingyao/frontend/desktop-dist")),
+    )
     mount_web(app, config.web_dist)
     return app

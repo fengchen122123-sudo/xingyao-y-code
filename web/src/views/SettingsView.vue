@@ -110,7 +110,7 @@ async function useDesktop(deviceId: string) {
     const issued = await response.json() as { token?: string };
     if (!issued.token) throw new Error("远端访问令牌为空");
     const base = (auth.server || window.location.origin).replace(/\/$/, "");
-    const url = `${base}/#/remote/${encodeURIComponent(deviceId)}?token=${encodeURIComponent(issued.token)}`;
+    const url = `${base}/desktop/${encodeURIComponent(deviceId)}?token=${encodeURIComponent(issued.token)}`;
     remoteUrl.value = url;
     remoteQr.value = await QRCode.toDataURL(url, { width: 240, margin: 1 });
     window.open(url, "_blank", "noopener,noreferrer");
