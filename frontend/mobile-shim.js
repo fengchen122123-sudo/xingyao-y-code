@@ -193,7 +193,7 @@
     ws.onopen = function () {
       sawHello = false;
       var auth = { token: token };
-      if (relayDevice) auth.device_id = relayDevice;
+      if (relayDevice) { auth.device_id = relayDevice; auth.jwt = token; }
       if (bootId && !legacy) {
         auth.last_boot_id = bootId;
         auth.last_seq = lastSeq;
