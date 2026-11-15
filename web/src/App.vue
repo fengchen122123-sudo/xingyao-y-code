@@ -2,7 +2,7 @@
   <div class="app-shell">
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <SessionDrawer
-      v-if="auth.signedIn"
+      v-if="auth.signedIn && !remoteMode"
       :open="navigationOpen"
       :sessions="app.sessions"
       :current="app.currentSession"
@@ -20,12 +20,12 @@
       @click="navigationOpen = false"
     ></button>
 
-    <div id="main-content" class="app-main" tabindex="-1">
+    <div id="main-content" class="app-main" :class="{ remote: remoteMode }" tabindex="-1">
       <p v-if="actionError" class="action-error" role="alert">{{ actionError }}</p>
       <router-view @open-navigation="navigationOpen = true" />
     </div>
 
-    <nav v-if="auth.signedIn" class="mobile-nav" aria-label="主要导航">
+    <nav v-if="auth.signedIn && !remoteMode" class="mobile-nav" aria-label="主要导航">
       <router-link to="/chat">
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15a3 3 0 0 1-3 3H9l-5 3v-6a3 3 0 0 1-1-2V7a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3Z"/></svg>
         <span>对话</span>
@@ -71,6 +71,7 @@ const router = useRouter();
 const navigationOpen = ref(false);
 const sessionBusy = ref(false);
 const actionError = ref("");
+const remoteMode = computed(() => Boolean(route.meta.remote));
 const currentPreview = computed(() => {
   const last = [...app.messages].reverse().find((message) => message.text.trim());
   return last?.text.replace(/\s+/g, " ").slice(0, 42) || "直接说你要做的事";

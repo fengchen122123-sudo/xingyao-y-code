@@ -14,6 +14,7 @@ from argon2.exceptions import VerifyMismatchError
 
 ACCESS_SECONDS = 30 * 60
 REFRESH_SECONDS = 30 * 24 * 60 * 60
+REMOTE_ACCESS_SECONDS = 23 * 60 * 60
 _HASHER = PasswordHasher()
 
 
@@ -72,6 +73,60 @@ def issue_tokens(database, account, secret: str, now: int | None = None) -> dict
         "refresh_token": refresh,
         "role": account["role"],
     }
+
+
+def issue_remote_token(database, account, secret: str, device_id: str, now: int | None = None) -> dict:
+    """给独立远端页签发只读设备入口令牌；不能用于管理接口。"""
+    now = int(time.time() if now is None else now)
+    jti = secrets.token_hex(16)
+    token = jwt.encode(
+        {
+            "sub": account["id"],
+            "username": account["username"],
+            "role": "user",
+            "auth_epoch": int(account["auth_epoch"]),
+            "jti": jti,
+            "typ": "remote",
+            "device_id": device_id,
+            "iat": now,
+            "exp": now + REMOTE_ACCESS_SECONDS,
+        },
+        secret,
+        algorithm="HS256",
+    )
+    return {"token": token, "expires_at": now + REMOTE_ACCESS_SECONDS}
+
+
+def read_remote_access(
+    database,
+    token: str,
+    secret: str,
+    device_id: str,
+    now: int | None = None,
+) -> Principal | None:
+    """校验远端页 token：类型、设备绑定、账号禁用和 auth_epoch 缺一不可。"""
+    now = int(time.time() if now is None else now)
+    try:
+        payload = jwt.decode(token, secret, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return None
+    if payload.get("typ") != "remote" or str(payload.get("device_id") or "") != device_id:
+        return None
+    account = database.execute(
+        "SELECT * FROM accounts WHERE id = ?",
+        (payload.get("sub"),),
+    ).fetchone()
+    if account is None or int(account["disabled"]):
+        return None
+    if int(payload.get("auth_epoch") or 0) != int(account["auth_epoch"]):
+        return None
+    return Principal(
+        account_id=account["id"],
+        username=account["username"],
+        role=str(account["role"]),
+        auth_epoch=int(account["auth_epoch"]),
+        jti=str(payload.get("jti") or ""),
+    )
 
 
 def read_access(database, token: str, secret: str, now: int | None = None) -> Principal | None:

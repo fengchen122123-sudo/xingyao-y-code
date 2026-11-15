@@ -1,5 +1,6 @@
 <template>
   <main class="page page-narrow settings-page">
+    <p v-if="error" class="action-error" role="alert">{{ error }}</p>
     <header class="page-header">
       <div>
         <p class="eyebrow">账号与连接</p>
@@ -65,25 +66,65 @@
       <router-link v-if="auth.role === 'admin'" class="button secondary-button" to="/admin/accounts">管理后台</router-link>
       <button class="button quiet-danger-button" type="button" @click="leave">退出登录</button>
     </div>
+
+    <div v-if="remoteQr" class="remote-qr-backdrop" @click.self="remoteQr = ''">
+      <section class="card remote-qr-card" role="dialog" aria-modal="true" aria-label="手机访问二维码">
+        <h2>手机访问这台电脑</h2>
+        <p class="muted">手机扫码后打开独立远端页；本地电脑必须保持星瑶运行。</p>
+        <img :src="remoteQr" alt="远端页面二维码" />
+        <code>{{ remoteUrl }}</code>
+        <p v-if="remoteUrl.includes('127.0.0.1') || remoteUrl.includes('localhost')" class="muted">
+          当前地址是本机隧道地址，手机无法直接访问。请用公网域名打开服务器后再生成二维码。
+        </p>
+        <div class="remote-qr-actions">
+          <button class="button secondary-button" type="button" @click="copyRemoteUrl">复制链接</button>
+          <button class="button" type="button" @click="remoteQr = ''">关闭</button>
+        </div>
+      </section>
+    </div>
   </main>
 </template>
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, ref } from "vue";
+import QRCode from "qrcode";
 import { useRouter } from "vue-router";
 import { useAppStore } from "../stores/app";
 import { useAuthStore } from "../stores/auth";
 import { useDeviceStore } from "../stores/devices";
+import { apiFetch } from "../transport/api";
 
 const auth = useAuthStore();
 const app = useAppStore();
 const devices = useDeviceStore();
 const router = useRouter();
 const initial = computed(() => auth.accountId.trim().slice(0, 1) || "我");
+const remoteQr = ref("");
+const remoteUrl = ref("");
+const error = ref("");
 onMounted(() => devices.load().catch(() => undefined));
 
-function useDesktop(deviceId: string) {
-  app.disconnect();
-  app.connectDesktop(deviceId);
+async function useDesktop(deviceId: string) {
+  try {
+    const response = await apiFetch(`/api/remote/device/${encodeURIComponent(deviceId)}/token`, { method: "POST" });
+    if (!response.ok) throw new Error("远端访问令牌签发失败");
+    const issued = await response.json() as { token?: string };
+    if (!issued.token) throw new Error("远端访问令牌为空");
+    const base = (auth.server || window.location.origin).replace(/\/$/, "");
+    const url = `${base}/#/remote/${encodeURIComponent(deviceId)}?token=${encodeURIComponent(issued.token)}`;
+    remoteUrl.value = url;
+    remoteQr.value = await QRCode.toDataURL(url, { width: 240, margin: 1 });
+    window.open(url, "_blank", "noopener,noreferrer");
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "远端页面打开失败";
+  }
+}
+
+async function copyRemoteUrl() {
+  try {
+    await navigator.clipboard.writeText(remoteUrl.value);
+  } catch {
+    // 剪贴板权限被拒绝时保留二维码，用户仍可直接扫码。
+  }
 }
 
 async function leave() {

@@ -480,3 +480,26 @@ h1, h2, p { margin-top: 0; }
 @media (prefers-reduced-motion: reduce) {
   .typing-indicator span { animation: none; opacity: 0.7; }
 }
+
+
+/* 独立远端页与手机二维码 */
+.app-main.remote { padding: 0; }
+.remote-qr-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(0 0 0 / 35%);
+}
+.remote-qr-card {
+  width: min(92vw, 380px);
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  text-align: center;
+}
+.remote-qr-card img { width: 240px; height: 240px; background: #fff; border-radius: 10px; }
+.remote-qr-card code { max-width: 100%; overflow-wrap: anywhere; font-size: 11px; color: var(--muted); }
+.remote-qr-actions { display: flex; gap: 8px; }

@@ -78,6 +78,7 @@ import { computed, nextTick, onMounted, ref, watch } from "vue";
 import WatchPanel from "../components/WatchPanel.vue";
 import { useAppStore, type ChatMessage } from "../stores/app";
 import { useDeviceStore } from "../stores/devices";
+import { useAuthStore } from "../stores/auth";
 import { renderMd } from "../utils/md";
 
 interface ModelResult { ok?: boolean; msg?: string; active_model_id?: string; active_model_name?: string }
@@ -86,6 +87,7 @@ defineEmits<{ "open-navigation": [] }>();
 
 const app = useAppStore();
 const devices = useDeviceStore();
+const auth = useAuthStore();
 const text = ref("");
 const input = ref<HTMLTextAreaElement | null>(null);
 const sending = ref(false);
@@ -109,7 +111,8 @@ const modelPlaceholder = computed(() => {
 
 onMounted(() => {
   // 没有画面时也要能提示「设备离线 / 正在同步」，所以聊天页也拉一次设备列表。
-  if (app.profile === "desktop") void devices.load().catch(() => undefined);
+  const remotePage = window.location.hash.startsWith("#/remote/");
+  if (app.profile === "desktop" && !auth.remote && !remotePage) void devices.load().catch(() => undefined);
   if (app.shim) void app.loadModels();
   else app.connect();
 });

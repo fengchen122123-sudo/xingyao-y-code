@@ -21,6 +21,8 @@ export const useAuthStore = defineStore("auth", {
     credential: "",
     role: "user",
     mode: "gateway" as const,
+    /** 独立远端页：只走设备 WebSocket，不调用账号 REST。 */
+    remote: false,
   }),
   getters: {
     signedIn: (state) => Boolean(state.credential && state.server),
@@ -29,6 +31,7 @@ export const useAuthStore = defineStore("auth", {
     async hydrate() {
       // 服务器地址只在偏好/会话里，凭据在密钥库/会话里，两者分开取。
       this.server = await serverAddressGet();
+      this.remote = false;
       this.accountId = await secretGet(SESSION_ACCOUNT);
       this.credential = await secretGet(SESSION_TOKEN);
       this.role = (await secretGet(SESSION_ROLE)) || "user";
@@ -60,6 +63,7 @@ export const useAuthStore = defineStore("auth", {
         if (!response.ok) return false;
         const body = await response.json();
         this.credential = body.access_token;
+      this.remote = false;
         this.role = body.role || this.role;
         await secretSet(SESSION_TOKEN, this.credential);
         await secretSet(SESSION_ROLE, this.role);
@@ -99,6 +103,7 @@ export const useAuthStore = defineStore("auth", {
       await secretClear(SECRET_KEYS);
     },
     async logout() {
+      this.remote = false;
       const refresh = await secretGet(SESSION_REFRESH);
       const { useAppStore } = await import("./app");
       const { useDeviceStore } = await import("./devices");

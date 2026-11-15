@@ -21,6 +21,8 @@ from gateway.auth import (
     bump_epoch,
     create_account,
     init_admin,
+    issue_remote_token,
+    read_remote_access,
     issue_tokens,
     logout,
     read_access,
@@ -286,6 +288,17 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
             await app.state.sockets.close_account(account_id)
         return {"ok": True}
 
+    @app.post("/api/remote/device/{device_id}/token")
+    def remote_device_token(device_id: str, user: Principal = Depends(principal)):
+        device = database.execute(
+            "SELECT * FROM devices WHERE id = ? AND account_id = ? AND revoked = 0",
+            (device_id, user.account_id),
+        ).fetchone()
+        if device is None:
+            raise HTTPException(status_code=404, detail="设备不存在")
+        account = database.execute("SELECT * FROM accounts WHERE id = ?", (user.account_id,)).fetchone()
+        return issue_remote_token(database, account, jwt_secret, device_id)
+
     @app.post("/api/admin/devices")
     def add_device(body: DeviceBody, account_id: str, user: Principal = Depends(admin)):
         device_id, token = app.state.relay.create_device(database, account_id, body.name)
@@ -463,7 +476,11 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         except Exception:
             await websocket.close(code=4401)
             return
-        principal_now = read_access(database, str(first.get("jwt") or ""), jwt_secret)
+        presented = str(first.get("jwt") or "")
+        device_id = str(first.get("device_id") or "")
+        principal_now = read_access(database, presented, jwt_secret)
+        if principal_now is None and device_id:
+            principal_now = read_remote_access(database, presented, jwt_secret, device_id)
         if principal_now is None:
             await websocket.close(code=4401)
             return
@@ -611,8 +628,10 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         except Exception:
             await websocket.close(code=4401)
             return
-        user = read_access(database, str(first.get("jwt") or ""), jwt_secret)
         device_id = str(first.get("device_id") or "")
+        user = read_access(database, str(first.get("jwt") or ""), jwt_secret)
+        if user is None and device_id:
+            user = read_remote_access(database, str(first.get("jwt") or ""), jwt_secret, device_id)
         row = database.execute(
             "SELECT account_id, revoked FROM devices WHERE id = ?", (device_id,)
         ).fetchone()
