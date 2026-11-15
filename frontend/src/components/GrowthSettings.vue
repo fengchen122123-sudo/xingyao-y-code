@@ -387,7 +387,7 @@ onMounted(() => { void loadGrowth(); });
 .primary-button:disabled, .secondary-button:disabled { opacity: .5; cursor: not-allowed; }
 .secondary-button { background: var(--bg3); color: var(--text); }
 .growth-hint { margin: 12px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
-.growth-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
+.growth-error { margin: 12px 0 0; color: var(--red); font-size: 12px; }
 .growth-tip { margin: 12px 0 0; color: var(--green); font-size: 12px; }
 .growth-loading { color: var(--text-faint); font-size: 12px; }
 .growth-status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }

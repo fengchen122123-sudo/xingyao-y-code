@@ -4,7 +4,7 @@
       <div class="ph-ico"><AppIcon name="chart" :size="14" :stroke-width="2" /></div>
       <div class="ph-title">
         <h3>星链</h3>
-        <p class="ph-sub">星瑶编排复杂任务时的计划执行进度</p>
+        <p class="ph-sub">星瑶编排复杂任务时的执行进度</p>
       </div>
       <button class="chip-btn" title="关闭" @click="$emit('close')"><AppIcon name="x" :size="12" :stroke-width="2" /> 关闭</button>
     </div>
@@ -37,7 +37,7 @@
       </div>
 
       <div v-else class="pop-empty" data-test="task-dialog-empty">
-        计划还没有条目。星瑶拆解任务后，各条目的执行进度会在这里实时更新。
+        星链还没有条目。星瑶拆解任务后，各条目的执行进度会在这里实时更新。
       </div>
     </div>
   </div>

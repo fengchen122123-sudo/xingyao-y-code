@@ -1709,6 +1709,57 @@ export interface NovelExportDto {
   visible_chars?: number;
 }
 
+// 桌面宠物状态快照（后端 pets 桥接）：running/pid 来自进程探测，
+// available 表示 Electron 运行时与桌宠资源是否就绪（false 时设置页提示填路径），
+// enabled 为配置里的开关值（星瑶启动时按它决定是否拉起桌宠）
+export interface PetStatusDto {
+  running: boolean;
+  pid: number | null;
+  electron_path: string;
+  pet_dir: string;
+  available: boolean;
+  enabled: boolean;
+  // 任务提示：星瑶执行任务时桌宠冒泡播报；缺省按 true 处理
+  notify_enabled?: boolean;
+  // Electron 运行时状态（缺运行时时 available=false，设置页据此提示一键下载安装）
+  runtime?: PetRuntimeStatus;
+  ok?: boolean;
+  msg?: string;
+}
+
+// Electron 运行时按需安装状态（core/pet_runtime.py::status() 与 detect() 合并后的结构，
+// 由 gui_pet_mixin._pet_runtime_snapshot 组装）：运行时不再随安装包分发，首次启用桌宠时
+// 后台下载约 151MB 分卷、解压到用户目录 ~/.ycode/pet-runtime，装一次后续复用。
+// state 为下载状态机的当前阶段：idle/downloading/verifying/extracting/done/failed/unknown；
+// downloaded/total/size 均为字节数，percent 为 0-100 的整数，msg 为给人看的提示或失败原因。
+export interface PetRuntimeStatus {
+  installed: boolean;
+  exe: string | null;
+  version: string | null;
+  size: number;
+  state: 'idle' | 'downloading' | 'verifying' | 'extracting' | 'done' | 'failed' | 'unknown' | (string & {});
+  downloaded: number;
+  total: number;
+  percent: number;
+  msg: string;
+}
+
+// pet_get_runtime_status / pet_install_runtime 的统一返回：
+// install 只表示「请求已受理」（后台线程下载），真正进度靠轮询 runtime
+export interface PetRuntimeResult {
+  ok: boolean;
+  runtime?: PetRuntimeStatus;
+  msg?: string;
+}
+
+// pet_set_enabled / pet_set_electron_path / pet_restart 的统一返回：
+// 失败时带 msg，status 为操作后的真实快照（前端据此校准开关与状态行）
+export interface PetMutationResult {
+  ok: boolean;
+  msg?: string;
+  status?: PetStatusDto;
+}
+
 // 后端所有方法均返回 Promise<纯 JSON 对象>；大多数写操作的返回值形状
 // 为 { ok: boolean, msg?: string, ...其余按方法而定 }，此处以 any 承接，
 // 具体字段读取处自行按契约文档取用，避免过度约束导致类型摩擦。
@@ -2225,6 +2276,22 @@ export interface PyWebViewAPI {
   cancel_download_update(): Promise<any>;
   has_active_tasks(): Promise<any>;
   launch_installer(filePath: string): Promise<any>;
+
+  // ---------------------------------------------------------------------------
+  // 桌面宠物（设置页「桌面宠物」分区）：桌宠是本机 Electron 进程，开关会真正
+  // 在桌面显示/隐藏它；四个方法都返回 { ok, msg, status }，status 为同一份
+  // 状态快照（running/pid/available/enabled/electron_path/pet_dir）
+  // ---------------------------------------------------------------------------
+  pet_get_status(): Promise<PetStatusDto>;
+  pet_set_enabled(enabled: boolean): Promise<PetMutationResult>;
+  // 任务提示开关：只在配置里开关，与桌宠进程是否运行无关
+  pet_set_notify_enabled(enabled: boolean): Promise<PetMutationResult>;
+  pet_set_electron_path(path: string): Promise<PetMutationResult>;
+  pet_restart(): Promise<PetMutationResult>;
+  // Electron 运行时按需安装：get 返回当前快照（前端每 2 秒轮询画进度条）；
+  // install 起后台下载线程并立刻返回（ok 仅表示请求已受理，幂等：已装好/正在装都直接回当前状态）
+  pet_get_runtime_status(): Promise<PetRuntimeResult>;
+  pet_install_runtime(): Promise<PetRuntimeResult>;
 
   // ---------------------------------------------------------------------------
   // Git 工作台（规格 §11/§13；桥接层 gui_git_mixin.GitBridgeMixin）

@@ -156,17 +156,17 @@ async function decline() {
 .gate-clause h3 { margin: 0 0 8px; font-size: 13.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .gate-clause ol { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
 .gate-clause li { color: var(--text-dim); font-size: 12.5px; line-height: 1.8; }
-.gate-clause--key { border-left: 2px solid var(--danger); padding-left: 12px; }
-.gate-clause--key h3 { color: var(--danger); }
+.gate-clause--key { border-left: 2px solid var(--red); padding-left: 12px; }
+.gate-clause--key h3 { color: var(--red); }
 .gate-key-tag {
   padding: 1px 7px;
-  border: 1px solid var(--danger);
+  border: 1px solid var(--red);
   border-radius: 999px;
-  color: var(--danger);
+  color: var(--red);
   font-size: 11px;
   font-weight: 400;
 }
-.gate-error { margin: 10px 0 0; color: var(--danger); font-size: 12.5px; }
+.gate-error { margin: 10px 0 0; color: var(--red); font-size: 12.5px; }
 .gate-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 .gate-btn {
   min-height: 38px;

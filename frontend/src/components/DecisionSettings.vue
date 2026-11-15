@@ -720,11 +720,11 @@ onMounted(() => {
 .status-row { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-faint); flex: none; }
 .status-dot.ok { background: var(--green); }
-.status-dot.bad { background: var(--danger); }
+.status-dot.bad { background: var(--red); }
 .status-text { color: var(--text-dim); font-size: 13px; flex: 1; min-width: 180px; }
 .probe-results { list-style: none; margin: 8px 0 0; padding: 0 0 0 19px; display: grid; gap: 4px; font-size: 12px; }
 .probe-results li.ok { color: var(--green); }
-.probe-results li.bad { color: var(--danger); }
+.probe-results li.bad { color: var(--red); }
 .model-row { display: flex; gap: 10px; }
 .model-row .text-field { flex: 1; }
 .model-select { margin-top: 8px; }
@@ -760,7 +760,7 @@ onMounted(() => {
 .secondary-button:disabled { opacity: .5; cursor: not-allowed; }
 .decision-note { margin: 8px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
 .decision-note.warn { color: var(--warning); }
-.decision-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
+.decision-error { margin: 12px 0 0; color: var(--red); font-size: 12px; }
 .decision-saved { margin: 12px 0 0; color: var(--green); font-size: 12px; }
 
 @media (max-width: 768px) {

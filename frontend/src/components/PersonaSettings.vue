@@ -209,7 +209,7 @@ onMounted(loadPersona);
 .primary-button { background: var(--text); color: var(--bg0); }
 .primary-button:disabled { opacity: .5; cursor: not-allowed; }
 .secondary-button { background: var(--bg3); color: var(--text); }
-.persona-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
+.persona-error { margin: 12px 0 0; color: var(--red); font-size: 12px; }
 .persona-saved { margin: 12px 0 0; color: var(--green); font-size: 12px; }
 .persona-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
 

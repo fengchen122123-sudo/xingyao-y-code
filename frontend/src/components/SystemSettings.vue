@@ -898,7 +898,7 @@ async function runDoctor() {
 .setting-save { height: 38px; padding: 0 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
 .setting-save:hover:not(:disabled) { background: var(--bg3); }
 .setting-save:disabled { cursor: not-allowed; opacity: .6; }
-.setting-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
+.setting-error { margin: 12px 0 0; color: var(--red); font-size: 12px; }
 .setting-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
 
 /* ── 电脑操控区（Task 12）── */
@@ -980,7 +980,7 @@ async function runDoctor() {
 .computer-preflight { margin: 14px 0 0; padding: 0; list-style: none; }
 .computer-preflight li { display: flex; align-items: center; gap: 7px; margin: 0 0 6px; color: var(--text-faint); font-size: 12px; }
 .computer-preflight li.ok { color: var(--text-dim); }
-.computer-preflight li:not(.ok) svg { color: var(--danger); }
+.computer-preflight li:not(.ok) svg { color: var(--red); }
 .computer-preflight li.ok svg { color: var(--green); }
 
 /* ── 运行自检（T3b）── */
@@ -995,7 +995,7 @@ async function runDoctor() {
 .doctor-status-icon { margin-top: 2px; color: var(--text-faint); }
 .doctor-item--ok .doctor-status-icon { color: var(--green); }
 .doctor-item--warn .doctor-status-icon { color: var(--warning); }
-.doctor-item--fail .doctor-status-icon { color: var(--danger); }
+.doctor-item--fail .doctor-status-icon { color: var(--red); }
 .doctor-item-body { min-width: 0; }
 .doctor-item-head { display: flex; align-items: baseline; gap: 8px; }
 .doctor-name { font-size: 13px; color: var(--text-bright); }

@@ -350,61 +350,64 @@ onMounted(load);
 </script>
 
 <style scoped>
+/* 颜色一律走 style.css 里真实存在的语义别名：--text / --text-dim / --text-faint /
+   --green / --yellow / --red / --mono。--text-1/--text-2/--text-3、--ok、--warn、
+   --danger、--font-mono 在本项目没有定义，写进去等于取值透明。 */
 .feishu-settings { display: flex; flex-direction: column; gap: 14px; }
 .feishu-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .feishu-header h1 { margin: 0 0 4px; font-size: 17px; }
-.feishu-header p { margin: 0; font-size: 12.5px; color: var(--text-2); line-height: 1.6; }
-.refresh-button { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-2); }
+.feishu-header p { margin: 0; font-size: 12.5px; color: var(--text-dim); line-height: 1.6; }
+.refresh-button { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); }
 
 .feishu-status { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); font-size: 12.5px; }
-.feishu-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); }
-.feishu-status.is-connected .dot { background: var(--ok); }
+.feishu-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+.feishu-status.is-connected .dot { background: var(--green); }
 .feishu-status.is-connecting .dot,
-.feishu-status.is-reconnecting .dot { background: var(--warn); }
-.feishu-status.is-error .dot { background: var(--danger); }
-.feishu-status .meta { margin-left: auto; color: var(--text-3); font-size: 11.5px; }
-.feishu-status .err { color: var(--danger); font-size: 11.5px; }
+.feishu-status.is-reconnecting .dot { background: var(--yellow); }
+.feishu-status.is-error .dot { background: var(--red); }
+.feishu-status .meta { margin-left: auto; color: var(--text-faint); font-size: 11.5px; }
+.feishu-status .err { color: var(--red); font-size: 11.5px; }
 
 .feishu-card { display: flex; flex-direction: column; gap: 6px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }
 .switch-row { display: flex; align-items: flex-start; gap: 10px; padding-bottom: 8px; }
 .switch-row input { margin-top: 3px; }
 .switch-row b { display: block; font-size: 13px; }
-.switch-row small { display: block; margin-top: 2px; font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+.switch-row small { display: block; margin-top: 2px; font-size: 11.5px; color: var(--text-faint); line-height: 1.5; }
 
-.field-label { margin-top: 6px; font-size: 12px; color: var(--text-2); }
-.field-hint { margin: 2px 0 6px; font-size: 11.5px; color: var(--text-3); line-height: 1.6; }
+.field-label { margin-top: 6px; font-size: 12px; color: var(--text-dim); }
+.field-hint { margin: 2px 0 6px; font-size: 11.5px; color: var(--text-faint); line-height: 1.6; }
 .text-field { min-height: 38px; padding: 0 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg1); color: var(--text); font-size: 13px; }
 .text-field:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
-.mono { font-family: var(--font-mono); }
+.mono { font-family: var(--mono); }
 .secret-field { display: flex; gap: 8px; align-items: center; }
 .secret-field .text-field { flex: 1; }
 
 .feishu-actions { display: flex; gap: 8px; margin-top: 12px; }
 .primary-button { padding: 0 18px; min-height: 38px; border: none; border-radius: 9px; background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; }
 .primary-button:disabled { opacity: .5; }
-.secondary-button { padding: 0 14px; min-height: 38px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg1); color: var(--text-2); font-size: 13px; }
+.secondary-button { padding: 0 14px; min-height: 38px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg1); color: var(--text-dim); font-size: 13px; }
 .secondary-button:disabled { opacity: .5; }
-.feishu-message { margin: 8px 0 0; font-size: 12px; color: var(--ok); }
-.feishu-message.bad { color: var(--danger); }
+.feishu-message { margin: 8px 0 0; font-size: 12px; color: var(--green); }
+.feishu-message.bad { color: var(--red); }
 
 .feishu-checklist { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }
 .feishu-checklist h2 { margin: 0 0 8px; font-size: 13px; }
 .feishu-checklist ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 5px; }
-.feishu-checklist li { display: flex; align-items: baseline; gap: 7px; font-size: 12.5px; color: var(--text-2); }
+.feishu-checklist li { display: flex; align-items: baseline; gap: 7px; font-size: 12.5px; color: var(--text-dim); }
 .feishu-checklist li .mark { flex: none; }
-.feishu-checklist li.ok .what { color: var(--text-1); }
-.feishu-checklist li .how { margin-left: auto; text-align: right; font-size: 11.5px; color: var(--text-3); max-width: 60%; }
+.feishu-checklist li.ok .what { color: var(--text); }
+.feishu-checklist li .how { margin-left: auto; text-align: right; font-size: 11.5px; color: var(--text-faint); max-width: 60%; }
 
 .feishu-help { padding: 0 14px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }
-.help-toggle { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 13px 0; border: none; background: none; color: var(--text-1); font-size: 13.5px; font-weight: 600; text-align: left; }
-.help-toggle .chev { transition: transform .15s; color: var(--text-3); font-size: 16px; }
+.help-toggle { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 13px 0; border: none; background: none; color: var(--text); font-size: 13.5px; font-weight: 600; text-align: left; }
+.help-toggle .chev { transition: transform .15s; color: var(--text-faint); font-size: 16px; }
 .help-toggle .chev.open { transform: rotate(90deg); }
 .help-body ol, .help-body ul { margin: 0; padding-left: 18px; }
-.help-body li { margin-bottom: 8px; font-size: 12.5px; color: var(--text-2); line-height: 1.75; }
+.help-body li { margin-bottom: 8px; font-size: 12.5px; color: var(--text-dim); line-height: 1.75; }
 .help-body li > ul { margin: 4px 0 4px; }
 .help-body li > ul > li { margin-bottom: 4px; list-style: circle; }
-.help-body h3 { margin: 14px 0 6px; font-size: 12.5px; color: var(--text-1); }
+.help-body h3 { margin: 14px 0 6px; font-size: 12.5px; color: var(--text); }
 .help-body a { color: var(--accent); }
-.help-body code { padding: 1px 5px; border-radius: 4px; background: var(--bg1); font-family: var(--font-mono); font-size: 11.5px; }
-.help-body .tip { display: block; margin-top: 3px; color: var(--text-3); font-size: 11.5px; }
+.help-body code { padding: 1px 5px; border-radius: 4px; background: var(--bg1); font-family: var(--mono); font-size: 11.5px; }
+.help-body .tip { display: block; margin-top: 3px; color: var(--text-faint); font-size: 11.5px; }
 </style>
