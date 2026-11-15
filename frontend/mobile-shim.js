@@ -103,7 +103,10 @@
     if (ws) {
       try { ws.close(); } catch (_) {}
     }
-    pending.forEach(function (item) { item.reject(new Error('连接已关闭')); });
+    pending.forEach(function (item) {
+      if (item.timer) clearTimeout(item.timer);
+      item.reject(new Error('连接已关闭'));
+    });
     pending.clear();
   };
 
@@ -114,7 +117,13 @@
         return;
       }
       var id = ++seq;
-      pending.set(id, { resolve: resolve, reject: reject });
+      // 设备离线/对端失联时不能无限等：否则 App 的启动页永远关不掉。
+      var timer = setTimeout(function () {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        reject(new Error('连接超时，电脑可能离线'));
+      }, 25000);
+      pending.set(id, { resolve: resolve, reject: reject, timer: timer });
       ws.send(JSON.stringify({ method: method, args: args, id: id }));
     });
   }
@@ -218,6 +227,7 @@
         var p = pending.get(msg.id);
         if (p) {
           pending.delete(msg.id);
+          if (p.timer) clearTimeout(p.timer);
           if (msg.error) {
             p.reject(new Error(msg.error));
           } else {
@@ -248,6 +258,11 @@
       }
     };
     ws.onclose = function (event) {
+      pending.forEach(function (item) {
+        if (item.timer) clearTimeout(item.timer);
+        item.reject(new Error('连接已断开'));
+      });
+      pending.clear();
       if (event && event.code === 4401) {
         // 配对失效/被轮换：清掉本地 token（仅当与本次使用的相同，避免误清新 token），
         // 通知前端显示「配对已失效」，并停止重连（空 token 重连只会一直失败）

@@ -867,6 +867,13 @@ def mount_desktop_ui(app: FastAPI, desktop_dir: Path | None) -> None:
     if assets.is_dir():
         app.mount("/desktop-assets", StaticFiles(directory=str(desktop_dir)), name="desktop-assets")
     shim = desktop_dir.parent / "mobile-shim.js"
+    icon = desktop_dir / "icon.png"
+
+    @app.get("/icon.png", include_in_schema=False)
+    def desktop_icon():
+        if not icon.is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(str(icon), media_type="image/png")
 
     @app.get("/desktop-shim.js", include_in_schema=False)
     def desktop_shim():
