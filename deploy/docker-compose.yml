@@ -18,6 +18,7 @@ services:
       XINGYAO_GATEWAY_DIR: /srv/xingyao-state/gateway
       XINGYAO_ACCOUNTS_ROOT: /srv/xingyao-state/accounts
       XINGYAO_KEYRING_PASSWORD_FILE: /run/secrets/keyring_password
+      XINGYAO_KEYRING_HOST_PASSWORD_FILE: ${XINGYAO_KEYRING_HOST_PASSWORD_FILE:-/etc/xingyao/keyring_password}
       XINGYAO_WORKER_KEYRING_SOURCE: xingyao-keyring
     secrets:
       - source: keyring_password

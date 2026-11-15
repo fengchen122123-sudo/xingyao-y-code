@@ -1,5 +1,7 @@
 # 部署：网关 + 工人容器
 
+完整部署、升级、回滚和故障排查见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
 目标机器只跑一个网关进程（或一个网关容器），工人容器由网关按账号创建。
 所有平台模型 Key 都存在网关侧的加密钥匙串里，工人的卷里只留 `keyring:` 引用。
 
@@ -10,10 +12,12 @@
 ```bash
 sudo install -d -m 0700 /etc/xingyao
 sudo sh -c 'printf "%s" "换成你自己的强口令" > /etc/xingyao/keyring_password'
-sudo chmod 0400 /etc/xingyao/keyring_password   # 只有 root 能读
+sudo chown root:10001 /etc/xingyao/keyring_password
+sudo chmod 0440 /etc/xingyao/keyring_password
 ```
 
-`0400` 是硬要求：口令文件被同组或其他人读到，等于所有模型 Key 泄露。
+网关以 root 读取，工人以 UID 10001 读取，因此使用 `root:10001 0440`。
+不要让其他用户读取；口令泄露等于所有模型 Key 泄露。
 
 ## 2. docker compose 部署
 
