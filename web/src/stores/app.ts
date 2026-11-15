@@ -136,7 +136,20 @@ export const useAppStore = defineStore("app", {
       this.status = profile === "desktop" ? "正在连接这台电脑" : "正在连接";
       shim.connect();
       // 连上没有不能只看「socket 打开了」：要等 shim 拿到 hello/整态才算可用。
-      void shim.whenReady().then(() => {
+      void shim.whenReady().then(async () => {
+        if (this.shim !== shim) return;
+        // 初次连接偶尔会错过 yc_snapshot；就绪后再主动取一次整态兜底，
+        // 否则刷新页面会出现“有旧消息但侧栏没有会话”的错位。
+        if (!this.sessions.length) {
+          try {
+            const state = await shim.rpc("get_initial_state", []) as Record<string, unknown>;
+            if (this.shim === shim && state && typeof state.current_session !== "undefined") {
+              this.replaceSnapshot(state);
+            }
+          } catch {
+            // 交由正常重连/事件流恢复，不把首次加载卡在兜底请求上。
+          }
+        }
         if (this.shim === shim && this.status !== "已同步") this.status = "已连接";
       }).catch(() => undefined);
     },
@@ -281,6 +294,11 @@ export const useAppStore = defineStore("app", {
         if (this.currentSession) this.activeTurns[this.currentSession] = this.activeTurn;
       }
       this.status = "已同步";
+      // 后端重启后 current_session 可能为空，但历史会话仍在；自动打开最近一条，
+      // 不能让用户刷新后看到“新对话”而侧栏却有旧会话。
+      if (!this.currentSession && this.sessions.length) {
+        void this.chooseSession(this.sessions[0].name).catch(() => undefined);
+      }
     },
     restoreActiveTurn(turn: ActiveTurn) {
       this.activeTurn = String(turn.turn_id || "");
@@ -328,6 +346,15 @@ export const useAppStore = defineStore("app", {
     removePendingUser(id: string) {
       this.pendingUsers = this.pendingUsers.filter((item) => item.id !== id);
       this.messages = this.messages.filter((item) => item.id !== id);
+    },
+    async newSession() {
+      const shim = this.shim;
+      if (!shim) throw new Error("还没有接上星瑶");
+      const created = await shim.rpc("create_session", { title: "新对话", workdir: "GLOBAL" }) as
+        { ok?: boolean; msg?: string; session_name?: string } | undefined;
+      if (created && created.ok === false) throw new Error(created.msg || "新对话创建失败");
+      const state = await shim.rpc("get_initial_state", []) as Record<string, unknown>;
+      if (this.shim === shim) this.replaceSnapshot(state);
     },
     async chooseSession(name: string) {
       const shim = this.shim;

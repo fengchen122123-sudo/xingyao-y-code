@@ -117,6 +117,8 @@ describe("app connection and event isolation", () => {
     app.connect();
     let releaseReady!: () => void;
     shims[0].whenReady.mockReturnValueOnce(new Promise<void>((resolve) => { releaseReady = resolve; }));
+    // 连接就绪后的初始整态兜底请求先消耗一次响应，再轮到 loadModels。
+    shims[0].rpc.mockResolvedValueOnce({ current_session: "", sessions: [], messages: [] });
     shims[0].rpc.mockRejectedValueOnce(new Error("模型服务暂不可用"));
     const loading = app.loadModels();
     expect(shims[0].rpc).not.toHaveBeenCalled();
@@ -175,6 +177,28 @@ describe("app connection and event isolation", () => {
     await expect(app.send("hi")).rejects.toThrow("发送失败");
     expect(app.messages).toEqual([]);
     expect(app.pendingUsers).toEqual([]);
+  });
+
+  it("creates a real new server session and refreshes the sidebar snapshot", async () => {
+    const app = useAppStore();
+    signedInAuth();
+    app.connect();
+    shims[0].rpc.mockImplementation(async (method: string) => {
+      if (method === "create_session") return { ok: true, session_name: "session_new" };
+      if (method === "get_initial_state") {
+        return {
+          current_session: "session_new",
+          sessions: [{ folder_name: "对话", sessions: [{ name: "session_new" }] }],
+          messages: [],
+        };
+      }
+      return { ok: true };
+    });
+    await app.newSession();
+    expect(shims[0].rpc).toHaveBeenCalledWith("create_session", { title: "新对话", workdir: "GLOBAL" });
+    expect(app.currentSession).toBe("session_new");
+    expect(app.sessions).toEqual([{ name: "session_new" }]);
+    expect(app.messages).toEqual([]);
   });
 
   it("reports connected once the transport is really ready", async () => {

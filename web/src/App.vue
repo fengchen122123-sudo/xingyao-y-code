@@ -97,10 +97,17 @@ async function chooseSession(name: string) {
 }
 
 async function newSession() {
-  const used = new Set(app.sessions.map((session) => session.name));
-  let name = "新对话";
-  let index = 2;
-  while (used.has(name)) name = `新对话 ${index++}`;
-  await chooseSession(name);
+  if (sessionBusy.value) return;
+  sessionBusy.value = true;
+  actionError.value = "";
+  try {
+    await app.newSession();
+    await router.push("/chat");
+    navigationOpen.value = false;
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : "新对话创建失败，请再试一次。";
+  } finally {
+    sessionBusy.value = false;
+  }
 }
 </script>
