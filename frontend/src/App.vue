@@ -71,10 +71,10 @@
             <button
               class="chip-btn task-entry"
               data-test="task-entry"
-              title="查看任务计划执行进度"
+              title="查看星链执行进度"
               @click.stop="taskDialogOpen = !taskDialogOpen"
             >
-              <AppIcon name="loader" :size="12" :stroke-width="2" :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }" /><span class="chip-label">计划</span>
+              <AppIcon name="loader" :size="12" :stroke-width="2" :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }" /><span class="chip-label">星链</span>
               <span v-if="taskEntry.activeCount > 0" class="task-entry-badge" data-test="task-entry-badge">{{ taskEntry.activeCount }}</span>
             </button>
             <TaskProgressDialog v-if="taskDialogOpen" @close="taskDialogOpen = false" />

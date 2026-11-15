@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root { --breath-px: 2px; --breath-sec: 4.2s; }
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      background: transparent; overflow: hidden; user-select: none;
+      cursor: grab;
+    }
+    body.dragging { cursor: grabbing; }
+    /* 外层不做任何缩放或过渡：窗口尺寸已锁定，交互缩放会被误读成角色忽大忽小 */
+    #stage { position: relative; width: 100%; height: 100%; transform-origin: center bottom; }
+    /* 角色区：贴底的正方形，边长 = 窗口宽度；上方整条 BUBBLE_BAND 留给气泡。
+       aspect-ratio 让托盘换尺寸时自动跟随，不需要 JS 传值。 */
+    #breath {
+      position: absolute; left: 0; bottom: 0; width: 100%;
+      aspect-ratio: 1 / 1; transform-origin: center bottom;
+    }
+    #breath.breathing { animation: breathe var(--breath-sec) ease-in-out infinite; }
+    #breath.landing { animation: land 420ms cubic-bezier(.2,.8,.3,1) both; }
+    body.no-motion #breath { animation: none !important; transform: none !important; }
+    @keyframes breathe {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(calc(-1 * var(--breath-px))); }
+    }
+    @keyframes land {
+      0%   { transform: translateY(-5px) scaleY(1.03); }
+      38%  { transform: translateY(2px) scaleY(0.95) scaleX(1.03); }
+      72%  { transform: translateY(-1px) scaleY(1.01); }
+      100% { transform: translateY(0) scaleY(1); }
+    }
+    /* 单图层：不做 opacity 过渡，杜绝两张不同姿势半透明叠加 */
+    .layer {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; image-rendering: auto;
+    }
+    #stage.grab-hint .layer { filter: drop-shadow(0 0 6px rgba(255,150,40,0.9)); }
+    /* 气泡完整落在顶部 56px 留白带内：top 4px + 最多 48px = 52px < 56px，
+       角色区从 y=56px 才开始，任何台词都不会压到丸子头或脸。 */
+    #bubble {
+      position: absolute; left: 50%; top: 4px; transform: translateX(-50%);
+      width: 90%; max-height: 48px; box-sizing: border-box;
+      display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+      background: rgba(255,255,255,0.96); color: #222;
+      border: 1px solid #e3e3e3; border-radius: 10px;
+      padding: 4px 8px; font: 12px/1.3 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      opacity: 0; transition: opacity 200ms linear;
+      pointer-events: none; text-align: center;
+      white-space: normal; word-break: break-word; overflow: hidden;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.18);
+    }
+    #bubble.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="breath">
+      <img id="frame" class="layer" draggable="false" />
+    </div>
+    <div id="bubble"></div>
+  </div>
+  <script src="./renderer.js"></script>
+</body>
+</html>

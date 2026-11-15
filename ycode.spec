@@ -129,6 +129,14 @@ common_datas = [
     ('skills', 'skills'),
     # 内置插件目录（随包发布）：core/plugin_loader.py 自动扫描并默认信任
     ('plugins', 'plugins'),
+    # 桌面宠物（设置 → 桌面宠物 的开关会拉起这个 Electron 桌宠）：只随包携带
+    # 源码与帧资产（约 0.5MB）。Electron 运行时近 370MB，不进安装包——
+    # core/pet_manager.py 启动时按「配置里的路径 → 包内 node_modules/electron
+    # → PATH 里的 electron」查找，找不到时设置页会提示用户填写 electron.exe 路径。
+    ('pets/xingyao_pet/src', 'pets/xingyao_pet/src'),
+    ('pets/xingyao_pet/assets', 'pets/xingyao_pet/assets'),
+    ('pets/xingyao_pet/scripts', 'pets/xingyao_pet/scripts'),
+    ('pets/xingyao_pet/package.json', 'pets/xingyao_pet'),
     # GUI 运行时用 WM_SETICON 设置窗口/任务栏图标，需随包携带 ico 文件
     ('assets/ycode.ico', 'assets'),
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）

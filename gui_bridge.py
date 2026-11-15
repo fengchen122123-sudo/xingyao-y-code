@@ -64,6 +64,7 @@ from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_
 from gui_git_mixin import GitBridgeMixin
 from gui_browser_mixin import BrowserBridgeMixin
 from gui_snip_mixin import SnipBridgeMixin
+from gui_pet_mixin import PetBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -1789,7 +1790,7 @@ class _SecretaryDispatchService:
         return dict(row)
 
 
-class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
+class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -2037,6 +2038,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             daemon=True,
             name="gui-update-cleaner",
         ).start()
+
+        # 桌宠自动恢复（gui_pet_mixin.PetBridgeMixin）：延迟 2.5s 在后台线程按
+        # pet_enabled 开关拉起桌宠。延迟是为了让窗口首帧先出来；定时器 daemon 化 +
+        # 回调内部全量 try/except，桌宠起不来或多等一会儿都不能阻塞 __init__、更不能
+        # 让 GUI 启动失败。
+        try:
+            _pet_restore_timer = threading.Timer(2.5, self._pet_auto_restore)
+            _pet_restore_timer.daemon = True
+            _pet_restore_timer.start()
+        except Exception:
+            logger.warning("桌宠延迟自动恢复定时器创建失败（已忽略）", exc_info=True)
 
     def _on_workflow_run_event(self, run_id: str, kind: str, payload: dict) -> None:
         """解释执行器实时事件 → 前端桥事件（JS 派发队列保证顺序）。"""
@@ -3818,6 +3830,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         if event_type not in ("token_delta", "thinking_delta"):
             self._flush_deltas()
         self._emit_raw(event_type, data)
+        # 桌宠气泡提示：方法内部已按白名单+节流吞掉异常，这里再兜一层，
+        # 确保桌宠的任何问题都不会打断事件派发链路。
+        try:
+            self._pet_notify_event(event_type, data)
+        except Exception:
+            logger.debug("桌宠提示转发失败", exc_info=True)
 
     def _emit_raw(self, event_type: str, data: Any):
         # 无窗口的 serve 进程没有 JS 桥，但局域网和飞书仍要收到同一条事件。

@@ -828,6 +828,7 @@ KNOWN_CONFIG_KEYS = frozenset({
     "command_shell", "shell_env_policy",
     "agent_turn_step_limit", "prompt_cache_keepalive_seconds",
     "mermaid_auto_open", "read_file_result_max_chars",
+    "pet_enabled", "pet_electron_path", "pet_notify_enabled",
     # 断点续跑总开关（S4）：只登记键名，缺省=关闭；关闭时状态机、事件序列、
     # 请求字节与改动前完全一致（规格 §9.5）
     "resume",
