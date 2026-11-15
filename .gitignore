@@ -59,6 +59,9 @@ mytemp/
 config.json
 active_skills.json
 mcp.json
+# 桌宠渲染配置不是密钥：帧映射/台词/气泡时长/窗口参数，必须随代码走
+# （gitignore 后规则覆盖前规则，本例外必须写在上面 config.json 之后，勿上移）
+!pets/xingyao_pet/src/renderer/config.json
 
 # OS
 .DS_Store
@@ -209,3 +212,32 @@ skills/tokenrhythm-account/reference.md
 # 误操作产生的临时文件（命令重定向写坏 / 空文件），不入库
 /a.txt
 /y
+
+# 官网后台：登录口令，以及含已下架草稿的本地全量数据。
+# 访客能看到的内容在 website/data/site.json，会随站点一起部署。
+site_admin/secret.json
+site_admin/store.json
+site_admin/admin.db
+pets/xingyao_pet/node_modules/
+
+# 误操作产生的空文件（命令重定向写坏，0 字节），不入库
+# —— 与上面的 /a.txt、/y、/' 同类，只用根目录锚定形式，避免误伤子目录同名文件
+/$null
+/)'
+
+# 前端桌面版构建产物：由服务器端 `vite build --outDir desktop-dist` 生成，
+# 每次构建内容全变（带 hash 的资源名），源码在 frontend/ 下，产物不入库
+frontend/desktop-dist/
+
+# 一次性部署脚本（含服务器端口与内部路径），仅本地使用，不入库
+_deploy_scratch/
+
+# Three.js 实验 demo（约 2-3MB 静态资源，仅本地试验），不入主仓库
+rainy-konbini/
+
+# 一次性探针输出（内容仅为连通性检查结果），不入库
+scripts/_probe5.txt
+
+# 一次性 Playwright 截图脚本（硬编码个人路径，仅本地使用），不入库
+scripts/shot_sheet.py
+scripts/shot_test.py
