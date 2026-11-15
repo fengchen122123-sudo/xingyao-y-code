@@ -27,13 +27,16 @@
           <div class="avatar avatar-lg" aria-hidden="true">星</div>
           <p>直接说你要做的事。</p>
         </div>
-        <article v-for="message in app.messages" :key="message.id" class="message" :class="message.role">
+        <article v-for="(message, index) in app.messages" :key="message.id" class="message" :class="[message.role, { waiting: isWaiting(message, index) }]">
           <div v-if="message.role !== 'user'" class="avatar avatar-sm" aria-hidden="true">星</div>
           <div class="message-bubble">
             <details v-if="message.thinking" class="thinking">
               <summary>思考过程</summary>
               <p>{{ message.thinking }}</p>
             </details>
+            <div v-if="isWaiting(message, index)" class="typing-indicator" role="status" aria-label="星瑶正在思考">
+              <span></span><span></span><span></span><em>正在思考</em>
+            </div>
             <div v-if="message.role === 'user'" class="message-text">{{ message.text }}</div>
             <div v-else-if="message.text" class="message-text markdown" v-html="render(message.text)"></div>
             <div v-for="tool in message.tools || []" :key="tool.id" class="tool-note">
@@ -73,7 +76,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import WatchPanel from "../components/WatchPanel.vue";
-import { useAppStore } from "../stores/app";
+import { useAppStore, type ChatMessage } from "../stores/app";
 import { useDeviceStore } from "../stores/devices";
 import { renderMd } from "../utils/md";
 
@@ -114,6 +117,16 @@ watch(() => app.shim, (shim) => {
   requestedModelId.value = "";
   if (shim) void app.loadModels();
 });
+
+function isWaiting(message: ChatMessage, index: number) {
+  return message.role !== "user"
+    && index === app.messages.length - 1
+    && !message.text
+    && !message.thinking
+    && !(message.tools?.length)
+    && Boolean(app.activeTurn)
+    && app.status !== "星瑶没有连上";
+}
 
 function render(value: string) {
   return renderMd(value);

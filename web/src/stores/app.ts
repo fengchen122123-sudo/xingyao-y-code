@@ -73,6 +73,8 @@ function mapMessages(value: unknown): ChatMessage[] {
 export const useAppStore = defineStore("app", {
   state: () => ({
     messages: [] as ChatMessage[],
+    /** 本地先显示、等待服务端 turn_start 认领的用户消息，避免回显重复。 */
+    pendingUsers: [] as { id: string; text: string }[],
     sessions: [] as { name: string }[],
     currentSession: "",
     activeTurn: "",
@@ -169,10 +171,16 @@ export const useAppStore = defineStore("app", {
           this.activeTurn = turn;
         }
         const userText = String(data.display_text || data.user_text || "");
-        if (userText && !this.messages.some((item) => item.role === "user" && item.text === userText)) {
-          this.messages.push({ id: String(Date.now()), role: "user", text: userText });
+        // 服务端回显的 display_text 可能带上下文/空白，不能靠文本相等去重。
+        // 优先认领本地乐观气泡；只有没有待认领消息时才从事件创建。
+        const pending = this.pendingUsers.shift();
+        if (pending) {
+          const local = this.messages.find((item) => item.id === pending.id);
+          if (local && userText) local.text = userText;
+        } else if (userText) {
+          this.messages.push({ id: `event-user-${Date.now()}`, role: "user", text: userText });
         }
-        this.messages.push({ id: String(Date.now() + 1), role: "agent", text: "", thinking: "", tools: [] });
+        this.messages.push({ id: `event-agent-${Date.now()}`, role: "agent", text: "", thinking: "", tools: [] });
         return;
       }
       const turn = String(data.turn_id || "");
@@ -298,15 +306,28 @@ export const useAppStore = defineStore("app", {
       return created;
     },
     async send(text: string) {
-      this.messages.push({ id: String(Date.now()), role: "user", text });
+      const id = `local-user-${Date.now()}-${this.pendingUsers.length}`;
+      this.messages.push({ id, role: "user", text });
+      this.pendingUsers.push({ id, text });
       const shim = this.shim;
       if (!shim) {
+        this.removePendingUser(id);
         this.status = "还没有接上星瑶";
         return;
       }
-      const result = await shim.rpc("send_user_message", { text, session_name: this.currentSession || undefined }) as
-        { ok?: boolean; msg?: string } | undefined;
-      if (result && result.ok === false) throw new Error(result.msg || "消息没有发出去，请再试一次");
+      try {
+        const result = await shim.rpc("send_user_message", { text, session_name: this.currentSession || undefined }) as
+          { ok?: boolean; msg?: string } | undefined;
+        if (result && result.ok === false) throw new Error(result.msg || "消息没有发出去，请再试一次");
+      } catch (error) {
+        // 没被服务端接受就不能留一条看起来已经发出去的本地消息。
+        this.removePendingUser(id);
+        throw error;
+      }
+    },
+    removePendingUser(id: string) {
+      this.pendingUsers = this.pendingUsers.filter((item) => item.id !== id);
+      this.messages = this.messages.filter((item) => item.id !== id);
     },
     async chooseSession(name: string) {
       const shim = this.shim;
@@ -315,6 +336,7 @@ export const useAppStore = defineStore("app", {
         ({ messages?: unknown; session_name?: string; active_turn_snapshot?: ActiveTurn; ok?: boolean; msg?: string } & ModelState) | undefined;
       if (result && result.ok === false) throw new Error(result.msg || "会话没有切换成功");
       this.currentSession = String(result?.session_name || name);
+      this.pendingUsers = [];
       this.messages = mapMessages(result?.messages);
       this.syncModel(result || {});
       // 围观画面和它的 run 属于上一个会话，切过去就必须清掉，否则会拿旧截图冒充当前会话。
@@ -378,6 +400,7 @@ export const useAppStore = defineStore("app", {
       this.shim?.close();
       this.shim = null;
       this.messages = [];
+      this.pendingUsers = [];
       this.sessions = [];
       this.currentSession = "";
       this.activeTurn = "";

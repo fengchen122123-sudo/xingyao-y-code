@@ -153,6 +153,30 @@ describe("app connection and event isolation", () => {
     expect(app.previewRun).toBe("");
   });
 
+  it("claims the optimistic user bubble instead of duplicating a turn echo", async () => {
+    const app = useAppStore();
+    signedInAuth();
+    app.connect();
+    app.currentSession = "s";
+    shims[0].rpc.mockResolvedValueOnce({ ok: true });
+    await app.send("你多大了");
+    expect(app.messages.filter((item) => item.role === "user")).toHaveLength(1);
+    app.apply({ type: "turn_start", data: { session_name: "s", turn_id: "t1", user_text: "你多大了\n" } });
+    expect(app.messages.filter((item) => item.role === "user")).toHaveLength(1);
+    expect(app.pendingUsers).toEqual([]);
+  });
+
+  it("removes the optimistic bubble when the server rejects the send", async () => {
+    const app = useAppStore();
+    signedInAuth();
+    app.connect();
+    app.currentSession = "s";
+    shims[0].rpc.mockResolvedValueOnce({ ok: false, msg: "发送失败" });
+    await expect(app.send("hi")).rejects.toThrow("发送失败");
+    expect(app.messages).toEqual([]);
+    expect(app.pendingUsers).toEqual([]);
+  });
+
   it("reports connected once the transport is really ready", async () => {
     const app = useAppStore();
     signedInAuth();
