@@ -43,9 +43,17 @@
     } catch (_) {}
   }
   var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
-  // 云中转的完整桌面 UI：服务器注入 __ycRelayDevice，直接连网关 relay。
+  // 云中转的完整桌面 UI / 独立移动端：服务器注入 __ycRelayDevice，直接连网关 relay。
   var relayDevice = window.__ycRelayDevice || window.location.pathname.split('/')[2] || '';
-  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + (relayDevice ? '/relay/client?device_id=' + encodeURIComponent(relayDevice) : '/');
+  // 网关可能被反代到子路径（如 /xy/bot/desktop/<设备号>）：ws 端点必须跟着前缀走，
+  // 否则固定打根路径 /relay/client 会 404。前缀＝设备号之前、去掉 desktop|m 那一段。
+  var relayPrefix = '';
+  if (relayDevice) {
+    var relaySegs = (window.location.pathname || '').split('/');
+    var relayAt = relaySegs.indexOf(relayDevice);
+    if (relayAt > 1) relayPrefix = relaySegs.slice(0, relayAt - 1).join('/');
+  }
+  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + (relayDevice ? relayPrefix + '/relay/client?device_id=' + encodeURIComponent(relayDevice) : '/');
 
   var ws = null;
   var seq = 0;
