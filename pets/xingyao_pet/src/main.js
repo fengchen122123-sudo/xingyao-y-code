@@ -1,8 +1,9 @@
 // main.js — 桌宠主进程：窗口、托盘、持久化、门禁记录。
 // 平台差异一律调 platform.js，本文件零 process.platform 判断。
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, protocol, net, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { pathToFileURL } = require("url");
 const platform = require("./platform");
 
 // 回归自检开关：PET_SELFTEST=1 时隔离 userData，避免与正在运行的桌宠抢单实例锁
@@ -16,6 +17,105 @@ if (process.env.PET_SELFTEST !== "1") {
   try {
     app.setPath("userData", path.join(require("os").homedir(), ".ycode", "xingyao-pet-data"));
   } catch { /* 路径不可写时退回 Electron 默认值，不让桌宠起不来 */ }
+}
+
+// 素材自定义协议必须在 app ready 之前登记特权，晚于 ready 登记不生效。
+// 皮肤素材在用户目录，用 file:// 加载时图片与 index.html 不同源，canvas getImageData
+// （点击命中检测 / 空白穿透）会被判成跨源污染直接抛 SecurityError；统一成 pet-asset://
+// 单一源后既躲开画布污染，也能把「素材根」钉死，顺带挡住 ../ 路径穿越。
+protocol.registerSchemesAsPrivileged([
+  { scheme: "pet-asset", privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }
+]);
+
+// ---------- 皮肤（宠物包） ----------
+// 五个环境变量由星瑶后端启动桌宠时注入；用户手动 node 启动调试时全都不存在，一律回落内置形象。
+const SKIN_ID = (process.env.YCODE_PET_SKIN || "").trim() || "xingyao";
+const SKIN_NAME = (process.env.YCODE_PET_NAME || "").trim() || "星瑶";
+const BUILTIN_ASSETS = path.join(__dirname, "..", "assets");
+const SKIN_ASSETS = (process.env.YCODE_PET_ASSETS || "").trim() || BUILTIN_ASSETS;
+const BUILTIN_CONFIG = path.join(__dirname, "renderer", "config.json");
+const SKIN_CONFIG = (process.env.YCODE_PET_CONFIG || "").trim() || BUILTIN_CONFIG;
+// 渲染端拿到的两个素材根：自定义协议的统一前缀，由下面的 registerPetAssetProtocol 解析。
+// skin 是当前宠物包，builtin 是随包内置素材——渲染层某个状态在宠物包里一帧都没有时，
+// 才整组换用 builtin，绝不逐帧混用。
+const ASSET_SCHEME_BASE = "pet-asset://skin";
+const BUILTIN_SCHEME_BASE = "pet-asset://builtin";
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null; // 不存在 / 不是合法 JSON：调用方一律按「没配」处理，不影响启动
+  }
+}
+
+// 宠物包只需写自己和内置不一样的字段，缺省沿用内置行为。
+// 否则每个皮肤包都得复制一整份 config.json，内置默认值以后改了也会被旧包覆盖回去。
+function loadSkinConfig() {
+  const base = readJsonFile(BUILTIN_CONFIG) || {};
+  gateLog(`[gate] CONFIG builtin=${BUILTIN_CONFIG} baseKeys=${Object.keys(base).join(",")}`);
+  if (!SKIN_CONFIG || path.resolve(SKIN_CONFIG) === path.resolve(BUILTIN_CONFIG)) return base;
+  const skin = readJsonFile(SKIN_CONFIG);
+  if (!skin || typeof skin !== "object") return base; // 皮肤配置缺失或坏掉：整体回落内置
+
+  // language / version / anchor 这类标量直接把皮肤值盖上去
+  const merged = { ...base, ...skin };
+  // canvas / motion / bubble / behaviors：逐键覆盖，皮肤只改它想改的那几个键
+  for (const key of ["canvas", "motion", "bubble", "behaviors"]) {
+    const v = skin[key];
+    if (v && typeof v === "object") merged[key] = { ...(base[key] || {}), ...v };
+  }
+  // animations：逐状态覆盖，同名状态整段替换（fps/loop/still/next 是成套的，逐键混会出半套配置），
+  // 内置有、皮肤没提的状态保留内置版本。
+  if (skin.animations && typeof skin.animations === "object") {
+    const anim = { ...(base.animations || {}) };
+    for (const [st, spec] of Object.entries(skin.animations)) {
+      if (spec && typeof spec === "object") anim[st] = spec;
+    }
+    merged.animations = anim;
+  }
+  return merged;
+}
+
+// ---------- 皮肤素材协议 ----------
+// 请求形如 pet-asset://skin/pet/idle/frame_000.png，host 决定查哪个素材根：
+//   skin    → 当前宠物包目录（严格只查这一处）
+//   builtin → 随包内置的星瑶素材
+// 为什么不在这里「先皮肤再内置」逐文件兜底：素材没画全的宠物包会把皮肤帧和内置帧
+// 混进同一个动作（待机第 1 帧自绘、第 2 帧突然变回星瑶）。回落必须由渲染层按
+// 「整个状态」判断，协议只负责把两个素材根分开，语义单一才不会串台。
+function registerPetAssetProtocol() {
+  protocol.handle("pet-asset", async (request) => {
+    let parsed = null;
+    let rel = "";
+    try {
+      parsed = new URL(request.url);
+      rel = decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
+    } catch {
+      return new Response("", { status: 400 }); // 畸形 URL 直接拒，不往下拼路径
+    }
+    const root = parsed.host === "builtin" ? BUILTIN_ASSETS : parsed.host === "skin" ? SKIN_ASSETS : "";
+    if (!root) return new Response("", { status: 404 }); // 未知 host 直接拒，不暴露别的目录
+    const rootAbs = path.resolve(root);
+    const fileAbs = path.resolve(path.join(root, rel));
+    // 前缀校验必须带上分隔符，否则根目录的兄弟目录（如 /x/pet-evil）会被误判成子路径
+    if (fileAbs !== rootAbs && !fileAbs.startsWith(rootAbs + path.sep)) {
+      return new Response("", { status: 404 });
+    }
+    let stat = null;
+    try { stat = fs.statSync(fileAbs); } catch { stat = null; }
+    if (!stat || !stat.isFile()) return new Response("", { status: 404 });
+    try {
+      const res = await net.fetch(pathToFileURL(fileAbs).toString());
+      const headers = new Headers(res.headers);
+      // 渲染端帧图是 crossOrigin="anonymous" 加载的：缺 CORS 头图片会落进不透明源，
+      // canvas 读像素抛 SecurityError，点击命中检测与空白穿透会一起失效。
+      headers.set("Access-Control-Allow-Origin", "*");
+      return new Response(res.body, { status: res.status, headers });
+    } catch {
+      return new Response("", { status: 500 });
+    }
+  });
 }
 
 const BASE_SIZE = 128; // 256@2x 显示为 128pt
@@ -167,6 +267,7 @@ function createWindow() {
     x,
     y,
     transparent: true,
+    backgroundColor: "#00000000",
     frame: false,
     hasShadow: false,
     resizable: false,
@@ -182,6 +283,7 @@ function createWindow() {
   });
 
   win.setAlwaysOnTop(settings.alwaysOnTop, platform.alwaysOnTopLevel());
+  win.setBackgroundColor("#00000000");
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.setIgnoreMouseEvents(false);
   win.loadFile(path.join(__dirname, "renderer", "index.html"));
@@ -287,30 +389,123 @@ function createTray() {
     { type: "separator" },
     { label: "退出", click: () => app.quit() }
   ]);
-  tray.setToolTip("星瑶 · 桌宠");
+  // 显示名跟着当前宠物包走，避免多皮肤时托盘永远写着「星瑶」
+  tray.setToolTip(`${SKIN_NAME} · 桌宠`);
   tray.setContextMenu(menu);
 }
 
 // 右键宠物本体弹出的快捷菜单（由渲染端坐标触发）
+// 坐标必须是「窗口内容区」坐标（渲染端 clientX/clientY）：Windows 上 menu.popup 的 x/y
+// 相对窗口而不是屏幕，早先传的是 screenX/screenY，菜单就被推到了窗口外老远处。
+// 显式传 window：桌宠窗口 focusable=false，永远不是「当前焦点窗口」，不带 window 时
+// 定位基准会落到别的窗口上。
+// 把一次「互动」转给渲染层：菜单只是触发器，动画与台词都由渲染层按现有状态机执行，
+// 主进程不重复实现一套动画逻辑
+function sendEmote(kind) {
+  if (!win || win.webContents.isDestroyed()) return;
+  win.webContents.send("pet:emote", kind);
+}
+
+// 把窗口挪回主屏右下角：用户把宠物拖出屏幕或换显示器后，右键一下就能找回来。
+// 用 lockedSize 而不是读回窗口尺寸——读回再写会在 150% DPI 下把角色越拖越大
+function dockToBottomRight() {
+  if (!win || !lockedSize.width) return;
+  const wa = screen.getPrimaryDisplay().workArea;
+  const x = wa.x + wa.width - lockedSize.width - 40;
+  const y = wa.y + wa.height - lockedSize.height - 8;
+  win.setBounds({ x, y, width: lockedSize.width, height: lockedSize.height });
+  saveState({ x, y });
+}
+
+// 打开用户宠物目录（~/.ycode/pets）：不存在就先建出来，否则 shell.openPath 会失败
+function openPetsDir() {
+  const dir = path.join(require("os").homedir(), ".ycode", "pets");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    shell.openPath(dir);
+  } catch (err) {
+    gateLog(`[gate] OPEN-PETS-DIR FAIL ${err && err.message ? err.message : err}`);
+  }
+}
+
 function showPetContextMenu(x, y) {
   if (!win) return;
   const menu = Menu.buildFromTemplate([
-    { label: "隐藏 / 显示", click: () => (win.isVisible() ? win.hide() : win.show()) },
+    // 顶部用禁用项当标题，一眼能确认当前生效的是哪个宠物包
+    { label: `${SKIN_NAME} · 桌宠`, enabled: false },
+    { type: "separator" },
+    { label: "摸摸头", click: () => sendEmote("greet") },
+    { label: "逗她一下", click: () => sendEmote("interact") },
+    { label: "让她说句话", click: () => sendEmote("talk") },
+    { type: "separator" },
     { label: "睡觉 / 唤醒", click: () => win.webContents.send("pet:sleep") },
+    { label: "隐藏 / 显示", click: () => (win.isVisible() ? win.hide() : win.show()) },
+    { type: "separator" },
     {
-      label: "动效（关掉后完全静止）",
-      type: "checkbox",
-      checked: settings.animate,
-      click: (item) => {
-        settings.animate = item.checked;
-        win.webContents.send("animate-changed", item.checked);
-        saveState({ settings });
-      }
+      label: "尺寸",
+      submenu: [
+        { label: "小", click: () => resizePet(96) },
+        { label: "中", click: () => resizePet(128) },
+        { label: "大", click: () => resizePet(160) }
+      ]
+    },
+    { label: "回到右下角", click: () => dockToBottomRight() },
+    { type: "separator" },
+    {
+      label: "更多设置",
+      submenu: [
+        {
+          label: "窗口置顶",
+          type: "checkbox",
+          checked: settings.alwaysOnTop,
+          click: (item) => {
+            settings.alwaysOnTop = item.checked;
+            win.setAlwaysOnTop(item.checked, platform.alwaysOnTopLevel());
+            saveState({ settings });
+          }
+        },
+        {
+          label: "鼠标穿透（空白处）",
+          type: "checkbox",
+          checked: settings.clickThrough,
+          click: (item) => {
+            settings.clickThrough = item.checked;
+            win.webContents.send("click-through-changed", item.checked);
+            saveState({ settings });
+          }
+        },
+        {
+          label: "安静模式（少冒泡）",
+          type: "checkbox",
+          checked: settings.quiet,
+          click: (item) => {
+            settings.quiet = item.checked;
+            win.webContents.send("quiet-changed", item.checked);
+            saveState({ settings });
+          }
+        },
+        {
+          // 动效是「关掉后完全静止」的硬开关：渲染层收到后锁死单帧
+          label: "动效（关掉后完全静止）",
+          type: "checkbox",
+          checked: settings.animate,
+          click: (item) => {
+            settings.animate = item.checked;
+            win.webContents.send("animate-changed", item.checked);
+            saveState({ settings });
+          }
+        }
+      ]
     },
     { type: "separator" },
+    { label: "打开宠物目录", click: () => openPetsDir() },
     { label: "退出", click: () => app.quit() }
   ]);
-  menu.popup({ x, y });
+  // 窗口很小（128×184），坐标钳在窗口内，避免渲染端给出异常值（NaN / 负值）时菜单飘走
+  const size = lockedSize.width ? lockedSize : win.getBounds();
+  const px = Number.isFinite(x) ? Math.min(Math.max(Math.round(x), 0), size.width) : undefined;
+  const py = Number.isFinite(y) ? Math.min(Math.max(Math.round(y), 0), size.height) : undefined;
+  menu.popup({ window: win, x: px, y: py });
 }
 
 // ---------- IPC ----------
@@ -323,6 +518,7 @@ function registerIpc() {
     gateLog(`[gate] G1 FAIL ${JSON.stringify(payload)}`);
   });
   ipcMain.on("window:moveBy", (_e, dx, dy) => {
+    gateLog(`[gate] MOVE-BY dx=${dx} dy=${dy} lockedSize=${lockedSize.width}x${lockedSize.height}`);
     if (!win || !lockedSize.width) return;
     const b = win.getBounds();
     // 只把 x/y 读回来算新位置；尺寸必须用锁定常量显式传完整矩形。
@@ -348,6 +544,15 @@ function registerIpc() {
     }
   });
   ipcMain.on("pet:contextmenu", (_e, x, y) => showPetContextMenu(x, y));
+  // 皮肤信息：渲染端不做任何推导，两个素材根 + 「内置与皮肤包合并后的 config」一次给全，
+  // 渲染层据此决定每个状态用皮肤帧，还是整组回落内置帧
+  ipcMain.handle("pet:get-skin", () => ({
+    id: SKIN_ID,
+    name: SKIN_NAME,
+    assetsBase: ASSET_SCHEME_BASE,
+    builtinBase: BUILTIN_SCHEME_BASE,
+    config: loadSkinConfig()
+  }));
   ipcMain.handle("settings:get", () => settings);
   ipcMain.handle("app:onboarded", () => !!loadState().onboarded);
   ipcMain.on("app:onboarded", () => saveState({ onboarded: true }));
@@ -437,6 +642,9 @@ if (!gotLock) {
       settings = { ...settings, ...savedSettings };
     }
     gateLog(`[gate] app starting ${app.getVersion()}`);
+    // 一行说清当前用的皮肤与素材根，排查「为什么显示的还是旧形象」时先看这行
+    gateLog(`[gate] SKIN id=${SKIN_ID} name=${SKIN_NAME} assets=${SKIN_ASSETS} config=${SKIN_CONFIG}`);
+    registerPetAssetProtocol(); // 必须早于 createWindow（loadFile 之后渲染端就会请求素材）
     registerIpc();
     createWindow();
     setupStdinBridge();

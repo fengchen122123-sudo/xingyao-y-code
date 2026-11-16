@@ -16,5 +16,9 @@ contextBridge.exposeInMainWorld("petAPI", {
   onAnimateChanged: (cb) => ipcRenderer.on("animate-changed", (_e, v) => cb(v)),
   contextMenu: (x, y) => ipcRenderer.send("pet:contextmenu", x, y),
   onPetSleep: (cb) => ipcRenderer.on("pet:sleep", () => cb()),
+  // 皮肤信息：主进程按 YCODE_PET_* 解析好（含配置合并），渲染端只管用
+  getSkin: () => ipcRenderer.invoke("pet:get-skin"),
+  // 右键菜单的互动入口：菜单只发语义，动画与台词由渲染层执行
+  onEmote: (cb) => ipcRenderer.on("pet:emote", (_e, kind) => cb(kind)),
   onBubble: (cb) => ipcRenderer.on("pet:bubble", (_e, text, ms) => cb(text, ms))
 });

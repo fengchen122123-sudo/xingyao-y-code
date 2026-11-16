@@ -35,8 +35,101 @@
         <span class="pet-toggle-state">{{ notifyEnabled ? '已开启' : '已关闭' }}</span>
       </label>
       <p class="pet-note pet-note-inline" data-test="pet-notify-note">
-        星瑶执行任务时会冒泡，比如开工、翻文件、敲命令、搞定；关掉就只保留桌宠自己的日常台词。
+        只在需要你出手时冒泡：等你确认、有事问你，任务完成或出错也会说一声；关掉就只保留桌宠自己的日常台词。
       </p>
+
+      <!-- 无聊时自己说话：与「任务提示」是两条独立气泡来源，互不影响 -->
+      <div class="pet-chat">
+        <label class="pet-toggle pet-toggle-secondary">
+          <input
+            data-test="pet-chat-enabled"
+            type="checkbox"
+            :checked="chatEnabled"
+            :disabled="chatBusy || loading || !bridgeReady"
+            @change="onChatToggle"
+          />
+          <span class="pet-toggle-text">无聊时自己说话</span>
+          <span class="pet-toggle-state">{{ chatEnabled ? '已开启' : '已关闭' }}</span>
+        </label>
+        <p class="pet-note pet-note-inline">
+          空闲超过上面这个时长后才会开口；之后每次间隔在它的 0.4~2.6 倍之间随机（10 分钟档约 4~26 分钟），
+          一天最多 40 句。只带时间和目录名，不读你的文件内容。
+        </p>
+        <div class="pet-chat-row">
+          <label class="pet-chat-field">
+            <span class="pet-chat-field-label">空闲多久算无聊</span>
+            <select
+              class="pet-chat-select"
+              data-test="pet-chat-idle"
+              :value="String(chatIdleSeconds)"
+              :disabled="chatBusy || !bridgeReady"
+              @change="onChatIdleChange"
+            >
+              <!-- 后端会把阈值钳在 60~86400 秒，旧配置/被钳过的值可能不在预设里；
+                   这里按真实值补一项，否则 select 会显示成空白 -->
+              <option v-if="!chatIdlePresets.includes(chatIdleSeconds)" :value="String(chatIdleSeconds)">
+                {{ chatIdleSeconds >= 60 ? `${Math.round(chatIdleSeconds / 60)} 分钟` : `${chatIdleSeconds} 秒` }}
+              </option>
+              <option value="300">5 分钟</option>
+              <option value="600">10 分钟</option>
+              <option value="1800">30 分钟</option>
+            </select>
+          </label>
+          <label class="pet-chat-field pet-chat-field-grow">
+            <span class="pet-chat-field-label">用哪个模型说</span>
+            <select
+              class="pet-chat-select"
+              data-test="pet-chat-model"
+              :value="chatModelId"
+              :disabled="chatBusy || !bridgeReady"
+              @change="onChatModelChange"
+            >
+              <option value="">自动（副模型 → 主模型）</option>
+              <option v-for="m in chatModels" :key="m.id" :value="m.id">
+                {{ m.name }}{{ m.provider_name ? `（${m.provider_name}）` : '' }}
+              </option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <!-- 宠物形象：列表与切换都走后端（磁盘上真正有什么以 pet_list_skins 为准） -->
+      <div class="pet-skin-head">
+        <span class="field-label pet-skin-label">宠物形象</span>
+        <button
+          class="pet-skin-dir-button"
+          data-test="pet-skins-open-dir"
+          type="button"
+          :disabled="!skinDir"
+          @click="openSkinDir"
+        >打开宠物目录</button>
+      </div>
+      <p class="pet-note pet-note-inline">
+        点卡片切换，切换会重新打开桌宠（约 1 秒）；把宠物包放进下面的目录，重启星瑶后就会出现在列表里。
+      </p>
+      <code v-if="skinDir" class="mono pet-skin-dir" data-test="pet-skins-dir">{{ skinDir }}</code>
+
+      <div class="pet-skin-grid" data-test="pet-skins">
+        <button
+          v-for="s in skins"
+          :key="s.id"
+          class="pet-skin-card"
+          :class="{ 'is-active': s.id === activeSkin }"
+          :disabled="skinBusy || s.id === activeSkin"
+          :data-test="`pet-skin-${s.id}`"
+          type="button"
+          @click="selectSkin(s.id)"
+        >
+          <img v-if="s.thumbnail" class="pet-skin-thumb" :src="s.thumbnail" :alt="s.name" />
+          <span v-else class="pet-skin-thumb pet-skin-thumb-empty">{{ skinInitial(s.name) }}</span>
+          <span class="pet-skin-name">{{ s.name }}</span>
+          <span class="pet-skin-meta">
+            <span class="pet-skin-badge">{{ skinSourceLabel(s.source) }}</span>
+            <span v-if="s.id === activeSkin" class="pet-skin-badge pet-skin-badge-active">使用中</span>
+          </span>
+        </button>
+      </div>
+      <p v-if="!skins.length" class="pet-note" data-test="pet-skins-empty">还没有可用的宠物形象。</p>
 
       <p class="pet-status" data-test="pet-status">
         <span class="pet-dot" :class="{ on: running && bridgeReady }"></span>
@@ -129,7 +222,15 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 import AppIcon from './AppIcon.vue';
-import type { PetMutationResult, PetRuntimeStatus, PetStatusDto } from '../types/pywebview';
+import type {
+  PetChatModelOption,
+  PetChatSettingsResult,
+  PetMutationResult,
+  PetRuntimeStatus,
+  PetSkinDto,
+  PetSkinResult,
+  PetStatusDto,
+} from '../types/pywebview';
 
 // 桌宠状态：运行中（running/pid）、是否启用（enabled）、运行时是否可用（available）
 const bridgeReady = ref(true);
@@ -147,6 +248,13 @@ const electronPath = ref('');
 const pendingText = ref('');
 const message = ref('');
 const messageOk = ref(true);
+
+// 宠物形象（皮肤）：skins 为后端扫出来的全部形象，activeSkin 是当前激活 id，
+// skinDir 是用户放宠物包的目录（「打开宠物目录」直接用它）
+const skins = ref<PetSkinDto[]>([]);
+const activeSkin = ref('');
+const skinDir = ref('');
+const skinBusy = ref(false);
 
 // Electron 运行时按需安装（运行时不再随安装包分发）：缺运行时时点开关或上方按钮
 // 都走同一条支路，状态集中在这组 ref 上，绝不另造一套并行逻辑
@@ -255,6 +363,9 @@ function applyStatus(status?: PetStatusDto, syncPath = false) {
   applyRuntime(status.runtime);
   // 旧后端不带该字段时按开启处理，保持桌宠原有冒泡行为
   notifyEnabled.value = typeof status.notify_enabled === 'boolean' ? status.notify_enabled : true;
+  // 形象以状态快照为准：切换失败、别处改了配置时，前端列表里的 active 可能已经过期，
+  // 只有后端返回的 skin_id 才是「磁盘上真正加载的形象」
+  if (typeof status.skin_id === 'string' && status.skin_id) activeSkin.value = status.skin_id;
   if (syncPath && typeof status.electron_path === 'string') electronPath.value = status.electron_path;
 }
 
@@ -274,6 +385,99 @@ async function refresh() {
     report(false, '读取桌宠状态失败');
   } finally {
     loading.value = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 宠物形象（皮肤）列表 / 切换 / 打开目录
+// ---------------------------------------------------------------------------
+
+// 缩略图缺失时的占位：取名字首字（Array.from 保证 emoji 之类不被截成半个码元）
+function skinInitial(name: string): string {
+  const chars = Array.from((name || '').trim());
+  return chars.length ? chars[0] : '宠';
+}
+
+// 来源角标：内置 / 我的宠物（未知来源原样显示，避免后端新增来源时界面空白）
+function skinSourceLabel(source: string): string {
+  if (source === 'builtin') return '内置';
+  if (source === 'user') return '我的宠物';
+  return source || '宠物';
+}
+
+// 容错写回：列表、当前形象、用户目录三者都以返回值为准（字段缺失时保留旧值）
+function applySkins(res?: PetSkinResult) {
+  if (!res) return;
+  if (Array.isArray(res.skins)) {
+    skins.value = res.skins.filter((s) => s && typeof s.id === 'string');
+  }
+  // active 是后端认定的当前形象；为空时退回条目上的 active 标记，避免高亮整体丢失
+  if (typeof res.active === 'string' && res.active) {
+    activeSkin.value = res.active;
+  } else {
+    const flagged = skins.value.find((s) => s.active);
+    if (flagged) activeSkin.value = flagged.id;
+  }
+  // user_dir 可能刚被后端建出来，跟着写回，保证「打开宠物目录」立刻可用
+  if (typeof res.user_dir === 'string') skinDir.value = res.user_dir;
+}
+
+async function loadSkins() {
+  if (disposed) return;
+  const api = getApi();
+  // 老后端没有 pet_list_skins：静默返回，不显示列表也不报错，其余功能照常可用
+  if (!api || typeof api.pet_list_skins !== 'function') return;
+  try {
+    const res = await api.pet_list_skins();
+    if (disposed) return;
+    applySkins(res);
+    if (res && res.ok === false) report(false, res.msg || '读取宠物列表失败');
+  } catch {
+    if (disposed) return;
+    report(false, '读取宠物列表失败');
+  }
+}
+
+async function selectSkin(id: string) {
+  if (skinBusy.value) return; // 切换会重启桌宠，重复点击直接吞掉
+  if (id === activeSkin.value) return;
+  const api = getApi();
+  if (!api || typeof api.pet_set_skin !== 'function') {
+    if (!api) bridgeReady.value = false;
+    report(false, '当前版本不支持切换宠物形象');
+    return;
+  }
+  skinBusy.value = true;
+  message.value = '';
+  try {
+    const res: PetMutationResult | undefined = await api.pet_set_skin(id);
+    if (disposed) return;
+    // 状态快照是真相来源：切换后桌宠已按新形象重启，running/pid 等都变了
+    if (res?.status) applyStatus(res.status);
+    // 再拉一次列表：后端可能因新形象缺配置/缺缩略图而实际回落到别的形象，
+    // 只有重新读一次才能让卡片高亮与磁盘真实状态一致
+    await loadSkins();
+    report(Boolean(res?.ok), res?.msg || (res?.ok ? '已切换' : '切换失败'));
+  } catch {
+    if (disposed) return;
+    report(false, '切换失败：桌面桥接不可用');
+  } finally {
+    skinBusy.value = false;
+  }
+}
+
+async function openSkinDir() {
+  if (!skinDir.value) return;
+  const api = getApi();
+  if (!api || typeof api.reveal_in_explorer !== 'function') {
+    report(false, '打开宠物目录失败');
+    return;
+  }
+  try {
+    const res = await api.reveal_in_explorer(skinDir.value);
+    if (res && res.ok === false) report(false, '打开宠物目录失败');
+  } catch {
+    report(false, '打开宠物目录失败');
   }
 }
 
@@ -477,6 +681,133 @@ async function toggleNotify(next: boolean) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 无聊时自己说话（pet_chat_*）：闲置到阈值后由模型生成一句台词冒泡。
+// 与「任务提示」完全独立：两条气泡来源各自有自己的开关和忙碌标记。
+// ---------------------------------------------------------------------------
+
+// 空闲阈值预设：选项固定三档；后端会把值钳在 60~86400 秒，
+// 手改配置或旧值不在预设里时，模板按真实值动态补一项，避免 select 显示成空白
+const chatIdlePresets = [300, 600, 1800];
+const chatEnabled = ref(false);
+const chatIdleSeconds = ref(600);
+const chatModelId = ref('');
+const chatModels = ref<PetChatModelOption[]>([]);
+const chatBusy = ref(false);
+
+// 容错写回：字段缺失时保留旧值（老后端或局部失败不该把界面清空）；
+// models 非数组时置空而不是保留旧列表，避免展示已被删掉的模型
+function applyChatSettings(res?: PetChatSettingsResult) {
+  if (!res) return;
+  if (typeof res.enabled === 'boolean') chatEnabled.value = res.enabled;
+  if (typeof res.idle_seconds === 'number' && Number.isFinite(res.idle_seconds)) {
+    chatIdleSeconds.value = Math.round(res.idle_seconds);
+  }
+  if (typeof res.model_id === 'string') chatModelId.value = res.model_id;
+  chatModels.value = Array.isArray(res.models)
+    ? res.models.filter((m) => m && typeof m.id === 'string')
+    : [];
+}
+
+// 返回 true 表示确实从后端读到了设置（调用方据此判断要不要自己回滚界面）
+async function loadChatSettings(): Promise<boolean> {
+  if (disposed) return false;
+  const api = getApi();
+  // 老后端没有 pet_chat_get_settings：静默返回，这组控件保持默认值，其余功能照常可用
+  if (!api || typeof api.pet_chat_get_settings !== 'function') return false;
+  try {
+    const res = await api.pet_chat_get_settings();
+    if (disposed) return false;
+    applyChatSettings(res);
+    if (res && res.ok === false) report(false, res.msg || '读取「自己说话」设置失败');
+    return true;
+  } catch {
+    if (disposed) return false;
+    report(false, '读取「自己说话」设置失败');
+    return false;
+  }
+}
+
+// 保存后必须回读：后端会把 idle_seconds 钳在 60~86400 秒，前端选的档位不一定被原样接受，
+// 只有重新 get 一次，开关与下拉显示的才是真正生效的值（失败时这也顺带完成了视觉回滚）
+async function saveChat(patch: {
+  enabled?: boolean;
+  idle_seconds?: number;
+  model_id?: string;
+}): Promise<boolean> {
+  if (chatBusy.value) return true; // 一次只发一个写请求，连点直接吞掉，避免请求互相覆盖
+  const api = getApi();
+  if (!api || typeof api.pet_chat_set_settings !== 'function') {
+    if (!api) bridgeReady.value = false;
+    const synced = await loadChatSettings();
+    if (synced) report(false, '当前版本不支持「自己说话」设置');
+    return synced;
+  }
+  chatBusy.value = true;
+  message.value = '';
+  let synced = false;
+  try {
+    const res = await api.pet_chat_set_settings(patch);
+    if (disposed) return false;
+    // 先回读再报结论：回读如果把「读取失败」写进提示区，会盖掉更重要的保存结论
+    synced = await loadChatSettings();
+    if (disposed) return synced;
+    if (res?.ok) report(true, res.msg || '已保存');
+    else report(false, res?.msg || '保存失败');
+  } catch {
+    if (disposed) return false;
+    // 桥接不可用：控件已经被点成新值，能读就回读一次把界面拉回后端真配置
+    synced = await loadChatSettings();
+    if (disposed) return synced;
+    report(false, '保存失败：桌面桥接不可用');
+  } finally {
+    chatBusy.value = false;
+  }
+  return synced;
+}
+
+function onChatToggle(event: Event) {
+  const target = event.target as HTMLInputElement | null;
+  const next = Boolean(target?.checked);
+  const previous = chatEnabled.value;
+  // 先乐观置位：只有 chatEnabled 真的变过一次，Vue 才会把 DOM 勾选一并改写；
+  // 保存失败时回读会把 chatEnabled 拉回后端真值，勾选也就跟着回滚
+  chatEnabled.value = next;
+  void saveChat({ enabled: next }).then((synced) => {
+    if (synced || disposed) return;
+    // 连设置都读不回来（老后端 / 桥接不可用）：手动还原，避免开关停在没生效的状态
+    chatEnabled.value = previous;
+    if (target) target.checked = previous;
+  });
+}
+
+function onChatIdleChange(event: Event) {
+  const target = event.target as HTMLSelectElement | null;
+  const next = Number(target?.value);
+  // Number('') === 0：空值/脏值直接忽略，别把 0 送给后端（后端会钳成最小值）
+  if (!Number.isFinite(next) || next <= 0) return;
+  const previous = chatIdleSeconds.value;
+  chatIdleSeconds.value = next;
+  void saveChat({ idle_seconds: next }).then((synced) => {
+    if (synced || disposed) return;
+    chatIdleSeconds.value = previous;
+    if (target) target.value = String(previous);
+  });
+}
+
+function onChatModelChange(event: Event) {
+  const target = event.target as HTMLSelectElement | null;
+  // 空串是合法值（= 自动），不能当成「没选」跳过
+  const next = String(target?.value ?? '');
+  const previous = chatModelId.value;
+  chatModelId.value = next;
+  void saveChat({ model_id: next }).then((synced) => {
+    if (synced || disposed) return;
+    chatModelId.value = previous;
+    if (target) target.value = previous;
+  });
+}
+
 async function savePath() {
   const api = getApi();
   if (!api || typeof api.pet_set_electron_path !== 'function') {
@@ -517,7 +848,12 @@ async function restart() {
   }
 }
 
-onMounted(refresh);
+// 状态、形象列表、「自己说话」设置并行拉取：三者互不依赖，串行只会白等多次往返
+onMounted(() => {
+  void refresh();
+  void loadSkins();
+  void loadChatSettings();
+});
 
 // 组件卸载：停掉运行时轮询并置卸载标志，之后不再发任何请求
 onUnmounted(() => {
@@ -582,10 +918,45 @@ onUnmounted(() => {
 .pet-error { color: var(--theme-danger); }
 .pet-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
 
+/* 宠物形象：标题行左侧沿用 field-label，右侧只给一个克制的小按钮（打开目录是辅助动作） */
+.pet-skin-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 20px 0 0; }
+.pet-skin-label { margin: 0; }
+.pet-skin-dir-button { min-height: 28px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--text-dim); font-size: 12px; cursor: pointer; flex: none; }
+.pet-skin-dir-button:hover:not(:disabled) { color: var(--text); background: var(--bg3); }
+.pet-skin-dir-button:disabled { opacity: .5; cursor: not-allowed; }
+.pet-skin-dir { display: block; margin: 8px 0 0; color: var(--text-faint); font-size: 11px; word-break: break-all; }
+.pet-skin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; margin-top: 10px; }
+.pet-skin-card { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; cursor: pointer; }
+.pet-skin-card:hover:not(:disabled) { background: var(--bg3); }
+/* 当前形象用强调色描边；正在切换时卡片仍保持可读，只把光标收掉 */
+.pet-skin-card.is-active { border-color: var(--accent); }
+.pet-skin-card:disabled { cursor: default; }
+.pet-skin-thumb { width: 64px; height: 64px; object-fit: contain; border-radius: 8px; }
+/* 缩略图缺失时的占位方块：与 img 同尺寸，居中显示名字首字 */
+.pet-skin-thumb-empty { display: grid; place-items: center; border: 1px solid var(--border); background: var(--bg3); color: var(--text-faint); font-size: 22px; font-weight: 600; }
+.pet-skin-name { width: 100%; font-size: 13px; font-weight: 600; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pet-skin-meta { display: flex; align-items: center; justify-content: center; gap: 4px; flex-wrap: wrap; color: var(--text-faint); font-size: 11px; }
+.pet-skin-badge { padding: 1px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg3); color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+.pet-skin-badge-active { border-color: var(--accent); color: var(--accent); background: transparent; }
+
 @media (max-width: 768px) {
   .pet-header { flex-direction: column; }
   .pet-path-row { flex-wrap: wrap; }
   .pet-path-row .secondary-button { margin-top: 8px; }
   .pet-actions { flex-wrap: wrap; }
+  /* 窄屏放不下 104px 三列：降到 88px，一行能多塞一张卡片 */
+  .pet-skin-grid { grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); }
+  /* 窄屏把两个下拉各占一行，挤在一行会把「自动（副模型 → 主模型）」截断 */
+  .pet-chat-field, .pet-chat-field-grow { min-width: 100%; }
 }
+
+/* 无聊时自己说话：与「任务提示」同属气泡开关，视觉沿用它的开关样式，
+   下面只补两个下拉的排版（阈值 + 模型并排，窄屏各占一行） */
+.pet-chat { margin-top: 16px; }
+.pet-chat-row { display: flex; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.pet-chat-field { display: flex; flex-direction: column; gap: 5px; min-width: 150px; }
+.pet-chat-field-grow { flex: 1 1 240px; min-width: 220px; }
+.pet-chat-field-label { color: var(--text-dim); font-size: 12px; }
+.pet-chat-select { min-height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text); font-size: 13px; }
+.pet-chat-select:disabled { opacity: .6; cursor: not-allowed; }
 </style>

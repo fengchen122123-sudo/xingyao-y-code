@@ -103,6 +103,63 @@ def _pet_dir() -> Path:
     return PET_DIR
 
 
+def pet_dir_path() -> Path:
+    """桌宠目录（等价于 _pet_dir()），供其它模块复用同一套路径解析规则。
+
+    core/pet_skins.py 也要按同样规则解析桌宠目录（内置星瑶的 assets / 配置都相对
+    它定位）。公开这个函数是为了不重复实现路径优先级（环境变量 → 打包位置 →
+    源码树）：两处各写一遍，改安装布局时必然有一处悄悄失效。
+    """
+    return _pet_dir()
+
+
+def _active_skin_safe() -> dict:
+    """当前激活皮肤的安全快照（id/name/assets_dir/config_path），任何异常都不外抛。
+
+    桌宠开关绝不能因为宠物库解析失败而整体失败：pet_skins 不可用、宠物包元数据
+    损坏、配置里留着已删除的 id，最坏也只是回落成内置星瑶——那仍是一只完整可
+    显示的形象，比设置页报错、开关点了没反应好得多。
+    """
+    pet = _pet_dir()
+    fallback = {
+        "id": "xingyao",
+        "name": "星瑶",
+        "assets_dir": str(pet / "assets"),
+        "config_path": str(pet / "src" / "renderer" / "config.json"),
+    }
+    # 不在模块顶层 import pet_skins：pet_skins 内部会延迟导入本模块，顶层互导会绕
+    # 成环。两种导入形式都试（本仓库里两种习惯都存在），写法同 _runtime_electron_candidates。
+    active_skin_id = None
+    resolve_active = None
+    try:
+        from .pet_skins import active_skin_id, resolve_active
+    except Exception:
+        try:
+            from core.pet_skins import active_skin_id, resolve_active
+        except Exception:
+            logger.debug("pet_skins 不可用，桌宠回落内置形象", exc_info=True)
+    if active_skin_id is None or resolve_active is None:
+        return fallback
+    try:
+        skin = resolve_active(active_skin_id())
+    except Exception:
+        logger.debug("解析激活皮肤失败，桌宠回落内置形象", exc_info=True)
+        return fallback
+    if not isinstance(skin, dict):
+        return fallback
+    # 字段缺失/为 None 时逐项回落；assets_dir、config_path 允许为空（含义是"用内置
+    # 那份"），由调用方决定不传，这里不擅自填成内置路径免得名字与形象错配。
+    try:
+        return {
+            "id": str(skin.get("id") or fallback["id"]),
+            "name": str(skin.get("name") or fallback["name"]),
+            "assets_dir": str(skin.get("assets_dir") or ""),
+            "config_path": str(skin.get("config_path") or ""),
+        }
+    except Exception:
+        return fallback
+
+
 def _config_value(key: str, default=None):
     """读单个配置项（先看模块级属性，再回落 config.json 的载荷）。
 
@@ -319,12 +376,16 @@ def get_status() -> dict:
             has_main = False
         available = bool(has_main and electron is not None)
 
+        skin = _active_skin_safe()
         status = {
             "running": pid is not None,
             "pid": pid,
             "electron_path": str(electron) if electron is not None else None,
             "pet_dir": str(pet),
             "available": available,
+            # 当前激活的桌宠形象：前端设置页可直接显示，不必自己再调 pet_skins。
+            "skin_id": str(skin.get("id") or "xingyao"),
+            "skin_name": str(skin.get("name") or "星瑶"),
         }
         if not available:
             missing = []
@@ -354,6 +415,9 @@ def _safe_status() -> dict:
             "electron_path": None,
             "pet_dir": str(PET_DIR),
             "available": False,
+            # 兜底骨架也带皮肤，保证前端任何时候都能读到这两个字段。
+            "skin_id": "xingyao",
+            "skin_name": "星瑶",
         }
 
 
@@ -403,6 +467,18 @@ def _start_locked(electron_path: str) -> dict:
     # 关键：ELECTRON_RUN_AS_NODE 会让 electron.exe 退化成一个 node 解释器去执行
     # 文件名参数，窗口永远不会出现，且进程能一直活着骗过探活。
     env.pop("ELECTRON_RUN_AS_NODE", None)
+    # 当前皮肤通过环境变量传给渲染层：桌宠那边只认环境变量，路径解析（环境变量 →
+    # 打包位置 → 源码树）全部留在 Python 侧，避免 Electron 里再写一套目录优先级。
+    skin = _active_skin_safe()
+    env["YCODE_PET_SKIN"] = str(skin.get("id") or "xingyao")
+    env["YCODE_PET_NAME"] = str(skin.get("name") or "星瑶")
+    assets_dir = str(skin.get("assets_dir") or "")
+    if assets_dir:
+        # 空串不传：Electron 收到空值不会自己回落，不设置该键才是"用内置那份"。
+        env["YCODE_PET_ASSETS"] = assets_dir
+    config_path = str(skin.get("config_path") or "")
+    if config_path:
+        env["YCODE_PET_CONFIG"] = config_path
 
     proc = subprocess.Popen(
         [str(electron), str(pet)],

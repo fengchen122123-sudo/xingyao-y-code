@@ -2,13 +2,19 @@
 // 关键决策：待机/睡觉/落地锁单帧（原始立绘），动效用平滑几何变换；
 // 动作帧一律单图层硬切。双层 crossfade 会把两张不同姿势半透明叠成鬼影，那是闪烁主因。
 (() => {
-  const cfgUrl = new URL("./config.json", location.href);
   const stageEl = document.getElementById("stage");
   const breathEl = document.getElementById("breath");
   const frameEl = document.getElementById("frame");
   const bubbleEl = document.getElementById("bubble");
 
+  // 可见帧图也走匿名 CORS 加载：hitPet 会把它 drawImage 到 canvas 读像素，
+  // 少了这个属性画布会被判成跨源污染，getImageData 抛 SecurityError（CORS 头由素材协议侧回）
+  frameEl.crossOrigin = "anonymous";
+
   let config = null;
+  // 素材根：assetBase 是当前宠物包，builtinBase 是随包内置素材（整状态回落时用）
+  let assetBase = "";
+  let builtinBase = "";
   const frames = {};   // state -> [Image...]
   const lines = {};    // state -> [string...]
   let state = "idle";
@@ -23,32 +29,47 @@
   let quiet = false;
   let animate = true;
   let walkDir = 1;
+  let lastActivityAt = performance.now();
   // 尊重系统「减弱动态效果」无障碍开关
   const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 
   // ---------- 素材加载与运行时校验 ----------
+  // 两个素材根都走 pet-asset 协议：与页面同源，画布不会被污染
+  function assetUrl(rel, base) {
+    return `${base || assetBase}/${rel}`;
+  }
+
+  // 单个状态整组加载：只从给定素材根读，读到第一张缺帧就停（探测式，不需要预先知道帧数）
+  async function loadFrames(st, base) {
+    const list = [];
+    for (let i = 0; i <= 64; i++) {
+      try {
+        const url = assetUrl(`pet/${st}/frame_${String(i).padStart(3, "0")}.png`, base);
+        const img = await loadImage(url);
+        if (!img.naturalWidth || img.naturalWidth <= 0) throw new Error("naturalWidth=0");
+        if (img.naturalWidth !== config.canvas.width) throw new Error(`size ${img.naturalWidth}!=${config.canvas.width}`);
+        list.push(img);
+      } catch {
+        break;
+      }
+    }
+    return list;
+  }
+
   async function loadAll() {
     const states = Object.keys(config.animations);
     const report = {};
     let ok = true;
     for (const st of states) {
-      const list = [];
-      let i = 0;
-      while (true) {
-        const url = new URL(`../../assets/pet/${st}/frame_${String(i).padStart(3, "0")}.png`, location.href);
-        try {
-          const img = await loadImage(url.href);
-          if (!img.naturalWidth || img.naturalWidth <= 0) throw new Error("naturalWidth=0");
-          if (img.naturalWidth !== config.canvas.width) throw new Error(`size ${img.naturalWidth}!=${config.canvas.width}`);
-          list.push(img);
-          i++;
-          if (i > 64) break;
-        } catch {
-          break;
-        }
+      // 先按当前宠物包加载；这一整个状态一帧都没有时，才整组换成内置素材。
+      // 绝不逐帧混用：否则自绘宠物没画 walk 时，走路动作会在两只宠物的姿势之间来回跳。
+      let list = await loadFrames(st, assetBase);
+      if (list.length === 0 && builtinBase && builtinBase !== assetBase) {
+        list = await loadFrames(st, builtinBase);
       }
       if (list.length === 0) {
-        const fb = await loadImage(new URL("../../assets/fallback/pet.svg", location.href).href);
+        // 兜底矢量图固定取内置素材：宠物包不要求自带 fallback
+        const fb = await loadImage(assetUrl("fallback/pet.svg", builtinBase));
         list.push(fb);
         ok = false;
         report[st] = "fallback";
@@ -61,7 +82,7 @@
     const bubbleSuffix = lang === "en" ? "_en" : "";
     for (const st of states) {
       try {
-        const res = await fetch(new URL(`../../assets/bubbles/${st}${bubbleSuffix}.txt`, location.href));
+        const res = await fetch(assetUrl(`bubbles/${st}${bubbleSuffix}.txt`));
         if (res.ok) {
           lines[st] = (await res.text()).split("\n").map(s => s.trim()).filter(Boolean);
         }
@@ -77,6 +98,10 @@
   function loadImage(url) {
     return new Promise((resolve, reject) => {
       const img = new Image();
+      // 匿名跨源加载：帧图之后会被 drawImage 到 canvas 读像素做点击命中检测，
+      // 不声明 crossOrigin 会被判成污染源（协议侧已回 Access-Control-Allow-Origin）。
+      // 失败仍按 load fail reject：帧探测正是靠这个 reject 判断「没有更多帧」。
+      img.crossOrigin = "anonymous";
       img.onload = () => resolve(img);
       img.onerror = () => reject(new Error("load fail"));
       img.src = url;
@@ -93,6 +118,13 @@
   function applyBreath() {
     const spec = config && config.animations[state];
     breathEl.classList.toggle("breathing", !!spec && !!spec.still && animate && !reducedMotion);
+  }
+
+  // 互动反馈：复用落地动画（弹性缩放）当「被摸到」的即时反馈，不额外新增素材
+  function bounceFeedback() {
+    breathEl.classList.remove("landing");
+    void breathEl.offsetWidth;          // 强制重排，重启动画
+    breathEl.classList.add("landing");
   }
 
   // ---------- 状态机 ----------
@@ -118,10 +150,18 @@
     }
   }
 
-  const PRIORITY = { greet: 4, interact: 4, drop: 3, drag: 2, walk: 1, idle: 0, sleep: -1 };
+  // drag 优先级最高：任何时候都要能拖动宠物，不能被 greet/interact 这些动作卡住
+  const PRIORITY = { drag: 5, greet: 4, interact: 4, drop: 3, walk: 1, idle: 0, sleep: -1 };
   function canInterrupt(cur, next) {
     if (cur === next) return true;
     return (PRIORITY[next] ?? 0) >= (PRIORITY[cur] ?? 0);
+  }
+
+  function markActivity() {
+    const now = performance.now();
+    lastActivityAt = now;
+    // 「说句话」这类不换状态的操作也算活动，不能让原来的闲置入睡计时继续偷跑。
+    if (state === "idle") sleepSince = now;
   }
 
   function tick(now) {
@@ -141,7 +181,14 @@
       frameIdx++;
       if (frameIdx >= arr.length) {
         if (spec.loop) frameIdx = 0;
-        else setState(spec.next || "idle");
+        else {
+          // 播完一轮后停留 2 秒再回 idle，而不是立刻消失。
+          // holdMs 是「至少停留多久」（默认 = 帧数 × 帧间隔），再加 2000ms 的停留，
+          // 否则 interact 这种 3 帧 / 4fps 的动作 0.75 秒就闪没了。
+          if (now - stateEnteredAt >= holdMs + 2000) {
+            setState(spec.next || "idle");
+          }
+        }
       }
     }
 
@@ -212,6 +259,7 @@
   let clickCycle = 0;
 
   document.addEventListener("mousedown", (e) => {
+    markActivity();
     pressing = true; moved = false; lastPos = { x: e.screenX, y: e.screenY };
     lastMoveAt = performance.now();
     stageEl.classList.add("pressed");
@@ -334,8 +382,30 @@
   }
 
   // ---------- 启动 ----------
-  fetch(cfgUrl).then(r => r.json()).then(async (c) => {
-    config = c;
+  (async () => {
+    // 皮肤信息由主进程按 YCODE_PET_* 解析好（含配置合并），渲染端只管用，不再自己 fetch 配置。
+    // getSkin 可能不存在（旧版 preload）或直接 reject，这里必须显式兜底：宁可静止也绝不白屏。
+    let skin = null;
+    try {
+      if (window.petAPI && typeof window.petAPI.getSkin === "function") {
+        skin = await window.petAPI.getSkin();
+      }
+    } catch (err) {
+      console.error("[pet] getSkin failed:", err);
+      if (window.petAPI && window.petAPI.rendererError) {
+        window.petAPI.rendererError({ reason: "getSkin failed", error: String((err && err.message) || err) });
+      }
+    }
+    // 没有配置就无从得知画布尺寸、状态表与动效参数，空转只会抛错，直接收工
+    if (!skin || !skin.config || !skin.config.animations) {
+      if (window.petAPI && window.petAPI.rendererError) {
+        window.petAPI.rendererError({ reason: "skin config unavailable" });
+      }
+      return;
+    }
+    assetBase = skin.assetsBase || "pet-asset://skin";
+    builtinBase = skin.builtinBase || "pet-asset://builtin";
+    config = skin.config;
     const mo = config.motion || {};
     document.documentElement.style.setProperty("--breath-px", `${mo.breathPx ?? 2}px`);
     document.documentElement.style.setProperty("--breath-sec", `${mo.breathSec ?? 4.2}s`);
@@ -354,10 +424,33 @@
     window.petAPI.onAnimateChanged((on) => setAnimate(on));
     // 外部气泡通道：父进程经 stdin 发来的气泡，自带显示时长
     window.petAPI.onBubble((text, ms) => showBubble(text, ms));
-    window.petAPI.onPetSleep(() => { setState(state === "sleep" ? "idle" : "sleep"); });
+    window.petAPI.onPetSleep(() => {
+      markActivity();
+      setState(state === "sleep" ? "idle" : "sleep");
+    });
+    // 右键菜单只发语义，动画与台词仍走状态机；talk 保持原行为，不切换动作。
+    window.petAPI.onEmote((kind) => {
+      markActivity();
+      if (kind === "talk") {
+        // 「让她说句话」不换动作，只冒一句现有台词 + 轻微弹跳，避免每次点都像抽风
+        const arr = (lines.interact && lines.interact.length ? lines.interact : lines.idle) || [];
+        if (arr.length) showBubble(pick(arr));
+        bounceFeedback();
+        return;
+      }
+      const next = kind === "greet" ? "greet" : "interact";
+      if (frames[next]) {
+        setState(next);      // setState 内部会按 lines[next] 自动冒一句台词
+        bounceFeedback();
+      } else {
+        bounceFeedback();    // 皮肤包缺这个状态时至少给一个动作反馈
+      }
+    });
     document.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      window.petAPI.contextMenu(e.screenX, e.screenY);
+      // 传窗口内容区坐标（clientX/clientY）：menu.popup 在 Windows 上按窗口坐标定位，
+      // 传 screenX/screenY 会让菜单被推到一个窗口外的偏移位置（离宠物很远）
+      window.petAPI.contextMenu(e.clientX, e.clientY);
     });
 
     setState("greet");
@@ -365,6 +458,12 @@
     scheduleTick();
     if (config.bubble && config.bubble.enabled) {
       window.petAPI.getOnboarded().then((done) => { if (!done) runOnboarding(); });
+    }
+  })().catch((err) => {
+    // 启动链上任何未预期异常都记一笔到 gate 日志，避免只留一个静默白屏
+    console.error("[pet] startup failed:", err);
+    if (window.petAPI && window.petAPI.rendererError) {
+      window.petAPI.rendererError({ reason: "startup failed", error: String((err && err.message) || err) });
     }
   });
 })();

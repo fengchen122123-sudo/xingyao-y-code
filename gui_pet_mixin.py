@@ -2,7 +2,8 @@
 
 把设置页「桌面宠物」的开关/路径/重启指令转发给 core.pet_manager 的进程管理，
 并把最终状态回推前端：每个方法都返回 dict，方法名即前端 JS 侧 API 名
-（pet_get_status / pet_set_enabled / pet_set_electron_path / pet_restart）。
+（pet_get_status / pet_set_enabled / pet_set_electron_path / pet_restart /
+pet_list_skins / pet_set_skin）。
 
 另有一条「Electron 运行时按需安装」的支路（pet_get_runtime_status /
 pet_install_runtime，运行时细节在 core/pet_runtime.py）：Electron 解压后约
@@ -29,72 +30,67 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 # 配置键名：与 config.py 已登记的键名保持一致
-# （pet_enabled / pet_electron_path / pet_notify_enabled）
+# （pet_enabled / pet_electron_path / pet_notify_enabled / pet_skin_id）
 _KEY_ENABLED = "pet_enabled"
 _KEY_ELECTRON_PATH = "pet_electron_path"
 _KEY_NOTIFY = "pet_notify_enabled"
+# 当前宠物形象 id（与 core/pet_skins 的 active_skin_id 读的是同一个键）
+_KEY_SKIN = "pet_skin_id"
+
+# 桌宠闲聊（core/pet_chat）空闲时长的合法区间（秒）。与 pet_chat 内部的钳制范围
+# 保持一致：太快会变成不停自言自语，太慢（>1 天）等于永远不说话，都不是用户想要
+# 的「偶尔说一句」。桥这一层先钳一次，是为了能给出明确提示而不是静默改值。
+_CHAT_IDLE_MIN = 60
+_CHAT_IDLE_MAX = 86400
 
 # ---------- 任务气泡提示（emit_event → 桌宠冒泡）----------
 # 气泡停留时长（毫秒）。桌宠侧会再钳一次范围，这里给常用值即可。
 _NOTIFY_BUBBLE_MS = 2600
 
-# 同一文案的最小发送间隔（秒）：工具连读十个文件不该刷十次"翻文件…"。
+# 同一文案的最小发送间隔（秒）。白名单里现在全是「值得打断用户」的事件，这条只在
+# 将来加回高频事件时兜底用。
 _NOTIFY_THROTTLE_SECONDS = 1.5
 
-# 收尾信号不受节流限制——用户最关心的就是"结束了没有"，重复也要让气泡更新。
-_NOTIFY_ALWAYS_EVENTS = frozenset({"turn_finish", "turn_error", "turn_cancelled"})
+# 白名单 = 全部「值得打断用户」的事件，只有四类：
+#   permission_request  要你确认权限 / 模型有事问你——不提示就会一直干等
+#   turn_finish         任务完成
+#   turn_error          任务出错
+#   turn_cancelled      任务被取消
+# 工具级事件（turn_start / tool_start）一律不冒泡：一个任务要读几十个文件、敲十几次
+# 命令，每步都说话等于全程在打扰；用户真正需要的只有「卡住我了」「结束了」「失败了」。
+_NOTIFY_EVENTS = frozenset({
+    "permission_request",
+    "turn_finish",
+    "turn_error",
+    "turn_cancelled",
+})
 
-# 白名单：先把高频事件的绝大多数（token_delta / round_started / pty_data …）挡在
-# 外面，再去做读配置、算文案这些稍重的动作。
-_NOTIFY_EVENTS = frozenset({"turn_start", "tool_start"}) | _NOTIFY_ALWAYS_EVENTS
+# 这四类都不节流：重复出现也要让气泡更新，用户最关心的就是「它停下了没有」。
+_NOTIFY_ALWAYS_EVENTS = _NOTIFY_EVENTS
 
-# 事件 → 固定文案（工具类事件另走 _NOTIFY_TOOL_RULES）
+# 事件 → 固定文案（permission_request 要区分提问/审批，另走 _notify_bubble_text）
 _NOTIFY_EVENT_TEXTS = {
-    "turn_start": "开工～",
     "turn_finish": "搞定！",
     "turn_error": "欸，出错了…",
     "turn_cancelled": "停手了",
 }
 
-_NOTIFY_TOOL_FALLBACK = "干活中…"
-
-# 工具名 → 拟人化文案；按顺序匹配，命中即返回。
-_NOTIFY_TOOL_RULES = (
-    (("read_file", "search_code", "glob_files", "find_definition",
-      "list_directory", "tool_result_read", "grep"), "翻文件…"),
-    (("write_file", "edit_file"), "改代码…"),
-    (("execute_command", "pty_manage"), "敲命令…"),
-    (("fetch_url", "search_news", "fetch_image"), "上网查…"),
-    (("run_subagent", "task"), "派个小助手…"),
-)
-
 # 文案 → 上次发送时刻（time.monotonic）。模块级：星瑶单进程，多会话共用一个节流表。
 _notify_last_sent: Dict[str, float] = {}
 
 
-def _notify_tool_text(name: Any) -> str:
-    """把工具名映射成一句拟人化文案；未知/缺失工具名统一"干活中…"。"""
-    try:
-        tool = str(name or "").strip()
-    except Exception:
-        tool = ""
-    if not tool:
-        return _NOTIFY_TOOL_FALLBACK
-    if tool.startswith("firecrawl"):
-        return "上网查…"
-    for names, text in _NOTIFY_TOOL_RULES:
-        if tool in names:
-            return text
-    return _NOTIFY_TOOL_FALLBACK
-
-
 def _notify_bubble_text(event_type: str, data: Any) -> Optional[str]:
-    """事件 → 气泡文案；不该冒泡的事件返回 None。"""
-    if event_type == "tool_start":
+    """事件 → 气泡文案；不该冒泡的事件返回 None。
+
+    permission_request 要分两种：ask_user 是模型在提问、用户得看内容再作答；
+    其它是工具要权限、点一下同意就继续。两者都意味着「任务停在这儿等你」，
+    所以都给气泡，但措辞不能混——用户看到"等你点头…"就知道只是批一下。
+    """
+    if event_type == "permission_request":
         name = ""
         if isinstance(data, dict):
-            name = data.get("name")
-        return _notify_tool_text(name)
+            name = str(data.get("function_name") or "")
+        return "有事问你～" if name == "ask_user" else "等你点头…"
     return _NOTIFY_EVENT_TEXTS.get(event_type)
 
 
@@ -170,6 +166,100 @@ def _pet_runtime_module():
     import pet_runtime
 
     return pet_runtime
+
+
+def _pet_skins_module():
+    """惰性导入 core.pet_skins（宠物库：列列表 / 校验 / 激活项读写）。
+
+    与 _pet_manager 同样的降级策略：导入失败抛给调用方，由桥方法统一转
+    ok=False；模块级导入会让没用桌宠的启动路径白扫一遍用户皮肤目录。
+    兼容以 core 目录为工作目录的调用（此时只有顶层 pet_skins）。
+    """
+    try:
+        from core import pet_skins
+
+        return pet_skins
+    except Exception:
+        pass
+    import pet_skins
+
+    return pet_skins
+
+
+def _pet_chat_module():
+    """惰性导入 core.pet_chat（桌宠「无聊时自己说一句」的调度线程与设置读写）。
+
+    与 _pet_manager / _pet_skins_module 同样的降级策略：导入失败抛给调用方，由桥
+    方法统一转 ok=False；模块级导入会让完全没用桌宠的启动路径也跟着拉起调度线程、
+    读写人类活动检测（GetLastInputInfo）那一套依赖。
+    兼容以 core 目录为工作目录的调用（此时只有顶层 pet_chat）。
+    """
+    try:
+        from core import pet_chat
+
+        return pet_chat
+    except Exception:
+        pass
+    import pet_chat
+
+    return pet_chat
+
+
+def _pet_chat_available_models() -> list:
+    """枚举全部已配置模型（providers[].models[]），供设置页下拉与 model_id 校验。
+
+    为什么整个函数吞异常、脏数据跳一条而不是抛：配置来自用户手改的 config.json，
+    models 写成 dict、条目缺 id、provider 不是对象都可能出现。这里的目的只是「给
+    下拉填选项」，坏一条就少一条，归零也就是下拉只剩「自动」——仍然可用。若为了
+    一处脏字段把整个设置页打成 ok=False，用户反而连关掉这个功能都点不了。
+    返回项只保留前端需要的三列：id 写回配置、name 给人看、provider_name 分组用。
+    """
+    models: list = []
+    try:
+        from core import model_manager
+
+        data = model_manager.load_config() or {}
+    except Exception:
+        logger.warning("读取模型列表失败（桌宠闲聊设置）", exc_info=True)
+        return models
+    try:
+        for provider in data.get("providers") or []:
+            if not isinstance(provider, dict):
+                continue
+            provider_name = str(provider.get("name") or "")
+            for model in provider.get("models") or []:
+                if not isinstance(model, dict):
+                    continue
+                # id 有就优先用；个别历史配置写成 model_id 也认，缺了就没法写回配置、
+                # 也没法按 id 解析请求，直接跳过。
+                model_id = str(model.get("id") or model.get("model_id") or "").strip()
+                if not model_id:
+                    continue
+                models.append({
+                    "id": model_id,
+                    "name": str(model.get("name") or model_id),
+                    "provider_name": provider_name,
+                })
+    except Exception:
+        logger.warning("解析模型列表失败（桌宠闲聊设置）", exc_info=True)
+    return models
+
+
+def _chat_minutes_text(seconds: int) -> str:
+    """把空闲秒数写成「给人看的分钟数」：整分钟不带小数，否则留一位。
+
+    闲聊间隔用户是按分钟想的（「10 分钟」比「600 秒」直观），但合法区间下探到 60
+    秒、上探到 86400 秒，一律换成分钟会出现 "0.5" / "1440" 这种不自然会话用大数，
+    所以整分钟才取整，其余保留一位小数。
+    """
+    try:
+        minutes = float(seconds) / 60.0
+    except (TypeError, ValueError):
+        return "若干"
+    rounded = round(minutes)
+    if abs(minutes - rounded) < 0.05:
+        return str(int(rounded))
+    return f"{minutes:.1f}"
 
 
 def _runtime_detect_cached(module, state: str) -> Dict[str, Any]:
@@ -390,14 +480,13 @@ class PetBridgeMixin:
 
     # ---------- 内部：事件 → 气泡提示 ----------
     def _pet_notify_event(self, event_type: str, data: Any = None) -> None:
-        """把一次前端事件转成桌宠气泡（"开工～/翻文件…/搞定！"）。
+        """把一次前端事件转成桌宠气泡（"等你点头…/有事问你～/搞定！/出错了…"）。
 
         由 ApiBridge.emit_event 在事件派发后顺带调用，属于高频路径，所以：
         1) 先按白名单挡掉绝大多数事件（token_delta / pty_data / round_started…），
            再做读配置、算文案这些稍重的动作；
-        2) 同一文案 1.5 秒内只发一次（工具连读十个文件不该刷十次"翻文件…"），
-           但 turn_finish / turn_error / turn_cancelled 是用户最关心的收尾信号，
-           不受节流限制；
+        2) 白名单里剩下的四类都是「用户必须知道」的节点（要人出手 / 完成 / 出错 /
+           取消），所以一条都不节流：漏掉一次"等你确认"，任务就在那儿干等着；
         3) 整个方法体包 try/except，任何异常只 logger.debug——桌宠出任何问题都
            不允许影响事件派发链路。
         """
@@ -538,6 +627,249 @@ class PetBridgeMixin:
             notes.append(f"Electron 路径已保存：{display}")
         return {"ok": ok, "msg": "；".join(notes), "status": self.pet_get_status()}
 
+    def pet_list_skins(self) -> Dict[str, Any]:
+        """列出全部可用宠物（内置星瑶 + 用户宠物包），供设置页一次性渲染选择列表。
+
+        每项都带 thumbnail（后端已编码好的 PNG data URI 字符串），前端直接塞进
+        img.src 即可，不必逐只再发请求——列表通常只有几只，一次给全比「先拿 id
+        再逐个取图」少一轮往返，也不会出现缩略图陆续跳出来的闪烁。
+        active 是收敛过的当前形象 id（配置里的脏值已被 active_skin_id 换成内置），
+        user_dir 告诉用户宠物包该放哪个目录。
+        """
+        try:
+            pet_skins = _pet_skins_module()
+            active = pet_skins.active_skin_id()
+            return {
+                "ok": True,
+                "skins": pet_skins.list_skins(active),
+                "active": active,
+                "user_dir": str(pet_skins.user_skin_dir()),
+                "msg": "",
+            }
+        except Exception as exc:
+            logger.warning("读取宠物列表失败: %s", exc, exc_info=True)
+            try:
+                active = _pet_skins_module().BUILTIN_SKIN_ID
+            except Exception:
+                # 连 pet_skins 都导不进来：退回内置 id 字面量，前端至少知道"只有星瑶"。
+                active = "xingyao"
+            return {
+                "ok": False,
+                "skins": [],
+                "active": active,
+                "user_dir": "",
+                "msg": f"读取宠物列表失败：{exc}",
+            }
+
+    def pet_set_skin(self, skin_id: str) -> Dict[str, Any]:
+        """切换桌面宠物形象：写配置，必要时重启桌宠让新形象立刻生效。
+
+        为什么要重启：形象目录是桌宠进程启动时通过 YCODE_PET_* 环境变量传进去的，
+        Electron 只在启动那一刻读一次，运行中改配置它根本看不见，所以正在运行时
+        只能 stop→start。重启不丢东西：窗口位置/尺寸/开关等状态都持久化在桌宠自己
+        的 userData 里，重启后会照旧恢复。
+        返回形状与 pet_set_enabled 一致（ok/msg/status），前端 PetMutationResult 直接复用。
+        """
+        want = str(skin_id or "").strip()
+        try:
+            pet_skins = _pet_skins_module()
+            skin = pet_skins.get_skin(want)
+            if skin is None:
+                return {
+                    "ok": False,
+                    "msg": "找不到这只宠物（可能已被删除）",
+                    "status": self.pet_get_status(),
+                }
+            name = str(skin.get("name") or want)
+            if not _save_config(_KEY_SKIN, want):
+                return {
+                    "ok": False,
+                    "msg": (
+                        f"配置未能写入 config.json（{_KEY_SKIN}={want}），"
+                        "重启星瑶后可能不保持，请检查 config.json 是否可写"
+                    ),
+                    "status": self.pet_get_status(),
+                }
+
+            notes = [f"已切换到「{name}」"]
+            ok = True
+            manager = None
+            running = False
+            try:
+                manager = _pet_manager()
+                running = bool(manager.get_status().get("running"))
+            except Exception as exc:
+                # 查不到就当作"没在运行"：宁可不重启（形象已写盘，下次启动即生效），
+                # 也不要盲目 stop/start 把用户正在用的桌宠弄掉。
+                logger.warning("切换宠物后查询桌宠状态失败: %s", exc, exc_info=True)
+                notes.append(f"查询桌宠状态失败：{exc}")
+
+            if not running:
+                notes[0] = f"{notes[0]}，下次打开桌宠时生效"
+            else:
+                try:
+                    stop_result = manager.stop()
+                except Exception as exc:
+                    logger.warning("切换宠物时停止桌宠失败: %s", exc, exc_info=True)
+                    stop_result = {"ok": False, "msg": f"停止桌宠异常：{exc}"}
+                if not isinstance(stop_result, dict) or not stop_result.get("ok"):
+                    stop_msg = (
+                        stop_result.get("msg") if isinstance(stop_result, dict) else ""
+                    ) or "桌宠未能停止"
+                    notes[0] = f"{notes[0]}，但新形象尚未生效"
+                    notes.append(f"桌宠未能停止（{stop_msg}）")
+                    ok = False
+                else:
+                    try:
+                        start_result = manager.start()
+                    except Exception as exc:
+                        logger.warning("切换宠物后重启桌宠失败: %s", exc, exc_info=True)
+                        start_result = {"ok": False, "msg": f"启动桌宠异常：{exc}"}
+                    if not isinstance(start_result, dict):
+                        start_result = {"ok": False, "msg": "启动返回值异常（非字典）"}
+                    ok = bool(start_result.get("ok"))
+                    start_msg = str(start_result.get("msg") or "")
+                    if ok:
+                        notes[0] = f"{notes[0]}，桌宠已重新打开"
+                        if start_msg:
+                            notes.append(start_msg)
+                    else:
+                        notes[0] = f"{notes[0]}，但重启桌宠失败，新形象尚未生效"
+                        notes.append(start_msg or "未取得启动结果")
+
+            return {"ok": ok, "msg": "；".join(notes), "status": self.pet_get_status()}
+        except Exception as exc:
+            logger.warning("切换宠物失败 skin_id=%r: %s", skin_id, exc, exc_info=True)
+            return {
+                "ok": False,
+                "msg": f"切换宠物失败：{exc}",
+                "status": self.pet_get_status(),
+            }
+
+    def pet_chat_get_settings(self) -> Dict[str, Any]:
+        """读取「桌宠闲聊」设置：开关 / 空闲间隔 / 指定模型 + 可选模型下拉。
+
+        一次返回全部：设置页打开只发一条请求，models 直接喂给下拉，前端不必再问
+        「有哪些模型」。models 故意容错成空数组（理由见 _pet_chat_available_models），
+        模型库坏掉时闲聊仍可用「自动」选模型说话，不该让整个设置页变成读取失败。
+        status 原样透出，里面的 thread_alive / last_spoken_at / today_count 是诊断
+        用的（用户问「它怎么一直不说话」时看这几个值最快）。
+
+        返回形状固定，失败分支也补齐同样字段：前端不做额外判空。
+        """
+        try:
+            state = _pet_chat_module().status()
+            return {
+                "ok": True,
+                "enabled": bool(state.get("enabled")),
+                "idle_seconds": int(state.get("idle_seconds") or 0),
+                "model_id": str(state.get("model_id") or ""),
+                "models": _pet_chat_available_models(),
+                "status": state,
+                "msg": "",
+            }
+        except Exception as exc:
+            logger.warning("读取桌宠闲聊设置失败: %s", exc, exc_info=True)
+            return {
+                "ok": False,
+                "enabled": False,
+                "idle_seconds": 600,
+                "model_id": "",
+                "models": [],
+                "status": {},
+                "msg": f"读取桌宠闲聊设置失败：{exc}",
+            }
+
+    def pet_chat_set_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """保存「桌宠闲聊」设置，只改 payload 里真正出现过的字段。
+
+        为什么按「键是否出现」而不是「值是不是 None」判断：前端会把整张表单原样
+        提交，三个字段一直是齐的，只看 None 就没法表达「这次只想换模型」。缺省的键
+        一律不动，正好对上 update_settings 的 None 语义。
+        为什么两种校验力度不同：idle_seconds 越界/非数值只提示、其余照常保存——用户
+        改完开关顺手点保存，不该因为一个数字把整次操作打回；越界时钳到边界（而不是
+        丢掉）是因为丢掉会让界面看起来「点了没反应」。model_id 找不到则整体失败：
+        写进去只会让调度线程每轮解析失败，不如当场说清楚模型没了。
+
+        返回形状统一 ok/msg/status；status 就是 update_settings 回的那份（比
+        status() 多一个 saved，写盘失败时能顺带提示「重启后可能丢失」）。
+        """
+        data = payload if isinstance(payload, dict) else {}
+        kwargs: Dict[str, Any] = {}
+        notes = []
+        try:
+            pet_chat = _pet_chat_module()
+
+            if "enabled" in data:
+                kwargs["enabled"] = bool(data.get("enabled"))
+
+            if "idle_seconds" in data:
+                raw = data.get("idle_seconds")
+                value = None
+                if not isinstance(raw, bool):
+                    try:
+                        value = int(raw)
+                    except (TypeError, ValueError):
+                        value = None
+                if value is None:
+                    notes.append("空闲时长不是数字，已忽略")
+                elif value < _CHAT_IDLE_MIN or value > _CHAT_IDLE_MAX:
+                    clamped = max(_CHAT_IDLE_MIN, min(_CHAT_IDLE_MAX, value))
+                    notes.append(
+                        f"空闲时长 {value} 秒超出 {_CHAT_IDLE_MIN}~{_CHAT_IDLE_MAX} 秒范围，"
+                        f"已按 {clamped} 秒处理"
+                    )
+                    kwargs["idle_seconds"] = clamped
+                else:
+                    kwargs["idle_seconds"] = value
+
+            model_name = ""
+            if "model_id" in data:
+                model_id = str(data.get("model_id") or "").strip()
+                if model_id:
+                    models = _pet_chat_available_models()
+                    match = next((m for m in models if m["id"] == model_id), None)
+                    if match is None:
+                        return {
+                            "ok": False,
+                            "msg": "找不到这个模型（可能已被删除）",
+                            "status": pet_chat.status(),
+                        }
+                    model_name = match["name"]
+                # 空串是合法值，语义是「自动选模型」，照传
+                kwargs["model_id"] = model_id
+
+            result = pet_chat.update_settings(**kwargs)
+            status = result if isinstance(result, dict) else pet_chat.status()
+
+            parts = []
+            if "enabled" in kwargs:
+                if kwargs["enabled"]:
+                    minutes = _chat_minutes_text(status.get("idle_seconds"))
+                    parts.append(f"已开启，空闲 {minutes} 分钟后会自己说一句")
+                else:
+                    parts.append("已关闭")
+            if "model_id" in kwargs:
+                if kwargs["model_id"]:
+                    parts.append(f"已切换到模型「{model_name}」")
+                else:
+                    parts.append("已改为自动选模型")
+            if "idle_seconds" in kwargs and "enabled" not in kwargs:
+                minutes = _chat_minutes_text(status.get("idle_seconds"))
+                if status.get("enabled"):
+                    parts.append(f"空闲时长已改为 {minutes} 分钟")
+                else:
+                    parts.append(f"空闲时长已改为 {minutes} 分钟（开启后生效）")
+            parts.extend(notes)
+            if not parts:
+                parts.append("未做修改")
+            if status.get("saved") is False:
+                parts.append("但配置未能写入 config.json，重启星瑶后可能不保持")
+            return {"ok": True, "msg": "；".join(parts), "status": status}
+        except Exception as exc:
+            logger.warning("保存桌宠闲聊设置失败 payload=%r: %s", payload, exc, exc_info=True)
+            return {"ok": False, "msg": f"保存桌宠闲聊设置失败：{exc}", "status": {}}
+
     def pet_restart(self) -> Dict[str, Any]:
         """重启桌宠：先 stop 再 start，用于"改了桌宠代码/配置后手动重载"。"""
         notes = []
@@ -579,6 +911,13 @@ class PetBridgeMixin:
         except Exception:
             logger.warning("桌宠自动恢复失败（已忽略，不影响 GUI）", exc_info=True)
             return
+        # 闲聊调度线程跟着启动一起拉起（start() 自身幂等，重复调用只留一条线程）。
+        # 整个包 try：模块缺失、线程起不来都只是「没有闲聊」这种可选功能失效，
+        # 绝不能让定时器线程里的异常冒出去影响 GUI 启动。
+        try:
+            _pet_chat_module().start()
+        except Exception:
+            logger.debug("桌宠闲聊调度线程启动失败（已忽略）", exc_info=True)
         try:
             if isinstance(result, dict) and not result.get("skipped"):
                 level = logging.INFO if result.get("ok") else logging.WARNING

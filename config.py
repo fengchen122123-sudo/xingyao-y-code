@@ -829,6 +829,11 @@ KNOWN_CONFIG_KEYS = frozenset({
     "agent_turn_step_limit", "prompt_cache_keepalive_seconds",
     "mermaid_auto_open", "read_file_result_max_chars",
     "pet_enabled", "pet_electron_path", "pet_notify_enabled",
+    # pet_skin_id：当前激活的桌宠形象 id（缺省由代码回落内置星瑶，故不进 DEFAULTS）
+    "pet_skin_id",
+    # 桌宠「无聊时自己说话」（core/pet_chat）：开关、指定模型 id（空串=自动）、
+    # 空闲阈值秒数。漏登记会让设置页写这三个键在 strict_config=true 下被未知键拦下。
+    "pet_chat_enabled", "pet_chat_model_id", "pet_chat_idle_seconds",
     # 断点续跑总开关（S4）：只登记键名，缺省=关闭；关闭时状态机、事件序列、
     # 请求字节与改动前完全一致（规格 §9.5）
     "resume",

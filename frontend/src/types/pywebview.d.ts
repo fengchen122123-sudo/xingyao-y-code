@@ -1723,7 +1723,70 @@ export interface PetStatusDto {
   notify_enabled?: boolean;
   // Electron 运行时状态（缺运行时时 available=false，设置页据此提示一键下载安装）
   runtime?: PetRuntimeStatus;
+  // 当前激活的宠物形象（皮肤）id 与显示名：设置页的卡片高亮以它为准，
+  // 因为只有后端知道磁盘上真正加载的是哪一个形象（前端列表可能是过期快照）
+  skin_id?: string;
+  skin_name?: string;
   ok?: boolean;
+  msg?: string;
+}
+
+// 单个宠物形象（皮肤）条目（pet_list_skins 的 skins[]）：
+// source 区分「内置星瑶」与「用户自己放进目录的宠物包」，dir 是该形象的根目录，
+// assets_dir/config_path 供调试与「打开目录」使用；active 表示它是否为当前形象；
+// thumbnail 是后端读图后编码的 data:image/png;base64,...，读不到时为空串（前端用名字首字占位）
+export interface PetSkinDto {
+  id: string;
+  name: string;
+  description: string;
+  author: string;
+  source: 'builtin' | 'user' | (string & {});
+  dir: string;
+  assets_dir: string;
+  config_path: string;
+  active: boolean;
+  thumbnail: string;
+}
+
+// pet_list_skins 的返回：skins 为全部可用形象（内置 + 用户目录），active 为当前激活 id，
+// user_dir 是用户放宠物包的目录（界面「打开宠物目录」按钮直接用它，不必二次推断）
+export interface PetSkinResult {
+  ok: boolean;
+  msg?: string;
+  skins: PetSkinDto[];
+  active: string;
+  user_dir: string;
+}
+
+// 「无聊时自己说话」：桌宠闲置到一定时长后，由模型生成一句台词冒泡。
+// 与「任务提示」是两条完全独立的气泡来源，各自保存自己的开关。
+// idle_seconds 由后端钳在 60~86400 秒；model_id 为空串表示「自动」
+// （优先副模型，没配副模型就用主模型），所以空串是合法值、不能省略成 undefined。
+export interface PetChatModelOption {
+  /** 模型 id：选中后作为 model_id 回传给后端 */
+  id: string;
+  /** 下拉里展示的模型名 */
+  name: string;
+  /** 提供方显示名：界面上挂在模型名后面，缺省时只显示模型名 */
+  provider_name?: string;
+}
+
+export interface PetChatSettings {
+  /** 是否允许闲置时自己开口 */
+  enabled: boolean;
+  /** 闲置多久算无聊（秒）；持久值可能与界面预设不同，后端会按住上下限钳制 */
+  idle_seconds: number;
+  /** 用哪个模型说话；空串 = 自动（副模型 → 主模型） */
+  model_id: string;
+  /** 可选模型列表，由后端按当前配置的提供商汇总 */
+  models: PetChatModelOption[];
+  /** 后端运行时状态（今日已说句数、上次开口时间等），前端不解释、只透传 */
+  status?: Record<string, unknown>;
+}
+
+// get/set 的统一返回：set 失败时也带 status，前端据此回滚视觉状态
+export interface PetChatSettingsResult extends PetChatSettings {
+  ok: boolean;
   msg?: string;
 }
 
@@ -2060,6 +2123,9 @@ export interface PyWebViewAPI {
   check_paths_kind(paths: string[]): Promise<Array<{ path: string; kind: 'file' | 'dir' | 'missing' }>>;
   open_path(path: string): Promise<any>;
   open_folder_in_explorer(path: string): Promise<any>;
+  // 在资源管理器中定位目标（文件则选中它，目录则打开它）：宠物设置页用它打开宠物包目录；
+  // 旧后端可能没有该方法，调用方需先判断是否为函数再退回 open_folder_in_explorer
+  reveal_in_explorer(path: string): Promise<any>;
   // Office 转 PDF 预览：首次会拉起 Office 进程（十几秒），结果按源文件 mtime 缓存
   preview_office_doc(path: string): Promise<any>;
   // PDF 编辑结果落盘：mode=copy 另存副本 / overwrite 先备份再覆盖；out_path 为空时
@@ -2292,6 +2358,15 @@ export interface PyWebViewAPI {
   // install 起后台下载线程并立刻返回（ok 仅表示请求已受理，幂等：已装好/正在装都直接回当前状态）
   pet_get_runtime_status(): Promise<PetRuntimeResult>;
   pet_install_runtime(): Promise<PetRuntimeResult>;
+  // 宠物形象（皮肤）列表与切换：list 扫描内置 + 用户目录下的宠物包并给出当前激活项；
+  // set 切换后后端会按新形象重启桌宠，因此返回里带操作后的真实状态快照
+  pet_list_skins(): Promise<PetSkinResult>;
+  pet_set_skin(skin_id: string): Promise<PetMutationResult>;
+  // 无聊时自己说话：get 返回开关、空闲阈值、选中模型与可选模型列表；
+  // set 只接受增量（只改传进来的字段），idle_seconds 由后端钳在 60~86400 秒，
+  // 所以 set 的返回里带 status，调用方需要再 get 一次才能拿到真正生效的值
+  pet_chat_get_settings(): Promise<PetChatSettingsResult>;
+  pet_chat_set_settings(payload: { enabled?: boolean; idle_seconds?: number; model_id?: string }): Promise<{ ok: boolean; msg?: string; status?: Record<string, unknown> }>;
 
   // ---------------------------------------------------------------------------
   // Git 工作台（规格 §11/§13；桥接层 gui_git_mixin.GitBridgeMixin）
