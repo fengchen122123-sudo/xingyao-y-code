@@ -28,6 +28,7 @@ from websockets.sync.server import serve
 
 import config
 from config import save_config_value as _save_config_value
+from core.local_image_inline import inline_local_images_in_payload
 from core.remote_transport import EventReplayBuffer
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,17 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
     } catch (_) {}
   }
   var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
-  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
+  // 云中转的完整桌面 UI / 独立移动端：服务器注入 __ycRelayDevice，直接连网关 relay。
+  var relayDevice = window.__ycRelayDevice || window.location.pathname.split('/')[2] || '';
+  // 网关可能被反代到子路径（如 /xy/bot/desktop/<设备号>）：ws 端点必须跟着前缀走，
+  // 否则固定打根路径 /relay/client 会 404。前缀＝设备号之前、去掉 desktop|m 那一段。
+  var relayPrefix = '';
+  if (relayDevice) {
+    var relaySegs = (window.location.pathname || '').split('/');
+    var relayAt = relaySegs.indexOf(relayDevice);
+    if (relayAt > 1) relayPrefix = relaySegs.slice(0, relayAt - 1).join('/');
+  }
+  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + (relayDevice ? relayPrefix + '/relay/client?device_id=' + encodeURIComponent(relayDevice) : '/');
 
   var ws = null;
   var seq = 0;
@@ -170,7 +181,10 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
     if (ws) {
       try { ws.close(); } catch (_) {}
     }
-    pending.forEach(function (item) { item.reject(new Error('连接已关闭')); });
+    pending.forEach(function (item) {
+      if (item.timer) clearTimeout(item.timer);
+      item.reject(new Error('连接已关闭'));
+    });
     pending.clear();
   };
 
@@ -181,7 +195,13 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
         return;
       }
       var id = ++seq;
-      pending.set(id, { resolve: resolve, reject: reject });
+      // 设备离线/对端失联时不能无限等：否则 App 的启动页永远关不掉。
+      var timer = setTimeout(function () {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        reject(new Error('连接超时，电脑可能离线'));
+      }, 25000);
+      pending.set(id, { resolve: resolve, reject: reject, timer: timer });
       ws.send(JSON.stringify({ method: method, args: args, id: id }));
     });
   }
@@ -251,6 +271,7 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
     ws.onopen = function () {
       sawHello = false;
       var auth = { token: token };
+      if (relayDevice) { auth.device_id = relayDevice; auth.jwt = token; }
       if (bootId && !legacy) {
         auth.last_boot_id = bootId;
         auth.last_seq = lastSeq;
@@ -284,6 +305,7 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
         var p = pending.get(msg.id);
         if (p) {
           pending.delete(msg.id);
+          if (p.timer) clearTimeout(p.timer);
           if (msg.error) {
             p.reject(new Error(msg.error));
           } else {
@@ -314,6 +336,11 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
       }
     };
     ws.onclose = function (event) {
+      pending.forEach(function (item) {
+        if (item.timer) clearTimeout(item.timer);
+        item.reject(new Error('连接已断开'));
+      });
+      pending.clear();
       if (event && event.code === 4401) {
         // 配对失效/被轮换：清掉本地 token（仅当与本次使用的相同，避免误清新 token），
         // 通知前端显示「配对已失效」，并停止重连（空 token 重连只会一直失败）
@@ -335,6 +362,26 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
   connect();
 })();
 """
+
+
+def build_pair_payload(url: str, token: str, expires_in: int) -> Dict:
+    """把绑定/公网 URL 包成前端要的结构：url + 二维码 PNG + 剩余秒数。
+
+    局域网扫码（LanServer.get_bind_info）与云中转公网扫码
+    （core.cloud_relay.portal）共用这一份，避免两处各自生成二维码。
+    """
+    img = qrcode.make(url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_b64 = base64.b64encode(buf.getvalue()).decode()
+    return {
+        "ok": True,
+        "url": url,
+        "token": token,
+        "qr": f"data:image/png;base64,{qr_b64}",
+        # expires_in=0 表示永久有效（TTL=0 签发），前端据此跳过倒计时自动刷新
+        "expires_in": int(expires_in),
+    }
 
 
 class LanServer:
@@ -829,19 +876,8 @@ class LanServer:
             token = self._token.decode()
             expires = self._token_expires
         url = self.bind_url(token, path=path)
-        img = qrcode.make(url)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        qr_b64 = base64.b64encode(buf.getvalue()).decode()
         remaining = 0 if expires is None else max(0, int(expires - time.time()))
-        return {
-            "ok": True,
-            "url": url,
-            "token": token,
-            "qr": f"data:image/png;base64,{qr_b64}",
-            # expires_in=0 表示永久有效（TTL=0 签发），前端据此跳过倒计时自动刷新
-            "expires_in": remaining,
-        }
+        return build_pair_payload(url, token, remaining)
 
     def set_ttl(self, seconds: int) -> None:
         """更新配对 token 的有效期（秒）；<= 0 表示永久有效。"""
@@ -889,6 +925,7 @@ class LanServer:
         """
         if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server":
             payload = self._rewrite_preview_url(payload, event_type)
+            payload = inline_local_images_in_payload(payload)
             self._note_serve_activity()
         with self._clients_lock:
             clients = list(self._clients)
@@ -988,7 +1025,7 @@ class LanServer:
         if isinstance(error, dict) and error.get("code") == "method_not_allowed":
             self._safe_send(ws, json.dumps({"id": msg_id, "error": "method not allowed"}))
             return
-        self._safe_send(ws, json.dumps({"id": msg_id, "result": result}))
+        self._safe_send(ws, inline_local_images_in_payload(json.dumps({"id": msg_id, "result": result})))
 
     def dispatch_rpc(self, method, args, turn_source: str | None = None) -> Dict[str, Any]:
         """单次 RPC 分发核心（WebSocket 路由与直调测试共用同一边界）。

@@ -8378,8 +8378,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         "刷新"按钮触发，强制重签并使旧 token 失效。
         mobile=True 绑定到独立移动端子应用（/m/ 路径，co-team 风格界面）；
         两种入口共享同一配对 token 与 WS 事件通道。
+
+        云中转已连上时优先给公网地址（手机不在同一 WiFi 也能扫）；公网入口任一环
+        拿不到就回落局域网地址，行为与从前完全一致。
         """
         try:
+            public = self._cloud_relay_pair_url(mobile=bool(mobile))
+            if public is not None:
+                from core.lan_server import build_pair_payload
+
+                return build_pair_payload(public["url"], public["token"], public["expires_in"])
             srv = self._ensure_lan_server()
             if srv is None:
                 return {"ok": False, "msg": "远程服务启动失败"}
@@ -8387,6 +8395,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         except Exception as e:
             logger.exception("get_remote_bind_qr 失败")
             return {"ok": False, "msg": str(e)}
+
+    def _cloud_relay_pair_url(self, mobile: bool) -> Optional[Dict[str, Any]]:
+        """云中转公网二维码；不可用时返回 None（内部已兜住所有异常）。"""
+        try:
+            from core.cloud_relay.portal import build_pair_url
+
+            data = config._load()
+            ttl = int(
+                data.get(config.REMOTE_TOKEN_TTL_KEY, config.REMOTE_TOKEN_TTL_DEFAULT) or 0
+            )
+            return build_pair_url(self, mobile=mobile, ttl_seconds=ttl)
+        except Exception:
+            logger.debug("云中转公网二维码不可用，回落局域网", exc_info=True)
+            return None
 
     def set_remote_token_ttl(self, seconds: int) -> Dict[str, Any]:
         """持久化远程控制 token 过期时间，并同步到已启动的服务。"""
