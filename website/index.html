@@ -16,11 +16,54 @@
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 </script>
 <link rel="apple-touch-icon" href="assets/xingyao-mark.png">
-<link rel="preload" as="image" href="assets/xingyao-portrait.png" fetchpriority="high">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Serif+SC:wght@600;700&display=swap" rel="stylesheet">
+<link rel="preload" as="image" href="assets/xingyao-portrait.webp" imagesrcset="assets/xingyao-portrait-512.webp 512w, assets/xingyao-portrait.webp 1024w" imagesizes="(max-width: 720px) min(100vw - 40px, 560px), min(100vw - 48px, 680px)" fetchpriority="high">
+<link rel="preload" as="font" type="font/woff2" href="assets/fonts/noto-serif-sc-700.woff2" crossorigin>
 <style>
+/* 自托管中文子集字体：仅打包首页实际用到的 281 个字符，
+   缺失字符自动回退 --serif/--sans/--mono 里的系统字体。
+   原先直接引 Google Fonts，中文分片要拉 26 个文件共 1.57MB。 */
+@font-face {
+  font-family: 'Noto Serif SC';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(assets/fonts/noto-serif-sc-600.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Noto Serif SC';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(assets/fonts/noto-serif-sc-700.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Noto Sans SC';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(assets/fonts/noto-sans-sc-400.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Noto Sans SC';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(assets/fonts/noto-sans-sc-500.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Noto Sans SC';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(assets/fonts/noto-sans-sc-600.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(assets/fonts/jetbrains-mono-400.woff2) format('woff2');
+}
 :root {
   --paper: #faf5f1;
   --sheet: #f3ece4;
@@ -159,6 +202,7 @@ html { scrollbar-color: var(--ink) var(--paper); }
   align-items: center;
   padding: 12px 0 72px;
 }
+.hero-art picture { display: block; }
 .hero-art img {
   width: min(100%, 680px);
   background: var(--paper);
@@ -451,7 +495,7 @@ dialog#demo-modal .btn { min-width: 120px; }
 <nav class="nav" aria-label="主导航">
   <div class="nav-inner">
     <a class="brand" href="#top" aria-label="星瑶Code 首页">
-      <img src="assets/xingyao-lockup.png" width="400" height="164" alt="星瑶">
+      <img src="assets/xingyao-lockup.webp" width="400" height="164" alt="星瑶">
       <span class="brand-code">Code</span>
     </a>
     <a class="btn btn-line nav-notice" href="tokens.html">Token 领取公告</a>
@@ -461,7 +505,10 @@ dialog#demo-modal .btn { min-width: 120px; }
 <main id="top">
   <header class="hero">
     <div class="hero-art">
-      <img src="assets/xingyao-portrait.png" width="1024" height="1024" alt="星瑶侧脸肖像：黑发盘髻，红围巾，白外套，耳际有带白翼的圆形像素徽记，上方是蓝色星轨与星瑶二字" fetchpriority="high">
+      <picture>
+        <source type="image/webp" srcset="assets/xingyao-portrait-512.webp 512w, assets/xingyao-portrait.webp 1024w" sizes="(max-width: 720px) min(100vw - 40px, 560px), min(100vw - 48px, 680px)">
+        <img src="assets/xingyao-portrait.png" width="1024" height="1024" alt="星瑶侧脸肖像：黑发盘髻，红围巾，白外套，耳际有带白翼的圆形像素徽记，上方是蓝色星轨与星瑶二字" fetchpriority="high">
+      </picture>
     </div>
     <div class="hero-copy">
       <h1>让代码，<br>回应你的想象。</h1>
@@ -537,7 +584,7 @@ dialog#demo-modal .btn { min-width: 120px; }
   <div class="wrap">
     <div class="footer-row">
       <a class="footer-brand" href="#top" aria-label="星瑶Code 首页">
-        <img src="assets/xingyao-lockup.png" width="400" height="164" alt="星瑶">
+        <img src="assets/xingyao-lockup.webp" width="400" height="164" alt="星瑶">
         <span>Code</span>
       </a>
       <div class="footer-links">
