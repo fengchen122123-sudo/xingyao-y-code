@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio
 import json
 import os
+import secrets
+import threading
 import time
 from pathlib import Path, PurePosixPath
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, WebSocket
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from gateway.workers import container_name
 from gateway.sessions import SessionReaper, SocketTable, close_with_4401
 from gateway.ws_agent import open_agent, preview_request
 
@@ -31,7 +35,7 @@ from gateway.auth import (
 )
 from gateway.db import connect
 from gateway.platform_models import PlatformModelStore
-from gateway.relay import OUTBOUND_LIMIT, DeviceSweeper, RelayRegistry
+from gateway.relay import OUTBOUND_LIMIT, DeviceSweeper, RelayRegistry, hash_token
 
 
 class LoginBody(BaseModel):
@@ -60,6 +64,13 @@ class PasswordBody(BaseModel):
 
 class DeviceBody(BaseModel):
     name: str
+
+
+class DeviceTokenBody(BaseModel):
+    """桌面用设备令牌自证换票：桌面只持有长期 device token，没有账号口令。"""
+
+    device_id: str
+    device_token: str
 
 
 class PatchAccount(BaseModel):
@@ -299,6 +310,45 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         account = database.execute("SELECT * FROM accounts WHERE id = ?", (user.account_id,)).fetchone()
         return issue_remote_token(database, account, jwt_secret, device_id)
 
+    # 换票限流窗口：设备令牌是长期密钥，换票接口不能是无成本的可爆破面。
+    # 网关按单进程 uvicorn 部署，进程内计数够用；重启清零只会放宽一个窗口。
+    _TICKET_WINDOW_SECONDS = 600.0
+    _TICKET_MAX_PER_WINDOW = 6
+    _ticket_hits: dict[str, list[float]] = {}
+    _ticket_lock = threading.Lock()
+
+    def _ticket_allowed(device_id: str, now: float) -> bool:
+        """同一设备 10 分钟内最多换 6 次票：正常用法是「用户打开二维码」级别。"""
+        with _ticket_lock:
+            hits = [stamp for stamp in _ticket_hits.get(device_id, []) if now - stamp < _TICKET_WINDOW_SECONDS]
+            if len(hits) >= _TICKET_MAX_PER_WINDOW:
+                _ticket_hits[device_id] = hits
+                return False
+            hits.append(now)
+            _ticket_hits[device_id] = hits
+            return True
+
+    @app.post("/api/relay/device-token")
+    def relay_device_token(body: DeviceTokenBody):
+        """桌面用设备令牌自证，换取只读 remote JWT，供公网二维码扫码入站。
+
+        设备令牌换票等于把它能做的事扩大到「读这台设备的远端页」，所以三处收口：
+        只签给未吊销且账号未禁用的设备、票里只绑自己这台 device_id、
+        同一设备 10 分钟内最多换 6 次。
+        """
+        if not _ticket_allowed(body.device_id, time.time()):
+            raise HTTPException(status_code=429, detail="换票过于频繁")
+        row = database.execute("SELECT * FROM devices WHERE id = ?", (body.device_id,)).fetchone()
+        # 令牌比对走常量时间：不能按响应耗时逐字节反推 token_hash
+        if row is None or int(row["revoked"]) or not secrets.compare_digest(
+            str(row["token_hash"]), hash_token(body.device_token)
+        ):
+            raise HTTPException(status_code=401, detail="设备令牌无效")
+        account = database.execute("SELECT * FROM accounts WHERE id = ?", (row["account_id"],)).fetchone()
+        if account is None or int(account["disabled"]):
+            raise HTTPException(status_code=403, detail="账号已停用")
+        return issue_remote_token(database, account, jwt_secret, body.device_id)
+
     @app.post("/api/admin/devices")
     def add_device(body: DeviceBody, account_id: str, user: Principal = Depends(admin)):
         device_id, token = app.state.relay.create_device(database, account_id, body.name)
@@ -466,6 +516,58 @@ def create_app(database_path: Path, jwt_secret: str) -> FastAPI:
         if status != 200:
             raise HTTPException(status_code=status)
         return Response(content=body, media_type=content_type)
+
+    @app.get("/novnc/{account_id}/{asset_path:path}")
+    async def novnc_asset(account_id: str, asset_path: str, request: Request, token: str = ""):
+        """把 noVNC 的静态资源从 worker 的 6080 转发出来。"""
+        import httpx
+
+        principal_now = read_access(database, token, jwt_secret)
+        if principal_now is None or principal_now.account_id != account_id:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        target = f"http://{container_name(account_id)}:6080/{asset_path}"
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                upstream = await client.get(target, params=request.query_params)
+        except Exception:
+            raise HTTPException(status_code=503, detail="novnc_unreachable")
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    @app.websocket("/novnc/{account_id}/websockify")
+    async def novnc_socket(websocket: WebSocket, account_id: str, token: str = ""):
+        """VNC 的 WebSocket 隧道：浏览器 <-> gateway <-> worker:6080。"""
+        import websockets
+
+        principal_now = read_access(database, token, jwt_secret)
+        if principal_now is None or principal_now.account_id != account_id:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        endpoint = f"ws://{container_name(account_id)}:6080/websockify"
+        try:
+            async with websockets.connect(endpoint, max_size=None) as upstream:
+                async def browser_to_worker():
+                    while True:
+                        frame = await websocket.receive_bytes()
+                        await upstream.send(frame)
+
+                async def worker_to_browser():
+                    async for message in upstream:
+                        await websocket.send_bytes(message)
+
+                await asyncio.gather(browser_to_worker(), worker_to_browser())
+        except Exception:
+            # 任一端断开都静默收尾：noVNC 自己会重连
+            pass
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/agent")
     async def agent_socket(websocket: WebSocket):
@@ -892,6 +994,48 @@ def mount_desktop_ui(app: FastAPI, desktop_dir: Path | None) -> None:
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
+def mount_mobile(app: FastAPI, mobile_dir: Path | None, shim_path: Path | None = None) -> None:
+    """把独立移动端（frontend-mobile/dist）暴露为 /m/<device_id>。
+
+    与桌面 UI 共用同一套 relay 协议：注入 __ycRelayDevice，shim 连 /relay/client。
+    目录缺失（没部署移动端包）时完全不挂路由，二维码退回 /desktop/<device_id>。
+    """
+    if mobile_dir is None or not (mobile_dir / "index.html").is_file():
+        return
+    root = Path(mobile_dir)
+    # frontend-mobile 的 vite base 是 /m/，dist 里的资源 URL 形如 /m/assets/xxx.js：
+    # 必须挂着这个前缀，否则会落到 mount_web 的通配路由上白屏。
+    assets = root / "assets"
+    if assets.is_dir():
+        app.mount("/m/assets", StaticFiles(directory=str(assets)), name="mobile-assets")
+    # mobile-shim.js 在 frontend/ 下（与桌面 UI 共用一份），不在 dist 目录里。
+    shim = Path(shim_path) if shim_path is not None else root.parent / "mobile-shim.js"
+
+    # 必须先注册 shim：/m/{device_id} 会把 /m/mobile-shim.js 当成设备号吃掉。
+    @app.get("/m/mobile-shim.js", include_in_schema=False)
+    def mobile_shim():
+        if not shim.is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(str(shim), media_type="application/javascript; charset=utf-8")
+
+    @app.get("/m/{device_id}", include_in_schema=False)
+    def mobile_index(device_id: str):
+        from fastapi.responses import HTMLResponse
+
+        # dist 根下的散装文件（favicon.svg / manifest.json / icon.png）按真实文件返回，
+        # 否则会被当成设备号返回一份 HTML。
+        static = _web_file(root, device_id)
+        if static is not None:
+            return FileResponse(static)
+        html = (root / "index.html").read_text(encoding="utf-8")
+        injection = (
+            f"<script>window.__ycRelayDevice={json.dumps(device_id)};</script>"
+            '<script src="/m/mobile-shim.js"></script>'
+        )
+        html = html.replace("</head>", injection + "</head>", 1)
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
 def app_from_env():
     from gateway.config import GatewayConfig
     from gateway.runtime import attach_runtime
@@ -916,6 +1060,13 @@ def app_from_env():
     mount_desktop_ui(
         app,
         Path(os.environ.get("XINGYAO_DESKTOP_DIST", "/srv/xingyao/frontend/desktop-dist")),
+    )
+    # 独立移动端可选部署：目录不存在时 mount_mobile 自己不挂路由，行为与从前一致。
+    # 默认指向 frontend-mobile/dist（移动端是独立前端子项目），shim 复用 frontend/ 下那份。
+    mount_mobile(
+        app,
+        Path(os.environ.get("XINGYAO_MOBILE_DIST", "/srv/xingyao/frontend-mobile/dist")),
+        Path(os.environ.get("XINGYAO_MOBILE_SHIM", "/srv/xingyao/frontend/mobile-shim.js")),
     )
     mount_web(app, config.web_dist)
     return app

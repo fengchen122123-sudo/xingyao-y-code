@@ -9,8 +9,10 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -76,11 +78,52 @@ def _start_computer_runtime():
     from core.computer.runtime import attach_preview_publisher, start_computer_runtime
 
     def _no_hotkey():
-        raise ComputerControlError("serve 进程不注册全局热键")
+        raise ComputerControlError("computer_unsupported_os", "serve 进程不注册全局热键")
 
     runtime = start_computer_runtime(hotkey_factory=_no_hotkey)
     attach_preview_publisher(runtime)
     return runtime
+
+
+def _start_remote_display() -> list:
+    """启动 Xvfb + x11vnc + websockify（仅 server 档且配置开启时）。
+
+    任何一步失败都整体回退：agent 仍然可用，只是不能远程接管。
+    """
+    try:
+        from core.computer.settings import remote_display_enabled
+    except Exception:
+        return []
+    if not remote_display_enabled():
+        return []
+    procs = []
+    try:
+        display = os.environ.get("DISPLAY") or ":99"
+        os.environ["DISPLAY"] = display
+        procs.append(subprocess.Popen(
+            ["Xvfb", display, "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        time.sleep(1.5)
+        procs.append(subprocess.Popen(
+            ["x11vnc", "-display", display, "-forever", "-shared", "-nopw",
+             "-localhost", "-rfbport", "5900", "-quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        procs.append(subprocess.Popen(
+            ["websockify", "--web", "/usr/share/novnc", "6080", "127.0.0.1:5900"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        logger.info("远程显示已就绪 display=%s novnc=http://127.0.0.1:6080", display)
+    except Exception:
+        logger.exception("远程显示启动失败，回退 headless")
+        for proc in procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        return []
+    return procs
 
 
 def main() -> int:
@@ -138,6 +181,12 @@ def main() -> int:
         except Exception:
             logger.exception("电脑操控运行时未启动（健康检查仍可用）")
 
+        remote_procs = []
+        try:
+            remote_procs = _start_remote_display()
+        except Exception:
+            logger.exception("远程显示未启动（不影响健康检查）")
+
         stop = threading.Event()
 
         def _handle(signum, _frame):
@@ -154,6 +203,11 @@ def main() -> int:
                 api.shutdown()
             except Exception:
                 logger.exception("退出时关闭 ApiBridge 失败")
+        for proc in locals().get("remote_procs", []) or []:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         try:
             from core.computer.runtime import shutdown_process_computer_runtime
 

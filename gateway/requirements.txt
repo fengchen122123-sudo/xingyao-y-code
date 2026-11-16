@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 websockets
+httpx
 docker
 argon2-cffi
 pyjwt

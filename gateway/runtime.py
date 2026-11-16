@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
 import queue
 import threading
@@ -235,6 +236,9 @@ def attach_runtime(app, config) -> None:
         config.worker_image,
         config.docker_network,
         platform_models=lambda: load_platform_models(app.state.database),
+        # 默认把网关挂载的源码目录直挂进工人容器；可用环境变量覆盖或置空关闭
+        source_dir=(os.environ.get("XINGYAO_WORKER_SOURCE_DIR")
+                    or ("/srv/xingyao" if os.path.isdir("/srv/xingyao") else "")),
     )
     app.state.workers = manager
     app.state.health = http_health

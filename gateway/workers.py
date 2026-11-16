@@ -67,11 +67,15 @@ def container_spec(
     network: str,
     keyring_file: str = "",
     keyring_source: str = "",
+    source_dir: str = "",
 ) -> dict:
     binds = [
         f"{volume}:/data",
         f"{volume.parent / 'workspace'}:/workspace",
     ]
+    if source_dir:
+        # 热更：宿主机源码直挂进容器，改完重启工人即生效，不必重建镜像
+        binds.append(f"{source_dir}:/opt/xingyao")
     env = {
         "TZ": "Asia/Shanghai",
         "LANG": "C.UTF-8",
@@ -109,7 +113,7 @@ def container_spec(
 
 
 class WorkerManager:
-    def __init__(self, docker, database, accounts_root: Path, image: str, network: str = "xingyao", platform_models=None, host_gateway: str | None = None):
+    def __init__(self, docker, database, accounts_root: Path, image: str, network: str = "xingyao", platform_models=None, host_gateway: str | None = None, source_dir: str = ""):
         self.docker = docker
         self.database = database
         self.accounts_root = Path(accounts_root)
@@ -117,6 +121,8 @@ class WorkerManager:
         self.network = network
         self.platform_models = platform_models
         self.host_gateway = docker_host_gateway() if host_gateway is None else host_gateway
+        # 源码挂载点：容器内 /opt/xingyao 换成宿主机目录
+        self.source_dir = source_dir
         self._guard = threading.Lock()
         self._account_locks: dict[str, threading.Lock] = {}
 
@@ -278,6 +284,7 @@ class WorkerManager:
             self.network,
             keyring_file,
             keyring_source=os.environ.get("XINGYAO_WORKER_KEYRING_SOURCE", "").strip(),
+            source_dir=self.source_dir,
         )
         if spec["ports"] or spec["docker_sock"]:
             raise RuntimeError("worker 不允许发布端口或挂载 docker.sock")

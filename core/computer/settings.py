@@ -29,6 +29,8 @@ DEFAULT_COMPUTER_BROWSER = "edge"
 # 桌面默认 edge 在容器里没有安装位置，内嵌 WebView2 也不存在，因此 serve 的
 # 缺省值必须是 chromium（设计 M07「从空 config.json 验收」）。
 DEFAULT_SERVER_BROWSER = "chromium"
+# 服务端远程接管（Xvfb + noVNC）：缺省关闭，显式开启才启动。
+REMOTE_DISPLAY_CONFIG_KEY = "computer_remote_display_enabled"
 
 # 进程内内存设置 generation：任何成功写入的设置变更都递增；
 # 关闭开关的路径固定为「先持久化 false → 递增 generation → 返回快照」，
@@ -107,6 +109,29 @@ def _bump_settings_generation() -> None:
 
 def _server_profile() -> bool:
     return os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server"
+
+
+def remote_display_enabled() -> bool:
+    """服务端是否启用远程接管（Xvfb + noVNC）。
+
+    桌面版恒 False：Windows 上有真实浏览器窗口，用户本来就能直接操作，
+    不读这个配置，避免任何配置差异影响本机体验。
+    """
+    if not _server_profile():
+        return False
+    try:
+        data = config._load()
+    except Exception:
+        logger.debug("读取远程显示配置失败，按关闭处理", exc_info=True)
+        return False
+    return _read_bool(data, REMOTE_DISPLAY_CONFIG_KEY)
+
+
+def resolve_headless() -> bool:
+    """浏览器是否无头：桌面版恒 False；服务端默认 True，开启远程显示后才 False。"""
+    if sys.platform == "win32":
+        return False
+    return not remote_display_enabled()
 
 
 def _read_bool(data: dict, key: str) -> bool:

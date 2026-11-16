@@ -36,6 +36,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from core.computer.actions import MAX_WAIT_MS, MIN_WAIT_MS, _parse_url
+from core.computer.settings import resolve_headless
 from core.computer.models import (
     ComputerAction,
     ComputerControlError,
@@ -1254,7 +1255,7 @@ class BrowserComputerBackend:
         """Windows 保持有界面、不附加容器参数。Linux 恒无头。"""
         kwargs = {
             "user_data_dir": user_data_dir,
-            "headless": sys.platform != "win32",
+            "headless": resolve_headless(),
             "viewport": {"width": self._viewport_width, "height": self._viewport_height},
             "device_scale_factor": 1,
         }
