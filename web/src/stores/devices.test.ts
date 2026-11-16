@@ -72,6 +72,29 @@ describe("device store", () => {
     vi.unstubAllGlobals();
   });
 
+  it("keeps devices unknown until an authoritative status arrives", async () => {
+    const auth = useAuthStore();
+    auth.server = "https://example.test";
+    auth.credential = "jwt";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      // /api/devices 不返回 online：这时不能把设备写成离线。
+      json: async () => ({ devices: [{ id: "d", name: "台式机" }] }),
+    }));
+    const devices = useDeviceStore();
+    await devices.load();
+    expect(devices.devices[0].state).toBe("unknown");
+    expect(devices.devices[0].online).toBeUndefined();
+
+    // 权威状态到了以后才落成在线/离线。
+    const socket = devices.socket as unknown as Socket;
+    socket.message({ type: "device_status", data: { device_id: "d", online: true } });
+    expect(devices.devices[0].state).toBe("online");
+    expect(devices.devices[0].online).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
   it("reconnects with backoff after the socket drops", async () => {
     vi.useFakeTimers();
     const auth = useAuthStore();

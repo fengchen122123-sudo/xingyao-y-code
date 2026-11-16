@@ -9,6 +9,11 @@
   --sidebar: #201f1b;
   --sidebar-muted: #aaa69c;
   --shadow: 0 10px 28px rgba(48, 40, 24, .07);
+  /* 细节层：阴影分档 + 统一缓动，省得每个组件各写一套曲线 */
+  --shadow-sm: 0 1px 2px rgba(48, 40, 24, .05), 0 4px 12px rgba(48, 40, 24, .04);
+  --shadow-lg: 0 18px 44px rgba(48, 40, 24, .1);
+  --ease: cubic-bezier(.22, .8, .26, 1);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
 }
 * { box-sizing: border-box; }
 html, body, #app { height: 100%; margin: 0; }
@@ -19,6 +24,9 @@ body {
   font-size: 15px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  /* 等宽数字让时间/计数不跳动，连字特性让小写排版更利落 */
+  font-feature-settings: "tnum" 1, "ss01" 1;
+  text-rendering: optimizeLegibility;
 }
 button, input, textarea, select { font: inherit; color: inherit; }
 button, select { cursor: pointer; }
@@ -98,6 +106,28 @@ h1, h2, p { margin-top: 0; }
   display: block; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--sidebar-muted); font-size: 12px;
 }
+.session-item { position: relative; }
+.session-item .session-button { padding-right: 34px; }
+.session-delete {
+  position: absolute; top: 50%; right: 8px; transform: translateY(-50%);
+  width: 22px; height: 22px; padding: 0; display: grid; place-items: center;
+  border: 0; border-radius: 6px; background: transparent; color: var(--sidebar-muted);
+  opacity: 0; cursor: pointer; transition: opacity .12s, color .12s, background .12s;
+}
+.session-item:hover .session-delete, .session-delete:focus-visible { opacity: 1; }
+.session-delete:hover { background: rgba(255, 255, 255, .1); color: #fff; }
+.session-delete .icon { width: 12px; height: 12px; stroke-width: 2.2; }
+.session-confirm {
+  position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
+  display: flex; align-items: center; gap: 4px;
+}
+.session-confirm button {
+  border: 0; border-radius: 6px; padding: 3px 8px; font-size: 11px; cursor: pointer;
+}
+.session-confirm .confirm-yes { background: #b4413a; color: #fff; }
+.session-confirm .confirm-no { background: #3a3731; color: #e8e4dc; }
+/* 触屏没有 hover：删除入口必须常显，否则永远点不到。 */
+@media (hover: none) { .session-delete { opacity: 1; } }
 .sidebar-empty { margin: 8px 10px; color: var(--sidebar-muted); font-size: 13px; }
 .sidebar-foot {
   margin-top: auto; padding-top: 10px; border-top: 1px solid #3c3933;
@@ -503,3 +533,186 @@ h1, h2, p { margin-top: 0; }
 .remote-qr-card img { width: 240px; height: 240px; background: #fff; border-radius: 10px; }
 .remote-qr-card code { max-width: 100%; overflow-wrap: anywhere; font-size: 11px; color: var(--muted); }
 .remote-qr-actions { display: flex; gap: 8px; }
+
+
+/* ============ 细节打磨层 ============
+   只做观感微调：进入动效、统一过渡、滚动条、气泡层次。
+   配色和布局沿用上面的米色调体系，不在这里改版式。 */
+
+@keyframes message-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* 新消息轻微上浮淡入；历史消息初次渲染同样柔和，不会硬切。 */
+.message { animation: message-in .24s var(--ease-out) both; }
+
+/* 气泡层次：助手侧靠边框，用户侧靠浅阴影，避免两坨同质色块。 */
+.message.user .message-bubble { box-shadow: var(--shadow-sm); }
+.message-bubble { transition: box-shadow .18s var(--ease); }
+
+/* 正文行距节奏 */
+.message-text { letter-spacing: .002em; }
+@media (min-width: 761px) {
+  .message { margin-bottom: 18px; }
+}
+
+/* 输入框聚焦时抬一层，让"正在输入"有反馈。 */
+.composer { transition: border-color .16s var(--ease), box-shadow .22s var(--ease); }
+.composer:focus-within { box-shadow: var(--shadow-lg); }
+
+/* 聊天区滚动条：和侧栏一致的细条风格，不再露出系统默认灰块。 */
+.chat-stream { scrollbar-width: thin; scrollbar-color: #d9d3c7 transparent; }
+.chat-stream::-webkit-scrollbar { width: 10px; }
+.chat-stream::-webkit-scrollbar-track { background: transparent; }
+.chat-stream::-webkit-scrollbar-thumb {
+  border: 3px solid transparent; border-radius: 999px;
+  background-clip: content-box; background-color: #d9d3c7;
+}
+.chat-stream::-webkit-scrollbar-thumb:hover { background-color: #c3bcac; }
+
+/* 交互元素统一过渡曲线，避免有的地方生硬、有的地方拖沓。 */
+.button, .session-button, .device-card, .icon-button, .new-chat,
+.sidebar-link, .account-link, .status-pill {
+  transition: background-color .16s var(--ease), border-color .16s var(--ease),
+              color .16s var(--ease), box-shadow .2s var(--ease);
+}
+
+/* 设备卡悬停给一点位移，配合阴影变化，比单纯变边框更有质感。 */
+.device-card { transition: transform .16s var(--ease), border-color .16s var(--ease), box-shadow .2s var(--ease); }
+.device-card:not(:disabled):hover { transform: translateY(-1px); }
+
+@media (prefers-reduced-motion: reduce) {
+  .message { animation: none; }
+  .device-card:not(:disabled):hover { transform: none; }
+  .button, .session-button, .device-card, .icon-button, .new-chat,
+  .sidebar-link, .account-link, .status-pill, .composer, .message-bubble {
+    transition: none;
+  }
+}
+
+/* ============ 可见层：气泡与留白 ============
+   上一版只调了动效/悬停这类静止看不出来的细节，静态对比几乎无感。
+   这里改真正占视觉面积的部分：气泡形状、配色、间距、字重。 */
+
+/* 助手气泡：去掉 1px 边框（米色背景上显得脏），改用柔和投影托起 */
+.message-bubble {
+  border: 0;
+  border-radius: 20px;
+  border-bottom-left-radius: 8px;
+  background: #fffefb;
+  box-shadow: 0 1px 2px rgba(48, 40, 24, .04), 0 8px 24px rgba(48, 40, 24, .06);
+  padding: 13px 16px;
+}
+
+/* 用户气泡：浅绿换成同色系的暖米，和整体米色调统一 */
+.message.user .message-bubble {
+  border-radius: 20px;
+  border-bottom-right-radius: 8px;
+  background: #ece6d9;
+  box-shadow: none;
+}
+
+/* 消息之间拉开距离，阅读节奏更稳 */
+.message { margin-bottom: 22px; }
+.message-text { line-height: 1.7; }
+
+/* 侧栏当前会话加一条左侧竖线，扫一眼就知道在哪 */
+.session-button.active { box-shadow: inset 2px 0 0 #f4f1ea; }
+
+/* 标题字重提一档，和摘要拉开层次 */
+.chat-heading h1 { font-weight: 680; }
+.session-topline strong { font-weight: 600; }
+
+@media (max-width: 760px) {
+  .message { margin-bottom: 16px; }
+  .message-bubble { padding: 11px 13px; }
+}
+
+/* ============ 工具调用折叠 ============
+   默认收起，避免一屏几十条命令把正文挤没；展开后逐条列出命令和输出。 */
+.tool-group {
+  margin-top: 10px;
+  overflow: hidden;
+  border: 1px solid #e8e2d7;
+  border-radius: 11px;
+  background: #f7f3ec;
+}
+.tool-group > summary {
+  display: flex; align-items: center; gap: 8px; padding: 9px 11px;
+  color: var(--muted); font-size: 12px; cursor: pointer; list-style: none;
+}
+.tool-group > summary::-webkit-details-marker { display: none; }
+.tool-group > summary:hover { background: #f1ece2; }
+.tool-group > summary .icon { width: 14px; height: 14px; }
+.tool-group-hint { margin-left: auto; font-size: 11px; opacity: .65; }
+.tool-group[open] > summary { border-bottom: 1px solid #e8e2d7; }
+.tool-group[open] .tool-group-hint { display: none; }
+.tool-group .tool-note { margin: 0; border-radius: 0; background: transparent; padding: 9px 11px; }
+.tool-group .tool-note + .tool-note { border-top: 1px solid #efe9de; }
+
+/* Markdown 正文的排版细节：标题、表格、引用、代码块都给了明确比例。 */
+.message-text.markdown > :first-child { margin-top: 0; }
+.message-text.markdown > :last-child { margin-bottom: 0; }
+.message-text.markdown p { margin: 0 0 10px; }
+.message-text.markdown h1,
+.message-text.markdown h2,
+.message-text.markdown h3 {
+  margin: 18px 0 8px; font-weight: 660; letter-spacing: -.01em; line-height: 1.35;
+}
+.message-text.markdown h1 { font-size: 19px; }
+.message-text.markdown h2 { font-size: 17px; }
+.message-text.markdown h3 { font-size: 15.5px; }
+.message-text.markdown ul,
+.message-text.markdown ol { margin: 0 0 10px; padding-left: 22px; }
+.message-text.markdown li { margin: 3px 0; }
+.message-text.markdown blockquote {
+  margin: 10px 0; padding: 6px 12px; border-left: 3px solid #ddd5c6;
+  color: var(--muted); background: #faf7f1;
+}
+.message-text.markdown table {
+  width: 100%; margin: 10px 0; border-collapse: collapse; font-size: 13.5px;
+}
+.message-text.markdown th,
+.message-text.markdown td {
+  padding: 7px 10px; border: 1px solid #e8e2d7; text-align: left; vertical-align: top;
+}
+.message-text.markdown th { background: #f7f3ec; font-weight: 600; }
+.message-text.markdown pre {
+  margin: 10px 0; padding: 11px 13px; overflow-x: auto;
+  border-radius: 10px; background: #f5f1e9;
+}
+.message-text.markdown pre code { padding: 0; background: transparent; font-size: 12.5px; line-height: 1.6; }
+.message-text.markdown hr { margin: 14px 0; border: 0; border-top: 1px solid #e8e2d7; }
+.message-text.markdown a { color: #6b5b3e; text-decoration: underline; text-underline-offset: 2px; }
+
+/* ============ 过程入口 ============
+   思考和工具调用合并成一行「▸ 过程」，默认收起。
+   展开后才看得到思考原文和每条命令明细。 */
+.message-process { margin-top: 8px; color: var(--muted); font-size: 12px; }
+.message-process > summary {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 0; cursor: pointer; list-style: none; opacity: .72;
+}
+.message-process > summary::-webkit-details-marker { display: none; }
+.message-process > summary:hover { opacity: 1; }
+.message-process > summary::before { content: "▸"; font-size: 10px; line-height: 1; }
+.message-process[open] > summary::before { content: "▾"; }
+.process-thinking {
+  margin: 8px 0; padding: 10px 12px; white-space: pre-wrap;
+  border-radius: 10px; background: #f7f3ec; font-size: 12px; line-height: 1.65;
+}
+.message-process .tool-note { margin-top: 6px; }
+
+/* Markdown 正文里的图片：限制在气泡宽度内，长截图也不撑满屏幕 */
+.message-text.markdown img {
+  display: block;
+  max-width: 100%;
+  max-height: 50vh;
+  width: auto;
+  height: auto;
+  margin: 10px 0;
+  border-radius: 10px;
+  background: #f7f3ec;
+  object-fit: contain;
+}

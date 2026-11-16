@@ -48,16 +48,16 @@
           :key="device.id"
           type="button"
           class="device-card"
-          :class="{ offline: !device.online }"
-          :disabled="!device.online"
+          :class="{ offline: device.state === 'offline' }"
+          :disabled="device.state === 'offline'"
           @click="useDesktop(device.id)"
         >
           <span class="device-icon" aria-hidden="true">
             <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="11" rx="2"/><path d="M2 19h20"/></svg>
           </span>
-          <span class="device-copy"><strong>{{ device.name }}</strong><small>{{ device.online ? "在线 · 可以连接" : "电脑上的星瑶未运行" }}</small></span>
-          <span class="status-pill" :class="device.online ? 'success' : 'neutral'">{{ device.online ? "在线" : "离线" }}</span>
-          <svg v-if="device.online" class="icon device-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+          <span class="device-copy"><strong>{{ device.name }}</strong><small>{{ deviceHint(device) }}</small></span>
+          <span class="status-pill" :class="device.state === 'online' ? 'success' : 'neutral'">{{ devicePill(device) }}</span>
+          <svg v-if="device.state === 'online'" class="icon device-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
         </button>
       </div>
     </section>
@@ -102,6 +102,23 @@ const remoteQr = ref("");
 const remoteUrl = ref("");
 const error = ref("");
 onMounted(() => devices.load().catch(() => undefined));
+
+type DeviceState = "unknown" | "online" | "offline" | "resyncing";
+
+/** 状态文案：unknown 表示列表接口还没给出权威值，不能写成「未运行」。 */
+function deviceHint(device: { state: DeviceState }) {
+  if (device.state === "online") return "在线 · 可以连接";
+  if (device.state === "offline") return "电脑上的星瑶未运行";
+  if (device.state === "resyncing") return "正在重新同步…";
+  return "正在检测状态…";
+}
+
+function devicePill(device: { state: DeviceState }) {
+  if (device.state === "online") return "在线";
+  if (device.state === "offline") return "离线";
+  if (device.state === "resyncing") return "同步中";
+  return "检测中";
+}
 
 async function useDesktop(deviceId: string) {
   try {

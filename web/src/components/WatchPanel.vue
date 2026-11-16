@@ -21,7 +21,7 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { PreviewLoader } from "../transport/preview";
 import { useAuthStore } from "../stores/auth";
 
-type DeviceState = "online" | "offline" | "resyncing";
+type DeviceState = "unknown" | "online" | "offline" | "resyncing";
 
 const props = defineProps<{ src: string; state?: DeviceState; reason?: string }>();
 defineEmits<{ stop: [] }>();

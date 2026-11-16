@@ -57,17 +57,35 @@ function flattenSessions(value: unknown): { name: string }[] {
 
 function mapMessages(value: unknown): ChatMessage[] {
   if (!Array.isArray(value)) return [];
-  return value.map((item, index) => {
+  // 同一轮里，工具消息和思考消息都并进最近一条助手气泡：
+  // 以前每条各占一个框，刷新后一屏全是「思考过程 / 执行了 N 个操作」。
+  const merged: ChatMessage[] = [];
+  let seq = 0;
+  const ensureAgent = (): ChatMessage => {
+    const last = merged[merged.length - 1];
+    if (last && last.role === "agent") return last;
+    const created: ChatMessage = { id: `agent-${seq++}`, role: "agent", text: "" };
+    merged.push(created);
+    return created;
+  };
+  value.forEach((item, index) => {
     const message = item as { role?: string; content?: string; reasoning_content?: string; name?: string };
-    const role = message.role === "user" ? "user" : message.role === "tool" ? "tool" : "agent";
-    return {
-      id: String(index),
-      role,
-      text: String(message.content || ""),
-      thinking: String(message.reasoning_content || ""),
-      tools: role === "tool" ? [{ id: String(index), title: String(message.name || "工具"), detail: String(message.content || "") }] : [],
-    };
+    const content = String(message.content || "");
+    if (message.role === "user") {
+      merged.push({ id: String(index), role: "user", text: content });
+      return;
+    }
+    const agent = ensureAgent();
+    if (message.role === "tool") {
+      agent.tools = agent.tools || [];
+      agent.tools.push({ id: String(index), title: String(message.name || "工具"), detail: content });
+      return;
+    }
+    const thinking = String(message.reasoning_content || "");
+    if (thinking) agent.thinking = agent.thinking ? `${agent.thinking}\n${thinking}` : thinking;
+    if (content) agent.text += content;
   });
+  return merged;
 }
 
 export const useAppStore = defineStore("app", {
@@ -172,6 +190,22 @@ export const useAppStore = defineStore("app", {
       }
       const session = String(data.session_name || "");
       if (session && this.currentSession && session !== this.currentSession) return;
+      if (frame.type === "session_renamed") {
+        // 首轮结束时会话会自动改名（拿首条消息当标题）。后端推了事件，前端必须跟着换名，
+        // 否则侧栏还挂着旧名，点旧名等于切到一个不存在的会话，消息就空了。
+        const oldName = String(data.old || data.old_name || "");
+        const newName = String(data.new || data.new_name || "");
+        if (newName) {
+          if (Array.isArray(data.sessions)) this.sessions = flattenSessions(data.sessions);
+          else if (oldName) this.sessions = this.sessions.map((item) => (item.name === oldName ? { name: newName } : item));
+          if (oldName && this.currentSession === oldName) this.currentSession = newName;
+          if (oldName && typeof this.activeTurns[oldName] !== "undefined") {
+            this.activeTurns[newName] = this.activeTurns[oldName];
+            delete this.activeTurns[oldName];
+          }
+        }
+        return;
+      }
       if (frame.type === "model_changed") {
         this.syncModel(data);
         return;
@@ -355,6 +389,29 @@ export const useAppStore = defineStore("app", {
       if (created && created.ok === false) throw new Error(created.msg || "新对话创建失败");
       const state = await shim.rpc("get_initial_state", []) as Record<string, unknown>;
       if (this.shim === shim) this.replaceSnapshot(state);
+    },
+    /** 删除会话：数据清理与"当前会话"兜底都由后端负责，这里只同步列表和视图。 */
+    async deleteSession(name: string) {
+      const shim = this.shim;
+      if (!shim) throw new Error("还没有接上星瑶");
+      const removingCurrent = name === this.currentSession;
+      const result = await shim.rpc("delete_session", { session_name: name }) as
+        { ok?: boolean; success?: boolean; msg?: string; sessions?: unknown; current_session?: string } | undefined;
+      if (result && (result.ok === false || result.success === false)) {
+        throw new Error(result.msg || "会话没有删除成功");
+      }
+      if (this.shim !== shim) return;
+      this.sessions = flattenSessions(result?.sessions);
+      // 删掉的正是当前会话：后端已经切到新建的空会话，本地气泡必须跟着清，
+      // 否则旧消息会挂在新会话上，看起来像没删掉。
+      if (removingCurrent) {
+        const state = await shim.rpc("get_initial_state", []) as Record<string, unknown>;
+        if (this.shim === shim) this.replaceSnapshot(state);
+        return;
+      }
+      if (typeof result?.current_session === "string" && result.current_session) {
+        this.currentSession = result.current_session;
+      }
     },
     async chooseSession(name: string) {
       const shim = this.shim;

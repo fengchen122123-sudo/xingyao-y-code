@@ -281,4 +281,58 @@ describe("app connection and event isolation", () => {
     expect(app.currentSession).toBe("work");
     expect(app.previewUrl).toBe("/computer-preview/2");
   });
+
+  it("deletes a non-current session and refreshes the list without reloading the snapshot", async () => {
+    const app = useAppStore();
+    signedInAuth();
+    app.connect();
+    app.sessions = [{ name: "keep" }, { name: "gone" }];
+    app.currentSession = "keep";
+    shims[0].rpc.mockImplementation(async (method: string) => {
+      if (method === "delete_session") {
+        return { ok: true, success: true, sessions: [{ name: "keep" }], current_session: "keep" };
+      }
+      return { ok: true };
+    });
+    await app.deleteSession("gone");
+    expect(shims[0].rpc).toHaveBeenCalledWith("delete_session", { session_name: "gone" });
+    expect(app.sessions).toEqual([{ name: "keep" }]);
+    expect(app.currentSession).toBe("keep");
+    // 删的不是当前会话：不该顺手重拉整态，否则会白丢正在看的消息。
+    expect(shims[0].rpc.mock.calls.some((call) => call[0] === "get_initial_state")).toBe(false);
+  });
+
+  it("reloads the snapshot when the deleted session is the one on screen", async () => {
+    const app = useAppStore();
+    signedInAuth();
+    app.connect();
+    app.sessions = [{ name: "doomed" }];
+    app.currentSession = "doomed";
+    app.messages = [{ id: "1", role: "user", text: "旧消息" }];
+    shims[0].rpc.mockImplementation(async (method: string) => {
+      if (method === "delete_session") {
+        return { ok: true, success: true, sessions: [{ name: "session_new001" }], current_session: "session_new001" };
+      }
+      if (method === "get_initial_state") {
+        return { sessions: [{ name: "session_new001" }], current_session: "session_new001", messages: [] };
+      }
+      return { ok: true };
+    });
+    await app.deleteSession("doomed");
+    expect(app.currentSession).toBe("session_new001");
+    // 后端已切到新建的空会话，本地气泡必须一起清掉。
+    expect(app.messages).toEqual([]);
+  });
+
+  it("keeps the session when the bridge refuses to delete a running turn", async () => {
+    const app = useAppStore();
+    signedInAuth();
+    app.connect();
+    app.sessions = [{ name: "busy" }];
+    app.currentSession = "busy";
+    shims[0].rpc.mockResolvedValueOnce({ ok: false, success: false, msg: "该会话正在运行回合，请先停止或等待完成后再删除" });
+    await expect(app.deleteSession("busy")).rejects.toThrow("正在运行回合");
+    expect(app.sessions).toEqual([{ name: "busy" }]);
+    expect(app.currentSession).toBe("busy");
+  });
 });

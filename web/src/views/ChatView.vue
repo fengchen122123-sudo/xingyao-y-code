@@ -30,19 +30,19 @@
         <article v-for="(message, index) in app.messages" :key="message.id" class="message" :class="[message.role, { waiting: isWaiting(message, index) }]">
           <div v-if="message.role !== 'user'" class="avatar avatar-sm" aria-hidden="true">星</div>
           <div class="message-bubble">
-            <details v-if="message.thinking" class="thinking">
-              <summary>思考过程</summary>
-              <p>{{ message.thinking }}</p>
-            </details>
             <div v-if="isWaiting(message, index)" class="typing-indicator" role="status" aria-label="星瑶正在思考">
               <span></span><span></span><span></span><em>正在思考</em>
             </div>
             <div v-if="message.role === 'user'" class="message-text">{{ message.text }}</div>
             <div v-else-if="message.text" class="message-text markdown" v-html="render(message.text)"></div>
-            <div v-for="tool in message.tools || []" :key="tool.id" class="tool-note">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m14.7 6.3 3 3M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z"/></svg>
-              <span><strong>{{ tool.title }}</strong><small v-if="tool.detail">{{ tool.detail }}</small></span>
-            </div>
+            <!-- 思考与工具调用收进同一个「过程」入口：默认收起，不再每条各占一框 -->
+            <details v-if="message.thinking || message.tools?.length" class="message-process">
+              <summary>过程<span v-if="message.tools?.length"> · {{ message.tools.length }} 步</span></summary>
+              <p v-if="message.thinking" class="process-thinking">{{ message.thinking }}</p>
+              <div v-for="tool in message.tools || []" :key="tool.id" class="tool-note">
+                <span><strong>{{ tool.title }}</strong><small v-if="tool.detail">{{ tool.detail }}</small></span>
+              </div>
+            </details>
           </div>
         </article>
         <div id="watch" class="watch-anchor">

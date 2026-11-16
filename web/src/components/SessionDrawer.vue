@@ -17,22 +17,42 @@
     <p class="sidebar-label">最近</p>
     <nav class="session-list" aria-label="会话">
       <p v-if="!sessions.length" class="sidebar-empty">还没有会话，直接说你要做的事。</p>
-      <button
+      <div
         v-for="session in sessions"
         :key="session.name"
-        class="session-button"
+        class="session-item"
         :class="{ active: session.name === current }"
-        type="button"
-        :disabled="busy"
-        :aria-current="session.name === current ? 'page' : undefined"
-        @click="$emit('select', session.name)"
       >
-        <span class="session-topline">
-          <strong>{{ session.name }}</strong>
-          <span v-if="session.name === current">当前</span>
-        </span>
-        <small>{{ session.name === current ? preview : "打开这段对话" }}</small>
-      </button>
+        <button
+          class="session-button"
+          type="button"
+          :disabled="busy"
+          :aria-current="session.name === current ? 'page' : undefined"
+          @click="$emit('select', session.name)"
+        >
+          <span class="session-topline">
+            <strong>{{ session.name }}</strong>
+            <span v-if="session.name === current && pendingDelete !== session.name">当前</span>
+          </span>
+          <small>{{ session.name === current ? preview : "打开这段对话" }}</small>
+        </button>
+        <template v-if="!busy">
+          <button
+            v-if="pendingDelete !== session.name"
+            class="session-delete"
+            type="button"
+            :aria-label="`删除会话 ${session.name}`"
+            :title="`删除会话 ${session.name}`"
+            @click.stop="pendingDelete = session.name"
+          >
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+          </button>
+          <span v-else class="session-confirm">
+            <button class="confirm-yes" type="button" @click.stop="confirmDelete(session.name)">删除</button>
+            <button class="confirm-no" type="button" @click.stop="pendingDelete = ''">取消</button>
+          </span>
+        </template>
+      </div>
     </nav>
 
     <div class="sidebar-foot">
@@ -61,18 +81,33 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import { useAuthStore } from "../stores/auth";
 
-defineProps<{
+const props = defineProps<{
   open: boolean;
   sessions: { name: string }[];
   current: string;
   preview: string;
   busy: boolean;
 }>();
-defineEmits<{ select: [name: string]; new: []; close: [] }>();
+const emit = defineEmits<{ select: [name: string]; new: []; close: []; delete: [name: string] }>();
 
 const auth = useAuthStore();
 const initial = computed(() => auth.accountId.trim().slice(0, 1) || "我");
+/** 正在等待二次确认的会话名：一次只确认一条，避免多个确认条同屏。 */
+const pendingDelete = ref("");
+
+// 切走会话或列表刷新后，残留的确认条会指着一个已经不在列表里的名字。
+watch(() => props.current, () => { pendingDelete.value = ""; });
+watch(() => props.sessions, () => {
+  if (pendingDelete.value && !props.sessions.some((session) => session.name === pendingDelete.value)) {
+    pendingDelete.value = "";
+  }
+});
+
+function confirmDelete(name: string) {
+  pendingDelete.value = "";
+  emit("delete", name);
+}
 </script>

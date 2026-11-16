@@ -10,6 +10,7 @@
       :busy="sessionBusy"
       @select="chooseSession"
       @new="newSession"
+      @delete="deleteSession"
       @close="navigationOpen = false"
     />
     <button
@@ -107,6 +108,21 @@ async function newSession() {
     navigationOpen.value = false;
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : "新对话创建失败，请再试一次。";
+  } finally {
+    sessionBusy.value = false;
+  }
+}
+
+async function deleteSession(name: string) {
+  if (sessionBusy.value) return;
+  sessionBusy.value = true;
+  actionError.value = "";
+  try {
+    await app.deleteSession(name);
+    // 删的是当前会话时后端会切到新建的空会话，留在对话页即可；删别的会话不动路由。
+    await router.push("/chat");
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : "会话没有删除成功，请再试一次。";
   } finally {
     sessionBusy.value = false;
   }

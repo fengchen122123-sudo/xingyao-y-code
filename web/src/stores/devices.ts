@@ -19,9 +19,10 @@ interface DeviceFrame {
 export interface DeviceRow {
   id: string;
   name: string;
-  online: boolean;
-  /** 在线/离线/正在整态重来：device_reset 与 resync_required 都要让页面看出来。 */
-  state: "online" | "offline" | "resyncing";
+  /** 列表接口不带在线状态时是 undefined：必须区分「还没查到」与「确实离线」。 */
+  online?: boolean;
+  /** 未知/在线/离线/正在整态重来：unknown 只在权威状态到达前短暂存在。 */
+  state: "unknown" | "online" | "offline" | "resyncing";
   generation?: number;
   reason?: string;
 }
@@ -43,8 +44,10 @@ export const useDeviceStore = defineStore("devices", {
       this.devices = rows.map((row) => ({
         id: row.id,
         name: row.name,
-        online: Boolean(row.online),
-        state: row.online ? "online" : "offline",
+        online: typeof row.online === "boolean" ? row.online : undefined,
+        // 列表接口不返回在线状态，权威值靠 /ws/devices 推送。这里先挂 unknown，
+        // 若直接折成 false，每台设备进页面都会先闪一下「电脑上的星瑶未运行」。
+        state: typeof row.online === "boolean" ? (row.online ? "online" : "offline") : "unknown",
       }));
       this.watch();
     },
