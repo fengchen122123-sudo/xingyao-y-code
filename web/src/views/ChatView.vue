@@ -45,6 +45,14 @@
             </details>
           </div>
         </article>
+        <div v-if="app.takeover" class="takeover-card" role="status">
+          <p class="takeover-title">需要你接手操作</p>
+          <p class="takeover-hint">星瑶停在了一个需要人工完成的步骤{{ app.takeover.reason ? "（" + app.takeover.reason + "）" : "" }}，完成验证后在远程桌面里继续。</p>
+          <div class="takeover-actions">
+            <a class="takeover-btn primary" :href="remoteDesktopUrl" target="_blank" rel="noopener">打开远程桌面</a>
+            <button class="takeover-btn" type="button" @click="finishTakeover">我已完成，继续</button>
+          </div>
+        </div>
         <div id="watch" class="watch-anchor">
           <WatchPanel :src="app.previewUrl" :state="deviceState" :reason="deviceReason" @stop="app.stopWatching()" />
         </div>
@@ -178,6 +186,23 @@ async function send() {
     error.value = cause instanceof Error ? cause.message : "消息没有发出去，请再试一次。";
   } finally {
     sending.value = false;
+  }
+}
+
+// 远程桌面地址：跟随当前部署前缀（/xy/bot 等），并带上网关要求的 token。
+const remoteDesktopUrl = computed(() => {
+  if (!app.takeover) return "";
+  const prefix = window.location.pathname.replace(/\/(?:#.*)?$/, "").replace(/\/$/, "");
+  const account = encodeURIComponent(auth.accountId || "");
+  const token = encodeURIComponent(auth.credential || "");
+  return `${window.location.origin}${prefix}/novnc/${account}/vnc.html?path=websockify&autoconnect=1&resize=scale&token=${token}`;
+});
+
+async function finishTakeover() {
+  try {
+    await app.resumeComputer();
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "恢复失败，请重试";
   }
 }
 

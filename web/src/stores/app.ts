@@ -101,6 +101,8 @@ export const useAppStore = defineStore("app", {
     answering: [] as string[],
     previewUrl: "",
     previewRun: "",
+    /** 星瑶卡在需要人操作的地方（验证码/登录），等用户接管后恢复。 */
+    takeover: null as { runId: string; reason: string } | null,
     status: "未连接",
     profile: "agent" as "agent" | "desktop",
     deviceId: "",
@@ -277,6 +279,17 @@ export const useAppStore = defineStore("app", {
       if (frame.type === "permission_dismiss") {
         const id = String(data.id || data.request_id || "");
         this.approvals = this.approvals.filter((item) => !id || item.id !== id);
+        return;
+      }
+      if (frame.type === "computer_state") {
+        // 后端在 request_user_takeover 时把 run 置成 waiting_for_user
+        const status = String(data.status || "");
+        const runId = String(data.run_id || data.runId || "");
+        if (status === "waiting_for_user" && runId) {
+          this.takeover = { runId, reason: String(data.reason || "") };
+        } else if (status && status !== "waiting_for_user") {
+          this.takeover = null;
+        }
         return;
       }
       if (frame.type === "computer_observation" && typeof data.preview_url === "string") {
@@ -476,6 +489,16 @@ export const useAppStore = defineStore("app", {
       this.activeTurn = "";
       this.status = "已停下";
     },
+    /** 用户在远程桌面完成验证后，让星瑶从当前页面继续。 */
+    async resumeComputer() {
+      const shim = this.shim;
+      const current = this.takeover;
+      if (!shim || !current) return;
+      const result = await shim.rpc("resume_computer_control", { run_id: current.runId }) as
+        { ok?: boolean; msg?: string } | undefined;
+      if (result && result.ok === false) throw new Error(result.msg || "恢复失败，请重试");
+      this.takeover = null;
+    },
     async stopWatching() {
       if (!this.previewRun) return;
       await this.shim?.rpc("stop_computer_control", { run_id: this.previewRun });
@@ -493,6 +516,7 @@ export const useAppStore = defineStore("app", {
       this.answering = [];
       this.previewUrl = "";
       this.previewRun = "";
+      this.takeover = null;
       this.models = [];
       this.activeModelId = "";
       this.activeModelName = "";

@@ -716,3 +716,25 @@ h1, h2, p { margin-top: 0; }
   background: #f7f3ec;
   object-fit: contain;
 }
+
+/* ============ 接管卡片 ============
+   星瑶卡在验证码/登录这类需要人工的步骤时出现。 */
+.takeover-card {
+  margin: 14px auto;
+  max-width: 720px;
+  padding: 14px 16px;
+  border: 1px solid #e8c88a;
+  border-radius: 12px;
+  background: #fdf6e7;
+}
+.takeover-title { margin: 0 0 4px; font-weight: 620; font-size: 14px; }
+.takeover-hint { margin: 0 0 10px; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+.takeover-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.takeover-btn {
+  display: inline-block; padding: 7px 14px; border: 1px solid var(--line); border-radius: 9px;
+  background: #fff; color: var(--ink); font-size: 13px; cursor: pointer; text-decoration: none;
+  transition: background .16s var(--ease), border-color .16s var(--ease);
+}
+.takeover-btn:hover { background: #faf7f1; }
+.takeover-btn.primary { background: #1c1b17; border-color: #1c1b17; color: #fff; }
+.takeover-btn.primary:hover { background: #33312b; }
