@@ -356,6 +356,47 @@ npx vite build --base=/desktop-assets/ --outDir desktop-dist
 
 网关通过 `XINGYAO_DESKTOP_DIST` 读取该目录，默认是 `/srv/xingyao/frontend/desktop-dist`。
 
+## 11.5 桌面二维码走公网（可选）
+
+云中转连上后，桌面「手机访问」二维码会优先给公网地址，手机不在同一 WiFi 也能扫：
+
+```text
+https://<DOMAIN>/m/<DEVICE_ID>?token=<REMOTE_TOKEN>
+```
+
+拿不到公网入口的任何一环（未开启、未连上、换票失败）都回落原来的局域网地址，
+行为与从前一致。
+
+换票：桌面上只有长期 device token，没有账号口令，所以走一条专用接口换取只读
+`remote` 令牌——`POST /api/relay/device-token`，请求体 `{device_id, device_token}`。
+网关侧三重收口：只签给未吊销且账号未启用的设备、票只绑自己的 `device_id`、
+同一设备 10 分钟内最多换 6 次（超限返回 429，桌面回落局域网）。
+
+### 部署独立移动端页面
+
+不给这台机器部署移动端包时，公网二维码指向 `/desktop/<DEVICE_ID>`（桌面响应式 UI）。
+要拿到专属移动端界面，再部署一份：
+
+```bash
+cd frontend-mobile
+npx vite build            # base 已是 /m/，输出 dist/
+# 上传到服务器，目录结构：
+#   /srv/xingyao/frontend/mobile-dist/{index.html,assets/...}
+#   /srv/xingyao/frontend/mobile-shim.js   （与 desktop 共用同一份 shim）
+```
+
+网关通过 `XINGYAO_MOBILE_DIST` 读取，默认 `/srv/xingyao/frontend/mobile-dist`；
+目录不存在时 `mount_mobile` 不挂任何路由。
+
+### 反代到子路径时注意
+
+设备拨号地址形如 `wss://<域名>/xy/bot/relay/device`（子路径反代）时，页面地址是
+`https://<域名>/xy/bot/m/<DEVICE_ID>`。shim 会按 pathname 推导出 `/xy/bot` 前缀再去连
+`/xy/bot/relay/client`，这一环代码已处理；但 `index.html` 里的资源引用是构建期
+写死的绝对路径（`/desktop-assets/` 或 `/m/assets/`），**不带子路径前缀**。所以子路径
+反代时必须在反代层把 `/desktop-assets`、`/m/assets`、`/desktop-shim.js`、
+`/m/mobile-shim.js` 也一并代理到网关，否则页面会白屏。
+
 ---
 
 ## 12. 备份与恢复
