@@ -40,6 +40,52 @@ it('点击手机图标后调用 get_remote_bind_qr 并渲染二维码 img', asyn
   expect(img.attributes('src')).toBe('data:image/png;base64,QUJD');
 });
 
+it('云中转回落局域网时显示 relay_notice 提示', async () => {
+  // 后端只在「开关开着却没连上」时下发 relay_notice，前端要把它显示出来，
+  // 否则用户看到局域网地址会以为云中转开关没生效
+  const get_remote_bind_qr = vi.fn(async () => ({
+    ok: true,
+    url: 'http://192.168.1.5:8765/?token=lan',
+    token: 'lan',
+    qr: 'data:image/png;base64,TEFO',
+    expires_in: 900,
+    relay_notice: '云中转未连上，已使用局域网地址（手机需与电脑连同一 WiFi）',
+  }));
+  (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  const notice = wrapper.find('[data-test="remote-bind-notice"]');
+  expect(notice.exists()).toBe(true);
+  expect(notice.text()).toContain('云中转未连上');
+});
+
+it('正常出码时不渲染 relay_notice 提示', async () => {
+  const get_remote_bind_qr = vi.fn(async () => ({
+    ok: true,
+    url: 'https://xingyaocode.cn/xy/bot/desktop/dev-1?token=jwt',
+    token: 'jwt',
+    qr: 'data:image/png;base64,UFVCTElD',
+    expires_in: 900,
+  }));
+  (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(wrapper.find('[data-test="remote-bind-modal"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="remote-bind-notice"]').exists()).toBe(false);
+});
+
 it('获取二维码失败时不显示弹窗，并弹出错误提示', async () => {
   const get_remote_bind_qr = vi.fn(async () => ({ ok: false, msg: '局域网服务未就绪' }));
   (window as any).pywebview = { api: { get_remote_bind_qr } };

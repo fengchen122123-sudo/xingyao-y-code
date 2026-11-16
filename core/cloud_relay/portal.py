@@ -106,24 +106,37 @@ def mobile_page_available(base: str, device_id: str) -> bool:
         return False
 
 
-def build_pair_url(bridge, *, mobile: bool, ttl_seconds: int = 0) -> dict | None:
+def build_pair_url(
+    bridge, *, mobile: bool, ttl_seconds: int = 0, reason: dict | None = None
+) -> dict | None:
     """云中转可用时返回公网二维码信息，否则返回 None 由调用方回落局域网。
 
     返回 ``{"url", "token", "expires_in"}``；``expires_in=0`` 表示不过期，
     与局域网配对 token 的 TTL 语义保持一致。
+
+    回落原因写进 ``reason``（``code`` + 面向用户的 ``message``）：本模块只提供事实，
+    是否在界面上提示由调用方决定，避免二维码路径里塞界面判断。
     """
+
+    def fail(code: str, message: str) -> None:
+        if reason is not None:
+            reason["code"] = code
+            reason["message"] = message
+        return None
+
+    hint = "已使用局域网地址（手机需与电脑连同一 WiFi）"
     try:
         service = getattr(bridge, "_cloud_relay_service", None)
         if service is None:
-            return None
+            return fail("disabled", f"云中转未启动，{hint}")
         status: dict[str, Any] = service.status()
         if not status.get("connected"):
-            return None
+            return fail("offline", f"云中转未连上，{hint}")
         device_id = str(status.get("device_id") or "")
         relay_url = str(config._load().get(config.CLOUD_RELAY_URL_KEY) or "")
         base = site_base(relay_url)
         if not device_id or not base:
-            return None
+            return fail("config", f"云中转缺少设备号或网关地址，{hint}")
         # 换票结果在本地缓存：二维码是「打开就生成」的高频动作，而网关对换票限流
         # （10 分钟 6 次），反复打开不能每次都去打网关。临近过期才重新换。
         payload = None
@@ -136,7 +149,7 @@ def build_pair_url(bridge, *, mobile: bool, ttl_seconds: int = 0) -> dict | None
             if payload is not None:
                 _TICKET_CACHE[device_id] = payload
         if payload is None:
-            return None
+            return fail("ticket", f"云中转换票失败，{hint}")
         jwt_token = str(payload.get("token") or "")
         # 移动端包没部署时退回桌面响应式页：同样能扫，只是不是专属移动端界面。
         if mobile and not mobile_page_available(base, device_id):
@@ -156,4 +169,4 @@ def build_pair_url(bridge, *, mobile: bool, ttl_seconds: int = 0) -> dict | None
         }
     except Exception:
         logger.exception("云中转公网二维码生成失败")
-        return None
+        return fail("error", f"云中转公网入口不可用，{hint}")

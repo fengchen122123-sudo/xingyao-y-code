@@ -226,8 +226,11 @@ def test_bind_qr_falls_back_to_lan_when_relay_unavailable(monkeypatch):
     import gui_bridge
 
     bridge = gui_bridge.ApiBridge.__new__(gui_bridge.ApiBridge)
-    monkeypatch.setattr(bridge, "_cloud_relay_pair_url", lambda mobile: None)
+    monkeypatch.setattr(
+        bridge, "_cloud_relay_pair_url", lambda mobile, reason=None: None
+    )
     monkeypatch.setattr(bridge, "_ensure_lan_server", lambda: None)
     result = bridge.get_remote_bind_qr(mobile=True)
     assert result["ok"] is False
     assert "启动失败" in result["msg"]
+

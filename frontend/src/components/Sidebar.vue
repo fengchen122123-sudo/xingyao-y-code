@@ -507,6 +507,11 @@
       <div class="modal-body">
         <img class="qr-img" :src="remoteBind.qr" alt="绑定二维码" />
         <div class="bind-url">{{ remoteBind.url }}</div>
+        <!-- 云中转开着却没连上时后端会带 relay_notice：不提示的话，用户看到局域网地址
+             会以为开关没生效 -->
+        <div v-if="remoteBind.relay_notice" class="bind-notice" data-test="remote-bind-notice">
+          {{ remoteBind.relay_notice }}
+        </div>
         <div class="bind-hint" data-test="remote-bind-hint">
           {{ remoteBindRefreshing ? '正在刷新配对链接…' : `链接有效期：${formatExpiry(remoteBind.expires_in)}，请在过期前扫码` }}
         </div>
@@ -1095,7 +1100,14 @@ const confirmDeleteName = ref('');
 const confirmArchiveName = ref('');
 // 手机访问绑定信息（点击手机图标后弹出二维码，弹窗内可切换移动端 / web远端）
 // permanent=true 表示永久有效（后端 expires_in=0），不做倒计时自动刷新
-const remoteBind = ref<null | { url: string; qr: string; expires_in: number; permanent?: boolean }>(null);
+const remoteBind = ref<null | {
+  url: string;
+  qr: string;
+  expires_in: number;
+  permanent?: boolean;
+  // 云中转开着却回落局域网时后端给的原因；为空表示就是局域网/公网正常出码
+  relay_notice?: string;
+}>(null);
 // 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
 const remoteBindRefreshing = ref(false);
 // 绑定目标：mobile=新版独立移动端（/m/）/ desktop=经典响应式网页（/）。
@@ -1896,6 +1908,8 @@ async function fetchRemoteBind(forceNew: boolean) {
         // expires_in=0：永久有效（TTL 选“永久”时后端永不过期）
         expires_in: result.expires_in ?? 0,
         permanent: !(result.expires_in > 0),
+        // 后端仅在本该走云中转、却回落局域网时才下发；正常出码时为空串
+        relay_notice: result.relay_notice || '',
       };
       startExpiryWatch();
     } else if (!forceNew || !remoteBind.value) {
@@ -2606,6 +2620,15 @@ function getFolderTitle(g: SessionGroup) {
 .bind-hint {
   font-size: 11.5px;
   color: var(--text-faint);
+}
+/* 云中转回落提示：比常规提示更醒目，但不至于像报错 */
+.bind-notice {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--warn, #c9791a);
+  text-align: center;
+  max-width: 100%;
+  word-break: break-all;
 }
 .modal-foot {
   padding: 13px 18px;

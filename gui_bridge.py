@@ -8380,10 +8380,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         两种入口共享同一配对 token 与 WS 事件通道。
 
         云中转已连上时优先给公网地址（手机不在同一 WiFi 也能扫）；公网入口任一环
-        拿不到就回落局域网地址，行为与从前完全一致。
+        拿不到就回落局域网地址，行为与从前完全一致。回落时若云中转开关是开着的，
+        在 payload 上附 relay_notice 说明原因，否则用户看到局域网地址会以为开关没生效。
         """
         try:
-            public = self._cloud_relay_pair_url(mobile=bool(mobile))
+            fallback: Dict[str, str] = {}
+            public = self._cloud_relay_pair_url(mobile=bool(mobile), reason=fallback)
             if public is not None:
                 from core.lan_server import build_pair_payload
 
@@ -8391,12 +8393,29 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             srv = self._ensure_lan_server()
             if srv is None:
                 return {"ok": False, "msg": "远程服务启动失败"}
-            return srv.get_bind_info(force_new=bool(force_new), path="/m/" if mobile else "/")
+            payload = srv.get_bind_info(
+                force_new=bool(force_new), path="/m/" if mobile else "/"
+            )
+            notice = self._relay_fallback_notice(fallback)
+            if notice:
+                payload["relay_notice"] = notice
+            return payload
         except Exception as e:
             logger.exception("get_remote_bind_qr 失败")
             return {"ok": False, "msg": str(e)}
 
-    def _cloud_relay_pair_url(self, mobile: bool) -> Optional[Dict[str, Any]]:
+    def _relay_fallback_notice(self, reason: Dict[str, str]) -> str:
+        """开关开着却回落局域网时才提示；开关关着是正常局域网模式，不必打扰。"""
+        try:
+            if not bool(config._load().get(config.CLOUD_RELAY_ENABLED_KEY, False)):
+                return ""
+            return str(reason.get("message") or "")
+        except Exception:
+            return ""
+
+    def _cloud_relay_pair_url(
+        self, mobile: bool, reason: Optional[Dict[str, str]] = None
+    ) -> Optional[Dict[str, Any]]:
         """云中转公网二维码；不可用时返回 None（内部已兜住所有异常）。"""
         try:
             from core.cloud_relay.portal import build_pair_url
@@ -8405,7 +8424,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             ttl = int(
                 data.get(config.REMOTE_TOKEN_TTL_KEY, config.REMOTE_TOKEN_TTL_DEFAULT) or 0
             )
-            return build_pair_url(self, mobile=mobile, ttl_seconds=ttl)
+            return build_pair_url(self, mobile=mobile, ttl_seconds=ttl, reason=reason)
         except Exception:
             logger.debug("云中转公网二维码不可用，回落局域网", exc_info=True)
             return None
