@@ -1,7 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<resources>
-    <string name="app_name">星瑶</string>
-    <string name="title_activity_main">星瑶</string>
-    <string name="package_name">app.xingyao.personal</string>
-    <string name="custom_url_scheme">app.xingyao.personal</string>
-</resources>

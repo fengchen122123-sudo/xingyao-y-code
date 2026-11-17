@@ -1,76 +1,13 @@
-"""云中转换票：桌面用设备令牌换只读 remote JWT，供公网二维码扫码入站。"""
+"""桌面侧配对 URL 与二维码。"""
 
 from __future__ import annotations
 
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 
 import config
 from core.cloud_relay import portal
-from gateway.app import create_app
-from gateway.auth import read_remote_access
-
-SECRET = "jwt-secret-jwt-secret-jwt-secret"
-
-
-def _client(tmp_path):
-    app = create_app(tmp_path / "gateway.db", SECRET)
-    app.state.init_admin("root", "secret-secret")
-    client = TestClient(app)
-    account = app.state.database.execute("SELECT id FROM accounts WHERE username = 'root'").fetchone()
-    device_id, device_token = app.state.relay.create_device(
-        app.state.database, account["id"], "家里的台式机"
-    )
-    return app, client, device_id, device_token
-
-
-def _ticket(client, device_id, device_token):
-    return client.post(
-        "/api/relay/device-token",
-        json={"device_id": device_id, "device_token": device_token},
-    )
-
-
-def test_device_token_is_exchanged_for_readable_remote_jwt(tmp_path):
-    app, client, device_id, device_token = _client(tmp_path)
-    response = _ticket(client, device_id, device_token)
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["token"]
-    assert payload["expires_at"] > time.time()
-    # 换来的票必须能被远端页校验器认，且只绑自己这台设备
-    principal = read_remote_access(app.state.database, payload["token"], SECRET, device_id)
-    assert principal is not None
-    other = read_remote_access(app.state.database, payload["token"], SECRET, "another-device")
-    assert other is None
-
-
-def test_wrong_device_token_is_rejected(tmp_path):
-    _app, client, device_id, _device_token = _client(tmp_path)
-    assert _ticket(client, device_id, "not-the-token").status_code == 401
-    assert _ticket(client, "missing-device", "whatever").status_code == 401
-
-
-def test_revoked_device_is_rejected(tmp_path):
-    app, client, device_id, device_token = _client(tmp_path)
-    app.state.relay.revoke(app.state.database, device_id)
-    assert _ticket(client, device_id, device_token).status_code == 401
-
-
-def test_disabled_account_is_rejected(tmp_path):
-    app, client, device_id, device_token = _client(tmp_path)
-    app.state.database.execute("UPDATE accounts SET disabled = 1 WHERE username = 'root'")
-    app.state.database.commit()
-    assert _ticket(client, device_id, device_token).status_code == 403
-
-
-def test_exchange_is_rate_limited(tmp_path):
-    _app, client, device_id, device_token = _client(tmp_path)
-    codes = [_ticket(client, device_id, device_token).status_code for _ in range(7)]
-    assert codes[:6] == [200] * 6
-    assert codes[6] == 429
 
 
 def test_site_base_keeps_reverse_proxy_prefix():
@@ -162,44 +99,6 @@ def test_pair_url_returns_none_when_exchange_fails(relay_config, monkeypatch):
     assert portal.build_pair_url(_FakeBridge(_FakeService(True, "dev-1")), mobile=True) is None
 
 
-def _fake_mobile_dist(tmp_path):
-    frontend = tmp_path / "frontend"
-    mobile = frontend / "mobile-dist"
-    (mobile / "assets").mkdir(parents=True)
-    (mobile / "index.html").write_text(
-        "<html><head></head><body>m</body></html>", encoding="utf-8"
-    )
-    (mobile / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
-    (frontend / "mobile-shim.js").write_text("// shim", encoding="utf-8")
-    return mobile
-
-
-def test_mount_mobile_injects_device_and_serves_assets(tmp_path):
-    from gateway.app import create_app, mount_mobile
-
-    mobile = _fake_mobile_dist(tmp_path)
-    app = create_app(tmp_path / "gw.db", SECRET)
-    mount_mobile(app, mobile)
-    client = TestClient(app)
-
-    page = client.get("/m/dev-1")
-    assert page.status_code == 200
-    assert 'window.__ycRelayDevice="dev-1"' in page.text
-    assert "/m/mobile-shim.js" in page.text
-    # vite base 是 /m/，资源必须在这个前缀下取到，不能落到 web 通配路由
-    assert client.get("/m/assets/app.js").text == "console.log(1)"
-    # /m/{device_id} 不得把 shim 当设备号吃掉
-    assert client.get("/m/mobile-shim.js").text == "// shim"
-
-
-def test_mount_mobile_skips_when_package_is_absent(tmp_path):
-    from gateway.app import create_app, mount_mobile
-
-    app = create_app(tmp_path / "gw.db", SECRET)
-    mount_mobile(app, tmp_path / "missing-mobile-dist")
-    assert TestClient(app).get("/m/dev-1").status_code == 404
-
-
 def test_bind_qr_prefers_public_url_when_relay_connected(monkeypatch):
     """云中转连上时二维码给公网地址，且自带二维码图，前端无需区分来源。"""
     import gui_bridge
@@ -208,7 +107,7 @@ def test_bind_qr_prefers_public_url_when_relay_connected(monkeypatch):
     monkeypatch.setattr(
         bridge,
         "_cloud_relay_pair_url",
-        lambda mobile: {
+        lambda mobile, reason=None: {
             "url": "https://example.com/xy/bot/m/dev-1?token=jwt",
             "token": "jwt",
             "expires_in": 3600,

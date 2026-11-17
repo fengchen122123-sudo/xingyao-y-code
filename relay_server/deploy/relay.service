@@ -1,0 +1,14 @@
+[Unit]
+Description=Xingyao minimal relay server (relay_server)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/relay/relay.env
+WorkingDirectory=/srv/relay
+ExecStart=/srv/relay/venv/bin/python -m relay_server serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,4 @@
-"""云中转回落局域网时的原因回传：二维码不再静默换地址。
-
-独立于 test_relay_device_token.py：那边要 import gateway.app（依赖 argon2-cffi），
-在没装该依赖的环境里整个模块收不进来，本文件的用例不能被它拖累。
-"""
+"""云中转回落局域网时的原因回传：二维码不再静默换地址。"""
 
 from __future__ import annotations
 
