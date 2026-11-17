@@ -43,17 +43,43 @@
        角色区从 y=56px 才开始，任何台词都不会压到丸子头或脸。 */
     #bubble {
       position: absolute; left: 50%; top: 4px; transform: translateX(-50%);
-      width: 90%; max-height: 48px; box-sizing: border-box;
+      width: 94%; max-height: 48px; box-sizing: border-box;
       display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
       background: rgba(255,255,255,0.96); color: #222;
-      border: 1px solid #e3e3e3; border-radius: 10px;
-      padding: 4px 8px; font: 12px/1.3 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-      opacity: 0; transition: opacity 200ms linear;
+      border: 1.5px solid #e3e3e3; border-radius: 10px;
+      padding: 4px 7px; font: 600 11.5px/1.28 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      opacity: 0; transition: opacity 200ms linear, border-color 180ms ease, background-color 180ms ease;
       pointer-events: none; text-align: center;
       white-space: normal; word-break: break-word; overflow: hidden;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.18);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
     }
     #bubble.show { opacity: 1; }
+    #bubble.kind-finish {
+      background: rgba(240, 253, 246, 0.98); border-color: #2eb872; color: #14532d;
+      box-shadow: 0 2px 10px rgba(46, 184, 114, 0.3);
+    }
+    #bubble.kind-error {
+      background: rgba(255, 243, 243, 0.98); border-color: #e5484d; color: #7f1d1d;
+      box-shadow: 0 2px 10px rgba(229, 72, 77, 0.32);
+    }
+    #bubble.kind-question {
+      background: rgba(241, 246, 255, 0.98); border-color: #3b82f6; color: #1e3a8a;
+      box-shadow: 0 2px 10px rgba(59, 130, 246, 0.34);
+    }
+    #bubble.kind-permission {
+      background: rgba(255, 249, 235, 0.98); border-color: #f59e0b; color: #78350f;
+      box-shadow: 0 2px 10px rgba(245, 158, 11, 0.36);
+    }
+    #bubble.kind-cancel {
+      background: rgba(248, 250, 252, 0.96); border-color: #94a3b8; color: #334155;
+    }
+    #bubble.show.sticky { animation: bubble-pulse 1.8s ease-in-out infinite; }
+    body.no-motion #bubble.show.sticky { animation: none !important; }
+    @media (prefers-reduced-motion: reduce) { #bubble.show.sticky { animation: none !important; } }
+    @keyframes bubble-pulse {
+      0%, 100% { transform: translateX(-50%) scale(1); }
+      50% { transform: translateX(-50%) scale(1.03); }
+    }
   </style>
 </head>
 <body>

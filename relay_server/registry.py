@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
+import sqlite3
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -35,6 +36,10 @@ RPC_ROUTE_LIMIT = 512
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class DeviceAlreadyEnrolledError(ValueError):
+    """同一设备编码重复申请令牌时抛出，避免未授权覆盖已有设备凭据。"""
 
 
 class RelayRegistry:
@@ -66,6 +71,35 @@ class RelayRegistry:
             (device_id, name, hash_token(token), int(time.time())),
         )
         database.commit()
+        return device_id, token
+
+    def enroll_device(
+        self, database, device_code: str, name: str | None = None
+    ) -> tuple[str, str]:
+        """按客户端设备编码签发独立设备凭据（不同设备不同 device_id 与 token）。"""
+        code = str(device_code or "").strip()
+        if not code or len(code) > 128:
+            raise ValueError("device_code 不能为空且长度不能超过 128")
+        existing = database.execute(
+            "SELECT id FROM devices WHERE device_code = ?", (code,)
+        ).fetchone()
+        if existing is not None:
+            raise DeviceAlreadyEnrolledError("该设备编码已注册")
+        display_name = str(name or "").strip()[:64] or code[:64]
+        device_id = str(uuid.uuid4())
+        token = secrets.token_urlsafe(32)
+        try:
+            database.execute(
+                """
+                INSERT INTO devices(id, name, token_hash, revoked, created_at, device_code)
+                VALUES (?, ?, ?, 0, ?, ?)
+                """,
+                (device_id, display_name, hash_token(token), int(time.time()), code),
+            )
+            database.commit()
+        except sqlite3.IntegrityError as exc:
+            database.rollback()
+            raise DeviceAlreadyEnrolledError("该设备编码已注册") from exc
         return device_id, token
 
     def _forget(self, device_id: str) -> dict | None:

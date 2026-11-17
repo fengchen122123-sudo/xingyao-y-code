@@ -1719,6 +1719,11 @@ def _chat_with_model_generator(
     from core.harness.progress_guard import TurnProgressGuard
 
     progress_guard = TurnProgressGuard()
+    # JEV loop_guard（任务执行期异常纠偏）：仅在连续报错/重复受阻/接近停滞时触发，
+    # 同回合最多介入 2 次、两次之间至少间隔 2 步，正常执行零开销。
+    consecutive_error_steps = 0
+    last_loop_guard_turn = -10
+    loop_guard_count = 0
     # 电脑操控 Turn 状态（Task 10 接线点①）：capability 由入口层冻结传入；
     # lease/run 在模型首次真正调用 computer_action 时才建立（惰性 start_run，
     # 不让普通对话回合白白占用进程级排他租约），Turn 终态统一收尾。
@@ -3764,6 +3769,7 @@ def _chat_with_model_generator(
             # 必须被 tool 消息应答」的约束；pending_persistence 入队顺序与之一致。
             # 同一 turn 只注入一次：除生成器局部 orchestration_nudge_sent 外，还按
             # turn_id 做进程内去重（异常重入时不再重复注入）。
+            orchestration_injected_this_step = False
             if _should_nudge_orchestration(
                 # 参数名为历史遗留（函数内只做布尔门禁）；这里传 Turn 起点的
                 # 编排可用快照，关闭子代理开关后不再催模型调用不存在的 run_subagent。
@@ -3774,6 +3780,7 @@ def _chat_with_model_generator(
                 already_sent=orchestration_nudge_sent,
             ):
                 orchestration_nudge_sent = True
+                orchestration_injected_this_step = True
                 _register_orchestration_nudge(parent_turn_id)
                 orchestration_request = {
                     "role": "user",
@@ -3793,6 +3800,66 @@ def _chat_with_model_generator(
                 progress_guard.observe(
                     _step_progress_observation(None, session_id=parent_session)
                 )
+
+            # JEV loop_guard：连续报错/重复调用受阻/接近停滞时问一次止损决策
+            from core.harness.tool_pipeline import REPEAT_CALL_BLOCKED_TEXT
+
+            step_repeat_blocked = any(
+                REPEAT_CALL_BLOCKED_TEXT in str(record.message.get("content", "") or "")
+                for record in records
+            )
+            step_failed_samples = [
+                f"{record.message.get('name', 'tool')}: {str(record.message.get('content', '') or '')[:100]}"
+                for record in records
+                if not _tool_result_ok(record.message.get("name", ""), record.message)
+            ]
+            if records and len(step_failed_samples) == len(records):
+                consecutive_error_steps += 1
+            elif step_repeat_blocked:
+                consecutive_error_steps += 1
+            else:
+                consecutive_error_steps = 0
+
+            if (
+                not orchestration_injected_this_step
+                and turn + 1 < max_turns
+                and loop_guard_count < 2
+                and (turn - last_loop_guard_turn) >= 2
+                and (
+                    consecutive_error_steps >= 2
+                    or step_repeat_blocked
+                    or progress_guard.stalled_steps >= max(2, progress_guard.MAX_STALLED_STEPS - 2)
+                )
+            ):
+                try:
+                    from core.task_decision_hooks import (
+                        build_loop_intervention_message,
+                        decide_loop_intervention,
+                    )
+
+                    loop_decision = decide_loop_intervention(
+                        turn_index=turn,
+                        max_turns=max_turns,
+                        consecutive_error_steps=consecutive_error_steps,
+                        stalled_steps=progress_guard.stalled_steps,
+                        repeat_blocked=step_repeat_blocked,
+                        error_samples=step_failed_samples,
+                    )
+                    guidance_text = build_loop_intervention_message(loop_decision)
+                except Exception:
+                    guidance_text = None
+                if guidance_text:
+                    last_loop_guard_turn = turn
+                    loop_guard_count += 1
+                    guidance_msg = {"role": "user", "content": guidance_text}
+                    messages.append(guidance_msg)
+                    pending_persistence.append(("user", guidance_msg))
+                    logger.info(
+                        "loop_guard 采纳决策 [%s]（session=%s turn=%s）",
+                        loop_decision,
+                        parent_session,
+                        turn + 1,
+                    )
 
             if event_callback is None:
                 app_context.set_task_status('executing')

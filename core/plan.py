@@ -958,6 +958,35 @@ def plan_retry(item_id: str, force: bool = False) -> str:
             f"  4. 确认修改后再调用 plan_retry(item_id='{item_id}', force=True) 强制重试。"
         )
 
+    # JEV plan_recovery：对 failed/blocked 且有报错的项，在无 force 重试前判断恢复策略
+    if item.get("status") in {"failed", "blocked"} and last_error and not force:
+        try:
+            from core.task_decision_hooks import decide_plan_recovery
+
+            recovery = decide_plan_recovery(
+                item_id=item_id,
+                subject=str(item.get("subject") or ""),
+                attempts=attempts,
+                last_error=last_error,
+            )
+        except Exception:
+            recovery = None
+        if recovery == "split_smaller":
+            return (
+                f"⚠️ [JEV 恢复建议：拆小或调整方案] 计划项 '{item_id}' 上次失败原因：\n"
+                f"  {last_error}\n"
+                f"决策模型建议先调整方案或拆小任务再重跑：\n"
+                f"  1. 用 plan_update(item_id='{item_id}', subject='调整后的任务描述') 缩小范围或换方法；\n"
+                f"  2. 若确认无需修改也要直接重跑，请调用 plan_retry(item_id='{item_id}', force=True)。"
+            )
+        if recovery == "escalate_user":
+            return (
+                f"⚠️ [JEV 恢复建议：升级向用户确认] 计划项 '{item_id}' 上次失败原因：\n"
+                f"  {last_error}\n"
+                f"决策模型判断该问题可能涉及外部权限、环境依赖或需求歧义，建议先停止自动重试并向用户确认；\n"
+                f"若用户已确认解决，可调用 plan_retry(item_id='{item_id}', force=True) 继续执行。"
+            )
+
     if scheduler.retry(item_id):
         if attempts >= 1:
             return (

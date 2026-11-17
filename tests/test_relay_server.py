@@ -803,3 +803,73 @@ class TestPages:
         with TestClient(app) as c:
             assert c.get("/desktop/any-device").status_code == 404
             assert c.get("/m/any-device").status_code == 404
+
+
+def test_device_enroll_issues_distinct_tokens_and_rejects_duplicate(tmp_path):
+    app = create_app(str(tmp_path / "relay.db"), "jwt-secret")
+    with TestClient(app) as client:
+        r1 = client.post(
+            "/api/relay/device-enroll",
+            json={"device_code": "machine-alpha", "name": "alpha-pc"},
+        )
+        r2 = client.post(
+            "/api/relay/device-enroll",
+            json={"device_code": "machine-beta", "name": "beta-pc"},
+        )
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        d1, d2 = r1.json(), r2.json()
+        assert d1["device_id"] != d2["device_id"]
+        assert d1["token"] != d2["token"]
+
+        # 同一设备编码重复申请必须被拒绝，防止未授权覆盖已有设备令牌
+        dup = client.post(
+            "/api/relay/device-enroll",
+            json={"device_code": "machine-alpha"},
+        )
+        assert dup.status_code == 409
+
+        # 空设备编码返回 400
+        bad = client.post("/api/relay/device-enroll", json={"device_code": "   "})
+        assert bad.status_code == 400
+
+        # 新领到的 device_id + token 可直接换取 remote JWT 并建立 /relay/device 连接
+        t1 = client.post(
+            "/api/relay/device-token",
+            json={"device_id": d1["device_id"], "device_token": d1["token"]},
+        )
+        assert t1.status_code == 200
+        assert t1.json().get("token")
+        with client.websocket_connect("/relay/device") as ws:
+            ws.send_json(
+                {
+                    "type": "relay_register",
+                    "device_id": d1["device_id"],
+                    "token": d1["token"],
+                    "boot_id": "boot-alpha",
+                }
+            )
+            ack = ws.receive_json()
+            assert ack["type"] == "relay_registered"
+
+
+def test_device_enroll_enforces_enroll_key_when_configured(tmp_path):
+    app = create_app(
+        str(tmp_path / "relay.db"),
+        "jwt-secret",
+        enroll_key="my-secret-enroll-key",
+    )
+    with TestClient(app) as client:
+        missing = client.post("/api/relay/device-enroll", json={"device_code": "dev-a"})
+        assert missing.status_code == 401
+        wrong = client.post(
+            "/api/relay/device-enroll",
+            json={"device_code": "dev-a", "enroll_key": "wrong"},
+        )
+        assert wrong.status_code == 401
+        ok = client.post(
+            "/api/relay/device-enroll",
+            json={"device_code": "dev-a", "enroll_key": "my-secret-enroll-key"},
+        )
+        assert ok.status_code == 200
+        assert ok.json()["token"]

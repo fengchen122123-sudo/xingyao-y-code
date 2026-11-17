@@ -512,6 +512,18 @@
         <div v-if="remoteBind.relay_notice" class="bind-notice" data-test="remote-bind-notice">
           {{ remoteBind.relay_notice }}
         </div>
+        <!-- 未配置/未连接云中转时引导去服务器配置 -->
+        <div v-if="remoteCloudMissing" class="bind-cloud-setup" data-test="remote-bind-cloud-setup">
+          <span v-if="!remoteBind.relay_notice" class="bind-cloud-tip">
+            尚未连接公网云中转（当前仅同一 WiFi 局域网可用）
+          </span>
+          <button
+            type="button"
+            class="btn-link-setup"
+            data-test="remote-bind-go-settings"
+            @click="goToCloudRelaySettings()"
+          >去服务器配置</button>
+        </div>
         <div class="bind-hint" data-test="remote-bind-hint">
           {{ remoteBindRefreshing ? '正在刷新配对链接…' : `链接有效期：${formatExpiry(remoteBind.expires_in)}，请在过期前扫码` }}
         </div>
@@ -1110,6 +1122,8 @@ const remoteBind = ref<null | {
 }>(null);
 // 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
 const remoteBindRefreshing = ref(false);
+// 是否缺少公网云中转连接（用于显示「去服务器配置」引导按钮）
+const remoteCloudMissing = ref(false);
 // 绑定目标：mobile=新版独立移动端（/m/）/ desktop=经典响应式网页（/）。
 // 默认移动端；用 localStorage 记住上次选择（沿用 'ycode-*' 键前缀约定）。
 type RemoteBindMode = 'desktop' | 'mobile';
@@ -1911,6 +1925,18 @@ async function fetchRemoteBind(forceNew: boolean) {
         // 后端仅在本该走云中转、却回落局域网时才下发；正常出码时为空串
         relay_notice: result.relay_notice || '',
       };
+      let cloudMissing = Boolean(result.relay_notice);
+      if (typeof (api as any).get_cloud_relay_settings === 'function') {
+        try {
+          const relayRes = await (api as any).get_cloud_relay_settings();
+          if (relayRes?.ok && relayRes.settings) {
+            cloudMissing = !relayRes.settings.connected;
+          }
+        } catch {
+          // 读取云中转状态失败不阻断局域网二维码展示
+        }
+      }
+      remoteCloudMissing.value = cloudMissing;
       startExpiryWatch();
     } else if (!forceNew || !remoteBind.value) {
       store.notifyModal('手机访问', (result && result.msg) || '获取绑定二维码失败');
@@ -1975,6 +2001,13 @@ function stopExpiryWatch() {
 function closeRemoteBind() {
   stopExpiryWatch();
   remoteBind.value = null;
+  remoteCloudMissing.value = false;
+}
+
+function goToCloudRelaySettings() {
+  closeRemoteBind();
+  store.settingsSection = 'cloud-relay';
+  store.settingsOpen = true;
 }
 
 // 将 expires_in（秒）转成友好文案；0 表示永久有效
@@ -2629,6 +2662,37 @@ function getFolderTitle(g: SessionGroup) {
   text-align: center;
   max-width: 100%;
   word-break: break-all;
+}
+.bind-cloud-setup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  width: 100%;
+  box-sizing: border-box;
+}
+.bind-cloud-tip {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.btn-link-setup {
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.btn-link-setup:hover {
+  background: var(--accent);
+  color: #fff;
 }
 .modal-foot {
   padding: 13px 18px;

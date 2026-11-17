@@ -44,54 +44,129 @@ _CHAT_IDLE_MIN = 60
 _CHAT_IDLE_MAX = 86400
 
 # ---------- 任务气泡提示（emit_event → 桌宠冒泡）----------
-# 气泡停留时长（毫秒）。桌宠侧会再钳一次范围，这里给常用值即可。
-_NOTIFY_BUBBLE_MS = 2600
+# 气泡默认停留时长（毫秒）。不同事件会按重要性给更长时长，提问/权限还会设为常驻。
+_NOTIFY_BUBBLE_MS = 4500
 
 # 同一文案的最小发送间隔（秒）。白名单里现在全是「值得打断用户」的事件，这条只在
 # 将来加回高频事件时兜底用。
 _NOTIFY_THROTTLE_SECONDS = 1.5
 
-# 白名单 = 全部「值得打断用户」的事件，只有四类：
+# turn_error 与 error 在 _emit_owned_error 中会连续发出同一条报错文案：
+# 窗口内同文案的 error 去重，但独立发出的 error（如未激活模型/提问超时）仍正常提示。
+_ERROR_DEDUP_SECONDS = 2.0
+_last_error_notify = (0.0, "")
+
+# 白名单 = 全部「值得打断用户」的事件（外加 permission_dismiss 用于收起待确认气泡）：
 #   permission_request  要你确认权限 / 模型有事问你——不提示就会一直干等
+#   permission_dismiss  用户已确认或取消，收起桌宠上对应的待确认提示
 #   turn_finish         任务完成
-#   turn_error          任务出错
+#   turn_error / error  任务出错或执行前报错
 #   turn_cancelled      任务被取消
 # 工具级事件（turn_start / tool_start）一律不冒泡：一个任务要读几十个文件、敲十几次
 # 命令，每步都说话等于全程在打扰；用户真正需要的只有「卡住我了」「结束了」「失败了」。
 _NOTIFY_EVENTS = frozenset({
     "permission_request",
+    "permission_dismiss",
     "turn_finish",
     "turn_error",
+    "error",
     "turn_cancelled",
 })
 
-# 这四类都不节流：重复出现也要让气泡更新，用户最关心的就是「它停下了没有」。
+# 关键节点一律不节流：漏掉一次"等你确认/出错/完成"，用户就会一直干等。
 _NOTIFY_ALWAYS_EVENTS = _NOTIFY_EVENTS
 
-# 事件 → 固定文案（permission_request 要区分提问/审批，另走 _notify_bubble_text）
-_NOTIFY_EVENT_TEXTS = {
-    "turn_finish": "搞定！",
-    "turn_error": "欸，出错了…",
-    "turn_cancelled": "停手了",
+# 需要权限的常见工具 → 简短易懂的提示后缀（气泡最多两行，要一眼看懂）
+_PERMISSION_TOOL_LABELS = {
+    "execute_command": "执行命令",
+    "sandbox_outside_access": "访问项目外路径",
+    "write_file": "写入文件",
+    "edit_file": "修改文件",
+    "delete_file": "删除文件",
+    "undo_turn": "撤销回合",
 }
 
 # 文案 → 上次发送时刻（time.monotonic）。模块级：星瑶单进程，多会话共用一个节流表。
 _notify_last_sent: Dict[str, float] = {}
 
 
-def _notify_bubble_text(event_type: str, data: Any) -> Optional[str]:
-    """事件 → 气泡文案；不该冒泡的事件返回 None。
+def _clip_notify_snippet(raw: Any, limit: int = 12) -> str:
+    """把错误或问题摘要压成单行短语，确保能完整放进桌宠两行气泡里。"""
+    text = " ".join(str(raw or "").split()).strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip("，。、：:,. ") + "…"
 
-    permission_request 要分两种：ask_user 是模型在提问、用户得看内容再作答；
+
+def _notify_bubble_spec(event_type: str, data: Any) -> Optional[Dict[str, Any]]:
+    """事件 → 桌宠气泡完整规格（text / ms / kind / emote / sticky）。
+
+    permission_request 要分两种：ask_user 是模型给出选项等你做决定；
     其它是工具要权限、点一下同意就继续。两者都意味着「任务停在这儿等你」，
-    所以都给气泡，但措辞不能混——用户看到"等你点头…"就知道只是批一下。
+    所以加长/常驻显示并配上动作反应，直到用户在界面操作后由 permission_dismiss 收起。
     """
+    payload = data if isinstance(data, dict) else {}
     if event_type == "permission_request":
-        name = ""
-        if isinstance(data, dict):
-            name = str(data.get("function_name") or "")
-        return "有事问你～" if name == "ask_user" else "等你点头…"
-    return _NOTIFY_EVENT_TEXTS.get(event_type)
+        name = str(payload.get("function_name") or "")
+        if name == "ask_user":
+            args = payload.get("arguments")
+            q_raw = args.get("question") if isinstance(args, dict) else ""
+            snippet = _clip_notify_snippet(q_raw, limit=12)
+            text = f"等你选：{snippet}" if snippet else "有选项等你选一下～"
+            return {
+                "text": text,
+                "ms": 15000,
+                "kind": "question",
+                "emote": "interact",
+                "sticky": True,
+            }
+        action = _PERMISSION_TOOL_LABELS.get(name, "")
+        if not action:
+            summary = str(payload.get("summary") or "").splitlines()[0] if payload.get("summary") else ""
+            action = _clip_notify_snippet(summary, limit=10)
+        text = f"需要权限：{action}，等你点头～" if action else "需要你确认权限，等你点头～"
+        return {
+            "text": text,
+            "ms": 15000,
+            "kind": "permission",
+            "emote": "look_around",
+            "sticky": True,
+        }
+    if event_type == "turn_finish":
+        return {
+            "text": "任务完成啦！快回来看看～",
+            "ms": 6000,
+            "kind": "finish",
+            "emote": "happy",
+            "sticky": False,
+        }
+    if event_type in ("turn_error", "error"):
+        snippet = _clip_notify_snippet(payload.get("message"), limit=12)
+        text = f"出错啦：{snippet}" if snippet else "任务出错啦，快回来看看！"
+        return {
+            "text": text,
+            "ms": 8000,
+            "kind": "error",
+            "emote": "look_around",
+            "sticky": False,
+        }
+    if event_type == "turn_cancelled":
+        return {
+            "text": "任务已停手了",
+            "ms": 3200,
+            "kind": "cancel",
+            "emote": "",
+            "sticky": False,
+        }
+    return None
+
+
+def _notify_bubble_text(event_type: str, data: Any) -> Optional[str]:
+    """兼容入口：返回事件对应的桌宠气泡文案；不该冒泡时返回 None。"""
+    spec = _notify_bubble_spec(event_type, data)
+    return spec["text"] if spec else None
 
 
 # get_status() 异常时的最小骨架：形状与 pet_manager.get_status() 对齐，
@@ -480,31 +555,50 @@ class PetBridgeMixin:
 
     # ---------- 内部：事件 → 气泡提示 ----------
     def _pet_notify_event(self, event_type: str, data: Any = None) -> None:
-        """把一次前端事件转成桌宠气泡（"等你点头…/有事问你～/搞定！/出错了…"）。
+        """把一次前端事件转成桌宠气泡与动作提醒。
 
         由 ApiBridge.emit_event 在事件派发后顺带调用，属于高频路径，所以：
         1) 先按白名单挡掉绝大多数事件（token_delta / pty_data / round_started…），
            再做读配置、算文案这些稍重的动作；
-        2) 白名单里剩下的四类都是「用户必须知道」的节点（要人出手 / 完成 / 出错 /
-           取消），所以一条都不节流：漏掉一次"等你确认"，任务就在那儿干等着；
+        2) 白名单里剩下的节点都是「用户必须知道」的状态（待选选项 / 待批权限 /
+           完成 / 出错 / 取消），不节流；其中 turn_error 与随后的同文案 error 去重；
         3) 整个方法体包 try/except，任何异常只 logger.debug——桌宠出任何问题都
            不允许影响事件派发链路。
         """
+        global _last_error_notify
         try:
             if event_type not in _NOTIFY_EVENTS:
                 return
             if not _config_bool(_KEY_NOTIFY, True):
                 return
-            text = _notify_bubble_text(event_type, data)
-            if not text:
+            if event_type == "permission_dismiss":
+                _pet_manager().clear_bubble(("question", "permission"))
                 return
+
             now = time.monotonic()
+            if event_type in ("turn_error", "error"):
+                raw_msg = str(data.get("message") or "") if isinstance(data, dict) else ""
+                prev_ts, prev_msg = _last_error_notify
+                if event_type == "error" and (now - prev_ts) < _ERROR_DEDUP_SECONDS and raw_msg == prev_msg:
+                    return
+                _last_error_notify = (now, raw_msg)
+
+            spec = _notify_bubble_spec(event_type, data)
+            if not spec or not spec.get("text"):
+                return
+            text = spec["text"]
             if event_type not in _NOTIFY_ALWAYS_EVENTS:
                 last = _notify_last_sent.get(text)
                 if last is not None and (now - last) < _NOTIFY_THROTTLE_SECONDS:
                     return
             _notify_last_sent[text] = now
-            result = _pet_manager().push_bubble(text, _NOTIFY_BUBBLE_MS)
+            result = _pet_manager().push_bubble(
+                text,
+                int(spec.get("ms") or _NOTIFY_BUBBLE_MS),
+                kind=str(spec.get("kind") or ""),
+                emote=str(spec.get("emote") or ""),
+                sticky=bool(spec.get("sticky")),
+            )
             # 桌宠未运行是常态（用户没开桌宠），不值得刷日志；统一降到 debug。
             if isinstance(result, dict) and not result.get("ok"):
                 logger.debug("桌宠气泡未推送（%s）：%s", text, result.get("msg"))
@@ -745,6 +839,144 @@ class PetBridgeMixin:
                 "msg": f"切换宠物失败：{exc}",
                 "status": self.pet_get_status(),
             }
+
+    def pet_import_skin(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """导入用户自定义桌宠（支持图片/GIF 序列帧或 ZIP 宠物包），可选立即激活。"""
+        import base64
+
+        if not isinstance(payload, dict):
+            return {"ok": False, "msg": "参数格式不正确"}
+        mode = str(payload.get("mode") or "images").strip().lower()
+        name = str(payload.get("name") or "").strip()
+        persona = str(payload.get("persona") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        activate = bool(payload.get("activate", True))
+        files = payload.get("files") or []
+        if not isinstance(files, list) or not files:
+            return {"ok": False, "msg": "请先选择要导入的文件"}
+
+        raw_items: list[bytes] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            b64 = str(item.get("data") or "").strip()
+            if not b64:
+                continue
+            if "," in b64 and b64.startswith("data:"):
+                b64 = b64.split(",", 1)[1]
+            try:
+                raw_items.append(base64.b64decode(b64, validate=False))
+            except Exception:
+                continue
+
+        if not raw_items:
+            return {"ok": False, "msg": "文件解码失败，请重试"}
+
+        try:
+            pet_skins = _pet_skins_module()
+            if mode == "zip":
+                res = pet_skins.import_skin_from_zip(
+                    raw_items[0],
+                    name=name,
+                    persona=persona,
+                    description=description,
+                )
+            else:
+                res = pet_skins.import_skin_from_images(
+                    name,
+                    raw_items,
+                    persona=persona,
+                    description=description,
+                )
+        except Exception as exc:
+            logger.warning("导入桌宠失败: %s", exc, exc_info=True)
+            return {"ok": False, "msg": f"导入失败：{exc}"}
+
+        if not res.get("ok"):
+            return res
+
+        skin = res.get("skin") or {}
+        skin_id = str(skin.get("id") or "")
+        if activate and skin_id:
+            switch_res = self.pet_set_skin(skin_id)
+            return {
+                "ok": True,
+                "msg": res.get("msg") or "导入成功",
+                "skin": skin,
+                "status": switch_res.get("status"),
+                "list": self.pet_list_skins(),
+            }
+        return {
+            "ok": True,
+            "msg": res.get("msg") or "导入成功",
+            "skin": skin,
+            "list": self.pet_list_skins(),
+        }
+
+    def pet_update_skin(self, skin_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """更新自定义桌宠的名称与人设（persona）。"""
+        if not isinstance(payload, dict):
+            return {"ok": False, "msg": "参数格式不正确"}
+        try:
+            pet_skins = _pet_skins_module()
+            res = pet_skins.update_skin_meta(
+                str(skin_id or "").strip(),
+                name=payload.get("name"),
+                persona=payload.get("persona"),
+                description=payload.get("description"),
+            )
+            if res.get("ok"):
+                res["list"] = self.pet_list_skins()
+            return res
+        except Exception as exc:
+            logger.warning("更新桌宠人设失败 skin_id=%r: %s", skin_id, exc, exc_info=True)
+            return {"ok": False, "msg": f"保存失败：{exc}"}
+
+    def pet_delete_skin(self, skin_id: str) -> Dict[str, Any]:
+        """删除自定义桌宠；若删掉的是当前激活形象则切回内置星瑶并按需重启。"""
+        try:
+            pet_skins = _pet_skins_module()
+            res = pet_skins.delete_skin(str(skin_id or "").strip())
+            if not res.get("ok"):
+                return res
+            if res.get("was_active"):
+                # 若删掉的是当前使用中的桌宠且桌宠正在运行，重启使其切回默认星瑶
+                try:
+                    manager = _pet_manager()
+                    if manager.get_status().get("running"):
+                        manager.stop()
+                        manager.start()
+                except Exception as exc:
+                    logger.debug("删除激活桌宠后重启失败: %s", exc)
+            res["list"] = self.pet_list_skins()
+            res["status"] = self.pet_get_status()
+            return res
+        except Exception as exc:
+            logger.warning("删除桌宠失败 skin_id=%r: %s", skin_id, exc, exc_info=True)
+            return {"ok": False, "msg": f"删除失败：{exc}"}
+
+    def pet_test_bubble(self, text: str = "") -> Dict[str, Any]:
+        """向运行中的桌宠发送一条测试气泡，用于验证与星瑶系统的集成效果。"""
+        try:
+            manager = _pet_manager()
+            if not manager.get_status().get("running"):
+                return {"ok": False, "msg": "请先开启「显示桌宠」再测试冒泡"}
+            msg = str(text or "").strip()
+            if not msg:
+                try:
+                    skin = _pet_skins_module().resolve_active(_pet_skins_module().active_skin_id())
+                    skin_name = str(skin.get("name") or "星瑶")
+                except Exception:
+                    skin_name = "星瑶"
+                msg = f"你好呀，我是{skin_name}，已接入星瑶系统！"
+            res = manager.push_bubble(msg, 3600)
+            if isinstance(res, dict) and res.get("ok"):
+                return {"ok": True, "msg": "已在桌宠上显示测试气泡"}
+            err = res.get("msg") if isinstance(res, dict) else ""
+            return {"ok": False, "msg": err or "发送气泡失败"}
+        except Exception as exc:
+            logger.warning("测试桌宠气泡失败: %s", exc, exc_info=True)
+            return {"ok": False, "msg": f"发送气泡失败：{exc}"}
 
     def pet_chat_get_settings(self) -> Dict[str, Any]:
         """读取「桌宠闲聊」设置：开关 / 空闲间隔 / 指定模型 + 可选模型下拉。

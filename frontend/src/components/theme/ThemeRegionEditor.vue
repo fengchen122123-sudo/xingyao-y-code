@@ -101,7 +101,7 @@
             </select>
           </label>
         </div>
-        <p class="editor-hint">支持 PNG / JPEG / WebP，单张最大 10 MiB，边长不超过 8192 像素。</p>
+        <p class="editor-hint">支持 PNG / JPEG / WebP（≤ 10 MiB · 8192 px）。</p>
       </div>
     </template>
 
@@ -122,7 +122,6 @@
             @validity="valid => onFieldValidity(field.key, valid)"
           />
         </div>
-        <p class="editor-hint">修改会即时预览；字体、圆角等非颜色令牌保持当前值不变。</p>
       </div>
 
       <div class="editor-group">
@@ -159,7 +158,7 @@
             </select>
           </label>
         </div>
-        <p class="editor-hint">全局背景图垫在所有分区之下，无图分区会透出它。支持 PNG / JPEG / WebP，单张最大 10 MiB。</p>
+        <p class="editor-hint">底层背景图，无图分区自动透出（PNG / JPEG / WebP，≤ 10 MiB）。</p>
       </div>
     </template>
 
@@ -190,7 +189,7 @@
             <option value="dark">dark（深色按钮）</option>
           </select>
         </label>
-        <p class="editor-hint">系统标题栏使用 Windows DWM 颜色，只接受 #RRGGBB，不支持背景图片。</p>
+        <p class="editor-hint">仅支持 #RRGGBB 颜色值。</p>
       </div>
     </template>
 

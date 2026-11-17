@@ -3,7 +3,7 @@
     <header class="growth-header">
       <div>
         <h1>记忆与成长</h1>
-        <p>自我演化与经验学习开关、当前成长状态、变化日志与快照导出。</p>
+        <p>管理自我演化、经验学习与成长档案。</p>
       </div>
       <button class="refresh-button" type="button" title="重新加载" data-test="growth-refresh" @click="loadGrowth()">
         <AppIcon name="refresh" :size="14" />
@@ -14,7 +14,7 @@
       <div class="growth-switch-row">
         <div class="growth-switch-text">
           <h3>启用自我演化</h3>
-          <p>根据长期相处积累的特质、语气与叙事，形成稳定的自我模型。</p>
+          <p>随长期对话积累形成稳定的自我模型。</p>
         </div>
         <label class="growth-switch">
           <input
@@ -31,7 +31,7 @@
       <div class="growth-switch-row">
         <div class="growth-switch-text">
           <h3>启用经验学习</h3>
-          <p>从任务中提炼可复用的经验条目，命中后在后续同类任务里复用。</p>
+          <p>从历史任务提炼可复用经验并用于后续任务。</p>
         </div>
         <label class="growth-switch">
           <input
@@ -66,7 +66,7 @@
           @click="saveUserKey"
         >保存</button>
       </div>
-      <p class="growth-hint">同一用户标识下的成长数据互相独立；留空时按当前系统用户名自动解析。</p>
+      <p class="growth-hint">不同标识的成长数据相互独立，留空按系统用户名识别。</p>
 
       <p v-if="errorMsg" data-test="growth-error" class="growth-error">{{ errorMsg }}</p>
       <p v-else-if="tipMsg" data-test="growth-tip" class="growth-tip">{{ tipMsg }}</p>
@@ -140,7 +140,7 @@
           @click="exportSnapshot"
         >导出快照</button>
       </div>
-      <p class="growth-hint">重置会把旧数据改名为备份目录（不会立即删除）；导出内容仅本地下发，不上传。</p>
+      <p class="growth-hint">重置前会自动备份旧数据；导出仅在本地生成。</p>
     </section>
   </div>
 </template>

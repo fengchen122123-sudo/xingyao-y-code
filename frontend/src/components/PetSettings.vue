@@ -3,59 +3,237 @@
     <header class="pet-header">
       <div>
         <h1>桌面宠物</h1>
-        <p>桌宠是本机 Electron 应用：这里的开关会真正在桌面显示或隐藏它，星瑶退出时会一并关闭。</p>
+        <p>在桌面陪伴你的本机桌宠，支持自定义形象与人设。</p>
       </div>
-      <button class="refresh-button" type="button" title="重新读取桌宠状态" @click="refresh">
+      <button class="refresh-button" type="button" title="重新读取桌宠状态" @click="refreshAll">
         <AppIcon name="refresh" :size="14" />
       </button>
     </header>
 
-    <section class="pet-card">
-      <label class="pet-toggle">
-        <input
-          data-test="pet-enabled"
-          type="checkbox"
-          :checked="enabled"
-          :disabled="busy || loading || installing || !bridgeReady"
-          @change="onToggleChange"
-        />
-        <span class="pet-toggle-text">显示桌宠</span>
-        <span class="pet-toggle-state">{{ enabled ? '已开启' : '已关闭' }}</span>
-      </label>
+    <p v-if="!bridgeReady" data-test="pet-native-only" class="pet-banner pet-banner-info">
+      仅在桌面应用内可用：浏览器里打开设置页时无法控制桌宠。
+    </p>
 
-      <label class="pet-toggle pet-toggle-secondary">
-        <input
-          data-test="pet-notify-enabled"
-          type="checkbox"
-          :checked="notifyEnabled"
-          :disabled="notifyBusy || loading || !bridgeReady"
-          @change="onNotifyChange"
-        />
-        <span class="pet-toggle-text">任务提示</span>
-        <span class="pet-toggle-state">{{ notifyEnabled ? '已开启' : '已关闭' }}</span>
-      </label>
-      <p class="pet-note pet-note-inline" data-test="pet-notify-note">
-        只在需要你出手时冒泡：等你确认、有事问你，任务完成或出错也会说一声；关掉就只保留桌宠自己的日常台词。
-      </p>
+    <p
+      v-if="message"
+      data-test="pet-message"
+      class="pet-banner"
+      :class="messageOk ? 'pet-banner-ok' : 'pet-banner-err'"
+    >{{ message }}</p>
 
-      <!-- 无聊时自己说话：与「任务提示」是两条独立气泡来源，互不影响 -->
-      <div class="pet-chat">
-        <label class="pet-toggle pet-toggle-secondary">
+    <!-- 1. 核心状态栏（Hero Card） -->
+    <section class="pet-card pet-hero">
+      <div class="pet-hero-left">
+        <div class="pet-hero-info">
+          <div class="pet-hero-title-row">
+            <span class="pet-hero-name">{{ activeSkinName }}</span>
+            <span class="pet-status-pill" :class="{ on: running && bridgeReady }" data-test="pet-status">
+              <span class="pet-dot" :class="{ on: running && bridgeReady }"></span>
+              <span>{{ statusText }}</span>
+            </span>
+          </div>
+          <p class="pet-hero-sub">
+            {{ activeSkinObj?.persona || activeSkinObj?.description || '点击下方卡片切换形象，或导入你自己的桌宠。' }}
+          </p>
+        </div>
+      </div>
+
+      <div class="pet-hero-actions">
+        <button
+          v-if="running && bridgeReady"
+          data-test="pet-test-bubble"
+          class="ghost-button"
+          type="button"
+          title="在桌面上显示一条测试气泡"
+          :disabled="busy || testBubbleBusy"
+          @click="sendTestBubble"
+        >打个招呼</button>
+        <button
+          data-test="pet-restart"
+          class="ghost-button"
+          type="button"
+          :disabled="busy || loading || !bridgeReady || !running"
+          @click="restart"
+        >重新打开</button>
+        <label class="switch" title="开启或隐藏桌面宠物">
           <input
-            data-test="pet-chat-enabled"
+            data-test="pet-enabled"
             type="checkbox"
-            :checked="chatEnabled"
-            :disabled="chatBusy || loading || !bridgeReady"
-            @change="onChatToggle"
+            :checked="enabled"
+            :disabled="busy || loading || installing || !bridgeReady"
+            @change="onToggleChange"
           />
-          <span class="pet-toggle-text">无聊时自己说话</span>
-          <span class="pet-toggle-state">{{ chatEnabled ? '已开启' : '已关闭' }}</span>
+          <span class="switch-track"></span>
         </label>
-        <p class="pet-note pet-note-inline">
-          空闲超过上面这个时长后才会开口；之后每次间隔在它的 0.4~2.6 倍之间随机（10 分钟档约 4~26 分钟），
-          一天最多 40 句。只带时间和目录名，不读你的文件内容。
-        </p>
-        <div class="pet-chat-row">
+      </div>
+    </section>
+
+    <!-- 缺运行时 / 安装进度（仅在需要时出现） -->
+    <section v-if="bridgeReady && !available" class="pet-warn" data-test="pet-unavailable">
+      <div class="pet-warn-head">
+        <strong>需要 Electron 运行时（约 151 MB）</strong>
+        <button
+          class="secondary-button pet-install-button"
+          data-test="pet-install-runtime"
+          type="button"
+          :disabled="installing || loading || !bridgeReady"
+          @click="ensureRuntimeAndEnable"
+        >{{ installing ? '正在准备…' : '一键下载并启用' }}</button>
+      </div>
+      <p class="pet-warn-sub">
+        按需安装到 <code>~/.ycode/pet-runtime</code>（可在底部高级设置指定本地 electron.exe）。
+      </p>
+    </section>
+
+    <section
+      v-if="bridgeReady && (installing || runtimeFailed)"
+      class="pet-runtime"
+      :class="{ 'pet-runtime-failed': runtimeFailed }"
+      data-test="pet-runtime-progress"
+    >
+      <p class="pet-runtime-text" data-test="pet-runtime-text">{{ runtimeText || '正在准备运行时…' }}</p>
+      <div
+        v-if="runtimeShowProgress"
+        class="pet-progress"
+        role="progressbar"
+        aria-label="Electron 运行时下载进度"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        :aria-valuenow="runtimePercent"
+      >
+        <span class="pet-progress-fill" :style="{ width: `${runtimePercent}%` }"></span>
+      </div>
+      <button
+        v-if="runtimeFailed"
+        class="secondary-button pet-runtime-retry"
+        data-test="pet-runtime-retry"
+        type="button"
+        :disabled="installing"
+        @click="ensureRuntimeAndEnable"
+      >重试</button>
+    </section>
+
+    <!-- 2. 宠物形象与集成 -->
+    <section class="pet-card">
+      <div class="pet-section-head">
+        <div>
+          <h2>宠物形象</h2>
+          <p class="pet-section-desc">点选即可切换；支持图片、GIF 或 ZIP 宠物包。</p>
+        </div>
+        <div class="pet-section-actions">
+          <button
+            class="ghost-button"
+            data-test="pet-skins-open-dir"
+            type="button"
+            :disabled="!skinDir"
+            @click="openSkinDir"
+          >打开目录</button>
+          <button
+            class="primary-button"
+            data-test="pet-import-open"
+            type="button"
+            :disabled="!bridgeReady || skinBusy"
+            @click="openImportModal"
+          >+ 导入桌宠</button>
+        </div>
+      </div>
+
+      <div class="pet-skin-grid" data-test="pet-skins">
+        <div
+          v-for="s in skins"
+          :key="s.id"
+          class="pet-skin-item"
+          :class="{ 'is-active': s.id === activeSkin }"
+        >
+          <button
+            class="pet-skin-card"
+            :disabled="skinBusy || s.id === activeSkin"
+            :data-test="`pet-skin-${s.id}`"
+            type="button"
+            @click="selectSkin(s.id)"
+          >
+            <img v-if="s.thumbnail" class="pet-skin-thumb" :src="s.thumbnail" :alt="s.name" />
+            <span v-else class="pet-skin-thumb pet-skin-thumb-empty">{{ skinInitial(s.name) }}</span>
+            <span class="pet-skin-name">{{ s.name }}</span>
+            <span v-if="s.persona" class="pet-skin-persona" :title="s.persona">{{ s.persona }}</span>
+            <span class="pet-skin-meta">
+              <span class="pet-skin-badge">{{ skinSourceLabel(s.source) }}</span>
+              <span v-if="s.id === activeSkin" class="pet-skin-badge pet-skin-badge-active">使用中</span>
+            </span>
+          </button>
+
+          <!-- 自定义桌宠管理操作：编辑人设 / 删除 -->
+          <div v-if="s.source === 'user'" class="pet-skin-ops">
+            <button
+              class="pet-skin-op-btn"
+              type="button"
+              title="编辑名称与性格人设"
+              :data-test="`pet-skin-edit-${s.id}`"
+              @click.stop="openEditModal(s)"
+            >人设</button>
+            <button
+              class="pet-skin-op-btn pet-skin-op-danger"
+              type="button"
+              title="删除此桌宠"
+              :data-test="`pet-skin-delete-${s.id}`"
+              @click.stop="removeSkin(s)"
+            >删除</button>
+          </div>
+        </div>
+      </div>
+      <p v-if="!skins.length" class="pet-note" data-test="pet-skins-empty">还没有可用的宠物形象。</p>
+    </section>
+
+    <!-- 3. 互动与 AI 说话 -->
+    <section class="pet-card">
+      <div class="pet-section-head">
+        <div>
+          <h2>互动与气泡</h2>
+          <p class="pet-section-desc">控制桌宠在桌面冒泡提醒与 AI 陪伴说话的时机。</p>
+        </div>
+      </div>
+
+      <div class="pet-setting-list">
+        <div class="pet-setting-row">
+          <div class="pet-setting-copy">
+            <div class="pet-setting-title">任务提示</div>
+            <p class="pet-setting-sub" data-test="pet-notify-note">
+              仅在需要确认、提问、完成或出错时冒泡提醒。
+            </p>
+          </div>
+          <label class="switch">
+            <input
+              data-test="pet-notify-enabled"
+              type="checkbox"
+              :checked="notifyEnabled"
+              :disabled="notifyBusy || loading || !bridgeReady"
+              @change="onNotifyChange"
+            />
+            <span class="switch-track"></span>
+          </label>
+        </div>
+
+        <div class="pet-setting-row">
+          <div class="pet-setting-copy">
+            <div class="pet-setting-title">无聊时自己说话</div>
+            <p class="pet-setting-sub">
+              空闲达标后按人设随口说话（每日上限 40 句，不读文件内容）。
+            </p>
+          </div>
+          <label class="switch">
+            <input
+              data-test="pet-chat-enabled"
+              type="checkbox"
+              :checked="chatEnabled"
+              :disabled="chatBusy || loading || !bridgeReady"
+              @change="onChatToggle"
+            />
+            <span class="switch-track"></span>
+          </label>
+        </div>
+
+        <!-- 仅在开启「无聊时自己说话」时展开参数配置，保持界面清爽 -->
+        <div v-if="chatEnabled" class="pet-chat-subpanel">
           <label class="pet-chat-field">
             <span class="pet-chat-field-label">空闲多久算无聊</span>
             <select
@@ -65,8 +243,6 @@
               :disabled="chatBusy || !bridgeReady"
               @change="onChatIdleChange"
             >
-              <!-- 后端会把阈值钳在 60~86400 秒，旧配置/被钳过的值可能不在预设里；
-                   这里按真实值补一项，否则 select 会显示成空白 -->
               <option v-if="!chatIdlePresets.includes(chatIdleSeconds)" :value="String(chatIdleSeconds)">
                 {{ chatIdleSeconds >= 60 ? `${Math.round(chatIdleSeconds / 60)} 分钟` : `${chatIdleSeconds} 秒` }}
               </option>
@@ -76,7 +252,7 @@
             </select>
           </label>
           <label class="pet-chat-field pet-chat-field-grow">
-            <span class="pet-chat-field-label">用哪个模型说</span>
+            <span class="pet-chat-field-label">对话模型</span>
             <select
               class="pet-chat-select"
               data-test="pet-chat-model"
@@ -92,134 +268,174 @@
           </label>
         </div>
       </div>
-
-      <!-- 宠物形象：列表与切换都走后端（磁盘上真正有什么以 pet_list_skins 为准） -->
-      <div class="pet-skin-head">
-        <span class="field-label pet-skin-label">宠物形象</span>
-        <button
-          class="pet-skin-dir-button"
-          data-test="pet-skins-open-dir"
-          type="button"
-          :disabled="!skinDir"
-          @click="openSkinDir"
-        >打开宠物目录</button>
-      </div>
-      <p class="pet-note pet-note-inline">
-        点卡片切换，切换会重新打开桌宠（约 1 秒）；把宠物包放进下面的目录，重启星瑶后就会出现在列表里。
-      </p>
-      <code v-if="skinDir" class="mono pet-skin-dir" data-test="pet-skins-dir">{{ skinDir }}</code>
-
-      <div class="pet-skin-grid" data-test="pet-skins">
-        <button
-          v-for="s in skins"
-          :key="s.id"
-          class="pet-skin-card"
-          :class="{ 'is-active': s.id === activeSkin }"
-          :disabled="skinBusy || s.id === activeSkin"
-          :data-test="`pet-skin-${s.id}`"
-          type="button"
-          @click="selectSkin(s.id)"
-        >
-          <img v-if="s.thumbnail" class="pet-skin-thumb" :src="s.thumbnail" :alt="s.name" />
-          <span v-else class="pet-skin-thumb pet-skin-thumb-empty">{{ skinInitial(s.name) }}</span>
-          <span class="pet-skin-name">{{ s.name }}</span>
-          <span class="pet-skin-meta">
-            <span class="pet-skin-badge">{{ skinSourceLabel(s.source) }}</span>
-            <span v-if="s.id === activeSkin" class="pet-skin-badge pet-skin-badge-active">使用中</span>
-          </span>
-        </button>
-      </div>
-      <p v-if="!skins.length" class="pet-note" data-test="pet-skins-empty">还没有可用的宠物形象。</p>
-
-      <p class="pet-status" data-test="pet-status">
-        <span class="pet-dot" :class="{ on: running && bridgeReady }"></span>
-        <span :class="running && bridgeReady ? 'pet-state-on' : 'pet-state-off'">{{ statusText }}</span>
-      </p>
-
-      <p v-if="bridgeReady && !available" class="pet-warn" data-test="pet-unavailable">
-        未找到 Electron 运行时或桌宠资源：运行时不再随安装包分发，第一次启用时要下载约 151 MB。
-        <br />
-        <span class="pet-note pet-warn-sub">
-          运行时装在用户目录 ~/.ycode/pet-runtime，不占用安装包体积，装一次以后都不再下载。
-          也可以在下方手动填写已有的 electron.exe 路径。
-        </span>
-        <button
-          class="secondary-button pet-install-button"
-          data-test="pet-install-runtime"
-          type="button"
-          :disabled="installing || loading || !bridgeReady"
-          @click="ensureRuntimeAndEnable"
-        >{{ installing ? '正在准备运行时…' : '下载并启用（约 151 MB）' }}</button>
-      </p>
-
-      <!-- 运行时安装进度：开关与上方按钮共用这一份状态，失败时原地给重试 -->
-      <div
-        v-if="bridgeReady && (installing || runtimeFailed)"
-        class="pet-runtime"
-        :class="{ 'pet-runtime-failed': runtimeFailed }"
-        data-test="pet-runtime-progress"
-      >
-        <p class="pet-runtime-text" data-test="pet-runtime-text">{{ runtimeText || '正在准备运行时…' }}</p>
-        <div
-          v-if="runtimeShowProgress"
-          class="pet-progress"
-          role="progressbar"
-          aria-label="Electron 运行时下载进度"
-          aria-valuemin="0"
-          aria-valuemax="100"
-          :aria-valuenow="runtimePercent"
-        >
-          <span class="pet-progress-fill" :style="{ width: `${runtimePercent}%` }"></span>
-        </div>
-        <button
-          v-if="runtimeFailed"
-          class="secondary-button pet-runtime-retry"
-          data-test="pet-runtime-retry"
-          type="button"
-          :disabled="installing"
-          @click="ensureRuntimeAndEnable"
-        >重试</button>
-      </div>
-
-      <label class="field-label" for="pet-electron-path">Electron 路径</label>
-      <div class="pet-path-row">
-        <input
-          id="pet-electron-path"
-          v-model="electronPath"
-          data-test="pet-electron-path"
-          class="text-field mono"
-          type="text"
-          placeholder="留空使用内置：pets/xingyao_pet/node_modules/electron/dist/electron.exe"
-          :disabled="savingPath"
-        />
-        <button
-          data-test="pet-path-save"
-          class="secondary-button"
-          type="button"
-          :disabled="savingPath || !bridgeReady"
-          @click="savePath"
-        >{{ savingPath ? '保存中…' : '保存' }}</button>
-      </div>
-
-      <div class="pet-actions">
-        <button
-          data-test="pet-restart"
-          class="primary-button"
-          type="button"
-          :disabled="busy || loading || !bridgeReady || !running"
-          @click="restart"
-        >重新打开桌宠</button>
-      </div>
-
-      <p v-if="message" data-test="pet-message" class="pet-message" :class="messageOk ? 'pet-ok' : 'pet-error'">{{ message }}</p>
-      <p v-if="!bridgeReady" data-test="pet-native-only" class="pet-note">仅在桌面应用内可用：浏览器里打开设置页时无法控制桌宠。</p>
-      <p class="pet-note">拖动宠物可以移动它；双击让它睡觉或唤醒；右键弹出菜单，菜单里可以退出桌宠。</p>
     </section>
+
+    <!-- 4. 高级设置（默认折叠） -->
+    <details class="pet-card pet-advanced">
+      <summary class="pet-advanced-summary">
+        <span>高级设置与运行环境</span>
+        <span class="pet-advanced-hint">Electron 路径、宠物目录与快捷交互说明</span>
+      </summary>
+      <div class="pet-advanced-body">
+        <div class="pet-adv-block">
+          <label class="field-label" for="pet-electron-path">自定义 Electron 路径（可选）</label>
+          <div class="pet-path-row">
+            <input
+              id="pet-electron-path"
+              v-model="electronPath"
+              data-test="pet-electron-path"
+              class="text-field mono"
+              type="text"
+              placeholder="留空使用内置：pets/xingyao_pet/node_modules/electron/dist/electron.exe"
+              :disabled="savingPath"
+            />
+            <button
+              data-test="pet-path-save"
+              class="secondary-button"
+              type="button"
+              :disabled="savingPath || !bridgeReady"
+              @click="savePath"
+            >{{ savingPath ? '保存中…' : '保存' }}</button>
+          </div>
+        </div>
+
+        <div v-if="skinDir" class="pet-adv-block">
+          <div class="field-label">本地宠物包目录</div>
+          <code class="mono pet-skin-dir" data-test="pet-skins-dir">{{ skinDir }}</code>
+        </div>
+
+        <p class="pet-note">
+          交互技巧：拖动桌宠可移动位置；双击可让它睡觉或唤醒；右键弹出菜单（可隐藏或退出）。
+        </p>
+      </div>
+    </details>
+
+    <!-- 导入桌宠弹窗 -->
+    <div v-if="importModal.open" class="pet-modal-backdrop" @click.self="closeImportModal">
+      <div class="pet-modal" data-test="pet-import-modal">
+        <header class="pet-modal-head">
+          <h3>导入自定义桌宠</h3>
+          <button class="pet-modal-close" type="button" @click="closeImportModal">×</button>
+        </header>
+
+        <div class="pet-modal-tabs">
+          <button
+            type="button"
+            class="pet-tab"
+            :class="{ active: importModal.mode === 'images' }"
+            @click="importModal.mode = 'images'"
+          >图片 / GIF 创建</button>
+          <button
+            type="button"
+            class="pet-tab"
+            :class="{ active: importModal.mode === 'zip' }"
+            @click="importModal.mode = 'zip'"
+          >导入 ZIP 宠物包</button>
+        </div>
+
+        <div class="pet-modal-body">
+          <label class="pet-modal-field">
+            <span>桌宠名称</span>
+            <input
+              v-model="importModal.name"
+              type="text"
+              class="text-field"
+              :placeholder="importModal.mode === 'zip' ? '留空则自动读取压缩包内名称' : '例如：小橘猫、初音…'"
+            />
+          </label>
+
+          <label class="pet-modal-field">
+            <span>性格与说话语气（接入星瑶 AI 对话）</span>
+            <textarea
+              v-model="importModal.persona"
+              rows="2"
+              class="text-area"
+              placeholder="例如：傲娇毒舌但很关心主人的代码进度，喜欢用“哼”开头"
+            ></textarea>
+          </label>
+
+          <div class="pet-modal-field">
+            <span>{{ importModal.mode === 'zip' ? '选择 .zip 压缩包' : '选择图片或 GIF 动图（支持多张序列帧）' }}</span>
+            <label
+              class="pet-dropzone"
+              @dragover.prevent
+              @drop.prevent="onImportDrop"
+            >
+              <input
+                type="file"
+                :accept="importModal.mode === 'zip' ? '.zip' : 'image/png,image/jpeg,image/webp,image/gif'"
+                :multiple="importModal.mode === 'images'"
+                @change="onImportFilesChange"
+              />
+              <span v-if="!importModal.files.length">
+                点击选择或拖拽{{ importModal.mode === 'zip' ? ' ZIP 文件' : ' PNG / GIF / JPG 图片' }}到这里
+              </span>
+              <span v-else class="pet-dropzone-files">
+                已选择 {{ importModal.files.length }} 个文件：{{ importModal.files.map(f => f.name).join('、') }}
+              </span>
+            </label>
+            <p class="pet-modal-tip">
+              {{
+                importModal.mode === 'zip'
+                  ? '支持标准星瑶宠物包，也支持直接把图片打包成 zip，系统会自动转换格式并集成。'
+                  : '上传 GIF 会自动拆解成动画帧；上传多张 PNG 会按顺序组成呼吸动作。'
+              }}
+            </p>
+          </div>
+
+          <label class="pet-modal-check">
+            <input v-model="importModal.activate" type="checkbox" />
+            <span>导入后立即设为当前桌宠</span>
+          </label>
+
+          <p v-if="importModal.error" class="pet-modal-error">{{ importModal.error }}</p>
+        </div>
+
+        <footer class="pet-modal-foot">
+          <button type="button" class="ghost-button" :disabled="importModal.submitting" @click="closeImportModal">取消</button>
+          <button type="button" class="primary-button" :disabled="importModal.submitting" @click="submitImport">
+            {{ importModal.submitting ? '正在集成…' : '确认导入' }}
+          </button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- 编辑人设弹窗 -->
+    <div v-if="editModal.open" class="pet-modal-backdrop" @click.self="closeEditModal">
+      <div class="pet-modal" data-test="pet-edit-modal">
+        <header class="pet-modal-head">
+          <h3>编辑桌宠人设</h3>
+          <button class="pet-modal-close" type="button" @click="closeEditModal">×</button>
+        </header>
+        <div class="pet-modal-body">
+          <label class="pet-modal-field">
+            <span>桌宠名称</span>
+            <input v-model="editModal.name" type="text" class="text-field" />
+          </label>
+          <label class="pet-modal-field">
+            <span>性格与说话语气</span>
+            <textarea
+              v-model="editModal.persona"
+              rows="3"
+              class="text-area"
+              placeholder="描述它的性格、口癖或对主人的称呼，开启「无聊时自己说话」时会按此人设生成台词。"
+            ></textarea>
+          </label>
+          <p v-if="editModal.error" class="pet-modal-error">{{ editModal.error }}</p>
+        </div>
+        <footer class="pet-modal-foot">
+          <button type="button" class="ghost-button" :disabled="editModal.submitting" @click="closeEditModal">取消</button>
+          <button type="button" class="primary-button" :disabled="editModal.submitting" @click="submitEdit">
+            {{ editModal.submitting ? '保存中…' : '保存人设' }}
+          </button>
+        </footer>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 
 import AppIcon from './AppIcon.vue';
 import type {
@@ -232,16 +448,15 @@ import type {
   PetStatusDto,
 } from '../types/pywebview';
 
-// 桌宠状态：运行中（running/pid）、是否启用（enabled）、运行时是否可用（available）
 const bridgeReady = ref(true);
 const loading = ref(false);
 const busy = ref(false);
 const savingPath = ref(false);
+const testBubbleBusy = ref(false);
 const running = ref(false);
 const pid = ref<number | null>(null);
 const available = ref(true);
 const enabled = ref(false);
-// 任务提示：与「显示桌宠」互不影响，只存配置（桌宠没运行时也可切换）
 const notifyEnabled = ref(true);
 const notifyBusy = ref(false);
 const electronPath = ref('');
@@ -249,27 +464,40 @@ const pendingText = ref('');
 const message = ref('');
 const messageOk = ref(true);
 
-// 宠物形象（皮肤）：skins 为后端扫出来的全部形象，activeSkin 是当前激活 id，
-// skinDir 是用户放宠物包的目录（「打开宠物目录」直接用它）
-const skins = ref<PetSkinDto[]>([]);
-const activeSkin = ref('');
+const DEFAULT_BUILTIN_SKIN: PetSkinDto = {
+  id: 'xingyao',
+  name: '星瑶',
+  description: '星瑶的默认形象：白裙长发、会呼吸也会走动的少女，随对话做出拖拽与互动的动作。',
+  persona: '星瑶默认形象，温柔陪伴编程',
+  author: '星瑶',
+  source: 'builtin',
+  dir: '',
+  assets_dir: '',
+  config_path: '',
+  active: true,
+  thumbnail: '/pet-xingyao-preview.png',
+};
+
+const skins = ref<PetSkinDto[]>([DEFAULT_BUILTIN_SKIN]);
+const activeSkin = ref('xingyao');
 const skinDir = ref('');
 const skinBusy = ref(false);
 
-// Electron 运行时按需安装（运行时不再随安装包分发）：缺运行时时点开关或上方按钮
-// 都走同一条支路，状态集中在这组 ref 上，绝不另造一套并行逻辑
-const runtimeInstalled = ref(true); // 状态未读到时按「已装」处理，避免误判成需要安装
+const activeSkinObj = computed(() =>
+  skins.value.find((s) => s.id === activeSkin.value) || skins.value[0] || null,
+);
+const activeSkinName = computed(() => activeSkinObj.value?.name || '星瑶');
+
+const runtimeInstalled = ref(true);
 const runtimeState = ref('idle');
 const runtimeMsg = ref('');
 const runtimeDownloaded = ref(0);
 const runtimeTotal = ref(0);
 const runtimePercent = ref(0);
-// installing：从「点下去」到「启用成功/失败」的整段（下载 / 校验 / 解压 / 启用）
 const installing = ref(false);
 const runtimeFailed = ref(false);
 const RUNTIME_POLL_MS = 2000;
 let runtimeTimer: ReturnType<typeof setInterval> | null = null;
-// 组件卸载标志：卸载后轮询一律不再发请求（clearInterval 之外的兜底）
 let disposed = false;
 
 function formatMb(bytes: number): string {
@@ -277,13 +505,11 @@ function formatMb(bytes: number): string {
   return String(Math.max(1, Math.round(bytes / (1024 * 1024))));
 }
 
-// 运行时文案：state → 中文进度（failed 时直接显示后端 msg）
 const runtimeText = computed(() => {
   if (runtimeFailed.value) return runtimeMsg.value || '运行时安装失败，请重试';
   if (!installing.value) return '';
   switch (runtimeState.value) {
     case 'downloading': {
-      // total 还没拿到（刚起线程、等第一块字节）：先给「准备中」，避免刷出 0%（0 / 未知）
       if (runtimeTotal.value <= 0) return '正在准备运行时…';
       return `正在下载 Electron 运行时 ${runtimePercent.value}%（${formatMb(runtimeDownloaded.value)} / ${formatMb(runtimeTotal.value)} MB）`;
     }
@@ -300,28 +526,22 @@ const runtimeText = computed(() => {
   }
 });
 
-// 进度条只在真的有字节进度时出现（idle / 解压阶段给文案即可）
 const runtimeShowProgress = computed(() => {
   if (!installing.value || runtimeFailed.value) return false;
   return runtimeState.value === 'downloading';
 });
 
-// 缺运行时只看 available：后端 _resolve_electron 已经把「桌宠包内自带的运行时」和
-// 「用户目录自动下载的那份」都算进去了。再叠一条 runtimeInstalled 判断，会让
-// "包内已有运行时、只是没下载用户级副本"的机器白白触发一次 151MB 下载。
 const needsRuntime = computed(() => !available.value);
 
 const statusText = computed(() => {
-  if (!bridgeReady.value) return '仅在桌面应用内可用';
-  // 安装流程优先占住状态行，用户能一眼看到「正在准备运行时…」并跟随进度
+  if (!bridgeReady.value) return '仅桌面端可用';
   if (installing.value) return runtimeText.value || '正在准备运行时…';
   if (pendingText.value) return pendingText.value;
   if (loading.value) return '读取中…';
-  if (running.value) return `运行中（PID ${pid.value ?? '未知'}）`;
+  if (running.value) return `运行中 · PID ${pid.value ?? '未知'}`;
   return '未运行';
 });
 
-// 桥方法缺失（浏览器环境或后端未就绪）时统一降级为「仅桌面应用内可用」，不抛错
 function getApi() {
   return typeof window === 'undefined' ? undefined : window.pywebview?.api;
 }
@@ -331,8 +551,6 @@ function report(ok: boolean, text: string) {
   message.value = text;
 }
 
-// 运行时快照：pet_get_status.runtime 与 pet_get_runtime_status.runtime 同一结构，
-// 两处共用这一个入口，保证状态行与进度条永远来自同一份数据
 function applyRuntime(runtime?: PetRuntimeStatus) {
   if (!runtime) return;
   if (typeof runtime.installed === 'boolean') runtimeInstalled.value = runtime.installed;
@@ -343,28 +561,21 @@ function applyRuntime(runtime?: PetRuntimeStatus) {
   if (typeof runtime.percent === 'number') {
     runtimePercent.value = Math.max(0, Math.min(100, Math.round(runtime.percent)));
   }
-  // 已经就绪时清掉上一轮的失败态（例如用户在别处装好了再刷新状态）
   if (!installing.value && (runtimeInstalled.value || runtimeState.value === 'done')) {
     runtimeFailed.value = false;
   }
 }
 
-// syncPath：只在读取状态时回填输入框，避免用户正在输入时被状态刷新覆盖
 function applyStatus(status?: PetStatusDto, syncPath = false) {
   if (!status) return;
   running.value = Boolean(status.running);
   pid.value = typeof status.pid === 'number' ? status.pid : null;
   available.value = status.available !== false;
-  // 安装流程进行中不动开关：此时 enabled 表达的是「用户意图」，别被中间态快照回滚
   if (!installing.value) {
     enabled.value = typeof status.enabled === 'boolean' ? status.enabled : running.value;
   }
-  // pet_get_status 也带 runtime 字段：顺手同步，省一次额外请求
   applyRuntime(status.runtime);
-  // 旧后端不带该字段时按开启处理，保持桌宠原有冒泡行为
   notifyEnabled.value = typeof status.notify_enabled === 'boolean' ? status.notify_enabled : true;
-  // 形象以状态快照为准：切换失败、别处改了配置时，前端列表里的 active 可能已经过期，
-  // 只有后端返回的 skin_id 才是「磁盘上真正加载的形象」
   if (typeof status.skin_id === 'string' && status.skin_id) activeSkin.value = status.skin_id;
   if (syncPath && typeof status.electron_path === 'string') electronPath.value = status.electron_path;
 }
@@ -388,44 +599,44 @@ async function refresh() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 宠物形象（皮肤）列表 / 切换 / 打开目录
-// ---------------------------------------------------------------------------
+async function refreshAll() {
+  await Promise.all([refresh(), loadSkins(), loadChatSettings()]);
+}
 
-// 缩略图缺失时的占位：取名字首字（Array.from 保证 emoji 之类不被截成半个码元）
 function skinInitial(name: string): string {
   const chars = Array.from((name || '').trim());
   return chars.length ? chars[0] : '宠';
 }
 
-// 来源角标：内置 / 我的宠物（未知来源原样显示，避免后端新增来源时界面空白）
 function skinSourceLabel(source: string): string {
   if (source === 'builtin') return '内置';
-  if (source === 'user') return '我的宠物';
+  if (source === 'user') return '自定义';
   return source || '宠物';
 }
 
-// 容错写回：列表、当前形象、用户目录三者都以返回值为准（字段缺失时保留旧值）
 function applySkins(res?: PetSkinResult) {
   if (!res) return;
-  if (Array.isArray(res.skins)) {
-    skins.value = res.skins.filter((s) => s && typeof s.id === 'string');
+  if (Array.isArray(res.skins) && res.skins.length > 0) {
+    skins.value = res.skins
+      .filter((s) => s && typeof s.id === 'string')
+      .map((s) =>
+        s.id === 'xingyao' && !s.thumbnail
+          ? { ...s, thumbnail: DEFAULT_BUILTIN_SKIN.thumbnail }
+          : s,
+      );
   }
-  // active 是后端认定的当前形象；为空时退回条目上的 active 标记，避免高亮整体丢失
   if (typeof res.active === 'string' && res.active) {
     activeSkin.value = res.active;
   } else {
     const flagged = skins.value.find((s) => s.active);
     if (flagged) activeSkin.value = flagged.id;
   }
-  // user_dir 可能刚被后端建出来，跟着写回，保证「打开宠物目录」立刻可用
   if (typeof res.user_dir === 'string') skinDir.value = res.user_dir;
 }
 
 async function loadSkins() {
   if (disposed) return;
   const api = getApi();
-  // 老后端没有 pet_list_skins：静默返回，不显示列表也不报错，其余功能照常可用
   if (!api || typeof api.pet_list_skins !== 'function') return;
   try {
     const res = await api.pet_list_skins();
@@ -439,8 +650,7 @@ async function loadSkins() {
 }
 
 async function selectSkin(id: string) {
-  if (skinBusy.value) return; // 切换会重启桌宠，重复点击直接吞掉
-  if (id === activeSkin.value) return;
+  if (skinBusy.value || id === activeSkin.value) return;
   const api = getApi();
   if (!api || typeof api.pet_set_skin !== 'function') {
     if (!api) bridgeReady.value = false;
@@ -452,10 +662,7 @@ async function selectSkin(id: string) {
   try {
     const res: PetMutationResult | undefined = await api.pet_set_skin(id);
     if (disposed) return;
-    // 状态快照是真相来源：切换后桌宠已按新形象重启，running/pid 等都变了
     if (res?.status) applyStatus(res.status);
-    // 再拉一次列表：后端可能因新形象缺配置/缺缩略图而实际回落到别的形象，
-    // 只有重新读一次才能让卡片高亮与磁盘真实状态一致
     await loadSkins();
     report(Boolean(res?.ok), res?.msg || (res?.ok ? '已切换' : '切换失败'));
   } catch {
@@ -481,11 +688,210 @@ async function openSkinDir() {
   }
 }
 
+async function sendTestBubble() {
+  const api = getApi();
+  if (!api || typeof api.pet_test_bubble !== 'function') return;
+  testBubbleBusy.value = true;
+  try {
+    const res = await api.pet_test_bubble('');
+    report(Boolean(res?.ok), res?.msg || (res?.ok ? '已发送测试气泡' : '发送失败'));
+  } catch {
+    report(false, '发送测试气泡失败');
+  } finally {
+    testBubbleBusy.value = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 导入自定义桌宠 / 编辑人设 / 删除
+// ---------------------------------------------------------------------------
+
+const importModal = reactive({
+  open: false,
+  mode: 'images' as 'images' | 'zip',
+  name: '',
+  persona: '',
+  activate: true,
+  files: [] as File[],
+  submitting: false,
+  error: '',
+});
+
+function openImportModal() {
+  importModal.open = true;
+  importModal.mode = 'images';
+  importModal.name = '';
+  importModal.persona = '';
+  importModal.activate = true;
+  importModal.files = [];
+  importModal.submitting = false;
+  importModal.error = '';
+}
+
+function closeImportModal() {
+  if (importModal.submitting) return;
+  importModal.open = false;
+}
+
+function onImportFilesChange(event: Event) {
+  const input = event.target as HTMLInputElement | null;
+  if (!input?.files?.length) return;
+  importModal.files = Array.from(input.files);
+  importModal.error = '';
+}
+
+function onImportDrop(event: DragEvent) {
+  const dropped = event.dataTransfer?.files;
+  if (!dropped?.length) return;
+  const list = Array.from(dropped);
+  if (list.some((f) => f.name.toLowerCase().endsWith('.zip'))) {
+    importModal.mode = 'zip';
+    importModal.files = [list.find((f) => f.name.toLowerCase().endsWith('.zip'))!];
+  } else {
+    importModal.mode = 'images';
+    importModal.files = list;
+  }
+  importModal.error = '';
+}
+
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error(`读取文件 ${file.name} 失败`));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function submitImport() {
+  if (importModal.submitting) return;
+  const api = getApi();
+  if (!api || typeof api.pet_import_skin !== 'function') {
+    importModal.error = '当前版本不支持界面导入桌宠';
+    return;
+  }
+  if (!importModal.files.length) {
+    importModal.error = '请先选择要导入的文件';
+    return;
+  }
+  if (importModal.mode === 'images' && !importModal.name.trim()) {
+    importModal.error = '请给新桌宠起个名字';
+    return;
+  }
+
+  importModal.submitting = true;
+  importModal.error = '';
+  try {
+    const encoded = await Promise.all(
+      importModal.files.map(async (f) => ({
+        name: f.name,
+        data: await readFileAsBase64(f),
+      })),
+    );
+    const res = await api.pet_import_skin({
+      mode: importModal.mode,
+      name: importModal.name.trim(),
+      persona: importModal.persona.trim(),
+      activate: importModal.activate,
+      files: encoded,
+    });
+    if (!res?.ok) {
+      importModal.error = res?.msg || '导入失败';
+      return;
+    }
+    if (res.status) applyStatus(res.status);
+    if (res.list) applySkins(res.list);
+    else await loadSkins();
+    importModal.open = false;
+    report(true, res.msg || '导入成功');
+  } catch (err) {
+    importModal.error = err instanceof Error ? err.message : '导入失败';
+  } finally {
+    importModal.submitting = false;
+  }
+}
+
+const editModal = reactive({
+  open: false,
+  id: '',
+  name: '',
+  persona: '',
+  submitting: false,
+  error: '',
+});
+
+function openEditModal(skin: PetSkinDto) {
+  editModal.open = true;
+  editModal.id = skin.id;
+  editModal.name = skin.name;
+  editModal.persona = skin.persona || skin.description || '';
+  editModal.submitting = false;
+  editModal.error = '';
+}
+
+function closeEditModal() {
+  if (editModal.submitting) return;
+  editModal.open = false;
+}
+
+async function submitEdit() {
+  if (editModal.submitting) return;
+  const api = getApi();
+  if (!api || typeof api.pet_update_skin !== 'function') {
+    editModal.error = '当前版本不支持编辑桌宠人设';
+    return;
+  }
+  if (!editModal.name.trim()) {
+    editModal.error = '桌宠名称不能为空';
+    return;
+  }
+  editModal.submitting = true;
+  editModal.error = '';
+  try {
+    const res = await api.pet_update_skin(editModal.id, {
+      name: editModal.name.trim(),
+      persona: editModal.persona.trim(),
+    });
+    if (!res?.ok) {
+      editModal.error = res?.msg || '保存失败';
+      return;
+    }
+    if (res.list) applySkins(res.list);
+    else await loadSkins();
+    editModal.open = false;
+    report(true, res.msg || '已更新桌宠人设');
+  } catch {
+    editModal.error = '保存失败：桌面桥接不可用';
+  } finally {
+    editModal.submitting = false;
+  }
+}
+
+async function removeSkin(skin: PetSkinDto) {
+  const api = getApi();
+  if (!api || typeof api.pet_delete_skin !== 'function') return;
+  if (!window.confirm(`确定要删除自定义桌宠「${skin.name}」吗？`)) return;
+  skinBusy.value = true;
+  try {
+    const res = await api.pet_delete_skin(skin.id);
+    if (res?.status) applyStatus(res.status);
+    if (res?.list) applySkins(res.list);
+    else await loadSkins();
+    report(Boolean(res?.ok), res?.msg || (res?.ok ? '已删除' : '删除失败'));
+  } catch {
+    report(false, '删除失败：桌面桥接不可用');
+  } finally {
+    skinBusy.value = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 开关与运行时安装
+// ---------------------------------------------------------------------------
+
 function onToggleChange(event: Event) {
   const target = event.target as HTMLInputElement | null;
   const next = Boolean(target?.checked);
-  // 缺运行时时直接调 pet_set_enabled 必然失败（后端只会回「未找到运行时」），
-  // 所以把「打开」改成先装运行时、装好后自动启用；关闭仍走原来的路径
   if (next && needsRuntime.value) {
     void ensureRuntimeAndEnable();
     return;
@@ -518,12 +924,7 @@ async function toggleEnabled(next: boolean) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 缺运行时 → 后台安装 → 自动启用（开关与「下载并启用」按钮共用这一条路径）
-// ---------------------------------------------------------------------------
-
 function stopPolling() {
-  // 完成、失败、组件卸载三条路径都必须经过这里，保证定时器不泄漏
   if (runtimeTimer !== null) {
     clearInterval(runtimeTimer);
     runtimeTimer = null;
@@ -537,7 +938,6 @@ function startPolling() {
   }, RUNTIME_POLL_MS);
 }
 
-// 安装失败统一出口：开关回到关闭，保留错误文案与重试按钮（下次点击重走安装）
 function failRuntime(text: string) {
   stopPolling();
   installing.value = false;
@@ -545,19 +945,17 @@ function failRuntime(text: string) {
   enabled.value = false;
   runtimeFailed.value = true;
   runtimeMsg.value = text;
-  // 错误统一显示在运行时提示块，避免和底部 message 区重复两遍
   message.value = '';
 }
 
 async function ensureRuntimeAndEnable() {
-  if (installing.value) return; // 双击/重复点击直接吞掉
+  if (installing.value) return;
   const api = getApi();
   if (!api || typeof api.pet_install_runtime !== 'function') {
     if (!api) bridgeReady.value = false;
     else report(false, '当前版本不支持自动安装 Electron 运行时，请手动填写下方 electron.exe 路径。');
     return;
   }
-  // 用户意图先行：开关视觉置开，失败再回落
   enabled.value = true;
   installing.value = true;
   runtimeFailed.value = false;
@@ -567,7 +965,6 @@ async function ensureRuntimeAndEnable() {
   runtimeDownloaded.value = 0;
   runtimeTotal.value = 0;
   message.value = '';
-  // pet_install_runtime 立刻返回、下载在后台线程，所以先起轮询再调用
   startPolling();
   try {
     const res = await api.pet_install_runtime();
@@ -577,7 +974,6 @@ async function ensureRuntimeAndEnable() {
       failRuntime(res.msg || '启动运行时安装失败');
       return;
     }
-    // 幂等命中（之前就装好、或本次瞬间完成）：不必等轮询，直接启用
     if (runtimeInstalled.value) void enableAfterRuntime();
   } catch {
     if (disposed) return;
@@ -586,7 +982,6 @@ async function ensureRuntimeAndEnable() {
 }
 
 async function pollRuntime() {
-  // 卸载后一律不再发请求（onUnmounted 已 clearInterval，这里兜底正在飞行中的一次）
   if (disposed) {
     stopPolling();
     return;
@@ -612,16 +1007,14 @@ async function pollRuntime() {
     if (runtimeState.value === 'failed') {
       failRuntime(runtimeMsg.value || '运行时安装失败，请重试');
     }
-    // downloading / verifying / extracting / idle → 保持轮询，文案由 runtimeText 跟随
   } catch {
     if (disposed) return;
     failRuntime('查询运行时安装进度失败：桌面桥接不可用');
   }
 }
 
-// 运行时就绪后真正拉起桌宠；成功才算整段流程完成
 async function enableAfterRuntime() {
-  if (!installing.value) return; // 已经在启用阶段或已结束，避免重复调用
+  if (!installing.value) return;
   stopPolling();
   runtimeState.value = 'done';
   pendingText.value = '运行时已就绪，正在启用桌宠…';
@@ -641,7 +1034,6 @@ async function enableAfterRuntime() {
       pendingText.value = '';
       runtimeFailed.value = false;
       report(true, '桌宠已启动');
-      // 运行时刚落盘：重新读一次真实快照，把 available / running 校准回来
       await refresh();
       return;
     }
@@ -657,7 +1049,6 @@ function onNotifyChange(event: Event) {
   void toggleNotify(Boolean(target?.checked));
 }
 
-// 任务提示开关：独立 busy（notifyBusy），不与「显示桌宠」的 busy 互相锁死
 async function toggleNotify(next: boolean) {
   const api = getApi();
   if (!api || typeof api.pet_set_notify_enabled !== 'function') {
@@ -682,12 +1073,9 @@ async function toggleNotify(next: boolean) {
 }
 
 // ---------------------------------------------------------------------------
-// 无聊时自己说话（pet_chat_*）：闲置到阈值后由模型生成一句台词冒泡。
-// 与「任务提示」完全独立：两条气泡来源各自有自己的开关和忙碌标记。
+// 无聊时自己说话
 // ---------------------------------------------------------------------------
 
-// 空闲阈值预设：选项固定三档；后端会把值钳在 60~86400 秒，
-// 手改配置或旧值不在预设里时，模板按真实值动态补一项，避免 select 显示成空白
 const chatIdlePresets = [300, 600, 1800];
 const chatEnabled = ref(false);
 const chatIdleSeconds = ref(600);
@@ -695,8 +1083,6 @@ const chatModelId = ref('');
 const chatModels = ref<PetChatModelOption[]>([]);
 const chatBusy = ref(false);
 
-// 容错写回：字段缺失时保留旧值（老后端或局部失败不该把界面清空）；
-// models 非数组时置空而不是保留旧列表，避免展示已被删掉的模型
 function applyChatSettings(res?: PetChatSettingsResult) {
   if (!res) return;
   if (typeof res.enabled === 'boolean') chatEnabled.value = res.enabled;
@@ -709,11 +1095,9 @@ function applyChatSettings(res?: PetChatSettingsResult) {
     : [];
 }
 
-// 返回 true 表示确实从后端读到了设置（调用方据此判断要不要自己回滚界面）
 async function loadChatSettings(): Promise<boolean> {
   if (disposed) return false;
   const api = getApi();
-  // 老后端没有 pet_chat_get_settings：静默返回，这组控件保持默认值，其余功能照常可用
   if (!api || typeof api.pet_chat_get_settings !== 'function') return false;
   try {
     const res = await api.pet_chat_get_settings();
@@ -728,14 +1112,12 @@ async function loadChatSettings(): Promise<boolean> {
   }
 }
 
-// 保存后必须回读：后端会把 idle_seconds 钳在 60~86400 秒，前端选的档位不一定被原样接受，
-// 只有重新 get 一次，开关与下拉显示的才是真正生效的值（失败时这也顺带完成了视觉回滚）
 async function saveChat(patch: {
   enabled?: boolean;
   idle_seconds?: number;
   model_id?: string;
 }): Promise<boolean> {
-  if (chatBusy.value) return true; // 一次只发一个写请求，连点直接吞掉，避免请求互相覆盖
+  if (chatBusy.value) return true;
   const api = getApi();
   if (!api || typeof api.pet_chat_set_settings !== 'function') {
     if (!api) bridgeReady.value = false;
@@ -749,14 +1131,12 @@ async function saveChat(patch: {
   try {
     const res = await api.pet_chat_set_settings(patch);
     if (disposed) return false;
-    // 先回读再报结论：回读如果把「读取失败」写进提示区，会盖掉更重要的保存结论
     synced = await loadChatSettings();
     if (disposed) return synced;
     if (res?.ok) report(true, res.msg || '已保存');
     else report(false, res?.msg || '保存失败');
   } catch {
     if (disposed) return false;
-    // 桥接不可用：控件已经被点成新值，能读就回读一次把界面拉回后端真配置
     synced = await loadChatSettings();
     if (disposed) return synced;
     report(false, '保存失败：桌面桥接不可用');
@@ -770,12 +1150,9 @@ function onChatToggle(event: Event) {
   const target = event.target as HTMLInputElement | null;
   const next = Boolean(target?.checked);
   const previous = chatEnabled.value;
-  // 先乐观置位：只有 chatEnabled 真的变过一次，Vue 才会把 DOM 勾选一并改写；
-  // 保存失败时回读会把 chatEnabled 拉回后端真值，勾选也就跟着回滚
   chatEnabled.value = next;
   void saveChat({ enabled: next }).then((synced) => {
     if (synced || disposed) return;
-    // 连设置都读不回来（老后端 / 桥接不可用）：手动还原，避免开关停在没生效的状态
     chatEnabled.value = previous;
     if (target) target.checked = previous;
   });
@@ -784,7 +1161,6 @@ function onChatToggle(event: Event) {
 function onChatIdleChange(event: Event) {
   const target = event.target as HTMLSelectElement | null;
   const next = Number(target?.value);
-  // Number('') === 0：空值/脏值直接忽略，别把 0 送给后端（后端会钳成最小值）
   if (!Number.isFinite(next) || next <= 0) return;
   const previous = chatIdleSeconds.value;
   chatIdleSeconds.value = next;
@@ -797,7 +1173,6 @@ function onChatIdleChange(event: Event) {
 
 function onChatModelChange(event: Event) {
   const target = event.target as HTMLSelectElement | null;
-  // 空串是合法值（= 自动），不能当成「没选」跳过
   const next = String(target?.value ?? '');
   const previous = chatModelId.value;
   chatModelId.value = next;
@@ -848,14 +1223,10 @@ async function restart() {
   }
 }
 
-// 状态、形象列表、「自己说话」设置并行拉取：三者互不依赖，串行只会白等多次往返
 onMounted(() => {
-  void refresh();
-  void loadSkins();
-  void loadChatSettings();
+  void refreshAll();
 });
 
-// 组件卸载：停掉运行时轮询并置卸载标志，之后不再发任何请求
 onUnmounted(() => {
   disposed = true;
   stopPolling();
@@ -863,100 +1234,510 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.pet-settings { max-width: 920px; margin: 0 auto; }
-.pet-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
-.pet-header h1 { margin: 0 0 7px; font-size: 25px; }
-.pet-header p { margin: 0; color: var(--text-faint); font-size: 13px; line-height: 1.7; }
-.refresh-button { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); flex: none; }
-.refresh-button:hover { color: var(--text); background: var(--bg3); }
-.pet-card { border-top: 1px solid var(--border); padding-top: 16px; }
-.pet-toggle { display: flex; align-items: center; gap: 10px; color: var(--text); font-size: 13px; cursor: pointer; }
-.pet-toggle input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
-.pet-toggle input:disabled { cursor: not-allowed; opacity: .6; }
-.pet-toggle-state { color: var(--text-faint); font-size: 12px; }
-/* 任务提示开关：紧跟「显示桌宠」，与状态行之间留出更紧的说明间距 */
-.pet-toggle-secondary { margin-top: 12px; }
-.pet-note-inline { margin: 6px 0 0; }
-.pet-status { display: flex; align-items: center; gap: 8px; margin: 14px 0 0; font-size: 12px; }
-.pet-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); flex: none; }
-.pet-dot.on { background: var(--green); }
-.pet-state-on { color: var(--green); }
-.pet-state-off { color: var(--text-faint); }
-.pet-warn {
-  margin: 12px 0 0;
-  padding: 9px 13px;
-  border: 1px solid color-mix(in srgb, var(--theme-warning) 35%, var(--border));
+.pet-settings {
+  max-width: 880px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.pet-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.pet-header h1 { margin: 0 0 6px; font-size: 24px; font-weight: 700; }
+.pet-header p { margin: 0; color: var(--text-faint); font-size: 13px; line-height: 1.6; }
+
+.refresh-button {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
   border-radius: 9px;
-  background: color-mix(in srgb, var(--theme-warning) 8%, var(--bg1));
-  color: var(--theme-warning);
+  background: var(--bg2);
+  color: var(--text-dim);
+  flex: none;
+  cursor: pointer;
+}
+.refresh-button:hover { color: var(--text); background: var(--bg3); }
+
+/* 提示条 */
+.pet-banner {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+}
+.pet-banner-ok {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--bg1));
+  border-color: color-mix(in srgb, var(--green) 30%, var(--border));
+}
+.pet-banner-err {
+  color: var(--theme-danger);
+  background: color-mix(in srgb, var(--theme-danger) 8%, var(--bg1));
+  border-color: color-mix(in srgb, var(--theme-danger) 30%, var(--border));
+}
+.pet-banner-info {
+  color: var(--text-dim);
+  background: var(--bg2);
+}
+
+/* 卡片容器 */
+.pet-card {
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg1);
+}
+
+/* Hero 状态卡 */
+.pet-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 6%, var(--bg1)), var(--bg1));
+}
+.pet-hero-left {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+}
+.pet-hero-info { min-width: 0; flex: 1; }
+.pet-hero-title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pet-hero-name { font-size: 16px; font-weight: 700; color: var(--text); }
+.pet-hero-sub {
+  margin: 4px 0 0;
+  color: var(--text-faint);
   font-size: 12px;
-  line-height: 1.6;
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.field-label { display: block; margin: 20px 0 7px; color: var(--text-dim); font-size: 12px; }
-/* 运行时一键安装按钮：嵌在警告块里，比普通按钮更紧一号但仍显眼 */
-.pet-install-button { display: inline-flex; align-items: center; min-height: 32px; margin: 9px 0 0; padding: 0 14px; font-size: 12px; font-weight: 600; color: var(--theme-warning); border-color: currentColor; background: var(--bg2); }
-.pet-install-button:hover:not(:disabled) { background: var(--bg3); }
-/* 运行时安装进度块：与警告块同一套视觉语言，失败时整块转危险色 */
-.pet-runtime { margin: 12px 0 0; padding: 9px 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--text-dim); font-size: 12px; }
-.pet-runtime-failed { border-color: color-mix(in srgb, var(--theme-danger) 35%, var(--border)); background: color-mix(in srgb, var(--theme-danger) 8%, var(--bg1)); color: var(--theme-danger); }
-.pet-runtime-text { margin: 0; line-height: 1.6; }
-.pet-progress { margin: 8px 0 0; height: 4px; border-radius: 999px; background: var(--bg3); overflow: hidden; }
-.pet-progress-fill { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width .2s linear; }
-.pet-runtime-retry { min-height: 30px; margin: 9px 0 0; padding: 0 14px; font-size: 12px; }
-.pet-path-row { display: flex; align-items: center; gap: 10px; }
-.text-field { flex: 1; min-width: 0; min-height: 42px; padding: 0 13px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--text); font-size: 13px; }
-.text-field:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
-.text-field:disabled { cursor: wait; opacity: .7; }
-.mono { font-family: var(--mono); }
-.primary-button, .secondary-button { min-height: 38px; margin-top: 0; padding: 0 18px; border-radius: 9px; border: 1px solid var(--border); font-weight: 600; cursor: pointer; flex: none; }
-.primary-button { background: var(--text); color: var(--bg0); }
-.primary-button:disabled, .secondary-button:disabled { opacity: .5; cursor: not-allowed; }
+.pet-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+.pet-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+.pet-status-pill.on {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  background: color-mix(in srgb, var(--green) 8%, var(--bg1));
+}
+.pet-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
+.pet-dot.on { background: var(--green); }
+
+/* 滑动开关 Switch */
+.switch { position: relative; display: inline-flex; align-items: center; cursor: pointer; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch-track {
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  position: relative;
+  transition: background .18s ease, border-color .18s ease;
+}
+.switch-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform .18s ease, background .18s ease;
+}
+.switch input:checked + .switch-track {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.switch input:checked + .switch-track::after {
+  transform: translateX(18px);
+  background: #fff;
+}
+.switch input:disabled + .switch-track {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+/* 按钮体系 */
+.primary-button, .secondary-button, .ghost-button {
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  flex: none;
+  border: 1px solid var(--border);
+}
+.primary-button { background: var(--accent); border-color: var(--accent); color: #fff; }
+.primary-button:hover:not(:disabled) { filter: brightness(1.06); }
 .secondary-button { background: var(--bg3); color: var(--text); }
-.pet-actions { display: flex; gap: 10px; margin-top: 14px; }
-.pet-message { margin: 14px 0 0; font-size: 12px; }
-.pet-ok { color: var(--green); }
-.pet-error { color: var(--theme-danger); }
-.pet-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
+.secondary-button:hover:not(:disabled) { background: var(--bg2); }
+.ghost-button { background: transparent; color: var(--text-dim); }
+.ghost-button:hover:not(:disabled) { color: var(--text); background: var(--bg2); }
+.primary-button:disabled, .secondary-button:disabled, .ghost-button:disabled { opacity: .5; cursor: not-allowed; }
 
-/* 宠物形象：标题行左侧沿用 field-label，右侧只给一个克制的小按钮（打开目录是辅助动作） */
-.pet-skin-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 20px 0 0; }
-.pet-skin-label { margin: 0; }
-.pet-skin-dir-button { min-height: 28px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--text-dim); font-size: 12px; cursor: pointer; flex: none; }
-.pet-skin-dir-button:hover:not(:disabled) { color: var(--text); background: var(--bg3); }
-.pet-skin-dir-button:disabled { opacity: .5; cursor: not-allowed; }
-.pet-skin-dir { display: block; margin: 8px 0 0; color: var(--text-faint); font-size: 11px; word-break: break-all; }
-.pet-skin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; margin-top: 10px; }
-.pet-skin-card { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; cursor: pointer; }
-.pet-skin-card:hover:not(:disabled) { background: var(--bg3); }
-/* 当前形象用强调色描边；正在切换时卡片仍保持可读，只把光标收掉 */
-.pet-skin-card.is-active { border-color: var(--accent); }
+/* 运行时警告与进度 */
+.pet-warn {
+  padding: 12px 16px;
+  border: 1px solid color-mix(in srgb, var(--theme-warning) 35%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--theme-warning) 7%, var(--bg1));
+  color: var(--theme-warning);
+  font-size: 12.5px;
+}
+.pet-warn-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.pet-warn-sub { margin: 6px 0 0; color: var(--text-dim); font-size: 12px; line-height: 1.5; }
+.pet-install-button { color: var(--theme-warning); border-color: currentColor; background: var(--bg1); }
+
+.pet-runtime { padding: 12px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg2); color: var(--text-dim); font-size: 12.5px; }
+.pet-runtime-failed { border-color: color-mix(in srgb, var(--theme-danger) 35%, var(--border)); background: color-mix(in srgb, var(--theme-danger) 8%, var(--bg1)); color: var(--theme-danger); }
+.pet-runtime-text { margin: 0; line-height: 1.5; }
+.pet-progress { margin: 8px 0 0; height: 5px; border-radius: 999px; background: var(--bg3); overflow: hidden; }
+.pet-progress-fill { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width .2s linear; }
+.pet-runtime-retry { margin-top: 8px; }
+
+/* 分区标题 */
+.pet-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.pet-section-head h2 { margin: 0 0 4px; font-size: 15px; font-weight: 700; color: var(--text); }
+.pet-section-desc { margin: 0; color: var(--text-faint); font-size: 12px; line-height: 1.5; }
+.pet-section-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+
+/* 宠物形象网格 */
+.pet-skin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  gap: 12px;
+}
+.pet-skin-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg2);
+  overflow: hidden;
+  transition: border-color .15s ease, transform .15s ease;
+}
+.pet-skin-item:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.pet-skin-item.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.pet-skin-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 10px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
 .pet-skin-card:disabled { cursor: default; }
-.pet-skin-thumb { width: 64px; height: 64px; object-fit: contain; border-radius: 8px; }
-/* 缩略图缺失时的占位方块：与 img 同尺寸，居中显示名字首字 */
-.pet-skin-thumb-empty { display: grid; place-items: center; border: 1px solid var(--border); background: var(--bg3); color: var(--text-faint); font-size: 22px; font-weight: 600; }
-.pet-skin-name { width: 100%; font-size: 13px; font-weight: 600; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pet-skin-meta { display: flex; align-items: center; justify-content: center; gap: 4px; flex-wrap: wrap; color: var(--text-faint); font-size: 11px; }
-.pet-skin-badge { padding: 1px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg3); color: var(--text-faint); font-size: 11px; line-height: 1.5; }
-.pet-skin-badge-active { border-color: var(--accent); color: var(--accent); background: transparent; }
-
-@media (max-width: 768px) {
-  .pet-header { flex-direction: column; }
-  .pet-path-row { flex-wrap: wrap; }
-  .pet-path-row .secondary-button { margin-top: 8px; }
-  .pet-actions { flex-wrap: wrap; }
-  /* 窄屏放不下 104px 三列：降到 88px，一行能多塞一张卡片 */
-  .pet-skin-grid { grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); }
-  /* 窄屏把两个下拉各占一行，挤在一行会把「自动（副模型 → 主模型）」截断 */
-  .pet-chat-field, .pet-chat-field-grow { min-width: 100%; }
+.pet-skin-thumb { width: 76px; height: 76px; object-fit: contain; border-radius: 10px; }
+.pet-skin-thumb-empty {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text-faint);
+  font-size: 22px;
+  font-weight: 600;
+}
+.pet-skin-name {
+  width: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pet-skin-persona {
+  width: 100%;
+  font-size: 11px;
+  color: var(--text-faint);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pet-skin-meta { display: flex; align-items: center; justify-content: center; gap: 4px; flex-wrap: wrap; }
+.pet-skin-badge {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg3);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.pet-skin-badge-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
-/* 无聊时自己说话：与「任务提示」同属气泡开关，视觉沿用它的开关样式，
-   下面只补两个下拉的排版（阈值 + 模型并排，窄屏各占一行） */
-.pet-chat { margin-top: 16px; }
-.pet-chat-row { display: flex; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.pet-skin-ops {
+  display: flex;
+  border-top: 1px solid var(--border);
+  background: var(--bg1);
+}
+.pet-skin-op-btn {
+  flex: 1;
+  padding: 5px 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.pet-skin-op-btn + .pet-skin-op-btn { border-left: 1px solid var(--border); }
+.pet-skin-op-btn:hover { background: var(--bg3); color: var(--text); }
+.pet-skin-op-danger:hover { color: var(--theme-danger); }
+
+/* 互动开关列表 */
+.pet-setting-list { display: flex; flex-direction: column; }
+.pet-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 12px 0;
+}
+.pet-setting-row + .pet-setting-row { border-top: 1px solid var(--border); }
+.pet-setting-copy { min-width: 0; }
+.pet-setting-title { font-size: 13.5px; font-weight: 600; color: var(--text); }
+.pet-setting-sub { margin: 3px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.5; }
+
+.pet-chat-subpanel {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+}
 .pet-chat-field { display: flex; flex-direction: column; gap: 5px; min-width: 150px; }
 .pet-chat-field-grow { flex: 1 1 240px; min-width: 220px; }
-.pet-chat-field-label { color: var(--text-dim); font-size: 12px; }
-.pet-chat-select { min-height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text); font-size: 13px; }
+.pet-chat-field-label { color: var(--text-dim); font-size: 11.5px; }
+.pet-chat-select {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg1);
+  color: var(--text);
+  font-size: 13px;
+}
 .pet-chat-select:disabled { opacity: .6; cursor: not-allowed; }
+
+/* 高级设置折叠面板 */
+.pet-advanced { padding: 0; overflow: hidden; }
+.pet-advanced-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 20px;
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  list-style: none;
+}
+.pet-advanced-summary::-webkit-details-marker { display: none; }
+.pet-advanced-summary:hover { color: var(--text); background: var(--bg2); }
+.pet-advanced-hint { font-size: 12px; font-weight: 400; color: var(--text-faint); }
+.pet-advanced-body { padding: 0 20px 18px; border-top: 1px solid var(--border); }
+.pet-adv-block { margin-top: 14px; }
+.field-label { display: block; margin-bottom: 6px; color: var(--text-dim); font-size: 12px; }
+.pet-path-row { display: flex; align-items: center; gap: 10px; }
+.text-field {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 12px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg2);
+  color: var(--text);
+  font-size: 13px;
+}
+.text-field:focus, .text-area:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.text-area {
+  width: 100%;
+  padding: 9px 12px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg2);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+.mono { font-family: var(--mono); }
+.pet-skin-dir { display: block; color: var(--text-faint); font-size: 11.5px; word-break: break-all; }
+.pet-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
+
+/* 弹窗 */
+.pet-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(0, 0, 0, .48);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.pet-modal {
+  width: 100%;
+  max-width: 480px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .28);
+  overflow: hidden;
+}
+.pet-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.pet-modal-head h3 { margin: 0; font-size: 15px; font-weight: 700; }
+.pet-modal-close {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.pet-modal-close:hover { color: var(--text); }
+.pet-modal-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 12px 18px 0;
+}
+.pet-tab {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg2);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pet-tab.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.pet-modal-body {
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.pet-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.pet-dropzone {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 76px;
+  padding: 12px;
+  border: 1.5px dashed var(--border);
+  border-radius: 10px;
+  background: var(--bg2);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  text-align: center;
+  cursor: pointer;
+}
+.pet-dropzone:hover { border-color: var(--accent); }
+.pet-dropzone input { display: none; }
+.pet-dropzone-files { color: var(--accent); font-weight: 600; word-break: break-all; }
+.pet-modal-tip { margin: 0; font-size: 11.5px; color: var(--text-faint); line-height: 1.5; }
+.pet-modal-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.pet-modal-check input { accent-color: var(--accent); }
+.pet-modal-error { margin: 0; font-size: 12px; color: var(--theme-danger); }
+.pet-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+}
+
+@media (max-width: 768px) {
+  .pet-hero { flex-direction: column; align-items: stretch; }
+  .pet-hero-actions { justify-content: flex-end; }
+  .pet-section-head { flex-direction: column; }
+  .pet-path-row { flex-wrap: wrap; }
+  .pet-skin-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
+  .pet-chat-field, .pet-chat-field-grow { min-width: 100%; }
+}
 </style>

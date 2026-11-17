@@ -2,23 +2,30 @@
   <div class="settings-page" :class="{ 'settings-page--mobile': isMobile }">
     <aside class="settings-nav">
       <button class="back-workspace" @click="attemptCloseSettings"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
-      <div class="nav-section">基础设置</div>
+      <div class="nav-section nav-section--first">核心配置</div>
+      <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
-      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
-      <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
       <button data-test="hooks-nav" class="nav-item" :class="{ active: activeSection === 'hooks' }" @click="activeSection = 'hooks'"><span class="nav-ico"><AppIcon name="zap" :size="14" /></span>钩子 Hooks</button>
+
+      <div class="nav-section">外观与个性</div>
       <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
+      <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
       <button data-test="pet-nav" class="nav-item" :class="{ active: activeSection === 'pet' }" @click="activeSection = 'pet'"><span class="nav-ico"><AppIcon name="orbit" :size="14" /></span>桌面宠物</button>
       <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
-      <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
-      <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
+
+      <div class="nav-section">记忆与决策</div>
       <button data-test="growth-nav" class="nav-item" :class="{ active: activeSection === 'growth' }" @click="activeSection = 'growth'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>记忆与成长</button>
       <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
+
+      <div class="nav-section">集成与数据</div>
       <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
       <button data-test="cloud-relay-nav" class="nav-item" :class="{ active: activeSection === 'cloud-relay' }" @click="activeSection = 'cloud-relay'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>云中转</button>
       <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
-      <div class="nav-section">插件设置</div>
+      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
+      <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
+
+      <div v-if="pluginNavItems.length" class="nav-section">插件设置</div>
       <button v-for="p in pluginNavItems" :key="p.name" :data-test="`plugin-nav-${p.name}`" class="nav-item" :class="{ active: activePluginName === p.name }" @click="openPluginSection(p.name)"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>{{ p.name }}</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
@@ -345,7 +352,7 @@
           <div class="perm-row">
             <div>
               <h3>沙盒开关</h3>
-              <p>{{ store.sandboxEnabled ? '已解除：工作目录外的文件读写直接放行，不再询问（凭据文件除外）' : '已开启：仅允许访问当前工作目录内的文件' }}</p>
+              <p>{{ store.sandboxEnabled ? '已解除：允许读写工作目录外文件（凭据除外）' : '已开启：仅限访问当前工作目录内文件' }}</p>
             </div>
             <button
               data-test="sandbox-toggle"
@@ -357,7 +364,7 @@
           <div class="perm-row">
             <div>
               <h3>当前权限模式</h3>
-              <p>{{ formatPermMode(store.permissionMode) }}（可在输入框旁的权限按钮切换）</p>
+              <p>{{ formatPermMode(store.permissionMode) }}（可在输入框旁切换）</p>
             </div>
           </div>
 
@@ -378,7 +385,7 @@
                 >清空本项目规则</button>
               </div>
             </div>
-            <p class="whitelist-tip">用户手动添加或审批时选择“加入项目白名单”的规则会按项目目录保存到 permissions.json，重启后仍生效。命令按 token 前缀匹配；文件只放行规范化后的精确路径。任务级授权切换界面不清除，删除任务或重启后失效。</p>
+            <p class="whitelist-tip">按项目目录持久化保存；命令按前缀匹配，文件按精确路径匹配。</p>
             <div v-if="showPermRuleForm" class="wl-form">
               <select v-model="permRuleType" data-test="permission-rule-type" class="text-field">
                 <option value="command">命令前缀</option>
@@ -721,7 +728,7 @@
         <header class="settings-header">
           <div>
             <h1>外观与主题</h1>
-            <p>为 GUI 创建、编辑和切换可视化主题；CLI 的 /theme 配置保持独立、互不影响。</p>
+            <p>管理与自定义 GUI 界面主题（与 CLI 主题独立）。</p>
           </div>
         </header>
 
@@ -764,14 +771,14 @@
             <input v-model.number="modelModal.max_tokens" class="text-field" type="number" min="0" placeholder="留空使用默认" />
           </div>
         </div>
-        <p class="modal-field-hint">最大输出留空时使用按模型家族内置的默认输出上限（如 DeepSeek 384K、GLM-5.3 131K、其余 32K）。</p>
+        <p class="modal-field-hint">留空使用模型家族默认输出上限。</p>
         <label class="vision-choice">
           <input v-model="modelModal.supports_vision" data-test="model-supports-vision" type="checkbox" />
           <span><b>是否支持多模态</b><small>启用后允许向该模型发送图片内容</small></span>
         </label>
         <label class="vision-choice">
           <input v-model="modelModal.supports_function_calling" data-test="model-supports-function-calling" type="checkbox" />
-          <span><b>是否支持工具调用</b><small>默认视为支持（Agent 模型本就以工具调用驱动）；显式关闭会把该模型排除在电脑操控之外。电脑操控还要求开启多模态（视觉识图）</small></span>
+          <span><b>是否支持工具调用</b><small>关闭后将不参与工具调用与电脑操控</small></span>
         </label>
         <label class="field-label">电脑操控协议</label>
         <select v-model="modelModal.computer_protocol" data-test="model-computer-protocol" class="text-field">
@@ -780,7 +787,7 @@
           <option value="generic">通用视觉工具协议（generic）</option>
           <option value="native_openai">OpenAI 原生 Computer Use（native_openai）</option>
         </select>
-        <p class="modal-field-hint">电脑操控要求模型支持视觉（识图）；工具调用默认视为支持（显式关闭的模型除外）。选「自动」时，视觉已勾选的模型在开关开启后即可直接操控。</p>
+        <p class="modal-field-hint">选「自动」时，开启多模态与工具调用即自动启用。</p>
         <p v-if="computerProtocolError" data-test="model-computer-protocol-error" class="modal-field-error">
           {{ computerProtocolError }}
         </p>
@@ -1639,14 +1646,16 @@ onMounted(async () => {
 .settings-page { position: relative; flex: 1; min-width: 0; z-index: 80; display: flex; background: var(--bg0); color: var(--text); }
 /* 导航列：条目多于一屏时自身滚动（min-height:0 是 flex 子项允许收缩的前提，
    否则内容溢出可见、按钮被压扁，底部用户区被顶到容器外与状态栏重叠） */
-.settings-nav { width: 220px; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 22px 12px 14px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+.settings-nav { width: 224px; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 18px 12px 14px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
 /* 导航项不参与纵向压缩，宁可整体滚动也不压扁按钮 */
 .settings-nav > * { flex-shrink: 0; }
-.back-workspace, .nav-item { width: 100%; border: 0; background: transparent; color: var(--text-dim); text-align: left; border-radius: 9px; padding: 10px 12px; }
+.back-workspace, .nav-item { width: 100%; border: 0; background: transparent; color: var(--text-dim); text-align: left; border-radius: 8px; padding: 8px 10px; transition: background .15s ease, color .15s ease; }
+.back-workspace { margin-bottom: 4px; font-size: 13px; display: flex; align-items: center; gap: 8px; }
 .back-workspace:hover, .nav-item:hover { color: var(--text); background: var(--bg2); }
-.nav-section { margin: 28px 12px 8px; color: var(--text-faint); font-size: 11px; }
-.nav-item { display: flex; gap: 10px; align-items: center; font-size: 13px; }
-.nav-item.active { background: var(--bg3); color: var(--text); }
+.nav-section { margin: 16px 10px 4px; color: var(--text-faint); font-size: 11px; font-weight: 600; letter-spacing: 0.03em; }
+.nav-section--first { margin-top: 10px; }
+.nav-item { display: flex; gap: 9px; align-items: center; font-size: 13px; }
+.nav-item.active { background: var(--bg3); color: var(--text-bright, var(--text)); font-weight: 500; }
 .nav-spacer { flex: 1; }
 .settings-user { display: flex; align-items: center; gap: 10px; padding: 10px; color: var(--text-dim); font-size: 12px; }
 .settings-user span:nth-child(2) { flex: 1; font-weight: 600; }

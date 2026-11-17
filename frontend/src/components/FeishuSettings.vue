@@ -3,7 +3,7 @@
     <header class="feishu-header">
       <div>
         <h1>飞书集成</h1>
-        <p>在飞书里和星瑶对话：发消息驱动一轮任务，执行结果、权限审批与提问都在飞书闭环。</p>
+        <p>通过飞书机器人收发任务与处理审批。</p>
       </div>
       <button class="refresh-button" type="button" title="重新加载" @click="load">
         <AppIcon name="refresh" :size="14" />
@@ -30,7 +30,7 @@
         />
         <span>
           <b>启用飞书通道</b>
-          <small>关闭后星瑶与现在完全一致：不建立连接、不接收任何飞书消息。</small>
+          <small>关闭后不建立连接、不接收飞书消息。</small>
         </span>
       </label>
 
@@ -64,7 +64,7 @@
           @click="toggleSecret"
         >{{ showSecret ? '隐藏' : '显示' }}</button>
       </div>
-      <p class="field-hint">密钥加密保存（Windows 用 DPAPI），界面与快照都不回显明文。</p>
+      <p class="field-hint">加密保存，不回显明文。</p>
 
       <label class="field-label" for="feishu-approvers">审批白名单（open_id，逗号分隔）</label>
       <input
@@ -76,10 +76,7 @@
         placeholder="ou_xxx, ou_yyy"
         :disabled="loading || saving"
       />
-      <p class="field-hint">
-        只有名单内的人能在飞书点「批准 / 拒绝」；<b>留空则飞书侧不可审批</b>（fail-closed），
-        审批卡只做提醒，仍需回桌面端处理。
-      </p>
+      <p class="field-hint">仅名单内成员可在飞书审批；留空则仅作提醒。</p>
 
       <label class="field-label" for="feishu-notify-chat">固定推送会话 ID（可选）</label>
       <input
@@ -353,10 +350,10 @@ onMounted(load);
 /* 颜色一律走 style.css 里真实存在的语义别名：--text / --text-dim / --text-faint /
    --green / --yellow / --red / --mono。--text-1/--text-2/--text-3、--ok、--warn、
    --danger、--font-mono 在本项目没有定义，写进去等于取值透明。 */
-.feishu-settings { display: flex; flex-direction: column; gap: 14px; }
-.feishu-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.feishu-header h1 { margin: 0 0 4px; font-size: 17px; }
-.feishu-header p { margin: 0; font-size: 12.5px; color: var(--text-dim); line-height: 1.6; }
+.feishu-settings { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.feishu-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 6px; }
+.feishu-header h1 { margin: 0 0 6px; font-size: 25px; }
+.feishu-header p { margin: 0; font-size: 13px; color: var(--text-faint); line-height: 1.5; }
 .refresh-button { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); }
 
 .feishu-status { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); font-size: 12.5px; }

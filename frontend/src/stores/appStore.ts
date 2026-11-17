@@ -971,7 +971,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'decision' | 'plugins' | 'about' | 'contact' | 'disclaimer',
+    settingsSection: 'models' as 'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'pet' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer',
     // JEV 决策记录实时流：decision_recorded 事件累加未读徽章；面板按 tick 拉取刷新
     decisionUnread: 0,
     decisionEventTick: 0,

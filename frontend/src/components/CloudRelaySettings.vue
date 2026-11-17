@@ -3,10 +3,7 @@
     <header class="relay-header">
       <div class="relay-head-text">
         <h1>云中转</h1>
-        <p>
-          手机借你自己的服务器操作这台电脑。默认关闭；打开后本机主动外连，
-          <b>不需要公网 IP，也不用做端口映射</b>。
-        </p>
+        <p>通过中转服务器远程连接手机端（主动外连，无需公网 IP）。</p>
       </div>
       <button
         class="relay-icon-btn"
@@ -35,93 +32,157 @@
           data-test="cloud-relay-enabled"
           type="checkbox"
           :disabled="busy"
+          @change="onToggleEnabled"
         />
         <span>
-          <b>启用云中转</b>
-          <small>关闭时这台电脑不建立任何外连，和没配过完全一样。</small>
+          <b>连接远程（云中转）</b>
+          <small>开启后主动连接中转服务器供手机端接入。</small>
         </span>
       </label>
 
+      <!-- 一键让星瑶自动部署到服务器 -->
+      <div class="deploy-box" data-test="cloud-relay-deploy-card">
+        <div class="deploy-head">
+          <div>
+            <b>还没有配置服务器？让星瑶自动部署</b>
+            <p>填写服务器信息即可让星瑶自动部署（也可留空在对话中确认）。</p>
+          </div>
+        </div>
+        <div class="deploy-grid">
+          <input
+            v-model="deployHost"
+            data-test="deploy-host"
+            class="text-field mono"
+            type="text"
+            placeholder="服务器 IP 或域名（可选，如 129.204.50.227）"
+            :disabled="busy"
+            spellcheck="false"
+          />
+          <input
+            v-model="deployUser"
+            data-test="deploy-user"
+            class="text-field mono"
+            type="text"
+            placeholder="SSH 用户（默认 ubuntu / root）"
+            :disabled="busy"
+            spellcheck="false"
+          />
+          <input
+            v-model="deployDomain"
+            data-test="deploy-domain"
+            class="text-field mono"
+            type="text"
+            placeholder="公网域名（可选，如 example.com）"
+            :disabled="busy"
+            spellcheck="false"
+          />
+        </div>
+        <div class="deploy-actions">
+          <button
+            class="relay-btn primary"
+            type="button"
+            data-test="cloud-relay-auto-deploy"
+            :disabled="busy"
+            @click="startAutoDeploy"
+          >星瑶自动部署到服务器</button>
+          <button
+            class="relay-btn secondary"
+            type="button"
+            data-test="cloud-relay-copy-prompt"
+            :disabled="busy"
+            @click="copyDeployPrompt"
+          >复制部署提示词</button>
+        </div>
+      </div>
+
       <div class="relay-divider" />
 
-      <label class="field-label" for="relay-url">网关地址</label>
-      <input
-        id="relay-url"
-        v-model="url"
-        data-test="cloud-relay-url"
-        class="text-field mono"
-        type="text"
-        placeholder="wss://example.com/relay/device"
-        :disabled="busy"
-        spellcheck="false"
-      />
-      <p class="field-hint">
-        必须带 <code>wss://</code> 或 <code>ws://</code>；走公网用 <code>wss://</code>，
-        明文 <code>ws://</code> 只适合本机隧道。
-      </p>
+      <button
+        class="manual-toggle"
+        type="button"
+        data-test="cloud-relay-manual-toggle"
+        @click="showManual = !showManual"
+      >
+        <span>手动配置 / 高级设置</span>
+        <span class="chev" :class="{ open: showManual }">›</span>
+      </button>
 
-      <label class="field-label" for="relay-device">设备编号</label>
-      <input
-        id="relay-device"
-        v-model="deviceId"
-        data-test="cloud-relay-device-id"
-        class="text-field mono"
-        type="text"
-        placeholder="服务器创建这台设备时给出的编号"
-        :disabled="busy"
-        spellcheck="false"
-      />
-
-      <label class="field-label" for="relay-token">设备令牌</label>
-      <div class="secret-field">
+      <div v-show="showManual" class="manual-body">
+        <label class="field-label" for="relay-url">网关地址</label>
         <input
-          id="relay-token"
-          v-model="token"
-          data-test="cloud-relay-token"
+          id="relay-url"
+          v-model="url"
+          data-test="cloud-relay-url"
           class="text-field mono"
-          :type="showToken ? 'text' : 'password'"
-          :placeholder="hasToken ? '已配置；留空表示不修改' : '粘贴服务器给出的设备令牌'"
+          type="text"
+          placeholder="wss://example.com/relay/device"
           :disabled="busy"
           spellcheck="false"
         />
-        <button
-          class="relay-btn ghost"
-          type="button"
-          data-test="cloud-relay-toggle-token"
-          :disabled="busy"
-          @click="showToken = !showToken"
-        >{{ showToken ? '隐藏' : '显示' }}</button>
-      </div>
-      <p class="field-hint">
-        <span class="token-state" :class="{ ok: hasToken }">{{ hasToken ? '已配置' : '未配置' }}</span>
-        令牌加密存在本机（Windows 用 DPAPI），界面和日志都不回显明文。
-        三项要和服务器上同一台设备对得上，对不上只会一直连不通。
-      </p>
+        <p class="field-hint">公网建议使用 <code>wss://</code>。</p>
 
-      <div class="relay-actions">
-        <button
-          class="relay-btn primary"
-          type="button"
-          data-test="cloud-relay-save"
+        <label class="field-label" for="relay-device">设备编号</label>
+        <input
+          id="relay-device"
+          v-model="deviceId"
+          data-test="cloud-relay-device-id"
+          class="text-field mono"
+          type="text"
+          placeholder="服务器创建这台设备时给出的编号"
           :disabled="busy"
-          @click="save"
-        >{{ busy ? '处理中…' : '保存并连接' }}</button>
-        <button
-          class="relay-btn secondary"
-          type="button"
-          data-test="cloud-relay-reconnect"
-          :disabled="busy || !enabled"
-          title="不改配置，丢掉当前连接按原配置重拨"
-          @click="reconnect"
-        >重拨一次</button>
-        <button
-          v-if="isLive"
-          class="relay-btn danger"
-          type="button"
-          data-test="cloud-relay-disconnect"
-          :disabled="busy"
-          @click="disconnect"
-        >断开</button>
+          spellcheck="false"
+        />
+
+        <label class="field-label" for="relay-token">设备令牌</label>
+        <div class="secret-field">
+          <input
+            id="relay-token"
+            v-model="token"
+            data-test="cloud-relay-token"
+            class="text-field mono"
+            :type="showToken ? 'text' : 'password'"
+            :placeholder="hasToken ? '已配置；留空表示不修改' : '粘贴服务器给出的设备令牌'"
+            :disabled="busy"
+            spellcheck="false"
+          />
+          <button
+            class="relay-btn ghost"
+            type="button"
+            data-test="cloud-relay-toggle-token"
+            :disabled="busy"
+            @click="showToken = !showToken"
+          >{{ showToken ? '隐藏' : '显示' }}</button>
+        </div>
+        <p class="field-hint">
+          <span class="token-state" :class="{ ok: hasToken }">{{ hasToken ? '已配置' : '未配置' }}</span>
+          令牌加密保存；需与服务端设备配置一致。
+        </p>
+
+        <div class="relay-actions">
+          <button
+            class="relay-btn primary"
+            type="button"
+            data-test="cloud-relay-save"
+            :disabled="busy"
+            @click="save"
+          >{{ busy ? '处理中…' : '保存并连接' }}</button>
+          <button
+            class="relay-btn secondary"
+            type="button"
+            data-test="cloud-relay-reconnect"
+            :disabled="busy || !enabled"
+            title="不改配置，丢掉当前连接按原配置重拨"
+            @click="reconnect"
+          >重拨一次</button>
+          <button
+            v-if="isLive"
+            class="relay-btn danger"
+            type="button"
+            data-test="cloud-relay-disconnect"
+            :disabled="busy"
+            @click="disconnect"
+          >断开</button>
+        </div>
       </div>
 
       <p
@@ -184,8 +245,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
+import { useAppStore } from '../stores/appStore';
+
+const store = useAppStore();
 
 type RelaySettings = {
   enabled?: boolean;
@@ -223,6 +287,10 @@ const state = ref('disabled');
 const stats = ref({ queued: 0, dropped: 0, lost: 0 });
 const showToken = ref(false);
 const showGuide = ref(false);
+const showManual = ref(false);
+const deployHost = ref('');
+const deployUser = ref('');
+const deployDomain = ref('');
 const busy = ref(false);
 const message = ref('');
 const messageBad = ref(false);
@@ -253,6 +321,9 @@ const showMetrics = computed(
   () => isLive.value || stats.value.dropped > 0 || stats.value.lost > 0,
 );
 const urlLooksValid = computed(() => /^wss?:\/\//i.test(url.value.trim()));
+const hasConfig = computed(
+  () => Boolean(url.value.trim() && urlLooksValid.value && deviceId.value.trim() && (hasToken.value || token.value.trim())),
+);
 
 /** 配置检查清单：五步走完才算真的接通，避免「填了但没启用」这种半成品状态 */
 const checklist = computed(() => [
@@ -317,6 +388,7 @@ async function load() {
   url.value = settings.url || '';
   deviceId.value = settings.device_id || '';
   token.value = '';
+  showManual.value = Boolean(settings.url || settings.device_id || settings.has_token);
 }
 
 async function refreshStatus() {
@@ -384,6 +456,62 @@ async function disconnect() {
   }
 }
 
+async function onToggleEnabled() {
+  if (enabled.value) {
+    if (!hasConfig.value) {
+      messageBad.value = true;
+      message.value = '尚未配置远程服务器：请点击下方「星瑶自动部署到服务器」，或展开「手动配置」填写网关信息。';
+      await nextTick();
+      enabled.value = false;
+      return;
+    }
+    await save();
+    return;
+  }
+  await save();
+}
+
+function buildDeployPrompt(): string {
+  const host = deployHost.value.trim() || '（待确认：请先向我询问服务器公网 IP）';
+  const user = deployUser.value.trim() || 'ubuntu（若不同请向我确认）';
+  const domain = deployDomain.value.trim() || '（可选：若有域名请配置 HTTPS/WSS，无域名则先向我确认）';
+  return [
+    '请帮我把当前项目的云中转服务（relay_server）自动部署到我的 Linux 服务器，并完成本机 Y-code 的远程连接配置，让我能直接手机公网扫码使用。',
+    '',
+    '服务器信息：',
+    `- 服务器地址：${host}`,
+    `- SSH 用户：${user}`,
+    `- 公网域名：${domain}`,
+    '',
+    '请按以下步骤执行（注意：用户可能是通过安装包运行，本机不一定有源码或 Node/npm 环境）：',
+    '1. 如果缺少服务器 IP、SSH 登录方式（密钥或密码）或域名信息，先向我确认后再动手；',
+    '2. 定位服务端代码与静态资源（优先从当前程序运行目录 / 安装包内 `_internal/` 下的 `relay_server/`、`requirements-relay.txt`、`frontend-mobile/dist`、`frontend/dist`、`frontend/mobile-shim.js` 直接读取，无需源码或重新构建；若在源码目录且存在 `relay_server/deploy/README.md` 也可按其构建）；',
+    '3. 通过 SSH/SCP 将 `relay_server/`、`requirements-relay.txt`、移动端/桌面端静态资源及 `mobile-shim.js` 上传到服务器 `/srv/relay`；',
+    '4. 在服务器配置 Python venv、安装依赖、生成 `/etc/relay/jwt_secret` 与 `/etc/relay/relay.env`（监听 `127.0.0.1:18080`），安装并启动 systemd 服务 `relay.service`；',
+    '5. 配置 Nginx 反向代理（包含 `/m/`、`/desktop/`、`/relay/` 的 WebSocket Upgrade 与资源路径映射）和 HTTPS/WSS 证书；',
+    '6. 在服务器执行 `python -m relay_server create-device` 创建本机设备，拿到 `device_id` 与 `token`；',
+    '7. 把生成的 `wss://.../relay/device`、`device_id` 和 `token` 写入本机 Y-code 配置（`~/.ycode/config.json`，`token` 需按 `core.credentials.protect_secret` 加密或调用 `save_cloud_relay_settings`）并启用云中转，确认连接状态为 `connected` 后告诉我结果。',
+  ].join('\n');
+}
+
+function startAutoDeploy() {
+  const prompt = buildDeployPrompt();
+  store.settingsOpen = false;
+  void store.sendMessage(prompt);
+}
+
+async function copyDeployPrompt() {
+  const prompt = buildDeployPrompt();
+  try {
+    await navigator.clipboard.writeText(prompt);
+    messageBad.value = false;
+    message.value = '已复制部署提示词，粘贴发送给星瑶即可开始自动部署。';
+  } catch {
+    messageBad.value = true;
+    message.value = '复制失败，请直接点击「星瑶自动部署到服务器」。';
+  }
+}
+
 let timer: ReturnType<typeof setInterval> | undefined;
 
 onMounted(() => {
@@ -400,8 +528,9 @@ onUnmounted(() => {
 .relay-settings {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  max-width: 720px;
+  gap: 16px;
+  max-width: 860px;
+  margin: 0 auto;
 }
 
 /* ---------- 头部 ---------- */
@@ -409,19 +538,18 @@ onUnmounted(() => {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 16px;
+  margin-bottom: 4px;
 }
 .relay-head-text h1 {
-  margin: 0 0 5px;
-  font-size: 17px;
-  font-weight: 600;
+  margin: 0 0 6px;
+  font-size: 25px;
 }
 .relay-head-text p {
   margin: 0;
-  max-width: 62ch;
-  font-size: 12.5px;
-  line-height: 1.7;
-  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-faint);
 }
 .relay-head-text b {
   color: var(--text);
@@ -816,5 +944,72 @@ onUnmounted(() => {
   font-size: 11.5px;
   line-height: 1.65;
   color: var(--text-faint);
+}
+
+/* ---------- 一键部署引导 & 折叠手动配置 ---------- */
+.deploy-box {
+  margin-top: 12px;
+  padding: 13px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg1);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.deploy-head b {
+  display: block;
+  font-size: 13.5px;
+  margin-bottom: 3px;
+}
+.deploy-head p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.deploy-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+@media (max-width: 640px) {
+  .deploy-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.deploy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.manual-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 6px 0;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.manual-toggle:hover {
+  color: var(--text);
+}
+.manual-toggle .chev {
+  color: var(--text-faint);
+  font-size: 16px;
+  transition: transform 0.15s;
+}
+.manual-toggle .chev.open {
+  transform: rotate(90deg);
+}
+.manual-body {
+  display: flex;
+  flex-direction: column;
+  padding-top: 6px;
 }
 </style>

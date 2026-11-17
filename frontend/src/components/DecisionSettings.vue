@@ -4,7 +4,7 @@
     <header class="decision-header">
       <div>
         <h1>决策模型（JEV）</h1>
-        <p>接入基元律动 JEV 决策服务；默认关闭，启用后任何失败都会静默回落原有逻辑。</p>
+        <p>配置 JEV 决策服务（失败时自动回退原有逻辑）。</p>
       </div>
       <button class="refresh-button" type="button" title="重新加载" @click="reloadAll">
         <AppIcon name="refresh" :size="14" />
@@ -15,7 +15,7 @@
       <label class="switch-row">
         <input data-test="decision-enabled" v-model="enabledDraft" type="checkbox" :disabled="loading || saving" />
         <span class="switch-label">启用决策模型</span>
-        <span class="switch-hint">默认关闭；关闭时以下配置全部禁用，项目行为与未接入时一致</span>
+        <span class="switch-hint">关闭时禁用所有决策请求</span>
       </label>
 
       <div class="status-row">
@@ -80,7 +80,7 @@
         placeholder="留空 = 使用通道默认地址"
         :disabled="controlsDisabled"
       />
-      <p class="decision-note">通道决定 Key 从哪来（选谁就用谁配置里的多 Key 池）；Base URL 填写后覆盖通道地址，用于非标端点。自动匹配 = base_url 含 tokenrhythm 的第一个通道。</p>
+      <p class="decision-note">选择调用的厂商通道与 Key 池；填写 Base URL 可覆盖默认地址。</p>
 
       <div class="field-label">Key 策略</div>
       <div class="radio-row">
@@ -99,13 +99,13 @@
       <label class="switch-row">
         <input data-test="decision-shadow" v-model="shadowModeDraft" type="checkbox" :disabled="controlsDisabled" />
         <span class="switch-label">影子模式（只记录不生效）</span>
-        <span class="switch-hint">发请求并写审计，但决策结果不参与业务判断</span>
+        <span class="switch-hint">仅记录审计日志，不应用决策结果</span>
       </label>
 
       <label class="field-label" for="decision-timeout">超时（毫秒）</label>
       <div class="timeout-row">
         <input id="decision-timeout" data-test="decision-timeout" v-model.number="timeoutDraft" class="text-field timeout-input" type="number" :min="100" :max="5000" step="50" :disabled="controlsDisabled" />
-        <span class="range-hint">100 ~ 5000 ms；超时宁可不判也不拖慢主链路</span>
+        <span class="range-hint">100 ~ 5000 ms</span>
       </div>
 
       <div class="field-label">业务场景</div>
@@ -156,20 +156,20 @@
             class="decision-note warn"
             :data-test="`decision-scene-${row.scene}-live-warning`"
           >
-            正式模式：决策结果会真实影响任务行为（例如路由场景会真的换模型）；失败、超时或低置信会自动回退原逻辑，不会阻断任务。
+            正式模式：结果会真实影响任务行为（失败或超时自动回退）。
           </p>
           <p
             v-if="sceneShadowBlocked(row)"
             class="decision-note warn"
             :data-test="`decision-scene-${row.scene}-effective-hint`"
           >
-            全局影子模式已开启：本场景实际仍按「影子」运行（只记录不生效），关闭上方「影子模式」后才会正式生效。
+            全局影子模式已开启，当前仅记录不生效。
           </p>
         </div>
         <p v-if="!sceneRows.length" class="decision-note">场景列表未就绪（后端未响应或接口不可用）</p>
       </div>
       <p v-if="scenesMsg" class="decision-note" :class="{ warn: scenesFailed }" data-test="decision-scenes-msg">{{ scenesMsg }}</p>
-      <p class="decision-note">每个场景独立设置：关闭 = 零请求零记录；影子 = 真发请求、真写审计但结果丢弃；正式 = 决策结果真的参与业务判断。改一项即保存一项，无需点底部保存。</p>
+      <p class="decision-note">场景切换实时保存（关闭：不请求；影子：仅审计；正式：实际生效）。</p>
 
       <div class="field-label">决策记录</div>
       <div class="audit-row">
@@ -181,7 +181,7 @@
           {{ auditLine(item) }}
         </li>
       </ul>
-      <p class="decision-note">审计按天写入 ~/.ycode/decision_audit/YYYYMMDD.jsonl（不含 Key）；跑一次探针即可产生记录，业务场景接入后每次决策都会记录在这里。</p>
+      <p class="decision-note">审计日志按天保存在 ~/.ycode/decision_audit/。</p>
 
       <div class="decision-actions">
         <button data-test="decision-save" class="primary-button" type="button" :disabled="loading || saving" @click="saveSettings">

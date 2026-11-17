@@ -271,6 +271,58 @@ it('单入口默认移动端，切换 web远端后以单参签名请求并记住
   expect(wrapper.find('[data-test="remote-bind-modal"] h3').text()).toBe('移动端');
 });
 
+it('未连接云中转时显示「去服务器配置」按钮，点击跳转设置云中转页', async () => {
+  const get_remote_bind_qr = vi.fn(async () => ({
+    ok: true,
+    url: 'http://192.168.1.10:8765/',
+    qr: 'data:image/png;base64,LAN',
+    expires_in: 0,
+  }));
+  const get_cloud_relay_settings = vi.fn(async () => ({
+    ok: true,
+    settings: { enabled: false, connected: false },
+  }));
+  (window as any).pywebview = { api: { get_remote_bind_qr, get_cloud_relay_settings } };
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(wrapper.find('[data-test="remote-bind-cloud-setup"]').exists()).toBe(true);
+  await wrapper.find('[data-test="remote-bind-go-settings"]').trigger('click');
+
+  expect(wrapper.find('[data-test="remote-bind-modal"]').exists()).toBe(false);
+  expect(store.settingsOpen).toBe(true);
+  expect(store.settingsSection).toBe('cloud-relay');
+  wrapper.unmount();
+});
+
+it('已连接云中转时不显示「去服务器配置」引导卡片', async () => {
+  const get_remote_bind_qr = vi.fn(async () => ({
+    ok: true,
+    url: 'https://xingyaocode.cn/xy/bot/m/dev-1?token=abc',
+    qr: 'data:image/png;base64,CLOUD',
+    expires_in: 3600,
+  }));
+  const get_cloud_relay_settings = vi.fn(async () => ({
+    ok: true,
+    settings: { enabled: true, connected: true },
+  }));
+  (window as any).pywebview = { api: { get_remote_bind_qr, get_cloud_relay_settings } };
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(wrapper.find('[data-test="remote-bind-cloud-setup"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
 it('子页面打开时点击新会话会立即返回对话页面', async () => {
   delete (window as any).pywebview;
   const pinia = createPinia();

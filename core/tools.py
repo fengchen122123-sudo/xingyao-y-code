@@ -3761,12 +3761,36 @@ class SubagentManager:
                     )
                     self._terminate(task.task_id, "failed", details)
                 else:
-                    self._complete(
-                        task.task_id,
-                        _with_tool_error_footer(
-                            result, task.tool_errors, task.turn_error
-                        ),
+                    final_result = _with_tool_error_footer(
+                        result, task.tool_errors, task.turn_error
                     )
+                    review_verdict = None
+                    try:
+                        from core.task_decision_hooks import decide_subagent_review
+
+                        review_verdict = decide_subagent_review(
+                            description=task.description,
+                            subagent_type=task.subagent_type,
+                            result_text=result,
+                            tool_success_count=task.tool_success_count,
+                            tool_errors=task.tool_errors,
+                            plan_item_id=task.plan_item_id,
+                        )
+                    except Exception:
+                        review_verdict = None
+                    if review_verdict == "failed":
+                        self._terminate(
+                            task.task_id,
+                            "failed",
+                            "决策模型验收未通过：子代理结论显示未能完成核心目标",
+                        )
+                    else:
+                        if review_verdict == "incomplete":
+                            final_result += (
+                                "\n\n[JEV 验收提醒] 决策模型判定该子代理结论可能不完整，"
+                                "请核查关键交付物后决定是否继续补全或调用 plan_retry。"
+                            )
+                        self._complete(task.task_id, final_result)
             finally:
                 _tool_cache.set_current_session(None)
         finally:

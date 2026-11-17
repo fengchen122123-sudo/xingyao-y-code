@@ -141,6 +141,9 @@ common_datas = [
     ('assets/ycode.ico', 'assets'),
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
     ('assets/CHANGELOG.md', 'assets'),
+    # 云中转极简服务端与部署模板（<50KB）：让安装包版用户也能让星瑶直接读取并部署到自己的服务器
+    ('relay_server', 'relay_server'),
+    ('requirements-relay.txt', '.'),
 ] + pyfiglet_datas + tiktoken_ext_datas + pywinpty_datas \
   + openpyxl_datas + pypdf_datas + reportlab_datas
 

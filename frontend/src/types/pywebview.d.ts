@@ -1739,6 +1739,7 @@ export interface PetSkinDto {
   id: string;
   name: string;
   description: string;
+  persona?: string;
   author: string;
   source: 'builtin' | 'user' | (string & {});
   dir: string;
@@ -1746,6 +1747,24 @@ export interface PetSkinDto {
   config_path: string;
   active: boolean;
   thumbnail: string;
+}
+
+export interface PetImportPayload {
+  mode: 'images' | 'zip';
+  name: string;
+  persona?: string;
+  description?: string;
+  activate?: boolean;
+  files: Array<{ name: string; data: string }>;
+}
+
+export interface PetSkinMutationResult {
+  ok: boolean;
+  msg?: string;
+  skin?: PetSkinDto;
+  status?: PetStatusDto;
+  list?: PetSkinResult;
+  was_active?: boolean;
 }
 
 // pet_list_skins 的返回：skins 为全部可用形象（内置 + 用户目录），active 为当前激活 id，
@@ -2362,6 +2381,10 @@ export interface PyWebViewAPI {
   // set 切换后后端会按新形象重启桌宠，因此返回里带操作后的真实状态快照
   pet_list_skins(): Promise<PetSkinResult>;
   pet_set_skin(skin_id: string): Promise<PetMutationResult>;
+  pet_import_skin(payload: PetImportPayload): Promise<PetSkinMutationResult>;
+  pet_update_skin(skin_id: string, payload: { name?: string; persona?: string; description?: string }): Promise<PetSkinMutationResult>;
+  pet_delete_skin(skin_id: string): Promise<PetSkinMutationResult>;
+  pet_test_bubble(text?: string): Promise<{ ok: boolean; msg?: string }>;
   // 无聊时自己说话：get 返回开关、空闲阈值、选中模型与可选模型列表；
   // set 只接受增量（只改传进来的字段），idle_seconds 由后端钳在 60~86400 秒，
   // 所以 set 的返回里带 status，调用方需要再 get 一次才能拿到真正生效的值

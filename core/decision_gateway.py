@@ -25,11 +25,18 @@ from core import decision_service
 # 模块级 logger（标准库，不违反「只依赖 decision_service + 标准库」的约束）
 logger = logging.getLogger(__name__)
 
-# 允许接入的四个业务场景（与 DEFAULT_CONFIG["scenes"] 对齐）
+# 允许接入的四个配置型业务场景（与 DEFAULT_CONFIG["scenes"] 对齐）
 SCENES = ("router", "secretary", "search", "safety")
+
+# 任务执行期的自动决策场景：全局 enabled=True 时自动参与（不干预模型路由），
+# 默认遵循全局 shadow_mode，也可在 decision.json 的 scenes 里显式覆盖。
+TASK_SCENES = ("loop_guard", "subagent_review", "plan_recovery", "memory_filter")
+ALL_SCENES = SCENES + TASK_SCENES
 
 # 单题决策的超时兜底：真实决策宁可不用，也不能拖慢主流程
 DEFAULT_TIMEOUT_MS = 250
+# 任务执行期决策超时：实测 JEV 单次约 600~900ms，留足余量以免每次超时回退
+TASK_DEFAULT_TIMEOUT_MS = 1500
 
 # noul 题缺省阈值（配置缺失时使用）
 DEFAULT_THRESHOLD = 0.5
@@ -109,8 +116,8 @@ def _resolve_threshold(scene_cfg: dict, override=None) -> float:
     return value
 
 
-def _resolve_timeout_ms(scene_cfg: dict, override) -> int:
-    """超时优先级：调用方 override > scene.timeout_ms > 250ms，再钳制到服务边界。
+def _resolve_timeout_ms(scene_cfg: dict, override, default_timeout_ms: int = DEFAULT_TIMEOUT_MS) -> int:
+    """超时优先级：调用方 override > scene.timeout_ms > default_timeout_ms，再钳制到服务边界。
 
     MIN/MAX 现取 ``decision_service`` 上的常量（便于测试替换与统一维护）。
     """
@@ -118,11 +125,11 @@ def _resolve_timeout_ms(scene_cfg: dict, override) -> int:
     if value is None:
         value = scene_cfg.get("timeout_ms")
     if value is None or isinstance(value, bool):
-        value = DEFAULT_TIMEOUT_MS
+        value = default_timeout_ms
     try:
         timeout = int(value)
     except (TypeError, ValueError):
-        timeout = DEFAULT_TIMEOUT_MS
+        timeout = default_timeout_ms
     low = decision_service.MIN_TIMEOUT_MS
     high = decision_service.MAX_TIMEOUT_MS
     return max(low, min(high, timeout))
@@ -272,7 +279,7 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
     """
     try:
         # 1) 场景与题目形状先判（不做任何 IO）
-        if not isinstance(scene, str) or scene not in SCENES:
+        if not isinstance(scene, str) or scene not in ALL_SCENES:
             return None
         if not isinstance(question, dict):
             return None
@@ -284,9 +291,17 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
         cfg = decision_service.load_decision_config()
         if not isinstance(cfg, dict) or not bool(cfg.get("enabled")):
             return None
+        is_task_scene = scene in TASK_SCENES
         scene_cfg = _scene_config(cfg, scene)
-        if scene_cfg is None or not bool(scene_cfg.get("enabled")):
-            return None
+        if is_task_scene:
+            # 任务执行期场景：全局启用即自动开启，除非 decision.json 显式设为 enabled=false
+            if scene_cfg is not None and not bool(scene_cfg.get("enabled", True)):
+                return None
+            effective_scene_cfg = scene_cfg if scene_cfg is not None else {}
+        else:
+            if scene_cfg is None or not bool(scene_cfg.get("enabled")):
+                return None
+            effective_scene_cfg = scene_cfg
 
         # 2.5) 题面规范化：上游 choice 题要求 criteria 是「选项名 → 描述」的对象，
         #      数组/缺失一律 422。这里统一校正，校正不出任何选项就不发这次请求。
@@ -297,8 +312,23 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
                 return None
 
         # 3) shadow：照旧发请求并写审计，但结果丢弃（影子只做观测）
-        shadow = bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True))
-        effective_timeout = _resolve_timeout_ms(scene_cfg, timeout_ms)
+        if is_task_scene:
+            shadow = bool(cfg.get("shadow_mode")) or bool(effective_scene_cfg.get("shadow", False))
+            raw_global_timeout = cfg.get("timeout_ms")
+            if (
+                not isinstance(raw_global_timeout, bool)
+                and isinstance(raw_global_timeout, (int, float))
+                and int(raw_global_timeout) > TASK_DEFAULT_TIMEOUT_MS
+            ):
+                fallback_timeout = int(raw_global_timeout)
+            else:
+                fallback_timeout = TASK_DEFAULT_TIMEOUT_MS
+            effective_timeout = _resolve_timeout_ms(
+                effective_scene_cfg, timeout_ms, default_timeout_ms=fallback_timeout
+            )
+        else:
+            shadow = bool(cfg.get("shadow_mode")) or bool(effective_scene_cfg.get("shadow", True))
+            effective_timeout = _resolve_timeout_ms(effective_scene_cfg, timeout_ms)
         result = decision_service.ask_decision(
             scene=scene,
             state=state,
@@ -316,7 +346,7 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
         if question_type == "choice":
             picked = _pick_choice(answer, options)
         else:
-            picked = _pick_noul(answer, _resolve_threshold(scene_cfg, threshold))
+            picked = _pick_noul(answer, _resolve_threshold(effective_scene_cfg, threshold))
         if picked is _MISSING:
             return None
 

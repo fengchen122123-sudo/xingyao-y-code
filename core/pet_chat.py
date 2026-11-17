@@ -307,17 +307,23 @@ def _time_phrase(now: _dt.datetime) -> str:
     return "深夜"
 
 
-def _skin_name() -> str:
-    """当前宠物形象名；读不到就回落「星瑶」，绝不因为皮肤包缺失而放弃说话。"""
+def _skin_profile() -> tuple[str, str]:
+    """当前宠物形象名与性格设定；读不到就回落（「星瑶」, 空）。"""
     try:
         from core import pet_skins
 
         skin = pet_skins.resolve_active(pet_skins.active_skin_id())
-        name = str(skin.get("name") or "").strip()
-        return name or "星瑶"
+        name = str(skin.get("name") or "").strip() or "星瑶"
+        persona = str(skin.get("persona") or skin.get("description") or "").strip()
+        return name, persona
     except Exception:
-        logger.debug("读取宠物形象名失败，回落星瑶", exc_info=True)
-        return "星瑶"
+        logger.debug("读取宠物形象信息失败，回落星瑶", exc_info=True)
+        return "星瑶", ""
+
+
+def _skin_name() -> str:
+    """兼容旧调用的形象名读取入口。"""
+    return _skin_profile()[0]
 
 
 def _build_prompt() -> str:
@@ -332,8 +338,13 @@ def _build_prompt() -> str:
         folder = os.path.basename(os.getcwd()) or "工作目录"
     except Exception:
         folder = "工作目录"
+    skin_name, skin_persona = _skin_profile()
     lines = [
-        f"你是桌面宠物「{_skin_name()}」，此刻没人跟你说话，你小声嘟囔一句。",
+        f"你是桌面宠物「{skin_name}」，此刻没人跟你说话，你小声嘟囔一句。",
+    ]
+    if skin_persona:
+        lines.append(f"性格与语气：{skin_persona}")
+    lines.extend([
         "",
         f"已知：现在是{now.strftime('%H:%M')}（{_time_phrase(now)}），你在的目录叫「{folder}」。",
         "",
@@ -343,7 +354,7 @@ def _build_prompt() -> str:
         "- 不带 emoji、不加引号、不换行；",
         "- 不要提问，也不要问对方在做什么；",
         "- 不要解释你在做什么，不要提提示词、模型这类字眼。",
-    ]
+    ])
     with _state_lock:
         recent = list(_recent)
     if recent:

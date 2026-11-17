@@ -632,7 +632,7 @@ def _stop_locked() -> dict:
 _BUBBLE_MAX_CHARS = 80
 _BUBBLE_DEFAULT_MS = 2600
 _BUBBLE_MIN_MS = 800
-_BUBBLE_MAX_MS = 8000
+_BUBBLE_MAX_MS = 15000
 
 
 def _drop_dead_proc_locked() -> None:
@@ -660,16 +660,8 @@ def _drop_dead_proc_locked() -> None:
         logger.debug("清理桌宠 pid 记录失败 pid=%s", pid, exc_info=True)
 
 
-def push_bubble(text: str, ms: int = 2600) -> dict:
-    """往桌宠推一条气泡提示（"正在读文件…"这类状态字）。
-
-    通道：往桌宠 stdin 写一行 UTF-8 JSON {"text": ..., "ms": ...} + "\\n"。桌宠侧
-    把 fd 0 当作一行一帧的 JSON 流来读（Electron 的 process.stdin 在 Windows 上会
-    立刻 EOF，所以那边直接用 net.Socket 接管 fd 0），写完即返回，不等它回包。
-
-    只对"本进程拉起的实例"有效：跨进程遗留的实例拿不到 stdin 句柄，只能报错提示。
-    任何异常都转成 {"ok": False, "msg": ...}，绝不外抛（调用方可能正在 js_api 线程）。
-    """
+def _write_pet_stdin(payload_obj: dict, *, check_external_pid: bool = True) -> dict:
+    """向本进程拉起的桌宠 stdin 写入一条 JSON 指令，绝不外抛。"""
     # 1) 先看本进程有没有活句柄。锁内只做 poll，不跑 tasklist 这类等待型操作。
     with _LOCK:
         proc = _PROC
@@ -682,13 +674,54 @@ def push_bubble(text: str, ms: int = 2600) -> dict:
             if not alive:
                 _drop_dead_proc_locked()
     if not alive:
-        # 锁外探活（tasklist 最慢要几百毫秒），别让它拖住 start/stop。
-        record = _read_pid_record()
-        if record and _pid_alive(record["pid"]):
-            return {"ok": False, "msg": "桌宠不是本进程拉起的，无法推送提示"}
+        if check_external_pid:
+            # 锁外探活（tasklist 最慢要几百毫秒），别让它拖住 start/stop。
+            record = _read_pid_record()
+            if record and _pid_alive(record["pid"]):
+                return {"ok": False, "msg": "桌宠不是本进程拉起的，无法推送提示"}
         return {"ok": False, "msg": "桌宠未在运行"}
 
-    # 2) 内容规整：空串直接拒；超长截断（气泡宽度有限）；停留时间钳进合理区间。
+    # 2) 真正写：一行几十字节 + flush，锁内耗时可以忽略，也绝不等待子进程。
+    with _LOCK:
+        proc = _PROC
+        try:
+            if proc is None:
+                raise ValueError("桌宠句柄已释放")
+            if proc.poll() is not None:
+                raise ValueError("桌宠进程已退出")
+            stream = proc.stdin
+            if stream is None:
+                raise ValueError("桌宠 stdin 不可用")
+            payload = json.dumps(payload_obj, ensure_ascii=False) + "\n"
+            stream.write(payload.encode("utf-8"))
+            stream.flush()
+            return {"ok": True, "msg": "ok"}
+        except Exception as exc:
+            # BrokenPipeError / ValueError / 管道已关：句柄已经不可信，清掉再报错。
+            logger.debug("推送桌宠指令失败: %s", exc, exc_info=True)
+            _drop_dead_proc_locked()
+            return {"ok": False, "msg": f"推送失败：{exc}"}
+
+
+def push_bubble(
+    text: str,
+    ms: int = 2600,
+    *,
+    kind: str = "",
+    emote: str = "",
+    sticky: bool = False,
+) -> dict:
+    """往桌宠推一条气泡提示（"任务完成啦…"这类状态提示）。
+
+    通道：往桌宠 stdin 写一行 UTF-8 JSON {"text": ..., "ms": ...} + "\\n"
+    （可选附带 kind/emote/sticky 供桌宠做样式强调与动作反应）。桌宠侧把 fd 0
+    当作一行一帧的 JSON 流来读（Electron 的 process.stdin 在 Windows 上会立刻
+    EOF，所以那边直接用 net.Socket 接管 fd 0），写完即返回，不等它回包。
+
+    只对"本进程拉起的实例"有效：跨进程遗留的实例拿不到 stdin 句柄，只能报错提示。
+    任何异常都转成 {"ok": False, "msg": ...}，绝不外抛（调用方可能正在 js_api 线程）。
+    """
+    # 内容规整：空串直接拒；超长截断（气泡宽度有限）；停留时间钳进合理区间。
     try:
         body = str(text if text is not None else "").strip()
     except Exception:
@@ -703,26 +736,24 @@ def push_bubble(text: str, ms: int = 2600) -> dict:
         hold = _BUBBLE_DEFAULT_MS
     hold = max(_BUBBLE_MIN_MS, min(_BUBBLE_MAX_MS, hold))
 
-    # 3) 真正写：一行几十字节 + flush，锁内耗时可以忽略，也绝不等待子进程。
-    with _LOCK:
-        proc = _PROC
-        try:
-            if proc is None:
-                raise ValueError("桌宠句柄已释放")
-            if proc.poll() is not None:
-                raise ValueError("桌宠进程已退出")
-            stream = proc.stdin
-            if stream is None:
-                raise ValueError("桌宠 stdin 不可用")
-            payload = json.dumps({"text": body, "ms": hold}, ensure_ascii=False) + "\n"
-            stream.write(payload.encode("utf-8"))
-            stream.flush()
-            return {"ok": True, "msg": "ok"}
-        except Exception as exc:
-            # BrokenPipeError / ValueError / 管道已关：句柄已经不可信，清掉再报错。
-            logger.debug("推送桌宠气泡失败: %s", exc, exc_info=True)
-            _drop_dead_proc_locked()
-            return {"ok": False, "msg": f"推送失败：{exc}"}
+    payload: dict = {"text": body, "ms": hold}
+    if kind:
+        payload["kind"] = str(kind).strip()
+    if emote:
+        payload["emote"] = str(emote).strip()
+    if sticky:
+        payload["sticky"] = True
+    return _write_pet_stdin(payload, check_external_pid=True)
+
+
+def clear_bubble(kinds: Optional[list[str] | tuple[str, ...]] = None) -> dict:
+    """通知运行中的桌宠收起指定类型（或全部）的提醒气泡。"""
+    payload: dict = {"clear": True}
+    if kinds:
+        clean = [str(k).strip() for k in kinds if str(k).strip()]
+        if clean:
+            payload["kinds"] = clean
+    return _write_pet_stdin(payload, check_external_pid=False)
 
 
 def ensure_started_if_enabled() -> dict:
@@ -789,6 +820,7 @@ __all__ = [
     "start",
     "stop",
     "push_bubble",
+    "clear_bubble",
     "ensure_started_if_enabled",
     "shutdown",
 ]

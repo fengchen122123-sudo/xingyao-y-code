@@ -39,7 +39,7 @@
         type="button"
         @click="importThemeZip"
       >导入主题 ZIP…</button>
-      <p class="list-hint">内置主题只能启用或复制；用户主题支持编辑、重命名、删除和导出。</p>
+      <p class="list-hint">内置主题只读，可复制后自定义。</p>
     </aside>
 
     <section v-if="draft" class="theme-editor">
@@ -125,14 +125,7 @@
           @commit="onUnifyCommit"
           @validity="unifyValid = $event"
         />
-        <p class="unify-hint">
-          这里选一个颜色 → 一次性写入 <b>4 个全局文字令牌</b>（主文字 / 高亮文字 /
-          次级文字 / 弱化文字）+ <b>7 个分区的文字色</b>，整个界面的文字随之统一。
-          之后想单独微调某一处，照常改对应页签即可；再点这里的颜色会再次全部覆盖。
-          <br />
-          不含彩色按钮上的前景色（如蓝色按钮的白字）—— 跟着变会出现"绿字压蓝底"
-          之类的可读性问题，故刻意不动。
-        </p>
+        <p class="unify-hint">一键同步全局与各分区文字颜色（不含彩色按钮前景）。</p>
       </div>
 
       <ThemeRegionEditor

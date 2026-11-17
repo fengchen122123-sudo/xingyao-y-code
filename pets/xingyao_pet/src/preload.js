@@ -20,5 +20,6 @@ contextBridge.exposeInMainWorld("petAPI", {
   getSkin: () => ipcRenderer.invoke("pet:get-skin"),
   // 右键菜单的互动入口：菜单只发语义，动画与台词由渲染层执行
   onEmote: (cb) => ipcRenderer.on("pet:emote", (_e, kind) => cb(kind)),
-  onBubble: (cb) => ipcRenderer.on("pet:bubble", (_e, text, ms) => cb(text, ms))
+  onBubble: (cb) => ipcRenderer.on("pet:bubble", (_e, text, ms, meta) => cb(text, ms, meta)),
+  onBubbleClear: (cb) => ipcRenderer.on("pet:bubble-clear", (_e, kinds) => cb(kinds))
 });

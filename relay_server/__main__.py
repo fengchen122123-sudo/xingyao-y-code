@@ -49,6 +49,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         desktop_dir=os.environ.get("RELAY_DESKTOP_DIR") or None,
         mobile_dir=os.environ.get("RELAY_MOBILE_DIR") or None,
         shim_path=os.environ.get("RELAY_SHIM_PATH") or None,
+        enroll_key=os.environ.get("RELAY_ENROLL_KEY") or None,
     )
     host = os.environ.get("RELAY_BIND") or "127.0.0.1"
     port = int(os.environ.get("RELAY_PORT") or "18080")

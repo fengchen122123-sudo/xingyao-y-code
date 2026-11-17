@@ -25,8 +25,19 @@ def connect(path) -> sqlite3.Connection:
             token_hash TEXT NOT NULL,
             revoked INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
-            last_seen INTEGER
+            last_seen INTEGER,
+            device_code TEXT
         )
+        """
+    )
+    # 兼容既有库：补齐 device_code 列与唯一索引（NULL 允许多个，仅约束非空设备编码）
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(devices)").fetchall()}
+    if "device_code" not in cols:
+        conn.execute("ALTER TABLE devices ADD COLUMN device_code TEXT")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_device_code
+        ON devices(device_code) WHERE device_code IS NOT NULL
         """
     )
     conn.commit()

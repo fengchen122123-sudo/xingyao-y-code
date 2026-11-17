@@ -592,15 +592,30 @@ function setupStdinBridge() {
     if (!line) return;
     let msg;
     try { msg = JSON.parse(line); } catch { return; }   // 非法 JSON：忽略该行
-    if (!msg || typeof msg.text !== "string") return;
+    if (!msg || typeof msg !== "object") return;
+    if (msg.clear === true) {
+      const kinds = Array.isArray(msg.kinds)
+        ? msg.kinds.map((k) => String(k || "").trim()).filter(Boolean)
+        : null;
+      if (win && win.webContents && !win.webContents.isDestroyed()) {
+        win.webContents.send("pet:bubble-clear", kinds);
+        gateLog(`[gate] BUBBLE-CLEAR ${kinds ? kinds.join(",") : "*"}`);
+      }
+      return;
+    }
+    if (typeof msg.text !== "string") return;
     const text = msg.text.trim().slice(0, 80);          // 气泡宽度有限，过长截断
     if (!text) return;
     let ms = Number(msg.ms);
     if (!Number.isFinite(ms)) ms = 2600;                 // 缺省显示时长
-    ms = Math.min(Math.max(Math.round(ms), 800), 8000);  // 钳到合理区间
+    ms = Math.min(Math.max(Math.round(ms), 800), 15000); // 钳到合理区间
+    const meta = {};
+    if (typeof msg.kind === "string" && msg.kind.trim()) meta.kind = msg.kind.trim();
+    if (typeof msg.emote === "string" && msg.emote.trim()) meta.emote = msg.emote.trim();
+    if (msg.sticky === true) meta.sticky = true;
     if (win && win.webContents && !win.webContents.isDestroyed()) {
-      win.webContents.send("pet:bubble", text, ms);
-      gateLog(`[gate] BUBBLE ${text}`);
+      win.webContents.send("pet:bubble", text, ms, meta);
+      gateLog(`[gate] BUBBLE ${meta.kind ? `[${meta.kind}] ` : ""}${text}`);
     }
   }
 

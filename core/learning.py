@@ -832,6 +832,14 @@ def run_turn_learning(session, manager, model_cfg=None) -> bool:
             _release_learning(session, claim)
             return False
 
+        # JEV memory_filter：闲时后台过滤一次性噪音记忆，不拖慢前台任务
+        try:
+            from core.task_decision_hooks import filter_extracted_learning
+
+            extracted = filter_extracted_learning(extracted)
+        except Exception:
+            pass
+
         counts = apply_learning(extracted)
         # 只要模型给出了可解析结果就记账（哪怕各类别都是空数组——「看过但没有
         # 新东西」也是一次完整学习），否则每轮都会重复请求模型。

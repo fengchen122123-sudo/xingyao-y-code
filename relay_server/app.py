@@ -14,19 +14,31 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .auth import issue_remote_token, read_remote_token
 from .db import connect
-from .registry import OUTBOUND_LIMIT, DeviceSweeper, RelayRegistry, hash_token
+from .registry import (
+    OUTBOUND_LIMIT,
+    DeviceAlreadyEnrolledError,
+    DeviceSweeper,
+    RelayRegistry,
+    hash_token,
+)
 
 
 class DeviceTokenBody(BaseModel):
     device_id: str
     device_token: str
+
+
+class DeviceEnrollBody(BaseModel):
+    device_code: str
+    name: str | None = None
+    enroll_key: str | None = None
 
 
 def _namespace_rpc(relay: RelayRegistry, device_id: str, app_key: str, raw: str) -> dict | None:
@@ -193,29 +205,44 @@ def create_app(
     mobile_dir=None,
     shim_path=None,
     ticket_rate: tuple[int, float] = (6, 600),
+    enroll_key: str | None = None,
+    enroll_rate: tuple[int, float] = (10, 60),
 ) -> FastAPI:
     database = connect(db_path)
     relay = RelayRegistry()
     ticket_max, ticket_window = int(ticket_rate[0]), float(ticket_rate[1])
     _ticket_hits: dict[str, list[float]] = {}
     _ticket_lock = threading.Lock()
+    enroll_max, enroll_window = int(enroll_rate[0]), float(enroll_rate[1])
+    _enroll_hits: dict[str, list[float]] = {}
+    _enroll_lock = threading.Lock()
+    expected_enroll_key = str(enroll_key or "").strip() or None
+
+    def _rate_allowed(
+        hits_map: dict[str, list[float]],
+        lock: threading.Lock,
+        key: str,
+        now: float,
+        limit: int,
+        window: float,
+    ) -> bool:
+        with lock:
+            for k in list(hits_map):
+                stamps = [stamp for stamp in hits_map[k] if now - stamp < window]
+                if stamps:
+                    hits_map[k] = stamps
+                else:
+                    del hits_map[k]
+            hits = hits_map.get(key, [])
+            if len(hits) >= limit:
+                return False
+            hits.append(now)
+            hits_map[key] = hits
+            return True
 
     def _ticket_allowed(device_id: str, now: float) -> bool:
         """同一设备窗口内最多换票 ticket_max 次：正常用法是「用户打开二维码」级别。"""
-        with _ticket_lock:
-            # 顺带清理过期窗口键，防止历史 device_id 把表无限撑大
-            for key in list(_ticket_hits):
-                stamps = [stamp for stamp in _ticket_hits[key] if now - stamp < ticket_window]
-                if stamps:
-                    _ticket_hits[key] = stamps
-                else:
-                    del _ticket_hits[key]
-            hits = _ticket_hits.get(device_id, [])
-            if len(hits) >= ticket_max:
-                return False
-            hits.append(now)
-            _ticket_hits[device_id] = hits
-            return True
+        return _rate_allowed(_ticket_hits, _ticket_lock, device_id, now, ticket_max, ticket_window)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -262,6 +289,30 @@ def create_app(
         if not _ticket_allowed(body.device_id, time.time()):
             raise HTTPException(status_code=429, detail="换票过于频繁")
         return issue_remote_token(jwt_secret, body.device_id)
+
+    @app.post("/api/relay/device-enroll")
+    def relay_device_enroll(body: DeviceEnrollBody, request: Request):
+        """客户端携带唯一设备编码申请独立 device_id 与设备令牌（不同设备不同令牌）。"""
+        if expected_enroll_key is not None and not secrets.compare_digest(
+            expected_enroll_key, str(body.enroll_key or "").strip()
+        ):
+            raise HTTPException(status_code=401, detail="注册密钥无效")
+        client_ip = request.client.host if request.client else "unknown"
+        if not _rate_allowed(
+            _enroll_hits, _enroll_lock, client_ip, time.time(), enroll_max, enroll_window
+        ):
+            raise HTTPException(status_code=429, detail="注册过于频繁")
+        try:
+            device_id, token = relay.enroll_device(database, body.device_code, body.name)
+        except DeviceAlreadyEnrolledError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "device_id": device_id,
+            "token": token,
+            "device_code": str(body.device_code or "").strip(),
+        }
 
     @app.websocket("/relay/device")
     async def relay_device(websocket: WebSocket):

@@ -158,7 +158,7 @@
     }).catch(() => {});
   }
 
-  function setState(next) {
+  function setState(next, suppressBubble = false) {
     if (!config) return;
     const spec = config.animations[next];
     if (!spec) return;
@@ -187,8 +187,12 @@
         void breathEl.offsetWidth;          // 强制重排，重启动画
         breathEl.classList.add("landing");  // 落地冲击用几何弹性表达
       }
-      if (next === "sleep") { sleepEnteredAt = performance.now(); showBubble("Zzz…"); }
-      else if (lines[next] && lines[next].length && !quiet) showBubble(pick(lines[next]));
+      if (!suppressBubble && !currentBubbleSticky) {
+        if (next === "sleep") { sleepEnteredAt = performance.now(); showBubble("Zzz…"); }
+        else if (lines[next] && lines[next].length && !quiet) showBubble(pick(lines[next]));
+      } else if (next === "sleep") {
+        sleepEnteredAt = performance.now();
+      }
       applyBreath();
       applyFacing();
     }
@@ -319,22 +323,22 @@
         else setState("idle");
       }
     }
-    // idle 超时入睡
-    if (state === "idle" && behaviors.idleTimeoutSec) {
+    // idle 超时入睡（正显示常驻待确认提示时保持清醒等待）
+    if (state === "idle" && !currentBubbleSticky && behaviors.idleTimeoutSec) {
       if (now - sleepSince > behaviors.idleTimeoutSec * 1000) setState("sleep");
     }
     // 睡眠随机自动醒
     if (state === "sleep" && behaviors.sleepAutoWakeSec) {
       if (now - sleepEnteredAt > behaviors.sleepAutoWakeSec * 1000) setState("idle");
     }
-    // 闲置气泡（安静模式或间隔为 0 时抑制）
+    // 闲置气泡（安静模式、间隔为 0 或正显示常驻待确认提示时抑制）
     const idleBubbleMs = (behaviors.idleBubbleSec ?? 8) * 1000;
-    if (state === "idle" && !quiet && idleBubbleMs > 0 && now - lastBubbleAt > idleBubbleMs && lines.idle && lines.idle.length) {
+    if (state === "idle" && !quiet && !currentBubbleSticky && idleBubbleMs > 0 && now - lastBubbleAt > idleBubbleMs && lines.idle && lines.idle.length) {
       showBubble(pick(lines.idle));
       lastBubbleAt = now;
     }
-    // 自主行为：散步 + 伸懒腰 / 坐下 / 暖手 / 张望（关闭动效或减弱动态时不触发）
-    if (state === "idle" && animate && !reducedMotion && now >= autonomousCooldownUntil) {
+    // 自主行为：散步 + 伸懒腰 / 坐下 / 暖手 / 张望（关闭动效、减弱动态或待确认时抑制）
+    if (state === "idle" && !currentBubbleSticky && animate && !reducedMotion && now >= autonomousCooldownUntil) {
       if (behaviors.walkProbPerMinute && Math.random() < behaviors.walkProbPerMinute * (dt / 60000)) {
         setState("walk");
       } else if (behaviors.idleActionProbPerMinute && Math.random() < behaviors.idleActionProbPerMinute * (dt / 60000)) {
@@ -354,6 +358,9 @@
 
   // ---------- 气泡 ----------
   let bubbleTimer = null;
+  let currentBubbleKind = "";
+  let currentBubbleSticky = false;
+  const BUBBLE_KIND_CLASSES = ["kind-finish", "kind-error", "kind-question", "kind-permission", "kind-cancel"];
   const usedLines = [];
   function pick(arr) {
     if (usedLines.length >= arr.length) usedLines.length = 0;
@@ -362,14 +369,59 @@
     usedLines.push(idx);
     return arr[idx];
   }
-  function showBubble(text, msOverride) {
+  function triggerNotifyEmote(emote) {
+    if (!animate || reducedMotion || state === "drag" || state === "drop") return;
+    markActivity();
+    const target = emote && config && config.animations && config.animations[emote] && frames[emote] && frames[emote].length
+      ? emote
+      : "";
+    if (target) {
+      if (state === target) {
+        frameIdx = 0;
+        lastFrameAt = 0;
+        stateEnteredAt = performance.now();
+      } else {
+        setState(target, true);
+      }
+    } else if (state === "sleep") {
+      setState("idle", true);
+    }
+    bounceFeedback();
+  }
+  function clearBubble(kinds) {
+    if (Array.isArray(kinds) && kinds.length > 0 && !kinds.includes(currentBubbleKind)) return;
+    clearTimeout(bubbleTimer);
+    bubbleTimer = null;
+    currentBubbleKind = "";
+    currentBubbleSticky = false;
+    bubbleEl.classList.remove("show", "sticky", ...BUBBLE_KIND_CLASSES);
+  }
+  function showBubble(text, msOverride, meta) {
     if (!config || !config.bubble || !config.bubble.enabled) return;
+    const info = meta && typeof meta === "object" ? meta : {};
+    const kind = typeof info.kind === "string" ? info.kind.trim() : "";
+    const sticky = info.sticky === true;
+    bubbleEl.classList.remove("sticky", ...BUBBLE_KIND_CLASSES);
+    if (kind && BUBBLE_KIND_CLASSES.includes(`kind-${kind}`)) {
+      bubbleEl.classList.add(`kind-${kind}`);
+    }
+    if (sticky) bubbleEl.classList.add("sticky");
+    currentBubbleKind = kind;
+    currentBubbleSticky = sticky;
     bubbleEl.textContent = text;
     bubbleEl.classList.add("show");
     clearTimeout(bubbleTimer);
-    // msOverride：外部（父进程 stdin 通道）指定的显示时长，缺省回落到 config
-    const holdMs = (typeof msOverride === "number" && msOverride > 0 ? msOverride : (config.bubble.showMs || 2500));
-    bubbleTimer = setTimeout(() => bubbleEl.classList.remove("show"), holdMs);
+    bubbleTimer = null;
+    if (info.emote) triggerNotifyEmote(info.emote);
+    if (!sticky) {
+      // msOverride：外部（父进程 stdin 通道）指定的显示时长，缺省回落到 config
+      const holdMs = (typeof msOverride === "number" && msOverride > 0 ? msOverride : (config.bubble.showMs || 2500));
+      bubbleTimer = setTimeout(() => {
+        currentBubbleKind = "";
+        currentBubbleSticky = false;
+        bubbleEl.classList.remove("show", "sticky", ...BUBBLE_KIND_CLASSES);
+      }, holdMs);
+    }
   }
 
   // ---------- 拖拽与点击（focusable:false 下走 ipc 移窗） ----------
@@ -409,6 +461,7 @@
     if (moved) {
       setState("drop"); // 落地 → next: idle
     } else {
+      if (currentBubbleSticky) clearBubble();
       setTimeout(() => {
         if (state === "drag" || state === "drop") return;
         const isSleep = state === "sleep";
@@ -551,8 +604,11 @@
     });
     window.petAPI.onQuietChanged((on) => { quiet = on; });
     window.petAPI.onAnimateChanged((on) => setAnimate(on));
-    // 外部气泡通道：父进程经 stdin 发来的气泡，自带显示时长
-    window.petAPI.onBubble((text, ms) => showBubble(text, ms));
+    // 外部气泡通道：父进程经 stdin 发来的气泡，自带显示时长与样式/动作语义
+    window.petAPI.onBubble((text, ms, meta) => showBubble(text, ms, meta));
+    if (typeof window.petAPI.onBubbleClear === "function") {
+      window.petAPI.onBubbleClear((kinds) => clearBubble(kinds));
+    }
     window.petAPI.onPetSleep(() => {
       markActivity();
       setState(state === "sleep" ? "idle" : "sleep");

@@ -83,6 +83,10 @@ __all__ = [
     "resolve_active",
     "active_skin_id",
     "set_active_skin",
+    "import_skin_from_images",
+    "import_skin_from_zip",
+    "update_skin_meta",
+    "delete_skin",
 ]
 
 
@@ -287,6 +291,7 @@ def _builtin_entry(active_id: str) -> Dict[str, Any]:
         "id": BUILTIN_SKIN_ID,
         "name": BUILTIN_SKIN_NAME,
         "description": BUILTIN_SKIN_DESCRIPTION,
+        "persona": "",
         "author": BUILTIN_SKIN_AUTHOR,
         "source": "builtin",
         "dir": str(root),
@@ -348,6 +353,7 @@ def _user_entry(pkg_dir: Path, active_id: str) -> Optional[Dict[str, Any]]:
         "id": pkg_dir.name,
         "name": _meta_str(meta, "name", pkg_dir.name),
         "description": _meta_str(meta, "description", ""),
+        "persona": _meta_str(meta, "persona", ""),
         "author": _meta_str(meta, "author", ""),
         "source": "user",
         "dir": str(pkg_dir),
@@ -413,6 +419,7 @@ def _fallback_entry(active_id: str) -> Dict[str, Any]:
         "id": BUILTIN_SKIN_ID,
         "name": BUILTIN_SKIN_NAME,
         "description": BUILTIN_SKIN_DESCRIPTION,
+        "persona": "",
         "author": BUILTIN_SKIN_AUTHOR,
         "source": "builtin",
         "dir": "",
@@ -497,3 +504,286 @@ def set_active_skin(skin_id: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.warning("保存宠物皮肤 %r 失败: %s", key, exc)
         return False
+
+
+# ---------- 用户桌宠导入 / 编辑 / 删除 ----------
+_IMPORT_FRAME_MAX_PX = 256
+_IMPORT_MAX_GIF_FRAMES = 60
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def _safe_skin_id(name: str, root: Path) -> str:
+    """把展示名转成安全且不重名的目录 id。"""
+    import re
+    import time
+
+    ascii_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", (name or "").strip()).strip("_").lower()
+    base = ascii_slug[:32] if ascii_slug else f"pet_{int(time.time())}"
+    if base == BUILTIN_SKIN_ID:
+        base = f"{base}_custom"
+    candidate = base
+    idx = 2
+    while (root / candidate).exists():
+        candidate = f"{base}_{idx}"
+        idx += 1
+    return candidate
+
+
+def _write_pet_json(pkg_dir: Path, payload: Dict[str, Any]) -> None:
+    """写回宠物包 pet.json（UTF-8 美化输出）。"""
+    path = pkg_dir / "pet.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _save_pil_frame(img: Any, out_path: Path) -> None:
+    """将 PIL Image 统一转 RGBA、过大则等比缩放到 ≤256px 并写 PNG。"""
+    from PIL import Image
+
+    frame = img.convert("RGBA")
+    if max(frame.size) > _IMPORT_FRAME_MAX_PX:
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        frame.thumbnail((_IMPORT_FRAME_MAX_PX, _IMPORT_FRAME_MAX_PX), resample)
+    frame.save(out_path, format="PNG")
+
+
+def _convert_images_to_frames(images: List[bytes], idle_dir: Path) -> int:
+    """把一组图片字节（含 GIF 动图）写为 idle_dir/frame_NNN.png，返回成功写入帧数。"""
+    idle_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    try:
+        from PIL import Image, ImageSequence
+    except Exception:
+        # 缺 Pillow 时直接写原始字节为 PNG（仅适合用户本身传 PNG 的场景）
+        for raw in images:
+            if not raw:
+                continue
+            (idle_dir / f"frame_{count:03d}.png").write_bytes(raw)
+            count += 1
+        return count
+
+    for raw in images:
+        if not raw:
+            continue
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                n_frames = getattr(img, "n_frames", 1)
+                if n_frames > 1:
+                    for idx, frame in enumerate(ImageSequence.Iterator(img)):
+                        if idx >= _IMPORT_MAX_GIF_FRAMES:
+                            break
+                        _save_pil_frame(frame, idle_dir / f"frame_{count:03d}.png")
+                        count += 1
+                else:
+                    _save_pil_frame(img, idle_dir / f"frame_{count:03d}.png")
+                    count += 1
+        except Exception as exc:
+            logger.debug("跳过无法解码的导入图片: %s", exc)
+    return count
+
+
+def import_skin_from_images(
+    name: str,
+    images: List[bytes],
+    *,
+    persona: str = "",
+    description: str = "",
+    author: str = "",
+) -> Dict[str, Any]:
+    """从一组图片/GIF 字节创建用户宠物包，返回 {ok, msg, skin?}。"""
+    clean_name = (name or "").strip() or "我的桌宠"
+    if not images:
+        return {"ok": False, "msg": "请至少选择一张图片或 GIF 动图"}
+
+    root = user_skin_dir()
+    skin_id = _safe_skin_id(clean_name, root)
+    pkg_dir = root / skin_id
+    idle_dir = pkg_dir / "assets" / _STATE_ROOT / _IDLE_STATE
+
+    import shutil
+
+    try:
+        written = _convert_images_to_frames(images, idle_dir)
+        if written <= 0:
+            shutil.rmtree(pkg_dir, ignore_errors=True)
+            return {"ok": False, "msg": "未能识别所选图片，请确认格式为 PNG/JPG/WebP/GIF"}
+        meta = {
+            "id": skin_id,
+            "name": clean_name,
+            "persona": (persona or "").strip(),
+            "description": (description or "").strip(),
+            "author": (author or "").strip() or "自定义",
+        }
+        _write_pet_json(pkg_dir, meta)
+        skin = get_skin(skin_id)
+        if skin is None:
+            return {"ok": False, "msg": "导入成功但读取宠物包失败"}
+        return {"ok": True, "msg": f"已导入桌宠「{clean_name}」（共 {written} 帧）", "skin": skin}
+    except OSError as exc:
+        shutil.rmtree(pkg_dir, ignore_errors=True)
+        return {"ok": False, "msg": f"写入宠物目录失败: {exc}"}
+
+
+def _find_package_root(extracted: Path) -> Path:
+    """在解压目录里定位宠物包根：优先含 assets/pet/idle 的目录，其次剥离单一包裹文件夹。"""
+    if _idle_frames(extracted / "assets"):
+        return extracted
+    children = [p for p in extracted.iterdir() if p.name != "__MACOSX"]
+    if len(children) == 1 and children[0].is_dir():
+        if _idle_frames(children[0] / "assets"):
+            return children[0]
+        return children[0]
+    for sub in children:
+        if sub.is_dir() and _idle_frames(sub / "assets"):
+            return sub
+    return extracted
+
+
+def import_skin_from_zip(
+    zip_bytes: bytes,
+    *,
+    name: str = "",
+    persona: str = "",
+    description: str = "",
+    author: str = "",
+) -> Dict[str, Any]:
+    """从 ZIP 压缩包导入用户宠物包：兼容标准星瑶宠物包及普通图片文件夹压缩包。"""
+    import shutil
+    import tempfile
+    import zipfile
+
+    if not zip_bytes:
+        return {"ok": False, "msg": "压缩包内容为空"}
+
+    root = user_skin_dir()
+    with tempfile.TemporaryDirectory(prefix="ycode_pet_import_") as tmp:
+        tmp_dir = Path(tmp)
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                for member in zf.infolist():
+                    member_path = Path(member.filename)
+                    if member_path.is_absolute() or ".." in member_path.parts:
+                        return {"ok": False, "msg": "压缩包包含不安全路径，已拒绝导入"}
+                zf.extractall(tmp_dir)
+        except zipfile.BadZipFile:
+            return {"ok": False, "msg": "无效的 ZIP 压缩包"}
+        except OSError as exc:
+            return {"ok": False, "msg": f"解压失败: {exc}"}
+
+        src_root = _find_package_root(tmp_dir)
+        existing_meta = _read_pet_json(src_root)
+        clean_name = (
+            (name or "").strip()
+            or _meta_str(existing_meta, "name", "")
+            or (src_root.name if src_root != tmp_dir else "")
+            or "导入桌宠"
+        )
+        skin_id = _safe_skin_id(clean_name, root)
+        dst_dir = root / skin_id
+
+        try:
+            if _idle_frames(src_root / "assets"):
+                shutil.copytree(src_root, dst_dir)
+            else:
+                # 非标准结构（普通图片压缩包）：收集其中的图片/GIF 自动转为标准 idle 帧
+                img_files = sorted(
+                    (
+                        p
+                        for p in src_root.rglob("*")
+                        if p.is_file()
+                        and "__MACOSX" not in p.parts
+                        and p.suffix.lower() in _IMAGE_SUFFIXES
+                    ),
+                    key=lambda p: str(p).casefold(),
+                )
+                if not img_files:
+                    return {
+                        "ok": False,
+                        "msg": "压缩包内未找到 assets/pet/idle/frame_*.png 或可用图片",
+                    }
+                raw_list = [p.read_bytes() for p in img_files[:60]]
+                written = _convert_images_to_frames(raw_list, dst_dir / "assets" / _STATE_ROOT / _IDLE_STATE)
+                if written <= 0:
+                    shutil.rmtree(dst_dir, ignore_errors=True)
+                    return {"ok": False, "msg": "压缩包内图片无法解码"}
+
+            merged_meta = dict(existing_meta)
+            merged_meta["id"] = skin_id
+            merged_meta["name"] = clean_name
+            if persona.strip():
+                merged_meta["persona"] = persona.strip()
+            elif "persona" not in merged_meta:
+                merged_meta["persona"] = ""
+            if description.strip():
+                merged_meta["description"] = description.strip()
+            if author.strip():
+                merged_meta["author"] = author.strip()
+            elif not _meta_str(merged_meta, "author", ""):
+                merged_meta["author"] = "自定义"
+            _write_pet_json(dst_dir, merged_meta)
+        except OSError as exc:
+            shutil.rmtree(dst_dir, ignore_errors=True)
+            return {"ok": False, "msg": f"导入宠物包失败: {exc}"}
+
+    skin = get_skin(skin_id)
+    if skin is None:
+        return {"ok": False, "msg": "导入成功但读取宠物包失败"}
+    return {"ok": True, "msg": f"已导入桌宠「{clean_name}」", "skin": skin}
+
+
+def update_skin_meta(
+    skin_id: str,
+    *,
+    name: Optional[str] = None,
+    persona: Optional[str] = None,
+    description: Optional[str] = None,
+) -> Dict[str, Any]:
+    """更新用户宠物包的名称与人设（内置星瑶不可改）。"""
+    key = (skin_id or "").strip()
+    if not key or key == BUILTIN_SKIN_ID:
+        return {"ok": False, "msg": "内置星瑶不支持修改元数据"}
+    pkg_dir = user_skin_dir() / key
+    if not _is_dir(pkg_dir) or not _idle_frames(pkg_dir / "assets"):
+        return {"ok": False, "msg": "找不到指定的自定义桌宠"}
+
+    meta = _read_pet_json(pkg_dir)
+    meta["id"] = key
+    if name is not None:
+        clean_name = name.strip()
+        if not clean_name:
+            return {"ok": False, "msg": "桌宠名称不能为空"}
+        meta["name"] = clean_name
+    if persona is not None:
+        meta["persona"] = persona.strip()
+    if description is not None:
+        meta["description"] = description.strip()
+
+    try:
+        _write_pet_json(pkg_dir, meta)
+    except OSError as exc:
+        return {"ok": False, "msg": f"保存人设失败: {exc}"}
+
+    skin = get_skin(key)
+    return {"ok": True, "msg": "已更新桌宠人设", "skin": skin}
+
+
+def delete_skin(skin_id: str) -> Dict[str, Any]:
+    """删除用户宠物包（内置星瑶不可删）；若删除当前激活项则回落星瑶。"""
+    import shutil
+
+    key = (skin_id or "").strip()
+    if not key or key == BUILTIN_SKIN_ID:
+        return {"ok": False, "msg": "内置星瑶不能删除"}
+    pkg_dir = user_skin_dir() / key
+    if not _is_dir(pkg_dir):
+        return {"ok": False, "msg": "找不到指定的自定义桌宠"}
+
+    was_active = active_skin_id() == key
+    if was_active:
+        set_active_skin(BUILTIN_SKIN_ID)
+
+    try:
+        shutil.rmtree(pkg_dir)
+    except OSError as exc:
+        return {"ok": False, "msg": f"删除失败: {exc}"}
+
+    return {"ok": True, "msg": "已删除自定义桌宠", "was_active": was_active}

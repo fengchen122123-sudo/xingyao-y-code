@@ -64,7 +64,7 @@
       "loop": true,
       "priority": 1,
       "next": "idle",
-      "breath": true
+      "breath": false
     },
     "warm_hands": {
       "fps": 2.2,

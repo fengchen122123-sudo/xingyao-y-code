@@ -57,6 +57,15 @@ MIN_TIMEOUT_MS = 100
 MAX_TIMEOUT_MS = 5000
 KEY_COOLDOWN_SECONDS = 60
 
+# 任务执行过程中的自动决策场景：不在 DEFAULT_CONFIG["scenes"] 占界面行，
+# 只要全局 enabled=True 即自动随 shadow_mode 生效（也可在 decision.json 显式覆盖）。
+AUTO_TASK_SCENES = frozenset({
+    "loop_guard",
+    "subagent_review",
+    "plan_recovery",
+    "memory_filter",
+})
+
 # 探针的无害问题（每把 Key 至多 1 次调用，遵守基元律动技能红线：禁止压测）
 _PROBE_STATE = "本请求为无害连通探针，不涉及任何用户数据。"
 _PROBE_INSTRUCTIONS = "1+1 是否等于 2？请给出该命题成立的概率。"
@@ -652,7 +661,14 @@ def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None, au
     scene_name = scene if isinstance(scene, str) else str(scene or "")
     scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
     scene_cfg = scenes.get(scene_name)
-    if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
+    if isinstance(scene_cfg, dict):
+        if not bool(scene_cfg.get("enabled")):
+            return None
+        scene_shadow = bool(scene_cfg.get("shadow", True))
+    elif scene_name in AUTO_TASK_SCENES:
+        # 任务执行期决策点：只要全局启用即自动参与，默认遵循全局 shadow_mode
+        scene_shadow = False
+    else:
         return None
     if not isinstance(questions, dict) or not questions:
         raise ValueError("questions 必须是非空字典")
@@ -663,7 +679,7 @@ def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None, au
     if image_b64 is not None and len(questions) > 1:
         raise ValueError("带图请求一次只允许 1 题")
 
-    shadow = bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True))
+    shadow = bool(cfg.get("shadow_mode")) or scene_shadow
     audit_enabled = bool(cfg.get("audit_enabled", True))
     trace_id = uuid.uuid4().hex[:12]
     timeout_seconds = _effective_timeout_ms(cfg, timeout_ms) / 1000.0
