@@ -35,7 +35,9 @@
     .layer {
       position: absolute; inset: 0; width: 100%; height: 100%;
       object-fit: contain; image-rendering: auto;
+      transform-origin: center center;
     }
+    .layer.flipped { transform: scaleX(-1); }
     #stage.grab-hint .layer { filter: drop-shadow(0 0 6px rgba(255,150,40,0.9)); }
     /* 气泡完整落在顶部 56px 留白带内：top 4px + 最多 48px = 52px < 56px，
        角色区从 y=56px 才开始，任何台词都不会压到丸子头或脸。 */

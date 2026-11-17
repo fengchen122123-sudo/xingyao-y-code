@@ -437,6 +437,18 @@ function showPetContextMenu(x, y) {
     { label: "摸摸头", click: () => sendEmote("greet") },
     { label: "逗她一下", click: () => sendEmote("interact") },
     { label: "让她说句话", click: () => sendEmote("talk") },
+    { label: "出来走走", click: () => sendEmote("walk") },
+    {
+      label: "更多动作",
+      submenu: [
+        { label: "伸个懒腰", click: () => sendEmote("stretch") },
+        { label: "坐下休息", click: () => sendEmote("sit") },
+        { label: "呵气暖手", click: () => sendEmote("warm_hands") },
+        { label: "东张西望", click: () => sendEmote("look_around") },
+        { label: "开心一下", click: () => sendEmote("happy") },
+        { label: "害羞一下", click: () => sendEmote("shy") }
+      ]
+    },
     { type: "separator" },
     { label: "睡觉 / 唤醒", click: () => win.webContents.send("pet:sleep") },
     { label: "隐藏 / 显示", click: () => (win.isVisible() ? win.hide() : win.show()) },

@@ -20,15 +20,24 @@
   let state = "idle";
   let frameIdx = 0;
   let lastFrameAt = 0;
+  let lastTickAt = performance.now();
   let stateEnteredAt = 0;
   let walkRemain = 0;
+  let sitRemain = 0;
+  let sitLoopIdx = 0;
   let sleepSince = 0;
   let lastBubbleAt = 0;
   let sleepEnteredAt = 0;
   let lastBounceAt = 0;
+  let nextBlinkAt = performance.now() + 2600;
+  let blinkUntil = 0;
+  let doubleBlinkPending = false;
+  let nextTiltAt = performance.now() + 11000;
+  let tiltUntil = 0;
+  let autonomousCooldownUntil = 0;
   let quiet = false;
   let animate = true;
-  let walkDir = 1;
+  let walkDir = -1;
   let lastActivityAt = performance.now();
   // 尊重系统「减弱动态效果」无障碍开关
   const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
@@ -114,10 +123,14 @@
     frameEl.src = img.src;
   }
 
-  // 呼吸只在「静止类」状态启用，动作状态不叠加位移，避免双重运动
+  // 呼吸只在「静止 / 坐下」类状态启用，走路与大幅动作不叠加位移，避免双重运动
   function applyBreath() {
     const spec = config && config.animations[state];
-    breathEl.classList.toggle("breathing", !!spec && !!spec.still && animate && !reducedMotion);
+    breathEl.classList.toggle("breathing", !!spec && (!!spec.breath || !!spec.still) && animate && !reducedMotion);
+  }
+
+  function applyFacing() {
+    frameEl.classList.toggle("flipped", state === "walk" && walkDir > 0);
   }
 
   // 互动反馈：复用落地动画（弹性缩放）当「被摸到」的即时反馈，不额外新增素材
@@ -128,6 +141,23 @@
   }
 
   // ---------- 状态机 ----------
+  const SIT_LOOP = [1, 2, 1, 3];
+  const IDLE_AUTO_ACTIONS = ["stretch", "sit", "warm_hands", "look_around"];
+
+  function pickWalkDirection() {
+    window.petAPI.getMoveBounds().then(({ win, work }) => {
+      if (state !== "walk") return;
+      if (win.x + win.width >= work.x + work.width - 90) {
+        walkDir = -1;
+      } else if (win.x <= work.x + 90) {
+        walkDir = 1;
+      } else {
+        walkDir = Math.random() < 0.5 ? -1 : 1;
+      }
+      applyFacing();
+    }).catch(() => {});
+  }
+
   function setState(next) {
     if (!config) return;
     const spec = config.animations[next];
@@ -138,20 +168,48 @@
       lastFrameAt = 0;
       stateEnteredAt = performance.now();
       breathEl.classList.remove("landing");
-      if (next === "walk") walkRemain = 2000 + Math.random() * 3000;
-      if (next === "idle") sleepSince = performance.now();
+      if (next === "walk") {
+        walkRemain = 3200 + Math.random() * 4400;
+        walkDir = Math.random() < 0.5 ? -1 : 1;
+        pickWalkDirection();
+      }
+      if (next === "sit") {
+        sitRemain = 8000 + Math.random() * 6000;
+        sitLoopIdx = 0;
+      }
+      if (next === "idle") {
+        sleepSince = performance.now();
+        nextBlinkAt = sleepSince + 2000 + Math.random() * 3200;
+        nextTiltAt = sleepSince + 8000 + Math.random() * 9000;
+        autonomousCooldownUntil = Math.max(autonomousCooldownUntil, sleepSince + 2500);
+      }
       if (next === "drop") {
         void breathEl.offsetWidth;          // 强制重排，重启动画
-        breathEl.classList.add("landing");  // 落地冲击用几何弹性表达，不换一张画风不同的图
+        breathEl.classList.add("landing");  // 落地冲击用几何弹性表达
       }
       if (next === "sleep") { sleepEnteredAt = performance.now(); showBubble("Zzz…"); }
-      else if (lines[next] && lines[next].length) showBubble(pick(lines[next]));
+      else if (lines[next] && lines[next].length && !quiet) showBubble(pick(lines[next]));
       applyBreath();
+      applyFacing();
     }
   }
 
   // drag 优先级最高：任何时候都要能拖动宠物，不能被 greet/interact 这些动作卡住
-  const PRIORITY = { drag: 5, greet: 4, interact: 4, drop: 3, walk: 1, idle: 0, sleep: -1 };
+  const PRIORITY = {
+    drag: 5,
+    greet: 4,
+    interact: 4,
+    happy: 4,
+    shy: 3,
+    drop: 3,
+    stretch: 2,
+    warm_hands: 2,
+    sit: 1,
+    look_around: 1,
+    walk: 1,
+    idle: 0,
+    sleep: -1,
+  };
   function canInterrupt(cur, next) {
     if (cur === next) return true;
     return (PRIORITY[next] ?? 0) >= (PRIORITY[cur] ?? 0);
@@ -160,11 +218,38 @@
   function markActivity() {
     const now = performance.now();
     lastActivityAt = now;
+    autonomousCooldownUntil = now + 4500;
     // 「说句话」这类不换状态的操作也算活动，不能让原来的闲置入睡计时继续偷跑。
     if (state === "idle") sleepSince = now;
   }
 
+  function tickIdleFrames(now, arr) {
+    if (!animate || reducedMotion || arr.length < 2) {
+      showFrame(arr[0]);
+      return;
+    }
+    if (now >= nextBlinkAt) {
+      blinkUntil = now + 135;
+      if (!doubleBlinkPending && Math.random() < 0.25) {
+        doubleBlinkPending = true;
+        nextBlinkAt = now + 260;
+      } else {
+        doubleBlinkPending = false;
+        nextBlinkAt = now + 2800 + Math.random() * 3400;
+      }
+    }
+    if (arr.length >= 3 && now >= nextTiltAt) {
+      tiltUntil = now + 950;
+      nextTiltAt = now + 10000 + Math.random() * 10000;
+    }
+    if (now < blinkUntil) showFrame(arr[1]);
+    else if (arr.length >= 3 && now < tiltUntil) showFrame(arr[2]);
+    else showFrame(arr[0]);
+  }
+
   function tick(now) {
+    const dt = Math.min(Math.max(now - lastTickAt, 8), 80);
+    lastTickAt = now;
     const spec = config.animations[state];
     const arr = frames[state] || [];
     const interval = 1000 / (spec.fps || 4);
@@ -175,18 +260,36 @@
       showFrame(arr[0]);
       frameIdx = 0;
       if (!spec.loop && now - stateEnteredAt >= holdMs) setState(spec.next || "idle");
+    } else if (state === "idle") {
+      tickIdleFrames(now, arr);
+    } else if (state === "sit") {
+      if (now - lastFrameAt >= interval) {
+        lastFrameAt = now;
+        if (frameIdx === 0) {
+          showFrame(arr[0]);
+          frameIdx = 1;
+        } else {
+          const targetIdx = SIT_LOOP[sitLoopIdx % SIT_LOOP.length];
+          showFrame(arr[Math.min(targetIdx, arr.length - 1)]);
+          sitLoopIdx++;
+        }
+      }
+      sitRemain -= dt;
+      if (sitRemain <= 0) setState("idle");
     } else if (now - lastFrameAt >= interval) {
       lastFrameAt = now;
-      showFrame(arr[frameIdx]);
+      const safeIdx = Math.min(frameIdx, arr.length - 1);
+      showFrame(arr[safeIdx]);
       frameIdx++;
       if (frameIdx >= arr.length) {
         if (spec.loop) frameIdx = 0;
         else {
-          // 播完一轮后停留 2 秒再回 idle，而不是立刻消失。
-          // holdMs 是「至少停留多久」（默认 = 帧数 × 帧间隔），再加 2000ms 的停留，
-          // 否则 interact 这种 3 帧 / 4fps 的动作 0.75 秒就闪没了。
-          if (now - stateEnteredAt >= holdMs + 2000) {
+          // 播完一轮后短暂停留再回 idle；有明确短动作（如 drop）不拖延 2 秒
+          const tailPause = state === "drop" ? 80 : 900;
+          if (now - stateEnteredAt >= holdMs + tailPause) {
             setState(spec.next || "idle");
+          } else {
+            frameIdx = arr.length - 1;
           }
         }
       }
@@ -195,15 +298,26 @@
     const behaviors = config.behaviors || {};
     // walk 位移与贴边反弹（反弹检测节流，避免每帧一次 IPC 导致窗口抖动）
     if (state === "walk" && animate) {
-      const speed = (config.animations.walk.moveSpeed || 42) / (1000 / 16);
-      window.petAPI.moveBy(walkDir * speed, 0);
-      walkRemain -= 16;
+      const speedPx = (config.animations.walk.moveSpeed || 48) * (dt / 1000);
+      window.petAPI.moveBy(walkDir * speedPx, 0);
+      walkRemain -= dt;
       const bounceMs = (config.motion && config.motion.bounceCheckMs) || 150;
       if (now - lastBounceAt > bounceMs) {
         lastBounceAt = now;
-        maybeBounce().then((hit) => { if (hit) walkDir *= -1; });
+        maybeBounce().then((hit) => {
+          if (hit) {
+            walkDir *= -1;
+            applyFacing();
+          }
+        });
       }
-      if (walkRemain <= 0) setState("idle");
+      if (walkRemain <= 0) {
+        const roll = Math.random();
+        if (roll < 0.30 && frames.look_around) setState("look_around");
+        else if (roll < 0.55 && frames.sit) setState("sit");
+        else if (roll < 0.70 && frames.stretch) setState("stretch");
+        else setState("idle");
+      }
     }
     // idle 超时入睡
     if (state === "idle" && behaviors.idleTimeoutSec) {
@@ -219,9 +333,14 @@
       showBubble(pick(lines.idle));
       lastBubbleAt = now;
     }
-    // 随机散步：关闭动效 / 减弱动态时不触发
-    if (state === "idle" && animate && !reducedMotion && behaviors.walkProbPerMinute) {
-      if (Math.random() < behaviors.walkProbPerMinute / (60 * 1000 / 16)) setState("walk");
+    // 自主行为：散步 + 伸懒腰 / 坐下 / 暖手 / 张望（关闭动效或减弱动态时不触发）
+    if (state === "idle" && animate && !reducedMotion && now >= autonomousCooldownUntil) {
+      if (behaviors.walkProbPerMinute && Math.random() < behaviors.walkProbPerMinute * (dt / 60000)) {
+        setState("walk");
+      } else if (behaviors.idleActionProbPerMinute && Math.random() < behaviors.idleActionProbPerMinute * (dt / 60000)) {
+        const pool = IDLE_AUTO_ACTIONS.filter((k) => config.animations[k] && frames[k] && frames[k].length);
+        if (pool.length) setState(pool[Math.floor(Math.random() * pool.length)]);
+      }
     }
     scheduleTick();
   }
@@ -295,9 +414,13 @@
         const isSleep = state === "sleep";
         if (isSleep) { setState("greet"); }
         else if (canInterrupt(state, "interact") && frames.interact) {
-          setState("interact");
-          const arr = lines.interact || lines.idle || [];
-          if (arr.length) showBubble(arr[clickCycle++ % arr.length]);
+          const clickStates = ["interact", "happy", "shy"].filter((k) => frames[k] && config.animations[k]);
+          const chosen = clickStates.length > 1 && Math.random() < 0.4
+            ? clickStates[1 + Math.floor(Math.random() * (clickStates.length - 1))]
+            : "interact";
+          setState(chosen);
+          const arr = (lines[chosen] && lines[chosen].length ? lines[chosen] : (lines.interact || lines.idle)) || [];
+          if (arr.length && !quiet) showBubble(arr[clickCycle++ % arr.length]);
         } else if (lines.idle) {
           showBubble(pick(lines.idle));
         }
@@ -337,8 +460,11 @@
   function hitPet(e) {
     if (!frameEl.complete || !frameEl.naturalWidth) return true;
     const r = frameEl.getBoundingClientRect();
-    const x = Math.floor((e.clientX - r.left) / r.width * frameEl.naturalWidth);
+    let x = Math.floor((e.clientX - r.left) / r.width * frameEl.naturalWidth);
     const y = Math.floor((e.clientY - r.top) / r.height * frameEl.naturalHeight);
+    if (frameEl.classList.contains("flipped")) {
+      x = frameEl.naturalWidth - 1 - x;
+    }
     if (x < 0 || y < 0 || x >= frameEl.naturalWidth || y >= frameEl.naturalHeight) return false;
     if (frameEl.src !== maskKey) {
       const c = document.createElement("canvas");
@@ -362,6 +488,7 @@
       breathEl.classList.remove("landing");
     }
     applyBreath();
+    applyFacing();
   }
 
   // ---------- 首次引导（缩短到 2 句，高冷设定不连番冒泡） ----------
@@ -374,10 +501,12 @@
     window.petAPI.markOnboarded();
   }
 
-  // ---------- 调度：静止状态降频到 4Hz，避免 60fps 空转 ----------
+  // ---------- 调度：静止/睡眠降频，避免 60fps 空转 ----------
   function scheduleTick() {
-    if (state === "idle" || state === "sleep" || !animate)
+    if (!animate || state === "sleep")
       setTimeout(() => tick(performance.now()), 250);
+    else if (state === "idle" || state === "sit")
+      setTimeout(() => tick(performance.now()), 100);
     else requestAnimationFrame(tick);
   }
 
@@ -438,10 +567,10 @@
         bounceFeedback();
         return;
       }
-      const next = kind === "greet" ? "greet" : "interact";
-      if (frames[next]) {
-        setState(next);      // setState 内部会按 lines[next] 自动冒一句台词
-        bounceFeedback();
+      const allowed = config && config.animations && config.animations[kind] ? kind : "interact";
+      if (frames[allowed]) {
+        setState(allowed);      // setState 内部会按 lines[next] 自动冒一句台词
+        if (allowed !== "walk" && allowed !== "sit") bounceFeedback();
       } else {
         bounceFeedback();    // 皮肤包缺这个状态时至少给一个动作反馈
       }
