@@ -16,27 +16,74 @@
         tabindex="-1"
         data-test="confirm-modal"
       >
-        <div class="cm-layout">
-          <div class="cm-icon" :class="`tone-${resolvedTone}`" aria-hidden="true">
-            <AppIcon :name="iconName" :size="18" />
-          </div>
-          <div class="cm-content">
-            <div class="cm-title-row">
-              <h3 id="confirm-modal-title" class="cm-title">{{ displayTitle }}</h3>
-              <button
-                type="button"
-                class="cm-close"
-                aria-label="关闭"
-                data-test="confirm-modal-close"
-                @click="onDismiss"
+        <div class="cm-head">
+          <div class="cm-title-row">
+            <span
+              class="cm-icon"
+              :class="`tone-${resolvedTone}`"
+              :data-icon="iconVariant"
+              aria-hidden="true"
+            >
+              <!-- 统一 20px 双色调极简线性图标，去除了厚重浅底色块与尖锐三角警示框 -->
+              <svg
+                class="cm-svg"
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.85"
+                stroke-linecap="round"
+                stroke-linejoin="round"
               >
-                <AppIcon name="x" :size="15" />
-              </button>
-            </div>
-            <p v-if="displaySub" class="cm-sub">{{ displaySub }}</p>
-            <div v-if="store.confirmModal.message" class="cm-body">{{ store.confirmModal.message }}</div>
+                <template v-if="iconVariant === 'trash'">
+                  <path
+                    d="M6.5 7 7.3 18.5Q7.45 20 9 20h6q1.55 0 1.7-1.5L17.5 7Z"
+                    fill="currentColor"
+                    fill-opacity="0.14"
+                    stroke="none"
+                  />
+                  <path d="M4.5 7h15" />
+                  <path d="M9.5 7V4.8A1.3 1.3 0 0 1 10.8 3.5h2.4a1.3 1.3 0 0 1 1.3 1.3V7" />
+                  <path d="M6.5 7 7.3 18.5Q7.45 20 9 20h6q1.55 0 1.7-1.5L17.5 7" />
+                  <path d="M10.2 11.2v4.6" />
+                  <path d="M13.8 11.2v4.6" />
+                </template>
+                <template v-else-if="iconVariant === 'error'">
+                  <circle cx="12" cy="12" r="9.25" fill="currentColor" fill-opacity="0.13" />
+                  <path d="m14.7 9.3-5.4 5.4" />
+                  <path d="m9.3 9.3 5.4 5.4" />
+                </template>
+                <template v-else-if="iconVariant === 'success'">
+                  <circle cx="12" cy="12" r="9.25" fill="currentColor" fill-opacity="0.13" />
+                  <path d="m8.6 12.2 2.25 2.25 4.55-4.8" />
+                </template>
+                <template v-else-if="iconVariant === 'alert'">
+                  <circle cx="12" cy="12" r="9.25" fill="currentColor" fill-opacity="0.13" />
+                  <path d="M12 8.1v4.2" />
+                  <circle cx="12" cy="15.85" r="0.95" fill="currentColor" stroke="none" />
+                </template>
+                <template v-else>
+                  <circle cx="12" cy="12" r="9.25" fill="currentColor" fill-opacity="0.13" />
+                  <path d="M12 11.4v4.4" />
+                  <circle cx="12" cy="8.15" r="0.95" fill="currentColor" stroke="none" />
+                </template>
+              </svg>
+            </span>
+            <h3 id="confirm-modal-title" class="cm-title">{{ displayTitle }}</h3>
           </div>
+          <button
+            type="button"
+            class="cm-close"
+            aria-label="关闭"
+            data-test="confirm-modal-close"
+            @click="onDismiss"
+          >
+            <AppIcon name="x" :size="15" />
+          </button>
         </div>
+        <p v-if="displaySub" class="cm-sub">{{ displaySub }}</p>
+        <div v-if="store.confirmModal.message" class="cm-body">{{ store.confirmModal.message }}</div>
 
         <div class="cm-foot">
           <button
@@ -64,10 +111,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
-import type { IconName } from './iconPaths';
 import { useAppStore, type ConfirmTone } from '../stores/appStore';
 
 type ResolvedTone = ConfirmTone | 'success';
+type IconVariant = 'trash' | 'alert' | 'error' | 'success' | 'info';
 
 const store = useAppStore();
 
@@ -95,11 +142,17 @@ const buttonTone = computed<'danger' | 'primary'>(() => {
   return resolvedTone.value === 'danger' ? 'danger' : 'primary';
 });
 
-const iconName = computed<IconName>(() => {
-  if (resolvedTone.value === 'success') return 'check';
-  if (resolvedTone.value === 'danger' || resolvedTone.value === 'error' || resolvedTone.value === 'warning') {
-    return 'triangle-alert';
-  }
+const isDeleteAction = computed(() => {
+  if (resolvedTone.value !== 'danger') return false;
+  const combined = `${store.confirmModal.title}\n${store.confirmModal.confirmLabel}`;
+  return /删除|清空|移除/.test(combined);
+});
+
+const iconVariant = computed<IconVariant>(() => {
+  if (resolvedTone.value === 'success') return 'success';
+  if (resolvedTone.value === 'error') return 'error';
+  if (resolvedTone.value === 'warning') return 'alert';
+  if (resolvedTone.value === 'danger') return isDeleteAction.value ? 'trash' : 'alert';
   return 'info';
 });
 
@@ -202,59 +255,54 @@ onBeforeUnmount(() => {
   outline: none;
 }
 
-.cm-layout {
+.cm-head {
   display: flex;
   align-items: flex-start;
-  gap: 13px;
-}
-
-.cm-icon {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-.cm-icon.tone-danger,
-.cm-icon.tone-error {
-  background: var(--xy-rose-soft, color-mix(in srgb, var(--red) 13%, transparent));
-  color: var(--xy-rose, var(--red));
-}
-.cm-icon.tone-warning {
-  background: var(--xy-amber-soft, color-mix(in srgb, var(--orange) 13%, transparent));
-  color: var(--xy-amber, var(--orange));
-}
-.cm-icon.tone-success {
-  background: var(--xy-green-soft, color-mix(in srgb, var(--green) 13%, transparent));
-  color: var(--xy-green, var(--green));
-}
-.cm-icon.tone-info,
-.cm-icon.tone-primary {
-  background: var(--xy-accent-soft, var(--accent-soft));
-  color: var(--xy-accent, var(--accent));
-}
-
-.cm-content {
-  flex: 1;
-  min-width: 0;
+  justify-content: space-between;
+  gap: 10px;
 }
 
 .cm-title-row {
   display: flex;
   align-items: flex-start;
-  justify-content: space-between;
   gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.cm-icon {
+  width: 20px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.cm-svg {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+.cm-icon.tone-danger,
+.cm-icon.tone-error {
+  color: var(--xy-rose, var(--red));
+}
+.cm-icon.tone-warning {
+  color: var(--xy-amber, var(--orange));
+}
+.cm-icon.tone-success {
+  color: var(--xy-green, var(--green));
+}
+.cm-icon.tone-info,
+.cm-icon.tone-primary {
+  color: var(--xy-accent, var(--accent));
 }
 
 .cm-title {
   margin: 0;
-  padding-top: 1px;
   font-size: 15px;
   font-weight: 600;
-  line-height: 1.45;
+  line-height: 22px;
   letter-spacing: -0.01em;
   color: var(--xy-text, var(--text-bright));
 }
@@ -262,7 +310,7 @@ onBeforeUnmount(() => {
 .cm-close {
   width: 26px;
   height: 26px;
-  margin: -3px -6px 0 0;
+  margin: -2px -6px 0 0;
   border: none;
   border-radius: 8px;
   background: transparent;
@@ -280,14 +328,14 @@ onBeforeUnmount(() => {
 }
 
 .cm-sub {
-  margin: 2px 0 0;
+  margin: 4px 0 0;
   font-size: 12.5px;
   line-height: 1.45;
   color: var(--xy-text-3, var(--text-faint));
 }
 
 .cm-body {
-  margin-top: 8px;
+  margin-top: 12px;
   font-family: var(--sans);
   font-size: 13.5px;
   line-height: 1.6;

@@ -1170,13 +1170,34 @@ html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-title b {
   color: #fff;
   text-shadow: 0 1px 1px rgba(0, 40, 90, 0.5);
 }
-html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-src {
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-action-tag,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-src,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-head-status {
   color: #E4F2FD;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-status-dot {
+  background: #FFE58F;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-ask-wrap,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-foot {
+  background: transparent;
+  border-top-color: #C6DBEF;
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-question {
+  color: var(--qq09-peer);
 }
 html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-body {
   background: #fff;
-  border: 1px solid #C6DBEF;
-  border-radius: 2px;
+  border-color: #C6DBEF;
+  color: var(--qq09-peer);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-cmd-meta,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-kv-k {
+  color: var(--qq09-text-2);
+}
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-cmd-code,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-target-code,
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-kv-v {
   color: var(--qq09-peer);
 }
 html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .perm-card .pc-undo-impact {

@@ -38,6 +38,7 @@ describe('ConfirmModal', () => {
 
     expect(wrapper.find('[data-test="confirm-modal"]').exists()).toBe(true);
     expect(wrapper.get('.cm-title').text()).toBe('删除项目分组');
+    expect(wrapper.get('.cm-icon').attributes('data-icon')).toBe('trash');
     expect(wrapper.get('.cm-sub').text()).toBe('仅移出侧栏分组，磁盘文件不受影响');
     expect(wrapper.get('.cm-body').text()).toBe('确定要删除项目分组「.ycode」吗？');
     expect(wrapper.get('[data-test="confirm-modal-cancel"]').text()).toBe('取消');
@@ -113,6 +114,7 @@ describe('ConfirmModal', () => {
     await nextTick();
 
     expect(wrapper.get('.cm-icon').classes()).toContain('tone-primary');
+    expect(wrapper.get('.cm-icon').attributes('data-icon')).toBe('info');
     expect(wrapper.get('[data-test="confirm-modal-ok"]').classes()).toContain('tone-primary');
     expect(wrapper.get('[data-test="confirm-modal-ok"]').classes()).not.toContain('tone-danger');
 
@@ -129,6 +131,7 @@ describe('ConfirmModal', () => {
     await nextTick();
     expect(wrapper.find('[data-test="confirm-modal-cancel"]').exists()).toBe(false);
     expect(wrapper.get('.cm-icon').classes()).toContain('tone-error');
+    expect(wrapper.get('.cm-icon').attributes('data-icon')).toBe('error');
     expect(wrapper.get('[data-test="confirm-modal-ok"]').classes()).toContain('tone-primary');
 
     // 点遮罩不关闭通知弹窗
@@ -140,11 +143,21 @@ describe('ConfirmModal', () => {
     store.notifyModal('导出成功', '主题已导出到桌面');
     await nextTick();
     expect(wrapper.get('.cm-icon').classes()).toContain('tone-success');
+    expect(wrapper.get('.cm-icon').attributes('data-icon')).toBe('success');
 
     // Esc 可关闭通知弹窗
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await nextTick();
     expect(store.confirmModal.show).toBe(false);
+
+    // 非删除类危险操作（如撤销/覆盖）走柔和警示图标，不显示垃圾桶
+    const pNonDelete = store.askConfirm('撤销本轮修改', '', '确定撤销？', '撤销本轮修改');
+    await nextTick();
+    expect(wrapper.get('.cm-icon').classes()).toContain('tone-danger');
+    expect(wrapper.get('.cm-icon').attributes('data-icon')).toBe('alert');
+    store.resolveConfirm(false);
+    await pNonDelete;
+
     wrapper.unmount();
   });
 
