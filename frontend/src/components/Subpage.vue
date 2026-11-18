@@ -383,7 +383,7 @@ async function onRestoreSkill(s: SkillInfo) {
     '恢复内置版本',
     s.name || s.id,
     `将用内置源覆盖技能「${s.name || s.id}」，你在该技能文件里的改动会丢失。`,
-    '恢复内置版本 ⏎',
+    '恢复内置版本',
   );
   if (ok) await store.restoreSkill(s.id);
 }
@@ -398,7 +398,7 @@ async function onRemoveMcp(m: McpInfo) {
     '删除 MCP 服务',
     m.name,
     '将从 mcp.json 移除该服务配置，删除后需要重新添加才能恢复。',
-    '删除 ⏎',
+    '删除',
   );
   if (ok) await store.removeMcpServer(m.name);
 }

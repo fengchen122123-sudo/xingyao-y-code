@@ -368,8 +368,9 @@ watch(
 .session-search-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.65);
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.38));
   backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   z-index: 1200;
   display: flex;
   align-items: flex-start;
@@ -386,10 +387,10 @@ watch(
 .session-search-modal {
   width: 640px;
   max-width: 92vw;
-  background: var(--bg1);
-  border: 1px solid var(--border);
+  background: var(--xy-card, var(--bg1));
+  border: 1px solid var(--xy-border-strong, var(--border));
   border-radius: 16px;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.65), 0 0 0 1px var(--border);
+  box-shadow: var(--xy-shadow-pop, 0 20px 60px rgba(0, 0, 0, 0.35));
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -743,16 +744,6 @@ watch(
 
 <style>
 /* 浅色主题（白色主题）专项适配：解决浅色底色下高亮文字变白看不清的问题 */
-:root.light .session-search-mask,
-body.light .session-search-mask {
-  background: rgba(0, 0, 0, 0.35);
-}
-
-:root.light .session-search-modal,
-body.light .session-search-modal {
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15), 0 0 0 1px var(--border);
-}
-
 :root.light .session-search-modal mark,
 body.light .session-search-modal mark {
   background: #fef08a !important;

@@ -66,7 +66,6 @@ import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 import { requestFrontendReload } from '../utils/frontendUpdate';
 import type { MediaItem } from '../types/media';
 import type { AttachmentItem } from '../types/composer';
-import { formatPermMode } from '../utils/markdown';
 import {
   reduceExecutionState,
   type ExecutionState,
@@ -540,6 +539,8 @@ export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] 
   return paired;
 }
 
+export type ConfirmTone = 'danger' | 'warning' | 'primary' | 'info' | 'error';
+
 export interface ConfirmState {
   show: boolean;
   title: string;
@@ -548,6 +549,7 @@ export interface ConfirmState {
   confirmLabel: string;
   // notice 模式：单按钮提示框（只有"确定"），用于必须让用户看到的非对话类提示
   notice?: boolean;
+  tone?: ConfirmTone;
   resolve?: (ok: boolean) => void;
 }
 
@@ -1045,7 +1047,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
 
     // 确认弹窗（notice 模式时退化为单按钮提示框，用户点击"确定"才关闭）
-    confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎', notice: false } as ConfirmState,
+    confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除', notice: false } as ConfirmState,
 
     // 会话全局检索模态框（Command Palette）
     sessionSearchModal: {
@@ -2574,9 +2576,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
 
     // 非对话类提示：模态提示框，用户点击"确定"才关闭。
     // 有待决确认框时先按"取消"安全收尾：直接覆盖会让其 promise 永久悬置。
-    notifyModal(title: string, msg: string) {
+    notifyModal(title: string, msg: string, options?: { tone?: ConfirmTone }) {
       if (this.confirmModal.show && this.confirmModal.resolve) {
-        this.confirmModal.resolve(false);
+        const prevResolve = this.confirmModal.resolve;
+        this.confirmModal.resolve = undefined;
+        prevResolve(false);
       }
       this.confirmModal = {
         show: true,
@@ -2585,10 +2589,22 @@ navItems: [] as Array<{ id: number; preview: string }>,
         message: msg,
         confirmLabel: '确定',
         notice: true,
+        tone: options?.tone,
       };
     },
 
-    askConfirm(title: string, sub: string, message: string, confirmLabel: string = '确定删除 ⏎'): Promise<boolean> {
+    askConfirm(
+      title: string,
+      sub: string,
+      message: string,
+      confirmLabel: string = '确定删除',
+      options?: { tone?: ConfirmTone },
+    ): Promise<boolean> {
+      if (this.confirmModal.show && this.confirmModal.resolve) {
+        const prevResolve = this.confirmModal.resolve;
+        this.confirmModal.resolve = undefined;
+        prevResolve(false);
+      }
       return new Promise((resolve) => {
         this.confirmModal = {
           show: true,
@@ -2596,16 +2612,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
           sub,
           message,
           confirmLabel,
+          tone: options?.tone,
           resolve,
         };
       });
     },
 
     resolveConfirm(ok: boolean) {
-      if (this.confirmModal.resolve) {
-        this.confirmModal.resolve(ok);
-      }
+      const resolve = this.confirmModal.resolve;
+      this.confirmModal.resolve = undefined;
       this.confirmModal.show = false;
+      if (resolve) {
+        resolve(ok);
+      }
     },
 
     openSessionSearchModal() {
@@ -3077,13 +3096,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
             this.activeModelName = runtime.modelName!;
             this.reasoning = res.reasoning;
           }
-          // 新会话或空会话切换模型不再弹提示/产生新页面：模型绑定静默完成，
-          // 仅当该会话已有真实对话内容（user/assistant 消息）时才插入切换提示，
-          // 否则 notice 会让空状态页消失，表现为切模型后页面跳转
-          const hasDialog = runtime.messages.some(m => m.role === 'user' || m.role === 'assistant');
-          if (hasDialog && this.currentSessionName === targetSession) {
-            this.notifyChat('已切换活动模型: ' + runtime.modelName);
-          }
         } else {
           this.notifyChat('切换模型失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
@@ -3115,10 +3127,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
         ) return;
         if (res && res.ok) {
           this.reasoning = res.reasoning;
-          // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
-          if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
-            this.notifyChat(res.msg || ('思考设置已调整: ' + this.reasoning.choice));
-          }
         } else {
           this.reasoning = previous;
           this.notifyChat('思考设置调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -3163,10 +3171,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
           // 首条消息发送时随 send_user_message 带给后端补绑定
           const runtime = this._getSessionRuntime(sessionName);
           runtime.permMode = this.permissionMode;
-          // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
-          if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
-            this.notifyChat('权限模式已调整: ' + formatPermMode(this.permissionMode));
-          }
         } else {
           this.permissionMode = prev;
           this.notifyChat('权限模式调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -3187,12 +3191,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const res = await api.set_sandbox_enabled(enabled);
         if (res && res.ok) {
           this.sandboxEnabled = !!res.allow_outside_workspace;
-          // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
-          if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
-            this.notifyChat(
-              this.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅限工作目录内'
-            );
-          }
         } else {
           this.sandboxEnabled = prev;
           this.notifyChat('沙盒开关调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -7461,7 +7459,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         '清空会话历史',
         '此操作不可撤销',
         '清空当前会话的全部历史记录？此操作不可撤销',
-        '确定清空 ⏎'
+        '确定清空'
       );
       if (!ok) return;
 
@@ -8283,7 +8281,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
           '新版本已就绪',
           `星瑶Code v${this.updateState.latestVersion} 安装包下载完成`,
           '安装包已下载就绪，是否立即启动安装程序并重启软件？',
-          '立即安装 ⏎'
+          '立即安装',
+          { tone: 'primary' },
         );
         if (ok) {
           await this.launchInstaller();
@@ -8303,7 +8302,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
           '任务进行中警告',
           '当前仍有对话或后台任务正在执行中',
           '继续安装将关闭当前软件并中断正在执行的任务。是否确定现在立即安装？',
-          '中断并安装'
+          '中断并安装',
+          { tone: 'danger' },
         );
         if (ok) {
           await this.launchInstaller();
@@ -8313,7 +8313,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
           '启动安装',
           `准备安装 星瑶Code v${this.updateState.latestVersion}`,
           '是否立即启动安装向导并退出当前程序？',
-          '立即安装 ⏎'
+          '立即安装',
+          { tone: 'primary' },
         );
         if (ok) {
           await this.launchInstaller();

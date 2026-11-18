@@ -133,27 +133,31 @@
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
       <div class="assistant-body">
         <!-- 名字行：一个回合只在最前面显示一次（由 TurnGroup 决定归属），
-             其余轮次的助手消息不再重复「星瑶 · 模型」；「已取消」徽标始终保留 -->
+             其余轮次的助手消息不再重复「星瑶 模型」；「已取消」徽标始终保留 -->
         <div v-if="showName || msg.cancelled" class="assistant-name">
           <template v-if="showName">
-            <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+            <b class="an-agent">{{ store.agentName }}</b>
+            <span class="an-model">{{ msg.model_name || store.activeModelName || '模型' }}</span>
           </template>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 
-        <!-- 思考过程 Block（对齐 ZCode 思考块形态：脑图标 + 灰色状态文案 + 悬停才出现的箭头，
-             无底色无边框；展开后弱灰正文、左侧 1px 细线、限高内滚 + 上下边缘渐隐 + 默认吸底） -->
-        <div v-if="msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
+        <!-- 思考过程 Block（方案A 轻量原生流：灯泡图标 + 思考摘要 + 轻量展开） -->
+        <div v-if="showProcess && msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
           <FoldCard v-model:open="thinkingOpen" caret="end">
             <template #title>
               <span class="tk-head">
-                <AppIcon class="tk-brain" name="brain" :size="13" :stroke-width="1.7" />
+                <AppIcon class="tk-brain" name="lightbulb" :size="13" :stroke-width="1.8" />
                 <span class="tk-label" :class="{ 'is-thinking': !!thinkLiveLine }">{{ thinkLabel }}</span>
                 <template v-if="thinkLiveLine">
                   <span class="tk-sep">·</span>
                   <span class="tk-live" data-test="think-live-line">
                     <span class="tk-live-text">{{ thinkLiveLine }}</span>
                   </span>
+                </template>
+                <template v-else-if="!thinkingOpen && thinkSummaryLine">
+                  <span class="tk-sep">·</span>
+                  <span class="tk-summary">{{ thinkSummaryLine }}</span>
                 </template>
               </span>
             </template>
@@ -170,7 +174,7 @@
              文件链接先渲染、后经后端批量校验，目录/不存在的路径降级为纯文本；
              媒体清单（media_v1）存在时 ![..](..)/[video:..](..) 渲染为图片/视频 -->
         <div
-          v-if="msg.content && msg.content.trim()"
+          v-if="showAnswer && msg.content && msg.content.trim()"
           ref="mdBodyRef"
           class="md-body"
           @click="onMdBodyClick"
@@ -180,19 +184,19 @@
 
         <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
         <ToolExecutionTrace
-          v-if="(msg.tool_calls && msg.tool_calls.length > 0) || (msg.legacy_diffs && msg.legacy_diffs.length > 0)"
+          v-if="showProcess && ((msg.tool_calls && msg.tool_calls.length > 0) || (msg.legacy_diffs && msg.legacy_diffs.length > 0))"
           :calls="msg.tool_calls || []"
           :legacy-diffs="msg.legacy_diffs || []"
           :state="msg.execution_state || 'completed'"
         />
 
         <!-- 回合进行中的非终态错误（挂在助手消息上，不插队成独立 error 消息） -->
-        <div v-if="msg.error_note" class="error-note">
+        <div v-if="showAnswer && msg.error_note" class="error-note">
           <AppIcon name="triangle-alert" :size="13" /> {{ msg.error_note }}
         </div>
 
         <!-- 登录态失效：错误提示下方直接出现「重新登录」，点一下拉起登录窗 -->
-        <div v-if="msg.error_note && isLoginExpiredError(msg.error_note)" class="login-again-row">
+        <div v-if="showAnswer && msg.error_note && isLoginExpiredError(msg.error_note)" class="login-again-row">
           <button
             type="button"
             class="login-again-btn"
@@ -205,7 +209,7 @@
 
         <!-- 断点续跑（S4）：仅当后端 resume_plan 判定可续跑时出现（开关关闭时不出现）。
              按钮只续跑无写操作的调用；含写操作的调用需人工重做，blockers 列表就地展示 -->
-        <div v-if="msg.error_note && store.resumeAvailable" class="resume-continue" data-test="resume-continue">
+        <div v-if="showAnswer && msg.error_note && store.resumeAvailable" class="resume-continue" data-test="resume-continue">
           <button
             type="button"
             class="resume-btn"
@@ -217,7 +221,7 @@
           </button>
           <span class="resume-hint">仅回灌已完成的调用；含写操作的调用需手动重做</span>
         </div>
-        <ul v-if="msg.error_note && store.resumeBlockers.length" class="resume-blockers" data-test="resume-blockers">
+        <ul v-if="showAnswer && msg.error_note && store.resumeBlockers.length" class="resume-blockers" data-test="resume-blockers">
           <li
             v-for="item in store.resumeBlockers"
             :key="item.call_ordinal"
@@ -228,21 +232,21 @@
         </ul>
 
         <!-- 等待模型响应期间的动态反馈（对齐 CLI 的"正在干活"） -->
-        <div v-if="showWorking" class="working-line">
+        <div v-if="showAnswer && showWorking" class="working-line">
           <span class="spin"></span>
           <span class="wl-text">{{ store.agentName }}正在干活<span class="wl-dots"><i>.</i><i>.</i><i>.</i></span></span>
           <span v-if="elapsed >= 3" class="wl-elapsed">已等待 {{ elapsed }}s</span>
         </div>
 
         <!-- 流式生成中的实时速度指示胶囊 -->
-        <div v-else-if="isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
+        <div v-else-if="showAnswer && showStreamingSpeed && isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
           <AppIcon name="orbit" :size="12" class="zap-pulse" />
           <span>{{ liveSpeedText }}</span>
         </div>
 
         <!-- 助手消息底部性能指标结算栏（生成完毕后展示；中间工具轮次默认隐藏，避免每步重复刷屏） -->
         <div
-          v-else-if="showMetrics && msg.metrics && (msg.metrics.token_speed || msg.metrics.duration_s)"
+          v-else-if="showAnswer && showMetrics && msg.metrics && (msg.metrics.token_speed || msg.metrics.duration_s)"
           class="msg-metrics-bar"
           :title="metricsTooltip"
           data-test="msg-metrics"
@@ -309,13 +313,22 @@ import ToolExecutionTrace from './ToolExecutionTrace.vue';
 
 const props = withDefaults(defineProps<{
   msg: ChatMessage;
-  /** 是否显示「星瑶 · 模型」名字行：一个回合只在最前面显示一次 */
+  /** 是否显示「星瑶 模型」名字行：一个回合只在最前面显示一次 */
   showName?: boolean;
   /** 是否在底部展示速度/耗时结算条（TurnGroup 中间过程轮次传 false 降噪） */
   showMetrics?: boolean;
+  /** 是否显示流式速度胶囊（TurnGroup 方案A 关闭避免 t/s 刷屏） */
+  showStreamingSpeed?: boolean;
+  /** 是否渲染思考块与工具过程 */
+  showProcess?: boolean;
+  /** 是否渲染正文回答与尾部错误/状态 */
+  showAnswer?: boolean;
 }>(), {
   showName: true,
   showMetrics: true,
+  showStreamingSpeed: true,
+  showProcess: true,
+  showAnswer: true,
 });
 
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
@@ -429,6 +442,18 @@ function toPlainHeadline(line: string): string {
     .trim();
   return plain.length > THINK_LIVE_MAX ? `…${plain.slice(-THINK_LIVE_MAX)}` : plain;
 }
+
+// 已结束思考块的单行摘要（供折叠头展示「思考 · 摘要」）
+const thinkSummaryLine = computed(() => {
+  const raw = props.msg.reasoning_content || '';
+  if (!raw.trim()) return '';
+  const lines = raw.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const plain = toPlainHeadline(lines[i]);
+    if (plain) return plain;
+  }
+  return '';
+});
 
 // 折叠态要显示的实时思考行：仅在「本条最新气泡仍在流式生成」时给值，
 // 展开态（用户要看全文）与生成结束后都返回空串，回落到固定标签"思考"
@@ -1031,12 +1056,14 @@ function onEditKeydown(e: KeyboardEvent) {
   align-items: flex-end;
 }
 .msg-user .bubble {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 12px 12px 4px 12px;
-  padding: 10px 14px;
-  max-width: 70%;
-  line-height: 1.65;
+  background: var(--xy-user-bubble, var(--bg2));
+  border: none;
+  border-radius: 16px;
+  padding: 8px 16px;
+  max-width: 82%;
+  font-size: 14px;
+  line-height: 1.625;
+  color: var(--xy-text, var(--text));
 }
 .user-text {
   white-space: pre-wrap;
@@ -1209,30 +1236,39 @@ function onEditKeydown(e: KeyboardEvent) {
   min-width: 0;
 }
 .assistant-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
-  color: var(--text-faint);
-  margin-bottom: 4px;
+  color: var(--xy-text-3, var(--text-faint));
+  margin-bottom: 8px;
 }
-.assistant-name b {
-  color: var(--text-dim);
+.assistant-name .an-agent {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--xy-text, var(--text));
+}
+.assistant-name .an-model {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
 }
 .cancel-badge {
-  margin-left: 8px;
+  margin-left: 4px;
   font-size: 10.5px;
-  color: var(--orange);
-  background: rgba(240, 136, 62, 0.12);
+  color: var(--xy-amber, var(--orange));
+  background: var(--xy-amber-soft, rgba(240, 136, 62, 0.12));
   border-radius: 6px;
   padding: 1px 7px;
 }
 
-/* 思考块（对齐 ZCode）：整块无底色无边框，折叠头是一行轻量灰字——
-   脑图标 +「思考 · N 秒」+ 悬停才浮现的小箭头 */
+/* 思考块（方案A 轻量原生流）：整块无底色无边框，灯泡图标 +「思考 · 摘要」+ 展开箭头 */
 .think-block {
-  margin: 7px 0;
+  margin: 4px 0 6px;
   font-size: 12px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
-/* 折叠头改成贴合内容的行内宽度（ZCode 的 trigger 是 self-start，不铺满整行） */
 .think-block :deep(.fold-head) {
   width: fit-content;
   max-width: 100%;
@@ -1241,7 +1277,7 @@ function onEditKeydown(e: KeyboardEvent) {
   color: inherit;
 }
 .think-block :deep(.fold-head:hover) {
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
 }
 .tk-head {
   display: inline-flex;
@@ -1255,7 +1291,7 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 .tk-label {
   flex: none;
-  font-weight: 500;
+  font-weight: 400;
   white-space: nowrap;
 }
 /* 流式中的标签走极轻的扫光渐变，比"呼吸圆点"更安静 */
@@ -1278,17 +1314,21 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 .tk-sep {
   flex: none;
-  opacity: 0.5;
+  opacity: 0.65;
 }
-/* 收起态的流式摘要：单行省略，占用标签之后的剩余宽度 */
-.tk-live {
+/* 收起态的流式摘要 / 已完成单行摘要：单行省略，占用标签之后的剩余宽度 */
+.tk-live,
+.tk-summary {
   display: inline-flex;
   align-items: center;
   flex: 1 1 auto;
   min-width: 0;
   font-weight: 400;
   letter-spacing: 0;
-  color: var(--text-dim);
+  color: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tk-live-text {
   min-width: 0;
@@ -1296,9 +1336,9 @@ function onEditKeydown(e: KeyboardEvent) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 箭头平时不出现，悬停 / 键盘聚焦 / 已展开时才浮现（与 ZCode 的 hover-only 一致） */
 .think-block :deep(.fold-caret) {
-  opacity: 0;
+  opacity: 0.75;
+  margin-left: 2px;
   transition: opacity 0.12s ease, transform 0.15s ease;
 }
 .think-block :deep(.fold-head:hover .fold-caret),
@@ -1307,21 +1347,18 @@ function onEditKeydown(e: KeyboardEvent) {
   opacity: 1;
 }
 .tk-cnt {
-  margin: 4px 0 0 6px;
-  padding-left: 14px;
-  border-left: 1px solid var(--border);
-  /* 展开后默认只占 10 行高度（1.6em 即一行行高），超出部分内部滚动查看，
-     避免超长思考把整个对话拉成一条；+2px 抵消行高小数的取整误差，防止
-     恰好 10 行时露出 1px 滚动条 */
+  margin: 4px 0 2px;
+  padding-left: 20px;
+  border-left: none;
   max-height: calc(1.6em * 10 + 2px);
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   white-space: pre-wrap;
-  font-family: var(--mono);
+  font-family: inherit;
   font-size: 12px;
   line-height: 1.6;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 /* 滚动边缘渐隐：在顶部只淡出底边，在底部只淡出顶边，在中间两侧都淡 */
 .tk-cnt.is-scrollable.at-bottom:not(.at-top) {
@@ -1454,8 +1491,10 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 
 .md-body {
-  margin-top: 8px;
-  line-height: 1.7;
+  margin-top: 0;
+  font-size: 13.5px;
+  line-height: 1.68;
+  color: var(--xy-text, var(--text));
 }
 
 /* 本地文件链接：虚线强调，与普通 http 链接区分，点击走内嵌预览 */
@@ -1770,8 +1809,9 @@ function onEditKeydown(e: KeyboardEvent) {
   word-break: break-word;
 }
 
-/* 对话内系统提示条（取代原 Toast）：主色调、与错误卡区分 */
+/* 对话内系统提示条：轻量通透提示行，不抢占对话正文视觉层级 */
 .msg-notice {
+  width: 100%;
   display: flex;
   justify-content: flex-start;
 }
@@ -1779,20 +1819,20 @@ function onEditKeydown(e: KeyboardEvent) {
   width: 100%;
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 10px 14px;
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
-  border-left: 3px solid var(--accent);
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--xy-border, var(--border));
   border-radius: 10px;
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg2));
-  font-size: 13px;
-  line-height: 1.6;
+  background: var(--xy-surface, var(--bg2));
+  font-size: 12.5px;
+  line-height: 1.55;
 }
 .notice-icon {
   flex-shrink: 0;
-  color: var(--accent);
-  font-size: 15px;
-  line-height: 1.6;
+  color: var(--xy-text-3, var(--text-faint));
+  display: inline-flex;
+  align-items: center;
+  height: 19px;
 }
 .notice-body {
   flex: 1;
@@ -1804,13 +1844,13 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 .notice-title {
   flex-shrink: 0;
-  font-weight: 600;
-  color: var(--accent);
+  font-weight: 500;
+  color: var(--xy-text-2, var(--text-dim));
 }
 .notice-text {
   flex: 1;
   min-width: 0;
-  color: var(--text);
+  color: var(--xy-text-2, var(--text-dim));
   white-space: pre-wrap;
   word-break: break-word;
 }

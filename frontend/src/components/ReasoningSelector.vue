@@ -9,16 +9,14 @@
     :title="buttonTitle"
     @click.stop="toggleMenu"
   >
-    <AppIcon name="brain" :size="14" :stroke-width="1.9" />
+    <AppIcon name="brain" :size="13.5" :stroke-width="1.8" class="reasoning-icon" />
     <!-- compact 变体也显示文字标签（等级），方便用户一眼看到当前思考强度 -->
     <span class="reasoning-label">{{ currentLabel }}</span>
-    <AppIcon
+    <span
       v-if="!store.reasoning.disabled"
-      name="chevron-down"
-      :size="10"
-      :stroke-width="2"
       class="reasoning-chevron"
-    />
+      aria-hidden="true"
+    >▾</span>
   </button>
 
   <Teleport to="body">
@@ -140,47 +138,45 @@ defineExpose({ close });
 
 <style scoped>
 .reasoning-button {
-  height: 32px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 4px;
   flex-shrink: 0;
-  border: 1px solid var(--border);
-  background: var(--bg3);
-  color: var(--text-dim);
+  border: none;
+  border-radius: 8px;
+  padding: 0 8px;
+  font-size: 12px;
+  background: transparent;
+  color: var(--xy-text-2, var(--text-dim));
   cursor: pointer;
-  transition: 0.15s;
+  transition: background 0.14s, color 0.14s;
   white-space: nowrap;
 }
 .reasoning-button:hover:not(:disabled) {
-  border-color: var(--text-faint);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
 }
 .reasoning-button:disabled {
   cursor: default;
   opacity: 0.72;
 }
-.reasoning-compact {
-  border-radius: 7px;
-  padding: 4px 8px;
-  font-size: 12.5px;
-}
-.reasoning-hero {
-  border-radius: 10px;
-  padding: 0 11px;
-  font-size: 13px;
-  background: transparent;
+.reasoning-icon {
+  display: none;
 }
 /* 手机端：思考按钮只显示脑子图标，隐藏等级文字与展开箭头 */
 @media (max-width: 768px) {
+  .reasoning-icon {
+    display: inline-block;
+  }
   .reasoning-label,
   .reasoning-chevron {
     display: none;
   }
 }
 .reasoning-chevron {
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 .reasoning-menu {
   z-index: 1200;

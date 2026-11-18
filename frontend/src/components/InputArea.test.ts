@@ -117,11 +117,93 @@ it('运行中输入内容按 Enter 排队发送，不再打断当前任务', asy
 
   const wrapper = mount(InputArea);
   const editor = await typeInto(wrapper, '下一条指令');
+  expect(wrapper.get('#send-btn').classes()).toContain('active');
   await editor.trigger('keydown', { key: 'Enter' });
 
   expect(sendSpy).toHaveBeenCalledWith('下一条指令', []);
   expect(stopSpy).not.toHaveBeenCalled();
+  // 发送后输入框 DOM 与 composerText 均应清空，发送按钮回到停止态
+  expect(editor.element.textContent).toBe('');
+  expect(store._getSessionRuntime().composerText).toBe('');
+  expect(wrapper.get('#send-btn').classes()).toContain('stop');
   wrapper.unmount();
+});
+
+it('空闲时按 Enter 发送消息后清空输入框与 composerText', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  const sendSpy = vi.spyOn(store, 'sendMessage').mockResolvedValue(undefined);
+
+  const wrapper = mount(InputArea);
+  const editor = await typeInto(wrapper, '为什么会被拦住');
+  await editor.trigger('keydown', { key: 'Enter' });
+
+  expect(sendSpy).toHaveBeenCalledWith('为什么会被拦住', []);
+  expect(editor.element.textContent).toBe('');
+  expect(editor.classes()).toContain('is-empty');
+  expect(store._getSessionRuntime().composerText).toBe('');
+  wrapper.unmount();
+});
+
+it('打开斜杠补全面板时 ArrowDown 高亮不被 input 事件重置，Enter 选中后不被回滚', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  store.skills = [
+    { id: 's1', name: 'A', short_id: 'alpha', description: 'desc1', enabled: true } as any,
+    { id: 's2', name: 'B', short_id: 'beta', description: 'desc2', enabled: true } as any,
+  ];
+  const sendSpy = vi.spyOn(store, 'sendMessage').mockResolvedValue(undefined);
+
+  const wrapper = mount(InputArea, { attachTo: document.body });
+  const editor = await typeInto(wrapper, '/');
+  expect(wrapper.findAll('.sg-item')).toHaveLength(2);
+
+  await editor.trigger('keydown', { key: 'ArrowDown' });
+  await editor.trigger('keyup', { key: 'ArrowDown' });
+  const items = wrapper.findAll('.sg-item');
+  expect(items[1].classes()).toContain('active');
+
+  await editor.trigger('keydown', { key: 'Enter' });
+  expect(sendSpy).not.toHaveBeenCalled();
+  expect(editor.element.textContent).toBe('/beta ');
+  expect(store._getSessionRuntime().composerText).toBe('/beta ');
+  wrapper.unmount();
+});
+
+it('@ 引用补全后渲染为胶囊，随后按 Enter 发送可完整清空输入框', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  const sendSpy = vi.spyOn(store, 'sendMessage').mockResolvedValue(undefined);
+  (window as any).pywebview = {
+    api: {
+      search_sessions: vi.fn().mockResolvedValue({
+        ok: true,
+        sessions: [{ name: '缓存改造', count: 3, updated_at: '', workdir: '' }],
+      }),
+      search_workspace_files: vi.fn().mockResolvedValue({ files: [] }),
+    },
+  };
+
+  try {
+    const wrapper = mount(InputArea, { attachTo: document.body });
+    const editor = await typeInto(wrapper, '@缓存');
+    await flushPromises();
+    expect(wrapper.findAll('.sg-item')).toHaveLength(1);
+
+    await editor.trigger('keydown', { key: 'Tab' });
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(store._getSessionRuntime().composerText).toBe('@{缓存改造} ');
+    expect(editor.find('.ce-chip-session').exists()).toBe(true);
+
+    await editor.trigger('keydown', { key: 'Enter' });
+    expect(sendSpy).toHaveBeenCalledWith('@{缓存改造} ', []);
+    expect(store._getSessionRuntime().composerText).toBe('');
+    expect(editor.element.textContent).toBe('');
+    expect(editor.find('.ce-chip').exists()).toBe(false);
+    wrapper.unmount();
+  } finally {
+    delete (window as any).pywebview;
+  }
 });
 
 it('运行中输入为空时按钮为停止态，点击中断当前回合', async () => {

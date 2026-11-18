@@ -812,3 +812,24 @@ it('超过 2MB 的图片被拒绝：alert 提示且不写 localStorage（size �
   expect(localStorage.getItem('qq09.sidebarAvatar')).toBeNull();
   wrapper.unmount();
 });
+
+it('当前工作区分组不再显示绿色圆点 .g-current-dot，避免与会话完成绿点混淆', () => {
+  delete (window as any).pywebview;
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.sessionGroups = [{
+    folder_path: 'E:\\fch\\Y-code_tui',
+    folder_name: 'Y-code_tui',
+    is_global: false,
+    is_current: true,
+    sessions: [{ name: 's1', display_name: '会话 1', updated_at: '' }],
+  }] as any;
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  expect(wrapper.find('.g-current-dot').exists()).toBe(false);
+  expect(wrapper.find('.g-folder-ico.is-current').exists()).toBe(true);
+  expect(wrapper.find('.g-title.is-current').exists()).toBe(true);
+  expect(wrapper.find('.g-title').text()).toBe('Y-code_tui');
+  wrapper.unmount();
+});

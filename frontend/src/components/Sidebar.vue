@@ -138,42 +138,44 @@
       </div>
 
     <div class="side-menu">
-      <div class="menu-item" @click="newSession()">
-        <span class="mi-ico">✎</span>
+      <div class="menu-item menu-new-session" @click="newSession()">
+        <span class="mi-ico"><AppIcon name="pencil" :size="14.5" :stroke-width="1.8" /></span>
         <span class="mi-label">新会话</span>
         <span
           class="mi-workdir"
           :title="store.currentWorkdirLabel"
         >{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
-        <span class="mi-arrow">＋</span>
+        <span class="mi-plus">＋</span>
       </div>
       <div class="menu-item" @click="openSkills()">
-        <span class="mi-ico">❖</span>
+        <span class="mi-ico"><AppIcon name="sparkle" :size="14.5" :stroke-width="1.8" /></span>
         <span class="mi-label">星盘 · 技能</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openMcp()">
-        <span class="mi-ico">⧉</span>
+        <span class="mi-ico"><AppIcon name="blocks" :size="14.5" :stroke-width="1.8" /></span>
         <span class="mi-label">星桥 · MCP</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openPlugins()">
-        <span class="mi-ico">⬡</span>
+        <span class="mi-ico"><AppIcon name="hexagon" :size="14.5" :stroke-width="1.8" /></span>
         <span class="mi-label">星匣 · 插件</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openAutomations()">
-        <span class="mi-ico"><AppIcon name="orbit" :size="15" /></span>
+        <span class="mi-ico"><AppIcon name="orbit" :size="14.5" :stroke-width="1.8" /></span>
         <span class="mi-label">星轨</span>
         <span class="mi-arrow">›</span>
       </div>
     </div>
 
+    <div class="side-divider"></div>
+
     <div class="side-section">
-      项目会话
-      <span>
-        <button class="add-btn" title="搜索会话 (Ctrl+F)" style="margin-right:4px" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="13" /></button>
-        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="13" /></button>
+      <span>项目会话</span>
+      <span class="side-section-actions">
+        <button class="add-btn" title="搜索会话 (Ctrl+F)" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="13" :stroke-width="1.9" /></button>
+        <button class="add-btn" title="添加/引入项目文件夹" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="13.5" :stroke-width="1.9" /></button>
       </span>
     </div>
 
@@ -201,18 +203,26 @@
             @dragstart="onGroupDragStart($event, group)"
             @dragend="onGroupDragEnd()"
           >
-            <span class="g-arrow">{{ collapsedGroups[group.folder_path] ? '▸' : '▾' }}</span>
+            <span class="g-arrow" :class="{ collapsed: collapsedGroups[group.folder_path] }">
+              <AppIcon name="chevron-down" :size="12" :stroke-width="2" />
+            </span>
             <!-- 秘书分组是虚拟分组（folder_path='SECRETARY' 不是磁盘目录）：不能打开
                  目录，也不能整组删除，否则会把分组标识当路径发给后端 -->
             <span
               v-if="!group.is_global && group.folder_path !== 'GLOBAL' && !group.is_secretary"
               class="g-folder-ico"
+              :class="{ 'is-current': group.is_current }"
               title="在资源管理器中打开此目录"
               @click.stop="openFolder(group.folder_path)"
-            >📁</span>
-            <span class="g-title" :style="{ color: group.is_current ? 'var(--accent)' : 'inherit' }">
+            ><AppIcon name="folder" :size="13.5" :stroke-width="1.8" /></span>
+            <span v-else-if="group.is_secretary" class="g-group-ico">
+              <AppIcon name="bot" :size="13.5" :stroke-width="1.8" />
+            </span>
+            <span v-else class="g-group-ico">
+              <AppIcon name="message-square" :size="13.5" :stroke-width="1.8" />
+            </span>
+            <span class="g-title" :class="{ 'is-current': group.is_current }">
               {{ getFolderTitle(group) }}
-              <span v-if="group.is_current" class="g-current-dot" title="当前工作区" aria-label="当前"></span>
             </span>
             <span v-if="group.sessions && group.sessions.length > 0" class="g-count">{{ group.sessions.length }}</span>
 
@@ -274,18 +284,20 @@
                 @keydown.esc="onRenameEsc($event)"
                 @blur="commitRename()"
               />
-              <div v-else class="t">{{ s.display_name || s.name }}</div>
-              <span
-                v-if="store.sessionStatusDots[s.name]"
-                class="s-dot"
-                :class="`s-dot-${store.sessionStatusDots[s.name]}`"
-                :title="dotTitle(store.sessionStatusDots[s.name])"
-              ></span>
-              <span
-                v-if="store.runningSessions.includes(s.name)"
-                class="s-spinner"
-                title="正在执行回合"
-              ></span>
+              <template v-else>
+                <span
+                  v-if="store.runningSessions.includes(s.name)"
+                  class="s-running-dot"
+                  title="正在执行回合"
+                ></span>
+                <span
+                  v-else-if="store.sessionStatusDots[s.name]"
+                  class="s-dot"
+                  :class="`s-dot-${store.sessionStatusDots[s.name]}`"
+                  :title="dotTitle(store.sessionStatusDots[s.name])"
+                ></span>
+                <div class="t">{{ s.display_name || s.name }}</div>
+              </template>
               <div class="m">{{ relativeTime(s.updated_at) }}</div>
               <!-- 归档：可逆操作但误点会把会话挪出列表，故与删除一致走行内二次确认。
                    当前活跃会话不可归档，按钮置灰并给出原因 -->
@@ -347,10 +359,10 @@
           <span class="footer-copy"><b :title="trUserLabelTitle">{{ trUserLabelShort }}</b></span>
         </button>
         <button class="icon-btn" data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
-          <AppIcon name="settings" :size="16" />
+          <AppIcon name="settings" :size="14.5" :stroke-width="1.8" />
         </button>
         <button class="icon-btn phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
-          <AppIcon name="smartphone" :size="16" />
+          <AppIcon name="smartphone" :size="14.5" :stroke-width="1.8" />
         </button>
       </div>
       <!-- 基元律动账号浮层：登录成功后点左下角卡片，在卡片上方弹出 -->
@@ -2031,84 +2043,116 @@ function getFolderTitle(g: SessionGroup) {
 <style scoped>
 #sidebar {
   width: 240px;
-  border-right: 1px solid var(--border);
+  border-right: none;
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  transition: margin-left 0.25s;
+  transition: margin-left 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  user-select: none;
 }
 #sidebar.collapsed {
   margin-left: -240px;
 }
 .side-menu {
-  padding: 8px 8px 2px;
-  border-bottom: 1px solid var(--border);
+  padding: 2px 6px 8px;
+}
+.side-divider {
+  margin: 0 8px;
+  border-top: 1px solid var(--xy-border, var(--border));
 }
 .menu-item {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
+  gap: 10px;
+  height: 32px;
+  padding: 0 10px;
   border-radius: 8px;
   cursor: pointer;
-  color: var(--text-dim);
-  margin-bottom: 3px;
-  transition: 0.15s;
+  color: var(--xy-text-2, var(--text-dim));
+  margin-bottom: 2px;
+  font-size: 13px;
+  transition: background 0.14s, color 0.14s;
+}
+.menu-item.menu-new-session {
+  color: var(--xy-text, var(--text));
+}
+.menu-item.menu-new-session .mi-label {
+  font-weight: 500;
 }
 .menu-item:hover {
-  background: var(--bg2);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
 }
 .menu-item .mi-ico {
-  font-size: 14px;
-  width: 18px;
-  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--xy-text-2, var(--text-dim));
+  flex-shrink: 0;
 }
 .menu-item .mi-label {
   flex: 1;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 400;
   white-space: nowrap;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .menu-item .mi-workdir {
-  font-size: 11.5px;
-  color: var(--text-faint);
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 88px;
 }
-.menu-item .mi-arrow {
-  color: var(--text-faint);
+.menu-item .mi-plus {
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 14px;
+  line-height: 1;
   flex-shrink: 0;
+}
+.menu-item .mi-arrow {
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 12px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.menu-item:hover .mi-arrow {
+  opacity: 1;
 }
 
 .side-section {
   padding: 10px 10px 4px;
-  color: var(--text-faint);
-  font-size: 11.5px;
-  letter-spacing: 1px;
-  text-transform: uppercase;
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 12px;
+  font-weight: 500;
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
+.side-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
 .side-section .add-btn {
+  width: 24px;
+  height: 24px;
   background: none;
   border: none;
-  color: var(--text-faint);
-  font-size: 13px;
-  padding: 1px 5px;
-  border-radius: 4px;
-  transition: 0.15s;
+  color: var(--xy-text-3, var(--text-faint));
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.14s, color 0.14s;
 }
 .side-section .add-btn:hover {
-  color: var(--accent);
-  background: var(--bg3);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg3));
 }
 
 .side-scroll {
@@ -2116,177 +2160,196 @@ function getFolderTitle(g: SessionGroup) {
   overflow-y: auto;
 }
 #session-list {
-  padding: 0 6px;
+  padding: 0 4px 8px;
 }
 .session-group {
-  margin-bottom: 8px;
+  margin-bottom: 4px;
 }
 .group-header {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
-  border-radius: 6px;
+  border-radius: 8px;
   cursor: pointer;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 12.5px;
-  font-weight: 600;
+  font-weight: 500;
   user-select: none;
-  transition: 0.15s;
+  transition: background 0.14s, color 0.14s;
+}
+.group-header .g-folder-ico,
+.group-header .g-group-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--xy-text-2, var(--text-dim));
+  border-radius: 4px;
+  transition: color 0.14s, transform 0.14s;
 }
 .group-header .g-folder-ico {
-  font-size: 13px;
-  flex-shrink: 0;
   cursor: pointer;
-  padding: 0 2px;
-  border-radius: 4px;
-  transition: 0.15s;
+}
+.group-header .g-folder-ico.is-current {
+  color: var(--xy-accent, var(--accent));
 }
 .group-header .g-folder-ico:hover {
-  background: var(--bg3);
-  transform: scale(1.15);
+  transform: scale(1.08);
 }
 .more-toggle {
-  padding: 5px 8px 5px 12px;
-  font-size: 11.5px;
-  color: var(--text-faint);
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
   cursor: pointer;
-  border-radius: 6px;
-  transition: 0.15s;
+  border-radius: 8px;
+  transition: background 0.14s, color 0.14s;
   user-select: none;
 }
 .more-toggle:hover {
-  color: var(--accent);
-  background: var(--bg2);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg2));
 }
 .group-header:hover {
-  background: var(--bg2);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
 }
 .group-header .g-arrow {
-  font-size: 10px;
-  color: var(--text-faint);
-}
-.group-header .g-title {
-  flex: 1;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
+  color: var(--xy-text-3, var(--text-faint));
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+.group-header .g-arrow.collapsed {
+  transform: rotate(-90deg);
+}
+.group-header .g-title {
+  flex: 0 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  color: var(--xy-text-2, var(--text-dim));
 }
-.group-header .g-current-dot {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  color: var(--green);
-  background: currentColor;
-  flex-shrink: 0;
+.group-header .g-title.is-current {
+  color: var(--xy-text, var(--text));
 }
 .group-header .g-count {
-  font-size: 11px;
-  color: var(--text-faint);
-  padding: 0 2px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--xy-text-3, var(--text-faint));
+  margin-left: 2px;
 }
 .group-header .g-add, .group-header .g-del {
   background: none;
   border: none;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 12px;
-  padding: 0 4px;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 4px;
-  transition: 0.15s;
+  opacity: 0;
+  transition: opacity 0.14s, color 0.14s, background 0.14s;
+}
+.group-header .g-add {
+  margin-left: auto;
+}
+.group-header:hover .g-add,
+.group-header:hover .g-del {
+  opacity: 1;
 }
 .group-header .g-add:hover {
-  color: var(--accent);
-  background: var(--bg3);
+  color: var(--xy-text, var(--accent));
+  background: var(--xy-hover, var(--bg3));
 }
 .group-header .g-del:hover {
-  color: var(--red);
-  background: rgba(248, 81, 73, 0.15);
+  color: var(--xy-rose, var(--red));
+  background: var(--xy-rose-soft, rgba(248, 81, 73, 0.15));
 }
 
 .group-sessions {
-  padding-left: 6px;
+  padding-left: 12px;
   margin-top: 2px;
-  border-left: 1px solid var(--border);
-  margin-left: 10px;
 }
 .session-item {
   position: relative;
-  padding: 5px 9px;
-  border-radius: 7px;
+  padding: 6px 10px;
+  border-radius: 8px;
   cursor: pointer;
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 8px;
   margin-bottom: 2px;
-  border: 1px solid transparent;
+  border: none;
+  color: var(--xy-text-2, var(--text-dim));
+  transition: background 0.14s, color 0.14s;
 }
 .session-item:hover {
-  background: var(--bg2);
+  background: var(--xy-hover, var(--bg2));
 }
 .session-item.active {
-  background: var(--bg3);
-  border-color: var(--border);
+  background: var(--xy-active, var(--bg3));
+  color: var(--xy-text, var(--text));
+}
+.session-item.active .t {
+  font-weight: 500;
 }
 .session-item .t {
   flex: 1;
   min-width: 0;
-  font-size: 13px;
+  font-size: 12.5px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .session-item .m {
   flex-shrink: 0;
-  font-size: 11.5px;
-  color: var(--text-faint);
-  /* 右侧操作区（归档 ⤓ right:26px / 删除 ✕ right:6px 均为 absolute 定位）需要约 44px，
-     这里给时间预留等宽并右对齐，避免 hover 时按钮压在时间文字上 */
-  min-width: 44px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
+  min-width: 36px;
   text-align: right;
+  transition: opacity 0.14s;
 }
 /* hover 时时间让位给操作按钮：两层文字不再叠在一起 */
 .session-item:hover .m {
-  visibility: hidden;
+  opacity: 0;
 }
-/* 悬停时删除按钮出现在最右侧，隐藏时间避免重叠 */
-.session-item:hover .m {
-  visibility: hidden;
-}
-/* 正在执行回合的会话：名称右侧显示旋转动画图标 */
-.session-item .s-spinner {
+/* 正在执行回合的会话：名称左侧显示呼吸蓝点 */
+.session-item .s-running-dot {
   flex-shrink: 0;
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--border);
-  border-top-color: var(--orange);
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  background: var(--xy-accent, var(--accent));
+  animation: xy-pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes xy-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.4); opacity: 0.35; }
 }
 /* 状态提醒点：非当前会话任务完成/待确认/报错时显示，进入会话后消失 */
 .session-item .s-dot {
   flex-shrink: 0;
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
 }
 .session-item .s-dot-green {
-  background: var(--green);
-  box-shadow: 0 0 4px var(--green);
+  background: var(--xy-green, var(--green));
 }
 .session-item .s-dot-yellow {
-  background: var(--orange);
-  box-shadow: 0 0 4px var(--orange);
+  background: var(--xy-amber, var(--orange));
 }
 .session-item .s-dot-red {
-  background: var(--red);
-  box-shadow: 0 0 4px var(--red);
+  background: var(--xy-rose, var(--red));
 }
 @keyframes spin {
   to { transform: rotate(360deg); }
@@ -2489,12 +2552,13 @@ function getFolderTitle(g: SessionGroup) {
   background: var(--border);
 }
 .side-footer {
-  padding: 7px;
-  border-top: 1px solid var(--border);
+  padding: 8px 8px 4px;
+  border-top: 1px solid var(--xy-border, var(--border));
   display: grid;
-  /* 左侧用户卡片占满剩余宽度，右侧两个图标按钮各自固定 32px */
+  /* 左侧用户卡片占满剩余宽度，右侧两个图标按钮各自固定 28px */
   grid-template-columns: 1fr auto auto;
-  gap: 3px;
+  align-items: center;
+  gap: 4px;
 }
 /* 底部容器：账号浮层（TokenRhythmAccountPanel）以它为定位基准，
    absolute + bottom: calc(100% + 8px) 即贴在用户卡片正上方。
@@ -2508,132 +2572,140 @@ function getFolderTitle(g: SessionGroup) {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 7px 8px;
+  gap: 8px;
+  padding: 4px 4px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 8px;
   background: transparent;
-  color: var(--text-faint);
+  color: var(--xy-text-2, var(--text-faint));
   text-align: left;
+  transition: background 0.14s, color 0.14s;
 }
 .side-footer button:hover {
-  color: var(--text);
-  background: var(--bg2);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg2));
 }
 /* 底部用户卡片：可点击打开基元律动登录窗（圆形头像 + 名称），hover 反馈
    沿用 .side-footer button 的统一样式 */
 .side-footer .side-user {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 5px 7px;
-  color: var(--text-dim);
+  gap: 8px;
+  padding: 4px;
+  color: var(--xy-text, var(--text-dim));
   /* 名字已按 6 字符截断，这里再允许收缩一次：即使出现超长/不可断文本，
      也只让名字自己省略，不把右侧设置与手机图标挤出网格 */
   min-width: 0;
   overflow: hidden;
 }
 .side-footer .side-avatar {
-  flex: 0 0 26px;
-  width: 26px;
-  height: 26px;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
-  border-radius: 50%;
-  background: var(--bg3);
-  color: var(--text);
+  border-radius: 9999px;
+  background: var(--xy-text, var(--bg3));
+  color: var(--xy-canvas, var(--text));
   font-size: 12px;
   font-weight: 600;
 }
-/* 底部右侧图标按钮：设置与手机访问共用同一形态（32×32 圆形热区，与顶栏图标按钮同口径） */
+/* 底部右侧图标按钮：设置与手机访问共用同一形态（28×28 rounded-lg） */
 .side-footer .icon-btn {
-  width: 32px;
+  width: 28px;
+  height: 28px;
   justify-content: center;
-  padding: 7px;
+  padding: 0;
   gap: 0;
-  border-radius: 50%;
+  border-radius: 8px;
 }
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
-.footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.footer-copy b { font-size: 12px; font-weight: 500; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 手机访问绑定弹窗（结构参照 ConfirmModal 的 modal-mask 风格） */
+/* 手机访问绑定弹窗与秘书弹窗（对齐星瑶 v2 极简卡片风格） */
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  padding: 16px;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
-  backdrop-filter: blur(2px);
+  z-index: 5400;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 .modal {
-  width: 380px;
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  width: min(400px, calc(100vw - 32px));
+  background: var(--xy-card, var(--bg1));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
   overflow: hidden;
-  animation: remote-pop 0.2s;
+  animation: remote-pop 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 @keyframes remote-pop {
-  from { transform: scale(0.95); opacity: 0; }
+  from { transform: translateY(6px) scale(0.97); opacity: 0; }
   to { transform: none; opacity: 1; }
 }
 .modal-head {
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border);
+  padding: 18px 20px 12px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 .modal-head .mh-ico {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  background: var(--accent-soft);
-  color: var(--accent);
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--xy-accent-soft, var(--accent-soft));
+  color: var(--xy-accent, var(--accent));
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
 }
 .modal-head h3 {
-  font-size: 14.5px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--xy-text, var(--text-bright));
 }
 .modal-head p {
+  margin: 2px 0 0;
   font-size: 12px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 /* 版本切换分段控件（移动端 / web远端，共用同一配对 token） */
 .bind-switch {
   display: flex;
   gap: 4px;
-  margin: 12px 18px 0;
+  margin: 0 20px 12px;
   padding: 3px;
-  background: var(--bg3, rgba(255, 255, 255, 0.04));
-  border: 1px solid var(--border);
+  background: var(--xy-surface, var(--bg3, rgba(255, 255, 255, 0.04)));
+  border: 1px solid var(--xy-border, var(--border));
   border-radius: 9px;
 }
 .bind-switch button {
   flex: 1;
-  padding: 7px 0;
+  padding: 6px 0;
   border: none;
   background: none;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 12.5px;
   border-radius: 6px;
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .bind-switch button.active {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--xy-card, var(--accent-soft));
+  color: var(--xy-text, var(--accent));
+  box-shadow: var(--xy-shadow-sm, none);
   font-weight: 600;
 }
 .modal-body {
-  padding: 18px;
-  background: var(--bg2);
+  padding: 4px 20px 18px;
+  background: transparent;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2698,50 +2770,58 @@ function getFolderTitle(g: SessionGroup) {
   color: #fff;
 }
 .modal-foot {
-  padding: 13px 18px;
+  padding: 0 20px 18px;
   display: flex;
-  gap: 9px;
+  gap: 8px;
   justify-content: flex-end;
 }
 .btn {
-  border-radius: 8px;
-  padding: 7px 16px;
+  height: 34px;
+  border-radius: 9px;
+  padding: 0 15px;
   font-size: 13px;
-  border: 1px solid var(--border);
-  background: var(--bg3);
-  color: var(--text);
-  transition: 0.15s;
+  font-weight: 500;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  background: transparent;
+  color: var(--xy-text-2, var(--text));
+  transition: background 0.14s ease, color 0.14s ease, filter 0.14s ease;
 }
 .btn:hover {
-  border-color: var(--text-faint);
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
 }
 .btn.primary {
-  background: var(--accent);
+  background: var(--xy-accent, var(--accent));
   border: none;
-  color: #fff;
-  font-weight: 600;
+  color: var(--xy-accent-fg, #fff);
+  font-weight: 500;
+}
+.btn.primary:hover {
+  background: var(--xy-accent, var(--accent));
+  color: var(--xy-accent-fg, #fff);
+  filter: brightness(0.93);
 }
 
 /* 秘书起名弹窗的输入框：样式沿用侧栏就地重命名输入框（.s-rename-input）的观感，
    只是占满弹窗正文宽度（.modal-body 是居中列布局，需要显式 100%） */
 .s-name-input {
   width: 100%;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
+  background: var(--xy-surface, var(--bg2));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 8px;
+  color: var(--xy-text, var(--text));
   font-size: 13px;
   font-family: inherit;
-  padding: 8px 10px;
+  padding: 8px 11px;
   outline: none;
 }
 .s-name-input:focus {
-  border-color: var(--accent);
+  border-color: var(--xy-accent, var(--accent));
 }
 .s-name-hint {
   min-height: 15px;
   font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   text-align: left;
   align-self: stretch;
 }
@@ -2750,7 +2830,7 @@ function getFolderTitle(g: SessionGroup) {
    让多行人设有足够书写空间又不把弹窗撑出屏幕 */
 .s-persona-label {
   font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   text-align: left;
   align-self: stretch;
 }
@@ -2759,18 +2839,18 @@ function getFolderTitle(g: SessionGroup) {
   min-height: 130px;
   max-height: 320px;
   resize: vertical;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
+  background: var(--xy-surface, var(--bg2));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 8px;
+  color: var(--xy-text, var(--text));
   font-size: 13px;
   font-family: inherit;
   line-height: 1.55;
-  padding: 8px 10px;
+  padding: 8px 11px;
   outline: none;
 }
 .s-persona-input:focus {
-  border-color: var(--accent);
+  border-color: var(--xy-accent, var(--accent));
 }
 
 /* 移动端侧栏遮罩：桌面端不显示，仅在 <=768px 侧栏展开时盖住主区。

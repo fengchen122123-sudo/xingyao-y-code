@@ -119,8 +119,9 @@ async function decline() {
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgba(0, 0, 0, .72);
-  backdrop-filter: blur(8px);
+  background: var(--xy-modal-mask, rgba(0, 0, 0, .48));
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 .gate-card {
   width: min(680px, calc(100vw - 40px));
@@ -129,11 +130,11 @@ async function decline() {
   display: flex;
   flex-direction: column;
   padding: 24px 26px 18px;
-  border: 1px solid var(--border);
-  border-radius: 15px;
-  background: var(--bg2);
-  color: var(--text);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, .55);
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  background: var(--xy-card, var(--bg2));
+  color: var(--xy-text, var(--text));
+  box-shadow: var(--xy-shadow-pop, 0 24px 80px rgba(0, 0, 0, .35));
 }
 .gate-head { display: flex; flex-direction: column; gap: 6px; }
 .gate-title-row { display: flex; align-items: center; gap: 10px; }

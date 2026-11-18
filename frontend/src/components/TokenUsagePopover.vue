@@ -211,10 +211,10 @@ onUnmounted(() => {
   z-index: 999;
   box-sizing: border-box;
   padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--theme-float-background) 80%, transparent);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 14px;
+  background: var(--xy-card, color-mix(in srgb, var(--theme-float-background) 92%, transparent));
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
   backdrop-filter: blur(14px);
   color: var(--text);
   animation: tup-fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);

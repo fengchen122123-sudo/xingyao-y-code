@@ -360,7 +360,7 @@ async function selectTheme(summary: GuiThemeSummary) {
   try {
     if (hasLocalChanges.value) {
       const saveFirst = await store.askConfirm(
-        '未保存的主题修改', '', '当前主题有未保存的修改，是否先保存？', '保存修改',
+        '未保存的主题修改', '', '当前主题有未保存的修改，是否先保存？', '保存修改', { tone: 'primary' },
       );
       if (saveFirst) {
         if (!fieldsValid.value || !unifyValid.value) {
@@ -729,8 +729,8 @@ async function clearGlobalInherit() {
 .region-tabs button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12px; }
 .region-tabs button:hover { color: var(--text); background: var(--bg2); }
 .region-tabs button.active { background: var(--bg3); color: var(--text); border-color: var(--accent); }
-.modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; background: rgba(0, 0, 0, .68); backdrop-filter: blur(8px); }
-.theme-modal { width: min(460px, calc(100vw - 40px)); padding: 22px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); display: flex; flex-direction: column; gap: 8px; }
+.modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; padding: 16px; background: var(--xy-modal-mask, rgba(0, 0, 0, .36)); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.theme-modal { width: min(460px, calc(100vw - 40px)); padding: 22px; box-sizing: border-box; border: 1px solid var(--xy-border-strong, var(--border)); border-radius: 16px; background: var(--xy-card, var(--bg2)); box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, .35)); display: flex; flex-direction: column; gap: 8px; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .modal-head h3 { margin: 0; font-size: 15px; }
 .modal-head button { border: 0; background: transparent; color: var(--text-dim); font-size: 20px; }

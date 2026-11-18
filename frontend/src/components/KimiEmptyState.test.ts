@@ -89,7 +89,7 @@ it('shows the sandbox toggle without duplicating the git branch in the hero comp
   expect(wrapper.find('[data-test="hero-git-branch"]').exists()).toBe(false);
 
   const sandbox = wrapper.get('[data-test="hero-sandbox-button"]');
-  expect(sandbox.text()).toContain('沙盒: 限');
+  expect(sandbox.text()).toContain('沙盒限制中');
   await sandbox.trigger('click');
   expect(setSandbox).toHaveBeenCalledWith(true);
   wrapper.unmount();
@@ -130,6 +130,33 @@ it('空态页不显示 Beta 标签，并按项目工作区动态加载推荐提�
   await new Promise((r) => setTimeout(r, 0));
   await wrapper.vm.$nextTick();
   expect(wrapper.find('[data-test="project-prompt-suggestions"]').exists()).toBe(false);
+
+  delete (window as any).pywebview;
+  wrapper.unmount();
+});
+
+it('空态页按 Enter 发送首条消息后清空输入框与新会话 composerText', async () => {
+  const send_user_message = vi.fn().mockResolvedValue({ ok: true });
+  const get_sessions = vi.fn().mockResolvedValue({ ok: true, sessions: [] });
+  (window as any).pywebview = { api: { send_user_message, get_sessions } };
+
+  const store = useAppStore();
+  store.currentSessionName = '';
+  store.pendingWorkdir = 'GLOBAL';
+
+  const wrapper = mount(KimiEmptyState);
+  const editor = wrapper.get('.ce-input');
+  editor.element.textContent = '首条提问内容';
+  await editor.trigger('input');
+
+  await editor.trigger('keydown', { key: 'Enter' });
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(send_user_message).toHaveBeenCalledTimes(1);
+  expect(send_user_message.mock.calls[0][0]).toBe('首条提问内容');
+  expect(store.currentSessionName).toMatch(/^session_[0-9a-f]{6}$/);
+  expect(store._getSessionRuntime().composerText).toBe('');
+  expect(editor.element.textContent).toBe('');
 
   delete (window as any).pywebview;
   wrapper.unmount();

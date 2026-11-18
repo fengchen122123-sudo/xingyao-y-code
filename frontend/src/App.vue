@@ -58,11 +58,31 @@
         @dblclick="resetSidebarWidth"
       ></div>
 
+      <!-- 右侧圆角白底主工作面板 -->
+      <div class="xy-main-card">
       <!-- 中间主对话与聊天区域 -->
       <div id="center">
         <div id="chat-header" data-theme-region="conversation_toolbar">
-          <span class="crumb">
-            会话 / <b>{{ store.currentSessionDisplayName }}</b>
+          <span
+            class="crumb"
+            :class="{ 'is-mobile-clickable': isMobile }"
+            :role="isMobile ? 'button' : undefined"
+            :tabindex="isMobile ? 0 : undefined"
+            :title="isMobile ? '切换或新建会话' : undefined"
+            @click="isMobile && store.toggleSidebar()"
+            @keydown.enter.prevent="isMobile && store.toggleSidebar()"
+          >
+            <span class="crumb-prefix">会话</span>
+            <span class="crumb-sep">/</span>
+            <b class="crumb-name">{{ store.currentSessionDisplayName }}</b>
+            <AppIcon
+              v-if="isMobile"
+              name="chevron-down"
+              :size="13"
+              :stroke-width="2"
+              class="crumb-mobile-caret"
+            />
+            <span v-if="showHeaderWorkdirPill" class="crumb-workdir">{{ store.currentWorkdirLabel }}</span>
           </span>
           <span class="top-spacer"></span>
 
@@ -93,7 +113,7 @@
           </div>
 
           <div v-if="showExportEntry" class="export-wrap">
-            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /><span class="chip-label">导出</span></button>
+            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" :stroke-width="1.8" /><span class="chip-label">导出</span></button>
             <div v-if="showExportMenu" class="export-menu" @click.stop>
               <div class="export-item" @click="doExport('md')">Markdown (.md)</div>
               <div class="export-item" @click="doExport('html')">HTML (.html)</div>
@@ -151,12 +171,14 @@
             </div>
 
             <!-- 消息流列表：按回合分组渲染——回合结束后中间过程折叠成一块，
-                 只突出组尾的最终总结；运行中的回合保持逐条实时显示 -->
+                 只突出组尾的最终总结；运行中的回合保持轻量原生流卡片 -->
             <template v-else>
               <TurnGroup
-                v-for="group in messageGroups"
+                v-for="(group, gIdx) in messageGroups"
                 :key="groupKey(group)"
                 :group="group"
+                :running-elapsed-text="group.running && workElapsed >= 1 ? fmtWorkTime(workElapsed) : ''"
+                :final-work-time-text="gIdx === messageGroups.length - 1 && !group.running && finalWorkTime !== null ? fmtWorkTime(finalWorkTime) : ''"
               />
             </template>
 
@@ -165,19 +187,6 @@
 
             <!-- C11：项目级 Hook 信任卡片（跟随权限卡之后，信任前命令不执行） -->
             <HookTrustCard />
-
-            <!-- 回合活动指示：内容开始输出后才显示（等待首内容阶段由气泡内
-                 等待线负责，两条不重叠）；结束后保留一行静态工作时间 -->
-            <div v-if="showFlowWorking" class="working-indicator">
-              <span class="wi-ring"></span>
-              <span class="wi-text">{{ store.agentName }}正在干活</span>
-              <span class="wi-dots"><i>.</i><i>.</i><i>.</i></span>
-              <span v-if="workElapsed >= 1" class="wi-elapsed">已工作 {{ fmtWorkTime(workElapsed) }}</span>
-            </div>
-            <div v-else-if="finalWorkTime !== null" class="working-indicator done">
-              <span class="wi-check"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
-              <span class="wi-text">{{ store.agentName }}本轮工作 {{ fmtWorkTime(finalWorkTime) }}</span>
-            </div>
           </div>
           </div>
 
@@ -221,13 +230,66 @@
         <!-- 底部内嵌交互式终端（ZCode 式弹出）：v-show 保持挂载，
              收起期间输出持续累积到 xterm 缓冲不丢失。 -->
         <TerminalPane v-show="store.terminalPanelOpen" />
-      </div>
 
+        <!-- 状态栏：位于右侧圆角工作面板底部 -->
+        <div id="statusbar" data-theme-region="statusbar">
+          <span
+            class="si status-connection"
+            :class="{ 'is-connected': store.connected }"
+            data-test="status-connection"
+            data-mobile-status="primary"
+          >
+            <span class="s-dot" :class="{ off: !store.connected }"></span>
+            <span class="conn-full">{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
+            <span class="conn-short">{{ store.connected ? '已连接' : '已断开' }}</span>
+          </span>
+          <span class="si status-model" data-test="status-model" data-mobile-status="primary" :title="'当前模型: ' + (store.activeModelName || '未选择')">{{ store.activeModelName || '未选择模型' }}</span>
+          <span class="si status-workspace" data-test="status-workspace" data-mobile-status="primary" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
+          <span
+            v-if="gitBranchText"
+            class="si status-git-branch"
+            data-test="status-git-branch"
+            data-mobile-status="hidden"
+            :title="'Git 工作台: ' + gitBranchText + '（点击打开 Git 面板）'"
+            style="cursor: pointer"
+            @click="openGitPanel"
+          >{{ gitBranchText }}</span>
+          <span class="si status-token" data-test="status-token" data-mobile-status="hidden" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
+          <span class="si status-permission" data-test="status-permission" data-mobile-status="hidden">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
+          <span
+            class="si status-skill"
+            :class="{ 'is-empty': !store.usedSkills.length }"
+            data-test="status-skill"
+            data-mobile-status="hidden"
+            :title="statusSkillTitle"
+          >
+            <span class="skill-text">技能: {{ statusSkillText }}</span>
+          </span>
+          <span
+            class="si status-sandbox"
+            data-test="status-sandbox"
+            data-mobile-status="primary"
+            :class="{ 'si-warn': store.sandboxEnabled }"
+            :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅允许访问工作目录内文件'"
+          >沙盒: {{ store.sandboxEnabled ? '解除' : '限制' }}</span>
+          <!-- AI 生成内容声明：居中落在状态栏中段剩余区域，空间不足时收缩省略 -->
+          <span
+            class="si status-ai-notice"
+            data-test="status-ai-notice"
+            data-mobile-status="hidden"
+            title="本界面展示的内容由 AI 生成，仅供参考，请仔细甄别"
+          ><span class="notice-text">内容由 AI 生成，仅供参考，请仔细甄别</span></span>
+          <div class="right status-runtime" data-test="status-runtime">
+            <span class="si" data-test="status-running" data-mobile-status="primary">{{ statusRunningText }}</span>
+            <span class="si" data-test="status-charset" data-mobile-status="hidden">UTF-8</span>
+          </div>
+        </div>
+      </div>
 
       <!-- 右面板宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
       <div
         v-if="!isMobile && !store.rightPanelCollapsed"
-        class="panel-resizer"
+        class="panel-resizer panel-resizer-inner"
         :class="{ resizing: rightPanelResizing }"
         title="拖拽调整面板宽度，双击恢复默认"
         data-test="right-panel-resizer"
@@ -242,61 +304,8 @@
       <Transition name="right-panel-slide">
         <RightPanel v-show="!store.rightPanelCollapsed" />
       </Transition>
-      </template>
-    </div>
-
-    <!-- 状态栏 -->
-    <div id="statusbar" data-theme-region="statusbar">
-      <span
-        class="si status-connection"
-        :class="{ 'is-connected': store.connected }"
-        data-test="status-connection"
-        data-mobile-status="primary"
-      >
-        <span class="s-dot" :class="{ off: !store.connected }"></span>
-        <span class="conn-full">{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
-        <span class="conn-short">{{ store.connected ? '已连接' : '已断开' }}</span>
-      </span>
-      <span class="si status-model" data-test="status-model" data-mobile-status="primary" :title="'当前模型: ' + (store.activeModelName || '未选择')">{{ store.activeModelName || '未选择模型' }}</span>
-      <span class="si status-workspace" data-test="status-workspace" data-mobile-status="primary" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
-      <span
-        v-if="gitBranchText"
-        class="si status-git-branch"
-        data-test="status-git-branch"
-        data-mobile-status="hidden"
-        :title="'Git 工作台: ' + gitBranchText + '（点击打开 Git 面板）'"
-        style="cursor: pointer"
-        @click="openGitPanel"
-      >{{ gitBranchText }}</span>
-      <span class="si status-token" data-test="status-token" data-mobile-status="hidden" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
-      <span class="si status-permission" data-test="status-permission" data-mobile-status="hidden">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
-      <span
-        class="si status-skill"
-        :class="{ 'is-empty': !store.usedSkills.length }"
-        data-test="status-skill"
-        data-mobile-status="hidden"
-        :title="statusSkillTitle"
-      >
-        <span class="skill-text">技能: {{ statusSkillText }}</span>
-      </span>
-      <span
-        class="si status-sandbox"
-        data-test="status-sandbox"
-        data-mobile-status="primary"
-        :class="{ 'si-warn': store.sandboxEnabled }"
-        :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅允许访问工作目录内文件'"
-      >沙盒: {{ store.sandboxEnabled ? '解除' : '限制' }}</span>
-      <!-- AI 生成内容声明：居中落在状态栏中段剩余区域，空间不足时收缩省略 -->
-      <span
-        class="si status-ai-notice"
-        data-test="status-ai-notice"
-        data-mobile-status="hidden"
-        title="本界面展示的内容由 AI 生成，仅供参考，请仔细甄别"
-      ><span class="notice-text">内容由 AI 生成，仅供参考，请仔细甄别</span></span>
-      <div class="right status-runtime" data-test="status-runtime">
-        <span class="si" data-test="status-running" data-mobile-status="primary">{{ store.running ? '生成中…' : '空闲' }}</span>
-        <span class="si" data-test="status-charset" data-mobile-status="hidden">UTF-8</span>
       </div>
+      </template>
     </div>
 
     <!-- 确认弹窗 -->
@@ -476,6 +485,11 @@ function backToThemeEditor() {
 const showExportMenu = ref(false);
 // 空新会话页隐藏导出入口（无消息可导，顶部保持干净），进入真实或有消息会话时显示
 const showExportEntry = computed(() => store.messages.length > 0 || !!store.currentSessionName);
+const showHeaderWorkdirPill = computed(() =>
+  !!store.workdir && !!store.currentWorkdirLabel
+  && store.currentWorkdirLabel !== '对话'
+  && store.currentWorkdirLabel !== 'GLOBAL',
+);
 
 // 会话头部“计划”入口 + 任务计划进度对话框：计划数据由 plan_updated 事件流
 // 实时驱动，入口只在存在计划时显示，角标统计进行中的计划条目
@@ -828,20 +842,12 @@ let workTimer: number | undefined;
 let turnStartTs = 0;
 
 function fmtWorkTime(s: number): string {
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-// 与 MessageBubble 的等待线互斥：最后一条是空助手气泡 = 等待首内容阶段
-const showFlowWorking = computed(() => {
-  if (!store.running) return false;
-  const msgs = store.messages;
-  if (!msgs.length) return false;
-  const last = msgs[msgs.length - 1];
-  if (last.role !== 'assistant') return true;
-  if (last.content && last.content.trim()) return true;
-  if (last.reasoning_content && last.reasoning_content.trim()) return true;
-  if (last.tool_calls && last.tool_calls.length) return true;
-  return false;
+const statusRunningText = computed(() => {
+  if (!store.running) return '空闲';
+  return workElapsed.value >= 1 ? `执行中 · ${fmtWorkTime(workElapsed.value)}` : '执行中';
 });
 
 watch(() => store.running, (running) => {
@@ -1030,34 +1036,45 @@ onUnmounted(() => {
   z-index: 5000;
   display: grid;
   place-items: center;
-  background: rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(6px);
+  padding: 16px;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 .close-confirm-card {
-  width: min(420px, calc(100vw - 48px));
-  padding: 24px;
-  border: 1px solid var(--border);
+  width: min(416px, calc(100vw - 32px));
+  padding: 22px 22px 20px;
+  border: 1px solid var(--xy-border-strong, var(--border));
   border-radius: 16px;
-  background: var(--bg1);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  background: var(--xy-card, var(--bg1));
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
 }
-.close-confirm-card h3 { margin: 0 0 8px; font-size: 16px; }
-.close-confirm-card p { margin: 0 0 18px; color: var(--text-dim); font-size: 13px; line-height: 1.6; }
+.close-confirm-card h3 { margin: 0 0 6px; font-size: 15.5px; font-weight: 600; color: var(--xy-text, var(--text-bright)); }
+.close-confirm-card p { margin: 0 0 18px; color: var(--xy-text-2, var(--text-dim)); font-size: 13px; line-height: 1.6; }
 .cc-actions { display: flex; flex-direction: column; gap: 8px; }
 .cc-btn {
-  min-height: 38px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg2);
-  color: var(--text);
+  min-height: 36px;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 9px;
+  background: var(--xy-surface, var(--bg2));
+  color: var(--xy-text, var(--text));
   font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
-  transition: border-color 0.12s, background 0.12s;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
 }
-.cc-btn:hover { border-color: var(--accent); }
-.cc-btn.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
-.cc-btn.danger:hover { background: color-mix(in srgb, var(--red) 10%, var(--bg2)); }
-.cc-btn.ghost { background: transparent; color: var(--text-dim); }
+.cc-btn:hover { background: var(--xy-hover, var(--bg3)); border-color: var(--xy-accent, var(--accent)); }
+.cc-btn.danger {
+  color: var(--xy-rose, var(--red));
+  border-color: color-mix(in srgb, var(--xy-rose, var(--red)) 35%, var(--xy-border, var(--border)));
+  background: var(--xy-rose-soft, transparent);
+}
+.cc-btn.danger:hover {
+  background: color-mix(in srgb, var(--xy-rose, var(--red)) 18%, transparent);
+  border-color: var(--xy-rose, var(--red));
+}
+.cc-btn.ghost { background: transparent; border-color: transparent; color: var(--xy-text-2, var(--text-dim)); }
+.cc-btn.ghost:hover { background: var(--xy-hover, var(--bg2)); border-color: transparent; color: var(--xy-text, var(--text)); }
 .theme-preview-bar {
   position: sticky;
   top: 0;
@@ -1280,7 +1297,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   /* 不设背景色：全局背景图（body::before，最底层）可透到各分区间隙 */
-  color: var(--text);
+  color: var(--xy-text, var(--text));
   font-family: var(--sans);
   overflow: hidden;
 }
@@ -1290,13 +1307,24 @@ onUnmounted(() => {
   display: flex;
   min-height: 0;
   position: relative;
+  padding: 0 8px 8px;
 }
 
-/* 面板宽度拖拽手柄：5px 隐形热区压在分界线上（负 margin 向两侧各溢出
-   2px 便于抓取），悬停/拖拽时显示 accent 高亮中线；移动端由 v-if 不渲染 */
+.xy-main-card {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  border-radius: 16px;
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg1));
+  box-shadow: var(--xy-shadow-sm, none);
+  overflow: hidden;
+}
+
+/* 面板宽度拖拽手柄：占满 8px 缝隙的隐形热区，悬停/拖拽时显示 accent 高亮中线；移动端由 v-if 不渲染 */
 .panel-resizer {
-  width: 5px;
-  margin: 0 -2px;
+  width: 8px;
+  margin: 0;
   flex-shrink: 0;
   cursor: col-resize;
   position: relative;
@@ -1305,16 +1333,26 @@ onUnmounted(() => {
 .panel-resizer::after {
   content: '';
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 2px;
+  top: 8px;
+  bottom: 8px;
+  left: 3px;
   width: 2px;
+  border-radius: 999px;
   background: transparent;
   transition: background 0.15s;
 }
 .panel-resizer:hover::after,
 .panel-resizer.resizing::after {
   background: var(--accent);
+}
+.panel-resizer-inner {
+  width: 5px;
+  margin: 0 -2px;
+}
+.panel-resizer-inner::after {
+  top: 0;
+  bottom: 0;
+  left: 2px;
 }
 /* 拖拽期间禁止选中界面文本、强制列宽光标（指针移出手柄也保持） */
 #main.panel-resizing {
@@ -1368,12 +1406,12 @@ onUnmounted(() => {
 }
 
 #chat-header {
-  height: 38px;
-  border-bottom: 1px solid var(--border);
+  height: 44px;
+  border-bottom: 1px solid var(--xy-border, var(--border));
   display: flex;
   align-items: center;
-  padding: 0 16px;
-  gap: 10px;
+  padding: 0 20px;
+  gap: 8px;
   flex-shrink: 0;
   /* 工具栏按钮的收纳容器：侧栏/右侧面板展开挤窄的是中间列，
      媒体查询感知不到，改按本栏实际宽度分档（见下方 @container chat-header） */
@@ -1381,16 +1419,49 @@ onUnmounted(() => {
   container-name: chat-header;
 }
 #chat-header .crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-size: 13px;
-  color: var(--text-dim);
+  color: var(--xy-text-3, var(--text-dim));
   /* 会话名必须可压缩：空间不足时省略号截断，而不是把右侧操作按钮挤出行外 */
+  min-width: 0;
+}
+#chat-header .crumb.is-mobile-clickable {
+  cursor: pointer;
+  padding: 4px 6px;
+  margin-left: -6px;
+  border-radius: 8px;
+  transition: background 0.15s;
+}
+#chat-header .crumb.is-mobile-clickable:active {
+  background: var(--xy-hover, var(--bg2));
+}
+#chat-header .crumb-mobile-caret {
+  flex-shrink: 0;
+  color: var(--xy-text-3, var(--text-faint));
+}
+#chat-header .crumb-prefix,
+#chat-header .crumb-sep {
+  flex-shrink: 0;
+  color: var(--xy-text-3, var(--text-faint));
+}
+#chat-header .crumb-name {
+  font-weight: 600;
+  color: var(--xy-text, var(--text));
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-#chat-header .crumb b {
-  color: var(--text);
+#chat-header .crumb-workdir {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 400;
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text-2, var(--text-dim));
 }
 /* 对话头部 Git 分支 chip：图标 + 分支名，空间不足时省略号收缩（min-width:0
    才能突破 flex 最小内容宽度，否则按钮被挤成竖条、不省略） */
@@ -1461,24 +1532,15 @@ onUnmounted(() => {
   flex-direction: column;
   min-height: 0;
   position: relative;
-  /* 会话区做成与下方输入框一致的浮层卡片：四周 6px 衬边。
-     用 padding 而非 margin：margin 区不绘制本元素背景。
-     衬边色跟随工作区分区的背景透明度混合（--theme-workspace-* 由主题运行时
-     写在 documentElement 上）：实色主题 opacity=100% 衬边为纯白面板色；
-     全局背景图皮肤下调低透明度时，衬边与会话区一起透出背景图，
-     否则不透明白垫在半透明会话区下面会把背景图整块挡死。 */
-  padding: 6px;
-  background: color-mix(in srgb, var(--bg1) var(--theme-workspace-bg-opacity-pct, 100%), transparent);
+  padding: 0;
+  background: transparent;
 }
 #chat-scroll {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 28px 10px;
-  /* 圆角对齐输入框 #input-box（10px），内容随圆角裁剪；
-     描边与输入框同款：主题里会话区底色常与四周留白的 app 底色几乎同色，
-     没有这条 1px 描边时圆角卡片边界不可见（"看不到留白"的根因） */
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  padding: 16px 36px 12px;
+  border: none;
+  border-radius: 0;
   /* 保留浏览器 scroll anchoring（默认 auto）：翻页 prepend 与图片/异步内容
      分批撑高时由渲染引擎持续保持视口锚点，这是"不回退"的主力机制。
      JS 侧 maybeLoadOlder 的补偿是绝对定位赋值（oldTop + 内容增量），
@@ -1487,6 +1549,8 @@ onUnmounted(() => {
 /* 对话内容容器：消息列表的公共父级 */
 #chat-body {
   position: relative;
+  max-width: var(--chat-col-width);
+  margin: 0 auto;
 }
 /* 回到底部悬浮按钮：用户上滑浏览历史时出现（相对 .chat-viewport 定位） */
 .jump-bottom {
@@ -1514,16 +1578,17 @@ onUnmounted(() => {
 }
 
 .chip-btn {
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  border-radius: 7px;
-  padding: 4px 10px;
+  height: 28px;
+  background: transparent;
+  border: 1px solid var(--xy-border, var(--border));
+  color: var(--xy-text-2, var(--text-dim));
+  border-radius: 8px;
+  padding: 0 10px;
   font-size: 12px;
   display: flex;
   align-items: center;
-  gap: 5px;
-  transition: 0.15s;
+  gap: 6px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
   /* 单行 + 不参与压缩：文字永不断行、按钮不被挤成竖条；
      空间不足时由 .crumb 省略号让位，再窄则由下方 @container 收成纯图标 */
   white-space: nowrap;
@@ -1532,8 +1597,9 @@ onUnmounted(() => {
   position: relative;
 }
 .chip-btn:hover {
-  color: var(--text);
-  border-color: var(--text-faint);
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
+  border-color: var(--xy-border, var(--border));
 }
 
 /* ── 工具栏按钮图标化收纳 ──
@@ -1599,14 +1665,16 @@ onUnmounted(() => {
 }
 
 #statusbar {
-  height: 24px;
-  border-top: 1px solid var(--border);
+  height: 26px;
+  border-top: 1px solid var(--xy-border, var(--border));
   display: flex;
   align-items: center;
-  padding: 0 12px;
+  padding: 0 20px;
   gap: 16px;
-  font-size: 11px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
   flex-shrink: 0;
+  user-select: none;
 }
 #statusbar .si {
   display: flex;
@@ -1668,7 +1736,7 @@ onUnmounted(() => {
 }
 @media (min-width: 769px) {
   /* 桌面端底栏极简化：健康态隐藏"后端已连接"（仅断连提醒），并隐去与输入栏重复的
-     模型/工作区/Token/权限/沙盒/UTF-8 及空技能占位，只留居中声明与右侧运行状态 */
+     模型/工作区/Token/权限/沙盒/UTF-8 及技能占位，只留居中声明与右侧运行状态 */
   #statusbar .si.status-connection.is-connected,
   #statusbar .si.status-model,
   #statusbar .si.status-workspace,
@@ -1676,9 +1744,23 @@ onUnmounted(() => {
   #statusbar .si.status-token,
   #statusbar .si.status-permission,
   #statusbar .si.status-sandbox,
-  #statusbar .si.status-skill.is-empty,
+  #statusbar .si.status-skill,
   #statusbar [data-test="status-charset"] {
     display: none;
+  }
+  #statusbar .status-runtime .si {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+@media (max-width: 768px) {
+  #main {
+    padding: 0;
+  }
+  .xy-main-card {
+    border-radius: 0;
+    border: none;
+    box-shadow: none;
   }
 }
 /* 历史分页加载指示：细条、居中、弱化色，与现有轻提示风格一致 */

@@ -326,8 +326,13 @@ function onCompositionEnd() {
 }
 
 function onBlur() {
+  if (composing) {
+    composing = false;
+    commit();
+    return;
+  }
   // 失焦时把可能的脏结构一次性规范化（不影响输入过程）
-  if (!composing) normalizeIfNeeded();
+  normalizeIfNeeded();
 }
 
 function onPaste(e: ClipboardEvent) {
@@ -392,14 +397,16 @@ function deleteAdjacentChip(dir: -1 | 1): boolean {
 }
 
 function onKeydown(e: KeyboardEvent) {
+  // 组词中的 Enter/方向键属于输入法：必须在派发给父组件前拦截，避免误触发发送或补全导航
+  const isComposing = composing || e.isComposing || e.keyCode === 229;
+  if (isComposing) return;
+
   // 先让父组件跑补全导航与发送判定（Enter 发送由父组件 preventDefault 接管）
   emit('keydown', e);
-  if (e.defaultPrevented) {
-    commit();
-    return;
-  }
-  const isComposing = composing || e.isComposing;
-  if (isComposing) return; // 组词中的 Enter/方向键属于输入法
+  // 父组件接管按键时（如 Enter 发送清空 v-model、Tab/Enter 补全替换、方向键导航），
+  // Vue 尚未把新 modelValue 刷回 DOM，此时绝不能再调 commit()，否则会把 DOM 里的
+  // 旧内容重新回写到 modelValue，导致发送后输入框仍保留原文或补全被回滚
+  if (e.defaultPrevented) return;
 
   if (e.key === 'Enter') {
     e.preventDefault();
@@ -440,6 +447,7 @@ watch(
     if (composing) return;
     render(value || '');
   },
+  { flush: 'sync' },
 );
 
 onMounted(() => render(props.modelValue || ''));

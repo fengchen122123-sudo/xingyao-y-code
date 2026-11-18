@@ -89,11 +89,12 @@ const activeElapsedMs = computed(() => {
 });
 </script>
 <style scoped>
-/* 平铺的工具行：行间距交给每行自己的 padding，这里只给块级留白 */
+/* 平铺的工具行：行间距交给每行自己的 padding */
 .exec-trace {
   display: flex;
   flex-direction: column;
-  margin: 4px 0 6px;
+  gap: 3px;
+  margin: 4px 0 2px;
 }
 
 /* 无障碍播报专用：视觉隐藏但仍在可访问树里 */

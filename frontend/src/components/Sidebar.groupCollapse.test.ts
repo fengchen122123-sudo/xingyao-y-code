@@ -51,7 +51,7 @@ it('折叠分组后写入 localStorage，重新挂载仍保持折叠', async () 
   // 重新挂载（等价于切换页面/重启前端）后应恢复折叠态
   const w2 = mountSidebar([group]);
   expect(groupHidden(w2)).toBe(true);
-  expect(w2.get('.g-arrow').text()).toBe('▸');
+  expect(w2.get('.g-arrow').classes()).toContain('collapsed');
   w2.unmount();
 });
 

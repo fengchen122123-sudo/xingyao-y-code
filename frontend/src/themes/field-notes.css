@@ -24,12 +24,6 @@ html[data-gui-theme-id="builtin.field-notes"] #statusbar {
   --bg3: #1A332A;
 }
 
-/* "[当前]"标签：全局绿 #2F9E5F 在墨绿底上对比不足，提亮为手册浅绿。
-   模板内联 style 只能 !important 压。 */
-html[data-gui-theme-id="builtin.field-notes"] #sidebar .group-header .g-title > span {
-  color: #7FD4A4 !important;
-}
-
 /* ---- 2. 设计稿结构还原 ---- */
 
 /* 侧栏右缘 3px 朱橙细缝（设计稿标志性细节） */

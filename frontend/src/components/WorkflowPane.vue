@@ -297,6 +297,8 @@ async function onImport() {
         '覆盖同名工作流',
         `导入 ${scope === 'project' ? '项目' : '全局'}档`,
         `${exists.map(f => f.name).join('、')} 已存在，覆盖后星瑶侧的修改将丢失，是否继续？`,
+        '覆盖并继续',
+        { tone: 'warning' },
       );
       if (ok) {
         const retry = await store.importWorkflows(paths, scope, true);

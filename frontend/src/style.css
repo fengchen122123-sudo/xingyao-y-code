@@ -60,10 +60,186 @@
   --search-mark-bg: rgba(245, 158, 11, 0.28);
   --search-mark-text: #fde047;
 
-  /* 对话内容列宽度：消息、执行过程折叠卡、文件更改面板、输入框统一占满可用
-     宽度，不再固定 880px 居中，收起两侧面板后无大片留白，各元素左对齐线
-     一致。属布局变量，非主题 token，不受主题运行时覆盖。 */
-  --chat-col-width: 100%;
+  /* 星瑶Code 极简设计稿 v2（方案A）语义变量：自定义主题默认回落到 --theme-*，
+     内置浅/深色在下方按 data-gui-theme-id 精确赋值为设计稿色板。 */
+  --xy-bg: var(--theme-background-app);
+  --xy-sidebar: var(--theme-background-panel);
+  --xy-canvas: var(--theme-background-panel);
+  --xy-surface: var(--theme-background-card);
+  --xy-card: var(--theme-background-panel);
+  --xy-hover: color-mix(in srgb, var(--theme-text-primary) 5.5%, transparent);
+  --xy-active: color-mix(in srgb, var(--theme-text-primary) 9%, transparent);
+  --xy-border: var(--theme-border);
+  --xy-border-strong: color-mix(in srgb, var(--theme-text-primary) 16%, transparent);
+  --xy-text: var(--theme-text-bright);
+  --xy-text-2: var(--theme-text-secondary);
+  --xy-text-3: var(--theme-text-faint);
+  --xy-accent: var(--theme-accent);
+  --xy-accent-soft: var(--theme-accent-soft);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: var(--theme-background-card);
+  --xy-green: var(--theme-success);
+  --xy-green-soft: color-mix(in srgb, var(--theme-success) 13%, transparent);
+  --xy-amber: var(--theme-warning);
+  --xy-amber-soft: color-mix(in srgb, var(--theme-warning) 13%, transparent);
+  --xy-rose: var(--theme-danger);
+  --xy-rose-soft: color-mix(in srgb, var(--theme-danger) 13%, transparent);
+  --xy-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --xy-shadow-composer: 0 8px 28px -6px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.25);
+  --xy-shadow-pop: 0 14px 36px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.09);
+  --xy-modal-mask: rgba(0, 0, 0, 0.48);
+
+  /* 对话内容列宽度：对齐设计稿 max-w-[820px] 居中列宽 */
+  --chat-col-width: 820px;
+}
+
+/* 内置深色 / 未指定主题：精确对齐 xingyao-clean-ui.html data-xy-theme="dark" */
+:root:not([data-gui-theme-id]):not(.light),
+html[data-gui-theme-id="builtin.dark"] {
+  --xy-bg: #141416;
+  --xy-sidebar: #161618;
+  --xy-canvas: #1a1a1d;
+  --xy-surface: #202024;
+  --xy-card: #222226;
+  --xy-hover: rgba(255, 255, 255, 0.055);
+  --xy-active: rgba(255, 255, 255, 0.09);
+  --xy-border: rgba(255, 255, 255, 0.08);
+  --xy-border-strong: rgba(255, 255, 255, 0.14);
+  --xy-text: #f4f4f5;
+  --xy-text-2: #a1a1aa;
+  --xy-text-3: #83838c;
+  --xy-accent: #4f86f7;
+  --xy-accent-soft: rgba(79, 134, 247, 0.14);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: #27272b;
+  --xy-green: #4ade80;
+  --xy-green-soft: rgba(74, 222, 128, 0.13);
+  --xy-amber: #fbbf24;
+  --xy-amber-soft: rgba(251, 191, 36, 0.13);
+  --xy-rose: #f87171;
+  --xy-rose-soft: rgba(248, 113, 113, 0.13);
+  --xy-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --xy-shadow-composer: 0 8px 28px -6px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.25);
+  --xy-shadow-pop: 0 14px 36px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.09);
+  --xy-modal-mask: rgba(0, 0, 0, 0.48);
+  --bg0: var(--xy-bg);
+  --bg1: var(--xy-canvas);
+  --bg2: var(--xy-surface);
+  --bg3: var(--xy-card);
+  --border: var(--xy-border);
+  --text: var(--xy-text);
+  --text-bright: var(--xy-text);
+  --text-dim: var(--xy-text-2);
+  --text-faint: var(--xy-text-3);
+  --accent: var(--xy-accent);
+  --accent-soft: var(--xy-accent-soft);
+  --green: var(--xy-green);
+  --red: var(--xy-rose);
+  --orange: var(--xy-amber);
+  --float-bg: var(--xy-card);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* 内置浅色：精确对齐 xingyao-clean-ui.html data-xy-theme="light" */
+:root.light:not([data-gui-theme-id]),
+html[data-gui-theme-id="builtin.light"] {
+  --xy-bg: #f4f4f1;
+  --xy-sidebar: #f4f4f1;
+  --xy-canvas: #ffffff;
+  --xy-surface: #fafaf8;
+  --xy-card: #ffffff;
+  --xy-hover: rgba(24, 24, 27, 0.045);
+  --xy-active: rgba(24, 24, 27, 0.075);
+  --xy-border: rgba(24, 24, 27, 0.085);
+  --xy-border-strong: rgba(24, 24, 27, 0.14);
+  --xy-text: #18181b;
+  --xy-text-2: #52525b;
+  --xy-text-3: #7c7c82;
+  --xy-accent: #2563eb;
+  --xy-accent-soft: rgba(37, 99, 235, 0.09);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: #f2f4f7;
+  --xy-green: #16a34a;
+  --xy-green-soft: rgba(22, 163, 74, 0.10);
+  --xy-amber: #d97706;
+  --xy-amber-soft: rgba(217, 119, 6, 0.10);
+  --xy-rose: #dc2626;
+  --xy-rose-soft: rgba(220, 38, 38, 0.09);
+  --xy-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --xy-shadow-composer: 0 6px 24px -6px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.04);
+  --xy-shadow-pop: 0 12px 32px -4px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.05);
+  --xy-modal-mask: rgba(15, 23, 42, 0.24);
+  --bg0: var(--xy-bg);
+  --bg1: var(--xy-canvas);
+  --bg2: var(--xy-surface);
+  --bg3: var(--xy-card);
+  --border: var(--xy-border);
+  --text: var(--xy-text);
+  --text-bright: var(--xy-text);
+  --text-dim: var(--xy-text-2);
+  --text-faint: var(--xy-text-3);
+  --accent: var(--xy-accent);
+  --accent-soft: var(--xy-accent-soft);
+  --green: var(--xy-green);
+  --red: var(--xy-rose);
+  --orange: var(--xy-amber);
+  --float-bg: var(--xy-card);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* 内置浅/深色分区映射：顶栏与左侧栏融入外框底色，右侧工作面板为通透画布底色 */
+html[data-gui-theme-id="builtin.light"] [data-theme-region="app_header"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="app_header"] {
+  --theme-region-bg: var(--xy-bg);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="sidebar"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="sidebar"] {
+  --theme-region-bg: var(--xy-sidebar);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="composer"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="composer"] {
+  --theme-region-bg: var(--xy-canvas);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+  --theme-region-surface: var(--xy-card);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="workspace"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="workspace"] {
+  --theme-region-bg: var(--xy-canvas);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+  --theme-region-surface: var(--xy-card);
+  --theme-region-surface-panel: var(--xy-surface);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="workspace"] .msg-user .bubble[class],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="workspace"] .msg-user .bubble[class] {
+  background: var(--xy-user-bubble) !important;
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="conversation_toolbar"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="conversation_toolbar"],
+html[data-gui-theme-id="builtin.light"] [data-theme-region="statusbar"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="statusbar"] {
+  --theme-region-bg: var(--xy-canvas);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="right_panel"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="right_panel"] {
+  --theme-region-bg: var(--xy-surface);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
 }
 
 * {
@@ -75,7 +251,7 @@
 /* 应用兜底底色：body 已透明以透出全局背景图（body::before），
    无全局图时由 html 的语义应用背景色承接，保持不透明 */
 html {
-  background: var(--theme-background-app);
+  background: var(--xy-bg, var(--theme-background-app));
 }
 
 /* ---------- GUI 主题分区接线 ----------
@@ -212,7 +388,7 @@ html {
    透明度透图：保留语义色混合（accent/red 7%）与左边框提示，仅把其中的实色
    基底换成随分区透明度混合的 surface，全局背景图模式下不再以实色块遮挡 */
 [data-theme-region="workspace"] .notice-card[class] {
-  background: color-mix(in srgb, var(--accent) 7%, var(--theme-region-surface-panel)) !important;
+  background: var(--theme-region-surface-panel) !important;
 }
 [data-theme-region="workspace"] .error-card[class] {
   background: color-mix(in srgb, var(--red) 8%, var(--theme-region-surface-panel)) !important;
@@ -340,13 +516,17 @@ body::after {
 }
 
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 5px;
+  height: 5px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--bg3);
-  border-radius: 4px;
+  background: transparent;
+  border-radius: 999px;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: var(--xy-border-strong, var(--bg3));
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -416,15 +596,15 @@ button {
   color: var(--text);
 }
 
-/* Kimi 风格卡片 */
+/* Kimi 风格卡片（对齐极简设计稿 v2 新会话页） */
 .kimi-empty-container {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   min-height: calc(100vh - 160px);
-  padding: 20px;
-  animation: fadein 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  padding: 32px 24px;
+  animation: fadein 0.3s cubic-bezier(0.16, 1, 0.3, 1);
   user-select: none;
 }
 
@@ -456,25 +636,26 @@ button {
 .kimi-title {
   font-size: 22px;
   font-weight: 600;
-  color: var(--text-bright);
-  letter-spacing: -0.3px;
+  color: var(--xy-text, var(--text-bright));
+  letter-spacing: -0.015em;
 }
 
 .kimi-card {
   /* 补全面板 .suggest-panel 以此为绝对定位锚点（缺失会漂到窗口顶部） */
   position: relative;
   width: 100%;
-  max-width: 680px;
+  max-width: 660px;
   background: var(--theme-region-surface, var(--bg1));
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 16px 18px 12px;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  padding: 14px;
+  box-shadow: var(--xy-shadow-composer, none);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
 .kimi-card:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--xy-accent, var(--accent));
+  box-shadow: 0 0 0 3px var(--xy-accent-soft, var(--accent-soft)), var(--xy-shadow-composer, none);
 }
 
 .kimi-card.drop-hover {
@@ -490,10 +671,10 @@ button {
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 15px;
+  font-size: 14.5px;
   resize: none;
   min-height: 75px;
-  line-height: 1.6;
+  line-height: 1.625;
 }
 
 .kimi-card textarea::placeholder {
@@ -504,7 +685,9 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-top: 12px;
+  padding-top: 4px;
 }
 
 /* 左右按钮组：右侧（模型/发送）不参与压缩；左侧工具组允许收缩并在
@@ -514,27 +697,27 @@ button {
 }
 
 .kimi-pill-btn {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  border-radius: 10px;
-  padding: 6px 12px;
-  font-size: 12.5px;
+  background: transparent;
+  border: none;
+  color: var(--xy-text-2, var(--text-dim));
+  border-radius: 8px;
+  padding: 0 8px;
+  font-size: 12px;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   cursor: pointer;
-  transition: 0.15s;
+  transition: background 0.15s, color 0.15s;
   /* CJK 文本逐字换行会把按钮撑成多行竖条，文字一律单行 */
   white-space: nowrap;
   flex-shrink: 0;
-  /* 图标按钮(回形针)与文字按钮统一高度，一行内不出现高低差 */
-  min-height: 30px;
+  height: 28px;
 }
 
 /* 首页模型按钮：档位间隙里唯一可收缩的按钮，空间不足省略号截断 */
 .kimi-card-bar .model-chip {
-  max-width: 200px;
+  max-width: 170px;
   min-width: 0;
   overflow: hidden;
   flex-shrink: 1;
@@ -547,40 +730,46 @@ button {
 }
 
 .kimi-pill-btn:hover {
-  background: var(--bg3);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
 }
 
 .permission-mode-btn.perm-confirm {
-  --permission-color: var(--green);
+  --permission-color: var(--xy-green, var(--green));
+  --permission-soft: var(--xy-green-soft, color-mix(in srgb, var(--green) 12%, transparent));
 }
 
 .permission-mode-btn.perm-accept_edits {
-  --permission-color: var(--yellow);
+  --permission-color: var(--xy-amber, var(--yellow));
+  --permission-soft: var(--xy-amber-soft, color-mix(in srgb, var(--yellow) 12%, transparent));
 }
 
 .permission-mode-btn.perm-auto {
-  --permission-color: var(--cyan);
+  --permission-color: var(--xy-accent, var(--cyan));
+  --permission-soft: var(--xy-accent-soft, color-mix(in srgb, var(--cyan) 12%, transparent));
 }
 
 .permission-mode-btn.perm-plan {
   --permission-color: var(--purple);
+  --permission-soft: color-mix(in srgb, var(--purple) 12%, transparent);
 }
 
 .permission-mode-btn.perm-full {
-  --permission-color: var(--red);
+  --permission-color: var(--xy-rose, var(--red));
+  --permission-soft: var(--xy-rose-soft, color-mix(in srgb, var(--red) 12%, transparent));
 }
 
 .permission-mode-btn.permission-mode-btn.permission-mode-btn {
-  border-color: var(--permission-color);
+  border: none;
   color: var(--permission-color);
-  background: color-mix(in srgb, var(--permission-color) 12%, var(--bg2));
+  background: var(--permission-soft);
+  font-weight: 500;
 }
 
 .permission-mode-btn.permission-mode-btn.permission-mode-btn:hover {
-  border-color: var(--permission-color);
+  border: none;
   color: var(--permission-color);
-  background: color-mix(in srgb, var(--permission-color) 20%, var(--bg2));
+  background: color-mix(in srgb, var(--permission-color) 18%, transparent);
 }
 
 .permission-chevron {
@@ -590,25 +779,25 @@ button {
 }
 
 .kimi-send-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 9999px;
   border: none;
-  background: var(--bg3);
-  color: var(--text-faint);
-  font-size: 17px;
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 14px;
   font-weight: 700;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: 0.2s;
+  transition: background 0.15s, color 0.15s;
 }
 
 .kimi-card:focus-within .kimi-send-btn,
 .kimi-send-btn.active {
-  background: var(--accent);
-  color: #fff;
+  background: var(--xy-accent, var(--accent));
+  color: var(--xy-accent-fg, #fff);
 }
 .kimi-send-btn:disabled {
   opacity: 0.5;
@@ -623,25 +812,32 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  background: var(--theme-region-surface-panel, var(--bg1));
-  border: 1px solid transparent;
+  background: var(--theme-region-surface-panel, transparent);
+  border: none;
   border-radius: 999px;
-  padding: 5px 14px;
-  font-size: 12.5px;
-  color: var(--text-faint);
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
   cursor: pointer;
-  transition: 0.15s;
+  transition: background 0.15s, color 0.15s;
+}
+
+html[data-gui-theme-id="builtin.light"] .kimi-footer-workdir,
+html[data-gui-theme-id="builtin.dark"] .kimi-footer-workdir,
+html:not([data-gui-theme-id]) .kimi-footer-workdir {
+  background: transparent;
 }
 
 .kimi-footer-workdir:hover {
-  color: var(--text);
-  background: var(--bg2);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg2));
 }
 
 .kimi-project-prompts {
-  margin-top: 12px;
+  margin-top: 14px;
   width: 100%;
-  max-width: 680px;
+  max-width: 660px;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -654,9 +850,9 @@ button {
   max-width: 100%;
   padding: 0 12px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--xy-border, var(--border));
   background: transparent;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-family: inherit;
   font-size: 12px;
   line-height: 26px;
@@ -668,9 +864,9 @@ button {
 }
 
 .kimi-prompt-chip:hover {
-  color: var(--text);
-  border-color: var(--text-faint);
-  background: var(--bg2);
+  color: var(--xy-text, var(--text));
+  border-color: var(--xy-border-strong, var(--text-faint));
+  background: var(--xy-surface, var(--bg2));
 }
 
 /* 动效 */
@@ -687,8 +883,9 @@ button {
 
 /* 高清精细 Markdown 样式 */
 .md-body {
-  line-height: 1.78;
-  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.68;
+  color: var(--xy-text, var(--text));
 }
 .md-body p {
   margin: 6px 0;
@@ -861,6 +1058,8 @@ button {
   --theme-code-background: #f0f0ec;
   --theme-float-background: rgba(255, 255, 255, 0.97);
   --theme-shadow-color: rgba(0, 0, 0, 0.18);
+  --xy-shadow-pop: 0 12px 32px -4px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.05);
+  --xy-modal-mask: rgba(15, 23, 42, 0.24);
 
   /* 浅色主题下的搜索关键词高亮标记：高对比深琥珀字色与柔和黄色底色 */
   --search-mark-bg: #fef08a;
@@ -951,8 +1150,8 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
      Sidebar.vue scoped 样式（scoped 为 #sidebar[data-v-hash]，特异性更高）。 */
   #main > #sidebar {
     position: fixed;
-    top: 48px; /* 顶栏高度 */
-    bottom: 24px; /* 状态栏高度 */
+    top: 42px; /* 顶栏高度 */
+    bottom: 0;
     left: 0;
     width: min(300px, 86vw);
     z-index: 400;
@@ -980,18 +1179,19 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
   }
 
   /* 右面板：手机上默认隐藏（无切换入口，内容经全屏 Subpage 可达） */
-  #main > #rightbar {
+  #main #rightbar {
     display: none;
   }
 
-  /* 状态栏：手机端只保留连接、模型、工作区、沙盒、运行状态五项，其余隐藏。
-     注意：隐藏规则必须 !important —— App.vue scoped 的 `#statusbar .si[data-v-x]{display:flex}`
-     特异性 (1,2,0) 高于普通媒体查询规则，会顶掉 display:none。 */
+  /* 手机端底栏对齐桌面方案A的极简风格：正常态隐藏与顶栏/输入栏重复的
+     连接/模型/工作区/沙盒/权限等项，只留断开警告（断连时）、AI 轻提示与运行状态 */
   #statusbar {
     box-sizing: border-box;
-    height: calc(28px + env(safe-area-inset-bottom));
-    padding: 0 8px env(safe-area-inset-bottom);
-    gap: 8px;
+    height: calc(24px + env(safe-area-inset-bottom));
+    padding: 0 14px env(safe-area-inset-bottom);
+    gap: 10px;
+    font-size: 11px;
+    border-top: none;
     overflow: hidden;
     flex-wrap: nowrap;
   }
@@ -999,7 +1199,15 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     min-width: 0;
     white-space: nowrap;
   }
-  #statusbar [data-mobile-status="hidden"] {
+  #statusbar .si.status-connection.is-connected,
+  #statusbar .si.status-model,
+  #statusbar .si.status-workspace,
+  #statusbar .si.status-git-branch,
+  #statusbar .si.status-token,
+  #statusbar .si.status-permission,
+  #statusbar .si.status-skill,
+  #statusbar .si.status-sandbox,
+  #statusbar [data-test="status-charset"] {
     display: none !important;
   }
   #statusbar .conn-full {
@@ -1009,20 +1217,19 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     display: inline;
   }
   #statusbar .status-connection,
-  #statusbar .status-sandbox,
   #statusbar .status-runtime {
     flex: 0 0 auto;
   }
-  #statusbar .status-model {
+  #statusbar .status-ai-notice {
+    display: flex !important;
     flex: 1 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    min-width: 0;
+    justify-content: flex-start;
+    opacity: 0.72;
   }
-  #statusbar .status-workspace {
-    flex: 0 1 auto;
-    max-width: 22vw;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  #statusbar .status-runtime .si {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
   }
   /* 触屏优化：表单控件字号 >=16px，防 iOS 聚焦时自动放大页面 */
   textarea,
@@ -1031,17 +1238,17 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     font-size: 16px !important;
   }
 
-  /* 图标按钮 / 发送按钮 / 输入区按钮增大点击热区 */
+  /* 手机端顶栏与输入栏按钮保持轻量统一高度 */
   .icon-btn {
-    min-width: 40px;
-    min-height: 40px;
+    min-width: 34px;
+    min-height: 34px;
   }
   #input-area #send-btn {
-    width: 40px;
-    height: 40px;
+    width: 32px;
+    height: 32px;
   }
   #input-area .chip-btn {
-    min-height: 36px;
+    min-height: 28px;
   }
 
   /* 对话区窄屏压缩左右留白，消息气泡不溢出 */

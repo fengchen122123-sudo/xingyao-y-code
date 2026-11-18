@@ -28,8 +28,8 @@
         :title="undoButton.title"
         @click="onUndoClick"
       >
-        <AppIcon v-if="undoButton.icon" :name="undoButton.icon" :size="13" />
-        {{ undoButton.label }}
+        <span>{{ undoButton.label }}</span>
+        <AppIcon v-if="undoButton.icon" :name="undoButton.icon" :size="12" :stroke-width="2" />
       </button>
     </div>
 
@@ -267,7 +267,7 @@ const undoButton = computed<null | {
     if (availability === 'expired') {
       return { label: '撤销记录已过期', kind: 'muted', disabled: true, aria: '撤销记录已过期' };
     }
-    return { label: '撤销 ↶', kind: 'primary', disabled: busy.value, icon: 'chevron-right', aria: '撤销本轮文件修改' };
+    return { label: '撤销', kind: 'primary', disabled: busy.value, icon: 'undo', aria: '撤销本轮文件修改' };
   }
   if (st.status === 'conflicted') {
     return { label: '撤销受阻 · 重新检查', kind: 'warn', disabled: busy.value, aria: '撤销受阻，重新检查', title: '查看冲突详情' };
@@ -383,7 +383,7 @@ async function onUndoClick() {
       );
     }
     lines.push('建议撤销期间暂停其他工具对目标文件的写入。');
-    const ok = await store.askConfirm('撤销本轮修改', '按回合撤销文件修改', lines.join('\n'), '撤销本轮修改 ⏎');
+    const ok = await store.askConfirm('撤销本轮修改', '按回合撤销文件修改', lines.join('\n'), '撤销本轮修改');
     if (!ok) return;
     // 重新预检拿新令牌（确认期间文件可能已变化，执行前会再次校验）
     const fresh = await store.previewTurnUndo(props.turnId);
@@ -422,7 +422,8 @@ async function startRecovery(action: 'continue_revert' | 'cancel_revert') {
       action === 'continue_revert'
         ? `将使用本轮开始前快照完成剩余撤销：${result.preview.remaining_files.join('、') || '无剩余文件'}`
         : '将把已处理路径恢复到点击撤销之前的状态',
-      action === 'continue_revert' ? '继续撤销 ⏎' : '取消撤销 ⏎',
+      action === 'continue_revert' ? '继续撤销' : '取消撤销',
+      { tone: action === 'continue_revert' ? 'primary' : 'warning' },
     );
     if (!ok) return;
     const done = await store.executeTurnUndoRecovery(
@@ -489,14 +490,15 @@ async function openFile(path: string) {
 
 <style scoped>
 .cfp {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg2);
+  border: 1px solid var(--xy-border, var(--border));
+  border-radius: 12px;
+  background: var(--xy-surface, var(--bg2));
   overflow: hidden;
 }
 .cfp-head-row {
   display: flex;
-  align-items: stretch;
+  align-items: center;
+  padding-right: 10px;
 }
 .cfp-head {
   display: flex;
@@ -504,20 +506,20 @@ async function openFile(path: string) {
   gap: 8px;
   flex: 1;
   min-width: 0;
-  padding: 9px 12px;
+  padding: 10px 10px 10px 14px;
   background: none;
   border: none;
   cursor: pointer;
   font-family: inherit;
-  font-size: 13px;
-  color: var(--text-dim);
+  font-size: 12px;
+  color: var(--xy-text-2, var(--text-dim));
   text-align: left;
 }
 .cfp-head:hover {
-  background: var(--bg3);
+  background: var(--xy-hover, var(--bg3));
 }
 .cfp-head:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--xy-accent, var(--accent));
   outline-offset: -2px;
 }
 /* 撤销按钮：头部右侧独立操作区，与展开区互不嵌套、互不触发 */
@@ -526,27 +528,29 @@ async function openFile(path: string) {
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
-  margin: 5px 8px;
-  padding: 3px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  background: var(--xy-card, var(--bg1));
   font-family: inherit;
   font-size: 12px;
-  color: var(--text);
+  font-weight: 500;
+  color: var(--xy-text-2, var(--text));
   cursor: pointer;
   white-space: nowrap;
+  transition: color 0.14s, border-color 0.14s;
 }
 .cfp-undo-btn.primary:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--xy-border-strong, var(--accent));
+  color: var(--xy-text, var(--accent));
 }
 .cfp-undo-btn.warn {
-  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
-  color: var(--red);
+  border-color: color-mix(in srgb, var(--xy-rose, var(--red)) 45%, var(--border));
+  color: var(--xy-rose, var(--red));
 }
 .cfp-undo-btn.muted {
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   cursor: default;
 }
 .cfp-undo-btn:disabled {
@@ -554,34 +558,36 @@ async function openFile(path: string) {
   cursor: default;
 }
 .cfp-undo-btn:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--xy-accent, var(--accent));
   outline-offset: 1px;
 }
 .cfp-ico {
   flex-shrink: 0;
-  color: var(--text-faint);
+  color: var(--xy-text-2, var(--text-faint));
 }
 .cfp-title {
-  font-weight: 600;
-  color: var(--text);
+  font-weight: 500;
+  color: var(--xy-text, var(--text));
 }
 .cfp-stats {
   margin-left: auto;
   display: flex;
-  gap: 8px;
+  gap: 6px;
+  font-family: var(--mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 .cfp-caret {
   flex-shrink: 0;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   transition: transform 0.15s ease;
 }
 .cfp-caret.is-open {
   transform: rotate(90deg);
 }
 .cfp-body {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg1));
   padding: 4px 0;
 }
 .cfp-row {

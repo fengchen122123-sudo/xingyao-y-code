@@ -1,4 +1,5 @@
 import { mount } from '@vue/test-utils';
+import { defineComponent, ref } from 'vue';
 import { describe, expect, it } from 'vitest';
 import ComposerEditor from './ComposerEditor.vue';
 
@@ -108,6 +109,63 @@ describe('ComposerEditor @ 引用胶囊', () => {
     expect(wrapper.get('.ce-input').classes()).toContain('is-empty');
     await wrapper.setProps({ modelValue: '有内容了' });
     expect(wrapper.get('.ce-input').classes()).not.toContain('is-empty');
+    wrapper.unmount();
+  });
+
+  it('父组件在 keydown 中 preventDefault 并修改 v-model（如 Enter 发送清空）时，不回写旧文本且 DOM 清空', async () => {
+    const Host = defineComponent({
+      components: { ComposerEditor },
+      setup() {
+        const text = ref('');
+        const sent: string[] = [];
+        function onKeydown(e: KeyboardEvent) {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sent.push(text.value);
+            text.value = '';
+          }
+        }
+        return { text, sent, onKeydown };
+      },
+      template: '<ComposerEditor v-model="text" @keydown="onKeydown" />',
+    });
+
+    const wrapper = mount(Host, { attachTo: document.body });
+    const editor = wrapper.get('.ce-input');
+    editor.element.textContent = '为什么会被拦住';
+    await editor.trigger('input');
+    expect(wrapper.vm.text).toBe('为什么会被拦住');
+
+    await editor.trigger('keydown', { key: 'Enter' });
+
+    expect(wrapper.vm.sent).toEqual(['为什么会被拦住']);
+    expect(wrapper.vm.text).toBe('');
+    expect(editor.element.textContent).toBe('');
+    expect(editor.classes()).toContain('is-empty');
+    wrapper.unmount();
+  });
+
+  it('输入法组词期间按 Enter 不向父组件透传 keydown，也不触发 submit', async () => {
+    const wrapper = mountEditor('nihao');
+    const editor = wrapper.get('.ce-input');
+
+    await editor.trigger('compositionstart');
+    await editor.trigger('keydown', { key: 'Enter' });
+    expect(wrapper.emitted('keydown')).toBeUndefined();
+    expect(wrapper.emitted('submit')).toBeUndefined();
+
+    await editor.trigger('compositionend');
+
+    // 原生 isComposing=true（即使 compositionstart 未先到）同样拦截
+    editor.element.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true }),
+    );
+    expect(wrapper.emitted('keydown')).toBeUndefined();
+    expect(wrapper.emitted('submit')).toBeUndefined();
+
+    await editor.trigger('keydown', { key: 'Enter' });
+    expect(wrapper.emitted('keydown')).toHaveLength(1);
+    expect(wrapper.emitted('submit')).toHaveLength(1);
     wrapper.unmount();
   });
 });

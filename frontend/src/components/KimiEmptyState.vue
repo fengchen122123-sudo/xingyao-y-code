@@ -2,7 +2,7 @@
   <div class="kimi-empty-container">
     <div class="kimi-hero">
       <div class="kimi-title-row">
-        <span class="kimi-title">让 {{ store.agentName }} 帮你完成任务</span>
+        <span class="kimi-title">让{{ store.agentName }}帮你完成任务</span>
       </div>
     </div>
 
@@ -36,20 +36,21 @@
           <button
             ref="attachBtnRef"
             data-test="attachment-button"
-            class="kimi-pill-btn"
+            class="kimi-pill-btn kimi-icon-btn"
             title="添加附件"
             @click.stop="onAttachClick"
-          ><AppIcon name="paperclip" :size="14" /></button>
+          ><AppIcon name="paperclip" :size="14.5" :stroke-width="1.8" /></button>
           <!-- 屏幕截图：全屏框选屏幕任意区域；截图「发到输入框」后后端经
                snip_attachment_ready 桥事件回传路径，由 store 加入输入框附件 -->
           <button
             data-test="screen-snip-button"
-            class="kimi-pill-btn snip-pill"
+            class="kimi-pill-btn kimi-icon-btn snip-pill"
             title="截图：框选屏幕任意区域"
             @click.stop="onScreenSnipClick"
-          ><AppIcon name="scissors" :size="14" /></button>
+          ><AppIcon name="scissors" :size="14.5" :stroke-width="1.8" /></button>
           <!-- 触摸设备隐藏文件入口：点击后由系统弹出拍照/相册/文件选择 -->
           <input ref="touchFileInputRef" type="file" multiple style="display:none" @change="onPickInputChange">
+          <span class="composer-sep" aria-hidden="true"></span>
           <button
             ref="permBtnRef"
             data-test="permission-button"
@@ -57,10 +58,7 @@
             :class="`perm-${store.permissionMode}`"
             title="切换权限模式"
             @click.stop="togglePermDropdown"
-          >
-            <AppIcon class="perm-icon" name="shield" :size="13" :stroke-width="2" /><span class="perm-label">{{ formatPermMode(store.permissionMode) }}</span>
-            <AppIcon class="permission-chevron" name="chevron-down" :size="11" :stroke-width="2" />
-          </button>
+          ><span class="perm-dot" aria-hidden="true"></span><AppIcon class="perm-icon" name="shield" :size="13" :stroke-width="2" /><span class="perm-label">{{ formatPermMode(store.permissionMode) }}</span></button>
           <!-- 沙盒限制开关（绿框位）：与输入框沙盒 chip 同一后端配置 -->
           <button
             data-test="hero-sandbox-button"
@@ -68,7 +66,7 @@
             :class="{ 'sandbox-open': store.sandboxEnabled }"
             :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
-          ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
+          ><span class="sb-dot" aria-hidden="true"></span><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒已解除' : '沙盒限制中' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
         </div>
 
         <div ref="barRightRef" class="kimi-bar-right">
@@ -78,10 +76,7 @@
             class="kimi-pill-btn model-chip"
             title="切换模型"
             @click.stop="toggleModelCascader"
-          >
-            <AppIcon class="model-icon" name="box" :size="13" :stroke-width="2" /><span class="model-label">{{ store.activeModelName || '选择模型' }}</span>
-            <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" />
-          </button>
+          ><AppIcon class="model-icon" name="box" :size="13" :stroke-width="2" /><span class="model-label">{{ store.activeModelName || '选择模型' }}</span><span class="model-chevron" aria-hidden="true">▾</span></button>
 
           <ReasoningSelector
             ref="reasoningSelectorRef"
@@ -96,7 +91,7 @@
             :disabled="store.currentSessionRunning"
             title="发送消息 (Enter)"
             @click="handleSend"
-          ><AppIcon name="arrow-up" :size="16" :stroke-width="2.25" /></button>
+          ><AppIcon name="arrow-up" :size="14" :stroke-width="2.2" /></button>
         </div>
       </div>
     </div>
@@ -106,8 +101,9 @@
       class="kimi-footer-workdir"
       @click.stop="toggleWorkdirDropdown"
     >
-      <span class="workdir-label">{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '进入项目工作区' : '当前工作区: ' + store.currentWorkdirLabel }}</span>
-      <AppIcon name="chevron-down" :size="11" :stroke-width="2" class="model-chevron" />
+      <AppIcon name="folder" :size="13" :stroke-width="1.8" />
+      <span class="workdir-label">{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '进入项目工作区' : '当前工作区：' + store.currentWorkdirLabel }}</span>
+      <span class="model-chevron" aria-hidden="true">▾</span>
     </div>
 
     <!-- 项目感知推荐提示词：仅在绑定项目工作区且存在建议时出现，自由对话保持留白 -->
@@ -447,10 +443,43 @@ function handleKeydown(e: KeyboardEvent) {
   backdrop-filter: blur(14px);
   animation: fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
-/* 沙盒开关解除态：橙色提示（与输入框沙盒 chip 一致） */
+/* 沙盒开关与权限圆点（对齐极简设计稿 v2） */
+.composer-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 2px;
+  background: var(--xy-border, var(--border));
+  flex-shrink: 0;
+}
+.perm-dot,
+.sb-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.kimi-icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0 !important;
+}
+.sandbox-pill {
+  background: var(--xy-green-soft, color-mix(in srgb, var(--green) 12%, transparent));
+  color: var(--xy-green, var(--green));
+  font-weight: 500;
+}
+.sandbox-pill:hover {
+  background: color-mix(in srgb, var(--xy-green, var(--green)) 18%, transparent);
+  color: var(--xy-green, var(--green));
+}
 .sandbox-pill.sandbox-open {
-  border-color: var(--orange);
-  color: var(--orange);
+  background: var(--xy-amber-soft, color-mix(in srgb, var(--orange) 12%, transparent));
+  color: var(--xy-amber, var(--orange));
+}
+.sandbox-pill.sandbox-open:hover {
+  background: color-mix(in srgb, var(--xy-amber, var(--orange)) 18%, transparent);
+  color: var(--xy-amber, var(--orange));
 }
 .workdir-item {
   padding: 9px 12px;
@@ -548,16 +577,16 @@ function handleKeydown(e: KeyboardEvent) {
   gap: 6px;
   flex-shrink: 0;
 }
-/* 工具栏内边距整体收紧 2px：实测 600px 卡片里完整文字差 31px，
-   这些零碎宽度凑一凑就够，视觉上看不出区别，却能把权限文字留住 */
+/* 工具栏内边距 */
 .kimi-card-bar .kimi-bar-left .kimi-pill-btn,
 .kimi-card-bar .kimi-bar-right .kimi-pill-btn {
-  padding-left: 10px;
-  padding-right: 10px;
-}
-.kimi-card-bar .kimi-bar-left .permission-mode-btn {
   padding-left: 8px;
   padding-right: 8px;
+}
+.kimi-card-bar .kimi-bar-left .permission-mode-btn,
+.kimi-card-bar .kimi-bar-left .sandbox-pill {
+  padding-left: 10px;
+  padding-right: 10px;
 }
 /* 工作区标签：窄容器下省略号收尾，不折行把卡片撑高 */
 .workdir-label {
@@ -566,9 +595,8 @@ function handleKeydown(e: KeyboardEvent) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 权限文案只在真放不下时让位：`.kimi-bar-left` 的可用宽度由右侧模型名长度决定，
-   固定容器阈值算不准（旧阈值 660 让 600px 左右的卡片也被收成纯图标，肉眼看着
-   明明还有空位）。改由脚本实测 scrollWidth，真溢出才加 .is-tight */
+/* 权限文案只在真放不下时让位 */
+.kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .perm-dot,
 .kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .perm-label,
 .kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .permission-chevron {
   display: none;
@@ -631,20 +659,26 @@ function handleKeydown(e: KeyboardEvent) {
 
 @media (max-width: 768px) {
   /* 手机端收窄按钮：权限/模型只显示图标（颜色仍跟随状态），对齐对话中输入栏样式 */
+  .permission-mode-btn .perm-dot,
   .permission-mode-btn .perm-label,
   .permission-mode-btn .permission-chevron,
   .model-chip .model-label,
-  .model-chip .model-chevron {
+  .model-chip .model-chevron,
+  .sandbox-label-full,
+  .sb-dot {
     display: none;
   }
   .perm-icon,
   .model-icon {
     display: inline-flex;
   }
+  .sandbox-label-short {
+    display: inline;
+  }
   /* 手机端沙盒只留 开/限 */
   .sandbox-pill {
     font-size: 12px;
-    padding: 6px 9px;
+    padding: 0 9px;
   }
 }
 </style>

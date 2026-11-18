@@ -246,4 +246,16 @@ describe('Topbar sidebar toggle', () => {
     expect(wrapper.find('button#btn-toggle-side').exists()).toBe(false);
     expect(wrapper.get('#btn-toggle-side').classes()).toContain('mark');
   });
+
+  it('provides an explicit mobile menu button that toggles the sidebar drawer', async () => {
+    const store = useAppStore();
+    store.sidebarCollapsed = true;
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+
+    await wrapper.get('[data-test="mobile-sidebar-toggle"]').trigger('click');
+    expect(store.sidebarCollapsed).toBe(false);
+
+    await wrapper.get('[data-test="mobile-sidebar-toggle"]').trigger('click');
+    expect(store.sidebarCollapsed).toBe(true);
+  });
 });

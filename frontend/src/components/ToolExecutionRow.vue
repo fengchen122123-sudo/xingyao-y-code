@@ -40,8 +40,8 @@
         v-if="canExpand"
         class="trace-caret"
         :class="{ 'is-open': rowOpen }"
-        name="chevron-right"
-        :size="11"
+        name="chevron-down"
+        :size="12"
         :stroke-width="2"
       />
     </div>
@@ -392,7 +392,7 @@ function diffLineClass(line: string) {
 </script>
 
 <style scoped>
-/* 每条工具 = 一行摘要（无边框无底色，宽度贴合内容）+ 按需展开的缩进详情 */
+/* 方案A · 轻量原生流工具行：无竖向连接线、无外框，圆点 + 类别 + 目标 + diff/耗时 */
 .trace-row {
   margin: 0;
 }
@@ -402,71 +402,62 @@ function diffLineClass(line: string) {
   gap: 8px;
   width: fit-content;
   max-width: 100%;
-  padding: 3px 8px 3px 0;
+  padding: 2px 6px 2px 2px;
   border-radius: 6px;
-  font-size: 12.5px;
-  color: var(--text-faint);
-  transition: background 0.12s ease;
+  font-size: 13px;
+  line-height: 1.375;
+  color: var(--xy-text-2, var(--text-faint));
+  transition: opacity 0.12s ease, background 0.12s ease;
 }
 .trace-line.can-toggle {
   cursor: pointer;
 }
 .trace-line.can-toggle:hover {
-  background: color-mix(in srgb, var(--text) 5%, transparent);
+  opacity: 0.85;
 }
 .trace-line.can-toggle:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--xy-accent, var(--accent));
   outline-offset: 1px;
 }
-/* 箭头平时不出现，悬停 / 键盘聚焦 / 已展开时才浮现（与思考块一致） */
 .trace-line.can-toggle:hover .trace-caret,
 .trace-line.can-toggle:focus-visible .trace-caret,
 .trace-caret.is-open {
   opacity: 1;
 }
-/* 节点列：固定 18px 宽，圆点居中落在轨道线上 */
+/* 节点列：纯圆点（无竖向轨道线） */
 .trace-icon {
   position: relative;
   flex: none;
-  width: 18px;
-  height: 18px;
+  width: 10px;
+  height: 16px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-dim);
+  color: var(--xy-green, var(--green));
 }
-/* 轨道线：贯穿摘要行高度，相邻行首尾相接成为一条连续竖线；
-   首行从节点中心起、末行到节点中心止，线不会伸出整组两端 */
-.trace-icon::before {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: -3px;
-  bottom: -3px;
-  width: 1px;
-  margin-left: -0.5px;
-  background: var(--border);
-  opacity: 0.45;
+.trace-icon.node-subagent,
+.trace-icon.node-skill {
+  color: #8b5cf6;
 }
-.trace-row.trace-first .trace-icon::before {
-  top: 50%;
+.trace-icon.node-read,
+.trace-icon.node-search,
+.trace-icon.node-command,
+.trace-icon.node-mutation,
+.trace-icon.node-computer,
+.trace-icon.node-tool,
+.trace-icon.node-legacy {
+  color: var(--xy-green, var(--green));
 }
-.trace-row.trace-last .trace-icon::before {
-  bottom: 50%;
+.status-running .trace-icon {
+  color: var(--xy-accent, var(--accent));
 }
-/* 类别色：读取蓝 / 搜索青 / 运行绿 / 编辑橙 / 技能紫 / 通用灰 / 历史变更黄 */
-.trace-icon.node-read { color: var(--accent); }
-.trace-icon.node-search { color: var(--cyan); }
-.trace-icon.node-command { color: var(--green); }
-.trace-icon.node-mutation { color: var(--orange); }
-.trace-icon.node-skill { color: var(--purple); }
-.trace-icon.node-computer { color: var(--cyan); }
-.trace-icon.node-subagent { color: var(--purple); }
-.trace-icon.node-tool { color: var(--text-dim); }
-.trace-icon.node-legacy { color: var(--yellow); }
-.status-failed .trace-icon { color: var(--red); }
-.status-cancelled .trace-icon { color: var(--orange); }
-/* 节点圆点：当前色实心点，完成/取消后收一点透明度，运行中保持满亮 */
+.status-failed .trace-icon {
+  color: var(--xy-rose, var(--red));
+}
+.status-cancelled .trace-icon {
+  color: var(--xy-amber, var(--orange));
+}
+/* 节点圆点：6px 实心圆点；运行中 8px + 柔和呼吸 */
 .trace-node-dot {
   position: relative;
   z-index: 1;
@@ -475,52 +466,36 @@ function diffLineClass(line: string) {
   border-radius: 50%;
   background: currentColor;
 }
-.status-completed .trace-node-dot {
-  opacity: 0.55;
+.status-running .trace-node-dot {
+  width: 8px;
+  height: 8px;
+  animation: xy-dot-pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
-/* 运行中：圆点外圈持续扩散的脉冲光环（替代文字扫光） */
 .trace-node-pulse {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 6px;
-  height: 6px;
-  margin: -3px 0 0 -3px;
-  border-radius: 50%;
-  background: currentColor;
-  animation: trace-node-pulse 2s ease-out infinite;
-  pointer-events: none;
+  display: none;
 }
-@keyframes trace-node-pulse {
-  0% {
-    transform: scale(1);
-    opacity: 0.4;
-  }
-  70%,
-  100% {
-    transform: scale(2.8);
-    opacity: 0;
-  }
+@keyframes xy-dot-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.35); opacity: 0.35; }
 }
 .trace-node-mark {
   position: relative;
   z-index: 1;
-} 
-/* 运行中不转圈：图标保持静态，状态交给扫光标签与行尾耗时 */
+}
 .trace-kind {
   flex: none;
   font-weight: 500;
   white-space: nowrap;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
 }
 .trace-kind.is-live {
-  color: var(--text-bright);
+  color: var(--xy-accent, var(--accent));
 }
 .trace-target {
   min-width: 0;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--xy-text, var(--text));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -529,7 +504,7 @@ function diffLineClass(line: string) {
   flex: none;
   font-size: 10.5px;
   font-weight: 600;
-  color: var(--orange);
+  color: var(--xy-amber, var(--orange));
   border: 1px solid currentColor;
   border-radius: 999px;
   padding: 0 7px;
@@ -538,52 +513,54 @@ function diffLineClass(line: string) {
 .trace-diff-badge {
   flex: none;
   display: inline-flex;
-  gap: 4px;
+  gap: 5px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
 }
 .trace-diff-badge .add {
-  color: var(--green);
+  color: var(--xy-green, var(--green));
 }
 .trace-diff-badge .del {
-  color: var(--red);
+  color: var(--xy-green, var(--green));
 }
 .trace-meta {
   flex: none;
-  font-size: 11px;
+  font-size: 12px;
   font-family: var(--mono);
-  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  color: var(--xy-text-3, var(--text-faint));
 }
 /* 失败：红色状态词 + 虚线下划线，悬停出完整报错 */
 .trace-meta.is-error {
-  color: var(--red);
+  color: var(--xy-rose, var(--red));
   text-decoration: underline dotted;
   text-underline-offset: 3px;
   cursor: help;
 }
 .trace-meta.is-warn {
-  color: var(--orange);
+  color: var(--xy-amber, var(--orange));
 }
 .trace-meta.is-live {
-  color: var(--accent);
+  color: var(--xy-accent, var(--accent));
 }
 .trace-caret {
   flex: none;
-  opacity: 0;
-  color: var(--text-faint);
+  opacity: 0.75;
+  color: var(--xy-text-3, var(--text-faint));
   transition: opacity 0.12s ease, transform 0.15s ease;
 }
 .trace-caret.is-open {
-  transform: rotate(90deg);
+  transform: rotate(180deg);
 }
 
-/* 展开区：左侧细线与轨道线同一条竖线（9px 处），视觉上属于同一个节点 */
+/* 展开区：轻量缩进（无竖向边框线） */
 .trace-detail {
-  margin: 0 0 4px 9px;
-  padding: 2px 0 6px 13px;
-  border-left: 1px solid var(--border);
+  margin: 2px 0 4px 18px;
+  padding: 0;
+  border-left: none;
   font-size: 12px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 .trace-files {
   margin: 0;

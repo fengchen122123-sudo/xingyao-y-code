@@ -664,7 +664,7 @@ onUnmounted(() => {
 <style scoped>
 #rightbar {
   width: 330px;
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--xy-border, var(--border));
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
@@ -702,9 +702,9 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 38px;
-  padding: 0 8px;
-  border-bottom: 1px solid var(--border);
+  height: 44px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--xy-border, var(--border));
   flex-shrink: 0;
   min-width: 0;
 }
@@ -1013,23 +1013,25 @@ onUnmounted(() => {
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  padding: 16px;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
   display: none;
   align-items: center;
   justify-content: center;
   z-index: 1000;
-  backdrop-filter: blur(2px);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 .modal-mask.show {
   display: flex;
 }
 .modal {
   width: 640px;
-  max-width: 90vw;
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  max-width: calc(100vw - 32px);
+  background: var(--xy-card, var(--bg1));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
   overflow: hidden;
 }
 /* 文件预览弹窗加宽，保证代码行能完整显示 */

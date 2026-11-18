@@ -1,7 +1,18 @@
 <template>
   <div id="topbar" data-theme-region="app_header">
-    <!-- 侧栏开合入口：点击左上角星瑶图标收起/展开左侧栏
-         （热区只覆盖图标本身，右侧文字标题不参与；原独立汉堡按钮已移除） -->
+    <!-- 手机端显式会话/侧栏抽屉按钮：桌面端隐藏，手机端固定在左上角一眼可见 -->
+    <button
+      type="button"
+      class="icon-btn no-drag mobile-sidebar-btn"
+      data-test="mobile-sidebar-toggle"
+      :title="store.sidebarCollapsed ? '打开会话列表' : '收起会话列表'"
+      :aria-label="store.sidebarCollapsed ? '打开会话列表' : '收起会话列表'"
+      @click="store.toggleSidebar()"
+    >
+      <AppIcon name="menu" :size="16" :stroke-width="2" />
+    </button>
+    <!-- 侧栏开合入口：桌面端点击左上角星瑶图标收起/展开左侧栏
+         （热区只覆盖图标本身，右侧文字标题不参与；桌面端不显示额外汉堡按钮） -->
     <div class="logo no-drag" :title="logoTitle">
       <img
         class="mark"
@@ -45,13 +56,13 @@
     </button>
 
     <button class="icon-btn no-drag" id="btn-terminal" title="切换终端" data-test="btn-terminal" @click="store.toggleTerminalPanel()">
-      <AppIcon name="square-terminal" :size="16" />
+      <AppIcon name="square-terminal" :size="14.5" :stroke-width="1.8" />
     </button>
     <button class="icon-btn no-drag" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
-      <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" />
+      <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="14.5" :stroke-width="1.8" />
     </button>
     <button class="icon-btn no-drag" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">
-      <AppIcon name="panel-right" :size="16" />
+      <AppIcon name="panel-right" :size="14.5" :stroke-width="1.8" />
     </button>
 
     <!-- 自绘窗口控制按钮（frameless）：颜色随主题，hover 态清晰 -->
@@ -197,46 +208,66 @@ function handleUpdateClick() {
 
 <style scoped>
 #topbar {
-  height: 48px;
-  border-bottom: 1px solid var(--border);
+  height: 42px;
+  border-bottom: none;
   display: flex;
   align-items: center;
-  padding: 0 14px;
-  gap: 12px;
+  padding: 0 12px;
+  gap: 4px;
   flex-shrink: 0;
+  user-select: none;
 }
 
-/* 顶栏图标按钮（终端 / 主题 / 面板）：32×32 方形热区，圆角拉满成正圆。
-   与侧栏底部手机按钮同口径；窗口控制按钮（.win-btn，40×32）保持原圆角不动。 */
+/* 顶栏图标按钮（终端 / 主题 / 面板）：28×28 rounded-lg */
 #topbar .icon-btn {
-  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  color: var(--xy-text-2, var(--text-dim));
+}
+#topbar .icon-btn:hover {
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
+}
+.mobile-sidebar-btn {
+  display: none;
+}
+@media (max-width: 768px) {
+  .mobile-sidebar-btn {
+    display: inline-flex;
+  }
 }
 #topbar .logo {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   user-select: none;
 }
 #topbar .logo .mark {
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
   object-fit: cover;
   display: block;
   /* 兼作侧栏开合入口：热区只在图标本身 */
   cursor: pointer;
-  transition: filter 0.12s;
+  transition: transform 0.12s, filter 0.12s;
 }
 #topbar .logo .mark:hover {
-  filter: brightness(1.12);
+  filter: brightness(1.06);
+}
+#topbar .logo .mark:active {
+  transform: scale(0.95);
 }
 #topbar .logo .mark:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 #topbar .logo .name {
+  font-size: 13.5px;
   font-weight: 600;
-  letter-spacing: 0.5px;
+  letter-spacing: -0.01em;
+  color: var(--xy-text, var(--text));
 }
 #topbar .logo .sub {
   color: var(--text-faint);
@@ -257,16 +288,18 @@ function handleUpdateClick() {
 .window-controls {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 0;
   margin-left: 4px;
+  padding-left: 4px;
+  border-left: 1px solid var(--xy-border, var(--border));
 }
 .win-btn {
-  width: 40px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   border: none;
   background: transparent;
-  color: var(--text-dim);
-  font-size: 14px;
+  color: var(--xy-text-3, var(--text-dim));
+  font-size: 12px;
   line-height: 1;
   display: flex;
   align-items: center;
@@ -276,8 +309,8 @@ function handleUpdateClick() {
   transition: background 0.12s, color 0.12s;
 }
 .win-btn:hover {
-  background: var(--bg2);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
 }
 .win-close:hover {
   background: var(--red);

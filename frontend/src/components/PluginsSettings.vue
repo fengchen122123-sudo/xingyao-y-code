@@ -84,21 +84,21 @@ watch(
 <style scoped>
 .plugins-settings { max-width: 1120px; margin: 0 auto; }
 
-/* 标题栏 / 刷新按钮 / 左列表右详情骨架：与 SettingsPage 同款视觉 */
-.settings-header { display: flex; align-items: flex-end; justify-content: space-between; margin: 0 auto 26px; }
-.settings-header h1 { margin: 0 0 10px; font-size: 32px; letter-spacing: -1px; }
-.settings-header p { margin: 0; color: var(--text-faint); font-size: 13px; }
-.icon-button { background: transparent; color: var(--text-dim); border: 0; font-size: 20px; }
-.icon-button:hover { color: var(--text); }
-.model-settings-card { display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: 610px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); overflow: hidden; }
-.provider-list { padding: 16px 12px; border-right: 1px solid var(--border); background: var(--bg2); overflow-y: auto; }
+/* 标题栏 / 刷新按钮 / 左列表右详情骨架：与 SettingsPage 方案A 同款视觉 */
+.settings-header { display: flex; align-items: center; justify-content: space-between; margin: 0 auto 20px; }
+.settings-header h1 { margin: 0 0 6px; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
+.settings-header p { margin: 0; color: var(--xy-text-3, var(--text-faint)); font-size: 12.5px; }
+.icon-button { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; background: transparent; color: var(--xy-text-2, var(--text-dim)); border: 1px solid var(--xy-border, var(--border)); }
+.icon-button:hover { background: var(--xy-hover, var(--bg2)); color: var(--xy-text, var(--text)); }
+.model-settings-card { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: 580px; border: 1px solid var(--xy-border, var(--border)); border-radius: 14px; background: var(--xy-card, var(--bg1)); overflow: hidden; }
+.provider-list { padding: 14px 10px; border-right: 1px solid var(--xy-border, var(--border)); background: var(--xy-surface, var(--bg2)); overflow-y: auto; }
 /* 未选中插件时的占位也需要详情区同款内边距（子组件根元素共享父组件 scoped 属性） */
-.provider-detail { padding: 38px; }
-.list-label { padding: 4px 10px 10px; color: var(--text-faint); font-size: 11px; font-weight: 600; }
-.provider-empty { padding: 12px 10px; color: var(--text-faint); font-size: 11px; }
-.provider-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; cursor: pointer; }
-.provider-item:hover, .provider-item.active { background: var(--bg3); color: var(--text); }
-.provider-item.active { border-color: var(--border); }
+.provider-detail { padding: 28px 32px; }
+.list-label { padding: 4px 10px 8px; color: var(--xy-text-3, var(--text-faint)); font-size: 11px; font-weight: 600; }
+.provider-empty { padding: 12px 10px; color: var(--xy-text-3, var(--text-faint)); font-size: 12px; }
+.provider-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 7px 10px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--xy-text-2, var(--text-dim)); text-align: left; cursor: pointer; transition: background .15s ease, color .15s ease, border-color .15s ease; }
+.provider-item:hover { background: var(--xy-hover, var(--bg3)); color: var(--xy-text, var(--text)); }
+.provider-item.active { background: var(--xy-card, var(--bg1)); border-color: var(--xy-border, var(--border)); color: var(--xy-text, var(--text)); font-weight: 500; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
 .provider-logo { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 7px; background: var(--accent-soft); color: var(--accent); flex-shrink: 0; }
 .provider-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 

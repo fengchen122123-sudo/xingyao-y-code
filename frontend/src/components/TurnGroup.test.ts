@@ -121,13 +121,13 @@ describe('TurnGroup', () => {
     expect(wrapper.find('.fold-body .assistant-name').exists()).toBe(false);
   });
 
-  it('展开折叠区后名字行移到中间过程首条，仍只有一处', async () => {
+  it('展开折叠区后身份行仍固定在顶部且只有一处', async () => {
     const wrapper = mount(TurnGroup, { props: { group: finishedGroup() } });
 
     await wrapper.get('.fold-head').trigger('click');
 
     expect(wrapper.findAll('.assistant-name')).toHaveLength(1);
-    expect(wrapper.find('.fold-body .assistant-name').exists()).toBe(true);
+    expect(wrapper.find('.fold-body .assistant-name').exists()).toBe(false);
   });
 
   it('回合运行中名字行只出现在中间过程首条', () => {

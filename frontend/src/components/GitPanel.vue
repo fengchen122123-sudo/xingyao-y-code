@@ -631,8 +631,10 @@ watch(
 .git-confirm-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.45);
+  padding: 16px;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
   backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -640,27 +642,29 @@ watch(
   z-index: 4000;
 }
 .git-confirm {
-  background: var(--bg2);
-  border: 1px solid color-mix(in srgb, var(--red) 55%, var(--border));
-  border-radius: 14px;
-  padding: 16px 18px;
-  width: min(420px, 90vw);
+  background: var(--xy-card, var(--bg2));
+  border: 1px solid color-mix(in srgb, var(--xy-rose, var(--red)) 40%, var(--xy-border-strong, var(--border)));
+  border-radius: 16px;
+  padding: 20px 22px 18px;
+  width: min(416px, calc(100vw - 32px));
   display: flex;
   flex-direction: column;
   gap: 10px;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
 }
-.git-confirm-title { font-weight: 700; color: var(--red); font-size: 14px; }
-.git-confirm-text { font-size: 13px; line-height: 1.6; }
-.git-confirm-risk { font-size: 12px; color: var(--text-dim, #888); }
-.git-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+.git-confirm-title { font-weight: 600; color: var(--xy-rose, var(--red)); font-size: 15px; }
+.git-confirm-text { font-size: 13.5px; line-height: 1.6; color: var(--xy-text, var(--text)); }
+.git-confirm-risk { font-size: 12px; color: var(--xy-text-3, var(--text-dim, #888)); }
+.git-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
 /* ---------- Diff 审查弹窗：大窗口展示改动，点击遮罩/Esc 关闭 ---------- */
 .git-diff-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  padding: 16px;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
   backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -668,15 +672,15 @@ watch(
   z-index: 4000;
 }
 .git-diff-modal {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 14px;
+  background: var(--xy-card, var(--bg2));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
   width: min(1000px, 94vw);
   height: min(86vh, 920px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
 }
 .git-diff-modal-head {
   display: flex;

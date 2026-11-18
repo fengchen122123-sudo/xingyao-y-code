@@ -59,10 +59,10 @@ const emit = defineEmits<{
   right: 0;
   display: flex;
   flex-direction: column;
-  background: var(--float-bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.35);
+  background: var(--xy-card, var(--float-bg));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 12px;
+  box-shadow: var(--xy-shadow-pop, 0 -8px 30px rgba(0, 0, 0, 0.25));
   backdrop-filter: blur(14px);
   padding: 5px;
   /* 空会话页卡片居中，面板向上弹出时上方空间有限（约 280px），

@@ -298,7 +298,9 @@ async function trustSelected() {
   if (!target) return;
   const ok = await store.askConfirm(
     '信任插件', '信任后插件代码将被执行',
-    `确定信任插件「${target}」并启用吗？`
+    `确定信任插件「${target}」并启用吗？`,
+    '信任并启用',
+    { tone: 'warning' },
   );
   if (!ok) return;
   busy.value = true;

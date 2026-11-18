@@ -85,7 +85,7 @@ it('pending 新会话切换模型写入 pending runtime，不回写其它会话'
   expect(store.reasoning.choice).toBe('medium');
 });
 
-it('已有真实对话的会话切换模型仍显示切换提示', async () => {
+it('已有真实对话的会话切换模型也静默更新，不向消息流插入提示条', async () => {
   const store = useAppStore();
   store.currentSessionName = 'session-a';
   store.messages = [
@@ -96,9 +96,8 @@ it('已有真实对话的会话切换模型仍显示切换提示', async () => {
 
   await store.setModel('m-kimi');
 
-  const last = store.messages[store.messages.length - 1];
-  expect(last.role).toBe('notice');
-  expect(String(last.content)).toContain('已切换活动模型');
+  expect(store.activeModelId).toBe('m-kimi');
+  expect(store.messages).toHaveLength(2);
 });
 
 it('模型选择随会话 runtime 保存与恢复，切会话立即生效（不等后端响应）', async () => {

@@ -61,18 +61,22 @@ it('setPermissionMode 在空会话静默生效，不产生 notice', async () => 
   expect(store.messages.length).toBe(0);
 });
 
-it('setPermissionMode 在已有对话的会话中插入 notice', async () => {
+it('setPermissionMode 与 setSandbox 在已有对话中静默切换，不向消息流插入提示条', async () => {
   (window as any).pywebview = {
-    api: { set_permission_mode: vi.fn(async () => ({ ok: true, permission_mode: 'auto' })) },
+    api: {
+      set_permission_mode: vi.fn(async () => ({ ok: true, permission_mode: 'auto' })),
+      set_sandbox_enabled: vi.fn(async () => ({ ok: true, allow_outside_workspace: true })),
+    },
   };
   const store = useAppStore();
   store.messages.push({ role: 'user', content: '你好' } as never);
 
   await store.setPermissionMode('auto' as never);
+  await store.setSandbox(true);
 
-  const last = store.messages[store.messages.length - 1];
-  expect(last.role).toBe('notice');
-  expect(last.content).toContain('权限模式已调整');
+  expect(store.permissionMode).toBe('auto');
+  expect(store.sandboxEnabled).toBe(true);
+  expect(store.messages).toHaveLength(1);
 });
 
 it('setPermissionMode 失败时即使在空会话也保留失败提示', async () => {
