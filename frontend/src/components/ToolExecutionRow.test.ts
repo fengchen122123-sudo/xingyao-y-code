@@ -267,4 +267,74 @@ describe('computer action row', () => {
     expect(wrapper.find('.computer-shot').exists()).toBe(false);
     expect(wrapper.text()).toContain('该帧已过期');
   });
+
+  it('strips leading cd prefix in compact command target while preserving full command in title', () => {
+    const fullCmd = 'cd D:\\repo\\project; npm test';
+    const wrapper = mount(ToolExecutionRow, {
+      props: {
+        row: {
+          id: 'cmd-cd-1',
+          kind: 'tool',
+          count: 1,
+          action: '运行',
+          detail: fullCmd,
+          command: fullCmd,
+          status: 'completed',
+          errorSummary: '',
+          metrics: {},
+          calls: [
+            {
+              id: 'cmd-cd-1',
+              name: 'execute_command',
+              label: '运行',
+              display: {
+                category: 'command',
+                action: '运行',
+                target: fullCmd,
+                command: fullCmd,
+                metrics: {},
+                error_summary: '',
+                is_skill: false,
+              },
+              result: { ok: true, summary: '完成', result: 'ok', duration_ms: 80 },
+            },
+          ],
+          legacyDiffs: [],
+        },
+      },
+    });
+
+    expect(wrapper.get('.trace-target').text()).toBe('npm test');
+    expect(wrapper.get('.trace-line').attributes('title')).toContain(fullCmd);
+    wrapper.unmount();
+  });
+
+  it('summarizes multi-file legacy-diffs cleanly while keeping all files visible when expanded', async () => {
+    const wrapper = mount(ToolExecutionRow, {
+      props: {
+        row: {
+          id: 'legacy-diffs-multi',
+          kind: 'legacy-diffs',
+          count: 2,
+          action: '变更',
+          detail: 'src/b.ts 等 2 个文件',
+          command: '',
+          status: 'completed',
+          errorSummary: '',
+          metrics: {},
+          calls: [],
+          legacyDiffs: [
+            { file_path: 'src/b.ts', diff_text: '--- src/b.ts\n+++ src/b.ts\n-old\n+new' },
+            { file_path: 'src/c.ts', diff_text: '--- src/c.ts\n+++ src/c.ts\n-a\n+b' },
+          ],
+        },
+      },
+    });
+
+    expect(wrapper.get('.trace-target').text()).toBe('b.ts 等 2 个文件');
+    await wrapper.get('.trace-line').trigger('click');
+    expect(wrapper.text()).toContain('src/b.ts');
+    expect(wrapper.text()).toContain('src/c.ts');
+    wrapper.unmount();
+  });
 });

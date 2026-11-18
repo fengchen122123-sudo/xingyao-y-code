@@ -146,4 +146,25 @@ describe('TurnGroup', () => {
 
     expect(wrapper.findAll('.assistant-name')).toHaveLength(1);
   });
+
+  it('中间过程助手消息不重复渲染性能指标栏，仅末尾结果保留', () => {
+    const metrics = { duration_s: 2.34, token_speed: 58.2, completion_tokens: 142 };
+    const group: TurnGroupInfo = {
+      userMsg: user('跑个任务'),
+      middle: [
+        assistant({ content: '中间轮 1', metrics: { duration_s: 1.2, token_speed: 40.0, completion_tokens: 50 } }),
+        assistant({ content: '中间轮 2', metrics: { duration_s: 1.8, token_speed: 45.0, completion_tokens: 80 } }),
+      ],
+      tail: [assistant({ content: '最终回复', metrics })],
+      running: true,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    const bars = wrapper.findAll('.msg-metrics-bar');
+    expect(bars).toHaveLength(1);
+    expect(bars[0].text()).toContain('58.2 t/s');
+    wrapper.unmount();
+  });
 });

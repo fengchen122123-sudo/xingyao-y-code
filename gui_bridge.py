@@ -59,6 +59,7 @@ from core.secretary_dispatches import (
     DispatchStore,
 )
 from core import project_profile
+from core.project_prompt_suggestions import build_workspace_prompt_suggestions
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_terminal
 from gui_git_mixin import GitBridgeMixin
@@ -4894,6 +4895,41 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         except Exception as e:
             logger.exception("get_workspace_state 失败")
             return {"ok": False, "msg": str(e)}
+
+    def get_workspace_prompt_suggestions(
+        self,
+        workdir: str,
+        git_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """按工作区项目特征生成新会话推荐提示词（只读，不修改磁盘或切换目录）。"""
+        try:
+            raw = str(workdir or "").strip()
+            if not raw or raw.upper() == "GLOBAL":
+                return {"ok": True, "workdir": raw, "suggestions": []}
+            path = _resolve_real_path(raw)
+            if not os.path.isdir(path):
+                return {"ok": True, "workdir": raw, "suggestions": []}
+            recent_titles: List[str] = []
+            try:
+                rows = self._memory.get_all_sessions(
+                    workdir=path, sources=["GUI"], include_empty=False
+                )
+                recent_titles = [
+                    str(r.get("title") or r.get("name") or "").strip()
+                    for r in (rows or [])[:3]
+                    if str(r.get("title") or r.get("name") or "").strip()
+                ]
+            except Exception:
+                recent_titles = []
+            suggestions = build_workspace_prompt_suggestions(
+                path,
+                git_snapshot=git_snapshot if isinstance(git_snapshot, dict) else None,
+                recent_session_titles=recent_titles,
+            )
+            return {"ok": True, "workdir": path, "suggestions": suggestions}
+        except Exception as e:
+            logger.exception("get_workspace_prompt_suggestions 失败")
+            return {"ok": False, "msg": str(e), "suggestions": []}
 
     def get_novel_status(self, workdir: str) -> Dict[str, Any]:
         """返回小说项目状态；非小说项目返回 {"is_novel": False}。

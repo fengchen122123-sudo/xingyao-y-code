@@ -94,3 +94,43 @@ it('shows the sandbox toggle without duplicating the git branch in the hero comp
   expect(setSandbox).toHaveBeenCalledWith(true);
   wrapper.unmount();
 });
+
+it('空态页不显示 Beta 标签，并按项目工作区动态加载推荐提示词（点击回填）', async () => {
+  const get_workspace_prompt_suggestions = vi.fn(async (workdir: string) => ({
+    ok: true,
+    workdir,
+    suggestions: [
+      { id: 's1', label: '核对 181/184 双稿', prompt: '请核对小说 181/184 双稿差异' },
+      { id: 's2', label: '运行第 3 轮回归', prompt: '运行回归脚本扫字数' },
+    ],
+  }));
+  (window as any).pywebview = { api: { get_workspace_prompt_suggestions } };
+
+  const store = useAppStore();
+  store.currentSessionName = '';
+  store.workdir = 'D:\\小说';
+  store.currentWorkdirLabel = '小说';
+
+  const wrapper = mount(KimiEmptyState);
+  expect(wrapper.find('.kimi-beta').exists()).toBe(false);
+
+  await new Promise((r) => setTimeout(r, 0));
+  await wrapper.vm.$nextTick();
+
+  expect(get_workspace_prompt_suggestions).toHaveBeenCalledWith('D:\\小说', null);
+  const chips = wrapper.findAll('[data-test="project-prompt-chip"]');
+  expect(chips).toHaveLength(2);
+  expect(chips[0].text()).toBe('核对 181/184 双稿');
+
+  await chips[0].trigger('click');
+  expect(wrapper.get('.ce-input').text()).toBe('请核对小说 181/184 双稿差异');
+
+  store.workdir = '';
+  store.currentWorkdirLabel = '对话';
+  await new Promise((r) => setTimeout(r, 0));
+  await wrapper.vm.$nextTick();
+  expect(wrapper.find('[data-test="project-prompt-suggestions"]').exists()).toBe(false);
+
+  delete (window as any).pywebview;
+  wrapper.unmount();
+});

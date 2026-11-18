@@ -3,13 +3,14 @@
        （.msg-user）：红点导航按消息 id 精确定位用；本地新消息无 _msg_id 时不渲染 -->
   <MessageBubble v-if="group.userMsg" :msg="group.userMsg" :data-msg-id="group.userMsg?._msg_id ?? undefined" />
 
-  <!-- 回合运行中：保持现状，中间过程逐条实时显示，不折叠 -->
+  <!-- 回合运行中：保持现状，中间过程逐条实时显示，不折叠（中间轮隐藏底部速率条免刷屏） -->
   <template v-if="group.running">
     <MessageBubble
       v-for="m in group.middle"
       :key="msgKey(m)"
       :msg="m"
       :show-name="msgKey(m) === nameOwnerKey"
+      :show-metrics="false"
     />
   </template>
   <!-- 回合已结束：中间过程收成一块可展开的折叠区（FoldCard 统一折叠体系），
@@ -21,6 +22,7 @@
         :key="msgKey(m)"
         :msg="m"
         :show-name="msgKey(m) === nameOwnerKey"
+        :show-metrics="false"
       />
     </FoldCard>
   </div>
@@ -121,5 +123,9 @@ const title = computed(() => {
 }
 .turn-fold :deep(.fold-head:hover) {
   background: var(--bg2);
+}
+.turn-fold :deep(.fold-body) {
+  margin-top: 4px;
+  padding-left: 6px;
 }
 </style>

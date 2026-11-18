@@ -217,10 +217,39 @@ const groupFiles = computed(() => {
   );
 });
 
-// 行内目标：分组行给文件数（清单在展开区），命令行给命令原文，其余给路径
+function compactTargetDisplay(raw: string, isCommand: boolean): string {
+  let text = raw.trim();
+  if (!text) return '';
+  if (isCommand) {
+    // 去掉命令开头重复的 `cd <dir>;` / `cd <dir> &&` 前缀，让真实命令先露出（完整命令仍在悬停提示与展开区）
+    const stripped = text
+      .replace(/^(?:cd(?:\s+\/d)?|Set-Location)\s+(?:"[^"]+"|'[^']+'|[^\s;&]+)\s*(?:;|&&)\s*/i, '')
+      .trim();
+    if (stripped) text = stripped;
+  }
+  if (text.length > 32 && /^(?:[a-zA-Z]:[/\\]|\/)/.test(text) && !text.includes(' ')) {
+    const parts = text.replace(/\\/g, '/').split('/').filter(Boolean);
+    if (parts.length >= 3) {
+      return `…/${parts.slice(-2).join('/')}`;
+    }
+  }
+  return text;
+}
+
+function shortPathBase(filePath: string): string {
+  const parts = filePath.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] || filePath;
+}
+
+// 行内目标：分组行给文件数（清单在展开区），多文件 legacy-diffs 摘要收拢，其余收敛冗余前缀/长路径
 const targetText = computed(() => {
   if (isGroup.value) return `${props.row.count} 个文件`;
-  return props.row.command || props.row.detail || '';
+  if (props.row.kind === 'legacy-diffs' && diffs.value.length > 1) {
+    const first = shortPathBase(diffs.value[0]?.file_path || '');
+    return first ? `${first} 等 ${diffs.value.length} 个文件` : `${diffs.value.length} 个文件`;
+  }
+  if (props.row.command) return compactTargetDisplay(props.row.command, true);
+  return compactTargetDisplay(props.row.detail || '', false);
 });
 
 // 汇总本行所有调用携带的 Diff 以及未绑定的历史 Diff
@@ -417,6 +446,7 @@ function diffLineClass(line: string) {
   width: 1px;
   margin-left: -0.5px;
   background: var(--border);
+  opacity: 0.45;
 }
 .trace-row.trace-first .trace-icon::before {
   top: 50%;
@@ -521,6 +551,7 @@ function diffLineClass(line: string) {
 .trace-meta {
   flex: none;
   font-size: 11px;
+  font-family: var(--mono);
   color: var(--text-faint);
 }
 /* 失败：红色状态词 + 虚线下划线，悬停出完整报错 */

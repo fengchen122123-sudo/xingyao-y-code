@@ -240,9 +240,9 @@
           <span>{{ liveSpeedText }}</span>
         </div>
 
-        <!-- 助手消息底部性能指标结算栏（生成完毕后展示） -->
+        <!-- 助手消息底部性能指标结算栏（生成完毕后展示；中间工具轮次默认隐藏，避免每步重复刷屏） -->
         <div
-          v-else-if="msg.metrics && (msg.metrics.token_speed || msg.metrics.duration_s)"
+          v-else-if="showMetrics && msg.metrics && (msg.metrics.token_speed || msg.metrics.duration_s)"
           class="msg-metrics-bar"
           :title="metricsTooltip"
           data-test="msg-metrics"
@@ -311,8 +311,11 @@ const props = withDefaults(defineProps<{
   msg: ChatMessage;
   /** 是否显示「星瑶 · 模型」名字行：一个回合只在最前面显示一次 */
   showName?: boolean;
+  /** 是否在底部展示速度/耗时结算条（TurnGroup 中间过程轮次传 false 降噪） */
+  showMetrics?: boolean;
 }>(), {
   showName: true,
+  showMetrics: true,
 });
 
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
@@ -1225,8 +1228,8 @@ function onEditKeydown(e: KeyboardEvent) {
 /* 思考块（对齐 ZCode）：整块无底色无边框，折叠头是一行轻量灰字——
    脑图标 +「思考 · N 秒」+ 悬停才浮现的小箭头 */
 .think-block {
-  margin: 10px 0;
-  font-size: 12.5px;
+  margin: 7px 0;
+  font-size: 12px;
   color: var(--text-faint);
 }
 /* 折叠头改成贴合内容的行内宽度（ZCode 的 trigger 是 self-start，不铺满整行） */

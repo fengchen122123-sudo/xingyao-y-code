@@ -292,6 +292,21 @@ describe('MessageBubble', () => {
     wrapper.unmount();
   });
 
+  it('showMetrics 为 false 时隐藏底部性能指标栏', () => {
+    const wrapper = mount(MessageBubble, {
+      props: {
+        msg: assistantMessage({
+          content: '中间子步骤',
+          metrics: { duration_s: 2.34, token_speed: 58.2, completion_tokens: 142 },
+        }),
+        showMetrics: false,
+      },
+    });
+
+    expect(wrapper.find('.msg-metrics-bar').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it('流式生成中显示实时速度胶囊', async () => {
     const store = useAppStore();
     store.running = true;

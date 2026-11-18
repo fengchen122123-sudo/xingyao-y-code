@@ -92,7 +92,7 @@
             <DecisionRecordPopup v-if="decisionPanelOpen" @close="decisionPanelOpen = false" />
           </div>
 
-          <div class="export-wrap">
+          <div v-if="showExportEntry" class="export-wrap">
             <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /><span class="chip-label">导出</span></button>
             <div v-if="showExportMenu" class="export-menu" @click.stop>
               <div class="export-item" @click="doExport('md')">Markdown (.md)</div>
@@ -247,7 +247,12 @@
 
     <!-- 状态栏 -->
     <div id="statusbar" data-theme-region="statusbar">
-      <span class="si status-connection" data-test="status-connection" data-mobile-status="primary">
+      <span
+        class="si status-connection"
+        :class="{ 'is-connected': store.connected }"
+        data-test="status-connection"
+        data-mobile-status="primary"
+      >
         <span class="s-dot" :class="{ off: !store.connected }"></span>
         <span class="conn-full">{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
         <span class="conn-short">{{ store.connected ? '已连接' : '已断开' }}</span>
@@ -265,7 +270,13 @@
       >{{ gitBranchText }}</span>
       <span class="si status-token" data-test="status-token" data-mobile-status="hidden" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
       <span class="si status-permission" data-test="status-permission" data-mobile-status="hidden">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
-      <span class="si status-skill" data-test="status-skill" data-mobile-status="hidden" :title="statusSkillTitle">
+      <span
+        class="si status-skill"
+        :class="{ 'is-empty': !store.usedSkills.length }"
+        data-test="status-skill"
+        data-mobile-status="hidden"
+        :title="statusSkillTitle"
+      >
         <span class="skill-text">技能: {{ statusSkillText }}</span>
       </span>
       <span
@@ -463,6 +474,8 @@ function backToThemeEditor() {
 }
 
 const showExportMenu = ref(false);
+// 空新会话页隐藏导出入口（无消息可导，顶部保持干净），进入真实或有消息会话时显示
+const showExportEntry = computed(() => store.messages.length > 0 || !!store.currentSessionName);
 
 // 会话头部“计划”入口 + 任务计划进度对话框：计划数据由 plan_updated 事件流
 // 实时驱动，入口只在存在计划时显示，角标统计进行中的计划条目
@@ -1652,6 +1665,21 @@ onUnmounted(() => {
 }
 .si.tok-red {
   color: var(--red);
+}
+@media (min-width: 769px) {
+  /* 桌面端底栏极简化：健康态隐藏"后端已连接"（仅断连提醒），并隐去与输入栏重复的
+     模型/工作区/Token/权限/沙盒/UTF-8 及空技能占位，只留居中声明与右侧运行状态 */
+  #statusbar .si.status-connection.is-connected,
+  #statusbar .si.status-model,
+  #statusbar .si.status-workspace,
+  #statusbar .si.status-git-branch,
+  #statusbar .si.status-token,
+  #statusbar .si.status-permission,
+  #statusbar .si.status-sandbox,
+  #statusbar .si.status-skill.is-empty,
+  #statusbar [data-test="status-charset"] {
+    display: none;
+  }
 }
 /* 历史分页加载指示：细条、居中、弱化色，与现有轻提示风格一致 */
 .history-loading {

@@ -30,11 +30,15 @@ beforeEach(() => {
   delete (window as any).pywebview;
 });
 
-it('对话标题栏不再渲染「清空」按钮，导出入口保留', () => {
+it('空新会话页隐藏「导出」按钮；进入会话后渲染导出且不渲染「清空」', () => {
   const store = useAppStore();
   store.initialized = true;
-  const wrapper = mount(App, { global: { stubs } });
+  const emptyWrapper = mount(App, { global: { stubs } });
+  expect(emptyWrapper.find('#chat-header .export-wrap').exists()).toBe(false);
+  emptyWrapper.unmount();
 
+  store.currentSessionName = 'session-1';
+  const wrapper = mount(App, { global: { stubs } });
   const labels = wrapper.findAll('#chat-header .chip-btn').map((b) => b.text());
 
   expect(labels).not.toContain('清空');
@@ -45,6 +49,7 @@ it('对话标题栏不再渲染「清空」按钮，导出入口保留', () => {
 it('对话标题栏按钮文字收进 .chip-label，窄栏由容器查询换成纯图标', () => {
   const store = useAppStore();
   store.initialized = true;
+  store.currentSessionName = 'session-1';
   const wrapper = mount(App, { global: { stubs } });
 
   const exportBtn = wrapper.get('#chat-header .export-wrap .chip-btn');

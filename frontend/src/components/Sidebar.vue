@@ -142,7 +142,7 @@
         <span class="mi-ico">✎</span>
         <span class="mi-label">新会话</span>
         <span
-          class="mi-count"
+          class="mi-workdir"
           :title="store.currentWorkdirLabel"
         >{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
         <span class="mi-arrow">＋</span>
@@ -150,25 +150,21 @@
       <div class="menu-item" @click="openSkills()">
         <span class="mi-ico">❖</span>
         <span class="mi-label">星盘 · 技能</span>
-        <span class="mi-count">{{ store.skills.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openMcp()">
         <span class="mi-ico">⧉</span>
         <span class="mi-label">星桥 · MCP</span>
-        <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openPlugins()">
         <span class="mi-ico">⬡</span>
         <span class="mi-label">星匣 · 插件</span>
-        <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openAutomations()">
         <span class="mi-ico"><AppIcon name="orbit" :size="15" /></span>
         <span class="mi-label">星轨</span>
-        <span class="mi-count">{{ enabledAutomationCount }} / {{ store.automationTasks.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
     </div>
@@ -216,9 +212,9 @@
             >📁</span>
             <span class="g-title" :style="{ color: group.is_current ? 'var(--accent)' : 'inherit' }">
               {{ getFolderTitle(group) }}
-              <span v-if="group.is_current" style="font-size:10px;color:var(--green)"> [当前]</span>
+              <span v-if="group.is_current" class="g-current-dot" title="当前工作区" aria-label="当前"></span>
             </span>
-            <span class="g-count">{{ group.sessions ? group.sessions.length : 0 }} 个会话</span>
+            <span v-if="group.sessions && group.sessions.length > 0" class="g-count">{{ group.sessions.length }}</span>
 
             <!-- 「对话」（自由通用对话）分组的 ＋：原先挂在「项目会话」标题栏，
                  现移到行内，与「秘书」分组的入口位置保持一致 -->
@@ -1878,9 +1874,6 @@ function relativeTime(updatedAt?: string) {
   if (mon < 12) return `${mon}个月`;
   return `${Math.floor(mon / 12)}年`;
 }
-const connectedMcpCount = computed(() => store.mcps.filter(m => m.connected).length);
-const enabledPluginCount = computed(() => store.plugins.filter(p => p.enabled).length);
-const enabledAutomationCount = computed(() => store.automationTasks.filter(t => t.enabled).length);
 
 function toggleGroupCollapsed(path: string) {
   collapsedGroups.value[path] = !collapsedGroups.value[path];
@@ -2072,27 +2065,26 @@ function getFolderTitle(g: SessionGroup) {
   text-align: center;
 }
 .menu-item .mi-label {
+  flex: 1;
   font-size: 13px;
   font-weight: 500;
   white-space: nowrap;
-  flex-shrink: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.menu-item .mi-count {
-  margin-left: auto;
-  font-size: 11px;
+.menu-item .mi-workdir {
+  font-size: 11.5px;
   color: var(--text-faint);
-  background: var(--bg3);
-  border-radius: 8px;
-  padding: 1px 7px;
-  /* 目录名过长时单行显示并省略，不换行撑高菜单项 */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  min-width: 0;
+  max-width: 88px;
 }
 .menu-item .mi-arrow {
   color: var(--text-faint);
   font-size: 14px;
+  flex-shrink: 0;
 }
 
 .side-section {
@@ -2177,16 +2169,27 @@ function getFolderTitle(g: SessionGroup) {
 }
 .group-header .g-title {
   flex: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.group-header .g-current-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  color: var(--green);
+  background: currentColor;
+  flex-shrink: 0;
+}
 .group-header .g-count {
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--text-faint);
-  background: var(--bg3);
-  padding: 1px 6px;
-  border-radius: 6px;
+  padding: 0 2px;
 }
 .group-header .g-add, .group-header .g-del {
   background: none;

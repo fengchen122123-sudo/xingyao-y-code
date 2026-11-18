@@ -2,8 +2,7 @@
   <div class="kimi-empty-container">
     <div class="kimi-hero">
       <div class="kimi-title-row">
-        <span class="kimi-title">让 {{ store.agentName }} 来帮你完成任务</span>
-        <span class="kimi-beta">Beta</span>
+        <span class="kimi-title">让 {{ store.agentName }} 帮你完成任务</span>
       </div>
     </div>
 
@@ -23,7 +22,7 @@
           ref="editorRef"
           v-model="inputVal"
           :min-height="75"
-          placeholder="尽管问，或做个任务… / 调用技能与 MCP，@ 引用文件"
+          placeholder="尽管问，或做个任务… / 技能 @ 文件"
           @keydown="handleKeydown"
           @input="detectToken"
           @click="detectToken"
@@ -111,6 +110,23 @@
       <AppIcon name="chevron-down" :size="11" :stroke-width="2" class="model-chevron" />
     </div>
 
+    <!-- 项目感知推荐提示词：仅在绑定项目工作区且存在建议时出现，自由对话保持留白 -->
+    <div
+      v-if="projectPromptSuggestions.length"
+      class="kimi-project-prompts"
+      data-test="project-prompt-suggestions"
+    >
+      <button
+        v-for="item in projectPromptSuggestions"
+        :key="item.id"
+        type="button"
+        class="kimi-prompt-chip"
+        data-test="project-prompt-chip"
+        :title="item.prompt"
+        @click="applyProjectPrompt(item)"
+      >{{ item.label }}</button>
+    </div>
+
     <!-- 工作区切换下拉：可退出工作区回自由对话 / 快捷切换项目 / 引入新项目 -->
     <div v-if="showWorkdirDropdown" class="workdir-dropdown" :style="workdirDropdownStyle" @click.stop>
       <div
@@ -153,8 +169,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { useGitStore } from '../stores/gitStore';
+import type { WorkspacePromptSuggestion } from '../types/pywebview';
 import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
@@ -168,6 +186,7 @@ import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
 
 const store = useAppStore();
+const gitStore = useGitStore();
 const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
   set: value => { store._getSessionRuntime().composerText = value; },
@@ -195,6 +214,51 @@ const projectGroups = computed(() =>
 const isGlobalWorkdir = computed(() =>
   !store.workdir || store.currentWorkdirLabel === '对话' || store.currentWorkdirLabel === 'GLOBAL'
 );
+
+const projectPromptSuggestions = computed(() =>
+  isGlobalWorkdir.value ? [] : store.workspacePromptSuggestions,
+);
+
+function normalizeDirKey(path: string): string {
+  return String(path || '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
+watch(
+  [
+    () => store.workdir,
+    () => isGlobalWorkdir.value,
+    () => gitStore.workdir,
+    () => gitStore.snapshot?.branch_name,
+    () => gitStore.snapshot?.staged.length ?? 0,
+    () => gitStore.snapshot?.unstaged.length ?? 0,
+    () => gitStore.snapshot?.untracked.length ?? 0,
+    () => gitStore.snapshot?.conflicts.length ?? 0,
+    () => gitStore.snapshot?.ahead ?? 0,
+  ],
+  () => {
+    if (isGlobalWorkdir.value || !store.workdir) {
+      void store.loadWorkspacePromptSuggestions('GLOBAL');
+      return;
+    }
+    const matchingSnapshot =
+      gitStore.snapshot && normalizeDirKey(gitStore.workdir) === normalizeDirKey(store.workdir)
+        ? gitStore.snapshot
+        : null;
+    void store.loadWorkspacePromptSuggestions(store.workdir, matchingSnapshot);
+  },
+  { immediate: true },
+);
+
+function applyProjectPrompt(item: WorkspacePromptSuggestion) {
+  inputVal.value = item.prompt;
+  void nextTick(() => {
+    const ctrl = composerControl.value;
+    if (ctrl) {
+      ctrl.focus();
+      ctrl.setSelectionRange(item.prompt.length, item.prompt.length);
+    }
+  });
+}
 
 function toggleWorkdirDropdown() {
   reasoningSelectorRef.value?.close();

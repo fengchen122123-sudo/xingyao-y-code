@@ -55,6 +55,8 @@ import type {
   ResumeBlockerItem,
   SlashCommandInfo,
   GoalStateInfo,
+  GitSnapshotDto,
+  WorkspacePromptSuggestion,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
 import { isDocxFilePath, isMarkdownFilePath, isOfficeFilePath, isPdfFilePath, toFileUrl } from '../utils/localPath';
@@ -773,6 +775,9 @@ export const useAppStore = defineStore('app', {
     fileTreeExpanded: [] as string[],
     // 文件树后台加载序号：快速连切会话时过期结果凭序号丢弃
     fileTreeReqSeq: 0,
+    // 新会话项目感知推荐提示词（按当前工作区动态生成，GLOBAL 恒为空）
+    workspacePromptSuggestions: [] as WorkspacePromptSuggestion[],
+    workspacePromptReqSeq: 0,
     // 本回合实际用到的技能名（从 is_skill 工具调用收集）：turn_start 时清空，
     // 回合结束后固化为本回合结果，状态栏"技能"项据此显示；随会话 runtime 保存/恢复
     usedSkills: [] as string[],
@@ -4232,6 +4237,35 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (this.workdir !== workdir) return;
         if (res && res.ok && res.file_tree) this.fileTree = res.file_tree;
       } catch { /* 后台加载失败静默：树留空，不影响对话 */ }
+    },
+
+    async loadWorkspacePromptSuggestions(
+      workdir: string,
+      gitSnapshot?: GitSnapshotDto | null,
+    ) {
+      const target = String(workdir || '').trim();
+      const seq = ++this.workspacePromptReqSeq;
+      if (!target || target.toUpperCase() === 'GLOBAL') {
+        this.workspacePromptSuggestions = [];
+        return;
+      }
+      const api = window.pywebview?.api;
+      if (!api?.get_workspace_prompt_suggestions) {
+        this.workspacePromptSuggestions = [];
+        return;
+      }
+      try {
+        const res = await api.get_workspace_prompt_suggestions(target, gitSnapshot ?? null);
+        if (seq !== this.workspacePromptReqSeq) return;
+        if (String(this.workdir || '').trim() !== target) return;
+        if (res && res.ok && Array.isArray(res.suggestions)) {
+          this.workspacePromptSuggestions = res.suggestions;
+        } else {
+          this.workspacePromptSuggestions = [];
+        }
+      } catch {
+        if (seq === this.workspacePromptReqSeq) this.workspacePromptSuggestions = [];
+      }
     },
 
     // 按完整路径在已加载的文件树中定位节点（FileTreeNode 用 '\\' 拼路径，兼容两种分隔符）

@@ -1681,6 +1681,20 @@ export interface ProjectProfileDto {
   sections?: Record<string, string>;
 }
 
+// get_workspace_prompt_suggestions：新会话按项目特征生成的推荐提示词（只读）
+export interface WorkspacePromptSuggestion {
+  id: string;
+  label: string;
+  prompt: string;
+}
+
+export interface WorkspacePromptSuggestionsDto {
+  ok: boolean;
+  workdir?: string;
+  suggestions: WorkspacePromptSuggestion[];
+  msg?: string;
+}
+
 // list_novel_projects 单个小说项目（多书切换用）。path 是相对工作区的 posix
 // 路径，工作区自身（.novel.json 在根目录）为 "."；chapters_written 只给章数，
 // 不逐章读正文（只读扫描，快）。
@@ -1852,6 +1866,11 @@ export interface PyWebViewAPI {
   // 纯选目录：弹原生文件夹对话框只返回路径，不切换工作区（自动化任务表单用）
   pick_folder_dialog(): Promise<{ ok: boolean; path?: string; msg?: string }>;
   get_workspace_state(workdir: string): Promise<any>;
+  // 按工作区特征生成新会话推荐提示词（GLOBAL / 不存在目录返回空数组）
+  get_workspace_prompt_suggestions(
+    workdir: string,
+    gitSnapshot?: GitSnapshotDto | null,
+  ): Promise<WorkspacePromptSuggestionsDto>;
   // 小说工作台状态（只读扫描，不写文件、不轮询）；非小说项目 is_novel=false
   get_novel_status(workdir: string): Promise<NovelStatusDto>;
   // 读取单章正文（chapter 支持章号或正文文件名），供右侧「小说」页签内直接编辑
