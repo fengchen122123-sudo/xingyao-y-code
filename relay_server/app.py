@@ -136,6 +136,11 @@ def _mount_desktop(app: FastAPI, desktop_dir: Path | None, shim: Path | None) ->
     # assetsDir），与旧网关一致 mount 整个 dist 目录，icon.png 等根文件也一并覆盖。
     if desktop_dir.is_dir():
         app.mount("/desktop-assets", StaticFiles(directory=str(desktop_dir)), name="desktop-assets")
+    # 安装包 _internal/frontend/dist 以 base=/ 构建，HTML 与 JS chunk 引用 /assets/*；
+    # 同挂一份 /assets，使安装包用户无需源码与 Node 重编译即可直接托管桌面远端页。
+    assets = desktop_dir / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="desktop-root-assets")
     icon = desktop_dir / "icon.png"
 
     @app.get("/icon.png", include_in_schema=False)
@@ -181,16 +186,21 @@ def _mount_mobile(app: FastAPI, mobile_dir: Path | None, shim: Path | None) -> N
             raise HTTPException(status_code=404)
         return FileResponse(str(shim), media_type="application/javascript; charset=utf-8")
 
-    @app.get("/m/{device_id}", include_in_schema=False)
+    @app.get("/m/{device_id:path}", include_in_schema=False)
     def mobile_index(device_id: str):
         # dist 根下的散装文件（favicon.svg / manifest.json / icon.png）按真实文件返回，
         # 否则会被当成设备号返回一份 HTML。
         static = _web_file(root, device_id)
         if static is not None:
             return FileResponse(static)
+        # SPA 深链（如 /m/convo/session_123）回退到 index.html；带扩展名的缺失资源照常 404。
+        last_seg = device_id.rstrip("/").split("/")[-1] if device_id.rstrip("/") else ""
+        if "." in last_seg:
+            raise HTTPException(status_code=404)
+        head_device = device_id.split("/", 1)[0] if "/" in device_id else device_id
         html = (root / "index.html").read_text(encoding="utf-8")
         injection = (
-            f"<script>window.__ycRelayDevice={json.dumps(device_id)};</script>"
+            f"<script>window.__ycRelayDevice={json.dumps(head_device)};</script>"
             '<script src="/m/mobile-shim.js"></script>'
         )
         html = html.replace("</head>", injection + "</head>", 1)
@@ -396,7 +406,12 @@ def create_app(
                 except Exception:
                     return
                 receive = asyncio.create_task(websocket.receive_text())
-                frame = json.loads(raw)
+                try:
+                    frame = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(frame, dict):
+                    continue
                 if frame.get("type") == "ping":
                     relay.touch(device_id)
                     await websocket.send_text(json.dumps({"type": "pong"}))
@@ -436,6 +451,9 @@ def create_app(
         try:
             first = json.loads(await websocket.receive_text())
         except Exception:
+            await websocket.close(code=4401)
+            return
+        if not isinstance(first, dict):
             await websocket.close(code=4401)
             return
         device_id = str(first.get("device_id") or "")

@@ -13,12 +13,17 @@
 另外用快照断言把规则常量本身固定住——本次重构只搬移、不得改规则。
 """
 
+from pathlib import Path
+
 from packaging_datas import (
     DROP_SUBTREES,
     PYFIGLET_FONTS_DIR,
     PYFIGLET_KEPT_FONTS,
     TOKENIZERS_DIR,
     TOKENIZERS_KEPT_NAMES,
+    filter_hidden_imports,
+    strip_bloat_datas,
+    strip_unused_binaries,
     strip_unused_datas,
 )
 
@@ -283,3 +288,103 @@ class TestBoundaries:
         kept, removed_count, _ = strip_unused_datas(datas, 'GUI')
         assert kept == datas[:1]
         assert removed_count == 1
+
+
+class TestBloatPruning:
+    """零功能损失冗余裁剪规则（strip_bloat_datas / strip_unused_binaries / filter_hidden_imports）。"""
+
+    def test_strip_bloat_datas_drops_redundant_and_keeps_runtime_assets(self, tmp_path):
+        src_file = tmp_path / 'sample.bin'
+        src_file.write_bytes(b'x' * 100)
+        s = str(src_file)
+
+        dropped = [
+            (r'reportlab\fonts\DarkGarden.sfd', s, 'DATA'),
+            (r'reportlab\graphics\charts\axes.py', s, 'DATA'),
+            (r'reportlab\platypus\paragraph.py', s, 'DATA'),
+            (r'reportlab\pdfgen\canvas.py', s, 'DATA'),
+            (r'openpyxl\__init__.py', s, 'DATA'),
+            (r'pypdf\_reader.py', s, 'DATA'),
+            (r'_tcl_data\tzdata\Asia\Shanghai', s, 'DATA'),
+            (r'_tk_data\images\logo.eps', s, 'DATA'),
+            (r'_tk_data\demos\widget', s, 'DATA'),
+            (r'tcl8\8.5\tcltest-2.5.8.tm', s, 'DATA'),
+            (r'winpty\tests\test_pty.py', s, 'DATA'),
+            (r'webview\lib\runtimes\win-arm64\native\WebView2Loader.dll', s, 'DATA'),
+            (r'webview\lib\runtimes\win-x86\native\WebView2Loader.dll', s, 'DATA'),
+            (r'webview\lib\pywebview-android.jar', s, 'DATA'),
+            (r'webview\lib\WebBrowserInterop.x86.dll', s, 'DATA'),
+            (r'pythonnet\runtime\Python.Runtime.xml', s, 'DATA'),
+            (r'plugins\office\__pycache__\plugin.cpython-314.pyc', s, 'DATA'),
+            (r'relay_server\__pycache__\app.cpython-314.pyc', s, 'DATA'),
+        ]
+        kept_expected = [
+            (r'pypdf\py.typed', s, 'DATA'),
+            (r'_tcl_data\encoding\cp936.enc', s, 'DATA'),
+            (r'_tk_data\tk.tcl', s, 'DATA'),
+            (r'winpty\winpty.dll', s, 'DATA'),
+            (r'webview\lib\runtimes\win-x64\native\WebView2Loader.dll', s, 'DATA'),
+            (r'webview\lib\WebBrowserInterop.x64.dll', s, 'DATA'),
+            (r'webview\js\api.js', s, 'DATA'),
+            (r'pythonnet\runtime\Python.Runtime.dll', s, 'DATA'),
+            (r'plugins\office\plugin.py', s, 'DATA'),
+            (r'relay_server\app.py', s, 'DATA'),
+            (r'skills\baoyu-post-to-wechat\scripts\wechat-api.ts', s, 'DATA'),
+        ]
+
+        kept, removed_count, removed_bytes = strip_bloat_datas(dropped + kept_expected, 'GUI')
+        assert kept == kept_expected
+        assert removed_count == len(dropped)
+        assert removed_bytes == len(dropped) * 100
+
+    def test_strip_unused_binaries_drops_avif_win32ui_and_non_x64_webview(self, tmp_path):
+        src_file = tmp_path / 'mod.pyd'
+        src_file.write_bytes(b'y' * 250)
+        s = str(src_file)
+
+        dropped = [
+            (r'PIL\_avif.cp314-win_amd64.pyd', s, 'EXTENSION'),
+            (r'pythonwin\win32ui.pyd', s, 'EXTENSION'),
+            (r'mfc140u.dll', s, 'BINARY'),
+            (r'webview\lib\runtimes\win-x86\native\WebView2Loader.dll', s, 'BINARY'),
+            (r'webview\lib\WebBrowserInterop.x86.dll', s, 'BINARY'),
+        ]
+        kept_expected = [
+            (r'PIL\_imaging.cp314-win_amd64.pyd', s, 'EXTENSION'),
+            (r'PIL\_webp.cp314-win_amd64.pyd', s, 'EXTENSION'),
+            (r'win32\win32api.pyd', s, 'EXTENSION'),
+            (r'pywin32_system32\pythoncom314.dll', s, 'BINARY'),
+            (r'webview\lib\runtimes\win-x64\native\WebView2Loader.dll', s, 'BINARY'),
+            (r'webview\lib\WebBrowserInterop.x64.dll', s, 'BINARY'),
+        ]
+
+        kept, removed_count, removed_bytes = strip_unused_binaries(dropped + kept_expected, 'GUI')
+        assert kept == kept_expected
+        assert removed_count == len(dropped)
+        assert removed_bytes == len(dropped) * 250
+
+    def test_filter_hidden_imports_removes_excluded_subtrees(self):
+        mods = [
+            'reportlab.pdfgen.canvas',
+            'reportlab.pdfbase.ttfonts',
+            'reportlab.graphics',
+            'reportlab.graphics.charts.axes',
+            'reportlab.platypus.paragraph',
+            'winpty.ptyprocess',
+            'winpty.tests',
+            'winpty.tests.test_pty',
+        ]
+        assert filter_hidden_imports(mods, ('reportlab.graphics', 'reportlab.platypus', 'winpty.tests')) == [
+            'reportlab.pdfgen.canvas',
+            'reportlab.pdfbase.ttfonts',
+            'winpty.ptyprocess',
+        ]
+
+    def test_uninstaller_reuses_prescaled_logo_168(self):
+        """卸载器与安装器共用 assets/ycode-logo-168.png，不再携带 1MB+ ycode.png。"""
+        root = Path(__file__).resolve().parent.parent
+        assert (root / 'assets' / 'ycode-logo-168.png').is_file()
+        for rel in ('ycode_uninstall.py', 'ycode.spec', 'ycode_uninstall.spec'):
+            text = (root / rel).read_text(encoding='utf-8')
+            assert 'ycode-logo-168.png' in text
+            assert 'ycode.png' not in text

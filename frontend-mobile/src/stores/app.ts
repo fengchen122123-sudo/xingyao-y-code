@@ -273,46 +273,50 @@ export const useAppStore = defineStore('mobile-app', {
       this.ready = true;
     },
 
+    applyInitialState(st: Record<string, any>) {
+      this.sessionGroups = (st.sessions || []) as SessionGroup[];
+      this.currentSession = String(st.current_session || '');
+      this.currentWorkdir = String(st.workdir || '');
+      this.activeModelId = String(st.active_model_id || '');
+      this.activeModelName = String(st.active_model_name || '');
+      this.models = (st.models || []).map((m: any) => ({ id: String(m.id || ''), name: m.name ? String(m.name) : undefined, provider: m.provider ? String(m.provider) : undefined }));
+      this.permissionMode = String(st.permission_mode || 'confirm');
+      this.version = String(st.version || '');
+      // 人设名称（交互层展示用；后端仅在用户自定义时注入提示词）
+      const persona = (st.persona_settings || {}) as Record<string, any>;
+      this.agentName = String(persona.agent_name || '星瑶');
+      this.messages = normalizeMessages(st.messages || []);
+      this.historyHasMore = !!st.history_has_more;
+      this.historyOldestId = st.history_oldest_id ?? null;
+      this.tokenUsage = (st.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 }) as TokenUsage;
+      this.fileTree = (st.file_tree || []) as FileNode[];
+      this.skills = (st.skills || []) as Record<string, any>[];
+      this.mcps = (st.mcps || []) as Record<string, any>[];
+      this.reasoning = (st.reasoning || { ...REASONING_DEFAULT }) as ReasoningSnapshot;
+      this.runningSessions = Array.isArray(st.active_sessions) ? st.active_sessions.map(String) : [];
+      this.queues = {};
+      const qs = st.message_queues as Record<string, any[]> | undefined;
+      if (qs) {
+        for (const [name, list] of Object.entries(qs)) {
+          this.queues[name] = (list || []).map((m: any) => ({ id: String(m?.id || ''), text: String(m?.text || ''), attachments: Array.isArray(m?.attachments) ? m.attachments.map(String) : [] }));
+        }
+      }
+      void this.refreshUndoStates();
+      // 恢复正在流式的回合快照（重连/重载时不丢进行中的输出）
+      const snap = st.active_turn_snapshot as Record<string, any> | null;
+      if (snap && snap.session_name === this.currentSession) {
+        this.currentThinkingText = String(snap.thinking_text || '');
+        this.currentStreamingText = String(snap.streaming_text || '');
+      }
+      this.connected = true;
+      this.pairInvalid = false;
+      void this.fetchActivePermission(true);
+    },
+
     async reloadInitialState() {
       try {
         const st = await rpc<Record<string, any>>('get_initial_state');
-        this.sessionGroups = (st.sessions || []) as SessionGroup[];
-        this.currentSession = String(st.current_session || '');
-        this.currentWorkdir = String(st.workdir || '');
-        this.activeModelId = String(st.active_model_id || '');
-        this.activeModelName = String(st.active_model_name || '');
-        this.models = (st.models || []).map((m: any) => ({ id: String(m.id || ''), name: m.name ? String(m.name) : undefined, provider: m.provider ? String(m.provider) : undefined }));
-        this.permissionMode = String(st.permission_mode || 'confirm');
-        this.version = String(st.version || '');
-        // 人设名称（交互层展示用；后端仅在用户自定义时注入提示词）
-        const persona = (st.persona_settings || {}) as Record<string, any>;
-        this.agentName = String(persona.agent_name || '星瑶');
-        this.messages = normalizeMessages(st.messages || []);
-        this.historyHasMore = !!st.history_has_more;
-        this.historyOldestId = st.history_oldest_id ?? null;
-        this.tokenUsage = (st.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 }) as TokenUsage;
-        this.fileTree = (st.file_tree || []) as FileNode[];
-        this.skills = (st.skills || []) as Record<string, any>[];
-        this.mcps = (st.mcps || []) as Record<string, any>[];
-        this.reasoning = (st.reasoning || { ...REASONING_DEFAULT }) as ReasoningSnapshot;
-        this.runningSessions = Array.isArray(st.active_sessions) ? st.active_sessions.map(String) : [];
-        this.queues = {};
-        const qs = st.message_queues as Record<string, any[]> | undefined;
-        if (qs) {
-          for (const [name, list] of Object.entries(qs)) {
-            this.queues[name] = (list || []).map((m: any) => ({ id: String(m?.id || ''), text: String(m?.text || ''), attachments: Array.isArray(m?.attachments) ? m.attachments.map(String) : [] }));
-          }
-        }
-        void this.refreshUndoStates();
-        // 恢复正在流式的回合快照（重连/重载时不丢进行中的输出）
-        const snap = st.active_turn_snapshot as Record<string, any> | null;
-        if (snap && snap.session_name === this.currentSession) {
-          this.currentThinkingText = String(snap.thinking_text || '');
-          this.currentStreamingText = String(snap.streaming_text || '');
-        }
-        this.connected = true;
-        this.pairInvalid = false;
-        void this.fetchActivePermission(true);
+        this.applyInitialState(st);
       } catch (e: any) {
         this.connected = false;
         throw e;
@@ -651,6 +655,20 @@ export const useAppStore = defineStore('mobile-app', {
       if (type === 'pair_invalid') {
         this.pairInvalid = true;
         this.connected = false;
+        return;
+      }
+
+      if (type === 'initial_state_sync') {
+        this.applyInitialState(data);
+        return;
+      }
+
+      if (type === 'device_status') {
+        if (data.online === false) {
+          this.connected = false;
+        } else if (data.online === true && !this.connected) {
+          void this.reloadInitialState();
+        }
         return;
       }
 

@@ -30,6 +30,8 @@ describe('CloudRelaySettings', () => {
     const prompt = sendSpy.mock.calls[0][0];
     expect(prompt).toContain('_internal/');
     expect(prompt).toContain('relay_server');
+    expect(prompt).toContain('nginx-standalone.conf');
+    expect(prompt).toContain('--ycode-relay-configure');
     expect(prompt).toContain('129.204.50.227');
     expect(prompt).toContain('ubuntu');
     expect(prompt).toContain('xingyaocode.cn');

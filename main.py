@@ -3,12 +3,20 @@ import shutil
 import sys
 import io
 
-# CLI 轻量档位：必须在后续任何 core.* 导入之前声明——core.llm 会在模块导入期
-# 按该档位构建工具表（剔除 GUI 专属工具，每个请求少约 5.6k tokens 的工具定义）。
-# 只在真实入口生效（__name__ == "__main__"），避免测试 `import main` 时污染
-# 同进程后续构建的工具表；GUI 入口不设此变量，保持 full 档位。
+# CLI 专属写代码档位（coding）：必须在后续任何 core.* 导入之前声明——core.llm 会在
+# 模块导入期按该档位构建工具表（只保留 24 个核心编程工具，较 full 省约 77% Schema 体积）。
+# 只在真实入口生效（__name__ == "__main__"），避免测试 `import main` 时污染同进程工具表；
+# GUI 入口不设此变量，保持 full 档位（兼备编程与办公能力）。
 if __name__ == "__main__":
-    os.environ.setdefault("YCODE_TOOL_PROFILE", "cli")
+    os.environ.setdefault("YCODE_TOOL_PROFILE", "coding")
+    # 本机代理客户端退出后残留的 HTTP_PROXY/HTTPS_PROXY 会让所有外网请求撞空端口，
+    # 表现为登录/模型连接报 WinError 10061；在最早期做一次自愈（详见 core.net_env）。
+    try:
+        from core.net_env import sanitize_dead_local_proxy
+
+        sanitize_dead_local_proxy()
+    except Exception:
+        pass
 
 
 def _agent_name() -> str:

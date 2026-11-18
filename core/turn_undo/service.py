@@ -69,6 +69,7 @@ def has_default_storage() -> bool:
 _RECORDED_FIRST_PARTY_TOOLS = frozenset({
     "write_file",
     "edit_file",
+    "multi_edit",
     "fetch_image",
     "hunyuan_generate_image",     # core/hunyuan_image.py 保存点已接入
     "tokenrhythm_generate_image", # 插件 _save_image_bytes 保存点已接入

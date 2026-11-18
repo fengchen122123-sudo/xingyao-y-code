@@ -69,7 +69,8 @@ export interface ComposerResizeApi {
  * - 最大高度 = 窗口高度的 60%（小窗口保底默认+70px）
  * - 松手后写入 localStorage，下次进入自动恢复（按当时窗口重新夹取）
  */
-export function useComposerResize(getTextarea: () => HTMLTextAreaElement | null): ComposerResizeApi {
+// getTextarea 只用到 offsetHeight，富文本编辑器同样满足，故按 HTMLElement 收
+export function useComposerResize(getTextarea: () => HTMLElement | null): ComposerResizeApi {
   const textareaHeight = ref<number | null>(null);
   const isResizing = ref(false);
   // 下限（默认未拉伸高度）只在首次测量成功时锁定一次。拉伸后 textarea 的

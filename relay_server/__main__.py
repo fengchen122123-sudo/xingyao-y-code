@@ -53,7 +53,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     )
     host = os.environ.get("RELAY_BIND") or "127.0.0.1"
     port = int(os.environ.get("RELAY_PORT") or "18080")
-    uvicorn.run(app, host=host, port=port)
+    # 放大 WS 单帧上限（默认 16 MiB），与桌面端 70 MiB 对齐以承载 ≤50 MB 附件上传。
+    uvicorn.run(app, host=host, port=port, ws_max_size=70 * 1024 * 1024)
     return 0
 
 

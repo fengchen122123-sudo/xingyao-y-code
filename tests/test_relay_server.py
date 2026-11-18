@@ -377,6 +377,17 @@ class TestRegistry:
         assert offline[-1]["data"]["device_id"] == dev
         assert offline[-1]["data"]["online"] is False
 
+    def test_sweep_clears_send_and_calls_closer(self, conn, reg, device):
+        dev, token = device
+        reg.register(conn, dev, token, "b")
+        closed = []
+        reg.devices[dev]["connection"] = lambda: closed.append(True)
+        reg.devices[dev]["send"] = lambda _raw: True
+        reg.sweep(time.time() + OFFLINE_AFTER + 1)
+        assert closed == [True]
+        assert reg.devices[dev]["send"] is None
+        assert reg.devices[dev]["connection"] is None
+
     def test_touch_keeps_online(self, conn, reg, device):
         dev, token = device
         reg.register(conn, dev, token, "b")
@@ -688,7 +699,9 @@ class TestAppWS:
                 ws.receive_json()
             assert exc.value.code == 4401
 
-    def test_first_connect_replay_all(self, client, device):
+    def test_first_connect_sends_empty_replay(self, client, device):
+        """首连不补历史窗口：App 启动会自己 get_initial_state 拿整态，
+        窄带外网上再把同一批状态传一遍纯属浪费（实测单次 1MB 级）。"""
         dev, token = device
         with device_ws(client, dev, token) as dws:
             dws.send_json({"type": "evt", "data": {"n": 1}, "seq": 1})
@@ -700,7 +713,7 @@ class TestAppWS:
             with app_ws(client, dev, jwt_token) as app:
                 plan = app.receive_json()
                 assert plan["type"] == "replay"
-                assert [frame_seq(f) for f in plan["frames"]] == [1, 2]
+                assert plan["frames"] == []
 
     def test_replay_with_last_seq_window(self, client, device):
         dev, token = device
@@ -790,7 +803,36 @@ class TestPages:
     def test_assets_served(self, client):
         # 桌面 dist 以 --base=/desktop-assets/ 构建：资源 URL 带 assets/ 段（整目录 mount）
         assert client.get("/desktop-assets/assets/app.js").status_code == 200
+        # 安装包 _internal/frontend/dist 以 base=/ 构建：资源走 /assets/*
+        assert client.get("/assets/app.js").status_code == 200
         assert client.get("/m/assets/app.js").status_code == 200
+
+    def test_standalone_nginx_template_exists_with_required_routes(self):
+        from pathlib import Path
+
+        conf = Path(__file__).resolve().parent.parent / "relay_server" / "deploy" / "nginx-standalone.conf"
+        text = conf.read_text(encoding="utf-8")
+        for needle in (
+            "location = /health",
+            "location /api/",
+            "location /relay/",
+            "location /m/",
+            "location /desktop/",
+            "location /desktop-assets/",
+            "location /assets/",
+            "location = /desktop-shim.js",
+            "location = /icon.png",
+            "text/javascript",
+        ):
+            assert needle in text
+
+    def test_mobile_spa_deep_link_fallback_and_missing_asset_404(self, client):
+        deep = client.get("/m/convo/session-123")
+        assert deep.status_code == 200
+        assert '<script src="/m/mobile-shim.js"></script>' in deep.text
+        assert 'window.__ycRelayDevice="convo"' in deep.text
+        assert client.get("/m/assets/missing.js").status_code == 404
+        assert client.get("/m/missing.js").status_code == 404
 
     def test_missing_dist_404(self, db_path, tmp_path):
         app = create_app(

@@ -450,6 +450,26 @@ _client_instance: Optional[httpx.Client] = None
 _client_lock = threading.Lock()
 
 
+def _http2_enabled() -> bool:
+    """检查是否允许启用 HTTP/2（需要已安装 h2，且未被环境变量或配置显式关闭）。"""
+    env_flag = os.environ.get("YCODE_HTTP2", "").strip().lower()
+    if env_flag in ("0", "false", "no", "off"):
+        return False
+    try:
+        import config
+
+        if (config._load() or {}).get("native_http2") is False:
+            return False
+    except Exception:
+        pass
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("h2") is not None
+    except Exception:
+        return False
+
+
 def _get_shared_client() -> httpx.Client:
     """获取/初始化共享的高性能 httpx 同步长连接池。"""
     global _client_instance
@@ -466,7 +486,11 @@ def _get_shared_client() -> httpx.Client:
             # （流式 read 有界 600s，见 native_completion），此默认仅覆盖
             # 未指定 timeout 的边缘调用。
             timeout = httpx.Timeout(connect=15.0, read=None, write=30.0, pool=10.0)
-            _client_instance = httpx.Client(limits=limits, timeout=timeout)
+            _client_instance = httpx.Client(
+                limits=limits,
+                timeout=timeout,
+                http2=_http2_enabled(),
+            )
         return _client_instance
 
 

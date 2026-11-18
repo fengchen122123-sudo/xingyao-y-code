@@ -11,7 +11,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets/ycode.ico', 'assets'),
-        ('assets/ycode.png', 'assets'),
+        ('assets/ycode-logo-168.png', 'assets'),
     ],
     hiddenimports=[],
     hookspath=[],

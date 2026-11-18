@@ -89,18 +89,20 @@
           @select="applySuggest"
           @hover="i => suggestIndex = i"
         />
-        <textarea
-          ref="textareaRef"
-          v-model="inputVal"
-          rows="2"
-          :style="textareaHeight != null ? { height: textareaHeight + 'px' } : undefined"
-          :placeholder="`向${store.agentName}提问… / 调用技能与 MCP，@ 引用文件`"
-          @keydown="onKeydown"
-          @input="detectToken"
-          @click="detectToken"
-          @keyup="detectToken"
-          @paste="handlePaste"
-        ></textarea>
+        <!-- 富文本输入框：@ 引用渲染成胶囊（带图标、整块选中、退格一次全删） -->
+        <div class="composer-field">
+          <ComposerEditor
+            ref="editorRef"
+            v-model="inputVal"
+            :height="textareaHeight"
+            :placeholder="`向${store.agentName}提问… / 调用技能与 MCP，@ 引用文件`"
+            @keydown="onKeydown"
+            @input="detectToken"
+            @click="detectToken"
+            @keyup="detectToken"
+            @paste="handlePaste"
+          />
+        </div>
 
         <div id="input-bar">
           <button
@@ -241,6 +243,7 @@ import TokenUsagePopover from './TokenUsagePopover.vue';
 import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
+import ComposerEditor from './ComposerEditor.vue';
 import { useAttachments } from '../composables/useAttachments';
 import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
@@ -252,7 +255,12 @@ const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
   set: value => { store._getSessionRuntime().composerText = value; },
 });
-const textareaRef = ref<HTMLTextAreaElement | null>(null);
+// 富文本输入框：@ 引用渲染成胶囊（带图标、整块选中、退格一次全删）
+const editorRef = ref<InstanceType<typeof ComposerEditor> | null>(null);
+// 补全与高度拖拽要的是「value / selectionStart / setSelectionRange / offsetHeight」
+// 这套与 textarea 同名的成员，编辑器把它们映射到文本序列化与光标坐标，
+// 因此 useSuggest 与 useComposerResize 一行都不用改
+const composerControl = computed(() => editorRef.value?.control ?? null);
 
 const showModelCascader = ref(false);
 const showPermDropdown = ref(false);
@@ -376,9 +384,9 @@ onUnmounted(() => {
 });
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths, uploadFiles, openAttachmentImage } = useAttachments();
-const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, composerControl);
 // 输入框高度拖拽：最小=默认渲染高度，向上拖抬高、松手记忆，双击恢复
-const { textareaHeight, isResizing, onHandlePointerdown, resetHeight } = useComposerResize(() => textareaRef.value);
+const { textareaHeight, isResizing, onHandlePointerdown, resetHeight } = useComposerResize(() => editorRef.value?.el ?? null);
 
 // 排队消息：回合运行期间发送的消息（后端 message_queue 快照驱动）
 const queueItems = computed(() => store.currentMessageQueue);
@@ -609,15 +617,10 @@ async function undoQueue(item: QueuedMessage) {
   border-style: dashed;
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
-textarea {
-  width: 100%;
-  background: none;
-  border: none;
-  outline: none;
-  color: var(--text);
+/* 输入框字体：编辑器内部走 font: inherit，这里定的就是它的最终排版 */
+.composer-field {
   font-family: var(--sans);
   font-size: 14px;
-  resize: none;
   line-height: 1.65;
 }
 #input-bar {

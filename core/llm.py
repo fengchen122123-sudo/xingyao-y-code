@@ -155,6 +155,8 @@ _DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
     "auth_invalid",
     "permission_denied",
     "model_not_found",
+    "model_unavailable",
+    "policy_refusal",
 })
 
 
@@ -1464,7 +1466,7 @@ from core.llm_execution import (
 # system_prompt.md / system_prompt_gui.md 的“子任务超过 3 条（即 ≥ 4 条）必须先用
 # plan_write、3 条及以内直接执行”保持一致。
 _ORCHESTRATION_NUDGE_THRESHOLD = 3
-_ORCHESTRATION_COUNTED_TOOLS = frozenset({"write_file", "edit_file"})
+_ORCHESTRATION_COUNTED_TOOLS = frozenset({"write_file", "edit_file", "multi_edit"})
 _ORCHESTRATION_COMMAND_TOOL = "execute_command"
 # 文案常量迁至 core.injection_markers（展示层过滤前缀与文案同源，防漂移）；
 # 顶部以别名导入并保留 _ORCHESTRATION_NUDGE_TEXT 名称供既有引用使用。
@@ -3496,38 +3498,61 @@ def _chat_with_model_generator(
             if current_step is not None:
                 current_step.mark_tools_running()
 
-            # 输出被 max_tokens 截断时，工具参数几乎必然不完整（JSON 修复只能补全
-            # 语法，无法找回被截断的内容）。此时绝不能执行任何工具——尤其是
-            # write_file/edit_file 会把半截内容写进文件。改为向模型返回错误结果，
-            # 让它拆小参数后重新调用。
+            # 输出被 max_tokens 截断时，写操作或截断的尾部参数绝不能执行；
+            # 但对前面已经完整序列化且严格 read_only 的调用，先记为 safe_readonly_calls，
+            # 复用下方同一份 batch_executor 安全执行完只读调用后合并截断错误。
+            length_partial_calls = False
+            safe_readonly_calls = []
             if finish_reason == "length":
                 truncated_err = (
                     f"{TOOL_ERROR_PREFIX} 本次工具调用参数因输出长度限制被截断，未执行。"
                     "请把参数拆小（例如分多次 edit_file、缩短 content）后重新调用。"
                 )
-                for tc in tool_calls_list:
-                    synth = {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "content": truncated_err,
-                    }
-                    messages.append(synth)
-                    if stream:
-                        pending_persistence.append(("tool", synth))
-                flush_persistence()
-                if current_step is not None:
-                    current_step.mark_tools_committed()
-                    if turn + 1 < max_turns:
-                        current_step.complete()
-                _notify_event(event_callback, "notice", {
-                    "message": "模型输出被长度限制截断，已拦截本批工具调用并要求模型拆小参数重试。",
-                })
-                # 截断拦截未执行任何工具：合成错误结果相同，无状态变化 → 停滞 +1
-                progress_guard.observe(
-                    _step_progress_observation(None, session_id=parent_session)
-                )
-                continue
+                last_tc_idx = len(tool_calls_list) - 1
+                active_reg = tool_registry
+                for tc_idx, tc in enumerate(tool_calls_list):
+                    if tc_idx == last_tc_idx and len(tool_calls_list) > 1:
+                        # 最后一个调用通常是被 max_tokens 截断的位置，跳过以免参数残缺
+                        continue
+                    fn = tc.get("function") or {}
+                    t_name = str(fn.get("name") or "")
+                    t_raw = str(fn.get("arguments") or "")
+                    try:
+                        parsed_args = json.loads(t_raw) if t_raw.strip() else {}
+                    except (TypeError, ValueError):
+                        parsed_args = None
+                    try:
+                        spec = active_reg.get(t_name)
+                        is_ro = bool(getattr(spec, "read_only", False))
+                    except KeyError:
+                        is_ro = False
+                    if is_ro and isinstance(parsed_args, dict):
+                        safe_readonly_calls.append(tc)
+
+                if not safe_readonly_calls:
+                    for tc in tool_calls_list:
+                        synth = {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "content": truncated_err,
+                        }
+                        messages.append(synth)
+                        if stream:
+                            pending_persistence.append(("tool", synth))
+                    flush_persistence()
+                    if current_step is not None:
+                        current_step.mark_tools_committed()
+                        if turn + 1 < max_turns:
+                            current_step.complete()
+                    _notify_event(event_callback, "notice", {
+                        "message": "模型输出被长度限制截断，已拦截本批工具调用并要求模型拆小参数重试。",
+                    })
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
+                    continue
+                length_partial_calls = True
 
             tool_activity_seen = True
             # C8/C9：累计本回合工具调用总次数（Stop hook 的 tool_call_count 输入）。
@@ -3708,15 +3733,16 @@ def _chat_with_model_generator(
             notify_tool_event = (
                 lambda kind, payload: _notify_event(event_callback, kind, payload)
             )
+            _calls_for_batch = safe_readonly_calls if length_partial_calls else tool_calls_list
             # 续跑打点：记录本轮计划执行的工具调用总数。生产路径不走
             # ToolBatchExecutor.execute()，必须在这里补一次，否则该列始终为空。
             if current_step is not None:
                 try:
-                    current_step.mark_tool_call_count(len(tool_calls_list))
+                    current_step.mark_tool_call_count(len(_calls_for_batch))
                 except Exception:
                     logger.warning("mark tool call count failed", exc_info=True)
             for prepared_batch in batch_executor.prepare(
-                tool_calls_list,
+                _calls_for_batch,
                 tool_context,
             ):
                 batch_executor.begin_batch(
@@ -3736,10 +3762,71 @@ def _chat_with_model_generator(
                 key=lambda record: record.call_ordinal,
             ))
 
+            if length_partial_calls:
+                _executed_by_id = {
+                    rec.message.get("tool_call_id"): rec.message
+                    for rec in records
+                    if rec.message.get("tool_call_id")
+                }
+                for tc in tool_calls_list:
+                    msg_item = _executed_by_id.get(tc["id"]) or {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": truncated_err,
+                    }
+                    messages.append(msg_item)
+                    if stream:
+                        pending_persistence.append(("tool", msg_item))
+                followups = [
+                    msg for rec in records for msg in rec.followup_messages
+                ]
+                if followups:
+                    messages.extend(followups)
+                    if stream:
+                        pending_persistence.extend(("user", fu) for fu in followups)
+                flush_persistence()
+                if current_step is not None:
+                    current_step.mark_tools_committed()
+                    if turn + 1 < max_turns:
+                        current_step.complete()
+                _notify_event(event_callback, "notice", {
+                    "message": (
+                        f"模型输出被长度限制截断：已执行 {len(_executed_by_id)} 个完整只读调用，"
+                        "其余截断或写入调用已拦截重试。"
+                    ),
+                })
+                tool_activity_seen = True
+                continue
+
             # 编排提醒（软）：多步实质操作仍未建计划时拉一把，每回合最多一次。
             # 实质操作数在此累计；提醒本体的 append 推迟到全部 tool 结果（含
             # follow-up 观察消息）之后，见下方"工具结果全部入列后再追加"处。
             substantive_op_count += _count_substantive_ops(tool_calls_list)
+
+            # 已成功完成（status == "completed"）的 test 子代理等同真实测试验证证据，
+            # 避免主代理把测试派发给 subagent_type="test" 后仍触发验证声明误报。
+            if not used_command_tools:
+                _tc_by_id = {
+                    tc.get("id"): tc for tc in tool_calls_list if isinstance(tc, dict) and tc.get("id")
+                }
+                for _rec in records:
+                    _msg = _rec.message
+                    if _msg.get("name") != "run_subagent" or not _tool_result_ok("run_subagent", _msg):
+                        continue
+                    _tc = _tc_by_id.get(_msg.get("tool_call_id")) or {}
+                    try:
+                        _sub_args = json.loads((_tc.get("function") or {}).get("arguments") or "{}")
+                    except (TypeError, ValueError):
+                        _sub_args = {}
+                    if str((_sub_args or {}).get("subagent_type") or "").strip().lower() == "test":
+                        try:
+                            _sub_res = json.loads(str(_msg.get("content") or "{}"))
+                        except (TypeError, ValueError):
+                            _sub_res = {}
+                        if isinstance(_sub_res, dict) and _sub_res.get("status") == "completed":
+                            used_command_tools = True
+                            break
 
             results = [record.message for record in records]
             # follow-up 观察 user 消息按 call ordinal 追加在全部 tool results

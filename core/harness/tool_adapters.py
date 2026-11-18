@@ -11,9 +11,11 @@ from contextlib import nullcontext
 
 from core.tool_protocol import ToolResult
 from core.tools import (
+    capture_edit_diff as _capture_edit_diff,
     edit_file as _edit_file,
     is_outside_workspace as _is_outside_workspace,
     manage_task as _manage_task,
+    multi_edit as _multi_edit,
     read_file as _read_file,
     run_subagent as _run_subagent,
     _resolve_workspace_path,
@@ -46,6 +48,8 @@ _TRUSTED_READONLY_TOOLS = frozenset({
     "directory_tree",
     "search_code",
     "find_definition",
+    "get_outline",
+    "find_references",
     "glob_files",
     "view_file_outline",
 })
@@ -229,10 +233,10 @@ def classify_path_access(
             basename in _YCODE_CREDENTIAL_BASENAMES
             or (
                 ambiguous_short
-                and function_name in {"write_file", "edit_file"}
+                and function_name in {"write_file", "edit_file", "multi_edit"}
             )
         )
-        if credential_target and function_name in {"write_file", "edit_file"}:
+        if credential_target and function_name in {"write_file", "edit_file", "multi_edit"}:
             return "credential_write"
         return "trusted_read"
 
@@ -318,7 +322,7 @@ def _sandbox_outside_guard(
             ambiguous_short = "~" in basename and expanded == resolved
             is_credential_target = top_level and (
                 basename in _YCODE_CREDENTIAL_BASENAMES
-                or (ambiguous_short and function_name in {"write_file", "edit_file"})
+                or (ambiguous_short and function_name in {"write_file", "edit_file", "multi_edit"})
             )
             # 仅 ~/.ycode 顶层的凭据文件受限（子目录同名文件如
             # plugins/x/config.json 不是应用配置，不弹逐次询问）
@@ -326,7 +330,7 @@ def _sandbox_outside_guard(
                 return sandbox_bypass(), None
             # 凭据文件读取放行（诊断配置问题的常见需求），写入必须逐次询问——
             # 改写 mcp.json 可注入恶意 MCP server，改坏 config.json 会让应用不可用
-            if function_name not in {"write_file", "edit_file"}:
+            if function_name not in {"write_file", "edit_file", "multi_edit"}:
                 return sandbox_bypass(), None
             credential_write = True
     except Exception:
@@ -404,6 +408,7 @@ class ToolAdapterSet:
         read_file=_read_file,
         write_file=_write_file,
         edit_file=_edit_file,
+        multi_edit=_multi_edit,
         run_subagent=_run_subagent,
         manage_task=_manage_task,
         show_file_diff=_show_file_diff,
@@ -422,6 +427,7 @@ class ToolAdapterSet:
         self.read_file = read_file
         self.write_file = write_file
         self.edit_file = edit_file
+        self.multi_edit = multi_edit
         self.run_subagent = run_subagent
         self.manage_task = manage_task
         self.show_file_diff = show_file_diff
@@ -465,6 +471,10 @@ class ToolAdapterSet:
             friendly = f"🔍 {agent}正在读取文件：{arguments.get('file_path', '未知文件')}"
         elif name == "write_file":
             friendly = f"✍️ {agent}正在写入文件：{arguments.get('file_path', '未知文件')}"
+        elif name == "edit_file":
+            friendly = f"✏️ {agent}正在修改文件：{arguments.get('file_path', '未知文件')}"
+        elif name == "multi_edit":
+            friendly = f"✏️ {agent}正在批量修改文件：{arguments.get('file_path', '未知文件')}"
         elif name == "list_directory":
             friendly = f"📂 {agent}正在查看目录：{arguments.get('dir_path', '当前目录')}"
         elif name == "execute_command":
@@ -476,6 +486,10 @@ class ToolAdapterSet:
             friendly = f"🔍 {agent}正在全局查找: {arguments.get('query', '')}"
         elif name == "find_definition":
             friendly = f"🔍 {agent}正在查找符号定义: {arguments.get('symbol', '')}"
+        elif name == "get_outline":
+            friendly = f"📑 {agent}正在提取文件大纲: {arguments.get('file_path', '')}"
+        elif name == "find_references":
+            friendly = f"🔍 {agent}正在查找符号引用: {arguments.get('symbol', '')}"
         elif name == "search_news":
             friendly = f"🌐 {agent}正在联网搜索：{arguments.get('query', '')}"
         elif name == "fetch_url":
@@ -585,15 +599,86 @@ class ToolAdapterSet:
             truncated_note="已成功写入文件",
             tool_call_id=self.tool_call_id,
         )
-        return ToolResult(f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。")
+        diag_suffix = ""
+        if isinstance(write_result, str) and "\n⚠ " in write_result:
+            diag_suffix = write_result[write_result.find("\n⚠ ") :]
+        return ToolResult(
+            f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。{diag_suffix}"
+        )
+
+    def _execute_edit_like_tool(
+        self,
+        *,
+        tool_name: str,
+        handler,
+        builtin_handler,
+        resolved_tool,
+        file_path: str,
+        call_arguments: dict,
+        context,
+        panel_title: str,
+        truncated_note: str,
+    ) -> ToolResult:
+        bypass, error = self._guard(tool_name, file_path, context)
+        if error:
+            return ToolResult(error, is_error=True)
+
+        use_capture = not self._uses_override(handler, builtin_handler)
+        # 与 execute_write_file 同一口径：bypass 临界区内先按线程级 workdir
+        # 解析再判存，避免 GUI 安装目录 cwd 误报"文件不存在"。
+        with bypass if bypass is not None else self.sandbox_bypass():
+            resolved_path = _resolve_workspace_path(file_path)
+            if not resolved_path.is_file():
+                return ToolResult(
+                    f"{TOOL_ERROR_PREFIX} {tool_name} 目标文件不存在：{file_path}。"
+                    f"{tool_name} 只能修改已有文件；创建新文件请改用 write_file。",
+                    is_error=True,
+                )
+            old_content = ""
+            if not use_capture:
+                try:
+                    old_content = self.read_text(str(resolved_path))
+                except OSError as read_error:
+                    logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_error)
+
+            if use_capture:
+                with _capture_edit_diff() as diff_slot:
+                    result = self._execute_builtin(
+                        resolved_tool, handler, builtin_handler, call_arguments
+                    ).to_message_content()
+            else:
+                diff_slot = {}
+                result = self._execute_builtin(
+                    resolved_tool, handler, builtin_handler, call_arguments
+                ).to_message_content()
+
+            if not result.startswith(TOOL_ERROR_PREFIX):
+                if use_capture and "old" in diff_slot and "new" in diff_slot:
+                    old_content = diff_slot["old"]
+                    new_content = diff_slot["new"]
+                else:
+                    if use_capture:
+                        old_content = ""
+                    try:
+                        new_content = self.read_text(str(resolved_path))
+                    except OSError as read_error:
+                        logger.warning("读取新文件内容失败 (%s): %s", file_path, read_error)
+                        new_content = ""
+                self.show_file_diff(
+                    str(resolved_path),
+                    old_content,
+                    new_content,
+                    context.event_callback,
+                    panel_title=panel_title,
+                    truncated_note=truncated_note,
+                    tool_call_id=self.tool_call_id,
+                )
+        return ToolResult(result, is_error=result.startswith(TOOL_ERROR_PREFIX))
 
     def execute_edit_file(self, resolved_tool, arguments, context) -> ToolResult:
         file_path = arguments.get("file_path")
         target = arguments.get("target_content")
         replacement = arguments.get("replacement_content")
-        bypass, error = self._guard("edit_file", file_path, context)
-        if error:
-            return ToolResult(error, is_error=True)
         max_target_len = 1500
         if target and len(target) > max_target_len:
             return ToolResult(
@@ -602,51 +687,56 @@ class ToolAdapterSet:
                 f"不超过 {max_target_len} 字符的小段后重试；如需整体重写，请改用 write_file。",
                 is_error=True,
             )
-        # 与 execute_write_file 同一口径：bypass 临界区内先按线程级 workdir
-        # 解析再判存。进程 cwd 在 GUI 打包版停在安装目录，裸用原始相对路径
-        # 会按 cwd 判存，把合法编辑误报成"文件不存在"；而解析必须放在
-        # bypass 之内——工作区外的路径（守卫已批准）在临界区外会被
-        # _resolve_workspace_path 的越界检查直接拒绝。
-        with bypass if bypass is not None else self.sandbox_bypass():
-            resolved_path = _resolve_workspace_path(file_path)
-            if not resolved_path.is_file():
-                return ToolResult(
-                    f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
-                    "edit_file 只能修改已有文件；创建新文件请改用 write_file。",
-                    is_error=True,
-                )
-            try:
-                old_content = self.read_text(str(resolved_path))
-            except OSError as read_error:
-                logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_error)
-                old_content = ""
-            call_arguments = {
-                "file_path": file_path,
-                "target_content": target,
-                "replacement_content": replacement,
-                "replace_all": bool(arguments.get("replace_all", False)),
-                "start_line": arguments.get("start_line"),
-                "end_line": arguments.get("end_line"),
-            }
-            result = self._execute_builtin(
-                resolved_tool, self.edit_file, _edit_file, call_arguments
-            ).to_message_content()
-            if not result.startswith(TOOL_ERROR_PREFIX):
-                try:
-                    new_content = self.read_text(str(resolved_path))
-                except OSError as read_error:
-                    logger.warning("读取新文件内容失败 (%s): %s", file_path, read_error)
-                    new_content = ""
-                self.show_file_diff(
-                    str(resolved_path),
-                    old_content,
-                    new_content,
-                    context.event_callback,
-                    panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
-                    truncated_note="已局部替换并修改成功",
-                    tool_call_id=self.tool_call_id,
-                )
-        return ToolResult(result, is_error=result.startswith(TOOL_ERROR_PREFIX))
+        call_arguments = {
+            "file_path": file_path,
+            "target_content": target,
+            "replacement_content": replacement,
+            "replace_all": bool(arguments.get("replace_all", False)),
+            "start_line": arguments.get("start_line"),
+            "end_line": arguments.get("end_line"),
+        }
+        return self._execute_edit_like_tool(
+            tool_name="edit_file",
+            handler=self.edit_file,
+            builtin_handler=_edit_file,
+            resolved_tool=resolved_tool,
+            file_path=file_path,
+            call_arguments=call_arguments,
+            context=context,
+            panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
+            truncated_note="已局部替换并修改成功",
+        )
+
+    def execute_multi_edit(self, resolved_tool, arguments, context) -> ToolResult:
+        file_path = arguments.get("file_path")
+        edits = arguments.get("edits")
+        if not isinstance(edits, list) or not edits:
+            return ToolResult(
+                f"{TOOL_ERROR_PREFIX} multi_edit 失败：edits 必须为非空编辑列表。",
+                is_error=True,
+            )
+        max_target_len = 1500
+        for idx, item in enumerate(edits, start=1):
+            if isinstance(item, dict):
+                t = item.get("target_content")
+                if isinstance(t, str) and len(t) > max_target_len:
+                    return ToolResult(
+                        f"{TOOL_ERROR_PREFIX} multi_edit 第 {idx} 项 target_content 过长"
+                        f"（{len(t)} > {max_target_len} 字符），请拆分为更小的精确片段后重试。",
+                        is_error=True,
+                    )
+        call_arguments = {"file_path": file_path, "edits": edits}
+        return self._execute_edit_like_tool(
+            tool_name="multi_edit",
+            handler=self.multi_edit,
+            builtin_handler=_multi_edit,
+            resolved_tool=resolved_tool,
+            file_path=file_path,
+            call_arguments=call_arguments,
+            context=context,
+            panel_title=f"📝 [bold green]批量修改文件: {file_path}[/bold green]",
+            truncated_note="已批量修改成功",
+        )
 
     def execute_run_subagent(self, resolved_tool, arguments, context) -> ToolResult:
         if not context.allow_subagents:
@@ -881,6 +971,8 @@ class ToolAdapterSet:
             return self.execute_write_file(resolved_tool, arguments, context)
         if name == "edit_file":
             return self.execute_edit_file(resolved_tool, arguments, context)
+        if name == "multi_edit":
+            return self.execute_multi_edit(resolved_tool, arguments, context)
         if name == "run_subagent":
             return self.execute_run_subagent(resolved_tool, arguments, context)
         if name == "ask_user":

@@ -44,14 +44,48 @@
   }
   var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
   // 云中转的完整桌面 UI / 独立移动端：服务器注入 __ycRelayDevice，直接连网关 relay。
-  var relayDevice = window.__ycRelayDevice || window.location.pathname.split('/')[2] || '';
-  // 网关可能被反代到子路径（如 /xy/bot/desktop/<设备号>）：ws 端点必须跟着前缀走，
-  // 否则固定打根路径 /relay/client 会 404。前缀＝设备号之前、去掉 desktop|m 那一段。
+  // 注入值有一个坑：SPA 子路由刷新时服务端会把路由名当设备号注入（/m/convo）。
+  // 设备号是 UUID，注入值不像 UUID 就回退到上次记住的 UUID，否则刷新后连接的是假设备。
+  var DEVICE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  var injectedDevice = window.__ycRelayDevice || '';
+  var rememberedDevice = '';
+  var rememberedPrefix = '';
+  try {
+    rememberedDevice = window.localStorage.getItem('yc-relay-device') || '';
+    rememberedPrefix = window.localStorage.getItem('yc-relay-prefix') || '';
+    if (DEVICE_RE.test(injectedDevice)) {
+      window.localStorage.setItem('yc-relay-device', injectedDevice);
+      rememberedDevice = injectedDevice;
+    }
+  } catch (_) {}
+  var relayDevice = DEVICE_RE.test(injectedDevice)
+    ? injectedDevice
+    : (DEVICE_RE.test(rememberedDevice)
+      ? rememberedDevice
+      : ((window.location.pathname || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i) || [''])[0]);
+  // 网关可能被反代到子路径（如 /xy/bot/desktop/<设备号> 或刷新后的 /xy/bot/m/convo）：
+  // ws 端点必须跟着前缀走，否则固定打根路径 /relay/client 会 404。
   var relayPrefix = '';
   if (relayDevice) {
-    var relaySegs = (window.location.pathname || '').split('/');
+    var pathname = window.location.pathname || '';
+    var relaySegs = pathname.split('/');
     var relayAt = relaySegs.indexOf(relayDevice);
-    if (relayAt > 1) relayPrefix = relaySegs.slice(0, relayAt - 1).join('/');
+    if (relayAt > 1) {
+      relayPrefix = relaySegs.slice(0, relayAt - 1).join('/');
+    } else {
+      for (var si = 1; si < relaySegs.length; si++) {
+        if (relaySegs[si] === 'm' || relaySegs[si] === 'desktop') {
+          relayPrefix = relaySegs.slice(0, si).join('/');
+          break;
+        }
+      }
+      if (!relayPrefix && rememberedPrefix) relayPrefix = rememberedPrefix;
+    }
+    try {
+      if (DEVICE_RE.test(injectedDevice)) {
+        window.localStorage.setItem('yc-relay-prefix', relayPrefix);
+      }
+    } catch (_) {}
   }
   var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + (relayDevice ? relayPrefix + '/relay/client?device_id=' + encodeURIComponent(relayDevice) : '/');
 
@@ -75,7 +109,7 @@
 
   function watermarkKey() {
     var account = window.__ycAccountId || '';
-    var profile = window.__ycProfile || 'lan';
+    var profile = window.__ycProfile || (relayDevice ? 'relay:' + relayDevice : 'lan');
     return 'yc-watermark:' + window.location.origin + '|' + account + '|' + profile;
   }
 
@@ -91,7 +125,7 @@
   }
 
   function saveWatermark() {
-    if (isCapacitor() || legacy || !bootId) return;
+    if (isCapacitor() || legacy || (!bootId && !relayDevice)) return;
     try {
       window.localStorage.setItem(watermarkKey(), JSON.stringify({
         boot_id: bootId,
@@ -256,6 +290,50 @@
           seen = {};
           saveWatermark();
           if (msg.data && msg.data.resync_required) beginResync();
+          return;
+        }
+        if (msg.type === 'replay') {
+          sawHello = true;
+          var replayFrames = Array.isArray(msg.frames) ? msg.frames : [];
+          for (var i = 0; i < replayFrames.length; i++) {
+            var item = replayFrames[i];
+            if (typeof item === 'string') {
+              try { item = JSON.parse(item); } catch (_) { item = null; }
+            }
+            if (item && typeof item === 'object' && item.type) {
+              acceptFrame(item);
+            }
+          }
+          return;
+        }
+        if (msg.type === 'resync_required' || msg.type === 'device_reset') {
+          sawHello = true;
+          if (msg.data && msg.data.boot_id) bootId = msg.data.boot_id;
+          lastSeq = 0;
+          seen = {};
+          saveWatermark();
+          beginResync();
+          return;
+        }
+        if (msg.type === 'device_online') {
+          sawHello = true;
+          if (msg.data && msg.data.boot_id) {
+            bootId = msg.data.boot_id;
+            saveWatermark();
+          }
+          if (window.onBridgeEvent) {
+            window.onBridgeEvent({
+              type: 'device_status',
+              data: {
+                device_id: (msg.data && msg.data.device_id) || relayDevice,
+                online: true,
+              },
+            });
+          }
+          return;
+        }
+        if (msg.type === 'device_status') {
+          if (window.onBridgeEvent) window.onBridgeEvent(msg);
           return;
         }
         if (!sawHello && !legacy) {

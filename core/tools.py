@@ -77,7 +77,7 @@ def _raise_if_cancelled(cancel_event):
 # 整条链路死锁（2026-11-02 小说项目实测）。
 _SUBAGENT_READ_ONLY_TOOLS = frozenset({
     "read_file", "list_directory", "search_code", "glob_files",
-    "find_definition", "tool_result_read",
+    "find_definition", "get_outline", "find_references", "tool_result_read",
     "search_news", "fetch_url", "fetch_image", "get_weather",
     "office_read",
     "novel_status", "novel_wordcount", "novel_outline", "novel_audit",
@@ -87,12 +87,12 @@ _SUBAGENT_READ_ONLY_TOOLS = frozenset({
 _SUBAGENT_DEFAULT_ALLOWED_TOOLS = {
     "explore": _SUBAGENT_READ_ONLY_TOOLS,
     "implement": _SUBAGENT_READ_ONLY_TOOLS | frozenset({
-        "write_file", "edit_file", "execute_command",
+        "write_file", "edit_file", "multi_edit", "execute_command",
         "office_write", "novel_init", "novel_track",
     }),
     "test": frozenset({
         "read_file", "list_directory", "search_code", "glob_files",
-        "find_definition", "tool_result_read", "execute_command",
+        "find_definition", "get_outline", "find_references", "tool_result_read", "execute_command",
         "novel_status", "novel_wordcount", "novel_audit",
     }),
     "review": _SUBAGENT_READ_ONLY_TOOLS,
@@ -569,6 +569,14 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
     # 读已删除/无权限文件不应抛出异常栈
     try:
         file_size = resolved.stat().st_size
+        if file_size > 0:
+            with open(resolved, "rb") as _probe_f:
+                _sample = _probe_f.read(min(file_size, 8192))
+            if b"\x00" in _sample and not _sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+                return (
+                    f"🚨 检测到二进制文件（{file_path}，大小 {file_size} 字节），"
+                    "read_file 仅支持文本文件。"
+                )
         auto_limited = False
         if limit is None and file_size > READ_FILE_LARGE_BYTES:
             max_lines = READ_FILE_LARGE_DEFAULT_LINES
@@ -664,6 +672,82 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
         pass
     return final
 
+
+_EDIT_DIFF_TLS = threading.local()
+
+
+def capture_edit_diff():
+    """上下文管理器：收集单次内置 edit_file / multi_edit 在内存中已解析的新旧全文，
+    供 ToolAdapterSet 复用以展示 Diff，避免重复读盘 3 次。
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        prev = getattr(_EDIT_DIFF_TLS, "slot", None)
+        slot = {}
+        _EDIT_DIFF_TLS.slot = slot
+        try:
+            yield slot
+        finally:
+            _EDIT_DIFF_TLS.slot = prev
+
+    return _ctx()
+
+
+def _publish_edit_diff(old_text: str, new_text: str) -> None:
+    slot = getattr(_EDIT_DIFF_TLS, "slot", None)
+    if isinstance(slot, dict):
+        slot["old"] = old_text
+        slot["new"] = new_text
+
+
+def _check_post_edit_diagnostics(resolved_path: Path, text: str) -> str:
+    """写/改成功后在内存中零磁盘 IO 做轻量静态语法自检，仅在发现语法错误时返回警告行。"""
+    suffix = resolved_path.suffix.lower()
+    if suffix == ".py":
+        import ast
+
+        try:
+            ast.parse(text, filename=str(resolved_path))
+        except SyntaxError as exc:
+            col = f"第 {exc.offset} 列" if exc.offset else ""
+            return f"\n⚠ 静态语法检查发现问题（Python）：第 {exc.lineno} 行{col}：{exc.msg}"
+    elif suffix == ".json":
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as exc:
+            return f"\n⚠ 静态语法检查发现问题（JSON）：第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}"
+    return ""
+
+
+def _on_file_mutated(resolved_path) -> None:
+    """写/改文件成功后的统一收尾：刷新写前新鲜度指纹并失效检索缓存。"""
+    session_id = _tool_cache.get_current_session() or ""
+    try:
+        from core.fresh_read_guard import record_write
+
+        record_write(session_id, str(resolved_path))
+    except Exception:
+        pass
+    try:
+        _tool_cache.invalidate_after_mutation(str(resolved_path))
+    except Exception:
+        pass
+
+
+def _invalidate_caches_after_command(command: str) -> None:
+    """仅对可能改动工作区状态的命令清理读/搜缓存，纯查询命令保留缓存命中。"""
+    try:
+        from core.command_policy import classify_command_risk
+        from core.permission_policy import PermissionRisk
+
+        if classify_command_risk(command) is not PermissionRisk.QUERY:
+            _tool_cache.invalidate_after_mutation()
+    except Exception:
+        pass
+
+
 def write_file(file_path, content):
     """创建或完整写入文件（仅限当前工作目录内，统一按 utf-8 编码写入）。
 
@@ -742,15 +826,27 @@ def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, 
         existed_before = resolved.exists() and resolved.is_file()
         old_content = ""
         old_bytes = None
+        write_encoding = "utf-8"
         if existed_before:
             try:
                 old_bytes = resolved.read_bytes()
             except OSError as error:
                 return f"🚨 无法读取文件原始内容，已拒绝覆盖 {file_path}：{error}"
-            try:
-                old_content = old_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                old_content = old_bytes.decode("gbk", errors="replace")
+            if old_bytes.startswith(b"\xef\xbb\xbf"):
+                old_content = old_bytes.decode("utf-8-sig", errors="replace")
+                if not content.startswith("\ufeff"):
+                    write_encoding = "utf-8-sig"
+            else:
+                try:
+                    old_content = old_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    try:
+                        old_content = old_bytes.decode("gbk")
+                        # 仅当新内容也能无损编码为 GBK 时沿用原 GBK 编码
+                        content.encode("gbk")
+                        write_encoding = "gbk"
+                    except UnicodeError:
+                        old_content = old_bytes.decode("gbk", errors="replace")
 
         # 与 edit_file 对齐：先写同目录临时文件再 os.replace，避免写入中断留下半个文件
         # 自动创建父目录：用户/Agent 可能直接写到不存在的子目录（如 memory/feedback/），
@@ -766,7 +862,7 @@ def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, 
 
         # 按回合撤销：prepare（捕获 before + 持久化计划 after）成功后才允许触盘。
         # 快照失败 → 放弃写入；无活动回合检查点 → 退化为普通写入。
-        new_bytes = content.encode("utf-8")
+        new_bytes = content.encode(write_encoding)
         handle = None
         try:
             handle = _tu_recorder.prepare_mutation(
@@ -799,8 +895,8 @@ def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, 
             prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
         )
         try:
-            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
-                f.write(content)
+            with os.fdopen(fd, "wb") as f:
+                f.write(new_bytes)
             conflict = _mtime_conflict_error(file_path, resolved, expected_mtime_ns)
             if conflict:
                 try:
@@ -832,12 +928,30 @@ def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, 
                     f"🚨 文件已写入但未能通过可撤销性验证，本轮撤销保证失效"
                     f"（{file_path}）：\n{error.message}"
                 )
-    return f"✔ 文件 {file_path} 写入成功！"
+    _on_file_mutated(resolved)
+    diag = _check_post_edit_diagnostics(resolved, content)
+    return f"✔ 文件 {file_path} 写入成功！{diag}"
 
 # --- 下面是给星瑶装配的两个新神装 ---
 
-def list_directory(dir_path=".", max_entries=200):
-    """雷达工具：扫描文件夹，返回里面的所有文件和文件夹列表（仅限当前工作目录内）"""
+_LIST_DIR_IGNORE_NOISE = frozenset({
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+})
+
+
+def list_directory(dir_path=".", max_entries=200, depth=1):
+    """雷达工具：扫描文件夹，返回里面的所有文件和文件夹列表（仅限当前工作目录内）。
+
+    - depth=1（默认）：仅列直接子项，目录后缀加 '/' 便于区分
+    - depth>1（最高 4）：展开受控目录树视图并忽略 .git / node_modules / __pycache__ 等噪音目录
+    """
     try:
         resolved = _resolve_workspace_path(dir_path)
         if not os.path.exists(resolved):
@@ -847,15 +961,61 @@ def list_directory(dir_path=".", max_entries=200):
             # 名字像目录的单文件），不用 🚨 错误级返回——否则 UI 会渲染成红色失败。
             # 用普通提示文案引导模型改用 read_file 即可。
             return f"'{dir_path}' 是一个文件而不是目录，无法列出。请改用 read_file 工具读取该文件内容。"
-        items = os.listdir(resolved)
-        if not items:
-            return f"📂 目录 '{dir_path}' 为空。"
+
         max_entries = max(1, min(int(max_entries or 200), 1000))
-        if len(items) > max_entries:
-            shown = items[:max_entries]
-            shown.append(f"... (目录过大，已截断前 {max_entries} 项，共 {len(items)} 项)")
-            return "\n".join(shown)
-        return "\n".join(items)
+        tree_depth = max(1, min(int(depth or 1), 4))
+
+        if tree_depth == 1:
+            items = sorted(
+                os.listdir(resolved),
+                key=lambda name: (not os.path.isdir(os.path.join(resolved, name)), name.lower()),
+            )
+            if not items:
+                return f"📂 目录 '{dir_path}' 为空。"
+            formatted = [
+                f"{name}/" if os.path.isdir(os.path.join(resolved, name)) else name
+                for name in items[:max_entries]
+            ]
+            if len(items) > max_entries:
+                formatted.append(f"... (目录过大，已截断前 {max_entries} 项，共 {len(items)} 项)")
+            return "\n".join(formatted)
+
+        # 受控深度树状视图
+        lines: list[str] = []
+        truncated = False
+
+        def _walk(cur_path: str, level: int) -> None:
+            nonlocal truncated
+            if truncated or level > tree_depth:
+                return
+            try:
+                raw_names = os.listdir(cur_path)
+            except OSError:
+                return
+            raw_names.sort(
+                key=lambda name: (not os.path.isdir(os.path.join(cur_path, name)), name.lower())
+            )
+            indent = "  " * (level - 1)
+            for name in raw_names:
+                full = os.path.join(cur_path, name)
+                is_dir = os.path.isdir(full)
+                if is_dir and name in _LIST_DIR_IGNORE_NOISE:
+                    continue
+                if len(lines) >= max_entries:
+                    truncated = True
+                    return
+                lines.append(f"{indent}{name}/" if is_dir else f"{indent}{name}")
+                if is_dir and level < tree_depth:
+                    _walk(full, level + 1)
+                    if truncated:
+                        return
+
+        _walk(str(resolved), 1)
+        if not lines:
+            return f"📂 目录 '{dir_path}' 为空。"
+        if truncated:
+            lines.append(f"... (已达条目上限 {max_entries}，后续项已省略；可指定子目录继续查看)")
+        return "\n".join(lines)
     except Exception as e:
         return f"🚨 目录扫描失败: {str(e)}"
 
@@ -1080,6 +1240,7 @@ def execute_command(
             )
             start_time = time.time()
             output_capped = False
+            timed_out = False
             while True:
                 if cancel_event is not None and cancel_event.is_set():
                     _stop_process_tree(process)
@@ -1096,8 +1257,9 @@ def execute_command(
                     break
                 elapsed = time.time() - start_time
                 if elapsed >= timeout_seconds:
+                    timed_out = True
                     _stop_process_tree(process)
-                    return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
+                    break
                 # 轮询节奏随时长退避：短命令保持 0.1s 灵敏响应，长命令降频省 CPU。
                 # 代价：超时/取消/输出超限最多晚 0.5s 被察觉，属预期可接受。
                 if elapsed < 2.0:
@@ -1126,10 +1288,23 @@ def execute_command(
             except Exception:
                 pass
 
+        _invalidate_caches_after_command(command)
         output = decode_process_output(stdout_raw, output_encoding)
         if stderr_raw:
             stderr = decode_process_output(stderr_raw, output_encoding)
             output += f"\n[附加信息/警告]:\n{stderr}"
+
+        if timed_out:
+            detail = output.strip()
+            if detail:
+                max_tail = 4000
+                tail = detail[-max_tail:] if len(detail) > max_tail else detail
+                prefix = "...(已截断前段输出)...\n" if len(detail) > max_tail else ""
+                return (
+                    f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！\n"
+                    f"超时前已捕获输出（尾部）：\n{prefix}{tail}"
+                )
+            return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
 
         if output_capped:
             return (
@@ -1994,9 +2169,19 @@ def _get_search_exclude_dirs():
     return dirs
 
 
-def search_code(query, dir_path=".", cancel_event=None):
+def search_code(
+    query,
+    dir_path=".",
+    cancel_event=None,
+    glob="",
+    output_mode="content",
+    case_sensitive=False,
+    context_lines=1,
+):
     """精准搜索：跨文件全局查找代码片段或关键字。优先尝试 ripgrep。"""
+    import fnmatch
     import subprocess
+
     try:
         # 与 read_file 等工具一致，强制限定在当前工作目录内
         dir_path = str(_resolve_workspace_path(dir_path))
@@ -2006,7 +2191,18 @@ def search_code(query, dir_path=".", cancel_event=None):
     if cancel_event is not None and cancel_event.is_set():
         return "🛑 搜索已被用户取消。"
 
-    cache_key = _tool_cache.search_key("search_code", query, dir_path)
+    mode = str(output_mode or "content").strip().lower()
+    if mode not in {"content", "files", "count"}:
+        mode = "content"
+    glob_pattern = str(glob or "").strip()
+    is_case_sensitive = bool(case_sensitive)
+    ctx_lines = max(0, min(int(context_lines if context_lines is not None else 1), 5))
+
+    cache_key = _tool_cache.search_key(
+        "search_code",
+        (query, glob_pattern, mode, is_case_sensitive, ctx_lines),
+        dir_path,
+    )
     cached = _tool_cache.search_get(cache_key)
     if cached is not None:
         return cached
@@ -2019,15 +2215,32 @@ def search_code(query, dir_path=".", cancel_event=None):
             return shared
 
     def _run_rg(args_query, literal=False):
-        cmd = [
-            rg_executable, "-n", "-i", "--no-heading",
-            "--max-columns", "200", "-C", "1",
-            "-m", "20",  # 每个文件最多 20 处匹配，避免单文件刷屏
-        ]
+        cmd = [rg_executable]
+        if is_case_sensitive:
+            cmd.append("-s")
+        else:
+            cmd.append("-i")
+        if mode == "files":
+            cmd.append("-l")
+        elif mode == "count":
+            cmd.append("--count")
+        else:
+            cmd += [
+                "-n",
+                "--no-heading",
+                "--max-columns",
+                "200",
+                "-C",
+                str(ctx_lines),
+                "-m",
+                "20",
+            ]
         # 统一排除构建产物目录：git 仓库 rg 靠 .gitignore 排除，
         # 非 git 目录必须显式下发，否则会命中 target/dist 产物
         for _d in sorted(_get_search_exclude_dirs()):
             cmd += ["--glob", f"!**/{_d}/"]
+        if glob_pattern:
+            cmd += ["--glob", glob_pattern]
         if literal:
             cmd.append("-F")
         cmd += [args_query, dir_path]
@@ -2038,8 +2251,9 @@ def search_code(query, dir_path=".", cancel_event=None):
         if not output:
             return "未找到匹配的代码片段。"
         lines = output.split("\n")
-        if len(lines) > 60:
-            return "\n".join(lines[:60]) + f"\n\n... (匹配结果过多，已截断，共 {len(lines)} 行)"
+        max_lines = 100 if mode in {"files", "count"} else 80
+        if len(lines) > max_lines:
+            return "\n".join(lines[:max_lines]) + f"\n\n... (匹配结果过多，已截断前 {max_lines} 行，共 {len(lines)} 行)"
         return output
 
     rg_executable = None
@@ -2086,8 +2300,9 @@ def search_code(query, dir_path=".", cancel_event=None):
     
     results = []
     match_count = 0
-    max_matches = 50
-    
+    max_matches = 100 if mode in {"files", "count"} else 50
+    query_cmp = query if is_case_sensitive else query.lower()
+
     try:
         for root, dirs, files in os.walk(dir_path):
             if cancel_event is not None and cancel_event.is_set():
@@ -2096,36 +2311,51 @@ def search_code(query, dir_path=".", cancel_event=None):
             
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
-                if ext not in ALLOWED_EXTS:
+                if not glob_pattern and ext not in ALLOWED_EXTS:
                     continue
                     
                 file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(file_path, dir_path).replace("\\", "/")
+                if glob_pattern and not (
+                    fnmatch.fnmatch(file, glob_pattern) or fnmatch.fnmatch(rel_path, glob_pattern)
+                ):
+                    continue
                 
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         lines = f.readlines()
-                        
+
+                    file_hits = 0
                     for line_num, line in enumerate(lines, 1):
-                        if query.lower() in line.lower():
-                            start = max(0, line_num - 2)
-                            end = min(len(lines), line_num + 1)
-                            snippet = "".join(lines[start:end])
-                            
-                            results.append(f"📄 {file_path} (行 {line_num}):\n{snippet.strip()}")
-                            match_count += 1
-                            
-                            if match_count >= max_matches:
-                                results.append(f"\n⚠️ 搜索结果太多，已截断前 {max_matches} 条，请尝试更精确的关键字。")
-                                result_text = "\n---\n".join(results)
-                                _tool_cache.search_put(cache_key, result_text)
-                                return result_text
+                        hay = line if is_case_sensitive else line.lower()
+                        if query_cmp in hay:
+                            file_hits += 1
+                            if mode == "content":
+                                start = max(0, line_num - 1 - ctx_lines)
+                                end = min(len(lines), line_num + ctx_lines)
+                                snippet = "".join(lines[start:end])
+                                results.append(f"📄 {file_path} (行 {line_num}):\n{snippet.strip()}")
+                                match_count += 1
+                                if match_count >= max_matches:
+                                    results.append(f"\n⚠️ 搜索结果太多，已截断前 {max_matches} 条，请尝试更精确的关键字。")
+                                    result_text = "\n---\n".join(results)
+                                    _tool_cache.search_put(cache_key, result_text)
+                                    return result_text
+                    if file_hits > 0 and mode in {"files", "count"}:
+                        results.append(rel_path if mode == "files" else f"{rel_path}:{file_hits}")
+                        match_count += 1
+                        if match_count >= max_matches:
+                            break
                 except Exception:
                     continue
+            if match_count >= max_matches:
+                break
                     
         if not results:
             result_text = f"🔍 搜索完毕，未在代码文件中找到包含 `{query}` 的内容。"
         else:
-            result_text = "\n---\n".join(results)
+            sep = "\n" if mode in {"files", "count"} else "\n---\n"
+            result_text = sep.join(results)
         _tool_cache.search_put(cache_key, result_text)
         if session_id:
             _tool_cache.shared_put(session_id, ("search_code", cache_key), result_text)
@@ -2337,6 +2567,158 @@ def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, e
     else:
         return "🚨 错误：未知行动参数。可选值有 'list', 'status', 'wait', 'kill'。"
 
+def _leading_ws(line: str) -> str:
+    return line[: len(line) - len(line.lstrip(" \t"))]
+
+
+def _shift_replacement_indent(replacement: str, mode: str, delta: str, newline: str) -> str:
+    if not delta:
+        return replacement
+    ends_with_nl = replacement.endswith(("\r\n", "\n"))
+    lines = replacement.splitlines()
+    out: list[str] = []
+    for line in lines:
+        if not line.strip():
+            out.append("")
+        elif mode == "add":
+            out.append(delta + line)
+        elif line.startswith(delta):
+            out.append(line[len(delta) :])
+        else:
+            out.append(line.lstrip(" \t"))
+    joined = newline.join(out)
+    if ends_with_nl and out:
+        joined += newline
+    return joined
+
+
+def _indent_normalized_replace(content: str, target: str, replacement: str, replace_all: bool = False):
+    """按统一缩进偏移匹配多行 target（至少 2 行），兼容整块少/多缩进几个空格的场景。"""
+    target_lines_raw = target.splitlines()
+    if len(target_lines_raw) < 2 or not any(ln.strip() for ln in target_lines_raw):
+        return content, 0
+
+    target_stripped = [ln.lstrip(" \t") for ln in target_lines_raw]
+    content_lines = content.splitlines(keepends=True)
+    n = len(target_lines_raw)
+    if len(content_lines) < n:
+        return content, 0
+
+    matches: list[tuple[int, int, str, str]] = []
+    newline = "\r\n" if "\r\n" in content else "\n"
+    line_offsets: list[int] = [0]
+    for cl in content_lines:
+        line_offsets.append(line_offsets[-1] + len(cl))
+
+    i = 0
+    while i <= len(content_lines) - n:
+        window = content_lines[i : i + n]
+        mode_delta: tuple[str, str] | None = None
+        matched = True
+        for k in range(n):
+            c_no_nl = window[k].rstrip("\r\n")
+            if not c_no_nl.strip() and not target_lines_raw[k].strip():
+                continue
+            if c_no_nl.lstrip(" \t") != target_stripped[k]:
+                matched = False
+                break
+            c_ws = _leading_ws(c_no_nl)
+            t_ws = _leading_ws(target_lines_raw[k])
+            if c_ws == t_ws:
+                cur = ("none", "")
+            elif c_ws.endswith(t_ws):
+                cur = ("add", c_ws[: len(c_ws) - len(t_ws)])
+            elif t_ws.endswith(c_ws):
+                cur = ("strip", t_ws[: len(t_ws) - len(c_ws)])
+            else:
+                matched = False
+                break
+            if mode_delta is None:
+                mode_delta = cur
+            elif mode_delta != cur:
+                matched = False
+                break
+        if matched and mode_delta is not None:
+            start_pos = line_offsets[i]
+            # 对齐尾部换行：若 target 最后无换行，则保留窗口最后一行原本的换行符
+            if target.endswith(("\r\n", "\n")):
+                end_pos = line_offsets[i + n]
+            else:
+                last_line = window[-1]
+                nl_len = 2 if last_line.endswith("\r\n") else (1 if last_line.endswith("\n") else 0)
+                end_pos = line_offsets[i + n] - nl_len
+            matches.append((start_pos, end_pos, mode_delta[0], mode_delta[1]))
+            i += n
+        else:
+            i += 1
+
+    if not matches:
+        return content, 0
+    if len(matches) > 1 and not replace_all:
+        return content, len(matches)
+
+    result = content
+    for start_pos, end_pos, mode, delta in reversed(matches):
+        shifted = _shift_replacement_indent(replacement, mode, delta, newline)
+        result = result[:start_pos] + shifted + result[end_pos:]
+    return result, len(matches)
+
+
+def _closest_match_hint(content: str, target: str) -> str:
+    """edit_file 匹配失败时给出文件中最接近的行号与原文预览，减少无头重读。"""
+    import difflib
+
+    content_lines = content.splitlines()
+    target_lines = target.splitlines()
+    if not content_lines or not target_lines or len(content_lines) > 5000:
+        return ""
+    win = max(1, min(len(target_lines), len(content_lines)))
+    target_norm = "\n".join(ln.strip() for ln in target_lines if ln.strip())
+    if not target_norm:
+        return ""
+    keywords = {ln.strip() for ln in target_lines if len(ln.strip()) >= 6}
+
+    # 先线性筛选包含任意特征行（或无明显特征行时取首行关键词）的窗口，再跑 SequenceMatcher
+    scored_indices: list[tuple[int, int]] = []
+    anchor_tokens = [tok for tok in target_lines[0].strip().split() if len(tok) >= 3][:3]
+    for i in range(0, len(content_lines) - win + 1):
+        chunk = content_lines[i : i + win]
+        hits = sum(1 for ln in chunk if ln.strip() in keywords) if keywords else 0
+        if not hits and anchor_tokens:
+            joined_lower = " ".join(chunk)
+            hits = sum(1 for tok in anchor_tokens if tok in joined_lower)
+        if hits > 0:
+            scored_indices.append((hits, i))
+
+    if not scored_indices:
+        return ""
+    scored_indices.sort(reverse=True)
+    best_ratio = 0.0
+    best_span = (0, win)
+    for _, i in scored_indices[:6]:
+        cand = "\n".join(ln.strip() for ln in content_lines[i : i + win] if ln.strip())
+        if not cand:
+            continue
+        ratio = difflib.SequenceMatcher(None, target_norm, cand).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_span = (i, i + win)
+
+    if best_ratio < 0.45:
+        return ""
+    start_i, end_i = best_span
+    preview_lines = [
+        f"  {lineno}: {content_lines[lineno - 1]}"
+        for lineno in range(start_i + 1, min(end_i + 1, start_i + 7))
+    ]
+    if end_i - start_i > 6:
+        preview_lines.append("  ...")
+    return (
+        f"\n最接近的代码段位于第 {start_i + 1}-{end_i} 行（相似度 {best_ratio:.0%}）：\n"
+        + "\n".join(preview_lines)
+    )
+
+
 def _fuzzy_replace(content, target, replacement, replace_all=False):
     """
     在 content 中智能定位 target 并替换为 replacement。
@@ -2381,6 +2763,13 @@ def _fuzzy_replace(content, target, replacement, replace_all=False):
             return content[:start] + replacement + content[end:], 1
         if stripped_occ > 1:
             return content, stripped_occ
+
+    # 2.5. 多行统一缩进偏移匹配（如模型整体少写或多了几个空格缩进）
+    new_content, indent_occ = _indent_normalized_replace(
+        content, target, replacement, replace_all=replace_all
+    )
+    if indent_occ > 0:
+        return new_content, indent_occ
 
     # 3. 模糊匹配：按 target 的物理行数在 content 中滑动，取相似度最高的窗口。
     #    适用于 target_content 存在个别字符污染但仍与原文高度相似的场景。
@@ -2543,9 +2932,11 @@ def _edit_file_by_lines(
             + replaced_preview_lines[-2:]
         )
 
+    _publish_edit_diff(content, new_content)
+    diag = _check_post_edit_diagnostics(resolved, new_content)
     return (
         f"✔ 文件 {file_path} 第 {start_line}-{actual_end} 行替换成功！\n"
-        f"被替换原文预览：\n{preview}"
+        f"被替换原文预览：\n{preview}{diag}"
     )
 
 
@@ -2639,10 +3030,13 @@ def _recorded_atomic_write(resolved, encoding, new_content, *, file_path=None,
         except TurnUndoError as error:
             if error.code == "no_active_checkpoint":
                 # 回合外调用：保持既有行为，不做可撤销记录
-                return _atomic_write_edit_file(
+                write_err = _atomic_write_edit_file(
                     resolved, encoding, new_content,
                     file_path=file_path, expected_mtime_ns=None,
                 )
+                if not write_err:
+                    _on_file_mutated(resolved)
+                return write_err
             if error.code == "workspace_busy":
                 return (
                     f"🚨 该文件正在被另一个回合写入，本次未修改文件"
@@ -2667,6 +3061,7 @@ def _recorded_atomic_write(resolved, encoding, new_content, *, file_path=None,
                 f"🚨 本次修改未能通过可撤销性验证，请重读文件后重试"
                 f"（{file_path or resolved}）：\n{error.message}"
             )
+    _on_file_mutated(resolved)
     return None
 
 
@@ -2934,9 +3329,11 @@ def edit_file(
             )
             if write_err:
                 return write_err
+            _publish_edit_diff(content, new_content)
+            diag = _check_post_edit_diagnostics(resolved, new_content)
             return (
                 f"✔ 智能修改 {file_path}（自动定位最相似代码段，共 {occurrences} 处替换）\n"
-                f"被替换的原文（前 5 行）：\n{replaced_preview}"
+                f"被替换的原文（前 5 行）：\n{replaced_preview}{diag}"
             )
 
         # 换行风格自适应：把 target/replacement 统一成文件实际使用的换行风格，
@@ -2955,11 +3352,13 @@ def edit_file(
         )
 
         if occurrences == 0:
+            closest_hint = _closest_match_hint(content, match_target)
             return (
                 f"🚨 精准修改失败！在文件 {file_path} 中没有找到与 target_content 足够相似的代码段。\n"
                 f"建议：1) 使用 read_file(compress=False) 重新读取原始文本；"
                 f"2) 把 target_content 缩短到 1500 字符以内并包含唯一上下文；"
                 f"3) 若确实需要整体重写，再使用 write_file（write_file 会覆盖整个文件，diff 会显示全红）。"
+                f"{closest_hint}"
             )
         if occurrences > 1 and not replace_all:
             return (
@@ -2977,7 +3376,161 @@ def edit_file(
         )
         if write_err:
             return write_err
-        return f"✔ 已修改文件：{file_path}"
+        _publish_edit_diff(content, new_content)
+        diag = _check_post_edit_diagnostics(resolved, new_content)
+        return f"✔ 已修改文件：{file_path}{diag}"
+
+
+def _apply_edit_operation_in_memory(file_path, content, edit_item, step_label):
+    """在内存中执行单条批量编辑操作，返回 (new_content, error_message)。"""
+    if not isinstance(edit_item, dict):
+        return None, f"🚨 {step_label} 参数格式错误：每条编辑项必须是 JSON 对象。"
+
+    start_line = edit_item.get("start_line")
+    end_line = edit_item.get("end_line")
+    replacement_content = edit_item.get("replacement_content")
+    if replacement_content is None:
+        return None, f"🚨 {step_label} 缺少 replacement_content 参数。"
+    replacement = str(replacement_content)
+
+    if start_line is not None or end_line is not None:
+        if start_line is None or end_line is None:
+            return None, f"🚨 {step_label} 缺少成对的 start_line / end_line。"
+        try:
+            start_num = int(start_line)
+            end_num = int(end_line)
+        except (TypeError, ValueError):
+            return None, f"🚨 {step_label} start_line 和 end_line 必须是整数。"
+        lines = content.splitlines(keepends=True)
+        total_lines = len(lines)
+        if start_num < 1 or start_num > total_lines:
+            return None, f"🚨 {step_label} start_line={start_num} 超出范围（1-{total_lines}）。"
+        if end_num < start_num:
+            return None, f"🚨 {step_label} end_line={end_num} 小于 start_line={start_num}。"
+        actual_end = min(end_num, total_lines)
+        newline = "\r\n" if "\r\n" in content else "\n"
+        if "\r\n" in content and "\r\n" not in replacement:
+            replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
+        elif "\r\n" not in content and "\r\n" in replacement:
+            replacement = replacement.replace("\r\n", "\n")
+        replaced_block = "".join(lines[start_num - 1 : actual_end])
+        if replaced_block.endswith(("\r\n", "\n")) and not replacement.endswith(("\r\n", "\n")):
+            replacement += newline
+        new_content = "".join(lines[: start_num - 1]) + replacement + "".join(lines[actual_end:])
+        return new_content, None
+
+    target = str(edit_item.get("target_content") or "")
+    if not target:
+        return None, f"🚨 {step_label} 字符串模式必须提供非空的 target_content。"
+
+    replace_all = bool(edit_item.get("replace_all", False))
+    match_target, match_replacement = target, replacement
+    if "\r\n" in content:
+        if "\r\n" not in target:
+            match_target = target.replace("\r\n", "\n").replace("\n", "\r\n")
+            match_replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
+    elif "\r\n" in target:
+        match_target = target.replace("\r\n", "\n")
+        match_replacement = replacement.replace("\r\n", "\n")
+
+    new_content, occurrences = _fuzzy_replace(
+        content, match_target, match_replacement, replace_all=replace_all
+    )
+    if occurrences == 0:
+        hint = _closest_match_hint(content, match_target)
+        return (
+            None,
+            f"🚨 {step_label} 在 {file_path} 中未找到匹配的代码段。{hint}",
+        )
+    if occurrences > 1 and not replace_all:
+        return (
+            None,
+            f"🚨 {step_label} 目标片段在 {file_path} 中出现 {occurrences} 次，请提供更长上下文或设 replace_all=True。",
+        )
+    return new_content, None
+
+
+def multi_edit(file_path, edits):
+    """对同一文件执行原子性多处批量局部编辑（单次加锁、单次写盘与单个撤销记录）。
+
+    任意一项失败立即整批中止，磁盘文件保持原样。
+    """
+    if not isinstance(edits, list) or not edits:
+        return "🚨 multi_edit 失败：edits 必须为非空编辑列表。"
+
+    try:
+        resolved = _resolve_workspace_path(file_path)
+    except ValueError as e:
+        return f"🚨 批量修改失败！{e}"
+
+    with _edit_file_lock(resolved):
+        from core.fresh_read_guard import (
+            StaleReadError,
+            is_guard_enabled,
+            require_fresh_read,
+        )
+
+        try:
+            require_fresh_read(
+                _tool_cache.get_current_session() or "",
+                str(resolved),
+                tool_name="multi_edit",
+                skip=not is_guard_enabled(),
+            )
+        except StaleReadError as e:
+            return f"🚨 {e}"
+
+        expected_mtime_ns = _stat_mtime_ns(resolved)
+        try:
+            raw = resolved.read_bytes()
+        except FileNotFoundError:
+            return (
+                f"🚨 批量修改失败！文件不存在：{file_path}。"
+                "multi_edit 只能修改已存在的文件；新建文件请改用 write_file。"
+            )
+        except OSError as e:
+            return f"🚨 批量修改失败！无法读取文件 {file_path}: {e}"
+
+        if raw.startswith(b"\xef\xbb\xbf"):
+            original_content = raw.decode("utf-8-sig")
+            encoding = "utf-8-sig"
+        else:
+            try:
+                original_content = raw.decode("utf-8")
+                encoding = "utf-8"
+            except UnicodeDecodeError:
+                try:
+                    original_content = raw.decode("gbk")
+                    encoding = "gbk"
+                except UnicodeDecodeError:
+                    return f"🚨 批量修改失败！无法解码文件 {file_path}（既不是 UTF-8 也不是 GBK 编码）。"
+
+        working = original_content
+        total_edits = len(edits)
+        for idx, edit_item in enumerate(edits, start=1):
+            updated, err = _apply_edit_operation_in_memory(
+                file_path, working, edit_item, f"批量修改第 {idx}/{total_edits} 项"
+            )
+            if err:
+                return f"{err}\n（整批原子中止，文件未被修改）"
+            working = updated
+
+        if working == original_content:
+            return f"🚨 批量修改失败！全部 {total_edits} 项编辑后文件内容未发生变化（{file_path}）。"
+
+        write_err = _recorded_atomic_write(
+            resolved,
+            encoding,
+            working,
+            file_path=file_path,
+            expected_mtime_ns=expected_mtime_ns,
+            tool_name="multi_edit",
+        )
+        if write_err:
+            return write_err
+        _publish_edit_diff(original_content, working)
+        diag = _check_post_edit_diagnostics(resolved, working)
+        return f"✔ 已批量修改文件 {file_path}（共应用 {total_edits} 处变更）{diag}"
 
 _SUBAGENT_TERMINAL_STATUSES = {
     "completed",
@@ -3445,13 +3998,19 @@ class SubagentManager:
         description = str(task_description or "").strip()
         if not description:
             raise ValueError("task_description must not be empty")
+        normalized_type = str(subagent_type or "general")
         if model_config is None and self._uses_default_runner:
-            model_config = _snapshot_model_config(session_name=parent_session)
+            # 只有 explore/test 允许优先走 cheaper secondary 模型；
+            # implement/review/general 默认继承主模型，保证写代码与审查质量。
+            prefer_secondary = normalized_type in {"explore", "test"}
+            model_config = _snapshot_model_config(
+                prefer_secondary=prefer_secondary,
+                session_name=parent_session,
+            )
 
         # 加载自定义子 agent 配置：subagent_type 非内置 5 种时尝试从注册中心获取
         # 容错：加载失败回退到 None（_run_default_subagent 会按内置 general 处理）
         custom_config = None
-        normalized_type = str(subagent_type or "general")
         if normalized_type and normalized_type not in {
             "explore", "implement", "test", "review", "general"
         }:
@@ -5490,6 +6049,11 @@ def undo_turn(turn_id=""):
 
     if result.idempotent:
         return "ℹ 该回合此前已撤销过，本次未修改任何文件（聊天历史保留）。"
+
+    try:
+        _tool_cache.invalidate_after_mutation()
+    except Exception:
+        pass
 
     total = (len(result.restored_files) + len(result.deleted_created_files)
              + len(result.restored_deleted_files))

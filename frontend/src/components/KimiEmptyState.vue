@@ -17,16 +17,20 @@
         @select="applySuggest"
         @hover="i => suggestIndex = i"
       />
-      <textarea
-        ref="textareaRef"
-        v-model="inputVal"
-        placeholder="尽管问，或做个任务… / 调用技能与 MCP，@ 引用文件"
-        @keydown="handleKeydown"
-        @input="detectToken"
-        @click="detectToken"
-        @keyup="detectToken"
-        @paste="handlePaste"
-      ></textarea>
+      <!-- 富文本输入框：@ 引用渲染成胶囊（带图标、整块选中、退格一次全删） -->
+      <div class="kimi-field">
+        <ComposerEditor
+          ref="editorRef"
+          v-model="inputVal"
+          :min-height="75"
+          placeholder="尽管问，或做个任务… / 调用技能与 MCP，@ 引用文件"
+          @keydown="handleKeydown"
+          @input="detectToken"
+          @click="detectToken"
+          @keyup="detectToken"
+          @paste="handlePaste"
+        />
+      </div>
 
       <div class="kimi-card-bar">
         <div ref="barLeftRef" class="kimi-bar-left">
@@ -158,6 +162,7 @@ import PermDropdown from './PermDropdown.vue';
 import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
+import ComposerEditor from './ComposerEditor.vue';
 import { useAttachments } from '../composables/useAttachments';
 import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
@@ -167,7 +172,10 @@ const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
   set: value => { store._getSessionRuntime().composerText = value; },
 });
-const textareaRef = ref<HTMLTextAreaElement | null>(null);
+// 富文本输入框：@ 引用渲染成胶囊
+const editorRef = ref<InstanceType<typeof ComposerEditor> | null>(null);
+// 补全用的鸭子类型控件（与 textarea 同名成员，useSuggest 无需改动）
+const composerControl = computed(() => editorRef.value?.control ?? null);
 
 const showModelCascader = ref(false);
 const showPermDropdown = ref(false);
@@ -245,7 +253,7 @@ function closeComposerMenus() {
 }
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, uploadFiles, openAttachmentImage } = useAttachments();
-const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, composerControl);
 
 // 输入卡片容器：拖拽文件进入时高亮提示，drop 由原生事件桥（pywebview）提供完整路径
 const kimiCardRef = ref<HTMLElement | null>(null);
@@ -359,6 +367,11 @@ function handleKeydown(e: KeyboardEvent) {
 </script>
 
 <style scoped>
+/* 输入框字体：与改动前的 .kimi-card textarea 保持一致（15px / 1.6） */
+.kimi-field {
+  font-size: 15px;
+  line-height: 1.6;
+}
 .workdir-dropdown {
   z-index: 999;
   min-width: 220px;

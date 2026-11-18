@@ -170,14 +170,58 @@ def test_event_broadcast_and_reconnect_replay(relay_env, device_client):
         assert frame["data"] == {"x": 1}
         assert isinstance(frame["seq"], int)
         seq = frame["seq"]
-    # 同 jwt 重连：名额不泄漏，且 replay 必须含刚才的事件帧
-    with _app_connect(env, jwt_token) as app2:
+    # 断线期间设备继续产出第二条事件；带 last_seq + last_boot_id 同 jwt 重连，
+    # 名额不泄漏，且 replay 必须只补发缺失的第 2 条事件。
+    client.submit("e2e_event", {"x": 2})
+    _wait(lambda: client.outbound.qsize() == 0, message="第二条事件未发往网关")
+    time.sleep(0.05)
+    with _app_connect(
+        env, jwt_token, extra={"last_seq": seq, "last_boot_id": "e2e-boot"}
+    ) as app2:
         plan = _recv_json(app2)
         assert plan["type"] == "replay"
         frames = [json.loads(f) if isinstance(f, str) else f for f in plan["frames"]]
         assert any(
-            f.get("type") == "e2e_event" and f.get("seq") == seq for f in frames
+            f.get("type") == "e2e_event" and f.get("data") == {"x": 2} and f.get("seq") > seq
+            for f in frames
         )
+
+
+def test_large_inbound_frame_over_1mb_succeeds(relay_env):
+    from core.cloud_relay.service import MAX_WS_FRAME_BYTES
+
+    env = relay_env
+    conn = websockets.sync.client.connect(
+        f"ws://127.0.0.1:{env.port}/relay/device",
+        open_timeout=RECV_TIMEOUT,
+        max_size=MAX_WS_FRAME_BYTES,
+    )
+    client = CloudRelayClient(send=conn.send, boot_id="large-boot")
+    client.on_rpc = lambda method, args: {"method": method, "len": len(args[0])}
+    pump = threading.Thread(
+        target=client.pump,
+        args=(conn, env.device_token, env.device_id),
+        daemon=True,
+        name="e2e-large-pump",
+    )
+    pump.start()
+    try:
+        _wait(lambda: client.connected, message="设备客户端未能注册")
+        jwt_token = _ticket(env)
+        payload = "X" * (1300 * 1024)
+        with _app_connect(env, jwt_token) as app:
+            assert _recv_json(app)["type"] == "replay"
+            app.send(json.dumps({"method": "upload_echo", "args": [payload], "id": 77}))
+            resp = _recv_until(app, lambda f: f.get("id") == 77)
+            assert resp["result"] == {"method": "upload_echo", "len": len(payload)}
+            assert client.connected is True
+    finally:
+        client.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+        pump.join(timeout=5)
 
 
 def test_device_reconnect_generation_increments(relay_env, device_client):

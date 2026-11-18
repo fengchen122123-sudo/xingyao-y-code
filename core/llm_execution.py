@@ -67,6 +67,7 @@ from core.tools import (
     edit_file,
     is_outside_workspace,
     manage_task,
+    multi_edit,
     read_file,
     run_subagent,
     sandbox_bypass,
@@ -199,8 +200,10 @@ def _tool_event_payload_from_parts(call_id, function_name, arguments):
             "display": build_tool_display(function_name, {}),
         }
     preview = ""
-    if function_name in ("read_file", "write_file", "edit_file"):
+    if function_name in ("read_file", "write_file", "edit_file", "multi_edit", "get_outline"):
         preview = arguments.get("file_path", "")
+    elif function_name in ("find_definition", "find_references"):
+        preview = arguments.get("symbol", "")
     elif function_name in ("search_code", "search_news"):
         preview = arguments.get("query", "")
     elif function_name == "fetch_url":
@@ -503,7 +506,7 @@ def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
         if content == REPEAT_CALL_BLOCKED_TEXT:
             continue
         ok = _tool_result_ok(name, message)
-        if ok and name in {"write_file", "edit_file"}:
+        if ok and name in {"write_file", "edit_file", "multi_edit"}:
             mutation_committed = True
         elif ok and name == "execute_command" and tool_calls_by_id:
             command = ""
@@ -682,6 +685,7 @@ def _build_tool_pipeline_and_context(
         read_file=_adapter("read_file", read_file),
         write_file=_adapter("write_file", write_file),
         edit_file=_adapter("edit_file", edit_file),
+        multi_edit=_adapter("multi_edit", multi_edit),
         run_subagent=_adapter("run_subagent", run_subagent),
         manage_task=_adapter("manage_task", manage_task),
         show_file_diff=_adapter("_show_file_diff", _show_file_diff),

@@ -279,6 +279,26 @@ def _repeat_call_blocked_result(decoded: DecodedToolCall) -> dict:
     }
 
 
+_TOOL_WORKER_POOL_LOCK = threading.Lock()
+_TOOL_WORKER_POOL = None
+
+
+def _get_tool_worker_pool():
+    """获取复用的有界线程池，避免高并发只读批次反复创建/销毁 OS 线程。"""
+    global _TOOL_WORKER_POOL
+    if _TOOL_WORKER_POOL is not None:
+        return _TOOL_WORKER_POOL
+    with _TOOL_WORKER_POOL_LOCK:
+        if _TOOL_WORKER_POOL is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _TOOL_WORKER_POOL = ThreadPoolExecutor(
+                max_workers=16,
+                thread_name_prefix="ycode-tool-worker",
+            )
+        return _TOOL_WORKER_POOL
+
+
 def _submit_daemon_call(function, *args, **kwargs):
     # 并行工具线程必须继承提交线程的回合上下文（线程本地 workdir 与会话路由）。
     # 裸 daemon 线程里 get_workdir() 会兜底到进程 cwd（GUI 打包版从快捷方式
@@ -289,51 +309,47 @@ def _submit_daemon_call(function, *args, **kwargs):
 
     workdir = get_workdir()
     thread_session = app_context.get_thread_session()
-    # 并行工具线程同样必须继承提交线程的权限档位：线程本地档位不会自动
-    # 进入新线程，丢失后鉴权路径回退全局默认，会话级 full 会被掩盖成
-    # 全局 confirm/accept_edits，触发不该出现的权限询问。
     thread_permission_mode = app_context.get_thread_permission_mode()
-    # 并行工具线程同样必须继承提交线程的计划会话路由：同批并发的
-    # run_subagent（parallel_safe=True）在派发入口按会话读取计划
-    # （get_default_scheduler → get_bound_plan_session），线程本地路由
-    # 丢失会回退进程级单例并误判“计划项不存在”（审查 A6-02）。
     from core.plan import get_plan_route, set_current_plan_session as _bind_plan_route
 
     plan_session_id, plan_storage_dir = get_plan_route()
 
-    future = Future()
-
     def runner():
-        if not future.set_running_or_notify_cancel():
-            return
-        with workspace_scope(workdir):
-            if thread_session:
-                app_context.set_thread_session(thread_session)
-            if plan_session_id:
-                # storage_dir 一并继承：会话管理器若尚未注册，缺省会按本
-                # 线程工作目录重新推导，指向与回合线程不同的落盘位置。
-                _bind_plan_route(plan_session_id, storage_dir=plan_storage_dir)
-            permission_scope = (
-                app_context.permission_mode_scope(thread_permission_mode)
-                if thread_permission_mode
-                else None
-            )
-            if permission_scope is not None:
-                permission_scope.__enter__()
-            try:
-                future.set_result(function(*args, **kwargs))
-            except BaseException as error:
-                future.set_exception(error)
-            finally:
+        cur_thread = threading.current_thread()
+        prev_thread_name = cur_thread.name
+        prev_session = app_context.get_thread_session()
+        prev_plan_session, prev_plan_dir = get_plan_route()
+        cur_thread.name = "ycode-tool-call"
+        try:
+            with workspace_scope(workdir):
+                if thread_session:
+                    app_context.set_thread_session(thread_session)
+                if plan_session_id:
+                    _bind_plan_route(plan_session_id, storage_dir=plan_storage_dir)
+                permission_scope = (
+                    app_context.permission_mode_scope(thread_permission_mode)
+                    if thread_permission_mode
+                    else None
+                )
                 if permission_scope is not None:
-                    permission_scope.__exit__(None, None, None)
+                    permission_scope.__enter__()
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    if permission_scope is not None:
+                        permission_scope.__exit__(None, None, None)
+        finally:
+            cur_thread.name = prev_thread_name
+            try:
+                app_context.set_thread_session(prev_session)
+            except Exception:
+                pass
+            try:
+                _bind_plan_route(prev_plan_session, storage_dir=prev_plan_dir)
+            except Exception:
+                pass
 
-    threading.Thread(
-        target=runner,
-        daemon=True,
-        name="ycode-tool-call",
-    ).start()
-    return future
+    return _get_tool_worker_pool().submit(runner)
 
 
 def _legacy_group_tool_batches(
@@ -891,7 +907,7 @@ class ToolPipeline:
         命令风险、权限与沙盒策略，不能把任意命令可靠映射成单一文件目标。
         """
         name = decoded.name
-        if name not in {"write_file", "edit_file"}:
+        if name not in {"write_file", "edit_file", "multi_edit"}:
             return None
         declared = [
             str(value).strip()
@@ -1366,7 +1382,7 @@ class ToolPipeline:
             if (
                 legacy_boolean_authorization
                 and not bypass
-                and decoded.name in {"read_file", "write_file", "edit_file"}
+                and decoded.name in {"read_file", "write_file", "edit_file", "multi_edit"}
             ):
                 # 兼容只返回 bool 的旧权限替身：外部边界既已批准，adapter
                 # 必须在同一次临时 bypass 中执行，不能再次询问或提前探测路径。

@@ -2,13 +2,119 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
+import time
+from pathlib import Path
 from typing import Any
 
 import config
 
 logger = logging.getLogger(__name__)
+
+# 与 LanServer._serve 对齐，支持手机端 ≤50MB 附件（base64 约 67MB）及大状态快照。
+MAX_WS_FRAME_BYTES = 70 * 1024 * 1024
+_STATUS_FILENAME = "cloud_relay_status.json"
+
+
+def runtime_status_path() -> Path:
+    """运行态快照文件（不含密钥，供安装版 CLI / 自动部署流程探测 GUI 连接状态）。"""
+    cfg_file = getattr(config, "_CONFIG_FILE", "") or ""
+    base = Path(cfg_file).parent if cfg_file else Path(getattr(config, "YCODE_DIR", Path.home() / ".ycode"))
+    return base / _STATUS_FILENAME
+
+
+def write_runtime_status(detail: dict[str, Any]) -> None:
+    try:
+        target = runtime_status_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state": str(detail.get("state") or "disabled"),
+            "connected": bool(detail.get("connected", False)),
+            "device_id": str(detail.get("device_id") or ""),
+            "generation": int(detail.get("generation") or 0),
+            "queued": int(detail.get("queued") or 0),
+            "dropped": int(detail.get("dropped") or 0),
+            "lost": int(detail.get("lost") or 0),
+            "pid": os.getpid(),
+            "updated_at": int(time.time()),
+        }
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception:
+        logger.debug("写入云中转运行态快照失败", exc_info=True)
+
+
+def configure_cloud_relay(
+    url: str,
+    device_id: str,
+    token: str = "",
+    *,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """写入本机云中转配置（自动用 DPAPI/keyring 加密 token；不依赖系统 Python）。"""
+    clean_url = str(url or "").strip()
+    clean_dev = str(device_id or "").strip()
+    clean_tok = str(token or "").strip()
+    if enabled:
+        if not clean_url or not clean_url.lower().startswith(("ws://", "wss://")):
+            return {"ok": False, "msg": "网关地址必须以 ws:// 或 wss:// 开头"}
+        if not clean_dev:
+            return {"ok": False, "msg": "device_id 不能为空"}
+    config.save_config_value(config.CLOUD_RELAY_ENABLED_KEY, bool(enabled))
+    config.save_config_value(config.CLOUD_RELAY_URL_KEY, clean_url)
+    config.save_config_value(config.CLOUD_RELAY_DEVICE_ID_KEY, clean_dev)
+    if clean_tok:
+        try:
+            from core.credentials import protect_secret
+
+            stored = protect_secret(clean_tok)
+        except Exception:
+            logger.warning("云中转令牌加密失败，回落明文保存", exc_info=True)
+            stored = clean_tok
+        config.save_config_value(config.CLOUD_RELAY_TOKEN_KEY, stored)
+    data = config._load()
+    return {
+        "ok": True,
+        "enabled": bool(data.get(config.CLOUD_RELAY_ENABLED_KEY, False)),
+        "url": str(data.get(config.CLOUD_RELAY_URL_KEY) or ""),
+        "device_id": str(data.get(config.CLOUD_RELAY_DEVICE_ID_KEY) or ""),
+        "has_token": bool(str(data.get(config.CLOUD_RELAY_TOKEN_KEY) or "").strip()),
+    }
+
+
+def read_runtime_status() -> dict[str, Any]:
+    """合并配置文件与运行态快照（不含任何令牌明文）。"""
+    data = config._load()
+    runtime: dict[str, Any] = {}
+    path = runtime_status_path()
+    if path.is_file():
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                runtime = parsed
+        except Exception:
+            runtime = {}
+    return {
+        "ok": True,
+        "settings": {
+            "enabled": bool(data.get(config.CLOUD_RELAY_ENABLED_KEY, False)),
+            "url": str(data.get(config.CLOUD_RELAY_URL_KEY) or ""),
+            "device_id": str(data.get(config.CLOUD_RELAY_DEVICE_ID_KEY) or ""),
+            "has_token": bool(str(data.get(config.CLOUD_RELAY_TOKEN_KEY) or "").strip()),
+            "state": str(runtime.get("state") or "disabled"),
+            "connected": bool(runtime.get("connected", False)),
+            "generation": int(runtime.get("generation") or 0),
+            "queued": int(runtime.get("queued") or 0),
+            "dropped": int(runtime.get("dropped") or 0),
+            "lost": int(runtime.get("lost") or 0),
+            "pid": runtime.get("pid"),
+            "updated_at": runtime.get("updated_at"),
+        },
+    }
 
 
 def _background_factory(url: str, token: str, bridge, on_state=None):
@@ -28,16 +134,19 @@ def _background_factory(url: str, token: str, bridge, on_state=None):
     client = CloudRelayClient(send=lambda _payload: None)
     client.gateway_url = url
     client.device_token = token
-    client.on_registered = lambda: report("connected")
+    delay = 1
 
-    def on_rpc(method, args):
-        service = CloudRelayService(bridge=bridge)
-        return service.dispatch(method, args)
+    def on_registered() -> None:
+        nonlocal delay
+        delay = 1
+        report("connected")
 
-    client.on_rpc = on_rpc
+    client.on_registered = on_registered
+    rpc_host = CloudRelayService(bridge=bridge)
+    client.on_rpc = rpc_host.dispatch
 
     def loop() -> None:
-        delay = 1
+        nonlocal delay
         first = True
         while not client.closed:
             report("connecting" if first else "reconnecting")
@@ -49,12 +158,13 @@ def _background_factory(url: str, token: str, bridge, on_state=None):
                 # 注册表 Internet Settings）。用户开关代理软件时，代理端口未监听就
                 # 连不上，表现为 WinError 10061，二维码随之静默回落局域网。网关是
                 # 自建域名、直连可达，这里显式禁用代理避免被本地代理状态拖累。
+                # 同时显式放大 max_size（默认仅 1 MiB），防止大附件/大快照直接把连接打断。
                 try:
-                    connection = connect(url, proxy=None)
+                    connection = connect(url, proxy=None, max_size=MAX_WS_FRAME_BYTES)
                 except TypeError:
                     # proxy 参数 15.0 才引入；更老的版本只能沿用默认行为（读系统代理）
                     logger.warning("websockets 版本过低，无法禁用代理，建议升级到 15.0+")
-                    connection = connect(url)
+                    connection = connect(url, max_size=MAX_WS_FRAME_BYTES)
                 with connection as socket:
                     client._send = socket.send
                     data = config._load()
@@ -62,16 +172,18 @@ def _background_factory(url: str, token: str, bridge, on_state=None):
                     if not device_id:
                         device_id = str(data.get(config.CLOUD_RELAY_DEVICE_ID_KEY) or "") or "desktop"
                     client.pump(socket, token, device_id)
-                    client.flush()
             except Exception:
                 logger.exception("云中转连接中断")
                 client.connected = False
                 report("error")
+            else:
+                if not client.closed:
+                    client.connected = False
+                    report("reconnecting")
+            finally:
+                client._send = lambda _payload: None
             if client.closed:
                 return
-            if client.connected:
-                client.connected = False
-                report("reconnecting")
             time.sleep(delay)
             delay = min(delay * 2, 30)
 
@@ -80,18 +192,24 @@ def _background_factory(url: str, token: str, bridge, on_state=None):
 
 
 class CloudRelayService:
-    def __init__(self, bridge=None, client_factory=None):
+    def __init__(self, bridge=None, client_factory=None, *, persist_status: bool = False):
         self.bridge = bridge
         self._client_factory = client_factory
+        self._persist_status = bool(persist_status)
         self._client = None
         # 状态迁移会从后台线程回调进来，锁必须可重入，否则 start() 里自锁。
         self._lock = threading.RLock()
         self.state = "disabled"
         self._dispatch_host = None
 
+    def _sync_runtime_status(self) -> None:
+        if self._persist_status:
+            write_runtime_status(self.status())
+
     def _set_state(self, state: str) -> None:
         with self._lock:
             self.state = state
+        self._sync_runtime_status()
 
     def start(self) -> bool:
         try:
@@ -120,6 +238,7 @@ class CloudRelayService:
                 self._client = client
                 if self.state == "connecting":
                     self.state = "connected" if getattr(client, "connected", False) else "connecting"
+            self._sync_runtime_status()
             return True
         except Exception:
             logger.exception("云中转启动失败")
@@ -134,11 +253,16 @@ class CloudRelayService:
                 self.state = "stopped"
             if client is not None and hasattr(client, "close"):
                 client.close()
+            self._sync_runtime_status()
         except Exception:
             logger.exception("云中转停止失败")
 
     def on_event(self, event_type: str, data: Any) -> None:
         try:
+            from core.cloud_relay.client import DESKTOP_ONLY_EVENT_TYPES
+
+            if event_type in DESKTOP_ONLY_EVENT_TYPES:
+                return
             client = self._client
             if client is None:
                 return
@@ -149,11 +273,16 @@ class CloudRelayService:
     def dispatch(self, method, args):
         """桌面 relay 的来源固定是 lan，客户端带的 turn_source 会被剥掉。"""
         try:
-            if self._dispatch_host is None:
-                from core.lan_server import LanServer
+            host = self._dispatch_host
+            if host is None:
+                with self._lock:
+                    host = self._dispatch_host
+                    if host is None:
+                        from core.lan_server import LanServer
 
-                self._dispatch_host = LanServer(bridge=self.bridge)
-            return self._dispatch_host.dispatch_rpc(method, args, turn_source="lan")
+                        host = LanServer(bridge=self.bridge)
+                        self._dispatch_host = host
+            return host.dispatch_rpc(method, args, turn_source="lan")
         except Exception:
             logger.exception("云中转 RPC 分发失败")
             return {"ok": False, "msg": "内部方法执行失败，详见桌面端日志"}

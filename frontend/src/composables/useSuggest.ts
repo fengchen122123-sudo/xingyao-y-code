@@ -6,9 +6,23 @@ import type { SuggestItem } from '../components/InputSuggest.vue';
  * 输入自动补全 composable：/ 斜杠（内置命令 + 技能 + MCP）与 @ 文件引用。
  * InputArea 与 KimiEmptyState 共用，确保空会话页也有补全能力。
  */
+/**
+ * 输入框控件的最小契约。textarea 天然满足；富文本编辑器（ComposerEditor）
+ * 用「文本序列化 + 光标坐标」实现同名成员，因此补全逻辑对两种输入框通用，
+ * 不需要为了换控件重写检测/插入流程。
+ */
+export interface ComposerTextControl {
+  readonly value: string;
+  readonly selectionStart: number;
+  // textarea 的原生签名带 null 与 direction 参数，编辑器只用前两个参数：
+  // 用 any 收口，避免两套签名在类型层互相不兼容
+  setSelectionRange(...args: any[]): void;
+  focus?: () => void;
+}
+
 export function useSuggest(
   inputVal: Ref<string>,
-  textareaRef: Ref<HTMLTextAreaElement | null>,
+  textareaRef: Ref<ComposerTextControl | null>,
 ) {
   const store = useAppStore();
   const suggest = ref<{ mode: 'command' | 'file'; start: number; query: string } | null>(null);
@@ -312,7 +326,7 @@ export function useSuggest(
     suggestEmpty.value = '';
     nextTick(() => {
       if (ta) {
-        ta.focus();
+        ta.focus?.();
         const cursor = s.start + inserted.length;
         ta.setSelectionRange(cursor, cursor);
       }

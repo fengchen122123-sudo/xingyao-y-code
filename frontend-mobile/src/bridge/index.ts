@@ -88,3 +88,12 @@ export function onEvent(listener: Listener): () => void {
 window.addEventListener('yc-pair-invalid', () => {
   dispatch({ type: 'pair_invalid', data: {} });
 });
+
+// 补发整态自愈：shim 在收到 resync_required / device_reset / seq_reset 后拉取
+// get_initial_state 并派发此事件，通知 store 直接应用快照。
+window.addEventListener('yc-initial-state', (event: Event) => {
+  const detail = (event as CustomEvent).detail;
+  if (detail && typeof detail === 'object') {
+    dispatch({ type: 'initial_state_sync', data: detail });
+  }
+});

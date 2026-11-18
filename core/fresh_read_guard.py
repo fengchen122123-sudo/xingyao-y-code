@@ -50,14 +50,8 @@ def _fingerprint(path: Path) -> dict:
     return {"size": stat.st_size, "sha256": digest.hexdigest()}
 
 
-def record_read(session_id: str, path: str, *, full_read: bool) -> None:
-    """登记一次完整读取。
-
-    full_read 为 False（被 offset/limit 截断）时直接返回：只有把整个文件看完
-    才算读过，截断读取不足以支撑后续的精准修改。
-    """
-    if not full_read:
-        return
+def _store_fingerprint(session_id: str, path: str) -> None:
+    """内部统一指纹写入逻辑（读/写共用）。"""
     try:
         target = Path(path)
         if not target.exists() or not target.is_file():
@@ -74,6 +68,22 @@ def record_read(session_id: str, path: str, *, full_read: bool) -> None:
         if len(_READ_STATE) > MAX_TRACKED:
             # 简单兜底：整体清空，避免无界增长；清空后只是要求模型重新读取
             _READ_STATE.clear()
+
+
+def record_read(session_id: str, path: str, *, full_read: bool) -> None:
+    """登记一次完整读取。
+
+    full_read 为 False（被 offset/limit 截断）时直接返回：只有把整个文件看完
+    才算读过，截断读取不足以支撑后续的精准修改。
+    """
+    if not full_read:
+        return
+    _store_fingerprint(session_id, path)
+
+
+def record_write(session_id: str, path: str) -> None:
+    """写/改成功后刷新当前会话的文件指纹，使连续修改同一文件无需额外重读。"""
+    _store_fingerprint(session_id, path)
 
 
 def require_fresh_read(

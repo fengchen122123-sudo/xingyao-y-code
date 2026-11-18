@@ -250,3 +250,257 @@ def get_supported_languages():
     for _, lang in _DEFINITION_PATTERNS:
         langs.add(lang)
     return sorted(langs)
+
+
+_OUTLINE_IGNORE_DIRS = frozenset({
+    '.git', '.hg', '.svn', '.venv', 'venv', 'node_modules', '__pycache__',
+    '.idea', '.vscode', 'build', 'dist', 'target', 'out', '.gradle', 'bin', 'obj',
+})
+
+_OUTLINE_LANG_BY_EXT = {
+    '.py': 'python',
+    '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript',
+    '.ts': 'javascript', '.tsx': 'javascript',
+    '.go': 'go',
+    '.rs': 'rust',
+    '.java': 'java', '.c': 'java', '.cpp': 'java', '.cc': 'java',
+    '.h': 'java', '.hpp': 'java', '.cs': 'java',
+}
+
+
+def _python_ast_outline(text: str) -> list[str] | None:
+    """使用 ast 提取 Python 文件精确类/函数大纲（含嵌套方法与行号范围）。"""
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+
+    def _fmt_args(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        names = [a.arg for a in getattr(fn.args, "posonlyargs", ())]
+        names.extend(a.arg for a in fn.args.args)
+        if fn.args.vararg:
+            names.append("*" + fn.args.vararg.arg)
+        names.extend(a.arg for a in fn.args.kwonlyargs)
+        if fn.args.kwarg:
+            names.append("**" + fn.args.kwarg.arg)
+        joined = ", ".join(names)
+        if len(joined) > 60:
+            joined = joined[:57] + "..."
+        return joined
+
+    lines: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            end_ln = getattr(node, "end_lineno", node.lineno)
+            lines.append(f"L{node.lineno}-{end_ln}: class {node.name}")
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    prefix = "async def" if isinstance(child, ast.AsyncFunctionDef) else "def"
+                    c_end = getattr(child, "end_lineno", child.lineno)
+                    lines.append(
+                        f"  L{child.lineno}-{c_end}: {prefix} {child.name}({_fmt_args(child)})"
+                    )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            end_ln = getattr(node, "end_lineno", node.lineno)
+            lines.append(
+                f"L{node.lineno}-{end_ln}: {prefix} {node.name}({_fmt_args(node)})"
+            )
+    return lines
+
+
+def get_outline(file_path):
+    """提取单个源码文件的结构大纲（类 / 函数 / 方法签名与行号区间）。
+
+    比读取整文件更快、省 10x token，适合大文件速览后用 read_file(offset, limit) 精读。
+    """
+    try:
+        from core.tools import _resolve_workspace_path
+
+        resolved = _resolve_workspace_path(file_path)
+    except Exception as e:
+        return f"🚨 提取文件大纲失败: {e}"
+
+    if not resolved.exists():
+        return f"🚨 文件不存在：{file_path}"
+    if resolved.is_dir():
+        return f"'{file_path}' 是一个目录，请改用 list_directory。"
+
+    try:
+        file_mtime = os.path.getmtime(resolved)
+    except OSError:
+        file_mtime = 0.0
+    cache_key = _tool_cache.search_key("get_outline", str(resolved), str(resolved.parent), (file_mtime,))
+    cached = _tool_cache.search_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        raw = resolved.read_bytes()
+    except OSError as e:
+        return f"🚨 无法读取文件 {file_path}：{e}"
+    if b"\x00" in raw[:8192] and not raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return f"🚨 二进制文件不支持大纲提取：{file_path}"
+
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("gbk", errors="replace")
+
+    ext = resolved.suffix.lower()
+    outline_lines: list[str] | None = None
+    if ext == ".py":
+        outline_lines = _python_ast_outline(text)
+
+    if outline_lines is None:
+        lang = _OUTLINE_LANG_BY_EXT.get(ext)
+        lang_patterns = [
+            re.compile(pat)
+            for pat, p_lang in _DEFINITION_PATTERNS
+            if lang is None or p_lang == lang
+        ]
+        outline_lines = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            stripped = line.strip()
+            if not stripped or len(stripped) > 300:
+                continue
+            if any(rx.search(line) for rx in lang_patterns):
+                outline_lines.append(f"L{lineno}: {stripped[:120]}")
+
+    if not outline_lines:
+        result_text = f"文件 {file_path}（共 {len(text.splitlines())} 行）未识别出顶层类或函数定义。"
+    else:
+        max_items = 200
+        total_lines = len(text.splitlines())
+        body = outline_lines[:max_items]
+        if len(outline_lines) > max_items:
+            body.append(f"... (共 {len(outline_lines)} 项，已截断前 {max_items} 项)")
+        result_text = f"📑 {file_path}（共 {total_lines} 行，{len(outline_lines)} 项结构定义）：\n" + "\n".join(body)
+
+    _tool_cache.search_put(cache_key, result_text)
+    session_id = _tool_cache.get_current_session()
+    if session_id:
+        _tool_cache.shared_put(session_id, ("get_outline", cache_key), result_text)
+    return result_text
+
+
+def find_references(symbol, dir_path='.', file_extensions=None):
+    """查找符号在代码库中的全部引用位置（按整词边界匹配，含调用、导入与赋值）。"""
+    try:
+        from core.tools import _resolve_workspace_path
+
+        dir_path = str(_resolve_workspace_path(dir_path))
+    except Exception as e:
+        return f"🚨 查找引用失败: {e}"
+
+    if not symbol or not str(symbol).replace('_', '').isalnum():
+        return f"🚨 符号名只能包含字母、数字、下划线：{symbol!r}"
+    if len(symbol) > 128:
+        return f"🚨 符号名过长（{len(symbol)} 字符，上限 128）"
+
+    ext_tuple = tuple(file_extensions) if file_extensions else None
+    cache_key = _tool_cache.search_key("find_references", symbol, dir_path, ext_tuple)
+    cached = _tool_cache.search_get(cache_key)
+    if cached is not None:
+        return cached
+
+    session_id = _tool_cache.get_current_session()
+    if session_id:
+        shared = _tool_cache.shared_get(session_id, ("find_references", cache_key))
+        if shared is not None:
+            return shared
+
+    glob_args: list[str] = []
+    for ignored in sorted(_OUTLINE_IGNORE_DIRS):
+        glob_args.extend(['--glob', f'!**/{ignored}/'])
+    if file_extensions:
+        for ext in file_extensions:
+            norm = ext if str(ext).startswith('.') else '.' + str(ext)
+            glob_args.extend(['-g', f'*{norm}'])
+
+    max_refs = 60
+    try:
+        rg_bin = _get_rg_executable()
+        cmd = [
+            rg_bin, '-n', '--no-heading', '-w', '--max-columns', '200',
+            '-F', symbol, dir_path,
+        ] + glob_args
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+        if result.returncode not in (0, 1):
+            return f"🚨 查找引用失败（ripgrep 退出码 {result.returncode}）"
+        raw_out = result.stdout.strip()
+        if not raw_out:
+            result_text = f"未找到符号 {symbol!r} 的引用。"
+        else:
+            lines = raw_out.split('\n')
+            if len(lines) > max_refs:
+                result_text = '\n'.join(lines[:max_refs]) + f"\n... (共 {len(lines)} 处引用，已显示前 {max_refs} 处)"
+            else:
+                result_text = raw_out
+        _tool_cache.search_put(cache_key, result_text)
+        if session_id:
+            _tool_cache.shared_put(session_id, ("find_references", cache_key), result_text)
+        return result_text
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        return "🚨 查找引用超时（15 秒），请缩小 dir_path 范围或指定 file_extensions 重试。"
+    except Exception as e:
+        return f"🚨 查找引用异常: {e}"
+
+    # Python 回退扫描（按整词边界匹配）
+    word_re = re.compile(rf'\b{re.escape(symbol)}\b')
+    allowed_exts = (
+        {e if str(e).startswith('.') else '.' + str(e) for e in file_extensions}
+        if file_extensions
+        else {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rs', '.c', '.cpp', '.h', '.hpp', '.cs', '.rb', '.php'}
+    )
+    results: list[str] = []
+    scanned = 0
+    deadline = time.monotonic() + 20
+    try:
+        for root, dirs, files in os.walk(dir_path):
+            if time.monotonic() > deadline:
+                break
+            dirs[:] = [d for d in dirs if d not in _OUTLINE_IGNORE_DIRS and not d.startswith('.')]
+            for fname in files:
+                if fname.startswith('.') or os.path.splitext(fname)[1].lower() not in allowed_exts:
+                    continue
+                scanned += 1
+                if scanned > 3000:
+                    break
+                fpath = os.path.join(root, fname)
+                try:
+                    if os.path.getsize(fpath) > 2 * 1024 * 1024:
+                        continue
+                    with open(fpath, 'r', encoding='utf-8', errors='replace') as fh:
+                        for lineno, line in enumerate(fh, 1):
+                            if len(line) <= 2000 and word_re.search(line):
+                                rel = os.path.relpath(fpath, dir_path)
+                                results.append(f"{rel}:{lineno}:{line.rstrip()[:200]}")
+                                if len(results) >= max_refs:
+                                    result_text = '\n'.join(results) + f"\n... (限 {max_refs} 处引用)"
+                                    _tool_cache.search_put(cache_key, result_text)
+                                    return result_text
+                except OSError:
+                    continue
+            if scanned > 3000:
+                break
+    except Exception as e:
+        return f"🚨 查找引用失败: {e}"
+
+    result_text = '\n'.join(results) if results else f"未找到符号 {symbol!r} 的引用。"
+    _tool_cache.search_put(cache_key, result_text)
+    if session_id:
+        _tool_cache.shared_put(session_id, ("find_references", cache_key), result_text)
+    return result_text

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 from core.hooks.trust import compute_hook_digest
@@ -105,6 +106,11 @@ class HookRegistry:
             Path(project_hooks_path) if project_hooks_path else None
         )
         self._logger = logger or _logger
+        self._cache_lock = threading.Lock()
+        self._file_cache: dict[
+            tuple[str, str, bool],
+            tuple[tuple[int, int, int] | None, tuple[HookRegistration, ...]],
+        ] = {}
 
     @property
     def user_hooks_path(self) -> Path:
@@ -145,7 +151,46 @@ class HookRegistry:
 
     # ── 内部实现 ────────────────────────────────────────────────
 
+    @staticmethod
+    def _stat_signature(path: Path) -> tuple[int, int, int] | None:
+        """返回文件存在性及 (mtime_ns, size, ctime_ns) 签名；不存在时返回 None。"""
+        try:
+            st = path.stat()
+            return (
+                int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+                int(st.st_size),
+                int(getattr(st, "st_ctime_ns", 0)),
+            )
+        except OSError:
+            return None
+
     def _load_file(
+        self, path: Path, *, scope: str, include_disabled: bool = False
+    ) -> list[HookRegistration]:
+        """按文件 stat 签名缓存解析结果，文件未变化时直接返回副本。"""
+        cache_key = (str(path), scope, bool(include_disabled))
+        sig = self._stat_signature(path)
+        with self._cache_lock:
+            cached = self._file_cache.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                return list(cached[1])
+
+        if sig is None:
+            with self._cache_lock:
+                self._file_cache[cache_key] = (None, ())
+            return []
+
+        regs = self._load_file_uncached(
+            path, scope=scope, include_disabled=include_disabled
+        )
+        # 仅在成功读盘解析后更新缓存（读后立刻再 stat 确认未在读盘瞬间被并发修改）
+        post_sig = self._stat_signature(path)
+        if post_sig == sig:
+            with self._cache_lock:
+                self._file_cache[cache_key] = (sig, tuple(regs))
+        return regs
+
+    def _load_file_uncached(
         self, path: Path, *, scope: str, include_disabled: bool = False
     ) -> list[HookRegistration]:
         if not path.exists():

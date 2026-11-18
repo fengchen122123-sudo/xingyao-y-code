@@ -23,11 +23,15 @@ export interface ToolTraceRow {
 
 const LEGACY_CATEGORIES: Readonly<Record<string, string>> = {
   read_file: 'read',
+  get_outline: 'read',
   search_code: 'search',
   glob_files: 'search',
+  find_definition: 'search',
+  find_references: 'search',
   execute_command: 'command',
   write_file: 'mutation',
   edit_file: 'mutation',
+  multi_edit: 'mutation',
 };
 
 function displayFor(call: ToolCallUi): ToolDisplay | undefined {

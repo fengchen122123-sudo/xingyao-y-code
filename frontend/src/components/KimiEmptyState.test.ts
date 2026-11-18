@@ -62,11 +62,13 @@ it('未落库新会话离开空状态页后重新挂载仍恢复文字草稿', a
   store.pendingWorkdir = 'GLOBAL';
 
   let wrapper = mount(KimiEmptyState);
-  await wrapper.get('textarea').setValue('新会话尚未发送的内容');
+  const editor = wrapper.get('.ce-input');
+  editor.element.textContent = '新会话尚未发送的内容';
+  await editor.trigger('input');
   wrapper.unmount();
 
   wrapper = mount(KimiEmptyState);
-  expect(wrapper.get('textarea').element.value).toBe('新会话尚未发送的内容');
+  expect(wrapper.get('.ce-input').element.textContent).toBe('新会话尚未发送的内容');
   wrapper.unmount();
 });
 

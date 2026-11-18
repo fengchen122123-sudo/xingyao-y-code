@@ -78,17 +78,16 @@ def resolve_computer_capability(
     model = model or {}
     provider = provider or {}
 
-    # CLI 轻量模式硬禁用：main.py 入口在导入 core.* 之前设置 YCODE_TOOL_PROFILE=cli。
-    # 放在所有判定之前，保证任何调用方（主代理/子代理/后台任务）都拿不到能力，
-    # 也就不会把 computer_action 注入工具表。只读这一个入口声明，不碰配置文件。
+    # CLI / coding 轻量模式硬禁用：main.py 与 gui_main(--cli) 在导入 core.* 之前设置
+    # YCODE_TOOL_PROFILE=coding（或 cli）。放在所有判定之前，保证仅代码模式不注入电脑操控。
     try:
         import os
 
-        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "cli":
+        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() in ("cli", "coding"):
             return _rejected(
                 settings,
                 "computer_cli_disabled",
-                "CLI 轻量模式不提供电脑操控与浏览器操控",
+                "CLI / coding 轻量模式不提供电脑操控与浏览器操控",
             )
     except Exception:
         pass

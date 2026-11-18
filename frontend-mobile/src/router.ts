@@ -1,8 +1,23 @@
 import { createRouter, createWebHistory } from 'vue-router';
 
-// base 与 lan_server 的 /m/ 托管路径一致
+// base 与托管路径一致：局域网是 /m/；公网经 nginx 反代时页面在
+// /xy/bot/m/<device_id>（前缀还可能更深），路由 base 必须跟着当前地址走，
+// 否则 pushState 会把地址改到 /m/convo，之后的资源与刷新都会 404。
+function resolveBase(): string {
+  const path = window.location.pathname || '';
+  const mMatch = path.match(/^(.*?\/m)(?:\/|$)/);
+  if (mMatch && mMatch[1]) return mMatch[1] + '/';
+  const injected = (window as any).__ycRelayDevice;
+  const segs = path.split('/');
+  if (typeof injected === 'string' && injected) {
+    const at = segs.indexOf(injected);
+    if (at > 1) return segs.slice(0, at).join('/') + '/';
+  }
+  return '/m/';
+}
+
 export const router = createRouter({
-  history: createWebHistory('/m/'),
+  history: createWebHistory(resolveBase()),
   routes: [
     { path: '/', redirect: '/convo' },
     { path: '/convo', component: () => import('./views/ConvoListView.vue'), meta: { tab: 'convo' } },

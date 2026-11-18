@@ -42,7 +42,12 @@ _SPEC_DIR = globals().get('SPECPATH') or os.path.dirname(os.path.abspath(globals
 if _SPEC_DIR not in sys.path:
     sys.path.insert(0, _SPEC_DIR)
 
-from packaging_datas import strip_unused_datas  # noqa: E402  (须在 sys.path 补好之后)
+from packaging_datas import (  # noqa: E402  (须在 sys.path 补好之后)
+    filter_hidden_imports,
+    strip_bloat_datas,
+    strip_unused_binaries,
+    strip_unused_datas,
+)
 
 # ---------------------------------------------------------------------------
 # 第三方库隐藏依赖收集。CLI（main.py 的 run_cli/run_headless，经 gui_main 的
@@ -78,12 +83,15 @@ openpyxl_datas, openpyxl_binaries, openpyxl_hiddenimports = collect_all('openpyx
 pypdf_datas, pypdf_binaries, pypdf_hiddenimports = collect_all('pypdf')
 
 # PDF 编辑后端（core/pdf_edit.py）：pypdf 改页树 + reportlab 生成批注 overlay。
-# core/pdf_edit.py 由 gui_bridge.save_pdf_edits 在函数内 import（字面 import，
-# 字节码扫描能识别），Python 模块本身不会漏收；必须 collect_all 的是 reportlab
-# 的 datas（内置字体 AFM/TTF、barcode 与 graphics 的模板数据），缺了它们打包版
-# canvas 一初始化就报找不到字体文件。同上，这里也顺带被
-# build_release.verify_spec_collect_all_targets 纳入构建前环境硬校验。
+# core/pdf_edit.py 只使用 reportlab.pdfgen.canvas / pdfbase.pdfmetrics /
+# pdfbase.ttfonts.TTFont / lib.colors.HexColor，与系统 TrueType 字体（及内嵌
+# 纯 Python Helvetica 度量表），不依赖 reportlab.graphics / platypus 或其自带字库；
+# 仍保留 collect_all('reportlab') 以便 build_release.verify_spec_collect_all_targets
+# 在构建前校验环境完整性，再通过 filter_hidden_imports / strip_bloat_datas 裁剪无用子包与副本。
 reportlab_datas, reportlab_binaries, reportlab_hiddenimports = collect_all('reportlab')
+reportlab_hiddenimports = filter_hidden_imports(
+    reportlab_hiddenimports, ('reportlab.graphics', 'reportlab.platypus')
+)
 
 # Playwright（电脑操控，Task 16 / 设计 23.1）：**不再随包收集**（原先这里是
 # collect_all('playwright')）。原因：运行时只用系统 Edge/Chrome
@@ -102,6 +110,7 @@ reportlab_datas, reportlab_binaries, reportlab_hiddenimports = collect_all('repo
 # 二进制与 datas（Rust 扩展、conpty.dll / winpty.dll / OpenConsole.exe / winpty-agent.exe
 # 等）默认收集不全，否则打包后打开底部终端直接报错。
 pywinpty_datas, pywinpty_binaries, pywinpty_hiddenimports = collect_all('winpty')
+pywinpty_hiddenimports = filter_hidden_imports(pywinpty_hiddenimports, ('winpty.tests',))
 
 # CLI 与 GUI 都会用到的数据文件：默认配置模板、系统提示词模板、内置 ripgrep
 # （core.tools 的 search_code 工具依赖，两个入口共享同一套工具注册表）、前端
@@ -215,6 +224,19 @@ common_excludes = [
     # 但主程序自己（litellm、uvicorn、各处 HTTP 调用）就在用，排除会直接
     # ImportError。组件包内同名目录只是插在 sys.path 前面，仍可从主包复用。
     'ddgs', 'primp', 'lxml', 'fake_useragent',
+    # 体积裁剪（零功能损失）：
+    #   - PIL._avif / PIL.AvifImagePlugin：_avif.pyd 约 7.5MB（LZMA ~1.8MB），项目仅支持 png/jpg/jpeg/gif/webp；
+    #   - reportlab.graphics / reportlab.platypus：PDF 批注只用 canvas/pdfmetrics/TTFont/HexColor；
+    #   - pytest / _pytest / pluggy / iniconfig / winpty.tests：pywinpty.tests 拉进整套 pytest；
+    #   - setuptools / pkg_resources / distutils / cffi._shimmed_dist_utils：仅编译 C 扩展时使用；
+    #   - win32ui / pythonwin / pywin / makepy / selecttlb：仅 pywin32 IDE 对话框依赖，运行时只用 DispatchEx；
+    #   - pydoc_data：交互式 help() 主题文档库（rich.markdown 仅在 __main__ 块用到 pydoc）。
+    'PIL._avif', 'PIL.AvifImagePlugin',
+    'reportlab.graphics', 'reportlab.platypus',
+    'pytest', '_pytest', 'pluggy', 'iniconfig', 'winpty.tests',
+    'setuptools', 'pkg_resources', 'distutils', 'cffi._shimmed_dist_utils',
+    'win32ui', 'pythonwin', 'pywin', 'win32com.client.makepy', 'win32com.client.selecttlb',
+    'pydoc_data',
 ]
 
 
@@ -363,6 +385,10 @@ exe_gui = EXE(
 # ============================================================================
 a_gui.datas, _gui_removed, _gui_removed_bytes = strip_unused_datas(a_gui.datas, 'GUI(Y-code.exe)')
 print(f'[ycode.spec] GUI(Y-code.exe) 裁剪 {_gui_removed} 项，约 {_gui_removed_bytes / (1024 * 1024):.1f} MB')
+a_gui.datas, _bloat_removed, _bloat_removed_bytes = strip_bloat_datas(a_gui.datas, 'GUI(Y-code.exe)')
+print(f'[ycode.spec] GUI(Y-code.exe) 冗余数据裁剪 {_bloat_removed} 项，约 {_bloat_removed_bytes / (1024 * 1024):.1f} MB')
+a_gui.binaries, _bin_removed, _bin_removed_bytes = strip_unused_binaries(a_gui.binaries, 'GUI(Y-code.exe)')
+print(f'[ycode.spec] GUI(Y-code.exe) 冗余二进制裁剪 {_bin_removed} 项，约 {_bin_removed_bytes / (1024 * 1024):.1f} MB')
 
 
 # ============================================================================
@@ -371,8 +397,8 @@ print(f'[ycode.spec] GUI(Y-code.exe) 裁剪 {_gui_removed} 项，约 {_gui_remov
 # 只带 tkinter 界面需要的运行时（Analysis 会按 ycode_uninstall.py 的静态 import
 # 收 _tkinter.pyd 与 tcl/tk 数据），datas 仅窗口/横幅两个图标：
 #   - assets/ycode.ico：窗口 + 任务栏图标（_set_icon 用 iconbitmap + WM_SETICON）
-#   - assets/ycode.png：向导横幅图标（_build_chrome 用 tk.PhotoImage 读取，
-#     缺失时静默不显示，因此必须显式随包，否则卸载向导横幅会少一个图标）
+#   - assets/ycode-logo-168.png：向导横幅图标（_build_chrome 用 tk.PhotoImage 读取，
+#     复用安装向导侧栏预缩放图，省去 900KB+ 原图）
 # 下载/安装相关的重资产（frontend/dist、plugins、skills、litellm、ffmpeg……）
 # 一概不收：卸载器只需要 tkinter + os/shutil/winreg 这些标准库。
 #
@@ -386,7 +412,7 @@ a_uninst = Analysis(
     binaries=[],
     datas=[
         ('assets/ycode.ico', 'assets'),
-        ('assets/ycode.png', 'assets'),
+        ('assets/ycode-logo-168.png', 'assets'),
     ],
     # installer_common 是 ycode_uninstall.py 顶层 `from installer_common import ...`
     # 的普通模块 import，静态分析本就能收到；显式声明只是兜底（漏收会让卸载器
@@ -395,7 +421,7 @@ a_uninst = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # 卸载器只用 tkinter（横幅图标走 tk.PhotoImage 读 assets/ycode.png），
+    # 卸载器只用 tkinter（横幅图标走 tk.PhotoImage 读 assets/ycode-logo-168.png），
     # 全程不 import PIL，因此这里在 common_excludes 之外单独再排除 PIL：
     # 它只服务卸载器这一路，不能进 common_excludes —— 主程序
     # core/gui_theme.py 顶层 `from PIL import Image` 真的要用 PIL，
@@ -440,6 +466,12 @@ exe_uninst = EXE(
 # 形式分发），保留它与原 spec 的 COLLECT 组成保持一致，避免以后出现极端情况下
 # 静默漏收文件。
 # ============================================================================
+a_uninst.datas, _uninst_bloat_cnt, _uninst_bloat_bytes = strip_bloat_datas(
+    a_uninst.datas, 'UNINSTALL(Y-code-uninstall.exe)'
+)
+a_uninst.binaries, _, _ = strip_unused_binaries(
+    a_uninst.binaries, 'UNINSTALL(Y-code-uninstall.exe)'
+)
 _uninst_binaries = _dedupe_secondary_toc(
     [a_gui.binaries, a_gui.datas, a_gui.zipfiles], a_uninst.binaries, '卸载器 binaries')
 _uninst_datas = _dedupe_secondary_toc(

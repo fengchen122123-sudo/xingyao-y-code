@@ -380,6 +380,17 @@ def _render_stable_system_extra_sections(session_name=None) -> tuple[list[str], 
             parts.append(subagents_catalog)
     except Exception:
         pass
+    # 工作区工程规范（AGENTS.md / CLAUDE.md / .ycode/rules）：
+    # 仅在具名会话且非秘书会话时注入并随会话快照冻结，不影响无会话名的 SHA256 黄金测试。
+    if session_name and not _is_secretary_session_for_render(session_name):
+        try:
+            from core.workspace_bootstrap import load_workspace_rules
+
+            workspace_rules = load_workspace_rules()
+            if workspace_rules:
+                parts.append(workspace_rules)
+        except Exception:
+            pass
     return parts, skills_len
 
 
@@ -1472,6 +1483,18 @@ def prepare_turn_messages(
         session_start_note = ""
     if session_start_note:
         time_note = f"{time_note}\n\n{session_start_note}"
+    # 首轮局部工作区快速态势（技术栈 / 顶层目录 / git 分支与脏文件摘要）：
+    # 只在首轮临时内联到 time_note，不写入跨轮持久化前缀，避免破坏前缀缓存。
+    if turn_source == "local" and not _is_secretary_session_for_render(session_name):
+        if not any(m.get("role") == "assistant" for m in history):
+            try:
+                from core.workspace_bootstrap import build_workspace_bootstrap_context
+
+                bootstrap_note = build_workspace_bootstrap_context()
+                if bootstrap_note:
+                    time_note = f"{time_note}\n\n{bootstrap_note}"
+            except Exception:
+                pass
     try:
         summary_msg = build_background_task_summary(session_name)
     except Exception:

@@ -309,7 +309,12 @@ def describe_selected_command_shell(*, platform: str | None = None) -> str:
     if selected is None:
         return f"未知（{settings['command_shell']}，配置无效）"
     suffix = "" if selected["available"] else "（不可用：未安装）"
-    executable = os.path.basename(selected["executable"]) if selected["executable"] else "系统默认"
+    if selected["executable"]:
+        executable = os.path.basename(selected["executable"])
+    elif platform == "win32" and selected["id"] == "auto":
+        executable = "cmd.exe，不支持 PowerShell cmdlet；需要 PowerShell 时请显式传 shell_id='powershell'"
+    else:
+        executable = "系统默认"
     return f"{selected['label']} ({executable}){suffix}"
 
 

@@ -261,13 +261,18 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
             if len(lines) > 5:
                 preview += f"\n   ... (共 {len(lines)} 行)"
             print(f"   [预览]:\n   {preview}")
-    elif function_name == "edit_file":
+    elif function_name in {"edit_file", "multi_edit"}:
         file_path = arguments.get("file_path", "未知文件")
-        target = arguments.get("target_content", "")
-        repl = arguments.get("replacement_content", "")
-        print(f"[修改文件] {_agent_display_name()}申请修改文件: {file_path}")
-        print(f"   [-] 计划删除: {target.strip()[:100]}")
-        print(f"   [+] 计划替换: {repl.strip()[:100]}")
+        if function_name == "multi_edit":
+            edits = arguments.get("edits") or []
+            count = len(edits) if isinstance(edits, list) else 0
+            print(f"[批量修改文件] {_agent_display_name()}申请批量修改文件: {file_path}（共 {count} 处）")
+        else:
+            target = arguments.get("target_content", "")
+            repl = arguments.get("replacement_content", "")
+            print(f"[修改文件] {_agent_display_name()}申请修改文件: {file_path}")
+            print(f"   [-] 计划删除: {target.strip()[:100]}")
+            print(f"   [+] 计划替换: {repl.strip()[:100]}")
     elif function_name == "execute_command":
         cmd = arguments.get("command", "")
         shell_id = str(arguments.get("shell_id") or "").strip()
@@ -320,7 +325,7 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
                 if file_path:
                     _grant_write_add(_canonical_permission_path(file_path))
                     print(f"[当前任务已放行写入]：{file_path}")
-            elif function_name == "edit_file":
+            elif function_name in {"edit_file", "multi_edit"}:
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     _grant_edit_add(_canonical_permission_path(file_path))
@@ -351,6 +356,8 @@ _KNOWN_QUERY_TOOLS = frozenset({
     "list_directory",
     "search_code",
     "find_definition",
+    "get_outline",
+    "find_references",
     "glob_files",
     "fetch_url",
     "search_news",
@@ -420,7 +427,7 @@ def _permission_rule_facts(function_name, arguments):
                 project_rule = None
             else:
                 project_rule = ("command", command)
-    elif function_name in {"write_file", "edit_file"}:
+    elif function_name in {"write_file", "edit_file", "multi_edit"}:
         kind = "write" if function_name == "write_file" else "edit"
         field = "write_files" if kind == "write" else "edit_files"
         canonical = _canonical_permission_path(arguments.get("file_path", ""))
@@ -595,9 +602,9 @@ def authorize_tool_call(
             raise PermissionSystemError("沙箱外访问缺少有效的原始操作类型")
         path_value = arguments.get("path")
         effective_arguments = dict(arguments)
-        if effective_function_name in {"read_file", "write_file", "edit_file"}:
+        if effective_function_name in {"read_file", "write_file", "edit_file", "multi_edit"}:
             effective_arguments["file_path"] = path_value
-        elif effective_function_name in {"list_directory", "directory_tree", "search_code", "find_definition", "glob_files"}:
+        elif effective_function_name in {"list_directory", "directory_tree", "search_code", "find_definition", "get_outline", "find_references", "glob_files"}:
             effective_arguments["dir_path"] = path_value
         else:
             effective_arguments.setdefault("path", path_value)
@@ -784,13 +791,13 @@ def check_permission_and_ask(
         tool_spec = fetched_spec if fetched_spec is not None else SimpleNamespace(
             name=function_name,
             read_only=function_name in _KNOWN_QUERY_TOOLS,
-            mutates_files=function_name in {"write_file", "edit_file"},
+            mutates_files=function_name in {"write_file", "edit_file", "multi_edit"},
             requires_permission=True,
         )
     outside = outside_workspace
     if outside is None:
         outside = function_name == "sandbox_outside_access"
-        if function_name in {"read_file", "write_file", "edit_file"}:
+        if function_name in {"read_file", "write_file", "edit_file", "multi_edit"}:
             try:
                 from core.tools import is_outside_workspace as _fallback_check
                 outside = _llm_first("is_outside_workspace", _fallback_check)(

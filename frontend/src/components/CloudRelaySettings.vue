@@ -474,7 +474,7 @@ async function onToggleEnabled() {
 function buildDeployPrompt(): string {
   const host = deployHost.value.trim() || '（待确认：请先向我询问服务器公网 IP）';
   const user = deployUser.value.trim() || 'ubuntu（若不同请向我确认）';
-  const domain = deployDomain.value.trim() || '（可选：若有域名请配置 HTTPS/WSS，无域名则先向我确认）';
+  const domain = deployDomain.value.trim() || '（可选：若有域名请配置 HTTPS/WSS；无域名则确认是否直接走 ws://<IP>/relay/device）';
   return [
     '请帮我把当前项目的云中转服务（relay_server）自动部署到我的 Linux 服务器，并完成本机 Y-code 的远程连接配置，让我能直接手机公网扫码使用。',
     '',
@@ -483,14 +483,14 @@ function buildDeployPrompt(): string {
     `- SSH 用户：${user}`,
     `- 公网域名：${domain}`,
     '',
-    '请按以下步骤执行（注意：用户可能是通过安装包运行，本机不一定有源码或 Node/npm 环境）：',
-    '1. 如果缺少服务器 IP、SSH 登录方式（密钥或密码）或域名信息，先向我确认后再动手；',
-    '2. 定位服务端代码与静态资源（优先从当前程序运行目录 / 安装包内 `_internal/` 下的 `relay_server/`、`requirements-relay.txt`、`frontend-mobile/dist`、`frontend/dist`、`frontend/mobile-shim.js` 直接读取，无需源码或重新构建；若在源码目录且存在 `relay_server/deploy/README.md` 也可按其构建）；',
-    '3. 通过 SSH/SCP 将 `relay_server/`、`requirements-relay.txt`、移动端/桌面端静态资源及 `mobile-shim.js` 上传到服务器 `/srv/relay`；',
-    '4. 在服务器配置 Python venv、安装依赖、生成 `/etc/relay/jwt_secret` 与 `/etc/relay/relay.env`（监听 `127.0.0.1:18080`），安装并启动 systemd 服务 `relay.service`；',
-    '5. 配置 Nginx 反向代理（包含 `/m/`、`/desktop/`、`/relay/` 的 WebSocket Upgrade 与资源路径映射）和 HTTPS/WSS 证书；',
+    '请按以下步骤执行（注意：用户可能是通过安装包运行，本机不一定有源码、系统 Python 或 Node/npm 环境）：',
+    '1. 如果缺少服务器 IP、SSH 登录方式或域名确认，先向我确认后再动手；Windows 下优先使用 SSH 密钥（`ssh -i`），若只有密码且非交互命令无法输密码，可引导我先配好 SSH 公钥免密或临时使用 `SSH_ASKPASS`（用完即删，切勿落盘保存密码）；',
+    '2. 定位服务端代码与静态资源（先检查当前工作目录或正在运行的 `Y-code.exe` / `ycode.exe` 安装目录旁的 `_internal/`）：直接读取 `relay_server/`、`requirements-relay.txt`、`frontend-mobile/dist`、`frontend/dist`、`frontend/mobile-shim.js`（服务端已原生兼容 `frontend/dist` 的 `/assets/` 路径，无需源码或 Node 重新构建；若处于源码目录也可参考 `relay_server/deploy/README.md`）；',
+    '3. 通过 `scp` 将 `relay_server/`、`requirements-relay.txt`、移动端 `frontend-mobile/dist`（上传到 `/srv/relay/static/mobile`）、桌面端 `frontend/dist`（上传到 `/srv/relay/static/desktop`）及 `mobile-shim.js`（上传到 `/srv/relay/static/mobile-shim.js`）上传到服务器 `/srv/relay`；',
+    '4. 在服务器配置 Python venv、安装 `requirements-relay.txt`、生成 `/etc/relay/jwt_secret` 与 `/etc/relay/relay.env`（监听 `127.0.0.1:18080`），安装并启动 systemd 服务 `relay.service`（`relay_server/deploy/relay.service`）；',
+    '5. 参考 `relay_server/deploy/nginx-standalone.conf` 配置独立 Nginx 反向代理（必须覆盖 `/health`、`/api/`、`/relay/` 的 WebSocket Upgrade、`/m/`、`/desktop/`、`/assets/`、`/desktop-assets/`、`/desktop-shim.js`、`/icon.png` 与 JS/CSS gzip）：有域名则配 HTTPS/WSS（如 `certbot --nginx`），无域名仅 IP 则走 80 端口 HTTP/WS 并提醒放行云安全组端口；',
     '6. 在服务器执行 `python -m relay_server create-device` 创建本机设备，拿到 `device_id` 与 `token`；',
-    '7. 把生成的 `wss://.../relay/device`、`device_id` 和 `token` 写入本机 Y-code 配置（`~/.ycode/config.json`，`token` 需按 `core.credentials.protect_secret` 加密或调用 `save_cloud_relay_settings`）并启用云中转，确认连接状态为 `connected` 后告诉我结果。',
+    '7. 优先调用本机安装包自带命令 `ycode.exe --ycode-relay-configure --url "<ws(s)://.../relay/device>" --device-id "<ID>" --token "<TOKEN>"`（或 `Y-code.exe --ycode-relay-configure ...`，源码模式可用 `python gui_main.py --ycode-relay-configure ...`）自动加密写入 `~/.ycode/config.json`；等待 2~3 秒让运行中的 GUI 自动热加载连线后，执行 `ycode.exe --ycode-relay-status`（或查看 `~/.ycode/cloud_relay_status.json`）确认 `state` 为 `connected` 再告诉我结果。',
   ].join('\n');
 }
 

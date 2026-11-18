@@ -540,7 +540,8 @@ class UninstallWizard(tk.Tk):
         self._banner_sub = tk.Label(
             banner, font=FONT_PAGE_SUB, fg=COLOR_TEXT_DIM, bg=COLOR_BANNER, anchor="w")
         self._banner_sub.place(x=22, y=37)
-        icon_path = os.path.join(self.bundle_dir, "assets", "ycode.png")
+        # 与安装向导侧栏共用预缩放好的 168x168 透明 PNG，不再随包携带 1MB+ 原图
+        icon_path = os.path.join(self.bundle_dir, "assets", "ycode-logo-168.png")
         if os.path.exists(icon_path):
             try:
                 img = tk.PhotoImage(file=icon_path)

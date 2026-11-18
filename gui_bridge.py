@@ -1916,6 +1916,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         # 云中转默认关闭。未开启时不创建连接。
         self._cloud_relay_service = None
         self._cloud_relay_lock = threading.Lock()
+        self._cloud_relay_cfg_mtime_ns = None
+        self._cloud_relay_cfg_sig = None
+        self._cloud_relay_watcher_active = False
         # 电脑操控事件桥：controller listener 注册标记（进程内建立一次、幂等，
         # 见 _ensure_computer_event_bridge；set_window 与各控制方法都会触发）
         self._computer_event_listener = None
@@ -4445,10 +4448,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         except Exception:
             logger.debug("飞书通道服务启动线程创建失败", exc_info=True)
         try:
+            self._cloud_relay_watcher_active = True
             threading.Thread(
                 target=self._ensure_cloud_relay,
                 daemon=True,
                 name="cloud-relay-startup",
+            ).start()
+            threading.Thread(
+                target=self._cloud_relay_watcher_loop,
+                daemon=True,
+                name="cloud-relay-config-watcher",
             ).start()
         except Exception:
             logger.debug("云中转启动线程创建失败", exc_info=True)
@@ -8268,6 +8277,88 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 logger.exception("飞书通道服务启动失败")
                 return None
 
+    @staticmethod
+    def _cloud_relay_config_signature(data: Dict[str, Any]) -> tuple:
+        return (
+            bool(data.get(config.CLOUD_RELAY_ENABLED_KEY, False)),
+            str(data.get(config.CLOUD_RELAY_URL_KEY) or "").strip(),
+            str(data.get(config.CLOUD_RELAY_DEVICE_ID_KEY) or "").strip(),
+            str(data.get(config.CLOUD_RELAY_TOKEN_KEY) or "").strip(),
+        )
+
+    @staticmethod
+    def _safe_config_mtime_ns() -> Optional[int]:
+        try:
+            cfg_file = getattr(config, "_CONFIG_FILE", "")
+            return os.stat(cfg_file).st_mtime_ns if cfg_file else None
+        except OSError:
+            return None
+
+    def _record_cloud_relay_config_snapshot(self, data: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            loaded = data if data is not None else config._load()
+            self._cloud_relay_cfg_sig = self._cloud_relay_config_signature(loaded)
+            self._cloud_relay_cfg_mtime_ns = self._safe_config_mtime_ns()
+        except Exception:
+            pass
+
+    def _sync_cloud_relay_from_disk(self) -> None:
+        """监听磁盘 config.json 变更并热重载云中转（供 AI/CLI 写入配置后自动连线）。"""
+        if not getattr(self, "_cloud_relay_watcher_active", False):
+            return
+        mtime_ns = self._safe_config_mtime_ns()
+        if mtime_ns is None or mtime_ns == getattr(self, "_cloud_relay_cfg_mtime_ns", None):
+            return
+        lock = getattr(self, "_cloud_relay_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._cloud_relay_lock = lock
+        with lock:
+            if mtime_ns == getattr(self, "_cloud_relay_cfg_mtime_ns", None):
+                return
+            try:
+                data = config._load()
+                sig = self._cloud_relay_config_signature(data)
+            except Exception:
+                return
+            self._cloud_relay_cfg_mtime_ns = mtime_ns
+            if sig == getattr(self, "_cloud_relay_cfg_sig", None):
+                return
+            self._cloud_relay_cfg_sig = sig
+            current = getattr(self, "_cloud_relay_service", None)
+            if current is not None:
+                try:
+                    current.stop()
+                except Exception:
+                    pass
+                self._cloud_relay_service = None
+            if not sig[0]:
+                try:
+                    from core.cloud_relay.service import write_runtime_status
+
+                    write_runtime_status({"state": "disabled", "connected": False})
+                except Exception:
+                    pass
+                return
+            try:
+                from core.cloud_relay.service import CloudRelayService
+
+                try:
+                    service = CloudRelayService(bridge=self, persist_status=True)
+                except TypeError:
+                    service = CloudRelayService(bridge=self)
+                if service.start():
+                    self._cloud_relay_service = service
+            except Exception:
+                logger.exception("云中转热重载失败")
+
+    def _cloud_relay_watcher_loop(self) -> None:
+        while not getattr(self, "_shutting_down", False):
+            time.sleep(2.0)
+            if getattr(self, "_shutting_down", False):
+                return
+            self._sync_cloud_relay_from_disk()
+
     def _ensure_cloud_relay(self):
         """默认关闭。配置开启后才创建服务，失败不抛给调用方。"""
         if getattr(self, "_cloud_relay_service", None) is not None:
@@ -8282,7 +8373,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             try:
                 from core.cloud_relay.service import CloudRelayService
 
-                service = CloudRelayService(bridge=self)
+                self._record_cloud_relay_config_snapshot()
+                try:
+                    service = CloudRelayService(bridge=self, persist_status=True)
+                except TypeError:
+                    service = CloudRelayService(bridge=self)
                 if not service.start():
                     return None
                 self._cloud_relay_service = service
@@ -8294,6 +8389,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
     def get_cloud_relay_settings(self) -> Dict[str, Any]:
         """给设置卡片一次性拿全：开关、网关地址、设备号、密钥是否已配、连接状态。"""
         try:
+            self._sync_cloud_relay_from_disk()
             data = config._load()
             service = getattr(self, "_cloud_relay_service", None)
             detail = service.status() if service is not None else {"state": "disabled"}
@@ -8331,6 +8427,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 from core.credentials import protect_secret
 
                 config.save_config_value(config.CLOUD_RELAY_TOKEN_KEY, protect_secret(token))
+            self._record_cloud_relay_config_snapshot()
             current = getattr(self, "_cloud_relay_service", None)
             if current is not None:
                 current.stop()
@@ -8353,6 +8450,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             if current is not None:
                 current.stop()
                 self._cloud_relay_service = None
+            self._record_cloud_relay_config_snapshot()
             self._ensure_cloud_relay()
             return self.get_cloud_relay_settings()
         except Exception as error:
@@ -8362,6 +8460,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
     def cloud_relay_disconnect(self) -> Dict[str, Any]:
         """设置卡片「断开」按钮：只断当前连接，不清配置（下次启动还会连）。"""
         try:
+            self._record_cloud_relay_config_snapshot()
             current = getattr(self, "_cloud_relay_service", None)
             if current is not None:
                 current.stop()
@@ -8384,6 +8483,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         在 payload 上附 relay_notice 说明原因，否则用户看到局域网地址会以为开关没生效。
         """
         try:
+            self._sync_cloud_relay_from_disk()
             fallback: Dict[str, str] = {}
             public = self._cloud_relay_pair_url(mobile=bool(mobile), reason=fallback)
             if public is not None:

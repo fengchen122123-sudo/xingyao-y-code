@@ -159,10 +159,10 @@ def _dispatch_cli_argv() -> None:
         sys.argv.remove(_CLI_FLAG)
     except ValueError:
         pass
-    # CLI 轻量档位：core.llm 在 import 期按该变量构建工具表（剔除 GUI 专属工具，
-    # 每个请求少约 5.6k tokens 的工具定义）。main.py 只在自身作为 __main__ 运行时
-    # 设置它，这里是同一个「真实入口」语义，必须早于 import main。
-    os.environ.setdefault("YCODE_TOOL_PROFILE", "cli")
+    # CLI 专属写代码档位（coding）：core.llm 在 import 期按该变量构建工具表（仅保留核心
+    # 编程工具）。main.py 只在自身作为 __main__ 运行时设置它，这里是同一个「真实入口」语义，
+    # 必须早于 import main；普通 GUI 启动不进此分支，保留完整编程 + 办公能力。
+    os.environ.setdefault("YCODE_TOOL_PROFILE", "coding")
     # 必须先修好标准流：main.py 导入期就会按 isatty() 决定是否打印启动提示。
     _ensure_cli_stdio()
 
@@ -202,9 +202,45 @@ def _dispatch_office_convert_argv() -> None:
     raise SystemExit(run_convert_worker(pair[0], pair[1]))
 
 
+def _dispatch_relay_config_argv() -> None:
+    """安装包内置云中转配置/状态子命令，无需系统 Python 即可写入加密凭据与查询连接态。"""
+    if "--ycode-relay-configure" not in sys.argv and "--ycode-relay-status" not in sys.argv:
+        return
+    if _CLI_FLAG in sys.argv:
+        try:
+            sys.argv.remove(_CLI_FLAG)
+        except ValueError:
+            pass
+    _ensure_cli_stdio()
+
+    import argparse
+    from core.cloud_relay.service import configure_cloud_relay, read_runtime_status
+
+    if "--ycode-relay-status" in sys.argv:
+        print(json.dumps(read_runtime_status(), ensure_ascii=False))
+        raise SystemExit(0)
+
+    parser = argparse.ArgumentParser(prog="ycode-relay-configure")
+    parser.add_argument("--ycode-relay-configure", action="store_true")
+    parser.add_argument("--url", default="")
+    parser.add_argument("--device-id", default="")
+    parser.add_argument("--token", default="")
+    parser.add_argument("--disable", action="store_true")
+    args, _unknown = parser.parse_known_args()
+    res = configure_cloud_relay(
+        args.url,
+        args.device_id,
+        args.token,
+        enabled=not args.disable,
+    )
+    print(json.dumps(res, ensure_ascii=False))
+    raise SystemExit(0 if res.get("ok") else 2)
+
+
 # 必须排在 CLI 分派之前：本进程是被 core.office_preview 用 sys.executable 直接
 # 拉起的转换子进程，即使外层启动器（ycode.exe）再注入 --cli，也要先接住转换标志。
 _dispatch_office_convert_argv()
+_dispatch_relay_config_argv()
 _dispatch_cli_argv()
 
 
@@ -1181,4 +1217,12 @@ def main():
         _remove_instance_info()
 
 if __name__ == "__main__":
+    # 本机代理客户端退出后残留的 HTTP_PROXY/HTTPS_PROXY 会让所有外网请求撞空端口，
+    # 表现为登录/模型连接报 WinError 10061；在最早期做一次自愈（详见 core.net_env）。
+    try:
+        from core.net_env import sanitize_dead_local_proxy
+
+        sanitize_dead_local_proxy()
+    except Exception:
+        pass
     main()

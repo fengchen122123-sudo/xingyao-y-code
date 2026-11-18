@@ -893,10 +893,10 @@ def _notify_spec() -> ToolSpec:
 
 
 def register(registry):
-    """平台门控注册：非 Windows 与 CLI 轻量模式一律不注册。"""
+    """平台门控注册：非 Windows 与 CLI/coding/server 轻量模式一律不注册。"""
     if sys.platform != "win32":
         return
-    if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() in ("cli", "server"):
+    if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() in ("cli", "server", "coding"):
         return
     # 顺序即 schema 顺序：先只读查询，再写操作，最后是注册表与通知。
     registry.register(_process_list_spec())

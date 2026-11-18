@@ -248,6 +248,11 @@ class RelayRegistry:
                 continue
             if now - float(device.get("last_ping") or 0) > OFFLINE_AFTER:
                 device["online"] = False
+                closer = device.get("connection")
+                device["connection"] = None
+                device["send"] = None
+                if callable(closer):
+                    closer()
                 frame = {
                     "type": "device_status",
                     "data": {"device_id": device_id, "online": False},
@@ -352,6 +357,11 @@ class RelayRegistry:
                 return {"type": "replay", "frames": []}
             return self._resync(device_id, None, "boot")
         boot_id = device["boot_id"]
+        # 首连（客户端没有任何水位）不补历史窗口：App 启动走一次 get_initial_state
+        # 就能拿到整态，补窗口等于把同一批状态在窄带外网上再传一遍（实测单次 1MB 级）。
+        # 带 last_boot_id 的首连（GUI 重启后水位归零）仍走下面的窗口逻辑。
+        if first and not last_boot_id:
+            return {"type": "replay", "frames": []}
         # 首连（last_boot_id 为空）只代表「我没见过任何帧」，不是 GUI 重启。
         if last_boot_id and last_boot_id != boot_id:
             return self._resync(device_id, boot_id, "boot")

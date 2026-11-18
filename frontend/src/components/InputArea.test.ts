@@ -1,4 +1,4 @@
-import { mount, flushPromises } from '@vue/test-utils';
+import { mount, flushPromises, type VueWrapper } from '@vue/test-utils';
 import { nextTick } from 'vue';
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -15,6 +15,15 @@ beforeEach(() => {
 // 统一用原生构造器派发（bubbles 保证 window 上的 pointermove/up 监听能收到）
 function firePointer(el: EventTarget, type: string, clientY: number) {
   el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, clientY, pointerId: 1 }));
+}
+
+// 富文本编辑器是 contenteditable，没有 setValue：把文本写进 DOM 再派发 input 事件，
+// 走的正是真实输入路径（组件在 input 时序列化并写回 composerText）
+async function typeInto(wrapper: VueWrapper<any>, text: string) {
+  const editor = wrapper.get('.ce-input');
+  editor.element.textContent = text;
+  await editor.trigger('input');
+  return editor;
 }
 
 it('uses the current session state for the send/stop button', () => {
@@ -55,14 +64,13 @@ it('运行中按 Esc 不会中断当前任务（防误触）', async () => {
   const stopSpy = vi.spyOn(store, 'stopCurrentTurn').mockResolvedValue(undefined);
 
   const wrapper = mount(InputArea);
-  const textarea = wrapper.get('textarea');
-  await textarea.setValue('改到一半的想法');
-  await textarea.trigger('keydown', { key: 'Escape' });
-  await textarea.trigger('keydown', { key: 'Escape' });
+  const editor = await typeInto(wrapper, '改到一半的想法');
+  await editor.trigger('keydown', { key: 'Escape' });
+  await editor.trigger('keydown', { key: 'Escape' });
 
   expect(stopSpy).not.toHaveBeenCalled();
   // 输入内容原样保留，不会因为按 Esc 被清空或提交
-  expect((textarea.element as HTMLTextAreaElement).value).toBe('改到一半的想法');
+  expect(editor.element.textContent).toBe('改到一半的想法');
   wrapper.unmount();
 });
 
@@ -108,9 +116,8 @@ it('运行中输入内容按 Enter 排队发送，不再打断当前任务', asy
   const stopSpy = vi.spyOn(store, 'stopCurrentTurn').mockResolvedValue(undefined);
 
   const wrapper = mount(InputArea);
-  const textarea = wrapper.get('textarea');
-  await textarea.setValue('下一条指令');
-  await textarea.trigger('keydown', { key: 'Enter' });
+  const editor = await typeInto(wrapper, '下一条指令');
+  await editor.trigger('keydown', { key: 'Enter' });
 
   expect(sendSpy).toHaveBeenCalledWith('下一条指令', []);
   expect(stopSpy).not.toHaveBeenCalled();
@@ -148,7 +155,7 @@ it('点击撤销按钮把排队消息文本和附件恢复到输入框并取消�
   await flushPromises();
 
   // 文本回到输入框
-  expect(wrapper.get('textarea').element.value).toBe('要撤销的消息');
+  expect(wrapper.get('.ce-input').element.textContent).toBe('要撤销的消息');
   // 从队列移除（复用取消排队）
   expect(cancelSpy).toHaveBeenCalledWith('session-b', 'q1');
   // 附件（图片+文件）一并回到输入框
@@ -158,7 +165,7 @@ it('点击撤销按钮把排队消息文本和附件恢复到输入框并取消�
 
 it('拖拽顶边手柄抬高输入框，向下拖以默认高度为下限，松手记忆', async () => {
   const wrapper = mount(InputArea);
-  const textareaEl = () => (wrapper.get('textarea').element as HTMLTextAreaElement).style.height;
+  const textareaEl = () => (wrapper.get('.ce-input').element as HTMLElement).style.height;
 
   // jsdom 无布局：默认高度走 46px 兜底常量
   const handleEl = wrapper.get('[data-test="composer-resize-handle"]').element;
@@ -200,20 +207,20 @@ it('挂载时恢复上次记忆的高度，并按当前窗口重新夹取', asyn
   localStorage.setItem(COMPOSER_HEIGHT_KEY, '200');
   let wrapper = mount(InputArea);
   await nextTick();
-  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('200px');
+  expect((wrapper.get('.ce-input').element as HTMLElement).style.height).toBe('200px');
   wrapper.unmount();
 
   // 存储的上限按当前窗口夹取（461px），低于默认高度则视为未拉伸
   localStorage.setItem(COMPOSER_HEIGHT_KEY, '99999');
   wrapper = mount(InputArea);
   await nextTick();
-  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('461px');
+  expect((wrapper.get('.ce-input').element as HTMLElement).style.height).toBe('461px');
   wrapper.unmount();
 
   localStorage.setItem(COMPOSER_HEIGHT_KEY, '30');
   wrapper = mount(InputArea);
   await nextTick();
-  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('');
+  expect((wrapper.get('.ce-input').element as HTMLElement).style.height).toBe('');
   wrapper.unmount();
 });
 
@@ -221,11 +228,11 @@ it('双击手柄恢复默认高度并清除记忆', async () => {
   localStorage.setItem(COMPOSER_HEIGHT_KEY, '200');
   const wrapper = mount(InputArea);
   await nextTick();
-  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('200px');
+  expect((wrapper.get('.ce-input').element as HTMLElement).style.height).toBe('200px');
 
   await wrapper.get('[data-test="composer-resize-handle"]').trigger('dblclick');
 
-  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('');
+  expect((wrapper.get('.ce-input').element as HTMLElement).style.height).toBe('');
   expect(localStorage.getItem(COMPOSER_HEIGHT_KEY)).toBeNull();
   wrapper.unmount();
 });
@@ -235,17 +242,16 @@ it('切换会话时分别显示各自尚未发送的文字草稿', async () => {
   store.currentSessionName = 'session-a';
 
   const wrapper = mount(InputArea);
-  const textarea = wrapper.get('textarea');
-  await textarea.setValue('会话 A 草稿');
+  await typeInto(wrapper, '会话 A 草稿');
 
   store.currentSessionName = 'session-b';
   await nextTick();
-  expect(wrapper.get('textarea').element.value).toBe('');
+  expect(wrapper.get('.ce-input').element.textContent).toBe('');
 
-  await wrapper.get('textarea').setValue('会话 B 草稿');
+  await typeInto(wrapper, '会话 B 草稿');
   store.currentSessionName = 'session-a';
   await nextTick();
-  expect(wrapper.get('textarea').element.value).toBe('会话 A 草稿');
+  expect(wrapper.get('.ce-input').element.textContent).toBe('会话 A 草稿');
   wrapper.unmount();
 });
 
@@ -254,11 +260,11 @@ it('输入组件因设置页卸载后重新挂载仍恢复当前会话草稿', a
   store.currentSessionName = 'session-a';
 
   let wrapper = mount(InputArea);
-  await wrapper.get('textarea').setValue('设置往返后仍保留');
+  await typeInto(wrapper, '设置往返后仍保留');
   wrapper.unmount();
 
   wrapper = mount(InputArea);
-  expect(wrapper.get('textarea').element.value).toBe('设置往返后仍保留');
+  expect(wrapper.get('.ce-input').element.textContent).toBe('设置往返后仍保留');
   wrapper.unmount();
 });
 

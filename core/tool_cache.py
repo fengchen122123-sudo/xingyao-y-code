@@ -379,6 +379,55 @@ def truncate_bytes(text: str, max_bytes: int, tool_name: str) -> str:
     return f"{text_out}\n... [{tool_name} 结果已截断，省略 {omitted} 字节]"
 
 
+def invalidate_after_mutation(path: str | None = None) -> None:
+    """写/改/删或执行变更命令后清理可能过期的检索、目录与文件读取缓存。"""
+    norm_target: str | None = None
+    if path:
+        try:
+            norm_target = os.path.normcase(str(Path(path).resolve(strict=False)))
+        except OSError:
+            norm_target = os.path.normcase(str(path))
+
+    with _LOCK:
+        _search_cache.clear()
+        _search_sizes.clear()
+        _glob_cache.clear()
+        _glob_sizes.clear()
+        _lsp_cache.clear()
+        _lsp_sizes.clear()
+
+        if norm_target is None:
+            _read_file_cache.clear()
+            _read_file_sizes.clear()
+            _shared_cache.clear()
+            _shared_sizes.clear()
+            return
+
+        stale_read_keys = [
+            key
+            for key in _read_file_cache
+            if key and os.path.normcase(str(key[0])) == norm_target
+        ]
+        for key in stale_read_keys:
+            _read_file_cache.pop(key, None)
+            _read_file_sizes.pop(key, None)
+
+        for sess_id, sess_cache in list(_shared_cache.items()):
+            sess_sizes = _shared_sizes.get(sess_id)
+            for s_key in list(sess_cache):
+                kind = s_key[0] if isinstance(s_key, tuple) and s_key else None
+                if kind == "read_file":
+                    inner = s_key[1] if len(s_key) > 1 and isinstance(s_key[1], tuple) else ()
+                    if not inner or os.path.normcase(str(inner[0])) == norm_target:
+                        sess_cache.pop(s_key, None)
+                        if sess_sizes is not None:
+                            sess_sizes.pop(s_key, None)
+                else:
+                    sess_cache.pop(s_key, None)
+                    if sess_sizes is not None:
+                        sess_sizes.pop(s_key, None)
+
+
 def clear_all() -> None:
     """Testing helper: reset all caches."""
     global _read_file_cache, _search_cache, _glob_cache, _lsp_cache, _shared_cache

@@ -193,11 +193,41 @@ SERVER_EXCLUDED_TOOLS: frozenset[str] = (
     CLI_EXCLUDED_TOOLS - {"browser_set_viewport", "computer_control"}
 ) | frozenset({"skill_manage", "plugin_manage", "hook_manage"})
 
-VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli", "server")
+# coding：写代码极速精简档。仅保留源码读写、批量编辑、代码检索/LSP、命令执行、
+# 子代理、计划与历史回溯等核心研发工具，剔除生图/天气/小说/飞书/UI 面板等，
+# 将工具 Schema 体积从 ~65KB（full）/ ~40KB（cli）压缩至 ~14KB。
+CODING_INCLUDED_TOOLS: frozenset[str] = frozenset({
+    "read_file",
+    "write_file",
+    "edit_file",
+    "multi_edit",
+    "list_directory",
+    "search_code",
+    "glob_files",
+    "find_definition",
+    "get_outline",
+    "find_references",
+    "undo_turn",
+    "tool_result_read",
+    "execute_command",
+    "manage_task",
+    "run_subagent",
+    "plan_write",
+    "plan_update",
+    "plan_read",
+    "plan_retry",
+    "plan_resume_takeover",
+    "plan_finish",
+    "ask_user",
+    "recall_history",
+    "fetch_url",
+})
+
+VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli", "server", "coding")
 
 
 def _resolve_tool_profile(profile: str | None = None) -> str:
-    """解析工具表档位：显式参数 > 环境变量 > app_context UI 形态 > full。
+    """解析工具表档位：显式参数 > 环境变量 > config.tool_profile > app_context UI 形态 > full。
 
     环境变量优先于 app_context，是因为 core.llm 在模块导入期就会构建工具表，
     此时入口层往往还没来得及 set_ui_flavor；main.py 在 import core.llm 之前
@@ -215,10 +245,18 @@ def _resolve_tool_profile(profile: str | None = None) -> str:
     except Exception:
         pass
     try:
+        import config
+
+        cfg_value = str((config._load() or {}).get("tool_profile") or "").strip().lower()
+        if cfg_value in VALID_TOOL_PROFILES:
+            return cfg_value
+    except Exception:
+        pass
+    try:
         from core.app_context import get_ui_flavor
 
         if get_ui_flavor() == "cli":
-            return "cli"
+            return "coding"
     except Exception:
         pass
     return "full"
@@ -271,10 +309,11 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         ),
         ToolSpec(
             name="list_directory",
-            description="列出目录内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。超过 max_entries 时自动截断。",
+            description="列出目录内容（仅限当前工作目录内，目录以 '/' 结尾标注）。支持设 depth=2..4 展示目录树。",
             input_schema=_schema({
                 "dir_path": {"type": "string", "default": "."},
                 "max_entries": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000},
+                "depth": {"type": "integer", "default": 1, "minimum": 1, "maximum": 4, "description": "目录树展开深度（1=仅当前层，2-4=树状展开）"},
             }),
             execute=tools.list_directory,
             read_only=True,
@@ -285,10 +324,19 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         ),
         ToolSpec(
             name="search_code",
-            description="在项目中搜索代码内容。",
+            description="在项目中搜索代码内容；支持按 glob 过滤文件、output_mode（content/files/count）、区分大小写与自定义上下文行数。",
             input_schema=_schema({
                 "query": {"type": "string"},
                 "dir_path": {"type": "string", "default": "."},
+                "glob": {"type": "string", "default": "", "description": "可选文件过滤通配符，如 '*.py'、'core/*.py'"},
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files", "count"],
+                    "default": "content",
+                    "description": "输出模式：content=匹配行及上下文，files=仅返回命中文件路径，count=各文件命中次数",
+                },
+                "case_sensitive": {"type": "boolean", "default": False, "description": "是否区分大小写（默认 False）"},
+                "context_lines": {"type": "integer", "default": 1, "minimum": 0, "maximum": 5, "description": "content 模式下匹配行前后上下文行数"},
             }, ["query"]),
             execute=tools.search_code,
             read_only=True,
@@ -318,6 +366,44 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="查找符号定义",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="get_outline",
+            description=(
+                "提取单个源码文件的结构大纲（类、函数、方法签名及行号区间）。"
+                "阅读大文件前先调用本工具可快速掌握文件结构并配合 read_file(offset, limit) 精读。"
+            ),
+            input_schema=_schema({
+                "file_path": {"type": "string", "description": "要分析大纲的文件路径"},
+            }, ["file_path"]),
+            execute=_lsp.get_outline,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="提取文件大纲",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="find_references",
+            description=(
+                "跨文件查找符号的全部引用位置（按整词边界匹配，覆盖调用、导入与赋值），"
+                "适合修改函数签名或重构前评估影响面。"
+            ),
+            input_schema=_schema({
+                "symbol": {"type": "string", "description": "要查找引用的精确符号名（仅含字母/数字/下划线）"},
+                "dir_path": {"type": "string", "default": "."},
+                "file_extensions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "限定文件扩展名（如 ['.py', '.ts']），不传则全语言",
+                },
+            }, ["symbol"]),
+            execute=_lsp.find_references,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查找符号引用",
             side_effect_scope="none",
         ),
         ToolSpec(
@@ -793,6 +879,37 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             execute=tools.edit_file,
             mutates_files=True,
             activity_description="修改文件",
+            side_effect_scope="workspace",
+        ),
+        ToolSpec(
+            name="multi_edit",
+            description=(
+                "对同一文件执行原子性的批量局部修改（一次提交多处变更，显著减少多轮 edit_file 往返）。\n"
+                "单次加锁、单次写盘与单个撤销记录；任意一条失败则整批中止不写盘。\n"
+                "每项需提供 replacement_content，并传 target_content（唯一上下文 ≤1500 字符）或成对 start_line/end_line。"
+            ),
+            input_schema=_schema({
+                "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "按顺序原子执行的编辑项列表",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target_content": {"type": "string", "description": "字符串模式必传：旧代码段（≤1500 字符，含唯一上下文）"},
+                            "replacement_content": {"type": "string", "description": "必传：替换后的新代码段"},
+                            "replace_all": {"type": "boolean", "default": False, "description": "字符串模式下是否全量替换"},
+                            "start_line": {"type": "integer", "description": "行号模式起始行（1-based，须与 end_line 成对）"},
+                            "end_line": {"type": "integer", "description": "行号模式结束行（1-based，inclusive）"},
+                        },
+                        "required": ["replacement_content"],
+                    },
+                },
+            }, ["file_path", "edits"]),
+            execute=tools.multi_edit,
+            mutates_files=True,
+            activity_description="批量修改文件",
             side_effect_scope="workspace",
         ),
         ToolSpec(
@@ -1466,6 +1583,12 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         _excluded = CLI_EXCLUDED_TOOLS
     elif _profile_name == "server":
         _excluded = SERVER_EXCLUDED_TOOLS
+    elif _profile_name == "coding":
+        _excluded = {
+            spec.name
+            for spec in registry.all()
+            if spec.name not in CODING_INCLUDED_TOOLS
+        }
     if _excluded:
         removed = 0
         for _name in sorted(_excluded):
@@ -1475,7 +1598,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
                 continue
             removed += 1
         if removed:
-            _LOGGER.debug("CLI 轻量档位已剔除 %d 个 GUI 专属工具", removed)
+            _LOGGER.debug("%s 档位已剔除 %d 个非核心工具", _profile_name, removed)
     _apply_managed_tool_filter(registry)
     return registry
 
