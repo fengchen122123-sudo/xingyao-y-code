@@ -30,11 +30,12 @@ SECRETARY_READONLY_DENIED_MESSAGE = (
     "秘书会话不写项目文件；可以让我派活给某个会话去改。"
 )
 PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
+JEV_AUTO_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 自动决策（JEV）评估风险后拒绝了执行该操作。"
 PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息、执行明确的只读查询和制定计划，"
     "不允许执行修改或删除操作。请改用 plan_write 把操作步骤写入计划，"
-    "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
+    "并提示用户切换到「变更前确认」「自动编辑」「自动决策」或「完全访问」模式后再执行。"
 )
 DANGEROUS_COMMAND_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 危险命令已被安全策略拒绝。"
@@ -1087,6 +1088,8 @@ class ToolPipeline:
             return authorization, DANGEROUS_COMMAND_DENIED_MESSAGE
         if authorization.reason == "plan_mutation_denied":
             return authorization, PLAN_MODE_DENIED_MESSAGE
+        if authorization.reason == "jev_auto_deny":
+            return authorization, JEV_AUTO_DENIED_MESSAGE
         if authorization.cancelled or authorization.reason == "cancelled":
             return authorization, PERMISSION_CANCELLED_MESSAGE
         return authorization, PERMISSION_DENIED_MESSAGE

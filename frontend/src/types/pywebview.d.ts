@@ -11,7 +11,7 @@ import type {
   ThemeRegionId,
 } from '../themes/types';
 
-export type PermissionMode = 'confirm' | 'accept_edits' | 'plan' | 'full';
+export type PermissionMode = 'confirm' | 'accept_edits' | 'auto_decision' | 'plan' | 'full';
 export type ReasoningChoice = 'default' | 'off' | 'on' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type ComputerProtocolChoice = '' | 'none' | 'generic' | 'native_openai';
 
@@ -595,7 +595,8 @@ export interface PluginInfo {
   version: string;
   description: string;
   source: string;      // user | builtin
-  status: string;      // loaded | disabled | failed | overridden | pending_enable | pending_disable | untrusted
+  // removed = 用户从插件页移除的内置插件（随包文件未删，可恢复）
+  status: string;      // loaded | disabled | failed | overridden | pending_enable | pending_disable | untrusted | removed
   enabled: boolean;
   tools: string[];
   // 插件是否提供设置页（入口模块声明了 plugin_settings 钩子；未启用/未信任一律 false）
@@ -637,7 +638,7 @@ export interface AutomationTaskInfo {
   // 任务指定的执行模型 id：'' = 跟随会话绑定/全局默认
   model_id?: string;
   prompt: string;
-  permission_mode: 'confirm' | 'accept_edits' | 'plan' | 'full';
+  permission_mode: 'confirm' | 'accept_edits' | 'auto_decision' | 'plan' | 'full';
   missed_run_policy: 'skip' | 'run_once';
   notify_on_success: boolean;
   created_at: string;
@@ -1281,6 +1282,8 @@ export type BridgeEventType =
   | 'open_session'
   // JEV 决策记录实时推送（载荷见 DecisionRecordedBridgeData）
   | 'decision_recorded'
+  // 决策模型总开关状态变更（驱动权限下拉「自动决策」显隐）
+  | 'decision_settings_changed'
   // 背景图转换进度 / 完成 / 失败（后端 GuiBridge._background_convert_worker 推送）
   | 'bg_convert_progress'
   | 'bg_convert_done'
@@ -2106,8 +2109,10 @@ export interface PyWebViewAPI {
   clear_workflow_runs(name: string): Promise<{ ok: boolean; msg?: string }>;
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
-  // 物理删除用户插件目录；内置插件会被后端拒绝
+  // 插件页垃圾桶：用户插件物理删除目录，内置插件只记移除名单（不删随包文件）
   delete_plugin(name: string): Promise<any>;
+  // 恢复被移除的内置插件（清移除名单并热加载）
+  restore_plugin(name: string): Promise<any>;
   trust_plugin(name: string): Promise<any>;
   // 插件设置页（声明式渲染）：页面快照读取 / 动作执行 / 打开外部授权链接
   get_plugin_settings(name: string): Promise<any>;

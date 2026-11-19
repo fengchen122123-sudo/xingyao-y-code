@@ -74,7 +74,7 @@ class _FakeStarBridge:
 
     def set_permission_mode(self, mode, session_name=""):
         self.mode_set.append({"mode": mode, "session": session_name})
-        if mode not in ("confirm", "accept_edits", "plan", "full"):
+        if mode not in ("confirm", "accept_edits", "auto_decision", "plan", "full"):
             # 星瑶会显式拒绝未知档位，不静默兜底
             return {"ok": False, "msg": f"未知权限模式: {mode}"}
         self.permission_mode = mode
@@ -423,12 +423,27 @@ def test_mode_card_shows_current_and_offers_switching(tmp_path):
     assert card["header"]["title"]["content"] == "🔐 执行权限"
     body = _card_text(card)
     assert "变更前确认" in body and "← 当前" in body
-    # 当前档位不给切换按钮，其余三个都给
+    # 默认（JEV 未开启）只展示 3 个可切换档位，不出现 auto_decision
     values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
               for c in e["columns"] for b in c["elements"]]
     args = {v.get("arg") for v in values}
     assert args == {"accept_edits", "plan", "full"}
     assert all(v["cmd"] == "/mode" for v in values)
+
+
+def test_mode_card_includes_auto_decision_when_jev_enabled(tmp_path, monkeypatch):
+    from core import decision_service
+
+    monkeypatch.setattr(decision_service, "load_decision_config", lambda: {"enabled": True})
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/mode"))
+
+    card = api.cards[0]["card"]
+    values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
+              for c in e["columns"] for b in c["elements"]]
+    args = {v.get("arg") for v in values}
+    assert args == {"accept_edits", "auto_decision", "plan", "full"}
 
 
 def test_mode_switch_binds_to_bound_session(tmp_path):

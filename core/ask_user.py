@@ -57,6 +57,25 @@ def ask_user(
     except ValueError as error:
         return str(error)
 
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_payload(question, CANCELLED_RESULT)
+
+    from core import app_context
+
+    if app_context.get_permission_mode() == "auto_decision":
+        from core.permission_auto_decision import decide_ask_user_with_jev
+
+        picked_index = decide_ask_user_with_jev(question, choices, source=source)
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_payload(question, CANCELLED_RESULT)
+        if picked_index is not None and 0 <= picked_index < len(choices):
+            return json.dumps({
+                "question": question,
+                "selected_index": picked_index,
+                "selected": choices[picked_index],
+                "decided_by": "jev",
+            }, ensure_ascii=False)
+
     # 统一走 permission_broker：CLI 由 prompt_toolkit 提示回答，
     # GUI 由前端弹窗经 respond_permission 回答，headless 由入口层自动拒绝。
     # 不再检查具体 UI 实例，避免 core 层反向依赖 main。

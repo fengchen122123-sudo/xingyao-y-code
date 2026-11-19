@@ -46,11 +46,21 @@ HELP_TEXT = """**星瑶 · 飞书指令**
 PERMISSION_MODES = (
     ("confirm", "变更前确认", "改动前询问；只读查询放行"),
     ("accept_edits", "自动编辑", "普通改动放行，敏感改动仍询问"),
+    ("auto_decision", "自动决策", "权限与提问由 JEV 决策，高危/越界仍确认"),
     ("plan", "计划模式", "只读，先出方案再实施"),
     ("full", "完全访问", "不再询问，全部放行"),
 )
 _MODE_SHORT = {key: short for key, short, _ in PERMISSION_MODES}
 _MODE_DESC = {key: desc for key, _, desc in PERMISSION_MODES}
+
+
+def visible_permission_modes():
+    """决策模型未开启时隐藏 auto_decision 档位。"""
+    from core.permission_auto_decision import is_decision_model_enabled
+
+    if is_decision_model_enabled():
+        return PERMISSION_MODES
+    return tuple(item for item in PERMISSION_MODES if item[0] != "auto_decision")
 
 
 def permission_mode_label(mode: str) -> str:
@@ -138,7 +148,8 @@ def mode_card(*, current_mode: str, session_label: str,
         lines.append(f"**会话**　{session_label}")
     lines.append("")
     lines.append("**可选档位**")
-    for key, short, desc in PERMISSION_MODES:
+    modes = visible_permission_modes()
+    for key, short, desc in modes:
         mark = "　← 当前" if key == current_mode else ""
         lines.append(f"- {short}（`{key}`）：{desc}{mark}")
     elements: List[Dict[str, Any]] = [md("\n".join(lines))]
@@ -147,7 +158,7 @@ def mode_card(*, current_mode: str, session_label: str,
         buttons = [
             btn(f"切换到{short}", "primary" if key == "confirm" else "default",
                 {"kind": "cmd", "cmd": "/mode", "arg": key})
-            for key, short, _ in PERMISSION_MODES if key != current_mode
+            for key, short, _ in modes if key != current_mode
         ]
         if buttons:
             elements.append(btn_flow(buttons))

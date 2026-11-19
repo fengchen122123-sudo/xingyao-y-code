@@ -194,8 +194,17 @@ describe('Subpage - 星轨自动化任务', () => {
     const sel = wrapper.find('[data-test="automation-permission"]');
     expect(sel.text()).toContain('变更前确认');
     expect(sel.text()).toContain('自动编辑');
+    expect(sel.text()).not.toContain('自动决策');
     expect(sel.text()).toContain('计划模式');
     expect(sel.text()).toContain('完全访问');
+
+    store.decisionEnabled = true;
+    await wrapper.vm.$nextTick();
+    expect(sel.text()).toContain('自动决策');
+
+    await sel.setValue('auto_decision');
+    expect(wrapper.find('[data-test="automation-risk-note"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="automation-risk-note"]').text()).toContain('JEV');
 
     // 计划模式只读，不属于无人值守改文件风险档位
     await sel.setValue('plan');

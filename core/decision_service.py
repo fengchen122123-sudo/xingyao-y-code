@@ -64,6 +64,8 @@ AUTO_TASK_SCENES = frozenset({
     "subagent_review",
     "plan_recovery",
     "memory_filter",
+    "auto_permission",
+    "auto_question",
 })
 
 # 探针的无害问题（每把 Key 至多 1 次调用，遵守基元律动技能红线：禁止压测）

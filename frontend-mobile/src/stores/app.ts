@@ -198,6 +198,7 @@ export const useAppStore = defineStore('mobile-app', {
     activeModelName: '',
     models: [] as { id: string; name?: string; provider?: string }[],
     permissionMode: 'confirm',
+    decisionEnabled: false,
     // 聊天（当前会话）
     messages: [] as ChatMessage[],
     historyHasMore: false,
@@ -281,6 +282,7 @@ export const useAppStore = defineStore('mobile-app', {
       this.activeModelName = String(st.active_model_name || '');
       this.models = (st.models || []).map((m: any) => ({ id: String(m.id || ''), name: m.name ? String(m.name) : undefined, provider: m.provider ? String(m.provider) : undefined }));
       this.permissionMode = String(st.permission_mode || 'confirm');
+      this.decisionEnabled = !!st.decision_enabled;
       this.version = String(st.version || '');
       // 人设名称（交互层展示用；后端仅在用户自定义时注入提示词）
       const persona = (st.persona_settings || {}) as Record<string, any>;
@@ -923,6 +925,15 @@ export const useAppStore = defineStore('mobile-app', {
 
       if (type === 'mcp_status') {
         if (Array.isArray(data.mcps)) this.mcps = data.mcps as Record<string, any>[];
+        return;
+      }
+
+      if (type === 'decision_settings_changed') {
+        this.decisionEnabled = !!data.enabled;
+        if (!this.decisionEnabled && this.permissionMode === 'auto_decision') {
+          const nextMode = String(data.permission_mode || 'confirm');
+          this.permissionMode = nextMode === 'auto_decision' ? 'confirm' : nextMode;
+        }
         return;
       }
 

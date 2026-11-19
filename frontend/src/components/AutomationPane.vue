@@ -233,7 +233,7 @@
 
       <div class="ap-row">
         <select v-model="form.permissionMode" data-test="automation-permission" title="无人值守权限档位（与对话页权限档位同源）">
-          <option v-for="m in permissionModes" :key="m.v" :value="m.v" :title="m.desc">{{ formatPermMode(m.v) }}</option>
+          <option v-for="m in visiblePermissionModes" :key="m.v" :value="m.v" :title="m.desc">{{ formatPermMode(m.v) }}</option>
         </select>
         <select v-model="form.missedPolicy" title="应用未运行错过触发时">
           <option value="skip">错过则跳过</option>
@@ -241,8 +241,14 @@
         </select>
         <label class="ap-weekday"><input type="checkbox" v-model="form.notifyOnSuccess" /> 成功也通知</label>
       </div>
-      <div v-if="form.permissionMode === 'accept_edits' || form.permissionMode === 'full'" class="ap-risk" data-test="automation-risk-note">
-        ⚠ 无人值守档位：该任务的星轨自动化回合可以不经确认{{ form.permissionMode === 'full' ? '修改文件并执行命令' : '修改文件' }}，
+      <div v-if="form.permissionMode === 'accept_edits' || form.permissionMode === 'auto_decision' || form.permissionMode === 'full'" class="ap-risk" data-test="automation-risk-note">
+        ⚠ 无人值守档位：该任务的星轨自动化回合{{
+          form.permissionMode === 'full'
+            ? '可以不经确认修改文件并执行命令'
+            : form.permissionMode === 'auto_decision'
+              ? '将权限与提问交由 JEV 决策（未就绪或转人工时自动拒绝）'
+              : '可以不经确认修改文件'
+        }}，
         每次触发都会在目标会话留下完整过程，可按回合撤销。
       </div>
 
@@ -266,14 +272,21 @@ import type { AutomationTaskInfo } from '../types/pywebview';
 const store = useAppStore();
 
 // 无人值守权限档位：文案复用对话页 formatPermMode（变更前确认/自动编辑/
-// 计划模式/完全访问），说明按无人值守语义改写——升级到确认弹窗的请求
+// 自动决策/计划模式/完全访问），说明按无人值守语义改写——升级到确认弹窗的请求
 // 一律自动拒绝，不会挂死回合
 const permissionModes: Array<{ v: AutomationTaskInfo['permission_mode']; desc: string }> = [
   { v: 'confirm', desc: '变更前确认：查询自动放行；任何变更请求自动拒绝' },
   { v: 'accept_edits', desc: '自动编辑：普通编辑和构建自动放行；删除、提交、推送等敏感操作自动拒绝' },
+  { v: 'auto_decision', desc: '自动决策：权限与提问交由 JEV 裁决；需人工确认或 JEV 不可用时自动拒绝' },
   { v: 'plan', desc: '计划模式：允许读取、查询和制定计划；禁止修改或删除任务文件' },
   { v: 'full', desc: '完全访问：沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制' },
 ];
+
+const visiblePermissionModes = computed(() =>
+  permissionModes.filter(
+    (m) => m.v !== 'auto_decision' || store.decisionEnabled || form.permissionMode === 'auto_decision',
+  ),
+);
 
 const weekdayOptions = [
   { value: 1, label: '周一' },

@@ -48,11 +48,11 @@
       </div>
     </van-popup>
 
-    <!-- 权限档位（对齐客户端四档） -->
+    <!-- 权限档位（对齐客户端五档） -->
     <van-popup v-model:show="permDlg" position="bottom" round>
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMain">‹</span><span>权限档位</span><span class="x" @click="permDlg = false">✕</span></div>
-        <div v-for="p in PERM_MODES" :key="p.value" class="opt" :class="{ on: p.value === store.permissionMode }" @click="pickPerm(p.value)">
+        <div v-for="p in visiblePermModes" :key="p.value" class="opt" :class="{ on: p.value === store.permissionMode }" @click="pickPerm(p.value)">
           <span class="mono">{{ p.value }}</span><span class="d">{{ p.label }}</span>
           <span v-if="p.value === store.permissionMode" class="cur mono"><svg class="i sm"><use href="#i-check" /></svg>当前</span>
         </div>
@@ -134,9 +134,13 @@ const store = useAppStore();
 const PERM_MODES = [
   { value: 'confirm', label: '变更前确认' },
   { value: 'accept_edits', label: '自动编辑' },
+  { value: 'auto_decision', label: '自动决策' },
   { value: 'plan', label: '计划模式' },
   { value: 'full', label: '完全访问' },
 ];
+const visiblePermModes = computed(() =>
+  PERM_MODES.filter((p) => p.value !== 'auto_decision' || store.decisionEnabled),
+);
 
 const modelDlg = ref(false);
 const reasonDlg = ref(false);

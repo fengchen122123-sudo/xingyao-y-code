@@ -744,6 +744,7 @@ button {
   --permission-soft: var(--xy-amber-soft, color-mix(in srgb, var(--yellow) 12%, transparent));
 }
 
+.permission-mode-btn.perm-auto_decision,
 .permission-mode-btn.perm-auto {
   --permission-color: var(--xy-accent, var(--cyan));
   --permission-soft: var(--xy-accent-soft, color-mix(in srgb, var(--cyan) 12%, transparent));

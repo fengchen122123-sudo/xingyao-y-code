@@ -247,10 +247,12 @@ def test_blank_line_between_assistant_blocks_in_replay():
     ]
 
     rendered = render_session_history(history, width=60)
+    plain_text = plain(rendered)
 
-    assert "\n🤖" in plain(rendered) or "\n\x1b" in rendered
+    assert "\n  ✦" in plain_text
     # 第二个 assistant 块头部前必须有空行
-    assert "\n\x1b[35m🤖" in rendered
+    assert plain_text.count("✦ 星瑶") == 2
+    assert "\n\n  ✦ 星瑶" in plain_text or "回答一\n\n  ✦ 星瑶" in plain_text
 
 
 def test_history_replay_skips_system_injected_user_messages():

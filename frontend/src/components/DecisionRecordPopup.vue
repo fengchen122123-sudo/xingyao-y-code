@@ -93,6 +93,8 @@ const SCENE_LABELS: Record<string, string> = {
   secretary: '秘书（派会话）',
   search: '搜索（定条数）',
   safety: '安全（判命令）',
+  auto_permission: '权限（自动决策）',
+  auto_question: '提问（自动决策）',
   probe: '探针（连通性）',
 };
 

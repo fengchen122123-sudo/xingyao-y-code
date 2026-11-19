@@ -10,13 +10,14 @@ from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, VSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import DynamicStyle
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.data_structures import Point
 
+from core.themes import build_selector_style
 from core.model_manager import (
     load_config, set_active_model, add_provider,
     add_model_to_provider, delete_model, get_active_model,
@@ -24,27 +25,7 @@ from core.model_manager import (
     set_secondary_model, get_secondary_roles, set_secondary_roles
 )
 
-STYLE = Style.from_dict({
-    "header":        "bold #00b4d8",
-    "footer":        "#445566",
-    "provider":      "bold #c9d1d9",
-    "model.active":  "bold #00ffa3",
-    "model.normal":  "#718096",
-    "model.cursor":  "bold #ffffff bg:#1a2a3a",
-    "add.cursor":    "bold #f6c90e bg:#1a2a3a",
-    "add.normal":    "#f6c90e",
-    "wiz.title":     "bold #00b4d8",
-    "wiz.hint":      "#445566",
-    "proto.cursor":  "bold #ffffff bg:#1a2a3a",
-    "proto.normal":  "#718096",
-    "proto.ok":      "bold #00ffa3",
-    "input.label":   "bold #00b4d8",
-    "input.sep":     "#1a2a3a",
-    "ok":            "bold #00ffa3",
-    "cursor-column":  "",
-    "cursor-line":    "",
-    "focused  cursor-column": "bg:#2a3a4a",
-})
+STYLE = build_selector_style()
 
 from core.model_catalog import get_preset_providers, provider_route_name, protocol_choices
 
@@ -610,8 +591,8 @@ def open_model_selector(on_model_selected=None):
 
     def render_list():
         out = []
-        out += [_t("class:header", "  星瑶Code 模型管理器\n")]
-        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        out += [_t("class:header", "  ✦ 星瑶Code 模型管理器\n")]
+        out += [_t("class:footer", "  " + "─" * 56 + "\n")]
 
         cfg = load_config()
         secondary_id = cfg.get("secondary_model_id")
@@ -1847,7 +1828,7 @@ def open_model_selector(on_model_selected=None):
     app = Application(
         layout=layout,
         key_bindings=kb,
-        style=STYLE,
+        style=DynamicStyle(build_selector_style),
         full_screen=True,
         mouse_support=False,
     )

@@ -200,7 +200,7 @@ html { scrollbar-color: var(--ink) var(--paper); }
   grid-template-columns: minmax(0, 1.12fr) minmax(300px, 0.88fr);
   gap: clamp(28px, 4vw, 72px);
   align-items: center;
-  padding: 12px 0 72px;
+  padding: 12px 0 44px;
 }
 .hero-art picture { display: block; }
 .hero-art img {
@@ -253,7 +253,1172 @@ html { scrollbar-color: var(--ink) var(--paper); }
   font-variant-numeric: tabular-nums;
 }
 
-.features { padding: 132px 0 88px; }
+.showcase {
+  padding: 4px 0 16px;
+}
+.xy-app {
+  --xy-bg: #f4f4f1;
+  --xy-sidebar: #f4f4f1;
+  --xy-canvas: #ffffff;
+  --xy-surface: #fafaf8;
+  --xy-card: #ffffff;
+  --xy-hover: rgba(24, 24, 27, 0.045);
+  --xy-active: rgba(24, 24, 27, 0.075);
+  --xy-border: rgba(24, 24, 27, 0.085);
+  --xy-border-strong: rgba(24, 24, 27, 0.14);
+  --xy-text: #18181b;
+  --xy-text-2: #52525b;
+  --xy-text-3: #7c7c82;
+  --xy-accent: #2563eb;
+  --xy-accent-soft: rgba(37, 99, 235, 0.09);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: #f2f4f7;
+  --xy-code-bg: rgba(24, 24, 27, 0.055);
+  --xy-green: #16a34a;
+  --xy-green-soft: rgba(22, 163, 74, 0.10);
+  --xy-amber: #d97706;
+  --xy-amber-soft: rgba(217, 119, 6, 0.10);
+  --xy-rose: #dc2626;
+  --xy-rose-soft: rgba(220, 38, 38, 0.09);
+  --xy-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --xy-shadow-composer: 0 6px 24px -6px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.04);
+  --xy-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --xy-mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 644px;
+  border-radius: 16px;
+  border: 1px solid rgba(28, 42, 58, 0.13);
+  background: var(--xy-bg);
+  color: var(--xy-text);
+  font-family: var(--xy-sans);
+  font-size: 13.5px;
+  line-height: 1.55;
+  overflow: hidden;
+  color-scheme: light;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  box-shadow: 0 28px 68px -18px rgba(28, 42, 58, 0.15), 0 6px 20px -6px rgba(28, 42, 58, 0.06);
+}
+.xy-app[data-xy-theme="dark"] {
+  --xy-bg: #141416;
+  --xy-sidebar: #161618;
+  --xy-canvas: #1a1a1d;
+  --xy-surface: #202024;
+  --xy-card: #222226;
+  --xy-hover: rgba(255, 255, 255, 0.055);
+  --xy-active: rgba(255, 255, 255, 0.09);
+  --xy-border: rgba(255, 255, 255, 0.08);
+  --xy-border-strong: rgba(255, 255, 255, 0.14);
+  --xy-text: #f4f4f5;
+  --xy-text-2: #a1a1aa;
+  --xy-text-3: #83838c;
+  --xy-accent: #4f86f7;
+  --xy-accent-soft: rgba(79, 134, 247, 0.14);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: #27272b;
+  --xy-code-bg: rgba(255, 255, 255, 0.075);
+  --xy-green: #4ade80;
+  --xy-green-soft: rgba(74, 222, 128, 0.13);
+  --xy-amber: #fbbf24;
+  --xy-amber-soft: rgba(251, 191, 36, 0.13);
+  --xy-rose: #f87171;
+  --xy-rose-soft: rgba(248, 113, 113, 0.13);
+  --xy-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --xy-shadow-composer: 0 8px 28px -6px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.25);
+  color-scheme: dark;
+  border-color: rgba(28, 42, 58, 0.24);
+  box-shadow: 0 30px 72px -18px rgba(15, 23, 42, 0.34), 0 8px 22px -6px rgba(15, 23, 42, 0.18);
+}
+:where(.xy-app) button {
+  font-family: inherit;
+  color: var(--xy-text);
+}
+.xy-app svg {
+  display: block;
+  flex-shrink: 0;
+}
+.xy-side-scroll,
+.xy-chat-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.xy-side-scroll:hover,
+.xy-chat-scroll:hover {
+  scrollbar-color: var(--xy-border-strong) transparent;
+}
+.xy-app ::-webkit-scrollbar { width: 5px; height: 5px; }
+.xy-app ::-webkit-scrollbar-track { background: transparent; }
+.xy-app ::-webkit-scrollbar-thumb {
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+}
+.xy-app *:hover::-webkit-scrollbar-thumb { background: var(--xy-border-strong); }
+
+.xy-topbar {
+  height: 42px;
+  padding: 0 10px 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  user-select: none;
+}
+.xy-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.xy-logo-mark {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.12s, filter 0.12s;
+}
+.xy-logo-mark:hover { filter: brightness(1.06); }
+.xy-logo-mark:active { transform: scale(0.95); }
+.xy-logo-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 6px;
+}
+.xy-logo-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--xy-text);
+}
+.xy-spacer { flex: 1; }
+.xy-icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.14s;
+}
+.xy-topbar .xy-mobile-menu-btn {
+  display: none;
+}
+.xy-icon-btn:hover { background: var(--xy-hover); }
+.xy-icon-btn.is-static { cursor: default; }
+.xy-icon-btn.is-static:hover { background: transparent; }
+.xy-icon-btn.is-active {
+  background: var(--xy-accent-soft);
+  color: var(--xy-accent);
+}
+.xy-win-controls {
+  display: flex;
+  align-items: center;
+  margin-left: 4px;
+  padding-left: 4px;
+  border-left: 1px solid var(--xy-border);
+}
+.xy-win-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--xy-text);
+  opacity: 0.82;
+}
+.xy-win-btn.is-close:hover {
+  background: var(--xy-rose);
+  color: #ffffff;
+  opacity: 1;
+}
+
+.xy-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0 8px 8px;
+  gap: 6px;
+  position: relative;
+}
+.xy-sidebar {
+  width: 228px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  user-select: none;
+  transition: margin-left 0.22s var(--ease), opacity 0.18s ease;
+}
+.xy-sidebar.is-collapsed {
+  margin-left: -234px;
+  opacity: 0;
+  pointer-events: none;
+}
+.xy-side-menu {
+  padding: 2px 4px 8px;
+}
+.xy-menu-item {
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  margin-bottom: 2px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.14s;
+}
+.xy-menu-item:hover {
+  background: var(--xy-hover);
+  color: var(--xy-text);
+}
+.xy-menu-item.is-static { cursor: default; }
+.xy-menu-item.is-static:hover {
+  background: transparent;
+  color: var(--xy-text-2);
+}
+.xy-menu-item.is-new { color: var(--xy-text); }
+.xy-menu-item.is-new .xy-mi-label { font-weight: 500; }
+.xy-menu-item.is-active {
+  background: var(--xy-active);
+  color: var(--xy-text);
+}
+.xy-mi-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--xy-text);
+  flex-shrink: 0;
+}
+.xy-mi-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-mi-workdir {
+  font-size: 12px;
+  color: var(--xy-text-3);
+  max-width: 78px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-mi-plus {
+  display: inline-flex;
+  color: var(--xy-text);
+}
+.xy-mi-arrow {
+  color: var(--xy-text-3);
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.xy-menu-item:hover .xy-mi-arrow,
+.xy-menu-item.is-active .xy-mi-arrow { opacity: 1; }
+
+.xy-side-divider {
+  margin: 0 8px;
+  border-top: 1px solid var(--xy-border);
+}
+.xy-side-section {
+  padding: 10px 10px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--xy-text-3);
+}
+.xy-side-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--xy-text);
+}
+.xy-mini-ico-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--xy-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.xy-mini-ico-btn:hover { background: var(--xy-hover); }
+
+.xy-side-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 4px 8px;
+}
+.xy-group { margin-bottom: 4px; }
+.xy-group-head {
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.14s;
+}
+.xy-group-head:hover {
+  background: var(--xy-hover);
+  color: var(--xy-text);
+}
+.xy-g-arrow {
+  display: inline-flex;
+  color: var(--xy-text);
+  transition: transform 0.15s ease;
+}
+.xy-group.is-collapsed .xy-g-arrow { transform: rotate(-90deg); }
+.xy-group.is-collapsed .xy-group-sessions { display: none; }
+.xy-g-ico {
+  display: inline-flex;
+  color: var(--xy-text);
+}
+.xy-g-title {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-g-count {
+  font-family: var(--xy-mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--xy-text-3);
+  margin-left: 2px;
+}
+.xy-group-sessions {
+  padding-left: 12px;
+  margin-top: 2px;
+}
+.xy-session-btn {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 2px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.14s;
+}
+.xy-session-btn:hover { background: var(--xy-hover); }
+.xy-session-btn.is-active {
+  background: var(--xy-active);
+  color: var(--xy-text);
+}
+.xy-session-btn.is-active .xy-s-title { font-weight: 500; }
+.xy-s-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-s-time {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  color: var(--xy-text-3);
+}
+
+.xy-side-footer {
+  padding: 8px 6px 2px;
+  border-top: 1px solid var(--xy-border);
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 4px;
+}
+.xy-user-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text);
+  min-width: 0;
+  cursor: default;
+}
+.xy-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 9999px;
+  background: var(--xy-text);
+  color: var(--xy-canvas);
+  font-size: 12px;
+  font-weight: 600;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+.xy-user-name {
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.xy-main-card {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  border: 1px solid var(--xy-border);
+  background: var(--xy-canvas);
+  box-shadow: var(--xy-shadow-sm);
+  overflow: hidden;
+  position: relative;
+}
+.xy-chat-header {
+  height: 44px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--xy-border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.xy-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--xy-text-3);
+}
+.xy-crumb-name {
+  font-weight: 600;
+  color: var(--xy-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-crumb-workdir {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  background: var(--xy-hover);
+  color: var(--xy-text-2);
+}
+.xy-header-chip {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--xy-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background-color 0.14s;
+}
+.xy-header-chip:hover {
+  background: var(--xy-hover);
+  color: var(--xy-text);
+}
+
+.xy-workspace-stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.xy-chat-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 34px 12px;
+}
+.xy-chat-body {
+  max-width: 720px;
+  margin: 0 auto;
+}
+.xy-nav-dot {
+  position: absolute;
+  right: 14px;
+  top: 52%;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--xy-text-2);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.xy-msg-user {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 18px;
+}
+.xy-user-bubble {
+  background: var(--xy-user-bubble);
+  color: var(--xy-text);
+  border-radius: 16px;
+  padding: 8px 16px;
+  max-width: 82%;
+  font-size: 13.5px;
+  line-height: 1.62;
+}
+.xy-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+.xy-assistant-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.xy-agent-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--xy-text);
+}
+.xy-model-tag {
+  font-family: var(--xy-mono);
+  font-size: 12px;
+  color: var(--xy-text-3);
+}
+
+.xy-fold {
+  border-radius: 12px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.xy-fold.is-open {
+  border: 1px solid var(--xy-border);
+  background: var(--xy-surface);
+  padding: 10px 14px;
+}
+.xy-fold-head {
+  width: 100%;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--xy-text-3);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  cursor: pointer;
+}
+.xy-fold-head:hover { color: var(--xy-text-2); }
+.xy-fold-caret {
+  transition: transform 0.15s ease;
+}
+.xy-fold.is-open .xy-fold-caret { transform: rotate(90deg); }
+.xy-fold-right {
+  margin-left: auto;
+  font-family: var(--xy-mono);
+  font-size: 11.5px;
+  color: var(--xy-text-3);
+}
+.xy-fold-body {
+  display: none;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--xy-border);
+  flex-direction: column;
+  gap: 6px;
+}
+.xy-fold.is-open .xy-fold-body { display: flex; }
+.xy-trace-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--xy-text-2);
+}
+.xy-trace-ok { color: var(--xy-green); }
+.xy-trace-tool {
+  font-family: var(--xy-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--xy-text);
+}
+.xy-trace-arg {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--xy-mono);
+  font-size: 11.5px;
+  color: var(--xy-text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-trace-dur {
+  font-family: var(--xy-mono);
+  font-size: 11px;
+  color: var(--xy-text-3);
+  flex-shrink: 0;
+}
+
+.xy-md {
+  color: var(--xy-text);
+  font-size: 13.5px;
+  line-height: 1.72;
+}
+.xy-md p { margin: 0 0 10px; }
+.xy-md p:last-child { margin-bottom: 0; }
+.xy-md ul,
+.xy-md ol {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+.xy-md li { margin-bottom: 5px; }
+.xy-md li:last-child { margin-bottom: 0; }
+.xy-md strong { font-weight: 600; color: var(--xy-text); }
+.xy-md code {
+  font-family: var(--xy-mono);
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--xy-code-bg);
+  color: var(--xy-text);
+}
+
+.xy-turn-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 2px;
+  font-size: 12px;
+  color: var(--xy-text-3);
+  user-select: none;
+}
+.xy-work-done {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.xy-work-done svg { color: var(--xy-accent); }
+.xy-metrics {
+  font-family: var(--xy-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--xy-text-3);
+}
+
+.xy-term-drawer {
+  display: none;
+  border-top: 1px solid var(--xy-border);
+  background: var(--xy-surface);
+  padding: 8px 18px 10px;
+  font-family: var(--xy-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--xy-text-2);
+}
+.xy-term-drawer.is-open { display: block; }
+.xy-term-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-family: var(--xy-sans);
+  font-size: 11.5px;
+  color: var(--xy-text-3);
+}
+.xy-term-ok { color: var(--xy-green); }
+
+.xy-input-area {
+  padding: 4px 28px 10px;
+  flex-shrink: 0;
+}
+.xy-input-box {
+  max-width: 720px;
+  margin: 0 auto;
+  background: var(--xy-card);
+  border: 1px solid var(--xy-border-strong);
+  border-radius: 16px;
+  padding: 11px 12px 9px;
+  box-shadow: var(--xy-shadow-composer);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.xy-input-box:focus-within {
+  border-color: var(--xy-accent);
+  box-shadow: 0 0 0 3px var(--xy-accent-soft), var(--xy-shadow-composer);
+}
+.xy-composer-input {
+  width: 100%;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--xy-text);
+  font-family: var(--xy-sans);
+  font-size: 13.5px;
+  line-height: 1.6;
+  padding: 2px 4px 6px;
+}
+.xy-composer-input::placeholder { color: var(--xy-text-3); }
+.xy-input-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+}
+.xy-bar-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 2px;
+  background: var(--xy-border);
+  flex-shrink: 0;
+}
+.xy-chip {
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background-color 0.14s;
+}
+.xy-chip:hover {
+  background: var(--xy-hover);
+  color: var(--xy-text);
+}
+.xy-chip-icon {
+  width: 28px;
+  padding: 0;
+}
+.xy-pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.xy-perm-btn,
+.xy-sandbox-btn {
+  padding: 0 10px;
+  font-weight: 500;
+}
+.xy-perm-btn[data-perm="full"] {
+  background: var(--xy-rose-soft);
+  color: var(--xy-rose);
+}
+.xy-perm-btn[data-perm="auto"] {
+  background: var(--xy-accent-soft);
+  color: var(--xy-accent);
+}
+.xy-perm-btn[data-perm="confirm"] {
+  background: var(--xy-green-soft);
+  color: var(--xy-green);
+}
+.xy-sandbox-btn[data-sandbox="open"] {
+  background: var(--xy-amber-soft);
+  color: var(--xy-amber);
+}
+.xy-sandbox-btn[data-sandbox="locked"] {
+  background: var(--xy-green-soft);
+  color: var(--xy-green);
+}
+.xy-ctx-ring {
+  margin-left: auto;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--xy-mono);
+  font-size: 12px;
+  color: var(--xy-text-2);
+}
+.xy-ctx-ring svg { transform: rotate(-90deg); }
+.xy-ctx-bg {
+  fill: none;
+  stroke: var(--xy-border-strong);
+  stroke-width: 2.2;
+}
+.xy-ctx-fg {
+  fill: none;
+  stroke: var(--xy-accent);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+}
+.xy-model-chip {
+  font-size: 12px;
+  color: var(--xy-text-2);
+}
+.xy-caret {
+  color: var(--xy-text-3);
+  font-size: 10px;
+}
+.xy-send-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--xy-hover);
+  color: var(--xy-text-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.15s, color 0.15s;
+}
+.xy-send-btn.is-ready,
+.xy-input-box:focus-within .xy-send-btn,
+.xy-empty-card:focus-within .xy-send-btn {
+  background: var(--xy-accent);
+  color: var(--xy-accent-fg);
+}
+
+.xy-app.is-empty #xy-chat-scroll,
+.xy-app.is-empty .xy-nav-dot,
+.xy-app.is-empty #xy-input-area,
+.xy-app.is-empty .xy-input-area,
+.xy-app.is-empty #xy-export-btn {
+  display: none;
+}
+.xy-empty-state {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 28px;
+  user-select: none;
+  overflow-y: auto;
+}
+.xy-app.is-empty .xy-empty-state {
+  display: flex;
+}
+.xy-empty-title {
+  margin: 0 0 22px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--xy-text);
+  text-align: center;
+}
+.xy-empty-card {
+  position: relative;
+  width: 100%;
+  max-width: 640px;
+  background: var(--xy-card);
+  border: 1px solid var(--xy-border-strong);
+  border-radius: 16px;
+  padding: 14px;
+  box-shadow: var(--xy-shadow-composer);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.xy-empty-card:focus-within {
+  border-color: var(--xy-accent);
+  box-shadow: 0 0 0 3px var(--xy-accent-soft), var(--xy-shadow-composer);
+}
+.xy-empty-textarea {
+  width: 100%;
+  min-height: 74px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--xy-text);
+  font-family: var(--xy-sans);
+  font-size: 14px;
+  line-height: 1.625;
+  resize: none;
+  padding: 0;
+  display: block;
+}
+.xy-empty-textarea::placeholder { color: var(--xy-text-3); }
+.xy-empty-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 4px;
+}
+.xy-empty-bar-l,
+.xy-empty-bar-r {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.xy-empty-workdir-wrap {
+  position: relative;
+  margin-top: 16px;
+}
+.xy-empty-workdir {
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--xy-text-3);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: background-color 0.14s, color 0.14s;
+}
+.xy-empty-workdir:hover {
+  color: var(--xy-text);
+  background: var(--xy-hover);
+}
+.xy-workdir-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 204px;
+  padding: 5px;
+  border-radius: 10px;
+  border: 1px solid var(--xy-border-strong);
+  background: var(--xy-card);
+  box-shadow: var(--xy-shadow-composer);
+  display: none;
+  z-index: 12;
+}
+.xy-workdir-menu.is-open { display: block; }
+.xy-workdir-opt {
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--xy-text-2);
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.xy-workdir-opt:hover,
+.xy-workdir-opt.is-active {
+  background: var(--xy-hover);
+  color: var(--xy-text);
+}
+.xy-empty-prompts {
+  display: none;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 14px;
+  max-width: 640px;
+}
+.xy-empty-prompts.is-visible { display: flex; }
+.xy-prompt-pill {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--xy-border);
+  background: transparent;
+  color: var(--xy-text-3);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.14s, border-color 0.14s, background-color 0.14s;
+}
+.xy-prompt-pill:hover {
+  color: var(--xy-text);
+  border-color: var(--xy-border-strong);
+  background: var(--xy-surface);
+}
+
+.xy-model-cascader {
+  position: absolute;
+  z-index: 40;
+  display: none;
+  align-items: flex-end;
+  gap: 8px;
+}
+.xy-model-cascader.is-open { display: flex; }
+.xy-model-cascader.opens-down { align-items: flex-start; }
+.xy-cascader-panel {
+  min-width: 196px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: 14px;
+  border: 1px solid var(--xy-border-strong);
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 16px 40px -6px rgba(15, 23, 42, 0.16), 0 2px 8px rgba(15, 23, 42, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.xy-cascader-sub { min-width: 226px; }
+.xy-app[data-xy-theme="dark"] .xy-cascader-panel {
+  background: rgba(34, 34, 38, 0.94);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+}
+.xy-cascader-title {
+  padding: 5px 10px 3px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--xy-text-3);
+  user-select: none;
+}
+.xy-cascader-item {
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2);
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s, color 0.12s;
+}
+.xy-cascader-item:hover,
+.xy-cascader-item.is-active {
+  background: var(--xy-hover);
+  color: var(--xy-text);
+}
+.xy-cascader-item.is-selected {
+  background: var(--xy-active);
+  color: var(--xy-text);
+  font-weight: 500;
+}
+.xy-c-ico {
+  color: var(--xy-text-3);
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.xy-c-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-c-mono {
+  font-family: var(--xy-mono);
+  font-size: 12px;
+}
+.xy-c-vision {
+  color: var(--xy-accent);
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.xy-c-check {
+  color: var(--xy-accent);
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.xy-c-check-muted { color: var(--xy-text-3); }
+.xy-c-arrow {
+  color: var(--xy-text-3);
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.xy-cascader-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--xy-border);
+}
+.xy-cascader-hint {
+  padding: 5px 10px;
+  font-size: 11.5px;
+  color: var(--xy-text-3);
+  user-select: none;
+}
+
+.xy-statusbar {
+  height: 26px;
+  padding: 0 18px;
+  border-top: 1px solid var(--xy-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--xy-text-3);
+  flex-shrink: 0;
+  user-select: none;
+}
+.xy-status-spacer { width: 32px; }
+.xy-status-notice {
+  opacity: 0.78;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xy-status-state {
+  font-family: var(--xy-mono);
+  min-width: 32px;
+  text-align: right;
+}
+
+.xy-sidebar-backdrop {
+  display: none;
+}
+
+.features { padding: 104px 0 88px; }
 .section-title { font-size: clamp(2rem, 3.4vw, 3.15rem); max-width: 16em; }
 .lede {
   margin: 18px 0 0;
@@ -362,6 +1527,79 @@ html { scrollbar-color: var(--ink) var(--paper); }
 }
 .soon li + li { margin-top: 4px; }
 
+.thanks {
+  background: var(--paper);
+  padding: 44px 0;
+  border-top: 1px solid var(--line);
+}
+.thanks-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px 48px;
+}
+.thanks-eyebrow {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.thanks h2 {
+  margin: 6px 0 0;
+  font-family: var(--serif);
+  font-size: clamp(1.35rem, 2.2vw, 1.65rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  color: var(--ink);
+}
+.thanks-desc {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+  line-height: 1.6;
+}
+.thanks-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 20px 36px;
+}
+.thanks-partner {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  margin: -8px -12px;
+  border-radius: 10px;
+  color: var(--ink);
+  text-decoration: none;
+  opacity: 0.88;
+  transition: opacity 180ms var(--ease), background-color 180ms var(--ease);
+}
+.thanks-partner:hover {
+  opacity: 1;
+  background: rgba(28, 42, 58, 0.045);
+}
+.thanks-partner img {
+  height: 40px;
+  width: auto;
+  display: block;
+}
+.thanks-arrow {
+  display: inline-flex;
+  color: var(--ink-soft);
+  transition: transform 180ms var(--ease), color 180ms var(--ease);
+}
+.thanks-partner:hover .thanks-arrow {
+  color: var(--blue);
+  transform: translate(2px, -2px);
+}
+
 .footer { padding: 48px 0 36px; border-top: 1px solid var(--line); }
 .footer-row {
   display: flex;
@@ -452,10 +1690,15 @@ dialog#demo-modal .btn { min-width: 120px; }
     min-height: 0;
     align-items: start;
     gap: 8px;
-    padding: 12px 0 64px;
+    padding: 12px 0 36px;
   }
   .hero-art img { width: min(100%, 560px); }
   .hero-copy { padding-bottom: 0; }
+  .xy-app { height: 600px; }
+  .xy-sidebar { width: 204px; }
+  .xy-sidebar.is-collapsed { margin-left: -210px; }
+  .xy-chat-scroll { padding: 16px 22px 12px; }
+  .xy-input-area { padding: 4px 18px 10px; }
   .feature-row,
   .persona-body,
   .scarf-grid { grid-template-columns: 1fr; }
@@ -472,13 +1715,84 @@ dialog#demo-modal .btn { min-width: 120px; }
   }
   .brand img { height: 44px; }
   .brand-code { padding-bottom: 8px; }
-  .features { padding-top: 88px; }
+  .xy-app { height: 560px; border-radius: 14px; }
+  .xy-topbar .xy-mobile-menu-btn { display: inline-flex; }
+  .xy-win-controls { display: none; }
+  .xy-body { padding: 0 6px 6px; gap: 0; }
+  .xy-sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 6px;
+    left: 6px;
+    width: min(252px, calc(100% - 56px));
+    padding: 6px 4px 8px;
+    border-radius: 14px;
+    border: 1px solid var(--xy-border-strong);
+    background: var(--xy-sidebar);
+    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.2);
+    z-index: 12;
+    transform: translateX(calc(-100% - 14px));
+    margin-left: 0;
+    opacity: 0;
+    pointer-events: none;
+    transition: transform 0.22s var(--ease), opacity 0.18s ease;
+  }
+  .xy-sidebar.is-mobile-open {
+    margin-left: 0;
+    transform: translateX(0);
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .xy-sidebar-backdrop.is-open {
+    display: block;
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.22);
+    z-index: 10;
+    border-radius: 14px;
+  }
+  .xy-chat-header { padding: 0 12px; }
+  .xy-crumb-workdir,
+  .xy-header-chip span { display: none; }
+  .xy-header-chip { padding: 0 8px; }
+  .xy-chat-scroll { padding: 14px 16px 10px; }
+  .xy-nav-dot { display: none; }
+  .xy-input-area { padding: 4px 10px 8px; }
+  .xy-snip-btn,
+  .xy-reasoning-chip,
+  .xy-ctx-ring { display: none; }
+  .xy-model-label {
+    max-width: 108px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .xy-turn-footer { flex-wrap: wrap; gap: 6px; }
+  .xy-empty-state { padding: 18px 14px; }
+  .xy-empty-title { font-size: 19px; margin-bottom: 16px; }
+  .xy-empty-card { padding: 12px; }
+  .xy-empty-bar { flex-wrap: wrap; gap: 6px; }
+  .xy-empty-bar .xy-model-label { max-width: 76px; }
+  .xy-model-cascader.is-open {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    max-width: calc(100% - 16px);
+  }
+  .xy-cascader-panel,
+  .xy-cascader-sub {
+    min-width: 0;
+    width: min(280px, calc(100vw - 64px));
+    max-height: 185px;
+  }
+  .features { padding-top: 72px; }
   section, header { scroll-margin-top: 88px; }
   .title-break { display: block; }
   .legal a { display: block; }
   .legal-sep { display: none; }
   .persona { padding-bottom: 88px; }
   .scarf { padding: 80px 0 88px; }
+  .thanks { padding: 36px 0; }
+  .thanks-partner img { height: 34px; }
   .hero h1 { font-size: 2.45rem; }
 }
 
@@ -486,6 +1800,8 @@ dialog#demo-modal .btn { min-width: 120px; }
   html { scroll-behavior: auto; }
   .btn { transition: none; }
   .btn:hover, .btn:active { transform: none; }
+  .xy-app, .xy-sidebar, .xy-fold-caret, .xy-g-arrow, .thanks-partner, .thanks-arrow { transition: none; }
+  .thanks-partner:hover .thanks-arrow { transform: none; }
 }
 </style>
 </head>
@@ -522,6 +1838,313 @@ dialog#demo-modal .btn { min-width: 120px; }
       <p class="edition">星瑶Code 已上线 · v<span class="js-version">1.3.9</span></p>
     </div>
   </header>
+
+  <section class="showcase" id="preview" aria-label="星瑶Code 桌面界面预览">
+    <div class="wrap">
+      <div class="xy-app" id="xy-showcase" data-xy-theme="light">
+        <div class="xy-topbar">
+          <button type="button" class="xy-icon-btn xy-mobile-menu-btn" id="xy-mobile-menu" title="打开会话列表" aria-label="打开会话列表">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></svg>
+          </button>
+          <div class="xy-logo">
+            <button type="button" class="xy-logo-mark" id="xy-toggle-sidebar" title="收起 / 展开侧栏" aria-label="收起或展开侧栏">
+              <img src="assets/xingyao-portrait-512.webp" width="24" height="24" alt="星瑶Code">
+            </button>
+            <span class="xy-logo-name">星瑶Code</span>
+          </div>
+          <div class="xy-spacer"></div>
+          <button type="button" class="xy-icon-btn" id="xy-toggle-term" title="切换内嵌终端" aria-label="切换内嵌终端" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 11 2-2-2-2"/><path d="M11 13h4"/><rect width="18" height="18" x="3" y="3" rx="2"/></svg>
+          </button>
+          <button type="button" class="xy-icon-btn" id="xy-toggle-theme" title="切换浅色 / 深色主题" aria-label="切换浅色或深色主题" aria-pressed="false">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" id="xy-theme-icon"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+          </button>
+          <button type="button" class="xy-icon-btn" id="xy-toggle-panel" title="工作区面板" aria-label="工作区面板">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></svg>
+          </button>
+          <div class="xy-win-controls" aria-hidden="true">
+            <span class="xy-win-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 12h14"/></svg></span>
+            <span class="xy-win-btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="butt" stroke-linejoin="miter"><rect x="4.5" y="4.5" width="15" height="15"/></svg></span>
+            <span class="xy-win-btn is-close"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></span>
+          </div>
+        </div>
+
+        <div class="xy-body">
+          <div class="xy-sidebar-backdrop" id="xy-backdrop"></div>
+          <aside class="xy-sidebar" id="xy-sidebar" aria-label="会话与能力导航">
+            <div class="xy-side-menu">
+              <button type="button" class="xy-menu-item is-new" data-xy-action="new-session">
+                <span class="xy-mi-ico"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg></span>
+                <span class="xy-mi-label">新会话</span>
+                <span class="xy-mi-workdir">对话</span>
+                <span class="xy-mi-plus"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg></span>
+              </button>
+              <div class="xy-menu-item is-static">
+                <span class="xy-mi-ico"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 15 9 22 12 15 15 12 22 9 15 2 12 9 9"/></svg></span>
+                <span class="xy-mi-label">星盘 · 技能</span>
+              </div>
+              <div class="xy-menu-item is-static">
+                <span class="xy-mi-ico"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="7" height="7" x="14" y="3" rx="1"/><path d="M10 21V8a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H3"/></svg></span>
+                <span class="xy-mi-label">星桥 · MCP</span>
+              </div>
+              <div class="xy-menu-item is-static">
+                <span class="xy-mi-ico"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/></svg></span>
+                <span class="xy-mi-label">星匣 · 插件</span>
+              </div>
+              <div class="xy-menu-item is-static">
+                <span class="xy-mi-ico"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11.5 4.5 13.1 9.9 18.5 11.5 13.1 13.1 11.5 18.5 9.9 13.1 4.5 11.5 9.9 9.9Z"/><circle cx="18.8" cy="5.4" r="1.9"/></svg></span>
+                <span class="xy-mi-label">星轨</span>
+              </div>
+            </div>
+
+            <div class="xy-side-divider"></div>
+
+            <div class="xy-side-section">
+              <span>项目会话</span>
+              <span class="xy-side-section-actions" aria-hidden="true">
+                <span class="xy-mini-ico-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg></span>
+                <span class="xy-mini-ico-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M12 10v6"/><path d="M9 13h6"/></svg></span>
+              </span>
+            </div>
+
+            <div class="xy-side-scroll">
+              <div class="xy-group">
+                <button type="button" class="xy-group-head" aria-expanded="true">
+                  <span class="xy-g-arrow"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>
+                  <span class="xy-g-ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg></span>
+                  <span class="xy-g-title">秘书</span>
+                  <span class="xy-g-count">1</span>
+                </button>
+                <div class="xy-group-sessions">
+                  <button type="button" class="xy-session-btn" data-xy-session="secretary">
+                    <span class="xy-s-title">星见</span>
+                    <span class="xy-s-time">23小时</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="xy-group">
+                <button type="button" class="xy-group-head" aria-expanded="true">
+                  <span class="xy-g-arrow"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>
+                  <span class="xy-g-ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
+                  <span class="xy-g-title">对话</span>
+                  <span class="xy-g-count" id="xy-dialog-count">2</span>
+                </button>
+                <div class="xy-group-sessions" id="xy-dialog-sessions">
+                  <button type="button" class="xy-session-btn" data-xy-session="timeout">
+                    <span class="xy-s-title">排查接口偶发超时</span>
+                    <span class="xy-s-time">2小时</span>
+                  </button>
+                  <button type="button" class="xy-session-btn" data-xy-session="validation">
+                    <span class="xy-s-title">补充边界校验与单元测试</span>
+                    <span class="xy-s-time">昨天</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="xy-side-footer">
+              <div class="xy-user-card">
+                <span class="xy-avatar">星</span>
+                <span class="xy-user-name">本地工作区</span>
+              </div>
+              <span class="xy-icon-btn is-static" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.15" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+              </span>
+              <span class="xy-icon-btn is-static" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.15" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg>
+              </span>
+            </div>
+          </aside>
+
+          <div class="xy-main-card">
+            <div class="xy-chat-header">
+              <span class="xy-crumb">
+                <span>会话</span>
+                <span>/</span>
+                <b class="xy-crumb-name" id="xy-crumb-name">认识 星瑶Code</b>
+                <span class="xy-crumb-workdir" id="xy-crumb-workdir" style="display:none"></span>
+              </span>
+              <span class="xy-spacer"></span>
+              <button type="button" class="xy-header-chip" id="xy-export-btn" title="支持导出 Markdown / HTML / JSON">
+                <svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                <span>导出</span>
+              </button>
+              <button type="button" class="xy-header-chip" id="xy-branch-chip" title="Git 当前分支" style="display:none">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+                <span id="xy-branch-name">dev</span>
+              </button>
+            </div>
+
+            <div class="xy-workspace-stage">
+              <div class="xy-chat-scroll" id="xy-chat-scroll">
+                <div class="xy-chat-body" id="xy-chat-body">
+                  <div class="xy-msg-user">
+                    <div class="xy-user-bubble">可以介绍一下自己吗？</div>
+                  </div>
+                  <div class="xy-turn">
+                    <div class="xy-assistant-head">
+                      <b class="xy-agent-name">星瑶</b>
+                      <span class="xy-model-tag">deepseek-v4.1-flash-1017</span>
+                    </div>
+                    <div class="xy-fold" data-xy-fold>
+                      <button type="button" class="xy-fold-head" aria-expanded="false">
+                        <svg class="xy-fold-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                        <span>星瑶执行过程 · 3 个工具调用 · 已完成 · 12s</span>
+                      </button>
+                      <div class="xy-fold-body">
+                        <div class="xy-trace-row"><span class="xy-trace-ok">✓</span><span class="xy-trace-tool">read_file</span><span class="xy-trace-arg">README.md · 读取项目概览与工作区约定</span><span class="xy-trace-dur">0.3s</span></div>
+                        <div class="xy-trace-row"><span class="xy-trace-ok">✓</span><span class="xy-trace-tool">list_plugins</span><span class="xy-trace-arg">星盘技能 · 星桥 MCP · 星匣插件清单</span><span class="xy-trace-dur">0.4s</span></div>
+                        <div class="xy-trace-row"><span class="xy-trace-ok">✓</span><span class="xy-trace-tool">recall_memory</span><span class="xy-trace-arg">加载当前项目长期记忆与分支上下文</span><span class="xy-trace-dur">0.2s</span></div>
+                      </div>
+                    </div>
+                    <div class="xy-md">
+                      <p>我是 <strong>星瑶Code</strong>，运行在你本地电脑上的 AI 编程伙伴。我不只是回答问题，而是直接进入你的项目目录，读代码、改文件、跑命令并验证结果。</p>
+                      <p>我可以帮你：</p>
+                      <ol>
+                        <li><strong>理解项目并直接改动</strong> —— 深入代码库结构与调用链，修改文件、运行测试并支持按回合一键撤销。</li>
+                        <li><strong>多代理并肩工作</strong> —— 把探索、实现、测试与代码审查分派给多个子代理并行推进，复杂任务不必排队。</li>
+                        <li><strong>长期记忆与专属秘书</strong> —— 记住你的偏好、架构约束与历史决策，跨会话持续协作。</li>
+                        <li><strong>星盘技能 · 星桥 MCP · 星匣插件</strong> —— 按需装配技能、MCP 工具与本地插件，贴合你的工作流。</li>
+                        <li><strong>星轨自动化与手机远程</strong> —— 安排定时后台任务，扫码即可在手机端随时查看进度与下达指令。</li>
+                      </ol>
+                      <p>点击左侧 <code>新会话</code> 或任意示例会话，看看星瑶在真实场景中的工作方式。</p>
+                    </div>
+                    <div class="xy-turn-footer">
+                      <span class="xy-work-done">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+                        <span>星瑶本轮工作 12s</span>
+                      </span>
+                      <span class="xy-metrics">195.5 t/s · 12s · 286 tokens</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <span class="xy-nav-dot" aria-hidden="true"></span>
+
+              <div class="xy-empty-state" id="xy-empty-state">
+                <h3 class="xy-empty-title">让星瑶帮你完成任务</h3>
+                <div class="xy-empty-card">
+                  <textarea class="xy-empty-textarea" id="xy-empty-input" rows="3" placeholder="尽管问，或做个任务… / 技能 @ 文件" aria-label="新对话演示输入框"></textarea>
+                  <div class="xy-empty-bar">
+                    <div class="xy-empty-bar-l">
+                      <button type="button" class="xy-chip xy-chip-icon" title="添加附件" aria-label="添加附件">
+                        <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                      </button>
+                      <button type="button" class="xy-chip xy-chip-icon xy-snip-btn" title="屏幕截图" aria-label="屏幕截图">
+                        <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/></svg>
+                      </button>
+                      <span class="xy-bar-sep" aria-hidden="true"></span>
+                      <button type="button" class="xy-chip xy-perm-btn" id="xy-empty-perm-btn" data-perm="full" title="点击切换权限档位">
+                        <span class="xy-pill-dot" aria-hidden="true"></span>
+                        <span id="xy-empty-perm-label">完全访问</span>
+                      </button>
+                      <button type="button" class="xy-chip xy-sandbox-btn" id="xy-empty-sandbox-btn" data-sandbox="open" title="点击切换目录沙盒状态">
+                        <span class="xy-pill-dot" aria-hidden="true"></span>
+                        <span id="xy-empty-sandbox-label">沙盒已解除</span>
+                      </button>
+                    </div>
+                    <div class="xy-empty-bar-r">
+                      <button type="button" class="xy-chip xy-model-chip" id="xy-empty-model-btn" title="切换演示模型">
+                        <span class="xy-model-label" id="xy-empty-model-label">deepseek-v4.1-flash-1017</span>
+                        <span class="xy-caret" aria-hidden="true">▾</span>
+                      </button>
+                      <button type="button" class="xy-chip xy-reasoning-chip" id="xy-empty-reason-btn" title="切换思考深度">
+                        <span id="xy-empty-reason-label">极高</span>
+                        <span class="xy-caret" aria-hidden="true">▾</span>
+                      </button>
+                      <button type="button" class="xy-send-btn" id="xy-empty-send-btn" title="发送消息 (Enter)" aria-label="创建新对话并发送">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="xy-empty-workdir-wrap">
+                  <button type="button" class="xy-empty-workdir" id="xy-empty-workdir-btn" aria-expanded="false">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+                    <span id="xy-empty-workdir-label">进入项目工作区</span>
+                    <span class="xy-caret" aria-hidden="true">▾</span>
+                  </button>
+                  <div class="xy-workdir-menu" id="xy-workdir-menu" role="menu">
+                    <button type="button" class="xy-workdir-opt is-active" data-xy-workdir="" role="menuitem">自由对话（不绑定目录）</button>
+                    <button type="button" class="xy-workdir-opt" data-xy-workdir="xingyao-demo" role="menuitem">示例项目 · xingyao-demo</button>
+                  </div>
+                </div>
+
+                <div class="xy-empty-prompts" id="xy-empty-prompts">
+                  <button type="button" class="xy-prompt-pill" data-xy-prompt="帮我梳理这个项目的目录结构和核心调用链">梳理项目结构</button>
+                  <button type="button" class="xy-prompt-pill" data-xy-prompt="检查 config_loader.py 的边界校验并跑一遍测试">检查校验并跑测试</button>
+                  <button type="button" class="xy-prompt-pill" data-xy-prompt="帮我排查接口流式输出偶发卡顿的原因">排查流式卡顿</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="xy-term-drawer" id="xy-term-drawer">
+              <div class="xy-term-bar">
+                <span>内嵌终端 · PowerShell · D:\Projects\xingyao-demo</span>
+                <button type="button" class="xy-mini-ico-btn" id="xy-term-close" title="关闭终端" aria-label="关闭终端">×</button>
+              </div>
+              <div>PS D:\Projects\xingyao-demo&gt; pytest -q</div>
+              <div class="xy-term-ok">........ 8 passed in 0.42s</div>
+            </div>
+
+            <div class="xy-input-area" id="xy-input-area">
+              <div class="xy-input-box">
+                <input type="text" class="xy-composer-input" id="xy-composer-input" placeholder="向星瑶提问… / 调用技能与 MCP，@ 引用文件" aria-label="向星瑶提问演示输入框" autocomplete="off">
+                <div class="xy-input-bar">
+                  <button type="button" class="xy-chip xy-chip-icon" title="附加文件" aria-label="附加文件">
+                    <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                  </button>
+                  <button type="button" class="xy-chip xy-chip-icon xy-snip-btn" title="屏幕截图" aria-label="屏幕截图">
+                    <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/></svg>
+                  </button>
+                  <span class="xy-bar-sep" aria-hidden="true"></span>
+                  <button type="button" class="xy-chip xy-perm-btn" id="xy-perm-btn" data-perm="full" title="点击切换权限档位">
+                    <span class="xy-pill-dot" aria-hidden="true"></span>
+                    <span id="xy-perm-label">完全访问</span>
+                  </button>
+                  <button type="button" class="xy-chip xy-sandbox-btn" id="xy-sandbox-btn" data-sandbox="open" title="点击切换目录沙盒状态">
+                    <span class="xy-pill-dot" aria-hidden="true"></span>
+                    <span id="xy-sandbox-label">沙盒已解除</span>
+                  </button>
+                  <span class="xy-ctx-ring" title="当前上下文占用">
+                    <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+                      <circle class="xy-ctx-bg" cx="10" cy="10" r="7.5"/>
+                      <circle class="xy-ctx-fg" id="xy-ctx-arc" cx="10" cy="10" r="7.5" stroke-dasharray="3.8 47.12"/>
+                    </svg>
+                    <span id="xy-ctx-pct">8%</span>
+                  </span>
+                  <button type="button" class="xy-chip xy-model-chip" id="xy-model-btn" title="切换演示模型">
+                    <span class="xy-model-label" id="xy-model-label">deepseek-v4.1-flash-1017</span>
+                    <span class="xy-caret" aria-hidden="true">▾</span>
+                  </button>
+                  <button type="button" class="xy-chip xy-reasoning-chip" id="xy-reason-btn" title="切换思考深度">
+                    <span id="xy-reason-label">极高</span>
+                    <span class="xy-caret" aria-hidden="true">▾</span>
+                  </button>
+                  <button type="button" class="xy-send-btn" id="xy-send-btn" title="发送演示消息" aria-label="发送演示消息">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="xy-statusbar">
+              <span class="xy-status-spacer" aria-hidden="true"></span>
+              <span class="xy-status-notice">内容由 AI 生成，请仔细甄别</span>
+              <span class="xy-status-state" id="xy-status-state">空闲</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="xy-model-cascader" id="xy-model-cascader" role="dialog" aria-label="选择模型" aria-hidden="true">
+          <div class="xy-cascader-panel" id="xy-cascader-providers"></div>
+          <div class="xy-cascader-panel xy-cascader-sub" id="xy-cascader-models"></div>
+        </div>
+      </div>
+    </div>
+  </section>
 
   <section class="features" id="features">
     <div class="wrap">
@@ -575,6 +2198,24 @@ dialog#demo-modal .btn { min-width: 120px; }
           <li>macOS 正在筹备中</li>
           <li>Linux 正在筹备中</li>
         </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="thanks" id="thanks" aria-labelledby="thanks-heading">
+    <div class="wrap thanks-row">
+      <div class="thanks-head">
+        <p class="thanks-eyebrow" lang="en">SPECIAL THANKS</p>
+        <h2 id="thanks-heading">特别鸣谢</h2>
+        <p class="thanks-desc">感谢以下 Token 服务商在开发期间提供模型与算力支持</p>
+      </div>
+      <div class="thanks-list">
+        <a class="thanks-partner" href="https://tokenrhythm.studio/login" target="_blank" rel="noopener noreferrer" aria-label="基元律动官网（新窗口打开）" title="访问基元律动官网">
+          <img src="assets/tokenrhythm-logo.svg" width="170" height="43" alt="基元律动 · TokenRhythm">
+          <span class="thanks-arrow" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+          </span>
+        </a>
       </div>
     </div>
   </section>
@@ -762,6 +2403,680 @@ loadSiteData().then(function (mode) {
 document.getElementById("demo-modal-close").addEventListener("click", function () {
   document.getElementById("demo-modal").close();
 });
+
+/* 星瑶Code 桌面界面交互演示 */
+(function initXingYaoShowcase() {
+  var app = document.getElementById("xy-showcase");
+  if (!app) return;
+
+  var sidebar = document.getElementById("xy-sidebar");
+  var backdrop = document.getElementById("xy-backdrop");
+  var crumbName = document.getElementById("xy-crumb-name");
+  var crumbWorkdir = document.getElementById("xy-crumb-workdir");
+  var branchChip = document.getElementById("xy-branch-chip");
+  var branchName = document.getElementById("xy-branch-name");
+  var chatScroll = document.getElementById("xy-chat-scroll");
+  var chatBody = document.getElementById("xy-chat-body");
+  var termDrawer = document.getElementById("xy-term-drawer");
+  var termBtn = document.getElementById("xy-toggle-term");
+  var themeBtn = document.getElementById("xy-toggle-theme");
+  var themeIcon = document.getElementById("xy-theme-icon");
+  var composerInput = document.getElementById("xy-composer-input");
+  var sendBtn = document.getElementById("xy-send-btn");
+  var emptyInput = document.getElementById("xy-empty-input");
+  var emptySendBtn = document.getElementById("xy-empty-send-btn");
+  var emptyWorkdirBtn = document.getElementById("xy-empty-workdir-btn");
+  var emptyWorkdirLabel = document.getElementById("xy-empty-workdir-label");
+  var workdirMenu = document.getElementById("xy-workdir-menu");
+  var emptyPrompts = document.getElementById("xy-empty-prompts");
+  var sideWorkdirLabel = app.querySelector(".xy-mi-workdir");
+  var dialogSessions = document.getElementById("xy-dialog-sessions");
+  var dialogCount = document.getElementById("xy-dialog-count");
+  var modelCascader = document.getElementById("xy-model-cascader");
+  var cascaderProviders = document.getElementById("xy-cascader-providers");
+  var cascaderModels = document.getElementById("xy-cascader-models");
+  var ctxArc = document.getElementById("xy-ctx-arc");
+  var ctxPct = document.getElementById("xy-ctx-pct");
+  var statusState = document.getElementById("xy-status-state");
+
+  var SUN_PATH = '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>';
+  var MOON_PATH = '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>';
+
+  function escHtml(str) {
+    return String(str || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  var SESSIONS = {
+    intro: {
+      title: "认识 星瑶Code",
+      workdir: "",
+      branch: "",
+      ctx: 8,
+      model: "deepseek-v4.1-flash-1017",
+      user: "可以介绍一下自己吗？",
+      processSummary: "星瑶执行过程 · 3 个工具调用 · 已完成 · 12s",
+      traces: [
+        ["read_file", "README.md · 读取项目概览与工作区约定", "0.3s"],
+        ["list_plugins", "星盘技能 · 星桥 MCP · 星匣插件清单", "0.4s"],
+        ["recall_memory", "加载当前项目长期记忆与分支上下文", "0.2s"]
+      ],
+      bodyHtml:
+        "<p>我是 <strong>星瑶Code</strong>，运行在你本地电脑上的 AI 编程伙伴。我不只是回答问题，而是直接进入你的项目目录，读代码、改文件、跑命令并验证结果。</p>" +
+        "<p>我可以帮你：</p>" +
+        "<ol>" +
+        "<li><strong>理解项目并直接改动</strong> —— 深入代码库结构与调用链，修改文件、运行测试并支持按回合一键撤销。</li>" +
+        "<li><strong>多代理并肩工作</strong> —— 把探索、实现、测试与代码审查分派给多个子代理并行推进，复杂任务不必排队。</li>" +
+        "<li><strong>长期记忆与专属秘书</strong> —— 记住你的偏好、架构约束与历史决策，跨会话持续协作。</li>" +
+        "<li><strong>星盘技能 · 星桥 MCP · 星匣插件</strong> —— 按需装配技能、MCP 工具与本地插件，贴合你的工作流。</li>" +
+        "<li><strong>星轨自动化与手机远程</strong> —— 安排定时后台任务，扫码即可在手机端随时查看进度与下达指令。</li>" +
+        "</ol>" +
+        "<p>点击左侧 <code>新会话</code> 或任意示例会话，看看星瑶在真实场景中的工作方式。</p>",
+      duration: "12s",
+      metrics: "195.5 t/s · 12s · 286 tokens"
+    },
+    secretary: {
+      title: "星见",
+      workdir: "",
+      branch: "",
+      ctx: 12,
+      model: "deepseek-v4.1-flash-1017",
+      user: "帮我汇总一下这周项目里还没收尾的事项，按优先级排一下",
+      processSummary: "星瑶执行过程 · 3 个工具调用 · 已完成 · 9s",
+      traces: [
+        ["recall_memory", "检索近 7 天会话决议与待办记忆", "0.3s"],
+        ["git_status", "汇总当前工作区未合并改动与分支状态", "0.3s"],
+        ["read_file", "CHANGELOG.md · 核对近期功能收尾清单", "0.2s"]
+      ],
+      bodyHtml:
+        "<p>已结合本周会话记忆与工作区记录整理出 3 项待收尾事项：</p>" +
+        "<ol>" +
+        "<li><strong>高优 · 接口超时排查收尾</strong> —— 确认流式中断链路在异常断连下的资源释放，补齐回归验证。</li>" +
+        "<li><strong>中优 · 配置加载器边界单测</strong> —— 补全空配置与字段类型校验用例，确保异常提示清晰可定位。</li>" +
+        "<li><strong>低优 · 静态资源与文档同步</strong> —— 核对前端组件说明与本地缓存配置示例，保持文档与代码一致。</li>" +
+        "</ol>" +
+        "<p>需要我现在直接把其中哪一项转成可执行计划吗？</p>",
+      duration: "9s",
+      metrics: "201.4 t/s · 9s · 248 tokens"
+    },
+    timeout: {
+      title: "排查接口偶发超时",
+      workdir: "",
+      branch: "",
+      ctx: 14,
+      model: "deepseek-v4.1-flash-1017",
+      user: "流式输出偶发卡住 30 秒才报错，帮我定位原因并给最小修复方案",
+      processSummary: "星瑶执行过程 · 4 个工具调用 · 已完成 · 15s",
+      traces: [
+        ["grep_search", "检索 _request_stream 与 cancel_event 取消链路", "0.4s"],
+        ["read_file", "core/llm.py · 检查阻塞读与异常分类路径", "0.5s"],
+        ["verify_trace", "确认单响应流关闭不会影响共享连接池", "0.3s"]
+      ],
+      bodyHtml:
+        "<p>根因已定位：流式读取阻塞在底层 socket 时，仅设置 <code>cancel_event</code> 不会唤醒阻塞中的 <code>next(stream)</code>，导致最长等待一整个 read timeout。</p>" +
+        "<p><strong>最小修复方案：</strong></p>" +
+        "<ul>" +
+        "<li>在流启动时将单个 response 句柄登记到 <code>_inflight_streams</code> 注册表</li>" +
+        "<li>停止路径先 <code>cancel_event.set()</code> 再调用 <code>abort_inflight_streams()</code> 直接关闭该响应流</li>" +
+        "<li>绝不关闭共享 HTTP 连接池，确保被中断侧归一为用户取消而非网络重试</li>" +
+        "</ul>",
+      duration: "15s",
+      metrics: "189.0 t/s · 15s · 231 tokens"
+    },
+    validation: {
+      title: "补充边界校验与单元测试",
+      workdir: "",
+      branch: "",
+      ctx: 11,
+      model: "deepseek-v4.1-flash-1017",
+      user: "帮我检查 config_loader.py 的边界校验，补上缺失的异常提示和单元测试",
+      processSummary: "星瑶执行过程 · 4 个工具调用 · 已完成 · 14s",
+      traces: [
+        ["read_file", "config_loader.py · 读取配置解析与校验逻辑", "0.3s"],
+        ["edit_file", "config_loader.py · 补充空值与类型错误提示", "0.5s"],
+        ["edit_file", "tests/test_config_loader.py · 新增 3 个边界用例", "0.4s"],
+        ["run_command", "pytest tests/test_config_loader.py -q", "0.9s"]
+      ],
+      bodyHtml:
+        "<p>已完成 <code>config_loader.py</code> 的边界校验加固并跑通全部测试：</p>" +
+        "<ul>" +
+        "<li><strong>配置校验强化</strong> —— 对缺失必填字段与非法端口号抛出带字段名的明确提示，避免静默回退</li>" +
+        "<li><strong>新增 3 个边界单测</strong> —— 覆盖空配置文件、格式错误与默认值回填场景，<code>pytest</code> 全部通过</li>" +
+        "<li><strong>支持按回合回退</strong> —— 如需调整错误文案，可随时撤销本轮改动重新生成</li>" +
+        "</ul>",
+      duration: "14s",
+      metrics: "198.6 t/s · 14s · 216 tokens"
+    }
+  };
+
+  var currentSessionId = "intro";
+  var customSeq = 0;
+  var activeWorkdir = "";
+
+  function syncHeaderContext(title, workdir, branch) {
+    crumbName.textContent = title;
+    if (workdir) {
+      crumbWorkdir.textContent = workdir;
+      crumbWorkdir.style.display = "";
+    } else {
+      crumbWorkdir.style.display = "none";
+    }
+    if (branch) {
+      branchName.textContent = branch;
+      branchChip.style.display = "";
+    } else {
+      branchChip.style.display = "none";
+    }
+  }
+
+  function syncActiveSessionBtn(id) {
+    app.querySelectorAll("[data-xy-session]").forEach(function (btn) {
+      var active = Boolean(id) && btn.getAttribute("data-xy-session") === id;
+      btn.classList.toggle("is-active", active);
+      if (active) btn.setAttribute("aria-current", "true");
+      else btn.removeAttribute("aria-current");
+    });
+  }
+
+  function buildPreviewTurnHtml(text, modelName) {
+    return '<div class="xy-msg-user"><div class="xy-user-bubble">' + escHtml(text) + '</div></div>' +
+      '<div class="xy-turn">' +
+        '<div class="xy-assistant-head">' +
+          '<b class="xy-agent-name">星瑶</b>' +
+          '<span class="xy-model-tag">' + escHtml(modelName) + '</span>' +
+        '</div>' +
+        '<div class="xy-md">' +
+          '<p>这里是官网的交互界面预览，暂未连接本地文件系统与终端。下载 <strong>星瑶Code Windows 桌面版</strong> 后，打开你的项目文件夹，就能让星瑶直接读取代码、执行命令并完成这项任务。</p>' +
+        '</div>' +
+        '<div class="xy-turn-footer">' +
+          '<span class="xy-work-done">' +
+            '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>' +
+            '<span>界面预览回应</span>' +
+          '</span>' +
+          '<span class="xy-metrics">本地运行 · 开箱即用</span>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function renderFoldHtml(summary, traces) {
+    if (!traces || !traces.length) return "";
+    var rows = traces.map(function (t) {
+      return '<div class="xy-trace-row">' +
+        '<span class="xy-trace-ok">✓</span>' +
+        '<span class="xy-trace-tool">' + escHtml(t[0]) + '</span>' +
+        '<span class="xy-trace-arg">' + escHtml(t[1]) + '</span>' +
+        '<span class="xy-trace-dur">' + escHtml(t[2]) + '</span>' +
+        '</div>';
+    }).join("");
+    return '<div class="xy-fold" data-xy-fold>' +
+      '<button type="button" class="xy-fold-head" aria-expanded="false">' +
+      '<svg class="xy-fold-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>' +
+      '<span>' + escHtml(summary) + '</span>' +
+      '</button>' +
+      '<div class="xy-fold-body">' + rows + '</div>' +
+      '</div>';
+  }
+
+  function renderSession(id) {
+    var s = SESSIONS[id];
+    if (!s) return;
+    currentSessionId = id;
+    app.classList.remove("is-empty");
+    closeWorkdirMenu();
+    closeModelCascader();
+    syncHeaderContext(s.title, s.workdir, s.branch);
+    var circ = 47.12;
+    var pct = Math.max(4, Math.min(95, s.ctx || 8));
+    ctxArc.setAttribute("stroke-dasharray", ((pct / 100) * circ).toFixed(1) + " " + circ);
+    ctxPct.textContent = pct + "%";
+
+    if (s.customTurns) {
+      chatBody.innerHTML = s.customTurns.join("");
+    } else {
+      chatBody.innerHTML =
+        '<div class="xy-msg-user"><div class="xy-user-bubble">' + escHtml(s.user) + '</div></div>' +
+        '<div class="xy-turn">' +
+          '<div class="xy-assistant-head">' +
+            '<b class="xy-agent-name">星瑶</b>' +
+            '<span class="xy-model-tag">' + escHtml(s.model) + '</span>' +
+          '</div>' +
+          renderFoldHtml(s.processSummary, s.traces) +
+          '<div class="xy-md">' + s.bodyHtml + '</div>' +
+          '<div class="xy-turn-footer">' +
+            '<span class="xy-work-done">' +
+              '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>' +
+              '<span>星瑶本轮工作 ' + escHtml(s.duration) + '</span>' +
+            '</span>' +
+            '<span class="xy-metrics">' + escHtml(s.metrics) + '</span>' +
+          '</div>' +
+        '</div>' +
+        (s.extraTurns ? s.extraTurns.join("") : "");
+    }
+
+    chatScroll.scrollTop = 0;
+    syncActiveSessionBtn(id);
+    closeMobileSidebar();
+  }
+
+  function openNewSession() {
+    currentSessionId = "";
+    closeWorkdirMenu();
+    closeModelCascader();
+    app.classList.add("is-empty");
+    syncHeaderContext("新对话", activeWorkdir, "");
+    syncActiveSessionBtn("");
+    closeMobileSidebar();
+    window.setTimeout(function () { emptyInput.focus(); }, 0);
+  }
+
+  function closeWorkdirMenu() {
+    workdirMenu.classList.remove("is-open");
+    emptyWorkdirBtn.setAttribute("aria-expanded", "false");
+  }
+
+  function setWorkdir(dir) {
+    activeWorkdir = dir || "";
+    emptyWorkdirLabel.textContent = activeWorkdir ? ("当前工作区：" + activeWorkdir) : "进入项目工作区";
+    if (sideWorkdirLabel) sideWorkdirLabel.textContent = activeWorkdir || "对话";
+    emptyPrompts.classList.toggle("is-visible", Boolean(activeWorkdir));
+    workdirMenu.querySelectorAll("[data-xy-workdir]").forEach(function (opt) {
+      opt.classList.toggle("is-active", opt.getAttribute("data-xy-workdir") === activeWorkdir);
+    });
+    if (app.classList.contains("is-empty")) {
+      syncHeaderContext("新对话", activeWorkdir, "");
+    }
+  }
+
+  function isMobileView() {
+    return window.matchMedia && window.matchMedia("(max-width: 720px)").matches;
+  }
+  function closeMobileSidebar() {
+    sidebar.classList.remove("is-mobile-open");
+    backdrop.classList.remove("is-open");
+  }
+  function toggleSidebar() {
+    if (isMobileView()) {
+      var willOpen = !sidebar.classList.contains("is-mobile-open");
+      sidebar.classList.toggle("is-mobile-open", willOpen);
+      backdrop.classList.toggle("is-open", willOpen);
+    } else {
+      sidebar.classList.toggle("is-collapsed");
+    }
+  }
+  function toggleTheme() {
+    var next = app.getAttribute("data-xy-theme") === "dark" ? "light" : "dark";
+    app.setAttribute("data-xy-theme", next);
+    themeBtn.setAttribute("aria-pressed", String(next === "dark"));
+    themeIcon.innerHTML = next === "dark" ? MOON_PATH : SUN_PATH;
+  }
+
+  document.getElementById("xy-toggle-sidebar").addEventListener("click", toggleSidebar);
+  document.getElementById("xy-mobile-menu").addEventListener("click", toggleSidebar);
+  backdrop.addEventListener("click", closeMobileSidebar);
+  themeBtn.addEventListener("click", toggleTheme);
+
+  termBtn.addEventListener("click", function () {
+    var open = termDrawer.classList.toggle("is-open");
+    termBtn.classList.toggle("is-active", open);
+    termBtn.setAttribute("aria-pressed", String(open));
+  });
+  document.getElementById("xy-term-close").addEventListener("click", function () {
+    termDrawer.classList.remove("is-open");
+    termBtn.classList.remove("is-active");
+    termBtn.setAttribute("aria-pressed", "false");
+  });
+
+  app.querySelectorAll("[data-xy-action='new-session']").forEach(function (btn) {
+    btn.addEventListener("click", openNewSession);
+  });
+
+  sidebar.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-xy-session]");
+    if (!btn) return;
+    renderSession(btn.getAttribute("data-xy-session"));
+  });
+
+  app.querySelectorAll(".xy-group-head").forEach(function (head) {
+    head.addEventListener("click", function () {
+      var group = head.closest(".xy-group");
+      if (!group) return;
+      var collapsed = group.classList.toggle("is-collapsed");
+      head.setAttribute("aria-expanded", String(!collapsed));
+    });
+  });
+
+  chatBody.addEventListener("click", function (e) {
+    var head = e.target.closest(".xy-fold-head");
+    if (!head) return;
+    var fold = head.closest("[data-xy-fold]");
+    if (!fold) return;
+    var open = fold.classList.toggle("is-open");
+    head.setAttribute("aria-expanded", String(open));
+  });
+
+  var permModes = [
+    { key: "full", label: "完全访问" },
+    { key: "auto", label: "自动决策" },
+    { key: "confirm", label: "逐项确认" }
+  ];
+  var permIdx = 0;
+  var sandboxOpen = true;
+  var PROVIDER_MODELS = [
+    {
+      provider: "DeepSeek",
+      items: [
+        { id: "deepseek-v4.1-flash-1017", vision: false },
+        { id: "deepseek-chat", vision: false },
+        { id: "deepseek-reasoner", vision: false }
+      ]
+    },
+    {
+      provider: "智谱 GLM",
+      items: [
+        { id: "glm-5.3", vision: true },
+        { id: "glm-5.3-flash", vision: true },
+        { id: "glm-4.7", vision: false }
+      ]
+    },
+    {
+      provider: "通义千问 Qwen",
+      items: [
+        { id: "qwen3-coder-plus", vision: false },
+        { id: "qwen3-max", vision: true }
+      ]
+    },
+    {
+      provider: "Moonshot Kimi",
+      items: [
+        { id: "kimi-k2.5", vision: true },
+        { id: "kimi-k2-thinking", vision: false }
+      ]
+    }
+  ];
+  var activeModelId = "deepseek-v4.1-flash-1017";
+  var activeProvider = "DeepSeek";
+  var modelCascaderAnchor = null;
+  var reasons = ["极高", "高", "中"];
+  var reasonIdx = 0;
+
+  var permBtns = [document.getElementById("xy-perm-btn"), document.getElementById("xy-empty-perm-btn")];
+  var permLabels = [document.getElementById("xy-perm-label"), document.getElementById("xy-empty-perm-label")];
+  var sandboxBtns = [document.getElementById("xy-sandbox-btn"), document.getElementById("xy-empty-sandbox-btn")];
+  var sandboxLabels = [document.getElementById("xy-sandbox-label"), document.getElementById("xy-empty-sandbox-label")];
+  var modelBtns = [document.getElementById("xy-model-btn"), document.getElementById("xy-empty-model-btn")];
+  var modelLabels = [document.getElementById("xy-model-label"), document.getElementById("xy-empty-model-label")];
+  var reasonBtns = [document.getElementById("xy-reason-btn"), document.getElementById("xy-empty-reason-btn")];
+  var reasonLabels = [document.getElementById("xy-reason-label"), document.getElementById("xy-empty-reason-label")];
+
+  var HEX_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/></svg>';
+  var CHECK_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+  var CHEVRON_R_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>';
+  var EYE_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>';
+
+  function findProviderOfModel(modelId) {
+    for (var i = 0; i < PROVIDER_MODELS.length; i++) {
+      var group = PROVIDER_MODELS[i];
+      for (var j = 0; j < group.items.length; j++) {
+        if (group.items[j].id === modelId) return group.provider;
+      }
+    }
+    return PROVIDER_MODELS[0].provider;
+  }
+
+  function renderCascaderProviders() {
+    var html = '<div class="xy-cascader-title">模型供应商</div>' + PROVIDER_MODELS.map(function (group) {
+      var hasCur = group.items.some(function (m) { return m.id === activeModelId; });
+      var isActive = group.provider === activeProvider;
+      return '<button type="button" class="xy-cascader-item' + (isActive ? ' is-active' : '') + '" data-xy-provider="' + escHtml(group.provider) + '">' +
+        '<span class="xy-c-ico">' + HEX_SVG + '</span>' +
+        '<span class="xy-c-label">' + escHtml(group.provider) + '</span>' +
+        (hasCur ? '<span class="xy-c-check xy-c-check-muted">' + CHECK_SVG + '</span>' : '') +
+        '<span class="xy-c-arrow">' + CHEVRON_R_SVG + '</span>' +
+      '</button>';
+    }).join("") + '<div class="xy-cascader-sep"></div><div class="xy-cascader-hint">支持自定义 OpenAI / Anthropic 接口</div>';
+    cascaderProviders.innerHTML = html;
+  }
+
+  function renderCascaderModels() {
+    var group = null;
+    for (var i = 0; i < PROVIDER_MODELS.length; i++) {
+      if (PROVIDER_MODELS[i].provider === activeProvider) {
+        group = PROVIDER_MODELS[i];
+        break;
+      }
+    }
+    if (!group) group = PROVIDER_MODELS[0];
+    cascaderModels.innerHTML = '<div class="xy-cascader-title">' + escHtml(group.provider) + '</div>' + group.items.map(function (m) {
+      var selected = m.id === activeModelId;
+      return '<button type="button" class="xy-cascader-item' + (selected ? ' is-selected' : '') + '" data-xy-model-choice="' + escHtml(m.id) + '">' +
+        '<span class="xy-c-label xy-c-mono">' + escHtml(m.id) + '</span>' +
+        (m.vision ? '<span class="xy-c-vision" title="支持多模态识图">' + EYE_SVG + '</span>' : '') +
+        (selected ? '<span class="xy-c-check">' + CHECK_SVG + '</span>' : '') +
+      '</button>';
+    }).join("");
+  }
+
+  function positionModelCascader(anchorEl) {
+    if (!anchorEl) return;
+    var appRect = app.getBoundingClientRect();
+    var btnRect = anchorEl.getBoundingClientRect();
+    var appW = appRect.width || 960;
+    var appH = appRect.height || 644;
+    var popW = modelCascader.offsetWidth || (isMobileView() ? Math.min(280, appW - 24) : 430);
+    var left = Math.max(10, Math.min(btnRect.left - appRect.left, appW - popW - 10));
+    var spaceAbove = btnRect.top - appRect.top - 8;
+    var spaceBelow = appRect.bottom - btnRect.bottom - 8;
+    var openDown = spaceAbove < 210 && spaceBelow > spaceAbove;
+    modelCascader.classList.toggle("opens-down", openDown);
+    modelCascader.style.left = Math.round(left) + "px";
+    if (openDown) {
+      modelCascader.style.top = Math.round(btnRect.bottom - appRect.top + 8) + "px";
+      modelCascader.style.bottom = "auto";
+    } else {
+      modelCascader.style.bottom = Math.round(appRect.bottom - btnRect.top + 8) + "px";
+      modelCascader.style.top = "auto";
+    }
+    void appH;
+  }
+
+  function openModelCascader(anchorEl) {
+    closeWorkdirMenu();
+    activeProvider = findProviderOfModel(activeModelId);
+    renderCascaderProviders();
+    renderCascaderModels();
+    modelCascaderAnchor = anchorEl;
+    modelCascader.classList.add("is-open");
+    modelCascader.setAttribute("aria-hidden", "false");
+    positionModelCascader(anchorEl);
+  }
+
+  function closeModelCascader() {
+    modelCascaderAnchor = null;
+    modelCascader.classList.remove("is-open");
+    modelCascader.setAttribute("aria-hidden", "true");
+  }
+
+  function syncToolbarState() {
+    permBtns.forEach(function (b) { if (b) b.setAttribute("data-perm", permModes[permIdx].key); });
+    permLabels.forEach(function (el) { if (el) el.textContent = permModes[permIdx].label; });
+    sandboxBtns.forEach(function (b) { if (b) b.setAttribute("data-sandbox", sandboxOpen ? "open" : "locked"); });
+    sandboxLabels.forEach(function (el) { if (el) el.textContent = sandboxOpen ? "沙盒已解除" : "沙盒限制中"; });
+    modelLabels.forEach(function (el) { if (el) el.textContent = activeModelId; });
+    reasonLabels.forEach(function (el) { if (el) el.textContent = reasons[reasonIdx]; });
+  }
+
+  permBtns.forEach(function (b) {
+    if (b) b.addEventListener("click", function () { permIdx = (permIdx + 1) % permModes.length; syncToolbarState(); });
+  });
+  sandboxBtns.forEach(function (b) {
+    if (b) b.addEventListener("click", function () { sandboxOpen = !sandboxOpen; syncToolbarState(); });
+  });
+  modelBtns.forEach(function (b) {
+    if (b) b.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (modelCascader.classList.contains("is-open") && modelCascaderAnchor === b) {
+        closeModelCascader();
+      } else {
+        openModelCascader(b);
+      }
+    });
+  });
+  reasonBtns.forEach(function (b) {
+    if (b) b.addEventListener("click", function () { reasonIdx = (reasonIdx + 1) % reasons.length; syncToolbarState(); });
+  });
+
+  cascaderProviders.addEventListener("mouseover", function (e) {
+    var row = e.target.closest("[data-xy-provider]");
+    if (!row) return;
+    var nextProvider = row.getAttribute("data-xy-provider");
+    if (nextProvider && nextProvider !== activeProvider) {
+      activeProvider = nextProvider;
+      renderCascaderProviders();
+      renderCascaderModels();
+    }
+  });
+  cascaderProviders.addEventListener("click", function (e) {
+    var row = e.target.closest("[data-xy-provider]");
+    if (!row) return;
+    activeProvider = row.getAttribute("data-xy-provider") || activeProvider;
+    renderCascaderProviders();
+    renderCascaderModels();
+  });
+  cascaderModels.addEventListener("click", function (e) {
+    var choice = e.target.closest("[data-xy-model-choice]");
+    if (!choice) return;
+    activeModelId = choice.getAttribute("data-xy-model-choice") || activeModelId;
+    syncToolbarState();
+    closeModelCascader();
+  });
+
+  emptyWorkdirBtn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    closeModelCascader();
+    var open = workdirMenu.classList.toggle("is-open");
+    emptyWorkdirBtn.setAttribute("aria-expanded", String(open));
+  });
+  workdirMenu.querySelectorAll("[data-xy-workdir]").forEach(function (opt) {
+    opt.addEventListener("click", function () {
+      setWorkdir(opt.getAttribute("data-xy-workdir"));
+      closeWorkdirMenu();
+    });
+  });
+  app.addEventListener("click", function (e) {
+    if (workdirMenu.classList.contains("is-open") && !e.target.closest(".xy-empty-workdir-wrap")) {
+      closeWorkdirMenu();
+    }
+    if (modelCascader.classList.contains("is-open") && !e.target.closest("#xy-model-cascader") && !e.target.closest(".xy-model-chip")) {
+      closeModelCascader();
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") {
+      closeWorkdirMenu();
+      closeModelCascader();
+    }
+  });
+  window.addEventListener("resize", function () {
+    if (modelCascader.classList.contains("is-open") && modelCascaderAnchor) {
+      positionModelCascader(modelCascaderAnchor);
+    }
+  });
+  emptyPrompts.querySelectorAll("[data-xy-prompt]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      emptyInput.value = btn.getAttribute("data-xy-prompt") || "";
+      emptySendBtn.classList.toggle("is-ready", emptyInput.value.trim().length > 0);
+      emptyInput.focus();
+    });
+  });
+
+  function sendDemoMessage() {
+    var text = (composerInput.value || "").trim();
+    if (!text) return;
+    closeModelCascader();
+    composerInput.value = "";
+    sendBtn.classList.remove("is-ready");
+    statusState.textContent = "演示模式";
+
+    var turnHtml = buildPreviewTurnHtml(text, activeModelId);
+    var activeSession = SESSIONS[currentSessionId];
+    if (activeSession) {
+      if (activeSession.customTurns) activeSession.customTurns.push(turnHtml);
+      else {
+        activeSession.extraTurns = activeSession.extraTurns || [];
+        activeSession.extraTurns.push(turnHtml);
+      }
+    }
+    var wrap = document.createElement("div");
+    wrap.innerHTML = turnHtml;
+    while (wrap.firstChild) chatBody.appendChild(wrap.firstChild);
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+    window.setTimeout(function () { statusState.textContent = "空闲"; }, 1200);
+  }
+
+  function createSessionFromEmpty() {
+    var text = (emptyInput.value || "").trim();
+    if (!text) return;
+    closeModelCascader();
+    emptyInput.value = "";
+    emptySendBtn.classList.remove("is-ready");
+    statusState.textContent = "演示模式";
+
+    var shortTitle = text.length > 14 ? text.slice(0, 14) + "…" : text;
+    var newId = "custom-" + (++customSeq);
+    SESSIONS[newId] = {
+      title: shortTitle,
+      workdir: activeWorkdir,
+      branch: "",
+      ctx: 4,
+      model: activeModelId,
+      customTurns: [buildPreviewTurnHtml(text, activeModelId)]
+    };
+
+    var itemBtn = document.createElement("button");
+    itemBtn.type = "button";
+    itemBtn.className = "xy-session-btn";
+    itemBtn.setAttribute("data-xy-session", newId);
+    itemBtn.innerHTML =
+      '<span class="xy-s-title">' + escHtml(shortTitle) + '</span>' +
+      '<span class="xy-s-time">刚刚</span>';
+    dialogSessions.insertBefore(itemBtn, dialogSessions.firstChild);
+    var dialogGroup = dialogSessions.closest(".xy-group");
+    if (dialogGroup && dialogGroup.classList.contains("is-collapsed")) {
+      dialogGroup.classList.remove("is-collapsed");
+      var headBtn = dialogGroup.querySelector(".xy-group-head");
+      if (headBtn) headBtn.setAttribute("aria-expanded", "true");
+    }
+    dialogCount.textContent = String(dialogSessions.querySelectorAll("[data-xy-session]").length);
+
+    renderSession(newId);
+    window.setTimeout(function () { statusState.textContent = "空闲"; }, 1200);
+  }
+
+  composerInput.addEventListener("input", function () {
+    sendBtn.classList.toggle("is-ready", composerInput.value.trim().length > 0);
+  });
+  composerInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault();
+      sendDemoMessage();
+    }
+  });
+  sendBtn.addEventListener("click", sendDemoMessage);
+
+  emptyInput.addEventListener("input", function () {
+    emptySendBtn.classList.toggle("is-ready", emptyInput.value.trim().length > 0);
+  });
+  emptyInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      createSessionFromEmpty();
+    }
+  });
+  emptySendBtn.addEventListener("click", createSessionFromEmpty);
+})();
 </script>
 </body>
 </html>

@@ -30,7 +30,14 @@ SCENES = ("router", "secretary", "search", "safety")
 
 # 任务执行期的自动决策场景：全局 enabled=True 时自动参与（不干预模型路由），
 # 默认遵循全局 shadow_mode，也可在 decision.json 的 scenes 里显式覆盖。
-TASK_SCENES = ("loop_guard", "subagent_review", "plan_recovery", "memory_filter")
+TASK_SCENES = (
+    "loop_guard",
+    "subagent_review",
+    "plan_recovery",
+    "memory_filter",
+    "auto_permission",
+    "auto_question",
+)
 ALL_SCENES = SCENES + TASK_SCENES
 
 # 单题决策的超时兜底：真实决策宁可不用，也不能拖慢主流程

@@ -2,11 +2,12 @@ from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import DynamicStyle
 
 import os
 
 import core.app_context as app_context
+from core.themes import build_selector_style
 
 
 # 会话数据来源：优先使用调用方显式传入的参数，其次回落到 app_context
@@ -17,16 +18,7 @@ def get_manager():
 def get_current_session():
     return app_context.get_current_session() or "default"
 
-STYLE = Style.from_dict({
-    "header":          "bold #00b4d8",
-    "footer":          "#445566",
-    "session.active":  "bold #00ffa3",
-    "session.normal":  "#718096",
-    "session.cursor":  "bold #ffffff bg:#1a2a3a",
-    "ok":              "bold #00ffa3",
-    "empty":           "#f6c90e",
-    "cursor-column":   "",
-})
+STYLE = build_selector_style()
 
 def _t(style: str, text: str):
     return (style, text)
@@ -81,9 +73,9 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
     def render_list():
         out = []
         view_label = "已归档列表" if state["archived_view"] else "活跃列表"
-        out += [_t("class:header", f"  星瑶Code 历史会话管家 (Sessions) · {view_label}\n")]
+        out += [_t("class:header", f"  ✦ 星瑶Code 历史会话管家 (Sessions) · {view_label}\n")]
         out += [_t("class:footer", f"  当前目录: {os.getcwd()}\n")]
-        out += [_t("", "  -----------------------------------------\n")]
+        out += [_t("class:footer", "  " + "─" * 56 + "\n")]
 
         if not state["sessions"]:
             if state["archived_view"]:
@@ -248,7 +240,7 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
     app = Application(
         layout=Layout(root_container),
         key_bindings=kb,
-        style=STYLE,
+        style=DynamicStyle(build_selector_style),
         full_screen=True
     )
     

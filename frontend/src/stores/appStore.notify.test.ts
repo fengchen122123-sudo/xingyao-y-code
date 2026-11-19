@@ -92,6 +92,41 @@ it('setPermissionMode 失败时即使在空会话也保留失败提示', async (
   expect(last.content).toContain('权限模式调整失败');
 });
 
+it('setPermissionMode 切到 auto_decision 且后端返回 decision_warning 时弹窗提示且不污染消息流', async () => {
+  (window as any).pywebview = {
+    api: {
+      set_permission_mode: vi.fn(async () => ({
+        ok: true,
+        permission_mode: 'auto_decision',
+        decision_warning: '决策模型（JEV）尚未启用',
+      })),
+    },
+  };
+  const store = useAppStore();
+
+  await store.setPermissionMode('auto_decision');
+
+  expect(store.permissionMode).toBe('auto_decision');
+  expect(store.messages).toHaveLength(0);
+  expect(store.confirmModal.show).toBe(true);
+  expect(store.confirmModal.notice).toBe(true);
+  expect(store.confirmModal.message).toContain('尚未启用');
+});
+
+it('decision_settings_changed 事件同步 decisionEnabled，关闭时将 auto_decision 回落到 confirm', () => {
+  const store = useAppStore();
+  store.permissionMode = 'auto_decision';
+  store.decisionEnabled = true;
+
+  store.handleBridgeEvent({
+    type: 'decision_settings_changed',
+    data: { enabled: false, permission_mode: 'confirm' },
+  } as any);
+
+  expect(store.decisionEnabled).toBe(false);
+  expect(store.permissionMode).toBe('confirm');
+});
+
 // ---- 双端同步提示（post_notice 广播 + notice 桥事件回环插入）----
 
 it('桥可用时 notifyChat 经 post_notice 广播，本地不直接插入（等事件回环）', () => {

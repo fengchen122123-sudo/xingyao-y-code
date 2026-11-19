@@ -198,7 +198,9 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
+import { getActivePinia } from 'pinia';
 
+import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import type {
   DecisionAuditRecentItem,
@@ -337,8 +339,18 @@ function normalizeProbe(raw: Partial<DecisionProbeKeyResult>): DecisionProbeKeyR
   };
 }
 
+function syncStoreDecisionEnabled(enabled: boolean) {
+  if (!getActivePinia()) return;
+  const store = useAppStore();
+  store.decisionEnabled = enabled;
+  if (!enabled && store.permissionMode === 'auto_decision') {
+    store.permissionMode = 'confirm';
+  }
+}
+
 function applySettings(settings: Partial<DecisionSettingsSnapshot>) {
   enabledDraft.value = settings.enabled === true;
+  syncStoreDecisionEnabled(enabledDraft.value);
   modelIdDraft.value = String(settings.model_id ?? '');
   endpointStyleDraft.value = settings.endpoint_style === 'systemone' ? 'systemone' : 'decision';
   const mode = String(settings.key_mode ?? 'auto');

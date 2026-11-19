@@ -33,6 +33,7 @@ from core.permission_policy import (
     decide_permission,
 )
 # safety 场景（JEV 决策）薄包装层：只做「allow → ask」的加严，纯函数判定不受污染
+from core.permission_auto_decision import apply_auto_decision_to_permission
 from core.permission_safety_gate import apply_decision_to_permission
 
 # 工具结果中的错误哨兵前缀
@@ -44,7 +45,7 @@ PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息、执行明确的只读查询和制定计划，"
     "不允许执行修改或删除操作。请改用 plan_write 把操作步骤写入计划，"
-    "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
+    "并提示用户切换到「变更前确认」「自动编辑」「自动决策」或「完全访问」模式后再执行。"
 )
 PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
@@ -240,6 +241,7 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
     mode_display = {
         "confirm": "每次确认",
         "accept_edits": "自动编辑",
+        "auto_decision": "自动决策",
         "plan": "计划确认",
         "full": "完全访问",
     }
@@ -671,19 +673,29 @@ def authorize_tool_call(
         project_rule_hit=project_hit,
     )
     decision = decide_permission(facts)
-    # JEV safety 场景接入：高风险操作再问一次「直接执行是否安全」，
-    # **唯一允许的变化是 allow → ask**（只能加严，不能放宽）。
-    # 纯函数 decide_permission 保持无网络 IO，决策叠加在薄包装层完成；
-    # JEV 关闭 / 影子 / 失败 / 低风险时该调用是纯本地空转，判定完全不变。
-    decision = apply_decision_to_permission(
+    # 自动决策模式（auto_decision）：在保持灾难性硬拒与沙盒/凭据边界不变的前提下，
+    # 把待确认的操作交给 JEV auto_permission 场景裁决（allow / ask_user / deny）。
+    decision = apply_auto_decision_to_permission(
         facts,
         decision,
-        command=(
-            str(effective_arguments.get("command", ""))
-            if effective_function_name == "execute_command"
-            else effective_function_name
-        ),
+        function_name=effective_function_name,
+        arguments=effective_arguments,
+        source=permission_source,
     )
+    # JEV safety 场景接入：高风险操作再问一次「直接执行是否安全」，
+    # **唯一允许的变化是 allow → ask**（只能加严，不能放宽）。
+    # 若本次刚由 JEV auto_permission 评估放行（jev_auto_allow），不重复发第二次请求；
+    # 其余场景（如 full / 白名单）照常由 safety 兜底。
+    if decision.reason != "jev_auto_allow":
+        decision = apply_decision_to_permission(
+            facts,
+            decision,
+            command=(
+                str(effective_arguments.get("command", ""))
+                if effective_function_name == "execute_command"
+                else effective_function_name
+            ),
+        )
 
     if decision.action is PermissionAction.ALLOW:
         _notify_event(event_callback, "permission_resolved", {
@@ -693,6 +705,12 @@ def authorize_tool_call(
         })
         return AuthorizationResult(True, decision.reason, sandbox_bypass=outside)
     if decision.action is PermissionAction.DENY:
+        if decision.reason == "jev_auto_deny":
+            _notify_event(event_callback, "permission_resolved", {
+                "approved": False,
+                "automatic": True,
+                "reason": decision.reason,
+            })
         return AuthorizationResult(False, decision.reason)
 
     sandbox_request = decision.reason == "sandbox_boundary_requires_confirmation"

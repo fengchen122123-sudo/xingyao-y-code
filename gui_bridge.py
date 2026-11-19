@@ -4536,6 +4536,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 "secondary_model_roles": get_secondary_roles(),
                 # 当前会话生效的权限档位（会话绑定优先，回退全局默认）
                 "permission_mode": self._effective_permission_mode(self._current_session),
+                # 决策模型总开关：未开启时前端不展示「自动决策」权限档位
+                "decision_enabled": self._is_decision_model_enabled(),
                 # 沙盒开关（是否允许访问工作目录外文件）：与 CLI /sandbox 共享同一配置键
                 "allow_outside_workspace": bool(config_data.get("allow_outside_workspace", False)),
                 "system_settings": self.get_system_settings(),
@@ -4591,6 +4593,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             return {
                 "models": [], "providers": [], "active_model_id": "",
                 "active_model_name": "未激活模型", "permission_mode": "confirm",
+                "decision_enabled": False,
                 "reasoning": _reasoning_snapshot_for_model(None),
                 "sessions": [], "skills": [], "mcps": [],
                 "workdir": "", "current_session": self._current_session,
@@ -6457,6 +6460,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             logger.exception("set_secondary_roles 失败")
             return {"ok": False, "msg": str(e)}
 
+    @staticmethod
+    def _is_decision_model_enabled() -> bool:
+        from core.permission_auto_decision import is_decision_model_enabled
+
+        return is_decision_model_enabled()
+
     def _effective_permission_mode(self, session_name: str) -> str:
         """会话生效的权限档位：会话绑定优先，未绑定回退全局默认。
 
@@ -6464,14 +6473,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         会话与新会话的兜底，改动不再互相覆盖。getattr 防御裸实例测试桥
         可能未初始化全局档位（同 _automation_turn_labels 先例）。
         """
+        mode = ""
         if session_name:
             try:
                 bound = self._memory.get_session_permission_mode(session_name)
                 if bound:
-                    return bound
+                    mode = bound
             except Exception:
                 logger.debug("读取会话权限档位失败", exc_info=True)
-        return getattr(self, "_current_permission_mode", "confirm") or "confirm"
+        if not mode:
+            mode = getattr(self, "_current_permission_mode", "confirm") or "confirm"
+        if mode == "auto_decision" and not self._is_decision_model_enabled():
+            return "confirm"
+        return mode
 
     def get_permission_mode(self, session_name: str = "") -> Dict[str, Any]:
         """返回指定会话的**生效**权限档位（会话级优先，未绑定回退全局默认）。
@@ -6498,12 +6512,31 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 }
             canonical = app_context.normalize_permission_mode(mode)
             target_session = str(session_name or "").strip()
+            if canonical == "auto_decision" and not self._is_decision_model_enabled():
+                fallback_mode = (
+                    self._effective_permission_mode(target_session)
+                    if target_session
+                    else getattr(self, "_current_permission_mode", "confirm")
+                )
+                return {
+                    "ok": False,
+                    "msg": "决策模型（JEV）尚未启用，无法切换到「自动决策」；请先在「设置 → 记忆与决策 → 决策模型（JEV）」中开启。",
+                    "permission_mode": fallback_mode,
+                }
+            warning = ""
+            if canonical == "auto_decision":
+                from core.permission_auto_decision import get_auto_decision_readiness_warning
+
+                warning = get_auto_decision_readiness_warning()
             if target_session:
                 # 会话级绑定：只影响该会话，不改全局默认/配置文件。会话尚未
                 # 落库（前端 pending 草稿）时绑不上，前端把选择随首条消息带
                 # 给 worker 落绑定（pending_permission_mode）
                 bound = self._memory.set_session_permission_mode(target_session, canonical)
-                return {"ok": True, "permission_mode": canonical, "bound": bound}
+                res: Dict[str, Any] = {"ok": True, "permission_mode": canonical, "bound": bound}
+                if warning:
+                    res["decision_warning"] = warning
+                return res
             self._current_permission_mode = canonical
             app_context.set_permission_mode(canonical)
             try:
@@ -6511,7 +6544,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 save_config_value("permission_mode", canonical)
             except Exception:
                 logger.warning("持久化权限模式失败", exc_info=True)
-            return {"ok": True, "permission_mode": canonical}
+            res = {"ok": True, "permission_mode": canonical}
+            if warning:
+                res["decision_warning"] = warning
+            return res
         except Exception as e:
             logger.exception("set_permission_mode 失败")
             return {"ok": False, "msg": str(e)}
@@ -6848,6 +6884,26 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
 
         try:
             settings = decision_service.save_decision_config(patch)
+            decision_enabled = bool(settings.get("enabled"))
+            if not decision_enabled and getattr(self, "_current_permission_mode", "confirm") == "auto_decision":
+                self._current_permission_mode = "confirm"
+                app_context.set_permission_mode("confirm")
+                try:
+                    from config import save_config_value
+
+                    save_config_value("permission_mode", "confirm")
+                except Exception:
+                    logger.warning("关闭决策模型后重置全局权限模式失败", exc_info=True)
+            if hasattr(self, "emit_event"):
+                try:
+                    self.emit_event("decision_settings_changed", {
+                        "enabled": decision_enabled,
+                        "permission_mode": self._effective_permission_mode(
+                            getattr(self, "_current_session", "")
+                        ),
+                    })
+                except Exception:
+                    logger.debug("推送 decision_settings_changed 失败", exc_info=True)
             return {"ok": True, "msg": "决策设置已保存", "settings": settings}
         except ValueError as error:
             current = decision_service.load_decision_config()
@@ -9693,6 +9749,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 if not app_context.is_known_permission_mode(raw_permission):
                     return {"ok": False, "msg": f"未知权限模式: {raw_permission}"}
                 pending_permission_mode = app_context.normalize_permission_mode(raw_permission)
+                if pending_permission_mode == "auto_decision" and not self._is_decision_model_enabled():
+                    pending_permission_mode = "confirm"
             # 斜杠命令接入点放在取锁之前：命令要么是纯文本展开、要么是本地副作用，
             # 都不需要进入回合临界区；若放进锁内，命令里的 post_notice 广播会在持锁
             # 期间触发前端回调，容易和排队/补发逻辑互相等待。
@@ -10606,6 +10664,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             errors = validate_task(raw)
             if errors:
                 return {"ok": False, "errors": errors}
+            if raw.get("permission_mode") == "auto_decision" and not self._is_decision_model_enabled():
+                return {"ok": False, "errors": ["决策模型（JEV）尚未启用，无人值守任务不能设为「自动决策」"]}
             # 指定模型必须真实存在于配置（与 send_user_message 的 known_ids 防线同源）；
             # 保存后模型被删除的场景由派发端兜底：绑定陈旧 id 时 get_active_model
             # 自动回退全局默认，任务不会被卡死
@@ -13034,13 +13094,23 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             return {"ok": False, "msg": str(e)}
 
     def delete_plugin(self, name: str) -> Dict[str, Any]:
-        """删除用户插件目录（插件页垃圾桶）。内置插件拒绝删除。"""
+        """插件页垃圾桶：用户插件物理删除，内置插件只记移除名单（不删随包文件，可恢复）。"""
         try:
-            from core.plugin_loader import delete_plugin as _delete
-            ok, msg = _delete(name)
+            from core.plugin_loader import remove_plugin as _remove
+            ok, msg = _remove(name)
             return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
         except Exception as e:
             logger.exception("delete_plugin 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def restore_plugin(self, name: str) -> Dict[str, Any]:
+        """恢复被移除的内置插件（清移除名单并热加载），返回最新插件快照。"""
+        try:
+            from core.plugin_loader import restore_plugin as _restore
+            ok, msg = _restore(name)
+            return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
+        except Exception as e:
+            logger.exception("restore_plugin 失败")
             return {"ok": False, "msg": str(e)}
 
     def trust_plugin(self, name: str) -> Dict[str, Any]:

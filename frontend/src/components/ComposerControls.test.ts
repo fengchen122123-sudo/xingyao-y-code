@@ -36,6 +36,12 @@ describe('composer controls', () => {
 
     expect(wrapper.get('[data-test="permission-button"]').classes()).toContain('perm-plan');
 
+    store.permissionMode = 'auto_decision';
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.get('[data-test="permission-button"]').classes()).toContain('perm-auto_decision');
+    expect(wrapper.get('[data-test="permission-button"]').text().replace(/\s+/g, '')).toBe('自动决策');
+
     store.permissionMode = 'full';
     await wrapper.vm.$nextTick();
 
@@ -49,13 +55,21 @@ describe('composer controls', () => {
     wrapper.unmount();
   });
 
-  it('uses green for confirm mode in the dropdown', () => {
+  it('hides auto_decision until decisionEnabled is true', async () => {
+    const store = useAppStore();
+    store.decisionEnabled = false;
     const wrapper = mount(PermDropdown, {
       props: { visible: true, anchorEl: document.createElement('button') },
       global: { stubs: { teleport: true } },
     });
 
     expect(wrapper.findAll('.dd-dot')[0].attributes('style')).toContain('var(--green)');
+    expect(wrapper.text()).not.toContain('自动决策');
+
+    store.decisionEnabled = true;
+    await nextTick();
+
+    expect(wrapper.text()).toContain('自动决策');
     wrapper.unmount();
   });
 });

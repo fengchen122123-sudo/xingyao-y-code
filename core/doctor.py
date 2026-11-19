@@ -163,7 +163,7 @@ def check_config() -> CheckResult:
         "配置",
         STATUS_WARN,
         "；".join(issues),
-        "未知键多为拼写错误，请删除或修正；权限模式可选 confirm / accept_edits / plan / full",
+        "未知键多为拼写错误，请删除或修正；权限模式可选 confirm / accept_edits / auto_decision / plan / full",
     )
 
 

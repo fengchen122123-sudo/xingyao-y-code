@@ -10,14 +10,11 @@ from core.tool_presenter import (
 )
 from core.turn_renderer import sanitize_protocol_text
 from core.ui_markers import (
-    ANSI_CYAN,
-    ANSI_GRAY,
-    ANSI_GREEN,
-    ANSI_MAGENTA,
-    ANSI_RED,
+    ANSI_BOLD,
     ANSI_RESET,
     MARK_DONE,
     MARK_FAILED,
+    theme_ansi,
 )
 
 
@@ -32,11 +29,16 @@ def _arguments(tool_call: dict) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _styled_summary(summary: str, target: str) -> str:
+def _styled_summary(
+    summary: str,
+    target: str,
+    theme_name: str | None = None,
+) -> str:
     if not target or target not in summary:
         return summary
     before, _, after = summary.partition(target)
-    return f"{before}{ANSI_CYAN}{target}{ANSI_RESET}{after}"
+    accent_soft = theme_ansi("accent_soft", theme_name)
+    return f"{before}{accent_soft}{target}{ANSI_RESET}{after}"
 
 
 def _strip_escapes(value):
@@ -81,6 +83,7 @@ def render_session_history(
     history: list[dict],
     width: int,
     tool_verbose: bool | None = None,
+    theme_name: str | None = None,
 ) -> str:
     # 窄终端钳制：render_markdown_to_ansi 要求 width >= 20
     width = max(20, width)
@@ -94,8 +97,14 @@ def render_session_history(
         tool_verbose = True
     output: list[str] = []
     pending_tools: dict[str, tuple[str, dict]] = {}
-    # 轮次分隔线：user 消息之间用一条灰色细线隔开；首条消息前不打印
-    separator = f"{ANSI_GRAY}{'─' * min(width, 60)}{ANSI_RESET}\n"
+    accent = theme_ansi("accent", theme_name)
+    border_dim = theme_ansi("border_dim", theme_name)
+    ok_c = theme_ansi("ok", theme_name)
+    err_c = theme_ansi("err", theme_name)
+    muted = theme_ansi("text_muted", theme_name)
+    # 轮次分隔线：与实时对话一致保留左侧 2 格留白，60 列保持精确 60 格。
+    sep_width = width if width <= 60 else min(max(60, width - 4), width - 4)
+    separator = f"  {border_dim}{'─' * sep_width}{ANSI_RESET}\n"
     # 上一个输出块类型：None(尚未输出) / "user" / "assistant" / "tool"
     prev_block: str | None = None
 
@@ -114,7 +123,7 @@ def render_session_history(
             content = _sanitize_user_content(message.get("content"))
             if prev_block is not None:
                 output.append("\n" + separator + "\n")
-            output.append(f"{ANSI_CYAN}✨ You >{ANSI_RESET} {content}\n")
+            output.append(f"  {ANSI_BOLD}{accent}❯ 你{ANSI_RESET} {content}\n")
             prev_block = "user"
             continue
 
@@ -145,9 +154,9 @@ def render_session_history(
                     _agent_label = get_active_agent_name()
                 except Exception:
                     _agent_label = "星瑶"
-                output.append(f"{ANSI_MAGENTA}🤖 {_agent_label} >{ANSI_RESET}\n")
+                output.append(f"  {ANSI_BOLD}{accent}✦ {_agent_label}{ANSI_RESET}\n")
                 try:
-                    output.append(render_markdown_to_ansi(content, width))
+                    output.append(render_markdown_to_ansi(content, width, theme_name=theme_name))
                 except Exception:
                     # 单块病态 markdown 只降级为原文，不能让整个历史回放失败
                     output.append(content or "")
@@ -167,13 +176,13 @@ def render_session_history(
             if not tool_verbose:
                 continue
             summary = summarize_tool_finished(name, arguments, result, ok=ok)
-            summary = _styled_summary(summary, tool_target(name, arguments))
-            color = ANSI_GREEN if ok else ANSI_RED
+            summary = _styled_summary(summary, tool_target(name, arguments), theme_name)
+            color = ok_c if ok else err_c
             marker = MARK_DONE if ok else MARK_FAILED
             # 工具行紧跟所属的 assistant 块；若上文是其他块则先补一个空行
             if prev_block not in (None, "assistant", "tool"):
                 output.append("\n")
-            output.append(f"{color}{marker}{ANSI_RESET} {summary}\n")
+            output.append(f"  {color}{marker}{ANSI_RESET} {muted}·{ANSI_RESET} {summary}\n")
             prev_block = "tool"
 
     return "".join(output)

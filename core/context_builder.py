@@ -107,7 +107,7 @@ def _build_runtime_context_block(runtime: RuntimeContext) -> str:
         plan_instruction = (
             "计划模式约束：只允许读取信息、执行明确的只读查询和维护计划元数据；"
             "不得修改或删除工作区文件。最终回答必须输出可执行计划，并说明需要"
-            "切换到变更前确认、自动编辑或完全访问模式后再实施。\n"
+            "切换到变更前确认、自动编辑、自动决策或完全访问模式后再实施。\n"
         )
     subagent_instruction = ""
     if not runtime.subagent_enabled:

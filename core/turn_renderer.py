@@ -9,9 +9,9 @@ from core.thinking_stream import ThinkingStreamBuffer
 from core.tool_progress import ActiveToolStatus, ToolProgressAggregator
 from core.ui_markers import (
     ANSI_RESET,
-    ANSI_YELLOW,
     plan_color,
     plan_mark,
+    theme_ansi,
 )
 
 
@@ -162,6 +162,7 @@ class TurnRenderer:
                         str(data.get("file_path") or "").strip(),
                         added,
                         removed,
+                        diff_text=str(data.get("diff_text") or ""),
                     )
                 )
         elif kind == "plan_updated":
@@ -312,7 +313,8 @@ class TurnRenderer:
             _agent = get_agent_display_name()
         except Exception:
             _agent = "星瑶"
-        self._append_line(f"{ANSI_YELLOW}  ! {_agent}暂未完成当前步骤{ANSI_RESET}")
+        warn_c = theme_ansi("warn")
+        self._append_line(f"{warn_c}  ! {_agent}暂未完成当前步骤{ANSI_RESET}")
 
     def finish(self) -> str:
         if not self._finished:

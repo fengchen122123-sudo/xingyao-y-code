@@ -766,3 +766,110 @@ def test_delete_plugin_refuses_builtin(plugin_env):
     assert ok is False
     assert "内置" in msg
     assert (builtin_dir / "coreplug" / "plugin.json").is_file()
+
+
+# ── 内置插件「移除 / 恢复」（不删随包文件，名单持久化到 plugin_removed.json） ──
+
+
+@pytest.fixture(autouse=True)
+def _removed_env(tmp_path, monkeypatch):
+    """隔离移除名单持久化文件，避免用例写进真实用户目录 ~/.ycode/plugin_removed.json。"""
+    monkeypatch.setattr(plugin_loader, "_removed_file", lambda: tmp_path / "plugin_removed.json")
+
+
+def test_remove_builtin_plugin_unloads_without_deleting_files(plugin_env, monkeypatch):
+    _user_dir, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "coreplug", "coreplug", _GOOD_PLUGIN)
+    registry = ToolRegistry()
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+    assert plugin_loader.load_and_register(registry) == ["coreplug"]
+    assert not registry.execute("demo_tool", x="a").is_error
+
+    ok, msg = plugin_loader.remove_plugin("coreplug")
+
+    assert ok is True
+    assert "coreplug" in msg
+    # 内置插件随包发布：只记名单 + 热卸载，安装目录里的文件必须原样保留
+    assert (builtin_dir / "coreplug" / "plugin.json").is_file()
+    assert (builtin_dir / "coreplug" / "plugin.py").is_file()
+    # 工具立即不可用（不用重启）
+    assert registry.execute("demo_tool", x="a").is_error
+    infos = [i for i in plugin_loader.get_plugin_infos() if i["name"] == "coreplug"]
+    assert len(infos) == 1
+    assert infos[0]["status"] == "removed"
+    assert infos[0]["tools"] == []
+    assert "coreplug" in plugin_loader._load_removed()
+
+
+def test_removed_builtin_plugin_is_skipped_on_reload(plugin_env, monkeypatch):
+    _user_dir, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "coreplug", "coreplug", _GOOD_PLUGIN)
+    first = ToolRegistry()
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: first)
+    plugin_loader.load_and_register(first)
+    assert plugin_loader.remove_plugin("coreplug")[0] is True
+
+    # 模拟重启：全新 registry 再扫一次盘，已移除的内置插件不得复活
+    second = ToolRegistry()
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: second)
+    loaded = plugin_loader.load_and_register(second)
+
+    assert loaded == []
+    assert second.execute("demo_tool", x="a").is_error
+    infos = [i for i in plugin_loader.get_plugin_infos() if i["name"] == "coreplug"]
+    assert [i["status"] for i in infos] == ["removed"]
+    assert infos[0]["tools"] == []
+
+
+def test_restore_builtin_plugin_reloads_tools(plugin_env, monkeypatch):
+    _user_dir, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "coreplug", "coreplug", _GOOD_PLUGIN)
+    registry = ToolRegistry()
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+    plugin_loader.load_and_register(registry)
+    assert plugin_loader.remove_plugin("coreplug")[0] is True
+    assert registry.execute("demo_tool", x="a").is_error
+
+    ok, _msg = plugin_loader.restore_plugin("coreplug")
+
+    assert ok is True
+    result = registry.execute("demo_tool", x="back")
+    assert not result.is_error
+    assert result.content == "hello back"
+    infos = [i for i in plugin_loader.get_plugin_infos() if i["name"] == "coreplug"]
+    assert len(infos) == 1
+    assert infos[0]["status"] == "loaded"
+    assert infos[0]["tools"] == ["demo_tool"]
+    assert "coreplug" not in plugin_loader._load_removed()
+
+
+def test_toggle_enabled_refused_for_removed_builtin(plugin_env, monkeypatch):
+    _user_dir, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "coreplug", "coreplug", _GOOD_PLUGIN)
+    registry = ToolRegistry()
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+    plugin_loader.load_and_register(registry)
+    assert plugin_loader.remove_plugin("coreplug")[0] is True
+
+    ok, msg = plugin_loader.toggle_plugin("coreplug", True)
+
+    assert ok is False
+    # 实现文案：插件 X 已被移除，请先恢复再启用
+    assert "被移除" in msg and "恢复" in msg
+
+
+def test_removed_name_does_not_block_user_plugin_with_same_name(plugin_env):
+    user_dir, builtin_dir = plugin_env
+    _make_plugin(user_dir / "dup", "dup", _GOOD_PLUGIN)
+    _make_plugin(builtin_dir / "dup", "dup", _BROKEN_PLUGIN)
+    # 移除名单里有该名字，但只该压制内置那一份
+    plugin_loader._save_removed({"dup"})
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == ["dup"]
+    assert registry.execute("demo_tool", x="u").content == "hello u"
+    by_source = {i["source"]: i for i in plugin_loader.get_plugin_infos()}
+    assert by_source["user"]["status"] == "loaded"
+    assert by_source["builtin"]["status"] == "overridden"

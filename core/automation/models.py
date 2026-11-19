@@ -9,7 +9,7 @@ from core.automation.scheduling import TRIGGER_TYPES, validate_trigger
 # 无人值守权限档位（语义完全复用 core/permission_policy.py，不另造判定）；
 # plan=计划模式（只读查询与规划）与人工回合同源，升级到确认弹窗的请求
 # 依然按无人值守语义立即自动拒绝（_activate_permission_request）。
-PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
+PERMISSION_MODES = ("confirm", "accept_edits", "auto_decision", "plan", "full")
 
 # 错过触发（应用未运行）的处理策略。
 MISSED_RUN_POLICIES = ("skip", "run_once")

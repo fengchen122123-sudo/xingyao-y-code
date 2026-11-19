@@ -410,6 +410,46 @@ def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
     return orphan_names
 
 
+# ─── 内置插件"移除"：不删随包文件，只记一份用户移除名单 ────────────
+# 内置插件位于安装目录（打包态是 _MEIPASS 临时解包目录，下次启动会重新解包），
+# 物理删除既无意义也会破坏安装包完整性；因此内置插件的"删除"落地为移除名单：
+# 写进 ~/.ycode/plugin_removed.json → 扫描时跳过、插件页默认不显示、工具不注册，
+# 用户可随时恢复。用户级插件仍走 delete_plugin 的物理删除。
+
+def _removed_file() -> Path:
+    try:
+        import config
+        return Path(config.YCODE_DIR) / "plugin_removed.json"
+    except Exception:
+        return Path.home() / ".ycode" / "plugin_removed.json"
+
+
+def _load_removed() -> set[str]:
+    """读取被移除的内置插件名集合；文件缺失/损坏时视为空集合。"""
+    try:
+        with open(_removed_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        names = data.get("builtin") if isinstance(data, dict) else None
+        if isinstance(names, list):
+            return {str(n).strip() for n in names if str(n).strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _save_removed(names: set[str]) -> None:
+    path = _removed_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"builtin": sorted(names)}, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def is_builtin_removed(name: str) -> bool:
+    """内置插件是否已被用户移除（列表隐藏 + 加载时跳过）。"""
+    return str(name or "").strip() in _load_removed()
+
+
 def delete_plugin(name: str) -> tuple[bool, str]:
     """物理删除用户插件目录。内置插件在安装目录里，拒绝删除。
 
@@ -473,6 +513,111 @@ def _locate_plugin_dir(name: str) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def remove_plugin(name: str) -> tuple[bool, str]:
+    """插件页垃圾桶的统一入口：用户插件物理删除，内置插件记入移除名单。
+
+    - 用户级：与 delete_plugin 一致，直接删目录（不可恢复）；
+    - 内置：只写移除名单并热卸载工具，不碰安装目录里的文件（打包态是临时解包
+      目录，删了下次启动又回来），可随时 restore_plugin 恢复。
+    """
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    name = name.strip()
+
+    with _REFRESH_LOCK:
+        target = _locate_plugin_dir(name)
+        if target is None or not (target / "plugin.json").is_file():
+            return False, f"未找到插件 {name}"
+        if not _is_builtin_plugin(target):
+            return delete_plugin(name)
+
+        removed = _load_removed()
+        removed.add(name)
+        try:
+            _save_removed(removed)
+        except Exception as exc:
+            return False, f"写入移除记录失败: {exc}"
+
+        tools: list = []
+        for info in _PLUGIN_INFOS:
+            if info.get("name") == name and info.get("status") != "overridden":
+                tools = list(info.get("tools") or [])
+                info["status"] = "removed"
+                info["tools"] = []
+                info.pop("error", None)
+                break
+        # 立即卸载：注销工具 + 调插件 cleanup() 回收它写入的持久化数据
+        _unload_removed_plugin(name, tools, _live_registry())
+        return True, f"已移除内置插件 {name}（随包文件未删除，可随时恢复）"
+
+
+def restore_plugin(name: str) -> tuple[bool, str]:
+    """恢复被移除的内置插件：删移除记录并立即热加载，无需重启。"""
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    name = name.strip()
+
+    with _REFRESH_LOCK:
+        removed = _load_removed()
+        if name not in removed:
+            return False, f"插件 {name} 不在已移除名单里"
+        removed.discard(name)
+        try:
+            _save_removed(removed)
+        except Exception as exc:
+            return False, f"写入移除记录失败: {exc}"
+
+        # 只认内置目录那一份：同名用户插件是另一回事，恢复动作针对随包插件
+        target: Path | None = None
+        for base in plugin_dirs():
+            child = base / name
+            if (child / "plugin.json").is_file() and _is_builtin_plugin(child):
+                target = child
+                break
+        if target is None:
+            return False, f"未找到内置插件 {name} 的目录"
+        if not _check_plugin_trusted(target, name):
+            return False, f"插件 {name} 未通过信任确认，已拒绝加载"
+
+        registry = _live_registry()
+        info = next(
+            (
+                i for i in _PLUGIN_INFOS
+                if i.get("name") == name and i.get("status") == "removed"
+            ),
+            None,
+        )
+        if registry is None:
+            # 无运行时注册表：只清名单，工具等下次启动生效
+            if info is not None:
+                info["status"] = "disabled"
+            return True, f"已恢复内置插件 {name}（运行时注册表不可用，重启后加载）"
+
+        before = {s.name for s in registry.all()}
+        try:
+            loaded_name = _load_one(target, registry)
+        except SystemExit as exc:
+            # 同 load_and_register：SystemExit 只算该插件加载失败，不穿透中断调用方
+            if info is not None:
+                info["status"] = "failed"
+                info["error"] = f"SystemExit({exc.code!r})"
+            return True, f"已恢复内置插件 {name}，但热加载失败: SystemExit({exc.code!r})"
+        except Exception as exc:
+            if info is not None:
+                info["status"] = "failed"
+                info["error"] = str(exc)
+            return True, f"已恢复内置插件 {name}，但热加载失败: {exc}"
+        if not loaded_name:
+            # plugin.json 里 enabled=false：恢复"可见"，但仍保持禁用
+            if info is not None:
+                info["status"] = "disabled"
+            return True, f"已恢复内置插件 {name}（当前为禁用状态）"
+        if info is not None:
+            info["status"] = "loaded"
+            info["tools"] = sorted(s.name for s in registry.all() if s.name not in before)
+        return True, f"已恢复内置插件 {name}"
+
+
 def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
     """切换插件开关：写回 plugin.json 持久化，并热挂载/卸载运行时工具（无需重启）。
 
@@ -493,6 +638,10 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
                 break
     if target is None or not (target / "plugin.json").is_file():
         return False, f"未找到插件 {name}"
+    # 被移除的内置插件在列表里是隐藏的：写 plugin.json 的 enabled 只会得到一个
+    # "开着但没人看得见"的插件，直接引导用户先恢复
+    if enabled and _is_builtin_plugin(target) and is_builtin_removed(name):
+        return False, f"插件 {name} 已被移除，请先恢复再启用"
     meta_path = target / "plugin.json"
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -733,6 +882,7 @@ def _refresh_plugins_locked(registry=None) -> None:
         for info in _PLUGIN_INFOS
         if info.get("status") != "overridden"
     }
+    removed_names = _load_removed()
 
     # 2) 扫盘发现新插件（目录优先级与记录结构同 load_and_register）
     for idx, base in enumerate(plugin_dirs()):
@@ -765,6 +915,11 @@ def _refresh_plugins_locked(registry=None) -> None:
             }
             if plugin_name in taken_names:
                 info["status"] = "overridden"
+                _PLUGIN_INFOS.append(info)
+                continue
+            if source == "builtin" and plugin_name in removed_names:
+                # 同 load_and_register：已移除的内置插件只记录状态供恢复，不加载执行
+                info["status"] = "removed"
                 _PLUGIN_INFOS.append(info)
                 continue
             if registry is None:
@@ -817,6 +972,8 @@ def load_and_register(registry) -> list[str]:
     loaded: list[str] = []
     seen: set[str] = set()
     _PLUGIN_INFOS.clear()
+    # 用户已移除的内置插件名单（plugin_removed.json）
+    removed_names = _load_removed()
     # plugin_dirs() 约定用户目录在前：索引 0 即用户级，其余为内置
     for idx, base in enumerate(plugin_dirs()):
         source = "user" if idx == 0 else "builtin"
@@ -849,6 +1006,11 @@ def load_and_register(registry) -> list[str]:
             }
             if plugin_name in seen:
                 info["status"] = "overridden"
+                _PLUGIN_INFOS.append(info)
+                continue
+            if source == "builtin" and plugin_name in removed_names:
+                # 用户已移除的内置插件只留一条记录供插件页恢复，不执行插件代码
+                info["status"] = "removed"
                 _PLUGIN_INFOS.append(info)
                 continue
             if meta.get("enabled", True) is not False and not _check_plugin_trusted(child, plugin_name):

@@ -141,8 +141,18 @@
             placeholder="搜索插件…"
             title="按名称 / 介绍 / 工具名搜索，多个关键词用空格分隔"
           />
+          <!-- 已移除的内置插件仍在 store.plugins 里（status=removed），用一个开关切换展示 -->
+          <button
+            v-if="removedPluginCount"
+            class="seg-btn"
+            :class="{ active: showRemoved }"
+            data-test="plugins-show-removed"
+            title="查看被移除的内置插件并恢复"
+            @click="showRemoved = !showRemoved"
+          >已移除 {{ removedPluginCount }}</button>
         </div>
         <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
+        <div v-else-if="filteredPlugins.length === 0 && showRemoved" class="sub-empty">没有被移除的内置插件</div>
         <div v-else-if="filteredPlugins.length === 0" class="sub-empty">没有符合筛选条件的插件</div>
         <div v-else class="sub-list">
           <div v-for="p in filteredPlugins" :key="p.name" class="sub-row">
@@ -157,14 +167,15 @@
             </div>
             <div class="row-side">
               <button v-if="p.status === 'untrusted'" class="row-text-btn solid" title="确认插件内容后加载" @click.stop="store.trustPlugin(p.name)">信任并加载</button>
-              <label class="switch" title="启用/禁用该插件（重启后完全生效）" @click.stop>
+              <button v-if="p.status === 'removed'" class="row-text-btn solid" data-test="plugin-restore-btn" title="恢复该内置插件并立即加载" @click.stop="store.restorePlugin(p.name)">恢复</button>
+              <label v-if="p.status !== 'removed'" class="switch" title="启用/禁用该插件（重启后完全生效）" @click.stop>
                 <input type="checkbox" :checked="p.enabled" @change="store.togglePlugin(p.name, ($event.target as HTMLInputElement).checked)" />
                 <span class="switch-track"></span>
               </label>
               <button
-                v-if="p.source === 'user'"
+                v-if="p.status !== 'removed'"
                 class="row-trash"
-                title="删除该插件目录"
+                :title="p.source === 'user' ? '删除该插件目录' : '移除该内置插件（不删随包文件，可恢复）'"
                 @click.stop="onDeletePlugin(p)"
               >
                 <AppIcon name="trash" :size="15" />
@@ -330,10 +341,14 @@ const refreshingSkills = ref(false);
 type SourceFilterValue = 'all' | 'builtin' | 'user';
 const sourceFilter = ref<SourceFilterValue>('all');
 
+// 已移除的内置插件仍在插件列表里（status=removed），默认不展示；
+// 为 false 时 list 只给在用插件，避免已移除项与在用项混排。
+const showRemoved = ref(false);
+
 // 关键词搜索：技能 / MCP / 插件三页共用同一个输入框，切页时与来源筛选一起重置。
 // MCP 后端只返回服务名，故该页搜索范围仅服务名。
 const searchQuery = ref('');
-watch(() => props.subType, () => { sourceFilter.value = 'all'; searchQuery.value = ''; });
+watch(() => props.subType, () => { sourceFilter.value = 'all'; searchQuery.value = ''; showRemoved.value = false; });
 
 // 关键词按空格拆成多个词，全部命中才算匹配（忽略大小写）；只传小写后的 kw
 function hitSearch(kw: string, fields: Array<string | undefined | null>): boolean {
@@ -349,9 +364,12 @@ const filteredSkills = computed(() => {
     return hitSearch(kw, [s.name, s.id, s.short_id, s.description]);
   });
 });
+const removedPluginCount = computed(() => store.plugins.filter(p => p.status === 'removed').length);
 const filteredPlugins = computed(() => {
   const kw = searchQuery.value.trim().toLowerCase();
   return store.plugins.filter(p => {
+    // 先按“在用/已移除”分流：已移除视图只列可恢复项，常规视图隐藏它们
+    if ((p.status === 'removed') !== showRemoved.value) return false;
     if (sourceFilter.value !== 'all' && (p.source === 'user' ? 'user' : 'builtin') !== sourceFilter.value) return false;
     return hitSearch(kw, [p.name, p.description, p.tools.join(' ')]);
   });
@@ -488,6 +506,7 @@ function pluginStatusText(p: PluginInfo) {
     case 'pending_enable': return '已启用（重启后生效）';
     case 'pending_disable': return '已禁用（重启后生效）';
     case 'untrusted': return '未信任 —— 首次安装或内容已变化，需确认后加载';
+    case 'removed': return '已移除 —— 随包文件未删除，可随时恢复';
     default: return p.status || '';
   }
 }
@@ -499,11 +518,15 @@ function pluginDescText(p: PluginInfo): string {
 }
 
 async function onDeletePlugin(p: PluginInfo) {
+  // 内置插件走软移除（只记移除名单、停加载），随包文件仍在安装目录，故文案必须区分来源
+  const builtin = p.source === 'builtin';
   const ok = await store.askConfirm(
     '删除插件',
     p.name,
-    `将从磁盘删除插件「${p.name}」的目录，里面的文件会一并移除，且无法恢复。`,
-    '删除',
+    builtin
+      ? `将把内置插件「${p.name}」从插件列表移除并停止加载，随包文件不会删除，可随时恢复。`
+      : `将从磁盘删除插件「${p.name}」的目录，里面的文件会一并移除，且无法恢复。`,
+    builtin ? '移除' : '删除',
   );
   if (ok) await store.deletePlugin(p.name);
 }

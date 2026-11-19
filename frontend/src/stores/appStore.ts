@@ -615,7 +615,7 @@ export const useAppStore = defineStore('app', {
     secondaryModelId: '',
     secondaryModelRoles: { vision: true, compression: true, subagent: true } as { vision: boolean; compression: boolean; subagent: boolean },
 
-    // 权限模式（规范值：confirm | accept_edits | plan | full，展示一律经 formatPermMode）
+    // 权限模式（规范值：confirm | accept_edits | auto_decision | plan | full，展示一律经 formatPermMode）
     permissionMode: 'confirm' as PermissionMode,
 
     // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享后端配置
@@ -982,6 +982,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
     settingsSection: 'models' as 'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'pet' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer',
+    // 决策模型（JEV）总开关：未开启时权限菜单不展示「自动决策」选项
+    decisionEnabled: false,
     // JEV 决策记录实时流：decision_recorded 事件累加未读徽章；面板按 tick 拉取刷新
     decisionUnread: 0,
     decisionEventTick: 0,
@@ -2950,6 +2952,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.secondaryModelId = init.secondary_model_id || '';
         this.secondaryModelRoles = init.secondary_model_roles || { vision: true, compression: true, subagent: true };
         this.permissionMode = init.permission_mode || 'confirm';
+        this.decisionEnabled = !!(init as any).decision_enabled;
         this.sandboxEnabled = !!(init as any).allow_outside_workspace;
         if (init.system_settings) {
           this.systemSettings = init.system_settings;
@@ -3174,6 +3177,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           // 首条消息发送时随 send_user_message 带给后端补绑定
           const runtime = this._getSessionRuntime(sessionName);
           runtime.permMode = this.permissionMode;
+          if (res.decision_warning) {
+            // 不向消息流插 notice（空会话页插消息会导致页面切走），改用弹窗提示
+            this.notifyModal('自动决策（JEV）', String(res.decision_warning));
+          }
         } else {
           this.permissionMode = prev;
           this.notifyChat('权限模式调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -5798,6 +5805,18 @@ navItems: [] as Array<{ id: number; preview: string }>,
         void this._handleOpenSessionEvent(event);
         return;
       }
+      if (type === 'decision_settings_changed') {
+        this.decisionEnabled = !!data.enabled;
+        if (!this.decisionEnabled && this.permissionMode === 'auto_decision') {
+          const nextMode = (data.permission_mode as PermissionMode) || 'confirm';
+          this.permissionMode = nextMode === 'auto_decision' ? 'confirm' : nextMode;
+          if (this.currentSessionName) {
+            this._getSessionRuntime(this.currentSessionName).permMode = this.permissionMode;
+          }
+        }
+        return;
+      }
+
       // 决策记录实时推送（JEV 每次决策落审计后由桥转发）：头部「决策」按钮
       // 累加未读徽章，面板开着时按 tick 拉取刷新；独立支路，不参与会话
       // runtime 归属，处理完直接返回
@@ -6975,6 +6994,25 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('插件', '删除插件失败: ' + err);
+      }
+    },
+
+    // 恢复被移除的内置插件（内置插件不走物理删除，只写移除名单）。
+    // 与 deletePlugin 的差别：成功要弹提示——恢复会热加载插件，用户需要确认结果。
+    async restorePlugin(name: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.restore_plugin(name);
+        if (res && res.ok) {
+          this.plugins = res.plugins || this.plugins;
+          this.notifyModal('插件', res.msg || '插件已恢复');
+        } else {
+          this.notifyModal('插件', '恢复插件失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('插件', '恢复插件失败: ' + err);
       }
     },
 

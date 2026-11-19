@@ -23,10 +23,11 @@ _current_session_fallback: str = ""
 _manager_fallback: Optional[Any] = None
 _permission_mode_fallback: str = "confirm"
 
-# 规范权限模式集合：全系统只允许出现这四个值
+# 规范权限模式集合：全系统只允许出现这五个值
 # confirm=变更前确认(查询放行、变更询问) / accept_edits=自动编辑(普通变更放行、敏感变更询问)
+# auto_decision=自动决策(权限与提问交由 JEV 决策；灾难性硬拒、越界/凭据仍确认)
 # plan=计划模式(只读查询与规划) / full=完全访问(非灾难性操作由沙盒边界决定)
-CANONICAL_PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
+CANONICAL_PERMISSION_MODES = ("confirm", "accept_edits", "auto_decision", "plan", "full")
 
 # 历史遗留 / 中文标签 -> 规范值的映射表
 _PERMISSION_MODE_ALIASES = {
@@ -42,6 +43,12 @@ _PERMISSION_MODE_ALIASES = {
     "自动编辑": "accept_edits",
     "自动接受编辑": "accept_edits",
     "自动接受修改": "accept_edits",
+    "auto_decision": "auto_decision",
+    "auto-decision": "auto_decision",
+    "autodecision": "auto_decision",
+    "jev": "auto_decision",
+    "自动决策": "auto_decision",
+    "自动决策模式": "auto_decision",
     "plan": "plan",
     "planning": "plan",
     "计划模式": "plan",
@@ -72,7 +79,7 @@ def is_known_permission_mode(value: Any) -> bool:
 
 
 def normalize_permission_mode(value: Any) -> str:
-    """把任意来源的权限模式值规范化为四种标准权限模式之一。
+    """把任意来源的权限模式值规范化为五种标准权限模式之一。
 
     未知值（含已下线的历史 auto 模式）一律回落到最保守的 'confirm'，绝不放宽权限。
     """
@@ -216,7 +223,7 @@ def automation_turn_scope(run_id: Any):
 
 
 def get_permission_mode() -> str:
-    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。
+    """返回当前权限模式的规范值（confirm / accept_edits / auto_decision / plan / full）。
 
     线程级绑定优先（多会话并行时每个回合线程持有自己的会话档位），未绑定时
     回退到入口层注册的全局值；鉴权路径（core.permission_terminal）据此判定，

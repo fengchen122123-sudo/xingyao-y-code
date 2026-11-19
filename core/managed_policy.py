@@ -24,8 +24,8 @@ from core.app_context import is_known_permission_mode, normalize_permission_mode
 MANAGED_FILE_ENV = "YCODE_MANAGED_FILE"
 
 # 权限模式强度排序（越大越宽松）：上限校验 = 生效模式不得比 max 更宽松。
-# plan=只读 / confirm=变更前确认 / accept_edits=自动编辑 / full=完全访问
-_MODE_RANK = {"plan": 0, "confirm": 1, "accept_edits": 2, "full": 3}
+# plan=只读 / confirm=变更前确认 / accept_edits=自动编辑 / auto_decision=自动决策 / full=完全访问
+_MODE_RANK = {"plan": 0, "confirm": 1, "accept_edits": 2, "auto_decision": 3, "full": 4}
 
 _STATE_LOCK = threading.RLock()
 # path -> ((mtime_ns, size), data | None)；data=None 表示该文件版本解析失败，

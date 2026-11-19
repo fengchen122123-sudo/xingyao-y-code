@@ -80,6 +80,12 @@ def decide_permission(facts: PermissionFacts) -> PermissionDecision:
             )
         return PermissionDecision(PermissionAction.ALLOW, "normal_mutation_allow")
 
+    if facts.mode == "auto_decision":
+        return PermissionDecision(
+            PermissionAction.ASK,
+            "auto_decision_requires_jev",
+        )
+
     if facts.mode == "full":
         return PermissionDecision(PermissionAction.ALLOW, "full_mode_allow")
 

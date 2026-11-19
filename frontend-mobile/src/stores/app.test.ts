@@ -208,4 +208,15 @@ describe('mobile-app store：云中转整态同步与在线状态', () => {
     expect(store.connected).toBe(true);
     expect(store.currentSession).toBe('s-new');
   });
+
+  it('decision_settings_changed 同步 decisionEnabled，关闭时回退 auto_decision', () => {
+    const store = fresh();
+    store.applyInitialState({ decision_enabled: true, permission_mode: 'auto_decision' });
+    expect(store.decisionEnabled).toBe(true);
+    expect(store.permissionMode).toBe('auto_decision');
+
+    store.applyEvent('decision_settings_changed', { enabled: false, permission_mode: 'confirm' });
+    expect(store.decisionEnabled).toBe(false);
+    expect(store.permissionMode).toBe('confirm');
+  });
 });

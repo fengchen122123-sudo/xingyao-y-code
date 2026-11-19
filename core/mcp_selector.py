@@ -18,26 +18,16 @@ from prompt_toolkit.layout.processors import (
     ConditionalProcessor,
     PasswordProcessor,
 )
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import DynamicStyle
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 
 from core.mcp_client import mcp_manager
+from core.themes import build_selector_style
 
-STYLE = Style.from_dict({
-    "header":        "bold #00b4d8",
-    "footer":        "#445566",
-    "mcp.on":        "bold #00ffa3",
-    "mcp.off":       "#718096",
-    "mcp.cursor":    "bold #ffffff bg:#1a2a3a",
-    "ok":            "bold #00ffa3",
-    "warn":          "#f6c90e",
-    "err":           "#ff6b6b",
-    "input.label":   "bold #00b4d8",
-    "input.field":   "",
-})
+STYLE = build_selector_style()
 
 # 预设 MCP 模板：用户选中后按提示依次输入字段即可
 #
@@ -348,8 +338,8 @@ def open_mcp_selector(on_closed=None):
 
     def render_header():
         out = []
-        out += [_t("class:header", "  星瑶Code MCP 服务管理器\n")]
-        out += [_t("", "  -----------------------------------------\n")]
+        out += [_t("class:header", "  ✦ 星瑶Code MCP 服务管理器\n")]
+        out += [_t("class:footer", "  " + "─" * 56 + "\n")]
         out += [_t("class:footer", f"  配置文件: {mcp_manager.config_file}\n")]
         out += [_t("", "\n")]
         return out
@@ -828,7 +818,7 @@ def open_mcp_selector(on_closed=None):
     app = Application(
         layout=layout,
         key_bindings=kb,
-        style=STYLE,
+        style=DynamicStyle(build_selector_style),
         full_screen=True,
         mouse_support=False,
     )

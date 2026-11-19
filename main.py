@@ -183,7 +183,23 @@ from core.permission_broker import PermissionRequest, permission_broker
 from core.tool_progress import ActiveToolStatus
 from core.turn_controller import TurnController
 from core.turn_renderer import TurnRenderer
-from core.ui_markers import ANSI_GRAY, ANSI_RESET, plan_color, plan_html_color, plan_mark
+from core.themes import THEME_DESCS as _THEME_DESCS, get_theme as _get_theme
+from core.ui_markers import (
+    ANSI_BOLD,
+    ANSI_GRAY,
+    ANSI_RESET,
+    diff_stat_bar,
+    html_escape,
+    pad_left,
+    pad_right,
+    plan_color,
+    plan_html_color,
+    plan_mark,
+    progress_bar,
+    term_display_width,
+    theme_ansi,
+    truncate_display,
+)
 from core.plan import bind_default_plan_session, get_default_plan_manager
 from core.model_manager import get_active_model
 from core.version import __version__ as YCODE_VERSION
@@ -228,9 +244,14 @@ except Exception:  # 启动扫描失败不阻断主流程；下次启动重试
 #   4. 后台线程绝不直接调用 print_formatted_text / app_instance.invalidate()。
 # ---------------------------------------------------------------------------
 current_theme = config.MY_THEME
-# 权限模式统一走 app_context 规范化，全系统只允许四种已定义模式
+# 权限模式统一走 app_context 规范化，全系统只允许已定义模式
 import core.app_context as _app_ctx
 current_permission_mode = _app_ctx.normalize_permission_mode(config.MY_PERMISSION_MODE)
+if current_permission_mode == "auto_decision":
+    from core.permission_auto_decision import is_decision_model_enabled as _jev_enabled_at_boot
+
+    if not _jev_enabled_at_boot():
+        current_permission_mode = "confirm"
 show_memory_summary = False
 confirm_prompt = None
 
@@ -293,6 +314,8 @@ _turn_separator_needed = False
 pending_action = None   # 待处理的主线程操作：目前可能的值有 "open_models" / "open_skills" / "open_sessions"
 # 计划项状态提示去重：避免同一个计划项反复失败/重试时刷屏
 _last_printed_plan_state: dict[str, str] = {}
+# 每回合起始时间戳（仅 UI 线程读写，供回合结束尾签显示耗时）
+_turn_started_at: dict[str, float] = {}
 
 # ---------------------------------------------------------------------------
 # 注册 CLI 运行时上下文（让 core/llm.py 通过 app_context 访问，而非直接 import main）
@@ -341,6 +364,10 @@ class _CLIContext:
         return manager
 
     @property
+    def current_theme(self) -> str:
+        return current_theme
+
+    @property
     def permission_callback(self):
         return None  # CLI 使用 prompt_toolkit broker，不需要 GUI 回调
 
@@ -363,25 +390,16 @@ def _sync_active_model_context():
 _sync_active_model_context()
 
 
-# 主题配色展示元数据（/theme list 与无参数帮助共用）
-THEME_DESCS = {
-    "cyan": ("极光青", "#00b4d8"),
-    "matrix": ("骇客绿", "#39ff14"),
-    "nord": ("北欧蓝", "#88c0d0"),
-    "cyberpunk": ("赛博粉", "#ff007f"),
-    "dracula": ("德古拉紫", "#bd93f9"),
-    "lava": ("熔岩红", "#ff5555"),
-    "sunset": ("落日橙", "#ff9f43"),
-    "amber": ("琥珀黄", "#f1fa8c"),
-    "white": ("象牙白", "#ffffff"),
-}
+# 主题配色展示元数据（单一事实来源在 core.themes，/theme list 与无参数帮助共用）
+THEME_DESCS = _THEME_DESCS
 
 # /permission 帮助文本（list 子命令与无参数帮助共用）
 PERMISSION_HELP_LINES = (
-    "  - <b>confirm</b>      : 变更前确认 (查询自动放行；任何变更都需要确认)",
-    "  - <b>accept_edits</b> : 自动编辑 (普通编辑和构建自动放行；删除、提交、推送等敏感操作需要确认)",
-    "  - <b>plan</b>         : 计划模式 (允许读取、查询和制定计划；禁止修改或删除任务文件)",
-    "  - <b>full</b>         : 完全访问 (沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制)",
+    "  - <b>confirm</b>       : 变更前确认 (查询自动放行；任何变更都需要确认)",
+    "  - <b>accept_edits</b>  : 自动编辑 (普通编辑和构建自动放行；删除、提交、推送等敏感操作需要确认)",
+    "  - <b>auto_decision</b> : 自动决策 (权限与提问交由 JEV 决策；灾难性硬拒，越界/凭据仍确认)",
+    "  - <b>plan</b>          : 计划模式 (允许读取、查询和制定计划；禁止修改或删除任务文件)",
+    "  - <b>full</b>          : 完全访问 (沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制)",
 )
 
 # @文件补全的工作目录清单缓存（TTL 秒内重复按键不再重新 os.walk）
@@ -398,28 +416,22 @@ MEMORY_COMPRESS_THRESHOLD = 0.70
 
 def _esc(text) -> str:
     """转义一切插入 prompt_toolkit HTML(...) 的外部/用户内容，防止标签解析错乱。"""
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return html_escape(text)
 
 
-def _term_display_width(text):
+def _term_display_width(text, *, strip_html: bool = False):
     """按终端显示宽度计算字符串宽度（中文等 East Asian 宽字符算 2 格）。"""
-    import unicodedata
-    return sum(
-        2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-        for ch in str(text)
-    )
+    return term_display_width(text, strip_html=strip_html)
 
 
-def _pad_right(text, width):
+def _pad_right(text, width, *, strip_html: bool = False):
     """按终端显示宽度左对齐补齐到 width 格。"""
-    text = str(text)
-    return text + " " * max(0, width - _term_display_width(text))
+    return pad_right(text, width, strip_html=strip_html)
 
 
 def _pad_left(text, width):
     """按终端显示宽度右对齐补齐到 width 格。"""
-    text = str(text)
-    return " " * max(0, width - _term_display_width(text)) + text
+    return pad_left(text, width)
 
 
 def _truncate_visible(text, width, ellipsis="…"):
@@ -430,31 +442,7 @@ def _truncate_visible(text, width, ellipsis="…"):
     渠道域名尾部与 `[scope]` 标记切掉——这两段正是用来区分车道的部分，
     因此按显示宽度保留首尾、中间用省略号收尾。
     """
-    text = str(text)
-    if width <= 0:
-        return ""
-    if _term_display_width(text) <= width:
-        return text
-    ellipsis_width = _term_display_width(ellipsis)
-    if ellipsis_width >= width:
-        return ellipsis[:width]
-    budget = width - ellipsis_width
-    head_budget = (budget + 1) // 2
-
-    def _take(chars, limit):
-        taken = []
-        used = 0
-        for char in chars:
-            char_width = _term_display_width(char)
-            if used + char_width > limit:
-                break
-            taken.append(char)
-            used += char_width
-        return "".join(taken), used
-
-    head, head_used = _take(text, head_budget)
-    tail, _ = _take(reversed(text), budget - head_used)
-    return head + ellipsis + "".join(reversed(tail))
+    return truncate_display(text, width, ellipsis=ellipsis)
 
 
 def _parse_usage_date_args(args):
@@ -484,11 +472,12 @@ def _parse_usage_date_args(args):
 
 def _render_usage_section(manager, label, start_s, end_s):
     """打印一个日期区间的按模型 token 用量统计段，返回该段是否有数据。"""
+    t = _get_theme(current_theme)
     title = f"{label} ({start_s})" if start_s == end_s else f"{label} ({start_s} ~ {end_s})"
-    print_formatted_text(HTML(f"<b><ansiyellow>{_esc(title)}</ansiyellow></b>"))
+    print_formatted_text(HTML(f"  <style fg='{t['accent']}'><b>▸ {_esc(title)}</b></style>"))
     rows = manager.query_token_usage_by_model(start_s, end_s)
     if not rows:
-        print_formatted_text(HTML("  <ansigray>暂无记录</ansigray>"))
+        print_formatted_text(HTML(f"    <style fg='{t['text_muted']}'>暂无记录</style>"))
         return False
     # 展开 api_base 与 scope：同名模型的不同渠道/保活分行显示，main 不再被合并
     display_rows = [
@@ -500,7 +489,7 @@ def _render_usage_section(manager, label, start_s, end_s):
         min(60, max(_term_display_width(name) for _, name in display_rows) + 2),
     )
     _header = (
-        "  " + _pad_right("模型", name_w)
+        "    " + _pad_right("模型", name_w)
         + " " + _pad_left("输入", 14)
         + " " + _pad_left("输出", 14)
         + " " + _pad_left("缓存输入", 14)
@@ -508,7 +497,7 @@ def _render_usage_section(manager, label, start_s, end_s):
         + " " + _pad_left("命中率", 10)
         + " " + _pad_left("合计", 14)
     )
-    print_formatted_text(HTML(f"<ansigray>{_header}</ansigray>"))
+    print_formatted_text(HTML(f"<style fg='{t['text_muted']}'>{_header}</style>"))
     for r, route_label in display_rows:
         _cache_prompt = int(r.get("cache_prompt", 0) or 0)
         _rate = _format_cache_hit_rate(r["cached"], _cache_prompt)
@@ -516,7 +505,7 @@ def _render_usage_section(manager, label, start_s, end_s):
         # 再补齐，最后才转义（转义会插入 &amp; 等实体，先转义会让宽度测量失真）。
         _name_cell = _esc(_pad_right(_truncate_visible(route_label, name_w), name_w))
         print_formatted_text(HTML(
-            f"  {_name_cell} {r['prompt']:>14} "
+            f"    {_name_cell} {r['prompt']:>14} "
             f"{r['completion']:>14} {_cache_prompt:>14} {r['cached']:>14} "
             f"{_rate:>10} {r['total']:>14}"
         ))
@@ -528,9 +517,9 @@ def _render_usage_section(manager, label, start_s, end_s):
         # endpoint/scope 的缓存身份彼此独立，跨路由百分比没有诊断意义。
         _sub_rate = "--"
         print_formatted_text(HTML(
-            f"  <ansicyan>{_pad_right('小计', name_w)} {sub['prompt']:>14} "
+            f"    <style fg='{t['accent_soft']}'>{_pad_right('小计', name_w)} {sub['prompt']:>14} "
             f"{sub['completion']:>14} {sub['cache_prompt']:>14} {sub['cached']:>14} "
-            f"{_sub_rate:>10} {sub['total']:>14}</ansicyan>"
+            f"{_sub_rate:>10} {sub['total']:>14}</style>"
         ))
     from core.cache_keepalive import load_keepalive_interval
     idle_seconds = int(load_keepalive_interval() or 120)
@@ -540,7 +529,7 @@ def _render_usage_section(manager, label, start_s, end_s):
     diagnostic_text = _format_cache_diagnostic_summary(diagnostic)
     if diagnostic_text:
         print_formatted_text(HTML(
-            f"  <ansigray>{_esc(diagnostic_text)}</ansigray>"
+            f"    <style fg='{t['text_muted']}'>{_esc(diagnostic_text)}</style>"
         ))
     return True
 
@@ -762,17 +751,17 @@ def _on_background_subagent_terminal(task_id: str, status: str, description: str
     用 _bg_summary_triggered 集合避免对同一批任务重复触发。
     """
     def _print_notification():
-        # 状态对应的图标和颜色
+        t = _get_theme(current_theme)
         icon_color = {
-            "completed": "ansigreen",
-            "failed": "ansired",
-            "timed_out": "ansired",
-            "cancelled": "ansigray",
-        }.get(status, "ansiyellow")
+            "completed": t["ok"],
+            "failed": t["err"],
+            "timed_out": t["err"],
+            "cancelled": t["text_muted"],
+        }.get(status, t["warn"])
         icon = {
             "completed": "✓",
             "failed": "✗",
-            "timed_out": "⏰",
+            "timed_out": "◷",
             "cancelled": "⊘",
         }.get(status, "•")
         status_label = {
@@ -786,28 +775,34 @@ def _on_background_subagent_terminal(task_id: str, status: str, description: str
         desc_short = (description or "")[:40]
         # 摘要截断到 150 字符
         summary_short = (summary or "")[:150]
-        # HTML 转义
-        import html as _html
-        desc_safe = _html.escape(desc_short)
-        summary_safe = _html.escape(summary_short)
-        tid_safe = _html.escape(task_id)
+        desc_safe = _esc(desc_short)
+        summary_safe = _esc(summary_short)
+        tid_safe = _esc(task_id)
 
         try:
-            print_formatted_text(HTML(""))
-            print_formatted_text(HTML(
-                f"<ansicyan>🔔 后台子代理{status_label}：</ansicyan>"
-                f"<ansigray>{desc_safe}</ansigray> "
-                f"(<{icon_color}>{icon}</{icon_color}> "
-                f"id=<ansicyan>{tid_safe}</ansicyan>)"
-            ))
+            lines = [
+                "",
+                (
+                    f"  <style fg='{t['accent']}'><b>◈ 后台子代理{status_label}</b></style> "
+                    f"<style fg='{t['text']}'>{desc_safe}</style> "
+                    f"<style fg='{t['text_muted']}'>(</style>"
+                    f"<style fg='{icon_color}'>{icon}</style>"
+                    f"<style fg='{t['text_muted']}'> · id=</style>"
+                    f"<style fg='{t['accent_soft']}'>{tid_safe}</style>"
+                    f"<style fg='{t['text_muted']}'>)</style>"
+                ),
+            ]
             if summary_short:
-                print_formatted_text(HTML(
-                    f"   <ansigray>详情：{summary_safe}</ansigray>"
-                ))
-            print_formatted_text(HTML(
-                f"   <ansigray>输入 /tasks tail {tid_safe} 查看完整结果</ansigray>"
-            ))
-            print_formatted_text(HTML(""))
+                lines.append(
+                    f"    <style fg='{t['text_muted']}'>├─</style> "
+                    f"<style fg='{t['text_soft']}'>{summary_safe}</style>"
+                )
+            lines.append(
+                f"    <style fg='{t['text_muted']}'>└─ 查看完整结果:</style> "
+                f"<style fg='{t['accent_soft']}'>/tasks tail {tid_safe}</style>"
+            )
+            lines.append("")
+            _print_ui_html("\n".join(lines))
         except Exception:
             # 通知打印失败不能影响主流程
             pass
@@ -886,12 +881,49 @@ def _undo_turn_impact_for_card(args: dict) -> dict:
         return {"available": False, "message": str(exc)}
 
 
+def _confirm_card_meta(prompt: dict | None) -> tuple[str, str]:
+    """根据待确认请求的风险级别返回 (边框样式类名, 卡片标题)。"""
+    if not prompt:
+        return ("class:frame.warn", "确认操作")
+    func = str(prompt.get("function_name", "") or "")
+    args = prompt.get("arguments") or {}
+    if func == "ask_user":
+        return ("class:frame", "✦ 需要你的选择")
+    if func == "sandbox_outside_access":
+        return ("class:frame.warn", "⚑ 越界访问确认")
+    if func == "undo_turn":
+        return ("class:frame.warn", "↩ 撤销回合确认")
+    if func == "execute_command":
+        try:
+            from core.command_policy import classify_command_risk
+            from core.permission_policy import PermissionRisk
+
+            risk = classify_command_risk(str(args.get("command", "") or ""))
+            if risk in (PermissionRisk.SENSITIVE_MUTATION, PermissionRisk.CATASTROPHIC):
+                return ("class:frame.err", "⚠ 敏感命令确认")
+        except Exception:
+            pass
+        return ("class:frame.warn", "⚡ 执行命令确认")
+    if func in ("write_file", "edit_file"):
+        return ("class:frame.warn", "✎ 文件变更确认")
+    return ("class:frame.warn", "◈ 工具调用确认")
+
+
 def _confirm_prompt_text(prompt: dict | None) -> str:
     if not prompt:
         return ""
+    t = _get_theme(current_theme)
     func = prompt["function_name"]
     args = prompt["arguments"]
-    text = _permission_source_line(prompt)
+    source_line = _permission_source_line(prompt)
+    text = (
+        f"<style fg='{t['text_muted']}'>{source_line.rstrip()}</style>\n"
+        if source_line
+        else ""
+    )
+    frame_cls, _ = _confirm_card_meta(prompt)
+    lead_color = t["err"] if frame_cls == "class:frame.err" else t["warn"]
+
     if func == "execute_command":
         cmd = args.get("command", "")
         cmd_lines = cmd.splitlines()
@@ -901,11 +933,20 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
             cmd_display = cmd
         if len(cmd_display) > 250:
             cmd_display = cmd_display[:247] + "..."
-        text += f"💻  {_agent_name()}申请执行命令: {_esc(cmd_display)}\n"
+        text += (
+            f"<style fg='{lead_color}'>❯</style>  "
+            f"<style fg='{t['text']}'>{_esc(_agent_name())}申请执行命令: {_esc(cmd_display)}</style>\n"
+        )
     elif func == "write_file":
-        text += f"✍️  {_agent_name()}申请写入文件: {_esc(args.get('file_path', ''))}\n"
+        text += (
+            f"<style fg='{t['warn']}'>✎</style>  "
+            f"<style fg='{t['text']}'>{_esc(_agent_name())}申请写入文件: {_esc(args.get('file_path', ''))}</style>\n"
+        )
     elif func == "edit_file":
-        text += f"📝  {_agent_name()}申请修改文件: {_esc(args.get('file_path', ''))}\n"
+        text += (
+            f"<style fg='{t['warn']}'>✎</style>  "
+            f"<style fg='{t['text']}'>{_esc(_agent_name())}申请修改文件: {_esc(args.get('file_path', ''))}</style>\n"
+        )
     elif func == "ask_user":
         q = str(args.get("question", ""))
         q_lines = q.splitlines()
@@ -915,54 +956,80 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
             q_display = q
         if len(q_display) > 200:
             q_display = q_display[:197] + "..."
-        text += f"❓  {_agent_name()}需要你的选择: {_esc(q_display)}\n"
+        text += (
+            f"<style fg='{t['accent']}'>?</style>  "
+            f"<style fg='{t['text']}'>{_esc(_agent_name())}需要你的选择: {_esc(q_display)}</style>\n"
+        )
     elif func == "sandbox_outside_access":
-        text += f"🛡  {_agent_name()}申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
-        text += "    （沙盒模式下默认仅限工作目录内；可选择在本任务内放行，或用 /sandbox on 长期开放）\n"
+        text += (
+            f"<style fg='{t['warn']}'>⚑</style>  "
+            f"<style fg='{t['text']}'>{_esc(_agent_name())}申请访问工作目录之外的路径: {_esc(args.get('path', ''))}</style>\n"
+        )
+        text += (
+            f"<style fg='{t['text_muted']}'>    （沙盒模式下默认仅限工作目录内；"
+            "可选择在本任务内放行，或用 /sandbox on 长期开放）</style>\n"
+        )
     elif func == "undo_turn":
         # 按回合撤销权限卡：预检影响摘要 + 未覆盖副作用 + 后续回合语义依赖警告
-        text += f"↩️  {_agent_name()}申请撤销一整轮的文件修改: {_esc(str(args.get('turn_id') or '最近可撤销回合'))}\n"
+        text += (
+            f"<style fg='{t['warn']}'>↩</style>  "
+            f"<style fg='{t['text']}'>{_esc(_agent_name())}申请撤销一整轮的文件修改: "
+            f"{_esc(str(args.get('turn_id') or '最近可撤销回合'))}</style>\n"
+        )
         impact = _undo_turn_impact_for_card(args)
         if impact.get("available"):
             lines = [
-                f"    回合 {_esc(impact['short_id'])}：共 {impact['file_count']} 个文件 — "
+                f"<style fg='{t['text']}'>    回合 {_esc(impact['short_id'])}：共 {impact['file_count']} 个文件 — "
                 f"恢复原内容 {impact['restore_content_count']}，"
                 f"删除本轮新建 {impact['delete_created_count']}，"
-                f"恢复本轮删除 {impact['restore_deleted_count']}",
+                f"恢复本轮删除 {impact['restore_deleted_count']}</style>",
             ]
             if impact.get("created_files"):
-                lines.append(f"    将删除的新建文件: {_esc('、'.join(impact['created_files']))}")
-            lines.append("    聊天历史保留，星瑶将记住文件结果已失效。")
+                lines.append(
+                    f"<style fg='{t['text_muted']}'>    将删除的新建文件: {_esc('、'.join(impact['created_files']))}</style>"
+                )
+            lines.append(
+                f"<style fg='{t['text_muted']}'>    聊天历史保留，星瑶将记住文件结果已失效。</style>"
+            )
             if impact.get("has_uncovered_command_effects"):
-                lines.append("    ⚠️ 本轮执行过通用命令：仅恢复受控文件，命令的其他副作用不撤销。")
+                lines.append(
+                    f"<style fg='{t['warn']}'>    ! 本轮执行过通用命令：仅恢复受控文件，命令的其他副作用不撤销。</style>"
+                )
             if impact.get("subsequent_completed_turns", 0) > 0:
                 lines.append(
-                    f"    ⚠️ 目标回合之后还有 {impact['subsequent_completed_turns']} 个已完成回合，"
-                    "可能存在语义依赖，撤销后请重新检查或测试。"
+                    f"<style fg='{t['warn']}'>    ! 目标回合之后还有 {impact['subsequent_completed_turns']} 个已完成回合，"
+                    "可能存在语义依赖，撤销后请重新检查或测试。</style>"
                 )
             if impact.get("conflicts"):
-                lines.append("    ⚠️ 预检发现冲突文件，批准后将拒绝整轮撤销、零文件写入。")
+                lines.append(
+                    f"<style fg='{t['err']}'>    ! 预检发现冲突文件，批准后将拒绝整轮撤销、零文件写入。</style>"
+                )
             text += "\n".join(lines) + "\n"
         else:
             msg = impact.get("message") or "预检不可用"
-            text += f"    ⚠️ 预检未通过：{_esc(msg)}（批准后执行会拒绝写入）\n"
+            text += f"<style fg='{t['warn']}'>    ! 预检未通过：{_esc(msg)}（批准后执行会拒绝写入）</style>\n"
     else:
         # 默认分支：其余工具（含 MCP 工具）展示函数名与参数摘要，不再显示空白
         summary = ", ".join(
             f"{key}={str(value)[:80]}" for key, value in list(args.items())[:3]
         )
-        text += f"🔧  {_agent_name()}申请调用工具: {_esc(func)}({_esc(summary)})\n"
+        text += (
+            f"<style fg='{t['accent']}'>◈</style>  "
+            f"<style fg='{t['text']}'>{_esc(_agent_name())}申请调用工具: {_esc(func)}({_esc(summary)})</style>\n"
+        )
 
     if func == "ask_user":
-        text += "👉 请选择确认操作（↑/↓ 选择后 Enter；或直接输入内容后 Enter 自定义回答）:\n"
+        text += (
+            f"<style fg='{t['text_muted']}'>› 请选择确认操作（↑/↓ 选择后 Enter；或直接输入内容后 Enter 自定义回答）:</style>\n"
+        )
     else:
-        text += "👉 请选择确认操作:\n"
+        text += f"<style fg='{t['text_muted']}'>› 请选择确认操作:</style>\n"
     for idx, option in enumerate(prompt["options"]):
         prefix = "  > " if idx == prompt["current_idx"] else "    "
         if idx == prompt["current_idx"]:
-            text += f"<ansigreen><b>{prefix}{_esc(option)}</b></ansigreen>\n"
+            text += f"<style bg='{t['accent_bg']}' fg='{t['accent']}'><b>{prefix}{_esc(option)}</b></style>\n"
         else:
-            text += f"{prefix}{_esc(option)}\n"
+            text += f"<style fg='{t['text_muted']}'>{prefix}{_esc(option)}</style>\n"
     return text
 
 
@@ -1020,7 +1087,13 @@ def _clear_active_thinking() -> None:
 
 def _thinking_panel_text() -> str:
     """Return transient reasoning text for the live CLI panel only."""
-    return active_thinking_text or "正在分析..."
+    raw = str(active_thinking_text or "").strip()
+    if not raw:
+        return "正在分析..."
+    lines = raw.splitlines()
+    if len(lines) > 10:
+        return f"… (已省略前 {len(lines) - 10} 行)\n" + "\n".join(lines[-10:])
+    return "\n".join(lines)
 
 
 def _reset_turn_state():
@@ -1161,7 +1234,7 @@ COMMAND_COMPLETIONS = [
     ("/hooks import", "从 ZCode 配置导入 hook (预览确认后写入,rollback 撤销)"),
     ("/skills", "技能管理 (list/refresh/enable/disable 或开选择器)"),
     ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
-    ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
+    ("/permission", "切换安全权限级别 (confirm/accept_edits/auto_decision/plan/full)"),
     ("/turns", "设置单任务最大模型轮次 (10-1000)"),
     ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
     ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
@@ -1357,9 +1430,34 @@ def _format_plan_items(items):
 def _format_live_plan_items(items):
     """Return a compact colored snapshot for the execution-only plan panel."""
     visible = [item for item in items if str(item.get("subject", "")).strip()]
+    total = len(visible)
     completed = sum(item.get("status") == "completed" for item in visible)
-    lines = [f"  进度 {completed}/{len(visible)}"]
-    for item in visible[:8]:
+    pct = int(completed * 100 / total) if total else 0
+    bar = progress_bar(completed, total, width=10, theme_name=current_theme)
+    muted = theme_ansi("text_soft", current_theme)
+    dim = theme_ansi("text_muted", current_theme)
+    text_bright = theme_ansi("text", current_theme)
+    warn = theme_ansi("warn", current_theme)
+    accent_soft = theme_ansi("accent_soft", current_theme)
+
+    lines = [
+        f"  {muted}进度 {completed}/{total}{ANSI_RESET}  {bar}  {dim}{pct}%{ANSI_RESET}"
+    ]
+
+    if total <= 8:
+        shown_indices = list(range(total))
+    else:
+        # 优先围绕进行中项保留上下文，避免活跃项被截断在 8 项之外
+        active_idxs = [i for i, it in enumerate(visible) if it.get("status") == "in_progress"]
+        anchor = active_idxs[0] if active_idxs else max(0, completed - 1)
+        start = max(0, anchor - 2)
+        end = min(total, start + 8)
+        if end - start < 8:
+            start = max(0, end - 8)
+        shown_indices = list(range(start, end))
+
+    for idx in shown_indices:
+        item = visible[idx]
         status = item.get("status")
         color = plan_color(status)
         marker = plan_mark(status)
@@ -1367,9 +1465,36 @@ def _format_live_plan_items(items):
         stage = str(item.get("stage", "")).strip()
         stage_label = {"plan": "计划", "build": "构建", "review": "审查"}.get(stage, "")
         suffix = f" [{stage_label}]" if stage_label else ""
-        lines.append(f"  {color}{marker}{ANSI_RESET} {subject}{suffix}")
-    if len(visible) > 8:
-        lines.append(f"  ... 还有 {len(visible) - 8} 项")
+        if status == "in_progress":
+            subj_color = text_bright
+        elif status == "completed":
+            subj_color = dim
+        else:
+            subj_color = muted
+
+        meta_parts = []
+        exec_mode = str(item.get("execution_mode", "") or "").strip()
+        takeover_state = str(item.get("takeover_status", "") or "").strip()
+        if exec_mode == "takeover":
+            if status == "in_progress":
+                meta_parts.append(f"{warn}⚡ 接管中{ANSI_RESET}")
+            elif takeover_state == "queued":
+                meta_parts.append(f"{warn}⏳ 接管排队{ANSI_RESET}")
+        elif exec_mode == "subagent" and status == "in_progress":
+            meta_parts.append(f"{accent_soft}→ 子代理{ANSI_RESET}")
+        blocked_by = item.get("blocked_by")
+        if blocked_by and status != "completed":
+            refs = ", ".join(f"#{b}" for b in list(blocked_by)[:2])
+            meta_parts.append(f"{dim}等待 {refs}{ANSI_RESET}")
+        meta_suffix = f"  {' · '.join(meta_parts)}" if meta_parts else ""
+        lines.append(
+            f"  {color}{marker}{ANSI_RESET} {subj_color}{subject}{suffix}{ANSI_RESET}{meta_suffix}"
+        )
+
+    if total > len(shown_indices):
+        lines.append(
+            f"  {dim}… 共 {total} 项（已折叠 {total - len(shown_indices)} 项）{ANSI_RESET}"
+        )
     return "\n".join(lines)
 
 
@@ -1439,14 +1564,31 @@ def _print_ui_fragment(fragment):
             write_fragment()
 
 
+def _print_ui_html(html_text: str) -> None:
+    """运行中走 run_in_terminal 排队打印 HTML，防止与 _print_ui_fragment 乱序。"""
+    def _write():
+        print_formatted_text(HTML(html_text), flush=True)
+
+    app = app_instance
+    if (
+        app is not None
+        and app.loop is not None
+        and getattr(app, "_is_running", False)
+    ):
+        run_in_terminal(_write)
+    else:
+        print_formatted_text(HTML(html_text))
+
+
 def _terminal_width():
     return max(20, shutil.get_terminal_size((100, 24)).columns)
 
 
 def _print_turn_separator() -> None:
-    """在两轮对话之间打印一条灰色细分隔线（前后各留一个空行）。"""
-    line = "─" * min(_terminal_width(), 60)
-    _print_ui_fragment(f"\n{ANSI_GRAY}{line}{ANSI_RESET}\n")
+    """在两轮对话之间打印一条细分隔线（前后各留一个空行，左侧留白 2 格）。"""
+    border = theme_ansi("border", current_theme)
+    line = "─" * min(max(16, _terminal_width() - 4), 60)
+    _print_ui_fragment(f"\n  {border}{line}{ANSI_RESET}\n")
 
 
 def _echo_user_input(html_text: str) -> None:
@@ -1455,7 +1597,21 @@ def _echo_user_input(html_text: str) -> None:
     if _turn_separator_needed:
         _print_turn_separator()
     _turn_separator_needed = True
-    print_formatted_text(HTML(html_text))
+    _print_ui_html(html_text)
+
+
+def _echo_user_message(
+    raw_text: str, *, queued: bool = False, prefix_tag: str = ""
+) -> None:
+    """按当前主题统一回显用户输入，避免多处重复拼装 HTML。"""
+    t = _get_theme(current_theme)
+    safe = _esc(raw_text)
+    tag = f"{_esc(prefix_tag)} " if prefix_tag else ""
+    if queued:
+        body = f"<style fg='{t['text_muted']}'>(排队等待中...) {tag}{safe}</style>"
+    else:
+        body = f"<style fg='{t['text']}'>{tag}{safe}</style>"
+    _echo_user_input(f"  <style fg='{t['accent']}'><b>❯ 你</b></style> {body}")
 
 
 def _render_public_answer_block(turn_id: str, text: str) -> None:
@@ -1466,10 +1622,21 @@ def _render_public_answer_block(turn_id: str, text: str) -> None:
     # 第一个事件（可能只是一次工具调用）到来时就打印。同一回合只打印一次。
     if not _answer_header_printed.get(turn_id):
         _answer_header_printed[turn_id] = True
-        print_formatted_text(HTML(f"\n<b><magenta>🤖 {_agent_name()} &gt;</magenta></b> "))
+        t = _get_theme(current_theme)
+        model_label = str(current_model_name or "").strip()
+        model_suffix = (
+            f" <style fg='{t['text_muted']}'>· {_esc(model_label)}</style>"
+            if model_label and model_label != "未激活模型"
+            else ""
+        )
+        _print_ui_html(
+            f"\n  <style fg='{t['accent']}'><b>✦ {_esc(_agent_name())}</b></style>{model_suffix}"
+        )
     try:
         from core.terminal_markdown import MarkdownRenderError, render_markdown_to_ansi
-        rendered = render_markdown_to_ansi(block, _terminal_width())
+        rendered = render_markdown_to_ansi(
+            block, _terminal_width(), theme_name=current_theme
+        )
     except MarkdownRenderError:
         rendered = block
     _print_ui_fragment(rendered)
@@ -1488,9 +1655,9 @@ def _maybe_export_mermaid_block(block: str) -> None:
         export_result = export_diagram_html(block)
     except Exception as export_error:
         # 导出失败必须可见：静默吞掉会让"没有提示"变得无法诊断
-        print_formatted_text(HTML(
-            f"<ansigray>⚠️ Mermaid 图表导出失败: {_esc(str(export_error))}</ansigray>"
-        ))
+        _print_ui_html(
+            f"  <style fg='{_get_theme(current_theme)['text_muted']}'>! Mermaid 图表导出失败: {_esc(str(export_error))}</style>"
+        )
         return
     if export_result is None:
         return
@@ -1510,10 +1677,10 @@ def _maybe_export_mermaid_block(block: str) -> None:
         )
     else:
         notice = (
-            f"ℹ️ 检测到 {diagram_count} 张 Mermaid 图，已生成网页: {diagram_path.name}"
+            f"ℹ 检测到 {diagram_count} 张 Mermaid 图，已生成网页: {diagram_path.name}"
             " —— 输入 /diagram open 在浏览器查看"
         )
-    print_formatted_text(HTML(f"<ansigray>{_esc(notice)}</ansigray>"))
+    _print_ui_html(f"  <style fg='{_get_theme(current_theme)['text_muted']}'>{_esc(notice)}</style>")
 
 
 def _find_paragraph_boundary(buffer: str) -> int:
@@ -1576,7 +1743,8 @@ def _render_ui_event(event):
         # 数据库记录不受此影响，event 仍带完整 summary 入库。
         renderer = TurnRenderer()
         ui_renderers[event.turn_id] = renderer
-        # "🤖 星瑶 >" 头部不在这里打印：改到 _render_public_answer_block 里，
+        _turn_started_at.setdefault(event.turn_id, time.time())
+        # "✦ 星瑶" 头部不在这里打印：改到 _render_public_answer_block 里，
         # 在本回合第一个 Markdown 正文块真正要渲染之前才打印（见该函数注释）。
 
     if event.kind == "status":
@@ -1591,7 +1759,10 @@ def _render_ui_event(event):
                 _active_tool_status = None
         message = str(event.payload.get("message", ""))
         if message:
-            print_formatted_text(HTML(f"\n<ansigray>{_esc(message)}</ansigray>"))
+            t = _get_theme(current_theme)
+            _print_ui_html(
+                f"\n  <style fg='{t['text_muted']}'>{_esc(message)}</style>"
+            )
         return
 
     if event.kind == "step_metrics":
@@ -1647,12 +1818,16 @@ def _render_ui_event(event):
                 f"{subject} 等待主 Agent 接管（队列第 {queue_position} 项）"
                 if subject else f"等待主 Agent 接管（队列第 {queue_position} 项）"
             )
+            tag = "⏳ 接管排队"
         else:
             line = (
                 f"{subject} 子 Agent 已超时，主 Agent 正在接管并核查现场"
                 if subject else "子 Agent 已超时，主 Agent 正在接管并核查现场"
             )
-        _print_ui_fragment(f"\n⏵ {line}\n")
+            tag = "⚡ 接管切换"
+        warn = theme_ansi("warn", current_theme)
+        muted = theme_ansi("text_muted", current_theme)
+        _print_ui_fragment(f"\n{warn}{tag}{ANSI_RESET} {muted}{line}{ANSI_RESET}\n")
         if app_instance is not None:
             app_instance.invalidate()
         return
@@ -1662,7 +1837,8 @@ def _render_ui_event(event):
         # 否则会把计划项显示成它原有的状态，反而看不出"为什么一直没动"
         message = str(event.payload.get("reason") or "").replace("\x1b", "").strip()
         if message:
-            _print_ui_fragment(f"{ANSI_RESET}! {message}\n")
+            warn = theme_ansi("warn", current_theme)
+            _print_ui_fragment(f"{warn}! 调度诊断：{ANSI_RESET}{message}\n")
         if app_instance is not None:
             app_instance.invalidate()
         return
@@ -1705,7 +1881,8 @@ def _render_ui_event(event):
     if event.kind == "notice":
         message = str(event.payload.get("message", ""))
         if message:
-            print_formatted_text(HTML(f"<ansiyellow>! {_esc(message)}</ansiyellow>"))
+            t = _get_theme(current_theme)
+            _print_ui_html(f"  <style fg='{t['warn']}'>! {_esc(message)}</style>")
         if app_instance is not None:
             app_instance.invalidate()
         return
@@ -1806,10 +1983,31 @@ def _render_ui_event(event):
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        # 回合结束后留一个空行，与下一轮的轮次分隔线形成呼吸间距
-        print_formatted_text("\n", end="", flush=True)
+        had_answer = bool(_answer_header_printed.pop(event.turn_id, False))
+        started_at = _turn_started_at.pop(event.turn_id, None)
+        if had_answer and started_at is not None:
+            t = _get_theme(current_theme)
+            elapsed = max(0.0, time.time() - started_at)
+            speed_part = (
+                f" · {_last_token_speed:.1f} t/s"
+                if _last_token_speed is not None and _last_token_speed > 0
+                else ""
+            )
+            _print_ui_html(
+                f"  <style fg='{t['text_muted']}'>── 完成 · 用时 {elapsed:.1f}s{speed_part}</style>\n"
+            )
+        else:
+            # 回合结束后留一个空行，与下一轮的轮次分隔线形成呼吸间距
+            app = app_instance
+            if (
+                app is not None
+                and app.loop is not None
+                and getattr(app, "_is_running", False)
+            ):
+                _print_ui_fragment("\n")
+            else:
+                print_formatted_text("\n", end="", flush=True)
         ui_renderers.pop(event.turn_id, None)
-        _answer_header_printed.pop(event.turn_id, None)
         _clear_active_thinking()
         _active_tool_status = None
         is_thinking = False
@@ -1823,9 +2021,11 @@ def _render_ui_event(event):
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        print_formatted_text(HTML("\n<ansiyellow>⏹ 本轮任务已取消。</ansiyellow>\n"))
+        t = _get_theme(current_theme)
+        _print_ui_html(f"\n  <style fg='{t['warn']}'>⏹ 本轮任务已取消。</style>\n")
         ui_renderers.pop(event.turn_id, None)
         _answer_header_printed.pop(event.turn_id, None)
+        _turn_started_at.pop(event.turn_id, None)
         _clear_active_thinking()
         _active_tool_status = None
         is_thinking = False
@@ -1842,9 +2042,13 @@ def _render_ui_event(event):
             )
         _flush_public_answer(event.turn_id, final=True)
         message = str(event.payload.get("message") or "未知错误")
-        print_formatted_text(HTML(f"\n<ansired>⚠️ 回合异常结束：{_esc(message)}</ansired>\n"))
+        t = _get_theme(current_theme)
+        _print_ui_html(
+            f"\n  <style fg='{t['err']}'>⚠ 回合异常结束：{_esc(message)}</style>\n"
+        )
         ui_renderers.pop(event.turn_id, None)
         _answer_header_printed.pop(event.turn_id, None)
+        _turn_started_at.pop(event.turn_id, None)
         _clear_active_thinking()
         _active_tool_status = None
         is_thinking = False
@@ -1894,7 +2098,10 @@ def trigger_session_auto_rename(session_name, user_query, api_model, api_key, ap
             global current_session
             if current_session == session_name:
                 current_session = final_title
-            print_formatted_text(HTML(f"\n<ansigray>💡 会话已自动命名为：{_esc(final_title)}</ansigray>"))
+            t = _get_theme(current_theme)
+            _print_ui_html(
+                f"\n  <style fg='{t['text_muted']}'>◈ 会话已自动命名为：{_esc(final_title)}</style>"
+            )
             if app_instance:
                 app_instance.invalidate()
         schedule_ui(update_ui)
@@ -1963,8 +2170,55 @@ def trigger_session_auto_rename(session_name, user_query, api_model, api_key, ap
     threading.Thread(target=_rename_job, daemon=True).start()
 
 
+def _truncate_path_left(path_text: str, max_width: int) -> str:
+    """路径过长时保留末尾目录与文件名，按显示宽度左侧省略。"""
+    s = str(path_text or "")
+    if max_width <= 0 or _term_display_width(s) <= max_width:
+        return s
+    if max_width <= 2:
+        return _truncate_visible(s, max_width)
+    acc = ""
+    acc_w = 0
+    budget = max_width - 1  # 给 "…" 留 1 格
+    for ch in reversed(s):
+        cw = _term_display_width(ch)
+        if acc_w + cw > budget:
+            break
+        acc = ch + acc
+        acc_w += cw
+    return "…" + acc
+
+
+def _collect_home_capabilities() -> str:
+    """轻量读取首页能力摘要（不阻塞启动、不主动拉起重量模块）。"""
+    parts: list[str] = []
+    try:
+        from core.skills import get_active_skill_ids
+
+        parts.append(f"技能 {len(get_active_skill_ids())}")
+    except Exception:
+        pass
+    mcp_mod = sys.modules.get("core.mcp_client")
+    if mcp_mod is not None:
+        try:
+            srv = getattr(mcp_mod.mcp_manager, "servers", {}) or {}
+            parts.append(f"MCP {len(srv)}")
+        except Exception:
+            pass
+    pl_mod = sys.modules.get("core.plugin_loader")
+    if pl_mod is not None:
+        try:
+            pinfos = pl_mod.get_plugin_infos() or []
+            enabled_p = sum(1 for p in pinfos if getattr(p, "enabled", False))
+            parts.append(f"插件 {enabled_p}")
+        except Exception:
+            pass
+    parts.append(f"主题 {current_theme}")
+    return " · ".join(parts)
+
+
 def print_logo(clear_screen=True):
-    """打印 Logo (画卡版) 及系统信息卡片"""
+    """打印方案 A 首页概览卡片（保留经典 4 行像素头像，单主色克制随主题变化）。"""
     if clear_screen:
         if app_instance is not None and getattr(app_instance, "renderer", None):
             # 应用运行期间必须用 prompt_toolkit 自己的清屏：os.system 会绕过
@@ -1972,91 +2226,158 @@ def print_logo(clear_screen=True):
             try:
                 app_instance.renderer.clear()
             except Exception:
-                os.system('cls' if os.name == 'nt' else 'clear')
+                os.system("cls" if os.name == "nt" else "clear")
         else:
-            os.system('cls' if os.name == 'nt' else 'clear')
-        
-    custom_fig = pyfiglet.Figlet(font='slant')
-    logo_text = custom_fig.renderText('XINGYAO')
-    safe_logo = logo_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    from core.themes import THEMES
-    theme_color = THEMES.get(current_theme, {}).get("border", "#00b4d8")
-    
-    print_formatted_text(HTML(f"<style fg='{theme_color}'><b>{safe_logo}</b></style>"))
-    
+            os.system("cls" if os.name == "nt" else "clear")
+
+    t = _get_theme(current_theme)
+    term_w = _terminal_width()
+    card_w = min(max(term_w - 4, 54), 100)
+    inner_w = card_w - 2
+
     cwd = os.getcwd()
-    
-    cwd_display = cwd
-    if len(cwd) > 35:
-        cwd_display = "..." + cwd[-32:]
-        
     active_info = get_active_model()
     model_display = active_info["name"] if active_info else "未激活模型"
-    safe_session = current_session.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    
-    def display_width(s):
-        clean_s = re.sub(r'<[^>]+>', '', s)
-        clean_s = clean_s.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-        width = 0
-        for char in clean_s:
-            code = ord(char)
-            if 0x2500 <= code <= 0x259F:
-                width += 1
-            elif code > 127:
-                width += 2
-            else:
-                width += 1
-        return width
-        
-    def make_box_line(content, inside_width=56):
-        w = display_width(content)
-        spaces = inside_width - w
-        if spaces < 0:
-            spaces = 0
-        return f"<style fg='{theme_color}'>│</style>{content}{' ' * spaces}<style fg='{theme_color}'>│</style>\n"
-        
-    def make_data_line(label, val):
-        val_str = str(val)
-        w = display_width(val_str)
-        if w > 38:
-            truncated = ""
-            curr_w = 0
-            for char in val_str:
-                char_w = 2 if ord(char) > 127 else 1
-                if curr_w + char_w > 35:
-                    truncated += "..."
-                    break
-                truncated += char
-                curr_w += char_w
-            val_str = truncated
-            
-        escaped_val = val_str.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        return make_box_line(f"{label}<ansigray>{escaped_val}</ansigray>")
+    effort_val = ""
+    if active_info:
+        try:
+            effort_val = str(active_info.get("reasoning_effort") or "").strip()
+        except Exception:
+            effort_val = ""
+    model_summary = f"{model_display} · 思考:{effort_val}" if effort_val else model_display
 
-    avatar_row1 = f"  <style fg='{theme_color}'>▄▄    ▄▄</style>    <b>欢迎使用 星瑶Code CLI</b>"
-    avatar_row2 = f" <style fg='{theme_color}'>██████████</style>   {_agent_name()} (Hacker Girl) 为您服务"
-    avatar_row3 = f" <style fg='{theme_color}'>██ █  █ ██</style>   输入 /help 获取帮助"
-    avatar_row4 = f"  <style fg='{theme_color}'>▀██████▀</style>    "
-    
-    card = (
-        f"<style fg='{theme_color}'>┌────────────────────────────────────────────────────────┐</style>\n"
-        + make_box_line(avatar_row1)
-        + make_box_line(avatar_row2)
-        + make_box_line(avatar_row3)
-        + make_box_line(avatar_row4)
-        + make_box_line("")
-        + make_data_line("   Directory : ", cwd_display)
-        + make_data_line("   Session   : ", safe_session)
-        + make_data_line("   Model     : ", model_display)
-        + make_data_line("   Theme     : ", current_theme)
-        + make_data_line("   Version   : ", f"v{YCODE_VERSION}")
-        + make_box_line("")
-        + make_box_line(f"   提示: {_agent_name()}是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
-        + f"<style fg='{theme_color}'>└────────────────────────────────────────────────────────┘</style>\n"
+    perm_map = {
+        "confirm": "确认",
+        "accept_edits": "自动编辑",
+        "auto_decision": "自动决策",
+        "plan": "计划只读",
+        "full": "完全访问",
+    }
+    perm_label = perm_map.get(current_permission_mode, current_permission_mode)
+    try:
+        from core.model_manager import load_config
+
+        sandbox_open = bool(load_config().get("allow_outside_workspace", False))
+        sandbox_label = "目录外放行" if sandbox_open else "沙盒限制"
+    except Exception:
+        sandbox_label = "沙盒限制"
+    perm_summary = f"{perm_label} · {sandbox_label}"
+    caps_summary = _collect_home_capabilities()
+    agent_title = _agent_name()
+
+    def _fit_html(content: str, width: int) -> str:
+        w = _term_display_width(content, strip_html=True)
+        if w < width:
+            return content + (" " * (width - w))
+        return content
+
+    def _box_row(content: str) -> str:
+        fitted = _fit_html(content, inner_w)
+        return (
+            f"  <style fg='{t['border']}'>│</style>"
+            f"{fitted}"
+            f"<style fg='{t['border']}'>│</style>\n"
+        )
+
+    def _kv_line(label: str, val: str, col_w: int, *, is_path: bool = False) -> str:
+        # 统一字段行：标签Muted + 数值Text，超出列宽自动省略保证边框严格对齐
+        prefix = f"  {label}  "
+        val_budget = max(8, col_w - _term_display_width(prefix) - 1)
+        trimmed = (
+            _truncate_path_left(val, val_budget)
+            if is_path
+            else _truncate_visible(str(val or ""), val_budget)
+        )
+        return (
+            f"<style fg='{t['text_muted']}'>{_esc(prefix)}</style>"
+            f"<style fg='{t['text']}'>{_esc(trimmed)}</style>"
+        )
+
+    top_title_plain = f" ✦ XINGYAO CODE  v{YCODE_VERSION} "
+    top_dashes = max(2, card_w - 3 - _term_display_width(top_title_plain))
+    top_line = (
+        f"  <style fg='{t['border']}'>╭─</style>"
+        f"<style fg='{t['accent']}'><b> ✦ XINGYAO CODE</b></style>"
+        f"<style fg='{t['text_muted']}'>  v{_esc(YCODE_VERSION)} </style>"
+        f"<style fg='{t['border']}'>{'─' * top_dashes}╮</style>\n"
     )
-    
+    bottom_line = f"  <style fg='{t['border']}'>╰{'─' * inner_w}╯</style>\n"
+
+    # 严格保留经典 4 行像素小头像字形
+    short_agent_sub = _truncate_visible(f"{agent_title} (Hacker Girl) · 终端编程伙伴", max(18, card_w - 50 if card_w >= 84 else inner_w - 14))
+    avatar_rows = (
+        f"  <style fg='{t['accent']}'>▄▄    ▄▄</style>   <b><style fg='{t['text']}'>欢迎回来，{_esc(_truncate_visible(agent_title, 12))}为您服务</style></b>",
+        f" <style fg='{t['accent']}'>██████████</style>  <style fg='{t['text_soft']}'>{_esc(short_agent_sub)}</style>",
+        f" <style fg='{t['accent']}'>██ █  █ ██</style>  <style fg='{t['text_muted']}'>输入 </style><style fg='{t['accent_soft']}'>/help</style><style fg='{t['text_muted']}'> 查看全部指令</style>",
+        f"  <style fg='{t['accent']}'>▀██████▀</style>   ",
+    )
+
+    if card_w >= 84:
+        right_w = 34
+        left_w = inner_w - right_w - 1
+        left_lines = [
+            "",
+            *avatar_rows,
+            "",
+            _kv_line("工作区", cwd, left_w, is_path=True),
+            _kv_line("会话  ", current_session, left_w),
+            _kv_line("模型  ", model_summary, left_w),
+            _kv_line("权限  ", perm_summary, left_w),
+            _kv_line("能力  ", caps_summary, left_w),
+            "",
+        ]
+        right_lines = [
+            "",
+            f"  <style fg='{t['accent']}'><b>常用指令</b></style>",
+            f"  <style fg='{t['accent_soft']}'>/models</style>   <style fg='{t['text_soft']}'>切换模型与思考档位</style>",
+            f"  <style fg='{t['accent_soft']}'>/session</style>  <style fg='{t['text_soft']}'>会话管理与归档切换</style>",
+            f"  <style fg='{t['accent_soft']}'>/skills</style>   <style fg='{t['text_soft']}'>管理与调用技能插件</style>",
+            f"  <style fg='{t['accent_soft']}'>/plan</style>     <style fg='{t['text_soft']}'>查看或控制任务计划</style>",
+            f"  <style fg='{t['accent_soft']}'>/goal</style>     <style fg='{t['text_soft']}'>目标驱动自主迭代</style>",
+            f"  <style fg='{t['accent_soft']}'>/changes</style>  <style fg='{t['text_soft']}'>文件改动与 /undo 回滚</style>",
+            f"  <style fg='{t['accent_soft']}'>/theme</style>    <style fg='{t['text_soft']}'>切换克制单主色主题</style>",
+            "",
+            f"  <style fg='{t['accent_soft']}'>@文件</style><style fg='{t['text_muted']}'> 挂载上下文 · </style><style fg='{t['accent_soft']}'>@会话</style><style fg='{t['text_muted']}'> 引用</style>",
+            "",
+        ]
+        body_rows = ""
+        for idx in range(max(len(left_lines), len(right_lines))):
+            l_cell = _fit_html(left_lines[idx] if idx < len(left_lines) else "", left_w)
+            r_cell = _fit_html(right_lines[idx] if idx < len(right_lines) else "", right_w)
+            if _term_display_width(l_cell, strip_html=True) > left_w:
+                l_cell = _esc(_truncate_visible(l_cell, left_w))
+                l_cell = _fit_html(l_cell, left_w)
+            if _term_display_width(r_cell, strip_html=True) > right_w:
+                r_cell = _esc(_truncate_visible(r_cell, right_w))
+                r_cell = _fit_html(r_cell, right_w)
+            body_rows += (
+                f"  <style fg='{t['border']}'>│</style>"
+                f"{l_cell}"
+                f"<style fg='{t['border_dim']}'>│</style>"
+                f"{r_cell}"
+                f"<style fg='{t['border']}'>│</style>\n"
+            )
+    else:
+        single_lines = [
+            "",
+            *avatar_rows,
+            "",
+            _kv_line("工作区", cwd, inner_w, is_path=True),
+            _kv_line("会话  ", current_session, inner_w),
+            _kv_line("模型  ", model_summary, inner_w),
+            _kv_line("权限  ", perm_summary, inner_w),
+            _kv_line("能力  ", caps_summary, inner_w),
+            "",
+            f"  <style fg='{t['accent_soft']}'>@文件</style><style fg='{t['text_muted']}'> 挂载上下文 · </style><style fg='{t['accent_soft']}'>/models</style><style fg='{t['text_muted']}'> 切换模型</style>",
+            "",
+        ]
+        body_rows = "".join(_box_row(line) for line in single_lines)
+
+    card = top_line + body_rows + bottom_line
     print_formatted_text(HTML(card))
-    print_formatted_text(HTML("<ansigray>   Enter 发送 | Ctrl+N 换行 | Ctrl+C 清空/中断 | Ctrl+D 退出 | Ctrl+T 记忆</ansigray>\n"))
+    print_formatted_text(HTML(
+        f"<style fg='{t['text_muted']}'>  Enter 发送 · Ctrl+N 换行 · Ctrl+C 清空/中断 · Shift+Tab 权限 · Ctrl+T 记忆 · Ctrl+D 退出</style>\n"
+    ))
 
 
 def _resolve_session_after_selector(current_session_name, existed_before):
@@ -2083,14 +2404,23 @@ def show_session_history(session_name):
     history = manager.get_history(session_name)
     safe_session = session_name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     from core.history_renderer import render_session_history
-    rendered = render_session_history(history, _terminal_width())
+    t = _get_theme(current_theme)
+    rendered = render_session_history(
+        history, _terminal_width(), theme_name=current_theme
+    )
     if not rendered:
-        print_formatted_text(HTML(f"<ansiyellow>ℹ 会话 {safe_session} 当前没有任何对话记录。</ansiyellow>"))
+        print_formatted_text(HTML(
+            f"  <style fg='{t['warn']}'>ℹ 会话 {safe_session} 当前没有任何对话记录。</style>"
+        ))
         return
 
-    print_formatted_text(HTML(f"\n<ansicyan><b>--- 会话 {safe_session} 历史对话记录 ---</b></ansicyan>"))
+    _print_ui_html(
+        f"\n  <style fg='{t['accent']}'><b>◈ 会话 {safe_session} 历史对话记录</b></style>"
+    )
     _print_ui_fragment(rendered)
-    print_formatted_text(HTML("<ansicyan><b>--------------------------------------</b></ansicyan>\n"))
+    _print_ui_html(
+        f"  <style fg='{t['border']}'>{'─' * 38}</style>\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2726,6 +3056,49 @@ def handle_checkpoint_command(command_text: str, current_session: str) -> None:
     print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /checkpoint [list|restore &lt;turn_id&gt;]</ansired>"))
 
 
+def _diff_stat_html(added: int, removed: int, *, width: int = 5) -> str:
+    """生成用于 prompt_toolkit HTML(...) 的紧凑增删比例条（如 ++++-）。"""
+    total = max(0, int(added)) + max(0, int(removed))
+    if total <= 0 or width <= 0:
+        return ""
+    slots = min(width, total)
+    plus_slots = round(max(0, added) / total * slots)
+    if added > 0 and plus_slots == 0:
+        plus_slots = 1
+    if removed > 0 and plus_slots == slots and slots > 1:
+        plus_slots = slots - 1
+    minus_slots = slots - plus_slots
+    t = _get_theme(current_theme)
+    parts = []
+    if plus_slots:
+        parts.append(f"<style fg='{t['ok']}'>{'+' * plus_slots}</style>")
+    if minus_slots:
+        parts.append(f"<style fg='{t['err']}'>{'-' * minus_slots}</style>")
+    return "".join(parts)
+
+
+def _progress_bar_html(completed: int, total: int, *, width: int = 10) -> str:
+    """生成用于 prompt_toolkit HTML(...) 的主题主色进度条。"""
+    width = max(2, int(width))
+    if total <= 0:
+        filled = 0
+    else:
+        ratio = max(0.0, min(1.0, completed / total))
+        filled = round(ratio * width)
+        if completed > 0 and filled == 0:
+            filled = 1
+        if completed < total and filled == width:
+            filled = width - 1
+    empty = width - filled
+    t = _get_theme(current_theme)
+    parts = []
+    if filled:
+        parts.append(f"<style fg='{t['accent']}'>{'━' * filled}</style>")
+    if empty:
+        parts.append(f"<style fg='{t['border_dim']}'>{'━' * empty}</style>")
+    return "".join(parts)
+
+
 def print_turn_file_summary_if_ready(session_name: str, turn_id: str) -> None:
     """回合封闭后（worker 线程调用，经 schedule_ui 切回主线程）：检查点进入
     ready 时在最终回答后显示文件修改摘要与 /undo 指引（规格 17.1）。"""
@@ -2738,31 +3111,61 @@ def print_turn_file_summary_if_ready(session_name: str, turn_id: str) -> None:
         files = status.get("files") or []
         if not files:
             return
+        t = _get_theme(current_theme)
         net_added = sum(f.get("net_added") or 0 for f in files)
         net_removed = sum(f.get("net_removed") or 0 for f in files)
-        print_formatted_text(HTML(""))
-        print_formatted_text(HTML("<ansicyan>文件修改</ansicyan>"))
-        print_formatted_text(HTML(
-            f"<ansigray>{len(files)} 个文件已编辑  </ansigray>"
-            f"<ansigreen>+{net_added}</ansigreen> <ansired>-{net_removed}</ansired>"
-        ))
+        rule_w = min(max(_terminal_width() - 6, 48), 72)
+        header_plain = f" ✎ 本轮文件变更 · {len(files)} 个文件 +{net_added} -{net_removed} "
+        top_dash = "─" * max(2, rule_w - 2 - _term_display_width(header_plain))
+
+        card_lines = [
+            "",
+            (
+                f"  <style fg='{t['border']}'>╭─</style>"
+                f"<style fg='{t['accent']}'><b> ✎ 本轮文件变更</b></style>"
+                f"<style fg='{t['text_muted']}'> · {len(files)} 个文件已编辑 </style>"
+                f"<style fg='{t['ok']}'>+{net_added}</style> "
+                f"<style fg='{t['err']}'>-{net_removed}</style> "
+                f"<style fg='{t['border']}'>{top_dash}</style>"
+            ),
+        ]
         shown = files[:5]
+        path_w = max(18, min(42, max(_term_display_width(f.get("display_path") or "") for f in shown) + 2))
         for f in shown:
-            print_formatted_text(HTML(
-                f"  {_esc(f.get('display_path') or '')}  "
-                f"<ansigreen>+{f.get('net_added') or 0}</ansigreen> "
-                f"<ansired>-{f.get('net_removed') or 0}</ansired>"
-            ))
+            fa = int(f.get("net_added") or 0)
+            fr = int(f.get("net_removed") or 0)
+            dpath = str(f.get("display_path") or "")
+            path_padded = _esc(_pad_right(_truncate_visible(dpath, path_w), path_w))
+            stat_bar = _diff_stat_html(fa, fr, width=5)
+            bar_suffix = f"  {stat_bar}" if stat_bar else ""
+            card_lines.append(
+                f"  <style fg='{t['border']}'>│</style> "
+                f"<style fg='{t['text']}'>{path_padded}</style> "
+                f"<style fg='{t['ok']}'>+{fa}</style> "
+                f"<style fg='{t['err']}'>-{fr}</style>"
+                f"{bar_suffix}"
+            )
         if len(files) > 5:
-            print_formatted_text(HTML(f"  <ansigray>还有 {len(files) - 5} 个文件（/undo status 查看全部）</ansigray>"))
+            card_lines.append(
+                f"  <style fg='{t['border']}'>│</style> "
+                f"<style fg='{t['text_muted']}'>… 还有 {len(files) - 5} 个文件（/undo status 查看全部）</style>"
+            )
         if status.get("has_uncovered_command_effects"):
-            print_formatted_text(HTML(
-                "<ansiyellow>⚠️ 本轮执行过通用命令：命令的其他副作用不在撤销范围内。</ansiyellow>"
-            ))
-        print_formatted_text(HTML(
-            f"可撤销本轮修改：<ansicyan>/undo {_esc(_undo_short_id(status['turn_id']))}</ansicyan>"
-        ))
-        print_formatted_text(HTML(""))
+            card_lines.append(
+                f"  <style fg='{t['border']}'>│</style> "
+                f"<style fg='{t['warn']}'>! 本轮执行过通用命令：命令的其他副作用不在撤销范围内。</style>"
+            )
+        short_id = _undo_short_id(status["turn_id"])
+        foot_plain = f" ↩ 可撤销本轮修改：/undo {short_id} "
+        foot_dash = "─" * max(2, rule_w - 2 - _term_display_width(foot_plain))
+        card_lines.append(
+            f"  <style fg='{t['border']}'>╰─</style>"
+            f"<style fg='{t['text_muted']}'> ↩ 可撤销本轮修改：</style>"
+            f"<style fg='{t['accent_soft']}'>/undo {_esc(short_id)}</style> "
+            f"<style fg='{t['border']}'>{foot_dash}</style>"
+        )
+        card_lines.append("")
+        _print_ui_html("\n".join(card_lines))
     except Exception:
         logging.getLogger("py.warnings").debug(
             "回合文件摘要展示失败", exc_info=True
@@ -3047,10 +3450,8 @@ def _format_goal_status(state) -> str:
 def _goal_notice(html_text: str) -> None:
     """打印一行目标模式提示（跨线程安全）。
 
-    有 prompt_toolkit App 时统一经 schedule_ui 回到 UI 线程打印，遵守
-    "后台线程不直接调用 print_formatted_text" 的约定；没有 App（headless）时
-    schedule_ui 会静默丢弃回调，此时直接打印——否则目标每一轮的进展对用户
-    完全不可见，看起来像"启动了但什么都没发生"。
+    有 prompt_toolkit App 时统一经 schedule_ui 回到 UI 线程并通过 _print_ui_html 打印，
+    遵守线程纪律并与 Markdown 流保持保序；没有 App（headless）时直接打印。
     """
     if app_instance is None:
         try:
@@ -3058,7 +3459,7 @@ def _goal_notice(html_text: str) -> None:
         except Exception:
             pass
         return
-    schedule_ui(lambda: print_formatted_text(HTML(html_text)))
+    schedule_ui(lambda: _print_ui_html(html_text))
 
 
 def _goal_store():
@@ -3142,13 +3543,14 @@ def _goal_start_run(state):
     def on_event(event, current_state):
         """循环进度回调：只打印，不碰界面对象，也绝不把异常抛回循环。"""
         try:
+            t = _get_theme(current_theme)
             if event == "round_done":
                 summary = ""
                 if current_state.history:
                     summary = str(current_state.history[-1].get("summary") or "")
                 _goal_notice(
-                    f"<ansicyan>🎯 目标第 {current_state.round}/{current_state.max_rounds} 轮：</ansicyan>"
-                    f"<ansigray>{_esc(summary)}</ansigray>"
+                    f"  <style fg='{t['accent']}'><b>◎ 目标第 {current_state.round}/{current_state.max_rounds} 轮</b></style> "
+                    f"<style fg='{t['text_muted']}'>{_esc(summary)}</style>"
                 )
             elif event == "finished":
                 hint = (
@@ -3157,8 +3559,8 @@ def _goal_start_run(state):
                     else ""
                 )
                 _goal_notice(
-                    f"<ansigreen>✔ 目标流程结束{hint}</ansigreen> "
-                    f"<ansigray>{_esc(_format_goal_status(current_state))}</ansigray>"
+                    f"  <style fg='{t['ok']}'><b>✔ 目标流程结束{hint}</b></style> "
+                    f"<style fg='{t['text_muted']}'>{_esc(_format_goal_status(current_state))}</style>"
                 )
         except Exception:
             logging.getLogger("py.warnings").debug("目标进度提示打印失败", exc_info=True)
@@ -3175,7 +3577,8 @@ def _goal_start_run(state):
             )
         except Exception as exc:  # 循环自身缺陷不该让后台线程静默死掉
             logging.getLogger("py.warnings").exception("目标循环异常退出")
-            _goal_notice(f"<ansired>❌ 目标循环异常终止：{_esc(exc)}</ansired>")
+            t = _get_theme(current_theme)
+            _goal_notice(f"  <style fg='{t['err']}'>❌ 目标循环异常终止：{_esc(exc)}</style>")
         finally:
             # 只删自己那一条：期间用户可能 stop 后重建了新目标，误删会把新循环的
             # 取消事件一起丢掉（之后 /goal stop 就失效了）。
@@ -3194,33 +3597,40 @@ def _goal_start_run(state):
 
 def _goal_handle_status(session_name) -> None:
     """/goal status：输出轮次 / 状态 / 最近一轮摘要。"""
+    t = _get_theme(current_theme)
     try:
         state = _goal_store().load(session_name)
     except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ 读取目标状态失败：{_esc(exc)}</style>"))
         return
     if state is None:
         print_formatted_text(
-            HTML(f"<ansiyellow>ℹ {_esc(_format_goal_status(None))}</ansiyellow>")
+            HTML(f"  <style fg='{t['warn']}'>ℹ {_esc(_format_goal_status(None))}</style>")
         )
         return
-    print_formatted_text(HTML(f"<ansicyan>🎯 {_esc(_format_goal_status(state))}</ansicyan>"))
+    bar = _progress_bar_html(state.round, max(1, state.max_rounds), width=12)
+    print_formatted_text(HTML(
+        f"  <style fg='{t['accent']}'><b>◎ {_esc(_format_goal_status(state))}</b></style>  {bar}"
+    ))
     if state.goal:
-        print_formatted_text(HTML(f"<ansigray>  目标：{_esc(state.goal)}</ansigray>"))
+        print_formatted_text(HTML(
+            f"    <style fg='{t['text_muted']}'>目标：{_esc(state.goal)}</style>"
+        ))
     if state.check:
-        print_formatted_text(
-            HTML(f"<ansigray>  验证命令：{_esc(state.check)}</ansigray>")
-        )
+        print_formatted_text(HTML(
+            f"    <style fg='{t['text_muted']}'>验证命令：{_esc(state.check)}</style>"
+        ))
 
 
 def _goal_handle_stop(session_name) -> None:
     """/goal stop：置位该会话的取消事件，并中断正在跑的那一轮。"""
+    t = _get_theme(current_theme)
     with _GOAL_RUNS_LOCK:
         cancel_event = _GOAL_RUNS.get(session_name)
     if cancel_event is None:
         # 没有运行中的循环时说清楚，而不是静默成功让用户以为已经停了
         print_formatted_text(HTML(
-            "<ansiyellow>ℹ 当前会话没有运行中的目标（/goal status 查看进度）。</ansiyellow>"
+            f"  <style fg='{t['warn']}'>ℹ 当前会话没有运行中的目标（/goal status 查看进度）。</style>"
         ))
         return
     cancel_event.set()
@@ -3231,7 +3641,7 @@ def _goal_handle_stop(session_name) -> None:
     except Exception:
         logging.getLogger("py.warnings").debug("中断目标回合失败", exc_info=True)
     print_formatted_text(HTML(
-        "<ansigreen>✔ 已停止目标：本轮中断，不再自动续跑。</ansigreen>"
+        f"  <style fg='{t['ok']}'>✔ 已停止目标：本轮中断，不再自动续跑。</style>"
     ))
 
 
@@ -3239,15 +3649,16 @@ def _goal_handle_resume(session_name) -> None:
     """/goal resume：把 blocked / stopped / interrupted 的目标重新跑起来。"""
     from core.slash_commands.goal.state import STATUS_RUNNING
 
+    t = _get_theme(current_theme)
     try:
         store = _goal_store()
         state = store.load(session_name)
     except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ 读取目标状态失败：{_esc(exc)}</style>"))
         return
     if state is None:
         print_formatted_text(HTML(
-            "<ansiyellow>ℹ 当前会话没有可恢复的目标，用 /goal &lt;目标&gt; 新建一个。</ansiyellow>"
+            f"  <style fg='{t['warn']}'>ℹ 当前会话没有可恢复的目标，用 /goal &lt;目标&gt; 新建一个。</style>"
         ))
         return
     if state.status not in _GOAL_RESUMABLE:
@@ -3258,15 +3669,15 @@ def _goal_handle_resume(session_name) -> None:
         }.get(state.status, "")
         status_text = _GOAL_STATUS_TEXT.get(state.status, state.status)
         print_formatted_text(HTML(
-            f"<ansiyellow>ℹ 当前状态为「{_esc(status_text)}」，不能恢复。{_esc(hint)}</ansiyellow>"
+            f"  <style fg='{t['warn']}'>ℹ 当前状态为「{_esc(status_text)}」，不能恢复。{_esc(hint)}</style>"
         ))
         return
     if state.round >= state.max_rounds:
         # 轮次已用尽的目标恢复后会立刻再次 blocked（循环条件一开始就不成立），
         # 让用户看到"说恢复了其实没跑"比直接说明更糟。
         print_formatted_text(HTML(
-            f"<ansiyellow>ℹ 轮次已用尽（{state.round}/{state.max_rounds}），"
-            "请用 /goal &lt;目标&gt; [--rounds N] 重新设定目标与轮次。</ansiyellow>"
+            f"  <style fg='{t['warn']}'>ℹ 轮次已用尽（{state.round}/{state.max_rounds}），"
+            "请用 /goal &lt;目标&gt; [--rounds N] 重新设定目标与轮次。</style>"
         ))
         return
     # 用核心层的常量而不是字面量 "running"：状态机改名字时这里会立刻 ImportError，
@@ -3275,15 +3686,15 @@ def _goal_handle_resume(session_name) -> None:
     try:
         store.save(state)
     except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ 保存目标状态失败：{_esc(exc)}</style>"))
         return
     started, message = _goal_start_run(state)
     if not started:
-        print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ {_esc(message)}</style>"))
         return
     print_formatted_text(HTML(
-        f"<ansigreen>✔ 已恢复目标（第 {state.round}/{state.max_rounds} 轮起）："
-        f"{_esc(state.goal)}</ansigreen>"
+        f"  <style fg='{t['ok']}'>✔ 已恢复目标（第 {state.round}/{state.max_rounds} 轮起）："
+        f"{_esc(state.goal)}</style>"
     ))
 
 
@@ -3298,15 +3709,16 @@ def _goal_handle_confirm(session_name) -> None:
         STATUS_AWAITING_CONFIRM,
     )
 
+    t = _get_theme(current_theme)
     try:
         store = _goal_store()
         state = store.load(session_name)
     except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 读取目标状态失败：{_esc(exc)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ 读取目标状态失败：{_esc(exc)}</style>"))
         return
     if state is None:
         print_formatted_text(HTML(
-            "<ansiyellow>ℹ 当前会话没有可确认的目标，用 /goal &lt;目标&gt; 新建一个。</ansiyellow>"
+            f"  <style fg='{t['warn']}'>ℹ 当前会话没有可确认的目标，用 /goal &lt;目标&gt; 新建一个。</style>"
         ))
         return
     if state.status != STATUS_AWAITING_CONFIRM:
@@ -3316,18 +3728,18 @@ def _goal_handle_confirm(session_name) -> None:
             "achieved": "目标已达成，无需重复确认；要跑新目标请用 /goal <目标>",
         }.get(state.status, "")
         print_formatted_text(HTML(
-            f"<ansiyellow>ℹ 当前状态为「{_esc(status_text)}」，无需确认。{_esc(hint)}</ansiyellow>"
+            f"  <style fg='{t['warn']}'>ℹ 当前状态为「{_esc(status_text)}」，无需确认。{_esc(hint)}</style>"
         ))
         return
     state.status = STATUS_ACHIEVED
     try:
         store.save(state)
     except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ 保存目标状态失败：{_esc(exc)}</style>"))
         return
     print_formatted_text(HTML(
-        f"<ansigreen>✔ 已确认目标达成（第 {state.round}/{state.max_rounds} 轮）："
-        f"{_esc(state.goal)}</ansigreen>"
+        f"  <style fg='{t['ok']}'>✔ 已确认目标达成（第 {state.round}/{state.max_rounds} 轮）："
+        f"{_esc(state.goal)}</style>"
     ))
 
 
@@ -3336,10 +3748,11 @@ def _goal_handle_start(action, session_name) -> None:
     from core.slash_commands.goal.state import GoalState
     from core.slash_commands.goal_command import DEFAULT_MAX_ROUNDS, GOAL_USAGE
 
+    t = _get_theme(current_theme)
     goal = str(action.get("goal") or "").strip()
     if not goal:
         # 理论上命令层已拦住空目标，这里兜底：没有目标的循环只会空转烧 token
-        print_formatted_text(HTML(f"<ansired>❌ 目标不能为空。{_esc(GOAL_USAGE)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ 目标不能为空。{_esc(GOAL_USAGE)}</style>"))
         return
     try:
         max_rounds = int(action.get("max_rounds") or 0)
@@ -3351,7 +3764,7 @@ def _goal_handle_start(action, session_name) -> None:
         existing = _GOAL_RUNS.get(session_name)
     if existing is not None and not existing.is_set():
         print_formatted_text(HTML(
-            "<ansired>❌ 当前会话已有运行中的目标，先 /goal stop 再重新设定。</ansired>"
+            f"  <style fg='{t['err']}'>❌ 当前会话已有运行中的目标，先 /goal stop 再重新设定。</style>"
         ))
         return
     state = GoalState(
@@ -3363,19 +3776,19 @@ def _goal_handle_start(action, session_name) -> None:
     try:
         _goal_store().save(state)
     except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 保存目标状态失败：{_esc(exc)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ 保存目标状态失败：{_esc(exc)}</style>"))
         return
     started, message = _goal_start_run(state)
     if not started:
-        print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        print_formatted_text(HTML(f"  <style fg='{t['err']}'>❌ {_esc(message)}</style>"))
         return
     suffix = f" · 验证命令：{_esc(state.check)}" if state.check else ""
     print_formatted_text(HTML(
-        f"<ansigreen>✔ 已启动目标（最多 {state.max_rounds} 轮）：{_esc(state.goal)}"
-        f"{suffix}</ansigreen>"
+        f"  <style fg='{t['ok']}'>✔ 已启动目标（最多 {state.max_rounds} 轮）：{_esc(state.goal)}"
+        f"{suffix}</style>"
     ))
     print_formatted_text(HTML(
-        "<ansigray>  进度自动播报；/goal status 查看，/goal stop 或 Ctrl+C 停止。</ansigray>"
+        f"    <style fg='{t['text_muted']}'>进度自动播报；/goal status 查看，/goal stop 或 Ctrl+C 停止。</style>"
     ))
 
 
@@ -3383,21 +3796,22 @@ def _run_goal_cli(args_text: str) -> None:
     """/goal 的 CLI 入口：复用命令层解析，只按 action 做适配层该做的事。"""
     from core.slash_commands.goal_command import GOAL_USAGE, handle_goal
 
+    t = _get_theme(current_theme)
     result = handle_goal(args_text)
     if not result.get("ok"):
         print_formatted_text(HTML(
-            f"<ansired>❌ {_esc(result.get('msg') or '目标参数无效')}</ansired>"
+            f"  <style fg='{t['err']}'>❌ {_esc(result.get('msg') or '目标参数无效')}</style>"
         ))
         return
     action = result.get("action") or {}
     kind = str(action.get("action") or "")
     if kind == "goal_help":
-        print_formatted_text(HTML(f"<ansicyan>🎯 {_esc(GOAL_USAGE)}</ansicyan>"))
+        print_formatted_text(HTML(f"  <style fg='{t['accent']}'><b>◎ {_esc(GOAL_USAGE)}</b></style>"))
         print_formatted_text(HTML(
-            "<ansigray>  控制: /goal status | /goal stop | /goal resume | /goal confirm（自评达成后确认收尾）</ansigray>"
+            f"    <style fg='{t['text_muted']}'>控制: /goal status | /goal stop | /goal resume | /goal confirm（自评达成后确认收尾）</style>"
         ))
         print_formatted_text(HTML(
-            "<ansigray>  示例: /goal 把测试跑绿 --check pytest -q --rounds 5</ansigray>"
+            f"    <style fg='{t['text_muted']}'>示例: /goal 把测试跑绿 --check pytest -q --rounds 5</style>"
         ))
         return
     session_name = current_session
@@ -3418,98 +3832,126 @@ def _run_goal_cli(args_text: str) -> None:
 
 def handle_slash_command(command_text):
     """斜杠指令路由器"""
-    global current_session, current_model, _turn_separator_needed
+    global current_session, current_model, current_theme, _turn_separator_needed
 
     parts = command_text.strip().split()
     cmd = parts[0].lower()
 
     if cmd == "/help":
-        print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
-        print_formatted_text(HTML("🌟 <b><ansigreen>星瑶Code CLI 系统指令与操作指南</ansigreen></b>"))
-        print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
-        print_formatted_text(HTML("<b><ansiyellow>【1. 会话与上下文管理】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名，A 归档，Tab 切归档区)"))
-        print_formatted_text(HTML("  <ansicyan>/session &lt;会话名称&gt;</ansicyan>              : 按名称直接切换到指定会话 (不存在则创建)"))
-        print_formatted_text(HTML("  <ansicyan>/session all</ansicyan>                         : 列出所有目录下的历史会话 (含归属路径与时间)"))
-        print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
-        print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
-        print_formatted_text(HTML("  <ansicyan>/session archive &lt;会话名称&gt;</ansicyan>         : 归档指定会话（从默认列表隐藏，数据保留、可恢复）"))
-        print_formatted_text(HTML("  <ansicyan>/session unarchive &lt;会话名称&gt;</ansicyan>       : 取消归档，恢复回默认会话列表"))
-        print_formatted_text(HTML("  <ansicyan>/session archived</ansicyan>                    : 列出全部已归档会话 (含归档时间与归属路径)"))
-        print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
-        print_formatted_text(HTML(f"  <ansicyan>/undo [turn_id]</ansicyan>                      : 按回合撤销文件修改（整轮预检+确认；list 列表 / status 状态 / recover 恢复中断事务，默认确认 N，无 --force）"))
-        print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
-        print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
-        print_formatted_text(HTML(f"  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（{_agent_name()}输出 mermaid 代码块时自动生成）"))
-        print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
-        print_formatted_text(HTML("  <ansicyan>/git &lt;子命令&gt;</ansicyan>                          : Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log，高风险操作需 --confirm)"))
-        print_formatted_text(HTML("  <ansicyan>/clear</ansicyan>                                  : 清理终端当前屏幕"))
+        t = _get_theme(current_theme)
+        a = t["accent"]
+        s = t["accent_soft"]
+        m = t["text_muted"]
+        d = t["text_muted"]
+        b = t["border"]
+        agent = _esc(_agent_name())
+
+        def _help_section(title: str) -> None:
+            dash = "─" * max(4, 62 - _term_display_width(title))
+            print_formatted_text(HTML(
+                f"  <style fg='{a}'><b>❖ {_esc(title)}</b></style> <style fg='{t['border_dim']}'>{dash}</style>"
+            ))
+
+        def _help_row(command_label: str, desc: str) -> None:
+            padded = _esc(_pad_right(command_label, 38))
+            print_formatted_text(HTML(
+                f"    <style fg='{s}'>{padded}</style> <style fg='{m}'>{desc}</style>"
+            ))
+
+        print_formatted_text(HTML(
+            f"  <style fg='{b}'>╭─</style><style fg='{a}'><b> ✦ 星瑶Code CLI 系统指令与操作指南</b></style>"
+            f" <style fg='{b}'>{'─' * 34}</style>"
+        ))
+        _help_section("1. 会话与上下文管理")
+        _help_row("/session", "打开全屏会话管理器 UI（Enter 切换 / Del 删除 / R 改名 / A 归档 / Tab 归档区）")
+        _help_row("/session <会话名称>", "按名称直接切换到指定会话（不存在则创建）")
+        _help_row("/session all", "列出所有目录下的历史会话（含归属路径与时间）")
+        _help_row("/session rename <新名称>", "重命名当前活动会话")
+        _help_row("/session delete <会话名称>", "物理删除指定会话（安全切回防御）")
+        _help_row("/session archive <会话名称>", "归档指定会话（从默认列表隐藏，数据保留可恢复）")
+        _help_row("/session unarchive <会话名称>", "取消归档，恢复回默认会话列表")
+        _help_row("/session archived", "列出全部已归档会话（含归档时间与归属路径）")
+        _help_row("/new", "创建并切换到全新会话（历史会话保留，/session 可切回）")
+        _help_row("/undo [turn_id]", "按回合撤销文件修改（list / status / recover，默认确认 N）")
+        _help_row("/checkpoint", "会话级检查点管理（list 查看 / restore &lt;turn_id&gt; 整轮回滚）")
+        _help_row("/share", "导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）")
+        _help_row("/diagram [open 序号|list]", f"打开/列出已生成的 Mermaid 流程图网页（{agent}输出时自动生成）")
+        _help_row("/worktree", "Git worktree 管理（list / create / remove / prune）")
+        _help_row("/git <子命令>", "Git 工作台（status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log）")
+        _help_row("/clear", "清理终端当前屏幕")
         print_formatted_text(HTML(""))
-        print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/models</ansicyan>                              : 打开全屏模型管理器 UI (切换模型、API 密钥、API 地址)"))
-        print_formatted_text(HTML("  <ansicyan>/effort &lt;档位&gt;</ansicyan>      : 切换当前模型思考模式 (档位随模型，无参查看可选档位；按模型保存，下轮请求生效)"))
-        print_formatted_text(HTML("  <ansicyan>/persona [name|title|text|reset]</ansicyan>   : 人设设置 (智能体名称/对你的称呼/人设文本，保存即全局生效)"))
-        print_formatted_text(HTML("  <ansicyan>/shell [id]</ansicyan>                         : 选择默认命令解释器 (AI 命令/后台任务统一使用；无参查看列表)"))
-        print_formatted_text(HTML("  <ansicyan>/open [path]</ansicyan>                          : 在系统中打开文件/目录 (无参=当前工作区)"))
-        print_formatted_text(HTML("  <ansicyan>/clear-history [y]</ansicyan>                   : 清空当前会话全部历史消息 (输入 /clear-history y 确认，不影响任务计划与长期记忆)"))
-        print_formatted_text(HTML("  <ansicyan>/queue [list|cancel 序号|clear]</ansicyan>      : 管理排队中的消息 (AI 忙碌时新消息会排队)"))
-        print_formatted_text(HTML("  <ansicyan>/paste-image [说明]</ansicyan>                  : 发送剪贴板图片给模型 (可附说明文字)"))
-        print_formatted_text(HTML("  <ansicyan>/update [check|download|cancel|install]</ansicyan> : 检查/下载/安装新版本 (安装会退出 星瑶Code)"))
-        print_formatted_text(HTML("  <ansicyan>/changes [N]</ansicyan>                          : 查看最近 N 个回合的文件变更汇总 (默认 3)"))
-        print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
-        print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
-        print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
-        print_formatted_text(HTML("  <ansicyan>/turns &lt;轮次&gt;</ansicyan>                         : 设置单任务最大模型轮次 (10-1000，仅影响新任务；无参数查看当前值)"))
-        print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:工作目录外读写直接放行 | off:仅限工作目录内)"))
-        print_formatted_text(HTML("  <ansicyan>/whitelist list|add|remove|clear</ansicyan>        : 管理当前项目白名单 (command/write/edit)"))
-        print_formatted_text(HTML("  <ansicyan>/usage</ansicyan>                                : 查看 Token 用量统计 (按模型区分: 今日/近7天/近30天，精确数值)"))
-        print_formatted_text(HTML("  <ansicyan>/usage &lt;日期&gt; [截止日期]</ansicyan>          : 查询指定单日或区间的 Token 用量 (例: /usage 2026-08-01 2026-08-05)"))
+
+        _help_section("2. 模型与样式配置")
+        _help_row("/models", "打开全屏模型管理器 UI（切换模型、API 密钥、API 地址）")
+        _help_row("/effort <档位>", "切换当前模型思考模式（无参查看可选档位；下轮请求生效）")
+        _help_row("/persona [name|title|text|reset]", "人设设置（智能体名称/对你的称呼/人设文本，保存即全局生效）")
+        _help_row("/shell [id]", "选择默认命令解释器（AI 命令/后台任务统一使用；无参查看列表）")
+        _help_row("/open [path]", "在系统中打开文件/目录（无参=当前工作区）")
+        _help_row("/clear-history [y]", "清空当前会话全部历史消息（不影响任务计划与长期记忆）")
+        _help_row("/queue [list|cancel 序号|clear]", "管理排队中的消息（AI 忙碌时新消息会排队）")
+        _help_row("/paste-image [说明]", "发送剪贴板图片给模型（可附说明文字）")
+        _help_row("/update [check|download|cancel|install]", "检查/下载/安装新版本（安装会退出 星瑶Code）")
+        _help_row("/changes [N]", "查看最近 N 个回合的文件变更汇总（默认 3）")
+        _help_row("/theme", "列出当前所有可用的终端单主色主题")
+        _help_row("/theme <主题名称>", "切换主题（cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white, starlight）")
+        _help_row("/permission <confirm|accept_edits|auto_decision|plan|full>", "切换权限级别（confirm | accept_edits | auto_decision | plan | full）")
+        _help_row("/turns <轮次>", "设置单任务最大模型轮次（10-1000，无参查看当前值）")
+        _help_row("/sandbox <on|off>", "沙盒开关（on=目录外直接放行 | off=仅限工作目录内）")
+        _help_row("/whitelist list|add|remove|clear", "管理当前项目白名单（command/write/edit）")
+        _help_row("/usage", "查看 Token 用量统计（按模型区分：今日/近7天/近30天）")
+        _help_row("/usage <日期> [截止日期]", "查询指定单日或区间的 Token 用量（例: /usage 2026-08-01 2026-08-05）")
         print_formatted_text(HTML(""))
-        print_formatted_text(HTML("<b><ansiyellow>【3. 技能插件管理】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/skills</ansicyan>                              : 打开全屏技能选择器 UI (空格勾选开启/关闭)"))
-        print_formatted_text(HTML("  <ansicyan>/skills list</ansicyan>                         : 在终端列出所有扫描到的技能，展示启用状态与短 ID"))
-        print_formatted_text(HTML("  <ansicyan>/skills refresh</ansicyan>                      : 重新扫描技能目录 (新装技能免重启生效)"))
-        print_formatted_text(HTML("  <ansicyan>/skills enable &lt;短ID&gt;</ansicyan>             : 启用指定短 ID 对应的技能"))
-        print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan>            : 禁用指定短 ID 对应的技能"))
-        print_formatted_text(HTML(f"  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让{_agent_name()}为您执行任务"))
-        print_formatted_text(HTML("  <ansicyan>/plugins</ansicyan>                             : 查看已安装的进程内插件 (名称/版本/来源/加载状态/提供的工具)"))
-        print_formatted_text(HTML("  <ansicyan>/plugins enable|disable &lt;name&gt;</ansicyan>        : 启用/禁用指定插件 (写回 plugin.json，重启后生效)"))
-        print_formatted_text(HTML("  <ansicyan>/plugins reload</ansicyan>                       : 重新扫描插件目录刷新清单 (不重启)"))
-        print_formatted_text(HTML("  <ansicyan>/hooks</ansicyan>                                : Hook 生命周期钩子管理 (查看清单/trust|deny|revoke|reset 序号 信任操作)"))
-        print_formatted_text(HTML("  <ansicyan>/hooks import</ansicyan>                         : <b>从 ZCode 配置导入 hook</b> (预览确认后写入;rollback 撤销导入)"))
-        print_formatted_text(HTML("  <ansicyan>/mcp</ansicyan>                                 : MCP 服务管理 (open/status/tools/enable/disable/reconnect/edit)"))
+
+        _help_section("3. 技能插件管理")
+        _help_row("/skills", "打开全屏技能选择器 UI（空格勾选开启/关闭）")
+        _help_row("/skills list", "在终端列出所有扫描到的技能，展示启用状态与短 ID")
+        _help_row("/skills refresh", "重新扫描技能目录（新装技能免重启生效）")
+        _help_row("/skills enable <短ID>", "启用指定短 ID 对应的技能")
+        _help_row("/skills disable <短ID>", "禁用指定短 ID 对应的技能")
+        _help_row("/<短ID> [提问内容]", f"<b>主动且强制调用指定技能</b>让{agent}为您执行任务")
+        _help_row("/plugins", "查看已安装的进程内插件（名称/版本/来源/状态/工具）")
+        _help_row("/plugins enable|disable <name>", "启用/禁用指定插件（写回 plugin.json，重启生效）")
+        _help_row("/plugins reload", "重新扫描插件目录刷新清单（不重启）")
+        _help_row("/hooks", "Hook 生命周期钩子管理（清单/trust/deny/revoke/reset）")
+        _help_row("/hooks import", "<b>从 ZCode 配置导入 hook</b>（预览确认后写入；rollback 撤销）")
+        _help_row("/mcp", "MCP 服务管理（open/status/tools/enable/disable/reconnect/edit）")
         print_formatted_text(HTML(""))
-        print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/tasks</ansicyan>                               : 查看或接管目前正在运行的后台长周期服务/命令"))
-        print_formatted_text(HTML("  <ansicyan>/tasks kill &lt;任务ID&gt;</ansicyan>              : 终结指定后台进程或子代理任务"))
-        print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;任务ID&gt;</ansicyan>              : 查看任务最新 30 行日志 (子代理任务显示运行状态)"))
-        print_formatted_text(HTML("  <ansicyan>/plan</ansicyan>                                : 查看当前任务计划与逐项状态"))
-        print_formatted_text(HTML("  <ansicyan>/plan &lt;pause|resume|retry ID|cancel&gt;</ansicyan>       : 暂停、恢复、重试或取消计划"))
-        print_formatted_text(HTML("  <ansicyan>/doctor [--json]</ansicyan>                    : 聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 输出机器可读结果)"))
-        print_formatted_text(HTML("  <ansicyan>/doctor export [--full y]</ansicyan>           : 导出排障诊断包 zip (manifest/journal/doctor/日志；默认不含消息正文，--full 经脱敏+确认后追加)"))
+
+        _help_section("4. 任务托管与后台进程")
+        _help_row("/tasks", "查看或接管目前正在运行的后台长周期服务/命令")
+        _help_row("/tasks kill <任务ID>", "终结指定后台进程或子代理任务")
+        _help_row("/tasks tail <任务ID>", "查看任务最新 30 行日志（子代理任务显示运行状态）")
+        _help_row("/plan", "查看当前任务计划与逐项状态")
+        _help_row("/plan <pause|resume|retry ID|cancel>", "暂停、恢复、重试或取消计划")
+        _help_row("/doctor [--json]", "聚合自检（配置/凭据/数据库/MCP/网络；--json 机器可读）")
+        _help_row("/doctor export [--full y]", "导出排障诊断包 zip（默认不含正文，--full 经确认后追加）")
         print_formatted_text(HTML(""))
-        print_formatted_text(HTML("<b><ansiyellow>【5. KAIROS 长期记忆系统】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/remember &lt;内容&gt;</ansicyan>                     : 手动追加一条规则、偏好或事实到今日的记忆日志"))
-        print_formatted_text(HTML("  <ansicyan>/dream</ansicyan>                                 : 在后台触发梦境总结，将所有记忆日志提炼归纳并更新索引"))
-        print_formatted_text(HTML("  <ansicyan>/memory</ansicyan>                                : 快速查阅当前的长期记忆索引 (MEMORY.md) 内容"))
-        print_formatted_text(HTML("  <ansicyan>/compress [force]</ansicyan>                      : 手动触发当前会话的记忆压缩 (保留最近若干条，更早的历史由大模型提炼为摘要；加 force 强制保留更少条数)"))
+
+        _help_section("5. KAIROS 长期记忆系统")
+        _help_row("/remember <内容>", "手动追加一条规则、偏好或事实到今日的记忆日志")
+        _help_row("/dream", "在后台触发梦境总结，将记忆日志提炼归纳并更新索引")
+        _help_row("/memory", "快速查阅当前的长期记忆索引（MEMORY.md）内容")
+        _help_row("/compress [force]", "手动触发当前会话的记忆压缩（force 强制保留更少条数）")
         print_formatted_text(HTML(""))
-        print_formatted_text(HTML("<b><ansiyellow>【6. 终端常用快捷操作】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>@文件名</ansicyan>                               : <b>在提问中挂载本地文件</b> (例如: <ansigray>这行代码怎么改 @main.py</ansigray>)"))
-        print_formatted_text(HTML(f"  <ansicyan>Enter</ansicyan>                                 : 提交当前文本给{_agent_name()}（闲置立即执行，繁忙则自动排队等待）"))
-        print_formatted_text(HTML("  <ansicyan>Ctrl+N</ansicyan>                                    : 在输入框内输入新的一行换行符"))
-        print_formatted_text(HTML(f"  <ansicyan>Ctrl+C</ansicyan>                                : <b>{_agent_name()}思考中时立即发送强行中断信号</b>；闲置时清空输入框"))
-        print_formatted_text(HTML("  <ansicyan>Ctrl+T</ansicyan>                                : <b>切换展开/收起底部浮窗显示当前会话的背景记忆摘要</b>"))
-        print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 星瑶Code 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
-        print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 星瑶Code CLI"))
+
+        _help_section("6. 终端常用快捷操作")
+        _help_row("@文件名", "<b>在提问中挂载本地文件</b>（例如: 这行代码怎么改 @main.py）")
+        _help_row("Enter", f"提交当前文本给{agent}（闲置立即执行，繁忙则自动排队等待）")
+        _help_row("Ctrl+N", "在输入框内插入换行符（输入框随行数自动增高 1~5 行）")
+        _help_row("Ctrl+C", f"<b>{agent}思考/执行中时强行中断</b>；闲置时清空输入框")
+        _help_row("Ctrl+T", "<b>切换展开/收起底部背景记忆摘要浮窗</b>")
+        _help_row("Shift+Tab", "<b>循环切换权限模式</b>（确认 → 自动编辑 → 自动决策 → 计划模式 → 完全访问）")
+        _help_row("Ctrl+D / /exit", "安全退出 星瑶Code CLI")
         print_formatted_text(HTML(""))
-        print_formatted_text(HTML("<b><ansiyellow>【7. 目标模式 (自主迭代)】</ansiyellow></b>"))
-        print_formatted_text(HTML("  <ansicyan>/goal &lt;目标&gt; [--check &lt;命令&gt;] [--rounds &lt;N&gt;]</ansicyan> : 启动目标模式，自主迭代推进直到达成或轮次用尽 ( --check 退出码 0 视为达成，最可信；--rounds 默认 10)"))
-        print_formatted_text(HTML("  <ansicyan>/goal status</ansicyan>                          : 查看当前目标进度 (第 N/M 轮 · 状态 · 最近一轮摘要)"))
-        print_formatted_text(HTML("  <ansicyan>/goal stop</ansicyan>                            : 停止当前目标 (本轮中断，不再自动续跑；Ctrl+C 同效)"))
-        print_formatted_text(HTML("  <ansicyan>/goal resume</ansicyan>                          : 恢复已停止/受阻/中断的目标，从当前轮次继续跑"))
-        print_formatted_text(HTML("  <ansicyan>/goal help</ansicyan>                            : 查看 /goal 的参数用法 (不带参数的 /goal 也显示它)"))
-        print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
+
+        _help_section("7. 目标模式 (自主迭代)")
+        _help_row("/goal <目标> [--check <命令>] [--rounds <N>]", "启动目标模式，自主迭代直到达成或轮次用尽（--rounds 默认 10）")
+        _help_row("/goal status", "查看当前目标进度（第 N/M 轮 · 状态 · 最近一轮摘要）")
+        _help_row("/goal stop", "停止当前目标（本轮中断，不再自动续跑；Ctrl+C 同效）")
+        _help_row("/goal resume", "恢复已停止/受阻/中断的目标，从当前轮次继续跑")
+        _help_row("/goal help", "查看 /goal 参数用法")
+        print_formatted_text(HTML(f"  <style fg='{b}'>╰{'─' * 68}</style>"))
+        print_formatted_text(HTML(f"    <style fg='{d}'>提示：输入 / 可触发命令自动补全</style>"))
 
     elif cmd in ("/models", "/model"):
         # 不在后台线程里直接开选择器（会和主线程的 event loop 冲突）
@@ -3583,32 +4025,55 @@ def handle_slash_command(command_text):
 
     elif cmd == "/theme":
         from core.themes import THEMES
+
+        def _print_theme_list() -> None:
+            cur_t = _get_theme(current_theme)
+            print_formatted_text(HTML(
+                f"  <style fg='{cur_t['accent']}'><b>✦ 可用单主色主题方案</b></style> "
+                f"<style fg='{cur_t['text_muted']}'>(当前: {_esc(current_theme)})</style>"
+            ))
+            for tname in THEMES.keys():
+                desc, color = THEME_DESCS.get(tname, ("未知", "#ffffff"))
+                active_mark = (
+                    f"<style fg='{cur_t['accent']}'>●</style>"
+                    if tname == current_theme
+                    else f"<style fg='{cur_t['text_muted']}'>○</style>"
+                )
+                print_formatted_text(HTML(
+                    f"    {active_mark} <style fg='{cur_t['text']}'><b>{tname:<10}</b></style> "
+                    f"<style fg='{cur_t['text_soft']}'>({_esc(desc):<4})</style>  "
+                    f"<style fg='{color}'>████</style> <style fg='{cur_t['text_muted']}'>{color}</style>"
+                ))
+
         if len(parts) > 1:
             theme_name = parts[1].lower().strip("<>\"'")
             if theme_name == "list":
-                print_formatted_text(HTML("<b><ansicyan>可用主题配色方案：</ansicyan></b>"))
-                for t in THEMES.keys():
-                    desc, color = THEME_DESCS.get(t, ("未知", "#ffffff"))
-                    print_formatted_text(HTML(f"  - <b>{t:<10}</b> ({desc:<4}) : <style fg='{color}'>████</style>"))
+                _print_theme_list()
             elif theme_name in THEMES:
                 from config import save_config_value
                 save_config_value("theme", theme_name)
-                global current_theme
                 current_theme = theme_name
-                print_formatted_text(HTML(f"<ansigreen>✔ 已切换配色主题为: <b>{theme_name}</b></ansigreen>"))
+                new_t = _get_theme(current_theme)
+                print_formatted_text(HTML(
+                    f"  <style fg='{new_t['ok']}'>✔ 已切换配色主题为: <b>{theme_name}</b></style>"
+                ))
                 # 不退出主 App（exit 且未设 pending_action 会导致整个程序退出），
                 # current_theme 已更新，刷新一次让状态栏/边框立即反映新主题
                 if app_instance:
                     app_instance.invalidate()
             else:
+                cur_t = _get_theme(current_theme)
                 available = ", ".join(THEMES.keys())
-                print_formatted_text(HTML(f"<ansired>❌ 未知主题配色「{_esc(theme_name)}」，可选主题：{available}</ansired>"))
+                print_formatted_text(HTML(
+                    f"  <style fg='{cur_t['err']}'>❌ 未知主题配色「{_esc(theme_name)}」，可选主题：{available}</style>"
+                ))
         else:
-            print_formatted_text(HTML("<b><ansicyan>可用主题配色方案：</ansicyan></b>"))
-            for t in THEMES.keys():
-                desc, color = THEME_DESCS.get(t, ("未知", "#ffffff"))
-                print_formatted_text(HTML(f"  - <b>{t:<10}</b> ({desc:<4}) : <style fg='{color}'>████</style>"))
-            print_formatted_text(HTML("用法: <ansiyellow>/theme &lt;主题名称&gt;</ansiyellow>"))
+            cur_t = _get_theme(current_theme)
+            _print_theme_list()
+            print_formatted_text(HTML(
+                f"    <style fg='{cur_t['text_muted']}'>用法: </style>"
+                f"<style fg='{cur_t['accent_soft']}'>/theme &lt;主题名称&gt;</style>"
+            ))
 
     elif cmd == "/permission":
         if len(parts) > 1 and parts[1] != "list":
@@ -3616,26 +4081,51 @@ def handle_slash_command(command_text):
             # 与 GUI 的 set_permission_mode 一致：接受已登记别名（yolo/中文标签等），
             # 拼错的值明确报错，绝不静默回落成 confirm 后当作切换成功
             if _app_ctx.is_known_permission_mode(mode_name):
-                from config import save_config_value
-                global current_permission_mode
-                current_permission_mode = _app_ctx.normalize_permission_mode(mode_name)
-                save_config_value("permission_mode", current_permission_mode)
-                mapping = {
-                    "confirm": "变更前确认",
-                    "accept_edits": "自动编辑",
-                    "plan": "计划模式",
-                    "full": "完全访问",
-                }
-                print_formatted_text(HTML(f"<ansigreen>✔ 权限控制模式已切换为: <b>{mapping[current_permission_mode]}</b></ansigreen>"))
-                if app_instance:
-                    app_instance.invalidate()
+                from core.permission_auto_decision import (
+                    get_auto_decision_readiness_warning,
+                    is_decision_model_enabled,
+                )
+
+                target_mode = _app_ctx.normalize_permission_mode(mode_name)
+                if target_mode == "auto_decision" and not is_decision_model_enabled():
+                    print_formatted_text(HTML(
+                        "<ansired>❌ 决策模型（JEV）尚未启用，无法切换到自动决策模式；请先启用决策模型。</ansired>"
+                    ))
+                else:
+                    from config import save_config_value
+                    global current_permission_mode
+                    current_permission_mode = target_mode
+                    save_config_value("permission_mode", current_permission_mode)
+                    mapping = {
+                        "confirm": "变更前确认",
+                        "accept_edits": "自动编辑",
+                        "auto_decision": "自动决策",
+                        "plan": "计划模式",
+                        "full": "完全访问",
+                    }
+                    print_formatted_text(HTML(f"<ansigreen>✔ 权限控制模式已切换为: <b>{mapping[current_permission_mode]}</b></ansigreen>"))
+                    if current_permission_mode == "auto_decision":
+                        warn_msg = get_auto_decision_readiness_warning()
+                        if warn_msg:
+                            print_formatted_text(HTML(f"<ansiyellow>⚠ {_esc(warn_msg)}</ansiyellow>"))
+                    if app_instance:
+                        app_instance.invalidate()
             else:
-                print_formatted_text(HTML(f"<ansired>❌ 未知权限模式「{_esc(mode_name)}」，可选模式：confirm, accept_edits, plan, full</ansired>"))
+                from core.permission_auto_decision import is_decision_model_enabled
+
+                opts = "confirm, accept_edits, auto_decision, plan, full" if is_decision_model_enabled() else "confirm, accept_edits, plan, full"
+                print_formatted_text(HTML(f"<ansired>❌ 未知权限模式「{_esc(mode_name)}」，可选模式：{opts}</ansired>"))
         else:
+            from core.permission_auto_decision import is_decision_model_enabled
+
+            jev_enabled = is_decision_model_enabled()
             print_formatted_text(HTML("<b><ansicyan>可用权限模式：</ansicyan></b>"))
             for line in PERMISSION_HELP_LINES:
+                if not jev_enabled and "<b>auto_decision</b>" in line:
+                    continue
                 print_formatted_text(HTML(line))
-            print_formatted_text(HTML("用法: <ansiyellow>/permission &lt;confirm|accept_edits|plan|full&gt;</ansiyellow>"))
+            usage_modes = "confirm|accept_edits|auto_decision|plan|full" if jev_enabled else "confirm|accept_edits|plan|full"
+            print_formatted_text(HTML(f"用法: <ansiyellow>/permission &lt;{usage_modes}&gt;</ansiyellow>"))
 
     elif cmd == "/turns":
         # 与 GUI 系统设置「单任务最大模型轮次」共用同一配置键与校验逻辑；
@@ -3937,11 +4427,7 @@ def handle_slash_command(command_text):
                     print_formatted_text(HTML("<ansiyellow>ℹ 剪贴板中没有图片。</ansiyellow>"))
         if explicit_paths:
             was_queued = is_thinking
-            safe_note = _esc(note)
-            if was_queued:
-                _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) [剪贴板图片] {safe_note}</ansigray>")
-            else:
-                _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> [剪贴板图片] {safe_note}")
+            _echo_user_message(note, queued=was_queued, prefix_tag="[剪贴板图片]")
             msg_queue.put({
                 "text": note,
                 "was_queued": was_queued,
@@ -3970,6 +4456,7 @@ def handle_slash_command(command_text):
     elif cmd == "/changes":
         # 会话文件变更历史回看（数据源：turn_undo 检查点，只读消费）。
         # 与每轮结束后的自动摘要互补：/changes 面向任意时刻的跨回合回看。
+        t = _get_theme(current_theme)
         try:
             limit_n = int(parts[1]) if len(parts) > 1 else 3
         except ValueError:
@@ -3980,19 +4467,25 @@ def handle_slash_command(command_text):
         try:
             states = tu.list_turn_undo_states(session_id, limit=50)
         except Exception as exc:
-            print_formatted_text(HTML(f"<ansired>❌ 读取变更记录失败：{_esc(str(exc))}</ansired>"))
+            print_formatted_text(HTML(f"<style fg='{t['err']}'>❌ 读取变更记录失败：{_esc(str(exc))}</style>"))
             return
         with_changes = [s for s in states if (s.get("file_count") or 0) > 0]
         if not with_changes:
-            print_formatted_text(HTML("<ansiyellow>ℹ 当前会话还没有文件修改记录。</ansiyellow>"))
+            print_formatted_text(HTML(f"<style fg='{t['warn']}'>ℹ 当前会话还没有文件修改记录。</style>"))
             return
-        print_formatted_text(HTML(f"<b><ansicyan>最近文件变更（{min(limit_n, len(with_changes))} 个回合）：</ansicyan></b>"))
-        for s in with_changes[:limit_n]:
+        shown_turns = with_changes[:limit_n]
+        print_formatted_text(HTML(
+            f"  <style fg='{t['border']}'>╭─</style>"
+            f"<style fg='{t['accent']}'><b> ✎ 最近文件变更（{len(shown_turns)} 个回合）</b></style> "
+            f"<style fg='{t['border']}'>{'─' * 34}</style>"
+        ))
+        for s in shown_turns:
+            short_tid = _esc(_undo_short_id(s['turn_id']))
             print_formatted_text(HTML(
-                f"  回合 <b>{_esc(_undo_short_id(s['turn_id']))}</b> · {_esc(_undo_status_label(s))}"
-                f" · {s.get('file_count') or 0} 文件"
-                f" <ansigreen>+{s.get('net_added') or 0}</ansigreen>"
-                f" <ansired>-{s.get('net_removed') or 0}</ansired>"
+                f"  <style fg='{t['border']}'>│</style> 回合 <style fg='{t['accent_soft']}'><b>{short_tid}</b></style> "
+                f"<style fg='{t['text_muted']}'>· {_esc(_undo_status_label(s))} · {s.get('file_count') or 0} 文件</style> "
+                f"<style fg='{t['ok']}'>+{s.get('net_added') or 0}</style> "
+                f"<style fg='{t['err']}'>-{s.get('net_removed') or 0}</style>"
             ))
             try:
                 detail = tu.get_turn_undo_status(session_id, s["turn_id"])
@@ -4000,16 +4493,24 @@ def handle_slash_command(command_text):
                 detail = None
             files = (detail or {}).get("files") or []
             for f in files[:8]:
+                fa = int(f.get("net_added") or 0)
+                fr = int(f.get("net_removed") or 0)
+                bar = _diff_stat_html(fa, fr, width=5)
+                bar_suffix = f"  {bar}" if bar else ""
                 print_formatted_text(HTML(
-                    f"      {_esc(str(f.get('display_path') or ''))}"
-                    f"  <ansigreen>+{f.get('net_added') or 0}</ansigreen>"
-                    f" <ansired>-{f.get('net_removed') or 0}</ansired>"
+                    f"  <style fg='{t['border']}'>│</style>   <style fg='{t['text']}'>{_esc(str(f.get('display_path') or ''))}</style> "
+                    f"<style fg='{t['ok']}'>+{fa}</style> "
+                    f"<style fg='{t['err']}'>-{fr}</style>"
+                    f"{bar_suffix}"
                 ))
             if len(files) > 8:
                 print_formatted_text(HTML(
-                    f"      <ansigray>还有 {len(files) - 8} 个文件（/undo status {_esc(_undo_short_id(s['turn_id']))} 查看全部）</ansigray>"
+                    f"  <style fg='{t['border']}'>│</style>   <style fg='{t['text_muted']}'>… 还有 {len(files) - 8} 个文件（/undo status {short_tid} 查看全部）</style>"
                 ))
-        print_formatted_text(HTML("<ansigray>  回滚某轮：/undo &lt;短ID&gt; 或 /checkpoint restore &lt;turn_id&gt;</ansigray>"))
+        print_formatted_text(HTML(
+            f"  <style fg='{t['border']}'>╰─</style> "
+            f"<style fg='{t['text_muted']}'>回滚某轮：/undo &lt;短ID&gt; 或 /checkpoint restore &lt;turn_id&gt;</style>"
+        ))
 
     elif cmd == "/sandbox":
         # 沙盒开关：控制文件工具是否可访问当前工作目录之外的路径
@@ -4262,28 +4763,29 @@ def handle_slash_command(command_text):
         )
         from core.tools import subagent_manager
 
+        t_theme = _get_theme(current_theme)
         if len(parts) > 1:
             subcmd = parts[1]
             if subcmd == "kill" and len(parts) > 2:
                 tid = parts[2]
                 cleaned_tid = tid.strip("<>")
-                safe_tid = cleaned_tid.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                safe_tid = _esc(cleaned_tid)
                 # 先尝试 shell 后台进程
                 if kill_background_task(cleaned_tid):
-                    print_formatted_text(HTML(f"<ansigreen>✔ 后台进程 {safe_tid} 已成功终结。</ansigreen>"))
+                    print_formatted_text(HTML(f"<style fg='{t_theme['ok']}'>✔ 后台进程 {safe_tid} 已成功终结。</style>"))
                 else:
                     # 再尝试子代理后台任务（cancel 而非 kill，协作式取消）
                     sub_tasks = subagent_manager.snapshot()
                     matched = [t for t in sub_tasks if t.task_id == cleaned_tid]
                     if matched and matched[0].status not in {"completed", "failed", "cancelled", "timed_out"}:
                         subagent_manager.cancel(cleaned_tid, "用户通过 /tasks kill 终止")
-                        print_formatted_text(HTML(f"<ansigreen>✔ 子代理任务 {safe_tid} 已请求取消。</ansigreen>"))
+                        print_formatted_text(HTML(f"<style fg='{t_theme['ok']}'>✔ 子代理任务 {safe_tid} 已请求取消。</style>"))
                     else:
-                        print_formatted_text(HTML(f"<ansired>❌ 找不到任务 ID: {safe_tid}，或任务已经提前结束。</ansired>"))
+                        print_formatted_text(HTML(f"<style fg='{t_theme['err']}'>❌ 找不到任务 ID: {safe_tid}，或任务已经提前结束。</style>"))
             elif subcmd in ("tail", "log", "status") and len(parts) > 2:
                 tid = parts[2]
                 cleaned_tid = tid.strip("<>")
-                safe_tid = cleaned_tid.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                safe_tid = _esc(cleaned_tid)
                 # 先查 shell 后台进程日志；返回的 🚨 错误信息不算有效日志，
                 # 必须继续查子代理任务状态，避免对 subagent-* ID 显示"未找到日志"
                 output = get_task_output(cleaned_tid, tail_lines=30)
@@ -4293,7 +4795,9 @@ def handle_slash_command(command_text):
                     and not output.strip().startswith("🚨")
                 )
                 if shell_log_available:
-                    print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
+                    print_formatted_text(HTML(
+                        f"  <style fg='{t_theme['accent']}'><b>◈ 任务 {safe_tid} 最新 30 行日志</b></style>"
+                    ))
                     # Low 修复：任务日志可能携带 ANSI 控制序列，直接 print 会注入终端样式；
                     # get_task_output 已整段剥离，这里兜底再过一次共享清洗函数
                     from core.process_io import strip_ansi_escapes
@@ -4304,33 +4808,56 @@ def handle_slash_command(command_text):
                     matched = [t for t in sub_tasks if t.task_id == cleaned_tid]
                     if matched:
                         t = matched[0]
-                        print_formatted_text(HTML(f"<ansicyan><b>--- 子代理任务 {safe_tid} 状态 ---</b></ansicyan>"))
-                        status_color = {"completed": "ansigreen", "failed": "ansired",
-                                       "cancelled": "ansigray", "timed_out": "ansired"}.get(t.status, "ansiyellow")
-                        print_formatted_text(HTML(f"  状态: <{status_color}>{t.status}</{status_color}> | 类型: {t.subagent_type} | 阶段: {t.stage}"))
-                        print_formatted_text(HTML(f"  执行: {round(t.execution_elapsed, 1)}s | 等待审批: {round(t.approval_wait_elapsed, 1)}s"))
+                        print_formatted_text(HTML(
+                            f"  <style fg='{t_theme['border']}'>╭─</style>"
+                            f"<style fg='{t_theme['accent']}'><b> ◈ 子代理任务 {safe_tid} 状态</b></style>"
+                        ))
+                        status_color = {
+                            "completed": t_theme["ok"],
+                            "failed": t_theme["err"],
+                            "cancelled": t_theme["text_muted"],
+                            "timed_out": t_theme["err"],
+                        }.get(t.status, t_theme["warn"])
+                        print_formatted_text(HTML(
+                            f"  <style fg='{t_theme['border']}'>│</style> 状态: <style fg='{status_color}'>{t.status}</style> "
+                            f"<style fg='{t_theme['text_muted']}'>· 类型: </style><style fg='{t_theme['accent_soft']}'>{t.subagent_type}</style> "
+                            f"<style fg='{t_theme['text_muted']}'>· 阶段: {t.stage}</style>"
+                        ))
+                        print_formatted_text(HTML(
+                            f"  <style fg='{t_theme['border']}'>│</style> <style fg='{t_theme['text_muted']}'>"
+                            f"执行: {round(t.execution_elapsed, 1)}s · 等待审批: {round(t.approval_wait_elapsed, 1)}s</style>"
+                        ))
                         detail_turn_code = turn_short_code(t.parent_turn_id)
                         if detail_turn_code:
-                            print_formatted_text(HTML(f"  回合: <ansigray>[turn:{detail_turn_code}]</ansigray>"))
-                        desc_safe = (t.description or "")[:80].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                        print_formatted_text(HTML(f"  描述: {desc_safe}"))
+                            print_formatted_text(HTML(
+                                f"  <style fg='{t_theme['border']}'>│</style> <style fg='{t_theme['text_muted']}'>回合: [turn:{detail_turn_code}]</style>"
+                            ))
+                        desc_safe = _esc((t.description or "")[:80])
+                        print_formatted_text(HTML(
+                            f"  <style fg='{t_theme['border']}'>│</style> 描述: {desc_safe}"
+                        ))
                         if t.result:
-                            result_safe = (t.result or "")[:500].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                            print_formatted_text(HTML(f"  <ansigray>结果摘要: {result_safe}</ansigray>"))
+                            result_safe = _esc((t.result or "")[:500])
+                            print_formatted_text(HTML(
+                                f"  <style fg='{t_theme['border']}'>│</style> <style fg='{t_theme['text_muted']}'>结果摘要: {result_safe}</style>"
+                            ))
                         if t.error:
-                            error_safe = (t.error or "")[:500].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                            print_formatted_text(HTML(f"  <ansired>错误: {error_safe}</ansired>"))
+                            error_safe = _esc((t.error or "")[:500])
+                            print_formatted_text(HTML(
+                                f"  <style fg='{t_theme['border']}'>│</style> <style fg='{t_theme['err']}'>错误: {error_safe}</style>"
+                            ))
+                        print_formatted_text(HTML(f"  <style fg='{t_theme['border']}'>╰{'─' * 40}</style>"))
                     else:
                         # shell 日志返回错误时直接展示错误信息，否则提示无日志
                         if output and output.strip():
-                            print_formatted_text(HTML(f"<ansiyellow>{_esc(output.strip())}</ansiyellow>"))
+                            print_formatted_text(HTML(f"<style fg='{t_theme['warn']}'>{_esc(output.strip())}</style>"))
                         else:
-                            print_formatted_text(HTML(f"<ansiyellow>ℹ 任务 {safe_tid} 没有可用日志或状态信息。</ansiyellow>"))
+                            print_formatted_text(HTML(f"<style fg='{t_theme['warn']}'>ℹ 任务 {safe_tid} 没有可用日志或状态信息。</style>"))
             else:
-                print_formatted_text(HTML("<ansired>❌ 用法错误。可选指令：</ansired>"))
-                print_formatted_text(HTML("  <ansicyan>/tasks</ansicyan>           : 列出所有后台任务"))
-                print_formatted_text(HTML("  <ansicyan>/tasks kill &lt;ID&gt;</ansicyan> : 终结指定后台任务"))
-                print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;ID&gt;</ansicyan> : 查看任务日志输出"))
+                print_formatted_text(HTML(f"<style fg='{t_theme['err']}'>❌ 用法错误。可选指令：</style>"))
+                print_formatted_text(HTML(f"  <style fg='{t_theme['accent_soft']}'>/tasks</style>           : 列出所有后台任务"))
+                print_formatted_text(HTML(f"  <style fg='{t_theme['accent_soft']}'>/tasks kill &lt;ID&gt;</style> : 终结指定后台任务"))
+                print_formatted_text(HTML(f"  <style fg='{t_theme['accent_soft']}'>/tasks tail &lt;ID&gt;</style> : 查看任务日志输出"))
         else:
             # 同时查询 shell 后台进程和子代理后台任务
             shell_tasks = list_active_tasks()
@@ -4339,72 +4866,115 @@ def handle_slash_command(command_text):
             bg_sub_snapshots = [t for t in sub_snapshots if t.run_in_background]
 
             if not shell_tasks and not bg_sub_snapshots:
-                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有运行中的后台异步任务。</ansiyellow>"))
+                print_formatted_text(HTML(f"<style fg='{t_theme['warn']}'>ℹ 当前没有运行中的后台异步任务。</style>"))
             else:
                 if shell_tasks:
-                    print_formatted_text(HTML("<ansicyan><b>当前运行的后台进程（shell）：</b></ansicyan>"))
+                    print_formatted_text(HTML(
+                        f"<style fg='{t_theme['accent']}'><b>◈ 当前运行的后台进程（shell）</b></style>"
+                    ))
                     for t in shell_tasks:
-                        safe_cmd = t['command'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        safe_cmd = _esc(t['command'])
                         turn_code = turn_short_code(t.get('turn_id'))
                         turn_suffix = (
-                            f" | 回合: <ansigray>[turn:{turn_code}]</ansigray>" if turn_code else ""
+                            f" · 回合: <style fg='{t_theme['text_muted']}'>[turn:{turn_code}]</style>" if turn_code else ""
                         )
-                        print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']}{turn_suffix} | 命令: {safe_cmd}"))
+                        print_formatted_text(HTML(
+                            f"  <style fg='{t_theme['accent']}'>•</style> ID: <style fg='{t_theme['accent_soft']}'>{t['task_id']}</style> "
+                            f"<style fg='{t_theme['text_muted']}'>· PID: {t['pid']} · 运行: {t['duration']}{turn_suffix} · 命令: {safe_cmd}</style>"
+                        ))
                 if bg_sub_snapshots:
                     if shell_tasks:
                         print_formatted_text(HTML(""))
-                    print_formatted_text(HTML("<ansicyan><b>当前运行的后台子代理：</b></ansicyan>"))
+                    print_formatted_text(HTML(
+                        f"<style fg='{t_theme['accent']}'><b>◈ 当前运行的后台子代理</b></style>"
+                    ))
                     for t in bg_sub_snapshots:
-                        status_color = {"completed": "ansigreen", "failed": "ansired",
-                                       "cancelled": "ansigray", "timed_out": "ansired",
-                                       "in_progress": "ansiyellow", "running": "ansiyellow"}.get(t.status, "ansigray")
-                        desc_safe = (t.description or "")[:50].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        status_color = {
+                            "completed": t_theme["ok"],
+                            "failed": t_theme["err"],
+                            "cancelled": t_theme["text_muted"],
+                            "timed_out": t_theme["err"],
+                            "in_progress": t_theme["accent"],
+                            "running": t_theme["accent"],
+                        }.get(t.status, t_theme["text_muted"])
+                        desc_safe = _esc((t.description or "")[:50])
                         sub_turn_code = turn_short_code(t.parent_turn_id)
                         sub_turn_suffix = (
-                            f" | 回合: <ansigray>[turn:{sub_turn_code}]</ansigray>" if sub_turn_code else ""
+                            f" · 回合: <style fg='{t_theme['text_muted']}'>[turn:{sub_turn_code}]</style>" if sub_turn_code else ""
                         )
                         print_formatted_text(HTML(
-                            f"  <ansigreen>• ID: {t.task_id}</ansigreen> | 状态: <{status_color}>{t.status}</{status_color}> "
-                            f"| 类型: <ansicyan>{t.subagent_type}</ansicyan> | 阶段: {t.stage} "
-                            f"| 执行: {round(t.execution_elapsed, 1)}s{sub_turn_suffix} | 描述: {desc_safe}"
+                            f"  <style fg='{status_color}'>•</style> ID: <style fg='{t_theme['accent_soft']}'>{t.task_id}</style> "
+                            f"<style fg='{t_theme['text_muted']}'>· 状态: </style><style fg='{status_color}'>{t.status}</style> "
+                            f"<style fg='{t_theme['text_muted']}'>· 类型: {t.subagent_type} · 阶段: {t.stage} "
+                            f"· 执行: {round(t.execution_elapsed, 1)}s{sub_turn_suffix} · 描述: {desc_safe}</style>"
                         ))
-                print_formatted_text(HTML("<ansigray>提示：你可以输入 `/tasks tail &lt;ID&gt;` 查看日志/状态，或 `/tasks kill &lt;ID&gt;` 终结任务。</ansigray>"))
+                print_formatted_text(HTML(
+                    f"<style fg='{t_theme['text_muted']}'>提示：你可以输入 </style>"
+                    f"<style fg='{t_theme['accent_soft']}'>/tasks tail &lt;ID&gt;</style>"
+                    f"<style fg='{t_theme['text_muted']}'> 查看日志/状态，或 </style>"
+                    f"<style fg='{t_theme['accent_soft']}'>/tasks kill &lt;ID&gt;</style>"
+                    f"<style fg='{t_theme['text_muted']}'> 终结任务。</style>"
+                ))
 
     elif cmd in ("/plan", "/plans"):
         from core.task_scheduler import get_default_scheduler
 
+        t = _get_theme(current_theme)
         scheduler = get_default_scheduler()
         if len(parts) == 1:
             items = get_default_plan_manager().snapshot()
             if not items:
-                print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有任务计划。</ansiyellow>"))
+                print_formatted_text(HTML(f"  <style fg='{t['warn']}'>ℹ 当前会话没有任务计划。</style>"))
             else:
                 completed = sum(item.get("status") == "completed" for item in items)
-                print_formatted_text(HTML(f"<ansicyan><b>当前任务计划 ({completed}/{len(items)})</b></ansicyan>"))
+                pct = int(completed * 100 / len(items)) if items else 0
+                bar = _progress_bar_html(completed, len(items), width=12)
+                print_formatted_text(HTML(
+                    f"  <style fg='{t['border']}'>╭─</style>"
+                    f"<style fg='{t['accent']}'><b> ❖ 当前任务计划 ({completed}/{len(items)})</b></style> "
+                    f"{bar} <style fg='{t['text_muted']}'>{pct}%</style>"
+                ))
                 for item in items:
-                    marker = plan_mark(item.get("status"))
-                    color = plan_html_color(item.get("status"))
+                    st = str(item.get("status") or "").lower()
+                    marker = plan_mark(st)
+                    st_hex = {
+                        "completed": t["ok"],
+                        "done": t["ok"],
+                        "in_progress": t["accent"],
+                        "active": t["accent"],
+                        "failed": t["err"],
+                        "blocked": t["warn"],
+                        "cancelled": t["text_muted"],
+                    }.get(st, t["text_muted"])
                     subject = _esc(item.get("subject", ""))
-                    print_formatted_text(HTML(f"  <{color}>{marker}</{color}> {_esc(item['id'])}  {subject}"))
+                    stage = str(item.get("stage", "") or "").strip()
+                    stage_tag = {"plan": "计划", "build": "构建", "review": "审查"}.get(stage, "")
+                    stage_suffix = f" <style fg='{t['text_muted']}'>[{stage_tag}]</style>" if stage_tag else ""
+                    print_formatted_text(HTML(
+                        f"  <style fg='{t['border']}'>│</style> <style fg='{st_hex}'>{marker}</style> "
+                        f"<style fg='{t['text_muted']}'>{_esc(item['id'])}</style>  "
+                        f"<style fg='{t['text']}'>{subject}</style>{stage_suffix}"
+                    ))
+                print_formatted_text(HTML(f"  <style fg='{t['border']}'>╰{'─' * 40}</style>"))
         else:
             action = parts[1].lower()
             if action == "pause":
                 scheduler.pause()
-                print_formatted_text(HTML("<ansiyellow>⏸ 任务计划已暂停，不再启动新的计划项。</ansiyellow>"))
+                print_formatted_text(HTML(f"<style fg='{t['warn']}'>⏸ 任务计划已暂停，不再启动新的计划项。</style>"))
             elif action == "resume":
                 scheduler.resume()
-                print_formatted_text(HTML("<ansigreen>▶ 任务计划已恢复。</ansigreen>"))
+                print_formatted_text(HTML(f"<style fg='{t['ok']}'>▶ 任务计划已恢复。</style>"))
             elif action == "retry" and len(parts) > 2:
                 item_id = parts[2].strip("<>")
                 if scheduler.retry(item_id):
-                    print_formatted_text(HTML(f"<ansigreen>↻ 已重新排队计划项：{_esc(item_id)}</ansigreen>"))
+                    print_formatted_text(HTML(f"<style fg='{t['ok']}'>↻ 已重新排队计划项：{_esc(item_id)}</style>"))
                 else:
-                    print_formatted_text(HTML(f"<ansired>❌ 计划项 {_esc(item_id)} 当前不可重试。</ansired>"))
+                    print_formatted_text(HTML(f"<style fg='{t['err']}'>❌ 计划项 {_esc(item_id)} 当前不可重试。</style>"))
             elif action == "cancel":
                 count = scheduler.cancel_all()
-                print_formatted_text(HTML(f"<ansiyellow>⏹ 已取消 {count} 个未完成计划项。</ansiyellow>"))
+                print_formatted_text(HTML(f"<style fg='{t['warn']}'>⏹ 已取消 {count} 个未完成计划项。</style>"))
             else:
-                print_formatted_text(HTML("<ansired>❌ 用法：/plan、/plan pause、/plan resume、/plan retry &lt;id&gt;、/plan cancel</ansired>"))
+                print_formatted_text(HTML(f"<style fg='{t['err']}'>❌ 用法：/plan、/plan pause、/plan resume、/plan retry &lt;id&gt;、/plan cancel</style>"))
 
     elif cmd == "/resume":
         # 断点续跑（规格 §4.1 CLI 入口）：开关关闭只提示；否则打印断点 + 一次性确认。
@@ -4646,6 +5216,7 @@ def handle_slash_command(command_text):
         # 用法: /plugins                -> 查看清单
         #       /plugins enable <name>  -> 启用某插件
         #       /plugins disable <name> -> 禁用某插件
+        #       /plugins restore <name> -> 恢复被移除的内置插件
         #       /plugins reload         -> 重新扫描插件目录刷新清单
         from core import plugin_loader
         sub_parts = command_text.strip().split(maxsplit=2)
@@ -4668,6 +5239,17 @@ def handle_slash_command(command_text):
                 print_formatted_text(HTML("<ansired>⚠️ 用法: /plugins disable &lt;插件名&gt;</ansired>"))
             else:
                 ok, msg = plugin_loader.toggle_plugin(target, False)
+                if ok:
+                    print_formatted_text(HTML(f"<ansigreen>✔ {_esc(msg)}</ansigreen>"))
+                else:
+                    print_formatted_text(HTML(f"<ansired>⚠️ {_esc(msg)}</ansired>"))
+
+        elif sub == "restore":
+            target = sub_parts[2].strip() if len(sub_parts) > 2 else ""
+            if not target:
+                print_formatted_text(HTML("<ansired>⚠️ 用法: /plugins restore &lt;插件名&gt;</ansired>"))
+            else:
+                ok, msg = plugin_loader.restore_plugin(target)
                 if ok:
                     print_formatted_text(HTML(f"<ansigreen>✔ {_esc(msg)}</ansigreen>"))
                 else:
@@ -4698,6 +5280,9 @@ def handle_slash_command(command_text):
                     elif status == "disabled":
                         check = "<ansigray>[ ]</ansigray>"
                         state = "<ansigray>已禁用</ansigray>"
+                    elif status == "removed":
+                        check = "<ansigray>[ ]</ansigray>"
+                        state = "<ansigray>已移除（可恢复）</ansigray>"
                     elif status == "overridden":
                         check = "<ansigray>[ ]</ansigray>"
                         state = "<ansigray>被同名用户级插件覆盖</ansigray>"
@@ -4725,11 +5310,11 @@ def handle_slash_command(command_text):
                         print_formatted_text(HTML(f"      <ansigray>工具: {_esc(', '.join(tools))}</ansigray>"))
                     print_formatted_text(HTML(f"      <ansigray>路径: {_esc(info.get('path', ''))}</ansigray>"))
                 print_formatted_text(HTML(
-                    "<ansigray>  使用 /plugins enable|disable &lt;插件名&gt; 切换开关（重启后生效），/plugins reload 刷新清单。</ansigray>"
+                    "<ansigray>  使用 /plugins enable|disable &lt;插件名&gt; 切换开关（重启后生效），/plugins restore &lt;插件名&gt; 恢复已移除的内置插件，/plugins reload 刷新清单。</ansigray>"
                 ))
         else:
             print_formatted_text(HTML(
-                "<ansired>⚠️ 未知子命令。用法: /plugins [enable &lt;name&gt;|disable &lt;name&gt;|reload]</ansired>"
+                "<ansired>⚠️ 未知子命令。用法: /plugins [enable &lt;name&gt;|disable &lt;name&gt;|restore &lt;name&gt;|reload]</ansired>"
             ))
 
     elif cmd == "/hooks" or command_text.strip().startswith("/hooks "):
@@ -5127,14 +5712,130 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML(f"<ansired>❌ 未知指令: {safe_cmd}，输入 /help 查看帮助。</ansired>"))
 
 
+class _RoundedFrame:
+    """圆角边框容器：替代直角 Frame，支持动态标题与风险级边框色。"""
+
+    def __init__(
+        self,
+        body,
+        title="",
+        style: str = "",
+        border_style="class:frame.border",
+        title_style=None,
+    ) -> None:
+        self.body = body
+
+        def _border_cls() -> str:
+            return (
+                border_style()
+                if callable(border_style)
+                else str(border_style or "class:frame.border")
+            )
+
+        def _title_cls() -> str:
+            if callable(title_style):
+                return title_style()
+            if title_style:
+                return str(title_style)
+            b = _border_cls()
+            return "class:frame.label" if b in ("class:frame", "class:frame.border", "class:frame.dim") else b
+
+        def _title_fragments():
+            text = title() if callable(title) else str(title or "")
+            if not text:
+                return [(_border_cls(), "─")]
+            return [(_title_cls(), f" {text} ")]
+
+        top_row = VSplit(
+            [
+                Window(width=D.exact(2)),
+                Window(width=1, height=1, char="╭", style=_border_cls),
+                Window(width=1, height=1, char="─", style=_border_cls),
+                Window(
+                    content=FormattedTextControl(_title_fragments),
+                    height=1,
+                    dont_extend_width=True,
+                ),
+                Window(height=1, char="─", style=_border_cls),
+                Window(width=1, height=1, char="╮", style=_border_cls),
+                Window(width=D.exact(2)),
+            ],
+            height=1,
+        )
+        middle_row = VSplit(
+            [
+                Window(width=D.exact(2)),
+                Window(width=1, char="│", style=_border_cls),
+                Window(width=1),
+                body,
+                Window(width=1),
+                Window(width=1, char="│", style=_border_cls),
+                Window(width=D.exact(2)),
+            ],
+            padding=0,
+        )
+        bottom_row = VSplit(
+            [
+                Window(width=D.exact(2)),
+                Window(width=1, height=1, char="╰", style=_border_cls),
+                Window(height=1, char="─", style=_border_cls),
+                Window(width=1, height=1, char="╯", style=_border_cls),
+                Window(width=D.exact(2)),
+            ],
+            height=1,
+        )
+        self.container = HSplit([top_row, middle_row, bottom_row], style=style)
+
+    def __pt_container__(self):
+        return self.container
+
+
+def _active_subagent_snapshots():
+    """轻量读取未终态子代理快照（仅访问已加载的 core.tools，不触发冷导入）。"""
+    tools_mod = sys.modules.get("core.tools")
+    if tools_mod is None:
+        return []
+    mgr = getattr(tools_mod, "subagent_manager", None)
+    if mgr is None:
+        return []
+    try:
+        snaps = mgr.snapshot() or []
+    except Exception:
+        return []
+    terminal = {"completed", "failed", "cancelled", "timed_out"}
+    return [
+        s for s in snaps
+        if getattr(s, "status", "") not in terminal
+        and (
+            not getattr(s, "parent_session", "")
+            or getattr(s, "parent_session", "") == current_session
+        )
+    ]
+
+
+def _context_watermark_style(pct: float) -> str:
+    """按上下文占用比例返回四级水位样式类。"""
+    if pct >= 95.0:
+        return "class:status.ctx_crit"
+    if pct >= 80.0:
+        return "class:status.ctx_high"
+    if pct >= 60.0:
+        return "class:status.ctx_warn"
+    return "class:status.token"
+
+
+def _context_bar_text(pct: float, width: int = 6) -> str:
+    """生成紧凑的四级水位字符进度条（▓▓▓░░░）。"""
+    width = max(2, int(width))
+    clamped = max(0.0, min(100.0, float(pct)))
+    filled = max(0, min(width, round(clamped / 100.0 * width)))
+    if clamped > 0 and filled == 0:
+        filled = 1
+    return ("▓" * filled) + ("░" * (width - filled))
+
+
 def _make_input_app():
-    """
-    构建 Claude Code 风格的输入框：
-    ┌──────────────────────────────────────┐
-    │ >                                    │
-    └──────────────────────────────────────┘
-     model · session · dir     快捷键提示
-    """
+    """构建克制单主色风格的 CLI 主交互界面（支持动态多行输入与圆角状态卡片）。"""
     # COMMAND_COMPLETIONS 已提取为模块级常量（模块层定义供测试断言，
     # SlashCommandCompleter 引用不变）。
     command_completions = COMMAND_COMPLETIONS
@@ -5231,8 +5932,8 @@ def _make_input_app():
     input_area = TextArea(
         multiline=True,
         wrap_lines=True,
-        # 固定 1 行：超过的内容在框内滚动查看
-        height=D.exact(1),
+        # 随内容自适应 1~5 行，超出 5 行在框内滚动
+        height=D(min=1, max=5),
         style="class:input-field",
         focus_on_click=True,
         read_only=Condition(lambda: confirm_prompt is not None),
@@ -5316,11 +6017,7 @@ def _make_input_app():
                 if is_skill:
                     # 主动调用技能，放入后台队列处理
                     was_queued = is_thinking
-                    safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    if was_queued:
-                        _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) {safe_input}</ansigray>")
-                    else:
-                        _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
+                    _echo_user_message(text, queued=was_queued)
                         
                     # M35：入队时快照当前会话名，worker 处理时使用快照，
                     # 避免排队期间用户 /session switch 后消息写入错误的会话
@@ -5336,23 +6033,17 @@ def _make_input_app():
                     # /undo、/memory 等可能短暂阻塞 UI，但保证命令与用户输入严格按序执行），
                     # 因此后台 worker 里不再有 slash 路由分支。
                     input_area.text = ""
-                    safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
+                    _echo_user_message(text)
                     try:
                         handle_slash_command(text)
                     except Exception as e:
+                        t = _get_theme(current_theme)
                         print_formatted_text(
-                            HTML(f"\n<ansired>⚠️ 命令执行出错：{_esc(str(e))}</ansired>\n")
+                            HTML(f"\n<style fg='{t['err']}'>⚠ 命令执行出错：{_esc(str(e))}</style>\n")
                         )
             else:
                 was_queued = is_thinking
-                safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                if was_queued:
-                    # 立即打印置灰的排队等待提示
-                    _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) {safe_input}</ansigray>")
-                else:
-                    # 正常的青色高亮提示
-                    _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
+                _echo_user_message(text, queued=was_queued)
                 
                 # M35：入队时快照当前会话名（与上方技能调用分支一致）
                 msg_queue.put({
@@ -5471,7 +6162,13 @@ def _make_input_app():
     def toggle_permission_mode(event):
         """Shift+Tab 循环切换 星瑶Code 权限模式"""
         global current_permission_mode
-        modes = ["confirm", "accept_edits", "plan", "full"]
+        from core.permission_auto_decision import is_decision_model_enabled
+
+        modes = (
+            ["confirm", "accept_edits", "auto_decision", "plan", "full"]
+            if is_decision_model_enabled()
+            else ["confirm", "accept_edits", "plan", "full"]
+        )
         try:
             curr_idx = modes.index(current_permission_mode)
         except ValueError:
@@ -5483,12 +6180,11 @@ def _make_input_app():
         event.app.invalidate()
 
     def get_status():
-        """底部状态栏内容：极简无底色，带 Token 统计与后台任务监控"""
+        """底部状态栏内容：克制单主色、四级上下文水位与动态运行标签。"""
         # 1. 提取短模型名（使用内存缓存，避免每次渲染都读盘解析 config.json）
         model_display = current_model_name or "未激活模型"
 
-        # 2. 读取统一快照：输入/输出/命中取进程累计（跨会话/渠道/scope 混算）；
-        #    车道热命中率不进状态栏（一行宽度有限），明细改用 /usage 查看
+        # 2. 读取统一快照：输入/输出/命中取进程累计（跨会话/渠道/scope 混算）
         usage_snapshot = get_token_usage_snapshot(
             current_session, current_model, current_url, "main"
         )
@@ -5496,16 +6192,13 @@ def _make_input_app():
         latest_total = usage_snapshot["window"]["latest_total"]
         max_win = current_ctx_win
 
-        # 保活命中率与车道热口径都不再进状态栏：省掉一次 _status_cache_metrics
-        # 查询，需要看明细时用 /usage。
         cum_prompt = process_usage["cumulative_prompt"]
         cum_completion = process_usage["cumulative_completion"]
         cum_cached = process_usage["cumulative_cached"]
 
-        # 命中率分母用 prompt tokens（缓存只可能命中输入部分），
-        # 用 total（含输出）会把比率稀释失真。未报告时为 None，显示 "--"。
+        # 命中率分母用 prompt tokens（缓存只可能命中输入部分）
         global_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else None
-        pct = (latest_total / max_win * 100) if max_win > 0 else 0
+        pct = (latest_total / max_win * 100) if max_win > 0 else 0.0
 
         def format_num(n):
             if n >= 1_000_000:
@@ -5523,26 +6216,18 @@ def _make_input_app():
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 状态栏 Token 概览：只报进程累计口径与上下文占用（车道热命中率与保活已移除）
-        token_info = _compose_status_token_info(
-            prompt=prompt_str,
-            completion=completion_str,
-            cached=cached_str,
-            global_rate=global_rate_str,
-            ctx_pct=f"{pct:.0f}%",
-            ctx_used=latest_total_str,
-            ctx_max=max_win_str,
-        )
+        # 状态栏 Token 概览拆成累计流量 + 四级水位进度条
+        token_flow = f"↑ {prompt_str} · ↓ {completion_str} · ⚡ {cached_str} ({global_rate_str})"
+        ctx_bar = _context_bar_text(pct, width=6)
+        ctx_text = f" {ctx_bar} {pct:.0f}% ({latest_total_str}/{max_win_str})"
+        ctx_style = _context_watermark_style(pct)
 
-        # 3. 状态位：一律展示最近一次请求的实测吐字速度（t/s）——运行中只加
-        # 旋转动画，不再叠状态文字；仅「等待授权确认」保留文字提示，因为那一
-        # 步需要用户动手。直接读模块全局变量，不再 import main 自引用
+        # 3. 状态位：一律展示最近一次请求的实测吐字速度（t/s）
         status_label, task_style = _compose_status_task_segment(
             task_status, _last_token_speed
         )
 
         if task_status != "idle":
-            # 播放流式旋转动画
             elapsed = time.time()
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             frame = frames[int(elapsed * 5) % len(frames)]
@@ -5552,13 +6237,16 @@ def _make_input_app():
 
         # 2.5 渲染权限模式标识
         perm_style = "class:status.permission_confirm"
-        perm_label = " 变更前确认 "
+        perm_label = " 确认 "
         if current_permission_mode == "confirm":
-            perm_label = " 变更前确认 "
+            perm_label = " 确认 "
             perm_style = "class:status.permission_confirm"
         elif current_permission_mode == "accept_edits":
             perm_label = " 自动编辑 "
             perm_style = "class:status.permission_accept_edits"
+        elif current_permission_mode == "auto_decision":
+            perm_label = " 自动决策 "
+            perm_style = "class:status.permission_auto_decision"
         elif current_permission_mode == "plan":
             perm_label = " 计划模式 "
             perm_style = "class:status.permission_plan"
@@ -5566,35 +6254,69 @@ def _make_input_app():
             perm_label = " 完全访问 "
             perm_style = "class:status.permission_full"
 
-        # 电脑操控段（设计 17.2，Task 14 审查裁决①）：活动 run 才显示
-        # 「电脑操控: 运行中 · Edge · N 步」，否则状态栏保持既有布局。
         segments = [
-            ("class:status.model",   f" {model_display} "),
-            ("class:status.sep",     "  |  "),
-            (perm_style,             perm_label),
-            ("class:status.sep",     "  |  "),
-            ("class:status.token",   token_info),
-            ("class:status.sep",     "  |  "),
-            (task_style,             task_info),
+            ("class:status.model", f"   ✦ {model_display} "),
+            ("class:status.sep",   "│"),
+            (perm_style,           perm_label),
+            ("class:status.sep",   "│ "),
+            ("class:status.token", token_flow),
+            (ctx_style,            ctx_text),
         ]
-        # 状态栏不渲染 Git 段（git 子进程在本机约 1s，见 _ensure_cli_disclaimer_consent
-        # 上方的说明）；Git 信息按需用 /git status 查看，保证输入零阻塞。
+        try:
+            q_size = msg_queue.qsize()
+        except Exception:
+            q_size = 0
+        if q_size > 0:
+            segments.extend([
+                ("class:status.sep",  " │"),
+                ("class:status.warn", f" 排队 {q_size} "),
+            ])
+        active_subs = _active_subagent_snapshots()
+        if active_subs:
+            segments.extend([
+                ("class:status.sep",   " │"),
+                ("class:status.model", f" 子代理 {len(active_subs)} "),
+            ])
+        if _goal_has_running():
+            segments.extend([
+                ("class:status.sep",   " │"),
+                ("class:status.model", " 目标运行中 "),
+            ])
+        segments.extend([
+            ("class:status.sep", " │"),
+            (task_style,         task_info),
+        ])
         return segments
 
     def get_activity_text():
         """渲染独立区域的执行中状态。"""
         if is_thinking:
             elapsed = max(0.0, time.time() - activity_start_time)
-            # 帧下标与状态栏的旋转动画用同一套公式（基于绝对时间而非本地
-            # elapsed），避免两个动画刷新率不一致导致的观感卡顿。
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             frame = frames[int(time.time() * 5) % len(frames)]
-            # 首轮对话赶在后台预热完成前发出时，模型引擎首次初始化
-            # 需要时间——如实显示“启动模型引擎”，避免看似卡死。
             if not _llm_engine_ready and _active_tool_status is None:
-                return f"  {frame} {_agent_name()}正在启动模型引擎 · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
-            return _format_activity_text(task_status, _active_tool_status, elapsed, frame)
-        return ""
+                return [
+                    ("class:status.activity_spin", f"  {frame} "),
+                    ("class:status.think", f"{_agent_name()}正在启动模型引擎"),
+                    ("class:status.activity_meta", f" · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"),
+                ]
+            raw = _format_activity_text(task_status, _active_tool_status, elapsed, frame)
+            lines = raw.split("\n", 1)
+            head = lines[0]
+            stripped_head = head.lstrip()
+            indent = head[: len(head) - len(stripped_head)]
+            if stripped_head.startswith(frame + " "):
+                rest = stripped_head[len(frame) + 1 :]
+                frags = [
+                    ("class:status.activity_spin", f"{indent}{frame} "),
+                    ("class:status.think", rest),
+                ]
+            else:
+                frags = [("class:status.think", head)]
+            if len(lines) > 1 and lines[1]:
+                frags.append(("class:status.activity_detail", f"\n{lines[1]}"))
+            return frags
+        return []
 
     @Condition
     def is_live_thinking_cond():
@@ -5615,31 +6337,32 @@ def _make_input_app():
         return HTML(_confirm_prompt_text(confirm_prompt))
 
     confirm_window = ConditionalContainer(
-        content=Frame(
+        content=_RoundedFrame(
             Window(
                 content=FormattedTextControl(get_confirm_prompt_content),
-                height=D(min=6, max=9),
-                wrap_lines=True
+                height=D(min=6, max=11),
+                wrap_lines=True,
             ),
-            title="🚨 敏感操作授权确认 (用方向键选择，回车确认)",
-            style="class:status.confirm-frame"
+            title=lambda: _confirm_card_meta(confirm_prompt)[1],
+            style="class:status.confirm-frame",
+            border_style=lambda: _confirm_card_meta(confirm_prompt)[0],
         ),
-        filter=Condition(lambda: confirm_prompt is not None)
+        filter=Condition(lambda: confirm_prompt is not None),
     )
 
     # 记忆与任务拆解面板内容生成器
     def get_memory_summary_content():
         summary = manager.get_memory_summary(current_session) or "暂无会话记忆摘要。"
-        
+
         from core.plan import get_default_plan_manager
         plan_text = _format_plan_items(get_default_plan_manager().snapshot())
-                    
-        display_text = f"💡 [会话记忆摘要]\n  {summary}\n"
+
+        display_text = f"◈ [会话记忆摘要]\n  {summary}\n"
         if plan_text:
-            display_text += "\n📋 [当前任务规划]\n" + plan_text
+            display_text += "\n❖ [当前任务规划]\n" + plan_text
         else:
-            display_text += "\n📋 [当前任务规划]\n  暂无计划步骤 (可在对话中输入以产生任务)"
-            
+            display_text += "\n❖ [当前任务规划]\n  暂无计划步骤 (可在对话中输入以产生任务)"
+
         return display_text
 
     def get_live_plan_content():
@@ -5661,14 +6384,15 @@ def _make_input_app():
         return any(item.get("status") not in TERMINAL_STATUSES for item in items)
 
     live_plan_window = ConditionalContainer(
-        content=Frame(
+        content=_RoundedFrame(
             Window(
                 content=FormattedTextControl(get_live_plan_content),
                 height=D(min=2, max=10),
                 wrap_lines=True,
             ),
-            title="📋 当前任务计划",
+            title="❖ 当前任务计划",
             style="class:status.live-plan-frame",
+            border_style="class:frame.dim",
         ),
         filter=Condition(
             lambda: _has_active_plan_items()
@@ -5683,24 +6407,69 @@ def _make_input_app():
     )
 
     memory_window = ConditionalContainer(
-        content=Frame(
+        content=_RoundedFrame(
             Window(
                 content=FormattedTextControl(get_memory_summary_content),
                 height=6,
-                wrap_lines=True
+                wrap_lines=True,
             ),
-            title="🧠 会话记忆与任务拆解面板 (Ctrl+T 折叠/展开)",
-            style="class:status.memory-frame"
+            title="◈ 会话记忆与任务拆解 (Ctrl+T 折叠/展开)",
+            style="class:status.memory-frame",
+            border_style="class:frame.dim",
         ),
-        filter=Condition(lambda: show_memory_summary)
+        filter=Condition(lambda: show_memory_summary),
     )
+
+    def get_subagent_panel_content():
+        active = _active_subagent_snapshots()
+        if not active:
+            return []
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        spinner = frames[int(time.time() * 5) % len(frames)]
+        fragments = []
+        for idx, s in enumerate(active[:4]):
+            if idx > 0:
+                fragments.append(("", "\n"))
+            stype = str(getattr(s, "subagent_type", "") or "agent")
+            stage = str(getattr(s, "stage", "") or "")
+            desc = _truncate_visible(str(getattr(s, "description", "") or ""), 44)
+            elapsed_s = float(getattr(s, "execution_elapsed", 0.0) or 0.0)
+            badge = "后台" if getattr(s, "run_in_background", False) else "并发"
+            stage_part = f" · {stage}" if stage else ""
+            fragments.append(("class:status.subagent_spin", f"  {spinner} "))
+            fragments.append(("class:status.subagent_type", f"[{stype}] "))
+            fragments.append(("class:status.subagent_text", f"{desc} "))
+            fragments.append(("class:status.subagent_meta", f"({badge}{stage_part} · {elapsed_s:.1f}s)"))
+        if len(active) > 4:
+            fragments.append(("", "\n"))
+            fragments.append(("class:status.subagent_meta", f"  … 还有 {len(active) - 4} 个并行子代理"))
+        return fragments
+
+    subagent_window = ConditionalContainer(
+        content=_RoundedFrame(
+            Window(
+                content=FormattedTextControl(get_subagent_panel_content),
+                height=D(min=1, max=5),
+                wrap_lines=True,
+            ),
+            title=lambda: f"◈ 并发子代理 ({len(_active_subagent_snapshots())})",
+            style="class:status.subagent-frame",
+            border_style="class:frame.dim",
+        ),
+        filter=Condition(lambda: bool(_active_subagent_snapshots())),
+    )
+
+    def get_input_prefix():
+        if confirm_prompt is not None:
+            return [("class:input-prefix-wait", "  ? ")]
+        return [("class:input-prefix", "  ❯ ")]
 
     root_container = HSplit([
         confirm_window,
         live_plan_window,
         memory_window,
         ConditionalContainer(
-            content=Frame(
+            content=_RoundedFrame(
                 Window(
                     content=FormattedTextControl(
                         _thinking_panel_text,
@@ -5711,43 +6480,45 @@ def _make_input_app():
                     always_hide_cursor=True,
                     style="class:status.thinking-content",
                 ),
-                title=f"{_agent_name()}正在思考",
+                title=lambda: f"◌ {_agent_name()} 思考轨迹 · {max(0.0, time.time() - think_start_time):.1f}s",
                 style="class:status.thinking-frame",
+                border_style="class:frame.dim",
             ),
             filter=is_live_thinking_cond,
         ),
         ConditionalContainer(
             content=Window(
                 content=FormattedTextControl(get_activity_text),
-                # 活动标题与安全命令摘要各占一行。
+                # 活动标题与安全命令摘要各占一行（children[4] 测试契约保持不变）。
                 height=2,
-                style="class:status.think"
+                style="class:status.think",
             ),
-            filter=is_working_cond
+            filter=is_working_cond,
         ),
+        subagent_window,
         # 弹性占位：吸收 HSplit 的所有剩余高度（非全屏模式下布局高度只增不减，
         # 思考面板消失后多出的行会灌进唯一无 max 上限的容器）。把它放在输入框上方，
         # 输入框+状态栏就能始终钉在布局区域底部，不随思考面板显隐而跳动。
-        # weight 设大，防止思考面板 Frame（同样无 max 上限）分走空间被撑高。
         Window(height=D(min=0, weight=100)),
         Window(
             content=FormattedTextControl(
-                lambda: [("class:input-line", "─" * _terminal_width() + "\n")]
+                lambda: [("class:input-line", "  " + ("─" * max(16, _terminal_width() - 4)) + "\n")]
             ),
             height=1,
             style="class:input-line",
         ),
         VSplit([
             Window(
-                content=FormattedTextControl([("class:input-prefix", "> ")]),
-                width=D.exact(2),
+                content=FormattedTextControl(get_input_prefix),
+                width=D.exact(4),
                 style="class:input-field",
             ),
             input_area,
+            Window(width=D.exact(2)),
         ]),
         Window(
             content=FormattedTextControl(
-                lambda: [("class:input-line", "─" * _terminal_width() + "\n")]
+                lambda: [("class:input-line", "  " + ("─" * max(16, _terminal_width() - 4)) + "\n")]
             ),
             height=1,
             style="class:input-line",
@@ -5800,52 +6571,64 @@ def _build_cli_style(theme_name):
     cached = _CLI_STYLE_CACHE.get(theme_name)
     if cached is not None:
         return cached
-    from core.themes import THEMES
-    theme_cfg = THEMES.get(theme_name, THEMES["cyan"])
-    border_color = theme_cfg.get("border", "#00b4d8")
-    label_color = theme_cfg.get("label", "bold #00b4d8")
-    status_main = theme_cfg.get("status_main", "bold #00b4d8")
-    status_text = theme_cfg.get("status_text", "#718096")
-    status_sep = theme_cfg.get("status_sep", "#445566")
-    text_input = theme_cfg.get("text_input", "#dde1e7")
-    menu_current = theme_cfg.get("menu_current", "bg:#00b4d8 #ffffff bold")
-    menu_current_meta = theme_cfg.get("menu_current_meta", "bg:#00b4d8 #ffffff")
+    t = _get_theme(theme_name)
 
     style = Style.from_dict({
-        # 输入框边框
-        "input-frame":     "bg:#0a0a0f",
-        "input-line":      f"{border_color}",
-        "input-prefix":    f"bg:#0a0a0f {label_color}",
-        "status.memory-frame": f"bg:#0a0a0f {status_text}",
-        "status.live-plan-frame": f"bg:#0a0a0f {status_text}",
-        "status.thinking-frame": f"bg:#0a0a0f {status_text}",
-        "status.thinking-content": f"bg:#0a0a0f {status_text}",
+        # 输入框：融入终端原生背景，仅保留极细微分隔线与主题引导符
+        "input-frame":            "",
+        "input-line":             t["border_dim"],
+        "input-prefix":           f"bold {t['accent']}",
+        "input-prefix-wait":      f"bold {t['warn']}",
+        "input-field":            t["text_input"],
 
-        "status.confirm-frame": f"bg:#0a0a0f {status_main} bold",
-        "frame.border":    border_color,
-        "frame.label":     label_color,
-        # 输入文字
-        "input-field":     f"bg:#0a0a0f {text_input}",
-        # 状态栏：去掉所有底色，直接使用前景色
-        "status.model":    status_main,
-        "status.sep":      status_sep,
-        "status.token":    status_text,
-        "status.think":    "bold #e2e8f0",
-        "status.task_active": "bold #39ff14",  # 矩阵亮绿
-        "status.task_idle":   status_sep,
-        # 闲置位的实测吐字速度：用主题主色加粗，比原来的灰色"闲置"更醒目
-        "status.task_speed":  f"bold {border_color}",
-        "status.permission_confirm":      "bold #50fa7b",
-        "status.permission_accept_edits": "bold #f1fa8c",
-        "status.permission_plan":         "bold #88c0d0",
-        "status.permission_full":         "bold #ffb86c",
-        
-        # 下拉补全菜单的颜色
-        "completion-menu": "bg:#1a2a3a #e2e8f0",
-        "completion-menu.completion": "bg:#1a2a3a #e2e8f0",
-        "completion-menu.completion.current": menu_current,
-        "completion-menu.meta.completion": "bg:#1a2a3a #718096",
-        "completion-menu.meta.completion.current": menu_current_meta,
+        # 圆角状态/确认框
+        "frame.border":           t["border"],
+        "frame.dim":              t["border_dim"],
+        "frame.warn":             t["warn"],
+        "frame.err":              t["err"],
+        "frame.label":            t["label"],
+        "status.memory-frame":    t["text_soft"],
+        "status.live-plan-frame": t["text_soft"],
+        "status.thinking-frame":  t["text_muted"],
+        "status.thinking-content": t["text_soft"],
+        "status.subagent-frame":  t["text_soft"],
+        "status.confirm-frame":   f"bold {t['accent']}",
+
+        # 状态栏：透明底色，克制单主色 + 四级上下文水位
+        "status.model":           t["status_main"],
+        "status.sep":             t["status_sep"],
+        "status.token":           t["text_muted"],
+        "status.ctx_warn":        t["warn"],
+        "status.ctx_high":        t["err"],
+        "status.ctx_crit":        f"bold {t['err']}",
+        "status.warn":            f"bold {t['warn']}",
+        "status.think":           f"bold {t['text']}",
+        "status.activity_spin":   f"bold {t['accent']}",
+        "status.activity_meta":   t["text_muted"],
+        "status.activity_detail": t["accent_soft"],
+        "status.subagent_spin":   f"bold {t['accent']}",
+        "status.subagent_type":   t["accent_soft"],
+        "status.subagent_text":   t["text"],
+        "status.subagent_meta":   t["text_muted"],
+        "status.task_active":     f"bold {t['warn']}",
+        "status.task_idle":       t["status_sep"],
+        "status.task_speed":      f"bold {t['accent']}",
+
+        # 权限档位标识（低饱和信号/主题色，避免霓虹撞色）
+        "status.permission_confirm":       f"bold {t['ok']}",
+        "status.permission_accept_edits":  f"bold {t['accent_soft']}",
+        "status.permission_auto_decision": f"bold {t['accent']}",
+        "status.permission_plan":          f"bold {t['warn']}",
+        "status.permission_full":          f"bold {t['err']}",
+
+        # 下拉补全菜单（深色柔面底色 + 当前主题主色高亮）
+        "completion-menu":                        f"bg:{t['menu_bg']} {t['menu_text']}",
+        "completion-menu.completion":             f"bg:{t['menu_bg']} {t['menu_text']}",
+        "completion-menu.completion.current":     t["menu_current"],
+        "completion-menu.meta.completion":        f"bg:{t['menu_bg']} {t['menu_meta']}",
+        "completion-menu.meta.completion.current": t["menu_current_meta"],
+        "scrollbar.background":                   f"bg:{t['surface_bg']}",
+        "scrollbar.button":                       f"bg:{t['border_dim']}",
     })
     _CLI_STYLE_CACHE[theme_name] = style
     return style
@@ -5942,13 +6725,13 @@ def _background_worker():
             # 转换为友好的用户消息，触发主代理汇总后台任务结果
             # 这不是用户主动输入的，而是后台任务全部终态后自动触发的
             if is_internal and user_input == "__ycode_internal__:summarize_background_tasks":
-                # 打印系统触发提示（不是 "✨ You >"，避免混淆）
-                schedule_ui(lambda: print_formatted_text(
-                    HTML("\n<ansicyan>📦 所有后台子代理任务已结束，正在自动汇总结果...</ansicyan>\n")
+                # 打印系统触发提示（不是 "❯ 你"，避免混淆）
+                schedule_ui(lambda: _print_ui_html(
+                    f"\n  <style fg='{_get_theme(current_theme)['accent']}'>◈ 所有后台子代理任务已结束，正在自动汇总结果...</style>\n"
                 ))
                 # 转换为友好的用户消息，让主代理自然汇总
                 user_input = "请汇总所有后台子代理任务的结果并告诉我。如果某些任务失败了，请用你自身的工具（如 search_news / fetch_url 等）接手完成，然后一并汇总。"
-                # internal 指令不算排队任务，不打印 "⚡ [开始执行排队任务]"
+                # internal 指令不算排队任务，不打印 "▶ [开始执行排队任务]"
                 was_queued = False
                 is_skill_call = False
             else:
@@ -5966,8 +6749,9 @@ def _background_worker():
                 # 先按原始文本截断再转义，避免把 &lt; 之类的 HTML 实体从中间切断
                 display_input = user_input[:50] + "..." if len(user_input) > 50 else user_input
                 display_input = _esc(display_input)
-                schedule_ui(lambda text=display_input: print_formatted_text(
-                    HTML(f"⚡ <b><ansigreen>[开始执行排队任务]</ansigreen></b> <ansigray>{text}</ansigray>")
+                schedule_ui(lambda text=display_input: _print_ui_html(
+                    f"  <style fg='{_get_theme(current_theme)['accent']}'><b>▶ [开始执行排队任务]</b></style> "
+                    f"<style fg='{_get_theme(current_theme)['text_muted']}'>{text}</style>"
                 ))
 
             # 捕捉配置
@@ -5975,8 +6759,10 @@ def _background_worker():
             active_info = get_active_model()
             if not active_info or not active_info.get("litellm_model"):
                 _report_task_result(task_data, False, "未配置或激活任何大模型")
-                schedule_ui(lambda: print_formatted_text(
-                    HTML("<ansired>! 您当前未配置或激活任何大模型！请输入 /models 添加并激活模型后再进行对话。</ansired>")
+                schedule_ui(lambda: _print_ui_html(
+                    f"  <style fg='{_get_theme(current_theme)['err']}'>"
+                    "! 您当前未配置或激活任何大模型！请输入 /models 添加并激活模型后再进行对话。"
+                    "</style>"
                 ))
                 continue
 
@@ -6042,8 +6828,8 @@ def _background_worker():
                 skill_name = parts[0][1:]
                 actual_query = parts[1] if len(parts) > 1 else "请启动并运行该技能。"
 
-                schedule_ui(lambda name=_esc(skill_name): print_formatted_text(
-                    HTML(f"\n⚡ <b><ansigreen>[主动调用技能: {name}]</ansigreen></b>")
+                schedule_ui(lambda name=_esc(skill_name): _print_ui_html(
+                    f"\n  <style fg='{_get_theme(current_theme)['accent']}'><b>⚡ [主动调用技能: {name}]</b></style>"
                 ))
 
                 parsed_content, attached_msgs = parse_user_input(actual_query)
@@ -6074,13 +6860,13 @@ def _background_worker():
                     parsed_content, attached_msgs = user_input, []
                 # 在终端打印挂载的文件提示
                 for msg in attached_msgs:
-                    schedule_ui(lambda message=_esc(msg): print_formatted_text(
-                        HTML(f"  <ansigreen>{message}</ansigreen>")
+                    schedule_ui(lambda message=_esc(msg): _print_ui_html(
+                        f"    <style fg='{_get_theme(current_theme)['ok']}'>{message}</style>"
                     ))
                 if session_refs:
                     for name in session_refs:
-                        schedule_ui(lambda n=_esc(name): print_formatted_text(
-                            HTML(f"  <ansigreen>💬 已引用对话: {n}</ansigreen>")
+                        schedule_ui(lambda n=_esc(name): _print_ui_html(
+                            f"    <style fg='{_get_theme(current_theme)['accent_soft']}'>◈ 已引用对话: {n}</style>"
                         ))
 
             # --- 按回合撤销生命周期重排（规格 9.1）---
