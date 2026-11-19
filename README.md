@@ -1,13 +1,13 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.3.9](https://img.shields.io/badge/Version-1.3.9-green.svg)](core/version.py)
+[![Version 1.4.0](https://img.shields.io/badge/Version-1.4.0-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
 [English](README.en.md) | 中文
 
-> 一个国产终端 AI 编程助手，代号「星瑶」。支持 TUI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
+> 一个国产桌面 + 终端双形态 AI 编程助手，代号「星瑶」。支持 GUI 窗口与 TUI 控制台、多模型切换、子代理编排、计划与工作流执行、长期记忆、MCP 扩展、可插拔技能与插件、星轨自动化任务、桌面宠物，以及手机局域网远程访问。
 
 > **使用须知**：本项目是运行在你本地设备上的 AI 编程辅助工具，自身不提供模型服务，模型需你自行配置并直接与其通信。AI 生成内容可能不准确、需你自行审查验证；软件具备文件读写与命令执行能力，请在使用前阅读下方「免责条款」——安装向导与首次启动都会提示确认。
 
@@ -23,13 +23,19 @@
 - **9 种终端主题**：cyan / matrix / nord / cyberpunk / dracula / lava / sunset / amber / white，`/theme` 一键切换
 - **终端 Markdown 渲染**：代码块语法高亮、表格、列表等富文本展示
 - **思考流显示**：实时呈现模型推理过程（`<thinking>` 标签解析 + 句子边界缓冲）
+- **极简界面**：无边框窗口 + 统一设计 token，会话头面包屑与工作区标签、工具执行轨道行、设置子页单列行式列表；窗口控件与全站图标统一为矢量描边
+- **回合指标**：执行中实时显示瞬时输出速度，结束后显示整段任务墙钟总时长（写回该回合、保留到下一轮），悬浮可看任务总时长与模型耗时的区分
+- **右侧文档页签**：PDF / Word / Excel / PPT 在面板内直接预览，可就地加批注（高亮、方框、箭头、便签等）、白块遮盖改写、删页 / 旋转 / 插页，保存生成新 PDF
+- **小说工作台**：右栏「小说」页签按书看进度——章节列表点开即读即改，设定库汇总伏笔 / 角色 / 卷纲，附字数趋势、一键只读体检与全书导出
+- **桌面宠物**：星瑶常驻桌面小窗，任务执行时冒气泡播报状态；支持自建宠物包换肤（设置页卡片切换，重启生效），空闲闲聊阈值与模型可配
 
 ### 模型与工具
 
-- **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / Agnes 等多种协议，由自研 HTTPX 引擎（`core/llm_native_transport.py`）统一调用
+- **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / 阶跃等多种协议，由自研 HTTPX 引擎（`core/llm_native_transport.py`）统一调用；预置厂商目录只带厂商信息，模型交由「拉取可用模型」按需选择——端点自动拼接、404 换拼法重试、多 Key 逐个尝试，上下文窗口 / 最大输出 / 多模态能力按各厂商字段提取，未提供时按本地规格表回填
 - **副模型机制**：可配置副模型承担视觉识别、记忆压缩、子代理调用等任务，主副分工
-- **29 个内置工具**：文件读写、代码搜索、命令执行、网页抓取、图片下载与生图、天气查询、LSP 符号查找、计划编排、智能路由等
-- **工具结果缓存**：相同搜索/读取自动走本地缓存，节省 token 与时间
+- **91 个内置工具**（iMOM 定位插件另附 5 个专用工具，合计 96 个）：文件读写与批量原子编辑、跨文件代码搜索与符号大纲 / 引用、命令执行与后台任务、网页抓取与免费新闻搜索、图片与视频生成、天气查询、计划编排、子代理派发、会话 / 模型 / 技能 / 插件 / Hook 管理、办公文档读写、小说创作工具链、电脑操控与 Windows 系统工具
+- **免费网页搜索**：360 搜索优先、必应 RSS 兜底，不再依赖第三方包（超时也只降速不失效）
+- **工具结果缓存**：只读工具的相同搜索 / 读取走进程内缓存，节省 token 与时间
 
 ### 核心内核（Harness）
 
@@ -38,6 +44,8 @@
 - **崩溃恢复**：未完成回合仅标记为 `interrupted`，绝不自动重放模型请求、命令或文件写入等副作用
 - **请求指纹**：对最终 Provider 请求生成不可变指纹，配合 byte-golden 回归防止缓存漂移
 - **工具管线**：同签名重复调用抑制（RepeatCallGuard），相邻只读工具并发批量执行
+- **断点续跑判定**：被中断的回合按判定表决定从哪一步接续，工具事件以脱敏事实写入 journal 作为依据（只记事件与回放标记，不新增状态迁移）
+- **上下文缓存**：稳定前缀（跨轮不变内容全部并进系统提示词）+ 四级水位线（省略 / 折叠 / 摘要），插入式压缩复用主请求字节完成，长会话缓存命中率不随轮次崩跌
 
 ### 高级编排
 
@@ -45,22 +53,33 @@
 - **计划执行模式**：多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
 - **后台任务管理**：长周期命令后台执行，`/tasks` 查看状态、`/tasks tail` 看日志、`/tasks kill` 终结
 - **权限系统**：四种模式（confirm 变更前确认 / accept_edits 自动编辑 / plan 计划模式 / full 完全访问），沙盒控制工作目录访问边界
+- **星轨自动化任务**：把一段提示词绑定到定时 / 周期 / 启动 / 延时一次性触发器，到点自动向指定会话发起完整回合；可选用「每次新建会话」或「沿用固定会话」，错过触发默认补跑；无人值守权限只支持确认与自动编辑两档
+- **工作流编排**：`.dwf.ts` 脚本按阶段声明子代理、命令与汇报，保存后自动生成同名技能，`/workflow` 或 `workflow_run` 执行；每步事件实时可见
+- **秘书派活台账**：每次派活落一条记录（排队 / 执行中 / 完成 / 失败 / 取消 / 依赖未满足），回合结束回写结果摘要并通知发起会话，最多一批 8 条、可声明批次内依赖
+- **任务决策钩子**：循环止损、子代理验收等四个控制点可接入 JEV 决策模型，支持影子 / 正式两种运行模式，阈值与失败回落可配
 
 ### 记忆与上下文
 
 - **SQLite 会话记忆**：多会话切换；撤销不改写历史，聊天完整保留
 - **按回合撤销**：每个回合的受控文件修改持久化快照，`/undo` 整轮预检后一键撤销；冲突零写入、崩溃可恢复，模型通过上下文得知文件结果已失效
 - **长期记忆系统**：四类记忆（user / feedback / project / reference）+ 每日日志 + Dream 整理线程，支持「记住 XXX」指令
-- **智能记忆压缩**：历史 token 占用达 70% 自动压缩，工具结果预截断，tiktoken 精确估算
+- **智能记忆压缩**：四级水位线——历史 token 占窗口 60% 先做工具结果移除 / 折叠，80% 升级省略，95% 触发模型摘要；空闲 240 秒另跑本地水位维护与预压缩，触发判断优先用上一轮真实 API 用量基线
 - **会话导出**：`/share` 一键导出为 Markdown / HTML / JSON
+- **项目画像**：按项目目录记录技术栈 / 架构决策 / 硬约束 / 踩坑记录 / 偏好，每轮对话自动注入当前项目那几节；写入只落星瑶自己的记忆目录
+- **自我演化**：回合结束后静默学习，逐步形成用户档案与自我认知，设置页可查看或关闭
+- **摘要回溯**：每次压缩归档一代摘要，`recall_history` 可按边界回查被压缩掉的原始消息，细节不必靠猜
 
 ### 扩展生态
 
 - **技能系统（Skills）**：扫描 `SKILL.md` 并动态注入系统提示词，支持项目级与用户级
-- **插件系统（Plugins）**：进程内插件扩展工具能力，零核心侵入，单插件异常不影响启动；内置混元文生图插件，支持用户级插件热加载
+- **插件系统（Plugins）**：进程内插件扩展工具能力，零核心侵入，单插件异常不影响启动；内置 6 个插件，支持用户级插件热加载
 - **MCP 客户端**：全屏 CLI 配置器 + 10+ 预设模板（飞书 / 高德 / B 站 / SQLite / Postgres 等），AI 可自配置 MCP
 - **Git Worktree**：`/worktree` 管理多分支并行工作区
 - **Git 工作台**：GUI「源代码管理」页签 + CLI `/git` 命令（状态/Diff/暂存/提交/分支/同步/Stash/历史/冲突），支持外部变化自动刷新、仓库信任确认与高风险操作二次确认；AI 在对话中的 Git 操作仍走原有权限流程
+- **技能 / 插件可删除**：页面行尾垃圾桶二次确认后物理删除目录；内置源与内置插件拒绝删除，符号链接与越界路径一律拒绝（手机远程接口同步封禁）
+- **内置技能与插件**：仓库自带 15 个技能包（宝玉系列公众号 / 小红书配图、提示词扩写与优化、公众号排版、讲解视频、办公文档、插件开发等）与 6 个插件（混元生图、基元律动生图 / 生视频、办公文档、小说工作台、Windows 系统工具）
+- **GUI 主题系统**：内置皮肤 + 自定义主题，可复制 / 重命名 / 导入导出 ZIP、读取主题内图片资源
+- **手机远程访问**：中转服务把桌面会话接到局域网 / 外网，手机浏览器打开完整桌面界面（设备注册 + 独立令牌），事件广播异步化，手机断网不阻塞桌面
 
 ## 🚀 快速开始
 
@@ -358,45 +377,130 @@ venv\Scripts\python build_release.py --setup-only
 
 ## 🛠️ 内置工具
 
-Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工具），分为只读与变更两组：
+Y-code 内置 91 个工具（不含 iMOM 项目定位插件栈的 5 个专用工具），按用途分为九组：
 
-### 只读工具
+### 文件与代码（只读）
 
 | 工具 | 功能 |
 |------|------|
 | `read_file` | 读取文件（支持 offset/limit/行号显示/压缩；大文件自动截断） |
-| `list_directory` | 列出目录内容 |
-| `search_code` | 跨文件代码搜索（基于 ripgrep） |
+| `list_directory` | 列出目录内容（支持 depth=2..4 目录树） |
 | `glob_files` | 按 glob 模式查找文件 |
-| `find_definition` | 查找符号定义位置（支持 Python/JS/TS/Go/Rust/Java/C/C++/C#） |
-| `search_news` | 联网新闻搜索 |
-| `fetch_url` | 获取网页或 JSON（含 SSRF 防护） |
-| `get_weather` | 查询城市实时天气 |
+| `search_code` | 跨文件代码搜索（基于 ripgrep，坏正则自动降级字面量） |
+| `get_outline` | 提取源码文件结构大纲（类 / 函数签名与行号区间） |
+| `find_definition` | 查找符号定义位置（Python/JS/TS/Go/Rust/Java/C/C++/C#） |
+| `find_references` | 跨文件查找符号全部引用（整词边界，改签名前评估影响面） |
+| `tool_result_read` | 按句柄取回被折叠（snip/elide）的工具结果原文 |
 
-### 变更工具
+### 文件变更与命令
 
 | 工具 | 功能 |
 |------|------|
 | `write_file` | 创建新文件或完整重写小文件（拒绝覆盖 >500 行的已有文件） |
-| `edit_file` | 局部修改已有文件（字符串匹配 / 行号两条路径，含智能相似度兜底） |
-| `execute_command` | 执行本地命令（默认 30s 超时，支持后台执行） |
+| `edit_file` | 局部修改已有文件（字符串匹配 / 行号两条路径，含相似度兜底） |
+| `multi_edit` | 同一文件原子性批量修改（单次加锁、单次写盘，任一失败整批回滚） |
+| `execute_command` | 执行本地命令（默认 30s 超时，支持后台执行与子进程环境保护） |
+| `undo_turn` | 撤销某回合的全部受控文件修改（先预检，被外部改动过则整轮拒绝） |
+
+### 网络与媒体
+
+| 工具 | 功能 |
+|------|------|
+| `fetch_url` | 获取网页或 JSON（含 SSRF 防护） |
 | `fetch_image` | 把网页图片安全下载到本地（仅 http/https、png/jpg/gif/webp 白名单，10MB 上限） |
-| `hunyuan_generate_image` | 腾讯混元文生图：根据文字描述生成图片并保存到本地（支持多种尺寸与自定义水印，10~60 秒） |
-| `tokenrhythm_generate_image` | 基元律动（TokenRhythm）文生图：qwen-image-2.0 / wan2.7-image 模型，生成后立即下载到本地（需在插件页启用并配置该提供商 Key，默认关闭） |
-| `tokenrhythm_edit_image` | 基元律动图生图：上传 1 张原图（≤10MB）+ 文字指令改图（同一前置条件） |
+| `search_news` | 联网新闻 / 网页搜索（360 优先、必应 RSS 兜底） |
+| `get_weather` | 查询城市实时天气 |
+| `hunyuan_generate_image` | 腾讯混元文生图（多种尺寸、支持垫图与自定义水印） |
+| `tokenrhythm_generate_image` | 基元律动文生图：qwen-image-2.0 / wan2.7-image，一次 1~4 张 |
+| `tokenrhythm_edit_image` | 基元律动图生图：上传 1 张原图 + 文字指令改图 |
+| `tokenrhythm_generate_video` | 基元律动文生 / 图生视频：2~30 秒，480P / 720P / 1080P，按秒计费 |
+
+> 基元律动三件套需在插件页启用 `tokenrhythm_image` / `tokenrhythm_video` 插件并配置对应提供商 Key，默认关闭。
+
+### 会话与记忆
+
+| 工具 | 功能 |
+|------|------|
+| `session_manage` | 会话运维（列出 / 新建 / 改名 / 删除 / 归档 / 迁移目录 / 清空 / 压缩 / 检查点 / 撤销记录） |
+| `session_export` | 把指定会话导出为 md / html / json |
+| `search_sessions` | 跨会话全文检索历史消息（含已压缩归档的早期消息） |
+| `search_conversations` | 按会话名 / 内容检索会话 |
+| `recall_history` | 回溯当前会话更早被压缩归档的原始消息 |
+| `read_project_profile` | 读取项目画像（技术栈 / 架构决策 / 硬约束 / 踩坑 / 偏好 / 任务流水） |
+| `remember_decision` | 把一条项目级结论写进项目画像指定分节 |
+
+### 计划与派发
+
+| 工具 | 功能 |
+|------|------|
 | `ask_user` | 向用户提出澄清问题（1-3 个选项） |
-| `manage_task` | 查看或终止后台任务 |
-| `run_subagent` | 启动辅助 Agent（5 种内置类型 + 自定义） |
-| `plan_write` | 创建或替换任务计划 |
-| `plan_read` | 读取计划状态 |
-| `plan_update` | 更新计划项元数据 |
-| `plan_retry` | 重置失败项为 pending |
-| `plan_finish` | 完成主 Agent 接管的计划项（并执行验证命令） |
+| `plan_write` / `plan_read` / `plan_update` | 建立、读取、更新任务计划 |
+| `plan_retry` | 重置失败项为 pending 后重新派发 |
+| `plan_finish` | 完成主 Agent 接管的计划项（并真实执行验证命令） |
 | `plan_resume_takeover` | 恢复因超时移交主 Agent 的计划项 |
-| `mcp_add_server` | 新增 MCP server 配置 |
-| `mcp_remove_server` | 删除 MCP server 配置 |
-| `mcp_set_enabled` | 启用 / 禁用 MCP server |
-| `mcp_list_servers` | 列出所有 MCP server（API Key 掩码处理） |
+| `run_subagent` | 启动辅助 Agent（5 种内置类型 + 自定义子代理） |
+| `manage_task` | 查看 / 等待 / 终止后台任务与后台子代理 |
+| `dispatch_task` / `dispatch_batch` | 秘书派活（单条 / 批量，支持批次内依赖） |
+| `list_dispatches` / `get_dispatch_result` | 查看派活台账与结果 |
+| `secretary_probe` | 只读探针：导出进程内 core 模块签名快照 |
+| `open_session` | 打开（切换）指定会话 |
+| `create_project` | 在指定目录创建项目（含 AGENTS.md 等脚手架） |
+
+### 工作流与自动化
+
+| 工具 | 功能 |
+|------|------|
+| `workflow_list` / `workflow_save` / `workflow_run` / `workflow_finish` | 工作流的查看、保存、执行与收尾回写 |
+| `automation_list` / `automation_create` / `automation_update` / `automation_delete` / `automation_run_now` | 星轨自动化任务管理（定时 / 周期 / 启动 / 一次性触发器） |
+
+### 管理与运维
+
+| 工具 | 功能 |
+|------|------|
+| `model_manage` | 提供商 / 模型增删改、激活切换、思考档位、真实连通性测试、拉取厂商模型列表 |
+| `skill_manage` | 技能列表、启用 / 停用、重新扫描、恢复内置版本 |
+| `plugin_manage` | 插件列表、启用 / 停用、插件设置页动作 |
+| `hook_manage` | Hook 列表、新增 / 编辑 / 删除 / 停用（不含信任授权） |
+| `usage_stats` | Token 用量统计（1 / 7 / 30 / 365 天，按模型与缓存命中率） |
+| `update_manage` | 自更新检查、下载、安装与缓存清理 |
+| `system_settings` | 非安全设置项读写（默认解释器、轮次上限、搜索排除目录、AI 输出目录） |
+| `doctor_run` | 聚合自检（环境 / 配置 / 凭据 / 数据库 / MCP / 模型端点） |
+| `diagram_manage` | Mermaid 图表导出本地 HTML、列出与打开 |
+| `theme_manage` | 界面主题查看、切换、复制、导入导出 |
+| `persona_manage` | 人设（智能体名称、正文、称呼）读写 |
+| `decision_manage` | JEV 决策模型配置、探针与四个业务场景三态 |
+| `feishu_manage` | 飞书通道配置、凭据校验与连接状态 |
+| `lan_manage` | 局域网手机远程服务状态、启停 |
+| `mcp_add_server` / `mcp_remove_server` / `mcp_set_enabled` / `mcp_list_servers` | MCP server 增删、启停与列表（API Key 掩码） |
+
+### 电脑操控与系统（仅 Windows 部分）
+
+| 工具 | 功能 |
+|------|------|
+| `computer_control` | 电脑操控运行控制（状态 / 暂停 / 恢复 / 紧急停止 / 浏览器选项） |
+| `computer_action` | 浏览器或桌面单步动作与观察（元素引用优先，支持 sequence 打包与条件等待；电脑操控开启后才注册） |
+| `browser_pane` | GUI 内嵌浏览器面板打开 / 导航 / 前后退 / 状态 |
+| `browser_set_viewport` | 设置项目浏览器分辨率（移动页 375×667，桌面页 1440×900） |
+| `screenshot_capture` | 截屏（全屏 / 指定区域）保存为本地文件 |
+| `clipboard_image` | 读取剪贴板图片并落盘 |
+| `pty_manage` | 常驻 shell 伪终端（保持 cwd / REPL 交互） |
+| `windows_process_list` / `windows_process_kill` | 列进程 / 结束进程（内置系统进程保护） |
+| `windows_clipboard_get` / `windows_clipboard_set` | 读 / 写剪贴板文本 |
+| `windows_registry` | 只读注册表（项与值查询，不提供写入） |
+| `windows_notify` | 弹 Windows 系统提示框 |
+
+### 办公与小说
+
+| 工具 | 功能 |
+|------|------|
+| `office_read` | 读取 xlsx / xlsm / docx / pptx / pdf 内容并转结构化 Markdown |
+| `office_write` | 按统一规范生成 Excel（表头样式、斑马纹、冻结首行、自动筛选、打印排版） |
+| `novel_init` | 初始化小说项目（目录树、项目标记、7 个写作子 Agent 与参考资料） |
+| `novel_status` | 小说项目进度（已写章数、总字数、今日字数、下一章、伏笔数） |
+| `novel_outline` | 按单元 / 作用域读取卷纲片段（排纲档 / 写作档 / 目录） |
+| `novel_track` | 提交逐章追踪事务（伏笔、角色状态、时间线、上下文渲染） |
+| `novel_wordcount` | 按统一口径统计正文可见字数 |
+| `novel_audit` | 小说项目确定性体检（追踪断链、伏笔超期、字数不足、细纲缺口、AI 痕迹） |
 
 > 内置「iMOM 智能制造系统定位」插件另行提供 `imom_register_project` / `imom_list_projects` /
 > `imom_use_project` / `imom_build_index` / `imom_locate` 五个工具，用于 iMOM/MES 项目代码的
@@ -497,8 +601,10 @@ CLI 与 GUI 共用 `permissions.json` 中的项目白名单。设置页可手动
 **Dream 整理**：后台归纳整理线程，收集最近日志 + MEMORY.md 索引，用大模型生成整理策略，更新分类记忆文件。
 
 ### 记忆压缩
-- 触发阈值：历史 token 占上下文窗口 70%
-- 工具结果预截断（超长结果保留开头 + 末尾 + 占位符）
+- 四级水位线：占窗口 60% 移除 / 折叠工具结果 → 80% 升级为省略 → 95% 触发模型摘要（LLM 压缩）
+- 插入式压缩：复用会话最后一次主请求的字节，在尾部追加压缩指令；快照缺失或路由不支持时静默回退分段路径
+- 空闲维护：用户空闲 240 秒（`memory_compression.idle_maintenance_seconds`，0 关闭）后跑本地水位维护与预压缩
+- 工具结果预截断（超长结果保留开头 + 末尾 + 占位符）；每条消息字节最多被改写两次且改写后永久冻结，保缓存前缀稳定
 - token 估算优先 tiktoken（cl100k_base），失败按字符数近似
 
 ## 🔌 MCP 集成
@@ -534,6 +640,9 @@ CLI 与 GUI 共用 `permissions.json` 中的项目白名单。设置页可手动
 并默认启用；**已释放且内容未被用户改动过的内置技能，会随新版本自动升级**；
 用户改动过的一律保留，用户主动删除的也不会复活。
 
+**删除**：技能页行尾垃圾桶二次确认后物理删除技能目录，同时从激活列表移除并清指纹缓存；
+安装包内的内置技能源拒绝删除，符号链接与越界路径一并拒绝。
+
 **技能文件格式**：
 ```markdown
 ---
@@ -567,9 +676,14 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 | 插件 | 位置 | 功能 |
 |------|------|------|
 | 混元文生图 | 仓库 `plugins/hunyuan_image/` | 腾讯混元文本生图，数据随包编译进 PYZ；Key 仅从环境变量 `HUNYUAN_API_KEY` 读取，代码中不存储 Key，未配置时工具明确报错 |
-| iMOM 定位器 | `~/.ycode/plugins/imom_locator/` | iMOM/MES 多项目代码定位：动态发现 publish、系统识别、页面索引构建与毫秒级定位 |
+| 基元律动生图 / 生视频 | 仓库 `plugins/tokenrhythm_image/`、`plugins/tokenrhythm_video/` | 文生图（qwen-image-2.0 / wan2.7-image）、整图改图、文生 / 图生视频（wan3.0-video，按秒计费）；需在插件页启用并配置对应提供商 Key，默认关闭 |
+| 办公文档 | 仓库 `plugins/office/` | `office_read` / `office_write`：读取 xlsx / docx / pptx / pdf，生成带统一排版的 Excel |
+| 小说工作台 | 仓库 `plugins/novel_workspace/` | `novel_init` / `status` / `outline` / `track` / `wordcount` / `audit` 六个工具 |
+| Windows 系统工具 | 仓库 `plugins/windows_tools/` | 列进程 / 结束进程、读 / 写剪贴板文本、只读注册表、弹系统通知（仅 Windows） |
+| iMOM 定位器 | `~/.ycode/plugins/imom_locator/`（用户级） | iMOM/MES 多项目代码定位：动态发现 publish、系统识别、页面索引构建与毫秒级定位 |
 
 > 用户级插件放在 `~/.ycode/plugins/<插件名>/`，同名插件会覆盖内置/仓库版本。
+> 插件页行尾垃圾桶可物理删除用户级插件（先卸载已注册工具并清信任指纹），内置插件拒绝删除；手机远程接口已同步封禁该动作。
 
 ## 📁 项目结构
 
@@ -577,35 +691,58 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 xingyao-y-code/
 ├── main.py                  # CLI 主入口
 ├── gui_main.py              # GUI 主入口（pywebview）
-├── gui_bridge.py            # GUI JS-API 桥接层
+├── gui_bridge.py            # GUI JS-API 桥接层（按领域拆为 browser / git / pet / snip 等 mixin）
 ├── config.py                # 配置加载（原子写 + 自愈）
 ├── config.example.json      # 配置模板
-├── system_prompt.md         # 系统提示词
-├── core/                    # 核心模块
+├── system_prompt.md         # 系统提示词（CLI）
+├── system_prompt_gui.md     # 系统提示词（GUI）
+├── system_prompt_secretary_gui.md  # 系统提示词（秘书会话）
+├── core/                    # 核心模块（144 个 Python 模块）
 │   ├── version.py           # 版本号（单一来源）
 │   ├── agent_service.py     # 对话服务（CLI/GUI 共源）
-│   ├── harness/             # 固定主代理内核（严格状态机 / SQLite Journal / 工具管线）
-│   ├── llm.py               # 模型请求入口与工具编排（自研 HTTPX 引擎）
+│   ├── harness/             # 固定主代理内核（严格状态机 / SQLite Journal / 工具管线 / 断点续跑判定）
+│   ├── computer/            # 电脑操控（浏览器通道 / 桌面 UIA / 元素定位 / 设置）
+│   ├── cloud_relay/         # 云端中转客户端与门户
+│   ├── serve/               # 局域网服务与指标
+│   ├── workflows/           # 工作流解析、执行与台账
+│   ├── automation/          # 星轨自动化任务与触发器
+│   ├── hooks/               # 生命周期 Hook
+│   ├── git/                 # Git 工作台桥
+│   ├── feishu/              # 飞书通道
+│   ├── slash_commands/      # 桌面版斜杠命令
+│   ├── turn_undo/           # 按回合撤销快照
+│   ├── llm.py               # 模型请求入口与工具编排
+│   ├── llm_native_transport.py  # 自研 HTTPX 原生传输（HTTP/2、流式中断）
+│   ├── model_discovery.py   # 厂商模型列表拉取（CLI / GUI 共用）
+│   ├── model_selector.py    # 全屏模型选择器（含拉取可用模型列表）
+│   ├── model_manager.py     # 多模型配置管理
 │   ├── tools.py             # 本地工具实现
 │   ├── tool_registry.py     # 工具注册表
 │   ├── tool_protocol.py     # 工具协议（ToolSpec 元数据）
+│   ├── tool_result_maintenance.py  # 工具结果 snip / elide 维护
 │   ├── memory.py            # SQLite 会话记忆 + 检查点
-│   ├── memory_compressor.py # 记忆压缩
+│   ├── memory_compressor.py # 记忆压缩（分段 / 插入式）
 │   ├── memory_kairos.py     # 长期记忆 + Dream 整理
+│   ├── memory_compression.py # 压缩策略配置
+│   ├── cache_keepalive.py   # 前缀缓存保活
+│   ├── idle_maintenance.py  # 空闲水位维护与预压缩
+│   ├── project_profile.py   # 项目画像
+│   ├── novel_service.py     # 小说项目服务（字数 / 追踪 / 体检）
+│   ├── pet_skins.py         # 桌宠形象包（帧序列）
+│   ├── decision_service.py  # JEV 决策模型接入
 │   ├── plan.py              # 计划管理
 │   ├── task_manager.py      # 后台任务管理
 │   ├── task_scheduler.py    # 依赖感知执行调度器
-│   ├── subagent_registry.py# 子代理注册中心
+│   ├── subagent_registry.py # 子代理注册中心
 │   ├── permission_broker.py # 权限中介
+│   ├── command_policy.py    # 命令风险分级与子进程环境变量策略
 │   ├── mcp_client.py        # MCP 客户端
 │   ├── mcp_selector.py      # MCP 全屏配置器
-│   ├── skills.py            # SKILL.md 扫描与注入
+│   ├── skills.py            # SKILL.md 扫描、注入与删除
 │   ├── skill_selector.py    # 技能选择器
-│   ├── plugin_loader.py     # 插件加载器
+│   ├── plugin_loader.py     # 插件加载器（信任指纹 / 删除）
 │   ├── lsp.py               # LSP-lite 符号查找
 │   ├── worktree.py          # Git worktree
-│   ├── model_manager.py     # 多模型配置管理
-│   ├── model_selector.py    # 全屏模型选择器
 │   ├── session_selector.py  # 全屏会话选择器
 │   ├── thinking_stream.py   # 思考流缓冲
 │   ├── reasoning_stream.py  # 推理流解析
@@ -614,7 +751,7 @@ xingyao-y-code/
 │   ├── turn_renderer.py     # 轮次渲染
 │   ├── history_renderer.py  # 历史渲染
 │   ├── tool_presenter.py    # 工具展示
-│   ├── tool_cache.py        # 工具结果缓存
+│   ├── tool_cache.py        # 只读工具结果进程内缓存
 │   ├── context_builder.py   # 上下文构建
 │   ├── turn_controller.py   # 轮次控制
 │   ├── input_parser.py      # 用户输入解析
@@ -626,30 +763,40 @@ xingyao-y-code/
 │   ├── runtime_warnings.py  # 运行时警告
 │   ├── ui_markers.py        # UI 标记
 │   └── app_context.py       # 应用上下文
-├── frontend/               # GUI 前端（Vue 3 + TypeScript + Vite）
+├── frontend/               # GUI 前端（Vue 3 + TypeScript + Vite，75 个 Vue 组件）
 │   ├── src/
-│   │   ├── components/      # 29 个 Vue 组件
+│   │   ├── components/      # Vue 组件
 │   │   ├── composables/     # 组合式函数（面板拖拽、视口判断等）
 │   │   ├── stores/          # Pinia 状态管理
 │   │   └── utils/
 │   ├── package.json
 │   └── vite.config.ts
-├── skills/                 # 内置技能示例
-├── plugins/                # 内置插件目录
+├── frontend-mobile/        # 手机端页面（随中转服务分发）
+├── relay_server/           # 中转服务器（设备注册 / 独立令牌 / 静态资源）
+├── pets/                   # 内置桌宠形象包（帧序列宠物包）
+├── site_admin/             # 官网后台（站点信息与下载包管理）
+├── website/                # 官网静态页
+├── skills/                 # 内置技能（15 个技能包）
+├── plugins/                # 内置插件（混元生图 / 基元律动生图·视频 / 办公文档 / 小说工作台 / Windows 工具）
 ├── vendor/ripgrep/         # 内置 ripgrep
+├── vendor/mermaid/         # 内置 Mermaid 渲染资源
+├── assets/                 # CHANGELOG、图标等打包资源
 ├── packaging/              # 打包辅助
-├── tests/                  # pytest 测试用例（117 个文件）
+├── scripts/                # 维护脚本
+├── tests/                  # pytest 测试用例（394 个文件）
 ├── docs/                   # 文档
 │   ├── BUILD.md            # 构建文档
 │   ├── all_features.md     # 全功能文档
+│   ├── module_map.md       # 模块地图
 │   └── superpowers/        # 设计与计划文档
 ├── build_release.py        # Windows 发布打包流水线
+├── publish_release.py      # 发布上传脚本
 ├── ycode.spec              # PyInstaller 双主程序打包 spec
 ├── ycode_setup.py          # Windows 安装向导（经典样式，user/machine 双范围）
 ├── ycode_setup.spec        # 安装向导打包 spec（开发者手动构建参考用）
 ├── ycode_uninstall.py      # Windows 卸载向导（经典样式 GUI）
 ├── ycode_uninstall.spec    # 卸载向导打包 spec
-└── README.md               # 本文件
+└── README.md               # 本文件（英文版 README.en.md）
 ```
 
 ## ⚙️ 配置详解
@@ -673,6 +820,7 @@ xingyao-y-code/
     "max_output_bytes": 1048576
   },
   "search_exclude_dirs": ["target", "out", "bin", "obj"],
+  "subagent_enabled": true,
   "memory_compression": {
     "retain_count": 8,
     "retain_count_force": 4,
@@ -680,7 +828,10 @@ xingyao-y-code/
     "tool_result_preview_limit_chars": 800,
     "tool_result_token_limit": 600,
     "summary_length_first": 250,
-    "summary_length_merge": 350
+    "summary_length_merge": 350,
+    "insert_mode": true,
+    "precompress_ratio": 0.85,
+    "idle_maintenance_seconds": 240
   },
   "providers": [...],
   "theme": "cyan",
@@ -688,7 +839,15 @@ xingyao-y-code/
   "allow_outside_workspace": false,
   "command_shell": "auto",
   "skill_search_paths": [],
-  "prompt_cache_keepalive_seconds": 120
+  "prompt_cache_keepalive_seconds": 120,
+  "shell_env_policy": {
+    "exclude_sensitive": true,
+    "inherit": "all"
+  },
+  "expose_mcp_admin_tools": false,
+  "resume": { "enabled": false },
+  "pet_skin_id": "xingyao",
+  "route_request_overrides": []
 }
 ```
 
@@ -702,14 +861,19 @@ xingyao-y-code/
 | `image_compression` | 图片压缩参数（默认长边 1536、质量 90、目标 1MiB） |
 | `search_exclude_dirs` | 代码搜索排除目录 |
 | `subagent_enabled` | 全局子代理开关：设为 `false` 时不派发子代理，计划编排工具（plan_write/plan_update）一并不可用，所有子任务由主 Agent 直接完成（默认 `true`） |
-| `memory_compression` | 记忆压缩参数 |
+| `memory_compression` | 记忆压缩参数（`insert_mode` 插入式压缩、`idle_maintenance_seconds` 空闲维护触发秒数（0 关闭）、`precompress_ratio` 预压缩水位） |
 | `providers` | 模型供应商列表 |
 | `theme` | 终端配色主题（9 种） |
 | `permission_mode` | 权限模式（confirm / accept_edits / plan / full） |
 | `allow_outside_workspace` | 沙盒开关 |
 | `command_shell` | 默认命令解释器（auto / pwsh / powershell / cmd；GUI「系统设置」会按实际安装情况限制选择） |
 | `skill_search_paths` | 技能搜索路径（项目级） |
-| `prompt_cache_keepalive_seconds` | DeepSeek/Kimi 前缀缓存保活间隔（默认 120；0 关闭；最小 60） |
+| `prompt_cache_keepalive_seconds` | DeepSeek / Kimi / GLM / Qwen 前缀缓存保活间隔（默认 120；0 关闭；最小 60） |
+| `shell_env_policy` | 子进程环境变量策略：`exclude_sensitive` 默认剔除 `*KEY*` / `*SECRET*` / `*TOKEN*` / `*PASSWORD*`（设为 `false` 恢复整份透传）；另支持 `inherit` / `exclude` / `include_only` / `set` |
+| `expose_mcp_admin_tools` | 是否把 MCP 管理类工具 schema 发给模型（默认 `false`，每轮省约 500 token） |
+| `resume` | 断点续跑开关（默认 `{"enabled": false}`） |
+| `pet_skin_id` | 当前桌宠形象包 ID（切换后需重启桌宠进程生效） |
+| `route_request_overrides` | 按域名匹配改写请求头 / body（适配要求特定 header 或 thinking 字段的网关） |
 
 ### config.toml 只读覆盖层（可选）
 
@@ -752,9 +916,17 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 | `mcp.json` | MCP 服务配置 |
 | `system_prompt.md` | 用户级系统提示词覆盖 |
 | `memory/` | 长期记忆（logs / user / feedback / project / reference） |
+| `self/` | 自我模型（自我演化形成的自我认知） |
 | `skills/` | 用户级技能 |
 | `plugins/` | 用户级插件 |
 | `agents/` | 自定义子代理定义 |
+| `pets/` | 用户自建桌宠形象包 |
+| `hooks/` 与 `hooks.json` | 生命周期 Hook 配置与信任记录 |
+| `gui-themes/` | 自定义界面主题 |
+| `persona.json` | 人设（智能体名称 / 正文 / 称呼） |
+| `decision.json` 与 `decision_audit/` | 决策模型配置与决策审计记录 |
+| `exports/` / `media/` / `tmp/` | 会话导出、媒体附件、AI 生成内容临时目录 |
+| `undo_blobs/` / `undo_transactions/` | 按回合撤销的文件快照与事务日志 |
 
 ## 🧪 运行测试
 
@@ -762,7 +934,7 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 pytest
 ```
 
-测试覆盖 117 个模块，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
+测试覆盖 394 个模块文件，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
 
 ### 电脑操控人工烟测（绝不进 pytest）
 
