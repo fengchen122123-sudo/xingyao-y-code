@@ -24,7 +24,7 @@
               <AppIcon name="loader" :size="12.5" :stroke-width="2.2" class="xy-spin" />
               <span class="xy-process-title">{{ runningTitle }}</span>
             </span>
-            <span class="xy-process-meta">{{ runningElapsedText ? `${runningElapsedText} · ` : '' }}收起 ▴</span>
+            <span class="xy-process-meta" data-test="running-process-meta">{{ runningMetaText }}</span>
           </button>
           <div class="xy-process-body">
             <MessageBubble
@@ -110,15 +110,21 @@
       :turn-id="group.turnId"
     />
 
-    <!-- 回合结束底部总结行：左工作时长 + 右速率/耗时/tokens -->
-    <div v-if="(!group.running && finalWorkTimeText) || tailMetricsText" class="xy-turn-footer">
-      <span v-if="!group.running && finalWorkTimeText" class="working-indicator done">
+    <!-- 回合底部：运行中显示当前输出速度；结束后左工作时长 + 右速率/耗时/tokens -->
+    <div v-if="(!group.running && totalDurationText) || tailMetricsText || liveSpeedText" class="xy-turn-footer">
+      <span v-if="!group.running && totalDurationText" class="working-indicator done" data-test="turn-total-duration">
         <AppIcon name="check" :size="13" :stroke-width="2.2" class="wi-check" />
-        <span class="wi-text">{{ store.agentName }}本轮工作 {{ finalWorkTimeText }}</span>
+        <span class="wi-text">{{ store.agentName }}本轮工作 {{ totalDurationText }}</span>
       </span>
       <span v-else></span>
       <span
-        v-if="tailMetricsText"
+        v-if="liveSpeedText"
+        class="msg-metrics-bar"
+        title="当前输出速度"
+        data-test="live-token-speed"
+      >{{ liveSpeedText }}</span>
+      <span
+        v-else-if="tailMetricsText"
         class="msg-metrics-bar"
         :title="tailMetricsTooltip"
         data-test="msg-metrics"
@@ -134,7 +140,7 @@ import ChangedFilesPanel from './ChangedFilesPanel.vue';
 import FoldCard from './FoldCard.vue';
 import MessageBubble from './MessageBubble.vue';
 import { useAppStore } from '../stores/appStore';
-import { formatDuration } from '../utils/tokenSpeed';
+import { formatDuration, formatTokenSpeed } from '../utils/tokenSpeed';
 import {
   collectFileChanges,
   groupStats,
@@ -214,11 +220,29 @@ const runningTitle = computed(() => {
   return `${store.agentName}执行过程 · 正在处理`;
 });
 
+// 运行中的瞬时输出速度。只挂在回合头部和底部各一处，不在每个气泡上重复刷。
+const liveSpeedText = computed(() => {
+  if (!props.group.running) return '';
+  const speed = Number(store.streamingSpeed) || 0;
+  return speed > 0 ? formatTokenSpeed(speed) : '';
+});
+
+const runningMetaText = computed(() => {
+  const parts: string[] = [];
+  if (liveSpeedText.value) parts.push(liveSpeedText.value);
+  if (props.runningElapsedText) parts.push(props.runningElapsedText);
+  parts.push('收起 ▴');
+  return parts.join(' · ');
+});
+
 const runningCollapsedText = computed(() => {
   const base = activeSubagentCount.value > 0
     ? `正在执行（${activeSubagentCount.value} 个星舰）`
     : `${store.agentName}正在执行`;
-  return props.runningElapsedText ? `${base} · ${props.runningElapsedText}` : base;
+  const parts = [base];
+  if (props.runningElapsedText) parts.push(props.runningElapsedText);
+  if (liveSpeedText.value) parts.push(liveSpeedText.value);
+  return parts.join(' · ');
 });
 
 // 回合文件更改摘要（无改动则空数组，面板不渲染）
@@ -247,29 +271,49 @@ const lastAssistant = computed(() => {
   return null;
 });
 
+function formatWorkTime(seconds: number): string {
+  const whole = Math.max(0, Math.round(seconds));
+  if (whole < 60) return `${whole}s`;
+  return `${Math.floor(whole / 60)}m ${whole % 60}s`;
+}
+
+// 回合墙钟总时长：优先用结束时记在用户消息上的秒数，这样下一轮开始后
+// 这一轮的总时长还在。最后一轮还没写入时，用页面计时器兜底。
+const totalDurationText = computed(() => {
+  if (props.group.running) return '';
+  const stamped = props.group.userMsg?.turnElapsedS
+    ?? [...props.group.middle, ...props.group.tail].find((m) => typeof m.turnElapsedS === 'number')?.turnElapsedS;
+  if (typeof stamped === 'number' && stamped >= 0) return formatWorkTime(stamped);
+  return props.finalWorkTimeText || '';
+});
+
 const processDurationText = computed(() => {
-  if (props.finalWorkTimeText) return props.finalWorkTimeText;
+  if (totalDurationText.value) return totalDurationText.value;
   const d = lastAssistant.value?.metrics?.duration_s;
   return d ? formatDuration(d) : '';
 });
 
 const tailMetricsText = computed(() => {
   const m = lastAssistant.value?.metrics;
-  if (!m || (!m.token_speed && !m.duration_s)) return '';
+  const total = totalDurationText.value;
+  if (!total && (!m || (!m.token_speed && !m.duration_s))) return '';
   const parts: string[] = [];
-  if (m.token_speed) parts.push(`${m.token_speed} t/s`);
-  if (m.duration_s) parts.push(formatDuration(m.duration_s));
-  if (m.completion_tokens) parts.push(`${m.completion_tokens.toLocaleString()} tokens`);
+  if (m?.token_speed) parts.push(`${m.token_speed} t/s`);
+  // 右下角的时间是整段任务的墙钟时长；没有总时长时才退回最后一次模型请求的耗时
+  if (total) parts.push(total);
+  else if (m?.duration_s) parts.push(formatDuration(m.duration_s));
+  if (m?.completion_tokens) parts.push(`${m.completion_tokens.toLocaleString()} tokens`);
   return parts.join(' · ');
 });
 
 const tailMetricsTooltip = computed(() => {
   const m = lastAssistant.value?.metrics;
-  if (!m) return '';
   const parts: string[] = [];
+  if (totalDurationText.value) parts.push(`任务总时长: ${totalDurationText.value}`);
+  if (!m) return parts.join(' · ');
   if (m.ttft_ms != null && m.ttft_ms > 0) parts.push(`首字延迟: ${m.ttft_ms}ms`);
   if (m.output_duration_s != null && m.output_duration_s > 0) parts.push(`生成耗时: ${m.output_duration_s}s`);
-  else if (m.duration_s != null && m.duration_s > 0) parts.push(`总耗时: ${m.duration_s}s`);
+  if (m.duration_s != null && m.duration_s > 0) parts.push(`模型耗时: ${m.duration_s}s`);
   if (m.completion_tokens) parts.push(`输出: ${m.completion_tokens} tokens`);
   if (m.token_speed) parts.push(`平均速度: ${m.token_speed} t/s`);
   return parts.join(' · ');

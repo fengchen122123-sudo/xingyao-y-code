@@ -56,22 +56,32 @@
     </button>
 
     <button class="icon-btn no-drag" id="btn-terminal" title="切换终端" data-test="btn-terminal" @click="store.toggleTerminalPanel()">
-      <AppIcon name="square-terminal" :size="14.5" :stroke-width="1.8" />
+      <AppIcon name="square-terminal" :size="16" :stroke-width="2.25" />
     </button>
     <button class="icon-btn no-drag" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
-      <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="14.5" :stroke-width="1.8" />
+      <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" :stroke-width="2.25" />
     </button>
     <button class="icon-btn no-drag" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">
-      <AppIcon name="panel-right" :size="14.5" :stroke-width="1.8" />
+      <AppIcon name="panel-right" :size="16" :stroke-width="2.25" />
     </button>
 
-    <!-- 自绘窗口控制按钮（frameless）：颜色随主题，hover 态清晰 -->
+    <!-- 自绘窗口控制按钮（frameless）：矢量图标，避免 12px 字符发虚 -->
     <div class="window-controls no-drag">
-      <button class="win-btn" title="最小化" data-test="win-min" @click="winMinimize">—</button>
-      <button class="win-btn" :title="maximized ? '还原' : '最大化'" data-test="win-max" @click="toggleMaximize">
-        {{ maximized ? '❐' : '▢' }}
+      <button class="win-btn" title="最小化" data-test="win-min" @click="winMinimize">
+        <AppIcon name="minus" :size="15" :stroke-width="2.5" />
       </button>
-      <button class="win-btn win-close" title="关闭" data-test="win-close" @click="winClose">✕</button>
+      <button class="win-btn" :title="maximized ? '还原' : '最大化'" data-test="win-max" @click="toggleMaximize">
+        <AppIcon
+          :name="maximized ? 'copy' : 'win-max'"
+          :size="15"
+          :stroke-width="2.25"
+          :linecap="maximized ? 'round' : 'butt'"
+          :linejoin="maximized ? 'round' : 'miter'"
+        />
+      </button>
+      <button class="win-btn win-close" title="关闭" data-test="win-close" @click="winClose">
+        <AppIcon name="x" :size="15" :stroke-width="2.5" />
+      </button>
     </div>
   </div>
 </template>
@@ -223,7 +233,7 @@ function handleUpdateClick() {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  color: var(--xy-text-2, var(--text-dim));
+  color: var(--xy-text, var(--text));
 }
 #topbar .icon-btn:hover {
   background: var(--xy-hover, var(--bg2));
@@ -298,8 +308,7 @@ function handleUpdateClick() {
   height: 28px;
   border: none;
   background: transparent;
-  color: var(--xy-text-3, var(--text-dim));
-  font-size: 12px;
+  color: var(--xy-text, var(--text));
   line-height: 1;
   display: flex;
   align-items: center;

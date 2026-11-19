@@ -2084,6 +2084,8 @@ export interface PyWebViewAPI {
   refresh_skills(): Promise<{ ok: boolean; skills?: SkillInfo[]; msg?: string }>;
   // 用内置源覆盖用户改动后的技能副本；成功时回传最新技能列表
   restore_skill(skill_id: string): Promise<{ ok: boolean; msg?: string; skills?: SkillInfo[] }>;
+  // 物理删除技能目录（用户搜索目录中的那一份，不碰安装包内置源）
+  delete_skill(skill_id: string): Promise<{ ok: boolean; msg?: string; skills?: SkillInfo[] }>;
   get_skills(): Promise<SkillInfo[]>;
   // 星轨自动化任务
   get_automation_tasks(): Promise<{ ok: boolean; tasks?: AutomationTaskInfo[]; msg?: string }>;
@@ -2104,6 +2106,8 @@ export interface PyWebViewAPI {
   clear_workflow_runs(name: string): Promise<{ ok: boolean; msg?: string }>;
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
+  // 物理删除用户插件目录；内置插件会被后端拒绝
+  delete_plugin(name: string): Promise<any>;
   trust_plugin(name: string): Promise<any>;
   // 插件设置页（声明式渲染）：页面快照读取 / 动作执行 / 打开外部授权链接
   get_plugin_settings(name: string): Promise<any>;

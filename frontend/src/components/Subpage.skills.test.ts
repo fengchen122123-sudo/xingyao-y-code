@@ -68,7 +68,7 @@ describe('Subpage - 来源筛选（全部/内置/用户）', () => {
   });
 
   function visibleNames(wrapper: ReturnType<typeof mount>): string[] {
-    return wrapper.findAll('.sub-card .sc-name').map(n => n.text());
+    return wrapper.findAll('.sub-row .row-name').map(n => n.text());
   }
 
   it('技能页默认显示全部，可按内置/用户筛选', async () => {
@@ -84,7 +84,7 @@ describe('Subpage - 来源筛选（全部/内置/用户）', () => {
     expect(visibleNames(wrapper)).toHaveLength(3);
 
     await wrapper.get('[data-test="src-filter-builtin"]').trigger('click');
-    expect(visibleNames(wrapper)).toEqual(['内置技能A 内置']);
+    expect(visibleNames(wrapper)).toEqual(['内置技能A']);
 
     await wrapper.get('[data-test="src-filter-user"]').trigger('click');
     const userNames = visibleNames(wrapper).join('|');
@@ -104,7 +104,7 @@ describe('Subpage - 来源筛选（全部/内置/用户）', () => {
     const wrapper = mountSubpage('skills');
 
     await wrapper.get('[data-test="src-filter-user"]').trigger('click');
-    expect(wrapper.findAll('.sub-card')).toHaveLength(0);
+    expect(wrapper.findAll('.sub-row')).toHaveLength(0);
     expect(wrapper.text()).toContain('没有符合筛选条件的技能');
   });
 
@@ -169,7 +169,7 @@ describe('Subpage - 恢复内置版本', () => {
     const wrapper = mountSubpage('skills');
 
     expect(wrapper.findAll('[data-test="restore-skill-btn"]')).toHaveLength(1);
-    const cards = wrapper.findAll('.sub-card');
+    const cards = wrapper.findAll('.sub-row');
     expect(cards[0].find('[data-test="restore-skill-btn"]').exists()).toBe(true);
     expect(cards[1].find('[data-test="restore-skill-btn"]').exists()).toBe(false);
     expect(cards[2].find('[data-test="restore-skill-btn"]').exists()).toBe(false);

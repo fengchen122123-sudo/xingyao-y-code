@@ -434,6 +434,9 @@ export interface ChatMessage {
   // turnId 是撤销定位键；positionKind 标识本条消息在回合中的位置种类
   turnId?: string;
   positionKind?: string;
+  // 本回合墙钟总时长（秒）。回合结束时写在触发它的用户消息上，
+  // 下一回合开始后仍留在这一轮，不跟「最后一条」的计时器一起被清掉。
+  turnElapsedS?: number;
 }
 
 const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
@@ -5314,6 +5317,27 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return true;
     },
 
+    /** 终态清零 turnStartedAt 之前调用：把本回合总时长记到触发它的用户消息上 */
+    stampTurnElapsed() {
+      const started = this.turnStartedAt;
+      if (!started) return;
+      const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000));
+      for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+        const message = this.messages[i];
+        if (message.role === 'user') {
+          message.turnElapsedS = elapsed;
+          return;
+        }
+      }
+      for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+        const message = this.messages[i];
+        if (message.role === 'assistant') {
+          message.turnElapsedS = elapsed;
+          return;
+        }
+      }
+    },
+
     async refreshSessions() {
       const api = this._api();
       if (!api) return;
@@ -5853,6 +5877,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this._clearStopFallbackTimer(finSession);
           // 当前 reducer 已绑定到目标 runtime，终态只更新目标会话。
           this.running = false;
+          this.stampTurnElapsed();
           this.turnStartedAt = 0;
           this.subagentTasks = [];
         } else if (this.running && this.runningSessions.length === 0) {
@@ -5862,6 +5887,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           console.warn(`[H2] 终态事件 ${type} 无归属且运行表为空，按当前会话 ${currentRuntimeKey} 收尾`);
           this._clearStopFallbackTimer(currentRuntimeKey);
           this.running = false;
+          this.stampTurnElapsed();
           this.turnStartedAt = 0;
           this.subagentTasks = [];
         }
@@ -6830,6 +6856,23 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    async deleteSkill(skillId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.delete_skill(skillId);
+        if (res && res.ok) {
+          this.skills = res.skills || this.skills;
+          this.skillsLoading = false;
+        } else {
+          this.notifyModal('技能', '删除技能失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('技能', '删除技能失败: ' + err);
+      }
+    },
+
     async toggleMcpServer(name: string, enabled: boolean) {
       const api = this._api();
       if (!api) return;
@@ -6916,6 +6959,22 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('插件', '插件状态更新失败: ' + err);
+      }
+    },
+
+    async deletePlugin(name: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.delete_plugin(name);
+        if (res && res.ok) {
+          this.plugins = res.plugins || this.plugins;
+        } else {
+          this.notifyModal('插件', '删除插件失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('插件', '删除插件失败: ' + err);
       }
     },
 

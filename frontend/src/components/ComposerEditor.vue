@@ -311,13 +311,17 @@ function commit() {
 }
 
 function onInput() {
-  // 组词期间 DOM 里是拼音/候选，不能提交（同 textarea 的 composing 守卫）
+  // 组词期间 DOM 里是拼音/候选，不能提交（同 textarea 的 composing 守卫）。
+  // 占位提示在 compositionstart 时已经收起，这里继续保持，避免拼音画在提示后面。
   if (composing) return;
   commit();
 }
 
 function onCompositionStart() {
   composing = true;
+  // 占位文案是 .is-empty::before，会占在光标前面。组词一开始就收起，
+  // 不等 compositionend（回车确认候选）才消失；取消组词后由 commit 按实际内容恢复。
+  isEmpty.value = false;
 }
 
 function onCompositionEnd() {

@@ -448,3 +448,43 @@ def test_gui_bridge_refresh_skills(tmp_path, monkeypatch):
     assert len(direct) == 1
     assert direct[0]["name"] == "refreshed_demo"
 
+
+def test_delete_skill_removes_directory_and_active_id(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    path = _write_skill(skill_dir, "demo")
+    (skill_dir / "notes.txt").write_text("gone", encoding="utf-8")
+    monkeypatch.setattr(skills, "get_skill_dirs", lambda: [str(root)])
+    monkeypatch.setattr(skills, "ACTIVE_SKILLS_FILE", str(tmp_path / "active.json"))
+    skills.save_active_skill_ids([str(path)])
+
+    result = skills.delete_skill(str(path))
+
+    assert result["ok"] is True
+    assert not skill_dir.exists()
+    assert skills.get_active_skill_ids() == []
+
+
+def test_delete_skill_rejects_path_outside_search_root(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    root.mkdir()
+    outside = tmp_path / "outside" / "demo"
+    path = _write_skill(outside, "demo")
+    monkeypatch.setattr(skills, "get_skill_dirs", lambda: [str(root)])
+
+    result = skills.delete_skill(str(path))
+
+    assert result["ok"] is False
+    assert path.is_file()
+
+
+def test_delete_skill_rejects_builtin_source(tmp_path, monkeypatch):
+    src, _user, _yc = _source_env(tmp_path, monkeypatch)
+    path = _write_skill(src / "bundled", "bundled")
+    monkeypatch.setattr(skills, "get_skill_dirs", lambda: [str(src)])
+
+    result = skills.delete_skill(str(path))
+
+    assert result["ok"] is False
+    assert path.is_file()
+

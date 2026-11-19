@@ -145,6 +145,33 @@ describe('ComposerEditor @ 引用胶囊', () => {
     wrapper.unmount();
   });
 
+  it('输入法一开始组词就收起占位提示，确认前不提交文本', async () => {
+    const wrapper = mountEditor('');
+    const editor = wrapper.get('.ce-input');
+    expect(editor.classes()).toContain('is-empty');
+
+    await editor.trigger('compositionstart');
+    expect(editor.classes()).not.toContain('is-empty');
+    expect(wrapper.emitted('update:modelValue')).toBeUndefined();
+
+    editor.element.textContent = 'nihao';
+    await editor.trigger('input');
+    expect(editor.classes()).not.toContain('is-empty');
+    expect(wrapper.emitted('update:modelValue')).toBeUndefined();
+
+    await editor.trigger('compositionend');
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['nihao']);
+    expect(editor.classes()).not.toContain('is-empty');
+
+    // 取消组词后内容为空，占位提示回来
+    editor.element.textContent = '';
+    await editor.trigger('compositionstart');
+    expect(editor.classes()).not.toContain('is-empty');
+    await editor.trigger('compositionend');
+    expect(editor.classes()).toContain('is-empty');
+    wrapper.unmount();
+  });
+
   it('输入法组词期间按 Enter 不向父组件透传 keydown，也不触发 submit', async () => {
     const wrapper = mountEditor('nihao');
     const editor = wrapper.get('.ce-input');

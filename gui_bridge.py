@@ -93,6 +93,7 @@ from core.skills import (
     save_active_skill_ids,
     scan_all_skills,
     restore_builtin_skill,
+    delete_skill,
     get_released_builtin_names,
     # 私有助手：core.skills 未提供公开的内置源目录访问器，技能列表要判断
     # "恢复内置版本"是否可用，只能直接取该目录路径
@@ -12955,6 +12956,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             logger.exception("restore_skill 失败")
             return {"ok": False, "msg": str(e)}
 
+    def delete_skill(self, skill_id: str) -> Dict[str, Any]:
+        """删除技能目录（技能页垃圾桶）。文件从磁盘移除，不回收安装包里的内置源。"""
+        try:
+            result = delete_skill(skill_id)
+            if not result.get("ok"):
+                return {"ok": False, "msg": str(result.get("msg") or "删除技能失败")}
+            return {"ok": True, "msg": result.get("msg") or "已删除技能", "skills": self._build_skill_list()}
+        except Exception as e:
+            logger.exception("delete_skill 失败")
+            return {"ok": False, "msg": str(e)}
+
     def refresh_skills(self) -> Dict[str, Any]:
         """重新扫描并返回所有技能列表（供前端技能页刷新按钮调用）。"""
         try:
@@ -13019,6 +13031,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             }
         except Exception as e:
             logger.exception("toggle_plugin 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def delete_plugin(self, name: str) -> Dict[str, Any]:
+        """删除用户插件目录（插件页垃圾桶）。内置插件拒绝删除。"""
+        try:
+            from core.plugin_loader import delete_plugin as _delete
+            ok, msg = _delete(name)
+            return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
+        except Exception as e:
+            logger.exception("delete_plugin 失败")
             return {"ok": False, "msg": str(e)}
 
     def trust_plugin(self, name: str) -> Dict[str, Any]:
@@ -15190,11 +15212,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             return {"ok": False, "msg": str(e)}
 
     def fetch_provider_models(self, provider_id: str) -> Dict[str, Any]:
-        """拉取厂商端点的可用模型列表（GET {base_url}/v1/models），供添加模型时一键填充。
+        """拉取厂商端点的可用模型列表（GET {base_url}/models 或 /v1/models），供添加模型时一键填充。
 
-        与对话请求链路完全独立：短超时、一次性 httpx 请求，不触碰共享连接池。
-        鉴权头同时携带 Bearer 与 x-api-key——OpenAI 网关认 Bearer，Anthropic
-        兼容端点认 x-api-key（实测阶跃 /v1/models 单发 x-api-key 会 401）。
+        请求实现收敛到 core.model_discovery，与 CLI /models 的「拉取模型」共用同一套
+        端点拼接、多 Key 尝试与元数据提取逻辑（鉴权头同时带 Bearer 与 x-api-key）。
         """
         try:
             real_provider_id = self._resolve_provider_id(provider_id)
@@ -15210,131 +15231,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             base_url = str(provider.get("base_url") or "").strip()
             if not base_url:
                 return {"ok": False, "msg": "该厂商未配置 Base URL"}
-            # base_url 可能已含版本段（OpenAI 惯例 …/v1，阶跃 step_plan/v1），
-            # 也可能是裸端点（如 …/step_plan）：前者直接拼 /models，后者补 /v1/models，
-            # 绝不能重复拼出版本段（曾出现 /v1/v1/models 404）。
-            base = base_url.rstrip("/")
-            url = (base + "/models") if base.endswith("/v1") else (base + "/v1/models")
-            from core.llm_policy import tokenrhythm_agent_headers
-            import httpx as _httpx
 
             # 多 Key provider：逐 Key 尝试（池「当前该用」的 Key 优先），任一通过
             # 鉴权即采用其结果；绝不把多行串整体塞进 Authorization / x-api-key。
-            probe_keys = _probe_keys_for_provider(provider)
-            resp = None
-            last_msg = ""
-            for api_key in probe_keys:
-                headers = {"accept": "application/json"}
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
-                    headers["x-api-key"] = api_key
-                headers.update(tokenrhythm_agent_headers(url))
-                try:
-                    candidate = _httpx.get(url, headers=headers, timeout=15.0)
-                except Exception as exc:
-                    # 网络层不可达：换 Key 无意义，直接返回
-                    return {"ok": False, "msg": f"无法连接 {base_url}: {exc}"}
-                if candidate.status_code == 200:
-                    resp = candidate
-                    break
-                body = (candidate.text or "").strip()[:200]
-                last_msg = f"获取失败 (HTTP {candidate.status_code}): {body}"
-            if resp is None:
-                if len(probe_keys) > 1:
-                    return {"ok": False, "msg": f"{len(probe_keys)} 个 Key 均获取失败，最后错误：{last_msg}"}
-                return {"ok": False, "msg": last_msg or "获取失败"}
-            try:
-                data = resp.json()
-            except ValueError:
-                return {"ok": False, "msg": "响应不是有效 JSON（该端点可能不支持 /v1/models）"}
-            items = data.get("data") if isinstance(data, dict) else data
-            if not isinstance(items, list):
-                return {"ok": False, "msg": "响应格式无法解析（非 OpenAI /v1/models 形状）"}
+            from core.model_discovery import fetch_model_list
 
-            # 上下文/多模态元数据字段名因厂商而异，逐个候选键提取：
-            # - 上下文：阶跃 max_input_tokens、OpenRouter/Together context_length、
-            #   Groq context_window、vLLM max_model_len
-            # - 最大输出：OpenRouter max_completion_tokens、通用 max_output_tokens
-            # - 多模态：阶跃 enable_vision_input、通用 supports_vision、
-            #   OpenRouter architecture.input_modalities 含 "image"
-            _context_keys = (
-                "max_input_tokens", "context_length", "context_window",
-                "max_model_len", "max_context_length",
-            )
-            _output_keys = ("max_completion_tokens", "max_output_tokens")
-            _vision_bool_keys = ("enable_vision_input", "supports_vision", "supports_image_input")
-
-            def _extract_meta(entry_item: dict):
-                context_window = None
-                for key in _context_keys:
-                    try:
-                        val = int(entry_item.get(key))
-                    except (TypeError, ValueError):
-                        continue
-                    if val > 0:
-                        context_window = val
-                        break
-                max_output = None
-                for key in _output_keys:
-                    try:
-                        val = int(entry_item.get(key))
-                    except (TypeError, ValueError):
-                        continue
-                    if val > 0:
-                        max_output = val
-                        break
-                supports_vision = None
-                for key in _vision_bool_keys:
-                    if isinstance(entry_item.get(key), bool):
-                        supports_vision = entry_item[key]
-                        break
-                if supports_vision is None:
-                    arch = entry_item.get("architecture")
-                    if isinstance(arch, dict):
-                        modalities = arch.get("input_modalities")
-                        if isinstance(modalities, list) and modalities:
-                            supports_vision = "image" in [str(m).lower() for m in modalities]
-                return context_window, max_output, supports_vision
-
-            from core.model_spec_table import lookup_model_spec
-
-            models: List[Dict[str, Any]] = []
-            for item in items:
-                if isinstance(item, dict):
-                    mid = str(item.get("id") or "").strip()
-                    model_type = str(item.get("model_type") or "")
-                    context_window, max_output, supports_vision = _extract_meta(item)
-                elif isinstance(item, str):
-                    mid, model_type = item.strip(), ""
-                    context_window, max_output, supports_vision = None, None, None
-                else:
-                    continue
-                if mid:
-                    # 厂商未提供元数据的字段回填本地规格表（官方文档核实值）
-                    spec_context, spec_output = lookup_model_spec(mid)
-                    if context_window is None:
-                        context_window = spec_context
-                    if max_output is None:
-                        max_output = spec_output
-                    models.append({
-                        "id": mid,
-                        "model_type": model_type,
-                        "context_window": context_window,
-                        "supports_vision": supports_vision,
-                        "max_tokens": max_output,
-                    })
-
-            def _sort_key(entry: Dict[str, str]):
-                # 明确标注为语音/图像/embedding 的条目排到末尾，对话模型靠前
-                model_type = entry.get("model_type") or ""
-                is_non_chat = any(
-                    keyword in model_type.lower()
-                    for keyword in ("语音", "图像", "音频", "文生图", "embedding", "rerank", "tts", "asr")
-                )
-                return (1 if is_non_chat else 0, entry["id"].lower())
-
-            models.sort(key=_sort_key)
-            return {"ok": True, "models": models, "count": len(models), "base_url": base_url}
+            return fetch_model_list(base_url, _probe_keys_for_provider(provider))
         except Exception as e:
             logger.exception("fetch_provider_models 失败")
             return {"ok": False, "msg": str(e)}

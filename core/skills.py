@@ -866,6 +866,84 @@ def scan_all_skills():
 
     return skills
 
+def delete_skill(skill_id):
+    """物理删除一个已扫描到的技能目录（含 SKILL.md）。
+
+    skill_id 与技能列表里的 id 相同，是 SKILL.md 的绝对路径。只允许删除
+    某个技能搜索根的直接子目录，并且该目录不能落在随包内置源里——内置源
+    是安装内容，用户删的是释放到用户目录后的那一份。已释放记录保持不变，
+    下次启动不会把删掉的内置技能再拷回来。
+    返回 {"ok": bool, "msg": str}，不抛异常。
+    """
+    if not isinstance(skill_id, str) or not skill_id.strip():
+        return {"ok": False, "msg": "技能标识无效"}
+    try:
+        skill_file = os.path.realpath(os.path.abspath(skill_id.strip()))
+    except Exception:
+        return {"ok": False, "msg": "技能标识无效"}
+    if not os.path.isfile(skill_file):
+        return {"ok": False, "msg": "技能文件不存在"}
+    if os.path.basename(skill_file).lower() != "skill.md":
+        return {"ok": False, "msg": "只能删除技能目录"}
+    skill_dir = os.path.dirname(skill_file)
+    if os.path.islink(skill_dir):
+        return {"ok": False, "msg": "不能删除符号链接技能目录"}
+    skill_dir_real = os.path.normcase(os.path.realpath(skill_dir))
+    if not os.path.normcase(skill_file).startswith(skill_dir_real + os.sep):
+        return {"ok": False, "msg": "技能文件不在技能目录内"}
+
+    allowed = False
+    for base in get_skill_dirs():
+        try:
+            base_real = os.path.normcase(os.path.realpath(os.path.abspath(base)))
+        except Exception:
+            continue
+        if os.path.dirname(skill_dir_real) == base_real and skill_dir_real.startswith(base_real + os.sep):
+            allowed = True
+            break
+    if not allowed:
+        return {"ok": False, "msg": "该技能不在可管理的技能目录中，已拒绝删除"}
+
+    try:
+        builtin_root = os.path.normcase(os.path.realpath(os.path.abspath(_builtin_skills_dir())))
+    except Exception:
+        builtin_root = ""
+    if builtin_root and (skill_dir_real == builtin_root or skill_dir_real.startswith(builtin_root + os.sep)):
+        return {"ok": False, "msg": "不能删除安装包内的内置技能源"}
+
+    try:
+        shutil.rmtree(skill_dir)
+    except OSError as e:
+        return {"ok": False, "msg": f"删除技能目录失败: {e}"}
+    _invalidate_fingerprint_cache(skill_dir)
+    _drop_active_skill_id(skill_file)
+    return {"ok": True, "msg": "已删除技能"}
+
+
+def _drop_active_skill_id(skill_file):
+    """从激活列表里去掉刚删除的 SKILL.md，避免留下指向已删除文件的 id。"""
+    try:
+        target = os.path.normcase(os.path.realpath(os.path.abspath(skill_file)))
+    except Exception:
+        return
+    kept = []
+    changed = False
+    for sid in get_active_skill_ids():
+        if not isinstance(sid, str):
+            changed = True
+            continue
+        try:
+            current = os.path.normcase(os.path.realpath(os.path.abspath(sid)))
+        except Exception:
+            current = os.path.normcase(os.path.abspath(sid))
+        if current == target:
+            changed = True
+            continue
+        kept.append(sid)
+    if changed:
+        save_active_skill_ids(kept)
+
+
 def get_active_skill_ids():
     # 读失败时优先从 .bak 备份恢复，避免激活技能无声丢失
     data = config._read_json_with_backup(ACTIVE_SKILLS_FILE, default=None)

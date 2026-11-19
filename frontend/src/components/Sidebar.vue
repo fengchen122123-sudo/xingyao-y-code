@@ -139,31 +139,31 @@
 
     <div class="side-menu">
       <div class="menu-item menu-new-session" @click="newSession()">
-        <span class="mi-ico"><AppIcon name="pencil" :size="14.5" :stroke-width="1.8" /></span>
+        <span class="mi-ico"><AppIcon name="pencil" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">新会话</span>
         <span
           class="mi-workdir"
           :title="store.currentWorkdirLabel"
         >{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
-        <span class="mi-plus">＋</span>
+        <span class="mi-plus"><AppIcon name="plus" :size="14" :stroke-width="2.5" /></span>
       </div>
       <div class="menu-item" @click="openSkills()">
-        <span class="mi-ico"><AppIcon name="sparkle" :size="14.5" :stroke-width="1.8" /></span>
+        <span class="mi-ico"><AppIcon name="sparkle" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星盘 · 技能</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openMcp()">
-        <span class="mi-ico"><AppIcon name="blocks" :size="14.5" :stroke-width="1.8" /></span>
+        <span class="mi-ico"><AppIcon name="blocks" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星桥 · MCP</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openPlugins()">
-        <span class="mi-ico"><AppIcon name="hexagon" :size="14.5" :stroke-width="1.8" /></span>
+        <span class="mi-ico"><AppIcon name="hexagon" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星匣 · 插件</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openAutomations()">
-        <span class="mi-ico"><AppIcon name="orbit" :size="14.5" :stroke-width="1.8" /></span>
+        <span class="mi-ico"><AppIcon name="orbit" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星轨</span>
         <span class="mi-arrow">›</span>
       </div>
@@ -174,8 +174,8 @@
     <div class="side-section">
       <span>项目会话</span>
       <span class="side-section-actions">
-        <button class="add-btn" title="搜索会话 (Ctrl+F)" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="13" :stroke-width="1.9" /></button>
-        <button class="add-btn" title="添加/引入项目文件夹" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="13.5" :stroke-width="1.9" /></button>
+        <button class="add-btn" title="搜索会话 (Ctrl+F)" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="15" :stroke-width="2.4" /></button>
+        <button class="add-btn" title="添加/引入项目文件夹" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="15" :stroke-width="2.4" /></button>
       </span>
     </div>
 
@@ -204,7 +204,7 @@
             @dragend="onGroupDragEnd()"
           >
             <span class="g-arrow" :class="{ collapsed: collapsedGroups[group.folder_path] }">
-              <AppIcon name="chevron-down" :size="12" :stroke-width="2" />
+              <AppIcon name="chevron-down" :size="14" :stroke-width="2.5" />
             </span>
             <!-- 秘书分组是虚拟分组（folder_path='SECRETARY' 不是磁盘目录）：不能打开
                  目录，也不能整组删除，否则会把分组标识当路径发给后端 -->
@@ -214,12 +214,12 @@
               :class="{ 'is-current': group.is_current }"
               title="在资源管理器中打开此目录"
               @click.stop="openFolder(group.folder_path)"
-            ><AppIcon name="folder" :size="13.5" :stroke-width="1.8" /></span>
+            ><AppIcon name="folder" :size="15" :stroke-width="2.35" /></span>
             <span v-else-if="group.is_secretary" class="g-group-ico">
-              <AppIcon name="bot" :size="13.5" :stroke-width="1.8" />
+              <AppIcon name="bot" :size="15" :stroke-width="2.35" />
             </span>
             <span v-else class="g-group-ico">
-              <AppIcon name="message-square" :size="13.5" :stroke-width="1.8" />
+              <AppIcon name="message-square" :size="15" :stroke-width="2.35" />
             </span>
             <span class="g-title" :class="{ 'is-current': group.is_current }">
               {{ getFolderTitle(group) }}
@@ -359,10 +359,10 @@
           <span class="footer-copy"><b :title="trUserLabelTitle">{{ trUserLabelShort }}</b></span>
         </button>
         <button class="icon-btn" data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
-          <AppIcon name="settings" :size="14.5" :stroke-width="1.8" />
+          <AppIcon name="settings" :size="16" :stroke-width="2.25" />
         </button>
         <button class="icon-btn phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
-          <AppIcon name="smartphone" :size="14.5" :stroke-width="1.8" />
+          <AppIcon name="smartphone" :size="16" :stroke-width="2.25" />
         </button>
       </div>
       <!-- 基元律动账号浮层：登录成功后点左下角卡片，在卡片上方弹出 -->
@@ -2087,7 +2087,7 @@ function getFolderTitle(g: SessionGroup) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--xy-text-2, var(--text-dim));
+  color: var(--xy-text, var(--text));
   flex-shrink: 0;
 }
 .menu-item .mi-label {
@@ -2108,8 +2108,10 @@ function getFolderTitle(g: SessionGroup) {
   max-width: 88px;
 }
 .menu-item .mi-plus {
-  color: var(--xy-text-3, var(--text-faint));
-  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--xy-text, var(--text));
   line-height: 1;
   flex-shrink: 0;
 }
@@ -2143,7 +2145,7 @@ function getFolderTitle(g: SessionGroup) {
   height: 24px;
   background: none;
   border: none;
-  color: var(--xy-text-3, var(--text-faint));
+  color: var(--xy-text, var(--text));
   border-radius: 6px;
   display: inline-flex;
   align-items: center;
@@ -2184,7 +2186,7 @@ function getFolderTitle(g: SessionGroup) {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  color: var(--xy-text-2, var(--text-dim));
+  color: var(--xy-text, var(--text));
   border-radius: 4px;
   transition: color 0.14s, transform 0.14s;
 }
@@ -2218,7 +2220,7 @@ function getFolderTitle(g: SessionGroup) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--xy-text-3, var(--text-faint));
+  color: var(--xy-text, var(--text));
   transition: transform 0.15s ease;
   flex-shrink: 0;
 }
@@ -2618,6 +2620,7 @@ function getFolderTitle(g: SessionGroup) {
   padding: 0;
   gap: 0;
   border-radius: 8px;
+  color: var(--xy-text, var(--text));
 }
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
 .footer-copy b { font-size: 12px; font-weight: 500; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

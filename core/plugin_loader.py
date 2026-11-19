@@ -39,6 +39,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -407,6 +408,69 @@ def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
 
     _logger.info("已清理孤儿 provider: %s", ", ".join(orphan_names))
     return orphan_names
+
+
+def delete_plugin(name: str) -> tuple[bool, str]:
+    """物理删除用户插件目录。内置插件在安装目录里，拒绝删除。
+
+    删除前先卸下已注册工具并清掉信任指纹。目录必须落在用户插件根目录之内，
+    符号链接若解析到根目录外同样拒绝。
+    """
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    name = name.strip()
+    if name in (".", "..") or any(sep in name for sep in ("/", "\\", "\x00")):
+        return False, "插件名无效"
+
+    with _REFRESH_LOCK:
+        target = _locate_plugin_dir(name)
+        if target is None or not (target / "plugin.json").is_file():
+            return False, f"未找到插件 {name}"
+        if _is_builtin_plugin(target):
+            return False, "内置插件随应用发布，不能删除"
+        try:
+            resolved = target.resolve()
+            user_root = plugin_dirs()[0].resolve()
+        except OSError as exc:
+            return False, f"无法定位插件目录: {exc}"
+        if resolved == user_root or not resolved.is_relative_to(user_root):
+            return False, "插件目录不在用户插件目录内，已拒绝删除"
+        try:
+            shutil.rmtree(resolved)
+        except OSError as exc:
+            return False, f"删除插件目录失败: {exc}"
+
+        tools: list = []
+        for info in _PLUGIN_INFOS:
+            if info.get("name") == name and info.get("status") != "overridden":
+                tools = list(info.get("tools") or [])
+                break
+        _unload_removed_plugin(name, tools, _live_registry())
+        _PLUGIN_INFOS[:] = [
+            info for info in _PLUGIN_INFOS
+            if str(info.get("name") or "") != name or info.get("status") == "overridden"
+        ]
+        store = _load_trust_store()
+        if str(resolved) in store:
+            store.pop(str(resolved), None)
+            _save_trust_store(store)
+        return True, f"已删除插件 {name}"
+
+
+def _locate_plugin_dir(name: str) -> Path | None:
+    """按插件名找目录。同名时优先用户目录，这样删除不会打到内置那一份。"""
+    candidates: list[Path] = []
+    for info in _PLUGIN_INFOS:
+        if info.get("name") == name and info.get("path"):
+            candidates.append(Path(info["path"]))
+    for base in plugin_dirs():
+        child = base / name
+        if (child / "plugin.json").is_file():
+            candidates.append(child)
+    for path in candidates:
+        if not _is_builtin_plugin(path):
+            return path
+    return candidates[0] if candidates else None
 
 
 def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:

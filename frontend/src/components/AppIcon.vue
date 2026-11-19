@@ -9,8 +9,8 @@
     fill="none"
     stroke="currentColor"
     :stroke-width="strokeWidth"
-    stroke-linecap="round"
-    stroke-linejoin="round"
+    :stroke-linecap="linecap"
+    :stroke-linejoin="linejoin"
     aria-hidden="true"
     v-html="path"
   />
@@ -27,8 +27,12 @@ const props = withDefaults(
     size?: number;
     /** 描边宽度，默认 1.75（24 viewBox 下小尺寸仍清晰） */
     strokeWidth?: number;
+    /** 线帽，默认圆角；窗口方块用 butt 才能保住直角 */
+    linecap?: 'round' | 'butt' | 'square';
+    /** 拐角，默认圆角；窗口方块用 miter */
+    linejoin?: 'round' | 'miter' | 'bevel';
   }>(),
-  { size: 16, strokeWidth: 1.75 },
+  { size: 16, strokeWidth: 1.75, linecap: 'round', linejoin: 'round' },
 );
 
 const path = computed(() => ICON_PATHS[props.name] ?? '');
@@ -40,6 +44,8 @@ const path = computed(() => ICON_PATHS[props.name] ?? '');
   display: inline-block;
   vertical-align: -0.15em;
   flex-shrink: 0;
+  /* 加粗描边时避免贴边被 viewBox 裁掉 */
+  overflow: visible;
 }
 /* 加载中旋转（配合 loader 弧线图标） */
 .app-icon.icon-spin {

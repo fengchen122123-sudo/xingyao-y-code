@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it } from 'vitest';
 import TurnGroup from './TurnGroup.vue';
 import type { TurnGroupInfo } from '../utils/turnGroups';
-import type { ChatMessage } from '../stores/appStore';
+import { useAppStore, type ChatMessage } from '../stores/appStore';
 
 beforeEach(() => setActivePinia(createPinia()));
 
@@ -165,6 +165,76 @@ describe('TurnGroup', () => {
     const bars = wrapper.findAll('.msg-metrics-bar');
     expect(bars).toHaveLength(1);
     expect(bars[0].text()).toContain('58.2 t/s');
+    wrapper.unmount();
+  });
+
+  it('回合执行中在过程头和底部显示当前 token 速度', async () => {
+    const store = useAppStore();
+    store.streamingSpeed = 184.1;
+    const group: TurnGroupInfo = {
+      userMsg: user('跑个任务'),
+      middle: [assistant({ content: '先查一下', tool_calls: [{ id: 't1' } as any], execution_state: 'running' })],
+      tail: [assistant({ content: '正在写', execution_state: 'running' })],
+      running: true,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, {
+      props: { group, runningElapsedText: '19s' },
+    });
+
+    expect(wrapper.get('[data-test="running-process-meta"]').text()).toContain('184.1 t/s');
+    expect(wrapper.get('[data-test="running-process-meta"]').text()).toContain('19s');
+    expect(wrapper.get('[data-test="live-token-speed"]').text()).toBe('184.1 t/s');
+
+    await wrapper.get('.xy-process-head').trigger('click');
+    expect(wrapper.get('.xy-shimmer-text').text()).toContain('184.1 t/s');
+
+    store.streamingSpeed = 0;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="live-token-speed"]').exists()).toBe(false);
+    expect(wrapper.get('.xy-shimmer-text').text()).not.toContain('t/s');
+    wrapper.unmount();
+  });
+
+  it('没有执行过程时，生成中的速度仍显示在回合底部', async () => {
+    const store = useAppStore();
+    store.streamingSpeed = 50;
+    const group: TurnGroupInfo = {
+      userMsg: user('你好'),
+      middle: [],
+      tail: [assistant({ content: '正在回答', execution_state: 'running' })],
+      running: true,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    expect(wrapper.find('[data-test="running-process-meta"]').exists()).toBe(false);
+    expect(wrapper.get('[data-test="live-token-speed"]').text()).toBe('50 t/s');
+    wrapper.unmount();
+  });
+
+  it('回合结束后显示任务总时长，右下角时间不用最后一次模型耗时', () => {
+    const metrics = { duration_s: 19, token_speed: 184.1, completion_tokens: 2694 };
+    const group: TurnGroupInfo = {
+      userMsg: user('跑个任务'),
+      middle: [assistant({ content: '先编译', tool_calls: [{ id: 't1' } as any] })],
+      tail: [assistant({ content: '完成', metrics })],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    group.userMsg!.turnElapsedS = 25;
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    expect(wrapper.get('[data-test="turn-total-duration"]').text()).toContain('本轮工作 25s');
+    const bar = wrapper.get('[data-test="msg-metrics"]');
+    expect(bar.text()).toContain('184.1 t/s');
+    expect(bar.text()).toContain('25s');
+    expect(bar.text()).not.toContain('19s');
+    expect(bar.attributes('title')).toContain('任务总时长: 25s');
+    expect(bar.attributes('title')).toContain('模型耗时: 19s');
     wrapper.unmount();
   });
 });

@@ -613,6 +613,10 @@ class LanServer:
         # force_new=True 会轮换 token 把其他已配对设备踢下线（配对二维码本就由
         # 桌面展示、手机扫码，手机无需调用）。三者 frontend-mobile 均零引用。
         "remove_mcp_server", "open_external_url", "get_remote_bind_qr",
+        # 技能 / 插件物理删除：删的是桌面本机目录（~/.ycode/skills、~/.agents/skills、
+        # ~/.ycode/plugins），手机既访问不到这些文件，也没有远程删桌面文档的场景。
+        # 与已封的 remove_mcp_server 同一边界（破坏性、桌面专属）。
+        "delete_skill", "delete_plugin",
         # PDF 编辑保存：写盘（mode="copy" 落新文件、mode="overwrite" 备份后覆盖
         # 源文件），路径鉴权用的是桌面会话工作区——手机端既访问不到桌面的这份
         # 文档，也没有远程改写桌面文件的场景，与已封的 open_path /

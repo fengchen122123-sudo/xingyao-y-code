@@ -740,3 +740,29 @@ def test_refresh_plugins_serializes_concurrent_loads(plugin_env, monkeypatch):
     assert max_active == 1
     loaded = [i for i in plugin_loader.get_plugin_infos() if i["name"] == "serial_demo"]
     assert len(loaded) == 1
+
+
+def test_delete_plugin_removes_user_directory(plugin_env, monkeypatch):
+    user_dir, _builtin_dir = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    registry = ToolRegistry()
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+    plugin_loader.load_and_register(registry)
+
+    ok, _msg = plugin_loader.delete_plugin("demo")
+
+    assert ok is True
+    assert not (user_dir / "demo").exists()
+    assert registry.execute("demo_tool", x="a").is_error
+
+
+def test_delete_plugin_refuses_builtin(plugin_env):
+    _user_dir, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "coreplug", "coreplug", _GOOD_PLUGIN)
+    plugin_loader.load_and_register(ToolRegistry())
+
+    ok, msg = plugin_loader.delete_plugin("coreplug")
+
+    assert ok is False
+    assert "内置" in msg
+    assert (builtin_dir / "coreplug" / "plugin.json").is_file()
