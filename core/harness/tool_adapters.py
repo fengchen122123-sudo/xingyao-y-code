@@ -52,6 +52,7 @@ _TRUSTED_READONLY_TOOLS = frozenset({
     "find_references",
     "glob_files",
     "view_file_outline",
+    "office_read",
 })
 
 
@@ -208,6 +209,7 @@ def classify_path_access(
     path_value,
     *,
     is_outside_workspace=_is_outside_workspace,
+    session_name=None,
 ):
     """Classify one path without prompting or mutating authorization state."""
     if not path_value:
@@ -267,6 +269,15 @@ def classify_path_access(
                 return "trusted_read"
         except Exception:
             pass
+        try:
+            from core.secretary import is_secretary_registered_workspace_read
+
+            if is_secretary_registered_workspace_read(
+                function_name, str(path_value), session_name=session_name
+            ):
+                return "trusted_read"
+        except Exception:
+            pass
     return "outside"
 
 
@@ -283,6 +294,7 @@ def _sandbox_outside_guard(
     is_outside_workspace=_is_outside_workspace,
     sandbox_bypass=_sandbox_bypass,
     permission_error_type=Exception,
+    session_name=None,
 ):
     """Return the existing one-shot bypass context or a model-visible denial."""
     if not path_value:
@@ -360,6 +372,15 @@ def _sandbox_outside_guard(
             from core.tools import is_trusted_paste_path, is_session_user_attached_path
 
             if is_trusted_paste_path(str(path_value)) or is_session_user_attached_path(str(path_value)):
+                return sandbox_bypass(), None
+        except Exception:
+            pass
+        try:
+            from core.secretary import is_secretary_registered_workspace_read
+
+            if is_secretary_registered_workspace_read(
+                function_name, str(path_value), session_name=session_name
+            ):
                 return sandbox_bypass(), None
         except Exception:
             pass

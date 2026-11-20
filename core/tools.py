@@ -487,6 +487,14 @@ def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
                 return candidate
         except Exception:
             pass
+        # 秘书跨项目只读豁免：只允许只读路径落入已登记项目工作区内
+        try:
+            from core.secretary import is_secretary_registered_workspace_read
+
+            if is_secretary_registered_workspace_read("read_file", str(candidate)):
+                return candidate
+        except Exception:
+            pass
     # AI 生成内容目录写入豁免：AI 产出的临时脚本 / 中间产物按设置统一落该目录，
     # 不属于越界访问（规格 6.1）。目录由用户在设置页指定，视为已授权；
     # 豁免只针对该目录，其余路径的沙盒判定不受影响。
@@ -4225,6 +4233,7 @@ class SubagentManager:
             else _nullcontext()
         )
         _permission_scope.__enter__()
+        _prev_thread_session = _subagent_app_context.get_thread_session()
         try:
             with self._lock:
                 if task.status != "pending":
@@ -4368,8 +4377,12 @@ class SubagentManager:
                 _tu_recorder.unbind_thread()
             except Exception:
                 pass
-            # 线程本地权限档位必须随任务结束解绑，避免复用线程（如测试主线程
-            # 直调）时档位残留到下一个任务
+            # 线程本地权限档位与会话路由必须随任务结束解绑，避免复用线程（如测试主线程
+            # 直调）时档位与会话残留到下一个任务
+            try:
+                _subagent_app_context.set_thread_session(_prev_thread_session)
+            except Exception:
+                pass
             try:
                 _permission_scope.__exit__(None, None, None)
             except Exception:
@@ -6684,3 +6697,715 @@ def remember_decision(workdir="", section="", content="", cancel_event=None):
     if not message:
         return f"🚨 记录失败：项目画像没有写成（{target}），请稍后重试。"
     return message
+
+
+# ---------------------------------------------------------------------------
+# 秘书只读分析与个人记忆工具（list_projects / list_sessions / read_session / manage_memory）
+# ---------------------------------------------------------------------------
+
+_SECRETARY_READ_SESSION_MAX_MSG_CHARS = 1500
+_SECRETARY_READ_SESSION_BUDGET_CHARS = 14000
+_SECRETARY_MEMORY_TYPES = ("user", "feedback", "project", "reference")
+
+
+def _secretary_redact_text(text: str) -> str:
+    """对摘要与会话正文做常见明文密钥/Token 脱敏。"""
+    import re
+
+    value = str(text or "")
+    if not value:
+        return ""
+    value = re.sub(r"sk-[A-Za-z0-9_-]{16,}", "[已脱敏密钥]", value)
+    value = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._-]{20,}", r"\1[已脱敏Token]", value)
+    return value
+
+
+def _secretary_normalize_workdir(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.upper() == "GLOBAL":
+        return "GLOBAL"
+    try:
+        from core.memory import _normalize_workdir
+
+        return _normalize_workdir(text)
+    except Exception:
+        return os.path.normpath(text)
+
+
+def _secretary_display_name(manager, session_name: str, source: str) -> str:
+    import re
+
+    if str(source or "").strip().upper() == "SECRETARY":
+        try:
+            getter = getattr(manager, "get_session_secretary_name", None)
+            if callable(getter):
+                name = str(getter(session_name) or "").strip()
+                if name:
+                    return name
+        except Exception:
+            pass
+        return "秘书"
+    if re.fullmatch(r"session_[0-9a-f]{6}", str(session_name or "")):
+        return "新会话"
+    return str(session_name or "")
+
+
+def list_projects(cancel_event=None):
+    """列出全部已登记项目工作区与全局会话统计（秘书专用，只读）。"""
+    _raise_if_cancelled(cancel_event)
+    try:
+        from core import app_context
+
+        manager = app_context.get_manager()
+    except Exception as exc:
+        return f"🚨 查询项目列表失败：{exc}"
+    if manager is None:
+        return "🚨 查询项目列表失败：会话存储尚未初始化。"
+
+    try:
+        workspaces = list(manager.get_all_workspaces() or [])
+        sessions = list(manager.get_all_sessions(include_empty=True, include_archived=True) or [])
+    except Exception as exc:
+        return f"🚨 查询项目列表失败：{exc}"
+
+    projects_map = {}
+
+    def _ensure_entry(norm_wd: str):
+        entry = projects_map.get(norm_wd)
+        if entry is None:
+            base = os.path.basename(norm_wd.rstrip("\\/")) or norm_wd
+            entry = {
+                "workdir": norm_wd,
+                "display_name": base,
+                "session_count": 0,
+                "archived_count": 0,
+                "last_updated_at": "",
+                "has_profile": False,
+                "profile_updated": "",
+            }
+            projects_map[norm_wd] = entry
+        return entry
+
+    for raw_ws in workspaces:
+        norm = _secretary_normalize_workdir(str(raw_ws or ""))
+        if not norm or norm == "GLOBAL":
+            continue
+        _ensure_entry(norm)
+
+    global_count = 0
+    secretary_count = 0
+    for item in sessions:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "GUI").strip().upper()
+        archived = bool(item.get("archived_at"))
+        msg_count = int(item.get("count") or 0)
+        if source == "SECRETARY":
+            if not archived:
+                secretary_count += 1
+            continue
+        raw_wd = str(item.get("workdir") or "").strip()
+        norm = _secretary_normalize_workdir(raw_wd)
+        if not norm or norm == "GLOBAL":
+            if not archived and msg_count > 0:
+                global_count += 1
+            continue
+        entry = _ensure_entry(norm)
+        if archived:
+            if msg_count > 0:
+                entry["archived_count"] += 1
+        else:
+            if msg_count > 0:
+                entry["session_count"] += 1
+            updated = str(item.get("updated_at") or "")
+            if updated > entry["last_updated_at"]:
+                entry["last_updated_at"] = updated
+
+    for norm_wd, entry in projects_map.items():
+        _raise_if_cancelled(cancel_event)
+        try:
+            state = project_profile.read_state(norm_wd)
+            if isinstance(state, dict):
+                entry["has_profile"] = bool(state.get("has_profile"))
+                entry["profile_updated"] = str(state.get("updated") or "")
+        except Exception:
+            pass
+
+    projects = sorted(
+        projects_map.values(),
+        key=lambda e: (str(e.get("last_updated_at") or ""), str(e.get("display_name") or "")),
+        reverse=True,
+    )
+    return _secretary_json({
+        "project_count": len(projects),
+        "projects": projects,
+        "global_session_count": global_count,
+        "secretary_session_count": secretary_count,
+    })
+
+
+def list_sessions(
+    workdir="",
+    keyword="",
+    include_archived=False,
+    include_secretary=False,
+    limit=20,
+    cancel_event=None,
+):
+    """按项目或关键词浏览历史会话列表（秘书专用，不强制要求关键词）。"""
+    _raise_if_cancelled(cancel_event)
+    try:
+        from core import app_context
+
+        manager = app_context.get_manager()
+    except Exception as exc:
+        return f"🚨 获取会话列表失败：{exc}"
+    if manager is None:
+        return "🚨 获取会话列表失败：会话存储尚未初始化。"
+
+    norm_filter = _secretary_normalize_workdir(str(workdir or ""))
+    kw = str(keyword or "").strip().lower()
+    size = _secretary_scope_limit(limit, default=20, maximum=50)
+    try:
+        raw_sessions = list(
+            manager.get_all_sessions(
+                workdir=None,
+                include_empty=False,
+                include_archived=bool(include_archived),
+            )
+            or []
+        )
+    except Exception as exc:
+        return f"🚨 获取会话列表失败：{exc}"
+
+    candidates = []
+    for item in raw_sessions:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "GUI").strip().upper()
+        if not include_secretary and source == "SECRETARY":
+            continue
+        raw_wd = str(item.get("workdir") or "").strip()
+        item_norm_wd = _secretary_normalize_workdir(raw_wd)
+        if norm_filter:
+            if norm_filter == "GLOBAL":
+                if item_norm_wd and item_norm_wd != "GLOBAL":
+                    continue
+            elif item_norm_wd != norm_filter:
+                continue
+        name = str(item.get("name") or "")
+        display_name = _secretary_display_name(manager, name, source)
+        search_text = str(item.get("search_text") or "")
+        updated_at = str(item.get("updated_at") or "")
+        candidates.append((item, source, name, display_name, search_text, item_norm_wd or "GLOBAL", updated_at))
+
+    candidates.sort(key=lambda row: row[6], reverse=True)
+
+    results = []
+    summary_getter = getattr(manager, "get_session_memory_summary", None)
+    for item, source, name, display_name, search_text, item_wd, updated_at in candidates:
+        _raise_if_cancelled(cancel_event)
+        if kw:
+            haystack = "\n".join((name, display_name, search_text)).lower()
+            matched = kw in haystack
+            summary_text = ""
+            if callable(summary_getter):
+                try:
+                    summary_text = str(summary_getter(name) or "")
+                except Exception:
+                    summary_text = ""
+            if not matched and kw not in summary_text.lower():
+                continue
+        else:
+            summary_text = ""
+            if callable(summary_getter):
+                try:
+                    summary_text = str(summary_getter(name) or "")
+                except Exception:
+                    summary_text = ""
+
+        redacted_summary = _secretary_redact_text(summary_text.strip())
+        if redacted_summary:
+            preview = redacted_summary[:200]
+        else:
+            preview = _secretary_redact_text(search_text.strip())[:160]
+
+        results.append({
+            "session_name": name,
+            "display_name": display_name,
+            "source": source,
+            "is_secretary": source == "SECRETARY",
+            "workdir": item_wd,
+            "updated_at": updated_at,
+            "message_count": int(item.get("count") or 0),
+            "archived": bool(item.get("archived_at")),
+            "has_summary": bool(summary_text.strip()),
+            "summary_preview": preview,
+        })
+        if len(results) >= size:
+            break
+
+    payload = {"count": len(results), "results": results}
+    if not results:
+        payload["hint"] = "未找到符合条件的会话，可放宽 workdir / keyword 或开启 include_archived。"
+    return _secretary_json(payload)
+
+
+def _secretary_extract_msg_text(msg: dict) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype == "text":
+                    txt = str(part.get("text") or "")
+                    if txt:
+                        parts.append(txt)
+                elif ptype in ("image_url", "image"):
+                    parts.append("[图片]")
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def read_session(
+    target="",
+    limit=30,
+    offset=0,
+    from_end=True,
+    include_summary=True,
+    include_tool_calls=True,
+    cancel_event=None,
+):
+    """读取指定会话的压缩记忆摘要与时间线消息（秘书专用，只读分析）。"""
+    _raise_if_cancelled(cancel_event)
+    target_text = str(target or "").strip()
+    if not target_text:
+        return "🚨 读取会话失败：target（会话名或显示名）不能为空。"
+
+    try:
+        from core import app_context
+
+        manager = app_context.get_manager()
+    except Exception as exc:
+        return f"🚨 读取会话失败：{exc}"
+    if manager is None:
+        return "🚨 读取会话失败：会话存储尚未初始化。"
+
+    try:
+        all_sessions = list(
+            manager.get_all_sessions(
+                workdir=None,
+                include_empty=True,
+                include_archived=True,
+            )
+            or []
+        )
+    except Exception as exc:
+        return f"🚨 读取会话失败：{exc}"
+
+    def _meta_entry(item):
+        name = str(item.get("name") or "")
+        source = str(item.get("source") or "GUI").strip().upper()
+        display = _secretary_display_name(manager, name, source)
+        return {
+            "session_name": name,
+            "display_name": display,
+            "source": source,
+            "is_secretary": source == "SECRETARY",
+            "workdir": str(item.get("workdir") or "GLOBAL"),
+            "updated_at": str(item.get("updated_at") or ""),
+            "archived": bool(item.get("archived_at")),
+            "search_text": str(item.get("search_text") or ""),
+        }
+
+    candidates_meta = [_meta_entry(item) for item in all_sessions if isinstance(item, dict)]
+
+    # 1. 精确 session_name
+    matched = [m for m in candidates_meta if m["session_name"] == target_text]
+    # 2. 精确 display_name
+    if not matched:
+        matched = [m for m in candidates_meta if m["display_name"] == target_text]
+    if not matched:
+        low = target_text.lower()
+        matched = [m for m in candidates_meta if m["display_name"].lower() == low]
+    # 3. 子串模糊匹配（session_name / display_name / search_text）
+    if not matched:
+        low = target_text.lower()
+        matched = [
+            m for m in candidates_meta
+            if low in m["session_name"].lower()
+            or low in m["display_name"].lower()
+            or low in m["search_text"].lower()
+        ]
+
+    if not matched:
+        return f"没有找到匹配「{target_text}」的会话。请先用 list_sessions 或 search_conversations 确认会话名。"
+    if len(matched) > 1:
+        matched.sort(key=lambda m: str(m.get("updated_at") or ""), reverse=True)
+        return _secretary_json({
+            "ok": False,
+            "error": f"匹配到多个会话（{len(matched)} 条），请改用更精确的 session_name。",
+            "candidates": [
+                {
+                    "session_name": m["session_name"],
+                    "display_name": m["display_name"],
+                    "workdir": m["workdir"],
+                    "updated_at": m["updated_at"],
+                }
+                for m in matched[:10]
+            ],
+        })
+
+    resolved = matched[0]
+    resolved_name = resolved["session_name"]
+    summary_text = ""
+    summary_generations = []
+    if include_summary:
+        try:
+            summary_getter = getattr(manager, "get_session_memory_summary", None)
+            if callable(summary_getter):
+                summary_text = _secretary_redact_text(str(summary_getter(resolved_name) or "").strip())[:4000]
+        except Exception:
+            summary_text = ""
+        try:
+            gen_getter = getattr(manager, "get_summary_generation_index", None)
+            if callable(gen_getter):
+                raw_gens = gen_getter(resolved_name, limit=10)
+                if isinstance(raw_gens, tuple) and len(raw_gens) == 2:
+                    summary_generations = list(raw_gens[0] or [])
+                elif raw_gens:
+                    summary_generations = list(raw_gens)
+        except Exception:
+            summary_generations = []
+
+    try:
+        raw_history = list(manager.get_history(resolved_name) or [])
+    except Exception as exc:
+        return f"🚨 读取会话历史失败：{exc}"
+
+    try:
+        from core.injection_markers import is_system_injected_user_text
+    except Exception:
+        def is_system_injected_user_text(_text):
+            return False
+    try:
+        from core.agent_service import strip_context_suffix
+    except Exception:
+        def strip_context_suffix(text):
+            return str(text or "")
+
+    entries = []
+    for raw_msg in raw_history:
+        _raise_if_cancelled(cancel_event)
+        if not isinstance(raw_msg, dict):
+            continue
+        role = str(raw_msg.get("role") or "").strip().lower()
+        if role == "system":
+            continue
+        raw_text = _secretary_extract_msg_text(raw_msg)
+        if role == "user":
+            if is_system_injected_user_text(raw_text):
+                if raw_text.lstrip().startswith("<task-notification>"):
+                    condensed = _secretary_redact_text(raw_text.strip())[:240]
+                    entries.append({"role": "system_notice", "content": condensed})
+                continue
+            cleaned = strip_context_suffix(raw_text).strip()
+            if not cleaned:
+                continue
+            entries.append({
+                "role": "user",
+                "content": _secretary_redact_text(cleaned)[:_SECRETARY_READ_SESSION_MAX_MSG_CHARS],
+            })
+        elif role == "assistant":
+            cleaned = raw_text.strip()
+            entry = {"role": "assistant", "content": _secretary_redact_text(cleaned)[:_SECRETARY_READ_SESSION_MAX_MSG_CHARS]}
+            tool_calls = raw_msg.get("tool_calls") or []
+            if include_tool_calls and isinstance(tool_calls, list) and tool_calls:
+                names = []
+                for tc in tool_calls:
+                    fn = (tc or {}).get("function") or {}
+                    tname = str(fn.get("name") or "").strip()
+                    if tname:
+                        names.append(tname)
+                if names:
+                    entry["tool_calls"] = names
+            if entry["content"] or entry.get("tool_calls"):
+                entries.append(entry)
+        elif role == "tool":
+            if not include_tool_calls:
+                continue
+            tname = str(raw_msg.get("name") or "tool")
+            cleaned = _secretary_redact_text(raw_text.strip())[:500]
+            if cleaned:
+                entries.append({"role": "tool", "name": tname, "content": cleaned})
+
+    total = len(entries)
+    lim = _secretary_scope_limit(limit, default=30, maximum=80)
+    try:
+        off = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        off = 0
+
+    if from_end:
+        end = max(0, total - off)
+        start = max(0, end - lim)
+    else:
+        start = min(total, off)
+        end = min(total, start + lim)
+
+    selected = entries[start:end]
+    # 防止超长工具输出/消息把单次调用预算撑爆：从最旧端裁剪，保留最新消息
+    budget = _SECRETARY_READ_SESSION_BUDGET_CHARS
+    trimmed = []
+    used = 0
+    for item in reversed(selected):
+        chunk = len(json.dumps(item, ensure_ascii=False))
+        if trimmed and used + chunk > budget:
+            break
+        trimmed.append(item)
+        used += chunk
+    trimmed.reverse()
+    actual_start = end - len(trimmed)
+
+    return _secretary_json({
+        "ok": True,
+        "session_name": resolved_name,
+        "display_name": resolved["display_name"],
+        "is_secretary": resolved["is_secretary"],
+        "workdir": resolved["workdir"],
+        "updated_at": resolved["updated_at"],
+        "archived": resolved["archived"],
+        "memory_summary": summary_text,
+        "summary_generations": summary_generations,
+        "total_messages": total,
+        "returned_range": [actual_start, end],
+        "has_more_before": actual_start > 0,
+        "has_more_after": end < total,
+        "messages": trimmed,
+    })
+
+
+def manage_memory(
+    action="list",
+    memory_type="user",
+    title="",
+    description="",
+    content="",
+    filename="",
+    cancel_event=None,
+):
+    """管理跨项目个人持久记忆（~/.ycode/memory/，秘书专用）。
+
+    只读/写 ~/.ycode/memory/ 下的 user / feedback / project / reference 四类
+    Markdown 文件与 MEMORY.md 索引；严禁写工作区代码或 ~/.ycode 顶层配置/凭据。
+    """
+    import hashlib
+    import re
+
+    _raise_if_cancelled(cancel_event)
+    try:
+        from core import memory_kairos as mk
+    except Exception as exc:
+        return f"🚨 记忆模块加载失败：{exc}"
+
+    act = str(action or "list").strip().lower()
+    mtype = str(memory_type or "user").strip().lower()
+    raw_fname = str(filename or "").strip()
+
+    if act == "list":
+        index_lines = []
+        files = []
+        try:
+            with mk._memory_io_lock:
+                mk.ensure_memory_dir()
+                idx_path = mk.MEMORY_DIR / "MEMORY.md"
+                if idx_path.is_file():
+                    for line in idx_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                        stripped = line.strip()
+                        if stripped:
+                            index_lines.append(stripped)
+                for subdir in _SECRETARY_MEMORY_TYPES:
+                    dir_path = mk.MEMORY_DIR / subdir
+                    if not dir_path.is_dir():
+                        continue
+                    for p in sorted(dir_path.glob("*.md")):
+                        if not p.is_file():
+                            continue
+                        try:
+                            text = p.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            text = ""
+                        files.append({
+                            "path": f"{subdir}/{p.name}",
+                            "type": subdir,
+                            "filename": p.name,
+                            "size_bytes": len(text.encode("utf-8", errors="replace")),
+                            "preview": text[:200],
+                        })
+        except Exception as exc:
+            return f"🚨 读取记忆列表失败：{exc}"
+        return _secretary_json({
+            "ok": True,
+            "action": "list",
+            "memory_dir": str(mk.MEMORY_DIR),
+            "index_lines": index_lines[: mk.MAX_MEMORY_INDEX_LINES],
+            "files": files,
+        })
+
+    if act == "save":
+        if mtype not in _SECRETARY_MEMORY_TYPES:
+            return (
+                "🚨 保存记忆失败：memory_type 只能是 "
+                + "、".join(_SECRETARY_MEMORY_TYPES)
+                + f"，收到「{mtype or '(空)'}」。"
+            )
+        ttl = str(title or "").strip()
+        body = str(content or "").strip()
+        desc = str(description or "").strip()
+        if not ttl:
+            return "🚨 保存记忆失败：title（记忆标题）不能为空。"
+        if len(ttl) > 120:
+            return f"🚨 保存记忆失败：title 过长（{len(ttl)} 字），上限 120 字。"
+        if not body:
+            return "🚨 保存记忆失败：content（记忆正文）不能为空。"
+        if len(body) > 4000:
+            return f"🚨 保存记忆失败：content 过长（{len(body)} 字），上限 4000 字。"
+        if not desc:
+            first_line = next((ln.strip() for ln in body.splitlines() if ln.strip()), ttl)
+            desc = first_line[:120]
+        if len(desc) > 220:
+            desc = desc[:220]
+        # 清掉换行避免破坏 MEMORY.md 单行格式
+        ttl_one = re.sub(r"[\r\n\[\]]+", " ", ttl).strip() or "memory"
+        desc_one = re.sub(r"[\r\n]+", " ", desc).strip() or ttl_one
+
+        if (
+            mk._contains_memory_directive(ttl_one)
+            or mk._contains_memory_directive(desc_one)
+            or mk._contains_memory_directive(body)
+        ):
+            return "🚨 保存记忆失败：内容触发记忆安全过滤（包含可疑覆盖/指令句式），已拒绝写入。"
+
+        # 确定安全的文件名（必须满足 _MEMORY_TARGET_RE 的 ASCII 安全文件名要求）
+        fname = raw_fname.replace("\\", "/").strip("/")
+        if "/" in fname:
+            prefix, tail = fname.split("/", 1)
+            if prefix in _SECRETARY_MEMORY_TYPES and prefix == mtype and "/" not in tail:
+                fname = tail
+            else:
+                return f"🚨 保存记忆失败：filename 只能是裸文件名（无需目录前缀），收到「{raw_fname}」。"
+        if fname:
+            if not fname.endswith(".md"):
+                fname += ".md"
+        else:
+            ascii_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", ttl_one).strip("._-")
+            digest = hashlib.sha1(ttl_one.encode("utf-8")).hexdigest()[:8]
+            if ascii_slug and re.match(r"^[A-Za-z0-9]", ascii_slug):
+                fname = f"{ascii_slug[:40]}_{digest}.md"
+            else:
+                fname = f"{mtype}_{digest}.md"
+
+        if not mk._is_safe_memory_filename(fname) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.md", fname
+        ):
+            return f"🚨 保存记忆失败：filename「{fname}」不合法，只允许字母/数字/._- 且以 .md 结尾。"
+
+        type_dir = mk.MEMORY_DIR / mtype
+        target_path = type_dir / fname
+        rel_target = f"{mtype}/{fname}"
+        index_line = f"- [{ttl_one}]({rel_target}) — {desc_one}"
+        if not mk._is_safe_memory_index_entry(index_line):
+            # 退回到不含可疑关键词的标题/摘要校验（若命中安全规则则拒绝）
+            return "🚨 保存记忆失败：标题或摘要未能通过记忆索引安全校验。"
+
+        file_text = (
+            f"---\nname: {ttl_one}\ndescription: {desc_one}\ntype: {mtype}\n---\n\n{body}\n"
+        )
+        try:
+            with mk._memory_io_lock:
+                mk.ensure_memory_dir()
+                type_dir.mkdir(parents=True, exist_ok=True)
+                if not mk._is_within_dir(target_path, type_dir):
+                    return f"🚨 保存记忆失败：路径越界（{target_path}）。"
+                mk._atomic_write_text(target_path, file_text)
+
+                idx_path = mk.MEMORY_DIR / "MEMORY.md"
+                existing = []
+                if idx_path.is_file():
+                    existing = idx_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                needle = f"]({rel_target})"
+                filtered = [ln for ln in existing if needle not in ln]
+                filtered.append(index_line)
+                if len(filtered) > mk.MAX_MEMORY_INDEX_LINES:
+                    filtered = filtered[-mk.MAX_MEMORY_INDEX_LINES:]
+                mk._atomic_write_text(idx_path, "\n".join(filtered).rstrip() + "\n")
+        except Exception as exc:
+            return f"🚨 保存记忆失败：{exc}"
+
+        return _secretary_json({
+            "ok": True,
+            "action": "save",
+            "path": rel_target,
+            "title": ttl_one,
+            "type": mtype,
+        })
+
+    if act == "delete":
+        spec = raw_fname.replace("\\", "/").strip("/")
+        if not spec:
+            return "🚨 删除记忆失败：请提供要删除的 filename（如 user/foo.md 或配合 memory_type）。"
+        if "/" in spec:
+            parts = spec.split("/")
+            if len(parts) != 2 or parts[0] not in _SECRETARY_MEMORY_TYPES:
+                return f"🚨 删除记忆失败：路径格式无效「{raw_fname}」，应为 <type>/<name>.md。"
+            del_type, del_name = parts
+        else:
+            if mtype not in _SECRETARY_MEMORY_TYPES:
+                return f"🚨 删除记忆失败：无效的 memory_type「{mtype}」。"
+            del_type, del_name = mtype, spec
+        if not del_name.endswith(".md"):
+            del_name += ".md"
+        if not mk._is_safe_memory_filename(del_name):
+            return f"🚨 删除记忆失败：非法文件名「{del_name}」。"
+        type_dir = mk.MEMORY_DIR / del_type
+        target_path = type_dir / del_name
+        rel_target = f"{del_type}/{del_name}"
+
+        existed = False
+        removed_index = 0
+        try:
+            with mk._memory_io_lock:
+                mk.ensure_memory_dir()
+                if not mk._is_within_dir(target_path, type_dir):
+                    return f"🚨 删除记忆失败：路径越界（{target_path}）。"
+                if target_path.is_file():
+                    target_path.unlink()
+                    existed = True
+                idx_path = mk.MEMORY_DIR / "MEMORY.md"
+                if idx_path.is_file():
+                    existing = idx_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    needle = f"]({rel_target})"
+                    kept = [ln for ln in existing if needle not in ln]
+                    removed_index = len(existing) - len(kept)
+                    if removed_index:
+                        content_out = ("\n".join(kept).rstrip() + "\n") if kept else ""
+                        mk._atomic_write_text(idx_path, content_out)
+        except Exception as exc:
+            return f"🚨 删除记忆失败：{exc}"
+
+        return _secretary_json({
+            "ok": True,
+            "action": "delete",
+            "path": rel_target,
+            "deleted_file": existed,
+            "removed_index_entries": removed_index,
+        })
+
+    return "🚨 记忆操作失败：action 只能是 list、save 或 delete。"

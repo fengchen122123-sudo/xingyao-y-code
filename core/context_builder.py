@@ -47,6 +47,8 @@ class RuntimeContext:
     # 全局子代理开关（设置页「子代理」）：默认 True，关闭时运行上下文块
     # 明确告知模型不要派子代理、也不要建计划编排。
     subagent_enabled: bool = True
+    # 秘书会话标记：默认 False，保持普通会话动态块字节逐字节不变。
+    is_secretary: bool = False
 
 
 def build_stable_prompt(base_prompt: str) -> str:
@@ -102,6 +104,17 @@ def _build_runtime_context_block(runtime: RuntimeContext) -> str:
     builder 必须能独立取值，否则会出现"基础块已含 6/7、注册表再拼一次"的双份
     注入；同时这也避免注册表 builder 回调 build_dynamic_prompt 造成的无限递归。
     """
+    if getattr(runtime, "is_secretary", False):
+        return (
+            f"{DYNAMIC_CONTEXT_PREFIX}\n"
+            f"当前模型：{runtime.model_name}\n"
+            f"当前权限模式：{runtime.permission_mode}\n"
+            "工作模式：跨项目私人秘书（全局历史会话 / 项目画像 / 已登记项目工作区"
+            "文件可只读分析；所有代码改动与命令执行必须通过 dispatch_task / "
+            "dispatch_batch 派给工作会话完成）\n"
+            f"AI 生成内容目录：{runtime.ai_output_dir}\n"
+            "（若上下文中存在多份本块，以最新一份为准）"
+        )
     plan_instruction = ""
     if runtime.permission_mode == "plan":
         plan_instruction = (

@@ -596,6 +596,52 @@ def _rewrite_lines(path: str, lines: list) -> None:
             pass
 
 
+def rename_session_audit(old_name: str, new_name: str) -> int:
+    """会话重命名时迁移历史审计记录里的 session_id，避免旧决策记录在新名下消失。"""
+    old_sid = str(old_name or "").strip()
+    new_sid = str(new_name or "").strip()
+    if not old_sid or not new_sid or old_sid == new_sid:
+        return 0
+    updated = 0
+    try:
+        directory = _audit_dir()
+        if not os.path.isdir(directory):
+            return 0
+        names = sorted(
+            name for name in os.listdir(directory) if name.endswith(".jsonl")
+        )
+        ascii_escaped = json.dumps(old_sid)[1:-1]
+        with _AUDIT_LOCK:
+            for name in names:
+                path = os.path.join(directory, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        lines = handle.readlines()
+                except OSError:
+                    continue
+                changed = False
+                for position, line in enumerate(lines):
+                    if old_sid not in line and ascii_escaped not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except Exception:
+                        continue
+                    if (
+                        isinstance(record, dict)
+                        and str(record.get("session_id") or "") == old_sid
+                    ):
+                        record["session_id"] = new_sid
+                        lines[position] = json.dumps(record, ensure_ascii=False) + "\n"
+                        changed = True
+                        updated += 1
+                if changed:
+                    _rewrite_lines(path, lines)
+    except Exception:
+        pass
+    return updated
+
+
 def mark_adopted(trace_id) -> None:
     """调用方采纳决策时按 trace_id 就地回填审计 adopted=true。"""
     if not isinstance(trace_id, str) or not trace_id:
@@ -649,7 +695,16 @@ def _final_reason(failures: list) -> str:
     return failures[-1]
 
 
-def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None, audit_extra=None):
+def ask_decision(
+    state,
+    questions,
+    *,
+    scene,
+    timeout_ms=None,
+    image_b64=None,
+    audit_extra=None,
+    session_id=None,
+):
     """向 JEV 发一次决策请求。
 
     - 禁用 / 场景未启用：直接 None（零请求、零副作用）；
@@ -686,8 +741,10 @@ def ask_decision(state, questions, *, scene, timeout_ms=None, image_b64=None, au
     trace_id = uuid.uuid4().hex[:12]
     timeout_seconds = _effective_timeout_ms(cfg, timeout_ms) / 1000.0
     record = _new_record(cfg, scene_name, shadow, trace_id)
-    # 会话归属在构造后立即填充，保证下面所有 _append_audit 分支都带上该字段
-    record["session_id"] = _current_session_id()
+    # 会话归属在构造后立即填充，保证下面所有 _append_audit 分支都带上该字段。
+    # 调用方显式给出 session_id（如后台学习线程）时优先采纳，否则读取线程/当前会话。
+    explicit_sid = str(session_id or "").strip() if session_id is not None else ""
+    record["session_id"] = explicit_sid or _current_session_id()
     record["state_digest"] = _state_digest(state)
     record["questions_digest"] = _sha16(questions)
     # 请求快照：记录真正发给决策模型的三个字段，供面板回看「问的是什么」
@@ -1103,6 +1160,10 @@ def get_decision_audit_summary(
         "today_shadow_count": 0,
         "today_adopted_count": 0,
         "today_fallback_count": 0,
+        # 所属范围的累计决策总数（传了 session_id 即本会话累计总数，否则全局累计）
+        "session_total_count": 0,
+        # 全局今日决策总数（不限会话，供面板消除「今日 N 次」的口径歧义）
+        "global_today_count": 0,
         "recent": [],
         # 本次是否按会话过滤 today_*/recent（前端据此决定文案口径）
         "session_scoped": bool(session_only and wanted_session),
@@ -1159,36 +1220,34 @@ def get_decision_audit_summary(
             return True
         return str(record.get("session_id") or "") == wanted_session
 
-    for name in reversed(names):
-        if any(
-            _is_business(record)
-            for record in _iter_records(os.path.join(directory, name))
-        ):
-            summary["has_business_records"] = True
-            break
-
-    if today_name in names:
-        for record in _iter_records(os.path.join(directory, today_name)):
-            if not _in_scope(record):
-                continue
-            summary["today_count"] += 1
-            if record.get("shadow"):
-                summary["today_shadow_count"] += 1
-            if record.get("adopted"):
-                summary["today_adopted_count"] += 1
-            if record.get("fallback_reason"):
-                summary["today_fallback_count"] += 1
-    # 最近 N 条：从最新文件往前收集；收集时把老文件插到前面，保持时间升序
+    # 按文件倒序单遍扫描：同步统计 has_business_records、session_total_count、
+    # global_today_count / today_* 以及最近 N 条（保持时间升序）。
     collected: list = []
     for name in reversed(names):
-        if len(collected) >= count:
-            break
-        briefs = [
-            _audit_brief(record)
-            for record in _iter_records(os.path.join(directory, name))
-            if _in_scope(record)
-        ]
-        collected = briefs + collected
+        records = _iter_records(os.path.join(directory, name))
+        is_today = name == today_name
+        file_briefs: list = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if not summary["has_business_records"] and _is_business(record):
+                summary["has_business_records"] = True
+            if not wanted_session or str(record.get("session_id") or "") == wanted_session:
+                summary["session_total_count"] += 1
+            if is_today:
+                summary["global_today_count"] += 1
+                if _in_scope(record):
+                    summary["today_count"] += 1
+                    if record.get("shadow"):
+                        summary["today_shadow_count"] += 1
+                    if record.get("adopted"):
+                        summary["today_adopted_count"] += 1
+                    if record.get("fallback_reason"):
+                        summary["today_fallback_count"] += 1
+            if len(collected) < count and _in_scope(record):
+                file_briefs.append(_audit_brief(record))
+        if file_briefs:
+            collected = file_briefs + collected
     summary["recent"] = collected[-count:]
     return summary
 

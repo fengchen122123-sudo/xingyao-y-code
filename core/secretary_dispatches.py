@@ -30,6 +30,7 @@ __all__ = [
     "STATUS_BLOCKED",
     "TERMINAL_STATUSES",
     "DispatchStore",
+    "format_secretary_dispatch_summary",
 ]
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ _COLUMNS = (
     "finished_at",
     "result_excerpt",
     "error",
+    "reported",
 )
 
 _SELECT_COLUMNS = ", ".join(_COLUMNS)
@@ -95,7 +97,8 @@ _SCHEMA_STATEMENTS = (
         started_at       TEXT NOT NULL DEFAULT '',
         finished_at      TEXT NOT NULL DEFAULT '',
         result_excerpt   TEXT NOT NULL DEFAULT '',
-        error            TEXT NOT NULL DEFAULT ''
+        error            TEXT NOT NULL DEFAULT '',
+        reported         INTEGER NOT NULL DEFAULT 0
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_secretary_dispatches_target "
@@ -209,6 +212,13 @@ class DispatchStore:
                 cursor = self._manager.conn.cursor()
                 for statement in _SCHEMA_STATEMENTS:
                     cursor.execute(statement)
+                cursor.execute("PRAGMA table_info(secretary_dispatches)")
+                cols = {col[1] for col in cursor.fetchall()}
+                if "reported" not in cols:
+                    cursor.execute(
+                        "ALTER TABLE secretary_dispatches "
+                        "ADD COLUMN reported INTEGER NOT NULL DEFAULT 0"
+                    )
                 self._manager.conn.commit()
             self._table_ready = True
         except Exception:
@@ -476,3 +486,159 @@ class DispatchStore:
         except Exception as exc:
             logger.debug("secretary dispatch unlocked_dependents failed: %s", exc)
             return []
+
+    def batch_has_active_tasks(self, batch_id: str) -> bool:
+        """批次里是否还有正在排队、运行或等待上游解锁的任务。"""
+        bid = _text(batch_id).strip()
+        if not bid:
+            return False
+        try:
+            with self._manager.acquire_lock():
+                cursor = self._cursor()
+                cursor.execute(
+                    "SELECT 1 FROM secretary_dispatches "
+                    "WHERE batch_id = ? "
+                    "  AND (status IN (?, ?) OR (status = ? AND COALESCE(error, '') = '')) "
+                    "LIMIT 1",
+                    (bid, STATUS_QUEUED, STATUS_RUNNING, STATUS_BLOCKED),
+                )
+                return cursor.fetchone() is not None
+        except Exception as exc:
+            logger.debug("secretary dispatch batch_has_active_tasks failed: %s", exc)
+            return False
+
+    def has_unreported_wakeable(self, secretary_session: str) -> bool:
+        """是否存在至少一条尚未汇报且非仅 cancelled 的终态派活记录。
+
+        单条被用户取消的任务不主动唤醒秘书，但若已有 done / failed / 级联阻塞记录，
+        唤醒时一并认领，既不遗漏真实结果也不私自重推已取消任务。
+        """
+        sec = _text(secretary_session).strip()
+        if not sec:
+            return False
+        try:
+            with self._manager.acquire_lock():
+                cursor = self._cursor()
+                cursor.execute(
+                    "SELECT 1 FROM secretary_dispatches "
+                    "WHERE secretary_session = ? "
+                    "  AND COALESCE(reported, 0) = 0 "
+                    "  AND (status IN (?, ?) OR (status = ? AND COALESCE(error, '') != '')) "
+                    "LIMIT 1",
+                    (sec, STATUS_DONE, STATUS_FAILED, STATUS_BLOCKED),
+                )
+                return cursor.fetchone() is not None
+        except Exception as exc:
+            logger.debug("secretary dispatch has_unreported_wakeable failed: %s", exc)
+            return False
+
+    def claim_unreported(
+        self,
+        secretary_session: str,
+        *,
+        include_cancelled: bool = True,
+    ) -> List[dict]:
+        """原子认领该秘书名下所有尚未汇报的终态派活（按 id 升序）。
+
+        只有真正终结的行才会被认领：
+        - ``done`` / ``failed``（可选含 ``cancelled``）
+        - 因上游失败而级联失败的 ``blocked``（``error != ''``）；单纯排队等待依赖的
+          ``blocked``（``error == ''``）尚未结束，不在此列。
+        认领后在同一把锁和事务内把 ``reported`` 置为 ``1``，保证每条结果至多汇报一次。
+        """
+        sec = _text(secretary_session).strip()
+        if not sec:
+            return []
+        terminal_statuses = [STATUS_DONE, STATUS_FAILED]
+        if include_cancelled:
+            terminal_statuses.append(STATUS_CANCELLED)
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        try:
+            with self._manager.acquire_lock():
+                cursor = self._cursor()
+                cursor.execute(
+                    f"SELECT {_SELECT_COLUMNS} FROM secretary_dispatches "
+                    f"WHERE secretary_session = ? "
+                    f"  AND COALESCE(reported, 0) = 0 "
+                    f"  AND (status IN ({placeholders}) OR (status = ? AND COALESCE(error, '') != '')) "
+                    f"ORDER BY id ASC",
+                    (sec, *terminal_statuses, STATUS_BLOCKED),
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    return []
+                items = [_row_to_dict(row) for row in rows]
+                ids = [item["id"] for item in items if item.get("id") is not None]
+                if ids:
+                    id_marks = ", ".join("?" for _ in ids)
+                    cursor.execute(
+                        f"UPDATE secretary_dispatches SET reported = 1 WHERE id IN ({id_marks})",
+                        tuple(ids),
+                    )
+                    self._manager.conn.commit()
+            return items
+        except Exception as exc:
+            logger.debug("secretary dispatch claim_unreported failed: %s", exc)
+            return []
+
+
+_STATUS_LABELS = {
+    STATUS_DONE: "已完成 (done)",
+    STATUS_FAILED: "执行失败 (failed)",
+    STATUS_CANCELLED: "用户已取消 (cancelled)",
+    STATUS_BLOCKED: "上游失败导致阻塞 (blocked)",
+    STATUS_RUNNING: "执行中 (running)",
+    STATUS_QUEUED: "排队中 (queued)",
+}
+
+
+def format_secretary_dispatch_summary(rows: List[dict]) -> str:
+    """把已认领的终态派活记录格式化为结构化文本，供自动唤醒与回合兜底共用。
+
+    对所有动态内容执行 ``neutralize_reserved_markers``，防止目标会话回复正文里的
+    伪造系统标签破坏外层提示边界。
+    """
+    items = [row for row in (rows or []) if isinstance(row, dict)]
+    if not items:
+        return ""
+    try:
+        from core.injection_markers import neutralize_reserved_markers
+    except Exception:
+        def neutralize_reserved_markers(val: str) -> str:
+            return str(val or "")
+
+    def _safe(value, limit: int = 800) -> str:
+        text = neutralize_reserved_markers(str(value or "").strip())
+        return text[:limit]
+
+    lines = [
+        "<secretary-dispatch-summary>",
+        f"以下 {len(items)} 项你此前派出的任务已有终态结果：",
+    ]
+    for row in items:
+        did = row.get("id")
+        status = str(row.get("status") or "").strip().lower()
+        label = _STATUS_LABELS.get(status, status or "未知")
+        title = _safe(row.get("title") or "未命名任务", 120)
+        target_session = _safe(row.get("target_session") or "", 120)
+        target_display = _safe(row.get("target_display") or target_session, 120)
+        workdir = _safe(row.get("workdir") or "GLOBAL", 200)
+        batch_id = _safe(row.get("batch_id") or "", 80)
+
+        header = f"- 任务 #{did}「{title}」| 状态：{label} | 会话：{target_display} ({target_session}) | 项目：{workdir}"
+        if batch_id:
+            header += f" | 批次：{batch_id}"
+        lines.append(header)
+
+        if status == STATUS_CANCELLED:
+            lines.append(
+                "  说明：该任务已被用户主动取消。严格禁止擅自重试或重新派发，除非用户后续明确要求。"
+            )
+        error_text = _safe(row.get("error") or "", 500)
+        excerpt = _safe(row.get("result_excerpt") or "", 800)
+        if error_text:
+            lines.append(f"  错误：{error_text}")
+        if excerpt:
+            lines.append(f"  结论摘要：{excerpt}")
+    lines.append("</secretary-dispatch-summary>")
+    return "\n".join(lines)

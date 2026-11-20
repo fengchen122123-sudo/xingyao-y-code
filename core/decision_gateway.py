@@ -267,7 +267,7 @@ def _pick_noul(answer, threshold: float):
 # ---------------------------------------------------------------------------
 
 def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=None,
-           audit_extra=None):
+           audit_extra=None, session_id=None):
     """单题决策。
 
     参数：
@@ -336,13 +336,16 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
         else:
             shadow = bool(cfg.get("shadow_mode")) or bool(effective_scene_cfg.get("shadow", True))
             effective_timeout = _resolve_timeout_ms(effective_scene_cfg, timeout_ms)
-        result = decision_service.ask_decision(
-            scene=scene,
-            state=state,
-            questions={"q": question},
-            timeout_ms=effective_timeout,
-            audit_extra=audit_extra,
-        )
+        ask_kwargs = {
+            "scene": scene,
+            "state": state,
+            "questions": {"q": question},
+            "timeout_ms": effective_timeout,
+            "audit_extra": audit_extra,
+        }
+        if session_id is not None:
+            ask_kwargs["session_id"] = session_id
+        result = decision_service.ask_decision(**ask_kwargs)
         if shadow:
             return None
         if not isinstance(result, dict):

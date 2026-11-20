@@ -461,6 +461,8 @@ _BG_COMMAND_SUMMARY_PROMPT = (
 _BG_SUMMARY_DISPLAY_TEXT = "📦 所有后台子代理任务已结束，正在自动汇总结果…"
 # 后台命令任务完成后的自动总结回合提示文案
 _BG_COMMAND_SUMMARY_DISPLAY_TEXT = "📦 后台任务已完成，正在总结结果…"
+# 秘书派活终态唤醒汇总回合在前端展示的提示文案
+_SECRETARY_DISPATCH_SUMMARY_DISPLAY_TEXT = "📋 派发任务已产生结果，秘书正在整理汇报…"
 
 
 def _resolve_real_path(path: str) -> str:
@@ -892,6 +894,8 @@ def _secretary_parse_batch_tasks(tasks) -> List[Dict[str, Any]]:
             "target": str(task.get("target") or "").strip(),
             "workdir": str(task.get("workdir") or "").strip(),
             "depends_on": list(dep_indices),
+            "model_id": str(task.get("model_id") or "").strip(),
+            "permission_mode": str(task.get("permission_mode") or "").strip(),
         })
     cycle = _secretary_batch_cycle_path(dep_map)
     if cycle:
@@ -1084,8 +1088,15 @@ class _SecretaryDispatchService:
                 updated = str(item.get("updated_at") or "")
                 if not _secretary_in_date_range(updated, start, end):
                     continue
-                if workdir_filter and workdir_filter != "GLOBAL":
-                    if str(item.get("workdir") or "") != workdir_filter:
+                if workdir_filter and workdir_filter.upper() != "GLOBAL":
+                    from core.memory import _normalize_workdir
+
+                    item_wd = str(item.get("workdir") or "").strip()
+                    if not item_wd or _normalize_workdir(item_wd) != _normalize_workdir(workdir_filter):
+                        continue
+                elif workdir_filter.upper() == "GLOBAL":
+                    item_wd = str(item.get("workdir") or "").strip()
+                    if item_wd and item_wd.upper() != "GLOBAL":
                         continue
                 name = str(item.get("name") or "")
                 if not name or name in merged:
@@ -1289,8 +1300,12 @@ class _SecretaryDispatchService:
             except Exception:
                 logger.debug("派活绑定额度档位失败", exc_info=True)
 
-        # 完成通知按"发起会话"路由：用户在秘书会话里看不到目标会话的流式输出
-        notify_session = str(getattr(bridge, "_current_session", "") or "")
+        # 完成通知与自动唤醒按"发起该派活的执行会话"优先路由，其次回落 UI 当前会话：
+        # 避免用户在秘书运行途中切走视图后完成结果错路由或唤醒失败
+        notify_session = (
+            str(app_context.get_thread_session() or "").strip()
+            or str(getattr(bridge, "_current_session", "") or "").strip()
+        )
         resolved_workdir = pending_workdir or self._session_workdir(session_name)
         return {
             "ok": True,
@@ -1472,6 +1487,8 @@ class _SecretaryDispatchService:
                     target=entry["target"],
                     prompt=entry["prompt"],
                     workdir=entry["workdir"],
+                    model_id=entry.get("model_id", ""),
+                    permission_mode=entry.get("permission_mode", ""),
                     task_title=entry["title"],
                 )
             except SecretaryDispatchError as exc:
@@ -1876,6 +1893,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         # 终态回调到来时若有回合正在运行，挂起到回合结束后补触发；
         # 按会话分桶（set），多会话并行时 pending 不会互相覆盖
         self._bg_summary_pending_sessions: set = set()
+        # 秘书派活闭环唤醒：秘书会话正忙时挂起，待其当前回合收尾后立即唤醒汇报
+        self._secretary_summary_lock = threading.Lock()
+        self._secretary_summary_pending_sessions: set = set()
         # 用户主动点过“终止”的会话：抑制后台任务终态的自动汇总回合，
         # 防止被取消的任务被“接手完成”机制复活；用户发新消息时解除
         self._user_cancelled_sessions: set = set()
@@ -2476,6 +2496,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             event.set()
         with self._bg_summary_lock:
             self._bg_summary_pending_sessions.clear()
+        sec_lock, sec_pending = self._get_secretary_summary_state()
+        with sec_lock:
+            sec_pending.clear()
         with self._perm_lock:
             timers = list(self._perm_timers.values())
             self._perm_timers.clear()
@@ -10408,10 +10431,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         一条 assistant 正文截 800 字）。台账缺失或写失败一律只记 debug，notice
         退化成不带任务编号的旧文案，收尾流程完全不受影响。
         """
+        # 完成通知：notice 按归属会话路由，避免在当前查看会话的面板里漏提示；
+        # 首轮自动改名后的新建会话用新会话名作标签，避免永远显示「新会话」
         try:
             ctx = dict(context or {})
             notify_session = str(ctx.get("notify_session") or "") or session_name
-            label = str(ctx.get("display_name") or "") or session_name
+            label = str(ctx.get("display_name") or "").strip()
+            if (
+                (not label or label == "新会话")
+                and session_name
+                and not _SECRETARY_DRAFT_NAME_RE.match(session_name)
+            ):
+                label = session_name
+            label = label or session_name
             dispatch_id = ctx.get("dispatch_id")
             try:
                 dispatch_id = None if dispatch_id in (None, "", 0) else int(dispatch_id)
@@ -10469,12 +10501,21 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             })
 
             # 3) 回写成功后推进下游依赖（P3）：done 解锁下游、failed/cancelled 级联
-            # 阻断，具体在独立 daemon 线程里跑，本回合收尾不等它
+            # 阻断，具体在独立 daemon 线程里跑，本回合收尾不等它；
+            # 单条派活（无 batch_id）终态为 done/failed 时主动唤醒秘书整理汇报
             if ledger_written:
                 try:
                     self._advance_dependents(dispatch_id)
                 except Exception:
                     logger.debug("派活依赖推进失败", exc_info=True)
+                if not cancelled and store is not None and dispatch_id is not None:
+                    try:
+                        finished_row = store.get(dispatch_id)
+                        batch_id = str((finished_row or {}).get("batch_id") or "").strip()
+                        if not batch_id:
+                            self._schedule_secretary_dispatch_wakeup(notify_session)
+                    except Exception:
+                        logger.debug("触发单条派活秘书唤醒失败", exc_info=True)
         except Exception:
             logger.debug("秘书派活收尾处理失败", exc_info=True)
 
@@ -10551,6 +10592,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     cancelled=(status == STATUS_CANCELLED),
                     seen={dispatch_id},
                 )
+            batch_id = str(row.get("batch_id") or "").strip()
+            secretary_session = str(row.get("secretary_session") or "").strip()
+            if batch_id and secretary_session:
+                if status == STATUS_FAILED or not store.batch_has_active_tasks(batch_id):
+                    self._schedule_secretary_dispatch_wakeup(secretary_session)
         except Exception:
             logger.debug("派活依赖推进失败", exc_info=True)
 
@@ -10947,6 +10993,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             except AttributeError:
                 pass
             try:
+                sec_lock, sec_pending = self._get_secretary_summary_state()
+                with sec_lock:
+                    sec_pending.discard(target)
+            except Exception:
+                pass
+            try:
                 from core.plan import suppress_plan_auto_continue
                 suppress_plan_auto_continue(target)
             except Exception:
@@ -11333,6 +11385,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 turn_start_data["display_text"] = display_text or "星轨自动化任务"
             elif internal_kind == "bg_command_summary":
                 turn_start_data["display_text"] = _BG_COMMAND_SUMMARY_DISPLAY_TEXT
+            elif internal_kind == "secretary_dispatch_summary":
+                turn_start_data["display_text"] = (
+                    display_text or _SECRETARY_DISPATCH_SUMMARY_DISPLAY_TEXT
+                )
             else:
                 turn_start_data["display_text"] = _BG_SUMMARY_DISPLAY_TEXT
         with self._active_turn_lock:
@@ -11856,6 +11912,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     daemon=True,
                     name="gui-bg-summary-recheck",
                 ).start()
+            # 秘书会话结束一轮对话后，补检期间是否有挂起待汇报的派活结果
+            try:
+                sec_lock, sec_pending = self._get_secretary_summary_state()
+                with sec_lock:
+                    sec_has_pending = session_name in sec_pending
+                    sec_pending.discard(session_name)
+                if sec_has_pending and not self._shutting_down:
+                    self._schedule_secretary_dispatch_wakeup(session_name)
+            except Exception:
+                logger.debug("秘书派活待汇报补检失败", exc_info=True)
             # 闲时维护重新计时：空闲超过配置延时后跑水位线维护与压缩（默认开，
             # config memory_compression.idle_maintenance_seconds = 0 关闭）
             if not self._shutting_down:
@@ -12035,6 +12101,134 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 name=f"gui-bg-summary-{session}",
             )
             self._active_turns[session] = worker
+            worker.start()
+
+    def _get_secretary_summary_state(self):
+        """懒取秘书派活唤醒锁与挂起集合（兼容裸实例测试桩）。"""
+        lock = getattr(self, "_secretary_summary_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._secretary_summary_lock = lock
+        pending = getattr(self, "_secretary_summary_pending_sessions", None)
+        if pending is None:
+            pending = set()
+            self._secretary_summary_pending_sessions = pending
+        return lock, pending
+
+    def _schedule_secretary_dispatch_wakeup(self, secretary_session: str) -> None:
+        """在独立守护线程中延迟防抖后尝试唤醒秘书会话整理汇报派活结果。"""
+        sec = str(secretary_session or "").strip()
+        if (
+            not sec
+            or getattr(self, "_shutting_down", False)
+            or not hasattr(self, "_turn_start_lock")
+            or getattr(self, "_active_turns", None) is None
+        ):
+            return
+        try:
+            threading.Thread(
+                target=self._deferred_secretary_dispatch_wakeup,
+                args=(sec,),
+                daemon=True,
+                name="gui-secretary-dispatch-wakeup",
+            ).start()
+        except Exception:
+            logger.debug("启动秘书派活唤醒线程失败", exc_info=True)
+
+    def _deferred_secretary_dispatch_wakeup(self, secretary_session: str) -> None:
+        try:
+            time.sleep(0.15)
+            if getattr(self, "_shutting_down", False):
+                return
+            self._maybe_start_secretary_dispatch_summary_turn(secretary_session)
+        except Exception:
+            logger.debug("秘书派活自动唤醒触发失败", exc_info=True)
+
+    def _maybe_start_secretary_dispatch_summary_turn(self, secretary_session: str) -> None:
+        """满足全部条件时，向原秘书会话发起一轮自动汇报回合。
+
+        条件：
+        1. 服务未关闭，且归属会话仍存在且确实为 ``SECRETARY`` 会话；
+        2. 秘书会话当前未被用户主动点停止拦截；
+        3. 存在可用的激活 LLM 模型；
+        4. 台账中有尚未汇报的非纯 cancelled 终态任务；
+        5. 秘书会话当前未在执行回合（正在执行则挂起，等其收尾后在 finally 补起）。
+        """
+        sec = str(secretary_session or "").strip()
+        if (
+            not sec
+            or getattr(self, "_shutting_down", False)
+            or not hasattr(self, "_turn_start_lock")
+            or getattr(self, "_active_turns", None) is None
+            or getattr(self, "_cancel_events", None) is None
+        ):
+            return
+        if sec in getattr(self, "_user_cancelled_sessions", ()):
+            return
+        memory = getattr(self, "_memory", None)
+        if memory is None:
+            return
+        try:
+            if str(memory.get_session_source(sec) or "").strip().upper() != "SECRETARY":
+                return
+            known = {
+                str(s.get("name") or "")
+                for s in (memory.get_all_sessions(workdir=None, include_empty=True, include_archived=False) or ())
+            }
+            if sec not in known:
+                return
+        except Exception:
+            logger.debug("秘书唤醒前会话校验失败", exc_info=True)
+            return
+
+        try:
+            active_model = get_active_model(sec)
+        except Exception:
+            active_model = None
+        if not isinstance(active_model, dict) or not active_model.get("litellm_model"):
+            return
+
+        store = self._secretary_dispatch_store()
+        if store is None:
+            return
+
+        from core.secretary_dispatches import format_secretary_dispatch_summary
+
+        with self._turn_start_lock:
+            if not store.has_unreported_wakeable(sec):
+                return
+            if self._is_turn_active(sec):
+                sec_lock, sec_pending = self._get_secretary_summary_state()
+                with sec_lock:
+                    sec_pending.add(sec)
+                return
+            rows = store.claim_unreported(sec)
+            if not rows:
+                return
+            summary_body = format_secretary_dispatch_summary(rows)
+            if not summary_body:
+                return
+            wakeup_prompt = (
+                "<task-notification>\n"
+                f"{summary_body}\n\n"
+                "请按照调度协议，向用户简洁清晰地汇报上述派发任务的最新结果"
+                "（说明已完成结论、失败原因或待决策事项；已被用户取消的任务严禁擅自重试）。\n"
+                "</task-notification>"
+            )
+            cancel_event = threading.Event()
+            self._cancel_events[sec] = cancel_event
+            worker = threading.Thread(
+                target=self._run_turn_worker_serialized,
+                args=(
+                    wakeup_prompt,
+                    sec,
+                    "secretary_dispatch_summary",
+                    _SECRETARY_DISPATCH_SUMMARY_DISPLAY_TEXT,
+                ),
+                daemon=True,
+                name=f"gui-sec-dispatch-summary-{sec}",
+            )
+            self._active_turns[sec] = worker
             worker.start()
 
     def _subagent_progress_poller(self, session_name: str, stop: threading.Event) -> None:

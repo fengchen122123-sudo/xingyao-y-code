@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 
 SECRETARY_SOURCE = "SECRETARY"
@@ -219,6 +220,12 @@ SECRETARY_ONLY_TOOLS = frozenset({
     # 「刚才那个任务怎么样」，普通会话工具集零变化。
     "list_dispatches",
     "get_dispatch_result",
+    # 跨项目与历史会话分析（只读浏览 + 按偏移分页读会话消息 + 个人记忆管理）：
+    # 仅秘书会话可见，普通会话工具集零变化。
+    "list_projects",
+    "list_sessions",
+    "read_session",
+    "manage_memory",
     # 项目画像（升级设计 2026-11-04 第 5.2 节）：read_project_profile 是只读
     # （scope=none，本可自动放行，列出来是为了普通会话看不到它）；
     # remember_decision 是 workspace 作用域，必须显式放行才不被只读门控拦下
@@ -230,16 +237,49 @@ SECRETARY_ONLY_TOOLS = frozenset({
     # SECRETARY_ALLOWED_TOOLS 里显式放行，否则秘书反而用不了。
 })
 
+# 即使 side_effect_scope == "none"，也必须从秘书会话屏蔽的编码/内部调度工具：
+# 秘书不能操作工作流状态机、子代理任务监控、代码计划状态机或 MCP 连接管理。
+SECRETARY_BLOCKED_TOOLS = frozenset({
+    "workflow_finish",
+    "manage_task",
+    "plan_read",
+    "mcp_list_servers",
+})
+
+# 允许秘书使用的纯只读插件工具（其余插件工具仍一律排除）
+SECRETARY_ALLOWED_PLUGIN_TOOLS = frozenset({
+    "office_read",
+})
+
+# 秘书可在「已登记项目工作区」内免沙盒越界确认直接只读访问的工具集合
+SECRETARY_READONLY_WORKSPACE_TOOLS = frozenset({
+    "read_file",
+    "list_directory",
+    "directory_tree",
+    "search_code",
+    "find_definition",
+    "get_outline",
+    "find_references",
+    "glob_files",
+    "view_file_outline",
+    "office_read",
+})
+
 # 秘书会话的额外允许项：这些工具不是只读（network / system / 跨会话写），
 # 但属于秘书的核心职责或无害的公开信息查询。其余允许项一律由
 # ``side_effect_scope == "none"`` 自动覆盖。
-SECRETARY_ALLOWED_TOOLS = SECRETARY_ONLY_TOOLS | frozenset({
+SECRETARY_ALLOWED_TOOLS = SECRETARY_ONLY_TOOLS | SECRETARY_ALLOWED_PLUGIN_TOOLS | frozenset({
     "get_weather",
     "search_news",
     "fetch_url",
     # 项目画像写入：作用域 system（只写 ~/.ycode/memory/projects/，跨项目），
     # 必须按名字显式放行；普通会话同样可见（特性 1）。
     "remember_decision",
+    # 定时提醒与自动化任务调度：属于秘书管家的日程安排能力
+    "automation_create",
+    "automation_update",
+    "automation_delete",
+    "automation_run_now",
 })
 
 
@@ -247,7 +287,7 @@ def _plugin_tool_names() -> frozenset:
     """已加载插件提供的工具名集合；取不到时返回空集（不抛错）。
 
     插件工具的 side_effect_scope 常依赖默认值（none），仅凭作用域会把插件
-    工具误放行；秘书会话只认内置工具（设计第 7 节），这里显式排除。
+    工具误放行；秘书会话只认内置工具与显式白名单插件（``SECRETARY_ALLOWED_PLUGIN_TOOLS``）。
     """
     try:
         from core import plugin_loader
@@ -266,18 +306,103 @@ def _plugin_tool_names() -> frozenset:
 def secretary_allows_tool(tool_name: str, side_effect_scope: str = "") -> bool:
     """秘书会话是否允许该工具（策略单一事实源）。
 
-    允许 = ``side_effect_scope == "none"``（只读类）或名字在
-    ``SECRETARY_ALLOWED_TOOLS`` 里；其余（写文件 / 执行命令 / 电脑操控 /
-    子代理 / 计划写 / 生图 / MCP / 插件）一律拒绝。空名字拒绝。
+    允许 = ``side_effect_scope == "none"``（只读类，排除编码/内部黑名单与未放行插件）
+    或名字在 ``SECRETARY_ALLOWED_TOOLS`` 里；其余（写文件 / 执行命令 / 电脑操控 /
+    子代理 / 计划写 / 生图 / MCP / 未白名单插件）一律拒绝。空名字拒绝。
     """
     name = str(tool_name or "").strip()
     if not name:
         return False
+    if name in SECRETARY_BLOCKED_TOOLS:
+        return False
+    if name in SECRETARY_ALLOWED_PLUGIN_TOOLS:
+        return True
     if name in _plugin_tool_names():
         return False
     if str(side_effect_scope or "").strip() == "none":
         return True
     return name in SECRETARY_ALLOWED_TOOLS
+
+
+def _get_registered_workspace_roots() -> list[str]:
+    """收集所有已登记且非根目录的项目工作区路径（用于秘书跨项目只读免确认）。"""
+    roots: list[str] = []
+    seen: set[str] = set()
+    try:
+        from core import app_context
+
+        manager = app_context.get_manager()
+        if manager is None:
+            return []
+        candidates: list[str] = []
+        get_ws = getattr(manager, "get_all_workspaces", None)
+        if callable(get_ws):
+            candidates.extend(get_ws() or ())
+        get_sess = getattr(manager, "get_all_sessions", None)
+        if callable(get_sess):
+            for item in get_sess(include_empty=True, include_archived=False) or ():
+                if isinstance(item, dict) and item.get("workdir"):
+                    candidates.append(str(item["workdir"]))
+    except Exception:
+        return []
+
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if not text or text.upper() == "GLOBAL":
+            continue
+        try:
+            resolved = os.path.realpath(os.path.expanduser(text))
+            if os.name == "nt" and resolved.startswith("\\\\?\\"):
+                resolved = resolved[4:]
+        except OSError:
+            continue
+        # 拒绝驱动器根目录（如 '/' 或 'C:\\'），防止整盘被当成工作区放行
+        if not resolved or os.path.dirname(resolved) == resolved:
+            continue
+        norm = os.path.normcase(resolved)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        roots.append(resolved)
+    return roots
+
+
+def is_secretary_registered_workspace_read(
+    tool_name: str,
+    path_value: str,
+    session_name=None,
+) -> bool:
+    """秘书会话的纯只读工具访问「已登记项目工作区」内路径时返回 True（免越界弹窗）。
+
+    安全边界：
+    1. 必须是秘书会话（显式 session_name 或当前执行线程/UI 会话）；
+    2. 工具必须属于 ``SECRETARY_READONLY_WORKSPACE_TOOLS``，绝不放行任何写工具；
+    3. 路径解析为真实绝对路径后必须严格落在已登记的非根目录项目工作区内。
+    """
+    name = str(tool_name or "").strip()
+    if name not in SECRETARY_READONLY_WORKSPACE_TOOLS:
+        return False
+    if not path_value:
+        return False
+    try:
+        if not is_secretary_session(session_name):
+            return False
+        target = os.path.realpath(os.path.expanduser(str(path_value)))
+        if os.name == "nt" and target.startswith("\\\\?\\"):
+            target = target[4:]
+        target_norm = os.path.normcase(target)
+    except Exception:
+        return False
+    if not target_norm:
+        return False
+    for root in _get_registered_workspace_roots():
+        root_norm = os.path.normcase(root)
+        try:
+            if os.path.commonpath([target_norm, root_norm]) == root_norm:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def is_secretary_tool_blocked(

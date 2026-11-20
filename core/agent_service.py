@@ -334,10 +334,11 @@ def _render_stable_system_extra_sections(session_name=None) -> tuple[list[str], 
     """
     parts: list[str] = []
     skills_len = 0
+    is_secretary = _is_secretary_session_for_render(session_name)
     # 人设设置块：仅当用户在设置页自定义了名称/称呼/人设时非空；
     # 默认配置返回空串，不影响 byte-stability。跨轮不变，归入稳定前缀。
     # 秘书会话一律不注入（见函数 docstring）。
-    if not _is_secretary_session_for_render(session_name):
+    if not is_secretary:
         try:
             from core.persona_settings import build_persona_prompt_block
 
@@ -357,32 +358,41 @@ def _render_stable_system_extra_sections(session_name=None) -> tuple[list[str], 
             parts.append(identity_block)
     except Exception:
         pass
-    parts.append(_GENERAL_CODING_STANDARDS)
+    # 秘书会话只分析/统筹/派活，不写代码、不执行 shell、不用编码技能与编码子代理；
+    # 因此剔除 _GENERAL_CODING_STANDARDS / 编码技能目录 / 自定义编码子代理清单，
+    # 并改用专门的 manage_memory 记忆指引，保持普通会话字节零变化。
+    if not is_secretary:
+        parts.append(_GENERAL_CODING_STANDARDS)
     try:
         import core.memory_kairos as memory_kairos
-        memory_section = memory_kairos.build_memory_system_section()
+        memory_section = (
+            memory_kairos.build_secretary_memory_system_section()
+            if is_secretary
+            else memory_kairos.build_memory_system_section()
+        )
         if memory_section.strip():
             parts.append(memory_section)
     except Exception:
         pass
-    try:
-        from core.skills import get_active_skills_catalog
-        skills_catalog = get_active_skills_catalog()
-        if skills_catalog.strip():
-            parts.append(skills_catalog)
-            skills_len = len(skills_catalog)
-    except Exception:
-        pass
-    try:
-        from core.subagent_registry import get_custom_subagents_catalog
-        subagents_catalog = get_custom_subagents_catalog()
-        if subagents_catalog.strip():
-            parts.append(subagents_catalog)
-    except Exception:
-        pass
+    if not is_secretary:
+        try:
+            from core.skills import get_active_skills_catalog
+            skills_catalog = get_active_skills_catalog()
+            if skills_catalog.strip():
+                parts.append(skills_catalog)
+                skills_len = len(skills_catalog)
+        except Exception:
+            pass
+        try:
+            from core.subagent_registry import get_custom_subagents_catalog
+            subagents_catalog = get_custom_subagents_catalog()
+            if subagents_catalog.strip():
+                parts.append(subagents_catalog)
+        except Exception:
+            pass
     # 工作区工程规范（AGENTS.md / CLAUDE.md / .ycode/rules）：
     # 仅在具名会话且非秘书会话时注入并随会话快照冻结，不影响无会话名的 SHA256 黄金测试。
-    if session_name and not _is_secretary_session_for_render(session_name):
+    if session_name and not is_secretary:
         try:
             from core.workspace_bootstrap import load_workspace_rules
 
@@ -547,7 +557,13 @@ def get_session_token_baseline(manager, session_name: str, model_name: str,
     return estimated
 
 
-def build_runtime_context(model_name: str, permission_mode: str, api_base: str = "", turn_source: str = "local"):
+def build_runtime_context(
+    model_name: str,
+    permission_mode: str,
+    api_base: str = "",
+    turn_source: str = "local",
+    is_secretary: bool = False,
+):
     """组装本轮的运行上下文（时间 / 计划快照 / 工作目录 / 电脑操控能力）。
 
     长期记忆、技能目录、自定义子 Agent 清单已并入稳定系统提示词
@@ -572,19 +588,25 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
     from core.workspace_context import get_workdir
 
     now = datetime.datetime.now()
-    plan_items = get_default_plan_manager().snapshot()
-    active_plan = "\n".join(
-        f"{item.get('stage', 'build')}/{item['status']}: {item['subject']}" for item in plan_items
-    ) or "无"
-    computer_capability = resolve_turn_computer_capability(
-        model_name, api_base=api_base or None, turn_source=turn_source
-    )
-    set_turn_computer_capability(computer_capability)
-    # 按回合撤销纠正块（规格 15.3）：无纠正记录/服务未配置时为空串，
-    # 动态块字节与历史版本一致；有纠正时按规范化工作区跨会话生效。
-    from core.turn_undo.prompt_context import build_workspace_correction_section
+    if is_secretary:
+        active_plan = "无"
+        computer_capability = None
+        set_turn_computer_capability(None)
+        workspace_corrections = ""
+    else:
+        plan_items = get_default_plan_manager().snapshot()
+        active_plan = "\n".join(
+            f"{item.get('stage', 'build')}/{item['status']}: {item['subject']}" for item in plan_items
+        ) or "无"
+        computer_capability = resolve_turn_computer_capability(
+            model_name, api_base=api_base or None, turn_source=turn_source
+        )
+        set_turn_computer_capability(computer_capability)
+        # 按回合撤销纠正块（规格 15.3）：无纠正记录/服务未配置时为空串，
+        # 动态块字节与历史版本一致；有纠正时按规范化工作区跨会话生效。
+        from core.turn_undo.prompt_context import build_workspace_correction_section
 
-    workspace_corrections = build_workspace_correction_section(get_workdir())
+        workspace_corrections = build_workspace_correction_section(get_workdir())
     # AI 生成内容目录（Task 6）：配置级稳定值，注入动态块告知模型统一落点。
     from core.ai_output_paths import resolve_ai_output_dir
 
@@ -603,6 +625,7 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
         workspace_corrections=workspace_corrections,
         ai_output_dir=str(resolve_ai_output_dir()),
         subagent_enabled=subagent_enabled(),
+        is_secretary=bool(is_secretary),
     )
 
 
@@ -1099,22 +1122,31 @@ def _trigger_background_precompress(
             logger.debug("预压缩 notify 回调异常，已忽略", exc_info=True)
 
     def _run():
+        from contextlib import nullcontext
+        from core import app_context
+
+        scope_fn = getattr(app_context, "thread_session_scope", None)
+        clean_session = str(session_name or "").strip()
+        session_scope = (
+            scope_fn(clean_session) if callable(scope_fn) and clean_session else nullcontext()
+        )
         try:
-            outcome = compress_session_memory(
-                manager,
-                session_name,
-                model_name,
-                api_key,
-                api_base,
-                output_callback=lambda message: _notify_precompress("compress", message),
-                cancel_event=cancel_event,
-                return_outcome=True,
-            )
-            status = getattr(outcome, "status", "unknown")
-            reason = getattr(outcome, "reason", "")
-            logger.info(
-                "会话 %s 预压缩结束：status=%s reason=%s", session_name, status, reason
-            )
+            with session_scope:
+                outcome = compress_session_memory(
+                    manager,
+                    session_name,
+                    model_name,
+                    api_key,
+                    api_base,
+                    output_callback=lambda message: _notify_precompress("compress", message),
+                    cancel_event=cancel_event,
+                    return_outcome=True,
+                )
+                status = getattr(outcome, "status", "unknown")
+                reason = getattr(outcome, "reason", "")
+                logger.info(
+                    "会话 %s 预压缩结束：status=%s reason=%s", session_name, status, reason
+                )
         except Exception:
             # 预压缩是锦上添花：任何异常只记日志，绝不影响对话主流程
             logger.exception("会话 %s 后台预压缩异常", session_name)
@@ -1442,16 +1474,24 @@ def prepare_turn_messages(
     #    现已内联到 user 消息，稳定提示词每轮现组插到首位，历史里不应再有 system 块
     history = _drop_legacy_context_systems(history)
 
-    runtime = build_runtime_context(model_name, permission_mode, api_base=api_base, turn_source=turn_source)
+    is_secretary_turn = _is_secretary_session_for_render(session_name)
+    runtime = build_runtime_context(
+        model_name,
+        permission_mode,
+        api_base=api_base,
+        turn_source=turn_source,
+        is_secretary=is_secretary_turn,
+    )
     dynamic_prompt = build_dynamic_prompt(runtime)
     # 【特性 1：项目状态接入所有会话】按会话工作目录读取项目画像的三节
     # （技术栈 / 架构决策 / 硬约束）拼成当轮注入块。必须挂在这里而不是稳定
     # 提示词通道：稳定段是会话级字节快照，会被首轮定格；本值每轮现算，
     # 由 _append_context_suffix_to_last_user 内联到末条 user 消息末尾。
     # 注入失败一律静默降级（返回空串 = 与改动前逐字节一致）。
-    project_state = _build_project_state_prompt(manager, session_name)
-    if project_state:
-        dynamic_prompt = f"{dynamic_prompt}\n\n{project_state}" if dynamic_prompt else project_state
+    if not is_secretary_turn:
+        project_state = _build_project_state_prompt(manager, session_name)
+        if project_state:
+            dynamic_prompt = f"{dynamic_prompt}\n\n{project_state}" if dynamic_prompt else project_state
     history.insert(0, system_message)
 
     # 2) 动态运行上下文块 + 后台汇总 + 时间注记统一内联到最后一条 user 消息末尾。
@@ -1500,6 +1540,17 @@ def prepare_turn_messages(
     except Exception:
         logger.warning("后台子代理汇总注入失败，已跳过本轮汇总", exc_info=True)
         summary_msg = ""
+    if is_secretary_turn and manager is not None and session_name:
+        try:
+            from core.secretary_dispatches import DispatchStore, format_secretary_dispatch_summary
+
+            unreported = DispatchStore(manager).claim_unreported(session_name)
+            if unreported:
+                sec_summary = format_secretary_dispatch_summary(unreported)
+                if sec_summary:
+                    summary_msg = f"{summary_msg}\n\n{sec_summary}".strip() if summary_msg else sec_summary
+        except Exception:
+            logger.debug("秘书未汇报派活摘要检查失败，已忽略", exc_info=True)
     # @ 提及对话：LAN 回合（turn_source != "local"）一律强制不解析——无论调用方
     # 显式传了什么，都按全局约束视为空列表，杜绝 LAN 客户端借 @{会话名} 注入
     # 其他会话内容；本地回合未显式给出时才从末条 user 消息兜底提取；显式列表照用。
@@ -1529,10 +1580,13 @@ def prepare_turn_messages(
         # （无会话名/未定型）时回落实时目录长度；空白目录段不计（2026-09-23）。
         skills_len = get_session_stable_skills_len(session_name)
         if skills_len is None:
-            from core.skills import get_active_skills_catalog
+            if is_secretary_turn:
+                skills_len = 0
+            else:
+                from core.skills import get_active_skills_catalog
 
-            skills_text = get_active_skills_catalog() or ""
-            skills_len = len(skills_text) if skills_text.strip() else 0
+                skills_text = get_active_skills_catalog() or ""
+                skills_len = len(skills_text) if skills_text.strip() else 0
         # 排除系统消息与已单列的后缀，避免占比重复计入；后缀未实际注入
         # （如媒体消息跳过内联）时不计运行上下文。
         suffix_chars = (

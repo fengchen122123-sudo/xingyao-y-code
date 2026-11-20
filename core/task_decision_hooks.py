@@ -256,7 +256,7 @@ def decide_plan_recovery(
         return None
 
 
-def decide_memory_filter(extracted: dict) -> str | None:
+def decide_memory_filter(extracted: dict, *, session_id: str | None = None) -> str | None:
     """后台学习经验落盘前的价值筛选。返回 keep_all / keep_facts_only / skip_all / None。"""
     try:
         if not isinstance(extracted, dict):
@@ -282,16 +282,21 @@ def decide_memory_filter(extracted: dict) -> str | None:
         for item in notes[:2]:
             lines.append(f"[笔记] {_collapse(item, 80)}")
         state = ("待沉淀记忆候选项：\n" + "\n".join(lines))[:500]
-        picked = decide(
-            "memory_filter",
-            state,
-            dict(_MEMORY_FILTER_QUESTION),
-            options=_MEMORY_FILTER_OPTIONS,
-            audit_extra={
+        decide_kwargs = {
+            "options": _MEMORY_FILTER_OPTIONS,
+            "audit_extra": {
                 "fact_count": len(facts),
                 "lesson_count": len(lessons),
                 "note_count": len(notes),
             },
+        }
+        if session_id is not None:
+            decide_kwargs["session_id"] = session_id
+        picked = decide(
+            "memory_filter",
+            state,
+            dict(_MEMORY_FILTER_QUESTION),
+            **decide_kwargs,
         )
         return picked if picked in _MEMORY_FILTER_OPTIONS else None
     except Exception as error:
@@ -299,11 +304,15 @@ def decide_memory_filter(extracted: dict) -> str | None:
         return None
 
 
-def filter_extracted_learning(extracted: dict) -> dict:
+def filter_extracted_learning(extracted: dict, *, session_id: str | None = None) -> dict:
     """按 JEV memory_filter 结果裁剪待落盘的抽取字典；None/异常保持原样。"""
     if not isinstance(extracted, dict):
         return extracted
-    decision = decide_memory_filter(extracted)
+    decision = (
+        decide_memory_filter(extracted, session_id=session_id)
+        if session_id is not None
+        else decide_memory_filter(extracted)
+    )
     if decision == "skip_all":
         return {"user_facts": [], "lessons": [], "self_notes": []}
     if decision == "keep_facts_only":

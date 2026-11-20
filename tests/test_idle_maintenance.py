@@ -206,3 +206,30 @@ def test_busy_session_is_skipped_at_fire_time(monkeypatch, manager):
     assert svc.status()["pending"] == 0  # 条目已消费，不会反复空转
     svc._busy.discard("s")
     svc.shutdown()
+
+
+def test_self_learning_thread_binds_own_session_instead_of_active_ui_session(
+    manager, monkeypatch
+):
+    """闲时学习线程必须绑定目标会话，否则 memory_filter 会串到当前查看的会话。"""
+    from core import app_context
+
+    observed = {}
+    monkeypatch.setattr(app_context, "get_current_session", lambda: "ui-viewing-other")
+
+    def fake_run_turn_learning(session, mgr, model_cfg):
+        observed["session_arg"] = session
+        observed["thread_session"] = app_context.get_thread_session()
+        return False
+
+    monkeypatch.setattr("core.learning.run_turn_learning", fake_run_turn_learning)
+    app_context.set_thread_session("outer-session")
+    try:
+        im._run_self_learning("idle-session", manager, ("m", "k", ""))
+        assert observed == {
+            "session_arg": "idle-session",
+            "thread_session": "idle-session",
+        }
+        assert app_context.get_thread_session() == "outer-session"
+    finally:
+        app_context.set_thread_session(None)

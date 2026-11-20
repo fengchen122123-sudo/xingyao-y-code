@@ -2641,6 +2641,7 @@ def _run_resume_turn_cli_worker(session_name: str, *, turn_id: str, parent_turn_
     global active_cancel_event, active_turn_id
 
     cancel_event = None
+    _prev_thread_session = _app_ctx.get_thread_session()
     try:
         from core.agent_service import build_resume_messages
         from core.llm import chat_with_model_events
@@ -2666,6 +2667,7 @@ def _run_resume_turn_cli_worker(session_name: str, *, turn_id: str, parent_turn_
             _tool_cache_cli.set_current_session(session_name)
         except Exception:
             pass
+        _app_ctx.set_thread_session(session_name)
         schedule_ui(lambda: print_formatted_text(HTML(
             "<ansigray>↻ 断点续跑：正在从上次中断处继续…</ansigray>"
         )))
@@ -2696,6 +2698,10 @@ def _run_resume_turn_cli_worker(session_name: str, *, turn_id: str, parent_turn_
             f"<ansired>❌ 断点续跑失败：{text}</ansired>"
         )))
     finally:
+        try:
+            _app_ctx.set_thread_session(_prev_thread_session)
+        except Exception:
+            pass
         if cancel_event is not None and active_cancel_event is cancel_event:
             active_cancel_event = None
         if active_turn_id == turn_id:
@@ -6959,9 +6965,11 @@ def _background_worker():
                 cancel_event.set()
             active_cancel_event = cancel_event
             active_turn_id = turn_id
-            # 主代理线程标记当前会话，使子代理可以共享工具级缓存
+            # 主代理线程标记当前会话，使子代理可以共享工具级缓存，并锚定线程级会话归属
             from core import tool_cache as _tool_cache
             _tool_cache.set_current_session(task_session)
+            _prev_thread_session = _app_ctx.get_thread_session()
+            _app_ctx.set_thread_session(task_session)
             # 将 undo 状态绑定到当前会话，防止切会话后 /undo 误操作其他会话的文件
             def mark_turn_started():
                 global is_thinking, think_start_time, task_status, activity_start_time
@@ -7063,6 +7071,7 @@ def _background_worker():
                     pass
                 from core import tool_cache as _tool_cache
                 _tool_cache.set_current_session(None)
+                _app_ctx.set_thread_session(_prev_thread_session)
                 # 清理卡在 in_progress 的计划项：子 agent 异常退出（超时/崩溃/未调用 terminal_callback）
                 # 会导致计划项永久卡在 in_progress，turn 结束后仍显示在状态栏。
                 # 但必须跳过"后台子代理仍在运行"的 in_progress 项——否则会误杀正常后台任务

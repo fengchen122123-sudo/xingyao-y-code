@@ -569,8 +569,17 @@ class ToolBatchExecutor:
         started_at = self.clock()
         # 绑定本次调用 id：run_subagent 创建子代理时据此把任务归属到派生它的
         # 调用上，GUI 卡片才能只展示"自己正在执行的这个"子代理。
-        with app_context.tool_call_scope(decoded.call_id):
-            message = self.execute_decoded(decoded, context)
+        # 并行工具线程在提交时未必继承父线程的 thread_session，这里补齐上下文，
+        # 确保秘书跨项目只读免确认等依赖 get_thread_session() 的判定一致。
+        parent_session = getattr(context, "parent_session", None)
+        session_scope = (
+            app_context.thread_session_scope(parent_session)
+            if parent_session and not app_context.get_thread_session()
+            else nullcontext()
+        )
+        with session_scope:
+            with app_context.tool_call_scope(decoded.call_id):
+                message = self.execute_decoded(decoded, context)
         duration_ms = round((self.clock() - started_at) * 1000)
         return message, max(0, duration_ms)
 

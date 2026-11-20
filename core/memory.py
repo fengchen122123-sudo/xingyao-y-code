@@ -945,9 +945,16 @@ class MemoryManager:
                         started_at       TEXT NOT NULL DEFAULT '',
                         finished_at      TEXT NOT NULL DEFAULT '',
                         result_excerpt   TEXT NOT NULL DEFAULT '',
-                        error            TEXT NOT NULL DEFAULT ''
+                        error            TEXT NOT NULL DEFAULT '',
+                        reported         INTEGER NOT NULL DEFAULT 0
                     )
                 ''')
+                cursor.execute("PRAGMA table_info(secretary_dispatches)")
+                sd_columns = [col[1] for col in cursor.fetchall()]
+                if "reported" not in sd_columns:
+                    cursor.execute(
+                        "ALTER TABLE secretary_dispatches ADD COLUMN reported INTEGER NOT NULL DEFAULT 0"
+                    )
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_secretary_dispatches_target "
                     "ON secretary_dispatches(target_session)"
@@ -4039,6 +4046,19 @@ class MemoryManager:
                     'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
                     (final_name, old_name),
                 )
+                # 秘书派活台账按 session_name 键控：改名后同时迁移归属秘书与目标会话，
+                # 避免结果查询或自动汇报唤醒按旧会话名失联（与上方更新同事务）
+                cursor.execute(
+                    'UPDATE secretary_dispatches SET secretary_session = ? WHERE secretary_session = ?',
+                    (final_name, old_name),
+                )
+                cursor.execute(
+                    'UPDATE secretary_dispatches SET target_session = ?, '
+                    'target_display = CASE WHEN target_display = \'\' OR target_display = \'新会话\' OR target_display = ? '
+                    'THEN ? ELSE target_display END '
+                    'WHERE target_session = ?',
+                    (final_name, old_name, final_name, old_name),
+                )
                 self.conn.commit()
                 result = (True, final_name)
             except Exception:
@@ -4047,6 +4067,11 @@ class MemoryManager:
                 return False, old_name
         from core.llm import rename_cache_usage_session
         rename_cache_usage_session(old_name, final_name)
+        try:
+            from core.decision_service import rename_session_audit
+            rename_session_audit(old_name, final_name)
+        except Exception:
+            pass
         return result
 
     def archive_session(self, session_name, archived_at=None) -> bool:

@@ -1153,3 +1153,80 @@ def test_audit_brief_carries_session_id(data_dir):
                              "session_id": "会话A"})
     assert brief["session_id"] == "会话A"
     assert svc._audit_brief({"scene": "router"})["session_id"] == ""
+
+
+def test_ask_decision_explicit_session_id_overrides_context(data_dir, monkeypatch):
+    """调用方显式传入 session_id 时，必须优先于 get_thread_session/get_current_session。"""
+    _write_user_config(data_dir, [PROVIDER])
+    svc.save_decision_config({
+        "enabled": True,
+        "audit_enabled": True,
+        "shadow_mode": True,
+        "scenes": {"router": {"enabled": True, "shadow": True}},
+    })
+    _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
+    _stub_session(monkeypatch, "线程会话", "进程会话")
+
+    svc.ask_decision("上下文", NOUL_Q, scene="router", session_id="显式指定会话")
+    assert _last_audit(data_dir)["session_id"] == "显式指定会话"
+
+
+def test_rename_session_audit_migrates_records_across_files(data_dir):
+    """会话改名后历史审计记录的 session_id 跟着迁移，不影响其他会话。"""
+    from core.memory import MemoryManager
+
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    day1 = audit / "20261119.jsonl"
+    day2 = audit / f"{svc._today()}.jsonl"
+    day1.write_text(
+        "\n".join([
+            json.dumps({"ts": "2026-11-19T10:00:00", "scene": "router", "session_id": "旧会话名", "trace_id": "t1"}, ensure_ascii=False),
+            json.dumps({"ts": "2026-11-19T10:01:00", "scene": "router", "session_id": "其他会话", "trace_id": "t2"}, ensure_ascii=False),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    day2.write_text(
+        json.dumps({"ts": "2026-11-20T10:00:00", "scene": "memory_filter", "session_id": "旧会话名", "trace_id": "t3"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    mgr = MemoryManager(":memory:")
+    mgr.create_session_explicit("旧会话名", workdir="GLOBAL", source="GUI")
+    ok, final_name = mgr.rename_session("旧会话名", "新会话名")
+    assert (ok, final_name) == (True, "新会话名")
+
+    old_summary = svc.get_decision_audit_summary(10, "旧会话名", session_only=True)
+    new_summary = svc.get_decision_audit_summary(10, "新会话名", session_only=True)
+    other_summary = svc.get_decision_audit_summary(10, "其他会话", session_only=True)
+    assert old_summary["recent"] == []
+    assert [r["trace_id"] for r in new_summary["recent"]] == ["t1", "t3"]
+    assert [r["trace_id"] for r in other_summary["recent"]] == ["t2"]
+
+
+def test_audit_summary_reports_session_total_and_global_today_counts(data_dir):
+    """session_only=True 返回本会话跨日累计 session_total_count，同时返回 global_today_count 消歧。"""
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    today = svc._today()
+    (audit / "20261119.jsonl").write_text(
+        "\n".join([
+            json.dumps({"ts": "2026-11-19T10:00:00", "scene": "router", "session_id": "当前会话"}),
+            json.dumps({"ts": "2026-11-19T10:05:00", "scene": "router", "session_id": "别的会话"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    (audit / f"{today}.jsonl").write_text(
+        "\n".join([
+            json.dumps({"ts": f"{today}T10:00:00", "scene": "auto_permission", "adopted": True, "session_id": "当前会话"}),
+            json.dumps({"ts": f"{today}T10:01:00", "scene": "auto_permission", "adopted": True, "session_id": "当前会话"}),
+            json.dumps({"ts": f"{today}T10:02:00", "scene": "subagent_review", "adopted": True, "session_id": "别的会话"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    scoped = svc.get_decision_audit_summary(1, "当前会话", session_only=True)
+    assert scoped["today_count"] == 2
+    assert scoped["session_total_count"] == 3  # 昨天 1 + 今天 2
+    assert scoped["global_today_count"] == 3   # 今日全部会话共 3 条
+    assert len(scoped["recent"]) == 1

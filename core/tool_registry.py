@@ -168,6 +168,10 @@ CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "dispatch_task",
     "open_session",
     "secretary_probe",
+    "list_projects",
+    "list_sessions",
+    "read_session",
+    "manage_memory",
     # 运维与内容生成
     "update_manage",
     "diagram_manage",
@@ -688,6 +692,66 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="读取项目画像",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="list_projects",
+            description=(
+                "列出所有已引入/活跃的项目工作区及统计（秘书专用，只读）：返回每个项目"
+                "目录、显示名、历史会话数、归档数、最近活跃时间及是否有项目画像，"
+                "同时返回通用会话数与秘书会话数。跨项目分析或需要确认项目路径时先调用它。"
+            ),
+            input_schema=_schema({}),
+            execute=tools.list_projects,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="列出已登记项目",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="list_sessions",
+            description=(
+                "按项目目录或可选关键词浏览历史会话（秘书专用，只读）：不需要必填关键词，"
+                "适合复盘某个项目近期做了什么、总结今天/本周进度或定位具体会话。"
+                "返回按更新时间倒序的 session_name、display_name、workdir、消息数、"
+                "最近更新时间与记忆摘要预览（JSON 字符串）。"
+            ),
+            input_schema=_schema({
+                "workdir": {"type": "string", "default": "", "description": "按项目目录过滤，或填 GLOBAL 查通用会话；留空查全部项目"},
+                "keyword": {"type": "string", "default": "", "description": "可选，在会话名/首条提问/记忆摘要中过滤的子串"},
+                "include_archived": {"type": "boolean", "default": False, "description": "是否包含已归档会话，默认 False"},
+                "include_secretary": {"type": "boolean", "default": False, "description": "是否包含秘书会话，默认 False"},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "最多返回的会话数（上限 50）"},
+            }),
+            execute=tools.list_sessions,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="浏览项目历史会话",
+            side_effect_scope="none",
+        ),
+        ToolSpec(
+            name="read_session",
+            description=(
+                "读取某个历史会话的完整背景摘要与对话消息（秘书专用，只读分析）："
+                "target 传 session_name 或显示名，自动剔除系统运行后缀并对敏感信息脱敏。"
+                "默认从会话末尾倒推读取最新 limit 条消息，支持 offset 分页回看更早对话。"
+                "先 list_sessions/search_conversations 定位会话名，再用本工具深度分析。"
+            ),
+            input_schema=_schema({
+                "target": {"type": "string", "description": "目标会话的 session_name 或显示名（必填）"},
+                "limit": {"type": "integer", "default": 30, "minimum": 1, "maximum": 80, "description": "最多读取的消息条数（1..80，默认 30）"},
+                "offset": {"type": "integer", "default": 0, "minimum": 0, "description": "分页偏移量（from_end=true 时表示跳过末尾多少条）"},
+                "from_end": {"type": "boolean", "default": True, "description": "true=从末尾最新消息倒数读取（默认），false=从头顺读"},
+                "include_summary": {"type": "boolean", "default": True, "description": "是否返回该会话的压缩记忆摘要与代次索引"},
+                "include_tool_calls": {"type": "boolean", "default": True, "description": "是否保留工具调用名与精简工具输出"},
+            }, ["target"]),
+            execute=tools.read_session,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="读取历史会话详情",
             side_effect_scope="none",
         ),
     ]
@@ -1495,6 +1559,8 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
                                 "items": {"type": "integer"},
                                 "description": "同批次内上游任务的下标（从 0 开始）；留空表示无依赖，可立即派发",
                             },
+                            "model_id": {"type": "string", "default": "", "description": "可选，指定该子任务使用的模型"},
+                            "permission_mode": {"type": "string", "default": "", "description": "可选，指定目标会话的权限档位"},
                         },
                         "required": ["prompt"],
                     },
@@ -1542,6 +1608,38 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             parallel_safe=False,
             activity_description="新建并引入项目文件夹",
             side_effect_scope="system",  # 表未覆盖：创建磁盘目录、登记工作区并改变侧栏分组
+        ),
+        ToolSpec(
+            name="manage_memory",
+            description=(
+                "管理跨项目个人持久记忆（秘书专用，只操作 ~/.ycode/memory/ 下的个人笔记"
+                "与 MEMORY.md 索引，不触碰任何项目代码或应用配置文件）。支持 list（查看现有"
+                "记忆列表与索引）、save（记住用户个人习惯、沟通偏好、长期纠正或跨项目事实）、"
+                "delete（遗忘/删除指定记忆条目）。"
+            ),
+            input_schema=_schema({
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "save", "delete"],
+                    "default": "list",
+                    "description": "操作类型：list / save / delete",
+                },
+                "memory_type": {
+                    "type": "string",
+                    "enum": ["user", "feedback", "project", "reference"],
+                    "default": "user",
+                    "description": "记忆分类：user（用户画像与偏好）/ feedback（纠正与习惯）/ project（跨项目持续事项）/ reference（外部系统入口）",
+                },
+                "title": {"type": "string", "default": "", "description": "save 时必填：简短标题（最多 120 字）"},
+                "description": {"type": "string", "default": "", "description": "save 时可选：一句话索引描述，方便后续按标题判断相关性"},
+                "content": {"type": "string", "default": "", "description": "save 时必填：要长期记住的正文内容"},
+                "filename": {"type": "string", "default": "", "description": "可选：save 时指定 ASCII 文件名（如 report_style.md）；delete 时必填（如 user/report_style.md）"},
+            }, ["action"]),
+            execute=tools.manage_memory,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="管理长期个人记忆",
+            side_effect_scope="system",
         ),
     ]
 

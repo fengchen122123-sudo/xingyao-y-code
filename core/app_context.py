@@ -382,6 +382,17 @@ def get_thread_session() -> str | None:
     return getattr(_thread_session_tls, "session_id", None)
 
 
+@contextlib.contextmanager
+def thread_session_scope(session_id: str | None):
+    """线程内临时绑定执行会话，退出时恢复原值（支持嵌套）。"""
+    previous = get_thread_session()
+    set_thread_session(session_id)
+    try:
+        yield
+    finally:
+        set_thread_session(previous)
+
+
 # ---------------------------------------------------------------------------
 # 工具调用归属（子代理卡片按派生它的调用分组）
 # ---------------------------------------------------------------------------

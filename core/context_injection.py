@@ -161,7 +161,8 @@ def _build_context_prefix(is_gui: bool, session_name: str | None = None) -> str:
             from core.secretary import is_secretary_session
 
             if is_secretary_session(session_name):
-                return build_stable_prompt(load_system_prompt(is_gui, session_name))
+                # 秘书会话不需要编码决策策略（_DECISION_POLICY），仅加载纯秘书系统提示词与专属身份/人设
+                return (load_system_prompt(is_gui, session_name) or "").strip()
         except Exception:
             # 身份解析异常按普通会话处理：前缀字节与改动前一致，绝不打断组装
             pass

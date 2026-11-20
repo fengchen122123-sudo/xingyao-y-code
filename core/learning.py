@@ -820,27 +820,40 @@ def run_turn_learning(session, manager, model_cfg=None) -> bool:
             # 节流不通过时直接返回，且不更新 msg_count（避免漏计后续新增消息）
             return False
 
-        resolved = _resolve_model_cfg(session, model_cfg)
-        if not resolved:
-            # 无可用凭据：回滚占位，下一轮还能再试
-            _release_learning(session, claim)
-            return False
+        from contextlib import nullcontext
+        from core import app_context
 
-        extracted = extract_turn_lessons(session, history, resolved)
-        if not extracted:
-            # 抽取失败（网络/坏 JSON/无凭据）：回滚占位，下一轮可重试
-            _release_learning(session, claim)
-            return False
+        scope_fn = getattr(app_context, "thread_session_scope", None)
+        clean_session = str(session or "").strip()
+        session_scope = (
+            scope_fn(clean_session) if callable(scope_fn) and clean_session else nullcontext()
+        )
+        with session_scope:
+            resolved = _resolve_model_cfg(session, model_cfg)
+            if not resolved:
+                # 无可用凭据：回滚占位，下一轮还能再试
+                _release_learning(session, claim)
+                return False
 
-        # JEV memory_filter：闲时后台过滤一次性噪音记忆，不拖慢前台任务
-        try:
-            from core.task_decision_hooks import filter_extracted_learning
+            extracted = extract_turn_lessons(session, history, resolved)
+            if not extracted:
+                # 抽取失败（网络/坏 JSON/无凭据）：回滚占位，下一轮可重试
+                _release_learning(session, claim)
+                return False
 
-            extracted = filter_extracted_learning(extracted)
-        except Exception:
-            pass
+            # JEV memory_filter：闲时后台过滤一次性噪音记忆，不拖慢前台任务。
+            # 同时在线程上下文与显式参数两层锚定归属会话，防止后台线程在未绑定
+            # thread_session 时落回 UI 当前查看的会话。
+            try:
+                from core.task_decision_hooks import filter_extracted_learning
 
-        counts = apply_learning(extracted)
+                extracted = filter_extracted_learning(
+                    extracted, session_id=clean_session or None
+                )
+            except Exception:
+                pass
+
+            counts = apply_learning(extracted)
         # 只要模型给出了可解析结果就记账（哪怕各类别都是空数组——「看过但没有
         # 新东西」也是一次完整学习），否则每轮都会重复请求模型。
         _mark_learned(session, total_user_messages)

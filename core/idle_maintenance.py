@@ -28,12 +28,36 @@ BLOB_GC_MIN_INTERVAL_SECONDS = 3600
 ARCHIVE_SWEEP_MIN_INTERVAL_SECONDS = 3600
 
 
+def _thread_session_scope(session):
+    """按给定会话绑定线程级会话上下文；空会话名或上下文不可用时为 no-op。"""
+    from contextlib import nullcontext
+
+    clean = str(session or "").strip()
+    if not clean:
+        return nullcontext()
+    try:
+        from core import app_context
+
+        scope_fn = getattr(app_context, "thread_session_scope", None)
+        if callable(scope_fn):
+            return scope_fn(clean)
+    except Exception:
+        pass
+    return nullcontext()
+
+
 def _run_self_learning(session, manager, model_cfg):
-    """线程体：跑一次回合学习；任何异常只记 debug，绝不外溢到线程外。"""
+    """线程体：跑一次回合学习；任何异常只记 debug，绝不外溢到线程外。
+
+    必须绑定线程级会话：学习线程在后台异步触发，若不绑定，memory_filter
+    决策写审计时 `_current_session_id()` 会退回到 UI 当前正在查看的会话，
+    把旧会话抽取出的记忆决策张冠李戴记到当前会话里。
+    """
     try:
         from core.learning import run_turn_learning
 
-        run_turn_learning(session, manager, model_cfg)
+        with _thread_session_scope(session):
+            run_turn_learning(session, manager, model_cfg)
     except Exception:
         _LOGGER.debug("会话 %s 回合学习失败（已忽略）", session, exc_info=True)
 
@@ -170,7 +194,8 @@ class IdleMaintenanceService:
                 self._cancel_events[session] = cancel_event
                 self_registered = True
         try:
-            self._do_maintenance(session, notify, cancel_event)
+            with _thread_session_scope(session):
+                self._do_maintenance(session, notify, cancel_event)
         except Exception:
             _LOGGER.debug("会话 %s 闲时维护异常（已忽略）", session, exc_info=True)
         finally:

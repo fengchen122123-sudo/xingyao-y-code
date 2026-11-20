@@ -446,3 +446,65 @@ def test_memory_filter_blocks_noisy_writes_in_run_turn_learning(data_dir, monkey
     result = learning_mod.run_turn_learning("s1", _FakeManager(), ("m", "k", "u"))
     assert result is False
     assert applied == [{"user_facts": [], "lessons": [], "self_notes": []}]
+
+
+def test_memory_filter_records_target_session_even_when_ui_views_other(data_dir, monkeypatch):
+    """后台学习运行期即使 UI 当前看着别的会话，memory_filter 也必须记在目标会话名下。"""
+    from core import app_context
+    from core import learning as learning_mod
+
+    _write_user_config(data_dir, [PROVIDER])
+    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    _mock_post(
+        monkeypatch,
+        lambda i, call: _resp(200, {"answers": {"q": {"choice": "keep_all"}}}),
+    )
+
+    class _FakeManager:
+        def get_history_for_llm(self, session):
+            return [{"role": "user", "content": f"msg {i}"} for i in range(8)]
+
+    monkeypatch.setattr(
+        learning_mod,
+        "extract_turn_lessons",
+        lambda s, h, r: {
+            "user_facts": [{"kind": "preference", "text": "桌宠最小改造"}],
+            "lessons": [],
+            "self_notes": [],
+        },
+    )
+    monkeypatch.setattr(
+        learning_mod,
+        "apply_learning",
+        lambda res: {"user_facts": 1, "lessons": 0, "self_notes": 0},
+    )
+    monkeypatch.setattr(app_context, "get_current_session", lambda: "ui-other-session")
+    app_context.set_thread_session(None)
+
+    assert learning_mod.run_turn_learning("bg-kimi-session", _FakeManager(), ("m", "k", "u")) is True
+
+    records = _audit_records(data_dir)
+    assert len(records) == 1
+    assert records[0]["scene"] == "memory_filter"
+    assert records[0]["session_id"] == "bg-kimi-session"
+    assert app_context.get_thread_session() is None
+
+
+def test_subagent_run_task_restores_thread_session_on_exit(data_dir, monkeypatch):
+    """SubagentManager._run_task 退出时恢复调用方线程会话，不残留父会话。"""
+    from core import app_context
+    from core.tools import SubagentManager, SubagentTask
+
+    _write_user_config(data_dir, [PROVIDER])
+    mgr = SubagentManager(runner=lambda task: "完成")
+    task = SubagentTask(
+        task_id="sub-restore-tls",
+        parent_session="sub-parent-session",
+        parent_turn_id="t1",
+        description="核查代码",
+        subagent_type="explore",
+    )
+    mgr._tasks[task.task_id] = task
+    app_context.set_thread_session(None)
+    mgr._run_task(task)
+    assert app_context.get_thread_session() is None
