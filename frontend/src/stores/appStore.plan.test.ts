@@ -213,5 +213,63 @@ describe('appStore plan_item_handoff', () => {
     expect((store.planData.items[0] as any).handoff_note).toBe(
       '子 Agent 已超时，主 Agent 正在接管并核查现场'
     );
+    expect((store.planData.items[0] as any).handoff_task_id).toBe('subagent-x');
+  });
+
+  it('plan_updated 保留阶段、依赖、文件、验收、结果/报错与异常态映射', () => {
+    const store = useAppStore();
+    store.currentSessionName = 's1';
+    store.handleBridgeEvent({
+      type: 'plan_updated',
+      data: {
+        session_name: 's1',
+        title: '端到端改造',
+        items: [
+          {
+            id: 'P1',
+            subject: '梳理接口',
+            status: 'completed',
+            stage: 'plan',
+            files: ['a.ts', 'b.ts'],
+            result: '已梳理完毕',
+            attempts: 1,
+          },
+          {
+            id: 'P2',
+            subject: '编写测试',
+            status: 'blocked',
+            stage: 'review',
+            depends_on: ['P1'],
+            verification: 'npm test',
+            verification_type: 'command',
+            attempts: 2,
+            error: '依赖未就绪',
+            handoff_task_id: 'sub-22',
+          },
+          {
+            id: 'P3',
+            subject: '清理脚本',
+            status: 'cancelled',
+          },
+        ],
+      },
+    } as any);
+
+    const [p1, p2, p3] = store.planData.items;
+    expect(p1.status).toBe('done');
+    expect(p1.stage).toBe('plan');
+    expect(p1.files).toEqual(['a.ts', 'b.ts']);
+    expect(p1.result).toBe('已梳理完毕');
+
+    expect(p2.status).toBe('blocked');
+    expect(p2.stage).toBe('review');
+    expect(p2.depends_on).toEqual(['P1']);
+    expect(p2.verification).toBe('npm test');
+    expect(p2.verification_type).toBe('command');
+    expect(p2.attempts).toBe(2);
+    expect(p2.error).toBe('依赖未就绪');
+    expect(p2.handoff_task_id).toBe('sub-22');
+
+    expect(p3.status).toBe('cancelled');
   });
 });

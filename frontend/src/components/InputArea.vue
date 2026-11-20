@@ -89,12 +89,14 @@
           @select="applySuggest"
           @hover="i => suggestIndex = i"
         />
-        <!-- 富文本输入框：@ 引用渲染成胶囊（带图标、整块选中、退格一次全删） -->
+        <!-- 富文本输入框：@ 引用与 / 技能渲染成胶囊（带图标、整块选中、退格一次全删） -->
         <div class="composer-field">
           <ComposerEditor
             ref="editorRef"
             v-model="inputVal"
             :height="textareaHeight"
+            :skill-ids="skillIds"
+            :command-ids="commandIds"
             :placeholder="`向${store.agentName}提问… / 调用技能与 MCP，@ 引用文件`"
             @keydown="onKeydown"
             @input="detectToken"
@@ -388,7 +390,7 @@ onUnmounted(() => {
 });
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths, uploadFiles, openAttachmentImage } = useAttachments();
-const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, composerControl);
+const { suggestItems, suggestIndex, suggestEmpty, skillIds, commandIds, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, composerControl);
 // 输入框高度拖拽：最小=默认渲染高度，向上拖抬高、松手记忆，双击恢复
 const { textareaHeight, isResizing, onHandlePointerdown, resetHeight } = useComposerResize(() => editorRef.value?.el ?? null);
 
@@ -880,6 +882,12 @@ async function undoQueue(item: QueuedMessage) {
    末尾的沙盒胶囊已经挤出可视区，只剩一条边框 */
 /* 权限文案先让位：模型名是工具栏里最需要常驻的可读信息，权限状态已由盾牌
    图标与配色表达。此档只收权限文字，模型名继续完整显示 */
+@container composer (min-width: 860px) {
+  .model-chip {
+    max-width: 240px;
+  }
+}
+
 @container composer (max-width: 660px) {
   .permission-mode-btn .perm-dot,
   .permission-mode-btn .perm-label,

@@ -173,6 +173,28 @@
 
       <div class="field-label">决策记录</div>
       <div class="audit-row">
+        <div class="audit-scope-tabs" role="group" aria-label="决策记录范围">
+          <button
+            data-test="decision-audit-scope-all"
+            type="button"
+            class="scope-tab"
+            :class="{ active: auditScope === 'all' }"
+            @click="setAuditScope('all')"
+          >
+            全部会话
+          </button>
+          <button
+            data-test="decision-audit-scope-session"
+            type="button"
+            class="scope-tab"
+            :class="{ active: auditScope === 'session' }"
+            :disabled="!activeSessionName"
+            :title="activeSessionName ? `仅查看当前会话（${activeSessionName}）` : '当前暂无已保存的会话'"
+            @click="setAuditScope('session')"
+          >
+            当前会话
+          </button>
+        </div>
         <span class="audit-summary-text" data-test="decision-audit-summary">{{ auditSummaryText }}</span>
         <button data-test="decision-audit-open" class="secondary-button" type="button" :disabled="loading || saving" @click="openAuditDir">打开审计目录</button>
       </div>
@@ -197,7 +219,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { getActivePinia } from 'pinia';
 
 import { useAppStore } from '../stores/appStore';
@@ -258,6 +280,7 @@ const modelOptions = ref<DecisionModelOption[]>([]);
 const fetchHint = ref('');
 const fetchFailed = ref(false);
 const auditSummary = ref<DecisionAuditSummary | null>(null);
+const auditScope = ref<'all' | 'session'>('all');
 
 // 业务场景（三态开关）：每个场景独立保存，改一项立即生效
 const sceneRows = ref<DecisionSceneRow[]>([]);
@@ -291,21 +314,35 @@ const statusDotClass = computed(() => {
   return '';
 });
 
+const activeSessionName = computed(() => {
+  const pinia = getActivePinia();
+  if (!pinia) return '';
+  return String(useAppStore(pinia).currentSessionName || '').trim();
+});
+
 const auditRecent = computed(() => auditSummary.value?.recent ?? []);
 
 const auditSummaryText = computed(() => {
   const summary = auditSummary.value;
-  if (!summary || summary.today_count <= 0) {
-    return '今日暂无决策记录（跑一次探针即可产生记录）';
+  const prefix = auditScope.value === 'session' ? '本会话今日' : '今日';
+  if (!summary || (summary.today_count <= 0 && !(summary.session_total_count ?? 0))) {
+    return auditScope.value === 'session'
+      ? '本会话暂无决策记录'
+      : '今日暂无决策记录（跑一次探针即可产生记录）';
   }
-  return `今日 ${summary.today_count} 次决策 · 影子 ${summary.today_shadow_count} · 采纳 ${summary.today_adopted_count} · 回退 ${summary.today_fallback_count}`;
+  const base = `${prefix} ${summary.today_count} 次决策 · 影子 ${summary.today_shadow_count} · 采纳 ${summary.today_adopted_count} · 回退 ${summary.today_fallback_count}`;
+  if (auditScope.value === 'session' && typeof summary.session_total_count === 'number') {
+    return `本会话累计 ${summary.session_total_count} 次 · ${base}`;
+  }
+  return base;
 });
 
-/** 单条审计记录的展示行：时间 · 场景 · 模式 · 延迟 · 回退原因 */
+/** 单条审计记录的展示行：时间 · 场景 · 模式 · 延迟 · 会话（全局口径） · 回退原因 */
 function auditLine(item: DecisionAuditRecentItem): string {
   const time = item.ts.length >= 19 ? item.ts.slice(11, 19) : item.ts;
   const parts = [time, item.scene || '未知场景', item.shadow ? '影子' : '正式'];
   if (typeof item.latency_ms === 'number') parts.push(`${item.latency_ms}ms`);
+  if (auditScope.value === 'all' && item.session_id) parts.push(`会话：${item.session_id}`);
   if (item.fallback_reason) parts.push(`回退：${item.fallback_reason}`);
   return parts.join(' · ');
 }
@@ -340,8 +377,9 @@ function normalizeProbe(raw: Partial<DecisionProbeKeyResult>): DecisionProbeKeyR
 }
 
 function syncStoreDecisionEnabled(enabled: boolean) {
-  if (!getActivePinia()) return;
-  const store = useAppStore();
+  const pinia = getActivePinia();
+  if (!pinia) return;
+  const store = useAppStore(pinia);
   store.decisionEnabled = enabled;
   if (!enabled && store.permissionMode === 'auto_decision') {
     store.permissionMode = 'confirm';
@@ -642,12 +680,38 @@ async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
   }
 }
 
+let auditRequestSeq = 0;
+
+function setAuditScope(scope: 'all' | 'session') {
+  if (auditScope.value === scope) return;
+  auditScope.value = scope;
+  void loadAuditSummary();
+}
+
 /** 审计汇总（决策记录面板）：加载失败静默，不阻塞其余控件 */
 async function loadAuditSummary() {
+  const seq = (auditRequestSeq += 1);
   try {
     const api = window.pywebview?.api;
     if (!api?.get_decision_audit_summary) return;
-    const res = await api.get_decision_audit_summary(10);
+    const scope = auditScope.value;
+    const sessionName = activeSessionName.value;
+    if (scope === 'session' && !sessionName) {
+      auditSummary.value = {
+        ok: true,
+        today_count: 0,
+        today_shadow_count: 0,
+        today_adopted_count: 0,
+        today_fallback_count: 0,
+        recent: [],
+      };
+      return;
+    }
+    const res =
+      scope === 'session'
+        ? await api.get_decision_audit_summary(10, sessionName, true)
+        : await api.get_decision_audit_summary(10);
+    if (seq !== auditRequestSeq) return;
     if (res?.ok) {
       auditSummary.value = {
         ok: true,
@@ -655,6 +719,12 @@ async function loadAuditSummary() {
         today_shadow_count: Number(res.today_shadow_count ?? 0),
         today_adopted_count: Number(res.today_adopted_count ?? 0),
         today_fallback_count: Number(res.today_fallback_count ?? 0),
+        ...(typeof res.session_total_count === 'number'
+          ? { session_total_count: res.session_total_count }
+          : {}),
+        ...(typeof res.global_today_count === 'number'
+          ? { global_today_count: res.global_today_count }
+          : {}),
         recent: Array.isArray(res.recent) ? res.recent : [],
       };
     }
@@ -662,6 +732,13 @@ async function loadAuditSummary() {
     // 记录面板失败不弹错
   }
 }
+
+watch(activeSessionName, (name) => {
+  if (auditScope.value === 'session') {
+    if (!name) auditScope.value = 'all';
+    void loadAuditSummary();
+  }
+});
 
 async function openAuditDir() {
   try {
@@ -759,7 +836,11 @@ onMounted(() => {
 .scene-modes { gap: 16px; }
 .scene-threshold { display: inline-flex; align-items: center; gap: 7px; color: var(--text-dim); font-size: 12px; }
 .scene-threshold-input { width: 92px; min-height: 34px; padding: 0 9px; }
-.audit-row { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+.audit-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.audit-scope-tabs { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg2); }
+.scope-tab { min-height: 30px; padding: 0 10px; border: none; background: transparent; color: var(--text-dim); font-size: 12px; cursor: pointer; }
+.scope-tab.active { background: var(--bg3); color: var(--text); font-weight: 600; }
+.scope-tab:disabled { opacity: .45; cursor: not-allowed; }
 .audit-hint { color: var(--text-faint); font-size: 12px; }
 .audit-summary-text { color: var(--text-dim); font-size: 12px; }
 .audit-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--text-dim); }

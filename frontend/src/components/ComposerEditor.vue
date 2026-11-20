@@ -20,15 +20,16 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
-import { splitRefSegments, refKindOf, refDisplayName, type RefKind } from '../utils/composerRefs';
+import { ICON_PATHS } from './iconPaths';
+import { splitRefSegments, refDisplayName, type RefKind } from '../utils/composerRefs';
 
 /**
- * 富文本输入框：把 @ 引用渲染成真正的胶囊（带图标、整块选中、退格一次全删）。
+ * 富文本输入框：把 @ 引用、/ 技能与斜杠命令渲染成真正的胶囊（带图标、整块选中、退格一次全删）。
  *
  * 为什么不是 textarea：textarea 是纯文本控件，既不能给某几个字符加背景，
  * 也不能让「一个引用」成为不可分割的单元。所以这里用 contenteditable，
  * DOM 里只有两种节点——普通文本节点与 `contenteditable="false"` 的胶囊元素，
- * 对外（父组件的 composerText / 后端）始终是 `@{会话名}`、`@路径` 这样的纯文本：
+ * 对外（父组件的 composerText / 后端）始终是 `@{会话名}`、`@路径`、`/short_id`、`/命令` 这样的纯文本：
  *
  *   文本 → DOM：splitRefSegments 切段，引用段渲染成胶囊（data-cref 存原始 token）
  *   DOM → 文本：遍历子节点，文本节点取文本、胶囊取 data-cref，逐字符拼回
@@ -48,6 +49,10 @@ const props = defineProps<{
   height?: number | null;
   /** 最小高度（px），默认 46（约两行） */
   minHeight?: number;
+  /** 已启用且未与内置命令重名的技能 short_id 列表，供识别技能胶囊 */
+  skillIds?: string[];
+  /** 内置斜杠命令名称列表（如 goal / fix），供识别命令胶囊 */
+  commandIds?: string[];
 }>();
 
 const emit = defineEmits<{
@@ -61,10 +66,19 @@ const emit = defineEmits<{
 
 const CHIP_CLASS = 'ce-chip';
 
-// 胶囊图标：复用项目图标库里的 path 数据（对话气泡 / 文档）
+// 胶囊图标：复用项目图标库里的 path 数据（对话气泡 / 文档 / 技能星盘 / 斜杠命令）
 const CHIP_ICON: Record<RefKind, string> = {
-  session: '<path d="M21 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/>',
-  file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
+  session: ICON_PATHS['message-square'],
+  file: ICON_PATHS.file,
+  skill: ICON_PATHS.sparkle,
+  command: ICON_PATHS.command,
+};
+
+const CHIP_TITLE: Record<RefKind, string> = {
+  session: '引用的对话',
+  file: '引用的文件',
+  skill: '调用的技能',
+  command: '执行的命令',
 };
 
 const elRef = ref<HTMLElement | null>(null);
@@ -123,13 +137,12 @@ function nodeLen(node: Node): number {
   return collect(node).length;
 }
 
-function createChip(raw: string): HTMLElement {
-  const kind = refKindOf(raw);
+function createChip(raw: string, kind: RefKind): HTMLElement {
   const chip = document.createElement('span');
   chip.className = `${CHIP_CLASS} ${CHIP_CLASS}-${kind}`;
   chip.contentEditable = 'false';
   chip.dataset.cref = raw;
-  chip.title = kind === 'session' ? `引用的对话：${refDisplayName(raw)}` : `引用的文件：${refDisplayName(raw)}`;
+  chip.title = `${CHIP_TITLE[kind]}：${refDisplayName(raw)}`;
 
   const icon = document.createElement('span');
   icon.className = `${CHIP_CLASS}-icon`;
@@ -149,8 +162,8 @@ function render(text: string) {
   if (!el) return;
   el.textContent = '';
   const frag = document.createDocumentFragment();
-  for (const seg of splitRefSegments(text)) {
-    if (seg.kind === 'ref') frag.appendChild(createChip(seg.text));
+  for (const seg of splitRefSegments(text, props.skillIds, props.commandIds)) {
+    if (seg.kind === 'ref') frag.appendChild(createChip(seg.text, seg.refKind));
     else if (seg.text) frag.appendChild(document.createTextNode(seg.text));
   }
   el.appendChild(frag);
@@ -164,7 +177,7 @@ function locatePoint(root: HTMLElement, offset: number): { node: Node; offset: n
   for (let i = 0; i < kids.length; i++) {
     const child = kids[i];
     const len = nodeLen(child);
-    if (offset <= acc + len) {
+    if (child.nodeType === Node.TEXT_NODE ? offset <= acc + len : offset < acc + len) {
       if (child.nodeType === Node.TEXT_NODE) {
         const max = (child.textContent || '').length;
         return { node: child, offset: Math.max(0, Math.min(offset - acc, max)) };
@@ -361,7 +374,7 @@ function adjacentChip(dir: -1 | 1): HTMLElement | null {
   const sel = document.getSelection();
   if (!el || !sel || !sel.rangeCount) return null;
   const range = sel.getRangeAt(0);
-  if (!range.collapsed) return null; // 有选区交给浏览器（跨胶囊选区会整块删除）
+  if (!range.collapsed) return null; // 有选区交给其他处理或浏览器
 
   const node = dir === -1 ? range.startContainer : range.endContainer;
   const offset = dir === -1 ? range.startOffset : range.endOffset;
@@ -370,15 +383,54 @@ function adjacentChip(dir: -1 | 1): HTMLElement | null {
     const text = node.textContent || '';
     if (dir === -1 && offset > 0) return null; // 光标在文本中间，正常删字
     if (dir === 1 && offset < text.length) return null;
-    const sibling = dir === -1 ? node.previousSibling : node.nextSibling;
+    let sibling: Node | null = dir === -1 ? node.previousSibling : node.nextSibling;
+    while (sibling && sibling.nodeType === Node.TEXT_NODE && !(sibling.textContent || '')) {
+      sibling = dir === -1 ? sibling.previousSibling : sibling.nextSibling;
+    }
     return isChip(sibling) ? sibling : null;
   }
   if (node === el) {
     const kids = Array.from(el.childNodes);
-    const target = dir === -1 ? kids[offset - 1] : kids[offset];
+    let idx = dir === -1 ? offset - 1 : offset;
+    while (
+      idx >= 0 &&
+      idx < kids.length &&
+      kids[idx].nodeType === Node.TEXT_NODE &&
+      !(kids[idx].textContent || '')
+    ) {
+      idx += dir;
+    }
+    const target = kids[idx];
     return isChip(target) ? target : null;
   }
   return null;
+}
+
+/** 点选整块胶囊后按退格/Delete：整块删除并收拢光标 */
+function deleteSelectedChip(): boolean {
+  const el = elRef.value;
+  const sel = document.getSelection();
+  if (!el || !sel || !sel.rangeCount) return false;
+  const range = sel.getRangeAt(0);
+  if (range.collapsed) return false;
+  if (
+    range.startContainer !== el ||
+    range.endContainer !== el ||
+    range.endOffset !== range.startOffset + 1
+  ) {
+    return false;
+  }
+  const target = el.childNodes[range.startOffset];
+  if (!isChip(target)) return false;
+  const idx = range.startOffset;
+  target.remove();
+  const nextRange = document.createRange();
+  nextRange.setStart(el, Math.max(0, Math.min(idx, el.childNodes.length)));
+  nextRange.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(nextRange);
+  commit();
+  return true;
 }
 
 /** 删掉胶囊并把光标放到它原来的位置；返回是否已处理 */
@@ -422,11 +474,11 @@ function onKeydown(e: KeyboardEvent) {
     }
     return;
   }
-  if (e.key === 'Backspace' && deleteAdjacentChip(-1)) {
+  if (e.key === 'Backspace' && (deleteSelectedChip() || deleteAdjacentChip(-1))) {
     e.preventDefault();
     return;
   }
-  if (e.key === 'Delete' && deleteAdjacentChip(1)) {
+  if (e.key === 'Delete' && (deleteSelectedChip() || deleteAdjacentChip(1))) {
     e.preventDefault();
   }
 }
@@ -452,6 +504,40 @@ watch(
     render(value || '');
   },
   { flush: 'sync' },
+);
+
+watch(
+  [() => props.skillIds, () => props.commandIds],
+  () => {
+    const el = elRef.value;
+    if (!el || composing) return;
+    const text = collect(el);
+    if (!text.includes('/')) return;
+    const currentRefs = Array.from(el.querySelectorAll(`.${CHIP_CLASS}`)).map(n => {
+      const chip = n as HTMLElement;
+      const kind = chip.classList.contains(`${CHIP_CLASS}-command`)
+        ? 'command'
+        : chip.classList.contains(`${CHIP_CLASS}-skill`)
+          ? 'skill'
+          : chip.classList.contains(`${CHIP_CLASS}-session`)
+            ? 'session'
+            : 'file';
+      return `${kind}:${chip.dataset.cref || ''}`;
+    });
+    const nextRefs = splitRefSegments(text, props.skillIds, props.commandIds)
+      .filter((s): s is Extract<typeof s, { kind: 'ref' }> => s.kind === 'ref')
+      .map(s => `${s.refKind}:${s.text}`);
+    if (
+      currentRefs.length === nextRefs.length &&
+      currentRefs.every((v, i) => v === nextRefs[i])
+    ) {
+      return;
+    }
+    const focused = document.activeElement === el;
+    const offset = focused ? caretOffset() : 0;
+    render(text);
+    if (focused) setCaretRange(Math.min(offset, text.length));
+  },
 );
 
 onMounted(() => render(props.modelValue || ''));
@@ -524,7 +610,9 @@ defineExpose({ el: elRef, control, insertText, focus: () => elRef.value?.focus()
   overflow: hidden;
   cursor: default;
 }
-.ce-chip-session {
+.ce-chip-session,
+.ce-chip-skill,
+.ce-chip-command {
   border-color: color-mix(in srgb, var(--accent) 26%, transparent);
   background: var(--accent-soft);
   color: var(--accent);
@@ -541,6 +629,7 @@ defineExpose({ el: elRef, control, insertText, focus: () => elRef.value?.focus()
 .ce-chip-icon svg {
   width: 11px;
   height: 11px;
+  overflow: visible;
 }
 .ce-chip-label {
   overflow: hidden;

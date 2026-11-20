@@ -1,4 +1,4 @@
-import { ref, nextTick, type Ref } from 'vue';
+import { computed, ref, nextTick, type Ref } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import type { SuggestItem } from '../components/InputSuggest.vue';
 
@@ -69,7 +69,8 @@ export function useSuggest(
       if (!s.enabled || !s.short_id) continue;
       items.push({
         key: 'skill:' + s.short_id,
-        icon: '⚡',
+        icon: '✦',
+        iconName: 'sparkle',
         label: '/' + s.short_id,
         desc: s.description || s.name,
         apply: '/' + s.short_id,
@@ -370,11 +371,37 @@ export function useSuggest(
     suggestEmpty.value = '';
   }
 
+  // 内置斜杠命令名称清单（与 slashCommands 同步，用于编辑器将 /goal 等渲染为命令胶囊）
+  const commandIds = computed<string[]>(() => {
+    const ids: string[] = [];
+    for (const c of store.slashCommands) {
+      const name = (c.name || '').trim().replace(/^\/+/, '');
+      if (name) ids.push(name);
+    }
+    return ids;
+  });
+
+  // 与 buildCommandItems 保持同一优先级：内置命令优先于同名技能，
+  // 只有实际会作为技能而非命令触发的 short_id 才允许在编辑器里渲染为技能胶囊
+  const skillIds = computed<string[]>(() => {
+    const cmdNames = new Set(commandIds.value.map(id => '/' + id.toLowerCase()));
+    const ids: string[] = [];
+    for (const s of store.skills) {
+      if (!s.enabled || !s.short_id) continue;
+      const shortId = s.short_id.trim();
+      if (!shortId || cmdNames.has('/' + shortId.toLowerCase())) continue;
+      ids.push(shortId);
+    }
+    return ids;
+  });
+
   return {
     suggest,
     suggestItems,
     suggestIndex,
     suggestEmpty,
+    skillIds,
+    commandIds,
     detectToken,
     applySuggest,
     onKeydown,

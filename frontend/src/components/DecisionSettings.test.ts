@@ -1,6 +1,8 @@
 import { mount, flushPromises } from '@vue/test-utils';
+import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import DecisionSettings from './DecisionSettings.vue';
+import { useAppStore } from '../stores/appStore';
 
 const baseSettings = {
   version: 1,
@@ -473,5 +475,86 @@ describe('DecisionSettings', () => {
     await flushPromises();
 
     expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('未知场景');
+  });
+
+  it('决策记录：支持在「全部会话」与「当前会话」间切换，全局列表展示归属会话', async () => {
+    setActivePinia(createPinia());
+    const store = useAppStore();
+    store.currentSessionName = 'sess-A';
+
+    const getSummary = vi.fn(async (_limit?: number, sessionId?: string, sessionOnly?: boolean) => {
+      if (sessionOnly && sessionId === 'sess-A') {
+        return {
+          ok: true,
+          today_count: 1,
+          today_shadow_count: 0,
+          today_adopted_count: 1,
+          today_fallback_count: 0,
+          recent: [
+            {
+              ts: '2026-11-20T14:00:00',
+              scene: 'subagent_review',
+              session_id: 'sess-A',
+              shadow: false,
+              adopted: true,
+              latency_ms: 420,
+              fallback_reason: '',
+              model_id: 'NeoHorse-Jev-4B',
+              answers_digest: '',
+            },
+          ],
+        };
+      }
+      return {
+        ok: true,
+        today_count: 2,
+        today_shadow_count: 0,
+        today_adopted_count: 2,
+        today_fallback_count: 0,
+        recent: [
+          {
+            ts: '2026-11-20T13:38:36',
+            scene: 'memory_filter',
+            session_id: 'sess-B',
+            shadow: false,
+            adopted: true,
+            latency_ms: 800,
+            fallback_reason: '',
+            model_id: 'NeoHorse-Jev-4B',
+            answers_digest: '',
+          },
+          {
+            ts: '2026-11-20T14:00:00',
+            scene: 'subagent_review',
+            session_id: 'sess-A',
+            shadow: false,
+            adopted: true,
+            latency_ms: 420,
+            fallback_reason: '',
+            model_id: 'NeoHorse-Jev-4B',
+            answers_digest: '',
+          },
+        ],
+      };
+    });
+
+    mockApi({ get_decision_audit_summary: getSummary });
+    const wrapper = mountPage();
+    await flushPromises();
+
+    // 默认全部会话：显示两会话，且每条带归属会话名
+    expect(getSummary).toHaveBeenLastCalledWith(10);
+    const listAll = wrapper.find('[data-test="decision-audit-list"]').text();
+    expect(listAll).toContain('会话：sess-B');
+    expect(listAll).toContain('会话：sess-A');
+
+    // 切到「当前会话」：按 session_only=true 拉取 sess-A
+    await wrapper.find('[data-test="decision-audit-scope-session"]').trigger('click');
+    await flushPromises();
+    expect(getSummary).toHaveBeenLastCalledWith(10, 'sess-A', true);
+    expect(wrapper.find('[data-test="decision-audit-summary"]').text()).toContain('本会话今日 1 次决策');
+    const listScoped = wrapper.find('[data-test="decision-audit-list"]').text();
+    expect(listScoped).toContain('subagent_review');
+    expect(listScoped).not.toContain('memory_filter');
   });
 });

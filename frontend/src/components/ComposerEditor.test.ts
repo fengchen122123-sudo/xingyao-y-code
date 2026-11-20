@@ -6,9 +6,9 @@ import ComposerEditor from './ComposerEditor.vue';
 // 富文本输入框：对外是纯文本（@{会话名} / @路径），对内是「文本节点 + 胶囊元素」。
 // 这里覆盖三件要紧的事：胶囊渲染、序列化回文本、以及「退格一次删掉整个引用」。
 
-function mountEditor(modelValue: string) {
+function mountEditor(modelValue: string, skillIds?: string[], commandIds?: string[]) {
   return mount(ComposerEditor, {
-    props: { modelValue, placeholder: '说点什么' },
+    props: { modelValue, placeholder: '说点什么', skillIds, commandIds },
     attachTo: document.body,
   });
 }
@@ -193,6 +193,94 @@ describe('ComposerEditor @ 引用胶囊', () => {
     await editor.trigger('keydown', { key: 'Enter' });
     expect(wrapper.emitted('keydown')).toHaveLength(1);
     expect(wrapper.emitted('submit')).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it('技能 token 渲染为带星盘图标的胶囊，序列保持原始 /short_id', async () => {
+    const wrapper = mountEditor('@{对话A} /gzh-design 帮我排版', ['gzh-design']);
+    const root = wrapper.get('.ce-input').element;
+
+    const skillChips = root.querySelectorAll('.ce-chip-skill');
+    expect(skillChips).toHaveLength(1);
+    expect((skillChips[0] as HTMLElement).contentEditable).toBe('false');
+    expect((skillChips[0] as HTMLElement).dataset.cref).toBe('/gzh-design');
+    expect(skillChips[0].querySelector('.ce-chip-label')?.textContent).toBe('gzh-design');
+    expect(skillChips[0].querySelector('.ce-chip-icon polygon')).not.toBeNull();
+
+    await wrapper.get('.ce-input').trigger('input');
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['@{对话A} /gzh-design 帮我排版']);
+    wrapper.unmount();
+  });
+
+  it('技能胶囊支持退格、Delete 以及点选后一次全删', async () => {
+    const wrapper = mountEditor('@{对话A} /gzh-design', ['gzh-design']);
+    const root = wrapper.get('.ce-input').element as HTMLElement;
+
+    // 1) 光标紧邻技能胶囊末尾按 Backspace：整块删除
+    caretToEnd(root);
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['@{对话A} ']);
+    expect(root.querySelector('.ce-chip-skill')).toBeNull();
+    expect(root.querySelector('.ce-chip-session')).not.toBeNull();
+
+    // 2) 点选技能胶囊后按 Delete：整块删除
+    await wrapper.setProps({ modelValue: '/gzh-design 排版' });
+    const chip = root.querySelector('.ce-chip-skill') as HTMLElement;
+    expect(chip).not.toBeNull();
+    chip.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Delete' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([' 排版']);
+    expect(root.querySelector('.ce-chip-skill')).toBeNull();
+    wrapper.unmount();
+  });
+
+  it('skillIds 异步到达后自动把草稿中的技能渲染为胶囊', async () => {
+    const wrapper = mountEditor('/gzh-design 排版');
+    expect(wrapper.find('.ce-chip-skill').exists()).toBe(false);
+
+    await wrapper.setProps({ skillIds: ['gzh-design'] });
+    expect(wrapper.findAll('.ce-chip-skill')).toHaveLength(1);
+    expect(wrapper.find('.ce-chip-skill .ce-chip-label').text()).toBe('gzh-design');
+    wrapper.unmount();
+  });
+
+  it('斜杠命令渲染为带命令图标的胶囊，序列保持原始 /cmd 且支持一次全删', async () => {
+    const wrapper = mountEditor('/goal 做一个网站', [], ['goal', 'fix']);
+    const root = wrapper.get('.ce-input').element as HTMLElement;
+
+    const cmdChips = root.querySelectorAll('.ce-chip-command');
+    expect(cmdChips).toHaveLength(1);
+    expect((cmdChips[0] as HTMLElement).contentEditable).toBe('false');
+    expect((cmdChips[0] as HTMLElement).dataset.cref).toBe('/goal');
+    expect(cmdChips[0].querySelector('.ce-chip-label')?.textContent).toBe('goal');
+    expect(cmdChips[0].querySelector('.ce-chip-icon path')).not.toBeNull();
+
+    await wrapper.get('.ce-input').trigger('input');
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['/goal 做一个网站']);
+
+    // 点选命令胶囊并按 Backspace：整块删除
+    (cmdChips[0] as HTMLElement).dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([' 做一个网站']);
+    expect(root.querySelector('.ce-chip-command')).toBeNull();
+
+    // 紧邻命令胶囊末尾退格：整块删除
+    await wrapper.setProps({ modelValue: '/fix' });
+    caretToEnd(root);
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['']);
+    expect(root.querySelector('.ce-chip-command')).toBeNull();
+    wrapper.unmount();
+  });
+
+  it('commandIds 异步到达后会把同名胶囊升级为命令胶囊', async () => {
+    const wrapper = mountEditor('/goal 任务', ['goal']);
+    expect(wrapper.find('.ce-chip-skill').exists()).toBe(true);
+
+    await wrapper.setProps({ commandIds: ['goal'] });
+    expect(wrapper.find('.ce-chip-skill').exists()).toBe(false);
+    expect(wrapper.find('.ce-chip-command').exists()).toBe(true);
+    expect(wrapper.find('.ce-chip-command .ce-chip-label').text()).toBe('goal');
     wrapper.unmount();
   });
 });

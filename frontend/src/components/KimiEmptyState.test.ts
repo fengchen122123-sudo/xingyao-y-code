@@ -161,3 +161,59 @@ it('空态页按 Enter 发送首条消息后清空输入框与新会话 composer
   delete (window as any).pywebview;
   wrapper.unmount();
 });
+
+it('空态页斜杠选择技能显示星盘图标与胶囊，删除时整块删除', async () => {
+  const store = useAppStore();
+  store.currentSessionName = '';
+  store.pendingWorkdir = 'GLOBAL';
+  store.skills = [
+    { id: 's1', name: '排版', short_id: 'gzh-design', description: '公众号排版', enabled: true } as any,
+  ];
+
+  const wrapper = mount(KimiEmptyState, { attachTo: document.body });
+  const editor = wrapper.get('.ce-input');
+  editor.element.textContent = '/g';
+  await editor.trigger('input');
+
+  const sgItems = wrapper.findAll('.sg-item');
+  expect(sgItems).toHaveLength(1);
+  expect(sgItems[0].find('.sg-icon svg polygon').exists()).toBe(true);
+
+  await editor.trigger('keydown', { key: 'Enter' });
+  expect(editor.find('.ce-chip-skill').exists()).toBe(true);
+  expect(editor.find('.ce-chip-skill .ce-chip-label').text()).toBe('gzh-design');
+  expect(store._getSessionRuntime().composerText).toBe('/gzh-design ');
+
+  const skillChip = editor.element.querySelector('.ce-chip-skill') as HTMLElement;
+  skillChip.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  await editor.trigger('keydown', { key: 'Backspace' });
+  expect(editor.find('.ce-chip-skill').exists()).toBe(false);
+  expect(store._getSessionRuntime().composerText).toBe(' ');
+  wrapper.unmount();
+});
+
+it('空态页斜杠选择内置命令（如 /goal）显示为胶囊且删除整块删除', async () => {
+  const store = useAppStore();
+  store.currentSessionName = '';
+  store.pendingWorkdir = 'GLOBAL';
+  store.slashCommands = [
+    { name: '/goal', usage: '/goal <目标>', summary: '目标模式', kind: 'hybrid' } as any,
+  ];
+
+  const wrapper = mount(KimiEmptyState, { attachTo: document.body });
+  const editor = wrapper.get('.ce-input');
+  editor.element.textContent = '/go';
+  await editor.trigger('input');
+
+  await editor.trigger('keydown', { key: 'Enter' });
+  expect(editor.find('.ce-chip-command').exists()).toBe(true);
+  expect(editor.find('.ce-chip-command .ce-chip-label').text()).toBe('goal');
+  expect(store._getSessionRuntime().composerText).toBe('/goal ');
+
+  const cmdChip = editor.element.querySelector('.ce-chip-command') as HTMLElement;
+  cmdChip.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  await editor.trigger('keydown', { key: 'Delete' });
+  expect(editor.find('.ce-chip-command').exists()).toBe(false);
+  expect(store._getSessionRuntime().composerText).toBe(' ');
+  wrapper.unmount();
+});

@@ -32,8 +32,43 @@ describe('composerRefs @ 引用切分', () => {
   it('胶囊标签去掉语法记号，类型判断只看前缀', () => {
     expect(refKindOf('@{缓存改造}')).toBe('session');
     expect(refKindOf('@src/a.ts')).toBe('file');
+    expect(refKindOf('/gzh-design')).toBe('skill');
+    expect(refKindOf('/goal', ['/goal'])).toBe('command');
     expect(refDisplayName('@{缓存改造}')).toBe('缓存改造');
     expect(refDisplayName('@src/a.ts')).toBe('src/a.ts');
+    expect(refDisplayName('/gzh-design')).toBe('gzh-design');
+    expect(refDisplayName('/goal')).toBe('goal');
+  });
+
+  it('传入已启用技能与斜杠命令列表时按优先级识别，不误伤路径与转义斜杠', () => {
+    const skills = ['gzh-design', 'office-format', 'goal'];
+    const commands = ['/goal', '/fix'];
+    const text = '/goal @{关于 /gzh-design 的讨论} /gzh-design /fix 帮我排版 @a.md //goal /usr/bin http://a.com/goal path/goal /goal/sub /office-format，收尾';
+    const segs = splitRefSegments(text, skills, commands);
+
+    expect(
+      segs
+        .filter((s): s is Extract<typeof s, { kind: 'ref' }> => s.kind === 'ref')
+        .map(s => [s.refKind, s.text]),
+    ).toEqual([
+      ['command', '/goal'],
+      ['session', '@{关于 /gzh-design 的讨论}'],
+      ['skill', '/gzh-design'],
+      ['command', '/fix'],
+      ['file', '@a.md'],
+      ['skill', '/office-format'],
+    ]);
+    expect(segs.map(s => s.text).join('')).toBe(text);
+  });
+
+  it('技能与命令短 ID 匹配大小写不敏感且保留原文 token', () => {
+    const segs = splitRefSegments('/Goal /GZH-Design 排版', ['gzh-design'], ['/goal']);
+    expect(segs).toEqual([
+      { kind: 'ref', text: '/Goal', refKind: 'command' },
+      { kind: 'text', text: ' ' },
+      { kind: 'ref', text: '/GZH-Design', refKind: 'skill' },
+      { kind: 'text', text: ' 排版' },
+    ]);
   });
 });
 
@@ -41,6 +76,10 @@ describe('composerRefs 退格整删的边界判定', () => {
   it('光标紧贴引用末尾时识别出整个 token', () => {
     expect(refTokenEndingAt('看下 @{缓存改造}', 10)).toBe('@{缓存改造}');
     expect(refTokenEndingAt('看下 @src/a.ts', 12)).toBe('@src/a.ts');
+    expect(refTokenEndingAt('@{对话} /gzh-design', 17, ['gzh-design'])).toBe('/gzh-design');
+    expect(refTokenEndingAt('/goal', 5, [], ['/goal'])).toBe('/goal');
+    expect(refTokenEndingAt('看下 @dir/gzh-design', 18, ['gzh-design'])).toBe('@dir/gzh-design');
+    expect(refTokenEndingAt('看下 /gzh-design/sub', 18, ['gzh-design'])).toBeNull();
   });
 
   it('光标在引用中间或不在引用上时返回 null（照常逐字删除）', () => {

@@ -236,4 +236,35 @@ describe('gitStore', () => {
     expect(git_confirm_operation).toHaveBeenCalledWith('E:/proj', 'reset_hard', { target: 'HEAD~1' }, 'tok-1');
     expect(store.pendingConfirm).toBeNull();
   });
+
+  it('unstageAll 将全部已暂存路径传给 git_unstage 并在空暂存时跳过请求', async () => {
+    const git_unstage = vi.fn().mockResolvedValue({ ok: true, snapshot: fakeSnapshot({ staged: [] }) });
+    mockApi({
+      git_get_status: vi.fn().mockResolvedValue({ ok: true, snapshot: fakeSnapshot() }),
+      git_get_trust: vi.fn().mockResolvedValue({ ok: true, level: 'trusted' }),
+      git_unstage,
+    });
+    const store = useGitStore();
+    await store.ensureLoaded('E:/proj');
+    await store.unstageAll();
+    expect(git_unstage).toHaveBeenCalledWith('E:/proj', ['a.py']);
+    await store.unstageAll();
+    expect(git_unstage).toHaveBeenCalledTimes(1);
+  });
+
+  it('loadCommitDiff 按提交区间加载 Diff 并更新状态', async () => {
+    const diffDoc = { raw_text: '+x', is_binary: false, hunks: [] };
+    const git_load_diff = vi.fn().mockResolvedValue({ ok: true, diff: diffDoc });
+    mockApi({
+      git_get_status: vi.fn().mockResolvedValue({ ok: true, snapshot: fakeSnapshot() }),
+      git_get_trust: vi.fn().mockResolvedValue({ ok: true, level: 'trusted' }),
+      git_load_diff,
+    });
+    const store = useGitStore();
+    await store.ensureLoaded('E:/proj');
+    await store.loadCommitDiff('p123', 'c456');
+    expect(git_load_diff).toHaveBeenCalledWith('E:/proj', '', false, 'p123', 'c456');
+    expect(store.selectedPath).toBe('commit:c456');
+    expect(store.diff).toEqual(diffDoc);
+  });
 });

@@ -7,15 +7,22 @@
       </div>
       <div v-else-if="visibleHunks.length === 0" class="git-diff-note">无差异</div>
       <div v-for="(hunk, hi) in visibleHunks" :key="hi" class="git-diff-hunk">
-        <div class="git-diff-hunk-header">@{{ '@' }} -{{ hunk.old_start }},{{ hunk.old_lines }} +{{ hunk.new_start }},{{ hunk.new_lines }} @@ {{ hunk.header }}</div>
+        <div class="git-diff-hunk-header">
+          @{{ '@' }} -{{ hunk.old_start }},{{ hunk.old_lines }} +{{ hunk.new_start }},{{ hunk.new_lines }} @@
+          <span v-if="hunk.header" class="git-hunk-context">{{ hunk.header }}</span>
+        </div>
         <div
           v-for="(row, li) in hunkRows(hunk)"
           :key="li"
           class="git-diff-line"
           :class="row.cls"
-        ><span class="git-ln">{{ row.oldNo }}</span><span class="git-ln">{{ row.newNo }}</span><span class="git-code">{{ row.text }}</span></div>
+        >
+          <span class="git-ln git-ln-old">{{ row.oldNo }}</span>
+          <span class="git-ln git-ln-new">{{ row.newNo }}</span>
+          <span class="git-code">{{ row.text }}</span>
+        </div>
       </div>
-      <div v-if="truncated" class="git-diff-note">大 Diff 已截断显示</div>
+      <div v-if="truncated" class="git-diff-note">大 Diff 已截断显示（仅展示前 2000 行）</div>
     </template>
   </div>
 </template>
@@ -59,7 +66,7 @@ function lineClass(line: string): string {
   if (line.startsWith('+')) return 'git-line-add';
   if (line.startsWith('-')) return 'git-line-del';
   if (line.startsWith('@@')) return 'git-line-hunk';
-  return '';
+  return 'git-line-ctx';
 }
 
 // 统一 diff 行号推进：- 行只走旧文件行号，+ 行只走新文件行号，
@@ -89,43 +96,82 @@ function hunkRows(hunk: { old_start: number; new_start: number; lines: string[] 
 
 <style scoped>
 .git-diff {
-  font-family: Consolas, 'Courier New', monospace;
+  font-family: var(--mono, Consolas, 'Courier New', monospace);
   font-size: 12px;
   overflow: auto;
   flex: 1;
+  background: var(--code-bg, var(--theme-code-background));
 }
 .git-diff-empty,
 .git-diff-note {
-  color: var(--text-dim, #888);
-  padding: 8px 10px;
+  color: var(--xy-text-3, var(--text-dim, #888));
+  padding: 24px 14px;
+  text-align: center;
+  font-family: var(--sans, inherit);
+}
+.git-diff-hunk + .git-diff-hunk {
+  margin-top: 2px;
 }
 .git-diff-hunk-header {
-  background: rgba(127, 127, 127, 0.15);
-  color: var(--text-dim, #888);
-  padding: 2px 10px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: color-mix(in srgb, var(--xy-accent, var(--accent)) 10%, var(--code-bg, var(--bg1)));
+  color: var(--xy-accent, var(--accent));
+  border-top: 1px solid var(--xy-border, var(--border));
+  border-bottom: 1px solid var(--xy-border, var(--border));
+  padding: 4px 12px;
+  font-size: 11.5px;
   user-select: none;
 }
-.git-line-add { background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green); }
-.git-line-del { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
-.git-line-hunk { color: var(--accent); }
+.git-hunk-context {
+  color: var(--xy-text-3, var(--text-faint));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .git-diff-line {
   display: flex;
-  align-items: baseline;
-  line-height: 1.45;
+  align-items: stretch;
+  line-height: 1.58;
+}
+.git-line-ctx .git-code {
+  color: var(--xy-text-2, var(--text-dim));
+}
+.git-line-add {
+  background: var(--xy-green-soft, color-mix(in srgb, var(--green) 14%, transparent));
+  box-shadow: inset 3px 0 0 var(--xy-green, var(--green));
+  color: var(--xy-green, var(--green));
+}
+.git-line-del {
+  background: var(--xy-rose-soft, color-mix(in srgb, var(--red) 14%, transparent));
+  box-shadow: inset 3px 0 0 var(--xy-rose, var(--red));
+  color: var(--xy-rose, var(--red));
+}
+.git-line-hunk {
+  color: var(--xy-accent, var(--accent));
 }
 .git-ln {
-  flex: 0 0 4em;
+  flex: 0 0 3.6em;
   text-align: right;
-  padding: 0 6px;
-  color: var(--text-faint, #666);
-  opacity: 0.8;
+  padding: 0 7px;
+  color: var(--xy-text-3, var(--text-faint, #666));
+  opacity: 0.72;
   user-select: none;
   font-variant-numeric: tabular-nums;
 }
+.git-ln-new {
+  border-right: 1px solid var(--xy-border, var(--border));
+  margin-right: 10px;
+}
 .git-code {
   flex: 1;
+  min-width: 0;
   white-space: pre-wrap;
   word-break: break-all;
-  padding-right: 10px;
+  padding-right: 14px;
 }
 </style>

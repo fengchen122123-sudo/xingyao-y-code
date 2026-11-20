@@ -86,15 +86,29 @@
           </span>
           <span class="top-spacer"></span>
 
+          <!-- 后台任务入口：当前会话有运行中后台任务时出现；与「星链 / 决策」同款胶囊 + 下拉面板 -->
+          <BackgroundTasksBar
+            :open="bgTasksOpen"
+            @toggle="toggleBgTasks"
+            @close="bgTasksOpen = false"
+          />
+
           <!-- 计划入口：星瑶创建了任务计划时显示；悬浮面板锚定在按钮下方，不遮全屏 -->
           <div v-if="taskEntry.visible" class="plan-entry-wrap">
             <button
               class="chip-btn task-entry"
+              :class="{ active: taskDialogOpen }"
+              :aria-expanded="taskDialogOpen"
               data-test="task-entry"
               title="查看星链执行进度"
-              @click.stop="taskDialogOpen = !taskDialogOpen"
+              @click.stop="toggleTaskDialog"
             >
-              <AppIcon name="loader" :size="12" :stroke-width="2" :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }" /><span class="chip-label">星链</span>
+              <AppIcon
+                :name="taskEntry.activeCount > 0 ? 'loader' : 'layers'"
+                :size="12"
+                :stroke-width="2"
+                :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }"
+              /><span class="chip-label">星链</span>
               <span v-if="taskEntry.activeCount > 0" class="task-entry-badge" data-test="task-entry-badge">{{ taskEntry.activeCount }}</span>
             </button>
             <TaskProgressDialog v-if="taskDialogOpen" @close="taskDialogOpen = false" />
@@ -105,15 +119,23 @@
           <div v-if="store.decisionHasRecords" class="decision-entry-wrap">
             <button
               class="chip-btn"
+              :class="{ active: decisionPanelOpen }"
+              :aria-expanded="decisionPanelOpen"
               data-test="decision-entry"
               title="查看 JEV 决策记录"
-              @click.stop="decisionPanelOpen = !decisionPanelOpen"
+              @click.stop="toggleDecisionPanel"
             ><AppIcon name="brain" :size="12" :stroke-width="2" /><span class="chip-label">决策</span><span v-if="store.decisionUnread > 0" class="decision-entry-badge" data-test="decision-entry-badge">{{ store.decisionUnread > 99 ? '99+' : store.decisionUnread }}</span></button>
             <DecisionRecordPopup v-if="decisionPanelOpen" @close="decisionPanelOpen = false" />
           </div>
 
           <div v-if="showExportEntry" class="export-wrap">
-            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" :stroke-width="1.8" /><span class="chip-label">导出</span></button>
+            <button
+              class="chip-btn"
+              :class="{ active: showExportMenu }"
+              :aria-expanded="showExportMenu"
+              title="导出会话"
+              @click.stop="toggleExportMenu"
+            ><AppIcon name="download" :size="13" :stroke-width="1.8" /><span class="chip-label">导出</span></button>
             <div v-if="showExportMenu" class="export-menu" @click.stop>
               <div class="export-item" @click="doExport('md')">Markdown (.md)</div>
               <div class="export-item" @click="doExport('html')">HTML (.html)</div>
@@ -221,9 +243,6 @@
           @close="store.closeSubpage()"
         />
 
-        <!-- 后台任务执行条：list_active_tasks 快照非空时出现，详情展开任务卡片 -->
-        <BackgroundTasksBar />
-
         <!-- 底部固定输入框：跟随中间对话栏宽度（存在消息时呈现） -->
         <InputArea v-if="store.messages && store.messages.length > 0" />
 
@@ -294,7 +313,7 @@
         title="拖拽调整面板宽度，双击恢复默认"
         data-test="right-panel-resizer"
         @pointerdown="onRightPanelResizerDown"
-        @dblclick="resetRightPanelWidth"
+        @dblclick="onResetRightPanelWidth"
       ></div>
 
       <!-- 右侧控制面板：必须用 v-show 而不是 v-if——卸载会重建组件，它内部的原生
@@ -366,6 +385,12 @@ import { formatPermMode } from './utils/markdown';
 import { buildMessageGroups, msgKey, type TurnGroupInfo } from './utils/turnGroups';
 import { useChatScroll } from './composables/useChatScroll';
 import { useIsMobile } from './composables/useViewport';
+import { chatLayoutWidth } from './composables/chatLayoutWidth';
+import {
+  pickWideDefaultTab,
+  WIDE_SPLIT_MIN_VIEWPORT_WIDTH,
+  wideRightPanelDefaultWidth,
+} from './composables/wideSplitPanel';
 import {
   RIGHT_PANEL_DEFAULT_WIDTH,
   RIGHT_PANEL_MAX_WIDTH,
@@ -473,6 +498,71 @@ const {
 // 拖拽期间给 #main 加 class：全局禁文本选择并强制 col-resize 光标
 const anyPanelResizing = computed(() => sidebarResizing.value || rightPanelResizing.value);
 
+// ── 宽屏 / 最大化侧边联动分栏 ──
+// 对话保持 960–1060px 舒适阅读宽；当桌面视口进入宽屏（>= 1440px）且处于
+// 默认 'wide' 布局时，自动展开右侧工作台（并按比例给定默认宽度，除非用户拖拽过），
+// 退回窄窗或切走布局模式时自动收起先前联动打开的右侧栏。
+const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1024);
+function onViewportResize() {
+  viewportWidth.value = window.innerWidth;
+}
+function hasCustomRightPanelWidth(): boolean {
+  try {
+    return localStorage.getItem(RIGHT_PANEL_WIDTH_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+const wideSplitActive = computed(
+  () => !isMobile.value
+    && store.initialized
+    && !store.settingsOpen
+    && chatLayoutWidth.value === 'wide'
+    && viewportWidth.value >= WIDE_SPLIT_MIN_VIEWPORT_WIDTH,
+);
+function syncWideSplitLayout() {
+  if (!hasCustomRightPanelWidth()) {
+    store.rightPanelWidth = wideSplitActive.value
+      ? wideRightPanelDefaultWidth(viewportWidth.value)
+      : RIGHT_PANEL_DEFAULT_WIDTH;
+  }
+  if (!wideSplitActive.value) {
+    store.leaveWideSplit();
+    return;
+  }
+  const tab = pickWideDefaultTab({
+    workdir: store.workdir,
+    bgTaskCount: store.currentSessionBackgroundTasks.length,
+    subagentTaskCount: store.subagentTasks.length,
+  });
+  if (store.rightPanelCollapsed) {
+    store.applyWideSplitExpand(tab);
+  } else if (tab && store.rightPanelTabs.length === 0 && store.rightPanelPicker) {
+    // 联动展开后停在选择页时，若随后打开了工作区或产生了任务，自动切入对应工作台
+    const wasAuto = store.wideSplitAutoExpanded;
+    store.openRightPanelTab(tab);
+    store.wideSplitAutoExpanded = wasAuto;
+  }
+}
+function onResetRightPanelWidth() {
+  resetRightPanelWidth();
+  if (wideSplitActive.value) {
+    store.rightPanelWidth = wideRightPanelDefaultWidth(viewportWidth.value);
+  }
+}
+watch(
+  [
+    wideSplitActive,
+    viewportWidth,
+    () => store.currentSessionName,
+    () => store.workdir,
+    () => store.currentSessionBackgroundTasks.length,
+    () => store.subagentTasks.length,
+  ],
+  () => { syncWideSplitLayout(); },
+  { immediate: true },
+);
+
 const chatScrollRef = ref<HTMLElement | null>(null);
 
 // 主题预览：从真实首页返回设置页继续编辑（退出预览模式、重开设置并落到外观与主题）
@@ -496,6 +586,8 @@ const showHeaderWorkdirPill = computed(() =>
 const taskDialogOpen = ref(false);
 // 决策记录入口：与计划入口同款悬浮面板（数据由 DecisionRecordPopup 自拉取）
 const decisionPanelOpen = ref(false);
+// 后台任务入口：与星链 / 决策同款头部胶囊 + 向下展开面板
+const bgTasksOpen = ref(false);
 const taskEntry = computed(() => taskEntryState({ plan: store.planData }));
 
 async function doExport(fmt: 'md' | 'html' | 'json') {
@@ -503,12 +595,37 @@ async function doExport(fmt: 'md' | 'html' | 'json') {
   await store.exportSession(fmt);
 }
 
-// 文档级点击统一收起头部悬浮层（导出菜单/计划面板）；按钮与面板内部
-// 用 @click.stop 挡泡，避免点开即关
+function toggleBgTasks() {
+  const next = !bgTasksOpen.value;
+  closeHeaderPopovers();
+  bgTasksOpen.value = next;
+}
+
+function toggleTaskDialog() {
+  const next = !taskDialogOpen.value;
+  closeHeaderPopovers();
+  taskDialogOpen.value = next;
+}
+
+function toggleDecisionPanel() {
+  const next = !decisionPanelOpen.value;
+  closeHeaderPopovers();
+  decisionPanelOpen.value = next;
+}
+
+function toggleExportMenu() {
+  const next = !showExportMenu.value;
+  closeHeaderPopovers();
+  showExportMenu.value = next;
+}
+
+// 文档级点击统一收起头部悬浮层（导出菜单/计划/决策/后台任务面板）；
+// 按钮与面板内部用 @click.stop 挡泡，避免点开即关
 function closeHeaderPopovers() {
   showExportMenu.value = false;
   taskDialogOpen.value = false;
   decisionPanelOpen.value = false;
+  bgTasksOpen.value = false;
 }
 
 const statusTokenPct = computed(() => {
@@ -741,7 +858,7 @@ async function onNavJump(payload: { index: number; id: number }) {
 // 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
 const railRef = ref<InstanceType<typeof MessageNavRail> | null>(null);
 function refreshRail() {
-  railRef.value?.refresh();
+  railRef.value?.refresh?.();
 }
 function getUserMsgElements(): HTMLElement[] {
   return Array.from(chatScrollRef.value?.querySelectorAll('.msg-user') ?? []);
@@ -973,6 +1090,8 @@ function onGlobalKeydown(e: KeyboardEvent) {
 let bgTaskPollTimer: number | undefined;
 
 onMounted(() => {
+  onViewportResize();
+  window.addEventListener('resize', onViewportResize);
   document.addEventListener('click', closeHeaderPopovers);
   window.addEventListener('keydown', onGlobalKeydown);
   void syncInitialWindowMaximized();
@@ -1012,6 +1131,7 @@ onMounted(() => {
   ensureBodyObserver();
 });
 onUnmounted(() => {
+  window.removeEventListener('resize', onViewportResize);
   document.removeEventListener('click', closeHeaderPopovers);
   clearInterval(bgTaskPollTimer);
   window.removeEventListener('keydown', onGlobalKeydown);
@@ -1403,6 +1523,8 @@ onUnmounted(() => {
   flex-direction: column;
   min-width: 0;
   position: relative;
+  container-type: inline-size;
+  container-name: center-pane;
 }
 
 #chat-header {
@@ -1601,6 +1723,11 @@ onUnmounted(() => {
   color: var(--xy-text, var(--text));
   border-color: var(--xy-border, var(--border));
 }
+.chip-btn.active {
+  background: var(--xy-active, var(--bg3));
+  color: var(--xy-text, var(--text));
+  border-color: var(--xy-border-strong, var(--border));
+}
 
 /* ── 工具栏按钮图标化收纳 ──
    计划/决策/导出/Git 分支四个胶囊带文字约需 280px，再加会话名与栏内边距，
@@ -1609,10 +1736,12 @@ onUnmounted(() => {
    ≤430 只留图标（图标 + 内边距约 34px，四个按钮不足 150px） */
 @container chat-header (max-width: 430px) {
   #chat-header .chip-label,
+  #chat-header :deep(.bg-entry-btn .chip-label),
   #chat-header .git-branch-label {
     display: none;
   }
-  #chat-header .chip-btn {
+  #chat-header .chip-btn,
+  #chat-header :deep(.bg-entry-btn) {
     padding: 4px 7px;
     gap: 4px;
   }
@@ -1622,7 +1751,8 @@ onUnmounted(() => {
   }
   /* 数字角标改成图标右上角的小圆点：不再横向占位，窄栏才能给会话名留出空间 */
   #chat-header .task-entry-badge,
-  #chat-header .decision-entry-badge {
+  #chat-header .decision-entry-badge,
+  #chat-header :deep(.bg-entry-badge) {
     position: absolute;
     top: -4px;
     right: -4px;

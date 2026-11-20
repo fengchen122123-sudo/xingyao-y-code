@@ -198,3 +198,62 @@ it('decision_recorded 带其他会话 session_id：只推进 tick，不累加未
   expect(store.decisionUnread).toBe(1);
   expect(store.decisionHasRecords).toBe(true);
 });
+
+it('打开「星链」与「决策」悬浮面板互斥，不会同时叠层显示', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  store.decisionHasRecords = true;
+  store.planData = {
+    title: '任务',
+    progress: 0,
+    items: [{ id: '1', text: '第一步', status: 'in_progress' }],
+  };
+  const wrapper = mount(App, { global: { stubs } });
+
+  await wrapper.get('[data-test="task-entry"]').trigger('click');
+  expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="decision-dialog"]').exists()).toBe(false);
+
+  await wrapper.get('[data-test="decision-entry"]').trigger('click');
+  expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(false);
+  expect(wrapper.find('[data-test="decision-dialog"]').exists()).toBe(true);
+
+  await wrapper.get('[data-test="task-entry"]').trigger('click');
+  expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="decision-dialog"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('后台任务入口收进会话头部，点击向下展开卡片且与「星链 / 决策」互斥', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  store.currentSessionName = 'sess-A';
+  store.backgroundTasks = [
+    { task_id: 't1', command: 'pytest -q', status: 'running', running_time: '10s', session_id: 'sess-A' },
+  ];
+  store.planData = {
+    title: '任务',
+    progress: 0,
+    items: [{ id: '1', text: '第一步', status: 'in_progress' }],
+  };
+  const wrapper = mount(App, { global: { stubs } });
+
+  const header = wrapper.get('#chat-header');
+  expect(header.find('[data-test="bg-bar"]').exists()).toBe(true);
+  expect(header.find('[data-test="bg-bar-count"]').text()).toBe('1');
+
+  await header.get('[data-test="bg-bar-details"]').trigger('click');
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(false);
+
+  // 打开「星链」会互斥关闭后台任务下拉卡片
+  await header.get('[data-test="task-entry"]').trigger('click');
+  expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
+
+  // 再打开后台任务会互斥关闭「星链」
+  await header.get('[data-test="bg-bar-details"]').trigger('click');
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(false);
+  wrapper.unmount();
+});

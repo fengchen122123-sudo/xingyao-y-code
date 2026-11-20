@@ -230,6 +230,8 @@ export interface DecisionAuditRecentItem {
   answer?: string;
   /** 记录唯一 ID：点开某条时用它回查完整请求/响应 */
   trace_id?: string;
+  /** 归属会话名（空串表示全局探针或无归属记录） */
+  session_id?: string;
 }
 
 // get_decision_record_detail() 单条决策记录：发给 JEV 的请求 + 上游返回的答案
@@ -290,6 +292,10 @@ export interface DecisionAuditSummary {
   today_shadow_count: number;
   today_adopted_count: number;
   today_fallback_count: number;
+  // 当前作用域（会话或全局）的累计决策次数
+  session_total_count?: number;
+  // 全部会话今日累计决策次数
+  global_today_count?: number;
   // 是否出现过真实业务决策（后端排除 scene="probe" 的探针记录）
   has_business_records?: boolean;
   // 本次汇总是否按会话过滤了 today_*/recent（true=会话口径，false=全局口径）
@@ -800,14 +806,32 @@ export interface FileNode {
   children?: FileNode[];
 }
 
+export type PlanTaskStatus =
+  | 'todo'
+  | 'in_progress'
+  | 'done'
+  | 'failed'
+  | 'blocked'
+  | 'cancelled';
+
 export interface PlanTaskItem {
   id: string;
   text: string;
-  status: 'todo' | 'in_progress' | 'done';
+  status: PlanTaskStatus;
+  stage?: string;
+  kind?: string;
+  depends_on?: string[];
+  files?: string[];
+  verification?: string;
+  verification_type?: string;
+  attempts?: number;
+  result?: string;
+  error?: string;
   // 子 Agent 超时接管可见性；plan_updated 快照是可恢复事实源
   execution_mode?: string;
   owner?: string;
   takeover_required?: boolean;
+  handoff_task_id?: string;
   handoff_reason?: string;
   takeover_sequence?: number;
   handoff_note?: string;

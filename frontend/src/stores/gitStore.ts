@@ -231,6 +231,13 @@ export const useGitStore = defineStore('git', {
       this._applyResult(res);
     },
 
+    async unstageAll() {
+      const paths = this.snapshot?.staged.map((f) => f.path) ?? [];
+      if (paths.length === 0) return;
+      const res = await callApi<any>('git_unstage', this.workdir, paths);
+      this._applyResult(res);
+    },
+
     async discard(path: string) {
       // Restore 未提交内容为高风险：走 preview → 确认 → execute（§13）
       const res = await callApi<any>('git_preview_risk', this.workdir, 'discard_changes', { paths: [path] });
@@ -286,6 +293,19 @@ export const useGitStore = defineStore('git', {
       this.diffLoading = true;
       try {
         const res = await callApi<any>('git_load_diff', this.workdir, path, staged, '', '');
+        this._applyResult(res);
+        this.diff = res.ok ? res.diff : null;
+      } finally {
+        this.diffLoading = false;
+      }
+    },
+
+    async loadCommitDiff(left: string, right: string) {
+      this.selectedPath = `commit:${right}`;
+      this.selectedStaged = false;
+      this.diffLoading = true;
+      try {
+        const res = await callApi<any>('git_load_diff', this.workdir, '', false, left, right);
         this._applyResult(res);
         this.diff = res.ok ? res.diff : null;
       } finally {

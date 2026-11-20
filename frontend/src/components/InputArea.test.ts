@@ -165,8 +165,124 @@ it('打开斜杠补全面板时 ArrowDown 高亮不被 input 事件重置，Ente
 
   await editor.trigger('keydown', { key: 'Enter' });
   expect(sendSpy).not.toHaveBeenCalled();
-  expect(editor.element.textContent).toBe('/beta ');
+  // 选中技能后渲染为胶囊（标签去掉前导 /，保留原始 /beta 在 composerText）
+  expect(editor.find('.ce-chip-skill').exists()).toBe(true);
+  expect(editor.find('.ce-chip-skill .ce-chip-label').text()).toBe('beta');
+  expect(editor.find('.ce-chip-skill .ce-chip-icon polygon').exists()).toBe(true);
+  expect(editor.element.textContent).toBe('beta ');
   expect(store._getSessionRuntime().composerText).toBe('/beta ');
+  wrapper.unmount();
+});
+
+it('斜杠面板技能项渲染星盘图标，选中技能后像对话一样显示为胶囊且删除一次全删', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  store.slashCommands = [
+    { name: '/goal', usage: '/goal <目标>', summary: '目标模式', kind: 'hybrid' } as any,
+  ];
+  store.skills = [
+    { id: 's1', name: '公众号排版', short_id: 'gzh-design', description: '排版引擎', enabled: true } as any,
+  ];
+  const sendSpy = vi.spyOn(store, 'sendMessage').mockResolvedValue(undefined);
+  (window as any).pywebview = {
+    api: {
+      search_sessions: vi.fn().mockResolvedValue({
+        ok: true,
+        sessions: [{ name: '缓存改造', count: 3, updated_at: '', workdir: '' }],
+      }),
+      search_workspace_files: vi.fn().mockResolvedValue({ files: [] }),
+    },
+  };
+
+  try {
+    const wrapper = mount(InputArea, { attachTo: document.body });
+    const editor = await typeInto(wrapper, '@缓存');
+    await flushPromises();
+    await editor.trigger('keydown', { key: 'Tab' });
+    expect(editor.find('.ce-chip-session').exists()).toBe(true);
+
+    // 在对话胶囊后输入 /g，并把光标放到末尾，验证命令图标与技能星盘 SVG 图标
+    const el = editor.element as HTMLElement;
+    el.appendChild(document.createTextNode('/g'));
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const sel = document.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    await editor.trigger('input');
+    const sgItems = wrapper.findAll('.sg-item');
+    expect(sgItems).toHaveLength(2);
+    expect(sgItems[0].find('.sg-icon').text()).toBe('⌘');
+    expect(sgItems[1].find('.sg-icon svg polygon').exists()).toBe(true);
+
+    // 选中 /gzh-design：对话胶囊与技能胶囊并排显示
+    await editor.trigger('keydown', { key: 'ArrowDown' });
+    await editor.trigger('keydown', { key: 'Enter' });
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(editor.find('.ce-chip-session').exists()).toBe(true);
+    expect(editor.find('.ce-chip-skill').exists()).toBe(true);
+    expect(editor.find('.ce-chip-skill .ce-chip-label').text()).toBe('gzh-design');
+    expect(store._getSessionRuntime().composerText).toBe('@{缓存改造} /gzh-design ');
+
+    // 点选技能胶囊并按 Backspace：整个技能胶囊一次删光，不影响前面的对话胶囊
+    const skillChip = el.querySelector('.ce-chip-skill') as HTMLElement;
+    skillChip.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    await editor.trigger('keydown', { key: 'Backspace' });
+    expect(editor.find('.ce-chip-skill').exists()).toBe(false);
+    expect(editor.find('.ce-chip-session').exists()).toBe(true);
+    expect(store._getSessionRuntime().composerText).toBe('@{缓存改造}  ');
+    wrapper.unmount();
+  } finally {
+    delete (window as any).pywebview;
+  }
+});
+
+it('斜杠面板选中内置命令（如 /goal）后渲染为胶囊，删除时整块删除，发送仍保留原始 /goal', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  store.slashCommands = [
+    { name: '/goal', usage: '/goal <目标>', summary: '目标模式', kind: 'hybrid' } as any,
+  ];
+  const sendSpy = vi.spyOn(store, 'sendMessage').mockResolvedValue(undefined);
+
+  const wrapper = mount(InputArea, { attachTo: document.body });
+  const editor = await typeInto(wrapper, '/go');
+  expect(wrapper.findAll('.sg-item')).toHaveLength(1);
+
+  await editor.trigger('keydown', { key: 'Enter' });
+  expect(sendSpy).not.toHaveBeenCalled();
+  expect(editor.find('.ce-chip-command').exists()).toBe(true);
+  expect(editor.find('.ce-chip-command .ce-chip-label').text()).toBe('goal');
+  expect(store._getSessionRuntime().composerText).toBe('/goal ');
+
+  // 退格删掉尾随空格后再退格：整个 /goal 胶囊一次全删
+  const el = editor.element as HTMLElement;
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  const sel = document.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+  el.lastChild!.textContent = '';
+  await editor.trigger('input');
+  await editor.trigger('keydown', { key: 'Backspace' });
+  expect(editor.find('.ce-chip-command').exists()).toBe(false);
+  expect(store._getSessionRuntime().composerText).toBe('');
+
+  // 重新选中并发送：对外仍提交原始 '/goal '
+  el.textContent = '/go';
+  const r2 = document.createRange();
+  r2.selectNodeContents(el);
+  r2.collapse(false);
+  sel?.removeAllRanges();
+  sel?.addRange(r2);
+  await editor.trigger('input');
+  await editor.trigger('keydown', { key: 'Enter' });
+  expect(editor.find('.ce-chip-command').exists()).toBe(true);
+  await editor.trigger('keydown', { key: 'Enter' });
+  expect(sendSpy).toHaveBeenCalledWith('/goal ', []);
+  expect(editor.find('.ce-chip-command').exists()).toBe(false);
   wrapper.unmount();
 });
 

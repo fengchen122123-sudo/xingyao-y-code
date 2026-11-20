@@ -16,7 +16,10 @@
           @mousedown.prevent="emit('select', it)"
           @mouseenter="emit('hover', i)"
         >
-          <span class="sg-icon">{{ it.icon }}</span>
+          <span class="sg-icon">
+            <AppIcon v-if="it.iconName" :name="it.iconName" :size="14" :stroke-width="2.1" />
+            <template v-else>{{ it.icon }}</template>
+          </span>
           <span class="sg-label">{{ it.label }}</span>
           <span class="sg-desc">{{ it.desc }}</span>
         </div>
@@ -27,9 +30,14 @@
 </template>
 
 <script setup lang="ts">
+import AppIcon from './AppIcon.vue';
+import type { IconName } from './iconPaths';
+
 export interface SuggestItem {
   key: string;
   icon: string;
+  /** 可选 SVG 图标名（ICON_PATHS），设置时替代文本/emoji icon 渲染 */
+  iconName?: IconName;
   label: string;
   desc: string;
   // 选中后写回输入框的完整词（含 / 或 @ 前缀）
@@ -98,7 +106,9 @@ const emit = defineEmits<{
 }
 .sg-icon {
   width: 18px;
-  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
   color: var(--accent);
   font-size: 12px;

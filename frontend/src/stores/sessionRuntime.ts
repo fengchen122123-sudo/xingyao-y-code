@@ -52,6 +52,9 @@ export interface SessionRuntimeState {
   // 保存/恢复——切会话不残留上一个会话的查看对象，否则 SubagentPane 会用
   // 新会话名去查上一会话的任务 id，详情串场
   subagentDetailId?: string;
+  // 后台回合先产生事件时，若尚未拉过全量历史，切回时补拉一次，避免覆盖旧消息
+  needsHistoryHydration?: boolean;
+  historyHydrated?: boolean;
 }
 
 export function createSessionRuntime(): SessionRuntimeState {

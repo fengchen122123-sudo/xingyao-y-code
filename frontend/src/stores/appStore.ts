@@ -23,6 +23,8 @@ import type {
   BridgeEvent,
   BackgroundVideoInfo,
   PlanData,
+  PlanTaskItem,
+  PlanTaskStatus,
   BackgroundTask,
   TokenUsage,
   ContextBreakdownItem,
@@ -901,6 +903,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 仅由顶栏“切换面板”按钮或底栏 Git 分支项手动展开；
     // 展开状态不持久化，每次启动都从收起开始
     rightPanelCollapsed: true,
+    // 宽屏/最大化自动联动分栏的瞬态标记：用户手动收起后在本次宽屏态内不再强弹回，
+    // 退回窄窗后自动复位，由宽屏联动自动展开的部分会在退出宽屏时同步收起。
+    wideSplitDismissed: false,
+    wideSplitAutoExpanded: false,
     // “打开标签页”选择页可见性：顶栏按钮等中性入口展开面板时先选择要看的内容，
     // 底栏 Git 分支项等定向入口经 openRightPanelTab 直接开页签（不持久化）。
     // 页签全部关闭时也回到选择页
@@ -1189,6 +1195,22 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 批次D：当前会话是否在排队等其他会话的回合释放锁（turn_queued）
     currentSessionQueued(state): boolean {
       return !!state.currentSessionName && state.queuedSessions.includes(state.currentSessionName);
+    },
+
+    // 当前查看的会话是否属于「秘书」分组
+    currentSessionIsSecretary(state): boolean {
+      const name = state.currentSessionName;
+      if (!name || !Array.isArray(state.sessionGroups)) return false;
+      for (const g of state.sessionGroups) {
+        const hit = Array.isArray(g?.sessions)
+          ? g.sessions.find(s => s.name === name)
+          : undefined;
+        if (hit) {
+          if ((g as { is_secretary?: boolean }).is_secretary) return true;
+          return typeof hit.secretary_name === 'string';
+        }
+      }
+      return false;
     },
 
     // 当前会话排队中的消息（输入框上方排队条渲染源）
@@ -1654,8 +1676,40 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 直接显示激活页签；一个页签都没开过 → 先进选择页
     toggleRightPanel() {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
+      this.wideSplitAutoExpanded = false;
+      this.wideSplitDismissed = this.rightPanelCollapsed;
       if (!this.rightPanelCollapsed) {
         this.rightPanelPicker = this.rightPanelTabs.length === 0;
+      }
+    },
+
+    // 宽屏联动展开/收起右侧面板：仅当用户未在当前宽屏周期内手动关闭时介入
+    applyWideSplitExpand(this: any, tab: RightPanelTabId | null) {
+      if (this.wideSplitDismissed) return;
+      if (this.rightPanelTabs.length > 0) {
+        if (!this.rightPanelCollapsed) return;
+        this.rightPanelCollapsed = false;
+        this.rightPanelPicker = false;
+        this.wideSplitAutoExpanded = true;
+        return;
+      }
+      if (tab) {
+        this.openRightPanelTab(tab);
+        this.wideSplitAutoExpanded = true;
+        return;
+      }
+      if (this.rightPanelCollapsed) {
+        this.rightPanelCollapsed = false;
+        this.rightPanelPicker = true;
+        this.wideSplitAutoExpanded = true;
+      }
+    },
+
+    leaveWideSplit(this: any) {
+      this.wideSplitDismissed = false;
+      if (this.wideSplitAutoExpanded) {
+        this.rightPanelCollapsed = true;
+        this.wideSplitAutoExpanded = false;
       }
     },
 
@@ -1669,7 +1723,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (!this.rightPanelTabs.includes(tab)) this.rightPanelTabs.push(tab);
       this.rightPanelActiveTab = tab;
       this.rightPanelPicker = false;
-      if (opts?.expand !== false) this.rightPanelCollapsed = false;
+      if (opts?.expand !== false) {
+        this.rightPanelCollapsed = false;
+        this.wideSplitDismissed = false;
+        this.wideSplitAutoExpanded = false;
+      }
       // 详情页签缺省查看对象：只在本会话有后台任务时自动选第一个，
       // 其他会话的任务不跨会话代选（与执行条的会话过滤口径一致）
       if (tab === 'tasks' && !this.bgTaskDetailId && this.currentSessionBackgroundTasks.length) {
@@ -1731,6 +1789,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
     showRightPanelPicker(this: any) {
       this.rightPanelCollapsed = false;
       this.rightPanelPicker = true;
+      this.wideSplitDismissed = false;
+      this.wideSplitAutoExpanded = false;
     },
 
     // 把浏览器页签开进指定会话的右面板（会话归属）：当前会话直接开；
@@ -4055,8 +4115,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 竞态防护：快速连点不同会话时响应可能乱序返回，过期响应直接丢弃，
         // 避免高亮停在 B 会话却渲染出 A 会话的内容
         if (this.currentSessionName !== sessionName) return;
-        if (!runtime.running && runtime.messages.length === 0) {
+        if (!runtime.running && (runtime.messages.length === 0 || runtime.needsHistoryHydration)) {
           runtime.messages = pairHistoryToolMessages(res.messages || []);
+          runtime.needsHistoryHydration = false;
+          runtime.historyHydrated = true;
           // 历史分页元信息：后端首页游标写入顶层与 runtime（缓存命中分支靠 bind 恢复）
           this.historyHasMore = !!res.history_has_more;
           this.historyOldestId = res.history_oldest_id ?? null;
@@ -5172,7 +5234,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           // message_queue 快照渲染排队条目，气泡等补发回合的 turn_start）
           const trimmed = text.trim();
           if (trimmed) {
-            const runtimeMsgs = this._getSessionRuntime(sessionName).messages;
+            const targetRt = this._getSessionRuntime(sessionName);
+            targetRt.historyHydrated = true;
+            const runtimeMsgs = targetRt.messages;
             const lastMsg = runtimeMsgs[runtimeMsgs.length - 1];
             if (!(lastMsg && lastMsg.role === 'user' && lastMsg.content === trimmed)) {
               runtimeMsgs.push({ role: 'user', content: trimmed });
@@ -5920,6 +5984,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
 
       if (type === 'turn_start') {
         const turnSession = String(data.session_name || '');
+        if (switchedRuntime && turnSession) {
+          const targetRt = this._getSessionRuntime(turnSession);
+          if (!targetRt.historyHydrated) {
+            targetRt.needsHistoryHydration = true;
+          }
+        }
         // 新回合已经开始：上一轮的停止请求必定已生效，兜底定时器不得再对该会话解锁
         this._clearStopFallbackTimer(turnSession);
         // 记录活跃会话
@@ -5992,7 +6062,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           });
         }
         if (data.internal === 'bg_summary') {
-          this.notifyChatLocal('后台子代理任务已全部结束，正在自动汇总结果');
+          this.notifyChatLocal('后台子代理任务已全部结束，正在自动汇总结果', 'notice', turnSession || undefined);
+        } else if (data.internal === 'secretary_dispatch_summary') {
+          this.notifyChatLocal('派发任务已产生结果，秘书正在整理汇报', 'notice', turnSession || undefined);
         }
       }
 
@@ -6197,24 +6269,53 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const queuePositions = new Map(
             queued.map((it: any, index: number) => [String(it?.id || ''), index + 1]),
           );
-          const items = data.items.map((it: any) => ({
-            id: it.id || String(Math.random()),
-            // 后端计划项的正文字段是 subject（见 core/plan.py snapshot）
-            text: it.subject || it.text || it.title || '',
-            status: it.status === 'completed' || it.status === 'done' || it.status === 'x' ? 'done' : (it.status === 'in_progress' || it.status === '/' ? 'in_progress' : 'todo'),
-            execution_mode: String(it.execution_mode || ''),
-            owner: String(it.owner || ''),
-            takeover_required: Boolean(it.takeover_required),
-            handoff_reason: String(it.handoff_reason || ''),
-            takeover_sequence: Number(it.takeover_sequence || 0),
-            handoff_note: terminalStatuses.has(String(it.status || ''))
-              ? undefined
-              : it.execution_mode === 'main_takeover'
-                ? '子 Agent 已超时，主 Agent 正在接管并核查现场'
-                : it.execution_mode === 'takeover_queued'
-                  ? `等待主 Agent 接管（队列第 ${queuePositions.get(String(it.id || '')) || 1} 项）`
-                  : undefined,
-          }));
+          const mapPlanStatus = (raw: unknown): PlanTaskStatus => {
+            const s = String(raw || '').trim();
+            if (s === 'completed' || s === 'done' || s === 'x') return 'done';
+            if (s === 'in_progress' || s === '/') return 'in_progress';
+            if (s === 'failed') return 'failed';
+            if (s === 'blocked') return 'blocked';
+            if (s === 'cancelled') return 'cancelled';
+            return 'todo';
+          };
+          const items: PlanTaskItem[] = data.items.map((it: any) => {
+            const dependsOn = Array.isArray(it.depends_on)
+              ? it.depends_on.map((d: any) => String(d || '').trim()).filter(Boolean)
+              : [];
+            const files = Array.isArray(it.files)
+              ? it.files.map((f: any) => String(f || '').trim()).filter(Boolean)
+              : [];
+            const attempts = Number(it.attempts || 0);
+            const item: PlanTaskItem = {
+              id: it.id || String(Math.random()),
+              // 后端计划项的正文字段是 subject（见 core/plan.py snapshot）
+              text: it.subject || it.text || it.title || '',
+              status: mapPlanStatus(it.status),
+              execution_mode: String(it.execution_mode || ''),
+              owner: String(it.owner || ''),
+              takeover_required: Boolean(it.takeover_required),
+              handoff_reason: String(it.handoff_reason || ''),
+              takeover_sequence: Number(it.takeover_sequence || 0),
+              handoff_note: terminalStatuses.has(String(it.status || ''))
+                ? undefined
+                : it.execution_mode === 'main_takeover'
+                  ? '子 Agent 已超时，主 Agent 正在接管并核查现场'
+                  : it.execution_mode === 'takeover_queued'
+                    ? `等待主 Agent 接管（队列第 ${queuePositions.get(String(it.id || '')) || 1} 项）`
+                    : undefined,
+            };
+            if (it.stage) item.stage = String(it.stage).trim();
+            if (it.kind) item.kind = String(it.kind).trim();
+            if (dependsOn.length > 0) item.depends_on = dependsOn;
+            if (files.length > 0) item.files = files;
+            if (it.verification) item.verification = String(it.verification).trim();
+            if (it.verification_type) item.verification_type = String(it.verification_type).trim();
+            if (attempts > 0) item.attempts = attempts;
+            if (it.result) item.result = String(it.result).trim();
+            if (it.error) item.error = String(it.error).trim();
+            if (it.handoff_task_id) item.handoff_task_id = String(it.handoff_task_id).trim();
+            return item;
+          });
           const doneCount = items.filter((i: any) => i.status === 'done').length;
           const progress = items.length > 0 ? Math.round((doneCount / items.length) * 100) : 0;
           this.planData = {
@@ -6242,6 +6343,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
             : '子 Agent 已超时，主 Agent 正在接管并核查现场';
           const items = Array.isArray(this.planData.items) ? this.planData.items : [];
           const hidx = items.findIndex((i: any) => i.id === handoffId);
+          const taskId = String(handoffItem.handoff_task_id || data.source_task_id || '').trim();
           const patched = {
             execution_mode: handoffMode,
             owner: String(handoffItem.owner || ''),
@@ -6249,6 +6351,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
             handoff_reason: String(handoffItem.handoff_reason || ''),
             takeover_sequence: Number(handoffItem.takeover_sequence || 0),
             handoff_note: handoffNote,
+            ...(taskId ? { handoff_task_id: taskId } : {}),
           };
           if (hidx >= 0) {
             items[hidx] = { ...items[hidx], ...patched };

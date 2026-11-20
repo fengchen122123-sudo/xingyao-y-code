@@ -736,6 +736,8 @@
              故放在主题卡片之前（与位置语义一致：壁纸 → 玻璃 → 界面） -->
         <AppGlassCard />
 
+        <ChatLayoutWidthCard />
+
         <section class="appearance-settings-card">
           <GuiThemeSettings ref="themeEditorRef" />
         </section>
@@ -834,6 +836,7 @@ import TokenUsageSettingsLegacy from './TokenUsageSettingsLegacy.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 import BackgroundConvert from './BackgroundConvert.vue';
 import AppGlassCard from './AppGlassCard.vue';
+import ChatLayoutWidthCard from './ChatLayoutWidthCard.vue';
 import SystemSettings from './SystemSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
 import GrowthSettings from './GrowthSettings.vue';
@@ -2150,6 +2153,7 @@ onMounted(async () => {
 
 /* ── 外观与主题分区 ── */
 .appearance-section { width: 100%; min-width: 0; }
+.appearance-section > :deep(.app-glass-card) { max-width: 1080px; margin-left: auto; margin-right: auto; }
 .appearance-settings-card { width: 100%; min-width: 0; max-width: 1080px; margin: 0 auto; border: 1px solid var(--xy-border, var(--border)); border-radius: 14px; background: var(--xy-card, var(--bg1)); padding: 20px 24px; }
 .perm-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--border); }
 .perm-row h3 { margin: 0 0 6px; font-size: 14px; }

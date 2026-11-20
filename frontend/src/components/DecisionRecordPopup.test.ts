@@ -65,8 +65,9 @@ describe('DecisionRecordPopup', () => {
     // 昨天有决策、今天没有：仍要能看到最近记录，不能退化成空态
     expect(wrapper.find('[data-test="decision-pop-empty"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="decision-pop-list"]').text()).toContain('昨天那次判断');
-    // 今日计数照旧单独展示，明确是「本会话今日」
-    expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('本会话今日 0 次决策');
+    // 今日计数照旧单独展示，明确是「当前会话」口径
+    expect(wrapper.find('[data-test="decision-pop-status"]').text()).toContain('当前会话');
+    expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('今日0');
   });
 
   it('有记录：渲染统计行与最近记录列表（含影子标记与延迟）', async () => {
@@ -98,7 +99,11 @@ describe('DecisionRecordPopup', () => {
     expect(api.get_decision_audit_summary).toHaveBeenCalledWith(10, 'sess-A', true);
 
     expect(wrapper.find('[data-test="decision-pop-status"]').text()).toContain('已启用');
-    expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('今日 2 次决策');
+    const statsText = wrapper.find('[data-test="decision-pop-stats"]').text();
+    expect(statsText).toContain('今日2');
+    expect(statsText).toContain('影子1');
+    expect(statsText).toContain('采纳1');
+    expect(statsText).toContain('回退0');
     const list = wrapper.find('[data-test="decision-pop-list"]').text();
     // 场景显示中文标签：一眼看出这条记录在判什么
     expect(list).toContain('探针（连通性）');
@@ -110,6 +115,43 @@ describe('DecisionRecordPopup', () => {
     expect(list).toContain('→ main');
     // 采纳状态与回退原因互斥展示
     expect(list).toContain('已采纳');
+  });
+
+  it('任务级场景展示中文名称，长事由摘要完整展示不截断，且关闭按钮可触发 close', async () => {
+    const longDigest = '角色：explore；计划项：P1；工具成功：15；遗留报错工具：无；任务：【只读扫描盘点】检查 E 盘大体积目录与镜像分布情况完整保留';
+    mockApi({
+      get_decision_audit_summary: vi.fn(async () => ({
+        ok: true,
+        today_count: 4,
+        today_shadow_count: 2,
+        today_adopted_count: 1,
+        today_fallback_count: 1,
+        recent: [
+          { ts: '2026-10-20T21:25:29', scene: 'subagent_review', shadow: true, adopted: false, latency_ms: 625, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: longDigest, answer: 'accepted', trace_id: 't1' },
+          { ts: '2026-10-20T21:49:07', scene: 'loop_guard', shadow: false, adopted: true, latency_ms: 765, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '步数：4/200', answer: 'pivot', trace_id: 't2' },
+          { ts: '2026-10-20T21:55:00', scene: 'plan_recovery', shadow: false, adopted: false, latency_ms: 510, fallback_reason: 'timeout', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '计划项 P2 重试判断', answer: '', trace_id: 't3' },
+          { ts: '2026-10-20T21:58:00', scene: 'memory_filter', shadow: true, adopted: false, latency_ms: 480, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '待沉淀记忆候选项', answer: 'keep_facts_only', trace_id: 't4' },
+        ],
+      })),
+    });
+    useAppStore().currentSessionName = 'sess-A';
+    const wrapper = mount(DecisionRecordPopup);
+    await flushPromises();
+
+    const listText = wrapper.find('[data-test="decision-pop-list"]').text();
+    expect(listText).toContain('子代理验收');
+    expect(listText).toContain('验收通过');
+    expect(listText).toContain('循环止损');
+    expect(listText).toContain('改换思路');
+    expect(listText).toContain('计划恢复');
+    expect(listText).toContain('回退：timeout');
+    expect(listText).toContain('记忆筛选');
+    expect(listText).toContain('仅留事实');
+    // 超出 72 字的摘要也完整展示，不再截断省略
+    expect(listText).toContain(longDigest);
+
+    await wrapper.find('[data-test="decision-pop-close"]').trigger('click');
+    expect(wrapper.emitted('close')).toBeTruthy();
   });
 
   it('会话名为空（新会话懒创建阶段）时不请求审计汇总，直接显示空态', async () => {
@@ -295,6 +337,52 @@ describe('DecisionRecordPopup', () => {
 
     expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(2);
     expect(store.decisionUnread).toBe(0);
+    wrapper.unmount();
+  });
+
+  it('明确展示当前会话累计决策数量与全局今日计数，超过 10 条时支持查看全部', async () => {
+    const api = mockApi({
+      get_decision_audit_summary: vi.fn(async (limit?: number) => ({
+        ok: true,
+        today_count: 12,
+        today_shadow_count: 0,
+        today_adopted_count: 12,
+        today_fallback_count: 0,
+        session_total_count: 15,
+        global_today_count: 29,
+        recent: Array.from({ length: limit === 10 ? 10 : 15 }, (_, idx) => ({
+          ts: `2026-11-20T16:00:${String(idx).padStart(2, '0')}`,
+          scene: 'auto_permission',
+          shadow: false,
+          adopted: true,
+          latency_ms: 500,
+          fallback_reason: '',
+          model_id: 'NeoHorse-Jev-4B',
+          answers_digest: '',
+          state_digest: `命令 ${idx + 1}`,
+          answer: 'allow',
+          trace_id: `t-${idx}`,
+        })),
+      })),
+    });
+    useAppStore().currentSessionName = 'sess-A';
+    const wrapper = mount(DecisionRecordPopup);
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="decision-pop-scope"]').text()).toContain('当前会话 · 共 15 次');
+    expect(wrapper.find('[data-test="decision-pop-session-total"]').text()).toContain('15');
+    expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('本会话今日12');
+    expect(wrapper.find('[data-test="decision-pop-global-hint"]').text()).toContain('全部会话今日共 29 次');
+    expect(wrapper.find('.foot-hint').text()).toContain('本会话共 15 条 · 显示最近 10 条');
+
+    const loadMoreBtn = wrapper.find('[data-test="decision-pop-load-more"]');
+    expect(loadMoreBtn.exists()).toBe(true);
+    await loadMoreBtn.trigger('click');
+    await flushPromises();
+
+    expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(50, 'sess-A', true);
+    expect(wrapper.findAll('[data-test="decision-pop-item"]')).toHaveLength(15);
+    expect(wrapper.find('[data-test="decision-pop-load-more"]').exists()).toBe(false);
     wrapper.unmount();
   });
 });

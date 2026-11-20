@@ -36,15 +36,17 @@ describe('useSuggest', () => {
 
     const inputVal = ref('/');
     const taRef = ref<HTMLTextAreaElement | null>(null);
-    const { detectToken, suggestItems, suggest } = useSuggest(inputVal, taRef);
+    const { detectToken, suggestItems, suggest, skillIds } = useSuggest(inputVal, taRef);
 
     taRef.value = mockTextarea('/', 1);
     detectToken();
 
     expect(suggest.value?.mode).toBe('command');
-    // 只有 enabled 的技能才出现
+    // 只有 enabled 的技能才出现，且使用侧栏同款星盘图标（sparkle）
     expect(suggestItems.value.length).toBe(1);
     expect(suggestItems.value[0].label).toBe('/debug');
+    expect(suggestItems.value[0].iconName).toBe('sparkle');
+    expect(skillIds.value).toEqual(['debug']);
   });
 
   it('斜杠命令：前缀过滤只返回匹配的候选', () => {
@@ -815,7 +817,7 @@ describe('useSuggest', () => {
 
     const inputVal = ref('/');
     const taRef = ref<HTMLTextAreaElement | null>(null);
-    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+    const { detectToken, suggestItems, skillIds, commandIds } = useSuggest(inputVal, taRef);
 
     taRef.value = mockTextarea('/', 1);
     detectToken();
@@ -825,6 +827,9 @@ describe('useSuggest', () => {
     expect(suggestItems.value.map(it => it.label)).toEqual(['/goal', '/graph']);
     expect(suggestItems.value[0].key).toBe('cmd:/goal');
     expect(suggestItems.value[1].key).toBe('skill:graph');
+    // 与内置命令重名的技能 short_id 不进入 skillIds，避免 /goal 被渲染成技能胶囊
+    expect(commandIds.value).toEqual(['goal']);
+    expect(skillIds.value).toEqual(['graph']);
   });
 
   it('斜杠命令：选中命令后插入 name 加一个空格', () => {

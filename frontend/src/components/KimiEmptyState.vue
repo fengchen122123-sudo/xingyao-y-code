@@ -16,12 +16,14 @@
         @select="applySuggest"
         @hover="i => suggestIndex = i"
       />
-      <!-- 富文本输入框：@ 引用渲染成胶囊（带图标、整块选中、退格一次全删） -->
+      <!-- 富文本输入框：@ 引用与 / 技能渲染成胶囊（带图标、整块选中、退格一次全删） -->
       <div class="kimi-field">
         <ComposerEditor
           ref="editorRef"
           v-model="inputVal"
           :min-height="75"
+          :skill-ids="skillIds"
+          :command-ids="commandIds"
           placeholder="尽管问，或做个任务… / 技能 @ 文件"
           @keydown="handleKeydown"
           @input="detectToken"
@@ -97,6 +99,7 @@
     </div>
 
     <div
+      v-if="!isSecretarySession"
       ref="workdirBtnRef"
       class="kimi-footer-workdir"
       @click.stop="toggleWorkdirDropdown"
@@ -106,9 +109,26 @@
       <span class="model-chevron" aria-hidden="true">▾</span>
     </div>
 
-    <!-- 项目感知推荐提示词：仅在绑定项目工作区且存在建议时出现，自由对话保持留白 -->
+    <!-- 秘书会话快捷起手建议（跨项目分析、任务进度、个人记忆） -->
     <div
-      v-if="projectPromptSuggestions.length"
+      v-if="isSecretarySession"
+      class="kimi-project-prompts"
+      data-test="secretary-prompt-suggestions"
+    >
+      <button
+        v-for="item in secretaryPromptSuggestions"
+        :key="item.id"
+        type="button"
+        class="kimi-prompt-chip"
+        data-test="secretary-prompt-chip"
+        :title="item.prompt"
+        @click="applyProjectPrompt(item)"
+      >{{ item.label }}</button>
+    </div>
+
+    <!-- 项目感知推荐提示词：仅在非秘书、绑定项目工作区且存在建议时出现，自由对话保持留白 -->
+    <div
+      v-if="!isSecretarySession && projectPromptSuggestions.length"
       class="kimi-project-prompts"
       data-test="project-prompt-suggestions"
     >
@@ -211,8 +231,28 @@ const isGlobalWorkdir = computed(() =>
   !store.workdir || store.currentWorkdirLabel === '对话' || store.currentWorkdirLabel === 'GLOBAL'
 );
 
+const isSecretarySession = computed(() =>
+  Boolean((store as { currentSessionIsSecretary?: boolean }).currentSessionIsSecretary),
+);
+const secretaryPromptSuggestions = [
+  {
+    id: 'sec-analyze-history',
+    label: '分析近期历史会话与进展',
+    prompt: '帮我盘点所有项目最近的活跃历史会话，汇总已完成事项、遗留问题和下一步建议。',
+  },
+  {
+    id: 'sec-list-dispatches',
+    label: '查看近期派发任务状态',
+    prompt: '查询最近派出去的任务（list_dispatches）现在的状态、完成结论或需要我拍板的事项。',
+  },
+  {
+    id: 'sec-manage-memory',
+    label: '查看或更新个人偏好记忆',
+    prompt: '查看你当前记下的跨项目个人偏好记忆，看看有哪些信息需要补充或更新。',
+  },
+];
 const projectPromptSuggestions = computed(() =>
-  isGlobalWorkdir.value ? [] : store.workspacePromptSuggestions,
+  isGlobalWorkdir.value || isSecretarySession.value ? [] : store.workspacePromptSuggestions,
 );
 
 function normalizeDirKey(path: string): string {
@@ -313,7 +353,7 @@ function closeComposerMenus() {
 }
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, uploadFiles, openAttachmentImage } = useAttachments();
-const { suggestItems, suggestIndex, suggestEmpty, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, composerControl);
+const { suggestItems, suggestIndex, suggestEmpty, skillIds, commandIds, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, composerControl);
 
 // 输入卡片容器：拖拽文件进入时高亮提示，drop 由原生事件桥（pywebview）提供完整路径
 const kimiCardRef = ref<HTMLElement | null>(null);

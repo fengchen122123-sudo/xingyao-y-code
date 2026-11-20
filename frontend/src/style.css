@@ -89,8 +89,35 @@
   --xy-shadow-pop: 0 14px 36px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.09);
   --xy-modal-mask: rgba(0, 0, 0, 0.48);
 
-  /* 对话内容列宽度：对齐设计稿 max-w-[820px] 居中列宽 */
+  /* 对话内容列宽度：默认保持 960–1060px 舒适阅读栏宽，宽屏或最大化时配合
+     右侧工作台联动分栏（App.vue）；根级保留回退供脱离 #center 的测试使用。 */
+  --chat-col-width: clamp(820px, 78vw, 1060px);
+  --empty-col-width: clamp(660px, 52vw, 820px);
+}
+
+html[data-chat-width="compact"] {
   --chat-col-width: 820px;
+  --empty-col-width: 660px;
+}
+html[data-chat-width="full"] {
+  --chat-col-width: max(820px, calc(100vw - 116px));
+  --empty-col-width: clamp(660px, 70vw, 1120px);
+}
+
+/* 对话容器内实际列宽：直接以 #center（center-pane）内联尺寸为基准，
+   侧栏/右侧面板开合或窗口最大化时实时联动；默认 wide 档上限收在 1060px，
+   避免超宽单栏把对话与输入框拉成扁平长带。 */
+#center > * {
+  --chat-col-width: clamp(820px, 92cqw, 1060px);
+  --empty-col-width: clamp(660px, 68cqw, 820px);
+}
+html[data-chat-width="compact"] #center > * {
+  --chat-col-width: 820px;
+  --empty-col-width: 660px;
+}
+html[data-chat-width="full"] #center > * {
+  --chat-col-width: max(820px, calc(100cqw - 116px));
+  --empty-col-width: clamp(660px, 72cqw, 1120px);
 }
 
 /* 内置深色 / 未指定主题：精确对齐 xingyao-clean-ui.html data-xy-theme="dark" */
@@ -644,7 +671,7 @@ button {
   /* 补全面板 .suggest-panel 以此为绝对定位锚点（缺失会漂到窗口顶部） */
   position: relative;
   width: 100%;
-  max-width: 660px;
+  max-width: var(--empty-col-width, 660px);
   background: var(--theme-region-surface, var(--bg1));
   border: 1px solid var(--xy-border-strong, var(--border));
   border-radius: 16px;
@@ -838,7 +865,7 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
 .kimi-project-prompts {
   margin-top: 14px;
   width: 100%;
-  max-width: 660px;
+  max-width: var(--empty-col-width, 660px);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
