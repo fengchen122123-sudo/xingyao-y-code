@@ -154,6 +154,54 @@ def test_safe_part_boundary_rejects_utf16_like_head(tmp_path):
         assert not build_release._looks_like_utf16_text(f.read(512))
 
 
+def test_build_release_body_appends_component_digest_line(tmp_path):
+    import hashlib
+
+    from core.components import _parse_component_digest
+
+    name = "playwright-component-1.62.0.zip"
+    payload = b"fake-component-zip-payload" * 200
+    (tmp_path / name).write_bytes(payload)
+    expected = hashlib.sha256(payload).hexdigest()
+
+    main_digest = "a" * 64
+    with patch.object(publish_release, "changelog_section", return_value="- 修复若干问题"):
+        body = publish_release.build_release_body(
+            "1.2.3",
+            main_digest,
+            ["XingYaoCode-setup-1.2.3.part1", name],
+            parts_dir=str(tmp_path),
+        )
+
+    assert f"SHA256: {main_digest}" in body
+    assert "### 组件包校验" in body
+    assert f"{name}  SHA256={expected}" in body
+    assert _parse_component_digest(body, name) == expected
+
+
+def test_build_release_body_skips_component_section_without_zip(tmp_path):
+    main_digest = "b" * 64
+    with patch.object(publish_release, "changelog_section", return_value="- 修复若干问题"):
+        # 不传 parts_dir：完全保持旧格式
+        legacy = publish_release.build_release_body(
+            "1.2.3", main_digest, ["XingYaoCode-setup-1.2.3.part1"]
+        )
+        # 传了 parts_dir 但里面没有 .zip：同样不追加组件小节
+        (tmp_path / "XingYaoCode-setup-1.2.3.part1").write_bytes(b"x" * 64)
+        with_bin_only = publish_release.build_release_body(
+            "1.2.3",
+            main_digest,
+            ["XingYaoCode-setup-1.2.3.part1"],
+            parts_dir=str(tmp_path),
+        )
+
+    for body in (legacy, with_bin_only):
+        assert "### 组件包校验" not in body
+        assert ".zip  SHA256=" not in body
+        assert f"SHA256: {main_digest}" in body
+    assert legacy == with_bin_only
+
+
 def _load_verify_vendor():
     import importlib.util
 
