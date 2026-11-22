@@ -1,22 +1,22 @@
 <template>
-  <!-- 电脑操控安全条（设计 16.1）：插在聊天标题栏下方、滚动区外——
-       对话滚动时保持可见；只对活动期 run 渲染（idle/stopped/completed/completing 不显示），
-       且只在本会话发起的 run 里渲染：其他会话正在操控时不串显到当前会话。
-       浏览器操控（target=browser）不渲染本条：右侧直接呈现可围观的浏览器，
-       停止入口收进浏览器工具栏，避免「操作浏览器」时冒出整套操控界面。 -->
   <div
-    v-if="store.computerBarVisibleInCurrentSession && !store.computerRunIsBrowser"
+    v-if="store.computerControlBarVisible"
     class="computer-control-bar"
     data-test="computer-control-bar"
     data-theme-region="conversation_toolbar"
   >
     <span class="ccb-dot" :class="dotClass" data-test="computer-status-dot"></span>
     <span class="ccb-status" data-test="computer-status-text">{{ statusText }}</span>
-    <span class="ccb-target" data-test="computer-target">{{ targetLabel }}</span>
-    <span class="ccb-meta ccb-secondary" data-test="computer-action-count">{{ store.computerRun.action_count }} 个动作</span>
-    <span v-if="currentActionLabel" class="ccb-meta ccb-secondary" data-test="computer-current-action">{{ currentActionLabel }}</span>
     <span
-      v-if="store.computerRun.current_surface"
+      v-if="isCrossSession"
+      class="ccb-owner"
+      data-test="computer-owner-banner"
+    >会话「{{ store.computerRun.owner_session_id }}」操控中</span>
+    <span v-if="targetLabel" class="ccb-target" data-test="computer-target">{{ targetLabel }}</span>
+    <span v-if="!isCrossSession" class="ccb-meta ccb-secondary" data-test="computer-action-count">{{ store.computerRun.action_count }} 个动作</span>
+    <span v-if="!isCrossSession && currentActionLabel" class="ccb-meta ccb-secondary" data-test="computer-current-action">{{ currentActionLabel }}</span>
+    <span
+      v-if="!isCrossSession && store.computerRun.current_surface"
       class="ccb-meta ccb-surface ccb-secondary"
       data-test="computer-surface"
       :title="store.computerRun.current_surface"
@@ -24,9 +24,10 @@
     <span class="ccb-spacer"></span>
     <span class="ccb-actions">
       <button
-        v-if="store.computerControlPausable !== 'none'"
+        v-if="!isCrossSession && store.computerControlPausable !== 'none'"
         class="chip-btn ccb-pause"
         data-test="computer-pause"
+        :disabled="store.computerControlMutating"
         :title="store.computerControlPausable === 'pause' ? '暂停：阻止下一个动作开始' : '恢复当前操控'"
         @click="togglePause"
       >
@@ -36,6 +37,7 @@
       <button
         class="chip-btn danger ccb-stop"
         data-test="computer-stop"
+        :disabled="store.computerControlMutating"
         title="立即停止当前操控（快捷键 Ctrl+Alt+Esc）"
         @click="stop"
       >
@@ -52,7 +54,6 @@ import AppIcon from './AppIcon.vue';
 
 const store = useAppStore();
 
-// 状态点颜色：运行绿 / 等待类黄 / 失败红
 const dotClass = computed(() => {
   const status = store.computerRun.status;
   if (status === 'running' || status === 'starting') return 'ok';
@@ -72,8 +73,6 @@ const STATUS_TEXTS: Record<string, string> = {
 
 const statusText = computed(() => STATUS_TEXTS[store.computerRun.status] || '电脑操控');
 
-// 当前动作：把后端 kind 翻成中文动词，让状态条能回答"它现在在干什么"，
-// 而不是只显示"已执行 N 个动作"这种事后统计。未知 kind 不渲染。
 const ACTION_VERBS: Record<string, string> = {
   observe: '观察',
   click: '点击',
@@ -84,6 +83,7 @@ const ACTION_VERBS: Record<string, string> = {
   type_text: '输入',
   keypress: '按键',
   wait: '等待',
+  wait_for: '等待条件',
   navigate: '打开网址',
   back: '后退',
   forward: '前进',
@@ -104,13 +104,18 @@ const currentActionLabel = computed(() => {
   return verb ? `正在${verb}` : '';
 });
 
-// 操控目标标识：Edge / Chrome / 桌面（设计 16.1）
+const isCrossSession = computed(() => {
+  const owner = store.computerRun.owner_session_id;
+  return !!owner && owner !== store.currentSessionName;
+});
+
 const targetLabel = computed(() => {
   const run = store.computerRun;
   if (run.target === 'desktop') return '桌面';
   const browser = String(run.browser || '').toLowerCase();
   if (browser === 'edge') return 'Edge';
   if (browser === 'chrome') return 'Chrome';
+  if (browser === 'embedded') return '内置浏览器';
   return run.target === 'browser' ? '浏览器' : '';
 });
 
@@ -162,6 +167,14 @@ async function stop() {
   color: var(--text);
   white-space: nowrap;
 }
+.ccb-owner {
+  font-size: 12px;
+  color: var(--yellow);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
 .ccb-target {
   padding: 1px 8px;
   border: 1px solid var(--border);
@@ -195,7 +208,6 @@ async function stop() {
   font-weight: 600;
 }
 
-/* 窄屏：次要文字（动作数/当前窗口）折叠，暂停/恢复与立即停止永不隐藏 */
 @media (max-width: 900px) {
   .ccb-secondary {
     display: none;

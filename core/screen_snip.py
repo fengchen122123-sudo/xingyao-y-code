@@ -1,50 +1,17 @@
-"""全屏任意位置截图：虚拟桌面度量、冻结帧捕获与遮罩页模板。
-
-模块定位（设计 docs/superpowers/specs/2026-10-14-screen-snip-design.md）：
-
-- ``get_virtual_screen_rect()``：用 Win32 ``GetSystemMetrics`` 的 SM_* 四常量
-  读取虚拟桌面物理像素矩形，原点允许多显示器负坐标（与
-  core/computer/win32_adapter.Win32InputAdapter.virtual_screen_rect 同口径，
-  但刻意不复用其实例——那会把整个电脑操控运行时依赖拖进 GUI 截图链路）；
-- ``capture_virtual_screen()``：惰性导入 ``PIL.ImageGrab`` 捕获整个虚拟桌面，
-  与 core/computer/windows_backend.default_image_grab 同一实现口径，模块顶层
-  不做 PIL 副作用导入；
-- ``build_snip_page()``：构建截图遮罩窗口的单文件 HTML（内联 CSS/JS），冻结帧
-  dataURL 经占位符一次注入。遮罩窗口的创建/回收/桥方法在 gui_snip_mixin.py。
-
-坐标约定：遮罩窗口覆盖虚拟桌面物理矩形；页面只负责显示**压缩预览**并回报选区
-（CSS px × 原始尺寸比例 → 原始物理像素），真正的裁剪由 Python 从原始全分辨率
-图执行（无损）。这条分工是被逼出来的：遮罩窗口经 ``create_window(html=...)``
-加载，走 WebView2 ``NavigateToString``，该接口对 HTML 内容有 **2MB 硬上限**，
-整屏 PNG 内联必然超限（超限时抛异常、窗口全黑），故预览必须体积可控、输出必须
-绕开页面。当前主场景两屏均 100% 缩放，CSS 像素与物理像素一一对应；混合 DPI
-多屏为已知限制（见设计文档）。
-"""
-
 from __future__ import annotations
 
 import ctypes
 import sys
 from typing import Tuple
 
-# SM_* 虚拟桌面度量（与 core/computer/win32_adapter 同口径）：
-# 原点可取负值（副屏位于主屏上方/左侧时）。
 _SM_XVIRTUALSCREEN = 76
 _SM_YVIRTUALSCREEN = 77
 _SM_CXVIRTUALSCREEN = 78
 _SM_CYVIRTUALSCREEN = 79
 
-# 冻结帧 dataURL 前缀：接受任意 image/* 的 base64 dataURL（PNG/JPEG 皆可）。
-# 不锁死 PNG 的原因：遮罩窗口经 create_window(html=...) 加载，走 WebView2 的
-# NavigateToString，该接口对 HTML 内容有 2MB 硬上限；整屏 PNG 转 base64 后
-# 轻易突破（实测 1920x2280 复杂界面达 2.6MB），超限时 NavigateToString 抛
-# "值不在预期的范围内"，遮罩窗口表现为全黑。故上层改用体积可控的 JPEG 冻结帧
-# （见 gui_snip_mixin.encode_frozen_frame），本函数只做格式宽松校验。
 _IMAGE_DATA_URL_PREFIX = "data:image/"
 _BASE64_MARKER = ";base64,"
-# 页面模板占位符：base64 字符集仅 [A-Za-z0-9+/=]，str.replace 注入无转义风险
 _SNIP_FRAME_PLACEHOLDER = "__SNIP_FRAME_DATA_URL__"
-# 原始全分辨率冻结帧的物理宽高占位符（预览可能被压缩，选区换算须以原始尺寸为准）
 _ORIG_W_PLACEHOLDER = "__SNIP_ORIG_W__"
 _ORIG_H_PLACEHOLDER = "__SNIP_ORIG_H__"
 
@@ -69,27 +36,12 @@ def get_virtual_screen_rect() -> Tuple[int, int, int, int]:
 
 
 def capture_virtual_screen():
-    """捕获整个虚拟桌面为 ``PIL.Image``。
-
-    与 core/computer/windows_backend.default_image_grab 同一实现口径：函数内
-    惰性导入 ``PIL.ImageGrab``，模块顶层不触发任何 PIL 副作用；失败由调用方
-    （gui_snip_mixin.screen_snip_start）转成用户可读错误。
-    """
     from PIL import ImageGrab
 
     return ImageGrab.grab(all_screens=True)
 
 
 def build_snip_page(frame_data_url: str, orig_width: int, orig_height: int) -> str:
-    """构建截图遮罩窗口的完整 HTML（单文件自包含，供 pywebview 窗口加载）。
-
-    冻结帧 dataURL 经占位符一次注入；``orig_width`` / ``orig_height`` 是**原始
-    全分辨率**冻结帧的物理尺寸（预览图可能被压缩/缩小，选区换算必须以此为准，
-    最终由 Python 从原始图裁剪，保证输出无损）。
-
-    构建后必须不再残留任何占位符（模板不变式，残留即说明模板被改坏，宁可报错
-    也不给用户一个空白遮罩）。
-    """
     if (
         not isinstance(frame_data_url, str)
         or not frame_data_url.startswith(_IMAGE_DATA_URL_PREFIX)

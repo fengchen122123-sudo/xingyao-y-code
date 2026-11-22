@@ -41,7 +41,6 @@ def test_explicit_transport_prefix_is_not_duplicated():
 
 
 def test_preset_providers_carry_no_models():
-    """预置厂商只预填厂商信息，不携带模型（模型由用户经「获取模型列表」添加）。"""
     for provider in get_preset_providers():
         assert "models" not in provider
         assert provider["name"]

@@ -26,7 +26,6 @@ describe('composer controls', () => {
     };
     const wrapper = mount(component);
 
-    // 附件按钮与权限下拉箭头已统一为 AppIcon SVG 图标：断言按钮内渲染了内联 svg
     expect(wrapper.get('[data-test="attachment-button"]').find('svg').exists()).toBe(true);
     expect(wrapper.get('[data-test="permission-button"]').text()).not.toContain('☑');
     expect(wrapper.get('[data-test="permission-button"]').classes()).toContain('perm-confirm');
@@ -35,6 +34,12 @@ describe('composer controls', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.get('[data-test="permission-button"]').classes()).toContain('perm-plan');
+
+    store.permissionMode = 'auto_decision';
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.get('[data-test="permission-button"]').classes()).toContain('perm-auto_decision');
+    expect(wrapper.get('[data-test="permission-button"]').text().replace(/\s+/g, '')).toBe('自动决策');
 
     store.permissionMode = 'full';
     await wrapper.vm.$nextTick();
@@ -49,13 +54,21 @@ describe('composer controls', () => {
     wrapper.unmount();
   });
 
-  it('uses green for confirm mode in the dropdown', () => {
+  it('hides auto_decision until decisionEnabled is true', async () => {
+    const store = useAppStore();
+    store.decisionEnabled = false;
     const wrapper = mount(PermDropdown, {
       props: { visible: true, anchorEl: document.createElement('button') },
       global: { stubs: { teleport: true } },
     });
 
     expect(wrapper.findAll('.dd-dot')[0].attributes('style')).toContain('var(--green)');
+    expect(wrapper.text()).not.toContain('自动决策');
+
+    store.decisionEnabled = true;
+    await nextTick();
+
+    expect(wrapper.text()).toContain('自动决策');
     wrapper.unmount();
   });
 });
@@ -80,7 +93,6 @@ describe('screen snip button', () => {
     ['active composer', InputArea],
   ])('renders the screen-snip button with a crop icon in the %s', (_name, component) => {
     const wrapper = mount(component);
-    // 与附件/权限按钮同口径：按钮内渲染 AppIcon 内联 svg
     const btn = wrapper.get('[data-test="screen-snip-button"]');
     expect(btn.find('svg').exists()).toBe(true);
     wrapper.unmount();

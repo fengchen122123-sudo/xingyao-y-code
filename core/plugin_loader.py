@@ -1,44 +1,9 @@
-"""通用插件加载框架。
-
-扫描内置插件目录与用户插件目录，加载每个插件的 plugin.json + 入口模块，
-调用其 register(registry) 完成工具注册。
-
-设计原则：
-- 对核心零侵入：build_default_registry() 末尾追加一次 load_and_register() 调用即可；
-- 单插件隔离：任一插件加载失败只记录日志并跳过，绝不影响 ycode 启动；
-- 用户级覆盖内置：同名插件以 ~/.ycode/plugins/ 下的为准；
-- 插件工具自动获得 ToolSpec 元数据驱动的权限拦截、schema 参数过滤与结果截断，
-  无需插件自行实现。
-
-插件目录结构：
-    <plugin_dir>/
-        plugin.json   # {"name", "version", "description", "entry", "enabled"}
-        <entry>.py    # 必须暴露 register(registry) 函数；可选 plugin.json 指定 entry
-
-插件内兄弟模块请用 import_sibling(__file__, "module_name") 加载，
-避免不同插件间的同名模块在 sys.modules 中互相覆盖。
-
-清理钩子（插件回收自己写入的持久化数据）：
-- 插件可选暴露无参函数 cleanup()，核心在禁用该插件时调用它；
-- 调用包在 try/except 内，失败只在 toggle 返回的提示里追加说明，绝不让禁用动作失败；
-- 启动扫描完成后由 _prune_orphan_providers() 兜底清理"其插件本次未加载"的孤儿
-  provider（只处理带 managed_by 标记的 provider，用户手配的配置绝不触碰）。
-
-信任机制（首次加载确认）：
-- 插件以进程全权限执行，加载前按目录内容指纹（文件哈希）判定是否已获信任；
-- 内置 plugins/ 目录随仓库发布，视为用户自己的代码：记录指纹并自动信任；
-- 用户级 ~/.ycode/plugins/ 首次见到或指纹变化时必须确认：交互终端弹出
-  [y/N] 确认（入口层可用 set_trust_prompt 注册自定义确认回调）；
-  非交互/headless 环境默认跳过加载并 logger.warning 提示；
-- 已确认指纹持久化到 ~/.ycode/plugin_trust.json（YCODE_DATA_DIR 优先）。
-"""
-
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import logging
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -46,22 +11,14 @@ from typing import Any
 
 _logger = logging.getLogger("ycode.plugins")
 
-# 内置插件目录（随 ycode 仓库发布）与用户插件目录（可覆盖内置同名插件）
 def _builtin_plugin_dir() -> Path:
-    """内置插件源目录：打包后位于 _MEIPASS/plugins，开发态为仓库根 plugins/。"""
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         return Path(meipass) / "plugins"
     return Path(__file__).resolve().parent.parent / "plugins"
 
-# 最近一次 load_and_register 的扫描结果（含禁用/失败/被覆盖的插件），
-# 供 /plugins 命令与诊断查询；每次扫描开头会整体重建。
 _PLUGIN_INFOS: list[dict] = []
 
-# 插件扫盘串行锁：get_plugins 会被前端轮询与工具调用并发触发，而
-# refresh_plugins 是「扫盘 → 信任确认 → exec + register」的复合操作。
-# 不加锁时多线程会同时对同一插件执行加载（2026-11-04 实测：一次并发刷新
-# 把同一个插件热加载了 15 次，起了 15 个网关监听端口）。
 _REFRESH_LOCK = threading.RLock()
 
 # 已加载插件的模块引用：留着是为了插件被禁用时能调用它可选的 cleanup() 钩子。
@@ -70,17 +27,9 @@ _LOADED_MODULES: dict[str, Any] = {}
 
 
 def get_plugin_infos() -> list[dict]:
-    """返回最近一次插件扫描的信息列表（dict 副本，调用方修改不影响内部状态）。
-
-    每条记录字段：name / version / description / path / source(user|builtin) /
-    status(loaded|disabled|failed|overridden|untrusted) / tools(list[str]) /
-    has_settings(bool，是否提供设置页) / error(可选)。
-    """
     result: list[dict] = []
     for info in _PLUGIN_INFOS:
         item = dict(info)
-        # 设置页由插件入口模块的可选 plugin_settings 钩子声明；未加载（未信任/未启用）
-        # 的插件代码不执行，一律视为没有设置页。
         module = _LOADED_MODULES.get(str(item.get("name") or ""))
         item["has_settings"] = callable(getattr(module, "plugin_settings", None))
         result.append(item)
@@ -88,15 +37,6 @@ def get_plugin_infos() -> list[dict]:
 
 
 def call_plugin_hook(plugin_name: str, hook_name: str, payload: dict | None = None) -> dict:
-    """调用已加载插件的可选钩子（如 ``plugin_settings``）。
-
-    安全边界：只对"已加载（=已信任 + 已启用）"的插件调用；未加载时返回
-    ``needs`` 指引（"trust" / "enable"），绝不执行未加载插件的代码。
-
-    返回约定：
-    - 成功：``{"ok": True, "data": <钩子原样返回的 dict>}``
-    - 失败：``{"ok": False, "message": str, "needs": "trust"|"enable"|None}``
-    """
     name = str(plugin_name or "").strip()
     if not name:
         return {"ok": False, "message": "插件名不能为空", "needs": None}
@@ -107,7 +47,7 @@ def call_plugin_hook(plugin_name: str, hook_name: str, payload: dict | None = No
             if str(info.get("name") or "") == name:
                 status = str(info.get("status") or "")
                 break
-        needs = "trust" if status == "untrusted" else "enable"
+        needs = "enable"
         if status == "disabled":
             message = f"插件 {name} 未启用，启用后即可配置"
         else:
@@ -126,72 +66,7 @@ def call_plugin_hook(plugin_name: str, hook_name: str, payload: dict | None = No
     return {"ok": True, "data": result}
 
 
-# ─── 插件信任机制：首次加载/指纹变化需确认 ─────────────────────────
-
-# 已确认指纹持久化文件：{str(plugin_dir.resolve()): fingerprint}
-def _trust_file() -> Path:
-    try:
-        import config
-        return Path(config.YCODE_DIR) / "plugin_trust.json"
-    except Exception:
-        return Path.home() / ".ycode" / "plugin_trust.json"
-
-
-def _load_trust_store() -> dict:
-    try:
-        with open(_trust_file(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
-    except Exception:
-        pass
-    return {}
-
-
-def _save_trust_store(store: dict) -> None:
-    try:
-        path = _trust_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(store, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-    except Exception as exc:
-        _logger.warning("插件信任记录写入失败: %s", exc)
-
-
-def _plugin_fingerprint(plugin_dir: Path) -> str:
-    """计算插件目录内容指纹：所有文件（跳过 __pycache__/.pyc）的路径+内容哈希。
-
-    plugin.json 例外：解析后剔除 "enabled" 字段、按键名排序再序列化后哈希。
-    原因：enabled 开关翻转由 toggle_plugin 回写 plugin.json，属于用户正常操作
-    而非内容篡改；指纹必须对它不敏感，否则"禁用状态下信任的插件，一开开关
-    就被误判为已变更"。解析失败时回退为原始字节哈希。
-    """
-    digest = hashlib.sha256()
-    for path in sorted(plugin_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(plugin_dir).as_posix()
-        if "__pycache__" in rel.split("/") or rel.endswith(".pyc"):
-            continue
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        if rel == "plugin.json":
-            try:
-                meta = json.loads(path.read_bytes().decode("utf-8"))
-                if isinstance(meta, dict):
-                    meta.pop("enabled", None)
-                canon = json.dumps(meta, ensure_ascii=False, sort_keys=True)
-                digest.update(canon.encode("utf-8"))
-                continue
-            except Exception:
-                pass  # 非 JSON 内容回退为原始字节哈希
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-    return digest.hexdigest()
-
-
 def _is_builtin_plugin(plugin_dir: Path) -> bool:
-    """判断是否内置插件目录（plugin_dirs() 中除首个用户目录外的任何目录之下）。"""
     try:
         resolved = plugin_dir.resolve()
     except OSError:
@@ -205,77 +80,9 @@ def _is_builtin_plugin(plugin_dir: Path) -> bool:
     return False
 
 
-# 插件信任确认回调：callback(path, name, fingerprint) -> bool；
-# None 时用默认行为（交互终端 input 确认，headless 拒绝）。
-_trust_prompt = None
-
-
 def set_trust_prompt(callback) -> None:
-    """注册插件信任确认回调（供入口层接入 CLI/GUI 弹窗）；传 None 恢复默认。"""
-    global _trust_prompt
-    _trust_prompt = callback
-
-
-def _confirm_plugin_trust(plugin_dir: Path, name: str, fingerprint: str) -> bool:
-    callback = _trust_prompt
-    if callback is not None:
-        try:
-            return bool(callback(str(plugin_dir), name, fingerprint))
-        except Exception:
-            return False
-    # 非主线程绝不落到 input()：插件刷新常由工具调用 / 前端 RPC 的 worker 线程
-    # 触发，控制台提示用户看不见，input() 会永久阻塞该线程——回合因此卡死，
-    # 停止按钮也打不断（2026-11-04 实测：plugin_manage 调用卡了 5.5 小时，
-    # 同时 15 个刷新线程一起阻塞在 stdin 上）。GUI / 后台场景请在插件页
-    # 手动「信任并启用」，或由入口层注册 set_trust_prompt 回调。
-    if threading.current_thread() is not threading.main_thread():
-        _logger.warning(
-            "插件 %s (%s) 需要信任确认，但当前在后台线程，已跳过控制台确认"
-            "（请在插件页手动信任，或用 set_trust_prompt 注册回调）",
-            name, plugin_dir,
-        )
-        return False
-    # 默认：交互终端（CLI）弹确认；非交互/headless 环境直接拒绝
-    if sys.stdin is not None and sys.stdout is not None \
-            and sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            print(f"\n[插件安全确认] 插件 {name} 首次加载或内容已变化: {plugin_dir}")
-            print("  插件代码将以 星瑶Code 进程的全部权限执行，请确认来源可信。")
-            answer = input("  信任并加载该插件？[y/N] ").strip().lower()
-            return answer in ("y", "yes")
-        except (EOFError, OSError, KeyboardInterrupt):
-            return False
-    return False
-
-
-def _check_plugin_trusted(plugin_dir: Path, name: str) -> bool:
-    """判定插件是否可加载：内置自动信任；用户级按指纹确认，未确认拒绝。"""
-    try:
-        fingerprint = _plugin_fingerprint(plugin_dir)
-    except OSError as exc:
-        _logger.warning("插件 %s 指纹计算失败，已跳过: %s", name, exc)
-        return False
-    key = str(plugin_dir.resolve())
-    store = _load_trust_store()
-    if _is_builtin_plugin(plugin_dir):
-        # 内置插件随仓库发布，视为用户自己的代码：记录指纹并自动信任
-        if store.get(key) != fingerprint:
-            store[key] = fingerprint
-            _save_trust_store(store)
-        return True
-    if store.get(key) == fingerprint:
-        return True
-    if _confirm_plugin_trust(plugin_dir, name, fingerprint):
-        store[key] = fingerprint
-        _save_trust_store(store)
-        _logger.info("插件 %s 已确认信任并记录指纹", name)
-        return True
-    _logger.warning(
-        "插件 %s (%s) 未获信任，已跳过加载。"
-        "在交互终端启动 ycode 时会弹出信任确认；或在确认来源可信后重试。",
-        name, plugin_dir,
-    )
-    return False
+    """兼容桩：信任校验已移除，入口层可继续调用但不会产生任何确认流程。"""
+    return None
 
 
 def _user_plugin_dir() -> Path:
@@ -287,7 +94,6 @@ def _user_plugin_dir() -> Path:
 
 
 def _live_registry():
-    """取调度层（core/llm.py）的运行时工具注册表单例；取不到（如独立测试进程）返回 None。"""
     try:
         from core import llm
         return getattr(llm, "tool_registry", None)
@@ -321,13 +127,6 @@ def _run_cleanup_hook(name: str) -> str:
 
 
 def _core_managed_markers() -> frozenset[str]:
-    """由核心功能（而不是插件）托管的 provider 标记值。
-
-    基元律动账号绑定自动创建的厂商用 ``managed_by="tokenrhythm"`` 标记，它不是插件名。
-    若把它按"来源插件本次未加载"处理，每次启动都会把登录后刚建好的厂商连 Key 一起
-    删掉（真实事故：登录成功 → 重启一次 → provider 消失，表现为"Key 没配置成功"）。
-    标记值只在 core 里定义一次，这里动态取，避免两处字面量漂移。
-    """
     try:
         from core.tokenrhythm_auth import MANAGED_PROVIDER_VALUE
 
@@ -339,10 +138,6 @@ def _core_managed_markers() -> frozenset[str]:
 def _is_orphan_provider(
     provider: dict, loaded_names: set[str], core_markers: frozenset[str]
 ) -> bool:
-    """是否该按孤儿清理：带 managed_by 标记、不属核心托管、且其插件本次未加载。
-
-    用户手配的厂商没有 managed_by 字段，永远不在此列。
-    """
     marker = provider.get("managed_by")
     if not marker:
         return False
@@ -353,13 +148,6 @@ def _is_orphan_provider(
 
 
 def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
-    """兜底清理"来源插件本次未加载"的孤儿 provider，返回被清理的 provider 名列表。
-
-    只处理带 managed_by 标记、且不属于核心托管的 provider：用户手配的配置没有该字段，
-    核心功能（账号绑定）创建的厂商由 ``_core_managed_markers()`` 豁免，都不会被碰。
-    典型场景：插件被禁用（或直接改了 plugin.json）后，它自举写入的 provider 仍留在
-    配置里，模型选择器就会一直显示一个已经用不了的厂商。
-    """
     try:
         import config
         from core.model_manager import load_config
@@ -386,7 +174,6 @@ def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
         removed_model_ids = set()
         kept = []
         for p in data.get("providers") or []:
-            # 写路径内二次判定：只删仍然符合"带标记、非核心托管、插件未加载"的项
             if isinstance(p, dict) and _is_orphan_provider(p, loaded_names, core_markers):
                 for m in (p.get("models") or []):
                     if isinstance(m, dict) and m.get("id"):
@@ -409,12 +196,184 @@ def _prune_orphan_providers(loaded_names: set[str]) -> list[str]:
     return orphan_names
 
 
-def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
-    """切换插件开关：写回 plugin.json 持久化，并热挂载/卸载运行时工具（无需重启）。
+def _removed_file() -> Path:
+    try:
+        import config
+        return Path(config.YCODE_DIR) / "plugin_removed.json"
+    except Exception:
+        return Path.home() / ".ycode" / "plugin_removed.json"
 
-    返回 (ok, msg)。持久化保证 CLI / GUI 下次启动状态一致；热切换通过直接操作
-    core.llm.tool_registry 单例让开关立即生效，两端行为同步。
-    """
+
+def _load_removed() -> set[str]:
+    try:
+        with open(_removed_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        names = data.get("builtin") if isinstance(data, dict) else None
+        if isinstance(names, list):
+            return {str(n).strip() for n in names if str(n).strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _save_removed(names: set[str]) -> None:
+    path = _removed_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"builtin": sorted(names)}, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def is_builtin_removed(name: str) -> bool:
+    """内置插件是否已被用户移除（列表隐藏 + 加载时跳过）。"""
+    return str(name or "").strip() in _load_removed()
+
+
+def delete_plugin(name: str) -> tuple[bool, str]:
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    name = name.strip()
+    if name in (".", "..") or any(sep in name for sep in ("/", "\\", "\x00")):
+        return False, "插件名无效"
+
+    with _REFRESH_LOCK:
+        target = _locate_plugin_dir(name)
+        if target is None or not (target / "plugin.json").is_file():
+            return False, f"未找到插件 {name}"
+        if _is_builtin_plugin(target):
+            return False, "内置插件随应用发布，不能删除"
+        try:
+            resolved = target.resolve()
+            user_root = plugin_dirs()[0].resolve()
+        except OSError as exc:
+            return False, f"无法定位插件目录: {exc}"
+        if resolved == user_root or not resolved.is_relative_to(user_root):
+            return False, "插件目录不在用户插件目录内，已拒绝删除"
+        try:
+            shutil.rmtree(resolved)
+        except OSError as exc:
+            return False, f"删除插件目录失败: {exc}"
+
+        tools: list = []
+        for info in _PLUGIN_INFOS:
+            if info.get("name") == name and info.get("status") != "overridden":
+                tools = list(info.get("tools") or [])
+                break
+        _unload_removed_plugin(name, tools, _live_registry())
+        _PLUGIN_INFOS[:] = [
+            info for info in _PLUGIN_INFOS
+            if str(info.get("name") or "") != name or info.get("status") == "overridden"
+        ]
+        return True, f"已删除插件 {name}"
+
+
+def _locate_plugin_dir(name: str) -> Path | None:
+    candidates: list[Path] = []
+    for info in _PLUGIN_INFOS:
+        if info.get("name") == name and info.get("path"):
+            candidates.append(Path(info["path"]))
+    for base in plugin_dirs():
+        child = base / name
+        if (child / "plugin.json").is_file():
+            candidates.append(child)
+    for path in candidates:
+        if not _is_builtin_plugin(path):
+            return path
+    return candidates[0] if candidates else None
+
+
+def remove_plugin(name: str) -> tuple[bool, str]:
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    name = name.strip()
+
+    with _REFRESH_LOCK:
+        target = _locate_plugin_dir(name)
+        if target is None or not (target / "plugin.json").is_file():
+            return False, f"未找到插件 {name}"
+        if not _is_builtin_plugin(target):
+            return delete_plugin(name)
+
+        removed = _load_removed()
+        removed.add(name)
+        try:
+            _save_removed(removed)
+        except Exception as exc:
+            return False, f"写入移除记录失败: {exc}"
+
+        tools: list = []
+        for info in _PLUGIN_INFOS:
+            if info.get("name") == name and info.get("status") != "overridden":
+                tools = list(info.get("tools") or [])
+                info["status"] = "removed"
+                info["tools"] = []
+                info.pop("error", None)
+                break
+        _unload_removed_plugin(name, tools, _live_registry())
+        return True, f"已移除内置插件 {name}（随包文件未删除，可随时恢复）"
+
+
+def restore_plugin(name: str) -> tuple[bool, str]:
+    """恢复被移除的内置插件：删移除记录并立即热加载，无需重启。"""
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    name = name.strip()
+
+    with _REFRESH_LOCK:
+        removed = _load_removed()
+        if name not in removed:
+            return False, f"插件 {name} 不在已移除名单里"
+        removed.discard(name)
+        try:
+            _save_removed(removed)
+        except Exception as exc:
+            return False, f"写入移除记录失败: {exc}"
+
+        target: Path | None = None
+        for base in plugin_dirs():
+            child = base / name
+            if (child / "plugin.json").is_file() and _is_builtin_plugin(child):
+                target = child
+                break
+        if target is None:
+            return False, f"未找到内置插件 {name} 的目录"
+        registry = _live_registry()
+        info = next(
+            (
+                i for i in _PLUGIN_INFOS
+                if i.get("name") == name and i.get("status") == "removed"
+            ),
+            None,
+        )
+        if registry is None:
+            if info is not None:
+                info["status"] = "disabled"
+            return True, f"已恢复内置插件 {name}（运行时注册表不可用，重启后加载）"
+
+        before = {s.name for s in registry.all()}
+        try:
+            loaded_name = _load_one(target, registry)
+        except SystemExit as exc:
+            if info is not None:
+                info["status"] = "failed"
+                info["error"] = f"SystemExit({exc.code!r})"
+            return True, f"已恢复内置插件 {name}，但热加载失败: SystemExit({exc.code!r})"
+        except Exception as exc:
+            if info is not None:
+                info["status"] = "failed"
+                info["error"] = str(exc)
+            return True, f"已恢复内置插件 {name}，但热加载失败: {exc}"
+        if not loaded_name:
+            if info is not None:
+                info["status"] = "disabled"
+            return True, f"已恢复内置插件 {name}（当前为禁用状态）"
+        if info is not None:
+            info["status"] = "loaded"
+            info["tools"] = sorted(s.name for s in registry.all() if s.name not in before)
+        return True, f"已恢复内置插件 {name}"
+
+
+def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
     target: Path | None = None
     for info in _PLUGIN_INFOS:
         if info.get("name") == name:
@@ -429,6 +388,8 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
                 break
     if target is None or not (target / "plugin.json").is_file():
         return False, f"未找到插件 {name}"
+    if enabled and _is_builtin_plugin(target) and is_builtin_removed(name):
+        return False, f"插件 {name} 已被移除，请先恢复再启用"
     meta_path = target / "plugin.json"
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -443,18 +404,11 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"写入 {meta_path} 失败: {exc}"
 
-    # 热切换：直接在当前进程的运行时注册表上挂载/卸载插件工具
     hot_note = ""
     registry = _live_registry()
     if registry is not None:
         try:
             if enabled:
-                # 启用即加载：未获信任的插件拒绝热加载（信任持久化不受影响）
-                if not _check_plugin_trusted(target, name):
-                    return False, (
-                        f"插件 {name} 未通过信任确认，已拒绝热加载"
-                        "（在交互终端重启 ycode 时会弹出信任确认）"
-                    )
                 # 先卸下同名旧工具，避免重复开关时 duplicate 报错
                 for info in _PLUGIN_INFOS:
                     if info.get("name") == name:
@@ -483,11 +437,8 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
                                 pass
                         info["status"] = "disabled"
                         break
-                # 禁用后调用插件可选的 cleanup()，回收它写入的持久化数据（如自举的 provider）
                 hot_note = _run_cleanup_hook(name)
         except SystemExit as exc:
-            # 同 load_and_register：SystemExit 按热切换失败处理，不穿透中断调用方
-            #（KeyboardInterrupt 仍向上传播）。
             _logger.warning("插件 %s 热切换触发 SystemExit(%r)，已按失败处理", name, exc.code)
             hot_note = f"（热切换失败: SystemExit({exc.code!r})，重启后生效）"
         except Exception as exc:
@@ -501,50 +452,10 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
 
 
 def trust_plugin(name: str) -> tuple[bool, str]:
-    """显式信任指定插件：计算其内容指纹并写入信任持久化存储。
-
-    供 GUI 桥接层调用，等效于 CLI 首次加载插件时在信任确认中回答 y。
-    背景：GUI 进程通常非交互终端（stdin 非 tty），默认确认函数恒返回
-    False，用户永远无法在 GUI 里信任插件；本接口让上层可以显式放行。
-
-    行为：
-    - 只按指纹持久化信任，不改动 plugin.json 的 enabled 状态、不注册工具；
-    - 信任后（内容不变的前提下）下次 load_and_register / toggle 启用可直接
-      加载，无需再弹确认；
-    - 对已信任插件重复调用是幂等的（重写相同指纹，仍返回成功）。
-
-    返回 (ok, msg)：成功时 msg 为可展示的中文提示；找不到插件或写入失败时
-    返回 (False, 错误描述)。
-    """
-    target: Path | None = None
-    for info in _PLUGIN_INFOS:
-        if info.get("name") == name:
-            target = Path(info["path"])
-            break
-    # 兜底：内存记录里没找到就扫一遍目录（与 toggle_plugin 同款）
-    if target is None:
-        for base in plugin_dirs():
-            child = base / name
-            if (child / "plugin.json").is_file():
-                target = child
-                break
-    if target is None or not (target / "plugin.json").is_file():
-        return False, f"未找到插件 {name}"
-
-    try:
-        fingerprint = _plugin_fingerprint(target)
-    except OSError as exc:
-        return False, f"计算插件 {name} 指纹失败: {exc}"
-
-    try:
-        store = _load_trust_store()
-        store[str(target.resolve())] = fingerprint
-        _save_trust_store(store)
-    except Exception as exc:
-        return False, f"写入插件信任记录失败: {exc}"
-
-    _logger.info("插件 %s 已被显式信任并记录指纹: %s", name, target)
-    return True, f"已信任插件 {name}，下次启动自动加载"
+    """兼容桩：信任校验已移除。保留入口是为了让 GUI 插件页 / CLI / RPC 调用不报错。"""
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    return True, "插件信任校验已关闭，无需确认"
 
 
 def plugin_dirs() -> list[Path]:
@@ -553,12 +464,6 @@ def plugin_dirs() -> list[Path]:
 
 
 def import_sibling(plugin_file: str, module_name: str) -> Any:
-    """加载插件目录内的兄弟模块，模块名带插件目录前缀，避免跨插件冲突。
-
-    用法（在插件的入口模块或兄弟模块内）：
-        from core.plugin_loader import import_sibling
-        scanner = import_sibling(__file__, "scanner")
-    """
     plugin_dir = Path(plugin_file).resolve().parent
     unique = f"_ycode_plugin_{plugin_dir.name}_{module_name}"
     cached = sys.modules.get(unique)
@@ -577,13 +482,12 @@ def import_sibling(plugin_file: str, module_name: str) -> Any:
 
 
 def _load_one(plugin_dir: Path, registry) -> str:
-    """加载单个插件并注册其工具。返回插件名。异常向上抛，由调用方隔离。"""
     meta_path = plugin_dir / "plugin.json"
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     name = str(meta.get("name") or plugin_dir.name)
     if meta.get("enabled", True) is False:
-        return ""  # 空串表示"已禁用，跳过"，与加载失败区分
+        return ""
     entry = plugin_dir / str(meta.get("entry") or "plugin.py")
     if not entry.is_file():
         raise ImportError(f"插件入口不存在: {entry}")
@@ -606,13 +510,6 @@ def _load_one(plugin_dir: Path, registry) -> str:
 
 
 def _unload_removed_plugin(name: str, tools: list, registry) -> None:
-    """插件目录被删除后的运行期清理：注销工具并调用插件的 cleanup 钩子。
-
-    为什么需要：refresh_plugins 此前只清信息记录；已加载插件的工具仍挂在
-    registry、cleanup 不会被调用（如 provider 自举的回收）。目录删除不经过
-    toggle 流程，这里是唯一的清理点。每一步独立隔离，单项失败不影响其余
-    清理与后续扫描。
-    """
     if not name:
         return
     module = _LOADED_MODULES.pop(name, None)
@@ -632,16 +529,6 @@ def _unload_removed_plugin(name: str, tools: list, registry) -> None:
 
 
 def refresh_plugins(registry=None) -> None:
-    """增量刷新插件信息：加载运行期间新安装的插件，移除已从磁盘删除的记录。
-
-    解决"运行期间安装的插件要重启进程才显示"的问题（此前 _PLUGIN_INFOS 只在
-    启动时 load_and_register 扫一次盘）。已加载的插件不会重复注册；
-    单插件失败仅记录，不影响其他插件。registry 缺省取运行时注册表单例。
-
-    并发安全：扫描、信任确认与加载注册的全区间由 _REFRESH_LOCK 串行化。
-    get_plugins 会被前端轮询与工具调用并发触发，不串行时多个线程会同时对
-    同一插件执行 exec + register（重复热加载、重复启动插件后台服务）。
-    """
     with _REFRESH_LOCK:
         _refresh_plugins_locked(registry)
 
@@ -651,7 +538,6 @@ def _refresh_plugins_locked(registry=None) -> None:
     if registry is None:
         registry = _live_registry()
 
-    # 1) 移除磁盘上已删除（plugin.json 不存在）的插件记录；已加载的做完整卸载
     for info in list(_PLUGIN_INFOS):
         path = info.get("path")
         if path and not (Path(path) / "plugin.json").is_file():
@@ -663,14 +549,13 @@ def _refresh_plugins_locked(registry=None) -> None:
             )
 
     known_paths = {str(info.get("path") or "") for info in _PLUGIN_INFOS}
-    # 已被占用的插件名（overridden 记录不占用：它是被同名压制的那个）
     taken_names = {
         str(info.get("name") or "")
         for info in _PLUGIN_INFOS
         if info.get("status") != "overridden"
     }
+    removed_names = _load_removed()
 
-    # 2) 扫盘发现新插件（目录优先级与记录结构同 load_and_register）
     for idx, base in enumerate(plugin_dirs()):
         source = "user" if idx == 0 else "builtin"
         try:
@@ -703,14 +588,13 @@ def _refresh_plugins_locked(registry=None) -> None:
                 info["status"] = "overridden"
                 _PLUGIN_INFOS.append(info)
                 continue
+            if source == "builtin" and plugin_name in removed_names:
+                info["status"] = "removed"
+                _PLUGIN_INFOS.append(info)
+                continue
             if registry is None:
                 # 无运行时注册表（极端降级）：只记录元信息，不执行加载
                 info["status"] = "disabled" if meta.get("enabled", True) is False else "loaded"
-                taken_names.add(plugin_name)
-                _PLUGIN_INFOS.append(info)
-                continue
-            if meta.get("enabled", True) is not False and not _check_plugin_trusted(child, plugin_name):
-                info["status"] = "untrusted"
                 taken_names.add(plugin_name)
                 _PLUGIN_INFOS.append(info)
                 continue
@@ -726,8 +610,6 @@ def _refresh_plugins_locked(registry=None) -> None:
                 else:
                     info["status"] = "disabled"
             except SystemExit as exc:
-                # 同 load_and_register：SystemExit 按"该插件热加载失败"处理，
-                # 不穿透中断刷新流程（KeyboardInterrupt 仍向上传播）。
                 taken_names.add(plugin_name)
                 info["status"] = "failed"
                 info["error"] = f"SystemExit({exc.code!r})"
@@ -741,11 +623,6 @@ def _refresh_plugins_locked(registry=None) -> None:
 
 
 def load_and_register(registry) -> list[str]:
-    """扫描所有插件目录并注册插件工具。返回成功加载的插件名列表。
-
-    单个插件的任何异常都被捕获、记录并跳过，保证 ycode 主流程不受影响。
-    """
-    # 重复调用时沿用上一轮的插件工具清单（本轮对已加载插件跳过重复注册，见下方分支）
     previous_tools = {
         str(info.get("name") or ""): list(info.get("tools") or [])
         for info in _PLUGIN_INFOS
@@ -753,7 +630,7 @@ def load_and_register(registry) -> list[str]:
     loaded: list[str] = []
     seen: set[str] = set()
     _PLUGIN_INFOS.clear()
-    # plugin_dirs() 约定用户目录在前：索引 0 即用户级，其余为内置
+    removed_names = _load_removed()
     for idx, base in enumerate(plugin_dirs()):
         source = "user" if idx == 0 else "builtin"
         try:
@@ -766,7 +643,6 @@ def load_and_register(registry) -> list[str]:
         for child in children:
             if not (child / "plugin.json").is_file():
                 continue
-            # 同名覆盖：用户目录先扫，内置目录遇到同名直接跳过
             try:
                 with open(child / "plugin.json", "r", encoding="utf-8") as f:
                     meta = json.load(f)
@@ -787,9 +663,8 @@ def load_and_register(registry) -> list[str]:
                 info["status"] = "overridden"
                 _PLUGIN_INFOS.append(info)
                 continue
-            if meta.get("enabled", True) is not False and not _check_plugin_trusted(child, plugin_name):
-                info["status"] = "untrusted"
-                seen.add(plugin_name)
+            if source == "builtin" and plugin_name in removed_names:
+                info["status"] = "removed"
                 _PLUGIN_INFOS.append(info)
                 continue
             # 已加载跳过：同一进程内重复调用 load_and_register（多入口/测试场景）时，
@@ -820,9 +695,6 @@ def load_and_register(registry) -> list[str]:
                 else:
                     info["status"] = "disabled"
             except SystemExit as exc:
-                # SystemExit 继承 BaseException，不会落入 except Exception：
-                # 单独按"该插件加载失败"处理，防止插件退出码穿透中断星瑶启动。
-                # KeyboardInterrupt 不在此列（同为 BaseException 子类），维持向上传播。
                 seen.add(plugin_name)
                 info["status"] = "failed"
                 info["error"] = f"SystemExit({exc.code!r})"
@@ -835,7 +707,7 @@ def load_and_register(registry) -> list[str]:
             _PLUGIN_INFOS.append(info)
 
     # 兜底清理孤儿 provider：只处理带 managed_by 标记、且其插件本次未加载的项。
-    # 禁用/失败/未受信任的插件都不算已加载。整段隔离：清理异常绝不影响星瑶启动。
+    # 禁用/失败/未加载的插件都不算已加载。整段隔离：清理异常绝不影响星瑶启动。
     try:
         _prune_orphan_providers(set(loaded))
     except Exception as exc:

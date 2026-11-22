@@ -332,7 +332,6 @@ def test_ask_user_out_of_range_index_is_reported_as_cancelled(monkeypatch):
 
 
 def test_permission_wait_breaks_out_promptly_on_cancel_event(monkeypatch):
-    """future.result 轮询等待：cancel_event 置位后立即返回，线程不再永久挂起。"""
     import core.llm as llm
     import main
 
@@ -374,7 +373,6 @@ def test_permission_wait_breaks_out_promptly_on_cancel_event(monkeypatch):
 
 
 def test_resolve_out_of_range_choice_is_treated_as_cancelled():
-    """resolve 越界 choice_index 不抛 KeyError，统一按取消处理并推进队列。"""
     activated = []
     broker = PermissionBroker(activate_prompt=activated.append)
     first = broker.enqueue("write_file", {}, "child-1", "turn-1", "一")
@@ -383,7 +381,6 @@ def test_resolve_out_of_range_choice_is_treated_as_cancelled():
     assert broker.resolve(first.request_id, 99) is True
 
     assert first.future.result() == CANCELLED_RESULT
-    # 队列正常推进，下一个请求被激活
     assert broker.active_request().request_id == second.request_id
     assert [request.request_id for request in activated] == [
         first.request_id,
@@ -401,7 +398,6 @@ def test_resolve_negative_choice_is_treated_as_cancelled():
 
 
 def test_permission_poll_exception_releases_enqueued_request(monkeypatch):
-    """轮询等待期间发生异常（如 KeyboardInterrupt）时回收 broker 中的请求。"""
     import core.llm as llm
     import main
 
@@ -455,7 +451,6 @@ def test_permission_poll_exception_releases_enqueued_request(monkeypatch):
 
 
 def test_ask_user_poll_exception_releases_enqueued_request(monkeypatch):
-    """ask_user 轮询异常退出时同样回收 broker 请求，避免后续提示永久排队。"""
     import core.ask_user as ask_user_module
     import main
 
@@ -505,7 +500,6 @@ def test_ask_user_poll_exception_releases_enqueued_request(monkeypatch):
 
 
 def test_ask_user_custom_answer_is_forwarded_as_custom_payload(monkeypatch):
-    """GUI 第四项输入框 / CLI 直接输入：自由文本回答原样透传给模型。"""
     import json
     import core.ask_user as ask_user_module
     import main
@@ -545,7 +539,6 @@ def test_ask_user_custom_answer_is_forwarded_as_custom_payload(monkeypatch):
 
 
 def test_cli_custom_answer_uses_real_ask_user_broker_path(monkeypatch):
-    """CLI 自由文本经激活提示与真实 ask_user 轮询完整返回。"""
     import json
     import core.ask_user as ask_user_module
     import main
@@ -599,7 +592,6 @@ def test_cli_custom_answer_uses_real_ask_user_broker_path(monkeypatch):
 
 
 def test_cli_stale_custom_answer_reports_failure_without_resolving_a_choice(monkeypatch):
-    """请求已失效时返回 False，Enter 调用方据此保留输入且直接 return。"""
     import main
 
     broker = PermissionBroker(activate_prompt=lambda request: None)
@@ -636,7 +628,6 @@ def test_cli_stale_custom_answer_reports_failure_without_resolving_a_choice(monk
 
 
 def test_custom_answer_for_non_ask_user_is_treated_as_cancelled():
-    """权限确认（允许/拒绝类）不开放自由文本：按取消兜底，不产出字符串结果。"""
     broker = PermissionBroker(activate_prompt=lambda request: None)
     request = broker.enqueue("execute_command", {"command": "rm -rf"}, "root", "turn-1", "主代理")
 
@@ -645,7 +636,6 @@ def test_custom_answer_for_non_ask_user_is_treated_as_cancelled():
 
 
 def test_resolve_custom_answer_ignores_choice_index(monkeypatch):
-    """自定义回答时 choice_index 不参与语义（前端传 -1 也不按取消处理）。"""
     broker = PermissionBroker(activate_prompt=lambda request: None)
     request = broker.enqueue("ask_user", {"question": "选哪个"}, "root", "turn-1", "主代理")
 

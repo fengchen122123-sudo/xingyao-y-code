@@ -1,5 +1,3 @@
-"""workspace_correction_ledger 动态上下文测试（规格 15.3 / 25.4）。"""
-
 import pytest
 
 from core.memory import MemoryManager
@@ -56,10 +54,8 @@ def test_correction_ledger_content_and_isolation(env):
     assert "turn-pc-1" in section
     assert "文件修改已由用户撤销" in section
     assert "必须重新读取磁盘文件" in section
-    # 不同工作区不串
     other = env["tmp"] / "other-ws"
     assert prompt_context.build_workspace_correction_section(other) == ""
-    # 同一规范化工作区的其他会话（相对路径/别名）也能看到
     assert prompt_context.build_workspace_correction_section(str(env["ws"]) + "/.") == section or \
         "turn-pc-1" in prompt_context.build_workspace_correction_section(str(env["ws"]) + "/.")
 
@@ -83,7 +79,6 @@ def test_interrupted_checkpoint_warns_not_reverted(env):
     target.write_bytes(b"new")
     tu_recorder.verify_after_mutation(handle)
     turn_undo_service.finish_turn(ctx)
-    # 模拟撤销中断（直接置 interrupted）
     env["storage"].transition_checkpoint(checkpoint.checkpoint_id, TurnUndoStatus.REVERTING)
     env["storage"].transition_checkpoint(
         checkpoint.checkpoint_id, TurnUndoStatus.INTERRUPTED,

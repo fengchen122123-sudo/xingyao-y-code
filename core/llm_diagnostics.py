@@ -1,5 +1,3 @@
-"""Token usage accounting and prompt cache diagnostics."""
-
 from __future__ import annotations
 
 import copy
@@ -11,9 +9,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# 全局变量：分离“本次窗口占比”和“整体累积消耗”
 session_token_usage = {
-    # 累积消耗（用来算钱）
     "cumulative_total": 0,
     "cumulative_prompt": 0,
     "cumulative_completion": 0,
@@ -25,7 +21,6 @@ session_token_usage = {
     "latest_prompt": 0,
     "latest_cached": 0,
 
-    # 缓存遥测（仅主代理镜像到状态栏；按会话独立累计）
     "cache_latest_rate": 0.0,
     "cache_hot_rate": 0.0,
     "cache_cumulative_rate": 0.0,
@@ -33,7 +28,7 @@ session_token_usage = {
     "cache_cumulative_cached": 0,
     "cache_invalidation_reason": "",
 
-    "max_window": 128000,  # 默认最大上下文窗口配置
+    "max_window": 128000,
 }
 # session_token_usage 会被后台 worker 线程与 UI 线程同时读写，所有读写必须走锁
 token_usage_lock = threading.Lock()
@@ -66,20 +61,6 @@ def _cache_usage_key(session_id, model_name, api_base, cache_scope="main"):
 
 
 def _strip_cache_control_markers(messages):
-    """返回消息列表的「客户端逻辑前缀」副本：脱离所有 cache_control 标记。
-
-    覆盖两种标记形态（跨渠道缓存命中率修复 · Task 2）：
-    - 消息顶层 ``cache_control``（Anthropic 协议）；
-    - ``content`` 列表内每个块的 ``cache_control``（Qwen / DashScope 兼容形态，
-      ``_apply_cache_control`` 会把字符串 content 改写为
-      ``[{"type": "text", "text": …, "cache_control": …}]``）。
-
-    除 ``cache_control`` 键外不改变任何字段值；打标引入的单文本块包装
-    （剥完后恰为 ``[{"type": "text", "text": X}]``）还原为客户端原字符串 X，
-    否则「同一批消息打标前后」的 sha256 会因 content 形态改写而漂移。
-    多块 content（如文本 + 图片）原样保留列表形态，只剥标记。
-    不修改传入对象（逐消息拷贝），调用方随后仍要拿原始消息打标、发送。
-    """
     normalized = []
     for message in messages or []:
         if not isinstance(message, dict):
@@ -129,11 +110,6 @@ def _build_cache_request_diagnostic(
     messages,
     route_override_fingerprint="",
 ):
-    """构建不含正文的确定性请求形状诊断。
-
-    route_override_fingerprint 为渠道请求形态覆盖的生效指纹（无覆盖为空串），
-    只作记录，便于事后按 route_override_sha256 归因缓存换代是否由覆盖变更引起。
-    """
     normalized_messages = _strip_cache_control_markers(messages)
     system_messages = [
         message for message in normalized_messages
@@ -162,13 +138,6 @@ def _build_cache_request_diagnostic(
 
 
 def _cache_control_request_metrics(messages):
-    """统计打标后线上消息的（显式 cache_control 标记数, 规范化字节数）。
-
-    与 `_build_cache_request_diagnostic` 的 request_bytes 使用同一规范化函数
-    （canonical JSON），保证「客户端逻辑前缀字节」(request_bytes) 与
-    「线上字节事实」(request_bytes_final) 可直接对照；标记计数覆盖消息顶层
-    与 content 块两种形态。该函数按线上原样测量，不做任何剥离。
-    """
     marker_count = 0
     for message in messages or []:
         if not isinstance(message, dict):
@@ -196,11 +165,6 @@ def _classify_cache_request_details(
     tools=None,
     route_override_fingerprint="",
 ):
-    """记录请求形状并返回可持久化的原因、哈希与公共前缀长度。
-
-    route_override_fingerprint 只透传进诊断记录（route_override_sha256），
-    不参与下方 current 的换代比较：覆盖变化不该被误判成一次缓存换代。
-    """
     state_key = (str(session_id), str(cache_scope or "main"))
     details = _build_cache_request_diagnostic(
         session_id, cache_scope, model_name, api_base, tools, messages,
@@ -270,7 +234,6 @@ def _record_cache_usage(
     model_name="",
     api_base="",
 ):
-    """分别累计当前轮、热启动与会话总命中率，并返回该通道的最新快照。"""
     if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens < 0:
         raise ValueError("prompt_tokens must be a non-negative integer")
     if isinstance(cached_tokens, bool) or not isinstance(cached_tokens, int) or cached_tokens < 0:
@@ -366,20 +329,6 @@ def record_keepalive_lane_usage(
     prompt_tokens,
     cached_tokens,
 ):
-    """把一轮保活 usage 计入 keepalive 车道桶：token 走既有记账，轮次单独 +1。
-
-    跨渠道缓存命中率修复 · Task 5 的证据数据源补记：保活亏损是稳态特征，
-    判定需要「该车道 keepalive 的轮次 + token 加权命中率」，而现有
-    _record_cache_usage 的 hot_turns 语义是「无失效原因的轮次」——保活请求
-    在 _account_server_usage 侧的 invalidation_reason 是「保活请求」（非空），
-    hot_turns 对 keepalive 桶恒为 0，不能当样本数用，因此轮次用独立的
-    ``turns`` 计数（桶结构是 dict，零迁移成本；旧桶无该键 → 0 → 样本不足 →
-    不动作，方向保守）。
-
-    本函数只做「保活 scope 补记」这一件事，不改 _record_cache_usage /
-    _normalize_server_usage / _cache_usage_key 的任何语义；main 记账路径
-    （_account_server_usage 的 main_scope 门）完全不动。
-    """
     _record_cache_usage(
         session_id,
         "keepalive",
@@ -559,14 +508,8 @@ def lane_keepalive_evidence(model_name, api_base):
     return (turns, prompt_tokens, cached_tokens, hit_rate)
 
 
-# 保活止损证据的跨进程存活（启动播种）。证据桶是内存态、进程重启即清零，而判定
-# 门槛是「该车道保活 ≥10 轮且命中率 <0.5」——意味着每次重启都要重新白烧 10 轮全价
-# 前缀才够判一次（实测亏损车道保活单轮平均 10.6 万 token，10 轮 ≈ 106 万）。
-# token_usage 里本来就有 cache_scope='keepalive' 的落库行，启动时按车道播进内存
-# 即可零成本续上，重启后第一次保活尝试前就能止损。
 PERSISTED_KEEPALIVE_EVIDENCE_SESSION = "__persisted_keepalive__"
 _KEEPALIVE_EVIDENCE_SEED_WINDOW_DAYS = 7
-# 进程启动时刻：播种窗口的右边界，用来把「本进程自己已计入内存的轮次」排除掉。
 _KEEPALIVE_EVIDENCE_PROCESS_STARTED_AT = int(time.time())
 _keepalive_lane_evidence_seeded = False
 _keepalive_lane_evidence_seed_lock = threading.RLock()
@@ -578,18 +521,6 @@ def seed_keepalive_lane_evidence_from_store(
     force=False,
     manager=None,
 ):
-    """把上一个进程留下的保活轮次播进内存证据桶，返回本次播种的车道数。
-
-    - `before_ts` 默认取进程启动时刻：本进程记的轮次已经在内存桶里，再播一遍会
-      双计（轮次翻倍 → 样本门槛被提前跨过，等于把「≥10 轮才动」的铁律削弱成 5 轮）。
-    - 窗口只取最近 `window_days` 天：保活亏损是稳态特征，但陈旧数据不该永久压制
-      一条已经好转的车道复活。
-    - 播进独立的合成会话键，不冒充任何真实会话：`get_token_usage_snapshot` 的
-      `cache_scopes` 按 (会话, 模型, 接口) 过滤，因此 GUI 的单会话保活展示不受影响，
-      而 `_scan_keepalive_lane_evidence` 的跨会话聚合能看到它。
-    - 只播一次（幂等）：`force=True` 才允许重复播种；manager 尚未就绪时不置
-      「已播种」标记，留给启动路径重试。失败只记日志，绝不影响启动。
-    """
     global _keepalive_lane_evidence_seeded
     with _keepalive_lane_evidence_seed_lock:
         if _keepalive_lane_evidence_seeded and not force:
@@ -637,8 +568,6 @@ def seed_keepalive_lane_evidence_from_store(
                     "hot_prompt": int(prompt_total),
                     "hot_cached": int(cached_total),
                     "hot_turns": int(turns),
-                    # 播种是历史合计，不冒充「最新一轮」：latest 一律留 0，
-                    # 展示层按 prompt=0 → rate=None 处理（未报告 ≠ 0）。
                     "latest_prompt": 0,
                     "latest_cached": 0,
                     "usage_valid": True,
@@ -757,7 +686,6 @@ _USAGE_FIELD_MISSING = object()
 
 
 def _usage_field(value, name):
-    """读取 dict 或 SDK 对象字段，并保留“缺失”与显式 None/0 的区别。"""
     if isinstance(value, dict):
         return value[name] if name in value else _USAGE_FIELD_MISSING
     if value is None:
@@ -766,7 +694,6 @@ def _usage_field(value, name):
 
 
 def _optional_nonnegative_int(raw, field_name, errors):
-    """把服务端整数规范为 int；拒绝会丢精度或掩盖异常的隐式转换。"""
     if raw is _USAGE_FIELD_MISSING or raw is None:
         return None
     if isinstance(raw, bool):
@@ -786,7 +713,6 @@ def _optional_nonnegative_int(raw, field_name, errors):
 
 
 def _normalize_server_usage(usage):
-    """归一化并严格校验一次服务端 usage，不估算或夹断任何真实 token。"""
     errors = []
     prompt_raw = _usage_field(usage, "prompt_tokens")
     completion_raw = _usage_field(usage, "completion_tokens")
@@ -813,7 +739,6 @@ def _normalize_server_usage(usage):
     if prompt_raw is _USAGE_FIELD_MISSING or prompt_raw is None:
         errors.append("prompt_tokens is required")
     if total_raw is _USAGE_FIELD_MISSING or total_raw is None:
-        # Anthropic 协议不返回 total_tokens：由 input+output 推导，不算缺失。
         if prompt is not None and completion is not None:
             total = prompt + completion
         else:
@@ -909,15 +834,6 @@ def _extract_cached_tokens(usage):
 
 
 def _extract_cache_write_tokens(usage):
-    """读取本轮缓存**写入** token；未报告 → None（Task 7 · 缓存读写分列）。
-
-    候选名与 cached 同构的三个来源：details 内嵌、OpenAI 兼容直读、
-    Anthropic 形态（`_anthropic_usage_to_openai` 会把 cache_creation 单独透出）。
-    刻意**不**进 `_normalize_server_usage` 的返回结构：那是既有调用方与测试的
-    精确契约，而写入量只影响「写入轮不算未命中」这一列展示，不该改变记账结构。
-
-    铁律：未报告 ≠ 0。非法值一律按未报告处理（返回 None），不猜、不夹断。
-    """
     if usage is None:
         return None
     details = _usage_field(usage, "prompt_tokens_details")
@@ -938,7 +854,6 @@ def _extract_cache_write_tokens(usage):
 
 
 def _persist_cache_request_diagnostic(request_details, usage):
-    """补齐 usage 并持久化请求诊断；失败不影响回复或正式 token 记账。"""
     if not request_details:
         logger.warning("缓存请求诊断缺少请求形状，已跳过持久化")
         return
@@ -962,7 +877,6 @@ def _persist_cache_request_diagnostic(request_details, usage):
         "usage_valid": usage_record["valid"],
         "usage_errors": tuple(usage_record["errors"]),
     })
-    # Task 7（缓存读写分列）：写入量从原始 usage 单独提取，未报告 → None。
     diagnostic["cache_write_tokens"] = _extract_cache_write_tokens(usage)
     try:
         from core import app_context
@@ -1059,8 +973,6 @@ def _account_server_usage(
         "api_base": api_base,
         "cache_scope": cache_scope,
     }
-    # 未报告写入量时不带该键：调用方（含测试替身）对 kwargs 做精确断言，
-    # 恒定多一个 None 键同样会改变既有契约。未报告 → 落库 NULL，语义不变。
     cache_write_tokens = _extract_cache_write_tokens(usage)
     if cache_write_tokens is not None:
         persist_kwargs["cache_write_tokens"] = cache_write_tokens

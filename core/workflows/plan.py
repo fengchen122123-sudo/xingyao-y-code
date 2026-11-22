@@ -1,27 +1,9 @@
-"""星流工作流运行计划（IR）：校验、受限表达式求值（ZCode 导入设计 §5.8 后继批次）。
-
-执行模型从「模型转译」升级为「确定性解释器」的中间表示：
-
-- ``.dwf.ts`` 仍是源格式（兼容/分享/人读）；``workflow_save`` 时模型可顺带产出
-  ``plan``（本模块定义的步骤图），经严格校验后作为 ``<name>.dwf.plan.json``
-  边车落盘；``workflow_run`` 发现有合法 plan → 解释器逐步执行、每步发事件；
-  没有 plan 或 plan 非法 → 回退现有转译执行（双模式并存，降级无感）。
-
-安全边界：
-
-- ``command`` 步骤只接受 argv 字面量（无 shell、无变量拼接）；
-- ``loop`` 必须带 1..20 的硬上限（无界循环在计划层即拒绝）；
-- ``while`` 条件经受限 AST 求值（只允许比较/布尔/字面量/变量引用）；
-- 步骤总数上限 500，parallel 分支上限 8。
-"""
-
 from __future__ import annotations
 
 import ast
 import json
 import re
 
-#: 步骤 op 集合（v1 子集）。
 STEP_OPS = ("phase", "agent", "command", "report", "log", "parallel", "loop", "fallback")
 
 MAX_STEPS = 500
@@ -31,7 +13,6 @@ MAX_PLAN_DEPTH = 6
 
 _TEMPLATE_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)\}")
 
-#: while 条件 AST 允许的节点与比较符（白名单之外一律拒绝）。
 _ALLOWED_CONDITION_NODES = (
     ast.Expression,
     ast.BoolOp,
@@ -54,12 +35,10 @@ _ALLOWED_COMPARE_OPS = (
     ast.NotIn,
 )
 
-#: walk 会遍历出非值节点（比较符/布尔符/一元符/上下文标记），检查时跳过。
 _OP_KINDS = (ast.operator, ast.boolop, ast.unaryop, ast.cmpop, ast.Load, ast.Store, ast.Del)
 
 
 def check_condition_grammar(expression: str) -> None:
-    """校验 while 条件语法形状：模板占位符替换成 None 后走白名单（不含值检查）。"""
     stubbed = _TEMPLATE_RE.sub("None", str(expression))
     try:
         tree = ast.parse(stubbed, mode="eval")
@@ -151,7 +130,6 @@ def _walk_steps(steps, depth: int, counter: list[int], errors: list[str], path: 
                 errors.append(f"{where}: fallback 缺少 fallback 数组")
             else:
                 _walk_steps(fallback_steps, depth + 1, counter, errors, f"{where}.fallback")
-        # report/log：value/message 必填在执行时按表达式求值，这里只查键存在
         if op in ("report", "log"):
             key = "value" if op == "report" else "message"
             if key not in step:
@@ -159,7 +137,6 @@ def _walk_steps(steps, depth: int, counter: list[int], errors: list[str], path: 
 
 
 def validate_plan(plan) -> list[str]:
-    """校验 plan，返回全部错误（空列表 = 合法）。"""
     if not isinstance(plan, dict):
         return ["plan 必须是对象"]
     errors: list[str] = []
@@ -167,9 +144,6 @@ def validate_plan(plan) -> list[str]:
     counter = [0]
     _walk_steps(steps, 0, counter, errors, "steps")
     return errors
-
-
-# -- 受限求值 --
 
 
 def resolve_path(scope: dict, path: str):
@@ -230,9 +204,8 @@ def eval_condition(expression: str, scope: dict) -> bool:
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, (ast.List, ast.Tuple, ast.Dict)):
-            return ast.literal_eval(node)  # 纯数据字面量（替换产物），直接取值
+            return ast.literal_eval(node)
         if isinstance(node, ast.Name):
-            # 替换后的变量已是字面量；残留裸名说明引用了未绑定变量
             raise PlanError(f"条件引用了未绑定的变量: {node.id}")
         if isinstance(node, ast.BoolOp):
             values = [_eval(v) for v in node.values]

@@ -1,15 +1,3 @@
-"""外观与人设管理工具（theme_manage / persona_manage）。
-
-职责边界：
-- 主题相关全部委托给 core.gui_theme.ThemeRepository（Schema 校验、内置主题
-  只读、ZIP 导入导出、资源读取都复用它的公开方法），本模块只做参数解析、
-  统一 JSON 封装与错误中文转述，绝不自己实现校验规则；
-- 人设读写复用 core.persona_settings（长度校验与落盘都在那一层）；
-- 刻意不 import gui_bridge / main / pywebview：GUI 侧只需要"尽力而为"的
-  通知，通过 core.app_context 探测已注册的上下文是否提供对应方法，
-  CLI / headless 下探测不到就直接跳过。
-"""
-
 from __future__ import annotations
 
 import base64
@@ -40,9 +28,6 @@ def _theme_error_class():
     return ThemeError
 
 
-# ---------------------------------------------------------------------------
-# 统一 JSON 输出
-# ---------------------------------------------------------------------------
 def _dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
@@ -60,19 +45,14 @@ def _fail(error: Any, **extra: Any) -> str:
 
 
 def _fail_theme(exc: ThemeError) -> str:
-    """把 ThemeError 的 code/path 一并回传给模型，便于自我修正参数。"""
     return _fail(exc.message or str(exc), code=exc.code, path=exc.path)
 
 
-# ---------------------------------------------------------------------------
-# 参数辅助
-# ---------------------------------------------------------------------------
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
 def _payload_mapping(payload: Any) -> dict[str, Any]:
-    """payload 允许传对象，也容忍模型把 JSON 序列化成字符串传进来。"""
     if payload is None:
         return {}
     if isinstance(payload, Mapping):
@@ -91,12 +71,6 @@ def _payload_mapping(payload: Any) -> dict[str, Any]:
 
 
 def _theme_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """取一份可用于保存的主题清单。
-
-    repository.get_theme() / save_theme() 返回的是"派生 DTO"，多带一个只读的
-    ``builtin`` 标记；持久化 Schema 不含该字段（与 GUI 侧保存路径处理一致），
-    这里只剥掉这一个派生字段，其余内容原样交给 Repository 校验。
-    """
     return {key: value for key, value in payload.items() if key != "builtin"}
 
 
@@ -107,15 +81,7 @@ def _local_path(value: Any, label: str) -> Path:
     return Path(text).expanduser()
 
 
-# ---------------------------------------------------------------------------
-# GUI 通知（best-effort）
-# ---------------------------------------------------------------------------
 def _notify_theme_activated(theme_id: str) -> dict[str, Any]:
-    """激活主题后尽力通知已注册的 GUI 上下文重绘；失败不影响工具结果。
-
-    用 getattr 探测方法而不是 import gui_bridge：CLI / headless 进程里根本
-    没有这些方法，探测不到就静默跳过。
-    """
     try:
         from core import app_context
 
@@ -132,7 +98,6 @@ def _notify_theme_activated(theme_id: str) -> dict[str, Any]:
             try:
                 method(theme_id)
             except TypeError:
-                # 某些刷新方法不接受参数（无参刷新）
                 method()
         except Exception as exc:  # noqa: BLE001 - GUI 侧失败只记录
             return {
@@ -144,9 +109,6 @@ def _notify_theme_activated(theme_id: str) -> dict[str, Any]:
     return {"notified": False, "reason": "GUI 上下文未提供主题刷新方法"}
 
 
-# ---------------------------------------------------------------------------
-# theme_manage 各动作
-# ---------------------------------------------------------------------------
 _THEME_ACTIONS = (
     "list", "get", "active", "activate", "save", "copy", "rename", "delete",
     "import", "export", "read_asset",
@@ -315,9 +277,6 @@ def theme_manage(
         return _fail(f"theme_manage 执行失败：{exc}")
 
 
-# ---------------------------------------------------------------------------
-# persona_manage
-# ---------------------------------------------------------------------------
 _PERSONA_ACTIONS = ("get", "set")
 
 
@@ -350,9 +309,6 @@ def persona_manage(
         return _fail(f"persona_manage 执行失败：{exc}")
 
 
-# ---------------------------------------------------------------------------
-# ToolSpec 装配
-# ---------------------------------------------------------------------------
 _THEME_ARGUMENTS = frozenset({
     "action", "theme_id", "payload", "source_path", "output_path", "asset_path",
 })
@@ -442,7 +398,6 @@ _PERSONA_SCHEMA: dict[str, Any] = {
 
 
 def build_specs() -> list[ToolSpec]:
-    """返回 theme_manage / persona_manage 两个工具契约。"""
     return [
         ToolSpec(
             name="theme_manage",

@@ -1,6 +1,5 @@
 from concurrent.futures import Future
 
-import hashlib
 
 import pytest
 
@@ -12,7 +11,6 @@ from rich.text import Text
 
 
 def _undo_cli_turn(tmp_path, session, turn, target, original, replacement):
-    """CLI 撤销测试夹具：真实 turn_undo 服务 + 一个覆盖目标文件的回合。"""
     from core.memory import MemoryManager
     from core.turn_undo import service as tu_service
     from core.turn_undo import recorder as tu_recorder
@@ -46,7 +44,6 @@ def _undo_cli_turn(tmp_path, session, turn, target, original, replacement):
 def test_undo_existing_empty_file_does_not_require_delete_confirmation(
     tmp_path, monkeypatch
 ):
-    """空文件被覆盖后按回合撤销：恢复原空内容，无需任何删除确认语义。"""
     from core.memory import MemoryManager
     from core.turn_undo import service as tu_service
 
@@ -67,7 +64,6 @@ def test_undo_existing_empty_file_does_not_require_delete_confirmation(
 
 
 def test_checkpoint_restore_preserves_original_non_utf8_bytes(tmp_path, monkeypatch):
-    """按回合撤销快照保存原始字节：GBK 文件恢复后与覆盖前逐字节一致。"""
     session = "cli-checkpoint-bytes"
     target = tmp_path / "legacy-gbk.txt"
     original = "旧版内容".encode("gbk")
@@ -298,7 +294,6 @@ def test_cancel_active_turn_cancels_permissions_and_foreground_subagents(monkeyp
 
     main._cancel_active_turn()
 
-    # 取消完全由每 turn 的 cancel_event 驱动，不再写 core.llm.cancel_requested
     assert cancel_event.is_set()
     assert cancelled_turns == ["turn-owned"]
     assert cancelled_subagents == [("session-owned", "turn-owned")]
@@ -469,8 +464,6 @@ def test_tool_started_switches_ui_to_executing_state(monkeypatch):
 
 
 def test_plan_item_events_print_one_line_and_refresh_panel(monkeypatch):
-    """计划项事件统一走 ui_markers：<mark> <subject>，不再有各异的动词前缀
-    和末尾多余的 " ✓"（见 core/ui_markers.py 与 main.py 的 plan_item_* 分支）。"""
     factory = TurnEventFactory("turn-plan-events")
     printed = []
     invalidated = []
@@ -583,7 +576,6 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
     main._render_ui_event(factory.emit("thinking_started"))
     main._render_ui_event(factory.emit("thinking_delta", {"text": "用户说了"}))
     main._render_ui_event(factory.emit("thinking_delta", {"text": "\"你好\""}))
-    # 800ms 阈值：极短思考不打印分隔行，这里模拟思考耗时 1s 越过阈值
     main.think_start_time -= 1.0
 
     assert main.active_thinking_text == '用户说了"你好"'
@@ -592,15 +584,12 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
 
     main._render_ui_event(factory.emit("thinking_finished"))
 
-    # 思考内容和完成分隔线都不进入终端历史。
     plain_so_far = Text.from_ansi("".join(writes)).plain
     assert "思考完成" not in plain_so_far
     assert "用户说了" not in plain_so_far
-    # 思考结束后面板延迟隐藏：保留最后一帧思考内容，直到下一个事件到来
     assert main.active_thinking_text == '用户说了"你好"'
     assert main.active_thinking_turn_id is None
 
-    # 模型开始输出正文时，延迟显示的思考内容被清除
     main._render_ui_event(factory.emit("assistant_delta", {"text": "答"}))
     assert main.active_thinking_text == ""
     main._render_ui_event(factory.emit("turn_finished"))
@@ -613,7 +602,6 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
 
 
 def test_thinking_segments_do_not_print_completion_dividers(monkeypatch):
-    """多段思考不刷空完成行，且结束后仍正常输出最终回答。"""
     factory = TurnEventFactory("turn-thinking-segments")
     fragments = []
 
@@ -734,7 +722,6 @@ def test_grouped_tool_output_stays_outside_markdown_buffer(monkeypatch):
 
 
 def test_brief_thinking_under_800ms_prints_no_divider_line(monkeypatch):
-    """极短思考（< 800ms，常见于模型回填的占位 reasoning）不打印分隔行，避免刷屏。"""
     factory = TurnEventFactory("turn-thinking-brief")
     fragments = []
 
@@ -747,7 +734,6 @@ def test_brief_thinking_under_800ms_prints_no_divider_line(monkeypatch):
 
     main._render_ui_event(factory.emit("thinking_started"))
     main._render_ui_event(factory.emit("thinking_delta", {"text": " "}))
-    # 不调整 think_start_time：事件瞬时完成，耗时 < 800ms
     main._render_ui_event(factory.emit("thinking_finished"))
 
     assert "思考完成" not in Text.from_ansi("".join(fragments)).plain
@@ -853,7 +839,6 @@ def test_evict_oldest_turn_removes_complete_rounds_only():
     assert main._evict_oldest_turn(history) is True
     assert [m["role"] for m in history] == ["system"]
 
-    # 仅剩 system 消息时无可淘汰轮次
     assert main._evict_oldest_turn(history) is False
     assert [m["role"] for m in history] == ["system"]
 
@@ -866,7 +851,6 @@ def test_evict_oldest_turn_keeps_user_boundary_when_history_starts_with_assistan
     ]
 
     assert main._evict_oldest_turn(history) is True
-    # 淘汰到下一个 user 边界为止，剩余历史仍以 user 开头
     assert [m["role"] for m in history] == ["system", "user"]
 
 
@@ -909,7 +893,6 @@ def test_drain_ui_events_survives_a_bad_event(monkeypatch):
     main.ui_event_queue.put(good)
     main.drain_ui_events()
 
-    # 坏事件不卡死队列：后续正常事件仍被消费并重置状态
     assert main.ui_event_queue.empty()
     assert main.task_status == "idle"
 
@@ -922,17 +905,14 @@ def test_background_worker_survives_malformed_task(monkeypatch):
     printed = []
     monkeypatch.setattr(main, "schedule_ui", lambda callback: scheduled.append(callback))
     monkeypatch.setattr(main, "print_formatted_text", lambda value, **kwargs: printed.append(value))
-    # 使用测试私有队列：worker 测试结束后阻塞在私有队列上，
-    # 不会消费后续测试投递到全局 msg_queue 的消息
     local_queue = queue.Queue()
     monkeypatch.setattr(main, "msg_queue", local_queue)
 
     worker = threading.Thread(target=main._background_worker, daemon=True)
     worker.start()
-    local_queue.put({})  # 缺少 text/was_queued 字段，必然触发 KeyError
+    local_queue.put({})
     local_queue.join()
 
-    # 兜底 try/except 保证 worker 不死，且异常已调度到 UI 线程提示
     assert worker.is_alive()
     assert len(scheduled) >= 1
     for callback in scheduled:
@@ -942,7 +922,6 @@ def test_background_worker_survives_malformed_task(monkeypatch):
 
 
 def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
-    """防回归：trigger_session_auto_rename 不得残留已删除函数的 return 语句（NameError）。"""
 
     class ImmediateThread:
         def __init__(self, target, daemon):
@@ -972,13 +951,10 @@ def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
 
     result = main.trigger_session_auto_rename("session_abc123", "帮我写个冒泡排序", "m", "k", "u")
 
-    # 同步执行完整个 _rename_job：不再抛 NameError，且重命名结果已调度回 UI 线程
     assert result is None
     assert len(scheduled) == 1
-    scheduled[0]()  # update_ui 在 app_instance=None 下可安全执行
+    scheduled[0]()
 
-
-# ── 会话选择器关闭后的切回防御（_resolve_session_after_selector）──
 
 class _FakeManager:
     def __init__(self, names):
@@ -989,7 +965,6 @@ class _FakeManager:
 
 
 def test_new_unsaved_session_survives_esc_from_selector(monkeypatch):
-    """新会话（未入库）按 Esc 返回时不得被切到最近会话"""
     import main as main_mod
 
     monkeypatch.setattr(
@@ -1003,7 +978,6 @@ def test_new_unsaved_session_survives_esc_from_selector(monkeypatch):
 
 
 def test_deleted_existing_session_falls_back_to_most_recent(monkeypatch):
-    """已入库会话在选择器里被删除后才切回到最近会话"""
     import main as main_mod
 
     monkeypatch.setattr(
@@ -1017,7 +991,6 @@ def test_deleted_existing_session_falls_back_to_most_recent(monkeypatch):
 
 
 def test_deleted_last_remaining_session_gets_fresh_name(monkeypatch):
-    """所有会话都被删除时回退到全新的 hex 会话名"""
     import main as main_mod
 
     monkeypatch.setattr(main_mod, "manager", _FakeManager([]))
@@ -1030,7 +1003,6 @@ def test_deleted_last_remaining_session_gets_fresh_name(monkeypatch):
 
 
 def test_existing_session_still_present_is_untouched(monkeypatch):
-    """已入库且未被删除的会话保持不变"""
     import main as main_mod
 
     monkeypatch.setattr(
@@ -1044,7 +1016,6 @@ def test_existing_session_still_present_is_untouched(monkeypatch):
 
 
 def test_new_command_creates_and_switches_session(monkeypatch):
-    """/new 创建全新会话并切换；历史会话不受影响。"""
     created = []
     synced = []
     printed = []
@@ -1093,9 +1064,6 @@ def test_effort_command_shows_current_level(monkeypatch):
 
 
 def test_effort_command_shows_toggle_off_choice(monkeypatch):
-    # toggle 型模型（如 minimax-m3）选"关闭"后，无参查看必须显示 off/关闭，
-    # 而不是兼容接口 get_model_reasoning_effort 返回 None 导致的错误 "default"。
-    # 注：kimi 家族已统一为 always_on_effort（不可关闭），不再适用本用例。
     import core.model_manager as mm
 
     printed = []
@@ -1116,8 +1084,6 @@ def test_effort_command_shows_toggle_off_choice(monkeypatch):
 
 
 def test_effort_command_fixed_model_hint(monkeypatch):
-    # fixed 型模型（如 minimax-m2.5）始终开启思考，应给提示而非档位列表。
-    # 注：kimi-k2.7-code 已并入 kimi 家族的能力档位列表，不再属 fixed 型。
     import core.model_manager as mm
 
     printed = []
@@ -1194,8 +1160,6 @@ def test_turn_finished_clears_completed_plan(tmp_path, monkeypatch):
 
 
 def test_plan_item_handoff_prints_takeover_notice_once(monkeypatch):
-    """active 接管打印一次固定接管提示；重复 live update 不刷屏；
-    queued 项显示固定队列文案与位置。"""
     factory = TurnEventFactory("turn-plan-handoff")
     printed = []
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
@@ -1217,7 +1181,6 @@ def test_plan_item_handoff_prints_takeover_notice_once(monkeypatch):
         "queue_position": 0,
     }
     main._render_ui_event(factory.emit("plan_item_handoff", dict(active_payload)))
-    # 重复 live update（同 item 同 mode）不刷屏
     main._render_ui_event(factory.emit("plan_item_handoff", dict(active_payload)))
 
     assert len(printed) == 1
@@ -1241,8 +1204,6 @@ def test_plan_item_handoff_prints_takeover_notice_once(monkeypatch):
 
 
 def test_writeback_rejected_prints_reason_instead_of_plan_mark(monkeypatch):
-    """回写被拒是调度诊断信息：必须打印原因本身，不能套用计划项的 <mark> 渲染
-    （否则会把计划项显示成它原来的 pending 状态，反而误导用户）。"""
     factory = TurnEventFactory("turn-writeback-rejected")
     printed = []
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
@@ -1262,18 +1223,12 @@ def test_writeback_rejected_prints_reason_instead_of_plan_mark(monkeypatch):
     assert "pending" in plain
 
 
-# ---------------------------------------------------------------------------
-# /turns 命令：CLI 设置单任务最大模型轮次（与 GUI 系统设置共用同一份配置）
-# ---------------------------------------------------------------------------
-
 def _turns_env(tmp_path, monkeypatch, data):
-    """隔离 config.json 到 tmp_path 并捕获终端输出；返回 (config 路径, 输出行列表)。"""
     import json as _json
 
     import config
 
     cfg_path = tmp_path / "config.json"
-    # 空 dict 会被 config.py 写闸门判为读失败而拒写，故补最小可用结构。
     payload = data if data else {"active_model_id": None, "providers": []}
     cfg_path.write_text(_json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg_path))
@@ -1334,11 +1289,7 @@ def test_turns_command_without_args_shows_current_and_usage(tmp_path, monkeypatc
     assert "/turns" in rendered
 
 
-# ---------------- 交互式控制台守卫（非 TTY 环境快速失败） ----------------
-
-
 class _FakeTTYStream:
-    """最小流替身：只为守卫提供 isatty()。"""
 
     def __init__(self, tty: bool) -> None:
         self._tty = tty
@@ -1364,7 +1315,7 @@ def test_require_interactive_console_exits_with_headless_guidance_when_stdout_pi
     rendered = capsys.readouterr().err
     assert "标准输出" in rendered
     assert "TTY" in rendered
-    assert "-p" in rendered  # headless 模式引导
+    assert "-p" in rendered
 
 
 def test_require_interactive_console_exits_when_only_stdin_piped(monkeypatch, capsys):
@@ -1379,13 +1330,6 @@ def test_require_interactive_console_exits_when_only_stdin_piped(monkeypatch, ca
 
 
 def test_run_cli_checks_console_before_any_initialization():
-    """接线断言：run_cli 首个可执行语句（跳过 docstring/global 声明）必须是控制台守卫。
-
-    非 TTY 管道下若守卫不在一切初始化副作用（模型选择器/后台线程/MCP 预热/
-    首绘 print_logo）之前，prompt_toolkit Win32Output 仍会裸崩溃
-    （NoConsoleScreenBufferError）。与 test_computer_cli.py 的 __main__
-    AST 测试同一模式。
-    """
     import ast
     import pathlib
 
@@ -1410,7 +1354,6 @@ def test_run_cli_checks_console_before_any_initialization():
     assert callee_name == "_require_interactive_console"
 
 def test_undo_list_preview_and_ambiguous_short_id(tmp_path, monkeypatch):
-    """/undo list 与 preview 正常工作；短 ID 歧义显式拒绝（规格 17.2）。"""
     from core.memory import MemoryManager
     from core.turn_undo import service as tu_service
     from core.turn_undo import recorder as tu_recorder
@@ -1431,7 +1374,6 @@ def test_undo_list_preview_and_ambiguous_short_id(tmp_path, monkeypatch):
         lambda obj: printed.append(str(obj)),
     )
 
-    # 两个同前缀回合制造短 ID 歧义 + 一个真实可撤销回合
     ws = tmp_path / "ws"
     target = ws / "x.py"
     for turn in ("aaaaaaaa-1", "aaaaaaaa-2", "bbbbbbbb-3"):
@@ -1452,11 +1394,9 @@ def test_undo_list_preview_and_ambiguous_short_id(tmp_path, monkeypatch):
     main.handle_slash_command("/undo list")
     main.handle_slash_command("/undo preview bbbbbbbb")
 
-    # 歧义前缀：显式拒绝并要求完整 ID
     printed.clear()
     main.handle_undo_command("/undo aaaaaaaa", session)
     assert any("匹配到 2 个回合" in line for line in printed)
-    # 精确短 ID 正常
     printed.clear()
     main.handle_undo_command("/undo preview bbbbbbbb-3", session)
     assert any("撤销影响" in line for line in printed if isinstance(line, str)) or printed

@@ -68,7 +68,7 @@ describe('Subpage - 来源筛选（全部/内置/用户）', () => {
   });
 
   function visibleNames(wrapper: ReturnType<typeof mount>): string[] {
-    return wrapper.findAll('.sub-card .sc-name').map(n => n.text());
+    return wrapper.findAll('.sub-row .row-name').map(n => n.text());
   }
 
   it('技能页默认显示全部，可按内置/用户筛选', async () => {
@@ -76,7 +76,7 @@ describe('Subpage - 来源筛选（全部/内置/用户）', () => {
     store.skills = [
       { id: 's1', name: '内置技能A', description: '', enabled: true, source: 'builtin' },
       { id: 's2', name: '用户技能B', description: '', enabled: true, source: 'user' },
-      { id: 's3', name: '旧技能C', description: '', enabled: false }, // 无 source 按用户算
+      { id: 's3', name: '旧技能C', description: '', enabled: false },
     ];
     const wrapper = mountSubpage('skills');
 
@@ -84,7 +84,7 @@ describe('Subpage - 来源筛选（全部/内置/用户）', () => {
     expect(visibleNames(wrapper)).toHaveLength(3);
 
     await wrapper.get('[data-test="src-filter-builtin"]').trigger('click');
-    expect(visibleNames(wrapper)).toEqual(['内置技能A 内置']);
+    expect(visibleNames(wrapper)).toEqual(['内置技能A']);
 
     await wrapper.get('[data-test="src-filter-user"]').trigger('click');
     const userNames = visibleNames(wrapper).join('|');
@@ -104,7 +104,7 @@ describe('Subpage - 来源筛选（全部/内置/用户）', () => {
     const wrapper = mountSubpage('skills');
 
     await wrapper.get('[data-test="src-filter-user"]').trigger('click');
-    expect(wrapper.findAll('.sub-card')).toHaveLength(0);
+    expect(wrapper.findAll('.sub-row')).toHaveLength(0);
     expect(wrapper.text()).toContain('没有符合筛选条件的技能');
   });
 
@@ -159,17 +159,14 @@ describe('Subpage - 恢复内置版本', () => {
   it('仅对已偏离内置版本（from_builtin 且 source 非 builtin）的技能显示恢复按钮', () => {
     const store = useAppStore();
     store.skills = [
-      // 被用户改过：曾由内置释放但当前 source 非 builtin → 显示恢复入口
       { id: 'drifted', name: '被改过的内置技能', description: '', enabled: true, source: 'user', from_builtin: true },
-      // 仍是内置：自身即内置源，无需恢复 → 不显示
       { id: 'pure', name: '纯内置技能', description: '', enabled: true, source: 'builtin', from_builtin: true },
-      // 纯用户技能：并非内置释放 → 不显示
       { id: 'user-skill', name: '用户技能', description: '', enabled: true, source: 'user' },
     ];
     const wrapper = mountSubpage('skills');
 
     expect(wrapper.findAll('[data-test="restore-skill-btn"]')).toHaveLength(1);
-    const cards = wrapper.findAll('.sub-card');
+    const cards = wrapper.findAll('.sub-row');
     expect(cards[0].find('[data-test="restore-skill-btn"]').exists()).toBe(true);
     expect(cards[1].find('[data-test="restore-skill-btn"]').exists()).toBe(false);
     expect(cards[2].find('[data-test="restore-skill-btn"]').exists()).toBe(false);

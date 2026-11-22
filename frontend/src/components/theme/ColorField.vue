@@ -30,7 +30,6 @@ const props = defineProps<{
   prefix: string;
   value: string;
   disabled?: boolean;
-  // Windows 原生标题栏走 DWM COLORREF，无 alpha 通道，只接受 #RRGGBB。
   opaqueOnly?: boolean;
 }>();
 
@@ -83,7 +82,6 @@ function onPickerInput(event: Event) {
   if (validate(value)) emit('commit', props.field.key, value);
 }
 
-// 外部替换模型（取消/切换主题/恢复继承）时同步文本框并清除错误。
 watch(
   () => props.value,
   (value) => {

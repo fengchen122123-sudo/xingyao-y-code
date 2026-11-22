@@ -1,10 +1,3 @@
-"""真实 provider 压缩墙钟计时（dev-compact 验证用）。
-
-对合成的大历史会话跑 compress_session_memory，记录分段耗时。
-用法：
-  python scripts/bench_compression_timing.py probe   # 小规模链路验证（1 段）
-  python scripts/bench_compression_timing.py compare # 新旧行为对比（多段，两轮）
-"""
 import sys
 import os
 import time
@@ -19,7 +12,7 @@ import core.memory_compressor as mc
 from core.model_manager import load_config
 
 MODEL = "openai/qwen3.8-flash"
-DELAY_BEHAVIOR = {"inter_chunk_delay_seconds": 1.5}  # 模拟修复前的无条件延时
+DELAY_BEHAVIOR = {"inter_chunk_delay_seconds": 1.5}
 ROUNDS = [
     ("旧行为(段间延时1.5s)", DELAY_BEHAVIOR),
     ("新行为(自适应0s)", {}),
@@ -27,7 +20,6 @@ ROUNDS = [
 
 
 def build_session(mgr, session, turns):
-    """构造 turns 轮历史，每轮 ~3600 CJK 字符（≈3600 token）。"""
     for i in range(turns):
         mgr.add_messages(session, [
             ("user", "第%d轮：请帮我重构模块%d并解释设计取舍。" % (i, i) + "背景上下文。" * 500),
@@ -45,7 +37,7 @@ def run_once(label, overrides):
     tmp = tempfile.mkdtemp()
     mgr = MemoryManager(os.path.join(tmp, "bench.db"))
     session = "bench_" + str(int(time.time()))
-    build_session(mgr, session, turns=25)  # ~90K 字符 ≈ 90K token → 4 段左右
+    build_session(mgr, session, turns=25)
     key = ""
     base = ""
     for p in load_config().get("providers", []):

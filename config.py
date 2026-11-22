@@ -65,13 +65,6 @@ _HISTORY_BACKUP_KEEP = 10
 
 
 def _history_backup_path(path):
-    """为 ``path + ".bak"`` 生成一份不重名的历史备份名：``config.json.bak.YYYYmmdd-HHMMSS``。
-
-    必须保持 ``.bak.`` 点分形式：``_recover_from_history_backups`` 用
-    ``glob(path + ".bak.*")`` 找历史备份，换成其它分隔符就再也找不到。
-    同一秒内多次写入时时间戳会相同，此时追加毫秒和递增序号，绝不覆盖已有历史备份
-    （否则「同一秒连续写两次」只留一份，等于把轮转退化成单备份）。
-    """
     base = f"{path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
     if not os.path.exists(base):
         return base
@@ -85,7 +78,6 @@ def _history_backup_path(path):
 
 
 def _prune_history_backups(path, keep=_HISTORY_BACKUP_KEEP):
-    """只保留最近 ``keep`` 份历史备份（按 mtime 倒序），更早的删掉。"""
     try:
         candidates = [item for item in glob.glob(path + ".bak.*") if os.path.isfile(item)]
         if len(candidates) <= keep:
@@ -111,7 +103,7 @@ def _rotate_history_backup(path, backup_path):
         if not os.path.exists(backup_path):
             return
         with open(backup_path, "r", encoding="utf-8") as f:
-            json.load(f)  # 只校验可解析：已损坏的 .bak 没有转存价值
+            json.load(f)
     except Exception as error:  # noqa: BLE001
         _log_warning("%s 未转存为历史备份（%s）", os.path.basename(backup_path), error)
         return
@@ -125,12 +117,6 @@ def _rotate_history_backup(path, backup_path):
 
 
 def _backup_if_valid(path):
-    """仅在当前文件是合法 JSON 时刷新 .bak 备份，保证备份始终是最近一份可用配置。
-
-    覆盖 .bak 之前先把旧的合法 .bak 转存成 ``config.json.bak.YYYYmmdd-HHMMSS``
-    历史备份，让「备份跟着主文件一起坏」也有更早的恢复源可用。
-    """
-    # 调用方可能传 pathlib.Path（ui_layout / permission_store 等），统一成 str
     path = os.fspath(path)
     backup_path = path + ".bak"
     try:
@@ -148,7 +134,6 @@ def _backup_if_valid(path):
 
 
 def _log_warning(message, *args):
-    """配置写失败等异常写入 runtime warnings 日志，而不是静默吞掉。"""
     try:
         logging.getLogger("py.warnings").warning(message, *args)
     except Exception:
@@ -156,19 +141,6 @@ def _log_warning(message, *args):
 
 
 def _config_read_failed(path):
-    """主文件存在但读不到用户数据：属于「读失败」，不是首次运行。
-
-    写路径用它做最后一道闸：读不出来时宁可拒绝保存，也不能拿空配置覆盖用户数据
-    （历史事故：读失败 → load_config 写默认 → 17 个厂商配置被 1 个默认厂商替换）。
-
-    「读失败」的判定口径（三者等价，都是「磁盘上拿不到用户数据」）：
-      - 文件有内容但解析不出 JSON（合法损坏）；
-      - 文件存在但 0 字节：空文件只可能是截断/异常残留，写路径若拿空 dict 顶替，
-        单键保存就会把文件覆盖成只剩这一个键；
-      - 能解析但顶层不是 dict，或顶层是空对象 ``{}``：正常写入的配置至少含
-        providers 或 active_model_id，空对象同样意味着「用户数据没读到」。
-    文件**不存在**仍返回 False（真首次运行，允许写默认结构）。
-    """
     try:
         if not os.path.exists(path):
             return False
@@ -182,7 +154,6 @@ def _config_read_failed(path):
 
 
 def _quarantine_corrupt_config(path):
-    """把无法解析的配置留一份现场副本（只复制、不改动原文件），便于事后人工恢复。"""
     target = f"{path}.corrupt-{time.strftime('%Y%m%d%H%M%S')}"
     try:
         shutil.copy2(path, target)
@@ -191,22 +162,10 @@ def _quarantine_corrupt_config(path):
         _log_warning("%s 读取失败，现场副本保存失败（%s）", os.path.basename(path), error)
 
 
-# 备份恢复的顶层类型契约：不同用途的 JSON 文件顶层结构不同，必须按文件逐一定义，
-# 不能一刀切放宽成「dict 或 list 都算可用」。
-#   - config.json 等配置型文件是对象：主文件被误写成 list 时，若把 list 备份当配置
-#     恢复，就会用非法结构覆盖用户配置，所以仍要求非空 dict；
-#   - active_skills.json / builtin_skills_released.json 本身以 list 存储，沿用
-#     「非空 dict」判据会把唯一可用的备份判为无效，导致激活技能/释放记录静默清空。
 _LIST_TYPED_JSON_FILES = {"active_skills.json", "builtin_skills_released.json"}
 
 
 def _expected_json_root_type(path):
-    """该文件备份恢复时要求的 JSON 顶层类型（dict / list）。
-
-    按文件名判定而非按调用方传参，是为了让所有既有读取点（含测试里 monkeypatch
-    出来的临时路径）无需改动就拿到正确契约；未知文件默认按配置型（dict）对待，
-    保持本次修复前的严格行为。
-    """
     return list if os.path.basename(path) in _LIST_TYPED_JSON_FILES else dict
 
 
@@ -255,7 +214,6 @@ _DIAG_CALLER_DEPTH = 3
 
 
 def _diag_snapshot(data):
-    """取配置诊断快照：providers 数量与 active_model_id（不含任何密钥）。"""
     if not isinstance(data, dict):
         return {"providers": None, "active_model_id": None}
     providers = data.get("providers")
@@ -266,7 +224,6 @@ def _diag_snapshot(data):
 
 
 def _diag_disk_snapshot(path):
-    """写入前磁盘上的配置快照；读不出来时各字段为 None（表示"未知"，不是"0 个"）。"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return _diag_snapshot(json.load(f))
@@ -275,7 +232,6 @@ def _diag_disk_snapshot(path):
 
 
 def _diag_callers(limit=_DIAG_CALLER_DEPTH):
-    """最近 N 层非本文件的调用帧，格式 "file:line in func"（由外到内）。"""
     frames = []
     try:
         for frame in reversed(traceback.extract_stack()[:-1]):
@@ -290,7 +246,6 @@ def _diag_callers(limit=_DIAG_CALLER_DEPTH):
 
 
 def _diag_write(path, before, after):
-    """记录一次结构化写入诊断；仅在 providers 减少/清零时升级为 WARNING。"""
     try:
         payload = (
             "%s 写入诊断：providers %s -> %s，active_model_id %r -> %r，调用方 %s",
@@ -358,7 +313,6 @@ def _copy_cached(data):
 
 
 def _read_json_with_backup(path, default=None):
-    """读取 JSON；使用 mtime 缓存，仅在磁盘文件真正改变时才重新读取磁盘，极大提升多窗口/高频刷新性能。"""
     try:
         current_mtime = os.path.getmtime(path)
         # 缓存探测/提交必须在 _CONFIG_LOCK 内完成：mtime 与 data 两个字段的
@@ -425,14 +379,11 @@ def _read_json_with_backup(path, default=None):
         _log_warning("%s 读取失败且没有可用备份，本次不覆盖原文件", os.path.basename(path))
         return default
 
-# 获取用户目录下的 .ycode 文件夹。测试/隔离运行可在进程启动前显式覆盖，
-# 默认生产路径保持不变。
 YCODE_DIR = os.environ.get("YCODE_DATA_DIR") or os.path.join(
     os.path.expanduser("~"), ".ycode"
 )
 os.makedirs(YCODE_DIR, exist_ok=True)
 
-# 集中定义所有持久化文件路径
 _CONFIG_FILE = os.path.join(YCODE_DIR, "config.json")
 DB_FILE = os.path.join(YCODE_DIR, "ycode.db")
 # GUI 使用独立的会话库：GUI 与 CLI 的对话记录互不可见、互不影响
@@ -443,36 +394,39 @@ MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")
 _TOML_CONFIG_FILE = os.path.join(YCODE_DIR, "config.toml")
 _TOML_CACHE: dict[str, dict] = {}
 
-# 局域网手机远程控制的配对 token 过期时间（秒）
 REMOTE_TOKEN_TTL_KEY = "remote_token_ttl"
 REMOTE_TOKEN_TTL_DEFAULT = 86400
-# 配对 token 与绝对过期时间戳（秒）的持久化键：应用重启后 token 保持固定
 REMOTE_PAIR_TOKEN_KEY = "remote_pair_token"
 REMOTE_PAIR_TOKEN_EXPIRES_KEY = "remote_pair_token_expires_at"
-# 配对端口持久化键：重启后复用同一端口，二维码 URL 不变、无需重新扫码
 REMOTE_PAIR_PORT_KEY = "remote_pair_port"
-# 局域网 MCP 服务（供手机端 MCP 客户端如阶跃 Amoo 调用）：默认开启，与远程控制共用配对 token
 REMOTE_MCP_ENABLED_KEY = "remote_mcp_enabled"
 REMOTE_MCP_ENABLED_DEFAULT = True
 REMOTE_MCP_PORT_KEY = "remote_mcp_port"
 REMOTE_MCP_PORT_DEFAULT = 8765
+REMOTE_PUBLIC_URL_KEY = "remote_public_url"
+# serve 进程：true 时权限请求不等待客户端，直接拒绝。
+SERVE_AUTO_DENY_KEY = "serve_auto_deny_permissions"
 
-# 飞书通道（在飞书里与星瑶对话）：默认关闭，未配置时不影响任何现有功能。
-# app_secret 写盘前经 core.credentials 加密（dpapi:/keyring: 前缀），读取时解密。
 FEISHU_ENABLED_KEY = "feishu_enabled"
 FEISHU_ENABLED_DEFAULT = False
 FEISHU_APP_ID_KEY = "feishu_app_id"
 FEISHU_APP_ID_DEFAULT = ""
 FEISHU_APP_SECRET_KEY = "feishu_app_secret"
 FEISHU_APP_SECRET_DEFAULT = ""
-# 审批白名单（open_id 列表）；为空时审批卡不渲染按钮
 FEISHU_APPROVERS_KEY = "feishu_approvers"
 FEISHU_APPROVERS_DEFAULT: tuple = ()
-# 固定推送落点（群/单聊 chat_id，oc_ 开头）；为空时推给最后说话的会话
 FEISHU_NOTIFY_CHAT_ID_KEY = "feishu_notify_chat_id"
 FEISHU_NOTIFY_CHAT_ID_DEFAULT = ""
 
-# 自动从当前源码目录初始化默认配置文件
+CLOUD_RELAY_ENABLED_KEY = "cloud_relay_enabled"
+CLOUD_RELAY_ENABLED_DEFAULT = False
+CLOUD_RELAY_URL_KEY = "cloud_relay_url"
+CLOUD_RELAY_URL_DEFAULT = ""
+CLOUD_RELAY_TOKEN_KEY = "cloud_relay_token"
+CLOUD_RELAY_TOKEN_DEFAULT = ""
+CLOUD_RELAY_DEVICE_ID_KEY = "cloud_relay_device_id"
+CLOUD_RELAY_DEVICE_ID_DEFAULT = ""
+
 if not os.path.exists(_CONFIG_FILE):
     default_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     if os.path.exists(default_config_path):
@@ -520,7 +474,6 @@ if not os.path.exists(_CONFIG_FILE):
             pass
 
 def _deep_merge(base, overlay):
-    """深合并：overlay 优先。dict 递归合并，list/标量整体替换；返回新对象，不污染入参。"""
     if isinstance(base, dict) and isinstance(overlay, dict):
         merged = dict(base)
         for key, value in overlay.items():
@@ -539,8 +492,6 @@ def _read_toml_overlay(path):
         with _CONFIG_LOCK:
             _TOML_CACHE.pop(path, None)
         return None
-    # 缓存探测/提交必须持锁：mtime 与 data 两字段分两次写入，无锁并发下
-    # 检查-写入交错会让读方拿到 mtime 与内容不配套的条目
     with _CONFIG_LOCK:
         cache_entry = _TOML_CACHE.setdefault(path, {"mtime": 0, "data": None})
         if cache_entry["data"] is not None and cache_entry["mtime"] == current_mtime:
@@ -588,11 +539,6 @@ def _warn_toml_overridden_keys(keys):
 
 
 def _load(managed=True):
-    """读取有效配置（JSON + TOML overlay 合并）；``managed=False`` 供写路径读用户原值。
-
-    受管策略（企业/团队管理员基线）在返回前套用：``permission_mode`` 超出上限时
-    降档并留警告。受管文件缺失时结果与改动前逐字节一致。
-    """
     data = _read_json_with_backup(_CONFIG_FILE, default=None)
     result = data if isinstance(data, dict) else {}
     overlay = _read_toml_overlay(_TOML_CONFIG_FILE)
@@ -661,11 +607,6 @@ def __getattr__(name):
 
 
 def _providers_wiped(before, after) -> bool:
-    """写入前厂商非空、写入后变成空/缺失：视为数据被抹掉，拒绝落盘。
-
-    历史事故：残缺数据（空对象/零字节/被删）经 load 拿到近似空配置后再保存单键，
-    会把用户全部厂商一次性清掉，随后插件自举重建出"只剩 3 个厂商"的假象。
-    """
     if not isinstance(before, dict) or not isinstance(after, dict):
         return False
     before_providers = before.get("providers")
@@ -676,15 +617,6 @@ def _providers_wiped(before, after) -> bool:
 
 
 def update_config(mutator, *, allow_provider_wipe: bool = False):
-    """在进程内锁中执行 load→mutate→原子写，消除读-改-写竞态（TOCTOU 丢失更新）。
-
-    mutator 接收当前配置 dict：原地修改后返回 None，或返回一个全新的 dict 作为写入内容。
-    返回值为实际写入的配置 dict。mutator 改动了同时被 config.toml 覆盖的键时，
-    写入运行时告警（TOML 读取时后合并，实际生效值仍以 TOML 为准）。
-    受管策略锁定的键（permission_mode 超上限）变更被拒绝（回退写入前值）并提示。
-    allow_provider_wipe 仅给『用户明确删除最后一个厂商』这类路径使用，
-    其余调用一律拒绝把 providers 写空（防止残缺配置把用户厂商一次性抹掉）。
-    """
     with _CONFIG_LOCK:
         data = _load(managed=False)
         if _config_read_failed(_CONFIG_FILE):
@@ -714,12 +646,6 @@ def update_config(mutator, *, allow_provider_wipe: bool = False):
 
 
 def save_config_value(key, value):
-    """保存配置项并持久化写入 config.json（原子写 + 进程内锁）。
-
-    该键同时被 config.toml 覆盖时写入运行时告警：TOML 读取时后合并，
-    保存"成功"但实际生效值仍以 TOML 为准。
-    受管策略锁定的键（permission_mode 超出管理员上限）拒绝写入并提示"由管理员锁定"。
-    """
     try:
         with _CONFIG_LOCK:
             data = _load(managed=False)
@@ -777,8 +703,6 @@ def save_nested_config_value(dotted_key, value):
             parent[child_key] = value
             data, rejected = enforce_managed_writes(data, before)
             _atomic_write_json(_CONFIG_FILE, data)
-        # config.toml 是只读覆盖层（读取时后合并）：同名子键会盖掉刚写入的值，
-        # 保存"成功却不生效"必须留痕
         overlay = _read_toml_overlay(_TOML_CONFIG_FILE)
         if isinstance(overlay, dict):
             section = overlay.get(parent_key)
@@ -795,63 +719,44 @@ def save_nested_config_value(dotted_key, value):
         return False
 
 
-# ---------------------------------------------------------------------------
-# T2 配置未知键校验：手改 config.json 拼错字段名时给出可见告警（此前静默无效）。
-# 只校验「键名」，不做类型/取值校验，也不触碰任何写路径。
-# 已知键来源 = config.example.json + config.py 默认结构 + 各模块运行时读写键的并集。
-# ---------------------------------------------------------------------------
-
 KNOWN_CONFIG_KEYS = frozenset({
-    # 模型与厂商
     "active_model_id", "secondary_model_id", "secondary_model_roles", "providers",
     # 旧版单模型格式（_resolve_constant 兼容读取 model/api_key/base_url）
     "model", "api_key", "base_url",
     # 权限与工作区
     "permission_mode", "allow_outside_workspace",
-    # 运行与界面
     "theme", "gui_theme_light", "gui_theme_id",
     "command_shell", "shell_env_policy",
     "agent_turn_step_limit", "prompt_cache_keepalive_seconds",
     "mermaid_auto_open", "read_file_result_max_chars",
-    # 断点续跑总开关（S4）：只登记键名，缺省=关闭；关闭时状态机、事件序列、
-    # 请求字节与改动前完全一致（规格 §9.5）
+    "pet_enabled", "pet_electron_path", "pet_notify_enabled",
+    "pet_skin_id",
+    "pet_chat_enabled", "pet_chat_model_id", "pet_chat_idle_seconds",
     "resume",
-    # 记忆/图片压缩
     "memory_compression", "image_compression",
-    # 工具、安全与数据目录
     "search_exclude_dirs", "skill_search_paths",
     "fetch_url_allow_hosts", "fetch_url_strict_ssrf",
     "expose_mcp_admin_tools", "project_hook_full_input",
     "ai_output_dir",
-    # 电脑操控
+    # 全局子代理开关（默认开启；false 时不派发子代理，计划编排工具
+    # plan_write/plan_update 一并不可用，所有子任务由主 Agent 直接完成）
+    "subagent_enabled",
     "browser_control_enabled", "computer_control_enabled", "computer_browser",
-    # 局域网远程控制
     "remote_token_ttl", "remote_pair_token", "remote_pair_token_expires_at",
     "remote_pair_port",
-    # 局域网 MCP 服务（供手机端 MCP 客户端调用；未登记会在 strict_config=true
-    # 下被 UnknownConfigKeysError 阻断启动）
     "remote_mcp_enabled", "remote_mcp_port",
-    # 飞书通道（在飞书里与星瑶对话）
+    "remote_public_url", "serve_auto_deny_permissions",
     "feishu_enabled", "feishu_app_id", "feishu_app_secret", "feishu_approvers",
     "feishu_notify_chat_id",
-    # 数据迁移
+    "cloud_relay_enabled", "cloud_relay_url", "cloud_relay_token", "cloud_relay_device_id",
     "media_v1_migration_done",
-    # 本任务新增：严格模式开关
     "strict_config",
-    # 缓存路由显式配置（core/route_overrides.py CONFIG_KEY、core/llm_dialects.py
-    # _KEEPALIVE_ROUTES_CONFIG_KEY）、保活
-    # 证据门开关（_KEEPALIVE_EVIDENCE_GATE_CONFIG_KEY）与 prompt_cache_key
-    # 白名单（_AFFINITY_LANES_CONFIG_KEY）。
-    # deepseek_cache_routes：已废弃不再读取（ledger 改纯模型家族判定），保留
-    # 键仅为旧 config.json 兼容（写入无任何效果，不会触发未知键告警）。
     "route_request_overrides", "cache_keepalive_routes", "deepseek_cache_routes",
     "cache_keepalive_evidence_gate", "cache_affinity_lanes",
 })
 
-# 已知嵌套对象（两层）允许的子键：顶层键 -> 子键集合
 KNOWN_NESTED_CONFIG_KEYS = {
     "secondary_model_roles": frozenset({"vision", "compression", "subagent"}),
-    # 断点续跑（默认关闭）：只允许 enabled 一个子键，拼错时启动告警可见
     "resume": frozenset({"enabled"}),
     "image_compression": frozenset({"max_edge", "quality", "max_output_bytes"}),
     "memory_compression": frozenset({
@@ -860,8 +765,6 @@ KNOWN_NESTED_CONFIG_KEYS = {
         "tool_result_token_limit", "summary_length_first", "summary_length_merge",
         "max_chunk_token_budget", "inter_chunk_delay_seconds", "max_total_seconds",
         "precompress_ratio",
-        # 水位线计算基准上限（tokens）：core/memory_compressor 读取、core/context_watermark
-        # 读写。漏登记会让启动误报「未知配置键（不会生效）」，strict_config 下还会阻断启动。
         "watermark_base_tokens", "model_watermark_bases",
     }),
     "shell_env_policy": frozenset({
@@ -869,10 +772,8 @@ KNOWN_NESTED_CONFIG_KEYS = {
     }),
 }
 
-# providers[] 与 providers[].models[] 条目的已知键（含可选扩展键）
 _KNOWN_PROVIDER_KEYS = frozenset({
     "id", "name", "base_url", "api_key", "protocol", "preset_id", "models",
-    # Qwen 缓存策略可挂在 provider 级（core.llm_dialects._QWEN_CACHE_CONFIG_KEYS）
     "enable_prompt_cache", "prompt_cache", "enable_cache_control", "cache_control",
     # 历史功能键：dd839a0（2026-09-19）前的「预设模型删除痕迹」功能已移除，
     # 老配置可能残留此键，按兼容保留（不报未知，避免 strict 模式误阻断启动）。
@@ -936,11 +837,6 @@ def _unknown_config_key_entries(data):
 
 
 def find_unknown_config_keys(data):
-    """返回配置 dict 中未知键的点分路径列表（如 "memory_compression.retain_cout"）。
-
-    覆盖顶层、已知嵌套对象两层、providers[]/providers[].models[] 条目；
-    非 dict 输入返回空列表。
-    """
     return [path for path, _ in _unknown_config_key_entries(data)]
 
 

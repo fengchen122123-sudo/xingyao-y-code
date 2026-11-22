@@ -35,7 +35,6 @@
           <span v-if="store.updateState.assetName" class="asset-name">({{ store.updateState.assetName }})</span>
         </div>
 
-        <!-- 下载中进度条 -->
         <div v-if="store.updateState.status === 'downloading'" class="download-progress-box">
           <div class="progress-info">
             <span>正在下载新版本安装包...</span>
@@ -49,7 +48,6 @@
           </div>
         </div>
 
-        <!-- 下载完成提示 -->
         <div v-else-if="store.updateState.status === 'downloaded'" class="downloaded-tip">
           <AppIcon name="check-circle" :size="16" class="tip-icon-success" />
           <span>安装包已就绪，安装完成后将自动清理安装包。</span>
@@ -57,25 +55,21 @@
       </div>
 
       <div class="modal-foot">
-        <!-- 未下载状态 -->
         <template v-if="store.updateState.status === 'available' || store.updateState.status === 'idle'">
           <button class="btn" @click="store.closeUpdateModal()">稍后提醒</button>
           <button class="btn primary" @click="store.startDownloadUpdate()">立即下载更新</button>
         </template>
 
-        <!-- 下载中状态 -->
         <template v-else-if="store.updateState.status === 'downloading'">
           <button class="btn danger" @click="store.cancelDownloadUpdate()">取消下载</button>
           <button class="btn primary" @click="store.closeUpdateModal()">后台下载</button>
         </template>
 
-        <!-- 下载完成状态 -->
         <template v-else-if="store.updateState.status === 'downloaded'">
           <button class="btn" @click="store.closeUpdateModal()">稍后安装</button>
           <button class="btn primary install-btn" @click="handleInstall">立即安装并重启</button>
         </template>
 
-        <!-- 安装中状态 -->
         <template v-else-if="store.updateState.status === 'installing'">
           <button class="btn primary" disabled>正在启动安装向导...</button>
         </template>
@@ -122,29 +116,31 @@ function handleInstall() {
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  padding: 16px;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
   display: none;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
-  backdrop-filter: blur(2px);
+  z-index: 5400;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 .modal-mask.show {
   display: flex;
 }
 .update-modal {
-  width: 520px;
-  max-width: 90vw;
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  width: 500px;
+  max-width: calc(100vw - 32px);
+  background: var(--xy-card, var(--bg1));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
   overflow: hidden;
   animation: pop 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 @keyframes pop {
   from {
-    transform: scale(0.95);
+    transform: translateY(6px) scale(0.97);
     opacity: 0;
   }
   to {
@@ -153,19 +149,18 @@ function handleInstall() {
   }
 }
 .modal-head {
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border);
+  padding: 18px 20px 12px;
   display: flex;
   align-items: center;
   gap: 12px;
   position: relative;
 }
 .modal-head .mh-ico {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  background: var(--accent-soft);
-  color: var(--accent);
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--xy-accent-soft, var(--accent-soft));
+  color: var(--xy-accent, var(--accent));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -217,9 +212,9 @@ function handleInstall() {
 }
 
 .modal-body {
-  padding: 18px;
+  padding: 4px 20px 18px;
   font-size: 13px;
-  background: var(--bg2);
+  background: transparent;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -228,21 +223,20 @@ function handleInstall() {
 .section-label {
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   margin-bottom: 6px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.2px;
 }
 
 .release-notes-box {
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 14px;
-  max-height: 180px;
+  background: var(--xy-surface, var(--bg2));
+  border: 1px solid var(--xy-border, var(--border));
+  border-radius: 10px;
+  padding: 12px 14px;
+  max-height: 190px;
   overflow-y: auto;
   line-height: 1.6;
-  color: var(--text);
+  color: var(--xy-text-2, var(--text));
 }
 .release-notes-box ul {
   margin: 0;
@@ -271,7 +265,6 @@ function handleInstall() {
   opacity: 0.8;
 }
 
-/* 下载进度条 */
 .download-progress-box {
   background: var(--bg1);
   border: 1px solid var(--border);
@@ -323,43 +316,52 @@ function handleInstall() {
 }
 
 .modal-foot {
-  padding: 13px 18px;
+  padding: 0 20px 18px;
   display: flex;
-  gap: 10px;
+  gap: 8px;
   justify-content: flex-end;
-  border-top: 1px solid var(--border);
-  background: var(--bg1);
+  background: transparent;
 }
 .btn {
-  border-radius: 8px;
-  padding: 7px 16px;
+  height: 34px;
+  border-radius: 9px;
+  padding: 0 15px;
   font-size: 13px;
-  border: 1px solid var(--border);
-  background: var(--bg3);
-  color: var(--text);
+  font-weight: 500;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  background: transparent;
+  color: var(--xy-text-2, var(--text));
   cursor: pointer;
-  transition: 0.15s;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, filter 0.14s ease;
 }
 .btn:hover {
-  border-color: var(--text-faint);
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
 }
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-  font-weight: 600;
+  background: var(--xy-accent, var(--accent));
+  border-color: transparent;
+  color: var(--xy-accent-fg, #fff);
+  font-weight: 500;
 }
 .btn.primary:hover {
-  opacity: 0.9;
+  background: var(--xy-accent, var(--accent));
+  color: var(--xy-accent-fg, #fff);
+  filter: brightness(0.93);
 }
 .btn.primary.install-btn {
-  background: #238636;
-  border-color: #238636;
+  background: var(--xy-green, #238636);
+  border-color: transparent;
 }
 .btn.danger {
-  background: var(--red);
-  border-color: var(--red);
+  background: var(--xy-rose, var(--red));
+  border-color: transparent;
   color: #fff;
+}
+.btn.danger:hover {
+  background: var(--xy-rose, var(--red));
+  color: #fff;
+  filter: brightness(0.93);
 }
 .mono {
   font-family: var(--mono);

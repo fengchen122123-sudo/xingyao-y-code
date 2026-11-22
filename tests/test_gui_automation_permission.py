@@ -1,8 +1,3 @@
-"""星轨自动化任务：无人值守权限自动拒绝（规格 5.5）。
-
-用真实 permission_broker 单例验证 resolve/future 语义；人工回合行为
-（无限等待 + PermCard 事件）必须分毫未动。
-"""
 import threading
 
 import pytest
@@ -34,13 +29,11 @@ def _make_bridge(manager):
     events = []
     bridge.emit_event = lambda etype, payload: events.append((etype, payload))
     bridge._events = events
-    # 人工路径会触达的 undo 影响查询桩掉（自动化路径在它之前返回）
     bridge._undo_turn_impact_for_event = lambda request: None
     return bridge
 
 
 def _enqueue_request(turn_id: str):
-    """通过真实 broker 入队一条默认三选项权限请求（choice_0/1/2）。"""
     request = broker_module.permission_broker.enqueue(
         "execute_command",
         {"command": "rm -rf /"},
@@ -68,33 +61,26 @@ def test_automation_permission_auto_denied_with_notice(manager, _clean_broker):
     broker_module.permission_broker.set_prompt_handlers(
         bridge._activate_permission_request, bridge._dismiss_permission_prompt
     )
-    # enqueue 未触发（注册前已激活）→ 手动激活
     bridge._activate_permission_request(request)
 
-    # future 已被以"拒绝"（索引 1）结算
     assert request.future.done()
     assert request.future.result(timeout=0) == 1
-    # 不弹权限卡
     assert all(e[0] != "permission_request" for e in bridge._events)
-    # 有 notice 留痕
     notices = [e for e in bridge._events if e[0] == "notice"]
     assert notices and "无人值守已自动拒绝" in notices[0][1]["message"]
     assert "每日摘要" in notices[0][1]["message"]
-    # 必须带归属会话：前端按 session_name 路由，缺省会串到当前查看的其他会话
     assert notices[0][1]["session_name"] == "星轨自动化任务"
 
 
 def test_human_permission_request_unaffected(manager, _clean_broker):
     bridge = _make_bridge(manager)
     turn_id = "turn-human-1"
-    # 不在自动化映射中 → 人工回合路径
     request = _enqueue_request(turn_id)
     broker_module.permission_broker.set_prompt_handlers(
         bridge._activate_permission_request, bridge._dismiss_permission_prompt
     )
     bridge._activate_permission_request(request)
 
-    # 权限卡事件已推送，future 仍未结算（无限等待语义）
     assert any(e[0] == "permission_request" for e in bridge._events)
     assert not request.future.done()
     assert broker_module.permission_broker.is_active(request.request_id)
@@ -126,27 +112,18 @@ def test_automation_permission_keyed_options_use_deny_key(manager, _clean_broker
     bridge._activate_permission_request(request)
 
     assert request.future.done()
-    # 命中 deny 键 → resolve_by_key 返回该键索引
     assert request.future.result(timeout=0) == 1
 
 
 def test_automation_label_cleaned_after_turn(manager, tmp_path):
-    """终态回写后 turn_labels 必须清空（配合 dispatch 测试的 worker 用例）。"""
     bridge = _make_bridge(manager)
     assert bridge._automation_turn_labels == {}
-    # 清理动作本身在 worker finally 中（见 test_gui_automation_dispatch）；
-    # 这里仅验证映射结构约定：标签包含 run_id 与 task_name
     bridge._automation_turn_labels["turn-x"] = {"run_id": "run-x", "task_name": "t"}
     bridge._automation_turn_labels.pop("turn-x", None)
     assert bridge._automation_turn_labels == {}
 
 
-# ---------------------------------------------------------------------------
-# 评审修复回归：P1-2 子代理权限归属自动拒绝 / P2-4 ask_user 取消
-# ---------------------------------------------------------------------------
-
 def test_subagent_of_automation_turn_auto_denied(manager, _clean_broker, monkeypatch):
-    """P1-2：自动化回合派生的子代理权限请求（owner=task_id）同样自动拒绝。"""
     from core.tools import SubagentTask, subagent_manager
 
     bridge = _make_bridge(manager)
@@ -160,7 +137,7 @@ def test_subagent_of_automation_turn_auto_denied(manager, _clean_broker, monkeyp
                               parent_turn_id=automation_turn, description="子任务")],
     )
 
-    request = _enqueue_request("sub-1")  # 子代理请求的 parent_turn_id 是 task_id
+    request = _enqueue_request("sub-1")
     broker_module.permission_broker.set_prompt_handlers(
         bridge._activate_permission_request, bridge._dismiss_permission_prompt
     )
@@ -173,7 +150,6 @@ def test_subagent_of_automation_turn_auto_denied(manager, _clean_broker, monkeyp
 
 
 def test_subagent_of_human_turn_not_denied(manager, _clean_broker, monkeypatch):
-    """人工回合派生的子代理不受影响：正常弹卡等待用户。"""
     from core.tools import SubagentTask, subagent_manager
 
     bridge = _make_bridge(manager)
@@ -195,13 +171,11 @@ def test_subagent_of_human_turn_not_denied(manager, _clean_broker, monkeypatch):
 
 
 def test_ask_user_cancelled_not_auto_answered(manager, _clean_broker):
-    """P2-4：自动化回合的 ask_user 走取消语义，绝不自动选第 2 个回答项。"""
     bridge = _make_bridge(manager)
     turn_id = "turn-automation-ask"
     bridge._automation_turn_labels[turn_id] = {"run_id": "run-9", "task_name": "调研任务"}
 
     request = _enqueue_request(turn_id)
-    # 伪造 ask_user：任意回答项字符串
     request = broker_module.permission_broker.enqueue(
         "ask_user",
         {"question": "选哪个方案？"},

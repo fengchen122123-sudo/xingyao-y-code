@@ -1,24 +1,5 @@
-/**
- * mobile-shim.js —— 局域网手机远程控制的 transport shim
- *
- * 桌面上 pywebview 注入 window.pywebview.api（RPC）与 window.onBridgeEvent（事件）。
- * 手机上无 pywebview，本 shim 用 WebSocket 模拟这两者，使手机加载同一个 dist 前端、
- * 复用全部组件与主题。
- *
- * 约定（与 core/lan_server.py 对齐）：
- * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验；断线重连时附带
- *   {"token", "last_seq"}，服务器按补发缓冲回放缺失的关键事件
- *   （turn_error/notice/permission_request 等，见 REPLAYABLE_EVENT_TYPES）。
- * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
- * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
- *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
- * - 配对 token：首次从 URL 参数取并写入 localStorage，随后立即用 history.replaceState
- *   清理地址栏 query（保留 path/hash），token 不残留于浏览器历史/截图/分享链接；
- *   之后刷新/重开（URL 无 token）回退读 localStorage，直到服务端 TTL 过期或被
- *   轮换（4401）才失效。
- */
 (function () {
-  if (window.pywebview) return; // 桌面环境不注入，防御性
+  if (window.pywebview) return;
 
   var STORAGE_KEY = 'yc-pair-token';
   var urlToken = new URLSearchParams(window.location.search).get('token') || '';
@@ -42,14 +23,115 @@
       }
     } catch (_) {}
   }
-  var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
-  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
+  var usedToken = token;
+  // 云中转的完整桌面 UI / 独立移动端：服务器注入 __ycRelayDevice，直接连网关 relay。
+  // 注入值有一个坑：SPA 子路由刷新时服务端会把路由名当设备号注入（/m/convo）。
+  // 设备号是 UUID，注入值不像 UUID 就回退到上次记住的 UUID，否则刷新后连接的是假设备。
+  var DEVICE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  var injectedDevice = window.__ycRelayDevice || '';
+  var rememberedDevice = '';
+  var rememberedPrefix = '';
+  try {
+    rememberedDevice = window.localStorage.getItem('yc-relay-device') || '';
+    rememberedPrefix = window.localStorage.getItem('yc-relay-prefix') || '';
+    if (DEVICE_RE.test(injectedDevice)) {
+      window.localStorage.setItem('yc-relay-device', injectedDevice);
+      rememberedDevice = injectedDevice;
+    }
+  } catch (_) {}
+  var relayDevice = DEVICE_RE.test(injectedDevice)
+    ? injectedDevice
+    : (DEVICE_RE.test(rememberedDevice)
+      ? rememberedDevice
+      : ((window.location.pathname || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i) || [''])[0]);
+  // 网关可能被反代到子路径（如 /xy/bot/desktop/<设备号> 或刷新后的 /xy/bot/m/convo）：
+  // ws 端点必须跟着前缀走，否则固定打根路径 /relay/client 会 404。
+  var relayPrefix = '';
+  if (relayDevice) {
+    var pathname = window.location.pathname || '';
+    var relaySegs = pathname.split('/');
+    var relayAt = relaySegs.indexOf(relayDevice);
+    if (relayAt > 1) {
+      relayPrefix = relaySegs.slice(0, relayAt - 1).join('/');
+    } else {
+      for (var si = 1; si < relaySegs.length; si++) {
+        if (relaySegs[si] === 'm' || relaySegs[si] === 'desktop') {
+          relayPrefix = relaySegs.slice(0, si).join('/');
+          break;
+        }
+      }
+      if (!relayPrefix && rememberedPrefix) relayPrefix = rememberedPrefix;
+    }
+    try {
+      if (DEVICE_RE.test(injectedDevice)) {
+        window.localStorage.setItem('yc-relay-prefix', relayPrefix);
+      }
+    } catch (_) {}
+  }
+  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + (relayDevice ? relayPrefix + '/relay/client?device_id=' + encodeURIComponent(relayDevice) : '/');
 
   var ws = null;
   var seq = 0;
-  var lastSeq = 0;        // 最后收到的补发事件 seq（服务器侧单调递增）
-  var hadConnection = false; // 是否发生过连接：区分全新页面与断线重连
-  var pending = new Map(); // id -> {resolve, reject}
+  var lastSeq = 0;
+  var bootId = '';
+  var sawHello = false;
+  var legacy = false;
+  var resyncing = false;
+  var pausedSeq = 0;
+  var held = [];
+  var seen = {};
+  var refetchOnce = false;
+  var hadConnection = false;
+  var pending = new Map();
+
+  function isCapacitor() {
+    return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+  }
+
+  function watermarkKey() {
+    var account = window.__ycAccountId || '';
+    var profile = window.__ycProfile || (relayDevice ? 'relay:' + relayDevice : 'lan');
+    return 'yc-watermark:' + window.location.origin + '|' + account + '|' + profile;
+  }
+
+  function loadWatermark() {
+    if (isCapacitor()) return;
+    try {
+      var raw = window.localStorage.getItem(watermarkKey());
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      bootId = parsed.boot_id || '';
+      lastSeq = Number(parsed.last_seq) || 0;
+    } catch (_) {}
+  }
+
+  function saveWatermark() {
+    if (isCapacitor() || legacy || (!bootId && !relayDevice)) return;
+    try {
+      window.localStorage.setItem(watermarkKey(), JSON.stringify({
+        boot_id: bootId,
+        last_seq: lastSeq,
+      }));
+    } catch (_) {}
+  }
+
+  loadWatermark();
+
+  window.__ycClearTransport = function () {
+    bootId = '';
+    lastSeq = 0;
+    seen = {};
+    held = [];
+    try { window.localStorage.removeItem(watermarkKey()); } catch (_) {}
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+    }
+    pending.forEach(function (item) {
+      if (item.timer) clearTimeout(item.timer);
+      item.reject(new Error('连接已关闭'));
+    });
+    pending.clear();
+  };
 
   function rpc(method, args) {
     return new Promise(function (resolve, reject) {
@@ -58,17 +140,87 @@
         return;
       }
       var id = ++seq;
-      pending.set(id, { resolve: resolve, reject: reject });
+      // 设备离线/对端失联时不能无限等：否则 App 的启动页永远关不掉。
+      var timer = setTimeout(function () {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        reject(new Error('连接超时，电脑可能离线'));
+      }, 25000);
+      pending.set(id, { resolve: resolve, reject: reject, timer: timer });
       ws.send(JSON.stringify({ method: method, args: args, id: id }));
+    });
+  }
+
+  function turnIsTerminal(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return false;
+    var status = snapshot.status || snapshot.state || '';
+    return status === 'completed' || status === 'cancelled' || status === 'canceled'
+      || status === 'error' || status === 'failed' || status === 'stopped'
+      || status === 'interrupted';
+  }
+
+  function acceptFrame(msg) {
+    var frameSeq = typeof msg.seq === 'number' ? msg.seq : null;
+    if (frameSeq !== null) {
+      var key = (bootId || '') + ':' + frameSeq;
+      if (seen[key]) return;
+      seen[key] = true;
+      if (frameSeq > lastSeq) lastSeq = frameSeq;
+      saveWatermark();
+    }
+    if (resyncing) {
+      held.push(msg);
+      return;
+    }
+    if (window.onBridgeEvent) window.onBridgeEvent(msg);
+  }
+
+  function beginResync() {
+    resyncing = true;
+    held = [];
+    pausedSeq = lastSeq;
+    rpc('get_initial_state', []).then(function (state) {
+      window.dispatchEvent(new CustomEvent('yc-initial-state', { detail: state }));
+      var batch = held;
+      held = [];
+      resyncing = false;
+      var snapshots = (state && state.active_turn_snapshots) || {};
+      var terminal = false;
+      if (snapshots && typeof snapshots === 'object') {
+        Object.keys(snapshots).forEach(function (name) {
+          if (turnIsTerminal(snapshots[name])) terminal = true;
+        });
+      }
+      var uncertain = false;
+      batch.forEach(function (frame) {
+        if (typeof frame.seq === 'number' && frame.seq <= pausedSeq) return;
+        if ((frame.type === 'token_delta' || frame.type === 'thinking_delta') && terminal) return;
+        if ((frame.type === 'token_delta' || frame.type === 'thinking_delta') && !state) {
+          uncertain = true;
+          return;
+        }
+        if (window.onBridgeEvent) window.onBridgeEvent(frame);
+      });
+      if (uncertain && !refetchOnce) {
+        refetchOnce = true;
+        beginResync();
+      }
+    }, function () {
+      resyncing = false;
+      held = [];
     });
   }
 
   function connect() {
     ws = new WebSocket(wsUrl);
     ws.onopen = function () {
+      sawHello = false;
       var auth = { token: token };
-      if (hadConnection) {
-        // 断线重连：携带水位请求补发，锁屏/切后台期间的关键事件不丢
+      if (relayDevice) { auth.device_id = relayDevice; auth.jwt = token; }
+      if (bootId && !legacy) {
+        auth.last_boot_id = bootId;
+        auth.last_seq = lastSeq;
+      } else if (hadConnection && !legacy) {
         auth.last_seq = lastSeq;
       }
       hadConnection = true;
@@ -94,10 +246,10 @@
         return;
       }
       if (msg && typeof msg.id !== 'undefined') {
-        // RPC 响应
         var p = pending.get(msg.id);
         if (p) {
           pending.delete(msg.id);
+          if (p.timer) clearTimeout(p.timer);
           if (msg.error) {
             p.reject(new Error(msg.error));
           } else {
@@ -105,16 +257,78 @@
           }
         }
       } else if (msg && msg.type) {
-        if (typeof msg.seq === 'number' && msg.seq > lastSeq) {
-          lastSeq = msg.seq; // 先记录水位再派发，避免处理器抛错丢水位
+        if (msg.type === 'hello') {
+          sawHello = true;
+          bootId = (msg.data && msg.data.boot_id) || bootId;
+          saveWatermark();
+          return;
         }
-        if (window.onBridgeEvent) {
-          // 事件广播（对象 {type, data, seq?}）
-          window.onBridgeEvent(msg);
+        if (msg.type === 'seq_reset') {
+          sawHello = true;
+          bootId = (msg.data && msg.data.boot_id) || bootId;
+          lastSeq = 0;
+          seen = {};
+          saveWatermark();
+          if (msg.data && msg.data.resync_required) beginResync();
+          return;
         }
+        if (msg.type === 'replay') {
+          sawHello = true;
+          var replayFrames = Array.isArray(msg.frames) ? msg.frames : [];
+          for (var i = 0; i < replayFrames.length; i++) {
+            var item = replayFrames[i];
+            if (typeof item === 'string') {
+              try { item = JSON.parse(item); } catch (_) { item = null; }
+            }
+            if (item && typeof item === 'object' && item.type) {
+              acceptFrame(item);
+            }
+          }
+          return;
+        }
+        if (msg.type === 'resync_required' || msg.type === 'device_reset') {
+          sawHello = true;
+          if (msg.data && msg.data.boot_id) bootId = msg.data.boot_id;
+          lastSeq = 0;
+          seen = {};
+          saveWatermark();
+          beginResync();
+          return;
+        }
+        if (msg.type === 'device_online') {
+          sawHello = true;
+          if (msg.data && msg.data.boot_id) {
+            bootId = msg.data.boot_id;
+            saveWatermark();
+          }
+          if (window.onBridgeEvent) {
+            window.onBridgeEvent({
+              type: 'device_status',
+              data: {
+                device_id: (msg.data && msg.data.device_id) || relayDevice,
+                online: true,
+              },
+            });
+          }
+          return;
+        }
+        if (msg.type === 'device_status') {
+          if (window.onBridgeEvent) window.onBridgeEvent(msg);
+          return;
+        }
+        if (!sawHello && !legacy) {
+          legacy = true;
+          beginResync();
+        }
+        acceptFrame(msg);
       }
     };
     ws.onclose = function (event) {
+      pending.forEach(function (item) {
+        if (item.timer) clearTimeout(item.timer);
+        item.reject(new Error('连接已断开'));
+      });
+      pending.clear();
       if (event && event.code === 4401) {
         // 配对失效/被轮换：清掉本地 token（仅当与本次使用的相同，避免误清新 token），
         // 通知前端显示「配对已失效」，并停止重连（空 token 重连只会一直失败）
@@ -128,7 +342,7 @@
         } catch (_) {}
         return;
       }
-      setTimeout(connect, 2000); // 基础断线重连
+      setTimeout(connect, 2000);
     };
     ws.onerror = function () {};
   }

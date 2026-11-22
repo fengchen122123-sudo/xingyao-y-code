@@ -21,20 +21,16 @@ ENCODING_RETRY_COOLDOWN_SECONDS = 300.0
 
 TRUNCATION_SUFFIX = "\n...[该条消息过长，中段已截断]..."
 
-# 默认配置：在压缩收益与额度消耗之间取平衡
 DEFAULT_RETAIN_COUNT = 8
 DEFAULT_RETAIN_COUNT_FORCE = 4
 DEFAULT_TOOL_RESULT_TRUNCATE_THRESHOLD_CHARS = 2000
 DEFAULT_TOOL_RESULT_PREVIEW_LIMIT_CHARS = 800
-DEFAULT_TOOL_RESULT_TOKEN_LIMIT = 600      # 近似 token 上限（优先于字符阈值）
+DEFAULT_TOOL_RESULT_TOKEN_LIMIT = 600
 DEFAULT_SUMMARY_LENGTH_FIRST = 250
 DEFAULT_SUMMARY_LENGTH_MERGE = 350
 COMPRESSION_CHUNK_WINDOW_RATIO = 0.25
 COMPRESSION_TIMEOUT_TOKENS_PER_SECOND = 1500
 
-# 单段 Chunk 预算上限：即使模型窗口高达 256k/1M，单段载荷也不超过 24000 token。
-# 避免过大 Prompt 一次性打满服务商的 TPM (Tokens Per Minute) 突发限制触发 429，
-# 同时中小载荷能显著提升模型对事实细节的提取质量。
 DEFAULT_MAX_CHUNK_TOKEN_BUDGET = 24000
 
 # 多段压缩时的段间平滑延时（秒）。默认 0：429 限流本就有独立的指数退避
@@ -52,14 +48,10 @@ COMPRESSION_ADAPTIVE_INTER_CHUNK_DELAY_SECONDS = 2.0
 # 避免压缩完成后立即再次触发（对应 OpenCode 的防抖教训）。
 DEFAULT_PRECOMPRESS_RATIO = 0.85
 
-# 单次压缩的总预算秒数上限（可经 config.json memory_compression.max_total_seconds 调优）
 DEFAULT_MAX_TOTAL_SECONDS = 180.0
 
-# 闲时自动维护触发延时（秒，0 关闭）：用户空闲该时长后跑水位线维护与压缩，
-# 让维护发生在缓存还热着的窗口内并顺带预热新前缀（core/idle_maintenance.py）
 DEFAULT_IDLE_MAINTENANCE_SECONDS = 240
 
-# 压缩请求触发 429 RateLimitError 时的基础退避秒数与最大重试次数
 COMPRESSION_RATE_LIMIT_BASE_DELAY_SECONDS = 5.0
 COMPRESSION_MAX_RETRIES = 3
 
@@ -67,7 +59,7 @@ COMPRESSION_MAX_RETRIES = 3
 class CompressionOutcome:
     """记忆压缩执行结果三态封装（compressed / skipped / failed）。"""
     def __init__(self, status: str, reason: str = ""):
-        self.status = status  # "compressed", "skipped", "failed"
+        self.status = status
         self.reason = reason
 
     def __bool__(self):
@@ -85,7 +77,6 @@ def is_session_compressing(manager, session_name: str) -> bool:
 
 
 def _positive_int_or_none(value):
-    """正整数校验：仅 int 且 >0 有效（bool 不算数），非法/缺失返回 None。"""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
     return value
@@ -113,13 +104,11 @@ def _normalize_model_watermark_bases(raw):
 
 
 def _load_compression_config():
-    """读取 config.json 中的记忆压缩配置，失败时返回默认值。"""
     try:
         from core.model_manager import load_config
         cfg = load_config()
         comp_cfg = cfg.get("memory_compression", {})
         return {
-            # 保留条数至少为 1：配置成 0/负数会让截断切片为空并抛 IndexError 被静默吞掉
             "retain_count": max(1, int(comp_cfg.get("retain_count", DEFAULT_RETAIN_COUNT))),
             "retain_count_force": max(1, int(comp_cfg.get("retain_count_force", DEFAULT_RETAIN_COUNT_FORCE))),
             "tool_result_truncate_threshold_chars": int(
@@ -140,19 +129,15 @@ def _load_compression_config():
             "max_total_seconds": float(
                 comp_cfg.get("max_total_seconds", DEFAULT_MAX_TOTAL_SECONDS)
             ),
-            # 闲时自动维护延时（秒，0 关闭），见 core/idle_maintenance.py
             "idle_maintenance_seconds": max(0, int(
                 comp_cfg.get("idle_maintenance_seconds", DEFAULT_IDLE_MAINTENANCE_SECONDS)
             )),
             "precompress_ratio": float(
                 comp_cfg.get("precompress_ratio", DEFAULT_PRECOMPRESS_RATIO)
             ),
-            # 水位线计算基准上限（tokens）：仅正整数有效，非法/缺失 → None
-            # （None = 不启用，保持纯窗口比例现行为）
             "watermark_base_tokens": _positive_int_or_none(
                 comp_cfg.get("watermark_base_tokens")
             ),
-            # 按模型覆盖的基准上限：非 dict 视为空表，非法条目静默过滤
             "model_watermark_bases": _normalize_model_watermark_bases(
                 comp_cfg.get("model_watermark_bases")
             ),
@@ -210,16 +195,6 @@ def get_watermark_base_tokens(model_name):
 
 
 def persisted_injection_sources() -> frozenset:
-    """PERSISTED 类注入的 source 清单（规格 02 §2.6：压缩的"必须保留"依据）。
-
-    为什么压缩只需要这份清单而不需要 source 级白名单：星瑶的 PERSISTED 注入
-    （运行上下文块 / 电脑操控说明 / 按回合撤销纠正）都由 build_dynamic_prompt
-    合并进**同一条上下文块消息**，所以保留粒度就是"承载动态块的那条消息"
-    ——比 ZCode 的消息级/source 级双层机制更简单。
-
-    注册表不可用时返回空集：压缩主流程绝不因为"保留依据查不到"而失败或改变
-    行为（保留判定退化为改造前口径）。
-    """
     try:
         from core.context_injection import build_default_injection_registry
 
@@ -232,12 +207,6 @@ def persisted_injection_sources() -> frozenset:
 
 
 def _persisted_context_anchor_index(messages: list) -> int | None:
-    """返回承载 PERSISTED 注入的最新上下文块消息下标（没有则 None）。
-
-    动态块由 agent_service 内联到 user 消息末尾，标记为 DYNAMIC_CONTEXT_PREFIX；
-    只有 PERSISTED 通道真的包含"运行上下文块"时才认为该标记代表需要保留的注入。
-    任何导入异常都退回 None（= 不做锚定），保证压缩行为与改造前一致。
-    """
     try:
         from core.context_builder import DYNAMIC_CONTEXT_PREFIX
         from core.context_injection import SOURCE_RUNTIME_CONTEXT_BLOCK
@@ -259,13 +228,6 @@ def _persisted_context_anchor_index(messages: list) -> int | None:
 
 
 def _get_encoding(timeout=10.0):
-    """惰性加载 tiktoken 编码器；网络不可达时绝不无限阻塞。
-
-    tiktoken 首次加载需联网下载 cl100k_base 编码文件（缓存在 %TEMP%），
-    网络受限时底层请求无超时、会永久挂起——此前压缩线程会被这一步卡死。
-    这里改为后台守护线程加载，主线程最多等 timeout 秒；未就绪则返回 None，
-    调用方退回字符估算。后台线程加载成功后后续调用直接复用。
-    """
     import time as _time
 
     state = _encoding_state
@@ -275,7 +237,6 @@ def _get_encoding(timeout=10.0):
         if status == "ready":
             return state["enc"]
         if status == "loading":
-            # 已有唯一加载线程在跑；并发调用不重复等待或再次下载。
             return None
         if status == "failed":
             failed_at = state.get("failed_at")
@@ -310,11 +271,6 @@ def _get_encoding(timeout=10.0):
 
 
 def _compression_chunk_budget(context_window, max_budget=None):
-    """压缩正文预算：窗口的 25%，极小窗口至少保留 512 token，同时设置绝对上限。
-
-    max_budget 缺省回落 DEFAULT_MAX_CHUNK_TOKEN_BUDGET；调用方可传入配置值，
-    避免把默认上限写死成第二处真相。
-    """
     if max_budget is None:
         max_budget = DEFAULT_MAX_CHUNK_TOKEN_BUDGET
     raw_budget = max(512, int(int(context_window) * COMPRESSION_CHUNK_WINDOW_RATIO))
@@ -322,7 +278,6 @@ def _compression_chunk_budget(context_window, max_budget=None):
 
 
 def _compression_request_timeout(prompt_tokens):
-    """按本段实际 prompt token 放大超时，并与主请求共用上下限。"""
     from core.llm import API_REQUEST_MAX_TIMEOUT_SECONDS, API_REQUEST_TIMEOUT_SECONDS
 
     estimated_tokens = max(0, int(prompt_tokens or 0))
@@ -334,7 +289,6 @@ def _compression_request_timeout(prompt_tokens):
 
 
 def _truncate_to_token_budget(content, token_budget):
-    """截断单条超长正文，并保证截断标记也计入 token 预算。"""
     token_count = _estimate_tokens(content)
     if token_count <= token_budget:
         return content, token_count
@@ -354,12 +308,6 @@ def _truncate_to_token_budget(content, token_budget):
 
 
 def _estimate_tokens(text):
-    """估算文本 token 数。优先用 tiktoken；不可用时退回 CJK 感知的字符估算。
-
-    兜底规则：CJK 字符按 1 token/字（中文实际 1~1.5 token/字，取下界），
-    其余按 1 token/4 字符（英文典型值）。相比一刀切的 len//2，
-    中文为主的文本不再被低估一半，分段预算更不容易把请求顶出窗口。
-    """
     if not isinstance(text, str):
         text = str(text)
     enc = _get_encoding()
@@ -373,17 +321,6 @@ def _estimate_tokens(text):
 
 
 def _truncate_long_tool_result(content, config=None):
-    """对超长工具结果做预截断，保留开头 + 末尾 + 占位符。
-
-    工具结果（特别是 read_file 返回的完整文件内容）在压缩时全部塞进 prompt 让 LLM 总结，
-    等于把整个文件又发一遍。预截断把单条工具结果限制在可控长度内，
-    能显著降低压缩调用的 token 成本（典型大文件 read_file 可省 80%+）。
-
-    策略：
-    - 字符长度超过阈值 或 token 数超过阈值时触发截断；
-    - 保留开头（通常是文件头/结构信息）和末尾（通常是关键结论），
-      中间用占位符标注截断长度，让 LLM 知道有内容被省略。
-    """
     if not isinstance(content, str):
         content = str(content)
     if config is None:
@@ -410,7 +347,6 @@ def _truncate_long_tool_result(content, config=None):
 
 
 def _build_summary_prompt(old_summary, chat_log, summary_limit):
-    """构造总结 / 合并 prompt（分段压缩时逐段复用，文案与历史行为一致）。"""
     if old_summary:
         return (
             "你是一个高度专业的记忆管理器。请根据【前期历史记忆摘要】和最新的【追加对话记录】，进行梳理和整合，生成一个全新的、合并后的中文背景记忆摘要。\n"
@@ -443,9 +379,6 @@ def _build_summary_prompt(old_summary, chat_log, summary_limit):
     )
 
 
-# ── 插入式压缩（Insert-then-Compress）─────────────────────────────────────
-
-# 指令自身的 token 预算（参与窗口余量估算）与摘要输出 max_tokens 上限。
 INSERT_PROMPT_TOKEN_BUDGET = 1200
 INSERT_SUMMARY_MAX_TOKENS = 8192
 
@@ -453,10 +386,6 @@ _TOPICS_RE = re.compile(r"<topics>(.*?)</topics>\s*", re.DOTALL | re.IGNORECASE)
 
 
 def _split_topics_from_summary(text):
-    """剥出摘要首部的 <topics>…</topics> 行，返回 (topics|None, 纯摘要文本)。
-
-    topics 是给回溯索引用的元数据，不能留在摘要正文里污染下一轮上下文。
-    """
     raw = (text or "").strip()
     if not raw:
         return None, ""
@@ -469,11 +398,6 @@ def _split_topics_from_summary(text):
 
 
 def _build_insert_compression_prompt(summary_limit):
-    """插入式压缩指令：追加在最后一次主请求字节尾部，作为下一条 user 消息。
-
-    模型在请求前缀里本就能看到 history[0] 的旧摘要块与全部活跃历史，因此
-    指令只负责任务切换与输出格式，不重复任何对话内容。
-    """
     return (
         "═══════════════════════════════════════════════════════════════\n"
         "重要：任务切换——记忆压缩模式\n"
@@ -508,13 +432,6 @@ def _get_keepalive_snapshot(session_name):
 def _try_insert_compression(manager, session_name, session_id, api_model, api_key,
                             api_url, old_boundary_raw, boundary_msg_id,
                             config, emit, cancel_event=None):
-    """插入式压缩：在最后一次主请求字节尾部追加压缩指令，单请求完成摘要。
-
-    前缀与上一次真实请求字节完全一致 → 命中热前缀缓存，只付指令与摘要输出
-    的增量 token；且模型看到的是原生结构化历史（含旧摘要块），合并质量优于
-    拍平文本。返回 CompressionOutcome（已终结）或 None（条件不满足/失败，
-    调用方回退分段路径）。本函数绝不抛出——一切异常吞掉转为 None。
-    """
     from copy import deepcopy
 
     try:
@@ -558,9 +475,6 @@ def _try_insert_compression(manager, session_name, session_id, api_model, api_ke
         if cancel_event is not None and cancel_event.is_set():
             return None
 
-        # 快照字节原样继承（含 tools 顺序与亲和参数）；只改消息尾部、输出上限
-        # 与流式开关。快照可能包含边界之后的保留区消息：摘要覆盖面略微超前于
-        # 提交边界，属保守方向的无害超覆盖，下次压缩自然合并。
         request = deepcopy(snapshot)
         request["messages"] = list(snapshot_messages) + [
             {"role": "user", "content": prompt}
@@ -581,7 +495,6 @@ def _try_insert_compression(manager, session_name, session_id, api_model, api_ke
             return None
 
         raw_text = (response.choices[0].message.content or "").strip()
-        # 非原生思考通道可能把思考内容以标签形式混进正文
         raw_text = re.sub(
             r"<(?:think|thinking)>.*?</(?:think|thinking)>", "",
             raw_text, flags=re.DOTALL | re.IGNORECASE,
@@ -600,7 +513,6 @@ def _try_insert_compression(manager, session_name, session_id, api_model, api_ke
             )
             emit("<ansigreen>✔ 插入式记忆压缩完成（热缓存命中，仅付增量 token）。</ansigreen>")
             return CompressionOutcome("compressed", "insert")
-        # 水位冲突（期间发生淘汰或并发压缩）：直接报冲突，不再空烧分段路径
         emit("<ansiyellow>ℹ 插入式压缩水位冲突（期间有淘汰或并发压缩），本次已跳过。</ansiyellow>")
         return CompressionOutcome("skipped", "conflict_stale")
     except Exception:
@@ -611,7 +523,6 @@ def _try_insert_compression(manager, session_name, session_id, api_model, api_ke
 
 
 def _cancellable_sleep(duration, cancel_event=None):
-    """支持被 cancel_event 打断的切片休眠。"""
     if duration <= 0:
         return True
     import time as _time
@@ -647,16 +558,6 @@ def _commit_summary_progress(manager, session_id, summary, boundary_id, expect_b
 
 
 def _finish_with_progress(committed, reason):
-    """中止收尾：只要有段落已落库就算 compressed（下游淘汰有摘要兜底），
-    否则才是 skipped（下游必须禁止推水位，见 agent_service 的淘汰禁区）。
-
-    注意：partial_timeout / partial_cancelled 等部分提交中止时，下游微调
-    淘汰从已提交水位起吃的是「未提交段」的轮次——这些轮次没有摘要兜底
-    （已提交摘要只覆盖水位之前的历史）。这是有意识的权衡：淘汰受
-    MAX_EVICT_TURNS 硬上限约束，超窗请求由 agent_service 的 I4 内存级
-    轮次裁剪兜底保证不 400；下一轮压缩从已提交水位续推，未提交段仍有
-    机会被补上摘要。
-    """
     if committed:
         return CompressionOutcome("compressed", "partial_" + reason)
     return CompressionOutcome("skipped", reason)
@@ -674,12 +575,6 @@ def compress_session_memory(
     max_timeout_seconds=None,
     return_outcome=False,
 ):
-    """
-    智能归纳压缩会话记忆：
-    1. 读取全部历史对话记录；
-    2. 保留最近的 N 条（force=True 时保留更少条）作为当前活跃上下文；
-    3. 把在此之前的所有更老对话打包，调用 LLM 提炼/合并生成简短中文记忆摘要并写入 sessions。
-    """
     def emit(message):
         # 强制要求 output_callback：后台线程绝不允许直接 print_formatted_text 触碰终端 UI。
         # 无 callback 时静默降级为诊断日志。
@@ -718,8 +613,6 @@ def compress_session_memory(
 def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit, cancel_event=None, max_timeout_seconds=None):
     config = _load_compression_config()
     if max_timeout_seconds is None:
-        # 默认回落到配置值（config.json memory_compression.max_total_seconds），
-        # 限流调优不必改代码
         max_timeout_seconds = config["max_total_seconds"]
     try:
         # 多步读写期间持有 manager 的可重入锁，与 add_messages 等写路径互斥
@@ -727,7 +620,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         with lock:
             cursor = manager.conn.cursor()
 
-            # 1. 查找会话基本信息
             cursor.execute('SELECT id, memory_summary, summarized_until_msg_id FROM sessions WHERE session_name = ?', (session_name,))
             row = cursor.fetchone()
             if not row:
@@ -735,10 +627,9 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
 
             session_id = row[0]
             old_summary = row[1]
-            old_boundary_raw = row[2]  # 原始值（可能为 NULL），用于乐观校验
+            old_boundary_raw = row[2]
             summarized_until_msg_id = row[2] or 0
 
-            # 2. 查询该会话下，目前所有活跃（未被旧总结排除）的消息
             cursor.execute('''
                 SELECT id, role, content FROM messages
                 WHERE session_id = ? AND id > ?
@@ -753,20 +644,12 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     "content": message_content_to_text(raw_content)
                 })
 
-            # 3. 统计需要保留的最近活跃消息
             retain_count = config["retain_count_force"] if force else config["retain_count"]
             if len(all_active_messages) <= retain_count + 2:
-                # force 与常规路径同样提示：静默跳过会让用户看到"正在后台压缩"
-                # 之后永远没有下文
                 emit(f"<ansiyellow>ℹ 当前会话活跃对话过少（少于 {retain_count + 2} 条），无需进行记忆压缩。</ansiyellow>")
                 return CompressionOutcome("skipped", "too_few_messages")
 
             retain_floor = len(all_active_messages) - retain_count
-            # 【PERSISTED 注入保留锚点】规格 02 §2.6 / C-T7：PERSISTED 注入合并进
-            # 动态块这一条消息，压缩必须让它活下来。保留区本来纯按条数截取，长
-            # 工具链回合里"末条 user 消息"可能被挤出保留区，于是最新的运行上下文
-            # 快照会被摘要吞掉。命中该情形时把边界回退到那条消息；正常情形下它本
-            # 就在保留区内，retain_floor 不变——即对本行为零影响。
             anchor = _persisted_context_anchor_index(all_active_messages)
             if anchor is not None and anchor < retain_floor:
                 retain_floor = anchor
@@ -780,15 +663,11 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             while extra < len(retained) and retained[extra]["role"] == "tool":
                 extra += 1
             if extra == len(retained):
-                # 保留区整条都是 tool 结果（其声明 assistant 必在待压缩区），
-                # 全部归入待压缩区后保留区清空：本次压缩没有可安全推进边界的
-                # 锚点，强行压缩会让孤儿 tool 进入摘要且活跃区无消息，直接拒绝。
                 emit("<ansiyellow>ℹ 保留区均为工具结果且配对助手消息在待压缩区，本次压缩已跳过（等待更多对话后再压缩）。</ansiyellow>")
                 return CompressionOutcome("skipped", "pairing_protect")
             if extra:
                 messages_to_summarize = all_active_messages[:retain_floor + extra]
 
-            # 4. 组装待总结对话文本日志（清洗思考标签 + 预截断工具结果）
             prepared_messages = []
             total_chars = 0
             for msg in messages_to_summarize:
@@ -802,16 +681,13 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 elif role == "tool":
                     role_display = "工具结果"
                 else:
-                    # 摘要里的自称跟随当前会话（秘书会话 → 秘书名）
                     try:
                         from core.secretary import get_active_agent_name
 
                         role_display = get_active_agent_name()
                     except Exception:
                         role_display = "星瑶"
-                # 过滤内容里的思考标签以缩减 Token 负担
                 clean_content = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>", "", msg["content"], flags=re.DOTALL | re.IGNORECASE).strip()
-                # 工具结果（role=tool）超长时预截断
                 if role == "tool" and clean_content:
                     clean_content = _truncate_long_tool_result(clean_content, config)
                 if clean_content:
@@ -821,7 +697,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             if not prepared_messages:
                 return CompressionOutcome("skipped", "no_content")
 
-            # 提交边界：保留区之前的最后一条待压缩消息（配对保护已就位）
             boundary_msg_id = messages_to_summarize[-1]["id"]
 
         # ── 插入式快速路径（Insert-then-Compress）─────────────────────────
@@ -840,7 +715,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         # LLM 调用耗时较长，在锁外执行，避免阻塞其它线程的正常读写
         emit("\n<ansigray>🧠 正在后台智能压缩并整合长对话记忆...</ansigray>")
 
-        # 优先使用 secondary（便宜）模型做摘要，降低后台记忆压缩的额度消耗
         compress_model, compress_key, compress_url = api_model, api_key, api_url
         compress_window = 0
         try:
@@ -867,11 +741,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         if compress_window <= 0:
             compress_window = 128000
 
-        # 历史一次性塞进单个 prompt 会在长会话下超过压缩模型窗口
-        # （如 88 万 token 历史 vs 26 万窗口），压缩请求本身超窗失败并反复重试。
-        # 按窗口的安全预算切成多段，逐段合并摘要，每段完成即增量写库（中止不白烧）。
-        # 预算取窗口 25%：其余留给指令、累积摘要、输出、Provider 处理延迟
-        # 与估算偏差（tiktoken 对非 OpenAI 分词器的估算普遍偏低）。
         chunk_token_budget = _compression_chunk_budget(compress_window, config["max_chunk_token_budget"])
 
         chunks = []
@@ -880,8 +749,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         for msg_id, role_display, content in prepared_messages:
             token_count = _estimate_tokens(content)
             if token_count > chunk_token_budget:
-                # 单条消息即超预算（如超长助手文本）：按 token 截断而非按字符，
-                # 中文 1 字符 ≈ 1~1.5 token，按字符截会严重超窗
                 content, token_count = _truncate_to_token_budget(
                     content, chunk_token_budget
                 )
@@ -903,8 +770,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         import time as _time
         import random as _random
         start_monotonic = _time.monotonic()
-        # 段间延时自适应：仅当本次压缩触发过 429 限流后，才对后续段间
-        # 插入平滑延时；未触限流时 0 延时直通，显著缩短多段串行总耗时。
         rate_limited = False
 
         # 每多一段放宽 30 字，缓解串行累积合并的信息衰减；上限 1200，
@@ -917,8 +782,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             emit("\n<ansiyellow>ℹ 待压缩历史过长（分段 > 12 段），建议在新会话中继续复杂任务以维持最佳上下文记忆。</ansiyellow>")
 
         for chunk_index, chunk in enumerate(chunks):
-            # 预算至少容得下 3 段：单段超时可达 106s，只给 180s 会退化到
-            # 「刚完成一段就爆预算」，永远压不完。
             per_chunk_seconds = (_compression_request_timeout(chunk_token_budget)
                                  + config["inter_chunk_delay_seconds"])
             budget_seconds = max(max_timeout_seconds, 3 * per_chunk_seconds)
@@ -962,8 +825,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 "api_key": compress_key,
                 "api_base": compress_url,
                 "messages": [{"role": "user", "content": prompt}],
-                # 分段载荷仍可能有数万 token，按实际 prompt 大小放大超时；
-                # 固定 60 秒会让 64K～100K token 的摘要请求稳定超时。
                 "timeout": request_timeout,
             }
             request_kwargs.update(_provider_cache_affinity_options(
@@ -973,8 +834,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 cache_session_id=session_name,
                 tool_contract="no-tools",
             ))
-            # 渠道请求形态覆盖：与 _provider_request_options 出口同一语义
-            # （headers → extra_headers、body → extra_body），压缩 scope 由此对齐
             from core.llm_dialects import _apply_route_request_overrides
 
             request_kwargs = _apply_route_request_overrides(
@@ -1016,14 +875,10 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     raise api_err
 
             if not candidate:
-                # 某一段返回空结果：继续合并后续段会丢失该段事实，就此中止；
-                # 已完成段落的进度已在上一轮循环提交，不回滚、不白烧。
                 emit("<ansiyellow>ℹ 记忆压缩中途返回空摘要，本次已中止（已完成段落进度已保存）。</ansiyellow>")
                 return _finish_with_progress(committed, "empty_summary")
             new_summary = candidate
 
-            # 每段完成即落库：任何后续中止（429 用尽 / 超预算 / 取消 / 异常）
-            # 最多损失当前段，不会把已付费的摘要一起作废。
             if _commit_summary_progress(
                 manager, session_id, new_summary,
                 chunk[-1][0], old_boundary_raw,

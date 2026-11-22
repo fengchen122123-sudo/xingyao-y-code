@@ -1,0 +1,273 @@
+import { mount } from '@vue/test-utils';
+import { defineComponent, ref } from 'vue';
+import { describe, expect, it } from 'vitest';
+import ComposerEditor from './ComposerEditor.vue';
+
+function mountEditor(modelValue: string, skillIds?: string[], commandIds?: string[]) {
+  return mount(ComposerEditor, {
+    props: { modelValue, placeholder: '说点什么', skillIds, commandIds },
+    attachTo: document.body,
+  });
+}
+
+function caretToEnd(el: HTMLElement) {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  const sel = document.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+}
+
+describe('ComposerEditor @ 引用胶囊', () => {
+  it('会话引用与文件引用渲染成不同样式的胶囊，标签只显示名字', () => {
+    const wrapper = mountEditor('看下 @{缓存改造} 和 @src/a.ts');
+    const root = wrapper.get('.ce-input').element;
+
+    const session = root.querySelectorAll('.ce-chip-session');
+    const file = root.querySelectorAll('.ce-chip-file');
+    expect(session).toHaveLength(1);
+    expect(file).toHaveLength(1);
+    expect(session[0].textContent).toContain('缓存改造');
+    expect(file[0].textContent).toContain('src/a.ts');
+    // 胶囊是不可编辑的原子元素，光标不会钻进里面改坏文本
+    expect((session[0] as HTMLElement).contentEditable).toBe('false');
+    wrapper.unmount();
+  });
+
+  it('胶囊内部仍保留原始 token，序列化后与原文逐字符相等', async () => {
+    const wrapper = mountEditor('先 @{对话A} 再 @docs/接口文档.md 结束');
+
+    await wrapper.get('.ce-input').trigger('input');
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([
+      '先 @{对话A} 再 @docs/接口文档.md 结束',
+    ]);
+    wrapper.unmount();
+  });
+
+  it('退格紧邻胶囊时整块删除引用，而不是删掉最后一个字符', async () => {
+    const wrapper = mountEditor('看下 @{缓存改造}');
+    const root = wrapper.get('.ce-input').element as HTMLElement;
+
+    caretToEnd(root);
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['看下 ']);
+    expect(root.querySelector('.ce-chip')).toBeNull();
+    wrapper.unmount();
+  });
+
+  it('光标在普通文字中间时退格仍是逐字删除（不误删相邻引用）', async () => {
+    const wrapper = mountEditor('@{缓存改造} 后面还有字');
+    const root = wrapper.get('.ce-input').element as HTMLElement;
+
+    const textNode = Array.from(root.childNodes).find(
+      n => n.nodeType === Node.TEXT_NODE && (n.textContent || '').includes('后面'),
+    ) as Text;
+    const range = document.createRange();
+    range.setStart(textNode, 2);
+    range.collapse(true);
+    const sel = document.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+    expect(root.querySelector('.ce-chip')).not.toBeNull();
+    wrapper.unmount();
+  });
+
+  it('Enter 提交发送，Shift+Enter 插入换行', async () => {
+    const wrapper = mountEditor('第一行');
+    const root = wrapper.get('.ce-input').element as HTMLElement;
+
+    caretToEnd(root);
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Enter' });
+    expect(wrapper.emitted('submit')).toHaveLength(1);
+
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Enter', shiftKey: true });
+    expect(wrapper.emitted('submit')).toHaveLength(1);
+    expect(root.textContent).toContain('第一行\n');
+    wrapper.unmount();
+  });
+
+  it('外部改值（切换会话/补全插入）时重建内容，胶囊随之更新', async () => {
+    const wrapper = mountEditor('');
+    await wrapper.setProps({ modelValue: '@{新的对话}' });
+    expect(wrapper.findAll('.ce-chip-session')).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it('空内容时带 is-empty 标记（占位文案靠它显示）', async () => {
+    const wrapper = mountEditor('');
+    expect(wrapper.get('.ce-input').classes()).toContain('is-empty');
+    await wrapper.setProps({ modelValue: '有内容了' });
+    expect(wrapper.get('.ce-input').classes()).not.toContain('is-empty');
+    wrapper.unmount();
+  });
+
+  it('父组件在 keydown 中 preventDefault 并修改 v-model（如 Enter 发送清空）时，不回写旧文本且 DOM 清空', async () => {
+    const Host = defineComponent({
+      components: { ComposerEditor },
+      setup() {
+        const text = ref('');
+        const sent: string[] = [];
+        function onKeydown(e: KeyboardEvent) {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sent.push(text.value);
+            text.value = '';
+          }
+        }
+        return { text, sent, onKeydown };
+      },
+      template: '<ComposerEditor v-model="text" @keydown="onKeydown" />',
+    });
+
+    const wrapper = mount(Host, { attachTo: document.body });
+    const editor = wrapper.get('.ce-input');
+    editor.element.textContent = '为什么会被拦住';
+    await editor.trigger('input');
+    expect(wrapper.vm.text).toBe('为什么会被拦住');
+
+    await editor.trigger('keydown', { key: 'Enter' });
+
+    expect(wrapper.vm.sent).toEqual(['为什么会被拦住']);
+    expect(wrapper.vm.text).toBe('');
+    expect(editor.element.textContent).toBe('');
+    expect(editor.classes()).toContain('is-empty');
+    wrapper.unmount();
+  });
+
+  it('输入法一开始组词就收起占位提示，确认前不提交文本', async () => {
+    const wrapper = mountEditor('');
+    const editor = wrapper.get('.ce-input');
+    expect(editor.classes()).toContain('is-empty');
+
+    await editor.trigger('compositionstart');
+    expect(editor.classes()).not.toContain('is-empty');
+    expect(wrapper.emitted('update:modelValue')).toBeUndefined();
+
+    editor.element.textContent = 'nihao';
+    await editor.trigger('input');
+    expect(editor.classes()).not.toContain('is-empty');
+    expect(wrapper.emitted('update:modelValue')).toBeUndefined();
+
+    await editor.trigger('compositionend');
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['nihao']);
+    expect(editor.classes()).not.toContain('is-empty');
+
+    editor.element.textContent = '';
+    await editor.trigger('compositionstart');
+    expect(editor.classes()).not.toContain('is-empty');
+    await editor.trigger('compositionend');
+    expect(editor.classes()).toContain('is-empty');
+    wrapper.unmount();
+  });
+
+  it('输入法组词期间按 Enter 不向父组件透传 keydown，也不触发 submit', async () => {
+    const wrapper = mountEditor('nihao');
+    const editor = wrapper.get('.ce-input');
+
+    await editor.trigger('compositionstart');
+    await editor.trigger('keydown', { key: 'Enter' });
+    expect(wrapper.emitted('keydown')).toBeUndefined();
+    expect(wrapper.emitted('submit')).toBeUndefined();
+
+    await editor.trigger('compositionend');
+
+    editor.element.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true }),
+    );
+    expect(wrapper.emitted('keydown')).toBeUndefined();
+    expect(wrapper.emitted('submit')).toBeUndefined();
+
+    await editor.trigger('keydown', { key: 'Enter' });
+    expect(wrapper.emitted('keydown')).toHaveLength(1);
+    expect(wrapper.emitted('submit')).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it('技能 token 渲染为带星盘图标的胶囊，序列保持原始 /short_id', async () => {
+    const wrapper = mountEditor('@{对话A} /gzh-design 帮我排版', ['gzh-design']);
+    const root = wrapper.get('.ce-input').element;
+
+    const skillChips = root.querySelectorAll('.ce-chip-skill');
+    expect(skillChips).toHaveLength(1);
+    expect((skillChips[0] as HTMLElement).contentEditable).toBe('false');
+    expect((skillChips[0] as HTMLElement).dataset.cref).toBe('/gzh-design');
+    expect(skillChips[0].querySelector('.ce-chip-label')?.textContent).toBe('gzh-design');
+    expect(skillChips[0].querySelector('.ce-chip-icon polygon')).not.toBeNull();
+
+    await wrapper.get('.ce-input').trigger('input');
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['@{对话A} /gzh-design 帮我排版']);
+    wrapper.unmount();
+  });
+
+  it('技能胶囊支持退格、Delete 以及点选后一次全删', async () => {
+    const wrapper = mountEditor('@{对话A} /gzh-design', ['gzh-design']);
+    const root = wrapper.get('.ce-input').element as HTMLElement;
+
+    caretToEnd(root);
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['@{对话A} ']);
+    expect(root.querySelector('.ce-chip-skill')).toBeNull();
+    expect(root.querySelector('.ce-chip-session')).not.toBeNull();
+
+    await wrapper.setProps({ modelValue: '/gzh-design 排版' });
+    const chip = root.querySelector('.ce-chip-skill') as HTMLElement;
+    expect(chip).not.toBeNull();
+    chip.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Delete' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([' 排版']);
+    expect(root.querySelector('.ce-chip-skill')).toBeNull();
+    wrapper.unmount();
+  });
+
+  it('skillIds 异步到达后自动把草稿中的技能渲染为胶囊', async () => {
+    const wrapper = mountEditor('/gzh-design 排版');
+    expect(wrapper.find('.ce-chip-skill').exists()).toBe(false);
+
+    await wrapper.setProps({ skillIds: ['gzh-design'] });
+    expect(wrapper.findAll('.ce-chip-skill')).toHaveLength(1);
+    expect(wrapper.find('.ce-chip-skill .ce-chip-label').text()).toBe('gzh-design');
+    wrapper.unmount();
+  });
+
+  it('斜杠命令渲染为带命令图标的胶囊，序列保持原始 /cmd 且支持一次全删', async () => {
+    const wrapper = mountEditor('/goal 做一个网站', [], ['goal', 'fix']);
+    const root = wrapper.get('.ce-input').element as HTMLElement;
+
+    const cmdChips = root.querySelectorAll('.ce-chip-command');
+    expect(cmdChips).toHaveLength(1);
+    expect((cmdChips[0] as HTMLElement).contentEditable).toBe('false');
+    expect((cmdChips[0] as HTMLElement).dataset.cref).toBe('/goal');
+    expect(cmdChips[0].querySelector('.ce-chip-label')?.textContent).toBe('goal');
+    expect(cmdChips[0].querySelector('.ce-chip-icon path')).not.toBeNull();
+
+    await wrapper.get('.ce-input').trigger('input');
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['/goal 做一个网站']);
+
+    (cmdChips[0] as HTMLElement).dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([' 做一个网站']);
+    expect(root.querySelector('.ce-chip-command')).toBeNull();
+
+    await wrapper.setProps({ modelValue: '/fix' });
+    caretToEnd(root);
+    await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
+    expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['']);
+    expect(root.querySelector('.ce-chip-command')).toBeNull();
+    wrapper.unmount();
+  });
+
+  it('commandIds 异步到达后会把同名胶囊升级为命令胶囊', async () => {
+    const wrapper = mountEditor('/goal 任务', ['goal']);
+    expect(wrapper.find('.ce-chip-skill').exists()).toBe(true);
+
+    await wrapper.setProps({ commandIds: ['goal'] });
+    expect(wrapper.find('.ce-chip-skill').exists()).toBe(false);
+    expect(wrapper.find('.ce-chip-command').exists()).toBe(true);
+    expect(wrapper.find('.ce-chip-command .ce-chip-label').text()).toBe('goal');
+    wrapper.unmount();
+  });
+});

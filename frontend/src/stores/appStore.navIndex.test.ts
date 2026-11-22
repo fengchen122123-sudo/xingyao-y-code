@@ -2,8 +2,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { useAppStore } from './appStore';
 
-// 红点导航全量索引：store navItems 状态 + refreshNavIndex + firstLoadedMsgId。
-
 beforeEach(() => {
   setActivePinia(createPinia());
   (window as any).pywebview = undefined;
@@ -55,7 +53,7 @@ it('refreshNavIndex 后端不可用/接口缺失时静默不炸', async () => {
   (window as any).pywebview = undefined;
   await expect(store.refreshNavIndex()).resolves.toBeUndefined();
 
-  (window as any).pywebview = { api: {} }; // 旧后端无此接口
+  (window as any).pywebview = { api: {} };
   await expect(store.refreshNavIndex()).resolves.toBeUndefined();
 });
 
@@ -112,7 +110,6 @@ it('切到从未加载索引的会话时 navItems 立即清空（不显示上个
   await store.refreshNavIndex();
   expect(store.navItems).toHaveLength(1);
 
-  // B 从未拉过索引（api 永不返回也无关，bind 时就该清空）
   api.get_session_nav_index = vi.fn().mockImplementation(() => new Promise(() => {}));
   void store.switchSession('B');
   await Promise.resolve();

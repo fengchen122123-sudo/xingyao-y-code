@@ -1,7 +1,15 @@
 <template>
   <div id="topbar" data-theme-region="app_header">
-    <!-- 侧栏开合入口：点击左上角星瑶图标收起/展开左侧栏
-         （热区只覆盖图标本身，右侧文字标题不参与；原独立汉堡按钮已移除） -->
+    <button
+      type="button"
+      class="icon-btn no-drag mobile-sidebar-btn"
+      data-test="mobile-sidebar-toggle"
+      :title="store.sidebarCollapsed ? '打开会话列表' : '收起会话列表'"
+      :aria-label="store.sidebarCollapsed ? '打开会话列表' : '收起会话列表'"
+      @click="store.toggleSidebar()"
+    >
+      <AppIcon name="menu" :size="16" :stroke-width="2" />
+    </button>
     <div class="logo no-drag" :title="logoTitle">
       <img
         class="mark"
@@ -18,16 +26,12 @@
       <div><span class="name">星瑶Code</span></div>
     </div>
 
-    <!-- 标题栏拖拽区：mousedown 延迟进原生移动循环（SC_MOVE+HTCAPTION），
-         连续点击的偶数次按下交给 dblclick，奇数次按下仍可开始新拖动；
-         避免 SC_MOVE 移动循环吞掉双击序列。 -->
     <div
       class="titlebar-drag"
       @mousedown.left="beginDrag"
       @dblclick="toggleMaximizeNative"
     ></div>
 
-    <!-- 软件更新提示按钮：发现新版本或下载就绪时展示 -->
     <button
       v-if="store.updateState.hasUpdate"
       class="update-topbar-btn no-drag"
@@ -45,22 +49,31 @@
     </button>
 
     <button class="icon-btn no-drag" id="btn-terminal" title="切换终端" data-test="btn-terminal" @click="store.toggleTerminalPanel()">
-      <AppIcon name="square-terminal" :size="16" />
+      <AppIcon name="square-terminal" :size="16" :stroke-width="2.25" />
     </button>
     <button class="icon-btn no-drag" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
-      <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" />
+      <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" :stroke-width="2.25" />
     </button>
     <button class="icon-btn no-drag" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">
-      <AppIcon name="panel-right" :size="16" />
+      <AppIcon name="panel-right" :size="16" :stroke-width="2.25" />
     </button>
 
-    <!-- 自绘窗口控制按钮（frameless）：颜色随主题，hover 态清晰 -->
     <div class="window-controls no-drag">
-      <button class="win-btn" title="最小化" data-test="win-min" @click="winMinimize">—</button>
-      <button class="win-btn" :title="maximized ? '还原' : '最大化'" data-test="win-max" @click="toggleMaximize">
-        {{ maximized ? '❐' : '▢' }}
+      <button class="win-btn" title="最小化" data-test="win-min" @click="winMinimize">
+        <AppIcon name="minus" :size="15" :stroke-width="2.5" />
       </button>
-      <button class="win-btn win-close" title="关闭" data-test="win-close" @click="winClose">✕</button>
+      <button class="win-btn" :title="maximized ? '还原' : '最大化'" data-test="win-max" @click="toggleMaximize">
+        <AppIcon
+          :name="maximized ? 'copy' : 'win-max'"
+          :size="15"
+          :stroke-width="2.25"
+          :linecap="maximized ? 'round' : 'butt'"
+          :linejoin="maximized ? 'round' : 'miter'"
+        />
+      </button>
+      <button class="win-btn win-close" title="关闭" data-test="win-close" @click="winClose">
+        <AppIcon name="x" :size="15" :stroke-width="2.5" />
+      </button>
     </div>
   </div>
 </template>
@@ -94,7 +107,6 @@ async function toggleMaximizeNative() {
   await toggleMaximize();
 }
 
-// 双击判定窗口（毫秒）：超过则按拖拽处理；连续点击的偶数次按下交给 dblclick。
 const DBLCLICK_MS = 400;
 let dragTimer: ReturnType<typeof setTimeout> | null = null;
 let dragArmed = false;
@@ -114,15 +126,12 @@ function enterNativeMoveLoop() {
   const shouldStart = dragArmed;
   cancelPendingDrag();
   if (!shouldStart) return;
-  // 系统原生移动循环：Snap / 动画原生。桥调用阻塞到拖拽结束，不 await。
   void api()?.window_begin_drag?.();
 }
 
-// 位移超过该阈值视为拖拽意图，立即进入移动循环（不傻等双击判定窗口）
 const DRAG_THRESHOLD_PX = 4;
 
 async function beginDrag(event: MouseEvent) {
-  // 连续点击序列中的偶数次按下交给 dblclick；第三次等奇数按下可开始新拖动。
   if (event.detail > 0 && event.detail % 2 === 0) {
     cancelPendingDrag();
     return;
@@ -153,7 +162,6 @@ async function winMinimize() {
   await api()?.window_minimize?.();
 }
 function winClose() {
-  // 关闭走 destroy 触发 closing 事件，由后端生命周期层做退出确认
   void api()?.window_close?.();
 }
 
@@ -162,14 +170,12 @@ onMounted(async () => {
     const result = await api()?.window_is_maximized?.();
     if (result?.ok) maximized.value = !!result.maximized;
   } catch {
-    // 桥未就绪（浏览器开发态）时忽略
   }
 });
 onBeforeUnmount(() => {
   cancelPendingDrag();
 });
 
-// logo 文字区域的悬停提示：显示版本信息（侧栏开合提示挂在星瑶图标上）
 const logoTitle = computed(() =>
   store.version ? `星瑶Code ${store.agentName} v${store.version}` : `星瑶Code ${store.agentName}`
 );
@@ -197,46 +203,64 @@ function handleUpdateClick() {
 
 <style scoped>
 #topbar {
-  height: 48px;
-  border-bottom: 1px solid var(--border);
+  height: 42px;
+  border-bottom: none;
   display: flex;
   align-items: center;
-  padding: 0 14px;
-  gap: 12px;
+  padding: 0 12px;
+  gap: 4px;
   flex-shrink: 0;
+  user-select: none;
 }
 
-/* 顶栏图标按钮（终端 / 主题 / 面板）：32×32 方形热区，圆角拉满成正圆。
-   与侧栏底部手机按钮同口径；窗口控制按钮（.win-btn，40×32）保持原圆角不动。 */
 #topbar .icon-btn {
-  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  color: var(--xy-text, var(--text));
+}
+#topbar .icon-btn:hover {
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
+}
+.mobile-sidebar-btn {
+  display: none;
+}
+@media (max-width: 768px) {
+  .mobile-sidebar-btn {
+    display: inline-flex;
+  }
 }
 #topbar .logo {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   user-select: none;
 }
 #topbar .logo .mark {
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
   object-fit: cover;
   display: block;
-  /* 兼作侧栏开合入口：热区只在图标本身 */
   cursor: pointer;
-  transition: filter 0.12s;
+  transition: transform 0.12s, filter 0.12s;
 }
 #topbar .logo .mark:hover {
-  filter: brightness(1.12);
+  filter: brightness(1.06);
+}
+#topbar .logo .mark:active {
+  transform: scale(0.95);
 }
 #topbar .logo .mark:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 #topbar .logo .name {
+  font-size: 13.5px;
   font-weight: 600;
-  letter-spacing: 0.5px;
+  letter-spacing: -0.01em;
+  color: var(--xy-text, var(--text));
 }
 #topbar .logo .sub {
   color: var(--text-faint);
@@ -253,20 +277,20 @@ function handleUpdateClick() {
   min-width: 40px;
 }
 
-/* 自绘窗口控制按钮：颜色随主题文字色，关闭 hover 用危险色 */
 .window-controls {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 0;
   margin-left: 4px;
+  padding-left: 4px;
+  border-left: 1px solid var(--xy-border, var(--border));
 }
 .win-btn {
-  width: 40px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   border: none;
   background: transparent;
-  color: var(--text-dim);
-  font-size: 14px;
+  color: var(--xy-text, var(--text));
   line-height: 1;
   display: flex;
   align-items: center;
@@ -276,16 +300,14 @@ function handleUpdateClick() {
   transition: background 0.12s, color 0.12s;
 }
 .win-btn:hover {
-  background: var(--bg2);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
 }
 .win-close:hover {
   background: var(--red);
   color: #fff;
 }
 
-/* 更新提示按钮 */
-/* 更新提示按钮 */
 .update-topbar-btn {
   display: flex;
   align-items: center;

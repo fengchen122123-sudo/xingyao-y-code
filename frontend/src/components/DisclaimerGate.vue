@@ -88,8 +88,6 @@ async function accept() {
   if (submitting.value) return;
   submitting.value = true;
   error.value = '';
-  // 成功后 store.disclaimerAcceptedVersion 就地更新，父级 v-if 失效，
-  // 本组件随之卸载——无需向上 emit 事件。
   error.value = await store.acceptDisclaimer();
   submitting.value = false;
 }
@@ -98,7 +96,6 @@ async function decline() {
   if (submitting.value) return;
   submitting.value = true;
   const bridge = api();
-  // 未接受条款则不提供服务：走完整退出序列（取消回合 → drain → 销毁窗口）
   try {
     if (bridge?.window_confirm_close) {
       await bridge.window_confirm_close('exit');
@@ -119,8 +116,9 @@ async function decline() {
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgba(0, 0, 0, .72);
-  backdrop-filter: blur(8px);
+  background: var(--xy-modal-mask, rgba(0, 0, 0, .48));
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 .gate-card {
   width: min(680px, calc(100vw - 40px));
@@ -129,11 +127,11 @@ async function decline() {
   display: flex;
   flex-direction: column;
   padding: 24px 26px 18px;
-  border: 1px solid var(--border);
-  border-radius: 15px;
-  background: var(--bg2);
-  color: var(--text);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, .55);
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  background: var(--xy-card, var(--bg2));
+  color: var(--xy-text, var(--text));
+  box-shadow: var(--xy-shadow-pop, 0 24px 80px rgba(0, 0, 0, .35));
 }
 .gate-head { display: flex; flex-direction: column; gap: 6px; }
 .gate-title-row { display: flex; align-items: center; gap: 10px; }
@@ -156,17 +154,17 @@ async function decline() {
 .gate-clause h3 { margin: 0 0 8px; font-size: 13.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .gate-clause ol { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
 .gate-clause li { color: var(--text-dim); font-size: 12.5px; line-height: 1.8; }
-.gate-clause--key { border-left: 2px solid var(--danger); padding-left: 12px; }
-.gate-clause--key h3 { color: var(--danger); }
+.gate-clause--key { border-left: 2px solid var(--red); padding-left: 12px; }
+.gate-clause--key h3 { color: var(--red); }
 .gate-key-tag {
   padding: 1px 7px;
-  border: 1px solid var(--danger);
+  border: 1px solid var(--red);
   border-radius: 999px;
-  color: var(--danger);
+  color: var(--red);
   font-size: 11px;
   font-weight: 400;
 }
-.gate-error { margin: 10px 0 0; color: var(--danger); font-size: 12.5px; }
+.gate-error { margin: 10px 0 0; color: var(--red); font-size: 12.5px; }
 .gate-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 .gate-btn {
   min-height: 38px;

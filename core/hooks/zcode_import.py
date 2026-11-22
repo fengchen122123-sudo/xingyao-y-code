@@ -1,20 +1,3 @@
-"""ZCode hooks 配置导入转换器（ZCode 导入设计 §2）。
-
-分层：
-
-- ``convert_matcher`` / ``convert_entry`` 纯转换函数，不做任何 I/O，可穷举测试；
-- ``plan_import`` 扫描来源文件（默认四路，见 ``scan_default_sources``）生成
-  导入计划（含跳过原因分类，绝不静默丢条目）；
-- ``apply_plan`` 把计划条目合并写入星瑶 hooks.json（按 scope 分组、去重、
-  带 ``imported_from`` 溯源）；
-- ``rollback_import`` 按 ``imported_from`` 前缀整批撤销。
-
-ZCode 侧格式事实（zai-org/ZCode 仓库 diagnosing-hooks 技能文档）：
-配置文件形态 ``{hooks: {enabled?, timeoutMs?, events: {<Event>: [{matcher?, hooks: [...]}]}}}``
-默认 disabled；插件形态 ``{hooks: {<Event>: [...]}}`` 无总开关。matcher 是
-大小写敏感正则；``command`` 型 timeout 单位是秒、``process`` 型 argv 无 shell。
-"""
-
 from __future__ import annotations
 
 import json
@@ -27,16 +10,10 @@ from pathlib import Path
 
 logger = logging.getLogger("ycode.hooks")
 
-# ── 常量与映射表 ──────────────────────────────────────────────
-
-#: ZCode 七事件里星瑶有对应事件点的四个（事件名两边同拼写，零转换）。
 SUPPORTED_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse", "Stop")
 
-#: 星瑶 v1 无对应事件点的三个：跳过并进导入报告（设计 §2.2）。
 UNSUPPORTED_EVENTS = ("UserPromptSubmit", "PermissionRequest", "PostToolUseFailure")
 
-#: SessionStart 的 matcher 匹配源是子类型（startup/resume/clear/compact）；
-#: 星瑶无子类型，全子类集等价于「全匹配」。
 _SESSION_START_SUBTYPES = frozenset({"startup", "resume", "clear", "compact"})
 
 #: ZCode PascalCase 工具名 → 星瑶蛇形小写工具名。ApplyPatch 在 ZCode 里是
@@ -54,8 +31,6 @@ TOOL_NAME_MAP = {
     "Grep": "search_code",
 }
 
-#: matcher 分支里出现这些元字符即视为正则语义，无法无损转换（设计 §2.3：
-#: 不降级为 ``*``——那会让 hook 从「命中少数工具」变成「命中所有工具」）。
 _META_CHARS = re.compile(r"[\[\](){}.*+?\\]")
 
 #: 与 core/hooks/types.py 的上限保持一致（导入侧先行截断，registry 兜底）。
@@ -63,15 +38,7 @@ MAX_TIMEOUT_MS = 300000
 DEFAULT_TIMEOUT_MS = 60000
 
 
-# ── 纯转换层 ──────────────────────────────────────────────────
-
-
 def _unwrap_outer_group(body: str) -> str:
-    """剥掉「整体包裹」的外层括号：``(A|B)`` → ``A|B``。
-
-    只在括号从第 0 位一直配平到末位时解包；``(?:A|B)`` 这类解包后残留
-    ``?:`` 仍会被元字符检查拒绝，``a(b)c`` 不整体包裹、原样返回。
-    """
     while body.startswith("(") and body.endswith(")"):
         depth = 0
         wrapped = True
@@ -90,12 +57,6 @@ def _unwrap_outer_group(body: str) -> str:
 
 
 def _literal_alternation(pattern: str) -> list[str] | None:
-    """把正则拆成「纯字面量分支列表」；含锚点/分组以外的正则语义返回 None。
-
-    接受 ``A`` / ``^A$`` / ``^(A|B)$`` / ``A|B`` 四种等价写法（ZCode 文档里的
-    常见形态）；其余（字符类、``.*``、前缀匹配、非捕获分组等）一律不可无损
-    转换。
-    """
     body = pattern.strip()
     if body.startswith("^"):
         body = body[1:]
@@ -123,12 +84,10 @@ def convert_matcher(event: str, matcher) -> tuple[str | None, str]:
     if branches is None:
         return None, f"matcher 正则无法无损转换: {pattern!r}"
     if event == "SessionStart":
-        # 星瑶无子类型：全子类集 → 全匹配；出现工具名等其他字面量语义不明，跳过。
         if set(branches) <= _SESSION_START_SUBTYPES:
             return "*", ""
         return None, f"SessionStart matcher 含未知子类型: {pattern!r}"
     if event == "Stop":
-        # Stop 的 matcher 匹配的是回复预览文本，星瑶 Stop 无 matcher 语义。
         return None, f"Stop matcher（匹配回复文本）无星瑶对应语义: {pattern!r}"
     mapped: list[str] = []
     for branch in branches:
@@ -152,7 +111,6 @@ def _resolve_timeout_ms(timeout_ms, timeout_seconds, config_default_ms) -> int:
 
 
 def _join_argv(argv: list[str]) -> str:
-    """process 型 argv 拼成命令行（Windows 用 list2cmdline 语义，POSIX 用 shlex）。"""
     if os.name == "nt":
         return subprocess.list2cmdline(argv)
     return shlex.join(argv)
@@ -193,16 +151,7 @@ def convert_entry(entry, *, config_default_timeout_ms=None):
     return star, ""
 
 
-# ── 配置解析与导入计划 ────────────────────────────────────────
-
-
 def _extract_groups(data):
-    """提取 (事件分组, 配置级默认超时, 不可导入原因)。
-
-    不可导入原因非空表示整个文件跳过（JSON 坏 / 缺 hooks 键 / 配置文件形态
-    未启用）。设计 §2.4：尊重 ZCode 侧 ``enabled`` 总开关语义——配置文件形态
-    必须显式 ``enabled: true``；插件形态无总开关。
-    """
     if not isinstance(data, dict):
         return {}, None, "配置顶层不是 JSON 对象"
     hooks = data.get("hooks")
@@ -319,7 +268,6 @@ def convert_file(data, *, label: str, path: str, scope: str) -> dict:
 
 
 def scan_default_sources(workspace_root=None) -> list[dict]:
-    """默认扫描来源（设计 §2.1）：用户级一路 + 项目级三路。插件 hooks 默认不扫。"""
     home = Path.home()
     root = Path(workspace_root or os.getcwd())
     return [
@@ -375,17 +323,16 @@ def plan_import(sources=None, workspace_root=None) -> dict:
     return {"files": files}
 
 
-# ── 落盘应用与回滚 ────────────────────────────────────────────
-
-
 def target_hooks_path(scope: str, workspace_root=None) -> Path:
     """星瑶侧目标文件：user → ~/.ycode/hooks.json；project → <root>/.ycode/hooks.json。"""
     if scope == "project":
         return Path(workspace_root or os.getcwd()) / ".ycode" / "hooks.json"
+    env_dir = os.environ.get("YCODE_DATA_DIR")
+    if env_dir and str(env_dir).strip():
+        return Path(env_dir) / "hooks.json"
     return Path.home() / ".ycode" / "hooks.json"
 
 
-#: 写入 hooks.json 时保留的字段（registry 侧忽略未知键，imported_from 仅溯源用）。
 _ENTRY_FIELDS = ("command", "matcher", "timeout_ms", "status_message", "imported_from")
 
 

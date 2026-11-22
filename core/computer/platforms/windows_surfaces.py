@@ -1,23 +1,10 @@
-"""Windows 语义定位实现（R10）：窗口枚举/激活 + UIA 托盘图标候选。
-
-线程模型与依赖边界：
-
-- 所有 UI Automation/COM 对象在专属 COM 线程初始化、使用和释放，控件对象
-  绝不跨线程传出（host 只返回脱敏的序号/名称/边界元组）。
-- Win32 ctypes 的 HWND/HDC 句柄参数与返回值全部按指针宽度声明
-  （wintypes.HWND 等），不存在只声明 GetForegroundWindow 而漏掉后续
-  接收句柄 API 的问题。
-- pytest 通过注入 fake host 验证，绝不触碰真实窗口、UIA 或鼠标键盘。
-- UIA 初始化失败（系统不提供所需元素）时托盘路径显式报
-  computer_surfaces_unavailable，绝不宣称 UIA 一定能解决。
-"""
-
 from __future__ import annotations
 
 import ctypes
 import logging
 import queue
 import threading
+import time
 from ctypes import wintypes
 
 from core.computer.models import ComputerControlError
@@ -30,7 +17,6 @@ _LOGGER = logging.getLogger(__name__)
 
 _SW_RESTORE = 9
 
-# UIA 稳定常量（属性/模式/控件类型 ID 由 UIAutomationCore 规范固定）。
 _UIA_CONTROL_TYPE_PROPERTY_ID = 30003
 _UIA_BUTTON_CONTROL_TYPE_ID = 50000
 _UIA_LIST_ITEM_CONTROL_TYPE_ID = 50007
@@ -38,12 +24,10 @@ _UIA_INVOKE_PATTERN_ID = 10000
 _UIA_TREE_SCOPE_DESCENDANTS = 0x4
 _CUIAUTOMATION_CLSID = "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
 
-# 托盘宿主窗口类名：主任务栏 / 副任务栏 / 隐藏图标展开区。
 _TRAY_HOST_CLASSES = (
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
     "NotifyIconOverflowWindow",
-    # Windows 11 XAML 托盘飞出面板宿主（展开"显示隐藏的图标"后出现）。
     "TopLevelWindowForOverflowXamlIsland",
 )
 
@@ -56,7 +40,6 @@ _EnumWindowsProc = (
 )
 
 if _user32 is not None:
-    # 句柄型参数/返回值统一按指针宽度声明；EnumWindows 首参数为回调类型。
     _user32.EnumWindows.argtypes = [_EnumWindowsProc, wintypes.LPARAM]
     _user32.EnumWindows.restype = wintypes.BOOL
     _user32.IsWindowVisible.argtypes = [wintypes.HWND]
@@ -119,7 +102,6 @@ def browser_window_hints(pid: int) -> tuple[tuple[int, str, bool], ...]:
 
 
 class _ComThread:
-    """专属 COM 线程：所有 UIA 调用经有界命令队列 marshal 到该线程执行。"""
 
     def __init__(self) -> None:
         self._queue: queue.Queue = queue.Queue()
@@ -143,21 +125,41 @@ class _ComThread:
                 f"UI Automation 不可用：{type(self._init_error).__name__}",
             )
         if not self._thread.is_alive():
-            # 线程未启动或已退出：队列不会有人消费，任何投递都必然空等。
             raise ComputerControlError(
                 "computer_surfaces_unavailable",
                 "UI Automation 不可用：COM 线程已退出",
             )
 
-    def call(self, fn):
+    def call(
+        self,
+        fn,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        timeout_code: str = "computer_surfaces_unavailable",
+    ):
         """在 COM 线程执行 fn(uia) 并返回结果；UIA 对象绝不离开该线程。"""
-        # 投递前先确认线程可消费任务，避免把初始化失败/线程死亡伪装成超时。
+        # 投递前先确认线程可消费任务、未取消且 deadline 未过期。
         self._raise_if_unavailable()
+        if cancel_event is not None and cancel_event.is_set():
+            raise ComputerControlError("computer_cancelled", "UI Automation 调用已取消")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ComputerControlError(timeout_code, "UI Automation 调用超时")
         done = threading.Event()
         holder: dict = {}
 
         def job():
             try:
+                if cancel_event is not None and cancel_event.is_set():
+                    holder["error"] = ComputerControlError(
+                        "computer_cancelled", "UI Automation 调用已取消"
+                    )
+                    return
+                if deadline is not None and time.monotonic() >= deadline:
+                    holder["error"] = ComputerControlError(
+                        timeout_code, "UI Automation 调用超时"
+                    )
+                    return
                 holder["result"] = fn(self._uia)
             except BaseException as error:
                 holder["error"] = error
@@ -165,12 +167,27 @@ class _ComThread:
                 done.set()
 
         self._queue.put(job)
-        if not done.wait(timeout=10):
+        if deadline is None and cancel_event is None:
+            finished = done.wait(timeout=10)
+        else:
+            hard_end = deadline if deadline is not None else time.monotonic() + 10.0
+            finished = False
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ComputerControlError(
+                        "computer_cancelled", "UI Automation 调用已取消"
+                    )
+                remaining = hard_end - time.monotonic()
+                if remaining <= 0:
+                    break
+                slice_wait = min(remaining, 0.05) if cancel_event is not None else remaining
+                if done.wait(timeout=slice_wait):
+                    finished = True
+                    break
+        if not finished:
             # 线程可能在等待窗口内死亡：优先报告真实原因。
             self._raise_if_unavailable()
-            raise ComputerControlError(
-                "computer_surfaces_unavailable", "UI Automation 调用超时"
-            )
+            raise ComputerControlError(timeout_code, "UI Automation 调用超时")
         if "error" in holder:
             raise holder["error"]
         return holder.get("result")
@@ -219,8 +236,6 @@ class _DefaultSurfaceHost:
     def __init__(self) -> None:
         self._com: _ComThread | None = None
         self._com_lock = threading.Lock()
-
-    # ---------------- 窗口（纯 Win32，可在调用线程执行） ----------------
 
     def enum_windows(self) -> list[tuple[int, str, int, tuple[int, int, int, int], bool]]:
         """可见且有标题的顶层窗口：(hwnd, title, pid, bounds, iconic)。"""
@@ -276,7 +291,6 @@ class _DefaultSurfaceHost:
         if _user32.IsIconic(handle):
             _user32.ShowWindow(handle, _SW_RESTORE)
         _user32.SetForegroundWindow(handle)
-        # GetForegroundWindow 可能返回 NULL（restype=HWND → None）。
         if int(_user32.GetForegroundWindow() or 0) != handle:
             raise ComputerControlError(
                 "computer_action_failed",
@@ -287,14 +301,8 @@ class _DefaultSurfaceHost:
         return int(_user32.GetForegroundWindow() or 0)
 
     def close_window(self, hwnd: int) -> None:
-        """礼貌关闭窗口（WM_CLOSE）：应用自行决定收起到托盘或退出。
-
-        仅用于验收探针（窗口隐藏→托盘恢复矩阵）；不终止进程。
-        """
         _WM_CLOSE = 0x0010
         _user32.PostMessageW(int(hwnd), _WM_CLOSE, 0, 0)
-
-    # ---------------- 托盘图标（UIA，专属 COM 线程） ----------------
 
     def _com_thread(self) -> _ComThread:
         with self._com_lock:
@@ -312,10 +320,6 @@ class _DefaultSurfaceHost:
         return hosts
 
     def list_tray_buttons(self) -> list[tuple[int, str, tuple[int, int, int, int], bool]]:
-        """返回 (element_serial, name, bounds, can_invoke)；元素本体留在 COM 线程。
-
-        每个元素的来源窗口类名记录在 ``_element_source``（诊断/验收用）。
-        """
         hosts = self._find_tray_hosts()
         if not hosts:
             return []
@@ -369,10 +373,6 @@ class _DefaultSurfaceHost:
                                 )
                             except Exception:
                                 can_invoke = False
-                            # 元素引用只登记进本线程内的注册表并整体替换（旧
-                            # 引用随之在本线程释放）；返回值只带序号与纯数据——
-                            # COM 接口指针跨 apartment 传出/释放是未定义行为，
-                            # 此前把 item 直接带出线程违反了本文件头部的不变量。
                             serial = id(item)
                             registry[serial] = item
                             buttons.append((hwnd, serial, name, bounds, can_invoke))
@@ -382,7 +382,6 @@ class _DefaultSurfaceHost:
             return buttons
 
         raw = com.call(collect)
-        # 序号→来源窗口类名（纯字符串，调用线程持有安全）
         buttons: list[tuple[int, str, tuple[int, int, int, int], bool]] = []
         self._element_source = {}
         for hwnd, serial, name, bounds, can_invoke in raw:
@@ -398,7 +397,6 @@ class _DefaultSurfaceHost:
         com = self._com_thread()
 
         def invoke(_uia):
-            # 注册表只在 COM 线程内读写（见 list_tray_buttons）
             item = getattr(self, "_elements", {}).get(int(serial))
             if item is None:
                 raise ComputerControlError(
@@ -429,7 +427,6 @@ class _DefaultSurfaceHost:
         com = self._com_thread()
 
         def bounds(_uia):
-            # 注册表只在 COM 线程内读写（见 list_tray_buttons）
             item = getattr(self, "_elements", {}).get(int(serial))
             if item is None:
                 return None
@@ -479,8 +476,6 @@ class WindowsSurfaceLocator:
         # ref → host 侧原生键（hwnd 或 UIA 元素序号），绝不回传给模型。
         self._native_keys: dict[str, int] = {}
         self._closed = False
-
-    # ---------------- 候选登记 ----------------
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -535,8 +530,6 @@ class WindowsSurfaceLocator:
                 operations = ("invoke", "click_point") if can_invoke else ("click_point",)
                 self._register("tray_icon", name, bounds, operations, serial)
             return tuple(c for c in self._candidates.values() if c.kind == "tray_icon")
-
-    # ---------------- 候选解析与操作 ----------------
 
     def _resolve(self, ref: str, generation: int) -> tuple[SurfaceCandidate, int]:
         with self._lock:

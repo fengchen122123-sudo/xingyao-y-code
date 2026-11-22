@@ -7,7 +7,6 @@ declare global {
     pywebview?: {
       api: Record<string, (...args: any[]) => Promise<any>>;
     };
-    /** lan_server 广播事件入口：{"type","data"} 对象 */
     onBridgeEvent?: ((msg: { type: string; data?: Record<string, any>; seq?: number }) => void) | null;
   }
 }

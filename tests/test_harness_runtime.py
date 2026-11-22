@@ -140,8 +140,6 @@ def test_nonpersistent_turn_uses_no_database_journal(mocker):
     )
 
     kinds = [event.kind for event in events]
-    # 只锁事件契约，不锁完整快照：指标类事件（如 step_metrics）会随生产实现
-    # 演进而追加，硬编码整个序列会把新事件误判成回归，故按语义分别断言。
     assert kinds.count("assistant_delta") == 6
     assert "step_metrics" in kinds
     assert kinds[-1] == "turn_finished"
@@ -177,7 +175,6 @@ def test_cancel_during_preparation_marks_the_turn_cancelled(mocker):
 
 
 def test_takeover_claim_failure_marks_preparing_turn_failed(mocker):
-    """接管认领属于 Harness 准备阶段，异常也必须收口为 failed。"""
     manager, _cancel_event = _persistent_runtime_fixture(mocker)
     mocker.patch(
         "core.llm._claim_takeover_at_turn_start",
@@ -226,8 +223,6 @@ def test_provider_error_sets_failed_and_keeps_turn_error_event(mocker):
 
 
 def test_round_limit_fails_turn_after_committing_the_last_step(mocker):
-    # 用 write_file（修改类工具）让每步产生真实进展：只有真实进展才能
-    # 越过 TurnProgressGuard 熔断抵达硬上限——纯观察类循环会先被熔断
     manager, _cancel_event = _persistent_runtime_fixture(mocker)
     load_limit = mocker.patch(
         "core.harness.turn_limits.load_turn_step_limit",
@@ -263,7 +258,6 @@ def test_round_limit_fails_turn_after_committing_the_last_step(mocker):
     history = manager.get_history("session")
     assert "3 轮" in str(history[-1]["content"])
     assert "任务未完成" in str(history[-1]["content"])
-    # 事件顺序：上限 assistant 消息必须先于最后 Step 的终态 step_status
     final_step_events = manager.conn.execute(
         "SELECT sequence, kind FROM harness_events "
         "WHERE step_id = ? ORDER BY sequence",
@@ -317,8 +311,6 @@ def _status_tool_result(tool_call, **_kwargs):
 
 
 def test_no_progress_guard_aborts_turn_before_fourteenth_request(tmp_path, mocker):
-    # 模型连续返回同一 manage_task(status) 观察类调用：任务指纹/计划占位/结果哈希
-    # 全部不变、无 mutation，第 12 个无进展 Step 后熔断，第 14 次 Provider 请求不得发送。
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     mocker.patch("core.app_context.get_manager", return_value=manager)
@@ -341,10 +333,7 @@ def test_no_progress_guard_aborts_turn_before_fourteenth_request(tmp_path, mocke
     turn = manager.get_harness_turn("turn-runtime")
     assert turn["status"] == "failed"
     assert turn["error_code"] == "NoProgressError"
-    # 有界读取进展预算：首次 manage_task 新读取签名算一次进展，此后同一签名
-    # 重复调用不再算，熔断由第 12 次请求推迟到第 13 次（12 步停滞 + 1 步读取进展）
     assert request_count == 13
-    # 用户可见错误：固定文案经 error 事件推送（GUI 据此展示 NoProgressError）
     error_events = [event for event in events if event.kind == "error"]
     assert any(
         "连续 12 轮没有检测到后台任务、计划或工具结果状态变化"
@@ -365,7 +354,6 @@ def test_no_progress_guard_aborts_turn_before_fourteenth_request(tmp_path, mocke
 
 
 def test_no_progress_guard_resets_when_mutation_committed(tmp_path, mocker):
-    # 第 5 步之后出现一次真实修改（write_file 成功提交），停滞计数清零、Turn 继续。
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     mocker.patch("core.app_context.get_manager", return_value=manager)
@@ -401,7 +389,6 @@ def test_no_progress_guard_resets_when_mutation_committed(tmp_path, mocker):
 def test_distinct_unplanned_subagents_are_progress_before_eighth_request(
     tmp_path, mocker
 ):
-    """连续 7 个不同的无计划子任务均有成果时，不得在第 7 次前误熔断。"""
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     mocker.patch("core.app_context.get_manager", return_value=manager)
@@ -459,12 +446,9 @@ def _plan_read_tool_result(tool_call, **_kwargs):
 
 
 def test_plan_read_loop_without_state_change_aborts(tmp_path, mocker):
-    # 计划快照不变时反复 plan_read：结果文本相同、计划指纹不变、无 mutation，
-    # 第 12 个无进展 Step 后熔断（计划 read/retry/subagent 循环）。
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     mocker.patch("core.app_context.get_manager", return_value=manager)
-    # 确保计划注册表无 "session" 条目：plan_state_fingerprint 返回稳定空态指纹
     mocker.patch.dict("core.plan._PLAN_MANAGERS", {}, clear=True)
     request_count = 0
 
@@ -488,8 +472,6 @@ def test_plan_read_loop_without_state_change_aborts(tmp_path, mocker):
 def test_timeout_handoff_takeover_completes_without_redelegation(
     tmp_path, monkeypatch, mocker
 ):
-    """真实超时重派 E2E：同项只建一个 subagent task；重派 blocked；
-    主 Agent direct write/plan_finish 完成后 Turn 正常结束。"""
     import core.llm as llm
     import core.tools as tools_module
     from core.plan import PlanManager
@@ -509,16 +491,6 @@ def test_timeout_handoff_takeover_completes_without_redelegation(
     llm._mark_plan_turn("turn-e2e-takeover")
 
     class FakeMonotonic:
-        """假时钟：按序列返回，序列耗尽后继续向前推进。
-
-        真实 time.monotonic() 一直在前进，桩必须模拟这两个性质，否则本用例
-        会以两种错误方式失效：
-        1) 直接 next()：实现多读一次就把 StopIteration 冒泡成「子代理启动失败」；
-        2) 耗尽后返回固定值：elapsed 恒为 0，超时永不触发——排队阶段的时间
-           不计入 execution_elapsed，第一次读到的 601 若落在排队窗口就被丢弃，
-           后面全是 0，于是子代理跑完被判「无有效正文」→ failed。
-        因此耗尽后按固定步长继续推进。
-        """
 
         def __init__(self, values):
             self._values = iter(values)
@@ -532,8 +504,6 @@ def test_timeout_handoff_takeover_completes_without_redelegation(
             return self._last
     slow_manager = tools_module.SubagentManager(
         runner=lambda record: record.cancel_event.wait(1),
-        # 模型伪造的 timeout_seconds=30 已由 adapter 丢弃；general 角色使用
-        # 系统 600 秒预算，因此假时钟必须跨过 600 才能触发真实 timeout。
         monotonic=FakeMonotonic([0.0, 601.0]),
         wait_interval=0.001,
     )
@@ -544,29 +514,24 @@ def test_timeout_handoff_takeover_completes_without_redelegation(
     mocker.patch(
         "core.llm.completion",
         side_effect=[
-            # 第 1 轮：模型伪造 30 秒被忽略，系统 600 秒预算到期后 handoff
             _tool_stream("call-1", "run_subagent", {
                 "task_description": "做点活",
                 "plan_item_id": "item",
                 "timeout_seconds": 30,
             }),
-            # 第 2 轮：同项重新派发 → blocked（main_takeover_required）
             _tool_stream("call-2", "run_subagent", {
                 "task_description": "重新做一遍",
                 "plan_item_id": "item",
                 "timeout_seconds": 30,
             }),
-            # 第 3 轮：主 Agent 直接写文件（scoped 接管放行）
             _tool_stream("call-3", "write_file", {
                 "file_path": str(out_file),
                 "content": "taken over",
             }),
-            # 第 4 轮：显式收尾
             _tool_stream("call-4", "plan_finish", {
                 "item_id": "item",
                 "result": "现场核查完成，接管工作已落地",
             }),
-            # 第 5 轮：正常文本收尾
             _text_stream("done"),
         ],
     )
@@ -582,7 +547,6 @@ def test_timeout_handoff_takeover_completes_without_redelegation(
 
     turn = manager.get_harness_turn("turn-e2e-takeover")
     assert turn["status"] == "completed"
-    # 同一计划项只创建一个 subagent task id（重派被 blocked）
     assert len(slow_manager.snapshot()) == 1
     item = plan.snapshot()[0]
     assert item["status"] == "completed"
@@ -661,8 +625,6 @@ def _dump_harness_tables(manager):
 
 
 def test_native_computer_turn_persists_sanitized_intermediate_row(tmp_path, mocker):
-    """原生中间行以 _computer_v1 脱敏投影落库；最终 assistant 文本正常保留；
-    response id 与截图 base64 绝不进 messages 或 Harness Journal。"""
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     manager.add_message("session", "user", "操作电脑")
@@ -697,12 +659,10 @@ def test_native_computer_turn_persists_sanitized_intermediate_row(tmp_path, mock
     assert projection["kind"] == "native_call"
     assert projection["run_id"] == "run-native"
     assert projection["call_id_hash"] == hashlib.sha256(b"call_1").hexdigest()
-    # 输入文字只保存 code point 数和 SHA-256（"秘密输入"=4 个 code point）
     type_summary = projection["action"][0]
     assert type_summary["kind"] == "type_text"
     assert type_summary["text_code_points"] == 4
     assert type_summary["text_sha256"] == hashlib.sha256("秘密输入".encode("utf-8")).hexdigest()
-    # 截图只保存 screen hash/尺寸（最后动作摘要携带）
     screen_summary = projection["action"][-1]
     assert screen_summary["screen_sha256"]
     assert isinstance(screen_summary["screen_width"], int)
@@ -710,11 +670,11 @@ def test_native_computer_turn_persists_sanitized_intermediate_row(tmp_path, mock
     assert history[2]["content"] == "操作完成"
 
     serialized_history = json.dumps(history, ensure_ascii=False, default=str)
-    assert "秘密输入" not in serialized_history  # 输入正文不落库
-    assert "resp_1" not in serialized_history  # response id 不落库
+    assert "秘密输入" not in serialized_history
+    assert "resp_1" not in serialized_history
     assert "resp_final" not in serialized_history
-    assert "cG5n" not in serialized_history  # 截图 base64 不落库
-    assert "resp_1" not in _dump_harness_tables(manager)  # response id 不进 Journal
+    assert "cG5n" not in serialized_history
+    assert "resp_1" not in _dump_harness_tables(manager)
 
     turn = manager.get_harness_turn("turn-native")
     assert turn["status"] == "completed"
@@ -723,7 +683,6 @@ def test_native_computer_turn_persists_sanitized_intermediate_row(tmp_path, mock
         (1, "completed"),
         (2, "completed"),
     ]
-    # run 正常收尾：complete_run 且不留 running 租约
     assert controller.complete_calls == 1
     assert controller.stop_calls == 0
     assert controller.execute_calls == [("run-native", "type_text", "browser")]
@@ -731,14 +690,11 @@ def test_native_computer_turn_persists_sanitized_intermediate_row(tmp_path, mock
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
 def test_native_crash_recovery_marks_interrupted_and_never_continues(tmp_path, mocker):
-    """崩溃恢复只标 interrupted：previous_response_id 只存 Turn 内存，
-    DB 无任何可继续状态；新回合首请求绝不携带旧 response id，动作零重放。"""
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     manager.add_message("session", "user", "操作电脑")
     mocker.patch("core.app_context.get_manager", return_value=manager)
     controller = _native_controller(tmp_path)
-    # 第二个响应先吐一段文本：生成器在续传 Step 的流消费中途挂起 = 进程崩溃
     partial_text_events = [
         {"type": "response.output_text.delta", "delta": "部分输出"},
         {"type": "response.completed", "response": {"id": "resp_2", "output": []}},
@@ -763,8 +719,6 @@ def test_native_crash_recovery_marks_interrupted_and_never_continues(tmp_path, m
         computer_capability=NATIVE_BROWSER_CAPABILITY,
         consume_background_notifications=False,
     )
-    # 消费到第一个 assistant_delta 为止：computer call 已执行、续传请求已发出，
-    # 续传状态（response id）只存在于生成器局部变量（Turn 内存）
     for event in generator:
         if event.kind == "assistant_delta":
             break
@@ -778,7 +732,6 @@ def test_native_crash_recovery_marks_interrupted_and_never_continues(tmp_path, m
     assert "resp_2" not in serialized_history
     assert "resp_1" not in _dump_harness_tables(manager)
 
-    # 崩溃恢复（既有 harness 语义）只把未完成 Turn/Step 标记 interrupted
     interrupted = manager.interrupt_stale_harness_runs(int(time.time() * 1000) + 10_000)
     assert interrupted >= 1
     assert manager.get_harness_turn("turn-native")["status"] == "interrupted"
@@ -806,12 +759,9 @@ def test_native_crash_recovery_marks_interrupted_and_never_continues(tmp_path, m
     assert fresh_request["input"] == [
         {"role": "system", "content": NATIVE_SYSTEM},
         {"role": "user", "content": "操作电脑"},
-    ]  # _computer_v1 中间行不进后续普通 Provider 请求
-    # 动作只执行过一次（悬停的旧 Turn 不重放）
+    ]
     assert controller.execute_calls == [("run-native", "type_text", "browser")]
 
-    # 清理悬停生成器：崩溃模拟后 close 可能触发非法状态转换（interrupted 无
-    # 出边），失败属预期，与断言无关
     try:
         generator.close()
     except Exception:
@@ -819,7 +769,6 @@ def test_native_crash_recovery_marks_interrupted_and_never_continues(tmp_path, m
 
 
 def test_capture_request_persists_model_and_canonical_api_base(tmp_path):
-    """capture_request 补写 model/api_base，且 api_base 只落规范化身份。"""
     from core.harness.request_envelope import PreparedStreamRequest, RequestEnvelope
     from core.harness.runtime import TurnRuntime
     from core.memory import canonicalize_api_base
@@ -873,7 +822,6 @@ def test_capture_request_persists_model_and_canonical_api_base(tmp_path):
 
 
 def test_model_and_api_base_fields_do_not_change_prefix_fingerprints():
-    """新增的两个路由字段是旁挂元数据：messages/system/tools 哈希不变。"""
     from core.harness.request_envelope import PreparedStreamRequest, RequestEnvelope
 
     messages = [{"role": "user", "content": "qi"}]
@@ -916,7 +864,6 @@ def test_canonicalize_api_base_never_keeps_credentials():
 
 
 def test_tool_call_writes_paired_started_and_finished_journal(tmp_path, mocker):
-    """一次真实工具调用在 journal 里成对写 tool_started → tool_finished。"""
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     mocker.patch("core.app_context.get_manager", return_value=manager)
@@ -928,8 +875,6 @@ def test_tool_call_writes_paired_started_and_finished_journal(tmp_path, mocker):
             _text_stream("done"),
         ],
     )
-    # 只验 journal 成对写：工具真实执行换成固定只读结果，避开沙盒询问等
-    # 环境相关分支；批执行器与 journal sink 仍走生产路径。
     mocker.patch(
         "core.llm._execute_single_tool_call",
         side_effect=_fixed_tool_result,

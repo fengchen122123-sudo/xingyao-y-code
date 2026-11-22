@@ -1,6 +1,8 @@
 import { mount, flushPromises } from '@vue/test-utils';
+import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import DecisionSettings from './DecisionSettings.vue';
+import { useAppStore } from '../stores/appStore';
 
 const baseSettings = {
   version: 1,
@@ -10,7 +12,6 @@ const baseSettings = {
   model_id: 'NeoHorse-Jev-4B',
   endpoint_style: 'decision',
   key_mode: 'auto',
-  shadow_mode: true,
   timeout_ms: 800,
   scenes: {},
   audit_enabled: true,
@@ -48,7 +49,6 @@ function mockApi(
     get_decision_audit_summary: vi.fn(async () => ({
       ok: true,
       today_count: 0,
-      today_shadow_count: 0,
       today_adopted_count: 0,
       today_fallback_count: 0,
       recent: [],
@@ -88,9 +88,9 @@ describe('DecisionSettings', () => {
       'decision-base-url',
       'decision-key-auto',
       'decision-key-index',
-      'decision-shadow',
       'decision-timeout',
     ];
+    expect(wrapper.find('[data-test="decision-shadow"]').exists()).toBe(false);
     for (const selector of disabledSelectors) {
       const element = wrapper.find(`[data-test="${selector}"]`).element as HTMLInputElement | HTMLButtonElement;
       expect(element.disabled, selector).toBe(true);
@@ -101,7 +101,6 @@ describe('DecisionSettings', () => {
       (wrapper.find('[data-test="decision-save"]').element as HTMLButtonElement).disabled,
     ).toBe(false);
 
-    // 打开审计目录不受总开关约束：审计记录随时可查看
     expect(
       (wrapper.find('[data-test="decision-audit-open"]').element as HTMLButtonElement).disabled,
     ).toBe(false);
@@ -113,7 +112,6 @@ describe('DecisionSettings', () => {
     await flushPromises();
 
     await wrapper.find('[data-test="decision-enabled"]').setValue(true);
-    // 开关打开后其余控件解除禁用
     expect(
       (wrapper.find('[data-test="decision-model-id"]').element as HTMLInputElement).disabled,
     ).toBe(false);
@@ -129,7 +127,6 @@ describe('DecisionSettings', () => {
       provider_ref: 'auto',
       base_url: '',
       key_mode: 'auto',
-      shadow_mode: true,
       timeout_ms: 800,
     });
     expect(wrapper.find('[data-test="decision-saved"]').text()).toBe('决策设置已保存');
@@ -150,7 +147,6 @@ describe('DecisionSettings', () => {
     const wrapper = mountPage();
     await flushPromises();
 
-    // 探针按钮受总开关约束：先打开开关
     await wrapper.find('[data-test="decision-enabled"]').setValue(true);
     await wrapper.find('[data-test="decision-probe"]').trigger('click');
     await flushPromises();
@@ -184,7 +180,7 @@ describe('DecisionSettings', () => {
     const select = wrapper.find('[data-test="decision-model-select"]');
     expect(select.exists()).toBe(true);
     const options = select.findAll('option');
-    expect(options.length).toBe(3); // 占位项 + 2 个模型
+    expect(options.length).toBe(3);
     expect(options[1].text()).toContain('NeoHorse-Jev-4B');
     expect(options[2].text()).toContain('NeoHorse-Jev-8B');
 
@@ -207,7 +203,6 @@ describe('DecisionSettings', () => {
 
     expect(wrapper.find('[data-test="decision-fetch-hint"]').text()).toContain('拉取模型列表超时');
     expect(wrapper.find('[data-test="decision-model-select"]').exists()).toBe(false);
-    // 失败后输入框仍可编辑
     const input = wrapper.find('[data-test="decision-model-id"]');
     expect((input.element as HTMLInputElement).disabled).toBe(false);
     await input.setValue('NeoHorse-Jev-Manual');
@@ -244,7 +239,7 @@ describe('DecisionSettings', () => {
     const select = wrapper.find('[data-test="decision-channel-select"]');
     expect(select.exists()).toBe(true);
     const options = select.findAll('option');
-    expect(options.length).toBe(3); // 自动匹配 + 两条通道
+    expect(options.length).toBe(3);
     expect(options[1].text()).toContain('基元律动');
     expect(options[1].text()).toContain('2 把 Key');
     expect(options[2].text()).toContain('OpenCode Zen 免费通道');
@@ -278,14 +273,12 @@ describe('DecisionSettings', () => {
       get_decision_audit_summary: vi.fn(async () => ({
         ok: true,
         today_count: 3,
-        today_shadow_count: 1,
-        today_adopted_count: 1,
+        today_adopted_count: 2,
         today_fallback_count: 1,
         recent: [
           {
             ts: '2026-10-16T10:00:00',
             scene: 'probe',
-            shadow: false,
             adopted: true,
             latency_ms: 326,
             fallback_reason: '',
@@ -295,8 +288,7 @@ describe('DecisionSettings', () => {
           {
             ts: '2026-10-16T10:01:00',
             scene: 'router',
-            shadow: true,
-            adopted: false,
+            adopted: true,
             latency_ms: 210,
             fallback_reason: '',
             model_id: 'NeoHorse-Jev-4B',
@@ -310,12 +302,13 @@ describe('DecisionSettings', () => {
 
     const summary = wrapper.find('[data-test="decision-audit-summary"]').text();
     expect(summary).toContain('今日 3 次决策');
-    expect(summary).toContain('影子 1');
+    expect(summary).toContain('采纳 2');
+    expect(summary).not.toContain('影子');
 
     const list = wrapper.find('[data-test="decision-audit-list"]').text();
     expect(list).toContain('probe');
     expect(list).toContain('router');
-    expect(list).toContain('影子');
+    expect(list).not.toContain('影子');
     expect(list).toContain('326ms');
 
     await wrapper.find('[data-test="decision-audit-open"]').trigger('click');
@@ -330,21 +323,17 @@ describe('DecisionSettings', () => {
     expect(wrapper.find('[data-test="decision-audit-summary"]').text()).toContain('暂无决策记录');
   });
 
-  it('业务场景：四行三态开关渲染，切正式给警示、全局影子压住时给提示', async () => {
-    // 全局影子开着：router 已按「正式」落盘，但真实生效仍是 shadow
+  it('业务场景：四行二态开关渲染，开启给警示且可切换到关闭', async () => {
     const rows = [
       {
         scene: 'router',
         label: '路由',
         description: '本回合用主模型还是副模型',
-        mode: 'shadow',
-        mode_text: '影子',
-        requested_mode: 'live',
+        mode: 'live',
+        mode_text: '开启',
         enabled: true,
-        shadow: false,
         threshold: 0.5,
         timeout_ms: 250,
-        global_shadow: true,
       },
       {
         scene: 'secretary',
@@ -352,25 +341,19 @@ describe('DecisionSettings', () => {
         description: '派发给哪个候选会话',
         mode: 'off',
         mode_text: '关闭',
-        requested_mode: 'off',
         enabled: false,
-        shadow: true,
         threshold: 0.6,
         timeout_ms: 250,
-        global_shadow: true,
       },
       {
         scene: 'search',
         label: '搜索',
         description: '一次取回几条结果',
-        mode: 'shadow',
-        mode_text: '影子',
-        requested_mode: 'shadow',
+        mode: 'live',
+        mode_text: '开启',
         enabled: true,
-        shadow: true,
         threshold: 0.5,
         timeout_ms: 250,
-        global_shadow: true,
       },
       {
         scene: 'safety',
@@ -378,12 +361,9 @@ describe('DecisionSettings', () => {
         description: '高风险命令是否放行',
         mode: 'off',
         mode_text: '关闭',
-        requested_mode: 'off',
         enabled: false,
-        shadow: true,
         threshold: 0.9,
         timeout_ms: 250,
-        global_shadow: true,
       },
     ];
     const api = mockApi(
@@ -391,13 +371,12 @@ describe('DecisionSettings', () => {
         get_decision_scenes: vi.fn(async () => ({
           ok: true,
           scenes: rows,
-          shadow_mode: true,
           enabled: true,
         })),
         set_decision_scene: vi.fn(async () => ({
           ok: true,
           msg: '路由场景已关闭',
-          scenes: rows.map((row) => (row.scene === 'router' ? { ...row, mode: 'off', mode_text: '关闭', requested_mode: 'off' } : row)),
+          scenes: rows.map((row) => (row.scene === 'router' ? { ...row, mode: 'off', mode_text: '关闭', enabled: false } : row)),
         })),
       },
       { enabled: true },
@@ -405,18 +384,17 @@ describe('DecisionSettings', () => {
     const wrapper = mountPage();
     await flushPromises();
 
-    // 四个场景行都在，且每行有三个三态单选项与阈值输入
     for (const scene of ['router', 'secretary', 'search', 'safety']) {
       expect(wrapper.find(`[data-test="decision-scene-${scene}"]`).exists()).toBe(true);
-      for (const mode of ['off', 'shadow', 'live']) {
+      for (const mode of ['off', 'live']) {
         expect(
           wrapper.find(`[data-test="decision-scene-${scene}-mode-${mode}"]`).exists(),
         ).toBe(true);
       }
+      expect(wrapper.find(`[data-test="decision-scene-${scene}-mode-shadow"]`).exists()).toBe(false);
       expect(wrapper.find(`[data-test="decision-scene-${scene}-threshold"]`).exists()).toBe(true);
     }
 
-    // 选中态跟随 requested_mode（router 是 live，secretary 是 off）
     expect(
       (wrapper.find('[data-test="decision-scene-router-mode-live"]').element as HTMLInputElement).checked,
     ).toBe(true);
@@ -424,14 +402,9 @@ describe('DecisionSettings', () => {
       (wrapper.find('[data-test="decision-scene-secretary-mode-off"]').element as HTMLInputElement).checked,
     ).toBe(true);
 
-    // 正式模式的警示 + 全局影子压住的提示
     expect(wrapper.find('[data-test="decision-scene-router-live-warning"]').text()).toContain('真实影响任务行为');
-    expect(wrapper.find('[data-test="decision-scene-router-effective-hint"]').text()).toContain('全局影子模式已开启');
-    // 非 live 场景不出现这两类提示
     expect(wrapper.find('[data-test="decision-scene-secretary-live-warning"]').exists()).toBe(false);
-    expect(wrapper.find('[data-test="decision-scene-secretary-effective-hint"]').exists()).toBe(false);
 
-    // 切换场景三态：立即调用 set_decision_scene 并回显提示
     const setScene = (api as unknown as { set_decision_scene: ReturnType<typeof vi.fn> }).set_decision_scene;
     await wrapper.find('[data-test="decision-scene-router-mode-off"]').setValue();
     await flushPromises();
@@ -451,15 +424,11 @@ describe('DecisionSettings', () => {
               description: '',
               mode: 'off',
               mode_text: '关闭',
-              requested_mode: 'off',
               enabled: false,
-              shadow: true,
               threshold: 0.5,
               timeout_ms: 250,
-              global_shadow: true,
             },
           ],
-          shadow_mode: true,
           enabled: true,
         })),
         set_decision_scene: vi.fn(async () => ({ ok: false, msg: '未知场景「nope」', scenes: [] })),
@@ -469,9 +438,83 @@ describe('DecisionSettings', () => {
     const wrapper = mountPage();
     await flushPromises();
 
-    await wrapper.find('[data-test="decision-scene-router-mode-shadow"]').setValue();
+    await wrapper.find('[data-test="decision-scene-router-mode-live"]').setValue();
     await flushPromises();
 
     expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('未知场景');
+  });
+
+  it('决策记录：支持在「全部会话」与「当前会话」间切换，全局列表展示归属会话', async () => {
+    setActivePinia(createPinia());
+    const store = useAppStore();
+    store.currentSessionName = 'sess-A';
+
+    const getSummary = vi.fn(async (_limit?: number, sessionId?: string, sessionOnly?: boolean) => {
+      if (sessionOnly && sessionId === 'sess-A') {
+        return {
+          ok: true,
+          today_count: 1,
+          today_adopted_count: 1,
+          today_fallback_count: 0,
+          recent: [
+            {
+              ts: '2026-11-20T14:00:00',
+              scene: 'subagent_review',
+              session_id: 'sess-A',
+              adopted: true,
+              latency_ms: 420,
+              fallback_reason: '',
+              model_id: 'NeoHorse-Jev-4B',
+              answers_digest: '',
+            },
+          ],
+        };
+      }
+      return {
+        ok: true,
+        today_count: 2,
+        today_adopted_count: 2,
+        today_fallback_count: 0,
+        recent: [
+          {
+            ts: '2026-11-20T13:38:36',
+            scene: 'memory_filter',
+            session_id: 'sess-B',
+            adopted: true,
+            latency_ms: 800,
+            fallback_reason: '',
+            model_id: 'NeoHorse-Jev-4B',
+            answers_digest: '',
+          },
+          {
+            ts: '2026-11-20T14:00:00',
+            scene: 'subagent_review',
+            session_id: 'sess-A',
+            adopted: true,
+            latency_ms: 420,
+            fallback_reason: '',
+            model_id: 'NeoHorse-Jev-4B',
+            answers_digest: '',
+          },
+        ],
+      };
+    });
+
+    mockApi({ get_decision_audit_summary: getSummary });
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(getSummary).toHaveBeenLastCalledWith(10);
+    const listAll = wrapper.find('[data-test="decision-audit-list"]').text();
+    expect(listAll).toContain('会话：sess-B');
+    expect(listAll).toContain('会话：sess-A');
+
+    await wrapper.find('[data-test="decision-audit-scope-session"]').trigger('click');
+    await flushPromises();
+    expect(getSummary).toHaveBeenLastCalledWith(10, 'sess-A', true);
+    expect(wrapper.find('[data-test="decision-audit-summary"]').text()).toContain('本会话今日 1 次决策');
+    const listScoped = wrapper.find('[data-test="decision-audit-list"]').text();
+    expect(listScoped).toContain('subagent_review');
+    expect(listScoped).not.toContain('memory_filter');
   });
 });

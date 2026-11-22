@@ -1,5 +1,3 @@
-// 旧版 Token 统计页专用的环图工具（改版前的 modelColor / donutGradient）。
-// 仅供 TokenUsageSettingsLegacy.vue 使用；新旧版式去留确定后可整体删除。
 const MODEL_COLORS = [
   '#6D9CFF', '#7BDCB5', '#B79CFF', '#FF9F7A', '#FFD166',
   '#62D0E8', '#F38BA8', '#A6E3A1', '#CBA6F7', '#89B4FA',

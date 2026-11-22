@@ -1,15 +1,3 @@
-"""受管浏览器执行进程的测试桩：纯协议回声，绝不启动 Playwright/浏览器。
-
-模式（--mode）：
-- normal：ready → 请求逐一响应（observe 返回罐装观察并写入假 PNG）；
-- hang_command：ready 后对所有请求永不响应（模拟 Playwright 调用卡死）；
-- hang_boot：永不发 ready（模拟启动挂死）；
-- no_exit_on_close：响应 close=ok 后继续存活（测试硬终止路径）；
-- crash_after_first：第一个请求正常响应后立刻退出（模拟进程崩溃）。
-
---pid-file：ready 后把自身 pid 写入该文件，供测试断言进程真实退出。
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -87,7 +75,7 @@ def main() -> int:
         command_id = request["id"]
         op = request["op"]
         if args.mode == "hang_command":
-            time.sleep(3600)  # 永不响应
+            time.sleep(3600)
         if op == "observe":
             _emit(
                 {
@@ -99,7 +87,7 @@ def main() -> int:
         elif op == "close":
             _emit({"id": command_id, "ok": True})
             if args.mode == "no_exit_on_close":
-                time.sleep(3600)  # 假装收尾成功但不退出
+                time.sleep(3600)
             return 0
         else:
             _emit({"id": command_id, "ok": True})

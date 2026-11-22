@@ -1,13 +1,3 @@
-"""项目级权限白名单持久化存储。
-
-用户手动添加或审批产生的命令前缀规则与文件路径白名单按项目工作目录分组，
-持久化到 ~/.ycode/permissions.json（YCODE_DATA_DIR 优先）。
-重启与切换任务后自动恢复；沙盒外访问的任务级放行不在此存储（不落盘）。
-
-读写复用 config 的 mtime 缓存与原子写（含 .bak 自愈），单项目条目设上限
-防止长期累积膨胀。任何损坏都回落空规则，绝不影响启动与正常询问流程。
-"""
-
 from __future__ import annotations
 
 import os
@@ -117,11 +107,6 @@ def _project_bucket(data: dict, key: str) -> dict:
 
 
 def project_rules(workdir=None) -> dict:
-    """返回指定项目（默认当前工作目录）的持久化白名单。
-
-    返回 {"commands": set[tuple[str, ...]], "write_files": set[str], "edit_files": set[str]}，
-    任何字段的损坏条目都会被静默剔除。
-    """
     key = canonical_workdir(workdir)
     with _STORE_LOCK:
         data = _load()

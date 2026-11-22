@@ -114,16 +114,16 @@ it('执行条只显示当前会话发起的任务，其他会话/无归属任务
   ];
   const wrapper = mount(BackgroundTasksBar);
 
-  // 只计本会话的 t1；当前会话为空（草稿）时不显示任何任务
   expect(wrapper.find('[data-test="bg-bar"]').exists()).toBe(true);
-  expect(wrapper.find('[data-test="bg-bar-count"]').text()).toContain('1 个后台任务在执行');
+  expect(wrapper.find('[data-test="bg-bar-details"]').text()).toContain('后台');
+  expect(wrapper.find('[data-test="bg-bar-count"]').text()).toBe('1');
 
   store.currentSessionName = '';
   expect(store.currentSessionBackgroundTasks).toHaveLength(0);
   wrapper.unmount();
 });
 
-it('有后台任务时显示数量文案，默认收起卡片，点详情展开', async () => {
+it('有后台任务时显示数量角标，默认收起卡片，点头部胶囊展开/收起', async () => {
   const store = useAppStore();
   store.currentSessionName = 's1';
   store.backgroundTasks = [
@@ -133,25 +133,24 @@ it('有后台任务时显示数量文案，默认收起卡片，点详情展开'
   const wrapper = mount(BackgroundTasksBar);
 
   expect(wrapper.find('[data-test="bg-bar"]').exists()).toBe(true);
-  expect(wrapper.find('[data-test="bg-bar-count"]').text()).toContain('2 个后台任务在执行');
+  expect(wrapper.find('[data-test="bg-bar-count"]').text()).toBe('2');
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
 
   await wrapper.find('[data-test="bg-bar-details"]').trigger('click');
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
   const cardText = wrapper.find('[data-test="bg-card"]').text();
+  expect(cardText).toContain('共 2 项');
   expect(cardText).toContain('pytest -q');
   expect(cardText).toContain('35s');
   expect(cardText).toContain('npm run build');
   expect(wrapper.find('[data-test="bg-kill-t1"]').exists()).toBe(true);
 
-  // 再点一次详情收起
   await wrapper.find('[data-test="bg-bar-details"]').trigger('click');
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
   wrapper.unmount();
 });
 
 it('终止任务调用 kill_task 并立即刷新快照', async () => {
-  // 组件挂载不拉快照，只有终止后的刷新会调用一次 get_background_tasks
   const getStatus = vi.fn().mockResolvedValue([]);
   const kill = vi.fn().mockResolvedValue({ ok: true, msg: '已终止后台任务' });
   (window as any).pywebview = { api: { get_background_tasks: getStatus, kill_task: kill } };
@@ -178,7 +177,6 @@ it('任务详情按钮保持卡片展开并打开右侧后台任务工作台', a
   await wrapper.find('[data-test="bg-bar-details"]').trigger('click');
   await wrapper.find('[data-test="bg-detail-t1"]').trigger('click');
 
-  // 详情不收起卡片：侧栏查看执行过程时卡片保持可见
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
   expect(store.bgTaskDetailId).toBe('t1');
   expect(store.bgTaskOpenNonce).toBe(1);
@@ -197,6 +195,29 @@ it('点击文档其他区域收起卡片', async () => {
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
 
   document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await wrapper.vm.$nextTick();
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('点击卡片内部空白不误收起，点关闭按钮或按 Esc 收起', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  store.backgroundTasks = [{ task_id: 't1', command: 'sleep 30', status: 'running', session_id: 's1' }];
+  const wrapper = mount(BackgroundTasksBar);
+
+  await wrapper.get('[data-test="bg-bar-details"]').trigger('click');
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
+
+  await wrapper.get('[data-test="bg-card"]').trigger('click');
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
+
+  await wrapper.get('[data-test="bg-pop-close"]').trigger('click');
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
+
+  await wrapper.get('[data-test="bg-bar-details"]').trigger('click');
+  expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
   await wrapper.vm.$nextTick();
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
   wrapper.unmount();

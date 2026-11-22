@@ -1,15 +1,8 @@
-"""缓存优化家族化判定：四族 × 渠道矩阵与 kimi 亲和键拒绝兜底。
-
-判定只看模型家族，不看渠道：deepseek → 账本+工具排序+保活；
-kimi → 亲和键+保活；glm → 保活；qwen → 断点+会话缓存头+工具排序+保活。
-"""
-
 import time
 from copy import deepcopy
 
 import pytest
 
-# 四族代表模型与各自官方渠道
 _FAMILIES = [
     ("openai/deepseek-v4.1-flash", "https://api.deepseek.com"),
     ("openai/kimi-k2.6", "https://api.moonshot.cn/v1"),
@@ -17,7 +10,6 @@ _FAMILIES = [
     ("openai/qwen3.8-flash", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
 ]
 
-# 非官方渠道：tokenrhythm / 阿里云 token-plan（maas.aliyuncs.com）/ 任意中转
 _OTHER_CHANNELS = [
     "https://tokenrhythm.studio/v1",
     "https://workspace-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
@@ -27,7 +19,6 @@ _OTHER_CHANNELS = [
 
 @pytest.fixture(autouse=True)
 def _isolate_route_state(monkeypatch):
-    """隔离路由判定全局态：配置替身、配置解析缓存与拉黑表不跨测试残留。"""
     import core.llm_dialects as dialects
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
@@ -45,13 +36,7 @@ def _isolate_route_state(monkeypatch):
         dialects._cache_control_disabled_routes.clear()
 
 
-# ---------------------------------------------------------------------------
-# qwen：断点 + 会话缓存头 + 工具排序，任意渠道自动启用
-# ---------------------------------------------------------------------------
-
-
 def test_qwen_cache_extras_enabled_across_channels():
-    """qwen 家族任意渠道：缓存开启判定、断点支持、会话缓存头、工具排序全部生效。"""
     from core.llm import (
         _provider_request_options,
         _qwen_cache_enabled,
@@ -75,17 +60,12 @@ def test_qwen_cache_extras_enabled_across_channels():
         assert [t["function"]["name"] for t in sorted_tools] == ["alpha", "zeta"]
 
 
-# ---------------------------------------------------------------------------
-# qwen（Task 1a）：名称优先的家族归属——聚合域不再把外族模型拽进 Qwen 家族
-# ---------------------------------------------------------------------------
-
 _MAAS_AGGREGATE_BASE = (
     "https://workspace-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 )
 
 
 def test_qwen_family_not_pulled_in_by_aggregate_domain():
-    """deepseek 名 × maas 聚合域：不得被判成 Qwen 家族，请求字节保持原样。"""
     from core.llm import (
         _apply_cache_control,
         _provider_request_options,
@@ -107,7 +87,6 @@ def test_qwen_family_not_pulled_in_by_aggregate_domain():
 
 
 def test_qwen_family_still_enabled_for_qwen_names_on_aggregate_domain():
-    """对偶断言：本族名 × maas 域行为零变化；名称无归属时域名兜底照旧。"""
     from core.llm import (
         _apply_cache_control,
         _is_qwen_family,
@@ -150,13 +129,11 @@ def test_qwen_family_still_enabled_for_qwen_names_on_aggregate_domain():
             ],
         },
     ]
-    # 源列表未被污染（deepcopy 传参）
     assert messages == [
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "inspect"},
     ]
 
-    # 名称无任何归属时，官方域名兜底照旧（_is_official_dashscope_route 未动）
     assert (
         _is_qwen_family(
             "custom-model", "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -165,22 +142,12 @@ def test_qwen_family_still_enabled_for_qwen_names_on_aggregate_domain():
     )
 
 
-# ---------------------------------------------------------------------------
-# Task 1b：kimi / deepseek / glm 对称收紧——名称优先于域名兜底
-#
-# 与 Task 1a 的 qwen 同一道门：名称命中本族 → True；名称已属其他已知族 →
-# 域名兜底不生效；名称无任何归属 → 官方域兜底照旧。
-# ---------------------------------------------------------------------------
-
 _FAMILY_ORDER = ("kimi", "deepseek", "glm", "qwen")
 
-# 四族 × {各自官方域, maas 聚合域, tokenrhythm, relay} 的完整笛卡尔积基底：
-# _FAMILIES 的四个官方域 + _OTHER_CHANNELS（含 maas 聚合域、tokenrhythm、relay）。
 _MATRIX_BASES = [official_base for _model, official_base in _FAMILIES] + list(
     _OTHER_CHANNELS
 )
 
-# 名称已属已知族的代表模型及其（唯一的）归属族。
 _OWNED_MODELS = [
     ("openai/deepseek-v4.1-flash", "deepseek"),
     ("openai/kimi-k2.6", "kimi"),
@@ -190,7 +157,6 @@ _OWNED_MODELS = [
 
 
 def _family_bools(model, api_base):
-    """四族判定的完整布尔四元组，顺序同 _FAMILY_ORDER。"""
     from core.llm import (
         _is_deepseek_family,
         _is_glm_family,
@@ -207,7 +173,6 @@ def _family_bools(model, api_base):
 
 
 def test_foreign_family_names_not_pulled_in_by_official_domains():
-    """外族模型 × 他族官方域：只剩本族单 True，不再被域名兜底拽进他族。"""
     from core.llm import (
         _is_deepseek_family,
         _is_glm_family,
@@ -215,29 +180,23 @@ def test_foreign_family_names_not_pulled_in_by_official_domains():
         is_deepseek_ledger_route,
     )
 
-    # kimi 名挂 deepseek 官方域：deepseek 家族不得抢认，kimi 名称命中照旧
     assert _is_deepseek_family("openai/kimi-k2.6", "https://api.deepseek.com") is False
     assert _is_kimi_family("openai/kimi-k2.6", "https://api.deepseek.com") is True
-    # glm 名挂 deepseek 官方域
     assert _is_deepseek_family("openai/glm-5.3", "https://api.deepseek.com") is False
-    # deepseek 名挂智谱官方域
     assert (
         _is_glm_family(
             "openai/deepseek-v4.1-flash", "https://open.bigmodel.cn/api/paas/v4"
         )
         is False
     )
-    # deepseek 名挂 moonshot 官方域（kimi 兜底是裸子串，比另外三族松）
     assert (
         _is_kimi_family("openai/deepseek-v4.1-flash", "https://api.moonshot.cn/v1")
         is False
     )
-    # kimi 名挂智谱官方域
     assert (
         _is_glm_family("openai/kimi-k2.6", "https://open.bigmodel.cn/api/paas/v4")
         is False
     )
-    # qwen 名挂 deepseek 官方域：不得启用 DeepSeek 账本（Task 1b 真实收益点）
     assert (
         is_deepseek_ledger_route("openai/qwen3.8-flash", "https://api.deepseek.com")
         is False
@@ -245,7 +204,6 @@ def test_foreign_family_names_not_pulled_in_by_official_domains():
 
 
 def test_unowned_names_still_fall_back_to_official_domains():
-    """名称无任何归属时，四族官方域兜底照旧（对偶语义，门不得误伤）。"""
     from core.llm import (
         _is_deepseek_family,
         _is_glm_family,
@@ -267,7 +225,6 @@ def test_unowned_names_still_fall_back_to_official_domains():
 @pytest.mark.parametrize("model,owner", _OWNED_MODELS)
 @pytest.mark.parametrize("api_base", _MATRIX_BASES)
 def test_family_matrix_known_names_single_owner(model, owner, api_base):
-    """四族名 × 七个渠道基底：完整四元组只有名称归属族为 True（含 maas 聚合域）。"""
     expected = tuple(family == owner for family in _FAMILY_ORDER)
     assert _family_bools(model, api_base) == expected, (model, api_base)
 
@@ -285,23 +242,16 @@ def test_family_matrix_known_names_single_owner(model, owner, api_base):
     ],
 )
 def test_family_matrix_unowned_name_domain_fallback(api_base, owner):
-    """名称无归属 × 七个渠道基底：域名兜底仅本族官方/聚合域生效，其余全 False。"""
     expected = tuple(family == owner for family in _FAMILY_ORDER)
     assert _family_bools("custom-model", api_base) == expected, api_base
 
 
 def test_mixed_family_names_keep_multi_membership():
-    """混合名维持现状：deepseek-qwen 双名仍双 True，不引入单值家族概念。"""
     from core.llm import _is_deepseek_family, _is_qwen_family
 
     model = "openai/deepseek-r1-qwen-distill"
     assert _is_deepseek_family(model, "https://relay.example/v1") is True
     assert _is_qwen_family(model, "https://relay.example/v1") is True
-
-
-# ---------------------------------------------------------------------------
-# deepseek：账本判定，任意渠道自动放行；非本族不误放
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("api_base", ["https://api.deepseek.com", *_OTHER_CHANNELS])
@@ -317,11 +267,6 @@ def test_deepseek_ledger_route_not_released_for_other_families():
     assert is_deepseek_ledger_route("openai/kimi-for-coding", "https://tokenrhythm.studio/v1") is False
     assert is_deepseek_ledger_route("openai/qwen3.8-flash", "https://relay.example/v1") is False
     assert is_deepseek_ledger_route("openai/glm-5.3", "https://relay.example/v1") is False
-
-
-# ---------------------------------------------------------------------------
-# 工具排序：deepseek / qwen 任意渠道字母序；kimi / glm / 其它原样
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("model,api_base", [
@@ -351,11 +296,6 @@ def test_tools_order_untouched_for_other_models():
         assert _select_request_tools_for_route(model, "https://relay.example/v1", tools) is tools
 
 
-# ---------------------------------------------------------------------------
-# kimi：缓存亲和键，任意渠道发送
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("api_base", ["https://api.moonshot.cn/v1", *_OTHER_CHANNELS])
 def test_kimi_affinity_sent_across_channels(api_base):
     from core.llm import _provider_request_options
@@ -364,11 +304,6 @@ def test_kimi_affinity_sent_across_channels(api_base):
         "openai/kimi-k2.6", api_base, cache_session_id="family-matrix"
     )
     assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
-
-
-# ---------------------------------------------------------------------------
-# 保活：四族任意渠道自动放行；非四族仍走显式白名单
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("model,official_base", _FAMILIES)
@@ -394,11 +329,6 @@ def test_keepalive_explicit_routes_still_gate_non_family_models(monkeypatch):
     assert _supports_cache_keepalive("openai/some-model", "https://tokenrhythm.studio/v1") is True
 
 
-# ---------------------------------------------------------------------------
-# kimi 亲和键 400 拒绝兜底：判定从严、临时拉黑、TTL 自愈、重试剥离
-# ---------------------------------------------------------------------------
-
-
 class _FakeBadRequest(Exception):
     status_code = 400
 
@@ -408,7 +338,6 @@ class _FakeServerError(Exception):
 
 
 def test_affinity_rejection_requires_bad_request_status_and_named_field():
-    """只有 400 且文案点名 prompt_cache_key / user_id 才拉黑；无关故障不误伤。"""
     from core.llm import _is_kimi_affinity_rejection
 
     assert _is_kimi_affinity_rejection(
@@ -429,7 +358,6 @@ def test_affinity_rejection_requires_bad_request_status_and_named_field():
 
 
 def test_affinity_blacklist_skips_key_and_expires_after_ttl():
-    """拉黑期间请求不再携带亲和键；TTL 到期自动恢复，一次误判不永久关优化。"""
     from core.llm import (
         _disable_affinity_route,
         _provider_request_options,
@@ -460,7 +388,6 @@ def _chunk(text="完成"):
 
 
 def test_affinity_rejection_downgrades_retry_without_key(mocker):
-    """模拟 400：拉黑该路由 → 本轮重试剥离亲和键 → 后续请求也不再携带。"""
     from core.llm import (
         _affinity_route_disabled,
         _provider_request_options,
@@ -510,7 +437,6 @@ _AFFINITY_LANE_OTHER_BASE = "https://relay-other.example/v1"
 
 
 def _set_affinity_lanes(monkeypatch, entries):
-    """配置替身 + 强制重读共用配置条目（同 cache_keepalive_routes 测试手法）。"""
     import core.llm_dialects as dialects
 
     monkeypatch.setattr(
@@ -522,7 +448,6 @@ def _set_affinity_lanes(monkeypatch, entries):
 
 
 def test_affinity_key_default_off_for_non_kimi_models():
-    """默认关闭：无 cache_affinity_lanes 配置时，非 kimi 模型一律不带亲和键。"""
     from core.llm import _provider_request_options
 
     for model, api_base in (
@@ -537,7 +462,6 @@ def test_affinity_key_default_off_for_non_kimi_models():
 
 @pytest.mark.parametrize("api_base", ["https://api.moonshot.cn/v1", *_OTHER_CHANNELS])
 def test_kimi_affinity_unchanged_with_empty_lanes(monkeypatch, api_base):
-    """白名单为空/缺省：kimi 家族在任意渠道仍带亲和键，行为零变化。"""
     from core.llm import _provider_request_options
 
     _set_affinity_lanes(monkeypatch, [])
@@ -548,7 +472,6 @@ def test_kimi_affinity_unchanged_with_empty_lanes(monkeypatch, api_base):
 
 
 def test_affinity_lane_whitelist_enables_only_listed_domain(monkeypatch):
-    """白名单开启后才生效：命中域名发亲和键，其他域名与家族仍不带。"""
     from core.llm import _provider_cache_affinity_options, _provider_request_options
 
     _set_affinity_lanes(monkeypatch, ["relay.example"])
@@ -572,7 +495,6 @@ def test_affinity_lane_whitelist_enables_only_listed_domain(monkeypatch):
     )
     assert "prompt_cache_key" not in blocked_dashscope.get("extra_body", {})
 
-    # 副模型/压缩通道（_provider_cache_affinity_options）同样只放行白名单车道
     affinity = _provider_cache_affinity_options(
         "openai/deepseek-v4.1-flash",
         _AFFINITY_LANE_BASE,
@@ -590,7 +512,6 @@ def test_affinity_lane_whitelist_enables_only_listed_domain(monkeypatch):
 
 
 def test_empty_affinity_lanes_byte_equivalent_to_missing_key(monkeypatch):
-    """白名单为空列表：未白名单行为与无配置时逐字等价（序列化级比对）。"""
     import json
 
     from core.llm import _provider_request_options
@@ -607,7 +528,6 @@ def test_empty_affinity_lanes_byte_equivalent_to_missing_key(monkeypatch):
 
 
 def test_affinity_lane_entry_normalization_accepts_bare_domain_and_url(monkeypatch):
-    """归一化：白名单写裸域名与写完整 URL 都匹配同一 api_base。"""
     from core.llm import _provider_request_options
 
     for entry in ("relay.example", "https://relay.example/v1"):
@@ -621,7 +541,6 @@ def test_affinity_lane_entry_normalization_accepts_bare_domain_and_url(monkeypat
 
 
 def test_affinity_lane_rejection_downgrades_retry_without_key(monkeypatch, mocker):
-    """白名单车道被上游 400 拒绝：本轮重试剥离亲和键，该路由进拉黑表。"""
     from core.llm import (
         _affinity_route_disabled,
         _provider_request_options,
@@ -663,8 +582,6 @@ def test_affinity_lane_rejection_downgrades_retry_without_key(monkeypatch, mocke
 
 
 def test_guard_no_prompt_cache_breakpoint_in_provider_kwargs(monkeypatch, mocker):
-    """铁律守卫：最终 provider kwargs（含 extra_body/extra_headers/metadata）
-    的序列化结果里不得出现 prompt_cache_breakpoint。"""
     import json
 
     from core.llm import _provider_request_options, chat_with_model_events
@@ -708,13 +625,6 @@ def test_guard_no_prompt_cache_breakpoint_in_provider_kwargs(monkeypatch, mocker
 
 
 def test_mixed_kimi_qwen_name_on_affinity_lane_keeps_kimi_branch_only(monkeypatch):
-    """白名单不得把 qwen 分支拽进亲和选项：kimi+qwen 混合名仍只走 kimi 分支。
-
-    混合名同时命中两族；原语义是 if/elif（kimi 命中即不再走 qwen），
-    白名单只应新增 prompt_cache_key 通道，不得顺带塞入 qwen 的会话缓存头。
-    注意：qwen 会话缓存头在主链路 `_provider_request_options` 里走的是另一条
-    独立路径，不受本函数分支影响——所以这条守卫断言只针对本函数的返回值。
-    """
     from core.llm import _provider_cache_affinity_options
 
     _set_affinity_lanes(monkeypatch, ["relay.example"])

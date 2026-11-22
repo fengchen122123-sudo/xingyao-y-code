@@ -1,5 +1,3 @@
-"""回归测试：代码审查修复的关键 bug（压缩重绑定、thinking 双发、turn_error 等）。"""
-
 import json
 import os
 import pathlib
@@ -75,12 +73,6 @@ def test_diff_ready_contains_exact_tool_call_id():
 
 
 def test_diff_ready_event_carries_full_diff_beyond_terminal_25_lines():
-    """发给前端的 diff_text 必须是完整 diff（带防失控上限）：
-
-    终端 ANSI 面板保留 25 行截断（text 字段），但 GUI「文件更改」面板
-    消费的 diff_text 若同样被截 25 行，大改动只能看到开头——前端
-    diffView.ts 自带上下文裁剪，后端不应替前端做激进截断。
-    """
     old_lines = "\n".join(f"old line {i}" for i in range(60)) + "\n"
     new_lines = "\n".join(f"new line {i}" for i in range(60)) + "\n"
     events = []
@@ -96,12 +88,10 @@ def test_diff_ready_event_carries_full_diff_beyond_terminal_25_lines():
     )
 
     payload = events[0][1]
-    # 前端拿到完整 diff：60 行改动（60 删 + 60 增）远超 25 行仍完整送达
     assert payload["diff_text"].count("\n") > 25
     assert "省略" not in payload["diff_text"]
     assert payload["diff_text"].count("-old line 59") == 1
     assert payload["diff_text"].count("+new line 59") == 1
-    # 终端面板（text）仍按 25 行截断，带省略提示
     assert "省略" in payload["text"]
 
 
@@ -161,7 +151,6 @@ def test_edit_file_execution_emits_diff_ready_for_exact_tool_call_id(mocker, tmp
 
 
 def test_compression_replaces_messages_in_place(mocker, monkeypatch):
-    """上下文压缩后必须原地替换 messages，调用方持有的列表不失联。"""
     from core import app_context
 
     monkeypatch.setattr(app_context, "get_current_session", lambda: "compress-session")
@@ -199,7 +188,6 @@ def test_compression_replaces_messages_in_place(mocker, monkeypatch):
     ))
 
     assert id(messages) == original_id
-    # 压缩后的历史已生效；会话内注入的 system 块（不落库）随原地替换保留
     assert {"role": "user", "content": "压缩后的历史"} in messages
     assert all(m.get("content") != "原始问题" for m in messages)
     assert messages[-1]["role"] == "assistant"
@@ -207,7 +195,6 @@ def test_compression_replaces_messages_in_place(mocker, monkeypatch):
 
 
 def test_rate_limit_error_does_not_trigger_compression(mocker, monkeypatch):
-    """rate limit 等错误不触发压缩路径。"""
     from core import app_context
 
     monkeypatch.setattr(app_context, "get_current_session", lambda: "rate-limit-session")
@@ -243,7 +230,6 @@ def test_rate_limit_error_does_not_trigger_compression(mocker, monkeypatch):
 
 
 def test_native_reasoning_emits_exactly_one_thinking_event_group(mocker):
-    """原生 reasoning_content 只产生一组 thinking_started/finished 事件。"""
     mocker.patch("core.llm.completion", return_value=iter([
         _chunk(reasoning="分析过程"),
         _chunk("最终回答"),
@@ -267,7 +253,6 @@ def test_native_reasoning_emits_exactly_one_thinking_event_group(mocker):
 
 
 def test_exception_emits_turn_error_without_turn_finished_and_rolls_back(mocker):
-    """异常结束的回合发 turn_error 而非 turn_finished，且内存消息回滚。"""
     mocker.patch("time.sleep")
     mocker.patch(
         "core.llm.completion",
@@ -293,7 +278,6 @@ def test_exception_emits_turn_error_without_turn_finished_and_rolls_back(mocker)
 
 
 def test_repeated_tool_call_name_is_not_concatenated(mocker):
-    """provider 重复发送 function.name 时不得拼接成坏名字。"""
     first_response = iter([
         _chunk(tool_calls=[
             _tool_call(0, "call-1", "glob_files", '{"pattern":"*.py"}'),
@@ -324,7 +308,6 @@ def test_repeated_tool_call_name_is_not_concatenated(mocker):
 
 
 def test_multiple_usage_chunks_are_counted_once(mocker):
-    """同一流中多个 usage chunk 只按最终块累计一次。"""
     import core.llm as llm
 
     with llm.token_usage_lock:
@@ -352,7 +335,6 @@ def test_multiple_usage_chunks_are_counted_once(mocker):
 
 
 def test_cancel_rollback_preserves_drained_notifications(mocker):
-    """取消回滚不丢失已 drain 的后台通知。"""
     notif = "<task-notification>后台结果</task-notification>"
     drain = mocker.patch(
         "core.tools.subagent_manager.drain_notifications",
@@ -389,7 +371,6 @@ def test_cancel_rollback_preserves_drained_notifications(mocker):
 
 
 def test_reasoning_fields_stripped_for_unsupported_providers(mocker):
-    """非白名单 provider 不接收 reasoning_content / thinking_blocks 回传。"""
     captured = {}
 
     def fake_completion(**kwargs):
@@ -428,7 +409,6 @@ def test_reasoning_fields_stripped_for_unsupported_providers(mocker):
 
 
 def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
-    """子代理回合触发压缩时，压缩与取历史都必须作用于子会话而非主 UI 会话。"""
     from core import app_context
 
     monkeypatch.setattr(app_context, "get_current_session", lambda: "main-ui-session")
@@ -473,7 +453,6 @@ def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
 
 
 def test_rollback_after_successful_compression_keeps_compressed_history(mocker, monkeypatch):
-    """压缩成功后本轮再异常：回滚不得把内存恢复成未压缩快照（DB 已被压缩）。"""
     from core import app_context
 
     monkeypatch.setattr(app_context, "get_current_session", lambda: "compress-then-fail")
@@ -506,14 +485,11 @@ def test_rollback_after_successful_compression_keeps_compressed_history(mocker, 
     ))
 
     assert "turn_error" in [event.kind for event in events]
-    # 回滚后的内存历史仍是压缩后的版本，与 DB 保持一致
-    # （未被回滚成原始快照；会话内注入的 system 块不落库、随回填保留）
     assert {"role": "user", "content": "压缩后的历史"} in messages
     assert all(m.get("content") != "原始问题" for m in messages)
 
 
 def test_edit_file_dispatch_passes_replace_all(mocker, tmp_path):
-    """调度层必须把 arguments['replace_all'] 透传给 edit_file。"""
     import core.llm as llm
 
     target = tmp_path / "data.txt"
@@ -554,8 +530,6 @@ def test_edit_file_dispatch_passes_replace_all(mocker, tmp_path):
 
 
 def test_write_file_old_content_falls_back_to_gbk(mocker, tmp_path):
-    """GBK 文件被 write_file 覆写时，按回合撤销快照保存原始 GBK 字节，
-    不得把解码替换字符写入快照（新记录器契约，替代旧 set_undo_state）。"""
     import hashlib
 
     import core.llm as llm
@@ -607,7 +581,6 @@ def test_write_file_old_content_falls_back_to_gbk(mocker, tmp_path):
 
 
 def test_generator_preamble_exception_emits_turn_error(mocker):
-    """生成器前置区（如记忆段构建）抛异常时补发 turn_error，不静默穿透。"""
     mocker.patch(
         "core.memory_kairos.build_memory_system_section",
         side_effect=RuntimeError("memory subsystem exploded"),
@@ -635,12 +608,11 @@ def test_generator_preamble_exception_emits_turn_error(mocker):
 
 
 def test_final_summary_retry_removes_empty_assistant_message(mocker):
-    """needs_final_summary 重试时，空 assistant 消息不留内存（避免下轮 API 400）。"""
     responses = [
         iter([_chunk(tool_calls=[
             _tool_call(0, "call-1", "glob_files", '{"pattern":"*.py"}'),
         ])]),
-        iter([_chunk("...")]),  # 无意义内容触发 final summary 重试
+        iter([_chunk("...")]),
         iter([_chunk("检查结论：一切正常。")]),
     ]
     mocker.patch("core.llm.completion", side_effect=responses)
@@ -655,16 +627,12 @@ def test_final_summary_retry_removes_empty_assistant_message(mocker):
         consume_background_notifications=False,
     ))
 
-    # 内存中不存在 content 为 None/空 且无 tool_calls 的悬空 assistant 消息
     for message in messages:
         if message["role"] == "assistant" and not message.get("tool_calls"):
             assert message.get("content")
 
 
-# ── 沙盒外访问询问（_sandbox_outside_guard）──
-
 def test_sandbox_guard_passes_through_for_inside_path(tmp_path, monkeypatch):
-    """沙盒内路径不触发询问，直接放行"""
     import core.llm as llm_mod
 
     monkeypatch.chdir(tmp_path)
@@ -683,7 +651,6 @@ def test_sandbox_guard_passes_through_for_inside_path(tmp_path, monkeypatch):
 
 
 def test_sandbox_guard_asks_and_denies_outside_path(tmp_path, monkeypatch):
-    """沙盒外路径 + 用户拒绝：返回拒绝文案"""
     import core.llm as llm_mod
     import core.tools as tools_mod
 
@@ -702,11 +669,6 @@ def test_sandbox_guard_asks_and_denies_outside_path(tmp_path, monkeypatch):
 
 
 def test_sandbox_guard_exempts_memory_dir_for_read_and_write(tmp_path, monkeypatch):
-    """~/.ycode 数据目录（含 memory）是自家数据读写区：read/write 均豁免沙盒外询问。
-
-    豁免必须返回 bypass 上下文（而非 (None, None)），否则工具层
-    _resolve_workspace_path 兜底校验仍会拒绝。
-    """
     import core.llm as llm_mod
     import core.memory_kairos as mk
 
@@ -736,11 +698,6 @@ def test_sandbox_guard_exempts_memory_dir_for_read_and_write(tmp_path, monkeypat
 def test_sandbox_guard_reads_ycode_dir_but_asks_before_writing_credentials(
     tmp_path, monkeypatch
 ):
-    """~/.ycode 全目录读取豁免（用户要求）；凭据文件写入仍逐次询问。
-
-    改写 mcp.json 可注入恶意 MCP server、改坏 config.json 会让应用不可用，
-    这两个文件（含 .bak）的写操作不受沙盒开关与读取豁免影响。
-    """
     import core.llm as llm_mod
     import core.memory_kairos as mk
 
@@ -762,7 +719,6 @@ def test_sandbox_guard_reads_ycode_dir_but_asks_before_writing_credentials(
         assert err is None, f".ycode/{rel} 不应被拒绝"
         assert cm is not None, f".ycode/{rel} 应获得 bypass 上下文"
 
-    # 凭据文件读取：同样豁免（诊断模型配置是常见需求）
     for rel in ("config.json", "config.json.bak", "mcp.json", "mcp.json.bak"):
         cm, err = llm_mod._sandbox_outside_guard(
             "read_file", str(tmp_path / ".ycode" / rel),
@@ -772,7 +728,6 @@ def test_sandbox_guard_reads_ycode_dir_but_asks_before_writing_credentials(
         assert cm is not None, f".ycode/{rel} 读取应获得 bypass 上下文"
     assert asked == []
 
-    # 凭据文件写入：必须询问，用户拒绝则拒绝执行
     for rel in ("config.json", "mcp.json"):
         cm, err = llm_mod._sandbox_outside_guard(
             "write_file", str(tmp_path / ".ycode" / rel),
@@ -784,7 +739,6 @@ def test_sandbox_guard_reads_ycode_dir_but_asks_before_writing_credentials(
 
 
 def test_sandbox_guard_rejects_unverifiable_path_without_asking(monkeypatch):
-    """Path classification errors must fail closed before any permission prompt."""
     import core.llm as llm_mod
 
     asked = []
@@ -809,7 +763,6 @@ def test_sandbox_guard_rejects_unverifiable_path_without_asking(monkeypatch):
 
 
 def test_sandbox_guard_toggle_on_auto_approves_outside_paths(tmp_path, monkeypatch):
-    """沙盒开关打开（allow_outside_workspace=True）：项目外读写直接放行，不再询问。"""
     import core.llm as llm_mod
     import core.model_manager as mm
 
@@ -836,7 +789,6 @@ def test_sandbox_guard_toggle_on_auto_approves_outside_paths(tmp_path, monkeypat
 
 
 def test_sandbox_guard_toggle_on_still_asks_credential_writes(tmp_path, monkeypatch):
-    """沙盒开关打开时，~/.ycode 凭据文件写入仍必须逐次询问（读取已豁免）。"""
     import core.llm as llm_mod
     import core.memory_kairos as mk
     import core.model_manager as mm
@@ -854,7 +806,6 @@ def test_sandbox_guard_toggle_on_still_asks_credential_writes(tmp_path, monkeypa
         lambda *a, **kw: asked.append(1) or False,
     )
 
-    # 读取：豁免（与沙盒开关无关）
     for rel in ("config.json", "mcp.json"):
         cm, err = llm_mod._sandbox_outside_guard(
             "read_file", str(tmp_path / ".ycode" / rel),
@@ -863,7 +814,6 @@ def test_sandbox_guard_toggle_on_still_asks_credential_writes(tmp_path, monkeypa
         assert err is None and cm is not None
     assert asked == []
 
-    # 写入：即使开关打开也要询问
     for rel in ("config.json", "mcp.json"):
         cm, err = llm_mod._sandbox_outside_guard(
             "write_file", str(tmp_path / ".ycode" / rel),
@@ -875,7 +825,6 @@ def test_sandbox_guard_toggle_on_still_asks_credential_writes(tmp_path, monkeypa
 
 
 def test_sandbox_guard_uses_configured_ycode_data_dir_for_credentials(monkeypatch):
-    """YCODE_DATA_DIR 是真实数据根；其中普通数据放行，顶层配置写入仍询问。"""
     import config
     import core.llm as llm_mod
     import core.model_manager as mm
@@ -1058,7 +1007,6 @@ def test_sandbox_guard_short_name_credential_requires_confirmation(
 def test_unverifiable_path_never_prompts_or_executes_a_file_tool(
     monkeypatch, function_name, arguments
 ):
-    """Read, write, and edit stop on an unclassifiable path before side effects."""
     import core.llm as llm_mod
 
     prompted = []
@@ -1073,8 +1021,6 @@ def test_unverifiable_path_never_prompts_or_executes_a_file_tool(
         "check_permission_and_ask",
         lambda *args, **kwargs: prompted.append((args, kwargs)) or True,
     )
-    # patch 类属性而非 _LazyToolRegistry 实例：实例 setattr 会把 fake 经
-    # __setattr__ 落到进程级缓存的内部注册表上（还原不可靠，见 test_llm_events）。
     from core.tool_registry import ToolRegistry
 
     monkeypatch.setattr(
@@ -1113,7 +1059,6 @@ def test_unverifiable_path_never_prompts_or_executes_a_file_tool(
 
 
 def test_external_missing_edit_requests_sandbox_access_before_existence_probe(tmp_path, monkeypatch):
-    """A denied external edit cannot disclose whether its target exists."""
     import core.llm as llm_mod
 
     workspace = tmp_path / "workspace"
@@ -1157,7 +1102,6 @@ def test_external_missing_edit_requests_sandbox_access_before_existence_probe(tm
 def test_sandbox_guard_requires_confirmation_for_writing_skill_file(
     tmp_path, monkeypatch, function_name
 ):
-    """Skill trust only exempts reads; writes must still request outside access."""
     import core.llm as llm_mod
     import core.skills as skills_mod
 
@@ -1189,7 +1133,6 @@ def test_sandbox_guard_requires_confirmation_for_writing_skill_file(
 
 
 def test_sandbox_guard_approved_bypass_allows_read(tmp_path, monkeypatch):
-    """沙盒外路径 + 用户同意本次：返回 bypass 上下文，其中可读取沙盒外文件"""
     import core.llm as llm_mod
     import core.tools as tools_mod
 
@@ -1200,7 +1143,6 @@ def test_sandbox_guard_approved_bypass_allows_read(tmp_path, monkeypatch):
     (outside / "note.txt").write_text("外部内容", encoding="utf-8")
     monkeypatch.chdir(workspace)
 
-    # 仅 bypass 上下文内放行（配置关闭、会话未放行）
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
     tools_mod.set_session_sandbox_bypass(False)
     monkeypatch.setattr(llm_mod, "check_permission_and_ask", lambda *a, **kw: True)
@@ -1212,14 +1154,12 @@ def test_sandbox_guard_approved_bypass_allows_read(tmp_path, monkeypatch):
     assert err is None and cm is not None
     with cm:
         assert tools_mod.read_file(str(outside / "note.txt")) == "外部内容"
-    # 离开上下文后沙盒恢复拒绝
     import pytest as _pytest
     with _pytest.raises(ValueError, match="路径越界"):
         tools_mod.read_file(str(outside / "note.txt"))
 
 
 def test_session_sandbox_bypass_flag(monkeypatch):
-    """始终放行：会话级标志置位后 _outside_workspace_allowed 为 True"""
     import core.tools as tools_mod
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
@@ -1233,11 +1173,6 @@ def test_session_sandbox_bypass_flag(monkeypatch):
 
 
 def test_imom_active_publish_root_reads_store(tmp_path, monkeypatch):
-    """回归：_get_imom_active_publish_root 必须能读出活跃项目的 publish_root
-
-    历史上函数内重复 json.load(f) 导致第二次读取 EOF 必抛异常被静默吞掉，
-    函数永远返回空串，使 imom_* 工具的沙盒守卫完全失效。
-    """
     import json as _json
     import os as _os
 
@@ -1258,25 +1193,16 @@ def test_imom_active_publish_root_reads_store(tmp_path, monkeypatch):
 
 
 def test_plan_mode_still_asks_sandbox_outside_read_access(monkeypatch):
-    """回归：plan 模式下 sandbox_outside_access 仍必须询问（不自动放行）。
-
-    新语义：plan 模式不批准任何修改——修改/执行类工具在
-    _execute_single_tool_call 中被 PLAN_MODE_DENIED_MESSAGE 硬拦截，
-    不会进入 check_permission_and_ask；能走到这里的只剩
-    sandbox_outside_access 等必须逐次询问的场景。
-    """
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod.app_context, "get_permission_mode", lambda: "plan")
     asked = []
-    # 权限回调的生产契约是布尔值；记录调用证明 plan 模式没有自动放行。
     monkeypatch.setattr(
         llm_mod.app_context,
         "get_permission_callback",
         lambda: (lambda *args, **kwargs: asked.append((args, kwargs)) or True),
     )
 
-    # sandbox_outside_access 必须继续询问
     assert llm_mod.check_permission_and_ask(
         "sandbox_outside_access", {"path": "/outside", "operation": "read_file"}
     ) is True
@@ -1287,8 +1213,6 @@ def test_plan_mode_still_asks_sandbox_outside_read_access(monkeypatch):
 
 
 def test_plan_mode_blocks_modifying_tools(monkeypatch):
-    """plan 模式硬拦截：任何需要权限的修改/执行类工具直接返回计划模式拒绝文案，
-    不执行、不询问；规划类工具（plan_write 等）不受影响。"""
     import json as _json
     import core.llm as llm_mod
 
@@ -1317,8 +1241,6 @@ def test_plan_mode_blocks_modifying_tools(monkeypatch):
     assert executed == []
 
 
-# ── 多模态图片透传（_strip_media_and_merge / _supports_vision）──
-
 def _image_msg(text="看图"):
     return {
         "role": "user",
@@ -1330,7 +1252,6 @@ def _image_msg(text="看图"):
 
 
 def test_vision_model_keeps_latest_image_and_strips_older(monkeypatch):
-    """支持视觉的模型：最近一条图片原样透传，更早的历史图片折叠为占位符"""
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod, "_supports_vision", lambda model: True)
@@ -1342,18 +1263,15 @@ def test_vision_model_keeps_latest_image_and_strips_older(monkeypatch):
     ]
     out = llm_mod._strip_media_and_merge(messages, "openai/vision-model")[0]
 
-    # 较早的图片被折叠，base64 不外泄
     assert isinstance(out[1]["content"], str)
     assert "AAAABBBB" not in out[1]["content"]
     assert "[图片]" in out[1]["content"]
-    # 最近一条图片完整保留多模态结构
     assert isinstance(out[3]["content"], list)
     assert out[3]["content"][1]["type"] == "image_url"
     assert "AAAABBBB" in out[3]["content"][1]["image_url"]["url"]
 
 
 def test_non_vision_model_flattens_image_without_base64_leak(monkeypatch):
-    """不支持视觉的模型：图片折叠为占位符，base64 绝不作为文本发送"""
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod, "_supports_vision", lambda model: False)
@@ -1364,7 +1282,6 @@ def test_non_vision_model_flattens_image_without_base64_leak(monkeypatch):
 
 
 def test_media_list_content_not_merged_with_text(monkeypatch):
-    """多模态 list 内容不参与同 role 文本合并；只有最新用户消息中的图片被保留"""
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod, "_supports_vision", lambda model: True)
@@ -1377,7 +1294,6 @@ def test_media_list_content_not_merged_with_text(monkeypatch):
 
 
 def test_supports_vision_config_flag_takes_precedence(monkeypatch):
-    """config.json 模型条目中的 supports_vision 显式标注优先于其它判定"""
     import core.llm as llm_mod
 
     monkeypatch.setattr(
@@ -1387,13 +1303,11 @@ def test_supports_vision_config_flag_takes_precedence(monkeypatch):
             {"litellm_model": "openai/m2", "supports_vision": True},
         ]}]},
     )
-    # 即使协议兜底会认为 openai/ 支持视觉，显式 False 也生效
     assert llm_mod._supports_vision("openai/m1") is False
     assert llm_mod._supports_vision("openai/m2") is True
 
 
 def test_supports_vision_unknown_default_false(monkeypatch):
-    """未知模型默认不支持视觉，避免把 image_url 发给纯文本模型触发 400"""
     import core.llm as llm_mod
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {"providers": []})
@@ -1403,12 +1317,7 @@ def test_supports_vision_unknown_default_false(monkeypatch):
     assert llm_mod._supports_vision(None) is False
 
 
-# ── 只思考不行动的促升兜底（P0 回归）──
-
-
 def test_reasoning_only_turn_is_nudged_to_act(mocker):
-    """模型只输出 reasoning、不调工具也不给正文：先注入催促消息让它真正行动，
-    而不是把整段内心独白当成本轮回合的交付结果。"""
     responses = [
         iter([_chunk(reasoning="让我先精确定位需要修改的 SQL，然后做修改。")]),
         iter([_chunk("检查结论：已定位问题并完成修改。")]),
@@ -1425,25 +1334,21 @@ def test_reasoning_only_turn_is_nudged_to_act(mocker):
         consume_background_notifications=False,
     ))
 
-    # 催促消息已注入对话，要求模型调用工具或给出结论
     assert any(
         m["role"] == "user" and "只输出了思考过程" in str(m.get("content", ""))
         for m in messages
     )
-    # 最终留下的 assistant 正文是结论，而不是思考原文
     final = [m for m in messages if m["role"] == "assistant" and m.get("content")]
     assert final and "检查结论" in final[-1]["content"]
     assert "让我先精确定位" not in final[-1]["content"]
 
 
 def test_reasoning_only_promotion_is_truncated(mocker):
-    """催促重试后模型仍只输出思考：促升为正文时必须截断，
-    不能把数万字内心独白全量倾倒给用户。"""
-    long_reasoning = "分析过程。" * 2000  # 远超预览上限
+    long_reasoning = "分析过程。" * 2000
     responses = [
         iter([_chunk(reasoning=long_reasoning)]),
-        iter([_chunk(reasoning=long_reasoning)]),  # 重试后仍只思考
-        iter([_chunk(reasoning=long_reasoning)]),  # 第二次重试后仍只思考
+        iter([_chunk(reasoning=long_reasoning)]),
+        iter([_chunk(reasoning=long_reasoning)]),
     ]
     mocker.patch("core.llm.completion", side_effect=responses)
     messages = [{"role": "user", "content": "使用方案A修改一下"}]
@@ -1466,8 +1371,6 @@ def test_reasoning_only_promotion_is_truncated(mocker):
 
 
 def test_reasoning_only_retries_twice_before_giving_up(mocker):
-    """模型连续多次只输出思考：系统应注入两次催促（重试两次）再收尾，
-    而不是重试一次后就静默结束（用户反馈"任务未执行完就结束"的根因）。"""
     responses = [
         iter([_chunk(reasoning="第一次思考")]),
         iter([_chunk(reasoning="第二次思考")]),
@@ -1485,14 +1388,12 @@ def test_reasoning_only_retries_twice_before_giving_up(mocker):
         consume_background_notifications=False,
     ))
 
-    # 注入两次催促（第一次与第二次失败后各一次）
     nudges = [
         m for m in messages
         if m["role"] == "user" and "只输出了思考过程" in str(m.get("content", ""))
     ]
     assert len(nudges) == 2, f"应注入两次催促，实际 {len(nudges)} 条"
 
-    # 最终留下促升的可见正文，且带错误事件让 UI 明确感知回合未正常完成
     final = [m for m in messages if m["role"] == "assistant" and m.get("content")]
     assert final, "促升兜底仍应留下一条可见回复"
     assert "未生成正式回复" in final[-1]["content"]
@@ -1500,8 +1401,6 @@ def test_reasoning_only_retries_twice_before_giving_up(mocker):
 
 
 def test_reasoning_only_emits_error_when_retries_exhausted(mocker):
-    """重试耗尽（连续多次只思考）后必须发出显式 error 事件，
-    而不是仅靠静默 notice——让 GUI 能把"任务未完成"写进对话流。"""
     responses = [
         iter([_chunk(reasoning="思考A")]),
         iter([_chunk(reasoning="思考B")]),
@@ -1539,7 +1438,6 @@ def _chunk_with_finish(content="", reasoning="", finish_reason=None):
 
 
 def test_reasoning_fields_preserved_for_all_assistant_messages(mocker):
-    """支持原生推理字段的 provider 必须收到完整 assistant 消息信封。"""
     captured = {}
 
     def fake_completion(**kwargs):
@@ -1591,7 +1489,6 @@ def test_reasoning_fields_preserved_for_all_assistant_messages(mocker):
 
 
 def test_openai_reasoning_route_strips_anthropic_thinking_blocks():
-    """切换到 OpenAI 路由时保留 reasoning_content，但不得发送 Anthropic 签名块。"""
     from core.llm import _strip_media_and_merge
 
     cleaned, _, _ = _strip_media_and_merge([
@@ -1610,8 +1507,6 @@ def test_openai_reasoning_route_strips_anthropic_thinking_blocks():
 
 
 def test_length_truncated_retry_bumps_max_tokens(mocker):
-    """思考被 max_tokens 截断（finish_reason=length）导致无正文时，
-    催促重试必须翻倍输出上限并要求压缩思考，否则同参数重试必然同样失败。"""
     captured = []
     responses = [
         iter([_chunk_with_finish(reasoning="长思考" * 100, finish_reason="length")]),
@@ -1638,7 +1533,6 @@ def test_length_truncated_retry_bumps_max_tokens(mocker):
     first_max = captured[0].get("max_tokens") or captured[0].get("max_completion_tokens")
     second_max = captured[1].get("max_tokens") or captured[1].get("max_completion_tokens")
     assert second_max == min(first_max * 2, 32768)
-    # 催促消息应包含压缩思考的提示
     assert any(
         m["role"] == "user" and "输出长度限制被截断" in str(m.get("content", ""))
         for m in messages
@@ -1646,7 +1540,6 @@ def test_length_truncated_retry_bumps_max_tokens(mocker):
 
 
 def test_context_overflow_circuit_breaker_after_compression(mocker, monkeypatch):
-    """压缩过一次后仍超窗必须直接熔断失败，不得继续重发超大载荷空烧额度。"""
     from core import app_context
 
     monkeypatch.setattr(app_context, "get_current_session", lambda: "overflow-breaker-session")
@@ -1681,7 +1574,6 @@ def test_context_overflow_circuit_breaker_after_compression(mocker, monkeypatch)
         consume_background_notifications=False,
     ))
 
-    # 第一次超窗 → 压缩一次并重试；第二次超窗 → 熔断，不再压缩也不再重发
     assert compress_calls == ["overflow-breaker-session"]
     assert len(completion_calls) == 2
     error_events = [e for e in events if e.kind == "turn_error"]
@@ -1693,7 +1585,6 @@ def test_context_overflow_circuit_breaker_after_compression(mocker, monkeypatch)
 
 
 def test_request_timeout_scales_with_payload(mocker, monkeypatch):
-    """大载荷请求的超时必须随估算 token 数放大（并封顶），小载荷保持默认 90s。"""
     captured = []
 
     def fake_completion(**kwargs):
@@ -1702,7 +1593,6 @@ def test_request_timeout_scales_with_payload(mocker, monkeypatch):
 
     mocker.patch("core.llm.completion", side_effect=fake_completion)
 
-    # 小载荷：默认超时
     monkeypatch.setattr("core.llm.estimate_tokens", lambda model, msgs: 1000)
     list(chat_with_model_events(
         "fake-model",
@@ -1714,7 +1604,6 @@ def test_request_timeout_scales_with_payload(mocker, monkeypatch):
     ))
     assert captured[-1]["timeout"] == 90
 
-    # 大载荷：超时放大 = 90 + tokens // 1500
     monkeypatch.setattr("core.llm.estimate_tokens", lambda model, msgs: 300_000)
     list(chat_with_model_events(
         "fake-model",
@@ -1726,7 +1615,6 @@ def test_request_timeout_scales_with_payload(mocker, monkeypatch):
     ))
     assert captured[-1]["timeout"] == 90 + 300_000 // 1500
 
-    # 超大载荷：封顶在 API_REQUEST_MAX_TIMEOUT_SECONDS
     monkeypatch.setattr("core.llm.estimate_tokens", lambda model, msgs: 100_000_000)
     list(chat_with_model_events(
         "fake-model",
@@ -1741,7 +1629,6 @@ def test_request_timeout_scales_with_payload(mocker, monkeypatch):
 
 
 def test_wait_notice_emitted_during_slow_request(mocker, monkeypatch):
-    """请求长时间无响应时必须向 UI 周期性上报等待状态，避免被误判为卡死。"""
     import time as _time
 
     monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
@@ -1771,12 +1658,6 @@ def test_wait_notice_emitted_during_slow_request(mocker, monkeypatch):
 
 
 def test_wait_notice_flushed_realtime_not_batched_after_first_chunk(mocker, monkeypatch):
-    """等待提示必须实时到达消费端，而不是积压到首个正文 chunk 之后一次性冲刷。
-
-    status 事件经回调进 pending_events，若等待期不 yield 空心跳，外层适配层
-    只会在拿到首个正文 chunk 时才 drain——GUI 上表现为“通了之后扎堆弹出”。
-    以 completion 返回时刻为界：至少一条提示必须在其之前到达。
-    """
     import time as _time
 
     monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
@@ -1815,8 +1696,6 @@ def test_wait_notice_flushed_realtime_not_batched_after_first_chunk(mocker, monk
 
 
 def test_request_wait_give_up_ends_turn_at_hard_cap_without_retry(mocker, monkeypatch):
-    """等待达到硬上限必须结束本轮并发出 turn_error，且绝不进入 API 重试循环
-    （重试只会再等一个上限时长）。"""
     import time as _time
 
     monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
@@ -1824,7 +1703,6 @@ def test_request_wait_give_up_ends_turn_at_hard_cap_without_retry(mocker, monkey
     monkeypatch.setattr("core.llm.REQUEST_WAIT_GIVE_UP_SECONDS", 0.25)
 
     def hanging_completion(**kwargs):
-        # 永不返回流：等待硬上限必须先于任何响应触发
         _time.sleep(5)
         return iter([_chunk("完成")])
 
@@ -1852,8 +1730,6 @@ def test_request_wait_give_up_ends_turn_at_hard_cap_without_retry(mocker, monkey
 
 
 def test_fold_old_media_for_estimate_keeps_only_latest_image():
-    """token 估算时历史图片必须折叠为占位符（与请求时的折叠规则一致），
-    仅最近一条带图用户消息保留原样，避免 base64 字符量虚高误触发压缩。"""
     from core.llm import _fold_old_media_for_estimate
 
     base64_blob = "a" * 200_000
@@ -1874,16 +1750,13 @@ def test_fold_old_media_for_estimate_keeps_only_latest_image():
     ]
     folded = _fold_old_media_for_estimate(messages)
 
-    # 历史图片折叠为 "[图片]" 占位符，不再携带 base64
     assert folded[0]["content"] == "第一张图 [图片]"
     assert base64_blob not in str(folded[0])
-    # 最近一条带图消息保留原样
     assert folded[2] is messages[2]
     assert base64_blob in str(folded[2])
 
 
 def test_estimate_tokens_ignores_old_image_base64(mocker):
-    """estimate_tokens 计数时，历史图片必须先折叠，base64 不得参与计数。"""
     import core.llm as llm_module
     from core.llm import estimate_tokens
 
@@ -1905,7 +1778,7 @@ def test_estimate_tokens_ignores_old_image_base64(mocker):
         counted.append(msgs)
         return 123
 
-    llm_module._token_estimate_cache["sig"] = None  # 避免命中签名缓存
+    llm_module._token_estimate_cache["sig"] = None
     mocker.patch("core.llm._token_counter", side_effect=fake_counter)
 
     assert estimate_tokens("fake-model", messages) == 123
@@ -1915,9 +1788,6 @@ def test_estimate_tokens_ignores_old_image_base64(mocker):
 
 
 def test_plan_active_does_not_prune_request_tools(mocker, monkeypatch):
-    """计划进行中不再裁剪 tools：计划约束由执行层 plan_enforced 拦截统一保证，
-    tools 列表逐字节稳定是 DeepSeek/Kimi 前缀缓存命中的前提，
-    计划创建/完成之间切换工具集会让缓存从头部整体失效。"""
     monkeypatch.setattr("core.llm._has_pending_plan", lambda session: True)
 
     captured = []
@@ -1945,8 +1815,6 @@ def test_plan_active_does_not_prune_request_tools(mocker, monkeypatch):
 
 
 def test_greeting_turn_keeps_tools_for_cache_stability(mocker):
-    """简单问候轮也必须携带 tools + tool_choice=auto：请求形状逐字节稳定是
-    前缀缓存命中的前提，问候轮省 schema token 的代价是后续轮次缓存整体失效。"""
     captured = []
 
     def fake_completion(**kwargs):
@@ -1975,9 +1843,6 @@ def test_official_deepseek_thinking_omits_tool_choice(mocker, monkeypatch):
         "core.model_manager.get_model_config_by_litellm_model",
         lambda model, base_url=None: None,
     )
-    # 默认配置把官方 DeepSeek 路由到 responses 协议，会绕开本用例要验证的
-    # chat completions tool_choice 契约（mock 的 completion 永远不被调用），
-    # 这里显式钉在 chat 协议
     monkeypatch.setattr(
         "core.model_manager.get_model_protocol",
         lambda model, base_url=None: "openai",
@@ -2010,7 +1875,6 @@ def test_deepseek_non_thinking_keeps_auto_tool_choice(mocker, monkeypatch):
         "core.model_manager.get_model_config_by_litellm_model",
         lambda model, base_url=None: {"enable_thinking": False},
     )
-    # 同上：钉在 chat 协议，避免默认 responses 路由绕开 mock 的 completion
     monkeypatch.setattr(
         "core.model_manager.get_model_protocol",
         lambda model, base_url=None: "openai",
@@ -2036,8 +1900,6 @@ def test_deepseek_non_thinking_keeps_auto_tool_choice(mocker, monkeypatch):
 
 
 def test_get_tools_schema_waits_for_mcp_only_once(mocker, monkeypatch):
-    """进程内首次构建 tools 前同步等待 MCP 就绪（避免 MCP schema 第 N 轮
-    突然出现破坏前缀缓存），后续调用恢复非阻塞。"""
     import core.llm as llm_mod
 
     calls = []
@@ -2051,8 +1913,6 @@ def test_get_tools_schema_waits_for_mcp_only_once(mocker, monkeypatch):
 
 
 def test_estimate_tokens_incremental_counts_only_tail(mocker):
-    """append-only 历史新增消息后，estimate_tokens 只对尾部增量计数，
-    不再全量 tokenize（大会话全量一次要数秒，每轮都发生就是明显卡顿）。"""
     import core.llm as llm_mod
     from core.llm import estimate_tokens
 
@@ -2076,15 +1936,12 @@ def test_estimate_tokens_incremental_counts_only_tail(mocker):
     assert counted_batches == [50, 1], "第二轮必须只计数新增的 1 条尾部消息"
     assert v2 > v1, "增量结果必须大于前值"
 
-    # 第三轮签名未变，直接命中签名缓存不再计数
     v3 = estimate_tokens("fake-model", history2)
     assert v3 == v2
     assert counted_batches == [50, 1]
 
 
 def test_estimate_tokens_prefix_changed_falls_back_to_full_count(mocker):
-    """历史被改写（如压缩）导致前缀字符数变化时，必须回退全量计数，
-    不得复用过期的前缀结果。"""
     import core.llm as llm_mod
     from core.llm import estimate_tokens
 
@@ -2102,7 +1959,6 @@ def test_estimate_tokens_prefix_changed_falls_back_to_full_count(mocker):
     history = [{"role": "user", "content": "x" * 1000} for _ in range(50)]
     estimate_tokens("fake-model", history)
 
-    # 模拟压缩：历史被整体替换为更短内容（等长前缀校验必须失败）
     compressed = [{"role": "user", "content": "压缩后" * 10} for _ in range(5)]
     estimate_tokens("fake-model", compressed + [{"role": "user", "content": "新问题"}])
 
@@ -2159,9 +2015,6 @@ def test_estimate_tokens_cache_snapshot_cannot_mix_concurrent_models(monkeypatch
 
 
 def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
-    """流式包装器会把 finish 后的最终 usage chunk 留在 wrapper.chunks
-    而不再对外 yield，迭代中拿到的 usage 不含缓存明细（命中记账恒为 0）。
-    记账必须从 chunks 尾部补取最终 usage。"""
     import core.llm as llm_mod
 
     final_usage = SimpleNamespace(
@@ -2171,8 +2024,6 @@ def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
     )
 
     class FakeStream:
-        """模拟流包装对象：迭代只给内容 chunk，
-        真实 usage 留在 chunks 属性里。"""
 
         chunks = [SimpleNamespace(usage=final_usage)]
 
@@ -2366,9 +2217,6 @@ def test_nonpersistent_vision_turn_does_not_replace_database_content(
     assert cas_calls == []
 
 
-# ── DeepSeek thinking：带 tool_calls 的 assistant 必须回传 reasoning_content key ──
-
-
 @pytest.mark.parametrize("reasoning", [None, 123])
 def test_deepseek_thinking_backfills_reasoning_content_string_field(
     monkeypatch, reasoning
@@ -2399,7 +2247,6 @@ def test_deepseek_thinking_backfills_reasoning_content_string_field(
 def test_deepseek_thinking_tool_call_without_reasoning_replays_empty_key(
     mocker, monkeypatch
 ):
-    """provider 不发 reasoning delta 时，下一请求仍须回传显式空 key。"""
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod, "get_tools_schema", lambda: [])
@@ -2481,7 +2328,6 @@ def test_non_thinking_deepseek_not_backfilled():
              "function": {"name": "read_file", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
     ]
-    # 非 thinking 的 deepseek 路由（如 openai/deepseek-v4-flash）字节不得改变
     fixed, _, _ = llm_mod._strip_media_and_merge(
         messages,
         "openai/deepseek-v4-flash",
@@ -2550,15 +2396,7 @@ def test_protocol_empty_content_marker_is_not_persisted_or_rendered(
     assert marker not in str(manager.get_history("session"))
 
 
-# ── neohorse 网关：仅允许一条开头 system 消息（记忆注入兼容性）──
-
-
 def test_neohorse_merges_leading_system_messages():
-    """子代理形态：[system, system(记忆注入), user] 必须合并为一条开头 system。
-
-    neohorse（tokenrhythm 网关）对多条 system 或中段 system 一律 400：
-    "System message must be at the beginning."
-    """
     import core.llm as llm_mod
 
     messages = [
@@ -2579,7 +2417,6 @@ def test_neohorse_merges_leading_system_messages():
 
 
 def test_neohorse_merges_mid_conversation_system():
-    """主 Agent 长会话形态：对话中间的 system 也必须折叠进开头一条。"""
     import core.llm as llm_mod
 
     messages = [
@@ -2600,7 +2437,6 @@ def test_neohorse_merges_mid_conversation_system():
 
 
 def test_other_providers_keep_separate_system_messages():
-    """非 neohorse 路由行为不变：连续 system 消息保持原样不合并。"""
     import core.llm as llm_mod
 
     messages = [

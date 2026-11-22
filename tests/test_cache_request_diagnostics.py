@@ -143,7 +143,6 @@ def test_diagnostic_defaults_to_empty_without_override():
 
 
 def test_route_override_fingerprint_records_without_counting_as_rotation():
-    """覆盖指纹变化只更新记录值，不得被换代判定误判成一次缓存换代。"""
     from core.llm import _classify_cache_request_details
 
     session = "diag-override-rotation"
@@ -164,7 +163,6 @@ def test_route_override_fingerprint_records_without_counting_as_rotation():
 
 
 def test_legacy_cache_diagnostic_table_migrates_route_override_column(tmp_path):
-    """老库升级：缺 route_override_sha256 列触发迁移；老调用不传该字段也能落库。"""
     import sqlite3
 
     from core.memory import MemoryManager
@@ -237,18 +235,7 @@ def test_legacy_cache_diagnostic_table_migrates_route_override_column(tmp_path):
     assert row == ("",)
 
 
-# ---------------------------------------------------------------------------
-# Task 2（跨渠道缓存命中率修复）：诊断指纹统一为逻辑前缀口径 + 线上字节事实
-# ---------------------------------------------------------------------------
-
-
 def test_content_block_cache_control_is_stripped_from_logical_prefix():
-    """Qwen 形态（content 块标记）不得进入逻辑前缀口径。
-
-    同一批消息，未打标版与 `_apply_cache_control` 打标后的版本，per-message
-    指纹与 messages_sha256 必须相等；否则「诊断显示字节没变」的归因不成立
-    （设计 §1.5 / §五 Task 2）。
-    """
     import copy
 
     from core.llm import (
@@ -267,7 +254,6 @@ def test_content_block_cache_control_is_stripped_from_logical_prefix():
         {"role": "user", "content": "round 2 question"},
     ]
     marked = _apply_cache_control(copy.deepcopy(messages), model, api_base)
-    # 前提：确实是 Qwen 形态——content 被改写成带块级 cache_control 的列表
     assert isinstance(marked[0]["content"], list)
     assert marked[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert isinstance(marked[-1]["content"], list)
@@ -285,7 +271,6 @@ def test_content_block_cache_control_is_stripped_from_logical_prefix():
     assert marked_diag["system_sha256"] == plain["system_sha256"]
     assert marked_diag["request_bytes"] == plain["request_bytes"]
 
-    # 会话内「带标记重发」不得被自己的标记误判成一次缓存换代
     session = "logical-prefix-session"
     first = _classify_cache_request_details(
         session, "main", model, api_base, "tools-v1", copy.deepcopy(messages)
@@ -300,7 +285,6 @@ def test_content_block_cache_control_is_stripped_from_logical_prefix():
 
 
 def test_message_level_cache_control_is_stripped_for_anthropic_form():
-    """Anthropic 形态（消息顶层标记）的回归保护：剥标记前后指纹必须相等。"""
     import copy
 
     from core.llm import _build_cache_request_diagnostic, _cache_message_fingerprints
@@ -326,8 +310,6 @@ def test_message_level_cache_control_is_stripped_for_anthropic_form():
 
 
 def test_strip_helper_preserves_every_field_except_cache_control():
-    """铁律：剥离只动 cache_control 键；content 块的 type/text 原样保留，
-    且不修改调用方传入的消息对象。"""
     import copy
 
     from core.llm import _strip_cache_control_markers
@@ -357,10 +339,8 @@ def test_strip_helper_preserves_every_field_except_cache_control():
 
     stripped = _strip_cache_control_markers(messages)
 
-    assert messages == snapshot  # 原对象一个字节都没动
-    # 打标引入的单文本块包装还原为客户端原字符串（Qwen 打标前形态）
+    assert messages == snapshot
     assert stripped[0]["content"] == "stable system"
-    # 多块 content（含非文本块）保持列表形态，只剥 cache_control
     assert stripped[1]["content"] == [
         {"type": "text", "text": "看看这张图"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
@@ -368,8 +348,6 @@ def test_strip_helper_preserves_every_field_except_cache_control():
 
 
 def test_legacy_cache_diagnostic_table_migrates_online_byte_columns(tmp_path):
-    """老库升级：缺 cache_control_markers / request_bytes_final 两列时自动补列，
-    老行保持 NULL（未观测 ≠ 0），重复打开幂等不报错。"""
     import sqlite3
 
     from core.memory import MemoryManager
@@ -451,12 +429,10 @@ def test_legacy_cache_diagnostic_table_migrates_online_byte_columns(tmp_path):
         "usage_valid": False,
         "usage_errors": (),
     }
-    # 新记录写真实观测值：真的没标记写 0，未打标字节数等于 request_bytes
     manager.add_cache_request_diagnostic(dict(
         base_row, session_id="new-row", cache_control_markers=0,
         request_bytes_final=188,
     ))
-    # 未观测（老调用方不传新字段）→ NULL，不冒充 0
     manager.add_cache_request_diagnostic(dict(base_row, session_id="unobserved-row"))
 
     new_rows = manager.query_cache_request_diagnostics(session_id="new-row")
@@ -467,7 +443,6 @@ def test_legacy_cache_diagnostic_table_migrates_online_byte_columns(tmp_path):
     assert unobserved[0]["request_bytes_final"] is None
     manager.close()
 
-    # 重复打开幂等不报错，列仍在
     reopened = MemoryManager(str(db_path))
     try:
         columns = {
@@ -507,7 +482,6 @@ def _stream_chunk(content=""):
 
 
 def _run_one_diagnostic_turn(monkeypatch, *, model, api_base, messages, session_id):
-    """跑一个最小流式回合，返回（线上 provider messages, 捕获的诊断对象）。"""
     from core.llm import chat_with_model_events
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
@@ -549,8 +523,6 @@ def _run_one_diagnostic_turn(monkeypatch, *, model, api_base, messages, session_
 
 
 def test_online_byte_facts_recorded_for_marked_request(monkeypatch):
-    """带显式标记的请求：记下真实标记数与打标后规范化字节数（同一行），
-    且逻辑前缀 sha256 等于剥离标记后的线上字节。"""
     import hashlib
 
     from core.llm import _canonical_diagnostic_json, _strip_cache_control_markers
@@ -566,7 +538,6 @@ def test_online_byte_facts_recorded_for_marked_request(monkeypatch):
         session_id="online-byte-facts-marked",
     )
 
-    # 前提：线上报文确实带显式标记（Qwen 形态：system + 尾部 user 各 1 个）
     assert isinstance(online_messages[0]["content"], list)
     assert online_messages[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert isinstance(online_messages[-1]["content"], list)
@@ -577,7 +548,6 @@ def test_online_byte_facts_recorded_for_marked_request(monkeypatch):
     )
     assert details["request_bytes_final"] > details["request_bytes"]
 
-    # 逻辑前缀口径：sha256 / request_bytes 等于剥离标记后的线上字节
     stripped = _strip_cache_control_markers(online_messages)
     assert details["messages_sha256"] == hashlib.sha256(
         _canonical_diagnostic_json(stripped).encode("utf-8")
@@ -590,7 +560,6 @@ def test_online_byte_facts_recorded_for_marked_request(monkeypatch):
 
 
 def test_online_byte_facts_record_zero_for_unmarked_request(monkeypatch):
-    """未打标车道：零标记，打标后字节数等于 request_bytes（字节零变化）。"""
     from core.llm import _canonical_diagnostic_json
 
     messages = [
@@ -605,8 +574,6 @@ def test_online_byte_facts_record_zero_for_unmarked_request(monkeypatch):
         session_id="online-byte-facts-unmarked",
     )
 
-    # 注意：chat_with_model_events 会注入系统提示词（含系统级段落），
-    # 线上 messages 不等于入参原样；这里断言的是「零标记」这一事实本身。
     assert all("cache_control" not in message for message in online_messages)
     assert all(
         not isinstance(message.get("content"), list)

@@ -1,22 +1,8 @@
-"""GitStateMonitor：外部 Git 状态同步（规格 §10）。
-
-- 按 Worktree 建立监控订阅；同一 Worktree 的全部会话共享同一探测线程；
-- 轻量指纹探测（HEAD/Index/Packed Refs/refs 目录/操作状态文件/工作区顶层
-  stat），零 git 进程开销；发现变化只做"失效"通知，最终状态由消费方重新
-  调用 Git 权威读取（§10：监控不生成第二事实源）；
-- 大量事件 Debounce/Coalesce 合并成一次通知；
-- 目标：应用活跃时外部分支切换通常在 1 秒内显示；窗口重新聚焦时调用
-  force_check() 立即校准；
-- 监控线程绝不直接触碰 prompt_toolkit / pywebview——只调用订阅者回调，
-  UI 线程投递由消费方（gui_bridge / CLI call_soon_threadsafe）负责。
-"""
-
 from __future__ import annotations
 
 import hashlib
 import os
 import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -31,7 +17,7 @@ _PROBE_TOP_MAX = 512
 @dataclass
 class _Subscription:
     sub_id: str
-    workspace: str          # 规范化 worktree 路径
+    workspace: str
     callback: Callable[[str], None]
 
 
@@ -59,11 +45,9 @@ class GitStateMonitor:
         self._debounce = debounce
         self._probe_depth = probe_depth
         self._lock = threading.RLock()
-        self._watchers: Dict[str, _Watcher] = {}  # normalized ws → watcher
-        self._subscribers: Dict[str, _Subscription] = {}  # sub_id → sub
+        self._watchers: Dict[str, _Watcher] = {}
+        self._subscribers: Dict[str, _Subscription] = {}
         self._stopped = False
-
-    # ---------------------------------------------------------------- 公开接口
 
     def subscribe(self, workspace_path: str, on_change: Callable[[str], None]) -> str:
         """订阅一个工作区的失效通知，返回订阅 ID。"""
@@ -130,8 +114,6 @@ class GitStateMonitor:
             watcher = self._watchers.get(ws)
             return len(watcher.subscriptions) if watcher else 0
 
-    # ---------------------------------------------------------------- 内部
-
     def _watch_loop(self, workspace: str) -> None:
         with self._lock:
             watcher = self._watchers.get(workspace)
@@ -146,12 +128,10 @@ class GitStateMonitor:
             fingerprint = self._probe(workspace)
             if fingerprint == last_fingerprint:
                 continue
-            # Debounce/Coalesce：等待窗口后复核，仍变化才通知一次
             stop_event.wait(self._debounce)
             confirmed = self._probe(workspace)
             last_fingerprint = confirmed
             if confirmed == fingerprint:
-                # 抖动回落也视为变化过一次（外部可能连续操作），保守通知
                 pass
             with self._lock:
                 watcher = self._watchers.get(workspace)
@@ -167,7 +147,6 @@ class GitStateMonitor:
             pass
 
     def _probe(self, workspace: str) -> str:
-        """轻量指纹：不启动 git 进程，只 stat 关键文件与目录。"""
         hasher = hashlib.sha256()
         self._hash_git_dir(workspace, hasher)
         self._hash_worktree_top(workspace, hasher)
@@ -186,19 +165,12 @@ class GitStateMonitor:
         ]
         for name in candidates:
             self._stat_into(hasher, os.path.join(git_dir, name))
-        # refs 目录递归 stat（通常很小）
         self._hash_tree(os.path.join(git_dir, "refs"), hasher)
         self._stat_into(hasher, os.path.join(git_dir, "packed-refs"))
-        # stash reflog（外部 stash 变化）
         self._stat_into(hasher, os.path.join(git_dir, "logs", "refs", "stash"))
-        # linked worktrees 注册表
         self._stat_into(hasher, os.path.join(git_dir, "worktrees"))
 
     def _resolve_git_dir(self, workspace: str) -> Optional[str]:
-        """解析真实 Git Dir（不假设 .git 一定是目录，§10）。
-
-        结果按 workspace 缓存于进程内：git dir 位置本身变化时由探测失败兜底。
-        """
         cache = getattr(self, "_git_dir_cache", None)
         if cache is None:
             cache = self._git_dir_cache = {}
@@ -217,7 +189,6 @@ class GitStateMonitor:
                         if not os.path.isabs(target):
                             target = os.path.join(key, target)
                         resolved = os.path.normpath(target)
-                        # gitdir: 文件指向 worktrees/<name>；common dir 在其上层
                         cache[key] = resolved
                         return resolved
             except OSError:
@@ -228,7 +199,6 @@ class GitStateMonitor:
         return None
 
     def _hash_worktree_top(self, workspace: str, hasher) -> None:
-        """工作区顶层条目 stat（名称 + mtime + size），用于失效变更列表/文件树。"""
         try:
             entries = sorted(os.scandir(workspace), key=lambda e: e.name)
         except OSError:

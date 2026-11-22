@@ -127,8 +127,6 @@ def test_responses_stream_normalizes_text_reasoning_tools_and_usage():
 
 
 def test_responses_bridge_enum_typed_events_are_normalized():
-    """网关/桥接实现合成事件的 type 若是枚举成员而非字符串（str() 得到成员名），
-    必须按 .value 归一化，否则映射器全部失配。"""
     class ResponsesAPIStreamEvents(enum.Enum):
         RESPONSE_CREATED = "response.created"
         OUTPUT_TEXT_DELTA = "response.output_text.delta"
@@ -157,10 +155,6 @@ def test_responses_bridge_enum_typed_events_are_normalized():
 
 
 def test_responses_completed_output_function_call_is_emitted():
-    """Responses 桥接（DeepSeek 等 chat-only provider）是非流式合成：
-    整个流只有 1 个 response.completed，function_call 完整放在 response.output[] 里，
-    没有 output_item.added / arguments.delta 事件。completed 分支必须从 output[]
-    提取 function_call，否则工具调用被静默吞掉、回合以 finish_reason=stop 结束。"""
     function_call = SimpleNamespace(
         type="function_call",
         id="fc-1",
@@ -197,8 +191,6 @@ def test_responses_completed_output_function_call_is_emitted():
 
 
 def test_responses_completed_output_function_call_no_double_emit():
-    """原生 Responses 流式路径：function_call 已由 output_item.added +
-    arguments.delta 事件产出，completed.output[] 里的同一 call_id 不得重复产出。"""
     added = _event(
         "response.output_item.added",
         output_index=0,
@@ -237,14 +229,13 @@ def test_responses_completed_output_function_call_no_double_emit():
     tool_chunks = [
         c for c in chunks if c.choices and c.choices[0].delta.tool_calls
     ]
-    # added 1 次 + arguments.delta 1 次，completed 不再补发
     assert len(tool_chunks) == 2
     joined = "".join(
         c.choices[0].delta.tool_calls[0].function.arguments
         for c in tool_chunks
         if c.choices[0].delta.tool_calls[0].function.arguments
     )
-    assert joined == '{"path": "a.py"}{"path": "a.py"}'[: len(joined)] or True  # 结构断言见上
+    assert joined == '{"path": "a.py"}{"path": "a.py"}'[: len(joined)] or True
     assert chunks[-1].choices[0].finish_reason == "tool_calls"
 
 
@@ -347,11 +338,6 @@ def test_chat_event_gateway_uses_configured_responses_protocol(monkeypatch):
     assert captured[0]["input"][-1] == {"role": "user", "content": "ping"}
 
 
-# ---------------------------------------------------------------------------
-# Task 11a：原生 computer_call 流事件（终态合并，禁止半截 JSON 执行）
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("tool", [
     {"type": "computer"},
     {"type": "web_search"},
@@ -359,8 +345,6 @@ def test_chat_event_gateway_uses_configured_responses_protocol(monkeypatch):
     {"type": "computer", "environment": "browser"},
 ], ids=["computer", "web-search", "code-interpreter", "computer-with-fields"])
 def test_responses_tools_reject_builtin_tool_definitions(tool):
-    """_responses_tools_from_chat_tools 仍拒绝任意 built-in：只允许 capability
-    分支直接传入的精确 computer definition（Task 11a Step 3）。"""
     with pytest.raises(ValueError):
         llm._responses_tools_from_chat_tools([tool])
 
@@ -373,8 +357,6 @@ def _computer_call_chunks(chunks):
 
 
 def test_responses_stream_forwards_terminal_computer_call():
-    """output_item.done 的 computer_call 是终态完整载荷：转发给 assembler 合并，
-    finish_reason 为 tool_calls（回合必须继续，不能当最终文本结束）。"""
     events = [
         _event("response.created", response=SimpleNamespace(id="resp_1")),
         _event("response.output_item.done", item=SimpleNamespace(
@@ -399,8 +381,6 @@ def test_responses_stream_forwards_terminal_computer_call():
 
 
 def test_responses_stream_ignores_partial_computer_call_added_events():
-    """output_item.added 携带的是半截 computer_call：绝不产生 computer_call 载荷，
-    禁止基于半截 JSON 触发执行。"""
     events = [
         _event("response.created", response=SimpleNamespace(id="resp_1")),
         _event("response.output_item.added", output_index=0, item=SimpleNamespace(
@@ -418,8 +398,6 @@ def test_responses_stream_ignores_partial_computer_call_added_events():
 
 
 def test_responses_stream_completed_output_carries_computer_call():
-    """非流式桥接只在 response.completed 的 output[] 里给出 computer_call：
-    同样作为终态完整载荷转发，response id 取自 completed。"""
     events = [
         _event("response.output_text.delta", delta="先看图"),
         _event("response.completed", response=SimpleNamespace(
@@ -454,8 +432,6 @@ def test_responses_stream_rejects_conflicting_response_ids():
 
 
 def test_stream_assembler_merges_computer_call_chunks():
-    """StreamAssembler 合并 computer_call 流事件：终态 payload 在 finish 时暴露，
-    普通（默认关闭）回合保持 None，AssembledResponse 形状不变。"""
     from core.harness.stream_assembler import StreamAssembler
 
     payload = {
@@ -482,7 +458,6 @@ def test_stream_assembler_merges_computer_call_chunks():
 
     assembler = StreamAssembler()
     assembler.consume(_computer_chunk(payload))
-    # done 与 completed 重复携带同一 call：合并为一个（后者覆盖前者）
     assembler.consume(_computer_chunk(payload))
     assembled = assembler.finish()
     assert assembled.computer_call == payload

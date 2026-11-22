@@ -1,6 +1,5 @@
 <template>
   <div class="cfp">
-    <!-- 头部：展开区（左）与撤销操作区（右）是独立交互元素，不嵌套（规格 16.2） -->
     <div class="cfp-head-row">
       <button class="cfp-head" type="button" :aria-expanded="open" @click="toggleOpen">
         <AppIcon class="cfp-ico" name="file" :size="14" />
@@ -17,7 +16,6 @@
           :stroke-width="2"
         />
       </button>
-      <!-- 撤销按钮：只调用按回合预检；状态机驱动展示（规格 16.3） -->
       <button
         v-if="undoButton"
         class="cfp-undo-btn"
@@ -28,13 +26,12 @@
         :title="undoButton.title"
         @click="onUndoClick"
       >
-        <AppIcon v-if="undoButton.icon" :name="undoButton.icon" :size="13" />
-        {{ undoButton.label }}
+        <span>{{ undoButton.label }}</span>
+        <AppIcon v-if="undoButton.icon" :name="undoButton.icon" :size="12" :stroke-width="2" />
       </button>
     </div>
 
     <div v-show="open" class="cfp-body">
-      <!-- 冲突视图：结构化原因 + 预期/实际，不提供强制覆盖（规格 16.4） -->
       <template v-if="conflicts.length">
         <div class="cfp-conflict-note">本次没有修改任何文件。以下文件与回合结束时的状态不一致：</div>
         <div v-for="c in conflicts" :key="c.file_id" class="cfp-conflict">
@@ -47,7 +44,6 @@
         <button class="cfp-recheck" type="button" @click="onUndoClick">重新检查</button>
       </template>
 
-      <!-- 恢复选择视图（M2）：interrupted 状态点击按钮后先展示两个恢复方向 -->
       <template v-else-if="recoveryOptions">
         <div class="cfp-conflict-note">撤销事务中断：文件可能处于部分恢复状态，请选择恢复方向。</div>
         <div v-if="recoveryOptions.processed?.length" class="cfp-conflict-detail">
@@ -77,7 +73,6 @@
         </div>
       </template>
 
-      <!-- 权威文件列表：检查点 ready 之后，展示持久化 before→after 净摘要 -->
       <template v-else-if="authFiles">
         <div v-for="f in authFiles" :key="f.file_id" class="cfp-item">
           <div
@@ -104,7 +99,6 @@
               :stroke-width="2"
             />
           </div>
-          <!-- 展开：按 file_id 惰性请求权威 diff -->
           <div v-if="expandedFileId === f.file_id" class="cfp-diff">
             <template v-if="authDiffLoading">加载中…</template>
             <template v-else-if="authDiff">
@@ -134,7 +128,6 @@
         </div>
       </template>
 
-      <!-- 旧数据 / 运行中回合：实时 diff 聚合展示（既有行为） -->
       <template v-else>
         <div v-for="c in changes" :key="c.path" class="cfp-item">
           <div
@@ -207,18 +200,14 @@ import type {
 
 const props = defineProps<{
   changes: FileChangeEntry[];
-  /** 按回合撤销：权威检查点状态摘要（旧后端 / 无关联回合缺省为 null） */
   undoState?: TurnUndoStateSummary | null;
-  /** 权威回合身份；撤销预检/执行的定位键 */
   turnId?: string;
 }>();
 
 const store = useAppStore();
 const open = ref(false);
-// 当前展开查看 diff 的文件路径；同一时间只展开一个，再次点击收起
 const expandedPath = ref('');
 
-// --- 权威模式（检查点 ready 之后）的状态 ---
 const authFiles = ref<TurnUndoFileSummary[] | null>(null);
 const expandedFileId = ref('');
 const authDiff = ref<Awaited<ReturnType<typeof store.fetchTurnUndoFileDiff>>>(null);
@@ -244,7 +233,6 @@ function baseName(p: string): string {
   return i >= 0 ? norm.slice(i + 1) : norm;
 }
 
-/** 展开时进入权威模式：按 turn_id 拉取持久化文件清单（惰性，单次请求） */
 async function toggleOpen() {
   open.value = !open.value;
   if (open.value && props.turnId && props.undoState && !authFiles.value && !conflicts.value.length) {
@@ -253,7 +241,6 @@ async function toggleOpen() {
   }
 }
 
-/** 撤销按钮状态机（规格 16.3） */
 const undoButton = computed<null | {
   label: string; kind: string; disabled: boolean; icon?: string;
   aria: string; title?: string;
@@ -267,7 +254,7 @@ const undoButton = computed<null | {
     if (availability === 'expired') {
       return { label: '撤销记录已过期', kind: 'muted', disabled: true, aria: '撤销记录已过期' };
     }
-    return { label: '撤销 ↶', kind: 'primary', disabled: busy.value, icon: 'chevron-right', aria: '撤销本轮文件修改' };
+    return { label: '撤销', kind: 'primary', disabled: busy.value, icon: 'undo', aria: '撤销本轮文件修改' };
   }
   if (st.status === 'conflicted') {
     return { label: '撤销受阻 · 重新检查', kind: 'warn', disabled: busy.value, aria: '撤销受阻，重新检查', title: '查看冲突详情' };
@@ -329,7 +316,6 @@ function nodeBrief(n: { kind: string; exists: boolean; size: number | null; sha2
 
 async function onUndoClick() {
   if (!props.turnId || busy.value) return;
-  // M2：interrupted 状态点击按钮 → 打开恢复选项视图（而非走撤销预检死胡同）
   if (props.undoState?.status === 'interrupted') {
     conflicts.value = [];
     recoveryPreview.value = null;
@@ -358,13 +344,11 @@ async function onUndoClick() {
     const first = await store.previewTurnUndo(props.turnId);
     if (!first) return;
     if (first.preview.conflicts && first.preview.conflicts.length) {
-      // 冲突：不显示执行，展示结构化冲突；状态由后端置为 conflicted
       conflicts.value = first.preview.conflicts;
       open.value = true;
       return;
     }
     const preview = first.preview;
-    // 组装确认文案（规格 16.4）：影响数量、删除新建清单、历史保留与副作用边界
     const lines: string[] = [
       `共 ${preview.file_count} 个文件：恢复原内容 ${preview.restore_content_count} 个、`
         + `删除本轮新建 ${preview.delete_created_count} 个、恢复本轮删除 ${preview.restore_deleted_count} 个。`,
@@ -383,9 +367,8 @@ async function onUndoClick() {
       );
     }
     lines.push('建议撤销期间暂停其他工具对目标文件的写入。');
-    const ok = await store.askConfirm('撤销本轮修改', '按回合撤销文件修改', lines.join('\n'), '撤销本轮修改 ⏎');
+    const ok = await store.askConfirm('撤销本轮修改', '按回合撤销文件修改', lines.join('\n'), '撤销本轮修改');
     if (!ok) return;
-    // 重新预检拿新令牌（确认期间文件可能已变化，执行前会再次校验）
     const fresh = await store.previewTurnUndo(props.turnId);
     if (!fresh) return;
     if (fresh.preview.conflicts && fresh.preview.conflicts.length) {
@@ -422,7 +405,8 @@ async function startRecovery(action: 'continue_revert' | 'cancel_revert') {
       action === 'continue_revert'
         ? `将使用本轮开始前快照完成剩余撤销：${result.preview.remaining_files.join('、') || '无剩余文件'}`
         : '将把已处理路径恢复到点击撤销之前的状态',
-      action === 'continue_revert' ? '继续撤销 ⏎' : '取消撤销 ⏎',
+      action === 'continue_revert' ? '继续撤销' : '取消撤销',
+      { tone: action === 'continue_revert' ? 'primary' : 'warning' },
     );
     if (!ok) return;
     const done = await store.executeTurnUndoRecovery(
@@ -468,9 +452,6 @@ function describeBinary(d: { before_size: number | null; after_size: number | nu
 async function openFile(path: string) {
   const api = window.pywebview && window.pywebview.api;
   if (!api || !path) return;
-  // diff 的 file_path 是工具参数原始值（模型常给相对路径），后端 open_path 按
-  // GUI 进程 CWD 解析相对路径——多会话下进程 CWD 不随会话变，校验必然失败。
-  // 在前端按当前会话工作目录拼出绝对路径再交给后端
   let target = path;
   const isAbsolute = /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith('\\\\') || path.startsWith('/');
   if (!isAbsolute && store.workdir) {
@@ -489,14 +470,15 @@ async function openFile(path: string) {
 
 <style scoped>
 .cfp {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg2);
+  border: 1px solid var(--xy-border, var(--border));
+  border-radius: 12px;
+  background: var(--xy-surface, var(--bg2));
   overflow: hidden;
 }
 .cfp-head-row {
   display: flex;
-  align-items: stretch;
+  align-items: center;
+  padding-right: 10px;
 }
 .cfp-head {
   display: flex;
@@ -504,49 +486,50 @@ async function openFile(path: string) {
   gap: 8px;
   flex: 1;
   min-width: 0;
-  padding: 9px 12px;
+  padding: 10px 10px 10px 14px;
   background: none;
   border: none;
   cursor: pointer;
   font-family: inherit;
-  font-size: 13px;
-  color: var(--text-dim);
+  font-size: 12px;
+  color: var(--xy-text-2, var(--text-dim));
   text-align: left;
 }
 .cfp-head:hover {
-  background: var(--bg3);
+  background: var(--xy-hover, var(--bg3));
 }
 .cfp-head:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--xy-accent, var(--accent));
   outline-offset: -2px;
 }
-/* 撤销按钮：头部右侧独立操作区，与展开区互不嵌套、互不触发 */
 .cfp-undo-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
-  margin: 5px 8px;
-  padding: 3px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  background: var(--xy-card, var(--bg1));
   font-family: inherit;
   font-size: 12px;
-  color: var(--text);
+  font-weight: 500;
+  color: var(--xy-text-2, var(--text));
   cursor: pointer;
   white-space: nowrap;
+  transition: color 0.14s, border-color 0.14s;
 }
 .cfp-undo-btn.primary:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--xy-border-strong, var(--accent));
+  color: var(--xy-text, var(--accent));
 }
 .cfp-undo-btn.warn {
-  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
-  color: var(--red);
+  border-color: color-mix(in srgb, var(--xy-rose, var(--red)) 45%, var(--border));
+  color: var(--xy-rose, var(--red));
 }
 .cfp-undo-btn.muted {
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   cursor: default;
 }
 .cfp-undo-btn:disabled {
@@ -554,34 +537,36 @@ async function openFile(path: string) {
   cursor: default;
 }
 .cfp-undo-btn:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--xy-accent, var(--accent));
   outline-offset: 1px;
 }
 .cfp-ico {
   flex-shrink: 0;
-  color: var(--text-faint);
+  color: var(--xy-text-2, var(--text-faint));
 }
 .cfp-title {
-  font-weight: 600;
-  color: var(--text);
+  font-weight: 500;
+  color: var(--xy-text, var(--text));
 }
 .cfp-stats {
   margin-left: auto;
   display: flex;
-  gap: 8px;
+  gap: 6px;
+  font-family: var(--mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 .cfp-caret {
   flex-shrink: 0;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   transition: transform 0.15s ease;
 }
 .cfp-caret.is-open {
   transform: rotate(90deg);
 }
 .cfp-body {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg1));
   padding: 4px 0;
 }
 .cfp-row {
@@ -703,7 +688,6 @@ async function openFile(path: string) {
   gap: 8px;
 }
 
-/* 展开的 diff 视图 */
 .cfp-diff {
   margin: 0 8px 8px;
   border: 1px solid var(--border);

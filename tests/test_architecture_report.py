@@ -1,12 +1,3 @@
-"""T7 架构度量与模块地图（scripts/architecture_report.py）单元测试。
-
-覆盖点（对应《Codex与ZCode增量改进》T7）：
-- scan：新增文件 >800 行告警；存量超基线 +10% 告警；存量只登记不前移；--check 只读
-- deps：ast 解析相对/绝对导入并检出循环依赖；外部导入不误报、无环不误报
-- map：docstring 首行生成模块地图；输出字节确定；竖线转义
-- 真实仓库只读冒烟：scan --check / deps / map 不抛异常且不写仓库文件
-"""
-
 from __future__ import annotations
 
 import json
@@ -25,9 +16,6 @@ from scripts.architecture_report import (
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
-
-
-# --------------------------------------------------------------------- scan
 
 
 def test_scan_tree_counts_lines_and_skips_pycache(tmp_path):
@@ -65,7 +53,6 @@ def test_scan_cli_first_registration_idempotent_and_check_readonly(tmp_path, cap
     _write(root / "a.py", "x = 1\n" * 900)
     baseline_path = tmp_path / "baseline.json"
 
-    # 首次运行：全量登记，不产生告警
     assert main(["scan", "--root", str(root), "--baseline", str(baseline_path)]) == 0
     first_bytes = baseline_path.read_bytes()
     payload = json.loads(first_bytes.decode("utf-8"))
@@ -73,18 +60,13 @@ def test_scan_cli_first_registration_idempotent_and_check_readonly(tmp_path, cap
     assert payload["root"] == "core"
     assert b"\r\n" not in first_bytes
 
-    # 重复运行：存量不前移，字节稳定
     assert main(["scan", "--root", str(root), "--baseline", str(baseline_path)]) == 0
     assert baseline_path.read_bytes() == first_bytes
 
-    # 新增超限文件：--check 告警且不写入
     _write(root / "b.py", "y = 2\n" * 900)
     assert main(["scan", "--root", str(root), "--baseline", str(baseline_path), "--check"]) == 1
     assert baseline_path.read_bytes() == first_bytes
     assert "core/b.py" in capsys.readouterr().out
-
-
-# --------------------------------------------------------------------- deps
 
 
 def test_deps_detects_relative_and_absolute_import_cycle(tmp_path, capsys):
@@ -109,7 +91,6 @@ def test_deps_ignores_external_imports_and_reports_no_cycle(tmp_path):
     assert failures == []
     assert graph["pkg.a"] == {"pkg.b"}
     assert graph["pkg.b"] == set()
-    # `from pkg import a`：alias 命中子模块 pkg.a，不再回退到包本身
     assert graph["pkg.c"] == {"pkg.a"}
     assert find_cycles(graph) == []
 
@@ -117,9 +98,6 @@ def test_deps_ignores_external_imports_and_reports_no_cycle(tmp_path):
 def test_find_cycles_sorted_groups_and_self_loop_ignored():
     graph = {"a": {"b"}, "b": {"a"}, "c": {"d"}, "d": {"c"}, "solo": {"solo"}}
     assert find_cycles(graph) == [["a", "b"], ["c", "d"]]
-
-
-# ---------------------------------------------------------------------- map
 
 
 def test_module_map_generation_and_determinism(tmp_path):
@@ -134,10 +112,9 @@ def test_module_map_generation_and_determinism(tmp_path):
     assert "`pkg/alpha.py`" in text
     assert "Alpha 模块：处理甲。" in text
     assert "`pkg/beta.py`" in text
-    assert "更多细节" not in text  # 只取 docstring 首行
+    assert "更多细节" not in text
     assert "\r\n" not in text
 
-    # 相同输入 → 相同输出字节
     assert main(["map", "--root", str(root), "--output", str(out)]) == 0
     assert out.read_bytes() == text.encode("utf-8")
 
@@ -149,7 +126,7 @@ def test_module_map_skips_title_line_in_docstring(tmp_path):
     assert main(["map", "--root", str(root), "--output", str(out)]) == 0
     row = next(line for line in out.read_text(encoding="utf-8").splitlines() if "`pkg/titled.py`" in line)
     assert "标题下方的真正描述。" in row
-    assert row.count("titled.py") == 1  # 标题行未被当作摘要重复输出
+    assert row.count("titled.py") == 1
 
 
 def test_module_map_escapes_pipe_in_docstring(tmp_path):
@@ -160,11 +137,7 @@ def test_module_map_escapes_pipe_in_docstring(tmp_path):
     assert "A \\| B 简介。" in out.read_text(encoding="utf-8")
 
 
-# ----------------------------------------------------------- 真实仓库只读冒烟
-
-
 def test_real_repo_readonly_smoke(tmp_path, capsys):
-    """真实仓库只读冒烟：全部输出走 tmp_path/stdout，不写仓库文件。"""
     missing = tmp_path / "no_such_baseline.json"
     assert main(["scan", "--check", "--baseline", str(missing)]) == 0
     assert not missing.exists()

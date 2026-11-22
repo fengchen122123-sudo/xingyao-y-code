@@ -1,9 +1,6 @@
-"""T6：飞书指令集、收件箱、卡住提醒、模型切换、功能面板单测。不触网。"""
-
 import json
 import time
 
-import pytest
 
 from core.feishu.bridge import FeishuBindingStore, FeishuBridge
 from core.feishu.config import FeishuConfig
@@ -29,7 +26,6 @@ class _FakeStarBridge:
         self.sandbox_set = []
 
     def get_sessions(self):
-        """按工作目录分组（与后端一致）：自由对话一组，其余每个目录一组。"""
         global_group = {
             "folder_path": "GLOBAL", "folder_name": "对话", "is_global": True, "is_current": True,
             "sessions": [s for s in self.sessions if (s.get("workdir") or "GLOBAL") == "GLOBAL"],
@@ -75,8 +71,7 @@ class _FakeStarBridge:
 
     def set_permission_mode(self, mode, session_name=""):
         self.mode_set.append({"mode": mode, "session": session_name})
-        if mode not in ("confirm", "accept_edits", "plan", "full"):
-            # 星瑶会显式拒绝未知档位，不静默兜底
+        if mode not in ("confirm", "accept_edits", "auto_decision", "plan", "full"):
             return {"ok": False, "msg": f"未知权限模式: {mode}"}
         self.permission_mode = mode
         return {"ok": True, "permission_mode": mode, "bound": True}
@@ -107,7 +102,6 @@ class _FakeApi:
         return {"code": 0, "data": {"message_id": f"om_t{len(self.texts)}"}}
 
 
-# 白名单按 open_id 校验；默认值与 _message 的发件人一致，避免"自己都不在白名单里"
 def _setup(tmp_path, approvers=("ou_abcdefgh",), bound_session="session_a", state="connected"):
     star = _FakeStarBridge()
     api = _FakeApi()
@@ -144,7 +138,6 @@ def _cmd_action(cmd, arg="", open_id="ou_allowed"):
 
 
 def _card_markdown(card):
-    """卡片里的 markdown 正文（避开 JSON 转义，路径断言用这个）。"""
     return "\n".join(str(e.get("content") or "") for e in card["body"]["elements"]
                      if e.get("tag") == "markdown")
 
@@ -152,8 +145,6 @@ def _card_markdown(card):
 def _card_text(card):
     return json.dumps(card, ensure_ascii=False)
 
-
-# ---------------------------------------------------------------- 指令
 
 def test_help_returns_instruction_card(tmp_path):
     br, _, api = _setup(tmp_path)
@@ -208,11 +199,6 @@ def test_new_creates_and_binds_session(tmp_path):
 
 
 def test_new_defaults_to_global_workdir_never_none(tmp_path):
-    """回归：新建会话必须显式传 GLOBAL。
-
-    后端 `create_session(workdir=None)` 的默认是**进程当前目录**（os.getcwd()），
-    传 None 会把飞书新会话悄悄绑到星瑶进程所在目录（真机表现为"工作目录莫名其妙"）。
-    """
     br, star, api = _setup(tmp_path)
 
     br.on_feishu_event(_message("/new"))
@@ -221,7 +207,7 @@ def test_new_defaults_to_global_workdir_never_none(tmp_path):
     assert star.created[0]["workdir"] is not None
     body = _card_text(api.cards[0]["card"])
     assert "自由对话" in body
-    assert "改为绑定项目目录" in body          # 回执卡给出绑定目录的入口
+    assert "改为绑定项目目录" in body
 
 
 def test_newdir_picker_lists_project_dirs(tmp_path):
@@ -237,7 +223,7 @@ def test_newdir_picker_lists_project_dirs(tmp_path):
     values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
               for c in e["columns"] for b in c["elements"]]
     assert {"kind": "cmd", "cmd": "/newdir", "arg": r"D:\proj\demo"} in values
-    assert {"kind": "cmd", "cmd": "/new"} in values      # 也给自由对话入口
+    assert {"kind": "cmd", "cmd": "/new"} in values
 
 
 def test_newdir_binds_session_to_directory(tmp_path):
@@ -252,15 +238,14 @@ def test_newdir_binds_session_to_directory(tmp_path):
 
 
 def test_list_shows_workdir_and_global_marker(tmp_path):
-    """列表每项显示工作目录（与桌面侧栏一致）：GLOBAL 显示"自由对话"，项目会话显示目录。"""
     br, star, api = _setup(tmp_path)
     star.sessions.append({"name": "session_g", "display_name": "自由聊", "workdir": "GLOBAL"})
 
     br.on_feishu_event(_message("/list"))
 
     body = _card_text(api.cards[0]["card"])
-    assert "自由对话" in body                        # GLOBAL 会话显示"自由对话"
-    assert "D:/proj" in body or "D:\\proj" in body   # 项目会话显示其目录
+    assert "自由对话" in body
+    assert "D:/proj" in body or "D:\\proj" in body
 
 
 def test_list_card_marks_current_and_offers_switch(tmp_path):
@@ -285,7 +270,7 @@ def test_list_pagination_is_stateless(tmp_path):
 
     body = _card_text(api.cards[0]["card"])
     assert "第 1/2 页" in body
-    assert "批量 9" not in body                      # 第 2 页才出现
+    assert "批量 9" not in body
 
 
 def test_switch_binds_by_index(tmp_path):
@@ -305,7 +290,7 @@ def test_switch_rejects_bad_index(tmp_path):
 
     assert "用法：/switch" in api.texts[0]["text"]
     assert "序号超出范围" in api.texts[1]["text"]
-    assert br._store.session_of("oc_1") == "session_a"   # 绑定不变
+    assert br._store.session_of("oc_1") == "session_a"
 
 
 def test_model_list_and_switch_by_index_and_id(tmp_path):
@@ -369,14 +354,13 @@ def test_unknown_command_reports(tmp_path):
 
 
 def test_whoami_returns_open_id_for_whitelist(tmp_path):
-    """白名单自助配置：发 /whoami 拿到「本应用视角」的 open_id。"""
     br, _, api = _setup(tmp_path, approvers=())
 
     br.on_feishu_event(_message("/whoami", open_id="ou_self1234"))
 
     text = api.texts[0]["text"]
     assert "ou_self1234" in text
-    assert "oc_1" in text                     # 同时给出 chat_id，便于填固定推送落点
+    assert "oc_1" in text
     assert "不在名单内" in text
     assert api.cards == []
 
@@ -398,7 +382,6 @@ def test_help_mentions_whoami(tmp_path):
 
 
 def test_plain_text_still_goes_to_model(tmp_path):
-    """回归：非指令消息不受指令集影响，仍直接发给绑定会话。"""
     br, star, _ = _setup(tmp_path)
 
     br.on_feishu_event(_message("帮我看下 README"))
@@ -406,10 +389,7 @@ def test_plain_text_still_goes_to_model(tmp_path):
     assert star.sent == [{"text": "帮我看下 README", "session_name": "session_a", "turn_source": "feishu"}]
 
 
-# ---------------------------------------------------------------- 执行权限档位
-
 def _patch_sandbox(monkeypatch, enabled: bool):
-    """沙盒状态来自全局配置（core.model_manager.load_config）。"""
     import core.model_manager as mm
 
     monkeypatch.setattr(mm, "load_config", lambda: {"allow_outside_workspace": enabled})
@@ -424,12 +404,26 @@ def test_mode_card_shows_current_and_offers_switching(tmp_path):
     assert card["header"]["title"]["content"] == "🔐 执行权限"
     body = _card_text(card)
     assert "变更前确认" in body and "← 当前" in body
-    # 当前档位不给切换按钮，其余三个都给
     values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
               for c in e["columns"] for b in c["elements"]]
     args = {v.get("arg") for v in values}
     assert args == {"accept_edits", "plan", "full"}
     assert all(v["cmd"] == "/mode" for v in values)
+
+
+def test_mode_card_includes_auto_decision_when_jev_enabled(tmp_path, monkeypatch):
+    from core import decision_service
+
+    monkeypatch.setattr(decision_service, "load_decision_config", lambda: {"enabled": True})
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/mode"))
+
+    card = api.cards[0]["card"]
+    values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
+              for c in e["columns"] for b in c["elements"]]
+    args = {v.get("arg") for v in values}
+    assert args == {"accept_edits", "auto_decision", "plan", "full"}
 
 
 def test_mode_switch_binds_to_bound_session(tmp_path):
@@ -444,7 +438,6 @@ def test_mode_switch_binds_to_bound_session(tmp_path):
 
 
 def test_mode_card_hides_buttons_without_approvers(tmp_path):
-    """fail-closed：未配置白名单时只读展示，不给切换入口。"""
     br, star, api = _setup(tmp_path, approvers=())
 
     br.on_feishu_event(_message("/mode"))
@@ -459,12 +452,11 @@ def test_mode_switch_refused_without_whitelist(tmp_path):
 
     br.on_feishu_event(_message("/mode full"))
 
-    assert star.mode_set == []                       # 不回调后端
+    assert star.mode_set == []
     assert "无权操作" in api.cards[0]["card"]["header"]["title"]["content"]
 
 
 def test_mode_switch_surfaces_unknown_mode_error(tmp_path):
-    """星瑶会显式拒绝未知档位（不静默兜底成 confirm），错误必须原样回显。"""
     br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
 
     br.on_feishu_event(_message("/mode 乱写的档位"))
@@ -482,8 +474,6 @@ def test_mode_switch_without_bound_session_reports(tmp_path):
     assert "未绑定会话" in api.cards[0]["card"]["header"]["title"]["content"]
 
 
-# ---------------------------------------------------------------- 沙盒开关
-
 def test_sandbox_card_shows_state_and_warns(tmp_path, monkeypatch):
     _patch_sandbox(monkeypatch, False)
     br, _, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
@@ -494,7 +484,7 @@ def test_sandbox_card_shows_state_and_warns(tmp_path, monkeypatch):
     assert card["header"]["title"]["content"] == "🧰 沙盒开关"
     body = _card_text(card)
     assert "已关闭" in body
-    assert "全局" in body                             # 必须写明是全局放宽项
+    assert "全局" in body
     values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
               for c in e["columns"] for b in c["elements"]]
     assert values == [{"kind": "cmd", "cmd": "/sandbox", "arg": "on"}]
@@ -508,7 +498,7 @@ def test_sandbox_card_reflects_enabled_state(tmp_path, monkeypatch):
 
     body = _card_text(api.cards[0]["card"])
     assert "已开启" in body
-    assert "off" in body                              # 给出关闭按钮
+    assert "off" in body
 
 
 def test_sandbox_turn_on_calls_backend(tmp_path, monkeypatch):
@@ -537,7 +527,7 @@ def test_sandbox_refused_without_whitelist(tmp_path, monkeypatch):
 
     br.on_feishu_event(_message("/sandbox on"))
 
-    assert star.sandbox_set == []                     # 全局放宽项：非白名单一律不动
+    assert star.sandbox_set == []
     assert "无权操作" in api.cards[0]["card"]["header"]["title"]["content"]
 
 
@@ -564,8 +554,6 @@ def test_panel_has_mode_and_sandbox_buttons(tmp_path):
     assert {"/mode", "/sandbox"} <= cmds
 
 
-# ---------------------------------------------------------------- 面板按钮 → 指令
-
 def test_panel_button_runs_command(tmp_path):
     br, _, api = _setup(tmp_path)
 
@@ -573,8 +561,6 @@ def test_panel_button_runs_command(tmp_path):
 
     assert api.cards[0]["card"]["header"]["title"]["content"] == "📈 星瑶 状态"
 
-
-# ---------------------------------------------------------------- 收件箱
 
 def _permission(request_id="req-1", function_name="run_command", summary="执行命令：ls", options=None):
     return {
@@ -630,14 +616,11 @@ def test_permission_dismiss_clears_inbox(tmp_path):
     assert "没有等你拍板的事" in _card_text(api.cards[-1]["card"])
 
 
-# ---------------------------------------------------------------- 卡住提醒
-
 def test_stall_watchdog_pushes_once_with_cooldown(tmp_path):
     br, _, api = _setup(tmp_path)
     br.on_feishu_event(_message("跑个长任务"))
     session = "session_a"
 
-    # 人为把活跃时间推回 20 分钟前
     with br._lock:
         br._pending[session]["last_activity"] = time.time() - 20 * 60
 
@@ -645,7 +628,7 @@ def test_stall_watchdog_pushes_once_with_cooldown(tmp_path):
     assert "🐢 星瑶疑似卡住" in api.cards[-1]["card"]["header"]["title"]["content"]
     assert "已 20 分钟无任何输出" in _card_text(api.cards[-1]["card"])
 
-    br._check_stalls()                                # 冷却期内不再提醒
+    br._check_stalls()
     assert sum(1 for c in api.cards if "🐢" in c["card"]["header"]["title"]["content"]) == 1
 
 

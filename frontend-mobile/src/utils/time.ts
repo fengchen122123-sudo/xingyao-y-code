@@ -1,4 +1,3 @@
-/** 时间显示工具 */
 
 export function relTime(ts: string): string {
   const d = Date.now() - new Date(ts).getTime();

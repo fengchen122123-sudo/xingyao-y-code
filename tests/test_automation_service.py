@@ -1,9 +1,3 @@
-"""星轨自动化任务：core 层服务句柄（AutomationService）测试。
-
-覆盖设计规格「服务句柄」：GUI 启动时注入回调，Agent 工具经 get() 访问；
-CLI/headless 未注册时 get() 返回 None。用 fake 回调记录调用，不依赖真实数据库。
-"""
-
 import pytest
 
 from core.automation import service
@@ -11,14 +5,12 @@ from core.automation import service
 
 @pytest.fixture(autouse=True)
 def _reset_singleton():
-    """每个用例前后重置模块级单例，避免用例互相污染。"""
     service.unregister()
     yield
     service.unregister()
 
 
 class _Recorder:
-    """记录 7 个回调调用的 fake，返回值可自定义以便断言原样转发。"""
 
     def __init__(self):
         self.calls = []
@@ -48,10 +40,6 @@ def _service(recorder: _Recorder) -> service.AutomationService:
     return service.AutomationService(**recorder.callbacks())
 
 
-# ---------------------------------------------------------------------------
-# get / register / unregister
-# ---------------------------------------------------------------------------
-
 def test_get_returns_none_when_unregistered():
     assert service.get() is None
 
@@ -77,14 +65,9 @@ def test_unregister_clears_and_is_idempotent():
     assert service.get() is svc
     assert service.unregister() is None
     assert service.get() is None
-    # 重复 unregister 不抛异常
     assert service.unregister() is None
     assert service.get() is None
 
-
-# ---------------------------------------------------------------------------
-# 7 个方法原样转发
-# ---------------------------------------------------------------------------
 
 def test_list_tasks_forwards():
     recorder = _Recorder()

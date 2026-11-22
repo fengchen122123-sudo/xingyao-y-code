@@ -54,7 +54,6 @@ describe('ChangedFilesPanel 按回合撤销', () => {
     const undoBtn = wrapper.get('.cfp-undo-btn');
     expect(undoBtn.text()).toContain('撤销');
     expect(undoBtn.attributes('aria-label')).toBe('撤销本轮文件修改');
-    // 展开区按钮与撤销按钮是兄弟节点，不互相嵌套
     expect(undoBtn.element.parentElement).toBe(wrapper.get('.cfp-head-row').element);
     expect(undoBtn.attributes('disabled')).toBeUndefined();
   });
@@ -128,7 +127,6 @@ describe('ChangedFilesPanel 中断恢复流程（M2）', () => {
     await vi.waitFor(() => {
       expect(wrapper.find('.cfp-recovery-actions').exists()).toBe(true);
     });
-    // 两个恢复方向按钮存在
     const buttons = wrapper.findAll('.cfp-recovery-actions button');
     expect(buttons.length).toBe(2);
     expect(buttons[0].text()).toContain('继续撤销');

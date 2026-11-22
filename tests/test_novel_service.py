@@ -1,10 +1,3 @@
-"""core.novel_service 小说工作区初始化测试（pytest + tmp_path）。
-
-覆盖设计文档 §11 P1 验收的第一条：
-novel_init 在空目录生成完整目录树，7 个 Agent 文件可被
-core.subagent_registry.parse_agent_md 解析且 name / allowed_tools 符合 §6.1 表格。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -20,7 +13,6 @@ import pytest
 from core import novel_service
 from core.subagent_registry import parse_agent_md
 
-# 设计文档 §6.1「七个 Agent 的最终配置」：name -> (base_type, model, allowed_tools)
 EXPECTED_AGENTS = {
     "story-architect": (
         "general",
@@ -59,10 +51,8 @@ EXPECTED_AGENTS = {
     ),
 }
 
-# 设计文档 §4.1 项目目录
 EXPECTED_DIRS = ("设定", "设定/角色", "大纲", "正文", "追踪", "追踪/逐章记录", "对标")
 
-# 星瑶 frontmatter 允许的字段（严格单行，其余一律丢弃）
 ALLOWED_FRONTMATTER_KEYS = {
     "name", "description", "when_to_use", "base_type", "model", "allowed_tools",
 }
@@ -70,7 +60,6 @@ ALLOWED_FRONTMATTER_KEYS = {
 
 @pytest.fixture(autouse=True)
 def _require_upstream_story_setup():
-    """上游技能包缺失时跳过：属于环境缺依赖，不是用例失败。"""
     agents_dir = novel_service.upstream_agents_dir()
     references_dir = novel_service.upstream_references_dir()
     missing = [str(p) for p in (agents_dir, references_dir) if not p.is_dir()]
@@ -89,7 +78,6 @@ def _require_upstream_story_setup():
 
 
 def _read_frontmatter_keys(path: Path) -> list[str]:
-    """读原始文件，返回 frontmatter 的 key 列表（用于校验字段收紧）。"""
     text = path.read_text(encoding="utf-8")
     assert text.startswith("---\n"), f"{path} 缺少 frontmatter"
     header = text.split("---\n", 2)[1]
@@ -104,7 +92,6 @@ def _read_frontmatter_keys(path: Path) -> list[str]:
 
 
 def test_init_creates_tree_and_marker(tmp_path):
-    """空目录初始化：目录齐全，.novel.json 可 json.load 且字段符合 §4.2。"""
     result = novel_service.init_novel_project(
         str(tmp_path),
         "长夜行",
@@ -128,13 +115,11 @@ def test_init_creates_tree_and_marker(tmp_path):
     assert data["target_words"] == 1000000
     assert data["engine"] == "story-ycode"
     assert data["engine_version"] == "1.0.0"
-    # ISO8601 UTC：可直接按固定格式解析
     assert isinstance(data["created_at"], str)
     datetime.strptime(data["created_at"], "%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_agents_parse_and_match_design_table(tmp_path):
-    """7 个 Agent 可被星瑶解析器解析，name / base_type / model / allowed_tools 对齐设计表。"""
     novel_service.init_novel_project(str(tmp_path), "长夜行")
     agents_dir = tmp_path / ".ycode" / "agents"
 
@@ -150,14 +135,11 @@ def test_agents_parse_and_match_design_table(tmp_path):
         assert config["model"] == model
         assert config["allowed_tools"] == tools
 
-        # description 单行且不超过 200 字
         assert "\n" not in config["description"]
         assert 0 < len(config["description"]) <= 200
-        # frontmatter 只保留约定的 6 个字段，且全部单行
         keys = _read_frontmatter_keys(path)
         assert set(keys) == ALLOWED_FRONTMATTER_KEYS
 
-        # 上游写死的 .claude 路径必须改写成项目内 .ycode 路径 + 二级兜底
         body = config["system_prompt"]
         assert ".claude/skills/story-setup" not in body
         assert ".ycode/skills/story-ycode/references/agent-references/" in body
@@ -165,7 +147,6 @@ def test_agents_parse_and_match_design_table(tmp_path):
 
 
 def test_agent_references_copied(tmp_path):
-    """上游 agent-references 全部 .md（含子目录）复制到项目内资料目录。"""
     novel_service.init_novel_project(str(tmp_path), "长夜行")
     target = (
         tmp_path / ".ycode" / "skills" / "story-ycode" / "references" / "agent-references"
@@ -180,7 +161,6 @@ def test_agent_references_copied(tmp_path):
 
 
 def test_init_is_idempotent(tmp_path):
-    """重复初始化：created 为空、项目标记与 Agent 文件不被覆盖。"""
     first = novel_service.init_novel_project(str(tmp_path), "长夜行", genre="玄幻")
     assert first["created"]
 
@@ -201,12 +181,6 @@ def test_init_is_idempotent(tmp_path):
 
 
 def test_init_without_upstream_uses_bundled_resources(tmp_path, monkeypatch):
-    """自包含契约：上游包不可用也能完成部署，Agent 与资料库取自插件自带资源。
-
-    upstream_agents_dir() / upstream_references_dir() 优先用
-    plugins/novel_workspace 下的自带副本，只有自带缺失才回退上游技能包，
-    因此 STORY_SETUP_ENV 指向不存在的目录不应影响部署结果。
-    """
     monkeypatch.setenv(novel_service.STORY_SETUP_ENV, str(tmp_path / "no-such-upstream"))
     root = tmp_path / "book"
 
@@ -226,12 +200,10 @@ def test_init_without_upstream_uses_bundled_resources(tmp_path, monkeypatch):
         root / ".ycode" / "skills" / "story-ycode" / "references" / "agent-references"
     )
     assert (references / "agent-reference-profiles.md").is_file()
-    # 自带资源可用时不应出现"上游…缺失"的降级条目
     assert not any("上游" in item for item in result["skipped"])
 
 
 def test_init_without_bundled_and_upstream_degrades_gracefully(tmp_path, monkeypatch):
-    """真降级：自带资源与上游包都缺失时仍建目录与标记，Agent/资料部署进 skipped。"""
     monkeypatch.setattr(novel_service, "bundled_novel_root", lambda: tmp_path / "no-bundled")
     monkeypatch.setenv(novel_service.STORY_SETUP_ENV, str(tmp_path / "no-such-upstream"))
     root = tmp_path / "book"
@@ -245,7 +217,6 @@ def test_init_without_bundled_and_upstream_degrades_gracefully(tmp_path, monkeyp
 
 
 def _load_plugin_module():
-    """按 plugin_loader 的方式从文件加载插件入口模块。"""
     plugin_path = (
         Path(__file__).resolve().parent.parent
         / "plugins" / "novel_workspace" / "plugin.py"
@@ -265,7 +236,6 @@ class _FakeRegistry:
 
 
 def test_plugin_registers_novel_init(tmp_path):
-    """插件薄壳注册 novel_init：元数据为写操作 + 需授权，执行转发核心实现。"""
     plugin = _load_plugin_module()
     registry = _FakeRegistry()
     plugin.register(registry)
@@ -283,12 +253,7 @@ def test_plugin_registers_novel_init(tmp_path):
     assert (tmp_path / "book" / novel_service.NOVEL_MARKER).is_file()
 
 
-# ---------------------------------------------------------------------------
-# 第二块：vendor 脚本接入（novel_outline / novel_track）
-# ---------------------------------------------------------------------------
-
 def _make_novel_project(root: Path) -> Path:
-    """造一个最小小说项目：.novel.json + 大纲/正文/追踪 目录（不依赖上游技能包）。"""
     root.mkdir(parents=True, exist_ok=True)
     (root / novel_service.NOVEL_MARKER).write_text(
         json.dumps(
@@ -314,7 +279,6 @@ def _make_novel_project(root: Path) -> Path:
 
 
 def _write_outline(root: Path, name: str = "卷纲_第001卷.md") -> Path:
-    """写一份带作用域声明的卷纲样例（outline_view.py 的段头约定）。"""
     path = root / "大纲" / name
     path.write_text(
         "\n".join(
@@ -339,7 +303,6 @@ def _write_outline(root: Path, name: str = "卷纲_第001卷.md") -> Path:
 
 
 def _context_block() -> dict:
-    """tracking_commit.py 要求的 context.position 等必填字段。"""
     return {
         "position": {
             "volume": "第001卷",
@@ -354,7 +317,6 @@ def _context_block() -> dict:
 
 
 def _init_document() -> dict:
-    """tracking_commit.py init 子命令的最小合法输入文档。"""
     context = _context_block()
     context["recent_chapters"] = []
     context["next_chapter_commitments"] = []
@@ -370,7 +332,6 @@ def _init_document() -> dict:
 
 
 def _append_document(chapter: int = 1, expected_revision: int = 0) -> dict:
-    """tracking_commit.py commit 子命令的最小合法 append 事务文档。"""
     return {
         "schema_version": 1,
         "mode": "append",
@@ -393,7 +354,6 @@ def _append_document(chapter: int = 1, expected_revision: int = 0) -> dict:
 
 
 def test_track_init_creates_state_file(tmp_path):
-    """novel_track(init) 建立追踪状态文件与派生视图，返回脚本 JSON。"""
     root = _make_novel_project(tmp_path / "book")
 
     result = novel_service.novel_track(str(root), "init", _init_document())
@@ -406,12 +366,10 @@ def test_track_init_creates_state_file(tmp_path):
     state = json.loads(state_file.read_text(encoding="utf-8"))
     assert state["last_committed_chapter"] == 0
     assert (root / "追踪" / "上下文.md").is_file()
-    # 事务临时文件不留在项目里
     assert not list(root.glob("novel-track-*.json"))
 
 
 def test_track_duplicate_append_is_rejected(tmp_path):
-    """同章重复 append 返回错误，且不覆盖已提交的逐章记录。"""
     root = _make_novel_project(tmp_path / "book")
     assert novel_service.novel_track(str(root), "init", _init_document())["ok"] is True
 
@@ -422,7 +380,6 @@ def test_track_duplicate_append_is_rejected(tmp_path):
     assert delta_file.is_file()
     delta_before = delta_file.read_bytes()
 
-    # 修订号已前进到 1，再交一次第 1 章的 append：脚本按章号守卫拒绝
     second = novel_service.novel_track(str(root), "append", _append_document(1, 1))
     assert second["ok"] is False
     assert "append chapter must be 2" in (second["error"] + second["stderr"])
@@ -432,7 +389,6 @@ def test_track_duplicate_append_is_rejected(tmp_path):
 
 
 def test_track_rejects_invalid_mode(tmp_path):
-    """mode 只接受 init / append / revision，非法值在调脚本前直接报错。"""
     root = _make_novel_project(tmp_path / "book")
 
     result = novel_service.novel_track(str(root), "commit", {"schema_version": 1})
@@ -443,7 +399,6 @@ def test_track_rejects_invalid_mode(tmp_path):
 
 
 def test_outline_returns_unit_section(tmp_path):
-    """novel_outline 取到指定单元的卷纲段文本（含卷级常任）。"""
     root = _make_novel_project(tmp_path / "book")
     _write_outline(root)
 
@@ -456,7 +411,6 @@ def test_outline_returns_unit_section(tmp_path):
 
 
 def test_outline_unknown_unit_returns_error(tmp_path):
-    """单元不存在时返回 ok=False，并带回脚本 stderr（不静默降级）。"""
     root = _make_novel_project(tmp_path / "book")
     _write_outline(root)
 
@@ -467,7 +421,6 @@ def test_outline_unknown_unit_returns_error(tmp_path):
 
 
 def test_outline_and_track_require_novel_marker(tmp_path):
-    """无 .novel.json 时两个工具都返回 is_novel=False，不抛异常。"""
     plain = tmp_path / "plain"
     plain.mkdir()
 
@@ -480,7 +433,6 @@ def test_outline_and_track_require_novel_marker(tmp_path):
 
 
 def test_vendor_scripts_for_outline_and_track_match_lock():
-    """三个脚本存在，VERSION.lock 可解析，sha256 与实际文件逐一致。"""
     vendor = novel_service.vendor_dir()
     lock_path = vendor / novel_service.VERSION_LOCK_NAME
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -502,7 +454,6 @@ def test_vendor_scripts_for_outline_and_track_match_lock():
 
 
 def test_missing_vendor_script_outline_and_track_return_error(tmp_path, monkeypatch):
-    """vendor 目录被移走/脚本缺失时返回结构化错误，不抛异常。"""
     root = _make_novel_project(tmp_path / "book")
     _write_outline(root)
     monkeypatch.setenv(novel_service.VENDOR_ENV, str(tmp_path / "no-vendor"))
@@ -520,7 +471,6 @@ def test_missing_vendor_script_outline_and_track_return_error(tmp_path, monkeypa
 
 
 def test_plugin_registers_outline_and_track_tools(tmp_path):
-    """插件注册 novel_outline（只读）与 novel_track（写操作 + 需授权）。"""
     plugin = _load_plugin_module()
     registry = _FakeRegistry()
     plugin.register(registry)
@@ -542,18 +492,12 @@ def test_plugin_registers_outline_and_track_tools(tmp_path):
     assert track_spec.input_schema["required"] == ["workdir", "mode", "transaction"]
     assert track_spec.input_schema["properties"]["mode"]["enum"] == ["init", "append", "revision"]
 
-    # 工具执行体转发核心实现：非小说目录返回 is_novel=False，且标记为错误结果
     result = outline_spec.execute(workdir=str(tmp_path / "plain"))
     assert result.is_error is True
     assert json.loads(result.content)["is_novel"] is False
 
 
-# ---------------------------------------------------------------------------
-# 第三块：只读工具（novel_status / novel_wordcount）
-# ---------------------------------------------------------------------------
-
 def _vendor_wordcount():
-    """按文件路径加载 vendored wordcount_core，作为独立口径参照。"""
     path = novel_service.vendor_script("wordcount_core.py")
     assert path is not None, "vendored wordcount_core.py 缺失"
     spec = importlib.util.spec_from_file_location("test_wordcount_core", path)
@@ -563,14 +507,12 @@ def _vendor_wordcount():
 
 
 def _write_chapter(root: Path, chapter: int, name: str, text: str) -> Path:
-    """按 第NNN章_章名.md 契约写一章正文。"""
     path = root / "正文" / f"第{chapter:03d}章_{name}.md"
     path.write_text(text, encoding="utf-8")
     return path
 
 
 def test_status_counts_chapters_and_total_words(tmp_path):
-    """3 章样例：章节数与可见字数与 wordcount_core 直接调用一致，顺带校验追踪字段。"""
     root = _make_novel_project(tmp_path / "book")
     texts = {
         1: "# 第001章 夜行\n\n风起。\n",
@@ -580,7 +522,6 @@ def test_status_counts_chapters_and_total_words(tmp_path):
     for number, text in texts.items():
         _write_chapter(root, number, f"测试章{number}", text)
 
-    # 追踪状态：已提交 3 章；两条伏笔一活跃一回收
     (root / "追踪" / novel_service.TRACKING_STATE_NAME).write_text(
         json.dumps(
             {
@@ -613,7 +554,6 @@ def test_status_counts_chapters_and_total_words(tmp_path):
 
 
 def test_status_today_words_uses_mtime(tmp_path):
-    """今日字数只统计 mtime 落在本地当天的章节。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 1, "今日", "今日码字三千")
     old_path = _write_chapter(root, 2, "旧章", "旧章内容不同")
@@ -631,7 +571,6 @@ def test_status_today_words_uses_mtime(tmp_path):
 
 
 def test_status_non_novel_returns_flag_only(tmp_path):
-    """非小说项目只返回 {"is_novel": False}，不带任何多余字段。"""
     plain = tmp_path / "plain"
     plain.mkdir()
 
@@ -639,7 +578,6 @@ def test_status_non_novel_returns_flag_only(tmp_path):
 
 
 def test_wordcount_text_and_file_agree(tmp_path):
-    """同一段文本，直接传 text 与传 workdir+chapter 读文件结果一致。"""
     root = _make_novel_project(tmp_path / "book")
     text = "---\n字数目标: 1000\n---\n# 第002章 夜行\n可见字数统计ABC 123。\n"
     _write_chapter(root, 2, "夜行", text)
@@ -654,12 +592,10 @@ def test_wordcount_text_and_file_agree(tmp_path):
     assert by_file["chapter"] == 2
     assert by_text["visible_chars"] == by_file["visible_chars"]
     assert by_text["visible_chars"] == wordcount.count_visible_chars(text)
-    # 两个入参都缺：参数错误而不是抛异常
     assert novel_service.novel_wordcount()["ok"] is False
 
 
 def test_status_empty_project_defaults(tmp_path):
-    """空项目：next_chapter=1、last_commit=0、active_foreshadows=0，字段严格对齐契约。"""
     root = _make_novel_project(tmp_path / "book")
 
     status = novel_service.novel_status(str(root))
@@ -681,12 +617,7 @@ def test_status_empty_project_defaults(tmp_path):
     assert status["outline_ready"] is False
 
 
-# ---------------------------------------------------------------------------
-# 第四块：确定性审计（novel_audit）
-# ---------------------------------------------------------------------------
-
 def _write_tracking_state(root: Path, payload: dict) -> Path:
-    """直接写 追踪/_tracking-state.json（审计只读状态，不依赖脚本校验）。"""
     path = root / "追踪" / novel_service.TRACKING_STATE_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -694,7 +625,6 @@ def _write_tracking_state(root: Path, payload: dict) -> Path:
 
 
 def test_audit_tracking_state_mismatch_returns_s1(tmp_path):
-    """追踪最近提交章（1）落后于正文最大章号（2）→ tracking_state 记 S1。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 1, "夜行", "# 第001章 夜行\n\n风起。\n")
     _write_chapter(root, 2, "入城", "# 第002章 入城\n\n雨落。\n")
@@ -711,16 +641,11 @@ def test_audit_tracking_state_mismatch_returns_s1(tmp_path):
     assert tracked[0]["file"] == "追踪/_tracking-state.json"
     assert "第1章" in tracked[0]["message"] and "第2章" in tracked[0]["message"]
     assert result["summary"]["S1"] == 1
-    # 状态对齐后不再报 S1
     _write_tracking_state(root, {"last_committed_chapter": 2})
     assert novel_service.novel_audit(str(root), scope="all")["summary"]["S1"] == 0
 
 
 def test_audit_foreshadow_overdue_returns_s2(tmp_path):
-    """计划第4章回收、最近提交到第25章（25 > 4 + 20）→ 该伏笔记 S2。
-
-    口径以计划回收章为基准；无计划章的长线伏笔（F004）不报。
-    """
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 25, "远行", "# 第025章 远行\n\n雪停了。\n")
     _write_tracking_state(root, {
@@ -735,7 +660,6 @@ def test_audit_foreshadow_overdue_returns_s2(tmp_path):
                 "importance": "高",
                 "updated_chapter": 3,
             },
-            # 计划第5章回收：25 <= 5 + 20，在宽限内，不应报
             "F002": {
                 "id": "F002",
                 "summary": "旧信",
@@ -745,7 +669,6 @@ def test_audit_foreshadow_overdue_returns_s2(tmp_path):
                 "importance": "中",
                 "updated_chapter": 5,
             },
-            # 已回收：不报
             "F003": {
                 "id": "F003",
                 "summary": "断刀",
@@ -755,7 +678,6 @@ def test_audit_foreshadow_overdue_returns_s2(tmp_path):
                 "importance": "低",
                 "updated_chapter": 10,
             },
-            # 无计划回收章的长线伏笔：没有逾期基准，不报
             "F004": {
                 "id": "F004",
                 "summary": "无名石碑",
@@ -779,7 +701,6 @@ def test_audit_foreshadow_overdue_returns_s2(tmp_path):
 
 
 def test_audit_non_novel_project_returns_is_novel_false(tmp_path):
-    """非小说项目：返回 ok=False + is_novel=False，不带 findings。"""
     plain = tmp_path / "plain"
     plain.mkdir()
 
@@ -792,7 +713,6 @@ def test_audit_non_novel_project_returns_is_novel_false(tmp_path):
 
 
 def test_audit_ai_patterns_flags_banned_words_and_formulas(tmp_path):
-    """AI 味检查为本地确定性扫描：禁用词、套句式、章末预告各出 S4，不进 skipped。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(
         root,
@@ -816,14 +736,11 @@ def test_audit_ai_patterns_flags_banned_words_and_formulas(tmp_path):
     assert "仿佛" in messages
     assert "不是A，而是B" in messages
     assert "他不知道的是" in messages
-    # 检查已真正执行：不再以 skipped 冒充通过
     assert not [s for s in result["skipped"] if s["check"] == "ai_patterns"]
-    # 空项目没有追踪状态：tracking_state 记 S3，与 AI 味检查互不影响
     assert result["summary"]["S3"] >= 1
 
 
 def test_audit_rejects_invalid_scope_and_checks(tmp_path):
-    """scope 只接受 chapter / all，checks 只接受 auto；非法值在扫描前直接报错。"""
     root = _make_novel_project(tmp_path / "book")
 
     bad_scope = novel_service.novel_audit(str(root), scope="volume")
@@ -834,18 +751,12 @@ def test_audit_rejects_invalid_scope_and_checks(tmp_path):
     assert bad_checks["ok"] is False
     assert "checks 只接受" in bad_checks["error"]
 
-    # 指定章的正文不存在：报参数错误而不是静默返回空结论
     missing_chapter = novel_service.novel_audit(str(root), scope="chapter", chapter=99)
     assert missing_chapter["ok"] is False
     assert "第 99 章" in missing_chapter["error"]
 
 
-# ---------------------------------------------------------------------------
-# 第五块：多书发现与导出（P3-B）
-# ---------------------------------------------------------------------------
-
 def _retitle(root: Path, title: str) -> Path:
-    """改写 .novel.json 的 title，用来区分同工作区里的多本书。"""
     marker = root / novel_service.NOVEL_MARKER
     data = json.loads(marker.read_text(encoding="utf-8"))
     data["title"] = title
@@ -854,11 +765,9 @@ def _retitle(root: Path, title: str) -> Path:
 
 
 def test_discover_self_is_novel_project(tmp_path):
-    """工作区自身是小说项目：只回一条，path 为 "."，章数只按正文文件数统计。"""
     root = _make_novel_project(tmp_path)
     _write_chapter(root, 1, "夜行", "# 第001章 夜行\n\n风起。\n")
     _write_chapter(root, 2, "入城", "# 第002章 入城\n\n雨落。\n")
-    # 不合章命名契约的文件不计入章节数（只数不读）
     (root / "正文" / "笔记.md").write_text("随笔，不是章节。\n", encoding="utf-8")
 
     result = novel_service.discover_novel_projects(str(root))
@@ -871,7 +780,6 @@ def test_discover_self_is_novel_project(tmp_path):
 
 
 def test_discover_lists_books_in_subdirs_and_stops_at_marker(tmp_path):
-    """工作区不是小说项目：扫出 a / b 两本；命中 .novel.json 后不再向下钻。"""
     workspace = tmp_path / "工作区"
     workspace.mkdir()
     (workspace / "README.md").write_text("普通工作区\n", encoding="utf-8")
@@ -883,7 +791,6 @@ def test_discover_lists_books_in_subdirs_and_stops_at_marker(tmp_path):
     _retitle(book_b, "乙书")
     _write_chapter(book_b, 1, "入城", "# 第001章 入城\n\n雨落。\n")
     _write_chapter(book_b, 2, "黎明", "# 第002章 黎明\n\n雪停。\n")
-    # 书内部再放一本"书"（深度 2，仍在扫描范围内）：命中 a 后不应再往下钻
     nested = book_a / "参考"
     nested.mkdir(parents=True)
     (nested / novel_service.NOVEL_MARKER).write_text(
@@ -902,7 +809,6 @@ def test_discover_lists_books_in_subdirs_and_stops_at_marker(tmp_path):
 
 
 def test_discover_skips_hidden_and_export_dirs(tmp_path):
-    """隐藏目录与「导出」目录里的 .novel.json 不收录；不存在的目录回结构化错误。"""
     workspace = tmp_path / "工作区"
     workspace.mkdir()
     for name in (".hidden", "导出"):
@@ -930,7 +836,6 @@ def test_discover_skips_hidden_and_export_dirs(tmp_path):
 
 
 def test_discover_empty_workspace_returns_empty_list(tmp_path):
-    """空工作区不是错误：ok=True 且 projects 为空数组。"""
     empty = tmp_path / "空工作区"
     empty.mkdir()
 
@@ -941,7 +846,6 @@ def test_discover_empty_workspace_returns_empty_list(tmp_path):
 
 
 def test_export_md_keeps_body_and_orders_chapters(tmp_path):
-    """md 导出：产物落在 导出/书名.md，保留正文原文、按章号升序、带书名标题。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 1, "夜行", "# 第001章 夜行\n\n他推门而入，风灌进来。\n")
     _write_chapter(root, 2, "入城", "# 第002章 入城\n\n雨落在青石板上。\n")
@@ -959,13 +863,11 @@ def test_export_md_keeps_body_and_orders_chapters(tmp_path):
     assert "他推门而入，风灌进来。" in text
     assert "雨落在青石板上。" in text
     assert text.index("第001章") < text.index("第002章")
-    # 可见字数与 novel_status 同口径，不另算一套
     assert result["visible_chars"] == novel_service.novel_status(str(root))["total_words"]
     assert result["visible_chars"] > 0
 
 
 def test_export_txt_strips_frontmatter_and_heading_marks(tmp_path):
-    """txt 导出：frontmatter 块与行首 # 标题被去掉，只留正文文字。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(
         root,
@@ -987,7 +889,6 @@ def test_export_txt_strips_frontmatter_and_heading_marks(tmp_path):
 
 
 def test_export_rejects_invalid_format_and_empty_body(tmp_path):
-    """非法 fmt 报「只接受 md / txt」；正文为空时报错且不生成导出文件。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 1, "夜行", "# 第001章 夜行\n\n风起。\n")
 
@@ -1002,7 +903,6 @@ def test_export_rejects_invalid_format_and_empty_body(tmp_path):
     assert "正文目录没有可导出的章节" in empty["error"]
     assert not (empty_root / "导出").exists()
 
-    # 非小说项目：返回 is_novel=False，同样不落任何文件
     plain = tmp_path / "plain"
     plain.mkdir()
     non_novel = novel_service.export_novel(str(plain))
@@ -1014,12 +914,7 @@ def test_export_rejects_invalid_format_and_empty_body(tmp_path):
     assert not (plain / "导出").exists()
 
 
-# ---------------------------------------------------------------------------
-# 第五块：novel_status 透出 target_words / chapters（前端逐章字数）
-# ---------------------------------------------------------------------------
-
 def _set_marker_field(root: Path, **fields) -> None:
-    """改写 .novel.json 的指定字段，其余键保持原样。"""
     path = root / novel_service.NOVEL_MARKER
     data = json.loads(path.read_text(encoding="utf-8"))
     data.update(fields)
@@ -1027,7 +922,6 @@ def _set_marker_field(root: Path, **fields) -> None:
 
 
 def test_status_exposes_target_words_and_chapters(tmp_path):
-    """目标字数从 marker 透出；chapters 的章号/章名/字数/提交态/细纲态逐章对齐。"""
     root = _make_novel_project(tmp_path / "book")
     _set_marker_field(root, target_words=750000)
     texts = {
@@ -1054,18 +948,15 @@ def test_status_exposes_target_words_and_chapters(tmp_path):
     for item in chapters:
         number = item["number"]
         assert item["words"] == wordcount.count_visible_chars(texts[number])
-        # 与 novel_wordcount 的文件口径一致，不另算一套
         assert item["words"] == novel_service.novel_wordcount(
             workdir=str(root), chapter=number
         )["visible_chars"]
         assert item["submitted"] == (number <= 2)
         assert item["outline_ready"] == (number == 1)
-    # 无 tracking actual 时，逐章字数之和就是原有 total_words
     assert status["total_words"] == sum(item["words"] for item in chapters)
 
 
 def test_status_chapter_words_prefer_tracking_actual(tmp_path):
-    """追踪记录 actual 存在时优先于现算可见字数；total_words 仍是原口径。"""
     root = _make_novel_project(tmp_path / "book")
     first_text = "短正文"
     second_text = "第二章正文也不长"
@@ -1083,7 +974,6 @@ def test_status_chapter_words_prefer_tracking_actual(tmp_path):
                     "metric": "visible_chars_v1",
                     "body_sha256": "0" * 64,
                 },
-                # actual 非正数视为不可用，回落现算值
                 "2": {"actual": 0, "target": 2500},
             },
         },
@@ -1102,7 +992,6 @@ def test_status_chapter_words_prefer_tracking_actual(tmp_path):
 
 
 def test_status_keeps_unreadable_chapter_with_zero_words(tmp_path, monkeypatch):
-    """正文读不出时该章仍出现在 chapters 里，words 为 0，不整章消失。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 1, "夜行", "可见正文")
     _write_chapter(root, 2, "空章", "")
@@ -1127,9 +1016,8 @@ def test_status_keeps_unreadable_chapter_with_zero_words(tmp_path, monkeypatch):
 
 
 def test_status_chapter_volume_only_when_outline_range_reliable(tmp_path):
-    """卷纲声明章号范围且归属唯一时才填 volume；范围重叠则整项省略。"""
     root = _make_novel_project(tmp_path / "book")
-    _write_outline(root)  # 卷纲_第001卷.md：单元 D1-01 声明「章节范围：第1-3章」
+    _write_outline(root)
     for number in (1, 2, 3, 4):
         _write_chapter(root, number, f"测试章{number}", f"第{number}章正文")
 
@@ -1139,7 +1027,6 @@ def test_status_chapter_volume_only_when_outline_range_reliable(tmp_path):
     assert [by_number[number]["volume"] for number in (1, 2, 3)] == [1, 1, 1]
     assert "volume" not in by_number[4]
 
-    # 第二卷声明与第一卷重叠：2、3 章归属不可靠 → 省略；4 章唯一归属第二卷
     (root / "大纲" / "卷纲_第002卷.md").write_text(
         "# 第002卷 卷纲\n\n- 章节范围：第2-5章\n", encoding="utf-8"
     )
@@ -1154,7 +1041,6 @@ def test_status_chapter_volume_only_when_outline_range_reliable(tmp_path):
 
 
 def test_status_target_words_defaults_to_zero(tmp_path):
-    """marker 缺 target_words 字段或标记损坏时，target_words 回落 0。"""
     root = _make_novel_project(tmp_path / "book")
     (root / novel_service.NOVEL_MARKER).write_text(
         json.dumps({"schema": novel_service.NOVEL_SCHEMA, "title": "长夜行"}),
@@ -1171,16 +1057,11 @@ def test_status_target_words_defaults_to_zero(tmp_path):
 
 
 def test_status_non_novel_has_no_chapter_fields(tmp_path):
-    """非小说项目仍然只返回 {"is_novel": False}，不附带 chapters / target_words。"""
     plain = tmp_path / "plain"
     plain.mkdir()
 
     assert novel_service.novel_status(str(plain)) == {"is_novel": False}
 
-
-# ---------------------------------------------------------------------------
-# 第六块：GUI 工作台聚合与文档预览（novel_workbench / read_novel_doc）
-# ---------------------------------------------------------------------------
 
 WORKBENCH_TOP_FIELDS = {"is_novel", "foreshadows", "characters", "volumes", "recent_daily"}
 FORESHADOW_FIELDS = {
@@ -1196,7 +1077,6 @@ VOLUME_FIELDS = {"no", "name", "chars", "current"}
 
 
 def _foreshadow_row(identifier: str, planted, status: str = "已埋", **extra) -> dict:
-    """构造一条伏笔记录：字段命名与 tracking_commit.py 写出的状态一致。"""
     row = {
         "id": identifier,
         "summary": f"{identifier} 的摘要",
@@ -1211,7 +1091,6 @@ def _foreshadow_row(identifier: str, planted, status: str = "已埋", **extra) -
 
 
 def test_workbench_returns_four_tables_with_contract_fields(tmp_path):
-    """小说项目：四张表齐全，每条记录的字段集与契约完全一致。"""
     root = _make_novel_project(tmp_path / "book")
     _write_tracking_state(root, {
         "last_committed_chapter": 5,
@@ -1229,14 +1108,12 @@ def test_workbench_returns_four_tables_with_contract_fields(tmp_path):
         assert set(item) == VOLUME_FIELDS
     for item in result["recent_daily"]:
         assert set(item) == {"date", "words"}
-    # 只读：不写任何文件、状态文件内容未变
     assert json.loads(
         (root / "追踪" / novel_service.TRACKING_STATE_NAME).read_text(encoding="utf-8")
     )["last_committed_chapter"] == 5
 
 
 def test_workbench_non_novel_and_missing_state_defaults(tmp_path):
-    """非小说项目只回 {"is_novel": False}；缺状态文件时四张表为空/固定 7 天。"""
     plain = tmp_path / "plain"
     plain.mkdir()
     assert novel_service.novel_workbench(str(plain)) == {"is_novel": False}
@@ -1253,25 +1130,14 @@ def test_workbench_non_novel_and_missing_state_defaults(tmp_path):
 
 
 def test_workbench_foreshadows_sorted_and_overdue_is_planted_basis(tmp_path):
-    """排序为 超期 → 搁置章数 → 埋设章；overdue 按埋设章基准（与审计口径不同维度）。
-
-    audit 的超期口径是「计划回收章 + 宽限」（见 _audit_foreshadow_overdue），
-    本 fixture 里没有任何一条超过「计划章 + 20」，所以审计一条都不报；面板的
-    overdue 看的是埋设章搁置多久，仍会标出 F001。两者不再等价，故分开断言。
-    """
     root = _make_novel_project(tmp_path / "book")
     _write_tracking_state(root, {
         "last_committed_chapter": 25,
         "foreshadow": {
-            # 差 22 章 > 20 → 面板 overdue
             "F001": _foreshadow_row("F001", 3, planned_resolution_chapter=21),
-            # 差 20 章，正好等于阈值 → 不算超期（严格大于）
             "F002": _foreshadow_row("F002", 5, planned_resolution_chapter=30),
-            # 已回收：即使搁置最久也不算超期
             "F003": _foreshadow_row("F003", 2, status="已回收"),
-            # 差 15 章 → 不超期
             "F004": _foreshadow_row("F004", 10),
-            # 埋设章缺失/为 0：面板与审计都跳过超期判定
             "F005": _foreshadow_row("F005", 0),
         },
     })
@@ -1280,12 +1146,9 @@ def test_workbench_foreshadows_sorted_and_overdue_is_planted_basis(tmp_path):
     rows = workbench["foreshadows"]
 
     assert [row["id"] for row in rows] == ["F001", "F005", "F003", "F002", "F004"]
-    # F005 埋设章为 0，stale 按 max(0, 25-0)=25 计，因此排在已回收的 F003 之前
     assert [row["stale_chapters"] for row in rows] == [22, 25, 23, 20, 15]
     assert [row["overdue"] for row in rows] == [True, False, False, False, False]
 
-    # 审计侧：计划章 21 / 30 都在「计划 + 20」宽限内（25 <= 41 / 50），无计划章的不判，
-    # 所以一条超期结论都不该有——这正是面板 overdue 与审计口径分离后的预期
     audit = novel_service.novel_audit(str(root), scope="all")
     overdue_messages = [
         item["message"] for item in audit["findings"] if item["type"] == "foreshadow_overdue"
@@ -1294,7 +1157,6 @@ def test_workbench_foreshadows_sorted_and_overdue_is_planted_basis(tmp_path):
 
 
 def test_workbench_characters_defaults_and_sorting(tmp_path):
-    """字符串字段缺省给空串、数组字段缺省给 []；有 open_threads 的排前面再按名字。"""
     root = _make_novel_project(tmp_path / "book")
     _write_tracking_state(root, {
         "characters": {
@@ -1323,13 +1185,11 @@ def test_workbench_characters_defaults_and_sorting(tmp_path):
 
 
 def test_workbench_volumes_current_requires_unique_range_hit(tmp_path):
-    """current 只在卷纲章号范围恰好唯一命中下一章时为 True；重叠时全为 False。"""
     root = _make_novel_project(tmp_path / "book")
-    _write_outline(root)  # 卷纲_第001卷.md：章节范围 第1-3章
+    _write_outline(root)
     (root / "大纲" / "卷纲_第002卷.md").write_text(
         "# 第002卷 卷纲\n\n- 章节范围：第4-8章\n", encoding="utf-8"
     )
-    # 上次提交到第 4 章 → 下一章为第 5 章，唯一落在第二卷
     _write_tracking_state(root, {"last_committed_chapter": 4})
 
     volumes = novel_service.novel_workbench(str(root))["volumes"]
@@ -1343,8 +1203,6 @@ def test_workbench_volumes_current_requires_unique_range_hit(tmp_path):
         assert item["chars"] == wordcount.count_visible_chars(text)
         assert item["chars"] > 0
 
-    # 第一卷改声明为第1-6章、第二卷为第2-8章：第 5 章同时落在两卷 → 归属不可靠，
-    # 两卷都不标当前卷（与 novel_status 省略 volume 字段同一判定）
     (root / "大纲" / "卷纲_第001卷.md").write_text(
         "# 第001卷 卷纲\n\n- 章节范围：第1-6章\n", encoding="utf-8"
     )
@@ -1357,7 +1215,6 @@ def test_workbench_volumes_current_requires_unique_range_hit(tmp_path):
 
 
 def test_workbench_recent_daily_has_seven_days_aggregated_by_mtime(tmp_path):
-    """recent_daily 固定 7 项、按日期升序；按章节文件 mtime 落到当天，窗口外不计。"""
     root = _make_novel_project(tmp_path / "book")
     wordcount = _vendor_wordcount()
     today_text = "今日正文若干字"
@@ -1381,7 +1238,6 @@ def test_workbench_recent_daily_has_seven_days_aggregated_by_mtime(tmp_path):
     by_date = {row["date"]: row["words"] for row in rows}
     assert by_date[date.today().isoformat()] == wordcount.count_visible_chars(today_text)
     assert by_date[dates[3].isoformat()] == wordcount.count_visible_chars("三天前的正文")
-    # 窗口外的旧章不计入任何一天；7 天字数之和等于窗口内正文
     assert sum(by_date.values()) == (
         wordcount.count_visible_chars(today_text)
         + wordcount.count_visible_chars("三天前的正文")
@@ -1389,7 +1245,6 @@ def test_workbench_recent_daily_has_seven_days_aggregated_by_mtime(tmp_path):
 
 
 def test_read_novel_doc_allows_whitelisted_dirs_only(tmp_path):
-    """大纲/设定/追踪 下的 .md 可读，返回原文、相对路径与同口径可见字数。"""
     root = _make_novel_project(tmp_path / "book")
     wordcount = _vendor_wordcount()
     docs = {
@@ -1415,13 +1270,12 @@ def test_read_novel_doc_allows_whitelisted_dirs_only(tmp_path):
 @pytest.mark.parametrize(
     "rel_path",
     [
-        "../外部.md",              # .. 穿越
-        "正文/第001章_夜行.md",     # 白名单外目录
-        "大纲/../../外部.md",       # 目录内再穿越
+        "../外部.md",
+        "正文/第001章_夜行.md",
+        "大纲/../../外部.md",
     ],
 )
 def test_read_novel_doc_rejects_escaping_paths(tmp_path, rel_path):
-    """越界路径一律拒绝：三段文案都带拒绝理由，且绝不返回文件内容。"""
     root = _make_novel_project(tmp_path / "book")
     _write_chapter(root, 1, "夜行", "# 第001章 夜行\n\n风起。\n")
     (tmp_path / "外部.md").write_text("项目外的内容\n", encoding="utf-8")
@@ -1434,7 +1288,6 @@ def test_read_novel_doc_rejects_escaping_paths(tmp_path, rel_path):
 
 
 def test_read_novel_doc_rejects_absolute_non_md_and_oversize(tmp_path):
-    """绝对路径、非 .md、超过 2MB 各自返回不同 error，不抛异常。"""
     root = _make_novel_project(tmp_path / "book")
     outline = _write_outline(root)
 
@@ -1462,7 +1315,6 @@ def test_read_novel_doc_rejects_absolute_non_md_and_oversize(tmp_path):
 
 
 def test_read_novel_doc_non_novel_project_returns_flag(tmp_path):
-    """非小说项目：返回 is_novel=False 的结构化错误，不读任何文件。"""
     plain = tmp_path / "plain"
     plain.mkdir()
 
@@ -1471,4 +1323,3 @@ def test_read_novel_doc_non_novel_project_returns_flag(tmp_path):
     assert result["ok"] is False
     assert result["is_novel"] is False
     assert "缺少 .novel.json" in result["error"]
-

@@ -1,13 +1,5 @@
-"""CLI 能力对齐 GUI 第一批命令的单元测试（实施计划：待开发/CLI补齐GUI功能第一批）。
-
-覆盖 /clear-history、/persona、/shell、/open、/skills refresh；
-Batch B/C（/computer browser、/queue、/paste-image、/update、/changes）
-随批次追加。
-"""
-
 import os
 
-import pytest
 
 import main
 
@@ -23,10 +15,6 @@ def _capture_print(monkeypatch):
 def _quiet_ui(monkeypatch):
     monkeypatch.setattr(main, "app_instance", None)
 
-
-# ---------------------------------------------------------------------------
-# /clear-history
-# ---------------------------------------------------------------------------
 
 def test_clear_history_requires_confirmation(monkeypatch):
     printed = _capture_print(monkeypatch)
@@ -74,10 +62,6 @@ def test_clear_history_confirmed_resets_token_usage(monkeypatch):
     assert any("已清空 7 条" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# /persona
-# ---------------------------------------------------------------------------
-
 def test_persona_show_displays_current_settings(monkeypatch):
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
@@ -123,7 +107,6 @@ def test_persona_text_over_limit_rejected(monkeypatch):
     import core.persona_settings as ps
     monkeypatch.setattr(ps, "get_persona_settings", lambda: {"agent_name": "星瑶", "persona": "", "user_title": ""})
 
-    # 模拟核心层校验：超限抛 PersonaSettingsError（与真实 save_persona_settings 一致）
     def _fake_save(agent_name, persona, user_title=""):
         if len(persona) > ps.MAX_PERSONA_LEN:
             raise ps.PersonaSettingsError(f"人设内容过长（最多 {ps.MAX_PERSONA_LEN} 字符）")
@@ -150,10 +133,6 @@ def test_persona_reset_restores_defaults(monkeypatch):
 
     assert calls == [(ps.DEFAULT_AGENT_NAME, "", "")]
 
-
-# ---------------------------------------------------------------------------
-# /shell
-# ---------------------------------------------------------------------------
 
 def _fake_shell_options():
     return [
@@ -201,10 +180,6 @@ def test_shell_set_success_and_failures(monkeypatch):
     assert any("命令提示符" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# /open
-# ---------------------------------------------------------------------------
-
 def test_open_default_workdir_and_relative_path(monkeypatch, tmp_path):
     opened = []
     printed = _capture_print(monkeypatch)
@@ -238,10 +213,6 @@ def test_open_missing_path_reports_error(monkeypatch, tmp_path):
     assert any("路径不存在" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# /skills refresh
-# ---------------------------------------------------------------------------
-
 def test_skills_refresh_reports_counts(monkeypatch):
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
@@ -261,10 +232,6 @@ def test_skills_refresh_reports_counts(monkeypatch):
     assert any("已启用 2 个" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# /queue
-# ---------------------------------------------------------------------------
-
 def _drain_main_queue():
     import queue as queue_mod
 
@@ -278,10 +245,6 @@ def _drain_main_queue():
 
 
 def _run_threads_inline(monkeypatch):
-    """把 threading.Thread 换成同步执行 target 的假线程。
-
-    /update check/download 已异步化；单测里内联执行 worker，保证断言确定性。
-    """
 
     class _InlineThread:
         def __init__(self, target=None, daemon=None, args=None, kwargs=None):
@@ -303,7 +266,6 @@ def test_queue_list_preserves_order(monkeypatch):
 
     main.handle_slash_command("/queue")
 
-    # list 之后必须原序回填
     assert main.msg_queue.qsize() == 3
     assert [i["text"] for i in _drain_main_queue()] == ["first", "second", "third"]
     assert any("first" in line for line in printed)
@@ -348,10 +310,6 @@ def test_queue_clear_discards_all(monkeypatch):
     assert any("已清空 2 条" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# /paste-image
-# ---------------------------------------------------------------------------
-
 class _FakeClipboardImage:
     def __init__(self):
         self.saved_path = ""
@@ -381,12 +339,11 @@ def test_paste_image_saves_temp_and_enqueues(monkeypatch):
 
     item = main.msg_queue.get_nowait()
     assert main.msg_queue.qsize() == 0
-    # 修复后路径经 explicit_paths 通道传递，不再嵌进文本
     assert item["text"] == "这里有个bug"
     assert len(item["explicit_paths"]) == 1
     assert "ycode_clip_" in item["explicit_paths"][0] and item["explicit_paths"][0].endswith(".png")
     assert item["session"] == "s1"
-    assert image.saved_path  # 临时文件确实被写出
+    assert image.saved_path
     assert any("[剪贴板图片]" in line for line in printed)
 
 
@@ -396,7 +353,6 @@ def test_paste_image_with_file_path_list_uses_paths_directly(monkeypatch, tmp_pa
     monkeypatch.setattr(main, "is_thinking", False)
     monkeypatch.setattr(main, "current_session", "s1")
     _drain_main_queue()
-    # 含空格路径：回归（代码审查 Important #4），explicit_paths 通道不得丢
     source = tmp_path / "新建 文件夹 (2)" / "shot.png"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"\x89PNG fake")
@@ -420,10 +376,6 @@ def test_paste_image_without_image_reports_empty(monkeypatch):
     assert main.msg_queue.qsize() == 0
     assert any("剪贴板中没有图片" in line for line in printed)
 
-
-# ---------------------------------------------------------------------------
-# /update
-# ---------------------------------------------------------------------------
 
 class _FakeDownloader:
     def __init__(self, downloading=False, started=True):
@@ -470,7 +422,6 @@ def test_update_check_latest_and_new_version(monkeypatch):
 
 
 def test_update_check_fetch_error_is_not_reported_as_latest(monkeypatch):
-    # 回归（代码审查 Important #1）：ok=False 必须报错，不得并入"已是最新版本"
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
     _run_threads_inline(monkeypatch)
@@ -507,12 +458,11 @@ def test_update_download_starts_with_release_params(monkeypatch):
     call = downloader.calls[0]
     assert call["target_version"] == "1.3.0"
     assert call["part_urls"] == ["https://x/y.part1"]
-    assert call["expected_sha256"] == "abc"  # 小写归一
+    assert call["expected_sha256"] == "abc"
     assert any("已开始下载 v1.3.0" in line for line in printed)
 
 
 def test_update_download_fetch_error_reports_failure(monkeypatch):
-    # 回归（代码审查 Important #1）：download 路径网络失败显式报错且不启动下载
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
     _run_threads_inline(monkeypatch)
@@ -563,13 +513,11 @@ def test_update_install_gates_on_turn_and_tasks(monkeypatch, tmp_path):
     import core.updater as upd
     monkeypatch.setattr(upd, "launch_installer", lambda path: launched.append(path) or True)
 
-    # 回合进行中：拒绝启动安装
     monkeypatch.setattr(main, "is_thinking", True)
     main.handle_slash_command(f"/update install {installer} y")
     assert launched == []
     assert any("正在执行的回合" in line for line in printed)
 
-    # 后台任务运行中：拒绝启动安装
     monkeypatch.setattr(main, "is_thinking", False)
     import core.task_manager as tm
     monkeypatch.setattr(tm, "list_active_tasks", lambda: [{"id": "t1"}])
@@ -577,7 +525,6 @@ def test_update_install_gates_on_turn_and_tasks(monkeypatch, tmp_path):
     assert launched == []
     assert any("后台任务" in line for line in printed)
 
-    # 门禁通过：启动安装且退出线程被捕获（不真正 os._exit）
     monkeypatch.setattr(tm, "list_active_tasks", lambda: [])
 
     class _NoopThread:
@@ -592,7 +539,7 @@ def test_update_install_gates_on_turn_and_tasks(monkeypatch, tmp_path):
     main.handle_slash_command(f"/update install {installer} y")
 
     assert launched == [str(installer)]
-    assert _NoopThread.last_kwargs is not None  # 退出线程已安排（测试内不执行）
+    assert _NoopThread.last_kwargs is not None
     assert any("安装向导已启动" in line for line in printed)
 
 
@@ -610,10 +557,6 @@ def test_update_install_requires_confirmation(monkeypatch, tmp_path):
     assert launched == []
     assert any("确认请输入" in line for line in printed)
 
-
-# ---------------------------------------------------------------------------
-# /changes
-# ---------------------------------------------------------------------------
 
 class _FakeTurnUndoService:
     def __init__(self, states, details=None):
@@ -674,12 +617,7 @@ def test_changes_empty_session_reports(monkeypatch):
     assert any("还没有文件修改记录" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# 代码审查修复回归
-# ---------------------------------------------------------------------------
-
 def test_persona_title_dash_clears_title(monkeypatch):
-    # Minor：/persona title - 表示清除称呼
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
     calls = []
@@ -717,14 +655,13 @@ def test_print_threadsafe_closed_loop_protection(monkeypatch):
             raise RuntimeError("loop closed during schedule")
 
     monkeypatch.setattr(main, "app_instance", type("App", (), {"loop": _ClosedLoop()})())
-    main._print_threadsafe("<b>x</b>")  # 不应抛异常
+    main._print_threadsafe("<b>x</b>")
 
     monkeypatch.setattr(main, "app_instance", type("App", (), {"loop": _RacyLoop()})())
-    main._print_threadsafe("<b>x</b>")  # RuntimeError 被吞掉
+    main._print_threadsafe("<b>x</b>")
 
 
 def test_queue_internal_messages_are_preserved_and_hidden(monkeypatch):
-    # Important #3：is_internal 条目不参与序号/清空，cancel/clear 不得丢弃
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
     _drain_main_queue()
@@ -734,7 +671,6 @@ def test_queue_internal_messages_are_preserved_and_hidden(monkeypatch):
     main.msg_queue.put(internal)
     main.msg_queue.put({"text": "用户二", "was_queued": True, "session": "s1"})
 
-    # list：只编排用户消息，内部消息原位回填
     main.handle_slash_command("/queue")
     all_items = _drain_main_queue()
     assert [i["text"] for i in all_items] == ["用户一", "__ycode_internal__:summarize_background_tasks", "用户二"]
@@ -743,7 +679,6 @@ def test_queue_internal_messages_are_preserved_and_hidden(monkeypatch):
     for i in all_items:
         main.msg_queue.put(i)
 
-    # cancel 1：移除"用户一"，内部消息与"用户二"保留
     printed.clear()
     main.handle_slash_command("/queue cancel 1")
     remaining = _drain_main_queue()
@@ -751,7 +686,6 @@ def test_queue_internal_messages_are_preserved_and_hidden(monkeypatch):
     for i in remaining:
         main.msg_queue.put(i)
 
-    # clear：只清用户消息，内部消息保留
     printed.clear()
     main.handle_slash_command("/queue clear")
     leftover = _drain_main_queue()
@@ -761,7 +695,6 @@ def test_queue_internal_messages_are_preserved_and_hidden(monkeypatch):
 
 
 def test_effort_missing_model_reports_not_found(monkeypatch):
-    # Minor #7：激活模型 id 残留但配置中无此模型，提示"未找到"而非"未声明思考能力"
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
 
@@ -773,12 +706,7 @@ def test_effort_missing_model_reports_not_found(monkeypatch):
     assert any("未在配置中找到激活模型" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# /hooks（C13：Hook 生命周期钩子管理 - 只读清单 + 信任操作）
-# ---------------------------------------------------------------------------
-
 def _fake_hook_entries():
-    """两条 hook 视图条目（字段与 core.hooks.trust.list_hooks_with_status 一致）。"""
     return [
         {
             "event": "PostToolUse",
@@ -806,7 +734,6 @@ def _fake_hook_entries():
 
 
 def _patch_hooks(monkeypatch, entries, calls=None):
-    """按 main.py 的函数内惰性导入打桩：patch 模块属性即可命中（与 /usage 等一致）。"""
     import core.hooks.trust as hook_trust
     import core.workspace_context as wsc
 
@@ -843,7 +770,6 @@ def test_hooks_trust_passes_digest_and_workspace_root(monkeypatch):
 
     main.handle_slash_command("/hooks trust 2")
 
-    # CLI 子命令 trust 映射为信任层动作名 grant（deny/revoke/reset 同名直传）
     assert calls == [("grant", "digest-2", {"workspace_root": "E:/fixed-ws"})]
     assert any("已信任" in line for line in printed)
     assert any("运行 /hooks 查看最新状态" in line for line in printed)
@@ -854,8 +780,8 @@ def test_hooks_trust_rejects_out_of_range_and_non_numeric_index(monkeypatch):
     _quiet_ui(monkeypatch)
     calls = _patch_hooks(monkeypatch, _fake_hook_entries(), calls=[])
 
-    main.handle_slash_command("/hooks trust 9")   # 越界
-    main.handle_slash_command("/hooks trust abc")  # 非数字
+    main.handle_slash_command("/hooks trust 9")
+    main.handle_slash_command("/hooks trust abc")
 
     assert calls == []
     assert any("序号" in line and "查看编号" in line for line in printed)

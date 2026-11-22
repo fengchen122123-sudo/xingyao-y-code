@@ -39,16 +39,13 @@ const props = defineProps<{
 const store = useAppStore();
 // 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
 const isMobile = useIsMobile();
-// FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
 const fullPath = computed(() => {
   return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
 });
-// 展开状态持久化在 store：文件树刷新后新组件实例也能凭路径恢复展开
 const isOpen = ref(store.fileTreeExpanded.includes(fullPath.value));
 const loading = ref(false);
 const loaded = ref(props.node.children !== undefined);
 
-// 目录图标已由模板中的 AppIcon（folder/folder-open）渲染，这里只算文件类型徽标
 const icon = computed(() => (props.node.d ? '' : extIcon(props.node.n)));
 
 async function toggle() {
@@ -63,7 +60,6 @@ async function toggle() {
     return;
   }
   isOpen.value = !isOpen.value;
-  // 同步到 store 的展开记录：刷新文件树时据此恢复展开并逐层刷新内容
   if (isOpen.value) {
     if (!store.fileTreeExpanded.includes(fullPath.value)) {
       store.fileTreeExpanded.push(fullPath.value);
@@ -95,7 +91,6 @@ async function toggle() {
   display: flex;
   align-items: center;
   gap: 7px;
-  /* 行高按设计稿 .row 定 24px（原来由字体行高决定，约 25.5px） */
   min-height: 24px;
   padding: 2px 8px;
   padding-right: 16px;
@@ -103,8 +98,6 @@ async function toggle() {
   cursor: pointer;
   font-size: 12.5px;
   color: var(--text-dim);
-  /* 行宽跟随内容（深层缩进 + 全名），超出由面板底部横向滚动条查看；
-     min-width 保证浅层行的悬停底色仍铺满面板 */
   width: max-content;
   min-width: 100%;
 }
@@ -129,11 +122,9 @@ async function toggle() {
   flex-shrink: 0;
 }
 .file-row .fname {
-  /* 完整文件名不截断，超出部分用横向滚动条查看 */
   white-space: nowrap;
 }
 .file-children {
-  /* 每层缩进 14px（含 1px 竖向引导线），对齐设计稿 .row 的 padding-left 递进 */
   margin-left: 10px;
   border-left: 1px solid var(--border);
   padding-left: 4px;

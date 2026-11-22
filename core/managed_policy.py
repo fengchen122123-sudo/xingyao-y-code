@@ -1,15 +1,3 @@
-"""企业/团队分发场景的管理员强制基线（借鉴 Codex ``requirements.toml``）。
-
-- 受管文件：Windows ``%ProgramData%\\Y-code\\managed.json``；
-  其他平台 ``/etc/ycode/managed.json``；``YCODE_MANAGED_FILE`` 环境变量覆盖（测试用）。
-- V1 可强制键：
-  - ``permission_mode_max``：权限模式上限，请求超限时在消费点降档 + 警告；
-  - ``disabled_tools``：工具名列表，注册表构建后过滤（禁用工具不可用）。
-- 文件缺失/损坏/顶层非对象时一律视为「无策略」：读取链与工具注册表零行为变化，
-  且不产生任何告警（缺省 = 现行为）。
-- 本模块只读受管文件，绝不回写；缓存以 (mtime_ns, size) 为键，管理端改写后自动失效。
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,12 +8,11 @@ from typing import Any
 
 from core.app_context import is_known_permission_mode, normalize_permission_mode
 
-# 测试/隔离运行可覆盖受管文件路径；生产默认路径不受影响
 MANAGED_FILE_ENV = "YCODE_MANAGED_FILE"
 
 # 权限模式强度排序（越大越宽松）：上限校验 = 生效模式不得比 max 更宽松。
-# plan=只读 / confirm=变更前确认 / accept_edits=自动编辑 / full=完全访问
-_MODE_RANK = {"plan": 0, "confirm": 1, "accept_edits": 2, "full": 3}
+# plan=只读 / confirm=变更前确认 / accept_edits=自动编辑 / auto_decision=自动决策 / full=完全访问
+_MODE_RANK = {"plan": 0, "confirm": 1, "accept_edits": 2, "auto_decision": 3, "full": 4}
 
 _STATE_LOCK = threading.RLock()
 # path -> ((mtime_ns, size), data | None)；data=None 表示该文件版本解析失败，
@@ -55,15 +42,10 @@ def managed_file_path() -> str:
 
 
 def load_managed_policy() -> dict:
-    """读取受管策略；文件缺失/损坏/顶层非对象时返回 ``{}``（无策略）。
-
-    返回值是浅拷贝，调用方的修改不会污染缓存。
-    """
     path = managed_file_path()
     try:
         stat = os.stat(path)
     except OSError:
-        # 文件不存在：清掉陈旧缓存，返回无策略（零行为变化）
         with _STATE_LOCK:
             _CACHE.pop(path, None)
         return {}
@@ -124,10 +106,6 @@ def permission_mode_ceiling(policy: dict | None = None) -> str | None:
 
 
 def clamp_permission_mode(requested: Any, policy: dict | None = None) -> str:
-    """把请求模式钳制在受管上限内：超限则降档并留一次性警告。
-
-    无上限或未超限时返回规范化后的请求值（与 ``normalize_permission_mode`` 一致）。
-    """
     mode = normalize_permission_mode(requested)
     ceiling = permission_mode_ceiling(policy)
     if ceiling is None or _MODE_RANK[mode] <= _MODE_RANK[ceiling]:
@@ -167,11 +145,6 @@ def apply_managed_policy(data: dict, policy: dict) -> dict:
 def enforce_managed_writes(
     data: dict, before: dict, policy: dict | None = None
 ) -> tuple[dict, tuple[str, ...]]:
-    """保存流程守卫：受管锁定键（``permission_mode``）的超限变更一律拒绝。
-
-    返回 ``(写入用 data, 被拒绝的键名元组)``；无策略/未超限时原样返回第一个入参，
-    零行为变化。拒绝时把该键回退为写入前值（``before``），并提示「由管理员锁定」。
-    """
     if not isinstance(data, dict):
         return data, ()
     if policy is None:
@@ -221,7 +194,6 @@ def disabled_tool_names(policy: dict | None = None) -> tuple[str, ...]:
 
 
 def _reset_state_for_tests() -> None:
-    """清空进程内缓存与告警去重状态（仅供测试隔离使用）。"""
     with _STATE_LOCK:
         _CACHE.clear()
         _WARNED.clear()

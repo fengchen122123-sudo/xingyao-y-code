@@ -2,20 +2,30 @@
   <div class="settings-page" :class="{ 'settings-page--mobile': isMobile }">
     <aside class="settings-nav">
       <button class="back-workspace" @click="attemptCloseSettings"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
-      <div class="nav-section">基础设置</div>
+      <div class="nav-section nav-section--first">核心配置</div>
+      <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
-      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
-      <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
       <button data-test="hooks-nav" class="nav-item" :class="{ active: activeSection === 'hooks' }" @click="activeSection = 'hooks'"><span class="nav-ico"><AppIcon name="zap" :size="14" /></span>钩子 Hooks</button>
+
+      <div class="nav-section">外观与个性</div>
       <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
-      <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
-      <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
+      <button data-test="pet-nav" class="nav-item" :class="{ active: activeSection === 'pet' }" @click="activeSection = 'pet'"><span class="nav-ico"><AppIcon name="orbit" :size="14" /></span>桌面宠物</button>
+      <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
+
+      <div class="nav-section">记忆与决策</div>
+      <button data-test="growth-nav" class="nav-item" :class="{ active: activeSection === 'growth' }" @click="activeSection = 'growth'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>记忆与成长</button>
       <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
+
+      <div class="nav-section">集成与数据</div>
       <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
+      <button data-test="cloud-relay-nav" class="nav-item" :class="{ active: activeSection === 'cloud-relay' }" @click="activeSection = 'cloud-relay'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>云中转</button>
       <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
-      <div class="nav-section">插件设置</div>
+      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
+      <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
+
+      <div v-if="pluginNavItems.length" class="nav-section">插件设置</div>
       <button v-for="p in pluginNavItems" :key="p.name" :data-test="`plugin-nav-${p.name}`" class="nav-item" :class="{ active: activePluginName === p.name }" @click="openPluginSection(p.name)"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>{{ p.name }}</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
@@ -84,7 +94,6 @@
             ><span class="add-provider-label"><AppIcon name="plus" :size="13" /> 添加自定义厂商</span></button>
           </div>
 
-          <!-- 副模型入口（红框位置）：点击后在右侧设置副模型 -->
           <button
             data-test="secondary-entry"
             class="secondary-entry-row"
@@ -98,7 +107,6 @@
         </aside>
 
         <div class="provider-detail" v-if="!isMobile || mobileDetail">
-          <!-- 手机端钻取：详情顶栏返回列表（桌面端不渲染该按钮） -->
           <button v-if="isMobile" class="mobile-detail-back" @click="closeMobileDetail"><AppIcon name="arrow-left" :size="14" /> 返回列表</button>
           <template v-if="selectedPreset">
             <div class="detail-title-row">
@@ -225,7 +233,6 @@
                   </div>
                 </div>
 
-                <!-- 方案 B：行内展开微型警告条 -->
                 <div
                   v-if="testResults[model.id]?.status === 'fail'"
                   class="model-error-banner"
@@ -342,7 +349,7 @@
           <div class="perm-row">
             <div>
               <h3>沙盒开关</h3>
-              <p>{{ store.sandboxEnabled ? '已解除：工作目录外的文件读写直接放行，不再询问（凭据文件除外）' : '已开启：仅允许访问当前工作目录内的文件' }}</p>
+              <p>{{ store.sandboxEnabled ? '已解除：允许读写工作目录外文件（凭据除外）' : '已开启：仅限访问当前工作目录内文件' }}</p>
             </div>
             <button
               data-test="sandbox-toggle"
@@ -354,7 +361,7 @@
           <div class="perm-row">
             <div>
               <h3>当前权限模式</h3>
-              <p>{{ formatPermMode(store.permissionMode) }}（可在输入框旁的权限按钮切换）</p>
+              <p>{{ formatPermMode(store.permissionMode) }}（可在输入框旁切换）</p>
             </div>
           </div>
 
@@ -375,7 +382,7 @@
                 >清空本项目规则</button>
               </div>
             </div>
-            <p class="whitelist-tip">用户手动添加或审批时选择“加入项目白名单”的规则会按项目目录保存到 permissions.json，重启后仍生效。命令按 token 前缀匹配；文件只放行规范化后的精确路径。任务级授权切换界面不清除，删除任务或重启后失效。</p>
+            <p class="whitelist-tip">按项目目录持久化保存；命令按前缀匹配，文件按精确路径匹配。</p>
             <div v-if="showPermRuleForm" class="wl-form">
               <select v-model="permRuleType" data-test="permission-rule-type" class="text-field">
                 <option value="command">命令前缀</option>
@@ -442,28 +449,20 @@
             </div>
             <h3>邮箱</h3>
             <p class="contact-desc">发送邮件与我们沟通</p>
-            <div class="contact-value mono" data-test="contact-email">{{ contactEmail }}</div>
-            <button
-              data-test="copy-email"
-              class="primary-button contact-copy-btn"
-              :class="{ copied: emailCopied }"
-              @click="copyEmail"
-            >
-              <AppIcon :name="emailCopied ? 'check' : 'pencil'" :size="13" />
-              {{ emailCopied ? '已复制' : '复制邮箱' }}
-            </button>
-          </section>
-
-          <section class="contact-card">
-            <div class="contact-card-icon">
-              <AppIcon name="qr" :size="22" />
+            <div class="contact-mail-list">
+              <div v-for="mail in contactEmails" :key="mail" class="contact-mail-item">
+                <div class="contact-value mono" data-test="contact-email">{{ mail }}</div>
+                <button
+                  data-test="copy-email"
+                  class="primary-button contact-copy-btn"
+                  :class="{ copied: copiedEmail === mail }"
+                  @click="copyEmail(mail)"
+                >
+                  <AppIcon :name="copiedEmail === mail ? 'check' : 'pencil'" :size="13" />
+                  {{ copiedEmail === mail ? '已复制' : '复制邮箱' }}
+                </button>
+              </div>
             </div>
-            <h3>微信群</h3>
-            <p class="contact-desc">扫码加入官方微信群</p>
-            <div class="contact-qr-wrap" @click="enlargedQr = { src: qrcodeWechat, alt: '微信群二维码' }">
-              <img :src="qrcodeWechat" alt="微信群二维码" class="contact-qr" data-test="contact-wechat-qr" />
-            </div>
-            <p class="contact-expiry">该二维码 7 天内（10月7日前）有效，过期后请重新获取</p>
           </section>
 
           <section class="contact-card">
@@ -562,7 +561,6 @@
           </footer>
         </section>
       </template>
-      <!-- 会话归档：原侧栏底部「已归档」区的完整入口，交互语义不变（可逆恢复 + 两段确认删除） -->
       <template v-else-if="activeSection === 'session-archive'">
         <header class="settings-header settings-header--narrow">
           <div>
@@ -582,7 +580,6 @@
         </header>
 
         <section class="perm-settings-card archive-settings-card" data-test="session-archive-page">
-          <!-- 批量操作栏：仅在批量模式出现，退出模式即收起（勾选同时清空） -->
           <div v-if="archiveBatchMode" class="archive-batch-bar" data-test="session-archive-batch-bar">
             <label class="archive-check">
               <input type="checkbox" data-test="session-archive-select-all" :checked="archiveAllSelected" @change="toggleArchiveSelectAll" />
@@ -607,7 +604,6 @@
             </div>
           </div>
           <div v-if="!orderedArchivedSessions.length" class="wl-empty" data-test="session-archive-empty">暂无归档会话</div>
-          <!-- 按归属目录折叠分组：组头点击收起/展开，批量模式下组头勾选框按目录整组选择 -->
           <div
             v-for="g in archiveGroups"
             :key="g.key"
@@ -660,7 +656,6 @@
                     <span class="mono archive-workdir" data-test="session-archive-workdir" :title="s.workdir || ''">{{ s.workdir || '未知目录' }}</span>
                   </div>
                 </div>
-                <!-- 批量模式下隐藏行内单项恢复/删除：批量语义与单项语义混排容易误触 -->
                 <div v-if="!archiveBatchMode" class="archive-actions">
                   <button
                     class="secondary-button compact"
@@ -688,7 +683,6 @@
           </div>
         </section>
       </template>
-      <!-- 插件设置页：内容由插件通过 plugin_settings 声明，前端只负责挂载 -->
       <template v-else-if="activePluginName">
         <header class="settings-header">
           <div>
@@ -706,22 +700,24 @@
       <TokenUsageSettingsLegacy v-else-if="activeSection === 'tokens-legacy'" />
       <SystemSettings v-else-if="activeSection === 'system'" />
       <PersonaSettings v-else-if="activeSection === 'persona'" />
+      <GrowthSettings v-else-if="activeSection === 'growth'" />
       <DecisionSettings v-else-if="activeSection === 'decision'" />
       <FeishuSettings v-else-if="activeSection === 'feishu'" />
+      <CloudRelaySettings v-else-if="activeSection === 'cloud-relay'" />
+      <PetSettings v-else-if="activeSection === 'pet'" />
       <BackgroundConvert v-else-if="activeSection === 'bg-convert'" />
 
-      <!-- 外观与主题常驻挂载（v-show）：切换设置分区不丢失未保存的主题草稿 -->
       <div v-show="activeSection === 'appearance'" class="appearance-section">
         <header class="settings-header">
           <div>
             <h1>外观与主题</h1>
-            <p>为 GUI 创建、编辑和切换可视化主题；CLI 的 /theme 配置保持独立、互不影响。</p>
+            <p>管理与自定义 GUI 界面主题（与 CLI 主题独立）。</p>
           </div>
         </header>
 
-        <!-- 全局玻璃层：主题编辑卡里是「全局颜色 → 背景图片」，玻璃层就贴在那层壁纸之上，
-             故放在主题卡片之前（与位置语义一致：壁纸 → 玻璃 → 界面） -->
         <AppGlassCard />
+
+        <ChatLayoutWidthCard />
 
         <section class="appearance-settings-card">
           <GuiThemeSettings ref="themeEditorRef" />
@@ -729,7 +725,6 @@
       </div>
     </main>
 
-    <!-- 二维码放大查看 -->
     <div v-if="enlargedQr" class="qr-enlarge-mask" @click="enlargedQr = null">
       <img :src="enlargedQr.src" :alt="enlargedQr.alt" class="qr-enlarge-img" />
     </div>
@@ -758,14 +753,14 @@
             <input v-model.number="modelModal.max_tokens" class="text-field" type="number" min="0" placeholder="留空使用默认" />
           </div>
         </div>
-        <p class="modal-field-hint">最大输出留空时使用按模型家族内置的默认输出上限（如 DeepSeek 384K、GLM-5.3 131K、其余 32K）。</p>
+        <p class="modal-field-hint">留空使用模型家族默认输出上限。</p>
         <label class="vision-choice">
           <input v-model="modelModal.supports_vision" data-test="model-supports-vision" type="checkbox" />
           <span><b>是否支持多模态</b><small>启用后允许向该模型发送图片内容</small></span>
         </label>
         <label class="vision-choice">
           <input v-model="modelModal.supports_function_calling" data-test="model-supports-function-calling" type="checkbox" />
-          <span><b>是否支持工具调用</b><small>默认视为支持（Agent 模型本就以工具调用驱动）；显式关闭会把该模型排除在电脑操控之外。电脑操控还要求开启多模态（视觉识图）</small></span>
+          <span><b>是否支持工具调用</b><small>关闭后将不参与工具调用与电脑操控</small></span>
         </label>
         <label class="field-label">电脑操控协议</label>
         <select v-model="modelModal.computer_protocol" data-test="model-computer-protocol" class="text-field">
@@ -774,7 +769,7 @@
           <option value="generic">通用视觉工具协议（generic）</option>
           <option value="native_openai">OpenAI 原生 Computer Use（native_openai）</option>
         </select>
-        <p class="modal-field-hint">电脑操控要求模型支持视觉（识图）；工具调用默认视为支持（显式关闭的模型除外）。选「自动」时，视觉已勾选的模型在开关开启后即可直接操控。</p>
+        <p class="modal-field-hint">选「自动」时，开启多模态与工具调用即自动启用。</p>
         <p v-if="computerProtocolError" data-test="model-computer-protocol-error" class="modal-field-error">
           {{ computerProtocolError }}
         </p>
@@ -785,7 +780,6 @@
       </form>
     </div>
 
-    <!-- 历史更新内容弹窗：随安装包发布的 CHANGELOG.md 全量条目 -->
     <div v-if="showChangelogHistory" class="modal-mask" @click.self="showChangelogHistory = false">
       <div data-test="changelog-history-modal" class="changelog-modal">
         <div class="modal-head"><h3>历史更新内容</h3><button type="button" @click="showChangelogHistory = false">×</button></div>
@@ -821,17 +815,19 @@ import TokenUsageSettingsLegacy from './TokenUsageSettingsLegacy.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 import BackgroundConvert from './BackgroundConvert.vue';
 import AppGlassCard from './AppGlassCard.vue';
+import ChatLayoutWidthCard from './ChatLayoutWidthCard.vue';
 import SystemSettings from './SystemSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
+import GrowthSettings from './GrowthSettings.vue';
 import DecisionSettings from './DecisionSettings.vue';
 import FeishuSettings from './FeishuSettings.vue';
+import CloudRelaySettings from './CloudRelaySettings.vue';
+import PetSettings from './PetSettings.vue';
 import PluginsSettings from './PluginsSettings.vue';
 import PluginSettingsPanel from './PluginSettingsPanel.vue';
 import HooksSettings from './HooksSettings.vue';
 import { useIsMobile } from '../composables/useViewport';
-import qrcodeWechat from '../assets/qrcode-wechat.png';
 import qrcodeFeishu from '../assets/qrcode-feishu.png';
-// 免责条款正文与版本号：设置页展示与首次使用确认弹窗共用同一事实源
 import {
   DISCLAIMER_CLAUSES as disclaimerClauses,
   DISCLAIMER_UPDATED_AT as disclaimerUpdatedAt,
@@ -841,28 +837,21 @@ import {
 import { parseModelTestError, type ParsedModelError } from '../utils/errorParser';
 
 const store = useAppStore();
-// 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
-// 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'bg-convert' | 'system' | 'persona' | 'decision' | 'feishu' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'pet' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 
-// ── 插件设置页入口（提供 plugin_settings 钩子的插件直接挂在左侧导航）────
 const PLUGIN_SECTION_PREFIX = 'plugin:';
-// 只有 has_settings === true（已启用且入口模块声明了设置页）的插件才进导航
 const pluginNavItems = computed(() => (store.plugins || []).filter((p: any) => p && p.has_settings));
 const activePluginName = computed(() =>
   activeSection.value.startsWith(PLUGIN_SECTION_PREFIX)
     ? activeSection.value.slice(PLUGIN_SECTION_PREFIX.length)
     : ''
 );
-// 刷新按钮自增该值，通知面板重新拉取设置页快照
 const pluginReloadKey = ref(0);
 function openPluginSection(name: string) {
   activeSection.value = `${PLUGIN_SECTION_PREFIX}${name}`;
 }
 
-// ── 会话归档分区（原侧栏底部「已归档」区搬入设置页）────────────
-// 归档列表不进主会话列表，故进入该分区时按需拉取（首次直接落在该分区也拉一次）。
 watch(activeSection, (section) => {
   if (section === 'session-archive') void store.loadArchivedSessions();
 }, { immediate: true });
@@ -884,9 +873,7 @@ const orderedArchivedSessions = computed(() => {
 type ArchiveSessionItem = (typeof store.archivedSessions)[number];
 interface ArchiveDirGroup {
   key: string;
-  /** 组头主标题：目录末级名；全局会话 / 无目录会话用固定文案 */
   label: string;
-  /** 组头副标题（完整路径，hover 可见），用于区分同名的不同目录 */
   path: string;
   sessions: ArchiveSessionItem[];
 }
@@ -901,7 +888,6 @@ const archiveGroups = computed<ArchiveDirGroup[]>(() => {
   const groups = new Map<string, ArchiveDirGroup>();
   for (const s of orderedArchivedSessions.value) {
     const workdir = (s.workdir || '').trim();
-    // 全局会话（workdir='GLOBAL'、is_global=true）不属于任何磁盘目录，单独成组
     const isGlobal = !!s.is_global || workdir.toUpperCase() === 'GLOBAL';
     const key = isGlobal ? '__GLOBAL__' : (workdir || '__UNKNOWN__');
     let group = groups.get(key);
@@ -919,7 +905,6 @@ const archiveGroups = computed<ArchiveDirGroup[]>(() => {
   return [...groups.values()];
 });
 
-/** 已收起的目录组 key：默认全部展开；设置页组件常驻，切分区再回来时保留收起状态 */
 const collapsedArchiveGroups = ref<string[]>([]);
 
 function archiveGroupCollapsed(key: string) {
@@ -932,7 +917,6 @@ function toggleArchiveGroup(key: string) {
   else collapsedArchiveGroups.value.push(key);
 }
 
-// 删除沿用侧栏归档区的两段确认：先点 ✕ 进入确认态，再点「确认」才真正删除
 const archiveConfirmName = ref('');
 
 function askArchiveDelete(name: string) {
@@ -944,14 +928,10 @@ function confirmArchiveDelete(name: string) {
   void store.deleteSingleSession(name);
 }
 
-// 取消归档：可逆操作，不弹确认框
 function restoreArchivedSession(name: string) {
   void store.unarchiveSession(name);
 }
 
-// ── 归档区批量管理（多选恢复 / 多选删除）────────────────────
-// 进入批量模式后每行左侧出现勾选框、行内单项操作隐藏；恢复沿用「可逆操作不弹确认框」
-// 的既有语义，删除则弹一次带数量提示的二次确认（与行内删除同一保护级别）。
 const archiveBatchMode = ref(false);
 const archiveSelected = ref<string[]>([]);
 const archiveBusy = ref(false);
@@ -981,7 +961,6 @@ function toggleArchiveSelectAll() {
     : orderedArchivedSessions.value.map(s => s.name);
 }
 
-/** 目录组在批量模式下的勾选态：all=整组已选 / some=半选 / none=未选（组头勾选框据此显示 indeterminate） */
 function archiveGroupSelectState(key: string): 'all' | 'some' | 'none' {
   const group = archiveGroups.value.find(g => g.key === key);
   if (!group || !group.sessions.length) return 'none';
@@ -990,7 +969,6 @@ function archiveGroupSelectState(key: string): 'all' | 'some' | 'none' {
   return picked === group.sessions.length ? 'all' : 'some';
 }
 
-/** 组头勾选：未全选则补齐该组全部会话，已全选则整组取消（按目录批量操作） */
 function toggleArchiveGroupSelect(key: string) {
   const group = archiveGroups.value.find(g => g.key === key);
   if (!group) return;
@@ -1008,7 +986,6 @@ async function batchRestoreArchived() {
   archiveBusy.value = true;
   const done = await store.batchUnarchiveSessions(names);
   archiveBusy.value = false;
-  // 只清成功项的勾选：失败项留在勾选里，用户可直接重试
   if (done.length) archiveSelected.value = archiveSelected.value.filter(n => !done.includes(n));
 }
 
@@ -1019,7 +996,7 @@ async function batchDeleteArchived() {
     '批量删除归档会话',
     `共 ${names.length} 个会话`,
     `确定要永久删除选中的 ${names.length} 个归档会话吗？对话记录会从数据库物理删除，无法恢复。`,
-    '确认删除 ⏎',
+    '确认删除',
   );
   if (!ok) return;
   archiveBusy.value = true;
@@ -1028,7 +1005,6 @@ async function batchDeleteArchived() {
   if (done.length) archiveSelected.value = archiveSelected.value.filter(n => !done.includes(n));
 }
 
-// 列表变化（本端操作或其它端同步）后：清掉已不在列表里的勾选；列表空时退出批量模式
 watch(orderedArchivedSessions, (list) => {
   const names = new Set(list.map(s => s.name));
   const kept = archiveSelected.value.filter(n => names.has(n));
@@ -1039,7 +1015,6 @@ watch(orderedArchivedSessions, (list) => {
   }
 });
 
-// ZCode 风格的紧凑相对时间：刚刚 / 5分钟 / 3小时 / 13天 / 2个月（与侧栏归档区同一口径）
 function relativeTime(archivedAt?: string) {
   if (!archivedAt) return '';
   const t = new Date(archivedAt.replace(' ', 'T')).getTime();
@@ -1056,9 +1031,6 @@ function relativeTime(archivedAt?: string) {
   if (mon < 12) return `${mon}个月`;
   return `${Math.floor(mon / 12)}年`;
 }
-// ── 手机端钻取式布局（≤768px）────────────────────────────────
-// 桌面：分区侧栏 + 厂商列表 + 详情三栏并排（isMobile=false，模板不变）。
-// 手机：厂商列表全宽；点选后列表/详情互斥显示，详情顶栏带"返回列表"。
 const isMobile = useIsMobile();
 const mobileDetail = ref(false);
 function openMobileDetail() { if (isMobile.value) mobileDetail.value = true; }
@@ -1087,9 +1059,6 @@ let copiedErrorTimer: ReturnType<typeof setTimeout> | null = null;
 const providerForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const customForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 
-// M33 修复：副模型状态不再在 setup 时一次性快照（会与 store 脱节，
-// 后端/其他入口变更后设置页显示陈旧值）。改为 computed 双向绑定，
-// 读始终取 store 当前值，写直接同步回 store（与 setSecondaryRoles 乐观更新语义一致）。
 const secondaryModelId = computed({
   get: () => store.secondaryModelId,
   set: (v: string) => { store.secondaryModelId = v; },
@@ -1103,10 +1072,8 @@ const modelModal = reactive({
   show: false,
   model_id: '',
   name: '',
-  // 打开弹窗时的原始模型名：用于判断用户是否改过名字（未改名不必探测）
   original_name: '',
   context_window: 128000,
-  // 最大输出：'' = 留空（请求时走内置默认表）
   max_tokens: '' as number | '',
   supports_vision: false,
   // 电脑操控能力契约（设计 9.1）：generic 必须同时具备视觉与工具调用；
@@ -1115,7 +1082,6 @@ const modelModal = reactive({
   supports_function_calling: true,
   computer_protocol: '' as ComputerProtocolChoice,
 });
-// 「获取模型列表」：拉取厂商 /v1/models 的一键填充候选
 const remoteModels = ref<{ id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[] | null>(null);
 const fetchingModels = ref(false);
 
@@ -1130,7 +1096,6 @@ const computerProtocolError = computed(() => (
   ? COMPUTER_PROTOCOL_GENERIC_REASON
   : '');
 
-// 外观与主题编辑器（常驻挂载，通过 defineExpose 暴露脏检查）
 const themeEditorRef = ref<InstanceType<typeof GuiThemeSettings> | null>(null);
 
 async function attemptCloseSettings() {
@@ -1162,7 +1127,6 @@ watch(selectedProvider, (provider) => {
   showProviderKey.value = false;
 }, { immediate: true });
 
-// 输入框为空但后端已配置 Key 时，按需从后端取回明文填入（快照不含明文）
 async function revealProviderKey(): Promise<boolean> {
   const provider = selectedProvider.value;
   if (!provider) return false;
@@ -1230,7 +1194,6 @@ function selectProvider(id: string) {
   openMobileDetail();
 }
 
-// 点击左侧"副模型"入口：右侧切换到副模型设置面板
 function selectSecondary() {
   selectedKind.value = 'secondary';
   selectedId.value = '';
@@ -1239,9 +1202,6 @@ function selectSecondary() {
 }
 
 function startCustomProvider() {
-  // customForm 与设置页同生命周期：上次填写/保存后不重置，再次进入会看到
-  // 上一次的名称、Base URL 甚至 API Key 明文（表现为"历史缓存"）。
-  // 仅在从其它视图进入时重置，已在表单中重复点击则保留正在编辑的内容。
   if (selectedKind.value !== 'custom') {
     customForm.name = '';
     customForm.base_url = '';
@@ -1323,9 +1283,7 @@ function openModelModal(model?: ModelInfo) {
   modelModal.context_window = model?.context_window || 128000;
   modelModal.max_tokens = model?.max_tokens || '';
   modelModal.supports_vision = model?.supports_vision || false;
-  // 新增模型默认支持工具调用；编辑时保留该模型的既有值（显式关闭仍是关闭）
   modelModal.supports_function_calling = model ? !!model.supports_function_calling : true;
-  // 后端缺键模型返回 ''（自动）；显式 none/generic/native_openai 原样回填
   modelModal.computer_protocol = model?.computer_protocol || '';
   remoteModels.value = null;
 }
@@ -1350,7 +1308,6 @@ function pickRemoteModel(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
   if (!value) return;
   modelModal.name = value;
-  // 厂商元数据 + 本地规格表：能填的都填（未提供的字段保持表单原值）
   const entry = (remoteModels.value || []).find((m) => m.id === value);
   if (!entry) return;
   if (entry.context_window && entry.context_window > 0) {
@@ -1382,7 +1339,6 @@ async function saveModel() {
     return;
   }
   saving.value = true;
-  // 最大输出：留空 = 0（后端语义：新增不落键 / 编辑清除键，回到内置默认）
   const maxTokens = modelModal.max_tokens === '' ? 0 : Number(modelModal.max_tokens);
   // 思考设置在编辑弹窗里已下线：一律传 null（后端语义 = 不落键、不改动既有配置），
   // 避免改上下文窗口这类无关操作意外覆盖用户已保存的思考档位。
@@ -1451,7 +1407,6 @@ async function onSecondaryRolesChange() {
   await store.setSecondaryRoles({ ...secondaryRoles.value });
 }
 
-// ── 权限与沙盒分区：加载/清空当前项目的持久化白名单 ──
 const permRules = ref<{ commands: string[]; write_files: string[]; edit_files: string[] } | null>(null);
 const permClearing = ref(false);
 type PermissionRuleType = 'command' | 'write' | 'edit';
@@ -1473,7 +1428,6 @@ async function loadPermRules() {
       };
     }
   } catch {
-    // 后端未就绪时静默忽略，保留上次结果
   }
 }
 
@@ -1561,15 +1515,10 @@ function handleAboutUpdateClick() {
   }
 }
 
-// ------------------------------------------------------------------
-// 更新内容（关于页）：随安装包发布的 assets/CHANGELOG.md
-// ------------------------------------------------------------------
 const changelogEntries = ref<ChangelogEntry[]>([]);
 const changelogLoaded = ref(false);
 const showChangelogHistory = ref(false);
 
-// 当前版本条目：优先精确匹配运行版本号，匹配不到（如源码跑未发布版本）
-// 则回落到文件里的最新一条，保证关于页始终有内容可看
 const currentEntry = computed<ChangelogEntry | null>(() => {
   if (!changelogEntries.value.length) return null;
   return (
@@ -1586,27 +1535,23 @@ const currentEntry = computed<ChangelogEntry | null>(() => {
 // core/disclaimer_consent.py 的 DISCLAIMER_VERSION（否则已同意旧版本的
 // 用户不会重新看到确认弹窗）。
 
-// ------------------------------------------------------------------
-// 联系我们页
-// ------------------------------------------------------------------
-const contactEmail = 'contact@xingyaocode.cn';
-const emailCopied = ref(false);
+const contactEmails = ['fchyjy@qq.com', 'fengchen122123@gmail.com'];
+const copiedEmail = ref('');
 const enlargedQr = ref<{ src: string; alt: string } | null>(null);
 let emailCopyTimer: ReturnType<typeof setTimeout> | null = null;
 
-async function copyEmail() {
+async function copyEmail(mail: string) {
   try {
-    await navigator.clipboard.writeText(contactEmail);
+    await navigator.clipboard.writeText(mail);
   } catch {
     // 剪贴板 API 不可用时静默失败
   }
-  emailCopied.value = true;
+  copiedEmail.value = mail;
   if (emailCopyTimer) clearTimeout(emailCopyTimer);
-  emailCopyTimer = setTimeout(() => { emailCopied.value = false; }, 2000);
+  emailCopyTimer = setTimeout(() => { copiedEmail.value = ''; }, 2000);
 }
 
 onMounted(async () => {
-  // 插件导航项依赖 has_settings，进设置页先刷一次插件列表（store 内部已静默失败）
   void store.refreshPlugins();
   // 直接读 window.pywebview 而非 store._api()：后者为空时会弹
   // "连接失败" 模态框，更新内容拉取失败不该打扰用户
@@ -1619,7 +1564,6 @@ onMounted(async () => {
     const res = await api.get_changelog();
     if (res && res.ok) changelogEntries.value = res.entries || [];
   } catch {
-    // 更新内容属展示性信息，失败静默（关于页显示"暂无更新说明"）
   } finally {
     changelogLoaded.value = true;
   }
@@ -1627,105 +1571,337 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.settings-page { position: relative; flex: 1; min-width: 0; z-index: 80; display: flex; background: var(--bg0); color: var(--text); }
-/* 导航列：条目多于一屏时自身滚动（min-height:0 是 flex 子项允许收缩的前提，
-   否则内容溢出可见、按钮被压扁，底部用户区被顶到容器外与状态栏重叠） */
-.settings-nav { width: 220px; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 22px 12px 14px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
-/* 导航项不参与纵向压缩，宁可整体滚动也不压扁按钮 */
+.settings-page {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  z-index: 80;
+  display: flex;
+  padding: 0 8px 8px;
+  background: var(--xy-bg, var(--bg0));
+  color: var(--xy-text, var(--text));
+}
+.settings-nav {
+  width: 224px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 10px 12px;
+  background: var(--xy-sidebar, transparent);
+  border-right: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
 .settings-nav > * { flex-shrink: 0; }
-.back-workspace, .nav-item { width: 100%; border: 0; background: transparent; color: var(--text-dim); text-align: left; border-radius: 9px; padding: 10px 12px; }
-.back-workspace:hover, .nav-item:hover { color: var(--text); background: var(--bg2); }
-.nav-section { margin: 28px 12px 8px; color: var(--text-faint); font-size: 11px; }
-.nav-item { display: flex; gap: 10px; align-items: center; font-size: 13px; }
-.nav-item.active { background: var(--bg3); color: var(--text); }
-.nav-spacer { flex: 1; }
-.settings-user { display: flex; align-items: center; gap: 10px; padding: 10px; color: var(--text-dim); font-size: 12px; }
-.settings-user span:nth-child(2) { flex: 1; font-weight: 600; }
-.avatar { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: var(--bg3); color: var(--text); }
-.settings-main { flex: 1; min-width: 0; overflow: auto; padding: 46px 5vw; }
-.settings-header { max-width: 1120px; margin: 0 auto 26px; display: flex; align-items: flex-end; justify-content: space-between; }
-/* 权限与沙盒 / 关于：正文卡片宽度 860px，标题栏收窄到同宽，保证左边缘对齐且整体居中 */
+.back-workspace, .nav-item {
+  width: 100%;
+  min-height: 32px;
+  border: 0;
+  background: transparent;
+  color: var(--xy-text-2, var(--text-dim));
+  text-align: left;
+  border-radius: 8px;
+  padding: 6px 10px;
+  transition: background .15s ease, color .15s ease;
+}
+.back-workspace {
+  margin-bottom: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.back-workspace:hover, .nav-item:hover {
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg2));
+}
+.nav-section {
+  margin: 14px 10px 4px;
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.nav-section--first { margin-top: 8px; }
+.nav-item { display: flex; gap: 9px; align-items: center; font-size: 13px; }
+.nav-item .nav-ico {
+  display: inline-flex;
+  align-items: center;
+  color: var(--xy-text-3, var(--text-faint));
+  transition: color .15s ease;
+}
+.nav-item:hover .nav-ico,
+.nav-item.active .nav-ico {
+  color: var(--xy-text, var(--text));
+}
+.nav-item.active {
+  background: var(--xy-active, var(--bg3));
+  color: var(--xy-text, var(--text));
+  font-weight: 500;
+}
+.nav-spacer { flex: 1; min-height: 12px; }
+.settings-user {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 6px;
+  padding: 10px 8px 2px;
+  border-top: 1px solid var(--xy-border, var(--border));
+  color: var(--xy-text-2, var(--text-dim));
+  font-size: 12.5px;
+}
+.settings-user span:nth-child(2) {
+  flex: 1;
+  font-weight: 500;
+  color: var(--xy-text, var(--text));
+}
+.avatar {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--xy-text, var(--text));
+  color: var(--xy-canvas, var(--bg0));
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.settings-main {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 32px 4vw 40px;
+  border-radius: 16px;
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg1));
+  box-shadow: var(--xy-shadow-sm, none);
+}
+:global(html[data-gui-theme-id="builtin.light"]) .settings-main,
+:global(html[data-gui-theme-id="builtin.dark"]) .settings-main,
+:global(html:not([data-gui-theme-id])) .settings-main {
+  --bg0: var(--xy-canvas);
+  --bg1: var(--xy-card);
+  --bg2: var(--xy-surface);
+  --bg3: var(--xy-hover);
+  --border: var(--xy-border);
+}
+.settings-main :deep(.usage-header h1),
+.settings-main :deep(.settings-header h1) {
+  margin: 0 0 6px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.settings-header {
+  max-width: 1080px;
+  margin: 0 auto 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
 .settings-header--narrow { max-width: 860px; }
-.settings-header h1 { margin: 0 0 10px; font-size: 32px; letter-spacing: -1px; }
-.settings-header p, .detail-title-row p { margin: 0; color: var(--text-faint); font-size: 13px; }
-.icon-button { background: transparent; color: var(--text-dim); border: 0; font-size: 20px; }
-.model-settings-card { max-width: 1120px; min-height: 610px; margin: 0 auto; display: grid; grid-template-columns: 280px minmax(0, 1fr); border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); overflow: hidden; }
-.provider-list { padding: 16px 12px; border-right: 1px solid var(--border); background: var(--bg2); overflow-y: auto; }
-.list-label { padding: 4px 10px 10px; color: var(--text-faint); font-size: 11px; font-weight: 600; }
-.provider-empty { padding: 12px 10px; color: var(--text-faint); font-size: 11px; }
-.provider-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; }
-.provider-item:hover, .provider-item.active { background: var(--bg3); color: var(--text); }
-.provider-item.active { border-color: var(--border); }
-.provider-logo { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 7px; background: var(--accent-soft); color: var(--accent); font-size: 11px; }
-.provider-logo.cube { background: transparent; color: var(--text-dim); font-size: 18px; }
+.settings-header h1 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--xy-text, var(--text));
+}
+.settings-header p, .detail-title-row p {
+  margin: 0;
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 12.5px;
+}
+.icon-button {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2, var(--text-dim));
+  border: 1px solid var(--xy-border, var(--border));
+  transition: background .15s ease, color .15s ease;
+}
+.icon-button:hover {
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
+}
+.model-settings-card {
+  max-width: 1080px;
+  min-height: 580px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  border: 1px solid var(--xy-border, var(--border));
+  border-radius: 14px;
+  background: var(--xy-card, var(--bg1));
+  overflow: hidden;
+}
+.provider-list {
+  padding: 14px 10px;
+  border-right: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-surface, var(--bg2));
+  overflow-y: auto;
+}
+.list-label {
+  padding: 4px 10px 8px;
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 11px;
+  font-weight: 600;
+}
+.provider-empty { padding: 12px 10px; color: var(--xy-text-3, var(--text-faint)); font-size: 12px; }
+.provider-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2, var(--text-dim));
+  text-align: left;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+.provider-item:hover {
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
+}
+.provider-item.active {
+  background: var(--xy-card, var(--bg1));
+  border-color: var(--xy-border, var(--border));
+  color: var(--xy-text, var(--text));
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+.provider-logo { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 6px; background: var(--xy-accent-soft, var(--accent-soft)); color: var(--xy-accent, var(--accent)); font-size: 11px; }
+.provider-logo.cube { background: transparent; color: var(--xy-text-3, var(--text-dim)); font-size: 16px; }
+.provider-item.active .provider-logo.cube { color: var(--xy-text, var(--text)); }
 .provider-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.provider-state { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
-.provider-state.ready { background: var(--green); }
-.add-provider-row { width: 100%; margin-top: 10px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; display: flex; align-items: center; justify-content: space-between; }
-.add-provider-row:hover { border-color: var(--accent); color: var(--accent); }
-.add-provider-row.active { border-color: var(--accent); color: var(--accent); background: var(--bg3); }
-.add-provider-choices { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
-.custom-provider-row { margin-top: 10px; }
-/* 副模型入口：位于左侧列表底部（添加厂商下方），点击后在右侧设置副模型 */
-.secondary-entry-row {
+.provider-state { width: 6px; height: 6px; border-radius: 50%; background: var(--xy-text-3, var(--text-faint)); }
+.provider-state.ready { background: var(--xy-green, var(--green)); }
+.add-provider-row {
   width: 100%;
   margin-top: 10px;
-  padding: 9px 10px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
+  padding: 8px 10px;
+  border: 1px dashed var(--xy-border-strong, var(--border));
+  border-radius: 8px;
   background: transparent;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
+  font-size: 12.5px;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transition: border-color .15s ease, color .15s ease, background .15s ease;
+}
+.add-provider-label { display: inline-flex; align-items: center; gap: 6px; }
+.add-provider-row:hover { border-color: var(--xy-accent, var(--accent)); color: var(--xy-accent, var(--accent)); }
+.add-provider-row.active { border-color: var(--xy-accent, var(--accent)); color: var(--xy-accent, var(--accent)); background: var(--xy-accent-soft, var(--bg3)); }
+.add-provider-choices { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--xy-border, var(--border)); }
+.custom-provider-row { margin-top: 10px; }
+.secondary-entry-row {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--xy-border, var(--border));
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2, var(--text-dim));
   text-align: left;
   display: flex;
   align-items: center;
   gap: 9px;
+  transition: border-color .15s ease, color .15s ease, background .15s ease;
 }
 .secondary-entry-row:hover, .secondary-entry-row.active {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--bg3);
+  border-color: var(--xy-accent, var(--accent));
+  color: var(--xy-accent, var(--accent));
+  background: var(--xy-card, var(--bg1));
 }
-.secondary-entry-row .provider-logo { background: var(--bg3); color: var(--text-dim); }
-.secondary-entry-row.active .provider-logo { color: var(--accent); }
+.secondary-entry-row .provider-logo { background: var(--xy-hover, var(--bg3)); color: var(--xy-text-2, var(--text-dim)); }
+.secondary-entry-row.active .provider-logo { background: var(--xy-accent-soft, var(--accent-soft)); color: var(--xy-accent, var(--accent)); }
 .secondary-entry-row .provider-name { font-size: 13px; }
-.provider-detail { min-width: 0; padding: 38px; overflow-y: auto; }
-.detail-title-row { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 28px; }
-/* 标题列允许收缩：长厂商名不再把右侧删除按钮挤出可见区（名称本身已按 6 字符截断） */
+.provider-detail { min-width: 0; padding: 28px 32px; overflow-y: auto; }
+.detail-title-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; margin-bottom: 22px; }
 .detail-title-row > div { min-width: 0; }
-.detail-title-row h2 { margin: 0 0 8px; font-size: 20px; }
+.detail-title-row h2 { margin: 0 0 6px; font-size: 18px; font-weight: 600; color: var(--xy-text, var(--text)); }
 .detail-title-row h2.detail-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.protocol-badge, .vision-tag { align-self: flex-start; padding: 4px 9px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-faint); font-size: 11px; }
-.field-label { display: block; margin: 16px 0 7px; color: var(--text-dim); font-size: 12px; }
-.text-field, .readonly-field, .key-field { width: 100%; min-height: 42px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--text); font-size: 13px; }
-.text-field { padding: 0 13px; }
-.readonly-field { display: flex; align-items: center; padding: 0 13px; color: var(--text-dim); }
+.protocol-badge, .vision-tag { align-self: flex-start; padding: 3px 8px; border: 1px solid var(--xy-border, var(--border)); border-radius: 7px; color: var(--xy-text-3, var(--text-faint)); font-size: 11px; }
+.field-label { display: block; margin: 14px 0 6px; color: var(--xy-text-2, var(--text-dim)); font-size: 12px; font-weight: 500; }
+.text-field, .readonly-field, .key-field {
+  width: 100%;
+  min-height: 38px;
+  box-sizing: border-box;
+  border: 1px solid var(--xy-border, var(--border));
+  border-radius: 9px;
+  background: var(--xy-surface, var(--bg2));
+  color: var(--xy-text, var(--text));
+  font-size: 13px;
+  transition: border-color .15s ease, background .15s ease;
+}
+.text-field:focus,
+.key-field:focus-within {
+  border-color: var(--xy-accent, var(--accent));
+  background: var(--xy-card, var(--bg1));
+  outline: none;
+}
+.text-field { padding: 0 12px; }
+.readonly-field { display: flex; align-items: center; padding: 0 12px; color: var(--xy-text-2, var(--text-dim)); }
 .key-field { display: flex; align-items: center; overflow: hidden; }
-.key-field input { flex: 1; min-width: 0; height: 40px; padding: 0 13px; border: 0; background: transparent; color: var(--text); outline: 0; }
-/* 多 Key textarea：一行一个 Key；隐藏态用 -webkit-text-security 遮蔽（textarea 不支持 type=password） */
-.key-field textarea { flex: 1; min-width: 0; min-height: 76px; padding: 10px 13px; border: 0; background: transparent; color: var(--text); outline: 0; resize: vertical; font-family: var(--mono); font-size: 13px; line-height: 1.5; box-sizing: border-box; }
+.key-field input { flex: 1; min-width: 0; height: 36px; padding: 0 12px; border: 0; background: transparent; color: var(--xy-text, var(--text)); outline: 0; }
+.key-field textarea { flex: 1; min-width: 0; min-height: 72px; padding: 9px 12px; border: 0; background: transparent; color: var(--xy-text, var(--text)); outline: 0; resize: vertical; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; box-sizing: border-box; }
 .key-field .key-masked { -webkit-text-security: disc; }
-.key-field button, .row-actions button { border: 0; background: transparent; color: var(--text-faint); }
-.key-field button { padding: 0 13px; }
-.key-field .icon-button { display: flex; align-items: center; padding: 0 10px; cursor: pointer; }
+.key-field button, .row-actions button { border: 0; background: transparent; color: var(--xy-text-3, var(--text-faint)); font-size: 12px; }
+.key-field button { padding: 0 12px; }
+.key-field button:hover { color: var(--xy-text, var(--text)); }
+.key-field .icon-button { width: auto; height: auto; border: 0; display: flex; align-items: center; padding: 0 10px; cursor: pointer; }
 .key-field .icon-button:disabled { opacity: 0.4; cursor: default; }
 .mono { font-family: var(--mono); }
-.model-preview-title { margin: 24px 0 9px; color: var(--text-dim); font-size: 12px; }
-.preset-models, .configured-models { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-.configured-model-item { border-bottom: 1px solid var(--border); }
+.model-preview-title { margin: 22px 0 9px; color: var(--xy-text-2, var(--text-dim)); font-size: 12px; }
+.preset-models, .configured-models { border: 1px solid var(--xy-border, var(--border)); border-radius: 10px; overflow: hidden; background: var(--xy-card, transparent); }
+.configured-model-item { border-bottom: 1px solid var(--xy-border, var(--border)); }
 .configured-model-item:last-child { border-bottom: 0; }
-.preset-model-row, .configured-model-row { min-height: 48px; display: flex; align-items: center; gap: 14px; padding: 0 14px; font-size: 12px; }
-.preset-model-row { border-bottom: 1px solid var(--border); }
+.preset-model-row, .configured-model-row { min-height: 44px; display: flex; align-items: center; gap: 12px; padding: 0 14px; font-size: 12.5px; }
+.preset-model-row { border-bottom: 1px solid var(--xy-border, var(--border)); }
 .preset-model-row:last-child { border-bottom: 0; }
-.preset-model-row .mono { flex: 1; color: var(--text); }
+.preset-model-row .mono { flex: 1; color: var(--xy-text, var(--text)); }
 .vision-tag { padding: 2px 7px; flex-shrink: 0; white-space: nowrap; }
-.vision-tag.on { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, var(--border)); }
-.model-meta-ctx { flex-shrink: 0; white-space: nowrap; color: var(--text-dim); }
-.primary-button, .secondary-button { min-height: 38px; margin-top: 20px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--border); font-weight: 600; }
-.primary-button { background: var(--text); color: var(--bg0); }
-.secondary-button { background: var(--bg3); color: var(--text); }
-.secondary-button.compact { margin: 0; min-height: 34px; }
-.danger-icon { border: 0; background: transparent; color: var(--text-faint); font-size: 18px; }
-.danger-icon:hover, .row-actions .danger:hover { color: var(--red); }
+.vision-tag.on { color: var(--xy-green, var(--green)); border-color: color-mix(in srgb, var(--xy-green, var(--green)) 35%, var(--xy-border, var(--border))); }
+.model-meta-ctx { flex-shrink: 0; white-space: nowrap; color: var(--xy-text-3, var(--text-dim)); font-family: var(--mono); font-size: 11.5px; }
+.primary-button, .secondary-button {
+  min-height: 34px;
+  margin-top: 16px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid var(--xy-border, var(--border));
+  font-size: 12.5px;
+  font-weight: 500;
+  transition: background .15s ease, border-color .15s ease, opacity .15s ease;
+}
+.primary-button { background: var(--xy-text, var(--text)); color: var(--xy-canvas, var(--bg0)); border-color: transparent; }
+.primary-button:hover:not(:disabled) { opacity: 0.88; }
+.secondary-button { background: var(--xy-card, var(--bg1)); color: var(--xy-text, var(--text)); }
+.secondary-button:hover:not(:disabled) { background: var(--xy-hover, var(--bg3)); }
+.secondary-button.compact { margin: 0; min-height: 30px; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.danger-icon {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--xy-text-3, var(--text-faint));
+}
+.danger-icon:hover { background: var(--xy-rose-soft, rgba(220, 38, 38, 0.08)); color: var(--xy-rose, var(--red)); }
+.row-actions .danger:hover { color: var(--xy-rose, var(--red)); }
 .model-list-header { display: flex; align-items: center; justify-content: space-between; margin: 34px 0 10px; }
 .model-list-actions { display: flex; align-items: center; gap: 8px; }
 .model-list-header h3 { margin: 0 0 4px; font-size: 14px; }
@@ -1747,7 +1923,6 @@ onMounted(async () => {
 .row-actions button { flex-shrink: 0; white-space: nowrap; }
 .row-actions button:hover { color: var(--accent); }
 
-/* ---------- 方案 B：模型测试失败行内微型警告条 ---------- */
 .model-error-banner {
   display: flex;
   align-items: center;
@@ -1823,22 +1998,23 @@ onMounted(async () => {
   background: color-mix(in srgb, var(--red) 12%, transparent);
 }
 .empty-models, .empty-detail { padding: 48px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
-.modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; background: rgba(0, 0, 0, .68); backdrop-filter: blur(8px); }
-.model-modal { width: min(560px, calc(100vw - 40px)); padding: 24px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); }
+.modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; padding: 16px; background: var(--xy-modal-mask, rgba(0, 0, 0, .36)); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.model-modal { width: min(560px, calc(100vw - 40px)); padding: 24px; box-sizing: border-box; border: 1px solid var(--xy-border-strong, var(--border)); border-radius: 16px; background: var(--xy-card, var(--bg2)); box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, .35)); }
 .modal-field-row { display: flex; gap: 12px; }
 .modal-field-row .modal-field { flex: 1; min-width: 0; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; }
 .modal-head h3 { margin: 0; }
 .modal-head button { border: 0; background: transparent; color: var(--text-dim); font-size: 20px; }
 
-/* ---------- 联系我们页 ---------- */
 .contact-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
 .contact-card { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 24px 18px; background: var(--bg1); border: 1px solid var(--border); border-radius: 10px; transition: border-color 0.2s; }
 .contact-card:hover { border-color: var(--text-faint); }
 .contact-card-icon { width: 44px; height: 44px; border-radius: 10px; background: var(--bg2); display: flex; align-items: center; justify-content: center; color: var(--text-dim); margin-bottom: 14px; }
 .contact-card h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
 .contact-desc { margin: 0 0 14px; font-size: 12px; color: var(--text-dim); }
-.contact-value { font-size: 14px; padding: 8px 14px; background: var(--bg2); border-radius: 6px; margin-bottom: 14px; word-break: break-all; }
+.contact-mail-list { display: flex; flex-direction: column; gap: 18px; width: 100%; }
+.contact-mail-item { display: flex; flex-direction: column; align-items: center; }
+.contact-value { font-size: 14px; padding: 8px 14px; background: var(--bg2); border-radius: 6px; margin-bottom: 14px; word-break: break-all; max-width: 100%; }
 .contact-copy-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; font-size: 12px; }
 .contact-copy-btn.copied { opacity: 0.85; }
 .contact-qr-wrap { width: 170px; aspect-ratio: 2 / 3; height: auto; border-radius: 8px; overflow: hidden; background: #fff; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; padding: 6px; cursor: zoom-in; transition: transform 0.15s; }
@@ -1848,7 +2024,6 @@ onMounted(async () => {
 .qr-enlarge-img { max-width: 80vw; max-height: 80vh; border-radius: 12px; box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5); }
 .contact-expiry { margin: 0; font-size: 11px; color: var(--text-faint); }
 
-/* ---------- 关于页 · 更新内容 ---------- */
 .changelog-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .changelog-head h3 { margin: 0; }
 .changelog-version { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
@@ -1857,7 +2032,7 @@ onMounted(async () => {
 .changelog-notes { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
 .changelog-notes li { font-size: 12.5px; line-height: 1.55; color: var(--text-dim); }
 .changelog-empty { font-size: 12.5px; color: var(--text-faint); margin: 4px 0; }
-.changelog-modal { width: min(620px, calc(100vw - 40px)); max-height: min(72vh, 640px); padding: 24px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); display: flex; flex-direction: column; }
+.changelog-modal { width: min(620px, calc(100vw - 40px)); max-height: min(72vh, 640px); padding: 24px; box-sizing: border-box; border: 1px solid var(--xy-border-strong, var(--border)); border-radius: 16px; background: var(--xy-card, var(--bg2)); box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, .35)); display: flex; flex-direction: column; }
 .changelog-history-list { flex: 1; min-height: 0; overflow-y: auto; margin-top: 14px; padding-right: 6px; display: flex; flex-direction: column; gap: 18px; }
 .changelog-history-item { border-left: 2px solid var(--border); padding-left: 14px; }
 .changelog-history-item:first-child { border-left-color: var(--accent); }
@@ -1869,16 +2044,13 @@ onMounted(async () => {
 .role-choice { display: flex; align-items: flex-start; gap: 9px; padding: 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg1); color: var(--text); }
 .role-choice span { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
 .role-choice small { color: var(--text-faint); }
-.modal-field-error { margin: 8px 0 0; color: var(--danger); font-size: 12px; line-height: 1.6; }
+.modal-field-error { margin: 8px 0 0; color: var(--red); font-size: 12px; line-height: 1.6; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 
-/* ── 权限与沙盒分区 ── */
-.perm-settings-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
-/* 插件设置页分区：与其它分区同款卡片外框，面板自带内边距 */
-.plugin-nav-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); overflow: hidden; }
-.plugin-nav-card :deep(.provider-detail) { padding: 26px 28px; }
+.perm-settings-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--xy-border, var(--border)); border-radius: 14px; background: var(--xy-card, var(--bg1)); padding: 10px 26px 26px; }
+.plugin-nav-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--xy-border, var(--border)); border-radius: 14px; background: var(--xy-card, var(--bg1)); overflow: hidden; }
+.plugin-nav-card :deep(.provider-detail) { padding: 24px 26px; }
 
-/* ── 免责条款分区（法律声明）── */
 .disclaimer-card { padding: 6px 32px 30px; }
 .disclaimer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 18px 0 2px; color: var(--text-faint); font-size: 12px; }
 .disclaimer-meta .mono { color: var(--text-dim); }
@@ -1892,9 +2064,9 @@ onMounted(async () => {
 .disclaimer-foot { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }
 .disclaimer-foot p { margin: 0 0 6px; color: var(--text-faint); font-size: 12px; line-height: 1.8; }
 
-/* ── 外观与主题分区 ── */
 .appearance-section { width: 100%; min-width: 0; }
-.appearance-settings-card { width: 100%; min-width: 0; max-width: 1120px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 22px 24px; }
+.appearance-section > :deep(.app-glass-card) { max-width: 1080px; margin-left: auto; margin-right: auto; }
+.appearance-settings-card { width: 100%; min-width: 0; max-width: 1080px; margin: 0 auto; border: 1px solid var(--xy-border, var(--border)); border-radius: 14px; background: var(--xy-card, var(--bg1)); padding: 20px 24px; }
 .perm-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--border); }
 .perm-row h3 { margin: 0 0 6px; font-size: 14px; }
 .perm-row p { margin: 0; color: var(--text-faint); font-size: 12.5px; }
@@ -1913,10 +2085,8 @@ onMounted(async () => {
 .wl-remove { flex: none; border: 0; background: transparent; color: var(--red); cursor: pointer; padding: 4px 6px; }
 .wl-empty { padding: 26px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
 
-/* ── 会话归档分区 ── */
 .archive-settings-card { padding: 8px 24px 20px; }
 .archive-head-actions { display: flex; align-items: center; gap: 10px; }
-/* 目录分组：组间靠一行细分隔线区分（组内末行自带的下边框已由 .archive-row:last-child 去掉） */
 .archive-group + .archive-group { border-top: 1px solid var(--border); }
 .archive-group-head { display: flex; align-items: center; gap: 10px; padding: 10px 0 8px; }
 .archive-check--group { padding-left: 2px; }
@@ -1932,7 +2102,6 @@ onMounted(async () => {
 .archive-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--border); }
 .archive-row:last-child { border-bottom: 0; }
 .archive-row.confirming { background: rgba(239, 68, 68, 0.08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
-/* 批量模式下被勾选的行给一层浅色底：滚动长列表时也不丢选中位置 */
 .archive-row.picked { background: rgba(99, 102, 241, 0.08); border-radius: 8px; padding-left: 8px; padding-right: 8px; }
 .archive-main { flex: 1; min-width: 0; }
 .archive-main--pick { cursor: pointer; }
@@ -1951,11 +2120,8 @@ onMounted(async () => {
 .archive-del-btn { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--border); border-radius: 7px; background: transparent; color: var(--text-faint); cursor: pointer; }
 .archive-del-btn:hover { color: var(--red); border-color: var(--red); }
 .archive-del-btn--confirm { width: auto; padding: 0 9px; border-color: var(--red); color: var(--red); font-size: 11.5px; }
-/* ── 手机端钻取式布局（≤768px）──────────────────────────────
-   分区导航变顶部横滑条；模型配置卡片单列，列表/详情互斥显示。
-   仅在窄断点生效，桌面端布局不受任何影响。 */
 .mobile-detail-back {
-  display: none; /* 桌面端隐藏；详情返回按钮仅手机端渲染 */
+  display: none;
   align-items: center;
   gap: 6px;
   width: fit-content;
@@ -1973,24 +2139,26 @@ onMounted(async () => {
   .provider-detail { padding: 24px; }
 }
 @media (max-width: 768px) {
-  /* 页面纵向布局：导航在上、内容在下 */
-  .settings-page--mobile { flex-direction: column; }
+  .settings-page--mobile {
+    flex-direction: column;
+    padding: 0;
+  }
 
-  /* 分区导航 → 顶部横滑胶囊条；分组标题与底部用户区隐藏 */
   .settings-page--mobile .settings-nav {
     width: auto;
     flex-direction: row;
     align-items: center;
-    gap: 7px;
-    padding: 10px 10px;
+    gap: 6px;
+    padding: 8px 10px;
+    background: var(--xy-bg, var(--bg1));
     border-right: 0;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--xy-border, var(--border));
     overflow-x: auto;
     overflow-y: hidden; /* 横滑胶囊条只横向滚动，避免出现多余的纵向滚动条 */
     -webkit-overflow-scrolling: touch;
     flex: none;
   }
-  .settings-page--mobile .back-workspace { width: auto; flex: none; color: var(--accent); font-weight: 600; padding: 8px 4px; }
+  .settings-page--mobile .back-workspace { width: auto; flex: none; color: var(--xy-accent, var(--accent)); font-weight: 500; padding: 6px 6px; }
   .settings-page--mobile .nav-section,
   .settings-page--mobile .nav-spacer,
   .settings-page--mobile .settings-user { display: none; }
@@ -1999,20 +2167,32 @@ onMounted(async () => {
     /* 基础样式为纵向侧栏设计的 width:100% 必须复位，否则每个 chip 占满
        一整屏宽，7 个分区要横向拖 7 屏（width:100% + flex:none 不收缩） */
     width: auto;
-    border: 1px solid var(--border);
+    min-height: 28px;
+    border: 1px solid var(--xy-border, var(--border));
     border-radius: 999px;
-    padding: 5px 11px;
-    font-size: 12.5px;
+    padding: 4px 11px;
+    font-size: 12px;
+    background: var(--xy-canvas, transparent);
   }
-  .settings-page--mobile .nav-item.active { background: var(--bg3); }
+  .settings-page--mobile .nav-item.active {
+    background: var(--xy-text, var(--text));
+    color: var(--xy-canvas, var(--bg0));
+    border-color: transparent;
+  }
+  .settings-page--mobile .nav-item.active .nav-ico {
+    color: var(--xy-canvas, var(--bg0));
+  }
 
-  /* 内容区：去大留白 */
-  .settings-page--mobile .settings-main { padding: 16px 12px 22px; }
+  .settings-page--mobile .settings-main {
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 16px 14px 24px;
+  }
   .settings-page--mobile .settings-header { margin-bottom: 14px; }
-  .settings-page--mobile .settings-header h1 { font-size: 24px; letter-spacing: -0.5px; }
+  .settings-page--mobile .settings-header h1 { font-size: 20px; letter-spacing: -0.02em; }
   .settings-page--mobile .settings-header p, .settings-page--mobile .detail-title-row p { font-size: 12px; }
 
-  /* 模型配置卡片：单列全宽；列表/详情由 v-show + isMobile 互斥显示 */
   .settings-page--mobile .model-settings-card {
     grid-template-columns: minmax(0, 1fr);
     min-height: 0;
@@ -2023,7 +2203,6 @@ onMounted(async () => {
   .settings-page--mobile .detail-title-row { flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
   .settings-page--mobile .mobile-detail-back { display: inline-flex; }
 
-  /* 其余分区的卡片跟随收紧（Token 统计等子组件自带适配，此处只调容器） */
   .settings-page--mobile .perm-settings-card { padding: 6px 16px 20px; }
   .settings-page--mobile .plugin-nav-card :deep(.provider-detail) { padding: 18px 16px 22px; }
   .settings-page--mobile .whitelist-head { align-items: flex-start; flex-direction: column; }

@@ -1,5 +1,4 @@
 <template>
-  <!-- 近 7 天字数趋势：纯 CSS 柱状图（不引图表库），柱高按本组最大值归一 -->
   <div class="novel-daily">
     <div v-if="bars.length > 0" class="novel-daily-chart" data-test="novel-daily-chart">
       <div v-for="bar in bars" :key="bar.date" class="novel-daily-col">
@@ -26,11 +25,9 @@ import { computed } from 'vue';
 import type { NovelWorkbenchDailyDto } from '../types/pywebview.d';
 
 const props = defineProps<{
-  /** 近期字数项：来自 get_novel_workbench 的 recent_daily（后端固定 7 项、按日期升序） */
   rows: NovelWorkbenchDailyDto[];
 }>();
 
-// 柱子可视区高度（px）：与 .novel-daily-bars 的 height 保持一致
 const CHART_HEIGHT = 72;
 
 function toInt(value: unknown): number {
@@ -38,7 +35,6 @@ function toInt(value: unknown): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
-// 日期标签取 YYYY-MM-DD 的 5-10 位（MM-DD），缺字符时原样显示
 function shortDate(date: string): string {
   const text = String(date ?? '');
   return text.length >= 10 ? text.slice(5, 10) : text;
@@ -56,12 +52,10 @@ const bars = computed(() => {
 
 const totalWords = computed(() => props.rows.reduce((acc, row) => acc + toInt(row.words), 0));
 
-// 无数据行，或有行但整组字数合计为 0，都给出同一句提示（图表照常渲染）
 const showEmpty = computed(() => bars.value.length === 0 || totalWords.value === 0);
 </script>
 
 <style scoped>
-/* 颜色/字号只用全局 CSS 变量，跟随主题切换 */
 .novel-daily {
   display: flex;
   flex-direction: column;

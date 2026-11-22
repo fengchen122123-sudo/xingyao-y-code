@@ -1,20 +1,3 @@
-"""core/tools_admin_session.py
-Agent 工具 session_manage：会话生命周期与回合检查点管理。
-
-覆盖能力：
-- 会话：列出、新建、改名、删除、归档/取消归档、迁移工作目录、清空历史；
-- 记忆压缩：触发会话记忆摘要压缩（复用 memory_compressor 的既有入口）；
-- 检查点 / 按回合撤销：列出检查点、回滚某个回合的文件修改、列出撤销记录、
-  预检某回合撤销影响、对中断的撤销操作做恢复。
-
-设计约束：
-- 全部复用 core 层既有公开 API（MemoryManager / memory_compressor /
-  turn_undo.service），绝不 import gui_bridge / main / pywebview；
-- 不实现权限档位、沙箱、白名单、信任确认类动作（这些属于权限系统职责）；
-- 输出统一为 JSON 字符串（ensure_ascii=False）：成功 {"ok": true, ...}，
-  失败 {"ok": false, "error": "中文原因"}；任何异常都在本层捕获，不向外抛；
-- 找不到可靠 core 层入口的能力一律显式报错，不做假实现。
-"""
 from __future__ import annotations
 
 import json
@@ -50,17 +33,11 @@ _ACTIONS = (
     "undo_recover",
 )
 
-# 会话列表最多返回条数（列表只需可读概览，不追求全量倾倒）
 _LIST_LIMIT = 200
-# 检查点 / 撤销记录最多返回条数
 _CHECKPOINT_LIMIT = 100
-# 压缩过程提示最多回传条数
 _COMPRESS_NOTICE_LIMIT = 5
 
 
-# ---------------------------------------------------------------------------
-# 统一 JSON 输出
-# ---------------------------------------------------------------------------
 def _ok(**payload: Any) -> str:
     result: dict[str, Any] = {"ok": True}
     result.update(payload)
@@ -74,7 +51,6 @@ def _fail(error: str, **payload: Any) -> str:
 
 
 def _jsonable(value: Any) -> Any:
-    """把 dataclass / Enum / 元组 等结构转成可直接 json.dumps 的普通对象。"""
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value) and not isinstance(value, type):
@@ -89,7 +65,6 @@ def _jsonable(value: Any) -> Any:
 
 
 def _enum_value(value: Any) -> str:
-    """取枚举的字符串值；非枚举按 str 返回。"""
     return str(getattr(value, "value", value))
 
 
@@ -101,7 +76,6 @@ def _strip_markup(text: str) -> str:
 # core 层依赖获取（全部延迟导入，避免导入期副作用）
 # ---------------------------------------------------------------------------
 def _manager():
-    """返回进程级 MemoryManager；未初始化时显式失败。"""
     from core import app_context
 
     manager = app_context.get_manager()
@@ -111,7 +85,6 @@ def _manager():
 
 
 def _require_session(session: str) -> str:
-    """取目标会话名；参数为空时回落到当前会话。"""
     name = str(session or "").strip()
     if name:
         return name
@@ -130,7 +103,6 @@ def _require_session(session: str) -> str:
 
 
 def _session_records(manager) -> list[dict]:
-    """全量会话记录（含归档、含空会话），供存在性判断与列表展示。"""
     return manager.get_all_sessions(include_archived=True, include_empty=True)
 
 
@@ -144,7 +116,6 @@ def _require_existing_session(manager, name: str) -> None:
 
 
 def _auto_session_name(manager) -> str:
-    """自动命名：与既有 GUI/CLI 约定一致，生成 session_<6位十六进制>。"""
     existing = {str(row.get("name") or "") for row in _session_records(manager)}
     for _ in range(50):
         candidate = f"session_{uuid.uuid4().hex[:6]}"
@@ -175,9 +146,6 @@ def _turn_undo():
     return turn_undo_service
 
 
-# ---------------------------------------------------------------------------
-# 检查点 / 撤销条目摘要
-# ---------------------------------------------------------------------------
 def _checkpoint_item(state: dict) -> dict:
     turn_id = str(state.get("turn_id") or "")
     description = _strip_markup(state.get("description") or "")
@@ -215,9 +183,6 @@ def _preview_payload(preview: Any) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-# ---------------------------------------------------------------------------
-# 各 action 实现
-# ---------------------------------------------------------------------------
 def _action_list() -> str:
     manager = _manager()
     rows = _session_records(manager)
@@ -378,7 +343,6 @@ def _action_checkpoint_list(manager, session: str) -> str:
 
 
 def _resolve_turn_for_restore(manager, name: str, turn_id: str, operation_id: str) -> str:
-    """checkpoint_restore 的回合解析：优先 turn_id，其次由 operation_id 反查所属回合。"""
     session_id = _session_id(manager, name)
     turn = str(turn_id or "").strip()
     operation = str(operation_id or "").strip()
@@ -490,16 +454,9 @@ def _action_undo_recover(manager, session: str, operation_id: str) -> str:
                preview=preview_payload, result=_serialize_revert(result))
 
 
-# ---------------------------------------------------------------------------
-# 工具入口
-# ---------------------------------------------------------------------------
 def session_manage(action: str, session: str = "", new_name: str = "",
                    workdir: str = "", turn_id: str = "", operation_id: str = "",
                    output_path: str = "") -> str:
-    """会话生命周期管理工具（action 大小写不敏感）。
-
-    output_path 为协议预留参数，当前所有 action 均不使用。
-    """
     try:
         key = str(action or "").strip().lower()
         if not key:
@@ -554,7 +511,6 @@ def session_manage(action: str, session: str = "", new_name: str = "",
 
 
 def _execute(**arguments: Any) -> str:
-    """ToolSpec 执行入口：过滤调度层注入的内部键后转调 session_manage。"""
     clean = {name: value for name, value in arguments.items() if name in _KNOWN_ARGUMENTS}
     return session_manage(**clean)
 
@@ -601,7 +557,6 @@ _INPUT_SCHEMA: dict[str, Any] = {
 
 
 def build_specs() -> list[ToolSpec]:
-    """返回 session_manage 的工具规格（单条）。"""
     return [
         ToolSpec(
             name="session_manage",

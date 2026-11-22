@@ -1,13 +1,3 @@
-"""闲时自动维护：用户空闲 N 秒后跑水位线维护（snip/elide）与压缩。
-
-线程模型对齐 cache_keepalive：单守护线程 + Condition，按会话隔离条目，
-锁外执行任务。用户发新消息即开始新回合（on_turn_started）→ 撤销未触发的
-空闲任务并协作中断在跑的闲时压缩；与回合的共存依赖既有协议——回合组装
-检测 is_session_compressing 后禁推水位/禁账本轮换（agent_service），闲时
-任务触发前在锁内复查忙闲，压缩复用 _trigger_background_precompress 的
-防抖/防重入/CAS 增量落库。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -21,11 +11,43 @@ except Exception:  # pragma: no cover - memory_compressor 导入失败时保持�
 
 _LOGGER = logging.getLogger(__name__)
 
-# 孤儿 Blob 回收最短间隔（秒）：需全库扫媒体清单，闲时维护节流为每小时至多一次
 BLOB_GC_MIN_INTERVAL_SECONDS = 3600
 
-# 工具结果归档治理最短间隔（秒）：统计归档总体积要扫全表，同样每小时至多一次
 ARCHIVE_SWEEP_MIN_INTERVAL_SECONDS = 3600
+
+
+def _thread_session_scope(session):
+    """按给定会话绑定线程级会话上下文；空会话名或上下文不可用时为 no-op。"""
+    from contextlib import nullcontext
+
+    clean = str(session or "").strip()
+    if not clean:
+        return nullcontext()
+    try:
+        from core import app_context
+
+        scope_fn = getattr(app_context, "thread_session_scope", None)
+        if callable(scope_fn):
+            return scope_fn(clean)
+    except Exception:
+        pass
+    return nullcontext()
+
+
+def _run_self_learning(session, manager, model_cfg):
+    """线程体：跑一次回合学习；任何异常只记 debug，绝不外溢到线程外。
+
+    必须绑定线程级会话：学习线程在后台异步触发，若不绑定，memory_filter
+    决策写审计时 `_current_session_id()` 会退回到 UI 当前正在查看的会话，
+    把旧会话抽取出的记忆决策张冠李戴记到当前会话里。
+    """
+    try:
+        from core.learning import run_turn_learning
+
+        with _thread_session_scope(session):
+            run_turn_learning(session, manager, model_cfg)
+    except Exception:
+        _LOGGER.debug("会话 %s 回合学习失败（已忽略）", session, exc_info=True)
 
 
 def get_idle_maintenance_seconds():
@@ -42,23 +64,16 @@ def get_idle_maintenance_seconds():
 
 
 class IdleMaintenanceService:
-    """按会话调度的闲时维护服务。入口层只需两个调用：
-
-    - on_turn_started(session)：回合开始（撤销空闲任务 + 中断在跑压缩）
-    - on_turn_finished(session, notify)：回合结束（重新计时，到期跑维护）
-    """
 
     def __init__(self):
         self._condition = threading.Condition()
-        self._entries = {}      # session -> {"deadline", "notify"}
-        self._busy = set()      # 有回合在跑的会话
-        self._cancel_events = {}  # 在跑闲时压缩的协作取消事件
+        self._entries = {}
+        self._busy = set()
+        self._cancel_events = {}
         self._thread = None
         self._shutdown = False
-        self._last_blob_gc_at = None  # 上次孤儿 Blob 回收时间（monotonic，节流用）
-        self._last_archive_sweep_at = None  # 上次工具结果归档治理时间（monotonic，节流用）
-
-    # ── 入口层接线 API ────────────────────────────────────────────────────
+        self._last_blob_gc_at = None
+        self._last_archive_sweep_at = None
 
     def on_turn_started(self, session):
         """回合开始：撤销该会话未触发的空闲任务，协作中断在跑的闲时压缩。
@@ -105,8 +120,6 @@ class IdleMaintenanceService:
             self._entries.clear()
             self._condition.notify_all()
 
-    # ── 调度线程与维护执行 ────────────────────────────────────────────────
-
     def _ensure_thread_locked(self):
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(
@@ -133,8 +146,6 @@ class IdleMaintenanceService:
                     entry = dict(self._entries.pop(session))
                     entry["session"] = session
                     break
-            # 到期恰逢回合在跑：条目按设计消费掉不重排（不空转），
-            # 会话下次 on_turn_finished 会重新计时排期
             if session in self._busy:
                 continue
             threading.Thread(
@@ -160,14 +171,12 @@ class IdleMaintenanceService:
                 self._cancel_events[session] = cancel_event
                 self_registered = True
         try:
-            self._do_maintenance(session, notify, cancel_event)
+            with _thread_session_scope(session):
+                self._do_maintenance(session, notify, cancel_event)
         except Exception:
             _LOGGER.debug("会话 %s 闲时维护异常（已忽略）", session, exc_info=True)
         finally:
             with self._condition:
-                # 只清理自己注册的事件：复用方持有的是同一对象，`is` 比较
-                # 区分不出"我注册的"与"我复用的"，复用方先结束会把条目弹掉，
-                # 注册方还在等 done、回合开始却再也中断不到在跑的压缩
                 if self_registered and self._cancel_events.get(session) is cancel_event:
                     self._cancel_events.pop(session, None)
 
@@ -185,8 +194,6 @@ class IdleMaintenanceService:
         except Exception:
             _LOGGER.debug("会话 %s 闲时本地维护失败", session, exc_info=True)
 
-        # 媒体仓库治理（免费本地维护）：每次闲时清超期 .part 残留（目录通常
-        # 为空，成本极低）；孤儿 Blob 回收需全库扫媒体清单，按最短间隔节流。
         try:
             from core.media_store import prune_orphan_blobs, prune_orphan_tmp
 
@@ -201,9 +208,6 @@ class IdleMaintenanceService:
         except Exception:
             _LOGGER.debug("会话 %s 闲时媒体仓库治理失败", session, exc_info=True)
 
-        # 工具结果归档治理（免费本地维护）：先删超期归档，再按 accessed_at 有效
-        # 淘汰到预算内（刚被 tool_result_read 取回过的记录受保护）。统计归档总体
-        # 积要扫全表，与 Blob 回收同口径按小时节流。
         try:
             now = time.monotonic()
             if (
@@ -219,6 +223,38 @@ class IdleMaintenanceService:
                     )
         except Exception:
             _LOGGER.debug("会话 %s 归档治理失败", session, exc_info=True)
+
+        # 回合学习（自我演化接线）：闲时窗口恰好没有回合在跑，是跑一次学习的
+        # 最佳时机。学习要调大模型（60 秒超时），因此只起独立守护线程、绝不在
+        # 维护线程里同步等待——否则会拖住闲时压缩的推进与后续会话的维护排期。
+        # 取不到激活模型（含无 api_key）时直接跳过，不写日志噪声；线程内部
+        # 再包一层 try/except 只记 debug，异常一律不外溢。
+        try:
+            from core.model_manager import get_active_model
+
+            learning_active = get_active_model(session)
+        except Exception:
+            learning_active = None
+        if learning_active:
+            learning_model = (
+                learning_active.get("litellm_model") or learning_active.get("model") or ""
+            )
+            learning_key = learning_active.get("api_key") or ""
+            if learning_model and str(learning_key).strip():
+                model_cfg = (
+                    learning_model,
+                    learning_key,
+                    learning_active.get("base_url") or "",
+                )
+                try:
+                    threading.Thread(
+                        target=_run_self_learning,
+                        args=(session, manager, model_cfg),
+                        name=f"self-learning-{session}",
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    _LOGGER.debug("会话 %s 学习线程启动失败", session, exc_info=True)
 
         if cancel_event.is_set():
             return
@@ -263,14 +299,9 @@ class IdleMaintenanceService:
                 cancel_event, notify, done_event=done,
             )
             if spawned:
-                # 阻塞到压缩真正结束再返回：_trigger 是发射后不管的，若现在
-                # 就返回，finally 会把 cancel_event 弹出注册表，压缩在飞的
-                # 整个过程里回合开始都中断不到它（done_event 由压缩线程
-                # 的 finally 置位，包括失败/异常路径，不会永久挂起）
                 done.wait()
         except Exception:
             _LOGGER.debug("会话 %s 闲时压缩触发失败", session, exc_info=True)
 
 
-# 进程级单例：GUI 与 CLI 共用同一调度器
 idle_maintenance_service = IdleMaintenanceService()

@@ -130,7 +130,6 @@ describe('Topbar frameless window controls', () => {
     try {
       const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
       await wrapper.get('.titlebar-drag').trigger('mousedown', { button: 0 });
-      // 延迟判定：mousedown 后不立即移动，等待是否为双击
       expect((window as any).pywebview.api.window_begin_drag).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(450);
       expect((window as any).pywebview.api.window_begin_drag).toHaveBeenCalledOnce();
@@ -245,5 +244,17 @@ describe('Topbar sidebar toggle', () => {
 
     expect(wrapper.find('button#btn-toggle-side').exists()).toBe(false);
     expect(wrapper.get('#btn-toggle-side').classes()).toContain('mark');
+  });
+
+  it('provides an explicit mobile menu button that toggles the sidebar drawer', async () => {
+    const store = useAppStore();
+    store.sidebarCollapsed = true;
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+
+    await wrapper.get('[data-test="mobile-sidebar-toggle"]').trigger('click');
+    expect(store.sidebarCollapsed).toBe(false);
+
+    await wrapper.get('[data-test="mobile-sidebar-toggle"]').trigger('click');
+    expect(store.sidebarCollapsed).toBe(true);
   });
 });

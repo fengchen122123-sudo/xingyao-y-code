@@ -291,7 +291,6 @@ def test_owner_throttle_survives_journal_recreation_across_connections(tmp_path)
 
 
 def test_export_harness_journal_carries_resume_columns_without_body_text(tmp_path):
-    """导出形状：turn/step 带上续跑列，且任何记录都不出现正文键。"""
     manager, journal = _journal(tmp_path, now_ms=10_000)
     journal.create_step("turn-1:step:1", "turn-1", 1)
     manager.conn.execute(
@@ -324,7 +323,6 @@ def test_export_harness_journal_carries_resume_columns_without_body_text(tmp_pat
     assert turn_row["resume_from_step_ordinal"] == 3
     assert step_row["tool_call_count"] == 5
     assert step_row["replay_of_step_id"] == "turn-0:step:1"
-    # journal 只允许状态/ID/序号/时间/计数/sha256：正文键一个都不能出现。
     forbidden = {"content", "arguments", "result", "payload"}
     for row in rows:
         assert forbidden.isdisjoint(row), row

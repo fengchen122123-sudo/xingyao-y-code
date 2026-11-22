@@ -1,5 +1,3 @@
-"""Route host-process warnings to a diagnostic file instead of the CLI."""
-
 from __future__ import annotations
 
 import logging
@@ -33,8 +31,6 @@ def configure_runtime_warnings(log_path=None):
     warning_logger.addHandler(handler)
     warning_logger.setLevel(logging.WARNING)
     warning_logger.propagate = False
-    # Re-hook even when another runtime replaced warnings.showwarning after an
-    # earlier captureWarnings(True) call.
     logging.captureWarnings(False)
     logging.captureWarnings(True)
     return target

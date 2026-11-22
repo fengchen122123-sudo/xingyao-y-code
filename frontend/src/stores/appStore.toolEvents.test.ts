@@ -58,13 +58,11 @@ it('binds diff_ready only to the matching tool call', () => {
 
 it('pairs old history tool messages by explicit id when switching sessions', async () => {
   const store = useAppStore();
-  // 会话 1：实时回合产生 message-local 结果
   store.handleBridgeEvent(event('turn_start', { user_text: '检查代码' }));
   store.handleBridgeEvent(event('tool_start', startData('good', 'python -m pytest -q')));
   store.handleBridgeEvent(event('tool_finish', finishData('good', true, 1200)));
   store.handleBridgeEvent(event('turn_finish', {}));
 
-  // 会话 2：历史消息（旧形状 tool_calls + 独立 role=tool 消息）
   const history = [
     { role: 'user', content: '看看 README' },
     {
@@ -83,7 +81,6 @@ it('pairs old history tool messages by explicit id when switching sessions', asy
   };
   await store.switchSession('session-2', '历史会话');
 
-  // 配对的 role=tool 消息被折叠进助手消息，不再单独出现在列表里
   expect(store.messages).toHaveLength(2);
   const assistant = store.messages.find(m => m.role === 'assistant')!;
   expect(assistant.execution_state).toBe('completed');
@@ -104,13 +101,11 @@ it('pairs old history tool messages by explicit id when switching sessions', asy
 
 it('keeps a live assistant runtime when switching to a mid-turn session', async () => {
   const store = useAppStore();
-  // 模拟：会话 session-mid 的回合已开始，当前视图在其他会话。
   store.currentSessionName = 'session-other';
   store.handleBridgeEvent(event('turn_start', { user_text: '后台任务', session_name: 'session-mid' }));
   expect(store.runningSessions).toEqual(['session-mid']);
   expect(store.messages).toHaveLength(0);
 
-  // 切到正在运行回合的会话：历史最后一条是 user（本轮 assistant 尚未落库）
   (window as any).pywebview = {
     api: {
       switch_session: async () => ({
@@ -123,7 +118,6 @@ it('keeps a live assistant runtime when switching to a mid-turn session', async 
   };
   await store.switchSession('session-mid', '运行中会话');
 
-  // 切回时优先恢复实时 runtime，而不是使用旧历史覆盖它。
   expect(store.messages.at(-1)!.role).toBe('assistant');
   expect(store.messages.at(-1)!.execution_state).toBe('running');
   expect(() => store.handleBridgeEvent(event('tool_start', startData('mid-1', 'pytest -q')))).not.toThrow();
@@ -163,7 +157,6 @@ it('moves subagent snapshots into the running run_subagent call and freezes on c
   expect(message.tool_calls![0].subagent_tasks).toHaveLength(1);
   expect(message.tool_calls![0].subagent_tasks![0].description).toBe('调研代码结构');
 
-  // 完成后快照冻结：后续进度事件不再覆盖已完成的调用
   store.handleBridgeEvent(event('tool_finish', {
     id: 'sub-1', name: 'run_subagent', label: '运行子代理',
     ok: true, summary: '完成', result: 'done', duration_ms: 5000, display: {},
@@ -177,8 +170,6 @@ it('routes each subagent snapshot to the call that spawned it', () => {
   store.handleBridgeEvent(event('turn_start', { user_text: '并行调研' }));
   store.handleBridgeEvent(event('tool_start', { id: 'sub-1', name: 'run_subagent', label: '运行子代理', display: {} }));
   store.handleBridgeEvent(event('tool_start', { id: 'sub-2', name: 'run_subagent', label: '运行子代理', display: {} }));
-  // 后端每轮推送全会话快照（含更早回合的历史任务）：带归属 id 的任务只落到
-  // 派生它的那张卡片，历史任务（sub-0）不属于本条消息，不重复展示
   store.handleBridgeEvent(event('subagent_progress', {
     tasks: [
       { id: 'old', description: '上一回合的子代理', status: 'completed', stage: 'completed', elapsed: 9, tool_call_id: 'sub-0' },
@@ -227,7 +218,6 @@ it('carries stage history into subagent snapshots for the right-panel flow view'
     { name: 'model', at: 1758900000.5, detail: '' },
     { name: 'tool', at: 1758900001.5, detail: 'read_file ✓ 1.2s' },
   ]);
-  // 事件里的快照同时进入面板级列表，供查看入口复用
   expect(store.subagentTasks[0].stages).toHaveLength(2);
 });
 
@@ -282,13 +272,11 @@ it('hangs mid-turn error on the assistant message instead of breaking the contra
   store.handleBridgeEvent(event('turn_start', { user_text: '跑一下测试' }));
   store.handleBridgeEvent(event('tool_start', startData('t1', 'pytest -q')));
 
-  // 回合进行中的非终态错误：挂在助手消息上，不 push 独立 error 消息
   store.handleBridgeEvent(event('error', { message: '工具执行出错' }));
   const last = store.messages.at(-1)!;
   expect(last.role).toBe('assistant');
   expect(last.error_note).toBe('工具执行出错');
 
-  // 契约不被破坏：后续 tool_finish 不再抛错，仍落在同一助手消息上
   expect(() => store.handleBridgeEvent(event('tool_finish', finishData('t1', true, 800)))).not.toThrow();
   expect(store.messages.at(-1)!.tool_calls![0].result?.ok).toBe(true);
   expect(store.messages.at(-1)!.error_note).toBe('工具执行出错');
@@ -296,7 +284,6 @@ it('hangs mid-turn error on the assistant message instead of breaking the contra
 
 it('writes error as a standalone message only when no turn is active', () => {
   const store = useAppStore();
-  // 无活动回合（空闲状态）：错误仍写入对话流
   store.handleBridgeEvent(event('error', { message: '余额不足' }));
   expect(store.messages.at(-1)!.role).toBe('error');
   expect(store.messages.at(-1)!.content).toBe('余额不足');

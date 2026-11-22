@@ -2,12 +2,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it } from 'vitest';
 import { useAppStore } from './appStore';
 
-// 会话级瞬态隔离与页签清理：
-//   2) subagentDetailId 与 bgTaskDetailId 同口径随会话保存/恢复；
-//   3) 画笔截图模态（rightPanelSnipActive）切会话时退出，不把浏览器表面按住；
-//   6) 恢复页签集时按合法白名单过滤，避免过期 id 让 PANE_LABELS 取到 undefined；
-//   7) 关闭页签时同步清理该页签的瞬态（详情查看对象）。
-
 beforeEach(() => {
   setActivePinia(createPinia());
 });
@@ -36,7 +30,6 @@ it('切会话时退出画笔截图模态：rightPanelSnipActive 置 false', () =
 
   store.currentSessionName = 'B';
   store._bindSessionRuntime('B');
-  // 模态是会话瞬态：残留会把新会话浏览器原生表面持续压住
   expect(store.rightPanelSnipActive).toBe(false);
 });
 
@@ -62,7 +55,6 @@ it('关闭页签清理对应瞬态：关 tasks 清 bgTaskDetailId、关 subagent
   store.subagentDetailId = 'sub-1';
   store.openRightPanelTab('tasks');
   store.openRightPanelTab('subagent');
-  // 已设查看对象时开页签不会覆盖
   expect(store.bgTaskDetailId).toBe('t1');
   expect(store.subagentDetailId).toBe('sub-1');
 

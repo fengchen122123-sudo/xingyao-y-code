@@ -1,13 +1,3 @@
-"""wait_for 条件等待（Windows-MCP 对齐，2026-11-09）测试。
-
-Task 1 覆盖协议层：core.computer.models / core.computer.actions 的严格解析与
-schema 声明，不触碰真实 UIA 遍历、截图或轮询。
-
-Task 2 覆盖执行层：backend 的 wait_for 分片轮询与超时错误码、只读 probe
-（绝不调用 collect / 绝不替换 ref 全集）、window_active 走顶层窗口标题枚举。
-全部用注入 fake：绝不真实截屏、绝不真实遍历 UIA 树、绝不真实注入输入。
-"""
-
 from __future__ import annotations
 
 import time
@@ -26,7 +16,6 @@ def _properties() -> dict:
 
 
 def test_parse_wait_for_defaults():
-    """condition 缺省 text_exists，timeout_ms/interval_ms 取默认值；schema 同步声明。"""
     from core.computer.actions import WAIT_FOR_CONDITIONS
     action = parse_computer_action({
         "kind": "wait_for",
@@ -41,7 +30,6 @@ def test_parse_wait_for_defaults():
     assert action.text == "保存成功"
     assert action.window_name is None and action.element_ref is None
 
-    # 显式给出的合法值原样保留
     explicit = parse_computer_action({
         "kind": "wait_for",
         "target": "desktop",
@@ -53,13 +41,11 @@ def test_parse_wait_for_defaults():
     assert (explicit.timeout_ms, explicit.interval_ms) == (1000, 2000)
     assert explicit.window_name == "登录窗口"
 
-    # 新增字段对既有动作保持默认（None），不改变现有语义
     observe = parse_computer_action({"kind": "observe", "target": "desktop"})
     assert observe.condition is None
     assert observe.timeout_ms is None
     assert observe.interval_ms is None
 
-    # schema 同步暴露 wait_for 与四个新字段（condition 为枚举，数值带边界）
     properties = _properties()
     assert "wait_for" in properties["kind"]["enum"]
     assert properties["condition"]["enum"] == list(WAIT_FOR_CONDITIONS) == [
@@ -89,7 +75,6 @@ def test_parse_wait_for_rejects_unknown_condition():
 
 
 def test_parse_wait_for_rejects_missing_required_field():
-    """text_exists 缺 text；window_active 缺 window_name；text 超长拒绝。"""
     for payload in (
         {"kind": "wait_for", "target": "desktop"},
         {"kind": "wait_for", "target": "desktop", "condition": "text_exists"},
@@ -142,15 +127,32 @@ def test_parse_wait_for_rejects_timeout_out_of_range():
         assert raised.value.code == "computer_invalid_action"
 
 
-def test_parse_wait_for_rejects_browser_target():
-    with pytest.raises(ComputerControlError) as raised:
-        parse_computer_action({
-            "kind": "wait_for",
-            "target": "browser",
-            "text": "加载完成",
-        })
-    assert raised.value.code == "computer_invalid_action"
-    assert "desktop" in raised.value.message
+def test_parse_wait_for_browser_allows_same_doc_and_rejects_desktop_or_deferred():
+    ok_text = parse_computer_action({
+        "kind": "wait_for",
+        "target": "browser",
+        "condition": "text_exists",
+        "text": "加载完成",
+    })
+    assert ok_text.target == "browser" and ok_text.condition == "text_exists"
+
+    ok_el = parse_computer_action({
+        "kind": "wait_for",
+        "target": "browser",
+        "condition": "element_enabled",
+        "element_ref": "el-2",
+    })
+    assert ok_el.element_ref == "el-2" and ok_el.condition == "element_enabled"
+
+    for bad_payload in (
+        {"kind": "wait_for", "target": "browser", "condition": "window_active", "window_name": "Edge"},
+        {"kind": "wait_for", "target": "browser", "condition": "text_exists", "text": "x", "window_name": "Edge"},
+        {"kind": "wait_for", "target": "browser", "condition": "url_contains", "text": "x"},
+        {"kind": "wait_for", "target": "browser", "condition": "network_idle", "text": "x"},
+    ):
+        with pytest.raises(ComputerControlError) as raised:
+            parse_computer_action(bad_payload)
+        assert raised.value.code == "computer_invalid_action"
 
 
 def test_parse_wait_for_rejects_unknown_field():
@@ -171,11 +173,7 @@ def test_parse_wait_for_rejects_unknown_field():
         assert "wait_for" in raised.value.message
 
 
-# ---------------- Task 2：执行层（只读 probe 与分片轮询） ----------------
-
-
 class _WaitAdapter(FakeWin32Adapter):
-    """FakeWin32Adapter + list_top_window_titles（wait_for window_active 用）。"""
 
     def __init__(self, top_titles=(), **kwargs):
         super().__init__(**kwargs)
@@ -188,11 +186,6 @@ class _WaitAdapter(FakeWin32Adapter):
 
 
 class _FakeElementLocator:
-    """元素定位器 fake：probe 按脚本命中，collect/invalidate 一旦被调用即留痕。
-
-    ``elements`` 模拟 locator 层的 ref 全集；``elements_id`` 记录字典对象身份，
-    用于断言等待期间 ref 表既没有被替换、也没有被改写（el-N 仍然可用）。
-    """
 
     def __init__(self, probe_results=()):
         self.probe_results = list(probe_results)
@@ -213,7 +206,7 @@ class _FakeElementLocator:
 
     def collect(self, hwnd):
         self.collect_calls += 1
-        self.elements = {}  # 真实 collect 会整体替换 ref 全集
+        self.elements = {}
         return []
 
     def invalidate(self):
@@ -230,7 +223,6 @@ def _wait_backend(*, adapter=None, element_locator=None):
 
 
 def _wait_action(**overrides):
-    """构造合法 wait_for 动作；payload 按 condition 只带该条件的字段。"""
     payload = {
         "kind": "wait_for",
         "target": "desktop",
@@ -244,8 +236,7 @@ def _wait_action(**overrides):
 
 
 def test_wait_for_timeout_raises_wait_timeout_code():
-    """条件永不满足：等满 timeout_ms 后抛 computer_wait_timeout，提示改用 observe。"""
-    locator = _FakeElementLocator()  # probe 永远不命中
+    locator = _FakeElementLocator()
     backend = _wait_backend(element_locator=locator)
     started = time.monotonic()
     with pytest.raises(ComputerControlError) as raised:
@@ -253,21 +244,20 @@ def test_wait_for_timeout_raises_wait_timeout_code():
     elapsed = time.monotonic() - started
     assert raised.value.code == "computer_wait_timeout"
     assert "observe" in raised.value.message
-    assert 0.9 <= elapsed < 5  # 真等满 1000ms，不是立刻失败
-    assert len(locator.probe_calls) >= 2  # 按 interval_ms 分片轮询多次
+    assert 0.9 <= elapsed < 5
+    assert len(locator.probe_calls) >= 2
     # 只读：轮询期间绝不 collect（会整体替换 ref 全集），也不 invalidate。
     assert locator.collect_calls == 0
     assert locator.invalidate_calls == 0
 
 
 def test_wait_for_probe_hit_keeps_element_refs_untouched():
-    """probe 命中即返回；ref 表的对象身份与内容都不变（el-N 不失效）。"""
     locator = _FakeElementLocator([{"condition": "text_exists", "name": "保存成功"}])
     backend = _wait_backend(element_locator=locator)
     snapshot = dict(locator.elements)
     started = time.monotonic()
     backend.execute("run-wait", _wait_action())
-    assert time.monotonic() - started < 0.9  # 首轮命中，不空等
+    assert time.monotonic() - started < 0.9
     assert locator.collect_calls == 0
     assert locator.invalidate_calls == 0
     assert id(locator.elements) == locator.elements_id
@@ -277,30 +267,114 @@ def test_wait_for_probe_hit_keeps_element_refs_untouched():
     ]
 
 
-def test_wait_for_window_active_uses_top_window_titles():
-    """window_active 走 adapter.list_top_window_titles（大小写不敏感子串），不碰 UIA。"""
-    adapter = _WaitAdapter(
-        top_titles=("设置", "WeiXin 微信"), virtual_rect=(0, 0, 1920, 1080)
+def test_wait_for_window_active_checks_actual_foreground_hwnd_title():
+    # 后台同名窗口不得命中；只有实际前台 HWND 的标题包含目标子串才命中。
+    bg_only = _WaitAdapter(
+        foreground_id=1001,
+        foreground_title="设置",
+        top_titles=("设置", "WeiXin 微信"),
+        virtual_rect=(0, 0, 1920, 1080),
     )
     locator = _FakeElementLocator()
-    backend = _wait_backend(adapter=adapter, element_locator=locator)
-    backend.execute(
-        "run-wait", _wait_action(condition="window_active", window_name="微信")
-    )
-    assert adapter.top_title_calls >= 1
-    assert locator.probe_calls == []  # 窗口条件不走元素探测
-    # 没有匹配窗口时不会误判成功：等满超时抛 computer_wait_timeout。
-    other = _WaitAdapter(top_titles=("设置",), virtual_rect=(0, 0, 1920, 1080))
-    backend_other = _wait_backend(adapter=other, element_locator=locator)
+    backend_bg = _wait_backend(adapter=bg_only, element_locator=locator)
     with pytest.raises(ComputerControlError) as raised:
-        backend_other.execute(
-            "run-wait", _wait_action(condition="window_active", window_name="微信")
+        backend_bg.execute(
+            "run-wait",
+            _wait_action(condition="window_active", window_name="微信", timeout_ms=1000, interval_ms=100),
         )
+    assert raised.value.code == "computer_wait_timeout"
+    assert bg_only.top_title_calls == 0
+
+    import threading
+
+    switching = _WaitAdapter(
+        foreground_id=1001,
+        foreground_title="记事本",
+        top_titles=("记事本", "WeiXin 微信"),
+        virtual_rect=(0, 0, 1920, 1080),
+    )
+    backend_switch = _wait_backend(adapter=switching, element_locator=locator)
+
+    def switch_foreground_later():
+        time.sleep(0.15)
+        switching.foreground_id = 2002
+        switching.foreground_title = "WeiXin 微信"
+
+    worker = threading.Thread(target=switch_foreground_later, daemon=True)
+    worker.start()
+    backend_switch.execute(
+        "run-wait",
+        _wait_action(condition="window_active", window_name="微信", timeout_ms=2000, interval_ms=100),
+    )
+    worker.join(timeout=2)
+    assert switching.top_title_calls == 0
+    assert locator.probe_calls == []
+
+
+def test_com_thread_deadline_and_cancel_reject_queued_jobs_before_execution():
+    import queue as _queue
+    import threading
+    from core.computer.platforms.windows_surfaces import _ComThread
+
+    com = _ComThread.__new__(_ComThread)
+    com._queue = _queue.Queue()
+    com._ready = threading.Event()
+    com._ready.set()
+    com._init_error = None
+    com._uia = object()
+    ran = []
+
+    def fake_worker():
+        while True:
+            job = com._queue.get()
+            if job is None:
+                return
+            job()
+
+    com._thread = threading.Thread(target=fake_worker, daemon=True)
+    com._thread.start()
+    try:
+        with pytest.raises(ComputerControlError) as raised:
+            com.call(
+                lambda _uia: ran.append("expired"),
+                deadline=time.monotonic() - 0.1,
+                timeout_code="computer_wait_timeout",
+            )
+        assert raised.value.code == "computer_wait_timeout"
+        assert ran == []
+
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(ComputerControlError) as raised_cancel:
+            com.call(lambda _uia: ran.append("cancelled"), cancel_event=cancel)
+        assert raised_cancel.value.code == "computer_cancelled"
+        assert ran == []
+    finally:
+        com.close()
+
+
+def test_wait_for_discards_late_probe_hit_after_deadline():
+    class _SlowHitLocator(_FakeElementLocator):
+        def probe(self, hwnd, matcher, deadline=None, cancel_event=None):
+            assert deadline is not None
+            time.sleep(0.15)
+            return {"condition": "text_exists", "name": "保存成功"}
+
+    backend = _wait_backend(element_locator=_SlowHitLocator())
+    action = ComputerAction(
+        kind="wait_for",
+        target="desktop",
+        condition="text_exists",
+        text="保存成功",
+        timeout_ms=50,
+        interval_ms=50,
+    )
+    with pytest.raises(ComputerControlError) as raised:
+        backend._wait_for_interruptible(1001, action)
     assert raised.value.code == "computer_wait_timeout"
 
 
 def test_wait_for_element_condition_goes_through_probe_with_stale_ref():
-    """element_enabled 走 probe 转发；stale ref 直接上抛，不静默空等。"""
     locator = _FakeElementLocator(
         [
             ComputerControlError(
@@ -324,7 +398,6 @@ def test_wait_for_element_condition_goes_through_probe_with_stale_ref():
 
 
 def test_wait_for_stop_event_cancels_condition_wait():
-    """停止事件已置位时立刻 computer_cancelled，绝不空转到超时。"""
     locator = _FakeElementLocator()
     backend = _wait_backend(element_locator=locator)
     backend._stop_event.set()
@@ -336,11 +409,7 @@ def test_wait_for_stop_event_cancels_condition_wait():
     assert locator.probe_calls == []
 
 
-# ---------------- Task 2：RealUIAHost.probe 只读性（硬约束，绝不启动 COM） ----------------
-
-
 class _FakeUIAElement:
-    """UIA 元素的最小 fake：只暴露 probe 需要的两个 Current 属性。"""
 
     def __init__(self, name="保存", enabled=True):
         self.CurrentName = name
@@ -351,10 +420,9 @@ class _FakeUIAElement:
 
 
 def test_real_uia_probe_element_conditions_are_read_only():
-    """probe 只从 self._elements 读取：映射对象身份不变、内容不变、编号不重排。"""
     from core.computer.platforms.windows_elements_uia import RealUIAHost
 
-    host = RealUIAHost.__new__(RealUIAHost)  # 不启动 COM 线程，不触碰真实 UIA
+    host = RealUIAHost.__new__(RealUIAHost)
     host._elements = {"el-1": _FakeUIAElement(name="保存", enabled=False)}
     snapshot = dict(host._elements)
     snapshot_id = id(host._elements)
@@ -362,7 +430,6 @@ def test_real_uia_probe_element_conditions_are_read_only():
     assert host._probe_job(
         None, 1001, {"condition": "element_exists", "element_ref": "el-1"}
     ) == {"condition": "element_exists", "ref": "el-1", "name": "保存"}
-    # enabled=False 未命中，但同样不改映射
     assert (
         host._probe_job(
             None, 1001, {"condition": "element_enabled", "element_ref": "el-1"}
@@ -382,7 +449,6 @@ def test_real_uia_probe_element_conditions_are_read_only():
 
 
 class _FakeUIANode:
-    """UIA 树节点 fake：名称/类型 + 父子关系，Value pattern 一律不支持。"""
 
     def __init__(self, name="", children=()):
         self.CurrentName = name
@@ -413,7 +479,6 @@ class _FakeUIAWalker:
 
 
 class _FakeUIA:
-    """IUIAutomation 的最小 fake：ElementFromHandle + ControlViewWalker。"""
 
     def __init__(self, root):
         self._root = root
@@ -427,7 +492,6 @@ class _FakeUIA:
 
 
 def test_real_uia_probe_text_exists_matches_child_name_case_insensitively():
-    """text_exists 用 ControlViewWalker BFS 匹配 CurrentName；摘要不带 ref。"""
     from core.computer.platforms.windows_elements_uia import RealUIAHost
 
     root = _FakeUIANode(
@@ -447,7 +511,7 @@ def test_real_uia_probe_text_exists_matches_child_name_case_insensitively():
         "name": "Save Success 已完成",
         "value": "",
     }
-    assert "ref" not in hit  # 摘要不携带可操作引用，与 ref 生命周期解耦
+    assert "ref" not in hit
     assert id(host._elements) == snapshot_id and host._elements == snapshot
     assert (
         host._probe_job(
@@ -458,7 +522,6 @@ def test_real_uia_probe_text_exists_matches_child_name_case_insensitively():
 
 
 def test_real_uia_probe_text_exists_also_matches_value_pattern(monkeypatch):
-    """ValuePattern 当前值也参与匹配（COM 读值在 pytest 内用 seam 替身注入）。"""
     from core.computer.platforms import windows_elements_uia as uia_module
 
     monkeypatch.setattr(
@@ -476,11 +539,7 @@ def test_real_uia_probe_text_exists_also_matches_value_pattern(monkeypatch):
     assert host._elements == {}
 
 
-# ---------------- Task 2：locator 转发与 Win32 标题枚举 ----------------
-
-
 def test_locator_probe_gates_stale_ref_and_keeps_ref_table():
-    """locator.probe 先做 ref 成员门禁再转发；全程不替换 locator 的 ref 表。"""
     from core.computer.platforms.windows_elements import WindowsElementLocator
 
     forwarded = []
@@ -504,7 +563,132 @@ def test_locator_probe_gates_stale_ref_and_keeps_ref_table():
     with pytest.raises(ComputerControlError) as raised:
         locator.probe(1001, {"condition": "element_exists", "element_ref": "el-2"})
     assert raised.value.code == "computer_element_stale"
-    assert len(forwarded) == 1  # stale 在转发前就被拦下
+    assert len(forwarded) == 1
+
+
+def test_browser_wait_for_live_same_doc_conditions(tmp_path, monkeypatch):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as error:  # pragma: no cover
+        pytest.skip(f"playwright 不可用：{error}")
+
+    from core.computer import browser_backend as bb
+
+    class _HeadlessRuntimeFactory:
+        def __call__(self):
+            return sync_playwright()
+
+    monkeypatch.setattr(bb, "resolve_headless", lambda: True)
+    instance = bb.BrowserComputerBackend(
+        "edge", tmp_path / "edge-wait", playwright_factory=_HeadlessRuntimeFactory()
+    )
+    try:
+        instance.start()
+    except ComputerControlError as error:
+        pytest.skip(f"headless Edge 不可用：{error}")
+    try:
+        def _eval_page(fn):
+            return instance._call("test-eval", lambda: fn(instance.active_page))
+
+        _eval_page(
+            lambda p: p.set_content(
+                "<div id='status'>准备中</div>"
+                "<button id='btn' disabled>提交</button>"
+                "<script>"
+                "setTimeout(() => { document.getElementById('status').textContent = '已完成'; }, 250);"
+                "setTimeout(() => { document.getElementById('btn').disabled = false; }, 300);"
+                "</script>"
+            )
+        )
+        obs = instance.observe("run-wait-live")
+        btn_ref = next(e["ref"] for e in obs.elements if e["name"] == "提交")
+        instance.execute(
+            "run-wait-live",
+            parse_computer_action({
+                "kind": "wait_for",
+                "target": "browser",
+                "condition": "text_exists",
+                "text": "已完成",
+                "timeout_ms": 3000,
+                "interval_ms": 100,
+            }),
+        )
+        instance.execute(
+            "run-wait-live",
+            parse_computer_action({
+                "kind": "wait_for",
+                "target": "browser",
+                "condition": "element_enabled",
+                "element_ref": btn_ref,
+                "timeout_ms": 3000,
+                "interval_ms": 100,
+            }),
+        )
+        with pytest.raises(ComputerControlError) as timeout_err:
+            instance.execute(
+                "run-wait-live",
+                parse_computer_action({
+                    "kind": "wait_for",
+                    "target": "browser",
+                    "condition": "text_exists",
+                    "text": "永不出现",
+                    "timeout_ms": 1000,
+                    "interval_ms": 100,
+                }),
+            )
+        assert timeout_err.value.code == "computer_wait_timeout"
+
+        _eval_page(lambda p: p.goto("about:blank"))
+        with pytest.raises(ComputerControlError) as stale_err:
+            instance.execute(
+                "run-wait-live",
+                parse_computer_action({
+                    "kind": "wait_for",
+                    "target": "browser",
+                    "condition": "element_exists",
+                    "element_ref": btn_ref,
+                    "timeout_ms": 1000,
+                    "interval_ms": 100,
+                }),
+            )
+        assert stale_err.value.code == "computer_element_stale"
+    finally:
+        instance.close()
+
+
+def test_browser_wait_for_text_exists_cancels_on_close(tmp_path):
+    from tests.computer_fakes import FakePlaywrightRuntime, fake_png_bytes
+
+    runtime = FakePlaywrightRuntime(screenshot_bytes=fake_png_bytes(1))
+    backend = None
+    from core.computer.browser_backend import BrowserComputerBackend
+    import threading
+
+    backend = BrowserComputerBackend("edge", tmp_path / "edge", playwright_factory=lambda: runtime)
+    backend.start()
+    try:
+        backend.active_page.page_text = "等待中"
+        backend.observe("run-w")
+        closer = threading.Timer(0.12, backend.request_stop)
+        closer.start()
+        try:
+            with pytest.raises(ComputerControlError) as raised:
+                backend.execute(
+                    "run-w",
+                    parse_computer_action({
+                        "kind": "wait_for",
+                        "target": "browser",
+                        "condition": "text_exists",
+                        "text": "永远不会出现",
+                        "timeout_ms": 5000,
+                        "interval_ms": 100,
+                    }),
+                )
+            assert raised.value.code == "computer_cancelled"
+        finally:
+            closer.join(timeout=2)
+    finally:
+        backend.close()
 
 
 def test_win32_adapter_list_top_window_titles_only_returns_non_empty_titles():

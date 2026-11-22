@@ -1,8 +1,3 @@
-/**
- * 星瑶移动端全局 store：桌面 appStore.ts 的事件语义子集（移动端所需最小集）。
- * 数据源：bridge RPC（get_initial_state / switch_session / send_user_message ...）
- * + bridge 广播事件（turn_start / token_delta / plan_updated / permission_request ...）。
- */
 import { defineStore } from 'pinia';
 import { onEvent, rpc } from '../bridge';
 
@@ -106,10 +101,6 @@ interface TokenUsage {
 
 const HEARTBEAT_MS = 20000;
 
-/**
- * 历史会话里的旧形状 tool_call：{ id, function:{ name, arguments }, summary }。
- * 归一成 UI 形状 { id, name, label, display, result }（对齐桌面 appStore.normalizeHistoryCall）。
- */
 function normalizeHistoryCall(raw: any, toolMessages: Map<string, ChatMessage>): ToolCallUi {
   const name = String(raw?.name || raw?.function?.name || raw?.tool_name || 'tool');
   let label = String(raw?.label || raw?.summary || '');
@@ -134,10 +125,6 @@ function normalizeHistoryCall(raw: any, toolMessages: Map<string, ChatMessage>):
   return call;
 }
 
-/**
- * 把历史里独立的 role=tool 消息按 tool_call_id 配对进前一条助手消息的 tool_calls，
- * 配对完成后从列表移除（对齐桌面 pairHistoryToolMessages）。
- */
 export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] {
   const toolMessages = new Map<string, ChatMessage>();
   for (const m of messages) {
@@ -158,7 +145,6 @@ export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] 
   return paired;
 }
 
-/** 历史消息归一化：turn_id → turnId、metrics 透传、tool 消息配对进 assistant */
 function normalizeMessages(list: any[]): ChatMessage[] {
   const mapped = (list || []).map((m) => ({
     ...m,
@@ -168,7 +154,6 @@ function normalizeMessages(list: any[]): ChatMessage[] {
   return pairHistoryToolMessages(mapped);
 }
 
-/** 思考能力快照（对齐桌面 reasoning_capabilities.build_reasoning_snapshot） */
 export interface ReasoningSnapshot {
   kind: string;
   visible: boolean;
@@ -185,12 +170,9 @@ export const useAppStore = defineStore('mobile-app', {
   state: () => ({
     ready: false,
     connected: false,
-    // 配对失效（token 过期/被轮换，shim 4401 后置位）：需重新扫码
     pairInvalid: false,
     version: '',
-    // 人设：仅取智能体名称用于交互层展示（品牌文案不变；移动端不提供人设配置）
     agentName: '星瑶',
-    // 会话
     sessionGroups: [] as SessionGroup[],
     currentSession: '',
     currentWorkdir: '',
@@ -198,35 +180,25 @@ export const useAppStore = defineStore('mobile-app', {
     activeModelName: '',
     models: [] as { id: string; name?: string; provider?: string }[],
     permissionMode: 'confirm',
-    // 聊天（当前会话）
+    decisionEnabled: false,
     messages: [] as ChatMessage[],
     historyHasMore: false,
     historyOldestId: null as number | null,
     runningSessions: [] as string[],
-    // 排队消息（session → 快照，message_queue 事件全量幂等替换）
     queues: {} as Record<string, QueuedMsg[]>,
-    // 按回合撤销：turn_id → 检查点状态摘要
     turnUndoStates: {} as Record<string, Record<string, any>>,
-    // @ 引用与斜杠命令数据源
     fileTree: [] as FileNode[],
     skills: [] as Record<string, any>[],
     mcps: [] as Record<string, any>[],
-    // 思考强度（随当前模型变化）
     reasoning: { ...REASONING_DEFAULT } as ReasoningSnapshot,
-    // 流式
     currentStreamingText: '',
     currentThinkingText: '',
-    // 计划
     planTitle: '当前任务计划',
     planItems: [] as PlanItem[],
     planUpdatedAt: 0,
-    // 审批（跨会话聚合收件箱）
     permRequests: [] as PermRequest[],
-    // 指标
     tokenUsage: { used: 0, window: 0, cached_pct: 0, cumulative: 0 } as TokenUsage,
-    // 通知
     notices: [] as { text: string; kind: string; ts: number }[],
-    // 主题
     theme: (localStorage.getItem('ycode-mobile-theme') === 'light' ? 'light' : 'dark') as 'dark' | 'light',
   }),
 
@@ -263,8 +235,6 @@ export const useAppStore = defineStore('mobile-app', {
       if (this.notices.length > 20) this.notices.splice(0, this.notices.length - 20);
     },
 
-    // ---- 初始化 / 重载 ----
-
     async init() {
       this.applyTheme(this.theme);
       this.bindEvents();
@@ -273,53 +243,55 @@ export const useAppStore = defineStore('mobile-app', {
       this.ready = true;
     },
 
+    applyInitialState(st: Record<string, any>) {
+      this.sessionGroups = (st.sessions || []) as SessionGroup[];
+      this.currentSession = String(st.current_session || '');
+      this.currentWorkdir = String(st.workdir || '');
+      this.activeModelId = String(st.active_model_id || '');
+      this.activeModelName = String(st.active_model_name || '');
+      this.models = (st.models || []).map((m: any) => ({ id: String(m.id || ''), name: m.name ? String(m.name) : undefined, provider: m.provider ? String(m.provider) : undefined }));
+      this.permissionMode = String(st.permission_mode || 'confirm');
+      this.decisionEnabled = !!st.decision_enabled;
+      this.version = String(st.version || '');
+      const persona = (st.persona_settings || {}) as Record<string, any>;
+      this.agentName = String(persona.agent_name || '星瑶');
+      this.messages = normalizeMessages(st.messages || []);
+      this.historyHasMore = !!st.history_has_more;
+      this.historyOldestId = st.history_oldest_id ?? null;
+      this.tokenUsage = (st.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 }) as TokenUsage;
+      this.fileTree = (st.file_tree || []) as FileNode[];
+      this.skills = (st.skills || []) as Record<string, any>[];
+      this.mcps = (st.mcps || []) as Record<string, any>[];
+      this.reasoning = (st.reasoning || { ...REASONING_DEFAULT }) as ReasoningSnapshot;
+      this.runningSessions = Array.isArray(st.active_sessions) ? st.active_sessions.map(String) : [];
+      this.queues = {};
+      const qs = st.message_queues as Record<string, any[]> | undefined;
+      if (qs) {
+        for (const [name, list] of Object.entries(qs)) {
+          this.queues[name] = (list || []).map((m: any) => ({ id: String(m?.id || ''), text: String(m?.text || ''), attachments: Array.isArray(m?.attachments) ? m.attachments.map(String) : [] }));
+        }
+      }
+      void this.refreshUndoStates();
+      const snap = st.active_turn_snapshot as Record<string, any> | null;
+      if (snap && snap.session_name === this.currentSession) {
+        this.currentThinkingText = String(snap.thinking_text || '');
+        this.currentStreamingText = String(snap.streaming_text || '');
+      }
+      this.connected = true;
+      this.pairInvalid = false;
+      void this.fetchActivePermission(true);
+    },
+
     async reloadInitialState() {
       try {
         const st = await rpc<Record<string, any>>('get_initial_state');
-        this.sessionGroups = (st.sessions || []) as SessionGroup[];
-        this.currentSession = String(st.current_session || '');
-        this.currentWorkdir = String(st.workdir || '');
-        this.activeModelId = String(st.active_model_id || '');
-        this.activeModelName = String(st.active_model_name || '');
-        this.models = (st.models || []).map((m: any) => ({ id: String(m.id || ''), name: m.name ? String(m.name) : undefined, provider: m.provider ? String(m.provider) : undefined }));
-        this.permissionMode = String(st.permission_mode || 'confirm');
-        this.version = String(st.version || '');
-        // 人设名称（交互层展示用；后端仅在用户自定义时注入提示词）
-        const persona = (st.persona_settings || {}) as Record<string, any>;
-        this.agentName = String(persona.agent_name || '星瑶');
-        this.messages = normalizeMessages(st.messages || []);
-        this.historyHasMore = !!st.history_has_more;
-        this.historyOldestId = st.history_oldest_id ?? null;
-        this.tokenUsage = (st.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 }) as TokenUsage;
-        this.fileTree = (st.file_tree || []) as FileNode[];
-        this.skills = (st.skills || []) as Record<string, any>[];
-        this.mcps = (st.mcps || []) as Record<string, any>[];
-        this.reasoning = (st.reasoning || { ...REASONING_DEFAULT }) as ReasoningSnapshot;
-        this.runningSessions = Array.isArray(st.active_sessions) ? st.active_sessions.map(String) : [];
-        this.queues = {};
-        const qs = st.message_queues as Record<string, any[]> | undefined;
-        if (qs) {
-          for (const [name, list] of Object.entries(qs)) {
-            this.queues[name] = (list || []).map((m: any) => ({ id: String(m?.id || ''), text: String(m?.text || ''), attachments: Array.isArray(m?.attachments) ? m.attachments.map(String) : [] }));
-          }
-        }
-        void this.refreshUndoStates();
-        // 恢复正在流式的回合快照（重连/重载时不丢进行中的输出）
-        const snap = st.active_turn_snapshot as Record<string, any> | null;
-        if (snap && snap.session_name === this.currentSession) {
-          this.currentThinkingText = String(snap.thinking_text || '');
-          this.currentStreamingText = String(snap.streaming_text || '');
-        }
-        this.connected = true;
-        this.pairInvalid = false;
-        void this.fetchActivePermission(true);
+        this.applyInitialState(st);
       } catch (e: any) {
         this.connected = false;
         throw e;
       }
     },
 
-    /** 权限事件 / 快照统一入队（幂等） */
     upsertPermRequest(data: Record<string, any>, sessionName = '') {
       const req: PermRequest = {
         requestId: String(data.request_id || ''),
@@ -339,31 +311,27 @@ export const useAppStore = defineStore('mobile-app', {
       return req;
     },
 
-    /**
-     * 拉取当前未决权限快照（断线/重连后补齐错过的事件）。
-     * clearWhenEmpty：RPC 可用且确认无未决时清掉残留失效项；旧版桥无此方法时忽略。
-     */
     async fetchActivePermission(clearWhenEmpty = false) {
       try {
         const r = await rpc<Record<string, any>>('get_active_permission');
         const data = r?.permission;
         if (data && data.request_id) { this.upsertPermRequest(data); return; }
         if (clearWhenEmpty && this.permRequests.length) this.permRequests = [];
-      } catch { /* 旧版桥无 get_active_permission：忽略 */ }
+      } catch { }
     },
 
     startHeartbeat() {
       if ((this as any)._hbTimer) return;
       (this as any)._hbTimer = setInterval(async () => {
         if (document.visibilityState !== 'visible') return;
-        if (this.pairInvalid) return; // 配对失效：不再无谓探测，等重新扫码
+        if (this.pairInvalid) return;
         try {
           const u = await rpc<Record<string, any>>('get_token_usage');
           this.applyUsage(u);
           if (!this.connected) {
             this.connected = true;
             // 重连成功：整体恢复快照，避免错过离线期间的事件
-            try { await this.reloadInitialState(); } catch { /* 下一轮心跳重试 */ }
+            try { await this.reloadInitialState(); } catch { }
           }
         } catch {
           this.connected = false;
@@ -385,22 +353,19 @@ export const useAppStore = defineStore('mobile-app', {
     async refreshUsage() {
       try {
         this.applyUsage(await rpc<Record<string, any>>('get_token_usage'));
-      } catch { /* 心跳重试 */ }
+      } catch { }
     },
-
-    // ---- 会话 ----
 
     async refreshSessions() {
       try {
         this.sessionGroups = (await rpc<any[]>('get_sessions')) as SessionGroup[];
-      } catch { /* 心跳会带出连接态 */ }
+      } catch { }
     },
 
     async switchSession(name: string) {
       const st = await rpc<Record<string, any>>('switch_session', name);
       this.currentSession = String(st.session_name || name);
       this.currentWorkdir = String(st.workdir || '');
-      // switch_session 返回 active_model_id/name 与 reasoning（旧实现误读 session_model）
       this.activeModelId = String(st.active_model_id || this.activeModelId);
       this.activeModelName = String(st.active_model_name || this.activeModelName);
       if (st.reasoning) this.reasoning = st.reasoning as ReasoningSnapshot;
@@ -435,22 +400,16 @@ export const useAppStore = defineStore('mobile-app', {
       return name;
     },
 
-    // ---- 聊天 ----
-
     async send(text: string, attachments?: string[]) {
       const t = String(text || '').trim();
       if (!t || !this.currentSession) return;
       const paths = (attachments || []).filter((p) => p && p.trim());
-      // 对齐客户端：运行中发送由后端入队（FIFO），不乐观上屏；
-      // 用户气泡与 running 占位等补发回合的 turn_start 到达时再渲染
       if (!this.runningSessions.includes(this.currentSession)) {
         this.messages.push({ role: 'user', content: t });
         this.messages.push({ role: 'assistant', content: '', reasoning_content: '', tool_calls: [], execution_state: 'running' });
       }
       await rpc('send_user_message', t, this.currentSession, paths.length ? paths : null);
     },
-
-    // ---- 排队消息管理 ----
 
     async cancelQueued(messageId: string) {
       await rpc('cancel_queued_message', this.currentSession, messageId);
@@ -489,22 +448,17 @@ export const useAppStore = defineStore('mobile-app', {
         try {
           attachments = await this.filesInfo(item.attachments);
         } catch {
-          // 附件名读不到不影响回填文本：至少把路径还原成 chip
           attachments = item.attachments.map((p) => ({ path: p, name: p.split(/[\\/]/).pop() || p }));
         }
       }
       return { text: item.text, attachments };
     },
 
-    // ---- 附件（手机端经 WS 上传 base64，落盘后路径作为附件发送）----
-
     async uploadAttachment(name: string, dataB64: string): Promise<string> {
       const r = await rpc<Record<string, any>>('upload_file', name, dataB64);
       if (!r || !r.ok) throw new Error(r?.msg || '上传失败');
       return String(r.path);
     },
-
-    // ---- 按回合撤销（与桌面 ChangedFilesPanel 同链路）----
 
     async refreshUndoStates() {
       if (!this.currentSession) return;
@@ -515,7 +469,7 @@ export const useAppStore = defineStore('mobile-app', {
           for (const state of r.states || []) map[String(state.turn_id)] = state;
           this.turnUndoStates = map;
         }
-      } catch { /* 查询失败不打断会话 */ }
+      } catch { }
     },
 
     undoStateOf(turnId?: string): Record<string, any> | null {
@@ -533,8 +487,6 @@ export const useAppStore = defineStore('mobile-app', {
       if (!r || !r.ok) throw new Error(r?.msg || '撤销失败');
       return r.result || {};
     },
-
-    // ---- 会话管理（重命名/删除/清空/导出）----
 
     async renameSession(oldName: string, newName: string) {
       await rpc('rename_session', oldName, newName);
@@ -567,8 +519,6 @@ export const useAppStore = defineStore('mobile-app', {
       return String(r.path || r.file_path || r.msg || '已导出');
     },
 
-    // ---- 目录浏览（新建会话绑定项目用，手机端内置浏览器数据源）----
-
     async browseDirs(path = ''): Promise<{ isRoot: boolean; current: string; dirs: { name: string; path: string }[] }> {
       const r = await rpc<Record<string, any>>('browse_remote_dirs', path);
       if (!r || !r.ok) throw new Error(r?.msg || '目录读取失败');
@@ -578,8 +528,6 @@ export const useAppStore = defineStore('mobile-app', {
     async stopTurn() {
       await rpc('stop_current_turn', this.currentSession);
     },
-
-    // ---- 权限 ----
 
     async respondPermission(requestId: string, allow: boolean, always = false) {
       await rpc('respond_permission', requestId, allow, always);
@@ -592,12 +540,9 @@ export const useAppStore = defineStore('mobile-app', {
     },
 
     async respondPermissionChoice(requestId: string, choiceIndex: number, customText?: string) {
-      // ask_user 支持自由文本回答（choiceIndex=-1 + customText，对齐桌面 PermCard）
       await rpc('respond_permission_choice', requestId, choiceIndex, customText || '');
       this.permRequests = this.permRequests.filter((p) => p.requestId !== requestId);
     },
-
-    // ---- 设置 ----
 
     async setPermissionMode(mode: string) {
       await rpc('set_permission_mode', mode, this.currentSession);
@@ -611,7 +556,6 @@ export const useAppStore = defineStore('mobile-app', {
       if (r?.reasoning) this.reasoning = r.reasoning as ReasoningSnapshot;
     },
 
-    /** 设置思考强度/开关（下一轮请求生效）；乐观更新 + 失败回滚 */
     async setReasoning(choice: string) {
       const prev = this.reasoning;
       this.reasoning = { ...prev, choice };
@@ -626,13 +570,10 @@ export const useAppStore = defineStore('mobile-app', {
       }
     },
 
-    /** 工作区文件检索（@ 引用文件，与客户端 search_workspace_files 一致） */
     async searchWorkspaceFiles(query: string, limit = 20): Promise<string[]> {
       const r = await rpc<Record<string, any>>('search_workspace_files', query, limit);
       return ((r?.files || []) as string[]).map(String);
     },
-
-    // ---- 事件语义（appStore.ts 子集） ----
 
     bindEvents() {
       onEvent((e) => this.applyEvent(e.type || '', e.data || {}));
@@ -647,10 +588,23 @@ export const useAppStore = defineStore('mobile-app', {
       const session = String(data.session_name || '');
       const terminal = type === 'turn_finish' || type === 'turn_cancelled' || type === 'turn_error' || type === 'turn_idle';
 
-      // 配对失效（shim 收到 4401）：停止一切交互，等待用户重新扫码
       if (type === 'pair_invalid') {
         this.pairInvalid = true;
         this.connected = false;
+        return;
+      }
+
+      if (type === 'initial_state_sync') {
+        this.applyInitialState(data);
+        return;
+      }
+
+      if (type === 'device_status') {
+        if (data.online === false) {
+          this.connected = false;
+        } else if (data.online === true && !this.connected) {
+          void this.reloadInitialState();
+        }
         return;
       }
 
@@ -665,7 +619,6 @@ export const useAppStore = defineStore('mobile-app', {
             (m) => m.role === 'user' && m.content === userText,
           );
           if (userText && !already) this.messages.push({ role: 'user', content: userText });
-          // 按回合撤销：权威 turn_id 绑定到本轮用户消息（撤销卡片定位键）
           if (data.turn_id) {
             for (let i = this.messages.length - 1; i >= 0; i--) {
               const m = this.messages[i];
@@ -751,7 +704,6 @@ export const useAppStore = defineStore('mobile-app', {
         if (!this.isForCurrent(data)) return;
         const images = (Array.isArray(data.images) ? data.images : []).map(String).filter(Boolean);
         if (!images.length) return;
-        // 挂到最近一条用户气泡（turn_start 先行、图片随后补挂，与桌面一致）
         for (let i = this.messages.length - 1; i >= 0; i--) {
           const m = this.messages[i];
           if (m.role === 'user') {
@@ -763,7 +715,6 @@ export const useAppStore = defineStore('mobile-app', {
       }
 
       if (type === 'message_queue') {
-        // 排队消息全量快照：幂等替换该会话队列（与桌面同模式，免疫事件乱序）
         const qSession = session || this.currentSession;
         const raw = Array.isArray(data.queue) ? data.queue : [];
         const list: QueuedMsg[] = raw
@@ -853,7 +804,6 @@ export const useAppStore = defineStore('mobile-app', {
       }
 
       if (type === 'permission_dismiss') {
-        // 后端权限队列已清空（超时拒绝/取消）：整体重置，与桌面语义一致
         this.permRequests = [];
         return;
       }
@@ -905,6 +855,15 @@ export const useAppStore = defineStore('mobile-app', {
 
       if (type === 'mcp_status') {
         if (Array.isArray(data.mcps)) this.mcps = data.mcps as Record<string, any>[];
+        return;
+      }
+
+      if (type === 'decision_settings_changed') {
+        this.decisionEnabled = !!data.enabled;
+        if (!this.decisionEnabled && this.permissionMode === 'auto_decision') {
+          const nextMode = String(data.permission_mode || 'confirm');
+          this.permissionMode = nextMode === 'auto_decision' ? 'confirm' : nextMode;
+        }
         return;
       }
 

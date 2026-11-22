@@ -1,12 +1,3 @@
-"""飞书指令集：解析 `/xxx` 并构造对应的卡片（对齐 opencode-mobile 的指令表）。
-
-指令表：/help /panel /status /new [标题] /list /switch <序号> /model [名] /agent /inbox /stop
-除斜杠指令外的任何消息都直接作为 prompt 发给当前绑定的星瑶会话。
-
-翻页是**无状态**的：页码放在按钮的 callback value 里（`{"kind":"cmd","cmd":"/list","arg":"page:2"}`），
-服务端不保存翻页游标——与 opencode-mobile 的「无状态翻页」一致。
-"""
-
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.feishu.cards import (
@@ -46,11 +37,21 @@ HELP_TEXT = """**星瑶 · 飞书指令**
 PERMISSION_MODES = (
     ("confirm", "变更前确认", "改动前询问；只读查询放行"),
     ("accept_edits", "自动编辑", "普通改动放行，敏感改动仍询问"),
+    ("auto_decision", "自动决策", "权限与提问由 JEV 决策，高危/越界仍确认"),
     ("plan", "计划模式", "只读，先出方案再实施"),
     ("full", "完全访问", "不再询问，全部放行"),
 )
 _MODE_SHORT = {key: short for key, short, _ in PERMISSION_MODES}
 _MODE_DESC = {key: desc for key, _, desc in PERMISSION_MODES}
+
+
+def visible_permission_modes():
+    """决策模型未开启时隐藏 auto_decision 档位。"""
+    from core.permission_auto_decision import is_decision_model_enabled
+
+    if is_decision_model_enabled():
+        return PERMISSION_MODES
+    return tuple(item for item in PERMISSION_MODES if item[0] != "auto_decision")
 
 
 def permission_mode_label(mode: str) -> str:
@@ -61,11 +62,6 @@ def permission_mode_label(mode: str) -> str:
 
 
 def whoami_text(*, open_id: str, chat_id: str, allowed: bool) -> str:
-    """`/whoami` 回执：给出填白名单要用的 open_id。
-
-    注意 open_id 是「本应用视角」的用户标识——同一个人的 open_id 在不同应用里不同，
-    所以必须用星瑶自己看到的这个值去填白名单。
-    """
     lines = [
         "你的 open_id（复制到「设置 → 飞书集成 → 审批白名单」即可）：",
         open_id or "（拿不到 open_id：请确认应用已开通 im:message 权限）",
@@ -138,7 +134,8 @@ def mode_card(*, current_mode: str, session_label: str,
         lines.append(f"**会话**　{session_label}")
     lines.append("")
     lines.append("**可选档位**")
-    for key, short, desc in PERMISSION_MODES:
+    modes = visible_permission_modes()
+    for key, short, desc in modes:
         mark = "　← 当前" if key == current_mode else ""
         lines.append(f"- {short}（`{key}`）：{desc}{mark}")
     elements: List[Dict[str, Any]] = [md("\n".join(lines))]
@@ -147,7 +144,7 @@ def mode_card(*, current_mode: str, session_label: str,
         buttons = [
             btn(f"切换到{short}", "primary" if key == "confirm" else "default",
                 {"kind": "cmd", "cmd": "/mode", "arg": key})
-            for key, short, _ in PERMISSION_MODES if key != current_mode
+            for key, short, _ in modes if key != current_mode
         ]
         if buttons:
             elements.append(btn_flow(buttons))
@@ -198,11 +195,6 @@ def status_card(*, session_label: str, session_name: str, workdir: str, model_na
 
 
 def session_list_card(*, sessions: List[Dict[str, Any]], current_session: str, page: int) -> Dict[str, Any]:
-    """会话列表卡：当前项打标 + 点按钮切换 + 无状态翻页。
-
-    每项显示工作目录（与桌面侧栏一致）：自由对话显示「自由对话」，项目会话显示其目录。
-    排序沿用后端顺序——**分组内按创建时间倒序**（最新建的在前），不是按最近活跃时间。
-    """
     elements: List[Dict[str, Any]] = [
         btn_flow([btn("🆕 新建会话", "primary", {"kind": "cmd", "cmd": "/new"})]),
     ]

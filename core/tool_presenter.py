@@ -6,11 +6,6 @@ from typing import Any
 
 
 def _agent_display_name() -> str:
-    """当前会话生效的自称（秘书会话 → 秘书名，其余 → 设置页名字）。
-
-    走 core.secretary 而非直接读设置页：工具提示里的名字属于“当前会话内的自称”，
-    秘书会话必须显示该会话的秘书名；读取失败回落默认“星瑶”（与原行为一致）。
-    """
     try:
         from core.secretary import get_active_agent_name
 
@@ -23,10 +18,14 @@ _TOOL_COPY = {
     "read_file": ("查看文件", "已查看文件", "file_path"),
     "write_file": ("写入文件", "已写入文件", "file_path"),
     "edit_file": ("修改文件", "已修改文件", "file_path"),
+    "multi_edit": ("批量修改文件", "已批量修改文件", "file_path"),
     "execute_command": ("执行命令", "命令执行完成", "command"),
     "list_directory": ("查看目录", "已查看目录", "dir_path"),
     "glob_files": ("查找文件", "文件查找完成", "pattern"),
     "search_code": ("搜索代码", "代码搜索完成", "query"),
+    "find_definition": ("跳转定义", "已查找定义", "symbol"),
+    "get_outline": ("提取文件大纲", "已生成文件大纲", "file_path"),
+    "find_references": ("查找引用", "已查找引用", "symbol"),
     "search_news": ("搜索资料", "资料搜索完成", "query"),
     "fetch_url": ("访问网址", "网址访问完成", "url"),
     "get_weather": ("查询天气", "天气查询完成", "city"),
@@ -39,18 +38,18 @@ _TOOL_COPY = {
 
 _TOOL_CATEGORIES = {
     "read_file": "read",
+    "get_outline": "read",
     "search_code": "search",
     "glob_files": "search",
+    "find_definition": "search",
+    "find_references": "search",
     "execute_command": "command",
     "write_file": "mutation",
     "edit_file": "mutation",
-    # 电脑操控单独一类：前端据此用「动作动词 + 目标」的紧凑行渲染，
-    # 而不是落到 other 变成"使用工具 computer_action"。
+    "multi_edit": "mutation",
     "computer_action": "computer",
 }
 
-# computer_action 的 kind → 中文动词。与 actions.py 的 schema 枚举对齐，
-# 未收录的 kind 回落「操作」（新增 kind 时不至于展示成空白）。
 _COMPUTER_ACTION_VERBS = {
     "observe": "观察",
     "click": "点击",
@@ -61,6 +60,7 @@ _COMPUTER_ACTION_VERBS = {
     "type_text": "输入",
     "keypress": "按键",
     "wait": "等待",
+    "wait_for": "等待条件",
     "navigate": "打开网址",
     "back": "后退",
     "forward": "前进",
@@ -78,7 +78,7 @@ _COMPUTER_ACTION_VERBS = {
 
 
 def _computer_action_target(arguments: dict) -> str:
-    """动作目标的一行摘要：控件引用 > 网址 > 组合键 > 坐标 > 窗口 > 文本长度。
+    """动作目标的一行摘要：控件引用 > 网址 > 组合键 > 坐标 > 窗口 > 序列步数 > 文本长度。
 
     优先级按"最能识别目标"排序；所有字段都只是入参原值，不含截图或正文
     （text 只输出字数，绝不回显用户输入）。
@@ -95,9 +95,15 @@ def _computer_action_target(arguments: dict) -> str:
     surface_ref = str(arguments.get("surface_ref") or "").strip()
     if surface_ref:
         return surface_ref
+    window_name = str(arguments.get("window_name") or "").strip()
+    if window_name:
+        return window_name
     x, y = arguments.get("x"), arguments.get("y")
     if isinstance(x, int) and isinstance(y, int):
         return f"({x}, {y})"
+    steps = arguments.get("steps")
+    if isinstance(steps, list) and steps:
+        return f"{len(steps)} 步"
     text = str(arguments.get("text") or "")
     if text:
         return f"{len(text)} 字"
@@ -105,7 +111,6 @@ def _computer_action_target(arguments: dict) -> str:
 
 
 def _computer_action_display(arguments: dict, result: dict, ok: bool | None) -> dict[str, object]:
-    """电脑操控动作的展示投影：动作动词 + 目标，供对话区紧凑行渲染。"""
     kind = str(arguments.get("kind") or "").strip().lower()
     error_summary = ""
     if ok is False:
@@ -126,9 +131,13 @@ _TOOL_ACTIONS = {
     "read_file": "读取文件",
     "search_code": "搜索代码",
     "glob_files": "查找文件",
+    "find_definition": "跳转定义",
+    "get_outline": "提取文件大纲",
+    "find_references": "查找引用",
     "execute_command": "运行命令",
     "write_file": "写入文件",
     "edit_file": "修改文件",
+    "multi_edit": "批量修改文件",
     "list_directory": "查看目录",
     "search_news": "搜索资料",
     "fetch_url": "访问网址",
@@ -184,6 +193,14 @@ def describe_permission_request(function_name: str, arguments: dict) -> str:
     绝不把 arguments JSON 原文直接甩给用户。
     """
     args = dict(arguments or {})
+    if function_name == "embedded_browser_recreate":
+        url = sanitize_tool_display_text(args.get("url") or "", limit=180)
+        url_line = f"当前页面：{url}\n" if url else ""
+        return (
+            "内置浏览器刷新接管确认\n"
+            f"{url_line}"
+            "当前页面未启用自动化调试端口；接管需要重建并重新加载该页面（可能丢失未保存表单、页面内存状态和导航历史）。"
+        )
     if function_name == "sandbox_outside_access":
         path = str(args.get("path") or "")
         op = str(args.get("operation") or "")
@@ -225,7 +242,6 @@ def build_tool_display(
     result: dict | None = None,
     ok: bool | None = None,
 ) -> dict[str, object]:
-    """Build presentation-safe metadata for tool activity consumers."""
     if result is not None and not isinstance(result, dict):
         raise TypeError("result must be a dict or None")
 
@@ -236,7 +252,6 @@ def build_tool_display(
     command = str(arguments.get("command", "")) if name == "execute_command" else ""
     result_data: dict[str, Any] = result or {}
     if name == "computer_action":
-        # 电脑操控走独立展示投影（动作动词 + 目标），不走通用「使用工具」文案。
         return _computer_action_display(arguments, result_data, ok)
     metrics: dict[str, int] = {}
     if name == "read_file" and ok is True:
@@ -249,7 +264,6 @@ def build_tool_display(
         error_content = str(result_data.get("content", "") or "").lstrip("🚨").strip()
         error_summary = sanitize_tool_display_text(error_content, 160)
 
-    # D8：后台语义来自工具入参，不从可变的人类文案反向推断。
     background = (
         name == "execute_command"
         and ok is True
@@ -316,8 +330,6 @@ def summarize_tool_finished(
         # 显示真实的错误信息，而非通用的"此步骤暂未完成"，
         # 让用户/LLM 知道真正的原因以便修正
         content = str(result.get("content", "") or "").strip()
-        # 剥离错误哨兵前缀（🚨）：它只用于程序化失败判定，
-        # 拼进展示文案只会在不支持 emoji 的终端变成乱码噪音
         error_hint = content.lstrip("🚨").strip() if content else ""
         # 多行错误压成一行展示；上限 160 字符，避免像原来 80 字符那样
         # 把最关键的指导语（如"请使用 read_file 工具"）截掉

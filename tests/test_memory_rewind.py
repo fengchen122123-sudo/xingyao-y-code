@@ -1,10 +1,3 @@
-"""编辑已发送消息的存储层支撑：会话截断（rewind_to_message）。
-
-编辑一条历史用户消息意味着「从这条重新分叉」：该条及其之后的全部记录都要
-消失；被压缩的摘要与多代归档也随之失真，必须同事务作废，否则模型会在新回合
-里继续看到被作废的旧结论。
-"""
-
 import pytest
 
 from core.memory import MemoryManager
@@ -18,7 +11,6 @@ def manager():
 
 
 def _seed(manager, session="edit-session"):
-    """写入 4 条消息，返回按写入顺序排列的 (id, role, content)。"""
     rows = [
         ("user", "第一条提问"),
         ("assistant", "第一条回答"),
@@ -100,7 +92,6 @@ def test_rewind_clears_summary_and_archive(manager):
 
 
 def test_last_message_id_tracks_newest_row(manager):
-    """编辑入口靠它把数据库 id 带回前端（无消息时返回 0）。"""
     rows = _seed(manager)
 
     assert manager.get_last_message_id("edit-session") == rows[-1][0]

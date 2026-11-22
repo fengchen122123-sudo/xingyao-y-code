@@ -1,8 +1,5 @@
-"""turn_undo 存储层测试：状态机、DAO、内容寻址快照仓库、令牌、纠正与 GC。"""
-
 import hashlib
 import time
-import os
 import threading
 
 import pytest
@@ -59,10 +56,6 @@ def _make_checkpoint(store, manager, session="sess-undo", turn=None, root=None, 
     )
 
 
-# ---------------------------------------------------------------------------
-# 状态机迁移表
-# ---------------------------------------------------------------------------
-
 def test_checkpoint_transition_table_accepts_legal_paths():
     require_checkpoint_transition(TurnUndoStatus.RECORDING, TurnUndoStatus.READY)
     require_checkpoint_transition(TurnUndoStatus.READY, TurnUndoStatus.REVERTING)
@@ -90,10 +83,6 @@ def test_operation_transition_rejects_skip_states():
         require_operation_transition(OperationStatus.COMMITTED, OperationStatus.PREPARING)
 
 
-# ---------------------------------------------------------------------------
-# 内容寻址快照仓库
-# ---------------------------------------------------------------------------
-
 def test_blob_store_put_read_dedupe(tmp_path):
     blob = BlobStore(tmp_path / "blobs")
     data = b"hello undo \x00 binary \xff"
@@ -101,7 +90,6 @@ def test_blob_store_put_read_dedupe(tmp_path):
     assert sha == hashlib.sha256(data).hexdigest()
     assert blob.blob_path(sha).is_file()
     assert blob.read_bytes(sha) == data
-    # 去重：同内容再写不产生第二个文件
     before_count = sum(1 for _ in (tmp_path / "blobs").rglob("*") if _.is_file())
     sha2 = blob.put_bytes(data)
     after_count = sum(1 for _ in (tmp_path / "blobs").rglob("*") if _.is_file())
@@ -129,10 +117,6 @@ def test_blob_store_streaming_write(tmp_path):
     sha = blob.put_stream(io.BytesIO(data))
     assert blob.read_bytes(sha) == data
 
-
-# ---------------------------------------------------------------------------
-# 检查点 DAO 与 record_version
-# ---------------------------------------------------------------------------
 
 def test_create_and_get_checkpoint_roundtrip(store, manager):
     cp = _make_checkpoint(store, manager, turn="t-roundtrip")
@@ -197,10 +181,6 @@ def test_parent_checkpoint_must_match_session_and_workspace(store, manager):
     assert child.parent_checkpoint_id == cp.checkpoint_id
 
 
-# ---------------------------------------------------------------------------
-# 文件记录：最初 before 保留、最终 after 替换
-# ---------------------------------------------------------------------------
-
 def _file_values(after_kind=NodeKind.REGULAR_FILE, after_sha="a" * 64, blob="b" * 64, **overrides):
     values = {
         "canonical_path": "/ws/core/tools.py",
@@ -244,7 +224,6 @@ def test_file_upsert_keeps_original_before(store, manager):
     row = store.get_file(file_id)
     assert row.before_sha256 == "0" * 64
     assert row.after_sha256 == "a" * 64
-    # 同一回合第二次修改：只替换 after
     with manager._lock:
         cursor = manager.conn.cursor()
         store.update_after_plan_locked(
@@ -256,7 +235,6 @@ def test_file_upsert_keeps_original_before(store, manager):
     assert row.before_sha256 == "0" * 64
     assert row.after_sha256 == "c" * 64
     assert row.after_blob_sha256 == "d" * 64
-    # record_version 因恢复集合变化递增
     assert store.get_checkpoint(cp.checkpoint_id).record_version > cp.record_version + 1
 
 
@@ -274,10 +252,6 @@ def test_list_files_and_uniqueness(store, manager):
     assert len(store.list_files(cp.checkpoint_id)) == 1
 
 
-# ---------------------------------------------------------------------------
-# 撤销操作与恢复链
-# ---------------------------------------------------------------------------
-
 def test_operation_lifecycle_and_parent_resolution(store, manager):
     cp = _make_checkpoint(store, manager)
     op = store.create_operation(checkpoint_id=cp.checkpoint_id, kind=OperationKind.REVERT)
@@ -287,7 +261,6 @@ def test_operation_lifecycle_and_parent_resolution(store, manager):
     store.transition_operation(op.operation_id, OperationStatus.PREPARED)
     store.transition_operation(op.operation_id, OperationStatus.APPLYING)
     store.transition_operation(op.operation_id, OperationStatus.INTERRUPTED)
-    # 恢复子操作必须引用未解决父操作且同检查点
     child = store.create_operation(
         checkpoint_id=cp.checkpoint_id, kind=OperationKind.CONTINUE_REVERT,
         parent_operation_id=op.operation_id,
@@ -310,7 +283,6 @@ def test_recovery_rejects_cross_checkpoint_and_unresolved_parent(store, manager)
     cp2 = _make_checkpoint(store, manager, turn="t-b")
     op = store.create_operation(checkpoint_id=cp1.checkpoint_id, kind=OperationKind.REVERT)
     store.transition_operation(op.operation_id, OperationStatus.PREPARING)
-    # 父操作不是 interrupted/recovery_required → 拒绝
     with pytest.raises(TurnUndoError) as exc:
         store.create_operation(
             checkpoint_id=cp1.checkpoint_id, kind=OperationKind.CONTINUE_REVERT,
@@ -320,7 +292,6 @@ def test_recovery_rejects_cross_checkpoint_and_unresolved_parent(store, manager)
     store.transition_operation(op.operation_id, OperationStatus.PREPARED)
     store.transition_operation(op.operation_id, OperationStatus.APPLYING)
     store.transition_operation(op.operation_id, OperationStatus.INTERRUPTED)
-    # 跨检查点父子关系拒绝
     with pytest.raises(TurnUndoError) as exc:
         store.create_operation(
             checkpoint_id=cp2.checkpoint_id, kind=OperationKind.CANCEL_REVERT,
@@ -340,7 +311,6 @@ def test_recovery_cycle_rejected(store, manager):
         checkpoint_id=cp.checkpoint_id, kind=OperationKind.CONTINUE_REVERT,
         parent_operation_id=op.operation_id,
     )
-    # 子操作未终态时不能成为新的父（不处于 interrupted）
     with pytest.raises(TurnUndoError):
         store.create_operation(
             checkpoint_id=cp.checkpoint_id, kind=OperationKind.CANCEL_REVERT,
@@ -358,10 +328,6 @@ def test_list_nonterminal_operations(store, manager):
     assert store.list_nonterminal_operations() == []
 
 
-# ---------------------------------------------------------------------------
-# 确认令牌
-# ---------------------------------------------------------------------------
-
 def test_confirmation_single_consumption_and_expiry(store, manager):
     cp = _make_checkpoint(store, manager)
     op = store.create_operation(checkpoint_id=cp.checkpoint_id, kind=OperationKind.REVERT)
@@ -373,7 +339,6 @@ def test_confirmation_single_consumption_and_expiry(store, manager):
     assert token == "secret-token"
     record = store.find_confirmation_by_token("secret-token")
     assert record is not None
-    # 数据库只保存哈希
     assert record["token_hash"] == hashlib.sha256(b"secret-token").hexdigest()
     with manager._lock:
         cursor = manager.conn.cursor()
@@ -385,7 +350,6 @@ def test_confirmation_single_consumption_and_expiry(store, manager):
             store.consume_confirmation_locked(cursor, token_hash=record["token_hash"])
             manager.conn.rollback()
     assert exc.value.code == UndoErrorCode.TOKEN_ALREADY_USED
-    # 未知令牌
     with manager._lock:
         cursor = manager.conn.cursor()
         with pytest.raises(TurnUndoError) as exc:
@@ -403,7 +367,6 @@ def test_confirmation_rejects_cross_boot(store, manager):
     )
     record = store.find_confirmation_by_token("tok")
     assert record["boot_id"] == tu_storage.BOOT_ID
-    # 模拟重启：BOOT_ID 变化后旧令牌拒绝消费
     old_boot = tu_storage.BOOT_ID
     try:
         tu_storage.BOOT_ID = "different-boot"
@@ -417,10 +380,6 @@ def test_confirmation_rejects_cross_boot(store, manager):
     finally:
         tu_storage.BOOT_ID = old_boot
 
-
-# ---------------------------------------------------------------------------
-# 纠正记录与后续回合计数
-# ---------------------------------------------------------------------------
 
 def test_correction_idempotent_by_operation(store, manager):
     cp = _make_checkpoint(store, manager, root="/ws-corr")
@@ -437,7 +396,6 @@ def test_correction_idempotent_by_operation(store, manager):
     assert corr1 == corr2
     rows = store.list_corrections("/ws-corr")
     assert len(rows) == 1 and rows[0]["turn_id"] == cp.turn_id
-    # 不同工作区不串
     assert store.list_corrections("/other-ws") == []
 
 
@@ -447,16 +405,11 @@ def test_count_subsequent_ready_turns(store, manager):
     time.sleep(0.003)
     cp2 = _make_checkpoint(store, manager, turn="t-2", root="/ws-n")
     store.transition_checkpoint(cp2.checkpoint_id, TurnUndoStatus.READY)
-    # 早回合视角：之后有 1 个完成回合；晚回合视角：0
     assert store.count_subsequent_ready_turns(
         cp1.session_id, "/ws-n", cp1.started_at_ms, cp1.turn_id) == 1
     assert store.count_subsequent_ready_turns(
         cp2.session_id, "/ws-n", cp2.started_at_ms, cp2.turn_id) == 0
 
-
-# ---------------------------------------------------------------------------
-# message_turn_links
-# ---------------------------------------------------------------------------
 
 def test_message_turn_links_same_transaction(store, manager):
     cp = _make_checkpoint(store, manager)
@@ -511,12 +464,7 @@ def test_message_turn_links_unknown_kind_and_missing_checkpoint(store, manager):
         manager.conn.rollback()
 
 
-# ---------------------------------------------------------------------------
-# 保留策略与 GC
-# ---------------------------------------------------------------------------
-
 def test_retention_expires_old_checkpoints_but_keeps_lifecycle(store, manager):
-    # 最旧的已撤销检查点：验证超限过期只动快照保留状态、不覆盖 reverted 事实
     revoked = _make_checkpoint(store, manager, turn="t-rev2", root="/ws-ret")
     store.transition_checkpoint(revoked.checkpoint_id, TurnUndoStatus.READY)
     store.transition_checkpoint(revoked.checkpoint_id, TurnUndoStatus.REVERTING)
@@ -537,11 +485,9 @@ def test_retention_expires_old_checkpoints_but_keeps_lifecycle(store, manager):
 
     expired = store.expire_retained_checkpoints(store.resolve_session_id("sess-undo"), keep=50)
     assert len(expired) >= 5
-    # 最新 50 个保持 available；被撤销回合生命周期不被覆盖，仅快照过期
     revoked_row = store.get_checkpoint(revoked.checkpoint_id)
     assert revoked_row.status_enum is TurnUndoStatus.REVERTED
     assert revoked_row.availability_enum is SnapshotAvailability.EXPIRED
-    # recording 检查点永不过期
     active = _make_checkpoint(store, manager, turn="t-active", root="/ws-ret")
     store.expire_retained_checkpoints(store.resolve_session_id("sess-undo"), keep=50)
     assert store.get_checkpoint(active.checkpoint_id).availability_enum \
@@ -552,7 +498,6 @@ def test_gc_removes_only_unreferenced_blobs(store, manager, tmp_path):
     blob = store.blob_store
     keep_sha = blob.put_bytes(b"kept")
     drop_sha = blob.put_bytes(b"dropped")
-    # keep_sha 先建立数据库引用，drop_sha 无引用
     cp = _make_checkpoint(store, manager, root="/ws-gc")
     store.transition_checkpoint(cp.checkpoint_id, TurnUndoStatus.READY)
     with manager._lock:
@@ -565,7 +510,6 @@ def test_gc_removes_only_unreferenced_blobs(store, manager, tmp_path):
     assert store.collect_blob_garbage() >= 1
     assert blob.blob_path(drop_sha).exists() is False
     assert blob.blob_path(keep_sha).exists()
-    # 过期检查点的 blob 不再受保护
     store.expire_retained_checkpoints(store.resolve_session_id("sess-undo"), keep=0)
     store.collect_blob_garbage()
     assert not blob.blob_path(keep_sha).exists()

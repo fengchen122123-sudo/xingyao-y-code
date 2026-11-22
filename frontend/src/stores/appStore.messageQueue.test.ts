@@ -16,7 +16,6 @@ it('message_queue 事件全量替换该会话排队队列', () => {
   expect(store.currentMessageQueue).toHaveLength(1);
   expect(store.currentMessageQueue[0]).toEqual({ id: 'q1', text: '第一条', attachments: ['d:/a.txt'] });
 
-  // 空快照清空队列（补发完成后）
   store.handleBridgeEvent({ type: 'message_queue', data: { session_name: 's1', queue: [] } } as any);
   expect(store.currentMessageQueue).toHaveLength(0);
   expect('s1' in store.messageQueues).toBe(false);
@@ -37,11 +36,9 @@ it('运行中发送消息进入排队：不乐观渲染气泡、不清运行态'
 
   await store.sendMessage('排队消息', []);
 
-  // 未乐观渲染用户气泡 / running 占位（等补发回合的 turn_start 再渲染）
   const msgs = store.sessionRuntimeByName['s1'].messages;
   expect(msgs).toHaveLength(1);
   expect(msgs.some(m => m.content === '排队消息')).toBe(false);
-  // 原回合仍在运行：运行态不被清除（停止按钮不消失、后续发送继续入队）
   expect(store.runningSessions).toContain('s1');
   expect(store.sessionRuntimeByName['s1'].running).toBe(true);
 });

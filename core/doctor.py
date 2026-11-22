@@ -1,16 +1,3 @@
-"""core/doctor.py — `/doctor` 聚合自检（CLI 部分）。
-
-一键检查运行环境/配置/凭据/数据目录/数据库/MCP/模型端点/GUI 运行时，
-统一排障入口；输出人类可读版（入口层渲染）与 `--json` 版
-（schema 固定：name/status/detail/hint）。
-
-设计约束（实施计划与验收清单 · T3）：
-- 每项检查独立函数；单项内部异常必须隔离为 fail，绝不向外抛出；
-- 只读诊断：除数据目录做一次“写入-删除”自测临时文件外不做任何写入；
-- 网络探测仅模型端点一项（默认短超时），`skip_network=True` 时整项跳过；
-- 不引入第三方依赖（仅标准库 + 项目既有模块）；
-- 凭据只做“解密探活”，不把密钥发往任何地方。
-"""
 from __future__ import annotations
 
 import json
@@ -22,7 +9,6 @@ import config
 from core import credentials
 from core.version import __version__ as YCODE_VERSION
 
-# 检查状态：ok=通过 / warn=警告（可继续使用）/ fail=失败 / skip=跳过
 STATUS_OK = "ok"
 STATUS_WARN = "warn"
 STATUS_FAIL = "fail"
@@ -42,7 +28,6 @@ class CheckResult:
     hint: str = ""
 
     def to_dict(self) -> dict:
-        # 固定插入顺序，保证 --json 输出字段顺序稳定
         return {
             "name": self.name,
             "status": self.status,
@@ -51,12 +36,7 @@ class CheckResult:
         }
 
 
-# ---------------------------------------------------------------------------
-# 基础 IO 入口（测试可定点替换）
-# ---------------------------------------------------------------------------
-
 def _load_config() -> dict:
-    """读取当前生效配置（含 TOML overlay 与 DPAPI 解密后的 provider 密钥）。"""
     return config._load()
 
 
@@ -77,11 +57,6 @@ def _active_base_url() -> str:
 
 
 def _probe_endpoint(url: str, timeout: float) -> tuple[bool, str]:
-    """轻量探测 API 端点连通性（不带任何凭据）。
-
-    返回 (是否可达, 细节)：任何 HTTP 响应（含 401/404）都说明端点可达——
-    provider 根路径的返回码因厂商而异，仅连接层失败才算不可达。
-    """
     import urllib.error
     import urllib.request
 
@@ -102,7 +77,6 @@ def _probe_endpoint(url: str, timeout: float) -> tuple[bool, str]:
 
 
 def _quick_check(path: str) -> str:
-    """对一个 SQLite 库执行 PRAGMA quick_check(1)，返回检查串（正常为 "ok"）。"""
     import sqlite3
 
     connection = sqlite3.connect(path, timeout=2.0)
@@ -112,10 +86,6 @@ def _quick_check(path: str) -> str:
         connection.close()
     return str(row[0]) if row else ""
 
-
-# ---------------------------------------------------------------------------
-# ① 环境与版本
-# ---------------------------------------------------------------------------
 
 def check_environment() -> CheckResult:
     python_text = f"Python {sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}"
@@ -130,10 +100,6 @@ def check_environment() -> CheckResult:
         )
     return CheckResult("环境与版本", STATUS_OK, detail)
 
-
-# ---------------------------------------------------------------------------
-# ② 配置
-# ---------------------------------------------------------------------------
 
 def check_config() -> CheckResult:
     data = _load_config()
@@ -163,17 +129,13 @@ def check_config() -> CheckResult:
         "配置",
         STATUS_WARN,
         "；".join(issues),
-        "未知键多为拼写错误，请删除或修正；权限模式可选 confirm / accept_edits / plan / full",
+        "未知键多为拼写错误，请删除或修正；权限模式可选 confirm / accept_edits / auto_decision / plan / full",
     )
 
 
-# ---------------------------------------------------------------------------
-# ③ 凭据
-# ---------------------------------------------------------------------------
-
 def check_credentials() -> CheckResult:
     data = _load_config()
-    entries = []  # [(provider 显示名, 原始 api_key)]
+    entries = []
     providers = data.get("providers")
     if isinstance(providers, list) and providers:
         for provider in providers:
@@ -182,7 +144,6 @@ def check_credentials() -> CheckResult:
             label = str(provider.get("name") or provider.get("id") or "未命名 provider")
             entries.append((label, str(provider.get("api_key") or "")))
     else:
-        # 旧版单模型配置：密钥在顶层 api_key
         entries.append(("默认模型（旧版配置）", str(data.get("api_key") or "")))
 
     configured = [(label, raw) for label, raw in entries if raw]
@@ -212,10 +173,6 @@ def check_credentials() -> CheckResult:
     return CheckResult("凭据", STATUS_OK, f"{len(configured)} 个 API Key 解密正常")
 
 
-# ---------------------------------------------------------------------------
-# ④ 数据目录
-# ---------------------------------------------------------------------------
-
 def check_data_dir() -> CheckResult:
     root = str(config.YCODE_DIR)
     try:
@@ -233,10 +190,6 @@ def check_data_dir() -> CheckResult:
         )
     return CheckResult("数据目录", STATUS_OK, f"{root} 可读写")
 
-
-# ---------------------------------------------------------------------------
-# ⑤ 数据库
-# ---------------------------------------------------------------------------
 
 def check_databases() -> CheckResult:
     targets = (
@@ -270,10 +223,6 @@ def check_databases() -> CheckResult:
     return CheckResult("数据库", STATUS_OK, detail)
 
 
-# ---------------------------------------------------------------------------
-# ⑥ MCP
-# ---------------------------------------------------------------------------
-
 def check_mcp() -> CheckResult:
     path = str(config.MCP_FILE or "")
     if not path or not os.path.exists(path):
@@ -292,8 +241,6 @@ def check_mcp() -> CheckResult:
     if not isinstance(servers, dict) or not servers:
         return CheckResult("MCP 服务", STATUS_OK, "未配置 MCP 服务")
 
-    # 与连接前强制复核使用同一规则（命令白名单 + env 危险键拒绝），
-    # 提前暴露手工编辑 mcp.json 造成的“连得上才报错”问题
     from core.mcp_client import _validate_mcp_launch
 
     problems = []
@@ -314,10 +261,6 @@ def check_mcp() -> CheckResult:
         )
     return CheckResult("MCP 服务", STATUS_OK, f"{len(servers)} 个 MCP 服务启动参数合法")
 
-
-# ---------------------------------------------------------------------------
-# ⑦ 模型端点连通
-# ---------------------------------------------------------------------------
 
 def check_model_endpoint(*, skip_network: bool = False) -> CheckResult:
     if skip_network:
@@ -345,10 +288,6 @@ def check_model_endpoint(*, skip_network: bool = False) -> CheckResult:
     )
 
 
-# ---------------------------------------------------------------------------
-# ⑧ GUI 运行时
-# ---------------------------------------------------------------------------
-
 def check_gui_runtime() -> CheckResult:
     if sys.platform != "win32":
         return CheckResult("GUI 运行时", STATUS_SKIP, "非 Windows 平台，无需 WebView2")
@@ -364,10 +303,6 @@ def check_gui_runtime() -> CheckResult:
         f"下载安装：{gui_runtime_check.WEBVIEW2_DOWNLOAD_URL}",
     )
 
-
-# ---------------------------------------------------------------------------
-# 聚合入口
-# ---------------------------------------------------------------------------
 
 def _safe_check(name: str, func, kwargs: dict) -> CheckResult:
     """执行单项检查；任何异常都隔离为 fail，绝不向外抛出。"""
@@ -387,7 +322,6 @@ def _safe_check(name: str, func, kwargs: dict) -> CheckResult:
             f"检查返回了意外类型：{type(result).__name__}",
             "该项内部错误已被隔离，其余检查不受影响",
         )
-    # name 以注册名为准，保证 --json 的检查项名称稳定
     return CheckResult(name, result.status, result.detail, result.hint)
 
 

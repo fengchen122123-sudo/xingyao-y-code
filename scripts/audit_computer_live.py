@@ -1,8 +1,3 @@
-"""显式人工审计探针：真实浏览器仅访问本地测试页；desktop 模式仅截图。
-
-不调用 Provider，不读用户浏览器 profile，不进入自动 pytest。
-"""
-
 import argparse
 import json
 import sys
@@ -55,7 +50,6 @@ def browser_probe(channel):
     with tempfile.TemporaryDirectory(prefix="ycode-audit-profile-") as directory:
         from core.computer.platforms import get_platform_adapter
 
-        # 与生产接线一致：窗口标题提示由平台层提供（R5 受控页裁决）。
         hint_provider = getattr(get_platform_adapter(), "browser_window_hints", None)
         backend = BrowserComputerBackend(
             channel, Path(directory) / "profile", window_hint_provider=hint_provider
@@ -71,7 +65,6 @@ def browser_probe(channel):
             print(json.dumps(item, ensure_ascii=False), flush=True)
             return value
 
-        # _call 只用于测试页状态断言和 fixture 设置，始终在 backend worker 线程读取。
         def read(expression):
             return backend._call("audit oracle", lambda: backend.active_page.evaluate(expression))
 
@@ -105,11 +98,8 @@ def browser_probe(channel):
                 first = backend.active_page
                 second = backend._context.new_page()
                 second.goto(base + "/second")
-                # 两页同标题无法由窗口标题消歧：fixture 给第二页换不同标题。
                 second.evaluate("document.title = 'YCODE AUDIT SECOND'")
                 first.bring_to_front()
-                # fixture 同步：标签切换在渲染进程/系统侧异步生效，等窗口标题
-                # 真正反映第一页再断言（夹具同步，不是生产逻辑里的固定 sleep）。
                 deadline = time.perf_counter() + 5
                 while time.perf_counter() < deadline:
                     hints = backend._window_hint_provider(backend._browser_pid) or []
@@ -151,7 +141,6 @@ def _platform_hint_provider():
 
 
 def _profile_orphans(profile_resolved: str) -> int:
-    """统计仍以受控 profile 目录启动的浏览器进程数（退出校验）。"""
     import psutil
 
     count = 0
@@ -170,11 +159,6 @@ def _profile_orphans(profile_resolved: str) -> int:
 
 
 def browser_process_probe(channel):
-    """R2 第二段真实验收：进程模式（受管子进程）完整生命周期 + 停止边界。
-
-    只用公开 execute/observe 边界驱动；断言依据页面真实回显（title 更新）
-    与进程树退出（profile 无孤儿进程），不读取 Playwright 内部对象。
-    """
     results = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -294,7 +278,7 @@ def browser_process_probe(channel):
                 daemon=True,
             )
             in_flight.start()
-            time.sleep(0.3)  # 让在飞导航进入子进程执行
+            time.sleep(0.3)
             close_started = time.perf_counter()
             backend.close()
             close_ms = round((time.perf_counter() - close_started) * 1000, 1)
@@ -315,7 +299,6 @@ def browser_process_probe(channel):
                 admission_reject_under_200ms=rejected_fast,
                 orphan_browser_processes=orphans,
             )
-            # profile 执行权已释放：新实例可显式重开。
             retry = BrowserComputerBackend(
                 channel,
                 profile,
@@ -336,12 +319,6 @@ def browser_process_probe(channel):
 
 
 def browser_window_matrix_probe(channel):
-    """R5 真机矩阵：多窗口焦点跟踪 + 后台标签页零误操作。
-
-    地址栏聚焦与 DevTools 前台属于浏览器 UI 层，Playwright/CDP 无法驱动
-    （浏览器快捷键不经 renderer 分发）；其 fail-closed 行为由模拟测试覆盖，
-    此处验证可驱动的真实窗口场景。
-    """
     results = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -378,7 +355,6 @@ def browser_window_matrix_probe(channel):
             read(main_page, "document.title='YCODE MATRIX MAIN'")
             record("matrix_setup", True)
 
-            # 真实第二 OS 窗口（popup features）。
             read(
                 main_page,
                 "window.open('about:blank','_blank','popup,width=480,height=360')",
@@ -388,8 +364,6 @@ def browser_window_matrix_probe(channel):
                 time.sleep(0.05)
             popup = backend._context.pages[-1]
             read(popup, "document.title='YCODE MATRIX POPUP'")
-            # fixture：自动化环境有焦点防抢占，显式把 popup 窗口置前台。
-            # Playwright 对象归属 worker 线程：fixture 一律经 _call 派发。
             backend._call("fixture popup front", lambda: popup.bring_to_front())
             # popup 置前台后：观察必须落到 popup 页（窗口标题提示裁决）。
             assert wait_foreground_prefix("YCODE MATRIX POPUP"), "popup 未成为前台窗口"
@@ -399,7 +373,6 @@ def browser_window_matrix_probe(channel):
                 observation.page_title == "YCODE MATRIX POPUP",
                 title=observation.page_title,
             )
-            # 焦点切回主窗口：观察跟随主窗口，且点击落在主窗口页面。
             backend._call(
                 "fixture main front", lambda: main_page.bring_to_front()
             )
@@ -563,17 +536,12 @@ def desktop_input_probe():
         root.update()
         root.lift()
         root.focus_force()
-        # 测试进程由后台命令启动，显式激活自己创建的窗口后才执行输入。
         import ctypes
         user32 = ctypes.windll.user32
         user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         user32.GetAncestor.restype = ctypes.c_void_p
         user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
         test_hwnd = user32.GetAncestor(root.winfo_id(), 2)
-        # 前台获取是夹具同步：前台锁在别的进程手里时 SetForegroundWindow 会
-        # 失败。合法路径：AttachThreadInput 附加到前台线程后 SetForegroundWindow
-        # 再分离（我们自己的测试窗口，不触碰其他应用内容）；有界重试，
-        # 仍拿不到则 probe 的前台校验拒绝输入（正确 fail-closed）。
         kernel32 = ctypes.windll.kernel32
         user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         user32.GetWindowThreadProcessId.restype = ctypes.c_uint
@@ -607,7 +575,6 @@ def desktop_input_probe():
         record("desktop_move", lambda: execute("move", x=x, y=y), lambda: True)
         record("desktop_click", lambda: execute("click", x=x, y=y), lambda: counts["click"] == 1)
         record("desktop_right_click", lambda: execute("click", x=x, y=y, button="right"), lambda: counts["right"] == 1)
-        # 独立测试双击，避开前一击仍在系统双击时间窗内的干扰。
         import ctypes
         time.sleep(ctypes.windll.user32.GetDoubleClickTime()/1000 + 0.05)
         record("desktop_double_click", lambda: execute("double_click", x=x, y=y), lambda: counts["double"] >= 1)
@@ -629,15 +596,6 @@ def desktop_input_probe():
 
 
 def desktop_surfaces_probe():
-    """R10 真实验收矩阵：微信窗口/托盘候选定位与打开（到此为止）。
-
-    三段流程（本机可执行部分）：
-    A. 窗口可见 → activate_surface 置前台并复核前台标题；
-    B. 窗口可见 → WM_CLOSE 收起到托盘（礼貌关闭，不终止进程）→ 复核消失；
-    C. 窗口隐藏 → 托盘展开按钮 → 飞出面板重列候选 → 调用微信隐藏区图标
-       → 验证窗口重新出现且在前台。
-    绝不发送消息、不修改账号设置；不以 Invoke/SendInput 返回成功充数。
-    """
     from core.computer.windows_backend import WindowsComputerBackend
 
     backend = WindowsComputerBackend.create_default()
@@ -693,8 +651,6 @@ def desktop_surfaces_probe():
         )
 
         locator = backend._surface_locator
-        # 0. 窗口不可见时先经托盘 Invoke 恢复（保证 A/B/C 顺序可执行；
-        #    托盘 Invoke 是切换动作：隐藏→显示）。
         windows = wechat_windows(candidates)
         if not windows:
             fresh = locator.list_tray_icons()
@@ -709,9 +665,6 @@ def desktop_surfaces_probe():
                 windows = wait_wechat_window()
             record("restore_wechat_window_for_matrix", bool(windows))
 
-        # A. 窗口可见 → activate（唯一候选时）。探针从控制台进程启动，首轮
-        # 常被前台锁拒绝——夹具级有界重试（生产代码不加重试：模型看到明确
-        # 错误后自行决定，探针只模拟“看到错误后重试一次”的合理行为）。
         candidates = list_candidates()
         windows = wechat_windows(candidates)
         if windows:
@@ -741,7 +694,6 @@ def desktop_surfaces_probe():
                 ref=activated["ref"] if activated else "",
                 attempts_last_error=last_error,
             )
-            # 激活失败（前台锁重试仍被拒）→ 跳过前台复核与 B 段，不假装已激活。
             if activated:
                 observation = backend.observe("surface-audit")
                 record(
@@ -750,7 +702,6 @@ def desktop_surfaces_probe():
                     ok=any(key in observation.window_title for key in ("微信", "WeChat", "Weixin")),
                 )
 
-                # B. 礼貌关闭 → 窗口收入托盘（消失于顶层窗口列表）。
                 locator = backend._surface_locator
                 hwnd = locator._native_keys[activated["ref"]]
                 locator._host.close_window(hwnd)
@@ -765,8 +716,6 @@ def desktop_surfaces_probe():
         else:
             record("activate_wechat_window", "no_visible_window", ok=False)
 
-        # C. 隐藏区展开流程：expander → 飞出面板枚举 → 按微信图标实际所在
-        # 区域选择候选并语义调用 → 验证窗口重新出现且在前台。
         candidates = list_candidates()
         expander = [c for c in candidates if "显示隐藏的图标" in c["label"]]
         if not (expander and "invoke" in expander[0]["operations"]):
@@ -778,7 +727,6 @@ def desktop_surfaces_probe():
                            surface_ref=expander[0]["ref"],
                            surface_generation=expander[0]["surface_generation"]),
         )
-        # 飞出面板枚举：来自 Overflow/Xaml 宿主的候选即隐藏区图标。
         hidden_candidates = []
         deadline = time.perf_counter() + 4
         while time.perf_counter() < deadline and not hidden_candidates:
@@ -788,7 +736,6 @@ def desktop_surfaces_probe():
                 if "Overflow" in source or "Xaml" in source:
                     hidden_candidates.append(c)
         if not hidden_candidates:
-            # Invoke 是 toggle：第一次可能把已开的飞出面板关上了，再试一次。
             fresh = locator.list_tray_icons()
             expander = [c for c in fresh if "显示隐藏的图标" in c.label]
             if expander and "invoke" in expander[0]["operations"]:
@@ -838,7 +785,6 @@ def desktop_surfaces_probe():
         if restore_candidate is None:
             record("hidden_overflow_wechat_window_opened", False)
             return results
-        # 隐藏区候选同时验证局部原分辨率区域的坐标点击；仅使用最近观察的区域坐标。
         coordinate_ok = None
         if source_note == "hidden_overflow":
             candidate_ref = restore_candidate.ref
@@ -861,9 +807,6 @@ def desktop_surfaces_probe():
                 )
                 coordinate_ok = bool(wait_wechat_window())
             record("hidden_overflow_coordinate_click", coordinate_ok, source=source_note)
-        # Invoke path remains the semantic comparison for the same candidate.
-        # Invoke 是切换动作：坐标点击若已把窗口打开，再次 invoke 会把它收回去——
-        # 此时记录 invoke_skipped，不拿 toggle 充当失败。
         if coordinate_ok:
             reopened = True
             record(
@@ -937,9 +880,6 @@ def desktop_apps_probe():
         record(app, ok=True, foreground_title=local.window_title, local_size=[local.width, local.height], screen_changed=changed, duration_ms=round((time.perf_counter() - started) * 1000, 1))
 
     try:
-        # 用唯一命名临时文件启动记事本并按文件名匹配窗口：Win11 记事本是
-        # 单实例多标签且恢复上次会话，按进程名/通用标题匹配可能命中用户
-        # 自己的窗口（曾导致把验收文本打进用户会话标签——已修复）。
         notepad_tmp = Path(tempfile.gettempdir()) / f"ycode-apps-audit-{os.getpid()}.txt"
         notepad_tmp.write_text("", encoding="utf-8")
         notepad = subprocess.Popen(
@@ -959,7 +899,6 @@ def desktop_apps_probe():
             hwnd = backend._surface_locator._native_keys[match[0]["ref"]]
             backend._surface_locator._host.close_window(hwnd)
             time.sleep(0.5)
-            # 若弹出保存对话框（缓冲区有修改），发送 Alt+N（不保存）后重试关闭验证。
             gone = not windows_for("notepad.exe", (marker,))
             if not gone:
                 backend.execute("apps-audit", ComputerAction(kind="keypress", target="desktop", keys=("ALT", "N")))

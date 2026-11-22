@@ -1,5 +1,3 @@
-"""core/git/models.py 单元测试：错误码契约、脱敏与操作状态机（规格 §7.4/§14）。"""
-
 import pytest
 
 from core.git.models import (
@@ -17,7 +15,6 @@ from core.git.models import (
     validate_operation_state,
 )
 
-# 规格 §7.4 错误码契约表（"至少包含" + 追加 invalid_state）
 SPEC_ERROR_CODES = {
     "git_not_found",
     "git_version_unsupported",
@@ -91,7 +88,6 @@ def test_redact_text_keeps_clean_text():
 
 
 def test_state_machine_idle_phase_coupling():
-    # kind==IDLE ⇔ phase==NONE（冻结契约）
     validate_operation_state(OperationKind.IDLE, OperationPhase.NONE, ())
     with pytest.raises(GitError) as exc:
         validate_operation_state(OperationKind.IDLE, OperationPhase.RUNNING, ())
@@ -104,13 +100,9 @@ def test_state_machine_idle_phase_coupling():
 
 def test_state_machine_conflicts_are_orthogonal():
     conflict = ConflictEntry(path="a.txt", kind="both_modified")
-    # Rebase 冲突：kind=rebase + phase=paused_for_conflict + conflicts 非空
     validate_operation_state(OperationKind.REBASE, OperationPhase.PAUSED_FOR_CONFLICT, (conflict,))
-    # Rebase 停在 Edit 步骤可以没有冲突（规格 §14）
     validate_operation_state(OperationKind.REBASE, OperationPhase.PAUSED_FOR_EDIT, ())
-    # Idle 但遗留冲突（外部工具制造）：冲突维度独立，合法可表示
     validate_operation_state(OperationKind.IDLE, OperationPhase.NONE, (conflict,))
-    # 中断状态合法
     validate_operation_state(OperationKind.CHERRY_PICK, OperationPhase.INTERRUPTED, ())
 
 
@@ -153,7 +145,6 @@ def test_snapshot_value_object_holds_contract_fields():
     )
     assert snapshot.ahead == 2 and snapshot.behind == 1
     assert snapshot.staged[0].path == "a.py"
-    # frozen：不可变
     with pytest.raises(Exception):
         snapshot.ahead = 5
     assert SnapshotVersions(worktree_version="w").worktree_version == "w"

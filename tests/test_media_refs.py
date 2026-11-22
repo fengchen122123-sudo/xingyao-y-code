@@ -1,5 +1,3 @@
-"""tests/test_media_refs.py —— 媒体引用解析器测试。"""
-
 import os
 
 import pytest
@@ -88,7 +86,6 @@ def test_attach_media_manifest_to_persisted_copy(media_dir):
     attach_media_manifest(msg)
     items = msg["_display"]["media_v1"]["items"]
     assert len(items) == 1 and items[0]["kind"] == "image"
-    # 原 _display 字段保留
     assert msg["_display"]["model_id"] == "m"
 
 
@@ -99,7 +96,6 @@ def test_attach_media_manifest_skips_non_assistant(media_dir):
 
 
 def test_attach_propagates_infra_error(monkeypatch, tmp_path):
-    # 仓库不可写 → 契约要求显式失败而非静默降级
     from core import media_store
 
     def boom(path, workdir=None):

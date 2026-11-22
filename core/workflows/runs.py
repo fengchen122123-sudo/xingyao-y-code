@@ -1,15 +1,3 @@
-"""星流工作流运行记录（ycode.db ``workflow_runs`` 表）。
-
-「什么时候执行、执行得怎么样」的台账：``workflow_run`` 工具发起执行时落一条
-``running`` 记录并拿到 run_id；模型按契约在收尾时调 ``workflow_finish`` 回写
-终态（成功 / 失败 + 一句话结论）。应用启动时把遗留 ``running`` 一律标记为
-``interrupted``（与星轨自动化同款恢复语义——记录只是历史，绝不自动重放）。
-
-存储经 ``init_run_storage(manager)`` 注入（gui_bridge 启动时）；未注入（CLI /
-headless、或测试未初始化）时 ``get_run_storage()`` 返回 None，工具层全部
-best-effort 降级——工作流照常执行，只是不留台账。
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,7 +8,6 @@ from typing import Callable, Optional
 
 logger = logging.getLogger("ycode.workflows")
 
-#: 终态集合：finish 只允许 running → completed/failed；interrupted 仅由恢复写入。
 RUN_STATUSES = ("running", "completed", "failed", "interrupted")
 FINISH_STATUSES = ("completed", "failed")
 
@@ -54,7 +41,6 @@ _RUNS_TABLE_DDL = (
 )
 
 
-#: 行 → dict 的列序（SELECT * 依赖建表列序，显式列出防漂移）。
 _RUN_COLUMNS = (
     "id",
     "workflow_name",
@@ -106,8 +92,6 @@ class WorkflowRunStorage:
             for ddl in _RUNS_TABLE_DDL:
                 cursor.execute(ddl)
             self.conn.commit()
-
-    # -- 写入 --
 
     def create_run(
         self,
@@ -185,8 +169,6 @@ class WorkflowRunStorage:
             self.conn.commit()
             return cursor.rowcount
 
-    # -- 读取 --
-
     def get_run(self, run_id: str) -> Optional[dict]:
         with self._manager._lock:
             row = self.conn.execute(
@@ -210,8 +192,6 @@ class WorkflowRunStorage:
                     (limit,),
                 ).fetchall()
         return [_row_to_run(row) for row in rows]
-
-    # -- 节点级事件（解释执行器的进度流）--
 
     def append_event(self, run_id: str, kind: str, payload: dict) -> int:
         """落一条运行事件，返回 seq；台账未初始化时返回 0（best-effort）。"""
@@ -270,11 +250,8 @@ class WorkflowRunStorage:
 
 _storage: Optional[WorkflowRunStorage] = None
 
-#: 实时事件汇（gui_bridge 注册 → emit_event 推前端）；签名 (run_id, kind, payload)。
 _event_sink: Optional[Callable] = None
 
-#: 取消事件提供器（gui_bridge 注册）；签名 () -> threading.Event | None，
-#: 返回当前会话/回合的取消事件，解释执行器据此协作中断。
 _cancel_provider: Optional[Callable] = None
 
 

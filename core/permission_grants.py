@@ -1,5 +1,3 @@
-"""In-memory permission grants isolated by stable task/session identifiers."""
-
 from __future__ import annotations
 
 import threading

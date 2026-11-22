@@ -5,8 +5,6 @@ import { useAppStore } from './appStore';
 import type { SystemSettingsSnapshot } from '../types/pywebview';
 
 
-// 显式标注快照类型：context_watermark_base 的 null 字面量会被推断为 null 类型，
-// 导致构造「保存成功」新快照时赋数值报 TS2322
 const settings: SystemSettingsSnapshot = {
   command_shell: 'powershell',
   command_shell_available: true,
@@ -44,6 +42,7 @@ const settings: SystemSettingsSnapshot = {
   computer_platform_supported: true,
   computer_hotkey_available: true,
   computer_hotkey: 'Ctrl+Alt+Esc',
+  subagent_enabled: true,
   computer_active_model_capability: { model: '', eligible: false },
   computer_run: {
     run_id: '',
@@ -143,8 +142,6 @@ describe('system settings store', () => {
     expect(store.systemSettings.agent_turn_step_limit).toBe(200);
   });
 
-  // ── 上下文水位基准：同样只以后端返回快照覆盖，不做乐观持久值 ──
-
   it('persists a context watermark base and applies the returned snapshot', async () => {
     const next = structuredClone(settings);
     next.context_watermark_base = 800000;
@@ -188,8 +185,6 @@ describe('system settings store', () => {
     expect(store.systemSettings.context_watermark_base).toBeNull();
   });
 
-  // ── 电脑操控设置（Task 12）：只以后端返回快照覆盖，不做乐观持久值 ──
-
   it('rolls back to backend snapshot when browser enable preflight fails', async () => {
     const disabledSettings = structuredClone(settings);
     disabledSettings.browser_control_enabled = false;
@@ -225,7 +220,6 @@ describe('system settings store', () => {
 
     expect(ok).toBe(true);
     expect(disable).toHaveBeenCalledWith(false);
-    // 关闭调用后快照立即 false（即使后端清理尚在进行）
     expect(store.systemSettings.browser_control_enabled).toBe(false);
   });
 
@@ -264,8 +258,6 @@ describe('system settings store', () => {
     expect(enable).toHaveBeenCalledWith(true);
     expect(store.systemSettings.computer_control_enabled).toBe(true);
   });
-
-  // ── AI 生成内容目录（Task 5）：只以后端返回快照覆盖，失败即回滚 ──
 
   it('persists the AI output directory and applies the returned snapshot', async () => {
     const next = structuredClone(settings);

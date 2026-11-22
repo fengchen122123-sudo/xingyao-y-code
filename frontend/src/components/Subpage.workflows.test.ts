@@ -15,9 +15,6 @@ function mountSubpage(api: Record<string, unknown> = {}) {
   });
 }
 
-// 星流面板如今是星轨子页里的一个标签：从星轨入口进入后点标签切换过来。
-// openSubpage 改的是 store.subpage，而 subType prop 由 App.vue 绑定 ——
-// 测试里用 setProps 模拟 App 层对 store 变化的响应。
 async function mountViaTab(api: Record<string, unknown> = {}) {
   (window as any).pywebview = { api };
   const wrapper = mount(Subpage, {
@@ -54,7 +51,6 @@ describe('Subpage - 星流工作流', () => {
 
   it('从星轨标签页切入星流：分组空态与对话创建入口', async () => {
     const wrapper = await mountViaTab();
-    // tab 切换走真实 openSubpage（幂等置值），星流面板渲染
     expect(wrapper.find('[data-test="workflow-import-btn"]').exists()).toBe(true);
     expect(wrapper.find('[data-test="workflow-group-user"]').exists()).toBe(true);
     expect(wrapper.text()).toContain('还没有全局工作流');
@@ -66,7 +62,6 @@ describe('Subpage - 星流工作流', () => {
     expect(wrapper.text()).toContain('全局');
     expect(wrapper.text()).toContain('对所有项目可见');
     expect(wrapper.text()).toContain('还没有全局工作流');
-    // 自由对话（无项目目录）下不显示项目组
     expect(wrapper.find('[data-test="workflow-group-project"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="workflow-create-user"]').exists()).toBe(true);
   });
@@ -88,7 +83,7 @@ describe('Subpage - 星流工作流', () => {
 
     expect(prefillSpy).toHaveBeenCalledWith('帮我创建一个工作流：');
     expect(closeSpy).toHaveBeenCalled();
-    expect(sendSpy).not.toHaveBeenCalled(); // 只写草稿，发送交给用户
+    expect(sendSpy).not.toHaveBeenCalled();
   });
 
   it('修改入口：带工作流名预填输入框并关闭子页', async () => {
@@ -118,7 +113,7 @@ describe('Subpage - 星流工作流', () => {
     store.workdir = 'E:/work/demo';
     const wrapper = mountSubpage();
     expect(wrapper.find('[data-test="workflow-group-project"]').exists()).toBe(true);
-    expect(wrapper.text()).toContain('demo'); // 项目名作为组标题
+    expect(wrapper.text()).toContain('demo');
     expect(wrapper.text()).toContain('当前项目里还没有保存的工作流');
     expect(wrapper.find('[data-test="workflow-create-project-empty"]').exists()).toBe(true);
   });
@@ -158,12 +153,10 @@ describe('Subpage - 星流工作流', () => {
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="workflow-run-pr-review"]').trigger('click');
 
-    // 必填未填：拦截且不发消息
     await wrapper.find('[data-test="workflow-run-send"]').trigger('click');
     expect(sendSpy).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain('参数 base 必填');
 
-    // 填必填后发送：prompt 携带工作流名与参数；默认值留空不注入
     await wrapper.find('[data-test="workflow-arg-base"]').setValue('origin/main');
     await wrapper.find('[data-test="workflow-run-send"]').trigger('click');
     expect(sendSpy).toHaveBeenCalledTimes(1);
@@ -236,7 +229,6 @@ describe('Subpage - 星流工作流', () => {
     expect(box.text()).toContain('base=origin/main');
     expect(box.text()).toContain('3m30s');
 
-    // 再点收起
     await wrapper.find('[data-test="workflow-history-pr-review"]').trigger('click');
     expect(wrapper.find('[data-test="workflow-history-box-pr-review"]').exists()).toBe(false);
   });

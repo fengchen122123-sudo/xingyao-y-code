@@ -1,15 +1,3 @@
-"""渠道请求形态覆盖在压缩链路（compression scope）生效。
-
-来自 待开发/网关请求形态覆盖/设计规格与实施计划.md §4.3（全 scope 一致）、
-§6 V5（全 scope 一致）、§7 R9（compression 未生效缺口）、§9.4。
-
-压缩请求不经过 `_provider_request_options`（那条出口会带 max_tokens /
-thinking / allowed_openai_params，改变压缩请求字节），而是在
-`_provider_cache_affinity_options(...)` 之后单独合并
-`_apply_route_request_overrides`，语义与 provider options 出口一致：
-headers → extra_headers、body → extra_body。
-"""
-
 import pytest
 
 import core.memory_compressor as mc
@@ -33,7 +21,6 @@ class _Resp:
 
 @pytest.fixture(autouse=True)
 def _reset_override_cache():
-    """每个用例前后强制重读配置（同 tests/test_route_overrides_body.py 的先例）。"""
     import core.route_overrides as mod
 
     mod._cache["entry"] = None
@@ -42,7 +29,6 @@ def _reset_override_cache():
 
 
 def _fake_overrides(monkeypatch, data):
-    """把 route_request_overrides 的配置源换成测试数据并强制重读。"""
     import core.route_overrides as overrides
 
     monkeypatch.setattr(overrides, "_load_config_for_overrides", lambda: data)
@@ -67,12 +53,6 @@ def _seed_history(manager, count, filler=3):
 
 @pytest.fixture(autouse=True)
 def _no_secondary(monkeypatch):
-    """禁用副模型、固定窗口、强制字符估算，并堵掉插入式压缩分支。
-
-    复制自 tests/test_memory_compressor_chunks.py，额外把
-    `_get_keepalive_snapshot` 置 None：避免走 insert_mode 支线（那条支线用
-    保活快照，本身已带 extra_headers/extra_body），确保断言的是分段路径。
-    """
     monkeypatch.setattr(
         "core.model_manager.get_secondary_roles", lambda: {"compression": False}
     )
@@ -95,7 +75,6 @@ def _no_secondary(monkeypatch):
 
 
 def _capture_request(monkeypatch):
-    """桩掉压缩模型调用，返回被调用时的 kwargs 列表。"""
     captured = []
 
     def fake_completion(**kwargs):
@@ -107,7 +86,6 @@ def _capture_request(monkeypatch):
 
 
 def test_compression_request_carries_route_override(manager, monkeypatch):
-    """配置命中域名时，压缩请求带上覆盖的头与体。"""
     _fake_overrides(monkeypatch, {"route_request_overrides": [{
         "match": "tokenrhythm.studio",
         "headers": {"X-Test": "1"},
@@ -128,7 +106,6 @@ def test_compression_request_carries_route_override(manager, monkeypatch):
 
 
 def test_compression_request_untouched_without_override(manager, monkeypatch):
-    """未命中任何覆盖配置时，压缩请求字节零变化（不带 extra_headers/覆盖键）。"""
     _fake_overrides(monkeypatch, {})
     captured = _capture_request(monkeypatch)
     _seed_history(manager, 11)
@@ -145,7 +122,6 @@ def test_compression_request_untouched_without_override(manager, monkeypatch):
 
 
 def test_compression_override_merges_with_affinity_options(manager, monkeypatch):
-    """覆盖项与亲和参数是合并而非替换：prompt_cache_key 与覆盖键同时在场。"""
     _fake_overrides(monkeypatch, {"route_request_overrides": [{
         "match": "tokenrhythm.studio",
         "headers": {"X-Test": "1"},

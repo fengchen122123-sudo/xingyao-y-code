@@ -1,4 +1,3 @@
-"""线程本地工作目录上下文，替代进程级 os.chdir/Path.cwd 以支持多会话并行。"""
 import contextlib
 import threading
 from pathlib import Path

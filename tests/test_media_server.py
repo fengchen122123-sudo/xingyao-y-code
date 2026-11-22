@@ -1,7 +1,4 @@
-"""tests/test_media_server.py —— 受控媒体 HTTP 服务测试。"""
-
 import os
-import threading
 import urllib.error
 import urllib.request
 
@@ -50,7 +47,6 @@ def test_200_serves_blob_with_immutable_cache(server, blob):
     assert headers["Content-Type"] == "image/png"
     assert "immutable" in headers.get("Cache-Control", "")
     assert headers.get("Accept-Ranges") == "bytes"
-    # 前端"复制原图"fetch Blob 依赖 CORS 头（令牌才是访问控制边界）
     assert headers.get("Access-Control-Allow-Origin") == "*"
 
 
@@ -60,7 +56,6 @@ def test_wrong_token_returns_404(server, blob):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _fetch(bad)
     assert exc.value.code == 404
-    # 缺 token 同样 404
     no_token = url.split("?")[0]
     with pytest.raises(urllib.error.HTTPError) as exc:
         _fetch(no_token)
@@ -83,11 +78,9 @@ def test_range_requests(server, blob):
     assert status == 206
     assert body == PNG_BYTES[:10]
     assert headers["Content-Range"] == f"bytes 0-9/{len(PNG_BYTES)}"
-    # 开放尾区间
     status, headers, body = _fetch(url, headers={"Range": "bytes=90-"})
     assert status == 206
     assert body == PNG_BYTES[90:]
-    # 越界起点 → 416
     with pytest.raises(urllib.error.HTTPError) as exc:
         _fetch(url, headers={"Range": f"bytes={len(PNG_BYTES)}-"})
     assert exc.value.code == 416
@@ -109,11 +102,7 @@ def test_blob_name_whitelist():
         assert blob_name_is_safe("b" * 64 + ext), (mime, ext)
 
 
-# ---- 媒体 URL → 本地 Blob 路径反解（"另存为"用） ----
-
-
 def test_local_path_for_url_roundtrip(server, blob):
-    """本服务签发的 URL 应反解回真实存在的 Blob 文件路径。"""
     url = server.public_url(blob, "png")
     resolved = server.local_path_for_url(url)
     assert resolved is not None
@@ -122,25 +111,21 @@ def test_local_path_for_url_roundtrip(server, blob):
 
 
 def test_local_path_for_url_rejects_foreign_and_bad(server, blob):
-    """错令牌、缺令牌、非本机地址、非本服务端口、非法文件名一律拒绝。"""
     url = server.public_url(blob, "png")
     assert server.local_path_for_url(url.replace("t=", "t=wrong")) is None
     assert server.local_path_for_url(url.split("?")[0]) is None
     assert server.local_path_for_url("") is None
     assert server.local_path_for_url("https://example.com/m/" + blob + ".png") is None
     assert server.local_path_for_url("file:///" + blob + ".png") is None
-    # 同主机不同端口：不是本服务
     assert server.local_path_for_url(
         f"http://127.0.0.1:1/m/{blob}.png?t={server._token}"
     ) is None
-    # 文件名不合白名单
     assert server.local_path_for_url(
         f"{server.base_url()}/m/not-a-blob.png?t={server._token}"
     ) is None
 
 
 def test_local_path_for_url_missing_blob_returns_none(server):
-    """格式合法但仓库里没有该 Blob → None（不抛异常）。"""
     missing = "0" * 64
     url = server.public_url(missing, "png")
     assert server.local_path_for_url(url) is None

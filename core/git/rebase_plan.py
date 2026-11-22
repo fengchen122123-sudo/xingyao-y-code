@@ -1,16 +1,9 @@
-"""Interactive Rebase 计划读取与改写（规格 §5.10/§7 阶段任务）。
-
-实现方式：不解析/生成面向终端的 ASCII 文本，直接操作 Git 的 todo 文件——
-以临时 `GIT_SEQUENCE_EDITOR`（指向自身写入器）方式参与 `git rebase -i`
-流程；读取时解析 todo 文件为结构化行。崩溃/中断后不自动继续（§14）。
-"""
-
 from __future__ import annotations
 
 import os
 import tempfile
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from core.git.models import GitError, GitErrorCode, RepositoryIdentity
 from core.git.runner import GitRunner
@@ -38,7 +31,6 @@ def read_rebase_plan(runner: GitRunner, identity: RepositoryIdentity) -> List[Re
 
 
 def parse_plan_text(text: str) -> List[RebasePlanLine]:
-    """解析 todo 文本为结构化行；注释行忽略（纯函数，表驱动测试）。"""
     lines: List[RebasePlanLine] = []
     for raw in text.splitlines():
         line = raw.strip()

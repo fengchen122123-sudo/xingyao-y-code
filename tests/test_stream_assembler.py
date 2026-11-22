@@ -158,7 +158,6 @@ def test_deepseek_thinking_tool_call_preserves_empty_reasoning_string():
 
 
 def test_deepseek_thinking_text_reply_keeps_empty_reasoning_string():
-    """无工具调用的常规回复也要带空串：留 None 会让下一轮历史缺字段，被上游拒绝。"""
     assembler = StreamAssembler(require_tool_call_reasoning=True)
     assembler.consume(_chunk(content="拉好了"))
 
@@ -192,8 +191,6 @@ def test_non_reasoning_provider_strips_unsupported_reasoning_fields():
 
 
 def test_finish_drops_tool_call_with_empty_name_and_keeps_valid_sibling():
-    """Agnes 网关 400 场景：流式残缺调用（空 name/空 arguments）必须在
-    进入历史（内存/DB/DeepSeek 账本）之前丢弃，合法兄弟调用原样保留。"""
     assembler = StreamAssembler()
     assembler.consume(_chunk(tool_calls=[
         _tool_call(0, "call-bad", "", ""),
@@ -208,7 +205,6 @@ def test_finish_drops_tool_call_with_empty_name_and_keeps_valid_sibling():
 
 
 def test_finish_normalizes_empty_arguments_to_empty_object():
-    """有名字无参数的调用按无参调用回放 "{}"，不再携带非法的空串参数。"""
     assembler = StreamAssembler()
     assembler.consume(_chunk(tool_calls=[
         _tool_call(0, "call-1", "list_dir", ""),
@@ -222,7 +218,6 @@ def test_finish_normalizes_empty_arguments_to_empty_object():
 
 
 def test_finish_repairs_truncated_arguments_to_wire_valid_json():
-    """截断 JSON 参数按执行层同源的三段解析规整为可回放字节。"""
     assembler = StreamAssembler()
     assembler.consume(_chunk(tool_calls=[
         _tool_call(0, "call-1", "read_file", '{"file_path": "a.py'),
@@ -235,7 +230,6 @@ def test_finish_repairs_truncated_arguments_to_wire_valid_json():
 
 
 def test_finish_drops_tool_call_with_unparseable_arguments():
-    """三段解析全部失败的调用整体丢弃，绝不把非法 JSON 送进历史。"""
     assembler = StreamAssembler()
     assembler.consume(_chunk(tool_calls=[
         _tool_call(0, "call-1", "read_file", "not-json{{"),

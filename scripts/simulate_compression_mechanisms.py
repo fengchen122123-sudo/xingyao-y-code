@@ -1,28 +1,3 @@
-"""零成本模拟二：压缩机制专项——429 自适应冷却 / DeepSeek 账本基线与主动轮换代 / 取消与增量恢复。
-
-全部走生产路径（compress_session_memory / prepare_turn_messages / _prepare_deepseek_ledger_request /
-真实 SQLite / 真实 tiktoken），唯一替换点仍是 core.llm._dispatch_completion 桩，零 API 成本。
-
-三个专项：
-  C  429 自适应段间冷却
-     C1 新默认（延时 0，无 429）→ 段间 gap ≈ 0；
-     C2 第 1 段首调 429 → 重试成功后，后续段间 gap ≈ 2.0s（自适应冷却粘住整次压缩）；
-     C3 显式配置 inter_chunk_delay_seconds=1.5 → gap 恒 1.5s（老配置无条件兼容）。
-  D  DeepSeek 账本路由
-     D1 基线修正：同一会话同一份真实用量（112k），官方路由采信 112k，
-        中转路由 min 口径回落到本地估算（~31%）——水位判断天壤之别；
-     D2 主动轮换代：96% 水位真实回合 → Tier3 压缩落库 → 登记轮换代 +
-        用户提示 → 下一笔账本请求消费标记 force_new，代内容换成压缩后瘦身历史；
-     D3 反例：压缩失败（熔断语义）→ 不登记轮换代，consume 返回 False。
-  E  取消与增量恢复
-     4 段压缩进行到第 2 段 LLM 调用中取消 → 已完成段落落库保留、
-     中止处状态 partial_cancelled、守卫释放；再次压缩从已提交水位续推，
-     只压剩余段（增量恢复，不重复付费）。
-
-时间尺度压缩说明（等比缩放、语义不变）：429 重试基础退避 5.0s → 0.5s；
-桩 LLM 延迟 0.0002s/字符（≈4.8s/万 token 段）。自适应冷却 2.0s 与显式
-配置 1.5s 保持真实值以便精确测量。
-"""
 import sys
 import os
 import time
@@ -59,7 +34,7 @@ BASE_CFG = {
 
 
 class Fake429(Exception):
-    status_code = 429  # is_rate_limit_error 按 status_code 判定
+    status_code = 429
 
 
 class StubLLM:
@@ -67,9 +42,9 @@ class StubLLM:
 
     def __init__(self, spc=0.0002):
         self.spc = spc
-        self.fail_first_n = 0      # 前 N 次调用抛 429
-        self.fail_all = False      # 全部抛普通异常（熔断反例）
-        self.calls = []            # (t_start, t_end, status)
+        self.fail_first_n = 0
+        self.fail_all = False
+        self.calls = []
         self.ok_count = 0
         self.in_call = threading.Event()
 
@@ -144,7 +119,7 @@ def part_c(tmp):
     ):
         mgr, sess = make_mgr(tmp, "c_" + label[:2]), "sess_c"
         mgr.add_messages(sess, [("user", "开始")])
-        fill_to(mgr, sess, 0.58)  # ≈3 段
+        fill_to(mgr, sess, 0.58)
         stub = StubLLM()
         stub.fail_first_n = fail_first
         orig = llm._dispatch_completion
@@ -183,15 +158,12 @@ def part_d(tmp):
     print("D · DeepSeek 账本路由：基线修正 / 主动轮换代")
     print("=" * 70)
 
-    # ---- D1 基线修正 ----
     mgr, sess = make_mgr(tmp, "d1"), "sess_d1"
     mgr.add_messages(sess, [("user", "开始")])
-    est = fill_to(mgr, sess, 0.31)  # 工作副本 ~31%（压缩后的瘦历史形态）
+    est = fill_to(mgr, sess, 0.31)
     mgr.add_token_usage("openai", "deepseek-v4", 110000, 2000, None, 112000,
                         session_id=sess, api_base=DEEPSEEK_BASE, cache_scope="main")
     hist = mgr.get_history_for_llm(sess)
-    # baseline 内部固定按 CLI 口径（is_gui=False）组装系统提示词估算，
-    # 与 fill_to 返回的 GUI 口径略有差异，这里用同一口径对齐断言
     cli_est = agent_service.estimate_history_tokens_with_system(
         DEEPSEEK_MODEL, hist, is_gui=False)
     b_ledger = agent_service.get_session_token_baseline(
@@ -199,7 +171,7 @@ def part_d(tmp):
     b_relay = agent_service.get_session_token_baseline(
         mgr, sess, DEEPSEEK_MODEL, history=hist, api_base=RELAY_BASE)
     mgr.add_token_usage("openai", "qwen9-flash", 80000, 1000, None, 81000,
-                        session_id=sess, cache_scope="main")  # 跨模型真实记录
+                        session_id=sess, cache_scope="main")
     b_cross = agent_service.get_session_token_baseline(
         mgr, sess, DEEPSEEK_MODEL, history=hist, api_base=DEEPSEEK_BASE)
     print("[D1] 工作副本估算 %d（%.0f%%），真实用量 112000（87.5%%）" % (est, est / WINDOW * 100))
@@ -211,10 +183,9 @@ def part_d(tmp):
     assert b_cross == cli_est, "跨模型应丢弃旧真实记录"
     print("     D1 ✔ 修复生效：同一数据，官方路由水位 87.5%% vs 中转 31%%\n")
 
-    # ---- D2 主动轮换代（真实回合走 Tier3 → 登记 → 下一笔账本请求重建） ----
     mgr, sess = make_mgr(tmp, "d2"), "sess_d2"
     mgr.add_messages(sess, [("user", "开始")])
-    fill_to(mgr, sess, 0.96)  # 96%+ 水位，Tier3 同步压缩
+    fill_to(mgr, sess, 0.96)
     hist_fat = mgr.get_history_for_llm(sess)
     stub = StubLLM()
     orig = llm._dispatch_completion
@@ -233,7 +204,6 @@ def part_d(tmp):
         assert rot_notice, "应出现主动轮换代提示"
         print("[D2] 96%% 水位回合：Tier3 同步压缩 %.1fs 完成，用户提示：「%s」"
               % (time.time() - t0, re.sub(r"<[^>]+>", "", rot_notice[0])[:52]))
-        # 下一笔账本请求：入口消费标记 → force_new 重建
         gen2 = llm._prepare_deepseek_ledger_request(
             mgr, sess, DEEPSEEK_MODEL, DEEPSEEK_BASE, "main",
             mgr.get_history_for_llm(sess), [])
@@ -249,7 +219,6 @@ def part_d(tmp):
         assert consumed_again is False
         print("     D2 ✔ 登记→提示→消费→force_new 重建→一次性，全链路正确\n")
 
-        # ---- D3 反例：压缩失败不登记 ----
         mgr, sess = make_mgr(tmp, "d3"), "sess_d3"
         mgr.add_messages(sess, [("user", "开始")])
         fill_to(mgr, sess, 0.96)
@@ -279,8 +248,8 @@ def part_e(tmp):
     print("=" * 70)
     mgr, sess = make_mgr(tmp, "e"), "sess_e"
     mgr.add_messages(sess, [("user", "开始")])
-    fill_to(mgr, sess, 0.75)  # ≈4 段
-    stub = StubLLM()  # 快桩：每段约 4.4s，取消点可控地落在第 2 段调用中
+    fill_to(mgr, sess, 0.75)
+    stub = StubLLM()
     orig = llm._dispatch_completion
     llm._dispatch_completion = stub
     try:
@@ -293,19 +262,16 @@ def part_e(tmp):
 
         th = threading.Thread(target=run, daemon=True)
         th.start()
-        # 等第 2 段的 LLM 调用进行中（第 1 段已 ok）再取消
         deadline = time.monotonic() + 120
         while not (stub.ok_count >= 1 and stub.in_call.is_set()):
             if time.monotonic() > deadline:
                 raise RuntimeError("等待压缩推进超时")
             time.sleep(0.05)
-        time.sleep(1.0)  # 确保已进入第 2 段调用体内部深处
+        time.sleep(1.0)
         cancel.set()
         th.join(120)
         out = result["outcome"]
         saved = sum(1 for _, m in notices if "段压缩进度" in m)
-        # 语义：已落库段落 → status=compressed + reason=partial_cancelled
-        # （_finish_with_progress：有进度就算部分成功，partial_* 是 reason）
         print("[E1] 第 2 段调用中取消 → status=%s reason=%s，已落库段数=%d"
               % (out.status, out.reason, saved))
         assert out.status == "compressed" and out.reason == "partial_cancelled" and saved >= 1, "应中止且保留已完成段"
@@ -318,13 +284,11 @@ def part_e(tmp):
               % (len(row[0] or ""), row[1]))
         assert row[1], "CAS 水位应已推进"
 
-        # ---- E2 从已提交水位续推 ----
         stub2 = StubLLM()
         llm._dispatch_completion = stub2
         notices2 = []
         out2 = compress(mgr, sess, notices2)
         seg = re.search(r"分 (\d+) 段", "".join(m for _, m in notices2))
-        # 剩余内容 ≤ 一段时压缩器不发分段提示（reg 匹配不到），说明增量已很少
         n_seg = int(seg.group(1)) if seg else 1
         seg_desc = ("第 1/1 段直接压缩（剩余不足一段）" if not seg
                     else "分 %d 段" % n_seg)
@@ -339,7 +303,7 @@ def part_e(tmp):
 def main():
     tmp = tempfile.mkdtemp(prefix="sim_mech_")
     orig_backoff = mc.COMPRESSION_RATE_LIMIT_BASE_DELAY_SECONDS
-    mc.COMPRESSION_RATE_LIMIT_BASE_DELAY_SECONDS = 0.5  # 时间尺度压缩（5.0→0.5）
+    mc.COMPRESSION_RATE_LIMIT_BASE_DELAY_SECONDS = 0.5
     try:
         part_c(tmp)
         part_d(tmp)

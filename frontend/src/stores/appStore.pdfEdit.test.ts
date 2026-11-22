@@ -13,7 +13,6 @@ const EDITED_PDF = 'D:\\proj\\计划_已编辑_1.pdf';
 const SOURCE_DOCX = 'D:\\docs\\季度报告.docx';
 const CACHED_PDF = 'C:\\Users\\x\\.ycode\\exports\\preview\\office_ab12.pdf';
 
-// 一条最小的合法高亮操作（validateOps 口径）
 const OPS = [
   {
     kind: 'annot',
@@ -42,11 +41,9 @@ it('普通 PDF 保存副本：out_path 交给后端默认命名，成功后重�
 
   const res = await store.savePdfEdits(OPS, 'copy');
 
-  // 普通 PDF：第四个参数留空，后端在源文件同目录按时间戳命名
   expect(save).toHaveBeenCalledTimes(1);
   expect(save).toHaveBeenCalledWith(SOURCE_PDF, OPS, 'copy', '');
   expect(res).toMatchObject({ ok: true, path: EDITED_PDF, pages: 2 });
-  // 保存后把新文件重新开进「文档」页签：后续编辑针对的是新 PDF，不是原来那份
   expect(store.docPreviewRequest?.path).toBe(EDITED_PDF);
   expect(store.docPreviewRequest?.name).toBe('计划_已编辑_1.pdf');
   expect(store.docPreviewNonce).toBe(nonceBefore + 1);
@@ -97,7 +94,6 @@ it('Office 转换文档保存副本：副本落在源 docx 同目录，而不是
   const res = await store.savePdfEdits(OPS, 'copy');
 
   expect(res?.ok).toBe(true);
-  // 源文档路径（不是缓存 PDF）作为编辑目标，out_path 前端拼到源文档目录
   expect(save).toHaveBeenCalledWith(
     SOURCE_DOCX,
     OPS,

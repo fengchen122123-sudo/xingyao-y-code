@@ -1,19 +1,3 @@
-"""批量派活（dispatch_batch）+ 依赖推进器（_advance_dependents）。
-
-覆盖（升级设计 2026-11-04 第 6 节 / 实施计划任务 6）：
-1. 两个无依赖任务 → 两条台账 running，且都被派发；
-2. 三条任务、第三条依赖前两条 → 第三条第 blocked，前两条 running，依赖落成真实 id；
-3. depends_on 下标越界 → 抛 SecretaryDispatchError；
-4. depends_on 成环 → 抛错且文案含环路径；
-5. 9 条任务 → 超限抛错；
-6. 上游 done → 推进器把下游置 running 并派发（假 bridge 记录 _spawn_turn_worker）；
-7. 上游 failed → 下游 blocked（原因含上游 id）并级联到更深下游；
-8. 下游依赖两个上游、只有一个 done → 下游仍 blocked。
-
-风格对齐 tests/test_secretary_dispatch_ledger.py：ApiBridge.__new__ 裸实例 + 桩函数，
-台账用真 DispatchStore（临时 sqlite 的 MemoryManager），不 mock 存储层。
-"""
-
 import json
 import os
 import sys
@@ -35,7 +19,6 @@ from gui_bridge import ApiBridge
 
 @pytest.fixture(autouse=True)
 def _clean_singleton():
-    """每个用例前后清理模块级单例，避免用例互相污染。"""
     secretary_dispatch.unregister()
     yield
     secretary_dispatch.unregister()
@@ -43,7 +26,6 @@ def _clean_singleton():
 
 @pytest.fixture()
 def manager(tmp_path):
-    """独立临时 DB 的 MemoryManager，并注册为 app_context 当前管理器。"""
     m = MemoryManager(str(tmp_path / "ycode.db"))
     prev_ctx = app_context.get()
     prev_manager = app_context.get_manager()
@@ -62,10 +44,8 @@ def manager(tmp_path):
 
 
 def _make_bridge(manager, *, is_turn_active=False):
-    """构造仅含调度所需内部状态的裸桥实例，并注册调度服务句柄。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._shutting_down = False
-    # 秘书会话是派发的发起方：完成通知按它路由
     bridge._current_session = "s_secretary"
     bridge._turn_start_lock = threading.Lock()
     bridge._message_queues = {}
@@ -111,7 +91,6 @@ def _two_sessions(manager):
 
 
 def _wait_until(predicate, timeout=3.0):
-    """轮询等待推进器线程生效（它在独立 daemon 线程里跑，调用方不等待）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -121,16 +100,10 @@ def _wait_until(predicate, timeout=3.0):
 
 
 def _spawned_sessions(spawned):
-    """假 _spawn_turn_worker 记录里的目标会话名（第 2 个位置参数）。"""
     return [str(args[1]) for args, _kwargs in spawned]
 
 
-# ---------------------------------------------------------------------------
-# 批量派活：解析 / 落库 / 派发
-# ---------------------------------------------------------------------------
-
 def test_batch_two_independent_tasks_both_dispatched(manager):
-    """两个无依赖任务：两条台账都是 running，且各自被派发一次。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
 
@@ -156,7 +129,6 @@ def test_batch_two_independent_tasks_both_dispatched(manager):
     assert store.get(res["items"][0]["dispatch_id"])["title"] == "甲活"
     assert store.get(res["items"][0]["dispatch_id"])["prompt"] == "甲的正文"
 
-    # 两条都被真正派发，且 dispatch_context 指向各自的台账 id
     assert _spawned_sessions(spawned) == ["项目甲", "项目乙"]
     contexts = [kwargs["secretary_dispatch_context"] for _args, kwargs in spawned]
     assert [ctx["dispatch_id"] for ctx in contexts] == [
@@ -166,7 +138,6 @@ def test_batch_two_independent_tasks_both_dispatched(manager):
 
 
 def test_batch_dependent_task_blocked_until_upstreams(manager):
-    """第三条依赖前两条：第三条第 blocked（不派发），依赖落成真实的 dispatch_id。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
 
@@ -189,16 +160,13 @@ def test_batch_dependent_task_blocked_until_upstreams(manager):
     store = _store(manager)
     assert store.get(third_id)["status"] == "blocked"
     assert store.get(third_id)["depends_on"] == [first_id, second_id]
-    # blocked 是终态：建行时就按终态口径带错误原因（此处为空，等上游结论填）
     assert store.get(third_id)["finished_at"] == ""
     assert store.get(first_id)["status"] == "running"
     assert store.get(second_id)["status"] == "running"
-    # 有依赖项不派发：只有前两条真的起了回合
     assert _spawned_sessions(spawned) == ["项目甲", "项目乙"]
 
 
 def test_batch_depends_on_out_of_range_rejected(manager):
-    """depends_on 下标越界：直接拒绝，且不落任何台账行。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
 
@@ -214,7 +182,6 @@ def test_batch_depends_on_out_of_range_rejected(manager):
 
 
 def test_batch_cycle_rejected(manager):
-    """depends_on 成环（0→1→0）：拒绝并给出环路径。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
 
@@ -232,7 +199,6 @@ def test_batch_cycle_rejected(manager):
 
 
 def test_batch_over_eight_tasks_rejected(manager):
-    """单批超过 8 条：拒绝并提示上限。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
 
@@ -245,12 +211,7 @@ def test_batch_over_eight_tasks_rejected(manager):
     assert spawned == []
 
 
-# ---------------------------------------------------------------------------
-# 依赖推进器：上游 done → 下游自动启动
-# ---------------------------------------------------------------------------
-
 def test_advance_dispatches_downstream_when_upstream_done(manager):
-    """上游 done：推进器把下游置 running 并派发，notice 说明已自动启动。"""
     _two_sessions(manager)
     bridge, spawned, events = _make_bridge(manager)
     res = _service().dispatch_batch(tasks=[
@@ -283,12 +244,7 @@ def test_advance_dispatches_downstream_when_upstream_done(manager):
     assert any("自动启动" in text for text in notices)
 
 
-# ---------------------------------------------------------------------------
-# 依赖推进器：上游 failed → 下游 blocked（递归级联）
-# ---------------------------------------------------------------------------
-
 def test_advance_blocks_downstream_chain_when_upstream_failed(manager):
-    """上游 failed：直接下游 blocked（原因含上游 id），更深下游也 blocked。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
     res = _service().dispatch_batch(tasks=[
@@ -310,20 +266,13 @@ def test_advance_blocks_downstream_chain_when_upstream_failed(manager):
     assert store.get(second_id)["status"] == "blocked"
     assert store.get(third_id)["status"] == "blocked"
     assert "失败" in store.get(second_id)["error"]
-    # 级联文案同时指出直接上游与失效源头
     assert f"#{second_id}" in store.get(third_id)["error"]
     assert store.get(second_id)["finished_at"]
     assert store.get(third_id)["finished_at"]
-    # 阻断不等于派发：没有新的回合被启动
     assert len(spawned) == before
 
 
-# ---------------------------------------------------------------------------
-# 依赖推进器：多上游只完成一部分 → 下游继续等
-# ---------------------------------------------------------------------------
-
 def test_advance_keeps_downstream_blocked_with_partial_dependencies(manager):
-    """下游依赖两个上游、只有一个 done：下游仍 blocked 且不被派发。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
     res = _service().dispatch_batch(tasks=[
@@ -338,28 +287,17 @@ def test_advance_keeps_downstream_blocked_with_partial_dependencies(manager):
     _store(manager).mark_status(first_id, "done", result_excerpt="一半好了")
     bridge._advance_dependents(first_id)
 
-    # 给推进线程足够时间跑完，再确认它确实没动下游
     time.sleep(0.3)
     assert _store(manager).get(downstream_id)["status"] == "blocked"
     assert len(spawned) == before
 
 
-# ---------------------------------------------------------------------------
-# 工具策略：新工具只对秘书可见、按 system 口径登记
-# ---------------------------------------------------------------------------
-
 def test_dispatch_batch_is_secretary_only_tool():
-    """dispatch_batch 在秘书白名单里（system 作用域不会被只读门控自动放行）。"""
     assert "dispatch_batch" in secretary.SECRETARY_ONLY_TOOLS
     assert secretary.secretary_allows_tool("dispatch_batch", "system") is True
 
 
-# ---------------------------------------------------------------------------
-# 工具层与排队路径
-# ---------------------------------------------------------------------------
-
 def test_tool_layer_returns_json_and_readable_errors(manager):
-    """core.tools.dispatch_batch：成功返回 JSON，非法入参转成可读提示不抛异常。"""
     _two_sessions(manager)
     bridge, spawned, _events = _make_bridge(manager)
     from core import tools
@@ -379,7 +317,6 @@ def test_tool_layer_returns_json_and_readable_errors(manager):
 
 
 def test_batch_busy_target_goes_queued_with_ledger_id(manager):
-    """目标会话忙：台账落 queued，排队条目带台账 id 供补发回填。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, _events = _make_bridge(manager, is_turn_active=True)
 

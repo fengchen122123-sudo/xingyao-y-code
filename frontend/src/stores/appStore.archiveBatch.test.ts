@@ -2,9 +2,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { useAppStore } from './appStore';
 
-// 归档区批量恢复 / 批量删除的 store 层契约：一次桥接调用处理多个会话，
-// 直接采用后端回传的两侧快照（不做乐观增删），并按成功项回传名字列表。
-
 function archivedEntry(name: string, archivedAt: string) {
   return {
     name,
@@ -69,7 +66,6 @@ it('batchUnarchiveSessions 部分失败时提示失败条数，仍回传成功�
   expect(String(notify.mock.calls[0][1])).toContain('1 个失败');
 });
 
-// 可逆操作不弹确认框：恢复只走桥接，不产生 askConfirm
 it('batchUnarchiveSessions 不弹二次确认框', async () => {
   const unarchive_sessions = vi.fn(async () => ({
     ok: true, success: true, count: 1, names: ['a'], failed: [],

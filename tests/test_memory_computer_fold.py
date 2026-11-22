@@ -1,5 +1,3 @@
-"""回合收尾折叠会话全部电脑操控观察图（提速计划 Task 6）。"""
-
 from __future__ import annotations
 
 import json
@@ -50,7 +48,6 @@ def test_fold_removes_all_computer_images_including_latest(mm):
     for (raw,) in rows:
         assert "image_url" not in raw
         assert "已折叠" in raw
-        # _computer_v1 私有元数据原样保留
         assert "_computer_v1" in raw
 
 
@@ -61,7 +58,6 @@ def test_fold_is_idempotent(mm):
 
 
 def test_fold_never_touches_plain_media_messages(mm):
-    """无 _computer_v1 的普通多模态消息不触碰（职责归 _fold_stale_media_locked）。"""
     mm.conn.execute(
         "INSERT INTO messages(session_id, role, content) VALUES (?, 'user', ?)",
         (

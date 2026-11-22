@@ -1,23 +1,3 @@
-"""飞书卡片结构自检：把各类卡片发到真实会话，让飞书校验器逐张验收。
-
-为什么需要它：飞书对卡片结构极其严格，结构有问题时**整卡被拒**，而用户侧只看到
-「发消息没回复」——历史上已经踩过两次（表单内元素重名 230099/11310、note 标签）。
-单元测试能挡住一部分红线（见 tests/test_feishu_cards.py），但平台校验器才是最终裁判，
-本脚本把"我们的卡片能不能被飞书接受"变成一条可随时执行的命令。
-
-用法：
-    # 只打印卡片 JSON 与体积，不发送（CI/离线可用）
-    python scripts/feishu_card_check.py --dry-run
-
-    # 发到「最后一次说话的会话」（凭据与 chat 从配置/绑定状态读取）
-    python scripts/feishu_card_check.py --send
-
-    # 发到指定会话，或只挑几张
-    python scripts/feishu_card_check.py --send --chat oc_xxx --only completion,permission
-
-退出码：0 = 全部卡片被飞书接受；1 = 有卡片被拒（附飞书返回的 ErrPath/ErrMsg）。
-"""
-
 import argparse
 import json
 import os
@@ -51,7 +31,6 @@ from core.feishu.commands import (  # noqa: E402
 )
 from core.feishu.config import load_feishu_config  # noqa: E402
 
-# 测试用假数据（真实 request_id 不存在，卡片上的按钮点了会提示"已失效"，属预期）
 SESSION_LABEL = "飞书 · ou_abcdefgh"
 WORKDIR = r"D:\pxx\xingyao-y-code"
 SESSIONS = [

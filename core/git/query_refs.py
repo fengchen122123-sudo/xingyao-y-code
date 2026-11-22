@@ -1,9 +1,3 @@
-"""只读查询（规格 §5.5/§5.7/§5.9/§5.12）：分支、历史、Diff、Blame、Reflog、Tag、Remote、Stash。
-
-全部使用机器可读格式（NUL 分隔的 for-each-ref / 自定义 --format），
-不解析本地化人类输出；Remote URL 一律脱敏。
-"""
-
 from __future__ import annotations
 
 import re
@@ -15,11 +9,9 @@ from core.git.models import RepositoryIdentity
 from core.git.repository import normalize_repo_path
 from core.git.runner import ExecScope, GitRunner
 
-_RS = "\x1e"  # 记录分隔符（RS）
+_RS = "\x1e"
 _US = "\x1f"  # 字段分隔符（US）；argv 不能嵌 NUL，故用标准控制符
 
-
-# ---------------------------------------------------------------- 值对象
 
 @dataclass(frozen=True)
 class BranchRef:
@@ -71,7 +63,7 @@ class StashEntry:
 @dataclass(frozen=True)
 class ReflogEntry:
     oid: str
-    selector: str           # 例如 HEAD@{2}
+    selector: str
     message: str
 
 
@@ -87,17 +79,13 @@ class DiffHunk:
 
 @dataclass(frozen=True)
 class DiffDocument:
-    """Git Diff 独立数据契约（规格 §11.2：不复用模型工具的 ChangedFilesPanel 数据）。"""
 
     raw_text: str
     is_binary: bool
     hunks: Tuple[DiffHunk, ...]
 
 
-# ---------------------------------------------------------------- 分支
-
 def _track_marker_to_ab(marker: str) -> Tuple[int, int, bool]:
-    """%(upstream:track) 形如 ``[ahead 1, behind 2]`` / ``[gone]`` / 空。"""
     if not marker:
         return 0, 0, False
     ahead = 0
@@ -136,7 +124,6 @@ def list_branches(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[Bran
             name = refname[len("refs/remotes/"):]
             is_remote = True
             if name.endswith("/HEAD"):
-                # 远端 HEAD 指针不作为普通分支列出
                 continue
         else:
             continue
@@ -162,7 +149,7 @@ def list_branches(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[Bran
 class WorktreeInfo:
     path: str
     head_oid: str
-    branch: Optional[str]      # None = detached
+    branch: Optional[str]
     is_bare: bool = False
 
 
@@ -211,7 +198,6 @@ def list_worktrees(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[Wor
 
 
 def occupied_branches(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[str, ...]:
-    """被其他 Worktree 占用的分支，用于切换/删除硬规则（§5.6）。"""
     return tuple(
         wt.branch
         for wt in parse_worktree_porcelain(
@@ -226,8 +212,6 @@ def occupied_branches(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[
         and normalize_repo_path(wt.path) != normalize_repo_path(identity.worktree_root)
     )
 
-
-# ---------------------------------------------------------------- 历史与提交
 
 _LOG_FORMAT = _US.join(["%H", "%h", "%P", "%an", "%ae", "%at", "%ct", "%s", "%D"])
 
@@ -270,7 +254,6 @@ def log_page(
     path: Optional[str] = None,
     follow: bool = False,
 ) -> Tuple[List[CommitSummary], bool]:
-    """提交分页。返回 (提交列表, 是否还有更多)。不解析 --graph ASCII 文本（§5.9）。"""
     args: List[str] = [
         "log", f"--format={_LOG_FORMAT}{_RS}", f"--max-count={limit + 1}",
     ]
@@ -355,7 +338,6 @@ def diff_document(
     path: Optional[str] = None,
     staged: bool = False,
 ) -> DiffDocument:
-    """工作区 Diff / 暂存区 Diff / 任意两引用 Diff（§5.3）。"""
     args: List[str] = ["diff", "--no-ext-diff", "--no-textconv", "--find-renames"]
     if left is not None and right is not None:
         args.append(f"{left}..{right}")
@@ -370,8 +352,6 @@ def diff_document(
     is_binary = "Binary files" in raw or "GIT binary patch" in raw
     return DiffDocument(raw_text=raw, is_binary=is_binary, hunks=parse_unified_diff(raw))
 
-
-# ---------------------------------------------------------------- blame / reflog / tag / remote / stash
 
 def blame(
     runner: GitRunner,
@@ -394,7 +374,6 @@ def blame(
             continue
         parts = line.split(" ")
         if len(parts) >= 3 and len(parts[0]) == 40 and _is_hex(parts[0]):
-            # porcelain 头行: <sha> <orig_line> <final_line> [<num_lines>]
             current_short = parts[0][:8]
             try:
                 current_line = int(parts[2])
@@ -511,7 +490,7 @@ def list_stashes(
             continue
         f = record.split(_US)
         if len(f) >= 3:
-            selector = f[0]  # stash@{0}
+            selector = f[0]
             try:
                 index = int(selector.split("{")[1].rstrip("}"))
             except (IndexError, ValueError):

@@ -1,11 +1,3 @@
-"""AI 生成内容目录：AI 产物（生图 / 下载图 / 临时脚本）的统一落点。
-
-设计见 docs/superpowers/specs/2026-09-20-ai-output-dir-design.md。
-本模块是落点解析的唯一入口——各调用点不得自行读 config 拼路径，
-否则行为会分叉（历史上生图与 fetch_image 直接用进程 cwd，导致
-打包版把文件写进安装目录）。
-"""
-
 from __future__ import annotations
 
 import os
@@ -17,11 +9,10 @@ AI_OUTPUT_DIR_KEY = "ai_output_dir"
 
 
 class AiOutputDirError(Exception):
-    """设置 AI 生成内容目录失败（路径不可用等）。"""
+    pass
 
 
 def _read_setting() -> str:
-    """读取配置项；读取异常一律按未配置处理（不让配置故障阻断生图）。"""
     try:
         import config
 
@@ -31,7 +22,6 @@ def _read_setting() -> str:
 
 
 def _write_setting(value: str) -> bool:
-    """持久化配置项；返回是否写盘成功。"""
     try:
         import config
 
@@ -56,37 +46,38 @@ def _is_writable(path: Path) -> bool:
     return os.access(str(path), os.W_OK)
 
 
-def _expand(value: str) -> Path:
-    """展开 ~ 与 %VAR%/$VAR 后返回绝对路径；相对路径按线程工作目录解析。"""
-    expanded = os.path.expandvars(os.path.expanduser(value))
+def _strip_outer_quotes(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1].strip()
+    return text
+
+
+def _expand(value: str, *, base_dir: Path | None = None) -> Path:
+    text = _strip_outer_quotes(value)
+    expanded = os.path.expandvars(os.path.expanduser(text))
     candidate = Path(expanded)
     if not candidate.is_absolute():
-        candidate = get_workdir() / candidate
+        candidate = (base_dir if base_dir is not None else get_workdir()) / candidate
     return candidate.resolve()
 
 
-def resolve_ai_output_dir() -> Path:
-    """当前生效的 AI 生成内容目录（绝对路径，保证已存在）。
-
-    规则（规格 4）：
-    1. 读配置；未配置 → default_ai_output_dir()
-    2. 展开 ~ / 环境变量 → 规范化绝对路径
-    3. 当前线程 workdir 命中该目录（相等或子目录）→ 直接返回 workdir
-    4. 确保目录存在；配置目录不可用 → 回退默认目录（保证已创建）
-    """
+def resolve_ai_output_dir(*, respect_workdir: bool = True) -> Path:
     configured = _read_setting()
     fallback = default_ai_output_dir()
+    base_dir = None if respect_workdir else fallback.parent
     if not configured:
         target = fallback
     else:
         try:
-            target = _expand(configured)
+            target = _expand(configured, base_dir=base_dir)
         except Exception:
             target = fallback
 
-    workdir = get_workdir()
-    if workdir == target or target in workdir.parents:
-        return workdir
+    if respect_workdir:
+        workdir = get_workdir()
+        if workdir == target or target in workdir.parents:
+            return workdir
 
     if _is_writable(target):
         return target
@@ -107,32 +98,67 @@ def get_ai_output_dir_setting() -> str:
 
 def set_ai_output_dir_setting(value: str) -> Path:
     """保存配置并返回生效目录；目录不可用时抛 AiOutputDirError 且不写盘。"""
-    text = str(value or "").strip()
+    text = _strip_outer_quotes(value)
     if not text:
-        # 留空 = 恢复默认：先落盘再按默认规则解析
         if not _write_setting(text):
             raise AiOutputDirError("配置写入失败（~/.ycode/config.json）")
         return resolve_ai_output_dir()
     try:
+        expanded = os.path.expandvars(os.path.expanduser(text))
+        is_abs = Path(expanded).is_absolute()
         target = _expand(text)
     except Exception as error:
         raise AiOutputDirError(f"路径无法解析：{text}") from error
     if not _is_writable(target):
         raise AiOutputDirError(f"目录不可写或无法创建：{target}")
-    if not _write_setting(text):
+    stored_value = text if is_abs else str(target)
+    if not _write_setting(stored_value):
         raise AiOutputDirError("配置写入失败（~/.ycode/config.json）")
-    # 直接返回刚校验通过的目录，不回读配置：同一次调用内配置缓存可能尚未刷新，
-    # 回读会把这个刚设置好的目录丢掉（设置页会显示成默认值）。
     return target
 
 
-def is_ai_output_path(path) -> bool:
-    """路径是否位于 AI 生成内容目录内（沙盒豁免判定，规格 6.1）。"""
-    if not path:
+def is_ai_output_path(path, *, respect_workdir: bool = True) -> bool:
+    if not path or not _strip_outer_quotes(str(path)):
         return False
     try:
-        target = Path(os.path.expanduser(str(path))).resolve()
-        root = resolve_ai_output_dir()
+        base_dir = None if respect_workdir else default_ai_output_dir().parent
+        target = _expand(str(path), base_dir=base_dir)
+        root = resolve_ai_output_dir(respect_workdir=respect_workdir)
     except Exception:
         return False
     return target == root or root in target.parents
+
+
+def resolve_ai_output_save_dir(save_dir: str | None = None) -> str:
+    """解析媒体/文件生成工具的保存目录。
+
+    未传或传空串时落入 AI 生成内容目录；传入相对路径时基于当前工作区解析。
+    """
+    text = _strip_outer_quotes(save_dir or "") if save_dir is not None else ""
+    if not text:
+        return str(resolve_ai_output_dir())
+    return str(_expand(text))
+
+
+def is_ai_output_write_target(path) -> bool:
+    """判断路径是否属于临时 AI 输出目录的安全免审批写目标。
+
+    若当前工作区位于配置输出目录的真子目录下（用户显式打开的子项目），
+    该子项目内的文件仍按普通项目文件处理，避免静默绕过确认门禁。
+    """
+    if not path or not _strip_outer_quotes(str(path)):
+        return False
+    try:
+        target = _expand(str(path))
+        root = resolve_ai_output_dir()
+        if not (target == root or root in target.parents):
+            return False
+        workdir = get_workdir()
+        base_ai_dir = resolve_ai_output_dir(respect_workdir=False)
+        if base_ai_dir in workdir.parents and (
+            target == workdir or workdir in target.parents
+        ):
+            return False
+    except Exception:
+        return False
+    return True

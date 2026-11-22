@@ -1,7 +1,3 @@
-"""AI 生成内容目录解析测试（规格：2026-09-20-ai-output-dir-design.md）。"""
-
-import os
-import stat
 from pathlib import Path
 
 import pytest
@@ -12,7 +8,6 @@ from core.workspace_context import workspace_scope
 
 @pytest.fixture()
 def isolated(tmp_path, monkeypatch):
-    """隔离配置读取与默认目录，测试绝不触碰真实 ~/.ycode。"""
     default_dir = tmp_path / "data" / "tmp"
     monkeypatch.setattr(aop, "default_ai_output_dir", lambda: default_dir)
     monkeypatch.setattr(aop, "_read_setting", lambda: "")
@@ -39,7 +34,6 @@ def test_tilde_is_expanded(isolated, monkeypatch):
 
 
 def test_workdir_inside_configured_dir_returns_workdir(isolated, tmp_path, monkeypatch):
-    """规则：当前工作目录已在配置目录内 → 直接用工作目录，不再套一层。"""
     configured = tmp_path / "ai_out"
     project = configured / "proj"
     project.mkdir(parents=True)
@@ -57,7 +51,6 @@ def test_workdir_equal_to_configured_dir_returns_workdir(isolated, tmp_path, mon
 
 
 def test_unwritable_configured_dir_falls_back_to_default(isolated, tmp_path, monkeypatch):
-    """配置目录不可写 → 回退默认目录，不抛异常、不静默丢文件。"""
     blocked = tmp_path / "blocked"
     blocked.mkdir()
     monkeypatch.setattr(aop, "_read_setting", lambda: str(blocked))

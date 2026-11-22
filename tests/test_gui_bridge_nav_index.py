@@ -1,6 +1,3 @@
-# tests/test_gui_bridge_nav_index.py — 红点导航全量索引（TDD，先行失败）
-"""分页懒加载下，红点导航需要全量 user 消息索引（id+预览）来渲染全部红点；
-正文仍分页。同时气泡结构必须透传 _msg_id 作为跨页跳转锚点。"""
 import threading
 
 from core.memory import MemoryManager
@@ -26,7 +23,6 @@ def _seed(mem, session, n):
 
 
 def test_nav_index_returns_all_user_messages_regardless_of_paging():
-    """120 条消息（60 user）→ 索引 60 条全量、id 正序，不受分页影响。"""
     bridge = _bare_bridge()
     _seed(bridge._memory, "s", 120)
 
@@ -42,7 +38,6 @@ def test_nav_index_returns_all_user_messages_regardless_of_paging():
 
 
 def test_nav_index_preview_strips_context_suffix_and_folds_ws():
-    """预览剥离运行上下文后缀、折叠连续空白。"""
     bridge = _bare_bridge()
     bridge._memory.add_message(
         "s", "user",
@@ -54,7 +49,6 @@ def test_nav_index_preview_strips_context_suffix_and_folds_ws():
 
 
 def test_nav_index_preview_truncates_long_text():
-    """超长消息预览截断到 100 字 + 省略号。"""
     bridge = _bare_bridge()
     bridge._memory.add_message("s", "user", "字" * 200)
 
@@ -66,7 +60,6 @@ def test_nav_index_preview_truncates_long_text():
 
 
 def test_nav_index_pure_image_message_placeholder():
-    """纯图片（无文本 blocks）消息预览为 [图片] 占位。"""
     bridge = _bare_bridge()
     bridge._memory.add_message("s", "user", [{"type": "image", "url": "x.png"}])
 
@@ -86,7 +79,6 @@ def test_nav_index_unknown_or_empty_session_returns_empty():
 
 
 def test_load_session_messages_carries_msg_id_anchor():
-    """气泡结构透传 _msg_id（跨页跳转的 DOM 锚点依据）。"""
     bridge = _bare_bridge()
     _seed(bridge._memory, "s", 4)
 
@@ -100,7 +92,6 @@ def test_load_session_messages_carries_msg_id_anchor():
 
 
 def test_nav_index_skips_observation_followup_messages():
-    """电脑操控观察跟进消息不是用户发送的：红点导航一并跳过。"""
     import json
 
     from core.computer.provider_generic import _observation_followup_message
@@ -126,8 +117,6 @@ def test_nav_index_skips_observation_followup_messages():
 
 
 def test_nav_index_and_bubbles_skip_system_injected_messages():
-    """后台任务回报/护栏催促/hook 上下文等系统注入 user 消息：
-    红点导航与对话气泡都不出现，只留用户真实发送的内容。"""
     bridge = _bare_bridge()
     bridge._memory.add_message("s", "user", "真正的问题")
     bridge._memory.add_message("s", "user", (
@@ -159,8 +148,6 @@ def test_nav_index_and_bubbles_skip_system_injected_messages():
 
 
 def test_nav_index_and_bubbles_skip_internal_turn_injection_messages():
-    """内部回合的注入指令（后台子代理汇总 / 后台命令总结）与用户输入同形
-    （都是 role=user）：红点导航与对话气泡都必须跳过，否则红点会被污染。"""
     bridge = _bare_bridge()
     bridge._memory.add_message("s", "user", "帮我做两个后台任务测试")
     bridge._memory.add_message("s", "user", (

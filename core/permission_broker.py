@@ -1,5 +1,3 @@
-"""Serialize permission requests from root and child agent threads."""
-
 from __future__ import annotations
 
 import threading
@@ -11,7 +9,6 @@ from enum import Enum
 from typing import Callable, Mapping
 
 
-# 取消路径使用的独立结果值，与用户的 "拒绝" (1) 明确区分
 CANCELLED_RESULT = -1
 
 
@@ -64,10 +61,6 @@ class PermissionBroker:
         self._lock = threading.Lock()
 
     def has_prompt_handlers(self) -> bool:
-        """是否已有入口层注册的提示处理器。
-
-        没有处理器时入队请求永远无人应答，调用方应直接放弃询问而不是空等。
-        """
         with self._lock:
             return self._has_prompt_handlers
 
@@ -81,7 +74,6 @@ class PermissionBroker:
             self._dismiss_prompt = dismiss_prompt
             self._has_prompt_handlers = True
             active = self._active
-        # 锁外激活前复核：请求可能在此期间已被 resolve/cancel
         if active is not None and self.is_active(active.request_id):
             activate_prompt(active)
 
@@ -142,10 +134,6 @@ class PermissionBroker:
         return request
 
     def active_function_name(self, request_id: str) -> str | None:
-        """返回指定活跃请求的工具名；请求不存在/不活跃返回 None。
-
-        供 UI 桥接层做纵深防御：只有 ask_user 才透传自由文本回答。
-        """
         with self._lock:
             request = self._active
             if request is None or request.request_id != request_id:
@@ -213,7 +201,6 @@ class PermissionBroker:
             return self._active is not None and self._active.request_id == request_id
 
     def has_owner(self, owner_id: str) -> bool:
-        """Return whether an owner has an active or queued request."""
         normalized = str(owner_id)
         with self._lock:
             if self._active is not None and self._active.owner_id == normalized:

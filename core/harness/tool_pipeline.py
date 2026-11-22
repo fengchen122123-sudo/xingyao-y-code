@@ -1,5 +1,3 @@
-"""Deterministic single-tool execution pipeline."""
-
 from __future__ import annotations
 
 import hashlib
@@ -30,11 +28,12 @@ SECRETARY_READONLY_DENIED_MESSAGE = (
     "秘书会话不写项目文件；可以让我派活给某个会话去改。"
 )
 PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
+JEV_AUTO_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 自动决策（JEV）评估风险后拒绝了执行该操作。"
 PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息、执行明确的只读查询和制定计划，"
     "不允许执行修改或删除操作。请改用 plan_write 把操作步骤写入计划，"
-    "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
+    "并提示用户切换到「变更前确认」「自动编辑」「自动决策」或「完全访问」模式后再执行。"
 )
 DANGEROUS_COMMAND_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 危险命令已被安全策略拒绝。"
@@ -95,9 +94,6 @@ _REPEAT_GUARD_EXEMPT_TOOLS = frozenset({
 })
 
 
-# 后台任务观察类 action 不消耗重复额度：模型等待后台任务时需要反复
-# status/list/wait，拦截会迫使模型改用空输出命令当计时器（确定性循环根因）。
-# kill/stop/terminate/cancel 与未知 action 按保守策略不豁免。
 _REPEAT_GUARD_EXEMPT_MANAGE_TASK_ACTIONS = frozenset({"status", "list", "wait"})
 
 # follow-up 私有载荷在 message dict 上的内部暂存键（设计 19.3）：仅存在于
@@ -127,13 +123,6 @@ def repeat_guard_exempt(name: str, arguments: dict) -> bool:
 
 
 def _hook_permission_decision(authorization) -> str:
-    """把权限判定结果折算成发给 hook 的 permission_decision（规格 01 §3.3）。
-
-    authorize_tool_call 的放行有两类 reason：档位自动决策（*_allow / *_hit）
-    与询问选项 key（allow_once / allow_task / ...——询问已在权限链内同步完成）。
-    对 hook 报 "ask" 表示"该调用经过用户确认"，让 hook 能区分两类放行；
-    未放行（含用户拒绝/取消）统一报 "deny"。
-    """
     if isinstance(authorization, bool):
         return "allow" if authorization else "deny"
     if not bool(getattr(authorization, "allowed", False)):
@@ -145,13 +134,6 @@ def _hook_permission_decision(authorization) -> str:
 
 
 def _tool_message_with_hook_contexts(decoded, content, hook_result, event_name):
-    """构造工具消息，并把 hook 的 additional_context 挂到 follow-up 私有载荷上。
-
-    为什么复用 _FOLLOWUP_MESSAGES_KEY：无 hook 时不产生任何附加消息（零影响）；
-    有 hook 时沿用设计 19.3 的既有通道——ToolBatchExecutor 构造 record 时剥离进
-    ToolExecutionRecord.followup_messages，再经 llm.py 既有 follow-up 注入点进入
-    随后的请求，不新增任何消息通道（H-T6）。
-    """
     from core.hooks.lifecycle import contexts_to_messages
 
     message = _tool_message(decoded, content)
@@ -180,18 +162,13 @@ class ToolExecutionContext:
     # 设计 19.2）。默认 None：普通回合行为与序列化完全不变；固定 computer
     # 适配器只在携带 lease 时执行动作，否则返回稳定关闭错误。
     computer_lease: object | None = None
-    # 原生双 target 的 selector 状态（Task 11a，设计 11.2）：computer_select_target
-    # 固定 adapter 凭它写入 target 租约；不进普通 ToolRegistry。默认 None。
     computer_native_selection: object | None = None
-    # Hook 接入（C6/C7，规格 01 §5.2）：由 llm_execution._build_tool_pipeline_and_context
-    # 注入的 HookRunner。默认 None 时 execute_decoded 不运行任何 hook、不产生任何
-    # 附加消息，工具链行为与字节保持改造前完全一致（H-T16 硬约束）。
+    computer_capability: object | None = None
     hook_runner: object | None = None
     # 断点续跑记录（S1-b）：可选的事件落库回调，签名 (kind: str, facts: dict) -> None。
     # facts 只含哈希与元数据，绝不含参数原文或结果正文。默认 None 时事件流、
     # 工具执行顺序与请求字节均与改造前完全一致。
     journal_event_sink: Callable[[str, dict], None] | None = None
-    # 续跑打点用的 StepRuntime 句柄，仅用于写入 tool_call_count。默认 None 时不写库。
     harness_step: object | None = None
 
 
@@ -208,8 +185,6 @@ class ToolExecutionRecord:
     call_ordinal: int
     message: dict
     duration_ms: int
-    # follow-up 私有消息载荷（设计 19.3）：ToolBatchExecutor 构造 record 时从
-    # 普通 message 剥离暂存；默认空，现有工具的 record 完全不变。
     followup_messages: tuple[dict, ...] = ()
 
 
@@ -279,76 +254,77 @@ def _repeat_call_blocked_result(decoded: DecodedToolCall) -> dict:
     }
 
 
+_TOOL_WORKER_POOL_LOCK = threading.Lock()
+_TOOL_WORKER_POOL = None
+
+
+def _get_tool_worker_pool():
+    """获取复用的有界线程池，避免高并发只读批次反复创建/销毁 OS 线程。"""
+    global _TOOL_WORKER_POOL
+    if _TOOL_WORKER_POOL is not None:
+        return _TOOL_WORKER_POOL
+    with _TOOL_WORKER_POOL_LOCK:
+        if _TOOL_WORKER_POOL is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _TOOL_WORKER_POOL = ThreadPoolExecutor(
+                max_workers=16,
+                thread_name_prefix="ycode-tool-worker",
+            )
+        return _TOOL_WORKER_POOL
+
+
 def _submit_daemon_call(function, *args, **kwargs):
-    # 并行工具线程必须继承提交线程的回合上下文（线程本地 workdir 与会话路由）。
-    # 裸 daemon 线程里 get_workdir() 会兜底到进程 cwd（GUI 打包版从快捷方式
-    # 启动时是安装目录），沙盒守卫据此把项目内路径误判为"工作目录之外"，
-    # 触发不该出现的权限询问；任务级沙盒放行依赖稳定任务 ID 的线程绑定，
-    # 绑定丢失后即使选过“本任务内放行”也会反复询问。
     from core.workspace_context import get_workdir, workspace_scope
 
     workdir = get_workdir()
     thread_session = app_context.get_thread_session()
-    # 并行工具线程同样必须继承提交线程的权限档位：线程本地档位不会自动
-    # 进入新线程，丢失后鉴权路径回退全局默认，会话级 full 会被掩盖成
-    # 全局 confirm/accept_edits，触发不该出现的权限询问。
     thread_permission_mode = app_context.get_thread_permission_mode()
-    # 并行工具线程同样必须继承提交线程的计划会话路由：同批并发的
-    # run_subagent（parallel_safe=True）在派发入口按会话读取计划
-    # （get_default_scheduler → get_bound_plan_session），线程本地路由
-    # 丢失会回退进程级单例并误判“计划项不存在”（审查 A6-02）。
     from core.plan import get_plan_route, set_current_plan_session as _bind_plan_route
 
     plan_session_id, plan_storage_dir = get_plan_route()
 
-    future = Future()
-
     def runner():
-        if not future.set_running_or_notify_cancel():
-            return
-        with workspace_scope(workdir):
-            if thread_session:
-                app_context.set_thread_session(thread_session)
-            if plan_session_id:
-                # storage_dir 一并继承：会话管理器若尚未注册，缺省会按本
-                # 线程工作目录重新推导，指向与回合线程不同的落盘位置。
-                _bind_plan_route(plan_session_id, storage_dir=plan_storage_dir)
-            permission_scope = (
-                app_context.permission_mode_scope(thread_permission_mode)
-                if thread_permission_mode
-                else None
-            )
-            if permission_scope is not None:
-                permission_scope.__enter__()
-            try:
-                future.set_result(function(*args, **kwargs))
-            except BaseException as error:
-                future.set_exception(error)
-            finally:
+        cur_thread = threading.current_thread()
+        prev_thread_name = cur_thread.name
+        prev_session = app_context.get_thread_session()
+        prev_plan_session, prev_plan_dir = get_plan_route()
+        cur_thread.name = "ycode-tool-call"
+        try:
+            with workspace_scope(workdir):
+                if thread_session:
+                    app_context.set_thread_session(thread_session)
+                if plan_session_id:
+                    _bind_plan_route(plan_session_id, storage_dir=plan_storage_dir)
+                permission_scope = (
+                    app_context.permission_mode_scope(thread_permission_mode)
+                    if thread_permission_mode
+                    else None
+                )
                 if permission_scope is not None:
-                    permission_scope.__exit__(None, None, None)
+                    permission_scope.__enter__()
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    if permission_scope is not None:
+                        permission_scope.__exit__(None, None, None)
+        finally:
+            cur_thread.name = prev_thread_name
+            try:
+                app_context.set_thread_session(prev_session)
+            except Exception:
+                pass
+            try:
+                _bind_plan_route(prev_plan_session, storage_dir=prev_plan_dir)
+            except Exception:
+                pass
 
-    threading.Thread(
-        target=runner,
-        daemon=True,
-        name="ycode-tool-call",
-    ).start()
-    return future
+    return _get_tool_worker_pool().submit(runner)
 
 
 def _legacy_group_tool_batches(
     tool_calls: list[dict], registry: ToolRegistry
 ) -> tuple[ToolBatch, ...]:
-    """旧批次规划实现（原样保留，不参与生产执行）。
-
-    为什么保留：A5-A9 的对拍测试（tests/test_tool_scheduler.py）用它作为
-    "零回归"基线（无依赖声明的输入必须与 plan_tool_batches 逐批逐项一致）；
-    新调度器一旦出现线上问题，也可临时把 group_tool_batches 切回本函数
-    作为紧急回退，不需要回滚整个提交。
-
-    逻辑：相邻的 parallel_safe 调用合并成一批并行，遇到非 parallel_safe
-    断开；未注册的工具按非并行安全保守处理。
-    """
     batches: list[ToolBatch] = []
     for tool_call in tool_calls:
         name = tool_call["function"]["name"]
@@ -365,20 +341,6 @@ def _legacy_group_tool_batches(
 
 
 def group_tool_batches(tool_calls: list[dict], registry: ToolRegistry) -> tuple[ToolBatch, ...]:
-    """兼容包装：委托给 plan_tool_batches（规格 2.5）。
-
-    保留本函数是为了：现有调用方（ToolBatchExecutor.prepare）与测试无需
-    改动；出问题时可以快速切回旧实现（见 _legacy_group_tool_batches）。
-
-    为什么这里传 max_concurrency=len(tool_calls)（即不做批次大小截断）：
-    1. 产品决定要求「无依赖声明」的输入与旧实现逐批逐项完全一致（工作包
-       README 第 2 条 + 03 规格回归红线），而旧实现没有批次大小上限——
-       截断会让 5 个以上连续的 parallel_safe 调用从"一批"变成多批，
-       开始事件与流水线形态都会变化；
-    2. 真实并发上限仍由 ToolBatchExecutor 的 BoundedSemaphore(max_parallel=4)
-       在执行期兜底（T-T12），批内 future 再多也不会超过 4 个同时运行；
-    3. plan_tool_batches 默认的 max_concurrency=4 供新调用方按需显式使用。
-    """
     # 延迟导入：ToolBatch 定义在本模块，若在模块顶层互相导入会形成循环。
     from core.harness.tool_scheduler import plan_tool_batches
 
@@ -413,7 +375,6 @@ def build_tool_result_event_draft(
 
 
 def _journal_text_content(message) -> str:
-    """把工具结果消息的 content 归一化成文本，仅用于计算哈希（不保留正文）。"""
     try:
         content = message.get("content")
     except Exception:
@@ -454,7 +415,6 @@ def _journal_facts_for_call(prepared_call) -> dict:
 
 
 class ToolBatchExecutor:
-    """Execute adjacent safe tools concurrently and return model-ordered records."""
 
     def __init__(
         self,
@@ -531,13 +491,11 @@ class ToolBatchExecutor:
             raise KeyboardInterrupt("用户终止了工具执行。")
 
     def _emit_started_journal(self, context, prepared_call):
-        """逐调用即时写 tool_started：只落哈希与元数据，不落参数原文。"""
         facts = _journal_facts_for_call(prepared_call)
         facts["started"] = True
         self._emit_journal(context, "tool_started", facts)
 
     def _emit_finished_journal(self, context, prepared_call, message, duration_ms):
-        """逐调用即时写 tool_finished：只落结果哈希/耗时/状态，不落正文。"""
         facts = _journal_facts_for_call(prepared_call)
         facts["result_sha256"] = hashlib.sha256(
             _journal_text_content(message).encode("utf-8")
@@ -552,8 +510,17 @@ class ToolBatchExecutor:
         started_at = self.clock()
         # 绑定本次调用 id：run_subagent 创建子代理时据此把任务归属到派生它的
         # 调用上，GUI 卡片才能只展示"自己正在执行的这个"子代理。
-        with app_context.tool_call_scope(decoded.call_id):
-            message = self.execute_decoded(decoded, context)
+        # 并行工具线程在提交时未必继承父线程的 thread_session，这里补齐上下文，
+        # 确保秘书跨项目只读免确认等依赖 get_thread_session() 的判定一致。
+        parent_session = getattr(context, "parent_session", None)
+        session_scope = (
+            app_context.thread_session_scope(parent_session)
+            if parent_session and not app_context.get_thread_session()
+            else nullcontext()
+        )
+        with session_scope:
+            with app_context.tool_call_scope(decoded.call_id):
+                message = self.execute_decoded(decoded, context)
         duration_ms = round((self.clock() - started_at) * 1000)
         return message, max(0, duration_ms)
 
@@ -623,8 +590,6 @@ class ToolBatchExecutor:
                 "tool_requested",
                 self.event_payload(prepared_call.decoded),
             )
-        # journal 的 tool_started 不在这里写：批内排队不代表已开始执行，
-        # 逐调用即时写在 _execute_guarded 里（GUI 的 on_event 序列保持不变）。
         for prepared_call in batch.calls:
             self._emit(
                 on_event,
@@ -656,9 +621,6 @@ class ToolBatchExecutor:
 
         records = []
         for prepared_call, (message, duration_ms) in zip(batch.calls, results):
-            # 构造 record 时把 follow-up 私有载荷从普通 message 完全剥离：
-            # record.message 只含 role/tool_call_id/name/content，
-            # follow-up user 观察消息转由 record.followup_messages 承载。
             followup_messages = tuple(
                 message.pop(_FOLLOWUP_MESSAGES_KEY, ()) or ()
             )
@@ -687,9 +649,6 @@ class ToolBatchExecutor:
         total_calls = 0
 
         for batch in self.prepare(tool_calls, context):
-            # 续跑打点：记录本轮工具调用数（跨批累计——按批覆盖会在多批时
-            # 只剩最后一批的数目）。harness_step 默认 None 时不写库，因此
-            # 未接入续跑的场景行为与字节完全不变。
             step = getattr(context, "harness_step", None)
             total_calls += len(batch.calls)
             if step is not None:
@@ -730,8 +689,6 @@ def has_pending_plan(session_id):
     plan = get_default_plan_manager()
     if plan.session_id != str(session_id):
         return False
-    # Keep the gate active until every plan item is completed.  Failed,
-    # blocked, and cancelled items still require an explicit plan_retry.
     return any(item.get("status") != "completed" for item in plan.snapshot())
 
 
@@ -866,7 +823,6 @@ class ToolPipeline:
         self.pending_plan_checker = pending_plan_checker
 
     def _active_takeover_item(self, context):
-        """返回当前回合的 active 接管项（经生产调度器核验）；无则 None。"""
         try:
             from core.task_scheduler import get_default_scheduler
 
@@ -885,13 +841,8 @@ class ToolPipeline:
 
     @staticmethod
     def _takeover_files_violation(takeover, decoded):
-        """接管项声明 files 时，写文件只允许命中这些真实路径；未声明不加额外权限。
-
-        execute_command 不受 files 精确列表限制是既有设计取舍：命令仍完整经过
-        命令风险、权限与沙盒策略，不能把任意命令可靠映射成单一文件目标。
-        """
         name = decoded.name
-        if name not in {"write_file", "edit_file"}:
+        if name not in {"write_file", "edit_file", "multi_edit"}:
             return None
         declared = [
             str(value).strip()
@@ -919,6 +870,31 @@ class ToolPipeline:
             f"[{', '.join(declared)}]。其他文件请先用 plan_update 调整计划项的 files 字段。"
         )
 
+    @staticmethod
+    def _plan_target_hint(name: str) -> str:
+        try:
+            from core.plan import get_default_plan_manager
+
+            snapshot = get_default_plan_manager().snapshot()
+        except Exception:
+            return ""
+        if not snapshot or all(item.get("status") == "completed" for item in snapshot):
+            return ""
+        want_prep = name == "ask_user"
+        targets = [
+            item
+            for item in snapshot
+            if (item.get("kind") == "input_preparation") == want_prep
+            and item.get("status") in {"pending", "in_progress"}
+        ]
+        targets.sort(key=lambda item: item.get("status") != "pending")
+        if targets:
+            hints = ", ".join(
+                f"'{item['id']}'({item['subject']})" for item in targets[:5]
+            )
+            return f" 当前可绑定的计划项: [{hints}]。"
+        return " 当前没有可绑定的计划项，请先用 plan_read 查看各项状态再决定下一步。"
+
     def _plan_constraint(self, decoded, context):
         if not context.allow_subagents or not (
             self.plan_turn_checker(context.parent_turn_id)
@@ -943,7 +919,7 @@ class ToolPipeline:
         if name in _PLAN_BOUND_ORCHESTRATORS and not plan_item_id:
             return (
                 f"{_PLAN_BYPASS_ERROR_PREFIX} {name} 必须填写 plan_item_id，"
-                "不能执行未归属计划项的任务。"
+                f"不能执行未归属计划项的任务。{self._plan_target_hint(name)}"
             )
         if name in _PLAN_READ_ONLY_TOOLS or name in _PLAN_ROOT_CONTROL_TOOLS:
             return None
@@ -955,13 +931,7 @@ class ToolPipeline:
         if not snapshot or all(
             item.get("status") == "completed" for item in snapshot
         ):
-            # 计划在同一回合内被清空，或所有项都已完成时，门禁失去意义。
-            # completed 项可用 plan_retry 重开（子代理误报完成时），
-            # failed/blocked/cancelled 项通过 plan_retry 正规恢复。
             return None
-        # 主 Agent scoped 接管放行：仅当存在归属当前回合的 active 接管项时，
-        # 才允许主 Agent 直接调用任务工具继续该计划项；旧分支
-        # “所有 stalled 项 attempts>=2 后全局放行”已按计划删除。
         takeover = self._active_takeover_item(context)
         if takeover is not None:
             violation = self._takeover_files_violation(takeover, decoded)
@@ -1040,6 +1010,8 @@ class ToolPipeline:
             return authorization, DANGEROUS_COMMAND_DENIED_MESSAGE
         if authorization.reason == "plan_mutation_denied":
             return authorization, PLAN_MODE_DENIED_MESSAGE
+        if authorization.reason == "jev_auto_deny":
+            return authorization, JEV_AUTO_DENIED_MESSAGE
         if authorization.cancelled or authorization.reason == "cancelled":
             return authorization, PERMISSION_CANCELLED_MESSAGE
         return authorization, PERMISSION_DENIED_MESSAGE
@@ -1081,15 +1053,6 @@ class ToolPipeline:
         return STALE_EXECUTION_LEASE_TEXT
 
     def _secretary_gate_blocked(self, decoded, context) -> bool:
-        """秘书会话只读门控兜底（设计 2026-10-15 第 6 节）。
-
-        放在权限判定之前：秘书会话里被禁的工具直接失败，不弹确认卡——避免
-        "先弹确认再硬拒"的坏体验。schema 层已按同一策略过滤过一遍，这里是
-        兜底：MCP / 插件 / 保留工具等不经过注册表 schema 的调用同样被拦下。
-
-        作用域取自注册表；取不到时按空作用域判定（只会更严，不会放过写类
-        工具）。身份解析异常按普通会话处理——门控组件故障不得阻断正常会话。
-        """
         name = str(getattr(decoded, "name", "") or "")
         if not name:
             return False
@@ -1115,18 +1078,6 @@ class ToolPipeline:
         except Exception:
             return False
     def _automation_gate_blocked(self, decoded, context):
-        """自动化回合安全门控兜底（G3 防任务自我繁殖）。
-
-        星轨自动化派发的回合里，写类自动化工具（创建/修改/删除/立即执行）必须
-        直接失败：这类回合无人值守，确认卡等于卡死，且放行会让任务自我繁殖。
-
-        schema 层（core.llm）已按同一策略把这 4 个工具从工具列表里剔除，这里
-        是执行侧兜底：MCP / 插件 / 与注册表同名的调用不经过 schema 过滤，同样
-        被拦下。策略与判定集中在 core.automation.tool_policy（唯一事实源）。
-
-        返回带拒绝文案的 tool message；放行返回 None。门控组件异常按放行处理
-        （fail-open），绝不因策略组件故障阻断普通回合。
-        """
         try:
             from core.automation import tool_policy as automation_tool_policy
 
@@ -1137,6 +1088,74 @@ class ToolPipeline:
         except Exception:
             _LOGGER.debug("自动化回合门控判定失败（旁路，按放行处理）", exc_info=True)
         return None
+
+    def _browser_setting_gate_blocked(self, decoded, context):
+        if str(getattr(decoded, "name", "") or "") != "browser_pane":
+            return None
+        cap = getattr(context, "computer_capability", None)
+        if cap is None:
+            lease = getattr(context, "computer_lease", None)
+            cap = getattr(lease, "capability", None) if lease is not None else None
+        configured_browser = str(getattr(cap, "browser", "") or "").strip()
+        if not configured_browser:
+            try:
+                from core.computer.settings import load_computer_settings
+
+                configured_browser = str(
+                    getattr(load_computer_settings(), "computer_browser", "") or ""
+                ).strip()
+            except Exception:
+                configured_browser = ""
+        targets = tuple(getattr(cap, "targets", ()) or ()) if cap is not None else ()
+        browser_cap_on = bool(
+            getattr(context, "allow_subagents", False)
+            and cap is not None
+            and getattr(cap, "enabled", False)
+            and "browser" in targets
+        )
+        if configured_browser and configured_browser != "embedded":
+            from core.computer.settings import get_browser_label
+
+            label = get_browser_label(configured_browser)
+            if browser_cap_on:
+                return _tool_message(
+                    decoded,
+                    f"{TOOL_ERROR_PREFIX} 工具调用被系统设置拦截：当前系统设置「默认浏览器」为 "
+                    f"{label}（{configured_browser}），并非星瑶内置浏览器。请优先使用 "
+                    f"computer_action(target=\"browser\", ...) 操作 {label}，不要调用 browser_pane。",
+                )
+            return _tool_message(
+                decoded,
+                f"{TOOL_ERROR_PREFIX} 工具调用被系统设置拦截：当前系统设置「默认浏览器」为 "
+                f"{label}（{configured_browser}），并非星瑶内置浏览器；当前未启用浏览器操控，"
+                "禁止改用 browser_pane 打开内置浏览器绕开系统设置。",
+            )
+        if configured_browser == "embedded" and browser_cap_on:
+            args = decoded.arguments if isinstance(decoded.arguments, dict) else {}
+            act = str(args.get("action") or "").strip().lower()
+            url = str(args.get("url") or "").strip()
+            url_lower = url.lower()
+            is_web_nav = (
+                act in ("navigate", "back", "forward", "reload")
+                and (
+                    act != "navigate"
+                    or not url
+                    or url_lower.startswith(("http://", "https://"))
+                )
+            ) or (
+                act == "open"
+                and (not url or url_lower.startswith(("http://", "https://")))
+            )
+            if is_web_nav:
+                return _tool_message(
+                    decoded,
+                    f"{TOOL_ERROR_PREFIX} 工具调用被浏览器操控优先级拦截：当前系统设置「默认浏览器」"
+                    "为星瑶内置浏览器且已开启「浏览器操控」，打开或导航网页必须优先使用 "
+                    "computer_action(target=\"browser\", kind=\"navigate\"/\"observe\"/\"back\"/"
+                    "\"forward\"/\"reload\")，避免启动无调试端口的只读面板；"
+                    "browser_pane 仅用于 close/state/set_bounds、本地 file:// HTML 预览或关闭浏览器操控后使用。",
+                )
+        return None
     def _run_tool_hook(
         self,
         decoded,
@@ -1146,7 +1165,6 @@ class ToolPipeline:
         permission_decision: str = "",
         tool_result_preview: str = "",
     ):
-        """运行工具事件的 hook（C6）：无 runner 或执行失败时返回 None（零影响）。"""
         runner = getattr(context, "hook_runner", None)
         if runner is None:
             return None
@@ -1168,14 +1186,6 @@ class ToolPipeline:
         )
 
     def _hook_ask_override(self, decoded, context) -> str:
-        """hook 请求 ask 覆盖：真实走现有询问链（GUI 权限弹窗 / 终端选项）。
-
-        为什么复用 permission_terminal 的询问函数：它是全进程唯一询问入口
-        （broker 串行、GUI 与终端共用）；自造询问会让 GUI 弹窗、任务级授权与
-        取消路径全部失效。询问链不可用或自身异常时返回 "approved"——hook 是
-        增强能力，不能因为询问组件缺失把原本允许的调用据为失败（fail-open）。
-        返回 "approved" / "denied" / "cancelled"。
-        """
         try:
             from core import permission_terminal as terminal
 
@@ -1219,8 +1229,6 @@ class ToolPipeline:
                 return "denied"
             return "approved"
         except Exception:
-            # 询问链路异常（UI 事件丢失等）按 fail-open 保持原 allow：不把增强
-            # hook 的请求升级成工具失败。
             return "approved"
 
     def execute_decoded(self, decoded: DecodedToolCall, context) -> dict:
@@ -1256,6 +1264,14 @@ class ToolPipeline:
             )
             return automation_blocked
 
+        browser_blocked = self._browser_setting_gate_blocked(decoded, context)
+        if browser_blocked is not None:
+            _LOGGER.info(
+                "系统设置默认浏览器门控拦截 browser_pane：%s",
+                decoded.arguments.get("action") if isinstance(decoded.arguments, dict) else "",
+            )
+            return browser_blocked
+
         # 固定 computer 适配（设计 19.2）：保留名 computer_action 在 resolve_tool
         # 之前识别，不经过注册表与权限链（设置开关即用户授权边界）。
         reserved = self._execute_reserved_computer(decoded, context)
@@ -1285,8 +1301,6 @@ class ToolPipeline:
                 return _tool_message(decoded, denied)
             _raise_if_cancelled(context.cancel_event)
 
-            # C6（PreToolUse，规格 01 §5.2）：权限判定未拒绝后、执行前运行。
-            # hook 的阻断/权限覆盖在此生效；无 hook_runner 时整段零开销。
             pre_hook = self._run_tool_hook(
                 decoded,
                 context,
@@ -1310,12 +1324,6 @@ class ToolPipeline:
                         pre_hook,
                         "PreToolUse",
                     )
-                # C7 权限覆盖（规格 01 §5.3）：hook 只能向更严格方向收敛。
-                # deny 已在上面返回；"allow" 覆盖只在当前已走询问放行（ask）
-                # 时有意义——询问已在权限链内同步完成且用户已批准，这里保留
-                # 既有结果即可（对 deny 无效 —— deny 路径在 hook 之前已 return，
-                # H-T4 硬约束：hook 不能提权超过用户档位）。
-                # "ask" 覆盖：当前是档位自动放行时才需补一次真实询问。
                 if (
                     pre_hook.permission_override == "ask"
                     and _hook_permission_decision(authorization) == "allow"
@@ -1335,7 +1343,7 @@ class ToolPipeline:
             if (
                 legacy_boolean_authorization
                 and not bypass
-                and decoded.name in {"read_file", "write_file", "edit_file"}
+                and decoded.name in {"read_file", "write_file", "edit_file", "multi_edit"}
             ):
                 # 兼容只返回 bool 的旧权限替身：外部边界既已批准，adapter
                 # 必须在同一次临时 bypass 中执行，不能再次询问或提前探测路径。
@@ -1353,9 +1361,6 @@ class ToolPipeline:
                 f"{TOOL_ERROR_PREFIX} 调用工具 {decoded.name} 时发生系统内部错误：{tool_err}"
             )
         message = _tool_message(decoded, self.truncate_result(decoded.name, content))
-        # C6（PostToolUse，规格 01 §5.2）：result 生成后、return 前运行；聚合层
-        # 已按事件屏蔽阻断/权限字段，hook 在这里只能追加上下文。pre/post 的
-        # contexts 都走 follow-up 私有载荷通道（无 hook 时不产生任何附加消息）。
         post_hook = self._run_tool_hook(
             decoded, context, "PostToolUse", tool_result_preview=content
         )
@@ -1377,15 +1382,6 @@ class ToolPipeline:
         return message
 
     def _execute_reserved_computer(self, decoded: DecodedToolCall, context) -> dict | None:
-        """保留名固定适配（设计 19.2 + Task 11a）：非保留名返回 None。
-
-        computer_action：requires_permission=False（设置开关即用户授权边界）、
-        cancellable=True、parallel_safe=False、mutates_files=False 的语义由固定
-        适配器保证；领域错误返回稳定 9 键 JSON，follow-up 私有载荷暂存在
-        message 内部键上，由 ToolBatchExecutor 构造 record 时剥离。
-        computer_select_target（Task 11a）：原生双 target selector 经
-        provider_openai 的固定 adapter 写入 target 租约，不进普通 ToolRegistry。
-        """
         if decoded.name == "computer_select_target":
             from core.computer.provider_openai import execute_reserved_computer_selector
 

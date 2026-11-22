@@ -1,10 +1,3 @@
-"""电脑操控领域的不可变值对象、枚举、错误类型与 backend 协议。
-
-本模块不导入 GUI、CLI、LLM 传输层、Playwright 或全局配置（设计第 6 节规则 1）。
-枚举取值、错误码与字段形状以 docs/superpowers/specs/2026-09-02-computer-control-design.md
-第 7、9.3、21 节为准。
-"""
-
 import threading
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -66,19 +59,14 @@ class ComputerActionKind(str, Enum):
     FORWARD = "forward"
     RELOAD = "reload"
     REQUEST_USER_TAKEOVER = "request_user_takeover"
-    # R10 语义定位与局部观察（desktop only，协议扩展）。
     LIST_SURFACES = "list_surfaces"
     ACTIVATE_SURFACE = "activate_surface"
     INVOKE_SURFACE = "invoke_surface"
     OBSERVE_REGION = "observe_region"
-    # 批量微动作（2026-09-06 协议扩展）：一次调用串行执行多个基本输入动作。
     SEQUENCE = "sequence"
-    # 阶段二（2026-09-06 协议扩展，desktop only）：UIA 元素观察与元素引用动作。
     LIST_ELEMENTS = "list_elements"
     CLICK_ELEMENT = "click_element"
     SET_VALUE_ELEMENT = "set_value_element"
-    # Windows-MCP 对齐（2026-11-09 协议扩展，desktop only）：条件等待，
-    # 按 condition 轮询界面直到命中或超时，替代 wait 加反复 observe。
     WAIT_FOR = "wait_for"
 
 
@@ -109,38 +97,26 @@ class ComputerAction:
     target: str
     x: int | None = None
     y: int | None = None
-    # 局部观察区域尺寸（browser observe_region 专用；其他动作恒为 None）。
-    # 坐标语义：x/y 是区域左上角的 CSS 视口坐标，width/height 是区域宽高。
     width: int | None = None
     height: int | None = None
     path: tuple[tuple[int, int], ...] = ()
     button: str = "left"
     delta_x: int = 0
     delta_y: int = 0
-    # R7 滚动单位契约：css_pixel（browser，每轴 ±4000）/ wheel_step（desktop，
-    # 每轴 ±10）；None 表示按 target 默认单位。正方向统一为向右/向下。
     unit: str | None = None
     text: str | None = field(default=None, repr=False)
     keys: tuple[str, ...] = ()
     url: str | None = None
     duration_ms: int | None = None
     reason_code: str | None = None
-    # R10 语义定位动作（activate_surface/observe_region）引用 list_surfaces
-    # 观察给出的候选 ref 与代数；普通坐标动作为 None。
     surface_ref: str | None = None
     surface_generation: int | None = None
-    # 起终点输入在 parse_computer_action 解析时立即规范化为 path，存储层恒为 None。
     end_x: int | None = None
     end_y: int | None = None
     # sequence 批量动作的子步骤（仅 kind="sequence" 非空；子项本身也是
     # 不可变 ComputerAction，kind 限定为无副作用定位的八种基本输入动作）。
     steps: tuple["ComputerAction", ...] = ()
-    # 阶段二元素引用动作（click_element/set_value_element）引用的控件 ref；
-    # 仅在最近一次 list_elements 后有效，普通动作恒为 None。
     element_ref: str | None = None
-    # wait_for 条件等待（2026-11-09 协议扩展，desktop only）：condition 取值见
-    # actions.WAIT_FOR_CONDITIONS，window_name 限定窗口标题子串，timeout_ms/
-    # interval_ms 为总等待上限与轮询间隔；非 wait_for 动作这四项恒为 None。
     condition: str | None = None
     window_name: str | None = None
     timeout_ms: int | None = None
@@ -189,20 +165,44 @@ class ComputerObservation:
     # （"hwnd:<句柄>"）；surface_generation 在页切换/前台窗口/几何变化时递增。
     surface_id: str = ""
     surface_generation: int = 0
-    # R10：list_surfaces 观察给出的语义定位候选（SurfaceCandidate 的字典
-    # 形状：ref/kind/label/bounds/operations/surface_generation）；仅本次
-    # 观察有效，普通观察恒为空 tuple。
+    # Task 3：视觉帧身份与视口代际（仅本地/协议元数据，不进入 Provider 9 键投影）。
+    # frame_id 绑定本次观察的不可变坐标逆变换；不依赖 screen_sha256 充当文档或帧身份。
+    frame_id: str = ""
+    viewport_generation: int = 0
     surface_candidates: tuple = ()
-    # 阶段二：list_elements 观察携带的控件元素列表（dict：ref/kind/name/
-    # bounds/enabled）；与 surface_candidates 同一生命周期语义，普通观察恒空。
     elements: tuple = ()
     # 通用化重构 Task C：本动作是否发生了前台切换（输入前置激活），仅本地
     # 自愈判定使用；绝不加入 observation_provider_projection 投影（投影字节不变）。
     input_activated: bool = False
-    # 帧契约（2026-10-21）：本步截图与**上一步**截图完全相同。用于在 Provider
-    # 投影层省掉重复附图的字节——同画面重复发图只烧上下文，模型从上一张图就能
-    # 读到内容。同样不进 observation_provider_projection，投影字节保持稳定。
     screen_unchanged: bool = False
+
+
+@dataclass(frozen=True)
+class ObservationFrame:
+    """不可变视觉帧记录（Task 3）：绑定观察瞬间的有效坐标域与逆变换。
+
+    由 backend 在 observe 产出初始记录，Provider 若对超限截图重缩放或因超限/无图
+    省略截图，必须同步更新到 controller/backend 持有的同一 frame_id 记录上：
+    - 正常重缩放：同步更新 image_width / image_height 与 model_to_css 逆比例；
+    - 无图或超限且变换未知：coordinate_input_enabled=False，拒绝按旧比例盲点。
+    """
+
+    frame_id: str
+    run_id: str
+    target: str
+    surface_id: str = ""
+    surface_generation: int = 0
+    viewport_generation: int = 0
+    origin_x: int = 0
+    origin_y: int = 0
+    crop_width: int = 0
+    crop_height: int = 0
+    image_width: int = 0
+    image_height: int = 0
+    model_to_css_x: float = 1.0
+    model_to_css_y: float = 1.0
+    coordinate_input_enabled: bool = True
+    disabled_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -237,6 +237,17 @@ class ComputerCapability:
     reason: str = ""
 
 
+def resolve_browser_mode(target: str, browser: str) -> str:
+    """区分内置 WebView2（embedded）与外部 Edge/Chrome（external）。"""
+    if target != "browser":
+        return ""
+    if browser == "embedded":
+        return "embedded"
+    if browser:
+        return "external"
+    return ""
+
+
 @dataclass(frozen=True)
 class ComputerRunSnapshot:
     """UI/CLI 可见快照（设计 7.4）。
@@ -246,11 +257,14 @@ class ComputerRunSnapshot:
     """
 
     run_id: str = ""
+    run_generation: int = 0
+    event_seq: int = 0
     owner_session_id: str = ""
     owner_turn_id: str = ""
     status: str = ComputerRunStatus.IDLE.value
     target: str = ""
     browser: str = ""
+    browser_mode: str = ""
     model_name: str = ""
     protocol: str = ComputerProtocol.NONE.value
     started_at: float = 0.0

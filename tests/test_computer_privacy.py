@@ -1,12 +1,3 @@
-"""电脑操控隐私审计与统一退出（设计 22、23.2，Task 16 brief Step 1 逐字样例）。
-
-全部 fake 注入：Provider 流、controller/backend 均为测试替身，绝不触发真实
-键鼠、截屏、热键、浏览器或网络。语料扫描覆盖四类持久化面——DB messages、
-Harness Journal（harness_* 表）、公开回合事件与运行日志；brief 两样例逐字，
-另测 URL query token、Cookie、API key、profile 文件内容、preview token 与
-response id 冲突错误消息的脱敏（11b 用户裁决项）。
-"""
-
 import contextlib
 import json
 import logging
@@ -44,13 +35,7 @@ GENERIC_TURN = "turn-privacy-generic"
 NATIVE_TURN = "turn-privacy-native"
 
 
-# ---------------------------------------------------------------------------
-# brief Step 1 逐字样例的 Recorder 与统一关闭入口
-# ---------------------------------------------------------------------------
-
-
 class Recorder:
-    """brief 逐字样例的最小记录器：stop/close 按名追加调用序列。"""
 
     def __init__(self, calls, name):
         self._calls = calls
@@ -80,13 +65,7 @@ def _import_shutdown_computer_runtime():
     return shutdown_computer_runtime
 
 
-# ---------------------------------------------------------------------------
-# 语料：generic 与 native 投影链路真实执行 + 四类持久化面扫描
-# ---------------------------------------------------------------------------
-
-
 class _Corpus:
-    """隐私扫描语料：__contains__ 扫全部持久化面；native_rows 单独暴露。"""
 
     def __init__(self, parts: dict):
         self._parts = dict(parts)
@@ -104,12 +83,11 @@ class _Corpus:
 
 
 class _FileLogHandler(logging.Handler):
-    """把全部运行日志（含 DEBUG）落到 tmp_path/captured.log 供扫描。"""
 
     def __init__(self, path: Path):
         super().__init__(level=1)
         self._path = path
-        self._path.touch(exist_ok=True)  # 无日志记录时文件也存在，扫描方零防御
+        self._path.touch(exist_ok=True)
         self._formatter = logging.Formatter(
             "%(asctime)s %(levelname)s [%(name)s] %(message)s"
         )
@@ -184,7 +162,6 @@ def _owner(session, turn):
 
 
 def _run_generic_turn(stack, manager, controller, *, secret, navigate_url=""):
-    """真实 generic 链路：type_text(secret)（+ 可选 navigate）→ 最终文本，persist=True。"""
     steps = [
         [_chunk(tool_calls=[_tool_call(
             0, "call-privacy-generic", "computer_action",
@@ -254,7 +231,6 @@ _NATIVE_FINAL_TEXT = [
 
 
 def _run_native_turn(stack, manager, controller, *, secret, response_id):
-    """真实 native 链路：computer_call(type secret) → 续传 → 最终文本，persist=True。"""
     responses = [_native_call_events(secret, response_id), _NATIVE_FINAL_TEXT]
     requests = []
 
@@ -298,13 +274,6 @@ def core_app_context():
 
 
 def exercise_generic_and_native_projection(tmp_path, secret, response_id, *, navigate_url=""):
-    """真实走 generic 与 native 投影链路：DB/Journal/事件/日志全部落到 tmp_path。
-
-    generic：computer_action type_text（输入正文含 secret）+ 可选 navigate
-    （URL 含 query token）→ followup 多模态观察消息 → 最终文本；
-    native：computer_call type(secret, response_id) → 脱敏投影行 → 续传 →
-    最终文本。两回合均 persist=True（真实 Harness Journal + messages 表）。
-    """
     from core.memory import MemoryManager
 
     tmp_path = Path(tmp_path)
@@ -358,7 +327,6 @@ def exercise_generic_and_native_projection(tmp_path, secret, response_id, *, nav
 
 
 def read_text_database_journal_events_and_logs(tmp_path):
-    """汇总四类持久化面的可扫描文本（DB messages + Harness Journal + 事件 + 日志）。"""
     tmp_path = Path(tmp_path)
     parts = {}
     db_path = tmp_path / "runtime.db"
@@ -413,7 +381,6 @@ def test_persisted_and_logged_computer_records_exclude_secrets(tmp_path):
 
 
 def test_url_query_token_cookie_and_api_key_never_reach_persistence(tmp_path):
-    """URL query token、Cookie 值、API key 形态的输入绝不进任何持久化面。"""
     url_token = "URITOKEN-query-987654"
     cookie_value = "SID=cookie-secret-654321"
     api_key = "sk-priv-0123456789abcdefXYZ"
@@ -429,7 +396,6 @@ def test_url_query_token_cookie_and_api_key_never_reach_persistence(tmp_path):
 
 
 def test_response_id_conflict_messages_redact_both_ids():
-    """11b 用户裁决：冲突错误消息不得内嵌任一 response id 原文（可经 turn_error 外泄）。"""
     from core.computer.provider_openai import parse_openai_computer_events
 
     events = [
@@ -453,11 +419,6 @@ def test_llm_stream_response_id_conflict_message_redacts_both_ids():
     assert "resp_secret_b" not in message
 
 
-# ---------------------------------------------------------------------------
-# 统一退出的健壮性与真实 controller 语义
-# ---------------------------------------------------------------------------
-
-
 def _noop_abort(_cancel_event):
     return None
 
@@ -473,7 +434,6 @@ def _service_with_backends(backends):
 
 
 def test_shutdown_computer_runtime_survives_cleanup_errors():
-    """任一清理步骤抛错都不得阻断后续清理或向上传播。"""
     shutdown_computer_runtime = _import_shutdown_computer_runtime()
 
     class Boom:
@@ -494,7 +454,6 @@ def test_shutdown_computer_runtime_survives_cleanup_errors():
 
 
 def test_shutdown_stops_active_run_and_closes_retained_browser(tmp_path):
-    """统一退出：活动 run 停止（backend close）+ retained browser 一并清理。"""
     from core.computer.controller import ComputerControlService
 
     browser_backend = FakeComputerBackend("browser")
@@ -513,7 +472,7 @@ def test_shutdown_stops_active_run_and_closes_retained_browser(tmp_path):
         first.run_id, owner_one, ComputerAction(kind="observe", target="browser")
     )
     service.complete_run(first.run_id, owner_one, retain_browser_session=True)
-    assert browser_backend.close_count == 0  # retained：complete 不关闭
+    assert browser_backend.close_count == 0
 
     second = service.start_run(owner_two, GENERIC_CAPABILITY, target="desktop")
     service.execute(
@@ -527,13 +486,8 @@ def test_shutdown_stops_active_run_and_closes_retained_browser(tmp_path):
     assert final.run_id == second.run_id
     assert final.status == "stopped"
     assert final.stop_reason == "application_exit"
-    assert desktop_backend.closed  # 活动 run backend 已关闭
-    assert browser_backend.closed  # retained browser 一并清理
-
-
-# ---------------------------------------------------------------------------
-# 进程级轻量运行时：启动接线与紧急停止
-# ---------------------------------------------------------------------------
+    assert desktop_backend.closed
+    assert browser_backend.closed
 
 
 @pytest.fixture(autouse=True)
@@ -580,7 +534,6 @@ def _enabled_settings():
 
 
 def test_start_computer_runtime_with_defaults_is_lightweight():
-    """两开关全关：不注册热键、不导入 Playwright、不触碰 backend/截图。"""
     import sys
 
     from core.computer.runtime import start_computer_runtime
@@ -592,7 +545,7 @@ def test_start_computer_runtime_with_defaults_is_lightweight():
         hotkey_factory=lambda: api,
     )
     try:
-        assert runtime.hotkey is None  # 全关：不注册
+        assert runtime.hotkey is None
         assert api.register_calls == 0
         after = {name for name in sys.modules if "playwright" in name}
         assert after == before  # 绝不导入 Playwright
@@ -627,7 +580,6 @@ def test_start_computer_runtime_registers_hotkey_when_enabled():
 
 
 def test_hotkey_registration_failure_keeps_config_untouched(tmp_path, monkeypatch):
-    """注册失败：能力不可用，但绝不改写已开启的配置。"""
     use_temp_config(
         tmp_path,
         monkeypatch,
@@ -645,7 +597,6 @@ def test_hotkey_registration_failure_keeps_config_untouched(tmp_path, monkeypatc
 
 
 def test_hotkey_registration_failure_logs_without_traceback(caplog):
-    """注册失败属预期降级：INFO 留痕必须单行、绝不携带 traceback。"""
     from core.computer.runtime import start_computer_runtime
 
     api = FakeHotkeyApi(register_result=False, last_error_code=1409)
@@ -666,8 +617,6 @@ def test_hotkey_registration_failure_logs_without_traceback(caplog):
 
 
 def test_hotkey_registration_failure_never_reaches_console(caplog):
-    """注册失败不得产生 WARNING 及以上日志：CLI 无自定义 handler，WARNING 会
-    经 logging.lastResort 直打控制台，启动界面必须保持零提示。"""
     from core.computer.runtime import start_computer_runtime
 
     api = FakeHotkeyApi(register_result=False, last_error_code=1409)
@@ -687,7 +636,6 @@ def test_hotkey_registration_failure_never_reaches_console(caplog):
 
 
 def test_emergency_hotkey_stops_active_run(tmp_path):
-    """Ctrl+Alt+Esc 回调：停止活动 run（reason=emergency_hotkey）。"""
     from core.computer.runtime import start_computer_runtime
 
     service = _service_with_backends({"desktop": FakeComputerBackend("desktop")})
@@ -703,7 +651,7 @@ def test_emergency_hotkey_stops_active_run(tmp_path):
         controller_provider=lambda: service,
     )
     try:
-        api.on_hotkey()  # 模拟 Ctrl+Alt+Esc
+        api.on_hotkey()
         final = service.snapshot()
         assert final.run_id == snapshot.run_id
         assert final.status == "stopped"
@@ -743,17 +691,11 @@ def test_shutdown_process_computer_runtime_gathers_singletons(monkeypatch):
         assert isinstance(recorded.get("controller"), FakeService)
         assert recorded.get("hotkey") is runtime.hotkey
         assert recorded.get("reason") == "test_exit"
-        assert runtime_module.get_computer_runtime() is None  # 单例已清空
+        assert runtime_module.get_computer_runtime() is None
     finally:
         # shutdown_computer_runtime 被 fake 替身接管：真实热键由测试显式注销，
         # 绝不让 _active_hotkey 注册表泄漏到后续测试。
         runtime.hotkey.close()
-
-
-# ---------------------------------------------------------------------------
-# 热键生命周期接线（Task 5 移交 → Task 16）：用户开启设置时首次注册、
-# 活动能力存在时保持、两开关全关且无活动 run 时注销、退出统一注销
-# ---------------------------------------------------------------------------
 
 
 def test_refresh_hotkey_registers_on_enable_and_unregisters_when_idle():
@@ -774,12 +716,12 @@ def test_refresh_hotkey_registers_on_enable_and_unregisters_when_idle():
         settings_loader=_settings, hotkey_factory=lambda: api
     )
     try:
-        assert runtime.hotkey is None  # 全关启动：未注册
+        assert runtime.hotkey is None
         state["enabled"] = True
         refresh_computer_runtime_hotkey(
             settings_loader=_settings, hotkey_factory=lambda: api
         )
-        assert runtime.hotkey is not None  # 用户开启设置：首次注册
+        assert runtime.hotkey is not None
         assert api.register_calls == 1
         assert get_emergency_hotkey_snapshot().available is True
 
@@ -787,7 +729,7 @@ def test_refresh_hotkey_registers_on_enable_and_unregisters_when_idle():
         refresh_computer_runtime_hotkey(
             settings_loader=_settings, hotkey_factory=lambda: api
         )
-        assert runtime.hotkey is None  # 两开关全关且无活动 run：注销
+        assert runtime.hotkey is None
         assert api.unregister_calls == 1
         assert get_emergency_hotkey_snapshot().available is False
     finally:
@@ -795,7 +737,6 @@ def test_refresh_hotkey_registers_on_enable_and_unregisters_when_idle():
 
 
 def test_refresh_hotkey_keeps_hotkey_while_run_active():
-    """活动能力存在时保持：两开关全关但活动 run 尚在收尾，热键不得注销。"""
     from core.computer.runtime import (
         refresh_computer_runtime_hotkey,
         shutdown_computer_runtime,
@@ -821,14 +762,13 @@ def test_refresh_hotkey_keeps_hotkey_while_run_active():
             hotkey_factory=lambda: api,
             controller_provider=lambda: service,
         )
-        assert runtime.hotkey is not None  # 活动 run：保持注册
+        assert runtime.hotkey is not None
         assert api.unregister_calls == 0
     finally:
         shutdown_computer_runtime(controller=service, hotkey=runtime.hotkey)
 
 
 def test_refresh_hotkey_without_runtime_is_noop():
-    """运行时容器未启动：refresh 不自动启动、不读设置、零副作用。"""
     from core.computer.runtime import (
         get_computer_runtime,
         refresh_computer_runtime_hotkey,
@@ -857,18 +797,12 @@ def test_refresh_hotkey_settings_failure_keeps_current_registration():
         refresh_computer_runtime_hotkey(
             settings_loader=_boom, hotkey_factory=lambda: api
         )
-        assert runtime.hotkey is not None  # 读取失败：保持现状
+        assert runtime.hotkey is not None
     finally:
         shutdown_computer_runtime(hotkey=runtime.hotkey)
 
 
-# ---------------------------------------------------------------------------
-# 预览发布接线与 preview token / profile 内容审计
-# ---------------------------------------------------------------------------
-
-
 def test_controller_publishes_observation_png_to_lazy_preview(tmp_path):
-    """observation 产生时发布 PNG 到惰性预览服务；URL 可访问并进事件/快照。"""
     from core.computer.preview_server import ComputerPreviewServer  # noqa: F401
     from core.computer.runtime import ComputerRuntime, shutdown_computer_runtime
 
@@ -895,11 +829,10 @@ def test_controller_publishes_observation_png_to_lazy_preview(tmp_path):
     assert service.snapshot().preview_url == observation.preview_url
 
     shutdown_computer_runtime(controller=service, preview=runtime.preview)
-    assert not any((tmp_path / "preview").iterdir())  # 临时 PNG 已删除
+    assert not any((tmp_path / "preview").iterdir())
 
 
 def test_preview_token_never_reaches_logs_or_journal(tmp_path):
-    """preview token 只进 GUI 事件 URL，绝不进 DB/Journal/运行日志。"""
     from core.computer.runtime import ComputerRuntime, shutdown_computer_runtime
     from core.memory import MemoryManager
 
@@ -957,14 +890,14 @@ def test_preview_token_never_reaches_logs_or_journal(tmp_path):
                 consume_background_notifications=False,
                 computer_capability=GENERIC_CAPABILITY,
             ))
-        token = runtime.preview.token  # 观察已发布，预览服务已惰性启动
+        token = runtime.preview.token
         assert token
     finally:
         root.removeHandler(handler)
         handler.close()
         shutdown_computer_runtime(
             controller=service, preview=runtime.preview
-        )  # 清理 retained backend 与预览临时 PNG
+        )
         manager.close()
 
     corpus = read_text_database_journal_events_and_logs(tmp_path)
@@ -973,7 +906,6 @@ def test_preview_token_never_reaches_logs_or_journal(tmp_path):
 
 
 def test_browser_profile_contents_stay_local(tmp_path):
-    """浏览器 profile 文件内容绝不进入观察投影或运行日志（设计 22.2）。"""
     from core.computer.actions import observation_provider_projection
     from core.computer.browser_backend import BrowserComputerBackend
     from tests.computer_fakes import FakePlaywrightRuntime

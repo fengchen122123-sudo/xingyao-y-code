@@ -24,7 +24,6 @@ export default defineConfig({
     port: 5175,
     strictPort: true,
     proxy: {
-      // dev 下 lan_server 尚未启动时这些请求会失败，仅用于联调已启动的桌面端
       '/mobile-shim.js': { target: `http://localhost:${LAN_PORT}`, changeOrigin: true },
     },
   },

@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""search 场景接入测试：JEV 决定 search_news 的结果条数（num_results）。
-
-隔离策略：
-- ``tests/conftest.py`` 收集阶段已把 ``YCODE_DATA_DIR`` 指向临时目录；本文件再
-  把 ``config.YCODE_DIR`` monkeypatch 到每个用例的 tmp_path，绝不触碰真实
-  ``~/.ycode``；
-- DuckDuckGo 用 FakeDDGS 打桩，HTTP 层打桩 ``decision_service._post``——全程零真实
-  网络、零真实决策请求。
-
-覆盖点：决策返回 8 / 3 → 实际请求用该值；返回 None / 异常 → 用调用方传入值；
-JEV 全关 → 与原行为完全一致（零决策请求 + 请求参数不变）。
-"""
 import json
 import os
 import sys
@@ -32,12 +20,16 @@ PROVIDER = {
 }
 
 
-# ---------------------------------------------------------------------------
-# 测试基础设施
-# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _disable_free_web_search(monkeypatch):
+    from core import web_search
+
+    def _unavailable(*args, **kwargs):
+        raise web_search.SearchBackendError("测试中禁用免费网页通道")
+
+    monkeypatch.setattr(web_search, "search_web", _unavailable)
 
 def _install_fake_ddgs(monkeypatch, results=None):
-    """打桩 DDGS：记录每次 news() 请求的 max_results（= 真正发出去的条数）。"""
     requests = []
 
     class _FakeDDGS:
@@ -58,7 +50,6 @@ def _install_fake_ddgs(monkeypatch, results=None):
 
 
 def _mock_decide(monkeypatch, value):
-    """打桩网关 decide；记录调用参数，返回指定答案。"""
     calls = []
 
     def fake(scene, state, question, **kwargs):
@@ -79,14 +70,12 @@ def _write_user_config(data_dir, providers):
     )
 
 
-def _enable_scene(scene="search", *, shadow=False, **scene_extra):
-    """写决策配置：全局 enabled + 指定场景 enabled。"""
-    scene_cfg = {"enabled": True, "shadow": shadow}
+def _enable_scene(scene="search", **scene_extra):
+    scene_cfg = {"enabled": True}
     scene_cfg.update(scene_extra)
     return svc.save_decision_config(
         {
             "enabled": True,
-            "shadow_mode": shadow,
             "scenes": {scene: scene_cfg},
         }
     )
@@ -97,7 +86,6 @@ def _resp(code, body=None):
 
 
 def _mock_post(monkeypatch, handler):
-    """打桩 decision_service._post（网关链路真正发请求的唯一出口）。"""
     calls = []
 
     def fake(url, headers, payload, timeout_seconds):
@@ -109,7 +97,6 @@ def _mock_post(monkeypatch, handler):
 
 
 def _mock_no_network(monkeypatch):
-    """护栏：任何真实决策请求都视为失败（JEV 关闭时必须零请求）。"""
     calls = []
 
     def fake(url, headers, payload, timeout_seconds):  # pragma: no cover - 不应被调用
@@ -134,7 +121,6 @@ def _audit_records(data_dir):
 
 @pytest.fixture()
 def data_dir(tmp_path, monkeypatch):
-    """把 config.YCODE_DIR 重定向到 tmp_path，保证不读写真实 ~/.ycode。"""
     import config
 
     directory = tmp_path / "ycode"
@@ -145,12 +131,7 @@ def data_dir(tmp_path, monkeypatch):
     svc._reset_runtime_state()
 
 
-# ---------------------------------------------------------------------------
-# 1. 决策值被采纳
-# ---------------------------------------------------------------------------
-
 def test_decision_eight_is_used_for_request(monkeypatch):
-    """决策返回 8：本次 DDGS 请求就用 8 条（而不是调用方传入的 5）。"""
     calls = _mock_decide(monkeypatch, 8)
     requests = _install_fake_ddgs(monkeypatch)
 
@@ -163,7 +144,6 @@ def test_decision_eight_is_used_for_request(monkeypatch):
 
 
 def test_decision_three_is_used_for_request(monkeypatch):
-    """决策返回 3：请求用 3 条。"""
     _mock_decide(monkeypatch, 3)
     requests = _install_fake_ddgs(monkeypatch)
 
@@ -173,7 +153,6 @@ def test_decision_three_is_used_for_request(monkeypatch):
 
 
 def test_decision_overrides_large_caller_value(monkeypatch):
-    """调用方给 12、决策给 8：以决策为准（决策是本次请求的最终档位）。"""
     _mock_decide(monkeypatch, 8)
     requests = _install_fake_ddgs(monkeypatch)
 
@@ -182,12 +161,7 @@ def test_decision_overrides_large_caller_value(monkeypatch):
     assert [r["max_results"] for r in requests] == [8]
 
 
-# ---------------------------------------------------------------------------
-# 2. 返回 None / 异常 → 保持调用方传入值
-# ---------------------------------------------------------------------------
-
 def test_decision_none_keeps_caller_num_results(monkeypatch):
-    """决策返回 None（未启用/影子/失败/低置信）：用调用方传入的 num_results。"""
     _mock_decide(monkeypatch, None)
     requests = _install_fake_ddgs(monkeypatch)
 
@@ -197,7 +171,6 @@ def test_decision_none_keeps_caller_num_results(monkeypatch):
 
 
 def test_decision_none_keeps_default_num_results(monkeypatch):
-    """调用方未传 num_results：None 时保持默认 5。"""
     _mock_decide(monkeypatch, None)
     requests = _install_fake_ddgs(monkeypatch)
 
@@ -212,7 +185,6 @@ def test_decision_none_keeps_default_num_results(monkeypatch):
     ids=["str", "float", "bool", "zero", "fifty", "hundred"],
 )
 def test_illegal_decided_value_falls_back(monkeypatch, bad):
-    """决策值非法（非 int / 布尔 / 越界）：丢弃并用调用方传入值。"""
     _mock_decide(monkeypatch, bad)
     requests = _install_fake_ddgs(monkeypatch)
 
@@ -222,7 +194,6 @@ def test_illegal_decided_value_falls_back(monkeypatch, bad):
 
 
 def test_decision_exception_still_returns_results(monkeypatch):
-    """决策抛异常：search_news 照常返回正常结果，且用调用方传入值。"""
     _mock_decide(monkeypatch, RuntimeError("决策服务炸了"))
     requests = _install_fake_ddgs(monkeypatch)
 
@@ -233,12 +204,7 @@ def test_decision_exception_still_returns_results(monkeypatch):
     assert not result.startswith("🚨")
 
 
-# ---------------------------------------------------------------------------
-# 3. 隐私约束：state 只含查询词
-# ---------------------------------------------------------------------------
-
 def test_state_contains_only_query_and_question_shape(monkeypatch):
-    """state 只放查询词本身；题目形状/候选/超时符合规范。"""
     calls = _mock_decide(monkeypatch, None)
     _install_fake_ddgs(monkeypatch)
 
@@ -253,15 +219,9 @@ def test_state_contains_only_query_and_question_shape(monkeypatch):
     assert "判断这次联网检索的信息量需求" in question["instructions"]
 
 
-# ---------------------------------------------------------------------------
-# 4. JEV 全关 / 影子：与原行为完全一致
-# ---------------------------------------------------------------------------
-
 def test_jev_disabled_behaves_like_before(data_dir, monkeypatch):
-    """JEV 全关：0 次决策请求，请求参数与接入前一致，返回文本一致。"""
-    # 不写决策配置 = DEFAULT_CONFIG（enabled=false，scenes 全 shadow 且未启用）
     _write_user_config(data_dir, [PROVIDER])
-    post_calls = _mock_no_network(monkeypatch)  # 任何决策请求都会 AssertionError
+    post_calls = _mock_no_network(monkeypatch)
     requests = _install_fake_ddgs(monkeypatch)
 
     result = tools_mod.search_news("OpenAI 发布会", num_results=5)
@@ -276,7 +236,6 @@ def test_jev_disabled_behaves_like_before(data_dir, monkeypatch):
 
 
 def test_jev_disabled_keeps_clamp_behaviour(data_dir, monkeypatch):
-    """JEV 全关 + 超大 num_results：仍按原有 1~20 钳制（回归：不改动原逻辑）。"""
     _write_user_config(data_dir, [PROVIDER])
     _mock_no_network(monkeypatch)
     requests = _install_fake_ddgs(monkeypatch)
@@ -287,7 +246,6 @@ def test_jev_disabled_keeps_clamp_behaviour(data_dir, monkeypatch):
 
 
 def test_jev_disabled_no_results_message_unchanged(data_dir, monkeypatch):
-    """JEV 全关 + 无结果：仍返回 🚨 前缀（子代理失败流程依赖它）。"""
     _write_user_config(data_dir, [PROVIDER])
     _mock_no_network(monkeypatch)
     _install_fake_ddgs(monkeypatch, results=[])
@@ -298,33 +256,9 @@ def test_jev_disabled_no_results_message_unchanged(data_dir, monkeypatch):
     assert "不存在的选题" in result
 
 
-def test_scene_shadow_keeps_caller_value_but_sends_request(data_dir, monkeypatch):
-    """search 影子模式：真实发决策请求并写审计，但结果丢弃 → 用调用方传入值。"""
-    _write_user_config(data_dir, [PROVIDER])
-    _enable_scene("search", shadow=True)
-    post_calls = _mock_post(
-        monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "8"}}})
-    )
-    requests = _install_fake_ddgs(monkeypatch)
-
-    tools_mod.search_news("影子模式查询", num_results=5)
-
-    assert len(post_calls) == 1, "影子模式仍应发一次请求（只观测不采纳）"
-    assert [r["max_results"] for r in requests] == [5]
-    record = _audit_records(data_dir)[-1]
-    assert record["scene"] == "search"
-    assert record["shadow"] is True
-    assert record["adopted"] is False
-
-
-# ---------------------------------------------------------------------------
-# 5. 端到端（真实网关链路 + 打桩 HTTP）：live 模式采纳决策档位并回填审计
-# ---------------------------------------------------------------------------
-
 def test_live_mode_end_to_end_uses_decided_value(data_dir, monkeypatch):
-    """live 模式走完「网关 → 服务 → 审计」全链路：请求用 8 条，审计 adopted=true。"""
     _write_user_config(data_dir, [PROVIDER])
-    _enable_scene("search", shadow=False)
+    _enable_scene("search")
     post_calls = _mock_post(
         monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "8"}}})
     )
@@ -337,6 +271,6 @@ def test_live_mode_end_to_end_uses_decided_value(data_dir, monkeypatch):
     assert not result.startswith("🚨")
     record = _audit_records(data_dir)[-1]
     assert record["scene"] == "search"
-    assert record["shadow"] is False
+    assert "shadow" not in record
     assert record["adopted"] is True
     assert record["trace_id"]

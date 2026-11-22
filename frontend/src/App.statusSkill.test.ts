@@ -5,7 +5,6 @@ import { mount } from '@vue/test-utils';
 import App from './App.vue';
 import { useAppStore } from './stores/appStore';
 
-// 子组件全部 stub：只断言底部状态栏「技能」项的显示文本
 const stubs = {
   Topbar: true, Sidebar: true, KimiEmptyState: true, TurnGroup: true,
   InputArea: true, RightPanel: true, ConfirmModal: true, UpdateModal: true,
@@ -50,9 +49,7 @@ it('技能较多时截断并以省略号结尾，完整列表保留在 title', (
   ];
   const { wrapper } = mountWithSkills(skills);
   const el = wrapper.find('[data-test="status-skill"]');
-  // 前两个放得下、第三个超出预算：截断显示并以 "…" 结尾，不允许把全部名称堆进状态栏
   expect(el.text()).toBe('技能: systematic-debugging、test-driven-development…');
-  // 完整列表通过 title 保留，hover 可查
   expect(el.attributes('title')).toBe('本回合使用的技能：' + skills.join('、'));
   wrapper.unmount();
 });

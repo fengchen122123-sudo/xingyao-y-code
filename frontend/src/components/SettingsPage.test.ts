@@ -119,7 +119,6 @@ describe('SettingsPage', () => {
     const refreshSpy = vi.spyOn(store, 'refreshHooks').mockResolvedValue(undefined);
     const wrapper = mount(SettingsPage);
 
-    // 默认落在模型配置分区，钩子分区未挂载
     expect(wrapper.find('[data-test="hook-new-btn"]').exists()).toBe(false);
     expect(refreshSpy).not.toHaveBeenCalled();
 
@@ -127,7 +126,6 @@ describe('SettingsPage', () => {
 
     expect(wrapper.text()).toContain('钩子 Hooks');
     expect(wrapper.get('[data-test="hook-new-btn"]').isVisible()).toBe(true);
-    // 进入钩子分区挂载组件时自动刷新一次列表
     expect(refreshSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -150,7 +148,6 @@ describe('SettingsPage', () => {
 
     expect(wrapper.get('[data-test="model-supports-function-calling"]').attributes('type')).toBe('checkbox');
     const protocol = wrapper.get<HTMLSelectElement>('[data-test="model-computer-protocol"]');
-    // 自动（缺省）：视觉+工具调用双勾的模型无需逐个配置协议即可电脑操控
     expect(protocol.element.value).toBe('');
     const optionValues = Array.from(protocol.element.options).map(option => option.value);
     expect(optionValues).toEqual(['', 'none', 'generic', 'native_openai']);
@@ -168,7 +165,6 @@ describe('SettingsPage', () => {
 
     expect(wrapper.get<HTMLInputElement>('[data-test="model-supports-vision"]').element.checked).toBe(true);
     expect(wrapper.get<HTMLInputElement>('[data-test="model-supports-function-calling"]').element.checked).toBe(false);
-    // 后端对缺键模型返回 ''（自动）；该模型 fc=false，自动判定不会赋予操控资格
     expect(wrapper.get<HTMLSelectElement>('[data-test="model-computer-protocol"]').element.value).toBe('');
   });
 
@@ -180,12 +176,10 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="provider-p1"]').trigger('click');
     await wrapper.get('[data-test="add-model"]').trigger('click');
     await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('model-auto');
-    // 视觉+工具调用双勾 + 协议保持「自动」
     await wrapper.get('[data-test="model-supports-vision"]').setValue(true);
     await wrapper.get('[data-test="model-supports-function-calling"]').setValue(true);
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
-    // 新增模型未定 ID、后端无从判断思考能力 → reasoningChoice 传 null（不落键）
     expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '', 0, null);
   });
 
@@ -196,7 +190,6 @@ describe('SettingsPage', () => {
 
     await wrapper.get('[data-test="add-model"]').trigger('click');
     await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('bad-generic');
-    // 视觉与工具调用均未开启，直接选 generic
     await wrapper.get('[data-test="model-computer-protocol"]').setValue('generic');
 
     expect(wrapper.get('[data-test="model-computer-protocol-error"]').text()).toBe(
@@ -205,7 +198,6 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
     expect(addModel).not.toHaveBeenCalled();
-    // 前端阻止保存，modal 保持打开
     expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(true);
   });
 
@@ -314,7 +306,6 @@ describe('SettingsPage', () => {
               supports_vision: true,
               supports_function_calling: true,
               computer_protocol: '',
-              // 与后端 build_reasoning_snapshot 的真实输出一致：fixed 的 options 为空
               reasoning_choice: 'on',
               reasoning_options: [],
               reasoning_visible: true,
@@ -391,13 +382,11 @@ describe('SettingsPage', () => {
 
     expect(updateSpy).toHaveBeenCalledTimes(1);
     const args = updateSpy.mock.calls[0];
-    // 思考设置是 updateModel 的第 9 个参数
     expect(args.length).toBe(9);
     expect(args[args.length - 1]).toBeNull();
   });
 
   it('does not probe reasoning capabilities while typing a model name', async () => {
-    // 编辑弹窗不再展示思考设置，输入模型名时不该再发探测请求
     const store = useAppStore();
     const probeSpy = vi.spyOn(store, 'getReasoningSnapshotByName').mockResolvedValue(null);
     const wrapper = mount(SettingsPage);
@@ -418,7 +407,6 @@ describe('SettingsPage', () => {
 
     await wrapper.get('[data-test="provider-p1"]').trigger('click');
     const textarea = wrapper.get('[data-test="provider-api-key"]');
-    // textarea 不支持 type=password：隐藏态改由 key-masked class（-webkit-text-security: disc）实现
     expect(textarea.attributes('type')).toBeUndefined();
     expect(textarea.classes()).toContain('key-masked');
 
@@ -490,7 +478,6 @@ describe('SettingsPage', () => {
     await flushPromises();
 
     expect(writeText).toHaveBeenCalledWith('sk-real-key');
-    // 复制后仍为掩码态，仅剪贴板拿到明文
     expect(wrapper.get('[data-test="provider-api-key"]').classes()).toContain('key-masked');
   });
 
@@ -502,7 +489,6 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="provider-p1"]').trigger('click');
     const textarea = wrapper.get('[data-test="provider-api-key"]');
     expect(textarea.element.tagName).toBe('TEXTAREA');
-    // 多 Key：一行一个；保存时原样（含换行）传给后端
     await textarea.setValue('k1\nk2');
     await textarea.trigger('input');
 
@@ -525,7 +511,6 @@ describe('SettingsPage', () => {
 
     const textarea = wrapper.get('[data-test="preset-api-key"]');
     expect(textarea.element.tagName).toBe('TEXTAREA');
-    // 多 Key：一行一个；保存时原样（含换行）传给后端
     await textarea.setValue('k1\nk2');
     await textarea.trigger('input');
 
@@ -569,9 +554,7 @@ describe('SettingsPage', () => {
 
     expect(wrapper.get('.settings-header h1').text()).toBe('免责条款');
     const doc = wrapper.get('[data-test="disclaimer-doc"]');
-    // 8 个条款章节完整渲染
     expect(wrapper.findAll('.disclaimer-clause').length).toBe(8);
-    // 条款版本与更新日期可见（修改条款正文后需同步更新）
     expect(wrapper.get('[data-test="disclaimer-version"]').text()).toBe('v1.0');
     // 关键法定免责边界必须存在，防止后续编辑误删
     const text = doc.text();
@@ -595,17 +578,14 @@ describe('SettingsPage', () => {
     await testBtn!.trigger('click');
     await flushPromises();
 
-    // 方案 B：微型警告条展开
     const banner = wrapper.find('[data-test="model-error-banner"]');
     expect(banner.exists()).toBe(true);
     expect(banner.text()).toContain('API Key 无效或未授权');
     expect(banner.text()).toContain('请检查该厂商配置的 API Key');
 
-    // 点击复制报错
     await wrapper.get('[data-test="copy-test-error"]').trigger('click');
     expect(writeText).toHaveBeenCalledWith(rawError);
 
-    // 点击关闭警告条
     await wrapper.get('[data-test="dismiss-test-error"]').trigger('click');
     expect(wrapper.find('[data-test="model-error-banner"]').exists()).toBe(false);
   });

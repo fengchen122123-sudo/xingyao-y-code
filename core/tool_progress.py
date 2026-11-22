@@ -1,19 +1,35 @@
-"""Pure state machine for compact CLI tool-progress output."""
-
 from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+import re
 import time
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from core.ui_markers import ANSI_CYAN, ANSI_GREEN, ANSI_RED, ANSI_RESET
+from core.ui_markers import (
+    ANSI_RESET,
+    diff_stat_bar,
+    theme_ansi,
+)
 
 
 _DISPLAY_CATEGORIES = frozenset(
-    {"read", "search", "command", "mutation", "skill", "subagent", "other"}
+    {"read", "search", "command", "mutation", "skill", "subagent", "computer", "other"}
 )
+
+_CATEGORY_BADGES = {
+    "read": "读取",
+    "search": "搜索",
+    "command": "命令",
+    "mutation": "编辑",
+    "skill": "技能",
+    "subagent": "子代理",
+    "computer": "桌面",
+    "other": "工具",
+}
+
+_HUNK_HEADER_RE = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
 
 
 @dataclass(frozen=True)
@@ -93,6 +109,48 @@ class _PendingGroup:
     metrics: dict[str, int] = field(default_factory=dict)
 
 
+def _format_compact_diff_preview(diff_text: str, *, max_lines: int = 6) -> list[str]:
+    if not diff_text:
+        return []
+    muted = theme_ansi("text_muted")
+    ok_c = theme_ansi("ok")
+    err_c = theme_ansi("err")
+    changed: list[str] = []
+    old_ln = 0
+    new_ln = 0
+    total_changes = 0
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("--- ") or raw_line.startswith("+++ "):
+            continue
+        hunk = _HUNK_HEADER_RE.match(raw_line)
+        if hunk:
+            old_ln = int(hunk.group(1))
+            new_ln = int(hunk.group(2))
+            continue
+        if raw_line.startswith("\\"):
+            continue
+        if raw_line.startswith("-"):
+            total_changes += 1
+            if len(changed) < max_lines:
+                body = raw_line[1:][:96]
+                changed.append(f"    {muted}│ {old_ln:>4}{ANSI_RESET}  {err_c}- {body}{ANSI_RESET}\n")
+            old_ln += 1
+        elif raw_line.startswith("+"):
+            total_changes += 1
+            if len(changed) < max_lines:
+                body = raw_line[1:][:96]
+                changed.append(f"    {muted}│ {new_ln:>4}{ANSI_RESET}  {ok_c}+ {body}{ANSI_RESET}\n")
+            new_ln += 1
+        else:
+            old_ln += 1
+            new_ln += 1
+    if total_changes > max_lines:
+        changed.append(
+            f"    {muted}│       … 已省略其余 {total_changes - max_lines} 行变更{ANSI_RESET}\n"
+        )
+    return changed
+
+
 class ToolProgressAggregator:
     """Aggregate adjacent successful reads/searches and format all other results."""
 
@@ -107,7 +165,6 @@ class ToolProgressAggregator:
         event = ToolDisplayEvent.from_payload(payload)
         if not event.tool_id:
             return
-        # Moving a replacement to the end preserves the latest active action.
         self._active.pop(event.tool_id, None)
         self._finished_tool_ids.discard(event.tool_id)
         self._diff_tool_ids.discard(event.tool_id)
@@ -141,7 +198,13 @@ class ToolProgressAggregator:
             return lines
         if event.is_skill or event.category == "skill":
             lines = self.flush()
-            lines.append(f"{ANSI_CYAN}✦{ANSI_RESET} 使用技能：{event.target}\n")
+            accent = theme_ansi("accent")
+            accent_soft = theme_ansi("accent_soft")
+            muted = theme_ansi("text_muted")
+            lines.append(
+                f"  {accent}✦{ANSI_RESET} {muted}技能{ANSI_RESET}  "
+                f"使用技能：{accent_soft}{event.target}{ANSI_RESET}\n"
+            )
             return lines
         if event.ok is True and event.category in {"read", "search"}:
             lines: list[str] = []
@@ -162,14 +225,32 @@ class ToolProgressAggregator:
         lines.extend(self._success_lines(event))
         return lines
 
-    def record_diff(self, tool_call_id: str, file_path: str, added: int, removed: int) -> list[str]:
-        """Emit the authoritative diff summary for one mutation tool call."""
+    def record_diff(
+        self,
+        tool_call_id: str,
+        file_path: str,
+        added: int,
+        removed: int,
+        *,
+        diff_text: str = "",
+    ) -> list[str]:
+        """Emit the authoritative diff summary (plus compact preview for small edits)."""
         self._diff_tool_ids.add(str(tool_call_id))
         lines = self.flush()
+        ok_c = theme_ansi("ok")
+        err_c = theme_ansi("err")
+        accent_soft = theme_ansi("accent_soft")
+        muted = theme_ansi("text_muted")
+        stat_bar = diff_stat_bar(added, removed)
+        stat_suffix = f" {stat_bar}" if stat_bar else ""
         lines.append(
-            f"{ANSI_GREEN}✓{ANSI_RESET} 已修改 {ANSI_CYAN}{file_path}{ANSI_RESET}"
-            f" · {ANSI_GREEN}+{added}{ANSI_RESET} / {ANSI_RED}-{removed}{ANSI_RESET} 行\n"
+            f"  {ok_c}✓{ANSI_RESET} {muted}编辑{ANSI_RESET}  "
+            f"已修改 {accent_soft}{file_path}{ANSI_RESET}"
+            f" {muted}·{ANSI_RESET} {ok_c}+{added}{ANSI_RESET} / {err_c}-{removed}{ANSI_RESET} 行"
+            f"{stat_suffix}\n"
         )
+        if diff_text and 1 <= (added + removed) <= 10:
+            lines.extend(_format_compact_diff_preview(diff_text, max_lines=6))
         return lines
 
     def flush(self) -> list[str]:
@@ -177,14 +258,17 @@ class ToolProgressAggregator:
         self._pending = None
         if group is None:
             return []
+        ok_c = theme_ansi("ok")
+        muted = theme_ansi("text_muted")
         duration = _format_duration(group.duration_ms)
+        badge = _CATEGORY_BADGES.get(group.category, "工具")
         if group.category == "read":
             line_count = group.metrics.get("line_count", 0)
-            metric = f" · {line_count} 行" if line_count else ""
-            text = f"已读取 {group.count} 个文件{metric} · {duration}"
+            metric = f" {muted}· {line_count} 行{ANSI_RESET}" if line_count else ""
+            text = f"已读取 {group.count} 个文件{metric} {muted}· {duration}{ANSI_RESET}"
         else:
-            text = f"已完成 {group.count} 次搜索 · {duration}"
-        return [f"{ANSI_GREEN}✓{ANSI_RESET} {text}\n"]
+            text = f"已完成 {group.count} 次搜索 {muted}· {duration}{ANSI_RESET}"
+        return [f"  {ok_c}✓{ANSI_RESET} {muted}{badge}{ANSI_RESET}  {text}\n"]
 
     def active_status(self) -> ActiveToolStatus | None:
         if not self._active:
@@ -215,6 +299,18 @@ class ToolProgressAggregator:
             started_at=started_at,
         )
 
+    def active_statuses(self) -> list[ActiveToolStatus]:
+        """返回当前所有在途工具活动（按开始时间顺序）。"""
+        return [
+            ActiveToolStatus(
+                label=f"正在{event.action}",
+                detail=event.command or event.target,
+                count=1,
+                started_at=started_at,
+            )
+            for event, started_at in self._active.values()
+        ]
+
     def _standalone_lines(self, event: ToolDisplayEvent) -> list[str]:
         if event.ok is False:
             return self._failure_lines(event)
@@ -222,6 +318,11 @@ class ToolProgressAggregator:
 
     @staticmethod
     def _success_lines(event: ToolDisplayEvent) -> list[str]:
+        ok_c = theme_ansi("ok")
+        muted = theme_ansi("text_muted")
+        soft = theme_ansi("text_soft")
+        accent_soft = theme_ansi("accent_soft")
+        badge = _CATEGORY_BADGES.get(event.category, "工具")
         if event.category == "command":
             # D8：后台任务只表示"已启动"，不能显示"命令执行完成"误导用户
             summary = (
@@ -231,30 +332,43 @@ class ToolProgressAggregator:
             )
         else:
             summary = f"已{event.action}"
-        target = f" {event.target}" if event.target and event.category != "command" else ""
+        target = (
+            f" {accent_soft}{event.target}{ANSI_RESET}"
+            if event.target and event.category != "command"
+            else ""
+        )
+        duration = _format_duration(event.duration_ms or 0)
         lines = [
-            f"{ANSI_GREEN}✓{ANSI_RESET} {summary}{target} · {_format_duration(event.duration_ms or 0)}\n"
+            f"  {ok_c}✓{ANSI_RESET} {muted}{badge}{ANSI_RESET}  "
+            f"{summary}{target} {muted}· {duration}{ANSI_RESET}\n"
         ]
         if event.command:
-            lines.append(f"  └─ {event.command}\n")
+            lines.append(f"    {muted}└─{ANSI_RESET} {soft}{event.command}{ANSI_RESET}\n")
         return lines
 
     @staticmethod
     def _failure_lines(event: ToolDisplayEvent) -> list[str]:
+        err_c = theme_ansi("err")
+        muted = theme_ansi("text_muted")
+        soft = theme_ansi("text_soft")
+        duration = _format_duration(event.duration_ms or 0)
         lines = [
-            f"{ANSI_RED}✗{ANSI_RESET} {event.action}失败 · {_format_duration(event.duration_ms or 0)}\n"
+            f"  {err_c}✗{ANSI_RESET} {err_c}失败{ANSI_RESET}  "
+            f"{event.action}失败 {muted}· {duration}{ANSI_RESET}\n"
         ]
         if event.command:
-            lines.append(f"  ├─ {event.command}\n")
+            lines.append(f"    {muted}├─{ANSI_RESET} {soft}{event.command}{ANSI_RESET}\n")
         if event.error_summary:
-            lines.append(f"  └─ {event.error_summary}\n")
+            lines.append(f"    {muted}└─{ANSI_RESET} {err_c}{event.error_summary}{ANSI_RESET}\n")
         elif event.target and not event.command:
-            lines.append(f"  └─ {event.target}\n")
+            lines.append(f"    {muted}└─{ANSI_RESET} {soft}{event.target}{ANSI_RESET}\n")
         return lines
 
     @staticmethod
     def _protocol_error_line(reason: str) -> str:
-        return f"{ANSI_RED}✗{ANSI_RESET} 未知工具事件 · {reason}\n"
+        err_c = theme_ansi("err")
+        muted = theme_ansi("text_muted")
+        return f"  {err_c}✗{ANSI_RESET} {err_c}异常{ANSI_RESET}  未知工具事件 {muted}· {reason}{ANSI_RESET}\n"
 
 
 def _format_duration(duration_ms: int) -> str:

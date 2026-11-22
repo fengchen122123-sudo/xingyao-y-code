@@ -2,10 +2,7 @@
   <section class="app-glass-card" data-test="app-glass-card">
     <header class="agc-head">
       <h3>玻璃效果</h3>
-      <p>
-        在<strong>壁纸</strong>与<strong>界面内容</strong>之间叠一层可调的磨砂玻璃。
-        默认 0% = 关闭，与改之前完全一致。
-      </p>
+      <p>在壁纸与界面之间叠加磨砂玻璃（0% 为关闭）。</p>
     </header>
 
     <label class="agc-row">
@@ -47,11 +44,6 @@
         恢复默认（关闭）
       </button>
     </div>
-
-    <p class="agc-hint">
-      透明度越高、模糊越强，界面越"实"、壁纸越被压暗；透明度低 + 模糊高则偏通透。
-      参数存在本地（localStorage），重启后保持；这是纯前端效果，不影响主题文件。
-    </p>
   </section>
 </template>
 

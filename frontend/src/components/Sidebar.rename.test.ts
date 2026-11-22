@@ -5,15 +5,12 @@ import { nextTick } from 'vue';
 import Sidebar from './Sidebar.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 挂载到 document.body：重命名输入框的自动聚焦 / 全选需要真实文档焦点环境，
-// jsdom 下 detached 节点拿不到 activeElement。
 const wrappers: VueWrapper[] = [];
 afterEach(() => {
   wrappers.splice(0).forEach((w) => w.unmount());
   delete (window as any).pywebview;
 });
 
-// 每个用例自建会话数据（不 mock store，测真实行为）
 function sessionGroups() {
   return [
     {
@@ -40,7 +37,6 @@ function setup(api: Record<string, any> = {}) {
   return { wrapper, store };
 }
 
-// 右键第 index 个会话项；用原生 MouseEvent 以便携带 clientX/clientY（菜单跟随鼠标坐标）
 async function openMenu(
   wrapper: VueWrapper,
   index = 0,
@@ -158,14 +154,12 @@ it('值为空或与原名相同 → 不发请求并静默退出编辑态', async
   const rename_session = vi.fn();
   const { wrapper } = setup({ rename_session });
 
-  // 情形一：未改动直接回车
   await openMenu(wrapper);
   await clickRename(wrapper);
   await wrapper.find('[data-test="session-rename-input"]').trigger('keydown.enter');
   await new Promise((r) => setTimeout(r, 0));
   expect(wrapper.find('[data-test="session-rename-input"]').exists()).toBe(false);
 
-  // 情形二：只输入空白
   await openMenu(wrapper);
   await clickRename(wrapper);
   const input = wrapper.find('[data-test="session-rename-input"]');
@@ -223,7 +217,6 @@ it('点删除 → 关闭菜单并进入二次确认态，确认后才按旧名�
   expect(wrapper.find('.session-item .s-confirm').exists()).toBe(true);
   expect(delete_session).not.toHaveBeenCalled();
 
-  // 二次确认才真正落盘删除，且用的是该会话当时的名字
   await wrapper.find('.session-item .s-confirm').trigger('click');
   await new Promise((r) => setTimeout(r, 0));
   expect(delete_session).toHaveBeenCalledWith('session-a');
@@ -234,13 +227,11 @@ it('编辑态下点击输入框不会触发会话切换', async () => {
   const { wrapper, store } = setup({ switch_session });
   store.currentSessionName = 'session-a';
 
-  // 右键第二个会话（非当前会话）后进入编辑态
   await openMenu(wrapper, 1);
   await clickRename(wrapper);
   await wrapper.find('[data-test="session-rename-input"]').trigger('click');
   await new Promise((r) => setTimeout(r, 0));
 
-  // 真实行为断言：点击输入框走的是 @click.stop，没有触发 onSessionClick
   expect(switch_session).not.toHaveBeenCalled();
   expect(store.currentSessionName).toBe('session-a');
   expect(wrapper.find('[data-test="session-rename-input"]').exists()).toBe(true);
@@ -280,14 +271,12 @@ it('IME 组合态的 Enter（isComposing:true）→ 不提交、不改名、不�
   await openMenu(wrapper);
   await clickRename(wrapper);
   const input = wrapper.find('[data-test="session-rename-input"]');
-  // 组合中文字尚未上屏：v-model 里是中间态，若此刻提交会被「与原名相同」静默吞掉
   await input.setValue('候选词还没上屏');
   const ev = dispatchKey(input.element, 'Enter', { isComposing: true });
   await new Promise((r) => setTimeout(r, 0));
 
   expect(rename_session).not.toHaveBeenCalled();
   expect(store.sessionGroups[0].sessions[0].display_name).toBe('会话 A');
-  // 组合态不 preventDefault，把上屏交给输入法自己处理
   expect(ev.defaultPrevented).toBe(false);
   expect(wrapper.find('[data-test="session-rename-input"]').exists()).toBe(true);
 });

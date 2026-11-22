@@ -70,7 +70,6 @@ describe('renderMermaidBlocks', () => {
     await renderMermaidBlocks(root);
     expect(render).toHaveBeenCalledTimes(1);
 
-    // 模拟 v-html 重建：全新 DOM 节点 + 相同 key
     const root2 = document.createElement('div');
     document.body.appendChild(root2);
     const second = makeBlock('same', 'graph TD\nA-->B');
@@ -102,7 +101,6 @@ describe('renderMermaidBlocks', () => {
     root.appendChild(block);
     document.body.appendChild(root);
 
-    // 渲染进行中（编排已把状态置为 rendering）元素被 v-html 重建移除
     render.mockImplementation(async () => {
       block.remove();
       return { svg: SVG_OK };
@@ -112,7 +110,6 @@ describe('renderMermaidBlocks', () => {
     expect(block.getAttribute('data-state')).toBe('rendering');
     expect(block.querySelector('.mermaid-svg')).toBeNull();
 
-    // 重建后的新块凭缓存 key 直接命中
     const root2 = document.createElement('div');
     document.body.appendChild(root2);
     const rebuilt = makeBlock('k-race', 'graph TD\nA-->B');
@@ -159,7 +156,6 @@ describe('renderMermaidBlocks', () => {
     await renderMermaidBlocks(root);
 
     expect(render).toHaveBeenCalledTimes(2);
-    // 第二次渲染使用修复后的源码：标签整体双引号包裹
     expect(render.mock.calls[1][1]).toBe('flowchart LR\n  B --> E["说明 [DOC] 关键词"]');
     expect(block.getAttribute('data-state')).toBe('done');
     expect(block.querySelector('.mermaid-svg')).not.toBeNull();
@@ -248,8 +244,6 @@ describe('sanitizeSvg', () => {
   });
 
   it('mermaid 真实输出形态：未自闭合 <br> 不再被判空（htmlLabels 换行回归）', () => {
-    // 真实事故：源码写 <br/>，mermaid 输出序列化为未自闭合的 <br>，
-    // 旧版 XML 解析报 "Opening and ending tag mismatch" 把整张图判空
     const realShape =
       '<svg xmlns="http://www.w3.org/2000/svg" width="100">'
       + '<foreignObject><div><p>定位根因后修复<br>下一行</p></div></foreignObject>'
@@ -257,7 +251,6 @@ describe('sanitizeSvg', () => {
     const clean = sanitizeSvg(realShape);
     expect(clean).not.toBe('');
     expect(clean).toContain('foreignObject');
-    // XMLSerializer 会把未闭合 <br> 规范化为自闭合 <br />，渲染效果等价
     expect(clean).toMatch(/<br[\s/>]/i);
   });
 

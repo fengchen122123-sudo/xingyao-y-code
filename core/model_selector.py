@@ -1,23 +1,18 @@
-"""
-core/model_selector.py
-/models 指令触发的全屏 CLI 选择器。
-预置厂商、模型元数据与 GUI 共用 core.model_catalog，只需输入 API Key。
-"""
 import io
-import uuid
 import threading
 import contextlib
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, VSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import DynamicStyle
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.data_structures import Point
 
+from core.themes import build_selector_style
 from core.model_manager import (
     load_config, set_active_model, add_provider,
     add_model_to_provider, delete_model, get_active_model,
@@ -25,27 +20,7 @@ from core.model_manager import (
     set_secondary_model, get_secondary_roles, set_secondary_roles
 )
 
-STYLE = Style.from_dict({
-    "header":        "bold #00b4d8",
-    "footer":        "#445566",
-    "provider":      "bold #c9d1d9",
-    "model.active":  "bold #00ffa3",
-    "model.normal":  "#718096",
-    "model.cursor":  "bold #ffffff bg:#1a2a3a",
-    "add.cursor":    "bold #f6c90e bg:#1a2a3a",
-    "add.normal":    "#f6c90e",
-    "wiz.title":     "bold #00b4d8",
-    "wiz.hint":      "#445566",
-    "proto.cursor":  "bold #ffffff bg:#1a2a3a",
-    "proto.normal":  "#718096",
-    "proto.ok":      "bold #00ffa3",
-    "input.label":   "bold #00b4d8",
-    "input.sep":     "#1a2a3a",
-    "ok":            "bold #00ffa3",
-    "cursor-column":  "",
-    "cursor-line":    "",
-    "focused  cursor-column": "bg:#2a3a4a",
-})
+STYLE = build_selector_style()
 
 from core.model_catalog import get_preset_providers, provider_route_name, protocol_choices
 
@@ -54,17 +29,10 @@ PRESET_PROVIDERS = get_preset_providers()
 
 
 def _test_model_connection(protocol: str, model: str, base_url: str, api_key: str):
-    """使用与正式对话完全相同的协议入口验证模型连接。
-
-    多 Key（换行 / 逗号 / 分号分隔）时逐 Key 尝试，任一成功即通过；
-    全部失败抛出最后一个错误（调用方的错误格式化与展示逻辑不变）；
-    单 Key / 空 Key 行为与现状完全一致。
-    """
     from core.provider_keys import split_provider_keys
 
     keys = split_provider_keys(api_key)
     if not keys:
-        # 空串或非字符串输入：维持现状——不带 api_key 直接请求一次
         keys = [api_key]
     last_error: Exception | None = None
     for key in keys:
@@ -77,7 +45,6 @@ def _test_model_connection(protocol: str, model: str, base_url: str, api_key: st
 
 
 def _test_model_connection_once(protocol: str, model: str, base_url: str, api_key: str):
-    """单 Key 连接测试：正式对话同源协议入口（不做多 Key 遍历）。"""
     from core.llm import _request_stream
 
     kwargs = {
@@ -100,23 +67,31 @@ def _test_model_connection_once(protocol: str, model: str, base_url: str, api_ke
 
 
 def _t(style: str, text: str):
-    """快捷构造 (style, text) 元组"""
     return (style, text)
 
 
 def _format_test_error(exception, model_name):
-    """格式化连接测试错误信息"""
     msg = str(exception)
     if not msg:
         msg = repr(exception)
-    # 截断过长的错误信息
     if len(msg) > 200:
         msg = msg[:200] + "..."
     return f"连接测试失败 (模型: {model_name}): {msg}"
 
 
+def _fetched_model_entry(entry: dict) -> dict:
+    model = {
+        "name": str(entry.get("id") or ""),
+        "context_window": int(entry.get("context_window") or 128000),
+    }
+    if entry.get("supports_vision") is not None:
+        model["supports_vision"] = bool(entry["supports_vision"])
+    if entry.get("max_tokens"):
+        model["max_tokens"] = int(entry["max_tokens"])
+    return model
+
+
 def _latest_total_tokens() -> int:
-    """读取当前会话最新一轮的 token 总量（持锁，与 core.llm 的后台写线程互斥）。"""
     from core.llm import session_token_usage, token_usage_lock
     with token_usage_lock:
         return session_token_usage["latest_total"]
@@ -124,13 +99,13 @@ def _latest_total_tokens() -> int:
 
 def open_model_selector(on_model_selected=None):
     state = {
-        "mode":           "list",   # list | wizard | edit | addmodel
+        "mode":           "list",
         "cursor":         0,
         "items":          [],
         "preset_cursor":  0,
         "selected_preset": None,
         "proto_cursor":   0,
-        "add_step":       0,        # 0=select_preset_or_custom, 100=preset_key, 1=custom_name...
+        "add_step":       0,
         "add_data":       {},
         "new_provider_id": None,
         "message":        "",
@@ -139,7 +114,7 @@ def open_model_selector(on_model_selected=None):
         "edit_data":      {},
         "edit_model_id":   None,
         "edit_provider_id":None,
-        "am_step":        0,        # 为已有厂商添加模型：0=model_name 1=ctx
+        "am_step":        0,
         "am_data":        {},
         "am_provider_id":  None,
         "sec_cursor":     0,
@@ -148,6 +123,7 @@ def open_model_selector(on_model_selected=None):
         "roles_data":     {"vision": True, "compression": True, "subagent": True},
         "return_to_secondary": False,
         "secondary_candidate_id": None,
+        "pick":           None,
     }
 
     # 显式使用 multiline=False 限制单行输入框，绝不允许插入换行符造成残留与扩展
@@ -245,12 +221,12 @@ def open_model_selector(on_model_selected=None):
 
         threading.Thread(target=test_conn, daemon=True).start()
 
-    def _test_and_save_preset_provider(event, key):
-        """测试预设厂商连接并批量添加预置模型"""
+    def _save_preset_with_models(event, key, entries):
         preset = state.get("selected_preset")
-        if not preset:
+        if not preset or not entries:
             return
-        state["message"] = f"⏳ 正在验证连接预设厂商「{preset['name']}」..."
+        name = preset.get("name", "")
+        state["message"] = f"⏳ 正在验证连接预设厂商「{name}」..."
         state["testing"] = True
         event.app.invalidate()
 
@@ -269,16 +245,16 @@ def open_model_selector(on_model_selected=None):
         def test_conn():
             url = preset["base_url"]
             proto = preset["protocol"]
-            first_model = preset["models"][0]["name"]
+            first_model = entries[0]["id"]
             try:
                 _test_model_connection(proto, first_model, url, key)
 
                 pid = add_preset_provider_with_models(
-                    name=preset["name"],
+                    name=name,
                     base_url=url,
                     api_key=key,
                     protocol=proto,
-                    models=preset["models"],
+                    models=[_fetched_model_entry(entry) for entry in entries],
                     preset_id=preset["id"],
                 )
                 if state.get("return_to_secondary"):
@@ -289,12 +265,12 @@ def open_model_selector(on_model_selected=None):
                             break
 
                 def _on_success():
-                    msg = f"✔ 预设厂商「{preset['name']}」已成功验证保存（包含 {len(preset['models'])} 个模型）！"
+                    msg = f"✔ 预设厂商「{name}」已成功验证保存（包含 {len(entries)} 个模型）！"
                     if state.get("return_to_secondary"):
                         candidate = state.pop("secondary_candidate_id", None)
                         if candidate:
                             set_secondary_model(candidate)
-                            msg = f"✔ 已添加预设厂商并设为副模型：{preset['name']}"
+                            msg = f"✔ 已添加预设厂商并设为副模型：{name}"
                         state["return_to_secondary"] = False
                     state["message"] = msg
                     state["mode"] = "list"
@@ -318,7 +294,6 @@ def open_model_selector(on_model_selected=None):
                 _ui(_finish_testing)
 
         threading.Thread(target=test_conn, daemon=True).start()
-
     def _test_and_save_model(event, ctx, supports_vision):
         state["message"] = "⏳ 正在验证连接模型..."
         state["testing"] = True
@@ -367,7 +342,6 @@ def open_model_selector(on_model_selected=None):
                 def _on_success():
                     state["message"] = "✔ 模型连接测试成功，已保存！"
                     state["add_step"] = 6
-                    # new_provider_id 在 UI 线程写入，供后续"继续添加模型"复用
                     state["new_provider_id"] = pid
                     main_win.vertical_scroll = 0
                     layout.focus(main_win)
@@ -450,6 +424,135 @@ def open_model_selector(on_model_selected=None):
 
         threading.Thread(target=test_conn, daemon=True).start()
 
+    def _start_pick(event, purpose, base_url, api_key, protocol, title):
+        from core.model_discovery import fetch_model_list
+
+        state["pick"] = {
+            "purpose": purpose,
+            "title": title,
+            "status": "loading",
+            "msg": "",
+            "models": [],
+            "cursor": 0,
+            "checked": set(),
+            "multi": purpose == "preset",
+            "allow_manual": purpose != "preset",
+            "base_url": base_url,
+            "api_key": api_key,
+            "protocol": protocol,
+        }
+        state["testing"] = True
+        state["message"] = ""
+        input_buf.set_document(Document(""))
+        main_win.vertical_scroll = 0
+        layout.focus(main_win)
+        event.app.invalidate()
+
+        def _ui(callback):
+            # 与其它后台线程一致：loop 已关闭时直接丢弃回投，避免污染终端堆栈
+            loop = getattr(event.app, "loop", None)
+            if loop is None or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                pass
+
+        def worker():
+            result = fetch_model_list(base_url, api_key)
+
+            def _apply():
+                pick = state.get("pick")
+                state["testing"] = False
+                if not pick:
+                    event.app.invalidate()
+                    return
+                if result.get("ok"):
+                    models = result.get("models") or []
+                    pick["models"] = models
+                    pick["cursor"] = 0
+                    pick["checked"] = set()
+                    pick["status"] = "ok" if models else "empty"
+                    pick["msg"] = "" if models else "该厂商未返回任何模型，可手动输入模型名称"
+                else:
+                    pick["status"] = "error"
+                    pick["msg"] = str(result.get("msg") or "拉取失败")
+                main_win.vertical_scroll = 0
+                event.app.invalidate()
+
+            _ui(_apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pick_entries() -> list:
+        pick = state.get("pick") or {}
+        return pick.get("models") or []
+
+    def _pick_rows() -> int:
+        pick = state.get("pick") or {}
+        rows = len(_pick_entries())
+        return rows + (1 if pick.get("allow_manual") else 0)
+
+    def _pick_ctx_label(entry: dict) -> str:
+        ctx = int(entry.get("context_window") or 0)
+        if ctx >= 1000:
+            return f"{ctx // 1000}k"
+        return str(ctx) if ctx else "-"
+
+    def render_picker():
+        """拉取可用模型列表的展示层：加载中 / 失败可重试 / 列表可选。"""
+        pick = state.get("pick") or {}
+        out = []
+        title = str(pick.get("title") or "拉取可用模型")
+        out += [_t("class:header", f"  {title}\n")]
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        out += [_t("class:wiz.hint", f"  端点: {pick.get('base_url', '')}\n")]
+
+        status = pick.get("status")
+        if status == "loading":
+            out += [_t("class:wiz.title", "  ⏳ 正在拉取该厂商的可用模型列表...\n")]
+        elif status in ("error", "empty"):
+            out += [_t("class:wiz.title", f"  ❌ {pick.get('msg', '')}\n")]
+            if pick.get("purpose") == "preset":
+                out += [_t(
+                    "class:wiz.hint",
+                    "  按 r 重新拉取；Esc 回上一步改 Key，再按 Esc 可回厂商选择，"
+                    "改走「自定义手动添加厂商」手动录入模型名\n",
+                )]
+            else:
+                out += [_t("class:wiz.hint", "  按 r 重新拉取，Esc 返回手动输入模型名称\n")]
+        else:
+            models = _pick_entries()
+            out += [_t("class:wiz.hint", f"  共 {len(models)} 个可用模型\n")]
+            if pick.get("multi"):
+                out += [_t("class:footer", "  ↑↓ 移动  空格 勾选/取消  Enter 保存所选模型  Esc 返回\n")]
+                out += [_t("class:wiz.title", f"  已勾选 {len(pick.get('checked') or ())} 个（未勾选时 Enter 采用光标所在模型）\n")]
+            else:
+                out += [_t("class:footer", "  ↑↓ 移动  Enter 选用该模型  Esc 返回\n")]
+            for index, entry in enumerate(models):
+                vision = " 👁" if entry.get("supports_vision") else ""
+                if pick.get("multi"):
+                    mark = "☑" if entry["id"] in (pick.get("checked") or ()) else "☐"
+                    label = f"{mark} {entry['id']}  [{_pick_ctx_label(entry)}]{vision}"
+                else:
+                    label = f"{entry['id']}  [{_pick_ctx_label(entry)}]{vision}"
+                if index == pick.get("cursor"):
+                    out += [_t("class:model.cursor", f"  ▶ {label}\n")]
+                else:
+                    out += [_t("class:model.normal", f"    {label}\n")]
+            if pick.get("allow_manual"):
+                manual_label = "✎ 手动输入模型名称"
+                if pick.get("cursor") == len(models):
+                    out += [_t("class:add.cursor", f"  ▶ {manual_label}\n")]
+                else:
+                    out += [_t("class:add.normal", f"    {manual_label}\n")]
+
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        if state["message"]:
+            style = "class:ok" if not state["message"].startswith("❌") else "class:empty"
+            out += [_t(style, f"  {state['message']}\n")]
+        return out
+
     def _skip_providers(direction=1):
         n = len(state["items"])
         for _ in range(n):
@@ -459,8 +562,8 @@ def open_model_selector(on_model_selected=None):
 
     def render_list():
         out = []
-        out += [_t("class:header", "  星瑶Code 模型管理器\n")]
-        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        out += [_t("class:header", "  ✦ 星瑶Code 模型管理器\n")]
+        out += [_t("class:footer", "  " + "─" * 56 + "\n")]
 
         cfg = load_config()
         secondary_id = cfg.get("secondary_model_id")
@@ -614,10 +717,8 @@ def open_model_selector(on_model_selected=None):
             preset = state.get("selected_preset") or {}
             out += [_t("class:wiz.title", f"  快捷配置预设厂商 — 「{preset.get('name', '')}」\n")]
             out += [_t("class:wiz.hint",  f"  Base URL:  {preset.get('base_url', '')}\n")]
-            out += [_t("class:wiz.hint",  f"  API 协议:  {preset.get('protocol', '')}\n")]
-            models_str = ", ".join(m["name"] for m in preset.get("models", []))
-            out += [_t("class:wiz.hint",  f"  预置模型:  {models_str}\n\n")]
-            out += [_t("class:wiz.title",  "  ▶ 请在下方输入该厂商的 API Key 并按 Enter 验证保存：\n")]
+            out += [_t("class:wiz.hint",  f"  API 协议:  {preset.get('protocol', '')}\n\n")]
+            out += [_t("class:wiz.hint",  "  输入 Key 后会拉取该厂商的可用模型，勾选后再验证保存\n")]
 
             out += [_t("class:footer", "  " + "─" * 44 + "\n")]
             if state["message"]:
@@ -630,7 +731,7 @@ def open_model_selector(on_model_selected=None):
             1: ("步骤 1/6  厂商名称",     "输入厂商名称，如 DeepSeek："),
             2: ("步骤 2/6  API Base URL", "输入 Base URL，如 https://api.deepseek.com/v1："),
             3: ("步骤 3/6  API Key",       "输入 API Key："),
-            4: ("步骤 5a  模型名称",        "输入模型名称，如 deepseek-v4-flash："),
+            4: ("步骤 5a  模型名称",        "输入模型名称，或直接按 Enter 拉取可用模型列表："),
             5: ("步骤 5b  最大上下文",      "输入上下文 Token 数，如 128000："),
         }
 
@@ -701,7 +802,7 @@ def open_model_selector(on_model_selected=None):
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
 
         steps_map = {
-            0: ("步骤 1/3  模型名称",   "输入模型名称，如 deepseek-v4-flash："),
+            0: ("步骤 1/3  模型名称",   "输入模型名称，或直接按 Enter 拉取可用模型列表："),
             1: ("步骤 2/3  最大上下文", "输入上下文 Token 数，如 128000："),
             2: ("步骤 3/3  图片/视频输入", "该模型是否支持图片/视频输入？"),
         }
@@ -812,6 +913,8 @@ def open_model_selector(on_model_selected=None):
         return out
 
     def get_main_content():
+        if state.get("pick"):
+            return render_picker()
         if state["mode"] == "list":
             return render_list()
         elif state["mode"] == "edit":
@@ -829,16 +932,17 @@ def open_model_selector(on_model_selected=None):
         # 否则模型数量超过一屏时无法向下翻页，底部"设置副模型"等选项被裁掉。
         # 各 render 函数开头均有固定头部行，items 从偏移行后开始，每项占 1 行。
         mode = state["mode"]
+        if state.get("pick"):
+            pick = state["pick"]
+            if pick.get("status") == "ok":
+                return Point(x=0, y=5 + int(pick.get("cursor") or 0))
+            return Point(x=0, y=0)
         if mode == "list":
-            # render_list：标题 + 分隔线 + 副模型行 = 3 行头部
             return Point(x=0, y=3 + state["cursor"])
         if mode == "secondary":
-            # render_secondary_selector：标题 + 分隔线 + 当前用途 = 3 行头部
             return Point(x=0, y=3 + state["sec_cursor"])
         if mode == "wizard" and state["add_step"] == 0:
-            # render_wizard step0：标题 + 分隔线 + 步骤标题 + 提示 = 4 行头部
             return Point(x=0, y=4 + state["preset_cursor"])
-        # 其他模式（向导输入步 / 编辑 / 副模型用途）内容较短，光标置于顶部
         return Point(x=0, y=0)
 
     main_ctrl = FormattedTextControl(get_main_content, focusable=True, get_cursor_position=get_cursor_position)
@@ -846,6 +950,8 @@ def open_model_selector(on_model_selected=None):
 
     @Condition
     def need_input():
+        if state.get("pick"):
+            return False
         if state["mode"] == "addmodel":
             return state["am_step"] != 2
         if state["mode"] == "edit":
@@ -859,7 +965,7 @@ def open_model_selector(on_model_selected=None):
     def get_input_header():
         if state["mode"] == "addmodel":
             hints = {
-                0: "输入模型名称，按 Enter 确认",
+                0: "输入模型名称，或直接按 Enter 拉取可用模型列表",
                 1: "输入 Token 数量，按 Enter 确认",
                 2: "↑↓ 选择是否支持图片/视频输入，按 Enter 确认",
             }
@@ -889,14 +995,14 @@ def open_model_selector(on_model_selected=None):
             preset = state.get("selected_preset") or {}
             return [
                 ("class:footer", "  " + "─" * 44 + "\n"),
-                ("class:wiz.title", f"  ▶ 输入「{preset.get('name', '')}」的 API Key，按 Enter 确认\n"),
+                ("class:wiz.title", f"  ▶ 输入「{preset.get('name', '')}」的 API Key，按 Enter 拉取可用模型\n"),
             ]
 
         hints = {
             1: "输入厂商名称，按 Enter 确认",
             2: "输入 Base URL，按 Enter 确认",
             3: "输入 API Key，按 Enter 确认",
-            4: "输入模型名称，按 Enter 确认",
+            4: "输入模型名称，或直接按 Enter 拉取可用模型列表",
             5: "输入 Token 数量，按 Enter 确认",
             5.5: "↑↓ 选择是否支持图片/视频输入，按 Enter 确认",
         }
@@ -939,7 +1045,6 @@ def open_model_selector(on_model_selected=None):
     @kb.add("up", filter=Condition(lambda: state["mode"] == "list"))
     def _up(event):
         if state["cursor"] == 0:
-            # 已在列表顶部，不允许向上绕行到底部
             return
         state["cursor"] = max(0, state["cursor"] - 1)
         _skip_providers(-1)
@@ -1019,7 +1124,6 @@ def open_model_selector(on_model_selected=None):
 
     @kb.add("d", filter=Condition(lambda: state["mode"] == "list"))
     def _delete(event):
-        # 两步确认：删除模型是破坏性操作，与会话/MCP 选择器保持一致的确认习惯
         if not state["items"]:
             return
         item = state["items"][min(state["cursor"], len(state["items"]) - 1)]
@@ -1067,8 +1171,6 @@ def open_model_selector(on_model_selected=None):
     @kb.add("c-c")
     def _quit(event):
         if state.get("testing"):
-            # 连接测试进行中不允许退出：后台线程还会回投 UI 更新，
-            # 此时关闭 loop 会让测试线程崩溃
             state["message"] = "⏳ 正在测试连接，请稍候再退出..."
             return
         event.app.exit()
@@ -1095,13 +1197,11 @@ def open_model_selector(on_model_selected=None):
 
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "wizard"))
     def _w_enter(event):
-        if state.get("testing"):
+        if state.get("testing") or state.get("pick"):
             return
             
         state["message"] = ""
         step = state["add_step"]
-        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
-        # 混入配置后请求会直接 400，且肉眼极难排查
         text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
@@ -1121,8 +1221,14 @@ def open_model_selector(on_model_selected=None):
         elif step == 100:
             if not text:
                 return
-            input_buf.set_document(Document(""))
-            _test_and_save_preset_provider(event, text)
+            preset = state.get("selected_preset") or {}
+            state["add_data"]["api_key"] = text
+            _start_pick(
+                event, "preset",
+                str(preset.get("base_url") or ""), text,
+                str(preset.get("protocol") or "openai"),
+                f"拉取「{preset.get('name', '')}」可用模型",
+            )
 
         elif step == 1:
             if not text:
@@ -1153,6 +1259,14 @@ def open_model_selector(on_model_selected=None):
 
         elif step == 4:
             if not text:
+                proto = PROTOCOLS[state["add_data"].get("proto_idx", 0)][0]
+                _start_pick(
+                    event, "add",
+                    str(state["add_data"].get("base_url") or ""),
+                    str(state["add_data"].get("api_key") or ""),
+                    proto,
+                    f"拉取「{state['add_data'].get('name', '')}」可用模型",
+                )
                 return
             state["add_data"]["model_name"] = text
             input_buf.set_document(Document(""))
@@ -1200,7 +1314,7 @@ def open_model_selector(on_model_selected=None):
 
     @kb.add("escape", filter=Condition(lambda: state["mode"] == "wizard"))
     def _w_esc(event):
-        if state.get("testing"):
+        if state.get("testing") or state.get("pick"):
             return
 
         if state.pop("return_to_secondary", None):
@@ -1254,7 +1368,6 @@ def open_model_selector(on_model_selected=None):
             input_buf.set_document(Document(str(state["add_data"].get("context_window", 128000))))
             layout.focus(input_buf)
         elif step == 6:
-            # "继续添加/完成保存"步骤按 Esc：直接完成保存，返回列表
             state["items"] = build_items()
             state["mode"] = "list"
             state["message"] = "✔ 厂商已保存！"
@@ -1264,17 +1377,29 @@ def open_model_selector(on_model_selected=None):
 
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "addmodel"))
     def _am_enter(event):
-        if state.get("testing"):
+        if state.get("testing") or state.get("pick"):
             return
 
         state["message"] = ""
         step = state["am_step"]
-        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
-        # 混入配置后请求会直接 400，且肉眼极难排查
         text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
             if not text:
+                provider = None
+                for candidate in load_config().get("providers", []):
+                    if candidate["id"] == state["am_provider_id"]:
+                        provider = candidate
+                        break
+                if not provider:
+                    return
+                _start_pick(
+                    event, "addmodel",
+                    str(provider.get("base_url") or ""),
+                    str(provider.get("api_key") or ""),
+                    str(provider.get("protocol") or "openai"),
+                    f"拉取「{provider.get('name', '')}」可用模型",
+                )
                 return
             state["am_data"]["model_name"] = text
             input_buf.set_document(Document(""))
@@ -1312,7 +1437,7 @@ def open_model_selector(on_model_selected=None):
 
     @kb.add("escape", filter=Condition(lambda: state["mode"] == "addmodel"))
     def _am_esc(event):
-        if state.get("testing"):
+        if state.get("testing") or state.get("pick"):
             return
 
         state["message"] = ""
@@ -1350,8 +1475,6 @@ def open_model_selector(on_model_selected=None):
             
         state["message"] = ""
         step = state["edit_step"]
-        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
-        # 混入配置后请求会直接 400，且肉眼极难排查
         text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
@@ -1505,10 +1628,154 @@ def open_model_selector(on_model_selected=None):
     def _roles_esc(event):
         _open_secondary_selector(event)
 
+    def _pick_retry(event):
+        pick = state.get("pick") or {}
+        if state.get("testing"):
+            return
+        _start_pick(
+            event,
+            str(pick.get("purpose") or "add"),
+            str(pick.get("base_url") or ""),
+            str(pick.get("api_key") or ""),
+            str(pick.get("protocol") or "openai"),
+            str(pick.get("title") or "拉取可用模型"),
+        )
+
+    def _pick_commit(event):
+        pick = state.get("pick") or {}
+        models = _pick_entries()
+        purpose = str(pick.get("purpose") or "add")
+        cursor = int(pick.get("cursor") or 0)
+
+        if purpose == "preset":
+            checked = pick.get("checked") or set()
+            chosen = [entry for entry in models if entry["id"] in checked]
+            if not chosen and cursor < len(models):
+                chosen = [models[cursor]]
+            if not chosen:
+                state["message"] = "❌ 请先用空格勾选至少一个模型"
+                event.app.invalidate()
+                return
+            api_key = str(pick.get("api_key") or "")
+            state["pick"] = None
+            state["message"] = ""
+            _save_preset_with_models(event, api_key, chosen)
+            return
+
+        if cursor >= len(models):
+            state["pick"] = None
+            state["message"] = ""
+            if purpose == "add":
+                state["add_step"] = 4
+                input_buf.set_document(Document(state["add_data"].get("model_name", "")))
+            else:
+                state["am_step"] = 0
+                input_buf.set_document(Document(state["am_data"].get("model_name", "")))
+            main_win.vertical_scroll = 0
+            layout.focus(input_buf)
+            event.app.invalidate()
+            return
+
+        entry = models[cursor]
+        ctx = int(entry.get("context_window") or 128000)
+        vision = bool(entry.get("supports_vision"))
+        state["pick"] = None
+        state["proto_cursor"] = 1 if vision else 0
+        target = state["add_data"] if purpose == "add" else state["am_data"]
+        target.update({
+            "model_name": entry["id"],
+            "context_window": ctx,
+            "supports_vision": vision,
+        })
+        if purpose == "add":
+            state["add_step"] = 5.5
+            state["message"] = (
+                f"✔ 已选用 {entry['id']}（上下文 {ctx}）；Enter 确认多模态开关，"
+                "Esc 可回退修改上下文"
+            )
+        else:
+            state["am_step"] = 2
+            state["message"] = f"✔ 已选用 {entry['id']}（上下文 {ctx}）；Enter 确认多模态开关"
+        input_buf.set_document(Document(""))
+        main_win.vertical_scroll = 0
+        layout.focus(main_win)
+        event.app.invalidate()
+
+    @kb.add("up", filter=Condition(lambda: bool(state.get("pick"))))
+    def _pick_up(event):
+        pick = state.get("pick") or {}
+        if state.get("testing") or pick.get("status") != "ok":
+            return
+        pick["cursor"] = max(0, int(pick.get("cursor") or 0) - 1)
+
+    @kb.add("down", filter=Condition(lambda: bool(state.get("pick"))))
+    def _pick_down(event):
+        pick = state.get("pick") or {}
+        if state.get("testing") or pick.get("status") != "ok":
+            return
+        last = max(0, _pick_rows() - 1)
+        pick["cursor"] = min(last, int(pick.get("cursor") or 0) + 1)
+
+    @kb.add(
+        "space",
+        filter=Condition(
+            lambda: bool((state.get("pick") or {}).get("multi"))
+            and (state.get("pick") or {}).get("status") == "ok"
+        ),
+    )
+    def _pick_toggle(event):
+        pick = state.get("pick") or {}
+        if state.get("testing"):
+            return
+        models = _pick_entries()
+        cursor = int(pick.get("cursor") or 0)
+        if cursor >= len(models):
+            return
+        model_id = models[cursor]["id"]
+        checked = pick.setdefault("checked", set())
+        if model_id in checked:
+            checked.discard(model_id)
+        else:
+            checked.add(model_id)
+
+    @kb.add("enter", filter=Condition(lambda: bool(state.get("pick"))))
+    def _pick_enter(event):
+        pick = state.get("pick") or {}
+        if state.get("testing") or pick.get("status") == "loading":
+            return
+        if pick.get("status") != "ok":
+            _pick_retry(event)
+            return
+        _pick_commit(event)
+
+    @kb.add("r", filter=Condition(lambda: bool(state.get("pick"))))
+    def _pick_retry_key(event):
+        _pick_retry(event)
+
+    @kb.add("escape", filter=Condition(lambda: bool(state.get("pick"))))
+    def _pick_esc(event):
+        if state.get("testing"):
+            return
+        pick = state.pop("pick", None) or {}
+        purpose = str(pick.get("purpose") or "add")
+        state["message"] = ""
+        if purpose == "preset":
+            state["add_step"] = 100
+            input_buf.set_document(Document(state["add_data"].get("api_key", "")))
+        elif purpose == "add":
+            state["add_step"] = 4
+            input_buf.set_document(Document(state["add_data"].get("model_name", "")))
+        else:
+            state["am_step"] = 0
+            input_buf.set_document(Document(state["am_data"].get("model_name", "")))
+        main_win.vertical_scroll = 0
+        layout.focus(input_buf)
+        event.app.invalidate()
+
     app = Application(
         layout=layout,
         key_bindings=kb,
-        style=STYLE,
+        style=DynamicStyle(build_selector_style),
         full_screen=True,
         mouse_support=False,
     )

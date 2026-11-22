@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""Word .docx → Markdown 提取器（零外部依赖）。
-
-格式归一化层的确定性组件：把 docx 的标题层级 / 粗体 / 列表 / 图片
-转成本 skill 排版流程认识的 Markdown。
-
-用法：
-    extract_docx.py 文章.docx [-o 输出.md]
-    # 内嵌图片解包到 输出.md 同目录的 images/ 下，md 里用相对路径引用
-
-退出码：0 成功；1 失败（文件不存在 / 不是合法 docx）。
-提取不了的复杂结构（表格、文本框）会以「[表格：…]」占位并在 stderr 提示。
-"""
 
 import argparse
 import os
@@ -73,7 +61,7 @@ def para_text(p):
             text = f"<u>{text}</u>"
         out.append(text)
     s = "".join(out)
-    return re.sub(r"\*\*\*\*", "", s)  # 相邻粗体 run 合并的空标记
+    return re.sub(r"\*\*\*\*", "", s)
 
 
 def extract(docx_path, out_md):
@@ -94,7 +82,6 @@ def extract(docx_path, out_md):
     for el in body:
         tag = el.tag
         if tag == f"{W}tbl":
-            # 表格 → Markdown 表格，保住行列结构（合并单元格按普通格处理）
             rows = []
             for tr in el.findall(f"{W}tr"):
                 cells = ["".join(t.text or "" for t in tc.iter(f"{W}t"))
@@ -107,12 +94,11 @@ def extract(docx_path, out_md):
                 lines.append("|" + "---|" * ncols)
                 lines.extend(rows[1:])
                 lines.append("")
-                skipped += 1  # 计数改为"转换的表格数"
+                skipped += 1
             continue
         if tag != f"{W}p":
             continue
         p = el
-        # 图片
         for blip in p.iter(f"{A}blip"):
             rid = blip.get(f"{R}embed")
             src = media_of.get(rid)
@@ -132,11 +118,10 @@ def extract(docx_path, out_md):
         style_el = ppr.find(f"{W}pStyle") if ppr is not None else None
         sid = style_el.get(f"{W}val") if style_el is not None else ""
         lvl = heading_of.get(sid)
-        # 列表识别：直接编号(numPr) 或 列表类段落样式（List Bullet/Number/Paragraph/中文"列表"）
         is_list = (ppr is not None and ppr.find(f"{W}numPr") is not None) \
             or bool(re.search(r"list|列表", sid or "", re.I))
         if lvl:
-            text_clean = re.sub(r"^\*\*(.*)\*\*$", r"\1", text)  # 标题不需要再加粗
+            text_clean = re.sub(r"^\*\*(.*)\*\*$", r"\1", text)
             lines.append("#" * min(lvl + 0, 6) + " " + text_clean)
         elif is_list:
             lines.append("- " + text)

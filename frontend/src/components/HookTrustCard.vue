@@ -1,6 +1,4 @@
 <template>
-  <!-- C11：项目级 Hook 信任卡片（对话流内联，跟随 PermCard 之后；
-       Hook 命令在信任前不执行，需用户明确确认） -->
   <div v-if="store.pendingProjectHooks.length" class="hook-card" data-test="hook-trust-card">
     <div class="hc-head">
       <span class="hc-ico"><AppIcon name="zap" :size="16" /></span>
@@ -45,7 +43,6 @@ import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 const store = useAppStore();
 
-// 来源取第一条待信任 Hook 的配置文件路径（同一项目来源一致）
 const sourcePath = computed(() => store.pendingProjectHooks[0]?.source_path || '');
 // 提交中禁用双按钮：避免连点重复触发批量信任动作
 const busy = ref(false);

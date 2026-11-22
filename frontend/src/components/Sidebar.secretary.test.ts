@@ -5,19 +5,14 @@ import { nextTick } from 'vue';
 import Sidebar from './Sidebar.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 挂载到 document.body：起名弹窗的自动聚焦 / 全选需要真实文档焦点环境，
-// jsdom 下 detached 节点拿不到 activeElement。
 const wrappers: VueWrapper[] = [];
 afterEach(() => {
   wrappers.splice(0).forEach((w) => w.unmount());
   delete (window as any).pywebview;
 });
 
-// 内置推荐名字池（与 Sidebar.vue 的 SECRETARY_NAME_POOL 同源，仅供断言取用）
 const NAME_POOL = ['星河', '小满', '望舒', '清和', '云疏', '拾光'];
 
-// 每个用例自建分组数据（不 mock store，测真实行为）。秘书分组是虚拟分组
-// （folder_path='SECRETARY'、is_secretary=true）；组内会话带后端下发的秘书名。
 function secretaryGroups(secretaryName = '星河') {
   return [
     {
@@ -66,7 +61,6 @@ async function openNameModal(wrapper: VueWrapper) {
   await nextTick();
 }
 
-/** 等一轮微任务 + 宏任务：桥调用与随后的 store 收尾（可能多级 await）都落地 */
 async function flush() {
   await new Promise((r) => setTimeout(r, 0));
 }
@@ -107,7 +101,6 @@ it('名字为空或只有空白时创建按钮 disabled，点它也不发请求'
   await flush();
 
   expect(create_secretary_session).not.toHaveBeenCalled();
-  // 弹窗保持打开，用户能就地改完再提交
   expect(wrapper.find('[data-test="secretary-name-modal"]').exists()).toBe(true);
 });
 
@@ -121,7 +114,6 @@ it('超过 20 字符时按钮 disabled 且不静默截断，回到 20 字即可�
 
   await input.setValue('星'.repeat(21));
   expect((btn.element as HTMLButtonElement).disabled).toBe(true);
-  // 输入内容保持原样：截断会让显示名与用户输入不符，校验交给按钮禁用与提示
   expect((input.element as HTMLInputElement).value).toBe('星'.repeat(21));
   await btn.trigger('click');
   await flush();
@@ -156,10 +148,8 @@ it('填名按 Enter → 以该名字调用 create_secretary_session 并关闭弹
   await flush();
 
   expect(create_secretary_session).toHaveBeenCalledTimes(1);
-  // 第三参数是专属人设：没填就传空串（= 使用内置默认秘书人设）
   expect(create_secretary_session).toHaveBeenCalledWith('新会话', '清和', '');
   expect(wrapper.find('[data-test="secretary-name-modal"]').exists()).toBe(false);
-  // 会话以该名字落库并切为当前会话：侧栏条目、欢迎页、头部读的都是它
   expect(store.currentSessionName).toBe('session-sec2');
   expect(store.currentSessionDisplayName).toBe('清和');
   expect(store.agentName).toBe('清和');
@@ -240,10 +230,6 @@ it('桥取不到生效名时回落设置页名字，不打断切换流程', asyn
   expect(store.currentSessionName).toBe('session-a');
 });
 
-// ---------------------------------------------------------------------------
-// 秘书专属人设（每个秘书是一个独立 agent，人设只属于它自己的会话）
-// ---------------------------------------------------------------------------
-
 it('新建秘书可填专属人设：与名字一起提交给桥，并去掉首尾空白', async () => {
   const create_secretary_session = vi.fn(async () => ({
     ok: true,
@@ -284,7 +270,6 @@ it('秘书会话右键「编辑人设」：回填已有人设，保存走 set_se
     sessions: secretaryGroups(),
   }));
   const { wrapper, store } = setup({ set_secretary_persona });
-  // 条目带上后端下发的 secretary_persona，弹窗应原样回填（不再打一次后端）
   store.sessionGroups = [
     {
       ...secretaryGroups()[0],

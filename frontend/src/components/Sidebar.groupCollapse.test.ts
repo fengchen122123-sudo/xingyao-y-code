@@ -29,7 +29,6 @@ function mountSidebar(groups: any[]) {
   return mount(Sidebar, { global: { plugins: [pinia] } });
 }
 
-/** 分组会话区是否被 v-show 隐藏（jsdom 无布局引擎，直接断言 inline display 更可靠） */
 function groupHidden(wrapper: any) {
   return (wrapper.get('.group-sessions').attributes('style') || '').includes('display: none');
 }
@@ -48,10 +47,9 @@ it('折叠分组后写入 localStorage，重新挂载仍保持折叠', async () 
   expect(localStorage.getItem(COLLAPSED_KEY)).toContain('D:/proj/a');
   w1.unmount();
 
-  // 重新挂载（等价于切换页面/重启前端）后应恢复折叠态
   const w2 = mountSidebar([group]);
   expect(groupHidden(w2)).toBe(true);
-  expect(w2.get('.g-arrow').text()).toBe('▸');
+  expect(w2.get('.g-arrow').classes()).toContain('collapsed');
   w2.unmount();
 });
 

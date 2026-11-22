@@ -6,7 +6,6 @@
       <button class="ap-btn primary ap-new" data-test="automation-new-btn" @click="openCreate">＋ 新建任务</button>
     </div>
 
-    <!-- 任务列表 -->
     <div v-if="store.automationTasks.length === 0 && !form.show" class="ap-empty">
       还没有星轨自动化任务。点击「新建任务」，把一段提示词绑定到定时器上，
       星瑶会到点自动向指定会话发起一次完整回合。
@@ -16,7 +15,6 @@
         <div class="ap-card-top">
           <span class="ap-name">{{ t.name }}</span>
           <span class="ap-chip">{{ t.trigger_summary || t.trigger_type }}</span>
-          <!-- 任务生命周期状态（active/completed）：与运行历史的 statusLabel 不是同一套状态 -->
           <span
             v-if="t.status === 'completed'"
             class="ap-chip ok"
@@ -35,7 +33,18 @@
           </label>
         </div>
         <div class="ap-meta">
-          <span class="ap-meta-item" :title="`目标会话：${t.target_session}`">💬 {{ t.target_session }}</span>
+          <span
+            v-if="t.session_mode === 'per_run'"
+            class="ap-meta-item"
+            data-test="automation-task-session"
+            title="每次运行按「{日期} {任务名}」新建会话"
+          >💬 每次运行新建会话</span>
+          <span
+            v-else
+            class="ap-meta-item"
+            data-test="automation-task-session"
+            :title="`目标会话：${t.target_session}`"
+          >💬 {{ t.target_session }}</span>
           <span
             v-if="t.workdir === 'GLOBAL'"
             class="ap-meta-item"
@@ -64,7 +73,6 @@
           <button class="ap-btn danger" @click="onDelete(t)">删除</button>
         </div>
 
-        <!-- 运行历史 -->
         <div v-if="expanded[t.id]" class="ap-history">
           <div class="ap-history-head">
             <span>最近运行（{{ (store.automationRuns[t.id] || []).length }} 条）</span>
@@ -82,7 +90,6 @@
       </div>
     </div>
 
-    <!-- 新建 / 编辑表单 -->
     <div v-if="form.show" class="ap-form" data-test="automation-form">
       <div class="ap-form-title">{{ form.id ? '编辑任务' : '新建任务' }}</div>
 
@@ -92,13 +99,13 @@
 
       <div class="ap-row">
         <input v-model="form.name" data-test="automation-name" placeholder="任务名称（如：每日站会摘要）" maxlength="50" />
-        <select v-model="form.sessionMode" title="目标会话">
+        <select v-if="form.runSessionMode === 'fixed'" v-model="form.sessionMode" title="目标会话">
           <option value="" disabled>选择目标会话</option>
           <option v-for="s in sessionOptions" :key="s" :value="s">{{ s }}</option>
           <option value="__new__">新建会话…</option>
         </select>
         <input
-          v-if="form.sessionMode === '__new__'"
+          v-if="form.runSessionMode === 'fixed' && form.sessionMode === '__new__'"
           v-model="form.newSession"
           data-test="automation-new-session"
           placeholder="新会话名称"
@@ -106,8 +113,17 @@
         />
       </div>
 
+      <div class="ap-row">
+        <span class="ap-unit">运行会话</span>
+        <select v-model="form.runSessionMode" data-test="automation-run-session-mode" title="每次运行的会话落点">
+          <option value="per_run">每次运行新建会话</option>
+          <option value="fixed">固定使用指定会话</option>
+        </select>
+        <span v-if="form.runSessionMode === 'per_run'" class="ap-unit ap-workdir-hint" data-test="automation-run-session-preview">{{ runSessionPreview }}</span>
+      </div>
+
       <!-- 新会话工作目录：目标会话不存在时由任务代为创建，归属目录必须在这里指定 -->
-      <div v-if="form.sessionMode === '__new__'" class="ap-row" data-test="automation-workdir-row">
+      <div v-if="form.sessionMode === '__new__' || form.runSessionMode === 'per_run'" class="ap-row" data-test="automation-workdir-row">
         <span class="ap-unit">工作目录</span>
         <select v-model="form.workdirMode" data-test="automation-workdir-mode" title="新会话归属">
           <option value="global">自由对话（不绑定项目）</option>
@@ -149,7 +165,6 @@
           </label>
           <input v-model="form.time" type="time" data-test="automation-time" />
         </template>
-        <!-- 一次性触发：「N 分钟后」与绝对时刻二选一，保存时只传其中一个键 -->
         <template v-else-if="form.triggerType === 'once'">
           <select v-model="form.onceMode" data-test="automation-once-mode" title="一次性触发的表达方式">
             <option value="delay">N 分钟后</option>
@@ -181,7 +196,6 @@
       ></textarea>
       <div class="ap-char-count">{{ form.prompt.length }} / 6000</div>
 
-      <!-- 最多执行次数：留空 = 不限次；手动「立即执行」不计入该次数 -->
       <div class="ap-row">
         <span class="ap-unit">最多执行次数</span>
         <input
@@ -195,7 +209,6 @@
         <span class="ap-unit">留空 = 不限次；手动「立即执行」不计入次数</span>
       </div>
 
-      <!-- 执行模型：与对话页模型同源，留空跟随会话绑定/全局默认 -->
       <div class="ap-row">
         <span class="ap-unit">执行模型</span>
         <select v-model="form.modelId" data-test="automation-model" title="星轨自动化回合使用的模型">
@@ -209,7 +222,7 @@
 
       <div class="ap-row">
         <select v-model="form.permissionMode" data-test="automation-permission" title="无人值守权限档位（与对话页权限档位同源）">
-          <option v-for="m in permissionModes" :key="m.v" :value="m.v" :title="m.desc">{{ formatPermMode(m.v) }}</option>
+          <option v-for="m in visiblePermissionModes" :key="m.v" :value="m.v" :title="m.desc">{{ formatPermMode(m.v) }}</option>
         </select>
         <select v-model="form.missedPolicy" title="应用未运行错过触发时">
           <option value="skip">错过则跳过</option>
@@ -217,8 +230,14 @@
         </select>
         <label class="ap-weekday"><input type="checkbox" v-model="form.notifyOnSuccess" /> 成功也通知</label>
       </div>
-      <div v-if="form.permissionMode === 'accept_edits' || form.permissionMode === 'full'" class="ap-risk" data-test="automation-risk-note">
-        ⚠ 无人值守档位：该任务的星轨自动化回合可以不经确认{{ form.permissionMode === 'full' ? '修改文件并执行命令' : '修改文件' }}，
+      <div v-if="form.permissionMode === 'accept_edits' || form.permissionMode === 'auto_decision' || form.permissionMode === 'full'" class="ap-risk" data-test="automation-risk-note">
+        ⚠ 无人值守档位：该任务的星轨自动化回合{{
+          form.permissionMode === 'full'
+            ? '可以不经确认修改文件并执行命令'
+            : form.permissionMode === 'auto_decision'
+              ? '将权限与提问交由 JEV 决策（未就绪或转人工时自动拒绝）'
+              : '可以不经确认修改文件'
+        }}，
         每次触发都会在目标会话留下完整过程，可按回合撤销。
       </div>
 
@@ -241,15 +260,19 @@ import type { AutomationTaskInfo } from '../types/pywebview';
 
 const store = useAppStore();
 
-// 无人值守权限档位：文案复用对话页 formatPermMode（变更前确认/自动编辑/
-// 计划模式/完全访问），说明按无人值守语义改写——升级到确认弹窗的请求
-// 一律自动拒绝，不会挂死回合
 const permissionModes: Array<{ v: AutomationTaskInfo['permission_mode']; desc: string }> = [
   { v: 'confirm', desc: '变更前确认：查询自动放行；任何变更请求自动拒绝' },
   { v: 'accept_edits', desc: '自动编辑：普通编辑和构建自动放行；删除、提交、推送等敏感操作自动拒绝' },
+  { v: 'auto_decision', desc: '自动决策：权限与提问交由 JEV 裁决；需人工确认或 JEV 不可用时自动拒绝' },
   { v: 'plan', desc: '计划模式：允许读取、查询和制定计划；禁止修改或删除任务文件' },
   { v: 'full', desc: '完全访问：沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制' },
 ];
+
+const visiblePermissionModes = computed(() =>
+  permissionModes.filter(
+    (m) => m.v !== 'auto_decision' || store.decisionEnabled || form.permissionMode === 'auto_decision',
+  ),
+);
 
 const weekdayOptions = [
   { value: 1, label: '周一' },
@@ -269,6 +292,7 @@ const form = reactive({
   id: '',
   name: '',
   sessionMode: '',
+  runSessionMode: 'per_run' as 'per_run' | 'fixed',
   newSession: '',
   workdirMode: 'global' as 'global' | 'folder',
   workdir: '',
@@ -277,15 +301,13 @@ const form = reactive({
   intervalMinutes: 30,
   time: '09:30',
   weekdays: [1] as number[],
-  // 一次性触发：相对延迟（delayMinutes）与绝对时刻（runAt）二选一
   onceMode: 'delay' as 'delay' | 'absolute',
   delayMinutes: 60,
   runAt: '',
-  // 最多执行次数：'' = 不限次
   maxRuns: '' as string | number,
   prompt: '',
   permissionMode: 'confirm' as AutomationTaskInfo['permission_mode'],
-  missedPolicy: 'skip' as 'skip' | 'run_once',
+  missedPolicy: 'run_once' as 'skip' | 'run_once',
   notifyOnSuccess: false,
   errors: [] as string[],
 });
@@ -311,10 +333,20 @@ const existingSessionWorkdir = computed(() => {
   return '';
 });
 
+const runSessionPreview = computed(() => {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const date = `${now.getFullYear()}-${month}-${day}`;
+  const name = form.name.trim();
+  return name ? `${date} ${name}` : date;
+});
+
 function openCreate() {
   form.id = '';
   form.name = '';
   form.sessionMode = sessionOptions.value[0] || '__new__';
+  form.runSessionMode = 'per_run';
   form.newSession = '';
   form.workdirMode = 'global';
   form.workdir = '';
@@ -329,7 +361,7 @@ function openCreate() {
   form.maxRuns = '';
   form.prompt = '';
   form.permissionMode = 'confirm';
-  form.missedPolicy = 'skip';
+  form.missedPolicy = 'run_once';
   form.notifyOnSuccess = false;
   form.errors = [];
   form.show = true;
@@ -339,9 +371,8 @@ function openEdit(t: AutomationTaskInfo) {
   form.id = t.id;
   form.name = t.name;
   form.sessionMode = sessionOptions.value.includes(t.target_session) ? t.target_session : '__new__';
+  form.runSessionMode = t.session_mode === 'fixed' ? 'fixed' : 'per_run';
   form.newSession = sessionOptions.value.includes(t.target_session) ? '' : t.target_session;
-  // 旧任务 workdir 为空（跟随会话归属）：编辑新建会话目标时默认给自由对话，
-  // 需要项目目录的由用户显式选择
   if (t.workdir && t.workdir !== 'GLOBAL') {
     form.workdirMode = 'folder';
     form.workdir = t.workdir;
@@ -355,8 +386,6 @@ function openEdit(t: AutomationTaskInfo) {
   form.intervalMinutes = Number(cfg.interval_minutes) || 30;
   form.time = typeof cfg.time === 'string' ? cfg.time : '09:30';
   form.weekdays = Array.isArray(cfg.weekdays) ? cfg.weekdays.map(Number) : [1];
-  // once 落库后 trigger_config 只剩 run_at（delay_minutes 保存时已被后端归一化），
-  // 编辑时按绝对时刻形态回填；max_runs 为空表示不限次
   form.onceMode = typeof cfg.run_at === 'string' && cfg.run_at.trim() ? 'absolute' : 'delay';
   form.runAt = typeof cfg.run_at === 'string' ? toRunAtInput(cfg.run_at) : '';
   form.delayMinutes = Number(cfg.delay_minutes) > 0 ? Number(cfg.delay_minutes) : 60;
@@ -369,7 +398,6 @@ function openEdit(t: AutomationTaskInfo) {
   form.show = true;
 }
 
-// 后端 run_at 是 "YYYY-MM-DD HH:MM"；datetime-local 需要的值是 "YYYY-MM-DDTHH:MM"
 function toRunAtInput(value: string): string {
   const text = String(value || '').trim().replace(' ', 'T');
   return text.length >= 16 ? text.slice(0, 16) : text;
@@ -386,15 +414,18 @@ function pickWorkdir() {
 }
 
 async function onSave() {
-  const targetSession = form.sessionMode === '__new__' ? form.newSession.trim() : form.sessionMode;
-  if (!form.name.trim() || !form.prompt.trim() || !targetSession) {
-    form.errors = ['任务名称、目标会话与提示词均不能为空'];
+  // per_run：不要求目标会话，后端按 "{今天日期} {任务名}" 建/复用会话；
+  // fixed：沿用原有目标会话校验
+  const perRun = form.runSessionMode === 'per_run';
+  const targetSession = perRun
+    ? ''
+    : (form.sessionMode === '__new__' ? form.newSession.trim() : form.sessionMode);
+  if (!form.name.trim() || !form.prompt.trim() || (!perRun && !targetSession)) {
+    form.errors = [perRun ? '任务名称与提示词均不能为空' : '任务名称、目标会话与提示词均不能为空'];
     return;
   }
-  // 工作目录只在新建会话时指定：自由对话存 GLOBAL，项目任务存所选目录；
-  // 已有会话目标留空，运行时跟随会话自身归属
   let workdir = '';
-  if (form.sessionMode === '__new__') {
+  if (perRun || form.sessionMode === '__new__') {
     if (form.workdirMode === 'folder') {
       workdir = form.workdir.trim();
       if (!workdir) {
@@ -428,7 +459,6 @@ async function onSave() {
       config.delay_minutes = delay;
     }
   }
-  // 最多执行次数：留空 = 不限次（null）；手动「立即执行」不计入该次数
   const maxRunsRaw = String(form.maxRuns ?? '').trim();
   if (maxRunsRaw !== '') {
     const parsed = Number(maxRunsRaw);
@@ -446,6 +476,7 @@ async function onSave() {
       trigger_config: config,
       max_runs: maxRunsRaw === '' ? null : Number(maxRunsRaw),
       target_session: targetSession,
+      session_mode: form.runSessionMode,
       workdir,
       model_id: form.modelId,
       prompt: form.prompt,
@@ -471,13 +502,11 @@ function editingEnabled(): boolean {
 }
 
 function onToggle(t: AutomationTaskInfo, enabled: boolean) {
-  // 已完成任务生命周期结束：卡片开关已置灰，这里再兜一道
   if (t.status === 'completed') return;
   void store.toggleAutomationTask(t.id, enabled);
 }
 
 async function onRunNow(t: AutomationTaskInfo) {
-  // 已完成任务不再派发（按钮已 disabled，这里兜住程序化点击）
   if (t.status === 'completed') return;
   const res = await store.runAutomationTaskNow(t.id);
   if (res.ok) expanded[t.id] = true;

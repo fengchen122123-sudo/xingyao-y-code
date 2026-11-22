@@ -1,5 +1,4 @@
 <template>
-  <!-- 卷纲列表：窄面板里一行一卷，点击后由父组件去读该卷卷纲文档 -->
   <div v-if="rows.length === 0" class="novel-volume-empty" data-test="novel-volume-empty">
     大纲目录还没有卷纲文件
   </div>
@@ -27,7 +26,6 @@
 import type { NovelWorkbenchVolumeDto } from '../types/pywebview.d';
 
 defineProps<{
-  /** 卷纲表单项：来自 get_novel_workbench 的 volumes 数组（缺失时父组件传空数组） */
   rows: NovelWorkbenchVolumeDto[];
 }>();
 
@@ -43,7 +41,6 @@ function charsOf(row: NovelWorkbenchVolumeDto): number {
 </script>
 
 <style scoped>
-/* 颜色/字号只用全局 CSS 变量，跟随主题切换 */
 .novel-volume-empty {
   padding: 10px 2px;
   color: var(--text-faint);

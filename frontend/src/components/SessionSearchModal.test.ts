@@ -74,27 +74,21 @@ it('搜索弹窗输入关键词并检索会话与展示高亮切片', async () =
   const input = wrapper.find('[data-test="session-search-input"]');
   expect(input.exists()).toBe(true);
 
-  // 输入关键词
   await input.setValue('API');
-  // 等待 debounce
   await new Promise((r) => setTimeout(r, 200));
   await nextTick();
 
   expect(search_sessions_full).toHaveBeenCalledWith('API', 'all', undefined, 30);
 
-  // 检查渲染出来的条目
   const items = wrapper.findAll('.result-item');
   expect(items.length).toBe(2);
 
-  // 第一条：标题匹配
   expect(items[0].find('.type-badge').text()).toBe('标题匹配');
   expect(items[0].html()).toContain('<mark>API</mark>');
 
-  // 第二条：内容匹配
   expect(items[1].find('.type-badge').text()).toBe('用户提问');
   expect(items[1].find('.item-snippet').html()).toContain('<mark>API</mark>');
 
-  // 点击第一条，触发跳转
   await items[0].trigger('click');
   expect(store.sessionSearchModal.show).toBe(false);
 });
@@ -118,7 +112,6 @@ it('「包含已归档」开关默认关闭，开启后检索请求才带上 inc
   await wrapper.get('[data-test="session-search-input"]').setValue('归档');
   await new Promise((r) => setTimeout(r, 200));
   await nextTick();
-  // 默认关闭：保持原有 4 参签名不变（旧后端不接受第 5 参）
   expect(search_sessions_full).toHaveBeenLastCalledWith('归档', 'all', undefined, 30);
 
   await toggle.setValue(true);

@@ -61,7 +61,6 @@ describe('DisclaimerGate', () => {
     await flushPromises();
 
     expect(accept).toHaveBeenCalledTimes(1);
-    // 同意后状态就地更新，父级 v-if 失效，弹窗随之卸载
     expect(store.disclaimerAcceptedVersion).toBe(DISCLAIMER_VERSION);
     expect(store.disclaimerNeedsAccept).toBe(false);
   });
@@ -88,16 +87,13 @@ describe('DisclaimerGate', () => {
 
   it('re-triggers the gate when disclaimer version is bumped', () => {
     const store = useAppStore();
-    // 假设用户之前同意过 v1.0
     store.disclaimerAcceptedVersion = 'v1.0';
     store.disclaimerRequiredVersion = 'v1.0';
     expect(store.disclaimerNeedsAccept).toBe(false);
 
-    // 随后条款升级为 v1.1
     store.disclaimerRequiredVersion = 'v1.1';
     expect(store.disclaimerNeedsAccept).toBe(true);
 
-    // 重新同意 v1.1 后恢复通过
     store.disclaimerAcceptedVersion = 'v1.1';
     expect(store.disclaimerNeedsAccept).toBe(false);
   });

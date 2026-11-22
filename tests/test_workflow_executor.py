@@ -1,10 +1,7 @@
-"""星流工作流解释执行器测试（注入桩 runner，不真跑子代理/命令）。"""
-
 from __future__ import annotations
 
 import threading
 
-import pytest
 
 from core.workflows.executor import PlanExecutor, StepFailure
 
@@ -44,7 +41,7 @@ def test_sequential_phases_agent_report():
 
     summary, events = _run(plan, agent_runner=agent_runner, initial_scope={"topic": "星瑶"})
     assert summary["ok"] is True
-    assert captured["instructions"] == "处理 星瑶"  # 模板已用运行参数填充
+    assert captured["instructions"] == "处理 星瑶"
     kinds = [k for k, _ in events]
     assert kinds[0] == "phase_started"
     assert "agent_started" in kinds and "agent_completed" in kinds
@@ -96,7 +93,7 @@ def test_loop_bounded_with_condition_and_bind():
 
     summary, events = _run(plan, command_runner=command_runner)
     assert summary["ok"] is True
-    assert rounds["n"] == 3  # 第三轮条件满足退出
+    assert rounds["n"] == 3
     iterations = [p for k, p in events if k == "loop_iteration"]
     assert [p["iteration"] for p in iterations] == [1, 2, 3]
 
@@ -111,7 +108,6 @@ def test_command_blocked_on_confirm_mode():
 
 
 def test_parallel_branches_run_concurrently():
-    """三分支真并发：屏障等齐（串行执行会超时失败），结果聚合正确。"""
     barrier = threading.Barrier(3, timeout=10)
     plan = {"steps": [
         {"op": "parallel", "steps": [
@@ -122,7 +118,7 @@ def test_parallel_branches_run_concurrently():
     ]}
 
     def agent_runner(name, *a, **k):
-        barrier.wait()  # 三个分支不同时在跑就会超时
+        barrier.wait()
         return True, name
 
     summary, events = _run(plan, agent_runner=agent_runner)
@@ -167,4 +163,4 @@ def test_step_failure_with_condition_loop_reraises():
         ]},
     ]}
     summary, _ = _run(plan, agent_runner=lambda *a, **k: (False, "炸了"))
-    assert summary["ok"] is False  # 条件循环失败上抛（无静默吞错）
+    assert summary["ok"] is False

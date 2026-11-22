@@ -1,4 +1,3 @@
-"""并发压测：预压缩守卫 / 工具结果改写 / 水位估算 多线程叠加（dev-compact 验证用）。"""
 import tempfile
 import os
 import time

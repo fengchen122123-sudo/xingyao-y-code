@@ -39,7 +39,6 @@ describe('renderMarkdown 媒体语法', () => {
     expect((html.match(/md-img-copy"/g) || []).length).toBe(1);
     expect(html).toContain(`data-copy-src="${img(0).url}"`);
     expect(html).toContain('<svg');
-    // 复制按钮在 wrap 内、img 之后（事件委托按 button 命中，不触发灯箱）
     expect(html.indexOf('md-img-copy')).toBeGreaterThan(html.indexOf('md-img'));
   });
 
@@ -48,7 +47,6 @@ describe('renderMarkdown 媒体语法', () => {
     expect((html.match(/md-img-save"/g) || []).length).toBe(1);
     expect(html).toContain(`data-save-src="${img(0).url}"`);
     expect(html).toContain('data-save-name="微信群二维码"');
-    // 两个按钮同处一个操作区容器：各自绝对定位会互相重叠
     expect(html).toContain('class="md-img-actions"');
     expect(html.indexOf('md-img-actions')).toBeLessThan(html.indexOf('md-img-copy'));
   });

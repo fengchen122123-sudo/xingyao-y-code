@@ -1,5 +1,3 @@
-"""Pure policy helpers for session-scoped command authorization."""
-
 import fnmatch
 import os
 import re
@@ -21,10 +19,84 @@ _INLINE_EXEC_FLAGS = {
     "-m",
     "-p",
 }
+_SCRIPT_EVAL_EXECUTABLES = {"node", "nodejs", "perl", "ruby", "php"}
+_SHELL_EXECUTABLES = {"sh", "bash", "zsh", "dash", "ksh", "ash"}
+_POWERSHELL_EXECUTABLES = {"powershell", "pwsh"}
+_SAFE_PYTHON_MODULES = frozenset({
+    "py_compile",
+    "compileall",
+    "ast",
+    "dis",
+    "tokenize",
+    "json.tool",
+    "inspect",
+    "pytest",
+    "unittest",
+    "mypy",
+    "ruff",
+    "flake8",
+    "black",
+    "isort",
+})
+_READONLY_PYTHON_MODULES = frozenset({
+    "py_compile",
+    "ast",
+    "dis",
+    "tokenize",
+    "json.tool",
+    "inspect",
+})
 _QUERY_FLAGS = {"-v", "--version", "-version", "-h", "--help"}
 _UNSAFE_COMMAND_TEXT = (";", "&", "|", "<", ">", "`", "\r", "\n", "$(")
 _PYTHON_OR_PIP = re.compile(r"(?:python|pip)(?:\d+(?:\.\d+)*)?(?:\.exe)?\Z", re.IGNORECASE)
-_QUERY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+_QUERY_GIT_SUBCOMMANDS = {
+    "status",
+    "diff",
+    "log",
+    "show",
+    "rev-parse",
+    "ls-files",
+    "ls-tree",
+    "cat-file",
+    "blame",
+    "shortlog",
+    "describe",
+    "whatchanged",
+    "grep",
+    "diff-tree",
+    "merge-base",
+}
+_GIT_BRANCH_WRITE_FLAGS = {
+    "-d",
+    "-m",
+    "-c",
+    "--delete",
+    "--move",
+    "--copy",
+    "--edit-description",
+    "--set-upstream-to",
+    "--unset-upstream",
+}
+_GIT_BRANCH_QUERY_FLAGS = {
+    "-a",
+    "--all",
+    "-r",
+    "--remotes",
+    "-l",
+    "--list",
+    "-v",
+    "-vv",
+    "--verbose",
+    "--show-current",
+    "--contains",
+    "--no-contains",
+    "--merged",
+    "--no-merged",
+    "--sort",
+    "--format",
+}
+_GIT_TAG_QUERY_FLAGS = {"-l", "--list", "-n", "--sort", "--contains", "--points-at"}
+_GIT_REMOTE_QUERY_SUBS = {"-v", "--verbose", "show", "get-url"}
 _DELETE_COMMANDS = {"rm", "del", "erase", "rd", "rmdir", "remove-item"}
 _PROCESS_KILL_COMMANDS = {"kill", "pkill", "taskkill", "stop-process"}
 _PACKAGE_MUTATION_PAIRS = {
@@ -45,6 +117,8 @@ _PACKAGE_MUTATION_PAIRS = {
 }
 _QUERY_COMMANDS = {
     "cat",
+    "dir",
+    "findstr",
     "get-childitem",
     "get-content",
     "head",
@@ -55,9 +129,12 @@ _QUERY_COMMANDS = {
     "select-string",
     "tail",
     "test-path",
+    "tree",
     "type",
+    "wc",
     "where",
     "where.exe",
+    "which",
     "whoami",
 }
 _VERSION_QUERY_COMMANDS = {
@@ -104,7 +181,6 @@ _CATASTROPHIC_COMMAND_PATTERNS = (
         r"\b(?:curl|wget)\b[^\r\n|]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|ksh)\b",
         re.IGNORECASE,
     ),
-    # 下载后交给脚本解释器执行（sh 家族之外的变体）
     re.compile(
         r"\b(?:curl|wget)\b[^\r\n|]*\|\s*(?:sudo\s+)?(?:python\d*(?:\.exe)?|perl|ruby)\b",
         re.IGNORECASE,
@@ -115,7 +191,6 @@ _CATASTROPHIC_COMMAND_PATTERNS = (
         r"(?:sh|bash|zsh|ksh|python\d*(?:\.exe)?|perl)\b",
         re.IGNORECASE,
     ),
-    # PowerShell -EncodedCommand：base64 载荷无法静态审查，一律视为危险
     re.compile(
         r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:enc|ec|encodedcommand)\b",
         re.IGNORECASE,
@@ -275,11 +350,6 @@ def _dangerous_powershell_delete(segment, *, workdir=None, home=None):
 
 
 def is_dangerous_command(command: str, *, workdir=None, home=None) -> bool:
-    """Identify unambiguously catastrophic shell operations.
-
-    This is defense in depth, not a complete shell sandbox. Permission
-    confirmation remains required for mutating commands that are not matched.
-    """
     text = str(command or "").strip()
     if not text:
         return False
@@ -310,14 +380,36 @@ def _is_python_or_pip(executable: str) -> bool:
     return _PYTHON_OR_PIP.fullmatch(name) is not None
 
 
+def _is_git_command(executable: str) -> bool:
+    return executable in {"git", "git.exe"}
+
+
 def _has_inline_exec_flag(tokens: tuple[str, ...]) -> bool:
-    executable = os.path.basename(tokens[0].strip('"')).lower()
-    for argument in tokens[1:]:
-        flag = argument.lower()
-        if flag == "-c" and executable in {"git", "git.exe"}:
-            continue
-        if flag in _INLINE_EXEC_FLAGS:
+    executable = _normalized_executable(tokens[0])
+    is_python = _is_python_or_pip(tokens[0])
+    is_shell = executable in _SHELL_EXECUTABLES
+    is_script_eval = executable in _SCRIPT_EVAL_EXECUTABLES
+    i = 1
+    while i < len(tokens):
+        flag = tokens[i].lower()
+        if flag in {"-command", "-encodedcommand"}:
             return True
+        if flag in {"/c", "/k"} and executable == "cmd":
+            return True
+        if flag == "-c" and (is_python or is_shell or is_script_eval):
+            return True
+        if flag in {"-e", "--eval"} and (is_script_eval or is_shell):
+            return True
+        if flag == "-p" and executable in {"perl", "ruby"}:
+            return True
+        if flag in {"-p", "--print"} and executable in {"node", "nodejs"}:
+            return True
+        if flag == "-m" and is_python:
+            module_name = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
+            if module_name not in _SAFE_PYTHON_MODULES:
+                return True
+            i += 1
+        i += 1
     return False
 
 
@@ -328,32 +420,87 @@ def _normalized_executable(token: str) -> str:
     return executable
 
 
-def classify_command_risk(command: str, *, workdir=None, home=None) -> PermissionRisk:
-    """Classify a shell command without executing or expanding it."""
-    if is_dangerous_command(command, workdir=workdir, home=home):
-        return PermissionRisk.CATASTROPHIC
+def _classify_git_command(arguments: tuple[str, ...]) -> PermissionRisk:
+    """精确区分只读 git 查询、安全选项查询与变更型 git 子命令。"""
+    if not arguments or (len(arguments) == 1 and arguments[0] in _QUERY_FLAGS):
+        return PermissionRisk.QUERY
+    sub = arguments[0]
+    if sub in _QUERY_GIT_SUBCOMMANDS:
+        return PermissionRisk.QUERY
+    rest = arguments[1:]
+    if sub == "branch":
+        if any(arg in _GIT_BRANCH_WRITE_FLAGS for arg in rest):
+            return PermissionRisk.SENSITIVE_MUTATION
+        # 无参数或仅包含只读查询标志时视为 QUERY；含位置参数视为新建分支
+        for arg in rest:
+            if arg.startswith("--") and arg.split("=", 1)[0] in _GIT_BRANCH_QUERY_FLAGS:
+                continue
+            if arg in _GIT_BRANCH_QUERY_FLAGS:
+                continue
+            return PermissionRisk.SENSITIVE_MUTATION
+        return PermissionRisk.QUERY
+    if sub == "tag":
+        if not rest:
+            return PermissionRisk.QUERY
+        if all(arg in _GIT_TAG_QUERY_FLAGS for arg in rest):
+            return PermissionRisk.QUERY
+        return PermissionRisk.SENSITIVE_MUTATION
+    if sub == "remote":
+        if not rest or rest[0] in _GIT_REMOTE_QUERY_SUBS:
+            return PermissionRisk.QUERY
+        return PermissionRisk.SENSITIVE_MUTATION
+    if sub == "stash":
+        if rest and rest[0] in {"list", "show"}:
+            return PermissionRisk.QUERY
+        return PermissionRisk.SENSITIVE_MUTATION
+    if sub == "config":
+        if rest and any(arg in {"--get", "--get-all", "--list", "-l", "--show-origin"} for arg in rest):
+            positional = [arg for arg in rest if not arg.startswith("-")]
+            if "--list" in rest or "-l" in rest or len(positional) <= 1:
+                return PermissionRisk.QUERY
+        return PermissionRisk.SENSITIVE_MUTATION
+    return PermissionRisk.SENSITIVE_MUTATION
 
-    tokens = _safe_tokens(command)
-    if tokens is None or _has_inline_exec_flag(tokens):
+
+def _classify_single_command_tokens(
+    tokens: tuple[str, ...], *, allow_chdir_query: bool = False
+) -> PermissionRisk:
+    if _has_inline_exec_flag(tokens):
         return PermissionRisk.SENSITIVE_MUTATION
 
     executable = _normalized_executable(tokens[0])
     arguments = tuple(token.lower() for token in tokens[1:])
 
+    if allow_chdir_query and executable in {"cd", "set-location"}:
+        return PermissionRisk.QUERY
+
     if executable == "git":
-        if not arguments or (
-            len(arguments) == 1 and arguments[0] in _QUERY_FLAGS
-        ):
-            return PermissionRisk.QUERY
-        if arguments[0] in _QUERY_GIT_SUBCOMMANDS:
-            return PermissionRisk.QUERY
-        return PermissionRisk.SENSITIVE_MUTATION
+        return _classify_git_command(arguments)
 
     if executable in _DELETE_COMMANDS or executable in _PROCESS_KILL_COMMANDS:
         return PermissionRisk.SENSITIVE_MUTATION
 
     if arguments and (executable, arguments[0]) in _PACKAGE_MUTATION_PAIRS:
         return PermissionRisk.SENSITIVE_MUTATION
+
+    if _is_python_or_pip(tokens[0]) and "-m" in arguments:
+        m_idx = arguments.index("-m")
+        mod = arguments[m_idx + 1] if m_idx + 1 < len(arguments) else ""
+        if mod in _READONLY_PYTHON_MODULES:
+            return PermissionRisk.QUERY
+        if mod in _SAFE_PYTHON_MODULES:
+            return PermissionRisk.NORMAL_MUTATION
+
+    if executable == "ruff" and arguments and arguments[0] == "check":
+        if "--fix" not in arguments:
+            return PermissionRisk.QUERY
+        return PermissionRisk.NORMAL_MUTATION
+
+    if executable == "tsc" and "--noemit" in arguments:
+        return PermissionRisk.QUERY
+
+    if executable == "pytest" and "--collect-only" in arguments:
+        return PermissionRisk.QUERY
 
     if executable in _QUERY_COMMANDS:
         return PermissionRisk.QUERY
@@ -368,8 +515,113 @@ def classify_command_risk(command: str, *, workdir=None, home=None) -> Permissio
     return PermissionRisk.NORMAL_MUTATION
 
 
+def _split_safe_compound_segments(command: str) -> list[tuple[str, ...]] | None:
+    if not isinstance(command, str) or not command.strip():
+        return None
+
+    segments_raw: list[str] = []
+    buf: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    length = len(command)
+    while i < length:
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < length else ""
+        if ch in {"\r", "\n"}:
+            return None
+        if not in_single and (command[i : i + 2] in {"$(", "${"} or ch == "`"):
+            return None
+        if os.name != "nt" and not in_single and ch == "\\" and i + 1 < length:
+            buf.append(ch)
+            buf.append(nxt)
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            buf.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch in {"<", ">"}:
+                return None
+            if ch == "&":
+                if nxt == "&":
+                    segments_raw.append("".join(buf))
+                    buf.clear()
+                    i += 2
+                    continue
+                return None
+            if ch == "|":
+                segments_raw.append("".join(buf))
+                buf.clear()
+                i += 2 if nxt == "|" else 1
+                continue
+            if ch == ";":
+                segments_raw.append("".join(buf))
+                buf.clear()
+                i += 1
+                continue
+        buf.append(ch)
+        i += 1
+
+    if in_single or in_double:
+        return None
+    segments_raw.append("".join(buf))
+
+    parsed: list[tuple[str, ...]] = []
+    for raw in segments_raw:
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            tokens = tuple(shlex.split(text, posix=os.name != "nt"))
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+        parsed.append(tokens)
+    return parsed or None
+
+
+_RISK_SEVERITY = {
+    PermissionRisk.QUERY: 0,
+    PermissionRisk.NORMAL_MUTATION: 1,
+    PermissionRisk.SENSITIVE_MUTATION: 2,
+    PermissionRisk.CATASTROPHIC: 3,
+}
+
+
+def classify_command_risk(command: str, *, workdir=None, home=None) -> PermissionRisk:
+    """Classify a shell command without executing or expanding it."""
+    if is_dangerous_command(command, workdir=workdir, home=home):
+        return PermissionRisk.CATASTROPHIC
+
+    tokens = _safe_tokens(command)
+    if tokens is not None:
+        return _classify_single_command_tokens(tokens)
+
+    segments = _split_safe_compound_segments(command)
+    if not segments:
+        return PermissionRisk.SENSITIVE_MUTATION
+
+    max_risk = PermissionRisk.QUERY
+    last_idx = len(segments) - 1
+    for idx, seg_tokens in enumerate(segments):
+        risk = _classify_single_command_tokens(
+            seg_tokens, allow_chdir_query=(idx < last_idx)
+        )
+        if _RISK_SEVERITY[risk] > _RISK_SEVERITY[max_risk]:
+            max_risk = risk
+    return max_risk
+
+
 def parse_manual_command_rule(command: str) -> tuple[str, ...]:
-    """Parse a complete, persistable token prefix entered by the user."""
     if is_dangerous_command(command):
         raise ValueError("灾难性命令不能加入白名单")
 
@@ -382,7 +634,6 @@ def parse_manual_command_rule(command: str) -> tuple[str, ...]:
 
 
 def session_rule_for_command(command: str) -> tuple[str, ...] | None:
-    """Return the narrow session rule for a safe, non-composed command."""
     tokens = _safe_tokens(command)
     if tokens is None:
         return None
@@ -424,19 +675,12 @@ def _session_rule_is_exact(rule: tuple[str, ...]) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# T1 子进程环境变量策略：默认不把主进程的敏感环境变量（API Key / Token 等）
-# 透传给 execute_command 与后台任务拉起的子进程，堵住「模型执行命令时把
-# 凭据带给子进程」的泄漏面。这是唯一默认偏离旧行为的配置项（安全默认）；
-# 逃生门：config.json 设 "shell_env_policy": {"exclude_sensitive": false}。
-# ---------------------------------------------------------------------------
 SHELL_ENV_POLICY_CONFIG_KEY = "shell_env_policy"
 DEFAULT_SHELL_ENV_POLICY = {"inherit": "all", "exclude_sensitive": True}
 DEFAULT_SENSITIVE_ENV_PATTERNS = ("*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*")
 
 
 def _env_pattern_list(value) -> list[str]:
-    """归一化模式列表：字符串视为单模式，非法项静默忽略。"""
     if isinstance(value, str):
         return [value] if value else []
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -445,7 +689,6 @@ def _env_pattern_list(value) -> list[str]:
 
 
 def _env_name_matches(name: str, patterns: list[str]) -> bool:
-    """环境变量名按 fnmatch 匹配，大小写不敏感（Windows 语义跨平台统一）。"""
     upper = str(name).upper()
     return any(fnmatch.fnmatchcase(upper, pattern.upper()) for pattern in patterns)
 
@@ -453,16 +696,6 @@ def _env_name_matches(name: str, patterns: list[str]) -> bool:
 def build_child_env(
     base_env: Mapping[str, str], *, policy: dict | None = None
 ) -> dict[str, str]:
-    """构造子进程环境变量表（默认安全：排除敏感变量）。
-
-    策略字段（均为可选，非法值回退默认）：
-    - ``inherit``: ``all``（默认）继承 base_env；``none`` 从空表开始
-    - ``exclude_sensitive``: 默认 True，按 ``DEFAULT_SENSITIVE_ENV_PATTERNS``
-      排除敏感变量；显式 False 为逃生门（恢复旧行为）
-    - ``exclude``: 追加自定义排除模式（fnmatch，大小写不敏感）
-    - ``include_only``: 非空白名单，仅保留匹配变量
-    - ``set``: 固定注入，最终生效（显式覆盖同名的继承值）
-    """
     options = policy if isinstance(policy, dict) else {}
     base = dict(base_env) if isinstance(base_env, Mapping) else {}
 
@@ -495,7 +728,6 @@ def build_child_env(
 
 
 def load_shell_env_policy() -> dict:
-    """读取 config.json 的 shell_env_policy；缺省/非法值回退安全默认。"""
     resolved = dict(DEFAULT_SHELL_ENV_POLICY)
     try:
         import config

@@ -19,13 +19,11 @@ export function emitPtyExit(code: number): void {
   for (const handler of [...exitHandlers]) handler(code);
 }
 
-/** 订阅终端输出，返回取消订阅函数 */
 export function onPtyData(handler: PtyDataHandler): () => void {
   dataHandlers.add(handler);
   return () => dataHandlers.delete(handler);
 }
 
-/** 订阅终端进程退出，返回取消订阅函数 */
 export function onPtyExit(handler: PtyExitHandler): () => void {
   exitHandlers.add(handler);
   return () => exitHandlers.delete(handler);

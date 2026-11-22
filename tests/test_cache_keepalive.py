@@ -2,7 +2,6 @@ import pytest
 
 
 def _wait_until(predicate, timeout=5.0, interval=0.02):
-    """轮询等待条件成立；超时后做最后一次判定并由调用方断言。"""
     import time as _time
 
     deadline = _time.monotonic() + timeout
@@ -14,10 +13,6 @@ def _wait_until(predicate, timeout=5.0, interval=0.02):
 
 
 def _fire_immediately(service, session_key=None):
-    """把已注册会话条目的 deadline 回拨到过去并唤醒线程，立即触发一次保活。
-
-    session_key 为 None 时对所有会话条目生效（线程每轮挑最早到期的一个执行）。
-    """
     with service._condition:
         if session_key is None:
             targets = list(service._entries.items())
@@ -30,7 +25,6 @@ def _fire_immediately(service, session_key=None):
 
 
 def _keepalive_request(tag):
-    """最小可用保活请求；tag 落在 messages 里便于断言是哪个会话被保活。"""
     return {
         "model": "openai/qwen3.8-flash",
         "messages": [{"role": "user", "content": tag}],
@@ -39,12 +33,6 @@ def _keepalive_request(tag):
 
 @pytest.fixture(autouse=True)
 def _clear_route_config_caches():
-    """清空路由配置的指纹缓存，避免测试替身 load_config 的结论跨测试残留。
-
-    _configured_keepalive_routes / _qwen_cache 系列按 (load_config 身份, 配置
-    文件 mtime) 失效缓存；monkeypatch 换替身后指纹虽已变化，但缓存条目会持有
-    替身函数的引用，这里统一清空以保证测试间完全隔离。
-    """
     import core.llm_dialects as dialects
 
     def _clear():
@@ -58,7 +46,6 @@ def _clear_route_config_caches():
 
 
 def _drop_sessions(service, *session_keys):
-    """测试收尾：停掉指定会话的保活，避免线程残留在后续测试里继续发请求。"""
     for session_key in session_keys:
         service.register_request({}, interval=0, session_key=session_key)
 
@@ -66,11 +53,9 @@ def _drop_sessions(service, *session_keys):
 def test_keepalive_interval_defaults_120_and_rejects_too_short(monkeypatch):
     from core.cache_keepalive import load_keepalive_interval
 
-    # 未配置时默认 120 秒（防停顿后缓存 TTL 过期整轮 miss）
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
     assert load_keepalive_interval() == 120
 
-    # 显式配置 0 仍可关闭
     monkeypatch.setattr(
         "core.model_manager.load_config",
         lambda: {"prompt_cache_keepalive_seconds": 0},
@@ -90,7 +75,6 @@ def test_keepalive_interval_defaults_120_and_rejects_too_short(monkeypatch):
     # 配置路径绝不抛出（每轮主请求前置区裸调，raise 会打穿全部对话）：
     # 越界回落默认 120
     assert load_keepalive_interval() == 120
-    # 显式传 interval 的调用点（register_request）是编程错误，保留拒绝
     from core.cache_keepalive import CacheKeepaliveService
 
     with pytest.raises(ValueError, match="至少为 60"):
@@ -127,7 +111,6 @@ def test_keepalive_request_reuses_prefix_but_limits_output():
 
 
 def test_deepseek_keepalive_covers_third_party_routes():
-    """DeepSeek 家族任意渠道放行保活：官方与第三方中转一致。"""
     from core.llm import _supports_cache_keepalive
 
     assert _supports_cache_keepalive(
@@ -139,7 +122,6 @@ def test_deepseek_keepalive_covers_third_party_routes():
 
 
 def test_kimi_keepalive_covers_third_party_routes(monkeypatch):
-    """Kimi 家族任意渠道放行保活：官方与第三方中转一致。"""
     from core.llm import _supports_cache_keepalive
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
@@ -153,7 +135,6 @@ def test_kimi_keepalive_covers_third_party_routes(monkeypatch):
 
 
 def test_keepalive_routes_config_enables_explicit_gateway_routes(monkeypatch):
-    """顶层 cache_keepalive_routes 对非四族模型的显式通道：声明后该域名放行。"""
     from core.llm import _supports_cache_keepalive
 
     monkeypatch.setattr(
@@ -161,23 +142,19 @@ def test_keepalive_routes_config_enables_explicit_gateway_routes(monkeypatch):
         lambda: {"cache_keepalive_routes": ["tokenrhythm.studio"]},
     )
 
-    # 裸域名条目命中带路径的 api_base（/v1 后缀不影响域名归一化）
     assert _supports_cache_keepalive(
         "openai/some-model", "https://tokenrhythm.studio/v1"
     ) is True
-    # 无路径、大小写与端口变体同样命中
     assert _supports_cache_keepalive(
         "openai/some-model", "https://TokenRhythm.Studio"
     ) is True
     assert _supports_cache_keepalive(
         "openai/some-model", "https://tokenrhythm.studio:8443/v1"
     ) is True
-    # 未在配置中声明的其他网关路由不受影响
     assert _supports_cache_keepalive(
         "openai/some-model", "https://aggregator.example/v1"
     ) is False
 
-    # 条目写成完整 URL（带路径）走同一归一化，同样命中
     monkeypatch.setattr(
         "core.model_manager.load_config",
         lambda: {"cache_keepalive_routes": ["https://tokenrhythm.studio/v1"]},
@@ -253,7 +230,6 @@ def test_keepalive_response_without_usage_fails_loudly():
 
 
 def test_zhipu_keepalive_covers_third_party_routes():
-    """GLM 家族任意渠道放行保活：官方端点、未知路径与第三方中转一视同仁。"""
     from core.llm import _supports_cache_keepalive
 
     assert _supports_cache_keepalive(
@@ -262,14 +238,12 @@ def test_zhipu_keepalive_covers_third_party_routes():
     assert _supports_cache_keepalive(
         "zhipu/glm-5.2", "https://open.bigmodel.cn/api/paas/v4"
     ) is True
-    # 同域官方 CodingPlan 套餐端点（OpenAI/Anthropic 协议）同样放行
     assert _supports_cache_keepalive(
         "openai/glm-5.3", "https://open.bigmodel.cn/api/coding/paas/v4"
     ) is True
     assert _supports_cache_keepalive(
         "anthropic/glm-5.3-flash", "https://open.bigmodel.cn/api/anthropic"
     ) is True
-    # 家族判定不看 URL 形状：官方域名未知路径、第三方中转的 GLM 模型一律放行
     assert _supports_cache_keepalive(
         "openai/glm-5.3", "https://open.bigmodel.cn/api/unknown"
     ) is True
@@ -304,7 +278,6 @@ def test_glm_forced_thinking_keepalive_preserves_thinking_and_raises_output():
 
     keepalive = build_keepalive_request(original)
 
-    # 强制思考模型收到 disabled 会直接报错；保活必须保留 enabled 并抬高上限
     assert keepalive["extra_body"]["thinking"] == {"type": "enabled"}
     assert "reasoning_effort" not in keepalive
     assert keepalive["max_tokens"] == KEEPALIVE_THINKING_MODEL_MAX_TOKENS
@@ -329,8 +302,6 @@ def test_glm_family_thinking_keepalive_keeps_enabled():
 
     keepalive = build_keepalive_request(original)
 
-    # GLM 全系按家族统一为不可关思考（5.3 传 disabled 会报错，取家族交集）：
-    # 保活保留 enabled、去掉强度档并抬高 token 上限，与 glm-5.3 行为一致。
     assert keepalive["extra_body"]["thinking"] == {"type": "enabled"}
     assert "reasoning_effort" not in keepalive["extra_body"]
     assert keepalive["max_tokens"] == KEEPALIVE_THINKING_MODEL_MAX_TOKENS
@@ -338,12 +309,6 @@ def test_glm_family_thinking_keepalive_keeps_enabled():
 
 
 def test_keepalive_timeout_scales_with_prompt_size():
-    """保活请求超时必须随 prompt 规模放大（与主请求同口径：基础值 + tokens/1500）。
-
-    写死 30 秒时，40 万 token 会话在缓存恰好过期、需要全量预填充的场景下
-    必然超时；一次 Timeout 即令保活服务自停，随后 TTL 无人续、真实请求
-    全量 miss（gui-runtime.log 中保活自停绝大多数为 Timeout）。缓存命中时
-    预填充几乎免费，放大后的超时只是冷预填充的保险丝。"""
     from core.cache_keepalive import build_keepalive_request
     from core.llm import API_REQUEST_MAX_TIMEOUT_SECONDS, API_REQUEST_TIMEOUT_SECONDS
 
@@ -359,14 +324,12 @@ def test_keepalive_timeout_scales_with_prompt_size():
     })
     assert small["timeout"] == API_REQUEST_TIMEOUT_SECONDS
 
-    # 20 万 CJK 字 ≈ 20 万 token：90 + 133 = 223 秒
     mid = build_keepalive_request({
         **base,
         "messages": [{"role": "user", "content": "字" * 200_000}],
     })
     assert mid["timeout"] == API_REQUEST_TIMEOUT_SECONDS + 200_000 // 1500
 
-    # 100 万 token：90 + 666 = 756 → 封顶 600
     huge = build_keepalive_request({
         **base,
         "messages": [
@@ -378,10 +341,6 @@ def test_keepalive_timeout_scales_with_prompt_size():
 
 
 def test_keepalive_retries_transient_failure_instead_of_stopping(monkeypatch):
-    """瞬时失败（超时/限流/网络抖动）必须有界退避重试，不得一次失败即自停。
-
-    自停是级联放大器：服务停 → TTL 5 分钟无人续 → 真实请求全量 miss
-    （实测一次 40 万 token 会话因保活自停后全量 miss）。"""
     import core.cache_keepalive as ka
 
     calls = []
@@ -422,7 +381,6 @@ def test_keepalive_retries_transient_failure_instead_of_stopping(monkeypatch):
 
 
 def test_keepalive_stops_after_retries_exhausted(monkeypatch):
-    """重试耗尽（1 次首发 + 2 次退避重试）仍失败才停用该会话的保活。"""
     import core.cache_keepalive as ka
 
     calls = []
@@ -459,7 +417,6 @@ def test_keepalive_stops_after_retries_exhausted(monkeypatch):
 
 
 def test_keepalive_retry_backoff_yields_to_new_registration(monkeypatch):
-    """退避等待期间：服务不得自停（还在重试节奏里），新请求注册后旧重试立即让位。"""
     import time as _time
     import core.cache_keepalive as ka
 
@@ -476,7 +433,6 @@ def test_keepalive_retry_backoff_yields_to_new_registration(monkeypatch):
     monkeypatch.setattr(
         ka, "account_keepalive_response", lambda response, telemetry: {"valid": True}
     )
-    # 拉长退避窗口，保证测试能在退避期内完成新注册
     monkeypatch.setattr(ka, "KEEPALIVE_RETRY_BACKOFF_SECONDS", 30.0)
 
     service = ka.CacheKeepaliveService()
@@ -493,7 +449,6 @@ def test_keepalive_retry_backoff_yields_to_new_registration(monkeypatch):
         # 退避期内服务仍在重试节奏中，未自停（旧 bug：一次失败立即停）
         _time.sleep(0.3)
         assert service.status()["enabled"] is True
-        # 新注册接管：旧快照不再补发重试请求
         service.register_request(
             {
                 "model": "openai/qwen3.8-flash",
@@ -509,10 +464,6 @@ def test_keepalive_retry_backoff_yields_to_new_registration(monkeypatch):
 
 
 def test_session_key_falls_back_to_telemetry_then_default(monkeypatch):
-    """会话键解析：显式 session_key > telemetry.session_id > 固定默认键。
-
-    默认键保证旧调用方（只传 request/interval/telemetry）行为不变：
-    不带 telemetry 的 register_request 只影响默认键条目，不误伤会话条目。"""
     import core.cache_keepalive as ka
 
     monkeypatch.setattr(ka, "load_keepalive_interval", lambda: 120)
@@ -525,7 +476,6 @@ def test_session_key_falls_back_to_telemetry_then_default(monkeypatch):
             telemetry={"session_id": "session-x"},
         )
         assert set(service._entries) == {"session-x"}
-        # 显式 session_key 优先于 telemetry.session_id
         service.register_request(
             _keepalive_request("explicit"),
             interval=60,
@@ -533,7 +483,6 @@ def test_session_key_falls_back_to_telemetry_then_default(monkeypatch):
             session_key="session-y",
         )
         assert set(service._entries) == {"session-x", "session-y"}
-        # 旧调用方（无 session_key / 无 telemetry）落到固定默认键，间隔走配置默认值
         service.register_request(_keepalive_request("legacy"))
         assert set(service._entries) == {
             "session-x",
@@ -541,7 +490,6 @@ def test_session_key_falls_back_to_telemetry_then_default(monkeypatch):
             ka.DEFAULT_KEEPALIVE_SESSION_KEY,
         }
         assert service.status()["interval"] == 120
-        # 默认键的 interval=0 只停默认键条目，会话条目照旧
         service.register_request({}, interval=0)
         assert set(service._entries) == {"session-x", "session-y"}
     finally:
@@ -551,11 +499,6 @@ def test_session_key_falls_back_to_telemetry_then_default(monkeypatch):
 
 
 def test_multi_session_keepalive_tracks_each_session(monkeypatch):
-    """多会话各自注册快照后，每个会话都应被保活（不再只覆盖最后一个会话）。
-
-    单快照实现的 bug：register_request 覆盖全局快照，只有最后注册的会话被续
-    TTL；实测 19 个会话、920 次切换/天下，间隔 > 5 分钟切回时 28% 的请求
-    命中率 < 50%，而带保活的官方路由切回命中率 96.2%。"""
     import core.cache_keepalive as ka
 
     dispatched = []
@@ -588,7 +531,6 @@ def test_multi_session_keepalive_tracks_each_session(monkeypatch):
 
 
 def test_stopping_one_session_keeps_other_sessions_alive(monkeypatch):
-    """主请求开始时只停本会话快照：其他会话的保活继续（旧实现清空全局快照）。"""
     import time as _time
     import core.cache_keepalive as ka
 
@@ -611,7 +553,6 @@ def test_stopping_one_session_keeps_other_sessions_alive(monkeypatch):
         service.register_request(
             _keepalive_request("sess-b"), interval=60, session_key="sess-b"
         )
-        # 模拟主模型请求开始：只停 sess-a
         service.register_request({}, interval=0, session_key="sess-a")
         assert service.status()["session_count"] == 1
         _fire_immediately(service)
@@ -624,7 +565,6 @@ def test_stopping_one_session_keeps_other_sessions_alive(monkeypatch):
 
 
 def test_session_limit_evicts_oldest(monkeypatch):
-    """超过 MAX_KEEPALIVE_SESSIONS 时淘汰 last_activity 最旧的条目。"""
     import core.cache_keepalive as ka
 
     assert ka.MAX_KEEPALIVE_SESSIONS == 4
@@ -643,7 +583,6 @@ def test_session_limit_evicts_oldest(monkeypatch):
 
 
 def test_idle_session_is_pruned_from_loop(monkeypatch):
-    """last_activity 超过 KEEPALIVE_IDLE_EXPIRE_SECONDS 的条目在循环中被清理。"""
     import core.cache_keepalive as ka
 
     assert ka.KEEPALIVE_IDLE_EXPIRE_SECONDS == 30 * 60
@@ -656,7 +595,6 @@ def test_idle_session_is_pruned_from_loop(monkeypatch):
         service.register_request(
             _keepalive_request("fresh"), interval=60, session_key="fresh"
         )
-        # 把 stale 会话回拨到 1 小时前（超过 30 分钟空闲），唤醒线程触发清理
         with service._condition:
             service._entries["stale"]["last_activity"] -= 3600
             service._condition.notify_all()
@@ -670,7 +608,6 @@ def test_idle_session_is_pruned_from_loop(monkeypatch):
 
 
 def test_failing_session_does_not_stop_other_sessions(monkeypatch):
-    """某会话连续失败只停用该会话；其他会话的保活不受影响（旧实现全局自停）。"""
     import core.cache_keepalive as ka
 
     class _Timeout(Exception):
@@ -713,24 +650,10 @@ def test_failing_session_does_not_stop_other_sessions(monkeypatch):
         _drop_sessions(service, "sess-bad", "sess-good")
 
 
-# ---------------------------------------------------------------------------
-# 跨渠道缓存命中率修复 · Task 5：保活按车道证据止损
-#
-# 规则（写死）：
-# - 双条件同时满足才停：该车道 cache_scope='keepalive' 的独立 token 加权命中率
-#   < 0.5 且轮次 >= 10；
-# - 样本不足绝不动作（R3 保险丝）：轮次 < 10 时一律不停，哪怕命中率 0%；
-# - 健康车道行为零变化；开关 cache_keepalive_evidence_gate=false 时行为与
-#   改动前逐字等价；
-# - 止损 TTL 小时级（>= 3600s，不用 900s 的 400 拒绝档）；
-# - 止损日志只记车道标识与数字（turns / hit_rate / 判定时间），绝不记正文。
-# ---------------------------------------------------------------------------
-
 _TASK5_MODEL = "openai/deepseek-v4.1-flash"
 
 
 def _expire_keepalive_evidence_cache():
-    """强制下次聚合重读（短 TTL 缓存是生产优化，测试需可控失效）。"""
     import core.llm_diagnostics as diagnostics
 
     with diagnostics._keepalive_lane_evidence_lock:
@@ -739,20 +662,17 @@ def _expire_keepalive_evidence_cache():
 
 
 def _reset_keepalive_evidence_state():
-    """清空 Task 5 新增的全部进程内状态：止损表、开关缓存、聚合缓存。"""
     import core.llm_dialects as dialects
 
     with dialects._keepalive_evidence_disabled_lock:
         dialects._keepalive_evidence_disabled_routes.clear()
     with dialects._qwen_cache_cfg_lock:
-        # 开关与保活白名单共用同一份配置解析条目，清它即同时失效两者。
         dialects._keepalive_routes_cfg_cache["entry"] = None
     _expire_keepalive_evidence_cache()
 
 
 @pytest.fixture(autouse=True)
 def _isolate_keepalive_evidence():
-    """Task 5 状态隔离：测试前后清空止损表/开关缓存/聚合缓存，并回收测试桶。"""
     import core.llm_diagnostics as diagnostics
 
     with diagnostics.token_usage_lock:
@@ -769,17 +689,14 @@ def _isolate_keepalive_evidence():
 
 
 def _stub_config(monkeypatch, data):
-    """替换 load_config 并清掉开关指纹缓存，保证读到替身配置。"""
     import core.llm_dialects as dialects
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: data)
     with dialects._qwen_cache_cfg_lock:
-        # 开关与保活白名单共用同一份配置解析条目，清它即同时失效两者。
         dialects._keepalive_routes_cfg_cache["entry"] = None
 
 
 def _seed_keepalive_lane(session, model, api_base, *, turns, prompt_total, cached_total):
-    """按桶形状注入 keepalive 车道证据（轮次 + 累计 prompt/cached），并失效聚合缓存。"""
     import core.llm_diagnostics as diagnostics
 
     key = diagnostics._cache_usage_key(session, model, api_base, "keepalive")
@@ -801,11 +718,6 @@ def _seed_keepalive_lane(session, model, api_base, *, turns, prompt_total, cache
 
 
 def test_keepalive_lane_evidence_aggregates_across_sessions():
-    """跨会话聚合：同 (model, api_base) 的 keepalive 桶合计轮次与 token（他车道隔离）。
-
-    阿里云形状的两个会话切片：60 轮 + 58 轮 = 118 轮，
-    prompt 9,792,934 / cached 2,353,920（24.04%）。
-    """
     from core.llm_diagnostics import lane_keepalive_evidence
 
     base = "https://task5-aggregate.example/v1"
@@ -832,12 +744,10 @@ def test_keepalive_lane_evidence_aggregates_across_sessions():
     assert cached_tokens == 2_353_920
     assert hit_rate == pytest.approx(2_353_920 / 9_792_934)
     assert 0.2403 < hit_rate < 0.2405
-    # 另一车道（同模型、不同 api_base）不得混入
     assert lane_keepalive_evidence(_TASK5_MODEL, other_base)[:3] == (5, 5_000, 5_000)
 
 
 def test_aliyun_keepalive_lane_118_turns_2404_stops(monkeypatch):
-    """阿里云形状应停：118 轮、24.04% → 该车道保活停（False）。"""
     from core.llm import _supports_cache_keepalive
 
     base = "https://task5-aliyun.example/v1"
@@ -851,7 +761,6 @@ def test_aliyun_keepalive_lane_118_turns_2404_stops(monkeypatch):
 
 
 def test_tokenrhythm_keepalive_lane_61_turns_9015_stays(monkeypatch):
-    """基元律动形状应留：61 轮、90.15% → 保活保留（True）。"""
     from core.llm import _supports_cache_keepalive
 
     base = "https://task5-tokenrhythm.example/v1"
@@ -865,7 +774,6 @@ def test_tokenrhythm_keepalive_lane_61_turns_9015_stays(monkeypatch):
 
 
 def test_kimi_keepalive_lane_746_turns_9207_stays(monkeypatch):
-    """api.kimi.com 形状应留：746 轮、92.07% → 保活保留（True）。"""
     from core.llm import _supports_cache_keepalive
 
     base = "https://api.kimi.com/coding/v1"
@@ -879,7 +787,6 @@ def test_kimi_keepalive_lane_746_turns_9207_stays(monkeypatch):
 
 
 def test_keepalive_sample_fuse_9_turns_zero_hit_never_stops(monkeypatch):
-    """保险丝（R3）：9 轮、0% 命中 → 样本不足，绝不停（True）。"""
     from core.llm import _supports_cache_keepalive
 
     base = "https://task5-fuse.example/v1"
@@ -893,7 +800,6 @@ def test_keepalive_sample_fuse_9_turns_zero_hit_never_stops(monkeypatch):
 
 
 def test_keepalive_boundary_exactly_10_turns_below_half_stops(monkeypatch):
-    """双条件边界：恰好 10 轮、49.9% → 停（False）。"""
     from core.llm import _supports_cache_keepalive
     from core.llm_diagnostics import lane_keepalive_evidence
 
@@ -909,7 +815,6 @@ def test_keepalive_boundary_exactly_10_turns_below_half_stops(monkeypatch):
 
 
 def test_keepalive_mature_lane_at_half_hit_rate_stays(monkeypatch):
-    """双条件：>=10 轮但命中率 >= 0.5 → 不停（True）。"""
     from core.llm import _supports_cache_keepalive
 
     base = "https://task5-half.example/v1"
@@ -923,7 +828,6 @@ def test_keepalive_mature_lane_at_half_hit_rate_stays(monkeypatch):
 
 
 def _legacy_supports_cache_keepalive(model_name, api_base):
-    """改动前的判据（四族 ∨ 显式白名单）——用于逐字等价对照。"""
     from core.llm_dialects import (
         _is_deepseek_family,
         _is_glm_family,
@@ -962,7 +866,6 @@ def _legacy_supports_cache_keepalive(model_name, api_base):
     ],
 )
 def test_evidence_gate_healthy_lanes_match_legacy_verdict(model, api_base, monkeypatch):
-    """健康车道零变化：门开着且无亏损证据时，返回值与改动前判据逐字等价。"""
     from core.llm import _supports_cache_keepalive
 
     _stub_config(monkeypatch, {})
@@ -973,7 +876,6 @@ def test_evidence_gate_healthy_lanes_match_legacy_verdict(model, api_base, monke
 
 
 def test_evidence_gate_disabled_ignores_loss_lane(monkeypatch):
-    """开关 false：同样的亏损车道 → 门被关掉（True，行为与改动前等价）。"""
     from core.llm import _supports_cache_keepalive
 
     base = "https://task5-gate-off.example/v1"
@@ -987,7 +889,6 @@ def test_evidence_gate_disabled_ignores_loss_lane(monkeypatch):
 
 
 def test_evidence_gate_defaults_enabled_when_config_key_absent(monkeypatch):
-    """开关缺省 → 默认开（只可能停"已判定亏损"的车道）。"""
     import core.llm_dialects as dialects
 
     _stub_config(monkeypatch, {})
@@ -996,7 +897,6 @@ def test_evidence_gate_defaults_enabled_when_config_key_absent(monkeypatch):
 
 
 def test_keepalive_stop_ttl_is_hour_scale_and_reescalates(monkeypatch):
-    """止损 TTL 小时级（>=3600，明确不用 900），到期后重判并重新计满。"""
     import time as _time
     import core.llm_dialects as dialects
     from core.llm import _supports_cache_keepalive
@@ -1016,7 +916,6 @@ def test_keepalive_stop_ttl_is_hour_scale_and_reescalates(monkeypatch):
         remaining = dialects._keepalive_evidence_disabled_routes[key] - _time.monotonic()
     assert 3599 <= remaining <= 3601
 
-    # 把条目拨到过期：重判（证据仍亏损）→ 再次止损，TTL 重新计满
     with dialects._keepalive_evidence_disabled_lock:
         dialects._keepalive_evidence_disabled_routes[key] = _time.monotonic() - 1
     assert _supports_cache_keepalive(_TASK5_MODEL, base) is False
@@ -1026,7 +925,6 @@ def test_keepalive_stop_ttl_is_hour_scale_and_reescalates(monkeypatch):
 
 
 def test_keepalive_stop_log_records_lane_digits_only(monkeypatch, caplog):
-    """止损依据可观测：日志含车道标识、样本轮次、命中率与判定时间，且不含正文。"""
     import logging
     from core.llm import _supports_cache_keepalive
 
@@ -1061,7 +959,6 @@ def test_keepalive_stop_log_records_lane_digits_only(monkeypatch, caplog):
 
 
 def test_keepalive_evidence_isolates_main_scope_low_hit(monkeypatch):
-    """cache_scope 隔离：同车道 main scope 命中率再低也不得影响 keepalive 判定。"""
     import core.llm as llm
     import core.llm_diagnostics as diagnostics
 
@@ -1080,7 +977,6 @@ def test_keepalive_evidence_isolates_main_scope_low_hit(monkeypatch):
 
 
 def test_record_keepalive_lane_usage_accumulates_turns_and_tokens():
-    """保活记账通道：每轮 +1 轮次并累计 token；12 轮 70% → 判定可复算。"""
     from core.llm_diagnostics import (
         lane_keepalive_evidence,
         record_keepalive_lane_usage,
@@ -1102,7 +998,6 @@ def test_record_keepalive_lane_usage_accumulates_turns_and_tokens():
 
 
 def test_account_keepalive_response_feeds_lane_evidence(monkeypatch):
-    """保活响应记账成功后 → 车道证据累计；10 轮 10% 触发止损（False）。"""
     from types import SimpleNamespace
     from core.cache_keepalive import account_keepalive_response
     from core.llm import _supports_cache_keepalive
@@ -1133,7 +1028,6 @@ def test_account_keepalive_response_feeds_lane_evidence(monkeypatch):
 
 
 def test_account_keepalive_response_without_cache_report_skips_evidence(monkeypatch):
-    """未报告缓存明细的保活轮次不进车道证据（未报告 ≠ 0，R3 保险丝不受影响）。"""
     from types import SimpleNamespace
     from core.cache_keepalive import account_keepalive_response
     from core.llm_diagnostics import lane_keepalive_evidence
@@ -1154,7 +1048,6 @@ def test_account_keepalive_response_without_cache_report_skips_evidence(monkeypa
 
 
 def test_keepalive_evidence_cache_ttl_is_short_window(monkeypatch):
-    """聚合短 TTL 缓存（30~60s）：窗口内返回旧快照，过期后重扫。"""
     from core.llm_diagnostics import (
         _KEEPALIVE_LANE_EVIDENCE_TTL_SECONDS,
         lane_keepalive_evidence,
@@ -1169,31 +1062,19 @@ def test_keepalive_evidence_cache_ttl_is_short_window(monkeypatch):
     first = lane_keepalive_evidence(_TASK5_MODEL, base)
     assert first == (1, 1_000, 1_000, pytest.approx(1.0))
 
-    # TTL 窗口内再写一轮：缓存未过期，聚合仍返回旧快照
     record_keepalive_lane_usage("task5-cache", _TASK5_MODEL, base, 1_000, 0)
     assert lane_keepalive_evidence(_TASK5_MODEL, base) == first
 
-    # 过期后重扫：两轮合计 2000/1000 = 50%
     _expire_keepalive_evidence_cache()
     assert lane_keepalive_evidence(_TASK5_MODEL, base) == (
         2, 2_000, 1_000, pytest.approx(0.5),
     )
 
 
-# ---------------------------------------------------------------------------
-# 启动播种：止损证据必须跨进程存活
-#
-# 证据桶是内存态、重启即清零，而判定门槛是「该车道保活 ≥10 轮且命中率 <0.5」——
-# 意味着每次重启都要重新白烧 10 轮全价前缀才够判（实测亏损车道保活单轮平均
-# 10.6 万 token）。token_usage 里本来就有 cache_scope='keepalive' 的行，
-# 启动时按车道播进内存即可零成本续上。
-# ---------------------------------------------------------------------------
-
 _TASK5_SEED_MODEL_LEAF = "deepseek-v4.1-flash"
 
 
 def _clear_keepalive_lane(model, api_base):
-    """清掉某车道全部 keepalive 内存桶（含播种用的合成会话桶），避免测试间污染。"""
     import core.llm_diagnostics as diagnostics
 
     target = (str(model or "").lower(), str(api_base or "").rstrip("/").lower())
@@ -1208,7 +1089,6 @@ def _clear_keepalive_lane(model, api_base):
 
 def _persist_keepalive_turns(manager, api_base, *, turns, prompt, cached, ts_list=None,
                             session_prefix="persisted"):
-    """把「已落库的保活轮次」按真实记账路径写进 token_usage（含 cached=None 的未报告形状）。"""
     import time as _time
 
     now = int(_time.time())
@@ -1223,7 +1103,6 @@ def _persist_keepalive_turns(manager, api_base, *, turns, prompt, cached, ts_lis
 
 
 def test_seed_restores_loss_evidence_after_process_restart(tmp_path, monkeypatch):
-    """新进程内存为空：启动播种后必须立刻具备止损证据，不再白烧 10 轮保活。"""
     import time as _time
 
     import core.app_context as app_context
@@ -1263,11 +1142,6 @@ def test_seed_restores_loss_evidence_after_process_restart(tmp_path, monkeypatch
 
 
 def test_seed_skips_current_process_rows_and_unreported_turns(tmp_path, monkeypatch):
-    """播种只吃「本进程启动前」且「报告了缓存明细」的行。
-
-    本进程自己记的轮次已在内存桶里，再播一遍会双计（轮次翻倍 → 判定门槛被提前
-    跨过）；未报告缓存明细的轮次连入分母的资格都没有（未报告 ≠ 0）。
-    """
     import time as _time
 
     import core.app_context as app_context
@@ -1283,7 +1157,6 @@ def test_seed_skips_current_process_rows_and_unreported_turns(tmp_path, monkeypa
         ts_list=[process_start - 120 + i for i in range(12)],
         session_prefix="prev-process",
     )
-    # 本进程启动后落库的行：内存桶已计过一次，播种必须跳过
     _persist_keepalive_turns(
         manager, base, turns=8, prompt=100_000, cached=90_000,
         ts_list=[process_start + 10 + i for i in range(8)],
@@ -1314,7 +1187,6 @@ def test_seed_skips_current_process_rows_and_unreported_turns(tmp_path, monkeypa
 
 
 def test_seed_is_idempotent_and_keeps_per_session_view_clean(tmp_path, monkeypatch):
-    """播种幂等，且不冒充任何真实会话（GUI 的单会话保活展示不受播种影响）。"""
     import time as _time
 
     import core.app_context as app_context

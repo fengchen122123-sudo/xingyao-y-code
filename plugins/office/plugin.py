@@ -1,18 +1,3 @@
-"""office：办公文档读取插件。
-
-提供 office_read 工具：把 xlsx / docx / pptx / pdf 转成结构化 Markdown，
-让模型先"读懂"办公文档再做后续处理（整理、汇总、生成报告、改写）。
-
-设计取舍：
-- docx / pptx 不引入 python-docx / python-pptx。这两个库会带进 lxml（C 扩展），
-  打包体积会明显变大；而这两类文件的本质就是 zip 包里的 OOXML，读文本、表格、
-  标题层级用标准库 zipfile + xml.etree 足够，且零新增依赖。
-- xlsx 走已在依赖中的 openpyxl（能正确取公式的计算结果缓存、处理只读大表）。
-- pdf 走已在依赖中的 pypdf。
-
-边界：本工具只做「读」。写入能力（office_write）另做，且必须先定产物规范。
-"""
-
 from __future__ import annotations
 
 import io
@@ -25,7 +10,6 @@ from pathlib import Path
 from core.tool_protocol import ToolResult, ToolSpec
 
 SUPPORTED_EXTS = (".xlsx", ".xlsm", ".docx", ".pptx", ".pdf")
-# 老格式（.doc/.xls/.ppt）是二进制 OLE 结构，标准库读不了。
 LEGACY_HINT = {
     ".doc": "老版 Word（.doc）是二进制格式，请另存为 .docx 后再读",
     ".xls": "老版 Excel（.xls）是二进制格式，请另存为 .xlsx 后再读",
@@ -49,7 +33,6 @@ def _a(tag: str) -> str:
 
 
 def _md_cell(value) -> str:
-    """单元格值 → Markdown 表格安全文本（竖线转义、换行压平）。"""
     if value is None:
         return ""
     text = str(value)
@@ -63,7 +46,6 @@ def _md_cell(value) -> str:
 
 
 def _md_table(rows: list) -> str:
-    """二维列表 → Markdown 表格；第一行当表头，列数按最宽行补齐。"""
     if not rows:
         return ""
     width = max(len(r) for r in rows)
@@ -77,9 +59,6 @@ def _md_table(rows: list) -> str:
     out = [line(rows[0]), "| " + " | ".join(["---"] * width) + " |"]
     out.extend(line(r) for r in rows[1:])
     return "\n".join(out)
-
-
-# ─── xlsx ────────────────────────────────────────────────────────────
 
 
 def _read_xlsx(path: str, sheet: str = "", max_rows: int = DEFAULT_MAX_ROWS) -> str:
@@ -101,7 +80,6 @@ def _read_xlsx(path: str, sheet: str = "", max_rows: int = DEFAULT_MAX_ROWS) -> 
                 if idx >= max_rows:
                     truncated = True
                     break
-                # 整行全空直接跳过：Excel 里大量格式化产生的空行对模型没有信息量
                 if any(c is not None and str(c).strip() != "" for c in row):
                     rows.append(row)
             title = "## 工作表：%s" % name
@@ -117,19 +95,11 @@ def _read_xlsx(path: str, sheet: str = "", max_rows: int = DEFAULT_MAX_ROWS) -> 
         wb.close()
 
 
-# ─── docx ────────────────────────────────────────────────────────────
-
-
 def _docx_paragraph_text(p) -> str:
     return "".join(t.text or "" for t in p.iter(_w("t")))
 
 
 def _docx_heading_level(p) -> int:
-    """段落样式 → 标题层级；非标题返回 0。
-
-    兼容英文版（Heading1/Heading 1）与数字样式名（部分模板直接叫 "1"）。
-    不解析自定义样式的实际字号——按语义层级读已经够模型理解结构。
-    """
     ppr = p.find(_w("pPr"))
     if ppr is None:
         return 0
@@ -187,9 +157,6 @@ def _read_docx(path: str) -> str:
     return "\n\n".join(blocks)
 
 
-# ─── pptx ────────────────────────────────────────────────────────────
-
-
 def _read_pptx(path: str) -> str:
     with zipfile.ZipFile(path) as zf:
         names = [n for n in zf.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)]
@@ -209,9 +176,6 @@ def _read_pptx(path: str) -> str:
         return "\n\n".join(blocks)
 
 
-# ─── pdf ─────────────────────────────────────────────────────────────
-
-
 def _read_pdf(path: str, max_pages: int = DEFAULT_MAX_PAGES) -> str:
     from pypdf import PdfReader
 
@@ -224,7 +188,7 @@ def _read_pdf(path: str, max_pages: int = DEFAULT_MAX_PAGES) -> str:
     for idx in range(min(total, max_pages)):
         try:
             text = (reader.pages[idx].extract_text() or "").strip()
-        except Exception as exc:  # 单页解析失败不影响其余页
+        except Exception as exc:
             text = "（本页解析失败：%s: %s）" % (type(exc).__name__, exc)
         if not text:
             text = "（无文本，可能是扫描件或纯图片）"
@@ -232,9 +196,6 @@ def _read_pdf(path: str, max_pages: int = DEFAULT_MAX_PAGES) -> str:
     if total > max_pages:
         blocks.append("（已截断：共 %d 页，只读了前 %d 页）" % (total, max_pages))
     return "\n\n".join(blocks)
-
-
-# ─── 工具入口 ────────────────────────────────────────────────────────
 
 
 _MISSING_DEP_HINTS = {
@@ -245,12 +206,6 @@ _MISSING_DEP_HINTS = {
 
 
 def _missing_dependency_hint(exc: BaseException) -> str:
-    """把 ModuleNotFoundError 翻成「缺什么、怎么装」的可执行提示。
-
-    正常安装包已通过 ycode.spec 的 collect_all 内置这两个包；走到这里通常是
-    源码运行环境没装依赖，或拿到的是旧版安装包。裸抛 ModuleNotFoundError
-    对用户毫无可操作性，所以统一翻译。
-    """
     name = str(getattr(exc, "name", "") or "")
     package, capability = _MISSING_DEP_HINTS.get(name, (name, "该格式"))
     if not package:
@@ -300,7 +255,6 @@ def office_read(path, sheet="", max_rows=DEFAULT_MAX_ROWS, max_chars=DEFAULT_MAX
         else:
             body = _read_pdf(str(resolved))
     except ImportError as exc:
-        # openpyxl / pypdf 缺失：给可执行提示，别把 ModuleNotFoundError 甩给用户
         return ToolResult(content=_missing_dependency_hint(exc), is_error=True)
     except Exception as exc:
         return ToolResult(
@@ -321,10 +275,6 @@ def office_read(path, sheet="", max_rows=DEFAULT_MAX_ROWS, max_chars=DEFAULT_MAX
     return ToolResult(content=text)
 
 
-# ─── 写入：xlsx ──────────────────────────────────────────────────────
-
-# 默认样式规范。集中在一处是为了让「产物长什么样」只有唯一事实源：
-# 改样式只改这里，所有走 office_write 的表格一起变。
 STYLE = {
     "font_name": "微软雅黑",
     "font_size": 10.5,
@@ -339,7 +289,6 @@ STYLE = {
 
 
 def _display_width(value) -> int:
-    """按显示宽度估算列宽：中文/全角按 2，其余按 1。"""
     width = 0
     for ch in str(value):
         width += 2 if ord(ch) > 0x7F else 1
@@ -347,18 +296,12 @@ def _display_width(value) -> int:
 
 
 def _cell_value(value):
-    """限制单元格值类型：openpyxl 只接受标量，容器统一转文本。"""
     if value is None or isinstance(value, (str, int, float, bool, date, datetime)):
         return value
     return str(value)
 
 
 def _write_xlsx(path: Path, sheets, overwrite: bool = False):
-    """按办公室默认规范生成 xlsx 字节；返回 (字节, 数据行数, 工作表名列表)。
-
-    只在内存里生成产物、不落盘——落盘由调用方走 _save_with_turn_undo，
-    这样按回合撤销能拿到完整的计划 after。非法输入抛 ValueError。
-    """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -385,7 +328,7 @@ def _write_xlsx(path: Path, sheets, overwrite: bool = False):
     body_font = Font(name=STYLE["font_name"], size=STYLE["font_size"])
 
     wb = Workbook()
-    wb.remove(wb.active)  # 只保留传入的工作表，避免多出一个空的 Sheet
+    wb.remove(wb.active)
 
     written = 0
     names = []
@@ -423,7 +366,6 @@ def _write_xlsx(path: Path, sheets, overwrite: bool = False):
                         cell.fill = stripe_fill
         written += len(rows)
 
-        # 列宽按内容自适应：太窄中文挤成一团，太宽打印时会摊成好几页
         for c_idx in range(1, width + 1):
             longest = 0
             for row in rows:
@@ -436,10 +378,10 @@ def _write_xlsx(path: Path, sheets, overwrite: bool = False):
             )
 
         ws.row_dimensions[1].height = STYLE["header_row_height"]
-        ws.freeze_panes = "A2"  # 首行是表头，往下滚时不跟着走
+        ws.freeze_panes = "A2"
         if width:
             ws.auto_filter.ref = "A1:%s%d" % (get_column_letter(width), len(rows))
-            ws.print_title_rows = "1:1"  # 跨页打印时每页都重复表头
+            ws.print_title_rows = "1:1"
         ws.page_setup.orientation = "landscape"
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
@@ -451,12 +393,6 @@ def _write_xlsx(path: Path, sheets, overwrite: bool = False):
 
 
 def _save_with_turn_undo(path: Path, payload: bytes, tool_name: str) -> None:
-    """落盘并接入按回合撤销（与 write_file、图片落盘同一套记录器流程）。
-
-    检查点已封闭（迟到写入）时直接抛错、不触盘；没有活动检查点（CLI、测试或
-    未开启撤销的嵌入方）降级为不可撤销裸写，与 write_file 的降级语义一致。
-    工作区正被其他活跃回合写入时 prepare_mutation 抛 workspace_busy，同样不触盘。
-    """
     from core.turn_undo import coordinator as _tu_coordinator
     from core.turn_undo import recorder as _tu_recorder
     from core.turn_undo.models import NodeKind, TurnUndoError, UndoErrorCode
@@ -522,7 +458,6 @@ def office_write(path, sheets=None, overwrite=False):
     try:
         _save_with_turn_undo(resolved, payload, "office_write")
     except Exception as exc:
-        # 撤销记录失败（检查点已封闭 / 工作区被占）一律不触盘，如实报错
         return ToolResult(
             content="写入 %s 失败：%s: %s" % (resolved.name, type(exc).__name__, exc),
             is_error=True,

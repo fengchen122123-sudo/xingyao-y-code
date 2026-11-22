@@ -1,5 +1,3 @@
-"""Adapters for converting OpenAI Responses protocol stream events into Chat completion chunks."""
-
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -41,7 +39,6 @@ def _merge_stream_response_id(current, seen):
 
 
 def _plain_value(value):
-    """把上游事件对象树规范化为纯 dict/list/标量（computer_call 载荷用）。"""
     if isinstance(value, dict):
         return {key: _plain_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -72,7 +69,6 @@ def _responses_usage_as_chat_usage(response):
 
 
 def _responses_stream_as_chat_chunks(events):
-    """Responses 原始流 → chat chunks 的映射；生成器关闭时连带关闭底层流。"""
     try:
         yield from _responses_events_as_chat_chunks(events)
     finally:
@@ -80,15 +76,6 @@ def _responses_stream_as_chat_chunks(events):
 
 
 def _normalize_responses_event_type(event_type) -> str:
-    """Responses 事件 type 统一归一化为 'response.*' 字符串。
-
-    上游原生流事件的 type 是裸字符串；而某些网关/桥接实现自己合成事件流的
-    路径上（如 fake_stream：模型未登记原生流式能力时，改发非流式请求再
-    合成事件流），合成事件的 type 直接填
-    ResponsesAPIStreamEvents 枚举成员，str() 得到的是成员名
-    （如 'ResponsesAPIStreamEvents.RESPONSE_COMPLETED'）而非事件值，必须用
-    .value 还原，否则映射器全部失配。
-    """
     if isinstance(event_type, str):
         return event_type
     value = getattr(event_type, "value", None)
@@ -98,7 +85,6 @@ def _normalize_responses_event_type(event_type) -> str:
 
 
 def _responses_events_as_chat_chunks(events):
-    """将 Responses SSE 事件严格映射成现有工具循环消费的 chat chunks。"""
     saw_tool_calls = False
     response_id = ""
     # 已由 output_item.added 产出过的 function_call call_id：真流式路径
@@ -126,7 +112,6 @@ def _responses_events_as_chat_chunks(events):
         elif event_type == "response.refusal.delta":
             yield _chat_chunk(content=str(_obj_value(event, "delta", "")))
         elif event_type == "response.created":
-            # Task 11a：记录 response id，供 computer_call 载荷与原生续传使用
             response_id = _merge_stream_response_id(
                 response_id,
                 _obj_value(_obj_value(event, "response"), "id", ""),
@@ -164,13 +149,11 @@ def _responses_events_as_chat_chunks(events):
         elif event_type == "response.output_item.done":
             item = _obj_value(event, "item")
             if _obj_value(item, "type") == "computer_call":
-                # Task 11a：终态完整 computer_call 载荷，转发给 assembler 合并
                 saw_tool_calls = True
                 yield _chat_chunk(computer_call={
                     "response_id": response_id,
                     "item": _plain_value(item),
                 })
-            # 其余 item 类型维持忽略（function_call 已由 added+delta 事件覆盖）
             continue
         elif event_type == "response.completed":
             response = _obj_value(event, "response")
@@ -237,13 +220,6 @@ def _responses_events_as_chat_chunks(events):
 
 
 def _native_continuation_instructions(request_kwargs) -> str:
-    """从产生 computer_call 的 Step 请求中提取续传必须重发的 instructions。
-
-    首请求的系统上下文位于 input 的 system/developer 条目（prepare_stream_request
-    语义）；continuation 请求已有 instructions 键则直接复用。多个 system 条目按
-    出现顺序以空行连接。设计 11.3：官方 Responses 的 instructions 不会经
-    previous_response_id 自动继承，漏发会导致 system prompt 语义漂移。
-    """
     instructions = request_kwargs.get("instructions")
     if isinstance(instructions, str):
         return instructions
@@ -264,4 +240,3 @@ def _native_continuation_instructions(request_kwargs) -> str:
             if text:
                 parts.append(text)
     return "\n\n".join(parts)
-

@@ -1,21 +1,16 @@
-"""工作流 → 星瑶技能生成（双通道呈现之通道二，ZCode 导入设计 §3.3）。
-
-生成的技能放在 ``~/.ycode/skills/zcode-workflows/<name>/SKILL.md``，走
-``core/skills.py`` 的简单 frontmatter（单行 name/description）。技能正文告诉
-模型何时适用、参数表长什么样、以及「执行时调 workflow_run 工具」——对话里
-说人话即可被技能自动匹配命中，不必记住命令。
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
 
-from core.workflows.store import validate_name, workflows_dir
+from core.workflows.store import user_data_dir, validate_name, workflows_dir
 
 
 def skill_dir(name: str, *, home=None) -> Path:
-    base = Path(home) if home is not None else Path.home()
-    return base / ".ycode" / "skills" / "zcode-workflows" / name
+    if home is not None:
+        base = Path(home) / ".ycode"
+    else:
+        base = user_data_dir()
+    return base / "skills" / "zcode-workflows" / name
 
 
 def _single_line(text: str) -> str:

@@ -1,28 +1,4 @@
 # -*- coding: utf-8 -*-
-"""PDF 编辑后端：页面级增删/旋转/移动/插空白页 + 批注/覆盖层。
-
-对外只暴露 ``apply_edits(src_path, ops, out_path) -> dict``。前端（右栏「文档」
-页签里的 PDF 编辑器）把用户操作攒成 ops 数组交给 ``gui_bridge.save_pdf_edits``，
-桥层负责路径鉴权、备份与返回封装，本模块负责真正的 PDF 加工：
-
-1. 页面级操作（delete / rotate / move / insertBlank）用 pypdf 直接改页树——
-   空白页用 ``PageObject.create_blank_page`` 自造，不依赖 reportlab 生成再读
-   回来（少一次解析、也不受 reportlab 纸张尺寸表限制）。
-2. 批注/覆盖（highlight / underline / strike / rect / arrow / ink / note /
-   stamp / redact / text）用 reportlab 生成一张与目标页同尺寸的 overlay PDF，
-   再 ``page.merge_page(overlay)`` 叠到页面内容之上——原页面内容流一个字节都
-   不动，因此能保留原有文字、图片与可复制性。
-
-坐标口径（与前端 pdf.js ``getViewport({scale:1})`` 完全一致，前端用同一份
-schema）：单位是 PDF point，原点在**页面左上角**，y 轴向下，page 为 1-based。
-reportlab 的原点在左下角，所以绘制时统一翻转 y：``rect_y = page_h - (y + h)``，
-文字基线取 ``page_h - y - fontSize``。目标页带 /Rotate（非 0）时，用户看到的
-是旋转后的坐标系，显示宽高与页面宽高互换，本模块用一次 ``canvas.transform``
-完成「显示坐标 → 页面坐标」映射，让旋转页上的批注仍落在用户看到的位置。
-
-校验全部写在本模块（而不是桥层），任何调用方都过同一道关；非法输入一律
-``raise ValueError``，由桥层收敛成 ``{"ok": False, "msg": ...}``。
-"""
 
 import io
 import logging
@@ -40,18 +16,13 @@ _LOGGER = logging.getLogger(__name__)
 
 # 单次编辑的操作条数上限：正常 UI 交互远达不到，纯防御（避免一次请求吃满内存）
 MAX_OPS = 2000
-# 单个文本字段上限（批注正文 / 文本框内容）
 MAX_TEXT_LEN = 4000
-# 单条高亮类批注的矩形数上限（跨页框选时前端会按行拆成很多矩形）
 MAX_RECTS_PER_ANNOT = 500
-# 单条手写笔迹的点数上限
 MAX_INK_POINTS = 5000
-# 单页边长上限（point）：20000pt ≈ 7 米，超出必然是脏数据
 MAX_PAGE_DIM = 20000.0
 # 颜色必须是 #rrggbb（前端取色器输出的格式）
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
-# 中文字体注册名（overlay 里的 setFont 用这个名字）
 _CJK_FONT_NAME = "PDFEditCJK"
 # Windows 自带中文字体候选：(路径, TTC 子字体索引)。全部缺失时退 Helvetica
 # 并在返回结果里带 warning，绝不让「没字体」把整次保存变成失败。
@@ -63,29 +34,20 @@ _FONT_CANDIDATES = (
 )
 _FALLBACK_FONT = "Helvetica"
 
-# kind 取值（页面操作 + 批注/覆盖）
 _PAGE_KINDS = ("page",)
 _MARK_KINDS = ("annot", "redact", "text")
 _ALL_KINDS = _PAGE_KINDS + _MARK_KINDS
 _ANNOT_TYPES = ("highlight", "underline", "strike", "rect", "arrow", "ink", "note", "stamp")
 
-# 各批注类型的默认颜色 / 默认不透明度
 _DEFAULT_HIGHLIGHT_COLOR = "#ffd400"
 _DEFAULT_MARK_COLOR = "#e5484d"
 _DEFAULT_TEXT_COLOR = "#111111"
 _DEFAULT_REDACT_FILL = "#ffffff"
 
-# 字体注册结果缓存：(字体名, warning 或 None)。中文字体只需注册一次。
 _font_state = None
 
 
-# ---------------------------------------------------------------------------
-# 通用校验小工具：全部 raise ValueError（桥层负责转成 ok=False）
-# ---------------------------------------------------------------------------
-
-
 def _require_number(value, field: str) -> float:
-    """把字段收敛成有限浮点数；bool 不算数字（JSON 里 true/false 常被误传）。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} 必须是数字")
     number = float(value)
@@ -95,7 +57,6 @@ def _require_number(value, field: str) -> float:
 
 
 def _require_int(value, field: str) -> int:
-    """整数校验；允许 3.0 这类整值浮点（前端 JSON 序列化不区分）。"""
     if isinstance(value, bool):
         raise ValueError(f"{field} 必须是整数")
     if isinstance(value, int):
@@ -115,7 +76,6 @@ def _require_color(value, field: str, default: str) -> str:
 
 
 def _require_opacity(value, default: float) -> float:
-    """不透明度校验：0..1；缺省时用 default。"""
     if value is None:
         return default
     opacity = _require_number(value, "opacity")
@@ -125,11 +85,6 @@ def _require_opacity(value, default: float) -> float:
 
 
 def _stroke_width(op, default: float) -> float:
-    """批注描边宽度：op["width"] 优先（0.1..50），缺省用 default。
-
-    前端所有绘图类批注都会带 width（默认 1.5）；早先前端下发了而后端忽略，
-    导致「粗细」写了不生效。这里统一读取，并保留按矩形高度自适应出来的默认值。
-    """
     raw = op.get("width")
     if raw is None:
         return default
@@ -154,14 +109,12 @@ def _require_rect(value, field: str):
 
 
 def _require_point(value, field: str):
-    """点校验，返回 (x, y)。"""
     if not isinstance(value, dict):
         raise ValueError(f"{field} 必须是对象")
     return _require_number(value.get("x"), f"{field}.x"), _require_number(value.get("y"), f"{field}.y")
 
 
 def _require_text(op, field: str = "text") -> str:
-    """文本内容校验：非空且不超长。"""
     value = op.get(field)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} 必须是非空字符串")
@@ -171,7 +124,6 @@ def _require_text(op, field: str = "text") -> str:
 
 
 def _require_font_size(op, default: float) -> float:
-    """字号校验：1..300；缺省时用 default。"""
     raw = op.get("fontSize")
     if raw is None:
         return default
@@ -182,24 +134,13 @@ def _require_font_size(op, default: float) -> float:
 
 
 def _require_page_no(value, page_count: int, label: str) -> int:
-    """页码校验（1-based），返回 1-based 页码。"""
     page_no = _require_int(value, f"{label}的 page")
     if page_no < 1 or page_no > page_count:
         raise ValueError(f"{label}的页码超出范围：{page_no}（共 {page_count} 页）")
     return page_no
 
 
-# ---------------------------------------------------------------------------
-# 中文字体
-# ---------------------------------------------------------------------------
-
-
 def _ensure_cjk_font():
-    """注册中文字体，返回 (字体名, warning 或 None)。
-
-    缺字体的降级必须是「能保存但中文变方块」，不能抛异常——用户改的页面结构、
-    白块遮盖等操作不该因为一台机器没装微软雅黑就全部失败。
-    """
     global _font_state
     if _font_state is not None:
         return _font_state
@@ -228,19 +169,12 @@ def _reset_font_cache_for_tests():
     _font_state = None
 
 
-# ---------------------------------------------------------------------------
-# 页面操作（pypdf）
-# ---------------------------------------------------------------------------
-
-
 def _page_mediabox_size(page):
-    """取页面 MediaBox 的 (width, height, left, bottom)。"""
     media = page.mediabox
     return float(media.width), float(media.height), float(media.left), float(media.bottom)
 
 
 def _page_rotation(page) -> int:
-    """/Rotate 归一化到 0/90/180/270（异常值按 0 处理，避免坐标映射乱套）。"""
     try:
         rotation = int(page.rotation or 0) % 360
     except Exception:
@@ -249,7 +183,6 @@ def _page_rotation(page) -> int:
 
 
 def _apply_page_ops(pages, page_ops):
-    """按列表顺序应用页面操作，返回最终页序；标题提到的 page 都是「当前页序」的 1-based。"""
     pages = list(pages)
     for index, op in enumerate(page_ops):
         action = op.get("op")
@@ -263,8 +196,6 @@ def _apply_page_ops(pages, page_ops):
         elif action == "rotate":
             page_no = _require_page_no(op.get("page"), page_count, label)
             degrees = _require_int(op.get("degrees"), f"{label}的 degrees")
-            # 契约只接受 90/180/270：0 是「不旋转」（前端不该下发），其它角度
-            # 会让坐标映射与显示对不上，一律拒绝而不是静默取整。
             if degrees not in (90, 180, 270):
                 raise ValueError(f"旋转角度只支持 90/180/270：{degrees}")
             pages[page_no - 1].rotate(degrees)
@@ -285,7 +216,6 @@ def _apply_page_ops(pages, page_ops):
 
 
 def _blank_page_size(op, pages, after: int, label: str):
-    """新空白页尺寸：优先用 ops 给的 width/height，缺失时参照相邻页尺寸。"""
     width = op.get("width")
     height = op.get("height")
     if width is None or height is None:
@@ -304,22 +234,7 @@ def _blank_page_size(op, pages, after: int, label: str):
     return width, height
 
 
-# ---------------------------------------------------------------------------
-# overlay 绘制（reportlab）
-# ---------------------------------------------------------------------------
-
-
 def _apply_display_transform(c, rotation: int, page_w: float, page_h: float, left: float, bottom: float) -> None:
-    """把 canvas 坐标系换成「显示坐标」：x 向右、y 向上、原点在显示区左下角。
-
-    推导（页面宽高 W×H，显示宽高对 90/270 互换）：
-        0   : px = x,             py = y
-        90  : px = W - y,         py = x
-        180 : px = W - x,         py = y
-        270 : px = W - y,         py = H - x
-    reportlab 的 transform(a, b, c, d, e, f) 语义是 px = a·x + c·y + e，
-    py = b·x + d·y + f（与 PDF 的 cm 一致）。
-    """
     if rotation == 90:
         c.transform(0, 1, -1, 0, page_w + left, bottom)
     elif rotation == 180:
@@ -327,24 +242,20 @@ def _apply_display_transform(c, rotation: int, page_w: float, page_h: float, lef
     elif rotation == 270:
         c.transform(0, -1, -1, 0, page_w + left, page_h + bottom)
     else:
-        # 无旋转时只需补上 MediaBox 原点偏移（少数 PDF 的 MediaBox 不从 0,0 开始）
         c.translate(left, bottom)
 
 
 def _flip_rect(rect, display_h: float):
-    """把「左上角原点 y 向下」的矩形翻成 reportlab 的左下角原点坐标。"""
     x, y, w, h = rect
     return x, display_h - (y + h), w, h
 
 
 def _flip_point(point, display_h: float):
-    """把「左上角原点 y 向下」的点翻成 reportlab 坐标。"""
     x, y = point
     return x, display_h - y
 
 
 def _wrap_paragraph(paragraph: str, font_name: str, font_size: float, max_width: float):
-    """按可用宽度做逐字贪心换行；拉丁文优先在最后一个空格处断开，避免单词被切碎。"""
     if not paragraph:
         return [""]
     lines = []
@@ -366,7 +277,6 @@ def _wrap_paragraph(paragraph: str, font_name: str, font_size: float, max_width:
 
 
 def _layout_lines(text: str, font_name: str, font_size: float, max_width: float):
-    """整段文本换行：保留显式换行，逐段按宽度折行。"""
     lines = []
     for paragraph in str(text).split("\n"):
         lines.extend(_wrap_paragraph(paragraph, font_name, font_size, max_width))
@@ -374,10 +284,6 @@ def _layout_lines(text: str, font_name: str, font_size: float, max_width: float)
 
 
 def _draw_lines(c, lines, font_name, font_size, color, x, top_y, max_lines, centered: bool = False, box_width: float = 0.0):
-    """自上而下绘制已折好的文本行，返回实际绘制的行数。
-
-    top_y 是首行框顶（reportlab 坐标，y 向上）；基线按契约取 top_y - fontSize。
-    """
     line_height = font_size * 1.3
     c.saveState()
     c.setFillColor(HexColor(color))
@@ -398,7 +304,6 @@ def _draw_lines(c, lines, font_name, font_size, color, x, top_y, max_lines, cent
 
 
 def _draw_text_block(c, op, rect, font_name, font_size, color, display_h, warnings) -> bool:
-    """在矩形内绘制自动换行文本；超出高度的行丢弃并计入 warning。"""
     x, y, w, h = _flip_rect(rect, display_h)
     padding = 2.0
     max_width = max(w - 2 * padding, 1.0)
@@ -416,7 +321,6 @@ def _draw_text_block(c, op, rect, font_name, font_size, color, display_h, warnin
 
 
 def _draw_op(c, op, display_w: float, display_h: float, font_name: str, warnings) -> bool:
-    """绘制单条批注/覆盖操作，返回是否真的画了东西（没画就不用叠加 overlay）。"""
     kind = op.get("kind")
     if kind == "redact":
         fill = _require_color(op.get("fill"), "fill", _DEFAULT_REDACT_FILL)
@@ -563,10 +467,8 @@ def _draw_op(c, op, display_w: float, display_h: float, font_name: str, warnings
         if dropped:
             warnings.append(f"{'批注' if annot_type == 'note' else '图章'}文字超出框体，已丢弃 {dropped} 行")
         visible = lines[:max_lines]
-        # 浅色批注色（如便签默认的黄色）直接当文字色会看不清，改用深灰
         text_color = color if _is_dark(color) else _DEFAULT_TEXT_COLOR
         if annot_type == "stamp":
-            # 图章文字垂直居中：整块高度对齐框中心
             block_h = len(visible) * line_height
             top_y = y + (h + block_h) / 2.0 - (line_height - font_size)
             _draw_lines(
@@ -581,18 +483,15 @@ def _draw_op(c, op, display_w: float, display_h: float, font_name: str, warnings
 
 
 def _hex_rgb(color: str):
-    """#rrggbb → (r, g, b) 浮点三元组（reportlab 需要 0..1）。"""
     return tuple(int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
 
 
 def _is_dark(color: str) -> bool:
-    """颜色是否偏深（深色图章文字沿用批注色，浅色改用深灰保证可读）。"""
     red, green, blue = _hex_rgb(color)
     return (0.299 * red + 0.587 * green + 0.114 * blue) < 0.55
 
 
 def _build_overlay(page, ops, font_name: str, warnings):
-    """为单页生成 overlay PDF 字节；这页没有任何可绘制内容时返回 None。"""
     page_w, page_h, left, bottom = _page_mediabox_size(page)
     rotation = _page_rotation(page)
     display_w, display_h = (page_h, page_w) if rotation in (90, 270) else (page_w, page_h)
@@ -613,7 +512,6 @@ def _build_overlay(page, ops, font_name: str, warnings):
 
 
 def _apply_mark_ops(writer, mark_ops, font_name: str, warnings) -> None:
-    """把批注/覆盖操作按页分组，逐页生成 overlay 并叠加到页面内容之上。"""
     if not mark_ops:
         return
     page_count = len(writer.pages)
@@ -632,16 +530,10 @@ def _apply_mark_ops(writer, mark_ops, font_name: str, warnings) -> None:
 
 
 def _op_label(op) -> str:
-    """操作的中文名（只用于错误信息，帮助前端定位是哪一条操作非法）。"""
     kind = op.get("kind")
     if kind == "annot":
         return f"批注（{op.get('type')}）"
     return {"redact": "遮盖", "text": "文本"}.get(kind, "操作")
-
-
-# ---------------------------------------------------------------------------
-# 对外入口
-# ---------------------------------------------------------------------------
 
 
 def _atomic_write(writer, out_path: str) -> None:
@@ -665,18 +557,6 @@ def _atomic_write(writer, out_path: str) -> None:
 
 
 def apply_edits(src_path: str, ops, out_path: str) -> dict:
-    """把前端下发的 ops 应用到一个 PDF 上，结果写到 out_path。
-
-    参数:
-        src_path: 源 PDF 路径（只读；覆盖保存由桥层先备份再让 out_path == src_path）
-        ops: 操作数组，schema 见模块文档（页面操作先按顺序全部应用，批注再作用于
-             应用后的最终页序）
-        out_path: 输出 PDF 路径（父目录必须已存在）
-    返回:
-        {"path": 输出绝对路径, "pages": 页数, "warnings": [...], 有 warning 时另带 "warning"}
-    异常:
-        ValueError: 任何非法输入（ops 非法、页码越界、颜色/不透明度非法、源文件损坏等）
-    """
     if not isinstance(src_path, str) or not src_path:
         raise ValueError("源文件路径不能为空")
     if not os.path.isfile(src_path):

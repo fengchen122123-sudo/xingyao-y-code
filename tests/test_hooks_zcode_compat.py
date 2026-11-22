@@ -1,13 +1,3 @@
-"""ZCode 导入设计 §2.5 的执行器/输出契约增强测试。
-
-- 退出码契约：0 放行（解析 stdout）、2 = 主动阻断（stderr 末行作 reason）、
-  其他非 0 = failed；
-- stdout camelCase 别名（stopReason/additionalContext/permissionDecision）；
-- 模板变量：命令展开（纯函数）+ 环境变量注入（真实子进程）。
-
-沿用 test_hooks_executor.py 的真实子进程风格（python 解释器 + tmp 脚本）。
-"""
-
 from __future__ import annotations
 
 import sys
@@ -61,7 +51,6 @@ def test_exit_code_2_blocks_with_stderr_tail_as_reason(tmp_path):
         "sys.exit(2)\n",
     )
     outcome = run_hook(_registration(command), _hook_input())
-    # 2 = 主动阻断，不是失败：status ok + decision=block，走既有合并语义
     assert outcome.status == "ok"
     assert outcome.exit_code == 2
     assert outcome.output is not None
@@ -122,7 +111,6 @@ def test_template_variables_expanded_in_command():
     expanded = expand_template_variables(command, _hook_input())
     assert "run-check --project " + str(Path.cwd()) in expanded
     assert "--session sess-42" in expanded
-    # 三组拼写等价（YCODE/ZCODE/CLAUDE）
     assert expand_template_variables("${YCODE_PROJECT_DIR}", _hook_input()) == str(Path.cwd())
     assert expand_template_variables("${CLAUDE_PROJECT_DIR}", _hook_input()) == str(Path.cwd())
 
@@ -172,11 +160,10 @@ def test_build_hook_env_does_not_inject_empty_values():
         )
     )
     assert env["ZCODE_PROJECT_DIR"] == "/some/dir"
-    assert "CLAUDE_SESSION_ID" not in env  # 空 session 不注入（不清空继承值）
+    assert "CLAUDE_SESSION_ID" not in env
 
 
 def test_post_tool_use_stdin_includes_tool_response_superset(tmp_path):
-    """导入的 ZCode hook 读 tool_response；星瑶 stdin 同值双写（超集）。"""
     command = _script(
         tmp_path,
         "hook_stdin.py",

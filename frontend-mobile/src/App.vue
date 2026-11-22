@@ -9,7 +9,6 @@ const route = useRoute();
 const activeTab = computed(() => String(route.meta.tab || 'convo'));
 const showTabbar = computed(() => !!route.meta.tab);
 
-// tabbar 永远可见：有 tabbar 的页面弹层底部让出 tabbar 高度（详见 style.css）
 watch(showTabbar, (v) => document.documentElement.classList.toggle('has-tabbar', v), { immediate: true });
 
 // 新审批到达时全局轻提示（首次快照不算，避免每次进入都弹）
@@ -21,7 +20,6 @@ watch(() => store.permRequests.length, (n) => {
 
 onMounted(() => {
   store.init().catch(() => {
-    // init 失败时保持骨架页可交互：离线横幅提示重试
     store.ready = true;
   });
 });
@@ -33,12 +31,11 @@ function reloadPage() {
 async function retry() {
   try {
     await store.reloadInitialState();
-  } catch { /* 心跳持续重试 */ }
+  } catch { }
 }
 </script>
 
 <template>
-  <!-- 线性图标 sprite：与桌面 AppIcon 同风格（stroke 1.6 / 无填充 / currentColor） -->
   <svg style="display:none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v8a2.5 2.5 0 0 1-2.5 2.5H9l-4.2 3.4c-.4.3-.8 0-.8-.4V6.5z"/></symbol>
     <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3.5 21 19H3l9-15.5z"/><path d="M12 10v4.2"/><path d="M12 16.8v.2"/></symbol>
@@ -74,7 +71,6 @@ async function retry() {
   </svg>
 
   <div class="app-root">
-    <!-- 离线横幅：shim 无主动断线回调，由心跳探测驱动 -->
     <div v-if="!store.connected" class="conn-banner" @click="retry">
       <span class="conn-dot" />
       <span>与电脑连接中断，正在重连…（点按立即重试）</span>
@@ -142,7 +138,6 @@ async function retry() {
   flex: none;
 }
 
-/* 配对失效全屏遮罩：盖住 tabbar 与所有弹层，硬停止 */
 .pair-mask {
   position: fixed;
   inset: 0;

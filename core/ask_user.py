@@ -1,16 +1,11 @@
-"""Interactive user question adapter backed by the existing CLI prompt."""
-
 from __future__ import annotations
 
 import json
 import threading
-# Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
-# 只 except TimeoutError 会漏接，导致轮询循环直接崩溃
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 
 from core.permission_broker import CANCELLED_RESULT, permission_broker
 
-# 等待用户选择时的轮询间隔（秒），用于及时响应取消信号
 _POLL_INTERVAL_SECONDS = 0.1
 
 
@@ -57,11 +52,26 @@ def ask_user(
     except ValueError as error:
         return str(error)
 
-    # 统一走 permission_broker：CLI 由 prompt_toolkit 提示回答，
-    # GUI 由前端弹窗经 respond_permission 回答，headless 由入口层自动拒绝。
-    # 不再检查具体 UI 实例，避免 core 层反向依赖 main。
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_payload(question, CANCELLED_RESULT)
+
+    from core import app_context
+
+    if app_context.get_permission_mode() == "auto_decision":
+        from core.permission_auto_decision import decide_ask_user_with_jev
+
+        picked_index = decide_ask_user_with_jev(question, choices, source=source)
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_payload(question, CANCELLED_RESULT)
+        if picked_index is not None and 0 <= picked_index < len(choices):
+            return json.dumps({
+                "question": question,
+                "selected_index": picked_index,
+                "selected": choices[picked_index],
+                "decided_by": "jev",
+            }, ensure_ascii=False)
+
     if not permission_broker.has_prompt_handlers():
-        # 没有任何入口层注册应答通道，入队只会永久等待
         return "无法提问：当前终端没有活动的交互界面。"
 
     # owner/turn_id 统一来源：优先显式传入，turn 兜底 owner，线程名最后兜底
@@ -88,8 +98,6 @@ def ask_user(
             try:
                 result = request.future.result(timeout=_POLL_INTERVAL_SECONDS)
                 if isinstance(result, str):
-                    # 自由文本回答（GUI 第四项输入框 / CLI 直接输入）：
-                    # 原样透传给模型，不与选项索引混用
                     if result.strip():
                         custom_answer = result.strip()
                     break
@@ -113,7 +121,6 @@ def ask_user(
             "custom": True,
         }, ensure_ascii=False)
     if selected_index < 0 or selected_index >= len(choices):
-        # 取消或越界索引统一按取消处理，不再返回 selected: null 的伪成功
         return _cancelled_payload(question, selected_index)
     return json.dumps({
         "question": question,

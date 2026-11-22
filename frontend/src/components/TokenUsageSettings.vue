@@ -14,7 +14,6 @@
     </div>
 
     <template v-else>
-      <!-- 累计摘要条：数据来自累计（全量）lifetime 快照，无数据时占位 -- -->
       <section class="summary-strip" data-test="token-summary-strip" aria-label="累计用量概览">
         <div v-for="item in lifetimeItems" :key="item.label" class="summary-strip-item" data-test="token-summary-item">
           <div class="summary-strip-value">{{ item.value }}</div>
@@ -22,7 +21,6 @@
         </div>
       </section>
 
-      <!-- 热力图卡片 -->
       <section v-if="heatmap" class="usage-section heatmap-card" aria-label="Token 活动热力图">
         <div class="section-heading">
           <h2>Token 活动<span class="heatmap-hint">点格子看当天明细</span></h2>
@@ -68,7 +66,6 @@
         </div>
       </section>
 
-      <!-- 点热力图格子后就地展开的明细：折线排行 + 占比环图 -->
       <TokenUsageDayDetail
         v-if="selectionDetail"
         :detail="selectionDetail"
@@ -76,7 +73,6 @@
         @close="clearSelection"
       />
 
-      <!-- 范围切换 -->
       <div class="range-row">
         <div class="range-row-title">Token 用量</div>
         <div class="pill-tabs" role="group" aria-label="统计时间范围">
@@ -91,7 +87,6 @@
         </div>
       </div>
 
-      <!-- 每日模型用量趋势 -->
       <section class="usage-section" aria-label="每日模型用量">
         <div class="section-heading">
           <h2>每日模型用量</h2>
@@ -159,7 +154,6 @@
         <div v-else class="chart-empty">暂无用量数据</div>
       </section>
 
-      <!-- 模型用量环图 -->
       <section class="usage-section" aria-label="模型用量">
         <div class="section-heading">
           <h2>模型用量</h2>
@@ -244,7 +238,6 @@ const TREND_PLOT_WIDTH = TREND_WIDTH - TREND_PAD_LEFT * 2;
 const TREND_PLOT_HEIGHT = TREND_HEIGHT - TREND_PAD_TOP - TREND_PAD_BOTTOM;
 const DONUT_RADIUS = 48;
 const DONUT_CIRCUMFERENCE = 2 * Math.PI * DONUT_RADIUS;
-// 4 条水平虚线：0、1/3、2/3、1 处的绘图区高度。
 const trendGridLines = [0, 1, 2, 3].map(step => TREND_PAD_TOP + (step / 3) * TREND_PLOT_HEIGHT);
 
 const ranges = [
@@ -259,13 +252,11 @@ const heatmapModes: { value: HeatmapMode; label: string }[] = [
 ];
 const heatmapMode = ref<HeatmapMode>('daily');
 
-// 选中的热力图格子：daily 模式落到具体一天，weekly / cumulative 模式整列（自然周）为一格。
 const selection = ref<{ columnKey: string; date: string | null } | null>(null);
 
 // 模式切换后列 key 前缀已变，清掉旧选中态，避免留下对不上列的无主明细。
 watch(heatmapMode, () => { selection.value = null; });
 
-// 摘要条：lifetime 快照缺省时统一显示 --。
 const lifetimeItems = computed(() => {
   const snapshot = store.tokenStatisticsLifetime;
   const summary = snapshot ? buildLifetimeSummary(snapshot.days) : null;
@@ -284,7 +275,6 @@ const lifetimeItems = computed(() => {
   ];
 });
 
-// 热力图只在 lifetime 有真实用量时渲染，窗口固定 52 列。
 const heatmap = computed(() => {
   const snapshot = store.tokenStatisticsLifetime;
   if (!snapshot || snapshot.summary.total <= 0) return null;
@@ -304,7 +294,6 @@ const trend = computed(() => {
   const snapshot = statistics.value;
   const days = snapshot?.days ?? [];
   const chart = buildTrendChart(days, snapshot?.models ?? []);
-  // 折线点对齐到逐日命中带中心，让 hover 区域与曲线位置一致。
   const pathWidth = Math.max(0, TREND_PLOT_WIDTH - trendBandWidth.value);
   const series = chart.series.map(item => ({
     ...item,
@@ -344,8 +333,6 @@ const donutRows = computed(() => {
   });
 });
 
-// 点选明细：日期集合取自选中的格子（单日一格 / 整列 7 天），明细数据来自累计（全量）快照，
-// 热力图窗口本身也是 52 周，所以点击不会触达快照范围外。
 const selectionDetail = computed(() => {
   const current = selection.value;
   if (!current) return null;
@@ -386,7 +373,6 @@ function showAxisLabel(index: number) {
   return total <= 14 || index % 5 === 0;
 }
 
-// 趋势列 title 用「9月22日」这种不含年份的中文短日期。
 function dayLabel(date: string) {
   return formatDayFull(date).replace(/^\d{4}年/, '');
 }
@@ -407,7 +393,6 @@ async function refreshAll() {
 }
 
 onMounted(() => {
-  // 旧版入口可能留下「今日」（1）或「累计」（0）范围；新版没有这两个 tab，进入时回落到近 7 天。
   const days = store.tokenStatisticsDays === 1 || store.tokenStatisticsDays === 0
     ? 7
     : store.tokenStatisticsDays;
@@ -426,7 +411,6 @@ onMounted(() => {
 .usage-header h1 { margin: 0 0 9px; font-size: 32px; letter-spacing: -1px; }
 .usage-header p, .chart-empty { margin: 0; color: var(--text-faint); font-size: 12px; }
 
-/* 累计摘要条：5 格等宽，格间 1px 竖线 */
 .summary-strip { display: flex; align-items: stretch; overflow: hidden; margin-bottom: 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg1); }
 .summary-strip-item { flex: 1 1 0; min-width: 0; padding: 12px 10px; text-align: center; }
 .summary-strip-item + .summary-strip-item { border-left: 1px solid var(--border); }
@@ -437,15 +421,12 @@ onMounted(() => {
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .section-heading h2 { margin: 0; font-size: 14px; }
 
-/* 胶囊 tabs（热力图模式 / 统计范围） */
 .pill-tabs { display: flex; align-items: center; flex: 0 0 auto; padding: 3px; border-radius: 999px; background: var(--bg2); }
 .pill-tabs button { padding: 4px 10px; border: 0; border-radius: 999px; color: var(--text-dim); background: transparent; font-size: 11.5px; font-weight: 500; cursor: pointer; }
 .pill-tabs button.active { color: var(--text); background: var(--bg3); }
 
-/* 热力图：52 列 × 7 格 */
 .heatmap-grid { display: grid; grid-template-columns: repeat(52, minmax(0, 1fr)); column-gap: 3px; margin-top: 14px; }
 .heatmap-col { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-/* 格子按 button 渲染（键盘可达），清掉默认外观后按原尺寸绘制 */
 .heatmap-cell { width: 100%; min-width: 0; aspect-ratio: 1; padding: 0; border: 1px solid transparent; border-radius: 3px; background: none; appearance: none; cursor: pointer; transition: transform .15s ease; }
 .heatmap-cell.is-selected { box-shadow: 0 0 0 2px var(--accent); transform: scale(1.15); }
 .heatmap-cell.has-usage { border-color: var(--border); }
@@ -459,11 +440,9 @@ onMounted(() => {
 .heatmap-months { margin-top: 10px; }
 .heatmap-month { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-faint); font-size: 10px; }
 
-/* 范围行 */
 .range-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 22px; }
 .range-row-title { font-size: 13px; font-weight: 600; }
 
-/* 趋势图 */
 .trend-legend { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; }
 .trend-legend-item { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-dim); font-size: 11px; }
 .trend-legend-item i { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 3px; }
@@ -471,7 +450,6 @@ onMounted(() => {
 .trend-grid-line { stroke: var(--border); stroke-width: 1; }
 .trend-axis-label { fill: var(--text-faint); font-size: 10px; font-family: var(--mono); }
 
-/* 环图 + 模型列表 */
 .donut-grid { display: grid; grid-template-columns: minmax(0, 240px) minmax(0, 1fr); gap: 22px; align-items: center; margin-top: 14px; }
 .donut-wrap { position: relative; width: 190px; margin: 0 auto; }
 .donut-svg { display: block; width: 100%; height: auto; }
@@ -486,10 +464,8 @@ onMounted(() => {
 .model-share { color: var(--text-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .model-meta { grid-column: 2 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-faint); font-size: 10.5px; }
 
-/* 空态沿用虚线框 */
 .chart-empty { margin-top: 14px; padding: 34px 16px; border: 1px dashed var(--border); border-radius: 12px; text-align: center; color: var(--text-faint); font-size: 12px; }
 
-/* 底部刷新 */
 .usage-footer { display: flex; justify-content: flex-end; margin-top: 18px; }
 .refresh-button { display: inline-flex; align-items: center; gap: 5px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 9px; color: var(--text-dim); background: var(--bg1); font-size: 12px; cursor: pointer; }
 .refresh-button:hover { color: var(--text); }
@@ -497,7 +473,6 @@ onMounted(() => {
 .spinning { display: inline-block; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* 首屏加载 */
 .usage-loading { min-height: 320px; display: grid; place-content: center; justify-items: center; gap: 14px; color: var(--text-faint); font-size: 12px; }
 .loading-orbit { width: 34px; height: 34px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 

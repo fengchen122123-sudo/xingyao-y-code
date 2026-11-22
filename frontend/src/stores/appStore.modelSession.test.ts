@@ -2,9 +2,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { useAppStore } from './appStore';
 
-// 模型与会话的绑定关系：每个会话（含尚未落库的 pending 草稿）都有自己
-// 独立的模型选择，互不影响；切换会话时即时恢复该会话上次使用的模型。
-
 function reasoningSnapshot(choice = 'default') {
   return {
     kind: 'effort' as const,
@@ -85,7 +82,7 @@ it('pending 新会话切换模型写入 pending runtime，不回写其它会话'
   expect(store.reasoning.choice).toBe('medium');
 });
 
-it('已有真实对话的会话切换模型仍显示切换提示', async () => {
+it('已有真实对话的会话切换模型也静默更新，不向消息流插入提示条', async () => {
   const store = useAppStore();
   store.currentSessionName = 'session-a';
   store.messages = [
@@ -96,21 +93,18 @@ it('已有真实对话的会话切换模型仍显示切换提示', async () => {
 
   await store.setModel('m-kimi');
 
-  const last = store.messages[store.messages.length - 1];
-  expect(last.role).toBe('notice');
-  expect(String(last.content)).toContain('已切换活动模型');
+  expect(store.activeModelId).toBe('m-kimi');
+  expect(store.messages).toHaveLength(2);
 });
 
 it('模型选择随会话 runtime 保存与恢复，切会话立即生效（不等后端响应）', async () => {
   const store = useAppStore();
-  // 会话 A 绑定 deepseek
   store.currentSessionName = 'session-a';
   store.activeModelId = 'm-deepseek';
   store.activeModelName = '模型-m-deepseek';
   await store.setModel('m-deepseek-2');
   expect(store.activeModelId).toBe('m-deepseek-2');
 
-  // 手动捕获并切换到会话 B（B 从未选过模型 → 保持全局默认）
   store._captureRuntime('session-a');
   store.activeModelId = 'm-global';
   store.activeModelName = '模型-m-global';
@@ -118,17 +112,14 @@ it('模型选择随会话 runtime 保存与恢复，切会话立即生效（不�
   store._bindSessionRuntime('session-b');
   expect(store.activeModelId).toBe('m-global');
 
-  // 在 B 换成 kimi 并捕获
   await store.setModel('m-kimi');
   store._captureRuntime('session-b');
 
-  // 切回 A：立即恢复 deepseek-2，不受 B 影响
   store.currentSessionName = 'session-a';
   store._bindSessionRuntime('session-a');
   expect(store.activeModelId).toBe('m-deepseek-2');
   expect(store.activeModelName).toBe('模型-m-deepseek-2');
 
-  // 再切回 B：恢复 kimi
   store.currentSessionName = 'session-b';
   store._bindSessionRuntime('session-b');
   expect(store.activeModelId).toBe('m-kimi');
@@ -332,7 +323,6 @@ it('同一模型的旧异常不能把最新成功状态标记为断线', async (
 
 it('会话模型被删除后回落到后端配置模型', async () => {
   const store = useAppStore();
-  // A 绑定的模型（runtime 中的 m-gone）已在模型管理里被删除
   store.sessionRuntimeByName['session-a'] = {
     messages: [],
     streamingText: '',

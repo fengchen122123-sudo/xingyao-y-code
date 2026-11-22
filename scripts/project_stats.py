@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""项目 Python 代码统计脚本。
-
-递归统计 .py 文件指标并输出 JSON 报告：
-- total_py_files: .py 文件总数（跳过 venv / node_modules / .git / dist / build / mytemp）
-- total_code_lines: 非空、非纯注释（strip 后以 # 开头）的代码行总数
-- test_files: 文件名以 test_ 开头的 .py 文件数量
-
-用法：
-    venv\\Scripts\\python.exe scripts\\project_stats.py
-"""
 
 import json
 import sys
@@ -18,7 +8,6 @@ EXCLUDED_DIRS = {"venv", "node_modules", ".git", "dist", "build", "mytemp"}
 
 
 def _count_code_lines(path: Path) -> int:
-    """统计单个文件的代码行数：strip 后为空或以 # 开头的行不计。"""
     count = 0
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:

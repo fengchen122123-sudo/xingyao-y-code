@@ -1,16 +1,3 @@
-"""输入框上下文用量面板：上下文来源字符占比快照（纯旁路统计）。
-
-设计规格：`待开发/输入框上下文用量面板/设计规格.md` §3.3/§3.4。
-
-口径为**字符数估算**，仅用于 GUI 悬停面板展示来源占比，不进 token 账本。
-所有函数遵循旁路原则：内部 try/except 吞掉一切异常、非法输入静默过滤，
-统计绝不打扰对话主流程；快照写入与读取均持锁，GUI/后台线程并发安全。
-
-来源白名单与 `get_breakdown` 的稳定输出顺序一致（2026-09-23 对齐 ZCode：工具拆分）：
-messages（消息）/ system_prompt（系统提示词）/ skills（技能目录）/
-runtime_context（其他）/ system_tools（系统工具）/ mcp_tools（MCP 工具）。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -18,7 +5,6 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-#: 允许的来源；元组顺序即 get_breakdown 的稳定输出顺序（前端按此顺序渲染）
 VALID_SOURCES: tuple[str, ...] = (
     "messages",
     "system_prompt",
@@ -33,7 +19,6 @@ _breakdown: dict[str, int] = {}
 
 
 def _normalize_item(item) -> tuple[str, int] | None:
-    """把单项规范化为 (source, chars)；任何非法项返回 None（过滤）。"""
     if not isinstance(item, dict):
         return None
     source = item.get("source")
@@ -74,7 +59,6 @@ def set_breakdown(items: list[dict]) -> None:
 
 
 def update_source(source: str, chars: int) -> None:
-    """更新/追加单个来源的字符数；非法 source/chars 静默忽略。"""
     try:
         pair = _normalize_item({"source": source, "chars": chars})
         if pair is None:

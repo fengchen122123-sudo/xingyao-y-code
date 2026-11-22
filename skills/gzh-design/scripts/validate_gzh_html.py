@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-"""微信公众号 HTML 合规校验器。
-
-把 SKILL.md 里"必须遵守的平台限制"从模型自觉变成确定性兜底。
-排版生成后必跑：检查禁用标签/属性/样式，并核查文字节点是否用
-<span leaf=""> 包裹（公众号编辑器粘贴后保持样式的关键）。
-
-用法:
-    validate_gzh_html.py <file.html>
-    validate_gzh_html.py --stdin < file.html
-
-退出码: 1 = 有 ERROR（会被公众号过滤或粘贴后样式丢失）; 0 = 通过。
-"""
 
 import argparse
 import re
 import sys
 from html.parser import HTMLParser
 
-# (正则, 级别, 说明) —— ERROR 会被公众号编辑器过滤掉或导致样式失效
 FORBIDDEN = [
     (re.compile(r"<style[\s>]", re.I), "ERROR", "<style> 标签会被过滤，样式必须内联"),
     (re.compile(r"<script[\s>]", re.I), "ERROR", "<script> 标签会被过滤"),
@@ -38,11 +25,10 @@ FORBIDDEN = [
 ]
 
 CJK = re.compile(r"[一-鿿㐀-䶿]")
-SKIP_TAGS = {"head", "title", "style", "script"}  # 不参与公众号正文粘贴的区域
+SKIP_TAGS = {"head", "title", "style", "script"}
 # 中文字后紧跟半角逗号/分号/叹号/问号（应改全角）；只查"中文在前"避免中英混排误伤
 HALF_PUNCT = re.compile(r"[一-鿿㐀-䶿][,;!?]")
 ASCII_QUOTE = re.compile(r"[\"']")
-# 代码区特征：等宽字体或 white-space:pre —— 其内半角符号是正常的
 CODE_STYLE = re.compile(r"monospace|white-space\s*:\s*pre|courier|consolas|sf mono", re.I)
 
 
@@ -51,12 +37,12 @@ class LeafChecker(HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.stack = []           # [(tag, is_leaf, is_code)]
-        self.leaf_depth = 0       # 处于 span[leaf] 内的嵌套计数
-        self.code_depth = 0       # 处于代码区（等宽/pre）内的嵌套计数
-        self.span_leaf_count = 0  # 全文 span leaf 总数
-        self.unwrapped = []       # (文本片段, 父标签) —— 未被 leaf 包裹的中文文本
-        self.half_punct = []      # 正文里疑似半角标点的片段
+        self.stack = []
+        self.leaf_depth = 0
+        self.code_depth = 0
+        self.span_leaf_count = 0
+        self.unwrapped = []
+        self.half_punct = []
 
     def handle_starttag(self, tag, attrs):
         ad = dict(attrs)
@@ -85,7 +71,7 @@ class LeafChecker(HTMLParser):
         if not text or not CJK.search(text):
             return
         if any(t in SKIP_TAGS for t, _, _ in self.stack):
-            return  # <head>/<title>/<style>/<script> 内文字不进公众号正文
+            return
         if self.leaf_depth == 0:
             parent = self.stack[-1][0] if self.stack else "(root)"
             snippet = text[:24] + ("…" if len(text) > 24 else "")
@@ -108,7 +94,7 @@ def validate(html, name="<input>"):
     checker = LeafChecker()
     try:
         checker.feed(html)
-    except Exception as e:  # 容错：解析失败不致命，只提示
+    except Exception as e:
         warnings.append(f"HTML 解析中断: {e}")
 
     has_cjk = bool(CJK.search(html))

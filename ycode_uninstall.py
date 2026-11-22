@@ -1,32 +1,10 @@
-"""
-ycode_uninstall.py
-Y-code 官方 Windows 卸载向导（经典 Windows 安装程序样式 GUI，与安装向导一致）。
-
-会清理完整版 (GUI + 可选 CLI) 或独立 CLI 安装留下的全部痕迹：
-  - 桌面快捷方式 (星瑶code.lnk / 旧命名 Y-code.lnk / Y-code CLI.lnk / 旧版 Y-code TUI.lnk，都尝试删除)
-  - HKCU\\Environment\\PATH（user 范围）或系统 PATH（machine 范围）里的安装目录
-  - HKCU/HKLM\\...\\Uninstall 下的注册表项 (Y-code / Y-code-CLI / 旧版 Y-code-TUI)
-  - 可选：~/.ycode 用户配置与会话记录
-  - 安装目录本身 (Y-code.exe / ycode.exe / _internal/ / cli/ 及旧版 tui/ 子目录)
-
-安装范围 (scope) 与安装向导一侧的约定一致：
-  user    → 当前用户安装：HKCU 卸载项 / 用户 PATH / 个人桌面快捷方式
-  machine → 所有用户安装：HKLM 卸载项 / 系统 PATH / 公共桌面快捷方式（需管理员，
-            未提权时自动发起 UAC 重启，与安装向导同一套机制）
-
-引擎 run_uninstall() 与 UI 完全解耦，可无界面单测（参照 tests/test_uninstall_engine.py）。
-"""
 import os
 import sys
 import shutil
 import subprocess
-import time
 import ctypes
 import winreg
 
-# 复用安装/卸载向导共享的基础工具（桌面路径/环境变量广播/管理员检测/reparse 判定）。
-# 从 installer_common 导入而不是 ycode_setup：避免把安装向导的 tkinter/PIL
-# 依赖树拖进卸载器二进制（32MB → ~25MB）。
 from installer_common import (
     _is_reparse_path,
     broadcast_environment_change,
@@ -37,48 +15,26 @@ from installer_common import (
 
 
 def _resolve_ycode_data_dir():
-    """按 config.py 的 YCODE_DIR 逻辑定位真实用户数据目录：
-    环境变量 YCODE_DATA_DIR 优先，缺省 ~/.ycode。
-    卸载器保持与运行期一致的解析规则，UI/日志显示的就是将要删除的实际路径。
-    """
     return os.environ.get("YCODE_DATA_DIR") or os.path.join(
         os.path.expanduser("~"), ".ycode"
     )
 
 
 def _has_reparse_component(path):
-    """检查从文件系统根到 path 的整条目录链是否含有挂载点/符号链接。
-
-    修复 #2：若 ~/.ycode（或 YCODE_DATA_DIR 覆盖值）的任一级父目录是
-    目录联接/符号链接，shutil.rmtree 会顺着链接删到链接目标里的真实数据
-    （可能指向其他磁盘/共享目录），必须拒绝删除。
-    """
     path = os.path.abspath(path)
     drive, rest = os.path.splitdrive(path)
     current = drive + os.sep
     for part in (p for p in rest.split(os.sep) if p):
         current = os.path.join(current, part)
-        # lexists 能发现悬空链接（exists 对悬空链接返回 False 会漏检）
         if os.path.lexists(current) and _is_reparse_path(current):
             return current
     return None
 
 
 def _verify_ycode_install_dir(install_dir):
-    """删除 _internal/ 与 cli/ 前的强制校验：确认该目录确为 Y-code 安装目录。
-
-    修复 #1：必须同时满足两个条件，缺一不可——
-      (a) 同级存在 Y-code.exe（GUI 主程序入口，独立 CLI 安装也含 GUI 入口时同样满足）；
-      (b) _internal/version.txt 存在且内容含 Y-code 版本标识
-          （不区分大小写宽松匹配 "ycode"/"y-code"，兼容纯版本号与
-           "Y-code x.y.z" 两种 version.txt 实际格式）。
-    返回 True 表示通过。验证思路：把卸载器复制到一个只放了 _internal/cli
-    同名目录、但无 Y-code.exe 的目录运行，应拒绝删除且绝不执行 rmtree。
-    """
     exe_path = os.path.join(install_dir, "Y-code.exe")
     if not os.path.isfile(exe_path):
         return False
-    # M47：安装器写入卸载注册项的 Y-code 专用归属标记命中即视为合法安装
     if _registry_marker_matches(install_dir):
         return True
     version_path = os.path.join(install_dir, "_internal", "version.txt")
@@ -90,7 +46,6 @@ def _verify_ycode_install_dir(install_dir):
     if not content:
         return False
     lowered = content.lower()
-    # "y-code" 包含连字符，"ycode" 不含，两个子串分别宽松匹配
     if "y-code" in lowered or "ycode" in lowered:
         return True
     # 宽松兜底：构建流程 build_release.py 生成的 version.txt 是纯版本号
@@ -98,9 +53,6 @@ def _verify_ycode_install_dir(install_dir):
     return True
 
 def _registry_marker_matches(install_dir):
-    """读取卸载注册项中的 Y-code 专用归属标记（修复 M47 由安装器写入）：
-    InstallLocation 与本目录一致且标记为 Y-code 时返回 True，供 High-1 校验
-    作为 version.txt 之外的第二归属证据。任何读取失败都返回 False。"""
     target = os.path.normcase(os.path.normpath(install_dir))
     for key_name in ("Y-code", "Y-code-CLI", "Y-code-TUI"):
         key_path = (rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{key_name}")
@@ -125,10 +77,6 @@ UNINSTALL_KEY_NAMES = ("Y-code", "Y-code-CLI", "Y-code-TUI")
 SHORTCUT_NAMES = ("星瑶code.lnk", "Y-code.lnk", "Y-code CLI.lnk", "Y-code TUI.lnk")
 
 
-# ============================================================================
-# 安装范围检测
-# ============================================================================
-
 def detect_scope_for_install(install_dir, log=print):
     """判断指定安装目录属于 machine 还是 user 范围。
 
@@ -148,10 +96,6 @@ def detect_scope_for_install(install_dir, log=print):
                     return scope
         except OSError:
             continue
-    # 修复 T22：规范化后同时匹配 Program Files 与 Program Files (x86)
-    # （旧实现只查 ProgramFiles 一个前缀，64 位系统上装进 Program Files (x86)
-    # 会被误判 user，导致 machine 安装的卸载不提权、静默清不动）；两个环境
-    # 变量都读不到时保守按 machine 处理（触发 UAC 提权）并明确提示。
     target_norm = os.path.normcase(os.path.normpath(install_dir))
     pf_roots = [
         os.path.normcase(os.path.normpath(value))
@@ -169,12 +113,7 @@ def detect_scope_for_install(install_dir, log=print):
     return "user"
 
 
-# ============================================================================
-# 注册表操作（全部用 winreg）
-# ============================================================================
-
 def _remove_path_entry(hive, key_path, value_name, install_dir, log):
-    """从指定环境变量注册表项中移除安装目录，保留原始值类型 (REG_EXPAND_SZ)。"""
     with winreg.CreateKey(hive, key_path) as key:
         try:
             current_path, reg_type = winreg.QueryValueEx(key, value_name)
@@ -233,10 +172,6 @@ def remove_uninstall_registry_key(app_key_name, hive=winreg.HKEY_CURRENT_USER, l
         log(f"⚠️ 移除卸载注册表项 {app_key_name} 失败: {e}")
 
 
-# ============================================================================
-# 快捷方式
-# ============================================================================
-
 def remove_shortcut(name, desktop_dirs, log=print):
     """从给定桌面目录集合中删除快捷方式，不存在的自动跳过。"""
     for desktop_dir in desktop_dirs:
@@ -249,17 +184,12 @@ def remove_shortcut(name, desktop_dirs, log=print):
                 log(f"⚠️ 删除快捷方式 {shortcut_path} 失败: {e}")
 
 
-# ============================================================================
-# 卸载引擎（与 UI 解耦，可单测）
-# ============================================================================
-
 def run_uninstall(install_dir, scope="user", delete_config=False,
                   log=print, progress=lambda p: None):
     """执行完整卸载流程。各步骤的异常只记日志不中断（尽力清理），
     返回汇总 dict：{"install_dir", "scope", "deleted_config"}。"""
     install_dir = os.path.normpath(install_dir)
 
-    # 1. 删除桌面快捷方式（真实桌面 + 旧版 ~/Desktop 兜底；machine 范围加公共桌面）
     log("🔗 正在删除桌面快捷方式...")
     desktop_dirs = {get_desktop_dir(), os.path.join(os.path.expanduser("~"), "Desktop")}
     if scope == "machine":
@@ -271,7 +201,6 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
         log(f"⚠️ 删除快捷方式时发生警告: {e}")
     progress(20.0)
 
-    # 2. 从环境变量 PATH 中移除安装路径（按范围清系统/用户，当前用户 PATH 总是清一遍）
     log("🌐 正在从环境变量 (PATH) 中移除路径...")
     try:
         if scope == "machine":
@@ -281,8 +210,6 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
         log(f"⚠️ 移除环境变量时发生警告: {e}")
     progress(40.0)
 
-    # 3. 移除“应用和功能”里的卸载注册项（machine 范围两个 hive 都清，
-    #    兼容完整版入口 + 独立 CLI 入口 + 旧版 CLI 命名）
     log("🗂️ 正在清理注册表卸载信息...")
     try:
         hives = [winreg.HKEY_CURRENT_USER]
@@ -295,12 +222,6 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
         log(f"⚠️ 清理注册表时发生警告: {e}")
     progress(55.0)
 
-    # 4. 可选：删除用户配置与会话记录
-    #    修复 #2：按 config.py 的 YCODE_DIR 逻辑定位真实数据目录
-    #    （YCODE_DATA_DIR 环境变量优先，缺省 ~/.ycode），删除前对整条目录链
-    #    做挂载点/符号链接检查——命中 reparse point 时 shutil.rmtree 会顺着
-    #    链接删到链接目标的真实数据，必须拒绝。验证思路：把 ~/.ycode 换成指向
-    #    其他目录的目录联接后运行卸载，应拒绝删除并明确提示。
     deleted_config = False
     if delete_config:
         ycode_user_dir = _resolve_ycode_data_dir()
@@ -345,8 +266,6 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
             except Exception as e:
                 log(f"⚠️ 删除 {rel_file} 失败: {e}")
     for rel_dir in ("_internal", "cli", "tui"):
-        # tui 为旧版 CLI 变体安装残留目录：不清理会导致自销毁脚本的
-        # 非递归 Directory.Delete 失败，整个安装目录都删不掉
         target_dir = os.path.join(install_dir, rel_dir)
         if os.path.isdir(target_dir):
             try:
@@ -363,16 +282,11 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
     }
 
 
-# ============================================================================
-# UAC 提权与自销毁
-# ============================================================================
-
 def relaunch_elevated_uninstall():
     """以管理员权限重启自身（UAC 弹窗），携带 --elevated 防止循环提权。
     返回是否成功发起；成功后当前进程应直接退出，由提权后的新进程继续卸载向导。"""
     params = "--elevated"
     if not getattr(sys, "frozen", False):
-        # 源码调试态：sys.executable 是 python 解释器，需要带上脚本路径
         params = f'"{os.path.abspath(__file__)}" --elevated'
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable,
                                              params, None, 1)
@@ -380,12 +294,6 @@ def relaunch_elevated_uninstall():
 
 
 def schedule_self_destruct(install_dir):
-    """安排卸载程序退出后的自销毁：删除自身并移除已经为空的安装目录。
-
-    用 Popen 的 cwd 参数把子进程工作目录显式设成与 install_dir 无关的绝对路径
-    （%TEMP%，找不到则退回 C:\\），避免 cmd.exe 以 install_dir 为 cwd 导致
-    rmdir 因“目录正被使用”而失败。CREATE_NO_WINDOW 避免黑窗闪现。
-    """
     import tempfile
 
     self_exe = os.path.abspath(sys.executable)
@@ -417,10 +325,6 @@ def schedule_self_destruct(install_dir):
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-# ============================================================================
-# 可视化卸载向导（tkinter，经典 Windows 安装程序样式，与安装向导一致）
-# ============================================================================
-
 import queue
 import threading
 import tkinter as tk
@@ -442,7 +346,6 @@ FONT_VERSION = ("Microsoft YaHei UI", 8)
 
 
 def _read_installed_version(install_dir):
-    """尝试从安装目录读取版本号（_internal/version.txt），读不到返回 0.0.0。"""
     for rel in (os.path.join("_internal", "version.txt"), "version.txt"):
         version_path = os.path.join(install_dir, rel)
         try:
@@ -456,11 +359,6 @@ def _read_installed_version(install_dir):
 
 
 class UninstallWizard(tk.Tk):
-    """经典 Windows 卸载向导：欢迎 → 选项 → 卸载中 → 完成。
-
-    布局与安装向导同为 NSIS MUI2 三段式：顶部白色横幅（页标题/副标题/图标）、
-    中部内容区、底部按钮栏（左下版本号，右下 上一步/下一步/取消）。
-    """
 
     def __init__(self, install_dir, scope, bundle_dir):
         super().__init__()
@@ -469,7 +367,7 @@ class UninstallWizard(tk.Tk):
         self.bundle_dir = bundle_dir
         self.version = _read_installed_version(install_dir)
         self._ui_queue = queue.Queue()
-        self.uninstall_done = False  # 向导正常完成卸载（用于退出后触发自销毁）
+        self.uninstall_done = False
 
         self.title("Y-code 卸载")
         self.resizable(False, False)
@@ -493,9 +391,6 @@ class UninstallWizard(tk.Tk):
         self.show_page("welcome")
         self.after(50, self._drain_ui_queue)
 
-    # ------------------------------------------------------------------
-    # 窗口基础设施
-    # ------------------------------------------------------------------
     def _center_window(self):
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -528,9 +423,6 @@ class UninstallWizard(tk.Tk):
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # 三段式框架：横幅 + 底部按钮栏
-    # ------------------------------------------------------------------
     def _build_chrome(self):
         banner = tk.Frame(self, bg=COLOR_BANNER, height=BANNER_H)
         banner.pack(fill="x")
@@ -541,7 +433,7 @@ class UninstallWizard(tk.Tk):
         self._banner_sub = tk.Label(
             banner, font=FONT_PAGE_SUB, fg=COLOR_TEXT_DIM, bg=COLOR_BANNER, anchor="w")
         self._banner_sub.place(x=22, y=37)
-        icon_path = os.path.join(self.bundle_dir, "assets", "ycode.png")
+        icon_path = os.path.join(self.bundle_dir, "assets", "ycode-logo-168.png")
         if os.path.exists(icon_path):
             try:
                 img = tk.PhotoImage(file=icon_path)
@@ -568,9 +460,6 @@ class UninstallWizard(tk.Tk):
         self._btn_next.pack(side="right", padx=4, pady=9)
         self._btn_back.pack(side="right", padx=4, pady=9)
 
-    # ------------------------------------------------------------------
-    # 页面构建与导航
-    # ------------------------------------------------------------------
     def _page(self, name):
         page = tk.Frame(self._content, bg=COLOR_CONTENT)
         self._pages[name] = page
@@ -638,9 +527,6 @@ class UninstallWizard(tk.Tk):
         if idx > 0:
             self.show_page(self._flow[idx - 1])
 
-    # ------------------------------------------------------------------
-    # 各页面内容
-    # ------------------------------------------------------------------
     def _label(self, parent, text, font=FONT_TEXT, fg=COLOR_TEXT, **kw):
         return tk.Label(parent, text=text, font=font, fg=fg, bg=COLOR_CONTENT, **kw)
 
@@ -665,7 +551,6 @@ class UninstallWizard(tk.Tk):
 
     def _build_options_page(self):
         page = self._page("options")
-        # 修复 #2：UI 如实显示将要删除的实际数据目录（YCODE_DATA_DIR 优先）
         ycode_user_dir = _resolve_ycode_data_dir()
         ttk.Checkbutton(
             page,
@@ -705,9 +590,6 @@ class UninstallWizard(tk.Tk):
         self._finish_hint = self._label(page, "", FONT_TEXT, COLOR_TEXT_DIM, justify="center")
         self._finish_hint.place(relx=0.5, y=280, anchor="center")
 
-    # ------------------------------------------------------------------
-    # 交互逻辑
-    # ------------------------------------------------------------------
     def _start_uninstall(self):
         self.show_page("uninstalling")
         threading.Thread(
@@ -775,12 +657,7 @@ class UninstallWizard(tk.Tk):
         self.show_page("finish")
 
 
-# ============================================================================
-# 入口
-# ============================================================================
-
 def main():
-    # windowed 打包（--noconsole）时 sys.stdout 为 None，任何 print 都会炸
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="ignore")
     if sys.stderr is None:
@@ -815,7 +692,6 @@ def main():
     wizard = UninstallWizard(install_dir, scope, bundle_dir)
     wizard.mainloop()
 
-    # 卸载正常完成后退出向导 → 触发自销毁（删除卸载程序自身与安装目录残留）
     if wizard.uninstall_done and getattr(sys, "frozen", False):
         schedule_self_destruct(install_dir)
 

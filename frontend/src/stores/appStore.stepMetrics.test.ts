@@ -65,7 +65,6 @@ describe('appStore step_metrics and streaming speed', () => {
     store.handleBridgeEvent(event('turn_cancelled', { session_name: 's1' }));
     expect(store.streamingSpeed).toBe(0);
 
-    // 再次开始流式，并在 turn_error 时重置
     store.handleBridgeEvent(event('turn_start', { session_name: 's1', user_text: '测试错误' }));
     store.handleBridgeEvent(event('token_delta', { session_name: 's1', text: '即将出错的文本1' }));
     vi.advanceTimersByTime(200);
@@ -74,6 +73,19 @@ describe('appStore step_metrics and streaming speed', () => {
 
     store.handleBridgeEvent(event('turn_error', { session_name: 's1', error: 'Network failure' }));
     expect(store.streamingSpeed).toBe(0);
+  });
+
+  it('stamps the whole turn duration onto the user message when the turn ends', () => {
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const store = useAppStore();
+    store.currentSessionName = 's1';
+    store.handleBridgeEvent(event('turn_start', { session_name: 's1', user_text: '跑个任务' }));
+    vi.advanceTimersByTime(25_000);
+    store.handleBridgeEvent(event('turn_finish', { session_name: 's1' }));
+
+    const userMsg = store.messages.find((m) => m.role === 'user');
+    expect(userMsg?.turnElapsedS).toBe(25);
+    expect(store.turnStartedAt).toBe(0);
   });
 });
 

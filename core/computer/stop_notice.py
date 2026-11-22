@@ -1,20 +1,3 @@
-"""会话级「用户已停止电脑操控」抑制状态与模型可见通知。
-
-为什么要这个模块：用户点击停止只应结束电脑操控 run，不该终止整个对话回合
-（cancel_event 是回合级信号，置位后本轮直接结束，模型毫不知情）。控制器与
-工具适配层都需要一个不依赖 LLM 的轻量状态源，所以这里只用标准库、模块顶层
-绝不 import core.llm，避免把循环导入拉进电脑操控链路。
-
-抑制状态是进程级模块变量（单进程 GUI 足够，不需要落盘/跨进程同步），所有
-读写都在同一把锁内完成，因为停止入口可能来自 GUI 线程，而检查来自回合线程。
-
-解除抑制只有三条明确路径（除此之外一律保持抑制，防止模型换个 target 绕开）：
-① GUI 设置里重新开启电脑操控 → deactivate_user_stop("settings_reenabled")；
-② 用户新消息命中恢复关键词 → 回合入口调用 user_message_resumes_control 判定后
-   调 deactivate_user_stop；
-③ 进程重启（内存态自然清零）。
-"""
-
 from __future__ import annotations
 
 import threading
@@ -47,11 +30,9 @@ _RESUME_KEYWORDS = (
     "帮我点一下",
 )
 
-# 单把锁保护下面两个状态：写入方是 GUI/热键线程，读取方是回合线程与工具线程。
 _LOCK = threading.Lock()
 _stop_active = False
 _stop_reason = ""
-# 待投递通知按 reason 去重：用户连点几次停止不该在模型上下文里堆出多条同样文案。
 _pending_reasons: list[str] = []
 
 
@@ -70,11 +51,6 @@ def is_user_stop_active() -> bool:
 
 
 def deactivate_user_stop(reason: str = "user_resume") -> None:
-    """解除抑制（设置重开 / 用户消息命中恢复关键词）；同时清空未投递通知。
-
-    未投递通知必须一起丢掉：用户已经要求恢复，再让模型收到"别再操作"的通知
-    会与最新指令冲突，模型可能反过来拒绝执行。
-    """
     global _stop_active, _stop_reason
     with _LOCK:
         _stop_active = False
@@ -88,7 +64,6 @@ def queue_stop_notice(reason: str) -> None:
         normalized = str(reason or "user_stop")
         if normalized in _pending_reasons:
             return
-        # 防御性上限：正常流程一两次停止就会 drain，异常情况下也不无限增长。
         if len(_pending_reasons) < 4:
             _pending_reasons.append(normalized)
 

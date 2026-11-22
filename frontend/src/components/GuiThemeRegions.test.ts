@@ -8,8 +8,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import App from '../App.vue';
 import { useAppStore } from '../stores/appStore';
 
-// jsdom 下 import.meta.url 非 file 协议且 CSS 的 ?raw 导入会被置空，
-// 源码断言改从 vitest 根目录（frontend/）直接读文件。
 const runtimeSource = readFileSync(resolve(process.cwd(), 'src/themes/runtime.ts'), 'utf-8');
 const styleSource = readFileSync(resolve(process.cwd(), 'src/style.css'), 'utf-8');
 
@@ -27,8 +25,6 @@ function piniaWithInitializedStore() {
   return pinia;
 }
 
-// App 的重子组件（Topbar/Sidebar/InputArea/RightPanel）保持真实挂载，
-// 只桩掉与主题无关的深依赖，确保七个分区标记来自真实 DOM 根节点。
 const shallowStubs = {
   TurnGroup: true,
   KimiEmptyState: true,
@@ -70,7 +66,6 @@ describe('GUI theme regions', () => {
     for (const node of wrapper.findAll('[data-theme-region]')) {
       markers[node.attributes('data-theme-region') as string] = node.attributes('id') || '';
     }
-    // 现有根节点直接打标，不引入额外包装层
     expect(markers).toEqual({
       app_header: 'topbar',
       sidebar: 'sidebar',

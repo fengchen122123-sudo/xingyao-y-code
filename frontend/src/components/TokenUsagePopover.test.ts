@@ -52,7 +52,6 @@ describe('TokenUsagePopover', () => {
 
     expect(wrapper.get('[data-test="tup-session-metrics"]').text()).toContain('12,480');
     expect(wrapper.get('[data-test="tup-session-metrics"]').text()).toContain('9,876');
-    // 命中率 = 9876 / 12000 = 82%（不是 9876/12480=79%）
     expect(wrapper.get('[data-test="tup-session-metrics"]').text()).toContain('82%');
     wrapper.unmount();
   });
@@ -62,7 +61,6 @@ describe('TokenUsagePopover', () => {
     const { wrapper } = mountPopover();
 
     const metrics = wrapper.get('[data-test="tup-session-metrics"]').text();
-    // jsdom 会折叠模板空白：标签与数值间由 CSS margin 撑开视觉间距
     expect(metrics).toContain('命中0');
     expect(metrics).not.toContain('%');
     wrapper.unmount();
@@ -105,7 +103,6 @@ describe('TokenUsagePopover', () => {
     expect(rows).toHaveLength(2);
     expect(rows[0].classes()).toContain('current');
     expect(rows[0].text()).toContain('会话A');
-    // 会话B 无缓存样本 → 命中率显示 --，不冒充 0%
     expect(rows[1].text()).toContain('--');
     wrapper.unmount();
   });

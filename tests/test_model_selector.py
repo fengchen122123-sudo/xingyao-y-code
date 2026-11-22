@@ -38,13 +38,11 @@ def test_kimi_for_coding_preset_is_openai_format():
         ("openai", "https://api.kimi.com/coding/v1"),
     }
     openai_preset = next(preset for preset in kimi_coding if preset["protocol"] == "openai")
-    # 预置厂商只含厂商信息，不携带模型
     assert "models" not in openai_preset
 from core.model_selector import _latest_total_tokens
 
 
 def _run_selector_headless(monkeypatch):
-    """用假 Application 捕获布局，不真正进入全屏 CLI"""
     captured = {}
 
     class FakeApp:
@@ -62,7 +60,6 @@ def _run_selector_headless(monkeypatch):
 
 
 def test_list_shows_add_model_row_per_provider(monkeypatch, tmp_path):
-    """每个厂商的模型列表下方应有一行「＋ 添加模型」入口"""
     monkeypatch.setattr(
         model_selector, "load_config",
         lambda: {
@@ -84,7 +81,6 @@ def test_list_shows_add_model_row_per_provider(monkeypatch, tmp_path):
 
 
 def _press(captured, key, monkeypatch):
-    """在捕获的 KeyBindings 中找到当前 filter 通过的目标按键 handler 并触发"""
     from types import SimpleNamespace
     kb = captured["key_bindings"]
     for binding in kb.bindings:
@@ -102,7 +98,6 @@ def _press(captured, key, monkeypatch):
 
 
 def test_add_model_enter_opens_wizard(monkeypatch):
-    """光标移到「＋ 添加模型」行按 Enter 应进入 addmodel 向导"""
     from prompt_toolkit.keys import Keys
 
     monkeypatch.setattr(
@@ -117,10 +112,8 @@ def test_add_model_enter_opens_wizard(monkeypatch):
     captured = _run_selector_headless(monkeypatch)
     main_win = captured["layout"].container.children[0]
 
-    # 初始光标已自动跳过不可选中的 provider 标题行，直接落在 add_model 行
     assert _press(captured, Keys.Enter, monkeypatch), "enter 键绑定应存在"
 
-    # 应已进入 addmodel 向导模式，渲染包含厂商名与步骤提示
     text = "".join(t for _, t in main_win.content.text())
     assert "为「厂商一」添加模型" in text
     assert "步骤 1/3" in text
@@ -133,7 +126,6 @@ def test_latest_total_tokens_reads_current_value(monkeypatch):
 
 
 def test_latest_total_tokens_reads_under_lock():
-    """读取必须持 token_usage_lock：锁被占用时读取阻塞，释放后才完成"""
     with llm.token_usage_lock:
         done = threading.Event()
         result = []
@@ -150,7 +142,6 @@ def test_latest_total_tokens_reads_under_lock():
 
 
 def test_add_model_to_provider_persists_supports_vision(monkeypatch, tmp_path):
-    """add_model_to_provider 应将 supports_vision 写入 config.json"""
     from core.model_manager import add_model_to_provider, add_provider, load_config
     import config as config_mod
 
@@ -167,7 +158,6 @@ def test_add_model_to_provider_persists_supports_vision(monkeypatch, tmp_path):
 
 
 def test_update_provider_and_model_persists_supports_vision(monkeypatch, tmp_path):
-    """update_provider_and_model 应能更新模型的 supports_vision 字段"""
     from core.model_manager import (
         add_model_to_provider, add_provider, load_config, update_provider_and_model,
     )
@@ -188,7 +178,6 @@ def test_update_provider_and_model_persists_supports_vision(monkeypatch, tmp_pat
 
 
 def test_preset_add_via_selector_path_adds_provider_without_models(monkeypatch, tmp_path):
-    """selector 的预置厂商添加入口只建厂商条目（模型由用户经「获取模型列表」添加）。"""
     import config as config_mod
     from core.model_manager import add_preset_provider_with_models, load_config
 
@@ -208,13 +197,7 @@ def test_preset_add_via_selector_path_adds_provider_without_models(monkeypatch, 
     assert provider["models"] == []
 
 
-# ---------------------------------------------------------------------------
-# 多 Key 连接测试（厂商多 Key 一致性适配）
-# ---------------------------------------------------------------------------
-
-
 def test_connection_falls_back_across_multiple_keys(monkeypatch):
-    """多 Key（换行分隔）连接测试：首 Key 失败后自动尝试下一个，任一成功即通过。"""
     calls = []
 
     def fake_request_stream(protocol, kwargs, *, timeout, cancel_event=None):
@@ -233,10 +216,6 @@ def test_connection_falls_back_across_multiple_keys(monkeypatch):
 
 
 def test_connection_raises_last_error_when_all_keys_fail(monkeypatch):
-    """多 Key 全部失败：抛出最后一个 Key 的错误（调用方错误展示逻辑不变）。
-
-    逗号分隔串也按逐 Key 解析，证明 split_provider_keys 的分隔口径生效。
-    """
     errors = iter([RuntimeError("first-key-error"), RuntimeError("second-key-error")])
 
     def fake_request_stream(protocol, kwargs, *, timeout, cancel_event=None):
@@ -248,3 +227,289 @@ def test_connection_raises_last_error_when_all_keys_fail(monkeypatch):
         model_selector._test_model_connection(
             "openai", "model-a", "https://api.example.com", "sk-1,sk-2"
         )
+
+
+def _press_last(captured, key):
+    from types import SimpleNamespace
+
+    class _Loop:
+        def is_closed(self):
+            return False
+
+        def call_soon_threadsafe(self, callback):
+            callback()
+
+    kb = captured["key_bindings"]
+    handlers = []
+    for binding in kb.bindings:
+        if key not in binding.keys:
+            continue
+        try:
+            if binding.filter():
+                handlers.append(binding.handler)
+        except Exception:
+            continue
+    if not handlers:
+        return False
+    event = SimpleNamespace(
+        app=SimpleNamespace(
+            exit=lambda: None,
+            invalidate=lambda: None,
+            loop=_Loop(),
+        )
+    )
+    handlers[-1](event)
+    return True
+
+
+def _find_input_buffer(container):
+    from prompt_toolkit.layout.controls import BufferControl
+
+    if isinstance(container, BufferControl):
+        return container.buffer
+    children = getattr(container, "children", None)
+    if children:
+        for child in children:
+            found = _find_input_buffer(child)
+            if found is not None:
+                return found
+        return None
+    content = getattr(container, "content", None)
+    if content is not None:
+        return _find_input_buffer(content)
+    return None
+
+
+def _wait_text(main_win, needle, timeout=3.0):
+    import time
+
+    def current():
+        return "".join(text for _, text in main_win.content.text())
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if needle in current():
+            return current()
+        time.sleep(0.02)
+    return current()
+
+
+def _footer_text(layout):
+    footer_win = layout.container.children[1].content
+    return "".join(text for _, text in footer_win.content.text())
+
+
+def _wait_footer(layout, needle, timeout=3.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if needle in _footer_text(layout):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _one_provider_config():
+    return {
+        "active_model_id": None,
+        "providers": [{
+            "id": "p1",
+            "name": "厂商一",
+            "protocol": "openai",
+            "base_url": "https://api.example.com",
+            "api_key": "sk-test",
+            "models": [],
+        }],
+    }
+
+
+def _fake_fetch(models):
+    def fake(base_url, api_keys=None, timeout=15.0):
+        return {"ok": True, "models": models, "count": len(models), "base_url": base_url}
+
+    return fake
+
+
+def test_empty_model_name_enter_lists_fetched_models(monkeypatch):
+    from prompt_toolkit.keys import Keys
+
+    from core import model_discovery
+
+    monkeypatch.setattr(model_selector, "load_config", _one_provider_config)
+    monkeypatch.setattr(
+        model_discovery, "fetch_model_list",
+        _fake_fetch([{
+            "id": "m-alpha",
+            "model_type": "",
+            "context_window": 200000,
+            "supports_vision": True,
+            "max_tokens": None,
+        }]),
+    )
+
+    captured = _run_selector_headless(monkeypatch)
+    main_win = captured["layout"].container.children[0]
+
+    assert _press_last(captured, Keys.Enter)
+    assert "为「厂商一」添加模型" in "".join(t for _, t in main_win.content.text())
+
+    assert _press_last(captured, Keys.Enter)
+    text = _wait_text(main_win, "共 1 个可用模型")
+    assert "共 1 个可用模型" in text
+    assert "m-alpha" in text
+    assert "200k" in text
+
+    assert _press_last(captured, Keys.Enter)
+    text = _wait_text(main_win, "模型名称: m-alpha")
+    assert "模型名称: m-alpha" in text
+    assert "步骤 3/3" in text
+
+
+def test_fetch_failure_keeps_manual_input_available(monkeypatch):
+    from prompt_toolkit.keys import Keys
+
+    from core import model_discovery
+
+    monkeypatch.setattr(model_selector, "load_config", _one_provider_config)
+    monkeypatch.setattr(
+        model_discovery, "fetch_model_list",
+        lambda base_url, api_keys=None, timeout=15.0: {"ok": False, "msg": "获取失败 (HTTP 401): denied"},
+    )
+
+    captured = _run_selector_headless(monkeypatch)
+    main_win = captured["layout"].container.children[0]
+
+    assert _press_last(captured, Keys.Enter)
+    assert _press_last(captured, Keys.Enter)
+    text = _wait_text(main_win, "HTTP 401")
+    assert "按 r 重新拉取" in text
+
+    assert _press_last(captured, Keys.Escape)
+    text = "".join(t for _, t in main_win.content.text())
+    assert "步骤 1/3" in text
+    assert "HTTP 401" not in text
+
+
+def test_preset_flow_fetches_models_instead_of_reading_preset_models(monkeypatch, tmp_path):
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.keys import Keys
+
+    import json
+
+    import config as config_mod
+    from core import model_discovery
+    from core.model_manager import load_config as real_load_config
+
+    config_file = tmp_path / "preset_fetch.json"
+    config_file.write_text(
+        json.dumps({"active_model_id": None, "providers": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(config_mod, "_CONFIG_FILE", str(config_file))
+    monkeypatch.setattr("core.model_manager._CONFIG_FILE", str(config_file))
+    monkeypatch.setattr(
+        model_discovery, "fetch_model_list",
+        _fake_fetch([
+            {"id": "kimi-k3", "model_type": "", "context_window": 256000,
+             "supports_vision": False, "max_tokens": None},
+            {"id": "kimi-k3-vision", "model_type": "", "context_window": 256000,
+             "supports_vision": True, "max_tokens": None},
+        ]),
+    )
+    monkeypatch.setattr(model_selector, "_test_model_connection", lambda *a, **k: None)
+
+    captured = _run_selector_headless(monkeypatch)
+    main_win = captured["layout"].container.children[0]
+    input_buffer = _find_input_buffer(captured["layout"].container)
+    assert input_buffer is not None
+
+    assert _press_last(captured, Keys.Enter)
+    assert _press_last(captured, Keys.Enter)
+    input_buffer.set_document(Document("sk-preset"))
+
+    assert _press_last(captured, Keys.Enter)
+    text = _wait_text(main_win, "共 2 个可用模型")
+    assert "共 2 个可用模型" in text
+
+    assert _press_last(captured, " ")
+    assert _press_last(captured, Keys.Down)
+    assert _press_last(captured, " ")
+    assert _press_last(captured, Keys.Enter)
+
+    assert _wait_footer(captured["layout"], "已成功验证保存")
+
+    provider = real_load_config()["providers"][0]
+    assert provider["preset_id"] == "kimi-coding-openai"
+    assert [m["name"] for m in provider["models"]] == ["kimi-k3", "kimi-k3-vision"]
+    assert all(m["context_window"] == 256000 for m in provider["models"])
+    assert provider["models"][1]["supports_vision"] is True
+
+
+def test_custom_provider_flow_can_pick_fetched_model(monkeypatch, tmp_path):
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.keys import Keys
+
+    import json
+    import time
+
+    import config as config_mod
+    from core import model_discovery
+    from core.model_manager import load_config as real_load_config
+
+    config_file = tmp_path / "custom_fetch.json"
+    config_file.write_text(
+        json.dumps({"active_model_id": None, "providers": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(config_mod, "_CONFIG_FILE", str(config_file))
+    monkeypatch.setattr("core.model_manager._CONFIG_FILE", str(config_file))
+    monkeypatch.setattr(
+        model_discovery, "fetch_model_list",
+        _fake_fetch([{
+            "id": "gateway-model",
+            "model_type": "",
+            "context_window": 32000,
+            "supports_vision": False,
+            "max_tokens": None,
+        }]),
+    )
+    monkeypatch.setattr(model_selector, "_test_model_connection", lambda *a, **k: None)
+    errors = []
+    monkeypatch.setattr(
+        model_selector,
+        "_format_test_error",
+        lambda exc, model: errors.append(f"{type(exc).__name__}: {exc}") or "测试错误",
+    )
+
+    captured = _run_selector_headless(monkeypatch)
+    main_win = captured["layout"].container.children[0]
+    input_buffer = _find_input_buffer(captured["layout"].container)
+
+    assert _press_last(captured, Keys.Enter)
+    for _ in range(len(model_selector.PRESET_PROVIDERS)):
+        assert _press_last(captured, Keys.Down)
+    assert _press_last(captured, Keys.Enter)
+
+    for text in ("自建网关", "http://127.0.0.1:8000/v1", "sk-local"):
+        input_buffer.set_document(Document(text))
+        assert _press_last(captured, Keys.Enter)
+    assert _press_last(captured, Keys.Enter)
+
+    assert _press_last(captured, Keys.Enter)
+    text = _wait_text(main_win, "共 1 个可用模型")
+    assert "gateway-model" in text
+    assert "32k" in text
+
+    assert _press_last(captured, Keys.Enter)
+    text = _wait_text(main_win, "步骤 5c")
+    assert "步骤 5c" in text
+
+    assert _press_last(captured, Keys.Enter)
+
+    assert "模型连接测试成功" in _wait_text(main_win, "模型连接测试成功"), repr(errors)
+
+    provider = real_load_config()["providers"][0]
+    assert provider["name"] == "自建网关"
+    model = provider["models"][0]
+    assert model["name"] == "gateway-model"
+    assert model["context_window"] == 32000
+    assert model["supports_vision"] is False

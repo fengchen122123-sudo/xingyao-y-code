@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>星瑶Code CLI 样式稿</title>
+<style>
+  :root {
+    --ink: #0c1014;
+    --desk: #101418;
+    --text: #e8eef2;
+    --soft: #c3ced6;
+    --muted: #8b9aa4;
+    --faint: #667680;
+    --line: rgba(255, 255, 255, 0.07);
+    --cyan: #8fdfff;
+    --green: #7dcea0;
+    --red: #e08b8b;
+    --amber: #e3b67a;
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+    --sans: "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 48px 24px 80px;
+    background: var(--desk);
+    color: var(--soft);
+    font-family: var(--sans);
+  }
+
+  .page { max-width: 880px; margin: 0 auto; }
+
+  h1 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 600;
+    color: #f3f6f8;
+  }
+
+  .lead {
+    margin: 8px 0 0;
+    font-size: 14px;
+    color: var(--muted);
+  }
+
+  h2 {
+    margin: 36px 0 12px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .window {
+    background: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+  }
+
+  .titlebar {
+    height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 14px;
+    background: #14181d;
+    color: #d5dee4;
+    font-size: 13px;
+  }
+
+  .titlebar .folder {
+    color: var(--faint);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .titlebar .spacer { flex: 1; }
+
+  .winbtn {
+    width: 28px;
+    text-align: center;
+    color: #8d98a0;
+    font-size: 12px;
+  }
+
+  .screen { padding: 32px 36px 18px; }
+
+  .home {
+    background:
+      radial-gradient(440px 200px at 12% 0%, rgba(143, 223, 255, 0.08), transparent 70%),
+      var(--ink);
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .mark { width: 48px; height: 48px; flex: none; }
+  .mark.sm { width: 18px; height: 18px; }
+
+  .name {
+    font-size: 32px;
+    line-height: 1.05;
+    font-weight: 600;
+    color: #f5f8f8;
+  }
+
+  .role { margin-top: 3px; font-size: 13px; color: var(--muted); }
+
+  .ver {
+    margin-left: auto;
+    align-self: flex-start;
+    margin-top: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--faint);
+  }
+
+  .hello {
+    max-width: 36em;
+    margin: 26px 0 0;
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--soft);
+  }
+
+  .where {
+    margin: 26px 0 0;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: #d5e0e6;
+  }
+
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 6px;
+    margin: 8px 0 0;
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .meta span:not(:last-child)::after {
+    content: "·";
+    margin-left: 8px;
+    color: #3d4c54;
+  }
+
+  .composer {
+    margin-top: 28px;
+    background: #12171c;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 12px 14px 10px;
+  }
+
+  .working {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--soft);
+  }
+
+  .working em {
+    margin-left: auto;
+    font-style: normal;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pulse {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 0 4px rgba(143, 223, 255, 0.12);
+    animation: pulse 1.6s ease-out infinite;
+  }
+
+  @keyframes pulse {
+    50% { box-shadow: 0 0 0 0 rgba(143, 223, 255, 0); }
+  }
+
+  .field {
+    min-height: 28px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 15px;
+    color: var(--faint);
+  }
+
+  .caret {
+    width: 2px;
+    height: 16px;
+    background: var(--cyan);
+    border-radius: 1px;
+    animation: blink 1.05s steps(1) infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .hints {
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--faint);
+  }
+
+  .hints b {
+    font-weight: 500;
+    color: #a9b6be;
+  }
+
+  .status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 18px;
+    margin: 14px -8px 0;
+    padding-top: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--faint);
+  }
+
+  .status .model { color: var(--cyan); }
+  .status .perm { color: var(--amber); }
+
+  .track {
+    width: 72px;
+    height: 3px;
+    border-radius: 99px;
+    background: #243038;
+    overflow: hidden;
+  }
+
+  .track i {
+    display: block;
+    height: 100%;
+    background: var(--cyan);
+  }
+
+  .turn { margin-top: 22px; }
+  .turn:first-child { margin-top: 0; }
+
+  .user {
+    width: fit-content;
+    max-width: 34em;
+    padding: 10px 14px;
+    background: #171d24;
+    border-radius: 12px;
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.6;
+  }
+
+  .who {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    font-size: 13px;
+    color: var(--soft);
+  }
+
+  .tools { display: flex; flex-direction: column; gap: 2px; }
+
+  .tool {
+    display: grid;
+    grid-template-columns: 8px minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    min-height: 26px;
+    font-size: 13px;
+    color: var(--soft);
+  }
+
+  .tool.run {
+    margin: 2px -8px;
+    padding: 4px 8px;
+    background: rgba(143, 223, 255, 0.08);
+    border-radius: 8px;
+    color: #e7f7fb;
+  }
+
+  .tool .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+  }
+
+  .tool.run .dot { background: var(--cyan); }
+  .tool.bad .dot { background: var(--red); }
+
+  .tool code {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: #e7eef2;
+  }
+
+  .add { color: var(--green); }
+  .del { color: var(--red); }
+  .when {
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+  }
+
+  .prose {
+    max-width: 40em;
+    margin: 12px 0 0;
+    font-size: 15px;
+    line-height: 1.75;
+    color: var(--text);
+  }
+
+  .prose code {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--cyan);
+  }
+</style>
+</head>
+<body>
+  <div class="page">
+    <h1>星瑶Code</h1>
+    <p class="lead">首页，以及一轮正在进行的对话。</p>
+
+    <h2>首页</h2>
+    <div class="window">
+      <div class="titlebar">
+        <svg class="mark sm" viewBox="0 0 64 64" aria-hidden="true">
+          <path fill="#8fdfff" d="M14 28 L22 10 L30 26 Z"/>
+          <path fill="#8fdfff" d="M34 26 L42 10 L50 28 Z"/>
+          <rect fill="#8fdfff" x="10" y="24" width="44" height="32" rx="16"/>
+          <circle fill="#101418" cx="26" cy="38" r="3"/>
+          <circle fill="#101418" cx="40" cy="38" r="3"/>
+        </svg>
+        <span>星瑶Code</span>
+        <span class="spacer"></span>
+        <span class="winbtn">—</span>
+        <span class="winbtn">□</span>
+        <span class="winbtn">✕</span>
+      </div>
+      <div class="screen home">
+        <div class="brand">
+          <svg class="mark" viewBox="0 0 64 64" aria-hidden="true">
+            <path fill="#8fdfff" d="M14 28 L22 10 L30 26 Z"/>
+            <path fill="#8fdfff" d="M34 26 L42 10 L50 28 Z"/>
+            <rect fill="#8fdfff" x="10" y="24" width="44" height="32" rx="16"/>
+            <circle fill="#101418" cx="26" cy="38" r="3"/>
+            <circle fill="#101418" cx="40" cy="38" r="3"/>
+          </svg>
+          <div>
+            <div class="name">星瑶</div>
+            <div class="role">Hacker Girl · 编程伙伴</div>
+          </div>
+          <div class="ver">v1.3.9</div>
+        </div>
+
+        <p class="hello">欢迎使用。输入 /help 获取帮助，用 @文件 把上下文带上。</p>
+        <p class="where">D:\fengchenhao\ycode\xingyao-y-code</p>
+        <p class="meta">
+          <span>session_72f298</span>
+          <span>hy3</span>
+          <span>cyan</span>
+        </p>
+
+        <div class="composer">
+          <div class="field">问星瑶，或输入 / 查看命令<i class="caret"></i></div>
+          <div class="hints"><b>Enter</b> 发送 · <b>Ctrl+N</b> 换行 · <b>Ctrl+C</b> 中断 · <b>Ctrl+D</b> 退出 · <b>Ctrl+T</b> 记忆</div>
+        </div>
+
+        <div class="status">
+          <span class="model">hy3</span>
+          <span class="perm">完全访问</span>
+          <span>↑ 0 · ↓ 0 · ⚡ --</span>
+          <span style="display:inline-flex;align-items:center;gap:8px">
+            <span class="track"><i style="width:11%"></i></span>
+            11% · 14.6K/128K
+          </span>
+          <span>-- t/s</span>
+        </div>
+      </div>
+    </div>
+
+    <h2>运行中</h2>
+    <div class="window">
+      <div class="titlebar">
+        <svg class="mark sm" viewBox="0 0 64 64" aria-hidden="true">
+          <path fill="#8fdfff" d="M14 28 L22 10 L30 26 Z"/>
+          <path fill="#8fdfff" d="M34 26 L42 10 L50 28 Z"/>
+          <rect fill="#8fdfff" x="10" y="24" width="44" height="32" rx="16"/>
+          <circle fill="#101418" cx="26" cy="38" r="3"/>
+          <circle fill="#101418" cx="40" cy="38" r="3"/>
+        </svg>
+        <span>星瑶Code</span>
+        <span class="folder">xingyao-y-code</span>
+        <span class="spacer"></span>
+        <span class="winbtn">—</span>
+        <span class="winbtn">□</span>
+        <span class="winbtn">✕</span>
+      </div>
+      <div class="screen">
+        <div class="turn">
+          <div class="user">状态栏别挤成一串符号。</div>
+        </div>
+        <div class="turn">
+          <div class="who">
+            <svg class="mark sm" viewBox="0 0 64 64" aria-hidden="true">
+              <path fill="#8fdfff" d="M14 28 L22 10 L30 26 Z"/>
+              <path fill="#8fdfff" d="M34 26 L42 10 L50 28 Z"/>
+              <rect fill="#8fdfff" x="10" y="24" width="44" height="32" rx="16"/>
+              <circle fill="#101418" cx="26" cy="38" r="2.4"/>
+              <circle fill="#101418" cx="40" cy="38" r="2.4"/>
+            </svg>
+            星瑶
+          </div>
+          <div class="prose">模型、权限、用量和上下文分开。上下文是底部那条细线。</div>
+        </div>
+
+        <div class="turn">
+          <div class="user">首页那个大字太占地方。工具和回答分开。</div>
+        </div>
+        <div class="turn">
+          <div class="who">
+            <svg class="mark sm" viewBox="0 0 64 64" aria-hidden="true">
+              <path fill="#8fdfff" d="M14 28 L22 10 L30 26 Z"/>
+              <path fill="#8fdfff" d="M34 26 L42 10 L50 28 Z"/>
+              <rect fill="#8fdfff" x="10" y="24" width="44" height="32" rx="16"/>
+              <circle fill="#101418" cx="26" cy="38" r="2.4"/>
+              <circle fill="#101418" cx="40" cy="38" r="2.4"/>
+            </svg>
+            星瑶
+          </div>
+          <div class="tools">
+            <div class="tool">
+              <i class="dot"></i>
+              <span>已读取 2 个文件 · 120 行</span>
+              <span class="when">0.2s</span>
+            </div>
+            <div class="tool">
+              <i class="dot"></i>
+              <span>已修改 <code>main.py</code> · <span class="add">+18</span> <span class="del">−6</span></span>
+              <span class="when">0.3s</span>
+            </div>
+            <div class="tool bad">
+              <i class="dot"></i>
+              <span>搜索失败 · 没有匹配到 <code>print_logo</code></span>
+              <span class="when">0.4s</span>
+            </div>
+            <div class="tool run">
+              <i class="dot"></i>
+              <span>正在搜索 <code>print_logo</code></span>
+              <span class="when"></span>
+            </div>
+          </div>
+          <div class="prose">首页只留名字和一行说明。工具放在回答上面，正在做的事先出现在输入框里。<i class="caret" style="display:inline-block;vertical-align:text-bottom;margin-left:2px"></i></div>
+        </div>
+
+        <div class="composer">
+          <div class="working">
+            <i class="pulse"></i>
+            <span>正在搜索 print_logo</span>
+            <em>2.4s · Ctrl+C 中断</em>
+          </div>
+          <div class="field"><i class="caret"></i></div>
+          <div class="hints"><b>Enter</b> 发送 · <b>Ctrl+C</b> 中断</div>
+        </div>
+
+        <div class="status">
+          <span class="model">hy3</span>
+          <span class="perm">完全访问</span>
+          <span>↑ 18.2K · ↓ 1.1K · ⚡ 62%</span>
+          <span style="display:inline-flex;align-items:center;gap:8px">
+            <span class="track"><i style="width:23%"></i></span>
+            23% · 29.4K/128K
+          </span>
+          <span>36 t/s</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

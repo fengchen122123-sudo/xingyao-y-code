@@ -6,7 +6,6 @@ import HooksSettings from './HooksSettings.vue';
 import { useAppStore } from '../stores/appStore';
 import type { HookInfo } from '../types/pywebview';
 
-// C12/C13：Hook 管理页测试数据工厂（默认项目级待确认，按需覆盖）
 function makeHook(overrides: Partial<HookInfo> = {}): HookInfo {
   return {
     event: 'PreToolUse',
@@ -83,11 +82,9 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
 
     const rows = wrapper.findAll('[data-test="hook-row"]');
     expect(rows).toHaveLength(3);
-    // 状态文案按 status 派生
     expect(wrapper.text()).toContain('已信任');
     expect(wrapper.text()).toContain('待确认');
     expect(wrapper.text()).toContain('已撤销');
-    // 命令文本与来源徽标
     expect(wrapper.text()).toContain('python ./scripts/guard.py');
     expect(wrapper.text()).toContain('npm run fmt');
     expect(rows[0].text()).toContain('用户');
@@ -116,7 +113,6 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
     await rows[0].get('[data-test="hook-action-deny"]').trigger('click');
     expect(denySpy).toHaveBeenCalledWith('d-proj-pending');
 
-    // stale（配置已变更）同样需要重新决策
     expect(rows[1].find('[data-test="hook-action-grant"]').exists()).toBe(true);
     await rows[1].get('[data-test="hook-action-deny"]').trigger('click');
     expect(denySpy).toHaveBeenCalledWith('d-proj-stale');
@@ -136,7 +132,6 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
     const wrapper = mountHooks();
     const rows = wrapper.findAll('[data-test="hook-row"]');
 
-    // 已信任行不再展示信任/拒绝，只提供撤销入口
     expect(rows[0].find('[data-test="hook-action-grant"]').exists()).toBe(false);
     await rows[0].get('[data-test="hook-action-revoke"]').trigger('click');
     expect(revokeSpy).toHaveBeenCalledWith('d-proj-trusted');
@@ -156,8 +151,6 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
     await wrapper.get('[data-test="refresh-hooks-btn"]').trigger('click');
     expect(refreshSpy).toHaveBeenCalledTimes(1);
   });
-
-  // ---------------- C13：表单视图（新建/编辑/删除/启停）与列表筛选 ----------------
 
   it('新建钩子：填表保存携带 scope 且不含定位字段，成功后回到列表', async () => {
     const store = useAppStore();
@@ -186,10 +179,8 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
         scope: 'user',
       })
     );
-    // 新建不带编辑定位字段（由后端按 scope 决定写入用户级/项目级文件）
     expect(payload.source_path).toBeUndefined();
     expect(payload.digest).toBeUndefined();
-    // 保存成功后表单关闭
     expect(wrapper.find('[data-test="hook-form-save"]').exists()).toBe(false);
   });
 
@@ -241,7 +232,6 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
     expect(confirmSpy).toHaveBeenCalledTimes(1);
     expect(confirmSpy.mock.calls[0][0]).toContain('删除钩子');
     expect(deleteSpy).toHaveBeenCalledWith(hook.source_path, 'd-proj-del');
-    // 删除成功后回到列表
     expect(wrapper.find('[data-test="hook-form-save"]').exists()).toBe(false);
   });
 
@@ -281,7 +271,6 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
     expect((sw.element as HTMLInputElement).checked).toBe(true);
     expect((sw.element as HTMLInputElement).disabled).toBe(false);
 
-    // 取消勾选 = 禁用：checked 取反得到 disabled 语义
     await sw.setValue(false);
 
     expect(toggleSpy).toHaveBeenCalledTimes(1);
@@ -361,7 +350,6 @@ describe('HooksSettings - 钩子 Hooks 管理分区', () => {
     expect(saveSpy).not.toHaveBeenCalled();
     expect(notifySpy).toHaveBeenCalledTimes(1);
     expect(notifySpy.mock.calls[0][0]).toContain('表单校验');
-    // 表单保持在编辑态，便于用户补齐命令
     expect(wrapper.find('[data-test="hook-form-save"]').exists()).toBe(true);
   });
 });

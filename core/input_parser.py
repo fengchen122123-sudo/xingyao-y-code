@@ -8,26 +8,18 @@ from dataclasses import dataclass
 from core.injection_markers import neutralize_reserved_markers
 
 # 附件大小上限：防止大文件撑爆内存 / token
-MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 图片 20MB
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_DECODED_IMAGE_PIXELS = 40_000_000
-MAX_TEXT_BYTES = 200 * 1024         # 文本 200KB（超出部分截断）
+MAX_TEXT_BYTES = 200 * 1024
 
-# 默认图片压缩参数：在视觉质量和 token 成本之间取平衡
-DEFAULT_MAX_IMAGE_EDGE = 1536       # 最大边长（像素）
-DEFAULT_IMAGE_QUALITY = 90          # JPEG/WebP 质量
-DEFAULT_MAX_IMAGE_OUTPUT_BYTES = 1024 * 1024  # 压缩后目标上限（字节）
+DEFAULT_MAX_IMAGE_EDGE = 1536
+DEFAULT_IMAGE_QUALITY = 90
+DEFAULT_MAX_IMAGE_OUTPUT_BYTES = 1024 * 1024
 
-# @{会话名} 引用标记：} 定界，不允许跨行，标题上限 80 字符
 SESSION_REF_PATTERN = re.compile(r"@\{([^}\n]{1,80})\}")
 
-# @文件 的 token 边界：空白、@、花括号（@{会话名} 由 extract_session_refs 处理），
-# 以及中文句读。中文标点几乎不会出现在合法路径里，而中文输入法下 @ 引用后
-# 常紧跟句读（"看下 @接口文档.md，然后…"），以它作边界才能切出干净的路径。
-# 英文 . , ; 等不列入边界——它们是文件名与路径的常见组成（a.md / dir,1）。
 AT_PATH_TOKEN_PATTERN = re.compile(r"@([^\s@{}，。；！？：、）」】》]+)")
 
-# 尾部标点裁剪集合：token 末尾紧贴这些字符时逐层剥掉再判断文件是否存在。
-# 英文标点保留原有成员，中文句读一并覆盖（含全角）
 _TRAILING_PUNCTUATION = {
     ",", ".", ";", "!", "?", ":", ")", "]", "}", '"', "'",
     "，", "。", "；", "！", "？", "：", "）", "】", "》", "」", "、", "”", "’",
@@ -55,17 +47,10 @@ def _is_image_file(path):
 
 
 def _looks_binary(data):
-    """简单的二进制探测：头部包含 NUL 字节即视为二进制文件。
-
-    取舍说明：UTF-16 编码的文本文件天然含大量 NUL 字节，会被这里误判为二进制
-    而跳过。相比引入 chardet 之类的编码探测依赖，宁可让 UTF-16 用户手动转码，
-    保证检测逻辑零依赖、零误放进真二进制。
-    """
     return b"\x00" in data[:8192]
 
 
 def _load_image_compression_config():
-    """读取 config.json 中的图片压缩配置，失败时返回默认值。"""
     try:
         from core.model_manager import load_config
         cfg = load_config()
@@ -91,7 +76,6 @@ def _compress_image_bytes(
     max_output_bytes=DEFAULT_MAX_IMAGE_OUTPUT_BYTES,
     max_decoded_pixels=MAX_DECODED_IMAGE_PIXELS,
 ):
-    """规范化并压缩静态图片，返回数据及其真实媒体类型。"""
     try:
         from PIL import Image, ImageOps
     except ImportError as exc:
@@ -118,7 +102,6 @@ def _compress_image_bytes(
             )
         opened.load()
 
-        # GIF 保留原始动画和编码；仍执行格式识别与像素上限检查。
         if source_format == "gif":
             return CompressedImage(raw_bytes, mime_types[source_format], source_format)
 
@@ -184,14 +167,6 @@ def _compress_image_bytes(
 
 
 def _is_within_sandbox(file_path, session_id=None):
-    """M38 修复：@ 挂载/绝对路径挂载必须与 core/tools.py 走同一套沙盒边界校验。
-
-    只读复用 tools.py 的 _resolve_workspace_path（不修改 tools.py）：
-    默认仅允许当前工作目录内的路径；/sandbox on（或会话级/线程级放行）时与
-    read_file 一样放行工作目录外路径。越界返回 False，由调用方跳过该附件，
-    避免 ../.env、C:\\...\\id_rsa 之类的敏感文件被直接内联进 LLM 上下文并持久化。
-    用户显式上传/选择的附件和粘贴板临时图片属于用户授权操作，直接放行。
-    """
     try:
         from core.tools import is_trusted_paste_path, is_session_user_attached_path
         if is_trusted_paste_path(file_path) or is_session_user_attached_path(file_path, session_id):
@@ -207,12 +182,6 @@ def _is_within_sandbox(file_path, session_id=None):
 
 
 def parse_user_input(text, explicit_paths=None, session_id=None):
-    """
-    解析用户输入中的文件路径（包括 @文件 和绝对路径）。
-    返回 (处理后的最终 content, 附加的系统提示字符串列表)
-    content 如果包含图片，将返回 OpenAI 兼容的 list 结构。
-    explicit_paths: 来自 UI 显式选择或拖拽的附件列表（用户明确授权，不受沙盒越界限制）。
-    """
     if explicit_paths:
         try:
             from core.tools import register_session_user_attached_paths
@@ -222,17 +191,11 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
 
     extracted_files = []
 
-    # 0. 优先加入显式传入的附件路径
     if explicit_paths:
         for ep in explicit_paths:
             if ep and os.path.exists(ep) and os.path.isfile(ep):
                 extracted_files.append(str(Path(ep).resolve()))
 
-    # 1. 提取 @文件名 格式
-    #    字符集放开到「任意非空白、非花括号、非中文句读」：历史实现只认 ASCII，
-    #    「@接口文档.md」这类中文文件名（以及 @docs/接口文档.md 这种路径段含中文）
-    #    整段匹配不上，附件被静默丢弃——用户侧表现为「@ 了文件但内容没传过去」。
-    #    token 末尾紧贴的标点再从长到短逐层剥掉，命中真实文件即采用。
     for match in AT_PATH_TOKEN_PATTERN.findall(text):
         candidate = match
         resolved = ""
@@ -248,14 +211,9 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
             # 把 @xxx 从原始文本中删掉（只替换首个匹配，避免误删正文相同字串）
             text = text.replace(f"@{match}", "", 1).strip()
 
-    # 2. 提取盘符绝对路径 (例如 D:\wechatHistory\...\temp.png 或 D:/path/temp.png)
-    # 匹配带引号或不带引号的绝对路径，反斜杠与正斜杠两种写法都认
     abs_matches = re.finditer(r'(?:[\'"]?)([a-zA-Z]:[\\/][^\s\'"]+)(?:[\'"]?)', text)
     for m in abs_matches:
         candidate = m.group(1)
-        # 只接受原始候选路径精确匹配到真实文件的情况；
-        # 若路径末尾紧贴常见标点（如逗号、句号），循环去掉尾部标点直到找到真实文件或不再是标点。
-        # 注意：仅对标点字符做裁剪，避免把有效路径（如 D:data.txt）末尾字母切掉。
         trimmed = candidate
         while len(trimmed) > 1 and trimmed[-1] in _TRAILING_PUNCTUATION:
             if os.path.exists(trimmed) and os.path.isfile(trimmed):
@@ -289,7 +247,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
     img_cfg = _load_image_compression_config()
 
     for file_path in extracted_files:
-        # 用户显式指定的附件与粘贴图片直接放行；其余未受托的工作目录外路径拦截跳过
         try:
             allowed = _is_within_sandbox(file_path, session_id=session_id)
         except TypeError:
@@ -306,7 +263,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
             pass
         if _is_image_file(file_path):
             try:
-                # 原始文件限制保护读取内存，解码后另有像素数量限制。
                 if os.path.getsize(file_path) > MAX_IMAGE_BYTES:
                     limit_mb = MAX_IMAGE_BYTES // (1024 * 1024)
                     attached_msgs.append(
@@ -334,8 +290,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
                 else:
                     attached_msgs.append(f"🖼️ 已附加图片: {os.path.basename(file_path)}")
 
-                # 图片成功附加（压缩/未压缩分支均覆盖）：把原图路径写进文本，
-                # 供模型需要改图/垫图时把该路径传给生图插件的 image 参数
                 text_content += f"\n\n[附带图片文件: {os.path.basename(file_path)}]\n完整路径: {os.path.abspath(file_path)}（需要改图/垫图时，把此路径传给生图插件的 image 参数）\n"
 
                 encoded_string = base64.b64encode(compressed.data).decode('utf-8')
@@ -344,7 +298,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
                     "image_url": {
                         "url": f"data:{compressed.mime_type};base64,{encoded_string}"
                     },
-                    # 折叠占位符引用的原图来源路径；发往模型前由 _strip_media_and_merge 剥离
                     "source_path": os.path.abspath(file_path),
                 })
             except Exception as e:
@@ -356,8 +309,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
                 truncated = len(raw) > MAX_TEXT_BYTES
                 raw = raw[:MAX_TEXT_BYTES]
 
-                # 二进制非图片文件：无法直接内联内容，但把文件路径告知模型，
-                # 由模型自行用工具（Python 库/命令行）解析，而不是静默跳过
                 if _looks_binary(raw):
                     text_content += (
                         f"\n\n[附带文件: {os.path.basename(file_path)}]\n"
@@ -379,8 +330,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
                         if not truncated:
                             attached_msgs.append(f"⚠️ 无法解码的文本文件（疑似二进制），已跳过: {os.path.basename(file_path)}")
                             continue
-                        # 截断可能正好切在多字节字符中间：用 errors="replace" 替换
-                        # 损坏字节，而不是把正常文本误判为二进制跳过；取乱码更少的结果
                         utf8_guess = raw.decode("utf-8", errors="replace")
                         gbk_guess = raw.decode("gbk", errors="replace")
                         if utf8_guess.count("\ufffd") <= gbk_guess.count("\ufffd"):
@@ -402,10 +351,6 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
             except Exception as e:
                 attached_msgs.append(f"⚠️ 读取文本文件失败 {file_path}: {e}")
 
-    # T1.5 防伪造：用户输入（含附件内联内容）在进入历史前统一中和保留标记——
-    # 既防用户内容里的 `【当前运行上下文】` 等标记被 strip_context_suffix 误截断，
-    # 也防其被模型误认为系统注入的运行上下文。程序自身的上下文注入发生在本函数
-    # 之后（core/agent_service），使用未中和的原标记，strip 照常识别。
     text_content = neutralize_reserved_markers(text_content)
 
     if final_content:
@@ -413,17 +358,10 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
         final_content.insert(0, {"type": "text", "text": text_content})
         return final_content, attached_msgs
     else:
-        # 如果只有纯文本文件，直接返回字符串
         return text_content, attached_msgs
 
 
 def extract_session_refs(text):
-    """提取文本中的 @{会话名} 引用标记，返回 (清理后的文本, 会话名列表)。
-
-    会话名去重保序；所有 @{...} 标记均从文本中移除。
-    与 @文件 解析互不干扰：文件正则字符集不含 { }。
-    须在 parse_user_input 之前调用。
-    """
     if not text:
         return text, []
     refs = []
@@ -439,14 +377,6 @@ def extract_session_refs(text):
 
 
 def sanitize_session_title(text):
-    """从用户输入派生会话标题前的净化：@{会话名} 标记还原为内部名，并剥掉残留花括号。
-
-    标题之后会被再次作为 @{...} 引用的目标，因此标题里不能残留标记语法字符：
-    名字含 } 会让引用解析提前终止；前端插入引用时还会剥掉名字里的花括号
-    （useSuggest 的 replace(/[{}]/g, '')），两种情况都让「按名精确匹配」永远
-    落空，用户侧表现为「引用的对话不存在」。历史上自动标题截断 @{...} 标记
-    产生过「@{缓存改造} 阅读一下」「@{我这个自然语言交互如」这类不可引用的名字。
-    """
     if not text:
         return text or ""
     text = SESSION_REF_PATTERN.sub(lambda m: m.group(1), str(text))

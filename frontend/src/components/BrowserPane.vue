@@ -1,7 +1,4 @@
 <template>
-  <!-- 右侧面板「浏览器」工作台：DOM 工具栏 + 表面占位区。
-       真实网页由宿主叠加的原生 WebView2 控件渲染在占位区矩形上，
-       这里只负责工具栏交互、矩形上报与起始页/不支持态。 -->
   <div class="bp-root" data-test="browser-pane-root">
     <div class="bp-toolbar">
       <button
@@ -20,7 +17,6 @@
         @click="onForward"
       ><AppIcon name="chevron-right" :size="15" :stroke-width="2" /></button>
 
-      <!-- loading 时变停止按钮并让图标旋转（lucide loader 弧线本就为旋转设计） -->
       <button
         class="bp-btn"
         data-test="bp-reload"
@@ -36,7 +32,6 @@
         />
       </button>
 
-      <!-- 自由尺寸：自定义视口大小（原生表面贴合框矩形），对照桌面浏览器的设备模式 -->
       <button
         class="bp-btn"
         data-test="bp-size-toggle"
@@ -64,12 +59,11 @@
         @keydown="onAddrKeydown"
       />
 
-      <!-- 浏览器操控的紧急停止：target=browser 时顶部安全条不渲染，停止入口
-           收进工具栏，失控时仍能一键停止（快捷键 Ctrl+Alt+Esc 同样可用） -->
       <button
         v-if="store.computerRunIsBrowser && !store.computerRunTerminal"
         class="bp-btn bp-btn-stop"
         data-test="bp-computer-stop"
+        :disabled="store.computerControlMutating"
         title="停止当前浏览器操控（快捷键 Ctrl+Alt+Esc）"
         @click="stopBrowserControl"
       >
@@ -77,8 +71,6 @@
       </button>
     </div>
 
-    <!-- 自由尺寸菜单：预设 + 自定义宽高。打开期间宿主 hide 原生表面，
-         避免原生控件穿透盖住浮层（原生控件永远绘制在 DOM 之上） -->
     <div v-if="sizeMenuOpen" class="bp-size-menu" data-test="bp-size-menu">
       <div class="bp-size-presets">
         <button
@@ -123,12 +115,15 @@
       </p>
     </div>
 
-    <!-- 表面占位区：原生控件被宿主叠加在本矩形之上 -->
     <div ref="surfaceRef" class="bp-surface" data-test="bp-surface">
-      <!-- 自由尺寸视口框：渲染时矩形上报目标切到本框（原生表面精确贴合），
-           框尺寸 = 逻辑尺寸 × 适应缩放，网页逻辑视口恒等于请求尺寸 -->
+      <span
+        class="bp-phase-marker"
+        data-test="bp-surface-phase"
+        :data-phase="surface.surfacePhase.value"
+        aria-hidden="true"
+      ></span>
       <div
-        v-if="frameRenderable"
+        v-if="frameRenderable && !viewportConstrained"
         ref="frameRef"
         class="bp-frame"
         data-test="bp-frame"
@@ -145,7 +140,6 @@
         ></div>
       </div>
 
-      <!-- 宿主不支持（确认缺桥或桥显式回 unsupported_platform）：工具栏已禁用 -->
       <div v-if="unsupported" class="bp-notice" data-test="bp-unsupported">
         <AppIcon name="globe" :size="26" :stroke-width="1.5" />
         <p class="bp-notice-title">浏览器面板需要桌面端 GUI 宿主支持</p>
@@ -157,15 +151,29 @@
         <AppIcon name="loader" :size="22" :class="{ 'icon-spin': true }" />
       </div>
 
-      <!-- Office 文档转 PDF 进行中：优先于起始页/空态显示。首次转换要拉起
-           Office（10~25 秒），没有这个提示用户会以为点击没生效、反复点 -->
       <div v-else-if="officePending" class="bp-notice" data-test="bp-office-pending">
         <AppIcon name="loader" :size="22" :class="{ 'icon-spin': true }" />
         <p class="bp-notice-title">正在把 {{ officePending.name }} 转换成预览页</p>
         <p class="bp-notice-sub">首次转换需要 10~25 秒，之后会命中缓存</p>
       </div>
 
-      <!-- 起始页：没有页面时显示（此时原生表面被 hide，让出 DOM 起始页） -->
+      <div v-else-if="viewportConstrained" class="bp-constrained" data-test="bp-viewport-constrained">
+        <div class="bp-constrained-banner">
+          <strong>右栏空间不足，已暂停裁切式实时原生视图</strong>
+          <p class="bp-notice-sub">
+            {{ freeSize.w }} × {{ freeSize.h }} 在最小 {{ ZOOM_MIN }}× 缩放下至少需要
+            {{ viewportMinRequired.width }} × {{ viewportMinRequired.height }} px 面板空间；请手动拖宽右栏查看完整实时画面。
+          </p>
+        </div>
+        <img
+          v-if="constrainedThumbUrl"
+          class="bp-constrained-thumb"
+          data-test="bp-viewport-thumb"
+          :src="constrainedThumbUrl"
+          alt="完整视口缩略图"
+        />
+      </div>
+
       <div v-else-if="isStartPage" class="bp-start" data-test="bp-start">
         <p class="bp-start-title">内置浏览器</p>
         <div class="bp-start-cards">
@@ -182,9 +190,15 @@
         </div>
       </div>
 
-      <!-- 原生表面尚未就位（首帧 open 派发中/被临时隐藏）时的轻量占位 -->
-      <div v-else-if="!surfaceVisible" class="bp-notice" data-test="bp-surface-pending">
+      <div v-else-if="surface.surfacePhase.value === 'error'" class="bp-notice" data-test="bp-surface-error">
+        <AppIcon name="triangle-alert" :size="24" :stroke-width="1.6" />
+        <p class="bp-notice-title">原生浏览器视图加载失败</p>
+        <p class="bp-notice-sub">可尝试切换页签或点击刷新重试。</p>
+      </div>
+
+      <div v-else-if="!surfaceVisible || surface.surfacePhase.value === 'opening'" class="bp-notice" data-test="bp-surface-pending">
         <AppIcon name="loader" :size="22" :class="{ 'icon-spin': true }" />
+        <p v-if="surface.surfacePhase.value === 'opening'" class="bp-notice-sub">正在准备内置浏览器视图…</p>
       </div>
     </div>
   </div>
@@ -200,8 +214,6 @@ const props = defineProps<{ active: boolean }>();
 
 const store = useAppStore();
 
-// 浏览器操控的紧急停止：target=browser 时顶部安全条不渲染，停止入口收到
-// 工具栏（computerRunIsBrowser && !computerRunTerminal 时才显示）。
 function stopBrowserControl(): void {
   void store.stopComputerControl();
 }
@@ -231,7 +243,6 @@ const bridgePhase = ref<BridgePhase>(
   typeof readApi()?.browser_pane_open === 'function' ? 'ready' : 'waiting',
 );
 const bridgeWaiting = computed(() => bridgePhase.value === 'waiting');
-// 平台不支持 = 确认缺桥 或 宿主桥在任一次调用里显式回了 unsupported_platform
 const unsupported = computed(
   () => bridgePhase.value === 'missing' || !store.embeddedBrowser.supported,
 );
@@ -249,9 +260,7 @@ function onBridgeReady(): void {
   bridgePhase.value = 'ready';
   stopBridgeWait();
   window.removeEventListener('pywebviewready', onBridgeReady);
-  // 桥就绪晚于挂载是桌面端常态：此刻才能校准地址栏/前进后退等真实状态
   void calibrate();
-  // 挂起的外部导航请求（点击 html 时桥还没就绪）：就绪后补上导航
   if (pendingExternalUrl.value) {
     const url = pendingExternalUrl.value;
     pendingExternalUrl.value = '';
@@ -278,7 +287,6 @@ function isBlankUrl(url: string): boolean {
   return !url || url === 'about:blank';
 }
 
-// 起始页条件：无页面地址且不在加载中（加载中的 about:blank 由原生表面接管）
 const isStartPage = computed(() => {
   if (unsupported.value) return false;
   return isBlankUrl(String(store.embeddedBrowser.url || '')) && !store.embeddedBrowser.loading;
@@ -291,23 +299,15 @@ const officePending = computed(() => store.officePreviewPending);
 
 const surfaceRef = ref<HTMLElement | null>(null);
 
-// ── 自由尺寸（自定义视口 · 适应窗口）──
-// 照桌面浏览器设备模式的「适应窗口」：请求的逻辑视口（如 1280×800）不变，
-// 原生 WebView2 用 ZoomFactor 把渲染整体缩放后贴合到面板内的「视口框」矩形
-// ——框尺寸 = 逻辑尺寸 × 缩放，网页真实视口恒等于请求的逻辑尺寸。
-// 框四周留边距：拖拽手柄在框外，且 .bp-surface overflow:hidden。
 const SIZE_PRESETS = [
   { key: 'phone', label: '手机', w: 375, h: 667 },
   { key: 'tablet', label: '平板', w: 768, h: 1024 },
   { key: 'desktop', label: '桌面', w: 1280, h: 800 },
 ] as const;
-// 自定义输入的逻辑尺寸边界
 const FREE_MIN_W = 120;
 const FREE_MIN_H = 200;
 const FREE_MAX = 8192;
-// 视口框四周保留的最小边距（≥ 手柄外扩 7px + 呼吸空间）
 const FREE_RING = 16;
-// WebView2 ZoomFactor 允许范围（与后端 _ZOOM_MIN/_ZOOM_MAX 一致）
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 8;
 
@@ -328,49 +328,70 @@ const sizeLabel = computed(() =>
 // 适应窗口缩放：面板可绘区（扣除边距）与逻辑视口的内切比例。
 // 表面不可测量（clientWidth 为 0，如测试环境）时不缩放，保持 1:1。
 const fitScale = ref(1);
+const surfaceSize = ref({ width: 0, height: 0 });
 const zoomPct = computed(() => Math.round(fitScale.value * 100));
+
+const viewportMinRequired = computed(() => ({
+  width: Math.ceil(freeSize.value.w * ZOOM_MIN + FREE_RING * 2),
+  height: Math.ceil(freeSize.value.h * ZOOM_MIN + FREE_RING * 2),
+}));
+
+const viewportConstrained = computed(() => {
+  if (!freeSize.value.on || unsupported.value || bridgeWaiting.value || officePending.value) {
+    return false;
+  }
+  const sw = surfaceSize.value.width;
+  const sh = surfaceSize.value.height;
+  if (sw <= 0 || sh <= 0) return false;
+  const availW = sw - FREE_RING * 2;
+  const availH = sh - FREE_RING * 2;
+  return availW < freeSize.value.w * ZOOM_MIN || availH < freeSize.value.h * ZOOM_MIN;
+});
+
+const constrainedThumbUrl = computed(() => {
+  if (!viewportConstrained.value) return '';
+  return String(store.computerRun.preview_url || '');
+});
 
 function computeFitScale(w: number, h: number): number {
   const el = surfaceRef.value;
-  const availW = (el?.clientWidth ?? 0) - FREE_RING * 2;
-  const availH = (el?.clientHeight ?? 0) - FREE_RING * 2;
+  const cw = el?.clientWidth ?? 0;
+  const ch = el?.clientHeight ?? 0;
+  surfaceSize.value = { width: cw, height: ch };
+  const availW = cw - FREE_RING * 2;
+  const availH = ch - FREE_RING * 2;
   if (availW <= 0 || availH <= 0 || w <= 0 || h <= 0) return 1;
   return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(availW / w, availH / h)));
 }
 
 function updateFitScale() {
-  fitScale.value = freeSize.value.on ? computeFitScale(freeSize.value.w, freeSize.value.h) : 1;
+  if (!freeSize.value.on) {
+    const el = surfaceRef.value;
+    surfaceSize.value = { width: el?.clientWidth ?? 0, height: el?.clientHeight ?? 0 };
+    fitScale.value = 1;
+    return;
+  }
+  fitScale.value = computeFitScale(freeSize.value.w, freeSize.value.h);
 }
 
-// 视口框是缩放后的视觉尺寸；上报该矩形 + 缩放值，网页逻辑视口即恒等于请求尺寸
 const frameW = computed(() => Math.round(freeSize.value.w * fitScale.value));
 const frameH = computed(() => Math.round(freeSize.value.h * fitScale.value));
 
 const surface = useEmbeddedBrowserSurface({
   isActive: () => props.active,
-  // 起始页/不支持态/尺寸菜单打开时让宿主 hide：原生空白页会盖住 DOM 起始页，
-  // 原生页面会穿透盖住菜单浮层（原生控件永远绘制在 DOM 之上）。
-  // 例外：星瑶自动化已下发视口时，起始页也要显示原生表面——自动化马上要经
-  // CDP 导航，隐藏的 WebView2 截图会被节流/挂起（曾致首次 observe 超时、
-  // backend 被判封闭报「无法打开浏览器」）；短暂可见的空白页是预期围观体验。
-  // 画笔截图冻结帧接管整块面板时最先让位：冻结帧在进入模式前已捕获表面
-  // 像素，原生控件若继续显示会盖住画笔覆盖层；门控放在 automationViewport
-  // 之前——星瑶自动化的「起始页保显」也不能越过这个模态，snip 关闭后
-  // 既有 watch 会自动 re-show 表面。
   shouldShowSurface: () =>
     !store.rightPanelSnipActive &&
+    !store.embeddedBrowserOverlayBlocking &&
+    !viewportConstrained.value &&
     !unsupported.value &&
     !sizeMenuOpen.value &&
     // Office 转 PDF 期间先把原生表面收起：原生控件永远画在 DOM 之上，
     // 否则「正在转换」浮层会被上一页盖住（转换结束/失败后自动 re-show）
     !store.officePreviewPending &&
     (!isStartPage.value || !!store.embeddedBrowser.automationViewport),
-  // 自由尺寸模式下量「视口框」而非整块表面
   getSurfaceEl: () => frameRef.value || surfaceRef.value,
-  // 视口框是缩放后的视觉尺寸，逻辑视口 = 框尺寸 / 缩放 = 请求的逻辑尺寸。
-  // 只在真正量「框」时才带缩放：量整块表面（起始页态）时缩放无意义，
-  // 带上会让宿主把 surface 矩形除以 fitScale，得到错误的网页视口。
   getZoom: () => (frameRenderable.value && freeSize.value.on ? fitScale.value : 1),
+  getSessionName: () => store.currentSessionName,
   // 原生控件永远绘制在 DOM 之上且不受 overflow:hidden 裁剪：上报矩形一旦
   // 越出占位区就会盖住会话区（自由尺寸框在占位区不可测量时兜底缩放=1，
   // 曾按原始 1440×900 铺满整个主区）。所有上报矩形一律夹紧回占位区内。
@@ -380,12 +401,10 @@ const surface = useEmbeddedBrowserSurface({
 });
 const surfaceVisible = surface.surfaceVisible;
 
-// ── 地址栏 ──
 const addrInputRef = ref<HTMLInputElement | null>(null);
 const editing = ref(false);
 const draft = ref('');
 
-// 非聚焦显示当前地址（about:blank/空显示空串）；聚焦进入编辑态显示草稿
 const displayUrl = computed(() => {
   if (editing.value) return draft.value;
   const url = String(store.embeddedBrowser.url || '');
@@ -396,7 +415,6 @@ function onAddrFocus() {
   const url = String(store.embeddedBrowser.url || '');
   draft.value = isBlankUrl(url) ? '' : url;
   editing.value = true;
-  // 聚焦即全选：习惯「输入即替换」的用户不必先删旧地址
   void nextTick(() => addrInputRef.value?.select());
 }
 
@@ -404,24 +422,21 @@ function onAddrInput(e: Event) {
   draft.value = (e.target as HTMLInputElement).value;
 }
 
-// 失焦未提交：退出编辑态即丢弃草稿，displayUrl 自动回落到 state.url
 function onAddrBlur() {
   editing.value = false;
 }
 
-// IME 组合态守卫：中文输入法确认候选词的那次 Enter 会先到 keydown，
-// 此刻文字尚未上屏（isComposing=true / keyCode 229）——若直接提交会送出旧值。
 function isImeComposing(e: KeyboardEvent): boolean {
   return e.isComposing === true || (e as any).keyCode === 229;
 }
 
 function onAddrKeydown(e: KeyboardEvent) {
   if (e.key !== 'Enter') return;
-  if (isImeComposing(e)) return; // 组合中交给输入法上屏
+  if (isImeComposing(e)) return;
   e.preventDefault();
   const raw = draft.value.trim();
   editing.value = false;
-  if (!raw) return; // 空输入忽略：不改动当前页面
+  if (!raw) return;
   goTo(normalizeUrl(raw));
 }
 
@@ -431,10 +446,6 @@ function searchUrl(query: string): string {
   return SEARCH_PREFIX + encodeURIComponent(query);
 }
 
-// 提交归一化（参照浏览器地址栏习惯）：
-// - 已带 scheme（xx://）原样放行
-// - 含空格、或首段无 '.' 且非 localhost/IP → 走必应搜索
-// - 其余视为域名，补 https://
 function normalizeUrl(input: string): string {
   const text = input.trim();
   if (!text) return '';
@@ -448,10 +459,8 @@ function normalizeUrl(input: string): string {
   return searchUrl(text);
 }
 
-/** 导航到目标地址：乐观更新地址栏，再驱动原生表面 */
 function goTo(url: string) {
   if (!url || unsupported.value || bridgeWaiting.value) return;
-  // 乐观更新：立即从起始页切到「表面」态（原生控件随即被创建/接管）
   store.embeddedBrowser.url = url;
   surface.navigate(url);
 }
@@ -471,7 +480,6 @@ function consumeBrowserNavRequest() {
   // 页签未激活（面板折叠/停在别的页签）：等 active 变 true 再消费，
   // 否则会对着 0 尺寸占位区 open，导航被丢弃
   if (!props.active) return;
-  // 别的会话的导航请求不在当前视图消费：切到该会话时由 active 变化再触发
   if (req.session && req.session !== store.currentSessionName) return;
   if (store.browserNavNonce === consumedNavNonce) return;
   if (unsupported.value) {
@@ -494,14 +502,11 @@ function consumeBrowserNavRequest() {
   goTo(req.url);
 }
 
-// nonce 变化 = 新的导航请求（同一文件重复点击也会自增，watch 必触发）
 watch(() => store.browserNavNonce, consumeBrowserNavRequest);
-// 页签/面板激活：消费挂起期间到达的请求（切回会话时回放的 pending URL 走这条）
 watch(() => props.active, (active) => {
   if (active) consumeBrowserNavRequest();
 });
 
-// ── 工具栏按钮 ──
 function onBack() { surface.request('browser_pane_back'); }
 function onForward() { surface.request('browser_pane_forward'); }
 function onReloadOrStop() {
@@ -509,11 +514,8 @@ function onReloadOrStop() {
   else surface.request('browser_pane_reload');
 }
 
-// ── 自由尺寸交互 ──
-
 function toggleSizeMenu() {
   sizeMenuOpen.value = !sizeMenuOpen.value;
-  // 打开时把当前尺寸同步进自定义输入框，便于微调
   if (sizeMenuOpen.value) {
     customW.value = freeSize.value.w;
     customH.value = freeSize.value.h;
@@ -545,7 +547,6 @@ function applyFreeSize(preset: { w: number; h: number } | null) {
   }
   updateFitScale();
   sizeMenuOpen.value = false;
-  // 等视口框渲染/卸载完成后再量矩形（syncNow 内部有 rectKey 去重）
   void nextTick(() => surface.syncNow());
 }
 
@@ -577,7 +578,7 @@ function onGripDown(e: PointerEvent) {
     h: freeSize.value.h,
     scale: fitScale.value || 1,
   };
-  try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { /* jsdom 等 */ }
+  try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { }
   e.preventDefault();
 }
 
@@ -604,9 +605,6 @@ function onGripUp() {
   surface.syncNow();
 }
 
-// 星瑶浏览器自动化：面板按后端下发的项目分辨率做适应窗口呈现（用户围观）。
-// 与手动自由尺寸共用同一 rect+zoom 上报路径；后端嵌入控件的 CDP 连接与
-// 本面板看到的逻辑视口由此保持一致。
 watch(
   () => store.embeddedBrowser.automationViewport,
   (viewport) => {
@@ -622,6 +620,7 @@ watch(
       surface.syncNow();
     });
   },
+  { immediate: true },
 );
 
 // 视口框的挂载/卸载由 frameRenderable 翻转驱动（起始页→有页面），ResizeObserver
@@ -637,8 +636,6 @@ watch(frameRenderable, (renderable) => {
   });
 });
 
-// 挂载后校准一次：宿主可能已在别处创建过控件（如窗口重载后），
-// 用 get_state 把地址栏/前进后退能力拉回真实值
 async function calibrate() {
   try {
     const res = await readApi()?.browser_pane_get_state?.();
@@ -647,17 +644,22 @@ async function calibrate() {
     } else if (res && res.ok === false && res.error === 'unsupported_platform') {
       store.embeddedBrowser.supported = false;
     }
-  } catch { /* 桥未就绪：保持空态 */ }
+  } catch { }
 }
 
-// 面板尺寸变化时重算适应缩放：视口框随之缩放并重报矩形，
-// 保证任意面板尺寸下请求的逻辑视口都完整可见
 let surfaceRo: ResizeObserver | null = null;
+const onWindowResizeMetrics = () => {
+  if (!freeSize.value.on) return;
+  const prev = fitScale.value;
+  updateFitScale();
+  if (fitScale.value !== prev) void nextTick(() => surface.syncNow());
+};
 
 onMounted(() => {
   // 挂载前到达的外部导航请求（点击 html 时本组件可能还没挂载）统一在此消费：
   // 桥未就绪先挂起（就绪后补导航），宿主不支持则回退源码预览
   consumeBrowserNavRequest();
+  window.addEventListener('resize', onWindowResizeMetrics);
   // ResizeObserver 必须先于桥状态分支注册：面板尺寸变化与桥是否就绪无关。
   // 旧实现把它放在 `bridgePhase === 'ready' → return` 之后，正常启动（桥已就绪）
   // 永远走不到这里，于是拖动右侧面板宽度后 fitScale 不重算，视口框仍按旧尺寸
@@ -665,33 +667,28 @@ onMounted(() => {
   const el = surfaceRef.value;
   if (el && typeof ResizeObserver !== 'undefined') {
     try {
-      surfaceRo = new ResizeObserver(() => {
-        if (!freeSize.value.on) return;
-        const prev = fitScale.value;
-        updateFitScale();
-        if (fitScale.value !== prev) void nextTick(() => surface.syncNow());
-      });
+      surfaceRo = new ResizeObserver(onWindowResizeMetrics);
       surfaceRo.observe(el);
     } catch { surfaceRo = null; }
   }
   // 初始校准：resize 观测只在尺寸变化时触发，首帧的适应缩放要主动算一次。
   // 否则 fitScale 会一直停在兜底 1，视口框按原始逻辑尺寸渲染并溢出面板。
+  updateFitScale();
   if (freeSize.value.on) {
-    updateFitScale();
     void nextTick(() => surface.syncNow());
   }
-  // 桥已在 setup 前就绪（热重载/重挂载）：直接校准；waiting 则挂双通道等待
   if (bridgePhase.value === 'ready') { void calibrate(); return; }
   if (bridgePhase.value === 'waiting') watchBridge();
 });
 
 onUnmounted(() => {
   window.removeEventListener('pywebviewready', onBridgeReady);
+  window.removeEventListener('resize', onWindowResizeMetrics);
   stopBridgeWait();
   if (typeof document !== 'undefined') {
     document.removeEventListener('pointerdown', onDocPointerDown, true);
   }
-  if (surfaceRo) { try { surfaceRo.disconnect(); } catch { /* 忽略 */ } surfaceRo = null; }
+  if (surfaceRo) { try { surfaceRo.disconnect(); } catch { } surfaceRo = null; }
   dragStart = null;
   if (dragRaf) { cancelAnimationFrame(dragRaf); dragRaf = 0; }
 });
@@ -699,7 +696,7 @@ onUnmounted(() => {
 
 <style scoped>
 .bp-root {
-  position: relative; /* 自由尺寸菜单的定位锚点 */
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -759,7 +756,6 @@ onUnmounted(() => {
 .bp-addr:disabled {
   opacity: 0.5;
 }
-/* 表面占位区：原生 WebView2 被宿主叠加在本矩形之上 */
 .bp-surface {
   position: relative;
   flex: 1;
@@ -832,10 +828,9 @@ onUnmounted(() => {
   margin: 0;
   font-size: 12px;
 }
-/* ── 自由尺寸 ── */
 .bp-size-menu {
   position: absolute;
-  top: 40px; /* 工具栏（约 38px）下方 */
+  top: 40px;
   right: 8px;
   z-index: 30;
   width: 224px;
@@ -918,8 +913,6 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-faint);
 }
-/* 视口框：原生表面精确贴合本框；居中锚定，translate 后的矩形由
-   getBoundingClientRect 量得（含 transform，上报坐标天然正确） */
 .bp-frame {
   position: absolute;
   left: 50%;
@@ -944,5 +937,41 @@ onUnmounted(() => {
 }
 .bp-frame-grip:hover {
   border-color: var(--accent);
+}
+.bp-phase-marker {
+  display: none;
+}
+.bp-constrained {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  height: 100%;
+  box-sizing: border-box;
+  overflow: auto;
+}
+.bp-constrained-banner {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--yellow) 45%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--yellow) 10%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.bp-constrained-banner strong {
+  display: block;
+  margin-bottom: 4px;
+}
+.bp-constrained-thumb {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: calc(100% - 92px);
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
 }
 </style>

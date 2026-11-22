@@ -12,14 +12,11 @@ describe('renderMarkdown 表格渲染', () => {
     ].join('\n');
     const html = renderMarkdown(md);
     expect(html).toContain('<table>');
-    expect((html.match(/<tr>/g) || []).length).toBe(4); // 1 表头 + 3 数据行
+    expect((html.match(/<tr>/g) || []).length).toBe(4);
     expect(html).not.toContain('|---|');
   });
 
   it('某行含空的反引号对（上游占位符被清理后的残留）不应吞掉后续表格行', () => {
-    // 复现 2026-08-30 的实际事故：模型输出中的 `` 空代码片段
-    // （sanitize 清理占位符后的残留）使行内代码正则跨行贪婪匹配，
-    // 把第 2 行到第 4 行的反引号之间整张表吞成一段行内代码。
     const md = [
       '| # | 问题 | 状态 |',
       '|---|---|---|',
@@ -32,7 +29,6 @@ describe('renderMarkdown 表格渲染', () => {
     expect(html).toContain('<table>');
     // 表头 + 4 个数据行都必须存在
     expect((html.match(/<tr>/g) || []).length).toBe(5);
-    // 空的反引号对应原样保留为文本，不应成为跨行代码片段的起点
     expect(html).toContain('占位符泄漏到用户界面');
     expect(html).toContain('_resolve_stdio_errlog()');
   });
@@ -41,7 +37,6 @@ describe('renderMarkdown 表格渲染', () => {
     const md = '第一段有个孤立反引号 ` 结尾\n第二行 `code` 正常';
     const html = renderMarkdown(md);
     expect(html).toContain('<code>code</code>');
-    // 孤立反引号不应把换行后的内容吞进 <code>
     expect(html).not.toMatch(/<code>[^<]*\n/);
   });
 

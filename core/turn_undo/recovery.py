@@ -1,17 +1,3 @@
-"""星瑶按回合撤销：崩溃中断检测、路径冻结与显式恢复。
-
-规格 13/24：
-- 启动扫描把未终态撤销操作按确定性收敛（不自动重放任何文件写入）：
-  previewed → cancelled（令牌跨重启已失效）、preparing/prepared → failed
-  （未触碰目标）、applying/verifying → interrupted（磁盘状态不确定）。
-- interrupted 的检查点冻结全部影响路径（含父/子包含关系），且该工作区的
-  通用终端命令也被拒绝。
-- 用户显式选择 continue_revert（完成剩余撤销）或 cancel_revert（把已处理
-  路径恢复到点击撤销之前）；两种恢复都先预检并使用独立一次性令牌，每次
-  确认建立带 parent_operation_id 的独立操作，成功后原子解决父操作。
-- 文件已进入事务未知状态时进入 recovery_required，不猜测写入。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -45,10 +31,6 @@ from core.turn_undo.storage import _default_data_dir
 import secrets
 
 
-# ---------------------------------------------------------------------------
-# 启动扫描
-# ---------------------------------------------------------------------------
-
 def scan_and_mark_interrupted_on_startup(
     storage: TurnUndoStorage,
     coordinator: coordinator_mod.WorkspaceCoordinator,
@@ -62,7 +44,6 @@ def scan_and_mark_interrupted_on_startup(
         except TurnUndoError:
             continue
         if status is OperationStatus.PREVIEWED:
-            # 从未进入执行段：令牌跨 boot 已死，显式取消
             storage.transition_operation(
                 op.operation_id, OperationStatus.CANCELLED,
                 last_error_code=UndoErrorCode.TOKEN_EXPIRED,
@@ -97,7 +78,6 @@ def scan_and_mark_interrupted_on_startup(
                 "to_status": OperationStatus.FAILED.value,
             })
             continue
-        # APPLYING / VERIFYING：磁盘状态不确定 → interrupted + 冻结
         storage.transition_operation(
             op.operation_id, OperationStatus.INTERRUPTED,
             last_error_code=UndoErrorCode.REVERT_INTERRUPTED,
@@ -121,8 +101,6 @@ def scan_and_mark_interrupted_on_startup(
             "to_status": OperationStatus.INTERRUPTED.value,
         })
 
-    # 重启重建：已处于 interrupted / recovering 的检查点恢复冻结
-    # （协调器是进程内状态，崩溃后必须按持久化事实重新冻结，规格 24）
     for checkpoint in storage.list_checkpoints_by_status((
         TurnUndoStatus.INTERRUPTED, TurnUndoStatus.RECOVERING,
     )):
@@ -177,10 +155,6 @@ def scan_and_mark_interrupted_on_startup(
     return report
 
 
-# ---------------------------------------------------------------------------
-# 恢复预检
-# ---------------------------------------------------------------------------
-
 def _require_session_scope(storage: TurnUndoStorage, session_id: int, operation_id: str):
     operation = storage.get_operation(operation_id)
     checkpoint = storage.get_checkpoint(operation.checkpoint_id)
@@ -193,7 +167,6 @@ def _require_session_scope(storage: TurnUndoStorage, session_id: int, operation_
 
 
 def _classify_recovery_files(storage: TurnUndoStorage, operation) -> tuple[list, list, list]:
-    """把操作文件分为 (processed_ok, remaining, unknown)。"""
     op_files = storage.list_operation_files(operation.operation_id)
     rows = {row.file_id: row for row in storage.list_files(operation.checkpoint_id)}
     processed: list = []
@@ -206,7 +179,6 @@ def _classify_recovery_files(storage: TurnUndoStorage, operation) -> tuple[list,
             continue
         actual = recorder_mod.capture_node_state(row.canonical_path)
         if op_file.apply_status == FileStageStatus.APPLIED.value:
-            # 已处理文件：验证撤销结果仍在位
             expected_blob = row.before_blob_sha256
             if op_file.rollback_kind == RollbackKind.DELETE_CREATED.value:
                 ok = actual.kind is NodeKind.MISSING
@@ -265,7 +237,6 @@ def preview_recovery(
     processed, remaining, unknown = _classify_recovery_files(storage, operation)
 
     if unknown:
-        # 文件已进入事务未知状态：recovery_required，不直接写入
         if operation.status_enum is OperationStatus.INTERRUPTED:
             storage.transition_operation(
                 operation.operation_id, OperationStatus.RECOVERY_REQUIRED,
@@ -289,7 +260,6 @@ def preview_recovery(
         )
         return preview, ""
 
-    # 独立恢复操作 + 一次性令牌（每次确认新建，不覆盖原中断行）
     child_kind = (
         OperationKind.CONTINUE_REVERT
         if action is RecoveryAction.CONTINUE_REVERT
@@ -301,7 +271,6 @@ def preview_recovery(
         parent_operation_id=operation.operation_id,
         preview_version=checkpoint.record_version,
     )
-    # 令牌绑定恢复动作将触碰的文件集合指纹
     pairs = []
     for opf, row, _ in (
         (processed + remaining) if action is RecoveryAction.CANCEL_REVERT else remaining
@@ -341,10 +310,6 @@ def _recovery_fingerprint_set(pairs) -> str:
         digest.update(b"\n")
     return digest.hexdigest()
 
-
-# ---------------------------------------------------------------------------
-# 恢复执行
-# ---------------------------------------------------------------------------
 
 def execute_recovery(
     storage: TurnUndoStorage,
@@ -404,10 +369,10 @@ def execute_recovery(
 
     root = checkpoint.workspace_root
     with coordinator.workspace_lock(root):
-        if coordinator.active_turn_id(root) is not None:
+        if coordinator.has_active_turn(root):
             raise TurnUndoError(
                 UndoErrorCode.WORKSPACE_BUSY,
-                "工作区有正在进行的回合，请稍后恢复",
+                "工作区有正在进行的回合或后台写入任务，请稍后恢复",
             )
         if coordinator.active_undo_id(root) is not None:
             raise TurnUndoError(
@@ -448,7 +413,6 @@ def execute_recovery(
                 "恢复执行前发现文件与预检结果不一致，本次没有修改任何文件",
             )
 
-        # 短事务：消费令牌 + child preparing + 检查点 recovering
         with storage._manager._lock:
             cursor = storage.conn.cursor()
             try:
@@ -515,7 +479,6 @@ def _run_recovery_transaction(
         return error
 
     try:
-        # 严格按状态机推进：preparing → prepared → applying → verifying → committed
         storage.transition_operation(child_id, OperationStatus.PREPARED)
         storage.transition_operation(child_id, OperationStatus.APPLYING)
         if action is RecoveryAction.CONTINUE_REVERT:
@@ -530,7 +493,6 @@ def _run_recovery_transaction(
     except TurnUndoError as error:
         raise _interrupt(error) from error
 
-    # 同事务：child committed + parent resolved + 检查点终态 + （continue 时）纠正记录
     now = now_ms()
     with storage._manager._lock:
         cursor = storage.conn.cursor()
@@ -609,7 +571,6 @@ def _run_recovery_transaction(
         checkpoint.workspace_root,
         [row.canonical_path for _, row, _ in processed + remaining],
     )
-    # 成功收敛后清理事务隔离目录（中断时不清理，恢复需要其中的隔离文件）
     for done_id in (child_id, parent_op.operation_id):
         shutil.rmtree(
             _default_data_dir() / "undo_transactions" / done_id,
@@ -630,7 +591,6 @@ def _run_recovery_transaction(
 
 
 def _apply_continue(storage, checkpoint, child_id, remaining) -> list[str]:
-    """完成剩余撤销：与主事务相同的逐文件应用语义。"""
     isolation_dir = _operation_dir(storage, child_id)
     affected: list[str] = []
     for ordinal, (op_file, row, _) in enumerate(remaining):
@@ -685,7 +645,6 @@ def _apply_continue(storage, checkpoint, child_id, remaining) -> list[str]:
 
 
 def _refresh_after_identity(storage, row) -> None:
-    """自身恢复后的身份刷新：内容已验证一致，File ID 变化不是外部改动。"""
     actual = recorder_mod.capture_node_state(row.canonical_path)
     with storage._manager._lock:
         cursor = storage.conn.cursor()
@@ -703,13 +662,11 @@ def _refresh_after_identity(storage, row) -> None:
 
 
 def _apply_cancel(storage, checkpoint, child_id, processed, remaining) -> list[str]:
-    """取消撤销：把已处理路径恢复到用户点击撤销之前的状态。"""
     isolation_dir = _operation_dir(storage, child_id)
     affected: list[str] = []
     for ordinal, (op_file, row, _) in enumerate(processed):
         action = RollbackKind(op_file.rollback_kind)
         if action is RollbackKind.DELETE_CREATED:
-            # 撤销把新建文件移进了父操作隔离区（文件名 = 父操作文件 ID）
             isolated = (
                 _default_data_dir() / "undo_transactions" / op_file.operation_id
                 / f"{op_file.operation_file_id}.isolated"
@@ -735,7 +692,6 @@ def _apply_cancel(storage, checkpoint, child_id, processed, remaining) -> list[s
                 isolated.unlink()
             shutil.move(row.canonical_path, str(isolated))
         else:
-            # restore_content：恢复点击撤销之前的内容（after blob）
             rollback_blob = op_file.rollback_blob_sha256
             if not rollback_blob:
                 raise TurnUndoError(

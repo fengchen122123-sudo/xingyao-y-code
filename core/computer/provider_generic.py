@@ -1,9 +1,3 @@
-"""generic 协议的 Provider 投影：固定工具 schema、动态提示、批处理约束与观察消息。
-
-设计 10（统一动作协议）、19.1/19.3（Harness 和工具管线接入）：本模块不执行
-鼠标或键盘，只做消息/投影转换；动作执行经 ComputerTurnLease.controller。
-"""
-
 from __future__ import annotations
 
 import base64
@@ -18,6 +12,7 @@ from core.computer.actions import (
     sanitized_action_summary,
 )
 from core.computer.models import ComputerControlError, ComputerProtocol
+from core.computer.settings import get_browser_label, is_external_browser
 from core.computer.tool_adapter import (
     COMPUTER_ACTION_TOOL_NAME,
     COMPUTER_SELECT_TARGET_TOOL_NAME,
@@ -28,26 +23,12 @@ from core.tool_protocol import ToolResult
 
 _LOGGER = logging.getLogger(__name__)
 
-# follow-up 观察 user message 的固定说明文本（Task 9 brief 样例逐字）。
 OBSERVATION_FOLLOWUP_TEXT = "【电脑观察】请只依据这张最新截图决定下一步。"
 
-# 观察跟进消息持久化时的结构标记（_observation_followup_message 写入的
-# _computer_v1 键）。展示层据此把这类系统协议消息从用户气泡/红点导航中
-# 过滤掉——它们是系统发给模型的观察提示，不是用户发送的内容。
 _OBSERVATION_MARKER_KEY = "_computer_v1"
 
 
 def is_observation_protocol_message(obj) -> bool:
-    """判定是否为电脑操控观察跟进协议消息（展示层过滤用）。
-
-    兼容三种输入形状：
-    - memory 解析后的消息行 dict：_parse_message_rows 会把 JSON content 的
-      顶层键提升到行上，_computer_v1 出现在行 dict；
-    - 持久化 content 原始串（整个 message dict 的 JSON）：串内含该标记；
-    - 解析后的 message dict 本身。
-    其余形状（真实用户文本、多模态块列表、非字符串/字典）一律 False——
-    真实用户消息绝无此标记，模型上下文（get_history）不受展示过滤影响。
-    """
     if isinstance(obj, dict):
         return _OBSERVATION_MARKER_KEY in obj
     if isinstance(obj, str):
@@ -56,7 +37,7 @@ def is_observation_protocol_message(obj) -> bool:
 
 # 动态运行上下文里的电脑操控说明（通用化重构 Task E 的元素优先学说；只在
 # capability 决策为 enabled 时加入，绝不进 build_stable_system_message）。
-_GENERIC_DYNAMIC_PROMPT = (
+_GENERIC_DYNAMIC_CORE_RULES = (
     "电脑操控使用说明（generic 协议）：\n"
     "1. 第一次必须先调用 computer_action 的 observe 建立观察基线。\n"
     "2. 优先用元素引用操作，其次才是坐标：\n"
@@ -75,9 +56,10 @@ _GENERIC_DYNAMIC_PROMPT = (
     "     等页面就绪，再由后续步骤接着做，不要靠反复 observe 轮询等元素出现；\n"
     "     click_element / set_value_element 自带元素自动等待，不必在外层反复观察。\n"
     "   - 等待界面变化（文本出现、元素出现/可用、窗口激活）优先用 wait_for 条件等待\n"
-    "     （text_exists / element_exists / element_enabled / window_active），不要用\n"
-    "     wait 加反复 observe 轮询；wait_for 命中后直接返回新观察，超时返回\n"
-    "     computer_wait_timeout，此时改用 observe 检查画面再决定下一步。\n"
+    "     （text_exists / element_exists / element_enabled 支持 browser 同文档和\n"
+    "     desktop；window_active 只支持 desktop），不要用 wait 加反复 observe 轮询；\n"
+    "     wait_for 命中后直接返回新观察，超时返回 computer_wait_timeout，此时改用\n"
+    "     observe 检查画面再决定下一步。\n"
     "   - sequence 里打包 click_element / set_value_element 时，元素引用必须来自\n"
     "     sequence 之前最近一次 list_elements 返回的 ref，否则会报\n"
     "     computer_element_stale，需要重新 list_elements 取新 ref 后再发。\n"
@@ -88,16 +70,46 @@ _GENERIC_DYNAMIC_PROMPT = (
     "5. 出现焦点被抢、会话失活、窗口挪位时：先 list_elements 或 activate_surface"
     "重建基线，严禁按记忆里的旧坐标连续重试。\n"
     "6. 遇到登录、验证码或需要凭据时，改用 request_user_takeover 请求用户接管。\n"
-    "7. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。\n"
-    "8. 浏览器自动化在 GUI 右侧面板的内嵌浏览器里实时呈现（用户围观），页面按"
-    "项目分辨率渲染（桌面页默认 1440×900，移动页建议 375×667）；与目标页面"
-    "不匹配时先用 browser_set_viewport 调整再导航。\n"
+    "7. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。"
+)
+
+_BROWSER_REGION_OBSERVE_HINT = (
     "   - 图片型/密集小目标（网格游戏、图表、地图）看不清时，用 observe_region"
     " 指定 target=browser 与 x/y/width/height（CSS 视口坐标）放大该区域；"
     "之后的点击坐标以这块区域左上角为 (0,0)，回到整屏用 observe。"
 )
 
-# Provider tool result 的稳定 JSON 序列化参数（设计 10.2）。
+
+def _build_browser_dynamic_rule(capability) -> str:
+    targets = tuple(getattr(capability, "targets", ()) or ())
+    if "browser" not in targets:
+        if "desktop" in targets:
+            return "\n8. 当前仅开启桌面操控（target=desktop），未开启浏览器操控，不得调用 target=browser。"
+        return ""
+    browser = str(getattr(capability, "browser", "") or "").strip()
+    if browser == "embedded":
+        lead = (
+            "8. 当前系统默认浏览器为「星瑶内置浏览器」：浏览器网页打开（http/https）、"
+            "导航与交互必须优先使用 computer_action（target=browser），直接在 GUI 右侧面板"
+            "的内嵌浏览器里实时呈现（用户围观），不要先用 browser_pane 打开无调试端口的页面。"
+        )
+    elif is_external_browser(browser):
+        label = get_browser_label(browser)
+        window_note = "独立窗口运行，" if browser != "chromium" else ""
+        lead = (
+            f"8. 当前系统默认浏览器为「{label}」（{browser}，外部浏览器）：浏览器操作必须优先"
+            f"并严格通过 computer_action（target=browser）驱动该浏览器执行（{window_note}"
+            "实时截图与状态在 GUI 右侧面板「操控」页签预览），禁止改用 browser_pane 内置面板绕开系统设置。"
+        )
+    else:
+        lead = "8. 浏览器自动化在 GUI 右侧面板实时呈现。"
+    return (
+        f"\n{lead}"
+        "页面按项目分辨率渲染（桌面页默认 1440×900，移动页建议 375×667）；"
+        "与目标页面不匹配时先用 browser_set_viewport 调整再导航。\n"
+        f"{_BROWSER_REGION_OBSERVE_HINT}"
+    )
+
 _PROVIDER_JSON_KWARGS = {
     "ensure_ascii": False,
     "sort_keys": True,
@@ -114,11 +126,6 @@ def _is_generic_enabled(capability) -> bool:
 
 
 def build_generic_computer_tool(capability) -> dict | None:
-    """仅 generic 能力开启时返回 computer_action 工具 schema 副本。
-
-    返回深拷贝：调用方把它追加到现有 tools 尾部时不得改写模块级常量；
-    capability 关闭或非 generic 协议时返回 None（tools 字节保持原样）。
-    """
     if not _is_generic_enabled(capability):
         return None
     return copy.deepcopy(COMPUTER_ACTION_TOOL_SCHEMA)
@@ -128,16 +135,10 @@ def build_generic_dynamic_prompt(capability) -> str:
     """仅 generic 能力开启时返回电脑操控动态说明；否则空串（字节不变）。"""
     if not _is_generic_enabled(capability):
         return ""
-    return _GENERIC_DYNAMIC_PROMPT
+    return f"{_GENERIC_DYNAMIC_CORE_RULES}{_build_browser_dynamic_rule(capability)}"
 
 
 def validate_computer_tool_batch(tool_calls) -> None:
-    """整批校验（设计 10.1）：一次只能有一个 computer_action，且不得混用。
-
-    多个 computer call 或电脑动作与其他工具混用时抛 computer_invalid_action，
-    本 Step 不执行任何电脑动作（零副作用）；无电脑动作或单个独立电脑动作
-    时返回 None。接线点在调度层收到 tool_calls 之后、执行之前（Task 10）。
-    """
     calls = list(tool_calls or [])
     computer_calls = sum(
         1
@@ -156,17 +157,6 @@ def validate_computer_tool_batch(tool_calls) -> None:
 
 
 def computer_tool_arguments_projection(name: str, arguments) -> dict | None:
-    """computer 保留名工具参数的脱敏投影（设计 22.3/22.4，Task 16 隐私审计）。
-
-    - computer_action：经 parse_computer_action 严格解析后只保留
-      actions.sanitized_action_summary 摘要（输入正文/组合键/URL 只留
-      code point 数与 SHA-256）；解析失败回稳定错误形状，绝不回显原文；
-    - computer_select_target：只含 target 枚举，原样保留；
-    - 其他工具名返回 None（调用方保持原样，绝不触碰普通工具参数）。
-
-    ``arguments`` 可为已解析 dict 或原始 JSON 字符串；非法形态按解析失败
-    处理。投影是纯函数，供事件载荷与落库 tool_calls 两处共用。
-    """
     if name == COMPUTER_SELECT_TARGET_TOOL_NAME:
         if isinstance(arguments, str):
             try:
@@ -213,12 +203,12 @@ _ERROR_NEXT_STEP = {
     "computer_coordinate_out_of_bounds": "坐标超出当前画面尺寸，先 observe 确认尺寸再点",
     "computer_no_progress": "画面连续多次没有变化，换一种操作策略或直接询问用户",
     "computer_action_timeout": "动作超时且结果未知，先 observe 确认当前状态再决定",
+    "computer_wait_timeout": "等待条件在时限内未满足，先 observe 检查画面再决定下一步",
     "computer_invalid_action": "按工具说明修正参数后重试，不要原样重复同一调用",
 }
 
 
 def _error_message_with_next_step(error: ComputerControlError) -> str:
-    """错误文案追加「下一步」，让模型把错误码换成具体策略而不是盲目重试。"""
     message = str(getattr(error, "message", "") or "")
     hint = _ERROR_NEXT_STEP.get(str(getattr(error, "code", "") or ""))
     if not hint or hint in message:
@@ -227,7 +217,6 @@ def _error_message_with_next_step(error: ComputerControlError) -> str:
 
 
 def _error_result(target: str, action: str, error: ComputerControlError) -> ToolResult:
-    """稳定 9 键 JSON 错误结果（设计 10.2）：不携带截图、输入正文或旧图。"""
     payload = {
         "ok": False,
         "target": target,
@@ -239,6 +228,16 @@ def _error_result(target: str, action: str, error: ComputerControlError) -> Tool
         "error_code": error.code,
         "error_message": _error_message_with_next_step(error),
     }
+    details = getattr(error, "details", None) or {}
+    if action == "sequence" or "failed_step_index" in details:
+        if "failed_step_index" in details:
+            payload["failed_step_index"] = details["failed_step_index"]
+        if "submission_state" in details:
+            payload["submission_state"] = details["submission_state"]
+        if "completed_steps" in details:
+            payload["completed_steps"] = details["completed_steps"]
+        if "total_steps" in details:
+            payload["total_steps"] = details["total_steps"]
     return ToolResult(
         content=json.dumps(payload, **_PROVIDER_JSON_KWARGS),
         is_error=True,
@@ -257,7 +256,6 @@ def _read_observation_png(png_path: str) -> bytes:
         ) from error
 
 
-# 元素列表观察的 follow-up 说明文本（阶段二 a11y-first，2026-09-06）。
 _OBSERVATION_ELEMENTS_TEXT_PREFIX = (
     "【电脑观察·控件列表】请优先用元素引用动作操作"
     "（click_element 点击 / set_value_element 写值，目标输入框优先"
@@ -273,9 +271,6 @@ _OBSERVATION_REGION_HINT = (
     "点击，不要凭整屏截图目测坐标。"
 )
 
-# 浏览器 target 的定位提示（E3 修复）：observe_region 只支持 desktop，浏览器
-# 没有局部放大动作；旧文案对 browser 一视同仁，模型照做只会拿到
-# computer_invalid_action。浏览器只能看整屏图，因此提示强调"坐标以截图为准"。
 _OBSERVATION_BROWSER_POINT_HINT = (
     "【定位提示】本页没有可用的元素引用，请依据这张整屏截图判断位置，"
     "坐标以截图左上角为 (0,0)，不要凭记忆复用旧坐标。"
@@ -288,11 +283,7 @@ _OBSERVATION_REGION_VIEW_HINT = (
     "点击会换算回页面真实位置；需要回到整屏时调用 observe。"
 )
 
-# 「密集无名元素」判定阈值（元素数下限）：低于这个数量时逐行清单仍然便宜且
-# 有参考价值；超过它再叠加"命名元素占比 ≤20%"才判为清单无信息量。
 _DENSE_ELEMENT_MIN_COUNT = 60
-# 硬上限：元素多到这个量级时，即使都有名字，逐行清单也会把上下文吃掉，
-# 一律退化为「截图为主 + 显式 observe 可取全量」。
 _DENSE_ELEMENT_HARD_CAP = 300
 
 # 帧契约（2026-10-21，借 zcode frame-contract 的「体积上限 + 成对引用」思路）：
@@ -302,16 +293,14 @@ _DENSE_ELEMENT_HARD_CAP = 300
 _OBSERVATION_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 _OBSERVATION_IMAGE_MAX_EDGE = 1280
 
-# 画面与上一张完全相同时的替代说明：不重复附图，省下的 token 留给真实信息。
 _OBSERVATION_UNCHANGED_TEXT = (
     "【电脑观察】本次动作后画面与上一张截图完全相同，已省略重复图片，"
     "请直接依据上一张截图判断下一步；若怀疑画面其实已变，先调用 observe 重新确认。"
 )
 
-# 截图超限且缩放后仍超限时的说明。
 _OBSERVATION_IMAGE_OMITTED_TEXT = (
     "【电脑观察】本次截图体积仍超出上限，已省略图片，只返回画面摘要；"
-    "请依据 screen_sha256 与画面尺寸判断，必要时缩小窗口比例后重新 observe。"
+    "请依据 frame 标识、控件列表与画面尺寸判断，必要时缩小窗口比例后重新 observe。"
 )
 
 # B 方案（窗口被遮挡时的降级观察）：本次没有截图的说明。窗口最小化/被遮挡时
@@ -323,17 +312,10 @@ _OBSERVATION_NO_SCREENSHOT_TEXT = (
     "不要假设画面为空；需要图片时先让窗口重新可见（切回窗口或取消最小化）再 observe。"
 )
 
-# 无截图时附在文本观察里的页面正文章节标题（正文长度已由 backend 按码点截断）。
 _OBSERVATION_PAGE_TEXT_HEADING = "【页面正文】"
 
 
 def no_screenshot_observation_text(observation) -> str:
-    """无截图时的纯文本观察正文（B 方案降级；generic 与原生协议共用）。
-
-    为什么需要：截图缺失时观察只剩 DOM 信息（元素列表 / 页面正文），模型必须
-    同时知道"没有图"和"为什么没有图"，才能决定是继续按文本操作还是先恢复窗口。
-    正文长度已由 backend 截断，这里不再二次截断（再截短只会丢信息）。
-    """
     lines = [_OBSERVATION_NO_SCREENSHOT_TEXT]
     reason = str(getattr(observation, "screenshot_error", "") or "")
     if reason:
@@ -346,16 +328,20 @@ def no_screenshot_observation_text(observation) -> str:
     return "\n".join(lines)
 
 
-def _frame_reference_line(observation, *, size_bytes: int = 0) -> str:
-    """成对引用行（帧契约）：模型据此引用「同一帧」，而不是反复请求新图。
-
-    只含画面身份与尺寸，不含路径、时间戳或随机序号，保证相同画面字节稳定。
-    """
+def _frame_reference_line(
+    observation, *, size_bytes: int = 0, frame=None
+) -> str:
+    frame_id = str(
+        getattr(frame or observation, "frame_id", "")
+        or getattr(observation, "frame_id", "")
+        or ""
+    )
     sha = str(getattr(observation, "screen_sha256", "") or "")
+    width = int(getattr(frame, "image_width", 0) or getattr(observation, "width", 0) or 0)
+    height = int(getattr(frame, "image_height", 0) or getattr(observation, "height", 0) or 0)
     parts = [
-        f"frame={sha[:12] or 'unknown'}",
-        f"{int(getattr(observation, 'width', 0) or 0)}x"
-        f"{int(getattr(observation, 'height', 0) or 0)}",
+        f"frame={frame_id or sha[:12] or 'unknown'}",
+        f"{width}x{height}",
     ]
     if size_bytes:
         parts.append(f"png={size_bytes}B")
@@ -396,21 +382,10 @@ def _downscale_png(png_bytes: bytes) -> bytes | None:
 
 
 def _element_position_label(element, observation) -> str:
-    """按元素 bounds（物理屏幕坐标，矩形四角 left/top/right/bottom）给一个方位描述。
-
-    name 为空的控件（WebView2/Chromium 常见）只靠 bounds 无法判断是什么，
-    方位描述至少能让模型知道「右上角那个按钮」与列表项的对应关系。
-    坐标换算失败或落在画面外时返回空串，不阻断列表输出。
-    """
     bounds = tuple(element.get("bounds", ()) or ())
     if len(bounds) != 4:
         return ""
     try:
-        # 元素 bounds 是矩形四角 (left, top, right, bottom)——与生产方一致：
-        # windows_elements_uia 直接取 UIA CurrentBoundingRectangle 的四边，
-        # 浏览器侧 JS 取 getBoundingClientRect 的 right/bottom；绘图端
-        # som_annotator 也按同一语义读。故中心是两角均值，不能把 right/bottom
-        # 当宽高写成 left + right/2（那会把中心推到元素右下方，甚至推出画面）。
         left, top, right, bottom = (float(v) for v in bounds)
         vw = float(getattr(observation, "width", 0) or 0)
         vh = float(getattr(observation, "height", 0) or 0)
@@ -418,9 +393,6 @@ def _element_position_label(element, observation) -> str:
         oh = float(getattr(observation, "original_height", 0) or 0)
         if vw <= 0 or vh <= 0 or ow <= 0 or oh <= 0:
             return ""
-        # 反算与 screenshot_to_physical 同构：(物理 - 原点) * 模型尺寸 / 原始尺寸。
-        # 原点可为负（副屏在主屏上方/左侧），减法即完成平移，无需额外分支。
-        # 退化矩形（宽或高为 0，right==left / bottom==top）中心即角点，同样安全。
         mx = (((left + right) / 2.0) - float(getattr(observation, "origin_x", 0) or 0)) * vw / ow
         my = (((top + bottom) / 2.0) - float(getattr(observation, "origin_y", 0) or 0)) * vh / oh
     except (TypeError, ValueError):
@@ -439,7 +411,6 @@ def _element_position_label(element, observation) -> str:
 
 
 def _element_lines(observation) -> list[str]:
-    """控件列表的逐行渲染；带方位描述，未知位置时不加后缀。"""
     lines = []
     for element in getattr(observation, "elements", ()) or ():
         position = _element_position_label(element, observation)
@@ -454,11 +425,6 @@ def _element_lines(observation) -> list[str]:
 
 
 def _elements_content_blocks(element_lines: list[str]) -> list[dict]:
-    """控件列表的两个文本块（前缀 + 逐行）；无元素时返回空列表。
-
-    显式 observe 的附图路径与两条降级路径（无截图/超限）共用同一形状，
-    保证「能看图但看不了图」时也不会丢掉 el-N 引用。
-    """
     if not element_lines:
         return []
     return [
@@ -468,17 +434,8 @@ def _elements_content_blocks(element_lines: list[str]) -> list[dict]:
 
 
 def _is_dense_unnamed_elements(elements) -> bool:
-    """密集且几乎无名的元素列表 → 逐行清单信息量极低。
-
-    图片型/自绘界面（老式图片网格游戏、canvas 外壳里的空链接）会一次返回
-    上百个 name='' 的元素：清单既定位不了"哪个格子是哪一格"，又每步吞掉大量
-    上下文，还把模型从"看图判断"引向"按 bounds 猜"。这类列表改为以截图为主，
-    只在显式 observe 时保留清单。
-    """
     items = list(elements or ())
     if len(items) >= _DENSE_ELEMENT_HARD_CAP:
-        # 元素本身已经多到一行一行发就会吃掉大部分上下文：不论有没有名字
-        # 都退化为「截图为主」，显式 observe 仍可取回完整清单。
         return True
     if len(items) < _DENSE_ELEMENT_MIN_COUNT:
         return False
@@ -487,7 +444,6 @@ def _is_dense_unnamed_elements(elements) -> bool:
 
 
 def _dense_elements_note(count: int) -> str:
-    """密集无名元素时的替代说明：不给逐行清单，明确让模型看图/用坐标。"""
     return (
         f"【电脑观察·控件列表】本页 {count} 个可交互元素且几乎没有名称"
         "（图片型/自绘界面），本次已省略逐行清单；请依据截图判断局面，"
@@ -496,34 +452,21 @@ def _dense_elements_note(count: int) -> str:
     )
 
 
-def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> dict:
-    """观察的 follow-up user 消息（设计 10.2 + 阶段二双路径 + 帧契约）。
+def _observation_followup_message(
+    observation, *, run_id: str, ordinal: int, controller=None
+) -> dict:
+    from core.computer.frames import (
+        prepare_observation_image_frame,
+        sync_frame_disabled,
+    )
 
-    四条路径按优先级：
-    1. 有 elements 且不是显式 observe、且不是「密集无名」：纯文本控件列表
-       （a11y-first，请求不含截图字节）；
-    2. 画面与上一张完全相同（screen_unchanged 且不是显式 observe）：纯文本
-       说明，不重复附图；
-    3. 本次没有截图（png_path 为空，B 方案降级：窗口被遮挡/最小化导致截图
-       失败）：纯文本观察（无截图说明 + 页面正文），绝不读图；有 elements 时
-       仍附控件列表（否则模型既没图也没 el-N 引用）；
-    4. 其余：PNG 转 data:image/png;base64；显式 observe 有 elements 时先给
-       控件列表再附图，受体积上限约束——超限先缩放，缩放后仍超限则退化为
-       纯文摘略（带控件列表）。无 elements 时按 target 追加定位提示：
-       desktop 引导 observe_region 放大局部，browser 只能看整屏图，改为明确
-       坐标语义（避免模型对 browser 调用 desktop 专属动作）。
-
-    密集无名元素（图片型/网格界面）走附图路径但不带逐行清单：这类页面必须
-    靠看图判断，纯 bounds 清单既看不懂也点不准；显式 observe 例外，仍给全量。
-
-    tool result JSON、metadata 与日志绝不携带截图字节。_computer_v1 为私有
-    元数据（run_id/ordinal/target，必要时带 image_omitted 原因）。
-    """
     meta = {
         "run_id": run_id,
         "ordinal": int(ordinal),
         "target": observation.target,
     }
+    if getattr(observation, "frame_id", ""):
+        meta["frame_id"] = str(observation.frame_id)
     frame_line = _frame_reference_line(observation)
     elements = getattr(observation, "elements", ()) or ()
     element_lines = _element_lines(observation)
@@ -537,35 +480,41 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
         ]
     else:
         list_blocks = _elements_content_blocks(element_lines)
-    # 显式 observe 例外：模型主动要看画面时必须给图，同时保留控件列表，
-    # 让它「看图认位置、用 el-N 精确点击」，而不是退回目测坐标。
-    if (
-        element_lines
-        and getattr(observation, "action", "") != "observe"
-        and not dense_unnamed
-    ):
-        return {
-            "role": "user",
-            "content": _elements_content_blocks(element_lines),
-            "_computer_v1": meta,
-        }
     # 显式 observe 永远附图：模型主动要看画面时省略图片等于没回答它。
     # 局部观察同理——模型点名要看这块区域，画面没变也必须给。
     if (
         getattr(observation, "screen_unchanged", False)
         and observation.action not in ("observe", "observe_region")
     ):
+        unchanged_blocks = list_blocks + [
+            {"type": "text", "text": f"{_OBSERVATION_UNCHANGED_TEXT}\n{frame_line}"}
+        ]
         return {
             "role": "user",
-            "content": [
-                {"type": "text", "text": f"{_OBSERVATION_UNCHANGED_TEXT}\n{frame_line}"}
-            ],
+            "content": unchanged_blocks,
             "_computer_v1": {**meta, "image_omitted": "unchanged"},
         }
-    # B 方案降级：png_path 为空说明本次没有截图，绝不能走 _read_observation_png
-    # （空路径会抛 computer_backend_error，整条观察链就白降级了）。改为纯文本
-    # 观察：说明"本次没有截图"的原因，并附上后端截断好的页面正文。
+    # B 方案降级 / 纯文本控件清单：
+    # - png_path 为空且无截图失败、非显式 observe、有控件列表时，保持纯文本观察，且不修改后端 _coord_frame；
+    # - 真正截图失败 / 显式 observe 无图时，禁用本帧坐标输入并显式说明无图原因。
     if not str(getattr(observation, "png_path", "") or ""):
+        if (
+            element_lines
+            and not str(getattr(observation, "screenshot_error", "") or "")
+            and getattr(observation, "action", "") != "observe"
+            and not dense_unnamed
+        ):
+            return {
+                "role": "user",
+                "content": _elements_content_blocks(element_lines),
+                "_computer_v1": meta,
+            }
+        sync_frame_disabled(
+            observation,
+            reason="no_screenshot",
+            controller=controller,
+            run_id=run_id,
+        )
         return {
             "role": "user",
             "content": list_blocks + [
@@ -574,28 +523,30 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
             ],
             "_computer_v1": {**meta, "image_omitted": "no_screenshot"},
         }
-    png_bytes = _read_observation_png(observation.png_path)
-    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
-        scaled = _downscale_png(png_bytes)
-        if scaled:
-            png_bytes = scaled
-    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+    raw_png = _read_observation_png(observation.png_path)
+    png_bytes, omitted_reason, frame = prepare_observation_image_frame(
+        raw_png,
+        observation,
+        max_bytes=_OBSERVATION_IMAGE_MAX_BYTES,
+        downscale_fn=_downscale_png,
+        controller=controller,
+        run_id=run_id,
+    )
+    if png_bytes is None:
         return {
             "role": "user",
             "content": list_blocks + [
                 {
                     "type": "text",
                     "text": f"{_OBSERVATION_IMAGE_OMITTED_TEXT}\n"
-                    f"{_frame_reference_line(observation, size_bytes=len(png_bytes))}",
+                    f"{_frame_reference_line(observation, size_bytes=len(raw_png), frame=frame)}",
                 }
             ],
-            "_computer_v1": {**meta, "image_omitted": "too_large"},
+            "_computer_v1": {**meta, "image_omitted": omitted_reason or "too_large"},
         }
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
     content = list_blocks
     content.append({"type": "text", "text": OBSERVATION_FOLLOWUP_TEXT})
-    # 定位提示按 target 区分：observe_region 是 desktop 专属动作，浏览器没有
-    # 局部放大能力（旧文案会让模型对 browser 调用它并直接吃 invalid_action）。
     if not element_lines:
         if getattr(observation, "action", "") == "observe_region":
             content.append(
@@ -614,13 +565,6 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
 
 
 def execute_reserved_computer_tool(decoded, context) -> ToolResult | None:
-    """固定适配入口（设计 19.2）：非 computer_action 返回 None 走普通解析。
-
-    context 必须携带 Turn 冻结的 capability token、owner lease 与 run id；
-    设置关闭、owner 不符或动作非法分别返回稳定 9 键 JSON 错误结果。
-    动作序号取 controller.snapshot().action_count（controller 串行执行，
-    execute 返回后该值即本次动作的 ordinal）。
-    """
     if decoded.name != COMPUTER_ACTION_TOOL_NAME:
         return None
     lease = lease_from_context(context)
@@ -643,7 +587,10 @@ def execute_reserved_computer_tool(decoded, context) -> ToolResult | None:
         observation = lease.controller.execute(lease.run_id, lease.owner, action)
         ordinal = int(lease.controller.snapshot().action_count)
         followup = _observation_followup_message(
-            observation, run_id=lease.run_id, ordinal=ordinal
+            observation,
+            run_id=lease.run_id,
+            ordinal=ordinal,
+            controller=lease.controller,
         )
     except ComputerControlError as domain_error:
         return _error_result(action.target, action.kind, domain_error)

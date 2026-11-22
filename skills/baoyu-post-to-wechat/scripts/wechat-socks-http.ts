@@ -56,12 +56,10 @@ async function wechatHttpViaSocks(
         try {
           tlsSocket.destroy();
         } catch {
-          /* noop */
         }
         try {
           tcpSocket.destroy();
         } catch {
-          /* noop */
         }
         reject(err);
       };
@@ -79,7 +77,6 @@ async function wechatHttpViaSocks(
     try {
       stream.destroy();
     } catch {
-      /* noop */
     }
   }
 }

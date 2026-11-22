@@ -1,28 +1,4 @@
 # -*- coding: utf-8 -*-
-"""TokenRhythm wan3.0-video 真实 API 探针（人工受控执行，绝不由自动化跑）。
-
-用途：在烧真金白银之前，验证 tokenrhythm_video 插件实现的协议假设。
-2026-11-03 的实测记录已经验证过一部分假设（role 顶层字段、content 数组、
-success 终态、公网 URL 首帧、按秒计费），本探针覆盖插件依赖的完整链路：
-
-    阶段 A（可选）  本地首帧 → /v1/images/edits 保真重绘 → data[0].url（¥0.2）
-    阶段 B        文生视频（或图生视频）→ 轮询 → result.url → 下载
-
-全部走最便宜档（480P / 2 秒 ≈ ¥0.6；带阶段 A 共 ≈ ¥0.8），每个阶段开始前
-要求在终端手敲 yes 确认，Ctrl+C 可随时中止（轮询阶段中止不会退钱，但失败
-任务不扣费）。
-
-用法：
-    venv\\Scripts\\python.exe scripts\\probe_tokenrhythm_video.py                    # 只测文生视频
-    venv\\Scripts\\python.exe scripts\\probe_tokenrhythm_video.py --frame <图片路径>  # 先换首帧地址再测图生视频
-
-判定标准（跑完对照）：
-    1. 阶段 A 返回 data[0].url 是公网 HTTPS 地址 → 插件 _upload_frame_for_url 成立
-    2. 阶段 B 创建返回 HTTP 202 + estimated_output_cost_cny → 请求体结构成立
-    3. 轮询终态是 success（不是 succeeded）→ 插件终态判断成立
-    4. billing.total_cost_cny 与 480P ¥0.3/秒 × 2s = ¥0.6 一致 → 计费口径成立
-    5. result.url 能下载且开头字节是 ftyp → 产物落盘逻辑成立
-"""
 
 from __future__ import annotations
 
@@ -40,20 +16,14 @@ _API_BASE = "https://tokenrhythm.studio/v1"
 _POLL_INTERVAL = 5.0
 _POLL_TIMEOUT = 600.0
 
-# --yes 开关的模块级默认值：main() 里按参数覆盖（global 声明要求这里有绑定）
 AUTO_YES = False
 
-# 以 `python scripts\probe_...py` 运行时 sys.path[0] 是 scripts\，插件里的
-# `import config` / `from core...` 会找不到项目根目录模块、_resolve_api_key
-# 吞异常返回空串，报「未找到凭据」——这里显式注入项目根。
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 
 def _load_plugin():
-    """直接加载插件模块复用它的 _resolve_api_key / _upload_frame_for_url，
-    保证探针验证的就是插件真实跑的代码，而不是又抄一份。"""
     entry = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "plugins", "tokenrhythm_video", "plugin.py",
@@ -70,7 +40,6 @@ def _confirm(step: str, cost: str) -> bool:
     print(f"下一步：{step}")
     print(f"预计花费：{cost}")
     if AUTO_YES:
-        # --yes：用户已在对话里授权并划定预算，这里代替确认并留痕
         print("已按 --yes 自动确认（授权见对话记录）。")
         return True
     answer = input("确认执行请输入 yes（其它任意键跳过）：").strip().lower()
@@ -78,7 +47,6 @@ def _confirm(step: str, cost: str) -> bool:
 
 
 def _download(url: str, path: str, timeout=120.0) -> int:
-    """下载到指定文件，返回字节数（用于重绘图/视频产物落盘）。"""
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         blob = resp.read()
     with open(path, "wb") as handle:
@@ -87,11 +55,6 @@ def _download(url: str, path: str, timeout=120.0) -> int:
 
 
 def _mae(image_a: str, image_b: str, size: int = 512) -> float | None:
-    """两张图的 MAE（0~255，越小越像）。统一缩放到 size×size 再比，尺寸差异不进指标。
-
-    口径与实测记录一致（导出记录里对照组 MAE 70~83、首帧锁命中 4.8~6.3），
-    量级可直接对照。任何一张读不了就返回 None，不硬算。
-    """
     try:
         import numpy as np
         from PIL import Image
@@ -107,13 +70,6 @@ def _mae(image_a: str, image_b: str, size: int = 512) -> float | None:
 
 
 def _extract_first_frame(video_path: str, out_png: str) -> str | None:
-    """从 mp4 抽首帧（opencv）。opencv 不在就把指标降级为「重绘图 vs 原图」。
-
-    Windows 坑（2026-11-03 实测）：cv2.imwrite 对含中文的路径（用户目录带
-    「冯晨昊」）静默失败——返回 False 不抛错，文件根本没落盘，之前探针打印
-    「已存」是假成功，MAE 全部 No such file。改走 imencode 内存编码 + open()
-    二进制写，任意路径都稳；写完必须回读确认存在才算成功。
-    """
     try:
         import cv2
 
@@ -162,7 +118,6 @@ def probe(frame_path: str | None) -> int:
               "tokenrhythm.studio 的条目，或解密失败。先在设置页配好再跑。")
         return 2
 
-    # 单次运行的所有产物（原图/重绘图/视频/抽帧）都收进一个目录，方便复查
     run_dir = tempfile.mkdtemp(prefix="probe_tr_video_")
     print(f"[run] 产物目录：{run_dir}")
 
@@ -180,7 +135,6 @@ def probe(frame_path: str | None) -> int:
             except Exception as exc:
                 print(f"[A] 换地址失败：{exc}")
                 return 1
-            # 保真度量 1：重绘图就是视频接口实际吃的首帧，它的漂移就是链路漂移
             try:
                 size = _download(first_frame_url, refit_png)
                 print(f"[A] 重绘图已下载（{size} 字节）→ {refit_png}")
@@ -203,7 +157,6 @@ def probe(frame_path: str | None) -> int:
     payload = {
         "model": "wan3.0-video",
         "content": content,
-        # 最便宜档：480P × 2s ≈ ¥0.6
         "resolution": "480P",
         "duration": 2,
         "ratio": "16:9",
@@ -235,9 +188,6 @@ def probe(frame_path: str | None) -> int:
         print("[B] 未返回任务 id，终止。")
         return 1
 
-    # ---- 轮询 ----
-    # 实测轮询端点是 /v1/videos/{id}（第一轮真跑：拼成 /v1/videos/generations/{id}
-    # 连续 404 到超时），与创建端点不是同一个前缀
     poll_url = f"{_API_BASE}/videos/{task_id}"
     deadline = time.monotonic() + _POLL_TIMEOUT
     final = None
@@ -272,7 +222,6 @@ def probe(frame_path: str | None) -> int:
         print("[B] 完成 but 无 result.url，终止。")
         return 1
 
-    # ---- 下载 ----
     out = os.path.join(run_dir, f"video_{task_id}.mp4")
     with urllib.request.urlopen(video_url, timeout=120) as resp:
         blob = resp.read()
@@ -288,7 +237,6 @@ def probe(frame_path: str | None) -> int:
     if cost is not None:
         print(f"[B] 实际费用：¥{cost}（完成响应 billing.total_cost_cny）")
 
-    # 保真度量 2：视频首帧 vs 原图 / vs 重绘图（首帧锁是否命中的直接证据）
     if original_frame:
         frame_png = os.path.join(run_dir, "video_first_frame.png")
         if _extract_first_frame(out, frame_png):

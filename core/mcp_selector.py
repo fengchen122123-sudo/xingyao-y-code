@@ -1,9 +1,3 @@
-"""
-core/mcp_selector.py
-/mcp 指令触发的全屏 CLI 配置器。
-支持浏览/启用/禁用/新增/删除 MCP server，无需手动编辑 JSON。
-仿照 skill_selector.py 的实现风格。
-"""
 import os
 import subprocess
 import sys
@@ -18,43 +12,18 @@ from prompt_toolkit.layout.processors import (
     ConditionalProcessor,
     PasswordProcessor,
 )
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import DynamicStyle
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 
 from core.mcp_client import mcp_manager
+from core.themes import build_selector_style
 
-STYLE = Style.from_dict({
-    "header":        "bold #00b4d8",
-    "footer":        "#445566",
-    "mcp.on":        "bold #00ffa3",
-    "mcp.off":       "#718096",
-    "mcp.cursor":    "bold #ffffff bg:#1a2a3a",
-    "ok":            "bold #00ffa3",
-    "warn":          "#f6c90e",
-    "err":           "#ff6b6b",
-    "input.label":   "bold #00b4d8",
-    "input.field":   "",
-})
+STYLE = build_selector_style()
 
-# 预设 MCP 模板：用户选中后按提示依次输入字段即可
-#
-# 字段说明：
-#   name          MCP server 名称（写入 mcp.json 的 key）
-#   command       启动命令（通常为 npx）
-#   args          参数数组，支持 {{fieldName}} 占位符（用户输入会替换占位符）
-#   fields        需要用户输入的字段列表，每项：
-#                   {name, hint, secret?}
-#                   - name   字段名（对应 args 中的 {{name}}；若无占位符则写入 env[name]）
-#                   - hint   输入提示
-#                   - secret 可选，True 表示掩码显示（默认 False）
-#   desc          描述
-#   signup_url    申请 Key 的官方页面（输入时显示，便于复制到浏览器）
-#   support_level official(官方) / community(社区) / custom(需自研)
 PRESET_MCPS = [
-    # ─── 国内官方 ──────────────────────────────────────────
     {
         "name": "amap",
         "command": "npx",
@@ -90,7 +59,6 @@ PRESET_MCPS = [
         "signup_url": "https://mp.weixin.qq.com/",
         "support_level": "official",
     },
-    # ─── 国内社区 ──────────────────────────────────────────
     {
         "name": "bilibili",
         "command": "npx",
@@ -100,7 +68,6 @@ PRESET_MCPS = [
         "signup_url": "https://github.com/wangshunnn/bilibili-mcp-server",
         "support_level": "community",
     },
-    # ─── 数据库 ────────────────────────────────────────────
     {
         "name": "sqlite",
         "command": "npx",
@@ -117,15 +84,12 @@ PRESET_MCPS = [
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-postgres"],
         "fields": [
-            # DSN 含密码，走 env 传递（env 值写盘前会被 DPAPI 加密）；
-            # 放 args 会暴露在子进程命令行中（可被 WMI 读取）
             {"name": "POSTGRES_CONNECTION_STRING", "hint": "postgresql://user:pass@host:5432/db", "secret": True},
         ],
         "desc": "PostgreSQL 数据库（只读查询/Schema 查看）",
         "signup_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
         "support_level": "official",
     },
-    # ─── 网页抓取/搜索 ─────────────────────────────────────
     {
         "name": "firecrawl",
         "command": "npx",
@@ -146,7 +110,6 @@ PRESET_MCPS = [
         "signup_url": "https://github.com/KnockOutEZ/wigolo",
         "support_level": "community",
     },
-    # ─── 通用工具 ──────────────────────────────────────────
     {
         "name": "sequential-thinking",
         "command": "npx",
@@ -165,10 +128,7 @@ PRESET_MCPS = [
         "signup_url": None,
         "support_level": "official",
     },
-    # ─── 自研占位 ──────────────────────────────────────────
     {
-        # 携程问道暂无官方 MCP server，XingYaoCompanion 项目里是自研 HTTP 客户端
-        # 这里仅作为占位提示，引导用户去参考 XingYaoCompanion 项目的 wendao_client.py
         "name": "ctrip-wendao",
         "command": "",
         "args": [],
@@ -202,11 +162,6 @@ def _expand_arg(arg):
 
 
 def _build_server_config(preset, values):
-    """根据预设和用户输入值，组装最终的 args/env。
-    - args 中的 {{fieldName}} 占位符会被替换为用户输入值
-    - 未在 args 中出现的字段值，会被写入 env[fieldName]
-    - args 中的 $HOME / ~ / %VAR% 会展开为实际路径
-    """
     args = list(preset.get("args", []))
     env = {}
     for field in _get_preset_fields(preset):
@@ -226,21 +181,12 @@ def _t(style, text):
 
 
 def _mask_value(val):
-    """掩码处理：保留前 4 + 后 4，中间用 **** 替换。
-    遵循 user_profile 中"密码字段显示首4+****+尾4"的偏好。"""
     if not val or len(val) <= 8:
         return "*" * len(val) if val else ""
     return val[:4] + "****" + val[-4:]
 
 
 def _get_clipboard_text():
-    """读取系统剪贴板文本，按可靠性顺序尝试多种方案。
-
-    1. prompt_toolkit 内置剪贴板（某些终端/前端支持）
-    2. Windows PowerShell Get-Clipboard（Win10/11 默认可用）
-    3. tkinter 跨平台回退（Python 标准库）
-    """
-    # 1. prompt_toolkit 内部剪贴板
     try:
         from prompt_toolkit.application.current import get_app
         data = get_app().clipboard.get_data()
@@ -249,7 +195,6 @@ def _get_clipboard_text():
     except Exception:
         pass
 
-    # 2. Windows PowerShell Get-Clipboard
     if sys.platform == "win32":
         try:
             result = subprocess.run(
@@ -266,7 +211,6 @@ def _get_clipboard_text():
         except Exception:
             pass
 
-    # 3. tkinter 跨平台回退
     try:
         import tkinter
         root = tkinter.Tk()
@@ -281,48 +225,29 @@ def _get_clipboard_text():
 
 
 def _preset_line_count(preset):
-    """计算单个预设模板在 render_add 中占用的行数。
-    用于精确计算光标位置，确保窗口自动滚动到选中项。"""
-    # 1 行：名称 + 等级 + 描述
     lines = 1
-    # 1 行：command（custom 项无 command）
     if preset.get("command"):
         lines += 1
-    # 1 行：需要字段
     if _get_preset_fields(preset):
         lines += 1
-    # 1 行：获取 Key
     if preset.get("signup_url"):
         lines += 1
-    # 1 行：⚠ 自研提示
     if preset.get("support_level") == "custom":
         lines += 1
-    # 1 行：空行
     lines += 1
     return lines
 
 
 def open_mcp_selector(on_closed=None):
-    """全屏 CLI MCP 配置器。
-
-    操作说明：
-      ↑/↓ 移动光标
-      Enter 切换 [✓]/[ ] 启用/禁用
-      n 新增（从预设模板选）
-      d 删除当前 server
-      r 重连
-      Ctrl+D/Esc 保存并退出
-    """
-    # 状态：servers 是从 mcp_manager 读取的配置列表
     state = {
         "cursor": 0,
-        "servers": [],   # [{name, enabled, command, args, env, connected}]
-        "mode": "list",  # list / add / input_env / confirm_delete / custom_notice
-        "add_idx": 0,    # 新增时选中的预设索引
-        "input_idx": 0,  # 当前输入字段的索引（多字段顺序输入）
-        "input_values": {},  # 字段名 → 用户输入值
-        "input_value": "",   # 当前字段正在输入的值
-        "message": "",   # 底部消息提示
+        "servers": [],
+        "mode": "list",
+        "add_idx": 0,
+        "input_idx": 0,
+        "input_values": {},
+        "input_value": "",
+        "message": "",
     }
 
     def reload_servers():
@@ -348,8 +273,8 @@ def open_mcp_selector(on_closed=None):
 
     def render_header():
         out = []
-        out += [_t("class:header", "  星瑶Code MCP 服务管理器\n")]
-        out += [_t("", "  -----------------------------------------\n")]
+        out += [_t("class:header", "  ✦ 星瑶Code MCP 服务管理器\n")]
+        out += [_t("class:footer", "  " + "─" * 56 + "\n")]
         out += [_t("class:footer", f"  配置文件: {mcp_manager.config_file}\n")]
         out += [_t("", "\n")]
         return out
@@ -387,7 +312,6 @@ def open_mcp_selector(on_closed=None):
             is_cursor = (i == state["add_idx"])
             st = "class:mcp.cursor" if is_cursor else "class:mcp.off"
             prefix = " > " if is_cursor else "   "
-            # 维护等级标签：官方绿/社区黄/自研红
             level = preset.get("support_level", "community")
             if level == "official":
                 level_tag = ("class:mcp.on", "[官方]")
@@ -420,16 +344,13 @@ def open_mcp_selector(on_closed=None):
         if not fields:
             return out
         cur_field = fields[state["input_idx"]]
-        # 多字段时显示进度
         if len(fields) > 1:
             out += [_t("class:footer", f"  字段 {state['input_idx'] + 1}/{len(fields)}\n")]
         out += [_t("class:input.label", f"  请输入 {cur_field['name']}:\n")]
         out += [_t("class:footer", f"  提示: {cur_field.get('hint', '')}\n")]
-        # 显示申请 API Key 的官方链接（便于用户复制到浏览器打开）
         signup_url = preset.get("signup_url")
         if signup_url:
             out += [_t("class:warn", f"  获取 Key: {signup_url}\n")]
-        # 显示已输入的字段（掩码处理 secret 字段）
         if state["input_values"]:
             out += [_t("", "\n")]
             out += [_t("class:footer", "  已输入:\n")]
@@ -440,8 +361,6 @@ def open_mcp_selector(on_closed=None):
                 display = _mask_value(v) if f.get("secret") else v
                 out += [_t("class:footer", f"    {f['name']} = {display}\n")]
         out += [_t("", "\n")]
-        # 真实输入框渲染在主体下方的独立输入行（支持粘贴与光标编辑），
-        # 此处只渲染提示文字
         if state["input_idx"] < len(fields) - 1:
             out += [_t("class:footer", "  [Enter] 下一个字段  [Esc] 返回  （可直接粘贴，长 key 无需手打）\n")]
         else:
@@ -498,7 +417,6 @@ def open_mcp_selector(on_closed=None):
     def render_footer():
         msg = state.get("message", "")
         if msg:
-            # 截断过长的消息，确保单行显示（footer 高度固定为 1）
             text = f"  {msg}"
             if len(text) > 100:
                 text = text[:97] + "..."
@@ -509,37 +427,33 @@ def open_mcp_selector(on_closed=None):
         return [_t("class:footer", "")]
 
     def _input_env_input_line_y():
-        """计算 input_env 模式中 `> _` 输入行在 body 内的 y 坐标。"""
         preset = PRESET_MCPS[state["add_idx"]]
         fields = _get_preset_fields(preset)
         y = 0
         if len(fields) > 1:
             y += 1
-        y += 1  # 请输入字段名
-        y += 1  # 提示
+        y += 1
+        y += 1
         if preset.get("signup_url"):
             y += 1
-        y += 1  # 空行
+        y += 1
         if state["input_values"]:
-            y += 1  # 已输入标签
+            y += 1
             for f in fields:
                 if f["name"] in state["input_values"]:
                     y += 1
-        y += 1  # 空行
+        y += 1
         return y
 
     def get_cursor_position():
         if state["mode"] == "list":
             return Point(x=0, y=state["cursor"])
         if state["mode"] == "add":
-            # add 模式下每个预设占多行，需要累加前面所有预设的行数
-            # render_add 开头有 2 行：标题 + 空行
             y = 2
             for i in range(state["add_idx"]):
                 y += _preset_line_count(PRESET_MCPS[i])
             return Point(x=0, y=y)
         if state["mode"] == "input_env":
-            # 输入模式：光标应放在输入行 `> _` 上，确保该行可见
             return Point(x=0, y=_input_env_input_line_y())
         return Point(x=0, y=0)
 
@@ -557,12 +471,6 @@ def open_mcp_selector(on_closed=None):
         if app_ref[0] is not None:
             app_ref[0].invalidate()
 
-    # ─── input_env 真实输入框 ────────────────────────────────────
-    # 用真正的 Buffer + BufferControl 替代逐字符手搓输入。
-    # 这样修复了三个问题：
-    #   1. Linux/macOS 上粘贴（BracketedPaste）落入 dummy buffer 完全无效
-    #   2. Windows 上带换行的粘贴被整体丢弃
-    #   3. 没有光标移动/Home/End/Ctrl+W 等基本编辑能力
     input_buf = Buffer(multiline=False)
 
     def _is_secret_field_active():
@@ -576,10 +484,8 @@ def open_mcp_selector(on_closed=None):
             return False
 
     def _input_buf_text():
-        # API key/URL 一律单行：清洗粘贴带来的换行符
         return input_buf.text.replace("\r", "").replace("\n", "").strip()
 
-    # ─── list 模式按键 ───────────────────────────────────────────
     @kb.add("up")
     def _up(event):
         if state["mode"] == "list" and state["servers"]:
@@ -612,14 +518,12 @@ def open_mcp_selector(on_closed=None):
             set_message(msg)
         elif mode == "add":
             preset = PRESET_MCPS[state["add_idx"]]
-            # 自研项没有现成 MCP server，切到提示页引导用户
             if preset.get("support_level") == "custom" or not preset["command"]:
                 state["mode"] = "custom_notice"
                 invalidate()
                 return
             fields = _get_preset_fields(preset)
             if fields:
-                # 有字段需要输入：进入多字段顺序输入模式
                 state["mode"] = "input_env"
                 state["input_idx"] = 0
                 state["input_values"] = {}
@@ -628,7 +532,6 @@ def open_mcp_selector(on_closed=None):
                 event.app.layout.focus(input_win)
                 invalidate()
             else:
-                # 无需输入字段，直接添加
                 ok, msg = mcp_manager.add_server(
                     name=preset["name"],
                     command=preset["command"],
@@ -649,15 +552,12 @@ def open_mcp_selector(on_closed=None):
             if not val:
                 set_message(f"{cur_field['name']} 不能为空")
                 return
-            # 保存当前字段值
             state["input_values"][cur_field["name"]] = val
             input_buf.reset()
-            # 切换到下一个字段，或全部输完后提交
             if state["input_idx"] < len(fields) - 1:
                 state["input_idx"] += 1
                 invalidate()
             else:
-                # 所有字段输完，组装配置并添加
                 args, env = _build_server_config(preset, state["input_values"])
                 ok, msg = mcp_manager.add_server(
                     name=preset["name"],
@@ -673,7 +573,6 @@ def open_mcp_selector(on_closed=None):
                 reload_servers()
                 set_message(msg)
         elif mode == "confirm_delete":
-            # 边界防御：列表可能已空
             if not state["servers"] or state["cursor"] >= len(state["servers"]):
                 state["mode"] = "list"
                 invalidate()
@@ -689,7 +588,6 @@ def open_mcp_selector(on_closed=None):
     @kb.add("escape")
     def _exit(event):
         if state["mode"] in ("add", "input_env", "confirm_delete", "custom_notice"):
-            # 返回 list 模式，不退出应用
             state["mode"] = "list"
             state["input_idx"] = 0
             state["input_values"] = {}
@@ -723,12 +621,10 @@ def open_mcp_selector(on_closed=None):
             ch = event.key_sequence[0].key
         except Exception:
             return
-        # 只处理单字符可打印输入（ctrl/alt 组合键的 key 名长度 > 1，跳过）
         if len(ch) != 1 or not ch.isprintable():
             return
         mode = state["mode"]
         if mode == "list":
-            # list 模式：单字符命令 n/d/r
             low = ch.lower()
             if low == "n":
                 state["mode"] = "add"
@@ -777,8 +673,6 @@ def open_mcp_selector(on_closed=None):
         always_hide_cursor=True,
     )
 
-    # 真实输入行：input_env 模式下显示在主体和页脚之间。
-    # secret 字段用 PasswordProcessor 全程掩码。
     input_win = Window(
         content=BufferControl(
             buffer=input_buf,
@@ -795,21 +689,17 @@ def open_mcp_selector(on_closed=None):
     )
 
     root_container = HSplit([
-        # 顶部：固定 Header
         Window(
             content=FormattedTextControl(render_header),
             height=h,
             dont_extend_height=True,
             wrap_lines=False,
         ),
-        # 中间：可滚动主体
         body_window,
-        # 输入行：仅 input_env 模式显示
         ConditionalContainer(
             input_win,
             filter=Condition(lambda: state["mode"] == "input_env"),
         ),
-        # 底部：固定 Footer
         Window(
             content=FormattedTextControl(render_footer),
             height=1,
@@ -820,7 +710,6 @@ def open_mcp_selector(on_closed=None):
     ])
 
     layout = Layout(root_container)
-    # 显式 focus 主体窗口，启用 prompt_toolkit 的 auto-scroll
     layout.focus(body_window)
 
     # 注意 mouse_support 必须关闭：开启后会接管终端鼠标协议，
@@ -828,7 +717,7 @@ def open_mcp_selector(on_closed=None):
     app = Application(
         layout=layout,
         key_bindings=kb,
-        style=STYLE,
+        style=DynamicStyle(build_selector_style),
         full_screen=True,
         mouse_support=False,
     )

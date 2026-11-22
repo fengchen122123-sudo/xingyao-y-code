@@ -63,7 +63,6 @@ describe('token statistics store', () => {
 
   it('loads the lifetime (all history) snapshot', async () => {
     const lifetimeSnapshot = structuredClone(snapshot);
-    // 累计范围下后端回填实际覆盖天数，而不是固定 365
     lifetimeSnapshot.range.days = 120;
     const getStatistics = vi.fn().mockResolvedValue(lifetimeSnapshot);
     (window as any).pywebview = { api: { get_token_usage_statistics: getStatistics } };

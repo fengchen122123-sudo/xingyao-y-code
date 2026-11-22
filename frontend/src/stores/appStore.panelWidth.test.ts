@@ -7,7 +7,6 @@ import {
 } from '../composables/usePanelResize';
 import { useAppStore } from './appStore';
 
-// 视口宽度控制（jsdom 默认 1024）：右面板宽度按视口比例恢复，需可模拟
 function setViewportWidth(width: number) {
   Object.defineProperty(window, 'innerWidth', { value: width, writable: true, configurable: true });
 }
@@ -42,7 +41,6 @@ describe('面板宽度状态', () => {
   });
 
   it('侧栏最小宽度即默认宽度 240：低于 240 的存储值恢复时夹回 240', () => {
-    // 侧栏内容（菜单/会话项）在 240px 以下会挤压错位，故收窄下限=默认值
     localStorage.setItem(SIDEBAR_WIDTH_KEY, '180');
     const store = useAppStore();
     expect(store.sidebarWidth).toBe(240);

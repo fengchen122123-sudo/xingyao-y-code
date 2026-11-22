@@ -25,7 +25,6 @@ describe('mobile app store 事件语义', () => {
     expect(store.messages[0].turnId).toBe('t9');
     expect(store.isRunning).toBe(true);
 
-    // 重复 turn_start（同文本）不重复插入用户气泡
     store.applyEvent('turn_start', { session_name: 's1', user_text: '你好', turn_id: 't9' });
     expect(store.messages.filter((m) => m.role === 'user')).toHaveLength(1);
   });
@@ -181,5 +180,42 @@ describe('mobile app store 排队消息撤回', () => {
 
     expect(r?.attachments).toEqual([{ path: '/tmp/a.png', name: 'a.png' }]);
     expect(store.currentQueue.map((m) => m.id)).toEqual(['q1']);
+  });
+});
+
+describe('mobile-app store：云中转整态同步与在线状态', () => {
+  it('收到 initial_state_sync 时立即应用快照，device_status 正确切换连接态', async () => {
+    const get_initial_state = vi.fn(async () => ({ current_session: 's-new', messages: [] }));
+    const get_active_permission = vi.fn(async () => ({}));
+    const list_turn_undo_states = vi.fn(async () => ({ ok: true, states: [] }));
+    (window as any).pywebview = {
+      api: { get_initial_state, get_active_permission, list_turn_undo_states },
+    };
+
+    const store = fresh();
+    store.applyEvent('initial_state_sync', { current_session: 's1', messages: [{ role: 'user', content: 'hi' }] });
+    expect(store.connected).toBe(true);
+    expect(store.currentSession).toBe('s1');
+    expect(store.messages.length).toBe(1);
+
+    store.applyEvent('device_status', { online: false });
+    expect(store.connected).toBe(false);
+
+    store.applyEvent('device_status', { online: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(get_initial_state).toHaveBeenCalledTimes(1);
+    expect(store.connected).toBe(true);
+    expect(store.currentSession).toBe('s-new');
+  });
+
+  it('decision_settings_changed 同步 decisionEnabled，关闭时回退 auto_decision', () => {
+    const store = fresh();
+    store.applyInitialState({ decision_enabled: true, permission_mode: 'auto_decision' });
+    expect(store.decisionEnabled).toBe(true);
+    expect(store.permissionMode).toBe('auto_decision');
+
+    store.applyEvent('decision_settings_changed', { enabled: false, permission_mode: 'confirm' });
+    expect(store.decisionEnabled).toBe(false);
+    expect(store.permissionMode).toBe('confirm');
   });
 });

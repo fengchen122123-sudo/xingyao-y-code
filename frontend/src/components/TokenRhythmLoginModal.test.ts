@@ -5,7 +5,6 @@ import { nextTick } from 'vue';
 import TokenRhythmLoginModal from './TokenRhythmLoginModal.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 桥接 mock：默认未登录、发码成功、两种登录都成功；单个用例按需覆盖
 function installBridge(overrides: Record<string, any> = {}) {
   const api: Record<string, any> = {
     tr_auth_status: vi.fn(async () => ({ ok: true, logged_in: false, user: null, configured: false })),
@@ -54,7 +53,6 @@ function installBrokenCaptcha() {
   });
 }
 
-/** 可用的人机验证：记录初始化参数；show() 不自动成功，由用例显式触发 success */
 function installWorkingCaptcha() {
   const instance = { show: vi.fn(), hide: vi.fn() };
   const init = vi.fn((options: any) => {
@@ -76,7 +74,6 @@ function openModal() {
   return { store, wrapper, api: (window as any).pywebview.api };
 }
 
-/** 短信表单填好手机号与验证码并提交（按钮在校验通过后才可点，故直接提交表单）；invite 非空时一并填邀请码 */
 async function submitSms(w: VueWrapper, phone = '13800138000', code = '123456', invite = '') {
   await w.get('[data-test="tr-phone-input"]').setValue(phone);
   await w.get('[data-test="tr-code-input"]').setValue(code);
@@ -118,7 +115,6 @@ it('登录说明默认收起，点标题展开、再点收起', async () => {
   installBridge();
   const { wrapper: w } = openModal();
 
-  // v-show 收起时由 Vue 写入内联 display: none，这里直接断言该样式，比 isVisible 稳
   const listStyle = () => w.get('[data-test="tr-disclaimer"]').attributes('style') || '';
   expect(listStyle()).toContain('display: none');
   expect(w.get('[data-test="tr-disclaimer-toggle"]').attributes('aria-expanded')).toBe('false');
@@ -138,7 +134,6 @@ it('默认展示短信登录，可切换到密码登录', async () => {
 
   expect(w.find('[data-test="tr-sms-form"]').exists()).toBe(true);
   expect(w.find('[data-test="tr-password-form"]').exists()).toBe(false);
-  // 新样式改成底部文字链接切换：短信页展示的是「密码登录」入口
   expect(w.get('[data-test="tr-tab-password"]').text()).toContain('密码登录');
 
   await w.get('[data-test="tr-tab-password"]').trigger('click');
@@ -169,7 +164,6 @@ it('发送验证码成功后展示掩码手机号，按钮进入倒计时禁用'
   await nextTick();
   expect(w.get('[data-test="tr-send-code"]').text()).toContain('59');
 
-  // 倒计时走完后恢复可点
   await vi.advanceTimersByTimeAsync(59000);
   await nextTick();
   expect(w.get('[data-test="tr-send-code"]').attributes('disabled')).toBeUndefined();
@@ -278,7 +272,6 @@ it('点击遮罩、点关闭按钮或按 Esc 都能关闭弹窗', async () => {
   expect(store.trLoginModal.show).toBe(false);
 });
 
-// ── 人机验证（阿里云验证码）流程 ──────────────────────────────────────
 it('人机验证可用时：点击发送只唤起验证码，success 回调后才带 captchaVerifyParam 发码', async () => {
   const { init, instance } = installWorkingCaptcha();
   const api = installBridge();
@@ -348,12 +341,10 @@ it('降级发码时后端返回「安全验证」错误，原样展示后端文�
   await flushPromises();
 
   expect(w.get('[data-test="tr-login-error"]').text()).toContain('安全验证未通过，请改用密码登录');
-  // 发码失败不该进入倒计时，按钮仍是可点的「发送验证码」
   expect(w.get('[data-test="tr-send-code"]').text()).toContain('发送验证码');
   expect(w.get('[data-test="tr-send-code"]').attributes('disabled')).toBeUndefined();
 });
 
-// ── 协议勾选 ──────────────────────────────────────────────────────────
 it('未勾选用户协议时提交会被拦截，并提示先同意协议', async () => {
   const api = installBridge();
   const { wrapper: w } = openModal();
@@ -367,7 +358,6 @@ it('未勾选用户协议时提交会被拦截，并提示先同意协议', asyn
   expect(w.get('[data-test="tr-login-error"]').text()).toContain('用户协议');
 });
 
-// ── 邀请码（选填） ────────────────────────────────────────────────────
 it('填写邀请码时，作为第三个参数透传给短信登录桥接', async () => {
   const api = installBridge({
     tr_auth_status: vi.fn(async () => ({ ok: true, logged_in: true, user: { name: '阿晨' }, configured: true })),

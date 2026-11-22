@@ -1,17 +1,3 @@
-"""星瑶工作流存取：目录布局、同名遮蔽、命名校验与 ZCode 导入（设计 §3.1）。
-
-目录布局（与 ZCode 的作用域语义一致，只是根从 ``.zcode`` 换成 ``.ycode``）：
-
-::
-
-    ~/.ycode/workflows/          全局档（本机所有项目）
-    <project>/.ycode/workflows/  项目档（同名遮蔽全局档，first-wins）
-
-名字即文件名（``<name>.dwf.ts``），命名正则同时是路径穿越防线
-（显式拒绝 ``.`` / ``..``）。文件逐字节原样保留——星瑶不执行 TS，
-脚本文本是转译执行与将来对照升级的基准。
-"""
-
 from __future__ import annotations
 
 import json
@@ -31,18 +17,26 @@ logger = logging.getLogger("ycode.workflows")
 
 WORKFLOW_SUFFIX = ".dwf.ts"
 
-#: 与 ZCode 同款命名约束；这条正则就是路径穿越防线。
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 _SCOPES = ("project", "user")
+
+
+def user_data_dir() -> Path:
+    """用户数据根：YCODE_DATA_DIR 优先，否则 ~/.ycode。"""
+    env_dir = os.environ.get("YCODE_DATA_DIR")
+    if env_dir and str(env_dir).strip():
+        return Path(env_dir)
+    return Path.home() / ".ycode"
 
 
 def workflows_dir(scope: str, workspace_root=None, *, home=None) -> Path:
     """星瑶侧工作流目录（不主动创建，列出/导入时按需建）。"""
     if scope == "project":
         return Path(workspace_root or os.getcwd()) / ".ycode" / "workflows"
-    base = Path(home) if home is not None else Path.home()
-    return base / ".ycode" / "workflows"
+    if home is not None:
+        return Path(home) / ".ycode" / "workflows"
+    return user_data_dir() / "workflows"
 
 
 def zcode_workflows_dir(scope: str, workspace_root=None, *, home=None) -> Path:
@@ -63,7 +57,6 @@ def validate_name(name: str) -> str:
 
 
 def _read_entry(path: Path, name: str, scope: str) -> tuple[dict | None, dict | None]:
-    """读单个工作流文件 → (正常条目, invalid 条目)。二者互斥。"""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -142,12 +135,6 @@ def import_from_zcode(
     overwrite: bool = False,
     generate_skills: bool = True,
 ) -> dict:
-    """从兼容目录逐字节复制工作流文件到星瑶目录，并生成同名技能。
-
-    返回报告：imported / skipped（已存在未覆盖 / 名字非法 / 解析失败）/
-    各自点名。解析失败的文件**仍然复制**（原文保留供修复），但技能不生成、
-    列表里以 invalid 呈现。
-    """
     report = {"imported": [], "skipped": [], "invalid": []}
     for scope in scopes:
         source_dir = zcode_workflows_dir(scope, workspace_root, home=home)
@@ -176,7 +163,7 @@ def import_from_zcode(
                 parse_error = f"读取失败: {exc}"
             try:
                 target_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, target)  # 逐字节复制，不改一个字符
+                shutil.copyfile(source, target)
             except OSError as exc:
                 report["invalid"].append({"name": name, "scope": scope, "error": f"复制失败: {exc}"})
                 continue
@@ -194,7 +181,6 @@ def import_from_zcode(
 
 
 def _sync_skill_quietly(name: str, parsed, *, home=None) -> str:
-    """生成技能；失败只记日志不阻断导入（技能是通道二，不是主路径）。"""
     try:
         from core.workflows.skill_sync import generate_skill
 
@@ -233,15 +219,6 @@ def save_workflow(
     overwrite: bool = False,
     plan=None,
 ) -> str:
-    """新建 / 更新一个工作流文件（序列化 + 回读校验 + 技能同步）。
-
-    ``plan`` 非空时为确定性解释执行的可执行步骤图：先严格校验，通过后作为
-    ``<name>.dwf.plan.json`` 边车与脚本并存；校验失败整次保存拒绝（返回全部
-    错误）。plan 为空且同名旧边车存在 → 删除旧边车（脚本更新后 plan 可能失配）。
-
-    返回空串 = 成功；否则为可直接展示的错误文案。同名已存在且未传
-    overwrite 时拒绝（调用方先与用户确认再覆盖）。
-    """
     from core.workflows.frontmatter import serialize_workflow
     from core.workflows.plan import validate_plan
 
@@ -319,12 +296,6 @@ def import_workflow_file(
     home=None,
     overwrite: bool = False,
 ) -> dict:
-    """导入用户选择的工作流文件到指定档位。
-
-    与批量目录扫描不同：显式导入要求 frontmatter 可解析（坏文件不落盘、
-    直接报错），复制仍逐字节。返回 ``{"ok", "name", "path"}`` 或
-    ``{"ok": False, "error"}``。
-    """
     source = Path(str(source_path))
     if scope not in _SCOPES:
         return {"ok": False, "error": f"scope 必须是 {'/'.join(_SCOPES)} 之一"}
@@ -348,7 +319,7 @@ def import_workflow_file(
         return {"ok": False, "error": f"已存在同名工作流「{name}」", "exists": True}
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)  # 逐字节复制，不改一个字符
+        shutil.copyfile(source, target)
     except OSError as exc:
         return {"ok": False, "error": f"{source.name}: 复制失败: {exc}"}
     _sync_skill_quietly(name, parsed, home=home)

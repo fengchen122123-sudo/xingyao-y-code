@@ -1,20 +1,3 @@
-"""T5 审计/排障轨迹导出测试。
-
-需求（待开发/Codex与ZCode增量改进/实施计划与验收清单.md · T5）：
-- `export_diagnostics_bundle(*, dest_dir, session_name="", full=False) -> str` 返回 zip 路径；
-  包结构：manifest.json + journal.jsonl（turns/steps/events 逐行 JSON，含回合 ID）
-  + doctor.json（复用 core.doctor.run_checks 结果）+ logs/（GUI 运行日志尾部，存在才打包）；
-- 默认精简模式不含消息正文；full=True 需显式确认参数（confirm=True）且消息经脱敏；
-- 单项缺失（无日志 / 无 manager / doctor 失败）优雅降级为"继续导出 + manifest 记录"；
-- `core.memory.export_harness_journal(session_name="", since_ms=0) -> list[dict]`
-  只读、仅 ID 与元数据（Harness 纪律：journal 不落正文）；
-- CLI `/doctor export [--full y]` 注册（帮助列表 + 分派链 + 命令补全）。
-
-隔离策略：conftest.py 已在收集阶段把 YCODE_DATA_DIR 指到临时目录；本文件用
-tmp_path 构造独立 MemoryManager，对日志路径与 doctor 结果做定点打桩，
-不触碰真实 ~/.ycode，也不发起真实网络请求。
-"""
-
 import json
 import zipfile
 from pathlib import Path
@@ -29,12 +12,7 @@ from core.harness.models import HarnessEventKind, JournalEventDraft
 from core.memory import MemoryManager
 
 
-# ---------------------------------------------------------------------------
-# 公共工具
-# ---------------------------------------------------------------------------
-
 def _patch_main_print(monkeypatch):
-    """捕获 main.handle_slash_command 的 print_formatted_text 输出。"""
     import main
 
     printed = []
@@ -45,7 +23,6 @@ def _patch_main_print(monkeypatch):
 
 
 def _stub_doctor(monkeypatch):
-    """doctor 检查打桩：不发网络、不碰真实数据目录。"""
     rows = [
         doctor.CheckResult(name="环境与版本", status="ok", detail="星瑶Code v-test", hint=""),
         doctor.CheckResult(name="模型端点", status="skip", detail="已跳过", hint=""),
@@ -61,7 +38,6 @@ def _stub_missing_log(monkeypatch, tmp_path):
 
 
 def _read_bundle_texts(zip_path):
-    """解包 zip 并返回 {成员名: 文本}（日志等二进制成员按替换解码）。"""
     texts = {}
     with zipfile.ZipFile(zip_path) as bundle:
         for name in bundle.namelist():
@@ -77,13 +53,6 @@ def _journal_rows(zip_path):
 
 @pytest.fixture
 def manager(tmp_path, monkeypatch):
-    """独立 MemoryManager，含一个会话与一条 turn/step/event 轨迹。
-
-    必须清掉 app_context._context：全量套件里其它测试模块在收集期 import main，
-    main 注册的 _CLIContext.manager 是只读 property（指向 main 的模块级空库），
-    且 ctx 优先级高于 set_manager 的 fallback——不清掉的话 get_manager() 会
-    返回 main 的 manager，导出的 journal 恒为空（全量跑 3 连失败的根因）。
-    """
     manager = MemoryManager(str(tmp_path / "trace.db"))
     manager.create_session_explicit("s1")
     journal = HarnessJournal(manager, "owner-trace", clock_ms=lambda: 10_000)
@@ -103,10 +72,6 @@ def manager(tmp_path, monkeypatch):
     yield manager
     manager.close()
 
-
-# ---------------------------------------------------------------------------
-# ① zip 结构与 manifest
-# ---------------------------------------------------------------------------
 
 def test_bundle_zip_structure_and_manifest(manager, tmp_path, monkeypatch):
     _stub_doctor(monkeypatch)
@@ -143,17 +108,12 @@ def test_bundle_zip_structure_and_manifest(manager, tmp_path, monkeypatch):
 
         rows = [json.loads(line) for line in bundle.read("journal.jsonl").decode("utf-8").splitlines() if line.strip()]
         assert {row["type"] for row in rows} == {"turn", "step", "event"}
-        # T4 回合关联：每条 journal 记录都带回合 ID
         assert all(row.get("turn_id") for row in rows)
 
         doctor_payload = json.loads(bundle.read("doctor.json").decode("utf-8"))
         assert [row["name"] for row in doctor_payload] == ["环境与版本", "模型端点"]
         assert list(doctor_payload[0].keys()) == ["name", "status", "detail", "hint"]
 
-
-# ---------------------------------------------------------------------------
-# ② 精简模式（默认）不含消息正文
-# ---------------------------------------------------------------------------
 
 def test_slim_bundle_excludes_message_bodies(manager, tmp_path, monkeypatch):
     _stub_doctor(monkeypatch)
@@ -211,7 +171,6 @@ def test_full_mode_writes_redacted_messages(manager, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_redact_bundle_text_covers_home_dir_variants():
-    """本机用户目录的正/反斜杠与 JSON 转义双反斜杠变体都收敛为 <HOME>。"""
     home = Path.home()
     variants = [str(home), home.as_posix(), str(home).replace("\\", "\\\\")]
     for variant in variants:
@@ -220,7 +179,6 @@ def test_redact_bundle_text_covers_home_dir_variants():
         assert variant not in out, variant
         assert home.name not in out, variant
 
-    # 与本机无关的通用 Windows/POSIX 用户目录形态同样收敛
     generic = (
         r"C:\Users\someone-else\.ycode 与 C:/Users/someone-else/x "
         r"与 C:\\Users\\someone-else\\y"
@@ -231,7 +189,6 @@ def test_redact_bundle_text_covers_home_dir_variants():
 
 
 def test_doctor_and_log_export_are_redacted(manager, tmp_path, monkeypatch):
-    """doctor 行与日志行中的本机路径不再原样进包（审查报告 A2-02 实测泄漏点）。"""
     home = Path.home()
     rows = [
         doctor.CheckResult(
@@ -275,10 +232,6 @@ def test_doctor_and_log_export_are_redacted(manager, tmp_path, monkeypatch):
     assert any("doctor" in note and "<HOME>" in note for note in manifest["notes"])
 
 
-# ---------------------------------------------------------------------------
-# ④ 单项缺失时的优雅降级
-# ---------------------------------------------------------------------------
-
 def test_missing_log_file_degrades_gracefully(manager, tmp_path, monkeypatch):
     _stub_doctor(monkeypatch)
     _stub_missing_log(monkeypatch, tmp_path)
@@ -293,7 +246,6 @@ def test_missing_log_file_degrades_gracefully(manager, tmp_path, monkeypatch):
         assert not any(name.startswith("logs/") for name in names)
         manifest = json.loads(bundle.read("manifest.json").decode("utf-8"))
     assert "logs/gui-runtime.log" not in manifest["files"]
-    # 缺日志不算错误，但 manifest 明确记录该项未包含
     assert manifest["errors"] == []
 
 
@@ -331,13 +283,8 @@ def test_doctor_failure_is_isolated(manager, tmp_path, monkeypatch):
         assert json.loads(bundle.read("doctor.json").decode("utf-8")) == []
         manifest = json.loads(bundle.read("manifest.json").decode("utf-8"))
     assert any("doctor" in item.lower() for item in manifest["errors"])
-    # journal 仍完整导出，单项失败不拖垮整包
     assert {row["type"] for row in _journal_rows(zip_path)} == {"turn", "step", "event"}
 
-
-# ---------------------------------------------------------------------------
-# ⑤ memory.export_harness_journal：只读、元数据、过滤
-# ---------------------------------------------------------------------------
 
 def test_export_harness_journal_filters_by_session_and_since(tmp_path):
     manager = MemoryManager(str(tmp_path / "j.db"))
@@ -357,7 +304,7 @@ def test_export_harness_journal_filters_by_session_and_since(tmp_path):
 
     since_rows = manager.export_harness_journal(session_name="s1", since_ms=15_000)
     assert {row["turn_id"] for row in since_rows if row["type"] == "turn"} == {"turn-b"}
-    assert not any(row["type"] == "step" for row in since_rows)  # turn-a 的步进不越界带出
+    assert not any(row["type"] == "step" for row in since_rows)
 
     all_rows = manager.export_harness_journal()
     assert {row["turn_id"] for row in all_rows if row["type"] == "turn"} == {
@@ -425,10 +372,6 @@ def test_export_harness_journal_is_read_only(tmp_path):
     assert table_counts() == before
     manager.close()
 
-
-# ---------------------------------------------------------------------------
-# ⑥ CLI `/doctor export [--full y]`
-# ---------------------------------------------------------------------------
 
 def test_doctor_export_cli_slim(monkeypatch, tmp_path):
     import main

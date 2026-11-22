@@ -34,7 +34,6 @@ it('运行态与 runningSessions 不一致时，点停止后兜底仍必须解�
 
   await store.stopCurrentTurn();
 
-  // 停止请求受理后，与服务端真正在跑的会话表对齐：本会话不在里面就是本地状态失真
   expect(store.running).toBe(false);
 
   // 兜底定时器同样必须兜住这种不一致：即使前面没自愈，10s 也要恢复可发送
@@ -57,7 +56,6 @@ it('正常停止（会话确实在运行表里）不提前解锁：等后端终�
   expect(store.running).toBe(true);
   expect(store.runningSessions).toContain('s1');
 
-  // 真终态到达后才解锁
   store.handleBridgeEvent({ type: 'turn_cancelled', data: { session_name: 's1' } } as any);
   expect(store.running).toBe(false);
   expect(store.runningSessions).not.toContain('s1');

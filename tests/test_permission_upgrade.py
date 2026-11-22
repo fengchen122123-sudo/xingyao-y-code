@@ -1,12 +1,3 @@
-"""权限控制统一化改造（GUI 与 CLI 一致）的核心行为回归。
-
-覆盖：
-- accept_edits 第四档模式：工作区内文件编辑自动放行、命令与沙盒外访问仍询问
-- 沙盒外访问第三选项：choice 2 置位会话级放行，后续免询问；切会话收回
-- 「始终允许」项目级持久化：写 permissions.json、模拟重启后仍放行、内联命令不落盘
-- GUI：沙盒开关写配置；权限请求不挂超时定时器（与 CLI 无限等待对齐）、ask_user 仍挂
-"""
-
 import threading
 from concurrent.futures import Future
 
@@ -33,7 +24,6 @@ class _FakeApp:
 
 @pytest.fixture
 def interactive_env(monkeypatch):
-    """让 check_permission_and_ask 走 broker 路径而非阻塞的 raw input()。"""
     monkeypatch.setattr(llm.app_context, "get_app_instance", lambda: _FakeApp())
     monkeypatch.setattr(llm.app_context, "get_ui_flavor", lambda: "cli")
     monkeypatch.setattr(llm, "safe_print", lambda *args, **kwargs: None)
@@ -46,7 +36,6 @@ def interactive_env(monkeypatch):
 
 @pytest.fixture
 def clean_permission_state():
-    """清空会话白名单与沙盒会话放行，退出时同样复位，避免污染其他测试。"""
     from core import permission_grants
     import core.tools as tools_mod
 
@@ -59,10 +48,6 @@ def clean_permission_state():
 
 
 def _auto_answer_broker(monkeypatch, choice, asked, requests):
-    """构造一个同步应答的 broker：activate 即按预定 choice resolve。
-
-    asked 记录被询问的工具名，requests 保存原始请求（供断言选项列表）。
-    """
     broker = PermissionBroker()
 
     def activate(request):
@@ -74,10 +59,6 @@ def _auto_answer_broker(monkeypatch, choice, asked, requests):
     monkeypatch.setattr(llm, "permission_broker", broker)
     return broker
 
-
-# ---------------------------------------------------------------------------
-# accept_edits 第四档模式
-# ---------------------------------------------------------------------------
 
 def test_accept_edits_auto_approves_queries_and_edits_but_asks_sensitive_commands(
     interactive_env, clean_permission_state, monkeypatch, tmp_path
@@ -93,7 +74,6 @@ def test_accept_edits_auto_approves_queries_and_edits_but_asks_sensitive_command
     assert llm.check_permission_and_ask(
         "edit_file", {"file_path": str(tmp_path / "a.py"), "replacement_content": "y"}
     ) is True
-    # 编辑直接放行，不应有任何询问
     assert asked == []
 
     assert llm.check_permission_and_ask("execute_command", {"command": "git status"}) is True
@@ -121,7 +101,6 @@ def test_accept_edits_still_asks_sandbox_outside_access(
 def test_full_mode_still_asks_sandbox_outside_access(
     interactive_env, clean_permission_state, monkeypatch
 ):
-    """铁律回归：full 模式也不自动放行沙盒外访问。"""
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "full")
     asked, requests = [], []
     _auto_answer_broker(monkeypatch, 0, asked, requests)
@@ -132,10 +111,6 @@ def test_full_mode_still_asks_sandbox_outside_access(
     assert asked == ["sandbox_outside_access"]
 
 
-# ---------------------------------------------------------------------------
-# 沙盒外访问第三选项（会话级放行）
-# ---------------------------------------------------------------------------
-
 def test_sandbox_outside_access_third_option_sets_session_bypass(
     interactive_env, clean_permission_state, monkeypatch
 ):
@@ -143,17 +118,15 @@ def test_sandbox_outside_access_third_option_sets_session_bypass(
 
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
     asked, requests = [], []
-    _auto_answer_broker(monkeypatch, 2, asked, requests)  # 2 = 始终允许（本会话）
+    _auto_answer_broker(monkeypatch, 2, asked, requests)
 
     assert llm.check_permission_and_ask(
         "sandbox_outside_access", {"path": "D:/outside/x.txt", "operation": "read_file"}
     ) is True
-    # 选项恢复为 3 项，第三项是会话级放行
     assert len(requests[0].options) == 3
     assert "任务" in requests[0].options[2]
     assert tools_mod.is_session_sandbox_bypass_enabled() is True
 
-    # 同会话第二次访问：免询问自动放行
     assert llm.check_permission_and_ask(
         "sandbox_outside_access", {"path": "D:/other/y.txt", "operation": "read_file"}
     ) is True
@@ -163,13 +136,12 @@ def test_sandbox_outside_access_third_option_sets_session_bypass(
 def test_task_sandbox_bypass_does_not_bypass_confirm_write_permission(
     interactive_env, clean_permission_state, monkeypatch
 ):
-    """任务级沙箱放行只解除边界，confirm 模式的写入确认仍须执行。"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
     tools_mod.set_session_sandbox_bypass(True)
     asked, requests = [], []
-    _auto_answer_broker(monkeypatch, 1, asked, requests)  # deny
+    _auto_answer_broker(monkeypatch, 1, asked, requests)
 
     assert llm.check_permission_and_ask(
         "sandbox_outside_access",
@@ -182,7 +154,6 @@ def test_task_sandbox_bypass_does_not_bypass_confirm_write_permission(
 def test_raw_terminal_credential_request_rejects_always_option(
     clean_permission_state, monkeypatch
 ):
-    """凭据写只下发 allow-once/deny 时，raw terminal 输入 a 必须拒绝。"""
     import builtins
     import core.tools as tools_mod
     from core.permission_broker import PermissionOption, PermissionOptionKey
@@ -206,7 +177,6 @@ def test_raw_terminal_credential_request_rejects_always_option(
 def test_raw_terminal_normal_sandbox_request_accepts_task_bypass_option(
     clean_permission_state, monkeypatch
 ):
-    """普通沙箱请求显式提供 allow_task_sandbox 时仍支持 raw terminal 的 a。"""
     import builtins
     import core.tools as tools_mod
     from core.permission_broker import PermissionOption, PermissionOptionKey
@@ -252,12 +222,6 @@ def test_visible_session_switch_preserves_each_task_sandbox_bypass(
 def test_canonical_permission_path_resolves_relative_against_workdir(
     clean_permission_state, monkeypatch, tmp_path
 ):
-    """回归：白名单路径规范化必须按线程 workdir 解析相对路径。
-
-    GUI 多会话并行下进程 cwd 不可靠（打包版停在安装目录）；相对路径若按
-    进程 cwd 规范化，「始终允许」的授予键与后续命中键会错位。llm 与
-    permission_store 两处规范化必须保持同语义。
-    """
     import os
     from pathlib import Path
 
@@ -266,7 +230,6 @@ def test_canonical_permission_path_resolves_relative_against_workdir(
 
     workspace = tmp_path / "project"
     (workspace / "src").mkdir(parents=True)
-    # 进程 cwd 故意停在 workdir 之外（模拟打包版 GUI：cwd=安装目录）
     monkeypatch.chdir(tmp_path)
 
     with workspace_scope(str(workspace)):
@@ -274,7 +237,6 @@ def test_canonical_permission_path_resolves_relative_against_workdir(
         assert canonical == permission_store.canonical_file_path("src/app.py")
         assert canonical == os.path.normcase(str((workspace / "src" / "app.py")))
 
-        # 授予与命中同一规范化：进程 cwd 再漂移也不影响匹配
         llm._grant_write_add(llm._canonical_permission_path("src/app.py"))
         assert llm._grant_write_hit(llm._canonical_permission_path("src/app.py"))
         monkeypatch.chdir(workspace)
@@ -287,10 +249,6 @@ def test_canonical_permission_path_resolves_relative_against_workdir(
         )
 
 
-# ---------------------------------------------------------------------------
-# 「始终允许」项目级持久化
-# ---------------------------------------------------------------------------
-
 def test_always_allow_write_file_persists_across_restart(
     interactive_env, clean_permission_state, monkeypatch, tmp_path
 ):
@@ -301,20 +259,18 @@ def test_always_allow_write_file_persists_across_restart(
     target = str(tmp_path / "a.py")
 
     asked, requests = [], []
-    _auto_answer_broker(monkeypatch, 3, asked, requests)  # 加入项目白名单
+    _auto_answer_broker(monkeypatch, 3, asked, requests)
     assert llm.check_permission_and_ask("write_file", {"file_path": target, "content": "x"}) is True
 
     canonical = permission_store.canonical_file_path(target)
     assert canonical in permission_store.project_rules()["write_files"]
 
-    # 模拟重启：内存会话白名单清空，仍应从持久化规则自动放行（不询问）
     llm.session_allowed_write_files.clear()
     asked2, requests2 = [], []
     _auto_answer_broker(monkeypatch, 0, asked2, requests2)
     assert llm.check_permission_and_ask("write_file", {"file_path": target, "content": "y"}) is True
     assert asked2 == []
 
-    # 清空持久化规则后回到询问流程
     assert permission_store.clear_project() >= 1
     asked3, requests3 = [], []
     _auto_answer_broker(monkeypatch, 0, asked3, requests3)
@@ -340,7 +296,6 @@ def test_project_command_rule_matches_prefix_family(
     rules = permission_store.project_rules()["commands"]
     assert ("git", "push", "origin") in rules
 
-    # 同前缀族的后续命令免询问（模拟重启：仅靠持久化规则）
     llm.session_allowed_commands.clear()
     asked2, requests2 = [], []
     _auto_answer_broker(monkeypatch, 0, asked2, requests2)
@@ -349,7 +304,6 @@ def test_project_command_rule_matches_prefix_family(
         {"command": "git push origin dev"},
     ) is True
     assert asked2 == []
-    # 前缀族之外的命令仍询问
     asked3, requests3 = [], []
     _auto_answer_broker(monkeypatch, 0, asked3, requests3)
     assert llm.check_permission_and_ask(
@@ -392,19 +346,15 @@ def test_inline_exec_command_always_allow_is_session_exact_only(
     _auto_answer_broker(monkeypatch, 2, asked, requests)
     assert llm.check_permission_and_ask("execute_command", {"command": inline_cmd}) is True
 
-    # 内联执行命令不生成前缀规则、也不持久化（防投毒）
     assert permission_store.project_rules()["commands"] == set()
     assert llm.session_allowed_commands == set()
-    # 但会做「本会话精确放行」：完全相同的命令免问
     assert inline_cmd in llm.session_allowed_exact_commands
 
-    # 第二次完全相同的命令：命中会话精确放行，不再询问
     asked2, requests2 = [], []
     _auto_answer_broker(monkeypatch, 0, asked2, requests2)
     assert llm.check_permission_and_ask("execute_command", {"command": inline_cmd}) is True
     assert asked2 == []
 
-    # 变体内联命令：不命中精确放行，仍询问
     asked3, requests3 = [], []
     _auto_answer_broker(monkeypatch, 0, asked3, requests3)
     assert llm.check_permission_and_ask("execute_command", {"command": 'python -c "print(2)"'}) is True
@@ -421,9 +371,7 @@ def test_permission_store_isolated_by_workdir(tmp_path, monkeypatch):
 
     assert permission_store.add_command_rule(("git", "status"), workdir=proj_a) is True
     assert ("git", "status") in permission_store.project_rules(workdir=proj_a)["commands"]
-    # 另一个项目不受影响
     assert permission_store.project_rules(workdir=proj_b)["commands"] == set()
-    # 清空只影响目标项目
     assert permission_store.clear_project(workdir=proj_a) == 1
     assert permission_store.project_rules(workdir=proj_a)["commands"] == set()
 
@@ -484,17 +432,12 @@ def test_store_write_failure_is_not_reported_as_success(tmp_path, monkeypatch):
         permission_store.add_rule("edit", str(project / "a.py"), workdir=project)
 
 
-# ---------------------------------------------------------------------------
-# GUI：沙盒开关与超时语义
-# ---------------------------------------------------------------------------
-
 def _bare_bridge():
     from gui_bridge import ApiBridge
 
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._perm_lock = threading.Lock()
     bridge._perm_timers = {}
-    # 按回合撤销：权限事件按 turn_id 归属映射路由会话
     bridge._turn_owner_sessions = {}
     bridge._turn_owner_lock = threading.Lock()
     bridge.emit_event = lambda *args, **kwargs: None
@@ -533,8 +476,7 @@ def _make_request(function_name, options):
 
 
 def test_gui_permission_request_has_no_timeout_timer(monkeypatch):
-    """权限确认与 CLI 一致无限等待：不再挂 300s 自动拒绝定时器。"""
-    from gui_bridge import _session_from_turn_id  # 确保模块可导入
+    from gui_bridge import _session_from_turn_id
 
     bridge = _bare_bridge()
     request = _make_request("execute_command", ["y", "n", "a"])
@@ -543,7 +485,6 @@ def test_gui_permission_request_has_no_timeout_timer(monkeypatch):
 
 
 def test_gui_ask_user_still_has_timeout_timer():
-    """ask_user 提问类保留超时=取消，防止无人值守时回合永久卡死。"""
     bridge = _bare_bridge()
     request = _make_request("ask_user", ["方案A", "方案B"])
     bridge._activate_permission_request(request)

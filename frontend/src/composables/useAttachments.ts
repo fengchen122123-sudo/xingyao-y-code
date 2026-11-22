@@ -5,7 +5,6 @@ import type { AttachmentItem } from '../types/composer';
 
 export type { AttachmentItem } from '../types/composer';
 
-// 图片附件缩略图：可归档为受控媒体 URL 的扩展名白名单（与后端 MIME 白名单对齐）
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif']);
 function isImagePath(p: string): boolean { return IMAGE_EXTS.has(fileExt(p)); }
 
@@ -16,8 +15,6 @@ function isImagePath(p: string): boolean { return IMAGE_EXTS.has(fileExt(p)); }
 // ------------------------------------------------------------------
 interface DropWaiter {
   names: string[];
-  // M29：该次拖拽的占位 chip key；removeAttachment 删除占位时同步移除，
-  // 全部被删除时取消等待者，路径到达后不再复活已删附件
   keys: string[];
   timer: number;
   resolve: (paths: string[]) => void;
@@ -75,8 +72,6 @@ function waitDroppedPaths(names: string[], timeoutMs: number, keys: string[] = [
   });
 }
 
-// M29：取消包含指定占位 chip 的等待者中已删除的 key；
-// 该等待者的占位全部被删除时直接取消等待（resolve([]) 走不到 addPaths）
 function cancelWaiterForRemovedChip(path: string) {
   for (let i = dropWaiters.length - 1; i >= 0; i--) {
     const w = dropWaiters[i];
@@ -92,8 +87,6 @@ function cancelWaiterForRemovedChip(path: string) {
   }
 }
 
-// 输入框附件列表的共享逻辑：选择文件 → 查询文件信息 → 去重维护列表。
-// InputArea 与 KimiEmptyState 两处输入区共用。
 export function useAttachments() {
   const store = useAppStore();
   function currentAttachments(): AttachmentItem[] {
@@ -105,7 +98,6 @@ export function useAttachments() {
     get: currentAttachments,
     set: value => { store._getSessionRuntime().composerAttachments = value; },
   });
-  // 拖拽悬停状态：驱动输入框高亮提示
   const dragging = ref(false);
   let dragDepth = 0;
   let boundEl: HTMLElement | null = null;
@@ -136,7 +128,6 @@ export function useAttachments() {
     });
   }
 
-  // 手机/平板端：把 <input type=file> 选中的文件逐个经 WS RPC 上传到电脑，再加入附件列表
   async function uploadFiles(files: File[]) {
     const target = currentAttachments();
     const paths: string[] = [];
@@ -176,8 +167,6 @@ export function useAttachments() {
         size: info?.size ?? null,
       });
     }
-    // 图片附件缩略图：批量归档取受控媒体 URL 后补挂到已有附件项；
-    // 仅写 thumb 字段，其余逻辑不动（缩略图是增强能力，失败静默）
     const imagePaths = paths.filter(isImagePath);
     if (imagePaths.length) {
       try {
@@ -187,11 +176,9 @@ export function useAttachments() {
             if (!a.thumb && thumbs.has(a.path)) a.thumb = thumbs.get(a.path);
           }
         }
-      } catch { /* 缩略图失败静默，不影响附件 */ }
+      } catch { }
     }
   }
-  // 输入框粘贴事件：剪贴板中的图片落盘为临时文件后加入附件列表；
-  // 没有图片时不拦截，走默认文本粘贴
   function handlePaste(e: ClipboardEvent) {
     const items = e.clipboardData?.items;
     if (!items) return;
@@ -230,7 +217,6 @@ export function useAttachments() {
     target.splice(0, target.length);
   }
 
-  // 点击图片附件 chip：用现有灯箱打开当前附件中所有带缩略图的大图，定位到点击项
   function openAttachmentImage(path: string) {
     const urls = currentAttachments().map(a => a.thumb).filter((u): u is string => !!u);
     if (!urls.length) return;
@@ -294,8 +280,6 @@ export function useAttachments() {
     //    连续拖拽读到上一次的旧路径）
     let paths = await waitDroppedPaths(dropped.map(f => f.name), 4000, pendingKeys);
 
-    // M29 修复：等待期间用户可能已删除全部占位 chip（等待者被 removeAttachment
-    // 取消，或手动逐个删掉），此时任何通道解析出的路径都不应再复活附件
     if (!target.some(a => pendingKeys.includes(a.path))) {
       removePending();
       return;
@@ -325,8 +309,6 @@ export function useAttachments() {
         .map(s => decodeURIComponent(s.replace('file:///', '')));
     }
 
-    // 4) 替换占位 chip（等待期间用户可能已手动删除某些占位，removePending 只清还在的）
-    // M29：被删除占位对应的文件不复活——按文件名从解析结果中剔除
     const removedNames = new Set(
       pendingKeys
         .filter(k => !target.some(a => a.path === k))

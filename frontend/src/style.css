@@ -56,14 +56,211 @@
   --mono: var(--theme-font-mono);
   --sans: var(--theme-font-sans);
 
-  /* 搜索命中词高亮标记（mark）语义配色（深色默认） */
   --search-mark-bg: rgba(245, 158, 11, 0.28);
   --search-mark-text: #fde047;
 
-  /* 对话内容列宽度：消息、执行过程折叠卡、文件更改面板、输入框统一占满可用
-     宽度，不再固定 880px 居中，收起两侧面板后无大片留白，各元素左对齐线
-     一致。属布局变量，非主题 token，不受主题运行时覆盖。 */
-  --chat-col-width: 100%;
+  --xy-bg: var(--theme-background-app);
+  --xy-sidebar: var(--theme-background-panel);
+  --xy-canvas: var(--theme-background-panel);
+  --xy-surface: var(--theme-background-card);
+  --xy-card: var(--theme-background-panel);
+  --xy-hover: color-mix(in srgb, var(--theme-text-primary) 5.5%, transparent);
+  --xy-active: color-mix(in srgb, var(--theme-text-primary) 9%, transparent);
+  --xy-border: var(--theme-border);
+  --xy-border-strong: color-mix(in srgb, var(--theme-text-primary) 16%, transparent);
+  --xy-text: var(--theme-text-bright);
+  --xy-text-2: var(--theme-text-secondary);
+  --xy-text-3: var(--theme-text-faint);
+  --xy-accent: var(--theme-accent);
+  --xy-accent-soft: var(--theme-accent-soft);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: var(--theme-background-card);
+  --xy-green: var(--theme-success);
+  --xy-green-soft: color-mix(in srgb, var(--theme-success) 13%, transparent);
+  --xy-amber: var(--theme-warning);
+  --xy-amber-soft: color-mix(in srgb, var(--theme-warning) 13%, transparent);
+  --xy-rose: var(--theme-danger);
+  --xy-rose-soft: color-mix(in srgb, var(--theme-danger) 13%, transparent);
+  --xy-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --xy-shadow-composer: 0 8px 28px -6px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.25);
+  --xy-shadow-pop: 0 14px 36px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.09);
+  --xy-modal-mask: rgba(0, 0, 0, 0.48);
+
+  /* 对话内容列宽度：默认保持 960–1060px 舒适阅读栏宽，宽屏或最大化时配合
+     右侧工作台联动分栏（App.vue）；根级保留回退供脱离 #center 的测试使用。 */
+  --chat-col-width: clamp(820px, 78vw, 1060px);
+  --empty-col-width: clamp(660px, 52vw, 820px);
+}
+
+html[data-chat-width="compact"] {
+  --chat-col-width: 820px;
+  --empty-col-width: 660px;
+}
+html[data-chat-width="full"] {
+  --chat-col-width: max(820px, calc(100vw - 116px));
+  --empty-col-width: clamp(660px, 70vw, 1120px);
+}
+
+/* 对话容器内实际列宽：直接以 #center（center-pane）内联尺寸为基准，
+   侧栏/右侧面板开合或窗口最大化时实时联动；默认 wide 档上限收在 1060px，
+   避免超宽单栏把对话与输入框拉成扁平长带。 */
+#center > * {
+  --chat-col-width: clamp(820px, 92cqw, 1060px);
+  --empty-col-width: clamp(660px, 68cqw, 820px);
+}
+html[data-chat-width="compact"] #center > * {
+  --chat-col-width: 820px;
+  --empty-col-width: 660px;
+}
+html[data-chat-width="full"] #center > * {
+  --chat-col-width: max(820px, calc(100cqw - 116px));
+  --empty-col-width: clamp(660px, 72cqw, 1120px);
+}
+
+:root:not([data-gui-theme-id]):not(.light),
+html[data-gui-theme-id="builtin.dark"] {
+  --xy-bg: #141416;
+  --xy-sidebar: #161618;
+  --xy-canvas: #1a1a1d;
+  --xy-surface: #202024;
+  --xy-card: #222226;
+  --xy-hover: rgba(255, 255, 255, 0.055);
+  --xy-active: rgba(255, 255, 255, 0.09);
+  --xy-border: rgba(255, 255, 255, 0.08);
+  --xy-border-strong: rgba(255, 255, 255, 0.14);
+  --xy-text: #f4f4f5;
+  --xy-text-2: #a1a1aa;
+  --xy-text-3: #83838c;
+  --xy-accent: #4f86f7;
+  --xy-accent-soft: rgba(79, 134, 247, 0.14);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: #27272b;
+  --xy-green: #4ade80;
+  --xy-green-soft: rgba(74, 222, 128, 0.13);
+  --xy-amber: #fbbf24;
+  --xy-amber-soft: rgba(251, 191, 36, 0.13);
+  --xy-rose: #f87171;
+  --xy-rose-soft: rgba(248, 113, 113, 0.13);
+  --xy-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --xy-shadow-composer: 0 8px 28px -6px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.25);
+  --xy-shadow-pop: 0 14px 36px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.09);
+  --xy-modal-mask: rgba(0, 0, 0, 0.48);
+  --bg0: var(--xy-bg);
+  --bg1: var(--xy-canvas);
+  --bg2: var(--xy-surface);
+  --bg3: var(--xy-card);
+  --border: var(--xy-border);
+  --text: var(--xy-text);
+  --text-bright: var(--xy-text);
+  --text-dim: var(--xy-text-2);
+  --text-faint: var(--xy-text-3);
+  --accent: var(--xy-accent);
+  --accent-soft: var(--xy-accent-soft);
+  --green: var(--xy-green);
+  --red: var(--xy-rose);
+  --orange: var(--xy-amber);
+  --float-bg: var(--xy-card);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
+}
+
+:root.light:not([data-gui-theme-id]),
+html[data-gui-theme-id="builtin.light"] {
+  --xy-bg: #f4f4f1;
+  --xy-sidebar: #f4f4f1;
+  --xy-canvas: #ffffff;
+  --xy-surface: #fafaf8;
+  --xy-card: #ffffff;
+  --xy-hover: rgba(24, 24, 27, 0.045);
+  --xy-active: rgba(24, 24, 27, 0.075);
+  --xy-border: rgba(24, 24, 27, 0.085);
+  --xy-border-strong: rgba(24, 24, 27, 0.14);
+  --xy-text: #18181b;
+  --xy-text-2: #52525b;
+  --xy-text-3: #7c7c82;
+  --xy-accent: #2563eb;
+  --xy-accent-soft: rgba(37, 99, 235, 0.09);
+  --xy-accent-fg: #ffffff;
+  --xy-user-bubble: #f2f4f7;
+  --xy-green: #16a34a;
+  --xy-green-soft: rgba(22, 163, 74, 0.10);
+  --xy-amber: #d97706;
+  --xy-amber-soft: rgba(217, 119, 6, 0.10);
+  --xy-rose: #dc2626;
+  --xy-rose-soft: rgba(220, 38, 38, 0.09);
+  --xy-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --xy-shadow-composer: 0 6px 24px -6px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.04);
+  --xy-shadow-pop: 0 12px 32px -4px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.05);
+  --xy-modal-mask: rgba(15, 23, 42, 0.24);
+  --bg0: var(--xy-bg);
+  --bg1: var(--xy-canvas);
+  --bg2: var(--xy-surface);
+  --bg3: var(--xy-card);
+  --border: var(--xy-border);
+  --text: var(--xy-text);
+  --text-bright: var(--xy-text);
+  --text-dim: var(--xy-text-2);
+  --text-faint: var(--xy-text-3);
+  --accent: var(--xy-accent);
+  --accent-soft: var(--xy-accent-soft);
+  --green: var(--xy-green);
+  --red: var(--xy-rose);
+  --orange: var(--xy-amber);
+  --float-bg: var(--xy-card);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
+}
+
+html[data-gui-theme-id="builtin.light"] [data-theme-region="app_header"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="app_header"] {
+  --theme-region-bg: var(--xy-bg);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="sidebar"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="sidebar"] {
+  --theme-region-bg: var(--xy-sidebar);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="composer"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="composer"] {
+  --theme-region-bg: var(--xy-canvas);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+  --theme-region-surface: var(--xy-card);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="workspace"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="workspace"] {
+  --theme-region-bg: var(--xy-canvas);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+  --theme-region-surface: var(--xy-card);
+  --theme-region-surface-panel: var(--xy-surface);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="workspace"] .msg-user .bubble[class],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="workspace"] .msg-user .bubble[class] {
+  background: var(--xy-user-bubble) !important;
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="conversation_toolbar"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="conversation_toolbar"],
+html[data-gui-theme-id="builtin.light"] [data-theme-region="statusbar"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="statusbar"] {
+  --theme-region-bg: var(--xy-canvas);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
+}
+html[data-gui-theme-id="builtin.light"] [data-theme-region="right_panel"],
+html[data-gui-theme-id="builtin.dark"] [data-theme-region="right_panel"] {
+  --theme-region-bg: var(--xy-surface);
+  --theme-region-text: var(--xy-text);
+  --theme-region-border: var(--xy-border);
+  --theme-region-accent: var(--xy-accent);
 }
 
 * {
@@ -75,14 +272,9 @@
 /* 应用兜底底色：body 已透明以透出全局背景图（body::before），
    无全局图时由 html 的语义应用背景色承接，保持不透明 */
 html {
-  background: var(--theme-background-app);
+  background: var(--xy-bg, var(--theme-background-app));
 }
 
-/* ---------- GUI 主题分区接线 ----------
-   运行时在 documentElement 上写入 --theme-<region>-* 变量（region 下划线转连字符，
-   如 app_header → --theme-app-header-*）。每个分区先把自身变量别名到统一的
-   --theme-region-*，未加载主题时回落到全局语义 token。禁止按主题生成动态
-   class 或注入 style 字符串，全部通过 CSS 变量驱动。 */
 [data-theme-region="app_header"] {
   --theme-region-bg: var(--theme-app-header-bg, var(--theme-background-panel));
   --theme-region-text: var(--theme-app-header-text, var(--theme-text-primary));
@@ -176,23 +368,15 @@ html {
   position: relative;
   isolation: isolate;
   color: var(--theme-region-text);
-  /* 分区内旧别名改指向分区值：文字、边框、强调色随分区生效 */
   --text: var(--theme-region-text);
   --text-bright: var(--theme-region-text);
   --border: var(--theme-region-border);
   --accent: var(--theme-region-accent);
-  /* 表面色（气泡/卡片/输入框底色）：默认取卡片语义色，opacity=1 时实色不透图，
-     调低分区背景透明度时表面随之半透明，让分区背景图透进气泡区域 */
   --theme-region-surface: color-mix(in srgb, var(--theme-background-card) var(--theme-region-bg-opacity-pct), transparent);
   --theme-region-surface-panel: color-mix(in srgb, var(--theme-background-panel) var(--theme-region-bg-opacity-pct), transparent);
   --theme-region-surface-code: color-mix(in srgb, var(--theme-code-background) var(--theme-region-bg-opacity-pct), transparent);
 }
 
-/* 分区前景表面接管：气泡/输入框/权限卡的实色背景改随分区背景透明度。
-   代码块（--code-bg）、按钮等小元素保持实色以保证可读；主遮挡面才透图。
-   特异性说明：目标是 scoped 组件样式（.bubble[data-v-hash] = 0,3,0，且组件
-   CSS 在 style.css 之后加载）。此处用 [data-theme-region] + 类 + [class] 叠加到
-   (0,4,0)，确保覆盖 scoped 的 var(--bg2)/var(--bg1)。 */
 [data-theme-region="workspace"] .msg-user .bubble[class],
 [data-theme-region="workspace"] .perm-card[class] {
   background: var(--theme-region-surface-panel) !important;
@@ -200,19 +384,14 @@ html {
 [data-theme-region="composer"] #input-box[id] {
   background: var(--theme-region-surface) !important;
 }
-/* MD 代码块与"文件更改"面板同样随分区背景透明度透图：全局背景图模式下
-   不再以实色块突兀遮挡，代码块用 code 语义色参与透明混合 */
 [data-theme-region="workspace"] .md-body pre {
   background: var(--theme-region-surface-code) !important;
 }
 [data-theme-region="workspace"] .cfp[class] {
   background: var(--theme-region-surface-panel) !important;
 }
-/* 对话内提示卡 / 错误卡（权限调整、切模型、运行错误等）同样随分区背景
-   透明度透图：保留语义色混合（accent/red 7%）与左边框提示，仅把其中的实色
-   基底换成随分区透明度混合的 surface，全局背景图模式下不再以实色块遮挡 */
 [data-theme-region="workspace"] .notice-card[class] {
-  background: color-mix(in srgb, var(--accent) 7%, var(--theme-region-surface-panel)) !important;
+  background: var(--theme-region-surface-panel) !important;
 }
 [data-theme-region="workspace"] .error-card[class] {
   background: color-mix(in srgb, var(--red) 8%, var(--theme-region-surface-panel)) !important;
@@ -225,12 +404,10 @@ html {
   inset: 0;
   pointer-events: none;
 }
-/* 背景色层（最底）：按 bg-opacity 决定透明度，1 时实色不透全局图 */
 [data-theme-region]::after {
   z-index: -2;
   background: color-mix(in srgb, var(--theme-region-bg) var(--theme-region-bg-opacity-pct), transparent);
 }
-/* 背景图层（在背景色之上、内容之下）：图片透明度独立于背景色 */
 [data-theme-region]::before {
   z-index: -1;
   background-image: var(--theme-region-image);
@@ -240,14 +417,7 @@ html {
   opacity: var(--theme-region-image-opacity);
 }
 
-/* 滚动容器特判：overflow-y:auto 的分区（workspace），负 z-index 伪元素会被
-   滚动内容盖住（Chromium 对滚动容器层叠的标准行为，诊断已证实 ::before 画了
-   图但被压在滚动内容下）。改用元素自身 background 承载背景图，永远在内容之下。 */
 [data-theme-region="workspace"] {
-  /* 元素自身多重背景（上层在前）：
-     1) 图片遮罩层——用背景色按 (1-image_opacity) 罩淡图片，模拟独立图片透明度
-     2) 背景图层
-     background-color 承载按 bg-opacity 混合的分区背景色（最底）。 */
   background-image:
     linear-gradient(
       color-mix(in srgb, var(--theme-region-bg) var(--theme-workspace-image-mask-pct, 0%), transparent),
@@ -265,11 +435,6 @@ html {
   content: none;
 }
 
-/* 分区 isolation 会让分区内的下拉/浮层困在分区层级，被 DOM 靠后的
-   兄弟分区盖住。带弹出浮层的分区按需提升 z-index：
-   会话工具栏（导出菜单，向下弹）> 输入区（补全面板向上弹，须盖过工作区
-   底部；模型/权限下拉向下弹）> 工作区（空状态建议面板）> 其余分区；
-   全部低于全屏 Subpage(50) 与模态层（1000+）。 */
 [data-theme-region="conversation_toolbar"] {
   z-index: 10;
 }
@@ -281,8 +446,6 @@ html {
 }
 
 body {
-  /* 不设实色背景：全局背景图（body::before）在最底层透出；
-     无图时由 --theme-background-app 语义色经 html/body 默认背景供应 */
   color: var(--text);
   font-family: var(--sans);
   font-size: 14.5px;
@@ -290,12 +453,8 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  /* 建立层叠上下文：body::before 的 z-index:-1 默认会穿透到 html 画布背景
-     （不透明实色）之下导致全局图被盖住。position:relative 把伪元素层叠限制在
-     body 内部，使全局图保持在 html 背景之上、各分区之下。 */
   position: relative;
   isolation: isolate;
-  /* 不强制 antialiased：细体渲染会让小字发虚，用系统默认次像素渲染字形更饱满 */
 }
 
 /* Win10 frameless 窗口：系统无 API 隐藏 THICKFRAME 外框（core/frameless.py 只能
@@ -305,8 +464,6 @@ body {
   box-shadow: inset 0 0 0 1px var(--border);
 }
 
-/* 全局背景图：最底层，垫在所有分区之下。fixed 视口定位、负 z-index、
-   pointer-events 关闭，分区有自己的背景图时盖在它上面，无图分区透出它。 */
 body::before {
   content: '';
   position: fixed;
@@ -320,14 +477,6 @@ body::before {
   opacity: var(--theme-app-image-opacity, 1);
 }
 
-/* ── 全屏玻璃层：夹在「全局背景图」与「界面内容」之间 ────────────────────
-   背景图是 body::before（z-index:-1）；这里用 body::after 同层级、树序在后，
-   于是玻璃层恰好盖在壁纸之上、又被所有内容（z-index auto/0）盖住 ——
-   观感就是"壁纸之上糊了一层磨砂玻璃"，各半透明分区再叠上来。
-   透明度与模糊强度由 设置 → 外观与主题 → 玻璃效果 调整，
-   通过 --app-glass-opacity / --app-glass-blur 两个变量驱动（默认 0 = 完全不生效）。
-   注：本项目 body::after 此前未被占用（背景图在 body::before），故沿用原生伪元素，
-   与源实现保持同一层叠口径。 */
 body::after {
   content: '';
   position: fixed;
@@ -340,13 +489,17 @@ body::after {
 }
 
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 5px;
+  height: 5px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--bg3);
-  border-radius: 4px;
+  background: transparent;
+  border-radius: 999px;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: var(--xy-border-strong, var(--bg3));
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -366,7 +519,6 @@ button {
   font-family: var(--mono);
 }
 
-/* 顶栏按钮与 Pill */
 .pill {
   background: var(--bg2);
   border: 1px solid var(--border);
@@ -416,15 +568,14 @@ button {
   color: var(--text);
 }
 
-/* Kimi 风格卡片 */
 .kimi-empty-container {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   min-height: calc(100vh - 160px);
-  padding: 20px;
-  animation: fadein 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  padding: 32px 24px;
+  animation: fadein 0.3s cubic-bezier(0.16, 1, 0.3, 1);
   user-select: none;
 }
 
@@ -432,7 +583,7 @@ button {
   display: flex;
   align-items: center;
   gap: 14px;
-  margin-bottom: 28px;
+  margin-bottom: 24px;
 }
 
 .kimi-icon {
@@ -454,38 +605,27 @@ button {
 }
 
 .kimi-title {
-  font-size: 26px;
+  font-size: 22px;
   font-weight: 600;
-  color: var(--text);
-  letter-spacing: -0.3px;
-}
-
-.kimi-beta {
-  font-size: 11px;
-  color: var(--text-faint);
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-weight: 600;
-  text-transform: uppercase;
-  border: 1px solid var(--border);
-  letter-spacing: 0.5px;
+  color: var(--xy-text, var(--text-bright));
+  letter-spacing: -0.015em;
 }
 
 .kimi-card {
-  /* 补全面板 .suggest-panel 以此为绝对定位锚点（缺失会漂到窗口顶部） */
   position: relative;
   width: 100%;
-  max-width: 680px;
+  max-width: var(--empty-col-width, 660px);
   background: var(--theme-region-surface, var(--bg1));
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 16px 18px 12px;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  padding: 14px;
+  box-shadow: var(--xy-shadow-composer, none);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
 .kimi-card:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--xy-accent, var(--accent));
+  box-shadow: 0 0 0 3px var(--xy-accent-soft, var(--accent-soft)), var(--xy-shadow-composer, none);
 }
 
 .kimi-card.drop-hover {
@@ -501,10 +641,10 @@ button {
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 15px;
+  font-size: 14.5px;
   resize: none;
   min-height: 75px;
-  line-height: 1.6;
+  line-height: 1.625;
 }
 
 .kimi-card textarea::placeholder {
@@ -515,7 +655,9 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-top: 12px;
+  padding-top: 4px;
 }
 
 /* 左右按钮组：右侧（模型/发送）不参与压缩；左侧工具组允许收缩并在
@@ -525,27 +667,25 @@ button {
 }
 
 .kimi-pill-btn {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  border-radius: 10px;
-  padding: 6px 12px;
-  font-size: 12.5px;
+  background: transparent;
+  border: none;
+  color: var(--xy-text-2, var(--text-dim));
+  border-radius: 8px;
+  padding: 0 8px;
+  font-size: 12px;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   cursor: pointer;
-  transition: 0.15s;
-  /* CJK 文本逐字换行会把按钮撑成多行竖条，文字一律单行 */
+  transition: background 0.15s, color 0.15s;
   white-space: nowrap;
   flex-shrink: 0;
-  /* 图标按钮(回形针)与文字按钮统一高度，一行内不出现高低差 */
-  min-height: 30px;
+  height: 28px;
 }
 
-/* 首页模型按钮：档位间隙里唯一可收缩的按钮，空间不足省略号截断 */
 .kimi-card-bar .model-chip {
-  max-width: 200px;
+  max-width: 170px;
   min-width: 0;
   overflow: hidden;
   flex-shrink: 1;
@@ -558,40 +698,47 @@ button {
 }
 
 .kimi-pill-btn:hover {
-  background: var(--bg3);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
 }
 
 .permission-mode-btn.perm-confirm {
-  --permission-color: var(--green);
+  --permission-color: var(--xy-green, var(--green));
+  --permission-soft: var(--xy-green-soft, color-mix(in srgb, var(--green) 12%, transparent));
 }
 
 .permission-mode-btn.perm-accept_edits {
-  --permission-color: var(--yellow);
+  --permission-color: var(--xy-amber, var(--yellow));
+  --permission-soft: var(--xy-amber-soft, color-mix(in srgb, var(--yellow) 12%, transparent));
 }
 
+.permission-mode-btn.perm-auto_decision,
 .permission-mode-btn.perm-auto {
-  --permission-color: var(--cyan);
+  --permission-color: var(--xy-accent, var(--cyan));
+  --permission-soft: var(--xy-accent-soft, color-mix(in srgb, var(--cyan) 12%, transparent));
 }
 
 .permission-mode-btn.perm-plan {
   --permission-color: var(--purple);
+  --permission-soft: color-mix(in srgb, var(--purple) 12%, transparent);
 }
 
 .permission-mode-btn.perm-full {
-  --permission-color: var(--red);
+  --permission-color: var(--xy-rose, var(--red));
+  --permission-soft: var(--xy-rose-soft, color-mix(in srgb, var(--red) 12%, transparent));
 }
 
 .permission-mode-btn.permission-mode-btn.permission-mode-btn {
-  border-color: var(--permission-color);
+  border: none;
   color: var(--permission-color);
-  background: color-mix(in srgb, var(--permission-color) 12%, var(--bg2));
+  background: var(--permission-soft);
+  font-weight: 500;
 }
 
 .permission-mode-btn.permission-mode-btn.permission-mode-btn:hover {
-  border-color: var(--permission-color);
+  border: none;
   color: var(--permission-color);
-  background: color-mix(in srgb, var(--permission-color) 20%, var(--bg2));
+  background: color-mix(in srgb, var(--permission-color) 18%, transparent);
 }
 
 .permission-chevron {
@@ -601,25 +748,25 @@ button {
 }
 
 .kimi-send-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 9999px;
   border: none;
-  background: var(--bg3);
-  color: var(--text-faint);
-  font-size: 17px;
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 14px;
   font-weight: 700;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: 0.2s;
+  transition: background 0.15s, color 0.15s;
 }
 
 .kimi-card:focus-within .kimi-send-btn,
 .kimi-send-btn.active {
-  background: var(--accent);
-  color: #fff;
+  background: var(--xy-accent, var(--accent));
+  color: var(--xy-accent-fg, #fff);
 }
 .kimi-send-btn:disabled {
   opacity: 0.5;
@@ -627,29 +774,69 @@ button {
 }
 
 .kimi-footer-workdir {
-  margin-top: 18px;
-  /* 中间列被两侧面板挤窄时不超过容器宽度，超长文案走省略号（不折行、不撑宽） */
+  margin-top: 16px;
   max-width: 100%;
   box-sizing: border-box;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  background: var(--theme-region-surface-panel, var(--bg1));
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 8px 16px;
-  font-size: 13px;
-  color: var(--text-dim);
+  gap: 6px;
+  background: var(--theme-region-surface-panel, transparent);
+  border: none;
+  border-radius: 999px;
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
   cursor: pointer;
-  transition: 0.15s;
+  transition: background 0.15s, color 0.15s;
+}
+
+html[data-gui-theme-id="builtin.light"] .kimi-footer-workdir,
+html[data-gui-theme-id="builtin.dark"] .kimi-footer-workdir,
+html:not([data-gui-theme-id]) .kimi-footer-workdir {
+  background: transparent;
 }
 
 .kimi-footer-workdir:hover {
-  color: var(--text);
-  background: var(--bg2);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg2));
 }
 
-/* 动效 */
+.kimi-project-prompts {
+  margin-top: 14px;
+  width: 100%;
+  max-width: var(--empty-col-width, 660px);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.kimi-prompt-chip {
+  height: 28px;
+  max-width: 100%;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--xy-border, var(--border));
+  background: transparent;
+  color: var(--xy-text-3, var(--text-faint));
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 26px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.kimi-prompt-chip:hover {
+  color: var(--xy-text, var(--text));
+  border-color: var(--xy-border-strong, var(--text-faint));
+  background: var(--xy-surface, var(--bg2));
+}
+
 @keyframes fadein {
   from {
     opacity: 0;
@@ -661,10 +848,10 @@ button {
   }
 }
 
-/* 高清精细 Markdown 样式 */
 .md-body {
-  line-height: 1.78;
-  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.68;
+  color: var(--xy-text, var(--text));
 }
 .md-body p {
   margin: 6px 0;
@@ -704,8 +891,6 @@ button {
   color: var(--text);
 }
 
-/* 行内代码随分区背景透明度透图：实色基底换成半透明混合，
-   文字保持实色保证可读性，全局背景图模式下不再以实色块遮挡 */
 [data-theme-region="workspace"] .md-body code {
   background: color-mix(in srgb, var(--bg3) 70%, transparent) !important;
 }
@@ -725,7 +910,6 @@ button {
   padding: 0;
   color: var(--text);
 }
-/* 代码块复制按钮：容器定位 + 悬停浮现 */
 .md-body .code-block {
   position: relative;
   margin: 10px 0;
@@ -787,8 +971,6 @@ button {
   background: var(--bg2);
 }
 
-/* 表格随分区背景透明度透图：表头/斑马纹用 surface 半透明混合（不透明度
-   跟随主题设置），文字保持实色保证可读性，全局背景图模式下不再以实色块遮挡 */
 [data-theme-region="workspace"] .md-body th {
   background: color-mix(in srgb, var(--bg3) 65%, transparent) !important;
 }
@@ -811,10 +993,6 @@ button {
   }
 }
 
-/* 浅色主题：参考 ZCode 暖白——近白不刺眼、纯白卡片、边框极柔和。
-   默认值挂在 :root.light（html 元素）上：运行时把 light 类同步到 html，
-   主题变量以 inline 形式写入 documentElement 时可覆盖这里的默认值；
-   若仍挂在 body.light 上，body 自身声明会盖过从 html 继承的主题变量。 */
 :root.light {
   --theme-background-app: #f4f4f1;
   --theme-background-panel: #ffffff;
@@ -837,8 +1015,9 @@ button {
   --theme-code-background: #f0f0ec;
   --theme-float-background: rgba(255, 255, 255, 0.97);
   --theme-shadow-color: rgba(0, 0, 0, 0.18);
+  --xy-shadow-pop: 0 12px 32px -4px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.05);
+  --xy-modal-mask: rgba(15, 23, 42, 0.24);
 
-  /* 浅色主题下的搜索关键词高亮标记：高对比深琥珀字色与柔和黄色底色 */
   --search-mark-bg: #fef08a;
   --search-mark-text: #854d0e;
 }
@@ -846,7 +1025,6 @@ body.light .tool-head .tname {
   color: var(--text);
 }
 
-/* ---------- highlight.js 语法高亮配色（默认深色，body.light 浅色） ---------- */
 .fp-pre .hljs {
   background: transparent;
   color: #c9d1d9;
@@ -916,19 +1094,11 @@ body.light .fp-pre .hljs-selector-id { color: #8250df; }
 body.light .fp-pre .hljs-addition { color: #116329; }
 body.light .fp-pre .hljs-deletion { color: #82071e; }
 
-/* ============================================================================
-   移动端响应式布局（<=768px）
-   手机端通过 mobile-shim.js 加载同一套 dist 前端，此处只做布局/尺寸适配，
-   不改任何主题 CSS 变量（--accent/--border/--bg* 等），主题与桌面一致。
-   ========================================================================== */
 @media (max-width: 768px) {
-  /* 侧栏：改为 fixed 覆盖层，不占横向空间；默认收起（初始态由 appStore 按
-     视口判定），展开时从左侧滑入，收起滑出。选择器加 #main 前缀以覆盖
-     Sidebar.vue scoped 样式（scoped 为 #sidebar[data-v-hash]，特异性更高）。 */
   #main > #sidebar {
     position: fixed;
-    top: 48px; /* 顶栏高度 */
-    bottom: 24px; /* 状态栏高度 */
+    top: 42px;
+    bottom: 0;
     left: 0;
     width: min(300px, 86vw);
     z-index: 400;
@@ -947,7 +1117,6 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     box-shadow: none;
   }
 
-  /* 隐藏桌面专属控件：自绘窗口控制、标题栏拖拽区、软件更新按钮、右面板切换 */
   #topbar .window-controls,
   #topbar .titlebar-drag,
   #topbar .update-topbar-btn,
@@ -955,19 +1124,17 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     display: none;
   }
 
-  /* 右面板：手机上默认隐藏（无切换入口，内容经全屏 Subpage 可达） */
-  #main > #rightbar {
+  #main #rightbar {
     display: none;
   }
 
-  /* 状态栏：手机端只保留连接、模型、工作区、沙盒、运行状态五项，其余隐藏。
-     注意：隐藏规则必须 !important —— App.vue scoped 的 `#statusbar .si[data-v-x]{display:flex}`
-     特异性 (1,2,0) 高于普通媒体查询规则，会顶掉 display:none。 */
   #statusbar {
     box-sizing: border-box;
-    height: calc(28px + env(safe-area-inset-bottom));
-    padding: 0 8px env(safe-area-inset-bottom);
-    gap: 8px;
+    height: calc(24px + env(safe-area-inset-bottom));
+    padding: 0 14px env(safe-area-inset-bottom);
+    gap: 10px;
+    font-size: 11px;
+    border-top: none;
     overflow: hidden;
     flex-wrap: nowrap;
   }
@@ -975,7 +1142,15 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     min-width: 0;
     white-space: nowrap;
   }
-  #statusbar [data-mobile-status="hidden"] {
+  #statusbar .si.status-connection.is-connected,
+  #statusbar .si.status-model,
+  #statusbar .si.status-workspace,
+  #statusbar .si.status-git-branch,
+  #statusbar .si.status-token,
+  #statusbar .si.status-permission,
+  #statusbar .si.status-skill,
+  #statusbar .si.status-sandbox,
+  #statusbar [data-test="status-charset"] {
     display: none !important;
   }
   #statusbar .conn-full {
@@ -985,42 +1160,38 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     display: inline;
   }
   #statusbar .status-connection,
-  #statusbar .status-sandbox,
   #statusbar .status-runtime {
     flex: 0 0 auto;
   }
-  #statusbar .status-model {
+  #statusbar .status-ai-notice {
+    display: flex !important;
     flex: 1 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    min-width: 0;
+    justify-content: flex-start;
+    opacity: 0.72;
   }
-  #statusbar .status-workspace {
-    flex: 0 1 auto;
-    max-width: 22vw;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  #statusbar .status-runtime .si {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
   }
-  /* 触屏优化：表单控件字号 >=16px，防 iOS 聚焦时自动放大页面 */
   textarea,
   input,
   select {
     font-size: 16px !important;
   }
 
-  /* 图标按钮 / 发送按钮 / 输入区按钮增大点击热区 */
   .icon-btn {
-    min-width: 40px;
-    min-height: 40px;
+    min-width: 34px;
+    min-height: 34px;
   }
   #input-area #send-btn {
-    width: 40px;
-    height: 40px;
+    width: 32px;
+    height: 32px;
   }
   #input-area .chip-btn {
-    min-height: 36px;
+    min-height: 28px;
   }
 
-  /* 对话区窄屏压缩左右留白，消息气泡不溢出 */
   #center #chat-scroll {
     padding: 16px 14px 10px;
   }
@@ -1028,7 +1199,6 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     max-width: 88%;
   }
 
-  /* 代码块窄屏横向滚动，不撑破页面 */
   .md-body {
     overflow-wrap: break-word;
     word-break: break-word;

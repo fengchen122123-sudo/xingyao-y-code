@@ -39,7 +39,7 @@
         type="button"
         @click="importThemeZip"
       >导入主题 ZIP…</button>
-      <p class="list-hint">内置主题只能启用或复制；用户主题支持编辑、重命名、删除和导出。</p>
+      <p class="list-hint">内置主题只读，可复制后自定义。</p>
     </aside>
 
     <section v-if="draft" class="theme-editor">
@@ -112,9 +112,6 @@
         >系统标题栏</button>
       </nav>
 
-      <!-- 统一文字颜色（全局一键）：把 4 个全局文字令牌 + 7 个分区的文字色
-           一次性写成同一个颜色。只写 theme.json 里**已有**的字段，不新增任何
-           schema 键，所以后端 core/gui_theme.py 的校验不需要改。 -->
       <div v-if="selectedRegion === 'global'" class="unify-group">
         <div class="unify-title">统一文字颜色</div>
         <ColorField
@@ -125,14 +122,7 @@
           @commit="onUnifyCommit"
           @validity="unifyValid = $event"
         />
-        <p class="unify-hint">
-          这里选一个颜色 → 一次性写入 <b>4 个全局文字令牌</b>（主文字 / 高亮文字 /
-          次级文字 / 弱化文字）+ <b>7 个分区的文字色</b>，整个界面的文字随之统一。
-          之后想单独微调某一处，照常改对应页签即可；再点这里的颜色会再次全部覆盖。
-          <br />
-          不含彩色按钮上的前景色（如蓝色按钮的白字）—— 跟着变会出现"绿字压蓝底"
-          之类的可读性问题，故刻意不动。
-        </p>
+        <p class="unify-hint">一键同步全局与各分区文字颜色（不含彩色按钮前景）。</p>
       </div>
 
       <ThemeRegionEditor
@@ -172,7 +162,6 @@
       />
     </section>
 
-    <!-- 复制内置主题对话框 -->
     <div v-if="copyDialog" class="modal-mask" @click.self="copyDialog = null">
       <form data-test="copy-modal" class="theme-modal" @submit.prevent="confirmCopy">
         <div class="modal-head"><h3>复制为自定义主题</h3><button type="button" @click="copyDialog = null">×</button></div>
@@ -187,7 +176,6 @@
       </form>
     </div>
 
-    <!-- 重命名对话框 -->
     <div v-if="renameDialog" class="modal-mask" @click.self="renameDialog = null">
       <form data-test="rename-modal" class="theme-modal" @submit.prevent="confirmRename">
         <div class="modal-head"><h3>重命名主题</h3><button type="button" @click="renameDialog = null">×</button></div>
@@ -231,8 +219,6 @@ const THEME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 const store = useAppStore();
 
-// 编辑器本地草稿：所有字段编辑先落在这里；预览/保存把草稿快照送进 store。
-// Pinia state 是 reactive 代理，structuredClone 会抛错，克隆一律走 JSON。
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -244,13 +230,11 @@ const hasLocalChanges = computed(() => {
   return JSON.stringify(draft.value) !== JSON.stringify(store.savedGuiTheme);
 });
 
-// 草稿在 setup 阶段同步初始化，保证设置页打开时编辑器首帧可见。
 const initialDraft = store.guiThemeDraft ?? store.savedGuiTheme;
 const draft = ref<GuiTheme | null>(initialDraft ? clone(initialDraft) : null);
 
 const selectedRegion = ref<'global' | ThemeRegionId | 'native_titlebar'>('global');
 const fieldsValid = ref(true);
-// 统一文字颜色取色器的合法性：非法色值禁止保存/切换，与 fieldsValid 同一口径
 const unifyValid = ref(true);
 const busy = ref(false);
 const actionError = ref('');
@@ -262,8 +246,6 @@ function syncDraftFromStore() {
   draft.value = source ? clone(source) : null;
 }
 
-// ── 即时预览合并：同一时刻最多一个预览请求在执行；执行期间的最新草稿
-//    挂起，当前预览结束后补发一次。保存/取消走显式草稿参数，不依赖这里。──
 const previewPending = shallowRef<GuiTheme | null>(null);
 const previewRunning = ref(false);
 let disposed = false;
@@ -278,14 +260,7 @@ function schedulePreview() {
   void runPreview(snapshot);
 }
 
-// ── 统一文字颜色（全局一键）───────────────────────────────────────────────
-// 把 4 个全局文字令牌 + 7 个分区的文字色一次性写成同一个颜色。
-// 刻意只写 theme.json 里**已经存在**的字段，不新增 schema 键——
-// core/gui_theme.py 对未知字段是"明确报错"，新增键要同步改后端校验；
-// 而分区文字色本身就会在 CSS 的 [data-theme-region] 里覆盖全局令牌，
-// 所以把两边都写成同色就等于"全局统一"，无需改任何 CSS 或后端。
 const UNIFY_TEXT_TOKEN_KEYS = ['text_primary', 'text_bright', 'text_secondary', 'text_faint'] as const;
-// 展示值取"主文字"令牌：一键统一之后它就是那个统一色，语义自洽。
 const unifyColor = computed(() => String(draft.value?.tokens?.text_primary ?? '#000000'));
 
 function onUnifyCommit(_key: string, value: string) {
@@ -318,8 +293,6 @@ onUnmounted(() => {
   disposed = true;
 });
 
-// ── 预览：收起设置遮罩，直接看真实首页（草稿已实时渲染到真实 DOM）。
-//    顶部浮条由 App.vue 在 themePreviewMode 时显示，提供返回编辑。──
 function togglePreview() {
   if (!draft.value) return;
   store.settingsSection = 'appearance';
@@ -327,12 +300,10 @@ function togglePreview() {
   store.settingsOpen = false;
 }
 
-// 设置页用 v-show 常驻本组件，切换分区不丢草稿；关闭设置页前用它做脏检查。
 defineExpose({
   isDirty: () => hasLocalChanges.value || store.themeDirty,
 });
 
-// ── 字段编辑（编辑器 emit 的模型是三种形态的联合，按当前分区收窄） ──
 type EditorModel = ThemeRegion | Record<string, string | number> | NativeTitlebarTheme;
 
 function onRegionChange(value: EditorModel) {
@@ -359,7 +330,6 @@ function onAppImageChange(value: GuiTheme['app_image']) {
   schedulePreview();
 }
 
-// ── 主题切换（含脏编辑守卫：保存 / 放弃 / 留在当前） ──
 async function selectTheme(summary: GuiThemeSummary) {
   if (busy.value || summary.id === activeThemeId.value) return;
   store.themePreviewMode = false;
@@ -367,7 +337,7 @@ async function selectTheme(summary: GuiThemeSummary) {
   try {
     if (hasLocalChanges.value) {
       const saveFirst = await store.askConfirm(
-        '未保存的主题修改', '', '当前主题有未保存的修改，是否先保存？', '保存修改',
+        '未保存的主题修改', '', '当前主题有未保存的修改，是否先保存？', '保存修改', { tone: 'primary' },
       );
       if (saveFirst) {
         if (!fieldsValid.value || !unifyValid.value) {
@@ -398,19 +368,15 @@ async function selectTheme(summary: GuiThemeSummary) {
   }
 }
 
-// ── 保存 / 取消 ──
 async function saveTheme() {
   if (busy.value || !draft.value || !fieldsValid.value || !unifyValid.value) return;
   store.themePreviewMode = false;
   busy.value = true;
   const snapshot = clone(draft.value);
   try {
-    // 显式传最终草稿：预览排队未消化时也不丢快速输入的最后值。
     const result = await store.saveGuiThemeDraft(clone(snapshot));
     if (result.ok) {
       actionError.value = '';
-      // 保存飞行中用户又编辑时保留草稿增量（基于已保存快照，可再保存）；
-      // 只有飞行中无新编辑才整体采纳服务器返回的规范化主题。
       if (!draft.value) return;
       if (JSON.stringify(draft.value) === JSON.stringify(snapshot)) {
         draft.value = clone(result.theme);
@@ -443,7 +409,6 @@ async function cancelEdits() {
   }
 }
 
-// ── 复制内置主题 ──
 function suggestCopyId(baseId: string): string {
   const stem = baseId.replace(/builtin\./g, '').replace(/[^a-z0-9-]/g, '').slice(0, 40) || 'theme';
   const taken = new Set(store.guiThemes.map(theme => theme.id));
@@ -492,7 +457,6 @@ async function confirmCopy() {
   }
 }
 
-// ── 重命名（活动用户主题） ──
 function openRenameDialog() {
   if (!draft.value) return;
   renameDialog.value = { newId: draft.value.id, newName: draft.value.name };
@@ -518,7 +482,6 @@ async function confirmRename() {
     }
     renameDialog.value = null;
     actionError.value = '';
-    // store 已同步活动主题快照的 id/name；本地草稿只补 id/name，保留其余未保存编辑。
     if (draft.value) {
       draft.value.id = result.theme.id;
       draft.value.name = result.theme.name;
@@ -528,8 +491,6 @@ async function confirmRename() {
   }
 }
 
-// ── 删除 / 导入 / 导出 ──
-// 编辑器删除按钮仅对非活动用户主题可用（后端拒绝删除活动主题）
 const canDeleteDraft = computed(() =>
   !!draft.value && !draft.value.builtin && draft.value.id !== activeThemeId.value,
 );
@@ -594,7 +555,6 @@ async function exportTheme() {
   }
 }
 
-// ── 分区/全局背景图 ──
 function imageScope(): string {
   return selectedRegion.value === 'global' ? 'app' : (selectedRegion.value as string);
 }
@@ -625,7 +585,6 @@ async function removeImage() {
   try {
     const result = await store.removeGuiThemeImage(draft.value.id, scope as ThemeRegionId);
     if (result.ok) {
-      // 只清图片引用，保留该分区/全局其他未保存编辑；完整草稿随保存写回。
       if (scope === 'app') draft.value.app_image.image = null;
       else draft.value.regions[scope as ThemeRegionId].image = null;
       actionError.value = '';
@@ -638,7 +597,6 @@ async function removeImage() {
   }
 }
 
-// ── 恢复继承值：把分区/全局令牌重置为基础内置主题的当前值 ──
 const baseThemeCache = new Map<string, GuiTheme>();
 
 async function loadBaseTheme(): Promise<GuiTheme | null> {
@@ -705,7 +663,6 @@ async function clearGlobalInherit() {
 .theme-import { margin-top: 8px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12.5px; }
 .theme-import:hover { border-color: var(--accent); color: var(--accent); }
 .list-hint { margin: 10px 4px 0; font-size: 11px; color: var(--text-faint); line-height: 1.6; }
-/* ── 统一文字颜色（全局一键） ── */
 .unify-group {
   display: flex;
   flex-direction: column;
@@ -736,8 +693,8 @@ async function clearGlobalInherit() {
 .region-tabs button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12px; }
 .region-tabs button:hover { color: var(--text); background: var(--bg2); }
 .region-tabs button.active { background: var(--bg3); color: var(--text); border-color: var(--accent); }
-.modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; background: rgba(0, 0, 0, .68); backdrop-filter: blur(8px); }
-.theme-modal { width: min(460px, calc(100vw - 40px)); padding: 22px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); display: flex; flex-direction: column; gap: 8px; }
+.modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; padding: 16px; background: var(--xy-modal-mask, rgba(0, 0, 0, .36)); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.theme-modal { width: min(460px, calc(100vw - 40px)); padding: 22px; box-sizing: border-box; border: 1px solid var(--xy-border-strong, var(--border)); border-radius: 16px; background: var(--xy-card, var(--bg2)); box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, .35)); display: flex; flex-direction: column; gap: 8px; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .modal-head h3 { margin: 0; font-size: 15px; }
 .modal-head button { border: 0; background: transparent; color: var(--text-dim); font-size: 20px; }
@@ -749,7 +706,6 @@ async function clearGlobalInherit() {
 @media (max-width: 1100px) {
   .gui-theme-settings { grid-template-columns: 1fr; }
 }
-/* ── 手机端（≤768px）：卡片严格收在内容区内，操作区按触控尺寸重排。 ── */
 @media (max-width: 768px) {
   .gui-theme-settings { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .theme-list { max-height: 40vh; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px; border-radius: 12px; }

@@ -1,6 +1,3 @@
-# tests/test_gui_subagent_detail.py — 右面板"子代理"工作台数据链路
-# get_subagent_task_detail：目标任务完整阶段历史 + 会话任务清单（全局查目标、按会话过滤清单）
-# _subagent_progress_poller：subagent_progress 事件携带完整阶段历史
 import threading
 
 import pytest
@@ -12,7 +9,6 @@ from gui_bridge import ApiBridge
 
 @pytest.fixture(autouse=True)
 def _turn_undo_storage(tmp_path):
-    """后台子代理线程启动时依赖 turn_undo 服务，用临时库配置（参照 test_gui_tool_events）。"""
     from core.memory import MemoryManager
     from core.turn_undo import service as tu_service
 
@@ -22,7 +18,6 @@ def _turn_undo_storage(tmp_path):
 
 
 def _make_manager():
-    """三个任务的 manager：s1 前台/s1 后台/s2 前台；运行中注入两条工具阶段。"""
     holder = {}
 
     def runner(record):
@@ -66,13 +61,11 @@ def test_get_subagent_task_detail_returns_stages_and_session_tasks(monkeypatch):
         "read_file ✓ 1.2s",
         "edit_file ✗ 文件不存在",
     ]
-    # 清单只含 s1 的任务（前台+后台），不串 s2
     assert [t["description"] for t in res["tasks"]] == ["前台任务", "后台任务"]
     assert res["tasks"][1]["background"] is True
 
 
 def test_get_subagent_task_detail_finds_target_globally_filters_list(monkeypatch):
-    """目标按 task_id 全局查找：会话切换后仍可回看旧会话任务。"""
     manager = _make_manager()
     bridge = _bare_bridge(monkeypatch, manager)
     s1_task = next(s for s in manager.snapshot() if s.parent_session == "s1")
@@ -93,7 +86,6 @@ def test_get_subagent_task_detail_unknown_id(monkeypatch):
     assert res["ok"] is False
     assert res["task"] is None
     assert "未找到" in res["msg"]
-    # 清单照常返回，供前端切换到仍存在的任务
     assert len(res["tasks"]) == 2
 
 
@@ -103,7 +95,7 @@ def test_subagent_progress_poller_emits_stage_history(monkeypatch):
     captured = []
     monkeypatch.setattr(bridge, "emit_event", lambda kind, data: captured.append((kind, data)))
     stop = threading.Event()
-    stop.set()  # 预置停止：循环体先采样推送一次再退出
+    stop.set()
 
     bridge._subagent_progress_poller("s1", stop)
 
@@ -114,10 +106,6 @@ def test_subagent_progress_poller_emits_stage_history(monkeypatch):
     assert len(data["tasks"]) == 2
     task = data["tasks"][0]
     assert task["description"] == "前台任务"
-    # 阶段历史只断言注入的工具阶段（queued/running 等阶段 detail 为空，
-    # 完整历史按 queued→running→tool→completed 追加）；at 只验证存在，
-    # 不与全量列表索引绑定（此前取 stages[0]/[1] 的 at，恒为 queued/running
-    # 的时刻，与过滤后的 tool 阶段永不匹配）
     tool_stages = [s for s in task["stages"] if s["detail"]]
     assert [s["detail"] for s in tool_stages] == [
         "read_file ✓ 1.2s",
@@ -125,16 +113,10 @@ def test_subagent_progress_poller_emits_stage_history(monkeypatch):
     ]
     assert all(s["name"] == "tool" for s in tool_stages)
     assert all(s["at"] > 0 for s in tool_stages)
-    # s2 的任务不进本次推送
     assert all(t["description"] != "其他会话任务" for t in data["tasks"])
 
 
 def test_subagent_progress_poller_carries_tool_call_id(monkeypatch):
-    """子代理归属信息（派生它的 run_subagent 调用 id）必须随进度事件推送。
-
-    前端据此把每张卡片限定在自己创建的子代理上；缺这个字段就会退回
-    "全会话子代理聚合成一块"的旧行为。
-    """
     manager = SubagentManager(runner=lambda record: "结果正文")
     manager.run(
         "归属任务的子代理",
@@ -158,7 +140,6 @@ def test_subagent_progress_poller_carries_tool_call_id(monkeypatch):
 
 
 def test_tool_call_scope_stamps_and_restores_current_call_id():
-    """工具调用 id 的线程级绑定必须可嵌套且退出后恢复（否则串卡）。"""
     from core import app_context
 
     assert app_context.get_thread_tool_call_id() is None

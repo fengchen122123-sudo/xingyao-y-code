@@ -1,5 +1,3 @@
-"""GitApplicationService 测试：乐观并发/兼容矩阵集成/信任门/确认令牌（规格 §9/§13）。"""
-
 import pytest
 
 from core.git import service as service_mod
@@ -17,7 +15,6 @@ def env(tmp_path):
     repo = make_repo(tmp_path, commits=1)
     identity = resolve_repository(str(repo), GitRunner())
     svc = GitApplicationService()
-    # 默认信任仓库；信任门行为由专项用例单独验证
     trust_mod.trust_repository(identity, trust_mod.collect_security_fingerprint(GitRunner(), identity))
     return identity, repo, svc
 
@@ -30,7 +27,6 @@ def test_get_snapshot_fields(env):
     assert snap.operation_kind.value == "idle"
     assert len(snap.worktree_version) == 64 and len(snap.refs_version) == 64
     assert snap.identity_state == "ok"
-    # 版本确定性
     snap2 = svc.get_snapshot(identity.workspace_path)
     assert snap2.worktree_version == snap.worktree_version
     assert snap2.refs_version == snap.refs_version
@@ -112,11 +108,9 @@ def test_untrusted_repo_blocks_commit_until_trusted(tmp_path):
     svc = GitApplicationService()
     (repo / "f1.txt").write_bytes(b"x\n")
     svc.stage(identity.workspace_path, ["f1.txt"], SnapshotVersions(None, None))
-    # commit 属于 _TRUST_REQUIRED；未信任仓库必须先确认
     with pytest.raises(GitError) as exc:
         svc.commit(identity.workspace_path, "t", "", False, SnapshotVersions(None, None))
     assert exc.value.code is GitErrorCode.REPOSITORY_UNTRUSTED
-    # 信任后放行
     fp = trust_mod.collect_security_fingerprint(GitRunner(), identity)
     trust_mod.trust_repository(identity, fp)
     snap = svc.commit(identity.workspace_path, "t", "", False, SnapshotVersions(None, None))
@@ -126,27 +120,22 @@ def test_untrusted_repo_blocks_commit_until_trusted(tmp_path):
 def test_high_risk_requires_token_and_typed_confirm(env):
     identity, repo, svc = env
     run_git(repo, "commit", "-q", "--allow-empty", "-m", "droppable")
-    # reset_hard 属不可恢复：无令牌直接拒绝
     with pytest.raises(GitError) as exc:
         svc.execute(identity.workspace_path, "reset_hard", {"target": "HEAD~1"},
                     versions=SnapshotVersions(None, None))
     assert exc.value.code is GitErrorCode.CONFIRMATION_REQUIRED
-    # preview 拿令牌
     preview = svc.preview(identity.workspace_path, "reset_hard", {"target": "HEAD~1", "confirm_input": "HEAD~1"})
     assert preview.confirm_required and preview.typed_confirm_required and preview.token
-    # 输入不匹配 → 拒绝
     with pytest.raises(GitError) as exc:
         svc.execute(identity.workspace_path, "reset_hard",
                     {"target": "HEAD~1", "confirm_input": "wrong"},
                     versions=preview.versions, token=preview.token)
     assert exc.value.code is GitErrorCode.CONFIRMATION_INVALID
-    # 正确输入 + 令牌 → 执行
     preview2 = svc.preview(identity.workspace_path, "reset_hard",
                            {"target": "HEAD~1", "confirm_input": "HEAD~1"})
     svc.execute(identity.workspace_path, "reset_hard",
                 {"target": "HEAD~1", "confirm_input": "HEAD~1"},
                 versions=preview2.versions, token=preview2.token)
-    # 令牌一次性：重放拒绝（快照已因上次执行变化，版本门与一次性门任一生效）
     with pytest.raises(GitError) as exc:
         svc.execute(identity.workspace_path, "reset_hard",
                     {"target": "HEAD~1", "confirm_input": "HEAD~1"},
@@ -158,7 +147,6 @@ def test_token_invalidated_by_snapshot_change(env):
     identity, repo, svc = env
     preview = svc.preview(identity.workspace_path, "reset_hard",
                           {"target": "HEAD~1", "confirm_input": "HEAD~1"})
-    # preview 后工作区发生变化 → 快照版本失效 → 令牌随之失效
     (repo / "f1.txt").write_bytes(b"mutated\n")
     run_git(repo, "add", "-A")
     with pytest.raises(GitError) as exc:
@@ -184,6 +172,5 @@ def test_invalidate_event_hook_safe_on_error(env):
         raise RuntimeError("hook error")
     svc.on_invalidate = boom
     (repo / "f1.txt").write_bytes(b"x\n")
-    # 回调异常不阻断操作结果
     snap = svc.stage(identity.workspace_path, ["f1.txt"], SnapshotVersions(None, None))
     assert snap.staged

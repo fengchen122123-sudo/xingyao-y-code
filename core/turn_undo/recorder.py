@@ -1,24 +1,6 @@
-"""星瑶按回合撤销：受控文件修改前后的记录与验证（FileMutationRecorder）。
-
-契约（规格 9.3/9.4）：
-- prepare_mutation()：工具在真正写文件前调用。记录器自行从磁盘捕获最初
-  before 状态（不信任工具转述）、把计划 after 字节写入内容寻址仓库、
-  在数据库持久化 before/after 记录，全部成功后签发不可伪造的 MutationHandle。
-- verify_after_mutation()：工具写入成功后、声称成功前调用。立即读取实际
-  节点状态与计划 after 精确比较，记录实际 File ID/硬链接计数/权限位；
-  不一致、验证落库失败或文件在验证前被外部改变 → 检查点标记不可安全撤销
-  并显式报错，工具不得声称成功。
-
-严格可撤销节点只有 missing 与普通文件；最终路径符号链接、目录、特殊文件、
-硬链接（nlink>1）在写入前拒绝。无活动检查点上下文的线程（回合外的独立
-调用，如直接调用 tools.write_file 的测试/脚本）不记录、也不阻断——严格
-保证只覆盖回合作用域内的受控修改；回合内快照/落库失败则修改必须失败。
-"""
-
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
 import os
 import stat
@@ -43,7 +25,6 @@ from core.turn_undo.storage import TurnUndoStorage, now_ms
 
 logger = logging.getLogger(__name__)
 
-# 惰性读取，超限的大文件不整体载入内存（写入类工具自身已有 50KB/10MB 上限）
 _CAPTURE_CHUNK = 1024 * 1024
 
 
@@ -103,7 +84,6 @@ def capture_node_state(path: str) -> NodeState:
             link_count=st.st_nlink,
         )
     if stat.S_ISREG(st.st_mode):
-        # 内容哈希流式计算：预检与中途外部改动检测依赖精确 SHA-256（规格 11.2）
         digest = hashlib.sha256()
         try:
             with open(path, "rb") as handle:
@@ -132,7 +112,6 @@ def _identity_of(st: os.stat_result) -> str:
 
 
 def _reject_unsupported(node: NodeState, canonical_path: str) -> None:
-    """严格可撤销边界：最终路径符号链接/目录/特殊文件/多硬链接一律拒绝。"""
     if node.kind is NodeKind.MISSING:
         return
     if node.kind is NodeKind.SYMLINK:
@@ -157,10 +136,6 @@ def _reject_unsupported(node: NodeState, canonical_path: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# 检查点上下文注册表（线程绑定）
-# ---------------------------------------------------------------------------
-
 class RecorderContext:
     """一个活动回合检查点在记录器内的表示。"""
 
@@ -181,10 +156,9 @@ class RecorderContext:
 
 _context_lock = threading.Lock()
 _active_contexts: dict[str, RecorderContext] = {}
-_context_by_turn: dict[str, str] = {}  # turn_id -> checkpoint_id（新协议全局唯一）
+_context_by_turn: dict[str, str] = {}
 _tls = threading.local()
 
-# 记录器写库与签发句柄的串行锁；文件 I/O 不在其内。
 _record_lock = threading.RLock()
 
 
@@ -275,12 +249,6 @@ def current_context() -> Optional[RecorderContext]:
 
 
 def is_context_active(ctx: Optional[RecorderContext]) -> bool:
-    """TLS 指向的上下文是否仍是注册中的活动检查点。
-
-    消息自动关联（memory.add_messages）用它过滤陈旧绑定：绑定对象已被
-    注销（回合封闭）时不再写 message_turn_links；prepare/verify 路径不用
-    此过滤——迟到写入必须显式失败（H2）。
-    """
     if ctx is None:
         return False
     with _context_lock:
@@ -293,16 +261,22 @@ def release_context(checkpoint_id: str) -> None:
         ctx = _active_contexts.pop(checkpoint_id, None)
         if ctx is not None:
             _context_by_turn.pop(ctx.turn_id, None)
+    if ctx is not None:
+        # 回合结束兜底：清掉本回合遗留的文件级写入占用（异常路径没走
+        # verify/rollback 时也不会把这个文件永久标成"正在被写入"）
+        try:
+            from core.turn_undo import coordinator as coordinator_mod
+
+            coordinator_mod.get_coordinator().release_turn_paths(
+                ctx.workspace_root, ctx.turn_id,
+            )
+        except Exception:
+            logger.debug("清理回合文件写入占用失败", exc_info=True)
     if getattr(_tls, "ctx", None) is not None and _tls.ctx.checkpoint_id == checkpoint_id:
         unbind_thread()
 
 
-# ---------------------------------------------------------------------------
-# 记录与验证
-# ---------------------------------------------------------------------------
-
 def _capture_before_with_blob(storage: TurnUndoStorage, canonical_path: str) -> tuple[NodeState, Optional[str]]:
-    """捕获最初 before 状态并流式写入内容仓库；返回 (状态, blob_sha)。"""
     node = capture_node_state(canonical_path)
     if node.kind is not NodeKind.REGULAR_FILE:
         return node, None
@@ -344,35 +318,39 @@ def _require_active_context(*, need_owner: bool) -> RecorderContext:
             "当前线程没有绑定的活动回合检查点（回合外调用）",
         )
     if need_owner and not ctx.owner:
-        # 子代理只借记录权；prepare/verify 都允许，但封闭检查点由 registry 判定。
         pass
     return ctx
 
-
-def _ensure_workspace_writable(ctx: RecorderContext) -> None:
-    """同一工作区同一时刻只允许一个前台回合写入（规格 9.2 并发保护）。
-
-    多会话同时写同一目录时，撤销记录彼此不可见，后写者会让先写者的
-    "中途外部改动"检测必然命中。这里在触盘前快速失败，让调用方等待重试，
-    而不是把整个回合判死。后台任务检查点按设计允许与父回合并存，不参与互斥。
-    """
+def _claim_path_for_write(ctx: RecorderContext, canonical_path: str) -> None:
     if ctx.owner_kind == OwnerKind.BACKGROUND_TASK.value:
         return
     from core.turn_undo import coordinator as coordinator_mod
 
     coordinator = coordinator_mod.get_coordinator()
-    active = coordinator.active_turn_id(ctx.workspace_root)
-    if active and active != ctx.turn_id:
+    owner = coordinator.claim_path(ctx.workspace_root, canonical_path, ctx.turn_id)
+    if owner and owner != ctx.turn_id:
         raise TurnUndoError(
             UndoErrorCode.WORKSPACE_BUSY,
-            f"该目录正在被另一个回合写入（回合 {active[:8]}），"
-            f"请等待其完成后再重试: {ctx.workspace_root}",
+            f"该文件正在被另一个回合写入（回合 {owner[:8]}），"
+            f"请等待其完成后再重试: {canonical_path}",
             detail={
-                "active_turn_id": active,
-                "workspace_root": ctx.workspace_root,
+                "active_turn_id": owner,
+                "path": canonical_path,
             },
         )
 
+
+def _release_path_claim(ctx: Optional[RecorderContext], canonical_path: str) -> None:
+    if ctx is None or not canonical_path:
+        return
+    try:
+        from core.turn_undo import coordinator as coordinator_mod
+
+        coordinator_mod.get_coordinator().release_path(
+            ctx.workspace_root, canonical_path, ctx.turn_id,
+        )
+    except Exception:  # 释放失败只影响重试延迟，不能掩盖写入结果
+        logger.debug("释放文件写入占用失败: %s", canonical_path, exc_info=True)
 
 def prepare_mutation(
     *,
@@ -410,7 +388,6 @@ def prepare_mutation(
         )
 
     ctx = _require_active_context(need_owner=True)
-    _ensure_workspace_writable(ctx)
     storage = _storage_for_ctx()
     checkpoint = storage.get_checkpoint(ctx.checkpoint_id)
     if checkpoint.status_enum is not TurnUndoStatus.RECORDING:
@@ -428,9 +405,10 @@ def prepare_mutation(
         )
 
     canonical_path = canonicalize_path(display_path)
+    # 触盘前的文件级占用：同目录其它回合改别的文件完全不受影响。占用在
+    # verify_after_mutation / rollback_prepared_mutation 释放，回合封闭时兜底清理。
+    _claim_path_for_write(ctx, canonical_path)
     if source_kind is None:
-        # 来源默认值（规格 5.4）：借记录权的线程（前台子代理，线程绑定 owner=False）
-        # 与后台任务检查点都是子代理修改；只有线程 own 的主回合线程记为主代理
         thread_is_owner = bool(getattr(_tls, "owner", False))
         if not thread_is_owner or ctx.owner_kind == OwnerKind.BACKGROUND_TASK.value:
             source_kind = SourceKind.SUBAGENT
@@ -443,7 +421,6 @@ def prepare_mutation(
     tool_call_id = tool_call_id or tls_call
 
     with _record_lock:
-        # 1. 捕获最初 before（同一回合多次修改保留第一次的 before）
         existing = storage.get_file_by_path(ctx.checkpoint_id, canonical_path)
         before_node, before_blob = _capture_before_with_blob(storage, canonical_path)
         _reject_unsupported(before_node, canonical_path)
@@ -461,7 +438,6 @@ def prepare_mutation(
                     canonical_path,
                 )
 
-        # 2. 计划 after 字节写入内容仓库
         after_sha = None
         after_blob = None
         if after_content is not None:
@@ -477,7 +453,6 @@ def prepare_mutation(
             blob_sha256=after_blob,
         )
 
-        # 3. 短事务持久化记录
         mutated_at = now_ms()
         values = _file_values_from_states(
             canonical_path=canonical_path,
@@ -509,8 +484,6 @@ def prepare_mutation(
                     )
                     first = False
                 if file_skipped:
-                    # 同事务标记：该文件退出本回合撤销范围，但 after 计划仍更新，
-                    # 保证后续写入不会重复命中同一条冲突
                     storage.set_file_undo_result_locked(
                         cursor,
                         file_id=file_id,
@@ -534,12 +507,7 @@ def prepare_mutation(
 
 
 def rollback_prepared_mutation(handle: MutationHandle) -> None:
-    """prepare 之后、实际写入失败时回滚本次计划记录。
-
-    - 首次修改：整行删除（blob 失去引用，由 GC 回收）。
-    - 后续修改：恢复被替换前的已验证 after 状态（写入未发生，磁盘未变；
-      若磁盘已与上一计划不一致则显式失败——诚实暴露外部改动）。
-    """
+    _release_path_claim(current_context(), handle.canonical_path)
     storage = _storage_for_ctx()
     if handle.is_first_mutation or handle.previous_after is None:
         with storage._manager._lock:
@@ -612,8 +580,6 @@ def _state_matches_disk(state: NodeState, canonical_path: str) -> bool:
     if node.size != state.size:
         return False
     if state.sha256 is not None:
-        # 内容哈希是预检/中途检测的核心依据：捕获失败（None）按不一致处理，
-        # 宁可拒绝也不把无法核实的外部改动当成未变化（L6）
         return node.sha256 == state.sha256
     return True
 
@@ -631,7 +597,6 @@ def _file_values_from_states(
     tool_call_id: str,
 ) -> dict:
     if before is None:
-        # update_after_plan 路径不使用 before 字段
         before = NodeState(kind=NodeKind.MISSING, exists=False)
     return {
         "canonical_path": canonical_path,
@@ -711,7 +676,6 @@ def verify_after_mutation(handle: MutationHandle) -> NodeState:
     planned = handle.planned_after
 
     def _fail(reason: str):
-        # 单文件验证失败：该文件退出撤销范围，回合其余写入继续可用。
         with _record_lock:
             with storage._manager._lock:
                 cursor = storage.conn.cursor()
@@ -730,6 +694,7 @@ def verify_after_mutation(handle: MutationHandle) -> NodeState:
             "按回合撤销：写入验证失败，文件退出撤销范围: %s (%s)",
             canonical_path, reason,
         )
+        _release_path_claim(ctx, canonical_path)
         raise TurnUndoError(
             UndoErrorCode.FILE_CONFLICT,
             f"写入后实际状态与计划不一致，该文件已退出本回合撤销范围: {canonical_path}",
@@ -792,6 +757,7 @@ def verify_after_mutation(handle: MutationHandle) -> NodeState:
                     reason="验证结果落库失败，检查点不可安全撤销",
                 )
                 raise
+    _release_path_claim(ctx, canonical_path)
     return actual_state
 
 
@@ -868,19 +834,11 @@ def mark_uncovered_command_effects(tool_name: str) -> None:
     storage.mark_uncovered_command_effects(ctx.checkpoint_id)
 
 
-# ---------------------------------------------------------------------------
-# 回合封闭：净 diff 与状态收敛
-# ---------------------------------------------------------------------------
-
 def compute_net_diff(
     storage: TurnUndoStorage,
     before_blob: Optional[str],
     after_blob: Optional[str],
 ) -> tuple[int, int, str]:
-    """从最初 before 与最终 after blob 生成权威净增删统计。
-
-    返回 (net_added, net_removed, diff_kind)；二进制文件返回 (0, 0, 'binary')。
-    """
     if before_blob is None and after_blob is None:
         return 0, 0, "empty"
 
@@ -928,15 +886,12 @@ def close_turn(
         return checkpoint.status_enum
 
     files = storage.list_files(ctx.checkpoint_id)
-    # 退出撤销范围的文件（回合内被外部修改）不参与完整性校验与净 diff；
-    # 记录仍保留，供撤销预检列出 skipped 清单。
     active_files = [row for row in files if row.undo_result != UNDO_RESULT_SKIPPED]
     final_status = TurnUndoStatus.READY
     availability = SnapshotAvailability.AVAILABLE
     reason: Optional[str] = unavailable_reason
 
     if not files or not active_files:
-        # 没有任何受控修改，或全部文件都退出了撤销范围
         final_status = TurnUndoStatus.NO_CHANGES
         availability = SnapshotAvailability.NOT_REQUIRED
     else:

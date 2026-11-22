@@ -1,10 +1,3 @@
-"""Git 工作台不可变值对象、错误码与操作状态机。
-
-风格照 core/harness/models.py：str 枚举 + frozen dataclass + 显式校验函数。
-状态机三维正交（规格 §14）：operation_kind × operation_phase × conflicts，
-唯一耦合规则 kind==IDLE ⇔ phase==NONE；冲突维度独立可非空。
-"""
-
 from __future__ import annotations
 
 import re
@@ -14,7 +7,6 @@ from typing import Optional, Tuple
 
 
 class GitErrorCode(str, Enum):
-    """规格 §7.4 错误码（全表 + 追加 invalid_state）。"""
 
     GIT_NOT_FOUND = "git_not_found"
     GIT_VERSION_UNSUPPORTED = "git_version_unsupported"
@@ -72,7 +64,6 @@ _CRED_QUERY_RE = re.compile(r"(?i)(token|password|secret|access_token|private_ke
 
 
 def redact_text(text: str) -> str:
-    """移除 URL userinfo 与凭据形态的 Query 参数（规格 §16：凭据不进入日志/错误）。"""
     if not text:
         return text
     text = _URL_USERINFO_RE.sub(r"\1://***:***@", text)
@@ -130,7 +121,6 @@ def validate_operation_state(
 
 @dataclass(frozen=True)
 class RepositoryIdentity:
-    """仓库身份（规格 §7.1 + §5.1 仓库形态识别）。路径均为规范化绝对路径。"""
 
     workspace_path: str
     worktree_root: str
@@ -165,7 +155,6 @@ class ConflictEntry:
 
 @dataclass(frozen=True)
 class SnapshotVersions:
-    """乐观并发版本（规格 §9.3）：写请求必须携带，服务端锁内重算比较。"""
 
     worktree_version: Optional[str] = None
     refs_version: Optional[str] = None
@@ -173,7 +162,6 @@ class SnapshotVersions:
 
 @dataclass(frozen=True)
 class GitSnapshot:
-    """状态总览快照（规格 §7.2）。版本由服务端在锁内计算，前端不得自行生成。"""
 
     repository: RepositoryIdentity
     head_oid: str

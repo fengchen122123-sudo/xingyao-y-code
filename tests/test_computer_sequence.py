@@ -1,5 +1,3 @@
-"""sequence 批量动作（2026-09-06 协议扩展）的解析、执行、投影测试。"""
-
 from __future__ import annotations
 
 import json
@@ -16,9 +14,6 @@ from core.computer.models import (
     ComputerObservation,
     ComputerOwner,
 )
-
-
-# ---------------- Task 1：解析 ----------------
 
 
 def test_parse_sequence_ok():
@@ -76,7 +71,6 @@ def test_parse_sequence_rejects_empty_steps():
 
 
 def test_parse_sequence_accepts_element_actions():
-    """sequence 接受元素引用动作：点按钮 → 填输入框可一次打包（Task 4）。"""
     action = parse_computer_action({
         "kind": "sequence",
         "target": "desktop",
@@ -93,7 +87,6 @@ def test_parse_sequence_accepts_element_actions():
 
 
 def test_parse_sequence_still_rejects_list_elements():
-    """list_elements 仍不在 sequence 白名单：它会刷新 ref，必须单独调用。"""
     with pytest.raises(ComputerControlError) as exc:
         parse_computer_action({
             "kind": "sequence",
@@ -105,7 +98,6 @@ def test_parse_sequence_still_rejects_list_elements():
 
 
 def test_parse_sequence_element_step_target_must_match():
-    """元素子步骤沿用既有 target 一致性校验，不放宽。"""
     with pytest.raises(ComputerControlError) as exc:
         parse_computer_action({
             "kind": "sequence",
@@ -113,9 +105,6 @@ def test_parse_sequence_element_step_target_must_match():
             "steps": [{"kind": "click_element", "target": "browser", "element_ref": "el-1"}],
         })
     assert "target" in exc.value.message
-
-
-# ---------------- Task 2：controller 执行 ----------------
 
 
 class _RecordingBackend:
@@ -145,7 +134,6 @@ class _RecordingBackend:
 
 
 def test_controller_sequence_executes_all_steps_then_single_observe():
-    """sequence：backend.execute 按序收到全部子动作，observe 恰一次。"""
     from core.computer.controller import ComputerControlService
 
     backend = _RecordingBackend()
@@ -164,7 +152,6 @@ def test_controller_sequence_executes_all_steps_then_single_observe():
         enabled=True, protocol="generic", targets=("desktop",), settings_generation=0,
     )
     service.start_run(owner, capability, target="desktop")
-    # 协议规则：run 建立后第一次必须先 observe 清除 require_observe 基线。
     service.execute(service.snapshot().run_id, owner, ComputerAction(kind="observe", target="desktop"))
     backend.calls.clear()
     action = parse_computer_action({
@@ -180,11 +167,9 @@ def test_controller_sequence_executes_all_steps_then_single_observe():
 
 
 def test_controller_sequence_stops_on_cancel():
-    """取消事件置位后 sequence 剩余子动作不再执行。"""
     from core.computer.controller import ComputerControlService
 
     backend = _RecordingBackend()
-    # 同上：固定 generation provider，隔离全局设置写入（既有顺序性失败修复）
     service = ComputerControlService(
         backend_factory=lambda target, identity: backend,
         generation_provider=lambda: 0,
@@ -218,9 +203,6 @@ def test_controller_sequence_stops_on_cancel():
     assert ("execute", "keypress") not in backend.calls
 
 
-# ---------------- Task 3：投影与提示 ----------------
-
-
 def test_sequence_summary_is_sanitized():
     action = parse_computer_action({
         "kind": "sequence", "target": "desktop",
@@ -242,3 +224,174 @@ def test_generic_prompt_mentions_sequence():
     cap = ComputerCapability(enabled=True, protocol="generic", targets=("desktop",))
     prompt = build_generic_dynamic_prompt(cap)
     assert "sequence" in prompt
+
+
+def test_sequence_reports_failed_step_index_and_not_submitted_on_step0_precheck():
+    from core.computer.controller import ComputerControlService
+
+    class _StepFailBackend(_RecordingBackend):
+        def execute(self, run_id, action):
+            self.calls.append(("execute", action.kind))
+            raise ComputerControlError("computer_element_stale", "旧引用失效")
+
+    backend = _StepFailBackend()
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 0,
+    )
+    owner = ComputerOwner("s1", "t1", "测试", threading.Event())
+    cap = ComputerCapability(enabled=True, protocol="generic", targets=("desktop",), settings_generation=0)
+    snap = service.start_run(owner, cap, target="desktop")
+    service.execute(snap.run_id, owner, ComputerAction(kind="observe", target="desktop"))
+    backend.calls.clear()
+    action = parse_computer_action({
+        "kind": "sequence", "target": "desktop",
+        "steps": [
+            {"kind": "click_element", "target": "desktop", "element_ref": "el-1"},
+            {"kind": "keypress", "target": "desktop", "keys": ["ENTER"]},
+        ],
+    })
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(snap.run_id, owner, action)
+    assert raised.value.details["failed_step_index"] == 0
+    assert raised.value.details["submission_state"] == "not_submitted"
+    assert raised.value.details["completed_steps"] == 0
+    assert raised.value.details["total_steps"] == 2
+    service.stop(snap.run_id, "test")
+
+
+def test_sequence_reports_failed_step_index_and_submitted_after_partial_progress():
+    from core.computer.controller import ComputerControlService
+
+    class _SecondPreFailBackend(_RecordingBackend):
+        def execute(self, run_id, action):
+            self.calls.append(("execute", action.kind))
+            if action.kind == "click_element":
+                raise ComputerControlError("computer_element_stale", "第2步元素失效")
+
+    backend = _SecondPreFailBackend()
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 0,
+    )
+    owner = ComputerOwner("s1", "t1", "测试", threading.Event())
+    cap = ComputerCapability(enabled=True, protocol="generic", targets=("desktop",), settings_generation=0)
+    snap = service.start_run(owner, cap, target="desktop")
+    service.execute(snap.run_id, owner, ComputerAction(kind="observe", target="desktop"))
+    backend.calls.clear()
+    action = parse_computer_action({
+        "kind": "sequence", "target": "desktop",
+        "steps": [
+            {"kind": "click", "target": "desktop", "x": 1, "y": 2},
+            {"kind": "click_element", "target": "desktop", "element_ref": "el-9"},
+            {"kind": "keypress", "target": "desktop", "keys": ["ENTER"]},
+        ],
+    })
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(snap.run_id, owner, action)
+    assert raised.value.details["failed_step_index"] == 1
+    assert raised.value.details["submission_state"] == "submitted"
+    assert raised.value.details["completed_steps"] == 1
+    assert raised.value.details["total_steps"] == 3
+    service.stop(snap.run_id, "test")
+
+
+def test_sequence_reports_failed_step_index_and_outcome_unknown_on_timeout():
+    from core.computer.controller import ComputerControlService
+
+    class _TimeoutBackend(_RecordingBackend):
+        def execute(self, run_id, action):
+            self.calls.append(("execute", action.kind))
+            if action.kind == "keypress":
+                raise ComputerControlError("computer_action_timeout", "按键超时")
+
+    backend = _TimeoutBackend()
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 0,
+    )
+    owner = ComputerOwner("s1", "t1", "测试", threading.Event())
+    cap = ComputerCapability(enabled=True, protocol="generic", targets=("desktop",), settings_generation=0)
+    snap = service.start_run(owner, cap, target="desktop")
+    service.execute(snap.run_id, owner, ComputerAction(kind="observe", target="desktop"))
+    action = parse_computer_action({
+        "kind": "sequence", "target": "desktop",
+        "steps": [
+            {"kind": "click", "target": "desktop", "x": 1, "y": 2},
+            {"kind": "keypress", "target": "desktop", "keys": ["ENTER"]},
+        ],
+    })
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(snap.run_id, owner, action)
+    assert raised.value.details["failed_step_index"] == 1
+    assert raised.value.details["submission_state"] == "outcome_unknown"
+    service.stop(snap.run_id, "test")
+
+
+def test_generic_error_result_keeps_9_keys_for_non_sequence_and_reports_sequence_fields():
+    from core.computer import provider_generic
+
+    single = json.loads(
+        provider_generic._error_result(
+            "browser",
+            "click",
+            ComputerControlError("computer_element_stale", "旧引用"),
+        ).content
+    )
+    assert set(single) == {
+        "ok", "target", "action", "screen_sha256", "width", "height",
+        "origin_or_window", "error_code", "error_message",
+    }
+
+    seq = json.loads(
+        provider_generic._error_result(
+            "browser",
+            "sequence",
+            ComputerControlError(
+                "computer_action_timeout",
+                "超时期限已到",
+                details={
+                    "failed_step_index": 2,
+                    "submission_state": "outcome_unknown",
+                    "completed_steps": 2,
+                    "total_steps": 4,
+                },
+            ),
+        ).content
+    )
+    assert seq["failed_step_index"] == 2
+    assert seq["submission_state"] == "outcome_unknown"
+    assert seq["completed_steps"] == 2
+    assert seq["total_steps"] == 4
+
+
+def test_native_multi_action_call_attaches_failed_step_index_and_submission_state():
+    from core.computer.provider_openai import (
+        NativeComputerCall,
+        execute_native_computer_call,
+    )
+
+    class _Ctrl:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, action):
+            self.calls += 1
+            if self.calls == 2:
+                raise ComputerControlError("computer_action_timeout", "第二步超时")
+            return ComputerObservation(run_id="r", target="browser", action=action.kind)
+
+    call = NativeComputerCall(
+        "resp_1",
+        "call_1",
+        (
+            ComputerAction(kind="click", target="browser", x=1, y=2),
+            ComputerAction(kind="type_text", target="browser", text="hi"),
+        ),
+        (),
+    )
+    with pytest.raises(ComputerControlError) as raised:
+        execute_native_computer_call(call, _Ctrl())
+    assert raised.value.details["failed_step_index"] == 1
+    assert raised.value.details["submission_state"] == "outcome_unknown"
+    assert raised.value.details["total_steps"] == 2

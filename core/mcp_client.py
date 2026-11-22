@@ -63,16 +63,13 @@ def _redact_secret(value):
 
 def _redact_argument(argument):
     text = str(argument)
-    # Authorization headers and other embedded secret shapes.
     text = _redact_text(text)
-    # URI userinfo: scheme://user:password@host
     text = re.sub(
         r"(?P<prefix>[a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@/\s]+@",
         r"\g<prefix>***@",
         text,
         flags=re.IGNORECASE,
     )
-    # --secret=value / key=value forms.
     if "=" in text:
         key, _ = text.split("=", 1)
         if _is_sensitive_name(key):
@@ -145,7 +142,6 @@ def _decrypt_env_value(value):
 
 
 def _encrypt_env_values(env):
-    """写盘前加密 env 值；单个值加密失败时保留明文并记日志，不阻断配置写入。"""
     encrypted = {}
     for key, value in env.items():
         try:
@@ -156,16 +152,10 @@ def _encrypt_env_values(env):
     return encrypted
 
 
-# MCP 状态输出回调：默认写日志，由入口层（main.py / gui_bridge.py）
-# 按各自 UI 形态注册真正的展示方式，本模块不依赖任何界面库。
 _status_logger = None
 
 
 def set_status_logger(callback):
-    """注册 MCP 状态展示回调；传 None 恢复为默认的日志输出。
-
-    回调会在 MCP 后台线程中被调用，注册方必须自行切回各自的 UI 线程。
-    """
     global _status_logger
     _status_logger = callback
 
@@ -186,15 +176,6 @@ _STDIO_ERRLOG_FALLBACK = None  # 惰性打开的 os.devnull 流，进程级单�
 
 
 def _resolve_stdio_errlog():
-    """为 stdio_client 选择可用的子进程 stderr 重定向目标。
-
-    stdio_client 默认 errlog=sys.stderr；打包 GUI（console=False）下 sys.stderr
-    是 None 或无 fileno 的哑流（见 packaging/runtime_hook_nullstdout.py），
-    anyio 拉起子进程时取 fileno() 会抛 'null stream has no fileno'，
-    导致所有 stdio MCP 连接失败。此时回退到 os.devnull。
-
-    连接只发生在 MCP 专用事件循环线程内，惰性单例无需加锁。
-    """
     err = sys.stderr
     if err is not None:
         try:
@@ -212,10 +193,10 @@ class MCPManager:
     def __init__(self):
         import config
         self.config_file = config.MCP_FILE
-        self.servers = {} # name -> {"session": session, "stack": stack}
-        self.server_errors = {} # name -> 最近一次连接失败原因（连接成功时清除）
+        self.servers = {}
+        self.server_errors = {}
         self.tool_schemas = []
-        self.server_of_tool = {} # tool_name -> server_name
+        self.server_of_tool = {}
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
@@ -263,10 +244,6 @@ class MCPManager:
                 pass
 
     def _maybe_start_connection(self):
-        """启动 MCP 连接或创建占位 future，不等待完成。
-
-        必须在已持有 self._connect_lock 时调用。
-        """
         if self._closed:
             return
         if self._connect_future is None:
@@ -277,20 +254,12 @@ class MCPManager:
                 )
                 self._connect_future_is_placeholder = False
             else:
-                # 无配置：用一个已完成的 future 占位，后续访问零开销。
-                # 注意：空配置是进程级一次性决策——运行期再编辑 mcp.json
-                # 不会触发重连，需重启进程后生效。
                 done = concurrent.futures.Future()
                 done.set_result(None)
                 self._connect_future = done
                 self._connect_future_is_placeholder = True
 
     def _ensure_connected(self):
-        """首次访问时惰性连接所有 MCP 服务；配置为空时完全不启动连接。
-
-        支持运行期配置变化：若之前是空配置占位 future，而当前 mcp.json 已
-        包含 server，则重置连接标记并重新发起连接。
-        """
         if self._closed:
             return False
         with self._connect_lock:
@@ -314,7 +283,6 @@ class MCPManager:
                 future.cancel()
             except Exception:
                 pass
-            # 尝试取消事件循环中可能残留的冻结协程，减少僵尸协程积累
             try:
                 asyncio.run_coroutine_threadsafe(
                     self._cancel_pending_connections(), self.loop
@@ -352,7 +320,6 @@ class MCPManager:
                 _emit_status(f"\n[MCP] 拒绝连接服务 {name}: {launch_error}")
                 return None
 
-            # 读取连接时解密 env 值（dpapi:/keyring: 前缀），旧明文配置原样使用
             if env:
                 env = {key: _decrypt_env_value(value) for key, value in env.items()}
 
@@ -362,7 +329,6 @@ class MCPManager:
                 if str(key).upper() in _INHERITED_ENV_ALLOWLIST
             }
             if env:
-                # 合并时剔除对 PATH/COMSPEC/SYSTEMROOT 等继承键的覆盖尝试（双保险）
                 full_env.update({
                     key: value for key, value in env.items()
                     if str(key).upper() not in _INHERITED_ENV_ALLOWLIST
@@ -400,13 +366,11 @@ class MCPManager:
             await asyncio.wait_for(session.initialize(), timeout=INITIALIZE_TIMEOUT)
             self.servers[name] = {"session": session, "stack": stack}
 
-            # 获取工具列表
             tools_response = await asyncio.wait_for(session.list_tools(), timeout=INITIALIZE_TIMEOUT)
             # 先在局部构建，再整体替换为不可变快照，避免跨线程读到半成品列表
             new_schemas = []
             new_tool_map = {}
             for tool in tools_response.tools:
-                # 转换 MCP 工具 schema 到 OpenAI 兼容格式
                 schema = {
                     "type": "function",
                     "function": {
@@ -429,7 +393,6 @@ class MCPManager:
             _emit_status(f"\n[MCP] 成功连接服务: {name}")
             # 连接成功：清除该服务此前留下的失败原因
             self.server_errors.pop(name, None)
-            # 连接成功后把仍是明文的 env 值回写为加密版本（一次性迁移）
             self._encrypt_plaintext_env_on_disk(name)
             return name
         except asyncio.CancelledError:
@@ -478,9 +441,6 @@ class MCPManager:
             logging.getLogger(__name__).warning("MCP 服务 %s env 加密回写失败: %s", name, exc)
 
     async def _cancel_pending_connections(self) -> None:
-        """尝试取消当前事件循环中所有与 MCP 连接相关的挂起任务。
-        当连接超时时调用，减少僵尸协程在事件循环中积累。
-        显式传入目标 loop 枚举任务，避免依赖隐式 running-loop 解析的版本差异。"""
         try:
             for task in asyncio.all_tasks(self.loop):
                 if task.done():
@@ -499,14 +459,11 @@ class MCPManager:
             # 支持 enabled 字段：显式 false 时跳过连接，配置保留方便随时启用
             # 未设置 enabled 或 enabled=true 都按启用处理（向后兼容旧配置）
             if isinstance(conf, dict) and conf.get("enabled", True) is False:
-                # 主动跳过的服务不算连接失败，不写入 server_errors
                 _emit_status(f"\n[MCP] 跳过已禁用的服务: {name}")
                 continue
             names.append(name)
             tasks.append(self._connect_server(name, conf))
         if tasks:
-            # _connect_server 成功返回 name、失败返回 None；
-            # 记录失败名单让 gather 结果可区分成败，不再把异常吞成“成功”
             results = await asyncio.gather(*tasks, return_exceptions=True)
             failed = [
                 name for name, result in zip(names, results)
@@ -535,7 +492,6 @@ class MCPManager:
         )
 
     def get_schema(self, tool_name):
-        """Return one current schema without connecting or mutating state."""
         with self._connect_lock:
             for schema in self.tool_schemas:
                 if schema.get("function", {}).get("name") == tool_name:
@@ -548,7 +504,7 @@ class MCPManager:
             return f"MCP 工具 {tool_name} 不存在或服务未连接"
 
         session = self.servers[server_name]["session"]
-        original_tool_name = tool_name[len(server_name)+2:] # 去除 name__ 前缀
+        original_tool_name = tool_name[len(server_name)+2:]
 
         try:
             result = await asyncio.wait_for(
@@ -557,7 +513,6 @@ class MCPManager:
             )
             if result.isError:
                 return f"🚨 MCP 工具执行错误: {result.content}"
-            # 将执行结果内容转为字符串
             text_outputs = []
             for content in result.content:
                 if content.type == "text":
@@ -593,22 +548,15 @@ class MCPManager:
         self.servers.clear()
 
     def reconnect(self):
-        """运行期重连：先关闭所有现有连接与子进程，再清空状态，下次 get_schemas()/call_tool_sync() 时惰性重建。
-
-        供 /mcp reconnect 调用，避免用户编辑 mcp.json 后必须重启进程。
-        返回 (ok: bool, message: str)。
-        """
         if self._closed:
             return False, "MCP 管理器已关闭（进程退出中）"
         try:
-            # 1) 在事件循环中关闭所有现有 server stack
             try:
                 if not self.loop.is_closed():
                     future = asyncio.run_coroutine_threadsafe(self._close_all(), self.loop)
                     future.result(timeout=10)
             except Exception as e:
                 _emit_status(f"\n[MCP] 重连-关闭旧连接失败（继续重置）: {_redact_text(e)}")
-            # 2) 清空状态，重置占位标记，下次访问会重新读 mcp.json 并发起连接
             with self._connect_lock:
                 self.tool_schemas = []
                 self.server_of_tool = {}
@@ -616,14 +564,12 @@ class MCPManager:
                 self.server_errors = {}
                 self._connect_future = None
                 self._connect_future_is_placeholder = False
-            # 3) 重新读盘 + 立即触发一次连接（不阻塞等待结果）
             self._ensure_connected()
             return True, "已清空旧连接并重新发起连接，下次调用 MCP 工具时生效"
         except Exception as e:
             return False, f"重连失败: {_redact_text(e)}"
 
     def _server_tool_count(self, name):
-        """统计某 server 当前已就绪的工具数（按工具名 "<server>__" 前缀计数）。"""
         prefix = f"{name}__"
         return sum(
             1 for s in self.tool_schemas
@@ -635,17 +581,9 @@ class MCPManager:
         return self.server_errors.get(name) or "未知原因"
 
     def set_server_enabled(self, name, enabled):
-        """启用/禁用某个 MCP server，并立即重连生效。
-
-        会写回 mcp.json：把 server.enabled 字段设为 True/False。
-        若 server 不存在返回失败；若原本就没 enabled 字段，会新增。
-        禁用后下次 reconnect 不会拉起该 server，但配置保留以便随时启用。
-        返回 (ok: bool, message: str)；消息按真实连接结果生成，不暗示未发生的连接成功。
-        """
         if self._closed:
             return False, "MCP 管理器已关闭（进程退出中）"
         try:
-            # 1) 重新读盘拿最新配置
             with self._config_lock:
                 self._load_config()
                 servers = self.config.get("mcpServers", {})
@@ -655,7 +593,6 @@ class MCPManager:
                     return False, f"服务 {name} 的配置格式异常（应为对象）"
                 servers[name]["enabled"] = bool(enabled)
                 self._save_config_locked()
-            # 4) 触发重连让改动立即生效
             ok, msg = self.reconnect()
             if not ok:
                 return True, f"已更新 {name}.enabled={enabled}，但重连失败: {msg}"
@@ -669,18 +606,6 @@ class MCPManager:
             return False, f"更新失败: {_redact_text(e)}"
 
     def add_server(self, name, command, args, env=None, enabled=True):
-        """新增一个 MCP server 配置，并立即重连生效。
-
-        供 AI 工具和 /mcp CLI 配置器调用，避免用户手动编辑 JSON。
-        参数：
-          name: server 名称（用作 mcpServers 下的 key，也是工具名前缀）
-          command: 启动命令（如 "npx"）
-          args: 命令参数数组（如 ["-y", "firecrawl-mcp"]）
-          env: 环境变量字典（如 {"FIRECRAWL_API_KEY": "fc-xxx"}），可为 None
-          enabled: 是否立即启用，默认 True
-        返回 (ok: bool, message: str)；配置写盘成功时 ok 恒为 True，
-        但消息会如实说明是否真正连上（连不上时附带失败原因）。
-        """
         if self._closed:
             return False, "MCP 管理器已关闭（进程退出中）"
         if not name or not isinstance(name, str):
@@ -718,7 +643,6 @@ class MCPManager:
             ok, msg = self.reconnect()
             if not ok:
                 return True, f"已写入 {name} 配置，但重连失败: {msg}"
-            # 按真实结果反馈：只有该 server 真的连上才说“已新增服务”
             if name in self.servers:
                 return True, f"已新增服务 {name}（{self._server_tool_count(name)} 个工具）"
             return True, f"已写入 {name} 配置，但连接失败: {self._connect_failure_reason(name)}"
@@ -726,11 +650,6 @@ class MCPManager:
             return False, f"新增失败: {_redact_text(e)}"
 
     def remove_server(self, name):
-        """删除一个 MCP server 配置，并立即重连生效。
-
-        供 AI 工具和 /mcp CLI 配置器调用。
-        返回 (ok: bool, message: str)；消息只陈述删除结果，不暗示连接成功。
-        """
         if self._closed:
             return False, "MCP 管理器已关闭（进程退出中）"
         if not name:
@@ -751,12 +670,6 @@ class MCPManager:
             return False, f"删除失败: {_redact_text(e)}"
 
     def list_servers(self):
-        """返回所有 MCP server 配置的 JSON 字符串（供 AI 工具读取）。
-
-        包含 enabled/command/args/env/connected/last_error 字段，env 中的 API Key
-        会做全掩码处理（***），避免敏感信息泄露给 LLM。
-        last_error 为最近一次连接失败原因（无失败时为 null），便于排查连接问题。
-        """
         try:
             with self._config_lock:
                 self._load_config()
@@ -773,7 +686,6 @@ class MCPManager:
                     "connected": name in self.servers,
                     "last_error": self.server_errors.get(name),
                 }
-                # MCP 配置返回给模型时，环境变量值一律隐藏。调用方无需读取明文。
                 env = conf.get("env")
                 if env:
                     item["env"] = {key: _redact_secret(value) for key, value in env.items()}
@@ -795,7 +707,6 @@ class MCPManager:
             return json.dumps({"error": _redact_text(e)}, ensure_ascii=False)
 
     def close(self):
-        """Close servers and stop/join the private event-loop thread."""
         with self._connect_lock:
             if self._closed:
                 return
@@ -830,6 +741,5 @@ class MCPManager:
         except Exception:
             pass
 
-# 单例实例
 mcp_manager = MCPManager()
 atexit.register(mcp_manager.close)

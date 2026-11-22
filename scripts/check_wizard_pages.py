@@ -1,19 +1,3 @@
-"""安装向导页面注册一致性校验。
-
-新增或删除安装向导页面时，页面名必须在三处同时登记，否则运行时
-`show_page()` 会 KeyError：
-
-1. `SetupWizard._flow`        —— 导航顺序
-2. `SetupWizard._BANNERS`     —— 标题栏文案
-3. `self._page("<name>")`     —— 实际构建
-
-用法（在仓库根目录执行）：
-
-    python scripts/check_wizard_pages.py
-
-退出码 0 表示一致，1 表示存在漏注册。
-"""
-
 import io
 import re
 import sys

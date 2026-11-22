@@ -1,5 +1,3 @@
-"""Stable display buffering for streamed model reasoning."""
-
 from __future__ import annotations
 
 
@@ -20,7 +18,6 @@ def _stable_split(text: str, limit: int) -> int:
 
 
 class ThinkingStreamBuffer:
-    """Convert token-sized deltas into complete terminal display blocks."""
 
     def __init__(self, max_visible_chars: int = 120) -> None:
         if max_visible_chars < 1:

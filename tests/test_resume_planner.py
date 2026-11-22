@@ -1,6 +1,3 @@
-"""ResumePlanner（断点续跑 S2）单测：纯只读规划层，不写库、不发请求。"""
-import pytest
-
 from core.harness.journal import HarnessJournal
 from core.harness.models import HarnessEventKind, JournalEventDraft
 from core.harness.resume import (
@@ -20,7 +17,6 @@ class _Spec:
 
 
 class _Registry:
-    """最小注册表替身：只实现 planner 读取的两个方法。"""
 
     def __init__(self, specs, sources=None):
         self._specs = dict(specs)
@@ -36,7 +32,6 @@ class _Registry:
 
 
 def _setup(tmp_path, *, status="interrupted"):
-    """父回合：step1 已完成（带四哈希锚点），step2 停在 tools_running。"""
     manager = MemoryManager(str(tmp_path / "resume.db"))
     manager.create_session_explicit("session")
     journal = HarnessJournal(manager, "owner-test", clock_ms=lambda: 10_000)
@@ -126,7 +121,6 @@ def test_plan_blocks_write_call(tmp_path):
 
 
 def test_plan_blocks_uncertain_call(tmp_path):
-    """有 STARTED 无 FINISHED = 不确定态，绝不能自动重放（R-T16）。"""
     manager, journal = _setup(tmp_path)
     _emit(journal, name="read_file", started=True, finished=False)
     planner = ResumePlanner(
@@ -151,7 +145,6 @@ def test_plan_blocks_unregistered_tool(tmp_path):
 
 
 def test_plan_blocks_untrusted_plugin_source(tmp_path):
-    """插件/MCP 暴露的读工具也不能自动回灌（scope 声明不可信，R-T15）。"""
     manager, journal = _setup(tmp_path)
     _emit(journal, name="plugin_read")
     planner = ResumePlanner(
@@ -208,7 +201,6 @@ def test_anchor_comes_from_last_completed_step(tmp_path):
 
 
 def test_aborts_reports_missing_anchor(tmp_path):
-    """一个 step 都没完成 → 没有锚点，必须让用户手动重来（R-T8 同源）。"""
     manager = MemoryManager(str(tmp_path / "resume.db"))
     manager.create_session_explicit("session")
     journal = HarnessJournal(manager, "owner-test", clock_ms=lambda: 10_000)
@@ -252,7 +244,6 @@ def test_aborts_reports_owner_archived_and_undo(tmp_path):
 
 
 def test_probe_failure_is_treated_as_not_hit(tmp_path):
-    """探针自身报错不能让续跑彻底不可用：按未命中处理，兜底交给 S3 哈希断言。"""
     manager, journal = _setup(tmp_path)
     _emit(journal, name="read_file")
 

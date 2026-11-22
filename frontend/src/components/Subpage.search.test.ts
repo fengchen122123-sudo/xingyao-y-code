@@ -11,7 +11,7 @@ function mountSubpage(subType: 'skills' | 'mcp' | 'plugins' | 'models' = 'skills
 }
 
 function cardNames(wrapper: ReturnType<typeof mount>): string[] {
-  return wrapper.findAll('.sub-card .sc-name').map(n => n.text());
+  return wrapper.findAll('.sub-row .row-name').map(n => n.text());
 }
 
 async function typeSearch(wrapper: ReturnType<typeof mount>, kw: string) {
@@ -37,19 +37,19 @@ describe('Subpage - 关键词搜索', () => {
     const wrapper = mountSubpage('skills');
     expect(cardNames(wrapper)).toHaveLength(3);
 
-    await typeSearch(wrapper, '网文'); // 名称命中
+    await typeSearch(wrapper, '网文');
     expect(cardNames(wrapper).join('|')).toContain('网文写作');
 
-    await typeSearch(wrapper, 'COVER'); // 介绍命中且大小写不敏感
+    await typeSearch(wrapper, 'COVER');
     expect(cardNames(wrapper).join('|')).toContain('封面图生成');
 
-    await typeSearch(wrapper, '文章 视频'); // 两个词须同时命中
+    await typeSearch(wrapper, '文章 视频');
     const hit = cardNames(wrapper).join('|');
     expect(hit).toContain('讲解视频');
     expect(hit).not.toContain('网文写作');
     expect(hit).not.toContain('封面图生成');
 
-    await typeSearch(wrapper, ''); // 清空恢复全量
+    await typeSearch(wrapper, '');
     expect(cardNames(wrapper)).toHaveLength(3);
   });
 
@@ -65,7 +65,7 @@ describe('Subpage - 关键词搜索', () => {
     expect(cardNames(wrapper).join('|')).toContain('讲解视频');
 
     await wrapper.get('[data-test="src-filter-builtin"]').trigger('click');
-    expect(wrapper.findAll('.sub-card')).toHaveLength(0);
+    expect(wrapper.findAll('.sub-row')).toHaveLength(0);
     expect(wrapper.text()).toContain('没有符合筛选条件的技能');
   });
 
@@ -80,7 +80,7 @@ describe('Subpage - 关键词搜索', () => {
     await typeSearch(wrapper, '生图');
     expect(cardNames(wrapper).join('|')).toContain('tokenrhythm-image');
 
-    await typeSearch(wrapper, 'workbuddy_status'); // 工具名命中
+    await typeSearch(wrapper, 'workbuddy_status');
     expect(cardNames(wrapper).join('|')).toContain('workbuddy_connect');
   });
 
@@ -91,14 +91,14 @@ describe('Subpage - 关键词搜索', () => {
       { name: 'filesystem', enabled: false, connected: false, tools_count: 0 },
     ];
     const wrapper = mountSubpage('mcp');
-    expect(wrapper.findAll('.sub-card')).toHaveLength(2);
+    expect(wrapper.findAll('.sub-row')).toHaveLength(2);
 
     await typeSearch(wrapper, 'github');
     expect(cardNames(wrapper).join('|')).toContain('github');
     expect(cardNames(wrapper).join('|')).not.toContain('filesystem');
 
     await typeSearch(wrapper, 'zzz');
-    expect(wrapper.findAll('.sub-card')).toHaveLength(0);
+    expect(wrapper.findAll('.sub-row')).toHaveLength(0);
     expect(wrapper.text()).toContain('没有匹配的 MCP 服务');
   });
 
@@ -109,7 +109,7 @@ describe('Subpage - 关键词搜索', () => {
     ];
     const wrapper = mountSubpage('skills');
     await typeSearch(wrapper, '不存在的词');
-    expect(wrapper.findAll('.sub-card')).toHaveLength(0);
+    expect(wrapper.findAll('.sub-row')).toHaveLength(0);
 
     store.plugins = [
       { name: 'p1', version: '1.0', description: '', source: 'user', status: 'loaded', enabled: true, tools: [] },
@@ -117,6 +117,6 @@ describe('Subpage - 关键词搜索', () => {
     await wrapper.setProps({ subType: 'plugins' });
     const input = wrapper.get('[data-test="sub-search-input"]').element as HTMLInputElement;
     expect(input.value).toBe('');
-    expect(wrapper.findAll('.sub-card')).toHaveLength(1);
+    expect(wrapper.findAll('.sub-row')).toHaveLength(1);
   });
 });

@@ -58,8 +58,6 @@ it('no longer renders an action list in the panel (动作已移到对话区)', (
   store.reduceComputerEvent({ type: 'computer_action_finished', run_id: 'run-1', event_seq: 5, action_ordinal: 2, action_kind: 'type_text', ok: true, error_code: '', duration_ms: 140, text: 'secret text', text_length: 7 });
 
   const wrapper = mountPane();
-  // 2026-10-21：面板只留控制与最新截图，动作明细改在对话区逐行展示，
-  // 同一批动作不再两处重复，列表也不会在面板里越滚越长。
   expect(wrapper.find('[data-test="computer-trace-list"]').exists()).toBe(false);
   expect(wrapper.findAll('[data-test="computer-trace-row"]')).toHaveLength(0);
   // reducer 侧数据照旧保留（对话区据此渲染），且绝不保存输入正文
@@ -69,8 +67,6 @@ it('no longer renders an action list in the panel (动作已移到对话区)', (
 });
 
 it('renders production-shaped finished events with measured segments', () => {
-  // R9：生产事件由 controller 实测 duration_ms 与分段字段；reducer 直接使用
-  // 实测耗时而非前端自算；分段字段仅本地事件数据，不进 Provider 投影。
   const store = useAppStore();
   seedRun(store);
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
@@ -118,7 +114,6 @@ it('shows stop only without any resume button for provider safety runs', () => {
   const wrapper = mountPane();
   expect(wrapper.find('[data-test="computer-stop"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="computer-pause"]').exists()).toBe(false);
-  // Provider safety 确认契约未验证：不提供任何“继续”入口
   expect(wrapper.text()).not.toContain('继续');
   expect(wrapper.text()).not.toContain('恢复');
   wrapper.unmount();
@@ -153,7 +148,6 @@ it('keeps showing the stop reason after the run ends', () => {
 
   const wrapper = mountPane();
   expect(wrapper.text()).toContain('user_stop');
-  // 轨迹列表已移出面板：结束后也不会再出现动作行
   expect(wrapper.findAll('[data-test="computer-trace-row"]')).toHaveLength(0);
   wrapper.unmount();
 });
@@ -164,8 +158,6 @@ it('shows an empty state before any run has been seen', () => {
   expect(wrapper.text()).toContain('暂无');
   wrapper.unmount();
 });
-
-// ── 终态按钮可见性（2026-09-10 设计） ──
 
 it('终态不渲染「立即停止」按钮', () => {
   const store = useAppStore();
@@ -180,5 +172,57 @@ it('活动期仍渲染「立即停止」按钮', () => {
   store.computerRun = { ...store.computerRun, run_id: 'run-1', status: 'running' };
   const wrapper = mountPane();
   expect(wrapper.find('[data-test="computer-stop"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+it('外部浏览器明确标注实时截图预览（非网页 DOM）并展示首帧等待、省略/错误及图片加载失败回退', async () => {
+  const store = useAppStore();
+  seedRun(store, {
+    target: 'browser',
+    browser: 'edge',
+    browser_mode: 'external',
+    preview_url: '',
+  });
+  const wrapper = mountPane();
+  expect(wrapper.text()).toContain('外部浏览器截图预览');
+  expect(wrapper.text()).not.toContain('实时网页 DOM');
+  expect(wrapper.find('[data-test="cp-waiting-first-frame"]').exists()).toBe(true);
+
+  store.reduceComputerEvent({
+    type: 'computer_observation',
+    run_id: 'run-1',
+    event_seq: 4,
+    preview_url: '/computer-preview/tok/shot-9.png',
+    origin_or_window: 'https://example.com',
+  } as any);
+  await wrapper.vm.$nextTick();
+  const img = wrapper.get('[data-test="computer-preview-image"]');
+  await img.trigger('error');
+  expect(wrapper.find('[data-test="cp-preview-load-error"]').exists()).toBe(true);
+
+  store.reduceComputerEvent({
+    type: 'computer_observation',
+    run_id: 'run-1',
+    event_seq: 5,
+    image_omitted: 'too_large',
+    observation_error: 'frame_budget_exceeded',
+  } as any);
+  await wrapper.vm.$nextTick();
+  expect(wrapper.find('[data-test="cp-observation-notice"]').text()).toContain('too_large');
+  wrapper.unmount();
+});
+
+it('桌面模式展示当前窗口名称与观察采集时间', () => {
+  const store = useAppStore();
+  seedRun(store, {
+    target: 'desktop',
+    browser: '',
+    browser_mode: '',
+    current_surface: '记事本 - test.txt',
+    observation_updated_at_ms: 1700000000000,
+  });
+  const wrapper = mountPane();
+  expect(wrapper.find('[data-test="cp-desktop-window"]').text()).toContain('记事本 - test.txt');
+  expect(wrapper.find('[data-test="cp-observation-time"]').exists()).toBe(true);
   wrapper.unmount();
 });

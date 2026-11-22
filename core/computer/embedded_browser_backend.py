@@ -1,20 +1,3 @@
-"""内置 WebView2（GUI 右侧面板浏览器）的 CDP 直连 backend。
-
-与外部浏览器 backend 的本质区别：浏览器进程归 GUI 所有，本 backend 只通过
-Chrome DevTools Protocol「连接」它（playwright chromium.connect_over_cdp），
-绝不启动、绝不关闭任何浏览器进程。用户在右侧面板实时围观星瑶的操作。
-
-线程归属铁律与父类一致（browser_backend 模块 docstring）：构造函数不导入
-也不启动 Playwright；全部 Playwright 对象只属于 worker 线程，外部调用经
-有界命令队列 marshal。本 backend 固定使用线程模式——CDP 连接的生命周期
-天然在 GUI 进程内，无需再派生受管子进程。
-
-close()/teardown 只断开 CDP 连接（面板保活）；视口坐标系 = 项目分辨率
-（逻辑像素，由 controller 冻结进 identity），面板以「适应窗口缩放」呈现
-同一逻辑视口。高 DPI 下截图是物理像素，由 _normalize_frame 重采样回 CSS
-视口尺寸，保证「模型看到的图片坐标 = 动作坐标」。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -29,12 +12,10 @@ _LOGGER = logging.getLogger(__name__)
 _CDP_READY_POLL_INTERVAL = 0.25
 # CDP endpoint 必须是回环地址 + 1-65535 的合法端口
 _CDP_ENDPOINT_PREFIX = "http://127.0.0.1:"
-# 连接失败报错中 last_error 摘要的截断长度：CDP/Playwright 错误文本可能很长
 _ERROR_SUMMARY_MAX_CHARS = 300
 
 
 def _parse_cdp_port(endpoint: object) -> int | None:
-    """解析 "http://127.0.0.1:<port>[/...]" 中的端口；非回环或端口非法返回 None。"""
     if type(endpoint) is not str or not endpoint.startswith(_CDP_ENDPOINT_PREFIX):
         return None
     port_text = endpoint[len(_CDP_ENDPOINT_PREFIX):].split("/", 1)[0]
@@ -79,16 +60,9 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
     def cdp_endpoint(self) -> str:
         return self._cdp_endpoint
 
-    # ---------------- worker 线程：CDP 启动分支 ----------------
-
     def _boot(self) -> None:
-        """CDP 直连启动：不创建 profile 目录、不持有 profile 锁、不解析
-        浏览器 PID（浏览器归 GUI 所有，窗口标题提示退化为 DOM 可见性裁决）。"""
         factory = self._playwright_factory
         if factory is None:
-            # 惰性导入：只有真实启动时才触碰 playwright，且发生在 worker 线程。
-            # 安装包已不再自带 playwright（见 ycode.spec）：先确保按需组件就绪，
-            # 再导入；组件缺失时转成电脑操控领域错误码，提示用户去设置页下载。
             from core.components import ComponentError, ensure_playwright
 
             try:
@@ -128,7 +102,6 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
         self._browser_pid = None
 
     def _connect_with_retry(self):
-        """有界轮询 CDP 端口就绪（控件刚创建时内核异步初始化需要片刻）。"""
         deadline = time.monotonic() + self._start_timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
@@ -140,7 +113,10 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
                 return self._playwright.chromium.connect_over_cdp(self._cdp_endpoint)
             except Exception as error:
                 last_error = error
-                time.sleep(_CDP_READY_POLL_INTERVAL)
+                if self._worker_stop.wait(_CDP_READY_POLL_INTERVAL):
+                    raise ComputerControlError(
+                        "computer_browser_closed", "内置浏览器连接已被取消"
+                    ) from error
         if last_error is None:
             detail = "未知错误"
         else:
@@ -158,16 +134,6 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
         )
 
     def _observation_viewport(self, page) -> dict:
-        """坐标空间 = 页面真实 CSS 视口（innerWidth/innerHeight，即项目分辨
-        率经面板缩放后的逻辑值）。
-
-        E4（2026-11-02）：高 DPI 下 Playwright 截图是 视口 × devicePixelRatio
-        的物理像素，而 page.mouse 的坐标是 CSS 像素。旧实现把 PNG 原样发给
-        模型、却仍按 CSS 报 width/height，模型照图片给的坐标会被当成 CSS
-        坐标点击（1.25 倍缩放下越往右下偏得越多）。现在由 _normalize_frame
-        把截图重采样到 CSS 视口尺寸，因此 original 与 width 同值、scale=1：
-        图片坐标 = 动作坐标，三方一致。
-        """
         try:
             metrics = page.evaluate(
                 "() => ({ w: window.innerWidth, h: window.innerHeight,"

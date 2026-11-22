@@ -6,7 +6,6 @@ from core.reasoning_capabilities import (
 
 
 def test_transport_prefix_case_and_glm_alias_resolve_to_same_model_capability():
-    """传输前缀、大小写或已知命名空间不能改变同一模型的能力。"""
     assert normalize_reasoning_model_name("openai/K3-256K") == "k3-256k"
     assert normalize_reasoning_model_name("anthropic/kimi-for-coding") == "kimi-for-coding"
     assert normalize_reasoning_model_name("zai-org/GLM-5.2") == "glm-5.2"
@@ -15,12 +14,6 @@ def test_transport_prefix_case_and_glm_alias_resolve_to_same_model_capability():
 
 
 def test_deepseek_prefixed_names_resolve_to_official_thinking_capability():
-    """任意厂商的 deepseek 前缀模型（不区分大小写）都按官方思考模式文档适配。
-
-    依据 https://api-docs.deepseek.com/zh-cn/guides/thinking_mode：
-    thinking.type 控制开关、reasoning_effort 控制强度，档位 default/off/low/high/xhigh/max。
-    其中 xhigh 是官方接受的取值，服务端会按其映射表折叠为 high（不产生额外推理深度）。
-    """
     for name in (
         "deepseek-flash",
         "openai/DEEPSEEK-Flash",
@@ -37,11 +30,6 @@ def test_deepseek_prefixed_names_resolve_to_official_thinking_capability():
 
 
 def test_glm53_variant_names_inherit_family_capability():
-    """glm-5.3 家族未登记变体（如网关挂载名 flashx）自动继承强制思考能力。
-
-    能力表精确登记了 glm-5.3 / glm-5.3-flash / glm-5.3-free；其余以
-    glm-5.3 开头的变体按家族能力适配：low/high/max 三档，不可关闭。
-    """
     for name in (
         "glm-5.3-flashx",
         "openai/glm-5.3-flashx",
@@ -55,11 +43,6 @@ def test_glm53_variant_names_inherit_family_capability():
 
 
 def test_glm53_prefix_rule_does_not_spill_to_other_glm_generations():
-    """glm 全家族统一 default/low/high/max（不可关闭），glm-5.3 前缀规则不再特殊。
-
-    glm-5.4 / glm-5.2-plus 等未登记代际按 glm 家族规则适配；形似而并非
-    glm 前缀的 my-glm-5.3-clone 落到未登记模型的七档兜底通用强度。
-    """
     for name in ("glm-5.4", "glm-5.2-plus"):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name
@@ -73,11 +56,6 @@ def test_glm53_prefix_rule_does_not_spill_to_other_glm_generations():
 
 
 def test_prefix_rules_do_not_leak_to_lookalike_names():
-    """deepseek/agnes/glm-5.3 前缀规则不得外溢到形似而并非该家族的模型名。
-
-    my-deepseek-clone / my-agnes-clone 这类名字不以家族名开头，因此不会命中
-    前缀规则，只能落到未登记模型的兜底通用强度能力。
-    """
     for name in (
         "some-future-model",
         "my-deepseek-clone",
@@ -93,11 +71,6 @@ def test_prefix_rules_do_not_leak_to_lookalike_names():
 
 
 def test_unregistered_models_fall_back_to_generic_effort():
-    """未登记模型不能因为没进能力表就隐藏 GUI 思考按钮。
-
-    未登记模型统一返回通用强度能力：kind=effort、七档 默认/关闭/低/中/高/极高/最高、
-    request_strategy=effort_switch，由用户在 GUI 上自行选择是否注入 reasoning_effort。
-    """
     for name in (
         "hy4-preview",
         "openai/hy4-preview",
@@ -118,11 +91,6 @@ def test_unregistered_models_fall_back_to_generic_effort():
 
 
 def test_explicitly_hidden_models_stay_hidden():
-    """已确认不支持思考、显式登记为 hidden 的模型必须继续保持隐藏。
-
-    这些模型与"只是没登记的新模型"不同：它们的隐藏是精确事实，兜底通用
-    开关能力不能把它们重新变成可见。
-    """
     for name in (
         "sensenova-6.7-flash-lite",
         "step-explore",
@@ -136,8 +104,6 @@ def test_explicitly_hidden_models_stay_hidden():
 
 
 def test_agnes_prefixed_names_resolve_to_toggle_capability():
-    """任何 agnes 前缀模型（不区分大小写，含未来新版本）统一按
-    chat_template_kwargs.enable_thinking 开关适配，无需逐个登记。"""
     for name in (
         "agnes-3.0-flash",
         "openai/AGNES-4.0-future",
@@ -151,7 +117,6 @@ def test_agnes_prefixed_names_resolve_to_toggle_capability():
 
 
 def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
-    """模型切换不能继续显示旧的通用 low/high/max 档位。"""
     expected = {
         "k3": ("default", "low", "high", "max"),
         "k3-256k": ("default", "low", "high", "max"),
@@ -198,7 +163,6 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
 
 
 def test_fixed_models_are_visible_locked_on_and_explicit_hidden_models_are_hidden():
-    """固定思考必须显示为禁用的开启；显式登记为不支持思考的模型必须隐藏。"""
     for model_name in (
         "minimax-m2.5",
         "minimax-m2.7",
@@ -241,7 +205,6 @@ def test_fixed_models_are_visible_locked_on_and_explicit_hidden_models_are_hidde
 
 
 def test_unregistered_model_snapshot_exposes_effort_menu():
-    """未登记模型的 GUI 快照必须给出可操作的通用七档强度菜单。"""
     snapshot = build_reasoning_snapshot({"name": "hy4-preview"})
     assert snapshot == {
         "kind": "effort",
@@ -264,7 +227,6 @@ def test_unregistered_model_snapshot_exposes_effort_menu():
 
 
 def test_snapshot_serializes_labels_in_capability_order():
-    """前端菜单必须收到后端定义的精确顺序和英文原值标签。"""
     snapshot = build_reasoning_snapshot({"name": "qwen3.8-max"}, "medium")
     assert snapshot["choice"] == "medium"
     assert snapshot["options"] == [
@@ -277,7 +239,6 @@ def test_snapshot_serializes_labels_in_capability_order():
 
 
 def test_builtin_default_choice_only_for_models_with_official_facts():
-    """内置默认档位只填有官方依据的模型，其余留空，绝不编造。"""
     assert get_reasoning_capability("deepseek-v4-pro").default_choice == "high"
     assert get_reasoning_capability("deepseek-flash").default_choice == "high"
     assert get_reasoning_capability("openai/DeepSeek-v9-future").default_choice == "high"
@@ -302,7 +263,6 @@ def test_builtin_default_choice_only_for_models_with_official_facts():
 
 
 def test_snapshot_carries_builtin_default_choice():
-    """快照必须带上内置默认档位，前端据此自动预选。"""
     assert build_reasoning_snapshot({"name": "deepseek-v4-pro"})["default_choice"] == "high"
     assert build_reasoning_snapshot({"name": "kimi-for-coding"})["default_choice"] == "max"
     assert build_reasoning_snapshot({"name": "k3"})["default_choice"] == "max"
@@ -311,7 +271,6 @@ def test_snapshot_carries_builtin_default_choice():
 
 
 def test_kimi_prefix_family_uses_always_on_effort_with_official_default():
-    """kimi 全家族统一 default/low/high/max（不可关闭），官方默认 max。"""
     for name in (
         "kimi-k2.6",
         "kimi-k2.7-code",
@@ -327,7 +286,6 @@ def test_kimi_prefix_family_uses_always_on_effort_with_official_default():
 
 
 def test_glm_prefix_family_uses_thinking_object_effort_with_official_default():
-    """glm 全家族统一 default/low/high/max（不可关闭），官方默认 max。"""
     for name in (
         "glm-5",
         "glm-5.1",
@@ -343,8 +301,6 @@ def test_glm_prefix_family_uses_thinking_object_effort_with_official_default():
 
 
 def test_qwen_prefix_family_keeps_enable_thinking_effort_with_official_default():
-    """qwen 全家族统一 default/off/low/medium/xhigh，官方默认 xhigh（按用户决策，
-    不再限定 3.8 代际：老代际/未来代际/裸名都走家族规则）。"""
     for name in (
         "qwen3.8-max-preview",
         "qwen3.8-omni-flash",
@@ -366,8 +322,6 @@ def test_qwen_prefix_family_keeps_enable_thinking_effort_with_official_default()
 
 
 def test_bare_family_names_hit_family_rules():
-    """裸名 openai/deepseek、openai/kimi、openai/glm 等（无版本号后缀）
-    也必须命中家族规则，不能掉进兜底。"""
     expectations = {
         "openai/deepseek": (("default", "off", "low", "high", "xhigh", "max"), "thinking_object_effort", "high"),
         "deepseek": (("default", "off", "low", "high", "xhigh", "max"), "thinking_object_effort", "high"),
@@ -384,11 +338,6 @@ def test_bare_family_names_hit_family_rules():
 
 
 def test_family_prefix_rules_do_not_match_lookalike_names():
-    """形似名（my-kimi-clone / my-glm-clone / my-qwen-clone）仍走七档兜底。
-
-    家族判定用前缀匹配：qwenx 虽非通义千问，但按家族前缀规则会命中
-    qwen 能力（与 deepseekx/glmx 同理），这是前缀策略的既定取舍。
-    """
     for name in ("my-kimi-clone", "my-glm-clone", "my-qwen-clone"):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name

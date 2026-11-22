@@ -110,7 +110,6 @@ describe('MessageBubble 断点续跑入口（S4）', () => {
     expect(resumeExecute).toHaveBeenCalledWith('s1', []);
     const blockers = wrapper.get('[data-test="resume-blockers"]');
     expect(blockers.text()).toContain('第 1 个调用 write_file 需手动重做');
-    // 按钮仍在（未成功续跑），错误条与清单都在同一个气泡里
     expect(wrapper.find('[data-test="resume-continue-btn"]').exists()).toBe(true);
     wrapper.unmount();
   });

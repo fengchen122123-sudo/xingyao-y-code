@@ -17,7 +17,6 @@ const stubs = {
   AppIcon: true, MessageNavRail: { template: '<div />', methods: { refresh() {}, jumpToLoaded() {} } }, RemoteDirBrowser: true,
 };
 
-/** jsdom 无布局：scrollTop 可直接赋值，scrollHeight 需 defineProperty 模拟 */
 function setMetrics(el: HTMLElement, metrics: { scrollTop: number; scrollHeight: number }) {
   Object.defineProperty(el, 'scrollHeight', { value: metrics.scrollHeight, configurable: true });
   el.scrollTop = metrics.scrollTop;
@@ -99,7 +98,6 @@ it('prepend 旧消息后 scrollTop 按 scrollHeight 增量补偿（视口不跳�
   const oldTop = 60;
   const added = 800;
   vi.spyOn(store, 'loadOlderMessages').mockImplementation(async () => {
-    // 模拟 store prepend 一页旧消息后内容变高
     Object.defineProperty(el, 'scrollHeight', { value: oldHeight + added, configurable: true });
   });
 
@@ -108,7 +106,7 @@ it('prepend 旧消息后 scrollTop 按 scrollHeight 增量补偿（视口不跳�
   el.dispatchEvent(new Event('scroll'));
 
   await vi.waitFor(() => {
-    expect(el.scrollTop).toBe(oldHeight + added - oldHeight + oldTop); // 860
+    expect(el.scrollTop).toBe(oldHeight + added - oldHeight + oldTop);
   });
   wrapper.unmount();
 });
@@ -122,7 +120,6 @@ it('historyLoading 时消息流顶部显示加载指示，结束后隐藏', asyn
   await wrapper.vm.$nextTick();
   const indicator = wrapper.find('[data-test="history-loading"]');
   expect(indicator.exists()).toBe(true);
-  // 指示条位于 chat-body 内最前
   const body = wrapper.find('#chat-body').element;
   expect(body.firstElementChild).toBe(indicator.element);
 
@@ -134,13 +131,11 @@ it('historyLoading 时消息流顶部显示加载指示，结束后隐藏', asyn
 
 it('翻页 prepend（historyLoading=true）不得强制吸底', async () => {
   const { store, wrapper, el } = mountWithHistory();
-  // 用户滚到顶部 → stickToBottom=false
   setMetrics(el, { scrollTop: 0, scrollHeight: 2000 });
   el.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
   el.dispatchEvent(new Event('scroll'));
   await nextTick();
 
-  // 模拟翻页加载中：prepend 一页（user 消息数同步翻倍）
   store.historyLoading = true;
   const older = Array.from({ length: 10 }, (_, i) => ({
     role: i % 2 ? 'assistant' : 'user',
@@ -148,7 +143,7 @@ it('翻页 prepend（historyLoading=true）不得强制吸底', async () => {
   }));
   store.messages = [...older, ...store.messages] as any;
   await nextTick();
-  await new Promise(r => setTimeout(r, 60)); // 等 rAF 合并帧
+  await new Promise(r => setTimeout(r, 60));
 
   // 不得被 force 吸底改写为 scrollHeight
   expect(el.scrollTop).not.toBe(el.scrollHeight);
@@ -167,7 +162,6 @@ it('非翻页场景发送新消息仍然吸底（回归保护）', async () => {
   await nextTick();
   await new Promise(r => setTimeout(r, 60));
 
-  // force 吸底：scrollTop 被改写到底部
   expect(el.scrollTop).toBe(el.scrollHeight);
   wrapper.unmount();
 });
@@ -176,9 +170,8 @@ it('浏览器 anchoring 已保持位置时不再重复补偿（防双重跳位�
   const { store, wrapper, el } = mountWithHistory();
   setMetrics(el, { scrollTop: 10, scrollHeight: 2000 });
   vi.spyOn(store, 'loadOlderMessages').mockImplementation(async () => {
-    // 模拟 Chromium scroll anchoring：prepend 后 scrollTop 自动跟随内容增量
     Object.defineProperty(el, 'scrollHeight', { value: 2800, configurable: true });
-    el.scrollTop = 810; // 10 + 800（浏览器已自动补偿）
+    el.scrollTop = 810;
   });
   el.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
   el.dispatchEvent(new Event('scroll'));
@@ -192,7 +185,6 @@ it('浏览器 anchoring 未生效时兜底补偿内容增量', async () => {
   const { store, wrapper, el } = mountWithHistory();
   setMetrics(el, { scrollTop: 10, scrollHeight: 2000 });
   vi.spyOn(store, 'loadOlderMessages').mockImplementation(async () => {
-    // 只涨内容、不动 scrollTop（anchoring 未生效）
     Object.defineProperty(el, 'scrollHeight', { value: 2800, configurable: true });
   });
   el.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
@@ -225,10 +217,10 @@ it('真实翻页流程（loading 在 finally 复位）不得触发吸底——�
   };
   await store.loadOlderMessages();
   await nextTick();
-  await new Promise(r => setTimeout(r, 80)); // 等 watcher flush + rAF 吸底窗口
+  await new Promise(r => setTimeout(r, 80));
 
   expect(store.historyLoading).toBe(false);
-  expect(el.scrollTop).not.toBe(el.scrollHeight); // 未被强制吸底
+  expect(el.scrollTop).not.toBe(el.scrollHeight);
   wrapper.unmount();
 });
 
@@ -237,9 +229,7 @@ it('prepend 后异步内容继续撑高（长对话图片/高亮分批渲染）�
   const oldHeight = 2000;
   const oldTop = 10;
   vi.spyOn(store, 'loadOlderMessages').mockImplementation(async () => {
-    // 第一帧：prepend 完成（DOM 已插入），高度涨到 2600
     Object.defineProperty(el, 'scrollHeight', { value: 2600, configurable: true });
-    // 随后异步内容（图片解码 / 代码高亮 / 折叠体撑开）继续撑高到 3200
     window.setTimeout(() => {
       Object.defineProperty(el, 'scrollHeight', { value: 3200, configurable: true });
     }, 30);

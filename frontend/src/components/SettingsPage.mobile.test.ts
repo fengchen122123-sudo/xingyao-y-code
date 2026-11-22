@@ -54,7 +54,6 @@ describe('SettingsPage 手机端钻取布局', () => {
     const wrapper = mount(SettingsPage);
 
     expect(wrapper.find('.settings-page--mobile').exists()).toBe(true);
-    // v-if 硬互斥：未选中时详情不挂载
     expect(wrapper.find('.provider-list').exists()).toBe(true);
     expect(wrapper.find('.provider-detail').exists()).toBe(false);
   });
@@ -69,12 +68,10 @@ describe('SettingsPage 手机端钻取布局', () => {
     expect(wrapper.find('.provider-detail').exists()).toBe(true);
     expect(wrapper.find('.provider-list').exists()).toBe(false);
     expect(wrapper.get('.mobile-detail-back').isVisible()).toBe(true);
-    // 详情标题只展示前 6 个字符，完整厂商名挂在 title 里作悬停气泡
     expect(wrapper.get('.detail-title').text()).toBe('月之暗面 K…');
     expect(wrapper.get('.detail-title').attributes('title')).toBe('月之暗面 Kimi-for-Coding');
 
     await wrapper.get('.mobile-detail-back').trigger('click');
-    // closeMobileDetail 改的是 ref，DOM 同步在下一帧
     await wrapper.vm.$nextTick();
 
     expect(wrapper.find('.provider-list').exists()).toBe(true);
@@ -89,7 +86,6 @@ describe('SettingsPage 手机端钻取布局', () => {
     await wrapper.vm.$nextTick();
     expect(wrapper.find('.provider-detail').exists()).toBe(true);
 
-    // watch 默认 pre-flush，DOM 更新异步，先等一帧再断言
     mql.fireMobileChange(false);
     await wrapper.vm.$nextTick();
 

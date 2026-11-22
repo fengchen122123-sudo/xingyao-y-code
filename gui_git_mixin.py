@@ -1,20 +1,9 @@
-"""GUI Git 桥接混入（规格 §11/§13；实施计划跨阶段契约"GUI 桥契约"）。
-
-ApiBridge 继承本混入；pywebview 反射暴露 public snake_case 方法。
-铁律：
-- 返回 {"ok": bool, ...}，错误为 {"ok": False, "error": {code, message, retryable}}；
-- 事件只经 _emit_raw（→ _js_queue 单消费者线程 → evaluate_js），绝不直接触碰 JS；
-- 乐观并发：桥内缓存每个工作区最近一次权威快照版本，写操作自动携带；
-  外部变化经 git_state_changed 事件提醒前端调 git_refresh 刷新版本；
-- 高风险操作走 preview（git_preview_risk）→ 用户确认 → execute(token)。
-"""
-
 from __future__ import annotations
 
 import logging
 import threading
 from dataclasses import fields as dataclass_fields, is_dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from core.git.bootstrap import get_git_monitor, get_git_service
 from core.git.models import GitError, GitErrorCode, GitSnapshot, SnapshotVersions
@@ -24,10 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 def _to_dict(obj: Any) -> Any:
-    """dataclass/枚举/元组的安全 JSON 化（浅层递归）。"""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
-    if hasattr(obj, "value") and hasattr(obj, "name"):  # str Enum
+    if hasattr(obj, "value") and hasattr(obj, "name"):
         return obj.value
     if is_dataclass(obj):
         return {f.name: _to_dict(getattr(obj, f.name)) for f in dataclass_fields(obj)}
@@ -40,8 +28,6 @@ def _to_dict(obj: Any) -> Any:
 
 class GitBridgeMixin:
     """Git 工作台桥接方法集（ApiBridge 的继承混入）。"""
-
-    # ---- 惰性初始化 ------------------------------------------------------
 
     # js_api 方法由 pywebview 在各自线程派发，并发首调必须串行化创建：
     # 无锁双写会重置 _git_versions 等三个 dict，worktree_version=None 的
@@ -85,17 +71,14 @@ class GitBridgeMixin:
             },
         }
 
-    # ---- 事件与订阅 ------------------------------------------------------
-
     def _git_on_invalidated(self, workspace: str) -> None:
-        """监控线程回调：只入队事件，UI 线程投递由 _js_queue 派发器完成。"""
         try:
             self._emit_raw("git_state_changed", {"workspace": workspace})
         except Exception:
             logger.warning("git_state_changed 事件投递失败", exc_info=True)
 
     def _git_ensure_subscription(self, workdir: str) -> None:
-        self._git()  # 确保惰性字段就绪
+        self._git()
         key = normalize_repo_path(workdir)
         if key in self._git_subs:
             return
@@ -122,8 +105,6 @@ class GitBridgeMixin:
 
     def _git_session(self) -> str:
         return getattr(self, "_current_session", "") or ""
-
-    # ---- 仓库信任（§4.5）--------------------------------------------------
 
     def git_get_trust(self, workdir: str) -> Dict:
         """查询仓库信任状态：前端据此展示"允许本次 / 信任此仓库"对话框。"""
@@ -168,8 +149,6 @@ class GitBridgeMixin:
             return self._git_ok()
         except Exception as error:
             return self._git_err(error)
-
-    # ---- 快照与订阅入口 --------------------------------------------------
 
     def git_get_status(self, workdir: str) -> Dict:
         try:
@@ -264,8 +243,6 @@ class GitBridgeMixin:
         except Exception as error:
             return self._git_err(error)
 
-    # ---- Remote 与同步 ---------------------------------------------------
-
     def git_fetch(self, workdir: str, remote: str = "", prune: bool = False) -> Dict:
         try:
             snap = self._git().execute(
@@ -315,8 +292,6 @@ class GitBridgeMixin:
         except Exception as error:
             return self._git_err(error)
 
-    # ---- 历史 / Diff / Blame / Reflog / Tag / Stash -----------------------
-
     def git_load_history(self, workdir: str, skip: int = 0, limit: int = 50) -> Dict:
         try:
             commits, has_more = self._git().log_page(
@@ -365,7 +340,6 @@ class GitBridgeMixin:
                 workdir, operation, dict(params or {}),
                 session_id=self._git_session(),
             )
-            # preview 内含权威快照版本，同步更新缓存供执行使用
             self._git_versions[normalize_repo_path(workdir)] = preview.versions
             return self._git_ok(preview=_to_dict(preview))
         except Exception as error:
@@ -384,8 +358,6 @@ class GitBridgeMixin:
             return self._git_ok(snapshot=_to_dict(snap))
         except Exception as error:
             return self._git_err(error)
-
-    # ---- 阶段 7：冲突 / Rebase 计划 / Reflog 恢复 / AI 辅助（§5.10/§5.15）---
 
     def git_load_conflict(self, workdir: str, path: str) -> Dict:
         """三方冲突内容：Base/Ours/Theirs/工作区当前文本。"""
@@ -456,6 +428,3 @@ class GitBridgeMixin:
             return dict(self.send_user_message(template, workdir=workdir, turn_source="local"))
         except Exception as error:
             return self._git_err(error)
-
-    # ---- Worktree --------------------------------------------------------
-

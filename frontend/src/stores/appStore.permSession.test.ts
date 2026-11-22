@@ -46,26 +46,21 @@ it('权限选择只绑定当前会话并写入该会话 runtime', async () => {
 
 it('权限档位随会话 runtime 保存与恢复，切会话立即生效（不等后端响应）', async () => {
   const store = useAppStore();
-  // 会话 A 选完全访问
   store.currentSessionName = 'session-a';
   store.permissionMode = 'full';
   store._captureRuntime('session-a');
 
-  // 切到 B：B 从未选过档位 → 保持当前值，由后端 switch_session 响应校正
   store.currentSessionName = 'session-b';
   store._bindSessionRuntime('session-b');
   expect(store.permissionMode).toBe('full');
 
-  // 在 B 选计划模式并捕获
   store.permissionMode = 'plan';
   store._captureRuntime('session-b');
 
-  // 切回 A：恢复完全访问，不受 B 影响
   store.currentSessionName = 'session-a';
   store._bindSessionRuntime('session-a');
   expect(store.permissionMode).toBe('full');
 
-  // 再切回 B：恢复计划模式
   store.currentSessionName = 'session-b';
   store._bindSessionRuntime('session-b');
   expect(store.permissionMode).toBe('plan');

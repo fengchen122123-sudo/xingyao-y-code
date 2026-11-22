@@ -1,16 +1,3 @@
-"""OpenAI Responses 原生 Computer Use 协议（设计 11，Task 11a）。
-
-官方 GA 事实（2026-09-03 复核 developers.openai.com Computer use 指南与
-Responses API 参考）：tools: [{"type":"computer"}]、computer_call.actions[]、
-computer_call_output、previous_response_id；computer-use-preview 与单个
-``action`` 字段是旧 preview 集成，本项目不为新实现采用或自动回退。
-pending_safety_checks 条目形状为 {id, code, message}。
-
-本模块是纯解析/构造层：不执行鼠标键盘（动作执行经 controller 窄接口）、
-不读全局 config、不导入 GUI/CLI/Playwright。原生解析失败一律
-computer_provider_protocol_error，绝不改走 generic 协议。
-"""
-
 from __future__ import annotations
 
 import base64
@@ -30,11 +17,8 @@ from core.computer.models import (
 from core.computer.tool_adapter import COMPUTER_SELECT_TARGET_TOOL_NAME
 from core.tool_protocol import ToolResult
 
-# 官方 GA 精确 built-in 定义：只允许经 capability 分支直接传入 Responses 请求，
-# _responses_tools_from_chat_tools 仍拒绝任意 built-in（设计 11.1）。
 OPENAI_COMPUTER_TOOL_DEFINITION = {"type": "computer"}
 
-# 双 target 时的固定 selector function tool schema（Task 11a brief Step 3 逐字）。
 COMPUTER_SELECT_TARGET_TOOL_SCHEMA = {
     "type": "function",
     "name": "computer_select_target",
@@ -47,8 +31,6 @@ COMPUTER_SELECT_TARGET_TOOL_SCHEMA = {
     },
 }
 
-# 官方 GA wait 动作不携带时长字段（参考手册 Wait object 只有 type），
-# 映射到统一动作时使用固定 2 秒（官方指南示例的默认等待）。
 NATIVE_WAIT_DEFAULT_MS = 2000
 
 _PROVIDER_JSON_KWARGS = {
@@ -59,7 +41,6 @@ _PROVIDER_JSON_KWARGS = {
 
 _PROTOCOL_ERROR = "computer_provider_protocol_error"
 
-# 官方 GA 动作字段白名单（Responses API 参考 ComputerActionList 各 object）。
 _OFFICIAL_ACTION_FIELDS = {
     "click": frozenset({"type", "x", "y", "button", "keys"}),
     "double_click": frozenset({"type", "x", "y", "keys"}),
@@ -72,7 +53,6 @@ _OFFICIAL_ACTION_FIELDS = {
     "wait": frozenset({"type"}),
 }
 
-# 官方键名别名归一化到统一动作键名（官方指南 normalize_key 表的子集）。
 _KEY_ALIASES = {
     "RETURN": "ENTER",
     "ESCAPE": "ESC",
@@ -87,11 +67,7 @@ _KEY_ALIASES = {
     "ARROWRIGHT": "RIGHT",
 }
 
-# 官方鼠标按键 → 统一 button；back/forward 无统一等价，原样交给统一解析拒绝。
 _BUTTON_ALIASES = {"left": "left", "right": "right", "wheel": "middle"}
-
-
-# ---------------- 值对象 ----------------
 
 
 @dataclass(frozen=True)
@@ -133,9 +109,6 @@ class NativeCallResult:
     executed_actions: int = 0
 
 
-# ---------------- 内部工具 ----------------
-
-
 def _protocol_error(message: str, **details) -> ComputerControlError:
     return ComputerControlError(_PROTOCOL_ERROR, message, details=details or None)
 
@@ -147,7 +120,6 @@ def _field(value, key, default=None):
 
 
 def _normalized_type(event_type) -> str:
-    """事件 type 归一化为 'response.*' 字符串（桥接枚举走 .value）。"""
     if isinstance(event_type, str):
         return event_type
     value = getattr(event_type, "value", None)
@@ -213,13 +185,6 @@ def _map_drag_path(value):
 
 
 def _map_official_action(action, target: str) -> ComputerAction:
-    """官方 GA computer action → 统一 ComputerAction。
-
-    映射到统一动作后再次经 parse_computer_action 严格校验坐标/字段
-    （设计 11.2）：官方 screenshot 映射 observe，官方 drag 的 path/keys
-    直接映射统一动作的 path/keys；move/scroll 携带 keys 等统一 schema
-    不允许的组合由统一解析以 computer_invalid_action 拒绝。
-    """
     if not isinstance(action, dict):
         raise _protocol_error("官方 computer action 必须是对象")
     action_type = action.get("type")
@@ -267,7 +232,7 @@ def _map_official_action(action, target: str) -> ComputerAction:
         keys = _map_keys(action.get("keys"))
         if keys is not None:
             payload["keys"] = keys
-    else:  # click / double_click / move
+    else:
         payload = {"kind": action_type, "target": target, "x": action.get("x"), "y": action.get("y")}
         button = _map_button(action.get("button"))
         if button is not None:
@@ -290,7 +255,6 @@ def _parse_safety_check(check) -> SafetyCheck:
 
 
 def _dedupe_computer_items(items):
-    """合并同一 computer_call 的重复终态载荷（done 与 completed 重复携带）。"""
     by_call: dict[str, Any] = {}
     ordered = []
     for item in items:
@@ -308,7 +272,6 @@ def _dedupe_computer_items(items):
 
 
 def _native_call_from_item(response_id, item, target) -> NativeComputerCall:
-    """computer_call item → NativeComputerCall（parse 与流式载荷共用的严格校验）。"""
     call_id = _field(item, "call_id")
     if not isinstance(call_id, str) or not call_id:
         raise _protocol_error("computer_call 缺少 call id")
@@ -336,23 +299,12 @@ def _native_call_from_item(response_id, item, target) -> NativeComputerCall:
     return NativeComputerCall(response_id, call_id, actions, checks)
 
 
-# ---------------- 公共 API ----------------
-
-
 def native_has_dual_targets(capability) -> bool:
     """原生能力是否同时启用两个 target（此时首请求固定 parallel_tool_calls=false）。"""
     return _is_native_enabled(capability) and len(tuple(capability.targets or ())) > 1
 
 
 def build_openai_computer_tools(capability, target_selected) -> tuple[dict, ...]:
-    """构造 Responses 请求的原生 tools 尾部（设计 11.1）。
-
-    - 双 target 且尚未选择：依次返回 computer_select_target 与精确 computer
-      built-in（selector 必须单独完成一个 Step）；
-    - 单 target 或已选择：只返回 computer built-in；
-    - capability 关闭/非原生：返回空 tuple（请求字节不受影响）。
-    返回深拷贝，绝不暴露可变模块常量。
-    """
     if not _is_native_enabled(capability):
         return ()
     targets = tuple(capability.targets or ())
@@ -368,15 +320,6 @@ def build_openai_computer_tools(capability, target_selected) -> tuple[dict, ...]
 
 
 def parse_openai_computer_events(events, target=None) -> NativeComputerCall | NativeFinalText:
-    """严格解析一个 Provider response 的原生事件序列（设计 11.2）。
-
-    target 是本 Turn 冻结的操控目标（selector 租约或单 target 能力），
-    用于把官方动作映射为统一 ComputerAction；未选择时出现 computer_call
-    以 computer_invalid_state 拒绝。缺少 response id/call id/非空 actions[]、
-    selector 与 computer_call 同 response、未知动作或字段冲突一律
-    computer_provider_protocol_error；completed/incomplete/failed 三终态显式
-    区分，后两者同样以协议错误失败，绝不进入 generic 分支。
-    """
     response_id = ""
     selector_seen = False
     computer_items = []
@@ -461,12 +404,6 @@ def parse_openai_computer_events(events, target=None) -> NativeComputerCall | Na
 
 
 def native_computer_call_from_stream(payload, target=None) -> NativeComputerCall:
-    """从 assembler 合并的终态 computer_call 流载荷构造 NativeComputerCall。
-
-    payload 形如 {"response_id": ..., "item": {...}}（StreamAssembler 在
-    output_item.done / response.completed 终态后才暴露）；半截 JSON 永远
-    到不了这里。校验与 parse_openai_computer_events 共用同一严格路径。
-    """
     if not isinstance(payload, dict):
         raise _protocol_error("computer_call 流载荷必须是对象")
     item = payload.get("item")
@@ -476,36 +413,31 @@ def native_computer_call_from_stream(payload, target=None) -> NativeComputerCall
 
 
 def execute_native_computer_call(call, controller) -> NativeCallResult:
-    """按原序串行执行一批原生动作（设计 11.2，GA actions[] 例外规则）。
-
-    controller 是本函数的窄执行协议，不是 ComputerControlService 本体：
-    - execute(action)：必须在单动作内完成 cancel/pause/owner/generation
-      检查、backend 执行、本地 fresh after observation 与无进展判断；
-    - enter_provider_safety_required()：pending safety 时被调用。
-    真实服务签名是 execute(run_id, owner, action) /
-    enter_provider_safety_required(run_id)（core/computer/controller.py），
-    Task 11b 接线时必须由调用方构造绑定 run_id/owner 的适配器传入，
-    不得把真实服务直接传给本函数（审查修复轮 I-2 契约声明）。
-    任一动作失败或被停止即向上传播领域错误，余项绝不执行。整批成功后
-    observation 为最后一个动作的本地观察（"只回传最后一图"不等于
-    "中间动作不观察"）。pending safety checks 非空时零执行，controller
-    进入 provider_safety_required（设计 11.5：无已验证确认契约，绝不
-    伪造 acknowledged safety checks，也不回退 generic 绕过）。
-    """
     if call.pending_safety_checks:
         controller.enter_provider_safety_required()
         return NativeCallResult(status="provider_safety_required")
     observation = None
     executed = 0
-    for action in call.actions:
-        observation = controller.execute(action)
+    total = len(call.actions)
+    for step_idx, action in enumerate(call.actions):
+        try:
+            observation = controller.execute(action)
+        except ComputerControlError as error:
+            if total > 1:
+                from core.computer.actions import annotate_sequence_step_error
+
+                raise annotate_sequence_step_error(
+                    error,
+                    step_index=step_idx,
+                    step_kind=action.kind,
+                    total_steps=total,
+                    submitted_before_call=True,
+                ) from error
+            raise
         executed += 1
     return NativeCallResult(
         status="ok", observation=observation, executed_actions=executed
     )
-
-
-# ---------------- Task 11b：原生 continuation 与脱敏持久化投影 ----------------
 
 
 # 续传请求必须重发的请求级 options（不含 model/input/tools/instructions/
@@ -541,17 +473,6 @@ class NativeContinuationState:
 
 
 def build_continuation_request(turn_state, call_output) -> dict:
-    """构造原生续传 Step 的 Provider 请求 kwargs（设计 11.3 第 4 步）。
-
-    重发同一 model、同序 tools（含 computer built-in；selector 已选后本就不
-    在产生 computer_call 的 Step 请求里）、必要 instructions/options 与上一
-    response id；input 只有一个 computer_call_output，绝不重发完整消息历史
-    （产物无 "messages" 键）。官方 Responses API 明确上一响应的 instructions
-    不会经 previous_response_id 自动继承，漏发会导致 system prompt 语义漂移，
-    因此 instructions 必须显式重发。Provider 未返回可用 response id 时立即以
-    computer_provider_protocol_error 失败；禁止退回"重发全部截图历史"或
-    通用 function tool。键序固定，供 byte-golden 精确断言。
-    """
     response_id = str(getattr(turn_state, "response_id", "") or "")
     if not response_id:
         raise _protocol_error("Provider 未返回可用 response id，无法构造原生续传请求")
@@ -583,22 +504,23 @@ def _read_png_bytes(observation) -> bytes:
         ) from error
 
 
-def build_computer_call_output(call, observation) -> dict:
-    """整批动作成功后的 computer_call_output 输入条目（设计 11.3 第 3-4 步）。
+def build_computer_call_output(call, observation, *, controller=None) -> dict:
+    from core.computer.frames import (
+        prepare_observation_image_frame,
+        sync_frame_disabled,
+    )
+    from core.computer.provider_generic import (
+        _OBSERVATION_IMAGE_MAX_BYTES,
+        _downscale_png,
+        no_screenshot_observation_text,
+    )
 
-    只携带整批动作最后一张截图（"只回传最后一图"）；data URL 只存在于本
-    条目并发给 Provider，绝不持久化。不含任何确认字段（设计 11.5：GA
-    Computer use 请求 schema 未定义 acknowledged_safety_checks 契约前绝不
-    产出——pending safety 时 execute_native_computer_call 已先行返回
-    provider_safety_required，本函数只服务已执行成功的批次）。
-
-    B 方案降级：浏览器窗口被遮挡/最小化时渲染被节流，本次观察可能没有截图
-    （png_path 为空）。此时不调 _read_png_bytes（空路径必抛错、整批动作的
-    结果全丢），改发纯文本观察（无截图说明 + 页面正文）。
-    """
     if not str(getattr(observation, "png_path", "") or ""):
-        from core.computer.provider_generic import no_screenshot_observation_text
-
+        sync_frame_disabled(
+            observation,
+            reason="no_screenshot",
+            controller=controller,
+        )
         return {
             "type": "computer_call_output",
             "call_id": call.call_id,
@@ -606,21 +528,15 @@ def build_computer_call_output(call, observation) -> dict:
                 {"type": "input_text", "text": no_screenshot_observation_text(observation)}
             ],
         }
-    png_bytes = _read_png_bytes(observation)
-    # 与 provider_generic 同一上限（2MB/1280 边）：高分屏整屏 PNG 直接 base64
-    # 会显著放大请求体；超限先缩放，仍超限发纯文本观察（原生协议无省略图
-    # 专用字段，退回 input_text 与 B 方案降级同构）。
-    from core.computer.provider_generic import (
-        _OBSERVATION_IMAGE_MAX_BYTES,
-        _downscale_png,
-        no_screenshot_observation_text,
+    raw_png = _read_png_bytes(observation)
+    png_bytes, _omitted, _frame = prepare_observation_image_frame(
+        raw_png,
+        observation,
+        max_bytes=_OBSERVATION_IMAGE_MAX_BYTES,
+        downscale_fn=_downscale_png,
+        controller=controller,
     )
-
-    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
-        scaled = _downscale_png(png_bytes)
-        if scaled:
-            png_bytes = scaled
-    if len(png_bytes) > _OBSERVATION_IMAGE_MAX_BYTES:
+    if png_bytes is None:
         return {
             "type": "computer_call_output",
             "call_id": call.call_id,
@@ -682,14 +598,6 @@ def build_native_call_persistence_row(run_id, call, observation) -> dict:
 
 
 class BoundNativeController:
-    """把真实 ComputerControlService 绑定 run_id/owner 的窄执行协议适配器。
-
-    execute_native_computer_call 只认 execute(action) /
-    enter_provider_safety_required()（11a 窄协议）；真实服务签名是
-    execute(run_id, owner, action) / enter_provider_safety_required(run_id)
-    （审查修复轮 I-2 契约）。调用方（core/llm.py 原生分支）必须经本适配器
-    绑定后传入，不得把真实服务直接交给协议层。
-    """
 
     def __init__(self, controller, run_id, owner) -> None:
         self._controller = controller
@@ -703,21 +611,13 @@ class BoundNativeController:
         return self._controller.enter_provider_safety_required(self._run_id)
 
 
-# ---------------- target selector 固定适配（Task 9 保留名机制） ----------------
-
-
 class NativeTargetSelection:
-    """Turn 级原生 target 选择状态：selector adapter 写入，请求构造读取。
-
-    由 chat_with_model_events 在双 target 原生回合创建并注入
-    ToolExecutionContext.computer_native_selection；不进入普通 ToolRegistry。
-    """
 
     def __init__(self, capability, owner, controller) -> None:
         self.capability = capability
         self.owner = owner
         self.controller = controller
-        self.target = None  # None = 尚未选择（首请求带 selector）
+        self.target = None
         self.run_id = ""
 
 
@@ -732,13 +632,6 @@ def _selector_error(code: str, message: str) -> ToolResult:
 
 
 def execute_reserved_computer_selector(decoded, selection) -> ToolResult | None:
-    """computer_select_target 固定适配（Task 11a，设计 11.2）。
-
-    非 selector 调用返回 None 走普通解析；重复选择、选择后变更、target
-    值非法、target 未开启、start_run 失败均返回稳定 JSON 错误结果；
-    成功时 start_run(owner, capability, target) 写入 target 租约并记录
-    run_id，供后续请求去掉 selector、原生动作执行与 Turn 收尾使用。
-    """
     if decoded.name != COMPUTER_SELECT_TARGET_TOOL_NAME:
         return None
     if selection is None:

@@ -1,4 +1,3 @@
-"""断点续跑判定层单测：逐行覆盖判定表与边界。"""
 from __future__ import annotations
 
 import pytest
@@ -12,7 +11,6 @@ from core.harness.resume_policy import (
 
 
 def _facts(**overrides) -> ToolReplayFacts:
-    """默认是一个"纯只读且已完成"的调用，方便逐项覆盖。"""
     base = dict(
         tool_name="read_file",
         side_effect_scope="none",
@@ -29,9 +27,6 @@ def _facts(**overrides) -> ToolReplayFacts:
     )
     base.update(overrides)
     return ToolReplayFacts(**base)
-
-
-# ---- 判定表 1-10 行逐行 ----
 
 
 def test_block_session_archived():
@@ -78,7 +73,6 @@ def test_block_untrusted_source(source):
 
 
 def test_block_get_weather_even_if_scope_none():
-    """get_weather 声明 scope=none、read_only=True，但实际出网。"""
     assert decide_replay(
         _facts(tool_name="get_weather", side_effect_scope="none", read_only=True)
     ) == (ReplayDecision.BLOCK, "known_network_side_effect")
@@ -92,7 +86,6 @@ def test_block_permission_narrowed_for_write():
 
 
 def test_permission_narrowed_pure_read_still_replays():
-    """纯只读不受权限收窄影响，仍可回灌。"""
     assert decide_replay(_facts(permission_narrowed=True)) == (
         ReplayDecision.REPLAY,
         "read_replay",
@@ -123,11 +116,7 @@ def test_unknown_scope_defaults_to_confirm():
     ) == (ReplayDecision.CONFIRM, "write_requires_confirmation")
 
 
-# ---- 边界 ----
-
-
 def test_started_false_is_not_uncertain():
-    """从未开始不算不确定态：纯只读仍可回灌…但未开始无结果，应重新执行。"""
     decision, reason = decide_replay(_facts(started=False, finished=False))
     assert decision is ReplayDecision.REPLAY
     assert reason == "read_replay"

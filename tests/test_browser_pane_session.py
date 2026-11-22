@@ -1,15 +1,3 @@
-"""内嵌浏览器面板的会话归属回归测试。
-
-覆盖 2026-10-28 用户反馈的两个断点：
-
-1. ``browser_pane`` 工具经 ``app_context.get()`` 拿不到桥方法
-   （``_GuiContext`` 没有代理 ``browser_pane_*``），任何会话调用都返回
-   「缺少 browser_pane_open」；
-2. 原生 WebView2 控件全进程唯一，后台会话调用会直接作用到当前界面的
-   控件上（串台）。桥层改为：前台会话立即执行，后台会话只登记意图，
-   切回该会话时回放。
-"""
-
 import json
 from types import SimpleNamespace
 
@@ -73,7 +61,6 @@ def test_background_open_is_deferred_and_does_not_touch_controller(monkeypatch):
             {"session_name": "B", "url": "https://example.com"},
         )
     ]
-    # 归属没有被后台会话抢走
     assert d._browser_pane_owner() == ""
 
 
@@ -104,7 +91,6 @@ def test_activate_session_replays_pending_url(monkeypatch):
         )
     ]
     assert d._browser_pane_owner() == "B"
-    # pending 已消费，重复激活不会再次回放
     assert d.browser_pane_set_active_session("B")["activated"] is False
 
 
@@ -137,7 +123,6 @@ def test_assign_records_intent_without_controller(monkeypatch):
 
 
 def test_state_event_carries_owner_session(monkeypatch):
-    """controller 的 on_state 回调要把归属会话打进 embedded_browser 事件。"""
     monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
     d = Dummy("A")
     captured = {}
@@ -167,7 +152,6 @@ def test_state_event_carries_owner_session(monkeypatch):
 
 
 def test_gui_context_forwards_browser_bridge_methods():
-    """工具层只通过 app_context.get() 取上下文，_GuiContext 必须转发桥方法。"""
 
     class FakeBridge:
         def browser_pane_open(self, rect, url="", zoom=1.0, session_name=""):
@@ -180,7 +164,6 @@ def test_gui_context_forwards_browser_bridge_methods():
 
     assert ctx.browser_pane_open(VALID_RECT, "u", 1.0, "B")["args"][3] == "B"
     assert ctx.browser_pane_assign("u", "B")["args"] == ("u", "B")
-    # 白名单外不暴露 ApiBridge 内部状态
     try:
         ctx._window
     except AttributeError:
@@ -190,7 +173,6 @@ def test_gui_context_forwards_browser_bridge_methods():
 
 
 def test_tool_open_without_rect_uses_assign(monkeypatch):
-    """模型不传 rect 时不再报「需要 rect 参数」，改为登记意图交给前端测量。"""
     from core import app_context
     from core import tools_admin_interaction as tools
 
@@ -238,10 +220,6 @@ def test_tool_open_with_rect_passes_session(monkeypatch):
 
 
 def test_tool_to_gui_context_to_mixin_end_to_end(monkeypatch):
-    """整链路：工具 → app_context → _GuiContext → ApiBridge(mixin)。
-
-    这是 2026-10 断掉的那条链路（_GuiContext 不转发桥方法），必须端到端锁住。
-    """
     from core import app_context
     from core import tools_admin_interaction as tools
 
@@ -263,7 +241,6 @@ def test_tool_to_gui_context_to_mixin_end_to_end(monkeypatch):
 
     assert result["ok"] is True
     assert result["deferred"] is True
-    # 后台会话不得碰当前界面的原生控件
     assert bridge._embedded_browser.calls == []
     assert bridge.events == [
         (
@@ -274,7 +251,6 @@ def test_tool_to_gui_context_to_mixin_end_to_end(monkeypatch):
 
 
 def test_tool_not_visible_error_is_chinese(monkeypatch):
-    """后台会话调用 back/hide 时给出可读中文，而不是原始错误码。"""
     from core import app_context
     from core import tools_admin_interaction as tools
 

@@ -2,7 +2,6 @@
   <!-- 只读体检面板：一个按钮 + 分级汇总 + 逐条发现 + 跳过项，不做折叠/分页 -->
   <div class="novel-audit">
     <div class="novel-audit-head">
-      <!-- 运行审查 + 全部修复：修复入口只是把问题拼成指令交给星瑶，不在面板里直接改文件 -->
       <div class="novel-audit-actions">
         <button
           class="novel-audit-run"
@@ -81,26 +80,19 @@ import AppIcon from './AppIcon.vue';
 import type { NovelAuditDto, NovelAuditFindingDto } from '../types/pywebview.d';
 
 const props = defineProps<{
-  /** 最近一次体检结果：null 表示还没跑过（只显示按钮与说明） */
   result: NovelAuditDto | null;
-  /** 是否正在扫描：为真时按钮禁用并显示加载提示 */
   loading: boolean;
-  /** 桥接层错误文本（调用失败 / 缺桥），非空时按 --red 显示 */
   error: string;
   /** 是否正在把问题交给星瑶：为真时禁用修复入口，避免重复点击 */
   fixing?: boolean;
 }>();
 
 const emit = defineEmits<{
-  /** 点击「运行审查」：父组件负责调 run_novel_audit 并回填 result */
   (e: 'run'): void;
-  /** 点击单条「修复」：把这条 finding 交给父组件拼成对话指令 */
   (e: 'fix', finding: NovelAuditFindingDto): void;
-  /** 点击「全部修复」：父组件按 type 分组汇总出总指令 */
   (e: 'fixAll'): void;
 }>();
 
-// 分级固定四态（后端 AUDIT_LEVELS），缺项按 0 展示，不因缺键而漏格
 const LEVELS: { level: string; cls: string }[] = [
   { level: 'S1', cls: 'is-s1' },
   { level: 'S2', cls: 'is-s2' },
@@ -108,15 +100,12 @@ const LEVELS: { level: string; cls: string }[] = [
   { level: 'S4', cls: 'is-s4' },
 ];
 
-// result.ok 为 true 才算有结论；is_novel=false 与非 ok 结果走提示/错误分支
 const okResult = computed(() => (props.result?.ok === true ? props.result : null));
 const nonNovel = computed(() => props.result?.is_novel === false);
 
 const findings = computed(() => props.result?.findings ?? []);
 const skipped = computed(() => props.result?.skipped ?? []);
 
-// 错误文本优先级：桥接错误 > result.ok=false 时后端给的 error；
-// 合成一条后只渲染一个 data-test="novel-audit-error"，不重复出块
 const errorMessage = computed(() => {
   if (props.error) return props.error;
   const result = props.result;
@@ -133,7 +122,6 @@ function countOf(level: string): number {
 
 const summaryCells = computed(() => LEVELS.map((item) => ({ ...item, count: countOf(item.level) })));
 
-// 结论等级配色：S1 红 / S2、S3 黄 / S4 灰（S3 是语雀黄绿，统一用 --yellow 更稳）
 function levelClass(level: string): string {
   switch (String(level || '').trim().toUpperCase()) {
     case 'S1':
@@ -148,7 +136,6 @@ function levelClass(level: string): string {
 </script>
 
 <style scoped>
-/* 颜色/字号只用全局 CSS 变量，跟随主题切换 */
 .novel-audit {
   display: flex;
   flex-direction: column;
@@ -161,7 +148,6 @@ function levelClass(level: string): string {
   gap: 4px;
 }
 
-/* 运行审查与全部修复同一行：窄面板下允许换行，不挤压说明文案 */
 .novel-audit-actions {
   display: flex;
   align-items: center;
@@ -191,7 +177,6 @@ function levelClass(level: string): string {
   cursor: not-allowed;
 }
 
-/* 修复入口：与 .novel-audit-run 同色系，尺寸更小，hover/disabled 口径一致 */
 .novel-audit-fix-all,
 .novel-audit-fix {
   display: inline-flex;
@@ -215,7 +200,6 @@ function levelClass(level: string): string {
   opacity: 0.5;
   cursor: not-allowed;
 }
-/* 单条修复贴在卡片头部最右侧：margin-left:auto 不挤掉 level/type/file */
 .novel-audit-fix {
   margin-left: auto;
   flex: 0 0 auto;

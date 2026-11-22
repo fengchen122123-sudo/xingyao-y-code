@@ -1,16 +1,3 @@
-"""飞书长连接接入探针（T1）：在 websockets 17.1 上验证代码路径，不依赖飞书官方包。
-
-三种模式：
-  --http       假凭据请求飞书长连接接入点，断言返回飞书错误码（证明接入点可达、
-               请求构造正确、凭据校验路径有效）。CI 可跑，默认模式。
-  --ws-mock    本地起一个 asyncio websocket echo 服务器，用 websockets.connect
-               往返收发 + 关闭，验证 websockets 17.1 在当前 Python 上的传输路径。
-  --real       真凭据（环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET），请求接入点，
-               断言返回 code=0 并打印分配的 WS URL（完整建连验证在 T2 搬运完成后做）。
-
-退出码：所有断言通过 = 0；任一失败 = 1。不打印任何真实凭据。
-"""
-
 import argparse
 import asyncio
 import json
@@ -67,7 +54,6 @@ def http_check(args) -> int:
 
 
 async def _ws_mock_client():
-    """连接本地 echo 服务器，验证 websockets 17.1 的 connect/recv/send/close 路径。"""
     import websockets
 
     async def handler(ws):

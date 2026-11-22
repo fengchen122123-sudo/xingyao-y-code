@@ -497,8 +497,6 @@ def test_non_main_usage_increases_process_cost_without_overwriting_main(monkeypa
 
 
 def test_account_server_usage_notifies_listener_after_successful_accounting(monkeypatch):
-    """每次记账成功后必须通知 UI 监听器（GUI 据此实时推送 token_usage 事件），
-    让统计栏与上下文圆圈在回合进行中逐请求刷新，而非等整个回合结束。"""
     import core.llm as llm
 
     monkeypatch.setattr(llm, "_persist_token_usage", lambda *args, **kwargs: None)
@@ -530,12 +528,10 @@ def test_account_server_usage_notifies_listener_after_successful_accounting(monk
         invalidation_reason="",
     )
 
-    # 主 scope 记账后通知一次；注销后不再通知
     assert notified == [1]
 
 
 def test_account_server_usage_swallows_listener_errors(monkeypatch, caplog):
-    """监听器抛异常不得影响记账主流程：计数器与持久化都必须照常完成。"""
     import logging
 
     import core.llm as llm

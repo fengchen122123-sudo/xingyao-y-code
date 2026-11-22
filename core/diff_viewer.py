@@ -29,10 +29,6 @@ def generate_diff(old_content, new_content, file_path):
     return "".join(diff)
 
 def render_diff_table(diff_text):
-    """
-    将 unified diff 文本解析并渲染为带有双列行号的 Rich Table。
-    这能真实反映文件中的原始行号，而不仅仅是 Diff 字符串的序号。
-    """
     from rich.table import Table
     from rich.text import Text
 
@@ -53,7 +49,6 @@ def render_diff_table(diff_text):
         if re.match(r"^--- a/", line) or re.match(r"^\+\+\+ b/", line):
             continue
         elif line.startswith('@@'):
-            # 解析 @@ -9,4 +9,4 @@
             try:
                 parts = line.split(' ')
                 old_start = int(parts[1].split(',')[0].replace('-', ''))
@@ -66,7 +61,6 @@ def render_diff_table(diff_text):
                 new_ln = 0
             table.add_row('...', '...', Text(line, style="cyan"))
         elif line.startswith('\\'):
-            # "\ No newline at end of file" 只是注释行，不占文件行号
             continue
         elif line.startswith('-'):
             table.add_row(str(old_ln), '', Text(line, style="red"))

@@ -59,6 +59,9 @@ mytemp/
 config.json
 active_skills.json
 mcp.json
+# 桌宠渲染配置不是密钥：帧映射/台词/气泡时长/窗口参数，必须随代码走
+# （gitignore 后规则覆盖前规则，本例外必须写在上面 config.json 之后，勿上移）
+!pets/xingyao_pet/src/renderer/config.json
 
 # OS
 .DS_Store
@@ -210,3 +213,78 @@ skills/tokenrhythm-account/reference.md
 /a.txt
 /y
 
+# 官网后台：登录口令，以及含已下架草稿的本地全量数据。
+# 访客能看到的内容在 website/data/site.json，会随站点一起部署。
+site_admin/secret.json
+site_admin/store.json
+site_admin/admin.db
+pets/xingyao_pet/node_modules/
+
+# 误操作产生的空文件（命令重定向写坏，0 字节），不入库
+# —— 与上面的 /a.txt、/y、/' 同类，只用根目录锚定形式，避免误伤子目录同名文件
+/$null
+/)'
+
+# 前端桌面版构建产物：由服务器端 `vite build --outDir desktop-dist` 生成，
+# 每次构建内容全变（带 hash 的资源名），源码在 frontend/ 下，产物不入库
+frontend/desktop-dist/
+
+# 一次性部署脚本（含服务器端口与内部路径），仅本地使用，不入库
+_deploy_scratch/
+
+# Three.js 实验 demo（约 2-3MB 静态资源，仅本地试验），不入主仓库
+rainy-konbini/
+
+# 一次性探针输出（内容仅为连通性检查结果），不入库
+scripts/_probe5.txt
+
+# 一次性 Playwright 截图脚本（硬编码个人路径，仅本地使用），不入库
+scripts/shot_sheet.py
+scripts/shot_test.py
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Capacitor Android 容器（app/）构建产物与本地路径不入库
+#
+# 入库范围：app/android 下的 Gradle 脚本、AndroidManifest、res 资源、
+#          assets 里的 capacitor.config.json / capacitor.plugins.json（记录 appId 与插件集）。
+# 排除范围：cap sync 拷贝的前端产物、Gradle 构建输出、本机 SDK 路径、签名密钥、依赖目录。
+# 说明：文件上方（Python 段）已有不带锚定的 `build/`，本来就能匹配任意层级 build 目录；
+#      这里按 app/ 的语义再显式写一遍，让排除意图自解释。.gitignore 是后规则覆盖前规则，
+#      本段只加正向排除、没有取反规则，因此不会与上面的 `build/` 冲突。
+# ─────────────────────────────────────────────────────────────────────────────
+# Gradle 缓存与构建输出
+app/android/.gradle/
+app/android/build/
+app/android/app/build/
+app/android/app/release/
+app/android/capacitor-cordova-android-plugins/build/
+# 本机 SDK / JDK 路径（含个人绝对路径），绝不入库
+app/android/local.properties
+# Android Studio / Gradle 本机工程配置与缓存
+app/android/.idea/
+app/android/captures/
+app/android/.cxx/
+app/android/.externalNativeBuild/
+app/android/**/*.iml
+app/android/**/output-metadata.json
+# 签名密钥：绝不入库
+app/android/**/*.jks
+app/android/**/*.keystore
+# 安装包与编译中间产物
+app/android/**/*.apk
+app/android/**/*.aab
+app/android/**/*.ap_
+app/android/**/*.apk.sha1
+app/android/**/*.dex
+app/android/**/*.class
+app/android/**/*.hprof
+# cap sync 从 frontend 构建产物拷贝进来的 Web 资源（文件名带构建 hash，属产物）；
+# 源码在 frontend/ 下，可用 `npx cap sync android` 重新生成
+app/android/app/src/main/assets/public/
+# Node 依赖：根规则已有一个 node_modules/，此处显式声明 app/node_modules 不作为源码入库
+app/node_modules/
+
+# 历史设计文档归档（2026-11-21 从 docs/superpowers、docs 顶层报告与「待开发」迁入）
+# 归档属内部资料而非源码，整体不入库；上面的 docs/superpowers/ 与 /待开发/ 规则
+# 保留作防回归，避免同名目录被重新创建时误入版本库。
+docs/archive/

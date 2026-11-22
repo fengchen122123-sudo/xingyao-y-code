@@ -5,8 +5,6 @@ import { nextTick } from 'vue';
 import TokenRhythmAccountPanel from './TokenRhythmAccountPanel.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 桥接 mock（写法与 TokenRhythmLoginModal.test.ts 一致）：默认已登录且总览接口返回
-// 一份完整数据；单个用例按需覆盖某个方法
 function okOverview(overrides: Record<string, any> = {}) {
   return {
     ok: true,
@@ -41,10 +39,8 @@ function installBridge(overrides: Record<string, any> = {}) {
     tr_account_overview: vi.fn(async () => okOverview()),
     tr_auth_logout: vi.fn(async () => ({ ok: true, msg: '已退出基元律动账号' })),
     open_external_url: vi.fn(async () => ({ ok: true })),
-    // 账号中心原生弹窗两个 tab 各自对应的官方接口（openTrDialog 会按 tab 调其中之一）
     tr_usage_detail: vi.fn(async () => ({ ok: true, data: {} })),
     tr_profile: vi.fn(async () => ({ ok: true, data: {} })),
-    // 充值 tab 已随弹窗改版删除：这个 mock 只用于「充值不拉钱包流水」的反向断言
     tr_wallet_transactions: vi.fn(async () => ({ ok: true, data: {} })),
     ...overrides,
     ...overrides,
@@ -55,12 +51,10 @@ function installBridge(overrides: Record<string, any> = {}) {
 
 let wrapper: VueWrapper | null = null;
 
-/** 建 store + 挂组件（浮层默认关闭，由用例自己调 openTrAccountPanel） */
 function setup() {
   const pinia = createPinia();
   setActivePinia(pinia);
   const store = useAppStore();
-  // 前置条件：已登录（未登录时点卡片走的是登录弹窗，不归本组件管）
   store.trAuth.status = 'loggedIn';
   wrapper = mount(TokenRhythmAccountPanel, {
     // 组件用 Teleport 挂到 body（避免被侧栏裁剪）；测试里 stub 掉，内容仍留在组件内可查询
@@ -69,7 +63,6 @@ function setup() {
   return { store, wrapper };
 }
 
-/** 打开浮层并等首次总览请求落地 */
 async function openPanel(store: ReturnType<typeof useAppStore>) {
   store.openTrAccountPanel();
   await flushPromises();
@@ -98,9 +91,7 @@ it('超长账号名只显示前 6 个字符，完整名挂在 title 上', async 
 
   const nameEl = w!.get('[data-test="tr-acc-name"]');
   expect(nameEl.text()).toBe('基元律动请送…');
-  // 完整名字留给悬停气泡，不丢信息
   expect(nameEl.attributes('title')).toBe(longName);
-  // 头像仍取首字
   expect(w!.get('[data-test="tr-acc-avatar"]').text()).toBe('基');
 });
 
@@ -110,20 +101,16 @@ it('加载成功后展示两位小数余额、今日用量与千分位 Token', a
 
   await openPanel(store);
 
-  // 头部：昵称 + 手机号掩码（只显示中间四位）
   expect(w!.get('[data-test="tr-acc-name"]').text()).toBe('阿晨');
   expect(w!.get('[data-test="tr-acc-account"]').text()).toBe('138****8000');
   expect(w!.get('[data-test="tr-acc-avatar"]').text()).toBe('阿');
-  // 余额：298.09757398 → ¥298.10；今日已用 1.23456789 → ¥1.23
   expect(w!.get('[data-test="tr-acc-balance"]').text()).toBe('¥298.10');
   expect(w!.get('[data-test="tr-acc-today-cost"]').text()).toContain('¥1.23');
-  // 今日用量：调用次数、Token 千分位、输入/输出
   expect(w!.get('[data-test="tr-acc-calls"]').text()).toBe('12');
   expect(w!.get('[data-test="tr-acc-tokens"]').text()).toBe('34,567');
   const io = w!.get('[data-test="tr-acc-io"]').text();
   expect(io).toContain('30,000');
   expect(io).toContain('4,567');
-  // 底部来源说明固定存在
   expect(w!.get('[data-test="tr-account-panel"]').text()).toContain('数据来自基元律动官方接口');
 });
 
@@ -180,9 +167,7 @@ it('头部「官网」按钮在右侧内嵌浏览器打开官方账户页，并�
   await w!.get('[data-test="tr-acc-site"]').trigger('click');
   await flushPromises();
 
-  // 与「充值」同一套打开逻辑：右栏内嵌浏览器收到导航请求，目标就是官方账户页
   expect(store.browserNavRequest).toEqual({ url: 'https://tokenrhythm.studio/account/account', path: '' });
-  // 内嵌浏览器可用时不拉起系统浏览器，也不打开账号中心原生弹窗
   expect(api.open_external_url).not.toHaveBeenCalled();
   expect(store.trDialog.show).toBe(false);
   // 浮层收起，避免压住刚摊开的右栏
@@ -197,9 +182,7 @@ it('充值在右侧内嵌浏览器打开官方充值页，不弹原生弹窗', a
   await w!.get('[data-test="tr-acc-recharge"]').trigger('click');
   await flushPromises();
 
-  // 右栏内嵌浏览器收到导航请求，目标就是官方充值入口
   expect(store.browserNavRequest).toEqual({ url: 'https://tokenrhythm.studio/account/recharge?entry_source=header_menu', path: '' });
-  // 充值不再走原生弹窗：不打开弹窗、不拉钱包流水，也不拉起系统浏览器
   expect(store.trDialog.show).toBe(false);
   expect(api.tr_wallet_transactions).not.toHaveBeenCalled();
   expect(api.open_external_url).not.toHaveBeenCalled();
@@ -211,25 +194,20 @@ it('用量明细 / 个人信息 打开账号中心原生弹窗并收起账号浮
   const api = installBridge();
   const { store, wrapper: w } = setup();
 
-  // [按钮 data-test, 弹窗 tab, 该 tab 对应的桥方法]
   const cases: Array<[string, 'usage' | 'profile', string]> = [
     ['tr-acc-usage-detail', 'usage', 'tr_usage_detail'],
     ['tr-acc-profile', 'profile', 'tr_profile'],
   ];
   for (const [btn, tab, method] of cases) {
-    // 弹窗是同一实例按 tab 复用：先关掉上一个 tab，才能证明这次点击确实打开了弹窗
     store.closeTrDialog();
     await openPanel(store);
     await w!.get(`[data-test="${btn}"]`).trigger('click');
     await flushPromises();
-    // 走原生弹窗：tab 切到对应视图，并由它自己去拉官方数据
     expect(store.trDialog.show).toBe(true);
     expect(store.trDialog.tab).toBe(tab);
     expect(api[method]).toHaveBeenCalledTimes(1);
-    // 浮层收起：不压住刚打开的弹窗
     expect(store.trAccountPanel.show).toBe(false);
   }
-  // 原生弹窗路径：既不拉系统浏览器，也不给右栏内嵌浏览器发导航请求
   expect(api.open_external_url).not.toHaveBeenCalled();
   expect(store.browserNavRequest).toBeNull();
 });
@@ -238,7 +216,6 @@ it('个人信息 tab 关掉弹窗后回到浮层再点一次，仍是原生弹�
   const api = installBridge();
   const { store, wrapper: w } = setup();
 
-  // 先在「用量明细」视图，模拟用户关掉弹窗回到浮层，再点「个人信息」切换过去
   store.openTrDialog('usage');
   await flushPromises();
   expect(store.trDialog.tab).toBe('usage');
@@ -249,21 +226,17 @@ it('个人信息 tab 关掉弹窗后回到浮层再点一次，仍是原生弹�
   await w!.get('[data-test="tr-acc-profile"]').trigger('click');
   await flushPromises();
 
-  // 同一个弹窗实例按 tab 复用，不新开第二个窗口，也不会顺带重拉其它 tab 的数据
   expect(store.trDialog.show).toBe(true);
   expect(store.trDialog.tab).toBe('profile');
   expect(api.tr_profile).toHaveBeenCalledTimes(1);
   expect(api.tr_usage_detail).toHaveBeenCalledTimes(1);
-  // 原生弹窗路径：不拉系统浏览器，也不给右栏内嵌浏览器发导航请求
   expect(api.open_external_url).not.toHaveBeenCalled();
   expect(store.browserNavRequest).toBeNull();
-  // 浮层同样被 openTrDialog 内部收起
   expect(store.trAccountPanel.show).toBe(false);
 });
 
 it('退出登录成功后关闭浮层并清空账号快照', async () => {
   const api = installBridge({
-    // 退出后后端权威状态回到未登录：组件会再探测一次，卡片随之回到"星瑶Code"
     tr_auth_status: vi.fn(async () => ({ ok: true, logged_in: false, user: null, configured: false })),
   });
   const { store, wrapper: w } = setup();
@@ -299,12 +272,10 @@ it('点击浮层外部关闭，点浮层内部与左下角卡片本身不关闭'
   const { store, wrapper: w } = setup();
   await openPanel(store);
 
-  // 浮层内部：不关闭
   await w!.get('[data-test="tr-account-panel"]').trigger('mousedown');
   await nextTick();
   expect(store.trAccountPanel.show).toBe(true);
 
-  // 左下角用户卡片自身：由它负责 toggle，不算"外部"
   const card = document.createElement('button');
   card.setAttribute('data-test', 'side-user-card');
   document.body.appendChild(card);
@@ -313,7 +284,6 @@ it('点击浮层外部关闭，点浮层内部与左下角卡片本身不关闭'
   expect(store.trAccountPanel.show).toBe(true);
   card.remove();
 
-  // 其它任意位置：关闭
   document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
   await nextTick();
   expect(store.trAccountPanel.show).toBe(false);
@@ -342,7 +312,6 @@ it('partial=true 时在底部提示部分数据获取失败，且不打断展示
   await openPanel(store);
 
   expect(w!.get('[data-test="tr-acc-partial"]').text()).toContain('部分数据获取失败');
-  // 余额仍然正常展示（不是被错误页顶掉）
   expect(w!.get('[data-test="tr-acc-balance"]').text()).toBe('¥298.10');
 });
 
@@ -403,14 +372,11 @@ it('有临时额度时展示两位小数金额与最近到期日', async () => {
 
   await openPanel(store);
 
-  // 金额沿用 amountText + withCurrency：12.30000000 → ¥12.30
   expect(w!.get('[data-test="tr-acc-temporary"]').text()).toBe('¥12.30');
   // 到期日按本地时区拼 YYYY-MM-DD：用同一个 Date 推算期望值，避免依赖运行环境时区
   const date = new Date(iso);
   const expected = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-  // 小字同时展示金额：5.00000000 → ¥5.00
   expect(w!.get('[data-test="tr-acc-temporary-expire"]').text()).toBe(`最近到期 ${expected} ¥5.00`);
-  // 行标签固定存在（说明这一行不会被隐藏）
   expect(w!.get('[data-test="tr-account-panel"]').text()).toContain('临时额度');
 });
 
@@ -483,7 +449,6 @@ it('接口未返回 temporary_credits 时临时额度显示占位符', async () 
   expect(w!.find('[data-test="tr-acc-temporary-expire"]').exists()).toBe(false);
 });
 
-// ── 存量回归：余额 / 临时额度 / 按钮区保持原样 ─────────────────────────
 it('余额、临时额度与按钮区保持原样', async () => {
   installBridge();
   const { store, wrapper: w } = setup();
@@ -500,7 +465,6 @@ it('余额、临时额度与按钮区保持原样', async () => {
   }
 });
 
-// ── 登录过期：面板内直接出现「重新登录」 ──────────────────────────────
 it('总览返回登录过期时给出「重新登录」，点击收起面板并拉起登录窗', async () => {
   installBridge({
     tr_account_overview: vi.fn(async () => ({ ok: false, msg: '登录已过期，请重新登录' })),

@@ -1,20 +1,3 @@
-"""JEV 决策网关：业务场景接入决策模型的**唯一入口**。
-
-设计依据：docs/superpowers/specs/2026-10-18-jev-decision-integration.md。
-
-职责边界：
-- ``core.decision_service`` 只负责「发请求 + 写审计」；
-- 本模块在其上补齐三态闸门（off / shadow / live）、答案校验（choice 候选、
-  noul 阈值）、超时钳制与采纳回填（``mark_adopted``）；
-- 调用方拿到 ``None`` 时必须走接入前的原逻辑——**未启用 / 影子 / 低置信 /
-  答案非法 / 任何异常一律返回 None**，绝不向业务代码抛异常，也绝不拖慢主流程。
-
-硬性约束：
-- 不 import gui_bridge / webview，只依赖 core.decision_service 与标准库；
-- 未启用时零网络请求、零审计副作用；
-- 本模块自身不记录任何敏感内容（state / 答案交由 decision_service 审计层处理）。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -22,22 +5,29 @@ import re
 
 from core import decision_service
 
-# 模块级 logger（标准库，不违反「只依赖 decision_service + 标准库」的约束）
 logger = logging.getLogger(__name__)
 
-# 允许接入的四个业务场景（与 DEFAULT_CONFIG["scenes"] 对齐）
 SCENES = ("router", "secretary", "search", "safety")
+
+TASK_SCENES = (
+    "loop_guard",
+    "subagent_review",
+    "plan_recovery",
+    "memory_filter",
+    "auto_permission",
+    "auto_question",
+)
+ALL_SCENES = SCENES + TASK_SCENES
 
 # 单题决策的超时兜底：真实决策宁可不用，也不能拖慢主流程
 DEFAULT_TIMEOUT_MS = 250
+# 任务执行期决策超时：实测 JEV 单次约 600~900ms，留足余量以免每次超时回退
+TASK_DEFAULT_TIMEOUT_MS = 1500
 
-# noul 题缺省阈值（配置缺失时使用）
 DEFAULT_THRESHOLD = 0.5
 
-# 网关内部的「没有合法答案」标记（区分于合法的 None/False 之类的答案值）
 _MISSING = object()
 
-# 上游答案里包裹答案值的候选字段名（形状容错用）
 _VALUE_KEYS = ("choice", "noul", "answer", "value", "probability", "prob")
 
 
@@ -62,13 +52,6 @@ _REDACT_PATTERNS = (
 
 
 def redact_sensitive(text) -> str:
-    """把文本里的疑似密钥/口令替换成 ***；非字符串返回空串。
-
-    ``router``（用户输入）与 ``safety``（命令原文）会把原始文本发给决策模型，
-    其中可能夹带 ``export KEY=sk-...``、``Authorization: Bearer ...`` 之类的
-    内容。这里做一次保守替换：命中常见的密钥形态就抹掉值，其余文本原样保留，
-    保证决策模型仍能判断语义。
-    """
     if not isinstance(text, str):
         return ""
     value = text
@@ -78,12 +61,7 @@ def redact_sensitive(text) -> str:
 
 
 
-# ---------------------------------------------------------------------------
-# 配置读取（scene 级三态 + 阈值 + 超时）
-# ---------------------------------------------------------------------------
-
 def _scene_config(cfg: dict, scene: str) -> dict | None:
-    """取 scene 配置字典；缺失或形状异常返回 None（=未启用）。"""
     scenes = cfg.get("scenes")
     if not isinstance(scenes, dict):
         return None
@@ -94,12 +72,6 @@ def _scene_config(cfg: dict, scene: str) -> dict | None:
 
 
 def _resolve_threshold(scene_cfg: dict, override=None) -> float:
-    """读取答案门槛；优先级：调用方 override > scene.threshold > DEFAULT_THRESHOLD。
-
-    ``override`` 是给「需要拿到原始概率自行判断」的调用方留的窄口子
-    （如 safety 场景：它要把「安全概率偏低」解读为降级信号，而不是当作
-    无效答案丢弃）。传 None 时行为与旧版完全一致。
-    """
     raw = override if override is not None else scene_cfg.get("threshold", DEFAULT_THRESHOLD)
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return DEFAULT_THRESHOLD
@@ -109,28 +81,20 @@ def _resolve_threshold(scene_cfg: dict, override=None) -> float:
     return value
 
 
-def _resolve_timeout_ms(scene_cfg: dict, override) -> int:
-    """超时优先级：调用方 override > scene.timeout_ms > 250ms，再钳制到服务边界。
-
-    MIN/MAX 现取 ``decision_service`` 上的常量（便于测试替换与统一维护）。
-    """
+def _resolve_timeout_ms(scene_cfg: dict, override, default_timeout_ms: int = DEFAULT_TIMEOUT_MS) -> int:
     value = override
     if value is None:
         value = scene_cfg.get("timeout_ms")
     if value is None or isinstance(value, bool):
-        value = DEFAULT_TIMEOUT_MS
+        value = default_timeout_ms
     try:
         timeout = int(value)
     except (TypeError, ValueError):
-        timeout = DEFAULT_TIMEOUT_MS
+        timeout = default_timeout_ms
     low = decision_service.MIN_TIMEOUT_MS
     high = decision_service.MAX_TIMEOUT_MS
     return max(low, min(high, timeout))
 
-
-# ---------------------------------------------------------------------------
-# 答案提取与校验（形状容错：{"choice": "x"} / {"noul": 0.9} / 裸值）
-# ---------------------------------------------------------------------------
 
 def _as_text(value):
     """把候选值转为去空白文本；不可转（None/容器等）返回 None。"""
@@ -145,7 +109,6 @@ def _as_text(value):
 
 
 def _unwrap(payload):
-    """剥掉答案外层包装：{"choice": "x"} → "x"；裸值原样返回。"""
     if isinstance(payload, dict):
         for key in _VALUE_KEYS:
             if key in payload:
@@ -166,7 +129,6 @@ def _extract_answer(result: dict):
     if answers is None:
         return _MISSING
     if not isinstance(answers, dict):
-        # 上游直接返回裸值（无 answers 包装）
         return _unwrap(answers)
     if "q" in answers:
         payload = answers["q"]
@@ -188,26 +150,14 @@ def _pick_choice(answer, options):
         list(options) if isinstance(options, (list, tuple, set, frozenset)) else []
     )
     if not candidates:
-        # 未提供候选：不做校验，按文本返回
         return text
     for option in candidates:
         if _as_text(option) == text:
-            # 选中项原样返回（保留调用方给的类型，如 int 档位/条数）
             return option
     return _MISSING
 
 
 def _criteria_object(criteria, options) -> dict:
-    """把 choice 题的 criteria 规范成上游要求的「选项名 → 描述」对象。
-
-    上游协议（`GET /api/docs/jev`）：`choice` 的 `criteria` 必须是「选项名到描述的
-    对象，1～255 项」；传数组或干脆省略都会被上游判成 422 JEV_INVALID_REQUEST。
-    这里统一兜一层，避免每个调用点各写一遍形状：
-
-    - 已是对象：原样（转成字符串键值）使用；
-    - 数组：元素是 `{"name"/"id"/"choice", "description"}` 时取字段，否则以元素自述；
-    - 缺失：用调用方给的 ``options`` 构造（选项名即描述）。
-    """
     if isinstance(criteria, dict) and criteria:
         return {str(name): str(desc) for name, desc in criteria.items()}
     items = criteria if isinstance(criteria, (list, tuple)) else []
@@ -248,31 +198,10 @@ def _pick_noul(answer, threshold: float):
     return probability
 
 
-# ---------------------------------------------------------------------------
-# 对外唯一入口
-# ---------------------------------------------------------------------------
-
 def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=None,
-           audit_extra=None):
-    """单题决策。
-
-    参数：
-    - ``scene``：``"router"`` / ``"secretary"`` / ``"search"`` / ``"safety"``；
-    - ``state``：交给模型的上下文文本；
-    - ``question``：单题 dict，``{"type": "choice", ...}`` 或 ``{"type": "noul", ...}``；
-    - ``options``：choice 题的合法候选列表（为空则不做候选校验）；
-    - ``timeout_ms``：调用方建议超时（会被钳制到 MIN_TIMEOUT_MS..MAX_TIMEOUT_MS）；
-    - ``threshold``：noul 答案门槛覆盖（默认 None = 读 ``scenes.X.threshold``）。
-      仅给「需要原始概率自行裁决」的调用方使用（safety）：它必须能看到低于
-      门槛的概率值才能做出降级判断。传 None 时行为与旧版完全一致；
-    - ``audit_extra``：附带的审计上下文（如启发式基线），不含敏感内容。
-
-    返回：choice 题返回选中的候选（原样），noul 题返回 ``float`` 概率；
-    未启用 / 影子 / 上游失败 / 答案非法 / 任何异常一律返回 ``None``。
-    """
+           audit_extra=None, session_id=None):
     try:
-        # 1) 场景与题目形状先判（不做任何 IO）
-        if not isinstance(scene, str) or scene not in SCENES:
+        if not isinstance(scene, str) or scene not in ALL_SCENES:
             return None
         if not isinstance(question, dict):
             return None
@@ -280,43 +209,59 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
         if question_type not in ("choice", "noul"):
             return None
 
-        # 2) 三态闸门：off 直接返回（零请求、零副作用）
         cfg = decision_service.load_decision_config()
         if not isinstance(cfg, dict) or not bool(cfg.get("enabled")):
             return None
+        is_task_scene = scene in TASK_SCENES
         scene_cfg = _scene_config(cfg, scene)
-        if scene_cfg is None or not bool(scene_cfg.get("enabled")):
-            return None
+        if is_task_scene:
+            if scene_cfg is not None and not bool(scene_cfg.get("enabled", True)):
+                return None
+            effective_scene_cfg = scene_cfg if scene_cfg is not None else {}
+        else:
+            if scene_cfg is None or not bool(scene_cfg.get("enabled")):
+                return None
+            effective_scene_cfg = scene_cfg
 
-        # 2.5) 题面规范化：上游 choice 题要求 criteria 是「选项名 → 描述」的对象，
-        #      数组/缺失一律 422。这里统一校正，校正不出任何选项就不发这次请求。
         if question_type == "choice":
             question = dict(question)
             question["criteria"] = _criteria_object(question.get("criteria"), options)
             if not question["criteria"]:
                 return None
 
-        # 3) shadow：照旧发请求并写审计，但结果丢弃（影子只做观测）
-        shadow = bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True))
-        effective_timeout = _resolve_timeout_ms(scene_cfg, timeout_ms)
-        result = decision_service.ask_decision(
-            scene=scene,
-            state=state,
-            questions={"q": question},
-            timeout_ms=effective_timeout,
-            audit_extra=audit_extra,
-        )
-        if shadow:
-            return None
+        if is_task_scene:
+            raw_global_timeout = cfg.get("timeout_ms")
+            if (
+                not isinstance(raw_global_timeout, bool)
+                and isinstance(raw_global_timeout, (int, float))
+                and int(raw_global_timeout) > TASK_DEFAULT_TIMEOUT_MS
+            ):
+                fallback_timeout = int(raw_global_timeout)
+            else:
+                fallback_timeout = TASK_DEFAULT_TIMEOUT_MS
+            effective_timeout = _resolve_timeout_ms(
+                effective_scene_cfg, timeout_ms, default_timeout_ms=fallback_timeout
+            )
+        else:
+            effective_timeout = _resolve_timeout_ms(effective_scene_cfg, timeout_ms)
+        ask_kwargs = {
+            "scene": scene,
+            "state": state,
+            "questions": {"q": question},
+            "timeout_ms": effective_timeout,
+            "audit_extra": audit_extra,
+        }
+        if session_id is not None:
+            ask_kwargs["session_id"] = session_id
+        result = decision_service.ask_decision(**ask_kwargs)
         if not isinstance(result, dict):
             return None
 
-        # 4) 答案校验：非法答案一律视为未采纳
         answer = _extract_answer(result)
         if question_type == "choice":
             picked = _pick_choice(answer, options)
         else:
-            picked = _pick_noul(answer, _resolve_threshold(scene_cfg, threshold))
+            picked = _pick_noul(answer, _resolve_threshold(effective_scene_cfg, threshold))
         if picked is _MISSING:
             return None
 

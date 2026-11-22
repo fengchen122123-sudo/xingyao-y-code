@@ -75,7 +75,6 @@ describe('GUI theme startup error gate', () => {
       },
     });
 
-    // 预览模式 + 设置页已收起：浮条覆盖在真实首页上
     const bar = wrapper.get('[data-test="theme-preview-bar"]');
     expect(bar.text()).toContain('正在预览主题效果');
     expect(wrapper.find('#main').exists()).toBe(true);

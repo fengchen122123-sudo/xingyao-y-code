@@ -1,12 +1,3 @@
-"""Task 11a：OpenAI Responses 原生事件解析、target selector 与串行动作执行。
-
-Task 11b：原生 continuation、Provider safety 契约与脱敏持久化投影。
-
-全部 fake 注入：Provider 流、capability 决策与 controller 均为测试替身，
-绝不触发真实 Provider 请求、浏览器、截屏或键鼠。本文件还承载 Task 10 遗留
-F1（capability 每 Turn 只解析一次）的收敛测试。
-"""
-
 import base64
 import contextlib
 import hashlib
@@ -45,12 +36,10 @@ TURN = "comp-native-turn"
 NATIVE_MODEL_NAME = "openai/gpt-native-fake"
 OFFICIAL_OPENAI_BASE = "https://api.openai.com/v1"
 
-# brief Step 1 逐字样例使用的统一动作常量（原生执行串行语义测试）。
 MOVE = ComputerAction(kind="move", target="browser", x=10, y=20)
 CLICK = ComputerAction(kind="click", target="browser", x=1, y=1)
 TYPE_TEXT = ComputerAction(kind="type_text", target="browser", text="hi")
 
-# Task 11b（brief Step 1）：continuation 样例常量（ANY_CALL 在 import 块之后定义）。
 NATIVE_TURN_INSTRUCTIONS = "原生回合系统指令：先观察再操作，一次一个动作。"
 
 CREATED_EVENT = {"type": "response.created", "response": {"id": "resp_1"}}
@@ -79,8 +68,6 @@ COMPLETED_WITH_CALL_EVENT = {
     "response": {"id": "resp_1", "output": [deepcopy(COMPUTER_CALL_EVENT["item"])]},
 }
 
-# Task 11a 依赖的 provider_openai 公共接口（RED 阶段应 ModuleNotFoundError）。
-# Task 11b 新增：continuation/投影/绑定适配器（RED 阶段同样 ImportError）。
 from core.computer.provider_openai import (  # noqa: E402
     BoundNativeController,
     NativeComputerCall,
@@ -98,18 +85,12 @@ from core.computer.provider_openai import (  # noqa: E402
     parse_openai_computer_events,
 )
 
-# Task 11b（brief Step 1）：continuation 样例常量（依赖上面的 import）。
 ANY_CALL = NativeComputerCall("resp_any", "call_any", (CLICK,), ())
 ANY_CALL_OUTPUT = {
     "type": "computer_call_output",
     "call_id": "call_any",
     "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,cG5n"},
 }
-
-
-# ---------------------------------------------------------------------------
-# 模块内 helper（计划 fixture 契约：Task 11a 的 helper 定义在测试模块内）
-# ---------------------------------------------------------------------------
 
 
 def _chunk(content="", tool_calls=None):
@@ -126,10 +107,6 @@ def _chunk(content="", tool_calls=None):
 
 
 def _patch_request_env(monkeypatch):
-    """受控请求环境：固定 tools schema、openai 协议、无记忆注入。
-
-    与 test_computer_llm_generic 同一套最小桩，供 F1 与原生请求捕获共用。
-    """
     monkeypatch.setattr(llm_mod, "get_tools_schema", lambda: [ZETA_TOOL, ALPHA_TOOL])
     monkeypatch.setattr(
         model_manager, "get_model_protocol", lambda *_args, **_kwargs: "openai"
@@ -144,7 +121,6 @@ def _patch_request_env(monkeypatch):
 
 
 def _quiet_runtime_context(monkeypatch):
-    """屏蔽 prepare_turn_messages 的重依赖（技能/记忆/子代理/后台汇总）。"""
     import core.agent_service as agent_service
     import core.skills as skills
     import core.subagent_registry as subagent_registry
@@ -159,7 +135,6 @@ def _quiet_runtime_context(monkeypatch):
 
 
 def _computer_call_events(actions, *, call_id="call_1", response_id="resp_1", **item_extra):
-    """构造一个完整合法的原生 computer_call 事件序列。"""
     item = {
         "type": "computer_call",
         "id": "cc_1",
@@ -188,7 +163,6 @@ def _decoded_selector(target_value):
 
 
 def _native_selection(tmp_path, *, capability=NATIVE_DUAL_TARGET_CAPABILITY):
-    """双 target 原生回合的 selector 状态 + FakeController（含生命周期记录）。"""
     png_path = tmp_path / "observation-native.png"
     png_path.write_bytes(b"\x89PNG\r\n\x1a\nfake-observation")
     owner = ComputerOwner(
@@ -207,11 +181,6 @@ def _native_selection(tmp_path, *, capability=NATIVE_DUAL_TARGET_CAPABILITY):
 
 
 class NativeExecutionController:
-    """Task 11a 原生串行执行的最小 controller fake（窄接口协议）。
-
-    execute(action) 内完成动作记录、本地 after observation 与并发计数，
-    支持 fail_on_ordinal 注入第 N 个动作失败；绝不触碰真实键鼠/截屏。
-    """
 
     def __init__(self, *, fail_on_ordinal=None):
         self.execute_count = 0
@@ -263,12 +232,6 @@ def controller():
 def _run_native_responses_turn(
     *, capability, responses, controller=None, messages=None, events_out=None
 ):
-    """在受控 responses 环境里跑一个原生回合，返回按序捕获的 Provider 请求。
-
-    capability 显式穿参（F1 参数路径）；resolve_computer_capability 被钉死为
-    断言——传参后不得再自解析。events_out 非空时追加收集回合公开事件
-    （Task 11b：safety 失败等回合级断言需要 turn_error 事件）。
-    """
     captured = []
 
     def fake_responses(**kwargs):
@@ -326,7 +289,6 @@ _FINAL_TEXT_EVENTS = [
 
 
 def capture_responses_request(*, capability, messages=None):
-    """单请求原生回合：返回第一份（也是唯一一份）Responses 请求 kwargs。"""
     captured = _run_native_responses_turn(
         capability=capability, responses=[_FINAL_TEXT_EVENTS], messages=messages
     )
@@ -334,16 +296,7 @@ def capture_responses_request(*, capability, messages=None):
     return captured[0]
 
 
-# ---------------------------------------------------------------------------
-# F1 收敛（Task 10 遗留）：capability 每生产 Turn 只解析一次
-# ---------------------------------------------------------------------------
-
-
 def test_capability_resolved_once_per_production_turn(monkeypatch, tmp_path):
-    """生产 Turn = prepare_turn_messages（prompt 侧）+ chat_with_model_events
-    （tools 侧）。两条链路共享同一次 resolve_computer_capability 调用：
-    agent_service 解析一次后经 Turn handoff 穿参给模型事件入口，
-    chat_with_model_events 不再自解析。"""
     from core.agent_service import prepare_turn_messages
     from core.memory import MemoryManager
 
@@ -367,7 +320,7 @@ def test_capability_resolved_once_per_production_turn(monkeypatch, tmp_path):
         128000,
         permission_mode="auto",
     )
-    assert len(calls) == 1  # prompt 侧解析一次
+    assert len(calls) == 1
 
     monkeypatch.setattr(
         llm_mod, "completion", lambda **kwargs: iter([_chunk("电脑操控完成。")])
@@ -382,17 +335,10 @@ def test_capability_resolved_once_per_production_turn(monkeypatch, tmp_path):
         consume_background_notifications=False,
     ))
     manager.close()
-    assert len(calls) == 1  # tools 侧穿参复用，不再自解析
+    assert len(calls) == 1
 
 
 def test_production_native_capability_receives_entry_api_base(monkeypatch, tmp_path):
-    """审查修复轮 I-1：入口层 api_base 必须穿参到 Turn 能力解析。
-
-    F1 收敛把解析移到 prepare 侧后，若 api_base 不穿参，官方 OpenAI 路由的
-    native 能力在生产入口永远以 computer_protocol_mismatch 拒绝（fail-closed
-    但不可达）。本测试走真实 resolve 链路 + 临时 config，验证入口 api_base
-    真实流转为启用的 native 能力快照。
-    """
     from core.agent_service import prepare_turn_messages
     from core.computer.capability import take_turn_computer_capability
     from core.memory import MemoryManager
@@ -418,8 +364,6 @@ def test_production_native_capability_receives_entry_api_base(monkeypatch, tmp_p
         }],
         "browser_control_enabled": True,
     })
-    # model_manager 在 import 时复制了 config._CONFIG_FILE 的值（既有模式：
-    # 同时 patch 两处，见 tests/test_config.py）
     monkeypatch.setattr(
         model_manager, "_CONFIG_FILE",
         str(tmp_path / "config.json"),
@@ -441,11 +385,6 @@ def test_production_native_capability_receives_entry_api_base(monkeypatch, tmp_p
     assert capability is not None
     assert capability.enabled is True
     assert capability.protocol == "native_openai"
-
-
-# ---------------------------------------------------------------------------
-# Step 1 样例：受控 built-in 与双 target selector 首请求
-# ---------------------------------------------------------------------------
 
 
 def test_native_first_request_appends_controlled_computer_tool():
@@ -514,7 +453,6 @@ def test_build_openai_computer_tools_matrix(capability, target_selected, expecte
         for tool in tools
     )
     assert normalized == expected
-    # 返回的是受控深拷贝，不得暴露可变模块常量
     for tool in tools:
         if tool.get("type") == "computer":
             tool["type"] = "mutated"
@@ -522,11 +460,6 @@ def test_build_openai_computer_tools_matrix(capability, target_selected, expecte
     assert build_openai_computer_tools(NATIVE_BROWSER_CAPABILITY, None) == (
         {"type": "computer"},
     )
-
-
-# ---------------------------------------------------------------------------
-# Step 1 样例：事件完整性与 selector 冲突
-# ---------------------------------------------------------------------------
 
 
 def test_selector_and_computer_call_in_same_response_is_protocol_error(controller):
@@ -744,11 +677,6 @@ def test_final_text_ends_native_branch():
     assert result == NativeFinalText(text="任务完成")
 
 
-# ---------------------------------------------------------------------------
-# Step 1 样例：串行动作执行与 Provider 强制安全检查
-# ---------------------------------------------------------------------------
-
-
 def test_pending_safety_blocks_before_execution(controller):
     call = NativeComputerCall("resp_1", "call_1", (CLICK,), (SafetyCheck("sc_1", "reason"),))
     result = execute_native_computer_call(call, controller)
@@ -764,13 +692,13 @@ def test_pending_safety_enters_provider_safety_state(controller):
 
 
 def test_native_actions_are_serial_and_stop_after_first_failure(controller):
-    controller.fail_on_ordinal = 2  # 第二个动作（CLICK）执行时失败
+    controller.fail_on_ordinal = 2
     call = NativeComputerCall("resp_1", "call_1", (MOVE, CLICK, TYPE_TEXT), ())
     with pytest.raises(ComputerControlError):
         execute_native_computer_call(call, controller)
-    assert controller.attempted_actions == [MOVE, CLICK]  # 失败后 TYPE_TEXT 不再执行
+    assert controller.attempted_actions == [MOVE, CLICK]
     assert controller.max_concurrent_actions == 1
-    assert controller.observation_count == 2  # 每个动作都有本地 after observation
+    assert controller.observation_count == 2
 
 
 def test_native_actions_all_succeed_return_last_observation(controller):
@@ -779,11 +707,6 @@ def test_native_actions_all_succeed_return_last_observation(controller):
     assert result.status == "ok"
     assert result.observation is controller.observations[-1]
     assert controller.attempted_actions == [MOVE, CLICK]
-
-
-# ---------------------------------------------------------------------------
-# assembler 合并的终态 payload → NativeComputerCall（禁止半截 JSON 执行）
-# ---------------------------------------------------------------------------
 
 
 def test_native_call_from_assembled_stream_payload():
@@ -807,11 +730,6 @@ def test_native_call_from_stream_payload_missing_ids_is_protocol_error():
             target="browser",
         )
     assert raised.value.code == "computer_provider_protocol_error"
-
-
-# ---------------------------------------------------------------------------
-# selector 固定 adapter：租约建立与明确失败
-# ---------------------------------------------------------------------------
 
 
 def test_selector_first_call_writes_target_lease(tmp_path):
@@ -874,11 +792,6 @@ def test_selector_without_selection_context_fails():
     assert payload["error_code"] == "computer_disabled"
 
 
-# ---------------------------------------------------------------------------
-# 集成：selector 单独完成一个 Step，选择后 selector 从后续请求消失
-# ---------------------------------------------------------------------------
-
-
 def test_native_selector_step_writes_lease_and_drops_selector_from_next_request(tmp_path):
     selection, controller = _native_selection(tmp_path)
     selector_step_events = [
@@ -907,7 +820,6 @@ def test_native_selector_step_writes_lease_and_drops_selector_from_next_request(
     assert "computer_select_target" not in second_names
     assert second_names[-1] == "computer"
     assert captured[1]["parallel_tool_calls"] is False
-    # selector 建立了 target 租约，Turn 正常收尾 complete_run 不留 running
     assert controller.start_calls == 1
     assert controller.start_targets == ["browser"]
     assert controller.complete_calls == 1
@@ -921,11 +833,6 @@ def test_native_selector_step_writes_lease_and_drops_selector_from_next_request(
 
 
 class SafetyAwareFakeController(FakeController):
-    """FakeController + enter_provider_safety_required 记录（11b safety 契约）。
-
-    真实 ComputerControlService.enter_provider_safety_required(run_id) 会把 run
-    转入 provider_safety_required；fake 同步记录次数与状态供断言。
-    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -938,7 +845,6 @@ class SafetyAwareFakeController(FakeController):
 
 
 def _native_png_controller(tmp_path, *, capability=NATIVE_BROWSER_CAPABILITY):
-    """单 target 原生 live-loop 回合的 FakeController（png 指向临时文件）。"""
     png_path = Path(tmp_path) / "obs-native.png"
     png_path.write_bytes(b"png")
     owner = ComputerOwner(
@@ -956,7 +862,6 @@ def _native_png_controller(tmp_path, *, capability=NATIVE_BROWSER_CAPABILITY):
 
 
 def turn_state_without_response_id():
-    """构造缺 response id 的续传状态（brief Step 1：Provider 未返回可用 id）。"""
     return NativeContinuationState(
         model=NATIVE_MODEL_NAME,
         tools=({"type": "computer"},),
@@ -967,11 +872,6 @@ def turn_state_without_response_id():
 
 
 def capture_continuation_request(*, response_id="resp_1", call_id="call_1", png=b"png"):
-    """brief Step 1 样例 helper：跑一个 computer call + 续传 + 最终文本回合。
-
-    返回第二个（continuation）请求的捕获 kwargs。自管理临时 PNG（观测截图），
-    与 brief 的零 fixture 签名保持一致。
-    """
     with tempfile.TemporaryDirectory() as tmp:
         png_path = Path(tmp) / "obs-native.png"
         png_path.write_bytes(png)
@@ -1009,15 +909,15 @@ def capture_continuation_request(*, response_id="resp_1", call_id="call_1", png=
 
 def test_native_continuation_resends_model_tools_and_previous_id():
     request = capture_continuation_request(response_id="resp_1", call_id="call_1", png=b"png")
-    assert request["model"] == NATIVE_MODEL_NAME  # 重新发送同一 model
-    assert {"type": "computer"} in request["tools"]  # 重新发送同序 tools
+    assert request["model"] == NATIVE_MODEL_NAME
+    assert {"type": "computer"} in request["tools"]
     assert request["previous_response_id"] == "resp_1"
-    assert request["instructions"] == NATIVE_TURN_INSTRUCTIONS  # instructions 不自动继承，必须重发
+    assert request["instructions"] == NATIVE_TURN_INSTRUCTIONS
     assert request["input"] == [{
         "type": "computer_call_output",
         "call_id": "call_1",
         "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,cG5n"},
-    }]  # 不重发完整历史，input 只有本批 call output
+    }]
     assert "messages" not in request
 
 
@@ -1040,17 +940,12 @@ def test_call_output_never_invents_safety_acknowledgement_fields(tmp_path):
         height=6,
     )
     output = build_computer_call_output(ANY_CALL, observation)
-    assert "acknowledged_safety_checks" not in output  # GA schema 未确认前不得出现
+    assert "acknowledged_safety_checks" not in output
     assert "acknowledged_safety_checks" not in output["output"]
     assert output["call_id"] == "call_any"
 
 
 def test_call_output_without_screenshot_sends_text_observation():
-    """B 方案：本次没有截图时改发纯文本观察，绝不因缺图让整批动作结果丢失。
-
-    为什么：窗口被遮挡/最小化时 WebView2 渲染被节流，截图会卡住或失败；
-    旧实现在 _read_png_bytes 里对空 png_path 抛 computer_backend_error。
-    """
     observation = ComputerObservation(
         run_id="run-native",
         target="browser",
@@ -1070,7 +965,6 @@ def test_call_output_without_screenshot_sends_text_observation():
 
 
 def test_provider_missing_response_id_fails_turn_without_resending_history():
-    """流内 computer_call 载荷缺 response id：回合立即失败，没有第二次请求。"""
     call_events = [
         {"type": "response.output_item.done", "item": {
             "type": "computer_call",
@@ -1086,14 +980,11 @@ def test_provider_missing_response_id_fails_turn_without_resending_history():
         responses=[call_events],
         events_out=turn_events,
     )
-    # 唯一一次请求后立即失败：没有续传，也没有"重发全部截图历史"或 generic 请求
     assert len(captured) == 1
     assert any(event.kind == "turn_error" for event in turn_events)
 
 
 def test_native_computer_call_turn_executes_via_bound_adapter_and_continues(tmp_path):
-    """live loop 消费 assembled.computer_call：经绑定 run_id/owner 的窄协议
-    适配器串行执行，随后以 computer_call_output 续传；Turn 收尾 complete_run。"""
     controller = _native_png_controller(tmp_path)
     captured = _run_native_responses_turn(
         capability=NATIVE_BROWSER_CAPABILITY,
@@ -1113,22 +1004,14 @@ def test_native_computer_call_turn_executes_via_bound_adapter_and_continues(tmp_
         ("run-native", "move", "browser"),
         ("run-native", "click", "browser"),
     ]
-    # 惰性 start_run：首个原生 computer call 执行前建立（单 target 直取唯一 target）
     assert controller.start_calls == 1
     assert controller.start_targets == ["browser"]
-    # Turn 终态 complete_run，不留 running 租约
     assert controller.complete_calls == 1
     assert controller.completed_run_ids == ["run-native"]
     assert controller.stop_calls == 0
 
 
 def test_native_chained_continuation_two_calls_then_final_text(tmp_path):
-    """链式续传（11b 审查建议）：computer_call→computer_call→final text。
-
-    两个动作 Step 各自以上一 response id 续传（绝不跨响应复用旧 id），
-    input 每次只有上一批 call 的 computer_call_output；最终文本清空续传
-    状态并正常收尾（complete_run，不留 running 租约）。
-    """
     controller = _native_png_controller(tmp_path)
     first = _computer_call_events(
         [{"type": "click", "x": 1, "y": 1}], call_id="call_1", response_id="resp_1"
@@ -1142,7 +1025,6 @@ def test_native_chained_continuation_two_calls_then_final_text(tmp_path):
         controller=controller,
     )
     assert len(captured) == 3
-    # 第二请求：以 resp_1 续传，input 只有 call_1 的输出
     assert captured[1]["previous_response_id"] == "resp_1"
     assert captured[1]["input"] == [{
         "type": "computer_call_output",
@@ -1152,10 +1034,8 @@ def test_native_chained_continuation_two_calls_then_final_text(tmp_path):
             "image_url": "data:image/png;base64," + base64.b64encode(b"png").decode("ascii"),
         },
     }]
-    # 第三请求：以 resp_2 续传（不是 resp_1），input 只有 call_2 的输出
     assert captured[2]["previous_response_id"] == "resp_2"
     assert captured[2]["input"][0]["call_id"] == "call_2"
-    # 两个动作都经绑定适配器执行；run 只建立一次，最终 complete 收尾
     assert controller.execute_calls == [
         ("run-native", "click", "browser"),
         ("run-native", "observe", "browser"),
@@ -1166,7 +1046,6 @@ def test_native_chained_continuation_two_calls_then_final_text(tmp_path):
 
 
 def test_native_continuation_after_selector_drops_selector_from_tools(tmp_path):
-    """selector 已选后，continuation 重发的同序 tools 不再含 selector。"""
     selection, controller = _native_selection(tmp_path)
     selector_step_events = [
         {"type": "response.created", "response": {"id": "resp_1"}},
@@ -1192,15 +1071,12 @@ def test_native_continuation_after_selector_drops_selector_from_tools(tmp_path):
     assert names[-1] == "computer"
     assert continuation["previous_response_id"] == "resp_2"
     assert continuation["parallel_tool_calls"] is False
-    # selector 建立的租约被复用（不二次 start_run），动作经绑定适配器执行
     assert controller.start_calls == 1
     assert controller.execute_calls == [("run-native", "observe", "browser")]
     assert controller.complete_calls == 1
 
 
 def test_provider_safety_required_stops_turn_without_further_step(tmp_path):
-    """pending safety：不执行动作、不发起后续 Step，controller 停在
-    provider_safety_required 等用户显式停止（设计 11.5）。"""
     png_path = Path(tmp_path) / "obs-native.png"
     png_path.write_bytes(b"png")
     owner = ComputerOwner(
@@ -1228,12 +1104,10 @@ def test_provider_safety_required_stops_turn_without_further_step(tmp_path):
         controller=controller,
         events_out=turn_events,
     )
-    # 后续 Step 不发起：唯一一次请求就是携带 computer_call 的那次
     assert len(captured) == 1
     # 未确认绝不执行动作，也不伪造 acknowledged safety checks
     assert controller.execute_calls == []
     assert controller.safety_entries == 1
-    # controller 停在 provider_safety_required：Turn 收尾不 complete 也不 stop
     assert controller.run_status == "provider_safety_required"
     assert controller.complete_calls == 0
     assert controller.stop_calls == 0
@@ -1246,12 +1120,10 @@ def test_provider_safety_required_stops_turn_without_further_step(tmp_path):
         event.kind == "turn_error" and "安全检查" in str(event.payload.get("message", ""))
         for event in turn_events
     )
-    # safety check 原文只留在解析值对象里，不进入任何公开事件
     assert "访问的地址与任务不符" not in serialized_events
 
 
 def test_computer_call_mixed_with_function_calls_is_protocol_error(tmp_path):
-    """computer_call 与普通 function call 同响应：整批拒绝，零执行。"""
     controller = _native_png_controller(tmp_path)
     mixed_events = [
         {"type": "response.created", "response": {"id": "resp_1"}},
@@ -1281,8 +1153,6 @@ def test_computer_call_mixed_with_function_calls_is_protocol_error(tmp_path):
 
 
 def test_native_intermediate_row_projection_is_sanitized():
-    """brief Step 5 逐字形状 + 脱敏：输入文字只存 code point 数与 SHA-256，
-    截图只存 screen hash/尺寸；无 base64、完整 URL、response id。"""
     actions = (
         ComputerAction(kind="type_text", target="browser", text="秘密输入内容"),
         ComputerAction(kind="click", target="browser", x=3, y=4),
@@ -1324,14 +1194,12 @@ def test_native_intermediate_row_projection_is_sanitized():
     serialized = json.dumps(row, ensure_ascii=False)
     assert "秘密输入内容" not in serialized  # 输入正文绝不持久化
     assert "resp_secret" not in serialized  # response id 绝不持久化
-    assert "call_secret" not in serialized  # call id 只存 hash
-    assert "profile-path" not in serialized  # 本地路径不持久化
-    # 确定性投影：同一输入两次构造完全一致
+    assert "call_secret" not in serialized
+    assert "profile-path" not in serialized
     assert row == build_native_call_persistence_row("run-native", call, observation)
 
 
 def test_bound_native_controller_binds_run_and_owner(tmp_path):
-    """窄协议适配器把 run_id/owner 绑定到真实服务签名（审查 I-2 契约）。"""
     png_path = Path(tmp_path) / "obs-native.png"
     png_path.write_bytes(b"png")
     owner = ComputerOwner(
@@ -1356,7 +1224,6 @@ def test_bound_native_controller_binds_run_and_owner(tmp_path):
 
 
 def test_native_scroll_on_desktop_target_is_explicitly_rejected():
-    """R7：原生像素滚动在桌面 target 明确拒绝（协议错误），绝不静默近似为滚轮步进。"""
     with pytest.raises(ComputerControlError) as raised:
         parse_openai_computer_events(
             _computer_call_events(
@@ -1366,3 +1233,58 @@ def test_native_scroll_on_desktop_target_is_explicitly_rejected():
         )
     assert raised.value.code == "computer_provider_protocol_error"
     assert "像素" in raised.value.message
+
+
+def test_native_call_output_syncs_downscaled_frame_transform(tmp_path, monkeypatch):
+    import io
+    from PIL import Image
+    from core.computer import provider_generic
+    from core.computer.browser_backend import BrowserComputerBackend
+    from core.computer.controller import ComputerControlService
+    from tests.computer_fakes import FakePlaywrightRuntime
+
+    from core.computer.settings import ComputerSettingsSnapshot
+
+    buf = io.BytesIO()
+    Image.new("RGB", (2560, 1440), (10, 20, 30)).save(buf, format="PNG")
+    big_png = buf.getvalue() + (b"\x00" * 128)
+    runtime = FakePlaywrightRuntime(screenshot_bytes=big_png)
+    backend = BrowserComputerBackend(
+        "edge",
+        tmp_path / "edge",
+        playwright_factory=lambda: runtime,
+        viewport=(2560, 1440),
+    )
+    owner = ComputerOwner(SESSION, TURN, SESSION, threading.Event())
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        settings_loader=lambda: ComputerSettingsSnapshot(
+            browser_control_enabled=True,
+            computer_control_enabled=False,
+            computer_browser="edge",
+            browser_options=(),
+            profile_display_path="",
+            platform_supported=True,
+            generation=0,
+        ),
+        generation_provider=lambda: 0,
+    )
+    monkeypatch.setattr(provider_generic, "_OBSERVATION_IMAGE_MAX_BYTES", 5000)
+    snap = None
+    try:
+        snap = service.start_run(owner, NATIVE_BROWSER_CAPABILITY, target="browser")
+        obs = service.execute(
+            snap.run_id, owner, ComputerAction(kind="observe", target="browser")
+        )
+        output = build_computer_call_output(ANY_CALL, obs, controller=service)
+        assert output["output"]["type"] == "computer_screenshot"
+        frame = service.get_observation_frame(snap.run_id, obs.frame_id)
+        assert frame is not None
+        assert frame.image_width == 1280
+        assert frame.image_height == 720
+        assert frame.model_to_css_x == pytest.approx(2.0)
+        assert frame.model_to_css_y == pytest.approx(2.0)
+    finally:
+        if snap is not None:
+            service.stop(snap.run_id, "test")
+        backend.close()

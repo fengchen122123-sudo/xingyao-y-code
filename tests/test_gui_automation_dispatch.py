@@ -1,9 +1,3 @@
-"""星轨自动化任务：GUI 桥集成（分发、忙时排队透传、运行终态回写、js_api）。
-
-全部用裸实例 + 桩函数构造（与 tests/test_gui_message_queue.py 同模式），
-worker 终态用例走真实 _run_turn_worker + 真实 MemoryManager/turn_undo，
-只桩掉模型入口与事件出口。
-"""
 import threading
 
 import pytest
@@ -19,7 +13,6 @@ def manager(tmp_path):
 
 
 def _make_bridge(manager, tmp_path, *, is_turn_active=False):
-    """构造仅含自动化所需内部状态的裸桥实例。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._shutting_down = False
     bridge._current_session = "s1"
@@ -28,7 +21,6 @@ def _make_bridge(manager, tmp_path, *, is_turn_active=False):
     bridge._active_turns = {}
     bridge._cancel_events = {}
     bridge._is_turn_active = (lambda s: True) if is_turn_active else (lambda s: False)
-    # worker 终态用例会触达的身份/快照结构
     bridge._active_turn_ids = {}
     bridge._active_turn_lock = threading.Lock()
     bridge._active_turn_snapshots = {}
@@ -52,7 +44,6 @@ def _make_bridge(manager, tmp_path, *, is_turn_active=False):
     bridge._automation_engine = type(
         "E", (), {"notify_changed": lambda self: None}
     )()
-    # worker/权限路径的重量级出口全部桩掉
     bridge._undo_turn_impact_for_event = lambda request: None
     bridge._get_cancel_event = lambda s: threading.Event()
     bridge._finalize_session_deltas = lambda s: None
@@ -69,22 +60,21 @@ def _task_dict(**overrides) -> dict:
         "permission_mode": "confirm",
         "missed_run_policy": "skip",
         "enabled": 1,
+        # 本文件的用例针对「投递到固定会话」的语义（固定会话名 + pending_workdir
+        # 懒创建）；per_run 是存储层的新默认值，需显式固定回 fixed，否则默认值
+        # 一改这批断言就全部失真。per_run 行为见文件末尾的专项用例。
+        "session_mode": "fixed",
     }
     base.update(overrides)
     return base
 
 
 def _create_task_with_run(bridge, *, trigger_kind="scheduled", **overrides):
-    """入库任务并创建一条运行记录，返回 (task_dict, run_dict)。"""
     task_id = bridge._automation_storage.save_task(_task_dict(**overrides))
     task = bridge._automation_storage.get_task(task_id)
     run = bridge._automation_storage.create_run(task, trigger_kind=trigger_kind)
     return task, run
 
-
-# ---------------------------------------------------------------------------
-# _dispatch_automation_run
-# ---------------------------------------------------------------------------
 
 def test_dispatch_idle_spawns_internal_turn(manager, tmp_path):
     bridge, spawned, events = _make_bridge(manager, tmp_path)
@@ -100,7 +90,6 @@ def test_dispatch_idle_spawns_internal_turn(manager, tmp_path):
     assert kwargs["display_text"] == "星轨自动化任务「每日摘要」"
     assert kwargs["automation_context"]["run_id"] == run["id"]
     assert kwargs["automation_context"]["permission_mode"] == "confirm"
-    # 运行记录 queued → running
     run_row = bridge._automation_storage.list_runs(task["id"])[0]
     assert run_row["status"] == "running"
 
@@ -111,7 +100,7 @@ def test_dispatch_busy_enqueues_with_automation_metadata(manager, tmp_path):
 
     bridge._dispatch_automation_run(task, run["id"], "scheduled")
 
-    assert spawned == []  # 忙时不打断当前回合
+    assert spawned == []
     entry = bridge._message_queues["星轨自动化任务"][0]
     assert entry["text"] == "汇总昨日进展"
     assert entry["display_text"] == "星轨自动化任务「每日摘要」"
@@ -119,7 +108,6 @@ def test_dispatch_busy_enqueues_with_automation_metadata(manager, tmp_path):
     assert entry["automation_permission_mode"] == "confirm"
     assert entry["turn_source"] == "local"
     assert events[-1][0] == "message_queue"
-    # 运行记录保持 queued
     run_row = bridge._automation_storage.list_runs(task["id"])[0]
     assert run_row["status"] == "queued"
 
@@ -152,7 +140,6 @@ def test_drain_message_queue_passes_automation_context(manager, tmp_path):
     run_row = bridge._automation_storage.list_runs(task["id"])[0]
     assert run_row["status"] == "running"
 
-    # 旧式用户消息条目（无自动化键）补发不受影响
     bridge._message_queues["星轨自动化任务"] = [{
         "id": "q_user", "text": "你好", "display_text": "你好",
         "attachments": [], "turn_source": "local",
@@ -163,12 +150,7 @@ def test_drain_message_queue_passes_automation_context(manager, tmp_path):
     assert kwargs2.get("automation_context") is None
 
 
-# ---------------------------------------------------------------------------
-# 任务工作目录（workdir）：新会话懒创建归属
-# ---------------------------------------------------------------------------
-
 def test_dispatch_new_session_carries_task_workdir(manager, tmp_path):
-    """任务指定 workdir 且目标会话未落库：spawn 带 pending_workdir 供懒创建绑定。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path)
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
@@ -181,7 +163,6 @@ def test_dispatch_new_session_carries_task_workdir(manager, tmp_path):
 
 
 def test_dispatch_global_workdir_for_new_session(manager, tmp_path):
-    """GLOBAL：新会话挂自由对话分组，原样透传给 worker。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path)
     task, run = _create_task_with_run(bridge, workdir="GLOBAL")
 
@@ -191,7 +172,6 @@ def test_dispatch_global_workdir_for_new_session(manager, tmp_path):
 
 
 def test_dispatch_existing_session_keeps_own_workdir(manager, tmp_path):
-    """目标会话已存在：会话自身归属是权威，任务 workdir 不改写。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path)
     manager.ensure_session("星轨自动化任务", workdir=str(tmp_path / "other"), source="GUI")
     project_dir = tmp_path / "proj"
@@ -204,7 +184,6 @@ def test_dispatch_existing_session_keeps_own_workdir(manager, tmp_path):
 
 
 def test_dispatch_no_workdir_keeps_legacy_behavior(manager, tmp_path):
-    """旧任务（无 workdir）：不传 pending_workdir，行为与引入前一致。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path)
     task, run = _create_task_with_run(bridge)
 
@@ -214,7 +193,6 @@ def test_dispatch_no_workdir_keeps_legacy_behavior(manager, tmp_path):
 
 
 def test_dispatch_busy_queues_workdir_and_drain_rechecks(manager, tmp_path):
-    """忙时入队携带 pending_workdir；补发时会话已被创建则放弃改绑。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path, is_turn_active=True)
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
@@ -224,7 +202,6 @@ def test_dispatch_busy_queues_workdir_and_drain_rechecks(manager, tmp_path):
     entry = bridge._message_queues["星轨自动化任务"][0]
     assert entry["pending_workdir"] == str(project_dir)
 
-    # 会话在排队期间被其他回合创建 → 补发时以会话自身归属为准
     manager.ensure_session("星轨自动化任务", workdir=str(tmp_path / "other"), source="GUI")
     bridge._is_turn_active = lambda s: False
     bridge._drain_message_queue("星轨自动化任务")
@@ -233,7 +210,6 @@ def test_dispatch_busy_queues_workdir_and_drain_rechecks(manager, tmp_path):
 
 
 def test_save_automation_task_validates_workdir(manager, tmp_path):
-    """桥层保存校验：目录不存在拒绝，GLOBAL 与真实目录放行。"""
     bridge, _, _ = _make_bridge(manager, tmp_path)
 
     bad = bridge.save_automation_task(_task_dict(workdir=str(tmp_path / "no-such-dir")))
@@ -247,12 +223,7 @@ def test_save_automation_task_validates_workdir(manager, tmp_path):
     assert ok["ok"] is True
 
 
-# ---------------------------------------------------------------------------
-# 任务指定模型（model_id）：回合用该模型执行
-# ---------------------------------------------------------------------------
-
 def test_dispatch_passes_task_model(manager, tmp_path):
-    """任务指定模型：直发 spawn 带 pending_model_id。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path)
     task, run = _create_task_with_run(bridge, model_id="m-task")
 
@@ -263,7 +234,6 @@ def test_dispatch_passes_task_model(manager, tmp_path):
 
 
 def test_dispatch_no_model_keeps_legacy_behavior(manager, tmp_path):
-    """旧任务（无 model_id）：不传 pending_model_id。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path)
     task, run = _create_task_with_run(bridge)
 
@@ -273,7 +243,6 @@ def test_dispatch_no_model_keeps_legacy_behavior(manager, tmp_path):
 
 
 def test_dispatch_busy_queues_model_and_drain_forwards(manager, tmp_path):
-    """忙时入队携带任务模型；补发回合同样透传给 worker。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path, is_turn_active=True)
     task, run = _create_task_with_run(bridge, model_id="m-task")
 
@@ -288,7 +257,6 @@ def test_dispatch_busy_queues_model_and_drain_forwards(manager, tmp_path):
 
 
 def test_worker_binds_pending_model_for_new_session(manager, tmp_path):
-    """pending_model_id：worker 落库会话并绑定任务模型（ GLOBAL 兜底归属）。"""
     bridge, _, _ = _make_bridge(manager, tmp_path)
     task_obj, run = _create_task_with_run(bridge)
     bridge._automation_storage.mark_run_running(run["id"])
@@ -303,13 +271,11 @@ def test_worker_binds_pending_model_for_new_session(manager, tmp_path):
         )
 
     assert manager.get_session_model_id("星轨自动化任务") == "m-task"
-    # 会话已按 GLOBAL 兜底落库（任务未指定 workdir 的旧数据场景）
     names = [s.get("name") for s in manager.get_all_sessions(workdir=None, include_empty=True)]
     assert "星轨自动化任务" in names
 
 
 def test_worker_without_pending_model_keeps_binding_untouched(manager, tmp_path):
-    """未指定模型：worker 不改写会话既有模型绑定。"""
     bridge, _, _ = _make_bridge(manager, tmp_path)
     manager.ensure_session("星轨自动化任务", workdir="GLOBAL", source="GUI")
     manager.set_session_model_id("星轨自动化任务", "m-original")
@@ -321,7 +287,6 @@ def test_worker_without_pending_model_keeps_binding_untouched(manager, tmp_path)
 
 
 def test_save_automation_task_validates_model_id(manager, tmp_path, monkeypatch):
-    """桥层保存校验：模型必须存在于配置；保存后回读一致。"""
     import gui_bridge as gb
 
     monkeypatch.setattr(
@@ -339,12 +304,7 @@ def test_save_automation_task_validates_model_id(manager, tmp_path, monkeypatch)
     assert bridge.get_automation_tasks()["tasks"][0]["model_id"] == "m-ok"
 
 
-# ---------------------------------------------------------------------------
-# _run_turn_worker 终态回写（真实 worker + 桩模型入口）
-# ---------------------------------------------------------------------------
-
 class _WorkerHarness:
-    """为 _run_turn_worker 桩掉模型入口与事件出口，保留真实存储/turn_undo。"""
 
     def __init__(self, bridge, manager, tmp_path, consume_return=False, model_error=False,
                  terminal_error=None):
@@ -366,8 +326,6 @@ class _WorkerHarness:
 
         def _fake_consume(history, model_name, api_key, api_base, session_name, turn_id,
                           model_id=None, error_state=None, turn_source="local"):
-            # 模拟 core/llm.py 内层生成器把模型失败转为 turn_error 事件的真实路径：
-            # 经 _emit_owned_error(terminal=True) 落入 error_state，worker 据此感知
             if self.terminal_error and error_state is not None:
                 error_state["terminal_message"] = self.terminal_error
             return self.consume_return
@@ -430,8 +388,7 @@ def test_worker_finish_writes_completed_run(manager, tmp_path):
     run_row = bridge._automation_storage.list_runs(task_obj["id"])[0]
     assert run_row["status"] == "completed"
     assert run_row["finished_at"]
-    assert run_row["turn_id"]  # turn_id 已回填
-    # 提示词逐字落库为 user 消息（运行痕迹，messages 表唯一事实源）
+    assert run_row["turn_id"]
     with manager._lock:
         last = manager.conn.execute(
             """
@@ -442,7 +399,6 @@ def test_worker_finish_writes_completed_run(manager, tmp_path):
         ).fetchone()
     assert last is not None and last[0] == "user"
     assert "汇总昨日进展" in str(last[1])
-    # turn_id 已从自动化活跃映射清除
     assert bridge._automation_turn_labels == {}
 
 
@@ -480,17 +436,12 @@ def test_worker_finish_writes_error_run_on_model_missing(manager, tmp_path):
 
 
 def test_worker_without_automation_context_writes_nothing(manager, tmp_path):
-    """人工/内部回合零影响：不写 automation_runs、不登记 turn_labels。"""
     bridge, _, _ = _make_bridge(manager, tmp_path)
     with _WorkerHarness(bridge, manager, tmp_path, consume_return=False):
         bridge._run_turn_worker("你好", "星轨自动化任务")
     assert bridge._automation_storage.list_runs(None) == []
     assert bridge._automation_turn_labels == {}
 
-
-# ---------------------------------------------------------------------------
-# js_api 方法
-# ---------------------------------------------------------------------------
 
 def test_save_automation_task_validation_and_events(manager, tmp_path):
     bridge, _, events = _make_bridge(manager, tmp_path)
@@ -516,7 +467,6 @@ def test_save_automation_task_rejects_65th(manager, tmp_path):
     overflow = bridge.save_automation_task(_task_dict(name="超限"))
     assert overflow["ok"] is False
     assert "最多" in overflow["errors"][0]
-    # 编辑已有任务不受上限限制
     first = bridge.get_automation_tasks()["tasks"][0]
     edit = bridge.save_automation_task({**first, "name": "改名"})
     assert edit["ok"] is True
@@ -530,7 +480,6 @@ def test_run_now_and_single_flight(manager, tmp_path):
     assert res["ok"] is True
     assert len(spawned) == 1
 
-    # 上一次运行还在 running：单飞拒绝
     res2 = bridge.run_automation_task_now(task_id)
     assert res2["ok"] is False and "尚未结束" in res2["msg"]
     assert len(spawned) == 1
@@ -576,7 +525,6 @@ def test_delete_and_runs_api(manager, tmp_path):
 
 
 def test_dispatch_skipped_run_emits_notice(manager, tmp_path):
-    """storage.on_run_updated 回调链：skipped 行推送事件与 notice。"""
     bridge, _, events = _make_bridge(manager, tmp_path)
     bridge._automation_storage.on_run_updated = bridge._on_automation_run_updated
     task = _insert_due_with_active_run(bridge)
@@ -606,12 +554,7 @@ def _insert_due_with_active_run(bridge):
     return task
 
 
-# ---------------------------------------------------------------------------
-# 评审修复回归：P1-1 turn_error 终态 / P2-1 原子单飞 / P2-2 事件 / P2-6 自愈 / P2-7 DTO
-# ---------------------------------------------------------------------------
-
 def test_worker_turn_error_marks_run_error(manager, tmp_path):
-    """P1-1：模型侧 turn_error（terminal_message）必须记 error，不得误记 completed。"""
     bridge, _, events = _make_bridge(manager, tmp_path)
     task_obj, run = _create_task_with_run(bridge)
     bridge._automation_storage.mark_run_running(run["id"])
@@ -630,12 +573,10 @@ def test_worker_turn_error_marks_run_error(manager, tmp_path):
     assert "API 调用失败" in run_row["error"]
     notices = [e for e in events if e[0] == "notice"]
     assert any("运行失败" in e[1]["message"] for e in notices)
-    # 终态通知必须带归属会话：前端按 session_name 路由，缺省会串到当前查看的会话
     assert all(e[1]["session_name"] == "星轨自动化任务" for e in notices)
 
 
 def test_worker_finish_completed_notice_carries_session(manager, tmp_path):
-    """notify_on_success 开启时完成提示必须带 session_name（按归属会话路由）。"""
     bridge, _, events = _make_bridge(manager, tmp_path)
     task_obj, run = _create_task_with_run(bridge)
     bridge._automation_storage.mark_run_running(run["id"])
@@ -654,7 +595,6 @@ def test_worker_finish_completed_notice_carries_session(manager, tmp_path):
 
 
 def test_dispatch_spawn_failure_marks_error_run(manager, tmp_path):
-    """P2-6：spawn 抛异常时运行行立即置 error，不留 stuck 行阻塞单飞。"""
     bridge, _, _ = _make_bridge(manager, tmp_path)
     task_obj, run = _create_task_with_run(bridge)
 
@@ -670,23 +610,20 @@ def test_dispatch_spawn_failure_marks_error_run(manager, tmp_path):
 
 
 def test_run_row_transitions_push_events(manager, tmp_path):
-    """P2-2/P2-3：queued→running→completed 全程推 automation_run_updated，
-    认领（queued）时同步推任务快照。"""
     bridge, _, events = _make_bridge(manager, tmp_path)
     bridge._automation_storage.on_run_updated = bridge._on_automation_run_updated
-    task_obj, run = _create_task_with_run(bridge)  # create_run 即触发 queued
+    task_obj, run = _create_task_with_run(bridge)
 
-    bridge._dispatch_automation_run(task_obj, run["id"], "scheduled")  # → running
+    bridge._dispatch_automation_run(task_obj, run["id"], "scheduled")
     bridge._automation_storage.finish_run(run["id"], "completed")
 
     statuses = [e[1]["run"]["status"] for e in events if e[0] == "automation_run_updated"]
     assert statuses == ["queued", "running", "completed"]
     task_events = [e for e in events if e[0] == "automation_tasks_changed"]
-    assert len(task_events) == 1  # 仅 queued（认领）时刷新快照
+    assert len(task_events) == 1
 
 
 def test_manual_run_if_idle_atomic(manager, tmp_path):
-    """P2-1：锁内 check+insert，活动运行存在时返回 None。"""
     task_obj, run = _create_task_with_run(bridge := _make_bridge(manager, tmp_path)[0])
 
     bridge._automation_storage.mark_run_running(run["id"])
@@ -697,7 +634,6 @@ def test_manual_run_if_idle_atomic(manager, tmp_path):
 
 
 def test_task_dto_bools_normalized(manager, tmp_path):
-    """P2-7：enabled/notify_on_success 归一为布尔，与类型声明一致。"""
     bridge, _, _ = _make_bridge(manager, tmp_path)
     bridge._automation_storage.save_task(_task_dict(notify_on_success=1))
     dto = bridge.get_automation_tasks()["tasks"][0]
@@ -706,7 +642,6 @@ def test_task_dto_bools_normalized(manager, tmp_path):
 
 
 def test_run_now_single_flight_after_fix(manager, tmp_path):
-    """P2-1 桥层语义保持：原子单飞拒绝第二个并发手动触发。"""
     bridge, spawned, _ = _make_bridge(manager, tmp_path, is_turn_active=True)
     task_id = bridge.save_automation_task(_task_dict())["id"]
 
@@ -715,3 +650,66 @@ def test_run_now_single_flight_after_fix(manager, tmp_path):
     assert first["ok"] is True
     assert second["ok"] is False and "尚未结束" in second["msg"]
     assert len(bridge._message_queues["星轨自动化任务"]) == 1
+
+
+def _per_run_session_name(task_name="每日摘要"):
+    import datetime
+
+    return f"{datetime.datetime.now():%Y-%m-%d} {task_name}"
+
+
+def _session_names(manager):
+    return [
+        row["name"]
+        for row in manager.get_all_sessions(
+            workdir=None, include_empty=True, include_archived=True
+        )
+    ]
+
+
+def test_dispatch_per_run_creates_dated_session(manager, tmp_path):
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, run = _create_task_with_run(bridge, session_mode="per_run")
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    expected = _per_run_session_name()
+    assert len(spawned) == 1
+    assert spawned[0][0][1] == expected
+    assert expected in _session_names(manager)
+    run_row = bridge._automation_storage.list_runs(task["id"])[0]
+    assert run_row["session_name"] == expected
+    assert run_row["status"] == "running"
+
+
+def test_dispatch_per_run_binds_task_workdir(manager, tmp_path):
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    task, run = _create_task_with_run(
+        bridge, session_mode="per_run", workdir=str(project_dir)
+    )
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    expected = _per_run_session_name()
+    rows = manager.get_all_sessions(
+        workdir=None, include_empty=True, include_archived=True
+    )
+    row = next(r for r in rows if r["name"] == expected)
+    assert row["workdir"] == str(project_dir)
+    assert spawned[0][1]["pending_workdir"] == ""
+
+
+def test_dispatch_per_run_reuses_same_day_session(manager, tmp_path):
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, first_run = _create_task_with_run(bridge, session_mode="per_run")
+    bridge._dispatch_automation_run(task, first_run["id"], "scheduled")
+
+    second_run = bridge._automation_storage.create_run(task, trigger_kind="manual")
+    bridge._dispatch_automation_run(task, second_run["id"], "manual")
+
+    expected = _per_run_session_name()
+    assert _session_names(manager).count(expected) == 1
+    assert spawned[0][0][1] == expected
+    assert spawned[1][0][1] == expected

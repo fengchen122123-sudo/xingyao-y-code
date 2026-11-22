@@ -27,7 +27,6 @@ function makeRouter() {
   });
 }
 
-/** 等异步 action 链（RPC → 回填 → nextTick）走完 */
 function flush() {
   return new Promise((r) => setTimeout(r, 0));
 }
@@ -67,7 +66,6 @@ describe('ConvoDetailView 排队条', () => {
     expect(rows).toHaveLength(2);
     expect(rows[0].text()).toContain('第一条排队');
     expect(rows[1].text()).toContain('第二条排队');
-    // 旧实现只渲染队首一条，第 2 条没有任何操作入口
     for (const row of rows) {
       expect(row.findAll('.q-act').map((a) => a.text())).toEqual(['编辑', '插队', '取消']);
     }

@@ -1,16 +1,3 @@
-"""CLI 电脑操控运行控制与脱敏显示（设计第 17 节）。
-
-命令为 /computer status|pause|resume|stop|browser：前者只做运行控制，
-绝不修改永久设置开关（GUI 系统设置页专属）；browser 是唯一例外——查看/
-切换默认浏览器（CLI 侧没有系统设置页）。status/shlex.split 后运行控制
-必须恰好两个 token，不接受别名或额外参数。显示全部为纯文本（无 Markdown
-强调符号），动作摘要脱敏：输入文本只显示长度、URL 只显示 host。
-
-本模块不导入 main/GUI/Provider/Playwright，只依赖 controller 公开 API
-与 ComputerRunSnapshot 公开字段；controller listener 侧只产生待投递
-文本，绝不直接打印（线程安全铁律见 AGENTS.md）。
-"""
-
 from __future__ import annotations
 
 import shlex
@@ -22,7 +9,6 @@ from core.computer.models import ComputerControlError, ComputerRunSnapshot
 
 _COMMANDS = {"status", "pause", "resume", "stop"}
 
-# 存在可作用于 pause/resume/stop 的活动 run 的状态集合（终态与 idle 之外）。
 _ACTIVE_RUN_STATUSES = frozenset(
     {
         "starting",
@@ -41,8 +27,6 @@ _USAGE_TEXT = (
     "操控开关请在 GUI 系统设置页修改"
 )
 _NO_ACTIVE_RUN_TEXT = "电脑操控: 当前没有进行中的操控任务（可先 /computer status 查看状态）"
-# Task 14 审查裁决：stopping 窗口内 pause/resume/stop 的 computer_invalid_state
-# 内部文案（"非法状态转换：stopping → stopping"）改为友好提示。
 _STOPPING_RUN_TEXT = "电脑操控: run 已在停止中，请稍候（可用 /computer status 查看进度）"
 
 _STATUS_LABELS = {
@@ -112,11 +96,6 @@ def _target_label(snapshot: ComputerRunSnapshot) -> str:
 
 
 def render_computer_snapshot(snapshot: ComputerRunSnapshot) -> str:
-    """把 run 快照渲染为一行纯文本状态（无 Markdown 强调符号）。
-
-    无活动 run（idle/空 run id）视为关闭并提示到 GUI 系统设置页开启；
-    有 run 时固定为 ``电脑操控: 状态 · 目标 · N 步``，失败态追加错误码。
-    """
     if not snapshot.run_id or snapshot.status == "idle":
         return "电脑操控: 已关闭（请在 GUI 系统设置页开启）"
     label = _STATUS_LABELS.get(snapshot.status, snapshot.status)
@@ -139,7 +118,6 @@ def render_computer_status_bar(snapshot: ComputerRunSnapshot) -> str:
 
 
 def _url_host(url) -> str:
-    """URL 只保留 host：剥掉 userinfo、路径、查询与锚点；非法输入返回空。"""
     try:
         host = urlsplit(str(url)).hostname or ""
     except ValueError:
@@ -173,11 +151,6 @@ def render_computer_event(event: dict) -> str:
 
 
 def render_computer_cli_event(event: dict) -> str | None:
-    """把 controller 事件映射为 CLI 单行显示文本；无需显示时返回 None。
-
-    只显示动作开始摘要与失败动作（含错误码）；状态迁移与观察事件由
-    /computer status 与命令结果承担，不在事件流里重复刷屏。
-    """
     event_type = str(event.get("type", ""))
     if event_type == "computer_action_started":
         return render_computer_event(event)
@@ -190,14 +163,6 @@ def render_computer_cli_event(event: dict) -> str | None:
 
 
 def handle_computer_command(command: str, controller) -> ComputerCommandResult:
-    """严格解析并执行 /computer 命令（设计 17.1，扩展 browser 子命令）。
-
-    status/pause/resume/stop 固定两个 token：status 只读快照，其余要求活动
-    run 并把 controller.snapshot() 的当前 run id 传给 controller（run_id 校验
-    语义与 GUI Bridge 一致）。browser 是唯一允许修改的永久设置（默认浏览器：
-    无值=查看，带值=edge|chrome），活动 run 内禁止切换，口径与 GUI 一致。
-    任何其他路径都不修改永久设置键。
-    """
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -236,12 +201,6 @@ def handle_computer_command(command: str, controller) -> ComputerCommandResult:
 
 
 def _handle_browser_subcommand(args: list, controller) -> ComputerCommandResult:
-    """/computer browser：查看或切换默认浏览器（CLI 唯一可改的永久设置项）。
-
-    settings 导入保持函数内惰性：本模块保持轻量导入，且便于测试替换。
-    active_run 判定与 pause/resume/stop 同源（_ACTIVE_RUN_STATUSES），语义
-    与 GUI Bridge 的 set_computer_browser 一致。
-    """
     from core.computer.settings import load_computer_settings, set_computer_browser
 
     snapshot = controller.snapshot()

@@ -1,8 +1,3 @@
-"""gui_bridge 的基元律动（TokenRhythm）账号桥接方法单测。
-
-全部打桩：不联网、不读写真实 ~/.ycode 配置、不创建 Key。
-"""
-
 import pytest
 
 import core.tokenrhythm_auth as tr_auth
@@ -14,7 +9,6 @@ SETTINGS = {"providers": [{"id": "prov_1", "name": "基元律动"}], "models": [
 
 
 def _make_bridge(*, settings=SETTINGS, sync_error=None):
-    """裸实例 + 实例级打桩：绕过 ApiBridge.__init__ 的数据库/全局副作用。"""
     bridge = object.__new__(ApiBridge)
     calls = {"sync": 0}
 
@@ -45,13 +39,7 @@ DEFAULT_SYNC = {
 
 @pytest.fixture(autouse=True)
 def _stub_sync_models(monkeypatch):
-    """默认不触碰真实 sync_models（会联网并写配置）；需要断言的用例自行覆盖。"""
     monkeypatch.setattr(tr_auth, "sync_models", lambda provider_id=None: dict(DEFAULT_SYNC))
-
-
-# ---------------------------------------------------------------------------
-# 状态查询
-# ---------------------------------------------------------------------------
 
 
 def test_status_logged_out_and_not_configured(monkeypatch):
@@ -134,11 +122,6 @@ def test_status_failure_returns_error(monkeypatch):
     assert bridge.tr_auth_status() == {"ok": False, "msg": "会话查询炸了"}
 
 
-# ---------------------------------------------------------------------------
-# 发送短信验证码
-# ---------------------------------------------------------------------------
-
-
 def test_send_sms_success(monkeypatch):
     bridge, _ = _make_bridge()
     seen = []
@@ -156,7 +139,6 @@ def test_send_sms_success(monkeypatch):
 
     result = bridge.tr_auth_send_sms(" 13800138000 ")
 
-    # 未传 captcha：桥接层把空串归一成 None，core 层据此不写该字段。
     assert seen == [("13800138000", None)]
     assert result == {
         "ok": True,
@@ -169,7 +151,6 @@ def test_send_sms_success(monkeypatch):
 
 
 def test_send_sms_passes_captcha_verify_param(monkeypatch):
-    """桥接层把前端给的 captchaVerifyParam 原样透传给 core 层。"""
     bridge, _ = _make_bridge()
     seen = []
 
@@ -188,7 +169,6 @@ def test_send_sms_passes_captcha_verify_param(monkeypatch):
 
 
 def test_send_sms_blank_captcha_normalized_to_none(monkeypatch):
-    """captcha 为空串 / 纯空白时归一成 None，不把空串透传给 core。"""
     bridge, _ = _make_bridge()
     seen = []
 
@@ -231,11 +211,6 @@ def test_send_sms_error_message_passthrough(monkeypatch):
     assert result["msg"] == expected
     assert "安全验证" in result["msg"]
     assert "密码登录" in result["msg"]
-
-# ---------------------------------------------------------------------------
-# 短信登录
-# ---------------------------------------------------------------------------
-
 
 def test_sms_login_creates_key_and_syncs(monkeypatch):
     bridge, calls = _make_bridge()
@@ -292,7 +267,6 @@ def test_sms_login_existing_key_message(monkeypatch):
 
 
 def test_sms_login_bind_failure_is_not_silenced(monkeypatch):
-    """登录成功但绑定失败：ok 仍为 True（账号已登录），但 bind/msg 明确报错。"""
     bridge, calls = _make_bridge()
     error_message = "API Key 已创建，但写入模型厂商配置失败：磁盘只读"
     monkeypatch.setattr(
@@ -316,7 +290,7 @@ def test_sms_login_bind_failure_is_not_silenced(monkeypatch):
     assert error_message in result["msg"]
     assert "自动绑定 API Key 失败" in result["msg"]
     assert result["settings"] == SETTINGS
-    assert calls["sync"] == 0  # 绑定失败时不再宣称已同步
+    assert calls["sync"] == 0
 
 
 def test_sms_login_sync_failure_ignored(monkeypatch):
@@ -360,7 +334,6 @@ def test_sms_login_error_message_passthrough(monkeypatch):
 
 
 def test_sms_login_passes_invite_code(monkeypatch):
-    """桥接层把前端给的邀请码原样透传给 core 层（不做大小写 / 格式改写）。"""
     bridge, _ = _make_bridge()
     seen = []
 
@@ -384,7 +357,6 @@ def test_sms_login_passes_invite_code(monkeypatch):
 
 @pytest.mark.parametrize("invite_code", ["", "   ", None])
 def test_sms_login_blank_invite_code_normalized_to_none(monkeypatch, invite_code):
-    """邀请码为空串 / 纯空白（或未传）时归一成 None，不把空串透传给 core。"""
     bridge, _ = _make_bridge()
     seen = []
 
@@ -401,11 +373,6 @@ def test_sms_login_blank_invite_code_normalized_to_none(monkeypatch, invite_code
 
     assert bridge.tr_auth_sms_login("13800138000", "123456", invite_code)["ok"] is True
     assert seen == [None]
-
-
-# ---------------------------------------------------------------------------
-# 密码登录
-# ---------------------------------------------------------------------------
 
 
 def test_password_login_success(monkeypatch):
@@ -484,11 +451,6 @@ def test_password_login_settings_failure_degrades(monkeypatch):
     assert result["settings"] == {}
 
 
-# ---------------------------------------------------------------------------
-# 退出登录
-# ---------------------------------------------------------------------------
-
-
 def test_logout_success(monkeypatch):
     bridge, _ = _make_bridge()
     logout_calls = []
@@ -518,10 +480,6 @@ def test_logout_failure(monkeypatch):
     assert bridge.tr_auth_logout() == {"ok": False, "msg": "退出失败"}
 
 
-# ---------------------------------------------------------------------------
-# 账号概览
-# ---------------------------------------------------------------------------
-
 _OVERVIEW = {
     "ok": True,
     "user": {"id": 42, "nickname": "星瑶", "phone": "13800000000"},
@@ -547,7 +505,6 @@ _OVERVIEW = {
 
 
 def test_account_overview_success_passthrough(monkeypatch):
-    """成功：透传 user / wallet / usage_today / temporary_credits，金额仍是字符串。"""
     bridge, _ = _make_bridge()
     monkeypatch.setattr(tr_auth, "account_overview", lambda: dict(_OVERVIEW))
 
@@ -556,7 +513,6 @@ def test_account_overview_success_passthrough(monkeypatch):
     assert result == _OVERVIEW
     assert isinstance(result["wallet"]["available_balance_cny"], str)
     assert isinstance(result["usage_today"]["cost_cny"], str)
-    # 临时额度金额走字符串原样透传，桥接层不做任何数值换算
     assert result["temporary_credits"]["total_cny"] == "12.30000000"
     assert isinstance(result["temporary_credits"]["total_cny"], str)
     assert result["temporary_credits"]["count"] == 2
@@ -565,7 +521,6 @@ def test_account_overview_success_passthrough(monkeypatch):
 
 
 def test_account_overview_temporary_credits_missing_default(monkeypatch):
-    """core 没给 temporary_credits（老版本）时补零值三键，前端不必判空。"""
     bridge, _ = _make_bridge()
     legacy = {k: v for k, v in _OVERVIEW.items() if k != "temporary_credits"}
     monkeypatch.setattr(tr_auth, "account_overview", lambda: dict(legacy))
@@ -583,7 +538,6 @@ def test_account_overview_temporary_credits_missing_default(monkeypatch):
 
 @pytest.mark.parametrize("broken", [None, "", [], "12.3"])
 def test_account_overview_temporary_credits_not_dict_default(monkeypatch, broken):
-    """temporary_credits 不是字典（None / 字符串等）时同样降级成零值三键。"""
     bridge, _ = _make_bridge()
     data = dict(_OVERVIEW)
     data["temporary_credits"] = broken
@@ -600,7 +554,6 @@ def test_account_overview_temporary_credits_not_dict_default(monkeypatch, broken
 
 
 def test_account_overview_partial_passthrough(monkeypatch):
-    """部分失败：partial 与 errors 一并透传，前端可提示"部分数据暂不可用"。"""
     bridge, _ = _make_bridge()
     partial = dict(_OVERVIEW)
     partial["wallet"] = {
@@ -622,7 +575,6 @@ def test_account_overview_partial_passthrough(monkeypatch):
 
 
 def test_account_overview_not_logged_in(monkeypatch):
-    """core 返回 ok=False（未登录）：桥接层收敛成 ok=False + msg，不抛异常。"""
     bridge, _ = _make_bridge()
     monkeypatch.setattr(
         tr_auth, "account_overview", lambda: {"ok": False, "reason": "未登录"}
@@ -632,7 +584,6 @@ def test_account_overview_not_logged_in(monkeypatch):
 
 
 def test_account_overview_error_message_passthrough(monkeypatch):
-    """异常：返回 ok=False 且 msg 为异常原文。"""
     bridge, _ = _make_bridge()
 
     def _boom():
@@ -645,13 +596,7 @@ def test_account_overview_error_message_passthrough(monkeypatch):
         "msg": "获取账号概览失败：登录已过期",
     }
 
-# ---------------------------------------------------------------------------
-# 登录后模型同步 / 手动同步模型
-# ---------------------------------------------------------------------------
-
-
 def test_sms_login_syncs_models_with_bound_provider(monkeypatch):
-    """绑定成功后按 provider_id 同步模型，新增数量写进 msg。"""
     bridge, _ = _make_bridge()
     seen = []
 
@@ -688,7 +633,6 @@ def test_sms_login_syncs_models_with_bound_provider(monkeypatch):
 
 
 def test_sms_login_bind_failure_skips_model_sync(monkeypatch):
-    """绑定失败时不做模型同步，models.ok=False。"""
     bridge, _ = _make_bridge()
     sync_calls = []
 
@@ -712,7 +656,6 @@ def test_sms_login_bind_failure_skips_model_sync(monkeypatch):
 
 
 def test_sms_login_model_sync_failure_keeps_login_ok(monkeypatch):
-    """模型同步异常不影响登录结论：ok 仍为 True，models 带失败原因。"""
     bridge, _ = _make_bridge()
     monkeypatch.setattr(
         tr_auth, "sms_login", lambda phone, code, invite_code=None: _login_user()
@@ -736,7 +679,6 @@ def test_sms_login_model_sync_failure_keeps_login_ok(monkeypatch):
 
 
 def test_tr_auth_sync_models_passthrough_and_error(monkeypatch):
-    """tr_auth_sync_models：成功透传 core 结果并附 settings；异常收敛成 ok=False。"""
     bridge, calls = _make_bridge()
     payload = {
         "ok": True,
@@ -763,10 +705,6 @@ def test_tr_auth_sync_models_passthrough_and_error(monkeypatch):
 
     assert bad_result == {"ok": False, "msg": "未找到基元律动厂商配置，请先登录"}
 
-
-# ---------------------------------------------------------------------------
-# 会话守门：cookie 失效 → 绑定的 Key 不可用（只影响 tokenrhythm 厂商）
-# ---------------------------------------------------------------------------
 
 import threading  # noqa: E402  - 追加段自带导入，避免动文件头部
 from types import SimpleNamespace  # noqa: E402
@@ -798,7 +736,6 @@ _NEED_LOGIN_RESULT = {
 
 
 def _make_send_bridge(monkeypatch, *, active_model_id="tr/m1"):
-    """能走完 send_user_message 的裸实例：回合启动全部打桩，不碰数据库 / 线程。"""
     bridge = object.__new__(ApiBridge)
     bridge._shutting_down = False
     bridge._current_session = "session_1"
@@ -820,7 +757,6 @@ def _make_send_bridge(monkeypatch, *, active_model_id="tr/m1"):
 
 
 def test_send_message_blocked_when_tr_session_expired(monkeypatch):
-    """tokenrhythm 模型 + 会话失效：发消息被拦截，不进入模型调用。"""
     bridge, spawned = _make_send_bridge(monkeypatch)
     monkeypatch.setattr(tr_auth, "binding_active", lambda: True)
     monkeypatch.setattr(
@@ -836,7 +772,6 @@ def test_send_message_blocked_when_tr_session_expired(monkeypatch):
 
 
 def test_send_message_proceeds_when_tr_session_ok(monkeypatch):
-    """tokenrhythm 模型 + 会话有效：照常发消息（守门不误伤）。"""
     bridge, spawned = _make_send_bridge(monkeypatch)
     seen = []
     monkeypatch.setattr(tr_auth, "binding_active", lambda: True)
@@ -854,7 +789,6 @@ def test_send_message_proceeds_when_tr_session_ok(monkeypatch):
 
 
 def test_send_message_non_tokenrhythm_model_skips_session_health(monkeypatch):
-    """非 tokenrhythm 模型：完全不触发 binding_active / session_health（零额外请求）。"""
     bridge, spawned = _make_send_bridge(monkeypatch)
     called = []
 
@@ -873,7 +807,6 @@ def test_send_message_non_tokenrhythm_model_skips_session_health(monkeypatch):
 
 
 def test_send_message_tr_model_without_binding_skips_session_health(monkeypatch):
-    """tokenrhythm 模型但本地没有绑定（用户手填 Key）：不做会话校验。"""
     bridge, spawned = _make_send_bridge(monkeypatch)
     called = []
     monkeypatch.setattr(tr_auth, "binding_active", lambda: False)
@@ -889,7 +822,6 @@ def test_send_message_tr_model_without_binding_skips_session_health(monkeypatch)
 
 
 def test_send_message_falls_back_to_active_model_for_gate(monkeypatch):
-    """前端没带 model_id 时按会话生效模型判断，tokenrhythm 同样受守门。"""
     bridge, spawned = _make_send_bridge(monkeypatch)
     monkeypatch.setattr(
         gui_bridge,
@@ -908,7 +840,6 @@ def test_send_message_falls_back_to_active_model_for_gate(monkeypatch):
 
 
 def test_send_message_fails_open_when_gate_errors(monkeypatch):
-    """守门自身异常必须放行：不能让健康检查故障把对话入口打挂。"""
     bridge, spawned = _make_send_bridge(monkeypatch)
     monkeypatch.setattr(tr_auth, "binding_active", lambda: True)
 
@@ -924,7 +855,6 @@ def test_send_message_fails_open_when_gate_errors(monkeypatch):
 
 
 def test_tr_session_health_passthrough(monkeypatch):
-    """tr_session_health 透传 core 结果（含 force），异常收敛成 ok=False。"""
     bridge, _ = _make_bridge()
     seen = []
     monkeypatch.setattr(
@@ -953,4 +883,3 @@ def test_tr_session_health_passthrough(monkeypatch):
         "reason": "会话查询失败",
         "msg": "会话查询失败",
     }
-

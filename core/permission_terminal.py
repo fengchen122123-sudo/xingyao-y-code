@@ -1,5 +1,3 @@
-"""Interactive tool permission authorization and terminal prompts."""
-
 from __future__ import annotations
 
 import os
@@ -32,10 +30,9 @@ from core.permission_policy import (
     PermissionRisk,
     decide_permission,
 )
-# safety 场景（JEV 决策）薄包装层：只做「allow → ask」的加严，纯函数判定不受污染
+from core.permission_auto_decision import apply_auto_decision_to_permission
 from core.permission_safety_gate import apply_decision_to_permission
 
-# 工具结果中的错误哨兵前缀
 TOOL_ERROR_PREFIX = "🚨"
 ASK_USER_ERROR_PREFIX = "无法提问："
 TOOL_INTERNAL_ERROR_PREFIX = "Tool execution error:"
@@ -44,7 +41,7 @@ PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息、执行明确的只读查询和制定计划，"
     "不允许执行修改或删除操作。请改用 plan_write 把操作步骤写入计划，"
-    "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
+    "并提示用户切换到「变更前确认」「自动编辑」「自动决策」或「完全访问」模式后再执行。"
 )
 PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
@@ -240,6 +237,7 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
     mode_display = {
         "confirm": "每次确认",
         "accept_edits": "自动编辑",
+        "auto_decision": "自动决策",
         "plan": "计划确认",
         "full": "完全访问",
     }
@@ -261,13 +259,18 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
             if len(lines) > 5:
                 preview += f"\n   ... (共 {len(lines)} 行)"
             print(f"   [预览]:\n   {preview}")
-    elif function_name == "edit_file":
+    elif function_name in {"edit_file", "multi_edit"}:
         file_path = arguments.get("file_path", "未知文件")
-        target = arguments.get("target_content", "")
-        repl = arguments.get("replacement_content", "")
-        print(f"[修改文件] {_agent_display_name()}申请修改文件: {file_path}")
-        print(f"   [-] 计划删除: {target.strip()[:100]}")
-        print(f"   [+] 计划替换: {repl.strip()[:100]}")
+        if function_name == "multi_edit":
+            edits = arguments.get("edits") or []
+            count = len(edits) if isinstance(edits, list) else 0
+            print(f"[批量修改文件] {_agent_display_name()}申请批量修改文件: {file_path}（共 {count} 处）")
+        else:
+            target = arguments.get("target_content", "")
+            repl = arguments.get("replacement_content", "")
+            print(f"[修改文件] {_agent_display_name()}申请修改文件: {file_path}")
+            print(f"   [-] 计划删除: {target.strip()[:100]}")
+            print(f"   [+] 计划替换: {repl.strip()[:100]}")
     elif function_name == "execute_command":
         cmd = arguments.get("command", "")
         shell_id = str(arguments.get("shell_id") or "").strip()
@@ -320,7 +323,7 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
                 if file_path:
                     _grant_write_add(_canonical_permission_path(file_path))
                     print(f"[当前任务已放行写入]：{file_path}")
-            elif function_name == "edit_file":
+            elif function_name in {"edit_file", "multi_edit"}:
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     _grant_edit_add(_canonical_permission_path(file_path))
@@ -351,6 +354,8 @@ _KNOWN_QUERY_TOOLS = frozenset({
     "list_directory",
     "search_code",
     "find_definition",
+    "get_outline",
+    "find_references",
     "glob_files",
     "fetch_url",
     "search_news",
@@ -420,7 +425,7 @@ def _permission_rule_facts(function_name, arguments):
                 project_rule = None
             else:
                 project_rule = ("command", command)
-    elif function_name in {"write_file", "edit_file"}:
+    elif function_name in {"write_file", "edit_file", "multi_edit"}:
         kind = "write" if function_name == "write_file" else "edit"
         field = "write_files" if kind == "write" else "edit_files"
         canonical = _canonical_permission_path(arguments.get("file_path", ""))
@@ -483,11 +488,6 @@ def _get_active_tool_registry():
 
 
 def _llm_first(name, fallback):
-    """llm-first 解析入口层绑定。
-
-    core.llm 保留兼容入口，测试/外部调用方 patch core.llm.<name> 必须生效；
-    解析失败回落本模块实现。
-    """
     try:
         import core.llm as _llm
         fn = getattr(_llm, name, None)
@@ -595,9 +595,9 @@ def authorize_tool_call(
             raise PermissionSystemError("沙箱外访问缺少有效的原始操作类型")
         path_value = arguments.get("path")
         effective_arguments = dict(arguments)
-        if effective_function_name in {"read_file", "write_file", "edit_file"}:
+        if effective_function_name in {"read_file", "write_file", "edit_file", "multi_edit"}:
             effective_arguments["file_path"] = path_value
-        elif effective_function_name in {"list_directory", "directory_tree", "search_code", "find_definition", "glob_files"}:
+        elif effective_function_name in {"list_directory", "directory_tree", "search_code", "find_definition", "get_outline", "find_references", "glob_files"}:
             effective_arguments["dir_path"] = path_value
         else:
             effective_arguments.setdefault("path", path_value)
@@ -653,6 +653,24 @@ def authorize_tool_call(
     task_sandbox_bypass = (
         False if credential_write else is_session_sandbox_bypass_enabled()
     )
+    ai_output_write = False
+    if not credential_write and risk is PermissionRisk.NORMAL_MUTATION:
+        if (
+            tool_spec is not None
+            and getattr(tool_spec, "requires_permission", True) is False
+        ):
+            ai_output_write = True
+        elif (
+            effective_function_name
+            in {"write_file", "edit_file", "multi_edit", "office_write"}
+            and path_value
+        ):
+            try:
+                from core.ai_output_paths import is_ai_output_write_target
+
+                ai_output_write = is_ai_output_write_target(path_value)
+            except Exception as exc:
+                raise PermissionSystemError(f"AI 输出目录权限校验失败: {exc}") from exc
     facts = PermissionFacts(
         mode=app_context.get_permission_mode(),
         risk=risk,
@@ -662,21 +680,30 @@ def authorize_tool_call(
         task_sandbox_bypass=task_sandbox_bypass,
         task_grant_hit=task_hit,
         project_rule_hit=project_hit,
+        ai_output_write=ai_output_write,
     )
     decision = decide_permission(facts)
-    # JEV safety 场景接入：高风险操作再问一次「直接执行是否安全」，
-    # **唯一允许的变化是 allow → ask**（只能加严，不能放宽）。
-    # 纯函数 decide_permission 保持无网络 IO，决策叠加在薄包装层完成；
-    # JEV 关闭 / 影子 / 失败 / 低风险时该调用是纯本地空转，判定完全不变。
-    decision = apply_decision_to_permission(
+    decision = apply_auto_decision_to_permission(
         facts,
         decision,
-        command=(
-            str(effective_arguments.get("command", ""))
-            if effective_function_name == "execute_command"
-            else effective_function_name
-        ),
+        function_name=effective_function_name,
+        arguments=effective_arguments,
+        source=permission_source,
     )
+    # JEV safety 场景接入：高风险操作再问一次「直接执行是否安全」，
+    # **唯一允许的变化是 allow → ask**（只能加严，不能放宽）。
+    # 若本次刚由 JEV auto_permission 评估放行（jev_auto_allow），不重复发第二次请求；
+    # 其余场景（如 full / 白名单）照常由 safety 兜底。
+    if decision.reason != "jev_auto_allow":
+        decision = apply_decision_to_permission(
+            facts,
+            decision,
+            command=(
+                str(effective_arguments.get("command", ""))
+                if effective_function_name == "execute_command"
+                else effective_function_name
+            ),
+        )
 
     if decision.action is PermissionAction.ALLOW:
         _notify_event(event_callback, "permission_resolved", {
@@ -686,6 +713,12 @@ def authorize_tool_call(
         })
         return AuthorizationResult(True, decision.reason, sandbox_bypass=outside)
     if decision.action is PermissionAction.DENY:
+        if decision.reason == "jev_auto_deny":
+            _notify_event(event_callback, "permission_resolved", {
+                "approved": False,
+                "automatic": True,
+                "reason": decision.reason,
+            })
         return AuthorizationResult(False, decision.reason)
 
     sandbox_request = decision.reason == "sandbox_boundary_requires_confirmation"
@@ -784,13 +817,13 @@ def check_permission_and_ask(
         tool_spec = fetched_spec if fetched_spec is not None else SimpleNamespace(
             name=function_name,
             read_only=function_name in _KNOWN_QUERY_TOOLS,
-            mutates_files=function_name in {"write_file", "edit_file"},
+            mutates_files=function_name in {"write_file", "edit_file", "multi_edit"},
             requires_permission=True,
         )
     outside = outside_workspace
     if outside is None:
         outside = function_name == "sandbox_outside_access"
-        if function_name in {"read_file", "write_file", "edit_file"}:
+        if function_name in {"read_file", "write_file", "edit_file", "multi_edit"}:
             try:
                 from core.tools import is_outside_workspace as _fallback_check
                 outside = _llm_first("is_outside_workspace", _fallback_check)(

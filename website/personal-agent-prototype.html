@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f6f4ef">
+<title>星瑶</title>
+<style>
+  :root {
+    --bg: #f4f1ea;
+    --bg-deep: #ebe6dc;
+    --surface: #fffcf8;
+    --ink: #1c1b17;
+    --muted: #6f6a62;
+    --line: #e5e0d6;
+    --user: #e7f0e4;
+    --online: #2f8f55;
+    --shadow: 0 10px 28px rgba(48, 40, 24, .07);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background: var(--bg);
+    font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, textarea, input { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; }
+  h1, h2, p { margin: 0; }
+  :focus { outline: none; }
+  :focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; display: block; }
+  .avatar {
+    width: 36px; height: 36px; border-radius: 50%; flex: none;
+    background: var(--ink); color: #fff;
+    display: grid; place-items: center;
+    font-size: 14px; font-weight: 650;
+  }
+  .avatar.sm { width: 26px; height: 26px; font-size: 12px; }
+  .avatar.lg { width: 56px; height: 56px; font-size: 22px; }
+  .avatar .icon { stroke: #fff; width: 18px; height: 18px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #c8c2b6; display: inline-block; flex: none; }
+  .dot.on { background: var(--online); }
+  .dot.wait { background: #c4842f; }
+
+  .switch {
+    position: fixed; z-index: 5; top: 14px; right: 14px;
+    display: flex; padding: 3px; border: 1px solid var(--line);
+    border-radius: 999px; background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+  .switch button {
+    border: 0; background: transparent; color: var(--muted);
+    border-radius: 999px; padding: 6px 12px; font-size: 12px;
+  }
+  .switch button[aria-pressed="true"] { background: var(--ink); color: #fff; }
+
+  .frame { height: 100%; }
+  body.phone { background: #e4dfd4; overflow: hidden; padding: 20px 0; }
+  body.phone .frame {
+    width: 390px; height: 100%; margin: 0 auto;
+    border-radius: 32px; overflow: hidden; background: var(--bg);
+    box-shadow: 0 24px 70px rgba(48, 40, 24, .16);
+  }
+
+  .frame { position: relative; }
+  .app { height: 100%; display: flex; min-height: 0; background: var(--bg); }
+  .side {
+    width: 280px; flex: none; display: flex; flex-direction: column;
+    padding: 18px 14px 12px; min-height: 0; background: #201f1b; color: #f5f2eb;
+  }
+  .side .avatar { background: #f4f1ea; color: var(--ink); }
+  .side .side-label, .side .chat-btn time, .side .chat-preview, .side .account-chip { color: #aaa69c; }
+  .side .new-chat { border-color: #45423b; background: #2b2924; color: #fff; }
+  .side .new-chat:hover, .side .chat-btn:hover, .side .side-link:hover, .side .account-chip:hover { background: #2b2924; }
+  .side .chat-btn.active { background: #37342e; color: #fff; box-shadow: none; }
+  .side .side-foot { border-color: #3c3933; }
+  .side-head { padding: 4px 8px 14px; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .mark { font-weight: 680; letter-spacing: -.03em; font-size: 16px; }
+  .new-chat {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    height: 42px; margin: 0 4px 16px; border-radius: 14px;
+    border: 1px solid var(--line); background: var(--surface);
+    font-size: 14px; font-weight: 600;
+    box-shadow: 0 1px 2px rgba(48, 40, 24, .04);
+  }
+  .new-chat:hover { background: #fff; }
+  .side-label { margin: 0 10px 8px; font-size: 12px; color: var(--muted); }
+  .chats { overflow: auto; display: flex; flex-direction: column; gap: 4px; min-height: 0; }
+  .chat-btn, .side-link, .account-chip {
+    width: 100%; border: 0; background: transparent; text-align: left; border-radius: 14px;
+  }
+  .chat-btn { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; }
+  .chat-btn:hover, .side-link:hover, .account-chip:hover { background: rgba(255, 252, 248, .7); }
+  .chat-btn.active { background: var(--surface); box-shadow: 0 1px 2px rgba(48, 40, 24, .05); }
+  .chat-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .chat-title { font-size: 14px; font-weight: 650; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-btn time, .chat-preview, .side-link small { color: var(--muted); font-size: 12px; }
+  .chat-btn time { flex: none; }
+  .chat-preview { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .side-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; }
+  .side-link, .account-chip { display: flex; align-items: center; gap: 10px; padding: 10px; font-size: 14px; }
+  .account-chip { color: var(--muted); }
+
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+  .top {
+    flex: none; display: flex; align-items: center; gap: 8px;
+    padding: 0 22px; min-height: 72px; border-bottom: 1px solid var(--line);
+  }
+  .top-grow { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+  .top h1 { font-size: 16px; font-weight: 650; letter-spacing: -.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .status { display: flex; align-items: center; gap: 6px; margin-top: 2px; color: var(--muted); font-size: 12px; }
+  .model-picker {
+    position: relative; flex: none; max-width: 160px; display: flex; align-items: center;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  }
+  .model-picker select {
+    width: 100%; height: 36px; padding: 0 32px 0 12px; border: 0; border-radius: inherit;
+    appearance: none; background: transparent; font-size: 13px; text-overflow: ellipsis;
+  }
+  .model-picker .icon { position: absolute; right: 9px; width: 15px; pointer-events: none; color: var(--muted); }
+  .icon-btn, .stop {
+    border: 0; background: transparent; border-radius: 999px;
+    display: grid; place-items: center;
+  }
+  .icon-btn { width: 36px; height: 36px; color: var(--ink); }
+  .icon-btn:hover, .stop:hover { background: rgba(28, 27, 23, .06); }
+  .stop { height: 34px; padding: 0 12px; font-size: 13px; color: var(--muted); }
+
+  .transcript { flex: 1; overflow: auto; padding: 22px 22px 8px; }
+  .column { max-width: 720px; margin: 0 auto; }
+  .msg { display: flex; gap: 10px; margin: 0 0 14px; align-items: flex-start; }
+  .msg .avatar { margin-top: 2px; }
+  .msg.user { justify-content: flex-end; }
+  .bubble { max-width: min(100%, 540px); border-radius: 18px; padding: 11px 14px; }
+  .msg.agent .bubble { background: var(--surface); border: 1px solid var(--line); border-bottom-left-radius: 6px; }
+  .msg.user .bubble { background: var(--user); border-bottom-right-radius: 6px; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.65; }
+  .watch {
+    width: 100%; margin-top: 12px; padding: 8px 10px; border: 0; border-radius: 12px;
+    background: #f6f3ec; display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--ink); text-align: left;
+  }
+  .watch .chev { margin-left: auto; color: var(--muted); transition: transform .15s linear; }
+  .watch.open .chev { transform: rotate(90deg); }
+  .shot { margin-top: 8px; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: #fff; }
+  .shot-bar { height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #f6f3ec; }
+  .dots { display: flex; gap: 4px; }
+  .dots i { width: 7px; height: 7px; border-radius: 50%; background: #d5d0c6; display: block; }
+  .shot-bar span:last-child { font-size: 11px; color: var(--muted); }
+  .shot-body { padding: 16px 14px 14px; }
+  .sk { height: 8px; border-radius: 99px; background: #eeeae2; margin-bottom: 8px; }
+  .sk.w1 { width: 46%; } .sk.w2 { width: 72%; }
+  .sk-block { height: 54px; border-radius: 10px; background: linear-gradient(180deg, #f7f4ee, #efeae1); margin: 10px 0 8px; }
+  .shot-body p { font-size: 12px; color: var(--muted); }
+  .ask-card { margin-top: 12px; padding: 12px; border-radius: 14px; background: #f7f4ee; }
+  .ask-card p { font-size: 14px; }
+  .ask-card code {
+    display: block; margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+    background: #fff; font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+  }
+  .choices { display: flex; gap: 8px; margin-top: 12px; }
+  .choices button {
+    flex: 1; height: 38px; border-radius: 12px; border: 1px solid var(--line);
+    background: #fff; font-size: 14px;
+  }
+  .choices .yes { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .done {
+    display: flex; align-items: center; gap: 8px; margin-top: 12px;
+    font-size: 13px; color: var(--muted);
+  }
+  .tick {
+    width: 18px; height: 18px; border-radius: 50%; background: #e5f2e8; color: var(--online);
+    display: grid; place-items: center; flex: none;
+  }
+  .tick .icon { width: 12px; height: 12px; stroke: var(--online); }
+
+  .empty-state {
+    min-height: 48vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; color: var(--muted); text-align: center;
+  }
+  .dock { padding: 8px 22px 18px; }
+  .composer {
+    max-width: 720px; margin: 0 auto; display: flex; align-items: flex-end; gap: 8px;
+    background: var(--surface); border: 1px solid #e3ded3; border-radius: 24px;
+    padding: 8px 8px 8px 16px; box-shadow: var(--shadow);
+  }
+  .composer:focus-within { border-color: #cfc8ba; }
+  .composer textarea {
+    flex: 1; border: 0; resize: none; background: transparent; outline: none;
+    min-height: 28px; max-height: 140px; padding: 8px 0; line-height: 1.5; font-size: 15px;
+  }
+  .send {
+    width: 40px; height: 40px; border: 0; border-radius: 50%;
+    background: var(--ink); color: #fff; display: grid; place-items: center; flex: none;
+  }
+  .send:disabled { background: #ece7de; color: #b3aea4; }
+  .send .icon { width: 18px; height: 18px; }
+
+  .device {
+    width: 100%; display: flex; align-items: center; gap: 12px;
+    padding: 14px; margin-bottom: 10px; border-radius: 18px;
+    border: 1px solid var(--line); background: var(--surface); text-align: left;
+  }
+  .device:hover { border-color: #d8d2c6; }
+  .device-ico {
+    width: 42px; height: 42px; border-radius: 14px; background: #f3efe6;
+    display: grid; place-items: center; flex: none;
+  }
+  .device-copy { min-width: 0; flex: 1; }
+  .device-copy b { display: block; font-size: 15px; font-weight: 640; }
+  .device-copy small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+  .device.off { color: var(--muted); }
+  .warn {
+    margin-top: 4px; padding: 12px 14px; border-radius: 14px;
+    background: var(--surface); color: var(--muted); font-size: 13px; border: 1px solid var(--line);
+  }
+  .profile, .login {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 24px;
+    box-shadow: var(--shadow);
+  }
+  .profile { padding: 32px 24px; text-align: center; }
+  .profile .avatar, .login .avatar { margin: 0 auto 14px; }
+  .profile h2 { font-size: 20px; letter-spacing: -.03em; }
+  .profile p, .login > p { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .block-btn, .login button[type="submit"] {
+    height: 44px; margin-top: 20px; border-radius: 14px; font-size: 15px; font-weight: 600;
+  }
+  .block-btn { padding: 0 18px; border: 1px solid var(--line); background: #fff; }
+  .login-main { display: grid; place-items: center; }
+  .login { width: min(400px, calc(100% - 36px)); padding: 32px 28px 28px; }
+  .login h1 { text-align: center; font-size: 28px; letter-spacing: -.04em; }
+  .login > p { text-align: center; }
+  .login label { display: block; margin: 16px 0 6px; font-size: 13px; }
+  .login input {
+    width: 100%; height: 46px; border-radius: 12px; border: 1px solid var(--line);
+    background: #faf8f4; padding: 0 12px;
+  }
+  .login input:focus { border-color: #c9c2b4; background: #fff; }
+  .login button[type="submit"] { width: 100%; border: 0; background: var(--ink); color: #fff; }
+
+  .transcript, .chats { scrollbar-width: thin; scrollbar-color: #ddd6c8 transparent; }
+  .app.narrow .side { width: 100%; padding: 16px 14px calc(76px + env(safe-area-inset-bottom)); }
+  .app.narrow.hide-side .side { display: none; }
+  .app.narrow.hide-main .main { display: none; }
+  .app.narrow .transcript, .app.narrow .dock, .app.narrow .top { padding-left: 14px; padding-right: 14px; }
+  .app.narrow .main { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+  .app.narrow .top { gap: 7px; }
+  .app.narrow .top > .avatar { display: none; }
+  .app.narrow .model-picker { max-width: 120px; }
+  .app.narrow .model-picker select { padding-left: 10px; font-size: 12px; }
+  .app.narrow .dock { padding-bottom: 10px; }
+  .mobile-nav { display: none; }
+  .app.narrow .mobile-nav {
+    position: absolute; z-index: 4; inset: auto 0 0; min-height: 64px;
+    padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); display: flex;
+    border-top: 1px solid var(--line); background: rgba(255, 252, 248, .97);
+  }
+  .mobile-nav button {
+    min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 5px 2px; border: 0; background: transparent; color: var(--muted); font-size: 10px;
+  }
+  .mobile-nav button.active { color: var(--ink); }
+  .mobile-nav .icon { width: 21px; height: 21px; }
+  @media (max-width: 720px) {
+    .switch { display: none; }
+    body.phone { background: var(--bg); padding: 0; }
+    body.phone .frame { width: auto; border-radius: 0; box-shadow: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .watch .chev { transition: none; } }
+</style>
+</head>
+<body>
+  <div class="switch" role="group" aria-label="预览宽度">
+    <button type="button" id="wideBtn" aria-pressed="true">桌面</button>
+    <button type="button" id="phoneBtn" aria-pressed="false">手机</button>
+  </div>
+  <div class="frame">
+    <div class="app" id="app"></div>
+  </div>
+  <div id="live" class="sr-only" role="status"></div>
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const live = (t) => { $('#live').textContent = t; };
+const svg = (inner) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${inner}</svg>`;
+const I = {
+  plus: svg('<path d="M12 5v14M5 12h14"/>'),
+  up: svg('<path d="M12 19V5M6 11l6-6 6 6"/>'),
+  back: svg('<path d="M15 5 8 12l7 7"/>'),
+  laptop: svg('<rect x="4" y="5" width="16" height="11" rx="2"/><path d="M2 19h20"/>'),
+  chev: svg('<path d="m9 6 6 6-6 6"/>'),
+  check: svg('<path d="m5 12 5 5L20 7"/>'),
+  down: svg('<path d="m8 10 4 4 4-4"/>'),
+  chat: svg('<path d="M20 15a3 3 0 0 1-3 3H9l-5 3v-6a3 3 0 0 1-1-2V7a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3Z"/>'),
+  account: svg('<circle cx="12" cy="8" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/>'),
+  globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"/>')
+};
+
+const chats = [
+  {
+    id: 'week', title: '本周进展', when: '今天', approval: 'pending', watchOpen: false,
+    items: [
+      { role: 'user', text: '帮我整理这周的进展，看看核心功能和浏览器自动化。' },
+      {
+        role: 'agent',
+        text: '看过这周的记录，也打开了产品页。\n\n核心功能按计划，对话和确认已经连上。\n浏览器能打开页面、读取内容。',
+        watch: '产品首页',
+        ask: '要存成这个文件吗？'
+      }
+    ]
+  },
+  {
+    id: 'compete', title: '竞品首启', when: '昨天', approval: null, watchOpen: false,
+    items: [
+      { role: 'user', text: '对比一下三个产品第一次打开时在做什么。' },
+      { role: 'agent', text: '都是先给一件马上能做完的小事，而不是先介绍功能。' }
+    ]
+  },
+  {
+    id: 'month', title: '月度数据', when: '11月11日', approval: null, watchOpen: false,
+    items: [
+      { role: 'user', text: '汇总一下十一月。' },
+      { role: 'agent', text: '活跃 18 天，完成 46 项。' }
+    ]
+  },
+  {
+    id: 'migrate', title: '迁移清单', when: '11月8日', approval: null, watchOpen: false,
+    items: [
+      { role: 'user', text: '服务器迁移前要检查什么？' },
+      { role: 'agent', text: '数据、密钥、回调地址、回滚。按这个顺序做。' }
+    ]
+  }
+];
+
+const devices = [
+  { id: 'home', name: '家里的台式机', online: true },
+  { id: 'studio', name: '工作室电脑', online: false }
+];
+const threads = { home: { items: [] }, studio: { items: [] } };
+const state = {
+  previewPhone: location.hash === '#phone',
+  screen: 'chat',
+  chatId: 'week',
+  deviceId: null,
+  loggedIn: true,
+  account: '木偶',
+  model: '星瑶 Pro',
+  notice: '',
+  focus: false,
+  bottom: true
+};
+
+const smallScreen = matchMedia('(max-width: 720px)');
+const narrow = () => state.previewPhone || smallScreen.matches;
+const chat = () => chats.find((c) => c.id === state.chatId);
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+function snippet(c) {
+  const last = c.items.slice().reverse().find((m) => m.text);
+  if (!last) return '还没有消息';
+  return last.text.replace(/\s+/g, ' ').slice(0, 22);
+}
+function goBack() {
+  if (state.screen === 'device') state.screen = 'computers';
+  else if (narrow() && state.screen !== 'list') state.screen = 'list';
+  else state.screen = 'chat';
+  state.notice = '';
+  render();
+}
+function render() {
+  const isNarrow = narrow();
+  document.body.classList.toggle('phone', state.previewPhone && !smallScreen.matches);
+  $('#wideBtn').setAttribute('aria-pressed', String(!state.previewPhone));
+  $('#phoneBtn').setAttribute('aria-pressed', String(state.previewPhone));
+  const hideSide = !state.loggedIn || (isNarrow && state.screen !== 'list');
+  const hideMain = state.loggedIn && isNarrow && state.screen === 'list';
+  const app = $('#app');
+  app.className = 'app' + (isNarrow ? ' narrow' : '') + (hideSide ? ' hide-side' : '') + (hideMain ? ' hide-main' : '');
+  app.innerHTML = sideHtml() + mainHtml(isNarrow) + mobileNavHtml(isNarrow);
+  const box = $('#box');
+  if (box) {
+    box.addEventListener('input', () => {
+      box.style.height = 'auto';
+      box.style.height = Math.min(box.scrollHeight, 140) + 'px';
+      $('#send').disabled = !box.value.trim();
+    });
+    if (state.focus) box.focus();
+  }
+  const scroller = $('.transcript');
+  if (scroller && state.bottom) scroller.scrollTop = scroller.scrollHeight;
+  state.focus = false;
+  state.bottom = false;
+}
+function sideHtml() {
+  if (!state.loggedIn) return '';
+  const initial = esc(state.account.slice(0, 1) || '我');
+  const items = chats.map((c) => {
+    const on = c.id === state.chatId && state.screen === 'chat';
+    return `<button class="chat-btn${on ? ' active' : ''}" data-chat="${c.id}"${on ? ' aria-current="page"' : ''}>
+      <span class="chat-top"><span class="chat-title">${esc(c.title)}</span><time>${esc(c.when)}</time></span>
+      <span class="chat-preview">${esc(snippet(c))}</span>
+    </button>`;
+  }).join('');
+  return `<aside class="side">
+    <div class="side-head"><div class="brand"><span class="avatar sm">星</span><span class="mark">星瑶</span></div></div>
+    <button class="new-chat" data-action="new" type="button">${I.plus}新对话</button>
+    <p class="side-label">最近</p>
+    <nav class="chats" aria-label="对话">${items}</nav>
+    <div class="side-foot">
+      <button class="side-link" data-action="computers" type="button">${I.laptop}我的电脑</button>
+      <button class="account-chip" data-action="account" type="button"><span class="avatar sm">${initial}</span>${esc(state.account)}</button>
+    </div>
+  </aside>`;
+}
+function mainHtml(isNarrow) {
+  if (!state.loggedIn) return loginHtml();
+  if (isNarrow && state.screen === 'list') return '<main class="main"></main>';
+  let body = '';
+  if (state.screen === 'chat') body = chatHtml(chat(), isNarrow, false);
+  else if (state.screen === 'computers') body = computersHtml(isNarrow);
+  else if (state.screen === 'device') body = deviceHtml(isNarrow);
+  else if (state.screen === 'account') body = accountHtml(isNarrow);
+  return `<main class="main">${body}</main>`;
+}
+function backButton(show) {
+  if (!show) return '';
+  return `<button class="icon-btn" type="button" data-action="back" aria-label="返回">${I.back}</button>`;
+}
+function modelPicker() {
+  const options = ['星瑶 Pro', '星瑶 Lite', 'DeepSeek V4'].map((name) =>
+    `<option${state.model === name ? ' selected' : ''}>${name}</option>`
+  ).join('');
+  return `<label class="model-picker"><span class="sr-only">选择模型</span><select id="model">${options}</select>${I.down}</label>`;
+}
+function mobileNavHtml(isNarrow) {
+  if (!isNarrow || !state.loggedIn) return '';
+  const chatActive = state.screen === 'chat' || state.screen === 'list';
+  return `<nav class="mobile-nav" aria-label="主要导航">
+    <button type="button" class="${chatActive ? 'active' : ''}" data-nav="chat">${I.chat}<span>对话</span></button>
+    <button type="button" data-nav="approvals">${I.check}<span>确认</span></button>
+    <button type="button" data-nav="watch">${I.globe}<span>围观</span></button>
+    <button type="button" class="${state.screen === 'computers' || state.screen === 'device' ? 'active' : ''}" data-nav="computers">${I.laptop}<span>设备</span></button>
+    <button type="button" class="${state.screen === 'account' ? 'active' : ''}" data-nav="account">${I.account}<span>我的</span></button>
+  </nav>`;
+}
+function chatHtml(c, isNarrow, remote) {
+  const pending = c && c.approval === 'pending';
+  const title = remote ? devices.find((d) => d.id === state.deviceId).name : c.title;
+  const status = remote
+    ? '<i class="dot on"></i>消息转发到这台电脑'
+    : pending ? '<i class="dot wait"></i>等你确认' : '<i class="dot on"></i>在线';
+  const face = remote ? I.laptop : '星';
+  const items = c ? c.items : threads[state.deviceId].items;
+  const messages = items.length
+    ? items.map((m, i) => messageHtml(m, i, c)).join('')
+    : `<div class="empty-state"><div class="avatar lg">${remote ? I.laptop : '星'}</div><p>${remote ? '从这里给这台电脑发消息。' : '直接说你要做的事。'}</p></div>`;
+  return `<header class="top">
+      ${backButton(isNarrow || remote)}
+      <div class="top-grow"><div class="avatar">${face}</div><div style="min-width:0"><h1>${esc(title)}</h1><p class="status">${status}</p></div></div>
+      ${remote ? '' : modelPicker()}
+      ${pending ? '<button class="stop" type="button" data-action="stop">停止</button>' : ''}
+    </header>
+    <div class="transcript"><div class="column">${messages}</div></div>
+    ${composerHtml()}`;
+}
+function messageHtml(m, index, c) {
+  const text = `<div class="text">${esc(m.text)}</div>`;
+  if (m.role === 'user') return `<article class="msg user"><div class="bubble">${text}</div></article>`;
+  let extra = '';
+  if (m.watch) {
+    extra += `<button class="watch${c.watchOpen ? ' open' : ''}" type="button" data-watch="${index}">${I.globe}<span>看过${esc(m.watch)}</span><span class="chev">${I.chev}</span></button>`;
+    if (c.watchOpen) {
+      extra += `<div class="shot"><div class="shot-bar"><span class="dots"><i></i><i></i><i></i></span><span>${esc(m.watch)}</span></div><div class="shot-body"><div class="sk w1"></div><div class="sk w2"></div><div class="sk-block"></div><p>已打开并读取</p></div></div>`;
+    }
+  }
+  if (m.ask && c) {
+    if (c.approval === 'pending') {
+      extra += `<div class="ask-card"><p>${esc(m.ask)}</p><code>reports/2026-11-13.md</code><div class="choices"><button type="button" data-action="deny">先不存</button><button class="yes" type="button" data-action="allow">存下来</button></div></div>`;
+    } else if (c.approval === 'allowed') extra += `<p class="done"><span class="tick">${I.check}</span>已存成 reports/2026-11-13.md</p>`;
+    else if (c.approval === 'denied') extra += `<p class="done">没有保存。</p>`;
+    else if (c.approval === 'stopped') extra += `<p class="done">已停止，没有保存。</p>`;
+  }
+  return `<article class="msg agent"><div class="avatar" aria-hidden="true">星</div><div class="bubble">${text}${extra}</div></article>`;
+}
+function composerHtml() {
+  return `<form class="dock" id="composer"><div class="composer">
+    <label class="sr-only" for="box">消息</label>
+    <textarea id="box" rows="1" placeholder="发消息给星瑶"></textarea>
+    <button id="send" class="send" type="submit" disabled aria-label="发送">${I.up}</button>
+  </div></form>`;
+}
+function computersHtml(isNarrow) {
+  const rows = devices.map((d) => `<button class="device${d.online ? '' : ' off'}" type="button" data-device="${d.id}">
+    <span class="device-ico">${I.laptop}</span>
+    <span class="device-copy"><b>${esc(d.name)}</b><small>${d.online ? 'Windows · 在线' : 'Windows · 没开'}</small></span>
+    <i class="dot${d.online ? ' on' : ''}"></i>
+  </button>`).join('');
+  return `<header class="top">${backButton(true)}<div class="top-grow"><div style="min-width:0"><h1>我的电脑</h1><p class="status">服务器只负责转发</p></div></div></header>
+    <div class="transcript"><div class="column">${rows}${state.notice ? `<p class="warn">${esc(state.notice)}</p>` : ''}</div></div>`;
+}
+function deviceHtml(isNarrow) {
+  const t = threads[state.deviceId];
+  return chatHtml({ title: '', approval: null, items: t.items, watchOpen: false }, isNarrow, true);
+}
+function accountHtml(isNarrow) {
+  const initial = esc(state.account.slice(0, 1) || '我');
+  return `<header class="top">${backButton(true)}<div class="top-grow"><div style="min-width:0"><h1>账号</h1><p class="status">对话按账号分开</p></div></div></header>
+    <div class="transcript"><div class="column"><section class="profile"><div class="avatar lg">${initial}</div><h2>${esc(state.account)}</h2><p>这个账号里的对话只属于你。</p><button class="block-btn" type="button" data-action="logout">退出登录</button></section></div></div>`;
+}
+function loginHtml() {
+  return `<main class="main login-main"><form class="login" id="login">
+    <div class="avatar lg">星</div>
+    <h1>星瑶</h1>
+    <p>用账号把对话分开。</p>
+    <label for="who">账号</label>
+    <input id="who" name="who" autocomplete="username" value="木偶" required>
+    <label for="pass">密码</label>
+    <input id="pass" name="pass" type="password" autocomplete="current-password" placeholder="原型里随便填" required>
+    <button type="submit">进入</button>
+  </form></main>`;
+}
+function send(text) {
+  const clean = text.trim();
+  if (!clean) return;
+  if (state.screen === 'device') {
+    const t = threads[state.deviceId];
+    t.items.push({ role: 'user', text: clean });
+    t.items.push({ role: 'agent', text: '已转发到这台电脑。它在本机执行，服务器不看内容。' });
+  } else {
+    const c = chat();
+    if (c.title === '新对话') {
+      c.title = clean.length > 16 ? clean.slice(0, 16) + '…' : clean.split('\n')[0];
+      c.when = '刚刚';
+    }
+    c.items.push({ role: 'user', text: clean });
+    c.items.push({ role: 'agent', text: '收到。要改文件或访问外部时，我会先问你。' });
+  }
+  state.bottom = true;
+  state.focus = true;
+  render();
+}
+$('#app').addEventListener('change', (e) => {
+  if (e.target.id === 'model') {
+    state.model = e.target.value;
+    live('已选择 ' + state.model);
+  }
+});
+$('#app').addEventListener('click', (e) => {
+  const navBtn = e.target.closest('[data-nav]');
+  if (navBtn) {
+    const name = navBtn.dataset.nav;
+    if (name === 'chat') state.screen = 'list';
+    else if (name === 'approvals') {
+      state.screen = 'chat';
+      state.chatId = 'week';
+      state.bottom = true;
+      window.setTimeout(() => document.querySelector('.ask-card')?.scrollIntoView({ block: 'center' }), 0);
+    } else if (name === 'watch') {
+      state.screen = 'chat';
+      state.chatId = 'week';
+      chat().watchOpen = true;
+    } else state.screen = name;
+    state.notice = '';
+    render();
+    return;
+  }
+  const chatBtn = e.target.closest('[data-chat]');
+  if (chatBtn) {
+    state.chatId = chatBtn.dataset.chat;
+    state.screen = 'chat';
+    state.bottom = true;
+    render();
+    return;
+  }
+  const deviceBtn = e.target.closest('[data-device]');
+  if (deviceBtn) {
+    const d = devices.find((x) => x.id === deviceBtn.dataset.device);
+    if (!d.online) {
+      state.notice = '这台电脑没开。';
+      live(state.notice);
+      render();
+      return;
+    }
+    state.deviceId = d.id;
+    state.screen = 'device';
+    state.notice = '';
+    state.bottom = true;
+    render();
+    return;
+  }
+  const watch = e.target.closest('[data-watch]');
+  if (watch) {
+    chat().watchOpen = !chat().watchOpen;
+    render();
+    return;
+  }
+  const action = e.target.closest('[data-action]');
+  if (!action) return;
+  const name = action.dataset.action;
+  if (name === 'new') {
+    const id = 'c' + Date.now();
+    chats.unshift({ id, title: '新对话', when: '刚刚', approval: null, watchOpen: false, items: [] });
+    state.chatId = id;
+    state.screen = 'chat';
+    state.focus = true;
+    render();
+  } else if (name === 'computers') {
+    state.screen = 'computers';
+    state.notice = '';
+    render();
+  } else if (name === 'account') {
+    state.screen = 'account';
+    render();
+  } else if (name === 'back') goBack();
+  else if (name === 'allow' || name === 'deny' || name === 'stop') {
+    const c = chat();
+    c.approval = name === 'allow' ? 'allowed' : name === 'deny' ? 'denied' : 'stopped';
+    live(name === 'allow' ? '已保存' : name === 'deny' ? '没有保存' : '已停止');
+    render();
+  } else if (name === 'logout') {
+    state.loggedIn = false;
+    state.screen = 'login';
+    render();
+  }
+});
+$('#app').addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (e.target.id === 'login') {
+    state.account = $('#who').value.trim() || '木偶';
+    state.loggedIn = true;
+    state.screen = narrow() ? 'list' : 'chat';
+    live('已进入 ' + state.account);
+    render();
+    return;
+  }
+  if (e.target.id === 'composer') send($('#box').value);
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && state.screen !== 'chat' && state.screen !== 'list') goBack();
+  if (e.target.id === 'box' && e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send(e.target.value);
+  }
+});
+$('#wideBtn').addEventListener('click', () => { state.previewPhone = false; if (state.screen === 'list') state.screen = 'chat'; render(); });
+$('#phoneBtn').addEventListener('click', () => { state.previewPhone = true; render(); });
+smallScreen.addEventListener('change', () => {
+  if (smallScreen.matches && state.screen === 'chat') state.screen = 'list';
+  render();
+});
+if (smallScreen.matches) state.screen = 'list';
+render();
+</script>
+</body>
+</html>

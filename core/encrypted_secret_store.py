@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""带密钥的对称加解密模块。
-
-与 core.credentials.py 的 DPAPI/keyring 方案互补：DPAPI 把密钥托管给操作系统，
-本模块允许调用方显式提供口令（passphrase），由 PBKDF2-HMAC-SHA256 派生出
-AES-256-GCM 密钥，适合跨机器迁移、需要口令掌控权的场景。
-
-存储格式（全部为 ASCII，可直接写入 JSON）：
-    enc-v1:<base64(salt[16] || nonce[12] || ciphertext+tag)>
-- salt    ：每次加密随机生成（16 字节），保证相同口令+明文每次密文都不同
-- nonce   ：每次加密随机生成（12 字节），GCM 标准要求同一密钥下 nonce 不复用
-- tag     ：GCM 认证标签（16 字节），密文或密钥错误时解密必然失败
-"""
 from __future__ import annotations
 
 import base64
@@ -22,11 +10,10 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ENCRYPTED_PREFIX = "enc-v1:"
-SALT_SIZE = 16          # 字节
-NONCE_SIZE = 12         # 字节（GCM 推荐）
-KEY_SIZE = 32           # 字节，AES-256
-DEFAULT_KDF_ITERATIONS = 600_000  # OWASP 2023 对 PBKDF2-HMAC-SHA256 的推荐基线
-# derive_key() 省略 salt 时的常量盐（仅限便捷派生场景；正式加密一律随机盐）
+SALT_SIZE = 16
+NONCE_SIZE = 12
+KEY_SIZE = 32
+DEFAULT_KDF_ITERATIONS = 600_000
 _DEFAULT_KDF_SALT = b"Y-CODE-kdf-salt1"
 
 
@@ -35,11 +22,6 @@ def derive_key(
     salt: Optional[bytes] = None,
     iterations: int = DEFAULT_KDF_ITERATIONS,
 ) -> bytes:
-    """从口令 + 盐派生 32 字节 AES 密钥（确定性：同口令同盐必得同密钥）。
-
-    salt 未提供时使用固定应用常量盐：密钥派生仍有确定性，但安全性弱于
-    随机盐（无法抵抗彩虹表预计算），生产加密路径（encrypt/decrypt）始终显式传随机盐。
-    """
     if salt is None:
         salt = _DEFAULT_KDF_SALT
     if not isinstance(salt, (bytes, bytearray)) or len(salt) != SALT_SIZE:
@@ -73,7 +55,7 @@ class EncryptedSecretStore:
         nonce = os.urandom(NONCE_SIZE)
         key = derive_key(self._passphrase, salt, self._iterations)
         ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
-        payload = salt + nonce + ciphertext  # ciphertext 末尾已含 GCM tag
+        payload = salt + nonce + ciphertext
         return ENCRYPTED_PREFIX + base64.b64encode(payload).decode("ascii")
 
     def decrypt(self, token: str) -> str:
@@ -93,6 +75,5 @@ class EncryptedSecretStore:
         try:
             plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
         except InvalidTag as error:
-            # 密钥错误或密文被篡改；不回显任何明文/密文内容
             raise ValueError("解密失败：密钥错误或数据已被篡改") from error
         return plaintext.decode("utf-8")

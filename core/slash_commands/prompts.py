@@ -1,17 +1,5 @@
-"""提示词类斜杠命令的模板与展开函数。
-
-这些命令不直接执行本地动作，而是把用户参数填进一段固定的中文提示词，
-再当作一次普通回合交给模型。模板集中放这里，而不是散在 specs 的 handler
-里，是因为提示词是要反复打磨的文案：单独成文件便于 review 与调参，
-也避免 handler 与文案互相牵制。
-
-填充刻意使用 str.replace 而不是 str.format：模板里会出现 JSON 示例等
-字面花括号，format 会把它当成占位符而抛 KeyError。
-"""
-
 from typing import Dict
 
-# 命令名 -> 完整提示词模板，模板内用 {args} 标记用户参数位置。
 TEMPLATES: Dict[str, str] = {
     "/fix": (
         "请修复下面的问题。\n"
@@ -94,12 +82,6 @@ _DEFAULT_ARGS: Dict[str, str] = {
 
 
 def build_prompt(name: str, args: str) -> str:
-    """把用户参数填进对应模板，返回最终提示词；未知命令返回空串。
-
-    名称做去空格 + 小写归一，是因为 CLI 允许 `/FIX` 这类写法，且解析层已保证
-    大小写不敏感；返回空串而不是抛异常，是为了让入口统一走“未注册命令”分支，
-    不必为文案缺失写 try/except。
-    """
     key = str(name or "").strip().lower()
     template = TEMPLATES.get(key)
     if template is None:
@@ -109,5 +91,4 @@ def build_prompt(name: str, args: str) -> str:
     if not text:
         text = _DEFAULT_ARGS.get(key, "")
 
-    # 用 replace 而非 format：模板含字面花括号，format 会误判为占位符。
     return template.replace("{args}", text)

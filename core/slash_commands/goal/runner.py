@@ -1,12 +1,3 @@
-"""`/goal` 的完成判定与轮次循环：纯逻辑，不依赖 GUI / CLI。
-
-设计要点（设计文档 6.3 / 6.4）：
-  - `judge` 只做"这轮算不算达成"的三档判断，不含任何 IO 之外的知识；
-  - `run_goal_loop` 只编排"起一轮 → 判定 → 记历史"，具体怎么发起一轮由
-    `RoundExecutor` 适配层决定（GUI 走回合事件、CLI 走 msg_queue）。
-这样两端共享同一套循环语义，行为差异只可能出在适配层，便于定位。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -26,12 +17,8 @@ from core.slash_commands.goal.state import (
 
 logger = logging.getLogger(__name__)
 
-# 自评档的达成标记。用独立标签而不是"完成/已完成"这类词：模型正常叙述里随时
-# 可能出现那些词，标签是唯一的机器可判定信号。
 GOAL_ACHIEVED_MARKER = "<goal-status>achieved</goal-status>"
 
-# 历史摘要的字符上限：history 会随状态一起落盘并回显给用户，整段回复存进去会
-# 让 JSON 迅速膨胀（一轮可能上万字），摘要够用即可。
 _SUMMARY_LIMIT = 300
 
 
@@ -39,18 +26,13 @@ _SUMMARY_LIMIT = 300
 class RoundOutcome:
     """一轮执行的结果，由适配层（GUI/CLI executor）填充。"""
 
-    status: str = "completed"  # completed | cancelled | failed
+    status: str = "completed"
     reply_text: str = ""
     error: str = ""
     usage: dict = field(default_factory=dict)
 
 
 class RoundExecutor(Protocol):
-    """适配层需要实现的单轮执行协议。
-
-    只要求一个同步方法：循环本身跑在调用方（GUI 后台线程 / CLI daemon 线程）里，
-    核心层不引入线程，避免把线程模型绑进共享代码。
-    """
 
     def run_round(self, prompt: str, *, cancel_event) -> RoundOutcome:
         """执行一轮并把结果返回；取消时返回 status="cancelled"。"""
@@ -58,11 +40,6 @@ class RoundExecutor(Protocol):
 
 
 class _NeverCancelled:
-    """永不置位的取消信号。
-
-    让不关心取消的调用方（单测、一次性脚本）可以省略 cancel_event，同时循环里
-    不必到处判空。
-    """
 
     def is_set(self) -> bool:
         return False
@@ -122,11 +99,6 @@ def build_round_prompt(state: GoalState) -> str:
 
 
 def judge(state: GoalState, outcome: RoundOutcome, run_check=None) -> str:
-    """判断本轮结果，返回 "achieved" | "pending_confirm" | "continue"。
-
-    优先级按设计文档 6.3：有 check 就以退出码为准（可信），没有 check 才看自评
-    标记（不可信，需要用户确认）。两档都不成立就继续下一轮。
-    """
     if state.check:
         if run_check is None:
             # 配了 check 却没有执行器：判定不了，继续跑；绝不能拿自评标记冒充可信达成
@@ -181,12 +153,6 @@ def run_goal_loop(
     *,
     run_check=None,
 ) -> GoalState:
-    """驱动目标模式的多轮循环，返回收敛后的状态（同时已落盘）。
-
-    循环只依赖 `state.status` 与 `state.round` 两个量：所有退出路径都先改状态再
-    break，末尾统一判定 blocked，保证"转出循环"与"状态语义"一对一，不会出现
-    循环停了状态还写着 running。
-    """
     if cancel_event is None:
         cancel_event = _NeverCancelled()
 
@@ -197,15 +163,11 @@ def run_goal_loop(
 
         state.round += 1
         prompt = build_round_prompt(state)
-        # 本轮一开跑就写盘：GUI 状态条与 /goal status 读的是文件，若等收尾那次
-        # save，整个回合期间界面会一直停在上一轮的轮次（用户看到「第 0/10 轮」）。
         _persist(store, state)
 
         try:
             outcome = executor.run_round(prompt, cancel_event=cancel_event)
         except Exception as exc:  # noqa: BLE001 - 适配层任何异常都折算成本轮失败
-            # 不向上冒泡：目标循环多数跑在后台线程里，异常冒泡等于静默终止且状态
-            # 停在 running，用户既看不到错误也不知道要 resume。
             outcome = RoundOutcome(
                 status="failed", error=f"{type(exc).__name__}: {exc}"
             )
@@ -214,7 +176,6 @@ def run_goal_loop(
 
         outcome_status = str(outcome.status or "").strip().lower()
         if outcome_status == "cancelled":
-            # 用户中断：本轮不算进展，也不写 history，状态直接转 stopped
             state.status = STATUS_STOPPED
             break
 
@@ -247,7 +208,6 @@ def run_goal_loop(
         # verdict == "continue"：跑完最后一轮时由下方 blocked 兜底
 
     if state.status == STATUS_RUNNING and state.round >= state.max_rounds:
-        # 轮次耗尽仍未达成：转 blocked（可 resume），而不是假装还在跑
         state.status = STATUS_BLOCKED
 
     # 先落盘再发 finished：适配层收到 finished 后立刻查询状态/关面板，此时文件

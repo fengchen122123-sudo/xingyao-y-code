@@ -1,9 +1,3 @@
-"""状态栏闲置位展示实测吐字速度（t/s）的契约测试。
-
-速度只认 core.llm 的 step_metrics（上游 usage 的 completion_tokens ÷ 真实
-流式输出时长），未测到时显示 "-- t/s"，任何情况下都不按字符数估算。
-"""
-
 import pytest
 
 import main
@@ -25,7 +19,6 @@ def _step_metrics_event(payload, turn_id="turn-speed"):
 def test_format_token_speed_only_accepts_measured_positive_value():
     assert main._format_token_speed(42.34) == "42.3 t/s"
     assert main._format_token_speed(1) == "1.0 t/s"
-    # 未测到 / 非法值一律 --，不补 0.0 冒充实测
     assert main._format_token_speed(None) == "-- t/s"
     assert main._format_token_speed(0) == "-- t/s"
     assert main._format_token_speed(-3.2) == "-- t/s"
@@ -48,7 +41,6 @@ def test_idle_segment_without_measurement_shows_dash():
 
 @pytest.mark.parametrize("status", ["thinking", "executing"])
 def test_running_states_show_speed_without_status_text(status):
-    """运行中不再显示「思考中/正在干活」文字：速度滚动本身就是工作信号。"""
     text, style = main._compose_status_task_segment(status, 88.8)
     assert text == " 88.8 t/s "
     assert "思考" not in text and "干活" not in text
@@ -56,7 +48,6 @@ def test_running_states_show_speed_without_status_text(status):
 
 
 def test_waiting_still_keeps_actionable_status_text():
-    """等待授权确认必须保留文字：那一步需要用户动手，不能退化成速度。"""
     text, style = main._compose_status_task_segment("waiting", 88.8)
     assert text == " 等待授权确认... "
     assert style == "class:status.task_active"
@@ -104,6 +95,5 @@ def test_step_metrics_without_valid_speed_keeps_previous_value(monkeypatch):
     ):
         main._render_ui_event(_step_metrics_event(payload))
 
-    # 没有实测值时不覆盖、也不空转刷新
     assert main._last_token_speed == pytest.approx(12.5)
     assert app.invalidated == 0

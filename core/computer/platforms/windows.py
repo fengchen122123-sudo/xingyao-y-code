@@ -1,5 +1,3 @@
-"""Windows 接入层；执行依赖仅在相应方法调用时导入。"""
-
 import os
 import shutil
 
@@ -18,13 +16,15 @@ class WindowsPlatformAdapter:
     unavailable_reason = ""
 
     def find_browser_executable(self, browser: str) -> str:
+        # chromium 只给 Linux serve 用。Windows 列出它为不可用，不探测、不抛错。
+        if browser == "chromium":
+            return ""
         if browser not in _BROWSER_INSTALLS:
             raise ComputerControlError("computer_invalid_config", f"不支持的浏览器：{browser!r}")
         executable_name, relative_path = _BROWSER_INSTALLS[browser]
         executable = shutil.which(executable_name)
         if executable:
             return executable
-        # 同一浏览器依次检查原有安装位置，不跨浏览器或跨平台替换。
         for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
             root = os.environ.get(env_name)
             if root:

@@ -1,9 +1,3 @@
-"""电脑操控严格领域模型与动作解析测试（Task 2）。
-
-只覆盖 core.computer.models / core.computer.actions 的纯解析与值对象行为；
-不触碰真实键鼠、浏览器、截图或网络。
-"""
-
 import json
 from dataclasses import FrozenInstanceError
 
@@ -29,11 +23,6 @@ from core.computer.models import (
     ComputerRunStatus,
     ComputerTarget,
 )
-
-
-# ---------------------------------------------------------------------------
-# brief 样例测试（逐字）
-# ---------------------------------------------------------------------------
 
 
 def test_parse_click_requires_strict_integer_coordinates():
@@ -72,11 +61,6 @@ def test_parse_action_rejects_invalid_payload(payload):
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action(payload)
     assert raised.value.code == "computer_invalid_action"
-
-
-# ---------------------------------------------------------------------------
-# 每种合法动作的参数化覆盖
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("payload", [
@@ -120,11 +104,6 @@ def test_parse_drag_accepts_explicit_path_and_keeps_tuple_shape():
     assert all(type(point) is tuple for point in action.path)
 
 
-# ---------------------------------------------------------------------------
-# 未知字段 / 缺失字段 / 非法顶层形状
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("payload", [
     {"kind": "type_text", "target": "desktop", "text": "a", "extra": 1},
     {"kind": "keypress", "target": "desktop", "keys": ["A"], "x": 1},
@@ -142,16 +121,16 @@ def test_parse_rejects_unknown_fields(payload):
 
 
 @pytest.mark.parametrize("payload", [
-    {"target": "desktop"},                       # 缺 kind
-    {"kind": "click", "x": 1, "y": 2},           # 缺 target
-    {"kind": "click", "target": "desktop", "x": 1},          # 缺 y
-    {"kind": "move", "target": "desktop", "y": 2},           # 缺 x
-    {"kind": "type_text", "target": "desktop"},              # 缺 text
-    {"kind": "keypress", "target": "desktop"},               # 缺 keys
-    {"kind": "wait", "target": "desktop"},                   # 缺 duration_ms
-    {"kind": "navigate", "target": "browser"},               # 缺 url
-    {"kind": "request_user_takeover", "target": "browser"},  # 缺 reason_code
-    {"kind": "drag", "target": "desktop", "x": 1, "y": 2, "end_x": 3},  # 缺 end_y
+    {"target": "desktop"},
+    {"kind": "click", "x": 1, "y": 2},
+    {"kind": "click", "target": "desktop", "x": 1},
+    {"kind": "move", "target": "desktop", "y": 2},
+    {"kind": "type_text", "target": "desktop"},
+    {"kind": "keypress", "target": "desktop"},
+    {"kind": "wait", "target": "desktop"},
+    {"kind": "navigate", "target": "browser"},
+    {"kind": "request_user_takeover", "target": "browser"},
+    {"kind": "drag", "target": "desktop", "x": 1, "y": 2, "end_x": 3},
 ])
 def test_parse_rejects_missing_required_fields(payload):
     with pytest.raises(ComputerControlError) as raised:
@@ -173,11 +152,6 @@ def test_parse_rejects_invalid_envelope(payload):
     assert raised.value.code == "computer_invalid_action"
 
 
-# ---------------------------------------------------------------------------
-# bool 冒充 int / NaN / 非整数
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("payload", [
     {"kind": "click", "target": "desktop", "x": True, "y": 2},
     {"kind": "click", "target": "desktop", "x": 1, "y": False},
@@ -196,11 +170,6 @@ def test_parse_rejects_bool_float_nan_and_str_as_int(payload):
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action(payload)
     assert raised.value.code == "computer_invalid_action"
-
-
-# ---------------------------------------------------------------------------
-# drag 字段互斥与路径边界
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("payload", [
@@ -229,11 +198,6 @@ def test_parse_drag_accepts_path_size_bounds(size):
     assert len(action.path) == size
 
 
-# ---------------------------------------------------------------------------
-# text 8000 code point 边界
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("text", ["密" * 8000, "a"], ids=["exact-8000-cjk", "single-char"])
 def test_parse_type_text_accepts_up_to_8000_code_points(text):
     action = parse_computer_action({"kind": "type_text", "target": "desktop", "text": text})
@@ -251,11 +215,6 @@ def test_parse_type_text_rejects_out_of_range_or_non_string(text):
     assert raised.value.code == "computer_invalid_action"
 
 
-# ---------------------------------------------------------------------------
-# wait 100–10000 边界
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("duration_ms", [100, 5000, 10000])
 def test_parse_wait_accepts_duration_bounds(duration_ms):
     action = parse_computer_action(
@@ -271,11 +230,6 @@ def test_parse_wait_rejects_out_of_range_duration(duration_ms):
             {"kind": "wait", "target": "desktop", "duration_ms": duration_ms}
         )
     assert raised.value.code == "computer_invalid_action"
-
-
-# ---------------------------------------------------------------------------
-# keys 最多 8 个及白名单
-# ---------------------------------------------------------------------------
 
 
 def test_parse_keypress_accepts_at_most_eight_keys():
@@ -318,15 +272,9 @@ def test_parse_keypress_accepts_whitelisted_keys(keys):
     ["f1"],
 ], ids=["lower-ctrl", "lower-combo", "capitalized", "lower-f1"])
 def test_parse_keypress_rejects_non_canonical_key_case(keys):
-    """键名必须逐字匹配大写白名单，不做大小写归一（设计 21 禁止自动纠正）。"""
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action({"kind": "keypress", "target": "desktop", "keys": keys})
     assert raised.value.code == "computer_invalid_action"
-
-
-# ---------------------------------------------------------------------------
-# URL scheme 仅 http/https 且有 hostname；browser-only 导航
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("url", [
@@ -359,7 +307,6 @@ def test_parse_navigate_accepts_http_https_with_hostname(url):
     "broken-ipv6-literal", "non-numeric-port", "out-of-range-port",
 ])
 def test_parse_navigate_rejects_bad_url(url):
-    """非法 IPv6 字面量与非法端口也必须归为 computer_invalid_action，不得泄漏 ValueError。"""
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action({"kind": "navigate", "target": "browser", "url": url})
     assert raised.value.code == "computer_invalid_action"
@@ -380,11 +327,6 @@ def test_browser_only_navigation_rejects_desktop_target(kind):
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action(payload)
     assert raised.value.code == "computer_invalid_action"
-
-
-# ---------------------------------------------------------------------------
-# request_user_takeover reason_code 白名单
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("reason_code", [
@@ -408,11 +350,6 @@ def test_takeover_rejects_unregistered_reason_codes(reason_code):
     assert raised.value.code == "computer_invalid_action"
 
 
-# ---------------------------------------------------------------------------
-# button 白名单与鼠标 modifier
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("payload", [
     {"kind": "click", "target": "desktop", "x": 1, "y": 2, "button": ["left"]},
     {"kind": "click", "target": "desktop", "x": 1, "y": 2, "button": 1},
@@ -428,7 +365,6 @@ def test_takeover_rejects_unregistered_reason_codes(reason_code):
     "reason-list", "reason-int", "target-list", "target-int", "kind-list",
 ])
 def test_parse_rejects_unhashable_or_non_string_enum_values(payload):
-    """frozenset 成员判断遇到 list 等不可哈希值不得泄漏 TypeError。"""
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action(payload)
     assert raised.value.code == "computer_invalid_action"
@@ -445,11 +381,6 @@ def test_mouse_actions_reject_bad_button_and_modifier(payload):
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action(payload)
     assert raised.value.code == "computer_invalid_action"
-
-
-# ---------------------------------------------------------------------------
-# 值对象：错误类型、不可变性、隐私 repr
-# ---------------------------------------------------------------------------
 
 
 def test_control_error_str_is_chinese_message_and_details_default_empty():
@@ -504,14 +435,12 @@ def test_observation_repr_never_exposes_png_path():
 
 
 def test_observation_repr_never_exposes_page_text():
-    """B 方案：页面正文与截图路径同级别隐私，绝不进 repr（也就不进日志）。"""
     observation = _sample_observation(
         page_text="账户余额 123 元-秘密正文",
         screenshot_error="浏览器窗口不可见或被遮挡，本次未取到截图：TimeoutError",
     )
     assert "秘密正文" not in repr(observation)
     assert observation.page_text == "账户余额 123 元-秘密正文"
-    # 无截图原因只是简短说明，允许出现在 repr（不含正文/URL/堆栈）
     assert "TimeoutError" in repr(observation)
 
 
@@ -532,7 +461,7 @@ def test_observation_provider_projection_is_minimal_and_deterministic():
     blob = json.dumps(projection, sort_keys=True)
     assert "secret_capture" not in blob
     assert "png_path" not in blob
-    assert "path?x" not in blob  # 只含 origin，不含 query
+    assert "path?x" not in blob
 
 
 def test_observation_provider_projection_uses_window_summary_for_desktop():
@@ -561,7 +490,7 @@ def test_run_snapshot_public_dict_has_no_sensitive_fields():
     assert public["status"] == "running"
     for forbidden in ("text", "png", "png_path", "api_key", "cookie"):
         assert forbidden not in public
-    assert json.dumps(public)  # 可 JSON 序列化
+    assert json.dumps(public)
 
 
 def test_capability_and_enums_have_design_values():
@@ -577,13 +506,9 @@ def test_capability_and_enums_have_design_values():
         "observe", "click", "double_click", "move", "drag", "scroll",
         "type_text", "keypress", "wait", "navigate", "back", "forward", "reload",
         "request_user_takeover",
-        # R10 协议扩展（2026-09-05）：desktop 语义定位与局部观察。
         "list_surfaces", "activate_surface", "invoke_surface", "observe_region",
-        # 2026-09-06 协议扩展：sequence 批量微动作（提速计划 Task 1）。
         "sequence",
-        # 2026-09-06 协议扩展：UIA 元素观察与元素引用动作（提速计划 Task 10）。
         "list_elements", "click_element", "set_value_element",
-        # 2026-11-09 协议扩展（Windows-MCP 对齐）：desktop 条件等待。
         "wait_for",
     }
     capability = ComputerCapability(
@@ -641,23 +566,18 @@ def test_computer_action_tool_schema_shape():
     assert "完成任务后输出正常最终结论，不继续无意义观察" in description
 
 
-# ---------------------------------------------------------------------------
-# R7：滚动单位/方向契约（css_pixel vs wheel_step，正方向向右/向下）
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("payload", [
-    {"kind": "scroll", "target": "browser", "delta_x": 4001},                 # 超像素上限
+    {"kind": "scroll", "target": "browser", "delta_x": 4001},
     {"kind": "scroll", "target": "browser", "delta_y": -4001},
-    {"kind": "scroll", "target": "desktop", "delta_y": 11},                   # 超步进上限
+    {"kind": "scroll", "target": "desktop", "delta_y": 11},
     {"kind": "scroll", "target": "desktop", "delta_x": -11},
-    {"kind": "scroll", "target": "browser"},                                  # 两轴为零
+    {"kind": "scroll", "target": "browser"},
     {"kind": "scroll", "target": "desktop", "delta_x": 0, "delta_y": 0},
-    {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": "wheel_step"},  # 单位与 target 不匹配
+    {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": "wheel_step"},
     {"kind": "scroll", "target": "desktop", "delta_y": 1, "unit": "css_pixel"},
-    {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": "pixel"},        # 未知单位
+    {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": "pixel"},
     {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": True},
-    {"kind": "scroll", "target": "desktop", "delta_y": -240},                 # 旧像素值在桌面超限
+    {"kind": "scroll", "target": "desktop", "delta_y": -240},
 ])
 def test_parse_rejects_scroll_unit_range_and_zero_violations(payload):
     with pytest.raises(ComputerControlError) as raised:

@@ -1,5 +1,3 @@
-"""GitStateMonitor 测试（规格 §10/§17.2，真实临时仓库 + 快轮询）。"""
-
 import threading
 import time
 
@@ -47,8 +45,7 @@ def test_external_switch_notifies_within_deadline(env):
     run_git(repo, "branch", "feature/switched")
     collector = _Collector()
     monitor.subscribe(identity.workspace_path, collector)
-    time.sleep(0.2)  # 建立基线指纹
-    # 外部终端切换分支（真实 git 进程）
+    time.sleep(0.2)
     run_git(repo, "checkout", "-q", "feature/switched")
     assert collector.wait_count(1, timeout=2.0), "外部切换应在 ~1 秒内触发失效通知"
 
@@ -124,7 +121,6 @@ def test_linked_worktree_gitdir_file_probing(tmp_path):
         collector = _Collector()
         monitor.subscribe(str(linked), collector)
         time.sleep(0.2)
-        # 在 linked worktree 内提交（其 .git 是文件 + gitdir: 指针）
         make_commit(linked, "in linked wt")
         assert collector.wait_count(1, timeout=2.0)
     finally:
@@ -141,7 +137,7 @@ def test_unreadable_workspace_does_not_crash(tmp_path):
         import shutil
 
         shutil.rmtree(missing)
-        time.sleep(0.3)  # 探测目录消失不崩溃
+        time.sleep(0.3)
         assert monitor.subscriber_count(str(missing)) == 1
     finally:
         monitor.stop()

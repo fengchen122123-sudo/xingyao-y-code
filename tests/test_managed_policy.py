@@ -1,18 +1,3 @@
-"""tests/test_managed_policy.py — T6 受管策略层（借鉴 Codex requirements.toml）。
-
-验收面：
-- 受管 > 用户优先级成立（读取链降档）；
-- 请求超限被降档且留警告；
-- disabled_tools 工具在注册表不可用；
-- 受管文件缺失时零行为变化。
-
-隔离策略（沿用 tests/test_config_toml_overlay.py 的既有手法）：
-- ``YCODE_MANAGED_FILE`` 指向 pytest tmp_path 下的 managed.json；
-- ``config._CONFIG_FILE`` / ``config._TOML_CONFIG_FILE`` 指向 tmp_path；
-- 每个用例前后清空 config 的 mtime 缓存与 managed_policy 的进程内状态；
-- 不写 providers 数组，避开 DPAPI 加解密路径。
-"""
-
 import json
 import os
 from pathlib import Path
@@ -44,7 +29,6 @@ def _read_config(path):
 
 @pytest.fixture
 def managed_env(tmp_path, monkeypatch):
-    """隔离 config 与受管文件路径；返回 (managed.json 路径, config.json 路径)。"""
     managed_file = tmp_path / "managed.json"
     cfg_path = tmp_path / "config.json"
     toml_path = tmp_path / "config.toml"
@@ -62,7 +46,6 @@ def managed_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def captured_warnings(monkeypatch):
-    """捕获 managed_policy 的运行告警文本（不落真实日志）。"""
     captured = []
     monkeypatch.setattr(
         managed_policy,
@@ -71,10 +54,6 @@ def captured_warnings(monkeypatch):
     )
     return captured
 
-
-# ---------------------------------------------------------------------------
-# 受管文件定位与读取
-# ---------------------------------------------------------------------------
 
 def test_env_override_controls_managed_path(managed_env):
     managed_file, _ = managed_env
@@ -93,7 +72,6 @@ def test_default_managed_path_by_platform(monkeypatch):
 
 
 def test_missing_managed_file_is_noop(managed_env, captured_warnings):
-    """验收④：受管文件缺失时读取链与现状完全一致，且不产生任何告警。"""
     managed_file, cfg_path = managed_env
     assert not managed_file.exists()
     _write_config(cfg_path, {"permission_mode": "full", "theme": "cyan"})
@@ -119,10 +97,6 @@ def test_non_object_managed_json_returns_empty(managed_env, captured_warnings):
     assert any("managed.json" in warning for warning in captured_warnings)
 
 
-# ---------------------------------------------------------------------------
-# apply_managed_policy：纯函数语义与降档
-# ---------------------------------------------------------------------------
-
 def test_apply_clamps_over_ceiling_mode(managed_env, captured_warnings):
     data = {"permission_mode": "full", "theme": "cyan"}
     policy = {"permission_mode_max": "accept_edits"}
@@ -131,7 +105,7 @@ def test_apply_clamps_over_ceiling_mode(managed_env, captured_warnings):
 
     assert result["permission_mode"] == "accept_edits"
     assert result["theme"] == "cyan"
-    assert data["permission_mode"] == "full"  # 不污染入参
+    assert data["permission_mode"] == "full"
     assert any("降档" in warning and "accept_edits" in warning for warning in captured_warnings)
 
 
@@ -162,12 +136,7 @@ def test_apply_invalid_ceiling_value_ignored_with_warning(managed_env, captured_
     assert any("permission_mode_max" in warning for warning in captured_warnings)
 
 
-# ---------------------------------------------------------------------------
-# config 读取链：受管 > 用户
-# ---------------------------------------------------------------------------
-
 def test_config_load_downgrades_mode_above_ceiling(managed_env, captured_warnings):
-    """验收①②：用户配置 full 被受管上限压到 accept_edits，并留下降档警告。"""
     managed_file, cfg_path = managed_env
     _write_config(cfg_path, {"permission_mode": "full", "theme": "mine"})
     _write_managed(managed_file, {"permission_mode_max": "accept_edits"})
@@ -188,7 +157,6 @@ def test_config_load_keeps_user_mode_within_ceiling(managed_env):
 
 
 def test_config_load_managed_ceiling_beats_toml_overlay(managed_env):
-    """TOML overlay 是用户可写的读取覆盖层，同样不得绕过受管上限。"""
     managed_file, cfg_path = managed_env
     _write_config(cfg_path, {"permission_mode": "confirm"})
     Path(config._TOML_CONFIG_FILE).write_text(
@@ -198,10 +166,6 @@ def test_config_load_managed_ceiling_beats_toml_overlay(managed_env):
 
     assert config._load()["permission_mode"] == "accept_edits"
 
-
-# ---------------------------------------------------------------------------
-# 保存流程：受管锁定键写入拒绝
-# ---------------------------------------------------------------------------
 
 def test_save_config_value_rejects_over_ceiling_mode(managed_env, captured_warnings):
     managed_file, cfg_path = managed_env
@@ -242,12 +206,7 @@ def test_update_config_rejects_over_ceiling_mode_but_writes_other_keys(
     assert any("由管理员锁定" in warning for warning in captured_warnings)
 
 
-# ---------------------------------------------------------------------------
-# 权限消费方：模式上限校验（降档 + 警告）
-# ---------------------------------------------------------------------------
-
 def test_get_permission_mode_downgrades_and_warns_once(managed_env, captured_warnings):
-    """验收②：运行时请求 full 也被降档；同一降档只留一条警告（防刷屏）。"""
     managed_file, _ = managed_env
     _write_managed(managed_file, {"permission_mode_max": "accept_edits"})
 
@@ -260,7 +219,6 @@ def test_get_permission_mode_downgrades_and_warns_once(managed_env, captured_war
 
 
 def test_downgraded_mode_changes_permission_decision(managed_env):
-    """降档后的模式进入权限决策：full 对敏感变更自动放行，降为 accept_edits 后必须询问。"""
     managed_file, _ = managed_env
     _write_managed(managed_file, {"permission_mode_max": "accept_edits"})
 
@@ -276,19 +234,13 @@ def test_downgraded_mode_changes_permission_decision(managed_env):
 
 
 def test_get_permission_mode_unchanged_without_managed_file(managed_env, captured_warnings):
-    """验收④：无受管文件时权限模式读取零变化。"""
     app_context.set_permission_mode("full")
 
     assert app_context.get_permission_mode() == "full"
     assert captured_warnings == []
 
 
-# ---------------------------------------------------------------------------
-# 工具注册：disabled_tools 过滤
-# ---------------------------------------------------------------------------
-
 def test_disabled_tools_removed_from_registry(managed_env):
-    """验收③：禁用工具不在可用列表（schema / all / get / execute 全链路）。"""
     managed_file, _ = managed_env
     _write_managed(managed_file, {"disabled_tools": ["read_file"]})
 
@@ -296,7 +248,7 @@ def test_disabled_tools_removed_from_registry(managed_env):
 
     names = [spec.name for spec in registry.all()]
     assert "read_file" not in names
-    assert "write_file" in names  # 未禁用的工具保留
+    assert "write_file" in names
     with pytest.raises(KeyError):
         registry.get("read_file")
     assert "read_file" not in [schema["function"]["name"] for schema in registry.api_schemas()]
@@ -305,7 +257,6 @@ def test_disabled_tools_removed_from_registry(managed_env):
 
 
 def test_disabled_tools_absent_keeps_registry_intact(managed_env):
-    """验收④：无受管文件时工具注册表与现状一致。"""
     registry = build_default_registry()
 
     assert registry.get("read_file").name == "read_file"
@@ -323,7 +274,7 @@ def test_disabled_tools_unknown_names_ignored(managed_env):
 
 def test_disabled_tools_invalid_type_does_not_break_registry(managed_env, captured_warnings):
     managed_file, _ = managed_env
-    _write_managed(managed_file, {"disabled_tools": "read_file"})  # 应为字符串列表
+    _write_managed(managed_file, {"disabled_tools": "read_file"})
 
     registry = build_default_registry()
 

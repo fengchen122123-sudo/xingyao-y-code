@@ -1,4 +1,3 @@
-// gitStore 单元测试（规格 §17.3 前端测试选集：状态分组 / 外部事件刷新 / 确认流程）
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useGitStore } from './gitStore';
@@ -107,7 +106,6 @@ describe('gitStore', () => {
     store.onExternalChange({ workspace: 'E:/proj' });
     await new Promise((r) => setTimeout(r, 0));
     expect(get_status).toHaveBeenCalledTimes(2);
-    // 其他 Worktree 的事件不触发本工作区刷新
     store.onExternalChange({ workspace: 'E:/other' });
     await new Promise((r) => setTimeout(r, 0));
     expect(get_status).toHaveBeenCalledTimes(2);
@@ -119,9 +117,6 @@ describe('gitStore', () => {
   });
 
   it('切会话后在途的旧工作区快照响应被丢弃，不串台分支角标', async () => {
-    // 复现路径：项目会话（大仓库）快照请求在途 → 切到公共对话（workdir 清空
-    // 并 $reset）→ 旧响应迟到落地。无串号防护时旧仓库快照会重新填入 snapshot，
-    // 公共对话持续显示上一个项目的分支（git_get_status 实测秒级，窗口很大）
     let resolveStale!: () => void;
     const staleGate = new Promise<void>((resolve) => { resolveStale = resolve; });
     const get_status = vi.fn()
@@ -158,7 +153,6 @@ describe('gitStore', () => {
     });
     const store = useGitStore();
     const stale = store.ensureLoaded('E:/proj');
-    // 模拟 App.vue 切到 GLOBAL 会话：workdir 置空 + $reset
     store.workdir = '';
     store.$reset();
     resolveStale();
@@ -235,5 +229,36 @@ describe('gitStore', () => {
     await store.executeConfirmed('reset_hard', { target: 'HEAD~1' }, 'tok-1');
     expect(git_confirm_operation).toHaveBeenCalledWith('E:/proj', 'reset_hard', { target: 'HEAD~1' }, 'tok-1');
     expect(store.pendingConfirm).toBeNull();
+  });
+
+  it('unstageAll 将全部已暂存路径传给 git_unstage 并在空暂存时跳过请求', async () => {
+    const git_unstage = vi.fn().mockResolvedValue({ ok: true, snapshot: fakeSnapshot({ staged: [] }) });
+    mockApi({
+      git_get_status: vi.fn().mockResolvedValue({ ok: true, snapshot: fakeSnapshot() }),
+      git_get_trust: vi.fn().mockResolvedValue({ ok: true, level: 'trusted' }),
+      git_unstage,
+    });
+    const store = useGitStore();
+    await store.ensureLoaded('E:/proj');
+    await store.unstageAll();
+    expect(git_unstage).toHaveBeenCalledWith('E:/proj', ['a.py']);
+    await store.unstageAll();
+    expect(git_unstage).toHaveBeenCalledTimes(1);
+  });
+
+  it('loadCommitDiff 按提交区间加载 Diff 并更新状态', async () => {
+    const diffDoc = { raw_text: '+x', is_binary: false, hunks: [] };
+    const git_load_diff = vi.fn().mockResolvedValue({ ok: true, diff: diffDoc });
+    mockApi({
+      git_get_status: vi.fn().mockResolvedValue({ ok: true, snapshot: fakeSnapshot() }),
+      git_get_trust: vi.fn().mockResolvedValue({ ok: true, level: 'trusted' }),
+      git_load_diff,
+    });
+    const store = useGitStore();
+    await store.ensureLoaded('E:/proj');
+    await store.loadCommitDiff('p123', 'c456');
+    expect(git_load_diff).toHaveBeenCalledWith('E:/proj', '', false, 'p123', 'c456');
+    expect(store.selectedPath).toBe('commit:c456');
+    expect(store.diff).toEqual(diffDoc);
   });
 });

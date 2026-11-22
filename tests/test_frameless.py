@@ -14,7 +14,6 @@ from gui_bridge import ApiBridge
 
 
 def test_suppress_frame_border_passes_dwm_color_none(monkeypatch):
-    """防止把主题色重新画成可见的 DWM 外框。"""
     fake_dwm = SimpleNamespace(
         DwmExtendFrameIntoClientArea=Mock(return_value=0),
         DwmSetWindowAttribute=Mock(return_value=0),
@@ -24,7 +23,6 @@ def test_suppress_frame_border_passes_dwm_color_none(monkeypatch):
         "windll",
         SimpleNamespace(dwmapi=fake_dwm),
     )
-    # 版本判断影响 Win10/Win11 分支（margins 不同），固定 Win11 保证跨 OS 可重复
     monkeypatch.setattr(
         frameless,
         "sys",
@@ -52,7 +50,6 @@ def test_suppress_frame_border_passes_dwm_color_none(monkeypatch):
 
 
 def test_suppress_frame_border_requests_standard_rounded_corners(monkeypatch):
-    """隐藏 DWM 外框时仍须显式保留 Windows 11 标准窗口圆角。"""
     fake_dwm = SimpleNamespace(
         DwmExtendFrameIntoClientArea=Mock(return_value=0),
         DwmSetWindowAttribute=Mock(return_value=0),
@@ -82,7 +79,6 @@ def test_suppress_frame_border_requests_standard_rounded_corners(monkeypatch):
 
 
 def test_suppress_frame_border_clears_pywebview_extended_glass_margin(monkeypatch):
-    """隐藏外框时必须撤销 pywebview 为 shadow=True 延伸进客户区的 1px frame。"""
     fake_dwm = SimpleNamespace(
         DwmExtendFrameIntoClientArea=Mock(return_value=0),
         DwmSetWindowAttribute=Mock(return_value=0),
@@ -92,7 +88,6 @@ def test_suppress_frame_border_clears_pywebview_extended_glass_margin(monkeypatc
         "windll",
         SimpleNamespace(dwmapi=fake_dwm),
     )
-    # 版本判断影响 Win10/Win11 分支（margins 不同），固定 Win11 保证跨 OS 可重复
     monkeypatch.setattr(
         frameless,
         "sys",
@@ -117,7 +112,6 @@ def test_suppress_frame_border_clears_pywebview_extended_glass_margin(monkeypatc
 
 
 def test_main_window_disables_pywebview_shadow_extension(monkeypatch):
-    """窗口创建时应从源头禁用 pywebview 的 1px DWM glass margin。"""
     created = object()
     create_window = Mock(return_value=created)
     monkeypatch.setattr(gui_main, "webview", SimpleNamespace(create_window=create_window))
@@ -130,7 +124,6 @@ def test_main_window_disables_pywebview_shadow_extension(monkeypatch):
 
 
 def test_suppress_frame_border_reports_unsupported_before_windows_11(monkeypatch):
-    """Win10 不支持 DWMWA_BORDER_COLOR，必须显式返回 unsupported 而非假成功。"""
     fake_dwm = SimpleNamespace(
         DwmExtendFrameIntoClientArea=Mock(return_value=0),
         DwmSetWindowAttribute=Mock(return_value=0),
@@ -166,7 +159,6 @@ def test_suppress_frame_border_reports_unsupported_before_windows_11(monkeypatch
 
 
 def test_frameless_frame_reapply_hides_border_instead_of_repainting_it(monkeypatch):
-    """窗口 shown/restored 后不得通过标题栏重放让 DWM 外框复活。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._window = SimpleNamespace(frameless=True)
     bridge._hwnd = 321
@@ -190,7 +182,6 @@ def test_frameless_frame_reapply_hides_border_instead_of_repainting_it(monkeypat
 
 
 def test_frameless_theme_preview_does_not_paint_a_visible_resize_band(monkeypatch):
-    """透明页面热区负责 resize 后，主题预览不应依赖宿主 Form 边带。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._hwnd = 321
     bridge._window = SimpleNamespace(frameless=True)
@@ -203,7 +194,6 @@ def test_frameless_theme_preview_does_not_paint_a_visible_resize_band(monkeypatc
 
 
 def test_native_window_install_keeps_webview_full_bleed(monkeypatch):
-    """透明页面热区接管 resize 后，原生安装不得再缩进 WebView 形成可见边带。"""
     class EventHook:
         def __iadd__(self, _callback):
             return self
@@ -244,12 +234,6 @@ def test_native_window_install_keeps_webview_full_bleed(monkeypatch):
 
 
 def test_hit_test_leaves_titlebar_area_to_webview(monkeypatch):
-    """标题栏拖拽区命中必须保持 HTCLIENT，不得拦截为 HTCAPTION/HTTRANSPARENT。
-
-    实测 HTCAPTION 拦截从未承接交互（双击/拖动全部走 DOM），只会在手势
-    进行中间歇把 mousemove/mouseup 抖动路由为非客户区消息，导致快速拖动
-    失效并闪现禁用光标。标题栏交互统一由前端 DOM 事件驱动。
-    """
 
     class EventHook:
         def __iadd__(self, _callback):
@@ -275,7 +259,6 @@ def test_hit_test_leaves_titlebar_area_to_webview(monkeypatch):
         SizeChanged=EventHook(),
     )
     def screen_to_client(_hwnd, point_ptr):
-        # 测试窗口原点在 (0,0)：屏幕坐标即客户区坐标
         return True
 
     user32 = SimpleNamespace(
@@ -305,7 +288,6 @@ def test_hit_test_leaves_titlebar_area_to_webview(monkeypatch):
 
     assert frameless.enable_native_window_behaviors(form) is True
 
-    # 标题栏区域中部（屏幕坐标 600,30），距 3px 边缘之外：父/子窗口过程都应放行
     parent_proc = frameless._WNDPROC(installed[123])
     child_proc = frameless._WNDPROC(installed[456])
     lparam = (30 << 16) | 600
@@ -314,7 +296,6 @@ def test_hit_test_leaves_titlebar_area_to_webview(monkeypatch):
 
 
 def _make_fake_user32(cursor, monitor_rect, monitor=1):
-    """构造 _cursor_snap_vk 所需的最小 user32 桩：光标坐标 + 所在显示器边界。"""
 
     def get_cursor_pos(point_ptr):
         pt = ctypes.cast(point_ptr, ctypes.POINTER(ctypes.wintypes.POINT)).contents
@@ -346,19 +327,15 @@ def _make_fake_user32(cursor, monitor_rect, monitor=1):
         ((500, -500), (0, -1080, 1920, 0), None),
         # 第二屏在右边中间：原 bug 会误判 point.x >= 主屏宽-2 → 贴右边
         ((2500, 500), (1920, 0, 3840, 1080), None),
-        # 主屏正常贴左/右/上边缘
         ((0, 500), (0, 0, 1920, 1080), 0x25),
         ((1919, 500), (0, 0, 1920, 1080), 0x27),
         ((500, 0), (0, 0, 1920, 1080), 0x26),
-        # 第二屏的真实边缘仍应正确触发
         ((3839, 500), (1920, 0, 3840, 1080), 0x27),
         ((-1919, 500), (-1920, 0, 0, 1080), 0x25),
-        # 第二屏在上方（负 y）顶边：贴顶必须触发最大化，而非被主屏原点误判吞掉
         ((500, -1079), (0, -1080, 1920, 0), 0x26),
     ],
 )
 def test_cursor_snap_vk_uses_monitor_bounds(monkeypatch, cursor, monitor_rect, expected):
-    """多显示器下贴边判定必须相对光标所在显示器，而非主屏原点/宽度。"""
     monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
     monkeypatch.setattr(
         gui_bridge.ctypes,
@@ -370,7 +347,6 @@ def test_cursor_snap_vk_uses_monitor_bounds(monkeypatch, cursor, monitor_rect, e
 
 
 def test_frameless_preview_fails_when_dwm_border_cannot_be_hidden(monkeypatch):
-    """Windows 11 的 DWM 写入失败不能被伪装成主题预览成功。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._window = SimpleNamespace(frameless=True)
     bridge._hwnd = 321
@@ -399,7 +375,6 @@ def test_frameless_preview_fails_when_dwm_border_cannot_be_hidden(monkeypatch):
     ],
 )
 def test_window_begin_resize_starts_the_native_resize_loop(monkeypatch, edge, size_code):
-    """页面透明热区必须通过 GUI 线程进入 Windows 原生八方向 resize 循环。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._hwnd = 321
     bridge._browser_form = SimpleNamespace(Invoke=lambda callback: callback())
@@ -424,7 +399,6 @@ def test_window_begin_resize_starts_the_native_resize_loop(monkeypatch, edge, si
 
 
 def test_window_begin_resize_rejects_maximized_window_inside_gui_thread(monkeypatch):
-    """最大化检查必须发生在 GUI delegate 内，且不得启动系统 resize。"""
     in_invoke = {"value": False}
 
     def invoke(callback):
@@ -462,7 +436,6 @@ def test_window_begin_resize_rejects_maximized_window_inside_gui_thread(monkeypa
 
 
 def test_window_begin_drag_rejects_released_left_button(monkeypatch):
-    """左键已松开时拒绝过期拖动请求，绝不进入原生 SC_MOVE 移动循环。"""
     in_gui_thread = {"value": False}
     checked_in_gui_thread = []
 
@@ -475,7 +448,7 @@ def test_window_begin_drag_rejects_released_left_button(monkeypatch):
 
     def get_async_key_state(_vk):
         checked_in_gui_thread.append(in_gui_thread["value"])
-        return 0x0000  # VK_LBUTTON 未按下
+        return 0x0000
 
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._hwnd = 321
@@ -499,12 +472,10 @@ def test_window_begin_drag_rejects_released_left_button(monkeypatch):
     assert result == {"ok": False, "error": "left_button_released"}
     user32.ReleaseCapture.assert_not_called()
     user32.SendMessageW.assert_not_called()
-    # 状态守卫必须位于 GUI 线程回调内部，而非桥请求线程提前检查
     assert checked_in_gui_thread and all(checked_in_gui_thread)
 
 
 def test_window_begin_drag_starts_native_move_when_left_button_down(monkeypatch):
-    """左键仍按下时保持原生移动循环与贴边快捷处理。"""
     in_gui_thread = {"value": False}
     checked_in_gui_thread = []
 
@@ -517,7 +488,7 @@ def test_window_begin_drag_starts_native_move_when_left_button_down(monkeypatch)
 
     def get_async_key_state(_vk):
         checked_in_gui_thread.append(in_gui_thread["value"])
-        return 0x8000  # VK_LBUTTON 按下
+        return 0x8000
 
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._hwnd = 321
@@ -545,7 +516,6 @@ def test_window_begin_drag_starts_native_move_when_left_button_down(monkeypatch)
 
 
 def test_frameless_reapply_continues_after_a_transient_dwm_failure(monkeypatch):
-    """一次 DWM 瞬态失败不得吞掉后续延迟重放机会。"""
     bridge = ApiBridge.__new__(ApiBridge)
     calls = []
 
@@ -564,7 +534,6 @@ def test_frameless_reapply_continues_after_a_transient_dwm_failure(monkeypatch):
 
 
 def test_frameless_startup_uses_complete_frame_application(monkeypatch):
-    """句柄就绪后必须立即启用 resize 并清除全部 DWM frame 绘制。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._window = SimpleNamespace(title="Y-CODE", frameless=True)
     bridge._native_titlebar = copy.deepcopy(
@@ -593,13 +562,6 @@ def test_frameless_startup_uses_complete_frame_application(monkeypatch):
 
 
 def test_getminmaxinfo_clamps_maximize_to_monitor_work_area(monkeypatch):
-    """WM_GETMINMAXINFO 必须把最大尺寸/位置钳制到所在显示器工作区（排除任务栏）。
-
-    这是 frameless 窗口最大化不遮挡任务栏的核心：系统原生最大化
-    （SC_MAXIMIZE/Aero Snap/双击标题栏）读取 ptMaxSize/ptMaxPosition 决定
-    最大化窗口的位置与尺寸，默认按 rcMonitor 全屏（连任务栏一起盖）。
-    多显示器下必须按窗口所在显示器（MonitorFromWindow）计算。
-    """
     installed: dict[int, int] = {}
 
     def set_window_long_ptr(hwnd, _index, proc_addr):
@@ -608,8 +570,6 @@ def test_getminmaxinfo_clamps_maximize_to_monitor_work_area(monkeypatch):
 
     def get_monitor_info(_mon, mi_ptr):
         mi = ctypes.cast(mi_ptr, ctypes.POINTER(frameless._MONITORINFO)).contents
-        # 第二屏（主屏上方，负 y）：显示器 rcMonitor=(0,-1080,1920,0)，
-        # 工作区底部留 40px 任务栏 → rcWork=(0,-1080,1920,-40)
         mi.rcMonitor.left, mi.rcMonitor.top = 0, -1080
         mi.rcMonitor.right, mi.rcMonitor.bottom = 1920, 0
         mi.rcWork.left, mi.rcWork.top = 0, -1080
@@ -647,8 +607,6 @@ def test_getminmaxinfo_clamps_maximize_to_monitor_work_area(monkeypatch):
     result = parent_proc(123, frameless.WM_GETMINMAXINFO, 0, mmi_ptr)
     assert result == 0
 
-    # ptMaxPosition 是工作区相对 rcMonitor 左上角的偏移（多屏下可为负）
     assert (mmi.ptMaxPosition.x, mmi.ptMaxPosition.y) == (0, 0)
-    # ptMaxSize 是工作区宽高（1920x1040，底部 40px 任务栏被排除）
     assert (mmi.ptMaxSize.x, mmi.ptMaxSize.y) == (1920, 1040)
     user32.MonitorFromWindow.assert_called_once_with(123, 2)

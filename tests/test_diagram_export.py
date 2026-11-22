@@ -1,5 +1,3 @@
-"""core.diagram_export 的提取 / 转义 / HTML 生成 / 命令处理单测。"""
-
 from __future__ import annotations
 
 import sys
@@ -56,7 +54,6 @@ def test_extract_empty_block_skipped():
 
 
 def test_extract_requires_exact_lang():
-    # mermaidish / mermaid-2 等变体语言名不命中
     text = "```mermaidish\ngraph TD\n```\n\n```mermaid-x\nA\n```"
     assert de.extract_mermaid_blocks(text) == []
 
@@ -75,13 +72,9 @@ def test_export_writes_html_with_escaped_source(diagrams_dir):
     assert path.parent == diagrams_dir
     assert path.is_file()
     html_text = path.read_text(encoding="utf-8")
-    # 渲染器 script 必须是顶级的真实标签：模板不得把含 <script> 的 token
-    # 再包进一层 <script>（嵌套会被 HTML 解析器当 JS 文本，渲染器永不加载）
     assert "<script><script" not in html_text
-    # 源码必须以转义后的形式出现：<img 被转为 &lt;img，事件属性不再可执行
     assert "<img" not in html_text
     assert "&lt;img" in html_text
-    # strict 安全模式 + CSP + 本地渲染器引用
     assert "securityLevel: \"strict\"" in html_text
     assert "Content-Security-Policy" in html_text
     assert "vendor/mermaid/mermaid-11.17.2.min.js" in html_text
@@ -94,9 +87,6 @@ def test_export_multiple_blocks_numbered(diagrams_dir):
 
 
 def test_realistic_assistant_block_triggers_export(diagrams_dir):
-    # 模拟 CLI 实际会收到的完整正文块：散文 + 带 <br/> 换行与 style 填色的
-    # mermaid 块 + 收尾散文（正是 _render_public_answer_block 收到的形态），
-    # 回归用户实测"没有提示"的场景
     text = (
         "流程核心要点：\n\n"
         "```mermaid\n"
@@ -128,8 +118,6 @@ def test_export_unique_filenames(diagrams_dir):
 
 
 def test_render_fallback_when_js_missing(monkeypatch, diagrams_dir):
-    # 渲染器文件缺失时：不得输出空 src 的 script 标签（会回读页面自身当 JS），
-    # 且页面自带 no-mermaid 置位脚本保证源码兜底展示
     monkeypatch.setattr(de, "get_mermaid_js_path", lambda: None)
     text = f"```mermaid\n{FLOWCHART}\n```"
     path, _ = de.export_diagram_html(text)

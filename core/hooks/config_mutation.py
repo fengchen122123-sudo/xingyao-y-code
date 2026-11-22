@@ -1,34 +1,3 @@
-"""Hooks 配置变更（GUI 管理页「新建 / 编辑 / 删除 / 启停」的写入侧）。
-
-为什么需要独立的写入模块：``registry`` 只负责只读加载（且对坏条目「跳过」），
-``trust`` 只负责信任状态；GUI 管理页要改动磁盘上的两级 ``hooks.json``。若各
-调用方自行写文件，极易与 ``HookRegistry._parse_entry`` 的归一化口径漂移——
-写出的条目 registry 读不出、或 digest 对不上（信任记录指向幽灵条目）。本模块
-把「写」收敛到一处，并显式复用 registry / trust 的同一套口径：
-
-- 字段级归一化（matcher strip、timeout_ms int 转换 + 上限截断）与
-  ``HookRegistry._parse_entry`` 逐条对齐，保证「registry 加载出的 digest」
-  一定能被本模块定位（测试用「往返一致性」用例锁定该约束）；
-- digest 直接调用 ``trust.compute_hook_digest``，字段集合与 registry 一致
-  （只有 event/command/matcher/timeout_ms 参与，disabled/status_message 不参与）。
-
-设计约束：
-
-- 三个公开函数一律返回 ``tuple[bool, str]`` 且**绝不抛异常**：调用方是 GUI
-  事件回调，异常会让管理页崩在用户操作上；错误以可展示的中文原因返回。
-- 写入用「临时文件 + ``os.replace``」原子替换（与 ``HookTrustStore._save``
-  同模式），避免 registry / 执行侧读到半截 JSON——写坏配置文件等于让全部
-  hook 静默失效。
-- 保持文件干净：字段等于默认值时不落盘（``matcher:"*"`` / ``timeout_ms:60000``
-  / 空 ``status_message``），文件只表达「与默认不同的部分」；条目内未覆盖的
-  字段（含 ``disabled``）编辑时原样保留，兼容用户手写的扩展字段。
-- 文件级损坏（JSON 非法 / 顶层非对象 / hooks 非对象 / 事件值非数组）一律
-  拒绝并提示先修复，不做「覆盖重建」——那会静默丢弃用户文件里可能还能手修的
-  内容。
-
-调用方（GUI 管理页 / 后续 CLI）从这里导入，不要各自拼写 JSON。
-"""
-
 from __future__ import annotations
 
 import json
@@ -42,20 +11,13 @@ from core.hooks.types import DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, HookEvent
 
 _logger = logging.getLogger("ycode.hooks")
 
-#: 本模块编辑时负责覆盖的字段；其余字段（含 disabled）从原条目原样搬运。
 _OWNED_KEYS = frozenset({"command", "matcher", "timeout_ms", "status_message", "disabled"})
 
-#: v1 认可的 4 个事件值；未知事件键按 registry 口径跳过（不参与定位）。
 _EVENT_VALUES = frozenset(event.value for event in HookEvent)
 
-#: 区分「原条目没有 disabled 键」与「disabled: false」的哨兵。
 _MISSING = object()
 
-#: digest 未命中的统一文案（与 trust.apply_hook_trust_action 共用，GUI 提示刷新）。
 _NOT_FOUND_MESSAGE = "未找到对应的 hook（配置可能已变更，请刷新后重试）"
-
-
-# ── 路径解析（与 HookRegistry 构造口径一致）────────────────────
 
 
 def _resolve_user_path(user_hooks_path) -> Path:
@@ -64,7 +26,6 @@ def _resolve_user_path(user_hooks_path) -> Path:
 
 
 def _resolve_project_path(workspace_root, project_hooks_path) -> Path | None:
-    """项目级配置路径：显式注入优先，其次由 workspace_root 推导。"""
     if project_hooks_path:
         return Path(project_hooks_path)
     if workspace_root:
@@ -75,13 +36,6 @@ def _resolve_project_path(workspace_root, project_hooks_path) -> Path | None:
 def _resolve_source_path(
     source_path, workspace_root, user_hooks_path, project_hooks_path
 ) -> tuple[Path | None, str]:
-    """把 ``source_path`` 限定到允许写入的两个配置文件之一（str 比对）。
-
-    为什么按 str 比对而不是 Path 相等：GUI 传来的 source_path 就是 registry
-    加载时写入的 ``str(path)``；逐字符相等才是同一路径对象的同一写法，也顺带
-    保证后续 digest 复算用的 source_path 与 registry 完全一致（同一 Path 的
-    ``str()`` 稳定，跨写法比较可能因规范化差异误判）。
-    """
     if not isinstance(source_path, str) or not source_path.strip():
         return None, "缺少来源路径（source_path）"
     user_path = _resolve_user_path(user_hooks_path)
@@ -91,9 +45,6 @@ def _resolve_source_path(
     if project_path is not None and source_path == str(project_path):
         return project_path, ""
     return None, "该来源文件不允许通过管理页修改（仅支持用户级/项目级 hooks.json）"
-
-
-# ── 配置读写 ────────────────────────────────────────────────
 
 
 def _load_config(path: Path) -> tuple[dict | None, str]:
@@ -136,20 +87,7 @@ def _save_config(path: Path, data: dict) -> tuple[bool, str]:
     return True, ""
 
 
-# ── 条目归一化与定位（与 HookRegistry._parse_entry 对齐）────────
-
-
 def _entry_digest(entry, event_name: str, source_path: str) -> str | None:
-    """按 ``HookRegistry._parse_entry`` 口径归一化并计算条目 digest。
-
-    返回 None 表示该条目按加载口径不可见（缺 command / matcher 非法 / timeout
-    非法），不参与定位——registry 不为这类条目生成 digest，GUI 也不可能拿到
-    指向它们的指纹（这类条目只揪出「未知字段里塞了坏值」的手写配置）。
-
-    与 ``_parse_entry`` 的唯一有意偏离：不因 ``disabled=True`` 跳过。禁用条目
-    必须仍能被 ``set_hook_disabled`` 重新启用（否则「停用」就成了不可逆操作），
-    而 disabled 本就不参与指纹（``compute_hook_digest`` 字段白名单里没有它）。
-    """
     if not isinstance(entry, dict):
         return None
     command = entry.get("command")
@@ -160,7 +98,6 @@ def _entry_digest(entry, event_name: str, source_path: str) -> str | None:
         return None
     matcher = raw_matcher.strip()
     if not matcher:
-        # 空 matcher 无法确定匹配意图；registry 会跳过该条，这里同步跳过。
         return None
     raw_timeout = entry.get("timeout_ms", DEFAULT_TIMEOUT_MS)
     # bool 是 int 的子类，必须显式排除（与 _parse_entry 一致）
@@ -187,11 +124,6 @@ def _entry_digest(entry, event_name: str, source_path: str) -> str | None:
 
 
 def _locate_entry(hooks: dict, digest, source_path: str) -> tuple[str, int] | None:
-    """在全部事件数组中按 digest 定位条目，命中返回 ``(事件名, 下标)``。
-
-    事件键取文件里的原始字符串（registry 算 digest 用的就是 ``event.value``
-    这个键）；未知事件键与非数组值按 registry 口径跳过。
-    """
     if not isinstance(digest, str) or not digest:
         return None
     for event_name, entries in hooks.items():
@@ -233,13 +165,6 @@ def _build_entry(
 
 
 def _parse_common_fields(payload: dict):
-    """校验并归一化 payload 的通用字段（新增/编辑共用）。
-
-    返回 ``((event, command, matcher, timeout_ms, status_message), "")`` 或
-    ``(None, 校验失败原因)``。归一化口径与 ``_parse_entry`` 一致，差别只在
-    宽容度：matcher 缺失/空白归一到 ``"*"``（GUI 表单场景不因此拒绝），
-    而 registry 对「手写文件里的空 matcher」是跳过该条。
-    """
     raw_event = payload.get("event")
     try:
         event = HookEvent(raw_event)
@@ -275,25 +200,9 @@ def _parse_common_fields(payload: dict):
     return (event, command, matcher, timeout_ms, status_message), ""
 
 
-# ── 公开 API ────────────────────────────────────────────────
-
-
 def save_hook_config(
     payload, *, workspace_root=None, user_hooks_path=None, project_hooks_path=None
 ) -> tuple[bool, str]:
-    """新增或编辑一条 hook 配置；返回 ``(ok, 中文原因)``，绝不抛异常。
-
-    payload 两种形态（GUI 管理页表单直接对应）：
-
-    - 新增：``{"scope": "user"|"project", "event", "matcher", "command",
-      "timeout_ms", "status_message"}``；
-    - 编辑：``{"source_path", "digest", "event", "matcher", "command",
-      "timeout_ms", "status_message"}``（无 scope）。
-
-    编辑的定位口径与 ``HookRegistry`` 加载完全一致：``source_path`` 必须是
-    解析出的用户级/项目级配置路径（str 比对），``digest`` 由 registry 加载
-    （或本模块删除/启停后）取得。成功文案：新增 "已保存"、编辑 "已更新"。
-    """
     try:
         return _save_hook_config_impl(
             payload,
@@ -309,10 +218,6 @@ def save_hook_config(
 def delete_hook_config(
     source_path, digest, *, workspace_root=None, user_hooks_path=None, project_hooks_path=None
 ) -> tuple[bool, str]:
-    """删除一条 hook 配置（定位逻辑与编辑完全一致）；成功文案 "已删除"。
-
-    从事件数组移除命中条目；数组为空则删除该事件键（保持文件干净）。
-    """
     try:
         if not isinstance(digest, str) or not digest:
             return False, "缺少 hook 指纹（digest）"
@@ -352,7 +257,6 @@ def set_hook_disabled(
     """
     try:
         if not isinstance(disabled, bool):
-            # 拒绝 "true" 这类字符串：把「想启用」误判成停用是危险方向
             return False, "disabled 必须是布尔值"
         if not isinstance(digest, str) or not digest:
             return False, "缺少 hook 指纹（digest）"
@@ -381,9 +285,6 @@ def set_hook_disabled(
     except Exception as exc:  # 兜底绝不抛出
         _logger.warning("更新 hook 状态异常（已拒绝）: %s", exc)
         return False, f"更新 hook 状态失败：{exc}"
-
-
-# ── save 的内部实现 ─────────────────────────────────────────
 
 
 def _save_hook_config_impl(
@@ -510,7 +411,6 @@ def _edit_hook(
     if event.value == old_event_name:
         hooks[old_event_name][index] = new_entry
     else:
-        # 先确认目标数组可用，再做内存搬运（失败整体不落盘，磁盘无副作用）
         destination = hooks.get(event.value)
         if destination is None:
             destination = []

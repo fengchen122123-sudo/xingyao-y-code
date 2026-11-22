@@ -1,6 +1,5 @@
 <template>
   <div class="terminal-pane" data-test="terminal-pane">
-    <!-- 顶缘拖拽手柄：向上拖变高，双击恢复默认 -->
     <div
       class="terminal-resizer"
       :class="{ resizing }"
@@ -54,11 +53,6 @@ let unsubs: Array<() => void> = [];
 let resizePushTimer: number | undefined;
 let started = false;
 
-// 主题色取自全局 CSS 变量（GUI 主题切换时跟随刷新）
-// ANSI 16 色板按主题分两套：PowerShell 的 PSReadLine 会按语法给输入着色
-// （命令=ANSI 亮黄、字符串=亮青等），默认色板按深色终端底设计，直接用在
-// 浅色主题的白底上完全看不清。浅色套用 VS Code Light+ 的压暗色板，
-// 深色套用 xterm 默认色板。
 const ANSI_DARK: Record<string, string> = {
   black: '#2e2e2e',
   red: '#cd3131',
@@ -155,17 +149,16 @@ async function startSession() {
 function onResizerDown(e: PointerEvent) {
   const startY = e.clientY;
   const startHeight = store.terminalPanelHeight;
-  // 上限随视口锁定：至少给对话区留 260px
   const maxHeight = Math.max(TERMINAL_PANEL_MIN_HEIGHT, Math.min(TERMINAL_PANEL_MAX_HEIGHT, window.innerHeight - 260));
   const handle = e.currentTarget as HTMLElement;
-  try { handle.setPointerCapture?.(e.pointerId); } catch { /* jsdom 无此实现 */ }
+  try { handle.setPointerCapture?.(e.pointerId); } catch { }
   resizing.value = true;
   const onMove = (ev: PointerEvent) => {
     const next = Math.min(maxHeight, Math.max(TERMINAL_PANEL_MIN_HEIGHT, startHeight + (startY - ev.clientY)));
     store.setTerminalPanelHeight(next);
   };
   const onUp = (ev: PointerEvent) => {
-    try { handle.releasePointerCapture?.(ev.pointerId); } catch { /* 忽略 */ }
+    try { handle.releasePointerCapture?.(ev.pointerId); } catch { }
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
     window.removeEventListener('pointercancel', onUp);
@@ -206,7 +199,6 @@ unsubs.push(
       if (ready) {
         void startSession();
         requestAnimationFrame(() => {
-          // 打开瞬间重读主题色：GUI 主题的 CSS 变量可能晚于组件挂载落地
           applyTerminalTheme();
           fitAndSync(false);
           term?.focus();
@@ -232,12 +224,10 @@ onMounted(() => {
   term.open(hostRef.value);
   fitAndSync(false);
 
-  // 用户键入 → 桥 → ConPTY
   term.onData((text) => {
     void store.ptyTerminalWrite(text);
   });
 
-  // PTY 输出 → xterm（v-show 隐藏时组件保持挂载，输出持续累积不丢）
   unsubs.push(onPtyData((text) => {
     term?.write(text);
   }));
@@ -246,14 +236,11 @@ onMounted(() => {
     term?.write(`\r\n\x1b[90m[进程已退出，代码 ${code}，点击 ⟳ 重启]\x1b[0m\r\n`);
   }));
 
-  // 容器尺寸变化（面板拖拽/窗口缩放/侧栏调整）→ 自适应并同步 ConPTY
   resizeObserver = new ResizeObserver(() => fitAndSync(true));
   resizeObserver.observe(hostRef.value);
 
-  // 主题切换跟随
   unsubs.push(
     watch(() => store.themeLight, () => {
-      // 等 GUI 主题 CSS 变量落地后再读色值
       requestAnimationFrame(applyTerminalTheme);
     })
   );
@@ -283,7 +270,6 @@ onBeforeUnmount(() => {
   position: relative;
 }
 
-/* 顶缘拖拽手柄：压在上边线上的隐形热区，悬停/拖拽显示 accent 高亮线 */
 .terminal-resizer {
   position: absolute;
   top: -3px;
@@ -356,7 +342,6 @@ onBeforeUnmount(() => {
   color: var(--text);
 }
 
-/* xterm 容器：占满剩余空间，内边距由 xterm 内部处理 */
 .terminal-host {
   flex: 1;
   min-height: 0;

@@ -1,17 +1,3 @@
-"""Turn 起点电脑操控能力决策（设计 9.3）。
-
-resolve_computer_capability 是纯函数：不读全局 config、不做网络探测、不按模型名
-分支。判定只依赖显式传入的模型元数据（supports_vision / supports_function_calling /
-computer_protocol）、provider 的 protocol/base_url、设置快照与 turn_source。
-官方 OpenAI base 只允许规范化 host api.openai.com。
-
-Turn capability handoff（Task 11a F1 收敛）：入口层 worker 线程按
-prepare_turn_messages → chat_with_model_events 顺序串行完成一个生产 Turn；
-prepare 侧（agent_service.build_runtime_context）解析一次后把快照存进本线程
-handoff，模型事件入口取出复用，避免同一 Turn 解析两次。handoff 取出即清空
-（一次性），只在同线程内可见，绝不是跨回合/跨线程的全局状态。
-"""
-
 from __future__ import annotations
 
 import threading
@@ -21,8 +7,6 @@ from urllib.parse import urlsplit
 from core.computer.models import ComputerCapability, ComputerProtocol, ComputerTarget
 
 if TYPE_CHECKING:
-    # 仅类型注解使用：core.computer.settings 会连带 platforms/config（约 36ms），
-    # 不该跟着纯判定模块一起进 CLI 的启动路径。
     from core.computer.settings import ComputerSettingsSnapshot
 
 _OFFICIAL_OPENAI_HOST = "api.openai.com"
@@ -78,34 +62,33 @@ def resolve_computer_capability(
     model = model or {}
     provider = provider or {}
 
-    # CLI 轻量模式硬禁用：main.py 入口在导入 core.* 之前设置 YCODE_TOOL_PROFILE=cli。
-    # 放在所有判定之前，保证任何调用方（主代理/子代理/后台任务）都拿不到能力，
-    # 也就不会把 computer_action 注入工具表。只读这一个入口声明，不碰配置文件。
     try:
         import os
 
-        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "cli":
+        if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() in ("cli", "coding"):
             return _rejected(
                 settings,
                 "computer_cli_disabled",
-                "CLI 轻量模式不提供电脑操控与浏览器操控",
+                "CLI / coding 轻量模式不提供电脑操控与浏览器操控",
             )
     except Exception:
         pass
 
-    if turn_source != "local":
+    if turn_source not in ("local", "server"):
         return _rejected(
             settings, "computer_remote_forbidden", "局域网、手机或飞书等远程发起的回合不允许电脑操控"
         )
-    if not settings.platform_supported:
+    if turn_source != "server" and not settings.platform_supported:
         return _rejected(
-            settings, "computer_unsupported_os", "电脑操控目前仅支持 Windows"
+            settings,
+            "computer_unsupported_os",
+            "桌面电脑操控目前仅支持 Windows；Linux 服务只提供无头浏览器",
         )
 
     targets = []
     if settings.browser_control_enabled:
         targets.append(ComputerTarget.BROWSER.value)
-    if settings.computer_control_enabled:
+    if settings.computer_control_enabled and turn_source != "server":
         targets.append(ComputerTarget.DESKTOP.value)
     if not targets:
         return _rejected(settings, "computer_disabled", "电脑操控未开启")

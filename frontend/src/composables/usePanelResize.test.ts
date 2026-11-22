@@ -87,7 +87,6 @@ describe('parseStoredRatio', () => {
 
   it('超过视口 50% 上限时收敛到 0.5', () => {
     expect(parseStoredRatio('0.8', 1000)).toBe(0.5);
-    // 旧版像素存储的越界值同样收敛到 50%
     expect(parseStoredRatio('9999', 1000)).toBe(0.5);
   });
 
@@ -106,11 +105,9 @@ describe('ratioToWidth', () => {
   });
 
   it('换算结果夹取到 [min, min(配置上限, 视口 50%)]', () => {
-    // 小视口：50% 守卫优先于配置上限
     expect(ratioToWidth(0.5, 260, 1280, 800)).toBe(400);
     // 超宽视口：固定上限 1280 兜底
     expect(ratioToWidth(0.5, 260, 1280, 4000)).toBe(1280);
-    // 低于最小宽度时抬到 min
     expect(ratioToWidth(0.1, 260, 1280, 1000)).toBe(260);
   });
 });
@@ -127,8 +124,6 @@ describe('computeRestoredRatioWidth', () => {
   });
 });
 
-// 直接驱动 composable 的拖拽流程（无组件实例，仅使用 window 监听部分，
-// 模式同 useComposerResize.test.ts）
 function fakePointer(clientX: number): PointerEvent {
   return { clientX, pointerId: 1, currentTarget: {}, preventDefault() {} } as unknown as PointerEvent;
 }
@@ -202,14 +197,12 @@ describe('usePanelResize 拖拽流程', () => {
     const { api, getWidth } = makeApi('left', 240);
     api.onHandlePointerdown(fakePointer(0));
     fakeWindowPointer('pointermove', 9999);
-    // 上限取 panelMaxWidth(maxWidth) 的实时计算值，而非裸配置上限
     expect(getWidth()).toBe(panelMaxWidth(480));
     expect(getWidth()).toBeLessThanOrEqual(480);
     fakeWindowPointer('pointerup', 9999);
   });
 });
 
-// 视口宽度控制（jsdom 默认 1024）：比例联动测试需要模拟窗口缩放
 function setViewportWidth(width: number) {
   Object.defineProperty(window, 'innerWidth', { value: width, writable: true, configurable: true });
 }

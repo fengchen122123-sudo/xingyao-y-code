@@ -1,19 +1,9 @@
-"""
-core/app_context.py
-====================
-运行时上下文中间层。
-
-CLI (main.py) 和 GUI (gui_bridge.py) 在启动时各自注册一个上下文对象，
-core/llm.py 及其他核心模块通过此模块统一访问运行时状态，
-彻底消除对 `import main` 的直接依赖。
-"""
-
 from __future__ import annotations
 import contextlib
 import threading
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import Any, Callable, Optional
 
-_context: Optional[Any] = None  # 当前注册的上下文实例
+_context: Optional[Any] = None
 
 # 模块级兜底状态：没有注册 ctx（如纯 headless / 单元测试）时依然可用，
 # 注册了 ctx 时优先信任 ctx 的实时值。
@@ -23,12 +13,12 @@ _current_session_fallback: str = ""
 _manager_fallback: Optional[Any] = None
 _permission_mode_fallback: str = "confirm"
 
-# 规范权限模式集合：全系统只允许出现这四个值
+# 规范权限模式集合：全系统只允许出现这五个值
 # confirm=变更前确认(查询放行、变更询问) / accept_edits=自动编辑(普通变更放行、敏感变更询问)
+# auto_decision=自动决策(权限与提问交由 JEV 决策；灾难性硬拒、越界/凭据仍确认)
 # plan=计划模式(只读查询与规划) / full=完全访问(非灾难性操作由沙盒边界决定)
-CANONICAL_PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
+CANONICAL_PERMISSION_MODES = ("confirm", "accept_edits", "auto_decision", "plan", "full")
 
-# 历史遗留 / 中文标签 -> 规范值的映射表
 _PERMISSION_MODE_ALIASES = {
     "confirm": "confirm",
     "default": "confirm",
@@ -42,6 +32,12 @@ _PERMISSION_MODE_ALIASES = {
     "自动编辑": "accept_edits",
     "自动接受编辑": "accept_edits",
     "自动接受修改": "accept_edits",
+    "auto_decision": "auto_decision",
+    "auto-decision": "auto_decision",
+    "autodecision": "auto_decision",
+    "jev": "auto_decision",
+    "自动决策": "auto_decision",
+    "自动决策模式": "auto_decision",
     "plan": "plan",
     "planning": "plan",
     "计划模式": "plan",
@@ -55,11 +51,6 @@ _PERMISSION_MODE_ALIASES = {
 
 
 def is_known_permission_mode(value: Any) -> bool:
-    """判断给定值是否是可识别的权限模式（规范值或已登记的别名）。
-
-    用于区分"用户选了合法模式"与"传了个拼错/未知的值"——后者不应被
-    normalize 静默兜底成 confirm 后当作切换成功。
-    """
     text = str(value or "").strip()
     if not text:
         return False
@@ -72,7 +63,7 @@ def is_known_permission_mode(value: Any) -> bool:
 
 
 def normalize_permission_mode(value: Any) -> str:
-    """把任意来源的权限模式值规范化为四种标准权限模式之一。
+    """把任意来源的权限模式值规范化为五种标准权限模式之一。
 
     未知值（含已下线的历史 auto 模式）一律回落到最保守的 'confirm'，绝不放宽权限。
     """
@@ -85,10 +76,6 @@ def normalize_permission_mode(value: Any) -> str:
     return _PERMISSION_MODE_ALIASES.get(lowered, _PERMISSION_MODE_ALIASES.get(text, "confirm"))
 
 
-# ---------------------------------------------------------------------------
-# 注册 / 获取
-# ---------------------------------------------------------------------------
-
 def register(ctx: Any) -> None:
     """由 CLI 或 GUI 在启动时调用，注册当前运行环境的上下文对象。"""
     global _context
@@ -98,10 +85,6 @@ def register(ctx: Any) -> None:
 def get() -> Optional[Any]:
     return _context
 
-
-# ---------------------------------------------------------------------------
-# UI 形态（cli / gui / headless）
-# ---------------------------------------------------------------------------
 
 def set_ui_flavor(flavor: str) -> None:
     """由入口层声明当前 UI 形态，核心模块据此决定是否走终端交互路径。"""
@@ -125,10 +108,6 @@ def get_ui_flavor() -> str:
     return _ui_flavor
 
 
-# ---------------------------------------------------------------------------
-# 当前激活模型（model, key, url）
-# ---------------------------------------------------------------------------
-
 def set_active_model_tuple(model: str, key: str, url: str) -> None:
     """入口层每次更新激活模型时调用，供 core 层（子代理等）读取。"""
     global _active_model_tuple
@@ -136,7 +115,6 @@ def set_active_model_tuple(model: str, key: str, url: str) -> None:
 
 
 def get_active_model_tuple() -> Optional[tuple]:
-    """返回 (model, key, url)；从未设置过时返回 None，由调用方自行兜底。"""
     return _active_model_tuple
 
 
@@ -164,11 +142,6 @@ def get_thread_permission_mode() -> str | None:
 
 @contextlib.contextmanager
 def permission_mode_scope(mode: Any):
-    """线程内临时绑定权限档位，退出时恢复原值（支持嵌套）。
-
-    回合入口用会话生效档位包裹整段执行，回合期间档位冻结，下轮才可能变化。
-    与 workspace_scope 一样，裸设置在线程复用时可能残留，必须用 scope 恢复。
-    """
     previous = getattr(_permission_mode_tls, "mode", None)
     set_thread_permission_mode(mode)
     try:
@@ -176,10 +149,6 @@ def permission_mode_scope(mode: Any):
     finally:
         _permission_mode_tls.mode = previous
 
-
-# ---------------------------------------------------------------------------
-# 自动化回合标记（G3：防任务自我繁殖）
-# ---------------------------------------------------------------------------
 
 # 线程级自动化回合标记：星轨自动化派发的回合线程绑定本次运行 id，工具 schema
 # 层（core.llm）与执行层（core.harness.tool_pipeline）据此隐藏/拒绝写类自动化
@@ -200,13 +169,6 @@ def get_thread_automation_turn() -> str | None:
 
 @contextlib.contextmanager
 def automation_turn_scope(run_id: Any):
-    """线程内临时标记「本回合由星轨自动化派发」，退出时恢复原值（支持嵌套）。
-
-    必须用 scope 而不是裸 set_thread_automation_turn：回合线程会被复用（同一
-    线程承接后续普通回合），裸设置只要有一条提前返回/异常路径漏了解绑，普通
-    会话就会永久丢掉 automation_* 写工具并被门控拒绝——正是 scope 的 finally
-    负责兜底恢复。
-    """
     previous = getattr(_automation_turn_tls, "run_id", None)
     set_thread_automation_turn(run_id)
     try:
@@ -216,14 +178,6 @@ def automation_turn_scope(run_id: Any):
 
 
 def get_permission_mode() -> str:
-    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。
-
-    线程级绑定优先（多会话并行时每个回合线程持有自己的会话档位），未绑定时
-    回退到入口层注册的全局值；鉴权路径（core.permission_terminal）据此判定，
-    因此会话级完整访问档位必须经 set_thread_permission_mode 写入才能生效。
-    受管策略存在时在此做上限兜底：任何来源（配置文件 / 会话切换 / 运行时命令）
-    的超限请求都在消费点降档，保证所有消费方拿到的都是合规模式。
-    """
     thread_mode = getattr(_permission_mode_tls, "mode", None)
     if thread_mode is not None:
         return _apply_managed_ceiling(normalize_permission_mode(thread_mode))
@@ -249,12 +203,6 @@ def _apply_managed_ceiling(mode: str) -> str:
 
 
 def set_permission_mode(value: Any) -> str:
-    """写入权限模式（自动规范化），返回最终生效的规范值。
-
-    若当前线程已绑定线程级档位（回合/子代理/并行工具线程内），同步更新该
-    绑定，避免"改了全局值但本线程仍按旧档位鉴权"的语义割裂；未绑定时只写
-    全局值（入口层切换会话默认档位的旧语义）。
-    """
     global _permission_mode_fallback
     canonical = normalize_permission_mode(value)
     if getattr(_permission_mode_tls, "mode", None) is not None:
@@ -271,19 +219,13 @@ def set_permission_mode(value: Any) -> str:
 
 
 def get_permission_callback() -> Optional[Callable]:
-    """返回 GUI 注册的权限回调，cli 模式下返回 None。"""
     ctx = _context
     if ctx is None:
         return None
     return getattr(ctx, "permission_callback", None)
 
 
-# ---------------------------------------------------------------------------
-# CLI App 实例
-# ---------------------------------------------------------------------------
-
 def get_app_instance() -> Optional[Any]:
-    """返回 CLI 的 prompt_toolkit App 实例；GUI 模式下为 None。"""
     ctx = _context
     if ctx is None:
         return None
@@ -297,12 +239,7 @@ def invalidate_ui() -> None:
         ctx.invalidate_ui()
 
 
-# ---------------------------------------------------------------------------
-# 消息持久化
-# ---------------------------------------------------------------------------
-
 def get_manager() -> Optional[Any]:
-    """返回 MemoryManager 实例，用于消息持久化。"""
     ctx = _context
     if ctx is not None:
         mgr = getattr(ctx, "manager", None)
@@ -312,11 +249,6 @@ def get_manager() -> Optional[Any]:
 
 
 def set_manager(manager: Any) -> None:
-    """显式注册 MemoryManager（没有 ctx 或 ctx 不暴露 manager 时的兜底通道）。
-
-    注意：ctx 已注册且其 manager 是只读视图（如 CLI 的 _CLIContext 代理到
-    模块全局）时，ctx 优先级高于本 fallback——调用方若需覆盖，必须先注销 ctx。
-    """
     global _manager_fallback
     _manager_fallback = manager
     ctx = _context
@@ -351,16 +283,6 @@ def set_current_session(name: str) -> None:
             pass
 
 
-# ---------------------------------------------------------------------------
-# 线程会话绑定（多会话并行隔离的统一路由锚点）
-# ---------------------------------------------------------------------------
-# GUI 回合线程 / 子代理线程在入口处绑定自己的会话名，core 层的"每会话"状态
-# （计划管理器、授权白名单、沙盒放行）据此路由到各自会话的存储，并行回合
-# 互不可见、互不阻塞。未绑定线程（CLI 后台 worker 之外的主流程、测试主线程）
-# 返回 None，调用方回落到进程级全局（与单会话时代行为一致）。
-# 注意：get_current_session 是"UI 当前查看的会话"（进程级，会随用户切换变化），
-# get_thread_session 是"本线程正在执行的回合所属会话"（线程级，回合期间稳定），
-# 并行场景下所有会话归属判断必须用后者。
 _thread_session_tls = threading.local()
 
 
@@ -375,12 +297,17 @@ def get_thread_session() -> str | None:
     return getattr(_thread_session_tls, "session_id", None)
 
 
-# ---------------------------------------------------------------------------
-# 工具调用归属（子代理卡片按派生它的调用分组）
-# ---------------------------------------------------------------------------
-# 并行工具线程各自绑定本线程正在执行的调用 id：run_subagent 创建子代理时
-# 据此把任务归属到派生它的调用上。GUI 卡片据此只展示自己创建的子代理，
-# 而不是把会话内所有（含历史）子代理都堆到同一张卡上。
+@contextlib.contextmanager
+def thread_session_scope(session_id: str | None):
+    """线程内临时绑定执行会话，退出时恢复原值（支持嵌套）。"""
+    previous = get_thread_session()
+    set_thread_session(session_id)
+    try:
+        yield
+    finally:
+        set_thread_session(previous)
+
+
 _thread_tool_call_tls = threading.local()
 
 
@@ -395,11 +322,6 @@ def get_thread_tool_call_id() -> str | None:
 
 @contextlib.contextmanager
 def tool_call_scope(call_id: str | None):
-    """线程内临时绑定工具调用 id，退出时恢复原值（支持嵌套）。
-
-    必须用 scope 而非裸设置：并行工具线程会被复用，裸设置一旦有异常路径
-    漏了解绑，后续调用创建的子代理会记到上一个调用 id 上（串卡）。
-    """
     previous = getattr(_thread_tool_call_tls, "call_id", None)
     set_thread_tool_call_id(call_id)
     try:
@@ -407,10 +329,6 @@ def tool_call_scope(call_id: str | None):
     finally:
         _thread_tool_call_tls.call_id = previous
 
-
-# ---------------------------------------------------------------------------
-# 任务状态
-# ---------------------------------------------------------------------------
 
 def set_task_status(val: str) -> None:
     ctx = _context

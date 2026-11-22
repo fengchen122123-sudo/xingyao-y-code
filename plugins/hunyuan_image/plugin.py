@@ -1,10 +1,3 @@
-"""hunyuan_image：腾讯混元生图插件入口（薄壳）。
-
-工具实现位于 core.hunyuan_image（随主程序编译进 PYZ 分发），本文件只负责
-注册工具与转发调用，不含 API Key 及任何请求逻辑——安装包中插件目录即使
-明文可见也不泄露秘密。
-"""
-
 from __future__ import annotations
 
 from core.hunyuan_image import VALID_SIZES, generate_image
@@ -55,13 +48,10 @@ def register(registry):
         },
         execute=generate_image,
         read_only=False,
-        mutates_files=True,          # 会下载图片写入本地文件
-        requires_permission=True,    # 写操作走用户审批
-        cancellable=True,            # 生图耗时长，允许用户中断
+        mutates_files=True,
+        requires_permission=True,
+        cancellable=True,
         parallel_safe=False,
         activity_description="混元生图中（约 10~60 秒）",
-        # 规格 03 §3.2 取值表：生图类工具（hunyuan_generate_image /
-        # tokenrhythm_*）归 network——会发起外部网络请求；此处补全声明，
-        # 避免取默认 none 与契约表漂移（A 阶段评审修复）。
         side_effect_scope="network",
     ))

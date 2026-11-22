@@ -193,7 +193,6 @@ describe('countDiffChanges', () => {
   });
 
   it('剥离 ANSI 转义码与 Rich 边框后仍能统计', () => {
-    // Rich 表格/面板渲染后的行：行首带边框 │，内容带 ANSI 颜色码
     const diff = ['[32m│ +[0m added line │', '[31m│ -[0m removed line │'].join('\n');
     expect(countDiffChanges(diff)).toEqual({ added: 1, removed: 1 });
   });
@@ -219,8 +218,8 @@ describe('collectFileChanges', () => {
     expect(changes).toHaveLength(2);
     const a = changes.find((c) => c.name === 'a.py')!;
     expect(a.path).toBe('core/a.py');
-    expect(a.added).toBe(3); // 2 + 1
-    expect(a.removed).toBe(2); // 1 + 1
+    expect(a.added).toBe(3);
+    expect(a.removed).toBe(2);
     const b = changes.find((c) => c.name === 'b.py')!;
     expect(b.added).toBe(0);
     expect(b.removed).toBe(1);

@@ -1,10 +1,9 @@
 <template>
-  <!-- 决策模型（JEV）设置分区：总开关默认关；关闭时其余控件全部置灰 -->
   <div class="decision-settings" data-test="decision-settings-page">
     <header class="decision-header">
       <div>
         <h1>决策模型（JEV）</h1>
-        <p>接入基元律动 JEV 决策服务；默认关闭，启用后任何失败都会静默回落原有逻辑。</p>
+        <p>配置 JEV 决策服务（失败时自动回退原有逻辑）。</p>
       </div>
       <button class="refresh-button" type="button" title="重新加载" @click="reloadAll">
         <AppIcon name="refresh" :size="14" />
@@ -15,7 +14,7 @@
       <label class="switch-row">
         <input data-test="decision-enabled" v-model="enabledDraft" type="checkbox" :disabled="loading || saving" />
         <span class="switch-label">启用决策模型</span>
-        <span class="switch-hint">默认关闭；关闭时以下配置全部禁用，项目行为与未接入时一致</span>
+        <span class="switch-hint">关闭时禁用所有决策请求</span>
       </label>
 
       <div class="status-row">
@@ -80,7 +79,7 @@
         placeholder="留空 = 使用通道默认地址"
         :disabled="controlsDisabled"
       />
-      <p class="decision-note">通道决定 Key 从哪来（选谁就用谁配置里的多 Key 池）；Base URL 填写后覆盖通道地址，用于非标端点。自动匹配 = base_url 含 tokenrhythm 的第一个通道。</p>
+      <p class="decision-note">选择调用的厂商通道与 Key 池；填写 Base URL 可覆盖默认地址。</p>
 
       <div class="field-label">Key 策略</div>
       <div class="radio-row">
@@ -96,16 +95,10 @@
         </label>
       </div>
 
-      <label class="switch-row">
-        <input data-test="decision-shadow" v-model="shadowModeDraft" type="checkbox" :disabled="controlsDisabled" />
-        <span class="switch-label">影子模式（只记录不生效）</span>
-        <span class="switch-hint">发请求并写审计，但决策结果不参与业务判断</span>
-      </label>
-
       <label class="field-label" for="decision-timeout">超时（毫秒）</label>
       <div class="timeout-row">
         <input id="decision-timeout" data-test="decision-timeout" v-model.number="timeoutDraft" class="text-field timeout-input" type="number" :min="100" :max="5000" step="50" :disabled="controlsDisabled" />
-        <span class="range-hint">100 ~ 5000 ms；超时宁可不判也不拖慢主链路</span>
+        <span class="range-hint">100 ~ 5000 ms</span>
       </div>
 
       <div class="field-label">业务场景</div>
@@ -129,7 +122,7 @@
                   type="radio"
                   :name="`decision-scene-mode-${row.scene}`"
                   :value="option.value"
-                  v-model="row.requested_mode"
+                  v-model="row.mode"
                   :disabled="controlsDisabled || sceneSaving === row.scene"
                   @change="changeSceneMode(row, option.value)"
                 />
@@ -152,36 +145,51 @@
             </label>
           </div>
           <p
-            v-if="row.requested_mode === 'live'"
+            v-if="row.mode === 'live'"
             class="decision-note warn"
             :data-test="`decision-scene-${row.scene}-live-warning`"
           >
-            正式模式：决策结果会真实影响任务行为（例如路由场景会真的换模型）；失败、超时或低置信会自动回退原逻辑，不会阻断任务。
-          </p>
-          <p
-            v-if="sceneShadowBlocked(row)"
-            class="decision-note warn"
-            :data-test="`decision-scene-${row.scene}-effective-hint`"
-          >
-            全局影子模式已开启：本场景实际仍按「影子」运行（只记录不生效），关闭上方「影子模式」后才会正式生效。
+            开启后结果会真实影响任务行为（失败或超时自动回退）。
           </p>
         </div>
         <p v-if="!sceneRows.length" class="decision-note">场景列表未就绪（后端未响应或接口不可用）</p>
       </div>
       <p v-if="scenesMsg" class="decision-note" :class="{ warn: scenesFailed }" data-test="decision-scenes-msg">{{ scenesMsg }}</p>
-      <p class="decision-note">每个场景独立设置：关闭 = 零请求零记录；影子 = 真发请求、真写审计但结果丢弃；正式 = 决策结果真的参与业务判断。改一项即保存一项，无需点底部保存。</p>
+      <p class="decision-note">场景切换实时保存（关闭：不请求；开启：实际生效）。</p>
 
       <div class="field-label">决策记录</div>
       <div class="audit-row">
+        <div class="audit-scope-tabs" role="group" aria-label="决策记录范围">
+          <button
+            data-test="decision-audit-scope-all"
+            type="button"
+            class="scope-tab"
+            :class="{ active: auditScope === 'all' }"
+            @click="setAuditScope('all')"
+          >
+            全部会话
+          </button>
+          <button
+            data-test="decision-audit-scope-session"
+            type="button"
+            class="scope-tab"
+            :class="{ active: auditScope === 'session' }"
+            :disabled="!activeSessionName"
+            :title="activeSessionName ? `仅查看当前会话（${activeSessionName}）` : '当前暂无已保存的会话'"
+            @click="setAuditScope('session')"
+          >
+            当前会话
+          </button>
+        </div>
         <span class="audit-summary-text" data-test="decision-audit-summary">{{ auditSummaryText }}</span>
         <button data-test="decision-audit-open" class="secondary-button" type="button" :disabled="loading || saving" @click="openAuditDir">打开审计目录</button>
       </div>
       <ul v-if="auditRecent.length" class="audit-list" data-test="decision-audit-list">
-        <li v-for="(item, index) in auditRecent" :key="index" :class="{ shadow: item.shadow }">
+        <li v-for="(item, index) in auditRecent" :key="index">
           {{ auditLine(item) }}
         </li>
       </ul>
-      <p class="decision-note">审计按天写入 ~/.ycode/decision_audit/YYYYMMDD.jsonl（不含 Key）；跑一次探针即可产生记录，业务场景接入后每次决策都会记录在这里。</p>
+      <p class="decision-note">审计日志按天保存在 ~/.ycode/decision_audit/。</p>
 
       <div class="decision-actions">
         <button data-test="decision-save" class="primary-button" type="button" :disabled="loading || saving" @click="saveSettings">
@@ -197,8 +205,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
+import { getActivePinia } from 'pinia';
 
+import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import type {
   DecisionAuditRecentItem,
@@ -212,7 +222,6 @@ import type {
   DecisionSettingsSnapshot,
 } from '../types/pywebview';
 
-// 探针状态 → 中文标签（与 core.decision_service.probe_decision 的分类一一对应）
 const PROBE_LABELS: Record<string, string> = {
   available: '可用',
   no_permission: '权限不足',
@@ -223,11 +232,10 @@ const PROBE_LABELS: Record<string, string> = {
   error: '失败',
 };
 
-// 业务场景三态（顺序：关闭 → 影子 → 正式，风险由低到高；文案与后端 mode_text 一致）
+// 业务场景二态（关闭 / 开启；文案与后端 mode_text 一致）
 const SCENE_MODE_OPTIONS: { value: DecisionSceneMode; label: string }[] = [
   { value: 'off', label: '关闭' },
-  { value: 'shadow', label: '影子' },
-  { value: 'live', label: '正式' },
+  { value: 'live', label: '开启' },
 ];
 
 const loading = ref(false);
@@ -243,7 +251,6 @@ const modelIdDraft = ref('');
 const endpointStyleDraft = ref<'decision' | 'systemone'>('decision');
 const keyModeDraft = ref<'auto' | 'index'>('auto');
 const keyIndexDraft = ref(1);
-const shadowModeDraft = ref(true);
 const timeoutDraft = ref(800);
 const providerRef = ref('auto');
 const baseUrlDraft = ref('');
@@ -256,8 +263,8 @@ const modelOptions = ref<DecisionModelOption[]>([]);
 const fetchHint = ref('');
 const fetchFailed = ref(false);
 const auditSummary = ref<DecisionAuditSummary | null>(null);
+const auditScope = ref<'all' | 'session'>('all');
 
-// 业务场景（三态开关）：每个场景独立保存，改一项立即生效
 const sceneRows = ref<DecisionSceneRow[]>([]);
 // 正在保存的场景名（只禁用该行，避免整页置灰打断连续调整）
 const sceneSaving = ref('');
@@ -266,7 +273,6 @@ const scenesFailed = ref(false);
 
 let savedTipTimer: ReturnType<typeof setTimeout> | null = null;
 
-// 总开关关闭时：除总开关与保存按钮外的控件全部置灰（设计第 6 节）
 const controlsDisabled = computed(() => loading.value || saving.value || !enabledDraft.value);
 
 const availableEntry = computed(
@@ -289,21 +295,35 @@ const statusDotClass = computed(() => {
   return '';
 });
 
+const activeSessionName = computed(() => {
+  const pinia = getActivePinia();
+  if (!pinia) return '';
+  return String(useAppStore(pinia).currentSessionName || '').trim();
+});
+
 const auditRecent = computed(() => auditSummary.value?.recent ?? []);
 
 const auditSummaryText = computed(() => {
   const summary = auditSummary.value;
-  if (!summary || summary.today_count <= 0) {
-    return '今日暂无决策记录（跑一次探针即可产生记录）';
+  const prefix = auditScope.value === 'session' ? '本会话今日' : '今日';
+  if (!summary || (summary.today_count <= 0 && !(summary.session_total_count ?? 0))) {
+    return auditScope.value === 'session'
+      ? '本会话暂无决策记录'
+      : '今日暂无决策记录（跑一次探针即可产生记录）';
   }
-  return `今日 ${summary.today_count} 次决策 · 影子 ${summary.today_shadow_count} · 采纳 ${summary.today_adopted_count} · 回退 ${summary.today_fallback_count}`;
+  const base = `${prefix} ${summary.today_count} 次决策 · 采纳 ${summary.today_adopted_count} · 回退 ${summary.today_fallback_count}`;
+  if (auditScope.value === 'session' && typeof summary.session_total_count === 'number') {
+    return `本会话累计 ${summary.session_total_count} 次 · ${base}`;
+  }
+  return base;
 });
 
-/** 单条审计记录的展示行：时间 · 场景 · 模式 · 延迟 · 回退原因 */
+/** 单条审计记录的展示行：时间 · 场景 · 延迟 · 会话（全局口径） · 回退原因 */
 function auditLine(item: DecisionAuditRecentItem): string {
   const time = item.ts.length >= 19 ? item.ts.slice(11, 19) : item.ts;
-  const parts = [time, item.scene || '未知场景', item.shadow ? '影子' : '正式'];
+  const parts = [time, item.scene || '未知场景'];
   if (typeof item.latency_ms === 'number') parts.push(`${item.latency_ms}ms`);
+  if (auditScope.value === 'all' && item.session_id) parts.push(`会话：${item.session_id}`);
   if (item.fallback_reason) parts.push(`回退：${item.fallback_reason}`);
   return parts.join(' · ');
 }
@@ -337,20 +357,29 @@ function normalizeProbe(raw: Partial<DecisionProbeKeyResult>): DecisionProbeKeyR
   };
 }
 
+function syncStoreDecisionEnabled(enabled: boolean) {
+  const pinia = getActivePinia();
+  if (!pinia) return;
+  const store = useAppStore(pinia);
+  store.decisionEnabled = enabled;
+  if (!enabled && store.permissionMode === 'auto_decision') {
+    store.permissionMode = 'confirm';
+  }
+}
+
 function applySettings(settings: Partial<DecisionSettingsSnapshot>) {
   enabledDraft.value = settings.enabled === true;
+  syncStoreDecisionEnabled(enabledDraft.value);
   modelIdDraft.value = String(settings.model_id ?? '');
   endpointStyleDraft.value = settings.endpoint_style === 'systemone' ? 'systemone' : 'decision';
   const mode = String(settings.key_mode ?? 'auto');
   if (mode.startsWith('index:')) {
     keyModeDraft.value = 'index';
-    // key_mode 的 N 是 0 基，界面按「第 N 把」1 基展示
     keyIndexDraft.value = (parseInt(mode.slice('index:'.length), 10) || 0) + 1;
   } else {
     keyModeDraft.value = 'auto';
     keyIndexDraft.value = 1;
   }
-  shadowModeDraft.value = settings.shadow_mode !== false;
   timeoutDraft.value = Number(settings.timeout_ms ?? 800) || 800;
   providerRef.value = String(settings.provider_ref ?? 'auto');
   baseUrlDraft.value = String(settings.base_url ?? '');
@@ -370,7 +399,6 @@ async function loadSettings() {
   try {
     const api = window.pywebview?.api;
     if (!api?.get_decision_settings) {
-      // 后端未就绪（如纯前端预览）：保留默认草稿，不报错
       return;
     }
     const res = await api.get_decision_settings();
@@ -414,7 +442,6 @@ async function saveSettings() {
       provider_ref: providerRef.value.trim() || 'auto',
       base_url: baseUrlDraft.value.trim(),
       key_mode: keyModeDraft.value === 'auto' ? 'auto' : `index:${index}`,
-      shadow_mode: shadowModeDraft.value,
       timeout_ms: timeout,
     });
     if (res?.ok) {
@@ -422,7 +449,6 @@ async function saveSettings() {
       savedTip.value = res.msg || '已保存';
       if (savedTipTimer) clearTimeout(savedTipTimer);
       savedTipTimer = setTimeout(() => { savedTip.value = ''; }, 2500);
-      // 全局影子开关会改变各场景的"真实生效三态"：保存后重取场景快照
       loadScenes();
     } else {
       // 保存失败：保留用户草稿不回滚，只回显后端原因
@@ -449,7 +475,7 @@ async function runProbe() {
     probeResults.value = Array.isArray(res?.results) ? res.results.map(normalizeProbe) : [];
     probeModelId.value = String(res?.model_id ?? '');
     if (res?.msg) probeMsg.value = String(res.msg);
-    loadAuditSummary(); // 探针会写一条审计记录：刷一次面板立即可见
+    loadAuditSummary();
   } catch {
     probeMsg.value = '探针执行失败';
   } finally {
@@ -496,33 +522,22 @@ function pickModel(event: Event) {
 
 /** 业务场景条目归一：容忍后端字段缺失/扩展，避免渲染崩溃 */
 function normalizeScene(raw: Partial<DecisionSceneRow>): DecisionSceneRow {
-  const mode = raw.mode === 'live' || raw.mode === 'shadow' || raw.mode === 'off' ? raw.mode : 'off';
-  const requested = raw.requested_mode === 'live' || raw.requested_mode === 'shadow' || raw.requested_mode === 'off'
-    ? raw.requested_mode
-    : mode;
+  const mode: DecisionSceneMode = raw.mode === 'live' ? 'live' : 'off';
   const threshold = Number(raw.threshold ?? 0.5);
   return {
     scene: String(raw.scene ?? ''),
     label: String(raw.label ?? raw.scene ?? ''),
     description: String(raw.description ?? ''),
     mode,
-    mode_text: String(raw.mode_text ?? (mode === 'live' ? '正式' : mode === 'shadow' ? '影子' : '关闭')),
-    requested_mode: requested,
-    enabled: raw.enabled === true,
-    shadow: raw.shadow !== false,
+    mode_text: String(raw.mode_text ?? (mode === 'live' ? '开启' : '关闭')),
+    enabled: raw.enabled === true || mode === 'live',
     threshold: Number.isFinite(threshold) ? threshold : 0.5,
     timeout_ms: Number(raw.timeout_ms ?? 250) || 250,
-    global_shadow: raw.global_shadow === true,
   };
 }
 
 function applyScenes(rows: Partial<DecisionSceneRow>[] | undefined) {
   sceneRows.value = Array.isArray(rows) ? rows.map(normalizeScene).filter((row) => row.scene) : [];
-}
-
-/** 用户选了"正式"但全局影子把场景压成影子：这一行要额外提示 */
-function sceneShadowBlocked(row: DecisionSceneRow): boolean {
-  return row.requested_mode === 'live' && row.mode !== 'live';
 }
 
 /** 拉取四场景快照；接口缺失/异常一律返回 null（绝不抛错） */
@@ -543,7 +558,6 @@ async function restoreScenes() {
   if (rows) applyScenes(rows);
 }
 
-/** 场景三态快照（设置页「业务场景」区块）：失败静默，不阻塞其余控件 */
 async function loadScenes() {
   const rows = await fetchSceneRows();
   if (rows) {
@@ -554,7 +568,6 @@ async function loadScenes() {
   scenesMsg.value = '加载业务场景失败';
 }
 
-/** 切换某场景的三态：后端按三态反推两个布尔并立即落盘 */
 async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
   if (sceneSaving.value) return;
   sceneSaving.value = row.scene;
@@ -570,11 +583,9 @@ async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
     }
     const res = await api.set_decision_scene(row.scene, mode);
     if (res?.ok) {
-      // 后端返回最新四场景快照：用它刷新，保证 mode / requested_mode 都是落盘后的真实状态
       if (res.scenes) applyScenes(res.scenes);
       scenesMsg.value = res.hint ? `${res.msg || '已保存'}；${res.hint}` : String(res.msg || '已保存');
-      // 选了「正式」但真实生效不是 live（全局影子压住）：提示改用警示色
-      scenesFailed.value = mode === 'live' && res.effective_mode !== undefined && res.effective_mode !== 'live';
+      scenesFailed.value = false;
     } else {
       scenesFailed.value = true;
       scenesMsg.value = String(res?.msg || '保存场景设置失败');
@@ -589,7 +600,6 @@ async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
   }
 }
 
-/** 改某场景阈值：钳制到 0~1 后按当前所选三态一起保存（阈值不影响三态） */
 async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
   if (sceneSaving.value) return;
   const input = event.target as HTMLInputElement;
@@ -611,8 +621,7 @@ async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
       scenesMsg.value = '后端接口未就绪，无法保存场景设置';
       return;
     }
-    // 传 requested_mode：保持「用户想要的档位」，不让全局影子的折算值覆盖用户选择
-    const res = await api.set_decision_scene(row.scene, row.requested_mode, threshold);
+    const res = await api.set_decision_scene(row.scene, row.mode, threshold);
     if (res?.ok) {
       if (res.scenes) applyScenes(res.scenes);
       scenesMsg.value = `${row.label}场景阈值已保存为 ${threshold}`;
@@ -630,26 +639,61 @@ async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
   }
 }
 
-/** 审计汇总（决策记录面板）：加载失败静默，不阻塞其余控件 */
+let auditRequestSeq = 0;
+
+function setAuditScope(scope: 'all' | 'session') {
+  if (auditScope.value === scope) return;
+  auditScope.value = scope;
+  void loadAuditSummary();
+}
+
 async function loadAuditSummary() {
+  const seq = (auditRequestSeq += 1);
   try {
     const api = window.pywebview?.api;
     if (!api?.get_decision_audit_summary) return;
-    const res = await api.get_decision_audit_summary(10);
+    const scope = auditScope.value;
+    const sessionName = activeSessionName.value;
+    if (scope === 'session' && !sessionName) {
+      auditSummary.value = {
+        ok: true,
+        today_count: 0,
+        today_adopted_count: 0,
+        today_fallback_count: 0,
+        recent: [],
+      };
+      return;
+    }
+    const res =
+      scope === 'session'
+        ? await api.get_decision_audit_summary(10, sessionName, true)
+        : await api.get_decision_audit_summary(10);
+    if (seq !== auditRequestSeq) return;
     if (res?.ok) {
       auditSummary.value = {
         ok: true,
         today_count: Number(res.today_count ?? 0),
-        today_shadow_count: Number(res.today_shadow_count ?? 0),
         today_adopted_count: Number(res.today_adopted_count ?? 0),
         today_fallback_count: Number(res.today_fallback_count ?? 0),
+        ...(typeof res.session_total_count === 'number'
+          ? { session_total_count: res.session_total_count }
+          : {}),
+        ...(typeof res.global_today_count === 'number'
+          ? { global_today_count: res.global_today_count }
+          : {}),
         recent: Array.isArray(res.recent) ? res.recent : [],
       };
     }
   } catch {
-    // 记录面板失败不弹错
   }
 }
+
+watch(activeSessionName, (name) => {
+  if (auditScope.value === 'session') {
+    if (!name) auditScope.value = 'all';
+    void loadAuditSummary();
+  }
+});
 
 async function openAuditDir() {
   try {
@@ -668,7 +712,6 @@ function reloadAll() {
   loadAuditSummary();
 }
 
-/** 拉取可选调用通道列表（不含 Key 内容）；失败静默，不阻塞页面其余控件 */
 async function loadProviders() {
   if (channelsLoading.value) return;
   channelsLoading.value = true;
@@ -688,7 +731,6 @@ async function loadProviders() {
         .filter((item) => item.ref);
     }
   } catch {
-    // 通道列表失败不弹错：用户仍可用自动匹配或手动输入 Base URL
   } finally {
     channelsLoading.value = false;
   }
@@ -720,11 +762,11 @@ onMounted(() => {
 .status-row { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-faint); flex: none; }
 .status-dot.ok { background: var(--green); }
-.status-dot.bad { background: var(--danger); }
+.status-dot.bad { background: var(--red); }
 .status-text { color: var(--text-dim); font-size: 13px; flex: 1; min-width: 180px; }
 .probe-results { list-style: none; margin: 8px 0 0; padding: 0 0 0 19px; display: grid; gap: 4px; font-size: 12px; }
 .probe-results li.ok { color: var(--green); }
-.probe-results li.bad { color: var(--danger); }
+.probe-results li.bad { color: var(--red); }
 .model-row { display: flex; gap: 10px; }
 .model-row .text-field { flex: 1; }
 .model-select { margin-top: 8px; }
@@ -741,17 +783,19 @@ onMounted(() => {
 .scene-name { font-weight: 600; font-size: 13px; }
 .scene-mode-badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg3); }
 .scene-mode-badge.live { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
-.scene-mode-badge.shadow { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
 .scene-desc { color: var(--text-faint); font-size: 12px; flex: 1; min-width: 200px; }
 .scene-controls { display: flex; align-items: center; gap: 18px; margin-top: 10px; flex-wrap: wrap; }
 .scene-modes { gap: 16px; }
 .scene-threshold { display: inline-flex; align-items: center; gap: 7px; color: var(--text-dim); font-size: 12px; }
 .scene-threshold-input { width: 92px; min-height: 34px; padding: 0 9px; }
-.audit-row { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+.audit-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.audit-scope-tabs { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg2); }
+.scope-tab { min-height: 30px; padding: 0 10px; border: none; background: transparent; color: var(--text-dim); font-size: 12px; cursor: pointer; }
+.scope-tab.active { background: var(--bg3); color: var(--text); font-weight: 600; }
+.scope-tab:disabled { opacity: .45; cursor: not-allowed; }
 .audit-hint { color: var(--text-faint); font-size: 12px; }
 .audit-summary-text { color: var(--text-dim); font-size: 12px; }
 .audit-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--text-dim); }
-.audit-list li.shadow { opacity: .75; }
 .decision-actions { display: flex; gap: 10px; margin-top: 16px; }
 .primary-button, .secondary-button { min-height: 38px; padding: 0 18px; border-radius: 9px; border: 1px solid var(--border); font-weight: 600; cursor: pointer; font-size: 13px; }
 .primary-button { background: var(--text); color: var(--bg0); }
@@ -760,7 +804,7 @@ onMounted(() => {
 .secondary-button:disabled { opacity: .5; cursor: not-allowed; }
 .decision-note { margin: 8px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
 .decision-note.warn { color: var(--warning); }
-.decision-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
+.decision-error { margin: 12px 0 0; color: var(--red); font-size: 12px; }
 .decision-saved { margin: 12px 0 0; color: var(--green); font-size: 12px; }
 
 @media (max-width: 768px) {

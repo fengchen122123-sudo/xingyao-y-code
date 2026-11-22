@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Fetch a WeChat MP article and dump its main text + image list to files."""
 import html
 import os
 import re
@@ -22,7 +21,6 @@ def fetch(url):
 
 
 def extract_div(doc, marker):
-    """Return the whole <div ...> block whose opening tag contains `marker`."""
     pos = doc.index(marker)
     start = doc.rindex("<div", 0, pos)
     depth = 0

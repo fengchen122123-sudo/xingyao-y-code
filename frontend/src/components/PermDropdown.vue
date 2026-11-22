@@ -19,7 +19,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from 'vue';
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
@@ -35,12 +35,17 @@ const store = useAppStore();
 
 const styleObj = ref<Record<string, string>>({});
 
-const permModes: Array<{ v: PermissionMode; c: string; desc: string }> = [
+const ALL_PERM_MODES: Array<{ v: PermissionMode; c: string; desc: string }> = [
   { v: 'confirm', c: 'var(--green)', desc: '查询自动放行；任何变更都需要确认' },
   { v: 'accept_edits', c: 'var(--yellow, #f1fa8c)', desc: '普通编辑和构建自动放行；删除、提交、推送等敏感操作需要确认' },
+  { v: 'auto_decision', c: 'var(--xy-accent, var(--cyan, #58a6ff))', desc: '遇到权限与提问交由 JEV 决策；灾难性硬拒绝，越界与凭据仍确认' },
   { v: 'plan', c: 'var(--purple)', desc: '允许读取、查询和制定计划；禁止修改或删除任务文件' },
   { v: 'full', c: 'var(--red)', desc: '沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制' },
 ];
+
+const permModes = computed(() =>
+  ALL_PERM_MODES.filter((m) => m.v !== 'auto_decision' || store.decisionEnabled),
+);
 
 function selectMode(val: PermissionMode) {
   store.setPermissionMode(val);

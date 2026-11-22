@@ -1,12 +1,3 @@
-"""loopback 令牌化截图预览服务（设计 16.3）。
-
-不变量：只绑定 127.0.0.1；每进程随机 token；只服务当前 run 最近 3 张 PNG；
-URL 路径固定 /computer-preview/{token}/{run_id}/{ordinal}.png；错 token、
-路径穿越、目录索引一律 404（不区分原因）。publish 用临时文件 + os.replace；
-切换 run 立即删除旧 run 图片；start 只清理 root 下 24 小时前的本服务进程目录
-（preview-* 命名），绝不误删其他数据；stop 幂等，停止后删除本进程目录并释放端口。
-"""
-
 from __future__ import annotations
 
 import hmac
@@ -99,8 +90,6 @@ class ComputerPreviewServer:
             thread.join(timeout=10)
         shutil.rmtree(self._process_dir, ignore_errors=True)
 
-    # ---------------- 内部 ----------------
-
     def _base_url_locked(self) -> str:
         assert self._server is not None
         return f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -131,14 +120,10 @@ class ComputerPreviewServer:
                 shutil.rmtree(child, ignore_errors=True)
 
     def _resolve_get(self, raw_path: str) -> bytes | None:
-        """严格匹配固定 URL 形状；任何不匹配（含错 token/穿越/索引）返回 None→404。"""
         segments = urlsplit(raw_path).path.split("/")
         if len(segments) != 5 or segments[0] != "" or segments[1] != _URL_PREFIX:
             return None
         token, run_id, filename = segments[2], segments[3], segments[4]
-        # 常量时间比较（时序侧信道加固）：候选 token 可能携带非 ASCII 字符
-        # （请求行按 latin-1 解码），compare_digest 对非 ASCII str 会抛
-        # TypeError，先拒之；服务未启动（token 为空）同样直接拒绝。
         if (
             not self.token
             or not token.isascii()
@@ -182,6 +167,6 @@ class ComputerPreviewServer:
                 self.wfile.write(payload)
 
             def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib 签名
-                return  # 预览服务不往 stderr 写访问日志
+                return
 
         return _PreviewHandler

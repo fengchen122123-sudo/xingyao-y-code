@@ -5,13 +5,6 @@ from core.route_overrides import resolve_route_override, HEADER_DENY_KEYS, BODY_
 
 @pytest.fixture(autouse=True)
 def _reset_override_cache():
-    """每个用例前强制重读配置。
-
-    配置指纹只反映「loader 身份 + config 文件 mtime」；monkeypatch 换掉
-    _load_config_for_overrides 时二者都不变，只靠 TTL 兜底会让用例串味
-    （2026-09-24 实测：去掉这个 fixture，本文件 5 个用例挂 3 个）。
-    手法同 _keepalive_routes_cfg_cache 注释里写明的"测试可直接把 entry 置 None"。
-    """
     import core.route_overrides as mod
     mod._cache["entry"] = None
     yield
@@ -76,11 +69,6 @@ def test_env_var_reference_is_expanded(monkeypatch):
 
 
 def test_stamp_change_invalidates_cache(monkeypatch):
-    """配置指纹变化必须立刻失效缓存，而不是等 10 秒 TTL。
-
-    注意这里刻意不调用 _fake_config（它会把缓存置 None）——缓存必须靠
-    stamp 比对失效，才证明实现真的带了指纹。
-    """
     import core.route_overrides as mod
 
     stamp = {"value": ("loader", 1)}
@@ -94,5 +82,5 @@ def test_stamp_change_invalidates_cache(monkeypatch):
     assert resolve_route_override("m", "https://tokenrhythm.studio/v1")["headers"] == {"X-Test": "old"}
 
     config["route_request_overrides"][0]["headers"] = {"X-Test": "new"}
-    stamp["value"] = ("loader", 2)  # 指纹变了，TTL 还没到
+    stamp["value"] = ("loader", 2)
     assert resolve_route_override("m", "https://tokenrhythm.studio/v1")["headers"] == {"X-Test": "new"}

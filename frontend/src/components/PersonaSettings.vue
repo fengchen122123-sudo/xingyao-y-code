@@ -3,7 +3,7 @@
     <header class="persona-header">
       <div>
         <h1>人设设置</h1>
-        <p>自定义智能体的名称与人设；人设内容留空表示使用内置默认人设。</p>
+        <p>自定义智能体名称、称呼与人设（留空使用默认）。</p>
       </div>
       <button class="refresh-button" type="button" title="重新加载" @click="loadPersona">
         <AppIcon name="refresh" :size="14" />
@@ -43,7 +43,7 @@
         class="persona-textarea"
         :maxlength="20000"
         rows="9"
-        placeholder="描述智能体的身份、性格与说话风格；填写后取代内置默认人设（安全规范保留），清空后自动恢复默认。"
+        placeholder="描述智能体的身份、性格与说话风格（留空恢复默认）。"
         :disabled="loading || saving"
       ></textarea>
       <div class="persona-meta">
@@ -70,10 +70,7 @@
 
       <p v-if="errorMsg" data-test="persona-error" class="persona-error">{{ errorMsg }}</p>
       <p v-else-if="savedTip" data-test="persona-saved" class="persona-saved">{{ savedTip }}</p>
-      <p class="persona-note">人设内容与称呼会随名称一起注入会话提示词：填写后取代内置默认人设中的身份与性格设定（安全红线与工具规范保留），清空后自动恢复内置默认人设，不会丢失。</p>
-      <!-- 会话级稳定段落快照：人设属于注入点 2，进行中的会话已在首请求定型目录字节
-           以保住前缀缓存；因此保存的改动只对新建会话生效。 -->
-      <p class="persona-note" data-test="session-snapshot-note">已打开的会话将在新会话中生效：进行中的会话沿用其启动时的目录快照，以保证前缀缓存稳定。</p>
+      <p class="persona-note" data-test="session-snapshot-note">保存后对新建会话生效。</p>
     </section>
   </div>
 </template>
@@ -121,7 +118,6 @@ async function loadPersona() {
   try {
     const api = (window as any).pywebview?.api;
     if (!api?.get_persona_settings) {
-      // 后端未就绪（如测试环境）：显示占位但不报错
       applySnapshot('星瑶', '', '');
       return;
     }
@@ -170,7 +166,6 @@ async function savePersona() {
         String(res.persona ?? personaDraft.value),
         String(res.user_title ?? userTitleDraft.value.trim()),
       );
-      // 名称/称呼即时同步全局：界面文案、执行过程、思考提示立刻切换，无需重启
       store.applyPersonaSettings({ agent_name: res.agent_name, user_title: res.user_title });
       savedTip.value = res.msg || '已保存';
       if (savedTipTimer) clearTimeout(savedTipTimer);
@@ -209,7 +204,7 @@ onMounted(loadPersona);
 .primary-button { background: var(--text); color: var(--bg0); }
 .primary-button:disabled { opacity: .5; cursor: not-allowed; }
 .secondary-button { background: var(--bg3); color: var(--text); }
-.persona-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
+.persona-error { margin: 12px 0 0; color: var(--red); font-size: 12px; }
 .persona-saved { margin: 12px 0 0; color: var(--green); font-size: 12px; }
 .persona-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
 

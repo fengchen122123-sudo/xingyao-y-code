@@ -6,7 +6,6 @@
         <button class="rdb-close" data-test="rdb-close" @click="store.closeRemoteDirBrowser()">✕</button>
       </div>
 
-      <!-- 当前路径 + 返回上级 -->
       <div class="rdb-pathbar">
         <button
           v-if="!store.remoteDirBrowser.isRoot"
@@ -63,7 +62,6 @@ function enterDir(d: { name: string; path: string }) {
 }
 
 function goUp() {
-  // 取当前路径的父目录；盘符根（如 C:\）时回盘符列表
   const cur = store.remoteDirBrowser.current;
   if (!cur) return;
   const norm = cur.replace(/[\\/]+$/, '');
@@ -85,71 +83,77 @@ function onConfirm() {
 
 <style scoped>
 .rdb-mask {
-  position: fixed; inset: 0; z-index: 300;
-  background: rgba(0, 0, 0, 0.45);
+  position: fixed; inset: 0; z-index: 5400;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   display: flex; align-items: center; justify-content: center;
   padding: 16px;
 }
 .rdb-card {
   width: min(560px, 94vw); max-height: 80vh;
-  background: var(--bg-card, #fff); color: var(--text-main, #222);
-  border-radius: 14px; display: flex; flex-direction: column;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  background: var(--xy-card, var(--bg1, #fff)); color: var(--xy-text, var(--text, #222));
+  border: 1px solid var(--xy-border-strong, var(--border, #eee));
+  border-radius: 16px; display: flex; flex-direction: column;
+  box-shadow: var(--xy-shadow-pop, 0 12px 40px rgba(0, 0, 0, 0.25));
   overflow: hidden;
 }
 .rdb-head {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 16px; border-bottom: 1px solid var(--border-soft, #eee);
+  padding: 14px 18px; border-bottom: 1px solid var(--xy-border, #eee);
 }
 .rdb-title { font-weight: 600; font-size: 15px; }
 .rdb-close {
   border: none; background: transparent; font-size: 15px;
-  cursor: pointer; color: var(--text-faint, #999); padding: 4px 8px;
+  cursor: pointer; color: var(--xy-text-3, #999); padding: 4px 8px; border-radius: 6px;
 }
+.rdb-close:hover { background: var(--xy-hover, rgba(0, 0, 0, 0.05)); color: var(--xy-text, #222); }
 .rdb-pathbar {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 16px; border-bottom: 1px solid var(--border-soft, #eee);
+  padding: 8px 18px; border-bottom: 1px solid var(--xy-border, #eee);
 }
 .rdb-up {
-  border: 1px solid var(--border-soft, #ddd); background: transparent;
+  border: 1px solid var(--xy-border-strong, #ddd); background: transparent;
   border-radius: 8px; padding: 4px 10px; font-size: 12px; cursor: pointer;
-  color: var(--text-main, #222); white-space: nowrap;
+  color: var(--xy-text, #222); white-space: nowrap;
 }
+.rdb-up:hover { background: var(--xy-hover, rgba(0, 0, 0, 0.05)); }
 .rdb-path {
-  font-size: 12px; color: var(--text-faint, #888);
+  font-size: 12px; color: var(--xy-text-3, #888);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  direction: rtl; text-align: left; /* 长路径时显示尾部（当前目录名） */
+  direction: rtl; text-align: left;
 }
-.rdb-list { flex: 1; overflow-y: auto; padding: 6px 8px; min-height: 200px; }
-.rdb-hint { padding: 24px 0; text-align: center; color: var(--text-faint, #999); font-size: 13px; }
-.rdb-err { color: #d33; }
+.rdb-list { flex: 1; overflow-y: auto; padding: 6px 10px; min-height: 200px; }
+.rdb-hint { padding: 24px 0; text-align: center; color: var(--xy-text-3, #999); font-size: 13px; }
+.rdb-err { color: var(--xy-rose, #d33); }
 .rdb-item {
   display: flex; align-items: center; gap: 8px;
   padding: 9px 10px; border-radius: 8px; font-size: 13.5px;
   cursor: pointer;
 }
-.rdb-item:active { background: var(--bg-hover, rgba(0, 0, 0, 0.05)); }
-.rdb-item.selected { background: var(--bg-active, rgba(64, 128, 255, 0.12)); }
+.rdb-item:hover { background: var(--xy-hover, rgba(0, 0, 0, 0.04)); }
+.rdb-item:active { background: var(--xy-hover, rgba(0, 0, 0, 0.05)); }
+.rdb-item.selected { background: var(--xy-accent-soft, rgba(64, 128, 255, 0.12)); }
 .rdb-icon { flex: none; }
 .rdb-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rdb-pick {
-  flex: none; border: 1px solid var(--border-soft, #ddd);
+  flex: none; border: 1px solid var(--xy-border-strong, #ddd);
   background: transparent; border-radius: 999px;
   padding: 3px 10px; font-size: 12px; cursor: pointer;
-  color: var(--text-main, #222);
+  color: var(--xy-text, #222);
 }
 .rdb-foot {
   display: flex; align-items: center; gap: 10px;
-  padding: 10px 16px; border-top: 1px solid var(--border-soft, #eee);
+  padding: 12px 18px; border-top: 1px solid var(--xy-border, #eee);
 }
 .rdb-selected-path {
-  flex: 1; font-size: 11.5px; color: var(--text-faint, #888);
+  flex: 1; font-size: 11.5px; color: var(--xy-text-3, #888);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .rdb-confirm {
   flex: none; border: none; border-radius: 9px;
-  background: var(--accent, #3b82f6); color: #fff;
-  padding: 8px 16px; font-size: 13px; cursor: pointer;
+  background: var(--xy-accent, var(--accent, #3b82f6)); color: var(--xy-accent-fg, #fff);
+  padding: 8px 16px; font-size: 13px; font-weight: 500; cursor: pointer;
 }
 .rdb-confirm:disabled { opacity: 0.5; }
 </style>

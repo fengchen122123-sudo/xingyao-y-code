@@ -10,7 +10,6 @@
     <div v-if="store.workflowsLoading" class="wp-empty">读取中…</div>
 
     <template v-else>
-      <!-- 全局组：对所有项目可见 -->
       <div class="wp-group" data-test="workflow-group-user">
         <div class="wp-group-head">
           <span class="wp-group-name">全局</span>
@@ -110,7 +109,6 @@
         </div>
       </div>
 
-      <!-- 项目组：仅当前打开的项目（自由对话下不显示该组） -->
       <div v-if="inProject" class="wp-group" data-test="workflow-group-project">
         <div class="wp-group-head">
           <span class="wp-group-name">{{ projectLabel }}</span>
@@ -214,7 +212,6 @@
         </div>
       </div>
 
-      <!-- 坏文件 -->
       <div v-if="store.workflowInvalid.length" class="wp-invalid">
         <div class="wp-invalid-title">解析失败（不参与执行，可修复或删除）</div>
         <div v-for="bad in store.workflowInvalid" :key="bad.name" class="wp-invalid-row" :title="bad.path || ''">
@@ -233,7 +230,6 @@ import type { WorkflowArgDecl, WorkflowInfo } from '../types/pywebview';
 
 const store = useAppStore();
 
-// name → 脚本原文；undefined = 未展开，'' = 展开但还在读取
 const scriptShown = reactive<Record<string, string>>({});
 
 const runForm = reactive({
@@ -245,7 +241,6 @@ const runForm = reactive({
 
 const importing = reactive({ busy: false });
 
-// 分组：全局 / 当前项目（自由对话没有项目组——未打开的项目不出现在这里）
 const userWorkflows = computed(() => store.workflows.filter(w => w.scope === 'user'));
 const projectWorkflows = computed(() => store.workflows.filter(w => w.scope === 'project'));
 const inProject = computed(() => !!store.workdir && store.workdir !== 'GLOBAL');
@@ -268,14 +263,11 @@ function defaultLabel(value: unknown): string {
   }
 }
 
-// 通过对话创建：预填当前会话输入框并回到对话，由用户补全需求后发送；
-// 星瑶会用 workflow_save 落成 .dwf.ts 文件并生成同名技能
 function onCreateViaChat() {
   store.prefillComposer('帮我创建一个工作流：');
   store.closeSubpage();
 }
 
-// 通过对话修改：带出工作流名与查看/保存路径，用户补全修改要求
 function onEditViaChat(w: WorkflowInfo) {
   store.prefillComposer(
     `请修改工作流「${w.name}」（可先用 workflow_list 查看它的定义，改完用 workflow_save 以 overwrite 保存）：我的修改要求：`,
@@ -285,18 +277,19 @@ function onEditViaChat(w: WorkflowInfo) {
 
 async function onImport() {
   const paths = await store.pickWorkflowFiles();
-  if (!paths) return; // 取消 / 未选
+  if (!paths) return;
   const scope = inProject.value ? 'project' : 'user';
   importing.busy = true;
   try {
     let result = await store.importWorkflows(paths, scope);
-    // 同名已存在：确认后对这部分文件覆盖重导
     const exists = (result.failed || []).filter(f => f.exists);
     if (exists.length && result.failed) {
       const ok = await store.askConfirm(
         '覆盖同名工作流',
         `导入 ${scope === 'project' ? '项目' : '全局'}档`,
         `${exists.map(f => f.name).join('、')} 已存在，覆盖后星瑶侧的修改将丢失，是否继续？`,
+        '覆盖并继续',
+        { tone: 'warning' },
       );
       if (ok) {
         const retry = await store.importWorkflows(paths, scope, true);
@@ -336,7 +329,6 @@ async function toggleScript(w: WorkflowInfo) {
   scriptShown[w.name] = detail && detail.body ? detail.body : '（无脚本文本）';
 }
 
-// 运行历史：展开时按需拉取台账（workflow_run 登记 / workflow_finish 回写）
 const runsShown = reactive<Record<string, boolean>>({});
 
 function toggleRuns(w: WorkflowInfo) {
@@ -374,7 +366,6 @@ function argsPreview(args: Record<string, any>): string {
   return text.length > 60 ? text.slice(0, 59) + '…' : text;
 }
 
-// 实时事件条：最新一次运行仍在 running 时，把解释执行器的节点事件翻成一行行进度
 function liveLines(w: WorkflowInfo): string[] {
   const runs = store.workflowRuns[w.name] || [];
   const active = runs.find(r => r.status === 'running');
@@ -411,8 +402,6 @@ function openRun(w: WorkflowInfo) {
       // 布尔没有「留空」态：有默认用默认，否则 false
       runForm.values[argName] = decl.default === true;
     } else {
-      // 有默认值的参数留空（输入框 placeholder 展示默认值），
-      // 留空 = 按声明的 default 生效，不显式注入 prompt
       runForm.values[argName] = '';
     }
   }
@@ -425,7 +414,7 @@ function formatArgValue(decl: WorkflowArgDecl, raw: unknown): string {
     try {
       return JSON.stringify(JSON.parse(text));
     } catch {
-      return JSON.stringify(text); // 非 JSON 文本按字符串字面量传入
+      return JSON.stringify(text);
     }
   }
   return text;
@@ -440,7 +429,7 @@ async function onRun(w: WorkflowInfo) {
       runForm.error = `参数 ${argName} 必填`;
       return;
     }
-    if ('default' in decl && !text) continue; // 留空走声明默认值
+    if ('default' in decl && !text) continue;
     if (text) parts.push(`${argName}=${formatArgValue(decl, raw)}`);
   }
   const prompt = parts.length

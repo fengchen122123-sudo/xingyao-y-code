@@ -1,9 +1,3 @@
-"""ZCode hooks 导入转换器测试（ZCode 导入设计 §2）。
-
-纯转换层直接调函数穷举；plan/apply/rollback 用 tmp 目录构造来源与目标，
-绝不触碰真实用户目录。
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,9 +14,6 @@ from core.hooks.zcode_import import (
 )
 
 
-# ── convert_matcher ────────────────────────────────────────────
-
-
 def test_matcher_omitted_is_wildcard():
     assert convert_matcher("PreToolUse", None) == ("*", "")
     assert convert_matcher("PreToolUse", "") == ("*", "")
@@ -34,9 +25,7 @@ def test_matcher_exact_alternation_maps_tool_names():
     assert convert_matcher("PreToolUse", "^Bash$") == ("execute_command", "")
     assert convert_matcher("PreToolUse", "^(Bash|Read)$") == ("execute_command|read_file", "")
     assert convert_matcher("PostToolUse", "Edit | Write") == ("edit_file|write_file", "")
-    # ApplyPatch 是 Write/Edit 的别名 → 多值 matcher
     assert convert_matcher("PreToolUse", "^ApplyPatch$") == ("write_file|edit_file", "")
-    # 未知名保留原样（匹配不上任何星瑶工具，无害）
     assert convert_matcher("PreToolUse", "^Frobnicate$") == ("Frobnicate", "")
 
 
@@ -49,17 +38,12 @@ def test_matcher_regex_semantics_rejected_not_degraded():
 
 
 def test_matcher_event_specific_policies():
-    # SessionStart 匹配子类型：全子类集 → 全匹配；出现工具名 → 跳过
     assert convert_matcher("SessionStart", "^(startup|resume|clear|compact)$") == ("*", "")
     assert convert_matcher("SessionStart", "startup")[0] == "*"
     matcher, reason = convert_matcher("SessionStart", "^Bash$")
     assert matcher is None and reason
-    # Stop 的 matcher 匹配回复文本：星瑶无对应语义，任何显式 matcher → 跳过
     matcher, reason = convert_matcher("Stop", "summary")
     assert matcher is None and reason
-
-
-# ── convert_entry ──────────────────────────────────────────────
 
 
 def test_entry_command_type_with_seconds_timeout_trap():
@@ -99,7 +83,7 @@ def test_entry_process_type_joins_argv_and_maps_status_message():
             "args": ["--fix", "a b.txt"],
             "timeoutMs": 2500,
             "statusMessage": "checking",
-            "async": True,  # ZCode 文档：async 无运行时效果，忽略
+            "async": True,
         }
     )
     assert reason == ""
@@ -107,7 +91,6 @@ def test_entry_process_type_joins_argv_and_maps_status_message():
     assert entry["status_message"] == "checking"
     assert "tools/check.sh" in entry["command"]
     assert "--fix" in entry["command"]
-    # 含空格参数必须被引号包裹（Windows list2cmdline / POSIX shlex 均如此）
     assert '"a b.txt"' in entry["command"]
 
 
@@ -118,9 +101,6 @@ def test_entry_rejects_unknown_type_and_missing_command():
     assert entry is None and reason
     entry, reason = convert_entry({"type": "process", "command": "x", "args": "nope"})
     assert entry is None and reason
-
-
-# ── convert_file：事件映射与跳过报告 ──────────────────────────
 
 
 def _config_payload(*, enabled=True):
@@ -141,7 +121,6 @@ def _config_payload(*, enabled=True):
                 "UserPromptSubmit": [
                     {"hooks": [{"type": "command", "command": "audit.sh"}]}
                 ],
-                # Stop 的 matcher 匹配回复文本：显式给 matcher 触发「无对应语义」跳过
                 "Stop": [
                     {
                         "matcher": "summary",
@@ -160,11 +139,10 @@ def test_convert_file_maps_events_and_reports_skips():
     first = report["entries"][0]
     assert first["event"] == "PreToolUse"
     assert first["matcher"] == "write_file|edit_file"
-    assert first["timeout_ms"] == 20000  # timeout 秒 → 毫秒
+    assert first["timeout_ms"] == 20000
     assert first["imported_from"] == "zcode:user"
     second = report["entries"][1]
-    assert second["timeout_ms"] == 90000  # 配置级默认超时兜底
-    # UserPromptSubmit 无事件点：条目点名跳过；Stop 的显式 matcher 无语义：跳过
+    assert second["timeout_ms"] == 90000
     assert {item["event"] for item in report["skipped"]} == {"UserPromptSubmit", "Stop"}
 
 
@@ -185,9 +163,6 @@ def test_convert_file_plugin_shape_has_no_enabled_gate():
     assert report["status"] == "imported"
     assert report["entries"][0]["event"] == "PostToolUse"
     assert report["entries"][0]["matcher"] == "*"
-
-
-# ── plan / apply / rollback（tmp 目录，project scope）──────────
 
 
 def _write(path: Path, payload) -> str:
@@ -222,15 +197,12 @@ def test_apply_and_rollback_project_scope(tmp_path):
     entries = data["hooks"]["PreToolUse"]
     assert len(entries) == 2
     assert entries[0]["imported_from"] == "zcode:project-config"
-    # 星瑶侧字段名：timeout_ms / status_message
     assert entries[0]["timeout_ms"] == 20000
 
-    # 重复导入：同事件同命令视为重复，跳过并计数
     summary_again = apply_plan(plan, workspace_root=str(tmp_path))
     assert summary_again["written"] == 0
     assert summary_again["duplicates"] == 2
 
-    # 混入一条原生条目后回滚：只删 imported_from=zcode: 的
     data["hooks"]["PreToolUse"].append(
         {"command": "native.sh", "matcher": "*", "timeout_ms": 60000}
     )
@@ -252,4 +224,4 @@ def test_apply_skips_unparseable_target_without_overwriting(tmp_path):
     summary = apply_plan(plan, workspace_root=str(tmp_path))
     assert summary["written"] == 0
     assert summary["errors"]
-    assert target.read_text(encoding="utf-8") == "{corrupt"  # 坏文件未被覆盖
+    assert target.read_text(encoding="utf-8") == "{corrupt"

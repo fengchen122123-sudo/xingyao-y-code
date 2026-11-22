@@ -1,10 +1,3 @@
-"""工作流转译执行指令构建器（ZCode 导入设计 §3.4）。
-
-星瑶不执行 TypeScript：``workflow_run`` 工具把「固定映射契约 + 脚本原文 +
-生效参数」组装成执行指令返回，主代理在同一回合按契约把脚本的编排语义映射
-到星瑶工具上完成执行。契约写死在代码里（单一事实源），不靠模型即兴发挥。
-"""
-
 from __future__ import annotations
 
 import json
@@ -45,11 +38,6 @@ WORKFLOW_EXECUTION_CONTRACT = """\
 def build_execution_directive(
     name: str, parsed: ParsedWorkflow, effective_args: dict, run: dict | None = None
 ) -> str:
-    """组装执行指令：任务框架 + 运行信息 + 生效参数 + 固定契约 + 脚本原文。
-
-    ``run`` 是运行台账记录（workflow_run 已登记）；为 None 表示台账不可用，
-    指令相应去掉收尾要求。
-    """
     parts: list[str] = [
         f"执行星瑶工作流「{name}」：{parsed.description.strip()}",
     ]

@@ -44,7 +44,6 @@
             <span class="tm">{{ isTurnLive(turn) ? '运行中' : '' }}</span>
           </div>
 
-          <!-- 工具执行行（默认折叠为一行摘要，点开看明细） -->
           <div v-if="turnToolRows(turn).length" class="fw" :class="{ open: logsOpen.has(ti) }">
             <div class="foldhead" @click="toggleLogs(ti)">
               <svg class="i sm chev"><use href="#i-chev-r" /></svg>
@@ -62,14 +61,12 @@
             </div>
           </div>
 
-          <!-- 思考段（已完成回放，默认 2 行截断，点标题展开） -->
           <div v-if="turnThinking(turn) && !isTurnLive(turn)" class="tw" :class="{ open: thinkOpen.has(ti) }">
             <div class="think">
               <div class="lb" @click="toggleThink(ti)">思考 <svg class="i sm chev"><use href="#i-chev-r" /></svg></div>{{ turnThinking(turn) }}
             </div>
           </div>
 
-          <!-- 结论 -->
           <div v-for="m in answersOf(turn)" :key="'c' + (m._msg_id ?? m.content?.slice(0, 20))" class="ans">
             <div v-if="m.content"><MdView :source="m.content" /></div>
             <div v-if="m.media?.length" class="imgrow">
@@ -77,13 +74,11 @@
             </div>
           </div>
 
-          <!-- 错误备注 + 重发 -->
           <div v-for="m in errorsOf(turn)" :key="'e' + (m._msg_id ?? m.error_note)" class="inline danger">
             {{ m.error_note }}
             <span class="retry" @click="resendLast"><svg class="i sm"><use href="#i-redo" /></svg>重发上一条消息</span>
           </div>
 
-          <!-- 回合 metrics footer（默认只留操作，指标收进“详情”） -->
           <div v-if="turnMetrics(turn) || turnUndoable(turn)" class="mw" :class="{ open: metricsOpen.has(ti) }">
             <div class="mrow">
               <span class="op" @click="copyMsg(lastAnswerText(turn))"><svg class="i sm"><use href="#i-copy" /></svg>复制</span>
@@ -102,7 +97,6 @@
             <span class="op" @click="copyMsg(lastAnswerText(turn))"><svg class="i sm"><use href="#i-copy" /></svg>复制</span>
           </div>
 
-          <!-- 运行中 live -->
           <template v-if="isTurnLive(turn)">
             <div v-if="reasonBuf" class="thinking">
               <div class="lab">思考</div>{{ reasonBuf.slice(-700) }}
@@ -113,7 +107,6 @@
         </div>
       </template>
 
-      <!-- 内联审批卡：直接在对话内允许/拒绝（与「审批」Tab 同源） -->
       <div v-if="activePerm" class="perm-card" :class="{ ask: isAskPerm }">
         <div class="pc-head">
           <svg class="i"><use :href="isAskPerm ? '#i-chat' : '#i-shield'" /></svg>
@@ -148,7 +141,6 @@
       <van-empty v-if="!store.connected" description="连接中断，等待重连…" />
     </div>
 
-    <!-- 一键到顶 / 到底（长会话时按需显示，浮在输入栏上方） -->
     <div v-if="showToTop || showToBottom" class="scroll-nav" :style="{ bottom: composerH + 12 + 'px' }">
       <div v-if="showToTop" class="snav-btn" title="回到顶部" @click="toTop">
         <svg class="i lg"><use href="#i-up2" /></svg>
@@ -158,9 +150,7 @@
       </div>
     </div>
 
-    <!-- 输入栏 -->
     <div ref="composerEl" class="composer">
-      <!-- 排队条：逐条列出（旧实现只渲染队首，第 2 条起没有任何操作入口） -->
       <div v-if="store.currentQueue.length" class="qbar">
         <div class="q-head"><svg class="i sm"><use href="#i-clock" /></svg>排队 {{ store.currentQueue.length }} 条</div>
         <div class="q-list">
@@ -175,7 +165,6 @@
         </div>
       </div>
 
-      <!-- 附件 chips -->
       <div v-if="attachChips.length" class="chips">
         <div v-for="(a, ai) in attachChips" :key="ai" class="chip">
           <svg class="i sm"><use href="#i-clip" /></svg>{{ a.name }}
@@ -186,7 +175,6 @@
       <div class="irow">
         <div class="input-box">
           <textarea v-model="draft" rows="1" :placeholder="`向${store.agentName}提问… 更多功能见右上角会话操作`" @keydown.enter.prevent="onEnter" @input="onInput" />
-          <!-- 提示/状态 + 停止：与输入框同一行（trailing） -->
           <span v-if="store.isRunning" class="inline-meta running"><span class="dot" />运行中<span class="stop-ic" title="中止会话" @click="stop"><svg class="i sm"><use href="#i-stop" /></svg></span></span>
           <span v-else class="inline-meta">Enter 发送</span>
         </div>
@@ -199,7 +187,6 @@
       </div>
     </div>
 
-    <!-- 添加附件：拍照 / 相册 / 文件（移动端底部菜单，不越 tabbar） -->
     <van-popup v-model:show="attachDlg" position="bottom" round>
       <div class="sheet att-sheet">
         <div class="sh-h"><span>添加附件</span><span class="x" @click="attachDlg = false">✕</span></div>
@@ -209,7 +196,6 @@
       </div>
     </van-popup>
 
-    <!-- 撤销确认（preview → execute，与桌面 ChangedFilesPanel 同链路） -->
     <van-popup v-model:show="undoDlg" position="bottom" round>
       <div class="sheet">
         <div class="sh-h"><span>撤销此回合</span><span class="x" @click="undoDlg = false">✕</span></div>
@@ -221,7 +207,6 @@
       </div>
     </van-popup>
 
-    <!-- 会话操作（⋯：模型/权限/重命名/清空/导出/删除，与列表长按共用组件） -->
     <SessionOps :show="opsDlg" :target="currentTarget" :can-insert="true" @close="opsDlg = false" @reopen="opsDlg = true" @deleted="goBack" @insert="insertDraft" />
   </div>
 </template>
@@ -240,7 +225,6 @@ const props = defineProps<{ id: string }>();
 const store = useAppStore();
 const router = useRouter();
 
-// 星瑶品牌 logo（public 静态资源，运行时引用；/m/ 前缀与 lan_server 托管路径一致）
 const logoUrl = '/m/icon.png';
 
 const draft = ref('');
@@ -254,7 +238,6 @@ const camInput = ref<HTMLInputElement>();
 const galInput = ref<HTMLInputElement>();
 const fileInput = ref<HTMLInputElement>();
 
-// ---- 次要信息折叠（工具日志 / 思考 / 指标，默认收起）----
 const thinkOpen = ref(new Set<number>());
 const logsOpen = ref(new Set<number>());
 const metricsOpen = ref(new Set<number>());
@@ -270,7 +253,6 @@ const toggleLogs = makeToggle(logsOpen);
 const toggleThink = makeToggle(thinkOpen);
 const toggleMetrics = makeToggle(metricsOpen);
 
-// ---- 输入：多行自适应 + / @ 引导到会话操作 ----
 let lastHintTs = 0;
 function onInput(e: Event) {
   autoGrow(e);
@@ -281,7 +263,6 @@ function onInput(e: Event) {
   }
 }
 
-/** 会话操作「更多操作」选中后插入输入框（技能 / MCP / 引用文件） */
 function insertDraft(text: string) {
   const cur = draft.value.replace(/\s+$/, '');
   draft.value = (cur ? cur + ' ' : '') + text;
@@ -295,7 +276,6 @@ function insertDraft(text: string) {
   });
 }
 
-// ---- 附件 ----
 async function onFiles(e: Event) {
   const input = e.target as HTMLInputElement;
   const files = Array.from(input.files || []);
@@ -360,7 +340,6 @@ function turnMetrics(turn: TurnGroup): ChatMessage['metrics'] | null {
   }
   return agg;
 }
-/** 本回合末条用户消息的 turnId 可撤销（后端有检查点状态时显示按钮） */
 function turnUndoable(turn: TurnGroup): boolean {
   return !!(turn.user?.turnId && store.undoStateOf(turn.user.turnId));
 }
@@ -368,18 +347,15 @@ function lastAnswerText(turn: TurnGroup): string {
   const answers = answersOf(turn);
   return answers.length ? answers[answers.length - 1].content : '';
 }
-/** 本回合全部工具调用（含历史配对结果） */
 function turnCalls(turn: TurnGroup): ToolCallUi[] {
   const calls: ToolCallUi[] = [];
   for (const m of turn.items) for (const c of m.tool_calls || []) calls.push(c);
   return calls;
 }
-/** 工具执行行：按 display 分类/分组，动作+目标+状态（对齐桌面） */
 function turnToolRows(turn: TurnGroup): ToolTraceRow[] {
   const state = isTurnLive(turn) ? 'running' : (turn.items.some((m) => m.error_note) ? 'error' : 'completed');
   return buildToolTraceRows(turnCalls(turn), state);
 }
-/** 折叠摘要：工具执行状态（执行中 / 有失败 / 已完成） */
 function toolStatus(turn: TurnGroup): string {
   const rows = turnToolRows(turn);
   if (rows.some((r) => r.status === 'running')) return '执行中…';
@@ -477,7 +453,6 @@ const reasonBuf = computed(() => store.currentThinkingText);
 const streamingText = computed(() => store.currentStreamingText);
 const recentNotices = computed(() => store.notices.slice(-3));
 
-// token 水位
 const pctClamped = computed(() => {
   const { used, window } = store.tokenUsage;
   const p = window ? Math.round((used / window) * 100) : (used ? Math.min(100, Math.round(used / 128000 * 100)) : 0);
@@ -575,7 +550,6 @@ async function stop() {
   }
 }
 
-// ---- 排队 ----
 async function cancelQueued(id: string) {
   try {
     await store.cancelQueued(id);
@@ -591,13 +565,12 @@ async function jumpQueued(id: string) {
     showFailToast(e?.message || '插队失败');
   }
 }
-/** 撤回排队消息：移出队列并把文本/附件回填输入框，供重新编辑后再发 */
 async function undoQueued(m: QueuedMsg) {
   if (draft.value.trim()) {
     try {
       await showConfirmDialog({ title: '撤回排队消息', message: '输入框已有内容，撤回会覆盖当前草稿。' });
     } catch {
-      return; // 用户放弃
+      return;
     }
   }
   try {
@@ -620,7 +593,6 @@ async function undoQueued(m: QueuedMsg) {
   }
 }
 
-// ---- 撤销回合 ----
 const undoDlg = ref(false);
 const undoSummary = ref('');
 const undoToken = ref('');
@@ -668,20 +640,17 @@ function autoGrow(e: Event) {
   ta.style.height = Math.min(124, ta.scrollHeight) + 'px';
 }
 
-/** 发送键复用：无文字→打开附件菜单；有文字→发送 */
 function onPrimary() {
   if (!draft.value.trim()) { attachDlg.value = true; return; }
   void send();
 }
 
-/** 附件来源：拍照 / 相册 / 文件（各自唤起对应 input） */
 function pickAttach(kind: 'cam' | 'gal' | 'file') {
   attachDlg.value = false;
   const el = kind === 'cam' ? camInput.value : kind === 'gal' ? galInput.value : fileInput.value;
   el?.click();
 }
 
-// ---- 一键到顶 / 到底 ----
 const showToTop = ref(false);
 const showToBottom = ref(false);
 const composerH = ref(72);
@@ -706,17 +675,14 @@ function toBottom() {
 let composerRO: ResizeObserver | null = null;
 
 const opsDlg = ref(false);
-// ⋯ 菜单目标=当前会话（与列表长按共用 SessionOps 组件）
 const currentTarget = computed(() => store.flatSessions.find((s) => s.name === store.currentSession) || null);
 
 let unwatch: (() => void) | null = null;
 onMounted(() => {
-  // 深链直开：确保当前会话与路由一致（tab 内切换时 store 已就绪则跳过）
   const want = decodeURIComponent(props.id || '');
   if (want && want !== store.currentSession && store.flatSessions.some((s) => s.name === want)) {
     void store.switchSession(want).then(() => nextTick(scrollEnd)).catch(() => {});
   }
-  // 流式更新跟随滚动
   let lastLen = 0;
   unwatch = store.$subscribe(() => {
     const len = store.currentStreamingText.length + store.currentThinkingText.length;
@@ -725,7 +691,6 @@ onMounted(() => {
       ensureLiveVisible();
     }
   });
-  // 输入栏高度随排队条/附件 chips/多行输入变化，实时同步浮动按钮位置
   if (composerEl.value && typeof ResizeObserver !== 'undefined') {
     composerRO = new ResizeObserver(() => { composerH.value = composerEl.value?.offsetHeight || 72; });
     composerRO.observe(composerEl.value);
@@ -738,14 +703,12 @@ onBeforeUnmount(() => { unwatch?.(); composerRO?.disconnect(); composerRO = null
 
 <style scoped>
 .page { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; position: relative; }
-/* 一键到顶 / 到底：浮在输入栏上方，按需显示 */
 .scroll-nav { position: absolute; right: 14px; z-index: 5; display: flex; flex-direction: column; gap: 8px; }
 .snav-btn { width: 34px; height: 34px; border-radius: 50%; background: var(--bg-raised); border: 1px solid var(--line); color: var(--text-2); display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,.3); cursor: pointer; }
 .snav-btn:active { background: var(--bg-overlay); transform: scale(.94); }
 .snav-btn .down { transform: rotate(180deg); }
 .nav-title { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
 .nvlogo { width: 22px; height: 22px; border-radius: 6px; object-fit: cover; box-shadow: 0 0 8px var(--accent-soft); }
-/* 返回键最左且醒目（logo 保留在标题旁） */
 .nav-back { width: 36px; height: 36px; border-radius: 10px; background: var(--bg-raised); border: 1px solid var(--line-strong); color: var(--text-bright); display: flex; align-items: center; justify-content: center; flex: none; }
 .nav-back .i { transform: rotate(180deg); }
 .nav-back:active { background: var(--bg-overlay); }
@@ -779,7 +742,6 @@ html.light .u-bub { background: var(--accent); }
 .a-head .tm { margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--text-3); }
 .a-head .live { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); align-self: center; animation: livepulse 1.2s infinite; }
 
-/* 折叠：工具日志 / 思考 / 指标（默认收起，点标题展开） */
 .foldhead { display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-3); cursor: pointer; padding: 4px 0; user-select: none; }
 .chev { transition: transform .15s; }
 .fw.open > .foldhead .chev, .tw.open .lb .chev { transform: rotate(90deg); }
@@ -795,7 +757,6 @@ html.light .u-bub { background: var(--accent); }
 .lg .st { width: 5px; height: 5px; border-radius: 50%; background: var(--ok); flex: none; }
 .lg.err .st { background: var(--danger); }
 .lg.live .st { background: var(--accent); animation: livepulse 1s infinite; }
-/* 分类色：读/搜=accent、命令=绿、写=mutation 橙 */
 .lg .st.k-read-group, .lg .st.k-search-group { background: var(--accent); }
 .lg .st.k-command { background: var(--ok); }
 .lg .st.k-mutation { background: var(--warn); }
@@ -807,7 +768,6 @@ html.light .u-bub { background: var(--accent); }
 .lg.err .rs { color: var(--danger); }
 .lg.live .rs { color: var(--accent); }
 
-/* 内联审批卡（与审批 Tab 同源） */
 .perm-card { border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent); background: var(--bg-panel); border-radius: 14px; padding: 12px 14px; margin: 10px 0 4px; }
 .perm-card.ask { border-color: color-mix(in srgb, var(--accent) 32%, transparent); }
 .pc-head { font-size: 11.5px; font-weight: 600; color: var(--danger); display: flex; gap: 7px; align-items: center; }
@@ -828,7 +788,6 @@ html.light .u-bub { background: var(--accent); }
 
 .thinking { font-size: 12px; line-height: 1.78; color: var(--text-3); border-left: 2px solid var(--line); padding-left: 11px; margin: 6px 0; max-height: 130px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .thinking .lab { font-size: 9.5px; letter-spacing: .16em; margin-bottom: 3px; opacity: .7; }
-/* 已完成回放的思考段（受 .tw 折叠控制） */
 .think { font-size: 12px; line-height: 1.78; color: var(--text-3); border-left: 2px solid var(--line); padding-left: 11px; margin: 4px 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .think .lb { font-size: 9.5px; letter-spacing: .16em; opacity: .7; margin-bottom: 3px; font-family: var(--font-mono); display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
 .ans { margin-top: 3px; font-size: 14.5px; line-height: 1.78; overflow-wrap: anywhere; }
@@ -852,12 +811,10 @@ html.light .u-bub { background: var(--accent); }
 .notice { font-size: 10.5px; color: var(--text-3); }
 .notice.warn { color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); background: color-mix(in srgb, var(--warn) 8%, var(--bg-panel)); border-radius: 8px; padding: 6px 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-/* ===== 输入栏 ===== */
 .composer { flex: none; position: sticky; bottom: 0; z-index: 5; background: var(--bg); border-top: 1px solid var(--line); padding: 9px 16px calc(14px + env(safe-area-inset-bottom)); }
 
 .qbar { font-size: 11px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--bg-panel)); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); border-radius: 10px; padding: 7px 12px 8px; margin-bottom: 7px; }
 .q-head { display: flex; align-items: center; gap: 6px; }
-/* 多条排队时限制高度、行内滚动，不把输入区顶出屏幕 */
 .q-list { max-height: 30vh; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
 .q-row { display: flex; align-items: center; gap: 7px; color: var(--text-1); }
 .q-idx { flex: none; font-size: 10px; color: var(--text-3); }
@@ -870,13 +827,11 @@ html.light .u-bub { background: var(--accent); }
 .chips { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
 .chip { font-size: 11px; font-family: var(--font-mono); color: var(--text-2); background: var(--bg-raised); border: 1px solid var(--line); border-radius: 99px; padding: 3px 10px; display: flex; gap: 6px; align-items: center; }
 .chip .x { color: var(--text-3); cursor: pointer; display: flex; }
-/* 提示/状态 + 停止：并入输入框同一行 */
 .inline-meta { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--text-3); flex: none; align-self: flex-end; white-space: nowrap; }
 .inline-meta.running { color: var(--ok); }
 .inline-meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); flex: none; }
 .inline-meta .stop-ic { width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--line-strong); display: flex; align-items: center; justify-content: center; color: var(--text-2); }
 .inline-meta .stop-ic:active { background: var(--bg-raised); }
-/* 输入行只有 [输入框][发送键]：附件入口复用发送键，编辑区最大化 */
 .irow { display: flex; align-items: flex-end; gap: 8px; }
 .hidden-file { display: none; }
 .input-box { flex: 1; min-width: 0; background: var(--bg-overlay); border-radius: 14px; padding: 8px 13px; display: flex; align-items: flex-end; gap: 8px; min-height: 40px; }
@@ -888,13 +843,11 @@ html.light .input-box { background: var(--bg-inset); }
 .send.empty { background: var(--bg-raised); border-color: var(--line-strong); color: var(--text-2); }
 .send:disabled { opacity: .5; }
 
-/* 添加附件底部菜单 */
 .att-sheet .ai { display: flex; align-items: center; gap: 13px; padding: 15px 16px; font-size: 14px; cursor: pointer; }
 .att-sheet .ai:active { background: var(--bg-raised); }
 .att-sheet .ai .ic { width: 38px; height: 38px; border-radius: 10px; background: var(--bg-raised); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; color: var(--accent); flex: none; }
 .att-sheet .ai .sub { margin-left: auto; font-size: 11px; color: var(--text-3); }
 
-/* 撤销弹层 */
 .sheet { padding: 14px 16px 20px; }
 .sh-h { display: flex; align-items: center; justify-content: space-between; padding: 0; margin-bottom: 10px; font-size: 13px; font-weight: 600; }
 .sh-h .x { font-size: 12px; color: var(--text-3); font-weight: 400; padding: 4px 8px; }

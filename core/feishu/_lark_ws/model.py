@@ -1,15 +1,7 @@
-"""端点响应模型（搬运自 lark-oapi 1.7.3，MIT）。
-
-上游：lark_oapi/ws/model.py。
-改造：内联上游 core/construct.py 的 init()，去掉对 lark_oapi.core 的依赖
-（本传输层不引入上游包，见 README.md）。
-"""
-
 from typing import Dict, Optional
 
 
 def _init(obj, d, types: Dict) -> None:
-    """把 dict 字段灌进模型对象；嵌套字段按 types 声明的类继续构造。"""
     if d is None:
         return
     for k, v in d.items():

@@ -43,7 +43,6 @@ it('model_changed 不串会话：其他会话的切换不影响当前显示状�
 
   expect(store.activeModelId).toBe('glm-5.3-flash');
   expect(store.activeModelName).toBe('glm-5.3-flash');
-  // 但目标会话 runtime 已记录新模型，切回去时直接采用
   expect(store._getSessionRuntime('另一个会话').modelId).toBe('k3');
 });
 

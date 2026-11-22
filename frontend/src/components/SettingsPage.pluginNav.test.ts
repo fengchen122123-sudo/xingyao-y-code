@@ -5,10 +5,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import SettingsPage from './SettingsPage.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 插件设置页从区里的「插件」列表提升为左侧导航一级入口：
-// 数据源是 store.plugins 里 has_settings === true 的项（后端 get_plugins 已返回该字段），
-// 页面主体复用 PluginSettingsPanel（props name / reloadKey），故沿用 PluginsSettings.test.ts 的
-// PAGE 常量与 loadPluginSettings mock 写法，store 数据用 $patch 铺。
 const PAGE = {
   title: 'WorkBuddy',
   sections: [
@@ -37,7 +33,6 @@ function setup() {
   return { wrapper, store };
 }
 
-/** 点左侧导航里的插件项，等设置页快照落地 */
 async function openPluginNav(wrapper: VueWrapper, name: string) {
   await wrapper.get(`[data-test="plugin-nav-${name}"]`).trigger('click');
   await flushPromises();
@@ -54,10 +49,8 @@ describe('SettingsPage 插件设置页导航入口', () => {
 
     const nav = wrapper.get('[data-test="plugin-nav-workbuddy_connect"]');
     expect(nav.text()).toContain('workbuddy_connect');
-    // has_settings 为 false 或缺省（含禁用插件）都不进导航
     expect(wrapper.find('[data-test="plugin-nav-smart_router"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="plugin-nav-hunyuan_image"]').exists()).toBe(false);
-    // 未点击前不渲染任何插件设置页
     expect(wrapper.find('[data-test="plugin-nav-page-workbuddy_connect"]').exists()).toBe(false);
   });
 
@@ -73,7 +66,6 @@ describe('SettingsPage 插件设置页导航入口', () => {
     expect(page.text()).toContain('当前账号');
     expect(page.text()).toContain('木偶');
     expect(wrapper.get('[data-test="plugin-nav-workbuddy_connect"]').classes()).toContain('active');
-    // 切到插件设置分区后不再渲染插件列表页
     expect(wrapper.find('[data-test="plugins-refresh"]').exists()).toBe(false);
   });
 

@@ -1,5 +1,3 @@
-"""Workspace Process Registry 测试（规格 §9.2）。"""
-
 from core.git import process_registry as reg
 from core.git.process_registry import (
     ProcessRecord,
@@ -19,13 +17,13 @@ def test_register_and_query_by_workspace():
     register_process("E:/proj", handle="h1", kind="execute_command", risk_class="git")
     register_process("e:/PROJ", handle="h2", kind="background_task", foreground=False, long_running=True)
     records = active_processes("E:/proj")
-    assert {r.handle for r in records} == {"h1", "h2"}  # 路径规范化（大小写/分隔符）后同一工作区
+    assert {r.handle for r in records} == {"h1", "h2"}
 
 
 def test_unregister_removes_record():
     register_process("E:/proj", handle="h1")
     assert unregister_process("h1") is True
-    assert unregister_process("h1") is False  # 幂等
+    assert unregister_process("h1") is False
     assert active_processes("E:/proj") == ()
 
 

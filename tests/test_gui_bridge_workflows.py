@@ -1,10 +1,3 @@
-"""GUI 桥层的星流工作流方法测试（get_workflows / get_workflow_detail /
-pick 占位 / import_workflows / save_workflow / delete_workflow）。
-
-桥实例用 ``ApiBridge.__new__`` 只装必需属性（gui_bridge 测试既有惯例）；
-工作流目录全部指到 tmp（home 由 monkeypatch 接管），绝不触碰真实用户目录。
-"""
-
 from __future__ import annotations
 
 import json
@@ -42,6 +35,7 @@ def env(tmp_path, monkeypatch):
     home, root = tmp_path / "home", tmp_path / "proj"
     root.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("YCODE_DATA_DIR", str(home / ".ycode"))
     return home, root
 
 
@@ -54,7 +48,6 @@ def test_get_workflows_lists_user_and_project_scopes(env):
     result = _bridge().get_workflows(str(root))
     assert result["ok"] is True
     names = [item["name"] for item in result["workflows"]]
-    # 项目档遮蔽同名全局档；坏文件进 invalid
     assert names == ["shared"]
     assert result["workflows"][0]["scope"] == "project"
     assert result["workflows"][0]["description"].startswith("Project")
@@ -94,9 +87,8 @@ def test_import_workflows_from_picked_files(env):
     assert "仅支持" in errors["bad.txt"]
     assert "missing_frontmatter" in errors["broken.dwf.ts"]
     copied = root / ".ycode" / "workflows" / "pr.dwf.ts"
-    assert copied.read_text(encoding="utf-8") == _WORKFLOW  # 逐字节复制
+    assert copied.read_text(encoding="utf-8") == _WORKFLOW
 
-    # 同名再导：exists 标记 + overwrite=True 覆盖
     again = bridge.import_workflows([str(picked / "pr.dwf.ts")], str(root), "project")
     assert again["failed"][0]["exists"] is True
     overwrite = bridge.import_workflows([str(picked / "pr.dwf.ts")], str(root), "project", True)
@@ -122,10 +114,8 @@ def test_save_and_delete_workflow_roundtrip(env):
     text = saved.read_text(encoding="utf-8")
     assert text.startswith("/* zcode-workflow")
     assert 'phase("Run");' in text
-    # 技能同步生成
     assert (home / ".ycode" / "skills" / "zcode-workflows" / "my-flow" / "SKILL.md").is_file()
 
-    # 同名不覆盖；overwrite=True 覆盖
     dup = bridge.save_workflow(dict(payload))
     assert dup["ok"] is False and "已存在同名" in dup["errors"][0]
     updated = bridge.save_workflow({**payload, "description": "My flow v2.", "overwrite": True})
@@ -173,7 +163,7 @@ def test_workflow_runs_bridge_roundtrip(env, tmp_path):
 
 
 def test_workflow_runs_bridge_tolerates_missing_storage(env):
-    bridge = _bridge()  # ApiBridge.__new__：不带 _workflow_run_storage 属性
+    bridge = _bridge()
     result = bridge.get_workflow_runs("pr")
     assert result["ok"] is True and result["runs"] == []
 

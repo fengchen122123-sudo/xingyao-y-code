@@ -1,5 +1,3 @@
-"""星轨自动化任务：常量、任务字段校验与 UI 摘要。"""
-
 from __future__ import annotations
 
 import os
@@ -9,17 +7,16 @@ from core.automation.scheduling import TRIGGER_TYPES, validate_trigger
 # 无人值守权限档位（语义完全复用 core/permission_policy.py，不另造判定）；
 # plan=计划模式（只读查询与规划）与人工回合同源，升级到确认弹窗的请求
 # 依然按无人值守语义立即自动拒绝（_activate_permission_request）。
-PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
+PERMISSION_MODES = ("confirm", "accept_edits", "auto_decision", "plan", "full")
 
-# 错过触发（应用未运行）的处理策略。
 MISSED_RUN_POLICIES = ("skip", "run_once")
+
+SESSION_MODES = ("per_run", "fixed")
 
 # 任务生命周期状态：active=可触发；completed=执行次数耗尽（自然终态，不可逆——
 # 不允许 set_enabled 复活、不允许编辑改回 active，只能复制新建）。
 TASK_STATUSES = ("active", "completed")
 
-# 运行状态机：queued → running → completed | cancelled | error；
-# skipped（单飞/错过）与 interrupted（启动恢复）为旁路终态。
 RUN_STATUSES = (
     "queued",
     "running",
@@ -32,10 +29,8 @@ RUN_STATUSES = (
 ACTIVE_RUN_STATUSES = ("queued", "running")
 FINISH_RUN_STATUSES = ("completed", "cancelled", "error")
 
-# 触发种类。
 TRIGGER_KINDS = ("scheduled", "startup", "manual", "catchup")
 
-# 任务规模上限（设计规格 5.1）。
 MAX_TASKS = 64
 MAX_NAME_CHARS = 50
 MAX_PROMPT_CHARS = 6000
@@ -64,10 +59,20 @@ def validate_task(task: dict) -> list[str]:
     elif len(prompt) > MAX_PROMPT_CHARS:
         errors.append(f"提示词不能超过 {MAX_PROMPT_CHARS} 个字符")
 
+    # 运行会话模式：缺省（None/空串）视为 per_run；取值必须显式列举
+    session_mode = task.get("session_mode")
+    if session_mode in (None, ""):
+        session_mode = "per_run"
+    elif isinstance(session_mode, str):
+        session_mode = session_mode.strip() or "per_run"
+    if session_mode not in SESSION_MODES:
+        errors.append(f"运行会话模式必须是 {'/'.join(SESSION_MODES)} 之一")
+
     target_session = task.get("target_session")
-    if not isinstance(target_session, str) or not target_session.strip():
+    target_text = target_session.strip() if isinstance(target_session, str) else ""
+    if session_mode == "fixed" and not target_text:
         errors.append("目标会话不能为空")
-    elif len(target_session.strip()) > MAX_SESSION_CHARS:
+    elif len(target_text) > MAX_SESSION_CHARS:
         errors.append(f"目标会话名不能超过 {MAX_SESSION_CHARS} 个字符")
 
     # 工作目录可选：空 = 跟随目标会话归属（已有会话以其登记目录为权威）；
@@ -97,7 +102,6 @@ def validate_task(task: dict) -> list[str]:
         if isinstance(max_runs, bool) or not isinstance(max_runs, int) or max_runs < 1:
             errors.append("最多执行次数必须是 ≥1 的整数（留空表示不限次）")
 
-    # status 是读侧字段（由存储层按认领次数维护），入参只接受 active
     status = task.get("status")
     if status not in (None, "") and status != "active":
         errors.append(

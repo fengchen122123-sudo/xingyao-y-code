@@ -1,8 +1,3 @@
-"""令牌化截图预览服务（core/computer/preview_server.py）测试（计划 Task 5 / 设计 16.3）。
-
-只打 127.0.0.1 loopback；错 token、旧 run、第四旧图与路径穿越一律 404。
-"""
-
 import os
 import socket
 import time
@@ -16,16 +11,12 @@ from tests.computer_fakes import fake_png_bytes, http_status
 
 
 def _http_get(url: str):
-    """GET 并返回 (status, headers, body)；HTTPError 同样返回其状态与头。"""
     request = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status, response.headers, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.headers, error.read()
-
-
-# ---------------- brief 样例（逐字） ----------------
 
 
 def test_preview_server_requires_token_and_keeps_only_three(tmp_path):
@@ -40,9 +31,6 @@ def test_preview_server_requires_token_and_keeps_only_three(tmp_path):
     finally:
         server.stop()
     assert not list(tmp_path.rglob("*.png"))
-
-
-# ---------------- 绑定、响应头与内容 ----------------
 
 
 def test_preview_server_binds_loopback_with_random_port(tmp_path):
@@ -82,9 +70,6 @@ def test_preview_server_tokens_differ_between_instances(tmp_path):
         second.stop()
 
 
-# ---------------- 路径穿越与 run_id 边界（一律 404） ----------------
-
-
 def test_preview_server_rejects_traversal_and_directory_index(tmp_path):
     server = ComputerPreviewServer(tmp_path)
     base = server.start()
@@ -116,8 +101,8 @@ def test_preview_server_rejects_invalid_run_id_and_filename_in_url(tmp_path):
         assert http_status(f"{prefix}/run-a/index.png") == 404
         assert http_status(f"{prefix}/run-a/1.PNG") == 404
         assert http_status(f"{prefix}/run-a/1.png/extra") == 404
-        assert http_status(f"{prefix}/run-b/1.png") == 404  # 未发布的 run
-        assert http_status(f"{prefix}/run-a/2.png") == 404  # 未发布的序号
+        assert http_status(f"{prefix}/run-b/1.png") == 404
+        assert http_status(f"{prefix}/run-a/2.png") == 404
     finally:
         server.stop()
 
@@ -131,9 +116,6 @@ def test_publish_rejects_invalid_run_id(tmp_path, run_id):
             server.publish(run_id, fake_png_bytes(1))
     finally:
         server.stop()
-
-
-# ---------------- run 切换、残留清理与资源释放 ----------------
 
 
 def test_switching_run_deletes_old_run_images_immediately(tmp_path):
@@ -152,10 +134,10 @@ def test_switching_run_deletes_old_run_images_immediately(tmp_path):
 
 
 def test_start_cleans_stale_directories_older_than_24_hours(tmp_path):
-    stale = tmp_path / "preview-9999-deadbeef"  # 本服务进程目录命名模式的残留
+    stale = tmp_path / "preview-9999-deadbeef"
     stale.mkdir()
     (stale / "leftover.png").write_bytes(fake_png_bytes(1))
-    fresh = tmp_path / "preview-8888-cafef00d"  # 同模式但未超龄
+    fresh = tmp_path / "preview-8888-cafef00d"
     fresh.mkdir()
     old = time.time() - 25 * 60 * 60
     os.utime(stale, (old, old))
@@ -171,7 +153,6 @@ def test_start_cleans_stale_directories_older_than_24_hours(tmp_path):
 
 
 def test_start_keeps_stale_directories_with_foreign_names(tmp_path):
-    """超过 24h 但非 preview-* 命名的目录绝不删除，避免误删并发进程/其他数据。"""
     foreign = tmp_path / "other-app-data"
     foreign.mkdir()
     (foreign / "keep.txt").write_text("keep", encoding="utf-8")
@@ -195,7 +176,7 @@ def test_stop_releases_port_and_is_idempotent(tmp_path):
     server.stop()
     server.stop()
     with socket.socket() as probe:
-        probe.bind(("127.0.0.1", port))  # stop 后端口必须可重新绑定
+        probe.bind(("127.0.0.1", port))
 
 
 def test_publish_requires_started_server(tmp_path):
@@ -204,15 +185,7 @@ def test_publish_requires_started_server(tmp_path):
         server.publish("run-a", fake_png_bytes(1))
 
 
-# ---------------- token 比较加固（常量时间 + 非 ASCII 候选） ----------------
-
-
 def test_preview_server_compares_token_in_constant_time(tmp_path, monkeypatch):
-    """token 校验必须走 hmac.compare_digest（常量时间），而非 != 短路比较。
-
-    预览服务绑定 loopback，时序侧信道风险低，但 token 是唯一鉴权材料，
-    比较方式按加固基线钉死：用 spy 包裹 hmac.compare_digest 断言被调用。
-    """
     import hmac as hmac_mod
 
     calls = []
@@ -235,11 +208,6 @@ def test_preview_server_compares_token_in_constant_time(tmp_path, monkeypatch):
 
 
 def test_preview_server_rejects_non_ascii_token_with_clean_404(tmp_path):
-    """原始非 ASCII 字节 token（请求行按 latin-1 解码后为非 ASCII str）必须干净 404。
-
-    hmac.compare_digest 对非 ASCII str 抛 TypeError（会变成 500/断连），
-    此测试钉住 isascii 前置守卫：坏 token 永远只表现为 404，不区分原因。
-    """
     server = ComputerPreviewServer(tmp_path)
     base = server.start()
     port = int(base.rsplit(":", 1)[1])

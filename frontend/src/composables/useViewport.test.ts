@@ -40,7 +40,6 @@ describe('useIsMobile', () => {
     expect(isMobile.value).toBe(true);
     desktop.fire(false);
     expect(isMobile.value).toBe(false);
-    // 确认订阅已注册（fire 有监听者），消除未使用告警语义歧义
     expect(mobile.fire).toBeTruthy();
   });
 });

@@ -1,9 +1,6 @@
 <template>
   <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : msg.role === 'notice' ? 'msg-notice' : 'msg-assistant'">
-    <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大）；气泡下方悬停浮现操作栏 -->
     <template v-if="msg.role === 'user'">
-      <!-- QQ2009 皮肤专属：用户消息昵称行（仅内置 QQ2009 主题激活时渲染；
-           样式在 themes/qq2009.css，本组件不加样式） -->
       <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-msg-sender">
         <b class="qq09-sender-name">木偶</b>
       </div>
@@ -33,7 +30,6 @@
             @click="store.openLightbox(msg.images!, i)"
           >
         </div>
-        <!-- 编辑态：图片可逐张移除，新图由下方「添加图片」追加 -->
         <div
           v-if="editing && editImages.length"
           class="edit-img-grid"
@@ -62,8 +58,6 @@
           >{{ note }}</div>
         </div>
       </div>
-      <!-- 编辑态操作区：保存即截断本条之后的历史并重新生成；被截断回合的
-           文件改动不会回滚，所以就地提示一句，避免用户以为代码也退回去了 -->
       <div v-if="editing" class="user-edit-bar">
         <span class="user-edit-hint">{{ editHint }}</span>
         <input
@@ -103,7 +97,6 @@
           <span>{{ editSubmitting ? '处理中…' : '保存并重新生成' }}</span>
         </button>
       </div>
-      <!-- 用户消息操作栏：气泡下方，悬停气泡时浮现；点击编辑或复制本条消息 -->
       <div v-else-if="msg.content" class="user-action-bar">
         <button
           v-if="canEdit"
@@ -129,31 +122,31 @@
       </div>
     </template>
 
-    <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
       <div class="assistant-body">
-        <!-- 名字行：一个回合只在最前面显示一次（由 TurnGroup 决定归属），
-             其余轮次的助手消息不再重复「星瑶 · 模型」；「已取消」徽标始终保留 -->
         <div v-if="showName || msg.cancelled" class="assistant-name">
           <template v-if="showName">
-            <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+            <b class="an-agent">{{ store.agentName }}</b>
+            <span class="an-model">{{ msg.model_name || store.activeModelName || '模型' }}</span>
           </template>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 
-        <!-- 思考过程 Block（对齐 ZCode 思考块形态：脑图标 + 灰色状态文案 + 悬停才出现的箭头，
-             无底色无边框；展开后弱灰正文、左侧 1px 细线、限高内滚 + 上下边缘渐隐 + 默认吸底） -->
-        <div v-if="msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
+        <div v-if="showProcess && msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
           <FoldCard v-model:open="thinkingOpen" caret="end">
             <template #title>
               <span class="tk-head">
-                <AppIcon class="tk-brain" name="brain" :size="13" :stroke-width="1.7" />
+                <AppIcon class="tk-brain" name="lightbulb" :size="13" :stroke-width="1.8" />
                 <span class="tk-label" :class="{ 'is-thinking': !!thinkLiveLine }">{{ thinkLabel }}</span>
                 <template v-if="thinkLiveLine">
                   <span class="tk-sep">·</span>
                   <span class="tk-live" data-test="think-live-line">
                     <span class="tk-live-text">{{ thinkLiveLine }}</span>
                   </span>
+                </template>
+                <template v-else-if="!thinkingOpen && thinkSummaryLine">
+                  <span class="tk-sep">·</span>
+                  <span class="tk-summary">{{ thinkSummaryLine }}</span>
                 </template>
               </span>
             </template>
@@ -170,7 +163,7 @@
              文件链接先渲染、后经后端批量校验，目录/不存在的路径降级为纯文本；
              媒体清单（media_v1）存在时 ![..](..)/[video:..](..) 渲染为图片/视频 -->
         <div
-          v-if="msg.content && msg.content.trim()"
+          v-if="showAnswer && msg.content && msg.content.trim()"
           ref="mdBodyRef"
           class="md-body"
           @click="onMdBodyClick"
@@ -178,21 +171,18 @@
           <div v-for="b in mdBlocks" :key="b.key" class="md-block" v-html="b.html"></div>
         </div>
 
-        <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
         <ToolExecutionTrace
-          v-if="(msg.tool_calls && msg.tool_calls.length > 0) || (msg.legacy_diffs && msg.legacy_diffs.length > 0)"
+          v-if="showProcess && ((msg.tool_calls && msg.tool_calls.length > 0) || (msg.legacy_diffs && msg.legacy_diffs.length > 0))"
           :calls="msg.tool_calls || []"
           :legacy-diffs="msg.legacy_diffs || []"
           :state="msg.execution_state || 'completed'"
         />
 
-        <!-- 回合进行中的非终态错误（挂在助手消息上，不插队成独立 error 消息） -->
-        <div v-if="msg.error_note" class="error-note">
+        <div v-if="showAnswer && msg.error_note" class="error-note">
           <AppIcon name="triangle-alert" :size="13" /> {{ msg.error_note }}
         </div>
 
-        <!-- 登录态失效：错误提示下方直接出现「重新登录」，点一下拉起登录窗 -->
-        <div v-if="msg.error_note && isLoginExpiredError(msg.error_note)" class="login-again-row">
+        <div v-if="showAnswer && msg.error_note && isLoginExpiredError(msg.error_note)" class="login-again-row">
           <button
             type="button"
             class="login-again-btn"
@@ -203,9 +193,7 @@
           </button>
         </div>
 
-        <!-- 断点续跑（S4）：仅当后端 resume_plan 判定可续跑时出现（开关关闭时不出现）。
-             按钮只续跑无写操作的调用；含写操作的调用需人工重做，blockers 列表就地展示 -->
-        <div v-if="msg.error_note && store.resumeAvailable" class="resume-continue" data-test="resume-continue">
+        <div v-if="showAnswer && msg.error_note && store.resumeAvailable" class="resume-continue" data-test="resume-continue">
           <button
             type="button"
             class="resume-btn"
@@ -217,7 +205,7 @@
           </button>
           <span class="resume-hint">仅回灌已完成的调用；含写操作的调用需手动重做</span>
         </div>
-        <ul v-if="msg.error_note && store.resumeBlockers.length" class="resume-blockers" data-test="resume-blockers">
+        <ul v-if="showAnswer && msg.error_note && store.resumeBlockers.length" class="resume-blockers" data-test="resume-blockers">
           <li
             v-for="item in store.resumeBlockers"
             :key="item.call_ordinal"
@@ -227,22 +215,19 @@
           </li>
         </ul>
 
-        <!-- 等待模型响应期间的动态反馈（对齐 CLI 的"正在干活"） -->
-        <div v-if="showWorking" class="working-line">
+        <div v-if="showAnswer && showWorking" class="working-line">
           <span class="spin"></span>
           <span class="wl-text">{{ store.agentName }}正在干活<span class="wl-dots"><i>.</i><i>.</i><i>.</i></span></span>
           <span v-if="elapsed >= 3" class="wl-elapsed">已等待 {{ elapsed }}s</span>
         </div>
 
-        <!-- 流式生成中的实时速度指示胶囊 -->
-        <div v-else-if="isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
+        <div v-else-if="showAnswer && showStreamingSpeed && isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
           <AppIcon name="orbit" :size="12" class="zap-pulse" />
           <span>{{ liveSpeedText }}</span>
         </div>
 
-        <!-- 助手消息底部性能指标结算栏（生成完毕后展示） -->
         <div
-          v-else-if="msg.metrics && (msg.metrics.token_speed || msg.metrics.duration_s)"
+          v-else-if="showAnswer && showMetrics && msg.metrics && (msg.metrics.token_speed || msg.metrics.duration_s)"
           class="msg-metrics-bar"
           :title="metricsTooltip"
           data-test="msg-metrics"
@@ -261,7 +246,6 @@
       </div>
     </div>
 
-    <!-- 错误提示（余额不足 / 模型异常等运行错误，写入对话流而非弹窗） -->
     <div v-else-if="msg.role === 'error'" class="error-card">
       <span class="error-icon"><AppIcon name="triangle-alert" :size="16" /></span>
       <div class="error-body">
@@ -282,7 +266,6 @@
       </div>
     </div>
 
-    <!-- 对话内系统提示（取代原 Toast：跟随对话流，不自动消失） -->
     <div v-else-if="msg.role === 'notice'" class="notice-card">
       <span class="notice-icon"><AppIcon name="info" :size="15" /></span>
       <div class="notice-body">
@@ -309,25 +292,28 @@ import ToolExecutionTrace from './ToolExecutionTrace.vue';
 
 const props = withDefaults(defineProps<{
   msg: ChatMessage;
-  /** 是否显示「星瑶 · 模型」名字行：一个回合只在最前面显示一次 */
   showName?: boolean;
+  showMetrics?: boolean;
+  /** 是否显示流式速度胶囊（TurnGroup 方案A 关闭避免 t/s 刷屏） */
+  showStreamingSpeed?: boolean;
+  showProcess?: boolean;
+  showAnswer?: boolean;
 }>(), {
   showName: true,
+  showMetrics: true,
+  showStreamingSpeed: true,
+  showProcess: true,
+  showAnswer: true,
 });
 
-// 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
-// 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
 const store = useAppStore();
 
-// 登录过期提示上的「重新登录」：拉起基元律动登录窗，并顺手刷新一次登录态
-// （接口抖动时状态能立即回正，用户关掉弹窗也不会继续看到过期的账号信息）。
 function onLoginAgain() {
   store.openTrLoginModal();
   void store.refreshTrAuth();
 }
 // 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
 const isMobile = useIsMobile();
-// 用户消息复制按钮的「已复制」反馈状态与定时器
 const userCopied = ref(false);
 let userCopiedTimer: number | undefined;
 const showWorking = computed(() => {
@@ -346,7 +332,6 @@ const isLatestAssistant = computed(() => {
   return msgs.length > 0 && msgs[msgs.length - 1] === props.msg;
 });
 
-// 流式实时速度胶囊可见性：正在运行、是当前最新助手消息、非纯等待中且已有流式文本
 const isStreamingSpeedVisible = computed(() => {
   if (props.msg.role !== 'assistant' || !store.running) return false;
   if (!isLatestAssistant.value) return false;
@@ -361,7 +346,6 @@ const liveSpeedText = computed(() => {
   return speed > 0 ? formatTokenSpeed(speed) : '正在输出...';
 });
 
-// 结算后性能指标 Tooltip 详细说明
 const metricsTooltip = computed(() => {
   const m = props.msg.metrics;
   if (!m) return '';
@@ -383,7 +367,6 @@ const metricsTooltip = computed(() => {
   return parts.join(' · ');
 });
 
-// 等待时长计时：等待超过 3 秒后显示秒数，让用户明确知道仍在处理而不是卡死
 const elapsed = ref(0);
 let elapsedTimer: number | undefined;
 watch(showWorking, (v) => {
@@ -403,8 +386,6 @@ onUnmounted(() => {
   if (userCopiedTimer) window.clearTimeout(userCopiedTimer);
 });
 
-// 思考块默认跟随全局 store.showThinking；用户在本条消息上手动切换过一次后，
-// 该条消息就"钉住"为用户选择的状态，不再随全局按钮变化。
 const localThinkOverride = ref<boolean | null>(null);
 const thinkingOpen = computed({
   get: () => (localThinkOverride.value !== null ? localThinkOverride.value : store.showThinking),
@@ -415,8 +396,6 @@ const thinkingOpen = computed({
 // 避免一整段没有换行的思考把标题塞满开头几个字、看上去像不动
 const THINK_LIVE_MAX = 90;
 
-// 去掉行首 markdown 标记（标题 # / 引用 > / 列表 - * 1. / 代码围栏）与行内强调符号，
-// 只留一行纯文本给折叠标题用
 function toPlainHeadline(line: string): string {
   const plain = line
     .replace(/^\s*```[A-Za-z0-9_+-]*/, '')
@@ -427,8 +406,17 @@ function toPlainHeadline(line: string): string {
   return plain.length > THINK_LIVE_MAX ? `…${plain.slice(-THINK_LIVE_MAX)}` : plain;
 }
 
-// 折叠态要显示的实时思考行：仅在「本条最新气泡仍在流式生成」时给值，
-// 展开态（用户要看全文）与生成结束后都返回空串，回落到固定标签"思考"
+const thinkSummaryLine = computed(() => {
+  const raw = props.msg.reasoning_content || '';
+  if (!raw.trim()) return '';
+  const lines = raw.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const plain = toPlainHeadline(lines[i]);
+    if (plain) return plain;
+  }
+  return '';
+});
+
 const thinkLiveLine = computed(() => {
   if (thinkingOpen.value) return '';
   if (!store.running || !isLatestAssistant.value) return '';
@@ -442,9 +430,6 @@ const thinkLiveLine = computed(() => {
   return '';
 });
 
-/* ── 思考耗时（对齐 ZCode 的「思考 · N 秒」）──────────────────────────
-   只有在本条气泡还处于流式态时才有可信的起始时刻；历史消息挂载时已经
-   结束，拿不到起始时间，就不编造耗时，标签只显示「思考」。 */
 const thinkStartAt = ref<number | null>(null);
 const thinkEndedAt = ref<number | null>(null);
 const thinkTick = ref(Date.now());
@@ -480,14 +465,12 @@ const thinkDurationSec = computed(() => {
   return Math.max(1, Math.round((end - start) / 1000));
 });
 
-// 收起 + 流式中显示「正在思考 · <最新一行>」；其余显示「思考」，有耗时时追加「· N 秒」
 const thinkLabel = computed(() => {
   if (thinkLiveLine.value) return '正在思考';
   const sec = thinkDurationSec.value;
   return sec === null ? '思考' : `思考 · ${sec} 秒`;
 });
 
-// 耗时只在「展开 + 流式中」每秒刷新：收起态看不到秒数，没必要触发整块重渲染
 watch(
   () => thinkingOpen.value && thinkStreaming.value,
   (ticking) => {
@@ -504,7 +487,6 @@ watch(
   { immediate: true },
 );
 
-/* ── 展开区滚动：边缘渐隐状态 + 默认吸底 ────────────────────────────── */
 const tkScrollRef = ref<HTMLElement | null>(null);
 const tkAtTop = ref(true);
 const tkAtBottom = ref(true);
@@ -518,7 +500,6 @@ function syncTkScroll() {
   tkAtBottom.value = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
 }
 
-// 思考内容流式追加时默认跟到底部；用户自己往上滚离底部后不再抢滚动位置
 watch(
   () => props.msg.reasoning_content,
   async () => {
@@ -530,7 +511,6 @@ watch(
   },
 );
 
-// 收起态是 v-show 隐藏（clientHeight=0），重新展开后要重算遮罩与吸底状态
 watch(thinkingOpen, async () => {
   await nextTick();
   syncTkScroll();
@@ -548,7 +528,6 @@ onUnmounted(() => {
   }
 });
 
-// 媒体渲染上下文：media_v1 清单按 ordinal 与正文中的媒体语法对齐
 const mediaCtx = computed(() =>
   props.msg.media && props.msg.media.length ? { items: props.msg.media } : undefined
 );
@@ -564,8 +543,6 @@ const mediaSignature = computed(() =>
 );
 let lastMediaSig: string | null = null;
 
-// 块级增量渲染：已完成块的 HTML 按「起始媒体序号 + 块源码」缓存，
-// 流式期间只重渲染尾部块。缓存是组件级的，随组件销毁回收，不跨消息串味。
 const blockCache = new Map<string, { html: string; mediaCount: number }>();
 
 interface MdBlock {
@@ -618,9 +595,6 @@ async function copyToClipboard(text: string): Promise<void> {
   }
 }
 
-// Markdown 内容点击事件委托：本地文件链接走内嵌预览，代码块复制按钮走复制；
-// 媒体图片点击进灯箱（与本条消息内其他图片共用导航序列），
-// 悬停的"复制原图"按钮把原图写入系统剪贴板
 function onMdBodyClick(e: MouseEvent) {
   const copyBtn = (e.target as HTMLElement).closest('button.md-img-copy');
   if (copyBtn) {
@@ -638,10 +612,6 @@ function onMdBodyClick(e: MouseEvent) {
     return;
   }
 
-  // mermaid 图点击放大进灯箱（须先于 img 分支判断：图内不含 md-img，
-  // 两者天然互斥）。传的是当前 DOM 里 injectSvg 注入的已净化 SVG 字符串，
-  // 灯箱用 v-html 直注（与气泡同一条渲染路径），不绕 data URL 二次解析；
-  // 流式重建 DOM 后点到的总是最新缓存内容，天然安全。
   const mermaidSvg = (e.target as HTMLElement).closest('.mermaid-svg');
   if (mermaidSvg) {
     const svg = mermaidSvg.innerHTML;
@@ -703,7 +673,6 @@ function onMdBodyClick(e: MouseEvent) {
       }, 1500);
     })
     .catch(() => {
-      // 复制失败保持原样，不额外提示
     });
 }
 
@@ -752,9 +721,6 @@ async function copyMdImageToClipboard(src: string, btn: HTMLButtonElement) {
   }
 }
 
-// "另存为"：后端弹原生保存对话框，把仓库里的原文件复制到用户选择的位置。
-// 图片与视频共用本函数（按钮由 Markdown 渲染层产出，类名不同、属性约定一致）。
-// 用户取消不提示失败；成功/失败都在按钮上短暂反馈，不打断阅读。
 async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButtonElement) {
   const label = btn.querySelector('.md-img-save-text, .md-video-save-text');
   const restore = () => {
@@ -772,7 +738,6 @@ async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButton
     if (res && res.ok) {
       feedback('已保存', 'saved');
     } else if (!res || !res.cancelled) {
-      // 取消对话框不是错误，静默复原；其余失败给出可见提示
       feedback('保存失败', 'save-failed');
       if (res && res.msg) store.notifyChat(`另存失败：${res.msg}`);
     }
@@ -781,7 +746,6 @@ async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButton
   }
 }
 
-// mermaid 块复制源码：渲染成功与否都可从隐藏/展示的 pre.mermaid-src 取原文
 function onMermaidCopyClick(btn: HTMLElement) {
   const source = btn.closest('.mermaid-block')?.querySelector('pre.mermaid-src');
   if (!source) return;
@@ -794,7 +758,6 @@ function onMermaidCopyClick(btn: HTMLElement) {
       }, 1500);
     })
     .catch(() => {
-      // 复制失败保持原样，不额外提示
     });
 }
 
@@ -803,9 +766,6 @@ function onMermaidCopyClick(btn: HTMLElement) {
 // 挂载/内容变化后再由后端批量确认真实类型；目录与不存在的路径还原为纯文本，
 // 避免用户点击后才发现「无法预览」。校验失败（如 API 未就绪）时保留链接原样。
 const mdBodyRef = ref<HTMLElement | null>(null);
-// 跨渲染的路径类型缓存：v-html 在 content 每次变化时整体重建 DOM，
-// 节点级标记会随 innerHTML 替换丢失，因此按路径文本缓存校验结果；
-// 流式输出期间同一路径只请求一次后端。
 const pathKindCache = new Map<string, string>();
 let pathCheckSeq = 0;
 
@@ -833,8 +793,7 @@ function downgradeInvalidFileLinks(root: HTMLElement | null): void {
   if (!pending.length) return;
   const seq = ++pathCheckSeq;
   store.checkPathsKind(pending.map(p => p.abs)).then((results) => {
-    if (seq !== pathCheckSeq) return; // 期间内容又变了，丢弃过期结果
-    // 按返回的 path 字段对应（而非索引），对重复触发/乱序更稳健
+    if (seq !== pathCheckSeq) return;
     for (const r of results || []) {
       if (r && r.kind) {
         const hit = pending.find(p => p.abs === r.path);
@@ -845,7 +804,6 @@ function downgradeInvalidFileLinks(root: HTMLElement | null): void {
       if (!a.isConnected) continue;
       const raw = a.getAttribute('data-file-link') || '';
       const kind = pathKindCache.get(raw);
-      // 校验不到的条目（理论不发生）保持链接原样，宁可多留可点链接也不误伤
       if (kind && kind !== 'file') {
         const span = document.createElement('span');
         span.textContent = a.textContent || '';
@@ -866,7 +824,6 @@ watch(
   { immediate: true },
 );
 
-// 用户消息复制：点击复制按钮把本条消息文本写入剪贴板，按钮短暂显示「已复制」
 async function copyUserMessage() {
   const text = props.msg.content || '';
   if (!text) return;
@@ -876,20 +833,15 @@ async function copyUserMessage() {
   userCopiedTimer = window.setTimeout(() => { userCopied.value = false; }, 1500);
 }
 
-// 编辑已发送消息：气泡就地变输入框，提交后由 store 截断历史并重新发送。
-// 生成中也能编辑：提交会先打断当前回合并等它收尾，再回滚重发
 const editing = ref(false);
 const editText = ref('');
 const editSubmitting = ref(false);
 const editInputRef = ref<HTMLTextAreaElement | null>(null);
-// 编辑态的图片：初始是本条消息原有的 dataURL；新增的（选文件/粘贴）也是 dataURL，
-// 提交时统一经 saveClipboardImage 落盘成路径，交给 sendMessage 的附件链路
 const editImages = ref<string[]>([]);
 const editImageInput = ref<HTMLInputElement | null>(null);
 
 const canEdit = computed(() => !!props.msg._msg_id);
 
-// 提示要说清后果：运行中会中断当前回合并丢弃它产生的记录
 const editHint = computed(() => (store.running
   ? '保存将中断当前回合，并删除该回合产生的记录'
   : '该回合的文件改动不会随编辑回滚'));
@@ -935,8 +887,6 @@ function readFileAsDataUrl(file: File): Promise<string> {
 
 async function addEditImageFiles(files: File[]) {
   for (const file of files) {
-    // 与 save_clipboard_image 支持的格式对齐：不支持的当场挡掉，
-    // 免得提交时才报错、用户还得重新选一遍
     if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) continue;
     const url = await readFileAsDataUrl(file);
     if (url) editImages.value.push(url);
@@ -946,7 +896,7 @@ async function addEditImageFiles(files: File[]) {
 async function onEditImagesPicked(e: Event) {
   const input = e.target as HTMLInputElement;
   const files = Array.from(input.files || []);
-  input.value = '';   // 复位后同一个文件可以再次选择
+  input.value = '';
   await addEditImageFiles(files);
 }
 
@@ -977,7 +927,6 @@ async function submitEdit() {
   if (editSubmitting.value) return;
   const text = editText.value.trim();
   const imagesChanged = !sameImages(editImages.value, props.msg.images || []);
-  // 文本和图都没动 = 取消；文本和图都空 = 没内容可发
   if (!text && !editImages.value.length) return;
   if (text === (props.msg.content || '').trim() && !imagesChanged) {
     cancelEdit();
@@ -985,7 +934,6 @@ async function submitEdit() {
   }
   editSubmitting.value = true;
   try {
-    // 历史图与新图都是 dataURL：统一落盘成路径后走 sendMessage 的附件链路
     const paths: string[] = [];
     for (const url of editImages.value) {
       if (!url.startsWith('data:')) {
@@ -998,7 +946,6 @@ async function submitEdit() {
       paths.push(saved);
     }
     const ok = await store.editUserMessage(props.msg, text, paths);
-    // 成功后本组件对应的消息已被移出列表；失败留在编辑态便于重试
     if (ok) editing.value = false;
   } finally {
     editSubmitting.value = false;
@@ -1028,18 +975,19 @@ function onEditKeydown(e: KeyboardEvent) {
   align-items: flex-end;
 }
 .msg-user .bubble {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 12px 12px 4px 12px;
-  padding: 10px 14px;
-  max-width: 70%;
-  line-height: 1.65;
+  background: var(--xy-user-bubble, var(--bg2));
+  border: none;
+  border-radius: 16px;
+  padding: 8px 16px;
+  max-width: 82%;
+  font-size: 14px;
+  line-height: 1.625;
+  color: var(--xy-text, var(--text));
 }
 .user-text {
   white-space: pre-wrap;
   word-break: break-word;
 }
-/* 用户消息图片：1 张大图 / 2 张并排 / 3 张及以上三列网格 */
 .img-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -1092,7 +1040,6 @@ function onEditKeydown(e: KeyboardEvent) {
 .attachment-note + .attachment-note {
   margin-top: 2px;
 }
-/* 用户消息操作栏：气泡下方一行，悬停气泡时浮现（时间戳后续补充） */
 .user-action-bar {
   display: flex;
   align-items: center;
@@ -1104,7 +1051,6 @@ function onEditKeydown(e: KeyboardEvent) {
 .msg-user:hover .user-action-bar {
   opacity: 1;
 }
-/* 编辑态：气泡变可编辑文本框，操作区常驻（不随 hover 淡出） */
 .user-bubble.is-editing {
   max-width: 80%;
 }
@@ -1206,30 +1152,38 @@ function onEditKeydown(e: KeyboardEvent) {
   min-width: 0;
 }
 .assistant-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
-  color: var(--text-faint);
-  margin-bottom: 4px;
+  color: var(--xy-text-3, var(--text-faint));
+  margin-bottom: 8px;
 }
-.assistant-name b {
-  color: var(--text-dim);
+.assistant-name .an-agent {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--xy-text, var(--text));
+}
+.assistant-name .an-model {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
 }
 .cancel-badge {
-  margin-left: 8px;
+  margin-left: 4px;
   font-size: 10.5px;
-  color: var(--orange);
-  background: rgba(240, 136, 62, 0.12);
+  color: var(--xy-amber, var(--orange));
+  background: var(--xy-amber-soft, rgba(240, 136, 62, 0.12));
   border-radius: 6px;
   padding: 1px 7px;
 }
 
-/* 思考块（对齐 ZCode）：整块无底色无边框，折叠头是一行轻量灰字——
-   脑图标 +「思考 · N 秒」+ 悬停才浮现的小箭头 */
 .think-block {
-  margin: 10px 0;
-  font-size: 12.5px;
-  color: var(--text-faint);
+  margin: 4px 0 6px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
 }
-/* 折叠头改成贴合内容的行内宽度（ZCode 的 trigger 是 self-start，不铺满整行） */
 .think-block :deep(.fold-head) {
   width: fit-content;
   max-width: 100%;
@@ -1238,7 +1192,7 @@ function onEditKeydown(e: KeyboardEvent) {
   color: inherit;
 }
 .think-block :deep(.fold-head:hover) {
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
 }
 .tk-head {
   display: inline-flex;
@@ -1252,10 +1206,9 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 .tk-label {
   flex: none;
-  font-weight: 500;
+  font-weight: 400;
   white-space: nowrap;
 }
-/* 流式中的标签走极轻的扫光渐变，比"呼吸圆点"更安静 */
 .tk-label.is-thinking {
   background: linear-gradient(
     90deg,
@@ -1275,17 +1228,20 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 .tk-sep {
   flex: none;
-  opacity: 0.5;
+  opacity: 0.65;
 }
-/* 收起态的流式摘要：单行省略，占用标签之后的剩余宽度 */
-.tk-live {
+.tk-live,
+.tk-summary {
   display: inline-flex;
   align-items: center;
   flex: 1 1 auto;
   min-width: 0;
   font-weight: 400;
   letter-spacing: 0;
-  color: var(--text-dim);
+  color: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tk-live-text {
   min-width: 0;
@@ -1293,9 +1249,9 @@ function onEditKeydown(e: KeyboardEvent) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 箭头平时不出现，悬停 / 键盘聚焦 / 已展开时才浮现（与 ZCode 的 hover-only 一致） */
 .think-block :deep(.fold-caret) {
-  opacity: 0;
+  opacity: 0.75;
+  margin-left: 2px;
   transition: opacity 0.12s ease, transform 0.15s ease;
 }
 .think-block :deep(.fold-head:hover .fold-caret),
@@ -1304,23 +1260,19 @@ function onEditKeydown(e: KeyboardEvent) {
   opacity: 1;
 }
 .tk-cnt {
-  margin: 4px 0 0 6px;
-  padding-left: 14px;
-  border-left: 1px solid var(--border);
-  /* 展开后默认只占 10 行高度（1.6em 即一行行高），超出部分内部滚动查看，
-     避免超长思考把整个对话拉成一条；+2px 抵消行高小数的取整误差，防止
-     恰好 10 行时露出 1px 滚动条 */
+  margin: 4px 0 2px;
+  padding-left: 20px;
+  border-left: none;
   max-height: calc(1.6em * 10 + 2px);
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   white-space: pre-wrap;
-  font-family: var(--mono);
+  font-family: inherit;
   font-size: 12px;
   line-height: 1.6;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
-/* 滚动边缘渐隐：在顶部只淡出底边，在底部只淡出顶边，在中间两侧都淡 */
 .tk-cnt.is-scrollable.at-bottom:not(.at-top) {
   -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
   mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
@@ -1365,7 +1317,6 @@ function onEditKeydown(e: KeyboardEvent) {
   to { transform: rotate(360deg); }
 }
 
-/* 等待响应期间的动态反馈行 */
 .working-line {
   display: flex;
   align-items: center;
@@ -1394,7 +1345,6 @@ function onEditKeydown(e: KeyboardEvent) {
   font-size: 11.5px;
 }
 
-/* 流式生成实时速度胶囊 */
 .streaming-speed-pill {
   display: inline-flex;
   align-items: center;
@@ -1417,7 +1367,6 @@ function onEditKeydown(e: KeyboardEvent) {
   50% { opacity: 1; transform: scale(1.15); }
 }
 
-/* 生成完毕指标结算栏 */
 .msg-metrics-bar {
   display: inline-flex;
   align-items: center;
@@ -1451,18 +1400,18 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 
 .md-body {
-  margin-top: 8px;
-  line-height: 1.7;
+  margin-top: 0;
+  font-size: 13.5px;
+  line-height: 1.68;
+  color: var(--xy-text, var(--text));
 }
 
-/* 本地文件链接：虚线强调，与普通 http 链接区分，点击走内嵌预览 */
 .md-body :deep(a[data-file-link]) {
   color: var(--accent);
   text-decoration: underline dotted;
   cursor: pointer;
 }
 
-/* ---- 媒体语法渲染：图片网格 / 视频播放器 / 明确失败态 ---- */
 .md-body :deep(.md-media-wrap) {
   position: relative;
   display: block;
@@ -1478,10 +1427,6 @@ function onEditKeydown(e: KeyboardEvent) {
   cursor: zoom-in;
   object-fit: contain;
 }
-/* 悬停浮现的媒体操作区（图片：复制原图 / 另存为；视频：另存为）：压在媒体
-   右上角，按钮横向排列。视频原生控件条在底部，与顶部操作区不重叠。
-   配色固定为深色底白字（不随主题变量走），保证压在任意明暗的图片/画面上
-   都有足够对比度 */
 .md-body :deep(.md-img-actions),
 .md-body :deep(.md-video-actions) {
   position: absolute;
@@ -1496,7 +1441,6 @@ function onEditKeydown(e: KeyboardEvent) {
 .md-body :deep(.md-media-wrap:hover .md-video-actions),
 .md-body :deep(.md-img-actions:focus-within),
 .md-body :deep(.md-video-actions:focus-within),
-/* 按钮自身处于反馈态时（点击后鼠标移开）操作区继续保持可见 */
 .md-body :deep(.md-img-actions:has(.copied)),
 .md-body :deep(.md-img-actions:has(.saved)),
 .md-body :deep(.md-img-actions:has(.copy-failed)),
@@ -1570,9 +1514,6 @@ function onEditKeydown(e: KeyboardEvent) {
   font-size: 12px;
 }
 
-/* ---- mermaid 图表块：渲染中/成功/失败三态 ----
-   markdown.ts 只产出占位容器（源码已转义在 pre.mermaid-src 内），
-   mermaidRenderer 异步注入净化后的 SVG；流式重建 DOM 后凭缓存 key 秒回。 */
 .md-body :deep(.mermaid-block) {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1608,11 +1549,9 @@ function onEditKeydown(e: KeyboardEvent) {
   max-width: 100%;
   height: auto;
 }
-/* mermaid 图可点击放大进灯箱（见 onMdBodyClick 的 .mermaid-svg 分支） */
 .md-body :deep(.mermaid-svg) {
   cursor: zoom-in;
 }
-/* 渲染中占位 */
 .md-body :deep(.mermaid-block[data-state='pending'])::after,
 .md-body :deep(.mermaid-block[data-state='rendering'])::after {
   content: '图表渲染中…';
@@ -1622,7 +1561,6 @@ function onEditKeydown(e: KeyboardEvent) {
   color: var(--text-faint);
   padding: 8px 0;
 }
-/* 渲染失败：显示源码 + 明确提示（渲染器加载失败同此态） */
 .md-body :deep(.mermaid-block[data-state='error']) .mermaid-src {
   display: block;
   white-space: pre-wrap;
@@ -1640,14 +1578,12 @@ function onEditKeydown(e: KeyboardEvent) {
   color: var(--orange);
   margin-top: 6px;
 }
-/* 成功态与渲染中隐藏源码（error 态由上面规则放开） */
 .md-body :deep(.mermaid-block[data-state='done'] .mermaid-src),
 .md-body :deep(.mermaid-block[data-state='pending'] .mermaid-src),
 .md-body :deep(.mermaid-block[data-state='rendering'] .mermaid-src) {
   display: none;
 }
 
-/* 挂在助手消息上的非终态错误提示 */
 .error-note {
   display: flex;
   align-items: flex-start;
@@ -1665,7 +1601,6 @@ function onEditKeydown(e: KeyboardEvent) {
   word-break: break-word;
 }
 
-/* 登录过期：错误提示旁直接出现的「重新登录」入口 */
 .login-again-row {
   display: flex;
   align-items: center;
@@ -1691,7 +1626,6 @@ function onEditKeydown(e: KeyboardEvent) {
   background: color-mix(in srgb, var(--accent) 16%, var(--bg3));
 }
 
-/* 断点续跑入口（S4）：紧贴错误条，说明"只续跑无写操作的调用" */
 .resume-continue {
   display: flex;
   align-items: center;
@@ -1767,8 +1701,8 @@ function onEditKeydown(e: KeyboardEvent) {
   word-break: break-word;
 }
 
-/* 对话内系统提示条（取代原 Toast）：主色调、与错误卡区分 */
 .msg-notice {
+  width: 100%;
   display: flex;
   justify-content: flex-start;
 }
@@ -1776,20 +1710,20 @@ function onEditKeydown(e: KeyboardEvent) {
   width: 100%;
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 10px 14px;
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
-  border-left: 3px solid var(--accent);
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--xy-border, var(--border));
   border-radius: 10px;
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg2));
-  font-size: 13px;
-  line-height: 1.6;
+  background: var(--xy-surface, var(--bg2));
+  font-size: 12.5px;
+  line-height: 1.55;
 }
 .notice-icon {
   flex-shrink: 0;
-  color: var(--accent);
-  font-size: 15px;
-  line-height: 1.6;
+  color: var(--xy-text-3, var(--text-faint));
+  display: inline-flex;
+  align-items: center;
+  height: 19px;
 }
 .notice-body {
   flex: 1;
@@ -1801,13 +1735,13 @@ function onEditKeydown(e: KeyboardEvent) {
 }
 .notice-title {
   flex-shrink: 0;
-  font-weight: 600;
-  color: var(--accent);
+  font-weight: 500;
+  color: var(--xy-text-2, var(--text-dim));
 }
 .notice-text {
   flex: 1;
   min-width: 0;
-  color: var(--text);
+  color: var(--xy-text-2, var(--text-dim));
   white-space: pre-wrap;
   word-break: break-word;
 }

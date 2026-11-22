@@ -5,17 +5,12 @@ import { nextTick } from 'vue';
 import Sidebar from './Sidebar.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 移植自二改包 src/components/Sidebar.moveSession.test.ts，按本仓（官方 1.3.6）现状调整：
-// - 会话分组多了「秘书」（folder_path='SECRETARY'）：它不是磁盘目录，不能作为移动目标，
-//   秘书会话本身也不提供「移动到…」入口，故新增两条对应用例；
-// - 目标条目文案走本仓现有的 getFolderTitle 口径。
 const wrappers: VueWrapper[] = [];
 afterEach(() => {
   wrappers.splice(0).forEach((w) => w.unmount());
   delete (window as any).pywebview;
 });
 
-// 秘书分组 + 两个项目分组 + 一个「对话」(GLOBAL) 分组
 function sessionGroups() {
   return [
     {
@@ -268,7 +263,6 @@ describe('store.moveSessionToWorkdir', () => {
     await nextTick();
 
     expect(store.workdir).toBe('F:\\projA');
-    // 文件树内容原样保留（不经 toBe：pinia 状态里是响应式代理，不是同一个引用）
     expect(store.fileTree).toEqual(treeBefore);
   });
 

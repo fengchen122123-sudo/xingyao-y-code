@@ -1,26 +1,9 @@
-"""Win32 SendInput 输入适配器（设计 13.2-13.4、21）。
-
-ctypes 封装 Win32 SendInput。所有底层调用点（SendInput、DPI awareness、
-input desktop、foreground window、GetSystemMetrics、热键探测）都可通过构造
-参数注入，pytest 绝不真实移动鼠标或发送键盘；默认实现只在生产/人工 smoke
-路径惰性触碰 ctypes.windll。
-
-preflight() 顺序固定（fail-closed）：
-平台 win32 → 设置/确认 Per-Monitor V2 DPI awareness → input desktop 名称为
-Default → 存在 foreground window → 紧急停止热键可注册。任何失败映射稳定
-错误码，绝不请求管理员提权、绝不重启进程。
-
-SendInput 返回数量少于请求数量即 computer_input_rejected，并按已成功前缀
-尽力释放本批次已按下的键/鼠标键；组合键与 drag 在 finally 中释放已按下
-状态。鼠标绝对坐标使用 MOUSEEVENTF_VIRTUALDESK|MOUSEEVENTF_ABSOLUTE，
-Unicode 文本使用 KEYEVENTF_UNICODE。
-"""
-
 from __future__ import annotations
 
 import ctypes
 import logging
 import sys
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Callable
@@ -28,8 +11,6 @@ from typing import Callable
 from core.computer.models import ComputerControlError
 
 _LOGGER = logging.getLogger(__name__)
-
-# ---------------- Win32 常量 ----------------
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
@@ -64,7 +45,6 @@ _ABSOLUTE_RANGE = 65535
 _GA_ROOT = 2
 _VK_MENU = 0x12
 
-# 统一动作键名 → 虚拟键码（登记制；与 core/computer/actions.py 的键名白名单对齐）。
 KEY_NAME_TO_VK = {
     "CTRL": 0x11,
     "ALT": 0x12,
@@ -100,9 +80,6 @@ _MOUSE_ACTIONS = frozenset(
 )
 
 
-# ---------------- 事件描述符（send_input seam 的输入形状） ----------------
-
-
 @dataclass(frozen=True)
 class MouseEventDescriptor:
     """一个鼠标输入事件；x/y 为 0-65535 归一化虚拟桌面坐标（仅 MOVE 使用）。"""
@@ -121,8 +98,6 @@ class KeyEventDescriptor:
     scan: int
     flags: int
 
-
-# ---------------- ctypes INPUT 结构（仅默认 send_input 使用） ----------------
 
 _ULONG_PTR = ctypes.c_size_t
 
@@ -164,18 +139,11 @@ class _INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("union", _INPUT_UNION)]
 
 
-# ---------------- 默认 seam 实现（只在生产路径惰性触碰 windll） ----------------
-
 _CF_UNICODETEXT = 13
 _GMEM_MOVEABLE = 0x0002
 
 
 def _ctypes_set_clipboard_text(text: str) -> None:
-    """默认剪贴板写入：CF_UNICODETEXT；剪贴板被占用时短暂重试后失败。
-
-    只在 type_text 非 ASCII 路径惰性触碰 windll；不恢复用户原剪贴板内容
-    （恢复无可靠事务语义，与业界 RPA 实现一致）。
-    """
     import time as _time
 
     user32 = ctypes.windll.user32
@@ -188,8 +156,6 @@ def _ctypes_set_clipboard_text(text: str) -> None:
     kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
     kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
     kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
-    # SetClipboardData 与 OpenClipboard/EmptyClipboard/CloseClipboard 一样
-    # 属于 user32；kernel32 只承担 Global* 内存管理。
     user32.SetClipboardData.restype = ctypes.c_void_p
     user32.SetClipboardData.argtypes = (wintypes.UINT, ctypes.c_void_p)
     user32.OpenClipboard.argtypes = (wintypes.HWND,)
@@ -198,8 +164,6 @@ def _ctypes_set_clipboard_text(text: str) -> None:
         if user32.OpenClipboard(0):
             handle = None
             try:
-                # EmptyClipboard 属于 user32（winuser.h）；kernel32 只有
-                # GlobalAlloc/GlobalLock/GlobalUnlock/SetClipboardData。
                 user32.EmptyClipboard()
                 handle = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
                 if not handle:
@@ -215,8 +179,6 @@ def _ctypes_set_clipboard_text(text: str) -> None:
                     raise OSError("SetClipboardData 失败")
                 return  # 成功后句柄归系统所有，不得 GlobalFree
             except Exception as error:
-                # ctypes 函数查找失败抛 AttributeError 而非 OSError
-                #（会话 156 实测），统一归一为稳定领域错误。
                 if handle:
                     try:
                         kernel32.GlobalFree(handle)
@@ -234,7 +196,6 @@ def _ctypes_set_clipboard_text(text: str) -> None:
 
 
 def _ctypes_send_input(events: list) -> int:
-    """默认 SendInput：把事件描述符转换为 INPUT 数组，返回成功注入的数量。"""
     user32 = ctypes.windll.user32
     count = len(events)
     array = (_INPUT * count)()
@@ -254,16 +215,6 @@ def _ctypes_send_input(events: list) -> int:
 
 
 def _ctypes_ensure_dpi_awareness() -> bool:
-    """确认进程为 Per-Monitor V2；已是则只验证，否则显式设置后再验证。
-
-    设置失败时降级评估 System DPI aware（2026-09-05 GUI 开关死锁修复）：
-    pywebview WinForms 后端启动即 SetProcessDPIAware()，把 GUI 进程锁死在
-    System aware——进程 DPI 感知只能设置一次，此处再切 PMv2 必然失败。
-    System aware 下桌面操控坐标链路依然自洽：GetSystemMetrics/截图 DC/
-    SendInput 0-65535 归一化全部工作在物理像素桌面坐标系（DPI 虚拟化只
-    影响 UNAWARE 进程与窗口呈现，不影响这些 API），因此放行。UNAWARE
-    （系统缩放≠100% 时 metrics 被虚拟化）与 PMv1 仍拒绝（fail-closed）。
-    """
     user32 = ctypes.windll.user32
     user32.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
     user32.AreDpiAwarenessContextsEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -276,7 +227,6 @@ def _ctypes_ensure_dpi_awareness() -> bool:
             user32.GetThreadDpiAwarenessContext(), pmv2
         ):
             return True
-    # PMv2 设置失败（GUI 进程已被 pywebview 锁死）：System aware 坐标自洽，放行
     system = ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)
     return bool(
         user32.AreDpiAwarenessContextsEqual(
@@ -286,11 +236,7 @@ def _ctypes_ensure_dpi_awareness() -> bool:
 
 
 def _ctypes_input_desktop_name() -> str | None:
-    """当前 input desktop 名称；打不开（非交互式会话）返回 None。"""
     user32 = ctypes.windll.user32
-    # 64 位句柄防御（Task 16）：ctypes 默认 restype 是 c_int，会把 64 位
-    # HDESK 截断成 32 位——CloseDesktop 随即拿到无效句柄（句柄泄漏）。
-    # 显式声明 c_void_p，CloseDesktop 的参数同样按指针宽度传递。
     user32.OpenInputDesktop.restype = ctypes.c_void_p
     user32.CloseDesktop.argtypes = [ctypes.c_void_p]
     handle = user32.OpenInputDesktop(0, False, _GENERIC_READ)
@@ -313,18 +259,11 @@ def _ctypes_input_desktop_name() -> str | None:
 
 def _ctypes_foreground_window() -> int:
     user32 = ctypes.windll.user32
-    # 64 位窗口句柄防御（Task 16）：默认 c_int restype 会截断 HWND。
     user32.GetForegroundWindow.restype = ctypes.c_void_p
     return int(user32.GetForegroundWindow() or 0)
 
 
 def _ctypes_window_from_point(x: int, y: int) -> int:
-    """默认 WindowFromPoint：物理坐标点所属窗口的**顶层** HWND（无窗口返回 0）。
-
-    64 位句柄防御（Task 16 教训）：restype 显式 c_void_p，避免 HWND 截断；
-    WindowFromPoint 可能返回子窗口（如 Edit 控件），SetForegroundWindow 需要
-    顶层窗口，故经 GetAncestor(GA_ROOT) 上溯（上溯失败回落原句柄）。
-    """
     user32 = ctypes.windll.user32
     user32.WindowFromPoint.restype = ctypes.c_void_p
     user32.WindowFromPoint.argtypes = (wintypes.POINT,)
@@ -339,21 +278,12 @@ def _ctypes_window_from_point(x: int, y: int) -> int:
 
 
 def _ctypes_set_foreground_window(hwnd: int) -> bool:
-    """默认 SetForegroundWindow：失败用经典 Alt 键技巧（VK_MENU down+up）
-    解除系统前台锁后重试一次，仍失败返回 False。
-
-    best-effort（通用化重构 Task C）：调用方适配器方法吞异常归一为 False，
-    绝不抛错阻断输入。
-    """
+    """调用 SetForegroundWindow 并验证实际前台句柄（不使用 VK_MENU 或 AttachThreadInput）。"""
     user32 = ctypes.windll.user32
     user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-    if user32.SetForegroundWindow(int(hwnd)):
-        return True
-    user32.keybd_event(_VK_MENU, 0, 0, 0)
-    try:
-        return bool(user32.SetForegroundWindow(int(hwnd)))
-    finally:
-        user32.keybd_event(_VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    if not user32.SetForegroundWindow(int(hwnd)):
+        return False
+    return _ctypes_foreground_window() == int(hwnd)
 
 
 def _ctypes_window_title(hwnd: int) -> str:
@@ -416,9 +346,6 @@ def _default_hotkey_probe() -> bool:
     finally:
         probe.close()
     return True
-
-
-# ---------------- 适配器 ----------------
 
 
 class Win32InputAdapter:
@@ -485,8 +412,14 @@ class Win32InputAdapter:
         )
         self._pressed_keys: list[str] = []
         self._pressed_buttons: set[str] = set()
+        self._input_gate = threading.Lock()
+        self._input_stop = threading.Event()
 
-    # ---------------- preflight 与运行期桌面检查 ----------------
+    def request_stop(self) -> None:
+        """Reject new input batches after the currently submitted batch completes."""
+        self._input_stop.set()
+        with self._input_gate:
+            pass
 
     def preflight(self) -> None:
         """固定顺序 fail-closed 检查；任何失败映射稳定错误码，不提权不重启。"""
@@ -551,10 +484,6 @@ class Win32InputAdapter:
         return title if isinstance(title, str) else ""
 
     def foreground_window_id(self) -> int:
-        """前台窗口本地稳定标识（HWND 整数值）；无前台窗口返回 0。
-
-        只用于本地 surface 身份比对（R5），不进入 Provider 消息或 Journal。
-        """
         hwnd = self._get_foreground_window()
         return int(hwnd) if hwnd else 0
 
@@ -596,11 +525,23 @@ class Win32InputAdapter:
             _LOGGER.exception("SetForegroundWindow 激活失败")
             return False
 
-    # ---------------- 底层发送与部分失败恢复 ----------------
-
-    def _deliver(self, events: list) -> None:
-        """发送一批事件；SendInput 部分成功时按已生效前缀尽力释放后报错。"""
-        sent = self._send_input(list(events))
+    def _deliver(self, events: list, *, release_only: bool = False) -> None:
+        if release_only and any(
+            isinstance(event, KeyEventDescriptor)
+            and not event.flags & KEYEVENTF_KEYUP
+            or isinstance(event, MouseEventDescriptor)
+            and any(event.flags & down for down, _up in _MOUSE_BUTTON_FLAGS.values())
+            for event in events
+        ):
+            raise ComputerControlError(
+                "computer_invalid_action", "停止后只允许释放已按下的键鼠输入"
+            )
+        with self._input_gate:
+            if self._input_stop.is_set() and not release_only:
+                raise ComputerControlError(
+                    "computer_cancelled", "桌面输入已停止，拒绝提交新输入批次"
+                )
+            sent = self._send_input(list(events))
         if sent == len(events):
             return
         self._release_batch_prefix(events[: max(0, int(sent))])
@@ -610,7 +551,6 @@ class Win32InputAdapter:
         )
 
     def _release_batch_prefix(self, events: list) -> None:
-        """部分 SendInput 成功后，为前缀中未配对的 down 事件补发 up（尽力而为）。"""
         pending: list = []
         for event in events:
             if isinstance(event, KeyEventDescriptor):
@@ -660,11 +600,22 @@ class Win32InputAdapter:
         except ValueError:
             pass
 
-    def _key_up_quietly(self, name: str, vk: int) -> None:
+    def _key_up_quietly(
+        self, name: str, vk: int, *, release_only: bool = True
+    ) -> None:
         try:
-            self._key_up(name, vk)
+            if release_only and self._input_stop.is_set():
+                self._deliver(
+                    [KeyEventDescriptor(vk=vk, scan=0, flags=KEYEVENTF_KEYUP)],
+                    release_only=True,
+                )
+                try:
+                    self._pressed_keys.remove(name)
+                except ValueError:
+                    pass
+            else:
+                self._key_up(name, vk)
         except Exception:
-            # 释放失败保留按下标记，供 release_all 重试（与 browser backend 一致）。
             _LOGGER.exception("释放按键失败: %s", name)
 
     @staticmethod
@@ -675,8 +626,6 @@ class Win32InputAdapter:
                 f"不支持的键名: {name!r}",
             )
         return name, KEY_NAME_TO_VK[name]
-
-    # ---------------- 公开输入 API ----------------
 
     def send_keys(self, keys) -> None:
         """组合键：按顺序按下、逆序释放；任何失败都在 finally 中释放已按下键。"""
@@ -756,7 +705,7 @@ class Win32InputAdapter:
             self._dispatch_mouse(action, x=x, y=y, button=button, delta=delta, path=path)
         finally:
             for name, vk in reversed(pressed):
-                self._key_up_quietly(name, vk)
+                self._key_up_quietly(name, vk, release_only=True)
 
     def _dispatch_mouse(self, action: str, *, x, y, button: str, delta: int, path) -> None:
         down_flag, up_flag = _MOUSE_BUTTON_FLAGS[button]
@@ -789,13 +738,10 @@ class Win32InputAdapter:
         elif action == "wheel":
             if type(delta) is not int:
                 raise ComputerControlError("computer_invalid_action", "wheel delta 必须是整数")
-            # R7 统一契约：delta 为逻辑滚轮步进，正值向下；Win32
-            # MOUSEEVENTF_WHEEL 正值表示滚轮远离用户（内容向上），故取反。
             self._deliver([MouseEventDescriptor(0, 0, MOUSEEVENTF_WHEEL, -delta * WHEEL_DELTA)])
         elif action == "hwheel":
             if type(delta) is not int:
                 raise ComputerControlError("computer_invalid_action", "hwheel delta 必须是整数")
-            # R7：逻辑步进正值向右，与 Win32 MOUSEEVENTF_HWHEEL 正方向一致。
             self._deliver([MouseEventDescriptor(0, 0, MOUSEEVENTF_HWHEEL, delta * WHEEL_DELTA)])
         elif action == "drag":
             self._drag(path, button, down_flag, up_flag)
@@ -822,9 +768,10 @@ class Win32InputAdapter:
             for point_x, point_y in points[1:]:
                 self._deliver([self._absolute_move(point_x, point_y)])
         finally:
-            # try/finally 保证释放；up 失败时保留按下标记供 release_all 重试。
             try:
-                self._deliver([MouseEventDescriptor(0, 0, up_flag)])
+                self._deliver(
+                    [MouseEventDescriptor(0, 0, up_flag)], release_only=True
+                )
             except Exception:
                 _LOGGER.exception("拖拽收尾释放鼠标键失败: %s", button)
                 raise
@@ -832,7 +779,6 @@ class Win32InputAdapter:
                 self._pressed_buttons.discard(button)
 
     def _absolute_move(self, x: int, y: int) -> MouseEventDescriptor:
-        """物理像素 → 0-65535 归一化虚拟桌面坐标；发送前再次检查半开区间边界。"""
         if type(x) is not int or type(y) is not int:
             raise ComputerControlError("computer_invalid_action", "坐标 x/y 必须是整数")
         origin_x, origin_y, width, height = self.virtual_screen_rect()
@@ -855,27 +801,31 @@ class Win32InputAdapter:
         )
 
     def release_all(self) -> None:
-        """尽力释放全部已按下的键与鼠标键；释放失败只留痕不抛出。
-
-        先整体快照再构造事件：controller 停止路径的 release 与回合线程的
-        send_keys 并发时，直接 reversed(列表) 迭代会抛
-        "list changed size during iteration"被上层吞掉，本次释放失败、
-        修饰键残留。
-        """
-        pressed_keys = list(self._pressed_keys)
-        pressed_buttons = sorted(self._pressed_buttons)
-        self._pressed_keys.clear()
-        self._pressed_buttons.clear()
-        events: list = []
-        for name in reversed(pressed_keys):
-            events.append(
-                KeyEventDescriptor(vk=KEY_NAME_TO_VK[name], scan=0, flags=KEYEVENTF_KEYUP)
-            )
-        for button in pressed_buttons:
-            events.append(MouseEventDescriptor(0, 0, _MOUSE_BUTTON_FLAGS[button][1]))
-        if not events:
-            return
-        try:
-            self._send_input(events)
-        except Exception:
-            _LOGGER.exception("释放全部输入状态失败")
+        with self._input_gate:
+            pressed_keys = list(self._pressed_keys)
+            pressed_buttons = sorted(self._pressed_buttons)
+            events: list = []
+            for name in reversed(pressed_keys):
+                events.append(
+                    KeyEventDescriptor(
+                        vk=KEY_NAME_TO_VK[name], scan=0, flags=KEYEVENTF_KEYUP
+                    )
+                )
+            for button in pressed_buttons:
+                events.append(MouseEventDescriptor(0, 0, _MOUSE_BUTTON_FLAGS[button][1]))
+            if not events:
+                return
+            try:
+                sent = self._send_input(events)
+            except Exception as error:
+                raise ComputerControlError(
+                    "computer_cleanup_failed",
+                    f"释放已按下的输入失败：{type(error).__name__}",
+                ) from error
+            if sent != len(events):
+                raise ComputerControlError(
+                    "computer_input_rejected",
+                    f"释放输入只接受了 {sent}/{len(events)} 个事件，按键状态仍待确认",
+                )
+            self._pressed_keys.clear()
+            self._pressed_buttons.clear()

@@ -1,22 +1,13 @@
-"""水位线计算基准上限（memory_compression.watermark_base_tokens /
-model_watermark_bases）配置读取层的单元测试。
-
-只验证配置读取与容错：非法配置必须安全回落（None / {}），
-绝不能把用户写错的新配置变成配置读取崩溃。
-"""
-
 import pytest
 
 import core.memory_compressor as mc
 
 
 def _patch_load_config(monkeypatch, config):
-    """把 core.model_manager.load_config 打桩为返回指定 dict。"""
     monkeypatch.setattr("core.model_manager.load_config", lambda: config)
 
 
 def test_missing_memory_compression_section(monkeypatch):
-    """a. 无 memory_compression 配置 → 基准为 None / 空表。"""
     _patch_load_config(monkeypatch, {})
     cfg = mc._load_compression_config()
     assert cfg["watermark_base_tokens"] is None
@@ -25,7 +16,6 @@ def test_missing_memory_compression_section(monkeypatch):
 
 
 def test_global_watermark_base_tokens(monkeypatch):
-    """b. 全局 watermark_base_tokens 生效。"""
     _patch_load_config(
         monkeypatch,
         {"memory_compression": {"watermark_base_tokens": 400000}},
@@ -35,7 +25,6 @@ def test_global_watermark_base_tokens(monkeypatch):
 
 
 def test_model_specific_overrides_global(monkeypatch):
-    """c. model_watermark_bases 命中时覆盖全局值，未命中回落全局值。"""
     _patch_load_config(
         monkeypatch,
         {
@@ -50,7 +39,6 @@ def test_model_specific_overrides_global(monkeypatch):
 
 
 def test_model_name_leaf_and_case_normalization(monkeypatch):
-    """d. 模型名取最后一个 "/" 之后的叶子名、小写；键也 strip + 小写归一。"""
     _patch_load_config(
         monkeypatch,
         {
@@ -69,7 +57,6 @@ def test_model_name_leaf_and_case_normalization(monkeypatch):
 
 @pytest.mark.parametrize("bad_value", [0, -1, "abc", 1.5, True, None])
 def test_invalid_global_value_is_none(monkeypatch, bad_value):
-    """e1. 全局基准非法值安全忽略为 None。"""
     _patch_load_config(
         monkeypatch,
         {"memory_compression": {"watermark_base_tokens": bad_value}},
@@ -80,7 +67,6 @@ def test_invalid_global_value_is_none(monkeypatch, bad_value):
 
 @pytest.mark.parametrize("bad_dict", ["oops", [1, 2], 123, None])
 def test_non_dict_model_bases_is_empty(monkeypatch, bad_dict):
-    """e2. model_watermark_bases 非 dict → {}，并按全局值回落。"""
     _patch_load_config(
         monkeypatch,
         {
@@ -95,7 +81,6 @@ def test_non_dict_model_bases_is_empty(monkeypatch, bad_dict):
 
 
 def test_invalid_model_entries_are_filtered(monkeypatch):
-    """e3. 非法条目过滤，合法条目保留。"""
     _patch_load_config(
         monkeypatch,
         {
@@ -118,7 +103,6 @@ def test_invalid_model_entries_are_filtered(monkeypatch):
 
 
 def test_load_config_exception_falls_back_safely(monkeypatch):
-    """f. load_config 抛异常 → 配置读取仍可用且基准为 None（不抛）。"""
 
     def boom():
         raise RuntimeError("config broken")

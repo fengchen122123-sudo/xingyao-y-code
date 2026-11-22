@@ -1,22 +1,3 @@
-"""集成测试：厂商多 Key 粘性故障转移接入主请求链路（core/llm.py）。
-
-设计依据：docs/superpowers/specs/2026-10-12-provider-multi-key-failover-design.md
-（第 3 节「请求链路接入」）。
-
-mock 层级：
-- ``core.llm.completion``：控制上游响应（抛错 / 返回 chunk 流）；
-- ``core.model_manager.load_config``：注入双 Key provider 配置；
-- Key 池本身走真实 ``core.provider_keys.build_key_failover`` / ``ProviderKeyPool``，
-  仅清理进程内 ``_POOL_REGISTRY`` 保证测试隔离（池为进程内存态）。
-
-覆盖行为规格：
-a) 402 额度耗尽 → 第二次请求自动换到第二个 Key 并成功；成功 Key 成为新 sticky；
-b) 401 鉴权失败 → 同样自动切换；
-c) 两个 Key 全失败 → 抛原错误，completion 调用次数 = Key 数（本链每 Key 只试一次）；
-d) 成功路径 → api_key 全程不变（跨 Turn 粘性），不触发切换；
-e) 429 限速 → 不切换 Key（走既有退避重试，sleep 已 mock 为 no-op）。
-"""
-
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -67,7 +48,6 @@ PROVIDER_CONFIG = {
 
 
 class _StubApiError(Exception):
-    """带状态码的上游异常（可被 map_llm_error 分类）。"""
 
     def __init__(self, message, status_code=None):
         super().__init__(message)
@@ -85,7 +65,6 @@ def _chunk(content=""):
 
 
 def _make_fast_retry(mocker):
-    """把退避等待压到最小，避免测试真实 sleep（参照 test_degenerate_output_guard）。"""
     mocker.patch("core.llm.is_rate_limit_error", lambda exc: (True, 0.01))
     mocker.patch("core.llm.random.random", lambda: 0.0)
     mocker.patch("core.llm.time.sleep", lambda *args, **kwargs: None)
@@ -93,7 +72,6 @@ def _make_fast_retry(mocker):
 
 @pytest.fixture(autouse=True)
 def _double_key_provider(mocker):
-    """注入双 Key provider 配置，并在测试前后重置进程内 Key 池注册表。"""
     mocker.patch(
         "core.model_manager.load_config", return_value=deepcopy(PROVIDER_CONFIG)
     )
@@ -103,7 +81,6 @@ def _double_key_provider(mocker):
 
 
 def _run_turn(turn_id, messages=None):
-    """跑一个最小成本的完整回合（persist=False，不消费后台通知）。"""
     if messages is None:
         messages = [{"role": "user", "content": "你好"}]
     return list(
@@ -120,7 +97,6 @@ def _run_turn(turn_id, messages=None):
 
 
 def test_key_related_failure_classification():
-    """_is_key_related_failure 仅覆盖三类 Key 类失败；429/404 等不命中。"""
     assert llm._KEY_RELATED_FAILURE_CATEGORIES == frozenset({
         "insufficient_quota", "auth_invalid", "permission_denied",
     })
@@ -143,7 +119,6 @@ def test_key_related_failure_classification():
 
 
 def test_quota_error_switches_to_next_key_and_keeps_new_key_sticky(mocker):
-    """a) 402 额度耗尽：第二次请求自动用 k2 成功；k2 成为后续请求链的 sticky Key。"""
     keys_used = []
 
     def completion(**kwargs):
@@ -157,7 +132,6 @@ def test_quota_error_switches_to_next_key_and_keeps_new_key_sticky(mocker):
 
     events = _run_turn("turn-quota-switch")
 
-    # 同一请求链内：第一次用 KEY_1（失败）→ 静默换到 KEY_2（成功）
     assert keys_used == [KEY_1, KEY_2]
     assert events[-1].kind == "turn_finished"
     assert not any(event.kind in ("error", "turn_error") for event in events)
@@ -167,14 +141,12 @@ def test_quota_error_switches_to_next_key_and_keeps_new_key_sticky(mocker):
     assert any("多 Key 静默切换" in message for message in info_args)
     assert not any(KEY_1 in message or KEY_2 in message for message in info_args)
 
-    # 粘性迁移：后续请求链直接使用成功过的 KEY_2，不回切 KEY_1
     events_second = _run_turn("turn-quota-switch-second")
     assert keys_used == [KEY_1, KEY_2, KEY_2]
     assert events_second[-1].kind == "turn_finished"
 
 
 def test_auth_error_switches_to_next_key(mocker):
-    """b) 401 鉴权失败：自动切换到第二个 Key 重发。"""
     keys_used = []
 
     def completion(**kwargs):
@@ -193,7 +165,6 @@ def test_auth_error_switches_to_next_key(mocker):
 
 
 def test_all_keys_fail_raises_original_error_without_infinite_retry(mocker):
-    """c) 两个 Key 全失败：抛原错误，completion 调用次数 = Key 数（本链每 Key 只试一次）。"""
     keys_used = []
     quota_exc = _StubApiError(QUOTA_ERROR_TEXT, status_code=402)
 
@@ -213,7 +184,6 @@ def test_all_keys_fail_raises_original_error_without_infinite_retry(mocker):
 
 
 def test_success_path_never_switches_key(mocker):
-    """d) 成功路径：api_key 全程不变（两个连续 Turn 都用 sticky Key），不触发切换。"""
     keys_used = []
 
     def completion(**kwargs):
@@ -234,7 +204,6 @@ def test_success_path_never_switches_key(mocker):
 
 
 def test_rate_limit_does_not_switch_key_and_keeps_retrying(mocker):
-    """e) 429 限速：不切换 Key，走既有退避重试（第三次成功）。"""
     _make_fast_retry(mocker)
     keys_used = []
     rate_exc = _StubApiError(RATE_LIMIT_ERROR_TEXT, status_code=429)

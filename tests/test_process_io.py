@@ -41,7 +41,6 @@ def test_strip_ansi_escapes_handles_osc_and_two_byte_sequences():
 
 
 def test_strip_ansi_escapes_neutralizes_lone_esc_byte():
-    # 不完整序列（日志截断常见）：整段正则匹配不上，兜底删 ESC 使其失效
     assert strip_ansi_escapes("前缀\x1b[33") == "前缀[33"
     assert "\x1b" not in strip_ansi_escapes("a\x1bb")
 

@@ -1,24 +1,6 @@
-"""断点续跑 S4「入口与开关」单测：GUI 桥接 resume_plan / resume_execute。
-
-覆盖四件事：
-1. 开关关闭（默认）时两个入口都回 disabled，且零副作用（不写库、不发请求）；
-2. 开关打开且存在可续跑回合时，plan 快照字段齐全（父回合 / 断点位置 / 锚点 /
-   判定 / blockers / aborts）；
-3. aborts 非空时 resume_execute 直接回原因，绝不构造/调用执行层；
-4. 桥接内部异常被吞成 {"ok": False, "msg": ...}，不冒到前端。
-
-另有「真实接线」回归（S4 收尾）：
-5. 门禁通过时 resume_execute 返回 dry_run=False，request_fn 被调用一次且关键字为
-   turn_id / parent_turn_id / request_reason="resume"，线程起点收到同一 turn_id；
-6. 续跑不改写父回合历史（messages 零新增、父 turn 行逐字段未变）；
-7. ResumeExecutor 拿到的是同一 owner 租约的 HarnessJournal；manager 不支持
-   journal 存储时 writer 回退 None 且不报错；
-8. 续跑 worker 内部抛异常不吞：turn_error + notice + turn_finish 都可见。
-"""
 import threading
 import types
 
-import pytest
 
 import config
 import core.agent_service as agent_service
@@ -32,7 +14,6 @@ from gui_bridge import ApiBridge
 
 
 class _Spec:
-    """工具规格替身：只读、无副作用、内置来源。"""
 
     read_only = True
     side_effect_scope = "none"
@@ -53,7 +34,6 @@ class _Registry:
 
 
 def _bridge(manager):
-    """不走 __init__（会拉起窗口队列等依赖），只注入续跑需要的管理器。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._memory = manager
     return bridge
@@ -65,7 +45,6 @@ def _switch(monkeypatch, enabled):
 
 
 def _setup(tmp_path, *, completed_step=True):
-    """父回合：step1 已完成（带四哈希锚点），step2 停在 tools_running。"""
     manager = MemoryManager(str(tmp_path / "resume-entry.db"))
     manager.create_session_explicit("session")
     journal = HarnessJournal(manager, "owner-test", clock_ms=lambda: 10_000)
@@ -131,7 +110,6 @@ def test_switch_off_returns_disabled_without_side_effects(tmp_path, monkeypatch)
     assert plan_payload == {"ok": False, "reason": "disabled"}
     assert exec_payload == {"ok": False, "reason": "disabled"}
     assert exec_payload_confirmed == {"ok": False, "reason": "disabled"}
-    # 零副作用：不建 turn、不写 step、不写事件、不发请求（executor 未接线）
     assert _counts(manager) == before
 
 
@@ -185,7 +163,6 @@ def test_switch_on_plan_snapshot_is_complete(tmp_path, monkeypatch):
     assert plan["replayable_count"] == 1
     assert plan["blocked_count"] == 0
     assert plan["blockers"] == []
-    # 规划接口只读：不建 turn、不写事件
     assert _counts(manager) == before
 
 
@@ -204,7 +181,7 @@ def test_plan_without_interrupted_turn_is_not_resumable(tmp_path, monkeypatch):
 
 
 def test_execute_returns_abort_reason_without_touching_executor(tmp_path, monkeypatch):
-    manager = _setup(tmp_path, completed_step=False)  # 没有已完成 Step -> 无锚点
+    manager = _setup(tmp_path, completed_step=False)
     _switch(monkeypatch, True)
     monkeypatch.setattr(
         tool_registry, "build_default_registry", lambda *a, **k: _Registry({"read_file": _Spec()})
@@ -262,17 +239,10 @@ def _now_ms() -> int:
 
 
 def _refresh_owner_heartbeat(manager, owner_id="owner-test"):
-    """把测试 owner 的心跳刷到当前时刻。
-
-    resume_execute 注入的 writer 用真实时钟且构造即 recover_stale；不刷新的话
-    10s 过期判定会把父回合 tools_running 的 step 踩成 interrupted（与本用例
-    无关的噪声，掩盖真正要断言的"父回合未被改动"）。
-    """
     HarnessJournal(manager, owner_id, clock_ms=_now_ms)
 
 
 class _SyncThread:
-    """threading.Thread 同步替身：start() 立刻在当前线程执行 target。"""
 
     created: list = []
 
@@ -289,7 +259,6 @@ class _SyncThread:
 
 
 def _sync_threads(monkeypatch):
-    """只替换 gui_bridge 模块内的 threading 引用，不动全局 threading 模块。"""
     _SyncThread.created = []
     monkeypatch.setattr(
         gui_bridge_mod, "threading", types.SimpleNamespace(Thread=_SyncThread)
@@ -297,7 +266,6 @@ def _sync_threads(monkeypatch):
 
 
 class _RecordingExecutor(resume_mod.ResumeExecutor):
-    """真执行层 + 记录 request_fn 收到的关键字（不改变任何原有行为）。"""
 
     instances: list = []
 
@@ -330,7 +298,6 @@ def _patch_registry(monkeypatch):
 
 
 def _stub_resume_worker(bridge, calls):
-    """worker 替身：只记录线程起点收到的参数，绝不发模型请求。"""
 
     def _worker(session_name, *, turn_id, parent_turn_id):
         calls.append(
@@ -366,14 +333,12 @@ def test_execute_wires_request_fn_and_returns_dry_run_false(tmp_path, monkeypatc
     payload = bridge.resume_execute("session", [])
 
     assert payload["ok"] is True
-    # 真实接线后不再是 dry-run
     assert payload["dry_run"] is False
     assert payload["parent_turn_id"] == "turn-parent"
     assert payload["replayed"] == 1
 
     assert len(_RecordingExecutor.instances) == 1
     executor = _RecordingExecutor.instances[0]
-    # 执行层只发一次请求，关键字锁定续跑口径
     assert executor.request_calls == [
         {
             "turn_id": payload["turn_id"],
@@ -381,7 +346,6 @@ def test_execute_wires_request_fn_and_returns_dry_run_false(tmp_path, monkeypatc
             "request_reason": "resume",
         }
     ]
-    # 请求经一个 daemon 线程起，线程起点拿到同一个 turn_id / parent_turn_id
     assert len(_SyncThread.created) == 1
     assert _SyncThread.created[0].daemon is True
     assert worker_calls == [
@@ -413,7 +377,7 @@ def test_execute_passes_owner_shared_journal_writer(tmp_path, monkeypatch):
 
 
 def test_resume_journal_writer_falls_back_to_none_without_journal_storage():
-    bridge = _bridge(object())  # 鸭子类型 manager：没有任何 harness_* 存储接口
+    bridge = _bridge(object())
 
     # 不支持 journal 时回退 None（交执行层按原逻辑自建），绝不抛错
     assert bridge._resume_journal_writer() is None
@@ -442,10 +406,8 @@ def test_execute_does_not_touch_parent_history(tmp_path, monkeypatch):
     payload = bridge.resume_execute("session", [])
 
     assert payload["ok"] is True
-    # 写 user 消息是明确的违规：历史条数、内容、LLM 口径都必须逐条不变
     assert manager.get_history("session") == history_before
     assert manager.get_history_for_llm("session") == llm_history_before
-    # 父回合行逐字段未变（仍 interrupted），续跑另起一行新 turn
     assert _parent_turn_row(manager) == parent_before
     assert payload["turn_id"] != "turn-parent"
 
@@ -499,19 +461,17 @@ def test_resume_worker_surfaces_exception_as_visible_error(tmp_path, monkeypatch
     assert terminals and "组装爆炸" in terminals[0]["message"]
     notices = [payload.get("message", "") for kind, payload in events if kind == "notice"]
     assert any("断点续跑失败" in message and "组装爆炸" in message for message in notices)
-    # 前端不会卡在 running：终态与解锁事件必须补发
     assert "turn_finish" in kinds
 
 
 def test_consume_turn_events_passes_resume_kwargs_only_on_resume_path(monkeypatch):
-    """resume_turn / request_reason 只在续跑路径显式传入，普通回合逐字不变。"""
     import core.llm as llm_mod
 
     captured = []
 
     def _fake_chat(*args, **kwargs):
         captured.append(dict(kwargs))
-        return iter(())  # 零事件：只关心透传给模型入口的关键字
+        return iter(())
 
     monkeypatch.setattr(llm_mod, "chat_with_model_events", _fake_chat)
     bridge = ApiBridge.__new__(ApiBridge)
@@ -535,9 +495,7 @@ def test_consume_turn_events_passes_resume_kwargs_only_on_resume_path(monkeypatc
     assert resumed is False and plain is False
     assert captured[0]["parent_turn_id"] == "turn-parent"
     assert captured[0]["request_reason"] == "resume"
-    # resume_turn=True 让 TurnRuntime.start 跳过 create_turn（turn 行已由执行层建好）
     assert captured[0]["resume_turn"] is True
-    # 普通回合：父子同 id、空 request_reason、resume_turn=False
     assert captured[1]["parent_turn_id"] == "turn-plain"
     assert captured[1]["request_reason"] == ""
     assert captured[1]["resume_turn"] is False

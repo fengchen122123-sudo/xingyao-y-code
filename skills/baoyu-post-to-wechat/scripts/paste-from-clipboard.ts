@@ -35,7 +35,6 @@ function sleepSync(ms: number): void {
 function activateApp(appName: string): boolean {
   if (process.platform !== 'darwin') return false;
 
-  // Activate and wait for app to be frontmost
   const script = `
     tell application "${appName}"
       activate
@@ -57,7 +56,6 @@ function activateApp(appName: string): boolean {
 
 function pasteMac(retries: number, delayMs: number, targetApp?: string): boolean {
   for (let i = 0; i < retries; i++) {
-    // Build script that activates app (if specified) and sends keystroke in one atomic operation
     const script = targetApp
       ? `
         tell application "${targetApp}"
@@ -93,10 +91,9 @@ function pasteMac(retries: number, delayMs: number, targetApp?: string): boolean
 }
 
 function pasteLinux(retries: number, delayMs: number): boolean {
-  // Try xdotool first (X11), then ydotool (Wayland)
   const tools = [
     { cmd: 'xdotool', args: ['key', 'ctrl+v'] },
-    { cmd: 'ydotool', args: ['key', '29:1', '47:1', '47:0', '29:0'] }, // Ctrl down, V down, V up, Ctrl up
+    { cmd: 'ydotool', args: ['key', '29:1', '47:1', '47:0', '29:0'] },
   ];
 
   for (const tool of tools) {

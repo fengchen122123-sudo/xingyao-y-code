@@ -7,10 +7,7 @@
     </div>
 
     <div class="sub-body">
-      <!-- 技能页 -->
       <div v-if="subType === 'skills'">
-        <!-- 会话级稳定段落快照：技能的启停会改变 system 头，而进行中的会话已在首请求
-             定型目录字节以保住前缀缓存；因此本页的改动只对新建会话生效。 -->
         <p class="sub-note" data-test="session-snapshot-note">
           已打开的会话将在新会话中生效：进行中的会话沿用其启动时的目录快照，以保证前缀缓存稳定。
         </p>
@@ -34,48 +31,39 @@
             title="重新扫描所有技能"
             :disabled="refreshingSkills"
             @click="onRefreshSkills"
-          >
-            <AppIcon name="refresh" :size="12" :class="{ 'icon-spin': refreshingSkills }" />
-            {{ refreshingSkills ? '刷新中…' : '刷新技能' }}
-          </button>
+          >{{ refreshingSkills ? '刷新中…' : '刷新技能' }}</button>
         </div>
-        <div class="sub-grid">
-          <!-- 首屏技能改为后端后台扫描 + skills_loaded 事件推送：空列表可能是
-               "还没扫完"而非"真没有技能"，据此区分文案，避免误导用户 -->
-          <div v-if="store.skills.length === 0" class="sub-empty">
-            {{ store.skillsLoading ? '技能加载中…' : '暂无可用技能' }}
-          </div>
-          <div v-else-if="filteredSkills.length === 0" class="sub-empty">没有符合筛选条件的技能</div>
-          <div v-for="s in filteredSkills" :key="s.id" class="sub-card">
-            <div class="sc-top">
-              <div class="sc-ico"><AppIcon name="gem" :size="16" /></div>
-              <div class="sc-name">
-                {{ s.name || s.id }}
-                <span class="pl-src" :class="s.source === 'builtin' ? 'builtin' : 'user'">{{ s.source === 'builtin' ? '内置' : '用户' }}</span>
-              </div>
-              <label class="switch" title="启用/禁用该技能" @click.stop>
-                <input type="checkbox" :checked="s.enabled" @change="onToggleSkill(s, ($event.target as HTMLInputElement).checked)" />
-                <span class="switch-track"></span>
-              </label>
+        <div v-if="store.skills.length === 0" class="sub-empty">
+          {{ store.skillsLoading ? '技能加载中…' : '暂无可用技能' }}
+        </div>
+        <div v-else-if="filteredSkills.length === 0" class="sub-empty">没有符合筛选条件的技能</div>
+        <div v-else class="sub-list">
+          <div v-for="s in filteredSkills" :key="s.id" class="sub-row">
+            <AppIcon name="sparkle" :size="15" class="row-mark" />
+            <div class="row-main">
+              <div class="row-name">{{ s.name || s.id }}</div>
+              <div class="row-sub" :title="s.description || ''">{{ s.description || '项目/用户自定义扩展技能' }}</div>
             </div>
-            <div class="sc-desc">{{ s.description || '项目/用户自定义扩展技能' }}</div>
-            <div class="sc-id">
-              {{ s.short_id || s.id }}
-              <!-- 已偏离内置版本（曾由内置释放但当前 source 非 builtin）才提供恢复入口：
-                   内置技能本身无需恢复，被用户改过或老索引缺失导致误判为用户的才需要 -->
+            <div class="row-side">
               <button
                 v-if="s.from_builtin === true && s.source !== 'builtin'"
-                class="btn primary sc-restore-btn"
+                class="row-text-btn"
                 data-test="restore-skill-btn"
                 title="用内置源覆盖当前技能文件中的用户改动"
                 @click.stop="onRestoreSkill(s)"
               >恢复内置版本</button>
+              <label class="switch" title="启用/禁用该技能" @click.stop>
+                <input type="checkbox" :checked="s.enabled" @change="onToggleSkill(s, ($event.target as HTMLInputElement).checked)" />
+                <span class="switch-track"></span>
+              </label>
+              <button class="row-trash" title="删除该技能目录" @click.stop="onDeleteSkill(s)">
+                <AppIcon name="trash" :size="15" />
+              </button>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- MCP 页 -->
       <div v-else-if="subType === 'mcp'">
          <div class="sub-toolbar">
            <span class="toolbar-spacer"></span>
@@ -86,8 +74,8 @@
              placeholder="搜索服务名…"
              title="按 MCP 服务名搜索"
            />
-           <button class="chip-btn" title="添加自定义 MCP 服务" @click="addForm.show = !addForm.show"><AppIcon name="plus" :size="12" /> 添加服务</button>
-           <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()"><AppIcon name="refresh" :size="12" /> 重连</button>
+           <button class="chip-btn" title="添加自定义 MCP 服务" @click="addForm.show = !addForm.show">添加服务</button>
+           <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()">重连</button>
          </div>
          <div v-if="addForm.show" class="mcp-add-form">
            <div class="maf-row">
@@ -103,36 +91,33 @@
              <button class="chip-btn" @click="addForm.show = false">取消</button>
              <button class="chip-btn maf-confirm" @click="submitAddMcp">添加</button>
            </div>
-         </div>        <div class="sub-grid">
-          <div v-if="store.mcps.length === 0" class="sub-empty">暂无已配置的 MCP 服务</div>
-          <div v-else-if="filteredMcps.length === 0" class="sub-empty">没有匹配的 MCP 服务</div>
-          <div v-for="m in filteredMcps" :key="m.name" class="sub-card mcp-card">
-            <div class="sc-top">
-              <div class="sc-ico">⧉</div>
-              <div class="sc-name">
-                {{ m.name }}
-              </div>
-              <span class="status-dot" :class="mcpStatusClass(m)" :title="mcpStatusText(m)"></span>
+         </div>
+        <div v-if="store.mcps.length === 0" class="sub-empty">暂无已配置的 MCP 服务</div>
+        <div v-else-if="filteredMcps.length === 0" class="sub-empty">没有匹配的 MCP 服务</div>
+        <div v-else class="sub-list">
+          <div v-for="m in filteredMcps" :key="m.name" class="sub-row">
+            <AppIcon name="blocks" :size="15" class="row-mark" />
+            <div class="row-main">
+              <div class="row-name">{{ m.name }}</div>
+              <div
+                class="row-sub"
+                :class="[mcpStatusClass(m), { bad: !!mcpErrorText(m) }]"
+                :title="mcpErrorFull(m) || mcpStatusText(m)"
+              >{{ mcpRowText(m) }}</div>
+            </div>
+            <div class="row-side">
               <label class="switch" title="启用/禁用该 MCP 服务" @click.stop>
                 <input type="checkbox" :checked="m.enabled" @change="onToggleMcp(m, ($event.target as HTMLInputElement).checked)" />
                 <span class="switch-track"></span>
               </label>
-            </div>
-            <div class="sc-desc">
-              {{ '工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m) }}<span
-                v-if="mcpErrorText(m)"
-                class="mcp-err"
-                :title="mcpErrorFull(m)"
-              > · 失败原因: {{ mcpErrorText(m) }}</span>
-            </div>
-            <div class="sc-id">
-              <button class="chip-btn danger" title="删除该 MCP 服务" @click.stop="onRemoveMcp(m)">删除</button>
+              <button class="row-trash" title="删除该 MCP 服务" @click.stop="onRemoveMcp(m)">
+                <AppIcon name="trash" :size="15" />
+              </button>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- 插件页 -->
       <div v-else-if="subType === 'plugins'">
         <div class="sub-toolbar">
           <div class="src-filter" data-test="source-filter">
@@ -148,33 +133,49 @@
             placeholder="搜索插件…"
             title="按名称 / 介绍 / 工具名搜索，多个关键词用空格分隔"
           />
+          <button
+            v-if="removedPluginCount"
+            class="seg-btn"
+            :class="{ active: showRemoved }"
+            data-test="plugins-show-removed"
+            title="查看被移除的内置插件并恢复"
+            @click="showRemoved = !showRemoved"
+          >已移除 {{ removedPluginCount }}</button>
         </div>
-        <div class="sub-grid">
-          <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
-          <div v-else-if="filteredPlugins.length === 0" class="sub-empty">没有符合筛选条件的插件</div>
-          <div v-for="p in filteredPlugins" :key="p.name" class="sub-card">
-            <div class="sc-top">
-              <div class="sc-ico">⬡</div>
-              <div class="sc-name">
-                {{ p.name }}
-                <span class="pl-ver">v{{ p.version }}</span>
-                <span class="pl-src" :class="p.source">{{ p.source === 'user' ? '用户' : '内置' }}</span>
-              </div>
-              <label class="switch" title="启用/禁用该插件（重启后完全生效）" @click.stop>
+        <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
+        <div v-else-if="filteredPlugins.length === 0 && showRemoved" class="sub-empty">没有被移除的内置插件</div>
+        <div v-else-if="filteredPlugins.length === 0" class="sub-empty">没有符合筛选条件的插件</div>
+        <div v-else class="sub-list">
+          <div v-for="p in filteredPlugins" :key="p.name" class="sub-row">
+            <AppIcon name="hexagon" :size="15" class="row-mark" />
+            <div class="row-main">
+              <div class="row-name">{{ p.name }}</div>
+              <div
+                class="row-sub"
+                :class="{ bad: p.status === 'failed' }"
+                :title="p.status === 'failed' ? pluginStatusText(p) : (p.description || '')"
+              >{{ pluginDescText(p) }}</div>
+            </div>
+            <div class="row-side">
+              <button v-if="p.status === 'untrusted'" class="row-text-btn solid" title="确认插件内容后加载" @click.stop="store.trustPlugin(p.name)">信任并加载</button>
+              <button v-if="p.status === 'removed'" class="row-text-btn solid" data-test="plugin-restore-btn" title="恢复该内置插件并立即加载" @click.stop="store.restorePlugin(p.name)">恢复</button>
+              <label v-if="p.status !== 'removed'" class="switch" title="启用/禁用该插件（重启后完全生效）" @click.stop>
                 <input type="checkbox" :checked="p.enabled" @change="store.togglePlugin(p.name, ($event.target as HTMLInputElement).checked)" />
                 <span class="switch-track"></span>
               </label>
-            </div>
-            <div class="sc-desc">{{ p.description || '无描述' }}</div>
-            <div class="sc-id">
-              {{ pluginStatusText(p) }}<template v-if="p.tools.length"> · 工具: {{ p.tools.join(', ') }}</template>
-              <button v-if="p.status === 'untrusted'" class="btn primary sc-trust-btn" title="确认插件内容后加载" @click.stop="store.trustPlugin(p.name)">信任并加载</button>
+              <button
+                v-if="p.status !== 'removed'"
+                class="row-trash"
+                :title="p.source === 'user' ? '删除该插件目录' : '移除该内置插件（不删随包文件，可恢复）'"
+                @click.stop="onDeletePlugin(p)"
+              >
+                <AppIcon name="trash" :size="15" />
+              </button>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- 星轨：自动化任务 + 工作流 双标签页（参考 ZCode 的 Automations 页签形态） -->
       <div v-else-if="subType === 'automations' || subType === 'workflows'" class="auto-page">
         <div class="auto-tabs" role="tablist" aria-label="星轨页签" data-test="auto-tabs">
           <button
@@ -198,7 +199,6 @@
         <WorkflowPane v-else />
       </div>
 
-      <!-- 模型管理页 -->
       <div v-else class="models-page">
         <div class="model-section-title">添加供应商</div>
         <div class="model-form">
@@ -325,17 +325,16 @@ const desc = computed(() => {
 
 const refreshingSkills = ref(false);
 
-// 来源筛选：全部 / 内置 / 用户，口径与卡片角标一致——
-// 技能缺 source（旧版后端）按用户算，插件非 'user' 按内置算
 type SourceFilterValue = 'all' | 'builtin' | 'user';
 const sourceFilter = ref<SourceFilterValue>('all');
 
-// 关键词搜索：技能 / MCP / 插件三页共用同一个输入框，切页时与来源筛选一起重置。
-// MCP 后端只返回服务名，故该页搜索范围仅服务名。
-const searchQuery = ref('');
-watch(() => props.subType, () => { sourceFilter.value = 'all'; searchQuery.value = ''; });
+// 已移除的内置插件仍在插件列表里（status=removed），默认不展示；
+// 为 false 时 list 只给在用插件，避免已移除项与在用项混排。
+const showRemoved = ref(false);
 
-// 关键词按空格拆成多个词，全部命中才算匹配（忽略大小写）；只传小写后的 kw
+const searchQuery = ref('');
+watch(() => props.subType, () => { sourceFilter.value = 'all'; searchQuery.value = ''; showRemoved.value = false; });
+
 function hitSearch(kw: string, fields: Array<string | undefined | null>): boolean {
   if (!kw) return true;
   const hay = fields.filter(Boolean).join(' ').toLowerCase();
@@ -349,9 +348,11 @@ const filteredSkills = computed(() => {
     return hitSearch(kw, [s.name, s.id, s.short_id, s.description]);
   });
 });
+const removedPluginCount = computed(() => store.plugins.filter(p => p.status === 'removed').length);
 const filteredPlugins = computed(() => {
   const kw = searchQuery.value.trim().toLowerCase();
   return store.plugins.filter(p => {
+    if ((p.status === 'removed') !== showRemoved.value) return false;
     if (sourceFilter.value !== 'all' && (p.source === 'user' ? 'user' : 'builtin') !== sourceFilter.value) return false;
     return hitSearch(kw, [p.name, p.description, p.tools.join(' ')]);
   });
@@ -375,15 +376,23 @@ function onToggleSkill(s: SkillInfo, checked: boolean) {
   store.toggleSkill(s.id, checked);
 }
 
-// 恢复内置版本会用内置源覆盖用户改动（破坏性），先复用项目统一的 askConfirm
-// 二次确认（与删除模型/撤销回合同一机制，底层是全局 ConfirmModal），
-// 确认后再调 store action；失败提示由 store.restoreSkill 内部统一处理
+async function onDeleteSkill(s: SkillInfo) {
+  const label = s.name || s.id;
+  const ok = await store.askConfirm(
+    '删除技能',
+    label,
+    `将从磁盘删除技能「${label}」的目录，里面的文件会一并移除，且无法恢复。`,
+    '删除',
+  );
+  if (ok) await store.deleteSkill(s.id);
+}
+
 async function onRestoreSkill(s: SkillInfo) {
   const ok = await store.askConfirm(
     '恢复内置版本',
     s.name || s.id,
     `将用内置源覆盖技能「${s.name || s.id}」，你在该技能文件里的改动会丢失。`,
-    '恢复内置版本 ⏎',
+    '恢复内置版本',
   );
   if (ok) await store.restoreSkill(s.id);
 }
@@ -392,13 +401,12 @@ function onToggleMcp(m: McpInfo, checked: boolean) {
   store.toggleMcpServer(m.name, checked);
 }
 
-// 删除 MCP 服务会改写 mcp.json，属破坏性操作，先二次确认再调 store action
 async function onRemoveMcp(m: McpInfo) {
   const ok = await store.askConfirm(
     '删除 MCP 服务',
     m.name,
     '将从 mcp.json 移除该服务配置，删除后需要重新添加才能恢复。',
-    '删除 ⏎',
+    '删除',
   );
   if (ok) await store.removeMcpServer(m.name);
 }
@@ -415,7 +423,6 @@ function mcpErrorText(m: McpInfo): string {
   return err.length > MCP_ERR_MAX ? err.slice(0, MCP_ERR_MAX) + '…' : err;
 }
 
-// 添加自定义 MCP 服务的表单状态
 const addForm = reactive({
   show: false,
   name: '',
@@ -433,7 +440,6 @@ function submitAddMcp() {
     return;
   }
   const args = addForm.args.split(/\s+/).filter(Boolean);
-  // 解析每行一个的 KEY=VALUE 环境变量
   const env: Record<string, string> = {};
   for (const line of addForm.env.split('\n')) {
     const t = line.trim();
@@ -453,13 +459,19 @@ function submitAddMcp() {
 }
 
 function mcpStatusClass(m: McpInfo) {
-  if (!m.enabled) return 'gray';
-  return m.connected ? 'green' : 'yellow';
+  if (!m.enabled) return 'off';
+  return m.connected ? 'ok' : 'wait';
 }
 
 function mcpStatusText(m: McpInfo) {
   if (!m.enabled) return '已禁用';
   return m.connected ? '已连接' : '已启用但未连接';
+}
+
+function mcpRowText(m: McpInfo): string {
+  const head = `${mcpStatusText(m)} · 工具 ${m.tools_count ?? 0}`;
+  const err = mcpErrorText(m);
+  return err ? `${head} · 失败原因: ${err}` : head;
 }
 
 function pluginStatusText(p: PluginInfo) {
@@ -471,13 +483,32 @@ function pluginStatusText(p: PluginInfo) {
     case 'pending_enable': return '已启用（重启后生效）';
     case 'pending_disable': return '已禁用（重启后生效）';
     case 'untrusted': return '未信任 —— 首次安装或内容已变化，需确认后加载';
+    case 'removed': return '已移除 —— 随包文件未删除，可随时恢复';
     default: return p.status || '';
   }
 }
 
+// 加载失败时介绍位改成红字原因；其余状态仍显示描述
+function pluginDescText(p: PluginInfo): string {
+  if (p.status === 'failed') return pluginStatusText(p);
+  return p.description || '无描述';
+}
 
-// 打开 MCP / 插件 / 自动化页时刷新一次最新状态；星轨/星流双标签共用一个
-// 子页，切换或打开任一标签都同时刷新两侧数据（两侧各自幂等，开销可忽略）
+async function onDeletePlugin(p: PluginInfo) {
+  // 内置插件走软移除（只记移除名单、停加载），随包文件仍在安装目录，故文案必须区分来源
+  const builtin = p.source === 'builtin';
+  const ok = await store.askConfirm(
+    '删除插件',
+    p.name,
+    builtin
+      ? `将把内置插件「${p.name}」从插件列表移除并停止加载，随包文件不会删除，可随时恢复。`
+      : `将从磁盘删除插件「${p.name}」的目录，里面的文件会一并移除，且无法恢复。`,
+    builtin ? '移除' : '删除',
+  );
+  if (ok) await store.deletePlugin(p.name);
+}
+
+
 watch(
   () => [props.visible, props.subType] as const,
   ([visible, type]) => {
@@ -493,12 +524,10 @@ watch(
   }
 );
 
-// 星轨/星流标签切换：换 subType 而不关子页（openSubpage 是幂等置值）
 function switchAutoTab(tab: 'automations' | 'workflows') {
   store.openSubpage(tab);
 }
 
-// ---- 模型管理：添加供应商 ----
 const newProvider = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const addingProvider = ref(false);
 
@@ -509,8 +538,6 @@ async function submitAddProvider() {
   }
   addingProvider.value = true;
   try {
-    // M34 修复：addProvider 失败（返回 null）时不检查返回值仍清空表单，
-    // 用户填写内容丢失且误以为已添加。成功才清空。
     const res = await store.addProvider(newProvider.name.trim(), newProvider.base_url.trim(), newProvider.api_key.trim(), newProvider.protocol);
     if (res && res.ok) {
       newProvider.name = '';
@@ -523,11 +550,9 @@ async function submitAddProvider() {
   }
 }
 
-// ---- 模型管理：添加模型 ----
 const newModel = reactive({ provider_id: '', model_name: '', context_window: 32000, max_tokens: '' as number | '' });
 const addingModel = ref(false);
 
-// ---- 模型管理：获取模型列表一键填充 ----
 const subpageRemoteModels = ref<{ id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[] | null>(null);
 const subpageFetchingModels = ref(false);
 
@@ -557,7 +582,6 @@ function pickSubpageModel(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
   if (!value) return;
   newModel.model_name = value;
-  // 厂商元数据 + 本地规格表：能填的都填（未提供的字段保持表单原值）
   const entry = (subpageRemoteModels.value || []).find((m) => m.id === value);
   if (!entry) return;
   if (entry.context_window && entry.context_window > 0) {
@@ -573,7 +597,6 @@ async function submitAddModel() {
   }
   addingModel.value = true;
   try {
-    // M34 修复：同上，addModel 成功才清空表单；最大输出留空 = null（走内置默认）
     const maxTokens = newModel.max_tokens === '' ? null : Number(newModel.max_tokens);
     const res = await store.addModel(newModel.provider_id, newModel.model_name.trim(), Number(newModel.context_window) || 0, false, true, '', maxTokens);
     if (res && res.ok) {
@@ -585,7 +608,6 @@ async function submitAddModel() {
   }
 }
 
-// ---- 模型管理：测试连接 ----
 const testingModelId = ref<string | null>(null);
 const testResults = ref<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
 
@@ -665,13 +687,101 @@ async function testModelRow(m: ModelInfo) {
   padding: 22px 26px;
   min-width: 0;
 }
-.sub-grid {
+.sub-list {
   max-width: 960px;
   margin: 0 auto;
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 14px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
 }
+.sub-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.sub-row:last-child {
+  border-bottom: none;
+}
+.sub-row:hover {
+  background: var(--xy-hover, rgba(127, 127, 127, 0.06));
+}
+.row-mark {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.row-main {
+  min-width: 0;
+  flex: 1;
+}
+.row-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-sub.ok { color: var(--green); }
+.row-sub.wait { color: var(--orange); }
+.row-sub.off { color: var(--text-faint); }
+.row-sub.bad { color: var(--red); }
+.row-side {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.row-text-btn {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  padding: 4px 2px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.row-text-btn:hover { text-decoration: underline; }
+.row-text-btn.danger { color: var(--text-dim); }
+.row-text-btn.danger:hover { color: var(--red); text-decoration: none; }
+.row-text-btn.solid {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-weight: 600;
+}
+.row-text-btn.solid:hover { text-decoration: none; }
+.row-trash {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.row-trash:hover {
+  color: var(--red);
+  background: rgba(220, 38, 38, 0.08);
+}
+.sub-row .switch { margin-left: 0; }
 .sub-toolbar {
   max-width: 960px;
   margin: 0 auto 14px;
@@ -683,7 +793,6 @@ async function testModelRow(m: ModelInfo) {
 .toolbar-spacer {
   flex: 1;
 }
-/* 星轨/星流双标签页签（复用技能页 .seg-btn 分段外观，置于内容区顶部） */
 .auto-page {
   display: flex;
   flex-direction: column;
@@ -721,7 +830,6 @@ async function testModelRow(m: ModelInfo) {
   color: var(--accent);
   font-weight: 600;
 }
-/* 技能 / MCP / 插件三页共用的关键词搜索框（与钩子页 .hook-search 同款外观） */
 .sub-search {
   background: var(--bg2);
   border: 1px solid var(--border);
@@ -737,7 +845,6 @@ async function testModelRow(m: ModelInfo) {
 .sub-search:focus {
   border-color: var(--accent);
 }
-/* 来源分段筛选：全部 / 内置 / 用户 */
 .src-filter {
   display: inline-flex;
   align-items: center;
@@ -768,78 +875,17 @@ async function testModelRow(m: ModelInfo) {
   font-weight: 600;
 }
 .sub-empty {
+  max-width: 960px;
+  margin: 0 auto;
   color: var(--text-faint);
   font-size: 12.5px;
   padding: 20px 0;
   text-align: center;
-  grid-column: 1 / -1;
-}
-.sub-card {
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
-  transition: 0.15s;
-}
-.sub-card:hover {
-  border-color: var(--text-faint);
-}
-.sub-card .sc-top {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-.sub-card .sc-ico {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  flex-shrink: 0;
-  color: var(--text-dim);
-}
-.sub-card .sc-name {
-  font-size: 13.5px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.sub-card .sc-desc {
-  font-size: 12px;
-  color: var(--text-dim);
-  line-height: 1.6;
-  min-height: 38px;
-}
-.sub-card .sc-id {
-  font-size: 10.5px;
-  color: var(--text-faint);
-  font-family: var(--mono);
-  margin-top: 4px;
-}
-.sub-card .sc-trust-btn {
-  margin-left: 8px;
-  padding: 1px 8px;
-  font-size: 10px;
-  vertical-align: middle;
-}
-/* 技能卡片「恢复内置版本」按钮：与信任按钮同量级的次级操作外观 */
-.sub-card .sc-restore-btn {
-  margin-left: 8px;
-  padding: 1px 10px;
-  font-size: 10px;
-  line-height: 1.6;
-  vertical-align: middle;
 }
 
-/* MCP 添加服务表单 */
 .mcp-add-form {
-  margin-bottom: 12px;
+  max-width: 960px;
+  margin: 0 auto 12px;
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -899,49 +945,7 @@ async function testModelRow(m: ModelInfo) {
   color: var(--accent);
   background: var(--accent-soft);
 }
-.mcp-err {
-  color: var(--red);
-  word-break: break-all;
-}
-.pl-ver {
-  font-size: 10.5px;
-  color: var(--text-faint);
-  font-weight: 400;
-  margin-left: 4px;
-}
-.pl-src {
-  font-size: 10px;
-  padding: 0 6px;
-  border-radius: 6px;
-  margin-left: 4px;
-  background: var(--bg3);
-  color: var(--text-dim);
-  font-weight: 400;
-}
-.pl-src.user {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
 
-/* 状态圆点 */
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  margin-left: auto;
-}
-.status-dot.green {
-  background: var(--green);
-}
-.status-dot.gray {
-  background: var(--text-faint);
-}
-.status-dot.yellow {
-  background: var(--yellow);
-}
-
-/* 开关 Pill */
 .switch {
   position: relative;
   display: inline-block;
@@ -1052,7 +1056,6 @@ async function testModelRow(m: ModelInfo) {
   to { transform: rotate(360deg); }
 }
 
-/* 模型管理页 */
 .models-page {
   max-width: 760px;
   margin: 0 auto;

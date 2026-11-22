@@ -1,10 +1,3 @@
-"""星瑶按回合撤销：GUI、CLI、模型工具共用的编排入口（TurnUndoService）。
-
-本模块提供进程级存储注册、默认存储访问与回合生命周期编排原语；
-preview/execute/recovery 编排在 transaction.py / recovery.py 完成后由
-service 暴露为规格 19 的 API。
-"""
-
 from __future__ import annotations
 
 import threading
@@ -22,12 +15,6 @@ _service_lock = threading.RLock()
 
 
 def configure_default_manager(manager, *, blob_root=None) -> TurnUndoStorage:
-    """应用启动时注册进程级 MemoryManager；返回绑定的存储。
-
-    GUI（gui_bridge.ApiBridge）与 CLI（main.py）各自创建 MemoryManager 后
-    调用本函数；重复调用以最后一次为准（单进程单连接语义不变）。
-    启动校验：mutates_files 工具未接入记录器时立即失败（规格 9.5）。
-    """
     global _default_manager, _default_storage
     with _service_lock:
         _default_manager = manager
@@ -69,22 +56,18 @@ def has_default_storage() -> bool:
 _RECORDED_FIRST_PARTY_TOOLS = frozenset({
     "write_file",
     "edit_file",
+    "multi_edit",
     "fetch_image",
-    "hunyuan_generate_image",     # core/hunyuan_image.py 保存点已接入
-    "tokenrhythm_generate_image", # 插件 _save_image_bytes 保存点已接入
-    "tokenrhythm_edit_image",     # 同上（edit_image 复用同一落盘路径）
-    "novel_init",                 # core/novel_service.py _write_text 落盘点已接入
-    "novel_track",                # 同上：快照重放经 _write_text 记录 before/after
-    "office_write",               # office plugin _save_with_turn_undo
+    "hunyuan_generate_image",
+    "tokenrhythm_generate_image",
+    "tokenrhythm_edit_image",
+    "novel_init",
+    "novel_track",
+    "office_write",
 })
 
 
 def validate_recorder_coverage(registry) -> list[str]:
-    """校验 mutates_files=True 的工具均已接入记录器（规格 9.5）。
-
-    返回未接入的工具名列表；非空即启动/测试校验失败。插件工具经
-    core.hunyuan_image / tokenrhythm 插件接入记录器，同样受此约束。
-    """
     uncovered = []
     try:
         specs = registry.all()
@@ -97,10 +80,6 @@ def validate_recorder_coverage(registry) -> list[str]:
     return uncovered
 
 
-# ---------------------------------------------------------------------------
-# 回合生命周期编排
-# ---------------------------------------------------------------------------
-
 def begin_turn(
     *,
     session_id: int,
@@ -110,11 +89,6 @@ def begin_turn(
     parent_checkpoint_id: Optional[str] = None,
     description: str = "",
 ):
-    """创建持久化检查点并注册记录器上下文（绑定当前线程为 owner）。
-
-    供 GUI/CLI 回合 worker 在"首条用户消息落库之前"调用；后台写文件任务
-    在任务启动时以 owner_kind=BACKGROUND_TASK 调用。
-    """
     storage = get_default_storage()
     root = _coordinator_mod.canonicalize_workspace_root(workspace_root)
     checkpoint = storage.create_checkpoint(
@@ -127,16 +101,14 @@ def begin_turn(
     )
     ctx = _recorder.begin_recording(storage, checkpoint)
     coordinator = _coordinator_mod.get_coordinator()
-    coordinator.register_active_turn(root, turn_id)
+    if owner_kind == OwnerKind.BACKGROUND_TASK:
+        coordinator.register_background_turn(root, turn_id)
+    else:
+        coordinator.register_active_turn(root, turn_id)
     return checkpoint, ctx
 
 
 def finish_turn(ctx, *, aborted: bool = False, reason: str = "") -> TurnUndoStatus:
-    """回合封闭：净 diff、完整性校验、状态收敛、注销活跃登记。
-
-    注销必须在 finally 中执行（M4）：close_turn 抛错（如 DB 故障）时若不注销，
-    该工作区后续所有撤销/恢复会被活跃登记永久阻塞为 workspace_busy。
-    """
     storage = get_default_storage()
     coordinator = _coordinator_mod.get_coordinator()
     try:
@@ -146,12 +118,12 @@ def finish_turn(ctx, *, aborted: bool = False, reason: str = "") -> TurnUndoStat
             status = _recorder.close_turn(ctx)
     finally:
         coordinator.unregister_active_turn(ctx.workspace_root, ctx.turn_id)
-    # 超限检查点快照过期（不触发生命周期事实，不扫描磁盘；GC 在启动扫描时执行）
+        coordinator.unregister_background_turn(ctx.workspace_root, ctx.turn_id)
     try:
         storage.expire_retained_checkpoints(ctx.session_id)
     except TurnUndoError:
         raise
-    except Exception as exc:  # 保留策略失败不阻断回合收尾
+    except Exception as exc:
         import logging
 
         logging.getLogger("py.warnings").warning(
@@ -165,14 +137,6 @@ def begin_background_task_turn(
     parent_turn_id: str,
     description: str = "",
 ):
-    """后台写文件任务启动时调用：以独立检查点 + 独立 turn_id 开始记录。
-
-    与父回合通过 parent_checkpoint_id 关联（同 session_id、同规范化工作区由
-    存储层校验）；父检查点上下文缺失时按 turn_id 查库兜底——父回合已封闭
-    （后台任务在并发队列等待期间父回合结束）也必须建立独立检查点而非裸奔
-    （规格 9.2，H2）；连持久化检查点都不存在（旧协议回合）时返回 None。
-    成功返回 (checkpoint, ctx)；当前线程被绑定为 owner。
-    """
     parent_ctx = _recorder.find_context_by_turn(parent_turn_id)
     if parent_ctx is not None:
         checkpoint, ctx = begin_turn(
@@ -184,7 +148,6 @@ def begin_background_task_turn(
             description=description,
         )
         return checkpoint, ctx
-    # 父 ctx 已注销：查库取父检查点（可能已封闭），仍建立归属明确的子检查点
     storage = get_default_storage()
     parent = storage.get_checkpoint_by_turn_global(parent_turn_id)
     if parent is None:
@@ -206,10 +169,6 @@ def finish_background_task_turn(ctx, *, reason: str = "") -> Optional[TurnUndoSt
         return None
     return finish_turn(ctx, aborted=bool(reason), reason=reason)
 
-
-# ---------------------------------------------------------------------------
-# 规格 19 公共 API（GUI / CLI / 模型工具共用）
-# ---------------------------------------------------------------------------
 
 def preview_turn_undo(session_id: int, turn_id: str, *, token_ttl_ms: int | None = None):
     """预检并返回 (TurnUndoPreview, token)；冲突时 token 为空串。"""
@@ -390,8 +349,6 @@ def startup_recovery_scan() -> list[dict]:
     coordinator = _coordinator_mod.get_coordinator()
     report = recovery.scan_and_mark_interrupted_on_startup(storage, coordinator)
     storage.delete_stale_confirmations()
-    # 保留策略与 GC 接线（M3/规格 8.1）：逐会话过期超限检查点快照，
-    # 再回收已无任何有效数据库引用的内容块（中断/待恢复快照不回收）
     try:
         for session_id in storage.distinct_checkpoint_sessions():
             storage.expire_retained_checkpoints(session_id)
@@ -410,14 +367,9 @@ def resolve_session_id(session_name: str) -> int:
 
 
 def resolve_turn_id_in_session(session_id: int, turn_id: str = "") -> str:
-    """把模型/用户提供的（可能为短）turn_id 解析为本会话唯一回合。
-
-    空值 → 最近一个 ready 前台回合；短 ID 在会话内唯一时接受，歧义显式失败。
-    """
     storage = get_default_storage()
     value = str(turn_id or "").strip()
     if not value:
-        # 无参数撤销最近 ready 前台回合：按 session_id 限定
         with storage._manager._lock:
             cursor = storage.conn.cursor()
             cursor.execute(
@@ -466,11 +418,6 @@ def resolve_turn_id_in_session(session_id: int, turn_id: str = "") -> str:
 
 
 def undo_turn_permission_impact(arguments: dict) -> dict:
-    """undo_turn 权限卡富化：预检并返回影响摘要（只读，不签发令牌）。
-
-    供 CLI 权限卡与 GUI 权限事件在展示"影响摘要"时调用；服务未配置或
-    预检失败时返回 {"available": False}，卡片退回通用展示。
-    """
     try:
         from core import app_context
 
@@ -501,4 +448,3 @@ def undo_turn_permission_impact(arguments: dict) -> dict:
     except Exception as exc:
         code = getattr(exc, "code", "")
         return {"available": False, "code": code, "message": str(exc)}
-

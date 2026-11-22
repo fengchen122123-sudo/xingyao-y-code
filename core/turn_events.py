@@ -1,5 +1,3 @@
-"""Structured events emitted while an agent turn is running."""
-
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
@@ -18,16 +16,12 @@ class TurnEvent:
 
 
 class TurnEventFactory:
-    """Create ordered event snapshots for one turn."""
 
     def __init__(self, turn_id: str):
         if not turn_id:
             raise ValueError("turn_id must not be empty")
         self.turn_id = turn_id
         self._sequence = 0
-        # 并行工具批次会跨线程 emit，序号自增必须串行化。
-        # 注意：序号只保证唯一且单调递增，不保证跨线程的实际交付顺序
-        # （先拿到序号的线程可能后把事件交给消费者）。
         self._sequence_lock = threading.Lock()
 
     def emit(self, kind: str, payload: Mapping[str, Any] | None = None) -> TurnEvent:

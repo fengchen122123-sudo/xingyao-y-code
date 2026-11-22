@@ -71,12 +71,6 @@ def test_tool_finish_payload_has_duration_result_and_display():
 
 
 def _patch_registry_execute(mocker, **kwargs):
-    """patch ToolRegistry.execute 类属性。
-
-    不能 patch _LazyToolRegistry 实例（core.llm.tool_registry）：fake 会经
-    __setattr__ 落到进程级缓存的内部注册表上，而 teardown 的还原对
-    __slots__ 包装器必然失败，fake executor 从此泄漏并污染后续所有测试。
-    """
     from core.tool_registry import ToolRegistry
 
     return mocker.patch.object(ToolRegistry, "execute", **kwargs)
@@ -104,9 +98,6 @@ def test_repaired_arguments_are_shared_by_event_payload_and_executor(mocker):
         return FakeToolResult()
 
     mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
-    # 不能 patch _LazyToolRegistry 实例：fake 会经 __setattr__ 落到进程级
-    # 缓存的内部注册表上，而 teardown 的还原对 __slots__ 包装器必然失败，
-    # fake executor 就此泄漏并污染后续所有测试。patch 类属性可被可靠还原。
     from core.tool_registry import ToolRegistry
 
     mocker.patch.object(ToolRegistry, "execute", side_effect=fake_execute)
@@ -216,7 +207,6 @@ def test_cancelled_main_turn_cancels_claimed_takeover(mocker):
 
 
 def _install_mid_turn_takeover(mocker, *, cancel=False):
-    """让子 Agent 在当前主回合已开始后才超时移交。"""
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
 
@@ -241,7 +231,6 @@ def _install_mid_turn_takeover(mocker, *, cancel=False):
 
 
 def test_normal_end_requeues_takeover_created_mid_turn(mocker):
-    """回合中途产生的接管租约也必须在自然结束时释放。"""
     plan = _install_mid_turn_takeover(mocker)
 
     list(chat_with_model_events(
@@ -261,7 +250,6 @@ def test_normal_end_requeues_takeover_created_mid_turn(mocker):
 
 
 def test_cancelled_turn_cancels_takeover_created_mid_turn(mocker):
-    """用户取消不得遗留 active 接管项给下一回合自动复活。"""
     plan = _install_mid_turn_takeover(mocker, cancel=True)
 
     with pytest.raises(KeyboardInterrupt):
@@ -541,14 +529,11 @@ def test_kimi_k3_request_uses_anthropic_high_thinking_budget(mocker):
 
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 4096}
     assert captured["max_tokens"] == 131072
-    # thinking 对 OpenAI 兼容语义是非标准参数，必须显式声明
-    # allowed_openai_params，保证网关按白名单放行。
     assert captured["allowed_openai_params"] == ["thinking"]
     assert "reasoning_effort" not in captured
 
 
 def test_chat_request_uses_explicit_cache_scope_and_actual_tool_contract(mocker):
-    """实际聊天入口必须把角色、父会话和最终 tools schema 纳入缓存通道。"""
     from core.llm import _provider_request_options, _tool_contract_fingerprint
 
     captured = {}
@@ -581,7 +566,6 @@ def test_chat_request_uses_explicit_cache_scope_and_actual_tool_contract(mocker)
 
 
 def test_kimi_k3_generic_anthropic_route_also_bypasses_param_check(mocker):
-    """非 kimi coding 的 anthropic 兼容端点（经销商网关等）同样必须带豁免参数。"""
     captured = {}
 
     def fake_completion(**kwargs):
@@ -747,9 +731,6 @@ def test_tool_result_error_prefix_is_not_reported_as_success():
 
 
 def test_repeat_blocked_result_commits_journal_error_status():
-    # 重复调用拦截结果（🚨 前缀）必须被识别为失败：
-    # llm.py 提交路径用 _tool_result_ok 判定 ok，
-    # build_tool_result_event_draft 据此写 result_status="error"。
     from core.harness.tool_pipeline import (
         REPEAT_CALL_BLOCKED_TEXT,
         ToolExecutionRecord,
@@ -951,7 +932,6 @@ def test_root_plan_turn_rejects_direct_tool_bypass(mocker):
     scheduler = get_default_scheduler()
     assert scheduler.start_item("weather") is True
     assert scheduler.fail("weather", "测试失败") is True
-    # 使用 write_file 测试计划锁：只读工具已被放行，而写文件仍必须走 run_subagent
     result = llm._execute_single_tool_call(
         {
             "id": "write-direct",
@@ -1085,11 +1065,6 @@ def test_plan_turn_requires_bound_orchestrators_and_blocks_other_tools(
 
 
 def test_plan_turn_allows_manage_task_passthrough():
-    """回归：计划激活时 manage_task（后台任务监控）必须放行，不被计划门禁拦截。
-
-    模型需要用 manage_task 查看/管理后台子代理任务；kill 操作有独立的用户确认，
-    拦截它只会让模型在计划期间对后台任务失明。
-    """
     from core.plan import bind_default_plan_session, get_default_plan_manager
     import core.llm as llm
 
@@ -1248,9 +1223,6 @@ def test_child_schema_excludes_run_subagent(mocker):
 
 
 def test_root_with_pending_plan_keeps_full_tools_for_cache_stability(mocker):
-    """计划进行中不再裁剪 tools：计划约束由执行层 plan_enforced 拦截统一保证。
-    tools 列表逐字节稳定是 DeepSeek/Kimi 前缀缓存命中的前提，
-    计划创建↔完成之间切换工具集会让缓存从头部整体失效。"""
     from core.plan import bind_default_plan_session, get_default_plan_manager
 
     captured = {}
@@ -1280,7 +1252,6 @@ def test_root_with_pending_plan_keeps_full_tools_for_cache_stability(mocker):
         bind_default_plan_session(previous_session)
 
     names = {item["function"]["name"] for item in captured["tools"]}
-    # 计划控制工具与只读探索工具必须仍在（供主 Agent 推进计划）
     assert {
         "plan_write", "plan_update", "plan_read", "plan_retry", "run_subagent", "ask_user",
         "read_file", "list_directory", "search_code", "glob_files", "find_definition",
@@ -1401,8 +1372,6 @@ def test_completed_tool_turn_persists_one_ordered_batch(mocker):
 
 
 def test_cancelled_tool_turn_salvages_completed_messages(mocker):
-    """取消回合时，已产生的 assistant 消息必须打捞落库，悬空的 tool_calls
-    组补取消占位结果（否则重开会话看不到终止前进度，且下一轮 API 会 400）。"""
     persisted = []
     cancel_event = threading.Event()
 
@@ -1441,7 +1410,6 @@ def test_cancelled_tool_turn_salvages_completed_messages(mocker):
     except KeyboardInterrupt:
         pass
 
-    # 一笔打捞 batch：assistant（带 tool_calls）+ 合成的取消占位 tool 结果
     batches = [p for p in persisted if p[1] == "batch"]
     assert len(batches) == 1
     session, _kind, batch = batches[0]
@@ -1456,8 +1424,6 @@ def test_cancelled_tool_turn_salvages_completed_messages(mocker):
 
 
 def test_edit_file_on_missing_file_gives_clear_error(mocker):
-    """回归：edit_file 对不存在的文件必须提示改用 write_file，
-    不得误报"JSON 修复后不完整"（掩盖真实原因，曾导致子代理白白失败）。"""
     import core.llm as llm
 
     mocker.patch("core.llm.check_permission_and_ask", return_value=True)
@@ -1484,8 +1450,6 @@ def test_edit_file_on_missing_file_gives_clear_error(mocker):
 
 
 def test_stalled_plan_after_repeated_failures_allows_direct_diagnosis(mocker):
-    """回归：计划项多次失败全部停滞后，只读/查询类诊断命令仍可直接执行，
-    主 Agent 不被计划锁逼入死局（修改类工具改由超时接管状态机放行）。"""
     from core.plan import bind_default_plan_session, get_default_plan_manager
     from core.task_scheduler import get_default_scheduler
     import core.llm as llm
@@ -1502,7 +1466,6 @@ def test_stalled_plan_after_repeated_failures_allows_direct_diagnosis(mocker):
     )
 
     scheduler = get_default_scheduler()
-    # 模拟两次执行失败：failed -> retry -> failed（attempts=2，计划停滞）
     assert scheduler.start_item("impl") is True
     assert scheduler.fail("impl", "第一次失败") is True
     assert scheduler.retry("impl") is True
@@ -1528,12 +1491,6 @@ def test_stalled_plan_after_repeated_failures_allows_direct_diagnosis(mocker):
 
 
 def test_cleared_plan_turn_releases_tool_gate(mocker):
-    """回归：计划在同一回合内被清空后，执行工具门禁必须解除。
-
-    plan_write 成功会把回合标记为计划回合；若模型随后清空计划（snapshot 为空），
-    门禁不能再以“必须通过 run_subagent(plan_item_id=...)”拦截主 Agent，
-    否则没有计划项可提供 plan_item_id，主 Agent 被锁死（GUI 实测死锁）。
-    """
     from core.plan import bind_default_plan_session, get_default_plan_manager
     import core.llm as llm
 
@@ -1569,11 +1526,6 @@ def test_cleared_plan_turn_releases_tool_gate(mocker):
 
 
 def test_completed_plan_turn_releases_tool_gate(mocker):
-    """回归：计划项全部 completed 后，主 Agent 必须能直接接手执行。
-
-    子代理可能在产物未落盘时错误结束计划项；如果终态计划仍维持工具门禁，
-    主 Agent 会被锁在无法重试、无法重建、也无法直接修复的死循环里。
-    """
     from core.plan import bind_default_plan_session, get_default_plan_manager
     import core.llm as llm
 
@@ -1619,7 +1571,6 @@ def test_completed_plan_turn_releases_tool_gate(mocker):
     ["completed", "failed"],
 ])
 def test_unresolved_plan_keeps_tool_gate_across_turns(mocker, statuses):
-    """回归：新回合仍须恢复未解决计划，不能直接绕过失败类终态。"""
     from core.plan import bind_default_plan_session, get_default_plan_manager
     import core.llm as llm
 
@@ -1662,12 +1613,6 @@ def test_unresolved_plan_keeps_tool_gate_across_turns(mocker, statuses):
 
 
 def test_plan_retry_repeat_calls_are_not_suppressed(mocker):
-    """回归：plan_retry 等计划状态机工具不受重复调用抑制。
-
-    plan_retry 的设计流程是“首次返回根因分析提示、再次调用强制重置”；
-    若被 _RepeatCallGuard 以“相同调用已成功 2 次”拦截，调度器会把计划项
-    锁死在 failed 态（run_subagent 要求先 plan_retry，plan_retry 又被守卫拦）。
-    """
     from core.plan import bind_default_plan_session, get_default_plan_manager
     import core.llm as llm
 
@@ -1709,8 +1654,6 @@ def test_plan_retry_repeat_calls_are_not_suppressed(mocker):
 
 
 def test_unparseable_tool_arguments_return_error_without_executing():
-    """当 tool_call arguments 是完全无法解析的畸形 JSON 时，应直接返回解析错误，
-    而不是用空参数继续执行工具。"""
     from core.llm import _execute_single_tool_call
 
     malformed_arguments = '{"items": [{"id": "a", "stage": "" Received Messages=[]'
@@ -1732,7 +1675,6 @@ def test_unparseable_tool_arguments_return_error_without_executing():
 
 
 def test_execute_command_preview_is_truncated_in_tool_event_payload():
-    """execute_command 的长命令 preview 应该被截断，避免 UI 刷屏。"""
     from core.llm import _tool_event_payload
 
     long_command = "powershell -Command " + "x" * 200
@@ -1751,7 +1693,6 @@ def test_execute_command_preview_is_truncated_in_tool_event_payload():
 
 
 def test_summarize_execute_command_started_truncates_long_command():
-    """summarize_tool_started 对 execute_command 的显示应截断到 30 字符。"""
     from core.tool_presenter import summarize_tool_started
 
     long_command = "powershell -Command " + "x" * 200
@@ -1828,14 +1769,10 @@ def test_no_progress_abort_emits_fixed_user_visible_error(mocker):
         if event.kind == "assistant_delta"
     )
     assert _NO_PROGRESS_MESSAGE not in public_text
-    # 有界读取进展预算：首次 manage_task 新读取签名算一次进展，此后同一签名
-    # 重复调用不再算，熔断由第 12 次请求推迟到第 13 次（12 步停滞 + 1 步读取进展）
     assert request_count == 13
 
 
 def test_no_progress_abort_works_without_harness_runtime(mocker):
-    # legacy chat_with_model（无 Harness）场景：guard 照常观察、门禁照常生效，
-    # 终止消息写入历史并作为回合回复返回。
     from core.llm import chat_with_model
 
     request_count = 0
@@ -1867,13 +1804,11 @@ def test_no_progress_abort_works_without_harness_runtime(mocker):
     reply = chat_with_model("fake-model", "fake-key", messages)
 
     assert reply == _NO_PROGRESS_MESSAGE
-    # 同上：首次新读取签名消耗一格读取预算，熔断推迟到第 13 次请求
     assert request_count == 13
     assert messages[-1] == {"role": "assistant", "content": _NO_PROGRESS_MESSAGE}
 
 
 def test_step_progress_observation_ignores_call_ids_and_plan_placeholder():
-    import hashlib
 
     from core.llm import _step_progress_observation
 
@@ -1883,9 +1818,7 @@ def test_step_progress_observation_ignores_call_ids_and_plan_placeholder():
     obs_a = _step_progress_observation(records_a, {})
     obs_b = _step_progress_observation(records_b, {})
 
-    # 只改变工具 call id 不算进展：结果哈希必须一致
     assert obs_a.tool_results_sha256 == obs_b.tool_results_sha256
-    # 计划快照为真实计划指纹：不传 session 时走默认路由，同状态两次调用稳定一致
     from core.plan import plan_state_fingerprint
 
     assert obs_a.plan_snapshot_sha256 == plan_state_fingerprint(None)
@@ -1898,7 +1831,6 @@ def test_step_progress_observation_skips_observation_tools_and_blocked_results()
 
     baseline = _step_progress_observation(None, None)
 
-    # 观察类工具（manage_task 等）结果不纳入结果哈希
     obs = _step_progress_observation(
         [_progress_record("c1", "manage_task", '{"status":"running"}')],
         {},
@@ -1906,7 +1838,6 @@ def test_step_progress_observation_skips_observation_tools_and_blocked_results()
     assert obs.tool_results_sha256 == baseline.tool_results_sha256
     assert obs.mutation_committed is False
 
-    # RepeatCallGuard 拦截结果跳过：不纳入哈希、不算 mutation
     obs_blocked = _step_progress_observation(
         [_progress_record("c2", "write_file", REPEAT_CALL_BLOCKED_TEXT)],
         {},
@@ -1914,7 +1845,6 @@ def test_step_progress_observation_skips_observation_tools_and_blocked_results()
     assert obs_blocked.tool_results_sha256 == baseline.tool_results_sha256
     assert obs_blocked.mutation_committed is False
 
-    # 非观察类工具结果纳入结果哈希
     obs_written = _step_progress_observation(
         [_progress_record("c3", "write_file", "写入完成")],
         {},
@@ -1925,21 +1855,18 @@ def test_step_progress_observation_skips_observation_tools_and_blocked_results()
 def test_step_progress_observation_mutation_rules():
     from core.llm import _step_progress_observation
 
-    # write_file/edit_file 结果 ok → mutation
     obs = _step_progress_observation(
         [_progress_record("c1", "write_file", "写入完成")],
         {},
     )
     assert obs.mutation_committed is True
 
-    # 失败结果不算 mutation
     obs_fail = _step_progress_observation(
         [_progress_record("c2", "edit_file", "🚨 文件不存在")],
         {},
     )
     assert obs_fail.mutation_committed is False
 
-    # execute_command 查询类命令（QUERY）不算 mutation
     query_calls = {
         "c3": {
             "id": "c3",
@@ -1955,7 +1882,6 @@ def test_step_progress_observation_mutation_rules():
     )
     assert obs_query.mutation_committed is False
 
-    # execute_command 修改类命令且结果 ok → mutation
     mutation_calls = {
         "c4": {
             "id": "c4",
@@ -1973,7 +1899,6 @@ def test_step_progress_observation_mutation_rules():
 
 
 def test_different_subagent_task_ids_do_not_reset_stall():
-    """子代理动态 task_id 不得把超时移交结果当成业务进展。"""
     import json
 
     from core.llm import _step_progress_observation
@@ -1994,7 +1919,6 @@ def test_different_subagent_task_ids_do_not_reset_stall():
 
 
 def test_unplanned_subagent_progress_uses_arguments_but_ignores_dynamic_task_id():
-    """无计划子代理的不同工作算进展；同一工作只换 task_id 不算。"""
     import json
 
     from core.llm import _step_progress_observation
@@ -2030,7 +1954,6 @@ def test_unplanned_subagent_progress_uses_arguments_but_ignores_dynamic_task_id(
 
 
 def test_plan_bound_subagent_result_is_delegated_to_plan_fingerprint():
-    """计划绑定子代理的参数和动态结果都不绕过计划状态指纹。"""
     import json
 
     from core.llm import _step_progress_observation
@@ -2063,7 +1986,6 @@ def test_plan_bound_subagent_result_is_delegated_to_plan_fingerprint():
 
 
 def test_plan_state_tools_do_not_contribute_result_progress():
-    """所有计划控制工具只依据 canonical 计划快照计进展，正文不算。"""
     from core.llm import _step_progress_observation
 
     observations = [
@@ -2085,7 +2007,6 @@ def test_plan_state_tools_do_not_contribute_result_progress():
 
 
 def test_alternating_plan_control_failures_abort_after_twelve_stalled_steps():
-    """回归：切换计划工具和返回文案不能伪造进展、绕过无进展熔断。"""
     from core.harness.progress_guard import TurnProgressGuard
     from core.llm import _step_progress_observation
 
@@ -2111,11 +2032,6 @@ def test_alternating_plan_control_failures_abort_after_twelve_stalled_steps():
 
 
 def test_budget_notice_provider_injects_at_step_boundary(mocker):
-    """子代理预算提醒必须以 user 消息插在 Step 边界，并随事件流上报。
-
-    注入位置错误（例如插在 tool_calls 与 tool 结果之间）会制造悬空
-    tool_calls，OpenAI/Anthropic 都会 400，所以这条契约必须锁住。
-    """
     from types import SimpleNamespace
 
     seen_messages = []
@@ -2142,14 +2058,12 @@ def test_budget_notice_provider_injects_at_step_boundary(mocker):
     first_request = seen_messages[0]
     assert first_request[-1]["role"] == "user"
     assert "时间预算提醒" in first_request[-1]["content"]
-    # 只注入一次：provider 返回 None 后不再追加
     assert sum(
         1 for m in first_request if "时间预算提醒" in str(m.get("content"))
     ) == 1
 
 
 def test_budget_notice_provider_failure_never_breaks_turn(mocker):
-    """提醒通道异常必须被吞掉：预算提示失败不能中断子代理回合。"""
     def completion(**kwargs):
         return iter([_chunk("ok")])
 

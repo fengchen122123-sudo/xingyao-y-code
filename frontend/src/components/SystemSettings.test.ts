@@ -12,23 +12,20 @@ const turnStepLimitFields = {
   agent_turn_step_limit_max: 1000,
 };
 
-// 上下文水位基准设置：null 表示未设置（跟随模型真实窗口），取值范围由 min/max 给出
 const contextWatermarkFields = {
   context_watermark_base: null as number | null,
   context_watermark_base_min: 50000,
   context_watermark_base_max: 2000000,
 };
 
-// AI 生成内容目录设置（Task 5）：setting 为原始配置值（未配置为空串），
-// default 为默认目录（占位符与说明文案展示用）
 const aiOutputDirFields = {
   ai_output_dir: 'C:\\ycode-data\\tmp',
   ai_output_dir_setting: '',
   ai_output_dir_default: 'C:\\ycode-data\\tmp',
 };
 
-// 电脑操控设置快照（Task 12）：两个开关默认关闭，浏览器选项独立探测
 const computerSettings = {
+  subagent_enabled: true,
   browser_control_enabled: false,
   computer_control_enabled: false,
   computer_browser: 'edge',
@@ -195,8 +192,6 @@ describe('SystemSettings', () => {
     expect(save).not.toHaveBeenCalled();
   });
 
-  // ── 上下文水位基准 ──
-
   function mountWithContextWatermark(overrides: Record<string, unknown> = {}) {
     const store = useAppStore();
     store.systemSettings = {
@@ -260,7 +255,6 @@ describe('SystemSettings', () => {
 
     await wrapper.get('[data-test="context-watermark-base-input"]').setValue('0');
 
-    // 0 是「不设基准」（跟随模型真实窗口），不受 min/max 约束
     expect(wrapper.find('[data-test="context-watermark-base-error"]').exists()).toBe(false);
     const button = wrapper.get('[data-test="save-context-watermark-base"]');
     expect(button.attributes('disabled')).toBeUndefined();
@@ -336,8 +330,6 @@ describe('SystemSettings', () => {
     }
   });
 
-  // ── AI 生成内容目录（Task 5）──
-
   it('saves the AI output directory through the store', async () => {
     const store = useAppStore();
     store.systemSettings = {
@@ -354,7 +346,6 @@ describe('SystemSettings', () => {
     const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
     const wrapper = mount(SystemSettings);
 
-    // 占位符显示后端给出的默认目录，用户不填即恢复默认
     const input = wrapper.get('[data-test="ai-output-dir-input"]');
     expect(input.attributes('placeholder')).toBe('C:\\ycode-data\\tmp');
 
@@ -402,7 +393,6 @@ describe('SystemSettings', () => {
       command_shell_options: [],
     };
     const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
-    // 选择目录走 store.pickFolderPlain（桌面原生对话框 / 触屏内置浏览器统一入口）
     const pick = vi.spyOn(store, 'pickFolderPlain').mockImplementation(async (cb: (path: string) => void) => {
       cb('D:\\ai_out');
     });
@@ -430,7 +420,6 @@ describe('SystemSettings', () => {
       command_shell_options: [],
     };
     const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
-    // 用户取消：pickFolderPlain 的回调不触发
     vi.spyOn(store, 'pickFolderPlain').mockImplementation(async () => {});
     const wrapper = mount(SystemSettings);
 
@@ -440,8 +429,6 @@ describe('SystemSettings', () => {
     expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('');
     expect(save).not.toHaveBeenCalled();
   });
-
-  // ── 电脑操控区（Task 12）──
 
   function mountWithComputerSettings(overrides: Record<string, unknown> = {}) {
     const store = useAppStore();
@@ -549,7 +536,6 @@ describe('SystemSettings', () => {
     try {
       const { wrapper } = mountWithComputerSettings();
 
-      // 手机端不显示可点击启用控件（后端边界由 Task 15 实施）
       expect(wrapper.find('[data-test="browser-control-switch"]').exists()).toBe(false);
       expect(wrapper.find('[data-test="computer-control-switch"]').exists()).toBe(false);
       expect(wrapper.find('[data-test="computer-browser-select"]').exists()).toBe(false);
@@ -598,11 +584,9 @@ describe('computer active model capability hint', () => {
 
   it('shows eligible summary when switches on and model qualifies', () => {
     const wrapper = mountWith({ browser_control_enabled: true });
-    // 合格提示是说明性内容，收在「环境检测与安全提示」折叠区里，不占主视图行
     const hint = wrapper.get('[data-test="computer-diagnostics-capability-hint"]');
     expect(hint.text()).toContain('已具备电脑操控资格');
     expect(hint.classes()).not.toContain('blocked');
-    // 不合格时才是需要立刻看到的问题，仍然放在折叠区外
     expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
   });
 
@@ -612,113 +596,57 @@ describe('computer active model capability hint', () => {
   });
 });
 
-// ── 运行自检（T3b）──
+describe('subagent switch', () => {
+  const subagentApi = { set_subagent_enabled: vi.fn() };
 
-describe('doctor self-check entry', () => {
-  const doctorApi = { run_doctor: vi.fn() };
-  const baseSettings = {
-    command_shell: 'auto',
-    command_shell_available: true,
-    command_shell_error: '',
-    remote_token_ttl: 86400,
-    ...turnStepLimitFields,
-    ...contextWatermarkFields,
-    ...aiOutputDirFields,
-    ...computerSettings,
-    command_shell_options: [],
-  };
-
-  function mountWithDoctor() {
+  function mountWithSubagent(overrides: Record<string, unknown> = {}) {
     setActivePinia(createPinia());
     const store = useAppStore();
-    store.systemSettings = { ...baseSettings } as typeof store.systemSettings;
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...contextWatermarkFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      ...overrides,
+    } as typeof store.systemSettings;
     return { store, wrapper: mount(SystemSettings) };
   }
 
   beforeEach(() => {
     vi.clearAllMocks();
-    (window as any).pywebview = { api: doctorApi };
+    (window as any).pywebview = { api: subagentApi };
   });
 
   afterEach(() => {
     delete (window as any).pywebview;
   });
 
-  it('runs the aggregate self-check through the bridge and renders name/status/detail/hint', async () => {
-    doctorApi.run_doctor.mockResolvedValue({
-      ok: true,
-      summary: { ok: 1, warn: 1, fail: 1, skip: 1 },
-      checks: [
-        { name: '环境与版本', status: 'ok', detail: '星瑶Code v1.0.0 · Python 3.11.9 · win32', hint: '' },
-        { name: '配置', status: 'warn', detail: '存在未知配置键：memory_compression.retain_cout', hint: '未知键多为拼写错误，请删除或修正' },
-        { name: '凭据', status: 'fail', detail: '1/1 个 API Key 解密失败', hint: '请在模型设置中重新填写并保存' },
-        { name: '模型端点', status: 'skip', detail: '已跳过网络探测（skip_network=True）', hint: '' },
-      ],
-    });
-    const { wrapper } = mountWithDoctor();
+  it('renders the subagent switch as on when the snapshot enables it', () => {
+    const { wrapper } = mountWithSubagent();
 
-    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
-    await flushPromises();
-
-    expect(doctorApi.run_doctor).toHaveBeenCalledTimes(1);
-    expect(wrapper.get('[data-test="doctor-summary"]').text()).toBe('共 4 项：通过 1、警告 1、失败 1、跳过 1');
-
-    const failed = wrapper.get('[data-test="doctor-check-凭据"]');
-    expect(failed.text()).toContain('失败');
-    expect(failed.text()).toContain('1/1 个 API Key 解密失败');
-    expect(failed.text()).toContain('建议：请在模型设置中重新填写并保存');
-    expect(wrapper.get('[data-test="doctor-check-环境与版本"]').text()).toContain('通过');
-    expect(wrapper.get('[data-test="doctor-check-模型端点"]').text()).toContain('跳过');
+    const toggle = wrapper.get('[data-test="subagent-switch"]');
+    expect(toggle.attributes('aria-checked')).toBe('true');
+    expect(wrapper.get('[data-test="subagent-settings-section"]').text()).toContain('run_subagent');
   });
 
-  it('disables the button while the self-check is running', async () => {
-    let resolveRun: ((report: unknown) => void) | null = null;
-    doctorApi.run_doctor.mockImplementation(
-      () => new Promise(resolve => { resolveRun = resolve; }),
-    );
-    const { wrapper } = mountWithDoctor();
-    const button = wrapper.get('[data-test="run-doctor-button"]');
+  it('turns the subagent switch off through the backend bridge', async () => {
+    subagentApi.set_subagent_enabled.mockResolvedValue({ ok: true, settings: null });
+    const { wrapper } = mountWithSubagent();
 
-    await button.trigger('click');
-
-    expect(button.text()).toContain('检查中');
-    expect(button.attributes('disabled')).toBeDefined();
-
-    resolveRun!({ ok: true, checks: [], summary: { ok: 0, warn: 0, fail: 0, skip: 0 } });
+    await wrapper.get('[data-test="subagent-switch"]').trigger('click');
     await flushPromises();
 
-    expect(wrapper.get('[data-test="run-doctor-button"]').attributes('disabled')).toBeUndefined();
+    expect(subagentApi.set_subagent_enabled).toHaveBeenCalledTimes(1);
+    expect(subagentApi.set_subagent_enabled).toHaveBeenCalledWith(false);
   });
 
-  it('shows the bridge error message when the report is not ok', async () => {
-    doctorApi.run_doctor.mockResolvedValue({ ok: false, msg: '检查器崩溃', checks: [] });
-    const { wrapper } = mountWithDoctor();
+  it('renders the subagent switch as off when the snapshot disables it', () => {
+    const { wrapper } = mountWithSubagent({ subagent_enabled: false });
 
-    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
-    await flushPromises();
-
-    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('检查器崩溃');
-    expect(wrapper.find('[data-test="doctor-results"]').exists()).toBe(false);
-  });
-
-  it('shows an error when the bridge call rejects', async () => {
-    doctorApi.run_doctor.mockRejectedValue(new Error('bridge down'));
-    const { wrapper } = mountWithDoctor();
-
-    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
-    await flushPromises();
-
-    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('bridge down');
-  });
-
-  it('explains that pywebview is required when the bridge is unavailable', async () => {
-    delete (window as any).pywebview;
-    const { wrapper } = mountWithDoctor();
-
-    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
-    await flushPromises();
-
-    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('连接失败');
-    expect(doctorApi.run_doctor).not.toHaveBeenCalled();
+    expect(wrapper.get('[data-test="subagent-switch"]').attributes('aria-checked')).toBe('false');
   });
 });

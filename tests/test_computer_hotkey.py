@@ -1,8 +1,3 @@
-"""全局紧急停止热键（core/computer/hotkey.py）测试（计划 Task 5 / 设计 3.3、15.1、17.3）。
-
-所有测试只使用 FakeHotkeyApi，绝不在 pytest 中注册真实系统热键。
-"""
-
 import ctypes
 import logging
 import sys
@@ -21,12 +16,8 @@ from tests.computer_fakes import FakeHotkeyApi
 
 @pytest.fixture(autouse=True)
 def _clear_active_hotkey():
-    """每个测试结束后清空进程级活动热键注册表，避免跨测试污染。"""
     yield
     hotkey_module._set_active_hotkey(None)
-
-
-# ---------------- brief 样例（逐字） ----------------
 
 
 def test_hotkey_registration_failure_is_not_reported_available():
@@ -39,7 +30,6 @@ def test_hotkey_registration_failure_is_not_reported_available():
 
 
 def test_registration_failure_message_names_hotkey_as_occupied():
-    """注册失败异常消息必须点名热键并说明"已被占用"（Win32 1409 语义）。"""
     api = FakeHotkeyApi(register_result=False, last_error_code=1409)
     hotkey = EmergencyStopHotkey(api, on_stop=lambda: None)
     with pytest.raises(ComputerControlError) as raised:
@@ -53,9 +43,6 @@ def test_hotkey_callback_only_requests_controller_stop():
     hotkey = EmergencyStopHotkey(FakeHotkeyApi(), on_stop=lambda: requested.append("stop"))
     hotkey._dispatch_for_test("Ctrl+Alt+Esc")
     assert requested == ["stop"]
-
-
-# ---------------- 生命周期与快照边界 ----------------
 
 
 def test_hotkey_start_registers_once_and_reports_available():
@@ -133,9 +120,6 @@ def test_default_api_requires_windows(monkeypatch):
     with pytest.raises(ComputerControlError) as raised:
         WindowsHotkeyApi()
     assert raised.value.code == "computer_unsupported_os"
-
-
-# ---------------- 安全留痕：异常绝不静默吞掉 ----------------
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="默认热键 API 仅在 Windows 构造")

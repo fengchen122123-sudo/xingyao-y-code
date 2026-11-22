@@ -1,12 +1,3 @@
-"""流式尾部丢失修复的回归测试。
-
-根因 1（已修）：回合收尾 finally 直接 pop delta 缓冲，回合末尾滞留在缓冲里
-的最后一块文本（距上次冲刷不足 60ms、冲刷线程未轮到）被静默丢弃，前端靠
-delta 累加渲染，尾部永久缺失。
-根因 2 兜底（新增）：evaluate_js 投递可能静默失败，后端回合结束补发
-message_final 全文事件，前端仅在全文更长时覆盖校正。
-"""
-
 import threading
 
 from core.memory import MemoryManager
@@ -14,7 +5,6 @@ from gui_bridge import ApiBridge
 
 
 def _bare_bridge(db=":memory:"):
-    """不经 __init__ 构造裸实例，挂载 delta 缓冲与内存版 MemoryManager。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._memory = MemoryManager(db)
     bridge._shutting_down = False
@@ -28,7 +18,6 @@ def _bare_bridge(db=":memory:"):
 
 
 def test_finalize_session_deltas_flushes_tail_before_discard(monkeypatch):
-    """回归保护：收尾必须先冲刷再清缓冲，滞留在缓冲的尾部文本不得丢失。"""
     bridge = _bare_bridge()
     sent = []
     monkeypatch.setattr(
@@ -45,14 +34,12 @@ def test_finalize_session_deltas_flushes_tail_before_discard(monkeypatch):
 
 
 def test_finalize_session_deltas_tolerates_empty_buffers():
-    """缓冲为空时收尾是无害 no-op，不得抛异常。"""
     bridge = _bare_bridge()
     bridge._finalize_session_deltas("不存在的会话")
     assert bridge._delta_buffers == {}
 
 
 def test_emit_message_final_sends_last_assistant_full_text(monkeypatch):
-    """message_final 携带最后一条 assistant 消息全文（content + reasoning）。"""
     bridge = _bare_bridge()
     events = []
     monkeypatch.setattr(
@@ -72,7 +59,6 @@ def test_emit_message_final_sends_last_assistant_full_text(monkeypatch):
 
 
 def test_emit_message_final_noop_without_assistant_text(monkeypatch):
-    """会话中没有 assistant 文本（如开场即工具调用失败）时不发事件。"""
     bridge = _bare_bridge()
     events = []
     monkeypatch.setattr(
@@ -87,7 +73,6 @@ def test_emit_message_final_noop_without_assistant_text(monkeypatch):
 
 
 def test_emit_message_final_swallows_errors():
-    """兜底事件绝不能阻断 turn_finish：内存读取抛异常时静默吞掉。"""
     bridge = _bare_bridge()
 
     class _BrokenMemory:
@@ -95,20 +80,10 @@ def test_emit_message_final_swallows_errors():
             raise RuntimeError("磁盘 IO 失败")
 
     bridge._memory = _BrokenMemory()
-    # 不应抛出
     bridge._emit_message_final("会话A")
 
 
-# ---------------------------------------------------------------------------
-# 回合边界过滤（after_msg_id）：异常结束的回合不得把上一轮助手全文当成本轮回复
-# 补发。core/llm.rollback_turn_messages() 会回滚本轮内存消息，若本轮尚未落库
-# 任何助手消息，history 末尾会退化成上一轮的助手消息；前端 message_final 分支
-# 只做「全文更长就覆盖」（appStore.ts），不过滤就会把上一轮结果灌进本轮气泡。
-# ---------------------------------------------------------------------------
-
-
 def _bare_turn_bridge(db=":memory:"):
-    """裸 bridge：在 _bare_bridge 之上补齐 _run_turn_worker 全流程所需属性。"""
     bridge = _bare_bridge(db)
     bridge._cancel_events = {"session": threading.Event()}
     bridge._active_turns = {}
@@ -125,8 +100,6 @@ def _bare_turn_bridge(db=":memory:"):
     bridge._delta_flusher = None
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
-    # 按回合撤销：worker 生命周期依赖真实服务；服务必须与 bridge._memory
-    # 共用同一连接（message_turn_links 的 FK 校验在同一个数据库里）
     from core.turn_undo import service as _tu_service
     import tempfile as _tempfile
 
@@ -137,7 +110,6 @@ def _bare_turn_bridge(db=":memory:"):
 
 
 def test_emit_message_final_skips_stale_assistant_before_boundary(monkeypatch):
-    """边界之后没有助手消息：不得补发上一轮助手全文（用户报告的现象）。"""
     bridge = _bare_bridge()
     events = []
     monkeypatch.setattr(
@@ -154,7 +126,6 @@ def test_emit_message_final_skips_stale_assistant_before_boundary(monkeypatch):
 
 
 def test_emit_message_final_sends_only_message_after_boundary(monkeypatch):
-    """边界之后新增了助手消息：只补发该条，绝不能补发上一轮那条。"""
     bridge = _bare_bridge()
     events = []
     monkeypatch.setattr(
@@ -176,11 +147,6 @@ def test_emit_message_final_sends_only_message_after_boundary(monkeypatch):
 
 
 def test_worker_exception_does_not_replay_previous_assistant_message(monkeypatch):
-    """端到端回归：回合异常结束时不得把上一轮助手全文当本轮回复补发。
-
-    预置上一轮 user+assistant，本回合在 get_active_model 处抛异常（等价于
-    provider 断连），turn_error 必须发出，而 message_final 一条都不能有。
-    """
     bridge = _bare_turn_bridge()
     bridge._memory.create_session_explicit("session")
     bridge._memory.add_message("session", "user", "上一轮提问")
@@ -201,7 +167,6 @@ def test_worker_exception_does_not_replay_previous_assistant_message(monkeypatch
 
 
 def test_worker_emits_message_final_for_current_turn_message(monkeypatch, tmp_path):
-    """端到端正向保护：本回合落库了助手消息时，仍要补发该条（不是上一轮）。"""
     bridge = _bare_turn_bridge()
     bridge._memory.create_session_explicit("session")
     bridge._memory.add_message("session", "user", "上一轮提问")
@@ -225,7 +190,6 @@ def test_worker_emits_message_final_for_current_turn_message(monkeypatch, tmp_pa
     bridge._maybe_auto_rename = lambda _name: None
 
     def _fake_consume(*_args, **_kwargs):
-        # 模拟本回合内助手消息正常落库（未取消、未回滚）
         bridge._memory.add_message("session", "assistant", "本轮的完整回复")
         return False
 

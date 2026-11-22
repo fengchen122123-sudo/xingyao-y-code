@@ -1,17 +1,8 @@
-/**
- * 模型连接测试及 API 调用的错误解析与友好文案归一化。
- *
- * 作用：将 LiteLLM / Provider 抛出的深层嵌套技术堆栈（如 AuthenticationError /
- * OpenAIException / ConnectionError）转换为用户易懂的人性化中文提示与排查建议，
- * 避免在设置界面或调用链中直接暴露晦涩冗长、破坏布局的原始技术堆栈。
- */
 
 export interface ParsedModelError {
   /** 简短核心原因（例如："API Key 无效或未授权"、"账号余额不足"） */
   title: string;
-  /** 详细排查指引或简短说明 */
   detail: string;
-  /** 原始错误信息（供开发者复制或查看完整堆栈） */
   raw: string;
 }
 
@@ -19,7 +10,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
   const raw = (rawMsg || '').trim();
   const lower = raw.toLowerCase();
 
-  // 1. 认证 / Key 无效 / 401 Unauthorized
   if (
     lower.includes('authenticationerror') ||
     lower.includes('invalid authentication') ||
@@ -35,7 +25,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
     };
   }
 
-  // 2. 欠费 / 额度耗尽 / 余额不足
   if (
     lower.includes('insufficient_quota') ||
     lower.includes('quota') ||
@@ -51,7 +40,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
     };
   }
 
-  // 3. 频次限制 / 429 Too Many Requests
   if (
     lower.includes('ratelimiterror') ||
     lower.includes('too many requests') ||
@@ -65,7 +53,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
     };
   }
 
-  // 4. 超时 (Timeout)
   if (
     lower.includes('timeout') ||
     lower.includes('timed out') ||
@@ -78,7 +65,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
     };
   }
 
-  // 5. 网络连通性 (ConnectionError / DNS 解析失败)
   if (
     lower.includes('connectionerror') ||
     lower.includes('failed to establish') ||
@@ -93,7 +79,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
     };
   }
 
-  // 6. 找不到模型 / 404 Not Found
   if (
     lower.includes('notfounderror') ||
     lower.includes('does not exist') ||
@@ -108,7 +93,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
     };
   }
 
-  // 7. 403 权限不足
   if (
     lower.includes('permissiondenied') ||
     lower.includes('forbidden') ||
@@ -121,7 +105,6 @@ export function parseModelTestError(rawMsg: string): ParsedModelError {
     };
   }
 
-  // 8. 5xx 服务端错误
   if (
     lower.includes('internalservererror') ||
     lower.includes('bad gateway') ||

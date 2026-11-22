@@ -1,6 +1,4 @@
 <template>
-  <!-- 内联 SVG 图标：统一 lucide 风格（24 viewBox / 圆角线帽 / currentColor 描边），
-       尺寸由 size 控制，颜色跟随父级 color，与文本基线对齐 -->
   <svg
     class="app-icon"
     :width="size"
@@ -9,8 +7,8 @@
     fill="none"
     stroke="currentColor"
     :stroke-width="strokeWidth"
-    stroke-linecap="round"
-    stroke-linejoin="round"
+    :stroke-linecap="linecap"
+    :stroke-linejoin="linejoin"
     aria-hidden="true"
     v-html="path"
   />
@@ -23,12 +21,12 @@ import { ICON_PATHS } from './iconPaths';
 const props = withDefaults(
   defineProps<{
     name: string;
-    /** 渲染尺寸（px），默认 16 */
     size?: number;
-    /** 描边宽度，默认 1.75（24 viewBox 下小尺寸仍清晰） */
     strokeWidth?: number;
+    linecap?: 'round' | 'butt' | 'square';
+    linejoin?: 'round' | 'miter' | 'bevel';
   }>(),
-  { size: 16, strokeWidth: 1.75 },
+  { size: 16, strokeWidth: 1.75, linecap: 'round', linejoin: 'round' },
 );
 
 const path = computed(() => ICON_PATHS[props.name] ?? '');
@@ -40,8 +38,9 @@ const path = computed(() => ICON_PATHS[props.name] ?? '');
   display: inline-block;
   vertical-align: -0.15em;
   flex-shrink: 0;
+  /* 加粗描边时避免贴边被 viewBox 裁掉 */
+  overflow: visible;
 }
-/* 加载中旋转（配合 loader 弧线图标） */
 .app-icon.icon-spin {
   animation: app-icon-rotate 1s linear infinite;
 }

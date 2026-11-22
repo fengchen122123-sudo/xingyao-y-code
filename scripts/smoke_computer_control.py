@@ -1,30 +1,6 @@
-"""Manual smoke probe for Y-CODE computer control prerequisites.
-
-This script is NEVER run by automated tests. It must only be executed by a
-human who explicitly allows a visible system browser window to open or a real
-desktop screenshot / mouse move / click / typing. It does not download
-browsers and only navigates to about:blank.
-
-Modes:
-- --probe-browser edge|chrome: raw Playwright channel probe on about:blank.
-- --browser-observe edge|chrome: start the dedicated BrowserComputerBackend,
-  take exactly one observation (screenshot only, no input), print the redacted
-  summary (origin / truncated title / sha256), then close.
-- --desktop-observe: start the real WindowsComputerBackend (preflight +
-  exactly one desktop screenshot, no input), print the redacted summary, close.
-- --desktop-input --confirm-real-input I_UNDERSTAND: perform exactly one
-  move + one click + one fixed harmless type in the visible test area.
-  Before EVERY step the script prints the redacted action it is about to
-  perform and waits for a single Enter; any other input aborts immediately.
-  The user must first open a non-sensitive test window (e.g. an empty editor
-  or blank page) in the foreground. Missing or wrong confirmation exits 2
-  without touching anything. release/stop is called after the test.
-"""
-
 import argparse
 import sys
 
-# --desktop-input 固定敲入的无敏感测试文本（可见测试区域）。
 SMOKE_TYPE_TEXT = "ycode smoke"
 
 

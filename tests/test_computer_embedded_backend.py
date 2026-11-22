@@ -1,7 +1,3 @@
-"""内置 WebView2 CDP 直连 backend（core/computer/embedded_browser_backend.py）的
-headless 测试：不触碰 Playwright（构造函数铁律），只测身份校验、坐标域与
-观察视口 hook。"""
-
 from pathlib import Path
 
 import pytest
@@ -32,19 +28,13 @@ def test_backend_targets_browser_and_never_owns_context():
 
 def test_coordinate_validation_uses_project_viewport():
     backend = _backend(viewport=(800, 600))
-    backend._check_coordinates(799, 599)  # 半开区间内不抛
+    backend._check_coordinates(799, 599)
     with pytest.raises(ComputerControlError) as excinfo:
         backend._check_coordinates(800, 0)
     assert excinfo.value.code == "computer_coordinate_out_of_bounds"
 
 
 def test_observation_viewport_reports_live_metrics_with_dpr():
-    """E4：原始尺寸必须等于 CSS 视口（帧会被 _normalize_frame 重采样）。
-
-    高 DPI 下截图是 1280×800×1.25 的物理像素，若 original 仍报 1600×1000，
-    模型按图片给的坐标会被当成 CSS 坐标点击并系统性偏移；重采样后图片与动作
-    同尺寸，因此 original 与 width 同值、scale=1。
-    """
     backend = _backend()
 
     class _FakePage:
@@ -61,7 +51,6 @@ def test_observation_viewport_reports_live_metrics_with_dpr():
 
 
 def test_normalize_frame_resamples_physical_pixels_to_css_viewport():
-    """E4：物理像素截图（1600×1000）被重采样成 CSS 视口（1280×800）。"""
     import io
 
     from PIL import Image
@@ -80,7 +69,6 @@ def test_normalize_frame_resamples_physical_pixels_to_css_viewport():
 
 
 def test_normalize_frame_keeps_image_when_size_matches():
-    """尺寸已经一致时不重新编码（避免无谓的 PNG 体积膨胀）。"""
     import io
 
     from PIL import Image
@@ -108,3 +96,37 @@ def test_observation_viewport_falls_back_to_project_viewport_on_error():
     assert metrics["width"] == 800
     assert metrics["height"] == 600
     assert metrics["scale_x"] == 1.0
+
+
+def test_connect_with_retry_aborts_immediately_when_stop_event_sets(monkeypatch):
+    import threading
+    import time
+
+    import core.computer.embedded_browser_backend as emb
+
+    monkeypatch.setattr(emb, "_CDP_READY_POLL_INTERVAL", 2.0)
+    backend = _backend()
+
+    class _FailingChromium:
+        def connect_over_cdp(self, _endpoint):
+            raise RuntimeError("not ready yet")
+
+    class _FakePlaywright:
+        chromium = _FailingChromium()
+
+    backend._playwright = _FakePlaywright()
+    backend._start_timeout = 10.0
+
+    def trigger_stop():
+        time.sleep(0.03)
+        backend._worker_stop.set()
+
+    stopper = threading.Thread(target=trigger_stop, daemon=True)
+    stopper.start()
+    started = time.monotonic()
+    with pytest.raises(ComputerControlError) as excinfo:
+        backend._connect_with_retry()
+    elapsed = time.monotonic() - started
+    stopper.join(timeout=1.0)
+    assert excinfo.value.code == "computer_browser_closed"
+    assert elapsed < 0.5

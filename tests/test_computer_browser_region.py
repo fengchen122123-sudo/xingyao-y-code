@@ -1,9 +1,3 @@
-"""browser 局部观察（observe_region，E5 2026-11-03）的 fake 层测试。
-
-覆盖：区域裁剪尺寸/origin、区域坐标系下的点击换算、越界拒绝、回到整屏观察
-后坐标复位。全部走 tests.computer_fakes，绝不启动真实浏览器。
-"""
-
 from __future__ import annotations
 
 import io
@@ -60,7 +54,7 @@ def test_observe_region_crops_region_and_sets_origin(backend):
     assert (observation.width, observation.height) == (200, 120)
     assert (observation.original_width, observation.original_height) == (200, 120)
     assert (observation.origin_x, observation.origin_y) == (100, 50)
-    assert observation.elements == ()  # 区域观察不附 DOM 清单
+    assert observation.elements == ()
     with Image.open(io.BytesIO(Path(observation.png_path).read_bytes())) as image:
         assert image.size == (200, 120)
 
@@ -105,7 +99,7 @@ def test_full_observe_resets_coordinate_frame(backend):
     backend.execute("run-a", _observe_region(x=100, y=50, width=200, height=120))
     backend.observe("run-a")
 
-    backend.observe("run-a")  # 回到整屏
+    backend.observe("run-a")
     backend.execute(
         "run-a",
         parse_computer_action({"kind": "click", "target": "browser", "x": 10, "y": 20}),
@@ -127,8 +121,27 @@ def test_observe_region_out_of_viewport_is_rejected(backend):
 def test_observe_region_requires_surface_baseline(backend):
     page = backend.active_page
     page.screenshot_bytes = _png(400, 300)
-    # 从未 observe 过：页面 token 未知，坐标动作前必须建立基线
     backend.execute("run-a", _observe_region())
     observation = backend.observe("run-a")
-    # 首次 observe 不受影响：pending 区域仍然生效
     assert observation.action == "observe_region"
+
+
+def test_viewport_change_invalidates_region_frame_and_increments_generation(backend):
+    page = backend.active_page
+    page.screenshot_bytes = _png(400, 300)
+    first = backend.observe("run-a")
+    assert first.viewport_generation == 1
+    assert first.frame_id
+
+    backend._viewport_width, backend._viewport_height = (800, 600)
+    with pytest.raises(ComputerControlError) as raised:
+        backend.execute(
+            "run-a",
+            parse_computer_action({"kind": "click", "target": "browser", "x": 10, "y": 10}),
+        )
+    assert raised.value.code == "computer_surface_changed"
+
+    page.screenshot_bytes = _png(800, 600)
+    second = backend.observe("run-a")
+    assert second.viewport_generation == 2
+    assert second.frame_id != first.frame_id

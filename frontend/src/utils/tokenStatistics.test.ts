@@ -86,14 +86,12 @@ describe('buildHeatmapWeeks', () => {
       expect(new Date(`${column.cells[0].date}T00:00:00Z`).getUTCDay()).toBe(0);
     }
 
-    // 窗口内无数据日期补 0 格
     const emptyCell = columns[0].cells[0];
     expect(emptyCell.total).toBe(0);
     expect(emptyCell.requests).toBe(0);
     expect(emptyCell.level).toBe(0);
     expect(emptyCell.title).toBe('2026年9月6日 · 0 Token · 0 次请求');
 
-    // 窗口外数据被忽略
     const dates = columns.flatMap(column => column.cells.map(cell => cell.date));
     expect(dates).not.toContain('2026-09-01');
     expect(dates).toHaveLength(21);
@@ -102,9 +100,9 @@ describe('buildHeatmapWeeks', () => {
   it('daily 模式按全窗口最大单日值分级并生成标题', () => {
     const columns = buildHeatmapWeeks(dailyDays, '2026-09-22', 'daily', 3);
 
-    expect(columns[2].cells[0].level).toBe(4); // 100 / 100
-    expect(columns[2].cells[1].level).toBe(0); // 9/21 无数据
-    expect(columns[2].cells[2].level).toBe(2); // 50 / 100 → ceil(2) = 2
+    expect(columns[2].cells[0].level).toBe(4);
+    expect(columns[2].cells[1].level).toBe(0);
+    expect(columns[2].cells[2].level).toBe(2);
     expect(columns[2].cells[2].title).toBe('2026年9月22日 · 50 Token · 1 次请求');
     expect(columns[2].title).toBeNull();
   });
@@ -129,11 +127,9 @@ describe('buildHeatmapWeeks', () => {
     expect(columns[0].cells.every(cell => cell.level === 0)).toBe(true);
     expect(columns[0].title).toBe('截至 2026年9月12日 · 0 Token · 0 次请求');
 
-    // 9/13-9/19 周：30 / 150 → 1 级，从底部填充 2 格
     expect(columns[1].title).toBe('截至 2026年9月19日 · 30 Token · 2 次请求');
     expect(columns[1].cells.map(cell => cell.level)).toEqual([0, 0, 0, 0, 0, 1, 1]);
 
-    // 9/20-9/26 周：150 / 150 → 4 级，7 格填满
     expect(columns[2].title).toBe('截至 2026年9月26日 · 150 Token · 3 次请求');
     expect(columns[2].cells.map(cell => cell.level)).toEqual([4, 4, 4, 4, 4, 4, 4]);
   });
@@ -165,7 +161,6 @@ describe('buildHeatmapMonthLabels', () => {
     const columns = buildHeatmapWeeks([], '2026-09-22', 'daily', 12);
     const labels = buildHeatmapMonthLabels(columns);
 
-    // 窗口 7/5-9/26：7/26-8/1 与 8/30-9/5 两列包含 1 日，分别归入 8 月与 9 月。
     expect(labels.map(label => label.key)).toEqual(['2026-07', '2026-08', '2026-09']);
     expect(labels.map(label => label.label)).toEqual(['7月', '8月', '9月']);
     expect(labels.map(label => label.span)).toEqual([3, 5, 4]);
@@ -323,7 +318,7 @@ describe('buildLifetimeSummary', () => {
     expect(summary.totalTokens).toBe(25);
     expect(summary.peakDay).toEqual({ date: '2026-09-01', total: 10 });
     expect(summary.activeDays).toBe(4);
-    expect(summary.currentStreak).toBe(0); // 最后一天为 0
+    expect(summary.currentStreak).toBe(0);
     expect(summary.longestStreak).toBe(3);
   });
 
@@ -377,10 +372,6 @@ describe('日期格式化与 token 计数', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// 热力图点选明细
-// ---------------------------------------------------------------------------
-
 function modelMetrics(
   key: string,
   prompt: number,
@@ -407,7 +398,6 @@ const modelA = modelMetrics('alpha/flash', 180, 40, 100, 200, 2);
 const modelB = modelMetrics('beta/max', 70, 10, 30, 80, 1);
 
 describe('buildSelectionDetail', () => {
-  // 日级字段与模型合计保持一致（真实后端快照就是这么来的）。
   const dayOne: TokenStatisticsDay = {
     date: '2026-09-22',
     prompt: 250,

@@ -1,26 +1,3 @@
-"""管理交互类 Agent 工具：PTY 终端 / 内嵌浏览器面板 / 截屏 / 剪贴板图片 / 电脑操控。
-
-设计约束：
-- 只复用 core 层公开模块（gui_terminal / app_context / ai_output_paths /
-  workspace_context / computer.*），禁止 import gui_bridge / main / pywebview；
-  需要 GUI 能力时统一通过 ``core.app_context.get()`` 动态取当前运行上下文，
-  用 getattr 探测其公开方法，缺失即返回明确中文错误，绝不伪造成功。
-- 所有工具统一返回 JSON 字符串（ensure_ascii=False）：
-  成功 ``{"ok": true, ...}``，失败 ``{"ok": false, "error": "中文原因"}``；
-- 所有异常在工具入口兜底，任何情况下都不向调度层抛出；
-- 不新增权限档位 / 信任类动作：本模块只做用户可感知的交互与状态查询。
-
-read_only 口径：本模块全部工具都会产生进程外副作用（创建 PTY、驱动 UI、
-落盘截图/剪贴板图片、启停电脑操控 run），即使是 state/status 这类只读动作，
-也按工具整体语义置 read_only=False，避免把混合语义工具误标成只读；
-mutates_files 口径：screenshot_capture / clipboard_image 落的是 AI 产物文件（截图 /
-剪贴板图片），不属于受控源码编辑，因此统一 mutates_files=False、不接入按回合撤销
-记录器；产物路径仍由返回值（path 字段）如实给出。
-
-工具清单（build_specs() 返回 5 个 ToolSpec）：
-pty_manage / browser_pane / screenshot_capture / clipboard_image / computer_control
-"""
-
 from __future__ import annotations
 
 import datetime
@@ -34,11 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from core.tool_protocol import ToolSpec
-
-
-# ---------------------------------------------------------------------------
-# 通用返回与容错
-# ---------------------------------------------------------------------------
 
 
 def _dumps(payload: dict[str, Any]) -> str:
@@ -93,7 +65,7 @@ def _as_float(value: Any, default: float = 1.0) -> float:
         number = float(value)
     except (TypeError, ValueError):
         return default
-    if number != number or number in (float("inf"), float("-inf")):  # NaN / inf
+    if number != number or number in (float("inf"), float("-inf")):
         return default
     return number
 
@@ -102,10 +74,6 @@ def _timestamp_slug(prefix: str, suffix: str = ".png") -> str:
     now = datetime.datetime.now()
     return f"{prefix}-{now.strftime('%Y%m%d-%H%M%S')}-{now.microsecond // 1000:03d}{suffix}"
 
-
-# ---------------------------------------------------------------------------
-# 1) pty_manage：常驻 shell（复用 core.gui_terminal）
-# ---------------------------------------------------------------------------
 
 # 工具侧输出缓冲上限：只保留尾部，避免常驻 shell 的输出无限吃内存
 _PTY_BUFFER_CHARS = 32 * 1024
@@ -116,12 +84,6 @@ PTY_ACTIONS = ("ensure", "write", "resize", "kill", "state")
 
 
 class _PtyHolder:
-    """模块级 PTY 单例容器：线程锁 + 输出环形缓冲 + 会话复用。
-
-    为什么自己缓冲输出：``PtyTerminalSession`` 只提供 write/resize/kill/is_alive，
-    输出仅通过构造时的 on_output 回调派发，没有同步读取接口。工具需要「最近
-    输出」用于状态汇报，因此在回调里保存尾部文本。
-    """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -134,7 +96,6 @@ class _PtyHolder:
         self._started_at = 0.0
         self._last_exit: int | None = None
 
-    # -- 回调（由会话后台线程触发，持锁时间极短） --
     def _append_output(self, text: str) -> None:
         if not text:
             return
@@ -150,7 +111,6 @@ class _PtyHolder:
             self._last_exit = _as_int(code, 0)
             self._session = None
 
-    # -- 对外操作 --
     def tail(self) -> str:
         with self._lock:
             text = "".join(self._chunks)
@@ -269,7 +229,7 @@ def pty_manage(action: str = "state", data: str = "", cols: int = 80, rows: int 
     if act == "ensure":
         try:
             payload = holder.ensure(cols, rows)
-        except Exception as exc:  # PtyTerminalError 携带中文消息，其余异常原样展示
+        except Exception as exc:
             return _fail(str(exc) or f"{type(exc).__name__}")
         return _ok(action=act, **payload)
 
@@ -296,22 +256,16 @@ def pty_manage(action: str = "state", data: str = "", cols: int = 80, rows: int 
         result = holder.kill()
         return _ok(action=act, **result)
 
-    # state
     return _ok(action=act, **_strip_output(holder.status()))
 
 
 def _strip_output(status: dict[str, Any]) -> dict[str, Any]:
-    """终态汇报里保留尾部输出，同时给出长度便于判断是否有内容。"""
     data = dict(status)
     output = str(data.pop("recent_output", "") or "")
     data["recent_output"] = output
     data["recent_output_chars"] = len(output)
     return data
 
-
-# ---------------------------------------------------------------------------
-# 2) browser_pane：GUI 内嵌浏览器面板（经 app_context 取 GUI 上下文）
-# ---------------------------------------------------------------------------
 
 BROWSER_ACTIONS = (
     "open",
@@ -324,10 +278,7 @@ BROWSER_ACTIONS = (
     "set_bounds",
 )
 
-# action -> (桥方法名, 是否需要 rect)
 _BROWSER_METHODS: dict[str, tuple[str, bool]] = {
-    # open 不再强制 rect：模型不知道窗口布局，缺 rect 时走 browser_pane_assign
-    # 只登记「该会话要打开这个地址」，由前端在页签激活时测量矩形并真正 open。
     "open": ("browser_pane_open", False),
     "close": ("browser_pane_hide", False),
     "navigate": ("browser_pane_navigate", False),
@@ -354,11 +305,6 @@ def _browser_context() -> Any:
 
 
 def _browser_session() -> str:
-    """本次调用所属会话：回合线程绑定的会话优先（多会话并行下稳定）。
-
-    线程级绑定由回合入口写入，后台并行的 B 会话不会因为用户正在看 A 而被
-    误判成 A；未绑定的调用（前端直连、测试主线程）回落到当前查看会话。
-    """
     from core import app_context
 
     return str(
@@ -371,7 +317,6 @@ def _browser_session() -> str:
 def _call_browser_bridge(
     method_name: str, rect: dict | None, url: str, zoom: float, session_name: str = ""
 ) -> Any:
-    """按桥方法的真实签名调用；缺少方法时抛 RuntimeError（中文消息）。"""
     ctx = _browser_context()
     if ctx is None:
         raise RuntimeError(_BROWSER_ERROR_TEXT["no_gui"])
@@ -398,7 +343,6 @@ def browser_pane(action: str, url: str = "", rect: Any = None, zoom: float = 1.0
 
     method_name, need_rect = _BROWSER_METHODS[act]
     rect_value: dict | None = None
-    # open 的 rect 可选（模型不知道窗口布局）；其余需要 rect 的动作缺参即报错。
     if isinstance(rect, dict) and rect:
         rect_value = dict(rect)
     if need_rect and rect_value is None:
@@ -427,7 +371,6 @@ def browser_pane(action: str, url: str = "", rect: Any = None, zoom: float = 1.0
     except RuntimeError as exc:
         return _fail(str(exc))
     except TypeError as exc:
-        # 桥方法签名与预期不一致（上下文不是 GUI 桥）：明确报错，不猜参数
         return _fail(f"调用 {method_name} 失败（方法签名不匹配）：{exc}")
 
     if not isinstance(result, dict):
@@ -450,10 +393,6 @@ def browser_pane(action: str, url: str = "", rect: Any = None, zoom: float = 1.0
     return _ok(action=act, **payload)
 
 
-# ---------------------------------------------------------------------------
-# 3) screenshot_capture：全屏 / 区域截屏（PIL.ImageGrab）
-# ---------------------------------------------------------------------------
-
 SCREENSHOT_MODES = ("full", "region")
 
 _PILLOW_LOCK = threading.Lock()
@@ -473,12 +412,6 @@ def _venv_python_candidates() -> list[Path]:
 
 
 def _probe_pillow() -> tuple[bool, str, str]:
-    """检测 Pillow 是否可用，返回 (可用, 版本, 探测来源)。
-
-    先按约定执行 ``.\\venv\\Scripts\\python.exe -c "import PIL; print(PIL.__version__)"``
-    （打包/多解释器环境下能确认落盘进程之外的解释器也确实装了 Pillow）；
-    venv 解释器不存在或执行失败时，退回进程内 import 探测。
-    """
     with _PILLOW_LOCK:
         if _PILLOW_CACHE["checked"] and _PILLOW_CACHE["available"]:
             return True, str(_PILLOW_CACHE["version"]), str(_PILLOW_CACHE["source"])
@@ -533,7 +466,6 @@ def _resolve_output_target(output_path: str, prefix: str) -> Path:
 
 
 def _save_image(image: Any, target: Path) -> int:
-    """保存图片并返回字节数；异常由调用方翻译成中文错误。"""
     if target.suffix.lower() == ".png":
         image.save(str(target), format="PNG")
     else:
@@ -606,15 +538,11 @@ def screenshot_capture(
     )
 
 
-# ---------------------------------------------------------------------------
-# 4) clipboard_image：读取 / 保存剪贴板图片
-# ---------------------------------------------------------------------------
-
 CLIPBOARD_ACTIONS = ("read", "save")
 
 
 class _ClipboardNoImage(Exception):
-    """剪贴板里没有图片（携带中文消息）。"""
+    pass
 
 
 def _grab_clipboard_image() -> Any:
@@ -670,10 +598,6 @@ def clipboard_image(action: str = "read", output_path: str = "") -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# 5) computer_control：查看 / 暂停 / 恢复 / 停止电脑操控，查看浏览器选项
-# ---------------------------------------------------------------------------
-
 COMPUTER_ACTIONS = ("status", "pause", "resume", "stop", "browser")
 
 
@@ -705,11 +629,6 @@ def _hotkey_available() -> bool:
 
 
 def _computer_run_state() -> tuple[str, dict[str, Any]]:
-    """返回 (状态来源, run 公开快照)。
-
-    优先走 GUI 上下文（它会确保事件桥已挂接，供前端实时校准）；无 GUI 上下文
-    或上下文缺该方法时退回 core controller 的进程级单例快照。
-    """
     from core import app_context
 
     ctx = app_context.get()
@@ -730,7 +649,6 @@ def _computer_run_state() -> tuple[str, dict[str, Any]]:
 
 
 def _computer_mutate(act: str, run_id: str) -> dict[str, Any]:
-    """执行 pause/resume/stop：优先 GUI 桥方法，退回 core controller 公开方法。"""
     from core import app_context
 
     ctx = app_context.get()
@@ -754,8 +672,6 @@ def _computer_mutate(act: str, run_id: str) -> dict[str, Any]:
         elif act == "resume":
             snapshot = controller.resume(run_id)
         else:
-            # 走 stop_for_user：用户（或模型代表用户）停止操控不应终止整个
-            # 对话回合，只需结束 run 并留下"用户已停止"的抑制态与通知。
             snapshot = controller.stop_for_user(run_id, "user_stop")
     except ComputerControlError as exc:
         return {
@@ -835,13 +751,7 @@ def computer_control(action: str) -> str:
     return _ok(action=act, source=outcome.get("source", ""), run_id=run_id, result=result)
 
 
-# ---------------------------------------------------------------------------
-# 工具契约
-# ---------------------------------------------------------------------------
-
-
 def build_specs() -> list[ToolSpec]:
-    """返回 5 个管理交互工具契约（供工具注册表装配）。"""
     rect_schema = {
         "type": "object",
         "description": "面板矩形（物理/逻辑像素以桥层校验为准），需含 x/y/width/height",
@@ -891,8 +801,12 @@ def build_specs() -> list[ToolSpec]:
         ToolSpec(
             name="browser_pane",
             description=(
-                "驱动 GUI 内嵌浏览器面板：open 打开、close 关闭、navigate 导航、"
+                "驱动 GUI 内嵌「星瑶内置浏览器」面板：open 打开、close 关闭、navigate 导航、"
                 "back/forward/reload 前进后退刷新、state 查看状态、set_bounds 调整位置。"
+                "【系统设置优先】仅当系统设置「默认浏览器」为星瑶内置浏览器（embedded）时适用，"
+                "绝不用于代替 Edge/Chrome；且当 computer_action(target=\"browser\") 可用时，"
+                "网页打开、导航与页面交互必须优先使用 computer_action，本工具仅用于 close/state/"
+                "set_bounds、本地 file:// 页面预览或未开启浏览器操控时的只读展示。"
                 "open 的 rect 可省略——真实位置由界面测量，不要凭空编造坐标；"
                 "在非当前查看的会话里打开时只登记意图，切回该会话才显示。"
                 "仅在 GUI 运行环境可用，非 GUI 环境会明确报错。"
@@ -948,8 +862,6 @@ def build_specs() -> list[ToolSpec]:
             ),
             execute=screenshot_capture,
             read_only=False,
-            # 只写截图产物文件（default 落 AI 输出目录，返回值即真实路径），
-            # 不属于受控源码编辑，因此不声明 mutates_files、不纳入按回合撤销记录器。
             mutates_files=False,
             requires_permission=True,
             cancellable=True,
@@ -978,8 +890,6 @@ def build_specs() -> list[ToolSpec]:
             ),
             execute=clipboard_image,
             read_only=False,
-            # 只写剪贴板图片落盘文件（返回值即真实产物路径），不属于受控源码编辑，
-            # 因此不声明 mutates_files、不纳入按回合撤销记录器。
             mutates_files=False,
             requires_permission=True,
             cancellable=True,

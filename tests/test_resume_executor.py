@@ -1,8 +1,3 @@
-"""ResumeExecutor（断点续跑 S3 最小可用版）单测：fake writer / planner / request_fn。
-
-执行层只做四件事：门禁 -> 建 resume turn -> 写事件 -> 调注入的请求函数。
-"已完成调用的结果"由 messages 表提供，本层绝不伪造工具结果。
-"""
 import threading
 
 import pytest
@@ -22,7 +17,6 @@ from core.memory import MemoryManager
 
 
 class _FakeWriter:
-    """收集 (turn_id, draft)，并记录 resume turn 的建表字段。"""
 
     def __init__(self):
         self.turns = []
@@ -137,7 +131,6 @@ def test_unconfirmed_block_requires_confirm_and_sends_no_request():
     assert confirms[0].call_ordinal == 1
     assert confirms[0].tool_name == "write_file"
     assert confirms[0].arguments_sha256 == "w" * 64
-    # 未建 turn：确认事件挂父回合上，且绝无 resume_started
     assert writer.event_turns(HarnessEventKind.RESUME_WRITE_CONFIRM_REQUIRED) == ["turn-parent"]
     assert writer.drafts(HarnessEventKind.RESUME_STARTED) == []
 
@@ -260,9 +253,7 @@ def test_normal_path_builds_resume_turn_and_replays_reads():
         ("turn-parent:step:2", 0, "read_file", str(0) * 64),
         ("turn-parent:step:2", 1, "grep", str(1) * 64),
     ]
-    # 只有两个 REPLAY_WITH_RESULT 回灌；REPLAY_FRESH 不写事件
     assert len(replayed) == 2
-    # 成功路径不在父回合上留任何事件（父回合零改动）
     assert {event_turn for event_turn, _draft in writer.events} == {turn_id}
     assert request.calls == [
         {"turn_id": turn_id, "parent_turn_id": "turn-parent", "request_reason": "resume"}
@@ -305,7 +296,6 @@ def _turn_row(manager, turn_id):
 
 
 def test_real_journal_default_writer_keeps_parent_interrupted(tmp_path):
-    """默认 writer（HarnessJournal）真跑：三个字段落库，父回合一个字节都不动。"""
     manager = MemoryManager(str(tmp_path / "resume-exec.db"))
     manager.create_session_explicit("session")
     journal = HarnessJournal(manager, "owner-exec", clock_ms=lambda: 10_000)
@@ -335,7 +325,6 @@ def test_real_journal_default_writer_keeps_parent_interrupted(tmp_path):
     assert row[1] == "resume"
     assert row[2] == 2
     assert row[3] == "created"
-    # 父回合仍是 interrupted，且所有列逐字段未变（§4.3）
     assert parent_before[3] == "interrupted"
     assert _turn_row(manager, "turn-parent") == parent_before
 

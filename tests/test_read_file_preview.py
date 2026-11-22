@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""read_file_preview 对目录 / 不存在路径的错误信息测试。"""
 import os
 import sys
 import tempfile
@@ -23,7 +22,6 @@ def test_preview_directory_returns_folder_message():
         bridge = _make_bridge_with_workdir(tmp)
         res = bridge.read_file_preview(sub)
         assert res["ok"] is False
-        # 目录要有专属、准确的提示，而不是误导性的「文件不存在」
         assert "文件夹" in res["msg"] or "目录" in res["msg"]
 
 
@@ -119,11 +117,6 @@ def test_preview_credential_config_always_denied(tmp_path, monkeypatch):
     assert res["ok"] is False
 
 
-# ---------------------------------------------------------------------------
-# 图片文件应用内预览：按扩展名走 base64 data URL 分支
-# ---------------------------------------------------------------------------
-
-# 最小 PNG 头（后端不校验图片内容，只要二进制字节即可）
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
 
@@ -141,7 +134,6 @@ def test_preview_png_returns_image_data_url(tmp_path, monkeypatch):
     assert res["ok"] is True
     assert res["kind"] == "image"
     assert res["data_url"].startswith("data:image/png;base64,")
-    # data URL 可逆解码回原始字节
     import base64
     decoded = base64.b64decode(res["data_url"].split(",", 1)[1])
     assert decoded == _PNG_BYTES
@@ -170,7 +162,6 @@ def test_preview_oversized_image_rejected(tmp_path, monkeypatch):
     import gui_bridge as gb
     f = tmp_path / "big.png"
     f.write_bytes(_PNG_BYTES)
-    # 把图片上限压到 1 字节，避免真的写 20MB 文件
     monkeypatch.setattr(gb, "IMAGE_PREVIEW_MAX_BYTES", 1)
     bridge = _make_global_bridge(tmp_path, monkeypatch)
     res = bridge.read_file_preview(str(f))
@@ -186,10 +177,6 @@ def test_preview_non_image_binary_still_rejected(tmp_path, monkeypatch):
     assert res["ok"] is False
     assert "系统中打开" in res["msg"]
 
-
-# ---------------------------------------------------------------------------
-# PDF 应用内预览：右栏「文档」页签由前端 pdf.js 渲染，字节按 base64 data URL 过桥
-# ---------------------------------------------------------------------------
 
 _PDF_BYTES = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
 
@@ -218,13 +205,6 @@ def test_preview_oversized_pdf_rejected(tmp_path, monkeypatch):
     assert "过大" in res["msg"]
 
 
-# ---------------------------------------------------------------------------
-# 预览产物豁免：Office 转出的 PDF / Markdown 预览页落在数据目录 exports/preview，
-# 不在会话工作区里。沙盒未解除时若不豁免，转换完的 PDF 会被自己的路径策略拦下
-# （用户白等 20 秒），所以只对这一层目录开口子，数据目录其它位置照旧拒绝。
-# ---------------------------------------------------------------------------
-
-
 def test_office_cached_pdf_allowed_when_sandbox_off(tmp_path, monkeypatch):
     from core import web_preview
     _inject_ycode_data_dir(monkeypatch, tmp_path)
@@ -251,7 +231,6 @@ def test_pdf_outside_preview_dir_still_denied_when_sandbox_off(tmp_path, monkeyp
     preview_dir = tmp_path / "ydata" / "exports" / "preview"
     preview_dir.mkdir(parents=True)
     monkeypatch.setattr(web_preview, "get_preview_dir", lambda: preview_dir)
-    # 数据目录根部的文件不在豁免范围内（只有预览产物那一层放行）
     outside = tmp_path / "ydata" / "loose.pdf"
     outside.write_bytes(_PDF_BYTES)
     workspace = tmp_path / "ws"
@@ -262,10 +241,6 @@ def test_pdf_outside_preview_dir_still_denied_when_sandbox_off(tmp_path, monkeyp
 
     assert res["ok"] is False
     assert "工作区" in res["msg"]
-# ---------------------------------------------------------------------------
-# docx 应用内预览：不再由 Word COM 转 PDF，直接把 OOXML 字节按 base64 交前端
-# docx-preview 渲染，所以这里回 kind=docx（不是 pdf），字节要能原样还原。
-# ---------------------------------------------------------------------------
 
 _DOCX_BYTES = b"PK\x03\x04" + b"\x00" * 24
 
@@ -296,7 +271,6 @@ def test_preview_oversized_docx_rejected(tmp_path, monkeypatch):
     assert "过大" in res["msg"]
 
 def test_preview_docx_extension_but_pdf_content_falls_back_to_pdf(tmp_path, monkeypatch):
-    # 扩展名不可信：把 PDF 改名成 .docx 时，不能让 JSZip 去解 zip 而报英文错
     f = tmp_path / "renamed.docx"
     f.write_bytes(_PDF_BYTES)
     bridge = _make_global_bridge(tmp_path, monkeypatch)
@@ -307,7 +281,6 @@ def test_preview_docx_extension_but_pdf_content_falls_back_to_pdf(tmp_path, monk
 
 
 def test_preview_broken_docx_reports_chinese_message(tmp_path, monkeypatch):
-    # 「PDF 转 Word」失败留下的空壳：内容是随机字节，既非 ZIP 也非 PDF
     f = tmp_path / "broken.docx"
     f.write_bytes(bytes(range(256)) * 4)
     sibling = tmp_path / "broken.pdf"
@@ -316,5 +289,4 @@ def test_preview_broken_docx_reports_chinese_message(tmp_path, monkeypatch):
     res = bridge.read_file_preview(str(f))
     assert res["ok"] is False
     assert "不是有效的 Word 文档" in res["msg"]
-    # 同目录有源 PDF 时应把它指出来，省得用户自己找
     assert "broken.pdf" in res["msg"]

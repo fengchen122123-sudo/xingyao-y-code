@@ -29,25 +29,21 @@ function mountSidebar(groups: any[]) {
   return mount(Sidebar, { global: { plugins: [pinia] } });
 }
 
-/** 分组渲染顺序（含 GLOBAL）：读 data-group-path 比读标题文本更稳 */
 function orderOf(wrapper: any): string[] {
   return wrapper.findAll('.group-header').map((h: any) => h.attributes('data-group-path'));
 }
 
-/** 按路径定位分组根节点，避免依赖 GLOBAL 是否占了第 0 位 */
 function groupByPath(wrapper: any, path: string) {
   const idx = orderOf(wrapper).indexOf(path);
   return wrapper.findAll('.session-group')[idx];
 }
 
-/** 拖拽源：在 group-header 上派发带 dataTransfer 的 dragstart */
 async function dragStart(wrapper: any, path: string) {
   await groupByPath(wrapper, path).find('.group-header').trigger('dragstart', {
     dataTransfer: { effectAllowed: '', setData: () => {} },
   });
 }
 
-/** 落到目标的 y 坐标：上半区（0~10）插到前，下半区（10~20）插到后 */
 async function dropOn(wrapper: any, path: string, clientY: number) {
   const el = groupByPath(wrapper, path);
   await el.trigger('dragover', { clientY });
@@ -64,8 +60,6 @@ function makeThreeProjects() {
 beforeEach(() => {
   localStorage.clear();
   delete (window as any).pywebview;
-  // jsdom 无布局引擎，getBoundingClientRect 恒为 0，会让"上半区/下半区"判定失效；
-  // 统一桩成 top=0 / height=20 的固定盒，使落点中线逻辑真正被覆盖
   (Element.prototype as any).getBoundingClientRect = () => ({
     top: 0, bottom: 20, height: 20, left: 0, right: 0, width: 0, x: 0, y: 0,
     toJSON: () => ({}),
@@ -78,7 +72,7 @@ it('拖到目标下半区时插到目标之后，顺序落盘并在重新挂载�
   expect(orderOf(w1)).toEqual(['GLOBAL', ...PROJECTS]);
 
   await dragStart(w1, 'D:/proj/a');
-  await dropOn(w1, 'D:/proj/b', HALF_AFTER); // 落在 b 的下半区 → 插到 b 之后
+  await dropOn(w1, 'D:/proj/b', HALF_AFTER);
 
   expect(orderOf(w1)).toEqual(['GLOBAL', 'D:/proj/b', 'D:/proj/a', 'D:/proj/c']);
   expect(JSON.parse(localStorage.getItem(ORDER_KEY) as string)).toEqual([
@@ -98,7 +92,7 @@ it('拖到目标上半区时插到目标之前', async () => {
   const w = mountSidebar(makeThreeProjects());
 
   await dragStart(w, 'D:/proj/c');
-  await dropOn(w, 'D:/proj/a', HALF_BEFORE); // 落在 a 的上半区 → 插到 a 之前
+  await dropOn(w, 'D:/proj/a', HALF_BEFORE);
 
   expect(orderOf(w)).toEqual(['GLOBAL', 'D:/proj/c', 'D:/proj/a', 'D:/proj/b']);
   w.unmount();
@@ -110,7 +104,7 @@ it('「对话」分组固定最顶、不可拖动，也不能作为落点', asyn
   expect(headers[0].attributes('draggable')).toBe('false');
   expect(headers[1].attributes('draggable')).toBe('true');
 
-  await dragStart(w, 'D:/proj/c'); // 拖 c 到「对话」上
+  await dragStart(w, 'D:/proj/c');
   await dropOn(w, 'GLOBAL', HALF_AFTER);
 
   expect(orderOf(w)).toEqual(['GLOBAL', ...PROJECTS]);
@@ -122,7 +116,6 @@ it('未记录的新分组追加在末尾，不影响已排好的顺序', async (
   localStorage.setItem(ORDER_KEY, JSON.stringify(['D:/proj/c']));
   const w = mountSidebar(makeThreeProjects());
 
-  // c 按记忆排到最前，a/b 未记录故保持后端字母序排在后面
   expect(orderOf(w)).toEqual(['GLOBAL', 'D:/proj/c', 'D:/proj/a', 'D:/proj/b']);
   w.unmount();
 });
@@ -138,7 +131,6 @@ it('右键菜单「上移 / 下移 / 置顶」按动作调整顺序', async () =
   expect(w.find('[data-test="group-ctx-menu"]').exists()).toBe(true);
   await w.get('[data-test="group-move-up"]').trigger('click');
   expect(orderOf(w)).toEqual(['GLOBAL', 'D:/proj/b', 'D:/proj/a', 'D:/proj/c']);
-  // 执行后菜单自动关闭
   expect(w.find('[data-test="group-ctx-menu"]').exists()).toBe(false);
 
   await openMenu('D:/proj/a');

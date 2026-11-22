@@ -1,7 +1,3 @@
-"""测试大模型上游报错中文映射与排查建议引擎。"""
-
-import pytest
-
 from core.llm_error_mapper import (
     format_user_facing_error,
     map_llm_error,
@@ -16,7 +12,6 @@ class DummyApiException(Exception):
 
 
 def test_auth_invalid_401():
-    # 1. 明确携带 401 状态码
     exc = DummyApiException("Incorrect API key provided: sk-abcdef1234567890", status_code=401)
     info = map_llm_error(exc)
     assert info.category == "auth_invalid"
@@ -30,12 +25,6 @@ def test_auth_invalid_401():
 
 
 def test_model_not_supported_under_401_is_not_blamed_on_api_key():
-    """401 + ModelError（模型下线/不被上游支持）不能诊断成"API 凭证无效"。
-
-    实测案例：OpenCode Zen 免费档对已下线模型回
-    {"type":"error","error":{"type":"ModelError","message":"Model xxx is not supported"}}，
-    状态码是 401。旧逻辑把它归类成凭证问题，用户按提示反复检查 API Key 也解决不了。
-    """
     exc = DummyApiException(
         "API 凭证无效或未授权 (HTTP 401): "
         '{"type":"error","error":{"type":"ModelError",'
@@ -53,7 +42,6 @@ def test_model_not_supported_under_401_is_not_blamed_on_api_key():
 
 
 def test_insufficient_quota_402():
-    # 2. 欠费 / 额度耗尽
     exc = DummyApiException("Error code: 429 - {'error': {'message': 'You exceeded your current quota', 'type': 'insufficient_quota'}}")
     info = map_llm_error(exc)
     assert info.category == "insufficient_quota"
@@ -64,7 +52,6 @@ def test_insufficient_quota_402():
 
 
 def test_rate_limit_429():
-    # 3. 普通 429 速率限制
     exc = DummyApiException("Error code: 429 - Rate limit reached for requests per minute (RPM)", status_code=429)
     info = map_llm_error(exc)
     assert info.category == "rate_limit"
@@ -75,7 +62,6 @@ def test_rate_limit_429():
 
 
 def test_context_overflow_400():
-    # 4. 上下文超限
     exc = DummyApiException("This model's maximum context length is 128000 tokens. However, your messages resulted in 135000 tokens.")
     info = map_llm_error(exc)
     assert info.category == "context_overflow"
@@ -86,7 +72,6 @@ def test_context_overflow_400():
 
 
 def test_permission_denied_403():
-    # 5. 地域或权限限制 403
     exc = DummyApiException("User location is not supported for the requested model", status_code=403)
     info = map_llm_error(exc)
     assert info.category == "permission_denied"
@@ -97,7 +82,6 @@ def test_permission_denied_403():
 
 
 def test_model_not_found_404():
-    # 6. 模型不存在 404
     exc = DummyApiException("The model `gpt-9-turbo` does not exist or you do not have access to it.", status_code=404)
     info = map_llm_error(exc)
     assert info.category == "model_not_found"
@@ -108,7 +92,6 @@ def test_model_not_found_404():
 
 
 def test_service_overloaded_503():
-    # 7. 服务商过载 503
     exc = DummyApiException("AnthropicError: overloaded_error: Overloaded", status_code=503)
     info = map_llm_error(exc)
     assert info.category == "service_overloaded"
@@ -116,7 +99,6 @@ def test_service_overloaded_503():
 
 
 def test_gateway_error_502_504():
-    # 8. 网关超时 504
     exc = DummyApiException("504 Gateway Time-out: The server didn't respond in time.")
     info = map_llm_error(exc)
     assert info.category == "gateway_error"
@@ -124,7 +106,6 @@ def test_gateway_error_502_504():
 
 
 def test_internal_server_error_500():
-    # 9. 服务商内部故障 500
     exc = DummyApiException("500 Internal Server Error", status_code=500)
     info = map_llm_error(exc)
     assert info.category == "internal_server_error"
@@ -132,7 +113,6 @@ def test_internal_server_error_500():
 
 
 def test_network_connection_error():
-    # 10. 网络连接错误 / 超时
     class ConnectTimeout(Exception):
         pass
 
@@ -146,7 +126,6 @@ def test_network_connection_error():
 
 
 def test_policy_refusal():
-    # 11. 安全审查拦截
     exc = DummyApiException("Your request was rejected due to safety policy violation: content_policy")
     info = map_llm_error(exc)
     assert info.category == "policy_refusal"
@@ -164,7 +143,6 @@ def test_sensitive_key_redaction():
 
 
 def test_already_chinese_message_passthrough():
-    # 13. 已有中文消息原样透传
     msg = "已被用户取消，当前会话已停止。"
     assert format_user_facing_error(msg) == msg
 
@@ -173,6 +151,5 @@ def test_already_chinese_message_passthrough():
 
 
 def test_none_or_empty_error():
-    # 14. 空异常鲁棒性
     assert format_user_facing_error(None) == "未知错误"
     assert format_user_facing_error("") == "未知错误"

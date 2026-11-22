@@ -1,5 +1,3 @@
-"""T4：飞书出站 API 客户端单测（令牌缓存、请求构造、退避、错误处理）。不触网。"""
-
 import json
 
 import pytest
@@ -8,7 +6,6 @@ from core.feishu.client import FeishuApiClient, FeishuApiError
 
 
 class _Recorder:
-    """记录请求并按脚本返回响应。"""
 
     def __init__(self, responses):
         self.responses = list(responses)
@@ -44,7 +41,7 @@ def test_token_is_cached_across_calls():
     client.send_text("oc_1", "第一条")
     client.send_text("oc_1", "第二条")
 
-    assert len(http.calls) == 3                      # 令牌只取一次
+    assert len(http.calls) == 3
     assert http.calls[0]["url"].endswith("/open-apis/auth/v3/tenant_access_token/internal")
     assert http.calls[0]["body"] == {"app_id": "cli_a", "app_secret": "sec"}
     assert http.calls[1]["headers"]["Authorization"] == "Bearer t-abc"
@@ -56,7 +53,7 @@ def test_token_refreshed_after_expiry():
     client = FeishuApiClient("cli_a", "sec", http=http, clock=lambda: now[0])
 
     client.send_text("oc_1", "第一次")
-    now[0] += 120                                    # 越过过期点
+    now[0] += 120
     client.send_text("oc_1", "第二次")
 
     assert len(http.calls) == 4

@@ -1,17 +1,3 @@
-"""Mermaid 图表本地导出（CLI 端）。
-
-CLI 终端无法渲染图形；模型输出中的 ```mermaid 代码块由本模块提取后生成
-自包含本地 HTML（引用随包分发的 vendor/mermaid/mermaid-*.min.js，strict
-安全模式），写入 ~/.ycode/exports/diagrams/，由用户通过 /diagram open 主动
-在浏览器打开。浏览器即渲染器，终端不承担图形绘制。
-
-安全约定（与 GUI 前端渲染同一威胁模型：mermaid 源码来自模型输出，按不可信
-输入处理）：
-- 源码写入 HTML 前先经 html.escape 转义（先转义后展示，正文与属性双份）；
-- mermaid 以 securityLevel: 'strict' 初始化（净化 SVG 标签、禁用交互回调）；
-- 页面带 CSP，禁止一切远程资源，脚本只允许本地 file: 与内联初始化段。
-"""
-
 from __future__ import annotations
 
 import datetime
@@ -24,14 +10,11 @@ from pathlib import Path
 
 _MERMAID_JS_NAME = "mermaid-11.17.2.min.js"
 
-# 只提取显式标注 mermaid 语言的闭合代码块；未闭合栅栏（流式中间态）与
-# 其他语言块不命中。DOTALL 允许源码跨行，非贪婪在第一个闭合栅栏处截断。
 _MERMAID_BLOCK_RE = re.compile(
     r"```mermaid[ \t]*\r?\n(.*?)\r?\n?[ \t]*```",
     re.DOTALL | re.IGNORECASE,
 )
 
-# 本进程最近一次导出（/diagram open 的首选目标）；重启后回落目录扫描。
 _LAST_EXPORT: Path | None = None
 
 
@@ -103,8 +86,6 @@ def build_diagram_html(sources: list[str]) -> str:
             'onerror="document.body.classList.add(\'no-mermaid\')"></script>'
         )
     else:
-        # 渲染器未随包（异常安装）：不输出空 src 的 script 标签——空 src 会
-        # 回读页面自身当 JS 解析。直接置 no-mermaid 态，页面只显示源码。
         mermaid_script = "<script>document.body.classList.add('no-mermaid');</script>"
     page = _HTML_TEMPLATE
     page = page.replace("__MERMAID_SCRIPT__", mermaid_script)
@@ -115,11 +96,6 @@ def build_diagram_html(sources: list[str]) -> str:
 
 
 def export_diagram_html(text: str) -> tuple[Path, int] | None:
-    """检测并导出 text 内的 mermaid 块；无命中返回 None。
-
-    返回 (文件路径, 图表数)。同一块只会被 flush 渲染一次（CLI 的段落切分
-    不会拆开代码围栏），因此每次导出对应一个新文件，不做去重。
-    """
     global _LAST_EXPORT
     sources = extract_mermaid_blocks(text)
     if not sources:
@@ -157,17 +133,12 @@ def open_diagram(path: Path) -> bool:
 
 
 def handle_diagram_command(command_text: str) -> str:
-    """处理 /diagram 斜杠命令，返回可直接打印给用户的文本。
-
-    用法: /diagram open [序号]（默认 open 最近一张）| /diagram list
-    """
     parts = command_text.strip().split()
     sub = parts[1].lower() if len(parts) > 1 else "open"
 
     if sub == "open":
         files = get_recent_diagrams()
         if not files:
-            # 提示文案里的自称跟随当前会话（秘书会话 → 秘书名）
             try:
                 from core.secretary import get_active_agent_name
 
@@ -203,8 +174,6 @@ def handle_diagram_command(command_text: str) -> str:
     return "⚠️ 用法: /diagram [open [序号] | list]"
 
 
-# 模板用 token 替换而非 f-string：内联 JS/CSS 含大量 {} 与反引号，
-# f-string 转义会把这些片段全部破坏。
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>

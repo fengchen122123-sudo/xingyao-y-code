@@ -1,5 +1,3 @@
-"""core/workspace_settings.py（项目级 KV 存储）的行为测试。"""
-
 import json
 
 import pytest
@@ -11,7 +9,6 @@ def test_set_then_get_roundtrip_and_merge(tmp_path):
     assert workspace_settings.get_workspace_setting(tmp_path, "k") is None
     assert workspace_settings.set_workspace_setting(tmp_path, "k", {"a": 1}) is True
     assert workspace_settings.get_workspace_setting(tmp_path, "k") == {"a": 1}
-    # 合并语义：写入第二个键不得覆盖第一个
     workspace_settings.set_workspace_setting(tmp_path, "k2", 7)
     assert workspace_settings.get_workspace_setting(tmp_path, "k") == {"a": 1}
     assert workspace_settings.get_workspace_setting(tmp_path, "k2") == 7

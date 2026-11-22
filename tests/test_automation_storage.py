@@ -1,5 +1,3 @@
-"""星轨自动化任务：SQLite 存储层（CRUD、CAS 认领、单飞、恢复、清理、级联删除）。"""
-
 import threading
 import time
 from datetime import datetime
@@ -44,10 +42,6 @@ def _insert_due_task(storage: AutomationStorage, *, next_run_at=1000.0, **overri
     return storage.get_task(task["id"])
 
 
-# ---------------------------------------------------------------------------
-# 基础 CRUD
-# ---------------------------------------------------------------------------
-
 def test_save_and_get_task_roundtrip(storage):
     task_id = storage.save_task(_task())
     loaded = storage.get_task(task_id)
@@ -70,28 +64,41 @@ def test_save_task_updates_existing(storage):
 
 
 def test_workdir_roundtrip(storage):
-    # 缺省任务 workdir 为空（跟随目标会话归属，兼容旧数据）
     task_id = storage.save_task(_task())
     assert storage.get_task(task_id)["workdir"] == ""
-    # GLOBAL（自由对话）与具体目录路径都要原样存取
     global_id = storage.save_task(_task(name="g", workdir="GLOBAL"))
     assert storage.get_task(global_id)["workdir"] == "GLOBAL"
     path_id = storage.save_task(_task(name="p", workdir="E:\\proj"))
     assert storage.get_task(path_id)["workdir"] == "E:\\proj"
-    # 编辑可改写 workdir
     storage.save_task({**storage.get_task(path_id), "workdir": ""})
     assert storage.get_task(path_id)["workdir"] == ""
 
 
 def test_model_id_roundtrip(storage):
-    # 缺省任务 model_id 为空（跟随会话绑定/全局默认，兼容旧数据）
     task_id = storage.save_task(_task())
     assert storage.get_task(task_id)["model_id"] == ""
     mid = storage.save_task(_task(name="m", model_id="m-task"))
     assert storage.get_task(mid)["model_id"] == "m-task"
-    # 编辑可改写 model_id
     storage.save_task({**storage.get_task(mid), "model_id": ""})
     assert storage.get_task(mid)["model_id"] == ""
+
+
+def test_session_mode_defaults_to_per_run(storage):
+    task_id = storage.save_task(_task())
+    assert storage.get_task(task_id)["session_mode"] == "per_run"
+    fixed_id = storage.save_task(_task(name="固定会话", session_mode="fixed"))
+    assert storage.get_task(fixed_id)["session_mode"] == "fixed"
+    blank_id = storage.save_task(_task(name="空白", session_mode="   "))
+    assert storage.get_task(blank_id)["session_mode"] == "per_run"
+    storage.save_task({**storage.get_task(fixed_id), "session_mode": "per_run"})
+    assert storage.get_task(fixed_id)["session_mode"] == "per_run"
+
+
+def test_missed_run_policy_defaults_to_run_once(storage):
+    task = _task()
+    task.pop("missed_run_policy")
+    task_id = storage.save_task(task)
+    assert storage.get_task(task_id)["missed_run_policy"] == "run_once"
 
 
 def test_validate_task_rejects_non_string_model_id(storage):
@@ -103,7 +110,6 @@ def test_validate_task_rejects_non_string_model_id(storage):
 
 
 def test_validate_task_accepts_plan_permission_mode(storage):
-    """计划模式与人工回合同源合法：只读查询与规划，无人值守不挂死。"""
     from core.automation.models import validate_task
 
     assert validate_task(_task(permission_mode="plan")) == []
@@ -111,7 +117,6 @@ def test_validate_task_accepts_plan_permission_mode(storage):
 
 
 def test_migration_adds_workdir_column_to_legacy_table(manager):
-    """旧版本任务表（无 workdir 列）打开时自动补列，旧任务读到空串且可编辑。"""
     with manager._lock:
         cursor = manager.conn.cursor()
         cursor.execute("DROP TABLE IF EXISTS automation_tasks")
@@ -154,6 +159,55 @@ def test_migration_adds_workdir_column_to_legacy_table(manager):
     assert reloaded["model_id"] == "m1"
 
 
+def test_migration_adds_session_mode_column_to_legacy_table(manager):
+    with manager._lock:
+        cursor = manager.conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS automation_tasks")
+        cursor.execute("""
+            CREATE TABLE automation_tasks (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                trigger_type TEXT NOT NULL,
+                trigger_config TEXT NOT NULL DEFAULT '{}',
+                target_session TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                permission_mode TEXT NOT NULL DEFAULT 'confirm',
+                missed_run_policy TEXT NOT NULL DEFAULT 'skip',
+                notify_on_success INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run_at TEXT,
+                next_run_at REAL,
+                workdir TEXT NOT NULL DEFAULT '',
+                model_id TEXT NOT NULL DEFAULT '',
+                max_runs INTEGER,
+                scheduled_run_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active'
+            )
+        """)
+        cursor.execute(
+            """
+            INSERT INTO automation_tasks (
+                id, name, trigger_type, trigger_config, target_session, prompt,
+                created_at, updated_at
+            ) VALUES (
+                't1', '旧任务', 'daily', '{"time": "09:30"}', '自动化任务', 'p',
+                '2026-01-01 00:00:00', '2026-01-01 00:00:00'
+            )
+            """
+        )
+        manager.conn.commit()
+    storage = AutomationStorage(manager)
+    loaded = storage.get_task("t1")
+    assert loaded is not None and loaded["session_mode"] == "per_run"
+    assert loaded["missed_run_policy"] == "skip"
+    storage.save_task({**loaded, "session_mode": "fixed"})
+    assert storage.get_task("t1")["session_mode"] == "fixed"
+    AutomationStorage(manager)
+    assert storage.get_task("t1")["session_mode"] == "fixed"
+
+
 def test_list_tasks(storage):
     storage.save_task(_task(name="A"))
     storage.save_task(_task(name="B"))
@@ -174,14 +228,13 @@ def test_save_task_startup_has_null_next_run(storage):
 
 
 def test_save_task_disabled_keeps_schedule_computed(storage):
-    # 禁用任务同样维护 next_run_at（引擎按 enabled 过滤），重启用时语义一致
     task_id = storage.save_task(_task(enabled=0))
     assert storage.get_task(task_id)["next_run_at"] is not None
 
 
 def test_set_enabled_recomputes_next_run_on_enable(storage):
     task_id = storage.save_task(_task(trigger_type="daily", trigger_config={"time": "09:30"}))
-    storage.set_next_run_raw(task_id, 1000.0)  # 模拟停用期间的过期时刻
+    storage.set_next_run_raw(task_id, 1000.0)
     storage.set_enabled(task_id, False)
     assert storage.get_task(task_id)["enabled"] == 0
     before = time.time()
@@ -207,10 +260,6 @@ def test_count_tasks(storage):
     assert storage.count_tasks() == 3
 
 
-# ---------------------------------------------------------------------------
-# 运行记录
-# ---------------------------------------------------------------------------
-
 def test_mark_running_and_finish_run(storage):
     task_id = storage.save_task(_task())
     run_id = new_automation_id("run")
@@ -227,9 +276,18 @@ def test_mark_running_and_finish_run(storage):
     assert run["status"] == "completed"
     assert run["finished_at"]
 
-    # 终态 exactly-once：二次收尾是 no-op
     assert storage.finish_run(run_id, "error", "不应生效") is False
     assert storage.list_runs(task_id)[0]["status"] == "completed"
+
+
+def test_set_run_session_rewrites_session_name(storage):
+    task_id = storage.save_task(_task())
+    run_id = new_automation_id("run")
+    storage._insert_run_raw(run_id, task_id, "自动化任务", "queued")
+    assert storage.set_run_session(run_id, "2026-11-11 每日站会摘要") is True
+    assert storage.list_runs(task_id)[0]["session_name"] == "2026-11-11 每日站会摘要"
+    assert storage.list_runs(task_id)[0]["status"] == "queued"
+    assert storage.set_run_session("run-不存在", "x") is False
 
 
 def test_finish_run_rejects_unknown_status(storage):
@@ -256,7 +314,7 @@ def test_run_retention_per_task(storage):
     for i in range(55):
         run_id = new_automation_id("run")
         storage._insert_run_raw(run_id, task_id, "会话", "completed")
-        time.sleep(0.001)  # 保证 queued_at 可排序
+        time.sleep(0.001)
     runs = storage.list_runs(task_id)
     assert len(runs) == 50
 
@@ -303,7 +361,6 @@ def test_claim_due_task_once(storage):
     task, run_id, kind = claimed[0]
     assert kind == "scheduled"
     assert storage.get_task(task["id"])["next_run_at"] > now
-    # 下一轮不再触发
     assert storage.claim_due_tasks(now, _compute(None), include_startup=False, catchup_enabled=False) == []
 
 
@@ -330,7 +387,7 @@ def test_claim_single_flight_writes_skipped(storage):
     skipped = [r for r in runs if r["status"] == "skipped"]
     assert len(skipped) == 1
     assert "上一次运行尚未结束" in skipped[0]["error"]
-    assert storage.get_task(task["id"])["next_run_at"] > before  # 周期照常推进
+    assert storage.get_task(task["id"])["next_run_at"] > before
 
 
 def test_claim_startup_only_on_first_iteration(storage):
@@ -343,7 +400,6 @@ def test_claim_startup_only_on_first_iteration(storage):
 
 
 def test_claim_startup_no_repeat_within_same_process(storage):
-    """给了进程启动时刻后，同一进程的后续轮次不重复触发 startup。"""
     task_id = storage.save_task(_task(trigger_type="startup", trigger_config={}))
     boot = time.time()
     first = storage.claim_due_tasks(
@@ -359,11 +415,6 @@ def test_claim_startup_no_repeat_within_same_process(storage):
 
 
 def test_claim_startup_retriggers_on_next_process(storage):
-    """回归：应用再次启动时 startup 任务必须重新触发。
-
-    修复前认领标记写入 next_run_at 后就再不为 NULL，而认领条件要求它是 NULL，
-    导致 startup 任务一生只触发一次。
-    """
     task_id = storage.save_task(_task(trigger_type="startup", trigger_config={}))
     boot1 = time.time()
     first = storage.claim_due_tasks(
@@ -371,7 +422,6 @@ def test_claim_startup_retriggers_on_next_process(storage):
     )
     assert len(first) == 1 and first[0][2] == "startup"
     storage.finish_run(first[0][1], "completed")
-    # 下一次应用启动：进程启动时刻晚于上次写入的认领标记
     boot2 = boot1 + 86400
     second = storage.claim_due_tasks(
         boot2, _compute(None), include_startup=True, catchup_enabled=False, startup_since=boot2
@@ -385,7 +435,7 @@ def test_catchup_skip_policy_records_and_reschedules(storage):
     task = _insert_due_task(storage, next_run_at=time.time() - 3600, missed_run_policy="skip")
     now = time.time()
     claimed = storage.claim_due_tasks(now, _compute(None), include_startup=True, catchup_enabled=True)
-    assert claimed == []  # skip 不派发
+    assert claimed == []
     runs = storage.list_runs(task["id"])
     assert any(r["status"] == "skipped" and "过期" in r["error"] for r in runs)
     assert storage.get_task(task["id"])["next_run_at"] > now
@@ -397,7 +447,6 @@ def test_catchup_run_once_dispatches_once(storage):
     claimed = storage.claim_due_tasks(now, _compute(None), include_startup=True, catchup_enabled=True)
     assert len(claimed) == 1 and claimed[0][2] == "catchup"
     assert storage.get_task(task["id"])["next_run_at"] > now
-    # 补跑后不会连环补
     again = storage.claim_due_tasks(now + 1, _compute(None), include_startup=True, catchup_enabled=True)
     assert again == []
 
@@ -429,7 +478,7 @@ def test_claim_guard_against_non_future_next_run(storage):
     _insert_due_task(storage, next_run_at=now - 10, trigger_type="daily", trigger_config={"time": "09:30"})
 
     def bad_compute(trigger_type, config, now_ts):
-        return now_ts  # 故意返回不严格递增的值
+        return now_ts
 
     claimed = storage.claim_due_tasks(now, bad_compute, include_startup=False, catchup_enabled=False)
     assert len(claimed) == 1
@@ -442,7 +491,6 @@ def test_earliest_next_run(storage):
     storage.save_task(_task(name="b", trigger_type="daily", trigger_config={"time": "09:00"}))
     earliest = storage.earliest_next_run()
     assert earliest is not None and earliest > time.time()
-    # 禁用任务不计入
     storage.save_task(_task(name="c", enabled=0, trigger_type="daily", trigger_config={"time": "00:00"}))
     assert storage.earliest_next_run() == pytest.approx(earliest)
 
@@ -452,10 +500,6 @@ def test_iso_now_and_new_id():
     assert len(value) >= 19
     assert new_automation_id("run").startswith("run-")
 
-
-# ---------------------------------------------------------------------------
-# once（一次性触发器）：归一化、陈旧拒绝、认领后不再有下一次
-# ---------------------------------------------------------------------------
 
 def _once_task(**overrides) -> dict:
     base = {
@@ -472,7 +516,6 @@ def test_save_once_normalizes_delay_minutes_to_run_at(storage):
     loaded = storage.get_task(task_id)
 
     config = loaded["trigger_config"]
-    # delay_minutes 不落库，只落服务端时钟锚定的 run_at
     assert set(config) == {"run_at"}
     fire_ts = scheduling.parse_run_at(config["run_at"])
     assert before + 6 * 60 < fire_ts <= before + 8 * 60 + 1
@@ -483,7 +526,6 @@ def test_resave_once_keeps_original_run_at(storage):
     task_id = storage.save_task(_once_task())
     first_next = storage.get_task(task_id)["next_run_at"]
 
-    # 再次保存（如改名字）不得把触发时刻往后推
     storage.save_task({**storage.get_task(task_id), "name": "改名"})
     assert storage.get_task(task_id)["next_run_at"] == first_next
 
@@ -508,7 +550,6 @@ def test_save_once_accepts_future_run_at(storage):
 
 def test_claim_once_clears_next_run_and_does_not_refire(storage):
     now = time.time()
-    # 保存期用未来 run_at 过陈旧拒绝，再把 next_run_at 拽到过去模拟到期
     future_run_at = datetime.fromtimestamp(now + 3600).strftime("%Y-%m-%d %H:%M")
     task = _insert_due_task(
         storage,
@@ -519,7 +560,6 @@ def test_claim_once_clears_next_run_and_does_not_refire(storage):
 
     claimed = storage.claim_due_tasks(now, _compute(None), include_startup=False, catchup_enabled=False)
     assert len(claimed) == 1 and claimed[0][2] == "scheduled"
-    # once 认领后没有下一次：next_run_at 必须置 NULL，而不是被钳制到 now+1
     assert storage.get_task(task["id"])["next_run_at"] is None
     assert storage.claim_due_tasks(now + 3600, _compute(None), include_startup=False, catchup_enabled=False) == []
 
@@ -539,10 +579,6 @@ def test_catchup_once_clears_next_run(storage):
     assert len(claimed) == 1 and claimed[0][2] == "catchup"
     assert storage.get_task(task["id"])["next_run_at"] is None
 
-
-# ---------------------------------------------------------------------------
-# 有限次执行：max_runs / scheduled_run_count / status（设计规格 3.2 / 3.6）
-# ---------------------------------------------------------------------------
 
 _LEGACY_DDL = """
     CREATE TABLE automation_tasks (
@@ -567,7 +603,6 @@ _LEGACY_DDL = """
 
 
 def test_migration_adds_run_limit_columns_to_legacy_table(manager):
-    """旧库（无三列）初始化后补列：存量行 max_runs NULL / 计数 0 / status active。"""
     with manager._lock:
         cursor = manager.conn.cursor()
         cursor.execute("DROP TABLE IF EXISTS automation_tasks")
@@ -599,7 +634,6 @@ def test_migration_adds_run_limit_columns_to_legacy_table(manager):
     assert loaded["max_runs"] is None
     assert loaded["scheduled_run_count"] == 0
     assert loaded["status"] == "active"
-    # 存量任务照常可编辑，编辑后新列仍不被改写（无限循环语义不变）
     storage.save_task({**loaded, "name": "改名"})
     reloaded = storage.get_task("legacy-1")
     assert reloaded["name"] == "改名"
@@ -651,7 +685,6 @@ def test_edit_does_not_reset_run_count_or_status(storage):
     storage.claim_due_tasks(
         time.time(), _compute(None), include_startup=False, catchup_enabled=False
     )
-    # 编辑（改名 + 改 max_runs）不得重置计数，也不得改写 status
     storage.save_task({**storage.get_task(task["id"]), "name": "改名", "max_runs": 10})
     reloaded = storage.get_task(task["id"])
     assert reloaded["name"] == "改名"
@@ -661,7 +694,6 @@ def test_edit_does_not_reset_run_count_or_status(storage):
 
 
 def _finish_queued_runs(storage, task_id) -> None:
-    """收尾该任务全部 queued 运行行，解除单飞（存储层测试不派发真实回合）。"""
     for run in storage.list_runs(task_id):
         if run["status"] == "queued":
             storage.finish_run(run["id"], "completed")
@@ -682,7 +714,6 @@ def test_max_runs_exhausted_marks_completed(storage):
     assert reloaded["scheduled_run_count"] == 2
     assert reloaded["status"] == "completed"
     assert reloaded["next_run_at"] is None
-    # 终态之后即便把 next_run_at 拽回过去也不会再被认领
     storage.set_next_run_raw(task["id"], time.time() - 10)
     assert storage.claim_due_tasks(
         time.time(), compute, include_startup=False, catchup_enabled=False
@@ -727,7 +758,7 @@ def test_earliest_next_run_skips_completed_task(storage):
     storage.claim_due_tasks(
         time.time(), _compute(None), include_startup=False, catchup_enabled=False
     )
-    storage.set_next_run_raw(task["id"], time.time() - 10)  # 强行造出过期时刻
+    storage.set_next_run_raw(task["id"], time.time() - 10)
     assert storage.earliest_next_run() is None
 
 
@@ -751,7 +782,6 @@ def test_claim_once_marks_completed(storage):
 
 
 def test_catchup_once_skip_marks_completed(storage):
-    """once + skip：错过即终态（规格 3.4）——skipped 留痕后置 completed。"""
     now = time.time()
     future_run_at = datetime.fromtimestamp(now + 3600).strftime("%Y-%m-%d %H:%M")
     task = _insert_due_task(
@@ -770,4 +800,3 @@ def test_catchup_once_skip_marks_completed(storage):
     reloaded = storage.get_task(task["id"])
     assert reloaded["status"] == "completed"
     assert reloaded["next_run_at"] is None
-

@@ -21,7 +21,6 @@ def _wait_for_status(expected):
 
 
 def test_failed_encoding_load_retries_after_cooldown(monkeypatch):
-    """临时失败超过冷却期后必须重试；永久 failed 会让进程终身退回字符估算。"""
     _reset_encoding_state()
     attempts = []
     encoding = object()
@@ -54,7 +53,6 @@ def test_failed_encoding_load_retries_after_cooldown(monkeypatch):
 
 
 def test_compression_budget_uses_quarter_of_secondary_window():
-    """副模型分段必须留出足够处理余量（25%），且受单段 24000 token 上限约束避免打爆 TPM。"""
     assert mc._compression_chunk_budget(256000) == 24000
     assert mc._compression_chunk_budget(64000) == 16000
     assert mc._compression_chunk_budget(4096) == 1024
@@ -68,12 +66,10 @@ def test_compression_budget_uses_quarter_of_secondary_window():
 def test_compression_timeout_scales_with_prompt_tokens(
     prompt_tokens, expected_timeout
 ):
-    """约 64K token 的摘要请求不能沿用会稳定失败的固定 60 秒超时。"""
     assert mc._compression_request_timeout(prompt_tokens) == expected_timeout
 
 
 def test_truncated_message_includes_suffix_within_token_budget(monkeypatch):
-    """二分前缀必须为截断标记预留 token，拼接后的正文仍不得超过预算。"""
     monkeypatch.setattr(mc, "_estimate_tokens", lambda text: len(text))
     content = "长" * 5000
 

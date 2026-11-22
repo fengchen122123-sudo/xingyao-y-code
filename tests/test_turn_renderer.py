@@ -241,18 +241,13 @@ def test_sanitize_protocol_text_removes_empty_content_protocol_marker():
 
 
 def test_sanitize_stream_text_holds_back_split_marker_prefix():
-    """流式场景：疑似占位符前缀的尾部暂扣，拼齐后完整删除，普通文本零暂扣。"""
     marker = "[System: Empty message content sanitised to satisfy protocol]"
-    # 完整标记一次到达：全部删除，无暂扣
     assert sanitize_stream_text(f"前文 {marker} 后文") == ("前文  后文", "")
-    # 标记前缀跨片：只发安全头部，暂扣疑似前缀
     cut = 30
     emit, rest = sanitize_stream_text("正文" + marker[:cut])
     assert emit == "正文"
     assert rest == marker[:cut]
-    # 下一片拼齐后完整删除
     emit2, rest2 = sanitize_stream_text(rest + marker[cut:] + "后文")
     assert emit2 == "后文"
     assert rest2 == ""
-    # 普通文本（含 System 字样）原样发出，不暂扣
     assert sanitize_stream_text("普通 System 说明") == ("普通 System 说明", "")

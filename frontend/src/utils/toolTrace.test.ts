@@ -199,7 +199,6 @@ describe('buildToolTraceRows', () => {
       displayedCall('agent-2', 'run_subagent', 'other', true),
     ]);
 
-    // run_subagent 单独一类（对话区显示为「星舰」）：不并入普通工具、也不聚合
     expect(rows.map((row) => row.kind)).toEqual(['mutation', 'mutation', 'subagent', 'subagent']);
     expect(rows.every((row) => row.count === 1)).toBe(true);
     expect(rows[2].id).toBe('subagent:agent-1');
@@ -413,7 +412,6 @@ describe('buildSubagentFlatView', () => {
   });
 });
 
-// 电脑操控调用单独成类：行内以「动词 + 目标」渲染，不并入通用 tool 行
 it('maps computer actions to their own row kind', () => {
   const rows = buildToolTraceRows([
     {

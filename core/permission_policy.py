@@ -25,6 +25,7 @@ class PermissionFacts:
     task_sandbox_bypass: bool = False
     task_grant_hit: bool = False
     project_rule_hit: bool = False
+    ai_output_write: bool = False
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ def decide_permission(facts: PermissionFacts) -> PermissionDecision:
     if (
         facts.mode == "plan"
         and not facts.plan_internal
-        and facts.risk is not PermissionRisk.QUERY
+        and (facts.risk is not PermissionRisk.QUERY or facts.ai_output_write)
     ):
         return PermissionDecision(PermissionAction.DENY, "plan_mutation_denied")
 
@@ -66,6 +67,9 @@ def decide_permission(facts: PermissionFacts) -> PermissionDecision:
     if facts.risk is PermissionRisk.QUERY:
         return PermissionDecision(PermissionAction.ALLOW, "query_allow")
 
+    if facts.ai_output_write:
+        return PermissionDecision(PermissionAction.ALLOW, "ai_output_dir_allow")
+
     if facts.mode == "confirm":
         return PermissionDecision(
             PermissionAction.ASK,
@@ -79,6 +83,12 @@ def decide_permission(facts: PermissionFacts) -> PermissionDecision:
                 "sensitive_requires_confirmation",
             )
         return PermissionDecision(PermissionAction.ALLOW, "normal_mutation_allow")
+
+    if facts.mode == "auto_decision":
+        return PermissionDecision(
+            PermissionAction.ASK,
+            "auto_decision_requires_jev",
+        )
 
     if facts.mode == "full":
         return PermissionDecision(PermissionAction.ALLOW, "full_mode_allow")

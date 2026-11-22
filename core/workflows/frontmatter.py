@@ -1,17 +1,3 @@
-"""ZCode 工作流 frontmatter 解析（纯按行文本协议，ZCode 导入设计 §3.2）。
-
-协议（与 zai-org/ZCode ``saved-workflows/frontmatter.ts`` 对齐）：
-
-- 文件第一段非空白内容必须是 ``/* zcode-workflow`` 行；
-- 体内是 YAML，键只有 ``description``（必填）/ ``whenToUse`` / ``args``；
-- 一行只有 ``*/`` 终止；**脚本逐字节跟在终止行之后**；
-- 坏文件是正常情况（用户手改的一等公民），调用方应把它放进 invalid 列表
-  指名道姓，而不是炸掉整个清单。
-
-解析只认行文本，不依赖 TypeScript——这正是该格式可被 Python 直译的原因。
-``body`` 提取在原文上按字节切分（而不是重组行），保证脚本文本逐字节保真。
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -21,7 +7,6 @@ import yaml
 START_MARKER = "/* zcode-workflow"
 END_MARKER = "*/"
 
-#: args 声明允许的类型（与 ZCode SavedWorkflowArgDeclarationSchema 一致）。
 ARG_TYPES = ("string", "number", "boolean", "json")
 
 _METADATA_KEYS = frozenset({"description", "whenToUse", "args"})
@@ -45,7 +30,6 @@ class ParsedWorkflow:
     when_to_use: str = ""
     args: dict = field(default_factory=dict)
     body: str = ""
-    #: 正文首行之前有多少行：文件行号(1-based) = 正文行号(1-based) + body_line_offset
     body_line_offset: int = 0
 
 
@@ -82,8 +66,6 @@ def _normalize_args(raw_args) -> dict:
                 raise _invalid_metadata(f"参数 {name} 的 required 必须是布尔值")
             normalized["required"] = decl["required"]
         if "default" in decl:
-            # default 不在此处按类型判别：与应用后的传参走同一条类型检查
-            # （args.validate_workflow_args），错在生效那一刻报。
             normalized["default"] = decl["default"]
         args[name] = normalized
     return args
@@ -94,7 +76,7 @@ def parse_frontmatter(text: str) -> ParsedWorkflow:
     lines = text.splitlines()
     idx = 0
     while idx < len(lines) and not lines[idx].strip():
-        idx += 1  # 容忍前导空行
+        idx += 1
     if idx >= len(lines) or lines[idx].strip() != START_MARKER:
         raise WorkflowFrontmatterError(
             "missing_frontmatter",
@@ -147,11 +129,6 @@ def parse_frontmatter(text: str) -> ParsedWorkflow:
 
 
 def _extract_body(text: str, lines: list[str], end_idx: int) -> str:
-    """在原文上按字节截取终止行之后的脚本，保真行尾风格与尾换行。
-
-    splitlines 不保留行尾符，重组会丢 ``\\r\\n`` / 末行终止符；因此逐行在
-    原文上推进读指针（每行吃掉自己的行尾），兼容 ``\\n`` 与 ``\\r\\n`` 混排。
-    """
     position = 0
     for line in lines[: end_idx + 1]:
         found = text.find(line, position)
@@ -166,12 +143,6 @@ def _extract_body(text: str, lines: list[str], end_idx: int) -> str:
 
 
 def serialize_workflow(description: str, when_to_use: str = "", args=None, body: str = "") -> str:
-    """把元数据与脚本序列化为 .dwf.ts 全文。
-
-    键序固定 ``description → whenToUse → args``（与解析器约定一致，保存两次
-    逐字节相同）；脚本逐字节跟在 ``*/`` 行之后，缺尾换行时补一个（POSIX 友好，
-    且补过的正文在下次读回时原样保留——序列化幂等）。
-    """
     meta: dict = {"description": str(description)}
     if str(when_to_use or "").strip():
         meta["whenToUse"] = str(when_to_use)

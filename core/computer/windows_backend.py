@@ -1,18 +1,3 @@
-"""Windows 桌面 backend：截图、坐标映射与 SendInput 调度（设计 13、21、22）。
-
-- 截图由构造注入的 ``image_grab`` 提供；生产默认 ``default_image_grab()``
-  在方法内惰性 ``from PIL import ImageGrab`` 并 ``grab(all_screens=True)``，
-  模块顶层不导入 PIL.ImageGrab 做任何副作用操作。
-- 虚拟桌面原点/宽高来自 Win32 adapter 的 GetSystemMetrics；Pillow 图像尺寸
-  必须与 Win32 宽高一致，否则 preflight/observe 失败。
-- 最长边大于 1920 时按同一比例等比缩小，PNG 使用确定参数编码。
-- 坐标反算只依赖最新 observation；SendInput 前由 adapter 再次检查虚拟桌面
-  半开区间边界（越界 computer_coordinate_out_of_bounds）。
-- 每次桌面动作前重新检查 interactive desktop；截图失败抛
-  computer_backend_start_failed，绝不复用 _last_observation。
-- pytest 通过 FakeImage/FakeWin32Adapter 注入，绝不真实截屏或注入输入。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -36,7 +21,10 @@ from core.computer.models import (
     ComputerAction,
     ComputerControlError,
     ComputerObservation,
+    ObservationFrame,
 )
+from core.computer.frames import coordinate_disabled_error
+from core.computer.platforms.windows_elements import _call_with_supported_kwargs
 
 try:
     from PIL import Image
@@ -51,17 +39,13 @@ _LOGGER = logging.getLogger(__name__)
 _MAX_MODEL_EDGE = 1920
 _MAX_TITLE_CHARS = 200
 _KEEP_SCREENSHOTS = 3
-# 剪贴板写入到 Ctrl+V 粘贴之间的小间隔：给目标窗口焦点线程让路（2026-09-06）。
 _CLIPBOARD_PASTE_DELAY_S = 0.05
-# Task C（P3 输入前置激活）：SetForegroundWindow 成功后的激活沉降等待。
 _ACTIVATION_SETTLE_S = 0.15
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
-# 阶段二（2026-09-06）：UIA 元素观察与元素引用动作（desktop only）。
 _ELEMENT_KINDS = frozenset({"list_elements", "click_element", "set_value_element"})
 # 自动补表的元素上限（与 WindowsElementLocator.MAX_ELEMENTS 对齐）：超大树
 # 只截前 N 个，避免把一次观察拖成整树遍历后的超长上下文。
 _MAX_OBSERVE_ELEMENTS = 200
-# R10：语义定位与局部观察动作（不做 surface 输入复核——它们自带 ref+代数校验）。
 _SEMANTIC_DESKTOP_KINDS = frozenset(
     {"list_surfaces", "activate_surface", "invoke_surface", "observe_region"}
 )
@@ -79,14 +63,6 @@ def default_image_grab():
 def screenshot_to_physical(
     x: int, y: int, observation: ComputerObservation
 ) -> tuple[int, int]:
-    """按最新 observation 记录的比例把截图坐标反算为物理坐标（设计 13.1）。
-
-    physical_x = origin_x + round(x * original_width / model_width)
-    physical_y = origin_y + round(y * original_height / model_height)
-
-    bool 不透传（computer_invalid_action）；模型坐标与换算后的物理坐标都
-    必须在半开区间内（越界 computer_coordinate_out_of_bounds）。
-    """
     if type(x) is not int or type(y) is not int:
         raise ComputerControlError(
             "computer_invalid_action",
@@ -170,27 +146,18 @@ class WindowsComputerBackend:
         # 绝不持大锁睡满整个等待时长让 close 无法收尾。
         self._stop_event = threading.Event()
         self._last_observation: ComputerObservation | None = None
-        # R10：语义定位的待发布候选/待观察区域与区域基线（ref, generation, bounds）。
         self._pending_surface_candidates: tuple = ()
-        # 阶段二：list_elements 待发布的控件元素列表（与候选同一取用-清空模式）。
         self._pending_elements: tuple = ()
-        # Task B（SoM）：最近一次有效元素表与其观察代数——list_elements 后
-        # 紧邻 observe 记录；后续 observe 在代数未变时复用（观察继续标注），
-        # 代数变化即清空并失效 locator 的 ref 全集。
         self._last_elements: tuple = ()
         self._elements_surface_generation: int = -1
         self._pending_region: tuple | None = None
         self._region_baseline: tuple | None = None
-        # R5：桌面 surface 签名 = (前台窗口身份, 虚拟桌面几何)；变化时代数递增，
-        # 输入前复核不一致即拒绝（旧坐标失效）。
         self._surface_signature: tuple | None = None
         self._surface_generation = 0
-        # Task C（P3）：本动作是否发生了前台切换；observe 构造观察时消费
-        # （写入 input_activated 并清零），输入动作分发前重置。
+        self._frame_seq = 0
+        self._frames: dict[str, ObservationFrame] = {}
+        self._active_frame: ObservationFrame | None = None
         self._last_activation_changed = False
-        # 键盘焦点护栏：最近一次 pointer 动作（click/double_click/drag）的目标
-        # 窗口身份；键盘动作发送前比对当前前台，不一致即 computer_foreground_lost。
-        # 新观察会重建焦点基线（清空该参照），届时回落到观察记录的前台窗口。
         self._last_pointer_target_hwnd: int | None = None
 
     @classmethod
@@ -207,32 +174,60 @@ class WindowsComputerBackend:
             element_locator=WindowsElementLocator(),
         )
 
-    # ---------------- ComputerBackend 协议 ----------------
-
     def start(self) -> None:
         with self._lock:
             self._start_locked()
 
+    def _stale_capture_observation_locked(self, run_id: str) -> ComputerObservation:
+        if self._last_elements and self._element_locator is not None:
+            try:
+                self._element_locator.invalidate()
+            except Exception:
+                _LOGGER.exception("失效旧元素引用失败")
+        self._surface_generation += 1
+        self._surface_signature = None
+        self._last_observation = None
+        self._last_elements = ()
+        self._elements_surface_generation = -1
+        self._region_baseline = None
+        self._last_pointer_target_hwnd = None
+        return ComputerObservation(
+            run_id=run_id,
+            target="desktop",
+            action="observe",
+            ok=False,
+            error_code="computer_surface_changed",
+            error_message="截屏或控件采集期间前景窗口或桌面几何变化，当前观察不可用于坐标输入，请重新 observe",
+            width=0,
+            height=0,
+            original_width=0,
+            original_height=0,
+            surface_id="",
+            surface_generation=self._surface_generation,
+            elements=(),
+        )
+
     def observe(self, run_id: str) -> ComputerObservation:
         with self._lock:
             self._ensure_started_locked()
-            # 每次桌面动作（含观察）前重新检查 interactive desktop。
             self._adapter.ensure_interactive()
+            before_hwnd = int(self._adapter.foreground_window_id() or 0)
             (origin_x, origin_y, original_width, original_height), image = (
                 self._grab_checked_locked()
             )
+            capture_rect = (origin_x, origin_y, original_width, original_height)
+            after_grab_hwnd = int(self._adapter.foreground_window_id() or 0)
+            after_grab_rect = self._adapter.virtual_screen_rect()
+            if (after_grab_hwnd, after_grab_rect) != (before_hwnd, capture_rect):
+                return self._stale_capture_observation_locked(run_id)
             pending_candidates = self._pending_surface_candidates
             self._pending_surface_candidates = ()
             pending_elements = self._pending_elements
             self._pending_elements = ()
             pending_region = self._pending_region
             self._pending_region = None
-            # 本次观察最终附加的元素集：pending 优先，其次代数未变的上代元素表。
             effective_elements = pending_elements
-            # R5/Task B：代数先于观察构造更新——元素表有效性按最新代数判定。
-            signature = self._surface_signature_current_locked(
-                origin_x, origin_y, original_width, original_height
-            )
+            signature = (before_hwnd, origin_x, origin_y, original_width, original_height)
             if signature != self._surface_signature:
                 self._surface_generation += 1
                 self._surface_signature = signature
@@ -240,8 +235,6 @@ class WindowsComputerBackend:
             # 避免「先点 B、再观察 C」时拿旧点击目标误判焦点丢失。
             self._last_pointer_target_hwnd = None
             if pending_region is not None:
-                # R10 局部观察：从原始分辨率整屏裁剪候选区域，区域原点/尺寸
-                # 进入观察的 origin/original_*，坐标反算沿用既有公式结构。
                 observation = self._build_region_observation_locked(
                     run_id, image, (origin_x, origin_y), pending_region
                 )
@@ -263,12 +256,10 @@ class WindowsComputerBackend:
                     self._last_elements
                     and self._elements_surface_generation == self._surface_generation
                 ):
-                    # Task B：上代元素表在代数未变时仍有效——观察继续标注。
                     elements = self._last_elements
                 else:
                     elements = ()
                     if self._last_elements:
-                        # 代数变化：旧元素表作废，locator 的 ref 全集同时失效。
                         self._last_elements = ()
                         self._elements_surface_generation = -1
                         if self._element_locator is not None:
@@ -276,11 +267,11 @@ class WindowsComputerBackend:
                                 self._element_locator.invalidate()
                             except Exception:
                                 _LOGGER.exception("失效旧元素引用失败")
-                    # 自动补表：没有新 list_elements 时直接抓一次前台窗口元素，
-                    # 模型第一次 observe 就能拿到 ref 用 click_element 精确点击
-                    # （32×33 像素的小按钮靠截图目测必然点偏）。best-effort：
-                    # 失败只留痕，观察照常返回普通截图。
-                    elements = self._collect_elements_locked()
+                    elements = self._collect_elements_locked(before_hwnd)
+                    after_collect_hwnd = int(self._adapter.foreground_window_id() or 0)
+                    after_collect_rect = self._adapter.virtual_screen_rect()
+                    if (after_collect_hwnd, after_collect_rect) != (before_hwnd, capture_rect):
+                        return self._stale_capture_observation_locked(run_id)
                     if elements:
                         self._last_elements = elements
                         self._elements_surface_generation = self._surface_generation
@@ -321,23 +312,71 @@ class WindowsComputerBackend:
                 elements=effective_elements,
             )
             if pending_region is not None:
-                # 区域观察建立区域基线（候选 ref/代数/边界），供输入前失效复核。
                 self._region_baseline = pending_region
-            # Task C：消费本动作的前置激活结果（仅本地字段，绝不进入投影）。
+            self._frame_seq += 1
+            frame_id = f"desktop-{self._surface_generation}-{self._frame_seq}"
             observation = replace(
-                observation, input_activated=self._last_activation_changed
+                observation,
+                frame_id=frame_id,
+                viewport_generation=self._surface_generation,
+                input_activated=self._last_activation_changed,
             )
+            frame = ObservationFrame(
+                frame_id=frame_id,
+                run_id=run_id,
+                target="desktop",
+                surface_id=observation.surface_id,
+                surface_generation=observation.surface_generation,
+                viewport_generation=observation.viewport_generation,
+                origin_x=observation.origin_x,
+                origin_y=observation.origin_y,
+                crop_width=observation.original_width or observation.width,
+                crop_height=observation.original_height or observation.height,
+                image_width=observation.width,
+                image_height=observation.height,
+                model_to_css_x=float(observation.scale_x or 1.0),
+                model_to_css_y=float(observation.scale_y or 1.0),
+                coordinate_input_enabled=True,
+                disabled_reason="",
+            )
+            self._frames[frame_id] = frame
+            while len(self._frames) > 32:
+                self._frames.pop(next(iter(self._frames)))
+            self._active_frame = frame
             self._last_activation_changed = False
             self._last_observation = observation
             return observation
 
+    def sync_observation_frame(self, frame: ObservationFrame) -> None:
+        """同步 Provider 重缩放逆变换或超限禁用状态到桌面当前帧。"""
+        with self._lock:
+            if not frame.frame_id:
+                return
+            self._frames[frame.frame_id] = frame
+            while len(self._frames) > 32:
+                self._frames.pop(next(iter(self._frames)))
+            if self._active_frame is not None and self._active_frame.frame_id == frame.frame_id:
+                self._active_frame = frame
+                if (
+                    frame.coordinate_input_enabled
+                    and self._last_observation is not None
+                    and frame.image_width > 0
+                    and frame.image_height > 0
+                ):
+                    self._last_observation = replace(
+                        self._last_observation,
+                        width=frame.image_width,
+                        height=frame.image_height,
+                        scale_x=frame.model_to_css_x,
+                        scale_y=frame.model_to_css_y,
+                    )
+
     def execute(self, run_id: str, action: ComputerAction) -> None:
         wait_duration: int | None = None
-        # wait_for（2026-11-09 Windows-MCP 对齐）：锁内只记录动作本体，轮询在
-        # 锁外进行——条件等待最长 30s，持锁会阻塞 close/停止收尾（与 wait 同层）。
         wait_for_action: ComputerAction | None = None
         with self._lock:
             self._ensure_started_locked()
+            self._raise_if_stopped_locked()
             if action.target != "desktop":
                 raise ComputerControlError(
                     "computer_invalid_action",
@@ -356,9 +395,7 @@ class WindowsComputerBackend:
                     "computer_invalid_action",
                     f"桌面 backend 不支持动作：{kind!r}",
                 )
-            # 每次桌面动作前重新检查 interactive desktop（锁屏/安全桌面即失败）。
             self._adapter.ensure_interactive()
-            # Task C：激活标记只反映本动作——分发前重置（异常路径不留陈旧标记）。
             self._last_activation_changed = False
             if kind == "wait":
                 duration = action.duration_ms
@@ -379,26 +416,17 @@ class WindowsComputerBackend:
                 self._dispatch_semantic_locked(action)
                 return
             else:
-                # 真机验收修正（2026-09-06）：键盘动作不做事前激活——键盘没有
-                # 目标点，"目标=上次观察的窗口"在按键打开新窗口（如 Win+R 运行
-                # 对话框）的场景会把旧窗口抢回前台，真机实测 3 条文本被误发进
-                # 微信群聊。键盘输入的焦点漂移维持 R5 fail-closed：前台与最近
-                # 观察不一致即拒绝，强制重新 observe 后再输入。
                 self._require_current_surface_locked()
                 if kind in _KEYBOARD_KINDS:
-                    # 键盘没有目标点：额外复核前台仍是最近一次 pointer 目标窗口。
                     self._require_keyboard_focus_locked()
                 self._dispatch_locked(action)
                 return
-        # R8：wait 在锁外分片等待，close 可收尾、停止可中断。
         if wait_for_action is not None:
             self._wait_for_interruptible(
                 int(self._adapter.foreground_window_id()), wait_for_action
             )
         elif wait_duration is not None:
             self._wait_interruptible(wait_duration)
-
-    # ---------------- 阶段二：UIA 元素观察与元素引用动作 ----------------
 
     def _dispatch_element_locked(self, action: ComputerAction) -> None:
         """元素动作分发（调用方持有锁）：list_elements 纯观察不要求画面基线；
@@ -411,76 +439,96 @@ class WindowsComputerBackend:
             )
         kind = action.kind
         if kind == "list_elements":
-            hwnd = self._adapter.foreground_window_id()
-            self._pending_elements = tuple(locator.collect(hwnd))
-            # Task B：记录收集时刻的观察代数，供后续 observe 判定元素表有效性。
+            hwnd = int(self._adapter.foreground_window_id() or 0)
+            collected = tuple(locator.collect(hwnd))
+            if int(self._adapter.foreground_window_id() or 0) != hwnd:
+                try:
+                    locator.invalidate()
+                except Exception:
+                    pass
+                raise ComputerControlError(
+                    "computer_surface_changed",
+                    "控件采集期间前台窗口已切换，请重新 observe 后再操作",
+                )
+            self._pending_elements = collected
             self._elements_surface_generation = self._surface_generation
             return
         self._require_current_surface_locked()
+        self._raise_if_stopped_locked()
+        expected_hwnd = (
+            int(self._surface_signature[0])
+            if self._surface_signature is not None
+            else None
+        )
         if kind == "click_element":
-            locator.click(action.element_ref)
+            _call_with_supported_kwargs(
+                locator.click, action.element_ref, expected_hwnd=expected_hwnd
+            )
             return
-        # set_value_element
         if not isinstance(action.text, str) or not action.text:
             raise ComputerControlError(
                 "computer_invalid_action", "set_value_element 需要非空 text"
             )
-        locator.set_value(action.element_ref, action.text)
+        _call_with_supported_kwargs(
+            locator.set_value,
+            action.element_ref,
+            action.text,
+            expected_hwnd=expected_hwnd,
+        )
 
-    def _collect_elements_locked(self) -> tuple:
-        """自动补元素表（调用方持有锁）：前台窗口 UIA 元素，best-effort。
-
-        observe 没有新的 list_elements 结果、也没有代数未变的上代元素表时调用：
-        直接抓一次前台窗口元素，模型第一次观察即可用 click_element 精确点击，
-        不必退回截图目测坐标（小控件只有几十像素，目测必然点偏）。
-
-        任何失败（UIA 不可用、窗口关闭、COM 异常）只记日志并返回空表——观察
-        退回普通截图，绝不因为补表失败阻断观察。元素数量按
-        ``_MAX_OBSERVE_ELEMENTS`` 截断，避免超大树拖慢观察。
-        """
+    def _collect_elements_locked(self, hwnd: int | None = None) -> tuple:
         locator = self._element_locator
         if locator is None:
             return ()
         try:
-            hwnd = self._adapter.foreground_window_id()
-            listing = tuple(locator.collect(hwnd))
+            target_hwnd = (
+                int(hwnd)
+                if hwnd is not None
+                else int(self._adapter.foreground_window_id() or 0)
+            )
+            listing = tuple(locator.collect(target_hwnd))
         except Exception:
             _LOGGER.exception("自动提取前台窗口元素失败，观察退回普通截图")
             return ()
         return listing[:_MAX_OBSERVE_ELEMENTS]
 
-    # ---------------- Task C：输入前置激活（best-effort，绝不阻断输入） ----------------
-
     def _ensure_target_window_active_locked(self, point: tuple[int, int]) -> bool:
-        """把输入目标点所属顶层窗口提到前台并等激活沉降；返回是否发生了前台切换。
-
-        - 目标 = 输入点所属顶层窗口（WindowFromPoint，64 位安全经 adapter）：
-          点击命中点所在窗口是权威目标，激活它不改变动作语义；
-        - 已是前台/查询失败/无目标：不切换，返回 False；
-        - SetForegroundWindow 失败或激活过程异常：抛 ComputerControlError 中止本次输入。
-          旧实现是 best-effort 直接继续发送，输入会落到仍在前台的旧窗口，
-          表现为失去焦点、点到别处，因此改为显式失败。
-
-        仅用于 pointer 类动作（click/double_click/drag）；键盘动作没有目标点，
-        不做前置激活（真机验收修正：键盘激活会把旧观察窗口抢回前台）。
-
-        查询到的目标窗口无论是否发生切换，都记为「最近一次 pointer 目标窗口」，
-        供后续键盘动作复核焦点（_require_keyboard_focus_locked）。
-        """
+        px, py = int(point[0]), int(point[1])
         try:
-            hwnd = self._adapter.window_from_point(int(point[0]), int(point[1]))
-            if hwnd:
-                # 记录最近一次 pointer 动作的目标窗口（键盘焦点参照）。
-                self._last_pointer_target_hwnd = int(hwnd)
-            if not hwnd or hwnd == self._adapter.foreground_window_id():
+            hwnd = int(self._adapter.window_from_point(px, py) or 0)
+            if hwnd <= 0:
+                raise ComputerControlError(
+                    "computer_surface_ambiguous",
+                    "无法确定坐标命中的目标窗口，请重新 observe 核对界面后再操作",
+                    {"point": [px, py]},
+                )
+            self._last_pointer_target_hwnd = hwnd
+            if hwnd == int(self._adapter.foreground_window_id() or 0):
                 return False
             if not self._adapter.set_foreground_window(hwnd):
                 raise ComputerControlError(
                     "computer_foreground_activation_failed",
                     "目标窗口未能置前，已在发送输入前中止，避免输入落到其他窗口。请先调用 activate_surface 激活目标窗口，或重新 observe 建立基线后再试。",
-                    {"hwnd": int(hwnd), "point": [int(point[0]), int(point[1])]},
+                    {"hwnd": hwnd, "point": [px, py]},
                 )
-            time.sleep(_ACTIVATION_SETTLE_S)
+            if self._stop_event.wait(_ACTIVATION_SETTLE_S):
+                raise ComputerControlError(
+                    "computer_cancelled", "桌面操控已停止，取消前置激活后的输入"
+                )
+            actual_fg = int(self._adapter.foreground_window_id() or 0)
+            if actual_fg != hwnd:
+                raise ComputerControlError(
+                    "computer_foreground_activation_failed",
+                    f"前置激活后实际前台窗口（hwnd {actual_fg}）与目标（hwnd {hwnd}）不符，已在发送输入前中止。",
+                    {"hwnd": hwnd, "actual_hwnd": actual_fg, "point": [px, py]},
+                )
+            post_hwnd = int(self._adapter.window_from_point(px, py) or 0)
+            if post_hwnd != hwnd:
+                raise ComputerControlError(
+                    "computer_surface_changed",
+                    "激活目标窗口后坐标位置命中窗口已发生变化，请重新 observe 后再操作",
+                    {"expected_hwnd": hwnd, "actual_hwnd": post_hwnd, "point": [px, py]},
+                )
             return True
         except ComputerControlError:
             raise
@@ -489,10 +537,8 @@ class WindowsComputerBackend:
             raise ComputerControlError(
                 "computer_foreground_activation_failed",
                 "激活目标窗口时出错，已在发送输入前中止，避免输入落到错误窗口。请重新 observe 建立基线后再试。",
-                {"point": [int(point[0]), int(point[1])], "reason": str(exc)},
+                {"point": [px, py], "reason": str(exc)},
             ) from exc
-
-    # ---------------- Task B：SoM 编号标注（best-effort，绝不阻断观察） ----------------
 
     def _annotate_elements_locked(
         self,
@@ -503,7 +549,6 @@ class WindowsComputerBackend:
         origin_x: int,
         origin_y: int,
     ) -> bytes:
-        """把元素 ref 编号画到观察 PNG 上；标注失败退回普通截图并留痕。"""
         from core.computer.som_annotator import annotate_screenshot
 
         try:
@@ -519,9 +564,8 @@ class WindowsComputerBackend:
             _LOGGER.exception("SoM 编号标注失败，观察退回普通截图")
             return png
 
-    # ---------------- R10：语义定位与局部观察 ----------------
-
     def _dispatch_semantic_locked(self, action: ComputerAction) -> None:
+        self._raise_if_stopped_locked()
         locator = self._surface_locator
         if locator is None:
             raise ComputerControlError(
@@ -560,15 +604,26 @@ class WindowsComputerBackend:
             )
             return
         if kind == "activate_surface":
-            # 激活窗口并验证实际前台身份（SetForegroundWindow 失败显式报错）。
             locator.activate_window(action.surface_ref, action.surface_generation)
+            # 激活/恢复窗口后旧观察坐标与元素引用立即失效，必须重新 observe 建立新基线
+            self._last_observation = None
+            self._active_frame = None
+            self._last_elements = ()
+            self._elements_surface_generation = -1
+            self._region_baseline = None
+            self._surface_signature = None
+            self._last_pointer_target_hwnd = None
+            if self._element_locator is not None:
+                try:
+                    self._element_locator.invalidate()
+                except Exception:
+                    _LOGGER.exception("激活窗口后失效旧元素引用失败")
             return
         if kind == "invoke_surface":
             # 按候选实际支持的语义调用（UIA Invoke）；失败显式报错，
             # 绝不自动退化为同位置盲点（那是模型的显式 click 选择）。
             locator.invoke_element(action.surface_ref, action.surface_generation)
             return
-        # observe_region：解析候选当前边界，交由紧随的观察裁剪原分辨率区域。
         candidate = locator.resolve_candidate(action.surface_ref, action.surface_generation)
         if candidate is None:
             raise ComputerControlError(
@@ -646,21 +701,7 @@ class WindowsComputerBackend:
                     "computer_cancelled", "显式等待被停止中断"
                 )
 
-    # ---------------- wait_for：只读条件轮询（锁外执行） ----------------
-
     def _wait_for_interruptible(self, hwnd: int, action: ComputerAction) -> None:
-        """按 interval_ms 分片轮询只读条件，直到命中或超时（锁外执行）。
-
-        设计红线（2026-11-09 设计 5.1 / 计划 Task 2 硬约束）：轮询**绝不**调用
-        ``element_locator.collect``——collect 会整体替换 ref 全集
-        （windows_elements_uia.py 的 collect 末尾 ``self._elements = elements``），
-        模型手里的 el-N 会在等待期间全部失效。这里只走 ``locator.probe`` 的只读
-        探测，全程不重建映射、不重新编号。
-
-        分片语义：每片不超过 interval_ms，且不超过剩余时间；每片都用
-        ``_stop_event.wait`` 等待，停止/关闭立即中断（computer_cancelled），
-        绝不空转到超时。超时抛 computer_wait_timeout，message 提示改用 observe。
-        """
         condition = str(action.condition or "text_exists")
         timeout_ms = int(action.timeout_ms or WAIT_FOR_DEFAULT_TIMEOUT_MS)
         interval_ms = int(action.interval_ms or WAIT_FOR_DEFAULT_INTERVAL_MS)
@@ -676,9 +717,16 @@ class WindowsComputerBackend:
                 raise ComputerControlError(
                     "computer_cancelled", "条件等待被停止中断"
                 )
-            if self._wait_for_match(int(hwnd), condition, matcher, window_name):
-                return
+            matched = self._wait_for_match(
+                int(hwnd), condition, matcher, window_name, deadline=deadline
+            )
+            if self._stop_event.is_set():
+                raise ComputerControlError(
+                    "computer_cancelled", "条件等待被停止中断"
+                )
             remaining = deadline - time.monotonic()
+            if matched and remaining > 0:
+                return
             if remaining <= 0:
                 raise ComputerControlError(
                     "computer_wait_timeout",
@@ -691,16 +739,24 @@ class WindowsComputerBackend:
                 )
 
     def _wait_for_match(
-        self, hwnd: int, condition: str, matcher: dict, window_name: str
+        self,
+        hwnd: int,
+        condition: str,
+        matcher: dict,
+        window_name: str,
+        *,
+        deadline: float | None = None,
     ) -> dict | None:
-        """单轮条件检查：window_active 走顶层窗口标题，其余走只读 probe。"""
+        """单轮条件检查：window_active 只查实际前台 HWND 标题，其余走只读 probe。"""
         if condition == "window_active":
             if not window_name:
                 return None
-            for title in self._adapter.list_top_window_titles() or ():
-                folded = str(title).casefold()
-                if window_name in folded:
-                    return {"condition": condition, "title": str(title)}
+            fg_hwnd = int(self._adapter.foreground_window_id() or 0)
+            if fg_hwnd <= 0:
+                return None
+            title = str(self._adapter.foreground_window_title() or "")
+            if window_name in title.casefold():
+                return {"condition": condition, "title": title}
             return None
         if window_name:
             # window_name 作范围限定：前台窗口标题不含该子串时本轮不命中
@@ -718,12 +774,17 @@ class WindowsComputerBackend:
                 "computer_elements_unavailable",
                 "当前桌面 backend 未提供 UIA 元素探测能力，无法执行该等待条件",
             )
-        return locator.probe(int(hwnd), matcher)
+        return _call_with_supported_kwargs(
+            locator.probe,
+            int(hwnd),
+            matcher,
+            deadline=deadline,
+            cancel_event=self._stop_event,
+        )
 
     def _surface_signature_current_locked(
         self, origin_x: int, origin_y: int, width: int, height: int
     ) -> tuple:
-        """当前桌面 surface 签名：前台窗口本地身份 + 虚拟桌面几何。"""
         return (
             int(self._adapter.foreground_window_id()),
             origin_x,
@@ -733,11 +794,6 @@ class WindowsComputerBackend:
         )
 
     def _require_current_surface_locked(self) -> None:
-        """输入前复核：前台窗口身份/桌面几何必须与最近一次观察一致（R5）。
-
-        用户切到其他软件、窗口切换或 DPI/分辨率变化都会使旧坐标失效：
-        零输入并显式报错，由 controller 要求重新 observe。
-        """
         if self._last_observation is None or self._surface_signature is None:
             return
         origin_x, origin_y, width, height = self._adapter.virtual_screen_rect()
@@ -750,7 +806,6 @@ class WindowsComputerBackend:
                 "前台窗口或桌面几何已变化，旧坐标已失效，"
                 "必须重新观察（observe）后再操作",
             )
-        # R10 区域基线失效复核：候选窗口/控件移动或消失使旧区域坐标作废。
         baseline = self._region_baseline
         if baseline is not None and self._surface_locator is not None:
             ref, generation, bounds = baseline
@@ -763,18 +818,6 @@ class WindowsComputerBackend:
                 )
 
     def _require_keyboard_focus_locked(self) -> None:
-        """键盘动作发送前复核：前台窗口必须是最近一次 pointer 动作的目标窗口。
-
-        键盘没有目标点，焦点被抢走后按键会静默打进错误窗口。R5 只比对「最近
-        一次观察」基线：用户从刚点击的窗口切回观察过的窗口时基线仍吻合，缺口
-        正在这里——键盘输入会送到不该收键的窗口。参照优先级：
-
-        1. 最近一次 pointer 动作（click/double_click/drag）的目标窗口；
-        2. 没有 pointer 参照时回落到最近一次观察记录的前台窗口。
-
-        两者都没有（尚未观察、也没点过）时放行，不阻塞首次键盘输入。不一致即
-        零输入 + 显式报错，由模型 click 或 activate_surface 重建焦点。
-        """
         expected = self._last_pointer_target_hwnd
         if expected is None:
             signature = self._surface_signature
@@ -793,12 +836,27 @@ class WindowsComputerBackend:
             {"expected_hwnd": int(expected), "current_hwnd": current},
         )
 
+    def _raise_if_stopped_locked(self) -> None:
+        if self._stop_event.is_set():
+            raise ComputerControlError(
+                "computer_cancelled", "桌面 backend 已停止，拒绝提交新输入"
+            )
+
+    def request_stop(self) -> None:
+        """关闭输入准入而不等待当前 backend 锁，供 controller 的停止路径先调用。"""
+        self._stop_event.set()
+        adapter_stop = getattr(self._adapter, "request_stop", None)
+        if callable(adapter_stop):
+            adapter_stop()
+
     def release_inputs(self) -> None:
         """尽力释放所有按下的键和鼠标键；失败只留痕不抛出。"""
         try:
-            self._adapter.release_all()
+            with self._lock:
+                self._adapter.release_all()
         except Exception:
             _LOGGER.exception("释放桌面输入状态失败")
+            raise
 
     def is_reusable(self) -> bool:
         """retained 领取裁决（R4）：桌面 backend 同步执行，无 pending 命令。"""
@@ -806,6 +864,7 @@ class WindowsComputerBackend:
             return self._started and not self._closed
 
     def close(self) -> None:
+        self.request_stop()
         with self._lock:
             if self._closed:
                 return
@@ -814,17 +873,13 @@ class WindowsComputerBackend:
             owns = self._owns_screenshot_dir
             self._screenshot_dir = None
             self._last_observation = None
-        # 先中断进行中的显式 wait，再做其余清理（R8）。
-        self._stop_event.set()
         self.release_inputs()
-        # R10：释放语义定位器（COM 线程/UIA 元素）。
         locator = self._surface_locator
         if locator is not None:
             try:
                 locator.close()
             except Exception:
                 _LOGGER.exception("关闭桌面语义定位器失败")
-        # Task A：释放 UIA 元素定位器（惰性 COM 线程）；失败只留痕不阻断收尾。
         element_locator = self._element_locator
         if element_locator is not None:
             try:
@@ -833,8 +888,6 @@ class WindowsComputerBackend:
                 _LOGGER.exception("关闭桌面元素定位器失败")
         if owns and screenshot_dir is not None:
             shutil.rmtree(screenshot_dir, ignore_errors=True)
-
-    # ---------------- 内部：启动、截图、动作分发 ----------------
 
     def _start_locked(self) -> None:
         if self._closed:
@@ -850,7 +903,6 @@ class WindowsComputerBackend:
                 "Pillow 不可用，无法进行桌面截图",
             )
         self._adapter.preflight()
-        # preflight 级别试抓一次：验证 Pillow 尺寸与 Win32 metrics 一致。
         self._grab_checked_locked()
         self._started = True
 
@@ -888,13 +940,11 @@ class WindowsComputerBackend:
         return (origin_x, origin_y, width, height), image
 
     def _encode_png(self, image) -> bytes:
-        """确定参数 PNG 编码：同一画面产生同一字节。"""
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", optimize=False)
         return buffer.getvalue()
 
     def _window_title_summary(self) -> str:
-        """前台窗口标题的受控摘要：截断 200 字符，失败时为空串。"""
         try:
             title = self._adapter.foreground_window_title()
         except Exception:
@@ -905,6 +955,9 @@ class WindowsComputerBackend:
         return title[:_MAX_TITLE_CHARS]
 
     def _require_observation(self) -> ComputerObservation:
+        frame = self._active_frame
+        if frame is not None and not frame.coordinate_input_enabled:
+            raise coordinate_disabled_error(frame.disabled_reason)
         observation = self._last_observation
         if observation is None:
             raise ComputerControlError(
@@ -929,11 +982,11 @@ class WindowsComputerBackend:
         )
 
     def _dispatch_locked(self, action: ComputerAction) -> None:
+        self._raise_if_stopped_locked()
         kind = action.kind
         if kind in ("click", "double_click", "move"):
             x, y = self._physical_point(action)
             if kind != "move":
-                # Task C（P3）指针前置激活：目标点所属窗口非前台时先激活再输入。
                 if self._ensure_target_window_active_locked((x, y)):
                     self._last_activation_changed = True
             self._adapter.send_mouse(
@@ -967,6 +1020,7 @@ class WindowsComputerBackend:
             if action.delta_y:
                 self._adapter.send_mouse(action="wheel", delta=action.delta_y)
             if action.delta_x:
+                self._raise_if_stopped_locked()
                 self._adapter.send_mouse(action="hwheel", delta=action.delta_x)
         elif kind == "drag":
             path = self._physical_path(action)
@@ -984,10 +1038,12 @@ class WindowsComputerBackend:
                     "computer_invalid_action", "type_text 需要非空 text"
                 )
             if any(ord(ch) > 127 for ch in action.text):
-                # 中文等非 ASCII 文本经 KEYEVENTF_UNICODE 注入会被 IME/目标
-                # 应用输入处理扰动（会话 147 实测乱码），改走剪贴板 + Ctrl+V。
                 self._adapter.set_clipboard_text(action.text)
-                time.sleep(_CLIPBOARD_PASTE_DELAY_S)
+                if self._stop_event.wait(_CLIPBOARD_PASTE_DELAY_S):
+                    raise ComputerControlError(
+                        "computer_cancelled",
+                        "电脑操控已停止，取消尚未提交的中文粘贴",
+                    )
                 self._adapter.send_keys(("CTRL", "V"))
             else:
                 self._adapter.send_text(action.text)
@@ -1002,8 +1058,6 @@ class WindowsComputerBackend:
                 "computer_invalid_action",
                 f"桌面 backend 不支持动作：{kind!r}",
             )
-
-    # ---------------- 内部：截图短期存储（最多保留最近 3 张） ----------------
 
     def _store_screenshot_locked(self, png: bytes) -> Path:
         if self._screenshot_dir is None:

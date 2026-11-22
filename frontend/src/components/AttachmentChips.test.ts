@@ -4,9 +4,6 @@ import { describe, expect, it } from 'vitest';
 import AttachmentChips from './AttachmentChips.vue';
 import type { AttachmentItem } from '../types/composer';
 
-// 纯展示组件：不依赖 store，直接传 props 驱动渲染断言。
-// items 用 reactive 包裹，保证 onThumbError 原地改写 thumb 能触发重渲染。
-
 const imgItem: AttachmentItem = {
   path: 'C:/tmp/a.png',
   name: 'a.png',

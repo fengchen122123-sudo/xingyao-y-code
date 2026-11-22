@@ -1,34 +1,14 @@
-"""T3 /doctor 聚合自检（CLI 部分）测试。
-
-需求（待开发/Codex与ZCode增量改进/实施计划与验收清单.md · T3）：
-- `run_checks(*, skip_network=False) -> list[CheckResult]` 检查 8 项；
-- `CheckResult(name, status, detail, hint)`，status ∈ {ok, warn, fail, skip}；
-- 单项检查内部异常必须隔离为 fail、不向外抛出；
-- --json 输出结构稳定（name/status/detail/hint）；
-- CLI `/doctor [--json]` 注册（帮助列表 + 分派链 + 命令补全）。
-
-隔离策略：conftest.py 已在收集阶段把 YCODE_DATA_DIR 指到临时目录；本文件对
-config 文件路径常量、core.doctor 的 IO/探测入口做定点 mock，不触碰真实
-~/.ycode，也不发起真实网络请求（_probe_endpoint 一律打桩）。
-"""
-
 import inspect
 import json
 import sqlite3
 import sys
 
-import pytest
 
 import config
 import core.doctor as doctor
 
 
-# ---------------------------------------------------------------------------
-# 公共工具
-# ---------------------------------------------------------------------------
-
 def _patch_main_print(monkeypatch):
-    """捕获 main.handle_slash_command 的 print_formatted_text 输出。"""
     import main
 
     printed = []
@@ -47,12 +27,7 @@ def _fake_results():
     ]
 
 
-# ---------------------------------------------------------------------------
-# run_checks 结构与异常隔离
-# ---------------------------------------------------------------------------
-
 def test_run_checks_returns_eight_ordered_items(monkeypatch):
-    # 模型端点项不得发起真实网络请求
     monkeypatch.setattr(doctor, "_active_base_url", lambda: "https://api.example.com")
     monkeypatch.setattr(doctor, "_probe_endpoint", lambda url, timeout: (True, "HTTP 200"))
 
@@ -73,7 +48,6 @@ def test_run_checks_signature_is_keyword_only():
 
 
 def test_run_checks_isolates_item_exceptions(monkeypatch):
-    """单项检查抛异常必须隔离为 fail，其余项照常产出，绝不向外抛出。"""
     def _boom():
         raise RuntimeError("检查内部故障")
 
@@ -81,14 +55,13 @@ def test_run_checks_isolates_item_exceptions(monkeypatch):
     monkeypatch.setattr(doctor, "_active_base_url", lambda: "https://api.example.com")
     monkeypatch.setattr(doctor, "_probe_endpoint", lambda url, timeout: (True, "HTTP 200"))
 
-    results = doctor.run_checks()  # 不抛出
+    results = doctor.run_checks()
 
     assert len(results) == 8
     row = next(r for r in results if r.name == "数据目录")
     assert row.status == "fail"
     assert "检查执行异常" in row.detail
     assert row.hint
-    # 其他项仍正常产出
     assert next(r for r in results if r.name == "环境与版本").status in {"ok", "warn"}
 
 
@@ -106,10 +79,6 @@ def test_run_checks_skip_network_skips_probe(monkeypatch):
     assert calls == []
 
 
-# ---------------------------------------------------------------------------
-# ① 环境与版本
-# ---------------------------------------------------------------------------
-
 def test_check_environment_reports_version_and_runtime():
     result = doctor.check_environment()
 
@@ -119,10 +88,6 @@ def test_check_environment_reports_version_and_runtime():
     assert "Python" in result.detail
     assert "打包版" in result.detail or "源码运行" in result.detail
 
-
-# ---------------------------------------------------------------------------
-# ② 配置
-# ---------------------------------------------------------------------------
 
 def test_check_config_flags_unknown_keys(monkeypatch):
     monkeypatch.setattr(
@@ -153,10 +118,6 @@ def test_check_config_ok_for_known_values(monkeypatch):
 
     assert doctor.check_config().status == "ok"
 
-
-# ---------------------------------------------------------------------------
-# ③ 凭据
-# ---------------------------------------------------------------------------
 
 def test_check_credentials_flags_undecryptable_key(monkeypatch):
     monkeypatch.setattr(
@@ -205,10 +166,6 @@ def test_check_credentials_warns_when_no_key(monkeypatch):
     assert result.hint
 
 
-# ---------------------------------------------------------------------------
-# ④ 数据目录
-# ---------------------------------------------------------------------------
-
 def test_check_data_dir_ok_and_writable(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "YCODE_DIR", str(tmp_path / "data"))
 
@@ -226,10 +183,6 @@ def test_check_data_dir_fails_on_unwritable_path(monkeypatch, tmp_path):
     assert result.hint
 
 
-# ---------------------------------------------------------------------------
-# ⑤ 数据库
-# ---------------------------------------------------------------------------
-
 def test_check_databases_ok_with_valid_db_and_missing_gui_db(monkeypatch, tmp_path):
     db = tmp_path / "ycode.db"
     sqlite3.connect(db).close()
@@ -239,7 +192,7 @@ def test_check_databases_ok_with_valid_db_and_missing_gui_db(monkeypatch, tmp_pa
     result = doctor.check_databases()
 
     assert result.status == "ok"
-    assert "ycode_gui.db" in result.detail  # 尚未创建（首次运行正常）
+    assert "ycode_gui.db" in result.detail
 
 
 def test_check_databases_fail_on_corrupt_db(monkeypatch, tmp_path):
@@ -254,10 +207,6 @@ def test_check_databases_fail_on_corrupt_db(monkeypatch, tmp_path):
     assert "ycode.db" in result.detail
     assert result.hint
 
-
-# ---------------------------------------------------------------------------
-# ⑥ MCP
-# ---------------------------------------------------------------------------
 
 def test_check_mcp_ok_when_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "MCP_FILE", str(tmp_path / "mcp.json"))
@@ -301,10 +250,6 @@ def test_check_mcp_ok_on_valid_server(monkeypatch, tmp_path):
     assert doctor.check_mcp().status == "ok"
 
 
-# ---------------------------------------------------------------------------
-# ⑦ 模型端点连通
-# ---------------------------------------------------------------------------
-
 def test_check_model_endpoint_skips_network_when_requested(monkeypatch):
     called = []
     monkeypatch.setattr(
@@ -346,16 +291,7 @@ def test_check_model_endpoint_warns_on_unreachable(monkeypatch):
     assert result.hint
 
 
-# ---------------------------------------------------------------------------
-# ⑦-补 探测请求头（X-TokenRhythm-Agent）
-# ---------------------------------------------------------------------------
-
 def _request_header(request, name):
-    """大小写不敏感读取 urllib.request.Request 的请求头。
-
-    Python 3.14 起 Request.get_header() 不再做 capitalize 规范化，
-    与 add_header 的存储键不再对称、会取不到值；测试统一走本例遍历。
-    """
     return next(
         (value for key, value in request.headers.items() if key.lower() == name.lower()),
         None,
@@ -363,7 +299,6 @@ def _request_header(request, name):
 
 
 def _capture_probe_headers(monkeypatch, url):
-    """打桩 urlopen 执行一次 _probe_endpoint，返回 (可达结果, 实际请求对象)。"""
     import urllib.request as urllib_request
 
     captured = {}
@@ -387,7 +322,6 @@ def _capture_probe_headers(monkeypatch, url):
 
 
 def test_probe_endpoint_carries_tokenrhythm_agent_header_for_tokenrhythm(monkeypatch):
-    """探测基元律动端点时携带 X-TokenRhythm-Agent 客户端标识头。"""
     from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 
     ok, request = _capture_probe_headers(monkeypatch, "https://tokenrhythm.studio/v1")
@@ -397,18 +331,11 @@ def test_probe_endpoint_carries_tokenrhythm_agent_header_for_tokenrhythm(monkeyp
 
 
 def test_probe_endpoint_omits_tokenrhythm_agent_header_for_other_hosts(monkeypatch):
-    """探测非基元律动主机时不得携带该标识头。"""
     ok, request = _capture_probe_headers(monkeypatch, "https://api.example.com")
 
     assert ok is True
     assert _request_header(request, "X-TokenRhythm-Agent") is None
 
-
-# ---------------------------------------------------------------------------
-# ⑧ GUI 运行时
-# ---------------------------------------------------------------------------
-# ⑧ GUI 运行时
-# ---------------------------------------------------------------------------
 
 def test_check_gui_runtime_skips_off_windows(monkeypatch):
     import core.gui_runtime_check as grc
@@ -447,20 +374,12 @@ def test_check_gui_runtime_ok_with_version(monkeypatch):
     assert "131.0.2903.86" in result.detail
 
 
-# ---------------------------------------------------------------------------
-# CheckResult / --json schema
-# ---------------------------------------------------------------------------
-
 def test_check_result_to_dict_schema_is_stable():
     result = doctor.CheckResult(name="X", status="ok", detail="d", hint="h")
 
     assert list(result.to_dict().keys()) == ["name", "status", "detail", "hint"]
     assert result.to_dict() == {"name": "X", "status": "ok", "detail": "d", "hint": "h"}
 
-
-# ---------------------------------------------------------------------------
-# CLI 注册（main.py）
-# ---------------------------------------------------------------------------
 
 def test_doctor_registered_in_command_completions():
     import main
@@ -490,10 +409,10 @@ def test_doctor_command_human_readable_output(monkeypatch):
     text = "\n".join(printed)
     assert "聚合自检" in text
     assert "环境与版本" in text
-    assert "警告" in text  # warn 项标签
-    assert "失败" in text  # fail 项标签
-    assert "跳过" in text  # skip 项标签
-    assert "删除拼错的键" in text  # hint 展示
+    assert "警告" in text
+    assert "失败" in text
+    assert "跳过" in text
+    assert "删除拼错的键" in text
     assert "未知指令" not in text
 
 

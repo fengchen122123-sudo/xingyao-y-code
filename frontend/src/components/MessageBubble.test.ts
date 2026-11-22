@@ -78,7 +78,6 @@ describe('MessageBubble', () => {
     const store = useAppStore();
     store.messages.push(assistantMessage({ execution_state: 'running' }));
     store.running = true;
-    // 用 store 内部的响应式代理作为 props，模拟 App.vue 的 v-for 传参
     const msg = store.messages[store.messages.length - 1];
     const wrapper = mount(MessageBubble, { props: { msg } });
     expect(wrapper.find('.working-line').exists()).toBe(true);
@@ -106,8 +105,6 @@ describe('MessageBubble', () => {
     expect(wrapper.find('.tool-card').exists()).toBe(false);
     expect(wrapper.find('.diff-list').exists()).toBe(false);
     const trace = wrapper.get('.exec-trace');
-    // 轨迹行改用「类别 + 目标」摘要：命令行给「运行 npm test」，
-    // 历史遗留 Diff 行给「变更 old.py」，不再有整句"未绑定的历史文件变更"
     expect(trace.text()).toContain('运行');
     expect(trace.text()).toContain('变更');
     expect(trace.text()).toContain('old.py');
@@ -226,8 +223,6 @@ describe('MessageBubble', () => {
       props: { msg: assistantMessage({ content: '下面是流程图' }) },
     });
 
-    // 模拟 mermaidRenderer.injectSvg 注入的净化后 SVG 容器（v-html 异步注入，
-    // 测试直接补 DOM，走同一个点击委托入口）
     const holder = document.createElement('div');
     holder.className = 'mermaid-svg';
     holder.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="10"><text>节点</text></svg>';
@@ -240,7 +235,6 @@ describe('MessageBubble', () => {
     const [images, index] = open.mock.calls[0];
     expect(index).toBe(0);
     expect(images).toHaveLength(1);
-    // 灯箱走 v-html 直注 SVG（与气泡同路径），传的就是净化后的 SVG 字符串本身
     expect(images[0]).toBe(holder.innerHTML);
     expect(images[0]).toMatch(/^\s*<svg/);
     wrapper.unmount();
@@ -289,6 +283,21 @@ describe('MessageBubble', () => {
     expect(title).toContain('生成耗时: 2.22s');
     expect(title).toContain('平均速度: 58.2 t/s');
     expect(title).toContain('输出: 142 tokens');
+    wrapper.unmount();
+  });
+
+  it('showMetrics 为 false 时隐藏底部性能指标栏', () => {
+    const wrapper = mount(MessageBubble, {
+      props: {
+        msg: assistantMessage({
+          content: '中间子步骤',
+          metrics: { duration_s: 2.34, token_speed: 58.2, completion_tokens: 142 },
+        }),
+        showMetrics: false,
+      },
+    });
+
+    expect(wrapper.find('.msg-metrics-bar').exists()).toBe(false);
     wrapper.unmount();
   });
 
@@ -432,7 +441,6 @@ describe('MessageBubble 思考块折叠态实时预览', () => {
     store.running = true;
     store.showThinking = false;
     store.messages.push(assistantMessage({ reasoning_content: reasoning, execution_state: 'running' }));
-    // 走 store 响应式代理，模拟 App.vue 的 v-for 传参
     const msg = store.messages[store.messages.length - 1];
     return { wrapper: mount(MessageBubble, { props: { msg } }), store };
   }
@@ -444,7 +452,6 @@ describe('MessageBubble 思考块折叠态实时预览', () => {
     expect(head.find('[data-test="think-live-line"]').exists()).toBe(true);
     expect(head.text()).toContain('然后确认渲染细节');
     expect(head.text()).not.toContain('思考过程');
-    // 折叠态：v-show 隐藏全文容器，只留标题行预览
     expect(wrapper.get('.tk-cnt').isVisible()).toBe(false);
     wrapper.unmount();
   });
@@ -460,7 +467,6 @@ describe('MessageBubble 思考块折叠态实时预览', () => {
     const head = wrapper.get('.think-block .fold-head');
 
     await head.trigger('click');
-    // 展开态不再显示流式摘要，标签回到「思考」（有可信耗时时带秒数）
     expect(wrapper.get('.think-block .tk-label').text()).toMatch(/^思考/);
     expect(wrapper.find('.think-block [data-test="think-live-line"]').exists()).toBe(false);
     expect(wrapper.get('.tk-cnt').text()).toContain('先分析结构');
@@ -507,7 +513,6 @@ describe('MessageBubble QQ2009 用户昵称行', () => {
 
     const sender = wrapper.get('.qq09-msg-sender');
     expect(sender.get('.qq09-sender-name').text()).toBe('木偶');
-    // 昵称行在用户气泡之前（气泡仍是文案承载者）
     expect(wrapper.get('.msg-user').html()).toContain('qq09-msg-sender');
     wrapper.unmount();
   });

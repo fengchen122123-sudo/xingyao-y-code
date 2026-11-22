@@ -1,7 +1,4 @@
 <template>
-  <!-- /goal 目标状态条：插在聊天标题栏下方、滚动区外（与电脑操控安全条同层），
-       对话滚动时保持可见。只有当前会话真的有目标时才渲染，没有目标时整块不存在，
-       不占布局高度 -->
   <div
     v-if="visible && goalState"
     class="goal-bar"
@@ -10,8 +7,6 @@
     data-theme-region="conversation_toolbar"
   >
     <span class="gb-badge" :class="statusTone" data-test="goal-status">{{ statusLabel }}</span>
-    <!-- 目标原文可能很长（用户随手写一段需求），单行省略 + title 悬浮看全文，
-         避免把轮次和按钮挤出可视区 -->
     <span class="gb-goal" :title="goalState.goal" data-test="goal-text">{{ goalState.goal }}</span>
     <span class="gb-round" data-test="goal-round">第 {{ goalState.round }}/{{ goalState.max_rounds }} 轮</span>
     <span
@@ -54,9 +49,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
 
-// 轮询间隔：目标循环一轮动辄几十秒，5 秒足够让徽标跟上，又不至于把桥打满
 const POLL_INTERVAL_MS = 5000;
-// 达成后停留时长：让用户看到"已完成"这个结果，再自动收起（只是隐藏显示）
 const ACHIEVED_VISIBLE_MS = 3000;
 
 const store = useAppStore();
@@ -65,9 +58,6 @@ const store = useAppStore();
 // 否则切会话/重拉后会出现"store 已更新、条上还是旧状态"
 const goalState = computed(() => store.goalState);
 
-// achieved 后只做"本地隐藏"：不改 store —— "目标已达成"这件事仍需可查
-// （切走再切回、刷新页面都会重新拉到并再显示一次），直接清 store 会让
-// 用户以为目标记录被删了
 const achievedHidden = ref(false);
 
 // 按钮点击期间的本地 busy：防止连点重复打桥（停止/继续都不是幂等重放友好的操作）
@@ -76,8 +66,6 @@ const busy = ref(false);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let hideTimer: ReturnType<typeof setTimeout> | null = null;
 
-// 状态码 -> 中文徽标：后端给的是英文码（权威定义在 core/slash_commands/goal/state.py），
-// 中文文案只在这里维护一份
 const STATUS_LABELS: Record<string, string> = {
   running: '进行中',
   awaiting_confirm: '待确认',
@@ -87,7 +75,6 @@ const STATUS_LABELS: Record<string, string> = {
   interrupted: '已中断',
 };
 
-// 徽标配色分组：run 绿 / warn 黄 / ok 绿亮 / bad 红 / dim 灰
 const STATUS_TONES: Record<string, string> = {
   running: 'run',
   awaiting_confirm: 'warn',
@@ -102,8 +89,6 @@ const statusTone = computed(() => STATUS_TONES[statusKey.value] || 'dim');
 const statusLabel = computed(() => STATUS_LABELS[statusKey.value] || statusKey.value);
 const isAchieved = computed(() => statusKey.value === 'achieved');
 
-// running / awaiting_confirm 都是"还在推进"（后者等用户确认下一步），可停止；
-// blocked/stopped/interrupted 是"停住了但没结论"，可继续（与后端 _GOAL_RESUMABLE 一致）
 const canStop = computed(
   () => statusKey.value === 'running' || statusKey.value === 'awaiting_confirm',
 );
@@ -118,8 +103,6 @@ const canConfirm = computed(() => statusKey.value === 'awaiting_confirm');
 
 const visible = computed(() => !!goalState.value && !achievedHidden.value);
 
-// 状态指纹：轮询每次都会换成新对象，直接 watch 对象会让"已隐藏"被反复重置；
-// 只有状态/目标/轮次真的变了才重新决定是否展示
 const stateKey = computed(() => {
   const g = goalState.value;
   return g ? `${g.status}|${g.goal}|${g.round}|${g.max_rounds}` : '';
@@ -147,16 +130,12 @@ watch(
 function startPolling() {
   if (pollTimer) return;
   pollTimer = setInterval(() => {
-    // goalState 为空（当前会话没有目标）时不轮询：状态条本就不显示，空转只会
-    // 白白打桥；新目标出现靠 sendMessage 里的 /goal 一次性刷新兜住。
-    // achieved 已收起时同理：没有可展示的状态，不必继续拉。
     if (!goalState.value || achievedHidden.value) return;
     void store.loadGoalState();
   }, POLL_INTERVAL_MS);
 }
 
 onMounted(() => {
-  // 挂载先探测一次：刷新页面/切到已有目标的会话时不必等第一个 5 秒
   void store.loadGoalState();
   startPolling();
 });
@@ -177,7 +156,6 @@ async function onStop() {
   if (busy.value) return;
   busy.value = true;
   try {
-    // store 内部调用后已重拉状态，按钮/徽标会随新快照自动切换
     await store.stopGoal();
   } finally {
     busy.value = false;
@@ -218,7 +196,6 @@ async function onConfirm() {
   color: var(--text-dim);
   overflow: hidden;
 }
-/* 达成是终局好消息：整条换成低饱和绿底，靠颜色也能一眼分辨成功/停止 */
 .goal-bar.gb-achieved {
   background: color-mix(in srgb, var(--green) 12%, var(--bg2));
   border-bottom-color: color-mix(in srgb, var(--green) 45%, var(--border));
@@ -310,7 +287,6 @@ async function onConfirm() {
   background: rgba(248, 81, 73, 0.15);
   border-color: var(--red);
 }
-/* 确认达成是"好消息"按钮：与整体达成态同色系，比普通操作更醒目 */
 .chip-btn.ok {
   color: var(--green);
   border-color: color-mix(in srgb, var(--green) 45%, var(--border));
@@ -320,7 +296,6 @@ async function onConfirm() {
   border-color: color-mix(in srgb, var(--green) 70%, var(--border));
 }
 
-/* 窄屏：摘要先折叠（次要信息），目标原文与按钮永不隐藏 */
 @media (max-width: 900px) {
   .gb-summary {
     display: none;

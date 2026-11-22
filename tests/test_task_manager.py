@@ -43,7 +43,6 @@ def test_background_task_env_disables_color_output(tmp_path, monkeypatch):
     monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
     monkeypatch.setattr(task_manager, "ACTIVE_TASKS", {})
     monkeypatch.setattr(task_manager.subprocess, "Popen", fake_popen)
-    # 继承环境里的 FORCE_COLOR 优先级高于 NO_COLOR，必须被移除
     monkeypatch.setenv("FORCE_COLOR", "1")
     monkeypatch.delenv("NO_COLOR", raising=False)
 
@@ -90,7 +89,6 @@ def test_background_task_output_decodes_raw_log_bytes(tmp_path, monkeypatch):
 
 def test_get_task_output_strips_ansi_escape_sequences(tmp_path, monkeypatch):
     task_id = "ansi-log"
-    # 模拟 vitest 在管道下的彩色输出：颜色码与正文混在日志原文里
     raw = (
         "\x1b[0;39m\x1b[33mHTMLCanvasElement's getContext()\x1b[39m not implemented\n"
         "\x1b[32mPASS\x1b[0m src/app.test.ts (14ms)\n"
@@ -154,7 +152,6 @@ def test_start_failure_closes_log_file_handle(tmp_path, monkeypatch):
 
 def test_get_task_output_reads_only_tail_of_large_log(tmp_path, monkeypatch):
     task_id = "big-log"
-    # 写入远超尾部读取上限的日志
     lines = [f"log line {index:06d}\n" for index in range(40000)]
     (tmp_path / f"task_{task_id}.log").write_text("".join(lines), encoding="utf-8")
 
@@ -191,7 +188,6 @@ def test_kill_refuses_to_kill_reused_pid(tmp_path, monkeypatch):
             }
         },
     )
-    # 当前 PID 的启动时间与记录严重不符 → PID 已被无关进程复用
     monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 999999.0)
     monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: True)
     taskkill_calls = []
@@ -209,14 +205,12 @@ def test_kill_refuses_to_kill_reused_pid(tmp_path, monkeypatch):
 
 
 def test_kill_refuses_when_process_identity_cannot_be_verified(tmp_path, monkeypatch):
-    """psutil 缺失导致无法校验进程身份时保守拒绝 kill，只清理记录不杀进程。"""
     monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
     monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
     monkeypatch.setattr(
         task_manager,
         "ACTIVE_TASKS",
         {
-            # 有启动时间记录但当前无法读取（psutil 缺失）
             "unverifiable": {
                 "id": "unverifiable",
                 "command": "demo",
@@ -231,7 +225,6 @@ def test_kill_refuses_when_process_identity_cannot_be_verified(tmp_path, monkeyp
                 "start_time": 1,
                 "output_encoding": "utf-8",
             },
-            # 旧记录无启动时间且命令行也无法获取（psutil 缺失）
             "legacy": {
                 "id": "legacy",
                 "command": "demo",
@@ -456,7 +449,6 @@ def test_kill_returns_false_for_already_exited_task(tmp_path, monkeypatch):
 
 
 def test_kill_detailed_classifies_natural_death(tmp_path, monkeypatch):
-    """进程在 kill 之前已自行结束：细分类为 natural_death，bool 包装保持 False。"""
     monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
     monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
     monkeypatch.setattr(
@@ -479,8 +471,6 @@ def test_kill_detailed_classifies_natural_death(tmp_path, monkeypatch):
             }
         },
     )
-    # 启动时间与记录一致：进程身份可验证，排除 conservative 拒绝分支，
-    # 才能走到"进程已自行结束"的 natural_death 分类
     monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 1000.0)
     monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: False)
 
@@ -503,11 +493,6 @@ def test_kill_detailed_reports_not_found_for_unknown_task(tmp_path, monkeypatch)
 
 
 def test_list_active_tasks_reports_output_heartbeat(tmp_path, monkeypatch):
-    """list_active_tasks 携带输出心跳：字节数/距最后输出秒数/尚无实际输出标记。
-
-    GUI 任务面板据此在运行期区分"仍在运行只是暂无输出"（缓冲管道命令的
-    运行期日志天然只有启动标记一行）与"任务已失联"。
-    """
     task_id = "heartbeat"
     log_path = tmp_path / f"task_{task_id}.log"
     log_path.write_bytes("[turn:004b1e8b] 后台任务启动\n".encode("utf-8"))
@@ -542,7 +527,6 @@ def test_list_active_tasks_reports_output_heartbeat(tmp_path, monkeypatch):
 
     assert len(rows) == 1
     row = rows[0]
-    # 日志只有启动标记（约 30 字节）：no_output_yet=True 且心跳字段齐备
     assert row["no_output_yet"] is True
     assert 0 < row["output_size"] <= task_manager._STARTUP_MARKER_MAX_BYTES
     assert isinstance(row["last_output_age"], int)
@@ -550,7 +534,6 @@ def test_list_active_tasks_reports_output_heartbeat(tmp_path, monkeypatch):
     assert row["turn_id"] == "004b1e8b-rest-of-uuid"
     assert row["session_id"] == "sess"
 
-    # 日志出现实际输出后 no_output_yet 翻转，字节数跟随增长
     log_path.write_bytes("[turn:004b1e8b] 后台任务启动\n".encode("utf-8") + b"x" * 200)
     row = task_manager.list_active_tasks()[0]
     assert row["no_output_yet"] is False
@@ -558,7 +541,6 @@ def test_list_active_tasks_reports_output_heartbeat(tmp_path, monkeypatch):
 
 
 def test_list_active_tasks_missing_log_reports_zero_output(tmp_path, monkeypatch):
-    """日志文件缺失（被清理/尚未创建）时心跳字段安全回退，不抛异常。"""
     task_id = "no-log"
     monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
     monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))

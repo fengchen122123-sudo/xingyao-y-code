@@ -1,8 +1,5 @@
 <template>
   <div class="trace-row" :class="[`status-${row.status}`, { 'is-open': rowOpen }]">
-    <!-- 摘要行（ZCode 形态）：类别图标 + 类别 + 目标 + 统计/耗时 + 悬停才出现的箭头。
-         整行可点开合并后的详情区（文件清单 / Diff / 结果 / 子代理任务），
-         不再有"展开详情""展开 Diff"两级文字开关和卡片边框 -->
     <div
       class="trace-line"
       :class="{ 'can-toggle': canExpand }"
@@ -15,8 +12,6 @@
       @keydown.enter.prevent="onLineClick"
       @keydown.space.prevent="onLineClick"
     >
-      <!-- 星轨节点：类别色圆点串在一条轨道线上，运行中自带扩散光环；
-           失败/取消时圆点换成状态图标，整行仍是同一颗节点 -->
       <span class="trace-icon" :class="nodeToneClass" aria-hidden="true">
         <AppIcon
           v-if="nodeMark"
@@ -40,34 +35,56 @@
         v-if="canExpand"
         class="trace-caret"
         :class="{ 'is-open': rowOpen }"
-        name="chevron-right"
-        :size="11"
+        name="chevron-down"
+        :size="12"
         :stroke-width="2"
       />
     </div>
 
     <div v-if="rowOpen" class="trace-detail">
-      <!-- 电脑操控：该动作当帧的截图（按画面哈希反查）+ 目标说明 -->
       <div v-if="isComputerRow" class="computer-detail">
-        <img
-          v-if="computerShotUrl"
-          class="computer-shot"
-          :src="computerShotUrl"
-          alt="该动作当帧截图"
-        />
+        <div v-if="computerShotUrl" class="computer-shot-stage">
+          <img
+            class="computer-shot"
+            :src="computerShotUrl"
+            alt="该动作当帧截图"
+          />
+          <svg
+            v-if="matchedComputerOverlay"
+            class="computer-overlay"
+            data-test="computer-svg-overlay"
+            :viewBox="`0 0 ${matchedComputerOverlay.width} ${matchedComputerOverlay.height}`"
+            preserveAspectRatio="none"
+          >
+            <circle
+              v-if="matchedComputerOverlay.kind === 'point'"
+              :cx="matchedComputerOverlay.x"
+              :cy="matchedComputerOverlay.y"
+              r="14"
+            />
+            <line
+              v-else-if="matchedComputerOverlay.kind === 'drag'"
+              :x1="matchedComputerOverlay.x1"
+              :y1="matchedComputerOverlay.y1"
+              :x2="matchedComputerOverlay.x2"
+              :y2="matchedComputerOverlay.y2"
+            />
+          </svg>
+        </div>
         <div class="computer-params">
           <span v-if="row.detail">目标：{{ row.detail }}</span>
           <span v-if="computerShotUrl">画面：该动作当帧（按画面哈希匹配）</span>
           <span v-else>画面：该帧已过期，右侧「电脑操控」面板可看本 run 最新一张</span>
+          <span v-if="!matchedComputerOverlay" class="computer-trace-fallback" data-test="computer-trace-fallback">
+            轨迹：无匹配帧几何，仅展示文本摘要（不猜测坐标）
+          </span>
         </div>
       </div>
 
-      <!-- 分组读取 / 搜索：列出每个文件目标 -->
       <ul v-if="groupFiles.length > 0" class="trace-files">
         <li v-for="(file, fi) in groupFiles" :key="fi">{{ file }}</li>
       </ul>
 
-      <!-- 文件变更 Diff：展开本行即直接可见，不再做二级开关 -->
       <div v-if="diffs.length > 0" class="diff-body">
         <template v-for="(d, di) in diffs" :key="di">
           <div v-if="diffs.length > 1" class="diff-file">{{ d.file_path }}</div>
@@ -80,7 +97,6 @@
         </template>
       </div>
 
-      <!-- run_subagent 子代理任务快照 -->
       <div v-if="subagentTasks.length > 0" class="subagent-tasks">
         <div v-for="task in subagentTasks" :key="task.id" class="subagent-task">
           <span class="subagent-stage" :class="subagentStageClass(task)">{{ subagentStageLabel(task) }}</span>
@@ -119,7 +135,6 @@ const props = defineProps<{
 
 const store = useAppStore();
 
-// 本地展开状态：整行一个开关，只影响本行 UI，不写入任何 store
 const rowOpen = ref(false);
 
 function onLineClick() {
@@ -127,7 +142,6 @@ function onLineClick() {
   rowOpen.value = !rowOpen.value;
 }
 
-// 轨道节点按工具类别取色（颜色在 scoped 样式里映射到语义 token）
 const NODE_TONES: Record<ToolTraceRow['kind'], string> = {
   'read-group': 'read',
   'search-group': 'search',
@@ -146,13 +160,11 @@ const KIND_LABELS: Record<ToolTraceRow['kind'], string> = {
   mutation: '编辑',
   skill: '技能',
   computer: '电脑',
-  // run_subagent 派生的是子代理任务，与右侧「星舰 · 子代理」面板同名
   subagent: '星舰',
   tool: '工具',
   'legacy-diffs': '变更',
 };
 
-// 电脑操控行直接把动作动词当类别（观察 / 点击 / 输入…），其余行用固定类别名
 const kindLabel = computed(() =>
   props.row.kind === 'computer'
     ? props.row.action || '电脑'
@@ -160,7 +172,6 @@ const kindLabel = computed(() =>
 );
 const nodeToneClass = computed(() => `node-${NODE_TONES[props.row.kind] ?? 'tool'}`);
 
-// 只有失败/取消把圆点换成状态图标，其余状态一律是类别色圆点
 const nodeMark = computed(() => {
   if (props.row.status === 'failed') return 'x';
   if (props.row.status === 'cancelled') return 'ban';
@@ -181,7 +192,6 @@ const durationText = computed(() => {
   return '';
 });
 
-// 行尾：失败/取消优先给状态词（悬停看完整报错），其余给耗时
 const metaText = computed(() => {
   if (props.row.status === 'failed') return '失败';
   if (props.row.status === 'cancelled') return '已取消';
@@ -196,19 +206,16 @@ const metaClass = computed(() => {
   return '';
 });
 
-// 失败行的状态词悬停展示完整报错（对齐 ZCode 的虚线下划线 + tooltip）
 const metaTitle = computed(() =>
   props.row.status === 'failed' ? props.row.errorSummary || props.row.action : '',
 );
 
-// 悬停整行的完整说明
 const lineTitle = computed(() => {
   const parts = [props.row.action, props.row.detail || props.row.command];
   if (props.row.errorSummary) parts.push(props.row.errorSummary);
   return parts.filter(Boolean).join(' · ');
 });
 
-// 分组行（read-group / search-group）列出每个调用的目标文件
 const isGroup = computed(() => props.row.kind === 'read-group' || props.row.kind === 'search-group');
 const groupFiles = computed(() => {
   if (!isGroup.value) return [];
@@ -217,13 +224,39 @@ const groupFiles = computed(() => {
   );
 });
 
-// 行内目标：分组行给文件数（清单在展开区），命令行给命令原文，其余给路径
+function compactTargetDisplay(raw: string, isCommand: boolean): string {
+  let text = raw.trim();
+  if (!text) return '';
+  if (isCommand) {
+    const stripped = text
+      .replace(/^(?:cd(?:\s+\/d)?|Set-Location)\s+(?:"[^"]+"|'[^']+'|[^\s;&]+)\s*(?:;|&&)\s*/i, '')
+      .trim();
+    if (stripped) text = stripped;
+  }
+  if (text.length > 32 && /^(?:[a-zA-Z]:[/\\]|\/)/.test(text) && !text.includes(' ')) {
+    const parts = text.replace(/\\/g, '/').split('/').filter(Boolean);
+    if (parts.length >= 3) {
+      return `…/${parts.slice(-2).join('/')}`;
+    }
+  }
+  return text;
+}
+
+function shortPathBase(filePath: string): string {
+  const parts = filePath.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] || filePath;
+}
+
 const targetText = computed(() => {
   if (isGroup.value) return `${props.row.count} 个文件`;
-  return props.row.command || props.row.detail || '';
+  if (props.row.kind === 'legacy-diffs' && diffs.value.length > 1) {
+    const first = shortPathBase(diffs.value[0]?.file_path || '');
+    return first ? `${first} 等 ${diffs.value.length} 个文件` : `${diffs.value.length} 个文件`;
+  }
+  if (props.row.command) return compactTargetDisplay(props.row.command, true);
+  return compactTargetDisplay(props.row.detail || '', false);
 });
 
-// 汇总本行所有调用携带的 Diff 以及未绑定的历史 Diff
 const diffs = computed<LegacyDiff[]>(() => {
   const list: LegacyDiff[] = [];
   for (const call of props.row.calls) {
@@ -250,7 +283,6 @@ const diffStats = computed(() => {
   return null;
 });
 
-// run_subagent 调用携带的子代理任务快照
 const subagentTasks = computed<SubagentTaskSnapshot[]>(() =>
   props.row.calls.flatMap((call) => call.subagent_tasks ?? []),
 );
@@ -284,8 +316,6 @@ function subagentStageClass(task: SubagentTaskSnapshot) {
   return 'run';
 }
 
-// 子 Agent 超时接管标记：结果 JSON 带 handoff 字段时展示固定徽标，
-// 卡片状态保持 timed_out，不与 completed 合并
 const takeoverBadge = computed(() => {
   for (const call of props.row.calls) {
     const text = call.result?.result ?? '';
@@ -299,13 +329,11 @@ const takeoverBadge = computed(() => {
         return '等待主 Agent 接管';
       }
     } catch {
-      // 非 JSON 结果（普通失败文本等）不展示徽标，继续检查其他调用
     }
   }
   return '';
 });
 
-// 结果文本：只拼接有实际内容的调用结果，全部为空则不展示结果区
 const resultText = computed(() =>
   props.row.calls
     .map((call) => call.result?.result ?? '')
@@ -318,23 +346,63 @@ const hasResult = computed(() => resultText.value.trim().length > 0);
 // screen_sha256 去 store.computerShots 反查——不按"第几个动作"猜，也不把
 // store 里最新一张硬套到历史动作上，避免图与动作错配。
 const isComputerRow = computed(() => props.row.kind === 'computer');
-const computerShotUrl = computed(() => {
-  if (!isComputerRow.value) return '';
+const computerCallPayloads = computed(() => {
+  if (!isComputerRow.value) return [] as Array<Record<string, any>>;
+  const out: Array<Record<string, any>> = [];
   for (const call of props.row.calls) {
     const text = call.result?.result ?? '';
     if (!text) continue;
     try {
-      const payload = JSON.parse(text);
-      const sha = String(payload?.screen_sha256 || '');
-      if (sha) {
-        const url = store.computerShots[sha];
-        if (url) return url;
-      }
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object') out.push(parsed as Record<string, any>);
     } catch {
-      // 非 JSON 结果（错误文本等）不参与匹配
+    }
+  }
+  return out;
+});
+const computerShotUrl = computed(() => {
+  for (const payload of computerCallPayloads.value) {
+    const sha = String(payload?.screen_sha256 || '');
+    if (sha) {
+      const url = store.computerShots[sha];
+      if (url) return url;
     }
   }
   return '';
+});
+const matchedComputerOverlay = computed(() => {
+  for (const payload of computerCallPayloads.value) {
+    const sha = String(payload?.screen_sha256 || '');
+    const frameId = String(payload?.frame_id || '');
+    const geom = payload?.action_geometry;
+    if (!sha || !frameId || !geom || typeof geom !== 'object') continue;
+    const frameShot = store.computerFrameShots?.[sha];
+    if (!frameShot || !frameShot.frame_id || frameShot.frame_id !== frameId) continue;
+    const width = Number(frameShot.image_width || payload?.image_width || 0);
+    const height = Number(frameShot.image_height || payload?.image_height || 0);
+    if (!(width > 0 && height > 0)) continue;
+    if (geom.kind === 'point' && Number.isFinite(Number(geom.x)) && Number.isFinite(Number(geom.y))) {
+      return { kind: 'point' as const, width, height, x: Number(geom.x), y: Number(geom.y) };
+    }
+    if (
+      geom.kind === 'drag'
+      && Number.isFinite(Number(geom.x1))
+      && Number.isFinite(Number(geom.y1))
+      && Number.isFinite(Number(geom.x2))
+      && Number.isFinite(Number(geom.y2))
+    ) {
+      return {
+        kind: 'drag' as const,
+        width,
+        height,
+        x1: Number(geom.x1),
+        y1: Number(geom.y1),
+        x2: Number(geom.x2),
+        y2: Number(geom.y2),
+      };
+    }
+  }
+  return null;
 });
 
 // 有展开内容时整行才可点：否则不挂 role=button、不显示箭头（对齐 ZCode 的 canToggle=false）
@@ -363,7 +431,6 @@ function diffLineClass(line: string) {
 </script>
 
 <style scoped>
-/* 每条工具 = 一行摘要（无边框无底色，宽度贴合内容）+ 按需展开的缩进详情 */
 .trace-row {
   margin: 0;
 }
@@ -373,70 +440,60 @@ function diffLineClass(line: string) {
   gap: 8px;
   width: fit-content;
   max-width: 100%;
-  padding: 3px 8px 3px 0;
+  padding: 2px 6px 2px 2px;
   border-radius: 6px;
-  font-size: 12.5px;
-  color: var(--text-faint);
-  transition: background 0.12s ease;
+  font-size: 13px;
+  line-height: 1.375;
+  color: var(--xy-text-2, var(--text-faint));
+  transition: opacity 0.12s ease, background 0.12s ease;
 }
 .trace-line.can-toggle {
   cursor: pointer;
 }
 .trace-line.can-toggle:hover {
-  background: color-mix(in srgb, var(--text) 5%, transparent);
+  opacity: 0.85;
 }
 .trace-line.can-toggle:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--xy-accent, var(--accent));
   outline-offset: 1px;
 }
-/* 箭头平时不出现，悬停 / 键盘聚焦 / 已展开时才浮现（与思考块一致） */
 .trace-line.can-toggle:hover .trace-caret,
 .trace-line.can-toggle:focus-visible .trace-caret,
 .trace-caret.is-open {
   opacity: 1;
 }
-/* 节点列：固定 18px 宽，圆点居中落在轨道线上 */
 .trace-icon {
   position: relative;
   flex: none;
-  width: 18px;
-  height: 18px;
+  width: 10px;
+  height: 16px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-dim);
+  color: var(--xy-green, var(--green));
 }
-/* 轨道线：贯穿摘要行高度，相邻行首尾相接成为一条连续竖线；
-   首行从节点中心起、末行到节点中心止，线不会伸出整组两端 */
-.trace-icon::before {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: -3px;
-  bottom: -3px;
-  width: 1px;
-  margin-left: -0.5px;
-  background: var(--border);
+.trace-icon.node-subagent,
+.trace-icon.node-skill {
+  color: #8b5cf6;
 }
-.trace-row.trace-first .trace-icon::before {
-  top: 50%;
+.trace-icon.node-read,
+.trace-icon.node-search,
+.trace-icon.node-command,
+.trace-icon.node-mutation,
+.trace-icon.node-computer,
+.trace-icon.node-tool,
+.trace-icon.node-legacy {
+  color: var(--xy-green, var(--green));
 }
-.trace-row.trace-last .trace-icon::before {
-  bottom: 50%;
+.status-running .trace-icon {
+  color: var(--xy-accent, var(--accent));
 }
-/* 类别色：读取蓝 / 搜索青 / 运行绿 / 编辑橙 / 技能紫 / 通用灰 / 历史变更黄 */
-.trace-icon.node-read { color: var(--accent); }
-.trace-icon.node-search { color: var(--cyan); }
-.trace-icon.node-command { color: var(--green); }
-.trace-icon.node-mutation { color: var(--orange); }
-.trace-icon.node-skill { color: var(--purple); }
-.trace-icon.node-computer { color: var(--cyan); }
-.trace-icon.node-subagent { color: var(--purple); }
-.trace-icon.node-tool { color: var(--text-dim); }
-.trace-icon.node-legacy { color: var(--yellow); }
-.status-failed .trace-icon { color: var(--red); }
-.status-cancelled .trace-icon { color: var(--orange); }
-/* 节点圆点：当前色实心点，完成/取消后收一点透明度，运行中保持满亮 */
+.status-failed .trace-icon {
+  color: var(--xy-rose, var(--red));
+}
+.status-cancelled .trace-icon {
+  color: var(--xy-amber, var(--orange));
+}
 .trace-node-dot {
   position: relative;
   z-index: 1;
@@ -445,52 +502,36 @@ function diffLineClass(line: string) {
   border-radius: 50%;
   background: currentColor;
 }
-.status-completed .trace-node-dot {
-  opacity: 0.55;
+.status-running .trace-node-dot {
+  width: 8px;
+  height: 8px;
+  animation: xy-dot-pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
-/* 运行中：圆点外圈持续扩散的脉冲光环（替代文字扫光） */
 .trace-node-pulse {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 6px;
-  height: 6px;
-  margin: -3px 0 0 -3px;
-  border-radius: 50%;
-  background: currentColor;
-  animation: trace-node-pulse 2s ease-out infinite;
-  pointer-events: none;
+  display: none;
 }
-@keyframes trace-node-pulse {
-  0% {
-    transform: scale(1);
-    opacity: 0.4;
-  }
-  70%,
-  100% {
-    transform: scale(2.8);
-    opacity: 0;
-  }
+@keyframes xy-dot-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.35); opacity: 0.35; }
 }
 .trace-node-mark {
   position: relative;
   z-index: 1;
-} 
-/* 运行中不转圈：图标保持静态，状态交给扫光标签与行尾耗时 */
+}
 .trace-kind {
   flex: none;
   font-weight: 500;
   white-space: nowrap;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
 }
 .trace-kind.is-live {
-  color: var(--text-bright);
+  color: var(--xy-accent, var(--accent));
 }
 .trace-target {
   min-width: 0;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--xy-text, var(--text));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -499,7 +540,7 @@ function diffLineClass(line: string) {
   flex: none;
   font-size: 10.5px;
   font-weight: 600;
-  color: var(--orange);
+  color: var(--xy-amber, var(--orange));
   border: 1px solid currentColor;
   border-radius: 999px;
   padding: 0 7px;
@@ -508,51 +549,52 @@ function diffLineClass(line: string) {
 .trace-diff-badge {
   flex: none;
   display: inline-flex;
-  gap: 4px;
+  gap: 5px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
 }
 .trace-diff-badge .add {
-  color: var(--green);
+  color: var(--xy-green, var(--green));
 }
 .trace-diff-badge .del {
-  color: var(--red);
+  color: var(--xy-green, var(--green));
 }
 .trace-meta {
   flex: none;
-  font-size: 11px;
-  color: var(--text-faint);
+  font-size: 12px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--xy-text-3, var(--text-faint));
 }
-/* 失败：红色状态词 + 虚线下划线，悬停出完整报错 */
 .trace-meta.is-error {
-  color: var(--red);
+  color: var(--xy-rose, var(--red));
   text-decoration: underline dotted;
   text-underline-offset: 3px;
   cursor: help;
 }
 .trace-meta.is-warn {
-  color: var(--orange);
+  color: var(--xy-amber, var(--orange));
 }
 .trace-meta.is-live {
-  color: var(--accent);
+  color: var(--xy-accent, var(--accent));
 }
 .trace-caret {
   flex: none;
-  opacity: 0;
-  color: var(--text-faint);
+  opacity: 0.75;
+  color: var(--xy-text-3, var(--text-faint));
   transition: opacity 0.12s ease, transform 0.15s ease;
 }
 .trace-caret.is-open {
-  transform: rotate(90deg);
+  transform: rotate(180deg);
 }
 
-/* 展开区：左侧细线与轨道线同一条竖线（9px 处），视觉上属于同一个节点 */
 .trace-detail {
-  margin: 0 0 4px 9px;
-  padding: 2px 0 6px 13px;
-  border-left: 1px solid var(--border);
+  margin: 2px 0 4px 18px;
+  padding: 0;
+  border-left: none;
   font-size: 12px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 .trace-files {
   margin: 0;
@@ -568,6 +610,12 @@ function diffLineClass(line: string) {
   flex-direction: column;
   gap: 6px;
 }
+.computer-shot-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  width: fit-content;
+}
 .computer-shot {
   display: block;
   max-width: 100%;
@@ -575,6 +623,23 @@ function diffLineClass(line: string) {
   width: auto;
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+.computer-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.computer-overlay circle {
+  fill: rgba(255, 86, 48, 0.18);
+  stroke: #ff5630;
+  stroke-width: 3;
+}
+.computer-overlay line {
+  stroke: #ff5630;
+  stroke-width: 3;
+  stroke-linecap: round;
 }
 .computer-params {
   display: flex;

@@ -1,5 +1,3 @@
-"""Dependency-aware execution scheduler for persisted plan items."""
-
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +21,6 @@ VerificationRunner = Callable[[str], tuple[bool, str]]
 
 
 def takeover_handoff_payload(item: dict[str, Any]) -> dict[str, Any]:
-    """构造 GUI/CLI 共用的接管事件载荷。"""
     event_item = deepcopy(item)
     return {
         "item": event_item,
@@ -50,7 +47,6 @@ def _reap_process_output(process: subprocess.Popen) -> None:
 
 
 def _stop_process_tree(process: subprocess.Popen) -> None:
-    """先 terminate 整棵进程树，超时后强制 kill 并 wait 回收，避免验证进程泄露。"""
     try:
         if os.name == "nt":
             subprocess.run(
@@ -81,8 +77,6 @@ class TaskScheduler:
         self,
         plan: PlanManager,
         *,
-        # 与 core/tools.py 的 _MAX_CONCURRENT_SUBAGENTS 对齐：调度上限低于
-        # 子代理并发上限时，模型按并发上限启动的最后一批认领会永远失败
         max_workers: int = 5,
         event_callback: SchedulerCallback | None = None,
         verification_runner: VerificationRunner | None = None,
@@ -108,11 +102,6 @@ class TaskScheduler:
         self._reset_orphaned_in_progress()
 
     def _reset_orphaned_in_progress(self) -> None:
-        """新调度器接管计划时兜底复位遗留 in_progress 项。
-
-        新实例的在途集合必然为空，此时任何 in_progress 项都是上一任调度器
-        异常退出（未走 shutdown/cancel_all）留下的孤儿：ready_items 不会选中它，
-        retry 也拒绝从 in_progress 恢复，不复位就会永久卡死。"""
         for item in self.plan.snapshot():
             if item.get("status") != "in_progress":
                 continue
@@ -169,7 +158,6 @@ class TaskScheduler:
                 return []
             for blocked in self._mark_blocked_dependencies():
                 pending_events.append(("plan_item_blocked", blocked))
-            # 依赖项可能被 plan_update 直接重置为 pending，启动前同步自愈 blocked 项
             self._revive_blocked_items()
             selected: list[dict[str, Any]] = []
             claimed = set(self._in_flight_files)
@@ -207,7 +195,6 @@ class TaskScheduler:
                 return False
             for blocked in self._mark_blocked_dependencies():
                 pending_events.append(("plan_item_blocked", blocked))
-            # 依赖项可能被 plan_update 直接重置为 pending，启动前同步自愈 blocked 项
             self._revive_blocked_items()
             item = next((candidate for candidate in self.plan.snapshot() if candidate["id"] == item_id), None)
             started_item = None
@@ -256,8 +243,6 @@ class TaskScheduler:
         ready_ids: set[str] | None = None,
     ) -> dict[str, Any] | None:
         files = set(item.get("files", []))
-        # 调用方未提供共享快照时才自行查询，且只查一次（旧实现连续调用两次
-        # ready_items，两次快照之间可能被其他线程改写导致判定不一致）
         if ready_ids is None:
             ready_ids = {candidate["id"] for candidate in self.plan.ready_items()}
         if item["id"] not in ready_ids:
@@ -315,13 +300,6 @@ class TaskScheduler:
     def _report_writeback_rejected(
         self, item_id: str, action: str, item: dict[str, Any] | None
     ) -> None:
-        """完成/失败回写被拒时显式上报，不再静默 return False。
-
-        回写只认 in_progress。子代理回调晚于回合结束（项已被降级为
-        pending/takeover_queued）时，静默丢弃会让"任务已干完、状态却一直不动"
-        没有任何可观测线索，因此这里同时写日志并发 plan_writeback_rejected 事件，
-        由 CLI/GUI 提示用户。
-        """
         if item is None:
             reason = f"{action} 回写被拒绝：计划项不存在。"
         else:
@@ -332,8 +310,6 @@ class TaskScheduler:
                 "只有 in_progress 状态才允许回写。"
             )
         _LOGGER.warning("计划项 %s %s", item_id, reason)
-        # 事件名不带 plan_item_ 前缀：CLI 把该前缀一律按"计划项状态变化"渲染，
-        # 复用会把该项显示成它原本的 pending 状态，反而误导用户
         self._emit("plan_writeback_rejected", {
             "item_id": str(item_id),
             "action": str(action),
@@ -425,8 +401,6 @@ class TaskScheduler:
         # 重开时清空 result/error 与执行租约，语义等同一次全新尝试。
         if item["status"] not in {"failed", "blocked", "cancelled", "completed"}:
             return False
-        # 已经发生超时接手的项只能显式 resume_takeover；普通 retry 会把它
-        # 重新下发给子代理，违反“超时一次后主 Agent 接手”的业务约束。
         if bool(item.get("takeover_required", False)):
             return False
         updated = self.plan.transition_execution(
@@ -454,19 +428,12 @@ class TaskScheduler:
         owner: str,
         event_callback: SchedulerCallback | None,
     ) -> bool:
-        """认领一个 pending 计划项交给真实子代理执行，并原子绑定执行租约字段。
-
-        与 start_item 的差异：同一临界区内额外写入 execution_mode=delegated、
-        delegation_count+1 与 handoff_task_id=source_task_id（真实子代理任务 id，
-        不得用角色名或事后猜测值代替），供超时移交 handoff_to_main 校验执行租约。
-        """
         pending_events: list[tuple[str, dict[str, Any]]] = []
         with self._lock:
             if self._paused:
                 return False
             for blocked in self._mark_blocked_dependencies():
                 pending_events.append(("plan_item_blocked", blocked))
-            # 依赖项可能被 plan_update 直接重置为 pending，启动前同步自愈 blocked 项
             self._revive_blocked_items()
             item = self._item(item_id)
             started_item = None
@@ -516,15 +483,6 @@ class TaskScheduler:
         parent_turn_id: str,
         reason: str,
     ) -> dict[str, Any] | None:
-        """子代理首次超时后把计划项移交给主 Agent（同一次尝试的延续）。
-
-        调度器锁内校验：项目存在、status=in_progress、execution_mode=delegated、
-        source_task_id 与真实执行租约 handoff_task_id 完全一致。
-        同一会话已有 active 接管项时进入 takeover_queued FIFO 队列；
-        否则直接成为 main_takeover 并绑定 owner=main:<turn_id>。
-        状态保持 in_progress 且不增加 attempts——接管属于同一次尝试的继续。
-        校验失败返回 None，绝不把超时改写成普通 failed。
-        """
         with self._lock:
             item = self._item(item_id)
             if (
@@ -595,11 +553,6 @@ class TaskScheduler:
             return None
 
     def claim_takeover_for_turn(self, parent_turn_id: str) -> dict[str, Any] | None:
-        """为真实主回合认领最早的接管项，并回收已死亡回合的旧租约。
-
-        同一 turn 重复调用幂等返回当前项；不同 turn 到来时先把旧 active
-        原子降级回 FIFO 队列，再按 sequence 认领，保证崩溃恢复后仍可继续。
-        """
         turn_id = str(parent_turn_id).strip()
         if not turn_id:
             return None
@@ -716,8 +669,6 @@ class TaskScheduler:
             return None
         with self._lock:
             item = self._item(item_id)
-            # takeover_queued 的 in_progress 项同样允许恢复：它是「等待主 Agent
-            # 接管」的排队态，旧守卫只看 status 会把它误判为正在执行而永久锁死。
             queued_in_progress = (
                 item is not None
                 and item.get("status") == "in_progress"
@@ -757,12 +708,6 @@ class TaskScheduler:
             return resumed
 
     def promote_next_takeover(self, parent_turn_id: str) -> dict[str, Any] | None:
-        """把 FIFO 队列中最早的 queued 项提升为 active 接管项并绑定新 turn。
-
-        已有 active 接管项（无论归属哪个 turn）时不提升——一个会话同一时刻
-        只允许一个 active 主 Agent 接管项。崩溃恢复后的 queued 项可能是
-        pending 状态（load 已复位），提升时同时恢复 in_progress。
-        """
         with self._lock:
             if self._active_takeover_locked() is not None:
                 return None
@@ -834,10 +779,6 @@ class TaskScheduler:
         return cancelled
 
     def shutdown(self) -> None:
-        """会话被切换后调用：终止在途验证进程并清空在途记录。
-
-        计划仍绑定原会话时把在途项回写 pending；计划已被新会话接管时
-        （bind_session 已替换全部计划项）不回写，避免误改新会话同名计划项。"""
         with self._lock:
             processes = list(self._verification_processes.values())
             self._verification_processes.clear()
@@ -943,7 +884,6 @@ class TaskScheduler:
         output_encoding = platform_console_encoding()
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = output_encoding
-        # 与 execute_command 的执行环境保持一致
         env["PYTHONUTF8"] = "0"
         # 不设置 cwd：验证命令必须和 execute_command 一样在项目工作目录下执行。
         # 历史上这里会根据计划项 files 把 cwd 偷换成文件所在目录，导致模型按项目根
@@ -1003,10 +943,6 @@ _DEFAULT_SCHEDULER_SESSION: str | None = None
 # 否则同一计划项会被两个调度器重复认领执行
 _DEFAULT_SCHEDULER_LOCK = threading.RLock()
 
-# 多会话并行：线程绑定了计划会话时，调度器按会话分桶（互不取消、互不阻塞）。
-# 原先"会话切换即 cancel_all"的单例语义只保留给未绑定线程（CLI 单会话主流程）
-# ——CLI 的 _DEFAULT_PLAN_MANAGER 是就地重绑的同一个对象，不收尾旧调度器
-# 会让在途计划项把结果写进切换后的新会话计划。
 _PARALLEL_SCHEDULERS: dict[str, TaskScheduler] = {}
 
 
@@ -1014,12 +950,6 @@ def get_default_scheduler(
     *,
     event_callback: SchedulerCallback | None = None,
 ) -> TaskScheduler:
-    """Return the scheduler for the currently bound plan session.
-
-    绑定线程（GUI 回合/子代理）：按会话取专属调度器，其他会话的调度器
-    不受影响（并行回合永不互相取消）。未绑定线程（CLI/测试主线程）：
-    维持进程级单例 + 切会话收尾的旧语义。
-    """
     from core.plan import get_bound_plan_session, get_default_plan_manager
 
     bound_session = get_bound_plan_session()
@@ -1037,7 +967,6 @@ def get_default_scheduler(
     global _DEFAULT_SCHEDULER, _DEFAULT_SCHEDULER_SESSION
     plan = get_default_plan_manager()
     session_id = plan.session_id
-    # 读取-判定-创建全程持锁（RLock 允许会话切换时 cancel_all 的事件回调重入）
     with _DEFAULT_SCHEDULER_LOCK:
         if _DEFAULT_SCHEDULER is not None and _DEFAULT_SCHEDULER_SESSION != session_id:
             # 会话切换时收尾旧调度器，避免 in-flight 项回调失联；

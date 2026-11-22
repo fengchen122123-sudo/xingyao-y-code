@@ -15,6 +15,7 @@
     "max_output_bytes": 1048576
   },
   "search_exclude_dirs": ["target", "out", "bin", "obj"],
+  "subagent_enabled": true,
   "prompt_cache_keepalive_seconds": 0,
   "route_request_overrides": [
     {

@@ -1,5 +1,3 @@
-"""C2：Hooks 配置加载与 matcher 测试（H-T1 / H-T2）。"""
-
 from __future__ import annotations
 
 import json
@@ -69,11 +67,11 @@ def test_bad_entry_is_skipped_but_good_entries_kept(tmp_path):
         user_payload={
             "hooks": {
                 "Stop": [
-                    {"command": ""},  # 缺 command → 跳过
+                    {"command": ""},
                     {"command": "ok1"},
-                    {"command": "ok2", "timeout_ms": True},  # bool 不是合法超时 → 跳过
-                    {"command": "ok3", "disabled": True},  # disabled → 跳过
-                    {"command": "ok4", "matcher": ""},  # 空 matcher → 跳过
+                    {"command": "ok2", "timeout_ms": True},
+                    {"command": "ok3", "disabled": True},
+                    {"command": "ok4", "matcher": ""},
                 ]
             }
         },
@@ -87,10 +85,10 @@ def test_unknown_event_and_timeout_bounds(tmp_path):
         tmp_path,
         user_payload={
             "hooks": {
-                "NopeEvent": [{"command": "x"}],  # 未知事件 → 跳过该事件
+                "NopeEvent": [{"command": "x"}],
                 "Stop": [
-                    {"command": "a", "timeout_ms": 99999999},  # 超上限 → 截断
-                    {"command": "b", "timeout_ms": 0},  # 非正数 → 跳过
+                    {"command": "a", "timeout_ms": 99999999},
+                    {"command": "b", "timeout_ms": 0},
                 ],
             }
         },
@@ -116,7 +114,6 @@ def test_registration_matches_non_tool_events_always(tmp_path):
     reg = registry.load()[0]
     # Stop 事件下 matcher 不生效（默认全匹配）——否则用户配置的 Stop hook 会静默失联
     assert registration_matches(reg, HookEvent.STOP, tool_name="") is True
-    # PreToolUse 事件下事件不同 → 不匹配
     assert registration_matches(reg, HookEvent.PRE_TOOL_USE, tool_name="write_file") is False
 
 
@@ -136,11 +133,7 @@ def test_missing_files_are_silently_skipped(tmp_path):
     assert registry.load() == []
 
 
-# ── disabled 条目可见性（管理列表口径；执行侧默认行为不变）────────────
-
-
 def test_disabled_entry_hidden_by_default_visible_with_include_disabled(tmp_path):
-    """disabled 条目：默认跳过（执行侧口径）；include_disabled=True 时可见带标记。"""
     registry = _registry(
         tmp_path,
         user_payload={
@@ -152,21 +145,17 @@ def test_disabled_entry_hidden_by_default_visible_with_include_disabled(tmp_path
             }
         },
     )
-    # 默认模式 = 执行侧口径：disabled 条目不可见，行为与改造前完全一致
     default_regs = registry.load()
     assert [r.command for r in default_regs] == ["on-hook"]
     assert default_regs[0].disabled is False
 
-    # 管理列表口径：禁用条目保留，且 disabled 标记如实读出
     visible_regs = registry.load(include_disabled=True)
     assert [r.command for r in visible_regs] == ["off-hook", "on-hook"]
     assert [r.disabled for r in visible_regs] == [True, False]
-    # 两种口径下同一条目的 digest 一致（disabled 不参与指纹，不干扰信任记录）
     assert default_regs[0].digest == visible_regs[1].digest
 
 
 def test_disabled_entry_digest_matches_field_whitelist(tmp_path):
-    """disabled 不参与 digest：与 compute_hook_digest 的字段白名单口径一致。"""
     registry = _registry(
         tmp_path,
         user_payload={"hooks": {"Stop": [{"command": "c1", "disabled": True}]}},
@@ -185,13 +174,12 @@ def test_disabled_entry_digest_matches_field_whitelist(tmp_path):
 
 
 def test_invalid_disabled_value_skipped_in_both_modes(tmp_path):
-    """非法 disabled 值（非 bool）：两种模式下都跳过（warning），不放行也不隐藏。"""
     registry = _registry(
         tmp_path,
         user_payload={
             "hooks": {
                 "Stop": [
-                    {"command": "bad", "disabled": "true"},  # 字符串不是合法 bool
+                    {"command": "bad", "disabled": "true"},
                     {"command": "good"},
                 ]
             }
@@ -202,7 +190,6 @@ def test_invalid_disabled_value_skipped_in_both_modes(tmp_path):
 
 
 def test_project_scope_disabled_visible_with_include_disabled(tmp_path):
-    """项目级目录（workspace_root 派生路径）同样遵循 include_disabled 口径。"""
     registry = _registry(
         tmp_path,
         project_payload={

@@ -169,11 +169,8 @@
 import { onBeforeUnmount, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
 
-// 插件设置页详情面板：只负责「某个插件」的设置页渲染与交互，由父组件决定挂载哪个插件
 const props = defineProps<{
-  // 要展示的插件名（必填）
   name: string;
-  // 父组件自增该值即强制重新加载当前插件的设置页
   reloadKey?: number;
 }>();
 
@@ -259,7 +256,6 @@ function onFormSubmit(section: any) {
   runAction(submit.action, { values: { ...formValues.value } });
 }
 
-// table section：cells 的键对应 columns[].key，缺列按空串；单元格值允许 \n 换行（拆成多行渲染）
 function cellLines(row: any, col: any): string[] {
   const raw = row?.cells ? row.cells[col?.key] : undefined;
   if (raw === undefined || raw === null) return [''];
@@ -270,7 +266,6 @@ function cellText(row: any, col: any): string {
   return cellLines(row, col).join('\n');
 }
 
-// columns[].badge = true 的列用 rows[].badges[key].tone 上色，缺省给 muted
 function cellBadgeTone(row: any, col: any): string {
   const tone = row?.badges?.[col?.key]?.tone;
   return tone ? String(tone) : 'muted';
@@ -298,7 +293,9 @@ async function trustSelected() {
   if (!target) return;
   const ok = await store.askConfirm(
     '信任插件', '信任后插件代码将被执行',
-    `确定信任插件「${target}」并启用吗？`
+    `确定信任插件「${target}」并启用吗？`,
+    '信任并启用',
+    { tone: 'warning' },
   );
   if (!ok) return;
   busy.value = true;
@@ -356,7 +353,6 @@ async function copyAuthUrl() {
   }
 }
 
-// 插件名变化或父组件自增 reloadKey：重载该插件的设置页（名称为空则清空并停轮询）
 watch(
   () => [props.name, props.reloadKey],
   () => {
@@ -392,7 +388,6 @@ onBeforeUnmount(() => stopPoll());
 .chip-btn.primary { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
 .chip-btn.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, var(--border)); }
 
-/* 声明式渲染器：状态徽标 / 信息行 / 列表行 / 动作区 / 授权框 */
 .plugin-badge { flex-shrink: 0; padding: 1px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg3); color: var(--text-faint); font-size: 10.5px; white-space: nowrap; }
 .plugin-badge.tone-ok { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, var(--border)); }
 .plugin-badge.tone-warn { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 35%, var(--border)); }
@@ -412,7 +407,6 @@ onBeforeUnmount(() => stopPoll());
 .plugin-list-actions { display: flex; gap: 7px; flex-shrink: 0; }
 .plugin-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 
-/* 表格控件（第六类 section）：窄屏横向滚动而不是挤爆布局 */
 .plugin-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .plugin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .plugin-table th { padding: 8px 10px; border-bottom: 1px solid var(--border); color: var(--text-faint); font-size: 11.5px; font-weight: 500; text-align: left; white-space: nowrap; }
@@ -427,7 +421,6 @@ onBeforeUnmount(() => stopPoll());
 .plugin-auth-box { margin-top: 20px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }
 .plugin-auth-url { margin: 6px 0 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg1); color: var(--text-dim); font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
 
-/* 表单字段（文本 / 密码 / 下拉） */
 .plugin-field input[type='text'],
 .plugin-field input[type='password'],
 .plugin-field select { width: 100%; min-height: 38px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--text); font-size: 13px; padding: 0 12px; outline: none; transition: 0.15s; }
@@ -435,7 +428,6 @@ onBeforeUnmount(() => stopPoll());
 .plugin-field input[type='password']:focus,
 .plugin-field select:focus { border-color: var(--accent); }
 
-/* 开关 Pill（与 HooksSettings 同款） */
 .switch { position: relative; display: inline-block; width: 34px; height: 18px; cursor: pointer; flex-shrink: 0; }
 .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
 .switch-track { position: absolute; inset: 0; background: var(--bg3); border: 1px solid var(--border); border-radius: 99px; transition: 0.15s; }
@@ -443,10 +435,8 @@ onBeforeUnmount(() => stopPoll());
 .switch input:checked + .switch-track { background: var(--accent); border-color: transparent; }
 .switch input:checked + .switch-track::before { transform: translateX(16px); background: #fff; }
 
-/* 手机端：面板可被设置页左侧导航直接挂载，父级不一定带 settings-page--mobile，这里兜一份与原值一致的间距 */
 @media (max-width: 768px) {
   .provider-detail { padding: 38px; }
-  /* 过度窄屏：给表格一个最小宽度，由 .plugin-table-wrap 横向滚动承载 */
   .plugin-table { min-width: 480px; }
 }
 </style>

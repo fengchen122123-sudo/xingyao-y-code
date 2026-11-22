@@ -16,12 +16,10 @@ import {
 // 与 composable 里的 key 保持一致（硬编码是为了「改 key 就会红」）
 const STORAGE_KEY = 'ycode.appGlass';
 
-/** 根变量由 CSS 的 body::after 消费；读 documentElement 上的 inline 值即最终效果。 */
 function rootVar(name: string): string {
   return document.documentElement.style.getPropertyValue(name).trim();
 }
 
-/** composable 的状态是模块级的，同一测试文件内需要手动归零（默认 = 关闭）。 */
 async function resetGlass() {
   setGlassOpacity(0);
   setGlassBlur(0);
@@ -39,8 +37,6 @@ describe('appGlass - 全局玻璃层 composable', () => {
   });
 
   it('默认 0：两个根变量都是 0，玻璃层不产生可见效果', () => {
-    // 冷启动路径：localStorage 里没有偏好 → loadAppGlass() 写回 0%，即 body::after 的
-    // color-mix 混入 0% 前景色、blur(0px) 为空操作，与未加玻璃层前完全一致。
     loadAppGlass();
     expect(glassOpacity.value).toBe(0);
     expect(glassBlur.value).toBe(0);
@@ -90,7 +86,6 @@ describe('appGlass - 全局玻璃层 composable', () => {
     loadAppGlass();
     expect(glassOpacity.value).toBe(60);
     expect(glassBlur.value).toBe(18);
-    // loadAppGlass 内部同步 apply()，无需等 watch 的微任务
     expect(rootVar('--app-glass-opacity')).toBe('60%');
     expect(rootVar('--app-glass-blur')).toBe('18px');
   });
@@ -175,7 +170,6 @@ describe('AppGlassCard - 设置卡片交互', () => {
     expect([glassOpacity.value, glassBlur.value]).toEqual([0, 0]);
     expect(rootVar('--app-glass-opacity')).toBe('0%');
     expect(rootVar('--app-glass-blur')).toBe('0px');
-    // 预设同样是持久化状态：写回 localStorage
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY) as string)).toEqual({
       opacity: 0,
       blur: 0,

@@ -1,0 +1,17 @@
+{
+  "name": "xingyao-pet",
+  "productName": "星瑶",
+  "version": "1.0.0",
+  "description": "星瑶 · 桌面宠物（帧动画 / 透明置顶 / 不抢焦点）",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node scripts/start.js",
+    "pack": "electron-builder --dir",
+    "dist:mac": "electron-builder --mac --arm64 --x64",
+    "dist:win": "electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0",
+    "electron-builder": "^26.0.0"
+  }
+}

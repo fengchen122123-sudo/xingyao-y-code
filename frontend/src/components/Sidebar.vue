@@ -1,11 +1,6 @@
 <template>
   <div id="sidebar" data-theme-region="sidebar" :class="{ collapsed: store.sidebarCollapsed }" :style="panelStyle">
-      <!-- QQ2009 皮肤专属：主面板用户卡（装饰性，仅内置 QQ2009 主题激活时渲染；
-           样式在 themes/qq2009.css 的 §2 小节，本组件不加样式） -->
       <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-user-card">
-        <!-- 头像：点击换自定义头像（隐藏 input 转交原生文件框，见 qq09PickAvatar）。
-             img 盖住默认企鹅底图（z-index 1，状态点 2）；GIF 的 DataURL 放进
-             img.src 即按帧自动播放，无需额外处理。状态点保持原样叠在右下角。 -->
         <div class="qq09-avatar" title="点击更换头像" @click="qq09PickAvatar">
           <img v-if="qq09AvatarData" class="qq09-avatar-img" :src="qq09AvatarData" alt="用户头像">
           <button
@@ -16,10 +11,8 @@
             title="恢复默认头像"
             @click.stop="qq09ResetAvatar"
           >×</button>
-          <!-- 状态点颜色由 :data-status 驱动（六色见 qq2009.css，与下方状态行同源） -->
           <span class="qq09-status-dot" :data-status="qq09Status" />
         </div>
-        <!-- 隐藏文件框：仅由头像点击触发（hidden 不占布局，也不参与用户卡 flex 排布） -->
         <input
           ref="qq09AvatarInputRef"
           type="file"
@@ -31,7 +24,6 @@
         <div class="qq09-user-meta">
           <div class="qq09-user-name">
             <template v-if="!qq09EditingName">
-              <!-- 不再用 :title（浏览器默认 tooltip），超长时改用自定义气泡 qq09Tip -->
               <span
                 class="qq09-user-name-text"
                 @mouseenter="qq09ShowTip($event, qq09UserName)"
@@ -54,7 +46,6 @@
               @blur="qq09SaveName"
             >
           </div>
-          <!-- 个性签名：与昵称同款就地编辑（铅笔 → 输入框 → 保存） -->
           <div class="qq09-user-sign">
             <template v-if="!qq09EditingSign">
               <span
@@ -78,7 +69,6 @@
               @blur="qq09SaveSign"
             >
           </div>
-          <!-- 在线状态：触发器 + 就地下拉（非原生 select）；图标为纯 CSS 圆点，无 emoji/图片 -->
           <div ref="qq09StatusRef" class="qq09-user-status">
             <button
               type="button"
@@ -109,8 +99,6 @@
               </button>
             </div>
           </div>
-          <!-- QQ 等级：图标为纯 CSS 绘制（太阳/月亮/星星，无 emoji/图片），
-               数量与种类由 QQ09_LEVEL_ICONS 按 16/4/1 换算；与状态胶囊同一行排布 -->
           <div class="qq09-user-level" data-test="qq09-user-level" :title="`QQ等级 ${QQ09_LEVEL} 级`">
             <span
               v-for="(icon, i) in QQ09_LEVEL_ICONS"
@@ -121,8 +109,6 @@
             />
           </div>
         </div>
-        <!-- 自定义气泡提示（网名 / 签名超长时显示完整文本）：fixed 定位，不参与用户卡
-             弹性布局；作为 hover 元素的兄弟节点渲染，状态不落在元素内部，编辑态切换不残留 -->
         <span
           v-if="qq09Tip.show"
           class="qq09-tip"
@@ -132,52 +118,49 @@
         >{{ qq09Tip.text }}</span>
       </div>
 
-      <!-- QQ2009 皮肤专属：搜索框，点击打开既有的会话搜索弹窗 -->
       <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-search" data-test="qq09-search" @click="store.openSessionSearchModal()">
         🔍 搜索会话、联系人…
       </div>
 
     <div class="side-menu">
-      <div class="menu-item" @click="newSession()">
-        <span class="mi-ico">✎</span>
+      <div class="menu-item menu-new-session" @click="newSession()">
+        <span class="mi-ico"><AppIcon name="pencil" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">新会话</span>
         <span
-          class="mi-count"
+          class="mi-workdir"
           :title="store.currentWorkdirLabel"
         >{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
-        <span class="mi-arrow">＋</span>
+        <span class="mi-plus"><AppIcon name="plus" :size="14" :stroke-width="2.5" /></span>
       </div>
       <div class="menu-item" @click="openSkills()">
-        <span class="mi-ico">❖</span>
+        <span class="mi-ico"><AppIcon name="sparkle" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星盘 · 技能</span>
-        <span class="mi-count">{{ store.skills.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openMcp()">
-        <span class="mi-ico">⧉</span>
+        <span class="mi-ico"><AppIcon name="blocks" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星桥 · MCP</span>
-        <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openPlugins()">
-        <span class="mi-ico">⬡</span>
+        <span class="mi-ico"><AppIcon name="hexagon" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星匣 · 插件</span>
-        <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openAutomations()">
-        <span class="mi-ico"><AppIcon name="orbit" :size="15" /></span>
+        <span class="mi-ico"><AppIcon name="orbit" :size="16" :stroke-width="2.35" /></span>
         <span class="mi-label">星轨</span>
-        <span class="mi-count">{{ enabledAutomationCount }} / {{ store.automationTasks.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
     </div>
 
+    <div class="side-divider"></div>
+
     <div class="side-section">
-      项目会话
-      <span>
-        <button class="add-btn" title="搜索会话 (Ctrl+F)" style="margin-right:4px" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="13" /></button>
-        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="13" /></button>
+      <span>项目会话</span>
+      <span class="side-section-actions">
+        <button class="add-btn" title="搜索会话 (Ctrl+F)" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="15" :stroke-width="2.4" /></button>
+        <button class="add-btn" title="添加/引入项目文件夹" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="15" :stroke-width="2.4" /></button>
       </span>
     </div>
 
@@ -205,23 +188,29 @@
             @dragstart="onGroupDragStart($event, group)"
             @dragend="onGroupDragEnd()"
           >
-            <span class="g-arrow">{{ collapsedGroups[group.folder_path] ? '▸' : '▾' }}</span>
+            <span class="g-arrow" :class="{ collapsed: collapsedGroups[group.folder_path] }">
+              <AppIcon name="chevron-down" :size="14" :stroke-width="2.5" />
+            </span>
             <!-- 秘书分组是虚拟分组（folder_path='SECRETARY' 不是磁盘目录）：不能打开
                  目录，也不能整组删除，否则会把分组标识当路径发给后端 -->
             <span
               v-if="!group.is_global && group.folder_path !== 'GLOBAL' && !group.is_secretary"
               class="g-folder-ico"
+              :class="{ 'is-current': group.is_current }"
               title="在资源管理器中打开此目录"
               @click.stop="openFolder(group.folder_path)"
-            >📁</span>
-            <span class="g-title" :style="{ color: group.is_current ? 'var(--accent)' : 'inherit' }">
-              {{ getFolderTitle(group) }}
-              <span v-if="group.is_current" style="font-size:10px;color:var(--green)"> [当前]</span>
+            ><AppIcon name="folder" :size="15" :stroke-width="2.35" /></span>
+            <span v-else-if="group.is_secretary" class="g-group-ico">
+              <AppIcon name="bot" :size="15" :stroke-width="2.35" />
             </span>
-            <span class="g-count">{{ group.sessions ? group.sessions.length : 0 }} 个会话</span>
+            <span v-else class="g-group-ico">
+              <AppIcon name="message-square" :size="15" :stroke-width="2.35" />
+            </span>
+            <span class="g-title" :class="{ 'is-current': group.is_current }">
+              {{ getFolderTitle(group) }}
+            </span>
+            <span v-if="group.sessions && group.sessions.length > 0" class="g-count">{{ group.sessions.length }}</span>
 
-            <!-- 「对话」（自由通用对话）分组的 ＋：原先挂在「项目会话」标题栏，
-                 现移到行内，与「秘书」分组的入口位置保持一致 -->
             <button
               v-if="isGlobalGroup(group)"
               class="g-add"
@@ -264,7 +253,6 @@
               @dragover.prevent="onSessionDragOver($event, group, s)"
               @drop.prevent="onSessionDrop(group, s)"
             >
-              <!-- 重命名编辑态：名称位置换成输入框；@click.stop 防止触发会话切换 -->
               <input
                 v-if="editingName === s.name"
                 :ref="bindRenameInput"
@@ -278,18 +266,20 @@
                 @keydown.esc="onRenameEsc($event)"
                 @blur="commitRename()"
               />
-              <div v-else class="t">{{ s.display_name || s.name }}</div>
-              <span
-                v-if="store.sessionStatusDots[s.name]"
-                class="s-dot"
-                :class="`s-dot-${store.sessionStatusDots[s.name]}`"
-                :title="dotTitle(store.sessionStatusDots[s.name])"
-              ></span>
-              <span
-                v-if="store.runningSessions.includes(s.name)"
-                class="s-spinner"
-                title="正在执行回合"
-              ></span>
+              <template v-else>
+                <span
+                  v-if="store.runningSessions.includes(s.name)"
+                  class="s-running-dot"
+                  title="正在执行回合"
+                ></span>
+                <span
+                  v-else-if="store.sessionStatusDots[s.name]"
+                  class="s-dot"
+                  :class="`s-dot-${store.sessionStatusDots[s.name]}`"
+                  :title="dotTitle(store.sessionStatusDots[s.name])"
+                ></span>
+                <div class="t">{{ s.display_name || s.name }}</div>
+              </template>
               <div class="m">{{ relativeTime(s.updated_at) }}</div>
               <!-- 归档：可逆操作但误点会把会话挪出列表，故与删除一致走行内二次确认。
                    当前活跃会话不可归档，按钮置灰并给出原因 -->
@@ -332,13 +322,8 @@
       </div>
     </div>
 
-    <!-- 底部容器：只为账号浮层提供定位基准（浮层 absolute 到 .side-bottom 的
-         上边缘），不改变内部 .side-footer 的网格布局 -->
     <div class="side-bottom">
       <div class="side-footer">
-        <!-- 左下角用户卡片：未登录点开基元律动（TokenRhythm）登录窗（登录成功后
-             后端自动绑定 API Key）；已登录则切换上方的账号浮层。
-             设置入口仍是右侧齿轮，手机访问是它右边的手机按钮 -->
         <button
           class="side-user"
           data-test="side-user-card"
@@ -351,20 +336,17 @@
           <span class="footer-copy"><b :title="trUserLabelTitle">{{ trUserLabelShort }}</b></span>
         </button>
         <button class="icon-btn" data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
-          <AppIcon name="settings" :size="16" />
+          <AppIcon name="settings" :size="16" :stroke-width="2.25" />
         </button>
         <button class="icon-btn phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
-          <AppIcon name="smartphone" :size="16" />
+          <AppIcon name="smartphone" :size="16" :stroke-width="2.25" />
         </button>
       </div>
-      <!-- 基元律动账号浮层：登录成功后点左下角卡片，在卡片上方弹出 -->
       <TokenRhythmAccountPanel />
-      <!-- 账号中心原生弹窗（充值 / 用量明细 / 个人信息），Teleport 到 body -->
       <TokenRhythmAccountDialog />
     </div>
   </div>
 
-  <!-- 会话右键菜单：fixed 浮层，跟随鼠标坐标并做视口边缘收拢 -->
   <div
     v-if="ctxMenu.show"
     ref="ctxMenuEl"
@@ -400,7 +382,6 @@
       @click="openMoveMenu()"
     >移动到…</div>
     <div class="ctx-item" data-test="ctx-rename" @click="startRename()">重命名</div>
-    <!-- 只有秘书会话有专属人设：每个秘书是用户自己创建的独立 agent -->
     <div
       v-if="ctxMenu.secretary"
       class="ctx-item"
@@ -410,8 +391,6 @@
     <div class="ctx-item danger" data-test="ctx-delete" @click="startDeleteFromMenu()">删除</div>
   </div>
 
-  <!-- 会话「移动到…」的目标分组选择：沿用右键菜单外观，不另造一套弹层样式。
-       只列已存在的项目分组（含「对话」GLOBAL），排除会话当前所在分组。 -->
   <div
     v-if="moveMenu.show"
     ref="moveMenuEl"
@@ -440,7 +419,6 @@
     </div>
   </div>
 
-  <!-- 项目分组右键菜单：排序入口（拖拽之外的确定性操作，首/末项自动置灰） -->
   <div
     v-if="groupMenu.show"
     ref="groupMenuEl"
@@ -470,7 +448,6 @@
     >置顶</div>
   </div>
 
-  <!-- 移动端侧栏遮罩：侧栏展开时盖住主区，点击收起（桌面端由 CSS 隐藏） -->
   <div
     v-if="!store.sidebarCollapsed"
     class="sidebar-backdrop"
@@ -489,7 +466,6 @@
             : '经典响应式网页，扫码即可作为第二个前端控制本机' }}</p>
         </div>
       </div>
-      <!-- 版本切换：两个前端共用同一配对 token，只切换 URL 路径 -->
       <div class="bind-switch" role="tablist">
         <button
           role="tab"
@@ -507,6 +483,20 @@
       <div class="modal-body">
         <img class="qr-img" :src="remoteBind.qr" alt="绑定二维码" />
         <div class="bind-url">{{ remoteBind.url }}</div>
+        <div v-if="remoteBind.relay_notice" class="bind-notice" data-test="remote-bind-notice">
+          {{ remoteBind.relay_notice }}
+        </div>
+        <div v-if="remoteCloudMissing" class="bind-cloud-setup" data-test="remote-bind-cloud-setup">
+          <span v-if="!remoteBind.relay_notice" class="bind-cloud-tip">
+            尚未连接公网云中转（当前仅同一 WiFi 局域网可用）
+          </span>
+          <button
+            type="button"
+            class="btn-link-setup"
+            data-test="remote-bind-go-settings"
+            @click="goToCloudRelaySettings()"
+          >去服务器配置</button>
+        </div>
         <div class="bind-hint" data-test="remote-bind-hint">
           {{ remoteBindRefreshing ? '正在刷新配对链接…' : `链接有效期：${formatExpiry(remoteBind.expires_in)}，请在过期前扫码` }}
         </div>
@@ -518,11 +508,6 @@
     </div>
   </div>
 
-  <!-- 秘书弹窗：新建时先起名（名字是它的身份来源），并可选填专属人设；
-       编辑时只改人设。每个秘书都是独立的 agent，人设只属于这个会话，
-       与设置页的星瑶人设无关。人设留空 = 内置默认秘书人设。
-       Enter 提交、Esc 取消、点遮罩关闭；新建时名字去首尾空白后为空或
-       超 20 字符则创建按钮禁用（与后端校验同口径） -->
   <div
     v-if="secretaryModal.show"
     class="modal-mask"
@@ -580,7 +565,6 @@
     </div>
   </div>
 
-  <!-- 基元律动账号登录窗：左下角用户卡片点击后打开，登录成功自动关窗 -->
   <TokenRhythmLoginModal />
 </template>
 
@@ -597,7 +581,6 @@ import { shortLabel } from '../utils/shortLabel';
 
 const store = useAppStore();
 
-// 左下角卡片点击：已登录 → 切换账号浮层；未登录 → 打开登录弹窗
 function onUserCardClick() {
   if (store.trAuth.status === 'loggedIn') store.toggleTrAccountPanel();
   else store.openTrLoginModal();
@@ -610,12 +593,9 @@ const trUserLabel = computed(() => {
   const user = (store.trAuth.user || {}) as Record<string, any>;
   return String(user.name || user.nickname || user.phone || user.account || '星瑶Code');
 });
-// 头像文字：已登录取账号名首字，未登录沿用原来的产品首字母 Y
 const trAvatarText = computed(() => (
   store.trAuth.status === 'loggedIn' ? (trUserLabel.value.slice(0, 1).toUpperCase() || 'Y') : 'Y'
 ));
-// 卡片上只显示前 6 个字符：账号名可以任意长，全量渲染会把右侧设置/手机图标
-// 挤出侧栏；完整名字挂在 <b> 的 title 上作悬停气泡。
 const trUserLabelShort = computed(() => shortLabel(trUserLabel.value));
 // 悬停气泡只对已登录账号给出完整账号名；未登录时按钮自身的 title 已是引导文案，
 // 这里返回 undefined 让属性不渲染，避免气泡内容重复。
@@ -623,8 +603,6 @@ const trUserLabelTitle = computed(() => (
   store.trAuth.status === 'loggedIn' ? trUserLabel.value : undefined
 ));
 
-// 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
-// 宽度。移动端（<=768px）不输出内联样式，布局交给 style.css 媒体查询。
 const isMobile = useIsMobile();
 const panelStyle = computed(() => {
   if (isMobile.value) return {};
@@ -639,7 +617,6 @@ const panelStyle = computed(() => {
 const COLLAPSED_GROUPS_KEY = 'ycode-sidebar-collapsed-groups';
 const EXPANDED_GROUPS_KEY = 'ycode-sidebar-expanded-groups';
 
-/** 读取一组被标记的路径（[{path}] 形态）；内容缺失/损坏时按空处理 */
 function loadFlagPaths(key: string): Record<string, boolean> {
   try {
     const raw = localStorage.getItem(key);
@@ -716,7 +693,6 @@ const orderedGroups = computed<SessionGroup[]>(() => {
   groupOrder.value.forEach((p, i) => {
     if (!rank.has(p)) rank.set(p, i);
   });
-  // Array.sort 稳定：两个未记录的分组比较结果为 0，保持后端字母序
   const ranked = projects.slice().sort((a, b) => {
     const ra = rank.get(a.folder_path);
     const rb = rank.get(b.folder_path);
@@ -741,8 +717,6 @@ function commitGroupOrder(paths: string[]) {
   pushLayoutToBackend();
 }
 
-/** 把 fromKey 移到 toKey 前/后：先摘除再按目标重新定位，天然吸收前后偏移。
- *  分组与会话两处排序共用；无法移动（缺键 / 移到自己身上）时返回 null。 */
 function moveBeforeOrAfter(
   list: string[],
   fromKey: string,
@@ -766,7 +740,6 @@ function moveGroupTo(fromPath: string, toPath: string, after: boolean) {
   commitGroupOrder(next);
 }
 
-/** 相邻移动（delta=±1）与置顶：右键菜单的确定性操作 */
 function moveGroupStep(path: string, delta: number) {
   const paths = currentProjectOrder();
   const i = paths.indexOf(path);
@@ -828,13 +801,6 @@ function saveSessionOrder(map: Record<string, string[]>) {
 
 const sessionOrder = ref<Record<string, string[]>>(loadSessionOrder());
 
-/** 把当前排序推给后端（权威副本）。
- *
- * localStorage 只是即时缓存：WebView2 在「拖完排序立刻重启」时会丢写——
- * 写前日志尾部留下 checksum mismatch，leveldb 恢复时整段丢弃，表现为
- * "数据写进文件了但应用读不到、重启就复原"。后端走原子写落盘才可靠。
- * 失败仅静默降级，不影响交互。
- */
 function pushLayoutToBackend() {
   const api = (window.pywebview && window.pywebview.api) as any;
   if (!api || typeof api.save_ui_layout !== 'function') return;
@@ -849,11 +815,6 @@ function pushLayoutToBackend() {
   }
 }
 
-/** 启动时用后端快照校正本地缓存。
- *
- * 后端为空快照（首次升级到带后端持久化的版本）时反向补写一次，把用户此前
- * 存在 localStorage 里的排序带过去，避免升级即丢历史。
- */
 async function syncLayoutFromBackend() {
   const api = (window.pywebview && window.pywebview.api) as any;
   if (!api || typeof api.get_ui_layout !== 'function') return;
@@ -968,7 +929,6 @@ function moveSessionTop(path: string, name: string) {
   commitSessionOrder(path, names);
 }
 
-// 会话拖拽态：dragSessionPath/Name 为源，dropSession* 为同组内的落点
 const dragSessionPath = ref('');
 const dragSessionName = ref('');
 const dropSessionPath = ref('');
@@ -993,14 +953,12 @@ function onSessionDragStart(e: DragEvent, group: SessionGroup, s: SessionInfo) {
     try {
       e.dataTransfer.setData('text/plain', s.name);
     } catch {
-      /* 同分组头：排序不依赖数据内容，忽略即可 */
     }
   }
 }
 
 function onSessionDragOver(e: DragEvent, group: SessionGroup, s: SessionInfo) {
   if (!dragSessionName.value) return;
-  // 会话归属由 workdir 决定，跨分组拖拽等于改项目归属，故不支持（给出禁止光标）
   if (group.folder_path !== dragSessionPath.value) {
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
     return;
@@ -1028,7 +986,6 @@ function onSessionDragEnd() {
   dropSessionAfter.value = false;
 }
 
-// 拖拽排序态：dragPath 为被拖分组，dropPath/dropAfter 为落点及其前后半区
 const dragPath = ref('');
 const dropPath = ref('');
 const dropAfter = ref(false);
@@ -1062,7 +1019,6 @@ function onGroupDragStart(e: DragEvent, g: SessionGroup) {
   }
 }
 
-/** 落点判定用分组头中线：上半区插到目标前，下半区插到目标后 */
 function onGroupDragOver(e: DragEvent, g: SessionGroup) {
   if (!dragPath.value || isGlobalGroup(g)) return;
   const box = e.currentTarget as HTMLElement | null;
@@ -1072,7 +1028,6 @@ function onGroupDragOver(e: DragEvent, g: SessionGroup) {
   dropAfter.value = e.clientY > rect.top + rect.height / 2;
 }
 
-// drop 只消费 dragover 阶段算好的落点（dropAfter），不需要事件对象
 function onGroupDrop(g: SessionGroup) {
   if (!dragPath.value || isGlobalGroup(g)) {
     onGroupDragEnd();
@@ -1089,17 +1044,19 @@ function onGroupDragEnd() {
   dropPath.value = '';
   dropAfter.value = false;
 }
-// 正在等待二次确认删除的会话名（在时间位置显示红色小确认按钮）
 const confirmDeleteName = ref('');
-// 正在等待二次确认归档的会话名（同处时间位置，确认按钮用主色区分可逆操作）
 const confirmArchiveName = ref('');
-// 手机访问绑定信息（点击手机图标后弹出二维码，弹窗内可切换移动端 / web远端）
-// permanent=true 表示永久有效（后端 expires_in=0），不做倒计时自动刷新
-const remoteBind = ref<null | { url: string; qr: string; expires_in: number; permanent?: boolean }>(null);
+const remoteBind = ref<null | {
+  url: string;
+  qr: string;
+  expires_in: number;
+  permanent?: boolean;
+  // 云中转开着却回落局域网时后端给的原因；为空表示就是局域网/公网正常出码
+  relay_notice?: string;
+}>(null);
 // 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
 const remoteBindRefreshing = ref(false);
-// 绑定目标：mobile=新版独立移动端（/m/）/ desktop=经典响应式网页（/）。
-// 默认移动端；用 localStorage 记住上次选择（沿用 'ycode-*' 键前缀约定）。
+const remoteCloudMissing = ref(false);
 type RemoteBindMode = 'desktop' | 'mobile';
 const REMOTE_BIND_MODE_KEY = 'ycode-remote-bind-mode';
 function loadRemoteBindMode(): RemoteBindMode {
@@ -1111,26 +1068,18 @@ function loadRemoteBindMode(): RemoteBindMode {
   }
 }
 const remoteBindMode = ref<RemoteBindMode>(loadRemoteBindMode());
-// 过期检查定时器：弹窗打开期间每秒检测，过期自动刷新 token
 let remoteBindExpiryTimer: ReturnType<typeof setInterval> | null = null;
 
-// 会话右键菜单：show 为浮层开关，x/y 为鼠标坐标（渲染后按视口边缘收拢）
 const MENU_EDGE = 8;
 const ctxMenu = reactive({ show: false, x: 0, y: 0, name: '', display: '', path: '', secretary: false });
 const ctxMenuEl = ref<HTMLElement | null>(null);
-// 就地重命名态：editingName 为会话名（唯一定位条目），editingValue 为输入框内容
 const editingName = ref('');
 const editingValue = ref('');
-// 进入编辑态时的原始显示名，用于判断"未改动"
 let editingOriginal = '';
 const renameInputEl = ref<HTMLInputElement | null>(null);
 
-// 秘书弹窗：mode='create' 由秘书分组 ＋ 打开（起名 + 可选人设并建会话），
-// mode='edit' 由右键「编辑人设」打开（只改该秘书的人设）。名字池随机预填一个推荐名
 const SECRETARY_NAME_POOL = ['星河', '小满', '望舒', '清和', '云疏', '拾光'];
-// 与后端 core.secretary.validate_secretary_name 同口径：去首尾空白后 1-20 字符
 const SECRETARY_NAME_MAX_LEN = 20;
-// 与后端 core.secretary.MAX_PERSONA_LEN 同口径；留空合法（= 内置默认秘书人设）
 const SECRETARY_PERSONA_MAX_LEN = 20000;
 const secretaryModal = reactive({
   show: false,
@@ -1142,7 +1091,6 @@ const secretaryNameDraft = ref('');
 const secretaryPersonaDraft = ref('');
 const secretaryNameInput = ref<HTMLInputElement | null>(null);
 const secretaryPersonaInput = ref<HTMLTextAreaElement | null>(null);
-// 规范化名字：去首尾空白后按码点计数与后端 len() 对齐（emoji 不算两个字符）
 const secretaryNameNormalized = computed(() => secretaryNameDraft.value.trim());
 const secretaryNameValid = computed(() => {
   const name = secretaryNameNormalized.value;
@@ -1156,7 +1104,6 @@ const secretaryNameHint = computed(() => {
   }
   return '';
 });
-// 人设留空视为"没填"，直接放行（走内置默认秘书人设），只有超长才拦
 const secretaryPersonaNormalized = computed(() => secretaryPersonaDraft.value.trim());
 const secretaryPersonaHint = computed(() => {
   const len = secretaryPersonaNormalized.value.length;
@@ -1167,11 +1114,9 @@ const secretaryPersonaHint = computed(() => {
 });
 const secretarySubmitValid = computed(() => {
   if (secretaryPersonaNormalized.value.length > SECRETARY_PERSONA_MAX_LEN) return false;
-  // 编辑态只改人设，没有名字输入框，不必校验名字
   return secretaryModal.mode === 'edit' ? true : secretaryNameValid.value;
 });
 
-// QQ2009 皮肤：用户卡昵称可就地编辑（localStorage 持久化，默认「木偶」）
 const QQ09_NAME_KEY = 'qq09.sidebarUserName';
 const qq09UserName = ref(localStorage.getItem(QQ09_NAME_KEY)?.trim() || '木偶');
 const qq09EditingName = ref(false);
@@ -1215,11 +1160,7 @@ function qq09SaveSign() {
 }
 function qq09CancelSign() { qq09EditingSign.value = false; }
 
-// QQ2009 皮肤：用户卡自定义气泡提示（网名 / 签名），替代浏览器默认 title。
-// 悬停约 350ms 后、且文本确实被省略号截断（scrollWidth > clientWidth）才显示；
-// 未截断时弹气泡纯属冗余。移出 / 点击 / 滚动 / 进入编辑态立即隐藏。
 const QQ09_TIP_DELAY = 350;
-// 元素离视口顶部小于此值时气泡改落到下方（并用 .flipped 翻转小三角）
 const QQ09_TIP_FLIP_TOP = 60;
 const qq09Tip = reactive({ show: false, text: '', top: 0, left: 0, flipped: false });
 let qq09TipTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1230,18 +1171,15 @@ function qq09HideTip() {
   }
   if (qq09Tip.show) qq09Tip.show = false;
 }
-/** 悬停延迟后在元素上方（空间不足则下方）弹出完整文本气泡 */
 function qq09ShowTip(e: MouseEvent, text: string) {
   const el = e.currentTarget as HTMLElement | null;
   if (!el) return;
   qq09HideTip();
   qq09TipTimer = setTimeout(() => {
     qq09TipTimer = null;
-    // 文本完整可见时不弹（scrollWidth 等于 clientWidth 即未截断）
     if (el.scrollWidth <= el.clientWidth) return;
     const rect = el.getBoundingClientRect();
     qq09Tip.text = text;
-    // 水平居中于元素；left/top 用视口坐标，配合 .qq09-tip 的 fixed 定位
     qq09Tip.left = rect.left + rect.width / 2;
     qq09Tip.flipped = rect.top < QQ09_TIP_FLIP_TOP;
     qq09Tip.top = qq09Tip.flipped ? rect.bottom + 5 : rect.top - 5;
@@ -1249,9 +1187,6 @@ function qq09ShowTip(e: MouseEvent, text: string) {
   }, QQ09_TIP_DELAY);
 }
 
-// QQ2009 皮肤：用户卡在线状态可切换（localStorage 持久化，缺省 online）
-// 六个状态与 qq2009.css 一一对应：.qq09-st-icon[data-st=*] 是菜单/状态行图标，
-// .qq09-status-dot[data-status=*] 是头像右下角的状态点。
 const QQ09_STATUS_KEY = 'qq09.sidebarStatus';
 const QQ09_STATUSES = [
   { id: 'online', label: '我在线上' },
@@ -1262,7 +1197,6 @@ const QQ09_STATUSES = [
   { id: 'offline', label: '隐身' },
 ] as const;
 type Qq09StatusId = (typeof QQ09_STATUSES)[number]['id'];
-/** 读 localStorage；非法/缺失值一律退回 online（与昵称同款就地持久化做法） */
 function loadQq09Status(): Qq09StatusId {
   const saved = localStorage.getItem(QQ09_STATUS_KEY);
   return QQ09_STATUSES.some((s) => s.id === saved) ? (saved as Qq09StatusId) : 'online';
@@ -1292,11 +1226,6 @@ const QQ09_LEVEL_ICONS: ReadonlyArray<'sun' | 'moon' | 'star'> = [
   ...Array.from({ length: QQ09_LEVEL % 4 }, () => 'star' as const),
 ];
 
-// QQ2009 皮肤：用户卡头像可点击更换（DataURL 持久化，默认企鹅底图）。
-// 2MB 上限的理由：localStorage 配额通常只有 5MB，DataURL 还要 base64 膨胀约 1/3，
-// 超过这个体积既会撑爆配额、也让同步读写明显变慢；2MB 以内的 GIF 动图能完整落盘。
-// 动图支持：GIF 的 DataURL 仍是标准 image/gif 资源，塞进 <img src> 后浏览器按帧
-// 自动播放，无需 CSS 精灵图或 JS 逐帧控制。
 const QQ09_AVATAR_KEY = 'qq09.sidebarAvatar';
 const QQ09_AVATAR_MAX_BYTES = 2 * 1024 * 1024;
 /** 读已存头像 DataURL；存储不可用 / 内容损坏（非 data:image/* 前缀）一律按无自定义头像处理 */
@@ -1312,7 +1241,6 @@ function loadQq09Avatar(): string {
 const qq09AvatarData = ref(loadQq09Avatar());
 const qq09AvatarInputRef = ref<HTMLInputElement | null>(null);
 
-/** 点头像：转交隐藏文件框；先清空 value 以便连续两次选同一个文件也能触发 change */
 function qq09PickAvatar() {
   qq09HideTip();
   const input = qq09AvatarInputRef.value;
@@ -1321,12 +1249,10 @@ function qq09PickAvatar() {
   input.click();
 }
 
-/** 选文件后：校验类型/体积 → FileReader 读 DataURL → 写内存态 + localStorage */
 function qq09OnAvatarFile(e: Event) {
   const input = e.target as HTMLInputElement | null;
   const file = input?.files?.[0];
   if (!file) return;
-  // 非图片直接忽略（accept 只是过滤器，用户仍可切到「所有文件」）
   if (!file.type.startsWith('image/')) return;
   if (file.size > QQ09_AVATAR_MAX_BYTES) {
     alert('图片不能超过 2MB（localStorage 容量有限，建议压缩后再传）');
@@ -1340,15 +1266,12 @@ function qq09OnAvatarFile(e: Event) {
     try {
       localStorage.setItem(QQ09_AVATAR_KEY, data);
     } catch {
-      /* 配额满时仅本次会话生效：头像已显示，只是不持久化，不打扰用户 */
     }
   };
-  // 读取失败（文件被移走/无权限）静默忽略，头像保持原样
   reader.onerror = () => {};
   reader.readAsDataURL(file);
 }
 
-/** 恢复默认头像：清内存态并删键，回到 CSS 画的企鹅底图 */
 function qq09ResetAvatar() {
   qq09AvatarData.value = '';
   try {
@@ -1364,16 +1287,13 @@ function openCtxMenu(e: MouseEvent, s: SessionInfo, group: SessionGroup) {
   ctxMenu.display = s.display_name || s.name;
   // 记下所属分组：菜单里的上移 / 下移 / 置顶要按组内顺序计算
   ctxMenu.path = group.folder_path;
-  // 秘书会话不提供「移动到…」：它的归属由 source 决定，改 workdir 不会离开「秘书」分组
   ctxMenu.secretary = !!s.secretary_name;
   ctxMenu.x = e.clientX;
   ctxMenu.y = e.clientY;
   ctxMenu.show = true;
-  // 菜单尺寸要等渲染后才知道，故下一帧再收拢到视口内
   nextTick(clampCtxMenu);
 }
 
-/** 把浮层坐标收拢进视口（尺寸要等渲染后才知道，故调用方放在 nextTick 里） */
 function clampToViewport(el: HTMLElement | null, x: number, y: number) {
   const width = el ? el.offsetWidth : 0;
   const height = el ? el.offsetHeight : 0;
@@ -1399,7 +1319,6 @@ function closeCtxMenu() {
   ctxMenu.secretary = false;
 }
 
-// 菜单项「重命名」：关菜单、就地进入编辑态，并把输入框聚焦全选
 function startRename() {
   if (!ctxMenu.name) return;
   editingName.value = ctxMenu.name;
@@ -1430,7 +1349,6 @@ function openSecretaryNameModal() {
   });
 }
 
-// 右键「编辑人设」：只对秘书会话出现，用侧栏条目里已下发的人设原文回填
 function openSecretaryPersonaModal() {
   const { name, display } = ctxMenu;
   closeCtxMenu();
@@ -1446,7 +1364,6 @@ function openSecretaryPersonaModal() {
   secretaryModal.show = true;
   nextTick(() => {
     secretaryPersonaInput.value?.focus();
-    // 光标落到末尾：编辑现有人设时接着写，而不是把原文全选覆盖掉
     const len = secretaryPersonaDraft.value.length;
     secretaryPersonaInput.value?.setSelectionRange(len, len);
   });
@@ -1461,8 +1378,6 @@ function closeSecretaryModal() {
   secretaryPersonaDraft.value = '';
 }
 
-// 提交：先校验（非法值不发请求，也不静默截断），关弹窗后交给 store。
-// 不 await：新建 / 保存失败由 store 弹可见提示，弹窗不必卡在加载态里
 function submitSecretaryModal() {
   if (!secretarySubmitValid.value) return;
   const persona = secretaryPersonaNormalized.value;
@@ -1477,23 +1392,18 @@ function submitSecretaryModal() {
   void store.createSecretarySession(name, persona);
 }
 
-// Enter 提交（仅名字输入框）：沿用重命名输入框的 IME 守卫——组合态下这次
-// Enter 是确认候选词，此刻文字还没上屏，提交会把中间态当名字发出去。
-// 人设是多行文本域，Enter 保留换行语义，不在这里提交
 function onSecretaryNameEnter(e: KeyboardEvent) {
   if (isImeComposing(e)) return;
   e.preventDefault();
   submitSecretaryModal();
 }
 
-// Esc 取消：组合态是取消候选词，不应关弹窗
 function onSecretaryNameEsc(e: KeyboardEvent) {
   if (isImeComposing(e)) return;
   e.preventDefault();
   closeSecretaryModal();
 }
 
-// 菜单项「删除」：复用现有二次确认流程（进入 confirming 态，仍需点红色确认按钮）
 function startDeleteFromMenu() {
   const name = ctxMenu.name;
   cancelRename();
@@ -1524,7 +1434,6 @@ function runCtxMenu(action: 'up' | 'down' | 'top') {
 const moveMenu = reactive({ show: false, x: 0, y: 0, name: '', fromPath: '' });
 const moveMenuEl = ref<HTMLElement | null>(null);
 
-// 当前会话是否已在「对话」分组：在的话不需要再给「对话」这一项
 const moveMenuFromGlobal = computed(() => !moveMenu.fromPath || moveMenu.fromPath === 'GLOBAL');
 const moveTargets = computed(() =>
   (store.sessionGroups || []).filter(
@@ -1563,12 +1472,10 @@ async function chooseMoveTarget(target: string) {
   await store.moveSessionToWorkdir(name, target);
 }
 
-// 分组右键菜单：拖拽之外的排序入口（触屏/手抖时更可靠，也便于长距离调整）
 const groupMenu = reactive({ show: false, x: 0, y: 0, path: '' });
 const groupMenuEl = ref<HTMLElement | null>(null);
 
 function openGroupCtxMenu(e: MouseEvent, g: SessionGroup) {
-  // 「对话」分组固定最顶，不提供排序菜单
   if (isGlobalGroup(g)) return;
   cancelRename();
   closeCtxMenu();
@@ -1603,7 +1510,6 @@ function runGroupMenu(action: 'up' | 'down' | 'top') {
   else moveGroupTop(path);
 }
 
-// v-for 内若用字符串 ref，Vue 会把值收集成数组；改用函数 ref 拿到唯一输入框
 function bindRenameInput(el: any) {
   renameInputEl.value = (el as HTMLInputElement) || null;
 }
@@ -1623,15 +1529,12 @@ function isImeComposing(e: KeyboardEvent): boolean {
   return e.isComposing === true || (e as any).keyCode === 229;
 }
 
-// Enter：组合中不 preventDefault、不提交（交由输入法上屏）；非组合态才阻止
-// 默认换行行为并提交重命名
 function onRenameEnter(e: KeyboardEvent) {
   if (isImeComposing(e)) return;
   e.preventDefault();
   commitRename();
 }
 
-// Esc：组合中是取消候选词，不应退出编辑态；非组合态才取消重命名
 function onRenameEsc(e: KeyboardEvent) {
   if (isImeComposing(e)) return;
   e.preventDefault();
@@ -1649,7 +1552,6 @@ function commitRename() {
   store.renameSession(oldName, next);
 }
 
-// 会话菜单、分组菜单、移动目标菜单互斥，统一收口关闭（滚动 / 缩放时顺带收掉 QQ2009 气泡）
 function closeSidebarMenus() {
   closeCtxMenu();
   closeGroupMenu();
@@ -1661,8 +1563,6 @@ function closeSidebarMenus() {
 function onDocMouseDown(e: MouseEvent) {
   // 气泡是纯悬停提示：任何点击都立即隐藏，避免残留
   qq09HideTip();
-  // QQ2009 状态菜单同款外点关闭：点在「触发器 + 下拉」包裹层外才关
-  // （层内的 mousedown 一律放行，交给触发器的 click 做开合、菜单项的 click 做选中）
   if (qq09StatusMenuOpen.value) {
     const wrap = qq09StatusRef.value;
     if (!(wrap && e.target instanceof Node && wrap.contains(e.target))) qq09CloseStatusMenu();
@@ -1680,20 +1580,16 @@ function onDocKeyDown(e: KeyboardEvent) {
     closeSidebarMenus();
     qq09CloseStatusMenu();
     cancelRename();
-    // 秘书弹窗也吃 Esc（输入框已聚焦时由它自己的 keydown.esc 先关，
-    // 这里兜住焦点不在输入框上的情况）
     closeSecretaryModal();
   }
 }
 
 onMounted(() => {
-  // 捕获阶段监听 scroll：侧栏内部滚动也能关闭菜单
   window.addEventListener('scroll', closeSidebarMenus, true);
   window.addEventListener('resize', closeSidebarMenus);
   document.addEventListener('mousedown', onDocMouseDown);
   document.addEventListener('keydown', onDocKeyDown);
 
-  // 账号状态是左下角用户卡片的数据源：启动后静默探测一次（未登录不弹提示）
   if (store.trAuth.status === 'unknown') void store.refreshTrAuth();
 
   // 用后端权威快照校正本地缓存（localStorage 在强杀场景会丢写）。
@@ -1708,8 +1604,6 @@ onMounted(() => {
       if (pywebviewLayoutApiReady()) {
         startLayoutSync();
       } else if (attempts > 300) {
-        // 30 秒仍未就绪（纯浏览器预览等无桥环境）：放弃轮询，
-        // localStorage 缓存照常可用，不影响排序本身
         clearInterval(layoutSyncTimer);
         layoutSyncTimer = undefined;
         window.removeEventListener('pywebviewready', onLayoutBridgeReady);
@@ -1730,8 +1624,6 @@ onUnmounted(() => {
   }
 });
 
-// 删除项目分组：先弹确认框（带分组名与组内对话数），确认后才真正移出分组。
-// 后端 delete_folder_group 只删分组内的对话记录，不动磁盘上的项目文件。
 async function askDeleteGroup(group: SessionGroup) {
   const title = getFolderTitle(group);
   const count = group.sessions ? group.sessions.length : 0;
@@ -1754,9 +1646,6 @@ function confirmDelete(name: string) {
   store.deleteSingleSession(name);
 }
 
-// 归档（行内 ⤓）：与删除同一套行内二次确认——首击只进入确认态，点确认才真正归档。
-// 归档可逆但会把会话挪出列表，误点后要找回来得进设置页，故不直接执行。
-// 确认后由 store 静默完成刷新；当前活跃会话在按钮上已置灰，store 里还有一道同源保护。
 function askArchive(name: string) {
   confirmDeleteName.value = '';
   confirmArchiveName.value = name;
@@ -1768,7 +1657,6 @@ function confirmArchive(name: string) {
 }
 
 function onSessionClick(s: { name: string; display_name?: string; workdir?: string }) {
-  // 处于二次确认态（删除 / 归档）时，点击条目其它区域视为取消，不切换会话
   if (confirmDeleteName.value === s.name || confirmArchiveName.value === s.name) {
     confirmDeleteName.value = '';
     confirmArchiveName.value = '';
@@ -1776,7 +1664,6 @@ function onSessionClick(s: { name: string; display_name?: string; workdir?: stri
   }
   confirmDeleteName.value = '';
   confirmArchiveName.value = '';
-  // 切换会话前清理右键菜单与重命名编辑态（两者互斥，且不随会话保留）
   closeCtxMenu();
   cancelRename();
   store.closeSubpage();
@@ -1784,7 +1671,6 @@ function onSessionClick(s: { name: string; display_name?: string; workdir?: stri
   collapseSidebarIfMobile();
 }
 
-// 移动端视口判定：<=768px 时侧栏为覆盖层，点遮罩 / 选择会话 / 点击菜单后收起
 function isMobileViewport(): boolean {
   return (
     typeof window !== 'undefined' &&
@@ -1799,7 +1685,6 @@ function collapseSidebarIfMobile() {
   }
 }
 
-// 侧栏菜单项：触发动作后，移动端自动收起覆盖层
 function newSession() {
   store.closeSubpage();
   store.createSessionSmart();
@@ -1835,7 +1720,6 @@ function toggleShowMore(path: string) {
   saveFlagPaths(EXPANDED_GROUPS_KEY, expandedGroups.value);
 }
 
-// ZCode 风格的紧凑相对时间：刚刚 / 5分钟 / 3小时 / 13天 / 2个月
 function relativeTime(updatedAt?: string) {
   if (!updatedAt) return '';
   const t = new Date(updatedAt.replace(' ', 'T')).getTime();
@@ -1852,16 +1736,12 @@ function relativeTime(updatedAt?: string) {
   if (mon < 12) return `${mon}个月`;
   return `${Math.floor(mon / 12)}年`;
 }
-const connectedMcpCount = computed(() => store.mcps.filter(m => m.connected).length);
-const enabledPluginCount = computed(() => store.plugins.filter(p => p.enabled).length);
-const enabledAutomationCount = computed(() => store.automationTasks.filter(t => t.enabled).length);
 
 function toggleGroupCollapsed(path: string) {
   collapsedGroups.value[path] = !collapsedGroups.value[path];
   saveFlagPaths(COLLAPSED_GROUPS_KEY, collapsedGroups.value);
 }
 
-// 点击分组文件夹图标：在系统资源管理器中打开该目录
 async function openFolder(path: string) {
   const api = window.pywebview && window.pywebview.api;
   if (!api || !path) return;
@@ -1875,8 +1755,6 @@ async function openFolder(path: string) {
   }
 }
 
-// 打开手机访问绑定弹窗：向后端请求二维码与配对链接。
-// 后端 token 固定：未过期直接复用，应用重启也不变；过期由后端自动重签。
 async function fetchRemoteBind(forceNew: boolean) {
   const api = window.pywebview && window.pywebview.api;
   if (!api) {
@@ -1884,8 +1762,6 @@ async function fetchRemoteBind(forceNew: boolean) {
     return;
   }
   try {
-    // get_remote_bind_qr 为后端桥接方法，前端类型契约尚未收录，故此处按返回结构取用；
-    // mobile 模式追加第二参数绑定独立移动端（/m/），web远端保持单参签名不变
     const result = remoteBindMode.value === 'mobile'
       ? await (api as any).get_remote_bind_qr(forceNew, true)
       : await (api as any).get_remote_bind_qr(forceNew);
@@ -1893,15 +1769,25 @@ async function fetchRemoteBind(forceNew: boolean) {
       remoteBind.value = {
         url: result.url,
         qr: result.qr,
-        // expires_in=0：永久有效（TTL 选“永久”时后端永不过期）
         expires_in: result.expires_in ?? 0,
         permanent: !(result.expires_in > 0),
+        relay_notice: result.relay_notice || '',
       };
+      let cloudMissing = Boolean(result.relay_notice);
+      if (typeof (api as any).get_cloud_relay_settings === 'function') {
+        try {
+          const relayRes = await (api as any).get_cloud_relay_settings();
+          if (relayRes?.ok && relayRes.settings) {
+            cloudMissing = !relayRes.settings.connected;
+          }
+        } catch {
+        }
+      }
+      remoteCloudMissing.value = cloudMissing;
       startExpiryWatch();
     } else if (!forceNew || !remoteBind.value) {
       store.notifyModal('手机访问', (result && result.msg) || '获取绑定二维码失败');
     } else {
-      // 手动刷新失败时保留旧弹窗内容，仅提示
       store.notifyModal('手机访问', (result && result.msg) || '刷新配对链接失败');
     }
   } catch (err) {
@@ -1911,13 +1797,10 @@ async function fetchRemoteBind(forceNew: boolean) {
   }
 }
 
-// 单一入口：按当前（或上次记住的）版本打开绑定弹窗
 async function openRemoteBind() {
   await fetchRemoteBind(false);
 }
 
-// 弹窗内切换版本：只换 URL 路径，复用同一 token（后端未过期直接复用，
-// 不会重签 token，也不会踢掉已扫码连接的手机）
 async function switchRemoteBindMode(mode: RemoteBindMode) {
   if (remoteBindMode.value === mode) return;
   remoteBindMode.value = mode;
@@ -1929,23 +1812,19 @@ async function switchRemoteBindMode(mode: RemoteBindMode) {
   await fetchRemoteBind(false);
 }
 
-// 手动刷新：强制后端重签 token，已绑定的旧链接立即失效
 async function refreshRemoteBind() {
   if (remoteBindRefreshing.value) return;
   remoteBindRefreshing.value = true;
   await fetchRemoteBind(true);
 }
 
-// 弹窗打开期间每秒检测剩余有效期，到期自动向后端请求新 token（未过期时后端会直接复用）
 function startExpiryWatch() {
   stopExpiryWatch();
-  // 永久有效（expires_in=0）无需倒计时，也就永远不会触发自动刷新
   if (remoteBind.value?.permanent) return;
   remoteBindExpiryTimer = setInterval(() => {
     if (!remoteBind.value) return;
     remoteBind.value.expires_in -= 1;
     if (remoteBind.value.expires_in <= 0) {
-      // 过期：自动刷新（后端检测到过期会重签新 token）
       fetchRemoteBind(false);
     }
   }, 1000);
@@ -1961,9 +1840,15 @@ function stopExpiryWatch() {
 function closeRemoteBind() {
   stopExpiryWatch();
   remoteBind.value = null;
+  remoteCloudMissing.value = false;
 }
 
-// 将 expires_in（秒）转成友好文案；0 表示永久有效
+function goToCloudRelaySettings() {
+  closeRemoteBind();
+  store.settingsSection = 'cloud-relay';
+  store.settingsOpen = true;
+}
+
 function formatExpiry(seconds: number): string {
   if (!seconds || seconds <= 0) return '永久有效';
   if (seconds < 60) return `${seconds} 秒`;
@@ -1974,7 +1859,6 @@ function formatExpiry(seconds: number): string {
   return `${Math.floor(hour / 24)} 天`;
 }
 
-// 状态提醒点 hover 文案
 function dotTitle(kind: 'green' | 'yellow' | 'red') {
   if (kind === 'green') return '该会话任务执行完成';
   if (kind === 'yellow') return '该会话等待确认操作';
@@ -1991,85 +1875,118 @@ function getFolderTitle(g: SessionGroup) {
 <style scoped>
 #sidebar {
   width: 240px;
-  border-right: 1px solid var(--border);
+  border-right: none;
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  transition: margin-left 0.25s;
+  transition: margin-left 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  user-select: none;
 }
 #sidebar.collapsed {
   margin-left: -240px;
 }
 .side-menu {
-  padding: 8px 8px 2px;
-  border-bottom: 1px solid var(--border);
+  padding: 2px 6px 8px;
+}
+.side-divider {
+  margin: 0 8px;
+  border-top: 1px solid var(--xy-border, var(--border));
 }
 .menu-item {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
+  gap: 10px;
+  height: 32px;
+  padding: 0 10px;
   border-radius: 8px;
   cursor: pointer;
-  color: var(--text-dim);
-  margin-bottom: 3px;
-  transition: 0.15s;
+  color: var(--xy-text-2, var(--text-dim));
+  margin-bottom: 2px;
+  font-size: 13px;
+  transition: background 0.14s, color 0.14s;
+}
+.menu-item.menu-new-session {
+  color: var(--xy-text, var(--text));
+}
+.menu-item.menu-new-session .mi-label {
+  font-weight: 500;
 }
 .menu-item:hover {
-  background: var(--bg2);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
 }
 .menu-item .mi-ico {
-  font-size: 14px;
-  width: 18px;
-  text-align: center;
-}
-.menu-item .mi-label {
-  font-size: 13px;
-  font-weight: 500;
-  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--xy-text, var(--text));
   flex-shrink: 0;
 }
-.menu-item .mi-count {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--text-faint);
-  background: var(--bg3);
-  border-radius: 8px;
-  padding: 1px 7px;
-  /* 目录名过长时单行显示并省略，不换行撑高菜单项 */
+.menu-item .mi-label {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 400;
+  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.menu-item .mi-workdir {
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  min-width: 0;
+  max-width: 88px;
+}
+.menu-item .mi-plus {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--xy-text, var(--text));
+  line-height: 1;
+  flex-shrink: 0;
 }
 .menu-item .mi-arrow {
-  color: var(--text-faint);
-  font-size: 14px;
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 12px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.menu-item:hover .mi-arrow {
+  opacity: 1;
 }
 
 .side-section {
   padding: 10px 10px 4px;
-  color: var(--text-faint);
-  font-size: 11.5px;
-  letter-spacing: 1px;
-  text-transform: uppercase;
+  color: var(--xy-text-3, var(--text-faint));
+  font-size: 12px;
+  font-weight: 500;
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
+.side-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
 .side-section .add-btn {
+  width: 24px;
+  height: 24px;
   background: none;
   border: none;
-  color: var(--text-faint);
-  font-size: 13px;
-  padding: 1px 5px;
-  border-radius: 4px;
-  transition: 0.15s;
+  color: var(--xy-text, var(--text));
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.14s, color 0.14s;
 }
 .side-section .add-btn:hover {
-  color: var(--accent);
-  background: var(--bg3);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg3));
 }
 
 .side-scroll {
@@ -2077,166 +1994,193 @@ function getFolderTitle(g: SessionGroup) {
   overflow-y: auto;
 }
 #session-list {
-  padding: 0 6px;
+  padding: 0 4px 8px;
 }
 .session-group {
-  margin-bottom: 8px;
+  margin-bottom: 4px;
 }
 .group-header {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
-  border-radius: 6px;
+  border-radius: 8px;
   cursor: pointer;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 12.5px;
-  font-weight: 600;
+  font-weight: 500;
   user-select: none;
-  transition: 0.15s;
+  transition: background 0.14s, color 0.14s;
+}
+.group-header .g-folder-ico,
+.group-header .g-group-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--xy-text, var(--text));
+  border-radius: 4px;
+  transition: color 0.14s, transform 0.14s;
 }
 .group-header .g-folder-ico {
-  font-size: 13px;
-  flex-shrink: 0;
   cursor: pointer;
-  padding: 0 2px;
-  border-radius: 4px;
-  transition: 0.15s;
+}
+.group-header .g-folder-ico.is-current {
+  color: var(--xy-accent, var(--accent));
 }
 .group-header .g-folder-ico:hover {
-  background: var(--bg3);
-  transform: scale(1.15);
+  transform: scale(1.08);
 }
 .more-toggle {
-  padding: 5px 8px 5px 12px;
-  font-size: 11.5px;
-  color: var(--text-faint);
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
   cursor: pointer;
-  border-radius: 6px;
-  transition: 0.15s;
+  border-radius: 8px;
+  transition: background 0.14s, color 0.14s;
   user-select: none;
 }
 .more-toggle:hover {
-  color: var(--accent);
-  background: var(--bg2);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg2));
 }
 .group-header:hover {
-  background: var(--bg2);
-  color: var(--text);
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text));
 }
 .group-header .g-arrow {
-  font-size: 10px;
-  color: var(--text-faint);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--xy-text, var(--text));
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+.group-header .g-arrow.collapsed {
+  transform: rotate(-90deg);
 }
 .group-header .g-title {
-  flex: 1;
+  flex: 0 1 auto;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  color: var(--xy-text-2, var(--text-dim));
+}
+.group-header .g-title.is-current {
+  color: var(--xy-text, var(--text));
 }
 .group-header .g-count {
-  font-size: 10.5px;
-  color: var(--text-faint);
-  background: var(--bg3);
-  padding: 1px 6px;
-  border-radius: 6px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--xy-text-3, var(--text-faint));
+  margin-left: 2px;
 }
 .group-header .g-add, .group-header .g-del {
   background: none;
   border: none;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 12px;
-  padding: 0 4px;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 4px;
-  transition: 0.15s;
+  opacity: 0;
+  transition: opacity 0.14s, color 0.14s, background 0.14s;
+}
+.group-header .g-add {
+  margin-left: auto;
+}
+.group-header:hover .g-add,
+.group-header:hover .g-del {
+  opacity: 1;
 }
 .group-header .g-add:hover {
-  color: var(--accent);
-  background: var(--bg3);
+  color: var(--xy-text, var(--accent));
+  background: var(--xy-hover, var(--bg3));
 }
 .group-header .g-del:hover {
-  color: var(--red);
-  background: rgba(248, 81, 73, 0.15);
+  color: var(--xy-rose, var(--red));
+  background: var(--xy-rose-soft, rgba(248, 81, 73, 0.15));
 }
 
 .group-sessions {
-  padding-left: 6px;
+  padding-left: 12px;
   margin-top: 2px;
-  border-left: 1px solid var(--border);
-  margin-left: 10px;
 }
 .session-item {
   position: relative;
-  padding: 5px 9px;
-  border-radius: 7px;
+  padding: 6px 10px;
+  border-radius: 8px;
   cursor: pointer;
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 8px;
   margin-bottom: 2px;
-  border: 1px solid transparent;
+  border: none;
+  color: var(--xy-text-2, var(--text-dim));
+  transition: background 0.14s, color 0.14s;
 }
 .session-item:hover {
-  background: var(--bg2);
+  background: var(--xy-hover, var(--bg2));
 }
 .session-item.active {
-  background: var(--bg3);
-  border-color: var(--border);
+  background: var(--xy-active, var(--bg3));
+  color: var(--xy-text, var(--text));
+}
+.session-item.active .t {
+  font-weight: 500;
 }
 .session-item .t {
   flex: 1;
   min-width: 0;
-  font-size: 13px;
+  font-size: 12.5px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .session-item .m {
   flex-shrink: 0;
-  font-size: 11.5px;
-  color: var(--text-faint);
-  /* 右侧操作区（归档 ⤓ right:26px / 删除 ✕ right:6px 均为 absolute 定位）需要约 44px，
-     这里给时间预留等宽并右对齐，避免 hover 时按钮压在时间文字上 */
-  min-width: 44px;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
+  min-width: 36px;
   text-align: right;
+  transition: opacity 0.14s;
 }
-/* hover 时时间让位给操作按钮：两层文字不再叠在一起 */
 .session-item:hover .m {
-  visibility: hidden;
+  opacity: 0;
 }
-/* 悬停时删除按钮出现在最右侧，隐藏时间避免重叠 */
-.session-item:hover .m {
-  visibility: hidden;
-}
-/* 正在执行回合的会话：名称右侧显示旋转动画图标 */
-.session-item .s-spinner {
+.session-item .s-running-dot {
   flex-shrink: 0;
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--border);
-  border-top-color: var(--orange);
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  background: var(--xy-accent, var(--accent));
+  animation: xy-pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
-/* 状态提醒点：非当前会话任务完成/待确认/报错时显示，进入会话后消失 */
+@keyframes xy-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.4); opacity: 0.35; }
+}
 .session-item .s-dot {
   flex-shrink: 0;
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
 }
 .session-item .s-dot-green {
-  background: var(--green);
-  box-shadow: 0 0 4px var(--green);
+  background: var(--xy-green, var(--green));
 }
 .session-item .s-dot-yellow {
-  background: var(--orange);
-  box-shadow: 0 0 4px var(--orange);
+  background: var(--xy-amber, var(--orange));
 }
 .session-item .s-dot-red {
-  background: var(--red);
-  box-shadow: 0 0 4px var(--red);
+  background: var(--xy-rose, var(--red));
 }
 @keyframes spin {
   to { transform: rotate(360deg); }
@@ -2262,7 +2206,6 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--red);
   background: rgba(248, 81, 73, 0.15);
 }
-/* 归档按钮与删除按钮同处 hover 操作区：删除贴最右，归档紧邻其左 */
 .session-item .s-archive {
   position: absolute;
   right: 26px;
@@ -2290,7 +2233,6 @@ function getFolderTitle(g: SessionGroup) {
   opacity: 0.3;
   cursor: not-allowed;
 }
-/* 二次确认状态：时间位置显示红色小确认按钮 */
 .session-item.confirming .m {
   visibility: hidden;
 }
@@ -2312,7 +2254,6 @@ function getFolderTitle(g: SessionGroup) {
 .session-item .s-confirm:hover {
   filter: brightness(1.15);
 }
-/* 归档的确认按钮与删除同处操作区，但用主色表示这是可逆操作 */
 .session-item .s-confirm.archive {
   right: 26px;
   background: var(--accent);
@@ -2322,7 +2263,6 @@ function getFolderTitle(g: SessionGroup) {
   to { transform: translateY(-50%) scale(1); opacity: 1; }
 }
 
-/* 就地重命名输入框：占据名称位置，样式与条目文字保持一致 */
 .session-item .s-rename-input {
   flex: 1;
   min-width: 0;
@@ -2336,7 +2276,6 @@ function getFolderTitle(g: SessionGroup) {
   outline: none;
 }
 
-/* 会话右键菜单：fixed 浮层贴在鼠标位置，坐标由内联 style 计算（含视口收拢） */
 .session-ctx-menu {
   position: fixed;
   z-index: 3000;
@@ -2362,13 +2301,11 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--red);
   background: rgba(248, 81, 73, 0.15);
 }
-/* 排序菜单的禁用项：首个/末个分组无可移动方向 */
 .session-ctx-menu .ctx-item.disabled {
   opacity: 0.4;
   pointer-events: none;
 }
 
-/* 分组拖拽排序：源分组淡化，落点用上下插入线提示 */
 .session-group.dragging {
   opacity: 0.45;
 }
@@ -2401,7 +2338,6 @@ function getFolderTitle(g: SessionGroup) {
   cursor: grabbing;
 }
 
-/* 会话拖拽排序：与分组同一套视觉语言（源条目淡化 + 上下插入线） */
 .session-item.dragging {
   opacity: 0.45;
 }
@@ -2432,24 +2368,19 @@ function getFolderTitle(g: SessionGroup) {
 .session-item[draggable='true']:active {
   cursor: grabbing;
 }
-/* 会话菜单里的排序项与重命名/删除之间的分隔线 */
 .session-ctx-menu .ctx-sep {
   height: 1px;
   margin: 4px 2px;
   background: var(--border);
 }
 .side-footer {
-  padding: 7px;
-  border-top: 1px solid var(--border);
+  padding: 8px 8px 4px;
+  border-top: 1px solid var(--xy-border, var(--border));
   display: grid;
-  /* 左侧用户卡片占满剩余宽度，右侧两个图标按钮各自固定 32px */
   grid-template-columns: 1fr auto auto;
-  gap: 3px;
+  align-items: center;
+  gap: 4px;
 }
-/* 底部容器：账号浮层（TokenRhythmAccountPanel）以它为定位基准，
-   absolute + bottom: calc(100% + 8px) 即贴在用户卡片正上方。
-   浮层不放在 .side-footer 内部：主题 CSS 里的 `#sidebar .side-footer button`
-   会连带改掉浮层按钮外观，这里避让开。 */
 .side-bottom {
   position: relative;
   flex: 0 0 auto;
@@ -2458,132 +2389,136 @@ function getFolderTitle(g: SessionGroup) {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 7px 8px;
+  gap: 8px;
+  padding: 4px 4px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 8px;
   background: transparent;
-  color: var(--text-faint);
+  color: var(--xy-text-2, var(--text-faint));
   text-align: left;
+  transition: background 0.14s, color 0.14s;
 }
 .side-footer button:hover {
-  color: var(--text);
-  background: var(--bg2);
+  color: var(--xy-text, var(--text));
+  background: var(--xy-hover, var(--bg2));
 }
-/* 底部用户卡片：可点击打开基元律动登录窗（圆形头像 + 名称），hover 反馈
-   沿用 .side-footer button 的统一样式 */
 .side-footer .side-user {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 5px 7px;
-  color: var(--text-dim);
+  gap: 8px;
+  padding: 4px;
+  color: var(--xy-text, var(--text-dim));
   /* 名字已按 6 字符截断，这里再允许收缩一次：即使出现超长/不可断文本，
      也只让名字自己省略，不把右侧设置与手机图标挤出网格 */
   min-width: 0;
   overflow: hidden;
 }
 .side-footer .side-avatar {
-  flex: 0 0 26px;
-  width: 26px;
-  height: 26px;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
-  border-radius: 50%;
-  background: var(--bg3);
-  color: var(--text);
+  border-radius: 9999px;
+  background: var(--xy-text, var(--bg3));
+  color: var(--xy-canvas, var(--text));
   font-size: 12px;
   font-weight: 600;
 }
-/* 底部右侧图标按钮：设置与手机访问共用同一形态（32×32 圆形热区，与顶栏图标按钮同口径） */
 .side-footer .icon-btn {
-  width: 32px;
+  width: 28px;
+  height: 28px;
   justify-content: center;
-  padding: 7px;
+  padding: 0;
   gap: 0;
-  border-radius: 50%;
+  border-radius: 8px;
+  color: var(--xy-text, var(--text));
 }
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
-.footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.footer-copy b { font-size: 12px; font-weight: 500; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 手机访问绑定弹窗（结构参照 ConfirmModal 的 modal-mask 风格） */
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  padding: 16px;
+  background: var(--xy-modal-mask, rgba(0, 0, 0, 0.36));
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
-  backdrop-filter: blur(2px);
+  z-index: 5400;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 .modal {
-  width: 380px;
-  background: var(--bg1);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  width: min(400px, calc(100vw - 32px));
+  background: var(--xy-card, var(--bg1));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  box-shadow: var(--xy-shadow-pop, 0 16px 40px rgba(0, 0, 0, 0.35));
   overflow: hidden;
-  animation: remote-pop 0.2s;
+  animation: remote-pop 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 @keyframes remote-pop {
-  from { transform: scale(0.95); opacity: 0; }
+  from { transform: translateY(6px) scale(0.97); opacity: 0; }
   to { transform: none; opacity: 1; }
 }
 .modal-head {
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border);
+  padding: 18px 20px 12px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 .modal-head .mh-ico {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  background: var(--accent-soft);
-  color: var(--accent);
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--xy-accent-soft, var(--accent-soft));
+  color: var(--xy-accent, var(--accent));
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
 }
 .modal-head h3 {
-  font-size: 14.5px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--xy-text, var(--text-bright));
 }
 .modal-head p {
+  margin: 2px 0 0;
   font-size: 12px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
-/* 版本切换分段控件（移动端 / web远端，共用同一配对 token） */
 .bind-switch {
   display: flex;
   gap: 4px;
-  margin: 12px 18px 0;
+  margin: 0 20px 12px;
   padding: 3px;
-  background: var(--bg3, rgba(255, 255, 255, 0.04));
-  border: 1px solid var(--border);
+  background: var(--xy-surface, var(--bg3, rgba(255, 255, 255, 0.04)));
+  border: 1px solid var(--xy-border, var(--border));
   border-radius: 9px;
 }
 .bind-switch button {
   flex: 1;
-  padding: 7px 0;
+  padding: 6px 0;
   border: none;
   background: none;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 12.5px;
   border-radius: 6px;
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .bind-switch button.active {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--xy-card, var(--accent-soft));
+  color: var(--xy-text, var(--accent));
+  box-shadow: var(--xy-shadow-sm, none);
   font-weight: 600;
 }
 .modal-body {
-  padding: 18px;
-  background: var(--bg2);
+  padding: 4px 20px 18px;
+  background: transparent;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2607,60 +2542,103 @@ function getFolderTitle(g: SessionGroup) {
   font-size: 11.5px;
   color: var(--text-faint);
 }
-.modal-foot {
-  padding: 13px 18px;
+.bind-notice {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--warn, #c9791a);
+  text-align: center;
+  max-width: 100%;
+  word-break: break-all;
+}
+.bind-cloud-setup {
   display: flex;
-  gap: 9px;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  width: 100%;
+  box-sizing: border-box;
+}
+.bind-cloud-tip {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.btn-link-setup {
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.btn-link-setup:hover {
+  background: var(--accent);
+  color: #fff;
+}
+.modal-foot {
+  padding: 0 20px 18px;
+  display: flex;
+  gap: 8px;
   justify-content: flex-end;
 }
 .btn {
-  border-radius: 8px;
-  padding: 7px 16px;
+  height: 34px;
+  border-radius: 9px;
+  padding: 0 15px;
   font-size: 13px;
-  border: 1px solid var(--border);
-  background: var(--bg3);
-  color: var(--text);
-  transition: 0.15s;
+  font-weight: 500;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  background: transparent;
+  color: var(--xy-text-2, var(--text));
+  transition: background 0.14s ease, color 0.14s ease, filter 0.14s ease;
 }
 .btn:hover {
-  border-color: var(--text-faint);
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text));
 }
 .btn.primary {
-  background: var(--accent);
+  background: var(--xy-accent, var(--accent));
   border: none;
-  color: #fff;
-  font-weight: 600;
+  color: var(--xy-accent-fg, #fff);
+  font-weight: 500;
+}
+.btn.primary:hover {
+  background: var(--xy-accent, var(--accent));
+  color: var(--xy-accent-fg, #fff);
+  filter: brightness(0.93);
 }
 
-/* 秘书起名弹窗的输入框：样式沿用侧栏就地重命名输入框（.s-rename-input）的观感，
-   只是占满弹窗正文宽度（.modal-body 是居中列布局，需要显式 100%） */
 .s-name-input {
   width: 100%;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
+  background: var(--xy-surface, var(--bg2));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 8px;
+  color: var(--xy-text, var(--text));
   font-size: 13px;
   font-family: inherit;
-  padding: 8px 10px;
+  padding: 8px 11px;
   outline: none;
 }
 .s-name-input:focus {
-  border-color: var(--accent);
+  border-color: var(--xy-accent, var(--accent));
 }
 .s-name-hint {
   min-height: 15px;
   font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   text-align: left;
   align-self: stretch;
 }
 
-/* 秘书人设输入区：与名字输入框同一套观感，纵向可拉伸但限制最小高度，
-   让多行人设有足够书写空间又不把弹窗撑出屏幕 */
 .s-persona-label {
   font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   text-align: left;
   align-self: stretch;
 }
@@ -2669,22 +2647,20 @@ function getFolderTitle(g: SessionGroup) {
   min-height: 130px;
   max-height: 320px;
   resize: vertical;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
+  background: var(--xy-surface, var(--bg2));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 8px;
+  color: var(--xy-text, var(--text));
   font-size: 13px;
   font-family: inherit;
   line-height: 1.55;
-  padding: 8px 10px;
+  padding: 8px 11px;
   outline: none;
 }
 .s-persona-input:focus {
-  border-color: var(--accent);
+  border-color: var(--xy-accent, var(--accent));
 }
 
-/* 移动端侧栏遮罩：桌面端不显示，仅在 <=768px 侧栏展开时盖住主区。
-   层级低于侧栏（style.css 中 #main > #sidebar z-index:400）以便侧栏可点击 */
 .sidebar-backdrop {
   display: none;
 }

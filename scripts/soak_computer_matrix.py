@@ -1,4 +1,3 @@
-"""Run the three real computer probes repeatedly and record every result."""
 from __future__ import annotations
 
 import argparse

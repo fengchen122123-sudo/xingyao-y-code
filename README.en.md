@@ -1,12 +1,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.3.9](https://img.shields.io/badge/Version-1.3.9-green.svg)](core/version.py)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
+[![Version 1.4.0](https://img.shields.io/badge/Version-1.4.0-green.svg)](core/version.py)
 
 # Xingyao (Y-code)
 
 English | [中文](README.md)
 
-> A terminal-based AI coding assistant built in China, codenamed "Xingyao". It ships both as a TUI console and a GUI window, with multi-model switching, subagent orchestration, plan execution, long-term memory, MCP extension, and a pluggable skill system.
+> A desktop + terminal AI coding assistant built in China, codenamed "Xingyao". It ships as a GUI window and a TUI console, with multi-model switching, subagent orchestration, plan and workflow execution, long-term memory, MCP extension, pluggable skills and plugins, scheduled automation tasks, a desktop pet, and LAN remote access from your phone.
 
 > **Before you start**: This project is an AI coding assistant that runs on your local machine. It does not provide model services itself — you configure your own models and the software talks to them directly. AI-generated content may be inaccurate and requires your own review and verification. The software can read and write files and execute commands, so please read the "Disclaimer" section below before use — both the installer and the first launch will prompt you to confirm.
 
@@ -22,13 +22,19 @@ English | [中文](README.md)
 - **9 terminal themes**: cyan / matrix / nord / cyberpunk / dracula / lava / sunset / amber / white, switchable with `/theme`.
 - **Terminal Markdown rendering**: Syntax-highlighted code blocks, tables, lists, and other rich text.
 - **Thinking stream display**: Shows the model's reasoning in real time (parses `<thinking>` tags with sentence-boundary buffering).
+- **Minimal interface**: Frameless window with unified design tokens — breadcrumb in the session header, workspace chip, tool-execution rail rows, and single-column row lists on settings subpages. Window controls and all icons are vector strokes.
+- **Turn metrics**: Live output speed while a turn runs; once it finishes, the whole-task wall-clock duration is shown (stamped onto that turn and kept for the next one), with a tooltip separating task duration from model time.
+- **Document tab in the right panel**: Preview PDF / Word / Excel / PPT in place, annotate them (highlight, box, arrow, sticky note, etc.), cover and rewrite with white blocks, delete / rotate / insert pages, and save the result as a new PDF.
+- **Novel workspace**: The right-panel "Novel" tab tracks each book — open a chapter to read or revise it, with foreshadowing / characters / volume outlines collected in setting tables, plus word-count trends, a read-only health check, and full-book export.
+- **Desktop pet**: A small always-on-top pet window that comments on task progress; custom pet packs can be swapped from the settings page (takes effect after restarting the pet), and idle chatter thresholds and model are configurable.
 
 ### Models and tools
 
-- **Multi-model management**: `/models` opens a full-screen model selector supporting OpenAI / Anthropic / DeepSeek / Agnes and other protocols, unified through a self-built HTTPX engine (`core/llm_native_transport.py`).
+- **Multi-model management**: `/models` opens a full-screen model selector supporting OpenAI / Anthropic / DeepSeek / StepFun and other protocols, unified through a self-built HTTPX engine (`core/llm_native_transport.py`). Preset providers only carry provider info; models are picked from a live "fetch available models" list — endpoint auto-assembly, alternate spelling on 404, multi-key retry, and context window / max output / vision extracted from each vendor's fields (with a local spec table as fallback).
 - **Secondary model support**: Configure a secondary model to handle vision recognition, memory compression, and subagent calls, splitting work between primary and secondary.
-- **29 built-in tools**: File read/write, code search, command execution, web fetching, image download and generation, weather, LSP symbol lookup, plan orchestration, intelligent routing, and more.
-- **Tool result caching**: Identical searches and reads hit a local cache automatically, saving tokens and time.
+- **94 default-registered tools** (`computer_action` is added when computer control is enabled, plus 5 dedicated tools from the iMOM locator plugin): File read/write with atomic batch edits, cross-file code search plus symbol outlines and references, command execution and background tasks, web fetching and free news search, image and video generation, weather, plan orchestration, subagent dispatch and secretary cross-project search, session / model / skill / plugin / hook management, office document read/write, the novel writing toolchain, and computer control plus Windows system tools.
+- **Free web search**: 360 Search first, Bing RSS as fallback; no third-party package dependency (timeouts slow it down but never disable it).
+- **Tool result caching**: Identical searches and reads from read-only tools hit an in-process cache, saving tokens and time.
 
 ### Core harness
 
@@ -37,29 +43,42 @@ English | [中文](README.md)
 - **Crash recovery**: Incomplete turns are only marked `interrupted` and are never automatically replayed — no model requests, commands, or file writes are re-executed.
 - **Request fingerprinting**: An immutable fingerprint is generated for the final provider request, paired with byte-golden regression tests to prevent cache drift.
 - **Tool pipeline**: Same-signature repeat-call suppression (RepeatCallGuard) and batched concurrent execution of adjacent read-only tools.
+- **Resume decisions**: Interrupted turns resume from a decided step according to a decision table; tool events are written to the journal as redacted facts (replay markers only, no new state transitions).
+- **Context caching**: A stable prefix (everything invariant across turns folded into the system prompt) plus four-level watermarks (snip / fold / summarize). Insert-mode compression reuses the main request bytes, so cache hit rate does not collapse as the conversation grows.
 
 ### Advanced orchestration
 
 - **Subagent system**: 5 built-in types (explore / implement / test / review / general) plus custom subagents, with dependency-aware parallel scheduling and nesting up to 3 levels deep.
 - **Plan execution mode**: For multi-step tasks (more than 3 subtasks after decomposition), a `plan_write` plan is created first and subtasks are dispatched along the dependency graph, with pause / resume / retry / cancel support.
 - **Background task management**: Long-running commands execute in the background. `/tasks` shows status, `/tasks tail` streams logs, `/tasks kill` terminates.
-- **Permission system**: Four modes (confirm before changes / accept_edits for automatic edits / plan mode / full access), with a sandbox controlling working-directory access boundaries.
+- **Permission system**: Five modes (confirm before changes / accept_edits for automatic edits / auto_decision for JEV-assisted approval / plan mode / full access), with a sandbox controlling working-directory access boundaries.
+- **Scheduled automation tasks**: Bind a prompt to interval / daily / weekly / startup / one-off triggers; the task starts a full agent turn in the chosen session on schedule. Choose a fresh session each run or reuse a fixed one, missed runs catch up by default, and unattended permission is limited to confirm / accept-edits.
+- **Workflow orchestration**: A `.dwf.ts` script declares phases with subagents, commands, and reports; saving it also generates a skill of the same name, and it runs via `/workflow` or `workflow_run` with live step events.
+- **Secretary dispatch ledger**: Every dispatch is recorded (queued / running / done / failed / cancelled / dependency unmet), the result summary is written back to the originating session, and a batch can hold up to 8 tasks with intra-batch dependencies.
+- **Task decision hooks**: Control points (loop stop-loss, subagent acceptance, etc.) can call the JEV decision model with per-scene toggles, configurable thresholds, and fail-open fallback.
 
 ### Memory and context
 
 - **SQLite session memory**: Switch between multiple sessions; undo never rewrites history, so conversations stay intact.
 - **Per-turn undo**: Controlled file modifications in each turn are snapshotted persistently. `/undo` runs a full pre-check before a one-click revert — zero writes on conflict, recoverable after crashes — and the model learns through context that the file results are invalid.
 - **Long-term memory system**: Four memory types (user / feedback / project / reference) plus daily logs and a Dream consolidation thread. Supports "remember XXX" instructions.
-- **Intelligent memory compression**: Automatically compresses when history reaches 70% of the context window, pre-truncates tool results, and estimates tokens precisely with tiktoken.
+- **Intelligent memory compression**: Four-level watermarks — at 60% of the window tool results are snipped / folded, at 80% elided, at 95% a model summary runs. After 240s idle a local watermark pass and pre-compression also run; trigger decisions use the previous turn's real API usage as the baseline.
 - **Session export**: `/share` exports to Markdown / HTML / JSON in one command.
+- **Project profile**: Records tech stack / architecture decisions / hard constraints / pitfalls / preferences per project directory and injects the relevant sections automatically each turn; writes only touch Xingyao's own memory directory.
+- **Self-evolution**: Learns quietly after each turn to build a user profile and self model, viewable or switchable off in settings.
+- **Summary recall**: Each compression archives a generation; `recall_history` can pull back the original messages behind a summary boundary, so details never have to be guessed.
 
 ### Extension ecosystem
 
 - **Skill system (Skills)**: Scans `SKILL.md` files and injects them into the system prompt, supporting both project-level and user-level skills.
-- **Plugin system (Plugins)**: In-process plugins extend tool capabilities with zero core intrusion; a failing plugin never blocks startup. Ships with a Hunyuan text-to-image plugin and supports hot-loading of user-level plugins.
+- **Plugin system (Plugins)**: In-process plugins extend tool capabilities with zero core intrusion; a failing plugin never blocks startup. Ships with 6 built-in plugins and supports hot-loading of user-level plugins.
 - **MCP client**: A full-screen CLI configurator with 10+ preset templates (Feishu / Amap / Bilibili / SQLite / Postgres, etc.). The AI can configure MCP itself.
 - **Git worktree**: `/worktree` manages parallel multi-branch workspaces.
 - **Git workbench**: A GUI "Source Control" tab plus the CLI `/git` command (status / diff / stage / commit / branch / sync / stash / history / conflicts), with automatic refresh on external changes, repository trust confirmation, and double confirmation for high-risk operations. AI-initiated Git operations in conversations still follow the normal permission flow.
+- **Deletable skills and plugins**: A trash button at the end of each row deletes the directory after double confirmation. Bundled sources and built-in plugins are refused, and symlinks or out-of-root paths are rejected (the phone remote API is blocked from these actions too).
+- **Bundled skills and plugins**: 15 skill packs ship in the repo (Baoyu-series WeChat / Xiaohongshu illustration, prompt expansion and optimization, WeChat layout, explainer video, office documents, plugin authoring) along with 6 plugins (Hunyuan image, TokenRhythm image / video, office documents, novel workspace, Windows system tools).
+- **GUI theme system**: Built-in skins plus custom themes — copy / rename / import-export ZIP / read image assets inside a theme.
+- **Phone remote access**: A relay service connects desktop sessions over LAN or the internet; a phone browser opens the full desktop interface (device registration with its own token), and event broadcasting is asynchronous so a silent phone never blocks the desktop.
 
 ## 🚀 Quick Start
 
@@ -301,7 +320,7 @@ Type these in the CLI input box (Tab completion supported). The desktop GUI only
 
 | Command | Description |
 |------|------|
-| `/permission <confirm\|accept_edits\|plan\|full>` | Switch permission level |
+| `/permission <confirm\|accept_edits\|auto_decision\|plan\|full>` | Switch permission level |
 | `/sandbox <on\|off>` | Toggle the sandbox (on = allow access outside the working directory) |
 | `/turns <10-1000>` | Set the maximum model turns per task (default 100) |
 | `/clear` | Clear the screen |
@@ -346,46 +365,131 @@ The desktop app does not provide commands for actions that already have GUI butt
 `/agent` and `/workflow` currently hand off to the model via prompt rather than calling tools directly: the command itself neither starts a subagent nor executes a workflow — it only writes the type, name, and arguments into the current turn's prompt so the model can invoke the corresponding tool.
 
 ## 🛠️ Built-in Tools
+Y-code registers 94 tools by default (`computer_action` is added when computer control is enabled, excluding the 5 dedicated tools from the iMOM project-locator plugin stack), grouped by purpose:
 
-Y-code ships 29 built-in tools (excluding the 5 locator tools from the iMOM project-locator plugin stack), split into read-only and mutating groups:
-
-### Read-only tools
+### Files and code (read-only)
 
 | Tool | Function |
-|------|------|
-| `read_file` | Read a file (supports offset/limit/line numbers/compression; large files are auto-truncated) |
-| `list_directory` | List directory contents |
-| `search_code` | Cross-file code search (based on ripgrep) |
+|------|----------|
+| `read_file` | Read a file (offset/limit/line numbers/compression; large files are auto-truncated) |
+| `list_directory` | List directory contents (supports depth=2..4 trees) |
 | `glob_files` | Find files by glob pattern |
-| `find_definition` | Locate symbol definitions (Python/JS/TS/Go/Rust/Java/C/C++/C#) |
-| `search_news` | Online news search |
-| `fetch_url` | Fetch web pages or JSON (with SSRF protection) |
-| `get_weather` | Query real-time weather for a city |
+| `search_code` | Cross-file code search (ripgrep-based, bad regex falls back to literal) |
+| `get_outline` | Extract a source file's structure outline (classes / function signatures with line ranges) |
+| `find_definition` | Locate a symbol definition (Python/JS/TS/Go/Rust/Java/C/C++/C#) |
+| `find_references` | Find all references to a symbol across files (word-boundary, for impact analysis) |
+| `tool_result_read` | Retrieve the original text behind a folded (snip/elide) tool result |
 
-### Mutating tools
+### File changes and commands
 
 | Tool | Function |
-|------|------|
-| `write_file` | Create a new file or fully rewrite a small file (refuses to overwrite existing files over 500 lines) |
-| `edit_file` | Edit an existing file locally (string-match or line-number paths, with intelligent similarity fallback) |
-| `execute_command` | Execute local commands (30s default timeout, background execution supported) |
-| `fetch_image` | Safely download a web image locally (http/https only, png/jpg/gif/webp allowlist, 10MB limit) |
-| `hunyuan_generate_image` | Tencent Hunyuan text-to-image: generate an image from a text description and save it locally (multiple sizes, custom watermark, 10–60 seconds) |
-| `tokenrhythm_generate_image` | TokenRhythm text-to-image: qwen-image-2.0 / wan2.7-image models, downloaded immediately after generation (requires the plugin toggle and provider key; off by default) |
-| `tokenrhythm_edit_image` | TokenRhythm image-to-image: upload 1 source image (≤10MB) plus a text instruction (same prerequisites) |
+|------|----------|
+| `write_file` | Create a new file or fully rewrite a small one (refuses to overwrite existing files over 500 lines) |
+| `edit_file` | Patch an existing file locally (string-match / line-range paths, with similarity fallback) |
+| `multi_edit` | Atomic batch edits within one file (single lock, single write; any failure aborts the whole batch) |
+| `execute_command` | Run local commands (30s default timeout, background mode, child-process env protection) |
+| `undo_turn` | Revert all controlled file changes in a turn (pre-checks first; refuses if files changed afterwards) |
+
+### Network and media
+
+| Tool | Function |
+|------|----------|
+| `fetch_url` | Fetch a web page or JSON (with SSRF protection) |
+| `fetch_image` | Safely download a web image (http/https only; png/jpg/gif/webp whitelist, 10MB cap) |
+| `search_news` | Web / news search (360 Search first, Bing RSS fallback) |
+| `get_weather` | Current weather and short-term forecast for a city |
+| `hunyuan_generate_image` | Tencent Hunyuan text-to-image (multiple sizes, image-to-image, custom watermark) |
+| `tokenrhythm_generate_image` | TokenRhythm text-to-image with qwen-image-2.0 / wan2.7-image, 1–4 images per call |
+| `tokenrhythm_edit_image` | TokenRhythm image-to-image: one source image plus an instruction |
+| `tokenrhythm_generate_video` | TokenRhythm text-to-video / image-to-video: 2–30s, 480P / 720P / 1080P, billed per second |
+
+> The three TokenRhythm tools require enabling the `tokenrhythm_image` / `tokenrhythm_video` plugins and configuring the matching provider key (off by default).
+
+### Sessions and memory
+
+| Tool | Function |
+|------|----------|
+| `session_manage` | Session maintenance (list / create / rename / delete / archive / move workdir / clear / compress / checkpoints / undo records) |
+| `session_export` | Export a session to md / html / json |
+| `search_sessions` | Full-text search across sessions, including compressed-away early messages |
+| `search_conversations` | Search sessions by name or content |
+| `recall_history` | Pull back earlier messages that were compressed out of the current session |
+| `read_project_profile` | Read a project profile (stack / decisions / constraints / pitfalls / preferences / task log) |
+| `remember_decision` | Record a project-level conclusion into a specific profile section |
+
+### Planning and dispatch
+
+| Tool | Function |
+|------|----------|
 | `ask_user` | Ask the user a clarifying question (1–3 options) |
-| `manage_task` | Inspect or terminate background tasks |
-| `run_subagent` | Start an auxiliary agent (5 built-in types plus custom) |
-| `plan_write` | Create or replace the task plan |
-| `plan_read` | Read plan status |
-| `plan_update` | Update plan item metadata |
-| `plan_retry` | Reset a failed item to pending |
-| `plan_finish` | Complete a plan item taken over by the main agent (and run its verification command) |
-| `plan_resume_takeover` | Resume a plan item handed to the main agent after a timeout |
-| `mcp_add_server` | Add an MCP server configuration |
-| `mcp_remove_server` | Remove an MCP server configuration |
-| `mcp_set_enabled` | Enable / disable an MCP server |
-| `mcp_list_servers` | List all MCP servers (API keys masked) |
+| `plan_write` / `plan_read` / `plan_update` | Create, read, and update a task plan |
+| `plan_retry` | Reset a failed item to pending and dispatch it again |
+| `plan_finish` | Finish a plan item taken over by the main agent (actually runs its verification command) |
+| `plan_resume_takeover` | Resume a plan item that timed out and moved to the main agent |
+| `run_subagent` | Start an auxiliary agent (5 built-in types plus custom subagents) |
+| `manage_task` | Inspect / wait on / kill background tasks and background subagents |
+| `dispatch_task` / `dispatch_batch` | Secretary dispatch (single / batch, with intra-batch dependencies) |
+| `list_dispatches` / `get_dispatch_result` | Review the dispatch ledger and results |
+| `list_projects` / `list_sessions` / `read_session` | Secretary cross-project session listing and paginated history reading |
+| `manage_memory` | Secretary personal long-term memory management (`~/.ycode/memory/` only) |
+| `open_session` | Open (switch to) a session |
+| `create_project` | Create a project in a directory (including AGENTS.md scaffolding) |
+
+### Workflows and automation
+
+| Tool | Function |
+|------|----------|
+| `workflow_list` / `workflow_save` / `workflow_run` / `workflow_finish` | Inspect, save, run, and close out workflows |
+| `automation_list` / `automation_create` / `automation_update` / `automation_delete` / `automation_run_now` | Manage scheduled automation tasks (interval / daily / weekly / startup / one-off triggers) |
+
+### Administration and operations
+
+| Tool | Function |
+|------|----------|
+| `model_manage` | Add/remove providers and models, switch the active model, set reasoning effort, test connectivity, fetch a vendor's model list |
+| `skill_manage` | List, enable/disable, rescan skills, or restore a built-in version |
+| `plugin_manage` | List plugins, enable/disable, run plugin settings actions |
+| `hook_manage` | List, add/edit, delete, and disable hooks (no trust granting) |
+| `usage_stats` | Token usage over 1 / 7 / 30 / 365 days, by model and cache hit rate |
+| `update_manage` | Self-update check, download, install, and cache cleanup |
+| `system_settings` | Read/write non-security settings (default shell, step limit, search excludes, AI output dir) |
+| `doctor_run` | Aggregated self-check (environment / config / credentials / database / MCP / model endpoints) |
+| `diagram_manage` | Export Mermaid diagrams to local HTML, list and open them |
+| `theme_manage` | View, activate, copy, import/export themes |
+| `persona_manage` | Read/write persona (agent name, persona body, how it addresses you) |
+| `decision_manage` | Configure the JEV decision model, probe keys, set the four business scenes |
+| `feishu_manage` | Configure the Feishu channel, validate credentials, check connection status |
+| `lan_manage` | LAN phone-remote service status, start/stop |
+| `mcp_add_server` / `mcp_remove_server` / `mcp_set_enabled` / `mcp_list_servers` | Add/remove MCP servers, enable/disable, list (keys masked) |
+
+### Computer control and system (Windows-only parts noted)
+
+| Tool | Function |
+|------|----------|
+| `computer_control` | Computer-control run control (status / pause / resume / emergency stop / browser options) |
+| `computer_action` | Single-step action and observation on a browser or the desktop (element refs first, `sequence` batching and conditional waits; registered only when computer control is enabled) |
+| `browser_pane` | Open / navigate / back-forward / reload the embedded browser pane |
+| `browser_set_viewport` | Set the project browser resolution (375×667 for mobile pages, 1440×900 for desktop) |
+| `screenshot_capture` | Capture the screen (full or region) to a local file |
+| `clipboard_image` | Read an image from the clipboard and save it |
+| `pty_manage` | Persistent shell pseudo-terminal (keeps cwd / REPL state) |
+| `windows_process_list` / `windows_process_kill` | List / kill processes (protected system processes refused) |
+| `windows_clipboard_get` / `windows_clipboard_set` | Read / write clipboard text |
+| `windows_registry` | Read-only registry access (keys and values; no writes) |
+| `windows_notify` | Show a Windows message box |
+
+### Office and novels
+
+| Tool | Function |
+|------|----------|
+| `office_read` | Read xlsx / xlsm / docx / pptx / pdf and convert to structured Markdown |
+| `office_write` | Generate a standard Excel file (header styling, zebra rows, frozen header, autofilter, print layout) |
+| `novel_init` | Initialize a novel project (directory tree, project marker, 7 writing subagents, reference material) |
+| `novel_status` | Novel project status (chapters written, total words, today's words, next chapter, foreshadow count) |
+| `novel_outline` | Read volume-outline sections by unit / scope (outline stage / writing stage / table of contents) |
+| `novel_track` | Commit a per-chapter tracking transaction (foreshadowing, character state, timeline, context rendering) |
+| `novel_wordcount` | Count visible body words with the shared measurement |
+| `novel_audit` | Deterministic novel health check (tracking gaps, overdue foreshadowing, short chapters, missing outlines, AI patterns) |
 
 > The built-in "iMOM manufacturing system locator" plugin separately provides five tools: `imom_register_project` / `imom_list_projects` / `imom_use_project` / `imom_build_index` / `imom_locate`. They perform four-layer page → Controller → SqlMapping localization for iMOM/MES project code and are useful in iMOM-related projects.
 
@@ -425,12 +529,13 @@ For multi-step tasks (more than 3 subtasks after decomposition), create an execu
 
 ## 🔒 Permissions and Security
 
-### Four permission modes
+### Five permission modes
 
 | Mode | Description |
 |------|------|
 | `confirm` (default) | Queries pass automatically; any modification, deletion, or execution change is asked first |
 | `accept_edits` | Queries plus ordinary edits and builds pass automatically; deletions, dependency installs, process termination, Git commit/push, and other sensitive operations are still asked |
+| `auto_decision` | Permission requests and clarifying questions are evaluated automatically by the decision model (JEV); falls back to user confirmation when unconfigured or high-risk |
 | `plan` | Only reads, read-only queries, plan metadata, and user clarifications are allowed; modifications and deletions are rejected outright with no authorization bypass |
 | `full` | All non-catastrophic operations inside the sandbox pass automatically; access outside the sandbox depends on the sandbox toggle |
 
@@ -484,8 +589,10 @@ Four memory types, modeled on Claude's memory pattern:
 **Dream consolidation**: A background thread collects recent logs plus the MEMORY.md index, uses a large model to generate a consolidation strategy, and updates the categorized memory files.
 
 ### Memory compression
-- Trigger threshold: history reaches 70% of the context window
-- Tool results are pre-truncated (long results keep the head, the tail, and a placeholder)
+- Four-level watermarks: at 60% of the window tool results are snipped / folded → at 80% elided → at 95% a model summary (LLM compression) runs
+- Insert-mode compression reuses the bytes of the session's last main request and appends the compression instruction; if the snapshot is missing or the route does not support it, it silently falls back to the segmented path
+- Idle maintenance: after 240s of user idleness (`memory_compression.idle_maintenance_seconds`, 0 disables) a local watermark pass and pre-compression run
+- Tool results are pre-truncated (long results keep the head, the tail, and a placeholder); each message's bytes can be rewritten at most twice and freeze permanently afterwards, keeping the cached prefix stable
 - Token estimation prefers tiktoken (cl100k_base), falling back to character-count approximation
 
 ## 🔌 MCP Integration
@@ -518,6 +625,8 @@ Built on `SKILL.md` files that are injected into the system prompt and influence
 3. Project level: explicitly configured via `skill_search_paths` in `config.json`
 
 **Built-in skills ship with the installer**: The bundled `skills/` are released to `~/.ycode/skills/` on first launch and enabled by default. **Built-in skills that have been released and never modified by the user upgrade automatically with new versions**; anything the user modified is preserved, and anything the user deleted stays deleted.
+
+**Deletion**: the trash button at the end of each row deletes the skill directory after double confirmation, removes it from the active list, and clears its fingerprint cache. Sources inside the installer are refused, as are symlinked or out-of-root paths.
 
 **Skill file format**:
 ```markdown
@@ -552,9 +661,14 @@ plugins/<plugin_name>/          # Built-in plugins (shipped with the repo)
 | Plugin | Location | Function |
 |------|------|------|
 | Hunyuan text-to-image | Repo `plugins/hunyuan_image/` | Tencent Hunyuan text-to-image; data is compiled into the PYZ. The key is read only from the `HUNYUAN_API_KEY` environment variable and never stored in code; the tool reports a clear error when unconfigured |
-| iMOM locator | `~/.ycode/plugins/imom_locator/` | Multi-project code localization for iMOM/MES: dynamic publish discovery, system identification, page index building, and millisecond-level lookup |
+| TokenRhythm image / video | Repo `plugins/tokenrhythm_image/`, `plugins/tokenrhythm_video/` | Text-to-image (qwen-image-2.0 / wan2.7-image), image editing, and text/image-to-video (wan3.0-video, billed per second); enable in the plugin page and configure the provider key — off by default |
+| Office documents | Repo `plugins/office/` | `office_read` / `office_write`: read xlsx / docx / pptx / pdf and generate standard-format Excel |
+| Novel workspace | Repo `plugins/novel_workspace/` | Six tools: `novel_init` / `status` / `outline` / `track` / `wordcount` / `audit` |
+| Windows system tools | Repo `plugins/windows_tools/` | List / kill processes, read / write clipboard text, read-only registry, system notification (Windows only) |
+| iMOM locator | `~/.ycode/plugins/imom_locator/` (user level) | Multi-project code localization for iMOM/MES: dynamic publish discovery, system identification, page index building, and millisecond-level lookup |
 
 > User-level plugins live in `~/.ycode/plugins/<plugin_name>/`; a plugin with the same name overrides the built-in/repository version.
+> The trash button on the plugins page physically deletes user-level plugins, or soft-removes built-in plugins (recorded in the removed list without deleting bundled files; restorable from the "Removed" view or via `/plugins restore`). The phone remote API blocks deletion, toggling, and restoration.
 
 ## 📁 Project Structure
 
@@ -562,35 +676,58 @@ plugins/<plugin_name>/          # Built-in plugins (shipped with the repo)
 xingyao-y-code/
 ├── main.py                  # CLI entry point
 ├── gui_main.py              # GUI entry point (pywebview)
-├── gui_bridge.py            # GUI JS-API bridge layer
+├── gui_bridge.py            # GUI JS-API bridge (split into browser / git / pet / snip mixins)
 ├── config.py                # Config loading (atomic writes + self-healing)
 ├── config.example.json      # Config template
-├── system_prompt.md         # System prompt
-├── core/                    # Core modules
+├── system_prompt.md         # System prompt (CLI)
+├── system_prompt_gui.md     # System prompt (GUI)
+├── system_prompt_secretary_gui.md  # System prompt (secretary sessions)
+├── core/                    # Core modules (144 Python modules)
 │   ├── version.py           # Version number (single source of truth)
 │   ├── agent_service.py     # Conversation service (shared by CLI/GUI)
-│   ├── harness/             # Fixed main-agent kernel (strict state machine / SQLite journal / tool pipeline)
-│   ├── llm.py               # Model request entry and tool orchestration (custom HTTPX engine)
+│   ├── harness/             # Main-agent kernel (state machine / journal / tool pipeline / resume policy)
+│   ├── computer/            # Computer control (browser channel / desktop UIA / element locating / settings)
+│   ├── cloud_relay/         # Cloud relay client and portal
+│   ├── serve/               # LAN services and metrics
+│   ├── workflows/           # Workflow parsing, execution, and ledger
+│   ├── automation/          # Scheduled automation tasks and triggers
+│   ├── hooks/               # Lifecycle hooks
+│   ├── git/                 # Git workbench bridge
+│   ├── feishu/              # Feishu channel
+│   ├── slash_commands/      # Desktop slash commands
+│   ├── turn_undo/           # Per-turn undo snapshots
+│   ├── llm.py               # Model request entry and tool orchestration
+│   ├── llm_native_transport.py  # Custom HTTPX transport (HTTP/2, in-flight abort)
+│   ├── model_discovery.py   # Vendor model-list fetching (shared by CLI / GUI)
+│   ├── model_selector.py    # Full-screen model selector (with model-list picking)
+│   ├── model_manager.py     # Multi-model configuration management
 │   ├── tools.py             # Local tool implementations
 │   ├── tool_registry.py     # Tool registry
 │   ├── tool_protocol.py     # Tool protocol (ToolSpec metadata)
+│   ├── tool_result_maintenance.py  # Tool-result snip / elide maintenance
 │   ├── memory.py            # SQLite session memory + checkpoints
-│   ├── memory_compressor.py # Memory compression
+│   ├── memory_compressor.py # Memory compression (segmented / insert mode)
 │   ├── memory_kairos.py     # Long-term memory + dream consolidation
+│   ├── memory_compression.py# Compression policy config
+│   ├── cache_keepalive.py   # Prompt-cache keepalive
+│   ├── idle_maintenance.py  # Idle watermark maintenance and pre-compression
+│   ├── project_profile.py   # Project profile
+│   ├── novel_service.py     # Novel project service (word count / tracking / audit)
+│   ├── pet_skins.py         # Desktop pet packs (frame sequences)
+│   ├── decision_service.py  # JEV decision-model integration
 │   ├── plan.py              # Plan management
 │   ├── task_manager.py      # Background task management
 │   ├── task_scheduler.py    # Dependency-aware execution scheduler
 │   ├── subagent_registry.py # Subagent registry
 │   ├── permission_broker.py # Permission broker
+│   ├── command_policy.py    # Command risk tiers and child env policy
 │   ├── mcp_client.py        # MCP client
 │   ├── mcp_selector.py      # MCP full-screen configurator
-│   ├── skills.py            # SKILL.md scanning and injection
+│   ├── skills.py            # SKILL.md scanning, injection, and deletion
 │   ├── skill_selector.py    # Skill selector
-│   ├── plugin_loader.py     # Plugin loader
+│   ├── plugin_loader.py     # Plugin loader (hot-load / soft-remove & restore / deletion)
 │   ├── lsp.py               # LSP-lite symbol lookup
 │   ├── worktree.py          # Git worktree
-│   ├── model_manager.py     # Multi-model configuration management
-│   ├── model_selector.py    # Full-screen model selector
 │   ├── session_selector.py  # Full-screen session selector
 │   ├── thinking_stream.py   # Thinking stream buffering
 │   ├── reasoning_stream.py  # Reasoning stream parsing
@@ -599,7 +736,7 @@ xingyao-y-code/
 │   ├── turn_renderer.py     # Turn rendering
 │   ├── history_renderer.py  # History rendering
 │   ├── tool_presenter.py    # Tool presentation
-│   ├── tool_cache.py        # Tool result cache
+│   ├── tool_cache.py        # In-process read-only tool result cache
 │   ├── context_builder.py   # Context building
 │   ├── turn_controller.py   # Turn control
 │   ├── input_parser.py      # User input parsing
@@ -611,30 +748,40 @@ xingyao-y-code/
 │   ├── runtime_warnings.py  # Runtime warnings
 │   ├── ui_markers.py        # UI markers
 │   └── app_context.py       # Application context
-├── frontend/               # GUI frontend (Vue 3 + TypeScript + Vite)
+├── frontend/               # GUI frontend (Vue 3 + TypeScript + Vite, 75 Vue components)
 │   ├── src/
-│   │   ├── components/      # 29 Vue components
+│   │   ├── components/      # Vue components
 │   │   ├── composables/     # Composables (panel drag, viewport detection, etc.)
 │   │   ├── stores/          # Pinia state management
 │   │   └── utils/
 │   ├── package.json
 │   └── vite.config.ts
-├── skills/                 # Built-in skill examples
-├── plugins/                # Built-in plugin directory
+├── frontend-mobile/        # Phone pages (served by the relay service)
+├── relay_server/           # Relay server (device registration / own tokens / static assets)
+├── pets/                   # Bundled desktop pet packs (frame sequences)
+├── site_admin/             # Website admin (site info and download package management)
+├── website/                # Static website
+├── skills/                 # Built-in skills (15 skill packs)
+├── plugins/                # Built-in plugins (Hunyuan image / TokenRhythm image & video / office / novel workspace / Windows tools)
 ├── vendor/ripgrep/         # Bundled ripgrep
+├── vendor/mermaid/         # Bundled Mermaid rendering assets
+├── assets/                 # CHANGELOG, icons, and other packaging assets
 ├── packaging/              # Packaging helpers
-├── tests/                  # pytest test cases (117 files)
+├── scripts/                # Maintenance scripts
+├── tests/                  # pytest test cases (394 files)
 ├── docs/                   # Documentation
 │   ├── BUILD.md            # Build documentation
 │   ├── all_features.md     # Full feature documentation
+│   ├── module_map.md       # Module map
 │   └── superpowers/        # Design and planning documents
 ├── build_release.py        # Windows release build pipeline
+├── publish_release.py      # Release upload script
 ├── ycode.spec              # PyInstaller spec for both entry points
 ├── ycode_setup.py          # Windows install wizard (classic style, user/machine scopes)
 ├── ycode_setup.spec        # Install wizard build spec (reference for manual builds)
 ├── ycode_uninstall.py      # Windows uninstall wizard (classic-style GUI)
 ├── ycode_uninstall.spec    # Uninstall wizard build spec
-└── README.md               # This file
+└── README.md               # Chinese version (this is README.en.md)
 ```
 
 ## ⚙️ Configuration Reference
@@ -658,6 +805,7 @@ Config file location: `~/.ycode/config.json`. A fresh install starts with a clea
     "max_output_bytes": 1048576
   },
   "search_exclude_dirs": ["target", "out", "bin", "obj"],
+  "subagent_enabled": true,
   "memory_compression": {
     "retain_count": 8,
     "retain_count_force": 4,
@@ -665,7 +813,10 @@ Config file location: `~/.ycode/config.json`. A fresh install starts with a clea
     "tool_result_preview_limit_chars": 800,
     "tool_result_token_limit": 600,
     "summary_length_first": 250,
-    "summary_length_merge": 350
+    "summary_length_merge": 350,
+    "insert_mode": true,
+    "precompress_ratio": 0.85,
+    "idle_maintenance_seconds": 240
   },
   "providers": [...],
   "theme": "cyan",
@@ -686,14 +837,20 @@ Config file location: `~/.ycode/config.json`. A fresh install starts with a clea
 | `secondary_model_roles` | Secondary model role switches (vision / compression / subagent) |
 | `image_compression` | Image compression parameters (default: long edge 1536, quality 90, target 1MiB) |
 | `search_exclude_dirs` | Directories excluded from code search |
-| `memory_compression` | Memory compression parameters |
+| `subagent_enabled` | Global subagent switch: `false` disables subagent dispatch and plan orchestration tools (plan_write/plan_update); all subtasks are done directly by the main agent (default `true`) |
+| `memory_compression` | Memory compression parameters (`insert_mode` insert-mode compression, `idle_maintenance_seconds` idle-maintenance trigger seconds (0 disables), `precompress_ratio` pre-compression watermark) |
 | `providers` | List of model providers |
 | `theme` | Terminal color theme (9 available) |
-| `permission_mode` | Permission mode (confirm / accept_edits / plan / full) |
+| `permission_mode` | Permission mode (confirm / accept_edits / auto_decision / plan / full) |
 | `allow_outside_workspace` | Sandbox toggle |
 | `command_shell` | Default command interpreter (auto / pwsh / powershell / cmd; the GUI "System settings" page restricts choices to what is installed) |
 | `skill_search_paths` | Skill search paths (project level) |
-| `prompt_cache_keepalive_seconds` | DeepSeek/Kimi prefix cache keep-alive interval (default 120; 0 disables; minimum 60) |
+| `prompt_cache_keepalive_seconds` | DeepSeek / Kimi / GLM / Qwen prefix cache keep-alive interval (default 120; 0 disables; minimum 60) |
+| `shell_env_policy` | Child-process environment policy: `exclude_sensitive` strips `*KEY*` / `*SECRET*` / `*TOKEN*` / `*PASSWORD*` by default (set `false` to pass everything through); also supports `inherit` / `exclude` / `include_only` / `set` |
+| `expose_mcp_admin_tools` | Whether to send MCP admin tool schemas to the model (default `false`, saves ~500 tokens per turn) |
+| `resume` | Resume-after-interruption switch (default `{"enabled": false}`) |
+| `pet_skin_id` | Active desktop pet pack ID (restart the pet process to apply) |
+| `route_request_overrides` | Rewrite request headers / body per host (for gateways that require specific headers or thinking fields) |
 
 ### config.toml read-only overlay (optional)
 
@@ -730,9 +887,17 @@ Files under `~/.ycode/`:
 | `mcp.json` | MCP service configuration |
 | `system_prompt.md` | User-level system prompt override |
 | `memory/` | Long-term memory (logs / user / feedback / project / reference) |
+| `self/` | Self model built by self-evolution |
 | `skills/` | User-level skills |
 | `plugins/` | User-level plugins |
 | `agents/` | Custom subagent definitions |
+| `pets/` | User-built desktop pet packs |
+| `hooks/` and `hooks.json` | Lifecycle hook definitions and trust records |
+| `gui-themes/` | Custom interface themes |
+| `persona.json` | Persona (agent name / body / how it addresses you) |
+| `decision.json` and `decision_audit/` | Decision-model config and decision audit records |
+| `exports/` / `media/` / `tmp/` | Session exports, media attachments, AI-generated content tmp |
+| `undo_blobs/` / `undo_transactions/` | Per-turn undo file snapshots and transaction logs |
 
 ## 🧪 Running Tests
 
@@ -740,7 +905,7 @@ Files under `~/.ycode/`:
 pytest
 ```
 
-Tests cover 117 modules, including agent_turn_e2e, harness (models/journal/runtime/request fingerprinting/tool pipeline), cancellation, config, memory_kairos, permission_broker, plan, task_scheduler, subagent_registry, tools, setup_engine, and uninstall_engine.
+Tests cover 394 module files, including agent_turn_e2e, harness (models/journal/runtime/request fingerprinting/tool pipeline), cancellation, config, memory_kairos, permission_broker, plan, task_scheduler, subagent_registry, tools, setup_engine, and uninstall_engine.
 
 ### Manual smoke tests for computer control (never part of pytest)
 

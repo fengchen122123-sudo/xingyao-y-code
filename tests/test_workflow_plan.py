@@ -1,5 +1,3 @@
-"""星流工作流 IR（plan）校验与受限求值测试。"""
-
 from __future__ import annotations
 
 import pytest
@@ -49,11 +47,9 @@ def test_validate_requires_bounded_loop():
 
 
 def test_validate_loop_while_condition_whitelist():
-    # 允许的比较/布尔
     assert validate_plan(_plan([
         {"op": "loop", "max": 2, "while": "{a} == 'x' and {b} > 1", "steps": [{"op": "log", "message": "m"}]},
     ])) == []
-    # 函数调用 / 属性赋值越界
     errors = validate_plan(_plan([
         {"op": "loop", "max": 2, "while": "__import__('os')", "steps": [{"op": "log", "message": "m"}]},
     ]))
@@ -70,9 +66,6 @@ def test_validate_step_count_and_depth_caps():
         deep = {"op": "fallback", "steps": [deep], "fallback": [{"op": "log", "message": "f"}]}
     errors = validate_plan(_plan([deep]))
     assert any("嵌套" in e for e in errors)
-
-
-# -- 模板与路径 --
 
 
 def test_resolve_path_dotted_and_errors():
@@ -92,9 +85,6 @@ def test_render_template_substitutes_and_strict():
         render_template("{missing}", scope)
 
 
-# -- 条件求值 --
-
-
 def test_eval_condition_comparisons_and_membership():
     scope = {"n": 2, "s": "passed", "items": ["a"]}
     assert eval_condition("{n} > 1", scope) is True
@@ -109,4 +99,4 @@ def test_eval_condition_rejects_unbound_and_syntax():
     with pytest.raises(PlanError):
         eval_condition("{nope} == 1", {})
     with pytest.raises(PlanError):
-        eval_condition("1 + 1 == 2", {})  # BinOp 不在白名单
+        eval_condition("1 + 1 == 2", {})

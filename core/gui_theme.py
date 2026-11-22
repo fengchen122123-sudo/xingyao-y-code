@@ -1,5 +1,3 @@
-"""GUI 主题 Schema v1、持久化及活动主题选择。"""
-
 from __future__ import annotations
 
 import copy
@@ -49,7 +47,6 @@ _TOKEN_RADIUS_KEYS = frozenset({"radius_small", "radius_medium", "radius_large"}
 _TOKEN_NUMBER_KEYS = _TOKEN_RADIUS_KEYS | frozenset({"shadow_strength"})
 _TOKEN_KEYS = _TOKEN_COLOR_KEYS | _TOKEN_FONT_KEYS | _TOKEN_NUMBER_KEYS
 _TITLEBAR_KEYS = frozenset({"background", "text", "border", "mode"})
-# 全局背景图：垫在所有分区之下的最底层（前端 body::before），无文字/边框语义
 _APP_IMAGE_KEYS = frozenset({"image", "image_opacity", "image_size", "image_position"})
 _REGION_KEYS = frozenset({
     "background", "text", "border", "accent", "background_opacity", "image",
@@ -136,7 +133,6 @@ def _builtin_theme(
     }
 
 
-# These values are the semantic equivalents of frontend/src/style.css :root/body.light.
 BUILTIN_THEMES = {
     "builtin.dark": _builtin_theme(
         "builtin.dark",
@@ -174,7 +170,6 @@ BUILTIN_THEMES = {
         },
         {"background": "#ffffff", "text": "#2c2c2a", "border": "#e3e3de", "mode": "light"},
     ),
-    # 内置 QQ2009：经典蓝色皮肤（蓝色渐变标题栏、浅蓝面板、橙色强调）
     "builtin.qq2009": _builtin_theme(
         "builtin.qq2009",
         "light",
@@ -203,7 +198,6 @@ BUILTIN_THEMES = {
             "statusbar": _region("#D5E5F4", "#2B5A7A", "#A9C8E4", "#3A8FD0"),
         },
     ),
-    # 内置田野笔记：纸质笔记本皮肤（墨绿框架 + 米色纸面 + 朱橙强调，直角、细边框、硬投影）
     "builtin.field-notes": _builtin_theme(
         "builtin.field-notes",
         "light",
@@ -313,8 +307,6 @@ def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(value, str) or value not in _APPEARANCES:
                 raise ThemeError("invalid_value", path, "标题栏模式只能是 light 或 dark")
         else:
-            # Windows COLORREF has no alpha channel. Web tokens/regions retain
-            # #RRGGBBAA support, while native chrome is explicitly opaque.
             _validate_opaque_color(value, path)
 
     regions = _require_mapping(manifest["regions"], "regions")
@@ -373,11 +365,6 @@ def _validate_asset_reference(value: Any, path: str) -> str:
 
 
 def _read_image_bounded(path: Path, label: str, unreadable: ThemeError) -> bytes:
-    """先检查文件元数据、再有上限地读取，防止超大文件先整块进入内存。
-
-    stat 与读取之间文件可能增长，因此读取上限仍是 _MAX_IMAGE_BYTES + 1，
-    读到的字节数超限同样拒绝。
-    """
     try:
         size = path.stat().st_size
     except OSError as error:
@@ -428,7 +415,6 @@ def _merge_theme(base: dict[str, Any], manifest: Mapping[str, Any]) -> dict[str,
 
 
 def _manifest_asset_references(manifest: Mapping[str, Any]) -> set[str]:
-    """主题清单引用的全部资源相对路径（分区图 + 全局背景图）。"""
     references = {
         region["image"] for region in manifest["regions"].values() if region["image"]
     }
@@ -448,9 +434,6 @@ class ThemeRepository:
         if not self.root.exists():
             return summaries
         for directory in sorted(self.root.iterdir(), key=lambda item: item.name):
-            # 跳过点前缀目录：staging（.gui-theme-*，建在 root 内，崩溃/占用
-            # 清理失败会残留）与用户随手放进来的杂项目录。无差别 get_theme 会让
-            # 一个不匹配 THEME_ID_RE 的目录把整个主题列表打挂到手动删除为止。
             if not directory.is_dir() or directory.name.startswith("."):
                 continue
             try:
@@ -496,7 +479,6 @@ class ThemeRepository:
         source_theme = self.get_theme(theme_id)
         manifest = self._manifest_for_copy(source_theme, new_id, new_name)
         if new_id == theme_id:
-            # 仅改名称：ID 与目录不变，原地重写清单即可，无需搬迁目录或改活动主题配置。
             theme_dir = self._theme_directory(theme_id)
             self._write_manifest(theme_dir / "theme.json", manifest)
             return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
@@ -540,7 +522,6 @@ class ThemeRepository:
 
     def import_image(self, theme_id: str, region: str, source: Path) -> str:
         manifest = self._editable_manifest(theme_id)
-        # region 取值：七个分区之一，或 "app"（全局背景图，写入 app_image.image）
         is_app_image = region == "app"
         if not is_app_image and region not in REGION_IDS:
             raise ThemeError("invalid_region", "region", "主题区域不存在")
@@ -557,7 +538,6 @@ class ThemeRepository:
             manifest["app_image"]["image"] if is_app_image
             else manifest["regions"][region]["image"]
         )
-        # 统计旧图是否仍被别处引用（其它分区或全局图），决定是否计入删除后的体积
         referenced_elsewhere = _manifest_asset_references(manifest) - {previous}
         old_size = 0
         if previous and previous != relative_path and previous not in referenced_elsewhere:

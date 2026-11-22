@@ -15,7 +15,7 @@ def test_plan_mode_dynamic_context_requires_plan_output():
 
     assert "只允许读取信息、执行明确的只读查询和维护计划元数据" in prompt
     assert "最终回答必须输出可执行计划" in prompt
-    assert "切换到变更前确认、自动编辑或完全访问模式后再实施" in prompt
+    assert "切换到变更前确认、自动编辑、自动决策或完全访问模式后再实施" in prompt
 
 
 def test_non_plan_dynamic_context_has_no_plan_only_instruction():
@@ -49,8 +49,6 @@ def test_context_builder_injects_runtime_layers_once():
     assert "当前计划：检查测试" in prompt
     assert "默认命令解释器：Windows PowerShell 5.1 (powershell.exe)" in prompt
     assert "命令失败后根据错误调整语法" in prompt
-    # 长期记忆/技能/子 Agent 已并入稳定系统提示词（build_stable_system_message），
-    # 动态块只承载会话内可能变化的字段（模型/权限/目录/计划），不再重复注入记忆。
     assert "用户偏好小步修改" not in prompt
 
 
@@ -86,8 +84,6 @@ def test_context_builder_always_selects_dedicated_network_tools():
 
 
 def test_main_uses_metadata_only_skill_catalog():
-    # 轮次上下文组装已下沉到 core/agent_service.py（CLI 与 GUI 共用），
-    # 技能目录必须仍然是"仅元数据"版本，不能整篇注入技能正文。
     main_source = Path("main.py").read_text(encoding="utf-8")
     agent_service_source = Path("core/agent_service.py").read_text(encoding="utf-8")
 
@@ -158,7 +154,6 @@ def test_source_and_package_versions_match():
     setup_source = Path("setup.py").read_text(encoding="utf-8")
     main_source = Path("main.py").read_text(encoding="utf-8")
 
-    # core/version.py 中的版本号应与导入值一致
     file_version = re.search(
         r'^__version__\s*=\s*"(\d+\.\d+\.\d+)"',
         version_source,
@@ -166,13 +161,10 @@ def test_source_and_package_versions_match():
     ).group(1)
     assert file_version == core_version
 
-    # setup.py 通过 _get_version() 从 core/version.py 读取版本
     assert "version=_get_version()" in setup_source.replace(" ", "")
     assert "core/version.py" in setup_source
 
-    # main.py 使用 core.version 中的版本
     assert "from core.version import __version__ as YCODE_VERSION" in main_source
-    assert 'f"v{YCODE_VERSION}"' in main_source
+    assert 'f" ✦ XINGYAO CODE  v{YCODE_VERSION} "' in main_source
 
-    # 版本号格式合法
     assert re.fullmatch(r"\d+\.\d+\.\d+", core_version)

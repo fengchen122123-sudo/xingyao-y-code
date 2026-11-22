@@ -1,26 +1,6 @@
-"""基元律动（TokenRhythm）账号登录与 API Key 自动绑定。
-
-对外提供三类能力：
-
-1. 账号登录：短信验证码登录 / 密码登录 / 会话查询 / 退出登录。
-2. 账号概览：一次取回余额、今日用量、个人信息与临时额度（只读，不落盘）。
-3. Key 自动绑定：登录成功后**总是**为当前账号新建一枚专属 API Key（名称「星瑶Code」）
-   写入模型厂商配置，绝不复用用户在模型配置里手动填过的 Key；「账号 ⇄ 厂商/Key」
-   绑定关系加密落盘，同一账号重复登录复用这枚 Key，换账号时先删掉旧账号的 Key 与
-   厂商再整体重建，退出登录时也会先删掉这枚 Key。
-
-安全约定：
-- 账号会话 cookie 默认只在进程内存；登录成功后可持久化到
-  ``~/.ycode/secrets/tokenrhythm_session.json``，内容经 Windows DPAPI 加密
-  （绑定当前 Windows 用户），用于重启后保持登录态。cookie 由服务端下发约 30 天
-  有效，过期或被服务端判定失效时自动清除；
-- 密码、明文 Key 绝不写日志、不写盘（写配置走 config / model_manager 既有
-  DPAPI 加密路径）；
-- 短信 / 密码登录不做自动重试，失败直接把服务端 message 抛给上层展示。
-"""
-
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -39,9 +19,6 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://tokenrhythm.studio"
 API_BASE_URL = BASE_URL + "/v1"
 DEFAULT_PROVIDER_NAME = "基元律动"
-# 登录自动创建的厂商会在 provider 记录里打上这个标记：退出登录 / 换账号时只清理
-# 带标记（或命中本地绑定）的条目。用户自己填 Key 配置的同域厂商没有标记，
-# 任何情况下都不会被改名或删除。
 MANAGED_PROVIDER_FLAG = "managed_by"
 # 注意：这个值不是插件名。core/plugin_loader 的孤儿清理会通过
 # _core_managed_markers() 把它排除，否则每次启动都会把账号绑定的厂商连 Key 删掉。
@@ -49,10 +26,6 @@ MANAGED_PROVIDER_VALUE = "tokenrhythm"
 # 上游某条模型记录缺 contextWindow（或给了非正数）时的保守兜底值：只为让本地
 # 配置有个合法正数，不代表模型真实上限——有值一律用接口给的 contextWindow。
 DEFAULT_CONTEXT_WINDOW = 128000
-# 注意：这里刻意不再保留"默认占位模型"常量。历史实现首次绑定时会硬编码写入
-# deepseek-v4.1-flash（128000 上下文）作为占位条目，但该裸名模型已在上游目录
-# 下线，只会给用户留下一条调不通的脏数据。模型目录统一由 sync_models() 按
-# GET /api/models 返回的真实 contextWindow 填充。
 API_KEY_NAME = "星瑶Code"
 
 _REQUEST_TIMEOUT = 20.0
@@ -60,14 +33,22 @@ _TERMS_CACHE_TTL = 30 * 60
 # 会话健康检查结果缓存时长：对话入口每轮都会问一次，60 秒内复用上次结论，
 # 避免每发一条消息都打一次 /api/auth/me。
 _SESSION_HEALTH_TTL = 60.0
-# 登录会话落盘位置：只存 cookie（已加密），不存密码 / token。
-_SESSION_FILE = Path.home() / ".ycode" / "secrets" / "tokenrhythm_session.json"
-# 账号 ⇄ Key 绑定关系落盘位置：只存账号 id / 昵称、厂商 id、Key id、绑定时间
-# （不含任何 Key 明文，整体 DPAPI 加密），用于判断本地厂商是否属于当前登录账号，
-# 换账号时据此整体重建。
-_BINDING_FILE = Path.home() / ".ycode" / "secrets" / "tokenrhythm_binding.json"
 
-# 短信发码阶段可能遇到的安全验证（阿里云验证码）错误码：需要给出可执行的中文提示。
+
+def _tokenrhythm_secret_dir() -> Path:
+    env_dir = os.environ.get("YCODE_DATA_DIR")
+    root = Path(env_dir) if env_dir and str(env_dir).strip() else Path.home() / ".ycode"
+    return root / "secrets"
+
+
+_TR_SECRET_DIR = _tokenrhythm_secret_dir()
+try:
+    _TR_SECRET_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+_SESSION_FILE = _TR_SECRET_DIR / "tokenrhythm_session.json"
+_BINDING_FILE = _TR_SECRET_DIR / "tokenrhythm_binding.json"
+
 _CAPTCHA_ERROR_CODES = frozenset(
     {"CAPTCHA_REQUIRED", "CAPTCHA_INVALID", "CAPTCHA_SERVICE_UNAVAILABLE"}
 )
@@ -88,7 +69,6 @@ _CAPTCHA_HINTS = {
     ),
 }
 
-# 创建 Key 响应里明文 Key 的字段名未最终确认：按顺序兜底尝试。
 _PLAIN_KEY_FIELDS = ("key", "apiKey", "secret", "plaintext", "token")
 
 _LOCK = threading.RLock()
@@ -99,7 +79,6 @@ _STATE: dict[str, Any] = {
     "challenge_phone": None,
     "terms_version": None,
     "terms_fetched_at": 0.0,
-    # 本次进程启动时是否成功从本地恢复过 cookie（没有就不必白白试探 /auth/me）
     "restored": False,
 }
 
@@ -129,11 +108,6 @@ class TokenRhythmAuthError(RuntimeError):
         self.code = code
         self.server_message = server_message
         self.status = status
-
-
-# ---------------------------------------------------------------------------
-# 进程内会话
-# ---------------------------------------------------------------------------
 
 
 def _save_session(client: httpx.Client) -> None:
@@ -181,7 +155,6 @@ def _save_session(client: httpx.Client) -> None:
 
 
 def _load_session(client: httpx.Client) -> bool:
-    """从本地恢复会话 cookie；文件不存在 / 解密失败 / 全部过期时返回 False。"""
     try:
         if not _SESSION_FILE.exists():
             return False
@@ -222,7 +195,6 @@ def _load_session(client: httpx.Client) -> bool:
 
 
 def _clear_session() -> None:
-    """删除本地会话文件（退出登录、服务端判定失效时调用）。"""
     try:
         _SESSION_FILE.unlink(missing_ok=True)
     except OSError:
@@ -230,7 +202,6 @@ def _clear_session() -> None:
 
 
 def _get_client() -> httpx.Client:
-    """返回进程内单例 Client；首次创建时尝试恢复上次登录的 cookie。"""
     global _CLIENT
     with _LOCK:
         if _CLIENT is None:
@@ -277,7 +248,6 @@ def logout() -> dict:
     binding = _load_binding() or {}
     key_id = str(binding.get("key_id") or "").strip()
     deleted = _delete_api_key(key_id) if key_id else False
-    # 模型配置一起移除：退出后不该在模型列表里继续留着一个用不了的基元律动
     providers_removed = _delete_tr_providers()
     _clear_binding()
     _reset_state()
@@ -299,11 +269,6 @@ def _require_login() -> None:
         raise TokenRhythmAuthError("尚未登录基元律动账号，请先登录后再自动绑定 API Key")
 
 
-# ---------------------------------------------------------------------------
-# HTTP 基础设施
-# ---------------------------------------------------------------------------
-
-
 def _headers_for(method: str) -> dict[str, str]:
     headers = {"accept": "application/json"}
     if method.upper() != "GET":
@@ -316,9 +281,6 @@ def _headers_for(method: str) -> dict[str, str]:
                 "sec-fetch-site": "same-origin",
             }
         )
-        # 登录后服务端会下发 tr_csrf cookie，官方前端在每次非 GET 请求时把它回填到
-        # X-CSRF-Token；只带 sec-fetch-site 只能过登录接口，登录后的写接口（建 Key 等）
-        # 仍会 403 CSRF_INVALID。
         try:
             csrf_token = _get_client().cookies.get("tr_csrf")
         except Exception:
@@ -367,11 +329,6 @@ def _request(
     allow_empty_data: bool = False,
     timeout: float | None = None,
 ) -> dict:
-    """调用 /api/*，成功返回完整 envelope，失败抛 TokenRhythmAuthError。
-
-    allow_empty_data：允许 `data` 为 null 也算成功（删除类接口可能返回空 data）。
-    timeout：单次请求超时（秒），缺省用 _REQUEST_TIMEOUT。
-    """
     url = BASE_URL + path
     try:
         response = _get_client().request(
@@ -429,11 +386,6 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
-# ---------------------------------------------------------------------------
-# 账号登录
-# ---------------------------------------------------------------------------
-
-
 def password_login(account: str, password: str) -> dict:
     """密码登录，并用 GET /api/auth/me 校验会话。"""
     account = str(account or "").strip()
@@ -459,7 +411,6 @@ def password_login(account: str, password: str) -> dict:
         _STATE["logged_in"] = True
         _STATE["challenge_id"] = None
         _STATE["challenge_phone"] = None
-    # 登录成功即持久化会话：重启应用后自动恢复登录态（cookie 约 30 天有效）
     _save_session(_get_client())
     # 刚登录的会话必须立刻重新校验，不能拿登录前的旧健康结论挡住对话
     _invalidate_health_cache()
@@ -480,7 +431,6 @@ def send_sms_code(phone: str, captcha_verify_param: str | None = None) -> dict:
     body: dict[str, Any] = {"scene": "login_register", "phone": phone}
     captcha = str(captcha_verify_param or "")
     if captcha.strip():
-        # 值原样透传，不做任何改写。
         body["captchaVerifyParam"] = captcha
     try:
         payload = _request("POST", "/api/auth/sms/send", body)
@@ -517,7 +467,6 @@ def send_sms_code(phone: str, captcha_verify_param: str | None = None) -> dict:
 
 
 def _terms_version() -> str:
-    """取当前用户协议版本，进程内缓存 30 分钟。"""
     now = time.monotonic()
     with _LOCK:
         cached = str(_STATE.get("terms_version") or "")
@@ -537,11 +486,6 @@ def _terms_version() -> str:
 
 
 def sms_login(phone: str, code: str, invite_code: str | None = None) -> dict:
-    """短信验证码登录 / 注册：verify → 用户协议版本 → login-or-register。
-
-    invite_code 是可选邀请码，仅在注册（首次登录）时生效；登录已存在的账号时
-    服务端会忽略它。值原样上送，不做大小写 / 格式改写。
-    """
     phone = str(phone or "").strip()
     code = str(code or "").strip()
     if not code:
@@ -572,8 +516,6 @@ def sms_login(phone: str, code: str, invite_code: str | None = None) -> dict:
         "termsAccepted": True,
         "termsVersion": terms_version,
     }
-    # 邀请码只有在去空白后非空时才带：官方前端同样是 `...(邀请码 ? { inviteCode } : {})`，
-    # 空串会被服务端当成"提供了但无效"而报错，所以空值一律不出现该键。
     invite = str(invite_code or "").strip()
     if invite:
         body["inviteCode"] = invite
@@ -590,23 +532,15 @@ def sms_login(phone: str, code: str, invite_code: str | None = None) -> dict:
         _STATE["logged_in"] = True
         _STATE["challenge_id"] = None
         _STATE["challenge_phone"] = None
-    # 短信登录同样持久化会话（未注册手机号会自动建号）
     _save_session(_get_client())
-    # 同上：短信登录成功后立即作废旧结论
     _invalidate_health_cache()
     return {"user": user, "ok": True}
 
 
 def account_status() -> dict:
-    """查询登录状态：优先用进程内会话，没有时尝试用持久化 cookie 恢复。
-
-    应用重启后内存里没有登录标记，这里用上次保存的 cookie 调一次 /auth/me：
-    成功即恢复登录态（用户无需重新登录），失败则清掉本地会话文件，避免每次
-    启动都白白试探。
-    """
     with _LOCK:
         logged_in = bool(_STATE.get("logged_in"))
-    _get_client()  # 首次调用会尝试恢复 cookie，并置 _STATE["restored"]
+    _get_client()
     with _LOCK:
         restored = bool(_STATE.get("restored"))
 
@@ -616,7 +550,6 @@ def account_status() -> dict:
         try:
             payload = _request("GET", _ME_PATH)
         except TokenRhythmAuthError:
-            # cookie 已失效（过期 / 被服务端注销）：清掉，下次按未登录处理
             _clear_session()
             return {"logged_in": False}
         user = _user_from(payload)
@@ -644,16 +577,7 @@ def account_status() -> dict:
 
 
 def export_session_cookies() -> list[dict[str, Any]]:
-    """导出当前登录会话的 cookie，供内嵌浏览器（WebView2）复用免登录。
-
-    只导出 tokenrhythm.studio 域名下的 cookie；未登录或无 cookie 时返回 []。
-    返回值每项形如：
-        {"name": str, "value": str, "domain": str, "path": str,
-         "secure": bool, "http_only": bool, "expires": int}   # expires 为 0 表示会话级
-    安全约束：本函数以及调用链绝不把 value 写日志/异常消息。
-    """
     try:
-        # _get_client() 首次调用会尝试从本地恢复持久化 cookie，所以重启后也能导出。
         client = _get_client()
         jar = getattr(getattr(client, "cookies", None), "jar", None) or ()
         exported: list[dict[str, Any]] = []
@@ -663,7 +587,6 @@ def export_session_cookies() -> list[dict[str, Any]]:
                 value = str(getattr(cookie, "value", "") or "")
                 if not name or not value:
                     continue
-                # 保留原始 domain（含 .tokenrhythm.studio 前导点），只按归一后的 host 判定归属
                 domain = str(getattr(cookie, "domain", "") or "").strip()
                 host = domain.lower().lstrip(".")
                 if host != "tokenrhythm.studio" and not host.endswith(
@@ -707,14 +630,12 @@ def export_session_cookies() -> list[dict[str, Any]]:
 
 
 def _invalidate_health_cache() -> None:
-    """作废会话健康检查缓存（登录 / 退出 / 会话被清理时调用）。"""
     with _LOCK:
         _HEALTH_CACHE["result"] = None
         _HEALTH_CACHE["at"] = 0.0
 
 
 def _cached_health(now: float) -> dict | None:
-    """取 TTL 内的上次结论；返回副本，调用方改返回值不会污染缓存。"""
     with _LOCK:
         result = _HEALTH_CACHE.get("result")
         at = float(_HEALTH_CACHE.get("at") or 0.0)
@@ -724,7 +645,6 @@ def _cached_health(now: float) -> dict | None:
 
 
 def _remember_health(result: dict, now: float) -> dict:
-    """记住本次结论（只保留约定的三个字段）并返回副本。"""
     snapshot = {
         "ok": bool(result.get("ok")),
         "logged_in": bool(result.get("logged_in")),
@@ -751,7 +671,6 @@ def _is_network_failure(error: BaseException) -> bool:
 
 
 def _expire_session() -> None:
-    """会话被服务端判定失效：清本地会话文件与进程内登录态，不留半登录状态。"""
     with _LOCK:
         _STATE["logged_in"] = False
         _STATE["restored"] = False
@@ -760,27 +679,6 @@ def _expire_session() -> None:
 
 
 def session_health(force: bool = False) -> dict:
-    """会话健康检查：登录时创建的专属 Key 只在会话有效时可用。
-
-    对话入口每轮都要问一次，所以带 60 秒缓存（``force=True`` 强制重新校验），
-    避免每发一条消息都打一次 /api/auth/me。返回固定三字段：
-
-    - ok：会话是否仍然可用（只有 True 才允许用这枚 Key 继续对话）；
-    - logged_in：当前是否处于登录态；
-    - reason：ok=False 时的中文原因。
-
-    判定顺序：
-    1. 无进程内登录态、且本地也恢复不出会话 → 直接返回「未登录」，不发任何请求；
-    2. 有会话 → ``GET /api/auth/me``：
-       - 成功且拿到 user：ok=True，并把登录态写回进程内；
-       - 401 / 服务端否决 / 没返回用户：清会话文件与登录态，
-         reason「登录已失效，请重新登录」；
-       - 网络异常：**不清会话**（网络抖动不等于登录失效，否则一次超时就把用户
-         踢下线），reason「会话校验失败（网络异常，可稍后重试）」，logged_in
-         保持原有判断。
-
-    日志只记结论与异常类型，绝不打印 cookie 或 Key。
-    """
     now = time.monotonic()
     if not force:
         cached = _cached_health(now)
@@ -789,12 +687,11 @@ def session_health(force: bool = False) -> dict:
 
     with _LOCK:
         logged_in = bool(_STATE.get("logged_in"))
-    _get_client()  # 首次调用会尝试从本地恢复 cookie，并置 _STATE["restored"]
+    _get_client()
     with _LOCK:
         restored = bool(_STATE.get("restored"))
 
     if not logged_in and not restored:
-        # 既没进程内登录态、也没有可恢复的会话文件：没有可校验的会话，不发请求
         return _remember_health(
             {"ok": False, "logged_in": False, "reason": _HEALTH_REASON_NO_LOGIN}, now
         )
@@ -821,7 +718,6 @@ def session_health(force: bool = False) -> dict:
 
     user = _user_from(payload)
     if not user:
-        # 200 但没有用户对象：等同于会话已被服务端作废，按失效处理
         logger.info("基元律动会话校验未返回用户信息，按登录失效处理")
         _expire_session()
         return _remember_health(
@@ -834,11 +730,6 @@ def session_health(force: bool = False) -> dict:
 
 
 def binding_active() -> bool:
-    """本地是否存在「账号 ⇄ 专属 Key」绑定（有 key_id 与 provider_id 才算）。
-
-    只读本地加密绑定文件，不联网、不触发任何请求：对话入口用它低成本判断
-    「这枚 Key 是不是登录时自动绑定的」，是才需要做会话守门。
-    """
     binding = _load_binding() or {}
     return bool(
         str(binding.get("key_id") or "").strip()
@@ -846,47 +737,24 @@ def binding_active() -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# 账号概览：余额 + 今日用量 + 个人信息 + 临时额度
-# ---------------------------------------------------------------------------
-
-# 四个数据源均取自官方前端页面（会话 cookie 鉴权，复用进程内同一个 Client）。
 _WALLET_PATH = "/api/wallet/summary"
 _USAGE_TODAY_PATH = "/api/usage/panel?range=today"
-# 今日消费全口径：与官方「用量与费用 · 钱包用量」页同源的多模态总览接口。
-# panel 只统计语言 Token 与图片任务，视频任务（wan3.0-video 等）完全不计入，
-# 只用它会让「今日已用」漏掉视频费用；这个接口的 summary.costCny 覆盖语言 / 视频 / 图片。
 _MULTIMODAL_TODAY_PATH = (
     "/api/usage/multimodal/overview"
     "?type=all&metric=cost&groupBy=model&range=today&fundingScope=WALLET"
 )
 _ME_PATH = "/api/auth/me"
-# 临时额度 = 剩余有效期"够近"的有效额度。请求只过滤失效项（includeInactive=false），
-# 刻意不传 includePermanent：服务端对"永久赠额"的判定与到期时间并不一致——充值活动赠额
-# 的到期时间被写成 2099-12-31 这类远期占位值，但传 includePermanent=true / false
-# 返回完全一样（实测），说明这枚参数挡不住它。所以全部取回来，本地按到期时间判定。
-# pageSize 上限实测 100：传 200 直接 400 BAD_REQUEST。
 _TEMPORARY_CREDITS_PATH = (
     "/api/wallet/expiring-credits?page=1&pageSize=100&includeInactive=false"
 )
-# 永久额度的判定阈值：到期时间晚于"现在 + 这个跨度"就等价于永久，不计入临时额度。
-# 实测同一账号里，真正会过期的邀请奖励是 30 天后到期，充值活动赠额是 2099-12-31
-# （70 多年后），10 年既能稳定切开两者，也不会误伤有效期较长的活动额度。
 _TEMPORARY_CREDITS_HORIZON = timedelta(days=365 * 10)
-# 临时额度接口单独放宽超时：服务端要汇总全部历史额度，冷启动实测 10~30 秒
-# （热态 0.3 秒），20 秒的通用超时一抖动就撞线，直接把这栏判成"获取失败"。
 _TEMPORARY_CREDITS_TIMEOUT = 45.0
-# 服务端冷启动汇总超时时回的错误码：属于"等一下再试就好"，可以重试。
 _RETRYABLE_CREDITS_CODES = frozenset({"INTERNAL_ERROR", "TIMEOUT", "SERVICE_UNAVAILABLE"})
 
 
 def _is_retryable_credits_error(error: TokenRhythmAuthError) -> bool:
-    """临时额度请求是否值得重试：只认传输层失败、5xx 与服务端内部错误码。
-
-    鉴权 / 参数类业务错误（HTTP 4xx、code 非内部错误）重试只会白等，直接降级。
-    """
     if error.status is None and error.code is None:
-        return True  # 超时 / 连接中断
+        return True
     if error.status is not None and error.status >= 500:
         return True
     return str(error.code or "").strip().upper() in _RETRYABLE_CREDITS_CODES
@@ -932,11 +800,6 @@ def _temporary_credits_default() -> dict:
 
 
 def _credit_items(payload: dict) -> list[dict]:
-    """解析 /api/wallet/expiring-credits 的 data。
-
-    外层结构不固定：可能是 ``{"items": [...]}``，也可能直接是数组；两种都兜底，
-    另外兼容 records / list 两种常见分页命名。结构无法识别时按"没有额度"处理。
-    """
     data = payload.get("data")
     if isinstance(data, list):
         candidates: list = data
@@ -973,7 +836,6 @@ def _decimal_amount(value: Any) -> Decimal | None:
     return None
 
 
-# 纳秒级小数秒（7~9 位）：fromisoformat 最多只吃 6 位，先截断再解析。
 _ISO_FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 
 
@@ -1021,19 +883,6 @@ def _first_field(item: dict, keys: tuple[str, ...]) -> Any:
 
 
 def _fetch_temporary_credits() -> dict:
-    """GET /api/wallet/expiring-credits → 有效临时额度的汇总。
-
-    每项字段（官方前端控制台在用）：grantedCny 授予金额、remainingCny 剩余金额、
-    consumedCny 已消费金额、grantedAt 授予时间、expiresAt 到期时间（ISO 字符串）、
-    validityStartsAt 生效时间、source / sourceLabel 来源（「邀请奖励」「充值活动赠额」等）。
-
-    口径：临时额度 = 会在**可预见的时间窗口内**到期的有效额度。请求只用
-    includeInactive=false 过滤失效项，其余条件全部在本地按到期时间判断：
-    remainingCny > 0、expiresAt 可解析、未过期，且到期时间不超过
-    ``_TEMPORARY_CREDITS_HORIZON``（2099 这类远期占位值代表永久额度，不计入）。
-    服务端 summary.expiringBalanceCny 不采用——它把伪永久的充值赠额一起算进去了。
-    求和用 Decimal 保留原始精度，不做两位小数四舍五入。
-    """
     try:
         payload = _request("GET", _TEMPORARY_CREDITS_PATH)
     except TokenRhythmAuthError as error:
@@ -1049,14 +898,9 @@ def _fetch_temporary_credits() -> dict:
         )
     items = _credit_items(payload)
     now = datetime.now(timezone.utc)
-    # 远期占位到期时间（2099-12-31 之类）等价于永久：把它算进来会让「临时额度」虚高，
-    # 「最近到期」也会被它带偏，所以统一按"到期时间是否落在窗口内"判定。
     horizon = now + _TEMPORARY_CREDITS_HORIZON
     total = Decimal("0")
     count = 0
-    # 先把有效额度收集起来：算完总合计再定位"最近到期日"，那一天的额度一起加总。
-    # 早先只取"最早到期的那一条"，同一到期日有多张体验卡时这个数字会在几张卡之间
-    # 来回跳（用户看到 ¥6.39 / ¥15.84 来回变），改成当日合计才稳定。
     valid: list[tuple[datetime, Decimal, str]] = []
     for item in items:
         remaining = _decimal_amount(
@@ -1068,10 +912,8 @@ def _fetch_temporary_credits() -> dict:
         expires_at = _parse_expires_at(raw_expires)
         if expires_at is None or expires_at <= now:
             continue
-        # 伪永久额度（充值活动赠额等）：有 expiresAt，但远到不构成"临时"
         if expires_at > horizon:
             continue
-        # 原始时间字符串一起留着：重新格式化会丢掉服务端给的纳秒精度
         valid.append(
             (expires_at, remaining, str(raw_expires if raw_expires is not None else "").strip())
         )
@@ -1081,11 +923,7 @@ def _fetch_temporary_credits() -> dict:
         total += remaining
         count += 1
     if valid:
-        # 最早到期那一条的原始字符串：保留服务端给的精度，格式化交给展示层
         nearest_raw = min(valid, key=lambda entry: entry[0])[2]
-    # 按"到期日"聚合而不是按精确时间：同一批发的体验卡到期时间只差几秒，
-    # 精确比较只会命中其中一张，那个数字会随着单张卡被消费光而跳动。
-    # 按日期合计表达的是"这一天会过期多少钱"，既稳定也更符合用户直觉。
     nearest_day = min((expires_at.date() for expires_at, _r, _raw in valid), default=None)
     nearest_amount = sum(
         (
@@ -1095,10 +933,6 @@ def _fetch_temporary_credits() -> dict:
         ),
         Decimal("0"),
     )
-    # 服务端 summary.expiringBalanceCny / nextExpiryAt 刻意不采用：它把伪永久的
-    # 充值赠额（2099 到期）也计入了"到期中余额"，正是这条口径让临时额度虚高。
-    # 分页保护：临时额度均为非负金额，服务端总数多于本页返回数时合计会偏小，记一条
-    # warning 便于排查（pageSize 已取到上限 100，正常账号远用不到）。
     data = payload.get("data")
     server_total = data.get("total") if isinstance(data, dict) else None
     if isinstance(server_total, int) and server_total > len(items):
@@ -1117,7 +951,6 @@ def _fetch_temporary_credits() -> dict:
             "临时额度未匹配到有效项：共 %d 条，首条字段 %s", len(items), sample_keys
         )
     return {
-        # format(total, "f") 走定点表示，既保留全部有效位也不会输出科学计数法。
         "total_cny": format(total, "f"),
         "count": count,
         "nearest_expires_at": nearest_raw,
@@ -1126,25 +959,16 @@ def _fetch_temporary_credits() -> dict:
 
 
 def _fetch_wallet() -> dict:
-    """GET /api/wallet/summary → data.availableBalanceCny / frozenBalanceCny / currency。"""
     data = _payload_data(_request("GET", _WALLET_PATH))
     frozen = data.get("frozenBalanceCny")
     return {
         "available_balance_cny": _amount_text(data.get("availableBalanceCny")),
-        # 冻结余额在契约里是可缺省字段：缺失给空串，有值则原样保留字符串。
         "frozen_balance_cny": "" if frozen is None else _amount_text(frozen),
         "currency": str(data.get("currency") or "").strip() or "CNY",
     }
 
 
 def _fetch_multimodal_cost(fallback: str) -> str:
-    """今日钱包消费全口径：/api/usage/multimodal/overview 的 summary.costCny。
-
-    该接口与官方「钱包用量」页同源，统计语言调用、视频任务与图片任务；
-    panel 接口不含视频，只用它会把「今日已用」算小（实测少掉整笔视频费）。
-    它是附加口径：请求失败或结构异常时回落到 panel 的 costCny，
-    不让一个补充接口把整块用量判成失败。
-    """
     try:
         payload = _request("GET", _MULTIMODAL_TODAY_PATH)
     except TokenRhythmAuthError:
@@ -1156,7 +980,6 @@ def _fetch_multimodal_cost(fallback: str) -> str:
 
 
 def _fetch_usage_today() -> dict:
-    """今日用量：panel 出调用次数与 Token，多模态总览出全口径消费金额。"""
     data = _payload_data(_request("GET", _USAGE_TODAY_PATH))
     summary = data.get("summary")
     if not isinstance(summary, dict):
@@ -1172,7 +995,6 @@ def _fetch_usage_today() -> dict:
 
 
 def _fetch_user_profile() -> dict:
-    """GET /api/auth/me → data（用户对象，字段随服务端，原样返回）。"""
     user = _user_from(_request("GET", _ME_PATH))
     if not user:
         raise TokenRhythmAuthError("服务端未返回用户信息，请稍后重试")
@@ -1180,29 +1002,6 @@ def _fetch_user_profile() -> dict:
 
 
 def account_overview() -> dict:
-    """一次取回「余额 + 今日用量 + 个人信息 + 临时额度」，供前端账号概览卡片使用。
-
-    字段来源（与官方前端一致，全部需要会话 cookie）：
-    - GET /api/wallet/summary            → data.availableBalanceCny / frozenBalanceCny / currency
-    - GET /api/usage/panel?range=today   → data.summary.{calls,totalTokens,inputTokens,outputTokens}
-    - GET /api/usage/multimodal/overview → data.summary.costCny（今日消费全口径：语言 + 视频 + 图片）
-    - GET /api/auth/me                   → data（用户对象，含 id / name / nickname / phone / email / status）
-    - GET /api/wallet/expiring-credits    → data.{items|records|list}（直接返回数组也兼容）
-      每项取 remainingCny / expiresAt：剩余金额 > 0、未过期，且到期时间落在
-      10 年窗口内的项才算"临时额度"（2099 这类远期占位值代表永久赠额，不计入；
-      服务端 summary.expiringBalanceCny 因含永久项不采用）。
-
-    未登录（进程内无会话）时不发任何请求，返回 ``{"ok": False, "reason": "未登录"}``：
-    与 account_status 风格一致——"没有会话"用返回值表达，而不是抛异常。
-
-    四个接口互相独立：单个失败只降级对应字段（金额 "0"、计数 0），并追加
-    ``"partial": True`` 与 ``"errors": {"wallet|usage|user|temporary_credits": 原因}``；
-    只有 wallet / usage / user 三个都失败才抛 TokenRhythmAuthError（此时基本等同于
-    会话失效 / 服务不可用），临时额度属于附加信息，失败只降级不升级成整体失败。
-    金额全程保持字符串，求和用 Decimal，不做 float 换算。
-
-    日志只记录失败分区，绝不打印余额 / 额度金额、手机号等敏感信息。
-    """
     with _LOCK:
         logged_in = bool(_STATE.get("logged_in"))
         has_client = _CLIENT is not None
@@ -1235,7 +1034,6 @@ def account_overview() -> dict:
         errors["temporary_credits"] = str(error)
         temporary_credits = _temporary_credits_default()
 
-    # 临时额度是附加信息：只有 wallet / usage / user 全失败才算整体失败。
     if all(key in errors for key in ("wallet", "usage", "user")):
         raise TokenRhythmAuthError(
             "获取账号概览失败："
@@ -1263,16 +1061,6 @@ def account_overview() -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
-# 账号中心只读查询（供前端「充值 / 用量明细 / 个人信息」弹窗直连官方接口）
-# ---------------------------------------------------------------------------
-#
-# 以下四个函数都用已登录的进程内会话 cookie 直连官方后台，返回「原生弹窗」所需
-# 的真实数据；它们是只读 GET，不落任何写操作。未登录时统一返回
-# ``{"ok": False, "reason": "未登录"}``；官方返回错误时收敛成 ``{"ok": False, "msg": ...}``，
-# 成功时 ``{"ok": True, "data": <服务端 data 原样>}``，字段由前端按需渲染并容错。
-
-# 用法面板支持的时间窗（与服务端路由一致）
 _USAGE_RANGES = frozenset(
     {"1h", "3h", "today", "3d", "7d", "14d", "30d", "all", "custom"}
 )
@@ -1306,12 +1094,6 @@ def user_profile() -> dict:
 def usage_detail(
     range: str = "7d", page: int = 1, page_size: int = 20
 ) -> dict:
-    """用量明细面板：GET /api/usage/panel?range=&page=&pageSize=。
-
-    range 取 ``1h / 3h / today / 3d / 7d / 14d / 30d / all / custom``，非法值
-    收敛成默认 7d（与前端入口一致）。返回 data 原样（含 summary 与各维度 token /
-    cost 字段以及分页后的明细 list），由前端渲染并容错缺失字段。
-    """
     if _require_logged_in_client() is None:
         return {"ok": False, "reason": "未登录"}
     r = str(range or "7d").strip()
@@ -1326,14 +1108,6 @@ def usage_detail(
 
 
 def wallet_transactions() -> dict:
-    """钱包流水明细：无参 GET /api/wallet/transactions（官方严格 schema）。
-
-    官方对该接口走严格 schema，任何查询参数（``range/page/pageSize/limit`` 等）
-    都会直接 400「请求包含未知字段（错误码：BAD_REQUEST）」，因此这里必须发
-    纯无参 GET，不拼接任何 query。
-    一次返回服务端默认条数（前端不分页、不做二次拉取），data 原样透传
-    （items / total 等字段随服务端），由前端容错渲染。
-    """
     if _require_logged_in_client() is None:
         return {"ok": False, "reason": "未登录"}
     try:
@@ -1344,11 +1118,6 @@ def wallet_transactions() -> dict:
 
 
 def call_logs(page: int = 1, page_size: int = 20, status: str = "") -> dict:
-    """调用日志：GET /api/call-logs/page?page=&pageSize=&status=。
-
-    status 空 = 全部；传 ``error`` 仅失败；其它字符串原样透传（数字状态码无效，
-    需前端约束）。返回 data 原样（list / total / page / pageSize / nextCursor）。
-    """
     if _require_logged_in_client() is None:
         return {"ok": False, "reason": "未登录"}
     try:
@@ -1360,11 +1129,6 @@ def call_logs(page: int = 1, page_size: int = 20, status: str = "") -> dict:
     except TokenRhythmAuthError as error:
         return {"ok": False, "msg": str(error)}
     return {"ok": True, "data": data if isinstance(data, dict) else {}}
-
-
-# ---------------------------------------------------------------------------
-# API Key 自动绑定
-# ---------------------------------------------------------------------------
 
 
 def _load_providers() -> list[dict]:
@@ -1437,12 +1201,10 @@ def _extract_plain_key(data: Any) -> str:
     return ""
 
 
-# 创建 Key 响应里 Key id 的字段名未最终确认：按顺序兜底，取不到就留空。
 _KEY_ID_FIELDS = ("id", "keyId", "apiKeyId")
 
 
 def _create_api_key() -> tuple[str, str]:
-    """创建一枚 API Key，返回 (明文 Key, Key id)；Key id 取不到时为空串。"""
     _require_login()
     payload = _request("POST", "/api/api-keys", {"name": API_KEY_NAME})
     data = payload.get("data")
@@ -1493,12 +1255,6 @@ def _delete_api_key(key_id: str) -> bool:
 
 
 def _account_key_ids() -> set[str]:
-    """当前登录账号名下所有 API Key 的 id 集合（GET /api/api-keys）。
-
-    用于判断绑定里的 key_id 是否还属于这个账号：不在就说明用户已在控制台删掉，
-    必须重新创建。data 既可能是数组，也可能是 ``{"items": [...]}`` 这类分页对象；
-    读取失败返回空集合（调用方据此走"重新创建"，不会误复用）。
-    """
     try:
         payload = _request("GET", "/api/api-keys")
     except TokenRhythmAuthError as error:
@@ -1525,11 +1281,6 @@ def _account_key_ids() -> set[str]:
         if key_id:
             ids.add(key_id)
     return ids
-
-
-# ---------------------------------------------------------------------------
-# 账号 ⇄ Key 绑定关系（加密落盘：换账号时据此整体重建）
-# ---------------------------------------------------------------------------
 
 
 def _save_binding(data: dict) -> bool:
@@ -1565,7 +1316,6 @@ def _save_binding(data: dict) -> bool:
 
 
 def _load_binding() -> dict | None:
-    """读取本地绑定信息；不存在 / 解密失败 / 结构异常一律按"无绑定"处理。"""
     try:
         if not _BINDING_FILE.exists():
             return None
@@ -1580,7 +1330,6 @@ def _load_binding() -> dict | None:
         return None
     account_id = str(data.get("account_id") or "").strip()
     if not account_id:
-        # 没有账号 id 就无法判断"是否换了账号"，等同无绑定。
         return None
     return {
         "v": _as_int(data.get("v"), 1),
@@ -1593,7 +1342,6 @@ def _load_binding() -> dict | None:
 
 
 def _clear_binding() -> None:
-    """删除本地绑定信息（换账号时调用）；失败只记日志。"""
     try:
         _BINDING_FILE.unlink(missing_ok=True)
     except OSError:
@@ -1603,11 +1351,6 @@ def _clear_binding() -> None:
 def _remember_binding(
     account: dict, provider_id: str, key_id: str = "", bound_at: int = 0
 ) -> None:
-    """记录最新绑定：账号 id / 昵称 + 厂商 id + Key id。
-
-    顺手给这条厂商打上托管标记：新建 / 覆盖 / 复用都会走到这里，标记只写这一处，
-    之后退出登录、换账号清理时就能精确区分"自己创建的"与"用户手动配置的"。
-    """
     _save_binding(
         {
             "account_id": account.get("id"),
@@ -1651,12 +1394,6 @@ def _current_account() -> dict:
 
 
 def _short_account_label(account_name: str, limit: int = 6) -> str:
-    """账号昵称定长截断：超过 limit 个码点就砍掉并补省略号。
-
-    昵称会落到厂商名、浮层标题这类窄位置（实测有「基元律动请送我token我…」
-    这种超长昵称），原样写进去会把厂商名撑到 20 多字、标题被 CSS 硬切。
-    按码点切分，避免把 emoji / 代理对劈成乱码。
-    """
     text = str(account_name or "").strip()
     keep = max(1, int(limit))
     chars = list(text)
@@ -1666,11 +1403,6 @@ def _short_account_label(account_name: str, limit: int = 6) -> str:
 
 
 def _bound_provider_name(account_name: str) -> str:
-    """厂商名称带上账号昵称（昵称超长只取前 6 个字符），与手动配置的「基元律动」区分开。
-
-    昵称取不到时回落到「基元律动（账号）」而不是裸「基元律动」：后者正是用户
-    自己手填 Key 时最常用的名字，重名会让两条配置在模型列表里无法分辨。
-    """
     nickname = _short_account_label(account_name) or "账号"
     return f"{DEFAULT_PROVIDER_NAME}（{nickname}）"
 
@@ -1713,7 +1445,6 @@ def _find_provider(providers: list[dict], provider_id: str) -> dict | None:
 
 
 def _provider_key_usable(provider: dict) -> bool:
-    """厂商里存的 Key 是否仍被服务端认可（GET {base_url}/models）。"""
     key = _existing_key(provider)
     if not key:
         return False
@@ -1745,14 +1476,6 @@ def _bind_result(
     key_created: bool | None = None,
     old_key_deleted: bool = False,
 ) -> dict:
-    """拼装返回值：原字段语义不变，补充 key_created / old_key_deleted。
-
-    created 一直表示"本次是否新建了 Key"；key_created 省略时跟随 created，
-    显式传 False 用于"复用已有 Key"的分支，便于上层区分。
-
-    model_added 是历史字段：自首次绑定不再写占位模型后恒为 False，仅为兼容
-    老调用方保留键位，新代码不要据此判断模型是否可用（看 sync_models 的结果）。
-    """
     created_key = bool(created) if key_created is None else bool(key_created)
     result: dict[str, Any] = {
         "created": bool(created),
@@ -1771,17 +1494,6 @@ def _bind_result(
 
 
 def _reuse_bound_key(account: dict, binding: dict, provider_name: str) -> dict | None:
-    """同账号重复登录：Key 仍属于账号且本地可用时复用，否则返回 None（要求新建）。
-
-    两个条件缺一不可：
-    1. binding.key_id 出现在 GET /api/api-keys 返回的 id 列表里（用户没在控制台删掉），
-       这是"这枚 Key 属于当前账号"的权威依据；
-    2. 本地绑定厂商还在，且里面存的 Key 能通过 GET {base_url}/models 校验，保证本地
-       配置没被改坏。
-
-    Key 被删 / 厂商丢失 / Key 失效一律返回 None，交给调用方新建一枚覆盖，
-    绝不退化成"沿用本地其它可用 Key"。
-    """
     key_id = str(binding.get("key_id") or "").strip()
     if not key_id:
         return None
@@ -1808,11 +1520,6 @@ def _reuse_bound_key(account: dict, binding: dict, provider_name: str) -> dict |
 
 
 def _mark_provider_managed(provider_id: str) -> None:
-    """给自动创建/绑定的厂商打托管标记（幂等）。
-
-    标记是"这条是本程序建的"的持久化凭据：即使本地绑定文件丢了，也能识别出来，
-    不会和用户手动配置的条目混为一谈。打标记失败不影响绑定主流程。
-    """
     target = str(provider_id or "").strip()
     if not target:
         return
@@ -1827,7 +1534,6 @@ def _mark_provider_managed(provider_id: str) -> None:
             ),
             None,
         )
-        # 厂商不存在或已有标记都不写盘：复用登录每次都走这里，别白白重写配置
         if provider is None:
             return
         if str(provider.get(MANAGED_PROVIDER_FLAG) or "").strip() == MANAGED_PROVIDER_VALUE:
@@ -1848,7 +1554,6 @@ def _mark_provider_managed(provider_id: str) -> None:
 
 
 def _is_managed_provider(provider: dict, bound_ids: set[str]) -> bool:
-    """这条厂商是否由本程序创建：带托管标记，或正是本地绑定记录里的那条。"""
     if str(provider.get(MANAGED_PROVIDER_FLAG) or "").strip() == MANAGED_PROVIDER_VALUE:
         return True
     provider_id = str(provider.get("id") or "").strip()
@@ -1856,12 +1561,6 @@ def _is_managed_provider(provider: dict, bound_ids: set[str]) -> bool:
 
 
 def _delete_tr_providers(keep_id: str = "") -> int:
-    """删除本程序自动创建/托管的基元律动厂商（keep_id 那条保留），返回删除数量。
-
-    只认两种身份：provider 上的托管标记，或本地绑定信息记录的 provider_id。
-    用户自己填 Key 配置的同域厂商两个都不满足——退出登录、换账号都不会动它，
-    名字里带「基元律动」也一样（用户手动配置的条目必须原样保留）。
-    """
     removed = 0
     try:
         from core import model_manager
@@ -1891,22 +1590,6 @@ def _delete_tr_providers(keep_id: str = "") -> int:
 
 
 def ensure_bound() -> dict:
-    """确保当前登录账号拥有一枚专属 API Key，并绑定到本地模型厂商。
-
-    产品语义（登录即新建专属 Key，绝不复用用户手动填过的 Key）：
-    1. 同账号、Key 仍在账号下且本地可用：复用这一枚，不重复创建（created=False）。
-    2. 同账号但 Key 已被删 / 厂商丢失 / Key 失效：新建一枚 Key，覆盖绑定过的厂商。
-    3. 换账号：先删旧账号的 Key（POST /api/api-keys/{id}/delete），再删旧厂商、
-       清绑定，然后新建 Key + 新建厂商（名称「基元律动（昵称）」）。
-    4. 无绑定 / 绑定损坏：一定新建 Key + 新建厂商 + 写绑定（不沿用本地任何已有 Key）。
-
-    未登录抛 TokenRhythmAuthError（请先登录基元律动账号）。
-    返回：created / key_created（是否新建了 Key）、old_key_deleted（换账号时旧 Key
-    是否删除成功）、provider_id、reason、account_id、account_name、provider_name；
-    account_switched 只在本次发生账号切换时出现。model_added 为历史字段（恒 False）：
-    本函数不再写入任何占位模型，新建厂商后由调用方用 sync_models() 填充真实目录。
-    日志只记 key_id / provider_id，绝不打印 Key 明文。
-    """
     account = _current_account()
     provider_name = _bound_provider_name(account["name"])
 
@@ -1920,7 +1603,6 @@ def ensure_bound() -> dict:
         old_key_id = str(binding.get("key_id") or "").strip()
         dropped_provider_id = str(binding.get("provider_id") or "").strip()
         old_key_deleted = _delete_api_key(old_key_id)
-        # 旧账号可能留下多条历史厂商，一并清掉，保证配置里只剩新账号那一条
         _delete_tr_providers()
         _delete_provider_quietly(dropped_provider_id)
         _clear_binding()
@@ -1935,7 +1617,6 @@ def ensure_bound() -> dict:
     _delete_tr_providers()
     new_key, key_id = _create_api_key()
 
-    # 目标厂商：同账号优先覆盖绑定过的那个；换账号 / 无绑定时一律新建厂商
     target: dict | None = None
     if not account_switched and binding:
         target = _find_provider(_load_providers(), binding.get("provider_id") or "")
@@ -1981,10 +1662,6 @@ def ensure_bound() -> dict:
             f"API Key 已创建，但新增模型厂商失败：{error}"
         ) from error
 
-    # 刻意不写任何"占位模型"：厂商建好后由调用方紧接着执行 sync_models()，
-    # 按上游 GET /api/models 的真实条目（含真实 contextWindow）填充目录。
-    # 历史实现此处硬编码 deepseek-v4.1-flash + 128000，而该裸名模型已在上游
-    # 下线，只会给用户留下一条调不通、上下文还比真实值小一截的脏模型。
     _remember_binding(account, provider_id, key_id)
     return _bind_result(
         account,
@@ -1998,27 +1675,14 @@ def ensure_bound() -> dict:
     )
 
 
-# ---------------------------------------------------------------------------
-# 模型目录同步：把基元律动提供的全部可用语言模型写入本地厂商
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# 模型目录同步：把基元律动提供的全部可用语言模型写入本地厂商
-# ---------------------------------------------------------------------------
-
 # 公开模型目录（无需登录）：GET BASE_URL + /api/models
 # 注意它和 Key 校验用的 {base_url}/v1/models 不是同一个端点。
 MODELS_PATH = "/api/models"
-# 只同步对话模型、只同步在线模型；图片 / 视频 / embedding / 下线一律跳过。
 _SYNC_MODEL_TYPE = "chat"
 _SYNC_MODEL_STATUS = "online"
 
 
 def _flag(mapping: Any, key: str) -> bool | None:
-    """读取能力布尔字段：有明确结论返回 True/False，缺失或无法判定返回 None。
-
-    返回 None 让调用方继续走兜底链（capabilities → 平铺字段 → 默认值），
-    避免把"字段缺失"误判成"明确不支持"。
-    """
     if not isinstance(mapping, dict) or key not in mapping:
         return None
     value = mapping[key]
@@ -2036,7 +1700,6 @@ def _flag(mapping: Any, key: str) -> bool | None:
 
 
 def _positive_int(value: Any, default: int | None) -> int | None:
-    """把字段转成正整数；缺失 / 非数字 / <=0 时返回默认值。"""
     if value is None or isinstance(value, bool):
         return default
     try:
@@ -2047,7 +1710,6 @@ def _positive_int(value: Any, default: int | None) -> int | None:
 
 
 def _openai_available(model: dict) -> bool:
-    """模型是否走 OpenAI 协议：capabilities.openai 优先，再看 protocolCapabilities。"""
     flag = _flag(model.get("capabilities"), "openai")
     if flag is not None:
         return flag
@@ -2076,7 +1738,6 @@ def _model_items(payload: dict) -> list[dict]:
 
 
 def _syncable_models(payload: dict) -> list[dict]:
-    """过滤出可同步的模型：type=chat、status=online、OpenAI 协议可用、有 id。"""
     usable: list[dict] = []
     for model in _model_items(payload):
         if str(model.get("type") or "").strip() != _SYNC_MODEL_TYPE:
@@ -2092,15 +1753,6 @@ def _syncable_models(payload: dict) -> list[dict]:
 
 
 def _sync_model_fields(model: dict) -> dict[str, Any]:
-    """把接口模型对象映射成本地模型条目的字段。
-
-    - 名称：用 id（就是请求时要带的模型名），不用展示名 name；
-    - 上下文窗口：contextWindow，缺失 / 非正数用 DEFAULT_CONTEXT_WINDOW 兜底；
-    - 最大输出：maxOutputTokens，缺失则不传（交给模型管理器的内置默认）；
-    - 视觉：capabilities.vision → supportsVision → 默认 False；
-    - 工具调用：capabilities.tools → supportsTools → 默认 True
-      （产品要求"尽量全部支持工具调用"，但字段明确为 false 时尊重服务端结论）。
-    """
     capabilities = model.get("capabilities")
     capabilities = capabilities if isinstance(capabilities, dict) else {}
 
@@ -2128,7 +1780,6 @@ def _sync_model_fields(model: dict) -> dict[str, Any]:
 
 
 def _resolve_sync_provider(provider_id: str | None) -> tuple[str, str]:
-    """确定要写入的厂商：入参 → 绑定信息 → 本地 base_url 含 tokenrhythm.studio。"""
     providers = _load_providers()
     explicit = str(provider_id or "").strip()
     if explicit:
@@ -2178,19 +1829,6 @@ def _existing_model_names(provider_id: str) -> set[str]:
 
 
 def sync_models(provider_id: str | None = None) -> dict:
-    """把基元律动提供的全部可用语言模型按 OpenAI 协议写入本地厂商。
-
-    流程：
-    1. 确定目标厂商：provider_id 入参 → 本地绑定信息 → base_url 含
-       tokenrhythm.studio 的厂商；都没有抛「未找到基元律动厂商配置，请先登录」。
-    2. GET /api/models（公开接口，无需登录），只保留 type=chat、status=online、
-       capabilities.openai 为 true（或 protocolCapabilities.openai.available
-       为 true）的模型，其余（图片 / 视频 / embedding / 下线）一律跳过。
-    3. 逐个调用 model_manager.add_model_to_provider 落盘；已有同名模型跳过。
-       单个模型添加失败只记入 failed，不影响其余模型。
-    4. 返回 {"ok", "provider_id", "provider_name", "total", "added",
-       "skipped", "failed"}；日志只记数量汇总，绝不打印 Key。
-    """
     target_id, provider_name = _resolve_sync_provider(provider_id)
     payload = _request("GET", MODELS_PATH)
     models = _syncable_models(payload)
@@ -2242,6 +1880,52 @@ def sync_models(provider_id: str | None = None) -> dict:
         "skipped": skipped,
         "failed": failed,
     }
+
+
+def _server_profile() -> bool:
+    return os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server"
+
+
+def _server_disabled_payload() -> dict:
+    return {
+        "ok": False,
+        "logged_in": False,
+        "reason": "disabled",
+        "msg": "server 档已禁用基元律动",
+    }
+
+
+def _disable_on_server(fn):
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        if _server_profile():
+            if fn.__name__ == "binding_active":
+                return False
+            return _server_disabled_payload()
+        return fn(*args, **kwargs)
+
+    return wrapped
+
+
+for _server_gated_name in (
+    "password_login",
+    "send_sms_code",
+    "sms_login",
+    "account_status",
+    "export_session_cookies",
+    "session_health",
+    "binding_active",
+    "account_overview",
+    "user_profile",
+    "usage_detail",
+    "wallet_transactions",
+    "call_logs",
+    "logout",
+    "ensure_bound",
+    "sync_models",
+):
+    globals()[_server_gated_name] = _disable_on_server(globals()[_server_gated_name])
 
 
 __all__ = [

@@ -1,10 +1,3 @@
-"""会话消息排队（FIFO）核心逻辑回归。
-
-覆盖：回合运行中入队、回合结束 FIFO 补发、取消排队、插队发送。
-Task 13a 追加：GUI Bridge 电脑操控控制 API（run_id 校验、pause/resume/stop
-透传、完整 snapshot 返回、safety acknowledge 固定不可用）。
-全部用裸实例 + 桩函数构造，不依赖真实 LLM / DB / 前端。
-"""
 import json
 import queue
 import threading
@@ -50,12 +43,6 @@ _ONE_MODEL_CONFIG = {
 
 
 def _make_bridge(is_turn_active):
-    """构造仅含消息排队所需内部状态的裸桥实例。
-
-    is_turn_active: 桩函数，控制 _is_turn_active 的判定结果
-    返回 (bridge, spawned, events, stopped)，后三者分别记录
-    回合启动调用 / 桥事件推送 / 停止回合调用，便于断言。
-    """
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._shutting_down = False
     bridge._current_session = "s1"
@@ -81,14 +68,11 @@ def test_send_user_message_queues_while_turn_active():
     assert res == {"ok": True, "queued": True}
     queue = bridge._message_queues["s1"]
     assert len(queue) == 1
-    # 内部保存含 @路径的完整文本（补发用），展示用 display_text
     assert queue[0]["text"] == "第一条 @d:/a.txt"
     assert queue[0]["display_text"] == "第一条"
-    # 快照事件已推送，且展示文本不含 @路径
     assert events and events[-1][0] == "message_queue"
     assert events[-1][1]["session_name"] == "s1"
     assert events[-1][1]["queue"][0]["text"] == "第一条"
-    # 没有直接启动新回合（不打断当前任务）
     assert spawned == []
 
 
@@ -97,7 +81,6 @@ def test_send_user_message_direct_when_idle():
 
     res = bridge.send_user_message("你好")
 
-    # 空闲时保持原行为：直接启动回合，不入队
     assert res == {"ok": True}
     assert len(spawned) == 1
     assert spawned[0][0] == ("你好", "s1")
@@ -106,7 +89,6 @@ def test_send_user_message_direct_when_idle():
 
 
 def test_send_user_message_binds_known_model(tmp_path, monkeypatch):
-    """前端携带的模型 id 在配置中存在时，随消息写入会话绑定。"""
     _use_tmp_config(tmp_path, monkeypatch, dict(_ONE_MODEL_CONFIG))
     bridge, spawned, _, _ = _make_bridge(lambda s: False)
     bound = []
@@ -122,15 +104,6 @@ def test_send_user_message_binds_known_model(tmp_path, monkeypatch):
 
 
 def test_pending_draft_first_message_switches_current_session(tmp_path):
-    """pending 草稿会话首发落库后，_current_session 必须从旧会话切到新会话。
-
-    回归场景：用户在旧会话「我这个自然语言交互如果给」里点"新会话"
-    （前端 pending 草稿，不落库），发出首条消息。草稿期 _current_session
-    刻意停留在旧会话（防 set_model 污染），但落库后必须切换——否则
-    search_sessions 会把旧会话误当当前会话排除（@ 候选里目标消失）、
-    同时不排除真正在用的会话（@ 候选混入当前会话），@ 文件候选也会
-    继续扫描旧会话的工作区。
-    """
     from core.memory import MemoryManager
 
     mem = MemoryManager(db_path=str(tmp_path / "t.db"))
@@ -139,19 +112,16 @@ def test_pending_draft_first_message_switches_current_session(tmp_path):
 
     bridge, spawned, _, _ = _make_bridge(lambda s: False)
     bridge._memory = mem
-    bridge._current_session = "我这个自然语言交互如果给"  # 草稿期停留的旧会话
-    bridge.get_sessions = lambda: {}  # _rename_session_to_title 事件负载用
+    bridge._current_session = "我这个自然语言交互如果给"
+    bridge.get_sessions = lambda: {}
 
     res = bridge.send_user_message(
         "为什么我输入@无法找到红", "session_abc123", None, "D:/proj"
     )
 
     assert res["ok"] is True
-    # 落库即命名：首条消息前 12 字成为会话名
     assert bridge._current_session == "为什么我输入@无法找到红"
-    # 启动的回合也必须使用新会话名
     assert spawned[0][0][1] == "为什么我输入@无法找到红"
-    # search_sessions 视角：旧会话恢复可见，新会话（当前）被正确排除
     names = [s["name"] for s in bridge.search_sessions("")["sessions"]]
     assert "我这个自然语言交互如果给" in names
     assert "为什么我输入@无法找到红" not in names
@@ -159,11 +129,6 @@ def test_pending_draft_first_message_switches_current_session(tmp_path):
 
 
 def test_pending_draft_first_message_lan_does_not_steal_current_session(tmp_path):
-    """LAN 分发的消息即使带 workdir，也不得抢占本地 _current_session。
-
-    LAN dispatch 的前 5 个位置参数含 workdir，若不加 turn_source 防线，
-    远端往某会话发消息会把本地正在用的会话切走。
-    """
     from core.memory import MemoryManager
 
     mem = MemoryManager(db_path=str(tmp_path / "t.db"))
@@ -185,11 +150,6 @@ def test_pending_draft_first_message_lan_does_not_steal_current_session(tmp_path
 
 
 def test_send_user_message_ignores_unknown_model_binding(tmp_path, monkeypatch):
-    """前端携带的模型 id 不在配置中（陈旧/已删除）时不得写入会话绑定。
-
-    回归防线：显示态一旦被陈旧全局值污染，不能让下一条消息把错误
-    绑定落成真实的会话模型。
-    """
     _use_tmp_config(tmp_path, monkeypatch, dict(_ONE_MODEL_CONFIG))
     bridge, spawned, _, _ = _make_bridge(lambda s: False)
     bound = []
@@ -201,7 +161,6 @@ def test_send_user_message_ignores_unknown_model_binding(tmp_path, monkeypatch):
 
     assert res == {"ok": True}
     assert bound == []
-    # 回合照常启动，仅忽略非法绑定
     assert len(spawned) == 1
 
 
@@ -214,16 +173,13 @@ def test_drain_message_queue_spawns_head_fifo():
 
     bridge._drain_message_queue("s1")
 
-    # FIFO：只补发队首一条，其余顺位保留
     assert [a[0][0] for a in spawned] == ["第一条"]
     assert [m["id"] for m in bridge._message_queues["s1"]] == ["q2"]
-    # 补发后队列快照已更新
     assert events and events[-1][0] == "message_queue"
     assert [m["id"] for m in events[-1][1]["queue"]] == ["q2"]
 
 
 def test_drain_skips_while_turn_active():
-    """并发竞态：新回合已建立时剩余队列留给那个回合自己的 finally 处理。"""
     bridge, spawned, _, _ = _make_bridge(lambda s: True)
     bridge._message_queues["s1"] = [
         {"id": "q1", "text": "x", "display_text": "x", "attachments": []},
@@ -246,7 +202,6 @@ def test_cancel_queued_message_removes_only_target():
     assert res["ok"] is True and res["removed"] == 1
     assert [m["id"] for m in bridge._message_queues["s1"]] == ["q2"]
 
-    # 队列清空后键整体移除（get_message_queue 返回空列表而非残留键）
     res2 = bridge.cancel_queued_message("s1", "q2")
     assert res2["removed"] == 1
     assert "s1" not in bridge._message_queues
@@ -262,7 +217,6 @@ def test_jump_queue_moves_to_front_and_stops_turn():
     res = bridge.jump_queue("s1", "q2")
 
     assert res["ok"] is True
-    # 移到队首：回合结束后 drain 优先补发它
     assert [m["id"] for m in bridge._message_queues["s1"]] == ["q2", "q1"]
     assert stopped == ["s1"]
     assert events and events[-1][0] == "message_queue"
@@ -279,7 +233,6 @@ def test_jump_queue_without_active_turn_only_reorders():
 
     assert res["ok"] is True
     assert [m["id"] for m in bridge._message_queues["s1"]] == ["q2", "q1"]
-    # 无活跃回合时无需停止
     assert stopped == []
 
 
@@ -306,22 +259,12 @@ def test_get_message_queue_returns_snapshot():
 
     assert res["ok"] is True
     assert res["session_name"] == "s1"
-    # 快照只含前端展示字段：display_text（不含 @路径）+ 附件列表
     assert res["queue"] == [
         {"id": "q1", "text": "完整", "attachments": ["d:/a.txt"]},
     ]
 
 
-# ---------------- Task 13a：电脑操控控制 API（设计 16.4/16.5） ----------------
-
-
 def _make_computer_bridge():
-    """构造仅含电脑操控控制 API 所需内部状态的裸桥实例。
-
-    fake controller 的生命周期方法会经 listener 向 _js_queue 投递状态事件，
-    队列与派发标记必须齐备；_js_dispatcher 指向主线程（恒 alive）阻止测试内
-    启动真实派发线程。
-    """
     instance = ApiBridge.__new__(ApiBridge)
     instance._shutting_down = False
     instance._window = None
@@ -345,13 +288,13 @@ def bridge(fake_controller, monkeypatch):
         lambda: fake_controller,
     )
     instance = _make_computer_bridge()
-    instance.get_computer_control_status()  # 控制方法惰性建立事件桥（生产路径）
+    instance.get_computer_control_status()
     return instance
 
 
 def test_bridge_mutation_requires_current_run_id(fake_controller, bridge):
     fake_controller.start_run(run_id="run-a")
-    result = bridge.stop_computer_control("run-b")  # 旧 UI 事件的 run id
+    result = bridge.stop_computer_control("run-b")
     assert result["ok"] is False
     assert fake_controller.snapshot().run_id == "run-a"
 
@@ -384,12 +327,10 @@ def test_bridge_stop_with_current_run_id_stops_run(fake_controller, bridge):
     assert result["ok"] is True
     assert result["status"] == "stopped"
     assert fake_controller.stop_calls == [("run-a", "user_stop")]
-    # 终态快照仍可见（镜像 controller _last_snapshot 语义）
     assert fake_controller.snapshot().run_id == "run-a"
 
 
 def test_every_control_operation_returns_full_snapshot(fake_controller, bridge):
-    """设计 16.4：每次控制操作返回完整 snapshot，供前端在事件丢弃后校准 Store。"""
     fake_controller.start_run(run_id="run-a")
     fake_controller.action_count = 12
     snapshot_keys = set(ComputerRunSnapshot().to_public_dict())
@@ -405,7 +346,6 @@ def test_every_control_operation_returns_full_snapshot(fake_controller, bridge):
     ]
     for result in results:
         assert result["ok"] is True
-        # 完整快照字段全部在场且与 controller 当前值一致
         assert snapshot_keys <= set(result)
         assert result["run_id"] == "run-a"
         assert result["action_count"] == 12
@@ -413,14 +353,12 @@ def test_every_control_operation_returns_full_snapshot(fake_controller, bridge):
 
 
 def test_failed_mutation_returns_current_snapshot_for_recalibration(fake_controller, bridge):
-    """run_id 不匹配被拒时，失败返回值带当前活动 run 的完整快照供前端校准。"""
     fake_controller.start_run(run_id="run-a")
 
     result = bridge.stop_computer_control("run-b")
 
     assert result["ok"] is False
     assert result["error_code"] == "computer_invalid_state"
-    # 返回的是当前活动 run（run-a），不是请求里被拒绝的旧 run id
     assert result["run_id"] == "run-a"
     assert result["status"] == "running"
-    assert fake_controller.stop_calls == []  # 新 run 未被旧事件停止
+    assert fake_controller.stop_calls == []

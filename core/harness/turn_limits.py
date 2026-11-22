@@ -1,5 +1,3 @@
-"""Strict per-Turn Provider Step limit configuration."""
-
 from __future__ import annotations
 
 import config

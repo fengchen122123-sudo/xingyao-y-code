@@ -56,7 +56,6 @@ describe('computeRestoredHeight', () => {
   });
 });
 
-// 直接驱动 composable 的拖拽流程（无组件实例，onMounted 恢复钩子不注册）
 function fakePointer(clientY: number): PointerEvent {
   return { clientY, pointerId: 1, currentTarget: {}, preventDefault() {} } as unknown as PointerEvent;
 }
@@ -68,11 +67,9 @@ function fakeWindowPointer(type: string, clientY: number) {
 
 describe('useComposerResize 拖拽下限', () => {
   it('下限只按默认高度锁定一次，拉高后仍能拖回默认（回归：拉上去拖不下来）', () => {
-    // 真实浏览器里拉伸会改变 offsetHeight；首次测量到的 60px 才是默认下限
     let el = { offsetHeight: 60 };
     const api = useComposerResize(() => el as unknown as HTMLTextAreaElement);
 
-    // 第一次拖拽：从默认 60px 拉高到 160px 并松手（写入记忆）
     api.onHandlePointerdown(fakePointer(100));
     fakeWindowPointer('pointermove', 0);
     expect(api.textareaHeight.value).toBe(160);
@@ -85,7 +82,6 @@ describe('useComposerResize 拖拽下限', () => {
     fakeWindowPointer('pointermove', 400);
     expect(api.textareaHeight.value).toBe(60);
     fakeWindowPointer('pointerup', 400);
-    // 拖回默认视为未拉伸，清除记忆
     expect(localStorage.getItem(COMPOSER_HEIGHT_KEY)).toBeNull();
   });
 

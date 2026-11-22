@@ -18,7 +18,6 @@
     </div>
 
     <div v-if="hasData" class="detail-grid">
-      <!-- 折线：横轴为按总量降序的模型，三条序列分别看总量 / 输入 / 输出 -->
       <div class="detail-panel">
         <div class="detail-panel-title">模型用量排行</div>
         <div class="ranking-legend" data-test="day-detail-legend">
@@ -78,7 +77,6 @@
         </svg>
       </div>
 
-      <!-- 扇形：当天各模型占比 -->
       <div class="detail-panel">
         <div class="detail-panel-title">模型占比</div>
         <div class="donut-grid">
@@ -212,7 +210,6 @@ function pointY(value: number) {
   return RANKING_PAD_TOP + RANKING_PLOT_HEIGHT * (1 - ratio);
 }
 
-// 每个数据点一条等宽命中带，方便 hover 读出该模型的三项数值。
 const bandWidth = computed(() => {
   const count = ranking.value.labels.length;
   return count <= 1 ? RANKING_PLOT_WIDTH : RANKING_PLOT_WIDTH / (count - 1);

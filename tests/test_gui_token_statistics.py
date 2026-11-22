@@ -143,7 +143,6 @@ def test_gui_token_statistics_supports_full_year_range():
 
 
 def test_gui_token_statistics_supports_lifetime_range():
-    """days=0 累计全量：区间起点取最早一条用量记录，不受 365 天限制。"""
     bridge = object.__new__(gui_bridge.ApiBridge)
     bridge._memory = MemoryManager(":memory:")
     today = date.today()
@@ -172,7 +171,6 @@ def test_gui_token_statistics_supports_lifetime_range():
 
 
 def test_gui_token_statistics_lifetime_without_records_covers_today_only():
-    """累计范围没有历史记录时只返回今天一格，不生成空日期。"""
     bridge = object.__new__(gui_bridge.ApiBridge)
     bridge._memory = MemoryManager(":memory:")
 

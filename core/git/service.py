@@ -1,18 +1,8 @@
-"""GitApplicationService：GUI/CLI 唯一应用服务门面（规格 §6/§9.3/§13）。
-
-每个写操作按 §9.3 九步顺序编排：
-  解析仓库 → 获取锁（固定顺序）→ 锁内重读权威状态 → 比较快照版本 →
-  前置检查（兼容矩阵/信任/风险确认/硬规则）→ 执行单个白名单操作 →
-  重读结果 → 发布失效事件 → 释放锁。
-
-状态过期（stale_snapshot）拒绝执行；确认令牌随快照过期立即失效。
-"""
-
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional
 
 from core.git import mutation, patch as git_patch, query, query_refs
 from core.git.coordinator import (
@@ -46,7 +36,6 @@ from core.git.risk import (
 from core.git.runner import ExecScope, GitRunner
 from core.git.trust import collect_security_fingerprint, require_trust
 
-# 操作 → 兼容矩阵类别（§9.2）
 _OPERATION_CATEGORY: Dict[str, GitOperationCategory] = {
     "status": GitOperationCategory.READ_ONLY,
     "log": GitOperationCategory.READ_ONLY,
@@ -99,7 +88,6 @@ _OPERATION_CATEGORY: Dict[str, GitOperationCategory] = {
     "ignore_add": GitOperationCategory.WORKTREE_REWRITE,
 }
 
-# 可能间接触发仓库脚本/过滤器/外部程序的操作：必须先过仓库信任（§4.5）
 _TRUST_REQUIRED = frozenset(
     {
         "commit", "merge", "rebase", "rebase_plan_write", "cherry_pick", "revert",
@@ -113,7 +101,6 @@ _TRUST_REQUIRED = frozenset(
 
 @dataclass(frozen=True)
 class GitRiskPreview:
-    """§13 preview 产物：影响范围 + 风险级别 + 一次性确认令牌。"""
 
     operation: str
     risk_level: RiskLevel
@@ -132,10 +119,7 @@ class GitApplicationService:
     confirmations: ConfirmationService = field(default_factory=ConfirmationService)
     on_invalidate: Optional[Callable[[str], None]] = None
 
-    # ---------------------------------------------------------------- 快照
-
     def resolve(self, ws: str) -> RepositoryIdentity:
-        """每个请求先解析真实仓库（§9.3 第 1 步）。"""
         return resolve_repository(str(ws), self.runner)
 
     def get_snapshot(self, ws: str) -> GitSnapshot:
@@ -144,8 +128,6 @@ class GitApplicationService:
             return self._build_snapshot(identity)
 
     def _build_snapshot(self, identity: RepositoryIdentity) -> GitSnapshot:
-        # --ignored=matching 并入唯一一次 status 扫描（ignored 计数由解析产出）；
-        # 曾为计数单独再全量扫一遍工作区，node_modules 仓库单次就要秒级
         raw_status = self.runner.run_checked(
             [
                 "status", "--porcelain=v2", "-z", "--branch", "--show-stash",
@@ -162,7 +144,7 @@ class GitApplicationService:
         wv = compute_worktree_version(
             identity=identity,
             head_oid=status.head_oid or "",
-            index_material="",  # index 材料已包含于 status 原始字节
+            index_material="",
             # 版本材料剥掉 `!` 记录，与不带 --ignored 的扫描字节保持一致：
             # ignored 文件变化不得触发版本变化（乐观并发会误报冲突）
             status_bytes=query.strip_ignored_records(raw_status.stdout),
@@ -213,8 +195,6 @@ class GitApplicationService:
             ).hexdigest(),
         )
 
-    # ---------------------------------------------------------------- 读接口
-
     def list_branches(self, ws: str):
         identity = self.resolve(ws)
         return query_refs.list_branches(self.runner, identity)
@@ -247,8 +227,6 @@ class GitApplicationService:
 
     def list_stashes(self, ws: str):
         return query_refs.list_stashes(self.runner, self.resolve(ws))
-
-    # ---------------------------------------------------------------- 风险与确认（§13）
 
     def preview(self, ws: str, operation: str, params: dict, session_id: str = "") -> GitRiskPreview:
         risk = classify_risk(operation)
@@ -297,11 +275,7 @@ class GitApplicationService:
 
     @staticmethod
     def _digest_params(params: dict) -> dict:
-        """参与确认摘要的参数：排除 confirm_input（它是验证凭据，不是操作参数），
-        保证 preview（无 confirm_input）与 execute（有 confirm_input）摘要一致。"""
         return {k: v for k, v in params.items() if k != "confirm_input"}
-
-    # ---------------------------------------------------------------- 写执行（§9.3）
 
     def execute(
         self,
@@ -333,7 +307,6 @@ class GitApplicationService:
             trust_fingerprint = collect_security_fingerprint(self.runner, identity)
 
         def _run_locked() -> GitSnapshot:
-            # 第 3-5 步：锁内重读权威状态、比较版本、前置检查
             fresh = self._build_snapshot(identity)
             if versions is not None:
                 if versions.worktree_version is not None and not versions_match(
@@ -375,9 +348,7 @@ class GitApplicationService:
                 )
             if risk is RiskLevel.UNRECOVERABLE:
                 self._verify_typed_confirmation(operation, params, fresh)
-            # 第 6 步：执行单个白名单操作
             _OPERATION_EXECUTORS[operation](self, identity, fresh, params)
-            # 第 7-8 步：重读结果 + 发布失效
             result_snapshot = self._build_snapshot(identity)
             if self.on_invalidate:
                 try:
@@ -395,7 +366,6 @@ class GitApplicationService:
     def _verify_typed_confirmation(
         self, operation: str, params: dict, fresh: GitSnapshot
     ) -> None:
-        """不可恢复操作要求输入目标分支名或短 Hash 二次确认（§13）。"""
         expected = params.get("target") or params.get("branch") or fresh.branch_name or ""
         typed = str(params.get("confirm_input") or "")
         if not expected or typed.strip() not in (expected, expected[:7], expected[:8]):
@@ -403,8 +373,6 @@ class GitApplicationService:
                 GitErrorCode.CONFIRMATION_INVALID,
                 f"二次确认输入不匹配目标 {expected}，操作已拒绝",
             )
-
-    # ---------------------------------------------------------------- 便捷写方法（内部走 execute）
 
     def stage(self, ws: str, paths, versions: SnapshotVersions, session_id: str = "") -> GitSnapshot:
         return self.execute(
@@ -434,8 +402,6 @@ class GitApplicationService:
             versions=versions, session_id=session_id,
         )
 
-
-# ---------------------------------------------------------------- 操作执行器（每个 = 单个白名单 git 调用）
 
 def _op_stage(service, identity, snapshot, params):
     paths = params.get("paths") or []
@@ -516,7 +482,6 @@ def _op_switch(service, identity, snapshot, params):
 
 
 def _status_of(snapshot: GitSnapshot):
-    """从快照重建 switch 硬规则所需的 StatusV2 视图。"""
     from core.git.query import StatusV2
 
     return StatusV2(

@@ -8,8 +8,6 @@ from core.memory import MemoryManager
 def _bridge_without_init(session_name="gui-token-session"):
     bridge = object.__new__(gui_bridge.ApiBridge)
     bridge._current_session = session_name
-    # 绕过 __init__ 的旁路桥需补齐 rename_session / _ensure_lan_server 依赖的属性，
-    # 与 __init__（gui_bridge.py）中的真实初始化保持同类型默认值
     bridge._turn_start_lock = threading.Lock()
     bridge._message_queues = {}
     bridge._lan_server = None
@@ -70,7 +68,6 @@ def test_gui_token_payload_uses_session_prompt_as_cache_denominator(monkeypatch)
 
 
 def test_gui_token_payload_exposes_cli_style_totals(monkeypatch):
-    """状态栏与 CLI 口径一致：输入/输出/命中取自 process 累计（计费口径）。"""
     bridge = _bridge_without_init()
     monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/deepseek-v4",
@@ -135,18 +132,10 @@ def test_gui_session_rename_and_clear_update_cache_lifecycle(monkeypatch):
 
 
 def test_gui_registers_realtime_listener_on_init(monkeypatch):
-    """GUI 启动必须把 _emit_token_usage 注册为记账监听器：
-    每次 LLM 请求（含子代理）记账完立即推送 token_usage 事件，
-    前端统计栏与上下文圆圈逐请求实时刷新，而非等回合结束。"""
-    # __init__ 会初始化 DB/窗口等重资源，既有测试均不构造完整实例；
-    # 这里只断言注册语句存在且传参正确（语句缺失即回归）。
     import inspect
     source = inspect.getsource(gui_bridge.ApiBridge.__init__)
     assert "set_token_usage_listener(self._emit_token_usage)" in source
 
-    # 再验证真实回调链：注册 _emit_token_usage 后，监听器触发即推送事件。
-    # 裸实例缺少 delta 缓冲等属性，_flush_deltas 会抛错并被
-    # _emit_token_usage 吞掉，因此一并补齐最小依赖。
     import threading
 
     pushed = []
@@ -192,7 +181,6 @@ def test_gui_registers_realtime_listener_on_init(monkeypatch):
 
 
 def test_ensure_fits_active_window_runs_asynchronously(tmp_path, monkeypatch):
-    """验证 _ensure_fits_active_window 触发压缩时派发到后台线程，不阻塞调用方（门闩机制消除假阳性）。"""
     bridge = _bridge_without_init("async-session")
     db = tmp_path / "async.db"
     bridge._memory = MemoryManager(str(db))
@@ -225,23 +213,14 @@ def test_ensure_fits_active_window_runs_asynchronously(tmp_path, monkeypatch):
 
     bridge._ensure_fits_active_window("async-session")
 
-    # 核心断言：主线程返回瞬间，后台线程已启动但被 latch 门闩阻断（同步实现必在此前已 set finished）
     assert bg_started.wait(timeout=1.0) is True
     assert bg_finished.is_set() is False
 
-    # 释放门闩，后台平稳退出
     latch.set()
     assert bg_finished.wait(timeout=1.0) is True
 
 
 def test_gui_compress_test_latch_catches_sync_regression(tmp_path, monkeypatch):
-    """守门：若 _ensure_fits_active_window 退化为同步实现，门闩断言必须失败。
-
-    用 start() 即同步执行 target 的 Thread 替身替换 gui_bridge.threading：
-    替身生效时 bg_finished 在 _ensure_fits_active_window 返回前必然已置位
-    （同步特征），证明 runs_asynchronously 用例的「返回瞬间未完成」断言不是
-    假阳性——两条用例合起来才封死同步回退。
-    """
     bridge = _bridge_without_init("sync-guard-session")
     db = tmp_path / "sync-guard.db"
     bridge._memory = MemoryManager(str(db))
@@ -283,13 +262,10 @@ def test_gui_compress_test_latch_catches_sync_regression(tmp_path, monkeypatch):
 
     bridge._ensure_fits_active_window("sync-guard-session")
 
-    # 同步替身下：调用返回时后台任务已执行完（证明替身确实生效且被路由）；
-    # 真实异步实现下此处应为 False——与 runs_asynchronously 用例互补。
     assert bg_finished.is_set() is True
 
 
 def test_ensure_fits_active_window_skips_when_turn_active(tmp_path, monkeypatch):
-    """当会话已有活跃回合时，跳过切模型异步压缩。"""
     bridge = _bridge_without_init("active-session")
     db = tmp_path / "active.db"
     bridge._memory = MemoryManager(str(db))
@@ -319,7 +295,6 @@ def test_ensure_fits_active_window_skips_when_turn_active(tmp_path, monkeypatch)
 
 
 def test_ensure_fits_active_window_skips_when_compressing(tmp_path, monkeypatch):
-    """当会话后台已在进行记忆压缩时，跳过切模型异步压缩。"""
     bridge = _bridge_without_init("comp-session")
     db = tmp_path / "comp.db"
     bridge._memory = MemoryManager(str(db))
@@ -351,9 +326,6 @@ def test_ensure_fits_active_window_skips_when_compressing(tmp_path, monkeypatch)
     assert bg_started.wait(timeout=0.1) is False
 
 
-# —— 跨渠道缓存命中率修复 · Task 4：GUI 侧 lane 维度与保活单列 ——
-
-# 改动前 get_token_usage 成功路径的键集合金样；新键只能增加，不能减少。
 _LEGACY_GUI_TOKEN_KEYS = {
     "used", "window", "cached_pct", "cumulative",
     "cache_latest_pct", "cache_hot_pct", "cache_session_pct",
@@ -381,7 +353,6 @@ def _snapshot_with_scopes():
 
 
 def test_gui_token_payload_exposes_lane_dimension_keeping_legacy_keys(monkeypatch):
-    """GUI 下发车道身份 + 保活单列命中率，且现有键一个都不少、语义不变（前端已在读）。"""
     bridge = _bridge_without_init()
     monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/deepseek-v4",
@@ -394,23 +365,15 @@ def test_gui_token_payload_exposes_lane_dimension_keeping_legacy_keys(monkeypatc
 
     payload = bridge.get_token_usage()
 
-    # 金样式：改动前的键必须仍是子集
     assert _LEGACY_GUI_TOKEN_KEYS <= set(payload)
-    # 车道身份：前端面板用它标注「这个数字属于哪条车道」
     assert payload["cache_lane_model"] == "openai/deepseek-v4"
     assert payload["cache_lane_api_base"] == "https://gui.example/v1"
-    # 保活单列（与主口径同分母的是 session_all，hot 另给一格与 CLI 状态栏同源）
     assert payload["cache_keepalive_session_pct"] == 10.0
     assert payload["cache_keepalive_hot_pct"] == 10.0
     assert payload["cache_hot_pct"] == 98.8
 
 
 def test_gui_token_payload_does_not_duplicate_existing_rate_keys(monkeypatch):
-    """车道命中率不重复下发：与既有 cache_hot_pct / cache_session_pct 同值的键必须不存在。
-
-    车道身份是新增信息，命中率本身早已按 (会话, 模型, 接口) 算好并下发；
-    再复制一份只涨载荷、并给前端留下「两个数字该信谁」的歧义。
-    """
     bridge = _bridge_without_init()
     monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/deepseek-v4",
@@ -429,7 +392,6 @@ def test_gui_token_payload_does_not_duplicate_existing_rate_keys(monkeypatch):
 
 
 def test_gui_keepalive_lane_rate_unreported_is_none_not_zero(monkeypatch):
-    """铁律「未报告 ≠ 0」：保活全是 cache_reported=0 时 GUI 字段为 None。"""
     bridge = _bridge_without_init()
     monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/local-vllm",
@@ -456,3 +418,97 @@ def test_gui_keepalive_lane_rate_unreported_is_none_not_zero(monkeypatch):
     assert payload["cache_keepalive_hot_pct"] is None
     assert payload["cache_keepalive_session_pct"] is None
 
+
+def test_recalc_token_usage_preserves_deepseek_real_usage_across_session_switch(tmp_path, monkeypatch):
+    import core.agent_service as agent_service
+
+    session = "ds-recalc-session"
+    bridge = _bridge_without_init(session)
+    bridge._memory = MemoryManager(str(tmp_path / "ds-recalc.db"))
+    bridge._memory.create_session_explicit(session)
+    bridge._memory.add_message(session, "user", "hello")
+    bridge._memory.add_token_usage(
+        "openai", "deepseek-v4.1-flash-1017", 263184, 1511, 261888, 264695,
+        session_id=session, cache_scope="main",
+    )
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/deepseek-v4.1-flash-1017",
+        "base_url": "https://api.deepseek.com",
+        "context_window": 1000000,
+    })
+    monkeypatch.setattr(
+        agent_service, "estimate_history_tokens_with_system", lambda *_a, **_k: 96690
+    )
+
+    saved = dict(llm.session_token_usage)
+    try:
+        bridge._recalc_token_usage(session)
+        payload = bridge.get_token_usage()
+        assert payload["used"] == 264695
+        assert payload["window"] == 1000000
+    finally:
+        with llm.token_usage_lock:
+            llm.session_token_usage.update(saved)
+
+
+def test_recalc_token_usage_returns_zero_for_cleared_session(tmp_path, monkeypatch):
+    session = "ds-cleared-session"
+    bridge = _bridge_without_init(session)
+    bridge._memory = MemoryManager(str(tmp_path / "ds-cleared.db"))
+    bridge._memory.create_session_explicit(session)
+    bridge._memory.add_message(session, "user", "hello")
+    bridge._memory.add_token_usage(
+        "openai", "deepseek-v4.1-flash-1017", 263184, 1511, 261888, 264695,
+        session_id=session, cache_scope="main",
+    )
+    bridge._memory.clear_session_messages(session)
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/deepseek-v4.1-flash-1017",
+        "base_url": "https://api.deepseek.com",
+        "context_window": 1000000,
+    })
+
+    saved = dict(llm.session_token_usage)
+    try:
+        bridge._recalc_token_usage(session)
+        payload = bridge.get_token_usage()
+        assert payload["used"] == 0
+    finally:
+        with llm.token_usage_lock:
+            llm.session_token_usage.update(saved)
+
+
+def test_ensure_fits_active_window_forwards_api_base(tmp_path, monkeypatch):
+    import core.agent_service as agent_service
+
+    session = "ds-fit-session"
+    bridge = _bridge_without_init(session)
+    bridge._memory = MemoryManager(str(tmp_path / "ds-fit.db"))
+    bridge._memory.create_session_explicit(session)
+    bridge._memory.add_message(session, "user", "hello")
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/deepseek-v4.1-flash-1017",
+        "base_url": "https://api.deepseek.com",
+        "context_window": 1000000,
+    })
+    monkeypatch.setattr(bridge, "_is_turn_active", lambda *_a: False)
+
+    captured = {}
+
+    def _fake_baseline(manager, sess, model, history=None, api_base=""):
+        captured["sess"] = sess
+        captured["model"] = model
+        captured["history"] = history
+        captured["api_base"] = api_base
+        return 1000
+
+    monkeypatch.setattr(agent_service, "get_session_token_baseline", _fake_baseline)
+
+    bridge._ensure_fits_active_window(session)
+    assert captured["sess"] == session
+    assert captured["model"] == "openai/deepseek-v4.1-flash-1017"
+    assert captured["api_base"] == "https://api.deepseek.com"
+    assert captured["history"] == [{"role": "user", "content": "hello"}]

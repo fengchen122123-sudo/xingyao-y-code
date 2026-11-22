@@ -1,15 +1,3 @@
-"""唯一 Git 进程执行器（规格 §8）。
-
-铁律：
-- 参数数组启动，绝不用 Shell；
-- 固定可执行文件与按作用域的子命令白名单（扩展必须改表并过评审）；
-- 显式设置 --no-optional-locks / protocol.ext.allow=never；只读覆盖 core.fsmonitor=false；
-  diff/log/show 默认 --no-ext-diff --no-textconv；
-- stdin 默认关闭（子进程不得等待不可见终端输入），GIT_TERMINAL_PROMPT=0；
-- 超时终止进程树，绝不自动重试；
-- 错误归类为 GitErrorCode，命令摘要与错误消息一律脱敏。
-"""
-
 from __future__ import annotations
 
 import os
@@ -30,7 +18,6 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class ExecScope(str, Enum):
-    """执行作用域：决定环境加固与白名单（规格 §8/§9.2 兼容矩阵的分类依据）。"""
 
     READ_ONLY = "read_only"
     INDEX = "index"
@@ -39,8 +26,6 @@ class ExecScope(str, Enum):
     NETWORK = "network"
 
 
-# 按作用域的子命令白名单（第一层：args[0]）。动词级校验（如 stash list vs stash pop）
-# 由唯一的上层调用方 query/mutation 层负责；runner 保证裸调不越过作用域边界。
 _SCOPE_SUBCOMMANDS: Dict[ExecScope, frozenset] = {
     ExecScope.READ_ONLY: frozenset(
         {
@@ -67,7 +52,6 @@ _SCOPE_SUBCOMMANDS: Dict[ExecScope, frozenset] = {
     ),
 }
 
-# diff/log/show 会触发外部 diff/textconv（规格 §8）
 _NO_EXTERNAL_DIFF_COMMANDS = frozenset({"diff", "log", "show"})
 
 
@@ -97,7 +81,6 @@ def parse_git_version(version_output: str) -> Tuple[int, int, int]:
 
 
 def with_paths(args: Sequence[str], paths: Iterable[str]) -> List[str]:
-    """路径参数前加 ``--`` 终止选项解析（规格 §8）。"""
     return [*args, "--", *[str(p) for p in paths]]
 
 
@@ -131,8 +114,6 @@ class GitRunner:
         self.git_executable = git_executable
         self._version_cache: Optional[Tuple[int, int, int]] = None
 
-    # ------------------------------------------------------------------ 公开入口
-
     def run(
         self,
         args: Sequence[str],
@@ -165,7 +146,6 @@ class GitRunner:
         stdin_data: bytes = b"",
         env_extra: Optional[Dict[str, str]] = None,
     ) -> GitProcessResult:
-        """与 run 相同，但非零退出显式失败（规格 §4.3）。"""
         result = self.run(
             args, cwd=cwd, scope=scope, timeout=timeout, stdin=stdin,
             stdin_data=stdin_data, env_extra=env_extra,
@@ -185,12 +165,6 @@ class GitRunner:
         return self._execute([str(a) for a in args], cwd=cwd, scope=None, timeout=timeout, stdin=False, env_extra=None)
 
     def check_available(self) -> Tuple[int, int, int]:
-        """探测 git 可执行与版本；缺失/不可解析显式失败。
-
-        结果按实例缓存：git 版本在进程生命周期内不会变化，而 resolve 每个
-        请求都会经过这里（快照/preview/写操作全走 resolve），慢环境下每次
-        探测都是一个真实的进程启动开销。
-        """
         if self._version_cache is not None:
             return self._version_cache
         try:
@@ -217,7 +191,6 @@ class GitRunner:
         minimum: Tuple[int, int, int],
         detected: Tuple[int, int, int],
     ) -> Tuple[int, int, int]:
-        """低于基线显式报错并给升级指引，不用旧命令模拟（规格 §5.1）。"""
         if detected < minimum:
             raise GitError(
                 GitErrorCode.GIT_VERSION_UNSUPPORTED,
@@ -229,10 +202,8 @@ class GitRunner:
         return detected
 
     def check_branch_name(self, name: str, *, cwd: str) -> None:
-        """分支名交由 git check-ref-format 校验（规格 §5.5），不以自研正则替代。"""
         candidate = str(name)
         if not candidate or candidate.startswith("-"):
-            # 选项注入形状的名字在进入 git 前本地拒绝
             raise GitError(
                 GitErrorCode.INVALID_REF,
                 f"非法分支名: {redact_text(candidate[:80])}",
@@ -305,8 +276,6 @@ class GitRunner:
             retryable=retryable,
         )
 
-    # ------------------------------------------------------------------ 内部
-
     def _check_whitelist(self, argv: List[str], scope: ExecScope) -> None:
         allowed = _SCOPE_SUBCOMMANDS.get(scope)
         if allowed is None:
@@ -321,7 +290,6 @@ class GitRunner:
             )
 
     def _build_command(self, argv: List[str], scope: Optional[ExecScope]) -> List[str]:
-        # 裸通道（scope=None）：原样执行，不加前缀、不注入任何配置
         if scope is None:
             return list(argv)
         cmd: List[str] = [self.git_executable]

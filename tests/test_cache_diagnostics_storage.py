@@ -115,7 +115,6 @@ def test_cache_diagnostic_summary_classifies_evidence_without_guessing_provider(
             request_reason=reason,
         ))
 
-    # prompt_drop：同身份上一条 100000，本条 97000（缩短 3%）。
     manager.add_cache_request_diagnostic(_diagnostic(
         ts=base_ts + 10, session_id="drop", prompt_tokens=100000,
         cached_tokens=99000, cache_miss_tokens=1000,
@@ -125,7 +124,6 @@ def test_cache_diagnostic_summary_classifies_evidence_without_guessing_provider(
         cached_tokens=1000, cache_miss_tokens=96000,
     ))
 
-    # idle_gap：相同身份间隔 121 秒，且没有更强客户端原因。
     manager.add_cache_request_diagnostic(_diagnostic(
         ts=base_ts + 20, session_id="idle", prompt_tokens=30000,
         cached_tokens=29000, cache_miss_tokens=1000,
@@ -141,7 +139,6 @@ def test_cache_diagnostic_summary_classifies_evidence_without_guessing_provider(
         ts=base_ts + 31, session_id="unreported", cached_tokens=None,
         cache_miss_tokens=None, cache_reported=False,
     ))
-    # 后台 scope 的低命中与未报告不得污染主链路摘要。
     manager.add_cache_request_diagnostic(_diagnostic(
         ts=base_ts + 32, session_id="background-low",
         cache_scope="keepalive", cached_tokens=0, cache_miss_tokens=30000,

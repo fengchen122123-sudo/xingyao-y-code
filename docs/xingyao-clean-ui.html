@@ -1,0 +1,1388 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>星瑶Code · 极简界面设计稿 v2</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    /* ------------------------------------------------------------------
+       星瑶Code UI Design Tokens (scoped to .xy-window, never on :root)
+       ------------------------------------------------------------------ */
+    .xy-window[data-xy-theme="light"] {
+      --xy-bg: #f4f4f1;
+      --xy-sidebar: #f4f4f1;
+      --xy-canvas: #ffffff;
+      --xy-surface: #fafaf8;
+      --xy-card: #ffffff;
+      --xy-hover: rgba(24, 24, 27, 0.045);
+      --xy-active: rgba(24, 24, 27, 0.075);
+      --xy-border: rgba(24, 24, 27, 0.085);
+      --xy-border-strong: rgba(24, 24, 27, 0.14);
+      --xy-text: #18181b;
+      --xy-text-2: #52525b;
+      --xy-text-3: #7c7c82;
+      --xy-accent: #2563eb;
+      --xy-accent-soft: rgba(37, 99, 235, 0.09);
+      --xy-accent-fg: #ffffff;
+      --xy-user-bubble: #f2f4f7;
+      --xy-green: #16a34a;
+      --xy-green-soft: rgba(22, 163, 74, 0.10);
+      --xy-amber: #d97706;
+      --xy-amber-soft: rgba(217, 119, 6, 0.10);
+      --xy-rose: #dc2626;
+      --xy-rose-soft: rgba(220, 38, 38, 0.09);
+      --xy-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+      --xy-shadow-composer: 0 6px 24px -6px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.04);
+      --xy-shadow-pop: 0 12px 32px -4px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.05);
+      --xy-window-shadow: 0 24px 60px -12px rgba(15, 23, 42, 0.14), 0 0 0 1px rgba(24, 24, 27, 0.08);
+    }
+
+    .xy-window[data-xy-theme="dark"] {
+      --xy-bg: #141416;
+      --xy-sidebar: #161618;
+      --xy-canvas: #1a1a1d;
+      --xy-surface: #202024;
+      --xy-card: #222226;
+      --xy-hover: rgba(255, 255, 255, 0.055);
+      --xy-active: rgba(255, 255, 255, 0.09);
+      --xy-border: rgba(255, 255, 255, 0.08);
+      --xy-border-strong: rgba(255, 255, 255, 0.14);
+      --xy-text: #f4f4f5;
+      --xy-text-2: #a1a1aa;
+      --xy-text-3: #83838c;
+      --xy-accent: #4f86f7;
+      --xy-accent-soft: rgba(79, 134, 247, 0.14);
+      --xy-accent-fg: #ffffff;
+      --xy-user-bubble: #27272b;
+      --xy-green: #4ade80;
+      --xy-green-soft: rgba(74, 222, 128, 0.13);
+      --xy-amber: #fbbf24;
+      --xy-amber-soft: rgba(251, 191, 36, 0.13);
+      --xy-rose: #f87171;
+      --xy-rose-soft: rgba(248, 113, 113, 0.13);
+      --xy-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+      --xy-shadow-composer: 0 8px 28px -6px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.25);
+      --xy-shadow-pop: 0 14px 36px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.09);
+      --xy-window-shadow: 0 26px 64px -12px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.09);
+    }
+
+    .xy-window {
+      background: var(--xy-bg);
+      color: var(--xy-text);
+      box-shadow: var(--xy-window-shadow);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    .xy-mono {
+      font-family: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .xy-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
+    .xy-scroll::-webkit-scrollbar-track { background: transparent; }
+    .xy-scroll::-webkit-scrollbar-thumb { background: transparent; border-radius: 999px; }
+    .xy-scroll:hover::-webkit-scrollbar-thumb { background: var(--xy-border-strong); }
+
+    @keyframes xyPulse {
+      0%, 100% { transform: scale(1); opacity: 0.95; }
+      50% { transform: scale(1.4); opacity: 0.35; }
+    }
+    .xy-pulse { animation: xyPulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+    @keyframes xySpin {
+      to { transform: rotate(360deg); }
+    }
+    .xy-spin { animation: xySpin 1.1s linear infinite; }
+
+    @keyframes xyShimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    .xy-shimmer-text {
+      background: linear-gradient(90deg, var(--xy-text-2) 25%, var(--xy-text) 50%, var(--xy-text-2) 75%);
+      background-size: 200% 100%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      animation: xyShimmer 2.6s linear infinite;
+    }
+
+    .xy-sidebar {
+      width: 244px;
+      transition: width 0.22s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.18s ease;
+    }
+    .xy-sidebar.is-collapsed {
+      width: 0;
+      opacity: 0;
+      overflow: hidden;
+    }
+
+    .xy-menu-row .xy-menu-arrow { opacity: 0; transition: opacity 0.14s ease; }
+    .xy-menu-row:hover .xy-menu-arrow { opacity: 1; }
+
+    .xy-session-row .xy-session-actions { opacity: 0; pointer-events: none; transition: opacity 0.14s ease; }
+    .xy-session-row:hover .xy-session-actions { opacity: 1; pointer-events: auto; }
+    .xy-session-row:hover .xy-session-time { opacity: 0; }
+
+    .xy-group-head .xy-group-actions { opacity: 0; transition: opacity 0.14s ease; }
+    .xy-group-head:hover .xy-group-actions { opacity: 1; }
+
+    .xy-composer {
+      background: var(--xy-card);
+      border: 1px solid var(--xy-border-strong);
+      box-shadow: var(--xy-shadow-composer);
+      transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+    .xy-composer:focus-within {
+      border-color: var(--xy-accent);
+      box-shadow: 0 0 0 3px var(--xy-accent-soft), var(--xy-shadow-composer);
+    }
+
+    .xy-pop {
+      background: var(--xy-card);
+      border: 1px solid var(--xy-border-strong);
+      box-shadow: var(--xy-shadow-pop);
+    }
+  </style>
+</head>
+<body class="bg-[var(--background,#ecece9)] text-[var(--foreground,#18181b)] antialiased m-0 p-3 sm:p-4">
+  <div class="max-w-[1380px] mx-auto flex flex-col gap-2.5">
+    <!-- ================================================================
+         顶部审阅切换条：对比 3 种「执行过程」显示方案 & 运行态/完成态
+         ================================================================ -->
+    <div class="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-[var(--card,#ffffff)] border border-[var(--border,#e4e4e7)] text-xs">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="font-semibold text-[var(--foreground,#18181b)]">执行过程样式：</span>
+        <div class="inline-flex p-0.5 rounded-lg bg-[var(--background,#f4f4f5)] border border-[var(--border,#e4e4e7)]">
+          <button id="proc-btn-capsule" onclick="setProcessStyle('capsule')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            方案A · 轻量原生流（推荐）
+          </button>
+          <button id="proc-btn-stepper" onclick="setProcessStyle('stepper')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            方案B · 紧凑阶段条
+          </button>
+          <button id="proc-btn-inspector" onclick="setProcessStyle('inspector')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            方案C · 主聊纯净 + 右侧实况栏
+          </button>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2">
+        <!-- 运行中 / 已完成 状态切换 -->
+        <div id="state-switcher" class="inline-flex p-0.5 rounded-lg bg-[var(--background,#f4f4f5)] border border-[var(--border,#e4e4e7)]">
+          <button id="state-btn-running" onclick="setExecState('running')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            运行中
+          </button>
+          <button id="state-btn-done" onclick="setExecState('done')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            已完成
+          </button>
+        </div>
+
+        <!-- 页面切换 -->
+        <div class="inline-flex p-0.5 rounded-lg bg-[var(--background,#f4f4f5)] border border-[var(--border,#e4e4e7)]">
+          <button id="page-btn-exec" onclick="switchView('exec')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            执行页面
+          </button>
+          <button id="page-btn-new" onclick="switchView('new')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            新会话页面
+          </button>
+        </div>
+
+        <!-- 浅/深色切换 -->
+        <div class="inline-flex p-0.5 rounded-lg bg-[var(--background,#f4f4f5)] border border-[var(--border,#e4e4e7)]">
+          <button id="theme-light" onclick="setAppTheme('light')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            浅色
+          </button>
+          <button id="theme-dark" onclick="setAppTheme('dark')" class="px-2.5 py-1 rounded-md font-medium transition-colors">
+            深色
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================================================================
+         桌面应用画布
+         ================================================================ -->
+    <div id="app-stage" class="xy-window rounded-2xl overflow-hidden flex flex-col" data-xy-theme="light" style="height: 770px; min-height: 640px;">
+      <!-- 顶栏 (42px) -->
+      <header class="h-[42px] shrink-0 flex items-center justify-between px-3 select-none" style="background: var(--xy-bg);">
+        <div class="flex items-center gap-2">
+          <img
+            onclick="toggleSidebar()"
+            title="收起 / 展开侧栏"
+            alt="星瑶Code"
+            class="w-6 h-6 rounded-md object-cover cursor-pointer transition-transform active:scale-95"
+            src="data:image/png;base64,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"
+          />
+          <span class="text-[13.5px] font-semibold tracking-tight" style="color: var(--xy-text);">星瑶Code</span>
+        </div>
+
+        <div class="flex items-center gap-1">
+          <button onclick="toggleTerminal()" title="终端面板" class="w-7 h-7 rounded-lg flex items-center justify-center transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+            <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><polyline points="7 9 10 12 7 15"/><line x1="12" y1="15" x2="16" y2="15"/></svg>
+          </button>
+          <button onclick="toggleAppTheme()" title="切换浅色 / 深色" class="w-7 h-7 rounded-lg flex items-center justify-center transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+            <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></svg>
+          </button>
+          <button onclick="toggleInspectorBtn()" title="右侧实况面板" class="w-7 h-7 rounded-lg flex items-center justify-center transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+            <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><line x1="15" y1="4" x2="15" y2="20"/></svg>
+          </button>
+          <div class="flex items-center ml-1 pl-1 border-l" style="border-color: var(--xy-border);">
+            <button class="w-7 h-7 rounded-md flex items-center justify-center text-xs" style="color: var(--xy-text-3);">—</button>
+            <button class="w-7 h-7 rounded-md flex items-center justify-center text-xs" style="color: var(--xy-text-3);">▢</button>
+            <button class="w-7 h-7 rounded-md flex items-center justify-center text-xs" style="color: var(--xy-text-3);">✕</button>
+          </div>
+        </div>
+      </header>
+
+      <!-- 主体区：左侧栏 + 右侧圆角白底主面板 -->
+      <div class="flex-1 min-h-0 flex px-2 pb-2 gap-2">
+        <!-- 左侧栏 -->
+        <aside id="xy-sidebar" class="xy-sidebar shrink-0 flex flex-col select-none" style="background: var(--xy-sidebar);">
+          <!-- 顶部 5 项纵向菜单：保持原纵向结构，全部去掉后面的数字与药丸框 -->
+          <nav class="px-1.5 pt-0.5 pb-2 space-y-0.5 text-[13px]">
+            <button onclick="switchView('new')" class="xy-menu-row w-full h-8 px-2.5 rounded-lg flex items-center gap-2.5 text-left transition-colors" style="color: var(--xy-text);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+              <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="color: var(--xy-text-2);"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+              <span class="flex-1 font-medium">新会话</span>
+              <span class="text-xs" style="color: var(--xy-text-3);">小说</span>
+              <span class="text-sm leading-none" style="color: var(--xy-text-3);">＋</span>
+            </button>
+
+            <button onclick="showToast('打开 星盘 · 技能')" class="xy-menu-row w-full h-8 px-2.5 rounded-lg flex items-center gap-2.5 text-left transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)';this.style.color='var(--xy-text)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-2)'">
+              <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15 9 22 12 15 15 12 22 9 15 2 12 9 9"/></svg>
+              <span class="flex-1">星盘 · 技能</span>
+              <span class="xy-menu-arrow text-xs" style="color: var(--xy-text-3);">›</span>
+            </button>
+
+            <button onclick="showToast('打开 星桥 · MCP')" class="xy-menu-row w-full h-8 px-2.5 rounded-lg flex items-center gap-2.5 text-left transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)';this.style.color='var(--xy-text)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-2)'">
+              <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/><path d="M11 7h4a2 2 0 0 1 2 2v4"/></svg>
+              <span class="flex-1">星桥 · MCP</span>
+              <span class="xy-menu-arrow text-xs" style="color: var(--xy-text-3);">›</span>
+            </button>
+
+            <button onclick="showToast('打开 星匣 · 插件')" class="xy-menu-row w-full h-8 px-2.5 rounded-lg flex items-center gap-2.5 text-left transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)';this.style.color='var(--xy-text)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-2)'">
+              <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l8.5 5v10L12 22l-8.5-5V7z"/></svg>
+              <span class="flex-1">星匣 · 插件</span>
+              <span class="xy-menu-arrow text-xs" style="color: var(--xy-text-3);">›</span>
+            </button>
+
+            <button onclick="showToast('打开 星轨')" class="xy-menu-row w-full h-8 px-2.5 rounded-lg flex items-center gap-2.5 text-left transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)';this.style.color='var(--xy-text)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-2)'">
+              <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+              <span class="flex-1">星轨</span>
+              <span class="xy-menu-arrow text-xs" style="color: var(--xy-text-3);">›</span>
+            </button>
+          </nav>
+
+          <div class="mx-2 border-t" style="border-color: var(--xy-border);"></div>
+
+          <!-- 项目会话栏 -->
+          <div class="px-2.5 pt-2.5 pb-1 flex items-center justify-between text-xs">
+            <span class="font-medium" style="color: var(--xy-text-3);">项目会话</span>
+            <div class="flex items-center gap-0.5">
+              <button onclick="showToast('搜索会话 (Ctrl+F)')" title="搜索会话 (Ctrl+F)" class="w-6 h-6 rounded-md flex items-center justify-center transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.background='var(--xy-hover)';this.style.color='var(--xy-text)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-3)'">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              </button>
+              <button onclick="showToast('引入项目文件夹')" title="引入项目目录" class="w-6 h-6 rounded-md flex items-center justify-center transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.background='var(--xy-hover)';this.style.color='var(--xy-text)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-3)'">
+                <svg width="13.5" height="13.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="flex-1 min-h-0 overflow-y-auto xy-scroll px-1 pb-2 space-y-1 text-[12.5px]">
+            <!-- 当前工作区 -->
+            <div>
+              <div class="xy-group-head flex items-center gap-1.5 px-2 py-1.5 rounded-lg cursor-pointer" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--xy-text-3);"><polyline points="6 9 12 15 18 9"/></svg>
+                <svg width="13.5" height="13.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-accent);"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                <span class="font-medium truncate" style="color: var(--xy-text);">小说</span>
+                <span class="w-1.5 h-1.5 rounded-full shrink-0" style="background: var(--xy-green);"></span>
+                <div class="xy-group-actions ml-auto"><button onclick="event.stopPropagation();selectWorkdir('小说',true);switchView('new')" class="w-5 h-5 rounded flex items-center justify-center" style="color: var(--xy-text-3);">＋</button></div>
+              </div>
+              <div class="pl-3 mt-0.5 space-y-0.5">
+                <div id="nav-session-novel" onclick="switchView('exec')" class="xy-session-row relative flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="background: var(--xy-active); color: var(--xy-text);">
+                  <span id="nav-dot-novel" class="w-1.5 h-1.5 rounded-full shrink-0 xy-pulse" style="background: var(--xy-accent);"></span>
+                  <span class="flex-1 truncate font-medium">你现在是一个习钻读者，你(2)</span>
+                  <span class="xy-session-time text-xs shrink-0" style="color: var(--xy-text-3);">刚刚</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 对话 -->
+            <div>
+              <div onclick="toggleGroup('grp-chat')" class="xy-group-head flex items-center gap-1.5 px-2 py-1.5 rounded-lg cursor-pointer" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                <svg id="ico-grp-chat" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--xy-text-3);"><polyline points="6 9 12 15 18 9"/></svg>
+                <svg width="13.5" height="13.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-text-2);"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                <span class="font-medium truncate" style="color: var(--xy-text-2);">对话</span>
+                <span class="xy-mono text-xs ml-1" style="color: var(--xy-text-3);">11</span>
+                <div class="xy-group-actions ml-auto"><button onclick="event.stopPropagation();selectWorkdir('自由对话',true);switchView('new')" class="w-5 h-5 rounded flex items-center justify-center" style="color: var(--xy-text-3);">＋</button></div>
+              </div>
+              <div id="grp-chat" class="pl-3 mt-0.5 space-y-0.5">
+                <div onclick="switchView('exec')" class="xy-session-row relative flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <span class="flex-1 truncate">http://127.0</span>
+                  <span class="xy-session-time text-xs" style="color: var(--xy-text-3);">3小时</span>
+                  <div class="xy-session-actions absolute right-1.5 flex items-center gap-0.5 px-1 rounded" style="background: var(--xy-sidebar);">
+                    <button onclick="event.stopPropagation();showToast('已归档')" class="w-5 h-5 text-xs" style="color: var(--xy-text-3);">⤓</button>
+                    <button onclick="event.stopPropagation();showToast('删除确认')" class="w-5 h-5 text-xs" style="color: var(--xy-text-3);">✕</button>
+                  </div>
+                </div>
+                <div onclick="switchView('exec')" class="xy-session-row relative flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <span class="flex-1 truncate">你好_2</span>
+                  <span class="xy-session-time text-xs" style="color: var(--xy-text-3);">5小时</span>
+                </div>
+                <div onclick="switchView('exec')" class="xy-session-row relative flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <span class="flex-1 truncate">检查一下为什么无法加载…</span>
+                  <span class="xy-session-time text-xs" style="color: var(--xy-text-3);">6小时</span>
+                </div>
+                <div onclick="switchView('exec')" class="xy-session-row relative flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <span class="flex-1 truncate">2026-11-18 每日9点…</span>
+                  <span class="xy-session-time text-xs" style="color: var(--xy-text-3);">6小时</span>
+                </div>
+                <button onclick="showToast('展开其余 7 条会话')" class="w-full text-left px-2.5 py-1 text-xs" style="color: var(--xy-text-3);">显示更多 (7)</button>
+              </div>
+            </div>
+
+            <!-- publish -->
+            <div>
+              <div onclick="toggleGroup('grp-publish')" class="xy-group-head flex items-center gap-1.5 px-2 py-1.5 rounded-lg cursor-pointer" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                <svg id="ico-grp-publish" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--xy-text-3);"><polyline points="6 9 12 15 18 9"/></svg>
+                <svg width="13.5" height="13.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-text-2);"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                <span class="font-medium truncate" style="color: var(--xy-text-2);">publish</span>
+                <span class="xy-mono text-xs ml-1" style="color: var(--xy-text-3);">4</span>
+              </div>
+              <div id="grp-publish" class="pl-3 mt-0.5 space-y-0.5">
+                <div onclick="switchView('exec')" class="xy-session-row flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <span class="flex-1 truncate">我应该是有两天没有…</span><span class="text-xs" style="color: var(--xy-text-3);">6小时</span>
+                </div>
+                <div onclick="switchView('exec')" class="xy-session-row flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <span class="flex-1 truncate">查看一下当前代码中…</span><span class="text-xs" style="color: var(--xy-text-3);">1天</span>
+                </div>
+                <div onclick="switchView('exec')" class="xy-session-row flex items-center gap-2 px-2.5 py-1.5 rounded-lg cursor-pointer" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <span class="flex-1 truncate">帮我切换成 develop</span><span class="text-xs" style="color: var(--xy-text-3);">1天</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="xy-group-head flex items-center gap-1.5 px-2 py-1.5 rounded-lg cursor-pointer" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--xy-text-3);"><polyline points="9 18 15 12 9 6"/></svg>
+              <svg width="13.5" height="13.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-text-3);"><path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/></svg>
+              <span class="truncate" style="color: var(--xy-text-2);">秘书</span>
+            </div>
+            <div class="xy-group-head flex items-center gap-1.5 px-2 py-1.5 rounded-lg cursor-pointer" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--xy-text-3);"><polyline points="9 18 15 12 9 6"/></svg>
+              <svg width="13.5" height="13.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-text-3);"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              <span class="truncate" style="color: var(--xy-text-2);">newapi</span>
+            </div>
+            <div class="xy-group-head flex items-center gap-1.5 px-2 py-1.5 rounded-lg cursor-pointer" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--xy-text-3);"><polyline points="9 18 15 12 9 6"/></svg>
+              <svg width="13.5" height="13.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-text-3);"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              <span class="truncate" style="color: var(--xy-text-2);">opensq…</span>
+            </div>
+          </div>
+
+          <!-- 底部账号 + 设置 + 手机扫码 -->
+          <div class="px-2 pt-2 pb-1 border-t flex items-center gap-1" style="border-color: var(--xy-border);">
+            <button onclick="showToast('基元律动账号详情')" class="flex-1 min-w-0 flex items-center gap-2 px-1 py-1 rounded-lg text-left transition-colors" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+              <div class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold shrink-0" style="background: var(--xy-text); color: var(--xy-canvas);">基</div>
+              <div class="flex-1 min-w-0 text-xs font-medium truncate" style="color: var(--xy-text);">基元律动</div>
+            </button>
+            <button onclick="showToast('打开全局设置')" title="打开设置" class="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+              <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </button>
+            <button onclick="toggleQrModal(true)" title="手机访问（移动端 / web远端）" class="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 transition-colors" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+              <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2.5" width="12" height="19" rx="2.2"/><line x1="11" y1="18" x2="13" y2="18"/></svg>
+            </button>
+          </div>
+        </aside>
+
+        <!-- ============================================================
+             右侧圆角白底主工作面板
+             ============================================================ -->
+        <div class="flex-1 min-w-0 flex rounded-xl border overflow-hidden" style="background: var(--xy-canvas); border-color: var(--xy-border); box-shadow: var(--xy-shadow-sm);">
+          <main class="flex-1 min-w-0 flex flex-col relative">
+            <!-- 会话头部 -->
+            <div class="h-[44px] shrink-0 px-5 border-b flex items-center justify-between" style="border-color: var(--xy-border);">
+              <div id="panel-crumb" class="flex items-center gap-2 min-w-0 text-[13px]"></div>
+
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button id="hdr-inspector-pill" onclick="toggleInspectorPane()" class="hidden h-7 px-2.5 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors" style="background: var(--xy-accent-soft); color: var(--xy-accent);">
+                  <span class="w-1.5 h-1.5 rounded-full xy-pulse" style="background: currentColor;"></span>
+                  <span>实况过程</span>
+                </button>
+                <button id="hdr-export-btn" onclick="showToast('导出会话：Markdown / HTML / JSON')" class="h-7 px-2.5 rounded-lg text-xs flex items-center gap-1.5 transition-colors" style="color: var(--xy-text-2); border: 1px solid var(--xy-border);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  <span>导出</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- ****************** 视图 A：执行页面 ****************** -->
+            <section id="view-exec" class="flex-1 min-h-0 flex flex-col">
+              <div class="flex-1 min-h-0 overflow-y-auto xy-scroll px-6 sm:px-9 pt-4 pb-3">
+                <div class="max-w-[820px] mx-auto space-y-4">
+
+                  <!-- 用户提问 -->
+                  <div class="flex justify-end">
+                    <div class="max-w-[82%] px-4 py-2 rounded-2xl text-[14px] leading-relaxed" style="background: var(--xy-user-bubble); color: var(--xy-text);">
+                      对《我在修仙界当债主》（300 章）做第三轮回归，顺便核对发布前还剩哪些硬伤。
+                    </div>
+                  </div>
+
+                  <!-- 助手回合容器 -->
+                  <div class="space-y-3">
+                    <!-- 身份抬头 -->
+                    <div class="flex items-center gap-2 text-xs">
+                      <span class="font-semibold text-[13.5px]" style="color: var(--xy-text);">星瑶</span>
+                      <span class="xy-mono text-xs" style="color: var(--xy-text-3);">deepseek-v4.1-flash-1017</span>
+                    </div>
+
+                    <!-- 核心重构区：执行过程展示（三种无圆点噪点的极简方案） -->
+                    <div id="exec-process-mount"></div>
+
+                    <!-- 干净利落的正文结果 -->
+                    <div id="exec-answer-block" class="text-[13.5px] leading-[1.68] space-y-2.5" style="color: var(--xy-text);">
+                      <ol class="list-decimal pl-5 space-y-1.5">
+                        <li>
+                          <span class="font-medium">181/184 双稿还在</span>，而 182 章正是短剧切片的第 9 条，一放就会被评论区抓“这两章怎么一样”。
+                        </li>
+                        <li>
+                          <span class="font-medium">更要命的是中段</span>：51–70 章、108–111 章、134–146 章、211–219 章、251–270 章这五段是爽点断档区，主角连续五到十章只做“认、等、赔钱”。这不是删重复句能解决的，得补事件。读者掉在 60 章左右，前面修得再干净也救不回来。
+                        </li>
+                      </ol>
+
+                      <div class="pt-1">
+                        <div class="font-semibold mb-1.5">发布前还剩三件，按顺序</div>
+                        <ol class="list-decimal pl-5 space-y-1">
+                          <li>181/184 双稿拆分（同 181/182 的处理方式，让 184 承担新事件）</li>
+                          <li>简介那句“第三笔 864”改成与“十七笔”不冲突的写法</li>
+                          <li>中段五个断档区，每区补一次有效反击或一次反转——这个工作量最大，但决定留存</li>
+                        </ol>
+                      </div>
+
+                      <p>其余可以不管：91 章超 2500 字（平台不卡上限）、脚手架还剩 1128 次（已从 2544 降下来，不再构成机械感）、241–245 再压也没意义（33 字重合已属正常）。</p>
+
+                      <p class="text-[13.5px]" style="color: var(--xy-text-2);">
+                        另外提醒一句：<span class="underline decoration-1 underline-offset-4">追踪_tracking-state.json</span> 的字数记录只覆盖 218 章且是旧值，之后用工具查进度会看到错数，不影响发布。本次使用的技能：<span class="xy-mono text-xs px-1.5 py-0.5 rounded" style="background: var(--xy-hover);">story-review</span>
+                      </p>
+                    </div>
+
+                    <!-- 已完成状态下的文件编辑总结条 + 本轮耗时 -->
+                    <div id="exec-finished-footer" class="space-y-2.5 pt-1">
+                      <div class="rounded-xl border overflow-hidden transition-colors" style="background: var(--xy-surface); border-color: var(--xy-border);">
+                        <div class="flex items-center justify-between px-3.5 py-2.5 gap-3">
+                          <button onclick="toggleDetail('edited-files-list')" class="flex-1 min-w-0 flex items-center gap-2 text-xs text-left">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-text-2);"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                            <span class="font-medium" style="color: var(--xy-text);">4 个文件已编辑</span>
+                            <span class="ml-auto xy-mono flex items-center gap-1.5">
+                              <span style="color: var(--xy-green);">+540</span>
+                              <span style="color: var(--xy-rose);">-405</span>
+                            </span>
+                            <span style="color: var(--xy-text-3);">›</span>
+                          </button>
+
+                          <button onclick="showToast('已预检：可安全撤销本轮 4 个文件修改')" class="h-7 px-2.5 rounded-lg text-xs font-medium flex items-center gap-1 border transition-colors shrink-0" style="background: var(--xy-card); border-color: var(--xy-border-strong); color: var(--xy-text-2);" onmouseover="this.style.color='var(--xy-text)'" onmouseout="this.style.color='var(--xy-text-2)'">
+                            <span>撤销</span>
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
+                          </button>
+                        </div>
+
+                        <div id="edited-files-list" class="hidden border-t px-3.5 py-2 space-y-1.5 text-xs xy-mono" style="border-color: var(--xy-border); background: var(--xy-canvas); color: var(--xy-text-2);">
+                          <div class="flex justify-between"><span>小说/_tmp65/r3.py</span><span><span style="color: var(--xy-green);">+214</span> <span style="color: var(--xy-rose);">-120</span></span></div>
+                          <div class="flex justify-between"><span>小说/_tmp65/r3b.py</span><span><span style="color: var(--xy-green);">+146</span> <span style="color: var(--xy-rose);">-98</span></span></div>
+                          <div class="flex justify-between"><span>小说/_tmp65/r3c.py</span><span><span style="color: var(--xy-green);">+102</span> <span style="color: var(--xy-rose);">-112</span></span></div>
+                          <div class="flex justify-between"><span>小说/story_check.py</span><span><span style="color: var(--xy-green);">+78</span> <span style="color: var(--xy-rose);">-75</span></span></div>
+                        </div>
+                      </div>
+
+                      <div class="flex items-center justify-between text-xs px-0.5" style="color: var(--xy-text-3);">
+                        <span class="flex items-center gap-1.5">
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--xy-accent)" stroke-width="2.2"><polyline points="20 6 9 17 4 12"/></svg>
+                          <span>星瑶本轮工作 8m 55s</span>
+                        </span>
+                        <span class="xy-mono">145 t/s · 17s · 1,630 tokens</span>
+                      </div>
+                    </div>
+
+                  </div>
+                </div>
+              </div>
+
+              <!-- 底部浮动输入框 -->
+              <div class="px-6 sm:px-9 pb-3.5 pt-1 shrink-0">
+                <div class="max-w-[820px] mx-auto">
+                  <div class="xy-composer rounded-2xl p-3 flex flex-col gap-2">
+                    <textarea id="exec-input" rows="2" placeholder="现在可以发布了吗（/ 调用技能，@ 引用文件）" class="w-full bg-transparent resize-none border-0 outline-none text-[14px] leading-relaxed" style="color: var(--xy-text);"></textarea>
+
+                    <div class="flex items-center justify-between gap-2 pt-0.5">
+                      <div class="flex items-center gap-1 flex-wrap">
+                        <button onclick="showToast('选择本地附件')" title="附加文件" class="w-7 h-7 rounded-lg flex items-center justify-center" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                          <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                        </button>
+                        <button onclick="showToast('屏幕区域截图')" title="屏幕截图" class="w-7 h-7 rounded-lg flex items-center justify-center" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                          <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+                        </button>
+                        <div class="w-px h-3.5 mx-0.5" style="background: var(--xy-border);"></div>
+                        <button onclick="cyclePerm(this)" class="h-7 px-2.5 rounded-lg text-xs flex items-center gap-1.5" style="background: var(--xy-rose-soft); color: var(--xy-rose);">
+                          <span class="w-1.5 h-1.5 rounded-full" style="background: currentColor;"></span>
+                          <span class="perm-text font-medium">完全访问</span>
+                        </button>
+                        <button onclick="toggleSandbox(this)" class="h-7 px-2.5 rounded-lg text-xs flex items-center gap-1.5" style="background: var(--xy-amber-soft); color: var(--xy-amber);">
+                          <span class="w-1.5 h-1.5 rounded-full" style="background: currentColor;"></span>
+                          <span class="sb-text font-medium">沙盒已解除</span>
+                        </button>
+                      </div>
+
+                      <div class="flex items-center gap-1.5">
+                        <div class="relative">
+                          <button onclick="togglePopover('pop-ctx')" class="h-7 px-2 rounded-lg flex items-center gap-1.5 text-xs" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                            <svg width="15" height="15" viewBox="0 0 20 20" class="-rotate-90">
+                              <circle cx="10" cy="10" r="7.5" fill="none" stroke="var(--xy-border-strong)" stroke-width="2.2"/>
+                              <circle cx="10" cy="10" r="7.5" fill="none" stroke="var(--xy-accent)" stroke-width="2.2" stroke-dasharray="9.4 47.1" stroke-linecap="round"/>
+                            </svg>
+                            <span class="xy-mono">20%</span>
+                          </button>
+                          <div id="pop-ctx" class="xy-pop hidden absolute right-0 bottom-9 w-[240px] rounded-xl p-3 z-30 text-xs space-y-2">
+                            <div class="flex justify-between font-medium" style="color: var(--xy-text);">
+                              <span>上下文与缓存</span><span class="xy-mono" style="color: var(--xy-accent);">20%</span>
+                            </div>
+                            <div class="space-y-1 xy-mono" style="color: var(--xy-text-2);">
+                              <div class="flex justify-between"><span>输入</span><span>16,923,816</span></div>
+                              <div class="flex justify-between"><span>输出</span><span>124,271</span></div>
+                              <div class="flex justify-between"><span>命中</span><span style="color: var(--xy-green);">15,529,088 (92%)</span></div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <button onclick="showToast('切换模型')" class="h-7 px-2 rounded-lg text-xs flex items-center gap-1" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                          <span class="truncate max-w-[140px]">deepseek-v4.1-flash-1017</span>
+                          <span style="color: var(--xy-text-3);">▾</span>
+                        </button>
+                        <button onclick="showToast('思考深度：极高')" class="h-7 px-2 rounded-lg text-xs flex items-center gap-1" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                          <span>极高</span>
+                          <span style="color: var(--xy-text-3);">▾</span>
+                        </button>
+                        <button id="exec-send-btn" onclick="onExecAction()" class="w-7 h-7 rounded-full flex items-center justify-center transition-colors" style="background: var(--xy-accent); color: var(--xy-accent-fg);">
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- ****************** 视图 B：新会话页面 ****************** -->
+            <section id="view-new" class="hidden flex-1 min-h-0 flex flex-col items-center justify-center px-6 py-8">
+              <div class="w-full max-w-[660px] flex flex-col items-center">
+                <h1 class="text-[22px] font-semibold tracking-tight text-center mb-6" style="color: var(--xy-text);">让星瑶帮你完成任务</h1>
+
+                <div class="xy-composer w-full rounded-2xl p-3.5 flex flex-col gap-3">
+                  <textarea id="new-input" rows="3" oninput="syncNewSendState()" placeholder="尽管问，或做个任务…  / 技能  @ 文件" class="w-full bg-transparent resize-none border-0 outline-none text-[14.5px] leading-relaxed" style="color: var(--xy-text);"></textarea>
+                  <div class="flex items-center justify-between gap-2 pt-1">
+                    <div class="flex items-center gap-1 flex-wrap">
+                      <button onclick="showToast('选择本地附件')" title="附加文件" class="w-7 h-7 rounded-lg flex items-center justify-center" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                        <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                      </button>
+                      <button onclick="showToast('屏幕区域截图')" title="屏幕截图" class="w-7 h-7 rounded-lg flex items-center justify-center" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                        <svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+                      </button>
+                      <div class="w-px h-3.5 mx-0.5" style="background: var(--xy-border);"></div>
+                      <button onclick="cyclePerm(this)" class="h-7 px-2.5 rounded-lg text-xs flex items-center gap-1.5" style="background: var(--xy-rose-soft); color: var(--xy-rose);">
+                        <span class="w-1.5 h-1.5 rounded-full" style="background: currentColor;"></span><span class="perm-text font-medium">完全访问</span>
+                      </button>
+                      <button onclick="toggleSandbox(this)" class="h-7 px-2.5 rounded-lg text-xs flex items-center gap-1.5" style="background: var(--xy-amber-soft); color: var(--xy-amber);">
+                        <span class="w-1.5 h-1.5 rounded-full" style="background: currentColor;"></span><span class="sb-text font-medium">沙盒已解除</span>
+                      </button>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                      <button onclick="showToast('切换模型')" class="h-7 px-2 rounded-lg text-xs flex items-center gap-1" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                        <span class="truncate max-w-[140px]">deepseek-v4.1-flash-1017</span>
+                        <span style="color: var(--xy-text-3);">▾</span>
+                      </button>
+                      <button onclick="showToast('思考深度：极高')" class="h-7 px-2 rounded-lg text-xs flex items-center gap-1" style="color: var(--xy-text-2);" onmouseover="this.style.background='var(--xy-hover)'" onmouseout="this.style.background='transparent'">
+                        <span>极高</span>
+                        <span style="color: var(--xy-text-3);">▾</span>
+                      </button>
+                      <button id="new-send-btn" onclick="launchFromNew()" title="发送 (Enter)" class="w-7 h-7 rounded-full flex items-center justify-center transition-colors" style="background: var(--xy-hover); color: var(--xy-text-3);">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="relative mt-4">
+                  <button onclick="togglePopover('pop-workdir')" class="h-7 px-3 rounded-full text-xs flex items-center gap-1.5 transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.background='var(--xy-hover)';this.style.color='var(--xy-text)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-3)'">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                    <span id="workdir-btn-text">当前工作区：<span id="active-workdir-label" class="font-medium" style="color: var(--xy-text-2);">小说</span></span>
+                    <span>▾</span>
+                  </button>
+                  <div id="pop-workdir" class="xy-pop hidden absolute left-1/2 -translate-x-1/2 top-8 w-[220px] rounded-xl p-1.5 z-30 text-xs"></div>
+                </div>
+
+                <!-- 根据所选项目动态浮现的推荐提示词（自由对话下自动收起保持纯粹） -->
+                <div id="new-project-prompts" class="flex flex-wrap items-center justify-center gap-2 mt-3.5"></div>
+              </div>
+            </section>
+
+            <!-- 可选折叠式终端 -->
+            <div id="xy-terminal" class="hidden h-[135px] shrink-0 border-t px-4 py-2 text-xs xy-mono" style="background: var(--xy-surface); border-color: var(--xy-border); color: var(--xy-text-2);">
+              <div class="flex justify-between pb-1"><span>终端 · pwsh</span><button onclick="toggleTerminal()">✕</button></div>
+              <div>PS D:\fengchenhao\小说&gt; python _tmp65/r3.py --verify</div>
+              <div style="color: var(--xy-green);">[OK] 300 chapters verified</div>
+            </div>
+
+            <!-- 底部极简声明条（去掉「已连接」） -->
+            <footer class="h-[26px] shrink-0 px-5 border-t flex items-center justify-between text-xs select-none" style="border-color: var(--xy-border); color: var(--xy-text-3);">
+              <span></span>
+              <span>内容由 AI 生成，仅供参考，请仔细甄别</span>
+              <span id="footer-run-state" class="xy-mono">运行中</span>
+            </footer>
+          </main>
+
+          <!-- ============================================================
+               方案C 专属：右侧「执行实况」抽屉（主聊天区零过程噪点）
+               ============================================================ -->
+          <aside id="inspector-pane" class="hidden w-[320px] shrink-0 border-l flex flex-col text-xs" style="background: var(--xy-surface); border-color: var(--xy-border);">
+            <div class="h-[44px] shrink-0 px-3.5 border-b flex items-center justify-between" style="border-color: var(--xy-border);">
+              <span class="font-semibold flex items-center gap-2" style="color: var(--xy-text);">
+                <span id="inspector-head-dot" class="w-2 h-2 rounded-full xy-pulse" style="background: var(--xy-accent);"></span>
+                <span id="inspector-head-title">执行实况 · 4 步</span>
+              </span>
+              <span id="inspector-head-meta" class="xy-mono" style="color: var(--xy-text-3);">已完成 3/4 · 8m 55s</span>
+            </div>
+
+            <div class="flex-1 min-h-0 overflow-y-auto xy-scroll p-3 space-y-2">
+              <!-- 步骤 1 -->
+              <div class="p-2.5 rounded-lg border space-y-1" style="background: var(--xy-card); border-color: var(--xy-border);">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="flex items-center gap-1.5 min-w-0">
+                    <span class="w-4 h-4 rounded-full shrink-0 flex items-center justify-center font-semibold" style="background: var(--xy-green-soft); color: var(--xy-green);">✓</span>
+                    <span class="font-medium truncate" style="color: var(--xy-text);">1. 第三轮全量回归</span>
+                    <span class="px-1.5 py-0.5 rounded text-xs leading-none shrink-0" style="background: var(--xy-surface); color: var(--xy-text-3);">星舰</span>
+                  </div>
+                  <span class="xy-mono shrink-0" style="color: var(--xy-text-3);">306.5s</span>
+                </div>
+                <div class="pl-6" style="color: var(--xy-text-3);">《我在修仙界当债主》300 章结构验证通过</div>
+              </div>
+
+              <!-- 步骤 2 -->
+              <div class="p-2.5 rounded-lg border space-y-1.5" style="background: var(--xy-card); border-color: var(--xy-border);">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="flex items-center gap-1.5 min-w-0">
+                    <span class="w-4 h-4 rounded-full shrink-0 flex items-center justify-center font-semibold" style="background: var(--xy-green-soft); color: var(--xy-green);">✓</span>
+                    <span class="font-medium truncate" style="color: var(--xy-text);">2. 脚本编辑与扫描</span>
+                    <span class="px-1.5 py-0.5 rounded text-xs leading-none shrink-0" style="background: var(--xy-surface); color: var(--xy-text-3);">变更</span>
+                  </div>
+                  <span class="xy-mono shrink-0" style="color: var(--xy-green);">+540 -405</span>
+                </div>
+                <div class="pl-6">
+                  <div class="rounded-md border divide-y xy-mono" style="background: var(--xy-surface); border-color: var(--xy-border); color: var(--xy-text-2);">
+                    <div class="px-2 py-1 flex justify-between"><span>edit · _tmp65/r3..r3c</span><span style="color: var(--xy-green);">4 文件</span></div>
+                    <div class="px-2 py-1 flex justify-between"><span>read_file + run_cmd</span><span style="color: var(--xy-text-3);">58ms</span></div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 步骤 3 -->
+              <div class="p-2.5 rounded-lg border space-y-1" style="background: var(--xy-card); border-color: var(--xy-border);">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="flex items-center gap-1.5 min-w-0">
+                    <span class="w-4 h-4 rounded-full shrink-0 flex items-center justify-center font-semibold" style="background: var(--xy-green-soft); color: var(--xy-green);">✓</span>
+                    <span class="font-medium truncate" style="color: var(--xy-text);">3. 定位阻塞项</span>
+                    <span class="px-1.5 py-0.5 rounded text-xs leading-none shrink-0" style="background: var(--xy-surface); color: var(--xy-text-3);">思考</span>
+                  </div>
+                  <span class="xy-mono shrink-0" style="color: var(--xy-text-3);">10s</span>
+                </div>
+                <div class="pl-6 leading-relaxed" style="color: var(--xy-text-2);">
+                  共同段降至 33 字、脚手架降至 1,128；筛出 181/184 双稿与中段 5 处断档。
+                </div>
+              </div>
+
+              <!-- 步骤 4（当前进行中 / 完成同步切换） -->
+              <div id="inspector-step4-card" class="p-2.5 rounded-lg border space-y-1.5" style="background: var(--xy-card); border-color: var(--xy-accent);">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="flex items-center gap-1.5 min-w-0">
+                    <span id="inspector-step4-ico" class="w-4 h-4 rounded-full shrink-0 flex items-center justify-center xy-spin" style="background: var(--xy-accent-soft); color: var(--xy-accent);">◌</span>
+                    <span class="font-semibold truncate" style="color: var(--xy-text);">4. 并行收尾</span>
+                    <span id="inspector-step4-pill" class="px-1.5 py-0.5 rounded text-xs leading-none shrink-0 font-medium" style="background: var(--xy-accent-soft); color: var(--xy-accent);">进行中</span>
+                  </div>
+                  <span id="inspector-step4-time" class="xy-mono shrink-0 font-medium" style="color: var(--xy-accent);">383.0s</span>
+                </div>
+                <div class="pl-6 space-y-1" style="color: var(--xy-text-2);">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="truncate">· 星舰 A：清理高密度后 8 章</span>
+                    <span id="inspector-step4-a" class="xy-mono shrink-0" style="color: var(--xy-accent);">运行中</span>
+                  </div>
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="truncate">· 星舰 B：机械收尾与章节对齐</span>
+                    <span id="inspector-step4-b" class="xy-mono shrink-0" style="color: var(--xy-accent);">运行中</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+
+      <!-- 手机访问扫码绑定弹窗 -->
+      <div id="qr-modal" onclick="if(event.target===this)toggleQrModal(false)" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4" style="background: rgba(0, 0, 0, 0.35);">
+        <div class="xy-pop w-[320px] rounded-2xl p-4 space-y-3 text-xs" style="color: var(--xy-text);">
+          <div class="flex items-start justify-between gap-2">
+            <div>
+              <div id="qr-modal-title" class="text-sm font-semibold">移动端</div>
+              <div id="qr-modal-sub" class="text-xs mt-0.5" style="color: var(--xy-text-3);">新版独立移动端界面，扫码即刻接管会话</div>
+            </div>
+            <button onclick="toggleQrModal(false)" class="w-6 h-6 rounded-md flex items-center justify-center" style="color: var(--xy-text-3);">✕</button>
+          </div>
+
+          <div class="grid grid-cols-2 p-0.5 rounded-lg border" style="background: var(--xy-surface); border-color: var(--xy-border);">
+            <button id="qr-tab-mobile" onclick="setQrMode('mobile')" class="py-1 rounded-md font-medium transition-colors" style="background: var(--xy-card); color: var(--xy-text); box-shadow: var(--xy-shadow-sm);">移动端</button>
+            <button id="qr-tab-web" onclick="setQrMode('web')" class="py-1 rounded-md font-medium transition-colors" style="color: var(--xy-text-3);">web远端</button>
+          </div>
+
+          <div class="flex flex-col items-center justify-center py-3 rounded-xl border" style="background: #ffffff; border-color: var(--xy-border);">
+            <svg width="132" height="132" viewBox="0 0 24 24" fill="none" stroke="#18181b" stroke-width="1.6">
+              <rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="3" width="6" height="6" rx="1"/><rect x="3" y="15" width="6" height="6" rx="1"/>
+              <path d="M5.5 5.5h1v1h-1zM17.5 5.5h1v1h-1zM5.5 17.5h1v1h-1z" fill="#18181b"/>
+              <path d="M12 4v3m0 3v2m-2 0h4m-2 3v5m3-5h2v2h-2m3-1v4m-5-1h2m4-7v2m-9-4h2" stroke-linecap="square"/>
+            </svg>
+            <span class="xy-mono text-xs mt-2" style="color: #52525b;">链接有效期：24h · LAN / 中继</span>
+          </div>
+
+          <div class="flex items-center justify-between gap-2 pt-0.5">
+            <button onclick="showToast('已复制配对链接')" class="flex-1 h-8 rounded-lg border font-medium transition-colors" style="border-color: var(--xy-border-strong); color: var(--xy-text-2);">复制链接</button>
+            <button onclick="showToast('已刷新二维码')" class="flex-1 h-8 rounded-lg font-medium transition-colors" style="background: var(--xy-accent); color: var(--xy-accent-fg);">刷新</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="xy-toast" class="pointer-events-none fixed bottom-8 left-1/2 -translate-x-1/2 px-3.5 py-1.5 rounded-full text-xs font-medium opacity-0 transition-opacity duration-200 z-50" style="background: var(--xy-text); color: var(--xy-canvas); box-shadow: var(--xy-shadow-pop);"></div>
+    </div>
+  </div>
+
+  <script>
+    let processStyle = 'capsule'; // 'capsule' | 'stepper' | 'inspector'
+    let execState = 'running';    // 'running' | 'done'
+    let currentView = 'exec';     // 'exec' | 'new'
+    let currentTheme = 'light';
+    let sidebarOpen = true;
+    let capsuleExpanded = true;
+    const expandedSteps = new Set();
+
+    function updateControlPills() {
+      const styleIds = ['capsule', 'stepper', 'inspector'];
+      styleIds.forEach((id) => {
+        const btn = document.getElementById('proc-btn-' + id);
+        if (id === processStyle) {
+          btn.style.background = 'var(--primary, #2563eb)';
+          btn.style.color = 'var(--primary-foreground, #ffffff)';
+        } else {
+          btn.style.background = 'transparent';
+          btn.style.color = 'var(--muted-foreground, #71717a)';
+        }
+      });
+
+      ['running', 'done'].forEach((s) => {
+        const btn = document.getElementById('state-btn-' + s);
+        if (s === execState) {
+          btn.style.background = 'var(--foreground, #18181b)';
+          btn.style.color = 'var(--background, #ffffff)';
+        } else {
+          btn.style.background = 'transparent';
+          btn.style.color = 'var(--muted-foreground, #71717a)';
+        }
+      });
+
+      ['exec', 'new'].forEach((v) => {
+        const btn = document.getElementById('page-btn-' + v);
+        if (v === currentView) {
+          btn.style.background = 'var(--foreground, #18181b)';
+          btn.style.color = 'var(--background, #ffffff)';
+        } else {
+          btn.style.background = 'transparent';
+          btn.style.color = 'var(--muted-foreground, #71717a)';
+        }
+      });
+
+      ['light', 'dark'].forEach((t) => {
+        const btn = document.getElementById('theme-' + t);
+        if (t === currentTheme) {
+          btn.style.background = 'var(--foreground, #18181b)';
+          btn.style.color = 'var(--background, #ffffff)';
+        } else {
+          btn.style.background = 'transparent';
+          btn.style.color = 'var(--muted-foreground, #71717a)';
+        }
+      });
+    }
+
+    function renderExecProcess() {
+      const mount = document.getElementById('exec-process-mount');
+      const answerBlock = document.getElementById('exec-answer-block');
+      const finishedFooter = document.getElementById('exec-finished-footer');
+      const inspectorPane = document.getElementById('inspector-pane');
+      const inspectorPill = document.getElementById('hdr-inspector-pill');
+      const footerRun = document.getElementById('footer-run-state');
+      const sendBtn = document.getElementById('exec-send-btn');
+      const navDot = document.getElementById('nav-dot-novel');
+
+      const isRunning = execState === 'running';
+      footerRun.textContent = currentView === 'new' ? '空闲' : (isRunning ? '执行中 · 8m 55s' : '空闲');
+      navDot.style.display = isRunning ? 'inline-block' : 'none';
+
+      if (isRunning) {
+        finishedFooter.classList.add('hidden');
+        answerBlock.style.opacity = '0.94';
+        sendBtn.title = '停止当前任务';
+        sendBtn.style.background = 'var(--xy-text)';
+        sendBtn.style.color = 'var(--xy-canvas)';
+        sendBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="2" width="8" height="8" rx="1.5"/></svg>';
+      } else {
+        finishedFooter.classList.remove('hidden');
+        answerBlock.style.opacity = '1';
+        sendBtn.title = '发送 (Enter)';
+        sendBtn.style.background = 'var(--xy-accent)';
+        sendBtn.style.color = 'var(--xy-accent-fg)';
+        sendBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>';
+      }
+
+      syncInspectorState(isRunning);
+
+      if (processStyle === 'inspector' && currentView === 'exec') {
+        inspectorPane.classList.remove('hidden');
+        inspectorPill.classList.remove('hidden');
+        inspectorPill.classList.add('inline-flex');
+      } else {
+        inspectorPane.classList.add('hidden');
+        inspectorPill.classList.add('hidden');
+        inspectorPill.classList.remove('inline-flex');
+      }
+
+      const bulbIcon = `<svg class="shrink-0" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color: var(--xy-text-3);"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2v.3h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z"/></svg>`;
+      const dotPurple = `<span class="w-1.5 h-1.5 rounded-full shrink-0" style="background: #8b5cf6;"></span>`;
+      const dotGreen = `<span class="w-1.5 h-1.5 rounded-full shrink-0" style="background: var(--xy-green);"></span>`;
+      const dotActive = isRunning
+        ? `<span class="w-2 h-2 rounded-full shrink-0 xy-pulse" style="background: var(--xy-accent);"></span>`
+        : dotPurple;
+
+      const buildNativeTrace = () => `
+        <div class="mt-2.5 space-y-3 text-[13px]">
+          <!-- 第 1 轮：思考 -> 星舰 -> 变更 -> 工具 -->
+          <div class="space-y-1.5">
+            <button onclick="toggleStepDetail('step-d1')" class="flex items-center gap-1.5 text-left text-xs transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.color='var(--xy-text-2)'" onmouseout="this.style.color='var(--xy-text-3)'">
+              ${bulbIcon}
+              <span>思考 · 先对全书 300 章做第三轮回归并扫描脚手架</span>
+              <span>${expandedSteps.has('step-d1') ? '▴' : '▾'}</span>
+            </button>
+            <div id="step-d1" class="${expandedSteps.has('step-d1') ? '' : 'hidden'} pl-5 text-xs leading-relaxed" style="color: var(--xy-text-3);">
+              目标目录：D:\\fengchenhao\\小说（300 章），核对重复段落、元叙述命中数与字数分布，随后执行脚本抽检。
+            </div>
+
+            <div class="space-y-1 pl-0.5">
+              <div class="flex items-center gap-2 leading-snug">
+                ${dotPurple}
+                <span class="font-medium shrink-0" style="color: var(--xy-text-2);">星舰</span>
+                <span class="truncate" style="color: var(--xy-text);">《我在修仙界当债主》（300 章）第三轮全量回归</span>
+                <span class="xy-mono text-xs shrink-0 ml-1" style="color: var(--xy-text-3);">306.5s</span>
+              </div>
+
+              <div>
+                <button onclick="toggleStepDetail('step-d2')" class="flex items-center gap-2 text-left leading-snug max-w-full" onmouseover="this.style.opacity='0.8'" onmouseout="this.style.opacity='1'">
+                  ${dotGreen}
+                  <span class="font-medium shrink-0" style="color: var(--xy-text-2);">变更</span>
+                  <span class="truncate" style="color: var(--xy-text);">_tmp65/r3.py 等 4 个临时分析脚本</span>
+                  <span class="xy-mono text-xs shrink-0" style="color: var(--xy-green);">+540 -405</span>
+                  <span class="text-xs shrink-0" style="color: var(--xy-text-3);">${expandedSteps.has('step-d2') ? '▴' : '▾'}</span>
+                </button>
+                <div id="step-d2" class="${expandedSteps.has('step-d2') ? '' : 'hidden'} mt-1 pl-4 space-y-0.5 xy-mono text-xs" style="color: var(--xy-text-3);">
+                  <div>edit · _tmp65/r3.py, r3b.py, r3c.py, stats.py (+540 -405)</div>
+                  <div>read_file · 状态摘要 · 14ms</div>
+                </div>
+              </div>
+
+              <div class="flex items-center gap-2 leading-snug">
+                ${dotGreen}
+                <span class="font-medium shrink-0" style="color: var(--xy-text-2);">工具</span>
+                <span class="truncate" style="color: var(--xy-text);">读取字数统计与脚手架扫描（4 次）</span>
+                <span class="xy-mono text-xs shrink-0 ml-1" style="color: var(--xy-text-3);">58ms</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 第 2 轮：思考结论 -> 当前并行星舰 -->
+          <div class="space-y-1.5 pt-0.5">
+            <button onclick="toggleStepDetail('step-d3')" class="flex items-center gap-1.5 text-left text-xs transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.color='var(--xy-text-2)'" onmouseout="this.style.color='var(--xy-text-3)'">
+              ${bulbIcon}
+              <span>思考 · 共同段降至 33 字，定位 181/184 双稿与中段 5 处断档</span>
+              <span>${expandedSteps.has('step-d3') ? '▴' : '▾'}</span>
+            </button>
+            <div id="step-d3" class="${expandedSteps.has('step-d3') ? '' : 'hidden'} pl-5 text-xs leading-relaxed" style="color: var(--xy-text-2);">
+              第三轮实测：241–245 最大共同段降到 33 字；脚手架四类合计从 2,544 次降至 1,128 次；元叙述命中数为 0，确认 181/184 双稿与中段 5 处爽点断档后拆出两个收尾星舰。
+            </div>
+
+            <div class="space-y-1 pl-0.5">
+              <div class="flex items-center gap-2 leading-snug">
+                ${dotActive}
+                <span class="font-medium shrink-0" style="color: ${isRunning ? 'var(--xy-accent)' : 'var(--xy-text-2)'};">星舰</span>
+                <span class="truncate" style="color: var(--xy-text);">清理全书脚手架密度最高的最后 8 章（已自动备份）</span>
+                <span class="xy-mono text-xs shrink-0 ml-1" style="color: ${isRunning ? 'var(--xy-accent)' : 'var(--xy-text-3)'};">383.0s</span>
+              </div>
+              <div class="flex items-center gap-2 leading-snug">
+                ${dotActive}
+                <span class="font-medium shrink-0" style="color: ${isRunning ? 'var(--xy-accent)' : 'var(--xy-text-2)'};">星舰</span>
+                <span class="truncate" style="color: var(--xy-text);">两件机械收尾活与章节对齐检查</span>
+                <span class="xy-mono text-xs shrink-0 ml-1" style="color: ${isRunning ? 'var(--xy-accent)' : 'var(--xy-text-3)'};">383.0s</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      if (processStyle === 'capsule') {
+        // 方案 A：保留原版轻盈通透的流式排版（无内框格、无表格线、无徽章堆叠，去掉 t/s 刷屏与路径杂音）
+        if (isRunning) {
+          if (capsuleExpanded) {
+            mount.innerHTML = `
+              <div class="rounded-xl border px-3.5 py-2.5 transition-all" style="background: var(--xy-canvas); border-color: var(--xy-border);">
+                <button onclick="toggleCapsule()" class="w-full flex items-center justify-between gap-3 text-xs text-left" style="color: var(--xy-text-3);">
+                  <span class="flex items-center gap-2 min-w-0">
+                    <svg class="xy-spin shrink-0" width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="var(--xy-accent)" stroke-width="2.2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                    <span class="font-medium truncate" style="color: var(--xy-text-2);">星瑶执行过程 · 2 个星舰并行收尾中</span>
+                  </span>
+                  <span class="xy-mono shrink-0">8m 55s · 收起 ▴</span>
+                </button>
+                ${buildNativeTrace()}
+              </div>
+            `;
+          } else {
+            mount.innerHTML = `
+              <button onclick="toggleCapsule()" class="inline-flex items-center gap-2 text-xs py-1 transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.color='var(--xy-text-2)'" onmouseout="this.style.color='var(--xy-text-3)'">
+                <svg class="xy-spin shrink-0" width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="var(--xy-accent)" stroke-width="2.2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                <span class="xy-shimmer-text font-medium">正在并行收尾（2 个星舰）· 8m 55s</span>
+                <span>展开 ▾</span>
+              </button>
+            `;
+          }
+        } else {
+          // 已完成态：默认折叠成极轻的一行；点开后同款通透白底框架
+          if (capsuleExpanded) {
+            mount.innerHTML = `
+              <div class="rounded-xl border px-3.5 py-2.5 transition-all" style="background: var(--xy-canvas); border-color: var(--xy-border);">
+                <button onclick="toggleCapsule()" class="w-full flex items-center justify-between gap-3 text-xs text-left" style="color: var(--xy-text-3);">
+                  <span>⌄ 星瑶执行过程 · 5 个动作 · 已完成</span>
+                  <span class="xy-mono shrink-0">8m 55s · 收起 ▴</span>
+                </button>
+                ${buildNativeTrace()}
+              </div>
+            `;
+          } else {
+            mount.innerHTML = `
+              <button onclick="toggleCapsule()" class="inline-flex items-center gap-1.5 text-xs py-0.5 transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.color='var(--xy-text-2)'" onmouseout="this.style.color='var(--xy-text-3)'">
+                <span>› 星瑶执行过程 · 5 个动作 · 已完成 · 8m 55s</span>
+              </button>
+            `;
+          }
+        }
+      } else if (processStyle === 'stepper') {
+        // 方案 B：紧凑单层阶段条（不占纵向空间的极简进度摘要）
+        mount.innerHTML = `
+          <div class="rounded-xl border px-3.5 py-2.5 text-xs space-y-2" style="background: var(--xy-surface); border-color: var(--xy-border);">
+            <div class="flex items-center justify-between gap-3">
+              <span class="flex items-center gap-2 font-medium" style="color: var(--xy-text);">
+                ${isRunning
+                  ? '<svg class="xy-spin shrink-0" width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="var(--xy-accent)" stroke-width="2.2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>'
+                  : '<span style="color: var(--xy-green);">✓</span>'}
+                <span>${isRunning ? '正在并行收尾（2 个星舰 · 已完成前 3 步）' : '已完成 4 个执行阶段（含 3 个星舰、4 个脚本编辑）'}</span>
+              </span>
+              <span class="xy-mono shrink-0" style="color: ${isRunning ? 'var(--xy-accent)' : 'var(--xy-text-3)'};">8m 55s</span>
+            </div>
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1" style="color: var(--xy-text-3);">
+              <span><span style="color: var(--xy-green);">●</span> 第三轮回归 306.5s</span>
+              <span><span style="color: var(--xy-green);">●</span> 脚本扫尾 +540 -405</span>
+              <span><span style="color: var(--xy-green);">●</span> 思考定位阻塞</span>
+              <span style="color: ${isRunning ? 'var(--xy-accent)' : 'var(--xy-text-2)'};">${isRunning ? '◌' : '<span style="color: var(--xy-green);">●</span>'} 并行清理后 8 章 383.0s</span>
+            </div>
+          </div>
+        `;
+      } else {
+        // 方案 C：对话纯净 + 右侧实况栏
+        if (isRunning) {
+          mount.innerHTML = `
+            <button onclick="toggleInspectorBtn()" class="inline-flex items-center gap-2 text-xs py-0.5 transition-colors" style="color: var(--xy-text-2);">
+              <svg class="xy-spin" width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="var(--xy-accent)" stroke-width="2.2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+              <span>正在并行收尾（2 个星舰运行中 · 在右侧实况栏查看）</span>
+            </button>
+          `;
+        } else {
+          mount.innerHTML = `
+            <button onclick="toggleInspectorBtn()" class="inline-flex items-center gap-1.5 text-xs py-0.5 transition-colors" style="color: var(--xy-text-3);" onmouseover="this.style.color='var(--xy-accent)'" onmouseout="this.style.color='var(--xy-text-3)'">
+              <span>在右侧查看本轮执行实况 ›</span>
+            </button>
+          `;
+        }
+      }
+    }
+
+    function syncInspectorState(isRunning) {
+      const headDot = document.getElementById('inspector-head-dot');
+      const headMeta = document.getElementById('inspector-head-meta');
+      const card = document.getElementById('inspector-step4-card');
+      const ico = document.getElementById('inspector-step4-ico');
+      const pill = document.getElementById('inspector-step4-pill');
+      const time = document.getElementById('inspector-step4-time');
+      const a = document.getElementById('inspector-step4-a');
+      const b = document.getElementById('inspector-step4-b');
+      if (!headDot || !card) return;
+
+      if (isRunning) {
+        headDot.style.background = 'var(--xy-accent)';
+        headDot.classList.add('xy-pulse');
+        headMeta.textContent = '已完成 3/4 · 8m 55s';
+        card.style.borderColor = 'var(--xy-accent)';
+        ico.className = 'w-4 h-4 rounded-full shrink-0 flex items-center justify-center xy-spin';
+        ico.style.background = 'var(--xy-accent-soft)';
+        ico.style.color = 'var(--xy-accent)';
+        ico.textContent = '◌';
+        pill.style.background = 'var(--xy-accent-soft)';
+        pill.style.color = 'var(--xy-accent)';
+        pill.textContent = '进行中';
+        time.style.color = 'var(--xy-accent)';
+        a.style.color = 'var(--xy-accent)';
+        a.textContent = '运行中';
+        b.style.color = 'var(--xy-accent)';
+        b.textContent = '运行中';
+      } else {
+        headDot.style.background = 'var(--xy-green)';
+        headDot.classList.remove('xy-pulse');
+        headMeta.textContent = '全部完成 4/4 · 8m 55s';
+        card.style.borderColor = 'var(--xy-border)';
+        ico.className = 'w-4 h-4 rounded-full shrink-0 flex items-center justify-center font-semibold';
+        ico.style.background = 'var(--xy-green-soft)';
+        ico.style.color = 'var(--xy-green)';
+        ico.textContent = '✓';
+        pill.style.background = 'var(--xy-green-soft)';
+        pill.style.color = 'var(--xy-green)';
+        pill.textContent = '已完成';
+        time.style.color = 'var(--xy-text-3)';
+        a.style.color = 'var(--xy-green)';
+        a.textContent = '已完成';
+        b.style.color = 'var(--xy-green)';
+        b.textContent = '已完成';
+      }
+    }
+
+    function toggleStepDetail(id) {
+      if (expandedSteps.has(id)) {
+        expandedSteps.delete(id);
+      } else {
+        expandedSteps.add(id);
+      }
+      renderExecProcess();
+    }
+
+    function toggleCapsule() {
+      capsuleExpanded = !capsuleExpanded;
+      renderExecProcess();
+    }
+
+    function setProcessStyle(style) {
+      processStyle = style;
+      capsuleExpanded = execState === 'running';
+      if (currentView !== 'exec') switchView('exec');
+      renderExecProcess();
+      updateControlPills();
+    }
+
+    function setExecState(state) {
+      execState = state;
+      capsuleExpanded = state === 'running';
+      if (currentView !== 'exec') switchView('exec');
+      renderExecProcess();
+      updateControlPills();
+    }
+
+    function toggleInspectorPane() {
+      document.getElementById('inspector-pane').classList.toggle('hidden');
+    }
+
+    function toggleInspectorBtn() {
+      if (processStyle !== 'inspector') {
+        setProcessStyle('inspector');
+      } else {
+        toggleInspectorPane();
+      }
+    }
+
+    function switchView(view) {
+      currentView = view;
+      closeAllPopovers();
+      const viewExec = document.getElementById('view-exec');
+      const viewNew = document.getElementById('view-new');
+      const crumb = document.getElementById('panel-crumb');
+      const stateSwitcher = document.getElementById('state-switcher');
+      const activeNav = document.getElementById('nav-session-novel');
+      const exportBtn = document.getElementById('hdr-export-btn');
+
+      if (view === 'exec') {
+        viewExec.classList.remove('hidden');
+        viewNew.classList.add('hidden');
+        stateSwitcher.classList.remove('opacity-40', 'pointer-events-none');
+        if (exportBtn) exportBtn.classList.remove('hidden');
+        activeNav.style.background = 'var(--xy-active)';
+        crumb.innerHTML = `
+          <span style="color: var(--xy-text-3);">会话</span>
+          <span style="color: var(--xy-text-3);">/</span>
+          <span class="font-semibold truncate" style="color: var(--xy-text);">你现在是一个习钻读者，你(2)</span>
+          <span class="px-1.5 py-0.5 rounded text-xs" style="background: var(--xy-hover); color: var(--xy-text-2);">小说</span>
+        `;
+      } else {
+        viewExec.classList.add('hidden');
+        viewNew.classList.remove('hidden');
+        stateSwitcher.classList.add('opacity-40', 'pointer-events-none');
+        if (exportBtn) exportBtn.classList.add('hidden');
+        activeNav.style.background = 'transparent';
+        crumb.innerHTML = `
+          <span style="color: var(--xy-text-3);">会话</span>
+          <span style="color: var(--xy-text-3);">/</span>
+          <span class="font-semibold" style="color: var(--xy-text);">新会话</span>
+        `;
+      }
+      renderExecProcess();
+      updateControlPills();
+    }
+
+    function setAppTheme(theme) {
+      currentTheme = theme;
+      document.getElementById('app-stage').setAttribute('data-xy-theme', theme);
+      updateControlPills();
+    }
+
+    function toggleAppTheme() {
+      setAppTheme(currentTheme === 'light' ? 'dark' : 'light');
+    }
+
+    function toggleSidebar() {
+      sidebarOpen = !sidebarOpen;
+      document.getElementById('xy-sidebar').classList.toggle('is-collapsed', !sidebarOpen);
+    }
+
+    function toggleGroup(id) {
+      const el = document.getElementById(id);
+      const ico = document.getElementById('ico-' + id);
+      const hidden = el.classList.toggle('hidden');
+      if (ico) ico.style.transform = hidden ? 'rotate(-90deg)' : 'rotate(0deg)';
+    }
+
+    function toggleDetail(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle('hidden');
+    }
+
+    function toggleTerminal() {
+      document.getElementById('xy-terminal').classList.toggle('hidden');
+    }
+
+    function closeAllPopovers() {
+      ['pop-ctx', 'pop-workdir'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.add('hidden');
+      });
+    }
+
+    function togglePopover(id) {
+      const target = document.getElementById(id);
+      const wasHidden = target.classList.contains('hidden');
+      closeAllPopovers();
+      if (wasHidden) target.classList.remove('hidden');
+    }
+
+    let activeWorkdir = '小说';
+    const WORKDIR_LIST = ['自由对话', '小说', 'xingyao-y-code', 'publish'];
+    const PROJECT_PROMPTS = {
+      '小说': [
+        { label: '核对 181/184 双稿与中段断档', prompt: '请帮我核对当前《小说》项目中 181/184 双稿拆分方案，以及中段 5 处断档区需要补充的事件。' },
+        { label: '运行第 3 轮回归并扫字数', prompt: '运行 _tmp65/r3.py 对全书 300 章做字数与脚手架扫描，汇总当前异常章节。' },
+        { label: '清理后 8 章高频脚手架', prompt: '清理全书脚手架命中最高的最后 8 章，修改前请先保留备份。' },
+      ],
+      'xingyao-y-code': [
+        { label: '查看 git status 与近期改动', prompt: '查看当前仓库 git status 和 diff 摘要，确认未提交修改涉及的模块。' },
+        { label: '运行回归测试与语法校验', prompt: '执行 py_compile 与 tests/test_prompt_byte_stability.py 回归测试并汇报结果。' },
+        { label: '梳理待收尾的问题列表', prompt: '结合近期对话与运行日志，梳理当前代码还剩哪些边界问题或待收尾项。' },
+      ],
+      'publish': [
+        { label: '核对发版清单与未提交文件', prompt: '核对 publish 工作区的版本配置、CHANGELOG 与待提交文件是否一致。' },
+        { label: '切换 develop 并拉取最新代码', prompt: '检查当前工作区是否干净，确认后切换到 develop 分支并同步最新提交。' },
+        { label: '生成本轮发布说明草稿', prompt: '根据最近提交记录整理一份简明清晰的发布更新日志草稿。' },
+      ],
+      '自由对话': []
+    };
+
+    function renderWorkdirDropdown() {
+      const box = document.getElementById('pop-workdir');
+      if (!box) return;
+      box.innerHTML = WORKDIR_LIST.map((name, idx) => {
+        const active = name === activeWorkdir;
+        const label = name === '自由对话' ? '自由对话（退出工作区）' : name;
+        return `<button onclick="selectWorkdirByIdx(${idx})" class="w-full text-left px-2.5 py-1.5 rounded-lg flex items-center justify-between gap-2 transition-colors" style="${active ? 'background: var(--xy-accent-soft); color: var(--xy-accent);' : 'color: var(--xy-text-2);'}" onmouseover="if(${!active})this.style.background='var(--xy-hover)'" onmouseout="if(${!active})this.style.background='transparent'"><span class="truncate">${label}</span>${active ? '<span>✓</span>' : ''}</button>`;
+      }).join('');
+    }
+
+    function renderNewPrompts() {
+      const mount = document.getElementById('new-project-prompts');
+      if (!mount) return;
+      const items = PROJECT_PROMPTS[activeWorkdir] || [];
+      if (!items.length) {
+        mount.classList.add('hidden');
+        mount.innerHTML = '';
+        return;
+      }
+      mount.classList.remove('hidden');
+      mount.innerHTML = items.map((item, idx) => `
+        <button onclick="applyProjectPrompt(${idx})" class="h-7 px-3 rounded-full text-xs border transition-colors" style="border-color: var(--xy-border); color: var(--xy-text-3); background: transparent;" onmouseover="this.style.background='var(--xy-surface)';this.style.color='var(--xy-text)';this.style.borderColor='var(--xy-border-strong)'" onmouseout="this.style.background='transparent';this.style.color='var(--xy-text-3)';this.style.borderColor='var(--xy-border)'">
+          ${item.label}
+        </button>
+      `).join('');
+    }
+
+    function applyProjectPrompt(idx) {
+      const items = PROJECT_PROMPTS[activeWorkdir] || [];
+      const item = items[idx];
+      if (!item) return;
+      const ta = document.getElementById('new-input');
+      ta.value = item.prompt;
+      ta.focus();
+      syncNewSendState();
+    }
+
+    function selectWorkdirByIdx(idx) {
+      selectWorkdir(WORKDIR_LIST[idx]);
+    }
+
+    function selectWorkdir(name, silent) {
+      activeWorkdir = name;
+      const labelEl = document.getElementById('workdir-btn-text');
+      if (labelEl) {
+        labelEl.innerHTML = name === '自由对话'
+          ? '进入项目工作区'
+          : `当前工作区：<span class="font-medium" style="color: var(--xy-text-2);">${name}</span>`;
+      }
+      renderWorkdirDropdown();
+      renderNewPrompts();
+      closeAllPopovers();
+      if (!silent) showToast('工作区已切换为：' + name);
+    }
+
+    function cyclePerm(btn) {
+      const label = btn.querySelector('.perm-text');
+      const modes = [
+        { name: '完全访问', bg: 'var(--xy-rose-soft)', fg: 'var(--xy-rose)' },
+        { name: '自动批准只读', bg: 'var(--xy-accent-soft)', fg: 'var(--xy-accent)' },
+        { name: '每次询问', bg: 'var(--xy-hover)', fg: 'var(--xy-text-2)' }
+      ];
+      const idx = (modes.findIndex((m) => m.name === label.textContent) + 1) % modes.length;
+      const next = modes[idx];
+      label.textContent = next.name;
+      btn.style.background = next.bg;
+      btn.style.color = next.fg;
+    }
+
+    function toggleSandbox(btn) {
+      const label = btn.querySelector('.sb-text');
+      if (label.textContent === '沙盒已解除') {
+        label.textContent = '沙盒限制中';
+        btn.style.background = 'var(--xy-green-soft)';
+        btn.style.color = 'var(--xy-green)';
+      } else {
+        label.textContent = '沙盒已解除';
+        btn.style.background = 'var(--xy-amber-soft)';
+        btn.style.color = 'var(--xy-amber)';
+      }
+    }
+
+    function onExecAction() {
+      const input = document.getElementById('exec-input');
+      if (input.value.trim()) {
+        input.value = '';
+        setExecState('running');
+        showToast('已发送到当前回合');
+      } else if (execState === 'running') {
+        setExecState('done');
+        showToast('已停止当前执行，切换至完成视图');
+      } else {
+        setExecState('running');
+        showToast('已重新发起执行');
+      }
+    }
+
+    function syncNewSendState() {
+      const val = document.getElementById('new-input').value.trim();
+      const btn = document.getElementById('new-send-btn');
+      if (val) {
+        btn.style.background = 'var(--xy-accent)';
+        btn.style.color = 'var(--xy-accent-fg)';
+      } else {
+        btn.style.background = 'var(--xy-hover)';
+        btn.style.color = 'var(--xy-text-3)';
+      }
+    }
+
+    function launchFromNew() {
+      const ta = document.getElementById('new-input');
+      if (!ta.value.trim()) {
+        showToast('请先输入问题或任务');
+        return;
+      }
+      ta.value = '';
+      syncNewSendState();
+      setExecState('running');
+      switchView('exec');
+      showToast('已创建新会话并切换到执行页面');
+    }
+
+    function toggleQrModal(show) {
+      document.getElementById('qr-modal').classList.toggle('hidden', !show);
+    }
+
+    function setQrMode(mode) {
+      const mBtn = document.getElementById('qr-tab-mobile');
+      const wBtn = document.getElementById('qr-tab-web');
+      const title = document.getElementById('qr-modal-title');
+      const sub = document.getElementById('qr-modal-sub');
+      if (mode === 'mobile') {
+        title.textContent = '移动端';
+        sub.textContent = '新版独立移动端界面，扫码即刻接管会话';
+        mBtn.style.background = 'var(--xy-card)';
+        mBtn.style.color = 'var(--xy-text)';
+        mBtn.style.boxShadow = 'var(--xy-shadow-sm)';
+        wBtn.style.background = 'transparent';
+        wBtn.style.color = 'var(--xy-text-3)';
+        wBtn.style.boxShadow = 'none';
+      } else {
+        title.textContent = 'web远端';
+        sub.textContent = '经典响应式网页，扫码即可作为第二个前端控制本机';
+        wBtn.style.background = 'var(--xy-card)';
+        wBtn.style.color = 'var(--xy-text)';
+        wBtn.style.boxShadow = 'var(--xy-shadow-sm)';
+        mBtn.style.background = 'transparent';
+        mBtn.style.color = 'var(--xy-text-3)';
+        mBtn.style.boxShadow = 'none';
+      }
+    }
+
+    let toastTimer;
+    function showToast(msg) {
+      const t = document.getElementById('xy-toast');
+      t.textContent = msg;
+      t.style.opacity = '1';
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { t.style.opacity = '0'; }, 2000);
+    }
+
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.relative')) closeAllPopovers();
+    });
+
+    selectWorkdir('小说', true);
+    switchView('exec');
+  </script>
+</body>
+</html>

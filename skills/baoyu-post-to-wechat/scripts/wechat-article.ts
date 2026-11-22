@@ -39,11 +39,9 @@ async function sendQrToTelegram(session: ChromeSession): Promise<void> {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!botToken || !chatId) return;
 
-  // Wait for QR to render before extracting
   await sleep(2000);
 
   try {
-    // Try to extract QR image from DOM first (avoids full-page screenshot noise)
     const domResult = await session.cdp.send<{ result: { value: string } }>('Runtime.evaluate', {
       expression: `
         (function() {
@@ -73,7 +71,6 @@ async function sendQrToTelegram(session: ChromeSession): Promise<void> {
     if (raw.startsWith('data:image')) {
       imgBuffer = Buffer.from(raw.split(',')[1] ?? '', 'base64');
     } else if (raw.startsWith('url:')) {
-      // Fetch inside Chrome to carry WeChat session cookies
       const imgUrl = raw.slice(4);
       const inBrowserFetch = await session.cdp.send<{ result: { value: string } }>('Runtime.evaluate', {
         expression: `
@@ -91,7 +88,6 @@ async function sendQrToTelegram(session: ChromeSession): Promise<void> {
       }, { sessionId: session.sessionId });
       imgBuffer = Buffer.from((inBrowserFetch.result.value as string) ?? '', 'base64');
     } else {
-      // Fallback: viewport screenshot (smaller than full-page; QR is usually in viewport)
       const screenshotResp = await session.cdp.send<{ data: string }>(
         'Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, { sessionId: session.sessionId }
       );
@@ -124,7 +120,6 @@ async function sendQrToTelegram(session: ChromeSession): Promise<void> {
 }
 
 async function waitForLogin(session: ChromeSession, timeoutMs = 120_000): Promise<boolean> {
-  // Notify via Telegram if configured (no-op when env vars absent)
   await sendQrToTelegram(session);
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -857,7 +852,6 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
   let cdp: CdpConnection;
   let chrome: ReturnType<typeof import('node:child_process').spawn> | null = null;
 
-  // Try connecting to existing Chrome: explicit port > auto-detect > launch new
   const portToTry = cdpPort ?? await findExistingChromeDebugPort(profileDir);
   if (portToTry) {
     const existing = await tryConnectExisting(portToTry);
@@ -882,7 +876,6 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
 
     let session: ChromeSession;
     if (!chrome) {
-      // Reusing existing Chrome: find an already-logged-in tab (has token in URL)
       const allTargets = await cdp.send<{ targetInfos: Array<{ targetId: string; url: string; type: string }> }>('Target.getTargets');
       const loggedInTab = allTargets.targetInfos.find(t => t.type === 'page' && t.url.includes('mp.weixin.qq.com') && t.url.includes('token='));
       const wechatTab = loggedInTab || allTargets.targetInfos.find(t => t.type === 'page' && t.url.includes('mp.weixin.qq.com'));
@@ -895,7 +888,6 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
         await cdp.send('DOM.enable', {}, { sessionId: reuseSid });
         session = { cdp, sessionId: reuseSid, targetId: wechatTab.targetId };
 
-        // Navigate to home if not already there
         const currentUrl = await evaluate<string>(session, 'window.location.href');
         if (!currentUrl.includes('/cgi-bin/home')) {
           console.log('[wechat] Navigating to home...');
@@ -903,7 +895,6 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
           await sleep(5000);
         }
       } else {
-        // No WeChat tab found, create one
         console.log('[wechat] No WeChat tab found, opening...');
         await cdp.send('Target.createTarget', { url: WECHAT_URL });
         await sleep(5000);
@@ -923,7 +914,6 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
     console.log('[wechat] Logged in.');
     await sleep(5000);
 
-    // Wait for menu to be ready
     const menuReady = await waitForElement(session, '.new-creation__menu', 40_000);
     if (!menuReady) throw new Error('Home page menu did not load');
 
@@ -943,7 +933,6 @@ export async function postArticle(options: ArticleOptions): Promise<void> {
     await cdp.send('Runtime.enable', {}, { sessionId });
     await cdp.send('DOM.enable', {}, { sessionId });
 
-    // Wait for editor elements to fully load
     console.log('[wechat] Waiting for editor to load...');
     const editorLoaded = await waitForElement(session, '#title', 30_000);
     if (!editorLoaded) throw new Error('Editor did not load (#title not found)');

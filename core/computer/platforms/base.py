@@ -1,5 +1,3 @@
-"""平台接入契约；不加载任何本机输入或图形依赖。"""
-
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -31,11 +29,6 @@ class ComputerPlatformAdapter(Protocol):
         ...
 
     def browser_window_hints(self, pid: int) -> tuple:
-        """受控浏览器进程的可见窗口标题提示（R5 受控页裁决系统侧信号）。
-
-        返回 (hwnd, title, is_foreground) 元组；未实现的平台显式抛
-        computer_unsupported_os（backend 据此回落到 DOM 可见性裁决）。
-        """
         ...
 
 
@@ -48,6 +41,14 @@ class UnavailablePlatformAdapter:
 
     @property
     def supported(self) -> bool:
+        return False
+
+    @property
+    def browser_supported(self) -> bool:
+        return False
+
+    @property
+    def desktop_supported(self) -> bool:
         return False
 
     def find_browser_executable(self, browser: str) -> str:

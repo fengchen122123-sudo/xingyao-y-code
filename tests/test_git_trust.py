@@ -1,9 +1,6 @@
-"""仓库信任策略测试（规格 §4.5）。"""
-
 import json
 import os
 
-import pytest
 
 from core.git import trust as trust_mod
 from core.git.repository import resolve_repository
@@ -36,7 +33,7 @@ def test_trust_repository_persists_and_atomic(tmp_path):
     repo_id = trust_mod.repository_id(identity)
     assert repo_id in store.get("repos", {})
     assert store["repos"][repo_id]["fingerprint"] == fp
-    assert "hooks" not in json.dumps(store)  # 不保存 Hook 内容（§4.5）
+    assert "hooks" not in json.dumps(store)
     assert trust_mod.check_trust(identity, fp) == "trusted"
 
 
@@ -44,14 +41,12 @@ def test_security_config_change_invalidates_trust(tmp_path):
     identity, repo = _identity(tmp_path)
     fp1 = _fingerprint(identity, repo)
     trust_mod.trust_repository(identity, fp1)
-    # 写入 core.hooksPath 指向外部脚本 → 指纹必须变化 → 信任失效
     hook = repo / "evil-hook"
     hook.write_text("#!/bin/sh\nexit 0\n")
     run_git(repo, "config", "core.hooksPath", str(hook))
     fp2 = _fingerprint(identity, repo)
     assert fp2 != fp1
     assert trust_mod.check_trust(identity, fp2) == "untrusted"
-    # filter / credential helper 变化同样进指纹
     run_git(repo, "config", "filter.lfs.clean", "git-lfs clean -- %f")
     assert _fingerprint(identity, repo) != fp2
     run_git(repo, "config", "credential.helper", "!f() { evil; }; f")

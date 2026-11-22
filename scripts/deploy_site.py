@@ -1,19 +1,5 @@
 #!/usr/bin/env python.exe
 # -*- coding: utf-8 -*-
-"""一键更新星瑶Code 官网静态站点。
-
-功能概要：
-  1. 通过 SSH/SFTP（paramiko）把本地 website/ 全量同步到远程静态目录；
-  2. 上传后逐文件做 MD5 校验，确保内容一致；
-  3. 最后做一次公网可用性验证（HTTP 状态码 + 关键字）。
-
-密码来源优先读环境变量 YA_SSH_PWD，缺失时交互式输入，
-脚本本身不包含任何明文密码。
-
-用法示例：
-    set YA_SSH_PWD=xxxxxx
-    venv\\Scripts\\python.exe scripts\\deploy_site.py
-"""
 
 from __future__ import annotations
 
@@ -26,9 +12,6 @@ import urllib.request
 
 import paramiko
 
-# ---------------------------------------------------------------------------
-# 默认配置（可通过命令行参数覆盖）
-# ---------------------------------------------------------------------------
 DEFAULT_HOST = os.environ.get("DEPLOY_HOST", "")
 DEFAULT_PORT = int(os.environ.get("DEPLOY_PORT") or "22")
 DEFAULT_USER = os.environ.get("DEPLOY_USER", "")
@@ -100,7 +83,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_password() -> str:
-    """获取 SSH 密码：优先环境变量，其次交互式输入。"""
     pwd = os.environ.get(PWD_ENV_VAR)
     if pwd:
         info(f"已从环境变量 {PWD_ENV_VAR} 读取密码。")

@@ -1,5 +1,3 @@
-"""core/git/runner.py 单元测试：参数数组执行、白名单、超时、错误归类与脱敏（规格 §8）。"""
-
 import subprocess
 
 import pytest
@@ -36,7 +34,6 @@ def test_run_status_on_real_repo(tmp_path):
 def test_run_nonzero_does_not_raise_but_run_checked_does(tmp_path):
     repo = make_repo(tmp_path)
     runner = GitRunner()
-    # rev-parse 一个不存在的对象：返回非零但不该抛
     result = runner.run(["rev-parse", "-q", "--verify", "no-such-ref"], cwd=str(repo))
     assert result.returncode != 0
     with pytest.raises(GitError) as exc:
@@ -51,7 +48,7 @@ def test_whitelist_rejects_unlisted_subcommand(tmp_path):
         with pytest.raises(GitError) as exc:
             runner.run(forbidden, cwd=str(repo))
         assert exc.value.code is GitErrorCode.UNSAFE_GIT_EXTENSION
-        assert exc.value.exit_code is None  # 未真正启动进程
+        assert exc.value.exit_code is None
 
 
 def test_scope_whitelist_write_scope_cannot_run_read_command(tmp_path):
@@ -96,7 +93,6 @@ def test_safe_config_and_env_injected(tmp_path, monkeypatch):
     cmd = captured["cmd"]
     assert "--no-optional-locks" in cmd
     assert "-c" in cmd and "protocol.ext.allow=never" in cmd
-    # status 覆盖 fsmonitor，避免读取用户全局配置里的外部监视器
     assert "core.fsmonitor=false" in cmd
     env = captured["kwargs"]["env"]
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
@@ -118,7 +114,6 @@ def test_env_extra_passthrough(tmp_path):
 def test_timeout_kills_process(tmp_path):
     repo = make_repo(tmp_path)
     runner = GitRunner()
-    # 用内部低层通道执行非 git 白名单的慢命令，验证超时与进程终止
     import sys
 
     slow = [sys.executable, "-c", "import time; time.sleep(15)"]
@@ -185,7 +180,6 @@ def test_check_branch_name_uses_git_validation(tmp_path):
     with pytest.raises(GitError) as exc:
         runner.check_branch_name("bad..name", cwd=str(repo))
     assert exc.value.code is GitErrorCode.INVALID_REF
-    # 选项注入形状的名字必须先被本地拒绝
     with pytest.raises(GitError):
         runner.check_branch_name("--upload-pack=evil", cwd=str(repo))
 
@@ -211,5 +205,4 @@ def test_version_below_baseline_rejected():
     with pytest.raises(GitError) as exc:
         runner.ensure_version((2, 36, 0), detected=(2, 20, 1))
     assert exc.value.code is GitErrorCode.GIT_VERSION_UNSUPPORTED
-    # 达标版本放行
     assert runner.ensure_version((2, 36, 0), detected=(2, 51, 2)) == (2, 51, 2)

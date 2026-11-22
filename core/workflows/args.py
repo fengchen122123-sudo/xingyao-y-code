@@ -1,15 +1,3 @@
-"""工作流 args 校验（语义与 ZCode 对齐，ZCode 导入设计 §3.5）。
-
-ZCode 的四条语义原样保留：
-
-- 未声明的传参 = 错误（静默丢弃会让调用方误以为生效）；
-- 收集全部违规一次性返回（调用方一次改对）；
-- 缺省与显式 ``undefined`` 同视：有 ``default`` → 填入并**与传参走同一条
-  类型检查**；无 default 且 required → 报缺失；无 default 非 required → 不注入；
-- ``number`` 拒 NaN/Infinity（过不了 JSON 边界）；``boolean`` 拒 0/1；
-  ``json`` 万能型（什么都收不校验）。
-"""
-
 from __future__ import annotations
 
 import math

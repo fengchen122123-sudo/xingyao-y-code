@@ -1,8 +1,4 @@
 ﻿# -*- coding: utf-8 -*-
-"""TokenRhythm 生图插件测试：密钥解析边界、参数校验、请求体结构与插件元数据。
-
-全部使用假 key（sk_tr_fake_test），绝不读取真实密钥；网络请求全部 mock。
-"""
 
 import importlib.util
 import io
@@ -22,7 +18,6 @@ _PLUGIN_ENTRY = os.path.join(_PLUGIN_DIR, "plugin.py")
 
 
 def _load_plugin():
-    """按文件路径加载插件模块（与 plugin_loader 的加载方式一致）。"""
     spec = importlib.util.spec_from_file_location("_test_tokenrhythm_image_plugin", _PLUGIN_ENTRY)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -30,7 +25,6 @@ def _load_plugin():
 
 
 class _Response:
-    """模拟 urlopen 的上下文管理器响应。"""
 
     def __init__(self, payload):
         self._payload = payload
@@ -46,11 +40,6 @@ class _Response:
 
 
 def _request_header(request, name):
-    """大小写不敏感读取 urllib.request.Request 的请求头。
-
-    Python 3.14 起 Request.get_header() 不再做 capitalize 规范化，
-    与 add_header 的存储键不再对称、会取不到值；测试统一走本例遍历。
-    """
     return next(
         (value for key, value in request.headers.items() if key.lower() == name.lower()),
         None,
@@ -66,7 +55,6 @@ class _FakeRegistry:
 
 
 class ResolveApiKeyTest(unittest.TestCase):
-    """密钥解析：只在运行时从用户配置读取，失败一律返回空串。"""
 
     def setUp(self):
         self.tr = _load_plugin()
@@ -107,7 +95,6 @@ class GenerateImageTest(unittest.TestCase):
         self.tr = _load_plugin()
 
     def test_no_key_returns_config_guidance(self):
-        """无 Key 时不发请求，返回含配置指引的错误。"""
         with mock.patch.object(self.tr, "_resolve_api_key", return_value=""), \
              mock.patch.object(self.tr.urllib.request, "urlopen") as fake_open:
             result = self.tr.generate_image("一只猫")
@@ -117,7 +104,6 @@ class GenerateImageTest(unittest.TestCase):
         fake_open.assert_not_called()
 
     def test_param_validation_rejects_without_network(self):
-        """非法参数直接报错且不发任何请求。"""
         cases = [
             dict(prompt=""),
             dict(prompt="猫", size="333x333"),
@@ -143,7 +129,7 @@ class GenerateImageTest(unittest.TestCase):
 
         def fake_urlretrieve(url, target):
             with open(target, "wb") as f:
-                f.write(b"\xff\xd8\xff\xe0")  # JPEG 头
+                f.write(b"\xff\xd8\xff\xe0")
 
         with tempfile.TemporaryDirectory() as save_dir:
             with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
@@ -174,7 +160,6 @@ class GenerateImageTest(unittest.TestCase):
         self.assertIn("401", result.content)
         self.assertIn("Key 无效", result.content)
     def test_wan_model_requests_b64_and_saves_decoded_bytes(self):
-        """wan2.7-image 让服务端直接回 base64：不再走 URL 下载。"""
         import base64
 
         captured = {}
@@ -199,7 +184,6 @@ class GenerateImageTest(unittest.TestCase):
                 self.assertEqual(f.read(), raw)
 
     def test_wan_model_falls_back_to_url_when_server_returns_url(self):
-        """服务端未按 base64 返回时兜底走 URL 下载，不报错。"""
         captured = {}
 
         def fake_urlopen(request, timeout):
@@ -221,7 +205,6 @@ class GenerateImageTest(unittest.TestCase):
         self.assertTrue(result.changed_files[0].endswith(".png"))
 
     def test_broken_b64_returns_error_without_crash(self):
-        """base64 数据损坏时返回错误结果，不抛异常。"""
 
         def fake_urlopen(request, timeout):
             return _Response({"data": [{"b64_json": "!!!broken!!!"}]})
@@ -235,7 +218,6 @@ class GenerateImageTest(unittest.TestCase):
         self.assertIn("base64", result.content)
 
     def test_generate_request_carries_tokenrhythm_agent_header(self):
-        """生图请求头必须携带 X-TokenRhythm-Agent 客户端标识（纯标识、不带版本号）。"""
         from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 
         captured = {}
@@ -258,7 +240,6 @@ class GenerateImageTest(unittest.TestCase):
         self.assertEqual(captured["agent"], TOKENRHYTHM_AGENT_NAME)
 
     def test_generate_request_carries_session_id_header(self):
-        """绑定执行会话时，生图请求头携带 X-Session-Id（本地会话与平台调用关联）。"""
         from core import app_context
 
         old_session = app_context.get_thread_session()
@@ -374,7 +355,6 @@ class EditImageTest(unittest.TestCase):
         self.assertIn(b"1024x1024", captured["body"])
 
     def test_edit_with_wan_model_requests_b64_and_saves(self):
-        """图生图选 wan2.7-image 时同样要求服务端回 base64 并直接落盘。"""
         import base64
 
         captured = {}
@@ -401,7 +381,6 @@ class EditImageTest(unittest.TestCase):
                 self.assertEqual(f.read(), raw)
 
     def test_edit_request_carries_tokenrhythm_agent_header(self):
-        """垫图改图请求头同样携带 X-TokenRhythm-Agent 客户端标识（纯标识、不带版本号）。"""
         from core.llm_policy import TOKENRHYTHM_AGENT_NAME
 
         captured = {}
@@ -425,7 +404,6 @@ class EditImageTest(unittest.TestCase):
         self.assertEqual(captured["agent"], TOKENRHYTHM_AGENT_NAME)
 
     def test_edit_request_carries_session_id_header(self):
-        """绑定执行会话时，垫图改图请求头同样携带 X-Session-Id。"""
         from core import app_context
 
         old_session = app_context.get_thread_session()
@@ -454,11 +432,8 @@ class EditImageTest(unittest.TestCase):
 
 
 class PluginMetadataTest(unittest.TestCase):
-    """插件默认关闭 + 注册的两个工具权限元数据正确。"""
 
     def test_plugin_json_enabled_by_deliberate_enable(self):
-        # 初始提交为默认关闭（40f2d7d），随后 135877e 明确"启用 tokenrhythm_image
-        # 插件"——启用是主动决策，本测试随之更新期望，而不是反过来改插件。
         with open(os.path.join(_PLUGIN_DIR, "plugin.json"), "r", encoding="utf-8") as f:
             meta = json.load(f)
         self.assertIs(meta.get("enabled"), True)

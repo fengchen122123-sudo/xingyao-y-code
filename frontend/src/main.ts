@@ -2,13 +2,13 @@ import { createApp } from 'vue';
 import { createPinia } from 'pinia';
 import './style.css';
 import './themes/field-notes.css';
-// 内置 QQ2009 皮肤的专属质感层（渐变标题栏/橙色悬停等平色 token 表达不了的效果）
 import './themes/qq2009.css';
 import App from './App.vue';
 import { applyBootTheme } from './themes/runtime';
 import { useAppStore } from './stores/appStore';
 import { registerFrontendUpdateHandlers } from './utils/frontendUpdate';
 import { loadAppGlass } from './composables/appGlass';
+import { loadChatLayoutWidth } from './composables/chatLayoutWidth';
 
 // 启动画面在 get_initial_state 返回前就会渲染：先同步恢复主题，避免浅色主题
 // 用户看到黑色 splash（后端真值返回后会再校正一次）。
@@ -16,11 +16,11 @@ import { loadAppGlass } from './composables/appGlass';
 // 六位 HEX，不把片段内容作为 CSS 或 HTML 注入。
 try {
   applyBootTheme(location.hash, document.body);
-} catch { /* 保持默认深色 */ }
+} catch { }
 
-// 全屏玻璃层偏好（设置 → 外观与主题 → 玻璃效果）：启动即恢复，读不到就是默认关闭。
-// 必须在 mount 之前应用，否则启动首帧会先闪一下无玻璃的版本。
+// 全屏玻璃层与对话栏宽偏好：必须在 mount 之前应用，避免首帧闪回旧尺寸/无玻璃。
 loadAppGlass();
+loadChatLayoutWidth();
 
 const app = createApp(App);
 app.use(createPinia());

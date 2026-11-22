@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root { --breath-px: 2px; --breath-sec: 4.2s; }
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      background: transparent; overflow: hidden; user-select: none;
+      cursor: grab;
+    }
+    body.dragging { cursor: grabbing; }
+    #stage { position: relative; width: 100%; height: 100%; transform-origin: center bottom; }
+    #breath {
+      position: absolute; left: 0; bottom: 0; width: 100%;
+      aspect-ratio: 1 / 1; transform-origin: center bottom;
+    }
+    #breath.breathing { animation: breathe var(--breath-sec) ease-in-out infinite; }
+    #breath.landing { animation: land 420ms cubic-bezier(.2,.8,.3,1) both; }
+    body.no-motion #breath { animation: none !important; transform: none !important; }
+    @keyframes breathe {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(calc(-1 * var(--breath-px))); }
+    }
+    @keyframes land {
+      0%   { transform: translateY(-5px) scaleY(1.03); }
+      38%  { transform: translateY(2px) scaleY(0.95) scaleX(1.03); }
+      72%  { transform: translateY(-1px) scaleY(1.01); }
+      100% { transform: translateY(0) scaleY(1); }
+    }
+    /* 单图层：不做 opacity 过渡，杜绝两张不同姿势半透明叠加 */
+    .layer {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; image-rendering: auto;
+      transform-origin: center center;
+    }
+    .layer.flipped { transform: scaleX(-1); }
+    #stage.grab-hint .layer { filter: drop-shadow(0 0 6px rgba(255,150,40,0.9)); }
+    #bubble {
+      position: absolute; left: 50%; top: 4px; transform: translateX(-50%);
+      width: 94%; max-height: 48px; box-sizing: border-box;
+      display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+      background: rgba(255,255,255,0.96); color: #222;
+      border: 1.5px solid #e3e3e3; border-radius: 10px;
+      padding: 4px 7px; font: 600 11.5px/1.28 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      opacity: 0; transition: opacity 200ms linear, border-color 180ms ease, background-color 180ms ease;
+      pointer-events: none; text-align: center;
+      white-space: normal; word-break: break-word; overflow: hidden;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    #bubble.show { opacity: 1; }
+    #bubble.kind-finish {
+      background: rgba(240, 253, 246, 0.98); border-color: #2eb872; color: #14532d;
+      box-shadow: 0 2px 10px rgba(46, 184, 114, 0.3);
+    }
+    #bubble.kind-error {
+      background: rgba(255, 243, 243, 0.98); border-color: #e5484d; color: #7f1d1d;
+      box-shadow: 0 2px 10px rgba(229, 72, 77, 0.32);
+    }
+    #bubble.kind-question {
+      background: rgba(241, 246, 255, 0.98); border-color: #3b82f6; color: #1e3a8a;
+      box-shadow: 0 2px 10px rgba(59, 130, 246, 0.34);
+    }
+    #bubble.kind-permission {
+      background: rgba(255, 249, 235, 0.98); border-color: #f59e0b; color: #78350f;
+      box-shadow: 0 2px 10px rgba(245, 158, 11, 0.36);
+    }
+    #bubble.kind-cancel {
+      background: rgba(248, 250, 252, 0.96); border-color: #94a3b8; color: #334155;
+    }
+    #bubble.show.sticky { animation: bubble-pulse 1.8s ease-in-out infinite; }
+    body.no-motion #bubble.show.sticky { animation: none !important; }
+    @media (prefers-reduced-motion: reduce) { #bubble.show.sticky { animation: none !important; } }
+    @keyframes bubble-pulse {
+      0%, 100% { transform: translateX(-50%) scale(1); }
+      50% { transform: translateX(-50%) scale(1.03); }
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="breath">
+      <img id="frame" class="layer" draggable="false" />
+    </div>
+    <div id="bubble"></div>
+  </div>
+  <script src="./renderer.js"></script>
+</body>
+</html>

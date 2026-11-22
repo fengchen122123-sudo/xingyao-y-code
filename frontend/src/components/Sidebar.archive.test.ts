@@ -4,9 +4,6 @@ import { afterEach, expect, it, vi } from 'vitest';
 import Sidebar from './Sidebar.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 归档入口收敛为「会话行内 ⤓ 归档按钮」：侧栏底部不再有「已归档」折叠区
-// （归档列表改由设置页承载）。这里沿用 rename/groupCollapse 两个测试文件的写法：
-// 不 mock store，直接灌数据后断言真实渲染与真实桥接调用。
 const wrappers: VueWrapper[] = [];
 afterEach(() => {
   wrappers.splice(0).forEach((w) => w.unmount());
@@ -29,7 +26,6 @@ function sessionGroups() {
   ];
 }
 
-/** store 侧的归档列表快照（侧栏已不渲染，仅用于校验数据同步） */
 function archivedList() {
   return [
     {
@@ -81,7 +77,6 @@ it('会话行 hover 操作区新增归档按钮：当前活跃会话置灰并给
   const btns = wrapper.findAll('[data-test="session-archive-btn"]');
   expect(btns.length).toBe(2);
 
-  // 第 0 条是当前活跃会话（store.currentSessionName = session-a）
   expect(btns[0].attributes('disabled')).toBeDefined();
   expect(btns[0].classes()).toContain('disabled');
   expect(btns[0].attributes('title')).toContain('不能归档');
@@ -122,7 +117,6 @@ it('归档沿用两段确认：先点 ⤓ 只进确认态，点「确认」才�
   ]);
   const { wrapper, store } = setup({ archive_session, get_archived_sessions });
 
-  // 首击：只进入确认态，不调桥接、不动列表
   await wrapper.findAll('[data-test="session-archive-btn"]')[1].trigger('click');
   await flushPromises();
   expect(archive_session).not.toHaveBeenCalled();
@@ -131,7 +125,6 @@ it('归档沿用两段确认：先点 ⤓ 只进确认态，点「确认」才�
   expect(confirmBtn.exists()).toBe(true);
   expect(confirmBtn.text()).toContain('确认');
 
-  // 次击「确认」：真正归档，会话移出主列表、归档列表刷新
   await confirmBtn.trigger('click');
   await flushPromises();
 
@@ -140,7 +133,6 @@ it('归档沿用两段确认：先点 ⤓ 只进确认态，点「确认」才�
   expect(store.sessionGroups[0].sessions.map((s) => s.name)).toEqual(['session-a']);
   expect(store.archivedSessions.map((s) => s.name)).toContain('session-b');
 
-  // 成功后静默完成：不再弹「已归档」提示框，确认态也已退出
   expect(store.confirmModal.show).toBe(false);
   expect(wrapper.find('[data-test="session-archive-confirm"]').exists()).toBe(false);
 });

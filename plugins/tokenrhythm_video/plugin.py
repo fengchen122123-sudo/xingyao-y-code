@@ -1,34 +1,3 @@
-"""tokenrhythm_video：基元律动（TokenRhythm）视频生成插件入口。
-
-提供 tokenrhythm_generate_video 工具：
-- 纯文生视频（wan3.0-video）
-- 图生视频：首帧支持公网 HTTPS URL 直传；本地首帧文件先经 /v1/images/edits
-  保真重绘换公网 OSS URL（¥0.2/次），再以 first_frame 角色注入 content
-
-协议（异步任务式，与生图的同步接口不同；下述要点来自 2026-11-03 真实调用实测，
-不是文档转述）：
-- POST /v1/videos/generations → HTTP 202 返回 {"id", "status": "queued", ...}
-- GET  /v1/videos/{id} 轮询，终态是 success（实测状态机 queued→running→success）
-- 文本必须放 content 数组：content:[{"type":"text","text":"..."}]，写 prompt 字段直接 400
-- 图生视频首帧只吃公网 HTTPS URL（上限约 4096 字符；base64 / data URL 实测全被拒），
-  且 content 项必须带顶层 role 字段：{"type":"image_url","image_url":{"url":...},
-  "role":"first_frame"}——缺 role 一律 400（不扣费），补上即 202
-- 不显式传 resolution/duration 会按最贵档（1080P/5s）扣钱：本工具总是显式传参
-- result.url 约 60 分钟时效，完成后必须及时下载；失败任务不扣费；无取消接口
-- 计费按秒：480P ¥0.3/秒、720P ¥0.6/秒、1080P ¥1.2/秒；输入图片本身免费
-- 本地首帧文件无法直接传：先用 /v1/images/edits（qwen-image-2.0，¥0.2/次）把本地图
-  保真重绘一次、拿返回的 data[0].url 公网 OSS 地址作首帧（画面以重绘结果为准）
-
-密钥安全约定与 tokenrhythm_image 完全一致：Key 只在运行时从
-~/.ycode/config.json 的 providers 中 base_url 含 tokenrhythm.studio 的条目读取
-（DPAPI 解密），仅存于内存、只用于请求头 Authorization: Bearer，绝不落盘。
-未配置时工具直接返回配置指引错误，不发起任何请求。
-
-为什么是独立插件而不是塞进 tokenrhythm_image：用户约束明确要求不改现有
-生图插件的任何 schema 与行为；两个插件的请求协议也不同（同步 JSON vs
-异步轮询），混在一个 register 里只会互相牵连。
-"""
-
 from __future__ import annotations
 
 import json
@@ -47,12 +16,10 @@ _VIDEO_URL = _API_BASE + "/videos/generations"
 VALID_MODELS = ("wan3.0-video",)
 VALID_RESOLUTIONS = ("480P", "720P", "1080P")
 
-# duration：文档口径 2~30 秒，-1 为智能时长
 _DURATION_MIN = 2
 _DURATION_MAX = 30
 _DURATION_SMART = -1
 
-# 首帧图片限制：与生图插件垫图同口径（1 张、≤10MB、jpg/jpeg/png）
 _IMAGE_MAX_BYTES = 10 * 1024 * 1024
 _IMAGE_ALLOWED_EXTS = (".jpg", ".jpeg", ".png")
 
@@ -70,13 +37,6 @@ _NOT_CONFIGURED_MSG = (
 
 
 def _resolve_api_key() -> str:
-    """运行时从用户配置读取基元律动 Key 并解密；失败一律返回空串。
-
-    与 tokenrhythm_image 同一份配置条目（base_url 含 tokenrhythm.studio）。
-    注意：import config 必须放在函数内部（避免循环导入）。两插件各自持有
-    一份该函数是刻意的——plugin_loader 按目录独立加载模块，跨插件 import
-    既不可靠（用户级同名覆盖会改变语义）也不被 import_sibling 支持。
-    """
     try:
         import config  # 函数内导入，避免循环导入
 
@@ -99,19 +59,15 @@ def _resolve_api_key() -> str:
 
 
 def _detect_video_ext(head: bytes) -> str:
-    """按文件头判断真实格式：MP4 的 ftyp 盒在 4~8 字节处，其余保守归 .mp4。"""
     if len(head) >= 8 and head[4:8] == b"ftyp":
         return ".mp4"
     return ".mp4"
 
 
 def _resolve_save_dir(save_dir: str | None) -> str:
-    """解析保存目录：未传 → AI 生成内容目录；显式传值 → 原样尊重（与生图插件同口径）。"""
-    if save_dir is None:
-        from core.ai_output_paths import resolve_ai_output_dir
+    from core.ai_output_paths import resolve_ai_output_save_dir
 
-        return str(resolve_ai_output_dir())
-    return os.path.abspath(save_dir or ".")
+    return resolve_ai_output_save_dir(save_dir)
 
 
 def _frame_dimensions(image_path: str) -> tuple:
@@ -126,13 +82,6 @@ def _frame_dimensions(image_path: str) -> tuple:
 
 
 def _refit_size(width: int, height: int) -> str:
-    """按首帧宽高比给 images/edits 选 size 档位（服务端支持
-    1024x1024 / 1280x720 / 720x1280 / 1280x1280 / 1024x1792 / 1792x1024）。
-
-    实测（2026-11-03 探针真跑）：不传 size 时 1280×720 的横图会被重绘成
-    1024×1024 正方形，构图被重新裁切，首帧保真显著劣化（MAE 24 的主要
-    来源）——所以必须显式传与原图宽高比一致的档位。
-    """
     if width > 0 and height > 0:
         if height > width:
             return "720x1280"
@@ -148,12 +97,6 @@ _FRAME_REFIT_PROMPT = "请原样重绘输出这张图片，保持画面内容、
 
 
 def _upload_frame_for_url(image_path: str, api_key: str) -> str:
-    """本地首帧 → 公网 HTTPS URL：经 /v1/images/edits 保真重绘换取 data[0].url。
-
-    为什么绕这一步：视频接口对首帧只接受公网 HTTPS URL（实测 base64 / data
-    URL 全被拒），而平台唯一的图片"上传换地址"入口就是改图接口。这一步额外
-    消耗 ¥0.2/次（qwen-image-2.0），调用方（工具描述/桥）必须把这一点讲清楚。
-    """
     boundary = "----YCodeVideoBoundary%s" % uuid.uuid4().hex
     # size 必须显式传：不传时服务端按 1024×1024 重绘，横/竖图构图会被重新裁切
     refit_size = _refit_size(*_frame_dimensions(image_path))
@@ -209,11 +152,6 @@ def _upload_frame_for_url(image_path: str, api_key: str) -> str:
 
 
 def _derive_ratio(width: int, height: int) -> str:
-    """按首帧宽高比推导 ratio：竖图（高>宽）出竖幅 9:16，其余 16:9。
-
-    wan3.0-video 文档口径 ratio 16:9 / 9:16；首帧与输出比例不一致会导致
-    画面裁切或黑边，所以跟随首帧而不是让用户手填。
-    """
     if width > 0 and height > 0 and height > width:
         return "9:16"
     return "16:9"
@@ -245,7 +183,6 @@ def _save_video_bytes(payload: bytes, save_dir: str, prefix: str) -> str:
 
 
 def _download_video(url: str, save_dir: str) -> str:
-    """下载 result.url 并落盘。官方要求"及时下载"，URL 可能有时效。"""
     with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as resp:
         payload = resp.read()
     if not payload:
@@ -254,7 +191,6 @@ def _download_video(url: str, save_dir: str) -> str:
 
 
 def _error_from_http(exc: urllib.error.HTTPError) -> ToolResult:
-    """HTTPError → 带排查提示的错误结果（detail 截前 500 字符）。"""
     try:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
     except Exception:
@@ -307,7 +243,6 @@ def generate_video(
             "非法 resolution：%r，可选值：%s" % (resolution, " / ".join(VALID_RESOLUTIONS)),
             is_error=True,
         )
-    # duration：-1 智能时长，或 2~30 的整数；bool 是 int 子类，先挡掉
     if isinstance(duration, bool) or not isinstance(duration, int):
         return ToolResult(
             "非法 duration：%r，必须为整数（%d~%d 秒，%d 表示智能时长）。"
@@ -321,9 +256,6 @@ def generate_video(
             is_error=True,
         )
 
-    # 首帧（可选）：公网 HTTPS URL 直传；本地路径 → images/edits 换公网 URL。
-    # 视频接口实测不收 base64 / data URL（上限约 4096 字符），本地图没有直传
-    # 通道，只能先花 ¥0.2 经改图接口换 OSS 地址。
     image_ref = str(image or "").strip()
     width = height = 0
     if image_ref and not image_ref.lower().startswith(("http://", "https://")):
@@ -380,7 +312,6 @@ def generate_video(
         method="POST",
     )
 
-    # ---- 阶段 1：创建任务（HTTP 202 + 任务 id）----
     try:
         created = _http_json(req)
     except urllib.error.HTTPError as exc:
@@ -421,7 +352,6 @@ def generate_video(
             return ToolResult("轮询视频任务失败：%s" % (exc,), is_error=True)
 
         status = str(status_doc.get("status") or "").strip().lower()
-        # 终态口径以实测为准：queued → running → success（不是文档里的 succeeded）
         if status in ("success", "succeeded", "completed"):
             final = status_doc
             break
@@ -441,7 +371,6 @@ def generate_video(
             is_error=True,
         )
 
-    # ---- 阶段 3：下载产物 ----
     result_field = final.get("result") or {}
     if not isinstance(result_field, dict):
         result_field = {}
@@ -476,8 +405,6 @@ def generate_video(
     lines.append(
         "请务必在回复中直接告诉用户本地文件路径，便于用户用本地播放器查看该视频。"
     )
-    # metadata 给桥层记账用（对话路径模型看不到）：任务 id 与实测费用，
-    # 生成台账（character_generation_records）从这里取数
     meta_cost = None
     if cost is not None:
         try:
@@ -490,22 +417,12 @@ def generate_video(
     )
 
 
-# ---------------------------------------------------------------------------
-# 工具注册
-# ---------------------------------------------------------------------------
-
 _PERMISSION_KWARGS = dict(
     read_only=False,
-    # 不声明 mutates_files：视频落的是本工具的 AI 产物（save_dir 缺省 → AI 生成
-    # 内容目录；落盘在回合外执行），不属于受控源码编辑，且
-    # _save_video_bytes 刻意不接入按回合撤销记录器（几十 MB 产物存快照既慢又
-    # 撑库，见该函数注释）；与 screenshot_capture / clipboard_image 的 AI 产物
-    # 口径一致。声明为 True 会让规格 9.5 的启动校验按"未接入记录器"直接失败。
     mutates_files=False,
-    requires_permission=True,    # 视频按条计费且耗时分钟级，写操作走用户审批
-    cancellable=True,            # 轮询+下载耗时长，允许用户中断
+    requires_permission=True,
+    cancellable=True,
     parallel_safe=False,
-    # 规格 03 §3.2 取值表：发起外部网络请求的工具归 network
     side_effect_scope="network",
 )
 

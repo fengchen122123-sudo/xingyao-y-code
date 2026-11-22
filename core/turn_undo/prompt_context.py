@@ -1,29 +1,14 @@
-"""星瑶按回合撤销：模型动态纠正上下文（规格 15.3）。
-
-从 workspace_corrections 纠正表构造紧凑的动态块，由 build_dynamic_prompt
-按当前规范化工作区追加。铁律：
-- 只进动态上下文，绝不进稳定 system prompt（保护前缀缓存）。
-- 同一规范化工作区的其他会话都能看到相关纠正；不同工作区不串。
-- 中断状态提示"工作区可能处于部分恢复状态"，不误称已撤销。
-- 不调整 Provider 历史字节、tools 顺序或缓存亲和材料。
-"""
-
 from __future__ import annotations
 
 import json
 from typing import Optional
 
 
-# 动态块中列出的最大文件数；较旧记录只保留回合/时间/数量摘要。
 _RECENT_FILE_LIMIT = 6
 _MAX_BLOCKS = 8
 
 
 def build_workspace_correction_section(workspace_root) -> str:
-    """构造纠正动态块；无纠正时返回空串（动态块字节与历史版本一致）。
-
-    workspace_root 为当前回合工作目录；内部按规范化真实路径查询。
-    """
     try:
         from core.turn_undo import coordinator as coordinator_mod
         from core.turn_undo import service as turn_undo_service
@@ -38,7 +23,6 @@ def build_workspace_correction_section(workspace_root) -> str:
             cp for cp in interrupted if cp.workspace_root == root
         ]
     except Exception:
-        # 纠正上下文属增强信息：查询失败不阻断回合（记录日志由调用方环境处理）
         return ""
 
     if not corrections and not interrupted:

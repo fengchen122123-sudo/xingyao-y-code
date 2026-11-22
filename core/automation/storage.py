@@ -1,15 +1,3 @@
-"""星轨自动化任务：SQLite 存储层。
-
-- 复用桥既有 MemoryManager 的连接与可重入锁（与 core/turn_undo/storage.py 同一
-  挂接模式）；建表幂等，写操作显式 ``commit()``。
-- ``claim_due_tasks`` 是防重复触发的唯一闸门：单条 CAS UPDATE 认领
-  （``WHERE next_run_at IS ?``），跨线程/跨进程重复触发天然被排除。
-- 单飞判定（同任务存在 queued/running 运行时写 skipped 不派发）与启动恢复
-  （遗留 queued/running → interrupted，绝不自动重跑）也在这里实现。
-- ``on_run_updated`` 回调：所有运行行变化（认领 queued/skipped、running、
-  终态、手动创建）提交后回调给桥层统一推送 ``automation_run_updated`` 事件。
-"""
-
 from __future__ import annotations
 
 import json
@@ -27,10 +15,8 @@ from core.automation.scheduling import RUN_AT_FORMAT, compute_next_run
 
 logger = logging.getLogger(__name__)
 
-# 每任务保留的运行记录条数（设计规格 5.6）。
 RUNS_RETENTION_PER_TASK = 50
 
-# 「错过触发」判定容差：引擎启动时 next_run_at 早于 now-60s 才算错过（设计规格 8.4）。
 CATCHUP_GRACE_SECONDS = 60.0
 
 # 一次性任务的陈旧容差：换算后的触发时刻最多允许落后当前时刻这么多秒
@@ -49,7 +35,7 @@ def _normalize_once_config(config: dict) -> dict:
         return dict(config)
     delay_minutes = config.get("delay_minutes")
     if isinstance(delay_minutes, bool) or not isinstance(delay_minutes, int):
-        return dict(config)  # 非法值原样留给校验层报错
+        return dict(config)
     fire_ts = time.time() + delay_minutes * 60
     return {"run_at": datetime.fromtimestamp(fire_ts).strftime(RUN_AT_FORMAT)}
 
@@ -82,6 +68,7 @@ _TASK_COLUMNS = (
     "max_runs",
     "scheduled_run_count",
     "status",
+    "session_mode",
 )
 
 _RUN_COLUMNS = (
@@ -109,7 +96,7 @@ AUTOMATION_TABLE_DDL = (
         target_session TEXT NOT NULL,
         prompt TEXT NOT NULL,
         permission_mode TEXT NOT NULL DEFAULT 'confirm',
-        missed_run_policy TEXT NOT NULL DEFAULT 'skip',
+        missed_run_policy TEXT NOT NULL DEFAULT 'run_once',
         notify_on_success INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -119,7 +106,8 @@ AUTOMATION_TABLE_DDL = (
         model_id TEXT NOT NULL DEFAULT '',
         max_runs INTEGER,
         scheduled_run_count INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'active'
+        status TEXT NOT NULL DEFAULT 'active',
+        session_mode TEXT NOT NULL DEFAULT 'per_run'
     )
     """,
     """
@@ -177,11 +165,8 @@ class AutomationStorage:
 
     def __init__(self, manager):
         self._manager = manager
-        # 认领路径产生的运行行（queued/skipped）提交后回调；由桥层注册。
         self.on_run_updated: Optional[RunUpdatedCallback] = None
         self._create_tables()
-
-    # -- 基础 --
 
     @property
     def conn(self):
@@ -203,8 +188,6 @@ class AutomationStorage:
                 cursor.execute(
                     "ALTER TABLE automation_tasks ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"
                 )
-            # 有限次执行三列（设计规格 3.6）：存量任务落 NULL / 0 / 'active'，
-            # 语义与升级前逐字节一致（无限循环照跑）
             if "max_runs" not in existing_cols:
                 cursor.execute(
                     "ALTER TABLE automation_tasks ADD COLUMN max_runs INTEGER"
@@ -217,9 +200,11 @@ class AutomationStorage:
                 cursor.execute(
                     "ALTER TABLE automation_tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
                 )
+            if "session_mode" not in existing_cols:
+                cursor.execute(
+                    "ALTER TABLE automation_tasks ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'per_run'"
+                )
             self.conn.commit()
-
-    # -- 任务 CRUD --
 
     def list_tasks(self) -> list[dict]:
         with self._manager._lock:
@@ -245,12 +230,6 @@ class AutomationStorage:
         return int(row[0]) if row else 0
 
     def save_task(self, task: dict) -> str:
-        """插入或更新任务；保存时统一重算 next_run_at（startup 恒 NULL）。
-
-        once 任务：``delay_minutes`` 先归一化成 ``run_at`` 再落库，且换算出的
-        触发时刻已在过去（含 60 秒容差）时拒绝保存，引导调用方改用
-        ``delay_minutes``（设计规格 3.1 的写库前陈旧拒绝）。
-        """
         now = iso_now()
         trigger_type = str(task.get("trigger_type") or "")
         config = task.get("trigger_config") if isinstance(task.get("trigger_config"), dict) else {}
@@ -277,7 +256,6 @@ class AutomationStorage:
                 )
                 existing = cursor.fetchone()
                 exists = existing is not None
-                # 终态不可逆：completed 任务不允许再被编辑（设计规格 3.2）
                 if exists and str(existing[0] or "") == "completed":
                     raise ValueError(
                         "任务已完成（执行次数已耗尽），不能再修改；请新建或复制一个任务"
@@ -293,10 +271,11 @@ class AutomationStorage:
                 str(task.get("target_session") or "").strip(),
                 str(task.get("prompt") or ""),
                 str(task.get("permission_mode") or "confirm"),
-                str(task.get("missed_run_policy") or "skip"),
+                str(task.get("missed_run_policy") or "run_once"),
                 1 if task.get("notify_on_success") else 0,
                 str(task.get("workdir") or "").strip(),
                 str(task.get("model_id") or "").strip(),
+                str(task.get("session_mode") or "per_run").strip() or "per_run",
             )
             if exists:
                 # 只允许改写 max_runs；scheduled_run_count / status 属于生命周期
@@ -307,7 +286,8 @@ class AutomationStorage:
                     SET name = ?, enabled = ?, trigger_type = ?, trigger_config = ?,
                         target_session = ?, prompt = ?, permission_mode = ?,
                         missed_run_policy = ?, notify_on_success = ?, workdir = ?,
-                        model_id = ?, updated_at = ?, next_run_at = ?, max_runs = ?
+                        model_id = ?, session_mode = ?, updated_at = ?,
+                        next_run_at = ?, max_runs = ?
                     WHERE id = ?
                     """,
                     (*fields, now, next_run, max_runs, task_id),
@@ -318,10 +298,10 @@ class AutomationStorage:
                     INSERT INTO automation_tasks (
                         id, name, enabled, trigger_type, trigger_config,
                         target_session, prompt, permission_mode, missed_run_policy,
-                        notify_on_success, workdir, model_id, max_runs,
+                        notify_on_success, workdir, model_id, session_mode, max_runs,
                         scheduled_run_count, status, created_at, updated_at,
                         last_run_at, next_run_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, NULL, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, NULL, ?)
                     """,
                     (task_id, *fields, max_runs, now, now, next_run),
                 )
@@ -384,8 +364,6 @@ class AutomationStorage:
             self.conn.commit()
         return deleted
 
-    # -- 运行记录 --
-
     def list_runs(self, task_id: Optional[str] = None, limit: int = RUNS_RETENTION_PER_TASK) -> list[dict]:
         query = f"SELECT {', '.join(_RUN_COLUMNS)} FROM automation_runs"
         params: list = []
@@ -438,6 +416,17 @@ class AutomationStorage:
                 "UPDATE automation_runs SET turn_id = ? WHERE id = ?", (turn_id, run_id)
             )
             self.conn.commit()
+
+    def set_run_session(self, run_id: str, session_name: str) -> bool:
+        with self._manager._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE automation_runs SET session_name = ? WHERE id = ?",
+                (session_name, run_id),
+            )
+            updated = cursor.rowcount > 0
+            self.conn.commit()
+        return updated
 
     def finish_run(self, run_id: str, status: str, error: str = "") -> bool:
         """写入运行终态。exactly-once：只有 queued/running 能被收尾。"""
@@ -507,8 +496,6 @@ class AutomationStorage:
         """
         with self._manager._lock:
             cursor = self.conn.cursor()
-            # completed 是终态：手动执行同样拒绝（设计规格 3.2）；手动执行不推进
-            # scheduled_run_count——试跑不消耗任务生命周期（计数双轨）
             row = cursor.execute(
                 "SELECT status FROM automation_tasks WHERE id = ?", (task["id"],)
             ).fetchone()
@@ -522,7 +509,6 @@ class AutomationStorage:
         return run
 
     def _insert_run_raw(self, run_id: str, task_id: str, session_name: str, status: str) -> None:
-        """测试辅助：直接插入一条最小运行行。"""
         with self._manager._lock:
             cursor = self.conn.cursor()
             cursor.execute(
@@ -543,8 +529,6 @@ class AutomationStorage:
                 "UPDATE automation_tasks SET last_run_at = NULL WHERE id = ?", (task_id,)
             )
             self.conn.commit()
-
-    # -- 引擎认领 --
 
     def earliest_next_run(self) -> Optional[float]:
         with self._manager._lock:
@@ -568,20 +552,6 @@ class AutomationStorage:
         catchup_enabled: bool = False,
         startup_since: Optional[float] = None,
     ) -> list[tuple[dict, str, str]]:
-        """原子认领到期任务，返回 [(task_snapshot, run_id, trigger_kind)]。
-
-        - 常规：CAS UPDATE 认领（trigger_kind="scheduled"）；
-        - include_startup（引擎首轮）：startup 任务认领一次（认领后写入
-          last_run_at/next_run_at 标记，本轮进程不再触发）。标记是持久化的，
-          所以不能用「next_run_at IS NULL」判定：标记写过一次就再不为 NULL，
-          任务会永久失效。传 startup_since（本次进程启动时刻）时按「标记早于
-          启动时刻」认领——每个进程生命周期恰好触发一次；不传则退化为
-          「next_run_at IS NULL 才认领」（仅用于不带进程时钟的裸调用）；
-        - catchup_enabled（引擎首轮）：next_run_at 早于容差的启用任务按
-          missed_run_policy 处理——skip 留痕重算；run_once 以 "catchup" 认领一次；
-        - 单飞：认领前检查同任务是否有 queued/running 运行，命中则写 skipped 行
-          且不派发（周期照常推进）。
-        """
         claimed: list[tuple[dict, str, str]] = []
         fired: list[dict] = []
         with self._manager._lock:
@@ -630,8 +600,6 @@ class AutomationStorage:
                     else:
                         self._push_next_run_locked(cursor, task["id"], next_ts)
                         if str(task.get("trigger_type")) == "once":
-                            # once + skip：错过即终态（设计规格 3.4）——skipped 留痕
-                            # 已写入，这里只落 completed，不再重算下一次
                             cursor.execute(
                                 "UPDATE automation_tasks SET status = 'completed' WHERE id = ? AND status = 'active'",
                                 (task["id"],),
@@ -661,8 +629,6 @@ class AutomationStorage:
             self._fire_run_updated(run)
         return claimed
 
-    # -- 认领内部 --
-
     def _select_tasks_locked(self, cursor, where: str, params: tuple = (), order: str = "created_at, rowid"):
         return cursor.execute(
             f"SELECT {', '.join(_TASK_COLUMNS)} FROM automation_tasks WHERE {where} ORDER BY {order}",
@@ -670,12 +636,6 @@ class AutomationStorage:
         ).fetchall()
 
     def _safe_next(self, compute_next: NextRunComputer, task: dict, now_ts: float) -> Optional[float]:
-        """计算下一次触发；异常兜底 1 小时后重试，非严格递增值钳制到 now+1。
-
-        once 任务在按计划时刻认领后就不再有下一次，必须在本函数里直接返回 None
-        （让 ``_push_next_run_locked`` 把 next_run_at 置 NULL）；一旦走到下面的
-        「钳制到 now+1」分支，next_run_at 永远是未来 1 秒，任务会被无限重触发。
-        """
         trigger_type = str(task["trigger_type"])
         if trigger_type == "once":
             return None
@@ -738,10 +698,8 @@ class AutomationStorage:
                 (next_ts, iso_now(), task["id"], task["next_run_at"]),
             )
         if cursor.rowcount != 1:
-            return  # 已被其他线程/进程抢先认领
+            return
         if trigger_kind != "startup":
-            # 只对定时/补跑派发计数（设计规格 3.2）：startup 每次进程启动只触发
-            # 一次，不构成有限次生命周期
             self._consume_scheduled_run_locked(cursor, task)
         claimed.append((task, self._insert_run_locked(cursor, task, "queued", trigger_kind=trigger_kind)["id"], trigger_kind))
 
@@ -763,7 +721,7 @@ class AutomationStorage:
             (task["id"],),
         )
         if cursor.rowcount != 1:
-            return  # 任务已被删除/已终态：不推进计数
+            return
         row = cursor.execute(
             "SELECT scheduled_run_count, max_runs FROM automation_tasks WHERE id = ?",
             (task["id"],),
@@ -774,10 +732,8 @@ class AutomationStorage:
         max_runs = row[1]
         exhausted = max_runs is not None and count >= int(max_runs)
         if not exhausted and str(task.get("trigger_type")) == "once":
-            # once 即 max_runs=1 的有限任务：认领一次就终态，不另造一次性分支
             exhausted = count >= 1
         if exhausted:
-            # 覆盖本函数调用方刚写的 next_ts：终态任务不再有任何触发时刻
             cursor.execute(
                 "UPDATE automation_tasks SET status = 'completed', next_run_at = NULL "
                 "WHERE id = ?",

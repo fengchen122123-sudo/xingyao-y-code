@@ -52,7 +52,6 @@
       </div>
     </van-pull-refresh>
 
-    <!-- 新建会话：绑定项目 -->
     <van-popup v-model:show="newDlg" position="bottom" round :style="{ maxHeight: '70%' }">
       <div class="sheet">
         <div class="sh-h"><span>新建会话</span><span class="x" @click="newDlg = false">✕</span></div>
@@ -74,7 +73,6 @@
       </div>
     </van-popup>
 
-    <!-- 项目选择（移动端内列表，替代系统 select） -->
     <van-popup v-model:show="projDlg" position="bottom" round :style="{ maxHeight: '70%' }">
       <div class="sheet">
         <div class="sh-h"><span>选择绑定项目</span><span class="x" @click="projDlg = false">✕</span></div>
@@ -97,7 +95,6 @@
       </div>
     </van-popup>
 
-    <!-- 服务器目录浏览 -->
     <van-popup v-model:show="dirDlg" position="bottom" round :style="{ maxHeight: '70%' }">
       <div class="sheet">
         <div class="sh-h"><span>选择工作目录</span><span class="x" @click="dirDlg = false">✕</span></div>
@@ -117,7 +114,6 @@
       </div>
     </van-popup>
 
-    <!-- 会话操作（长按，与详情 ⋯ 共用组件） -->
     <SessionOps :show="opsDlg" :target="opsTarget" @close="opsDlg = false" @reopen="opsDlg = true" @deleted="opsTarget = null" />
   </div>
 </template>
@@ -133,7 +129,6 @@ import { relTime } from '../utils/time';
 const store = useAppStore();
 const router = useRouter();
 
-// 星瑶品牌 logo（public 静态资源，运行时引用；/m/ 前缀与 lan_server 托管路径一致）
 const logoUrl = '/m/icon.png';
 
 const search = ref('');
@@ -203,8 +198,6 @@ async function onRefresh() {
   refreshing.value = false;
 }
 
-// ---- 新建（绑定项目）----
-
 function openNew() {
   newTitle.value = '';
   newWorkdir.value = '';
@@ -212,7 +205,6 @@ function openNew() {
   newDlg.value = true;
 }
 
-/** 选择绑定项目；选“浏览服务器目录…”则打开目录弹层 */
 function pickProject(v: string) {
   projDlg.value = false;
   if (v === '__browse__') {
@@ -282,8 +274,6 @@ onDeactivated(() => {
    window（永不滚动）→ reachTop 恒真 → 任何向下拖动都会被 preventDefault 抢去触发
    下拉刷新，列表反而滚不动。这里覆盖 Vant 的 overflow:hidden 让它命中自身。 */
 .list { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; }
-/* Vant 默认把 track 固定成 100% 高（内容靠溢出传播撑开滚动区）。改成随内容长高、
-   但至少一屏，滚动区尺寸不再依赖溢出传播规则。 */
 .list :deep(.van-pull-refresh__track) { height: auto; min-height: 100%; }
 .nvlogo { width: 22px; height: 22px; border-radius: 6px; object-fit: cover; box-shadow: 0 0 8px var(--accent-soft); }
 .newbtn { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-family: var(--font-mono); color: var(--accent); }
@@ -311,7 +301,6 @@ onDeactivated(() => {
 .frow { display: flex; flex-direction: column; gap: 5px; margin: 10px 0 0; }
 .frow label { font-size: 11px; color: var(--text-3); }
 .frow input { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--bg-inset); color: var(--text-1); font-size: 13px; outline: none; font-family: inherit; }
-/* 项目选择行（替代系统 select） */
 .pick { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--bg-inset); color: var(--text-1); font-size: 13px; cursor: pointer; }
 .pick span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pick .i { color: var(--text-3); }
