@@ -552,7 +552,7 @@ export function isLoopbackHostName(host: unknown): boolean {
   return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
 }
 
-function isLoopbackPageHost(): boolean {
+export function isLoopbackPageHost(): boolean {
   try {
     return isLoopbackHostName(window.location.hostname);
   } catch {
@@ -7192,7 +7192,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       try {
         const res = await api.export_session(fmt);
         if (res && res.ok) {
-          this.notifyChat('导出成功: ' + (res.path || ''));
+          const exportPath = String(res.path || '').trim();
+          this.notifyChat(exportPath ? `导出成功: ${exportPath}` : '导出成功');
         } else {
           this.notifyChat('导出失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }

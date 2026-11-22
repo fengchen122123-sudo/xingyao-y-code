@@ -243,3 +243,31 @@ it('background_subagent_terminal 按归属会话路由，不串到当前查看�
   expect(s2Msgs[s2Msgs.length - 1].role).toBe('notice');
   expect(s2Msgs[s2Msgs.length - 1].content).toBe('后台子代理已完成：调研');
 });
+
+it('exportSession 成功时广播带导出路径的提示，缺路径时不带多余冒号', async () => {
+  const postNotice = vi.fn(async () => ({ ok: true }));
+  const exportSession = vi.fn()
+    .mockResolvedValueOnce({ ok: true, path: 'C:\\Users\\x\\.ycode\\exports\\demo.html' })
+    .mockResolvedValueOnce({ ok: true, path: '' });
+  (window as any).pywebview = {
+    api: { export_session: exportSession, post_notice: postNotice },
+  };
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+
+  try {
+    await store.exportSession('html');
+    expect(exportSession).toHaveBeenCalledWith('html');
+    expect(postNotice).toHaveBeenNthCalledWith(
+      1,
+      '导出成功: C:\\Users\\x\\.ycode\\exports\\demo.html',
+      's1',
+      'notice',
+    );
+
+    await store.exportSession('md');
+    expect(postNotice).toHaveBeenNthCalledWith(2, '导出成功', 's1', 'notice');
+  } finally {
+    delete (window as any).pywebview;
+  }
+});
