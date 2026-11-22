@@ -37,12 +37,12 @@ _USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 DEFAULT_DOWNLOAD = {
     "mode": "gitee",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "windowsUrl": (
         "https://gitee.com/feng-chenhao/xingyao-y-code/releases/download/"
-        "v1.4.0/XingYaoCode-1.4.0.exe"
+        "v1.4.1/XingYaoCode-1.4.1.exe"
     ),
-    "fileName": "XingYaoCode-1.4.0.exe",
+    "fileName": "XingYaoCode-1.4.1.exe",
 }
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
