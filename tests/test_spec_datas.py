@@ -264,8 +264,6 @@ class TestBloatPruning:
             (r'_tk_data\demos\widget', s, 'DATA'),
             (r'tcl8\8.5\tcltest-2.5.8.tm', s, 'DATA'),
             (r'winpty\tests\test_pty.py', s, 'DATA'),
-            (r'webview\lib\runtimes\win-arm64\native\WebView2Loader.dll', s, 'DATA'),
-            (r'webview\lib\runtimes\win-x86\native\WebView2Loader.dll', s, 'DATA'),
             (r'webview\lib\pywebview-android.jar', s, 'DATA'),
             (r'webview\lib\WebBrowserInterop.x86.dll', s, 'DATA'),
             (r'pythonnet\runtime\Python.Runtime.xml', s, 'DATA'),
@@ -277,7 +275,9 @@ class TestBloatPruning:
             (r'_tcl_data\encoding\cp936.enc', s, 'DATA'),
             (r'_tk_data\tk.tcl', s, 'DATA'),
             (r'winpty\winpty.dll', s, 'DATA'),
+            (r'webview\lib\runtimes\win-arm64\native\WebView2Loader.dll', s, 'DATA'),
             (r'webview\lib\runtimes\win-x64\native\WebView2Loader.dll', s, 'DATA'),
+            (r'webview\lib\runtimes\win-x86\native\WebView2Loader.dll', s, 'DATA'),
             (r'webview\lib\WebBrowserInterop.x64.dll', s, 'DATA'),
             (r'webview\js\api.js', s, 'DATA'),
             (r'pythonnet\runtime\Python.Runtime.dll', s, 'DATA'),
@@ -291,7 +291,7 @@ class TestBloatPruning:
         assert removed_count == len(dropped)
         assert removed_bytes == len(dropped) * 100
 
-    def test_strip_unused_binaries_drops_avif_win32ui_and_non_x64_webview(self, tmp_path):
+    def test_strip_unused_binaries_drops_avif_win32ui_and_keeps_webview_runtimes(self, tmp_path):
         src_file = tmp_path / 'mod.pyd'
         src_file.write_bytes(b'y' * 250)
         s = str(src_file)
@@ -300,7 +300,6 @@ class TestBloatPruning:
             (r'PIL\_avif.cp314-win_amd64.pyd', s, 'EXTENSION'),
             (r'pythonwin\win32ui.pyd', s, 'EXTENSION'),
             (r'mfc140u.dll', s, 'BINARY'),
-            (r'webview\lib\runtimes\win-x86\native\WebView2Loader.dll', s, 'BINARY'),
             (r'webview\lib\WebBrowserInterop.x86.dll', s, 'BINARY'),
         ]
         kept_expected = [
@@ -308,7 +307,9 @@ class TestBloatPruning:
             (r'PIL\_webp.cp314-win_amd64.pyd', s, 'EXTENSION'),
             (r'win32\win32api.pyd', s, 'EXTENSION'),
             (r'pywin32_system32\pythoncom314.dll', s, 'BINARY'),
+            (r'webview\lib\runtimes\win-arm64\native\WebView2Loader.dll', s, 'BINARY'),
             (r'webview\lib\runtimes\win-x64\native\WebView2Loader.dll', s, 'BINARY'),
+            (r'webview\lib\runtimes\win-x86\native\WebView2Loader.dll', s, 'BINARY'),
             (r'webview\lib\WebBrowserInterop.x64.dll', s, 'BINARY'),
         ]
 
@@ -316,6 +317,29 @@ class TestBloatPruning:
         assert kept == kept_expected
         assert removed_count == len(dropped)
         assert removed_bytes == len(dropped) * 250
+
+    def test_real_pywebview_runtimes_survive_pruning(self):
+        import pytest
+
+        hooks = pytest.importorskip('PyInstaller.utils.hooks')
+        datas = hooks.collect_data_files('webview', subdir='lib')
+        binaries = hooks.collect_dynamic_libs('webview')
+
+        kept_datas, _, _ = strip_bloat_datas(datas, 'GUI')
+        kept_bins, _, _ = strip_unused_binaries(binaries, 'GUI')
+
+        kept_rel_paths = set()
+        for entry in kept_datas + kept_bins:
+            src, dest = entry[0], entry[1]
+            norm_dest = dest.replace('\\', '/').strip('/')
+            name = Path(src).name
+            kept_rel_paths.add(f'{norm_dest}/{name}'.lower() if norm_dest else name.lower())
+
+        for arch in ('win-arm64', 'win-x64', 'win-x86'):
+            assert f'webview/lib/runtimes/{arch}/native/webview2loader.dll' in kept_rel_paths
+        assert 'webview/lib/microsoft.web.webview2.core.dll' in kept_rel_paths
+        assert 'webview/lib/microsoft.web.webview2.winforms.dll' in kept_rel_paths
+        assert 'webview/lib/webbrowserinterop.x64.dll' in kept_rel_paths
 
     def test_filter_hidden_imports_removes_excluded_subtrees(self):
         mods = [

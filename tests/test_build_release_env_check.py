@@ -69,3 +69,26 @@ def test_real_spec_targets_importable_in_build_env():
     )
     assert "winpty" in targets
     assert build_release.find_missing_collect_all_targets(targets) == []
+
+
+def test_find_missing_core_bundle_files_catches_missing_webview_arch(tmp_path):
+    for rel_path in build_release.REQUIRED_CORE_BUNDLE_FILES:
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"dll")
+
+    assert build_release.find_missing_core_bundle_files(str(tmp_path)) == []
+
+    arm64_dll = tmp_path / "_internal" / "webview" / "lib" / "runtimes" / "win-arm64" / "native" / "WebView2Loader.dll"
+    arm64_dll.unlink()
+    missing = build_release.find_missing_core_bundle_files(str(tmp_path))
+    assert len(missing) == 1
+    assert "win-arm64" in missing[0]
+
+
+def test_verify_core_bundle_files_exits_when_incomplete(tmp_path):
+    import pytest
+
+    with pytest.raises(SystemExit) as exc_info:
+        build_release.verify_core_bundle_files(str(tmp_path))
+    assert exc_info.value.code == 1
