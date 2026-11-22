@@ -766,6 +766,24 @@ export interface SubagentStagePayload {
   detail: string;
 }
 
+export interface SubagentToolRecord {
+  id: string;
+  seq: number;
+  round: number;
+  name: string;
+  category: string;
+  action: string;
+  target: string;
+  args_preview?: string;
+  status: 'running' | 'ok' | 'err' | 'cancelled';
+  started_at: number;
+  finished_at?: number | null;
+  duration_ms?: number | null;
+  duration_text?: string;
+  error_summary?: string;
+  result_preview?: string;
+}
+
 export interface SubagentTaskDetail {
   id: string;
   description: string;
@@ -774,12 +792,25 @@ export interface SubagentTaskDetail {
   stage: string;
   stage_detail?: string;
   elapsed: number;
+  execution_elapsed?: number;
+  approval_wait_elapsed?: number;
+  timeout_seconds?: number;
   background: boolean;
   plan_item_id?: string;
+  handoff?: string;
+  model_name?: string;
+  approval_summary?: string;
+  rounds?: number;
+  tool_ok?: number;
+  tool_err?: number;
+  changed_count?: number;
   started_at?: number | null;
   finished_at?: number | null;
   stages: SubagentStagePayload[];
+  tool_records?: SubagentToolRecord[];
+  changed_files?: string[];
   result: string;
+  result_truncated?: boolean;
   error: string;
   partial: string;
 }
@@ -790,8 +821,19 @@ export interface SubagentTaskListItem {
   type: string;
   status: string;
   stage: string;
+  stage_detail?: string;
   elapsed: number;
+  execution_elapsed?: number;
+  approval_wait_elapsed?: number;
+  timeout_seconds?: number;
+  started_at?: number | null;
+  finished_at?: number | null;
   background: boolean;
+  model_name?: string;
+  rounds?: number;
+  tool_ok?: number;
+  tool_err?: number;
+  changed_count?: number;
 }
 
 export type ContextBreakdownSource =
@@ -2012,6 +2054,12 @@ export interface PyWebViewAPI {
     ok: boolean;
     task?: SubagentTaskDetail | null;
     tasks: SubagentTaskListItem[];
+    msg?: string;
+  }>;
+  cancel_subagent_task?(taskId: string, sessionName?: string): Promise<{
+    ok: boolean;
+    already_terminal?: boolean;
+    status?: string;
     msg?: string;
   }>;
 

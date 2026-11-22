@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildSubagentFlatView,
+  buildSubagentRoundGroups,
   buildToolTraceRows,
+  cleanSubagentTitle,
   countDiffChanges,
   reduceExecutionState,
   type ToolDisplay,
@@ -435,4 +437,58 @@ it('maps computer actions to their own row kind', () => {
   expect(rows[0].kind).toBe('computer');
   expect(rows[0].action).toBe('点击控件');
   expect(rows[0].detail).toBe('el-20');
+});
+
+describe('cleanSubagentTitle & buildSubagentRoundGroups', () => {
+  it('strips repetitive workdir and target prefixes without losing real intent', () => {
+    expect(
+      cleanSubagentTitle('工作目录 E:\\fch\\Y-code_tui，分支 dev。目标：校验发布包 SHA256 并上传'),
+    ).toBe('校验发布包 SHA256 并上传');
+    expect(cleanSubagentTitle('整理测试报告')).toBe('整理测试报告');
+  });
+
+  it('groups structured tool_records by round and attaches milestone stages while filtering noisy ones', () => {
+    const timeline = buildSubagentRoundGroups({
+      toolRecords: [
+        {
+          id: 'c1', seq: 1, round: 1, name: 'search_code', category: 'search',
+          action: '搜索代码', target: 'SHA256', status: 'ok', started_at: 100, duration_text: '31ms',
+        },
+        {
+          id: 'c2', seq: 2, round: 2, name: 'execute_command', category: 'command',
+          action: '运行命令', target: 'pytest', status: 'err', started_at: 120, error_summary: 'exit 1',
+        },
+      ],
+      stages: [
+        { name: 'thinking', at: 99, detail: '' },
+        { name: 'waiting_approval', at: 121, detail: '运行命令：pytest' },
+        { name: 'composing', at: 130, detail: '' },
+      ],
+      rounds: 2,
+      toolOk: 1,
+      toolErr: 1,
+    });
+
+    expect(timeline.hasStructuredTools).toBe(true);
+    expect(timeline.rounds).toBe(2);
+    expect(timeline.toolOk).toBe(1);
+    expect(timeline.toolErr).toBe(1);
+    expect(timeline.groups).toHaveLength(2);
+    expect(timeline.groups[0].milestones).toEqual([]);
+    expect(timeline.groups[1].milestones).toHaveLength(1);
+    expect(timeline.groups[1].milestones[0].name).toBe('waiting_approval');
+  });
+
+  it('falls back cleanly when tool_records is absent', () => {
+    const timeline = buildSubagentRoundGroups({
+      stages: [
+        { name: 'model', at: 100, detail: '' },
+        { name: 'tool', at: 101, detail: 'read_file' },
+        { name: 'tool', at: 102, detail: 'read_file ✓ 1.2s' },
+      ],
+    });
+    expect(timeline.hasStructuredTools).toBe(false);
+    expect(timeline.rounds).toBe(1);
+    expect(timeline.toolOk).toBe(1);
+  });
 });

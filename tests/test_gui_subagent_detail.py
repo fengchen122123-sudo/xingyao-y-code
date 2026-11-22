@@ -149,3 +149,145 @@ def test_tool_call_scope_stamps_and_restores_current_call_id():
             assert app_context.get_thread_tool_call_id() == "call-inner"
         assert app_context.get_thread_tool_call_id() == "call-outer"
     assert app_context.get_thread_tool_call_id() is None
+
+
+def test_get_subagent_task_detail_empty_id_returns_session_tasks(monkeypatch):
+    manager = _make_manager()
+    bridge = _bare_bridge(monkeypatch, manager)
+
+    res = bridge.get_subagent_task_detail("", "s1")
+
+    assert res["ok"] is True
+    assert res["task"] is None
+    assert [t["description"] for t in res["tasks"]] == ["前台任务", "后台任务"]
+    assert all("timeout_seconds" in t and "tool_ok" in t for t in res["tasks"])
+
+
+def test_cancel_subagent_task_stops_running_task_and_guards_session(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(record):
+        started.set()
+        release.wait(timeout=3.0)
+        return "done"
+
+    manager = SubagentManager(runner=runner)
+    bridge = _bare_bridge(monkeypatch, manager)
+    manager.run(
+        "长耗时后台任务",
+        "s1",
+        "t1",
+        run_in_background=True,
+        timeout_seconds=30,
+    )
+    assert started.wait(timeout=2.0)
+    task = manager.snapshot()[0]
+    manager._record_tool_started(
+        task.task_id,
+        "call-running",
+        1,
+        {"name": "execute_command", "arguments": {"command": "pytest"}},
+    )
+
+    cross = bridge.cancel_subagent_task(task.task_id, "other-session")
+    assert cross["ok"] is False
+
+    res = bridge.cancel_subagent_task(task.task_id, "s1")
+    release.set()
+    manager.wait_for_idle(2)
+
+    assert res["ok"] is True
+    assert res["status"] == "cancelled"
+    detail = bridge.get_subagent_task_detail(task.task_id, "s1")["task"]
+    assert detail["status"] == "cancelled"
+    assert detail["tool_records"][0]["status"] == "cancelled"
+
+    again = bridge.cancel_subagent_task(task.task_id, "s1")
+    assert again["ok"] is True
+    assert again["already_terminal"] is True
+
+
+def test_subagent_records_structured_tools_rounds_files_approval_and_fast_partial(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    def fake_events(*args, **kwargs):
+        yield TurnEvent("t1", 1, "thinking_started", {})
+        yield TurnEvent("t1", 2, "tool_started", {
+            "id": "call-1",
+            "name": "execute_command",
+            "preview": "curl -H Authorization: Bearer secret123",
+            "arguments": {"command": "curl -H 'Authorization: Bearer secret123' https://example.com"},
+            "display": {
+                "category": "command",
+                "action": "运行命令",
+                "target": "curl",
+                "command": "curl -H 'Authorization: Bearer ***' https://example.com",
+            },
+        })
+        yield TurnEvent("t1", 3, "permission_requested", {
+            "function_name": "execute_command",
+            "arguments": {"command": "curl https://example.com"},
+        })
+        yield TurnEvent("t1", 4, "permission_resolved", {})
+        yield TurnEvent("t1", 5, "tool_finished", {
+            "id": "call-1",
+            "name": "execute_command",
+            "ok": False,
+            "duration_ms": 420,
+            "summary": "401 Unauthorized",
+            "result": "Bearer secret123 rejected: 401 Unauthorized",
+            "display": {
+                "category": "command",
+                "action": "运行命令",
+                "target": "curl",
+                "command": "curl",
+                "error_summary": "401 Unauthorized",
+            },
+        })
+        yield TurnEvent("t1", 6, "thinking_started", {})
+        yield TurnEvent("t1", 7, "tool_started", {
+            "id": "call-2",
+            "name": "edit_file",
+            "arguments": {"file_path": "dist/manifest.json"},
+            "display": {"category": "mutation", "action": "修改文件", "target": "dist/manifest.json"},
+        })
+        yield TurnEvent("t1", 8, "diff_ready", {"file_path": "dist/manifest.json"})
+        yield TurnEvent("t1", 9, "tool_finished", {
+            "id": "call-2",
+            "name": "edit_file",
+            "ok": True,
+            "duration_ms": 18,
+            "result": "updated",
+            "display": {"category": "mutation", "action": "修改文件", "target": "dist/manifest.json"},
+        })
+        yield TurnEvent("t1", 10, "assistant_delta", {"text": "已完成修复并验证。" * 25})
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+    monkeypatch.setattr(
+        "core.task_decision_hooks.decide_subagent_review",
+        lambda **kwargs: None,
+    )
+
+    manager = SubagentManager()
+    bridge = _bare_bridge(monkeypatch, manager)
+    manager.run("多轮修复任务", "s1", "t1", timeout_seconds=120, model_config=("openai/gpt-4.1-mini", "k", "u"))
+    snap = manager.snapshot()[0]
+    detail = bridge.get_subagent_task_detail(snap.task_id, "s1")["task"]
+
+    assert detail["status"] == "completed"
+    assert detail["model_name"] == "gpt-4.1-mini"
+    assert detail["rounds"] == 3
+    assert detail["tool_ok"] == 1
+    assert detail["tool_err"] == 1
+    assert detail["changed_files"] == ["dist/manifest.json"]
+    assert detail["approval_summary"] == ""
+    assert len(detail["partial"]) >= 200
+    assert len(detail["tool_records"]) == 2
+    first, second = detail["tool_records"]
+    assert first["round"] == 1 and first["status"] == "err"
+    assert "secret123" not in first["args_preview"]
+    assert "secret123" not in first["result_preview"]
+    assert first["error_summary"] == "401 Unauthorized"
+    assert second["round"] == 2 and second["status"] == "ok" and second["duration_text"] == "18ms"

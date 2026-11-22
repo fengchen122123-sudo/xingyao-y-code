@@ -351,6 +351,7 @@ it('子代理查看打开子代理页签：头部信息 + 执行行 + 任务切�
   expect(rows[1].text()).toContain('✓ 1.2s');
   expect(wrapper.text()).toContain('轮次 1');
   expect(wrapper.text()).toContain('工具 1 成功');
+  await wrapper.get('[data-test="subagent-switcher-toggle"]').trigger('click');
   const chips = wrapper.findAll('.suba-chip');
   expect(chips).toHaveLength(2);
   await chips[1].trigger('click');

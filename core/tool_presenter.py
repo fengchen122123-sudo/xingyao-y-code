@@ -160,19 +160,66 @@ _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
 _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 
 
-def sanitize_tool_display_text(value: object, limit: int = 160) -> str:
+def _redact_tool_text(value: object, *, preserve_newlines: bool) -> str:
     text = _ANSI_RE.sub("", str(value or ""))
     text = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group(1)}***", text)
-    text = _CONTROL_RE.sub("", text.replace("\r", " ").replace("\n", " "))
+    if preserve_newlines:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    else:
+        text = text.replace("\r", " ").replace("\n", " ")
+    text = _CONTROL_RE.sub("", text)
     text = _NAMED_SECRET_RE.sub(lambda match: f"{match.group(1)}***", text)
     text = _BEARER_RE.sub(lambda match: f"{match.group(1)}***", text)
     text = _OPENAI_KEY_RE.sub("***", text)
-    text = " ".join(text.split())
+    return text
+
+
+def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     if limit <= 3:
         return text[:limit]
     return text[: limit - 3].rstrip() + "..."
+
+
+def sanitize_tool_display_text(value: object, limit: int = 160) -> str:
+    text = " ".join(_redact_tool_text(value, preserve_newlines=False).split())
+    return _truncate_text(text, limit)
+
+
+def sanitize_tool_multiline_text(value: object, limit: int = 1200) -> str:
+    """保留换行的安全预览清洗：复用统一脱敏规则后裁剪长度。"""
+    text = _redact_tool_text(value, preserve_newlines=True).strip()
+    return _truncate_text(text, limit)
+
+
+def format_tool_arguments_preview(
+    function_name: str,
+    arguments: Any,
+    limit: int = 800,
+) -> str:
+    """把工具入参整理成可读的多行摘要（供子代理过程展开查看）。"""
+    if not isinstance(arguments, dict) or not arguments:
+        return ""
+    lines: list[str] = []
+    for key, val in arguments.items():
+        k = str(key or "").strip()
+        if not k:
+            continue
+        if isinstance(val, (dict, list)):
+            try:
+                rendered = json.dumps(val, ensure_ascii=False)
+            except Exception:
+                rendered = str(val)
+        else:
+            rendered = str(val)
+        rendered = _redact_tool_text(rendered, preserve_newlines=True).strip()
+        if len(rendered) > 360:
+            rendered = _truncate_text(rendered, 360)
+        lines.append(f"{k}: {rendered}")
+    if not lines:
+        return ""
+    return _truncate_text("\n".join(lines), limit)
 
 
 def _skill_name_from_path(file_path: str) -> str:

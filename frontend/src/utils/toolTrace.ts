@@ -1,3 +1,5 @@
+import type { SubagentToolRecord } from '../types/pywebview.d';
+
 export type ExecutionState = 'running' | 'completed' | 'cancelled' | 'error';
 export type ExecutionLifecycleEvent =
   | 'turn_start'
@@ -361,4 +363,126 @@ export function buildSubagentFlatView(stages: SubagentStage[]): SubagentFlatView
     }
   }
   return { rows, rounds, toolOk, toolErr };
+}
+
+export interface SubagentMilestoneItem {
+  kind: 'milestone';
+  name: string;
+  at: number;
+  detail: string;
+}
+
+export interface SubagentRoundGroup {
+  round: number;
+  startedAt: number;
+  tools: SubagentToolRecord[];
+  milestones: SubagentMilestoneItem[];
+}
+
+export interface SubagentTimelineModel {
+  hasStructuredTools: boolean;
+  groups: SubagentRoundGroup[];
+  rounds: number;
+  toolOk: number;
+  toolErr: number;
+}
+
+const MILESTONE_STAGES = new Set([
+  'waiting_approval',
+  'budget_notice',
+  'summarizing',
+  'finalizing',
+]);
+
+/**
+ * 清洗子代理长指令用于顶部选择器与总览卡片的短标题：
+ * 剥离「工作目录 … 分支 …」「目标：」「任务：」等固定引导前缀，突出真实动作对象。
+ */
+export function cleanSubagentTitle(description: string): string {
+  const raw = String(description || '').replace(/\s+/g, ' ').trim();
+  if (!raw) return '';
+  let text = raw;
+  const targetIdx = text.search(/(?:^|[。\n\s])(?:目标|任务)\s*[:：]\s*/);
+  if (targetIdx >= 0 && targetIdx < 120) {
+    const after = text.slice(targetIdx).replace(/^[。\n\s]*(?:目标|任务)\s*[:：]\s*/, '').trim();
+    if (after.length >= 6) text = after;
+  } else {
+    text = text
+      .replace(/^工作目录\s+[^\s，。,]+(?:\s*[，,]\s*分支\s+[^\s，。,]+)?(?:\s*[（(][^）)]*[）)])?[。，,\s]*/i, '')
+      .replace(/^(?:目标|任务)\s*[:：]\s*/i, '')
+      .trim();
+  }
+  return text || raw;
+}
+
+export function buildSubagentRoundGroups(params: {
+  toolRecords?: SubagentToolRecord[];
+  stages?: SubagentStage[];
+  rounds?: number;
+  toolOk?: number;
+  toolErr?: number;
+}): SubagentTimelineModel {
+  const records = Array.isArray(params.toolRecords) ? params.toolRecords : [];
+  const stages = Array.isArray(params.stages) ? params.stages : [];
+  const flat = buildSubagentFlatView(stages);
+
+  if (records.length === 0) {
+    return {
+      hasStructuredTools: false,
+      groups: [],
+      rounds: Math.max(params.rounds ?? 0, flat.rounds),
+      toolOk: Math.max(params.toolOk ?? 0, flat.toolOk),
+      toolErr: Math.max(params.toolErr ?? 0, flat.toolErr),
+    };
+  }
+
+  const groupMap = new Map<number, SubagentRoundGroup>();
+  let okCount = 0;
+  let errCount = 0;
+
+  for (const rec of records) {
+    const roundNum = Math.max(1, Number(rec.round) || 1);
+    let grp = groupMap.get(roundNum);
+    if (!grp) {
+      grp = {
+        round: roundNum,
+        startedAt: Number(rec.started_at) || 0,
+        tools: [],
+        milestones: [],
+      };
+      groupMap.set(roundNum, grp);
+    } else if (rec.started_at && (!grp.startedAt || rec.started_at < grp.startedAt)) {
+      grp.startedAt = rec.started_at;
+    }
+    grp.tools.push(rec);
+    if (rec.status === 'ok') okCount += 1;
+    else if (rec.status === 'err') errCount += 1;
+  }
+
+  const groups = Array.from(groupMap.values()).sort((a, b) => a.round - b.round);
+  for (const stage of stages) {
+    if (!MILESTONE_STAGES.has(stage.name)) continue;
+    let targetGroup = groups[0]!;
+    for (const grp of groups) {
+      if (grp.startedAt <= 0 || stage.at >= grp.startedAt) {
+        targetGroup = grp;
+      } else {
+        break;
+      }
+    }
+    targetGroup.milestones.push({
+      kind: 'milestone',
+      name: stage.name,
+      at: stage.at,
+      detail: stage.detail || '',
+    });
+  }
+
+  return {
+    hasStructuredTools: true,
+    groups,
+    rounds: Math.max(params.rounds ?? 0, groups.length),
+    toolOk: Math.max(params.toolOk ?? 0, okCount),
+    toolErr: Math.max(params.toolErr ?? 0, errCount),
+  };
 }

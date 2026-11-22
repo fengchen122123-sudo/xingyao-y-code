@@ -12364,7 +12364,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
     def get_subagent_task_detail(self, task_id: str, session_name: str = "") -> Dict[str, Any]:
         try:
             from core.tools import subagent_manager
-            wanted = str(task_id or "")
+            wanted = str(task_id or "").strip()
             session = str(session_name or "")
             now = time.time()
             tasks: List[Dict[str, Any]] = []
@@ -12374,41 +12374,90 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 elapsed = 0
                 if snap.started_at:
                     elapsed = int((snap.finished_at or now) - snap.started_at)
+                exec_elapsed = int(round(float(getattr(snap, "execution_elapsed", 0.0) or 0.0)))
+                wait_elapsed = int(round(float(getattr(snap, "approval_wait_elapsed", 0.0) or 0.0)))
+                changed_files = list(getattr(snap, "changed_files", ()) or ())
                 item = {
                     "id": snap.task_id,
                     "description": snap.description,
                     "type": snap.subagent_type,
                     "status": snap.status,
                     "stage": snap.stage,
+                    "stage_detail": snap.stages[-1].detail if snap.stages else "",
                     "elapsed": elapsed,
+                    "execution_elapsed": exec_elapsed,
+                    "approval_wait_elapsed": wait_elapsed,
+                    "timeout_seconds": int(getattr(snap, "timeout_seconds", 600) or 600),
+                    "started_at": snap.started_at,
+                    "finished_at": snap.finished_at,
                     "background": bool(snap.run_in_background),
+                    "model_name": str(getattr(snap, "model_name", "") or ""),
+                    "rounds": int(getattr(snap, "rounds", 0) or 0),
+                    "tool_ok": int(getattr(snap, "tool_success_count", 0) or 0),
+                    "tool_err": int(getattr(snap, "tool_error_count", 0) or 0),
+                    "changed_count": len(changed_files),
                 }
                 if not session or snap.parent_session == session:
                     tasks.append(item)
-                if snap.task_id == wanted:
+                if wanted and snap.task_id == wanted:
                     target = snap
                     target_item = item
+            if not wanted:
+                return {"ok": True, "task": None, "tasks": tasks}
             if target is None or target_item is None:
                 return {"ok": False, "task": None, "tasks": tasks,
                         "msg": "未找到该子代理任务（可能已被清理）"}
+            raw_result = str(target.result or "")
+            raw_partial = str(target.partial_result or "")
             detail = {
                 **target_item,
-                "stage_detail": target.stages[-1].detail if target.stages else "",
                 "plan_item_id": target.plan_item_id,
-                "started_at": target.started_at,
-                "finished_at": target.finished_at,
+                "handoff": str(getattr(target, "handoff", "") or ""),
+                "approval_summary": str(getattr(target, "approval_summary", "") or ""),
                 "stages": [
                     {"name": s.name, "at": s.at, "detail": s.detail}
                     for s in target.stages
                 ],
-                "result": str(target.result or "")[:4000],
+                "tool_records": [dict(r) for r in (getattr(target, "tool_records", ()) or ())],
+                "changed_files": list(getattr(target, "changed_files", ()) or ()),
+                "result": raw_result[:12000],
+                "result_truncated": len(raw_result) > 12000,
                 "error": str(target.error or ""),
-                "partial": str(target.partial_result or "")[:2000],
+                "partial": raw_partial[:4000],
             }
             return {"ok": True, "task": detail, "tasks": tasks}
         except Exception as exc:
             logger.debug("get_subagent_task_detail 失败", exc_info=True)
             return {"ok": False, "task": None, "tasks": [], "msg": str(exc)}
+
+    def cancel_subagent_task(self, task_id: str, session_name: str = "") -> Dict[str, Any]:
+        """协作式停止指定子代理任务（仅允许停止当前会话或匹配归属的任务）。"""
+        try:
+            from core.tools import _SUBAGENT_TERMINAL_STATUSES, subagent_manager
+
+            tid = str(task_id or "").strip()
+            if not tid:
+                return {"ok": False, "msg": "缺少子代理任务 ID"}
+            snap = subagent_manager.task_snapshot(tid)
+            if snap is None:
+                return {"ok": False, "msg": "未找到该子代理任务"}
+            session = str(session_name or "")
+            if session and snap.parent_session and snap.parent_session != session:
+                return {"ok": False, "msg": "该子代理不属于当前会话"}
+            if snap.status in _SUBAGENT_TERMINAL_STATUSES:
+                return {
+                    "ok": True,
+                    "already_terminal": True,
+                    "status": snap.status,
+                    "msg": "子代理已处于终态",
+                }
+            cancelled = subagent_manager.cancel(tid, reason="user requested via GUI")
+            if cancelled:
+                return {"ok": True, "status": "cancelled", "msg": "已停止该子代理"}
+            return {"ok": False, "msg": "子代理已结束或无法停止"}
+        except Exception as exc:
+            logger.debug("cancel_subagent_task 失败", exc_info=True)
+            return {"ok": False, "msg": str(exc)}
 
     def kill_task(self, task_id: str) -> Dict[str, Any]:
         try:
