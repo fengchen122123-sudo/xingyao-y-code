@@ -1,39 +1,43 @@
 <template>
   <div class="settings-page" :class="{ 'settings-page--mobile': isMobile }">
     <aside class="settings-nav">
-      <button class="back-workspace" @click="attemptCloseSettings"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
-      <div class="nav-section nav-section--first">核心配置</div>
-      <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
-      <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
-      <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
-      <button data-test="hooks-nav" class="nav-item" :class="{ active: activeSection === 'hooks' }" @click="activeSection = 'hooks'"><span class="nav-ico"><AppIcon name="zap" :size="14" /></span>钩子 Hooks</button>
+      <div class="settings-nav-top">
+        <button class="back-workspace" data-test="back-workspace-btn" @click="attemptCloseSettings"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
+      </div>
+      <div class="settings-nav-scroll" data-test="settings-nav-scroll">
+        <div class="nav-section nav-section--first">核心配置</div>
+        <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
+        <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
+        <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
+        <button data-test="hooks-nav" class="nav-item" :class="{ active: activeSection === 'hooks' }" @click="activeSection = 'hooks'"><span class="nav-ico"><AppIcon name="zap" :size="14" /></span>钩子 Hooks</button>
 
-      <div class="nav-section">外观与个性</div>
-      <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
-      <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
-      <button data-test="pet-nav" class="nav-item" :class="{ active: activeSection === 'pet' }" @click="activeSection = 'pet'"><span class="nav-ico"><AppIcon name="orbit" :size="14" /></span>桌面宠物</button>
-      <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
+        <div class="nav-section">外观与个性</div>
+        <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
+        <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
+        <button data-test="pet-nav" class="nav-item" :class="{ active: activeSection === 'pet' }" @click="activeSection = 'pet'"><span class="nav-ico"><AppIcon name="orbit" :size="14" /></span>桌面宠物</button>
+        <button data-test="bg-convert-nav" class="nav-item" :class="{ active: activeSection === 'bg-convert' }" @click="activeSection = 'bg-convert'"><span class="nav-ico"><AppIcon name="play" :size="14" /></span>背景图转换</button>
 
-      <div class="nav-section">记忆与决策</div>
-      <button data-test="growth-nav" class="nav-item" :class="{ active: activeSection === 'growth' }" @click="activeSection = 'growth'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>记忆与成长</button>
-      <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
+        <div class="nav-section">记忆与决策</div>
+        <button data-test="growth-nav" class="nav-item" :class="{ active: activeSection === 'growth' }" @click="activeSection = 'growth'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>记忆与成长</button>
+        <button data-test="decision-nav" class="nav-item" :class="{ active: activeSection === 'decision' }" @click="activeSection = 'decision'"><span class="nav-ico"><AppIcon name="brain" :size="14" /></span>决策模型（JEV）</button>
 
-      <div class="nav-section">集成与数据</div>
-      <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
-      <button data-test="cloud-relay-nav" class="nav-item" :class="{ active: activeSection === 'cloud-relay' }" @click="activeSection = 'cloud-relay'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>云中转</button>
-      <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
-      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
-      <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
+        <div class="nav-section">集成与数据</div>
+        <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
+        <button data-test="cloud-relay-nav" class="nav-item" :class="{ active: activeSection === 'cloud-relay' }" @click="activeSection = 'cloud-relay'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>云中转</button>
+        <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
+        <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
+        <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
 
-      <div v-if="pluginNavItems.length" class="nav-section">插件设置</div>
-      <button v-for="p in pluginNavItems" :key="p.name" :data-test="`plugin-nav-${p.name}`" class="nav-item" :class="{ active: activePluginName === p.name }" @click="openPluginSection(p.name)"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>{{ p.name }}</button>
-      <div class="nav-section">关于</div>
-      <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
-      <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
-      <div class="nav-section">法律</div>
-      <button data-test="disclaimer-nav" class="nav-item" :class="{ active: activeSection === 'disclaimer' }" @click="activeSection = 'disclaimer'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>免责条款</button>
-      <div class="nav-spacer"></div>
-      <div class="settings-user"><span class="avatar">Y</span><span>星瑶Code</span><AppIcon name="settings" :size="13" /></div>
+        <div v-if="pluginNavItems.length" class="nav-section">插件设置</div>
+        <button v-for="p in pluginNavItems" :key="p.name" :data-test="`plugin-nav-${p.name}`" class="nav-item" :class="{ active: activePluginName === p.name }" @click="openPluginSection(p.name)"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>{{ p.name }}</button>
+        <div class="nav-section">关于</div>
+        <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
+        <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
+        <div class="nav-section">法律</div>
+        <button data-test="disclaimer-nav" class="nav-item" :class="{ active: activeSection === 'disclaimer' }" @click="activeSection = 'disclaimer'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>免责条款</button>
+        <div class="nav-spacer"></div>
+        <div class="settings-user"><span class="avatar">Y</span><span>星瑶Code</span><AppIcon name="settings" :size="13" /></div>
+      </div>
     </aside>
 
     <main class="settings-main">
@@ -1575,6 +1579,7 @@ onMounted(async () => {
   position: relative;
   flex: 1;
   min-width: 0;
+  min-height: 0;
   z-index: 80;
   display: flex;
   padding: 0 8px 8px;
@@ -1584,16 +1589,28 @@ onMounted(async () => {
 .settings-nav {
   width: 224px;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: 8px 10px 12px;
+  overflow: hidden;
+  padding: 0;
   background: var(--xy-sidebar, transparent);
   border-right: none;
   display: flex;
   flex-direction: column;
+}
+.settings-nav-top {
+  flex-shrink: 0;
+  padding: 8px 10px 6px;
+}
+.settings-nav-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 10px 12px;
+  display: flex;
+  flex-direction: column;
   gap: 2px;
 }
-.settings-nav > * { flex-shrink: 0; }
+.settings-nav-scroll > * { flex-shrink: 0; }
 .back-workspace, .nav-item {
   width: 100%;
   min-height: 32px;
@@ -1606,7 +1623,6 @@ onMounted(async () => {
   transition: background .15s ease, color .15s ease;
 }
 .back-workspace {
-  margin-bottom: 4px;
   font-size: 13px;
   font-weight: 500;
   display: flex;
@@ -2153,10 +2169,24 @@ onMounted(async () => {
     background: var(--xy-bg, var(--bg1));
     border-right: 0;
     border-bottom: 1px solid var(--xy-border, var(--border));
+    overflow: hidden;
+    flex: none;
+  }
+  .settings-page--mobile .settings-nav-top {
+    padding: 0;
+    flex-shrink: 0;
+  }
+  .settings-page--mobile .settings-nav-scroll {
+    flex: 1;
+    min-width: 0;
+    min-height: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 0;
     overflow-x: auto;
     overflow-y: hidden; /* 横滑胶囊条只横向滚动，避免出现多余的纵向滚动条 */
     -webkit-overflow-scrolling: touch;
-    flex: none;
   }
   .settings-page--mobile .back-workspace { width: auto; flex: none; color: var(--xy-accent, var(--accent)); font-weight: 500; padding: 6px 6px; }
   .settings-page--mobile .nav-section,

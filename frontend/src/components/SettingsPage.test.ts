@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
@@ -603,5 +604,32 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="model-error-banner"]').exists()).toBe(false);
     expect(wrapper.find('.test-result.ok').exists()).toBe(true);
     expect(wrapper.get('.test-result.ok').text()).toContain('连接成功');
+  });
+
+  it('keeps the back-workspace button pinned outside the scrollable nav list', async () => {
+    const store = useAppStore();
+    const closeSpy = vi.spyOn(store, 'closeModelSettings').mockImplementation(() => {});
+    const wrapper = mount(SettingsPage);
+
+    const navTop = wrapper.get('.settings-nav > .settings-nav-top');
+    const navScroll = wrapper.get('.settings-nav > [data-test="settings-nav-scroll"]');
+    const backBtn = navTop.get('[data-test="back-workspace-btn"]');
+
+    expect(backBtn.text()).toContain('返回工作区');
+    expect(navScroll.find('[data-test="back-workspace-btn"]').exists()).toBe(false);
+    expect(navScroll.find('[data-test="system-settings-nav"]').exists()).toBe(true);
+    expect(navScroll.find('[data-test="disclaimer-nav"]').exists()).toBe(true);
+    expect(navScroll.find('.settings-user').exists()).toBe(true);
+
+    await backBtn.trigger('click');
+    await flushPromises();
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+
+    const source = readFileSync('src/components/SettingsPage.vue', 'utf-8');
+    const css = source.slice(source.indexOf('<style'));
+    expect(css).toMatch(/\.settings-nav\s*{[^}]*overflow:\s*hidden;/);
+    expect(css).toMatch(/\.settings-nav-top\s*{[^}]*flex-shrink:\s*0;/);
+    expect(css).toMatch(/\.settings-nav-scroll\s*{[^}]*flex:\s*1;[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/);
+    expect(css).toMatch(/\.settings-page--mobile \.settings-nav-scroll\s*{[^}]*flex-direction:\s*row;[^}]*overflow-x:\s*auto;[^}]*overflow-y:\s*hidden;/);
   });
 });
