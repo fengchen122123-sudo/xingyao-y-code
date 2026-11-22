@@ -87,6 +87,10 @@ def strip_unused_datas(datas, label):
     return _filter_entries(datas, _should_drop)
 
 
+# 保留 webview/lib/runtimes/{win-arm64,win-x64,win-x86}：pywebview 的
+# edgechromium.py（以及 core/embedded_browser.py）在导入/加载期无条件遍历
+# ('win-arm64', 'win-x64', 'win-x86') 调用 interop_dll_path(platform)，
+# 缺任一架构目录都会在 x64 Windows 上直接抛出 FileNotFoundError 导致 GUI 启动失败。
 DROP_BLOAT_DATA_SUBTREES = (
     'reportlab/fonts',
     'reportlab/graphics',
@@ -95,8 +99,6 @@ DROP_BLOAT_DATA_SUBTREES = (
     '_tk_data/images',
     '_tk_data/demos',
     'winpty/tests',
-    'webview/lib/runtimes/win-arm64',
-    'webview/lib/runtimes/win-x86',
 )
 DROP_BLOAT_DATA_PREFIXES = (
     'tcl8/8.5/tcltest',
@@ -114,8 +116,6 @@ REDUNDANT_PY_DATA_PREFIXES = (
 
 DROP_UNUSED_BINARY_SUBTREES = (
     'pythonwin',
-    'webview/lib/runtimes/win-arm64',
-    'webview/lib/runtimes/win-x86',
 )
 DROP_UNUSED_BINARY_PREFIXES = (
     'pil/_avif',
